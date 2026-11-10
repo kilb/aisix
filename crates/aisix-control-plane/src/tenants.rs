@@ -408,16 +408,40 @@ pub(crate) async fn find(conn: &mut PgConnection, id: Uuid) -> Result<TenantRow,
     load(conn, raw.ok_or_else(ApiError::not_found)?).await
 }
 
+/// Fences a tenant's move onto [`ModelScope::All`] against a write that
+/// changes what every all-scope tenant reaches. Such a write takes it
+/// shared ([`lock_all_scope`]) before it reads which tenants are on `all`,
+/// and holds it to its commit; a move onto `all` takes it exclusive right
+/// after the tenant's own row (and account), before it projects the
+/// tenant's keys from the catalogue. So a tenant that joins `all` is either
+/// in the writer's census, its keys rewritten by the writer, or projected
+/// after the writer committed, from a catalogue that holds the writer's
+/// change. Without it a tenant could join between the census and the
+/// write and be rewritten by neither.
+///
+/// The writer takes it before any tenant row, the move after its tenant's
+/// row, and neither order can close a wait cycle: a writer waits only on
+/// rows of tenants already on `all`, and a move waits for the fence only
+/// while its tenant is not.
+pub const SCOPE_LOCK_KEY: i64 = 0x6169_7369_7863_7034;
+
 /// Locks every tenant on [`ModelScope::All`], in ascending id order, so a
 /// write that changes what those tenants reach (`channels::regenerate`, a
 /// public model's retire) can reproject their key documents in the same
 /// transaction, under the lock order: the tenant rows first, then the
-/// public model's row, then the resources lock.
+/// public model's row, then the resources lock. [`SCOPE_LOCK_KEY`] is taken
+/// shared first, so no tenant joins `all` between the census and the
+/// commit.
 ///
 /// A selected-scope tenant holds no reference to a public model as a whole,
 /// so it is not taken here; a change in the public model catalogue reaches
 /// it only through an operator's edit of its list.
 pub async fn lock_all_scope(conn: &mut PgConnection) -> Result<Vec<TenantRow>, ApiError> {
+    sqlx::query("SELECT pg_advisory_xact_lock_shared($1)")
+        .bind(SCOPE_LOCK_KEY)
+        .execute(&mut *conn)
+        .await
+        .map_err(DbError::from)?;
     let mut ids: Vec<Uuid> =
         sqlx::query_scalar("SELECT id FROM tenants WHERE model_scope = 'all' ORDER BY id")
             .fetch_all(&mut *conn)
@@ -1904,6 +1928,16 @@ pub async fn update(
                 };
                 if current.version != expected {
                     return Err(ApiError::version_mismatch(current.version));
+                }
+                // A move onto `all` waits for every catalogue write that
+                // counted the all-scope tenants without this one, and holds
+                // off the next until it commits ([`SCOPE_LOCK_KEY`]).
+                if scope == Some(ModelScope::All) && current.model_scope != ModelScope::All {
+                    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                        .bind(SCOPE_LOCK_KEY)
+                        .execute(&mut *conn)
+                        .await
+                        .map_err(DbError::from)?;
                 }
                 if groups.as_ref().is_some_and(Vec::is_empty) && !current.is_internal {
                     return Err(ApiError::validation(vec![no_groups(

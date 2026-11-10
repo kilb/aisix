@@ -141,6 +141,17 @@ way.
   takes every public model it reuses, in ascending id order, before that
   lock (`a_selection_takes_its_public_models_before_the_resources_lock`). Never take a group or public-model row after
   the resources lock; a path that needs both takes the row first.
+- **A tenant's move onto `model_scope = all` is fenced against the
+  catalogue writers by `tenants::SCOPE_LOCK_KEY`.** Every writer that counts
+  the all-scope tenants (`tenants::lock_all_scope`: the channel edits, a
+  public model's `PATCH`, retire and delete, a bulk apply) takes it shared
+  before that count, ahead of every tenant row, and a tenant `PATCH` that
+  moves a tenant onto `all` takes it exclusive right after the tenant's row
+  (and account), before the groups and the resources lock. No wait cycle
+  follows: a writer waits only on rows of tenants already on `all`, and a
+  move waits for the fence only while its tenant is not
+  (`a_tenant_moving_onto_all_while_a_model_becomes_callable_reaches_it`,
+  `tests/tenant_model_scope.rs`). Nothing else takes it.
 - **A generated document's owner is `public:<public_model_id>`, and only
   `src/channels.rs` writes one.** The direct and routing documents a public
   model implies go through `write_resource` like any other, with
@@ -174,8 +185,8 @@ way.
   else: a baseline comes from it only through a sync an operator attests.
 - **Advisory lock keys must be unique.** They are the `*_LOCK_KEY` constants,
   all `0x6169_7369_7863_70xx`: operators `7030`, projector `7031`, resources
-  `7032`, boot `7033`, signup `7073`, and the test harness's template lock
-  `7074` (`tests/support/mod.rs`). Postgres has one key space per database.
+  `7032`, boot `7033`, scope `7034`, signup `7073`, and the test harness's
+  template lock `7074` (`tests/support/mod.rs`). Postgres has one key space per database.
   A reused value serialises unrelated work, and a value shared with the
   projector's session-level lock makes a writer wait out the leader's whole
   tenure (then `lock_timeout`, then `503`). No test checks this; grep

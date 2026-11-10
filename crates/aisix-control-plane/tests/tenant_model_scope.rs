@@ -722,3 +722,94 @@ async fn the_upgrade_reads_the_stored_grants() {
 
     drop_database(db).await;
 }
+
+/// Backends of `cp`'s database waiting for a lock.
+async fn lock_waiters(cp: &TestCp) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM pg_stat_activity \
+         WHERE datname = current_database() AND wait_event_type = 'Lock'",
+    )
+    .fetch_one(cp.db().pool())
+    .await
+    .expect("read pg_stat_activity")
+}
+
+/// Returns once `n` backends wait for a lock; fails after 60 s.
+async fn until_lock_waiters(cp: &TestCp, n: i64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while lock_waiters(cp).await < n {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{n} lock waiters never appeared"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+/// A tenant that moves onto every public model while a channel edit that
+/// makes one callable is between its count of the all-scope tenants and its
+/// commit still gets that model in its keys: the edit counted the tenants
+/// without it, so the move must not complete until the edit has.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tenant_moving_onto_all_while_a_model_becomes_callable_reaches_it() {
+    let Some(cp) = TestCp::start_with(|cfg| cfg.db_lock_timeout_ms = 60_000).await else {
+        return;
+    };
+    let cp = std::sync::Arc::new(cp);
+    let admin = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let t = operator_tenant(&cp, &admin, "scope-race-9e4").await;
+    let r = patch(&cp, &admin, t, json!({"model_scope": "selected"})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let k = key(&cp, &admin, t, "scope-race-key").await;
+    let account = provider_key(&cp, &admin, "acct-scope-race-9e4").await;
+    let p = public_model(&cp, &admin, "pub-scope-race-9e4").await;
+    assert!(!ids(&key_doc(&cp, &k).await).contains(&p.to_string()));
+
+    // The channel edit counts the all-scope tenants, then waits for the
+    // public model's row, held here.
+    let mut held = cp.db().pool().begin().await.expect("begin");
+    sqlx::query("SELECT 1 FROM public_models WHERE id = $1 FOR UPDATE")
+        .bind(p)
+        .execute(&mut *held)
+        .await
+        .expect("hold the public model");
+    let edit = tokio::spawn({
+        let (cp, admin) = (cp.clone(), admin.clone());
+        async move {
+            cp.send(
+                "PUT",
+                &format!("/admin/provider-keys/{account}/channel-models/{p}"),
+                Some(admin.cookie()),
+                Some(json!({})),
+            )
+            .await
+        }
+    });
+    until_lock_waiters(&cp, 1).await;
+    // The move onto `all`: it either completes now, from the catalogue
+    // without the model (what the fence prevents), or waits for the edit.
+    let mut moved = tokio::spawn({
+        let (cp, admin) = (cp.clone(), admin.clone());
+        async move { patch(&cp, &admin, t, json!({"model_scope": "all"})).await }
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !moved.is_finished() && lock_waiters(&cp).await < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the move neither ended nor waited"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    held.rollback().await.expect("release the public model");
+
+    let edit = edit.await.expect("join");
+    assert_eq!(edit.status, 200, "{edit:?}");
+    let moved = (&mut moved).await.expect("join");
+    assert_eq!(moved.status, 200, "{moved:?}");
+    assert_eq!(moved.body["model_scope"], "all", "{moved:?}");
+    let doc = key_doc(&cp, &k).await;
+    assert!(
+        ids(&doc).contains(&p.to_string()),
+        "the key misses the model the edit made callable: {doc}"
+    );
+}
