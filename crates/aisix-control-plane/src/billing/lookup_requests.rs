@@ -22,7 +22,8 @@
 //!   its own rows.
 //! - Each row is shown as the call log shows it, through the same
 //!   [`tenant_view`] and SQL rules, and what it was charged is the charge
-//!   plus its re-pricing adjustments. Nothing of the platform's channel is
+//!   plus its re-pricing adjustments, with the quantities the latest run that
+//!   corrected it billed (`calls::EFFECTIVE`). Nothing of the platform's channel is
 //!   read: no provider, upstream model, cost price, error code or upstream
 //!   status or text.
 //!
@@ -47,7 +48,8 @@ use uuid::Uuid;
 
 use super::access::{key_access, KeyAccess, Visibility};
 use super::calls::{
-    call_model, tenant_view, text, Models, TenantStatus, ADJUSTED, EVENT_FIELDS, VISIBLE,
+    call_model, tenant_view, text, Models, TenantStatus, ADJUSTED, EFFECTIVE, EFF_LINES,
+    EVENT_FIELDS, VISIBLE,
 };
 use super::money::{cny_string, CURRENCY};
 use crate::db::DbError;
@@ -154,19 +156,18 @@ pub async fn request_cost(
     access: &KeyAccess,
     request_id: &str,
 ) -> Result<Option<RequestCost>, DbError> {
-    let mut sql = QueryBuilder::<Postgres>::new(
+    let mut sql = QueryBuilder::<Postgres>::new(format!(
         "SELECT pc.occurred_at, pc.requested_model_id, pc.status, pc.charge_micro_cny, \
-         pc.estimated, pc.lines, ",
-    );
+         pc.estimated, {EFF_LINES} AS lines, ",
+    ));
     sql.push(ADJUSTED).push(" AS adjusted, ");
     sql.push(EVENT_FIELDS).push(" AS ev");
-    sql.push(
-        " FROM pricing_charges_cny pc JOIN usage_events ue ON ue.event_id = pc.event_id \
-         WHERE pc.tenant_id = ",
-    )
-    .push_bind(access.tenant_id)
-    .push("::text AND pc.request_id = ")
-    .push_bind(request_id.to_string());
+    sql.push(" FROM pricing_charges_cny pc JOIN usage_events ue ON ue.event_id = pc.event_id");
+    sql.push(EFFECTIVE);
+    sql.push(" WHERE pc.tenant_id = ")
+        .push_bind(access.tenant_id)
+        .push("::text AND pc.request_id = ")
+        .push_bind(request_id.to_string());
     match (access.visibility, access.member_id) {
         (Visibility::Full, _) => {}
         (Visibility::Own, Some(member)) => {

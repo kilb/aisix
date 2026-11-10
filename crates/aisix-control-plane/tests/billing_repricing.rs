@@ -1820,3 +1820,140 @@ async fn a_legacy_internal_keys_rows_are_charged_at_the_group_it_takes_later() {
         "the internal tenant pays like any other"
     );
 }
+
+/// R-084: a run that charges a row stored unpriced explains the charge with
+/// the quantities it billed. The row's own charge keeps its empty lines (a
+/// charge is written once); the call log, the usage summary and the
+/// gateway's request-cost lookup read the lines of the run that corrected
+/// it, so a corrected call is never shown as charged for nothing. A row
+/// priced at intake, the control, keeps showing its own lines.
+#[tokio::test]
+async fn a_corrected_charge_shows_the_quantities_the_run_billed() {
+    let Some(r) = setup(false).await else { return };
+    let cp = &r.w.cp;
+    let priced_model = seed_model(cp, &r.w.admin).await;
+    price(cp, priced_model).await;
+    let mut events = Vec::new();
+    for (id, model) in [("ql1", r.model), ("ql2", r.model), ("qlp", priced_model)] {
+        let mut e = usage(&r.w, id, model, tokens_680());
+        e["is_final_attempt"] = json!(true);
+        events.push(e);
+    }
+    send(&r.w, events).await;
+    price(cp, r.model).await;
+    let (from, to) = last_hour(cp).await;
+    let (id, run) = previewed(
+        cp,
+        &r.w.admin,
+        run_body(from, to, json!({"model_id": r.model})),
+    )
+    .await;
+    assert_eq!(run["changed"], 2, "{run}");
+    assert_eq!(apply(cp, &r.admin, &id).await.status, 200);
+    // The charges themselves are as intake stored them.
+    for event in ["ql1", "ql2"] {
+        let lines: Value =
+            sqlx::query_scalar("SELECT lines FROM pricing_charges_cny WHERE event_id = $1")
+                .bind(event)
+                .fetch_one(cp.db().pool())
+                .await
+                .expect("read the charge's lines");
+        assert_eq!(lines, json!([]), "{event}");
+    }
+
+    // 1000 prompt tokens, 800 of them cache hits, and 200 completion tokens.
+    let billed = json!({"input": 200, "cache_read": 800, "output": 200});
+    let calls = owner_get(&r, "/api/usage/calls").await;
+    assert_eq!(calls.status, 200, "{calls:?}");
+    let items = calls.body["items"].as_array().expect("items");
+    assert_eq!(items.len(), 3, "{calls:?}");
+    for c in items {
+        let quantities: serde_json::Map<String, Value> = c["charge"]["lines"]
+            .as_array()
+            .expect("lines")
+            .iter()
+            .map(|l| {
+                (
+                    l["dimension"].as_str().expect("a dimension").to_string(),
+                    l["quantity"].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(Value::Object(quantities), billed, "{c}");
+        // At `shared`'s rate of 1 CNY per USD: the card's own figures.
+        for l in c["charge"]["lines"].as_array().expect("lines") {
+            assert!(l["rate_cny"].is_string(), "{c}");
+        }
+    }
+
+    let summary = owner_get(&r, &format!("/api/usage/summary?{}", around_now())).await;
+    assert_eq!(summary.status, 200, "{summary:?}");
+    // The tenant holds no grant, so both models share one row of three calls.
+    let rows = summary.body["items"].as_array().expect("items");
+    assert_eq!(rows.len(), 1, "{summary:?}");
+    assert_eq!(rows[0]["requests"], 3, "{summary:?}");
+    assert_eq!(
+        rows[0]["quantities"],
+        json!({"input": 600, "cache_read": 2_400, "output": 600}),
+        "{summary:?}"
+    );
+    assert_eq!(rows[0]["charged_micro_cny"], 2_040, "{summary:?}");
+
+    let lookup =
+        r.w.dp
+            .send(
+                "GET",
+                &format!("/dp/v1/keys/{}/requests?id=req-ql1", r.w.key),
+                None,
+            )
+            .await;
+    assert_eq!(lookup.status, 200, "{lookup:?}");
+    assert_eq!(lookup.body["items"][0]["charge_status"], "charged");
+    assert_eq!(
+        lookup.body["items"][0]["quantities"],
+        json!({"input": 200, "input_cache_read": 800, "output": 200}),
+        "{lookup:?}"
+    );
+}
+
+/// The input line's CNY rate of the one call in the owner's call log.
+async fn input_rate(r: &R) -> Value {
+    let calls = owner_get(r, "/api/usage/calls").await;
+    assert_eq!(calls.status, 200, "{calls:?}");
+    let lines = calls.body["items"][0]["charge"]["lines"].clone();
+    lines
+        .as_array()
+        .expect("lines")
+        .iter()
+        .find(|l| l["dimension"] == "input")
+        .unwrap_or_else(|| panic!("no input line in {lines}"))["rate_cny"]
+        .clone()
+}
+
+/// A charge two runs corrected shows the lines of the later one: the price
+/// its corrected amount was computed at.
+#[tokio::test]
+async fn a_charge_corrected_twice_shows_the_later_runs_lines() {
+    let Some(r) = setup(false).await else { return };
+    let cp = &r.w.cp;
+    let mut e = usage(&r.w, "tw1", r.model, tokens_680());
+    e["is_final_attempt"] = json!(true);
+    send(&r.w, vec![e]).await;
+    price(cp, r.model).await;
+    let (from, to) = last_hour(cp).await;
+    let (first, _) = previewed(cp, &r.w.admin, run_body(from, to, json!({}))).await;
+    assert_eq!(apply(cp, &r.admin, &first).await.status, 200);
+    let at_first = input_rate(&r).await;
+    assert!(at_first.is_string(), "{at_first}");
+
+    // Half the price: the second run refunds 340 µ¥.
+    reprice_model(cp, r.model, card("0.5", "1", "0.05")).await;
+    let (from, to) = last_hour(cp).await;
+    let (second, run) = previewed(cp, &r.w.admin, run_body(from, to, json!({}))).await;
+    assert_eq!(run["delta_micro_cny"], -340, "{run}");
+    assert_eq!(apply(cp, &r.admin, &second).await.status, 200);
+    let at_second = input_rate(&r).await;
+    assert_ne!(at_second, at_first, "the first run's rate is still shown");
+    let calls = owner_get(&r, "/api/usage/calls").await;
+    assert_eq!(calls.body["items"][0]["charge"]["adjusted_micro_cny"], 340);
+}

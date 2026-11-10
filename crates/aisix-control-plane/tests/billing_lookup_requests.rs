@@ -627,8 +627,12 @@ async fn an_adjusted_row_shows_its_corrected_cost() {
     // A row the run charged reads charged, as in the call log.
     assert_eq!(items[1]["charge"], "0.000680", "{r:?}");
     assert_eq!(items[1]["charge_status"], "charged");
-    // A run records no charge lines, so such a row shows no quantities.
-    assert_eq!(items[1]["quantities"], json!({}));
+    // The run's own lines explain what it charged (R-084): the row shows the
+    // quantities the run billed, though its stored charge has none.
+    assert_eq!(
+        items[1]["quantities"],
+        json!({"input": 200, "input_cache_read": 800, "output": 200})
+    );
     assert_eq!(r.body["total"], "0.011020");
     assert_eq!(r.body["pending"], false);
 }

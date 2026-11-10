@@ -26,7 +26,10 @@
 //! A charge is written once; a re-pricing run corrects it with adjustments
 //! (`pricing_adjustments`). A call shows their sum beside its charge
 //! (`adjusted_micro_cny`), and a summary's `charged_micro_cny` is the
-//! corrected charge: the charges plus their adjustments.
+//! corrected charge: the charges plus their adjustments. What a corrected
+//! charge bills is the latest run's: a call's lines, rate, discount and tier,
+//! and a summary's quantities, are the ones that run priced it at
+//! ([`EFFECTIVE`]).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -142,6 +145,34 @@ pub(super) const VISIBLE: &str =
 pub(super) const ADJUSTED: &str =
     "(SELECT SUM(pa.delta_micro_cny)::bigint FROM pricing_adjustments_cny pa \
      WHERE pa.event_id = pc.event_id)";
+
+/// The latest re-pricing adjustment of the charge `pc` that recorded what it
+/// priced the charge at, joined as `eff` (` LEFT JOIN LATERAL …`). A charge
+/// is written once, so one a run corrected is shown with that run's lines,
+/// rate, discount and tier ([`EFF_LINES`] and its siblings), the ones its
+/// corrected amount was computed from. `eff` is all NULL for a charge no run
+/// corrected, and for one corrected only before the adjustments recorded
+/// them (`0038`), whose own columns are read then.
+pub(super) const EFFECTIVE: &str = " LEFT JOIN LATERAL (\
+    SELECT pa.lines, pa.cny_per_usd_e4, pa.discount_bps, pa.service_tier \
+    FROM pricing_adjustments_cny pa WHERE pa.event_id = pc.event_id AND pa.lines IS NOT NULL \
+    ORDER BY pa.created_at DESC LIMIT 1) eff ON true";
+
+/// The charge's lines as [`EFFECTIVE`] corrects them.
+pub(super) const EFF_LINES: &str =
+    "(CASE WHEN eff.lines IS NOT NULL THEN eff.lines ELSE pc.lines END)";
+
+/// The charge's group rate as [`EFFECTIVE`] corrects it.
+const EFF_RATE: &str =
+    "(CASE WHEN eff.lines IS NOT NULL THEN eff.cny_per_usd_e4 ELSE pc.cny_per_usd_e4 END)";
+
+/// The charge's discount as [`EFFECTIVE`] corrects it.
+const EFF_DISCOUNT: &str =
+    "(CASE WHEN eff.lines IS NOT NULL THEN COALESCE(eff.discount_bps, 0) ELSE pc.discount_bps END)";
+
+/// The charge's served tier as [`EFFECTIVE`] corrects it.
+const EFF_TIER: &str =
+    "(CASE WHEN eff.lines IS NOT NULL THEN eff.service_tier ELSE pc.service_tier END)";
 
 /// The only keys read out of a usage row's event.
 pub(super) const EVENT_FIELDS: &str = "jsonb_build_object(\
@@ -324,14 +355,18 @@ struct Scope {
 
 impl Scope {
     /// ` FROM ... WHERE ...` over the charge `pc` and its usage row `ue`,
-    /// with one row per charge line `l` when `lines` is set.
+    /// with the correction `eff` ([`EFFECTIVE`]), and one row per charge
+    /// line `l` (the corrected lines) when `lines` is set.
     fn push_from(&self, sql: &mut QueryBuilder<'_, Postgres>, lines: bool) {
         sql.push(" FROM pricing_charges_cny pc JOIN usage_events ue ON ue.event_id = pc.event_id");
         // The display name only: a charge's group is shown by what tenants may
         // see, never by the routing name its provider keys carry.
         sql.push(" LEFT JOIN provider_groups g ON g.id = pc.group_id");
+        sql.push(EFFECTIVE);
         if lines {
-            sql.push(" CROSS JOIN LATERAL jsonb_array_elements(pc.lines) l");
+            sql.push(format!(
+                " CROSS JOIN LATERAL jsonb_array_elements({EFF_LINES}) l"
+            ));
         }
         sql.push(" WHERE pc.tenant_id = ");
         sql.push_bind(self.tenant).push("::text");
@@ -516,12 +551,13 @@ pub async fn list_calls(
         before: q.before,
     };
     let limit = page_limit(q.limit);
-    let mut sql = QueryBuilder::<Postgres>::new(
+    let mut sql = QueryBuilder::<Postgres>::new(format!(
         "SELECT pc.seq, pc.event_id, pc.occurred_at, pc.api_key_id, pc.user_id, \
-         pc.requested_model_id, pc.status, pc.charge_micro_cny, pc.service_tier, pc.estimated, \
-         pc.discount_bps, pc.lines, pc.cny_per_usd_e4, pc.group_id, g.display_name AS group_name, \
+         pc.requested_model_id, pc.status, pc.charge_micro_cny, {EFF_TIER} AS service_tier, \
+         pc.estimated, {EFF_DISCOUNT} AS discount_bps, {EFF_LINES} AS lines, \
+         {EFF_RATE} AS cny_per_usd_e4, pc.group_id, g.display_name AS group_name, \
          ue.request_id, ",
-    );
+    ));
     sql.push(ADJUSTED).push(" AS adjusted, ");
     sql.push(EVENT_FIELDS).push(" AS ev");
     scope.push_from(&mut sql, false);
