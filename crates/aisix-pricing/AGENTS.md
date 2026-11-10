@@ -33,8 +33,16 @@ failing unless it was written for them.
     from 0 to 100 CNY (`CnyPerUsd`);
   - a **charge** is integer micro-CNY (`MicroCny`).
 
-  Only an upstream's **cost** stays in micro-USD (`MicroUsd`). Prices cross
-  the API as decimal strings and are parsed to integers (`Rate::parse`,
+  An upstream's **cost** is the same lines at the serving account's cost
+  rate (a `CnyPerUsd`, the unit and range of a group rate), through the same
+  function with no discount, so it is rounded once the same way:
+
+  `cost_micro_cny = ⌈ Σ_d q_d × baseline_rate_d × cost_cny_per_usd_e4 / 10¹⁰ ⌉`
+
+  A row naming no account, an account with no cost rate in force, an
+  unreadable cost-rate revision or an amount past `i64` leaves the cost
+  unknown (`None`), never 0, and never refuses the charge. Prices cross the
+  API as decimal strings and are parsed to integers (`Rate::parse`,
   `CnyPerUsd::parse`); no `f64` or `f32` appears in `src/`.
 - Rounding first and multiplying afterwards bills a different number. The
   discriminating case is pinned in `the_rate_and_the_discount_are_inside_the_one_rounding`:
@@ -116,7 +124,7 @@ failing unless it was written for them.
 - Every price write refuses an `effective_from` more than
   `BACKDATE_TOLERANCE` (5 s) before the database's own `now()`
   (`crates/aisix-control-plane/src/pricing/store.rs`), for baselines, group
-  rates, cost prices and discounts alike, imports included. With no
+  rates, cost rates and discounts alike, imports included. With no
   backdating, the book at ingest equals the book at the row's `occurred_at`,
   so a row that arrives late is priced exactly as one that arrived on time.
 - Correcting past charges is re-pricing: it appends adjustments and never

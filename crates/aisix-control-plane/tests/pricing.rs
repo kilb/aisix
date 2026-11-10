@@ -16,10 +16,9 @@ use std::sync::Arc;
 use aisix_control_plane::audit::Actor;
 use aisix_control_plane::auth::{MemberRole, OperatorRole};
 use aisix_control_plane::error::ApiError;
-use aisix_control_plane::pricing::store::{
-    self, CostRevision, DiscountRevision, NewCostPrice, NewDiscount,
-};
-use aisix_pricing::{Catalogue, RateCard, ENGINE_VERSION};
+use aisix_control_plane::pricing::cost_rates::{self, CostRateRevision, NewCostRate};
+use aisix_control_plane::pricing::store::{self, DiscountRevision, NewDiscount};
+use aisix_pricing::{Catalogue, CnyPerUsd, RateCard, ENGINE_VERSION};
 use chrono::{DateTime, TimeDelta, Utc};
 use futures::FutureExt;
 use serde_json::{json, Value};
@@ -80,9 +79,16 @@ async fn send_if_match(
         .as_u16()
 }
 
-async fn insert_cost(cp: &TestCp, row: NewCostPrice) -> Result<CostRevision, ApiError> {
+async fn insert_cost_rate(cp: &TestCp, row: NewCostRate) -> Result<CostRateRevision, ApiError> {
     cp.db()
-        .tx(move |c| async move { store::insert_cost_price(c, &row, Actor::System).await }.boxed())
+        .tx(move |c| {
+            async move {
+                cost_rates::insert_cost_rate(c, &row, Actor::System)
+                    .await
+                    .map(|(revision, _)| revision)
+            }
+            .boxed()
+        })
         .await
 }
 
@@ -701,38 +707,35 @@ async fn every_price_write_is_audited_in_its_transaction() {
 }
 
 #[tokio::test]
-async fn cost_prices_and_discounts_follow_the_same_rules() {
+async fn cost_rates_and_discounts_follow_the_same_rules() {
     let Some(w) = world().await else { return };
+    let account = seed_provider_key(&w.cp, &w.admin).await;
     let version = pricing_version(&w.cp).await;
     let now = db_now(&w.cp).await;
-    let cost = |effective_from: DateTime<Utc>, card: RateCard| NewCostPrice {
-        upstream_provider: "openai".to_string(),
-        upstream_model: "gpt-4o-mini".to_string(),
-        provider_key_id: None,
+    let cost = |effective_from: DateTime<Utc>, rate: Option<&str>| NewCostRate {
+        provider_key_id: account,
+        model_id: None,
         effective_from,
-        card,
-        source: "manual".to_string(),
+        cny_per_usd: rate.map(|r| CnyPerUsd::parse(r).expect("a rate")),
+        note: String::new(),
     };
-    let no_default: RateCard = serde_json::from_value(json!({
-        "flex": {"base": {"input": "1", "output": "2"}}
-    }))
-    .expect("decodes");
     assert_refused_at(
-        &insert_cost(&w.cp, cost(now, no_default))
+        &insert_cost_rate(&w.cp, cost(now, None))
             .await
-            .expect_err("bad card"),
-        "/card",
+            .expect_err("a default with no rate"),
+        "/cny_per_usd",
     );
     assert_refused_at(
-        &insert_cost(&w.cp, cost(now - TimeDelta::minutes(1), card()))
+        &insert_cost_rate(&w.cp, cost(now - TimeDelta::minutes(1), Some("0.3")))
             .await
             .expect_err("in the past"),
         "/effective_from",
     );
-    let rev = insert_cost(&w.cp, cost(now, card()))
+    let rev = insert_cost_rate(&w.cp, cost(now, Some("0.3")))
         .await
-        .expect("a cost price");
+        .expect("a cost rate");
     assert_eq!(rev.engine_version, i64::from(ENGINE_VERSION));
+    assert_eq!(rev.cny_per_usd.as_deref(), Some("0.3"));
 
     let discount =
         |tenant_id: Uuid, effective_from: DateTime<Utc>, discount_bps: u16| NewDiscount {
@@ -769,14 +772,10 @@ async fn cost_prices_and_discounts_follow_the_same_rules() {
         .iter()
         .map(|(action, kind, _, tenant, _)| (action.as_str(), kind.as_str(), *tenant))
         .collect();
-    // Spelled out of parts: the workspace's price-field census
-    // (`no_one_reads_a_models_price_off_the_field`) reads any `.` + `cost`
-    // in a test as a field read, string literals included.
-    let cost_create = format!("pricing.{}.create", "cost");
     assert_eq!(
         actions,
         vec![
-            (cost_create.as_str(), "pricing_cost_revision", None),
+            ("pricing.cost_rate.create", "pricing_cost_rate", None),
             (
                 "pricing.discount.create",
                 "pricing_discount_revision",
@@ -785,7 +784,7 @@ async fn cost_prices_and_discounts_follow_the_same_rules() {
         ]
     );
     assert_eq!(pricing_version(&w.cp).await, version + 2);
-    assert_eq!(w.cp.count("pricing_cost_revisions").await, 1);
+    assert_eq!(w.cp.count("pricing_cost_rates").await, 1);
     assert_eq!(w.cp.count("pricing_discount_revisions").await, 1);
 }
 
@@ -1311,21 +1310,21 @@ async fn an_operator_sets_a_baseline_and_a_viewer_reads_it() {
 async fn a_price_write_that_is_not_json_is_415_and_writes_nothing() {
     let Some(w) = world().await else { return };
     let model = seed_model(&w.cp, &w.admin).await;
+    let account = seed_provider_key(&w.cp, &w.admin).await;
     let now = db_now(&w.cp).await;
     let version = pricing_version(&w.cp).await;
     let audits = w.cp.count("audit_log").await;
     let writes = [
         (
-            "/admin/pricing/baselines",
+            "/admin/pricing/baselines".to_string(),
             json!({"model_id": model, "effective_from": now, "card": card(), "note": "x"}),
         ),
         (
-            "/admin/pricing/cost",
-            json!({"upstream_provider": "openai", "upstream_model": "gpt-4o-mini",
-                   "effective_from": now, "card": card()}),
+            format!("/admin/provider-keys/{account}/cost-rates"),
+            json!({"model_id": null, "cny_per_usd": "0.3", "effective_from": now}),
         ),
         (
-            "/admin/pricing/discounts",
+            "/admin/pricing/discounts".to_string(),
             json!({"tenant_id": w.tenant, "effective_from": now, "discount_bps": 2000}),
         ),
     ];
@@ -1335,7 +1334,7 @@ async fn a_price_write_that_is_not_json_is_415_and_writes_nothing() {
             let r =
                 w.cp.send_raw(
                     "POST",
-                    path,
+                    &path,
                     Some(w.admin.cookie()),
                     content_type,
                     Some(bytes.clone()),
@@ -1350,7 +1349,7 @@ async fn a_price_write_that_is_not_json_is_415_and_writes_nothing() {
     }
     for table in [
         "pricing_baselines",
-        "pricing_cost_revisions",
+        "pricing_cost_rates",
         "pricing_discount_revisions",
     ] {
         assert_eq!(w.cp.count(table).await, 0, "{table}");
@@ -1363,6 +1362,7 @@ async fn a_price_write_that_is_not_json_is_415_and_writes_nothing() {
 async fn a_bad_price_is_422_with_the_field_path() {
     let Some(w) = world().await else { return };
     let model = seed_model(&w.cp, &w.admin).await;
+    let account = seed_provider_key(&w.cp, &w.admin).await;
     let now = db_now(&w.cp).await;
     let audits = w.cp.count("audit_log").await;
     let version = pricing_version(&w.cp).await;
@@ -1478,23 +1478,42 @@ async fn a_bad_price_is_422_with_the_field_path() {
         &rate(json!({"model_id": null, "cny_per_usd": null, "effective_from": now})).await,
         "/cny_per_usd",
     );
-    let cost = |body: Value| as_op(&w.cp, &w.admin, "POST", "/admin/pricing/cost", Some(body));
-    let upstream = |card: Value| json!({"upstream_provider": "openai", "upstream_model": "gpt-4o-mini", "effective_from": now, "card": card});
-    assert_422_at(&cost(upstream(Value::Null)).await, "/card");
-    assert_422_at(&cost(upstream(no_default.clone())).await, "/card");
+    // A cost rate is a rate like a group's: the same bounds, and an
+    // account's default row must carry one.
+    let cost_path = format!("/admin/provider-keys/{account}/cost-rates");
+    let cost = |body: Value| as_op(&w.cp, &w.admin, "POST", &cost_path, Some(body));
+    for bad in [
+        json!("-1"),
+        json!("100.0001"),
+        json!("1.00001"),
+        json!("abc"),
+        json!(0.3),
+    ] {
+        assert_422_at(
+            &cost(json!({"model_id": null, "cny_per_usd": bad, "effective_from": now})).await,
+            "/cny_per_usd",
+        );
+    }
     assert_422_at(
-        &cost(json!({"upstream_provider": "", "upstream_model": "gpt-4o-mini", "effective_from": now, "card": card()})).await,
-        "/upstream_provider",
+        &cost(json!({"model_id": null, "cny_per_usd": null, "effective_from": now})).await,
+        "/cny_per_usd",
     );
     assert_422_at(
-        &cost(json!({"upstream_provider": "openai", "upstream_model": "", "effective_from": now, "card": card()})).await,
-        "/upstream_model",
+        &cost(json!({"model_id": null, "cny_per_usd": "0.3",
+                     "effective_from": now - TimeDelta::hours(1)}))
+        .await,
+        "/effective_from",
+    );
+    assert_422_at(
+        &cost(json!({"model_id": Uuid::new_v4(), "cny_per_usd": "0.3", "effective_from": now}))
+            .await,
+        "/model_id",
     );
 
     // Nothing reached a table.
     for table in [
         "pricing_baselines",
-        "pricing_cost_revisions",
+        "pricing_cost_rates",
         "pricing_discount_revisions",
     ] {
         assert_eq!(w.cp.count(table).await, 0, "{table}");
@@ -1760,42 +1779,80 @@ async fn the_charge_status_filter_has_its_own_index() {
     );
 }
 
+/// A per-dimension cost card written before cost became a rate, by raw SQL
+/// as the retired route wrote it; its revision id.
+async fn legacy_cost_card(cp: &TestCp, model: &str, key: Option<Uuid>) -> i64 {
+    sqlx::query_scalar(
+        "INSERT INTO pricing_cost_revisions \
+         (engine_version, upstream_provider, upstream_model, provider_key_id, effective_from, \
+          card, source) \
+         VALUES ($1, 'openai', $2, $3, now(), $4, 'manual') RETURNING revision_id",
+    )
+    .bind(i64::from(ENGINE_VERSION))
+    .bind(model)
+    .bind(key)
+    .bind(serde_json::to_value(card()).expect("a card"))
+    .fetch_one(cp.db().pool())
+    .await
+    .expect("write a legacy cost card")
+}
+
+/// The cost cards are history: they are still listed, nothing writes one,
+/// and none of them costs a row.
 #[tokio::test]
-async fn cost_prices_and_discounts_are_written_and_listed() {
+async fn the_retired_cost_cards_are_listed_and_never_written_or_read() {
     let Some(w) = world().await else { return };
     let viewer = w.cp.admin_login_seeded(OperatorRole::Viewer).await;
-    let other_tenant = seed_tenant(&w.cp, &w.admin).await;
     let key_id = seed_provider_key(&w.cp, &w.admin).await;
-    let wr = &w;
-    let post = move |path: &'static str, body: Value| async move {
-        let r = as_op(&wr.cp, &wr.admin, "POST", path, Some(body)).await;
-        assert_eq!(r.status, 201, "POST {path}: {r:?}");
-        r.body
-    };
+    let g = legacy_cost_card(&w.cp, "gpt-4o-mini", None).await;
+    let k = legacy_cost_card(&w.cp, "gpt-4o-mini", Some(key_id)).await;
+    legacy_cost_card(&w.cp, "gpt-4o", None).await;
+
+    // The write route is gone: a POST finds no route (the method is not
+    // allowed, answered as every unknown route is) and writes nothing.
     let now = db_now(&w.cp).await;
-    let general = post(
+    let r = as_op(
+        &w.cp,
+        &w.admin,
+        "POST",
         "/admin/pricing/cost",
-        json!({"upstream_provider": "openai", "upstream_model": "gpt-4o-mini", "effective_from": now, "card": card()}),
+        Some(
+            json!({"upstream_provider": "openai", "upstream_model": "gpt-4o-mini",
+                    "effective_from": now, "card": card()}),
+        ),
     )
     .await;
     assert_eq!(
-        (
-            general["source"].clone(),
-            general["provider_key_id"].clone(),
-            general["created_by"].clone()
-        ),
-        (json!("manual"), Value::Null, json!(w.admin.id))
+        (r.status, r.header("allow")),
+        (404, Some("GET,HEAD")),
+        "{r:?}"
     );
-    let keyed = post(
-        "/admin/pricing/cost",
-        json!({"upstream_provider": "openai", "upstream_model": "gpt-4o-mini", "provider_key_id": key_id, "effective_from": now, "card": card()}),
+    assert_eq!(w.cp.count("pricing_cost_revisions").await, 3);
+
+    // A row the cards match exactly, served through the keyed card's
+    // account: no CNY cost, since cost is now a rate and the account has
+    // none, and no USD cost, since the cards are not read.
+    let model = seed_model(&w.cp, &w.admin).await;
+    price(&w.cp, model).await;
+    let mut row = usage(&w, "legacy-1", model, tokens_680());
+    row["provider_key_id"] = json!(key_id);
+    row["upstream_provider"] = json!("openai");
+    row["upstream_model"] = json!("gpt-4o-mini");
+    let r = deliver(&w.dp, Uuid::new_v4(), vec![row]).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let costs: (Option<i64>, Option<i64>, Option<Value>) = sqlx::query_as(
+        "SELECT cost_micro_cny, cost_micro_usd, cost_source FROM pricing_charges_cny \
+         WHERE event_id = 'legacy-1'",
     )
-    .await;
-    post(
-        "/admin/pricing/cost",
-        json!({"upstream_provider": "openai", "upstream_model": "gpt-4o", "effective_from": now, "card": card()}),
-    )
-    .await;
+    .fetch_one(w.cp.db().pool())
+    .await
+    .expect("read the charge");
+    assert_eq!(costs, (None, None, None));
+    assert_eq!(
+        charge_of(&w.cp, "legacy-1").await,
+        Some(Charge::charged(&w, 680))
+    );
+
     let ids = |r: &Resp| -> Vec<i64> {
         r.body["items"]
             .as_array()
@@ -1813,10 +1870,6 @@ async fn cost_prices_and_discounts_are_written_and_listed() {
     )
     .await;
     assert_eq!(r.status, 200, "{r:?}");
-    let (g, k) = (
-        general["revision_id"].as_i64().expect("an id"),
-        keyed["revision_id"].as_i64().expect("an id"),
-    );
     assert_eq!(ids(&r), vec![k, g], "newest first: {r:?}");
     let r = as_op(
         &w.cp,
@@ -1830,7 +1883,19 @@ async fn cost_prices_and_discounts_are_written_and_listed() {
     let r = as_op(&w.cp, &viewer, "GET", "/admin/pricing/cost?limit=1", None).await;
     assert_eq!(r.body["items"].as_array().map(Vec::len), Some(1));
     assert!(r.body["next_before"].as_i64().is_some(), "{r:?}");
+}
 
+#[tokio::test]
+async fn discounts_are_written_and_listed() {
+    let Some(w) = world().await else { return };
+    let viewer = w.cp.admin_login_seeded(OperatorRole::Viewer).await;
+    let other_tenant = seed_tenant(&w.cp, &w.admin).await;
+    let wr = &w;
+    let post = move |path: &'static str, body: Value| async move {
+        let r = as_op(&wr.cp, &wr.admin, "POST", path, Some(body)).await;
+        assert_eq!(r.status, 201, "POST {path}: {r:?}");
+        r.body
+    };
     let mine = post(
         "/admin/pricing/discounts",
         json!({"tenant_id": w.tenant, "effective_from": db_now(&w.cp).await, "discount_bps": 2000}),
@@ -1862,143 +1927,6 @@ async fn cost_prices_and_discounts_are_written_and_listed() {
     )
     .await;
     assert_422_at(&r, "query");
-}
-
-/// A cost price for one provider key must name a key that exists: a
-/// revision for any other would never apply.
-#[tokio::test]
-async fn a_cost_price_names_a_live_provider_key() {
-    let Some(w) = world().await else { return };
-    let now = db_now(&w.cp).await;
-    let cost = |key: Uuid| {
-        json!({
-            "upstream_provider": "openai",
-            "upstream_model": "gpt-4o-mini",
-            "provider_key_id": key,
-            "effective_from": now,
-            "card": card(),
-        })
-    };
-    let r = as_op(
-        &w.cp,
-        &w.admin,
-        "POST",
-        "/admin/pricing/cost",
-        Some(cost(Uuid::new_v4())),
-    )
-    .await;
-    assert_422_at(&r, "/provider_key_id");
-
-    let deleted = seed_provider_key(&w.cp, &w.admin).await;
-    let version: i64 = sqlx::query_scalar(
-        "SELECT version FROM gw_resources WHERE kind = 'provider_keys' AND id = $1",
-    )
-    .bind(deleted)
-    .fetch_one(w.cp.db().pool())
-    .await
-    .expect("read the key's version");
-    let status = send_if_match(
-        &w.cp,
-        &w.admin,
-        "DELETE",
-        &format!("/admin/resources/provider_keys/{deleted}"),
-        version,
-    )
-    .await;
-    assert_eq!(status, 200, "delete the provider key");
-    let r = as_op(
-        &w.cp,
-        &w.admin,
-        "POST",
-        "/admin/pricing/cost",
-        Some(cost(deleted)),
-    )
-    .await;
-    assert_422_at(&r, "/provider_key_id");
-    assert_eq!(w.cp.count("pricing_cost_revisions").await, 0);
-
-    let live = seed_provider_key(&w.cp, &w.admin).await;
-    let r = as_op(
-        &w.cp,
-        &w.admin,
-        "POST",
-        "/admin/pricing/cost",
-        Some(cost(live)),
-    )
-    .await;
-    assert_eq!(r.status, 201, "{r:?}");
-    assert_eq!(r.body["provider_key_id"], json!(live));
-}
-
-/// A provider or model with spaces around it matches no usage: it is `422`
-/// at its field, and nothing is written.
-#[tokio::test]
-async fn a_cost_price_with_spaces_around_the_upstream_is_refused() {
-    let Some(w) = world().await else { return };
-    let now = db_now(&w.cp).await;
-    for (field, provider, model) in [
-        ("/upstream_provider", " openai", "gpt-4o-mini"),
-        ("/upstream_model", "openai", "gpt-4o-mini\n"),
-    ] {
-        let r = as_op(
-            &w.cp,
-            &w.admin,
-            "POST",
-            "/admin/pricing/cost",
-            Some(json!({"upstream_provider": provider, "upstream_model": model, "effective_from": now, "card": card()})),
-        )
-        .await;
-        assert_422_at(&r, field);
-    }
-    assert_eq!(w.cp.count("pricing_cost_revisions").await, 0);
-}
-
-/// A cost revision no usage can match is written, with a
-/// `no_matching_upstream` warning; one that names a live model's provider
-/// and name, and a key of that provider, has none.
-#[tokio::test]
-async fn a_cost_price_that_can_never_apply_says_so() {
-    let Some(w) = world().await else { return };
-    let _model = seed_model(&w.cp, &w.admin).await; // openai / gpt-4o-mini
-    let key = seed_provider_key(&w.cp, &w.admin).await; // an openai key
-    let wr = &w;
-    let post = move |provider: &'static str, model: &'static str, key: Option<Uuid>| async move {
-        let now = db_now(&wr.cp).await;
-        let mut body = json!({"upstream_provider": provider, "upstream_model": model, "effective_from": now, "card": card()});
-        if let Some(key) = key {
-            body["provider_key_id"] = json!(key);
-        }
-        let r = as_op(&wr.cp, &wr.admin, "POST", "/admin/pricing/cost", Some(body)).await;
-        assert_eq!(r.status, 201, "{r:?}");
-        r.body["warnings"].clone()
-    };
-    let codes = |w: &Value| -> Vec<Value> {
-        w.as_array()
-            .expect("warnings")
-            .iter()
-            .map(|x| x["code"].clone())
-            .collect()
-    };
-    let none = json!(["no_matching_upstream"]);
-    // The pair a live model has, alone and through a key of that provider.
-    assert_eq!(post("openai", "gpt-4o-mini", None).await, json!([]));
-    assert_eq!(post("openai", "gpt-4o-mini", Some(key)).await, json!([]));
-    // A pair no model has (the case differs too).
-    assert_eq!(
-        json!(codes(&post("openai", "GPT-4o-mini", None).await)),
-        none
-    );
-    assert_eq!(
-        json!(codes(&post("openai", "gpt-5-nope", None).await)),
-        none
-    );
-    // A key of another provider than the revision's.
-    assert_eq!(
-        json!(codes(&post("anthropic", "gpt-4o-mini", Some(key)).await)),
-        json!(["no_matching_upstream", "no_matching_upstream"])
-    );
-    // Every one was still written.
-    assert_eq!(w.cp.count("pricing_cost_revisions").await, 5);
 }
 
 /// A catalogue whose `openai/fixture-7c1` announces two price changes far

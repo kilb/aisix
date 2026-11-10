@@ -28,7 +28,7 @@ export const REASONS: Record<string, string> = {
 
 export const reasonLabel = (code: string): string => REASONS[code] ?? code;
 
-const TABLES: Record<string, string> = { baseline: "基准价", rate: "分组换算率", cost: "成本", discount: "折扣" };
+const TABLES: Record<string, string> = { baseline: "基准价", rate: "分组换算率", cost: "成本换算率", discount: "折扣" };
 
 /** What 计价状态 and the Overview card show, derived once from the response. */
 export function statusView(s: PricingStatus) {

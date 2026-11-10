@@ -24,40 +24,54 @@ import { TwoStep } from "../../ui/TwoStep";
 import { useToast } from "../../ui/Toast";
 import "./Groups.css";
 
-/** How far back the realised rate is measured. */
-const REALISED_DAYS = 30;
+/** How far back the margin is measured. */
+const MARGIN_DAYS = 30;
 
 /** A rate typed by a person that buys nothing: `0`, however it is written. An empty field is not a rate at all. */
-function isZeroRate(text: string): boolean {
+export function isZeroRate(text: string): boolean {
   const typed = text.trim();
   return typed !== "" && /^0*(\.0*)?$/.test(typed);
 }
 
 /**
- * The 30-day realised rate, and beside it the part of the charge it leaves
- * out: rows whose cost is not known count in no ratio, so their charge is
- * named apart rather than hidden.
+ * The 30-day margin: the profit as a share of the charge whose cost is
+ * known, the charge, cost and profit it is measured on, and beside them the
+ * part of the charge whose cost is not known, named apart rather than
+ * hidden. Every figure is the API's own; nothing here is computed.
  */
-function RealisedRate({ row }: { row: MarginRow | undefined }) {
+function MarginCell({ row }: { row: MarginRow | undefined }) {
+  if (row === undefined) return <>—</>;
   return (
     <>
-      {row?.realised_cny_per_usd ?? "—"}
-      {row !== undefined && row.rows_without_cost > 0 && (
+      {row.margin_pct === null ? "—" : `${row.margin_pct}%`}
+      {row.rows > 0 && (
         <span className="cell-note">
-          另有 {row.rows_without_cost} 笔无成本，计 {fmtMicroCny(row.charged_without_cost_micro_cny)}
+          售价 {fmtMicroCny(row.charged_with_cost_micro_cny)}，成本 {fmtMicroCny(row.cost_micro_cny)}，利润{" "}
+          {fmtMicroCny(row.profit_micro_cny)}
+        </span>
+      )}
+      {row.rows_without_cost > 0 && (
+        <span className="cell-note">
+          另有 {row.rows_without_cost} 笔成本未知，计 {fmtMicroCny(row.charged_without_cost_micro_cny)}
         </span>
       )}
     </>
   );
 }
 
+/** What the helpers below read of a plan: a group's rate plan, or an account's cost-rate plan. */
+type Plan = {
+  current: { cny_per_usd: string | null } | null;
+  upcoming: { effective_from: string; cny_per_usd: string | null }[];
+};
+
 /** A plan's scheduled revisions, as their starts and what takes effect then. */
-function scheduledWords(plan: RatePlan, word: string): string {
+export function scheduledWords(plan: Plan, word: string): string {
   return plan.upcoming.map((r) => `${fmtUtc(r.effective_from)} 起${word} ${r.cny_per_usd ?? "结束覆盖"}`).join("、");
 }
 
-/** The rate a row shows: the model's override while one is in force, else the group's default. */
-function inForce(model: RatePlan, group: RatePlan): { label: string; rate: string | null } {
+/** The rate a row shows: the model's override while one is in force, else the default. */
+export function inForce(model: Plan, group: Plan): { label: string; rate: string | null } {
   const override = model.current?.cny_per_usd;
   if (override !== null && override !== undefined) return { label: "覆盖", rate: override };
   // An override whose current revision ends it, and no override at all, both
@@ -68,7 +82,7 @@ function inForce(model: RatePlan, group: RatePlan): { label: string; rate: strin
 /**
  * One group's per-model rates: its official baseline in USD, the rate that
  * applies (the model's own override, else the group's default), the ¥/M that
- * follows, and the rate the group actually realised over the last 30 days.
+ * follows, and the margin the group made on it over the last 30 days.
  *
  * Every ¥ figure is the API's own decimal string. Nothing here recomputes one:
  * the control plane owns the arithmetic, and a second implementation on this
@@ -87,23 +101,23 @@ export function GroupDetail({
 }) {
   const [rates, setRates] = useState<GroupRates | null>(null);
   const [prices, setPrices] = useState<Map<string, ModelGroupPriceRow>>(new Map());
-  /** Each model's 30-day margin row: the realised rate, and the charge it leaves out for want of a cost. */
-  const [realised, setRealised] = useState<Map<string, MarginRow>>(new Map());
+  /** Each model's 30-day margin row: its profit and margin, and the charge they leave out for want of a cost. */
+  const [margins, setMargins] = useState<Map<string, MarginRow>>(new Map());
   const [error, setError] = useState<string | null>(null);
   const [picked, setPicked] = useState<{ modelId: string; name: string; mode: "override" | "end" } | null>(null);
 
   const load = useCallback(async () => {
     const to = new Date();
-    const from = new Date(to.getTime() - REALISED_DAYS * 86_400_000);
+    const from = new Date(to.getTime() - MARGIN_DAYS * 86_400_000);
     try {
-      const [plans, all, margins] = await Promise.all([
+      const [plans, all, rows] = await Promise.all([
         groups.rates(group.id),
         groupPrices.list(),
         margin.list({ from: from.toISOString(), to: to.toISOString(), group_id: group.id }),
       ]);
       setRates(plans);
       setPrices(new Map(all.map((row) => [row.model_id, row])));
-      setRealised(new Map(margins.filter((m) => m.model.id !== null).map((m) => [m.model.id as string, m])));
+      setMargins(new Map(rows.filter((m) => m.model.id !== null).map((m) => [m.model.id as string, m])));
       setError(null);
     } catch (e) {
       setError(errorText(e));
@@ -170,7 +184,7 @@ export function GroupDetail({
               <th>换算率</th>
               <th className="num">¥/百万 输入</th>
               <th className="num">¥/百万 输出</th>
-              <th className="num">实际换算率（30 天）</th>
+              <th className="num">毛利（30 天）</th>
               <th className="right">操作</th>
             </tr>
           </thead>
@@ -205,7 +219,7 @@ export function GroupDetail({
                     {price?.output_per_million_cny === undefined ? "—" : fmtCnyPerMillion(price.output_per_million_cny)}
                   </td>
                   <td className="num tabular">
-                    <RealisedRate row={realised.get(row.model_id)} />
+                    <MarginCell row={margins.get(row.model_id)} />
                   </td>
                   <td className="right">
                     {canEdit && (

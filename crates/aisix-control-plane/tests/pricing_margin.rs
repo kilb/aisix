@@ -1,23 +1,29 @@
 //! The operators' margin view: what each (group, model) charged in a period
-//! against what the upstream cost, and the realised rate between them
-//! (`GET /admin/pricing/margin`), plus the same rate on each row of the
+//! against what its upstream accounts cost, profit and margin between them,
+//! all in CNY (`GET /admin/pricing/margin`), plus the cost on each row of the
 //! charge listing.
 //!
-//! Cost is what the platform pays, in USD; a charge is what a tenant pays, in
-//! CNY. The realised rate is CNY charged per USD of cost — no exchange rate
-//! is stored, and none is applied here.
+//! A charge is a baseline times a group rate; a cost is the same baseline
+//! lines times the serving account's cost rate. Both are micro-CNY, so
+//! profit is a subtraction and the margin a percentage of the charge.
 //!
 //! Usage arrives over `POST /dp/telemetry` exactly as a gateway sends it. A
-//! row's cost is known only when the row names the upstream that served it
-//! (`upstream_provider`, `upstream_model`) and a cost price covers that pair;
-//! a row that names neither is counted apart, never priced at a guessed cost.
+//! row's cost is known only when the row names the account that served it
+//! (`provider_key_id`) and that account has a cost rate in force; a row that
+//! names none is counted apart, never costed at a guess.
+//!
+//! Every expected figure is worked from the test's own rates: 1000 prompt
+//! tokens at `card()`'s input of 1 USD per million are 1000 µ$ of baseline,
+//! so 7200 µ¥ charged at a group rate of 7.2 and 300 µ¥ of cost at an
+//! account rate of 0.3: 6900 µ¥ of profit, a margin of 95.83 %.
 
 mod support;
 
 use aisix_control_plane::audit::Actor;
 use aisix_control_plane::auth::OperatorRole;
-use aisix_control_plane::pricing::margin::realised;
-use aisix_control_plane::pricing::store::{self, NewCostPrice};
+use aisix_control_plane::pricing::cost_rates::{self, NewCostRate};
+use aisix_control_plane::pricing::margin::margin_pct;
+use aisix_pricing::CnyPerUsd;
 use chrono::{DateTime, TimeDelta, Utc};
 use futures::FutureExt;
 use serde_json::{json, Value};
@@ -27,57 +33,62 @@ use support::world::{
 use support::{OperatorSession, Resp, TestCp};
 use uuid::Uuid;
 
-/// The upstream model a seeded model reaches, and the name a cost price must
-/// match.
-const UPSTREAM_MODEL: &str = "gpt-4o-mini";
-const UPSTREAM_PROVIDER: &str = "openai";
-
 /// The group rate the margin tests charge at: 7.2 CNY per USD.
 const RATE: &str = "7.2";
 
-/// [`RATE`] as the margin view shows it: four decimal places.
-const REALISED_7_2: &str = "7.2000";
+/// The cost rate of the account that serves the margin tests' rows.
+const COST_RATE: &str = "0.3";
+
+/// 7200 µ¥ charged against 300 µ¥ of cost: 6900 / 7200, to two places.
+const MARGIN_95_83: &str = "95.83";
 
 /// 1000 prompt tokens as the baseline prices them, at `card()`'s input of
-/// 1 USD per million: 1000 µ$ of cost, and 1000 × 1 × 7.2 = 7200 µ¥ of
-/// charge, so the realised rate is exactly 7.2.
+/// 1 USD per million: 1000 µ$ of baseline, 7200 µ¥ of charge at 7.2 and
+/// 300 µ¥ of cost at 0.3.
 fn tokens_1000() -> Value {
     json!({"prompt_tokens": 1000, "completion_tokens": 0})
 }
 
-/// `usage` with the channel the row was served by, which is what makes its
-/// cost knowable.
-fn served(w: &World, event_id: &str, model: Uuid, fields: Value) -> Value {
+/// `usage` served through `account`, which is what makes its cost knowable.
+fn served(w: &World, event_id: &str, model: Uuid, account: Uuid, fields: Value) -> Value {
     let mut event = usage(w, event_id, model, fields);
-    event["upstream_provider"] = json!(UPSTREAM_PROVIDER);
-    event["upstream_model"] = json!(UPSTREAM_MODEL);
+    event["provider_key_id"] = json!(account);
     event
 }
 
-/// A cost price of `input` USD per million input tokens for the upstream the
-/// seeded models reach, starting now.
-async fn cost(cp: &TestCp, input: &str) {
+/// `account`'s default cost rate of `cny_per_usd`, starting now, written by
+/// the control plane's own path.
+async fn account_rate(cp: &TestCp, account: Uuid, cny_per_usd: &str) {
     let now = db_now(cp).await;
-    let row = NewCostPrice {
-        upstream_provider: UPSTREAM_PROVIDER.to_string(),
-        upstream_model: UPSTREAM_MODEL.to_string(),
-        provider_key_id: None,
+    let row = NewCostRate {
+        provider_key_id: account,
+        model_id: None,
         effective_from: now,
-        card: serde_json::from_value(json!({
-            "default": {"base": {"input": input, "output": "2"}}
-        }))
-        .expect("a cost card"),
-        source: "manual".to_string(),
+        cny_per_usd: Some(CnyPerUsd::parse(cny_per_usd).expect("a rate")),
+        note: "the margin test's cost rate".to_string(),
     };
     cp.db()
-        .tx(move |c| async move { store::insert_cost_price(c, &row, Actor::System).await }.boxed())
+        .tx(move |c| {
+            async move {
+                cost_rates::insert_cost_rate(c, &row, Actor::System)
+                    .await
+                    .map(|(revision, _)| revision)
+            }
+            .boxed()
+        })
         .await
-        .expect("a cost price");
+        .expect("a cost rate");
+}
+
+/// An upstream account with a default cost rate of [`COST_RATE`].
+async fn costed_account(w: &World) -> Uuid {
+    let account = seed_provider_key(&w.cp, &w.admin).await;
+    account_rate(&w.cp, account, COST_RATE).await;
+    account
 }
 
 /// The world's baseline (`card()`) and a group rate of [`RATE`], both
-/// starting now: a model priced here charges 7.2 µ¥ per µ$ the upstream
-/// costs.
+/// starting now: a model priced here charges 7.2 µ¥ per µ$ of baseline.
 async fn price_at_rate(cp: &TestCp, model: Uuid) {
     let now = db_now(cp).await;
     let group = support::world::group_id(cp, support::world::SHARED_GROUP).await;
@@ -148,12 +159,12 @@ fn uuid(v: &Value, pointer: &str) -> Uuid {
 }
 
 #[tokio::test]
-async fn the_realised_rate_is_cny_charged_per_usd_of_cost() {
+async fn the_margin_is_the_charge_less_the_cost_in_cny() {
     let Some(w) = world().await else { return };
     let model = seed_model(&w.cp, &w.admin).await;
     price_at_rate(&w.cp, model).await;
-    cost(&w.cp, "1").await;
-    send(&w, vec![served(&w, "m1", model, tokens_1000())]).await;
+    let account = costed_account(&w).await;
+    send(&w, vec![served(&w, "m1", model, account, tokens_1000())]).await;
 
     let item = one(&margin(&w.cp, &w.admin, "").await);
     assert_eq!(
@@ -164,12 +175,15 @@ async fn the_realised_rate_is_cny_charged_per_usd_of_cost() {
     assert_eq!(item["group"]["display_name"], "通用分组");
     assert_eq!(uuid(&item, "/model/id"), model);
     assert_eq!(item["charged_micro_cny"], 7_200);
-    assert_eq!(item["cost_micro_usd"], 1_000);
-    // Four decimal places: the configured rate is 7.2, the realised one is
-    // shown at the view's own scale.
-    assert_eq!(item["realised_cny_per_usd"], "7.2000");
+    assert_eq!(item["charged_with_cost_micro_cny"], 7_200);
+    assert_eq!(item["cost_micro_cny"], 300);
+    assert_eq!(item["profit_micro_cny"], 6_900);
+    assert_eq!(item["margin_pct"], MARGIN_95_83);
     assert_eq!(item["rows"], 1);
     assert_eq!(item["rows_without_cost"], 0);
+    // The USD figures are gone, not zeroed.
+    assert_eq!(item.get("cost_micro_usd"), None, "{item}");
+    assert_eq!(item.get("realised_cny_per_usd"), None, "{item}");
 }
 
 #[tokio::test]
@@ -177,54 +191,95 @@ async fn rows_without_a_cost_are_counted_apart() {
     let Some(w) = world().await else { return };
     let model = seed_model(&w.cp, &w.admin).await;
     price_at_rate(&w.cp, model).await;
-    cost(&w.cp, "1").await;
+    let account = costed_account(&w).await;
+    let uncosted = seed_provider_key(&w.cp, &w.admin).await;
     send(
         &w,
         vec![
-            served(&w, "m1", model, tokens_1000()),
-            // Names no upstream, so nothing says what it cost. Its charge
-            // still happened; its amount must not enter either side of the
-            // rate.
+            served(&w, "m1", model, account, tokens_1000()),
+            // Names no account, so nothing says what it cost. Its charge
+            // still happened; its amount must not enter the profit.
             usage(&w, "m2", model, tokens_1000()),
+            // Served by an account with no cost rate: unknown too, not 0.
+            served(&w, "m3", model, uncosted, tokens_1000()),
         ],
     )
     .await;
 
     let item = one(&margin(&w.cp, &w.admin, "").await);
-    // Both rows' money is reported: the second row was charged too, and
-    // charging it is not made not to have happened by its cost being
-    // unknown.
-    assert_eq!(item["charged_micro_cny"], 14_400, "{item}");
-    // But the rate divides the costed half by the cost the costed half
-    // carries: 7200 µ¥ over 1000 µ$ is 7.2, and a rate diluted into 14.4
-    // would not be a check of anything.
+    // Every row's money is reported: the uncosted rows were charged too,
+    // and charging them is not made not to have happened by their cost
+    // being unknown.
+    assert_eq!(item["charged_micro_cny"], 21_600, "{item}");
+    // But the profit sets the costed third against the cost it carries:
+    // 7200 − 300. Counting the uncosted charge as profit would read 21 300.
     assert_eq!(item["charged_with_cost_micro_cny"], 7_200, "{item}");
-    assert_eq!(item["charged_without_cost_micro_cny"], 7_200, "{item}");
-    assert_eq!(item["cost_micro_usd"], 1_000, "{item}");
-    assert_eq!(item["realised_cny_per_usd"], REALISED_7_2, "{item}");
+    assert_eq!(item["charged_without_cost_micro_cny"], 14_400, "{item}");
+    assert_eq!(item["cost_micro_cny"], 300, "{item}");
+    assert_eq!(item["profit_micro_cny"], 6_900, "{item}");
+    assert_eq!(item["margin_pct"], MARGIN_95_83, "{item}");
     assert_eq!(item["rows"], 1, "{item}");
-    assert_eq!(item["rows_without_cost"], 1, "{item}");
+    assert_eq!(item["rows_without_cost"], 2, "{item}");
+    // And each uncosted charge stores no cost at all, rather than 0.
+    let costs: Vec<Option<i64>> = sqlx::query_scalar(
+        "SELECT cost_micro_cny FROM pricing_charges_cny WHERE event_id IN ('m2', 'm3') \
+         ORDER BY event_id",
+    )
+    .fetch_all(w.cp.db().pool())
+    .await
+    .expect("read the costs");
+    assert_eq!(costs, vec![None, None]);
 }
 
+/// A row that billed nothing, or that the response cache served, has no
+/// charge and never will have a cost: it is neither costed nor counted as
+/// unknown, so the unknown count is only what a cost rate could fix.
 #[tokio::test]
-async fn an_adjustment_counts_in_the_realised_rate() {
+async fn a_row_that_billed_nothing_is_not_an_unknown_cost() {
     let Some(w) = world().await else { return };
     let model = seed_model(&w.cp, &w.admin).await;
     price_at_rate(&w.cp, model).await;
-    cost(&w.cp, "1").await;
-    send(&w, vec![served(&w, "m1", model, tokens_1000())]).await;
+    let account = costed_account(&w).await;
+    let mut hit = served(&w, "h1", model, account, tokens_1000());
+    hit["cache_status"] = json!("hit");
+    send(
+        &w,
+        vec![
+            served(&w, "m1", model, account, tokens_1000()),
+            hit,
+            served(&w, "z1", model, account, json!({})),
+        ],
+    )
+    .await;
+    let item = one(&margin(&w.cp, &w.admin, "").await);
+    assert_eq!(
+        (item["rows"].as_i64(), item["rows_without_cost"].as_i64()),
+        (Some(1), Some(0)),
+        "{item}"
+    );
+    assert_eq!(item["cost_micro_cny"], 300, "{item}");
+}
+
+#[tokio::test]
+async fn an_adjustment_counts_in_the_profit() {
+    let Some(w) = world().await else { return };
+    let model = seed_model(&w.cp, &w.admin).await;
+    price_at_rate(&w.cp, model).await;
+    let account = costed_account(&w).await;
+    send(&w, vec![served(&w, "m1", model, account, tokens_1000())]).await;
     assert_eq!(
         one(&margin(&w.cp, &w.admin, "").await)["charged_micro_cny"],
         7_200
     );
 
     // A re-pricing run corrected the charge up by half: 10 800 charged
-    // against the same 1000 µ$ of cost is 10.8 CNY per USD.
+    // against the same 300 µ¥ of cost is 10 500 of profit, 97.22 %.
     adjustment(&w, "m1", 3_600).await;
     let item = one(&margin(&w.cp, &w.admin, "").await);
     assert_eq!(item["charged_micro_cny"], 10_800, "{item}");
-    assert_eq!(item["cost_micro_usd"], 1_000, "{item}");
-    assert_eq!(item["realised_cny_per_usd"], "10.8000", "{item}");
+    assert_eq!(item["cost_micro_cny"], 300, "{item}");
+    assert_eq!(item["profit_micro_cny"], 10_500, "{item}");
+    assert_eq!(item["margin_pct"], "97.22", "{item}");
     assert_eq!(item["rows"], 1, "{item}");
 }
 
@@ -303,7 +358,7 @@ async fn a_repriced_no_group_row(w: &World, event_id: &str, model: Uuid) -> i64 
     .await
     .expect("insert the unpriced charge");
     // What a run charged once the key's group was set: 7.2 for 1000 tokens at
-    // the $1/M cost card, written as an adjustment because the charge row is
+    // the $1/M baseline, written as an adjustment because the charge row is
     // append-only.
     let delta = 7_200;
     adjustment(w, event_id, delta).await;
@@ -315,7 +370,7 @@ async fn a_row_repriced_after_its_key_took_a_group_reports_under_that_group() {
     let Some(w) = world().await else { return };
     let model = seed_model(&w.cp, &w.admin).await;
     price_at_rate(&w.cp, model).await;
-    cost(&w.cp, "1").await;
+    let account = costed_account(&w).await;
     let delta = a_repriced_no_group_row(&w, "ng1", model).await;
 
     // The charge row still has no group of its own; its key has `shared`, and
@@ -337,22 +392,25 @@ async fn a_row_repriced_after_its_key_took_a_group_reports_under_that_group() {
     let item = one(&margin(&w.cp, &w.admin, "").await);
     assert_eq!(uuid(&item, "/group/id"), group.expect("a group"), "{item}");
     assert_eq!(item["charged_micro_cny"], delta, "{item}");
-    assert_eq!(item["cost_micro_usd"], 0, "{item}");
+    assert_eq!(item["cost_micro_cny"], 0, "{item}");
     assert_eq!(item["rows"], 0, "{item}");
     assert_eq!(item["rows_without_cost"], 1, "{item}");
-    // No cost, so no rate: null, not 0 and not a division by nothing.
-    assert_eq!(item["realised_cny_per_usd"], Value::Null, "{item}");
+    // No known cost, so no profit to speak of and no margin: null, not a
+    // division by nothing.
+    assert_eq!(item["profit_micro_cny"], 0, "{item}");
+    assert_eq!(item["margin_pct"], Value::Null, "{item}");
 
     // A costed charge on the same model in the same group, beside it: the
-    // item now holds both populations, and the rate divides only the costed
-    // one. Reading `charged_micro_cny` here would give 14.4 instead of 7.2.
-    send(&w, vec![served(&w, "m1", model, tokens_1000())]).await;
+    // item now holds both populations, and the profit counts only the
+    // costed one. Reading `charged_micro_cny` here would give 14 100.
+    send(&w, vec![served(&w, "m1", model, account, tokens_1000())]).await;
     let item = one(&margin(&w.cp, &w.admin, "").await);
     assert_eq!(item["charged_micro_cny"], 14_400, "{item}");
     assert_eq!(item["charged_with_cost_micro_cny"], 7_200, "{item}");
     assert_eq!(item["charged_without_cost_micro_cny"], delta, "{item}");
-    assert_eq!(item["cost_micro_usd"], 1_000, "{item}");
-    assert_eq!(item["realised_cny_per_usd"], REALISED_7_2, "{item}");
+    assert_eq!(item["cost_micro_cny"], 300, "{item}");
+    assert_eq!(item["profit_micro_cny"], 6_900, "{item}");
+    assert_eq!(item["margin_pct"], MARGIN_95_83, "{item}");
     assert_eq!(
         (item["rows"].as_i64(), item["rows_without_cost"].as_i64()),
         (Some(1), Some(1)),
@@ -365,7 +423,6 @@ async fn a_row_whose_key_names_no_group_is_its_own_item_with_a_null_group() {
     let Some(w) = world().await else { return };
     let model = seed_model(&w.cp, &w.admin).await;
     price_at_rate(&w.cp, model).await;
-    cost(&w.cp, "1").await;
     let delta = a_repriced_no_group_row(&w, "ng1", model).await;
     // A key that names no group (the one window R2 leaves open for a key an
     // older replica minted): the run bills it at nothing, so its money has
@@ -391,13 +448,13 @@ async fn the_margin_items_account_for_every_charged_row() {
     let Some(w) = world().await else { return };
     let model = seed_model(&w.cp, &w.admin).await;
     price_at_rate(&w.cp, model).await;
-    cost(&w.cp, "1").await;
+    let account = costed_account(&w).await;
     // Three kinds of row in one range: a costed charge with an adjustment, a
     // costless charge, and a repriced row whose charge names no group.
     send(
         &w,
         vec![
-            served(&w, "m1", model, tokens_1000()),
+            served(&w, "m1", model, account, tokens_1000()),
             usage(&w, "m2", model, tokens_1000()),
         ],
     )
@@ -453,15 +510,15 @@ async fn the_margin_items_account_for_every_charged_row() {
 }
 
 #[tokio::test]
-async fn each_charge_shows_its_realised_rate() {
+async fn each_charge_shows_its_cost() {
     let Some(w) = world().await else { return };
     let model = seed_model(&w.cp, &w.admin).await;
     price_at_rate(&w.cp, model).await;
-    cost(&w.cp, "1").await;
+    let account = costed_account(&w).await;
     send(
         &w,
         vec![
-            served(&w, "m1", model, tokens_1000()),
+            served(&w, "m1", model, account, tokens_1000()),
             usage(&w, "m2", model, tokens_1000()),
         ],
     )
@@ -484,9 +541,12 @@ async fn each_charge_shows_its_realised_rate() {
             .unwrap_or_else(|| panic!("{id} in {r:?}"))
             .clone()
     };
-    assert_eq!(row("m1")["realised_cny_per_usd"], REALISED_7_2, "{r:?}");
-    // A charge whose cost is unknown has no rate: null, never a guess.
-    assert_eq!(row("m2")["realised_cny_per_usd"], Value::Null, "{r:?}");
+    assert_eq!(row("m1")["cost_micro_cny"], 300, "{r:?}");
+    assert_eq!(row("m1")["charge_micro_cny"], 7_200, "{r:?}");
+    // A charge whose cost is unknown has none: null, never a guess.
+    assert_eq!(row("m2")["cost_micro_cny"], Value::Null, "{r:?}");
+    assert_eq!(row("m2")["charge_micro_cny"], 7_200, "{r:?}");
+    assert_eq!(row("m1").get("realised_cny_per_usd"), None, "{r:?}");
 }
 
 #[tokio::test]
@@ -494,7 +554,7 @@ async fn a_deleted_model_is_named_null_not_empty() {
     let Some(w) = world().await else { return };
     let model = seed_model(&w.cp, &w.admin).await;
     price_at_rate(&w.cp, model).await;
-    cost(&w.cp, "1").await;
+    let account = costed_account(&w).await;
     // A model that never carried a display name, so the two cases are told
     // apart by the row's presence rather than by its text.
     sqlx::query("UPDATE gw_resources SET doc = doc - 'display_name' WHERE id = $1")
@@ -502,7 +562,7 @@ async fn a_deleted_model_is_named_null_not_empty() {
         .execute(w.cp.db().pool())
         .await
         .expect("strip the display name");
-    send(&w, vec![served(&w, "d1", model, tokens_1000())]).await;
+    send(&w, vec![served(&w, "d1", model, account, tokens_1000())]).await;
     let item = one(&margin(&w.cp, &w.admin, "").await);
     // The row is live but unnamed: `""` says "no display name", which is
     // what the model's document says.
@@ -521,33 +581,28 @@ async fn a_deleted_model_is_named_null_not_empty() {
 }
 
 #[test]
-fn the_realised_rate_rounds_half_up_to_four_places() {
-    // 7.2 is exact at any scale; 7.20005 rounds to 7.2001, not 7.2000.
-    assert_eq!(realised(7_200_000, 1_000_000).as_deref(), Some("7.2000"));
-    assert_eq!(realised(7_200_050, 1_000_000).as_deref(), Some("7.2001"));
-    assert_eq!(realised(7_200_049, 1_000_000).as_deref(), Some("7.2000"));
-    // A third of a yuan per dollar, to four places.
-    assert_eq!(realised(1, 3).as_deref(), Some("0.3333"));
-    assert_eq!(realised(2, 3).as_deref(), Some("0.6667"));
-    // No cost, or a cost of nothing, has no rate at all.
-    assert_eq!(realised(5, 0), None);
-    assert_eq!(realised(5, -1), None);
-    // A charge of nothing against a real cost is 0, not null.
-    assert_eq!(realised(0, 1_000).as_deref(), Some("0.0000"));
-    // A cost of nothing against a real charge has no rate: cost 0 is the
-    // unknown case, and a ratio against it is not a number.
-    assert_eq!(realised(1_000, 0), None);
-    // A rate above 10 000 is possible (a deeply discounted upstream), and
-    // shown rather than clamped: 10⁶ µ¥ charged per 1 µ$ of cost is one
-    // million CNY per dollar.
-    assert_eq!(realised(1_000_000, 1).as_deref(), Some("1000000.0000"));
-    // A group's net charge can be negative after adjustments that reverse
-    // more than it charged. The sign is kept: it must not read as its own
-    // magnitude.
-    assert_eq!(realised(-7_200_000, 1_000_000).as_deref(), Some("-7.2000"));
-    assert_eq!(realised(-1, 3).as_deref(), Some("-0.3333"));
+fn the_margin_rounds_half_away_from_zero_to_two_places() {
+    // The worked example: ¥268 of profit on ¥280 charged.
+    assert_eq!(
+        margin_pct(268_000_000, 280_000_000).as_deref(),
+        Some("95.71")
+    );
+    assert_eq!(margin_pct(6_900, 7_200).as_deref(), Some("95.83"));
+    // Exact figures keep their two places.
+    assert_eq!(margin_pct(1, 2).as_deref(), Some("50.00"));
+    assert_eq!(margin_pct(7, 7).as_deref(), Some("100.00"));
+    assert_eq!(margin_pct(0, 7).as_deref(), Some("0.00"));
+    // Half a hundredth of a percent rounds up; just under it, down.
+    assert_eq!(margin_pct(1, 20_000).as_deref(), Some("0.01"));
+    assert_eq!(margin_pct(1, 20_001).as_deref(), Some("0.00"));
+    // A loss keeps its sign, and away from zero: a cost above the charge.
+    assert_eq!(margin_pct(-1, 20_000).as_deref(), Some("-0.01"));
+    assert_eq!(margin_pct(-12, 4).as_deref(), Some("-300.00"));
     // A magnitude below one place rounds to zero and keeps no sign.
-    assert_eq!(realised(-4, 1_000_000).as_deref(), Some("0.0000"));
+    assert_eq!(margin_pct(-1, 20_001).as_deref(), Some("0.00"));
+    // No charge, or a net negative one, has no percentage at all.
+    assert_eq!(margin_pct(-5, 0), None);
+    assert_eq!(margin_pct(5, -1), None);
 }
 
 #[tokio::test]
@@ -557,12 +612,12 @@ async fn the_margin_filters_by_group_and_model() {
     let other = seed_model(&w.cp, &w.admin).await;
     price_at_rate(&w.cp, one_model).await;
     price_at_rate(&w.cp, other).await;
-    cost(&w.cp, "1").await;
+    let account = costed_account(&w).await;
     send(
         &w,
         vec![
-            served(&w, "m1", one_model, tokens_1000()),
-            served(&w, "m2", other, tokens_1000()),
+            served(&w, "m1", one_model, account, tokens_1000()),
+            served(&w, "m2", other, account, tokens_1000()),
         ],
     )
     .await;
@@ -593,27 +648,6 @@ async fn the_margin_filters_by_group_and_model() {
     assert_eq!(bad.status, 422, "{bad:?}");
 }
 
-/// A cost price of `input` USD per million input tokens for the upstream the
-/// seeded models reach, when account `account` serves it, starting now.
-async fn account_cost(cp: &TestCp, account: Uuid, input: &str) {
-    let now = db_now(cp).await;
-    let row = NewCostPrice {
-        upstream_provider: UPSTREAM_PROVIDER.to_string(),
-        upstream_model: UPSTREAM_MODEL.to_string(),
-        provider_key_id: Some(account),
-        effective_from: now,
-        card: serde_json::from_value(json!({
-            "default": {"base": {"input": input, "output": "2"}}
-        }))
-        .expect("a cost card"),
-        source: "manual".to_string(),
-    };
-    cp.db()
-        .tx(move |c| async move { store::insert_cost_price(c, &row, Actor::System).await }.boxed())
-        .await
-        .expect("a cost price");
-}
-
 /// Account `id`'s display name, as its stored document holds it.
 async fn account_name(cp: &TestCp, id: Uuid) -> String {
     sqlx::query_scalar(
@@ -626,8 +660,8 @@ async fn account_name(cp: &TestCp, id: Uuid) -> String {
 }
 
 /// Two accounts serve one model in one group: both charge the group's price,
-/// and each costs its own. Filtered to one account, the margin is that
-/// account's charge over that account's cost, and its items name it.
+/// and each costs at its own rate. Filtered to one account, the margin is
+/// that account's charge against that account's cost, and its items name it.
 #[tokio::test]
 async fn a_margin_filtered_by_account_names_only_that_accounts_cost() {
     let Some(w) = world().await else { return };
@@ -637,24 +671,21 @@ async fn a_margin_filtered_by_account_names_only_that_accounts_cost() {
         seed_provider_key(&w.cp, &w.admin).await,
         seed_provider_key(&w.cp, &w.admin).await,
     );
-    // A costs 1 USD per million input tokens, B costs 3.
-    account_cost(&w.cp, a, "1").await;
-    account_cost(&w.cp, b, "3").await;
-    let via = |event_id: &str, account: Uuid| {
-        let mut event = served(&w, event_id, model, tokens_1000());
-        event["provider_key_id"] = json!(account);
-        event
-    };
+    // A costs 0.1 CNY per USD of baseline, B costs 0.3.
+    account_rate(&w.cp, a, "0.1").await;
+    account_rate(&w.cp, b, "0.3").await;
+    let via = |event_id: &str, account: Uuid| served(&w, event_id, model, account, tokens_1000());
     send(&w, vec![via("ma", a), via("mb", b)]).await;
 
-    // 7200 µ¥ each. A's is over 1000 µ$ of cost, a realised 7.2; B's over
-    // 3000 µ$, a realised 2.4.
-    for (account, cost, rate) in [(a, 1_000, "7.2000"), (b, 3_000, "2.4000")] {
+    // 7200 µ¥ each. A's costs 100 µ¥, a margin of 7100 / 7200; B's costs
+    // 300 µ¥, 6900 / 7200.
+    for (account, cost, profit, pct) in [(a, 100, 7_100, "98.61"), (b, 300, 6_900, "95.83")] {
         let item = one(&margin(&w.cp, &w.admin, &format!("&provider_key_id={account}")).await);
         assert_eq!(uuid(&item, "/model/id"), model, "{item}");
         assert_eq!(item["charged_micro_cny"], 7_200, "{item}");
-        assert_eq!(item["cost_micro_usd"], cost, "{item}");
-        assert_eq!(item["realised_cny_per_usd"], rate, "{item}");
+        assert_eq!(item["cost_micro_cny"], cost, "{item}");
+        assert_eq!(item["profit_micro_cny"], profit, "{item}");
+        assert_eq!(item["margin_pct"], pct, "{item}");
         assert_eq!(item["rows"], 1, "{item}");
         assert_eq!(item["provider_key_id"], json!(account), "{item}");
         assert_eq!(
@@ -666,8 +697,9 @@ async fn a_margin_filtered_by_account_names_only_that_accounts_cost() {
     // Over every account: both rows, one item, and no account named.
     let item = one(&margin(&w.cp, &w.admin, "").await);
     assert_eq!(item["charged_micro_cny"], 14_400, "{item}");
-    assert_eq!(item["cost_micro_usd"], 4_000, "{item}");
-    assert_eq!(item["realised_cny_per_usd"], "3.6000", "{item}");
+    assert_eq!(item["cost_micro_cny"], 400, "{item}");
+    assert_eq!(item["profit_micro_cny"], 14_000, "{item}");
+    assert_eq!(item["margin_pct"], "97.22", "{item}");
     assert_eq!(item["provider_key_id"], Value::Null, "{item}");
     assert_eq!(item["provider_key_display_name"], Value::Null, "{item}");
     // An account that served nothing matches nothing, and a malformed id is
@@ -702,7 +734,7 @@ async fn the_margin_is_ordered_by_the_groups_display_name_then_the_model() {
     price_at_rate(&w.cp, a_model).await;
     rate(&w.cp, zebra, db_now(&w.cp).await, RATE).await;
     rate(&w.cp, alpha, db_now(&w.cp).await, RATE).await;
-    cost(&w.cp, "1").await;
+    let account = costed_account(&w).await;
     // The tenant must be assigned both groups before a key may name either.
     let version: i64 = sqlx::query_scalar("SELECT version FROM tenants WHERE id = $1")
         .bind(w.tenant)
@@ -744,6 +776,7 @@ async fn the_margin_is_ordered_by_the_groups_display_name_then_the_model() {
                 &w,
                 &format!("{name}{prefix}-{suffix}"),
                 model,
+                account,
                 tokens_1000(),
             );
             event["api_key_id"] = json!(key);

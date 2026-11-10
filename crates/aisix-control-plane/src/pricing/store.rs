@@ -29,9 +29,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
 
 use aisix_pricing::{
-    BaselineRow, Catalogue, ChargeLine, CostPriceRow, CostSource, DiscountRow, Exemption,
-    GroupRateRow, Outcome, PriceBook, PriceRows, PricedEvent, PricingError, PricingWarning,
-    RateCard, RevisionTable, ENGINE_VERSION,
+    BaselineRow, Catalogue, ChargeLine, CostRateRow, DiscountRow, Exemption, GroupRateRow, Outcome,
+    PriceBook, PriceRows, PricedEvent, PricingError, PricingWarning, RevisionTable, ENGINE_VERSION,
 };
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::Serialize;
@@ -55,7 +54,8 @@ pub const BACKDATE_TOLERANCE: TimeDelta = TimeDelta::seconds(5);
 /// could exceed what an index entry holds, failing the batch it came in.
 const MAX_ID_CHARS: usize = 256;
 
-/// The in-memory price book, keyed on `cp_settings.pricing_version`.
+/// The in-memory price book, keyed on `cp_settings.pricing_version`, and
+/// the built-in catalogue the operators' API and the imports read.
 pub struct PriceBookCache {
     catalogue: Arc<Catalogue>,
     cached: RwLock<Option<(i64, Arc<PriceBook>)>>,
@@ -110,7 +110,7 @@ impl PriceBookCache {
 
     /// Loads the book on `conn`, logging each invalid revision.
     async fn load(&self, conn: &mut PgConnection) -> Result<Arc<PriceBook>, DbError> {
-        let book = Arc::new(load_price_book(conn, self.catalogue.clone()).await?);
+        let book = Arc::new(load_price_book(conn).await?);
         for r in book.invalid_revisions() {
             tracing::error!(
                 table = table_name(r.table),
@@ -178,24 +178,25 @@ fn table_name(table: RevisionTable) -> &'static str {
     match table {
         RevisionTable::Baseline => "pricing_baselines",
         RevisionTable::Rate => "pricing_group_rates",
-        RevisionTable::Cost => "pricing_cost_revisions",
+        RevisionTable::Cost => "pricing_cost_rates",
         RevisionTable::Discount => "pricing_discount_revisions",
     }
 }
 
 type BaselineTableRow = (i64, i64, Uuid, DateTime<Utc>, Value);
 type RateTableRow = (i64, i64, Uuid, Option<Uuid>, DateTime<Utc>, Option<i64>);
-type CostTableRow = (i64, i64, String, String, Option<Uuid>, DateTime<Utc>, Value);
+type CostRateTableRow = (i64, i64, Uuid, Option<Uuid>, DateTime<Utc>, Option<i64>);
 type DiscountTableRow = (i64, i64, Uuid, DateTime<Utc>, i64);
 
 /// Every revision of the four tables, read on `conn`, as a book. Ids are
 /// written as `Uuid::to_string()`, the lowercase hyphenated form the control
 /// plane projects and the gateway echoes back; cards stay raw JSON, so one
 /// bad or newer card is isolated to its own revision.
-pub async fn load_price_book(
-    conn: &mut PgConnection,
-    catalogue: Arc<Catalogue>,
-) -> Result<PriceBook, DbError> {
+///
+/// The cost side is `pricing_cost_rates`. The per-dimension cost cards of
+/// `pricing_cost_revisions` are no longer read: that table keeps the cards
+/// written before cost became a rate, and prices nothing.
+pub async fn load_price_book(conn: &mut PgConnection) -> Result<PriceBook, DbError> {
     let baselines: Vec<BaselineTableRow> = sqlx::query_as(
         "SELECT revision_id, engine_version, model_id, effective_from, card \
          FROM pricing_baselines",
@@ -208,10 +209,10 @@ pub async fn load_price_book(
     )
     .fetch_all(&mut *conn)
     .await?;
-    let cost: Vec<CostTableRow> = sqlx::query_as(
-        "SELECT revision_id, engine_version, upstream_provider, upstream_model, provider_key_id, \
-                effective_from, card \
-         FROM pricing_cost_revisions",
+    let cost_rates: Vec<CostRateTableRow> = sqlx::query_as(
+        "SELECT revision_id, engine_version, provider_key_id, model_id, effective_from, \
+                cny_per_usd_e4 \
+         FROM pricing_cost_rates",
     )
     .fetch_all(&mut *conn)
     .await?;
@@ -249,26 +250,24 @@ pub async fn load_price_book(
                 },
             )
             .collect(),
-        cost: cost
+        cost_rates: cost_rates
             .into_iter()
             .map(
                 |(
                     revision_id,
                     engine,
-                    upstream_provider,
-                    upstream_model,
-                    key,
+                    provider_key_id,
+                    model_id,
                     effective_from,
-                    card,
+                    cny_per_usd_e4,
                 )| {
-                    CostPriceRow {
+                    CostRateRow {
                         revision_id,
                         engine_version: engine_version(engine),
-                        upstream_provider,
-                        upstream_model,
-                        provider_key_id: key.map(|k| k.to_string()),
+                        provider_key_id: provider_key_id.to_string(),
+                        model_id: model_id.map(|m| m.to_string()),
                         effective_from,
-                        card,
+                        cny_per_usd_e4,
                     }
                 },
             )
@@ -286,7 +285,7 @@ pub async fn load_price_book(
             )
             .collect(),
     };
-    Ok(PriceBook::from_rows(rows, catalogue))
+    Ok(PriceBook::from_rows(rows))
 }
 
 /// A stored `engine_version` as the book reads it. One no `u32` holds
@@ -368,8 +367,10 @@ struct Columns<'a> {
     price_instant: Option<DateTime<Utc>>,
     status: &'static str,
     charge: Option<i64>,
+    /// `cost_micro_cny`: `None` when the cost is unknown.
     cost: Option<i64>,
-    cost_source: Option<Json<&'a CostSource>>,
+    /// The cost rate that costed the row, as `{kind: "account_rate", …}`.
+    cost_source: Option<Value>,
     baseline_revision_id: Option<i64>,
     rate_revision_id: Option<i64>,
     cny_per_usd_e4: Option<i64>,
@@ -395,7 +396,14 @@ impl<'a> Columns<'a> {
                 status: p.outcome.status(),
                 charge: Some(p.charge.0),
                 cost: p.cost.as_ref().map(|c| c.amount.0),
-                cost_source: p.cost.as_ref().map(|c| Json(&c.source)),
+                cost_source: p.cost.as_ref().map(|c| {
+                    json!({
+                        "kind": "account_rate",
+                        "revision_id": c.rate.revision_id,
+                        "cny_per_usd": c.rate.cny_per_usd,
+                        "model_override": c.rate.model_override,
+                    })
+                }),
                 baseline_revision_id: p.baseline.map(|b| b.revision_id),
                 rate_revision_id: p.rate.map(|r| r.revision_id),
                 cny_per_usd_e4: p.rate.map(|r| i64::from(r.cny_per_usd.0)),
@@ -447,6 +455,10 @@ impl<'a> Columns<'a> {
 /// Records the charge of the stored row `ident`, once: `AlreadyRecorded`
 /// when the row has one. An `Err` is stored as an `unpriced` charge with its
 /// code and no amount.
+///
+/// The cost goes to `cost_micro_cny`, NULL when it is unknown, and the rate
+/// that decided it to `cost_source`. `cost_micro_usd` is not written: it
+/// holds the costs of rows priced before cost became a rate.
 pub async fn record_charge(
     conn: &mut PgConnection,
     ident: &ChargeIdentity<'_>,
@@ -456,7 +468,7 @@ pub async fn record_charge(
     let inserted: Option<String> = sqlx::query_scalar(
         "INSERT INTO pricing_charges_cny \
          (event_id, tenant_id, api_key_id, user_id, requested_model_id, occurred_at, \
-          price_instant, status, charge_micro_cny, cost_micro_usd, cost_source, group_id, \
+          price_instant, status, charge_micro_cny, cost_micro_cny, cost_source, group_id, \
           baseline_revision_id, rate_revision_id, cny_per_usd_e4, rate_is_model_override, \
           discount_revision_id, discount_bps, service_tier, \
           requested_service_tier, long_context_above, estimated, exemption, error_code, lines, \
@@ -503,18 +515,6 @@ pub async fn record_charge(
     })
 }
 
-/// A cost price to write: what an upstream model costs the platform or,
-/// with a `provider_key_id`, what it costs through that one key.
-#[derive(Debug, Clone)]
-pub struct NewCostPrice {
-    pub upstream_provider: String,
-    pub upstream_model: String,
-    pub provider_key_id: Option<Uuid>,
-    pub effective_from: DateTime<Utc>,
-    pub card: RateCard,
-    pub source: String,
-}
-
 /// A tenant discount to write, in basis points (0 to 10000).
 #[derive(Debug, Clone)]
 pub struct NewDiscount {
@@ -523,7 +523,9 @@ pub struct NewDiscount {
     pub discount_bps: u16,
 }
 
-/// One `pricing_cost_revisions` row.
+/// One `pricing_cost_revisions` row: a per-dimension cost card written
+/// before cost became a rate. The table is read only by
+/// `GET /admin/pricing/cost`, for its history, and prices nothing.
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct CostRevision {
     pub revision_id: i64,
@@ -577,11 +579,6 @@ pub(crate) async fn starts_now_or_later(
     Ok(())
 }
 
-fn check_card(card: &RateCard) -> Result<(), ApiError> {
-    card.validate()
-        .map_err(|e| refused("/card", format!("价目卡不合法：{e}")))
-}
-
 async fn tenant_exists(conn: &mut PgConnection, id: Uuid) -> Result<bool, DbError> {
     Ok(
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM tenants WHERE id = $1)")
@@ -610,72 +607,6 @@ pub(crate) fn created_by(actor: Actor<'_>) -> Option<Uuid> {
         Actor::Operator(op) => Some(op.id),
         _ => None,
     }
-}
-
-/// Writes a cost revision starting at `row.effective_from`, refusing with
-/// `422` one that starts in the past (`/effective_from`), a card that does
-/// not validate (`/card`) and a provider key that is not live
-/// (`/provider_key_id`).
-pub async fn insert_cost_price(
-    conn: &mut PgConnection,
-    row: &NewCostPrice,
-    actor: Actor<'_>,
-) -> Result<CostRevision, ApiError> {
-    starts_now_or_later(&mut *conn, row.effective_from).await?;
-    check_card(&row.card)?;
-    if let Some(key) = row.provider_key_id {
-        // A revision for a key that does not exist would never apply.
-        let live: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM gw_resources \
-                            WHERE kind = 'provider_keys' AND id = $1 AND NOT deleted)",
-        )
-        .bind(key)
-        .fetch_one(&mut *conn)
-        .await
-        .map_err(DbError::from)?;
-        if !live {
-            return Err(refused("/provider_key_id", "供应商密钥不存在"));
-        }
-    }
-    let revision: CostRevision = sqlx::query_as(
-        "INSERT INTO pricing_cost_revisions \
-         (engine_version, upstream_provider, upstream_model, provider_key_id, effective_from, \
-          card, source, created_by) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
-         RETURNING revision_id, engine_version, upstream_provider, upstream_model, \
-                   provider_key_id, effective_from, card, source, created_by, created_at",
-    )
-    .bind(i64::from(ENGINE_VERSION))
-    .bind(&row.upstream_provider)
-    .bind(&row.upstream_model)
-    .bind(row.provider_key_id)
-    .bind(row.effective_from)
-    .bind(Json(&row.card))
-    .bind(&row.source)
-    .bind(created_by(actor))
-    .fetch_one(&mut *conn)
-    .await
-    .map_err(DbError::from)?;
-    bump_pricing_version(&mut *conn).await?;
-    audit::record(
-        conn,
-        AuditEntry {
-            actor,
-            action: "pricing.cost.create",
-            target_kind: "pricing_cost_revision",
-            target_id: Some(revision.revision_id.to_string()),
-            tenant_id: None,
-            detail: json!({
-                "upstream_provider": row.upstream_provider,
-                "upstream_model": row.upstream_model,
-                "provider_key_id": row.provider_key_id,
-                "effective_from": row.effective_from,
-                "source": row.source,
-            }),
-        },
-    )
-    .await?;
-    Ok(revision)
 }
 
 /// Writes a discount revision starting at `row.effective_from`, refusing

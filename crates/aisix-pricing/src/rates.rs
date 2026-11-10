@@ -98,11 +98,6 @@ impl<'de> Deserialize<'de> for Rate {
     }
 }
 
-/// An amount of money in micro-USD; never negative.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize)]
-#[serde(transparent)]
-pub struct MicroUsd(pub i64);
-
 /// CNY per USD, in ten-thousandths: `72_000` is 7.2 CNY for each USD of a
 /// model's baseline price. A rate of 0 makes a model free.
 ///

@@ -44,8 +44,8 @@ const BASELINE = { default: { base: { input: "1", output: "0" } } };
 /** The group's rate: 1000 µ$ at 7.2 is 7200 µ¥ a call. */
 const RATE = "7.2";
 const CHARGE_MICRO_CNY = 7_200;
-/** What each account costs, USD per million prompt tokens: A 1, B 3. */
-const COST = { a: "1", b: "3" };
+/** What each account costs, in CNY per USD of the baseline: A 0.1, B 0.3. */
+const COST = { a: "0.1", b: "0.3" };
 
 describe("a public model served by several accounts routes within the caller's group", () => {
   let cp: ControlPlaneStack | undefined;
@@ -132,8 +132,7 @@ describe("a public model served by several accounts routes within the caller's g
     expect(res.status, res.text).toBe(200);
 
     // The price is the public model's: a baseline on its id. Each account's
-    // cost is its own, keyed on the upstream name the account is sent, which
-    // is the public name when the row maps none. A price cannot start more
+    // cost is its own rate on that same baseline. A price cannot start more
     // than five seconds in the past, and one starting later would leave the
     // first calls unpriced.
     const startsAt = () => new Date(Date.now() - 4_000).toISOString();
@@ -148,12 +147,10 @@ describe("a public model served by several accounts routes within the caller's g
       ["a", accountA.id],
       ["b", accountB.id],
     ] as const) {
-      const cost = await cp.admin.post("/admin/pricing/cost", {
-        upstream_provider: "openai",
-        upstream_model: PUBLIC,
-        provider_key_id: id,
+      const cost = await cp.admin.post(`/admin/provider-keys/${id}/cost-rates`, {
+        model_id: null,
+        cny_per_usd: COST[which],
         effective_from: startsAt(),
-        card: { default: { base: { input: COST[which], output: "0" } } },
       });
       expect(cost.status, cost.text).toBe(201);
     }
@@ -301,15 +298,15 @@ describe("a public model served by several accounts routes within the caller's g
     }
   });
 
-  test("the margin filtered by account is that account's charge over its own cost", async () => {
+  test("the margin filtered by account is that account's charge against its own cost", async () => {
     const served = { a: a!.count("/v1/chat/completions"), b: b!.count("/v1/chat/completions") };
     const from = new Date(Date.now() - 3_600_000).toISOString();
     const to = new Date(Date.now() + 3_600_000).toISOString();
-    // A costs 1000 µ$ a call and B 3000, against 7200 µ¥ charged each: a
-    // realised 7.2 for A and 2.4 for B.
-    for (const [which, perCall, realised] of [
-      ["a", 1_000, "7.2000"],
-      ["b", 3_000, "2.4000"],
+    // 1000 µ$ of baseline a call costs A 100 µ¥ and B 300, against 7200 µ¥
+    // charged each: a margin of 7100 / 7200 for A and 6900 / 7200 for B.
+    for (const [which, perCall, margin] of [
+      ["a", 100, "98.61"],
+      ["b", 300, "95.83"],
     ] as const) {
       const res = await cp!.admin.get(
         `/admin/pricing/margin?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}` +
@@ -324,8 +321,9 @@ describe("a public model served by several accounts routes within the caller's g
       expect(item.provider_key_display_name, res.text).toBe(ACCOUNTS[which]);
       expect(item.rows, res.text).toBe(served[which]);
       expect(item.charged_micro_cny, res.text).toBe(served[which] * CHARGE_MICRO_CNY);
-      expect(item.cost_micro_usd, res.text).toBe(served[which] * perCall);
-      expect(item.realised_cny_per_usd, res.text).toBe(realised);
+      expect(item.cost_micro_cny, res.text).toBe(served[which] * perCall);
+      expect(item.profit_micro_cny, res.text).toBe(served[which] * (CHARGE_MICRO_CNY - perCall));
+      expect(item.margin_pct, res.text).toBe(margin);
     }
   });
 

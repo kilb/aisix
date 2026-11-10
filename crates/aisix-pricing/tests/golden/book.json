@@ -781,6 +781,6 @@
       "cny_per_usd_e4": 10000
     }
   ],
-  "cost": [],
+  "cost_rates": [],
   "discounts": []
 }

@@ -330,14 +330,27 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
         "/admin/pricing/catalogue",
         MinRole::Op(OperatorRole::Viewer),
     ),
+    // The cost cards written before cost became a rate: history only.
     (
         "GET",
         "/admin/pricing/cost",
         MinRole::Op(OperatorRole::Viewer),
     ),
+    // What each upstream account costs, per model, in CNY per USD of the
+    // baseline.
+    (
+        "GET",
+        "/admin/pricing/cost-rates",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
+    (
+        "GET",
+        "/admin/provider-keys/{id}/cost-rates",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
     (
         "POST",
-        "/admin/pricing/cost",
+        "/admin/provider-keys/{id}/cost-rates",
         MinRole::Op(OperatorRole::Operator),
     ),
     (
@@ -371,7 +384,8 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
         "/admin/pricing/tenants/{id}",
         MinRole::Op(OperatorRole::Viewer),
     ),
-    // What each group charged against what its upstream cost, per model.
+    // What each group charged against what its upstream accounts cost, per
+    // model, in CNY.
     (
         "GET",
         "/admin/pricing/margin",
@@ -767,9 +781,14 @@ pub fn browser_router(state: AppState) -> Router {
         .route("/admin/usage/batches", get(usage::list_batches))
         .route("/admin/usage/rejects", get(usage::list_rejects))
         .route("/admin/pricing/catalogue", get(pricing::api::catalogue))
+        .route("/admin/pricing/cost", get(pricing::api::list_cost))
         .route(
-            "/admin/pricing/cost",
-            get(pricing::api::list_cost).post(pricing::api::create_cost),
+            "/admin/pricing/cost-rates",
+            get(pricing::cost_rates::list_accounts),
+        )
+        .route(
+            "/admin/provider-keys/{id}/cost-rates",
+            get(pricing::cost_rates::list_account).post(pricing::cost_rates::create),
         )
         .route(
             "/admin/pricing/discounts",

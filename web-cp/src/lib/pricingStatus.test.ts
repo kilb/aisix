@@ -19,7 +19,7 @@ test("two invalid revisions give two rows and a card count of 2", () => {
     v.invalid.map((r) => [r.table, r.revision, r.reason]),
     [
       ["基准价", "11", "bad rate"],
-      ["成本", "abc", "overlap"],
+      ["成本换算率", "abc", "overlap"],
     ],
   );
   assert.equal(new Set(v.invalid.map((r) => r.key)).size, 2);

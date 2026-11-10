@@ -551,7 +551,10 @@ fn checked_description(raw: &str) -> Result<String, Detail> {
 /// A rate as given, at `path`: a decimal string of at most four decimals, 0
 /// to 100. `null`, an absent field and a JSON number are all refused, so the
 /// two routes that take a rate answer the same input the same way.
-fn checked_rate(path: &str, raw: Option<&Value>) -> Result<aisix_pricing::CnyPerUsd, Detail> {
+pub(crate) fn checked_rate(
+    path: &str,
+    raw: Option<&Value>,
+) -> Result<aisix_pricing::CnyPerUsd, Detail> {
     raw.and_then(Value::as_str)
         .and_then(|s| aisix_pricing::CnyPerUsd::parse(s).ok())
         .ok_or_else(|| Detail {

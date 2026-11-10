@@ -13,17 +13,16 @@
 //!   differs from it fails.
 //! - `golden/book.json` prices every family's model at one baseline card,
 //!   for one group at a rate of 1.0000 CNY per USD, with no tenant discount
-//!   and no cost price. Its `default` base rates are the `Model.cost` every
+//!   and no cost rate. Its `default` base rates are the `Model.cost` every
 //!   seeded model carries, so a row's `cost_usd` is the gateway's own figure
 //!   for the same price.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use aisix_core::spend_micro_usd;
 use aisix_pricing::{
-    price_event, BillableUsage, Catalogue, Dimension, Outcome, Payer, PriceBook, PriceRows,
-    PricedEvent, ServiceTier,
+    price_event, BillableUsage, Dimension, Outcome, Payer, PriceBook, PriceRows, PricedEvent,
+    ServiceTier,
 };
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -98,9 +97,7 @@ fn book() -> PriceBook {
     let path = golden("book.json");
     let json = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     let rows: PriceRows = serde_json::from_str(&json).expect("book.json holds price rows");
-    let catalogue = Catalogue::from_json(r#"{"version":"2026-11-06","entries":[]}"#)
-        .expect("an empty catalogue parses");
-    let book = PriceBook::from_rows(rows, Arc::new(catalogue));
+    let book = PriceBook::from_rows(rows);
     assert!(
         book.invalid_revisions().is_empty(),
         "every revision in book.json is readable: {:?}",
@@ -186,7 +183,7 @@ fn each_family_prices_to_its_hand_computed_charge() {
                 (status, charge),
                 "{family}: {priced:?}"
             );
-            // The book has no cost price and the catalogue no entry.
+            // The book has no cost rate.
             assert_eq!(*cost, None, "{family}: {priced:?}");
         }
     }
