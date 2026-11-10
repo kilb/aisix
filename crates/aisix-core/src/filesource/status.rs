@@ -226,6 +226,51 @@ mod tests {
         );
     }
 
+    /// A refused value is quoted so it can be found and fixed, and a URL
+    /// may carry a password in its userinfo. Neither refusal that quotes a
+    /// configured value — an unterminated `${` and a duplicate OIDC issuer —
+    /// may put that password into the load error, `/status/config` or the
+    /// sticky `last_failure`, which outlives the repair.
+    #[test]
+    fn a_refused_url_never_shows_its_password_before_or_after_the_repair() {
+        const PASSWORD: &str = "file-pass-LEAK";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resources.yaml");
+        for broken in [
+            format!(
+                "_format_version: \"1\"\nprovider_keys:\n  - display_name: pk\n    \
+                 api_key: sk-x\n    api_base: \"https://svc:{PASSWORD}@up.example.com/v1/${{HOST\"\n"
+            ),
+            format!(
+                "_format_version: \"1\"\noidc_providers:\n  - name: a\n    \
+                 issuer: https://svc:{PASSWORD}@sso.example.com/realms/x\n    audiences: [\"aisix\"]\n  \
+                 - name: b\n    issuer: https://svc:{PASSWORD}@sso.example.com/realms/x\n    \
+                 audiences: [\"other\"]\n"
+            ),
+        ] {
+            std::fs::write(&path, &broken).unwrap();
+            let cs = ConfigStatus::new(SourceKind::File);
+            let errors = load_resources_file_tracked(&path, 1, true, &cs, &|_| Vec::new())
+                .expect_err("the file is refused")
+                .to_string();
+            assert!(errors.contains("sso.example.com") || errors.contains("up.example.com"));
+            let failing = serde_json::to_string(&cs.view()).unwrap();
+            assert!(cs.view().last_failure.is_some(), "{failing}");
+
+            std::fs::write(
+                &path,
+                "_format_version: \"1\"\nprovider_keys:\n  - display_name: pk\n    api_key: sk-x\n",
+            )
+            .unwrap();
+            load_resources_file_tracked(&path, 2, true, &cs, &|_| Vec::new())
+                .expect("the repaired file loads");
+            let repaired = serde_json::to_string(&cs.view()).unwrap();
+            for shown in [&errors, &failing, &repaired] {
+                assert!(!shown.contains(PASSWORD), "{shown}");
+            }
+        }
+    }
+
     #[test]
     fn tracked_load_of_valid_file_reports_synced_without_revisions() {
         let dir = tempfile::tempdir().unwrap();
