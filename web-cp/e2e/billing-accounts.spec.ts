@@ -260,3 +260,70 @@ test("按期汇总：后端会拒绝的日期范围在本地说明原因，不�
   await expect(periods.getByRole("button", { name: "重试" })).toHaveCount(0);
   expect(asked).toBe(0);
 });
+
+test("后付租户没有信用额度但余额为正：不说所有调用都会被拒绝，提示余额用尽即停止，网关照常放行", async ({ page }) => {
+  const world = await seedTenant(stack, { mode: "postpaid", creditCny: "10.00" });
+  await login(page);
+  await expect(cell(accountRow(page, world), 5)).toHaveText("正常");
+  await accountRow(page, world).getByRole("button", { name: world.tenantName }).click();
+  const limit = region(page, "信用额度");
+  await expect(limit.getByText("尚无信用额度：余额用尽即停止调用")).toBeVisible();
+  await expect(limit.getByText("后付租户尚未设置信用额度，所有调用都会被拒绝")).toHaveCount(0);
+  await expect(limit.getByRole("status")).toHaveCount(0);
+  // Both modes spend balance plus credit: the call is admitted.
+  expect(await chat(stack, world.key.plaintext, world.model.name)).toBe(200);
+});
+
+/**
+ * A 加载更多 still on its way when the filter changes belongs to the old
+ * filter: its page must not be appended to the new list, nor its cursor
+ * replace the new one. The old continuation is held at the network until
+ * the new filter's list is shown, then let through with its real answer.
+ */
+test("余额流水加载更多途中换了类型：旧类型的下一页不混进新类型的列表", async ({ page }) => {
+  test.setTimeout(120_000);
+  // One funding top-up and 50 more: two pages of 充值 (a page is 50).
+  const world = await seedTenant(stack, { mode: "prepaid", creditCny: "10.00" });
+  for (let i = 0; i < 50; i++) {
+    await stack.admin.post(`/admin/tenants/${world.tenantId}/credits`, { amount_cny: "0.01", reason: `翻页-${i}` });
+  }
+  // And two 扣费.
+  for (let i = 0; i < 2; i++) expect(await chat(stack, world.key.plaintext, world.model.name)).toBe(200);
+  await expect
+    .poll(async () => (await stack.admin.get(`/admin/tenants/${world.tenantId}/billing/ledger?kind=usage`)).items.length, { timeout: 30_000 })
+    .toBe(2);
+
+  await login(page);
+  await accountRow(page, world).getByRole("button", { name: world.tenantName }).click();
+  const ledger = region(page, "余额流水");
+  const rows = ledger.locator("tbody tr");
+  const kinds = () => rows.locator("td:nth-child(2)").allTextContents();
+  await ledger.getByLabel("类型").selectOption({ label: "充值" });
+  await expect(rows).toHaveCount(50);
+
+  const NEXT_PAGE = /\/billing\/ledger\?.*before=/;
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => (release = resolve));
+  let reached!: () => void;
+  const arrived = new Promise<void>((resolve) => (reached = resolve));
+  await page.route(NEXT_PAGE, async (route) => {
+    reached();
+    await held;
+    await route.continue();
+  });
+  await ledger.getByRole("button", { name: "加载更多" }).click();
+  await arrived;
+
+  await ledger.getByLabel("类型").selectOption({ label: "扣费" });
+  await expect(rows).toHaveCount(2);
+  const answered = page.waitForResponse(NEXT_PAGE);
+  release();
+  await answered;
+  // Give the page a moment to take (and drop) the old answer.
+  await page.waitForTimeout(500);
+  await expect(rows).toHaveCount(2);
+  expect(await kinds()).toEqual(["扣费", "扣费"]);
+  // The new list is whole: no next page of the old filter is offered.
+  await expect(ledger.getByRole("button", { name: "加载更多" })).toHaveCount(0);
+  await page.unroute(NEXT_PAGE);
+});

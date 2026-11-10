@@ -23,3 +23,62 @@ export async function sendCredit<T>(post: () => Promise<T>): Promise<CreditOutco
     return isUnknownOutcome(error) ? { kind: "unknown", error } : { kind: "refused", error };
   }
 }
+
+/**
+ * Where a tenant's direct credit stands outside any one form: `pending` while
+ * a request is on its way, `unknown` once it ended without a definite answer.
+ */
+export type CreditLock = "pending" | "unknown";
+
+/**
+ * The per-tenant credit locks. They live outside the form, so closing the
+ * panel (or opening another tenant) never hands a fresh, unlocked form back,
+ * and they are observable, so a form opened while a credit is still on its
+ * way follows that credit to its end: locked while it is pending, and kept
+ * locked if it turns out unknown. They last for this page load only; a
+ * reload starts clean, as the operator then reads the ledger anyway.
+ */
+export function createCreditLocks() {
+  const locks = new Map<string, CreditLock>();
+  const listeners = new Set<() => void>();
+  const changed = () => {
+    for (const listener of listeners) listener();
+  };
+  return {
+    get(tenant: string): CreditLock | null {
+      return locks.get(tenant) ?? null;
+    },
+    /**
+     * Takes the lock for a new credit, synchronously, so a second confirm
+     * cannot get in: false while another credit of the tenant is on its way
+     * or unresolved.
+     */
+    acquire(tenant: string): boolean {
+      if (locks.has(tenant)) return false;
+      locks.set(tenant, "pending");
+      changed();
+      return true;
+    },
+    /** The credit ended: an unknown outcome keeps the lock until the operator has checked; any other frees it. */
+    settle(tenant: string, outcome: CreditOutcome<unknown>["kind"]): void {
+      if (outcome === "unknown") locks.set(tenant, "unknown");
+      else locks.delete(tenant);
+      changed();
+    },
+    /** The operator has checked an unknown credit and starts over; a credit still on its way keeps its lock. */
+    release(tenant: string): void {
+      if (locks.get(tenant) !== "unknown") return;
+      locks.delete(tenant);
+      changed();
+    },
+    subscribe(listener: () => void): () => void {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    },
+  };
+}
+
+/** The page's own locks, shared by every credit form it mounts. */
+export const creditLocks = createCreditLocks();

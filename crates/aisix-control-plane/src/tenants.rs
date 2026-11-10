@@ -1620,6 +1620,11 @@ pub struct TenantView {
     /// The stored selection, which the scope decides the meaning of: under
     /// `all` it is kept but grants nothing on its own.
     allowed_model_ids: Vec<Uuid>,
+    /// What the tenant reaches now, as [`scope_model_ids`] resolves it:
+    /// every live public model under `all`, the stored selection under
+    /// `selected`. A key's own selection is checked against this list, so it
+    /// is what a form offers a key and what a key's models are judged by.
+    effective_model_ids: Vec<Uuid>,
     allowed_provider_groups: Vec<String>,
     limits: TenantLimits,
     /// Members that are not removed, disabled ones included.
@@ -1688,9 +1693,20 @@ async fn views(
     .map_err(DbError::from)?
     .into_iter()
     .collect();
+    // The live public models, read once for every all-scope tenant listed
+    // rather than once per tenant; the rule is `scope_model_ids`'s own.
+    let public = if tenants.iter().any(|t| t.model_scope == ModelScope::All) {
+        public_model_ids(&mut *conn).await?
+    } else {
+        Vec::new()
+    };
     Ok(tenants
         .into_iter()
         .map(|t| {
+            let effective_model_ids = match t.model_scope {
+                ModelScope::All => public.clone(),
+                ModelScope::Selected => t.allowed_model_ids.clone(),
+            };
             let states: Vec<ResourceRollout> = rows
                 .get(&t.id)
                 .map(|rows| {
@@ -1707,6 +1723,7 @@ async fn views(
                 billing_mode: t.billing_mode,
                 model_scope: t.model_scope,
                 allowed_model_ids: t.allowed_model_ids,
+                effective_model_ids,
                 allowed_provider_groups: t.allowed_provider_groups,
                 limits: t.limits,
                 member_count: member_counts.get(&t.id).copied().unwrap_or(0),

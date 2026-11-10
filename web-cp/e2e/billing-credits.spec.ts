@@ -170,3 +170,61 @@ test("入账请求没有得到回答时，表单锁定，关闭面板后重开�
   await expect(page.getByText("已入账", { exact: true })).toBeVisible();
   expect(await topups(world)).toHaveLength(1);
 });
+
+/**
+ * The lock outlives the form: a credit still on its way when the panel is
+ * closed keeps the tenant's reopened form locked, and its unknown outcome
+ * reaches that new form too. The credit is stored by the real control plane;
+ * only its answer is held, then lost, at the network — the case the missing
+ * idempotency key leaves to this lock.
+ */
+test("入账请求途中关闭面板再打开：新表单在旧请求有结果前一直锁定，结果未知后仍锁定", async ({ page }) => {
+  const world = await seedTenant(stack, { mode: "prepaid", creditCny: "0" });
+  const CREDITS = `**/admin/tenants/${world.tenantId}/credits`;
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => (release = resolve));
+  let reached!: () => void;
+  const arrived = new Promise<void>((resolve) => (reached = resolve));
+  await page.route(CREDITS, async (route) => {
+    reached();
+    await held;
+    // The control plane stores the credit; its answer never reaches the page.
+    await route.fetch();
+    await route.abort("connectionreset");
+  });
+
+  await login(page);
+  let panel = await openPanel(page, world);
+  let form = credit(panel);
+  await form.getByLabel("金额（元）").fill("0.08");
+  await form.getByLabel("原因").fill("途中-ui-7c4");
+  await form.getByRole("button", { name: "入账", exact: true }).click();
+  await form.getByRole("button", { name: "确认入账" }).click();
+  await arrived;
+
+  // Closed while the credit is on its way, and opened again: locked.
+  await panel.getByRole("button", { name: "关闭" }).click();
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  panel = await openPanel(page, world);
+  form = credit(panel);
+  await expect(form.getByRole("status")).toContainText("上一笔入账仍在等待结果");
+  await expect(form.getByRole("button", { name: "入账", exact: true })).toBeDisabled();
+  await expect(form.getByLabel("金额（元）")).toBeDisabled();
+
+  // The answer is lost: the reopened form says the outcome is unknown, and stays locked.
+  release();
+  await expect(form.getByRole("alert").filter({ hasText: "入账结果未知" })).toBeVisible();
+  await expect(form.getByRole("button", { name: /^(确认)?入账$/ })).toHaveCount(0);
+  await page.unroute(CREDITS);
+  // It was in fact stored, once.
+  await expect.poll(async () => (await topups(world)).length).toBe(1);
+
+  // Once the operator has checked, the form starts over and credits again.
+  await form.getByRole("button", { name: "我已确认，重新填写" }).click();
+  await form.getByLabel("金额（元）").fill("0.02");
+  await form.getByLabel("原因").fill("途中-ui-7c4-2");
+  await form.getByRole("button", { name: "入账", exact: true }).click();
+  await form.getByRole("button", { name: "确认入账" }).click();
+  await expect(page.getByText("已入账", { exact: true })).toBeVisible();
+  expect(await topups(world)).toHaveLength(2);
+});

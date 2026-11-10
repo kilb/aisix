@@ -106,7 +106,13 @@ function PriceTable({ models }: { models: PricedModel[] }) {
             <td className="num">{perMillion(m.input_per_million)}</td>
             <td className="num">{perMillion(m.output_per_million)}</td>
             <td className="num">{perMillion(m.cache_read_per_million)}</td>
-            <td className="num">{perMillion(m.cache_write_per_million)}</td>
+            <td className="num">
+              {perMillion(m.cache_write_per_million)}
+              {/* A one-hour cache write billed at its own rate says so beneath the default write's. */}
+              {m.cache_write_1h_per_million !== undefined && (
+                <span className="hint cell-note">1 小时缓存写 {perMillion(m.cache_write_1h_per_million)}</span>
+              )}
+            </td>
           </tr>
         ))}
       </tbody>

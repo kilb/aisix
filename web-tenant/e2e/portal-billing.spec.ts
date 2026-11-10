@@ -386,3 +386,106 @@ test("密钥选择切换可用额度，成员额度单独成一站", async ({ pa
   await expect(readout.getByTestId("readout-amount")).toHaveText("¥0.50");
   await expect(readout.getByRole("listitem").filter({ hasText: "成员" })).toContainText("以此为准");
 });
+
+/**
+ * The organisation's quotas are a read of their own. When it fails, nothing
+ * that depends on them may be claimed: not "可正常调用", and not the whole
+ * balance as what a billing member can still spend while an exhausted quota
+ * refuses every call. The read fails at the network for that one request;
+ * nothing the control plane answers produces it on demand.
+ */
+test("组织额度读取失败时：不说可正常调用，也不把全部余额当作可用额度；重试后显示已停止", async ({ page }) => {
+  const world = await seedBillingWorld(stack, { members: ["billing"] }); // balance 10.00
+  const [billing] = world.members;
+  if (!billing) throw new Error("the world has a billing member");
+  await stack.admin.post(`/admin/tenants/${world.tenantId}/budgets`, { kind: "periodic", period: "month", limit_cny: "0.01" });
+  const api = await ownerApi(world);
+  await paidChat(world);
+  await expect.poll(async () => (await api.get("/api/budgets")).items.find((b: { scope: string }) => b.scope === "team")?.exhausted).toBe(true);
+  expect(await balanceOf(world)).toBeGreaterThan(0);
+
+  const BUDGETS = "**/api/budgets";
+  await page.route(BUDGETS, (route) => route.abort());
+  await openAccount(page, billing);
+  const balance = region(page, "余额");
+  await expect(balance).toContainText("¥9.");
+  await expect(balance.getByRole("alert")).toContainText("组织额度读取失败");
+  await expect(balance.locator("[data-state]")).not.toHaveAttribute("data-state", "ok");
+  await expect(balance).not.toContainText("可正常调用");
+  const readout = region(page, "可用额度");
+  await expect(readout.getByRole("alert")).toContainText("组织额度读取失败");
+  await expect(readout.getByTestId("readout-amount")).toHaveCount(0);
+
+  // The read recovers: stopped, and nothing left to spend.
+  await page.unroute(BUDGETS);
+  await balance.getByRole("button", { name: "重试" }).click();
+  await expect(balance.locator("[data-state]")).toHaveAttribute("data-state", "exhausted");
+  await expect(balance).toContainText("组织额度已用尽，调用已停止");
+  await expect(readout.getByTestId("readout-amount")).toHaveText("¥0.00");
+});
+
+/**
+ * A new filter's first page is still on its way: the old filter's cursor must
+ * not be offered for it, or 加载更多 continues the new filter from the old
+ * position and skips the entries in between. The new first page is held at
+ * the network and then let through with its real answer.
+ */
+test("换筛选后首页未到时不能加载更多；到了之后逐页翻完，每条只出现一次", async ({ page }) => {
+  test.setTimeout(150_000);
+  // Oldest first: the funding top-up, 50 more top-ups, then two calls. 充值
+  // and 全部 then both run past one page (50), at different positions.
+  const world = await seedBillingWorld(stack, { creditCny: "1.00" });
+  for (let i = 0; i < 50; i++) {
+    await stack.admin.post(`/admin/tenants/${world.tenantId}/credits`, { amount_cny: "0.01", reason: `翻页-${i}` });
+  }
+  await paidChat(world);
+  expect(await chat(stack, world.key.plaintext, world.model.name)).toBe(200);
+  await expect.poll(() => balanceOf(world), { timeout: 60_000 }).toBe(1_500_000 - 2 * CALL_MICRO_CNY);
+
+  await openAccount(page, world.owner);
+  const ledger = region(page, "余额流水");
+  const rows = bodyRows(ledger);
+  await expect(rows).toHaveCount(50);
+  await ledger.getByLabel("类型").selectOption({ label: "充值" });
+  await expect(rows.locator("td:nth-child(2)")).toHaveText(Array(50).fill("充值"));
+  await expect(ledger.getByRole("button", { name: "加载更多" })).toBeVisible();
+
+  // Back to 全部, whose first page is held.
+  const firstOfAll = (url: URL) =>
+    url.pathname.endsWith("/api/billing/ledger") && !url.searchParams.has("kind") && !url.searchParams.has("before");
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => (release = resolve));
+  let reached!: () => void;
+  const arrived = new Promise<void>((resolve) => (reached = resolve));
+  await page.route(firstOfAll, async (route) => {
+    reached();
+    await held;
+    await route.continue();
+  });
+  await ledger.getByLabel("类型").selectOption({ label: "全部" });
+  await arrived;
+  // Nothing of 充值's to continue from while 全部's first page is out.
+  await expect(ledger.getByRole("button", { name: "加载更多" })).toHaveCount(0);
+  release();
+  await expect(rows).toHaveCount(50);
+  await page.unroute(firstOfAll);
+  await ledger.getByRole("button", { name: "加载更多" }).click();
+  await expect(rows).toHaveCount(53);
+  await expect(ledger.getByRole("button", { name: "加载更多" })).toHaveCount(0);
+
+  // Every entry once, in order: each balance is the one before it less what it moved.
+  const balances = await rows.locator("td:nth-child(4)").allTextContents();
+  const expected: number[] = [];
+  let after = 1_500_000 - 2 * CALL_MICRO_CNY;
+  for (let k = 0; k < 2; k++) {
+    expected.push(after);
+    after += CALL_MICRO_CNY;
+  }
+  for (let k = 0; k < 50; k++) {
+    expected.push(after);
+    after -= 10_000;
+  }
+  expected.push(after);
+  expect(after).toBe(1_000_000);
+  expect(balances).toEqual(expected.map(cny));
+});

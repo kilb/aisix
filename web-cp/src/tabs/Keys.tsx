@@ -123,7 +123,7 @@ function ownerOf(k: AdminKey, tenant: Tenant, members: Member[] | null): string 
   return members?.find((m) => m.id === k.member_id)?.email ?? "成员";
 }
 
-/** The models key `k` may call, by name; a selected model the tenant no longer grants is marked. */
+/** The models key `k` may call, by name; a selected model the tenant does not reach now is marked. */
 function modelsOf(k: AdminKey, tenant: Tenant, names: Map<string, string> | null): string {
   return keyModels(k, tenant, names);
 }
@@ -624,13 +624,15 @@ function CreateForm({
 
   const grants = useMemo(
     () =>
-      tenant.allowed_model_ids
-        // The grant picker is built from the tenant's own list, so a name
-        // missing here is a model the catalogue has not loaded yet; the id
-        // is the honest fallback.
+      // What the tenant reaches now, which is what the control plane checks a
+      // key's selection against: every live public model under `all`, never
+      // the stored list that scope keeps aside.
+      tenant.effective_model_ids
+        // A name missing here is a model the catalogue has not loaded yet;
+        // the id is the honest fallback.
         .map((id) => ({ id, name: names?.get(id) ?? id }))
         .sort((a, b) => a.name.localeCompare(b.name)),
-    [tenant.allowed_model_ids, names],
+    [tenant.effective_model_ids, names],
   );
 
   /** The create body: every field left blank is left out. */

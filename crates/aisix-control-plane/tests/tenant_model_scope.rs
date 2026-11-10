@@ -333,6 +333,90 @@ async fn the_tenant_surfaces_follow_the_scope() {
     assert_eq!(names(&r.body), vec![hand_name]);
 }
 
+/// The operator's view of a tenant carries what its scope resolves to,
+/// beside the stored selection: the Dashboard offers a key exactly that set
+/// and judges a key's models by it, so an all-scope tenant whose stored list
+/// is empty (or still holds an older selection) is not shown as granting
+/// nothing (or that older list).
+#[tokio::test]
+async fn the_operator_view_carries_what_the_scope_resolves_to() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let account = provider_key(&cp, &admin, "acct-scope-view-9e4").await;
+    let first = public_model(&cp, &admin, "scope-pub-view-a-9e4").await;
+    let second = public_model(&cp, &admin, "scope-pub-view-b-9e4").await;
+    serve(&cp, &admin, account, first).await;
+    serve(&cp, &admin, account, second).await;
+    // Neither of these is in an all-scope tenant's reach.
+    let unserved = public_model(&cp, &admin, "scope-pub-view-unserved-9e4").await;
+    let hand = hand_made_model(&cp, &admin).await;
+
+    let effective = |body: &Value| -> Vec<String> {
+        let mut ids: Vec<String> = body["effective_model_ids"]
+            .as_array()
+            .unwrap_or_else(|| panic!("an effective list: {body}"))
+            .iter()
+            .map(|v| v.as_str().expect("a uuid").to_string())
+            .collect();
+        ids.sort();
+        ids
+    };
+    let listed = |body: &Value, id: Uuid| -> Value {
+        body["items"]
+            .as_array()
+            .expect("a list")
+            .iter()
+            .find(|t| t["id"] == json!(id))
+            .cloned()
+            .expect("the tenant is listed")
+    };
+
+    // All scope, nothing stored: both callable public models, and nothing
+    // else.
+    let created = operator_tenant(&cp, &admin, "scope-view-9e4").await;
+    let view = tenant(&cp, &admin, created).await;
+    assert_eq!(view.body["allowed_model_ids"], json!([]), "{view:?}");
+    assert_eq!(
+        effective(&view.body),
+        uuid_list(&[first, second]),
+        "{unserved}"
+    );
+    let all = cp
+        .send("GET", "/admin/tenants", Some(admin.cookie()), None)
+        .await;
+    assert_eq!(all.status, 200, "{all:?}");
+    assert_eq!(
+        effective(&listed(&all.body, created)),
+        uuid_list(&[first, second])
+    );
+
+    // Selected with a hand-made model: the stored list is what it reaches.
+    let r = patch(
+        &cp,
+        &admin,
+        created,
+        json!({"model_scope": "selected", "allowed_model_ids": [hand]}),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(effective(&r.body), uuid_list(&[hand]), "{r:?}");
+
+    // Back to all with that list kept: the stored list stands aside, and the
+    // view says the public models, not the list it keeps.
+    let r = patch(&cp, &admin, created, json!({"model_scope": "all"})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(r.body["allowed_model_ids"], json!([hand]), "{r:?}");
+    assert_eq!(effective(&r.body), uuid_list(&[first, second]), "{r:?}");
+    let view = tenant(&cp, &admin, created).await;
+    assert_eq!(
+        effective(&view.body),
+        uuid_list(&[first, second]),
+        "{view:?}"
+    );
+}
+
 /// Narrowing to `selected` without a list starts from what the tenant
 /// reaches now, and removing its last model leaves it with none — never with
 /// all.

@@ -10,6 +10,8 @@ import { STACK_START_TIMEOUT_MS, fundTenant, startStack, type ApiClient, type Js
 
 let stack: Stack;
 const models: Record<string, Json> = {};
+/** The account every tenant key reaches by default; it serves the public models below. */
+let sharedAccount: Json;
 
 const PASSWORD = "t5-e2e-pass-7c1a";
 /** How long a switch on the control plane may take to reach the gateway. */
@@ -39,6 +41,7 @@ test.beforeAll(async () => {
   }
   // Every account a tenant key reaches by default is in `shared`.
   const shared = await account("acct-t5-shared", ["shared"], "sk-t5-upstream-shared-1");
+  sharedAccount = shared;
   await account("acct-t5-eu", ["grp-eu-5d2"], "sk-t5-upstream-eu-2");
   await account("acct-t5-us", ["grp-us-8a4"], "sk-t5-upstream-us-3");
   const direct = (display_name: string, model_name: string) =>
@@ -539,6 +542,12 @@ test("改回全部公共模型后保存成功，范围是 all 且不再带模型
   await expect(grants.getByRole("radio", { name: "指定模型" })).toBeChecked();
   await grants.getByRole("radio", { name: "全部公共模型" }).check();
   await grants.getByRole("button", { name: "保存授权" }).click();
+  // The hand-made model the list holds is outside the all scope, so the
+  // widening takes it away from every key: it is named and confirmed first,
+  // and nothing is saved until then.
+  await expect(grants.getByRole("alert")).toContainText("chat-t5-e2e");
+  expect((await stack.admin.get(`/admin/tenants/${t.id}`)).model_scope).toBe("selected");
+  await grants.getByRole("button", { name: "确认保存授权" }).click();
   await expect(grants).toContainText("已保存授权");
 
   const stored = await stack.admin.get(`/admin/tenants/${t.id}`);
@@ -760,6 +769,118 @@ test("新租户默认分组使用同一选择器：按显示名选择，路由�
     const restored = await stack.admin.request("PUT", "/admin/settings/tenant-defaults", before);
     expect(restored.status, restored.text).toBe(200);
   }
+});
+
+/**
+ * Two public models served by the shared account, made once for the cases
+ * below: an earlier case relies on this stack having none, so they are made
+ * only when a case that needs them runs, after it. Other cases add public
+ * models of their own, so these cases name every one the tenant reaches.
+ */
+let servedPublics: Promise<Json[]> | undefined;
+function publicPair(): Promise<Json[]> {
+  servedPublics ??= (async () => {
+    const made: Json[] = [];
+    for (const name of ["pub-a-t5-e2e", "pub-b-t5-e2e"]) {
+      const pub = await stack.admin.post("/admin/public-models", { name });
+      await stack.admin.put(`/admin/provider-keys/${sharedAccount.id}/channel-models/${pub.id}`, { priority: 1, weight: 1 });
+      made.push(pub);
+    }
+    return made;
+  })();
+  return servedPublics;
+}
+
+/** The model names a tenant's own `/api/models` lists: what its scope reaches. */
+async function reached(t: TenantSide): Promise<string[]> {
+  return ((await t.client.get("/api/models")).items as Json[]).map((m) => m.name as string).sort();
+}
+
+test("全部公共模型改为指定模型时，去掉的公共模型要先确认：取消则不改，确认后只收回它", async ({ page }) => {
+  const [a, b] = await publicPair();
+  const t = await signUpActive("T5 Narrow Co 4e2", "owner@narrow-t5.test");
+  // Every public model this stack serves, these two among them.
+  const before = await reached(t);
+  expect(before).toEqual(expect.arrayContaining([a.name, b.name]));
+
+  await openTenants(page);
+  await openTenant(page, t.org);
+  const grants = page.getByRole("group", { name: "授权模型" });
+  await grants.getByRole("radio", { name: "指定模型" }).check();
+  // Narrowing starts from what the tenant reaches now.
+  await expect(grants.getByRole("checkbox", { name: a.name })).toBeChecked();
+  await expect(grants.getByRole("checkbox", { name: b.name })).toBeChecked();
+  await grants.getByRole("checkbox", { name: b.name }).uncheck();
+  await grants.getByRole("button", { name: "保存授权" }).click();
+  // Asked first, naming exactly what is taken away; nothing is saved yet.
+  const warning = grants.getByRole("alert");
+  await expect(warning).toContainText(b.name);
+  await expect(warning).not.toContainText(a.name);
+  expect((await stack.admin.get(`/admin/tenants/${t.id}`)).model_scope).toBe("all");
+
+  // Cancelled: the tenant keeps both.
+  await grants.getByRole("button", { name: "取消" }).click();
+  await expect(grants.getByRole("button", { name: "确认保存授权" })).toHaveCount(0);
+  expect((await stack.admin.get(`/admin/tenants/${t.id}`)).model_scope).toBe("all");
+  expect(await reached(t)).toEqual(before);
+
+  // Confirmed: only the model named is taken away.
+  await grants.getByRole("button", { name: "保存授权" }).click();
+  await grants.getByRole("button", { name: "确认保存授权" }).click();
+  await expect(grants).toContainText("已保存授权");
+  const after = await stack.admin.get(`/admin/tenants/${t.id}`);
+  expect(after.model_scope).toBe("selected");
+  expect(after.allowed_model_ids).toContain(a.id);
+  expect(after.allowed_model_ids).not.toContain(b.id);
+  expect(after.allowed_model_ids).toHaveLength(before.length - 1);
+  expect(await reached(t)).toEqual(before.filter((name) => name !== b.name));
+});
+
+/**
+ * The public-model list is read separately from the tenant and the model
+ * catalogue, so it can fail while they load. Narrowing must still start from
+ * what the tenant reaches — never from an empty set that a save would then
+ * store as "no models" — and widening back, which needs the list, waits for
+ * it. The failure is made at the network for that one read: no request to
+ * the control plane produces it on demand.
+ */
+test("公共模型列表读取失败时：改为指定模型仍从当前可用的模型开始，不会存成空授权；改回全部要等列表读到", async ({ page }) => {
+  const [a, b] = await publicPair();
+  const t = await signUpActive("T5 Unlisted Co 8f1", "owner@unlisted-t5.test");
+  // Every public model this stack serves, these two among them.
+  const before = await reached(t);
+  expect(before).toEqual(expect.arrayContaining([a.name, b.name]));
+  const PUBLIC_LIST = "**/admin/public-models";
+  await page.route(PUBLIC_LIST, (route) => route.abort());
+
+  await openTenants(page);
+  await openTenant(page, t.org);
+  const grants = page.getByRole("group", { name: "授权模型" });
+  // Under all, what the scope covers is unknown: the failure says so and the save waits.
+  await expect(grants.getByRole("alert").filter({ hasText: "公共模型列表读取失败" })).toBeVisible();
+  await expect(grants.getByRole("button", { name: "保存授权" })).toBeDisabled();
+
+  await grants.getByRole("radio", { name: "指定模型" }).check();
+  await expect(grants.getByRole("checkbox", { name: a.name })).toBeChecked();
+  await expect(grants.getByRole("checkbox", { name: b.name })).toBeChecked();
+  await grants.getByRole("button", { name: "保存授权" }).click();
+  await expect(grants).toContainText("已保存授权");
+  const narrowed = await stack.admin.get(`/admin/tenants/${t.id}`);
+  expect(narrowed.model_scope).toBe("selected");
+  expect(narrowed.allowed_model_ids).toEqual(expect.arrayContaining([a.id, b.id]));
+  expect(narrowed.allowed_model_ids).toHaveLength(before.length);
+  expect(await reached(t)).toEqual(before);
+
+  // Back to all: the save waits for the list, and the retry brings it.
+  await grants.getByRole("radio", { name: "全部公共模型" }).check();
+  await expect(grants.getByRole("button", { name: "保存授权" })).toBeDisabled();
+  await page.unroute(PUBLIC_LIST);
+  await grants.getByRole("button", { name: "重试" }).click();
+  await expect(grants.getByRole("checkbox", { name: a.name })).toBeChecked();
+  await expect(grants.getByRole("button", { name: "保存授权" })).toBeEnabled();
+  await grants.getByRole("button", { name: "保存授权" }).click();
+  // The first save's note is still shown, so the stored scope is what tells.
+  await expect.poll(async () => (await stack.admin.get(`/admin/tenants/${t.id}`)).model_scope).toBe("all");
 });
 
 // Last: it changes what every later signup starts with.
