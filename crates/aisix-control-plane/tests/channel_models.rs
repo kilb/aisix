@@ -2323,6 +2323,7 @@ fn the_routing_document_is_a_function_of_the_rows() {
         created_by: None,
         created_at: chrono::Utc::now(),
         retired_at: None,
+        routing: json!({}),
     };
     let row = |id: u128, priority: i32, weight: i32| channels::ChannelModelRow {
         id: Uuid::from_u128(id),
@@ -2419,6 +2420,7 @@ fn every_generated_document_loads_on_both_schemas() {
         created_by: None,
         created_at: chrono::Utc::now(),
         retired_at: None,
+        routing: json!({}),
     };
     let channel = |upstream: Option<&str>, priority: i32, weight: i32| channels::ChannelModelRow {
         id: Uuid::new_v4(),
@@ -3096,5 +3098,288 @@ async fn a_selection_takes_its_public_models_before_the_resources_lock() {
     assert!(
         resources_free,
         "the apply took the resources lock before the public model's: the lock order is inverted"
+    );
+}
+
+// ── the routing settings a public model carries ─────────────────────────────
+
+/// `PATCH /admin/public-models/{id}` as `who`, with `body`.
+async fn patch_public(cp: &TestCp, who: &OperatorSession, id: Uuid, body: Value) -> Resp {
+    cp.send(
+        "PATCH",
+        &format!("{PUBLICS}/{id}"),
+        Some(who.cookie()),
+        Some(body),
+    )
+    .await
+}
+
+/// `public_models.routing` as stored, for a row that must exist.
+async fn stored_routing(cp: &TestCp, id: Uuid) -> Value {
+    sqlx::query_scalar("SELECT routing FROM public_models WHERE id = $1")
+        .bind(id)
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("read the routing column")
+}
+
+/// A row written before `0037` reads as `{}` and still loads, and the document
+/// generated from it is byte-identical to the one built before the settings
+/// were stored at all: `round_robin` over exactly these targets, nothing else.
+///
+/// The insert omits the column, which is what an upgrade leaves behind and is
+/// the only way to reach the pre-`0037` shape from a migrated database.
+#[tokio::test]
+async fn a_row_written_before_the_routing_column_reads_as_empty_and_generates_todays_document() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let key = provider_key(&cp, &op, "acct-legacy-8c1").await;
+    let (id, _) = create_public(&cp, &op, "pub-legacy-8c1").await;
+    let r = put_channel(&cp, &op, key, id, json!({"priority": 2, "weight": 3})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let direct_id: Uuid = sqlx::query_scalar(
+        "SELECT direct_model_id FROM channel_models WHERE provider_key_id = $1 AND public_model_id = $2",
+    )
+    .bind(key)
+    .bind(id)
+    .fetch_one(cp.db().pool())
+    .await
+    .expect("read the channel row");
+
+    // The shape an upgrade leaves: the column defaults, nothing written.
+    sqlx::query("UPDATE public_models SET routing = DEFAULT WHERE id = $1")
+        .bind(id)
+        .execute(cp.db().pool())
+        .await
+        .expect("reset the column to the pre-0037 shape");
+    assert_eq!(stored_routing(&cp, id).await, json!({}));
+
+    // Same path a channel edit takes, so the generated document is rebuilt
+    // from the row as it now stands rather than read from the earlier write.
+    let ctx = WriteCtx::of(cp.state());
+    cp.db()
+        .tx(move |conn| {
+            async move {
+                channels::regenerate(conn, &ctx, id, &[]).await?;
+                Ok::<_, aisix_control_plane::error::ApiError>(())
+            }
+            .boxed()
+        })
+        .await
+        .expect("regenerate");
+
+    assert_eq!(
+        live(&cp, Kind::Models, id).await,
+        json!({
+            "display_name": "pub-legacy-8c1",
+            "routing": {
+                "strategy": "round_robin",
+                "targets": [{"model_id": direct_id.to_string(), "priority": 2, "weight": 3}],
+            },
+        })
+    );
+    // And the view says the model sets nothing of its own.
+    assert_eq!(public_model(&cp, &op, id).await["routing"], json!({}));
+}
+
+/// The settings an operator saves are written to the row, carried by the
+/// regenerated document, and survive the next account change — the whole
+/// point of storing them: before this, the strategy was hard-coded, so a tick
+/// on any account serving the model rewrote `round_robin` over whatever the
+/// operator had chosen.
+#[tokio::test]
+async fn saved_routing_settings_reach_the_document_and_survive_an_account_change() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let key = provider_key(&cp, &op, "acct-settings-8c1").await;
+    let (id, _) = create_public(&cp, &op, "pub-settings-8c1").await;
+    let r = put_channel(&cp, &op, key, id, json!({})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let direct_id: Uuid = sqlx::query_scalar(
+        "SELECT direct_model_id FROM channel_models WHERE provider_key_id = $1 AND public_model_id = $2",
+    )
+    .bind(key)
+    .bind(id)
+    .fetch_one(cp.db().pool())
+    .await
+    .expect("read the channel row");
+
+    let settings = json!({
+        "strategy": "consistent_hash",
+        "retries": 2,
+        "retry_on_429": true,
+        "fallback_on_statuses": [408, 429],
+        "when_all_unavailable": "try_anyway",
+        "hash_on": [{"type": "header", "name": "x-tenant"}],
+    });
+    let r = patch_public(&cp, &op, id, json!({"routing": settings})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    // The answer is the view, so a form re-renders from what was stored.
+    assert_eq!(r.body["routing"], settings);
+
+    let doc = live(&cp, Kind::Models, id).await;
+    assert_eq!(doc["routing"]["strategy"], "consistent_hash");
+    assert_eq!(doc["routing"]["retries"], 2);
+    assert_eq!(doc["routing"]["retry_on_429"], true);
+    assert_eq!(doc["routing"]["fallback_on_statuses"], json!([408, 429]));
+    assert_eq!(doc["routing"]["when_all_unavailable"], "try_anyway");
+    assert_eq!(
+        doc["routing"]["hash_on"],
+        json!([{"type": "header", "name": "x-tenant"}])
+    );
+    // The targets stay generated: the settings did not replace them.
+    assert_eq!(
+        doc["routing"]["targets"],
+        json!([{"model_id": direct_id.to_string(), "priority": 0, "weight": 1}])
+    );
+
+    // An account change on another model served by this one regenerates its
+    // document. The settings must come back unchanged.
+    let r = put_channel(&cp, &op, key, id, json!({"priority": 5})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let doc = live(&cp, Kind::Models, id).await;
+    assert_eq!(
+        doc["routing"]["strategy"], "consistent_hash",
+        "a channel edit reverted the operator's strategy: {doc}"
+    );
+    assert_eq!(doc["routing"]["when_all_unavailable"], "try_anyway");
+    assert_eq!(
+        doc["routing"]["targets"],
+        json!([{"model_id": direct_id.to_string(), "priority": 5, "weight": 1}]),
+        "the ticks still decide the targets"
+    );
+
+    // Unticking the account is a channel change too, and keeps them as well.
+    let r = cp
+        .send(
+            "DELETE",
+            &format!("/admin/provider-keys/{key}/channel-models/{id}"),
+            Some(op.cookie()),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, 204, "{r:?}");
+    let doc = live(&cp, Kind::Models, id).await;
+    assert_eq!(doc["routing"]["strategy"], "consistent_hash");
+    assert_eq!(doc["routing"]["targets"], json!([]));
+}
+
+/// Only what an operator can actually choose is stored: a setting equal to the
+/// gateway's default is dropped, so a default that moves in a later release
+/// reaches a model that never overrode it.
+#[tokio::test]
+async fn a_setting_equal_to_the_gateway_default_is_not_stored() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let (id, _) = create_public(&cp, &op, "pub-defaults-8c1").await;
+
+    let r = patch_public(
+        &cp,
+        &op,
+        id,
+        json!({"routing": {
+            "strategy": "round_robin",
+            "retry_on_429": false,
+            "when_all_unavailable": "fail",
+            "fallback_on_statuses": [],
+        }}),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(stored_routing(&cp, id).await, json!({}));
+
+    // `retries` has no gateway default (it defers to the deployment's
+    // `upstream.retries`), so a written `0` is an operator's choice and stays.
+    let r = patch_public(&cp, &op, id, json!({"routing": {"retries": 0}})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(stored_routing(&cp, id).await, json!({"retries": 0}));
+    // A body that sets nothing clears the row rather than leaving it.
+    let r = patch_public(&cp, &op, id, json!({"routing": {}})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(stored_routing(&cp, id).await, json!({}));
+}
+
+/// The targets are generated from the accounts, never set through this route,
+/// and a key the gateway's routing block does not define is refused by name.
+#[tokio::test]
+async fn a_targets_key_or_an_unknown_setting_is_refused_by_name() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let key = provider_key(&cp, &op, "acct-refuse-8c1").await;
+    let (id, _) = create_public(&cp, &op, "pub-refuse-8c1").await;
+    let r = put_channel(&cp, &op, key, id, json!({})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let before = live(&cp, Kind::Models, id).await;
+    let direct_id: Uuid = sqlx::query_scalar(
+        "SELECT direct_model_id FROM channel_models WHERE provider_key_id = $1 AND public_model_id = $2",
+    )
+    .bind(key)
+    .bind(id)
+    .fetch_one(cp.db().pool())
+    .await
+    .expect("read the channel row");
+
+    let r = patch_public(&cp, &op, id, json!({"routing": {"targets": []}})).await;
+    assert_422_at(&r, "/routing/targets");
+
+    let r = patch_public(&cp, &op, id, json!({"routing": {"sticky": true}})).await;
+    assert_422_at(&r, "/routing/sticky");
+
+    // A strategy the gateway does not have, and a status outside the range
+    // the schema allows, are refused at their own paths.
+    let r = patch_public(&cp, &op, id, json!({"routing": {"strategy": "random"}})).await;
+    assert_422_at(&r, "/routing/strategy");
+    let r = patch_public(
+        &cp,
+        &op,
+        id,
+        json!({"routing": {"fallback_on_statuses": [200]}}),
+    )
+    .await;
+    assert_422_at(&r, "/routing/fallback_on_statuses/0");
+
+    // Nothing was written or regenerated by any refusal.
+    assert_eq!(stored_routing(&cp, id).await, json!({}));
+    assert_eq!(live(&cp, Kind::Models, id).await, before);
+    assert!(live(&cp, Kind::Models, id).await["routing"]["targets"]
+        .as_array()
+        .is_some_and(|t| t.len() == 1 && t[0]["model_id"] == direct_id.to_string()));
+
+    // A viewer may read but not set them.
+    let viewer = cp.admin_login_seeded(OperatorRole::Viewer).await;
+    let r = patch_public(&cp, &viewer, id, json!({"routing": {}})).await;
+    assert_eq!(r.status, 403, "{r:?}");
+}
+
+/// A retired public model takes no settings: nothing would read them.
+#[tokio::test]
+async fn a_retired_public_model_refuses_settings() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let (id, _) = create_public(&cp, &op, "pub-retired-8c1").await;
+    let r = cp
+        .send(
+            "POST",
+            &format!("{PUBLICS}/{id}/delete"),
+            Some(op.cookie()),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let r = patch_public(&cp, &op, id, json!({"routing": {"retries": 1}})).await;
+    assert_eq!(
+        (r.status, r.body["code"].as_str()),
+        (409, Some("public_model_retired")),
+        "{r:?}"
     );
 }

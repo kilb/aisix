@@ -596,6 +596,11 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
         MinRole::Op(OperatorRole::Viewer),
     ),
     (
+        "PATCH",
+        "/admin/public-models/{id}",
+        MinRole::Op(OperatorRole::Operator),
+    ),
+    (
         "POST",
         "/admin/public-models/{id}/retire",
         MinRole::Op(OperatorRole::Operator),
@@ -935,7 +940,7 @@ pub fn browser_router(state: AppState) -> Router {
             "/admin/public-models",
             get(channels::list).post(channels::create),
         )
-        .route("/admin/public-models/{id}", get(channels::get))
+        .route("/admin/public-models/{id}", get(channels::get).patch(channels::patch))
         .route("/admin/public-models/{id}/retire", post(channels::retire))
         .route("/admin/public-models/{id}/delete", post(channels::delete))
         .route(

@@ -108,10 +108,21 @@ pub struct PublicModelRow {
     pub created_by: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub retired_at: Option<DateTime<Utc>>,
+    /// The routing settings the operator set, without `targets`: those are
+    /// read from `channel_models` on every write ([`routing_doc`]). A key
+    /// absent here means the gateway's own default, and one equal to that
+    /// default is dropped on write ([`checked_routing`]), so a default that
+    /// moves in a later gateway release reaches every model that never
+    /// overrode it.
+    ///
+    /// `{}` for every row written before `0037`: the document generated from
+    /// it is what [`routing_doc`] built then, `strategy: round_robin` over
+    /// the generated targets, so nothing changed for those models.
+    pub routing: Value,
 }
 
 /// The columns a [`PublicModelRow`] is read from.
-const PUBLIC_COLUMNS: &str = "id, name, enabled, created_by, created_at, retired_at";
+const PUBLIC_COLUMNS: &str = "id, name, enabled, created_by, created_at, retired_at, routing";
 
 /// One `channel_models` row.
 #[derive(Debug, Clone, PartialEq, Serialize, sqlx::FromRow)]
@@ -219,7 +230,15 @@ pub fn direct_doc(
 /// smooth weighted round-robin inside a tier and walks forward on failure,
 /// and tiers concatenate best-first, so "priority tiers, weighted inside a
 /// tier, falling over down the tiers" is exactly this strategy with
-/// `priority` and `weight` set on the targets.
+/// `priority` and `weight` set on the targets. It is also the setting
+/// [`default_routing`] names as the one a model that set no strategy means,
+/// so an operator who picks `round_robin` explicitly stores nothing.
+///
+/// The operator's own settings ([`PublicModelRow::routing`]) are written
+/// first and `targets` last, so the one field the generated document decides
+/// is the one field no stored setting can carry: the target list is always a
+/// function of `channel_models` and can never drift from the account rows. A
+/// stored `strategy` replaces the default here.
 ///
 /// Targets are ordered by `priority` descending, then `weight` descending,
 /// then `direct_model_id` ascending, so the document is a pure function of
@@ -247,13 +266,132 @@ pub fn routing_doc(public: &PublicModelRow, channels: &[ChannelModelRow]) -> Val
             })
         })
         .collect();
+    let strategy = public
+        .routing
+        .get("strategy")
+        .filter(|v| !v.is_null())
+        .cloned()
+        .unwrap_or_else(|| Value::String(DEFAULT_STRATEGY.to_string()));
+    let mut routing = public.routing.as_object().cloned().unwrap_or_default();
+    routing.insert("strategy".to_string(), strategy);
+    routing.insert("targets".to_string(), Value::Array(targets));
     json!({
         "display_name": public.name,
-        "routing": {
-            "strategy": "round_robin",
-            "targets": targets,
-        },
+        "routing": Value::Object(routing),
     })
+}
+
+/// The strategy a public model dispatches with when the operator set none.
+pub const DEFAULT_STRATEGY: &str = "round_robin";
+
+/// The settings a public model's `routing` column may hold a non-default
+/// value for: every property of the gateway's own `Routing` definition
+/// except `targets`, which is generated.
+///
+/// Read from the strict model schema rather than copied, so a setting the
+/// gateway adds is accepted here the day it lands, and one it retires is
+/// refused with it.
+fn settable_routing_keys() -> std::collections::BTreeSet<String> {
+    aisix_core::models::schema::resource_root_schema(Kind::Models.schema_name(), true)
+        .get("definitions")
+        .and_then(|d| d.get("Routing"))
+        .and_then(|d| d.get("properties"))
+        .and_then(Value::as_object)
+        .map(|properties| {
+            properties
+                .keys()
+                .filter(|key| key.as_str() != "targets")
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `settings` as the `public_models.routing` column stores them: the keys the
+/// gateway's `routing` block defines, minus the ones already at the
+/// gateway's default, validated against the gateway's own schema.
+///
+/// The column holds what the operator changed, so a setting equal to the
+/// default it is compared against here is not written: a default that moves
+/// in a later gateway release then reaches the model instead of being pinned
+/// by a value nobody chose. The three defaults are those of the gateway's
+/// code (`Routing::*_or_default`, and [`DEFAULT_STRATEGY`] for the one this
+/// module itself decides) — `retries` has none (it defers to the deployment's
+/// `upstream.retries`), and `max_fallbacks`'s is derived from the target
+/// count, so neither is ever treated as a default.
+///
+/// Refusals name the key: an unknown one, or `targets` itself, at
+/// `/routing/<key>`; a value the schema rejects at `/routing/<path>`.
+fn checked_routing(settings: &Value) -> Result<Value, Vec<Detail>> {
+    let Some(settings) = settings.as_object() else {
+        return Err(vec![Detail {
+            path: "/routing".to_string(),
+            message: "路由设置应为对象".to_string(),
+        }]);
+    };
+    let allowed = settable_routing_keys();
+    let mut problems = Vec::new();
+    for key in settings.keys() {
+        if !allowed.contains(key) {
+            problems.push(Detail {
+                path: format!("/routing/{key}"),
+                message: if key == "targets" {
+                    "route targets are generated from the accounts that serve the model and cannot be set here"
+                        .to_string()
+                } else {
+                    format!("网关的路由模型没有「{key}」这一设置")
+                },
+            });
+        }
+    }
+    if !problems.is_empty() {
+        return Err(problems);
+    }
+    let kept: serde_json::Map<String, Value> = settings
+        .iter()
+        .filter(|(key, value)| !at_default(key, value))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    // Validated as a whole routing block with no targets: the schema then
+    // decides the strategy enum, the status range and the hash chain's
+    // shape, exactly as it does for a hand-written model.
+    let mut probe_routing = kept.clone();
+    probe_routing
+        .entry("strategy".to_string())
+        .or_insert_with(|| Value::String(DEFAULT_STRATEGY.to_string()));
+    probe_routing.insert("targets".to_string(), json!([]));
+    let probe = json!({
+        "display_name": "routing",
+        "routing": Value::Object(probe_routing),
+    });
+    if let Err(err) = aisix_core::models::schema::validate_model(&probe) {
+        // The validator's path is an instance path from the probe's root, so
+        // it already carries the `/routing` this request's body nests the
+        // settings under; only a failure at the routing block itself (an
+        // empty path, or one outside it) needs putting back there.
+        let path = if err.path.starts_with("/routing") {
+            err.path
+        } else {
+            format!("/routing{}", err.path)
+        };
+        return Err(vec![Detail {
+            path,
+            message: format!("不符合网关的路由模型定义：{}", err.message),
+        }]);
+    }
+    Ok(Value::Object(kept))
+}
+
+/// Whether `key: value` is the gateway's default for that setting, and so
+/// need not be stored.
+fn at_default(key: &str, value: &Value) -> bool {
+    match key {
+        "strategy" => value.as_str() == Some(DEFAULT_STRATEGY),
+        "retry_on_429" => value.as_bool() == Some(false),
+        "when_all_unavailable" => value.as_str() == Some("fail"),
+        "fallback_on_statuses" => value.as_array().is_some_and(Vec::is_empty),
+        _ => false,
+    }
 }
 
 /// A public model's name as given: trimmed, 1 to [`MAX_NAME_CHARS`]
@@ -634,6 +772,9 @@ pub struct PublicModelView {
     pub name: String,
     pub enabled: bool,
     pub served_by: Vec<ServedBy>,
+    /// The routing settings the operator set, as stored; `{}` when none.
+    /// `targets` is not part of it, and is read from `served_by`.
+    pub routing: Value,
     pub tenants: i64,
     pub keys: i64,
     pub created_at: DateTime<Utc>,
@@ -647,6 +788,7 @@ async fn view(conn: &mut PgConnection, row: &PublicModelRow) -> Result<PublicMod
         name: row.name.clone(),
         enabled: row.enabled,
         served_by: served_by(conn, row.id).await?,
+        routing: row.routing.clone(),
         tenants: uses.tenants,
         keys: uses.keys,
         created_at: row.created_at,
@@ -800,8 +942,85 @@ pub async fn get(
     Ok(Json(answer))
 }
 
-/// What a public model's removal does with the accounts that serve it.
+/// `PATCH /admin/public-models/{id}` with `{routing: {...}}` → `200
+/// PublicModel`: sets the routing settings the public model's generated
+/// routing document carries, and regenerates that document in the same
+/// transaction.
 ///
+/// The body is the whole set of settings, not a patch of them: a key it
+/// omits is a key the model no longer sets, so it falls back to the gateway's
+/// default. `targets` is not settable (`422 /routing/targets`): the targets
+/// are generated from the accounts that serve the model, so removing one is
+/// removing that account's mapping on the account page. A key the gateway's
+/// `routing` block does not define is refused by name, and a value the
+/// gateway's schema rejects is refused at its own path.
+///
+/// The write goes through [`regenerate`], the same path a channel edit takes,
+/// so the generated document is written by the control plane's own
+/// transaction rather than by a `PUT` on a document owned by the public model
+/// (which answers `409 managed_resource`, and would be how a later
+/// regeneration silently reverted a hand edit).
+///
+/// The locks are a channel edit's: the all-scope tenants' rows, then the
+/// public model's, then the resources lock inside `write_resource`.
+pub async fn patch(
+    auth: OperatorAuth,
+    State(state): State<AppState>,
+    Path(raw): Path<String>,
+    ApiJson(body): ApiJson<PatchBody>,
+) -> Result<Json<Value>, ApiError> {
+    auth.require(OperatorRole::Operator)?;
+    let id = path_id(&raw)?;
+    let routing = checked_routing(&body.routing).map_err(ApiError::validation)?;
+    let ctx = WriteCtx::of(&state);
+    let answer = state
+        .db
+        .tx(move |conn| {
+            async move {
+                let all_scope = crate::tenants::lock_all_scope(&mut *conn).await?;
+                let existing = lock_public(&mut *conn, id).await?;
+                if existing.retired_at.is_some() {
+                    return Err(retired());
+                }
+                sqlx::query("UPDATE public_models SET routing = $2 WHERE id = $1")
+                    .bind(id)
+                    .bind(&routing)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(DbError::from)?;
+                audit::record(
+                    &mut *conn,
+                    AuditEntry {
+                        actor: Actor::Operator(&auth),
+                        action: "public_model.routing",
+                        target_kind: "public_model",
+                        target_id: Some(id.to_string()),
+                        tenant_id: None,
+                        detail: json!({"name": existing.name, "routing": routing}),
+                    },
+                )
+                .await?;
+                regenerate(&mut *conn, &ctx, id, &all_scope).await?;
+                let row = read_public(&mut *conn, id).await?;
+                view_json(&mut *conn, &row).await
+            }
+            .boxed()
+        })
+        .await?;
+    Ok(Json(answer))
+}
+
+/// `PATCH /admin/public-models/{id}`: the routing settings, as a whole set.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PatchBody {
+    /// The non-target settings of the model's routing block. Required: the
+    /// body is the whole set, so an absent one would be an ambiguous
+    /// "clear everything" rather than a request anyone wrote on purpose.
+    routing: Value,
+}
+
+/// What a public model's removal does with the accounts that serve it.
 /// The two routes differ only here: a retire holds the model while an enabled
 /// account serves it (the operator must mean to stop the name while its
 /// mappings stay as they were), and a delete takes the mappings with it, which

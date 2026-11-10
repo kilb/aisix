@@ -317,6 +317,12 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
         ("GET", "/admin/public-models/{id}") => {
             (format!("/admin/public-models/{}", Uuid::nil()), None)
         }
+        // The id matches nothing: 404 once the role check passed, so the
+        // settings are refused before anything is written.
+        ("PATCH", "/admin/public-models/{id}") => (
+            format!("/admin/public-models/{}", Uuid::nil()),
+            Some(json!({"routing": {"strategy": "round_robin"}})),
+        ),
         ("POST", "/admin/public-models/{id}/retire") => (
             format!("/admin/public-models/{}/retire", Uuid::nil()),
             Some(json!({})),

@@ -1656,12 +1656,34 @@ export interface PublicModel {
   name: string;
   enabled: boolean;
   served_by: ServedBy[];
+  /**
+   * The routing settings the operator set on the model's routing document, as
+   * stored: `{}` when none, and never `targets`, which come from `served_by`.
+   * A key that is absent means the gateway's own default.
+   */
+  routing: PublicModelRouting;
   /** Live tenants whose grants name it. */
   tenants: number;
   /** Live keys whose model selection names it. */
   keys: number;
   created_at: string;
   retired_at: string | null;
+}
+
+/**
+ * The non-target settings of a routing model, as the gateway's `Routing`
+ * definition names them. Every key is optional: absent is the gateway's
+ * default. `hash_on` is only read with `strategy: consistent_hash`.
+ */
+export interface PublicModelRouting {
+  strategy?: string;
+  retries?: number;
+  max_fallbacks?: number;
+  retry_on_429?: boolean;
+  fallback_on_statuses?: number[];
+  when_all_unavailable?: string;
+  hash_on?: unknown[];
+  [field: string]: unknown;
 }
 
 /**
@@ -1717,6 +1739,15 @@ export const publicModels = {
   },
   async get(id: string): Promise<PublicModel> {
     return (await call<PublicModel>("GET", `/admin/public-models/${seg(id)}`)).data;
+  },
+  /**
+   * Sets the model's routing settings, which its generated routing document
+   * carries, and regenerates that document. The body is the whole set: a key
+   * it omits falls back to the gateway's default. `targets` is refused, and a
+   * setting the gateway does not define is refused by name.
+   */
+  async patchRouting(id: string, routing: PublicModelRouting): Promise<PublicModel> {
+    return (await call<PublicModel>("PATCH", `/admin/public-models/${seg(id)}`, { routing })).data;
   },
   /** `409 public_model_in_use` with `counts {tenants, keys, channels}` while anything live names it. */
   async retire(id: string): Promise<PublicModel> {

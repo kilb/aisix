@@ -6,6 +6,7 @@ import { Msg, type Note } from "../components/Msg";
 import { RolloutBadge } from "../components/RolloutBadge";
 import {
   ApiError,
+  channelModels,
   publicModels,
   tenants,
   type PublicModel,
@@ -15,6 +16,7 @@ import {
 import { messageFor, problemAt } from "../lib/errors";
 import { errorText } from "../lib/fmt";
 import { modelClass, modelSource, type ModelClass, type ModelSource } from "../lib/modelSource";
+import { draftOf, routingBody, statusesOf } from "../lib/publicRouting";
 import { inUseText, retireWarning } from "../lib/retireWarning";
 import { defaultAt, enumAt, loadSchema } from "../lib/schema";
 import { useResource } from "../lib/useResource";
@@ -70,6 +72,14 @@ const SHAPE_LABEL: Record<Shape, string> = {
 /** What the routing form reads from the gateway's `model` schema. */
 type SchemaInfo = { strategies: string[]; preset: string | null } | { error: string };
 
+/**
+ * The strategy a public model's generated routing document dispatches on when
+ * the operator set none (`channels::routing_doc` in the control plane). It is
+ * not the schema's own default (`failover`), because `failover` would make a
+ * target's `weight` inert, so the form shows this one for "not set".
+ */
+const GENERATED_STRATEGY = "round_robin";
+
 /** Which form is open: a new model of one shape, or one model. */
 type Open = { mode: "new"; shape: "direct" | "routing" } | { mode: "edit"; id: string };
 
@@ -124,14 +134,23 @@ function groupsOf(m: Model | undefined, catalog: Catalog): string {
  *
  * Each row also says where it comes from. A model the operator wrote here is
  * edited and deleted here. One a public model generated is not: it is owned
- * by that public model, so a `DELETE` on it is refused as `managed_resource`
- * and a save would only be refused too. Those rows are read-only and lead to
- * 价格 · 公共模型; the only removal that works is retiring that public model,
- * which is what 停用 does — it deletes the routing document, every account's
- * direct document and the account mappings, or is refused with what still
- * names the model.
+ * by that public model, so a `DELETE` on it is refused as `managed_resource`.
+ *
+ * - A generated **routing** document is the public model's own name, and it
+ *   is where that name's routing settings live, so its 「编辑」 opens a form
+ *   for them (`PublicRoutingForm`) — saved through the public model's own
+ *   `PATCH`, which regenerates the document — with the targets shown and
+ *   removed by removing the account's mapping. Everything the name needs can
+ *   be done on this page.
+ * - A generated **direct** document is one account's mapping, and its
+ *   editable surface is that account's 模型 section, so it stays read-only
+ *   here: 查看 shows it, and nothing on this page leads elsewhere for it.
+ *
+ * Removing the name itself is 停用, which retires the public model: the
+ * routing document, every account's direct document and the account
+ * mappings go, or the retire is refused with what still names the model.
  */
-export function Models({ canEdit, onGoto }: TabProps) {
+export function Models({ canEdit }: TabProps) {
   const models = useResource<ModelDoc>("models");
   const accounts = useResource<AccountDoc>("provider_keys");
   const [publics, setPublics] = useState<PublicModel[] | null>(null);
@@ -297,9 +316,17 @@ export function Models({ canEdit, onGoto }: TabProps) {
   const shown = showInternal ? all : all.filter((m) => modelClass(m) !== "internal");
 
   const editing = open?.mode === "edit" ? models.items?.find((m) => m.id === open.id) : undefined;
-  // Only an operator's own model has a form here; a generated row is read-only
-  // (a save on it would be refused as `managed_resource` all the same).
-  const editable = editing !== undefined && modelSource(editing).kind === "manual";
+  // A model the operator wrote has the catalog form. A generated routing
+  // document is its public model's name, whose settings and target removal
+  // this page owns (`PublicRoutingForm`); a generated direct document is one
+  // account's mapping, changed in that account's 模型 section, so it opens
+  // read-only in the same catalog form.
+  const editingSource = editing ? modelSource(editing) : null;
+  const editingPublic =
+    editing && editingSource?.kind === "public" && !editingSource.generated
+      ? publicById?.get(editingSource.id)
+      : undefined;
+  const editable = editing !== undefined && (editingSource?.kind === "manual" || editingPublic !== undefined);
   const formProps = {
     catalog,
     schema,
@@ -314,13 +341,41 @@ export function Models({ canEdit, onGoto }: TabProps) {
       {open?.mode === "new" && (
         <ModelForm key={`new-${open.shape}`} model={null} shape={open.shape} readOnly={false} onReload={() => undefined} {...formProps} />
       )}
-      {editing && editable && (shapeOf(editing.doc) === "direct" || shapeOf(editing.doc) === "routing") && (
+      {editing && editingPublic && (
+        <PublicRoutingForm
+          key={`${editingPublic.id}:${editing.version}`}
+          publicModel={editingPublic}
+          model={editing}
+          catalog={catalog}
+          schema={schema}
+          readOnly={!canEdit}
+          onClose={() => setOpen(null)}
+          onSaved={(view) => {
+            setNote({
+              kind: "ok",
+              text: `已保存「${view.name}」的路由设置。`,
+            });
+            // The targets are regenerated with the document: read them back.
+            void models.reload();
+            void loadPublics();
+          }}
+          onTargetRemoved={(where) => {
+            setNote({
+              kind: "ok",
+              text: `已移除账号「${where}」对「${editingPublic.name}」的映射，该目标已不在路由里。`,
+            });
+            void models.reload();
+            void loadPublics();
+          }}
+        />
+      )}
+      {editing && editable && !editingPublic && (shapeOf(editing.doc) === "direct" || shapeOf(editing.doc) === "routing") && (
         // Keyed by version: a reload that finds a newer version starts the edit over.
         <ModelForm
           key={`${editing.id}:${editing.version}`}
           model={editing}
           shape={shapeOf(editing.doc) as "direct" | "routing"}
-          readOnly={!canEdit}
+          readOnly={!canEdit || modelSource(editing).kind === "public"}
           onReload={() => void models.reload()}
           {...formProps}
         />
@@ -448,10 +503,21 @@ export function Models({ canEdit, onGoto }: TabProps) {
                       <td className="right">
                         {src.kind === "public" ? (
                           <>
-                            {/* No form here: the row is owned by its public model, so it is changed there. */}
-                            <div className="sub">由公共模型生成，在这里只读</div>
-                            <Button size="sm" onClick={() => onGoto("pricing", "public-models")}>
-                              去公共模型
+                            {src.generated ? (
+                              // One account's mapping: its editable surface is
+                              // that account's 模型 section, so this is a view.
+                              <div className="sub">由公共模型生成，账号的「模型」里改</div>
+                            ) : (
+                              <div className="sub">由公共模型生成，路由设置在这里改</div>
+                            )}
+                            {/* The routing document is the public name itself:
+                                its settings and its targets are this page's. */}
+                            <Button
+                              size="sm"
+                              onClick={() => openForm({ mode: "edit", id: m.id })}
+                              disabled={!src.generated && !from}
+                            >
+                              {canEdit && !src.generated ? "编辑" : "查看"}
                             </Button>
                             {canEdit && from && (
                               <TwoStep
@@ -673,7 +739,13 @@ function ModelForm({
   const isNew = model === null;
   const doc = model?.doc ?? {};
   const routing = doc.routing ?? {};
-  const strategies = schema && "strategies" in schema ? schema.strategies : null;
+  const fromSchema = schema && "strategies" in schema ? schema.strategies : null;
+  const strategies =
+    fromSchema === null
+      ? null
+      : fromSchema.includes(GENERATED_STRATEGY)
+        ? fromSchema
+        : [GENERATED_STRATEGY, ...fromSchema];
   const preset = schema && "preset" in schema ? schema.preset : null;
   // As the form starts, to tell what the operator changed. An absent
   // strategy is "" and shows as the schema's default.
@@ -1042,6 +1114,331 @@ function ModelForm({
           </Button>
         </p>
       )}
+    </form>
+  );
+}
+
+/**
+ * One public model's routing settings, and the targets generated from the
+ * accounts that serve it.
+ *
+ * The settings are the model's own: they are saved through
+ * `PATCH /admin/public-models/{id}`, which regenerates the routing document in
+ * the same transaction, so a later account change cannot revert them. This is
+ * what a hand edit of the document could not do — the document is owned by
+ * the public model, and a save on it answers `409 managed_resource`.
+ *
+ * The targets are **not** edited here: each one is an account's mapping (what
+ * it serves the name as, its priority and weight), edited in that account's
+ * 模型 section. What this form does with them is show which account each comes
+ * from and offer to remove one, which removes that account's mapping
+ * (`DELETE …/channel-models/{public model id}`) — so the page can finish the
+ * settings without leaving it.
+ */
+function PublicRoutingForm({
+  publicModel,
+  model,
+  catalog,
+  schema,
+  readOnly,
+  onClose,
+  onSaved,
+  onTargetRemoved,
+}: {
+  publicModel: PublicModel;
+  /** The routing document, read for its targets and its rollout. */
+  model: Model;
+  catalog: Catalog;
+  schema: SchemaInfo | null;
+  readOnly: boolean;
+  onClose: () => void;
+  onSaved: (view: PublicModel) => void;
+  onTargetRemoved: (accountName: string) => void;
+}) {
+  const stored = publicModel.routing ?? {};
+  const [draft, setDraft] = useState(() => draftOf(stored, GENERATED_STRATEGY));
+  const [form, focusRefusal] = useRefusalFocus<HTMLFormElement>();
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<ApiError | string | null>(null);
+  // The target whose removal was clicked once, by its index in the form.
+  const [removing, setRemoving] = useState<number | null>(null);
+  const [removingBusy, setRemovingBusy] = useState(false);
+  const title = readOnly
+    ? `模型「${publicModel.name}」`
+    : `编辑模型「${publicModel.name}」`;
+  const locked = readOnly || busy;
+
+  const targets = model.doc.routing?.targets ?? [];
+  const accountOf = (t: Target): Account | undefined => {
+    const target = targetModel(t, catalog);
+    return target?.doc.provider_key_id ? catalog.accounts.get(target.doc.provider_key_id) : undefined;
+  };
+
+  function set<K extends keyof typeof draft>(key: K, value: (typeof draft)[K]) {
+    setDraft((d) => ({ ...d, [key]: value }));
+  }
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    // A removal in flight reloads the rows when it lands, which re-renders
+    // this form; saving settings from under it is not what the operator asked
+    // for, and the two writes would race on the same document.
+    if (removingBusy) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      const view = await publicModels.patchRouting(
+        publicModel.id,
+        routingBody(draft, stored, GENERATED_STRATEGY, statusesOf(draft.statuses)),
+      );
+      onSaved(view);
+    } catch (e) {
+      setErr(e instanceof ApiError ? e : String(e));
+      focusRefusal();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function removeTarget(accountId: string, accountName: string) {
+    setRemovingBusy(true);
+    setErr(null);
+    try {
+
+      await channelModels.remove(accountId, publicModel.id);
+
+      setRemoving(null);
+      onTargetRemoved(accountName);
+    } catch (e) {
+
+      setErr(e instanceof ApiError ? e : String(e));
+    } finally {
+      setRemovingBusy(false);
+    }
+  }
+
+  const details = err instanceof ApiError ? err.details : [];
+  const at = (path: string) => problemAt(details, (p) => p === path);
+  // The strategy options come from the schema, never from a list here: the
+  // one the generator uses for "not set" leads, since an operator who wants it
+  // back cannot find it otherwise (it is not the schema's own default).
+  const fromSchema = schema && "strategies" in schema ? schema.strategies : null;
+  const strategies =
+    fromSchema === null
+      ? null
+      : fromSchema.includes(GENERATED_STRATEGY)
+        ? fromSchema
+        : [GENERATED_STRATEGY, ...fromSchema];
+  const bad = schema && "error" in schema ? schema.error : null;
+  const statuses = statusesOf(draft.statuses);
+  const shown = [
+    "/routing/strategy",
+    "/routing/retries",
+    "/routing/max_fallbacks",
+    "/routing/retry_on_429",
+    "/routing/fallback_on_statuses",
+    "/routing/when_all_unavailable",
+  ];
+  const listed = details.filter((d) => !shown.includes(d.path));
+
+  return (
+    <form ref={form} className="panel" aria-label={title} onSubmit={submit}>
+      <h2>{title}</h2>
+      <p className="hint">
+        这是公共模型「{publicModel.name}」生成的路由模型。目标由「上游账号 → 模型」的勾选自动生成，这里只改选路与会话设置；要少一个目标，请在下面移除那个账号的映射。
+      </p>
+      {bad && (
+        <div className="f">
+          <span>选路设置</span>
+          <div className="note crit" role="alert">
+            {bad}
+          </div>
+        </div>
+      )}
+      <div className="r">
+        <Field label="选路策略" error={at("/routing/strategy")}>
+          {(aria) => (
+            <select
+              disabled={locked || strategies === null}
+              value={draft.strategy}
+              onChange={(e) => set("strategy", e.target.value)}
+              {...aria}
+            >
+              {[
+                ...(strategies ?? []),
+                ...(strategies?.includes(draft.strategy) || draft.strategy === "" ? [] : [draft.strategy]),
+              ].map((v) => (
+                <option key={v} value={v}>
+                  {v}
+                </option>
+              ))}
+            </select>
+          )}
+        </Field>
+        <Field label="全部不可用时的处理" error={at("/routing/when_all_unavailable")}>
+          {(aria) => (
+            <select
+              disabled={locked}
+              value={draft.whenAllUnavailable}
+              onChange={(e) => set("whenAllUnavailable", e.target.value)}
+              {...aria}
+            >
+              <option value="">（网关默认）</option>
+              <option value="fail">fail（返回 503）</option>
+              <option value="try_anyway">try_anyway（仍然尝试）</option>
+            </select>
+          )}
+        </Field>
+      </div>
+      <div className="r">
+        <Field label="重试次数" hint="留空用网关的默认值。" error={at("/routing/retries")}>
+          {(aria) => (
+            <input
+              type="number"
+              min={0}
+              step={1}
+              disabled={locked}
+              value={draft.retries}
+              onChange={(e) => set("retries", e.target.value)}
+              {...aria}
+            />
+          )}
+        </Field>
+        <Field label="最多切换几个目标" hint="留空表示后面的目标都可以试。" error={at("/routing/max_fallbacks")}>
+          {(aria) => (
+            <input
+              type="number"
+              min={0}
+              step={1}
+              disabled={locked}
+              value={draft.maxFallbacks}
+              onChange={(e) => set("maxFallbacks", e.target.value)}
+              {...aria}
+            />
+          )}
+        </Field>
+      </div>
+      <Field
+        label="额外重试的状态码"
+        hint="逗号分隔，例如 408, 429。上游用 4xx 表示临时故障时才有用；5xx 本来就会重试。"
+        error={at("/routing/fallback_on_statuses")}
+      >
+        {(aria) => (
+          <input
+            disabled={locked}
+            value={draft.statuses}
+            placeholder="（网关默认：不额外重试）"
+            onChange={(e) => set("statuses", e.target.value)}
+            {...aria}
+          />
+        )}
+      </Field>
+      {draft.statuses.trim() !== "" && statuses === null && (
+        <p className="hint">状态码要写成数字，用逗号分隔。</p>
+      )}
+      <label className="f">
+        <input
+          type="checkbox"
+          disabled={locked}
+          checked={draft.retryOn429}
+          onChange={(e) => set("retryOn429", e.target.checked)}
+        />{" "}
+        <span>429 也参与重试和切换</span>
+      </label>
+
+      <h2>路由目标（{targets.length}）</h2>
+      {targets.length === 0 ? (
+        <p className="hint">还没有账号服务这个模型：请求会以「上游不可用」失败。在「上游账号 → 模型」中勾选它即可。</p>
+      ) : (
+        <ul className="targets">
+          {targets.map((t, i) => {
+            const target = targetModel(t, catalog);
+            const account = accountOf(t);
+            const accountId = target?.doc.provider_key_id;
+            const accountName = account?.doc.display_name || accountId || "（账号已不存在）";
+            return (
+              <li key={t.model_id ?? i}>
+                <div className="r">
+                  <div>
+                    {target ? nameOf(target) : `${t.model_id ?? t.model ?? "—"}（模型不存在）`}
+                    <div className="sub">账号：{accountName}</div>
+                    <div className="sub">可服务分组：{groupsOf(target, catalog)}</div>
+                    {t.priority !== undefined && <div className="sub">优先级：{t.priority}</div>}
+                    {t.weight !== undefined && <div className="sub">权重：{t.weight}</div>}
+                  </div>
+                  <div className="right">
+                    {!readOnly && accountId ? (
+                      // Two steps held here rather than by `TwoStep`: a
+                      // removal reloads the rows behind this form, and the
+                      // step has to survive the re-render that causes.
+                      removing === i ? (
+                        <div>
+                          <p role="alert">
+                            移除后，账号「{accountName}」不再为「{publicModel.name}」提供服务，它对该模型的勾选也会取消。
+                          </p>
+                          <Button
+                            kind="danger"
+                            size="sm"
+                            busy={removingBusy}
+                            busyLabel="移除中…"
+                            onClick={() => void removeTarget(accountId, accountName)}
+                          >
+                            确认移除该目标
+                          </Button>{" "}
+                          <Button size="sm" disabled={removingBusy} onClick={() => setRemoving(null)}>
+                            取消
+                          </Button>
+                        </div>
+                      ) : (
+                        <Button size="sm" disabled={removingBusy} onClick={() => setRemoving(i)}>
+                          移除该目标
+                        </Button>
+                      )
+                    ) : (
+                      <div className="sub">{accountId ? "只读" : "账号已不存在，无法在这里移除"}</div>
+                    )}
+                  </div>
+                </div>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+      <p className="hint">优先级高的一组先用，这一组都不可用时才用下一组；同一组内按权重分配。目标的优先级和权重在账号的「模型」里改。</p>
+
+      {err && (
+        <div className="note crit" role="alert">
+          {typeof err === "string" ? err : messageFor(err)}
+          {listed.length > 0 && (
+            <ul>
+              {listed.map((d) => (
+                <li key={d.path}>
+                  <code>{d.path}</code>：{d.message}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+
+      <p>
+        {!readOnly && (
+          <>
+            <Button
+              kind="primary"
+              type="submit"
+              busy={busy}
+              busyLabel="保存中…"
+              disabled={statuses === null || removingBusy}
+            >
+              保存
+            </Button>{" "}
+          </>
+        )}
+        <Button type="button" disabled={busy} onClick={onClose}>
+          关闭
+        </Button>
+      </p>
     </form>
   );
 }

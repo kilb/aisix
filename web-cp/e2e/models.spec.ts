@@ -500,6 +500,138 @@ async function publicView(id: string): Promise<Json> {
   return stack.admin.get(`/admin/public-models/${id}`);
 }
 
+/** The routing block of the model document at `id`, which must be live. */
+async function routingOf(id: string): Promise<Json> {
+  return (await stack.admin.get(`/admin/resources/models/${id}`)).doc.routing;
+}
+
+test("公共模型的路由设置在这里改：保存后网关照它选路，之后账号上的勾选不会把它改回去", async ({ page }) => {
+  const suffix = randomUUID().slice(0, 8);
+  const accountName = `acct-route-settings-${suffix}`;
+  const account = await mockAccount(accountName, ["shared"]);
+  const publicName = `pub-route-settings-${suffix}`;
+  const pub = await newPublicModel(publicName);
+  await serve(account.id, pub.id);
+  const directName = `${publicName}#${accountName}`;
+
+  await openModels(page);
+  const row = modelRow(page, publicName);
+  await expect(row).toContainText("路由");
+  await row.getByRole("button", { name: "编辑", exact: true }).click();
+  const form = page.getByRole("form", { name: `编辑模型「${publicName}」` });
+
+  // A generated model starts on the generator's strategy, which is not the
+  // schema's own default, and on no setting of its own.
+  await expect(form.getByLabel("选路策略")).toHaveValue("round_robin");
+  await expect(form.getByLabel("重试次数")).toHaveValue("");
+
+  await form.getByLabel("选路策略").selectOption("consistent_hash");
+  await form.getByLabel("重试次数").fill("2");
+  await form.getByLabel("额外重试的状态码").fill("408, 429");
+  await form.getByLabel("429 也参与重试和切换").check();
+  await form.getByRole("button", { name: "保存" }).click();
+  await expect(page.getByText(`已保存「${publicName}」的路由设置`)).toBeVisible();
+
+  // The control plane stored what the operator set, and the document carries
+  // it: this is what a hand edit of the document could never do, since the
+  // document is owned by the public model (`409 managed_resource`).
+  await expect.poll(() => routingOf(pub.id), { timeout: APPLIED_WITHIN_MS }).toMatchObject({
+    strategy: "consistent_hash",
+    retries: 2,
+    fallback_on_statuses: [408, 429],
+    retry_on_429: true,
+  });
+  expect((await publicView(pub.id)).routing).toEqual({
+    strategy: "consistent_hash",
+    retries: 2,
+    fallback_on_statuses: [408, 429],
+    retry_on_429: true,
+  });
+
+  // Now an account change on the same model — a tick that regenerates the
+  // routing document. Before this change the generator wrote a hard-coded
+  // `round_robin` on every regeneration, so this second write reverted the
+  // operator's choice, silently.
+  await stack.admin.put(`/admin/provider-keys/${account.id}/channel-models/${pub.id}`, {
+    priority: 3,
+    weight: 1,
+  });
+  const after = await routingOf(pub.id);
+  expect(after).toMatchObject({
+    strategy: "consistent_hash",
+    retries: 2,
+    fallback_on_statuses: [408, 429],
+    retry_on_429: true,
+  });
+  // The tick still decides the targets, which is the one field the generator
+  // owns outright.
+  expect(after.targets).toEqual([
+    { model_id: (await modelNamed(directName)).id, priority: 3, weight: 1 },
+  ]);
+
+  // And the page shows the settings it stored when it is opened again.
+  await page.reload();
+  await page.getByRole("tab", { name: "模型与路由" }).click();
+  const again = modelRow(page, publicName);
+  await again.getByRole("button", { name: "编辑", exact: true }).click();
+  const reopened = page.getByRole("form", { name: `编辑模型「${publicName}」` });
+  await expect(reopened.getByLabel("选路策略")).toHaveValue("consistent_hash");
+  await expect(reopened.getByLabel("重试次数")).toHaveValue("2");
+  await expect(reopened.getByLabel("额外重试的状态码")).toHaveValue("408, 429");
+  await expect(reopened.getByLabel("429 也参与重试和切换")).toBeChecked();
+});
+
+test("从路由表单里移除一个目标：那个账号的映射随之取消，它不再出现在路由里", async ({ page }) => {
+  const suffix = randomUUID().slice(0, 8);
+  const keepName = `acct-target-keep-${suffix}`;
+  const dropName = `acct-target-drop-${suffix}`;
+  const keep = await mockAccount(keepName, ["shared"]);
+  const drop = await mockAccount(dropName, ["shared"]);
+  const publicName = `pub-target-remove-${suffix}`;
+  const pub = await newPublicModel(publicName);
+  await serve(keep.id, pub.id);
+  await serve(drop.id, pub.id);
+  const keptDirect = `${publicName}#${keepName}`;
+  const droppedDirect = `${publicName}#${dropName}`;
+
+  await openModels(page);
+  await modelRow(page, publicName).getByRole("button", { name: "编辑", exact: true }).click();
+  const form = page.getByRole("form", { name: `编辑模型「${publicName}」` });
+  // Each target says which account it is, so the operator can pick the right one.
+  await expect(form).toContainText(`账号：${keepName}`);
+  await expect(form).toContainText(`账号：${dropName}`);
+
+  // Two steps, and the warning names the account that will stop serving it.
+  const target = form.locator("li").filter({ hasText: `账号：${dropName}` });
+  await target.getByRole("button", { name: "移除该目标" }).click();
+  const warning = target.getByRole("alert");
+  await expect(warning).toContainText(`账号「${dropName}」`);
+  await expect(warning).toContainText(publicName);
+  await target.getByRole("button", { name: "取消" }).click();
+  await expect(target.getByRole("button", { name: "移除该目标" })).toBeVisible();
+
+  await target.getByRole("button", { name: "移除该目标" }).click();
+  await target.getByRole("button", { name: "确认移除该目标" }).click();
+  await expect(page.getByText(`已移除账号「${dropName}」对「${publicName}」的映射`)).toBeVisible();
+  // The target list is regenerated from the rows: the account that no longer
+  // serves the model is no longer a target, and the other one still is.
+  await expect(target).toHaveCount(0);
+  await expect(form.locator("li").filter({ hasText: `账号：${keepName}` })).toHaveCount(1);
+
+  // The mapping is gone on the account side too, and the routing document no
+  // longer names that account's direct document — the other target stays.
+  const table = await stack.admin.get(`/admin/provider-keys/${drop.id}/channel-models`);
+  expect((table.items as Json[]).find((i) => i.public_model_id === pub.id)?.served).toBe(false);
+  expect(await modelNamed(droppedDirect)).toBeUndefined();
+  const kept = await modelNamed(keptDirect);
+  expect(kept).toBeDefined();
+  await expect.poll(() => routingOf(pub.id), { timeout: APPLIED_WITHIN_MS }).toMatchObject({
+    targets: [{ model_id: kept.id, priority: 1, weight: 1 }],
+  });
+  // Removing a target is the account's mapping, not the model's settings.
+  expect((await publicView(pub.id)).routing).toEqual({});
+});
+
 /** Whether the model list still holds a row at `id`. */
 async function modelLive(id: string): Promise<boolean> {
   return (await status(`/admin/resources/models/${id}`)) === 200;
@@ -585,11 +717,14 @@ test("公共模型生成的模型在这里只能停用：停用后两张文档�
   // `409 managed_resource` and left the row in place.)
   await expect(routeRow.getByRole("button", { name: "删除", exact: true })).toHaveCount(0);
   await expect(directRow.getByRole("button", { name: "删除", exact: true })).toHaveCount(0);
-  // 编辑 led to a save that would have been refused too; it leads to the public model instead.
-  await expect(routeRow.getByRole("button", { name: /编辑|查看/, exact: true })).toHaveCount(0);
-  await expect(routeRow.getByRole("button", { name: "去公共模型" })).toBeVisible();
-  // And it says why it has no form here, rather than leaving the operator guessing.
-  await expect(routeRow).toContainText("由公共模型生成，在这里只读");
+  // The routing document is the public name itself, so its settings are edited
+  // here; the per-account document is one account's mapping, and its editable
+  // surface is that account's 模型 section, so this row only views it.
+  await expect(routeRow.getByRole("button", { name: "编辑", exact: true })).toBeVisible();
+  await expect(directRow.getByRole("button", { name: "查看", exact: true })).toBeVisible();
+  await expect(directRow).toContainText("账号的「模型」里改");
+  // No row leads anywhere else for the public model: the page completes it.
+  await expect(page.getByRole("button", { name: "去公共模型" })).toHaveCount(0);
 
   // An enabled account still serves it, so the retire is refused: the
   // warning says so before the confirmation, and the answer says why.
