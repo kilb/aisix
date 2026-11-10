@@ -45,7 +45,7 @@ export function Gate({
       <div className="gate-card">
         <div className="gate-plate">
           <div className="gate-mark">
-            <h1 className="display">AISIX Dashboard</h1>
+            <h1 className="display">Routio 运维台</h1>
             <span className="gate-sub">控制面 · 运维登录</span>
           </div>
           <Button
