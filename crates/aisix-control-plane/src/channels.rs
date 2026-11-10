@@ -74,7 +74,7 @@ use uuid::Uuid;
 
 use crate::audit::{self, Actor, AuditEntry};
 use crate::auth::{OperatorAuth, OperatorRole};
-use crate::db::DbError;
+use crate::db::{Db, DbError};
 use crate::error::{ApiError, Detail};
 use crate::http::ApiJson;
 use crate::resources::store::{self, ResourceRow};
@@ -657,6 +657,120 @@ pub async fn regenerate(
     // later than the routing document it depends on. The tenants' rows are
     // held by the caller, before this public model's row.
     crate::keys::reproject_tenants(&mut *conn, ctx, all_scope).await
+}
+
+/// The public models whose live routing document does not carry every
+/// routing setting the model stores, each key present with its stored value:
+/// the predicate the `public_routing_kept` trigger (migration `0039`)
+/// refuses a write of the document by. `$1` is the models' kind segment and
+/// `$2` one public model's id, or `NULL` for all.
+const DIVERGED_ROUTING: &str = "SELECT p.id FROM public_models p \
+     JOIN gw_resources r ON r.kind = $1 AND r.id = p.id \
+     WHERE ($2::uuid IS NULL OR p.id = $2) AND p.retired_at IS NULL AND NOT r.deleted \
+       AND r.managed_by = 'public:' || p.id::text \
+       AND jsonb_typeof(p.routing) = 'object' \
+       AND EXISTS (SELECT 1 FROM jsonb_each(p.routing) AS s(key, value) \
+                   WHERE (r.doc -> 'routing' -> s.key) IS DISTINCT FROM s.value) \
+     ORDER BY p.id";
+
+/// What one [`repair_routing`] pass did, in counts only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RoutingRepaired {
+    /// Public models whose routing document was regenerated, each with its
+    /// own audit row.
+    pub repaired: u64,
+    /// Public models the gateway-version gate refused, or that stayed busy
+    /// past the lock timeout, left for the next pass.
+    pub deferred: u64,
+    /// Public models whose regeneration failed for another reason; the next
+    /// pass tries them again.
+    pub failed: u64,
+}
+
+/// Regenerates every public model whose live routing document does not
+/// carry the routing settings the model stores ([`DIVERGED_ROUTING`]). A
+/// control plane older than `0037` wrote such a document on a channel edit
+/// (the default strategy and none of the settings) until `0039` fenced it
+/// out; the fence judges only a write of the document, so one written
+/// before it stays as it was, served without the settings, until it is
+/// regenerated. Run at boot and by every housekeeping tick
+/// (`housekeeping::tick`).
+///
+/// One transaction per public model, under a channel edit's locks: the
+/// scope fence and every all-scope tenant's row
+/// ([`crate::tenants::lock_all_scope`]), the public model's row, then the
+/// resources lock in [`regenerate`], which writes the document through
+/// [`write_resource`] from the stored settings and the channel rows. The
+/// predicate is read again once the row is held, so a peer running the same
+/// pass, or an edit that committed meanwhile, leaves nothing to do. Each
+/// model regenerated gets one audit row, `public_model.routing_regenerated`.
+/// A model the gateway-version gate refuses, or that stays busy, is left for
+/// the next pass, and so is one that fails otherwise, logged with its id.
+pub async fn repair_routing(db: &Db, ctx: &WriteCtx) -> Result<RoutingRepaired, ApiError> {
+    let diverged: Vec<Uuid> = sqlx::query_scalar(DIVERGED_ROUTING)
+        .bind(Kind::Models.segment())
+        .bind(None::<Uuid>)
+        .fetch_all(db.pool())
+        .await
+        .map_err(DbError::from)?;
+    let mut outcome = RoutingRepaired::default();
+    for id in diverged {
+        let ctx = WriteCtx {
+            mk: crate::crypto::MasterKey(ctx.mk.0),
+            env: ctx.env.clone(),
+            cp_version: ctx.cp_version.clone(),
+            stale_secs: ctx.stale_secs,
+        };
+        let repaired = db
+            .tx(move |conn| {
+                async move {
+                    let all_scope = crate::tenants::lock_all_scope(&mut *conn).await?;
+                    let row = lock_public(&mut *conn, id).await?;
+                    let still: Option<Uuid> = sqlx::query_scalar(DIVERGED_ROUTING)
+                        .bind(Kind::Models.segment())
+                        .bind(Some(id))
+                        .fetch_optional(&mut *conn)
+                        .await
+                        .map_err(DbError::from)?;
+                    if still.is_none() {
+                        return Ok(false);
+                    }
+                    regenerate(&mut *conn, &ctx, id, &all_scope).await?;
+                    audit::record(
+                        &mut *conn,
+                        AuditEntry {
+                            actor: Actor::System,
+                            action: "public_model.routing_regenerated",
+                            target_kind: "public_model",
+                            target_id: Some(id.to_string()),
+                            tenant_id: None,
+                            detail: json!({"name": row.name}),
+                        },
+                    )
+                    .await?;
+                    Ok::<_, ApiError>(true)
+                }
+                .boxed()
+            })
+            .await;
+        match repaired {
+            Ok(false) => {}
+            Ok(true) => outcome.repaired += 1,
+            Err(e) if crate::compat::refused(&e) || e.status == StatusCode::SERVICE_UNAVAILABLE => {
+                outcome.deferred += 1;
+            }
+            Err(e) => {
+                outcome.failed += 1;
+                tracing::warn!(
+                    public_model_id = %id,
+                    code = e.code,
+                    "a public model's routing document could not be regenerated from its stored \
+                     settings"
+                );
+            }
+        }
+    }
+    Ok(outcome)
 }
 
 /// Rewrites the direct documents of account `provider_key_id`'s enabled

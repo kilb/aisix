@@ -507,6 +507,13 @@ statement.
   A migration may also fence an old path, as `0027` does with its `BEFORE
   INSERT` triggers: that is a one-way change, and while both versions run an
   older replica's intake fails and its batch is resent (see `Db::migrate`).
+  A fence on `gw_resources` fires only on a write of the document (`INSERT`,
+  `UPDATE OF doc, deleted, managed_by`, as `0039`'s `public_routing_kept`
+  does): the projector updates every row's projection columns after its kine
+  write, and a row a fence refuses there stops every pass at its `seq`. A
+  row that broke the rule before the fence existed is repaired through
+  `write_resource` (`channels::repair_routing`, run by every housekeeping
+  tick), never by the fence.
 
 ## Defaults fail closed
 

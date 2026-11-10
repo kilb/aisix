@@ -21,6 +21,15 @@
 -- (a tombstone) is not judged. Like 0027's fences this is one-way: while an
 -- older control plane runs beside a newer one, its channel edits of a model
 -- with stored settings answer an error.
+--
+-- Only a write of the document is judged: an insert, and an update that sets
+-- `doc`, `deleted` or `managed_by`. The projector updates its projection
+-- columns on every row after it writes the row to kine, and a reconcile
+-- marks a drifted row the same way; a routing document that diverged before
+-- this fence existed must not fail those, or every projector pass would stop
+-- at its `seq` and no later document, a revocation included, would reach the
+-- gateways. Such a document is regenerated from the stored settings at boot
+-- and on every housekeeping tick (`channels::repair_routing`).
 CREATE FUNCTION public_routing_kept() RETURNS trigger
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -46,5 +55,5 @@ END
 $$;
 
 CREATE TRIGGER public_routing_kept
-  BEFORE INSERT OR UPDATE ON gw_resources
+  BEFORE INSERT OR UPDATE OF doc, deleted, managed_by ON gw_resources
   FOR EACH ROW EXECUTE FUNCTION public_routing_kept();
