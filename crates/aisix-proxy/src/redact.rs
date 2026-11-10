@@ -964,6 +964,107 @@ pub fn redact_json_encoded(
     let _ = redact_json_encoded_structured(chain, dir, encoded, counts, false);
 }
 
+/// Builds a JSON tree like `serde_json::Value`'s own deserializer does,
+/// except that an object naming a key more than once keeps every value of
+/// that key, in document order, as an array under the key, and reports that
+/// it did.
+///
+/// `serde_json` keeps only the last of a repeated key, while the encoded
+/// string a request or a response carries keeps them all, and RFC 8259 §4
+/// leaves which one a reader takes to the reader. A scan of the last-wins
+/// tree therefore reads one value and lets the others through unread.
+struct EveryValue<'a> {
+    repeated: &'a mut bool,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for EveryValue<'_> {
+    type Value = Value;
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<Value, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for EveryValue<'_> {
+    type Value = Value;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("any JSON value")
+    }
+    fn visit_bool<E>(self, v: bool) -> Result<Value, E> {
+        Ok(Value::Bool(v))
+    }
+    fn visit_i64<E>(self, v: i64) -> Result<Value, E> {
+        Ok(Value::from(v))
+    }
+    fn visit_u64<E>(self, v: u64) -> Result<Value, E> {
+        Ok(Value::from(v))
+    }
+    fn visit_f64<E>(self, v: f64) -> Result<Value, E> {
+        Ok(serde_json::Number::from_f64(v).map_or(Value::Null, Value::Number))
+    }
+    fn visit_str<E>(self, v: &str) -> Result<Value, E> {
+        Ok(Value::String(v.to_owned()))
+    }
+    fn visit_string<E>(self, v: String) -> Result<Value, E> {
+        Ok(Value::String(v))
+    }
+    fn visit_unit<E>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+    fn visit_none<E>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
+        let mut items = Vec::new();
+        while let Some(item) = seq.next_element_seed(EveryValue {
+            repeated: &mut *self.repeated,
+        })? {
+            items.push(item);
+        }
+        Ok(Value::Array(items))
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+        let mut out = serde_json::Map::new();
+        let mut repeated_keys: Vec<String> = Vec::new();
+        while let Some(key) = map.next_key::<String>()? {
+            let value = map.next_value_seed(EveryValue {
+                repeated: &mut *self.repeated,
+            })?;
+            let Some(slot) = out.get_mut(&key) else {
+                out.insert(key, value);
+                continue;
+            };
+            *self.repeated = true;
+            if repeated_keys.contains(&key) {
+                if let Value::Array(all) = slot {
+                    all.push(value);
+                }
+            } else {
+                let first = std::mem::take(slot);
+                *slot = Value::Array(vec![first, value]);
+                repeated_keys.push(key);
+            }
+        }
+        Ok(Value::Object(out))
+    }
+}
+
+/// `encoded` parsed as JSON, and whether an object in it repeats a key
+/// (see [`EveryValue`]). Without a repeated key the tree is the one
+/// `serde_json::from_str::<Value>` builds.
+fn parse_every_value(encoded: &str) -> serde_json::Result<(Value, bool)> {
+    use serde::de::DeserializeSeed;
+    let mut repeated = false;
+    let mut de = serde_json::Deserializer::from_str(encoded);
+    let value = EveryValue {
+        repeated: &mut repeated,
+    }
+    .deserialize(&mut de)?;
+    de.end()?;
+    Ok((value, repeated))
+}
+
 fn redact_json_encoded_structured(
     chain: &dyn Guardrail,
     dir: Direction,
@@ -974,9 +1075,9 @@ fn redact_json_encoded_structured(
     if encoded.is_empty() {
         return false;
     }
-    match serde_json::from_str::<Value>(encoded) {
-        Ok(mut v) => {
-            let unrewritable_tool_key = if detect_keys {
+    match parse_every_value(encoded) {
+        Ok((mut v, repeated)) => {
+            let mut unrewritable_tool_key = if detect_keys {
                 let mut key_counts = RedactionCounts::new();
                 let found = detect_unrewritable_object_keys(chain, dir, &v, &mut key_counts);
                 merge_counts(counts, key_counts);
@@ -988,7 +1089,18 @@ fn redact_json_encoded_structured(
             let mut value_counts = RedactionCounts::new();
             walk_value_strings(chain, dir, &mut v, &mut value_counts, !detect_keys);
             if !value_counts.is_empty() {
-                if let Ok(s) = serde_json::to_string(&v) {
+                if repeated {
+                    // A document that repeats a key was scanned with every
+                    // value it carries, and goes out as written when nothing
+                    // matched. A match in it cannot be written back:
+                    // re-serialising keeps one value per key, which changes
+                    // what the document says, and which value a reader takes
+                    // is the reader's choice. So it is reported the way an
+                    // unrewritable key is, and the caller refuses rather than
+                    // forward the unmasked bytes.
+                    merge_counts(counts, value_counts);
+                    unrewritable_tool_key = true;
+                } else if let Ok(s) = serde_json::to_string(&v) {
                     *encoded = s;
                     merge_counts(counts, value_counts);
                 }
@@ -4862,6 +4974,147 @@ mod tests {
 
     fn both() -> Arc<dyn Guardrail> {
         mask_chain(aisix_core::models::GuardrailHookPoint::Both)
+    }
+
+    /// Without a repeated key the tree is the one `serde_json` builds, so the
+    /// ordinary path is unchanged; with one, every value is kept.
+    #[test]
+    fn parse_every_value_is_serde_json_until_a_key_repeats() {
+        for doc in [
+            r#"{"a":1,"b":[1.5,-2,true,null,"s"],"c":{"d":"A"}}"#,
+            r#"[{"x":{}},[],"",0,18446744073709551615,-9223372036854775808]"#,
+            r#""plain""#,
+            "3.25e10",
+        ] {
+            let (tree, repeated) = parse_every_value(doc).unwrap();
+            assert!(!repeated, "{doc}");
+            assert_eq!(tree, serde_json::from_str::<Value>(doc).unwrap(), "{doc}");
+        }
+        let (tree, repeated) =
+            parse_every_value(r#"{"x":"a","y":{"z":1,"z":[2]},"x":"b","x":"c"}"#).unwrap();
+        assert!(repeated);
+        assert_eq!(tree, json!({"x": ["a", "b", "c"], "y": {"z": [1, [2]]}}));
+        assert!(parse_every_value(r#"{"x":1} trailing"#).is_err());
+    }
+
+    /// A tool call's arguments string reaches the upstream as written, so a
+    /// scan has to read every value a repeated key carries: the last-wins
+    /// tree reads only the last one and forwards the others unscanned (R-070).
+    /// A match there cannot be written back, so it is reported as a refusal,
+    /// on every family that carries an encoded arguments string.
+    #[test]
+    fn a_repeated_argument_key_is_scanned_whole_and_refused_not_forwarded() {
+        let chain = both();
+        for args in [
+            r#"{"x":"alice@example.com","x":"safe"}"#,
+            r#"{"x":"safe","x":"alice@example.com"}"#,
+            r#"{"x":"alice@example.com","x":"safe"}"#,
+            r#"{"x":{"y":"alice@example.com"},"x":"safe"}"#,
+        ] {
+            let mut chat: ChatFormat = serde_json::from_value(json!({
+                "model": "m",
+                "messages": [
+                    {"role": "user", "content": "clean"},
+                    {"role": "assistant", "content": null, "tool_calls": [{
+                        "id": "call_1", "type": "function",
+                        "function": {"name": "send", "arguments": args}
+                    }]},
+                    {"role": "tool", "tool_call_id": "call_1", "content": "ok"}
+                ]
+            }))
+            .unwrap();
+            let redaction = redact_chat_format_structured(chain.as_ref(), &mut chat);
+            assert!(redaction.unrewritable_tool_key, "chat request {args}");
+            assert_eq!(
+                chat.messages[1].extra["tool_calls"][0]["function"]["arguments"], args,
+                "a refused body is left as written"
+            );
+
+            let mut body = json!({"input": [
+                {"type": "function_call", "call_id": "c", "name": "send", "arguments": args}
+            ]});
+            let redaction = redact_responses_request_structured(chain.as_ref(), &mut body);
+            assert!(redaction.unrewritable_tool_key, "responses request {args}");
+            assert_eq!(body["input"][0]["arguments"], args);
+
+            let mut resp = ChatResponse {
+                logprobs: None,
+                more_choices: Vec::new(),
+                id: String::new(),
+                model: "m".into(),
+                message: ChatMessage::assistant(String::new()),
+                finish_reason: aisix_gateway::FinishReason::ToolCalls,
+                usage: aisix_gateway::UsageStats::new(0, 0),
+                service_tier: None,
+            };
+            resp.message.extra.insert(
+                "tool_calls".into(),
+                json!([{"id": "call_1", "type": "function",
+                        "function": {"name": "send", "arguments": args}}]),
+            );
+            let redaction = redact_chat_response_structured(chain.as_ref(), &mut resp);
+            assert!(redaction.unrewritable_tool_key, "chat response {args}");
+            assert_eq!(
+                resp.message.extra["tool_calls"][0]["function"]["arguments"],
+                args
+            );
+        }
+    }
+
+    /// Nothing matched: the repeated key is the caller's to send, so the
+    /// string goes out byte for byte rather than refused or normalised.
+    #[test]
+    fn a_clean_repeated_argument_key_goes_out_as_written() {
+        let chain = both();
+        let args = r#"{"x":"a","x":"b"}"#;
+        let mut chat: ChatFormat = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "assistant", "content": null, "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": {"name": "send", "arguments": args}
+            }]}]
+        }))
+        .unwrap();
+        let redaction = redact_chat_format_structured(chain.as_ref(), &mut chat);
+        assert!(!redaction.unrewritable_tool_key);
+        assert!(redaction.counts.is_empty());
+        assert_eq!(
+            chat.messages[0].extra["tool_calls"][0]["function"]["arguments"],
+            args
+        );
+    }
+
+    /// A block-action rule judges each value a repeated key carries, so the
+    /// shadowed one is refused like any other (the local segment pass reads
+    /// the same walk).
+    #[tokio::test]
+    async fn a_block_rule_sees_the_value_a_repeated_key_shadows() {
+        let chain: Arc<dyn Guardrail> =
+            Arc::new(GuardrailChain::new(vec![Arc::new(PiiGuardrail::new(
+                vec![builtin_rule("email", PiiAction::Block).unwrap()],
+                aisix_core::models::GuardrailHookPoint::Both,
+                262_144,
+                false,
+            ))]));
+        let mut chat: ChatFormat = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "assistant", "content": null, "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": {"name": "send",
+                             "arguments": r#"{"x":"alice@example.com","x":"safe"}"#}
+            }]}]
+        }))
+        .unwrap();
+        let moderation = moderate_chat_format_structured(
+            chain.as_ref(),
+            None,
+            aisix_guardrails::GuardrailVerdict::Allow,
+            &mut chat,
+            &mut RedactionCounts::new(),
+            &mut Vec::new(),
+        )
+        .await;
+        assert!(moderation.verdict.is_block());
     }
 
     /// `redact_anthropic_sse`, as the rewrite and its counts.
