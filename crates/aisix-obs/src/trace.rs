@@ -218,6 +218,11 @@ struct AttemptSpan {
     /// Stamped when the attempt settles ([`RequestTraceBundle::end_attempt`]);
     /// `None` for an attempt still in flight at emission time.
     end_unix_nano: Option<u64>,
+    /// Cleared when the attempt settled without reaching the upstream
+    /// ([`RequestTraceBundle::mark_not_dispatched`]): a target's own rate
+    /// limit refused it, or the request could not be assembled. Such an
+    /// attempt exports no CLIENT span.
+    dispatched: bool,
 }
 
 /// The request-owned trace identity: minted once at request start,
@@ -333,6 +338,7 @@ impl RequestTraceBundle {
                 span_id: SpanId::random(),
                 start_unix_nano: now,
                 end_unix_nano: None,
+                dispatched: true,
             });
         }
     }
@@ -353,6 +359,21 @@ impl RequestTraceBundle {
         }
     }
 
+    /// Record that attempt `index` settled without an upstream call. Called
+    /// from `RoutingTelemetry`'s settle step for an attempt recorded with
+    /// `dispatched: false`. The attempt keeps its index, and its usage event
+    /// and the request's SERVER span still report the refusal, but no
+    /// CLIENT span claims an upstream call that never happened.
+    pub fn mark_not_dispatched(&self, index: u32) {
+        let mut attempts = self
+            .attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(a) = attempts.get_mut(index as usize) {
+            a.dispatched = false;
+        }
+    }
+
     /// Snapshot the spans one usage event carries.
     ///
     /// Non-terminal (`terminal = false`): the event describes one failed /
@@ -367,6 +388,9 @@ impl RequestTraceBundle {
     /// when the handler measured a longer duration than the commit-time
     /// stamp — the streaming case, where `record()` fires at commit but
     /// the upstream keeps streaming.
+    ///
+    /// An attempt marked [`Self::mark_not_dispatched`] counts as no attempt
+    /// here: it gets no attempt span and does not open the logical span.
     ///
     /// A request that never dispatched an attempt (`attempts` empty):
     /// - `dispatched_upstream` — a family that dispatches without
@@ -405,25 +429,28 @@ impl RequestTraceBundle {
         let terminal_requested = terminal;
         let terminal = terminal && !self.terminal_emitted.swap(true, Ordering::AcqRel);
 
-        let attempt_span = attempts.get(attempt_index as usize).map(|a| {
-            let mut end = a.end_unix_nano.unwrap_or(now);
-            if terminal {
-                // The winning streaming attempt: `record()` stamped the
-                // commit, the handler measured the full stream. Both are
-                // real monotonic measurements from the same dispatch
-                // boundary; take the longer, clamped to now.
-                end = end
-                    .max(a.start_unix_nano.saturating_add(latency_nanos))
-                    .min(now);
-            }
-            SpanEmit {
-                role: SpanRole::Attempt,
-                span_id: a.span_id,
-                parent_span_id: Some(self.logical_span_id),
-                start_unix_nano: a.start_unix_nano,
-                end_unix_nano: end,
-            }
-        });
+        let attempt_span = attempts
+            .get(attempt_index as usize)
+            .filter(|a| a.dispatched)
+            .map(|a| {
+                let mut end = a.end_unix_nano.unwrap_or(now);
+                if terminal {
+                    // The winning streaming attempt: `record()` stamped the
+                    // commit, the handler measured the full stream. Both are
+                    // real monotonic measurements from the same dispatch
+                    // boundary; take the longer, clamped to now.
+                    end = end
+                        .max(a.start_unix_nano.saturating_add(latency_nanos))
+                        .min(now);
+                }
+                SpanEmit {
+                    role: SpanRole::Attempt,
+                    span_id: a.span_id,
+                    parent_span_id: Some(self.logical_span_id),
+                    start_unix_nano: a.start_unix_nano,
+                    end_unix_nano: end,
+                }
+            });
         // A non-terminal event from a dispatch path outside the attempt
         // chokepoints — an ensemble panel member or judge sub-call, the
         // known trunk bypass — still describes real upstream work:
@@ -457,11 +484,13 @@ impl RequestTraceBundle {
                 start_unix_nano: self.server_start_unix_nano,
                 end_unix_nano: now,
             });
-            if let Some(first) = attempts.first() {
+            if let Some(first) = attempts.iter().find(|a| a.dispatched) {
                 // Logical span: first dispatch → last settle (extended to
-                // this terminal event's own measured end).
+                // this terminal event's own measured end). Attempts that
+                // never reached the upstream are no part of it.
                 let last_end = attempts
                     .iter()
+                    .filter(|a| a.dispatched)
                     .filter_map(|a| a.end_unix_nano)
                     .max()
                     .unwrap_or(now)
@@ -748,6 +777,67 @@ mod tests {
         assert!(logical.end_unix_nano <= server.end_unix_nano);
         assert!(logical.start_unix_nano <= failed_span.start_unix_nano);
         assert!(attempt.end_unix_nano <= logical.end_unix_nano);
+    }
+
+    /// An attempt that never reached the upstream (a target's own rate limit
+    /// refused it) exports no CLIENT span: not its own non-terminal event's
+    /// attempt span, and no logical span when it was the only one, so an
+    /// all-local refusal is the SERVER span alone. A later real attempt
+    /// still gets its logical parent and attempt child, starting at the
+    /// real dispatch; a real zero-length call is still a span.
+    #[test]
+    fn an_undispatched_attempt_exports_no_client_span() {
+        // All local.
+        let bundle = RequestTraceBundle::new(None);
+        bundle.start_attempt(0);
+        bundle.end_attempt(0);
+        bundle.mark_not_dispatched(0);
+        assert!(bundle.emission(false, 0, 0, false).spans.is_empty());
+        let roles: Vec<_> = bundle
+            .emission(true, 0, 0, false)
+            .spans
+            .iter()
+            .map(|s| s.role)
+            .collect();
+        assert_eq!(roles, vec![SpanRole::Server]);
+
+        // Local, then real.
+        let bundle = RequestTraceBundle::new(None);
+        bundle.start_attempt(0);
+        bundle.end_attempt(0);
+        bundle.mark_not_dispatched(0);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        bundle.start_attempt(1);
+        bundle.end_attempt(1);
+        assert!(bundle.emission(false, 0, 0, false).spans.is_empty());
+        let terminal = bundle.emission(true, 1, 5, true);
+        let real_start = bundle.attempts.lock().unwrap()[1].start_unix_nano;
+        let logical = terminal
+            .spans
+            .iter()
+            .find(|s| s.role == SpanRole::Logical)
+            .expect("a logical span for the real dispatch");
+        assert_eq!(logical.start_unix_nano, real_start);
+        let attempts: Vec<_> = terminal
+            .spans
+            .iter()
+            .filter(|s| s.role == SpanRole::Attempt)
+            .collect();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].start_unix_nano, real_start);
+
+        // Control: a real dispatch measured at 0ms keeps its span.
+        let bundle = RequestTraceBundle::new(None);
+        bundle.start_attempt(0);
+        bundle.end_attempt(0);
+        let roles: Vec<_> = bundle
+            .emission(true, 0, 0, true)
+            .spans
+            .iter()
+            .map(|s| s.role)
+            .collect();
+        assert!(roles.contains(&SpanRole::Attempt), "{roles:?}");
+        assert!(roles.contains(&SpanRole::Logical), "{roles:?}");
     }
 
     /// Ids must be identical across repeated snapshots — the delivery
