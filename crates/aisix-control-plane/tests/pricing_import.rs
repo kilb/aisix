@@ -1218,7 +1218,11 @@ async fn a_proposal_only_a_dropped_price_flagged_can_be_confirmed() {
     let model_id = model(&cp, &op, "openai", "gpt-4.1").await;
     let batch = upload(&cp, &op).await;
     let proposal = current(&proposals(&cp, &op, &batch).await, "openai", "gpt-4.1").clone();
-    assert_eq!(proposal["flags"], json!(["unsupported_field"]), "{proposal}");
+    assert_eq!(
+        proposal["flags"],
+        json!(["unsupported_field"]),
+        "{proposal}"
+    );
     assert_eq!(
         proposal["dropped"],
         json!(["storage_searches_kcount"]),
@@ -1291,8 +1295,7 @@ async fn a_flagged_proposal_cannot_be_confirmed() {
 
     // One flag that blocks a confirmation while its card still stands, and
     // one whose prices made no card at all.
-    let blocking: Vec<&str> = ["time_of_day", "unsupported_variant", "invalid_card"]
-        .to_vec();
+    let blocking: Vec<&str> = ["time_of_day", "unsupported_variant", "invalid_card"].to_vec();
     let flagged = all
         .iter()
         .find(|p| {

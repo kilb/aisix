@@ -742,7 +742,11 @@ async fn the_preview_names_what_a_sync_would_do_to_each_model() {
     // The price it cannot meter is named, so the operator sees what a sync
     // from this entry does not bill.
     assert_eq!(f["entry"]["flags"], json!(["unsupported_field"]), "{f}");
-    assert_eq!(f["entry"]["dropped"], json!(["storage_searches_kcount"]), "{f}");
+    assert_eq!(
+        f["entry"]["dropped"],
+        json!(["storage_searches_kcount"]),
+        "{f}"
+    );
     // What it can meter is on the card.
     let (_, prices) = source("openai", "gpt-4o-mini");
     assert_eq!(

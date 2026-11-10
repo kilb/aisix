@@ -1736,20 +1736,18 @@ mod tests {
             .map(|i| format!(r#"{{"start":{},"price":2}}"#, i * 1000))
             .collect::<Vec<_>>()
             .join(",");
-        let e = entries(&dataset(&[
-            provider(
-                "p",
-                &[
-                    model("m", r#"{"equals":"m"}"#),
-                    r#"{"id":"odd","prices":{"input_mtok":1,"output_mtok":2,"storage_mtok":3}}"#
-                        .to_string(),
-                    format!(
-                        r#"{{"id":"cut","prices":{{"input_mtok":1,"output_mtok":2,
+        let e = entries(&dataset(&[provider(
+            "p",
+            &[
+                model("m", r#"{"equals":"m"}"#),
+                r#"{"id":"odd","prices":{"input_mtok":1,"output_mtok":2,"storage_mtok":3}}"#
+                    .to_string(),
+                format!(
+                    r#"{{"id":"cut","prices":{{"input_mtok":1,"output_mtok":2,
                              "cache_read_mtok":{{"base":0.1,"tiers":[{over_cap}]}}}}}}"#
-                    ),
-                ],
-            ),
-        ]));
+                ),
+            ],
+        )]));
         let card = serde_json::to_value(e[0].card.as_ref().expect("a card")).expect("JSON");
         assert_eq!(state_of(&e[0], None), SyncState::Create);
         assert_eq!(state_of(&e[0], Some(&baseline(card))), SyncState::Same);
