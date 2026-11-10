@@ -1401,12 +1401,22 @@ export interface SyncItem {
   model_id: string;
   name: string;
   state: SyncState;
-  /** `exact`: the name is the entry's id; `alias`: by id or alias, case or a provider prefix aside. */
-  matched_by: "exact" | "alias" | null;
+  /** `exact`: the name is the entry's id; `alias`: by id or alias, case or a provider prefix aside; `adapter`: by the protocol an account serving it speaks; `chosen`: the entry an operator chose. */
+  matched_by: "exact" | "alias" | "adapter" | "chosen" | null;
   entry: LibraryEntry | null;
-  /** Every candidate of an ambiguous model, none of them picked. */
-  candidates: { provider: string; model: string; name: string | null }[];
+  /** Every candidate of an ambiguous model, each with what choosing it takes. */
+  candidates: SyncCandidate[];
+  /** The entry an operator chose for this model, and whether the library still holds it. */
+  binding: { provider: string; model: string; chosen_at: string; in_library: boolean } | null;
   current: BaselineRevision | null;
+}
+
+/** One candidate of an ambiguous model: its entry, its headline rates, and what a sync from it would do. */
+export interface SyncCandidate extends LibraryEntry {
+  /** The `default` tier's base rates, USD per million; `null` without a card. */
+  input: string | null;
+  output: string | null;
+  state: SyncState;
 }
 
 export interface SyncPreview {
@@ -1450,6 +1460,10 @@ export const library = {
     return (
       await call<{ revisions: BaselineRevision[]; warnings: PriceWarning[] }>("POST", "/admin/pricing/library/sync", body)
     ).data;
+  },
+  /** Forgets the entry chosen for an ambiguous model: it is matched by name again. */
+  async unbind(modelId: string): Promise<void> {
+    await call<null>("DELETE", `/admin/pricing/library/bindings/${seg(modelId)}`);
   },
 };
 

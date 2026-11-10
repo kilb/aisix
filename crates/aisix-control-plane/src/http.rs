@@ -671,6 +671,12 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
         "/admin/pricing/library/sync",
         MinRole::Op(OperatorRole::Operator),
     ),
+    // Forgetting the entry chosen for an ambiguous model.
+    (
+        "DELETE",
+        "/admin/pricing/library/bindings/{model_id}",
+        MinRole::Op(OperatorRole::Operator),
+    ),
     // Gateways, on the gateway listener.
     ("POST", "/dp/heartbeat", MinRole::Dp),
     ("GET", "/dp/v1/keys/{key_id}/prices", MinRole::Dp),
@@ -964,6 +970,10 @@ pub fn browser_router(state: AppState) -> Router {
         .route(
             "/admin/pricing/library/sync",
             get(pricing::library::preview).post(pricing::library::sync),
+        )
+        .route(
+            "/admin/pricing/library/bindings/{model_id}",
+            axum::routing::delete(pricing::library::unbind),
         )
         .route_layer(axum::middleware::from_fn(json_only))
         .route_layer(axum::middleware::from_fn(only_listed_routes))

@@ -511,17 +511,31 @@ async fn an_upload_fills_the_library_and_the_browse_finds_by_name_or_provider() 
 
 /// An upstream account of `provider`; its id.
 async fn account(cp: &TestCp, op: &OperatorSession, provider: &str) -> Uuid {
+    speaking(cp, op, provider, None).await
+}
+
+/// An upstream account of `provider` speaking `adapter`; its id.
+async fn speaking(
+    cp: &TestCp,
+    op: &OperatorSession,
+    provider: &str,
+    adapter: Option<&str>,
+) -> Uuid {
+    let mut doc = json!({
+        "display_name": format!("acct-lib-{}", Uuid::new_v4().simple()),
+        "provider": provider,
+        "api_key": "sk-library-upstream-3d9",
+        "groups": ["shared"],
+    });
+    if let Some(adapter) = adapter {
+        doc["adapter"] = json!(adapter);
+    }
     let r = cp
         .send(
             "POST",
             "/admin/resources/provider_keys",
             Some(op.cookie()),
-            Some(json!({"doc": {
-                "display_name": format!("acct-lib-{}", Uuid::new_v4().simple()),
-                "provider": provider,
-                "api_key": "sk-library-upstream-3d9",
-                "groups": ["shared"],
-            }})),
+            Some(json!({ "doc": doc })),
         )
         .await;
     assert_eq!(r.status, 201, "{r:?}");
@@ -531,6 +545,11 @@ async fn account(cp: &TestCp, op: &OperatorSession, provider: &str) -> Uuid {
 /// A public model `name` served by a new account of `provider`; its id.
 async fn served(cp: &TestCp, op: &OperatorSession, name: &str, provider: &str) -> Uuid {
     let pk = account(cp, op, provider).await;
+    served_by(cp, op, name, pk).await
+}
+
+/// A public model `name` served by the account `pk`; its id.
+async fn served_by(cp: &TestCp, op: &OperatorSession, name: &str, pk: Uuid) -> Uuid {
     let public = public_model(cp, op, name).await;
     let r = cp
         .send(
@@ -547,6 +566,18 @@ async fn served(cp: &TestCp, op: &OperatorSession, name: &str, provider: &str) -
 /// A hand-made direct model named `name` of `provider`; its id.
 async fn direct(cp: &TestCp, op: &OperatorSession, name: &str, provider: &str) -> Uuid {
     let pk = account(cp, op, provider).await;
+    direct_on(cp, op, name, provider, pk).await
+}
+
+/// A hand-made direct model named `name` of `provider` on the account `pk`;
+/// its id.
+async fn direct_on(
+    cp: &TestCp,
+    op: &OperatorSession,
+    name: &str,
+    provider: &str,
+    pk: Uuid,
+) -> Uuid {
     let r = cp
         .send(
             "POST",
@@ -893,22 +924,13 @@ async fn a_sync_of_a_preview_that_moved_is_refused_and_writes_nothing() {
     // A card other than the library's: not what the operator attested.
     let mut moved = two.clone();
     moved["card"] = json!({"default": {"base": {"input": "0.01", "output": "0.02"}}});
-    // An ambiguous model, listed under one of its candidates with that
-    // candidate's own card.
-    let candidates = get(&cp, &op, &format!("{LIBRARY}?q=command-r&limit=200")).await;
-    let cohere = candidates["items"]
-        .as_array()
-        .expect("items")
-        .iter()
-        .find(|e| e["provider"] == "cohere" && e["model"] == "command-r")
-        .unwrap_or_else(|| panic!("cohere/command-r in {candidates}"))
-        .clone();
-    assert_eq!(cohere["flags"], json!([]), "{cohere}");
+    // An ambiguous model, listed under an entry that is none of its
+    // candidates, with that entry's own card.
     let picked = json!({
         "model_id": ambiguous,
         "provider": "cohere",
-        "model": "command-r",
-        "card": cohere["card"],
+        "model": "command-a",
+        "card": one["card"],
     });
     // An entry other than the one matched, with that entry's card.
     let mut other = two.clone();
@@ -959,4 +981,406 @@ async fn a_sync_of_a_preview_that_moved_is_refused_and_writes_nothing() {
         "only the manual baseline was written"
     );
     assert!(audits(&cp, "pricing.library.sync").await.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Narrowing by the serving accounts' protocol, and choosing a candidate.
+// ---------------------------------------------------------------------------
+
+const BINDINGS: &str = "/admin/pricing/library/bindings";
+
+/// The candidate of `provider` among a previewed ambiguous `item`'s.
+fn candidate(item: &Value, provider: &str) -> Value {
+    item["candidates"]
+        .as_array()
+        .expect("candidates")
+        .iter()
+        .find(|c| c["provider"] == provider)
+        .unwrap_or_else(|| panic!("a {provider} candidate in {item}"))
+        .clone()
+}
+
+/// A sync request's item listing `model` under `candidate`, as the page
+/// sends a choice.
+fn choosing(model: Uuid, candidate: &Value) -> Value {
+    json!({
+        "model_id": model,
+        "provider": candidate["provider"],
+        "model": candidate["model"],
+        "card": candidate["card"],
+    })
+}
+
+/// The entry recorded as chosen for `model`, as `provider/model`.
+async fn binding(cp: &TestCp, model: Uuid) -> Option<String> {
+    sqlx::query_scalar(
+        "SELECT provider || '/' || model FROM pricing_library_bindings WHERE model_id = $1",
+    )
+    .bind(model)
+    .fetch_optional(cp.db().pool())
+    .await
+    .expect("read the binding")
+}
+
+/// `item`'s matched entry as `provider/model`, and how it matched.
+fn matched(item: &Value) -> (String, Value) {
+    (
+        format!(
+            "{}/{}",
+            item["entry"]["provider"].as_str().unwrap_or_default(),
+            item["entry"]["model"].as_str().unwrap_or_default()
+        ),
+        item["matched_by"].clone(),
+    )
+}
+
+#[tokio::test]
+async fn an_account_of_the_platforms_own_provider_finds_the_entry_of_the_protocol_it_speaks() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    upload(&cp, &op, "v2-7de757d").await;
+    // The production shape: a provider id of the platform's own, and the
+    // protocol the account speaks. The first party, a cloud and others all
+    // price these names.
+    let anthropic = speaking(&cp, &op, "matrix-7c1", Some("anthropic")).await;
+    let openai = speaking(&cp, &op, "matrix-7c1", Some("openai")).await;
+    let claude = served_by(&cp, &op, "claude-opus-4-5", anthropic).await;
+    let gpt = direct_on(&cp, &op, "gpt-4o", "matrix-7c1", openai).await;
+    // No adapter: nothing to narrow on.
+    let bare = served(&cp, &op, "claude-opus-4-7", "matrix-7c1").await;
+    // The model's own provider wins over the protocol its account speaks.
+    let google = speaking(&cp, &op, "google", Some("anthropic")).await;
+    let own = served_by(&cp, &op, "claude-sonnet-4-5", google).await;
+
+    let p = preview(&cp, &op, None).await;
+    let c = item(&p, claude);
+    assert_eq!(
+        matched(&c),
+        ("anthropic/claude-opus-4-5".to_string(), json!("adapter")),
+        "{c}"
+    );
+    assert_eq!(c["state"], "create", "{c}");
+    let (_, prices) = source("anthropic", "claude-opus-4-5");
+    assert_eq!(
+        rate(&c["entry"]["card"], "input"),
+        micros(&prices["input_mtok"])
+    );
+    let g = item(&p, gpt);
+    assert_eq!(
+        matched(&g),
+        ("openai/gpt-4o".to_string(), json!("adapter")),
+        "{g}"
+    );
+    let b = item(&p, bare);
+    assert_eq!(b["state"], "ambiguous", "{b}");
+    assert!(
+        b["candidates"].as_array().map(Vec::len).unwrap_or_default() > 1,
+        "{b}"
+    );
+    let o = item(&p, own);
+    assert_eq!(
+        matched(&o),
+        ("google/claude-sonnet-4-5".to_string(), json!("exact")),
+        "{o}"
+    );
+
+    // Matched, so synced as any other match, and no choice is recorded.
+    let r = sync(
+        &cp,
+        &op,
+        json!({"library_id": p["library"]["id"], "attested": true, "items": [listed(&c)]}),
+    )
+    .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    assert_eq!(
+        baseline_of(&cp, &op, claude).await["source"]["library_entry"],
+        "anthropic/claude-opus-4-5"
+    );
+    assert_eq!(binding(&cp, claude).await, None);
+    assert!(audits(&cp, "pricing.library.bind").await.is_empty());
+}
+
+#[tokio::test]
+async fn an_ambiguous_model_syncs_from_the_candidate_chosen_and_keeps_the_choice() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    upload(&cp, &op, "v2-7de757d").await;
+    // Two providers price it, at different prices, and its own is neither.
+    let model = served(&cp, &op, "command-r", "relay-7c1").await;
+    let p = preview(&cp, &op, None).await;
+    let a = item(&p, model);
+    assert_eq!(a["state"], "ambiguous", "{a}");
+    assert_eq!(a["binding"], Value::Null, "{a}");
+    // Each candidate carries what choosing it takes: its rates, its page,
+    // its card, and what a sync from it would do.
+    let (page, prices) = source("cohere", "command-r");
+    let cohere = candidate(&a, "cohere");
+    assert_eq!(cohere["model"], "command-r");
+    assert_eq!(
+        micros(cohere["input"].as_str().unwrap_or("x")),
+        micros(&prices["input_mtok"])
+    );
+    assert_eq!(
+        micros(cohere["output"].as_str().unwrap_or("x")),
+        micros(&prices["output_mtok"])
+    );
+    assert_eq!(cohere["pricing_url"], json!(page));
+    assert_eq!(
+        rate(&cohere["card"], "input"),
+        micros(&prices["input_mtok"])
+    );
+    assert_eq!(cohere["state"], "create", "{cohere}");
+    let (_, theirs) = source("openrouter", "command-r");
+    let openrouter = candidate(&a, "openrouter");
+    assert_eq!(
+        micros(openrouter["input"].as_str().unwrap_or("x")),
+        micros(&theirs["input_mtok"])
+    );
+    assert_eq!(openrouter["state"], "create", "{openrouter}");
+
+    let r = sync(
+        &cp,
+        &op,
+        json!({
+            "library_id": p["library"]["id"],
+            "attested": true,
+            "items": [choosing(model, &cohere)],
+        }),
+    )
+    .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    let written = baseline_of(&cp, &op, model).await;
+    assert_eq!(written["source"]["library_entry"], "cohere/command-r");
+    assert_eq!(
+        rate(&written["card"], "input"),
+        micros(&prices["input_mtok"])
+    );
+    assert_eq!(
+        binding(&cp, model).await.as_deref(),
+        Some("cohere/command-r")
+    );
+    let rows = audits(&cp, "pricing.library.bind").await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["model_id"], json!(model));
+    assert_eq!(rows[0]["provider"], "cohere");
+    assert_eq!(rows[0]["model"], "command-r");
+    assert_eq!(audits(&cp, "pricing.library.sync").await.len(), 1);
+
+    // From then on it matches the entry chosen, and needs no choice.
+    let c = item(&preview(&cp, &op, None).await, model);
+    assert_eq!(
+        matched(&c),
+        ("cohere/command-r".to_string(), json!("chosen")),
+        "{c}"
+    );
+    assert_eq!(c["state"], "same", "{c}");
+    assert_eq!(c["candidates"], json!([]), "{c}");
+    assert_eq!(c["binding"]["provider"], "cohere", "{c}");
+    assert_eq!(c["binding"]["model"], "command-r", "{c}");
+    assert_eq!(c["binding"]["in_library"], json!(true), "{c}");
+    // A baseline set by hand since: the chosen entry updates it, listed as
+    // any match is, and the choice is not recorded again.
+    manual(
+        &cp,
+        &op,
+        model,
+        &json!({"default": {"base": {"input": "9", "output": "9"}}}),
+    )
+    .await;
+    let p = preview(&cp, &op, Some(model)).await;
+    let u = item(&p, model);
+    assert_eq!(u["state"], "update", "{u}");
+    assert_eq!(u["matched_by"], "chosen", "{u}");
+    let r = sync(
+        &cp,
+        &op,
+        json!({"library_id": p["library"]["id"], "attested": true, "items": [listed(&u)]}),
+    )
+    .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    assert_eq!(
+        rate(&baseline_of(&cp, &op, model).await["card"], "input"),
+        micros(&prices["input_mtok"])
+    );
+    assert_eq!(audits(&cp, "pricing.library.bind").await.len(), 1);
+    // The other candidate is no longer one: the model has one match.
+    let r = sync(
+        &cp,
+        &op,
+        json!({
+            "library_id": p["library"]["id"],
+            "attested": true,
+            "items": [choosing(model, &openrouter)],
+        }),
+    )
+    .await;
+    assert_eq!(
+        (r.status, paths(&r)),
+        (409, vec!["/items/0".to_string()]),
+        "{r:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_choice_that_is_not_the_models_candidate_or_its_card_is_refused() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    upload(&cp, &op, "v2-7de757d").await;
+    let fine = served(&cp, &op, "command-a", "cohere").await;
+    let model = served(&cp, &op, "command-r", "relay-7c1").await;
+    let p = preview(&cp, &op, None).await;
+    let one = listed(&item(&p, fine));
+    let a = item(&p, model);
+    let cohere = candidate(&a, "cohere");
+    let openrouter = candidate(&a, "openrouter");
+    assert_ne!(cohere["card"], openrouter["card"]);
+    let before = baselines(&cp).await;
+
+    // An entry of the library that is none of the model's candidates, with
+    // its own card.
+    let other = json!({
+        "model_id": model,
+        "provider": "cohere",
+        "model": "command-a",
+        "card": one["card"],
+    });
+    // A candidate, with another candidate's card.
+    let mut mixed = choosing(model, &openrouter);
+    mixed["card"] = cohere["card"].clone();
+    // A candidate, with a card of no candidate.
+    let mut edited = choosing(model, &cohere);
+    edited["card"] = json!({"default": {"base": {"input": "0.01", "output": "0.02"}}});
+    for (n, wrong) in [other, mixed, edited].into_iter().enumerate() {
+        let r = sync(
+            &cp,
+            &op,
+            json!({"library_id": p["library"]["id"], "attested": true, "items": [one, wrong]}),
+        )
+        .await;
+        assert_eq!(r.status, 409, "case {n}: {r:?}");
+        assert_eq!(r.body["code"], "library_stale", "case {n}");
+        assert_eq!(paths(&r), ["/items/1"], "case {n}");
+    }
+    assert_eq!(baselines(&cp).await, before);
+    assert_eq!(binding(&cp, model).await, None);
+    assert!(audits(&cp, "pricing.library.bind").await.is_empty());
+    assert!(audits(&cp, "pricing.library.sync").await.is_empty());
+}
+
+#[tokio::test]
+async fn a_choice_whose_entry_left_the_library_is_ignored_and_a_new_choice_replaces_it() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    upload(&cp, &op, "v2-7de757d").await;
+    let model = served(&cp, &op, "command-r", "relay-7c1").await;
+    // Chosen from an earlier library, which held an entry this one does not.
+    sqlx::query(
+        "INSERT INTO pricing_library_bindings (model_id, provider, model, chosen_by) \
+         VALUES ($1, 'cohere', 'command-r-retired', $2)",
+    )
+    .bind(model)
+    .bind(op.id)
+    .execute(cp.db().pool())
+    .await
+    .expect("record a choice");
+
+    let p = preview(&cp, &op, None).await;
+    let a = item(&p, model);
+    // Matched by its name again, and the preview says why.
+    assert_eq!(a["state"], "ambiguous", "{a}");
+    assert_eq!(a["matched_by"], Value::Null, "{a}");
+    assert_eq!(a["binding"]["provider"], "cohere", "{a}");
+    assert_eq!(a["binding"]["model"], "command-r-retired", "{a}");
+    assert_eq!(a["binding"]["in_library"], json!(false), "{a}");
+
+    // A choice made now replaces it.
+    let r = sync(
+        &cp,
+        &op,
+        json!({
+            "library_id": p["library"]["id"],
+            "attested": true,
+            "items": [choosing(model, &candidate(&a, "openrouter"))],
+        }),
+    )
+    .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    assert_eq!(
+        binding(&cp, model).await.as_deref(),
+        Some("openrouter/command-r")
+    );
+    let c = item(&preview(&cp, &op, None).await, model);
+    assert_eq!(c["matched_by"], "chosen", "{c}");
+    assert_eq!(c["binding"]["in_library"], json!(true), "{c}");
+}
+
+#[tokio::test]
+async fn forgetting_a_choice_makes_the_model_ambiguous_again() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    upload(&cp, &op, "v2-7de757d").await;
+    let model = served(&cp, &op, "command-r", "relay-7c1").await;
+    let p = preview(&cp, &op, None).await;
+    let r = sync(
+        &cp,
+        &op,
+        json!({
+            "library_id": p["library"]["id"],
+            "attested": true,
+            "items": [choosing(model, &candidate(&item(&p, model), "cohere"))],
+        }),
+    )
+    .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    assert_eq!(
+        item(&preview(&cp, &op, None).await, model)["matched_by"],
+        "chosen"
+    );
+
+    let r = cp
+        .send(
+            "DELETE",
+            &format!("{BINDINGS}/{model}"),
+            Some(op.cookie()),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, 204, "{r:?}");
+    assert_eq!(binding(&cp, model).await, None);
+    let rows = audits(&cp, "pricing.library.unbind").await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["model_id"], json!(model));
+    assert_eq!(rows[0]["provider"], "cohere");
+    assert_eq!(rows[0]["model"], "command-r");
+    let a = item(&preview(&cp, &op, None).await, model);
+    assert_eq!(a["state"], "ambiguous", "{a}");
+    assert_eq!(a["binding"], Value::Null, "{a}");
+    // The choice is gone, so no entry is the chosen one.
+    assert_eq!(a["matched_by"], Value::Null, "{a}");
+    // The baseline written from the choice stays: forgetting it writes no
+    // price. Each candidate is judged against it.
+    assert_eq!(candidate(&a, "cohere")["state"], "same", "{a}");
+    assert_eq!(candidate(&a, "openrouter")["state"], "update", "{a}");
+
+    // Nothing left to forget.
+    let r = cp
+        .send(
+            "DELETE",
+            &format!("{BINDINGS}/{model}"),
+            Some(op.cookie()),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, 404, "{r:?}");
+    assert_eq!(audits(&cp, "pricing.library.unbind").await.len(), 1);
 }

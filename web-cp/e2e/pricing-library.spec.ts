@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { expect, test, type Locator, type Page } from "@playwright/test";
-import { STACK_START_TIMEOUT_MS, startStack, type Stack } from "./stack";
+import { STACK_START_TIMEOUT_MS, startStack, type Json, type Stack } from "./stack";
 
 /**
  * 价格 · 价格库 against the real control plane through the built `dist/`.
@@ -99,15 +99,18 @@ async function account(provider: string, groups: string[]): Promise<string> {
   return key.id as string;
 }
 
-/** A public model `name` served by `accountId`. */
+/** A public model `name` served by `accountId`, the live one of that name when one already is. */
 async function publicModel(name: string, accountId: string): Promise<string> {
-  const pub = await stack.admin.post("/admin/public-models", { name });
+  const listed: Json = await stack.admin.get("/admin/public-models");
+  const existing = (listed.items as Json[]).find((m) => m.name === name && !m.retired_at);
+  const pub = existing ?? (await stack.admin.post("/admin/public-models", { name }));
   await stack.admin.put(`/admin/provider-keys/${accountId}/channel-models/${pub.id}`, { priority: 0, weight: 1 });
   return pub.id as string;
 }
 
+/** The preview's row of the model `name`, which keeps its identity however its cells read. */
 function previewRow(page: Page, name: string): Locator {
-  return page.getByRole("table", { name: "同步预览" }).getByRole("row").filter({ has: page.getByRole("cell", { name, exact: true }) });
+  return page.getByRole("table", { name: "同步预览" }).locator(`tr[data-model="${name}"]`);
 }
 
 test("离线上传数据集后，价格库按名称或供应商搜索，显示标价与价格页面", async ({ page }) => {
@@ -161,10 +164,14 @@ test("预览同步后一次确认：基准价写入，分组售价按换算率�
   await expect(created).toContainText("将新增");
   await expect(created).toContainText("cohere/command-a");
   await expect(created).toContainText(`输入 $${commandA.input} · 输出 $${commandA.output}`);
+  // Ambiguous: every candidate is offered as a price source, and none is
+  // chosen for the operator.
   const ambiguous = previewRow(page, "gpt-4o");
   await expect(ambiguous).toContainText("多个匹配");
-  await expect(ambiguous).toContainText("openai/gpt-4o");
-  await expect(ambiguous).toContainText("github-copilot/gpt-4o");
+  const sources = ambiguous.getByLabel("选择价格来源 gpt-4o").locator("option");
+  await expect(sources.filter({ hasText: "openai · gpt-4o" })).toHaveCount(1);
+  await expect(sources.filter({ hasText: "github-copilot · gpt-4o" })).toHaveCount(1);
+  await expect(sources.filter({ hasText: "openai · gpt-4o" })).toContainText("$2.5/10 每百万");
   await expect(previewRow(page, nothing)).toContainText("无匹配");
 
   // The one confirmation names how many models it writes: every row the
@@ -253,4 +260,136 @@ test("在基准价详情中为单个模型从价格库同步，需先勾选核�
   await expect(now).toContainText(usd(commandR.output));
   await expect(now).toContainText("价格库同步");
   await expect(one).toContainText("一致");
+});
+
+test("多个匹配的模型选好价格来源后同步：写入基准价、记住选择，刷新后仍显示已选", async ({ page }) => {
+  const suffix = randomUUID().slice(0, 6);
+  const group = await stack.admin.createGroup(`grp-choose-${suffix}`, `选择来源分组 ${suffix}`, "2");
+  // Two providers price `claude-2` at different prices, and neither is the
+  // provider the account is filed under.
+  const relay = await account(`relay-${suffix}`, [group.name as string]);
+  await publicModel("claude-2", relay);
+
+  await login(page);
+  await uploadDataset(page);
+  await section(page, "价格库");
+  const sync = page.getByRole("region", { name: "同步基准价" });
+  await expect(sync.getByRole("table", { name: "同步预览" })).toBeVisible();
+
+  const row = previewRow(page, "claude-2");
+  await expect(row).toContainText("多个匹配");
+  const pick = row.getByLabel("选择价格来源 claude-2");
+  // Nothing is chosen for the operator.
+  await expect(pick).toHaveValue("");
+  // Every candidate is offered with its own prices.
+  const anthropic = snapshot("anthropic", "claude-2");
+  const openrouter = snapshot("openrouter", "claude-2");
+  await expect(pick.locator("option", { hasText: "anthropic · claude-2" })).toContainText(
+    `$${anthropic.input}/${anthropic.output} 每百万`,
+  );
+  await expect(pick.locator("option", { hasText: "openrouter · claude-2" })).toContainText(
+    `$${openrouter.input}/${openrouter.output} 每百万`,
+  );
+  // The placeholder, and one line per candidate.
+  await expect(pick.locator("option")).toHaveCount(3);
+  // Nothing is written for it until one is chosen.
+  const before = await page
+    .getByRole("table", { name: "同步预览" })
+    .locator('tr[data-shown="create"], tr[data-shown="update"]')
+    .count();
+
+  await pick.selectOption({ value: "anthropic/claude-2" });
+  // The row now shows what syncing from the chosen entry would do.
+  await expect(row).toHaveAttribute("data-shown", "create");
+  await expect(row).toContainText("将新增");
+  await expect(row).toContainText(`输入 $${anthropic.input} · 输出 $${anthropic.output}`);
+
+  const after = await page
+    .getByRole("table", { name: "同步预览" })
+    .locator('tr[data-shown="create"], tr[data-shown="update"]')
+    .count();
+  expect(after).toBe(before + 1);
+  const all = sync.getByRole("button", { name: `同步 ${after} 个模型`, exact: true });
+  await sync.getByRole("checkbox", { name: "已对照官方价格页核对" }).check();
+  await all.click();
+  await expect(page.locator(".toast").filter({ hasText: `已同步 ${after} 个模型` }).first()).toBeVisible();
+
+  // Read again: the choice is recorded and the row shows it, with nothing
+  // left to do for it. The row's state is read first, so what follows is
+  // judged against the preview the sync left, not the one before it.
+  await expect(row).toHaveAttribute("data-shown", "same");
+  await expect(row).toContainText("已选：anthropic/claude-2");
+  await expect(row).toContainText("一致");
+  await expect(row.getByRole("button", { name: "重新选择" })).toBeVisible();
+
+  // 基准价: one baseline, written from the library under this operator's
+  // attestation, at the prices the chosen entry showed. The choice itself is
+  // pinned above and by the preview after the reload.
+  await section(page, "基准价");
+  const baseline = page
+    .getByRole("table", { name: "基准价" })
+    .getByRole("row")
+    .filter({ has: page.getByRole("button", { name: "claude-2", exact: true }) });
+  await expect(baseline).toHaveAttribute("data-state", "priced");
+  await expect(baseline).toContainText(usd(anthropic.input));
+  await expect(baseline).toContainText(usd(anthropic.output));
+  await expect(baseline).toContainText("价格库同步");
+  await expect(baseline).toContainText(REVISION);
+  await expect(baseline).toContainText(stack.operator.email);
+
+  // A reload keeps it: the choice is the control plane's, not the page's.
+  await page.reload();
+  await expect(page.locator("[data-tab]").first()).toBeVisible();
+  await page.locator('[data-tab="pricing"]').click();
+  await section(page, "价格库");
+  const again = previewRow(page, "claude-2");
+  await expect(again).toHaveAttribute("data-shown", "same");
+  await expect(again).toContainText("已选：anthropic/claude-2");
+  // 重新选择 forgets it, and the model needs a choice again.
+  await again.getByRole("button", { name: "重新选择" }).click();
+  await expect(again).toContainText("多个匹配");
+  await expect(again.getByLabel("选择价格来源 claude-2")).toHaveValue("");
+  await expect(again).not.toContainText("已选");
+});
+
+test("含长上下文价的条目在价格库与同步预览中标出，基准价缺少这一段时预览给出提示", async ({ page }) => {
+  // One provider prices `claude-sonnet-4-5`: a base rate and a band above
+  // 200K input tokens.
+  const anthropic = await account("anthropic", ["shared"]);
+  await publicModel("claude-sonnet-4-5", anthropic);
+
+  await login(page);
+  await uploadDataset(page);
+  await section(page, "价格库");
+
+  // The browse list marks the entry, with the band's own rates.
+  await page.getByLabel("搜索模型").fill("claude-sonnet-4-5");
+  const listed = page
+    .getByRole("table", { name: "价格库条目" })
+    .getByRole("row")
+    .filter({ has: page.getByRole("cell", { name: "anthropic", exact: true }) })
+    .filter({ has: page.getByText("claude-sonnet-4-5", { exact: true }) });
+  await expect(listed).toContainText("含长上下文价");
+  await expect(listed).toContainText(">200K 输入：$6 / $22.5 每百万");
+
+  // The sync preview marks it too, and says the baseline lacks the band.
+  const row = previewRow(page, "claude-sonnet-4-5");
+  await expect(row).toContainText("将新增");
+  await expect(row).toContainText("含长上下文价");
+  await expect(row).toContainText(">200K 输入：$6 / $22.5 每百万");
+  await expect(row).toContainText("当前基准价缺少长上下文档，同步后将补上");
+
+  // Once synced, the baseline carries the band, and the warning is gone.
+  const sync = page.getByRole("region", { name: "同步基准价" });
+  const writes = await page
+    .getByRole("table", { name: "同步预览" })
+    .locator('tr[data-shown="create"], tr[data-shown="update"]')
+    .count();
+  await sync.getByRole("checkbox", { name: "已对照官方价格页核对" }).check();
+  await sync.getByRole("button", { name: `同步 ${writes} 个模型`, exact: true }).click();
+  await expect(page.locator(".toast").filter({ hasText: `已同步 ${writes} 个模型` }).first()).toBeVisible();
+  const done = previewRow(page, "claude-sonnet-4-5");
+  await expect(done).toContainText("一致");
+  await expect(done).toContainText("含长上下文价");
+  await expect(done).not.toContainText("当前基准价缺少长上下文档");
 });

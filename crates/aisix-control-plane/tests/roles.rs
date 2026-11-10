@@ -405,6 +405,12 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
                 }],
             })),
         ),
+        // No choice is recorded for this model: past the role check, 404,
+        // so nothing is written.
+        ("DELETE", "/admin/pricing/library/bindings/{model_id}") => (
+            format!("/admin/pricing/library/bindings/{}", Uuid::new_v4()),
+            None,
+        ),
         _ => panic!("no fixture for {method} {path}: add one to tests/roles.rs"),
     }
 }

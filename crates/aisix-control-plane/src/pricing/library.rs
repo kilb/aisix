@@ -37,7 +37,25 @@
 //! Of several candidates, the ones whose provider is the model's own (a
 //! direct model's `provider`, the providers of the accounts serving a public
 //! model, or a `<provider>/` prefix on its name) are kept when there are any.
-//! One candidate left is the match; more is ambiguous and never synced.
+//! When that leaves more than one, the ones whose provider is the protocol
+//! family (`adapter`) of an account serving the model are kept when there
+//! are any: an account under a provider id of the platform's own that speaks
+//! `anthropic` finds the first-party entry, not the cloud and aggregator
+//! copies of the same name ([`MatchedBy::Adapter`]). The model's own
+//! provider is weighed first, so it wins over an adapter. One candidate left
+//! is the match; more is ambiguous, and is synced only from the candidate an
+//! operator chooses.
+//!
+//! # Choosing
+//!
+//! A sync that lists an ambiguous model under one of its candidates records
+//! the choice (`pricing_library_bindings`, one row per model, audited as
+//! `pricing.library.bind`). From then on the model matches the chosen entry
+//! before anything its name finds ([`MatchedBy::Chosen`]), so later syncs
+//! need no choice. A choice whose entry has left the library is ignored: the
+//! model is matched by name again, and the preview says so (its `binding`,
+//! `in_library: false`). `DELETE /admin/pricing/library/bindings/{model_id}`
+//! forgets a choice ([`unbind`]).
 //!
 //! # Syncing
 //!
@@ -46,16 +64,17 @@
 //! card differs from it), `same`, `flagged` (the entry carries a price the
 //! import would not confirm either), `unmatched` and `ambiguous`. `POST` of
 //! the same route writes the `create` and `update` items the operator lists,
-//! and nothing else, in one transaction, each as a `third_party` baseline
-//! starting now, under the operator's attestation. See [`sync`].
+//! an ambiguous model's under the candidate chosen, and nothing else, in one
+//! transaction, each as a `third_party` baseline starting now, under the
+//! operator's attestation. See [`sync`].
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
 use aisix_gateway::upstream_error_scrub::scrub_upstream_error_text;
-use aisix_pricing::RateCard;
+use aisix_pricing::{RateCard, ServiceTier};
 use axum::extract::rejection::QueryRejection;
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use chrono::{DateTime, NaiveDate, Utc};
@@ -525,6 +544,11 @@ pub enum MatchedBy {
     Exact,
     /// Case-insensitively, by the id or an alias, a provider prefix aside.
     Alias,
+    /// Of several candidates, the one whose provider is the protocol family
+    /// (`adapter`) of an account serving the model.
+    Adapter,
+    /// The entry an operator chose for the model ([`Binding`]).
+    Chosen,
 }
 
 /// What a name finds in the library: indexes into its entries.
@@ -591,57 +615,96 @@ impl<'a> Index<'a> {
         &self.entries[i]
     }
 
+    /// The entry `provider`'s `model` names exactly, if the library holds it.
+    pub fn keyed(&self, provider: &str, model: &str) -> Option<usize> {
+        self.exact
+            .get(&format!("{provider}/{model}"))?
+            .iter()
+            .copied()
+            .find(|i| self.entries[*i].provider == provider && self.entries[*i].model == model)
+    }
+
     /// What model `name`, served through `providers` (its own upstream
-    /// providers, as written), finds.
-    pub fn find(&self, name: &str, providers: &BTreeSet<String>) -> Match {
+    /// providers, as written) by accounts speaking `adapters` (their
+    /// protocol families), finds.
+    pub fn find(
+        &self,
+        name: &str,
+        providers: &BTreeSet<String>,
+        adapters: &BTreeSet<String>,
+    ) -> Match {
         let mut own: BTreeSet<String> = providers.iter().map(|p| p.to_lowercase()).collect();
         let folded = name.to_lowercase();
         if let Some((prefix, _)) = provider_prefixed(&folded, &self.providers) {
             own.insert(prefix.to_string());
         }
+        let adapters: BTreeSet<String> = adapters.iter().map(|a| a.to_lowercase()).collect();
         if let Some(found) = self.exact.get(name) {
-            return self.decide(found.clone(), &own, MatchedBy::Exact);
+            return self.decide(found.clone(), &own, &adapters, MatchedBy::Exact);
         }
         let found = self.loose.get(&folded).cloned().unwrap_or_default();
-        self.decide(found, &own, MatchedBy::Alias)
+        self.decide(found, &own, &adapters, MatchedBy::Alias)
     }
 
-    /// One candidate, or the ones of the model's own providers when that
-    /// leaves one; otherwise every candidate left, unpicked.
-    fn decide(&self, mut found: Vec<usize>, own: &BTreeSet<String>, by: MatchedBy) -> Match {
+    /// One candidate; or the ones of the model's own providers when that
+    /// leaves one; or, of those left, the ones of its accounts' adapters
+    /// when that leaves one. Otherwise every candidate left, unpicked.
+    fn decide(
+        &self,
+        mut found: Vec<usize>,
+        own: &BTreeSet<String>,
+        adapters: &BTreeSet<String>,
+        by: MatchedBy,
+    ) -> Match {
         found.sort_unstable();
         found.dedup();
         match found.as_slice() {
-            [] => Match::None,
-            [one] => Match::One(*one, by),
-            _ => {
-                let theirs: Vec<usize> = found
-                    .iter()
-                    .copied()
-                    .filter(|i| own.contains(&self.entries[*i].provider.to_lowercase()))
-                    .collect();
-                match theirs.as_slice() {
-                    [one] => Match::One(*one, by),
-                    [] => Match::Many(found),
-                    _ => Match::Many(theirs),
-                }
-            }
+            [] => return Match::None,
+            [one] => return Match::One(*one, by),
+            _ => {}
+        }
+        let theirs = self.narrow(found, own);
+        if let [one] = theirs.as_slice() {
+            return Match::One(*one, by);
+        }
+        let spoken = self.narrow(theirs, adapters);
+        match spoken.as_slice() {
+            [one] => Match::One(*one, MatchedBy::Adapter),
+            _ => Match::Many(spoken),
+        }
+    }
+
+    /// The candidates whose provider is one of `providers` (lower-cased),
+    /// or all of them when none is.
+    fn narrow(&self, found: Vec<usize>, providers: &BTreeSet<String>) -> Vec<usize> {
+        let kept: Vec<usize> = found
+            .iter()
+            .copied()
+            .filter(|i| providers.contains(&self.entries[*i].provider.to_lowercase()))
+            .collect();
+        if kept.is_empty() {
+            found
+        } else {
+            kept
         }
     }
 }
 
 /// A model a baseline can be written on, with the providers it is served
-/// through.
+/// through and the protocol families of the accounts serving it.
 #[derive(Debug, Clone)]
 pub struct Priceable {
     pub id: Uuid,
     pub name: String,
     pub providers: BTreeSet<String>,
+    /// The `adapter` of each live account serving it that names one.
+    pub adapters: BTreeSet<String>,
 }
 
 /// Every priceable model, or those of `only`, by name: its own `provider`
 /// (a hand-made direct model), and those of the live direct documents its
-/// channels generated (a public model).
+/// channels generated (a public model); and the `adapter` of each live
+/// account those documents name.
 async fn priceable(
     conn: &mut PgConnection,
     only: Option<&[Uuid]>,
@@ -654,27 +717,34 @@ async fn priceable(
             id,
             name,
             providers: BTreeSet::new(),
+            adapters: BTreeSet::new(),
         })
         .collect();
     let ids: Vec<Uuid> = models.iter().map(|m| m.id).collect();
-    let served: Vec<(Uuid, String)> = sqlx::query_as(
-        "SELECT r.id, r.doc->>'provider' FROM gw_resources r \
-         WHERE r.kind = $1 AND NOT r.deleted AND r.id = ANY($2) AND r.doc ? 'provider' \
+    let served: Vec<(Uuid, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT r.id, r.doc->>'provider', k.doc->>'adapter' FROM gw_resources r \
+         LEFT JOIN gw_resources k ON k.kind = $3 AND NOT k.deleted \
+           AND k.id::text = lower(r.doc->>'provider_key_id') \
+         WHERE r.kind = $1 AND NOT r.deleted AND r.id = ANY($2) \
          UNION \
-         SELECT cm.public_model_id, d.doc->>'provider' FROM channel_models cm \
+         SELECT cm.public_model_id, d.doc->>'provider', k.doc->>'adapter' FROM channel_models cm \
          JOIN gw_resources d ON d.kind = $1 AND d.id = cm.direct_model_id AND NOT d.deleted \
-         WHERE cm.public_model_id = ANY($2) AND d.doc ? 'provider'",
+         LEFT JOIN gw_resources k ON k.kind = $3 AND k.id = cm.provider_key_id AND NOT k.deleted \
+         WHERE cm.public_model_id = ANY($2)",
     )
     .bind(Kind::Models.segment())
     .bind(&ids)
+    .bind(Kind::ProviderKeys.segment())
     .fetch_all(&mut *conn)
     .await?;
-    let mut by_model: HashMap<Uuid, BTreeSet<String>> = HashMap::new();
-    for (id, provider) in served {
-        by_model.entry(id).or_default().insert(provider);
+    let mut by_model: HashMap<Uuid, (BTreeSet<String>, BTreeSet<String>)> = HashMap::new();
+    for (id, provider, adapter) in served {
+        let (providers, adapters) = by_model.entry(id).or_default();
+        providers.extend(provider);
+        adapters.extend(adapter);
     }
     for model in &mut models {
-        model.providers = by_model.remove(&model.id).unwrap_or_default();
+        (model.providers, model.adapters) = by_model.remove(&model.id).unwrap_or_default();
     }
     Ok(models)
 }
@@ -702,6 +772,9 @@ pub struct Planned<'a> {
     pub found: Match,
     pub state: SyncState,
     pub current: Option<BaselineRevision>,
+    /// The entry an operator chose for it, used only while the library holds
+    /// that entry.
+    pub binding: Option<Binding>,
     index: &'a Index<'a>,
 }
 
@@ -711,6 +784,18 @@ impl Planned<'_> {
         match self.found {
             Match::One(i, _) => Some(self.index.entry(i)),
             _ => None,
+        }
+    }
+
+    /// The entry it would be synced from when listed under `provider`'s
+    /// `model`: the one it matched, or the candidate of that name when it is
+    /// ambiguous.
+    fn listed_as(&self, provider: &str, model: &str) -> Option<&ParsedProposal> {
+        let named = |e: &&ParsedProposal| e.provider == provider && e.model == model;
+        match &self.found {
+            Match::One(i, _) => Some(self.index.entry(*i)).filter(named),
+            Match::Many(all) => all.iter().map(|i| self.index.entry(*i)).find(named),
+            Match::None => None,
         }
     }
 
@@ -728,24 +813,66 @@ impl Planned<'_> {
             "entry": self.entry().map(view),
             "candidates": candidates
                 .into_iter()
-                .map(|c| json!({"provider": c.provider, "model": c.model, "name": c.name}))
+                .map(|c| CandidateView {
+                    entry: view(c),
+                    input: headline(c, |r| &r.input),
+                    output: headline(c, |r| &r.output),
+                    state: state_of(c, self.current.as_ref()),
+                })
                 .collect::<Vec<_>>(),
+            "binding": self.binding.as_ref().map(|b| json!({
+                "provider": b.provider,
+                "model": b.model,
+                "chosen_at": b.chosen_at,
+                // Ignored once its entry has left the library.
+                "in_library": matches!(self.found, Match::One(_, MatchedBy::Chosen)),
+            })),
             "current": self.current,
         })
     }
 }
 
+/// One candidate of an ambiguous model, with everything choosing it takes:
+/// the entry, its headline rates, and what a sync from it would do.
+#[derive(Serialize)]
+struct CandidateView<'a> {
+    #[serde(flatten)]
+    entry: EntryView<'a>,
+    /// The `default` tier's base input rate, USD per million; `None` without
+    /// a card.
+    input: Option<String>,
+    output: Option<String>,
+    state: SyncState,
+}
+
+/// One base rate of `entry`'s `default` tier, as written.
+fn headline(
+    entry: &ParsedProposal,
+    rate: impl Fn(&aisix_pricing::Rates) -> &aisix_pricing::Rate,
+) -> Option<String> {
+    let tier = entry.card.as_ref()?.0.get(&ServiceTier::default_tier())?;
+    Some(rate(&tier.base).to_string())
+}
+
 /// What a sync would do to each of `models`, against the baselines in force
-/// `current`.
+/// `current` and the entries chosen `bindings`.
 pub fn plan<'a>(
     index: &'a Index<'a>,
     models: Vec<Priceable>,
     current: &HashMap<Uuid, BaselineRevision>,
+    bindings: &HashMap<Uuid, Binding>,
 ) -> Vec<Planned<'a>> {
     models
         .into_iter()
         .map(|model| {
-            let found = index.find(&model.name, &model.providers);
+            let binding = bindings.get(&model.id).cloned();
+            let found = match binding
+                .as_ref()
+                .and_then(|b| index.keyed(&b.provider, &b.model))
+            {
+                Some(i) => Match::One(i, MatchedBy::Chosen),
+                None => index.find(&model.name, &model.providers, &model.adapters),
+            };
             let current = current.get(&model.id).cloned();
             let state = match &found {
                 Match::None => SyncState::Unmatched,
@@ -757,6 +884,7 @@ pub fn plan<'a>(
                 found,
                 state,
                 current,
+                binding,
                 index,
             }
         })
@@ -795,6 +923,43 @@ async fn in_force(
         .collect())
 }
 
+/// The entry an operator chose for a model the library matched ambiguously,
+/// as `pricing_library_bindings` holds it.
+#[derive(Debug, Clone)]
+pub struct Binding {
+    pub provider: String,
+    pub model: String,
+    pub chosen_at: DateTime<Utc>,
+}
+
+/// The choices recorded for `models`, by model.
+async fn bindings(
+    conn: &mut PgConnection,
+    models: &[Priceable],
+) -> Result<HashMap<Uuid, Binding>, DbError> {
+    let ids: Vec<Uuid> = models.iter().map(|m| m.id).collect();
+    let rows: Vec<(Uuid, String, String, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT model_id, provider, model, chosen_at FROM pricing_library_bindings \
+         WHERE model_id = ANY($1)",
+    )
+    .bind(&ids)
+    .fetch_all(conn)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, provider, model, chosen_at)| {
+            (
+                id,
+                Binding {
+                    provider,
+                    model,
+                    chosen_at,
+                },
+            )
+        })
+        .collect())
+}
+
 /// `GET /admin/pricing/library/sync`'s query.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -807,8 +972,10 @@ pub struct PreviewQuery {
 /// `GET /admin/pricing/library/sync?model_id=` → `{library, cap, items}`:
 /// every priceable model (or `model_id` alone) with what a sync would do to
 /// it (`state`), the entry it matched and how (`entry`, `matched_by`), every
-/// candidate of an ambiguous one (`candidates`), and its baseline in force
-/// (`current`). `cap` is the most one sync writes. With no library,
+/// candidate of an ambiguous one with its headline rates and the state a
+/// sync from it would have (`candidates`), the entry an operator chose for
+/// it and whether the library still holds it (`binding`), and its baseline
+/// in force (`current`). `cap` is the most one sync writes. With no library,
 /// `library` is `null` and `items` empty. A `model_id` naming no priceable
 /// model is `404`.
 pub async fn preview(
@@ -821,10 +988,11 @@ pub async fn preview(
     let mut conn = state.db.pool().acquire().await.map_err(DbError::from)?;
     let library = current(&mut conn).await?;
     let only = q.model_id.map(|id| vec![id]);
-    let (models, current_baselines, now) = {
+    let (models, current_baselines, chosen, now) = {
         let models = priceable(&mut conn, only.as_deref()).await?;
         let current_baselines = in_force(&mut conn, &models).await?;
-        (models, current_baselines, db_now(&mut conn).await?)
+        let chosen = bindings(&mut conn, &models).await?;
+        (models, current_baselines, chosen, db_now(&mut conn).await?)
     };
     drop(conn);
     if q.model_id.is_some() && models.is_empty() {
@@ -839,7 +1007,7 @@ pub async fn preview(
     };
     let entries = entries_at(data, now).await?;
     let index = Index::new(&entries);
-    let items: Vec<Value> = plan(&index, models, &current_baselines)
+    let items: Vec<Value> = plan(&index, models, &current_baselines, &chosen)
         .iter()
         .map(Planned::answer)
         .collect();
@@ -865,8 +1033,9 @@ pub struct SyncBody {
     items: Vec<SyncItem>,
 }
 
-/// One model of a sync, as its preview showed it: the entry matched, and the
-/// card the operator attested.
+/// One model of a sync, as its preview showed it: the entry matched (or, for
+/// an ambiguous model, the candidate chosen), and the card the operator
+/// attested.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SyncItem {
@@ -887,16 +1056,19 @@ pub struct SyncItem {
 ///    `422 /items/<n>/card` for a card that is not one.
 /// 3. `409 library_stale` when `library_id` is not the library in use, and
 ///    when any item no longer previews as listed: a model no longer
-///    priceable, matched to another entry or none, no longer `create` or
-///    `update`, or whose entry's card is not the card sent. `details` names
-///    each such item at `/items/<n>`.
+///    priceable, matched to another entry or none (an ambiguous model: a
+///    `provider`/`model` that is none of its candidates), no longer `create`
+///    or `update` from that entry, or whose entry's card is not the card
+///    sent. `details` names each such item at `/items/<n>`.
 ///
 /// Otherwise one transaction holds the library's row, writes each listed
 /// item's card as a `third_party` baseline starting now, naming the library,
 /// its entry, the dataset's pricing page and checked date, and this operator's
 /// attestation, and records `pricing.library.sync` per model (the attester,
 /// `attested: true` and the sentence affirmed) beside the baseline's own
-/// `pricing.baseline.create`. A model not listed is never written, whatever
+/// `pricing.baseline.create`. An item that resolves an ambiguous model also
+/// records the candidate chosen as the model's binding
+/// (`pricing.library.bind`). A model not listed is never written, whatever
 /// its preview says now.
 pub async fn sync(
     auth: OperatorAuth,
@@ -964,8 +1136,9 @@ pub async fn sync(
                 let ids: Vec<Uuid> = body.items.iter().map(|i| i.model_id).collect();
                 let models = priceable(&mut *conn, Some(&ids)).await?;
                 let current_baselines = in_force(&mut *conn, &models).await?;
+                let chosen = bindings(&mut *conn, &models).await?;
                 let index = Index::new(&entries);
-                let planned = plan(&index, models, &current_baselines);
+                let planned = plan(&index, models, &current_baselines, &chosen);
                 let by_id: HashMap<Uuid, &Planned<'_>> =
                     planned.iter().map(|p| (p.model.id, p)).collect();
                 let mut moved = Vec::new();
@@ -979,17 +1152,17 @@ pub async fn sync(
                         });
                         continue;
                     };
-                    let entry = p
-                        .entry()
-                        .filter(|e| e.provider == item.provider && e.model == item.model);
-                    let Some(entry) = entry else {
+                    let Some(entry) = p.listed_as(&item.provider, &item.model) else {
                         moved.push(Detail {
                             path,
                             message: format!("{}：匹配的价格库条目已变化", p.model.name),
                         });
                         continue;
                     };
-                    if !matches!(p.state, SyncState::Create | SyncState::Update) {
+                    if !matches!(
+                        state_of(entry, p.current.as_ref()),
+                        SyncState::Create | SyncState::Update
+                    ) {
                         moved.push(Detail {
                             path,
                             message: format!("{}：已无需同步", p.model.name),
@@ -1003,7 +1176,8 @@ pub async fn sync(
                         });
                         continue;
                     }
-                    writes.push((p.model.id, entry, card.clone()));
+                    let chooses = matches!(p.found, Match::Many(_));
+                    writes.push((p.model.id, entry, card.clone(), chooses));
                 }
                 if !moved.is_empty() {
                     return Err(ApiError::library_stale(moved));
@@ -1012,7 +1186,7 @@ pub async fn sync(
                 let reference = meta.reference();
                 let mut revisions = Vec::with_capacity(writes.len());
                 let mut warnings = Vec::new();
-                for (model_id, entry, card) in writes {
+                for (model_id, entry, card, chooses) in writes {
                     let library_entry = format!("{}/{}", entry.provider, entry.model);
                     let row = NewBaseline {
                         model_id,
@@ -1055,6 +1229,9 @@ pub async fn sync(
                         },
                     )
                     .await?;
+                    if chooses {
+                        bind(&mut *conn, model_id, entry, &auth, now).await?;
+                    }
                     revisions.push(revision);
                     warnings.extend(more);
                 }
@@ -1072,6 +1249,99 @@ pub async fn sync(
         StatusCode::CREATED,
         Json(json!({"revisions": revisions, "warnings": warnings})),
     ))
+}
+
+/// Records `entry` as the one chosen for `model_id`, replacing an earlier
+/// choice (one whose entry left the library), with its audit row, in the
+/// sync's transaction.
+async fn bind(
+    conn: &mut PgConnection,
+    model_id: Uuid,
+    entry: &ParsedProposal,
+    auth: &OperatorAuth,
+    now: DateTime<Utc>,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        "INSERT INTO pricing_library_bindings (model_id, provider, model, chosen_by, chosen_at) \
+         VALUES ($1, $2, $3, $4, $5) \
+         ON CONFLICT (model_id) DO UPDATE SET \
+           provider = EXCLUDED.provider, model = EXCLUDED.model, \
+           chosen_by = EXCLUDED.chosen_by, chosen_at = EXCLUDED.chosen_at",
+    )
+    .bind(model_id)
+    .bind(&entry.provider)
+    .bind(&entry.model)
+    .bind(auth.id)
+    .bind(now)
+    .execute(&mut *conn)
+    .await
+    .map_err(DbError::from)?;
+    audit::record(
+        &mut *conn,
+        AuditEntry {
+            actor: Actor::Operator(auth),
+            action: "pricing.library.bind",
+            target_kind: "model",
+            target_id: Some(model_id.to_string()),
+            tenant_id: None,
+            detail: json!({
+                "model_id": model_id,
+                "provider": entry.provider,
+                "model": entry.model,
+            }),
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+/// `DELETE /admin/pricing/library/bindings/{model_id}` → `204`: forgets the
+/// entry chosen for the model (`pricing.library.unbind`), which is matched by
+/// its name again from then on. `404` when no choice is recorded for it.
+pub async fn unbind(
+    auth: OperatorAuth,
+    State(state): State<AppState>,
+    Path(raw): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    auth.require(OperatorRole::Operator)?;
+    let model_id = Uuid::parse_str(&raw).map_err(|_| ApiError::not_found())?;
+    state
+        .db
+        .tx(move |conn| {
+            async move {
+                let gone: Option<(String, String)> = sqlx::query_as(
+                    "DELETE FROM pricing_library_bindings WHERE model_id = $1 \
+                     RETURNING provider, model",
+                )
+                .bind(model_id)
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(DbError::from)?;
+                let Some((provider, model)) = gone else {
+                    return Err(ApiError::not_found());
+                };
+                audit::record(
+                    &mut *conn,
+                    AuditEntry {
+                        actor: Actor::Operator(&auth),
+                        action: "pricing.library.unbind",
+                        target_kind: "model",
+                        target_id: Some(model_id.to_string()),
+                        tenant_id: None,
+                        detail: json!({
+                            "model_id": model_id,
+                            "provider": provider,
+                            "model": model,
+                        }),
+                    },
+                )
+                .await?;
+                Ok::<_, ApiError>(())
+            }
+            .boxed()
+        })
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// A `422` at `path`.
@@ -1123,9 +1393,19 @@ mod tests {
     /// What `name` served through `providers` finds, as `provider/model`
     /// and how, or the candidates.
     fn found(entries: &[ParsedProposal], name: &str, providers: &[&str]) -> String {
+        spoken(entries, name, providers, &[])
+    }
+
+    /// [`found`], by accounts speaking `adapters`.
+    fn spoken(
+        entries: &[ParsedProposal],
+        name: &str,
+        providers: &[&str],
+        adapters: &[&str],
+    ) -> String {
         let index = Index::new(entries);
         let key = |i: usize| format!("{}/{}", entries[i].provider, entries[i].model);
-        match index.find(name, &own(providers)) {
+        match index.find(name, &own(providers), &own(adapters)) {
             Match::None => "none".to_string(),
             Match::One(i, by) => format!("{} by {by:?}", key(i)),
             Match::Many(all) => format!(
@@ -1234,6 +1514,55 @@ mod tests {
         assert_eq!(found(&e, "azure/m", &[]), "azure/m by Exact");
     }
 
+    #[test]
+    fn an_accounts_adapter_picks_among_candidates_its_own_provider_left() {
+        let e = entries(&dataset(&[
+            provider("anthropic", &[model("c", r#"{"equals":"c"}"#)]),
+            provider("aws", &[model("c", r#"{"equals":"c"}"#)]),
+            provider("openrouter", &[model("c", r#"{"equals":"c"}"#)]),
+        ]));
+        // A provider id of the platform's own narrows nothing; the protocol
+        // its account speaks names the first-party entry.
+        assert_eq!(
+            found(&e, "c", &["matrix"]),
+            "many: anthropic/c, aws/c, openrouter/c"
+        );
+        assert_eq!(
+            spoken(&e, "c", &["matrix"], &["anthropic"]),
+            "anthropic/c by Adapter"
+        );
+        assert_eq!(
+            spoken(&e, "c", &["matrix"], &["Anthropic"]),
+            "anthropic/c by Adapter"
+        );
+        // The model's own provider is weighed first, and wins over it.
+        assert_eq!(spoken(&e, "c", &["aws"], &["anthropic"]), "aws/c by Exact");
+        // Two of the model's own providers: the adapter picks between them.
+        assert_eq!(
+            spoken(&e, "c", &["aws", "anthropic"], &["anthropic"]),
+            "anthropic/c by Adapter"
+        );
+        // An adapter no candidate's provider is narrows nothing, and two
+        // adapters that each name a candidate still leave a choice.
+        assert_eq!(
+            spoken(&e, "c", &["matrix"], &["openai"]),
+            "many: anthropic/c, aws/c, openrouter/c"
+        );
+        assert_eq!(
+            spoken(&e, "c", &["matrix"], &["anthropic", "openrouter"]),
+            "many: anthropic/c, openrouter/c"
+        );
+        // One candidate needs no narrowing, and keeps how its name found it.
+        let one = entries(&dataset(&[provider(
+            "aws",
+            &[model("d", r#"{"equals":"d"}"#)],
+        )]));
+        assert_eq!(
+            spoken(&one, "d", &["matrix"], &["anthropic"]),
+            "aws/d by Exact"
+        );
+    }
+
     /// The committed snapshot of the real dataset, as names a platform
     /// actually carries find it.
     #[test]
@@ -1260,24 +1589,110 @@ mod tests {
         };
         // One provider carries it: found whoever serves it.
         assert_eq!(
-            key(index.find("command-a", &own(&[]))),
+            key(index.find("command-a", &own(&[]), &own(&[]))),
             "cohere/command-a by Exact"
         );
         // Two carry it: only the model's own provider decides.
-        assert!(matches!(index.find("gpt-4o", &own(&[])), Match::Many(_)));
+        assert!(matches!(
+            index.find("gpt-4o", &own(&[]), &own(&[])),
+            Match::Many(_)
+        ));
         assert_eq!(
-            key(index.find("gpt-4o", &own(&["openai"]))),
+            key(index.find("gpt-4o", &own(&["openai"]), &own(&[]))),
             "openai/gpt-4o by Exact"
         );
         assert_eq!(
-            key(index.find("openai/gpt-4o", &own(&[]))),
+            key(index.find("openai/gpt-4o", &own(&[]), &own(&[]))),
             "openai/gpt-4o by Exact"
         );
         // A dated snapshot name is one of the entry's own aliases.
         assert_eq!(
-            key(index.find("gpt-4o-2024-08-06", &own(&["openai"]))),
+            key(index.find("gpt-4o-2024-08-06", &own(&["openai"]), &own(&[]))),
             "openai/gpt-4o by Alias"
         );
+        // An account under the platform's own provider id, speaking a
+        // first party's protocol, finds that party's entry among the cloud
+        // and aggregator copies of the name.
+        assert!(matches!(
+            index.find("claude-opus-4-5", &own(&["matrix"]), &own(&[])),
+            Match::Many(_)
+        ));
+        assert_eq!(
+            key(index.find("claude-opus-4-5", &own(&["matrix"]), &own(&["anthropic"]))),
+            "anthropic/claude-opus-4-5 by Adapter"
+        );
+        assert_eq!(
+            key(index.find("gpt-4o", &own(&["matrix"]), &own(&["openai"]))),
+            "openai/gpt-4o by Adapter"
+        );
+    }
+
+    #[test]
+    fn a_choice_wins_while_the_library_holds_its_entry() {
+        let e = entries(&dataset(&[
+            provider("openai", &[model("m", r#"{"equals":"m"}"#)]),
+            provider("azure", &[model("m", r#"{"equals":"m"}"#)]),
+        ]));
+        let index = Index::new(&e);
+        let model = Priceable {
+            id: Uuid::new_v4(),
+            name: "m".to_string(),
+            providers: own(&["relay"]),
+            adapters: BTreeSet::new(),
+        };
+        let chose = |provider: &str| {
+            HashMap::from([(
+                model.id,
+                Binding {
+                    provider: provider.to_string(),
+                    model: "m".to_string(),
+                    chosen_at: now(),
+                },
+            )])
+        };
+        let none = HashMap::new();
+        let planned = plan(&index, vec![model.clone()], &none, &HashMap::new());
+        assert_eq!(planned[0].found, Match::Many(vec![0, 1]));
+        assert_eq!(planned[0].state, SyncState::Ambiguous);
+        let planned = plan(&index, vec![model.clone()], &none, &chose("azure"));
+        assert_eq!(planned[0].found, Match::One(1, MatchedBy::Chosen));
+        assert_eq!(planned[0].state, SyncState::Create);
+        assert_eq!(planned[0].answer()["binding"]["in_library"], json!(true));
+        // Its entry left the library: ignored, and said so.
+        let planned = plan(&index, vec![model.clone()], &none, &chose("github"));
+        assert_eq!(planned[0].found, Match::Many(vec![0, 1]));
+        assert_eq!(planned[0].answer()["binding"]["in_library"], json!(false));
+    }
+
+    #[test]
+    fn each_candidate_carries_its_rates_page_card_and_state() {
+        let e = entries(&dataset(&[
+            r#"{"id":"openai","pricing_urls":["https://openai.example/pricing"],"models":[{"id":"m","match":{"equals":"m"},"prices":{"input_mtok":2.5,"output_mtok":10}}]}"#.to_string(),
+            provider("azure", &[model("m", r#"{"equals":"m"}"#)]),
+        ]));
+        let index = Index::new(&e);
+        let model = Priceable {
+            id: Uuid::new_v4(),
+            name: "m".to_string(),
+            providers: BTreeSet::new(),
+            adapters: BTreeSet::new(),
+        };
+        // In force: azure's own card, so syncing from it changes nothing.
+        let azure = serde_json::to_value(e[1].card.as_ref().expect("a card")).expect("JSON");
+        let current = HashMap::from([(model.id, baseline(azure))]);
+        let answer = plan(&index, vec![model], &current, &HashMap::new())[0].answer();
+        let candidates = answer["candidates"].as_array().expect("candidates");
+        assert_eq!(candidates.len(), 2, "{answer}");
+        let openai = &candidates[0];
+        assert_eq!(openai["provider"], "openai");
+        assert_eq!(openai["model"], "m");
+        assert_eq!(openai["input"], "2.5");
+        assert_eq!(openai["output"], "10");
+        assert_eq!(openai["pricing_url"], "https://openai.example/pricing");
+        assert_eq!(openai["card"]["default"]["base"]["input"], "2.5");
+        assert_eq!(openai["state"], "update");
+        assert_eq!(candidates[1]["provider"], "azure");
+        assert_eq!(candidates[1]["state"], "same");
     }
 
     /// A baseline in force with `card`.

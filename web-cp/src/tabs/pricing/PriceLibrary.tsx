@@ -4,6 +4,7 @@ import { ApiError, library, type LibraryMeta, type LibraryPage } from "../../lib
 import { messageFor } from "../../lib/errors";
 import { errorText } from "../../lib/fmt";
 import { flagText } from "../../lib/importReview";
+import { longContextLines, longContextText } from "../../lib/library";
 import { fmtUtc } from "../../lib/money";
 import { safeHttpUrl } from "../../lib/safeUrl";
 import { Button } from "../../ui/Button";
@@ -148,6 +149,16 @@ export function PriceLibrary({ canEdit, onGoto }: TabProps) {
                         {e.name && e.name !== e.model && <span className="cell-note">{e.name}</span>}
                         {e.flags.length > 0 && (
                           <span className="cell-note library-flags">{e.flags.map(flagText).join("、")}</span>
+                        )}
+                        {longContextLines(e.card).length > 0 && (
+                          <span className="library-long-context">
+                            <span className="tag">含长上下文价</span>
+                            {longContextLines(e.card).map((line) => (
+                              <span key={`${line.tier}/${line.above_input_tokens}`} className="cell-note tabular">
+                                {longContextText(line)}
+                              </span>
+                            ))}
+                          </span>
                         )}
                       </td>
                       <td className="num tabular">{base?.input !== undefined ? usdPerMillion(base.input) : "—"}</td>

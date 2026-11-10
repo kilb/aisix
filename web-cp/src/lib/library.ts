@@ -1,4 +1,4 @@
-import type { RateCard, SyncItem, SyncRequestItem, SyncState } from "./api.ts";
+import type { RateCard, SyncCandidate, SyncItem, SyncRequestItem, SyncState } from "./api.ts";
 import { dimensionText, tierText } from "./importReview.ts";
 
 /**
@@ -70,17 +70,82 @@ export function cardLines(card: RateCard | null): string[] {
 
 /**
  * What a sync sends for `items`: each `create` and `update` with the entry it
- * matched and the card shown, in the order listed, at most `cap` of them.
- * Nothing else is ever sent, so a sync writes only what the preview showed.
+ * matched — an ambiguous model's with the candidate `chosen` for it — and the
+ * card shown, in the order listed, at most `cap` of them. Nothing else is
+ * ever sent, so a sync writes only what the preview showed.
  */
-export function syncRequest(items: SyncItem[], cap: number): SyncRequestItem[] {
-  return items
-    .filter((i) => (i.state === "create" || i.state === "update") && i.entry !== null && i.entry.card !== null)
-    .slice(0, cap)
-    .map((i) => ({
-      model_id: i.model_id,
-      provider: i.entry!.provider,
-      model: i.entry!.model,
-      card: i.entry!.card!,
-    }));
+export function syncRequest(
+  items: SyncItem[],
+  cap: number,
+  chosen: Record<string, SyncCandidate | undefined> = {},
+): SyncRequestItem[] {
+  const sent: SyncRequestItem[] = [];
+  for (const item of items) {
+    // An ambiguous model is written only from the candidate chosen for it,
+    // and any other only when it would create or update.
+    const from = item.state === "ambiguous" ? chosen[item.model_id] : undefined;
+    const source = from ?? item.entry;
+    const state = from ? from.state : item.state;
+    if ((state !== "create" && state !== "update") || !source?.card) continue;
+    sent.push({ model_id: item.model_id, provider: source.provider, model: source.model, card: source.card });
+    if (sent.length === cap) break;
+  }
+  return sent;
+}
+
+/** One long-context band of a card: its tier, threshold, and its input and output rates. */
+export interface LongContextLine {
+  tier: string;
+  above_input_tokens: number;
+  input: string;
+  output: string;
+}
+
+/**
+ * Every long-context band a card carries, one per tier and band, in tier
+ * order: what a request past the threshold is billed at, which a baseline
+ * without the band does not carry.
+ */
+export function longContextLines(card: RateCard | null): LongContextLine[] {
+  if (!card) return [];
+  const lines: LongContextLine[] = [];
+  for (const tier of Object.keys(card).sort((a, b) => (a === "default" ? -1 : b === "default" ? 1 : a.localeCompare(b)))) {
+    const part = (card[tier] ?? {}) as {
+      long_context?: { above_input_tokens?: unknown; rates?: Record<string, unknown> }[];
+    };
+    for (const band of Array.isArray(part.long_context) ? part.long_context : []) {
+      const above = Number(band.above_input_tokens);
+      if (!Number.isFinite(above)) continue;
+      lines.push({
+        tier,
+        above_input_tokens: above,
+        input: String(band.rates?.input ?? ""),
+        output: String(band.rates?.output ?? ""),
+      });
+    }
+  }
+  return lines;
+}
+
+/** A threshold as the Dashboard writes it: `272K` above a thousand, the count below it. */
+export function thresholdText(tokens: number): string {
+  return tokens >= 1000 ? `${Number((tokens / 1000).toFixed(1))}K` : String(tokens);
+}
+
+/** A long-context band in one line, as a candidate's tag carries it: `>272K 输入：$5 / $22.5 每百万`. */
+export function longContextText(line: LongContextLine): string {
+  const tier = line.tier === "default" ? "" : `${tierText(line.tier)} `;
+  return `${tier}>${thresholdText(line.above_input_tokens)} 输入：$${line.input} / $${line.output} 每百万`;
+}
+
+/**
+ * What a sync would change about the long-context bands, in Chinese: `null`
+ * when both sides carry one, or neither does. Display only — the state is
+ * decided by comparing the cards, as before.
+ */
+export function longContextChange(card: RateCard | null, current: RateCard | null): string | null {
+  const entry = longContextLines(card).length > 0;
+  const now = longContextLines(current).length > 0;
+  if (entry === now) return null;
+  return entry ? "当前基准价缺少长上下文档，同步后将补上" : "价格库条目没有长上下文档，同步将去掉它";
 }

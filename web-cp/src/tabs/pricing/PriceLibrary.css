@@ -37,3 +37,20 @@
   flex-direction: column;
   gap: var(--s-2);
 }
+
+/* A long-context band's tag and its rates: marked on every entry that
+   carries one, so a price a baseline lacks is never silent. */
+.library-long-context {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-1);
+  align-items: flex-start;
+}
+
+/* The entry chosen for an ambiguous model, and the way to choose again. */
+.library-chosen {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-2);
+  align-items: center;
+}
