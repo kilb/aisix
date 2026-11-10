@@ -1151,14 +1151,41 @@ pub async fn replace_generated_grants(
     db: &Db,
     ctx: &WriteCtx,
 ) -> Result<GeneratedGrantsReplaced, ApiError> {
+    // A holder names a channel's direct model, or the direct model of a
+    // channel removed since: no channel row and no live document, but the
+    // tombstone of a document a public model generated as a target (owned by
+    // `public:<id>` at another id than the public model's own). That is the
+    // grant `replace_generated_in` withdraws; without it, a tenant whose last
+    // such channel is gone would never be found. The tombstone outlives the
+    // delete's projection by a day (`housekeeping::TOMBSTONE_RETENTION`),
+    // and the pass runs at boot and on every tick, so it is found well
+    // within that. An id with no such trace is no evidence of a grant this
+    // repair is for, and is not looked for.
     let holders: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT t.id FROM tenants t \
+        "WITH named(id) AS ( \
+           SELECT u.id FROM tenants t, unnest(t.allowed_model_ids) AS u(id) \
+           UNION SELECT u.id FROM tenant_keys k, unnest(k.model_ids) AS u(id) \
+             WHERE k.revoked_at IS NULL \
+         ), gone(id) AS ( \
+           SELECT n.id FROM named n \
+           WHERE NOT EXISTS (SELECT 1 FROM gw_resources r \
+                             WHERE r.kind = $1 AND r.id = n.id AND NOT r.deleted) \
+             AND NOT EXISTS (SELECT 1 FROM channel_models cm WHERE cm.direct_model_id = n.id) \
+             AND EXISTS (SELECT 1 FROM gw_resources r \
+                         WHERE r.kind = $1 AND r.id = n.id AND r.deleted \
+                           AND r.managed_by LIKE 'public:%' \
+                           AND r.managed_by <> 'public:' || r.id::text) \
+         ) \
+         SELECT t.id FROM tenants t \
          WHERE EXISTS (SELECT 1 FROM channel_models cm WHERE cm.direct_model_id = ANY(t.allowed_model_ids)) \
+            OR EXISTS (SELECT 1 FROM gone g WHERE g.id = ANY(t.allowed_model_ids)) \
          UNION SELECT k.tenant_id FROM tenant_keys k \
          WHERE k.revoked_at IS NULL \
-           AND EXISTS (SELECT 1 FROM channel_models cm WHERE cm.direct_model_id = ANY(k.model_ids)) \
+           AND (EXISTS (SELECT 1 FROM channel_models cm WHERE cm.direct_model_id = ANY(k.model_ids)) \
+             OR EXISTS (SELECT 1 FROM gone g WHERE g.id = ANY(k.model_ids))) \
          ORDER BY 1",
     )
+    .bind(Kind::Models.segment())
     .fetch_all(db.pool())
     .await
     .map_err(DbError::from)?;
@@ -1228,7 +1255,26 @@ async fn replace_generated_in(
     .fetch_all(&mut *conn)
     .await
     .map_err(DbError::from)?;
-    if generated.is_empty() {
+    // An id that names no live model and no channel row is the direct model
+    // of a channel an operator removed since: an untick, or a retire of its
+    // public model, deletes the row and the document and leaves the grants.
+    // It reaches nothing, and a key document naming it fails the reference
+    // check, so it is withdrawn with the rest. It is not replaced: the
+    // operator stopped serving the model through that account. Read before
+    // anything returns early: a tenant whose every such channel is gone
+    // names nothing else here.
+    let dead: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT DISTINCT u.id FROM unnest($1::uuid[]) AS u(id) \
+         WHERE NOT EXISTS (SELECT 1 FROM gw_resources r \
+                           WHERE r.kind = $2 AND r.id = u.id AND NOT r.deleted) \
+           AND NOT EXISTS (SELECT 1 FROM channel_models cm WHERE cm.direct_model_id = u.id)",
+    )
+    .bind(&named)
+    .bind(Kind::Models.segment())
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(DbError::from)?;
+    if generated.is_empty() && dead.is_empty() {
         return Ok(None);
     }
     let mut publics: Vec<Uuid> = generated.iter().map(|(_, p)| *p).collect();
@@ -1253,23 +1299,6 @@ async fn replace_generated_in(
         .into_iter()
         .map(|(direct, public)| (direct, live.contains(&public).then_some(public)))
         .collect();
-    // An id that names no live model and no channel row is the direct model
-    // of a channel an operator removed since: an untick, or a retire of its
-    // public model, deletes the row and the document and leaves the grants.
-    // It reaches nothing, and a key document naming it fails the reference
-    // check, so it is withdrawn with the rest. It is not replaced: the
-    // operator stopped serving the model through that account.
-    let dead: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT DISTINCT u.id FROM unnest($1::uuid[]) AS u(id) \
-         WHERE NOT EXISTS (SELECT 1 FROM gw_resources r \
-                           WHERE r.kind = $2 AND r.id = u.id AND NOT r.deleted) \
-           AND NOT EXISTS (SELECT 1 FROM channel_models cm WHERE cm.direct_model_id = u.id)",
-    )
-    .bind(&named)
-    .bind(Kind::Models.segment())
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(DbError::from)?;
     map.extend(dead.into_iter().map(|id| (id, None)));
 
     let (grants, replaced, withdrawn) = replace_generated(&tenant.allowed_model_ids, &map);

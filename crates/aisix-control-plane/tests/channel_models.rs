@@ -3683,3 +3683,76 @@ async fn a_regeneration_frees_the_name_a_stale_direct_document_holds_before_reus
         "{doc}"
     );
 }
+
+/// A tenant whose stored grants name nothing but the direct document of a
+/// channel removed since — the last one an older release let it hold — is
+/// still found by the next pass, which withdraws the grant and the key
+/// selection naming it: they reach nothing, and a key document naming the
+/// direct document could not be written again. Nothing is granted in its
+/// place.
+#[tokio::test]
+async fn a_grant_of_only_removed_channels_is_withdrawn_at_the_next_boot() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let account = provider_key(&cp, &op, "acct-dead-5e1").await;
+    let (public, _) = create_public(&cp, &op, "pub-dead-8c1").await;
+    let r = put_channel(&cp, &op, account, public, json!({})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let direct = direct_of(&cp, account, public).await;
+    let tenant = tenant_granted(&cp, &op, &[]).await;
+    let follows = new_key(&cp, &op, tenant).await;
+    let selecting = new_key(&cp, &op, tenant).await;
+    store_old_grants(&cp, &op, tenant, &[direct], &[(selecting, vec![direct])]).await;
+    assert_eq!(key_grants(&cp, follows).await, vec![direct]);
+
+    // The operator unticks the account's last channel of the model.
+    let r = cp
+        .send(
+            "DELETE",
+            &format!("/admin/provider-keys/{account}/channel-models/{public}"),
+            Some(op.cookie()),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(r.status, 204, "{r:?}");
+    assert!(!is_live(&cp, Kind::Models, direct).await);
+
+    let booted = cp.restart().await;
+    assert_eq!(grants(&booted, tenant).await, Vec::<Uuid>::new());
+    assert_eq!(selection(&booted, selecting).await, Some(vec![]));
+    for k in [follows, selecting] {
+        assert_eq!(key_grants(&booted, k).await, Vec::<Uuid>::new(), "{k}");
+    }
+    let rows = replacement_rows(&booted).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        rows[0].2,
+        json!({
+            "replaced": [],
+            "withdrawn": [direct],
+            "keys": [{"key_id": selecting, "replaced": [], "withdrawn": [direct]}],
+        })
+    );
+    // An ordinary edit re-projects the keys again.
+    let current = booted
+        .send(
+            "GET",
+            &format!("/admin/tenants/{tenant}"),
+            Some(op.cookie()),
+            None,
+        )
+        .await;
+    let version = current.body["version"].as_i64().expect("a version");
+    let r = send_conditional(
+        &booted,
+        "PATCH",
+        &format!("/admin/tenants/{tenant}"),
+        op.cookie(),
+        version,
+        Some(json!({"name": "dead-renamed-5e1"})),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{r:?}");
+}
