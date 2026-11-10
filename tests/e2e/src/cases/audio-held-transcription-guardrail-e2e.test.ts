@@ -3,6 +3,8 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
   SeedClient,
+  metricDelta,
+  scrapeMetrics,
   slsLogsFor,
   spawnApp,
   startMockSls,
@@ -26,6 +28,12 @@ import {
 // transcript, and past it does what `on_buffer_exceeded` says, as every other
 // held stream does: `fail_closed` refuses, `fail_open` releases the
 // transcript unscanned and records the bypass on the request's row.
+//
+// A refusal past the cap still bills what the upstream answered: the
+// transcript was produced, and its terminal event reports the tokens whether
+// or not the caller gets to read it. So the refused request's row carries the
+// upstream's usage, and the upstream counts as having answered, even when the
+// cap is crossed frames before that terminal event arrives.
 
 const CALLER = "sk-held-transcription-caller";
 const CREDENTIAL_REF = "mock";
@@ -33,7 +41,8 @@ const LOGSTORE = "held-transcription";
 const hash = (s: string) => createHash("sha256").update(s).digest("hex");
 const FRAME_END = "\r\n\r\n";
 
-const sse = (text: string, deltas: string[]) =>
+/** The frames of a streamed transcription, each with its terminator. */
+const sseFrames = (text: string, deltas: string[]) =>
   [
     ...deltas.map((delta) => `data: ${JSON.stringify({ type: "transcript.text.delta", delta })}`),
     `data: ${JSON.stringify({
@@ -41,9 +50,8 @@ const sse = (text: string, deltas: string[]) =>
       text,
       usage: { type: "tokens", input_tokens: 26, output_tokens: 12, total_tokens: 38 },
     })}`,
-  ]
-    .join(FRAME_END)
-    .concat(FRAME_END);
+  ].map((frame) => frame + FRAME_END);
+const sse = (text: string, deltas: string[]) => sseFrames(text, deltas).join("");
 
 // The address written as JSON escapes on the wire: no `@` in the bytes.
 const escaped = (s: string) => s.replace("@", "\\u0040");
@@ -101,12 +109,15 @@ describe("a held streamed transcription is judged decoded and under its buffer c
       content_mode: "metadata_only",
     });
 
-    const cells: Array<[string, string, Record<string, unknown>]> = [
+    // A body is one write, or a list of frames written apart.
+    const cells: Array<[string, string | string[], Record<string, unknown>]> = [
       ["held-escaped-block", ESCAPED_SSE, { detectors: [{ type: "email", action: "block" }] }],
       ["held-escaped-mask", ESCAPED_SSE, { detectors: [{ type: "email", action: "mask" }] }],
       [
+        // Frame by frame: the first delta crosses the cap, and the terminal
+        // event with the usage arrives later.
         "held-cap-closed",
-        sse(LONG_CLEAN, [LONG_CLEAN.slice(0, 20), LONG_CLEAN.slice(20)]),
+        sseFrames(LONG_CLEAN, [LONG_CLEAN.slice(0, 20), LONG_CLEAN.slice(20)]),
         {
           detectors: [{ type: "email", action: "block" }],
           max_buffer_bytes: CAP,
@@ -124,7 +135,11 @@ describe("a held streamed transcription is judged decoded and under its buffer c
       ],
     ];
     for (const [name, body, rule] of cells) {
-      const upstream = await startOpenAiUpstream({ rawBody: body, rawContentType: "text/event-stream" });
+      const upstream = await startOpenAiUpstream(
+        Array.isArray(body)
+          ? { rawBodyChunks: body, eventDelayMs: 100, rawContentType: "text/event-stream" }
+          : { rawBody: body, rawContentType: "text/event-stream" },
+      );
       upstreams.push(upstream);
       const pk = await seed.createProviderKey({
         display_name: `${name}-pk`,
@@ -207,12 +222,21 @@ describe("a held streamed transcription is judged decoded and under its buffer c
     expect(row.get("completion_tokens")).toBe("12");
   });
 
-  test("past max_buffer_bytes, fail_closed refuses the transcript", async (ctx) => {
+  test("past max_buffer_bytes, fail_closed refuses the transcript and bills what the upstream reported", async (ctx) => {
     if (!etcdReachable) ctx.skip();
+    const before = await scrapeMetrics(app!.metricsUrl);
     const res = await transcribe("held-cap-closed");
     expect(res.status, res.body).toBe(422);
     expect(res.body).toContain("output_buffer_exceeded");
     expect(res.body).not.toContain("sixteen");
+    const row = await rowOf(res.requestId);
+    expect(row.get("prompt_tokens"), "the upstream's input tokens").toBe("26");
+    expect(row.get("completion_tokens"), "the upstream's output tokens").toBe("12");
+    // The upstream answered in full; the refusal was the gateway's.
+    const after = await scrapeMetrics(app!.metricsUrl);
+    const delta = (name: string) => metricDelta(before, after, name, { model: "held-cap-closed" });
+    expect(delta("aisix_deployment_success_responses_total")).toBe(1);
+    expect(delta("aisix_deployment_failure_responses_total")).toBe(0);
   });
 
   test("past max_buffer_bytes, fail_open releases it unscanned and records the bypass", async (ctx) => {
