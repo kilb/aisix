@@ -1270,6 +1270,14 @@ async fn dispatch(
     } else {
         aisix_gateway::scrub_upstream_error_body(&resp_body)
     };
+    // The upstream answered and billed this body. Its usage is read before
+    // any check below can refuse it or the caller can leave during one, so
+    // whichever way the exchange ends, the route's own telemetry credits it.
+    let (usage, tier) = response_usage_and_tier(metering, &resp_body);
+    if let Some(u) = usage {
+        merge_usage(&mut telemetry.usage, u);
+    }
+    telemetry.service_tier = tier;
 
     // Output guardrails govern generated successful answers. A provider's
     // non-success body is its error contract, so preserve its status, headers,
@@ -1310,15 +1318,10 @@ async fn dispatch(
                     error = %err,
                     "cannot safely select passthrough-route response text; blocking",
                 );
-                telemetry.guardrail_blocked = true;
-                telemetry.emitted = true;
-                return Err(RouteError::of(
-                    crate::error::guardrail_block_error(
-                        "response",
-                        None,
-                        Some(crate::error::TAG_UNSCANNABLE_BODY),
-                    ),
-                    &auth,
+                return Ok(telemetry.refuse_answered(
+                    snapshot,
+                    None,
+                    Some(crate::error::TAG_UNSCANNABLE_BODY),
                 ));
             }
         };
@@ -1352,27 +1355,15 @@ async fn dispatch(
                     reason = %reason,
                     "guardrail blocked passthrough-route response",
                 );
-                telemetry.guardrail_blocked = true;
-                // The telemetry guard has not emitted yet; drop it silently and
-                // let the shared error path report the 422.
-                telemetry.emitted = true;
-                return Err(RouteError::of(
-                    crate::error::guardrail_block_error(
-                        "response",
-                        guardrail_name.as_deref(),
-                        unavailable.as_deref(),
-                    ),
-                    &auth,
+                return Ok(telemetry.refuse_answered(
+                    snapshot,
+                    guardrail_name.as_deref(),
+                    unavailable.as_deref(),
                 ));
             }
         }
     }
 
-    let (usage, tier) = response_usage_and_tier(metering, &resp_body);
-    if let Some(u) = usage {
-        merge_usage(&mut telemetry.usage, u);
-    }
-    telemetry.service_tier = tier;
     if !status.is_success() {
         telemetry.keep_error_detail(&resp_body);
     }
@@ -1397,6 +1388,7 @@ async fn dispatch(
             .insert(header::HeaderName::from_static("x-aisix-request-id"), hv);
     }
 
+    telemetry.stream_reached_end = true;
     telemetry.emit();
     Ok(response)
 }
@@ -7334,10 +7326,12 @@ struct RouteTelemetry {
     /// until one is, so a stream that delivered nothing reports no
     /// caller-wait at all rather than an invented one.
     downstream_first_ms: Option<u32>,
-    /// `true` once the relay generator reached its own end — upstream EOF,
-    /// upstream error, or a guardrail block. It stays `false` only when the
-    /// CLIENT went away first, which is what the emit turns into a 499
-    /// (same signal the typed streaming endpoints record).
+    /// `true` once the exchange reached its own end: on a stream, the relay
+    /// generator's end — upstream EOF, upstream error, or a guardrail block;
+    /// on the buffered path, the response (or its refusal) being built. It
+    /// stays `false` only when the CLIENT went away first, which is what the
+    /// emit turns into a 499 (same signal the typed streaming endpoints
+    /// record).
     stream_reached_end: bool,
     /// Set on a streamed relay so the `Drop` emit can tell an abandoned
     /// stream from the buffered path, which never streams at all.
@@ -7422,6 +7416,26 @@ impl RouteTelemetry {
             crate::attempt::StreamRefusal::new(guardrail_name, unavailable).error_message;
     }
 
+    /// Refuse a buffered answer the upstream already sent, through this
+    /// telemetry rather than the route's generic error path, so the request's
+    /// one row and one quota credit keep the tokens the body reported, while
+    /// what was refused stays out of the export. Returns the refusal the
+    /// caller is sent.
+    fn refuse_answered(
+        mut self,
+        snapshot: &aisix_core::AisixSnapshot,
+        guardrail_name: Option<&str>,
+        unavailable: Option<&str>,
+    ) -> Response {
+        let error = crate::error::guardrail_block_error("response", guardrail_name, unavailable);
+        self.record_refusal(guardrail_name, unavailable);
+        self.status = error.status().as_u16();
+        self.stream_reached_end = true;
+        crate::usage_attr::note_client_error(snapshot, &error);
+        self.emit();
+        error.into_response()
+    }
+
     /// A successful renewal can prove a stream still owns its shared
     /// concurrency member; a missing member proves the opposite. The HTTP
     /// response head has already been sent, so terminate at EOF and record a
@@ -7473,6 +7487,16 @@ impl RouteTelemetry {
             Some(status) => self.status = status,
             None if self.streaming && !self.stream_reached_end => {
                 self.status = crate::CLIENT_CLOSED_REQUEST
+            }
+            // A buffered exchange dropped before its response was built: the
+            // caller left while the body was read or checked, before any head
+            // was written. Whatever usage the body already reported stays.
+            None if !self.stream_reached_end => {
+                self.status = crate::CLIENT_CLOSED_REQUEST;
+                if self.error_class.is_empty() {
+                    self.error_class = crate::CLIENT_DISCONNECTED_KIND.to_string();
+                    self.error_message = crate::cancel::CANCELLED_BEFORE_HEAD.to_string();
+                }
             }
             None if crate::attempt::relayed_response_failed(self.status)
                 && self.error_class.is_empty() =>
@@ -12833,6 +12857,164 @@ data: [DONE]\n\n";
                 "{row} streamed={streamed}: {exported_text}"
             );
         }
+    }
+
+    /// A buffered answer an output guardrail refuses was still sent, and
+    /// billed, by the upstream: the request's one row reports the tokens the
+    /// body reported, and the key's token window is charged them, so the next
+    /// request over the limit is refused.
+    #[tokio::test]
+    async fn a_refused_buffered_answer_keeps_the_tokens_it_reported() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::builder().start().await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "chatcmpl-1",
+                "object": "chat.completion",
+                "model": "gpt-4o",
+                "choices": [{"index": 0, "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": "the answer is BLOCKME"}}],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(provider_key_entry("http://unused"));
+        let key: ApiKey = serde_json::from_value(serde_json::json!({
+            "key_hash": ApiKey::hash_bearer("sk-caller"),
+            "allowed_models": ["*"],
+            "allowed_routes": ["*"],
+            "rate_limit": {"tpm": 5}
+        }))
+        .unwrap();
+        snap.apikeys.insert(ResourceEntry::new("k-1", key, 1));
+        snap.passthrough_routes
+            .insert(inject_route(&upstream.uri()));
+        let g: aisix_core::Guardrail = serde_json::from_str(
+            r#"{"name":"out-block","enabled":true,"hook_point":"output","fail_open":false,"kind":"keyword","patterns":[{"kind":"literal","value":"BLOCKME"}]}"#,
+        )
+        .unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-1", g, 1));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = crate::build_router(
+            crate::ProxyState::new(SnapshotHandle::new(snap), Arc::new(Hub::new()), &cfg())
+                .without_cache()
+                .with_usage_sink(UsageSink::new(tx)),
+        );
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/passthrough/openai/v1/chat/completions")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"model": "gpt-4o",
+                        "messages": [{"role": "user", "content": "hi"}]})
+                    .to_string(),
+                ))
+                .unwrap()
+        };
+
+        let resp = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        assert!(!String::from_utf8_lossy(&body).contains("the answer"));
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("a usage event for the refusal")
+            .expect("usage_sink sender dropped");
+        assert_eq!(ev.status_code, 422);
+        assert!(ev.guardrail_blocked);
+        assert_eq!((ev.prompt_tokens, ev.completion_tokens), (7, 3), "{ev:?}");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+                .await
+                .is_err(),
+            "one row for the request"
+        );
+
+        // The 10 tokens were charged to the key's 5-token window.
+        let next = app.oneshot(request()).await.unwrap();
+        assert_eq!(next.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// A caller that leaves while a buffered answer is still being read,
+    /// after the upstream's head arrived, is recorded as the cancel it is:
+    /// one terminal row, `499`, never the upstream's `200`.
+    #[tokio::test]
+    async fn a_buffered_relay_the_caller_left_is_recorded_as_a_cancel() {
+        use aisix_obs::UsageSink;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (head_sent_tx, head_sent) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut req = vec![0u8; 65536];
+            let _ = sock.read(&mut req).await;
+            sock.write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 500\r\n\r\n{",
+            )
+            .await
+            .unwrap();
+            sock.flush().await.unwrap();
+            let _ = head_sent_tx.send(());
+            // The rest of the body never comes.
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(provider_key_entry("http://unused"));
+        snap.apikeys.insert(apikey_entry("sk-caller", Some(&["*"])));
+        snap.passthrough_routes
+            .insert(inject_route(&format!("http://{addr}")));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = crate::build_router(
+            crate::ProxyState::new(SnapshotHandle::new(snap), Arc::new(Hub::new()), &cfg())
+                .without_cache()
+                .with_usage_sink(UsageSink::new(tx)),
+        );
+        let request = Request::builder()
+            .method("POST")
+            .uri("/passthrough/openai/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::json!({"model": "gpt-4o",
+                    "messages": [{"role": "user", "content": "hi"}]})
+                .to_string(),
+            ))
+            .unwrap();
+        let call = tokio::spawn(app.oneshot(request));
+        head_sent.await.unwrap();
+        // Let the gateway take the upstream head and start reading the body.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        call.abort();
+        let _ = call.await;
+
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("a usage event for the cancelled request")
+            .expect("usage_sink sender dropped");
+        assert_eq!(ev.status_code, crate::CLIENT_CLOSED_REQUEST, "{ev:?}");
+        assert_eq!(ev.error_class, crate::CLIENT_DISCONNECTED_KIND);
+        assert_eq!(ev.passthrough_route_name, "openai-tunnel");
+        // The sender closes with the dropped app; no second row before that.
+        assert!(
+            !matches!(
+                tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv()).await,
+                Ok(Some(_))
+            ),
+            "one terminal row for the request"
+        );
     }
 
     /// An upstream cut off mid-answer must not read as a whole answer: the body
