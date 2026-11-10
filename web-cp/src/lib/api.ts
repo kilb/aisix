@@ -1007,12 +1007,33 @@ export interface Charge {
   exemption: string | null;
   /** The pricing code behind an `unpriced` charge. */
   error_code: string | null;
+  /** The sum of the charge's re-pricing adjustments in micro-CNY; `null` when no run corrected it. */
+  adjusted_micro_cny: number | null;
+  /** The model's name, even once it is deleted (else the name the call sent); `null` when the call named none. */
+  model_name: string | null;
+  /** Whether the model the charge names by id no longer exists. */
+  model_deleted: boolean;
+  /** The call's HTTP status; `null` when its usage row records none. */
+  status_code: number | null;
+  /** The failed attempt's error class; `null` for a success. */
+  error_class: string | null;
+  /** `initial`, `retry` or `fallback`. */
+  attempt_kind: string;
+  /** The attempt's 0-based index within its request. */
+  attempt_index: number;
+  is_final_attempt: boolean | null;
 }
 
 export interface ChargeFilter {
   status?: string;
+  /** Every status but this one. */
+  exclude_status?: string;
   tenant_id?: string;
   api_key_id?: string;
+  /** The charge's requested model id. */
+  model_id?: string;
+  /** The pricing code; `unknown` for a charge stored without one. */
+  error_code?: string;
   event_id?: string;
   before?: number;
 }
@@ -1034,11 +1055,28 @@ export interface InvalidRevision {
   reason: string;
 }
 
+/** One kind of unpriced charge: a reason on a model, with the tier or group the reason is about. */
+export interface UnpricedDetail {
+  code: string;
+  count: number;
+  /** When the latest of these calls occurred. */
+  latest_at: string;
+  /** `id` is the charge's requested model id (`null` when the call named none); `name` survives the model's deletion. */
+  model: { id: string | null; name: string | null; deleted: boolean };
+  /** For `missing_tier_price`: the tier the baseline lacks (`""` when the upstream reported none). */
+  service_tier: string | null;
+  /** For `missing_rate`: the group without a rate. */
+  group: { id: string; name: string; display_name: string } | null;
+}
+
 /** The pricing health: version, unusable revisions and the last 24 hours' unpriced charges by code. */
 export interface PricingStatus {
   pricing_version: number | null;
   invalid_revisions: InvalidRevision[];
+  /** Charges still unpriced; those a re-pricing run corrected are in `corrected_last_24h`. */
   unpriced_last_24h: { total: number; by_code: Record<string, number> };
+  unpriced_details: { items: UnpricedDetail[]; truncated: boolean };
+  corrected_last_24h: { total: number; by_code: Record<string, number> };
 }
 
 export const pricingStatus = {

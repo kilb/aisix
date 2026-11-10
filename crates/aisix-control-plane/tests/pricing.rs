@@ -2455,3 +2455,556 @@ async fn a_free_group_and_a_full_discount_post_nothing_and_keep_their_batch() {
             .expect("count the paying tenant's entries");
     assert_eq!(entries, 1);
 }
+
+/// Whether a backend of this database is waiting for a lock while it reads
+/// `table`.
+async fn a_read_of_waits(cp: &TestCp, table: &str) -> bool {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+         WHERE datname = current_database() AND wait_event_type = 'Lock' \
+           AND query ILIKE '%FROM ' || $1 || '%')",
+    )
+    .bind(table)
+    .fetch_one(cp.db().pool())
+    .await
+    .expect("read pg_stat_activity")
+}
+
+/// R-001: intake loads the price book with one statement per table, each on
+/// a snapshot of its own. Two price writes that commit between its read of
+/// the baselines and its read of the group rates must not leave it pricing
+/// with the old baseline and the new rate, a pair that was never in force
+/// together: the book it prices with is one some version of the tables held.
+///
+/// The row occurs after both new revisions start (the 5 s backdate window a
+/// write is allowed): at the old prices it is 680 µ¥ (card × rate 1), at the
+/// new ones 2720 µ¥ (card × 2 at rate 2), and the mixed book would bill it
+/// 1360 µ¥. A row before both new revisions is still priced at the old pair.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_book_loaded_while_prices_change_never_mixes_two_versions() {
+    let Some(w) = world().await else { return };
+    let model = seed_model(&w.cp, &w.admin).await;
+    price(&w.cp, model).await;
+    let group = support::world::group_id(&w.cp, support::world::SHARED_GROUP).await;
+    // The revisions above start at the database's now; the new ones start a
+    // moment later, and before the row occurs.
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let new_from = db_now(&w.cp).await;
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let mut early = usage(&w, "e-early", model, tokens_680());
+    early["occurred_at"] = json!((new_from - TimeDelta::milliseconds(10)).to_rfc3339());
+    let late = usage(&w, "e-late", model, tokens_680());
+
+    // The group rates are held, so the load stops after reading the baselines.
+    let mut holder = PgConnection::connect(w.cp.database_url())
+        .await
+        .expect("connect");
+    sqlx::query("BEGIN")
+        .execute(&mut holder)
+        .await
+        .expect("begin");
+    sqlx::query("LOCK TABLE pricing_group_rates IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut holder)
+        .await
+        .expect("lock the group rates");
+
+    let delivered = deliver(&w.dp, Uuid::new_v4(), vec![early, late]);
+    let race = async {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        while !a_read_of_waits(&w.cp, "pricing_group_rates").await {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "intake never waited on the group rates"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        // A new baseline, card × 2, commits while intake waits...
+        let doubled = json!({
+            "default": {"base": {"input": "2", "output": "4", "cache_read": "0.2"}}
+        });
+        let mut tx = w.cp.db().pool().begin().await.expect("begin");
+        sqlx::query(
+            "INSERT INTO pricing_baselines \
+             (engine_version, model_id, effective_from, card, source_kind, source) \
+             VALUES ($1, $2, $3, $4, 'manual', '{\"note\": \"doubled\"}')",
+        )
+        .bind(i64::from(ENGINE_VERSION))
+        .bind(model)
+        .bind(new_from)
+        .bind(doubled)
+        .execute(&mut *tx)
+        .await
+        .expect("write the new baseline");
+        sqlx::query(
+            "UPDATE cp_settings SET value = to_jsonb((value::text)::bigint + 1) \
+             WHERE key = 'pricing_version'",
+        )
+        .execute(&mut *tx)
+        .await
+        .expect("bump");
+        tx.commit().await.expect("commit the baseline");
+        // ...and then a new rate of 2, which releases the lock.
+        sqlx::query(
+            "INSERT INTO pricing_group_rates \
+             (engine_version, group_id, model_id, effective_from, cny_per_usd_e4, note) \
+             VALUES ($1, $2, NULL, $3, 20000, 'doubled')",
+        )
+        .bind(i64::from(ENGINE_VERSION))
+        .bind(group)
+        .bind(new_from)
+        .execute(&mut holder)
+        .await
+        .expect("write the new rate");
+        sqlx::query(
+            "UPDATE cp_settings SET value = to_jsonb((value::text)::bigint + 1) \
+             WHERE key = 'pricing_version'",
+        )
+        .execute(&mut holder)
+        .await
+        .expect("bump");
+        sqlx::query("COMMIT")
+            .execute(&mut holder)
+            .await
+            .expect("commit the rate");
+    };
+    let (r, ()) = tokio::join!(delivered, race);
+    assert_eq!((r.status, r.body.clone()), (200, counts(2, 0, 0)), "{r:?}");
+    let charge = |id: &'static str| {
+        let pool = w.cp.db().pool().clone();
+        async move {
+            sqlx::query_scalar::<_, Option<i64>>(
+                "SELECT charge_micro_cny FROM pricing_charges_cny WHERE event_id = $1",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("read the charge")
+        }
+    };
+    // Never the mixed 1360: the late row at the new pair.
+    assert_eq!(charge("e-late").await, Some(2_720));
+    // The book still holds the history: the early row at the old pair.
+    assert_eq!(charge("e-early").await, Some(680));
+}
+
+/// A model document's `display_name` and `version`.
+async fn model_doc(cp: &TestCp, id: Uuid) -> (String, i64) {
+    sqlx::query_as(
+        "SELECT doc->>'display_name', version FROM gw_resources WHERE kind = 'models' AND id = $1",
+    )
+    .bind(id)
+    .fetch_one(cp.db().pool())
+    .await
+    .expect("read the model document")
+}
+
+/// Deletes model `id` as `admin`, which must answer 200.
+async fn delete_model(cp: &TestCp, admin: &OperatorSession, id: Uuid) {
+    let (_, version) = model_doc(cp, id).await;
+    let status = send_if_match(
+        cp,
+        admin,
+        "DELETE",
+        &format!("/admin/resources/models/{id}"),
+        version,
+    )
+    .await;
+    assert_eq!(status, 200, "delete model {id}");
+}
+
+/// The detail of `status` for `code` on `model`.
+fn detail<'a>(status: &'a Value, code: &str, model: Uuid) -> &'a Value {
+    status["unpriced_details"]["items"]
+        .as_array()
+        .expect("details")
+        .iter()
+        .find(|d| d["code"] == code && d["model"]["id"] == json!(model.to_string()))
+        .unwrap_or_else(|| panic!("no {code} detail for {model} in {status}"))
+}
+
+/// B3: 计价状态 says what each unpriced call was and what to fix, not just a
+/// count per reason: each reason by model, with the tier the card lacks
+/// (`missing_tier_price`) and the group without a rate (`missing_rate`), the
+/// count and the latest call. A deleted model is still named. A charge an
+/// applied re-pricing run has corrected no longer counts as unpriced: it is
+/// counted apart, as corrected.
+#[tokio::test]
+async fn the_status_details_each_unpriced_kind_and_counts_corrected_rows_apart() {
+    let Some(w) = world().await else { return };
+    let cp = &w.cp;
+    let (tiered, unpriced, fixed, unrated) = (
+        seed_model(cp, &w.admin).await,
+        seed_model(cp, &w.admin).await,
+        seed_model(cp, &w.admin).await,
+        seed_model(cp, &w.admin).await,
+    );
+    price(cp, tiered).await;
+    // A group whose rate starts now, and a key of the world's tenant in it:
+    // a call of an hour ago has a baseline in force and no rate.
+    support::seed_group(cp, &w.admin, "nr-b3").await;
+    let tenant = as_op(
+        cp,
+        &w.admin,
+        "GET",
+        &format!("/admin/tenants/{}", w.tenant),
+        None,
+    )
+    .await;
+    let patched = cp
+        .send_conditional(
+            "PATCH",
+            &format!("/admin/tenants/{}", w.tenant),
+            w.admin.cookie(),
+            tenant.body["version"].as_i64().expect("a version"),
+            json!({"allowed_provider_groups": ["shared", "nr-b3"]}),
+        )
+        .await;
+    assert_eq!(patched.status, 200, "{patched:?}");
+    let nr_key =
+        support::world::seed_key_in_group(cp, &w.admin, w.tenant, Some(w.member), "nr-b3").await;
+    let now = db_now(cp).await;
+    support::world::insert_baseline_backdated(
+        cp.db(),
+        unrated,
+        serde_json::to_value(card()).expect("a card"),
+        now - TimeDelta::hours(2),
+    )
+    .await;
+
+    let tier = |id: &str, ago: i64| {
+        let mut e = usage(&w, id, tiered, tokens_680());
+        e["service_tier"] = json!("priority");
+        e["occurred_at"] = json!((Utc::now() - TimeDelta::milliseconds(ago)).to_rfc3339());
+        e
+    };
+    let mut none = usage(&w, "e-none", unpriced, tokens_680());
+    none["requested_model"] = json!("sent-none");
+    let mut rate = usage(&w, "e-rate", unrated, tokens_680());
+    rate["api_key_id"] = json!(nr_key);
+    rate["occurred_at"] = json!((now - TimeDelta::hours(1)).to_rfc3339());
+    let r = deliver(
+        &w.dp,
+        Uuid::new_v4(),
+        vec![
+            tier("e-tier-1", 10),
+            tier("e-tier-2", 0),
+            none,
+            rate,
+            usage(&w, "e-fix", fixed, tokens_680()),
+        ],
+    )
+    .await;
+    assert_eq!((r.status, r.body.clone()), (200, counts(5, 0, 0)), "{r:?}");
+
+    // A run charges the one row of `fixed` once it has a price.
+    price(cp, fixed).await;
+    let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let to = db_now(cp).await;
+    let run = as_op(
+        cp,
+        &w.admin,
+        "POST",
+        "/admin/billing/repricing",
+        Some(json!({
+            "from": to - TimeDelta::hours(1), "to": to, "model_id": fixed,
+            "reason": "补录 b3",
+        })),
+    )
+    .await;
+    assert_eq!(
+        (run.status, run.body["changed"].clone()),
+        (201, json!(1)),
+        "{run:?}"
+    );
+    let id = run.body["id"].as_str().expect("a run id");
+    let applied = as_op(
+        cp,
+        &admin,
+        "POST",
+        &format!("/admin/billing/repricing/{id}/apply"),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(applied.status, 200, "{applied:?}");
+
+    let r = as_op(cp, &w.admin, "GET", "/admin/pricing/status", None).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let s = &r.body;
+    assert_eq!(
+        (
+            s["unpriced_last_24h"]["total"].clone(),
+            s["unpriced_last_24h"]["by_code"].clone()
+        ),
+        (
+            json!(4),
+            json!({"missing_tier_price": 2, "missing_price": 1, "missing_rate": 1})
+        ),
+        "{s}"
+    );
+    assert_eq!(
+        s["corrected_last_24h"],
+        json!({"total": 1, "by_code": {"missing_price": 1}}),
+        "{s}"
+    );
+    assert_eq!(s["unpriced_details"]["truncated"], false);
+    assert_eq!(
+        s["unpriced_details"]["items"].as_array().map(Vec::len),
+        Some(3),
+        "{s}"
+    );
+
+    let t = detail(s, "missing_tier_price", tiered);
+    assert_eq!(t["count"], 2, "{t}");
+    assert_eq!(t["service_tier"], "priority", "{t}");
+    assert_eq!(
+        t["model"]["name"],
+        json!(model_doc(cp, tiered).await.0),
+        "{t}"
+    );
+    assert_eq!(t["model"]["deleted"], false, "{t}");
+    assert!(t["group"].is_null(), "{t}");
+    let latest: DateTime<Utc> =
+        serde_json::from_value(t["latest_at"].clone()).expect("a latest time");
+    let first: DateTime<Utc> = sqlx::query_scalar(
+        "SELECT occurred_at FROM pricing_charges_cny WHERE event_id = 'e-tier-1'",
+    )
+    .fetch_one(cp.db().pool())
+    .await
+    .expect("read the first tier row");
+    assert!(latest > first, "the latest of the two: {t}");
+
+    let g = detail(s, "missing_rate", unrated);
+    assert_eq!(g["group"]["name"], "nr-b3", "{g}");
+    assert!(g["service_tier"].is_null(), "{g}");
+
+    let n = detail(s, "missing_price", unpriced);
+    assert_eq!(n["count"], 1, "{n}");
+    let name = model_doc(cp, unpriced).await.0;
+    assert_eq!(n["model"]["name"], json!(name), "{n}");
+
+    // Once the model is deleted it is still named, and marked deleted.
+    delete_model(cp, &w.admin, unpriced).await;
+    let r = as_op(cp, &w.admin, "GET", "/admin/pricing/status", None).await;
+    let n = detail(&r.body, "missing_price", unpriced);
+    assert_eq!(
+        (n["model"]["name"].clone(), n["model"]["deleted"].clone()),
+        (json!(name), json!(true)),
+        "{n}"
+    );
+}
+
+/// B4: an operator's charge listing says why a row was billed nothing and
+/// names its model even once the model is gone: the call's status, error
+/// class and attempt, the model's name from its document (or the name the
+/// call sent), and a flag for a deleted model. Rows billed nothing can be
+/// hidden, and the listing filters by model and reason.
+#[tokio::test]
+async fn a_charge_says_how_its_call_ended_and_names_a_deleted_model() {
+    let Some(w) = world().await else { return };
+    let cp = &w.cp;
+    let model = seed_model(cp, &w.admin).await;
+    price(cp, model).await;
+    let mut retry = usage(&w, "e-retry", model, json!({}));
+    for (k, v) in [
+        ("status_code", json!(502)),
+        ("error_class", json!("upstream_status")),
+        ("error_message", json!("upstream answered 502")),
+        ("attempt_kind", json!("retry")),
+        ("attempt_index", json!(2)),
+        ("is_final_attempt", json!(false)),
+        ("requested_model", json!("gpt-5.6")),
+    ] {
+        retry[k] = v;
+    }
+    let mut refused = usage(&w, "e-refused", model, json!({}));
+    refused["requested_model_id"] = json!("");
+    refused["requested_model"] = json!("no-such-model");
+    refused["status_code"] = json!(404);
+    refused["error_class"] = json!("model_not_found");
+    let mut anonymous = usage(&w, "e-anon", model, json!({}));
+    anonymous["requested_model_id"] = json!("");
+    anonymous["status_code"] = json!(401);
+    anonymous["error_class"] = json!("authentication_error");
+    let r = deliver(
+        &w.dp,
+        Uuid::new_v4(),
+        vec![
+            retry,
+            refused,
+            anonymous,
+            usage(&w, "e-ok", model, tokens_680()),
+        ],
+    )
+    .await;
+    assert_eq!((r.status, r.body.clone()), (200, counts(4, 0, 0)), "{r:?}");
+    let operator = &w.admin;
+    let list = move |query: String| async move {
+        let r = as_op(
+            cp,
+            operator,
+            "GET",
+            &format!("/admin/pricing/charges?{query}"),
+            None,
+        )
+        .await;
+        assert_eq!(r.status, 200, "{query}: {r:?}");
+        r.body["items"].as_array().expect("items").clone()
+    };
+    let one = |items: Vec<Value>, id: &str| {
+        items
+            .into_iter()
+            .find(|c| c["event_id"] == id)
+            .unwrap_or_else(|| panic!("no {id}"))
+    };
+    let name = model_doc(cp, model).await.0;
+
+    let all = list(format!("tenant_id={}", w.tenant)).await;
+    let retried = one(all.clone(), "e-retry");
+    assert_eq!(retried["status"], "nothing_to_bill", "{retried}");
+    assert_eq!(
+        (
+            retried["status_code"].clone(),
+            retried["error_class"].clone(),
+            retried["attempt_kind"].clone(),
+            retried["attempt_index"].clone(),
+            retried["is_final_attempt"].clone(),
+        ),
+        (
+            json!(502),
+            json!("upstream_status"),
+            json!("retry"),
+            json!(2),
+            json!(false)
+        ),
+        "{retried}"
+    );
+    assert_eq!(
+        (
+            retried["model_name"].clone(),
+            retried["model_deleted"].clone()
+        ),
+        (json!(name), json!(false)),
+        "{retried}"
+    );
+    // The upstream's own words stay in the usage row.
+    assert!(retried.get("error_message").is_none(), "{retried}");
+    let r = one(all.clone(), "e-refused");
+    assert_eq!(
+        (
+            r["model_name"].clone(),
+            r["model_deleted"].clone(),
+            r["status_code"].clone()
+        ),
+        (json!("no-such-model"), json!(false), json!(404)),
+        "{r}"
+    );
+    let r = one(all.clone(), "e-anon");
+    assert_eq!(
+        (r["model_name"].clone(), r["model_deleted"].clone()),
+        (Value::Null, json!(false)),
+        "{r}"
+    );
+    let ok = one(all, "e-ok");
+    assert_eq!(
+        (
+            ok["attempt_kind"].clone(),
+            ok["error_class"].clone(),
+            ok["status_code"].clone()
+        ),
+        (json!("initial"), Value::Null, json!(200)),
+        "{ok}"
+    );
+
+    // Hidden: every row billed nothing.
+    let shown: Vec<Value> = list(format!(
+        "tenant_id={}&exclude_status=nothing_to_bill",
+        w.tenant
+    ))
+    .await
+    .into_iter()
+    .map(|c| c["event_id"].clone())
+    .collect();
+    assert_eq!(shown, [json!("e-ok")]);
+    let by_model: Vec<Value> = list(format!("model_id={model}"))
+        .await
+        .into_iter()
+        .map(|c| c["event_id"].clone())
+        .collect();
+    // Newest first: intake stores a batch in event-id order.
+    assert_eq!(by_model, [json!("e-retry"), json!("e-ok")]);
+    let r = as_op(
+        cp,
+        &w.admin,
+        "GET",
+        "/admin/pricing/charges?exclude_status=billed",
+        None,
+    )
+    .await;
+    assert_422_at(&r, "exclude_status");
+
+    // The model is retired: its rows still name it, as deleted.
+    delete_model(cp, &w.admin, model).await;
+    let retried = one(list(format!("model_id={model}")).await, "e-retry");
+    assert_eq!(
+        (
+            retried["model_name"].clone(),
+            retried["model_deleted"].clone()
+        ),
+        (json!(name), json!(true)),
+        "{retried}"
+    );
+}
+
+/// The listing's `error_code` filter: one reason, or `unknown` for a charge
+/// stored without one.
+#[tokio::test]
+async fn charges_are_listed_by_reason() {
+    let Some(w) = world().await else { return };
+    let (priced, unpriced) = (
+        seed_model(&w.cp, &w.admin).await,
+        seed_model(&w.cp, &w.admin).await,
+    );
+    price(&w.cp, priced).await;
+    let r = deliver(
+        &w.dp,
+        Uuid::new_v4(),
+        vec![
+            usage(&w, "e-np", unpriced, tokens_680()),
+            usage(
+                &w,
+                "e-search",
+                priced,
+                json!({"prompt_tokens": 100, "web_search_requests": 2}),
+            ),
+            usage(&w, "e-ok", priced, tokens_680()),
+        ],
+    )
+    .await;
+    assert_eq!((r.status, r.body.clone()), (200, counts(3, 0, 0)), "{r:?}");
+    let ids = |query: &'static str| {
+        let w = &w;
+        async move {
+            let r = as_op(
+                &w.cp,
+                &w.admin,
+                "GET",
+                &format!("/admin/pricing/charges?{query}"),
+                None,
+            )
+            .await;
+            assert_eq!(r.status, 200, "{r:?}");
+            r.body["items"]
+                .as_array()
+                .expect("items")
+                .iter()
+                .map(|c| c["event_id"].as_str().expect("an id").to_string())
+                .collect::<Vec<_>>()
+        }
+    };
+    assert_eq!(ids("error_code=missing_price").await, ["e-np"]);
+    assert_eq!(
+        ids("error_code=missing_dimension_price").await,
+        ["e-search"]
+    );
+    assert!(ids("error_code=unknown&status=unpriced").await.is_empty());
+}

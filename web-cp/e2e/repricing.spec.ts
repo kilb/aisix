@@ -288,6 +288,50 @@ test("预览了另一次运行后，上一次打开的确认执行不会带过�
   expect((await ledger(world)).filter((e) => e.kind === "adjustment")).toHaveLength(0);
 });
 
+test("API 建的按分组筛选的运行过期后重新预览，仍只算该分组，不会扩到其他分组", async ({ page }) => {
+  const { world, model } = await unpricedWorld();
+  await price(model.id, CARD);
+  // The world's calls are all in `shared`; the run is for another group, which has none of them.
+  const other = ((await stack.admin.get("/admin/provider-groups")).items as Json[]).find((g) => g.name === "grp-ui-5d2");
+  expect(other).toBeDefined();
+  const run = await stack.admin.post("/admin/billing/repricing", {
+    from: new Date(Date.now() - 3_600_000).toISOString(),
+    to: new Date().toISOString(),
+    model_id: model.id,
+    tenant_id: world.tenantId,
+    group_id: other!.id,
+    status: "unpriced",
+    reason: "分组-ui",
+  });
+  expect(run.events).toBe(0);
+  // A new price makes the run stale.
+  await price(model.id, { default: { base: { input: "2000", output: "4000" } } });
+
+  await login(page, stack.operator.email, stack.operator.password);
+  const list = page.getByRole("table", { name: "重新计价运行" });
+  await expect(list.getByRole("row", { name: /分组-ui/ })).toContainText(`分组：${other!.display_name}`);
+  await list.getByRole("row", { name: /分组-ui/ }).getByRole("button", { name: "查看" }).click();
+  const result = page.getByRole("region", { name: "预览结果" });
+  await expect(result).toContainText(`分组 ${other!.display_name}`);
+  await page.getByRole("button", { name: "执行", exact: true }).click();
+  await page.getByRole("button", { name: "确认执行" }).click();
+  await expect(page.getByRole("alert").filter({ hasText: "预览之后价格或数据有变化，请重新预览" })).toBeVisible();
+  await page.getByRole("button", { name: "重新预览" }).click();
+  // The new run is shown once it offers 执行 again (the stale one offers only 重新预览).
+  await expect(page.getByRole("button", { name: "执行", exact: true })).toBeVisible();
+
+  // The new run keeps the group: none of the world's three calls is selected.
+  await expect(result).toContainText(`分组 ${other!.display_name}`);
+  await expect(totals(page).getByRole("row", { name: /选中的调用/ }).getByRole("cell")).toHaveText("0");
+  const again = ((await stack.admin.get("/admin/billing/repricing")).items as Json[]).find((r) => r.reason === "分组-ui" && r.id !== run.id);
+  expect(again?.filter.group_id).toBe(other!.id);
+  expect(again?.events).toBe(0);
+  await page.getByRole("button", { name: "执行", exact: true }).click();
+  await page.getByRole("button", { name: "确认执行" }).click();
+  await expect(page.getByRole("status").filter({ hasText: "已执行" })).toBeVisible();
+  expect((await ledger(world)).filter((e) => e.kind === "adjustment")).toHaveLength(0);
+});
+
 test("对账里未计价的原因显示中文名称", async ({ page }) => {
   await unpricedWorld();
   await login(page, stack.operator.email, stack.operator.password);

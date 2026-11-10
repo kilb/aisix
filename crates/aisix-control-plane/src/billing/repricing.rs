@@ -15,7 +15,9 @@
 //!    apply ends; it must be the preview's (`409 stale_preview`);
 //! 4. the totals, computed again, which must equal the preview's
 //!    (`409 stale_preview`);
-//! 5. one `pricing_adjustments` row per changed charge, one `adjustment`
+//! 5. one `pricing_adjustments` row per changed charge, carrying what the
+//!    run priced it at (its lines, group rate, discount and tier, which the
+//!    tenant views show for the corrected charge), one `adjustment`
 //!    ledger entry per tenant whose deltas do not sum to 0, the deltas
 //!    counted against cumulative quotas at each charge's own price instant
 //!    (`budgets::count_charges` in `Adjustment` mode), and every changed
@@ -169,6 +171,14 @@ struct Change {
     delta: i64,
     baseline_revision_id: Option<i64>,
     rate_revision_id: Option<i64>,
+    /// What the run priced the charge at, which the adjustment records so
+    /// that the corrected charge is shown with the quantities it bills
+    /// (`calls::EFFECTIVE`): the lines as a charge stores them, the group
+    /// rate, the discount and the served tier.
+    lines: Value,
+    cny_per_usd_e4: Option<i64>,
+    discount_bps: i64,
+    service_tier: Option<String>,
 }
 
 /// One selected charge with its usage row.
@@ -347,6 +357,10 @@ fn compute(
             delta,
             baseline_revision_id: priced.baseline.map(|b| b.revision_id),
             rate_revision_id: priced.rate.map(|r| r.revision_id),
+            lines: serde_json::to_value(&priced.lines).map_err(ApiError::internal)?,
+            cny_per_usd_e4: priced.rate.map(|r| i64::from(r.cny_per_usd.0)),
+            discount_bps: priced.discount.map_or(0, |d| i64::from(d.bps)),
+            service_tier: priced.service_tier.as_ref().map(|t| t.as_str().to_string()),
         });
     }
     totals.by_tenant = by_tenant.into_values().collect();
@@ -747,19 +761,34 @@ pub async fn apply(
                     let mut deltas = Vec::with_capacity(changes.len());
                     let mut baselines = Vec::with_capacity(changes.len());
                     let mut rates = Vec::with_capacity(changes.len());
+                    let mut lines = Vec::with_capacity(changes.len());
+                    let mut cny_rates = Vec::with_capacity(changes.len());
+                    let mut discounts = Vec::with_capacity(changes.len());
+                    let mut tiers = Vec::with_capacity(changes.len());
                     for c in &changes {
                         event_ids.push(c.event_id.as_str());
                         deltas.push(c.delta);
                         baselines.push(c.baseline_revision_id);
                         rates.push(c.rate_revision_id);
+                        lines.push(c.lines.clone());
+                        cny_rates.push(c.cny_per_usd_e4);
+                        discounts.push(c.discount_bps);
+                        tiers.push(c.service_tier.as_deref());
                     }
+                    // `created_at` is when the row is written, after this
+                    // transaction holds the tenants' billing locks: two runs
+                    // that correct one charge write in the order they
+                    // commit, which is how its latest adjustment is found.
                     sqlx::query(
                         "INSERT INTO pricing_adjustments_cny \
                          (run_id, event_id, delta_micro_cny, baseline_revision_id, \
-                          rate_revision_id, engine_version, reason, created_by) \
-                         SELECT $1, a.event_id, a.delta, a.baseline, a.rate, $6, $7, $8 \
-                         FROM unnest($2::text[], $3::bigint[], $4::bigint[], $5::bigint[]) \
-                           AS a(event_id, delta, baseline, rate)",
+                          rate_revision_id, engine_version, reason, created_by, lines, \
+                          cny_per_usd_e4, discount_bps, service_tier, created_at) \
+                         SELECT $1, a.event_id, a.delta, a.baseline, a.rate, $6, $7, $8, \
+                                a.lines, a.cny, a.discount, a.tier, clock_timestamp() \
+                         FROM unnest($2::text[], $3::bigint[], $4::bigint[], $5::bigint[], \
+                                     $9::jsonb[], $10::bigint[], $11::bigint[], $12::text[]) \
+                           AS a(event_id, delta, baseline, rate, lines, cny, discount, tier)",
                     )
                     .bind(id)
                     .bind(&event_ids)
@@ -769,6 +798,10 @@ pub async fn apply(
                     .bind(i64::from(ENGINE_VERSION))
                     .bind(&run.reason)
                     .bind(auth.id)
+                    .bind(&lines)
+                    .bind(&cny_rates)
+                    .bind(&discounts)
+                    .bind(&tiers)
                     .execute(&mut *conn)
                     .await
                     .map_err(DbError::from)?;

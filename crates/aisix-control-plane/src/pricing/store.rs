@@ -24,6 +24,16 @@
 //! later commit only makes the next read reload. A version row that is
 //! missing or not a whole number never stops intake: the book is then
 //! reloaded for every batch, and each such read is logged at ERROR.
+//!
+//! A load reads the four revision tables in four statements, and under the
+//! default READ COMMITTED isolation each statement sees what had committed
+//! when it started. Price writes that commit between two of them would leave
+//! a book holding, say, the old baseline beside the new rate: a pair that was
+//! never in force together. So a load is fenced by the version: it is read
+//! before and after the tables, and a load across which it moved is thrown
+//! away and done again ([`MAX_BOOK_LOADS`] times at most). Every price write
+//! moves the version in its own transaction, so a load whose fence held saw
+//! the tables exactly as that version left them.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
@@ -47,6 +57,13 @@ use crate::error::{ApiError, Detail};
 /// backdating allowed, for the moment between an operator's choice of
 /// "now" and the commit.
 pub const BACKDATE_TOLERANCE: TimeDelta = TimeDelta::seconds(5);
+
+/// How many times [`PriceBookCache::current`] loads the book before it gives
+/// up on finding the price tables still: a load across which
+/// `pricing_version` moved is done again. Price writes are operator actions,
+/// so a second load all but always holds; one that never does fails its
+/// caller's transaction, and intake's gateway sends the batch again.
+pub const MAX_BOOK_LOADS: usize = 5;
 
 /// The most characters of a row's `team_id`, `api_key_id`, `user_id` or
 /// `requested_model_id` a charge copies: the same cap usage intake puts on
@@ -80,9 +97,12 @@ impl PriceBookCache {
     /// the book on the same connection only when the version differs from
     /// the cached one, and logs one ERROR per invalid revision on each
     /// reload. Readers that find it stale at the same time share one reload.
-    /// A version that is missing or not a whole number is logged at ERROR and
-    /// reloads the book on every call, so intake keeps pricing from what the
-    /// tables hold. The cache lock is never held across an await.
+    /// A reload is fenced by the version (see the module docs): it is cached
+    /// under the version read before it only when the version read after it
+    /// is the same. A version that is missing or not a whole number is logged
+    /// at ERROR and reloads the book on every call, unfenced, so intake keeps
+    /// pricing from what the tables hold. The cache lock is never held across
+    /// an await.
     pub async fn current(&self, conn: &mut PgConnection) -> Result<Arc<PriceBook>, DbError> {
         let Some(version) = pricing_version(&mut *conn).await? else {
             tracing::error!(
@@ -99,13 +119,30 @@ impl PriceBookCache {
         }
         // One reader reloads; the rest wait here and then find its book.
         let _reloading = self.reload.lock().await;
-        if let Some(book) = self.cached_at(version) {
-            return Ok(book);
+        for _ in 0..MAX_BOOK_LOADS {
+            // Read again: the reader that held the lock may have cached a
+            // later version than the one read above.
+            let Some(before) = pricing_version(&mut *conn).await? else {
+                return self.load(conn).await;
+            };
+            if let Some(book) = self.cached_at(before) {
+                return Ok(book);
+            }
+            let book = self.load(conn).await?;
+            if pricing_version(&mut *conn).await? == Some(before) {
+                *self.cached.write().unwrap_or_else(PoisonError::into_inner) =
+                    Some((before, book.clone()));
+                return Ok(book);
+            }
         }
-        let book = self.load(conn).await?;
-        *self.cached.write().unwrap_or_else(PoisonError::into_inner) =
-            Some((version, book.clone()));
-        Ok(book)
+        tracing::error!(
+            loads = MAX_BOOK_LOADS,
+            "pricing_version moved during every load of the price book; the caller's \
+             transaction fails and is tried again"
+        );
+        Err(DbError::Db(sqlx::Error::Protocol(format!(
+            "pricing_version moved during each of {MAX_BOOK_LOADS} loads of the price book"
+        ))))
     }
 
     /// Loads the book on `conn`, logging each invalid revision.
@@ -158,19 +195,98 @@ pub async fn pricing_version(conn: &mut PgConnection) -> Result<Option<i64>, DbE
     .flatten())
 }
 
+/// The charges stored unpriced in the last 24 hours, by when they were
+/// priced, over the charge `pc`.
+const UNPRICED_LAST_DAY: &str =
+    "pc.status = 'unpriced' AND pc.priced_at >= now() - interval '24 hours'";
+
+/// Whether an applied re-pricing run has corrected the charge `pc`: it has
+/// an adjustment, which only an apply writes, and for a charge stored
+/// unpriced only when the run charged it. The charge itself still reads
+/// `unpriced`: it is written once.
+const CORRECTED: &str =
+    "EXISTS (SELECT 1 FROM pricing_adjustments_cny pa WHERE pa.event_id = pc.event_id)";
+
 /// The charges stored unpriced in the last 24 hours (by when they were
-/// priced), counted under each reason: the control plane's own
-/// (`unknown_api_key`, `tenant_mismatch`, `undecodable_usage`) as well as
-/// the engine's, and `unknown` for a charge with none. Ordered by reason.
-/// `/admin/pricing/status` and the reconciliation both report this.
+/// priced) that no re-pricing run has corrected since, counted under each
+/// reason: the control plane's own (`unknown_api_key`, `tenant_mismatch`,
+/// `undecodable_usage`) as well as the engine's, and `unknown` for a charge
+/// with none. Ordered by reason. `/admin/pricing/status` and the
+/// reconciliation both report this; a corrected one is counted by
+/// [`corrected_by_code`] instead.
 pub async fn unpriced_by_code(conn: &mut PgConnection) -> Result<Vec<(String, i64)>, DbError> {
-    Ok(sqlx::query_as(
-        "SELECT COALESCE(error_code, 'unknown'), count(*)::bigint FROM pricing_charges_cny \
-         WHERE status = 'unpriced' AND priced_at >= now() - interval '24 hours' \
-         GROUP BY 1 ORDER BY 1",
-    )
+    Ok(sqlx::query_as(&format!(
+        "SELECT COALESCE(pc.error_code, 'unknown'), count(*)::bigint FROM pricing_charges_cny pc \
+         WHERE {UNPRICED_LAST_DAY} AND NOT {CORRECTED} GROUP BY 1 ORDER BY 1"
+    ))
     .fetch_all(conn)
     .await?)
+}
+
+/// The charges [`unpriced_by_code`] leaves out because an applied re-pricing
+/// run has corrected them, counted under the reason they were stored
+/// unpriced for. Ordered by reason.
+pub async fn corrected_by_code(conn: &mut PgConnection) -> Result<Vec<(String, i64)>, DbError> {
+    Ok(sqlx::query_as(&format!(
+        "SELECT COALESCE(pc.error_code, 'unknown'), count(*)::bigint FROM pricing_charges_cny pc \
+         WHERE {UNPRICED_LAST_DAY} AND {CORRECTED} GROUP BY 1 ORDER BY 1"
+    ))
+    .fetch_all(conn)
+    .await?)
+}
+
+/// One kind of charge [`unpriced_by_code`] counts: its reason, the model the
+/// call addressed, and the served tier or the group when the reason is about
+/// one.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct UnpricedDetail {
+    /// The reason, as [`unpriced_by_code`] names it.
+    pub code: String,
+    /// The charge's `requested_model_id`, `""` when the call named none.
+    pub requested_model_id: String,
+    /// For `missing_tier_price`: the tier the engine looked for, the one the
+    /// upstream reported (`batch` for a batch row), `""` when it reported
+    /// none. `None` for every other reason.
+    pub service_tier: Option<String>,
+    /// For `missing_rate`: the group the charge is filed under, whose rate is
+    /// missing. `None` for every other reason.
+    pub group_id: Option<Uuid>,
+    pub count: i64,
+    /// When the latest of these calls occurred.
+    pub latest_at: DateTime<Utc>,
+    /// The model name a call sent, for a model the control plane no longer
+    /// knows by its id.
+    pub sent_model: Option<String>,
+}
+
+/// The most kinds [`unpriced_details`] lists.
+pub const MAX_UNPRICED_DETAILS: i64 = 200;
+
+/// What [`unpriced_by_code`] counts, by reason, model, and the tier or group
+/// the reason is about, with the latest occurrence of each; at most
+/// [`MAX_UNPRICED_DETAILS`] of them, by reason and then the most frequent
+/// first, and whether there were more.
+pub async fn unpriced_details(
+    conn: &mut PgConnection,
+) -> Result<(Vec<UnpricedDetail>, bool), DbError> {
+    let mut rows: Vec<UnpricedDetail> = sqlx::query_as(&format!(
+        "SELECT COALESCE(pc.error_code, 'unknown') AS code, pc.requested_model_id, \
+           CASE WHEN pc.error_code = 'missing_tier_price' THEN \
+             CASE WHEN ue.event->'is_batch' = 'true'::jsonb THEN 'batch' \
+                  ELSE COALESCE(ue.event->>'service_tier', '') END END AS service_tier, \
+           CASE WHEN pc.error_code = 'missing_rate' THEN pc.group_id END AS group_id, \
+           count(*)::bigint AS count, max(pc.occurred_at) AS latest_at, \
+           max(NULLIF(ue.event->>'requested_model', '')) AS sent_model \
+         FROM pricing_charges_cny pc LEFT JOIN usage_events ue ON ue.event_id = pc.event_id \
+         WHERE {UNPRICED_LAST_DAY} AND NOT {CORRECTED} \
+         GROUP BY 1, 2, 3, 4 ORDER BY 1, 5 DESC, 6 DESC LIMIT $1"
+    ))
+    .bind(MAX_UNPRICED_DETAILS + 1)
+    .fetch_all(conn)
+    .await?;
+    let more = rows.len() as i64 > MAX_UNPRICED_DETAILS;
+    rows.truncate(MAX_UNPRICED_DETAILS as usize);
+    Ok((rows, more))
 }
 
 /// The table an invalid revision is in, as the alert names it.

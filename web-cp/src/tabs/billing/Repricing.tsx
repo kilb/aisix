@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { TabProps } from "../../App";
-import { ApiError, repricing, resources, tenants, type RepricingRun, type Tenant } from "../../lib/api";
+import { ApiError, groups, repricing, resources, tenants, type Group, type RepricingRun, type Tenant } from "../../lib/api";
 import { messageFor, problemAt } from "../../lib/errors";
 import { errorText } from "../../lib/fmt";
 import { fmtMicroCny, fmtUtc } from "../../lib/money";
-import { deltaWord, outcomeUnknown, utcInputToIso, utcInputValue } from "../../lib/repricing";
+import { deltaWord, outcomeUnknown, previewAgainBody, utcInputToIso, utcInputValue } from "../../lib/repricing";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
 import { Field, useRefusalFocus } from "../../ui/Field";
@@ -67,6 +67,7 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
 
   const [tenantList, setTenantList] = useState<Tenant[]>([]);
   const [models, setModels] = useState<{ id: string; name: string }[]>([]);
+  const [groupList, setGroupList] = useState<Group[]>([]);
 
   const [runs, setRuns] = useState<RepricingRun[] | null>(null);
   const [next, setNext] = useState<number | null>(null);
@@ -84,6 +85,7 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
 
   useEffect(() => {
     tenants.list().then(setTenantList, () => undefined);
+    groups.list().then(setGroupList, () => undefined);
     resources.list<{ display_name?: string }>("models").then(
       (items) => setModels(items.map((m) => ({ id: m.id, name: m.doc.display_name ?? m.id }))),
       () => undefined,
@@ -109,6 +111,7 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
 
   const modelName = (id: string | null) => (id ? (models.find((m) => m.id === id)?.name ?? id) : null);
   const tenantName = (id: string | null) => (id ? (tenantList.find((t) => t.id === id)?.name ?? id) : null);
+  const groupName = (id: string | null) => (id ? (groupList.find((g) => g.id === id)?.display_name ?? id) : null);
 
   function set<K extends keyof Form>(key: K, value: Form[K]) {
     setForm((f) => ({ ...f, [key]: value }));
@@ -170,18 +173,10 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
     });
   }
 
-  /** Previews the same window and reason again, at today's prices. */
+  /** Previews the same window, filters and reason again, at today's prices. */
   async function previewAgain(run: RepricingRun) {
     if (previewing || sending.current) return;
-    const f = run.filter;
-    await runPreview({
-      from: f.from,
-      to: f.to,
-      model_id: f.model_id ?? undefined,
-      tenant_id: f.tenant_id ?? undefined,
-      status: f.status ?? undefined,
-      reason: run.reason,
-    });
+    await runPreview(previewAgainBody(run));
   }
 
   async function view(id: string) {
@@ -381,6 +376,7 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
             {fmtUtc(shown.filter.from)} 至 {fmtUtc(shown.filter.to)}
             {shown.filter.model_id && `，模型 ${modelName(shown.filter.model_id)}`}
             {shown.filter.tenant_id && `，租户 ${tenantName(shown.filter.tenant_id)}`}
+            {shown.filter.group_id && `，分组 ${groupName(shown.filter.group_id)}`}
             {`，状态 ${shown.filter.status ? statusLabel(shown.filter.status) : "全部"}`}。原因：{shown.reason}
           </p>
           <DataTable label="合计">
@@ -524,7 +520,8 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
                 <td>
                   {fmtUtc(r.filter.from)} 至 {fmtUtc(r.filter.to)}
                   <span className="cell-note">
-                    模型：{modelName(r.filter.model_id) ?? "全部"}；租户：{tenantName(r.filter.tenant_id) ?? "全部"}；状态：
+                    模型：{modelName(r.filter.model_id) ?? "全部"}；租户：{tenantName(r.filter.tenant_id) ?? "全部"}；
+                    {r.filter.group_id && `分组：${groupName(r.filter.group_id)}；`}状态：
                     {r.filter.status ? statusLabel(r.filter.status) : "全部"}
                   </span>
                 </td>
