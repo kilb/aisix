@@ -11,7 +11,11 @@
 # Gated: never runs on a normal push. Triggered manually (workflow_dispatch),
 # on the schedule below, or on a same-repo PR labeled `objstore real cloud`.
 # Each provider's test self-skips (logged) when its secrets are absent, so an
-# unconfigured run is a green no-op.
+# unconfigured PR run is a green no-op. A provider counts as configured only
+# when every secret its round-trip needs is set; a partial set fails any run,
+# and a manual or scheduled run fails unless at least one provider is
+# configured — either way the round-trips would otherwise self-skip and the
+# run would pass having tested nothing.
 #
 # ── Required repository secrets ──
 #   Settings → Secrets and variables → Actions → New repository secret
@@ -92,15 +96,37 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Report which providers are configured
         run: |
-          s3=0; gcs=0; azure=0
-          if [ -n "$AISIX_E2E_OBJSTORE_S3_BUCKET" ]; then echo "S3: configured"; s3=1; else echo "::warning::S3 secrets absent — objstore_smoke_s3 will self-skip"; fi
-          if [ -n "$AISIX_E2E_OBJSTORE_GCS_BUCKET" ]; then echo "GCS: configured"; gcs=1; else echo "::warning::GCS secrets absent — objstore_smoke_gcs will self-skip"; fi
-          if [ -n "$AISIX_E2E_OBJSTORE_AZURE_ACCOUNT" ]; then echo "Azure: configured"; azure=1; else echo "::warning::Azure secrets absent — objstore_smoke_azure will self-skip"; fi
+          # A provider is configured when every secret its round-trip reads
+          # as required is set — the same set the Rust test checks before it
+          # self-skips (S3 region and endpoint, and the Azure endpoint, are
+          # optional there and here). Some but not all of them is a broken
+          # configuration on any event: the round-trip would skip silently.
+          configured=0; partial=0
+          provider() {
+            local name=$1 test=$2; shift 2
+            local missing=() v
+            for v in "$@"; do [ -n "${!v}" ] || missing+=("$v"); done
+            if [ "${#missing[@]}" -eq 0 ]; then
+              echo "$name: configured"; configured=$((configured + 1))
+            elif [ "${#missing[@]}" -eq "$#" ]; then
+              echo "::warning::$name secrets absent — $test will self-skip"
+            else
+              echo "::error::$name is partially configured (missing ${missing[*]}) — $test would self-skip"
+              partial=1
+            fi
+          }
+          provider S3 objstore_smoke_s3 AISIX_E2E_OBJSTORE_S3_BUCKET \
+            AISIX_E2E_OBJSTORE_S3_ACCESS_KEY_ID AISIX_E2E_OBJSTORE_S3_SECRET_ACCESS_KEY
+          provider GCS objstore_smoke_gcs AISIX_E2E_OBJSTORE_GCS_BUCKET \
+            AISIX_E2E_OBJSTORE_GCS_SERVICE_ACCOUNT
+          provider Azure objstore_smoke_azure AISIX_E2E_OBJSTORE_AZURE_ACCOUNT \
+            AISIX_E2E_OBJSTORE_AZURE_ACCESS_KEY AISIX_E2E_OBJSTORE_AZURE_CONTAINER
+          [ "$partial" = 0 ] || exit 1
           # A manual dispatch or scheduled run is deliberate — secrets are
           # expected. Fail rather than pass green while testing nothing. PR
           # runs may legitimately have no secrets, so they still self-skip.
-          if [ "${{ github.event_name }}" != "pull_request" ] && [ "$s3" = 0 ] && [ "$gcs" = 0 ] && [ "$azure" = 0 ]; then
-            echo "::error::No object_store real-cloud secrets configured; this ${{ github.event_name }} run would test nothing."
+          if [ "${{ github.event_name }}" != "pull_request" ] && [ "$configured" = 0 ]; then
+            echo "::error::No object_store real-cloud provider fully configured; this ${{ github.event_name }} run would test nothing."
             exit 1
           fi
       - name: objstore real-cloud round-trips (S3 + GCS + Azure)
