@@ -964,6 +964,107 @@ pub fn redact_json_encoded(
     let _ = redact_json_encoded_structured(chain, dir, encoded, counts, false);
 }
 
+/// Builds a JSON tree like `serde_json::Value`'s own deserializer does,
+/// except that an object naming a key more than once keeps every value of
+/// that key, in document order, as an array under the key, and reports that
+/// it did.
+///
+/// `serde_json` keeps only the last of a repeated key, while the encoded
+/// string a request or a response carries keeps them all, and RFC 8259 §4
+/// leaves which one a reader takes to the reader. A scan of the last-wins
+/// tree therefore reads one value and lets the others through unread.
+struct EveryValue<'a> {
+    repeated: &'a mut bool,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for EveryValue<'_> {
+    type Value = Value;
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<Value, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for EveryValue<'_> {
+    type Value = Value;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("any JSON value")
+    }
+    fn visit_bool<E>(self, v: bool) -> Result<Value, E> {
+        Ok(Value::Bool(v))
+    }
+    fn visit_i64<E>(self, v: i64) -> Result<Value, E> {
+        Ok(Value::from(v))
+    }
+    fn visit_u64<E>(self, v: u64) -> Result<Value, E> {
+        Ok(Value::from(v))
+    }
+    fn visit_f64<E>(self, v: f64) -> Result<Value, E> {
+        Ok(serde_json::Number::from_f64(v).map_or(Value::Null, Value::Number))
+    }
+    fn visit_str<E>(self, v: &str) -> Result<Value, E> {
+        Ok(Value::String(v.to_owned()))
+    }
+    fn visit_string<E>(self, v: String) -> Result<Value, E> {
+        Ok(Value::String(v))
+    }
+    fn visit_unit<E>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+    fn visit_none<E>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
+        let mut items = Vec::new();
+        while let Some(item) = seq.next_element_seed(EveryValue {
+            repeated: &mut *self.repeated,
+        })? {
+            items.push(item);
+        }
+        Ok(Value::Array(items))
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+        let mut out = serde_json::Map::new();
+        let mut repeated_keys: Vec<String> = Vec::new();
+        while let Some(key) = map.next_key::<String>()? {
+            let value = map.next_value_seed(EveryValue {
+                repeated: &mut *self.repeated,
+            })?;
+            let Some(slot) = out.get_mut(&key) else {
+                out.insert(key, value);
+                continue;
+            };
+            *self.repeated = true;
+            if repeated_keys.contains(&key) {
+                if let Value::Array(all) = slot {
+                    all.push(value);
+                }
+            } else {
+                let first = std::mem::take(slot);
+                *slot = Value::Array(vec![first, value]);
+                repeated_keys.push(key);
+            }
+        }
+        Ok(Value::Object(out))
+    }
+}
+
+/// `encoded` parsed as JSON, and whether an object in it repeats a key
+/// (see [`EveryValue`]). Without a repeated key the tree is the one
+/// `serde_json::from_str::<Value>` builds.
+fn parse_every_value(encoded: &str) -> serde_json::Result<(Value, bool)> {
+    use serde::de::DeserializeSeed;
+    let mut repeated = false;
+    let mut de = serde_json::Deserializer::from_str(encoded);
+    let value = EveryValue {
+        repeated: &mut repeated,
+    }
+    .deserialize(&mut de)?;
+    de.end()?;
+    Ok((value, repeated))
+}
+
 fn redact_json_encoded_structured(
     chain: &dyn Guardrail,
     dir: Direction,
@@ -974,9 +1075,9 @@ fn redact_json_encoded_structured(
     if encoded.is_empty() {
         return false;
     }
-    match serde_json::from_str::<Value>(encoded) {
-        Ok(mut v) => {
-            let unrewritable_tool_key = if detect_keys {
+    match parse_every_value(encoded) {
+        Ok((mut v, repeated)) => {
+            let mut unrewritable_tool_key = if detect_keys {
                 let mut key_counts = RedactionCounts::new();
                 let found = detect_unrewritable_object_keys(chain, dir, &v, &mut key_counts);
                 merge_counts(counts, key_counts);
@@ -988,7 +1089,18 @@ fn redact_json_encoded_structured(
             let mut value_counts = RedactionCounts::new();
             walk_value_strings(chain, dir, &mut v, &mut value_counts, !detect_keys);
             if !value_counts.is_empty() {
-                if let Ok(s) = serde_json::to_string(&v) {
+                if repeated {
+                    // A document that repeats a key was scanned with every
+                    // value it carries, and goes out as written when nothing
+                    // matched. A match in it cannot be written back:
+                    // re-serialising keeps one value per key, which changes
+                    // what the document says, and which value a reader takes
+                    // is the reader's choice. So it is reported the way an
+                    // unrewritable key is, and the caller refuses rather than
+                    // forward the unmasked bytes.
+                    merge_counts(counts, value_counts);
+                    unrewritable_tool_key = true;
+                } else if let Ok(s) = serde_json::to_string(&v) {
                     *encoded = s;
                     merge_counts(counts, value_counts);
                 }
@@ -3005,6 +3117,137 @@ pub fn redact_transcription_response(
     Some((r.text.into_bytes(), r.counts))
 }
 
+/// Mask a streamed transcription (`stream: true`) held back for an output
+/// guardrail, frame by frame, on the decoded text of each event: a JSON
+/// escape (`@`) hides a match from the raw SSE bytes. The deltas of
+/// `transcript.text.delta` are one channel, rewritten as one text on its
+/// first frame (a match can span deltas); `transcript.text.done` and
+/// `transcript.text.segment` carry complete texts and are masked in place;
+/// an event of any other type has each of its string values but `type`
+/// masked, and a `data:` payload that is not JSON (but the `[DONE]`
+/// sentinel) is masked as plain text.
+/// Everything else in a frame (usage, ids, logprobs) is left as written,
+/// and a frame nothing matched in goes out byte for byte.
+///
+/// Also the scan surface: [`transcription_sse_text`] reads what this walk
+/// offers, so a slot the scan reads is a slot the mask rewrites.
+/// <https://platform.openai.com/docs/api-reference/audio/transcript-text-delta-event>
+pub fn redact_transcription_sse(
+    chain: &dyn Guardrail,
+    raw: &[u8],
+) -> Option<(Vec<u8>, RedactionCounts)> {
+    if !chain.redacts_output() {
+        return None;
+    }
+    let mut frames = split_sse_frames(raw);
+    let mut counts = RedactionCounts::new();
+    let event_type = |frame: &SseFrame| {
+        frame
+            .data
+            .as_ref()
+            .and_then(|d| d.get("type")?.as_str().map(str::to_owned))
+    };
+
+    let deltas: Vec<usize> = frames
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| event_type(f).as_deref() == Some("transcript.text.delta"))
+        .map(|(i, _)| i)
+        .collect();
+    let joined: String = deltas
+        .iter()
+        .filter_map(|&i| frames[i].data.as_ref()?.get("delta")?.as_str())
+        .collect();
+    if !joined.is_empty() {
+        if let Some(r) = redact_str(chain, Direction::Output, &joined) {
+            let mut first = true;
+            for &i in &deltas {
+                let frame = &mut frames[i];
+                if let Some(slot) = frame.data.as_mut().and_then(|d| d.get_mut("delta")) {
+                    if slot.is_string() {
+                        *slot = Value::String(if first {
+                            first = false;
+                            r.text.clone()
+                        } else {
+                            String::new()
+                        });
+                        frame.dirty = true;
+                    }
+                }
+            }
+            merge_counts(&mut counts, r.counts);
+        }
+    }
+
+    for frame in &mut frames {
+        let kind = event_type(frame);
+        match frame.data.as_mut() {
+            Some(data) => {
+                let before = masked_spans(&counts);
+                match kind.as_deref() {
+                    Some("transcript.text.delta") => {}
+                    Some("transcript.text.done" | "transcript.text.segment") => {
+                        if let Some(text) = data.get_mut("text") {
+                            apply_to_value_string(chain, Direction::Output, text, &mut counts);
+                        }
+                    }
+                    _ => {
+                        if let Some(map) = data.as_object_mut() {
+                            for (field, value) in map.iter_mut() {
+                                if field != "type" {
+                                    walk_value_strings(
+                                        chain,
+                                        Direction::Output,
+                                        value,
+                                        &mut counts,
+                                        false,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                frame.dirty |= masked_spans(&counts) != before;
+            }
+            // A payload that is not JSON has no slots to read it by, so the
+            // frame is read, and rewritten, as the text it is.
+            None if frame_payload(&frame.raw).is_some_and(|p| p.trim() != "[DONE]") => {
+                let text = String::from_utf8_lossy(&frame.raw).into_owned();
+                if let Some(r) = redact_str(chain, Direction::Output, &text) {
+                    frame.raw = r.text.into_bytes();
+                    merge_counts(&mut counts, r.counts);
+                }
+            }
+            None => {}
+        }
+    }
+
+    if counts.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(raw.len());
+    for frame in &frames {
+        out.extend_from_slice(&frame.render());
+        out.extend_from_slice(frame.term);
+    }
+    Some((out, counts))
+}
+
+/// The text a streamed transcription's output guardrail reads: every slot
+/// [`redact_transcription_sse`] offers, decoded, once each (the done event
+/// repeats the deltas).
+pub fn transcription_sse_text(raw: &[u8]) -> String {
+    let mut texts: Vec<String> = Vec::new();
+    for segment in collect_segments(|g| {
+        let _ = redact_transcription_sse(g, raw);
+    }) {
+        if !texts.contains(&segment.text) {
+            texts.push(segment.text);
+        }
+    }
+    texts.join("\n")
+}
+
 /// Mask a legacy `/v1/completions` RESPONSE body in place: `choices[].text`.
 pub fn redact_completions_response(chain: &dyn Guardrail, body: &mut Value) -> RedactionCounts {
     let mut counts = RedactionCounts::new();
@@ -4347,10 +4590,22 @@ pub fn redact_anthropic_sse(chain: &dyn Guardrail, raw: &[u8]) -> AnthropicSseRe
         merge_counts(&mut counts, local);
     }
 
+    // A text block's opening `text` already went through its channel above,
+    // at the head of the joined deltas. The block pass below must not offer it
+    // a second time: the collect walk would record it twice, and once the
+    // channel rewrite lands in that slot the apply walk sees a text the
+    // collect walk never did, which is a drift and refuses the answer.
+    let channel_start_frames: std::collections::BTreeSet<usize> = text_channels
+        .values()
+        .flatten()
+        .filter(|(_, site)| matches!(site, Site::BlockStartText))
+        .map(|&(fi, _)| fi)
+        .collect();
+
     // A block start may carry complete text-bearing content (tool input,
     // document/search text, or a server-tool result) instead of later deltas.
     // Run the same official-block walker used by non-streaming Messages.
-    for frame in &mut frames {
+    for (fi, frame) in frames.iter_mut().enumerate() {
         let changed = {
             let Some(data) = frame.data.as_mut() else {
                 continue;
@@ -4362,6 +4617,16 @@ pub fn redact_anthropic_sse(chain: &dyn Guardrail, raw: &[u8]) -> AnthropicSseRe
                 continue;
             };
             let before = block.clone();
+            // Set aside for the walk and put back in place, so everything
+            // else in the block (its citations) is still walked.
+            let channel_text = channel_start_frames
+                .contains(&fi)
+                .then(|| {
+                    block
+                        .get_mut("text")
+                        .map(|text| std::mem::replace(text, Value::String(String::new())))
+                })
+                .flatten();
             unrewritable_tool_key |= redact_anthropic_value(
                 chain,
                 Direction::Output,
@@ -4369,6 +4634,9 @@ pub fn redact_anthropic_sse(chain: &dyn Guardrail, raw: &[u8]) -> AnthropicSseRe
                 &mut counts,
                 AnthropicKeyContext::Protocol,
             );
+            if let (Some(text), Some(slot)) = (channel_text, block.get_mut("text")) {
+                *slot = text;
+            }
             *block != before
         };
         frame.dirty |= changed;
@@ -4862,6 +5130,147 @@ mod tests {
 
     fn both() -> Arc<dyn Guardrail> {
         mask_chain(aisix_core::models::GuardrailHookPoint::Both)
+    }
+
+    /// Without a repeated key the tree is the one `serde_json` builds, so the
+    /// ordinary path is unchanged; with one, every value is kept.
+    #[test]
+    fn parse_every_value_is_serde_json_until_a_key_repeats() {
+        for doc in [
+            r#"{"a":1,"b":[1.5,-2,true,null,"s"],"c":{"d":"A"}}"#,
+            r#"[{"x":{}},[],"",0,18446744073709551615,-9223372036854775808]"#,
+            r#""plain""#,
+            "3.25e10",
+        ] {
+            let (tree, repeated) = parse_every_value(doc).unwrap();
+            assert!(!repeated, "{doc}");
+            assert_eq!(tree, serde_json::from_str::<Value>(doc).unwrap(), "{doc}");
+        }
+        let (tree, repeated) =
+            parse_every_value(r#"{"x":"a","y":{"z":1,"z":[2]},"x":"b","x":"c"}"#).unwrap();
+        assert!(repeated);
+        assert_eq!(tree, json!({"x": ["a", "b", "c"], "y": {"z": [1, [2]]}}));
+        assert!(parse_every_value(r#"{"x":1} trailing"#).is_err());
+    }
+
+    /// A tool call's arguments string reaches the upstream as written, so a
+    /// scan has to read every value a repeated key carries: the last-wins
+    /// tree reads only the last one and forwards the others unscanned (R-070).
+    /// A match there cannot be written back, so it is reported as a refusal,
+    /// on every family that carries an encoded arguments string.
+    #[test]
+    fn a_repeated_argument_key_is_scanned_whole_and_refused_not_forwarded() {
+        let chain = both();
+        for args in [
+            r#"{"x":"alice@example.com","x":"safe"}"#,
+            r#"{"x":"safe","x":"alice@example.com"}"#,
+            r#"{"x":"alice@example.com","x":"safe"}"#,
+            r#"{"x":{"y":"alice@example.com"},"x":"safe"}"#,
+        ] {
+            let mut chat: ChatFormat = serde_json::from_value(json!({
+                "model": "m",
+                "messages": [
+                    {"role": "user", "content": "clean"},
+                    {"role": "assistant", "content": null, "tool_calls": [{
+                        "id": "call_1", "type": "function",
+                        "function": {"name": "send", "arguments": args}
+                    }]},
+                    {"role": "tool", "tool_call_id": "call_1", "content": "ok"}
+                ]
+            }))
+            .unwrap();
+            let redaction = redact_chat_format_structured(chain.as_ref(), &mut chat);
+            assert!(redaction.unrewritable_tool_key, "chat request {args}");
+            assert_eq!(
+                chat.messages[1].extra["tool_calls"][0]["function"]["arguments"], args,
+                "a refused body is left as written"
+            );
+
+            let mut body = json!({"input": [
+                {"type": "function_call", "call_id": "c", "name": "send", "arguments": args}
+            ]});
+            let redaction = redact_responses_request_structured(chain.as_ref(), &mut body);
+            assert!(redaction.unrewritable_tool_key, "responses request {args}");
+            assert_eq!(body["input"][0]["arguments"], args);
+
+            let mut resp = ChatResponse {
+                logprobs: None,
+                more_choices: Vec::new(),
+                id: String::new(),
+                model: "m".into(),
+                message: ChatMessage::assistant(String::new()),
+                finish_reason: aisix_gateway::FinishReason::ToolCalls,
+                usage: aisix_gateway::UsageStats::new(0, 0),
+                service_tier: None,
+            };
+            resp.message.extra.insert(
+                "tool_calls".into(),
+                json!([{"id": "call_1", "type": "function",
+                        "function": {"name": "send", "arguments": args}}]),
+            );
+            let redaction = redact_chat_response_structured(chain.as_ref(), &mut resp);
+            assert!(redaction.unrewritable_tool_key, "chat response {args}");
+            assert_eq!(
+                resp.message.extra["tool_calls"][0]["function"]["arguments"],
+                args
+            );
+        }
+    }
+
+    /// Nothing matched: the repeated key is the caller's to send, so the
+    /// string goes out byte for byte rather than refused or normalised.
+    #[test]
+    fn a_clean_repeated_argument_key_goes_out_as_written() {
+        let chain = both();
+        let args = r#"{"x":"a","x":"b"}"#;
+        let mut chat: ChatFormat = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "assistant", "content": null, "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": {"name": "send", "arguments": args}
+            }]}]
+        }))
+        .unwrap();
+        let redaction = redact_chat_format_structured(chain.as_ref(), &mut chat);
+        assert!(!redaction.unrewritable_tool_key);
+        assert!(redaction.counts.is_empty());
+        assert_eq!(
+            chat.messages[0].extra["tool_calls"][0]["function"]["arguments"],
+            args
+        );
+    }
+
+    /// A block-action rule judges each value a repeated key carries, so the
+    /// shadowed one is refused like any other (the local segment pass reads
+    /// the same walk).
+    #[tokio::test]
+    async fn a_block_rule_sees_the_value_a_repeated_key_shadows() {
+        let chain: Arc<dyn Guardrail> =
+            Arc::new(GuardrailChain::new(vec![Arc::new(PiiGuardrail::new(
+                vec![builtin_rule("email", PiiAction::Block).unwrap()],
+                aisix_core::models::GuardrailHookPoint::Both,
+                262_144,
+                false,
+            ))]));
+        let mut chat: ChatFormat = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "assistant", "content": null, "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": {"name": "send",
+                             "arguments": r#"{"x":"alice@example.com","x":"safe"}"#}
+            }]}]
+        }))
+        .unwrap();
+        let moderation = moderate_chat_format_structured(
+            chain.as_ref(),
+            None,
+            aisix_guardrails::GuardrailVerdict::Allow,
+            &mut chat,
+            &mut RedactionCounts::new(),
+            &mut Vec::new(),
+        )
+        .await;
+        assert!(moderation.verdict.is_block());
     }
 
     /// `redact_anthropic_sse`, as the rewrite and its counts.
@@ -8988,6 +9397,54 @@ mod tests {
         assert!(redact_transcription_response(chain.as_ref(), b"all clean\n").is_none());
     }
 
+    /// A streamed transcription carries its text JSON-escaped, so the raw
+    /// bytes hide a match: the scan and the mask read each event decoded
+    /// (R-044). The delta channel is one text, the done event's text is
+    /// masked in place, and everything else in a frame stays as written.
+    #[test]
+    fn transcription_sse_is_read_and_masked_decoded() {
+        let chain = both();
+        let raw = concat!(
+            "data: {\"type\":\"transcript.text.delta\",\"delta\":\"mail alice\\u0040exam\"}\r\n\r\n",
+            "data: {\"type\":\"transcript.text.delta\",\"delta\":\"ple.com now\"}\r\n\r\n",
+            "data: {\"type\":\"transcript.text.done\",\"text\":\"mail alice\\u0040example.com now\",",
+            "\"usage\":{\"type\":\"tokens\",\"input_tokens\":26,\"output_tokens\":12,\"total_tokens\":38}}\r\n\r\n",
+            "data: [DONE]\r\n\r\n",
+        )
+        .as_bytes();
+        assert!(!String::from_utf8_lossy(raw).contains("alice@example.com"));
+        assert_eq!(
+            transcription_sse_text(raw),
+            "mail alice@example.com now",
+            "the deltas and the done text read once, decoded",
+        );
+
+        let (rewritten, counts) = redact_transcription_sse(chain.as_ref(), raw).expect("rewrite");
+        assert_eq!(counts.get("email"), Some(&2));
+        let out = String::from_utf8(rewritten).unwrap();
+        let events: Vec<Value> = out
+            .split("\r\n\r\n")
+            .filter_map(|f| f.strip_prefix("data: "))
+            .filter(|p| *p != "[DONE]")
+            .map(|p| serde_json::from_str(p).expect("each frame stays JSON"))
+            .collect();
+        assert_eq!(events.len(), 3);
+        let deltas: String = events[..2]
+            .iter()
+            .map(|e| e["delta"].as_str().unwrap())
+            .collect();
+        assert_eq!(deltas, "mail [EMAIL_REDACTED] now");
+        assert_eq!(events[2]["text"], "mail [EMAIL_REDACTED] now");
+        assert_eq!(
+            events[2]["usage"]["output_tokens"], 12,
+            "usage stays as written"
+        );
+        assert!(out.ends_with("data: [DONE]\r\n\r\n"), "{out}");
+
+        let clean = b"data: {\"type\":\"transcript.text.done\",\"text\":\"all clean\"}\n\n";
+        assert!(redact_transcription_sse(chain.as_ref(), clean).is_none());
+    }
+
     // ── remote segment moderation (#932 bedrock follow-up) ──────────────
 
     use aisix_guardrails::{GuardrailVerdict, SegmentsOutcome};
@@ -9839,6 +10296,46 @@ mod tests {
         );
         assert_eq!(counts.get("EMAIL"), Some(&1));
         // The capture-rebuild helper reads the masked channel back.
+        assert_eq!(anthropic_sse_text(&held), "<M0:HELLO WORLD>");
+    }
+
+    /// A text block may open with text of its own (the start event's union
+    /// allows a non-empty one). That text heads its channel, so it is ONE
+    /// slot: offered again by the block pass, the apply walk would meet the
+    /// channel's rewrite where the collect walk saw the original and refuse
+    /// the answer as a drift (R-071). Its citations are still walked.
+    #[tokio::test]
+    async fn a_non_empty_start_text_is_one_slot_of_its_channel() {
+        let chain = seg_chain(StubSegments::masker());
+        let mut held: Vec<u8> = concat!(
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"hello \",\"citations\":[{\"type\":\"char_location\",\"cited_text\":\"quoted\"}]}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"world\"}}\n\n",
+        )
+        .as_bytes()
+        .to_vec();
+        let collected = collect_segments(|g| {
+            let _ = redact_anthropic_sse(g, &held);
+        });
+        let texts: Vec<&str> = collected.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, ["hello world", "quoted"], "each text offered once");
+
+        let moderation = moderate_anthropic_sse(
+            &chain,
+            GuardrailVerdict::Allow,
+            &mut held,
+            &mut RedactionCounts::new(),
+            &mut Vec::new(),
+        )
+        .await;
+        assert_eq!(moderation.verdict, GuardrailVerdict::Allow);
+        let out = String::from_utf8(held.clone()).unwrap();
+        assert!(out.contains("<M0:HELLO WORLD>"), "{out}");
+        assert!(
+            out.contains("<M1:QUOTED>"),
+            "the citation is masked too: {out}"
+        );
         assert_eq!(anthropic_sse_text(&held), "<M0:HELLO WORLD>");
     }
 

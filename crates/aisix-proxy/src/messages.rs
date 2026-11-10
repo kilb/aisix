@@ -2210,6 +2210,7 @@ async fn anthropic_passthrough_dispatch(
         let mut output_seg_counts = crate::redact::RedactionCounts::new();
         let mut output_monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
         let mut output_capture_safe = true;
+        let mut output_verdict = aisix_guardrails::GuardrailVerdict::Allow;
         if !resolved_chain.is_empty()
             && json_body
                 .get("content")
@@ -2243,58 +2244,79 @@ async fn anthropic_passthrough_dispatch(
             )
             .await;
             output_capture_safe = moderation.capture_safe;
-            if let aisix_guardrails::GuardrailVerdict::Block {
-                reason,
-                guardrail_name,
-                unavailable,
-            } = moderation.verdict
-            {
+            output_verdict = moderation.verdict;
+        }
+
+        // #932: mask-action PII rules rewrite the passthrough response body
+        // (text blocks + tool_use input) AFTER the block check passes. A mask
+        // that would have to rewrite a tool's structural field cannot be
+        // applied, so it refuses instead — and the answer was billed all the
+        // same, so it takes the charged block arm below rather than an error.
+        let mut output_redactions = crate::redact::RedactionCounts::new();
+        if !output_verdict.is_block() {
+            let redaction =
+                crate::redact::redact_anthropic_response(resolved_chain.as_ref(), &mut json_body);
+            if redaction.unrewritable_tool_key {
                 tracing::warn!(
-                    guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
                     guardrail_hook = "output",
                     model = %model_name,
-                    reason = %reason,
-                    "guardrail blocked /v1/messages passthrough response",
+                    "guardrail rejected /v1/messages passthrough response because a sensitive tool object key cannot be safely rewritten",
                 );
-                // 上游已经调用并按这些 token 计过费了，所以这一发带着账走成功
-                // 那条收尾路径（应答体是 422），而不是当成错误丢掉。丢掉的话
-                // 花费指标不记、额度闸也不扣，反复触发护栏就能无上限地花运营
-                // 方在供应商那边的钱。
-                //
-                // **Anthropic 形状**的错误信封，不是默认那个。这个端点是原生
-                // Anthropic：调用方的 SDK 按 `{type:"error", error:{…}}` 解析，
-                // 而 `into_response()` 出来的是 OpenAI 形状。走成功路径返回
-                // 意味着不再经过处理器那层错误转换，所以这里得自己转 —— 漏掉
-                // 这一步，拦截仍然是 422、账也照记，但正文换成了另一种协议，
-                // 而这正是主 e2e 抓到的那个回归。
-                let err = crate::error::guardrail_block_error(
-                    "response",
+                output_verdict = crate::redact::unrewritable_tool_key_verdict();
+            }
+            output_redactions = redaction.counts;
+        }
+        if let aisix_guardrails::GuardrailVerdict::Block {
+            reason,
+            guardrail_name,
+            unavailable,
+        } = output_verdict
+        {
+            tracing::warn!(
+                guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
+                guardrail_hook = "output",
+                model = %model_name,
+                reason = %reason,
+                "guardrail blocked /v1/messages passthrough response",
+            );
+            // 上游已经调用并按这些 token 计过费了，所以这一发带着账走成功
+            // 那条收尾路径（应答体是 422），而不是当成错误丢掉。丢掉的话
+            // 花费指标不记、额度闸也不扣，反复触发护栏就能无上限地花运营
+            // 方在供应商那边的钱。
+            //
+            // **Anthropic 形状**的错误信封，不是默认那个。这个端点是原生
+            // Anthropic：调用方的 SDK 按 `{type:"error", error:{…}}` 解析，
+            // 而 `into_response()` 出来的是 OpenAI 形状。走成功路径返回
+            // 意味着不再经过处理器那层错误转换，所以这里得自己转 —— 漏掉
+            // 这一步，拦截仍然是 422、账也照记，但正文换成了另一种协议，
+            // 而这正是主 e2e 抓到的那个回归。
+            let err = crate::error::guardrail_block_error(
+                "response",
+                guardrail_name.as_deref(),
+                unavailable.as_deref(),
+            );
+            crate::usage_attr::note_client_error_body(snapshot, || err.anthropic_body());
+            return Ok(DispatchOutcome {
+                response: err.into_anthropic_response(),
+                provider_label,
+                upstream_protocol: wire_protocol,
+                provider_key_id: pk_id.to_string(),
+                upstream_model,
+                metrics,
+                usage_handled_by_stream: false,
+                routing: RoutingTelemetry::default(),
+                // 被拦下的正文不进采集：拦了又归档等于没拦。
+                captured_content: None,
+                // 应答没有交付出去，也就没有输出侧的掩码计数 ——
+                // /v1/responses 的同类分支也是这么记的。
+                output_redactions: crate::redact::RedactionCounts::new(),
+                output_monitor_hits,
+                cache: crate::response_cache::CacheTelemetry::default(),
+                refusal: Some(crate::attempt::StreamRefusal::new(
                     guardrail_name.as_deref(),
                     unavailable.as_deref(),
-                );
-                crate::usage_attr::note_client_error_body(snapshot, || err.anthropic_body());
-                return Ok(DispatchOutcome {
-                    response: err.into_anthropic_response(),
-                    provider_label,
-                    upstream_protocol: wire_protocol,
-                    provider_key_id: pk_id.to_string(),
-                    upstream_model,
-                    metrics,
-                    usage_handled_by_stream: false,
-                    routing: RoutingTelemetry::default(),
-                    // 被拦下的正文不进采集：拦了又归档等于没拦。
-                    captured_content: None,
-                    // 应答没有交付出去，也就没有输出侧的掩码计数 ——
-                    // /v1/responses 的同类分支也是这么记的。
-                    output_redactions: crate::redact::RedactionCounts::new(),
-                    output_monitor_hits,
-                    cache: crate::response_cache::CacheTelemetry::default(),
-                    refusal: Some(crate::attempt::StreamRefusal::new(
-                        guardrail_name.as_deref(),
-                        unavailable.as_deref(),
-                    )),
-                });
-            }
+                )),
+            });
         }
 
         // Restore the gateway-facing model name so callers see what they asked
@@ -2302,20 +2324,6 @@ async fn anthropic_passthrough_dispatch(
         // than the one it was asked for (a dated snapshot, a server-side
         // remap), and the caller still addressed the alias.
         crate::model_echo::restamp_body(&mut json_body, model_name);
-
-        // #932: mask-action PII rules rewrite the passthrough response body
-        // (text blocks + tool_use input) AFTER the block check passes.
-        let redaction =
-            crate::redact::redact_anthropic_response(resolved_chain.as_ref(), &mut json_body);
-        if redaction.unrewritable_tool_key {
-            tracing::warn!(
-                guardrail_hook = "output",
-                model = %model_name,
-                "guardrail rejected /v1/messages passthrough response because a sensitive tool object key cannot be safely rewritten",
-            );
-            return Err(crate::error::guardrail_block_error("response", None, None));
-        }
-        let mut output_redactions = redaction.counts;
         crate::redact::merge_counts(&mut output_redactions, output_seg_counts);
 
         // Capture the prompt (the outbound request body) + assembled assistant
@@ -3329,6 +3337,7 @@ async fn cross_provider_dispatch(
         || crate::chat::estimation_output_text(&resp),
     );
     crate::attribution::note_answered_usage(answered.answered(snapshot, model_id));
+    let mut output_verdict = aisix_guardrails::GuardrailVerdict::Allow;
     if !resolved_chain.is_empty() {
         let (verdict, hits) = aisix_guardrails::Guardrail::check_output_non_segment_observed(
             resolved_chain.as_ref(),
@@ -3345,67 +3354,73 @@ async fn cross_provider_dispatch(
         )
         .await;
         output_capture_safe = moderation.capture_safe;
-        if let aisix_guardrails::GuardrailVerdict::Block {
-            reason,
-            guardrail_name,
-            unavailable,
-        } = moderation.verdict
-        {
-            tracing::warn!(
-                guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
-                guardrail_hook = "output",
-                model = %model_name,
-                reason = %reason,
-                "guardrail blocked /v1/messages response",
-            );
-            // 同 passthrough 那条：上游已经计过费，带着账走成功收尾路径。
-            fill_missing_anthropic_metrics(
-                &mut metrics,
-                &upstream_model,
-                || body.clone(),
-                || crate::chat::estimation_output_text(&resp),
-            );
-            // 同上：原生 Anthropic 端点要 Anthropic 形状的信封。
-            let err = crate::error::guardrail_block_error(
-                "response",
-                guardrail_name.as_deref(),
-                unavailable.as_deref(),
-            );
-            crate::usage_attr::note_client_error_body(snapshot, || err.anthropic_body());
-            return Ok(DispatchOutcome {
-                response: err.into_anthropic_response(),
-                provider_label,
-                upstream_protocol: aisix_gateway::upstream_protocol(provider_key),
-                provider_key_id: provider_key_id.to_string(),
-                upstream_model,
-                metrics,
-                usage_handled_by_stream: false,
-                routing: RoutingTelemetry::default(),
-                captured_content: None,
-                output_redactions: crate::redact::RedactionCounts::new(),
-                output_monitor_hits,
-                cache: crate::response_cache::CacheTelemetry::default(),
-                refusal: Some(crate::attempt::StreamRefusal::new(
-                    guardrail_name.as_deref(),
-                    unavailable.as_deref(),
-                )),
-            });
-        }
+        output_verdict = moderation.verdict;
     }
 
     // #932: mask-action PII rules rewrite the bridged response AFTER the
-    // block check passes, BEFORE it is rendered back as Anthropic JSON.
-    let redaction =
-        crate::redact::redact_chat_response_structured(resolved_chain.as_ref(), &mut resp);
-    if redaction.unrewritable_tool_key {
+    // block check passes, BEFORE it is rendered back as Anthropic JSON. A
+    // mask that would have to rewrite a tool's structural field cannot be
+    // applied, so it refuses instead — billed like a block, below.
+    let mut output_redactions = crate::redact::RedactionCounts::new();
+    if !output_verdict.is_block() {
+        let redaction =
+            crate::redact::redact_chat_response_structured(resolved_chain.as_ref(), &mut resp);
+        if redaction.unrewritable_tool_key {
+            tracing::warn!(
+                guardrail_hook = "output",
+                model = %model_name,
+                "guardrail rejected /v1/messages response because a sensitive tool object key cannot be safely rewritten",
+            );
+            output_verdict = crate::redact::unrewritable_tool_key_verdict();
+        }
+        output_redactions = redaction.counts;
+    }
+    if let aisix_guardrails::GuardrailVerdict::Block {
+        reason,
+        guardrail_name,
+        unavailable,
+    } = output_verdict
+    {
         tracing::warn!(
+            guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
             guardrail_hook = "output",
             model = %model_name,
-            "guardrail rejected /v1/messages response because a sensitive tool object key cannot be safely rewritten",
+            reason = %reason,
+            "guardrail blocked /v1/messages response",
         );
-        return Err(crate::error::guardrail_block_error("response", None, None));
+        // 同 passthrough 那条：上游已经计过费，带着账走成功收尾路径。
+        fill_missing_anthropic_metrics(
+            &mut metrics,
+            &upstream_model,
+            || body.clone(),
+            || crate::chat::estimation_output_text(&resp),
+        );
+        // 同上：原生 Anthropic 端点要 Anthropic 形状的信封。
+        let err = crate::error::guardrail_block_error(
+            "response",
+            guardrail_name.as_deref(),
+            unavailable.as_deref(),
+        );
+        crate::usage_attr::note_client_error_body(snapshot, || err.anthropic_body());
+        return Ok(DispatchOutcome {
+            response: err.into_anthropic_response(),
+            provider_label,
+            upstream_protocol: aisix_gateway::upstream_protocol(provider_key),
+            provider_key_id: provider_key_id.to_string(),
+            upstream_model,
+            metrics,
+            usage_handled_by_stream: false,
+            routing: RoutingTelemetry::default(),
+            captured_content: None,
+            output_redactions: crate::redact::RedactionCounts::new(),
+            output_monitor_hits,
+            cache: crate::response_cache::CacheTelemetry::default(),
+            refusal: Some(crate::attempt::StreamRefusal::new(
+                guardrail_name.as_deref(),
+                unavailable.as_deref(),
+            )),
+        });
     }
-    let mut output_redactions = redaction.counts;
     crate::redact::merge_counts(&mut output_redactions, output_seg_counts);
 
     // Token-estimation fallback (AISIX-Cloud#1074): fill counters the
