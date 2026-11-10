@@ -253,13 +253,16 @@ pub(crate) fn emit(
             // latency to report that would mean what an attempt's normally
             // means. One that has ANSWERED, and was being processed inside
             // the attempt when the caller left, did reach it, and took the
-            // time it took to answer.
-            dispatched: a.answered.is_some(),
-            latency_ms: a
-                .answered
-                .as_ref()
-                .map_or(0, |answered| answered.latency_ms),
+            // time it took to answer. So did one some of whose upstream
+            // calls answered, for as long as it ran.
+            dispatched: a.answered.is_some() || a.served_input_tokens.is_some(),
+            latency_ms: match (&a.answered, a.served_input_tokens) {
+                (Some(answered), _) => answered.latency_ms,
+                (None, Some(_)) => crate::attempt::measured_ms(a.started.elapsed()),
+                (None, None) => 0,
+            },
             usage: a.answered.as_ref().map(|answered| &answered.usage),
+            served_input_tokens: a.served_input_tokens.filter(|_| a.answered.is_none()),
         })
         .or_else(|| {
             ctx.won.as_ref().map(|w| Attempt {
@@ -272,6 +275,7 @@ pub(crate) fn emit(
                 dispatched: true,
                 latency_ms: w.latency_ms,
                 usage: w.usage.as_ref(),
+                served_input_tokens: None,
             })
         });
     let pk = ResolvedPk::resolve(&snap, &resolved.provider_key_id);
@@ -326,6 +330,20 @@ pub(crate) fn emit(
     if let Some(usage) = attempt.as_ref().and_then(|a| a.usage) {
         usage.apply(&mut event);
     }
+    // One that had not ended is billed what its answered upstream calls
+    // were served, as its failure row would have billed it.
+    if let Some((tokens, model_id)) = attempt
+        .as_ref()
+        .and_then(|a| Some((a.served_input_tokens?, a.model_id)))
+    {
+        event.prompt_tokens = tokens;
+        event.cost_usd = crate::usage_attr::request_cost_usd(
+            &snap,
+            model_id,
+            aisix_core::InputTokens::uncached_only(u64::from(tokens)),
+            0,
+        );
+    }
     let dispatched = attempt.as_ref().is_some_and(|a| a.dispatched);
     emit_one(
         state,
@@ -355,6 +373,9 @@ struct Attempt<'a> {
     /// What the attempt's answer is billed, when it answered and the family
     /// noted it before the caller left.
     usage: Option<&'a crate::usage_attr::AnsweredUsage>,
+    /// What an attempt that had not answered had been served by the upstream
+    /// calls of it that had ([`crate::attribution::InFlightAttempt::served_input_tokens`]).
+    served_input_tokens: Option<u32>,
 }
 
 /// The fields every event on this path shares: who called, what they asked

@@ -1743,6 +1743,30 @@ mod tests {
         );
     }
 
+    /// A throttled credential token endpoint reads to the caller as any
+    /// upstream 429 does: the rate-limit class with the endpoint's
+    /// `Retry-After`, and none of the endpoint's own words, which name it.
+    #[tokio::test]
+    async fn a_throttled_credential_endpoint_is_the_rate_limit_class() {
+        let err = BridgeError::upstream_status_with_retry_after(
+            429,
+            "azure aad token mint upstream returned HTTP 429 Too Many Requests: {}",
+            Some(std::time::Duration::from_secs(60)),
+        )
+        .answered_by_credential_endpoint();
+        let (class, relayed) = in_platform_mode(|| (classify_bridge(&err), relayed_status(&err)));
+        assert_eq!(class, PlatformErrorClass::RateLimited);
+        assert_eq!(relayed, None);
+        let resp = in_platform_mode(|| ProxyError::Bridge(err).into_response());
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(resp.headers()["retry-after"], "60");
+        let text = body_json(resp).await.to_string();
+        assert!(
+            text.contains("\"rate_limit_exceeded\"") && !text.contains("aad"),
+            "{text}"
+        );
+    }
+
     #[tokio::test]
     async fn the_anthropic_envelope_carries_anthropics_type_and_the_class_code() {
         let resp = in_platform_mode(|| {

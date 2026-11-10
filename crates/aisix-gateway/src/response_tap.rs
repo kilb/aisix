@@ -151,6 +151,16 @@ impl ResponseHeaderTap {
         *self.lock() = captured;
     }
 
+    /// What [`note_served_input_tokens`] last noted and nothing has taken,
+    /// left in place. For a reader outside the request's scope (the cancel
+    /// path runs from `Drop`).
+    pub fn served_input_tokens(&self) -> Option<u32> {
+        *self
+            .served_input_tokens
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Move the latest capture out, leaving nothing behind.
     pub fn take(&self) -> UpstreamResponseCapture {
         std::mem::take(&mut *self.lock())
@@ -200,12 +210,15 @@ pub fn note_upstream_error_body(body: &bytes::Bytes) {
     });
 }
 
-/// Note that the attempt now failing had already been served, and billed,
-/// in part: an operation the gateway makes in several upstream calls (one
-/// Titan embedding per text) that failed after some of them answered.
-/// `tokens` is the input those calls reported. The proxy takes it with
-/// [`take_served_input_tokens`] when the attempt fails, to bill it and to
-/// not replay the calls that answered. Outside a request scope it is a
+/// Note what the attempt in progress has been served, and billed, so far: an
+/// operation the gateway makes in several upstream calls (one Titan
+/// embedding per text) notes the input its answered calls reported after
+/// each of them, and clears it ([`take_served_input_tokens`]) once the whole
+/// operation succeeded. The proxy takes it when the attempt fails, to bill it
+/// and to not replay the calls that answered, and reads it
+/// ([`ResponseHeaderTap::served_input_tokens`]) when the caller hangs up
+/// before the attempt ends, so the row of a request nobody waited for still
+/// bills the calls the upstream answered. Outside a request scope it is a
 /// no-op.
 pub fn note_served_input_tokens(tokens: u32) {
     let _ = TAP.try_with(|tap| {

@@ -1918,6 +1918,16 @@ fn anthropic_tools_to_openai(
     }
 }
 
+/// The `name` of every entry of an Anthropic `tools` array.
+fn tool_names(tools: &serde_json::Value) -> Vec<String> {
+    tools
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|t| t.get("name")?.as_str().map(str::to_owned))
+        .collect()
+}
+
 /// An Anthropic server tool: Anthropic runs it itself, so no other upstream
 /// can — offering one there as a function the model may call would invent
 /// a tool nobody executes. The advisor tool (`advisor_20260301`) is one:
@@ -2015,10 +2025,20 @@ pub fn translate_extras_to_openai_shape_with(
     let mut output_config = None;
     let mut output_format = None;
     let mut serial_tool_calls = false;
+    // Names of the caller's tools the translation could not offer.
+    let mut dropped_tools: Vec<String> = Vec::new();
     for (key, value) in anthropic {
         match key.as_str() {
             "tools" => {
+                dropped_tools = tool_names(&value);
                 if let Some(translated) = anthropic_tools_to_openai(value, markers) {
+                    let offered: Vec<&str> = translated
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|t| t.get("function")?.get("name")?.as_str())
+                        .collect();
+                    dropped_tools.retain(|name| !offered.contains(&name.as_str()));
                     extra.insert("tools".to_string(), translated);
                 }
             }
@@ -2061,6 +2081,16 @@ pub fn translate_extras_to_openai_shape_with(
     // entries this bridge cannot express (AISIX-Cloud#1614).
     if !extra.contains_key("tools") && extra.remove("tool_choice").is_some() {
         tracing::debug!("dropping tool_choice: no tool survived translation to OpenAI shape");
+    }
+    // The same for a choice that forces one of the tools that did not
+    // survive (the advisor server tool beside a client tool): it would name
+    // a function the upstream was never offered. A name the caller never
+    // declared at all is still sent, for the upstream to answer.
+    let forced = extra
+        .get("tool_choice")
+        .and_then(|c| c.get("function")?.get("name")?.as_str());
+    if forced.is_some_and(|name| dropped_tools.iter().any(|d| d == name)) {
+        extra.remove("tool_choice");
     }
 
     // Anthropic carries "one tool call at a time" inside `tool_choice`;
@@ -3443,6 +3473,27 @@ pub fn parse_inbound_request_with(
     media: ToolResultMedia,
 ) -> Result<ChatFormat, AnthropicInboundError> {
     parse_inbound(body, InboundUse::Dispatch, markers, media)
+}
+
+/// Turn a request parsed under [`ToolResultMedia::Keep`] into the one
+/// [`ToolResultMedia::Drop`] parses: every `role:"tool"` message holding
+/// media keeps the text of its text parts alone. For a dispatch whose
+/// upstream, known only once the request is translated
+/// ([`aisix_gateway::Bridge::reads_tool_result_media`]), takes a tool
+/// result's text only.
+pub fn drop_tool_result_media(chat: &mut ChatFormat) {
+    use serde_json::Value;
+    for message in chat.messages.iter_mut().filter(|m| m.role == Role::Tool) {
+        if let Some(parts) = message.content_blocks.take() {
+            message.content = Some(
+                parts
+                    .iter()
+                    .filter(|p| p.get("type").and_then(Value::as_str) == Some("text"))
+                    .filter_map(|p| p.get("text").and_then(Value::as_str))
+                    .collect(),
+            );
+        }
+    }
 }
 
 /// The same parse, for the **input guardrail scan**: an assistant turn's
@@ -6742,6 +6793,51 @@ mod tests {
         assert_eq!(tools[0]["function"]["name"], "f");
     }
 
+    /// A choice forcing the advisor beside a client tool would name a
+    /// function the upstream was never offered, which it refuses. It goes
+    /// with the advisor; a choice of the surviving tool stays, and so does
+    /// a name the caller never declared, for the upstream to answer.
+    #[test]
+    fn a_choice_forcing_a_dropped_tool_is_dropped_with_it() {
+        let translate = |choice: serde_json::Value| {
+            let mut extra = serde_json::json!({
+                "tools": [
+                    {"type": "advisor_20260301", "name": "advisor", "model": "claude-opus-4-1"},
+                    {"name": "get_weather", "input_schema": {"type": "object"}},
+                ],
+                "tool_choice": choice,
+            })
+            .as_object()
+            .unwrap()
+            .clone();
+            translate_extras_to_openai_shape(&mut extra, MappedEffort::AsWritten);
+            let names: Vec<String> = extra["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["function"]["name"].as_str().unwrap().to_owned())
+                .collect();
+            assert_eq!(names, ["get_weather"], "{extra:?}");
+            extra.get("tool_choice").cloned()
+        };
+        assert_eq!(
+            translate(serde_json::json!({"type": "tool", "name": "advisor"})),
+            None
+        );
+        assert_eq!(
+            translate(serde_json::json!({"type": "tool", "name": "get_weather"})),
+            Some(serde_json::json!({"type": "function", "function": {"name": "get_weather"}}))
+        );
+        assert_eq!(
+            translate(serde_json::json!({"type": "tool", "name": "undeclared"})),
+            Some(serde_json::json!({"type": "function", "function": {"name": "undeclared"}}))
+        );
+        assert_eq!(
+            translate(serde_json::json!({"type": "any"})),
+            Some(serde_json::json!("required"))
+        );
+    }
+
     #[test]
     fn claudes_stop_reasons_take_openais_names() {
         for (raw, want) in [
@@ -9970,6 +10066,55 @@ mod tests {
         // A text-only result keeps its plain-string shape.
         assert_eq!(chat.messages[1].content_str(), "plain");
         assert!(chat.messages[1].content_blocks.is_none());
+    }
+
+    /// Dropping the media of a request parsed with it kept is the request
+    /// parsed without it, byte for byte, markers included: a dispatch that
+    /// learns only after translating that its upstream takes text sends what
+    /// it always sent there.
+    #[test]
+    fn dropping_kept_tool_result_media_matches_a_parse_that_dropped_it() {
+        let body = serde_json::json!({
+            "model": "claude",
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "shot", "input": {}},
+                    {"type": "tool_use", "id": "t2", "name": "shot", "input": {}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "cache_control": {"type": "ephemeral"},
+                     "content": [
+                        {"type": "text", "text": "screen "},
+                        {"type": "image", "source": {
+                            "type": "base64", "media_type": "image/png", "data": "aWc="
+                        }},
+                        {"type": "image", "source": {"type": "file", "file_id": "f1"}},
+                        {"type": "text", "text": "two"},
+                        {"type": "document", "title": "r.pdf", "source": {
+                            "type": "base64", "media_type": "application/pdf", "data": "JVBE"
+                        }},
+                    ]},
+                    {"type": "tool_result", "tool_use_id": "t2", "content": "plain"},
+                    {"type": "image", "source": {
+                        "type": "base64", "media_type": "image/png", "data": "aWc="
+                    }},
+                    {"type": "text", "text": "and this"},
+                ]},
+            ],
+        });
+        for markers in [CacheMarkers::Drop, CacheMarkers::Keep] {
+            let mut kept =
+                parse_inbound_request_with(&body, markers, ToolResultMedia::Keep).unwrap();
+            assert!(kept.messages[1].content_blocks.is_some(), "{markers:?}");
+            drop_tool_result_media(&mut kept);
+            let dropped =
+                parse_inbound_request_with(&body, markers, ToolResultMedia::Drop).unwrap();
+            assert_eq!(
+                serde_json::to_value(&kept).unwrap(),
+                serde_json::to_value(&dropped).unwrap(),
+                "{markers:?}"
+            );
+        }
     }
 
     #[test]

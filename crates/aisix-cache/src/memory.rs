@@ -361,7 +361,9 @@ mod tests {
     #[tokio::test]
     async fn an_overwrite_restarts_the_entrys_ttl() {
         let cache = MemoryCache::new(Duration::from_secs(300), 1 << 20);
-        let ttl = Duration::from_millis(400);
+        // Wide margins: the second sleep can overrun by up to 800ms under
+        // load before the refreshed entry's own deadline is reached.
+        let ttl = Duration::from_secs(2);
         cache
             .put_with_ttl("eq", sample_response(), ttl)
             .await
@@ -379,7 +381,7 @@ mod tests {
             .await
             .unwrap();
 
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::sleep(Duration::from_millis(1200)).await;
         let mut refreshed = sample_response();
         refreshed.message.content = Some("refreshed".into());
         cache.put_with_ttl("eq", refreshed, ttl).await.unwrap();
@@ -398,9 +400,9 @@ mod tests {
             .await
             .unwrap();
 
-        // Past the first write's deadline (400ms) and the shorter refresh's
-        // (50ms), well inside the equal refresh's own (650ms).
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        // Past the first write's deadline (2s) and the shorter refresh's
+        // (50ms), well inside the equal refresh's own (3.2s).
+        tokio::time::sleep(Duration::from_millis(1200)).await;
         cache.inner.run_pending_tasks().await;
         cache.bodies.run_pending_tasks().await;
 

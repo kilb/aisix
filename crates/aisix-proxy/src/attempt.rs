@@ -252,6 +252,7 @@ impl RoutingTelemetry {
             model_id: target.model_id.to_string(),
             started: std::time::Instant::now(),
             answered: None,
+            served_input_tokens: None,
         });
         (index, kind)
     }

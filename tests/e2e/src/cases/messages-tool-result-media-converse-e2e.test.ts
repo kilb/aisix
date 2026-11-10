@@ -21,6 +21,10 @@ import {
 // under the `toolUseId` it answers. A Chat Completions `tool` message is text
 // only, so an OpenAI target receives the result's text and the request still
 // succeeds.
+//
+// A GPT model on Bedrock is served by either: a request carrying tools by
+// Converse, which receives the image, and one without them by the Chat
+// Completions endpoint, which receives the text.
 
 const CALLER_PLAINTEXT = "sk-messages-tool-result-media";
 const CALLER_KEY_HASH = createHash("sha256").update(CALLER_PLAINTEXT).digest("hex");
@@ -44,6 +48,17 @@ const CONVERSE_STREAM = eventStream([
     { usage: { inputTokens: 30, outputTokens: 4, totalTokens: 34 }, metrics: { latencyMs: 5 } },
   ],
 ]);
+
+const CHAT_COMPLETIONS_REPLY = {
+  id: "chatcmpl-bedrock-gpt",
+  object: "chat.completion",
+  created: 1,
+  model: "gpt",
+  choices: [
+    { index: 0, message: { role: "assistant", content: "A blank image." }, finish_reason: "stop" },
+  ],
+  usage: { prompt_tokens: 30, completion_tokens: 4, total_tokens: 34 },
+};
 
 function messagesBody(model: string, stream: boolean) {
   return {
@@ -80,6 +95,20 @@ function messagesBody(model: string, stream: boolean) {
   };
 }
 
+/** The same conversation, with no `tools` offered on this turn. */
+function messagesBodyWithoutTools(model: string, stream: boolean) {
+  const { tools: _tools, ...body } = messagesBody(model, stream);
+  return body;
+}
+
+/** The `toolResult` blocks of a Converse request body. */
+function toolResultsOf(body: any) {
+  return body.messages
+    .flatMap((m: any) => m.content)
+    .filter((b: any) => b.toolResult)
+    .map((b: any) => b.toolResult);
+}
+
 describe("Messages → another protocol: a tool result's image", () => {
   let app: SpawnedApp | undefined;
   let bedrock: Server | undefined;
@@ -97,7 +126,10 @@ describe("Messages → another protocol: a tool result's image", () => {
       req.on("data", (c) => (raw += c));
       req.on("end", () => {
         received.push({ path: req.url ?? "", body: JSON.parse(raw || "{}") });
-        if (req.url?.endsWith("/converse-stream")) {
+        if (req.url?.endsWith("/openai/v1/chat/completions")) {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify(CHAT_COMPLETIONS_REPLY));
+        } else if (req.url?.endsWith("/converse-stream")) {
           res.writeHead(200, { "content-type": "application/vnd.amazon.eventstream" });
           res.end(CONVERSE_STREAM);
         } else {
@@ -140,6 +172,12 @@ describe("Messages → another protocol: a tool result's image", () => {
       display_name: "tool-media-nova",
       provider: "bedrock",
       model_name: "us.amazon.nova-lite-v1:0",
+      provider_key_id: bedrockPk.id,
+    });
+    await seed.createModel({
+      display_name: "tool-media-bedrock-gpt",
+      provider: "bedrock",
+      model_name: "us.openai.gpt-5.6-sol",
       provider_key_id: bedrockPk.id,
     });
     const openaiPk = await seed.createProviderKey({
@@ -186,16 +224,67 @@ describe("Messages → another protocol: a tool result's image", () => {
     const sent = received.slice(before);
     expect(sent).toHaveLength(1);
     expect(sent[0].path).toMatch(stream ? /\/converse-stream$/ : /\/converse$/);
-    const results = sent[0].body.messages
-      .flatMap((m: any) => m.content)
-      .filter((b: any) => b.toolResult)
-      .map((b: any) => b.toolResult);
+    const results = toolResultsOf(sent[0].body);
     expect(results).toHaveLength(1);
     expect(results[0].toolUseId).toBe("toolu_shot_1");
     expect(results[0].content).toEqual([
       { text: "here is the capture" },
       { image: { format: "png", source: { bytes: PNG } } },
     ]);
+  });
+
+  test.for([false, true])(
+    "a Bedrock GPT request with tools, stream=%s, is served by Converse and receives the image",
+    async (stream, ctx) => {
+      if (!etcdReachable || !app) return ctx.skip();
+      const before = received.length;
+      const res = await fetch(`${app.proxyUrl}/v1/messages`, {
+        method: "POST",
+        headers: { "x-api-key": CALLER_PLAINTEXT, "content-type": "application/json" },
+        body: JSON.stringify(messagesBody("tool-media-bedrock-gpt", stream)),
+      });
+      const text = await res.text();
+      expect(res.status, text).toBe(200);
+      expect(text).toContain("A blank image.");
+
+      const sent = received.slice(before);
+      expect(sent).toHaveLength(1);
+      expect(sent[0].path).toMatch(stream ? /\/converse-stream$/ : /\/converse$/);
+      const results = toolResultsOf(sent[0].body);
+      expect(results).toHaveLength(1);
+      expect(results[0].toolUseId).toBe("toolu_shot_1");
+      expect(results[0].content).toContainEqual({ text: "here is the capture" });
+      // The image reaches the model in the turn that answers the tool call,
+      // inside the result or beside it.
+      const turn = sent[0].body.messages.find((m: any) =>
+        m.content.some((b: any) => b.toolResult?.toolUseId === "toolu_shot_1"),
+      );
+      const images = turn.content.flatMap((b: any) =>
+        b.toolResult ? b.toolResult.content.filter((c: any) => c.image) : b.image ? [b] : [],
+      );
+      expect(images).toEqual([{ image: { format: "png", source: { bytes: PNG } } }]);
+    },
+  );
+
+  test("a Bedrock GPT request without tools is served by Chat Completions and receives the text", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    const before = received.length;
+    const res = await fetch(`${app.proxyUrl}/v1/messages`, {
+      method: "POST",
+      headers: { "x-api-key": CALLER_PLAINTEXT, "content-type": "application/json" },
+      body: JSON.stringify(messagesBodyWithoutTools("tool-media-bedrock-gpt", false)),
+    });
+    const text = await res.text();
+    expect(res.status, text).toBe(200);
+    expect(text).toContain("A blank image.");
+
+    const sent = received.slice(before);
+    expect(sent).toHaveLength(1);
+    expect(sent[0].path).toMatch(/\/openai\/v1\/chat\/completions$/);
+    const toolMessages = sent[0].body.messages.filter((m: any) => m.role === "tool");
+    expect(toolMessages).toHaveLength(1);
+    expect(toolMessages[0].tool_call_id).toBe("toolu_shot_1");
+    expect(toolMessages[0].content).toBe("here is the capture");
   });
 
   test("an OpenAI target receives the result's text and still answers", async (ctx) => {
