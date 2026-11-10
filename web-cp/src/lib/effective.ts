@@ -10,12 +10,20 @@ export interface EffectiveResolver {
 
 const TYPED = /^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2})(:\d{2})?Z?$/;
 
-/** A time typed as `YYYY-MM-DD HH:mm[:ss]` in UTC, as an ISO instant; null when it is not one. */
+/**
+ * A time typed as `YYYY-MM-DD HH:mm[:ss]` in UTC, as an ISO instant; null when
+ * it is not one. A day or a time the calendar does not have is not one: a
+ * browser's `Date` reads `2027-02-29` as 1 March and `24:00` as the next
+ * day's midnight, so the instant must give back exactly the fields typed.
+ */
 export function parseUtc(text: string): string | null {
   const m = TYPED.exec(text.trim());
   if (!m) return null;
-  const at = new Date(`${m[1]}T${m[2]}${m[3] ?? ":00"}Z`);
-  return Number.isNaN(at.getTime()) ? null : at.toISOString();
+  const typed = `${m[1]}T${m[2]}${m[3] ?? ":00"}`;
+  const at = new Date(`${typed}Z`);
+  if (Number.isNaN(at.getTime())) return null;
+  const iso = at.toISOString();
+  return iso.slice(0, 19) === typed ? iso : null;
 }
 
 /** A 422 refusal at `/effective_from` (duck-typed, so this file needs nothing from the API client). */

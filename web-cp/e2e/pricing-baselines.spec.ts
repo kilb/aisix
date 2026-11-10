@@ -427,3 +427,35 @@ test("联网搜索的价格不是每千次的金额时，在字段旁提示，�
   const stored = (await stack.admin.get("/admin/pricing/baselines")) as Json;
   expect(stored.items.find((i: Json) => i.model_id === model.id).current).toBeNull();
 });
+
+test("生效时间是日历上不存在的日子时报错且不写入；闰年的 2 月 29 日照常写入", async ({ page }) => {
+  const model = await newModel("cal-base", "gpt-5.4-nano");
+  await openBaselines(page);
+  const panel = await openModel(page, model.name);
+  await panel.getByLabel("方式").selectOption("manual");
+  await panel.getByLabel("输入", { exact: true }).fill("5");
+  await panel.getByLabel("输出", { exact: true }).fill("10");
+  await panel.getByLabel("说明", { exact: true }).fill("日历");
+  await panel.getByLabel("立即生效").uncheck();
+
+  // 2037 is no leap year, April has 30 days, and a day has no 24:00. Each was
+  // once read as a valid instant of another day and scheduled there.
+  for (const typed of ["2037-02-29 00:00", "2037-04-31 10:00", "2037-01-01 24:00"]) {
+    await panel.getByLabel("生效时间（UTC）").fill(typed);
+    await panel.getByRole("button", { name: "保存" }).click();
+    await expect(panel.getByLabel("生效时间（UTC）")).toHaveAttribute("aria-invalid", "true");
+    await expect(panel.getByText("生效时间应写成 年-月-日 时:分，按 UTC 计")).toBeVisible();
+  }
+  const refused = (await stack.admin.get("/admin/pricing/baselines")) as Json;
+  const none = refused.items.find((i: Json) => i.model_id === model.id);
+  expect(none.current).toBeNull();
+  expect(none.upcoming).toHaveLength(0);
+
+  await panel.getByLabel("生效时间（UTC）").fill("2036-02-29 00:00");
+  await panel.getByRole("button", { name: "保存" }).click();
+  await expect(page.getByText("已保存")).toBeVisible();
+  const stored = (await stack.admin.get("/admin/pricing/baselines")) as Json;
+  const listed = stored.items.find((i: Json) => i.model_id === model.id);
+  expect(listed.upcoming).toHaveLength(1);
+  expect(new Date(listed.upcoming[0].effective_from).toISOString()).toBe("2036-02-29T00:00:00.000Z");
+});

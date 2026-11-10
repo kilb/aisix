@@ -446,6 +446,47 @@ async fn a_manual_card_is_refused_at_the_field_that_breaks_it() {
 }
 
 #[tokio::test]
+async fn a_start_on_a_day_the_calendar_lacks_is_refused_and_writes_nothing() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let m = model(&cp, &admin, "bl-calendar-5d2").await;
+    let version = pricing_version(&cp).await;
+    // 2027 is no leap year, April has 30 days, and a day has no 24:00. A
+    // browser's `Date` reads each as a valid instant of another day; the
+    // write refuses them rather than schedule a price for a day nobody typed.
+    for at in [
+        "2027-02-29T00:00:00Z",
+        "2027-04-31T10:00:00Z",
+        "2027-01-01T24:00:00Z",
+    ] {
+        let r = post(
+            &cp,
+            &admin,
+            json!({"model_id": m, "effective_from": at, "card": card(), "note": "x"}),
+        )
+        .await;
+        assert_eq!(
+            (r.status, r.body["code"].clone()),
+            (422, json!("validation_failed")),
+            "{at}: {r:?}"
+        );
+    }
+    assert_eq!(pricing_version(&cp).await, version, "nothing was written");
+    // A leap year's 29 February is a day like any other.
+    let body = write(
+        &cp,
+        &admin,
+        json!({"model_id": m, "effective_from": "2028-02-29T00:00:00Z", "card": card(), "note": "x"}),
+    )
+    .await;
+    let starts: DateTime<Utc> =
+        serde_json::from_value(body["revision"]["effective_from"].clone()).expect("an instant");
+    assert_eq!(starts.to_rfc3339(), "2028-02-29T00:00:00+00:00");
+}
+
+#[tokio::test]
 async fn a_baseline_is_a_card_or_a_catalogue_key() {
     let cat = catalogue(
         "2026-11-06",
