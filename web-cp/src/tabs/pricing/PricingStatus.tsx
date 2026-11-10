@@ -11,8 +11,9 @@ import { handChargesFilter, statusView } from "../../lib/pricingStatus";
 /**
  * 计价状态: the pricing version, price revisions that cannot be used, and the
  * last day's unpriced calls, each kind by reason and model with what to do
- * about it and a link to its calls in 计费明细. Calls a re-pricing run has
- * corrected since are counted apart.
+ * about it and a link to its calls in 计费明细. When the list of kinds is cut
+ * short, each reason's calls it leaves out are one more row of that reason.
+ * Calls a re-pricing run has corrected since are counted apart.
  */
 export function PricingStatus({ onGoto }: TabProps) {
   const [status, setStatus] = useState<Status | null>(null);
@@ -124,6 +125,25 @@ export function PricingStatus({ onGoto }: TabProps) {
                     </td>
                   </tr>
                 ))}
+                {view.unlisted.map((u) => (
+                  <tr key={u.key}>
+                    <td>{u.label}</td>
+                    <td className="num">{fmtInt(u.count)}</td>
+                    <td colSpan={4}>其余 {fmtInt(u.count)} 次，未逐一列出</td>
+                    <td className="right">
+                      <Button
+                        type="button"
+                        size="sm"
+                        onClick={() => {
+                          handChargesFilter(u.filter);
+                          onGoto("pricing", "charges");
+                        }}
+                      >
+                        查看调用
+                      </Button>
+                    </td>
+                  </tr>
+                ))}
                 <tr>
                   <th scope="row">合计</th>
                   <td className="num">{fmtInt(view.unpricedTotal)}</td>
@@ -132,7 +152,9 @@ export function PricingStatus({ onGoto }: TabProps) {
               </tbody>
             </DataTable>
           )}
-          {view.detailsTruncated && <p className="hint">种类太多，只列出了最常见的一部分；合计仍是全部未计价的调用。</p>}
+          {view.detailsTruncated && (
+            <p className="hint">种类太多，没有逐一列出全部；每种原因没有列出的次数合在它的「其余 … 次」一行里，合计仍是全部未计价的调用。</p>
+          )}
           {view.correctedTotal > 0 && (
             <p className="hint" role="status">
               另有 {fmtInt(view.correctedTotal)} 次调用已通过重计价更正，不再计入未计价。

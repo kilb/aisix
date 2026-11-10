@@ -64,6 +64,12 @@ function withRate(map: RateMap, dimension: string, rate: string | undefined): Ra
   return next;
 }
 
+/** The units the field view takes: a rate per call is typed per thousand. */
+const FIELD_UNITS = "token 价格按每百万 tokens 填写；联网搜索按每千次填写，例如「每 1,000 次 10 美元」填 10。";
+
+/** The units the JSON view takes: the card as stored, every rate per million units, a rate per call included. */
+const JSON_UNITS = "JSON 里的每个价格都按每百万单位填写：token 按每百万 tokens，联网搜索按每百万次，例如「每 1,000 次 10 美元」填 \"10000\"。";
+
 /** What a rate per call typed per thousand says when it is no amount a card can hold. */
 const PER_THOUSAND_PROBLEM = "按每千次的美元数填写，最多 9 位小数";
 
@@ -75,7 +81,9 @@ const PER_THOUSAND_PROBLEM = "按每千次的美元数填写，最多 9 位小�
  * and stored, exactly, per million (`perMillionOfPerThousand`), the unit
  * every card holds. A rate left empty is left out of the card, and the
  * server decides whether the card is complete. `编辑完整价格卡（JSON）` opens
- * the whole card in the JSON editor instead.
+ * the whole card in the JSON editor instead, where every rate, a rate per
+ * call included, is per million units as the card stores it; the hint above
+ * the card says which unit the view on screen takes.
  *
  * Problems whose path starts `/card` show at their field, at their tier or
  * band, or else above the card. `onValidity` reports whether the card can be
@@ -254,7 +262,7 @@ export function RateCardEditor({
   return (
     <fieldset className="rate-card" aria-invalid={mine.length > 0 ? true : undefined} aria-describedby={above.length > 0 ? aboveId : undefined}>
       <legend>价格卡（美元）</legend>
-      <p className="hint">token 价格按每百万 tokens 填写；联网搜索按每千次填写，例如「每 1,000 次 10 美元」填 10。</p>
+      <p className="hint">{json === null ? FIELD_UNITS : JSON_UNITS}</p>
       {above.length > 0 && (
         <div className="note crit" role="alert" id={aboveId}>
           {above.map((d) => d.message).join("；")}

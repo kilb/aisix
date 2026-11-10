@@ -34,9 +34,10 @@ export function compactRateText(dimension: string, perMillion: string): string {
 /**
  * What each tier of a card bills, where tiers are listed. A batch row is
  * the usage of a finished batch job (`/v1/batches`), and only such a row is
- * priced at `batch`; any other row is priced at the tier its upstream
- * reports it served, with no tier, `standard` and `auto` read as `default`
- * (`ServiceTier::normalize`).
+ * priced at `batch`; on a card without one it is unpriced
+ * (`missing_tier_price`), never billed at `default`. Any other row is priced
+ * at the tier its upstream reports it served, with no tier, `standard` and
+ * `auto` read as `default` (`ServiceTier::normalize`).
  */
 export const TIER_HINT =
-  "标准档用于普通调用；批量档只用于批处理任务（Batch API）的用量，普通调用不会按它计费；flex、priority、fast 等档位只在上游报告以该档位服务时使用，卡上没有该档位时这样的调用记为未计价。";
+  "标准档用于普通调用；批量档只用于批处理任务（Batch API）的用量，普通调用不会按它计费，卡上没有批量档时批处理任务的用量记为未计价，不会按标准档计费；flex、priority、fast 等档位只在上游报告以该档位服务时使用，卡上没有该档位时这样的调用记为未计价。";

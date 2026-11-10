@@ -428,6 +428,33 @@ test("联网搜索的价格不是每千次的金额时，在字段旁提示，�
   expect(stored.items.find((i: Json) => i.model_id === model.id).current).toBeNull();
 });
 
+test("JSON 视图里每个价格都按每百万单位：提示不说按每千次填写，按提示写的联网搜索价是每千次 10 美元", async ({ page }) => {
+  const model = await newModel("search-json", "gpt-5.4-nano");
+  await openBaselines(page);
+  const panel = await openModel(page, model.name);
+  await panel.getByLabel("方式").selectOption("manual");
+  const card = panel.getByRole("group", { name: "价格卡（美元）" });
+  // The fields take a search per thousand.
+  await expect(card.getByText("联网搜索按每千次填写", { exact: false })).toBeVisible();
+
+  // The JSON view holds the card as stored: the per-thousand hint is gone,
+  // and the one shown gives the per-million figure for the same price.
+  await card.getByRole("button", { name: "编辑完整价格卡（JSON）" }).click();
+  await expect(card.getByText("联网搜索按每千次填写", { exact: false })).toHaveCount(0);
+  await expect(card.getByText("JSON 里的每个价格都按每百万单位填写", { exact: false })).toContainText('"10000"');
+
+  // Followed, the hint stores $10 per 1,000 searches, read back per thousand.
+  await card.getByLabel("资源文档").fill(JSON.stringify({ default: { base: { input: "1", output: "2", web_search: "10000" } } }));
+  await panel.getByLabel("说明", { exact: true }).fill("JSON 录入联网搜索");
+  await panel.getByRole("button", { name: "保存" }).click();
+  await expect(page.getByText("已保存")).toBeVisible();
+  await expect(panel.getByRole("region", { name: "现行基准价" })).toContainText("联网搜索 $10 / 千次");
+  const after = (await stack.admin.get("/admin/pricing/baselines")) as Json;
+  expect(after.items.find((i: Json) => i.model_id === model.id).current.card).toEqual({
+    default: { base: { input: "1", output: "2", web_search: "10000" } },
+  });
+});
+
 test("生效时间是日历上不存在的日子时报错且不写入；闰年的 2 月 29 日照常写入", async ({ page }) => {
   const model = await newModel("cal-base", "gpt-5.4-nano");
   await openBaselines(page);

@@ -506,3 +506,53 @@ test("已停用的公共模型可以恢复：恢复后在用、没有可用账�
     .toBe(true);
   expect((await modelDocs())[name].doc.routing.targets).toHaveLength(1);
 });
+
+/**
+ * A delete or restore whose answer is lost may still have landed. The control
+ * plane does the real write; only its answer is dropped at the network. The
+ * page must not report it as a failure: it says it could not tell, and reads
+ * the list again, which shows what the write did.
+ */
+test("删除或恢复的回答丢失时不说失败：说明没能确认，并重新读取列表显示实际状态", async ({ page }) => {
+  const suffix = randomUUID().slice(0, 8);
+  const name = `pub-lost-${suffix}`;
+  const pub = await stack.admin.post("/admin/public-models", { name });
+  const lose = async (path: string) =>
+    page.route(`**/admin/public-models/${pub.id}/${path}`, async (route) => {
+      // The control plane does the write; its answer never reaches the page.
+      await route.fetch();
+      await route.abort("connectionreset");
+    });
+
+  const panel = await openPublicModels(page);
+  const row = listRow(panel, name);
+  await expect(row.getByRole("cell").nth(5)).toHaveText("在用");
+
+  await lose("delete");
+  await row.getByRole("button", { name: "删除", exact: true }).click();
+  await row.getByRole("button", { name: "确认删除" }).click();
+  await expect(panel.getByRole("alert").filter({ hasText: "没能确认" })).toHaveText(`没能确认「${name}」是否已删除，已重新读取列表。`);
+  // Read again: the delete landed.
+  await expect(row.getByRole("cell").nth(5)).toHaveText("已停用");
+  expect((await stack.admin.get(`/admin/public-models/${pub.id}`)).retired_at).not.toBeNull();
+  await page.unroute(`**/admin/public-models/${pub.id}/delete`);
+
+  await lose("restore");
+  await row.getByRole("button", { name: "恢复", exact: true }).click();
+  await row.getByRole("button", { name: "确认恢复" }).click();
+  await expect(panel.getByRole("alert").filter({ hasText: "没能确认" })).toHaveText(`没能确认「${name}」是否已恢复，已重新读取列表。`);
+  await expect(row.getByRole("cell").nth(5)).toHaveText("在用");
+  expect((await stack.admin.get(`/admin/public-models/${pub.id}`)).retired_at).toBeNull();
+  await page.unroute(`**/admin/public-models/${pub.id}/restore`);
+});
+
+test("恢复前的提示说明：重新映射之前，请求会以 503 失败", async ({ page }) => {
+  const suffix = randomUUID().slice(0, 8);
+  const name = `pub-hint-${suffix}`;
+  const pub = await stack.admin.post("/admin/public-models", { name });
+  await stack.admin.post(`/admin/public-models/${pub.id}/delete`, {});
+  const panel = await openPublicModels(page);
+  const row = listRow(panel, name);
+  await row.getByRole("button", { name: "恢复", exact: true }).click();
+  await expect(row.getByRole("alert")).toContainText("「获取上游模型 → 写入映射」。在此之前，请求会以 503 失败（无可用上游）。");
+});

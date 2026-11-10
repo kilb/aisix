@@ -836,10 +836,6 @@ function GrantsPart({
   }, [stored]);
   useConflictClears(tenant.version, setRefused);
 
-  // What the tenant reaches now, as the control plane resolved it with the
-  // row. It comes with the tenant itself, so narrowing from it and checking
-  // a save against it never wait on, or guess at, another read.
-  const current = useMemo(() => new Set(tenant.effective_model_ids), [tenant.effective_model_ids]);
   // What the `all` scope gives: every live public model the catalogue lists.
   // A public model with no document yet is not callable and is not in scope
   // until an account serves it. `null` until both lists are read: an unread
@@ -849,6 +845,16 @@ function GrantsPart({
     const live = new Set(publics);
     return new Set(catalog.filter((m) => live.has(m.id)).map((m) => m.id));
   }, [catalog, publics]);
+  // What the tenant reaches now, as the control plane resolved it with the
+  // row, so narrowing from it and checking a save against it never wait on
+  // another read. Under a stored `all` scope it is what `all` gives once the
+  // lists are read: they can be read after the row was (a retry, a refresh),
+  // and a public model added or retired since must be what narrowing starts
+  // from and what a save says it withdraws.
+  const current = useMemo(
+    () => (tenant.model_scope === "all" && allScope !== null ? allScope : new Set(tenant.effective_model_ids)),
+    [tenant.model_scope, allScope, tenant.effective_model_ids],
+  );
   const all = scope === "all";
 
   // The catalog's models, then every granted or chosen model it does not
@@ -929,7 +935,7 @@ function GrantsPart({
    * scope had been standing aside.
    */
   function switchScope(next: "all" | "selected") {
-    setChosen(new Set(next === "selected" ? tenant.effective_model_ids : tenant.allowed_model_ids));
+    setChosen(new Set(next === "selected" ? current : tenant.allowed_model_ids));
     setScope(next);
   }
 

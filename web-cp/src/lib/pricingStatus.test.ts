@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { PricingStatus } from "./api.ts";
-import { chargesFilterFor, handChargesFilter, modelText, reasonLabel, remedy, statusView, takeChargesFilter } from "./pricingStatus.ts";
+import { chargesFilterFor, handChargesFilter, modelText, reasonLabel, remedy, statusView, takeChargesFilter, unlistedByCode } from "./pricingStatus.ts";
 
 const status: PricingStatus = {
   pricing_version: 7,
@@ -122,4 +122,47 @@ test("every reason says what to do; a tier the upstream did not report is said s
   assert.equal(remedy({ code: "brand_new", service_tier: null, group: null }), "未记录原因");
   assert.equal(modelText(null, false), "—");
   assert.equal(modelText("m", true), "m（已删除）");
+});
+
+test("a list cut short leaves no call out of a row: each reason's unlisted calls are one more row of it", () => {
+  // missing_rate is listed in part, no_group not at all (the cut took every
+  // kind of it), missing_price in full.
+  const byCode = { missing_price: 4, missing_rate: 9, no_group: 5 };
+  const items = [
+    { code: "missing_price", count: 3 },
+    { code: "missing_rate", count: 6 },
+    { code: "missing_price", count: 1 },
+  ];
+  assert.deepEqual(unlistedByCode(byCode, items, true), [
+    { code: "missing_rate", count: 3 },
+    { code: "no_group", count: 5 },
+  ]);
+  // A complete list has none, whatever the counts read a moment earlier said.
+  assert.deepEqual(unlistedByCode(byCode, items, false), []);
+  // A kind listed with more than its reason's count (a call that came in
+  // between the two reads) gives no negative row.
+  assert.deepEqual(unlistedByCode({ missing_price: 2 }, [{ code: "missing_price", count: 3 }], true), []);
+
+  const v = statusView({
+    ...status,
+    unpriced_last_24h: { total: 18, by_code: byCode },
+    unpriced_details: {
+      items: items.map((i) => ({ ...i, latest_at: "2026-11-10T09:00:00Z", model: { id: "m", name: "m", deleted: false }, service_tier: null, group: null })),
+      truncated: true,
+    },
+  });
+  assert.deepEqual(
+    v.unlisted.map((u) => [u.label, u.count]),
+    [
+      ["分组未设换算率", 3],
+      ["密钥未选分组", 5],
+    ],
+  );
+  // Every call is in a row: the listed kinds and the unlisted ones add up to the total.
+  assert.equal(v.details.reduce((n, d) => n + d.count, 0) + v.unlisted.reduce((n, u) => n + u.count, 0), v.unpricedTotal);
+  // Its link opens 计费明细 on that reason's unpriced calls.
+  assert.deepEqual(v.unlisted[1]!.filter, { status: "unpriced", error_code: "no_group" });
+  assert.equal(new Set([...v.details, ...v.unlisted].map((r) => r.key)).size, 5);
+  // The fixture above lists every kind: no unlisted row.
+  assert.deepEqual(statusView(status).unlisted, []);
 });

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { TabProps } from "../../App";
 import {
   ApiError,
@@ -9,6 +9,7 @@ import {
   type ModelGroupPriceRow,
   type PublicModel,
 } from "../../lib/api";
+import { isUnknownOutcome } from "../../lib/creditOutcome";
 import { messageFor, problemAt } from "../../lib/errors";
 import { errorText } from "../../lib/fmt";
 import { pricedState, unpricedReason } from "../../lib/publicPricing";
@@ -32,7 +33,7 @@ function tiersOf(model: PublicModel): string {
 
 /** What a restore does, asked before it runs. */
 function restoreWarning(model: PublicModel): string {
-  return `恢复「${model.name}」：它以原来的标识重新上线，授权、基准价和分组换算率照旧。原来的账号映射不会恢复：在上游账号的「模型」里勾选它，或用「获取上游模型 → 写入映射」，之前请求会以 503 失败（无可用上游）。`;
+  return `恢复「${model.name}」：它以原来的标识重新上线，授权、基准价和分组换算率照旧。原来的账号映射不会恢复：在上游账号的「模型」里勾选它，或用「获取上游模型 → 写入映射」。在此之前，请求会以 503 失败（无可用上游）。`;
 }
 
 /**
@@ -56,6 +57,11 @@ function restoreWarning(model: PublicModel): string {
  * A retired row's action is 恢复: the model comes back under its own id, with
  * no account serving it until one maps it again.
  *
+ * Every delete or restore reads the list again however it ended: a refusal
+ * may answer a model another operator changed, and a lost answer (no reply,
+ * a 5xx) says nothing of whether the write landed, so the page says it could
+ * not tell and shows what the control plane holds. The newest read wins.
+ *
  * 定价 judges a model by the groups that serve it ([`pricedState`]); 授权租户
  * and 密钥 count who can call it now, all-scope tenants included — not the
  * narrower references a delete is refused on, which the delete's own warning
@@ -73,20 +79,34 @@ export function PublicModels({ canEdit }: TabProps) {
   const [selected, setSelected] = useState<string | null>(null);
   const [name, setName] = useState("");
   const [creating, setCreating] = useState(false);
-  const [busy, setBusy] = useState<string | null>(null);
+  /** The models a delete or restore is on its way for. */
+  const [busy, setBusy] = useState<ReadonlySet<string>>(() => new Set());
   const [form, focusRefusal] = useRefusalFocus<HTMLFormElement>();
+  /** The newest read asked for: an answer to an older one is dropped. */
+  const latest = useRef(0);
 
   const load = useCallback(async () => {
+    const n = ++latest.current;
     try {
       const [models, priced, groupList] = await Promise.all([publicModels.list(), groupPrices.list(), groupsApi.list()]);
+      if (n !== latest.current) return;
       setRows(models);
       setPrices(new Map(priced.map((p) => [p.model_id, p] as const)));
       setLiveGroups(groupList);
       setError(null);
     } catch (e) {
+      if (n !== latest.current) return;
       setError(errorText(e));
     }
   }, []);
+
+  const mark = (id: string, on: boolean) =>
+    setBusy((all) => {
+      const next = new Set(all);
+      if (on) next.add(id);
+      else next.delete(id);
+      return next;
+    });
 
   useEffect(() => {
     void load();
@@ -131,30 +151,42 @@ export function PublicModels({ canEdit }: TabProps) {
   }
 
   async function remove(model: PublicModel) {
-    setBusy(model.id);
+    mark(model.id, true);
     setRefusal(null);
     try {
       await publicModels.delete(model.id);
       toast(`已删除「${model.name}」，各账号对它的映射和它的文档都已移除。`);
-      await load();
     } catch (e) {
-      setRefusal(e instanceof ApiError ? deleteRefusalText(e) : errorText(e));
+      setRefusal(
+        isUnknownOutcome(e)
+          ? `没能确认「${model.name}」是否已删除，已重新读取列表。`
+          : e instanceof ApiError
+            ? deleteRefusalText(e)
+            : errorText(e),
+      );
     } finally {
-      setBusy(null);
+      await load();
+      mark(model.id, false);
     }
   }
 
   async function restore(model: PublicModel) {
-    setBusy(model.id);
+    mark(model.id, true);
     setRefusal(null);
     try {
       await publicModels.restore(model.id);
       toast(`已恢复「${model.name}」。还没有账号服务它，请在上游账号的「模型」里重新映射。`);
-      await load();
     } catch (e) {
-      setRefusal(e instanceof ApiError ? `无法恢复「${model.name}」：${messageFor(e)}` : errorText(e));
+      setRefusal(
+        isUnknownOutcome(e)
+          ? `没能确认「${model.name}」是否已恢复，已重新读取列表。`
+          : e instanceof ApiError
+            ? `无法恢复「${model.name}」：${messageFor(e)}`
+            : errorText(e),
+      );
     } finally {
-      setBusy(null);
+      await load();
+      mark(model.id, false);
     }
   }
 
@@ -230,7 +262,7 @@ export function PublicModels({ canEdit }: TabProps) {
                       <TwoStep
                         label="恢复"
                         size="sm"
-                        busy={busy === m.id}
+                        busy={busy.has(m.id)}
                         busyLabel="恢复中…"
                         warning={restoreWarning(m)}
                         onConfirm={() => void restore(m)}
@@ -241,7 +273,7 @@ export function PublicModels({ canEdit }: TabProps) {
                         label="删除"
                         size="sm"
                         kind="danger"
-                        busy={busy === m.id}
+                        busy={busy.has(m.id)}
                         busyLabel="删除中…"
                         // Always asked: refused, it says why; accepted, it cannot be undone.
                         ask={() => true}

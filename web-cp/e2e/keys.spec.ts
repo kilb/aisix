@@ -504,7 +504,11 @@ test("全部范围租户新建密钥：可从全部公共模型里选，只选�
   const plaintext = ((await created.getByLabel("密钥明文").textContent()) ?? "").trim();
   expect(plaintext).toMatch(/^sk-rt-[A-Za-z0-9]{16,}$/);
 
-  // The gateway serves the one model chosen, and only it.
+  // The gateway serves the one model chosen, and only it. A key of the same
+  // tenant that picks no models is served pub2: the refusal is the narrowed
+  // key's, not a model nobody can call.
+  const control = await stack.admin.post(`/admin/tenants/${t.id}/keys`, { label: "allpick-control-t6" });
+  await expect.poll(() => chatStatus(control.plaintext, "pub2-t6-e2e"), { timeout: KEY_READY_MS }).toBe(200);
   await expect.poll(() => chatStatus(plaintext, "pub-t6-e2e"), { timeout: KEY_READY_MS }).toBe(200);
   expect(await chatStatus(plaintext, "pub2-t6-e2e")).not.toBe(200);
   const listed = (await stack.admin.get(`/admin/tenants/${t.id}/keys`)).items as Json[];

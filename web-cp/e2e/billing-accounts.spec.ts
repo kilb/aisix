@@ -279,8 +279,10 @@ test("后付租户没有信用额度但余额为正：不说所有调用都会�
  * filter: its page must not be appended to the new list, nor its cursor
  * replace the new one. The old continuation is held at the network until
  * the new filter's list is shown, then let through with its real answer.
+ * The new filter, 全部, has a next page of its own, so a cursor the old
+ * answer replaced shows as a 加载更多 that loads the wrong page or is gone.
  */
-test("余额流水加载更多途中换了类型：旧类型的下一页不混进新类型的列表", async ({ page }) => {
+test("余额流水加载更多途中换了类型：旧类型的下一页不混进新类型的列表，新类型照常翻页", async ({ page }) => {
   test.setTimeout(120_000);
   // One funding top-up and 50 more: two pages of 充值 (a page is 50).
   const world = await seedTenant(stack, { mode: "prepaid", creditCny: "10.00" });
@@ -314,16 +316,21 @@ test("余额流水加载更多途中换了类型：旧类型的下一页不混�
   await ledger.getByRole("button", { name: "加载更多" }).click();
   await arrived;
 
-  await ledger.getByLabel("类型").selectOption({ label: "扣费" });
-  await expect(rows).toHaveCount(2);
+  // 全部: 51 top-ups and 2 扣费, a first page of 50 and a next one of 3.
+  await ledger.getByLabel("类型").selectOption({ label: "全部" });
+  await expect(rows).toHaveCount(50);
   const answered = page.waitForResponse(NEXT_PAGE);
   release();
   await answered;
+  await page.unroute(NEXT_PAGE);
   // Give the page a moment to take (and drop) the old answer.
   await page.waitForTimeout(500);
-  await expect(rows).toHaveCount(2);
-  expect(await kinds()).toEqual(["扣费", "扣费"]);
-  // The new list is whole: no next page of the old filter is offered.
+  await expect(rows).toHaveCount(50);
+  // The new list pages on with its own cursor: its next page, and nothing of the old filter's.
+  await ledger.getByRole("button", { name: "加载更多" }).click();
+  await expect(rows).toHaveCount(53);
+  const all = await kinds();
+  expect(all.filter((k) => k === "扣费")).toHaveLength(2);
+  expect(all.filter((k) => k === "充值")).toHaveLength(51);
   await expect(ledger.getByRole("button", { name: "加载更多" })).toHaveCount(0);
-  await page.unroute(NEXT_PAGE);
 });

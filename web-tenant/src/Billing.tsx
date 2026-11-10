@@ -96,11 +96,17 @@ export function Billing({ member }: { member: SessionMember }) {
   // so nothing that depends on them is claimed until a read succeeds.
   const [team, setTeam] = useState<Budget[] | null>(null);
   const [teamErr, setTeamErr] = useState<string | null>(null);
+  /** The newest read of the quotas asked for (a retry is another): an answer to an older one is dropped. */
+  const teamTicket = useRef(0);
   const loadTeam = useCallback(async () => {
+    const n = ++teamTicket.current;
     try {
-      setTeam((await budgetApi.list()).filter((b) => b.scope === "team"));
+      const list = await budgetApi.list();
+      if (n !== teamTicket.current) return;
+      setTeam(list.filter((b) => b.scope === "team"));
       setTeamErr(null);
     } catch (e) {
+      if (n !== teamTicket.current) return;
       setTeam(null);
       setTeamErr(failure(e));
     }
