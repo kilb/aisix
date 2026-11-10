@@ -1454,6 +1454,15 @@ fn a_star_named_server_on_the_deny_side_blocks_the_export() {
     assert_eq!(keys[0]["mcp_access"]["deny"], json!([]));
 }
 
+/// The api key the anonymous fixtures below run as.
+fn register_anonymous_principal(snap: &AisixSnapshot) {
+    snap.apikeys.insert(ResourceEntry::new(
+        "k-uuid-1",
+        serde_json::from_value(json!({"key_hash": "ef".repeat(32), "allowed_models": []})).unwrap(),
+        1,
+    ));
+}
+
 /// The anonymous ceiling with `server_ids` set: one anonymous block,
 /// registered servers as named.
 fn anonymous_settings(anonymous: Value) -> ResourceEntry<aisix_core::models::McpAuthSettings> {
@@ -1467,6 +1476,7 @@ fn anonymous_settings(anonymous: Value) -> ResourceEntry<aisix_core::models::Mcp
 #[test]
 fn anonymous_ceiling_server_ids_resugar_to_names() {
     let snap = AisixSnapshot::new();
+    register_anonymous_principal(&snap);
     register_mcp_servers(&snap, &[("s-uuid-1", "docs"), ("s-uuid-2", "kb")]);
     snap.mcp_auth_settings.insert(anonymous_settings(json!({
         "api_key_id": "k-uuid-1",
@@ -1561,6 +1571,7 @@ fn a_star_named_server_in_the_anonymous_ceiling_blocks_the_export() {
 #[test]
 fn an_anonymous_ceiling_without_server_ids_is_left_alone() {
     let snap = AisixSnapshot::new();
+    register_anonymous_principal(&snap);
     register_mcp_servers(&snap, &[("s-uuid-1", "docs")]);
     snap.mcp_auth_settings.insert(anonymous_settings(json!({
         "api_key_id": "k-uuid-1",
@@ -1826,4 +1837,130 @@ fn a_url_password_is_a_placeholder_and_reads_back_to_the_same_url() {
     );
     let server = loaded.mcp_servers.get_by_name("tools").expect("server");
     assert_eq!(server.value.url, url("mcp.example"));
+}
+
+/// An etcd configuration with anonymous MCP access, a resource URL that
+/// carries a password in its userinfo, and an api key with a label, moved to
+/// a file and loaded back: the default export must not print the password,
+/// the placeholder it prints instead must put the same URL back, anonymous
+/// access must still run as the same key, and the key keeps its label.
+#[test]
+fn mcp_auth_settings_and_api_keys_survive_the_round_trip() {
+    use aisix_core::filesource::load_from_str;
+    use std::collections::HashMap;
+
+    const PASSWORD: &str = "p%40ss:LEAK";
+    let resource_url = format!("https://svc:{PASSWORD}@gw.example.com/mcp");
+    let snap = AisixSnapshot::new();
+    register_mcp_servers(&snap, &[("s-uuid-1", "docs")]);
+    snap.apikeys.insert(ResourceEntry::new(
+        "k-uuid-anon",
+        serde_json::from_value(json!({
+            "key_hash": "ab".repeat(32),
+            "display_name": "anonymous-docs",
+            "allowed_models": [],
+            "mcp_access": {"allow": ["docs__*"]},
+        }))
+        .unwrap(),
+        1,
+    ));
+    snap.mcp_auth_settings.insert(ResourceEntry::new(
+        "env-uuid-1",
+        serde_json::from_value(json!({
+            "resource_url": resource_url,
+            "anonymous": {
+                "enabled": true,
+                "api_key_id": "k-uuid-anon",
+                "source_cidrs": ["10.0.0.0/8"],
+                "servers": ["docs"],
+            },
+        }))
+        .unwrap(),
+        1,
+    ));
+
+    let doc = build_export_document(&snap, false);
+    assert!(doc.blocking.is_empty(), "{:?}", doc.blocking);
+    let yaml = crate::export::yaml_emit::emit_yaml(&doc).expect("emit");
+    assert!(!yaml.contains("LEAK"), "{yaml}");
+    let placeholder = doc
+        .secret_placeholders
+        .iter()
+        .find(|p| p.kind == "mcp_auth_settings")
+        .expect("the resource_url password becomes a placeholder");
+
+    // Loaded with each placeholder set to the value it stood for.
+    let env: HashMap<String, String> =
+        HashMap::from([(placeholder.env_var.clone(), "p%40ss:LEAK".to_string())]);
+    let loaded = load_from_str(&yaml, "exported.yaml", 1, &|n| env.get(n).cloned())
+        .expect("the exported file must re-load through the file source");
+    let settings = loaded.mcp_auth_settings.entries().pop().expect("settings");
+    assert_eq!(
+        settings.value.resource_url.as_deref(),
+        Some(resource_url.as_str())
+    );
+    let principal = &settings
+        .value
+        .anonymous
+        .as_ref()
+        .expect("anonymous")
+        .api_key_id;
+    let key = loaded
+        .apikeys
+        .get_by_id(principal)
+        .expect("anonymous access still names a key the file defines");
+    assert_eq!(key.value.key_hash, "ab".repeat(32));
+    assert_eq!(key.value.telemetry_name(), Some("anonymous-docs"));
+
+    // `--reveal-secrets` keeps the URL as stored.
+    let revealed = build_export_document(&snap, true);
+    assert_eq!(
+        find(&revealed, "mcp_auth_settings")[0]["resource_url"],
+        json!(resource_url)
+    );
+    assert!(revealed.secret_placeholders.is_empty());
+}
+
+/// Two keys sharing a label cannot both be keyed by it in the file; both
+/// fall back to their hash names, and the operator is told the label
+/// changes. A key whose label nobody shares keeps it.
+#[test]
+fn api_keys_sharing_a_display_name_fall_back_to_hash_names() {
+    let snap = AisixSnapshot::new();
+    for (id, hash, name) in [
+        ("k-1", "11".repeat(32), "team-a"),
+        ("k-2", "22".repeat(32), "team-a"),
+        ("k-3", "33".repeat(32), "solo"),
+    ] {
+        snap.apikeys.insert(ResourceEntry::new(
+            id,
+            serde_json::from_value(
+                json!({"key_hash": hash, "display_name": name, "allowed_models": []}),
+            )
+            .unwrap(),
+            1,
+        ));
+    }
+    let doc = build_export_document(&snap, false);
+    assert!(doc.blocking.is_empty(), "{:?}", doc.blocking);
+    let mut names: Vec<_> = find(&doc, "api_keys")
+        .iter()
+        .map(|k| k["display_name"].as_str().unwrap().to_string())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            synthetic_api_key_name(&"11".repeat(32)),
+            synthetic_api_key_name(&"22".repeat(32)),
+            "solo".to_string(),
+        ]
+    );
+    assert!(
+        doc.warnings
+            .iter()
+            .any(|w| w.contains("team-a") && w.contains("label")),
+        "{:?}",
+        doc.warnings
+    );
 }

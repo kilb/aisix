@@ -47,6 +47,9 @@ pub enum CredentialKind {
     /// No credential of its own (a route borrows a provider key's). URL:
     /// `target_url`.
     PassthroughRoute,
+    /// No credential of its own. URL: `resource_url`, which the gateway
+    /// publishes without its userinfo but stores as configured.
+    McpAuthSettings,
 }
 
 /// The URL fields of each kind, walked for a userinfo password.
@@ -57,6 +60,7 @@ const A2A_AGENT_URLS: &[&str] = &["url"];
 const OBSERVABILITY_EXPORTER_URLS: &[&str] = &["endpoint"];
 const OIDC_PROVIDER_URLS: &[&str] = &["issuer", "jwks_uri"];
 const PASSTHROUGH_ROUTE_URLS: &[&str] = &["target_url"];
+const MCP_AUTH_SETTINGS_URLS: &[&str] = &["resource_url"];
 
 /// Guardrail fields that hold a credential wherever they appear.
 const GUARDRAIL_SECRET_KEYS: &[&str] = &[
@@ -109,6 +113,7 @@ pub fn visit_credentials(
         CredentialKind::ObservabilityExporter => OBSERVABILITY_EXPORTER_URLS,
         CredentialKind::OidcProvider => OIDC_PROVIDER_URLS,
         CredentialKind::PassthroughRoute => PASSTHROUGH_ROUTE_URLS,
+        CredentialKind::McpAuthSettings => MCP_AUTH_SETTINGS_URLS,
     };
     for field in urls {
         url_password(doc, field, &sanitize(field), field, visit);
@@ -151,7 +156,7 @@ pub fn visit_credentials(
                 top_level(login, "client_secret", visit);
             }
         }
-        CredentialKind::PassthroughRoute => {}
+        CredentialKind::PassthroughRoute | CredentialKind::McpAuthSettings => {}
     }
 }
 
@@ -385,6 +390,11 @@ mod tests {
                 CredentialKind::PassthroughRoute,
                 json!({ "target_url": url }),
                 "TARGET_URL_PASSWORD",
+            ),
+            (
+                CredentialKind::McpAuthSettings,
+                json!({ "resource_url": url }),
+                "RESOURCE_URL_PASSWORD",
             ),
         ] {
             assert_eq!(

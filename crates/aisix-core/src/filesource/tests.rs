@@ -184,6 +184,11 @@ fn full_valid_file_loads_every_kind() {
     let ci_bot = snap.apikeys.get_by_name(&ci_bot_hash).unwrap();
     assert_eq!(ci_bot.value.jwt_subject.as_deref(), Some("agent-ci-bot"));
     assert_eq!(ci_bot.value.jwt_provider.as_deref(), Some("corp-keycloak"));
+    // The name the file keys the key by is also its label: the
+    // `${request.api_key.name}` template and the `api_key_name` metric
+    // label read it.
+    assert_eq!(ci_bot.value.display_name.as_deref(), Some("ci-bot"));
+    assert_eq!(ci_bot.value.telemetry_name(), Some("ci-bot"));
 
     // The claim mapping loads and its `resolve.api_key` name sugar
     // resolved to the ops key's derived id.
