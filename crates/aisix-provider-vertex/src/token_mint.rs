@@ -23,7 +23,7 @@
 
 use aisix_gateway::{credential_fingerprint, BridgeError};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -336,9 +336,14 @@ impl TokenMinter {
             // upstream failure (502 with cooldown semantics) rather
             // than `Config` (500, operator must fix). A flapping GCP
             // token endpoint should not look operator-actionable to
-            // the customer. 4xx (invalid_grant / bad SA / clock skew)
-            // IS operator-actionable, so it stays Config.
-            return Err(if status.is_server_error() {
+            // the customer. A 429 is transient too: Google's own auth
+            // client retries a token endpoint answer of 429 like a 5xx
+            // (google-auth `transport/__init__.py`
+            // `DEFAULT_RETRYABLE_STATUS_CODES`, read by
+            // `oauth2/_client.py` `_can_retry`). Every other 4xx
+            // (invalid_grant / bad SA / clock skew) IS
+            // operator-actionable, so it stays Config.
+            return Err(if status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS {
                 BridgeError::upstream_status_with_retry_after(status.as_u16(), msg, retry_after)
                     .with_body_read_error(read_error)
             } else {
@@ -635,6 +640,37 @@ mod tests {
                 assert!(message.contains("HTTP 503"));
                 assert!(message.contains("upstream OAuth backend transient failure"));
                 assert_eq!(retry_after, Some(std::time::Duration::from_secs(30)));
+            }
+            other => panic!("expected UpstreamStatus error, got {other:?}"),
+        }
+    }
+
+    /// A throttled token endpoint is transient, as Google's own auth
+    /// client treats it: a `429` reaches the cooldown layer with its hint
+    /// rather than reading as an operator's mistake.
+    #[tokio::test]
+    async fn token_endpoint_429_surfaces_as_upstream_status_with_retry_hint() {
+        let (private_pem, _) = test_key_pair();
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("Retry-After", "20")
+                    .set_body_string(r#"{"error":"rate_limit_exceeded"}"#),
+            )
+            .mount(&server)
+            .await;
+        let sa = sample_sa(&private_pem, &server.uri());
+        let minter = TokenMinter::new(Client::new()).with_token_endpoint_override(server.uri());
+        let err = minter.get_token(&sa).await.err().unwrap();
+        match err {
+            BridgeError::UpstreamStatus {
+                status,
+                retry_after,
+                ..
+            } => {
+                assert_eq!(status, 429);
+                assert_eq!(retry_after, Some(std::time::Duration::from_secs(20)));
             }
             other => panic!("expected UpstreamStatus error, got {other:?}"),
         }
