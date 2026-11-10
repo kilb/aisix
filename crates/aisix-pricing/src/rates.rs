@@ -463,8 +463,8 @@ impl RateCard {
     ///
     /// - every rate is at most `Rate::MAX`, however the card was built;
     /// - the card has a `default` tier, and every tier name is one a served
-    ///   tier can select: it matches `^[a-z0-9][a-z0-9_-]{0,31}$` and is not
-    ///   `standard`, an alias of `default`;
+    ///   tier can select: it matches `^[a-z0-9][a-z0-9_-]{0,31}$` and is
+    ///   neither `standard` nor `auto`, both aliases of `default`;
     /// - in each tier, band thresholds are above 0 and strictly increasing;
     /// - every band carries every optional rate its own tier's base carries;
     /// - every other tier has bands at exactly the default tier's
@@ -635,8 +635,9 @@ impl ServiceTier {
 
     /// The tier a row's rates come from. A batch row is `batch` whatever its
     /// upstream reports. Otherwise the served tier is lowercased first; then
-    /// absent, empty, `default` and `standard` are `default`, any other name
-    /// matching the pattern is itself, and anything else is `None`.
+    /// absent, empty, `default`, `standard` and `auto` are `default`, any
+    /// other name matching the pattern is itself, and anything else is
+    /// `None`.
     ///
     /// Upstreams report the tier they served in their own words: one names
     /// its standard tier `default` (`openai-python:
@@ -644,13 +645,22 @@ impl ServiceTier {
     /// `standard` (`anthropic-sdk-python: src/anthropic/types/usage.py`,
     /// `service_tier`); the gateway records the value verbatim (the
     /// `service_tier` field of `aisix_obs::UsageEvent`).
+    ///
+    /// `auto` is OpenAI's own request-side default — "the request will be
+    /// processed with the service tier configured in the Project settings.
+    /// Unless otherwise configured, the Project will use `default`"
+    /// (`openai-python`, `chat_completion.py`, the `service_tier` field). An
+    /// OpenAI-compatible upstream that echoes the request value back reports
+    /// it as the served tier, and it prices at `default`, which is what that
+    /// setting means; leaving it unselectable refused every such row
+    /// (`missing_tier_price`) instead of billing it.
     pub(crate) fn normalize(served: Option<&str>, is_batch: bool) -> Option<ServiceTier> {
         if is_batch {
             return Some(ServiceTier::batch());
         }
         let served = served.unwrap_or_default().to_ascii_lowercase();
         match served.as_str() {
-            "" | "default" | "standard" => Some(ServiceTier::default_tier()),
+            "" | "default" | "standard" | "auto" => Some(ServiceTier::default_tier()),
             name if is_tier_name(name) => Some(ServiceTier(served)),
             _ => None,
         }
@@ -691,7 +701,8 @@ pub enum RateCardError {
     NoDefaultTier,
     #[error(
         "service tier name {0:?} can never be selected: a name matches \
-         ^[a-z0-9][a-z0-9_-]{{0,31}}$, and `standard` is an alias of `default`"
+         ^[a-z0-9][a-z0-9_-]{{0,31}}$, and `standard` and `auto` are aliases \
+         of `default`"
     )]
     BadTierName(String),
     #[error("long-context band thresholds must strictly increase")]
@@ -1116,19 +1127,20 @@ mod tests {
 
     #[test]
     fn a_tier_spelled_as_a_default_alias_is_refused() {
-        // A served `standard` selects `default`, so a `standard` key could
-        // never be selected and its prices would be silently ignored.
-        let c = card(
-            r#"{"default":{"base":{"input":"1","output":"2"}},
-                "standard":{"base":{"input":"9","output":"9"}}}"#,
-        );
-        let err = c.validate().unwrap_err();
-        assert_eq!(err, RateCardError::BadTierName("standard".to_owned()));
-        assert!(
-            err.to_string()
-                .contains("`standard` is an alias of `default`"),
-            "{err}"
-        );
+        // A served `standard` or `auto` selects `default`, so such a key
+        // could never be selected and its prices would be silently ignored.
+        for alias in ["standard", "auto"] {
+            let c = card(&format!(
+                r#"{{"default":{{"base":{{"input":"1","output":"2"}}}},
+                    "{alias}":{{"base":{{"input":"9","output":"9"}}}}}}"#
+            ));
+            let err = c.validate().unwrap_err();
+            assert_eq!(err, RateCardError::BadTierName(alias.to_owned()));
+            assert!(
+                err.to_string().contains("are aliases of `default`"),
+                "{err}"
+            );
+        }
     }
 
     #[test]
@@ -1439,6 +1451,10 @@ mod tests {
         assert_eq!(n(None, false).as_deref(), Some("default"));
         assert_eq!(n(Some("standard"), false).as_deref(), Some("default"));
         assert_eq!(n(Some("STANDARD"), false).as_deref(), Some("default"));
+        // OpenAI's request-side default, echoed back by an OpenAI-compatible
+        // upstream as the served tier: the setting means `default`.
+        assert_eq!(n(Some("auto"), false).as_deref(), Some("default"));
+        assert_eq!(n(Some("AUTO"), false).as_deref(), Some("default"));
         assert_eq!(n(Some("FLEX"), false).as_deref(), Some("flex"));
         assert_eq!(n(Some("priority"), true).as_deref(), Some("batch"));
         assert_eq!(n(Some("not a tier!"), false), None);

@@ -1045,6 +1045,20 @@ mod tests {
     }
 
     #[test]
+    fn a_served_auto_tier_bills_default() {
+        // OpenAI's request-side default: "processed with the service tier
+        // configured in the Project settings. Unless otherwise configured,
+        // the Project will use 'default'". An OpenAI-compatible upstream
+        // that echoes the request value back reports it as the served tier,
+        // and the row is billed, not refused.
+        let p = price(r#"{"service_tier":"auto","prompt_tokens":1000,"completion_tokens":100}"#)
+            .expect("auto selects the default tier");
+        assert_eq!(p.charge, MicroCny(1200));
+        assert_eq!(p.service_tier.unwrap().as_str(), "default");
+        assert_eq!(p.warnings, Vec::new());
+    }
+
+    #[test]
     fn a_requested_tier_the_upstream_did_not_report_bills_default_and_says_so() {
         let p = price(r#"{"requested_service_tier":"flex","prompt_tokens":1000}"#).unwrap();
         assert_eq!(p.charge, MicroCny(1000));
