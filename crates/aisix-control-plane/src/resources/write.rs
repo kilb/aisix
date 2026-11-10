@@ -103,17 +103,46 @@ pub async fn write_resource(
             check_size(doc)?;
             let current = writable_row(conn, &w).await?;
             let doc = prepare(conn, ctx, &w, doc, &current.doc).await?;
-            Ok(store::update(conn, w.kind, w.id, w.expected_version, &doc).await?)
+            let position = keeps_position(w.kind, &current, Some(&doc));
+            Ok(store::update(conn, w.kind, w.id, w.expected_version, &doc, position).await?)
         }
         WriteOp::Delete => {
-            writable_row(conn, &w).await?;
+            let current = writable_row(conn, &w).await?;
             let (except, except_unowned) = non_holding_referrers(w.kind);
             let referrers = refs::incoming(conn, w.kind, w.id, except, except_unowned).await?;
             if !referrers.is_empty() {
                 return Err(ApiError::in_use(referrers));
             }
-            Ok(store::mark_deleted(conn, w.kind, w.id, w.expected_version).await?)
+            let position = keeps_position(w.kind, &current, None);
+            Ok(store::mark_deleted(conn, w.kind, w.id, w.expected_version, position).await?)
         }
+    }
+}
+
+/// Where a replace (`next` the document it writes) or a delete (`next`
+/// `None`) of `current` goes in the projection order.
+///
+/// A key's closure is ordered before what it guards goes: a suspension
+/// writes its keys disabled and only then deletes the tenant's limits
+/// policy, so a projector that stops between the two leaves no open key
+/// without the policy. A later write of the same key would move it behind
+/// that delete if it took the next place — a revoke while the tenant is
+/// suspended, or a grant change re-projecting it still disabled — and the
+/// closure the gateway has not received yet would then come after the
+/// policy's delete. So while the projector has not written a key's closed
+/// version, a write that keeps it closed (disabled, or deleted) keeps its
+/// place. A write that opens a key always takes the next place, after
+/// whatever the opening depends on. A closed key reaches nothing, so a
+/// reference its document names that is written later cannot be followed
+/// before it is there.
+fn keeps_position(kind: Kind, current: &ResourceRow, next: Option<&Value>) -> store::Position {
+    let closed = |doc: &Value| doc.get("disabled").and_then(Value::as_bool) == Some(true);
+    let queued = current.projected_version != Some(current.version);
+    let still_closed = next.is_none_or(closed);
+    if kind == Kind::ApiKeys && queued && closed(&current.doc) && still_closed {
+        store::Position::Kept
+    } else {
+        store::Position::Next
     }
 }
 

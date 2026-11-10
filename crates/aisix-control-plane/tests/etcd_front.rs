@@ -2260,3 +2260,48 @@ async fn the_projectors_claim_key_is_not_readable_by_a_gateway() {
     );
     assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
 }
+
+/// kine keeps every watch a call creates for as long as the call lasts, so
+/// the caps on calls bound the watches only while a call creates one. A
+/// second create inside the gateway's own key space, by a credential that
+/// still admits it, ends the call `ResourceExhausted`; a new call on the
+/// same connection still watches.
+#[tokio::test]
+async fn a_second_create_on_one_watch_call_ends_it() {
+    let Some(t) = Fixture::start().await else {
+        return;
+    };
+    let env = t.env();
+    let (conn, _gone) = one_connection(&t.cp, &t.bundle).await;
+    let (requests, mut responses) = raw_watch(conn.clone(), &env).await;
+    requests
+        .send(create(&format!("{env}models/")))
+        .await
+        .expect("send a second create");
+    let status = ending(&mut responses, Duration::from_secs(5))
+        .await
+        .expect_err("refused");
+    assert_eq!(status.code(), Code::ResourceExhausted, "{status:?}");
+    assert_eq!(status.message(), "etcdserver: one watch per call");
+
+    // A new call watches, and sees a write.
+    let (_requests, mut responses) = raw_watch(conn, &env).await;
+    t.put(&format!("{env}models/one-call-7c1"), "one-call-7c1")
+        .await;
+    let answer = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let r = responses
+                .message()
+                .await
+                .expect("the watch is open")
+                .expect("an answer");
+            if !r.events.is_empty() {
+                return r;
+            }
+        }
+    })
+    .await
+    .expect("an event within 5 s");
+    let key = answer.events[0].kv.as_ref().expect("a kv").key.clone();
+    assert_eq!(key, format!("{env}models/one-call-7c1").into_bytes());
+}

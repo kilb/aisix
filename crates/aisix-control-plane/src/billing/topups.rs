@@ -36,6 +36,7 @@ use crate::auth::{MemberAuth, MemberRole, OperatorAuth, OperatorRole};
 use crate::db::DbError;
 use crate::error::{ApiError, Detail};
 use crate::http::ApiJson;
+use crate::members;
 use crate::resources::write::WriteCtx;
 use crate::tenants;
 use crate::usage::{page, page_limit, query_rejected};
@@ -341,8 +342,14 @@ pub async fn request(
         .tx(move |conn| {
             async move {
                 // The tenant's row serialises its requests, so the count
-                // below holds until this one is in.
-                tenants::lock(&mut *conn, auth.tenant_id).await?;
+                // below holds until this one is in; the caller is read again
+                // under it, so one demoted meanwhile files nothing.
+                let auth = members::current(
+                    &mut *conn,
+                    &auth,
+                    &[MemberRole::Owner, MemberRole::Admin, MemberRole::Billing],
+                )
+                .await?;
                 let pending: i64 = sqlx::query_scalar(
                     "SELECT count(*) FROM billing_topups_cny \
                      WHERE tenant_id = $1 AND status = 'pending'",

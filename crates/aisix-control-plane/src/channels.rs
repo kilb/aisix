@@ -38,14 +38,17 @@
 //!
 //! A channel edit is one transaction: every all-scope tenant's row
 //! ([`crate::tenants::lock_all_scope`]), the public model's row `FOR UPDATE`
-//! ([`lock_public`]), then [`write_resource`], which takes
-//! `RESOURCES_LOCK_KEY` itself. A tenant's row sits before a public model's,
-//! which sits before the resources lock, which is the documented order. The
-//! tenants' rows are taken because a public model that becomes callable is
-//! in every all-scope tenant's scope at once, and their key documents, which
-//! name the models by id, are rewritten in the same transaction
-//! ([`crate::keys::reproject_tenants`]). This module still never withdraws a
-//! grant: a selected tenant's list is an operator's.
+//! ([`lock_public`]), then `RESOURCES_LOCK_KEY`, taken before the account's
+//! document is read ([`regenerate`], [`put_channel`]), so an account's
+//! delete, which counts its channel rows under that lock, and its rename,
+//! which rewrites its direct documents under it ([`follow_account`]), each
+//! come wholly before or after the edit. A tenant's row sits before a public
+//! model's, which sits before the resources lock, which is the documented
+//! order. The tenants' rows are taken because a public model that becomes
+//! callable is in every all-scope tenant's scope at once, and their key
+//! documents, which name the models by id, are rewritten in the same
+//! transaction ([`crate::keys::reproject_tenants`]). This module still never
+//! withdraws a grant: a selected tenant's list is an operator's.
 //!
 //! A retire takes the tenants' rows, then the public model's, then takes the
 //! resources lock itself ([`refs::lock_resources`]) because its reference
@@ -552,6 +555,11 @@ pub async fn regenerate(
     if public.retired_at.is_some() {
         return Err(retired());
     }
+    // The accounts are read under the resources lock, which an account's
+    // own replace holds while it rewrites the direct documents naming it
+    // ([`follow_account`]): read before it, a renamed account's old name
+    // could be written after that rewrite committed.
+    refs::lock_resources(&mut *conn).await?;
     let channels: Vec<ChannelModelRow> = sqlx::query_as(&format!(
         "SELECT {CHANNEL_COLUMNS} FROM channel_models \
          WHERE public_model_id = $1 AND enabled \
@@ -580,9 +588,22 @@ pub async fn regenerate(
     }
 
     let owner = owner(public_model_id);
+    // The documents that already exist are rewritten before any is created,
+    // so a name a rewrite gives up (an account renamed before its direct
+    // documents followed it) is free by the time a new one takes it.
+    let mut existing = Vec::with_capacity(served.len());
+    for (channel, _, _) in &served {
+        let live = store::get(&mut *conn, Kind::Models, channel.direct_model_id)
+            .await?
+            .is_some_and(|row| !row.deleted);
+        existing.push(live);
+    }
+    let mut ordered: Vec<(bool, &(ChannelModelRow, String, String))> =
+        existing.into_iter().zip(served.iter()).collect();
+    ordered.sort_by_key(|(live, _)| !*live);
     // Direct documents first: the routing document names them by id, and a
     // reference must be live when the referrer is written.
-    for (channel, display_name, provider) in &served {
+    for (_, (channel, display_name, provider)) in ordered {
         crate::tenants::put(
             conn,
             ctx,
@@ -636,6 +657,67 @@ pub async fn regenerate(
     // later than the routing document it depends on. The tenants' rows are
     // held by the caller, before this public model's row.
     crate::keys::reproject_tenants(&mut *conn, ctx, all_scope).await
+}
+
+/// Rewrites the direct documents of account `provider_key_id`'s enabled
+/// channel models from its document as it now stands (`doc`), in the
+/// caller's transaction, after a replace of the account: a direct document
+/// carries the account's display name and provider ([`direct_doc`]), so one
+/// left as it was keeps the old name, and an account given that name later
+/// could not have its own direct document for the same public model. Only
+/// a live direct document is rewritten; which ones exist is
+/// [`regenerate`]'s to decide. A rewrite whose name another live model
+/// already has is `409 name_taken`, and the replace fails with it.
+///
+/// The caller has written the account, so it holds the resources lock, and
+/// [`regenerate`] reads accounts only under that lock: a regeneration that
+/// runs after this commits reads the new name, and one that ran before
+/// committed first, so the rows it wrote are rewritten here. No public
+/// model's row is taken, which would be after the resources lock: this
+/// changes no target and no channel row, only the documents' names.
+pub async fn follow_account(
+    conn: &mut PgConnection,
+    ctx: &WriteCtx,
+    provider_key_id: Uuid,
+    doc: &Value,
+) -> Result<(), ApiError> {
+    let text = |field: &str| {
+        doc.get(field)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let (display_name, provider) = (text("display_name"), text("provider"));
+    let channels: Vec<ChannelModelRow> = sqlx::query_as(&format!(
+        "SELECT {CHANNEL_COLUMNS} FROM channel_models \
+         WHERE provider_key_id = $1 AND enabled \
+           AND public_model_id IN (SELECT id FROM public_models WHERE retired_at IS NULL) \
+         ORDER BY public_model_id, direct_model_id"
+    ))
+    .bind(provider_key_id)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(DbError::from)?;
+    for channel in channels {
+        let public = read_public(&mut *conn, channel.public_model_id).await?;
+        let owner = owner(public.id);
+        let live = store::get(&mut *conn, Kind::Models, channel.direct_model_id)
+            .await?
+            .is_some_and(|row| !row.deleted && row.managed_by.as_deref() == Some(owner.as_str()));
+        if !live {
+            continue;
+        }
+        crate::tenants::put(
+            conn,
+            ctx,
+            Kind::Models,
+            channel.direct_model_id,
+            &direct_doc(&channel, &public, &display_name, &provider),
+            &owner,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// Refuses the delete of a provider key any channel model names, `409
@@ -1582,11 +1664,6 @@ pub async fn put_channel(
         .db
         .tx(move |conn| {
             async move {
-                let Some((display_name, provider)) =
-                    provider_key_of(&mut *conn, provider_key_id).await?
-                else {
-                    return Err(refused("/provider_key_id", "该上游账号不存在或已删除"));
-                };
                 // A channel edit can make a public model callable or
                 // uncallable, which changes what every all-scope tenant
                 // reaches: their rows are taken first, before the public
@@ -1596,6 +1673,17 @@ pub async fn put_channel(
                 if public.retired_at.is_some() {
                     return Err(retired());
                 }
+                // The account is read under the resources lock, which its
+                // delete holds across its own count of the account's channel
+                // rows: either the delete has committed and the account is
+                // gone here, or it waits for this row and then counts it. A
+                // row naming a deleted account is never written.
+                refs::lock_resources(&mut *conn).await?;
+                let Some((display_name, provider)) =
+                    provider_key_of(&mut *conn, provider_key_id).await?
+                else {
+                    return Err(refused("/provider_key_id", "该上游账号不存在或已删除"));
+                };
                 let existing: Option<ChannelModelRow> = sqlx::query_as(&format!(
                     "SELECT {CHANNEL_COLUMNS} FROM channel_models \
                      WHERE provider_key_id = $1 AND public_model_id = $2 FOR UPDATE"
@@ -1670,14 +1758,6 @@ pub async fn put_channel(
                 )
                 .await?;
                 regenerate(&mut *conn, &ctx, public_model_id, &all_scope).await?;
-                let warnings: Vec<&str> = if provider_key_of(&mut *conn, provider_key_id)
-                    .await?
-                    .is_none()
-                {
-                    vec!["provider_key_missing"]
-                } else {
-                    Vec::new()
-                };
                 Ok::<_, ApiError>(json!({
                     "public_model_id": row.public_model_id,
                     "public_model_name": public.name,
@@ -1686,7 +1766,7 @@ pub async fn put_channel(
                     "weight": row.weight,
                     "enabled": row.enabled,
                     "served": true,
-                    "warnings": warnings,
+                    "warnings": [],
                 }))
             }
             .boxed()

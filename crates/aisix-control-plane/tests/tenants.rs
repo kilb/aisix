@@ -2336,3 +2336,138 @@ async fn a_channel_edit_takes_its_all_scope_tenants_first() {
         "disabling the last account withdraws no grant"
     );
 }
+
+/// Every row the projector has yet to write, in the order it writes them
+/// (`projector::project_pending` reads `ORDER BY seq`): `(kind, id, what)`,
+/// `what` being `delete`, `closed` or `open`.
+async fn projection_order(cp: &TestCp) -> Vec<(String, String, &'static str)> {
+    let rows: Vec<(String, Uuid, bool, Option<bool>)> = sqlx::query_as(
+        "SELECT kind, id, deleted, (doc->>'disabled')::boolean FROM gw_resources \
+         WHERE projected_version IS DISTINCT FROM version ORDER BY seq",
+    )
+    .fetch_all(cp.db().pool())
+    .await
+    .expect("read the pending rows");
+    rows.into_iter()
+        .map(|(kind, id, deleted, disabled)| {
+            let what = match (deleted, disabled) {
+                (true, _) => "delete",
+                (false, Some(true)) => "closed",
+                _ => "open",
+            };
+            (kind, id.to_string(), what)
+        })
+        .collect()
+}
+
+/// Marks every row as projected, as a projector that has caught up leaves
+/// them.
+async fn all_projected(cp: &TestCp) {
+    sqlx::query("UPDATE gw_resources SET projected_version = version")
+        .execute(cp.db().pool())
+        .await
+        .expect("mark projected");
+}
+
+/// Where `(kind, id)` stands in `order`.
+fn place(order: &[(String, String, &'static str)], kind: &str, id: &str) -> usize {
+    order
+        .iter()
+        .position(|(k, i, _)| k == kind && i == id)
+        .unwrap_or_else(|| panic!("{kind}/{id} is not due: {order:?}"))
+}
+
+/// A suspension closes the keys before it deletes the limits policy, so a
+/// projector that stops between the two never leaves an open key without
+/// the policy. A later write of a closed key the projector has not written
+/// yet — a revoke, or an edit that leaves it disabled — keeps that order;
+/// a reactivation still opens the keys only after the policy is back.
+#[tokio::test]
+async fn a_key_closure_stays_ahead_of_the_policy_delete_it_guards() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = Admin::as_role(&cp, OperatorRole::Operator).await;
+    let id = id_of(&admin.create_tenant("closure-order-7c1").await);
+    let pid = limits_policy_id(&cp, &id)
+        .await
+        .expect("a policy id")
+        .to_string();
+    let mint = |label: &'static str| {
+        let (admin, id) = (&admin, &id);
+        async move {
+            let r = admin
+                .post(
+                    &format!("/admin/tenants/{id}/keys"),
+                    json!({"label": label}),
+                )
+                .await;
+            assert_eq!(r.status, 201, "{r:?}");
+            r.body["key"]["id"].as_str().expect("a key id").to_string()
+        }
+    };
+    let revoked = mint("closure-revoked").await;
+    let edited = mint("closure-edited").await;
+    let key_version = |key: String| {
+        let admin = &admin;
+        async move {
+            let r = admin.get(&format!("/admin/keys/{key}")).await;
+            assert_eq!(r.status, 200, "{r:?}");
+            format!("\"{}\"", r.body["version"].as_i64().expect("a version"))
+        }
+    };
+    all_projected(&cp).await;
+
+    let r = admin.act(&id, "suspend").await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let order = projection_order(&cp).await;
+    let policy = place(&order, "rate_limit_policies", &pid);
+    assert_eq!(order[policy].2, "delete", "{order:?}");
+    for key in [&revoked, &edited] {
+        let at = place(&order, "api_keys", key);
+        assert_eq!(order[at].2, "closed", "{order:?}");
+        assert!(at < policy, "{order:?}");
+    }
+
+    // While the closures are still due: one key is revoked, the other's
+    // document rewritten, still disabled.
+    let v = key_version(revoked.clone()).await;
+    let r = admin
+        .delete(&format!("/admin/keys/{revoked}"), Some(&v))
+        .await;
+    assert_eq!(r.status, 204, "{r:?}");
+    let v = key_version(edited.clone()).await;
+    let r = admin
+        .send(
+            "PATCH",
+            &format!("/admin/keys/{edited}"),
+            Some(&v),
+            Some(json!({"label": "closure-edited-again"})),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let order = projection_order(&cp).await;
+    let policy = place(&order, "rate_limit_policies", &pid);
+    let at = place(&order, "api_keys", &revoked);
+    assert_eq!(order[at].2, "delete", "{order:?}");
+    assert!(
+        at < policy,
+        "the revoke moved behind the policy's delete: {order:?}"
+    );
+    let at = place(&order, "api_keys", &edited);
+    assert_eq!(order[at].2, "closed", "{order:?}");
+    assert!(
+        at < policy,
+        "the edit moved behind the policy's delete: {order:?}"
+    );
+
+    // Reopening goes after what it depends on.
+    let r = admin.act(&id, "reactivate").await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let order = projection_order(&cp).await;
+    let policy = place(&order, "rate_limit_policies", &pid);
+    assert_eq!(order[policy].2, "open", "{order:?}");
+    let at = place(&order, "api_keys", &edited);
+    assert_eq!(order[at].2, "open", "{order:?}");
+    assert!(policy < at, "the key opened before its policy: {order:?}");
+}

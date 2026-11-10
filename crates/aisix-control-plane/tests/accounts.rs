@@ -1062,3 +1062,174 @@ async fn a_mutating_request_that_is_not_json_is_415_and_changes_nothing() {
     assert_eq!(r.status, 200, "{r:?}");
     assert_eq!(status().await, "active");
 }
+
+/// Whether operator `id` is disabled and their role, as stored.
+async fn stored_operator(cp: &TestCp, id: Uuid) -> (String, bool) {
+    sqlx::query_as("SELECT role, disabled FROM operators WHERE id = $1")
+        .bind(id)
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("read the operator")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_queued_change_of_a_disabled_admin_cannot_undo_the_disable() {
+    // B's request was authorised while B was still an enabled admin, and
+    // then queued behind A's disable of B. Once the disable commits, the
+    // queued change must not turn B back on.
+    let Some(cp) = TestCp::start_with(patient).await else {
+        return;
+    };
+    let cp = Arc::new(cp);
+    let a = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let b = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let holder = hold_audit_inserts(&cp).await;
+
+    let disable = tokio::spawn({
+        let (cp, a, id) = (cp.clone(), a.clone(), b.id);
+        async move { patch(&cp, &a, id, json!({"disabled": true})).await }
+    });
+    until_lock_waiters(&cp, 1).await;
+    let undo = tokio::spawn({
+        let (cp, b) = (cp.clone(), b.clone());
+        async move { patch(&cp, &b, b.id, json!({"disabled": false, "role": "admin"})).await }
+    });
+    until_lock_waiters(&cp, 2).await;
+    holder.rollback().await.expect("release audit_log");
+
+    let disable = disable.await.expect("join");
+    assert_eq!(disable.status, 200, "{disable:?}");
+    let undo = undo.await.expect("join");
+    assert_eq!(undo.status, 401, "{undo:?}");
+    assert_eq!(
+        stored_operator(&cp, b.id).await,
+        ("admin".to_string(), true)
+    );
+    assert_eq!(live_sessions_of(&cp, b.id).await, 0);
+    assert_eq!(cp.admin_login(&b.email, TEST_PASSWORD).await.status, 401);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_queued_change_of_a_demoted_admin_is_refused() {
+    // B, demoted while its requests waited, can neither create an admin nor
+    // promote another operator with the authority it no longer has.
+    let Some(cp) = TestCp::start_with(patient).await else {
+        return;
+    };
+    let cp = Arc::new(cp);
+    let a = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let b = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let c = cp.seed_operator(OperatorRole::Viewer).await;
+    let holder = hold_audit_inserts(&cp).await;
+
+    let demote = tokio::spawn({
+        let (cp, a, id) = (cp.clone(), a.clone(), b.id);
+        async move { patch(&cp, &a, id, json!({"role": "viewer"})).await }
+    });
+    until_lock_waiters(&cp, 1).await;
+    let email = fresh_email("queued-create-7c1");
+    let create = tokio::spawn({
+        let (cp, b, email) = (cp.clone(), b.clone(), email.clone());
+        async move {
+            cp.send(
+                "POST",
+                "/admin/operators",
+                Some(b.cookie()),
+                Some(json!({
+                    "email": email,
+                    "role": "admin",
+                    "password": "queued-create-password-1",
+                })),
+            )
+            .await
+        }
+    });
+    until_lock_waiters(&cp, 2).await;
+    let promote = tokio::spawn({
+        let (cp, b, id) = (cp.clone(), b.clone(), c.id);
+        async move { patch(&cp, &b, id, json!({"role": "admin"})).await }
+    });
+    until_lock_waiters(&cp, 3).await;
+    holder.rollback().await.expect("release audit_log");
+
+    let demote = demote.await.expect("join");
+    assert_eq!(demote.status, 200, "{demote:?}");
+    let create = create.await.expect("join");
+    assert_eq!(create.status, 403, "{create:?}");
+    let promote = promote.await.expect("join");
+    assert_eq!(promote.status, 403, "{promote:?}");
+    let created: i64 = sqlx::query_scalar("SELECT count(*) FROM operators WHERE email = $1")
+        .bind(&email)
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("count operators");
+    assert_eq!(created, 0);
+    assert_eq!(
+        stored_operator(&cp, c.id).await,
+        ("viewer".to_string(), false)
+    );
+    assert_eq!(
+        stored_operator(&cp, b.id).await,
+        ("viewer".to_string(), false)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn of_two_password_changes_from_one_password_the_second_is_refused() {
+    // Both changes verify the same current password before either writes.
+    // The first commits; the second's current password is no longer the
+    // account's, so it must neither replace the new password nor end the
+    // session the first change kept.
+    let Some(cp) = TestCp::start_with(patient).await else {
+        return;
+    };
+    let cp = Arc::new(cp);
+    let me = cp.seed_operator(OperatorRole::Viewer).await;
+    let first_session = cp.admin_login_as(&me).await;
+    let second_session = cp.admin_login_as(&me).await;
+    let holder = hold_audit_inserts(&cp).await;
+
+    let change = |session: &OperatorSession, new: &'static str| {
+        let (cp, cookie) = (cp.clone(), session.cookie().to_string());
+        tokio::spawn(async move {
+            cp.send(
+                "POST",
+                "/admin/password",
+                Some(&cookie),
+                Some(json!({"current_password": TEST_PASSWORD, "new_password": new})),
+            )
+            .await
+        })
+    };
+    let first = change(&first_session, "first-new-password-7c1");
+    until_lock_waiters(&cp, 1).await;
+    let second = change(&second_session, "second-new-password-7c1");
+    until_lock_waiters(&cp, 2).await;
+    holder.rollback().await.expect("release audit_log");
+
+    let first = first.await.expect("join");
+    assert_eq!(first.status, 204, "{first:?}");
+    let second = second.await.expect("join");
+    assert_eq!(second.status, 401, "{second:?}");
+    assert_eq!(second.body["code"], "invalid_credentials", "{second:?}");
+    assert_eq!(
+        cp.admin_login(&me.email, "second-new-password-7c1")
+            .await
+            .status,
+        401
+    );
+    let r = cp
+        .get_with_cookie("/admin/session", first_session.cookie())
+        .await;
+    assert_eq!(r.body["authed"], true, "{r:?}");
+    let r = cp
+        .get_with_cookie("/admin/session", second_session.cookie())
+        .await;
+    assert_eq!(r.body["authed"], false, "{r:?}");
+    assert_eq!(
+        cp.admin_login(&me.email, "first-new-password-7c1")
+            .await
+            .status,
+        200
+    );
+}

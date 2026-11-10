@@ -3,7 +3,10 @@
 //! Every write bumps `version`, takes the next `seq` and notifies
 //! `gw_resources_dirty`, which is what the projector follows. Only
 //! [`super::write::write_resource`] calls the writes here: it holds the
-//! resources lock, so `seq` order is commit order.
+//! resources lock, so `seq` order is commit order. The one exception is a
+//! write that keeps its row's place ([`Position::Kept`]): a key's closure
+//! the projector has not written yet, replaced by one that still closes
+//! it, keeps the place the closure was given.
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -186,6 +189,17 @@ async fn refusal(conn: &mut PgConnection, kind: Kind, id: Uuid) -> StoreError {
     }
 }
 
+/// Where a write puts its row in the projection order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Position {
+    /// After every row written so far: the next `seq`.
+    Next,
+    /// Where the row already is, its `seq` kept. Only for a write that
+    /// replaces a version the projector has not written yet with one that
+    /// closes as much (`write::keeps_position`).
+    Kept,
+}
+
 /// Replaces the live row's document, when it is at `expected_version` (any
 /// version when `None`). The owner is kept.
 pub async fn update(
@@ -194,10 +208,12 @@ pub async fn update(
     id: Uuid,
     expected_version: Option<i64>,
     doc: &Value,
+    position: Position,
 ) -> Result<ResourceRow, StoreError> {
     let raw: Option<RawRow> = sqlx::query_as(&format!(
         "UPDATE gw_resources SET doc = $3, identity = $4, version = version + 1, \
-           seq = nextval('gw_resources_seq'), updated_at = now() \
+           seq = CASE WHEN $6 THEN seq ELSE nextval('gw_resources_seq') END, \
+           updated_at = now() \
          WHERE kind = $1 AND id = $2 AND NOT deleted \
            AND ($5::bigint IS NULL OR version = $5) \
          RETURNING {COLUMNS}"
@@ -207,6 +223,7 @@ pub async fn update(
     .bind(doc)
     .bind(identity(kind, doc))
     .bind(expected_version)
+    .bind(position == Position::Kept)
     .fetch_optional(&mut *conn)
     .await?;
     let Some(raw) = raw else {
@@ -223,10 +240,12 @@ pub async fn mark_deleted(
     kind: Kind,
     id: Uuid,
     expected_version: Option<i64>,
+    position: Position,
 ) -> Result<ResourceRow, StoreError> {
     let raw: Option<RawRow> = sqlx::query_as(&format!(
         "UPDATE gw_resources SET deleted = true, version = version + 1, \
-           seq = nextval('gw_resources_seq'), updated_at = now() \
+           seq = CASE WHEN $4 THEN seq ELSE nextval('gw_resources_seq') END, \
+           updated_at = now() \
          WHERE kind = $1 AND id = $2 AND NOT deleted \
            AND ($3::bigint IS NULL OR version = $3) \
          RETURNING {COLUMNS}"
@@ -234,6 +253,7 @@ pub async fn mark_deleted(
     .bind(kind.segment())
     .bind(id)
     .bind(expected_version)
+    .bind(position == Position::Kept)
     .fetch_optional(&mut *conn)
     .await?;
     let Some(raw) = raw else {

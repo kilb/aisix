@@ -3792,3 +3792,440 @@ async fn a_public_model_cannot_route_by_least_cost() {
         json!({"strategy": "least_latency"})
     );
 }
+
+
+/// Backends of `cp`'s database waiting for a lock.
+async fn lock_waiters(cp: &TestCp) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM pg_stat_activity \
+         WHERE datname = current_database() AND wait_event_type = 'Lock'",
+    )
+    .fetch_one(cp.db().pool())
+    .await
+    .expect("read pg_stat_activity")
+}
+
+/// Returns once `n` backends wait for a lock; fails after 60 s.
+async fn until_lock_waiters(cp: &TestCp, n: i64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while lock_waiters(cp).await < n {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{n} lock waiters never appeared"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+/// A transaction that holds back every insert into `audit_log` until it
+/// ends: a change blocks on its audit row after doing everything else.
+async fn hold_audit_inserts(cp: &TestCp) -> sqlx::Transaction<'static, sqlx::Postgres> {
+    let mut holder = cp.db().pool().begin().await.expect("begin");
+    sqlx::query("LOCK TABLE audit_log IN SHARE MODE")
+        .execute(&mut *holder)
+        .await
+        .expect("hold audit_log");
+    holder
+}
+
+/// `DELETE /admin/resources/provider_keys/{key}` at its current version.
+async fn delete_provider_key(cp: &TestCp, who: &OperatorSession, key: Uuid) -> Resp {
+    let current = cp
+        .send(
+            "GET",
+            &format!("/admin/resources/provider_keys/{key}"),
+            Some(who.cookie()),
+            None,
+        )
+        .await;
+    let version = current.body["version"].as_i64().expect("a version");
+    send_conditional(
+        cp,
+        "DELETE",
+        &format!("/admin/resources/provider_keys/{key}"),
+        who.cookie(),
+        version,
+        None,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_disabled_mapping_written_while_its_account_is_deleted_is_refused() {
+    // The delete counts the account's channel rows and commits first; the
+    // channel edit read the account before that commit. Once the delete has
+    // committed, the edit must not leave a row naming an account that is
+    // gone.
+    let Some(cp) = TestCp::start_with(|cfg| cfg.db_lock_timeout_ms = 60_000).await else {
+        return;
+    };
+    let cp = std::sync::Arc::new(cp);
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let key = provider_key(&cp, &op, "acct-race-del-5d1").await;
+    let (id, _) = create_public(&cp, &op, "pub-race-del-8c1").await;
+    let holder = hold_audit_inserts(&cp).await;
+
+    let delete = tokio::spawn({
+        let (cp, op) = (cp.clone(), op.clone());
+        async move { delete_provider_key(&cp, &op, key).await }
+    });
+    until_lock_waiters(&cp, 1).await;
+    let put = tokio::spawn({
+        let (cp, op) = (cp.clone(), op.clone());
+        async move { put_channel(&cp, &op, key, id, json!({"enabled": false})).await }
+    });
+    until_lock_waiters(&cp, 2).await;
+    holder.rollback().await.expect("release audit_log");
+
+    let delete = delete.await.expect("join");
+    assert_eq!(delete.status, 200, "{delete:?}");
+    let put = put.await.expect("join");
+    assert_422_at(&put, "/provider_key_id");
+    assert_eq!(channel_rows(&cp, id).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_account_deleted_while_a_disabled_mapping_is_written_is_refused() {
+    // The channel edit writes its row first and commits; the delete was
+    // sent while the row was uncommitted. Once the row has committed, the
+    // delete must count it and refuse.
+    let Some(cp) = TestCp::start_with(|cfg| cfg.db_lock_timeout_ms = 60_000).await else {
+        return;
+    };
+    let cp = std::sync::Arc::new(cp);
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let key = provider_key(&cp, &op, "acct-race-put-5d1").await;
+    let (id, _) = create_public(&cp, &op, "pub-race-put-8c1").await;
+    let version = cp
+        .send(
+            "GET",
+            &format!("/admin/resources/provider_keys/{key}"),
+            Some(op.cookie()),
+            None,
+        )
+        .await
+        .body["version"]
+        .as_i64()
+        .expect("a version");
+    let holder = hold_audit_inserts(&cp).await;
+
+    let put = tokio::spawn({
+        let (cp, op) = (cp.clone(), op.clone());
+        async move { put_channel(&cp, &op, key, id, json!({"enabled": false})).await }
+    });
+    until_lock_waiters(&cp, 1).await;
+    let delete = tokio::spawn({
+        let (cp, cookie) = (cp.clone(), op.cookie().to_string());
+        async move {
+            send_conditional(
+                &cp,
+                "DELETE",
+                &format!("/admin/resources/provider_keys/{key}"),
+                &cookie,
+                version,
+                None,
+            )
+            .await
+        }
+    });
+    until_lock_waiters(&cp, 2).await;
+    holder.rollback().await.expect("release audit_log");
+
+    let put = put.await.expect("join");
+    assert_eq!(put.status, 200, "{put:?}");
+    let delete = delete.await.expect("join");
+    assert_eq!(
+        (delete.status, delete.body["code"].as_str()),
+        (409, Some("in_use")),
+        "{delete:?}"
+    );
+    assert!(is_live(&cp, Kind::ProviderKeys, key).await);
+    assert_eq!(channel_rows(&cp, id).await, 1);
+}
+
+/// `PUT /admin/resources/provider_keys/{key}` renaming the account to
+/// `name`, at its current version; the answer.
+async fn rename_account(cp: &TestCp, who: &OperatorSession, key: Uuid, name: &str) -> Resp {
+    let current = cp
+        .send(
+            "GET",
+            &format!("/admin/resources/provider_keys/{key}"),
+            Some(who.cookie()),
+            None,
+        )
+        .await;
+    assert_eq!(current.status, 200, "{current:?}");
+    let version = current.body["version"].as_i64().expect("a version");
+    let mut doc = current.body["doc"].clone();
+    doc["display_name"] = json!(name);
+    send_conditional(
+        cp,
+        "PUT",
+        &format!("/admin/resources/provider_keys/{key}"),
+        who.cookie(),
+        version,
+        Some(json!({"doc": doc})),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_renamed_accounts_direct_documents_follow_it_and_free_the_old_name() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let old_name = "acct-rename-old-5d1";
+    let new_name = "acct-rename-new-5d1";
+    let a = provider_key(&cp, &op, old_name).await;
+    let (id, _) = create_public(&cp, &op, "pub-rename-8c1").await;
+    let r = put_channel(&cp, &op, a, id, json!({})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let a_direct = direct_of(&cp, a, id).await;
+
+    let r = rename_account(&cp, &op, a, new_name).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let doc = live(&cp, Kind::Models, a_direct).await;
+    assert_eq!(
+        doc["display_name"],
+        json!(format!("pub-rename-8c1#{new_name}")),
+        "{doc}"
+    );
+
+    // Another account takes the name given up, and serves the same model
+    // ahead of the renamed one.
+    let b = provider_key(&cp, &op, old_name).await;
+    let r = put_channel(&cp, &op, b, id, json!({"priority": 10})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let b_direct = direct_of(&cp, b, id).await;
+    let doc = live(&cp, Kind::Models, b_direct).await;
+    assert_eq!(
+        doc["display_name"],
+        json!(format!("pub-rename-8c1#{old_name}")),
+        "{doc}"
+    );
+    assert!(is_live(&cp, Kind::Models, a_direct).await);
+}
+
+#[tokio::test]
+async fn a_regeneration_frees_the_name_a_stale_direct_document_holds_before_reusing_it() {
+    // A direct document renamed before this release still carries the old
+    // account name. The account that takes that name later, ordered ahead
+    // of the renamed one, must still be served: the regeneration rewrites
+    // the stale document before it creates the new one.
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let old_name = "acct-stale-old-5d1";
+    let new_name = "acct-stale-new-5d1";
+    let a = provider_key(&cp, &op, old_name).await;
+    let (id, _) = create_public(&cp, &op, "pub-stale-8c1").await;
+    let r = put_channel(&cp, &op, a, id, json!({})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let a_direct = direct_of(&cp, a, id).await;
+    let r = rename_account(&cp, &op, a, new_name).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    // What an older release left behind: the direct document kept the name.
+    sqlx::query(
+        "UPDATE gw_resources SET doc = jsonb_set(doc, '{display_name}', to_jsonb($2::text)), \
+           identity = $2 \
+         WHERE kind = 'models' AND id = $1",
+    )
+    .bind(a_direct)
+    .bind(format!("pub-stale-8c1#{old_name}"))
+    .execute(cp.db().pool())
+    .await
+    .expect("leave the stale name");
+
+    let b = provider_key(&cp, &op, old_name).await;
+    let r = put_channel(&cp, &op, b, id, json!({"priority": 10})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let doc = live(&cp, Kind::Models, a_direct).await;
+    assert_eq!(
+        doc["display_name"],
+        json!(format!("pub-stale-8c1#{new_name}")),
+        "{doc}"
+    );
+    let doc = live(&cp, Kind::Models, direct_of(&cp, b, id).await).await;
+    assert_eq!(
+        doc["display_name"],
+        json!(format!("pub-stale-8c1#{old_name}")),
+        "{doc}"
+    );
+}
+
+/// A tenant whose stored grants name nothing but the direct document of a
+/// channel removed since — the last one an older release let it hold — is
+/// still found by the next pass, which withdraws the grant and the key
+/// selection naming it: they reach nothing, and a key document naming the
+/// direct document could not be written again. Nothing is granted in its
+/// place.
+#[tokio::test]
+async fn a_grant_of_only_removed_channels_is_withdrawn_at_the_next_boot() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let account = provider_key(&cp, &op, "acct-dead-5e1").await;
+    let (public, _) = create_public(&cp, &op, "pub-dead-8c1").await;
+    let r = put_channel(&cp, &op, account, public, json!({})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let direct = direct_of(&cp, account, public).await;
+    let tenant = tenant_granted(&cp, &op, &[]).await;
+    let follows = new_key(&cp, &op, tenant).await;
+    let selecting = new_key(&cp, &op, tenant).await;
+    store_old_grants(&cp, &op, tenant, &[direct], &[(selecting, vec![direct])]).await;
+    assert_eq!(key_grants(&cp, follows).await, vec![direct]);
+
+    // The operator unticks the account's last channel of the model.
+    let r = cp
+        .send(
+            "DELETE",
+            &format!("/admin/provider-keys/{account}/channel-models/{public}"),
+            Some(op.cookie()),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(r.status, 204, "{r:?}");
+    assert!(!is_live(&cp, Kind::Models, direct).await);
+
+    let booted = cp.restart().await;
+    assert_eq!(grants(&booted, tenant).await, Vec::<Uuid>::new());
+    assert_eq!(selection(&booted, selecting).await, Some(vec![]));
+    for k in [follows, selecting] {
+        assert_eq!(key_grants(&booted, k).await, Vec::<Uuid>::new(), "{k}");
+    }
+    let rows = replacement_rows(&booted).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        rows[0].2,
+        json!({
+            "replaced": [],
+            "withdrawn": [direct],
+            "keys": [{"key_id": selecting, "replaced": [], "withdrawn": [direct]}],
+        })
+    );
+    // An ordinary edit re-projects the keys again.
+    let current = booted
+        .send(
+            "GET",
+            &format!("/admin/tenants/{tenant}"),
+            Some(op.cookie()),
+            None,
+        )
+        .await;
+    let version = current.body["version"].as_i64().expect("a version");
+    let r = send_conditional(
+        &booted,
+        "PATCH",
+        &format!("/admin/tenants/{tenant}"),
+        op.cookie(),
+        version,
+        Some(json!({"name": "dead-renamed-5e1"})),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{r:?}");
+}
+
+/// Writes `doc` as public model `id`'s routing document through
+/// `write_resource`, the way a control plane from before `0037` regenerates
+/// it on a channel edit; the outcome.
+async fn write_routing_doc(
+    cp: &TestCp,
+    id: Uuid,
+    doc: Value,
+) -> Result<(), aisix_control_plane::error::ApiError> {
+    use aisix_control_plane::resources::write::{write_resource, ResourceWrite, WriteOp};
+    let ctx = WriteCtx::of(cp.state());
+    cp.db()
+        .tx(move |conn| {
+            async move {
+                let owner = channels::owner(id);
+                write_resource(
+                    conn,
+                    &ctx,
+                    ResourceWrite {
+                        kind: Kind::Models,
+                        id,
+                        op: WriteOp::Replace(&doc),
+                        expected_version: None,
+                        managed_by: Some(&owner),
+                    },
+                )
+                .await?;
+                Ok::<_, aisix_control_plane::error::ApiError>(())
+            }
+            .boxed()
+        })
+        .await
+}
+
+/// A control plane from before `0037` regenerates a public model's routing
+/// document from its own columns: the default strategy over the targets,
+/// without the settings the operator stored since. On a model that stores
+/// settings that write is refused, so the gateway never routes the model as
+/// if they were not set; on one that stores none it is what every release
+/// writes, and still goes through. This release's own writes carry every
+/// setting, each with its stored value.
+#[tokio::test]
+async fn an_older_writer_cannot_drop_a_public_models_stored_routing() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let key = provider_key(&cp, &op, "acct-fence-8c1").await;
+    let (id, _) = create_public(&cp, &op, "pub-fence-8c1").await;
+    let r = put_channel(&cp, &op, key, id, json!({})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let direct = direct_of(&cp, key, id).await;
+    let targets = json!([{"model_id": direct.to_string(), "priority": 0, "weight": 1}]);
+    let older = json!({
+        "display_name": "pub-fence-8c1",
+        "routing": {"strategy": "round_robin", "targets": targets},
+    });
+
+    // Stored nothing: the older shape is today's, and it is written.
+    write_routing_doc(&cp, id, older.clone())
+        .await
+        .expect("the older shape of a model that stores nothing");
+
+    let settings = json!({
+        "strategy": "consistent_hash",
+        "retries": 0,
+        "hash_on": [{"type": "header", "name": "x-tenant"}, {"type": "header", "name": "x-user"}],
+    });
+    let r = patch_public(&cp, &op, id, json!({"routing": settings})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let saved = live(&cp, Kind::Models, id).await;
+
+    let refused = write_routing_doc(&cp, id, older.clone()).await;
+    assert!(refused.is_err(), "the older shape dropped the settings");
+    // A write keeping all but one setting, or one whose list is reordered,
+    // drops it too.
+    let mut without_zero = saved.clone();
+    without_zero["routing"]
+        .as_object_mut()
+        .expect("routing")
+        .remove("retries");
+    assert!(write_routing_doc(&cp, id, without_zero).await.is_err());
+    let mut reordered = saved.clone();
+    reordered["routing"]["hash_on"] = json!([
+        {"type": "header", "name": "x-user"},
+        {"type": "header", "name": "x-tenant"},
+    ]);
+    assert!(write_routing_doc(&cp, id, reordered).await.is_err());
+    assert_eq!(live(&cp, Kind::Models, id).await, saved);
+
+    // This release's channel edits and resets still write.
+    let r = put_channel(&cp, &op, key, id, json!({"priority": 4})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let doc = live(&cp, Kind::Models, id).await;
+    assert_eq!(doc["routing"]["retries"], 0, "{doc}");
+    assert_eq!(doc["routing"]["hash_on"], settings["hash_on"], "{doc}");
+    let r = patch_public(&cp, &op, id, json!({"routing": {}})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    write_routing_doc(&cp, id, older)
+        .await
+        .expect("the settings are gone, so the older shape is today's again");
+}

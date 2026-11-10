@@ -812,6 +812,15 @@ pub async fn session(
     Ok(Json(session_view(&mut conn, auth.id).await?))
 }
 
+/// `401 invalid_credentials`, "当前密码错误": the current password given is
+/// not the member's, or no longer is.
+fn wrong_current_password() -> ApiError {
+    ApiError {
+        message: "当前密码错误".to_string(),
+        ..ApiError::invalid_credentials()
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChangePassword {
@@ -821,7 +830,9 @@ pub struct ChangePassword {
 
 /// `POST /api/password`: the caller's own password, whatever the tenant's
 /// status. Every other session of the caller ends; the one making the
-/// change stays.
+/// change stays. Of two changes from the same current password, the one
+/// that commits second is refused as a wrong current password, so it cannot
+/// replace the first one's.
 pub async fn change_password(
     auth: MemberAuth,
     State(state): State<AppState>,
@@ -854,13 +865,10 @@ pub async fn change_password(
         .passwords
         .verify(stored.as_deref(), &req.current_password)
         .await?;
-    if !matched {
+    let (true, Some(verified)) = (matched, stored) else {
         state.portal.logins.note_failure(&auth.email);
-        return Err(ApiError {
-            message: "当前密码错误".to_string(),
-            ..ApiError::invalid_credentials()
-        });
-    }
+        return Err(wrong_current_password());
+    };
     state.portal.logins.clear(&auth.email);
     let hash = state.passwords.hash(&req.new_password).await?;
     let current = carried_token(&headers);
@@ -868,18 +876,34 @@ pub async fn change_password(
         .db
         .tx(move |conn| {
             async move {
+                // Only over the hash just verified: a change that committed
+                // since replaced the password this one was checked against,
+                // and its own session would otherwise be ended by a
+                // password that is no longer the member's.
                 let updated = sqlx::query(
                     "UPDATE members SET password_hash = $2 \
-                     WHERE id = $1 AND NOT disabled AND removed_at IS NULL",
+                     WHERE id = $1 AND password_hash = $3 AND NOT disabled AND removed_at IS NULL",
                 )
                 .bind(auth.id)
                 .bind(&hash)
+                .bind(&verified)
                 .execute(&mut *conn)
                 .await
                 .map_err(DbError::from)?
                 .rows_affected();
                 if updated == 0 {
-                    return Err(ApiError::unauthenticated());
+                    let live: Option<bool> = sqlx::query_scalar(
+                        "SELECT true FROM members \
+                         WHERE id = $1 AND NOT disabled AND removed_at IS NULL",
+                    )
+                    .bind(auth.id)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(DbError::from)?;
+                    return Err(match live {
+                        Some(_) => wrong_current_password(),
+                        None => ApiError::unauthenticated(),
+                    });
                 }
                 session::revoke_all(&mut *conn, Principal::Member(auth.id), current.as_deref())
                     .await?;
