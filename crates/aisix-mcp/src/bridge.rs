@@ -695,6 +695,18 @@ impl RmcpBridge {
                 );
             }
         }
+        // What the gateway itself sends is noted, so an upstream error that
+        // quotes it is scrubbed of it: the credential that won
+        // its slot, and the URL's userinfo, which goes out as a Basic
+        // credential. A forwarded header is the caller's own and a
+        // `Delegate` value is the caller's to begin with.
+        if let Some(token) = &auth_header {
+            aisix_gateway::note_sent_credential(token);
+        }
+        if let (McpAuth::ApiKey(key), false) = (&upstream.auth, claims(API_KEY_HEADER)) {
+            aisix_gateway::note_sent_credential(key);
+        }
+        aisix_gateway::note_url_userinfo(&upstream.url);
         for (name, value) in forwarded {
             custom.insert(name.clone(), value.clone());
         }
@@ -749,7 +761,7 @@ impl RmcpBridge {
                     // Bounded apart: rmcp's own text can fill the bound by itself.
                     let error = McpError::Connect(format!(
                         "{}{}",
-                        sanitize_error_message(&message),
+                        sanitize_error_message(&scrub_sent_credentials(&message)),
                         sanitize_error_message(&causes)
                     ));
                     // An upstream 401 is handed to `connect`, which decides
@@ -811,6 +823,34 @@ impl ConnectFailure {
 impl From<McpError> for ConnectFailure {
     fn from(error: McpError) -> Self {
         ConnectFailure::Other(error)
+    }
+}
+
+/// A failure's log text with every credential noted for this operation taken
+/// out, through the shared scrubber's exact-value pass
+/// (`aisix_gateway::scrub_upstream_error_bytes`). The text goes to the
+/// operator's log, never to the caller, so the operator's own addresses in it
+/// stay. Runs before [`sanitize_error_message`], whose truncation could
+/// otherwise cut a credential short of matching.
+fn scrub_sent_credentials(message: &str) -> String {
+    String::from_utf8_lossy(&aisix_gateway::scrub_upstream_error_bytes(
+        message.as_bytes(),
+    ))
+    .into_owned()
+}
+
+/// Every string in `value` through the shared scrubber
+/// (`aisix_gateway::scrub_upstream_error_text`), for an error relayed to the
+/// caller: the credentials noted for this operation and the infrastructure
+/// names an error can carry come out.
+fn scrub_strings(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => {
+            *text = aisix_gateway::scrub_upstream_error_text(text);
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(scrub_strings),
+        serde_json::Value::Object(map) => map.values_mut().for_each(scrub_strings),
+        _ => {}
     }
 }
 
@@ -881,7 +921,7 @@ fn service_error_message(error: &ServiceError) -> String {
         }
         _ => error.to_string(),
     };
-    sanitize_error_message(&message)
+    sanitize_error_message(&scrub_sent_credentials(&message))
 }
 
 /// Whether a failed `initialize` handshake was an upstream `401 Unauthorized`.
@@ -957,14 +997,53 @@ fn transport_error_is_unauthorized(error: &rmcp::transport::DynamicTransportErro
     }
 }
 
+/// Most `tools/list` pages read from one upstream. A server paginates at its
+/// own page size, so this is far past any real inventory; it stops one that
+/// keeps handing back a cursor from looping until the deadline.
+const MAX_TOOL_LIST_PAGES: usize = 100;
+
+/// Most tools kept from one upstream's `tools/list`, across its pages.
+const MAX_LISTED_TOOLS: usize = 10_000;
+
 #[async_trait]
 impl McpBridge for RmcpBridge {
+    /// Every page of the upstream's tool list, read under one deadline.
+    ///
+    /// `tools/list` is paginated: a result carrying `nextCursor` has more
+    /// tools behind it, fetched by sending the cursor back
+    /// (<https://modelcontextprotocol.io/specification/2025-11-25/server/utilities/pagination>).
+    /// The downstream list is one complete result, so the pages are joined
+    /// here; an upstream past [`MAX_TOOL_LIST_PAGES`] or [`MAX_LISTED_TOOLS`]
+    /// fails the list rather than serving part of it.
     async fn list_tools(&self) -> Result<Vec<McpTool>, McpError> {
-        let result = tokio::time::timeout(self.timeout, self.running.list_tools(None))
+        let list = async {
+            let mut tools = Vec::new();
+            let mut params = None;
+            for _ in 0..MAX_TOOL_LIST_PAGES {
+                let page = self
+                    .running
+                    .list_tools(params)
+                    .await
+                    .map_err(request_error)?;
+                tools.extend(page.tools.into_iter().map(into_mcp_tool));
+                if tools.len() > MAX_LISTED_TOOLS {
+                    return Err(McpError::Request(format!(
+                        "upstream tools/list returned more than {MAX_LISTED_TOOLS} tools"
+                    )));
+                }
+                let Some(cursor) = page.next_cursor else {
+                    return Ok(tools);
+                };
+                params =
+                    Some(rmcp::model::PaginatedRequestParams::default().with_cursor(Some(cursor)));
+            }
+            Err(McpError::Request(format!(
+                "upstream tools/list did not end within {MAX_TOOL_LIST_PAGES} pages"
+            )))
+        };
+        tokio::time::timeout(self.timeout, list)
             .await
             .map_err(|_| McpError::Request("upstream tools/list timed out".to_string()))?
-            .map_err(request_error)?;
-        Ok(result.tools.into_iter().map(into_mcp_tool).collect())
     }
 
     async fn call_tool(
@@ -1019,12 +1098,24 @@ impl McpBridge for RmcpBridge {
                 ))
             }
         };
-        let content = serde_json::to_value(&result.content)
+        let mut content = serde_json::to_value(&result.content)
             .map_err(|e| McpError::Request(format!("failed to encode tool result: {e}")))?;
+        let mut structured_content = result.structured_content;
+        let is_error = result.is_error.unwrap_or(false);
+        // A tool error is the upstream's own failure, relayed to the agent
+        // (MCP `isError`, <https://modelcontextprotocol.io/specification/2025-11-25/server/tools#error-handling>),
+        // so it passes the shared scrubber as an OpenAPI tool's non-2xx text
+        // does. A successful result is the tool's answer and is relayed as sent.
+        if is_error {
+            scrub_strings(&mut content);
+            if let Some(structured) = &mut structured_content {
+                scrub_strings(structured);
+            }
+        }
         Ok(McpToolResult {
             content,
-            structured_content: result.structured_content,
-            is_error: result.is_error.unwrap_or(false),
+            structured_content,
+            is_error,
         })
     }
 }
@@ -1249,20 +1340,33 @@ impl EphemeralBridge {
     }
 }
 
+/// Run one upstream operation in a scope of its own for the credentials it
+/// sends, so its errors are scrubbed of them: an operation may run on a
+/// session task outside the request's scope. Starts from what the calling
+/// request noted, when there is one.
+fn with_sent_credentials<F: std::future::Future>(
+    fut: F,
+) -> impl std::future::Future<Output = F::Output> {
+    aisix_gateway::response_tap::scope(aisix_gateway::response_tap::detached(), fut)
+}
+
 #[async_trait]
 impl McpBridge for EphemeralBridge {
     async fn list_tools(&self) -> Result<Vec<McpTool>, McpError> {
-        if let McpAuth::UserOAuth(auth) = &self.upstream.auth {
-            return self
-                .as_signed_in_user(auth, |bridge| {
-                    async move { bridge.list_tools().await }.boxed()
-                })
-                .await;
-        }
-        RmcpBridge::connect(&self.upstream)
-            .await?
-            .list_tools()
-            .await
+        with_sent_credentials(async {
+            if let McpAuth::UserOAuth(auth) = &self.upstream.auth {
+                return self
+                    .as_signed_in_user(auth, |bridge| {
+                        async move { bridge.list_tools().await }.boxed()
+                    })
+                    .await;
+            }
+            RmcpBridge::connect(&self.upstream)
+                .await?
+                .list_tools()
+                .await
+        })
+        .await
     }
 
     async fn call_tool(
@@ -1270,18 +1374,21 @@ impl McpBridge for EphemeralBridge {
         name: &str,
         arguments: serde_json::Value,
     ) -> Result<McpToolResult, McpError> {
-        if let McpAuth::UserOAuth(auth) = &self.upstream.auth {
-            return self
-                .as_signed_in_user(auth, |bridge| {
-                    let arguments = arguments.clone();
-                    async move { bridge.call_tool(name, arguments).await }.boxed()
-                })
-                .await;
-        }
-        RmcpBridge::connect(&self.upstream)
-            .await?
-            .call_tool(name, arguments)
-            .await
+        with_sent_credentials(async {
+            if let McpAuth::UserOAuth(auth) = &self.upstream.auth {
+                return self
+                    .as_signed_in_user(auth, |bridge| {
+                        let arguments = arguments.clone();
+                        async move { bridge.call_tool(name, arguments).await }.boxed()
+                    })
+                    .await;
+            }
+            RmcpBridge::connect(&self.upstream)
+                .await?
+                .call_tool(name, arguments)
+                .await
+        })
+        .await
     }
 
     async fn preflight_auth(&self) -> Result<(), McpError> {

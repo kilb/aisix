@@ -784,3 +784,244 @@ fn headers(pairs: &[(&str, &str)]) -> Vec<(http::HeaderName, http::HeaderValue)>
         })
         .collect()
 }
+
+/// How a [`PagedServer`] paginates its tools.
+#[derive(Clone, Copy)]
+enum Paging {
+    /// Three tools, one per page, chained by cursor.
+    ThreePages,
+    /// A cursor on every page, forever.
+    Endless,
+    /// The first page answers; the second never does.
+    StallsOnPageTwo,
+}
+
+/// A real MCP server that hands its tool list out a page at a time — the
+/// `nextCursor` contract of `tools/list`.
+#[derive(Clone)]
+struct PagedServer(Paging);
+
+impl ServerHandler for PagedServer {
+    async fn list_tools(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
+        let cursor = request.and_then(|r| r.cursor);
+        let page: usize = cursor.as_deref().map_or(1, |c| {
+            c.strip_prefix("page-")
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0)
+        });
+        if page == 0 {
+            return Err(ErrorData::invalid_params("unknown cursor", None));
+        }
+        if page >= 2 && matches!(self.0, Paging::StallsOnPageTwo) {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        }
+        let schema = serde_json::json!({ "type": "object" })
+            .as_object()
+            .expect("object")
+            .clone();
+        let tool = Tool::new(format!("tool_{page}"), "paged", schema);
+        let mut result = ListToolsResult::with_all_items(vec![tool]);
+        let last = matches!(self.0, Paging::ThreePages) && page == 3;
+        if !last {
+            result.next_cursor = Some(format!("page-{}", page + 1));
+        }
+        Ok(result)
+    }
+
+    fn get_info(&self) -> ServerConfig {
+        let mut info = ServerConfig::default();
+        info.capabilities = ServerCapabilities::builder().enable_tools().build();
+        info
+    }
+}
+
+async fn spawn_paged_server(paging: Paging) -> SocketAddr {
+    let service = StreamableHttpService::new(
+        move || Ok(PagedServer(paging)),
+        Arc::new(LocalSessionManager::default()),
+        StreamableHttpServerConfig::default(),
+    );
+    let app = axum::Router::new().nest_service("/mcp", service);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    addr
+}
+
+/// A tool on a later page of the upstream's list is listed: the bridge
+/// follows `nextCursor` to the end, through the per-operation bridge the
+/// gateway uses as well as a held session.
+#[tokio::test]
+async fn tools_list_follows_the_upstream_cursor_to_the_last_page() {
+    let addr = spawn_paged_server(Paging::ThreePages).await;
+    let upstream = McpUpstream::new(format!("http://{addr}/mcp"));
+
+    let held = RmcpBridge::connect(&upstream).await.expect("connect");
+    let names: Vec<_> = held
+        .list_tools()
+        .await
+        .expect("list tools")
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    assert_eq!(names, ["tool_1", "tool_2", "tool_3"]);
+
+    let ephemeral = EphemeralBridge::new(upstream);
+    let names: Vec<_> = ephemeral
+        .list_tools()
+        .await
+        .expect("list tools")
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    assert_eq!(names, ["tool_1", "tool_2", "tool_3"]);
+}
+
+/// An upstream whose cursor never ends fails the list once the page cap is
+/// reached, instead of looping until the deadline or serving part of it.
+#[tokio::test]
+async fn an_endless_cursor_fails_the_list_at_the_page_cap() {
+    let addr = spawn_paged_server(Paging::Endless).await;
+    let upstream = McpUpstream::new(format!("http://{addr}/mcp"));
+    let bridge = RmcpBridge::connect(&upstream).await.expect("connect");
+    let err = bridge
+        .list_tools()
+        .await
+        .expect_err("an endless list fails");
+    assert!(err.to_string().contains("pages"), "{err}");
+}
+
+/// A later page that never answers fails the list at the operation's one
+/// deadline, which covers every page.
+#[tokio::test]
+async fn a_stalled_later_page_fails_the_list_at_the_deadline() {
+    let addr = spawn_paged_server(Paging::StallsOnPageTwo).await;
+    let upstream = McpUpstream::new(format!("http://{addr}/mcp"))
+        .with_timeout(std::time::Duration::from_millis(500));
+    let bridge = RmcpBridge::connect(&upstream).await.expect("connect");
+    let started = std::time::Instant::now();
+    let err = bridge.list_tools().await.expect_err("a stalled list fails");
+    assert!(err.to_string().contains("timed out"), "{err}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+/// The gateway-held key a [`ReflectingServer`] quotes back.
+const REFLECTED_KEY: &str = "held-key-0123456789";
+
+/// A real MCP server that quotes the `x-api-key` it was sent: in a tool
+/// error (`isError`, text and structured content), in a protocol error, and
+/// in an ordinary result.
+#[derive(Clone, Default)]
+struct ReflectingServer;
+
+impl ServerHandler for ReflectingServer {
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
+        Ok(ListToolsResult::with_all_items(Vec::new()))
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        let saw = context
+            .extensions
+            .get::<http::request::Parts>()
+            .and_then(|parts| parts.headers.get("x-api-key"))
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        match request.name.as_ref() {
+            "fails" => {
+                let mut result =
+                    CallToolResult::error(vec![ContentBlock::text(format!("rejected key {saw}"))]);
+                result.structured_content =
+                    Some(serde_json::json!({ "detail": [format!("key={saw}")] }));
+                Ok(result.into())
+            }
+            "breaks" => Err(ErrorData::internal_error(
+                format!("backend refused {saw}"),
+                None,
+            )),
+            _ => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                "your key is {saw}"
+            ))])
+            .into()),
+        }
+    }
+
+    fn get_info(&self) -> ServerConfig {
+        let mut info = ServerConfig::default();
+        info.capabilities = ServerCapabilities::builder().enable_tools().build();
+        info
+    }
+}
+
+/// A native upstream that quotes the credential the gateway sent it does not
+/// hand it on through an error: not to the agent in a tool error's content,
+/// not to the operator log in a protocol error's text. The rest of the error
+/// stands, and a successful result is the tool's own answer, relayed as sent.
+#[tokio::test]
+async fn an_upstream_error_quoting_the_held_credential_is_scrubbed_of_it() {
+    let service = StreamableHttpService::new(
+        || Ok(ReflectingServer),
+        Arc::new(LocalSessionManager::default()),
+        StreamableHttpServerConfig::default(),
+    );
+    let app = axum::Router::new().nest_service("/mcp", service);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let bridge = EphemeralBridge::new(
+        McpUpstream::new(format!("http://{addr}/mcp")).with_api_key(REFLECTED_KEY),
+    );
+
+    let failed = bridge
+        .call_tool("fails", serde_json::Value::Null)
+        .await
+        .expect("a tool error is a result");
+    assert!(failed.is_error);
+    let text = failed.content[0]["text"].as_str().unwrap_or_default();
+    assert!(text.starts_with("rejected key"), "{text}");
+    assert!(!text.contains(REFLECTED_KEY), "{text}");
+    let structured = failed
+        .structured_content
+        .expect("structured content")
+        .to_string();
+    assert!(structured.contains("key="), "{structured}");
+    assert!(!structured.contains(REFLECTED_KEY), "{structured}");
+
+    let broken = bridge
+        .call_tool("breaks", serde_json::Value::Null)
+        .await
+        .expect_err("a protocol error fails the call")
+        .to_string();
+    assert!(broken.contains("backend refused"), "{broken}");
+    assert!(!broken.contains(REFLECTED_KEY), "{broken}");
+
+    let answered = bridge
+        .call_tool("answers", serde_json::Value::Null)
+        .await
+        .expect("an ordinary result");
+    assert!(!answered.is_error);
+    assert_eq!(
+        answered.content[0]["text"],
+        format!("your key is {REFLECTED_KEY}")
+    );
+}

@@ -1469,7 +1469,8 @@ async fn agent_card(
 
 /// Point every service URL the card advertises at the gateway.
 ///
-/// The top-level `url` is what a 0.3 caller reads. A 1.0 caller instead picks
+/// The top-level `url` is what a 0.3 caller reads; a 1.0 card has none, and
+/// none is added. A 1.0 caller instead picks
 /// its endpoint out of `supportedInterfaces` (`additionalInterfaces` on a 0.3
 /// card), so rewriting only the top level leaves it reading the upstream
 /// address off the card and calling the agent directly — no auth, no quota, no
@@ -1480,7 +1481,9 @@ async fn agent_card(
 /// now points somewhere that will reject the caller. That is the intended
 /// trade — failing loudly beats silently bypassing governance.
 fn rewrite_card_urls(card: &mut aisix_a2a::AgentCard, gateway_url: &str) {
-    card.url = gateway_url.to_string();
+    if let Some(url) = &mut card.url {
+        *url = gateway_url.to_string();
+    }
     for key in ["supportedInterfaces", "additionalInterfaces"] {
         let Some(serde_json::Value::Array(interfaces)) = card.rest.get_mut(key) else {
             continue;
@@ -3476,7 +3479,10 @@ mod tests {
             !served.contains("internal.upstream"),
             "no upstream address may survive anywhere in the served card:\n{served}"
         );
-        assert_eq!(card.url, "https://gw.example.com/a2a/billing");
+        assert_eq!(
+            card.url.as_deref(),
+            Some("https://gw.example.com/a2a/billing")
+        );
         for key in ["supportedInterfaces", "additionalInterfaces"] {
             for interface in card.rest[key].as_array().unwrap() {
                 assert_eq!(interface["url"], "https://gw.example.com/a2a/billing");
@@ -3487,6 +3493,32 @@ mod tests {
         assert_eq!(
             card.rest["supportedInterfaces"][1]["protocolBinding"],
             "GRPC"
+        );
+    }
+
+    #[test]
+    fn a_1_0_card_without_a_top_level_url_is_served_without_one() {
+        // A2A 1.0's AgentCard has no top-level `url`: its endpoints are the
+        // interfaces'. The rewrite points those at the gateway and adds no
+        // legacy field the agent never published.
+        let mut card: aisix_a2a::AgentCard = serde_json::from_str(
+            r#"{
+                "name": "Agent",
+                "supportedInterfaces": [
+                    {"url": "https://internal.upstream/a2a", "protocolBinding": "JSONRPC",
+                     "protocolVersion": "1.0"}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        rewrite_card_urls(&mut card, "https://gw.example.com/a2a/billing");
+
+        let served = serde_json::to_value(&card).unwrap();
+        assert!(served.get("url").is_none(), "{served}");
+        assert_eq!(
+            served["supportedInterfaces"][0]["url"],
+            "https://gw.example.com/a2a/billing"
         );
     }
 

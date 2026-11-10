@@ -922,3 +922,174 @@ async fn a_json_rpc_error_quoting_the_credential_reaches_the_caller_without_it()
     assert!(!message.contains("agentTok0123456789"), "{resp}");
     assert_eq!(resp["error"]["code"], -32001);
 }
+
+/// Serve `app` on an ephemeral loopback port.
+async fn serve(app: Router) -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    addr
+}
+
+/// A streaming call the agent refuses quotes the credential it was sent, in
+/// both shapes a refusal can take on a stream: the JSON answer at HTTP 200,
+/// and an `error` event on an opened SSE stream. Neither hands it to the
+/// caller, the rest of the error stands, and a `result` is left as sent.
+#[tokio::test]
+async fn a_streamed_json_rpc_error_quoting_the_credential_reaches_the_caller_without_it() {
+    use futures::StreamExt;
+
+    fn quoted(headers: &HeaderMap) -> String {
+        headers
+            .get("x-api-key")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string()
+    }
+    async fn json_refusal(headers: HeaderMap, Json(body): Json<Value>) -> Json<Value> {
+        Json(json!({
+            "jsonrpc": "2.0",
+            "id": body["id"],
+            "error": {"code": -32001, "message": format!("key rejected; saw {}", quoted(&headers)),
+                      "data": {"detail": [format!("x-api-key={}", quoted(&headers))]}},
+        }))
+    }
+    async fn sse_refusal(headers: HeaderMap) -> impl IntoResponse {
+        let saw = quoted(&headers);
+        let result = json!({"jsonrpc": "2.0", "id": "s", "result": {"kind": "status-update",
+                            "echo": saw}});
+        let error = json!({"jsonrpc": "2.0", "id": "s", "error": {"code": -32603,
+                           "message": format!("internal error; saw {saw}")}});
+        (
+            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+            format!("data: {result}\n\ndata: {error}\n\n"),
+        )
+    }
+    let addr = serve(
+        Router::new()
+            .route("/json/a2a", post(json_refusal))
+            .route("/sse/a2a", post(sse_refusal)),
+    )
+    .await;
+    const KEY: &str = "agentKey0123456789";
+
+    let collect = |path: &'static str| async move {
+        let bridge = HttpBridge::new(upstream(
+            format!("http://{addr}{path}"),
+            A2aAuth::ApiKey(KEY.into()),
+        ));
+        aisix_gateway::response_tap::scope(aisix_gateway::response_tap::detached(), async move {
+            bridge
+                .send_stream(&json!({"jsonrpc":"2.0","id":"s","method":"message/stream"}))
+                .await
+                .expect("stream opens")
+                .collect::<Vec<_>>()
+                .await
+        })
+        .await
+        .into_iter()
+        .map(|event| event.expect("every event parses"))
+        .collect::<Vec<_>>()
+    };
+
+    let json = collect("/json/a2a").await;
+    assert_eq!(json.len(), 1, "{json:?}");
+    let error = &json[0]["error"];
+    assert_eq!(error["code"], -32001);
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|m| m.starts_with("key rejected")),
+        "{error}"
+    );
+    assert!(!error.to_string().contains(KEY), "{error}");
+
+    let sse = collect("/sse/a2a").await;
+    assert_eq!(sse.len(), 2, "{sse:?}");
+    // The answer is the agent's own and passes as sent.
+    assert_eq!(sse[0]["result"]["echo"], KEY);
+    let error = &sse[1]["error"];
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|m| m.starts_with("internal error")),
+        "{error}"
+    );
+    assert!(!error.to_string().contains(KEY), "{error}");
+}
+
+/// The JSON answer to a streaming call is read within the call's opening
+/// deadline: an agent that sends its head and part of the body and then
+/// stalls fails the call once the deadline passes, instead of holding it open.
+#[tokio::test]
+async fn a_stalled_json_answer_to_a_streaming_call_fails_at_the_deadline() {
+    async fn stalled() -> impl IntoResponse {
+        let body = futures::stream::once(async {
+            Ok::<_, std::convert::Infallible>(b"{\"jsonrpc\":\"2.0\",".to_vec())
+        })
+        .chain(futures::stream::pending());
+        (
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            axum::body::Body::from_stream(body),
+        )
+    }
+    use futures::StreamExt as _;
+    let addr = serve(Router::new().route("/a2a", post(stalled))).await;
+    let mut up = upstream(format!("http://{addr}/a2a"), A2aAuth::None);
+    up.timeout = Duration::from_millis(300);
+    let bridge = HttpBridge::new(up);
+
+    let started = Instant::now();
+    let opened = tokio::time::timeout(
+        Duration::from_secs(10),
+        bridge.send_stream(&json!({"jsonrpc":"2.0","id":"s","method":"message/stream"})),
+    )
+    .await
+    .expect("the call must not outlive its deadline");
+    assert!(
+        matches!(&opened, Err(A2aError::Request(message)) if message.contains("timed out")),
+        "{:?}",
+        opened.as_ref().map(|_| "a stream")
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+/// An A2A 1.0 agent card has no top-level `url` (its endpoints are in
+/// `supportedInterfaces`), and discovery reads it like a 0.3 card that does.
+#[tokio::test]
+async fn discovers_a_1_0_card_without_a_top_level_url() {
+    async fn card() -> Json<Value> {
+        Json(json!({
+            "name": "Modern Agent",
+            "description": "A2A 1.0",
+            "version": "1.0.0",
+            "supportedInterfaces": [
+                {"url": "https://agent.example.com/a2a", "protocolBinding": "JSONRPC",
+                 "protocolVersion": "1.0"}
+            ],
+            "capabilities": {"streaming": true},
+            "defaultInputModes": ["text/plain"],
+            "defaultOutputModes": ["text/plain"],
+            "skills": [{"id": "s1", "name": "Skill", "description": "d", "tags": []}]
+        }))
+    }
+    let addr = serve(Router::new().route("/.well-known/agent-card.json", get(card))).await;
+    let bridge = HttpBridge::new(upstream(format!("http://{addr}/a2a"), A2aAuth::None));
+
+    let card = bridge
+        .fetch_agent_card()
+        .await
+        .expect("a 1.0 card is a card");
+    assert_eq!(card.name, "Modern Agent");
+    assert_eq!(card.url, None);
+    assert_eq!(
+        card.rest["supportedInterfaces"][0]["url"],
+        "https://agent.example.com/a2a"
+    );
+    // Re-serialized without a field the agent never published.
+    assert!(serde_json::to_value(&card).unwrap().get("url").is_none());
+}
