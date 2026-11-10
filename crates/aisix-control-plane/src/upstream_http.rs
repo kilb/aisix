@@ -337,8 +337,14 @@ pub async fn fetch_models(
         };
         // The answer's own status is read here and nowhere else: a non-2xx
         // becomes the fixed `502`, so no status the upstream chose reaches
-        // the caller. Its words do, scrubbed.
+        // the caller. Its words do, scrubbed. A `401` or `403` only picks the
+        // words around them: the account's key was refused, which is what an
+        // operator has to fix.
         if !response.status().is_success() {
+            let refused_key = matches!(
+                response.status(),
+                reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+            );
             let detail = match read_body(response).await {
                 Ok(body) => scrub_upstream_error_text(String::from_utf8_lossy(&body).trim()),
                 // A body too large to read carries no text to relay; say why
@@ -349,7 +355,12 @@ pub async fn fetch_models(
                     .map(|detail| detail.message.clone())
                     .unwrap_or(error.message),
             };
-            return Err(ApiError::upstream_bad_response(detail_capped(detail)));
+            let detail = detail_capped(detail);
+            return Err(if refused_key {
+                ApiError::upstream_auth_refused(detail)
+            } else {
+                ApiError::upstream_bad_response(detail)
+            });
         }
         let body = read_body(response).await?;
         parse(wire, &body)

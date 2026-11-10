@@ -164,6 +164,25 @@ impl ApiError {
         }
     }
 
+    /// The upstream refused the account's own credential on its model list:
+    /// a `401` or a `403`. Said in those words because the fix is the
+    /// account's key, not the network or the list; the detail is still the
+    /// upstream's own text after scrubbing, and the status stays this route's
+    /// fixed `502`, never the one the upstream chose.
+    pub fn upstream_auth_refused(detail: impl Into<String>) -> ApiError {
+        ApiError {
+            details: vec![Detail {
+                path: "/upstream".to_string(),
+                message: detail.into(),
+            }],
+            ..Self::new(
+                StatusCode::BAD_GATEWAY,
+                "upstream_auth_refused",
+                "上游拒绝了该账号的密钥，请检查密钥是否正确、是否仍然有效",
+            )
+        }
+    }
+
     /// A 409 with its own code, such as `name_taken`.
     pub fn conflict(code: &'static str, message: impl Into<String>) -> ApiError {
         Self::new(StatusCode::CONFLICT, code, message)
