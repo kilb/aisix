@@ -3793,7 +3793,6 @@ async fn a_public_model_cannot_route_by_least_cost() {
     );
 }
 
-
 /// Backends of `cp`'s database waiting for a lock.
 async fn lock_waiters(cp: &TestCp) -> i64 {
     sqlx::query_scalar(
