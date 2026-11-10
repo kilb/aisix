@@ -435,10 +435,17 @@ pub(crate) async fn all(conn: &mut PgConnection) -> Result<Vec<TenantRow>, ApiEr
 /// change. Without it a tenant could join between the census and the
 /// write and be rewritten by neither.
 ///
+/// A tenant's creation is a move onto `all` too (every customer starts
+/// there): [`create`] takes it exclusive as its first lock, since there is
+/// no tenant row yet.
+///
 /// The writer takes it before any tenant row, the move after its tenant's
 /// row, and neither order can close a wait cycle: a writer waits only on
 /// rows of tenants already on `all`, and a move waits for the fence only
-/// while its tenant is not.
+/// while its tenant is not. A create holds nothing a writer waits on while
+/// it waits for the fence, and takes only the default groups' rows and the
+/// resources lock after it, which no writer holds while it waits for the
+/// fence.
 pub const SCOPE_LOCK_KEY: i64 = 0x6169_7369_7863_7034;
 
 /// Locks every tenant on [`ModelScope::All`], in ascending id order, so a
@@ -566,6 +573,16 @@ async fn insert(
 /// The default groups are taken `FOR SHARE` ([`locked_defaults`]) before the
 /// tenant row names them, so a retire of one either commits first, and is
 /// then not copied, or waits for this create and counts the new tenant.
+///
+/// A customer starts on [`ModelScope::All`], so a create is a move onto
+/// `all` and takes [`SCOPE_LOCK_KEY`] exclusive first, before any other lock
+/// (there is no tenant row yet): a catalogue write that counted the
+/// all-scope tenants without this one has committed before the tenant
+/// exists, and one that starts later waits for this commit and counts it.
+/// Without it a key minted for the new tenant while such a write is in
+/// flight would miss the model the write makes callable, and the write
+/// would rewrite only the tenants it counted. A pending tenant is fenced
+/// too: it is approved, and its keys minted, outside the writer's census.
 pub async fn create(
     conn: &mut PgConnection,
     ctx: &WriteCtx,
@@ -574,6 +591,11 @@ pub async fn create(
     billing_mode: BillingMode,
     actor: Actor<'_>,
 ) -> Result<TenantRow, ApiError> {
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(SCOPE_LOCK_KEY)
+        .execute(&mut *conn)
+        .await
+        .map_err(DbError::from)?;
     let defaults = locked_defaults(&mut *conn).await?;
     let approved_by = match (status, actor) {
         (TenantStatus::Active, Actor::Operator(op)) => Some(op.id),

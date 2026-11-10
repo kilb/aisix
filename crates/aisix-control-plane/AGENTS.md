@@ -147,10 +147,14 @@ way.
   public model's `PATCH`, retire, delete and restore, a bulk apply) takes it shared
   before that count, ahead of every tenant row, and a tenant `PATCH` that
   moves a tenant onto `all` takes it exclusive right after the tenant's row
-  (and account), before the groups and the resources lock. No wait cycle
-  follows: a writer waits only on rows of tenants already on `all`, and a
-  move waits for the fence only while its tenant is not
+  (and account), before the groups and the resources lock. A tenant's
+  creation (`tenants::create`, operator and signup alike) is a move onto
+  `all`, since every customer starts there, and takes it exclusive as its
+  first lock. No wait cycle follows: a writer waits only on rows of tenants
+  already on `all`, a move waits for the fence only while its tenant is
+  not, and a create holds nothing while it waits
   (`a_tenant_moving_onto_all_while_a_model_becomes_callable_reaches_it`,
+  `a_tenant_created_while_a_model_becomes_callable_reaches_it`,
   `tests/tenant_model_scope.rs`). Nothing else takes it.
 - **A generated document's owner is `public:<public_model_id>`, and only
   `src/channels.rs` writes one.** The direct and routing documents a public
