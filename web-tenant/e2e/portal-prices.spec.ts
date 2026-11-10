@@ -279,3 +279,41 @@ test("基准价单列 1 小时缓存写时，价格页在缓存写下另列这�
   // The model without a one-hour rate in the same table keeps its five plain cells.
   await rowPrices(panel, "chat-price-3f7", RATE_A);
 });
+
+/**
+ * A baseline with no cache rates of its own bills cached tokens at its input
+ * rate, so the page shows that price in both cache columns and says it is
+ * the input price, rather than a dash a reader takes for "free" or "unknown".
+ */
+test("基准价没有缓存价时，价格页的缓存读写按输入价显示并注明", async ({ page }) => {
+  const card = { input: "2", output: "8" };
+  const account = (await stack.admin.get("/admin/resources/provider_keys")).items.find(
+    (k: { doc: { display_name?: string } }) => k.doc.display_name === "acct-price-3f7",
+  );
+  const model = await stack.admin.post("/admin/resources/models", {
+    doc: { display_name: "chat-nocache-3f7", provider: "openai", model_name: "gpt-4o-mini", provider_key_id: account.id },
+  });
+  await stack.admin.post("/admin/pricing/baselines", {
+    model_id: model.id,
+    effective_from: new Date(Date.now() - 4_000).toISOString(),
+    card: { default: { base: card } },
+    note: "价格页 e2e 的无缓存价 3f7",
+  });
+  const id = await activeOrg("Prices NoCache Org 6a1", "owner@prices-6a1.test", [GROUP_A.name]);
+  const current = await stack.admin.get(`/admin/tenants/${id}`);
+  await stack.admin.patch(`/admin/tenants/${id}`, { allowed_model_ids: [pricedModelId, model.id] }, current.version);
+
+  await login(page, "owner@prices-6a1.test");
+  await page.getByRole("tab", { name: "价格", exact: true }).click();
+  const panel = page.getByRole("tabpanel", { name: GROUP_A.display });
+  const input = yuanPerMillion(card.input, RATE_A, DISCOUNT_BPS);
+  await expect(panel.getByRole("row", { name: /chat-nocache-3f7/ }).getByRole("cell")).toHaveText([
+    "chat-nocache-3f7",
+    input,
+    yuanPerMillion(card.output, RATE_A, DISCOUNT_BPS),
+    `${input}同输入价`,
+    `${input}同输入价`,
+  ]);
+  // A model with its own cache rates keeps its plain cells.
+  await rowPrices(panel, "chat-price-3f7", RATE_A);
+});

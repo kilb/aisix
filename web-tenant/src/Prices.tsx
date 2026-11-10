@@ -83,6 +83,22 @@ export function Prices({ initialGroup }: { initialGroup: string | null }) {
   );
 }
 
+/**
+ * A cache read or write price. A model with no cache rate of its own is
+ * billed at its input rate for those tokens (the pricing engine's fallback,
+ * `Rates::rate_for`), so the cell shows that price and says so, rather than
+ * a dash that reads as "not charged" or "unknown".
+ */
+function CacheRate({ own, input }: { own: string | undefined; input: string }) {
+  if (own !== undefined) return <>{perMillion(own)}</>;
+  return (
+    <>
+      {perMillion(input)}
+      <span className="hint cell-note">同输入价</span>
+    </>
+  );
+}
+
 function PriceTable({ models }: { models: PricedModel[] }) {
   return (
     <DataTable label="模型单价">
@@ -105,9 +121,11 @@ function PriceTable({ models }: { models: PricedModel[] }) {
             </td>
             <td className="num">{perMillion(m.input_per_million)}</td>
             <td className="num">{perMillion(m.output_per_million)}</td>
-            <td className="num">{perMillion(m.cache_read_per_million)}</td>
             <td className="num">
-              {perMillion(m.cache_write_per_million)}
+              <CacheRate own={m.cache_read_per_million} input={m.input_per_million} />
+            </td>
+            <td className="num">
+              <CacheRate own={m.cache_write_per_million} input={m.input_per_million} />
               {/* A one-hour cache write billed at its own rate says so beneath the default write's. */}
               {m.cache_write_1h_per_million !== undefined && (
                 <span className="hint cell-note">1 小时缓存写 {perMillion(m.cache_write_1h_per_million)}</span>
