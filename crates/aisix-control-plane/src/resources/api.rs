@@ -294,6 +294,11 @@ pub async fn replace(
                 if kind == Kind::Models {
                     tenants::refuse_ungrantable_reshape(conn, id, &row.doc).await?;
                 }
+                // The direct documents of its channel models carry the
+                // account's name and provider, and follow them here.
+                if kind == Kind::ProviderKeys {
+                    crate::channels::follow_account(conn, &ctx, id, &row.doc).await?;
+                }
                 audit::record(
                     conn,
                     AuditEntry {
@@ -344,8 +349,13 @@ pub async fn delete(
                 // An account some channel model names is refused in the
                 // operator's terms, before the generic reference check: a
                 // channel row whose direct document is already gone would
-                // otherwise leave nothing to hold the delete.
+                // otherwise leave nothing to hold the delete. Counted under
+                // the resources lock, which a channel edit takes before it
+                // reads the account and writes its row, so a row written
+                // meanwhile is either counted or written after the account
+                // is gone, and then refused.
                 if kind == Kind::ProviderKeys {
+                    super::refs::lock_resources(&mut *conn).await?;
                     crate::channels::refuse_if_served(conn, id).await?;
                 }
                 let write = ResourceWrite {
