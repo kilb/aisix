@@ -56,8 +56,8 @@ pub use output::{
 pub use sink::{
     AliyunSlsSink, BatchUnit, CapturedContent, ChannelKey, DatadogSink, EventBatch,
     ExporterPipelines, IdempotencyMarker, IdempotencyScheme, ObservabilitySink, OrderingScope,
-    PipelineConfig, SinkAck, SinkCapabilities, SinkContent, SinkError, SinkHandle, SinkHealth,
-    SinkPipeline, SinkRecord, SinkResult, SinkStatsSnapshot, SCHEMA_VERSION,
+    PartialSuccess, PipelineConfig, SinkAck, SinkCapabilities, SinkContent, SinkError, SinkHandle,
+    SinkHealth, SinkPipeline, SinkRecord, SinkResult, SinkStatsSnapshot, SCHEMA_VERSION,
 };
 pub use trace::{
     parse_traceparent, screen_tracestate, RemoteTraceContext, RequestTraceBundle, SpanEmit,

@@ -172,7 +172,7 @@ impl ObservabilitySink for DatadogSink {
         }
 
         let retry_after = super::retry_after_of(status, resp.headers());
-        let body = resp.text().await.unwrap_or_default();
+        let body = super::read_body_prefix(resp, super::RESPONSE_BODY_LIMIT).await;
         let detail = parse_datadog_error(status, &body);
         // 408 / 429 / 5xx are retried; other 4xx (400 malformed / 401/403
         // auth / 413 too large) fail identically on retry.
@@ -496,6 +496,35 @@ mod tests {
 
     fn batch_of(records: Vec<SinkRecord>) -> EventBatch {
         EventBatch::new(records.into_iter().map(Arc::new).collect())
+    }
+
+    /// An error body that never ends is read only as far as the excerpt
+    /// needs, compressed or not, instead of being buffered whole first.
+    #[tokio::test]
+    async fn an_endless_error_body_is_read_only_as_far_as_its_excerpt() {
+        for gzip in [false, true] {
+            let base = crate::sink::endless_body::serve(gzip).await;
+            let sink = DatadogSink::new(
+                "datadog-test",
+                base.strip_prefix("http://").unwrap(),
+                "test-dd-api-key",
+                "aisix-ai-gateway",
+                &[],
+                "ai-gateway",
+                reqwest::Client::new(),
+            );
+            let batch = batch_of(vec![SinkRecord::metadata_only(UsageEvent::default())]);
+            let delivery = sink.append_batch(&batch, &IdempotencyMarker::None);
+            let err = tokio::time::timeout(std::time::Duration::from_secs(10), delivery)
+                .await
+                .unwrap_or_else(|_| panic!("gzip={gzip}: the error body was read to its end"))
+                .expect_err("a 500 fails the delivery")
+                .to_string();
+            assert!(
+                err.contains("HTTP 500") && err.contains("xxxxxxxx"),
+                "gzip={gzip}: {err}"
+            );
+        }
     }
 
     /// Datadog's GenAI output count includes reasoning counted beside the
