@@ -338,6 +338,34 @@ pub async fn session(
     })))
 }
 
+/// Takes [`OPERATORS_LOCK_KEY`] and checks the caller again under it, as an
+/// enabled admin: the request was authorised from a read made before the
+/// lock, and a demotion or a disable that committed meanwhile must not be
+/// undone by a change that was already queued behind it. `401` once the
+/// caller is disabled, as a fresh request of theirs is; `403` once they are
+/// no longer an admin.
+async fn lock_as_admin(conn: &mut PgConnection, auth: &OperatorAuth) -> Result<(), ApiError> {
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(OPERATORS_LOCK_KEY)
+        .execute(&mut *conn)
+        .await
+        .map_err(DbError::from)?;
+    let role: Option<String> =
+        sqlx::query_scalar("SELECT role FROM operators WHERE id = $1 AND NOT disabled")
+            .bind(auth.id)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(DbError::from)?;
+    let role: OperatorRole = role
+        .ok_or_else(ApiError::unauthenticated)?
+        .parse()
+        .map_err(ApiError::internal)?;
+    if role != OperatorRole::Admin {
+        return Err(ApiError::forbidden());
+    }
+    Ok(())
+}
+
 /// The operator `id`, or `404 not_found`.
 async fn load(conn: &mut PgConnection, id: Uuid) -> Result<OperatorRow, ApiError> {
     let raw: Option<RawOperatorRow> = sqlx::query_as(&format!(
@@ -350,6 +378,15 @@ async fn load(conn: &mut PgConnection, id: Uuid) -> Result<OperatorRow, ApiError
     OperatorRow::from_raw(raw.ok_or_else(ApiError::not_found)?)
 }
 
+/// `401 invalid_credentials`, "当前密码错误": the current password given is
+/// not the account's, or no longer is.
+fn wrong_current_password() -> ApiError {
+    ApiError {
+        message: "当前密码错误".to_string(),
+        ..ApiError::invalid_credentials()
+    }
+}
+
 #[derive(Deserialize)]
 pub struct ChangePassword {
     current_password: String,
@@ -357,7 +394,9 @@ pub struct ChangePassword {
 }
 
 /// `POST /admin/password`: the caller's own password. Every other session
-/// of the caller ends; the one making the change stays.
+/// of the caller ends; the one making the change stays. Of two changes from
+/// the same current password, the one that commits second is refused as a
+/// wrong current password, so it cannot replace the first one's.
 pub async fn change_password(
     auth: OperatorAuth,
     State(state): State<AppState>,
@@ -385,13 +424,10 @@ pub async fn change_password(
         .passwords
         .verify(stored.as_deref(), &req.current_password)
         .await?;
-    if !matched {
+    let (true, Some(verified)) = (matched, stored) else {
         state.operator_logins.note_failure(&auth.email);
-        return Err(ApiError {
-            message: "当前密码错误".to_string(),
-            ..ApiError::invalid_credentials()
-        });
-    }
+        return Err(wrong_current_password());
+    };
     state.operator_logins.clear(&auth.email);
     let hash = state.passwords.hash(&req.new_password).await?;
     let current = session::token_from_headers(&headers, ADMIN_COOKIE).map(str::to_string);
@@ -399,12 +435,34 @@ pub async fn change_password(
         .db
         .tx(move |conn| {
             async move {
-                sqlx::query("UPDATE operators SET password_hash = $2 WHERE id = $1")
+                // Only over the hash just verified: a change that committed
+                // since replaced the password this one was checked against,
+                // and its own session would otherwise be ended by a
+                // password that is no longer the account's.
+                let updated = sqlx::query(
+                    "UPDATE operators SET password_hash = $2 \
+                     WHERE id = $1 AND password_hash = $3 AND NOT disabled",
+                )
+                .bind(auth.id)
+                .bind(&hash)
+                .bind(&verified)
+                .execute(&mut *conn)
+                .await
+                .map_err(DbError::from)?
+                .rows_affected();
+                if updated == 0 {
+                    let enabled: Option<bool> = sqlx::query_scalar(
+                        "SELECT true FROM operators WHERE id = $1 AND NOT disabled",
+                    )
                     .bind(auth.id)
-                    .bind(&hash)
-                    .execute(&mut *conn)
+                    .fetch_optional(&mut *conn)
                     .await
                     .map_err(DbError::from)?;
+                    return Err(match enabled {
+                        Some(_) => wrong_current_password(),
+                        None => ApiError::unauthenticated(),
+                    });
+                }
                 session::revoke_all(&mut *conn, Principal::Operator(auth.id), current.as_deref())
                     .await?;
                 audit::record(
@@ -492,6 +550,9 @@ pub async fn create(
         .db
         .tx(move |conn| {
             async move {
+                // The hash above takes long enough for the caller to lose
+                // the role meanwhile.
+                lock_as_admin(&mut *conn, &auth).await?;
                 insert(conn, Actor::Operator(&auth), &new, &hash)
                     .await
                     .map_err(|e| {
@@ -518,7 +579,8 @@ pub struct UpdateOperator {
 
 /// `PATCH /admin/operators/{id}` → `200 Operator`. The last enabled admin
 /// cannot be demoted or disabled (`409 last_admin`); disabling an operator
-/// ends their sessions in the same transaction.
+/// ends their sessions in the same transaction. A caller demoted or
+/// disabled while the request waited is refused ([`lock_as_admin`]).
 pub async fn update(
     auth: OperatorAuth,
     State(state): State<AppState>,
@@ -535,11 +597,7 @@ pub async fn update(
         .db
         .tx(move |conn| {
             async move {
-                sqlx::query("SELECT pg_advisory_xact_lock($1)")
-                    .bind(OPERATORS_LOCK_KEY)
-                    .execute(&mut *conn)
-                    .await
-                    .map_err(DbError::from)?;
+                lock_as_admin(&mut *conn, &auth).await?;
                 let current = load(&mut *conn, id).await?;
                 let role = req.role.unwrap_or(current.role);
                 let disabled = req.disabled.unwrap_or(current.disabled);

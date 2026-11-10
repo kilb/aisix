@@ -2294,6 +2294,67 @@ async fn changing_ones_password_ends_ones_other_sessions() {
         .contains("changed-password-7c1"));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn of_two_password_changes_from_one_password_the_second_is_refused() {
+    // Both changes verify the same current password before either writes.
+    // The first commits; the second's current password is no longer the
+    // member's, so it must neither replace the new password nor end the
+    // session the first change kept.
+    let Some(cp) = TestCp::start_with(patient).await else {
+        return;
+    };
+    let cp = Arc::new(cp);
+    let tenant = cp.seed_tenant(TenantStatus::Active).await;
+    let m = cp.seed_member(tenant, MemberRole::Member).await;
+    let first_session = cp.member_login_as(&m).await;
+    let second_session = cp.member_login_as(&m).await;
+    let holder = hold_audit_inserts(&cp).await;
+
+    let change = |session: &MemberSession, new: &'static str| {
+        let (cp, cookie) = (cp.clone(), session.cookie().to_string());
+        tokio::spawn(async move {
+            cp.send(
+                "POST",
+                "/api/password",
+                Some(&cookie),
+                Some(json!({"current_password": TEST_PASSWORD, "new_password": new})),
+            )
+            .await
+        })
+    };
+    let first = change(&first_session, "first-new-password-7c1");
+    until_lock_waiters(&cp, 1).await;
+    let second = change(&second_session, "second-new-password-7c1");
+    until_lock_waiters(&cp, 2).await;
+    holder.rollback().await.expect("release audit_log");
+
+    let first = first.await.expect("join");
+    assert_eq!(first.status, 204, "{first:?}");
+    let second = second.await.expect("join");
+    assert_eq!(second.status, 401, "{second:?}");
+    assert_eq!(second.body["code"], "invalid_credentials", "{second:?}");
+    assert_eq!(
+        cp.member_login(&m.email, "second-new-password-7c1")
+            .await
+            .status,
+        401
+    );
+    let s = cp
+        .get_with_cookie("/api/session", first_session.cookie())
+        .await;
+    assert_eq!(s.body["authed"], true, "{s:?}");
+    let s = cp
+        .get_with_cookie("/api/session", second_session.cookie())
+        .await;
+    assert_eq!(s.body["authed"], false, "{s:?}");
+    assert_eq!(
+        cp.member_login(&m.email, "first-new-password-7c1")
+            .await
+            .status,
+        200
+    );
+}
+
 #[tokio::test]
 async fn an_operator_invites_into_a_tenant_and_disables_its_members() {
     let Some(cp) = TestCp::start_with(|cfg| {
