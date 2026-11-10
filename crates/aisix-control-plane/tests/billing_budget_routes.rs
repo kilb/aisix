@@ -953,3 +953,142 @@ async fn who_may_call_the_tenant_quota_routes() {
     let r = w.cp.send("GET", "/api/budgets", None, None).await;
     assert_eq!(r.status, 401, "{r:?}");
 }
+
+/// Backends of `cp`'s database that are waiting for a lock.
+async fn lock_waiters(cp: &TestCp) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM pg_stat_activity \
+         WHERE datname = current_database() AND wait_event_type = 'Lock'",
+    )
+    .fetch_one(cp.db().pool())
+    .await
+    .expect("read pg_stat_activity")
+}
+
+/// Returns once `n` backends wait for a lock.
+async fn until_lock_waiters(cp: &TestCp, n: i64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while lock_waiters(cp).await < n {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{n} lock waiters never appeared"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_quota_write_queued_behind_the_callers_demotion_is_judged_by_the_new_role() {
+    // An owner's three quota writes are authorised while it is an owner,
+    // then queue on the tenant behind another owner's demotion of it. Once
+    // the demotion commits, each is judged as the member it now is: none of
+    // them may touch the owners' level.
+    let Some(cp) = TestCp::start_with(|cfg| cfg.db_lock_timeout_ms = 120_000).await else {
+        return;
+    };
+    let cp = std::sync::Arc::new(cp);
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let tenant = seed_tenant(&cp, &op).await;
+    let demoted = cp.member_login_seeded(tenant, MemberRole::Owner).await;
+    let other_owner = cp.member_login_seeded(tenant, MemberRole::Owner).await;
+    let m = cp.member_login_seeded(tenant, MemberRole::Member).await;
+    let k_m = support::world::seed_key(&cp, &op, tenant, Some(m.id)).await;
+    let r = tsend(
+        &cp,
+        &demoted,
+        "POST",
+        "/api/budgets",
+        Some(quota("api_key", &k_m, "0.05")),
+    )
+    .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    let key_cap = format!("/api/budgets/{}", id(&r));
+    let r = tsend(
+        &cp,
+        &demoted,
+        "POST",
+        "/api/budgets",
+        Some(quota("member", m.id, "0.05")),
+    )
+    .await;
+    assert_eq!(r.status, 201, "{r:?}");
+    let member_cap = format!("/api/budgets/{}", id(&r));
+
+    let mut holder = cp.db().pool().begin().await.expect("begin");
+    sqlx::query("LOCK TABLE audit_log IN SHARE MODE")
+        .execute(&mut *holder)
+        .await
+        .expect("hold audit_log");
+    let demotion = tokio::spawn({
+        let (cp, by, id) = (cp.clone(), other_owner.clone(), demoted.id);
+        async move {
+            cp.send(
+                "PATCH",
+                &format!("/api/members/{id}"),
+                Some(by.cookie()),
+                Some(json!({"role": "member"})),
+            )
+            .await
+        }
+    });
+    until_lock_waiters(&cp, 1).await;
+    let queued = |method: &'static str, path: String, body: Option<Value>| {
+        let (cp, by) = (cp.clone(), demoted.clone());
+        tokio::spawn(async move { tsend(&cp, &by, method, &path, body).await })
+    };
+    let delete = queued("DELETE", key_cap.clone(), None);
+    until_lock_waiters(&cp, 2).await;
+    let update = queued("PATCH", member_cap.clone(), Some(json!({"limit_cny": "9"})));
+    until_lock_waiters(&cp, 3).await;
+    let create = queued(
+        "POST",
+        "/api/budgets".to_string(),
+        Some(quota("member", demoted.id, "9")),
+    );
+    until_lock_waiters(&cp, 4).await;
+    // A member files no top-up either.
+    let topup = queued(
+        "POST",
+        "/api/billing/topups".to_string(),
+        Some(json!({"amount_cny": "10"})),
+    );
+    until_lock_waiters(&cp, 5).await;
+    holder.rollback().await.expect("release audit_log");
+
+    let demotion = demotion.await.expect("join");
+    assert_eq!(demotion.status, 200, "{demotion:?}");
+    // Quotas at a level a member does not see read as not found; a member
+    // quota is the owners' to set.
+    let delete = delete.await.expect("join");
+    assert_eq!(delete.status, 404, "{delete:?}");
+    let update = update.await.expect("join");
+    assert_eq!(update.status, 404, "{update:?}");
+    let create = create.await.expect("join");
+    assert_eq!(
+        (create.status, &create.body["code"]),
+        (403, &json!("budget_managed")),
+        "{create:?}"
+    );
+
+    let topup = topup.await.expect("join");
+    assert_eq!(topup.status, 403, "{topup:?}");
+    let topups: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM billing_topups_cny WHERE tenant_id = $1")
+            .bind(tenant)
+            .fetch_one(cp.db().pool())
+            .await
+            .expect("count top-ups");
+    assert_eq!(topups, 0);
+
+    let r = tsend(&cp, &other_owner, "GET", "/api/budgets", None).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let items = r.body["items"].as_array().expect("items");
+    assert_eq!(items.len(), 2, "{r:?}");
+    for item in items {
+        assert_eq!(item["limit_micro_cny"], json!(50_000), "{item:?}");
+    }
+    for path in [&key_cap, &member_cap] {
+        let id = path.rsplit('/').next().expect("an id");
+        assert_eq!(live_docs(&cp, id).await, 1, "{path}");
+    }
+}

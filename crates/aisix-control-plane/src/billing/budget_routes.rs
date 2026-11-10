@@ -32,6 +32,7 @@ use crate::auth::{MemberAuth, MemberRole, OperatorAuth, OperatorRole};
 use crate::db::DbError;
 use crate::error::{ApiError, Detail};
 use crate::http::ApiJson;
+use crate::members;
 use crate::resources::write::WriteCtx;
 use crate::tenants::{self, TenantRow};
 use crate::AppState;
@@ -492,8 +493,7 @@ pub async fn member_create(
     let (Some(scope), Some(scope_ref), true) = (scope, scope_ref, problems.is_empty()) else {
         return Err(ApiError::validation(problems));
     };
-    let by_member = auth.role == MemberRole::Member;
-    if by_member && scope == BudgetScope::Member {
+    if auth.role == MemberRole::Member && scope == BudgetScope::Member {
         return Err(ApiError::budget_managed());
     }
     let ctx = WriteCtx::of(&state);
@@ -502,6 +502,11 @@ pub async fn member_create(
         .tx(move |conn| {
             async move {
                 let (tenant, _) = tenants::lock_billing(&mut *conn, auth.tenant_id).await?;
+                let auth = members::current(&mut *conn, &auth, QUOTA_SETTERS).await?;
+                let by_member = auth.role == MemberRole::Member;
+                if by_member && scope == BudgetScope::Member {
+                    return Err(ApiError::budget_managed());
+                }
                 if by_member {
                     // A key that is not live and the tenant's reads as no
                     // key at all: the domain answers it at `/scope_ref`.
@@ -554,8 +559,13 @@ pub async fn member_create(
     Ok((StatusCode::CREATED, Json(api(&row, spent, now, &found))))
 }
 
+/// The member roles that set quotas on `/api/budgets`.
+const QUOTA_SETTERS: &[MemberRole] = &[MemberRole::Owner, MemberRole::Admin, MemberRole::Member];
+
 /// The quota `bid` of the caller's tenant that `auth` may edit, behind the
-/// billing lock: `404` for another tenant's, a deleted one, or (for a
+/// billing lock, `auth` being the caller as read under that lock
+/// ([`members::current`]: a caller demoted while the request waited is
+/// judged by the role it has now): `404` for another tenant's, a deleted one, or (for a
 /// member) one at a level it does not see; `403 budget_managed` for one set
 /// at a level above the caller's.
 async fn editable_row(
@@ -606,6 +616,7 @@ pub async fn member_update(
         .tx(move |conn| {
             async move {
                 let (tenant, _) = tenants::lock_billing(&mut *conn, auth.tenant_id).await?;
+                let auth = members::current(&mut *conn, &auth, QUOTA_SETTERS).await?;
                 editable_row(&mut *conn, &auth, bid).await?;
                 let actor = Actor::Member {
                     id: auth.id,
@@ -645,6 +656,7 @@ pub async fn member_delete(
         .tx(move |conn| {
             async move {
                 let (tenant, _) = tenants::lock_billing(&mut *conn, auth.tenant_id).await?;
+                let auth = members::current(&mut *conn, &auth, QUOTA_SETTERS).await?;
                 editable_row(&mut *conn, &auth, bid).await?;
                 let actor = Actor::Member {
                     id: auth.id,
