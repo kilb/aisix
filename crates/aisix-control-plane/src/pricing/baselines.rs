@@ -131,15 +131,17 @@ fn undecodable(card: &Value, e: serde_path_to_error::Error<serde_json::Error>) -
     let leaf = (path != "/card")
         .then(|| card.pointer(&path["/card".len()..]))
         .flatten();
+    // A threshold is judged before any price: written as text it would
+    // otherwise read as a price that does not parse.
     let message = match leaf {
+        Some(_) if path.ends_with("/above_input_tokens") => {
+            "长上下文门槛应是正整数（输入 token 数）".to_string()
+        }
         Some(Value::String(text)) => match Rate::parse(text) {
             Err(RateCardError::RateTooLarge) => "价格超出上限".to_string(),
             Err(_) => "价格应是不小于 0 的美元数，最多 6 位小数".to_string(),
             Ok(_) => format!("价目卡不合法：{}", e.inner()),
         },
-        Some(_) if path.ends_with("/above_input_tokens") => {
-            "长上下文门槛应是正整数（输入 token 数）".to_string()
-        }
         Some(Value::Number(_)) => "价格应写成十进制字符串，例如 \"2.5\"".to_string(),
         _ => format!("价目卡不合法：{}", e.inner()),
     };

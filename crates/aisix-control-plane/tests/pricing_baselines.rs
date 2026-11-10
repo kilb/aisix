@@ -445,6 +445,45 @@ async fn a_manual_card_is_refused_at_the_field_that_breaks_it() {
     assert_eq!(body["revision"]["card"], card);
 }
 
+/// A long-context threshold that is no token count is refused at the
+/// threshold with the threshold's words, whatever it was written as: text
+/// (which reads like a price), a negative number or a fraction. Never a
+/// price's words, which would send the operator to fix an amount.
+#[tokio::test]
+async fn a_threshold_that_is_no_token_count_is_refused_in_its_own_words() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let m = model(&cp, &admin, "bl-threshold-4b8").await;
+    let now = db_now(&cp).await;
+    let version = pricing_version(&cp).await;
+    let two = json!({"input": "1", "output": "2"});
+    for above in [
+        json!("200k"),
+        json!("200000"),
+        json!("2.5"),
+        json!(-5),
+        json!(1.5),
+    ] {
+        let card = json!({"default": {"base": two, "long_context": [
+            {"above_input_tokens": above, "rates": two}]}});
+        let r = post(
+            &cp,
+            &admin,
+            json!({"model_id": m, "effective_from": now, "card": card, "note": "x"}),
+        )
+        .await;
+        assert_422_at(&r, "/card/default/long_context/0/above_input_tokens");
+        assert_eq!(
+            r.body["details"][0]["message"],
+            json!("长上下文门槛应是正整数（输入 token 数）"),
+            "{above}: {r:?}"
+        );
+    }
+    assert_eq!(pricing_version(&cp).await, version, "nothing was written");
+}
+
 #[tokio::test]
 async fn a_start_on_a_day_the_calendar_lacks_is_refused_and_writes_nothing() {
     let Some(cp) = TestCp::start().await else {
