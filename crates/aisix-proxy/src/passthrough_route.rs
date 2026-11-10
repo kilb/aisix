@@ -3862,6 +3862,28 @@ fn merge_usage(acc: &mut Option<PassthroughUsage>, report: PassthroughUsage) {
     }
 }
 
+/// Merge the usage and served tier one streamed frame reports into the row,
+/// the way the relay loop reads them from every frame it parses. For a
+/// frame a hold-back cap takes before that parse: the upstream already
+/// reported (and billed) those counters, whatever the cap does with the
+/// frame's content.
+fn observe_frame_usage(
+    protocol: PassthroughProtocol,
+    telemetry: &mut RouteTelemetry,
+    frame: &[u8],
+) {
+    let (_, usage, tier, labelled) = frame_parts_and_tier(protocol, telemetry.metering, frame);
+    if let Some(u) = labelled {
+        merge_usage(&mut telemetry.labelled_usage, u);
+    }
+    if tier.is_some() {
+        telemetry.service_tier = tier;
+    }
+    if let Some(u) = usage {
+        merge_usage(&mut telemetry.usage, u);
+    }
+}
+
 /// An OpenAI-shape `usage` object, read exactly as `/v1/chat/completions`
 /// reads it from an OpenAI-compatible upstream.
 ///
@@ -6460,7 +6482,7 @@ fn stream_response(
             for frame in splitter.push(&chunk) {
                 // Both completed and splitter-overflowed frames take the
                 // same raw-cap preflight below.
-                let _overflowed = frame.overflowed;
+                let overflowed = frame.overflowed;
                 let frame = frame.bytes;
                 if !fail_opened {
                     if let Some((max_buffer_bytes, on_exceeded_fail_open)) = policy.hold_cap() {
@@ -6468,6 +6490,13 @@ fn stream_response(
                         // The splitter marks an unterminated frame as overflowed,
                         // but a complete frame can be oversized as well.
                         if held_content.would_exceed_after(0, frame.len(), max_buffer_bytes) {
+                            // The cap decides what happens to the frame's
+                            // content, not to the counters it already
+                            // reported: a complete frame is read for them
+                            // before either exit takes it.
+                            if !overflowed {
+                                observe_frame_usage(protocol, &mut telemetry, &frame);
+                            }
                             if on_exceeded_fail_open {
                                 fail_opened = true;
                                 crate::guardrail_stream::release_output_buffer_unscanned(&chain);
@@ -6852,6 +6881,11 @@ fn stream_response(
                         .then_some(*on_exceeded_fail_open),
                     _ => None,
                 };
+                if tail_raw_cap_hit.is_some() {
+                    // As for a framed one: the cap takes the tail's content,
+                    // not the counters it reports when it is whole.
+                    observe_frame_usage(protocol, &mut telemetry, &rest);
+                }
                 match tail_raw_cap_hit {
                     Some(false) => {
                         tracing::warn!(
