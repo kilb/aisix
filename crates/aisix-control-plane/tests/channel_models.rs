@@ -3756,3 +3756,105 @@ async fn a_grant_of_only_removed_channels_is_withdrawn_at_the_next_boot() {
     .await;
     assert_eq!(r.status, 200, "{r:?}");
 }
+
+/// Writes `doc` as public model `id`'s routing document through
+/// `write_resource`, the way a control plane from before `0037` regenerates
+/// it on a channel edit; the outcome.
+async fn write_routing_doc(
+    cp: &TestCp,
+    id: Uuid,
+    doc: Value,
+) -> Result<(), aisix_control_plane::error::ApiError> {
+    use aisix_control_plane::resources::write::{write_resource, ResourceWrite, WriteOp};
+    let ctx = WriteCtx::of(cp.state());
+    cp.db()
+        .tx(move |conn| {
+            async move {
+                let owner = channels::owner(id);
+                write_resource(
+                    conn,
+                    &ctx,
+                    ResourceWrite {
+                        kind: Kind::Models,
+                        id,
+                        op: WriteOp::Replace(&doc),
+                        expected_version: None,
+                        managed_by: Some(&owner),
+                    },
+                )
+                .await?;
+                Ok::<_, aisix_control_plane::error::ApiError>(())
+            }
+            .boxed()
+        })
+        .await
+}
+
+/// A control plane from before `0037` regenerates a public model's routing
+/// document from its own columns: the default strategy over the targets,
+/// without the settings the operator stored since. On a model that stores
+/// settings that write is refused, so the gateway never routes the model as
+/// if they were not set; on one that stores none it is what every release
+/// writes, and still goes through. This release's own writes carry every
+/// setting, each with its stored value.
+#[tokio::test]
+async fn an_older_writer_cannot_drop_a_public_models_stored_routing() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let key = provider_key(&cp, &op, "acct-fence-8c1").await;
+    let (id, _) = create_public(&cp, &op, "pub-fence-8c1").await;
+    let r = put_channel(&cp, &op, key, id, json!({})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let direct = direct_of(&cp, key, id).await;
+    let targets = json!([{"model_id": direct.to_string(), "priority": 0, "weight": 1}]);
+    let older = json!({
+        "display_name": "pub-fence-8c1",
+        "routing": {"strategy": "round_robin", "targets": targets},
+    });
+
+    // Stored nothing: the older shape is today's, and it is written.
+    write_routing_doc(&cp, id, older.clone())
+        .await
+        .expect("the older shape of a model that stores nothing");
+
+    let settings = json!({
+        "strategy": "consistent_hash",
+        "retries": 0,
+        "hash_on": [{"type": "header", "name": "x-tenant"}, {"type": "header", "name": "x-user"}],
+    });
+    let r = patch_public(&cp, &op, id, json!({"routing": settings})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let saved = live(&cp, Kind::Models, id).await;
+
+    let refused = write_routing_doc(&cp, id, older.clone()).await;
+    assert!(refused.is_err(), "the older shape dropped the settings");
+    // A write keeping all but one setting, or one whose list is reordered,
+    // drops it too.
+    let mut without_zero = saved.clone();
+    without_zero["routing"]
+        .as_object_mut()
+        .expect("routing")
+        .remove("retries");
+    assert!(write_routing_doc(&cp, id, without_zero).await.is_err());
+    let mut reordered = saved.clone();
+    reordered["routing"]["hash_on"] = json!([
+        {"type": "header", "name": "x-user"},
+        {"type": "header", "name": "x-tenant"},
+    ]);
+    assert!(write_routing_doc(&cp, id, reordered).await.is_err());
+    assert_eq!(live(&cp, Kind::Models, id).await, saved);
+
+    // This release's channel edits and resets still write.
+    let r = put_channel(&cp, &op, key, id, json!({"priority": 4})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let doc = live(&cp, Kind::Models, id).await;
+    assert_eq!(doc["routing"]["retries"], 0, "{doc}");
+    assert_eq!(doc["routing"]["hash_on"], settings["hash_on"], "{doc}");
+    let r = patch_public(&cp, &op, id, json!({"routing": {}})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    write_routing_doc(&cp, id, older)
+        .await
+        .expect("the settings are gone, so the older shape is today's again");
+}
