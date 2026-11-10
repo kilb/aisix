@@ -21,7 +21,9 @@ import {
 // failed. The request's usage row bills the input the first call reported,
 // and the gateway does not send the answered text again: the failure ends
 // the request even with retries configured, rather than replaying the
-// prefix on every retry.
+// prefix on every retry. A caller that hangs up while a later text is still
+// in flight leaves a row that bills the texts already answered, as the
+// failure would have.
 
 const CALLER_PLAINTEXT = "sk-bedrock-titan-partial";
 const CALLER_KEY_HASH = createHash("sha256").update(CALLER_PLAINTEXT).digest("hex");
@@ -35,6 +37,8 @@ describe("Bedrock Titan: a later text fails after an earlier one was served", ()
   let bedrock: Server | undefined;
   let sls: MockSls | undefined;
   const received: string[] = [];
+  // Answers to "hangs", held open until the suite ends.
+  const held: import("node:http").ServerResponse[] = [];
   let etcdReachable = false;
 
   beforeAll(async () => {
@@ -50,6 +54,10 @@ describe("Bedrock Titan: a later text fails after an earlier one was served", ()
       req.on("end", () => {
         const text = JSON.parse(raw || "{}").inputText as string;
         received.push(text);
+        if (text === "hangs") {
+          held.push(res);
+          return;
+        }
         if (text === "fails") {
           res.writeHead(503, {
             "content-type": "application/json",
@@ -102,6 +110,13 @@ describe("Bedrock Titan: a later text fails after an earlier one was served", ()
       provider_key_id: pk.id,
       retries: 2,
     });
+    await seed.createModel({
+      display_name: "titan-cancel",
+      provider: "bedrock",
+      model_name: "amazon.titan-embed-text-v1",
+      provider_key_id: pk.id,
+      cost: { input_per_1k: 1, output_per_1k: 1 },
+    });
     // Seeded last, so this key authenticating implies the whole seed set
     // has reached the gateway's snapshot.
     await seed.createApiKey({ key_hash: CALLER_KEY_HASH, allowed_models: ["*"] });
@@ -116,6 +131,7 @@ describe("Bedrock Titan: a later text fails after an earlier one was served", ()
 
   afterAll(async () => {
     await app?.exit();
+    for (const res of held) res.destroy();
     await sls?.close();
     await new Promise<void>((resolve) => (bedrock ? bedrock.close(() => resolve()) : resolve()));
   });
@@ -144,6 +160,36 @@ describe("Bedrock Titan: a later text fails after an earlier one was served", ()
     );
     expect(Number(row.get("status_code"))).toBe(res.status);
     expect(row.get("prompt_tokens")).toBe("4");
+  });
+
+  test("a caller that hangs up mid-array is billed the texts already served", async (ctx) => {
+    if (!etcdReachable || !app || !sls) return ctx.skip();
+    const before = received.length;
+    const controller = new AbortController();
+    const abandoned = fetch(`${app.proxyUrl}/v1/embeddings`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${CALLER_PLAINTEXT}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "titan-cancel", input: ["served", "served", "hangs"] }),
+      signal: controller.signal,
+    }).then((res) => res.text());
+    for (let i = 0; i < 400 && !received.slice(before).includes("hangs"); i++) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    // Two texts answered, the third is in flight when the caller leaves.
+    expect(received.slice(before)).toEqual(["served", "served", "hangs"]);
+    controller.abort();
+    await expect(abandoned).rejects.toThrow();
+
+    const row = await waitForSlsLog(
+      sls,
+      LOGSTORE,
+      (log) => log.get("requested_model") === "titan-cancel" && log.get("status_code") === "499",
+      "the 499 usage row of the abandoned request",
+    );
+    expect(row.get("error_class")).toBe("client_disconnected");
+    // AWS billed the two answered texts, 4 input tokens each.
+    expect(row.get("prompt_tokens")).toBe("8");
+    expect(Number(row.get("cost_usd") ?? "0")).toBeGreaterThan(0);
   });
 
   test("a failure at the first text bills nothing and keeps its retries", async (ctx) => {

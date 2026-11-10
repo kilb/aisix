@@ -124,6 +124,12 @@ pub(crate) struct InFlightAttempt {
     /// Messages and Responses output scan runs before their attempt
     /// settles). See [`crate::usage_attr::AnsweredUsage`].
     pub answered: Option<AnsweredAttempt>,
+    /// The input an attempt made of several upstream calls (one Titan
+    /// embedding per text) had been served when the caller hung up before
+    /// it ended ([`aisix_gateway::note_served_input_tokens`]). Read off the
+    /// request's response tap by [`RequestAttribution::take_cancel_context`];
+    /// `None` until then.
+    pub served_input_tokens: Option<u32>,
 }
 
 /// An attempt in flight that has answered: what its answer is billed, and
@@ -1027,8 +1033,16 @@ impl RequestAttribution {
     /// Move the cancel context out of the cell. Only the cancel guard calls
     /// this, once, from `Drop` — taking rather than cloning keeps the
     /// `Vec<AttemptRecord>` off every other read of this cell.
+    ///
+    /// The attempt still in flight takes what its answered upstream calls
+    /// were served so far: the bridge that makes them publishes it to the
+    /// request's response tap, the one place it can reach.
     pub(crate) fn take_cancel_context(&self) -> CancelContext {
-        std::mem::take(&mut self.lock().cancel)
+        let mut ctx = std::mem::take(&mut self.lock().cancel);
+        if let Some(attempt) = ctx.in_flight.as_mut() {
+            attempt.served_input_tokens = self.response_tap.served_input_tokens();
+        }
+        ctx
     }
 
     /// Whether this request still has a parked line — i.e. whether a
@@ -2469,6 +2483,7 @@ mod tests {
             model_id: format!("m-{index}"),
             started: Instant::now(),
             answered: None,
+            served_input_tokens: None,
         });
     }
 

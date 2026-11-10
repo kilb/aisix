@@ -1289,27 +1289,30 @@ impl Bridge for BedrockBridge {
                     send.await
                         .map_err(|e| crate::errors::sdk_error(e, started, deadline))
                 })
-                .await
-                .map_err(|e| titan_failed_after(i, prompt_tokens, e))?;
+                .await?;
                 let parsed: TitanEmbedResponse = serde_json::from_slice(resp.body().as_ref())
-                    .map_err(|e| {
-                        titan_failed_after(
-                            i,
-                            prompt_tokens,
-                            BridgeError::UpstreamDecode(e.to_string()),
-                        )
-                    })?;
+                    .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
                 if let Some(token_count) = parsed.input_text_token_count {
                     prompt_tokens += token_count;
                 } else {
                     usage_reported = false;
                 }
+                // Answered, and billed, whatever happens to the texts after
+                // it: noted at once, so a later text's failure, or the
+                // caller hanging up while it is in flight, still bills it
+                // (Titan takes one text per call,
+                // <https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters-titan-embed-text.html>).
+                aisix_gateway::note_served_input_tokens(
+                    prompt_tokens.min(u64::from(u32::MAX)) as u32
+                );
                 data.push(EmbeddingObject {
                     index: i as u32,
                     object: "embedding".to_string(),
                     embedding: EmbeddingVector::Float(parsed.embedding),
                 });
             }
+            // Every text answered: the response bills them, not the note.
+            let _ = aisix_gateway::take_served_input_tokens();
         } else if base_id.starts_with("cohere.embed") {
             // Borrows the texts rather than copying them into a `Value`:
             // the body is what the SDK holds for the whole upstream wait.
@@ -1400,18 +1403,6 @@ impl Bridge for BedrockBridge {
             },
         })
     }
-}
-
-/// `err`, for a Titan embedding that failed at text `index` after the texts
-/// before it had been answered, and billed: what they reported is noted for
-/// the attempt's row, which bills it, and so that the proxy does not send the
-/// answered texts again (Titan takes one text per call,
-/// <https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters-titan-embed-text.html>).
-fn titan_failed_after(index: usize, prompt_tokens: u64, err: BridgeError) -> BridgeError {
-    if index > 0 {
-        aisix_gateway::note_served_input_tokens(prompt_tokens.min(u64::from(u32::MAX)) as u32);
-    }
-    err
 }
 
 /// Titan embed response per the Amazon Titan Embeddings docs
@@ -8143,6 +8134,83 @@ mod tests {
         .await;
         assert_eq!(later, Some(4));
         assert_eq!(first, None);
+    }
+
+    /// The input of each answered text is noted the moment it answers, so a
+    /// caller that hangs up while a later text is in flight leaves it for the
+    /// cancel path to bill; a call whose every text answered leaves nothing,
+    /// since its response bills them.
+    #[tokio::test]
+    async fn titan_notes_each_answered_text_at_once_and_clears_on_success() {
+        use wiremock::matchers::{body_json, method as wm_method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::builder().start().await;
+        for text in ["a", "b"] {
+            Mock::given(wm_method("POST"))
+                .and(wm_path("/model/amazon.titan-embed-text-v1/invoke"))
+                .and(body_json(serde_json::json!({"inputText": text})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "embedding": [0.25, 0.5],
+                    "inputTextTokenCount": 4
+                })))
+                .mount(&server)
+                .await;
+        }
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/model/amazon.titan-embed-text-v1/invoke"))
+            .and(body_json(serde_json::json!({"inputText": "slow"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(30))
+                    .set_body_json(
+                        serde_json::json!({"embedding": [0.0], "inputTextTokenCount": 9}),
+                    ),
+            )
+            .mount(&server)
+            .await;
+
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("amazon.titan-embed-text-v1"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let embed = |input: Vec<&str>| EmbeddingRequest {
+            extra: Default::default(),
+            token_input: None,
+            model: "customer-facing-name".into(),
+            input: input.into_iter().map(str::to_string).collect(),
+            input_was_single: false,
+            encoding_format: None,
+            dimensions: None,
+            input_type: None,
+            embedding_types: None,
+        };
+        let tap = std::sync::Arc::new(aisix_gateway::ResponseHeaderTap::new(
+            Vec::new(),
+            false,
+            String::new(),
+        ));
+        aisix_gateway::response_tap::scope(tap.clone(), async {
+            let served = bridge.embed(&embed(vec!["a", "b"]), &ctx).await.unwrap();
+            assert_eq!(served.usage.prompt_tokens, 8);
+        })
+        .await;
+        assert_eq!(tap.served_input_tokens(), None);
+
+        // The caller leaves while the third text is in flight: the future is
+        // dropped, as axum drops a handler's.
+        let abandoned = aisix_gateway::response_tap::scope(
+            tap.clone(),
+            tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                bridge.embed(&embed(vec!["a", "b", "slow"]), &ctx),
+            ),
+        )
+        .await;
+        assert!(abandoned.is_err(), "the slow text answered: {abandoned:?}");
+        assert_eq!(tap.served_input_tokens(), Some(8));
     }
 
     #[tokio::test]
