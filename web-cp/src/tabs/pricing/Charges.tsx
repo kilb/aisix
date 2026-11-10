@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { TabProps } from "../../App";
-import { charges, resources, tenants as tenantsApi, type AdminKey, type Charge, type ChargeFilter, type Tenant } from "../../lib/api";
+import { charges, tenants as tenantsApi, type AdminKey, type Charge, type ChargeFilter, type Tenant } from "../../lib/api";
+import { chargeReason } from "../../lib/chargeReason";
 import { errorText } from "../../lib/fmt";
 import { fmtMicroCny, fmtUtc } from "../../lib/money";
-import { reasonLabel } from "../../lib/pricingStatus";
+import { modelText, reasonLabel, takeChargesFilter } from "../../lib/pricingStatus";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
 import { EmptyState } from "../../ui/EmptyState";
@@ -17,9 +18,12 @@ const STATUSES: [string, string][] = [
 
 const statusLabel = (s: string) => STATUSES.find(([v]) => v === s)?.[1] ?? s;
 
-/** 计费明细: every charge with its pricing reason, filterable and paged. */
+/**
+ * 计费明细: every charge with its pricing reason, filterable and paged. A link
+ * from 计价状态 opens it on that kind's calls (its status, reason and model).
+ */
 export function Charges(_props: TabProps) {
-  const [filter, setFilter] = useState<ChargeFilter>({});
+  const [filter, setFilter] = useState<ChargeFilter>(() => takeChargesFilter() ?? {});
   const [eventDraft, setEventDraft] = useState("");
   const [rows, setRows] = useState<Charge[] | null>(null);
   const [next, setNext] = useState<number | null>(null);
@@ -27,7 +31,6 @@ export function Charges(_props: TabProps) {
   const [loadingMore, setLoadingMore] = useState(false);
   const [tenants, setTenants] = useState<Tenant[]>([]);
   const [keys, setKeys] = useState<AdminKey[]>([]);
-  const [models, setModels] = useState<Record<string, string>>({});
   const generation = useRef(0);
 
   const loadFirst = useCallback(async (f: ChargeFilter) => {
@@ -50,10 +53,6 @@ export function Charges(_props: TabProps) {
 
   useEffect(() => {
     tenantsApi.list().then(setTenants, () => undefined);
-    resources.list<{ display_name?: string }>("models").then(
-      (items) => setModels(Object.fromEntries(items.map((m) => [m.id, m.doc.display_name ?? m.id]))),
-      () => undefined,
-    );
   }, []);
 
   // A key belongs to one tenant, so the key filter follows the tenant filter.
@@ -86,13 +85,18 @@ export function Charges(_props: TabProps) {
 
   const set = (patch: ChargeFilter) => setFilter((f) => ({ ...f, ...patch }));
   const tenantName = (id: string) => tenants.find((t) => t.id === id)?.name ?? id;
+  // The model and reason a link from 计价状态 set: the form has no field for them, so they are shown here.
+  const linked = [
+    filter.error_code ? `原因：${reasonLabel(filter.error_code)}` : null,
+    filter.model_id ? `模型：${rows?.find((c) => c.requested_model_id === filter.model_id)?.model_name ?? filter.model_id}` : null,
+  ].filter((x): x is string => x !== null);
 
   return (
     <div className="panel">
       <h2>计费明细</h2>
       <p className="hint">
         每一次调用的计价结果，最新的在前。售价和成本都以人民币计：成本是这次调用按上游账号的成本换算率算出的平台成本，未知时显示 —。
-        未计价的行写明原因。
+        未计价的行写明原因；无需计费的行写明调用怎样结束（上游失败、请求被拒绝或没有用量），这些行不收费。
       </p>
       <form
         className="r"
@@ -142,6 +146,14 @@ export function Charges(_props: TabProps) {
           </select>
         </label>
         <label className="f filter">
+          <input
+            type="checkbox"
+            checked={filter.exclude_status === "nothing_to_bill"}
+            onChange={(e) => set({ exclude_status: e.target.checked ? "nothing_to_bill" : undefined })}
+          />{" "}
+          <span>隐藏无需计费</span>
+        </label>
+        <label className="f filter">
           <span>事件</span>
           <input value={eventDraft} onChange={(e) => setEventDraft(e.target.value)} placeholder="事件编号" />
         </label>
@@ -152,6 +164,14 @@ export function Charges(_props: TabProps) {
           刷新
         </Button>
       </form>
+      {linked.length > 0 && (
+        <div className="r" role="status">
+          <span className="hint">只看 {linked.join("，")}</span>
+          <Button type="button" size="sm" onClick={() => set({ error_code: undefined, model_id: undefined })}>
+            清除
+          </Button>
+        </div>
+      )}
       {error && (
         <div className="note crit" role="alert">
           {error}
@@ -178,9 +198,9 @@ export function Charges(_props: TabProps) {
               <tr key={c.seq}>
                 <td className="tabular">{fmtUtc(c.occurred_at)}</td>
                 <td>{tenantName(c.tenant_id)}</td>
-                <td>{models[c.requested_model_id] ?? c.requested_model_id}</td>
+                <td>{modelText(c.model_name, c.model_deleted)}</td>
                 <td>{statusLabel(c.status)}</td>
-                <td>{c.error_code ? reasonLabel(c.error_code) : "—"}</td>
+                <td>{chargeReason(c)}</td>
                 <td className="num">{c.charge_micro_cny === null ? "—" : fmtMicroCny(c.charge_micro_cny)}</td>
                 <td className="num">{c.cost_micro_cny === null ? "—" : fmtMicroCny(c.cost_micro_cny)}</td>
                 <td>{c.service_tier ?? "—"}</td>
