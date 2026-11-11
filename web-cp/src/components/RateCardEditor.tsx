@@ -2,6 +2,7 @@ import { useEffect, useId, useState } from "react";
 import type { Detail, RateCard, RateMap, TierRates } from "../lib/api";
 import { problemAt } from "../lib/errors";
 import { perMillionOfPerThousand, perThousandOfPerMillion } from "../lib/money";
+import { cardShapeProblem } from "../lib/rateCardShape";
 import { isPerCall, TIER_HINT } from "../lib/rateUnits";
 import { Button } from "../ui/Button";
 import { Field } from "../ui/Field";
@@ -91,8 +92,15 @@ const PER_THOUSAND_PROBLEM = "按每千次的美元数填写，最多 9 位小�
  * Problems whose path starts `/card` show at their field, at their tier or
  * band, or else above the card. `onValidity` reports whether the card can be
  * sent as shown: false while the JSON view holds a document that does not
- * parse (and `value` is the last one that did), or a rate per call is no
- * amount.
+ * parse (and `value` is the last one that did), a document the field view
+ * cannot read, or a rate per call is no amount.
+ *
+ * The JSON view accepts any document that parses, and the field view can
+ * only render one whose tiers, base rates and bands are the shapes it reads.
+ * Closing the JSON view over a document that is not one keeps the JSON view
+ * open, with the problem named ([`cardShapeProblem`]): the field view would
+ * throw while rendering and take the page with it, and the text the operator
+ * typed would be gone.
  */
 export function RateCardEditor({
   value,
@@ -107,6 +115,8 @@ export function RateCardEditor({
 }) {
   const [json, setJson] = useState<string | null>(null);
   const [jsonError, setJsonError] = useState<string | null>(null);
+  /** What the last closing of the JSON view found unreadable as fields, if anything. */
+  const [shapeError, setShapeError] = useState<string | null>(null);
   /** What was typed into each rate-per-call field, by its path, so a half-typed amount stays on screen. */
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [adding, setAdding] = useState(TIERS[0]!.tier);
@@ -121,9 +131,9 @@ export function RateCardEditor({
   const unreadable = (text: string) => text.trim() !== "" && perMillionOfPerThousand(text.trim()) === null;
   const unread = Object.values(drafts).filter(unreadable).length;
   useEffect(() => {
-    onValidity?.(jsonError === null && unread === 0);
+    onValidity?.(jsonError === null && shapeError === null && unread === 0);
     // onValidity is the form's setter; these are what change.
-  }, [jsonError, unread]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [jsonError, shapeError, unread]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Every path the form shows a refusal at; any other goes above the card.
   const placed = new Set<string>();
@@ -245,6 +255,8 @@ export function RateCardEditor({
       const parsed: unknown = JSON.parse(text);
       if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("价格卡应是一个对象");
       setJsonError(null);
+      // The text changed: a shape complaint was about the previous document.
+      setShapeError(null);
       onChange(parsed as RateCard);
     } catch (e) {
       setJsonError(`不是合法的价格卡 JSON，修改尚未生效：${e instanceof Error ? e.message : String(e)}`);
@@ -253,13 +265,23 @@ export function RateCardEditor({
 
   function toggleJson() {
     setDrafts({});
-    if (json === null) {
-      setJson(JSON.stringify(value ?? {}, null, 2));
-    } else {
-      // The form shows the last card that parsed.
-      setJson(null);
-    }
     setJsonError(null);
+    if (json === null) {
+      // Opening the JSON view: the fields' card as a document.
+      setShapeError(null);
+      setJson(JSON.stringify(value ?? {}, null, 2));
+      return;
+    }
+    // Closing it: the fields can render only a card whose tiers, base rates
+    // and bands are the shapes they read. A card that is not stays here, with
+    // what is wrong named, so the text typed is not lost to a blank page.
+    const problem = cardShapeProblem(value ?? {});
+    if (problem !== null) {
+      setShapeError(problem);
+      return;
+    }
+    setShapeError(null);
+    setJson(null);
   }
 
   return (
@@ -384,9 +406,9 @@ export function RateCardEditor({
       ) : (
         <>
           <JsonEditor value={json} onChange={setJsonText} details={mine.map((d) => ({ ...d, path: d.path.slice("/card".length) }))} />
-          {jsonError && (
+          {(jsonError ?? shapeError) && (
             <div className="note crit" role="alert">
-              {jsonError}
+              {jsonError ?? shapeError}
             </div>
           )}
         </>

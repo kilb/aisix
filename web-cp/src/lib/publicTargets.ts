@@ -48,6 +48,21 @@ export function draftOf(s: Pick<ServedBy, "upstream_model" | "priority" | "weigh
   return { upstream: s.upstream_model ?? "", priority: String(s.priority), weight: String(s.weight) };
 }
 
+/**
+ * The draft a row shows: the stored mapping as it reads now, with only the
+ * fields the operator typed laid over it.
+ *
+ * A field the operator has not touched follows every later read, so a reload
+ * after another operator's change shows that change, and a save never sends
+ * the value it had when the row was first edited.
+ */
+export function shownDraft(
+  stored: Pick<ServedBy, "upstream_model" | "priority" | "weight">,
+  typed: Partial<TargetDraft> | undefined,
+): TargetDraft {
+  return { ...draftOf(stored), ...typed };
+}
+
 function upstreamOf(typed: string): string | null {
   const name = typed.trim();
   return name === "" ? null : name;

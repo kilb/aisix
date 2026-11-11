@@ -24,6 +24,7 @@ import {
   addedBody,
   changedBody,
   draftOf as targetDraftOf,
+  shownDraft,
   targetsOf,
   unsendable,
   withSaved,
@@ -1426,11 +1427,14 @@ function PublicRoutingForm({
   onTargetRemoved: (accountName: string, view: PublicModel | null) => void;
 }) {
   const stored = publicModel.routing ?? {};
-  // The settings as typed, or null while untouched: an untouched form shows
-  // what was last read.
-  const [settings, setSettings] = useState<RoutingDraft | null>(null);
-  // The served targets as typed, by account id; a row not here shows what was last read.
-  const [edits, setEdits] = useState<Record<string, TargetDraft>>({});
+  // The settings the operator typed, or null while untouched: a field not
+  // here shows what was last read, and only what was typed is sent, so a
+  // reload after another operator's change neither hides it nor reverts it.
+  const [settings, setSettings] = useState<Partial<RoutingDraft> | null>(null);
+  // The target fields the operator typed, by account id; a field not here
+  // shows what the mapping last read, so an untouched field follows every
+  // later read and is never sent back as the value it had at first edit.
+  const [edits, setEdits] = useState<Record<string, Partial<TargetDraft>>>({});
   const [additions, setAdditions] = useState<Addition[]>([]);
   const nextKey = useRef(1);
   const [form, focusRefusal] = useRefusalFocus<HTMLFormElement>();
@@ -1447,17 +1451,16 @@ function PublicRoutingForm({
   const title = readOnly ? `模型「${publicModel.name}」` : `编辑模型「${publicModel.name}」`;
   const locked = readOnly || busy;
 
-  const draft = settings ?? routingDraftOf(stored, GENERATED_STRATEGY);
+  const draft: RoutingDraft = { ...routingDraftOf(stored, GENERATED_STRATEGY), ...settings };
   const statuses = statusesOf(draft.statuses);
   const settingsBody = routingBody(draft, stored, GENERATED_STRATEGY, statuses);
   const settingsChanged = settings !== null && !sameRouting(settingsBody, stored);
 
   const targets = targetsOf(publicModel);
-  const shownOf = (t: ServedBy) => edits[t.provider_key_id] ?? targetDraftOf(t);
+  const shownOf = (t: ServedBy) => shownDraft(t, edits[t.provider_key_id]);
   const changedTargets = targets.flatMap((t) => {
-    const typed = edits[t.provider_key_id];
-    const body = typed === undefined ? null : changedBody(typed, t);
-    return body === null ? [] : [{ target: t, typed: typed!, body }];
+    const body = changedBody(shownOf(t), t);
+    return body === null ? [] : [{ target: t, typed: shownOf(t), body }];
   });
   const dirty = settingsChanged || changedTargets.length > 0 || additions.length > 0;
   // A disabled mapping is not a target; adding its account enables it again.
@@ -1466,7 +1469,7 @@ function PublicRoutingForm({
   );
 
   function set<K extends keyof RoutingDraft>(key: K, value: RoutingDraft[K]) {
-    setSettings((d) => ({ ...(d ?? routingDraftOf(stored, GENERATED_STRATEGY)), [key]: value }));
+    setSettings((d) => ({ ...d, [key]: value }));
   }
 
   /** Forgets the last save's word on one row: the operator is changing it. */
@@ -1476,7 +1479,9 @@ function PublicRoutingForm({
   }
 
   function editTarget(t: ServedBy, patch: Partial<TargetDraft>) {
-    setEdits((e) => ({ ...e, [t.provider_key_id]: { ...(e[t.provider_key_id] ?? targetDraftOf(t)), ...patch } }));
+    // Only what was typed is held: an untouched field keeps following the
+    // stored mapping, so a reload's newer value is what a save compares.
+    setEdits((e) => ({ ...e, [t.provider_key_id]: { ...e[t.provider_key_id], ...patch } }));
     settle(t.provider_key_id);
   }
 
@@ -1994,6 +1999,10 @@ function TargetRow({
         <div className="flex flex-col gap-1.5">
           <span className="text-xs font-medium text-muted-foreground @3xl:hidden">上游模型名称</span>
           <UpstreamModelPicker
+            // Keyed by the account: a row that switches accounts is a
+            // different model list, so nothing the first account answered
+            // (a list, a reason, a call still in flight) carries over.
+            key={accountId}
             accountId={accountId}
             value={draft.upstream}
             publicName={publicName}

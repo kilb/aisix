@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { PublicModel, ServedBy } from "./api.ts";
-import { addedBody, changedBody, draftOf, targetsOf, unsendable, withSaved } from "./publicTargets.ts";
+import { addedBody, changedBody, draftOf, shownDraft, targetsOf, unsendable, withSaved } from "./publicTargets.ts";
 
 // `npm run test:unit`.
 
@@ -50,6 +50,25 @@ test("an untouched target sends nothing", () => {
   assert.equal(changedBody(draftOf(s), s), null);
   // Surrounding blanks are not a change either.
   assert.equal(changedBody({ upstream: " gpt-up ", priority: " 2", weight: "5 " }, s), null);
+});
+
+test("a field the operator did not touch follows a later read, so a save never sends it back", () => {
+  // The operator edited the weight while the mapping held priority 1; another
+  // operator then set the priority to 9 and this page read it again. The form
+  // still holds only the typed weight, so what it sends is the weight alone —
+  // priority 9 is left as the other operator wrote it.
+  const typed = { weight: "3" };
+  const afterReload = served({ upstream_model: "gpt-up", priority: 9, weight: 1 });
+  const shown = shownDraft(afterReload, typed);
+  assert.deepEqual(shown, { upstream: "gpt-up", priority: "9", weight: "3" });
+  assert.deepEqual(changedBody(shown, afterReload), { weight: 3 });
+  // A row the operator never edited shows what was last read and sends nothing.
+  assert.equal(changedBody(shownDraft(afterReload, undefined), afterReload), null);
+  // An upstream name typed on its own is the only field sent, even when the
+  // stored priority changed under it.
+  assert.deepEqual(changedBody(shownDraft(served({ priority: 4 }), { upstream: "typed" }), served({ priority: 4 })), {
+    upstream_model: "typed",
+  });
 });
 
 test("only the fields that changed are sent", () => {

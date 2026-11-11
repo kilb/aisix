@@ -125,6 +125,71 @@ test("加载更多按 next_before 续页", async ({ page }) => {
   await expect(page.getByRole("button", { name: "加载更多" })).toHaveCount(0);
 });
 
+test("换筛选时不能用上一个筛选的 cursor 续页：新筛选的首页读回前没有「加载更多」，遍历覆盖全部记录", async ({ page }) => {
+  test.setTimeout(240_000);
+  // Filter A pages (more than one page of 50); filter B does not (12 rows).
+  const a = await seedTenant(stack);
+  const totalA = 52;
+  for (let sent = 0; sent < totalA; sent += 4) {
+    const statuses = await Promise.all(
+      Array.from({ length: Math.min(4, totalA - sent) }, () => chat(stack, a.key.plaintext, a.model.name)),
+    );
+    expect(statuses).toEqual(statuses.map(() => 200));
+  }
+  const b = await seedTenant(stack);
+  for (let sent = 0; sent < 12; sent += 4) {
+    await Promise.all(Array.from({ length: Math.min(4, 12 - sent) }, () => chat(stack, b.key.plaintext, b.model.name)));
+  }
+  await expect
+    .poll(async () => {
+      const p = (await stack.admin.get(`/admin/pricing/charges?tenant_id=${a.tenantId}&limit=500`)) as { items: Json[] };
+      return p.items.length;
+    }, { timeout: 60_000 })
+    .toBe(totalA);
+  const bRows = await chargesFor(b.tenantId, 12);
+
+  await openCharges(page);
+  const table = page.getByRole("table", { name: "计费明细" });
+  await page.getByLabel("租户").selectOption({ label: a.tenantName });
+  await expect(table.getByRole("row")).toHaveCount(51);
+  await expect(page.getByRole("button", { name: "加载更多" })).toBeVisible();
+
+  // Filter B's first page is held back while it is in flight: the request
+  // still reaches the real control plane and its answer is passed on
+  // unchanged; only when it arrives moves. The window the review found is
+  // open for as long as a slow answer takes.
+  let release: (() => void) | null = null;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const isFirstPageOfB = (url: URL) =>
+    url.pathname === "/admin/pricing/charges" && url.searchParams.get("tenant_id") === b.tenantId && !url.searchParams.has("before");
+  await page.route(
+    (url) => isFirstPageOfB(url),
+    async (route) => {
+      await held;
+      await route.continue();
+    },
+  );
+  await page.getByLabel("租户").selectOption({ label: b.tenantName });
+  // While B's first page is unresolved there is nothing to continue, so no
+  // continuation is offered — and the one on screen is A's, not B's.
+  await expect(table).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "加载更多" })).toHaveCount(0);
+  release!();
+  await expect(table.getByRole("row")).toHaveCount(13);
+  await expect(page.getByRole("button", { name: "加载更多" })).toHaveCount(0);
+  await page.unroute((url) => isFirstPageOfB(url));
+
+  // The traversal is the filter's own set: every one of B's charges, once.
+  const events = await table
+    .getByRole("row")
+    .evaluateAll((rows) => rows.slice(1).map((r) => r.textContent ?? ""));
+  const tenantCell = b.tenantName;
+  expect(events.filter((t) => t.includes(tenantCell))).toHaveLength(bRows.length);
+  expect(events.some((t) => t.includes(a.tenantName))).toBe(false);
+});
+
 test("无需计费的行写明原因；模型删除后仍显示名称；可以隐藏无需计费的行", async ({ page }) => {
   const world = await seedTenant(stack);
   const suffix = randomUUID().slice(0, 8);
