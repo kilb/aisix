@@ -14,6 +14,8 @@ import { DataTable, Loading } from "../ui/DataTable";
 import { EmptyState } from "../ui/EmptyState";
 import { Lamp } from "../ui/Lamp";
 import { TwoStep } from "../ui/TwoStep";
+import { CardHeader, PageHeader, Split } from "../components/page";
+import { Plus, RefreshCw } from "lucide-react";
 
 /** A cache policy document; fields the form does not show are kept as stored. */
 interface CachePolicyDoc {
@@ -241,124 +243,111 @@ export function Cache({ canEdit, onGoto }: TabProps) {
   const listedDetails = failure?.details.filter((d) => !FIELD_PATHS.includes(d.path)) ?? [];
   const ttlMissing = form !== null && !readOnly && form.ttl.trim() === "";
 
-  return (
-    <>
-      <div className="panel">
-        <h2>
-          缓存策略
-          <Button
-            size="sm"
-            type="button"
-            icon="refresh"
-            onClick={() => {
-              void policies.reload();
-              void models.reload();
-            }}
-          >
-            刷新
-          </Button>
-        </h2>
-        <p className="hint">
-          命中缓存的请求直接由网关应答，不再转发给上游。平台部署中缓存条目只在同一租户的 API 密钥之间共享（team 范围）。
-        </p>
-        {optionsError && (
-          <div className="note crit" role="alert">
-            {optionsError}
-          </div>
-        )}
-        {canEdit && (
-          <div className="r">
-            <Button kind="primary" type="button" disabled={!options} onClick={startNew}>
-              新建缓存策略
-            </Button>
-          </div>
-        )}
-        {policies.error && (
-          <div className="note crit" role="alert">
-            {messageFor(policies.error)}
-          </div>
-        )}
-        {policies.items === null && !policies.error && <Loading />}
-        {policies.items !== null && policies.items.length === 0 && <EmptyState text="还没有缓存策略。" />}
-        {policies.items !== null && policies.items.length > 0 && (
-          <DataTable>
-            <thead>
-              <tr>
-                <th>名称</th>
-                <th>范围</th>
-                <th>作用于</th>
-                <th className="right">缓存时长（秒）</th>
-                <th>启用</th>
-                <th>下发状态</th>
-                <th />
+  const list = (
+    <div className="panel mb-0">
+      <CardHeader
+        as="h2"
+        title={
+          <span className="inline-flex items-center gap-2">
+            全部策略
+            {policies.items && policies.items.length > 0 && <span className="tag">{policies.items.length}</span>}
+          </span>
+        }
+      />
+      {policies.error && (
+        <div className="note crit" role="alert">
+          {messageFor(policies.error)}
+        </div>
+      )}
+      {policies.items === null && !policies.error && <Loading />}
+      {policies.items !== null && policies.items.length === 0 && <EmptyState text="还没有缓存策略。" />}
+      {policies.items !== null && policies.items.length > 0 && (
+        <DataTable>
+          <thead>
+            <tr>
+              <th>名称</th>
+              <th>范围</th>
+              <th>作用于</th>
+              <th className="right">缓存时长（秒）</th>
+              <th>启用</th>
+              <th>下发状态</th>
+              <th />
+            </tr>
+          </thead>
+          <tbody>
+            {policies.items.map((p) => (
+              <tr key={p.id} className={form?.id === p.id ? "bg-muted" : undefined}>
+                <td className="font-medium">{p.doc.name}</td>
+                <td>
+                  <code className="tag font-mono">{p.doc.scope ?? "—"}</code>
+                </td>
+                <td>{appliesToText(p.doc)}</td>
+                <td className="right num">{p.doc.ttl_seconds ?? "—"}</td>
+                <td>
+                  <Lamp state={p.doc.enabled === false ? "disabled" : "applied"}>{p.doc.enabled === false ? "否" : "是"}</Lamp>
+                </td>
+                <td>
+                  <RolloutBadge rollout={p.rollout} />
+                </td>
+                <td className="right">
+                  <Button size="sm" type="button" onClick={() => open(p)}>
+                    {canEdit && p.doc.scope !== ENV_SCOPE ? "编辑" : "查看"}
+                  </Button>
+                  {canEdit && (
+                    <TwoStep
+                      label="删除"
+                      size="sm"
+                      disabled={busy}
+                      busy={removing === p.id}
+                      warning={`删除「${p.doc.name ?? p.id}」后，它覆盖的请求不再由网关缓存应答。`}
+                      onConfirm={() => void remove(p)}
+                    />
+                  )}
+                  {deleteFailure?.id === p.id && (
+                    <Failure
+                      error={deleteFailure.error}
+                      onReload={() => {
+                        setDeleteFailure(null);
+                        void policies.reload();
+                      }}
+                    />
+                  )}
+                </td>
               </tr>
-            </thead>
-            <tbody>
-              {policies.items.map((p) => (
-                <tr key={p.id}>
-                  <td>{p.doc.name}</td>
-                  <td>
-                    <code>{p.doc.scope ?? "—"}</code>
-                  </td>
-                  <td>{appliesToText(p.doc)}</td>
-                  <td className="right">{p.doc.ttl_seconds ?? "—"}</td>
-                  <td>
-                    <Lamp state={p.doc.enabled === false ? "disabled" : "applied"}>{p.doc.enabled === false ? "否" : "是"}</Lamp>
-                  </td>
-                  <td>
-                    <RolloutBadge rollout={p.rollout} />
-                  </td>
-                  <td className="right">
-                    <Button size="sm" type="button" onClick={() => open(p)}>
-                      {canEdit && p.doc.scope !== ENV_SCOPE ? "编辑" : "查看"}
-                    </Button>
-                    {canEdit && (
-                      <TwoStep
-                        label="删除"
-                        size="sm"
-                        disabled={busy}
-                        busy={removing === p.id}
-                        warning={`删除「${p.doc.name ?? p.id}」后，它覆盖的请求不再由网关缓存应答。`}
-                        onConfirm={() => void remove(p)}
-                      />
-                    )}
-                    {deleteFailure?.id === p.id && (
-                      <Failure
-                        error={deleteFailure.error}
-                        onReload={() => {
-                          setDeleteFailure(null);
-                          void policies.reload();
-                        }}
-                      />
-                    )}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </DataTable>
-        )}
-      </div>
+            ))}
+          </tbody>
+        </DataTable>
+      )}
+    </div>
+  );
 
-      {form && (
-        <div ref={panel} className="panel">
-          <h2>
+  const editor = form && (
+    <div ref={panel} className="panel mb-0">
+      <CardHeader
+        as="h2"
+        title={
+          <span className="inline-flex flex-wrap items-center gap-x-3 gap-y-1">
             {form.id === null ? "新建缓存策略" : `缓存策略 ${form.base.name ?? ""}`}
             {current && <RolloutBadge rollout={current.rollout} />}
-          </h2>
-          {form.envScoped && (
-            <div className="note warn">
-              {ENV_NOTE}{" "}
-              {canEdit && (
-                <Button type="button" onClick={() => onGoto("resources")}>
-                  到「全部资源」修改
-                </Button>
-              )}
-            </div>
+          </span>
+        }
+      />
+      {form.envScoped && (
+        <div className="note warn mt-0">
+          {ENV_NOTE}{" "}
+          {canEdit && (
+            <Button type="button" size="sm" onClick={() => onGoto("resources")}>
+              到「全部资源」修改
+            </Button>
           )}
-          <label className="f">
-            <span>名称</span>
-            <input value={form.name} disabled={readOnly} onChange={(e) => set({ name: e.target.value })} />
-          </label>
+        </div>
+      )}
+      <div className="grid gap-x-4 sm:grid-cols-2 xl:grid-cols-1 2xl:grid-cols-2">
+        <label className="f sm:col-span-2 xl:col-span-1 2xl:col-span-2">
+          <span>名称</span>
+          <input value={form.name} disabled={readOnly} onChange={(e) => set({ name: e.target.value })} />
+        </label>
+        <div className="min-w-0">
           <label className="f">
             <span>范围</span>
             {form.envScoped ? (
@@ -384,26 +373,11 @@ export function Cache({ canEdit, onGoto }: TabProps) {
               {scopeProblem}
             </p>
           )}
-          {options?.descriptions[form.scope] && <p className="hint">{options.descriptions[form.scope]}</p>}
-          <label className="f">
-            <span>作用于</span>
-            {form.otherTarget !== null ? (
-              <input value={form.otherTarget} disabled />
-            ) : (
-              <select value={form.target} disabled={readOnly} onChange={(e) => set({ target: e.target.value })}>
-                <option value="">全部请求</option>
-                {form.target && !models.items?.some((m) => m.id === form.target) && (
-                  <option value={form.target}>{form.target}</option>
-                )}
-                {(models.items ?? []).map((m) => (
-                  <option key={m.id} value={m.id}>
-                    {m.doc.display_name ?? m.id}
-                  </option>
-                ))}
-              </select>
-            )}
-          </label>
-          {form.otherTarget !== null && <p className="hint">这种写法的作用范围只能在「全部资源」页修改，保存时原样保留。</p>}
+          {options?.descriptions[form.scope] && (
+            <p className="hint -mt-2 mb-4 text-[13px]">{options.descriptions[form.scope]}</p>
+          )}
+        </div>
+        <div className="min-w-0">
           <label className="f">
             <span>缓存时长（秒）</span>
             <input
@@ -423,49 +397,107 @@ export function Cache({ canEdit, onGoto }: TabProps) {
               {ttlMissing ? "必填" : ttlProblem}
             </p>
           )}
+        </div>
+        <div className="min-w-0 sm:col-span-2 xl:col-span-1 2xl:col-span-2">
           <label className="f">
-            <span>启用</span>
-            <input
-              type="checkbox"
-              checked={form.enabled}
-              disabled={readOnly}
-              onChange={(e) => set({ enabled: e.target.checked })}
-            />
-          </label>
-          {conflict && <ConflictNote onReload={() => void reloadForm()} />}
-          {failure && (
-            <div className="note crit" role="alert">
-              {failure.text}
-              {listedDetails.length > 0 && (
-                <ul className="json-problems">
-                  {listedDetails.map((d, i) => (
-                    <li key={i} data-path={d.path}>
-                      <mark className="json-path">{d.path || "（文档根）"}</mark> {d.message}
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </div>
-          )}
-          <div className="r">
-            {!readOnly && (
-              <Button
-                kind="primary"
-                type="button"
-                disabled={busy || ttlMissing}
-                busy={busy && removing === null}
-                busyLabel="保存"
-                onClick={() => void submit()}
-              >
-                保存
-              </Button>
+            <span>作用于</span>
+            {form.otherTarget !== null ? (
+              <input value={form.otherTarget} disabled />
+            ) : (
+              <select value={form.target} disabled={readOnly} onChange={(e) => set({ target: e.target.value })}>
+                <option value="">全部请求</option>
+                {form.target && !models.items?.some((m) => m.id === form.target) && (
+                  <option value={form.target}>{form.target}</option>
+                )}
+                {(models.items ?? []).map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.doc.display_name ?? m.id}
+                  </option>
+                ))}
+              </select>
             )}
-            <Button type="button" onClick={() => setForm(null)}>
-              {readOnly ? "关闭" : "取消"}
-            </Button>
-          </div>
+          </label>
+          {form.otherTarget !== null && (
+            <p className="hint -mt-2 mb-4 text-[13px]">这种写法的作用范围只能在「全部资源」页修改，保存时原样保留。</p>
+          )}
+        </div>
+        <label className="f sm:col-span-2 xl:col-span-1 2xl:col-span-2">
+          <input
+            type="checkbox"
+            checked={form.enabled}
+            disabled={readOnly}
+            onChange={(e) => set({ enabled: e.target.checked })}
+          />
+          <span>启用</span>
+        </label>
+      </div>
+      {conflict && <ConflictNote onReload={() => void reloadForm()} />}
+      {failure && (
+        <div className="note crit" role="alert">
+          {failure.text}
+          {listedDetails.length > 0 && (
+            <ul className="json-problems">
+              {listedDetails.map((d, i) => (
+                <li key={i} data-path={d.path}>
+                  <mark className="json-path">{d.path || "（文档根）"}</mark> {d.message}
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
       )}
+      <div className="-mx-6 -mb-6 mt-2 flex justify-end gap-2 rounded-b-xl border-t border-border bg-muted/40 px-6 py-3">
+        <Button type="button" onClick={() => setForm(null)}>
+          {readOnly ? "关闭" : "取消"}
+        </Button>
+        {!readOnly && (
+          <Button
+            kind="primary"
+            type="button"
+            disabled={busy || ttlMissing}
+            busy={busy && removing === null}
+            busyLabel="保存"
+            onClick={() => void submit()}
+          >
+            保存
+          </Button>
+        )}
+      </div>
+    </div>
+  );
+
+  return (
+    <>
+      <PageHeader
+        title="缓存策略"
+        description="命中缓存的请求直接由网关应答，不再转发给上游。平台部署中缓存条目只在同一租户的 API 密钥之间共享（team 范围）。"
+        actions={
+          <>
+            <Button
+              type="button"
+              onClick={() => {
+                void policies.reload();
+                void models.reload();
+              }}
+            >
+              <RefreshCw aria-hidden />
+              刷新
+            </Button>
+            {canEdit && (
+              <Button kind="primary" type="button" disabled={!options} onClick={startNew}>
+                <Plus aria-hidden />
+                新建缓存策略
+              </Button>
+            )}
+          </>
+        }
+      />
+      {optionsError && (
+        <div className="note crit" role="alert">
+          {optionsError}
+        </div>
+      )}
+      <Split asideWidth="minmax(340px, 30%)" main={list} aside={editor || undefined} />
     </>
   );
 }
