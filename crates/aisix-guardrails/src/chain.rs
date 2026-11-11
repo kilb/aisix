@@ -773,6 +773,20 @@ impl Guardrail for GuardrailChain {
         self.record_bypass(reason);
     }
 
+    /// Trait hooks for [`GuardrailChain::record_unevaluable_input_bypass`]
+    /// and its output counterpart, so the redaction walkers — which hold the
+    /// erased `&dyn Guardrail` — can record an unreadable text field
+    /// (R-070). Renamed from the inherent methods on purpose: a trait method
+    /// and an inherent method of the same name on the same type silently
+    /// shadow one another at every concrete call site.
+    fn record_unreadable_input_bypass(&self, reason: &str) {
+        GuardrailChain::record_unevaluable_input_bypass(self, reason);
+    }
+
+    fn record_unreadable_output_bypass(&self, reason: &str) {
+        GuardrailChain::record_unevaluable_output_bypass(self, reason);
+    }
+
     /// The member whose cap is the one [`Self::stream_output_policy`]
     /// folded to: the smallest `max_buffer_bytes` among output members of
     /// the chain policy's own rank (a `window` member does not set a chain
