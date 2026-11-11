@@ -83,8 +83,14 @@ export interface OpenAiUpstreamOptions {
    * upstream that trickles its bytes is only visibly trickling
    * downstream if the gateway forwards them as they arrive. Takes
    * precedence over `rawBody`; no Content-Length is sent.
+   *
+   * `disconnectAfterChunks` drops the connection after the last one instead
+   * of ending the response cleanly, so a `responseHeaders` `content-length`
+   * larger than what was written reaches the client as a truncated transfer
+   * (Node otherwise waits for the missing bytes and the body never ends).
    */
   rawBodyChunks?: Array<string | Buffer>;
+  disconnectAfterChunks?: boolean;
   /** Content-Type for `rawBody` (default `application/octet-stream`). */
   rawContentType?: string;
   /** Per-request response script; used in order before static opts. */
@@ -134,6 +140,8 @@ export interface OpenAiUpstreamStep {
   rawBody?: string | Buffer;
   /** See `OpenAiUpstreamOptions.rawBodyChunks`. */
   rawBodyChunks?: Array<string | Buffer>;
+  /** See `OpenAiUpstreamOptions.rawBodyChunks`. */
+  disconnectAfterChunks?: boolean;
   /** Per-path 200 bodies — see `OpenAiUpstreamOptions.pathBodies`. */
   pathBodies?: Record<string, unknown>;
   /** Content-Type for `rawBody` (default `application/octet-stream`). */
@@ -277,6 +285,11 @@ export async function startOpenAiUpstream(
           if (res.writableEnded || res.destroyed) return;
           res.write(Buffer.from(chunk));
           if (step.eventDelayMs) await sleep(step.eventDelayMs);
+        }
+        if (step.disconnectAfterChunks) {
+          selfClosed = true;
+          res.destroy();
+          return;
         }
         if (!res.writableEnded && !res.destroyed) res.end();
         return;
