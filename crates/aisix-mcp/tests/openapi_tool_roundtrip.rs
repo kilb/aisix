@@ -654,6 +654,15 @@ fn capture_spec() -> Value {
                     "schema": { "type": "integer", "nullable": true } } } } } },
             "/note": { "post": { "operationId": "note",
                 "requestBody": json_body(json!({ "type": "object" })) } },
+            "/choice": { "post": { "operationId": "choice",
+                "requestBody": json_body(json!({ "oneOf": [
+                    { "type": "integer" }, { "type": "string" } ] })) } },
+            "/tier": { "post": { "operationId": "tier",
+                "requestBody": json_body(json!({ "enum": [7, 8] })) } },
+            "/maybe-choice": { "post": { "operationId": "maybeChoiceCasing",
+                "requestBody": { "content": { "application/json": {
+                    "schema": { "oneOf": [
+                        { "type": "integer" }, { "type": "null" } ] } } } } } },
             "/things/{id}/{body}": { "post": {
                 "operationId": "things",
                 "parameters": [
@@ -752,6 +761,35 @@ async fn a_primitive_body_reaches_the_api_as_published() {
     }
     let (_, _, seen) = call("maybe", json!({})).await;
     assert_eq!(seen["body"], "", "an omitted optional body sends none");
+}
+
+/// A body schema with no top-level `type` — a composition (`oneOf`) or an
+/// `enum` — is published as that composition, so what it admits reaches the
+/// API unchanged, the same as a declared primitive does; and a composed
+/// nullable schema still tells an explicit `null` from no body at all.
+#[tokio::test]
+async fn a_composed_body_reaches_the_api_as_published() {
+    let call = capture_client().await;
+    for (tool, value, wire) in [
+        ("choice", json!(7), "7"),
+        ("choice", json!("text"), "\"text\""),
+        ("tier", json!(7), "7"),
+        ("maybechoicecasing", Value::Null, "null"),
+    ] {
+        let (is_error, schema, seen) = call(tool, json!({ "body": value })).await;
+        assert_ne!(is_error, Some(true), "{tool}: {seen}");
+        let body_schema = &schema["properties"]["body"];
+        assert!(
+            body_schema.get("type").is_none(),
+            "{tool} must publish its composition: {schema}"
+        );
+        assert_eq!(seen["body"], wire, "{tool} sent {value} as {seen}");
+    }
+    let (_, _, seen) = call("choice", json!({})).await;
+    assert_eq!(
+        seen["body"], "",
+        "an omitted composed body sends none, not a null"
+    );
 }
 
 /// Two parameters that share a name, and a path parameter named like the
