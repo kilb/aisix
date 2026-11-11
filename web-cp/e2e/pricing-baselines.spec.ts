@@ -455,6 +455,57 @@ test("JSON 视图里每个价格都按每百万单位：提示不说按每千次
   });
 });
 
+test("JSON 里写了字段视图读不了的价格卡：切回字段时留在 JSON 视图并指出位置，改正后可继续编辑与保存", async ({ page }) => {
+  const model = await newModel("shape-base", "gpt-5.4-nano");
+  await openBaselines(page);
+  const panel = await openModel(page, model.name);
+  await panel.getByLabel("方式").selectOption("manual");
+  const card = panel.getByRole("group", { name: "价格卡（美元）" });
+  const toggle = card.getByRole("button", { name: "编辑完整价格卡（JSON）" });
+
+  // Top-level legal, inner band null: the document the review found blanked
+  // the whole Dashboard when the field view read `band.rates` of it.
+  const broken = JSON.stringify({ default: { base: { input: "1" }, long_context: [null] } });
+  await toggle.click();
+  await card.getByLabel("资源文档").fill(broken);
+  await toggle.click();
+
+  // The page is still here, the text is still there, and the problem is named
+  // at the band that is not one.
+  await expect(panel).toBeVisible();
+  await expect(card.getByLabel("资源文档")).toHaveValue(broken);
+  await expect(card.getByRole("alert")).toContainText("/default/long_context/0");
+  // An unreadable card is not saved as it stands.
+  await panel.getByLabel("说明", { exact: true }).fill("结构错误");
+  await panel.getByRole("button", { name: "保存" }).click();
+  await expect(card.getByRole("list", { name: "校验问题" })).toContainText("价格卡中有无法读取的内容，修改尚未生效；请先改正");
+  const none = (await stack.admin.get("/admin/pricing/baselines")) as Json;
+  expect(none.items.find((i: Json) => i.model_id === model.id).current).toBeNull();
+
+  // Corrected, the field view opens on the same card, and it saves.
+  const fixed = {
+    default: {
+      base: { input: "1", output: "3" },
+      // A band carries every optional rate its own tier's base carries.
+      long_context: [{ above_input_tokens: 200_000, rates: { input: "2", output: "4" } }],
+    },
+  };
+  await card.getByLabel("资源文档").fill(JSON.stringify(fixed));
+  // The shape complaint went with the document it was about. (The save's own
+  // refusal stays listed until the next save, as every refusal on this form
+  // does.)
+  await expect(card.getByText("/default/long_context/0")).toHaveCount(0);
+  await toggle.click();
+  await expect(card.getByLabel("资源文档")).toHaveCount(0);
+  const band = card.getByRole("group", { name: "标准档 长上下文档 1", exact: true });
+  await expect(band.getByLabel("输入超过（tokens）", { exact: true })).toHaveValue("200000");
+  await expect(band.getByLabel("输入", { exact: true })).toHaveValue("2");
+  await panel.getByRole("button", { name: "保存" }).click();
+  await expect(page.getByText("已保存")).toBeVisible();
+  const stored = (await stack.admin.get("/admin/pricing/baselines")) as Json;
+  expect(stored.items.find((i: Json) => i.model_id === model.id).current.card).toEqual(fixed);
+});
+
 test("生效时间是日历上不存在的日子时报错且不写入；闰年的 2 月 29 日照常写入", async ({ page }) => {
   const model = await newModel("cal-base", "gpt-5.4-nano");
   await openBaselines(page);
