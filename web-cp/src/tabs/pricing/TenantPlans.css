@@ -1,14 +1,4 @@
 /* 价格 · 租户方案. Every value comes from the tokens. */
-.plan-section {
-  margin-top: var(--s-6);
-}
-.plan-upcoming {
-  margin: var(--s-2) 0 0;
-  padding-left: var(--s-5);
-}
-.plan-form {
-  margin-top: var(--s-4);
-}
 .plan-ended {
   color: var(--text-2);
 }

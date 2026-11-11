@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { ArrowLeft } from "lucide-react";
 import { ApiError, channelModels, type PublicModel, type ServedBy } from "../../lib/api";
 import { messageFor } from "../../lib/errors";
 import { errorText } from "../../lib/fmt";
@@ -7,7 +8,10 @@ import { Button } from "../../ui/Button";
 import { DataTable } from "../../ui/DataTable";
 import { GroupList } from "../../ui/GroupName";
 import { useToast } from "../../ui/Toast";
+import { Card, CardHeader, PageHeader, Split } from "../../components/page";
+import { Lamp } from "../../ui/Lamp";
 import { LibrarySyncOne } from "./LibrarySync";
+import { CardFooter, Count } from "./kit";
 
 /**
  * The accounts serving a model, as the routing document orders them: one
@@ -91,103 +95,139 @@ export function PublicModelDetail({
     }
   }
 
-  return (
-    <div className="panel" role="region" aria-label={`公共模型 ${model.name}`}>
-      <h2>
-        <span className="mono">{model.name}</span>
-        <Button size="sm" type="button" onClick={onBack}>
-          返回列表
-        </Button>
-      </h2>
-      <p className="hint">
-        标识 <code>{model.id}</code>，创建于 {fmtUtc(model.created_at)}。授权租户 {model.reachable_tenants} 个、密钥{" "}
-        {model.reachable_keys} 个。
-      </p>
-      {error && (
-        <div className="note crit" role="alert">
-          重新生成失败：{error}
-        </div>
-      )}
-      {note && (
-        <div className="note" role="status">
-          {note}
-        </div>
-      )}
-      {canEdit && (
-        <p>
-          <Button type="button" busy={busy} busyLabel="重新生成中…" onClick={() => void regenerate()}>
-            重新生成
-          </Button>{" "}
-          <span className="hint">按当前表格重写生成的模型文档，不改变表格本身。</span>
-        </p>
-      )}
-      {served.length === 0 ? (
-        <div className="note warn" role="status">
-          <strong>无可用账号</strong>：所有服务该模型的账号都已停用或取消接入。模型仍保留在列表中，授权不受影响，但请求会以
-          503 失败（无可用上游）。
-        </div>
-      ) : (
-        <DataTable label="服务账号" compact>
-          <thead>
-            <tr>
-              <th className="num">层</th>
-              <th>上游账号</th>
-              <th className="num">优先级</th>
-              <th className="num">权重</th>
-              <th>上游模型名称</th>
-              <th>账号分组</th>
-              <th>状态</th>
-            </tr>
-          </thead>
-          <tbody>
-            {ordered.map((tier, index) =>
-              tier.accounts.map((account, at) => (
-                <tr key={account.provider_key_id} data-tier={tier.priority} data-enabled={account.enabled}>
-                  <td className="num">{at === 0 ? index + 1 : ""}</td>
-                  <td>{account.display_name || account.provider_key_id}</td>
-                  <td className="num tabular">{account.priority}</td>
-                  <td className="num tabular">{account.weight}</td>
-                  <td>
-                    {account.upstream_model === null ? (
-                      <span className="cell-note">同名（{model.name}）</span>
-                    ) : (
-                      <span className="mono">{account.upstream_model}</span>
-                    )}
-                  </td>
-                  <td>{account.groups.length > 0 ? <GroupList groups={account.groups} /> : "—"}</td>
-                  <td>{account.enabled ? "启用" : "已停用"}</td>
-                </tr>
-              )),
+  const aside =
+    canEdit || model.served_by.length > 0 ? (
+      <div className="grid gap-4">
+        {canEdit && (
+          <Card className="mb-0">
+            <CardHeader title="重新生成" description="按当前表格重写生成的模型文档，不改变表格本身。" />
+            {error && (
+              <div className="note crit mt-0" role="alert">
+                重新生成失败：{error}
+              </div>
             )}
-          </tbody>
-        </DataTable>
-      )}
-      {/* Priceable once an account has served it: its routing document is what a baseline prices. */}
-      {model.served_by.length > 0 && (
-        <LibrarySyncOne modelId={model.id} canEdit={canEdit} current={null} onSynced={onChanged} />
-      )}
-      {model.served_by.length > 0 && served.length === 0 && (
-        <DataTable label="服务账号（全部停用）" compact>
-          <thead>
-            <tr>
-              <th>上游账号</th>
-              <th className="num">优先级</th>
-              <th className="num">权重</th>
-              <th>状态</th>
-            </tr>
-          </thead>
-          <tbody>
-            {model.served_by.map((account) => (
-              <tr key={account.provider_key_id} data-enabled="false">
-                <td>{account.display_name || account.provider_key_id}</td>
-                <td className="num tabular">{account.priority}</td>
-                <td className="num tabular">{account.weight}</td>
-                <td>已停用</td>
-              </tr>
-            ))}
-          </tbody>
-        </DataTable>
-      )}
+            {note && (
+              <div className="note mt-0" role="status">
+                {note}
+              </div>
+            )}
+            <CardFooter className="mt-2">
+              <Button type="button" busy={busy} busyLabel="重新生成中…" onClick={() => void regenerate()}>
+                重新生成
+              </Button>
+            </CardFooter>
+          </Card>
+        )}
+        {/* Priceable once an account has served it: its routing document is what a baseline prices. */}
+        {model.served_by.length > 0 && (
+          <Card className="mb-0">
+            <LibrarySyncOne modelId={model.id} canEdit={canEdit} current={null} onSynced={onChanged} />
+          </Card>
+        )}
+      </div>
+    ) : undefined;
+
+  return (
+    <div role="region" aria-label={`公共模型 ${model.name}`}>
+      <PageHeader
+        title={<span className="mono text-[0.95em]">{model.name}</span>}
+        description={
+          <>
+            标识 <code>{model.id}</code>，创建于 {fmtUtc(model.created_at)}。授权租户 {model.reachable_tenants} 个、密钥{" "}
+            {model.reachable_keys} 个。
+          </>
+        }
+        actions={
+          <Button type="button" onClick={onBack}>
+            <ArrowLeft aria-hidden />
+            返回列表
+          </Button>
+        }
+      />
+      <Split
+        asideWidth="400px"
+        main={
+          <Card className="mb-0">
+            <CardHeader
+              className={served.length === 0 ? undefined : "mb-0"}
+              title={<>服务账号<Count n={served.length} /></>}
+            />
+            {served.length === 0 ? (
+              <div className="note warn mb-0 mt-0" role="status">
+                <strong>无可用账号</strong>：所有服务该模型的账号都已停用或取消接入。模型仍保留在列表中，授权不受影响，但请求会以
+                503 失败（无可用上游）。
+              </div>
+            ) : (
+              <DataTable label="服务账号" compact>
+                <thead>
+                  <tr>
+                    <th className="num">层</th>
+                    <th>上游账号</th>
+                    <th className="num">优先级</th>
+                    <th className="num">权重</th>
+                    <th>上游模型名称</th>
+                    <th>账号分组</th>
+                    <th>状态</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {ordered.map((tier, index) =>
+                    tier.accounts.map((account, at) => (
+                      <tr
+                        key={account.provider_key_id}
+                        data-tier={tier.priority}
+                        data-enabled={account.enabled}
+                        className={at === 0 && index > 0 ? "[&>td]:border-t [&>td]:border-t-border" : undefined}
+                      >
+                        <td className="num font-medium">{at === 0 ? index + 1 : ""}</td>
+                        <td className="font-medium">{account.display_name || account.provider_key_id}</td>
+                        <td className="num tabular">{account.priority}</td>
+                        <td className="num tabular">{account.weight}</td>
+                        <td>
+                          {account.upstream_model === null ? (
+                            <span className="cell-note">同名（{model.name}）</span>
+                          ) : (
+                            <span className="mono">{account.upstream_model}</span>
+                          )}
+                        </td>
+                        <td>{account.groups.length > 0 ? <GroupList groups={account.groups} /> : "—"}</td>
+                        <td>
+                          <Lamp state={account.enabled ? "applied" : "disabled"}>{account.enabled ? "启用" : "已停用"}</Lamp>
+                        </td>
+                      </tr>
+                    )),
+                  )}
+                </tbody>
+              </DataTable>
+            )}
+            {model.served_by.length > 0 && served.length === 0 && (
+              <DataTable label="服务账号（全部停用）" compact>
+                <thead>
+                  <tr>
+                    <th>上游账号</th>
+                    <th className="num">优先级</th>
+                    <th className="num">权重</th>
+                    <th>状态</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {model.served_by.map((account) => (
+                    <tr key={account.provider_key_id} data-enabled="false">
+                      <td>{account.display_name || account.provider_key_id}</td>
+                      <td className="num tabular">{account.priority}</td>
+                      <td className="num tabular">{account.weight}</td>
+                      <td>
+                        <Lamp state="disabled">已停用</Lamp>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </DataTable>
+            )}
+          </Card>
+        }
+        aside={aside}
+      />
     </div>
   );
 }

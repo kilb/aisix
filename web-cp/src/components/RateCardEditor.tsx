@@ -64,6 +64,9 @@ function withRate(map: RateMap, dimension: string, rate: string | undefined): Ra
   return next;
 }
 
+/** A set of rate fields: as many columns as the tier's box holds, two at the narrowest. */
+const RATE_GRID = "grid grid-cols-2 items-start gap-3 @md:grid-cols-3 @2xl:grid-cols-4 [&_.field]:mb-0";
+
 /** The units the field view takes: a rate per call is typed per thousand. */
 const FIELD_UNITS = "token 价格按每百万 tokens 填写；联网搜索按每千次填写，例如「每 1,000 次 10 美元」填 10。";
 
@@ -262,7 +265,7 @@ export function RateCardEditor({
   return (
     <fieldset className="rate-card" aria-invalid={mine.length > 0 ? true : undefined} aria-describedby={above.length > 0 ? aboveId : undefined}>
       <legend>价格卡（美元）</legend>
-      <p className="hint">{json === null ? FIELD_UNITS : JSON_UNITS}</p>
+      <p className="hint mb-3 text-[13px]">{json === null ? FIELD_UNITS : JSON_UNITS}</p>
       {above.length > 0 && (
         <div className="note crit" role="alert" id={aboveId}>
           {above.map((d) => d.message).join("；")}
@@ -277,21 +280,26 @@ export function RateCardEditor({
             const tierProblem = at(path);
             const bandsProblem = at(`${path}/long_context`);
             return (
-              <section key={tier} className="rate-tier" role="group" aria-label={tierTitle(tier)}>
-                <h4>
-                  {tierTitle(tier)}
+              <section
+                key={tier}
+                className="rate-tier @container m-0 mb-3 rounded-lg border border-border bg-card p-4"
+                role="group"
+                aria-label={tierTitle(tier)}
+              >
+                <div className="mb-3 flex min-h-8 items-center justify-between gap-3">
+                  <h4 className="m-0 text-sm">{tierTitle(tier)}</h4>
                   {tier !== "default" && (
                     <Button type="button" size="sm" kind="quiet" onClick={() => removeTier(tier)}>
                       移除档位
                     </Button>
                   )}
-                </h4>
+                </div>
                 {tierProblem && (
                   <div className="note crit" role="alert">
                     {tierProblem}
                   </div>
                 )}
-                <div className="r" role="group" aria-label={`${tierTitle(tier)} 基础价`}>
+                <div className={RATE_GRID} role="group" aria-label={`${tierTitle(tier)} 基础价`}>
                   {RATES.map((r) =>
                     rateField(`${path}/base/${r.dimension}`, r.dimension, r.label, t.base ?? {}, (rate) =>
                       setTier(tier, { ...t, base: withRate(t.base ?? {}, r.dimension, rate) }),
@@ -307,8 +315,13 @@ export function RateCardEditor({
                   const bandPath = `${path}/long_context/${n}`;
                   const threshold = `${bandPath}/above_input_tokens`;
                   return (
-                    <div key={n} className="rate-band" role="group" aria-label={`${tierTitle(tier)} 长上下文档 ${n + 1}`}>
-                      <div className="r">
+                    <div
+                      key={n}
+                      className="rate-band mt-3 mb-0 rounded-md border border-border bg-muted/40 p-3"
+                      role="group"
+                      aria-label={`${tierTitle(tier)} 长上下文档 ${n + 1}`}
+                    >
+                      <div className={RATE_GRID}>
                         <Field label="输入超过（tokens）" error={at(threshold)}>
                           {(aria) => (
                             <input
@@ -330,21 +343,23 @@ export function RateCardEditor({
                           ),
                         )}
                       </div>
-                      <Button type="button" size="sm" kind="quiet" onClick={() => removeBand(tier, n)}>
-                        移除这个长上下文档
-                      </Button>
+                      <div className="mt-2 flex justify-end">
+                        <Button type="button" size="sm" kind="quiet" onClick={() => removeBand(tier, n)}>
+                          移除这个长上下文档
+                        </Button>
+                      </div>
                     </div>
                   );
                 })}
-                <p>
+                <div className="mt-3">
                   <Button type="button" size="sm" onClick={() => addBand(tier)}>
                     添加长上下文档
                   </Button>
-                </p>
+                </div>
               </section>
             );
           })}
-          <div className="rate-add-tier r">
+          <div className="rate-add-tier flex flex-wrap items-end gap-3 [&_.field]:mb-0 [&_.field]:min-w-48 [&_.field]:flex-1">
             <Field label="要添加的档位">
               <select value={picked} onChange={(e) => setAdding(e.target.value)}>
                 {offered.map((t) => (
@@ -364,7 +379,7 @@ export function RateCardEditor({
               添加档位
             </Button>
           </div>
-          <p className="hint">{TIER_HINT}</p>
+          <p className="hint mt-3 text-[13px]">{TIER_HINT}</p>
         </>
       ) : (
         <>
@@ -376,11 +391,11 @@ export function RateCardEditor({
           )}
         </>
       )}
-      <p>
+      <div className="mt-3">
         <Button type="button" size="sm" aria-pressed={json !== null} onClick={toggleJson}>
           编辑完整价格卡（JSON）
         </Button>
-      </p>
+      </div>
     </fieldset>
   );
 }

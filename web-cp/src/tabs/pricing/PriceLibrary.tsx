@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { Database } from "lucide-react";
 import type { TabProps } from "../../App";
 import { ApiError, library, type LibraryMeta, type LibraryPage } from "../../lib/api";
 import { messageFor } from "../../lib/errors";
@@ -15,6 +16,8 @@ import { useToast } from "../../ui/Toast";
 import { usdPerMillion } from "./Baselines";
 import { LibrarySync } from "./LibrarySync";
 import { CREDIT } from "./PricingImport";
+import { Card, CardHeader, PageHeader } from "../../components/page";
+import { Count } from "./kit";
 
 /** How many entries one search lists. */
 const LISTED = 50;
@@ -78,35 +81,59 @@ export function PriceLibrary({ canEdit, onGoto }: TabProps) {
   const meta = page?.library ?? null;
   return (
     <>
-      <div className="panel">
-        <h2>
-          价格库
-          <Button size="sm" type="button" icon="refresh" onClick={() => void load(q)}>
+      <PageHeader
+        title="价格库"
+        description={CREDIT}
+        actions={
+          <Button type="button" icon="refresh" onClick={() => void load(q)}>
             刷新
           </Button>
-        </h2>
-        <p className="hint">{CREDIT}</p>
-        <p className="library-status" aria-label="价格库状态">
-          {page === null ? "正在读取价格库…" : meta ? <>当前价格库：{libraryWords(meta)}</> : "还没有价格库。"}
-        </p>
-        {canEdit && (
-          <div className="library-update">
-            <Button type="button" kind="primary" busy={fetching} busyLabel="更新中…" onClick={() => void update()}>
-              更新价格库
-            </Button>
-            <span className="hint">
-              从数据集的发布地址获取最新数据。无法访问外网时，可在「导入审核」上传数据集文件，同样会更新价格库。
+        }
+      />
+      <Card>
+        <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3 lg:flex-nowrap">
+          <div className="flex min-w-0 items-center gap-3">
+            <span className="grid size-9 shrink-0 place-items-center rounded-lg border border-border bg-muted text-muted-foreground" aria-hidden="true">
+              <Database className="size-4" />
             </span>
-            <Button type="button" size="sm" onClick={() => onGoto("pricing", "imports")}>
-              去「导入审核」上传
-            </Button>
+            <p className="library-status m-0 font-medium" aria-label="价格库状态">
+              {page === null ? "正在读取价格库…" : meta ? <>当前价格库：{libraryWords(meta)}</> : "还没有价格库。"}
+            </p>
           </div>
+          {canEdit && (
+            <div className="flex shrink-0 flex-wrap items-center gap-2">
+              <Button type="button" onClick={() => onGoto("pricing", "imports")}>
+                去「导入审核」上传
+              </Button>
+              <Button type="button" kind="primary" busy={fetching} busyLabel="更新中…" onClick={() => void update()}>
+                更新价格库
+              </Button>
+            </div>
+          )}
+        </div>
+        {canEdit && (
+          <p className="hint mt-4 max-w-none border-t border-border pt-3 text-[13px]">
+            从数据集的发布地址获取最新数据。无法访问外网时，可在「导入审核」上传数据集文件，同样会更新价格库。
+          </p>
         )}
         {fetchError && (
-          <div className="note crit" role="alert">
+          <div className="note crit mb-0" role="alert">
             更新失败：{fetchError}
           </div>
         )}
+      </Card>
+      <Card>
+        <CardHeader
+          className="mb-0"
+          title={<>价格库条目{page?.library && <Count n={page.total} />}</>}
+          actions={
+            <div className="w-full sm:w-80 [&_.field]:mb-0">
+              <Field label="搜索模型" hint="按模型名称、ID、别名或供应商">
+                {(aria) => <input {...aria} type="search" autoComplete="off" value={q} onChange={(e) => setQ(e.target.value)} />}
+              </Field>
+            </div>
+          }
+        />
         {error && (
           <div className="note crit" role="alert">
             {error}{" "}
@@ -115,9 +142,6 @@ export function PriceLibrary({ canEdit, onGoto }: TabProps) {
             </Button>
           </div>
         )}
-        <Field label="搜索模型" hint="按模型名称、ID、别名或供应商">
-          {(aria) => <input {...aria} type="search" autoComplete="off" value={q} onChange={(e) => setQ(e.target.value)} />}
-        </Field>
         {page === null ? (
           !error && <Loading />
         ) : !meta ? (
@@ -126,7 +150,7 @@ export function PriceLibrary({ canEdit, onGoto }: TabProps) {
           <EmptyState text="没有匹配的模型。" />
         ) : (
           <>
-            <DataTable label="价格库条目">
+            <DataTable label="价格库条目" scroll>
               <thead>
                 <tr>
                   <th>供应商</th>
@@ -142,9 +166,9 @@ export function PriceLibrary({ canEdit, onGoto }: TabProps) {
                   const href = safeHttpUrl(e.pricing_url);
                   return (
                     <tr key={`${e.provider}/${e.model}`}>
-                      <td>{e.provider}</td>
+                      <td className="text-muted-foreground">{e.provider}</td>
                       <td>
-                        <span className="mono">{e.model}</span>
+                        <span className="mono font-medium">{e.model}</span>
                         {e.name && e.name !== e.model && <span className="cell-note">{e.name}</span>}
                         {e.flags.length > 0 && (
                           <span className="cell-note library-flags">{e.flags.map(flagText).join("、")}</span>
@@ -155,7 +179,7 @@ export function PriceLibrary({ canEdit, onGoto }: TabProps) {
                           </span>
                         )}
                         {longContextLines(e.card).length > 0 && (
-                          <span className="library-long-context">
+                          <span className="library-long-context mt-1">
                             <span className="tag">含长上下文价</span>
                             {longContextLines(e.card).map((line) => (
                               <span key={`${line.tier}/${line.above_input_tokens}`} className="cell-note tabular">
@@ -186,12 +210,12 @@ export function PriceLibrary({ canEdit, onGoto }: TabProps) {
                 })}
               </tbody>
             </DataTable>
-            <p className="hint">
+            <p className="hint -mx-6 -mb-6 mt-0 max-w-none rounded-b-[calc(var(--radius)+3px)] border-t border-border bg-muted/40 px-6 py-3 text-[13px]">
               共 {page.total} 条{page.total > page.items.length ? `，显示前 ${page.items.length} 条；输入更多文字以缩小范围` : ""}
             </p>
           </>
         )}
-      </div>
+      </Card>
       <LibrarySync canEdit={canEdit} generation={generation} />
     </>
   );

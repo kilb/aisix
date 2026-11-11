@@ -29,7 +29,9 @@ import { EmptyState } from "../../ui/EmptyState";
 import { Field, useRefusalFocus } from "../../ui/Field";
 import { SidePanel } from "../../ui/SidePanel";
 import { useToast } from "../../ui/Toast";
+import { Card, CardHeader, PageHeader } from "../../components/page";
 import { CardLines, LibrarySyncOne } from "./LibrarySync";
+import { Count, FormGrid } from "./kit";
 
 /** The rates of a baseline's `default` tier, when the card has both. */
 function headline(card: RateCard | null): { input: string; output: string } | null {
@@ -223,109 +225,116 @@ export function Baselines({ canEdit, onGoto }: TabProps) {
   const detailPrice = prices.find((p) => p.model_id === detail?.model_id) ?? null;
 
   return (
-    <div className={detail ? "with-side is-open" : "with-side"}>
-      <div className="side-main">
-        <div className="panel">
-          <h2>
-            基准价
-            <Button size="sm" type="button" icon="refresh" onClick={() => void load()}>
-              刷新
-            </Button>
-          </h2>
-          <p className="hint">
-            每个模型的官方美元标价。租户按它乘以密钥所在分组的换算率，得出以人民币计的售价；没有基准价的模型排在最前面：它们无法计费。
-          </p>
-          <p>
-            <Button type="button" size="sm" onClick={() => onGoto("pricing", "imports")}>
+    <>
+      <PageHeader
+        title="基准价"
+        description="每个模型的官方美元标价。租户按它乘以密钥所在分组的换算率，得出以人民币计的售价；没有基准价的模型排在最前面：它们无法计费。"
+        actions={
+          <>
+            <Button type="button" onClick={() => onGoto("pricing", "imports")}>
               去「导入审核」确认第三方数据
             </Button>
-          </p>
-          {error && (
-            <div className="note crit" role="alert">
-              {error}{" "}
-              <Button type="button" onClick={() => void load()}>
-                重试
-              </Button>
-            </div>
-          )}
-          {rows === null ? (
-            !error && <Loading />
-          ) : rows.length === 0 ? (
-            <EmptyState text="还没有模型。先在「价格 → 公共模型」中新建公共模型，或在「上游账号 → 模型」中获取上游模型。" />
-          ) : (
-            <DataTable label="基准价">
-              <thead>
-                <tr>
-                  <th>模型</th>
-                  <th className="num">输入</th>
-                  <th className="num">输出</th>
-                  <th>来源</th>
-                  <th>生效时间（UTC）</th>
-                  <th className="num">待生效</th>
-                </tr>
-              </thead>
-              <tbody>
-                {rows.map((r) => {
-                  const rates = headline(r.current?.card ?? null);
-                  return (
-                    <tr key={r.model_id} data-state={r.current ? "priced" : "unpriced"}>
-                      <td>
-                        <button
-                          type="button"
-                          className="link-button"
-                          title={r.name}
-                          aria-expanded={selected === r.model_id}
-                          onClick={() => setSelected(r.model_id)}
-                        >
-                          {r.name}
-                        </button>
-                        {r.catalogue_update && (
-                          <span className="cell-note baseline-update">{catalogueUpdateWords(r.catalogue_update).row}</span>
-                        )}
-                      </td>
-                      <td className="num">
-                        {!r.current ? (
-                          <span className="baseline-unpriced">未定价</span>
-                        ) : rates ? (
-                          <span className="tabular">{usdPerMillion(rates.input)}</span>
-                        ) : (
-                          "—"
-                        )}
-                      </td>
-                      <td className="num">
-                        {!r.current ? "—" : rates ? <span className="tabular">{usdPerMillion(rates.output)}</span> : "—"}
-                      </td>
-                      <td>{r.current ? <BaselineSourceBadge revision={r.current} /> : "—"}</td>
-                      <td className="tabular">
-                        {r.current ? fmtUtc(r.current.effective_from) : "—"}
-                        {r.upcoming.length > 0 && (
-                          <span className="cell-note">
-                            待生效 {r.upcoming.map((u) => fmtUtc(u.effective_from)).join("、")}
-                          </span>
-                        )}
-                      </td>
-                      <td className="num">{r.upcoming.length}</td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </DataTable>
-          )}
+            <Button type="button" icon="refresh" onClick={() => void load()}>
+              刷新
+            </Button>
+          </>
+        }
+      />
+      {error && (
+        <div className="note crit mt-0" role="alert">
+          {error}{" "}
+          <Button type="button" onClick={() => void load()}>
+            重试
+          </Button>
         </div>
-      </div>
-      {detail && (
-        <BaselinePanel
-          key={detail.model_id}
-          row={detail}
-          canEdit={canEdit}
-          catalogue={catalogue}
-          doc={models.find((m) => m.id === detail.model_id)?.doc ?? null}
-          prices={detailPrice}
-          onClose={() => setSelected(null)}
-          onSaved={load}
-        />
       )}
-    </div>
+      <div className={detail ? "with-side is-open gap-y-4 xl:grid-cols-[minmax(0,1fr)_minmax(440px,42%)]" : "with-side"}>
+        <div className="side-main min-w-0">
+          <Card className="mb-0">
+            <CardHeader className="mb-0" title={<>模型{rows && <Count n={rows.length} />}</>} />
+            {rows === null ? (
+              !error && <Loading />
+            ) : rows.length === 0 ? (
+              <EmptyState text="还没有模型。先在「价格 → 公共模型」中新建公共模型，或在「上游账号 → 模型」中获取上游模型。" />
+            ) : (
+              <DataTable label="基准价">
+                <thead>
+                  <tr>
+                    <th>模型</th>
+                    <th className="num">输入</th>
+                    <th className="num">输出</th>
+                    <th>来源</th>
+                    <th>生效时间（UTC）</th>
+                    <th className="num">待生效</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map((r) => {
+                    const rates = headline(r.current?.card ?? null);
+                    return (
+                      <tr
+                        key={r.model_id}
+                        data-state={r.current ? "priced" : "unpriced"}
+                        className={selected === r.model_id ? "bg-accent/60" : undefined}
+                      >
+                        <td>
+                          <button
+                            type="button"
+                            className="link-button"
+                            title={r.name}
+                            aria-expanded={selected === r.model_id}
+                            onClick={() => setSelected(r.model_id)}
+                          >
+                            {r.name}
+                          </button>
+                          {r.catalogue_update && (
+                            <span className="cell-note baseline-update">{catalogueUpdateWords(r.catalogue_update).row}</span>
+                          )}
+                        </td>
+                        <td className="num">
+                          {!r.current ? (
+                            <span className="baseline-unpriced">未定价</span>
+                          ) : rates ? (
+                            <span className="tabular">{usdPerMillion(rates.input)}</span>
+                          ) : (
+                            "—"
+                          )}
+                        </td>
+                        <td className="num">
+                          {!r.current ? "—" : rates ? <span className="tabular">{usdPerMillion(rates.output)}</span> : "—"}
+                        </td>
+                        <td>{r.current ? <BaselineSourceBadge revision={r.current} /> : "—"}</td>
+                        <td className="tabular">
+                          {r.current ? fmtUtc(r.current.effective_from) : "—"}
+                          {r.upcoming.length > 0 && (
+                            <span className="cell-note">
+                              待生效 {r.upcoming.map((u) => fmtUtc(u.effective_from)).join("、")}
+                            </span>
+                          )}
+                        </td>
+                        <td className="num">{r.upcoming.length}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </DataTable>
+            )}
+          </Card>
+        </div>
+        {detail && (
+          <BaselinePanel
+            key={detail.model_id}
+            row={detail}
+            canEdit={canEdit}
+            catalogue={catalogue}
+            doc={models.find((m) => m.id === detail.model_id)?.doc ?? null}
+            prices={detailPrice}
+            onClose={() => setSelected(null)}
+            onSaved={load}
+          />
+        )}
+      </div>
+    </>
   );
 }
 
@@ -427,48 +436,54 @@ function BaselinePanel({
       ),
   );
 
+  const head = row.current ? headline(row.current.card) : null;
   return (
     <SidePanel title={row.name} label={`${row.name} 的基准价`} onClose={onClose}>
       {canEdit && (
-        <form ref={form} className="baseline-form" aria-label="新基准价" onSubmit={(e) => void save(e)} noValidate>
-          <h3>新基准价</h3>
-          <Field label="方式">
-            {(aria) => (
-              <select {...aria} value={mode} onChange={(e) => setMode(e.target.value as "catalogue" | "manual")}>
-                <option value="catalogue">从官方目录</option>
-                <option value="manual">手动录入</option>
-              </select>
-            )}
-          </Field>
-          {mode === "catalogue" ? (
-            <Field label="目录条目" error={problemAt(details, (p) => p === "/catalogue_key")}>
+        <form ref={form} className="baseline-form mt-5" aria-label="新基准价" onSubmit={(e) => void save(e)} noValidate>
+          <h3 className="mb-4 text-base">新基准价</h3>
+          <FormGrid>
+            <Field label="方式">
               {(aria) => (
-                <select {...aria} value={chosen} onChange={(e) => setEntry(e.target.value)}>
-                  <option value="">请选择</option>
-                  {keys.map((k) => (
-                    <option key={k} value={k}>
-                      {k}
-                    </option>
-                  ))}
+                <select {...aria} value={mode} onChange={(e) => setMode(e.target.value as "catalogue" | "manual")}>
+                  <option value="catalogue">从官方目录</option>
+                  <option value="manual">手动录入</option>
                 </select>
               )}
             </Field>
-          ) : (
-            <>
+            {mode === "catalogue" && (
+              <Field label="目录条目" error={problemAt(details, (p) => p === "/catalogue_key")}>
+                {(aria) => (
+                  <select {...aria} value={chosen} onChange={(e) => setEntry(e.target.value)}>
+                    <option value="">请选择</option>
+                    {keys.map((k) => (
+                      <option key={k} value={k}>
+                        {k}
+                      </option>
+                    ))}
+                  </select>
+                )}
+              </Field>
+            )}
+          </FormGrid>
+          {mode === "manual" && (
+            <div className="mt-4 grid gap-4">
               <RateCardEditor value={card} onChange={setCard} details={details} onValidity={setCardOk} />
               <Field label="说明" hint="写明这份价格是从哪里抄来的，最多 500 字" error={problemAt(details, (p) => p === "/note")}>
                 {(aria) => (
                   <textarea {...aria} rows={3} autoComplete="off" value={note} onChange={(e) => setNote(e.target.value)} />
                 )}
               </Field>
-            </>
+            </div>
           )}
-          <EffectiveFrom
-            onResolve={(r) => {
-              resolver.current = r;
-            }}
-            error={problemAt(details, (p) => p === "/effective_from")}
-          />
+          <div className="mt-4 flex flex-col gap-3 [&_.field]:mb-0 [&_label.check]:mb-0">
+            <EffectiveFrom
+              onResolve={(r) => {
+                resolver.current = r;
+              }}
+              error={problemAt(details, (p) => p === "/effective_from")}
+            />
+          </div>
           {strayDetails.length > 0 && (
             <div className="note crit" role="alert">
               {strayDetails.map((d) => d.message).join("；")}
@@ -494,31 +509,39 @@ function BaselinePanel({
               </ul>
             </div>
           )}
-          <p>
+          <div className="mt-5 flex justify-end gap-2 border-t border-border pt-4">
             <Button type="submit" kind="primary" busy={saving} busyLabel="保存中…">
               保存
             </Button>
-          </p>
+          </div>
         </form>
       )}
-      <section className="baseline-now" aria-label="现行基准价">
-        <h3>现行与待生效</h3>
+      <section className={canEdit ? "mt-6 border-t border-border pt-6" : "mt-5"} aria-label="现行基准价">
+        <h3 className="mb-3 text-base">现行与待生效</h3>
         {row.current ? (
-          <div className="baseline-revision">
-            <div className="baseline-rates money">
-              {headline(row.current.card) ? (
-                <>
-                  {usdPerMillion(headline(row.current.card)!.input)}
-                  {" · "}
-                  {usdPerMillion(headline(row.current.card)!.output)}
-                </>
-              ) : (
-                "价目卡无法读取"
-              )}
+          <div className="rounded-lg border border-border bg-muted/40 p-4">
+            <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
+              <div className="baseline-rates money tabular-nums">
+                {head ? (
+                  <>
+                    {usdPerMillion(head.input)}
+                    {" · "}
+                    {usdPerMillion(head.output)}
+                  </>
+                ) : (
+                  "价目卡无法读取"
+                )}
+              </div>
+              <p className="hint tabular text-[13px]">生效于 {fmtUtc(row.current.effective_from)}</p>
             </div>
-            <p className="hint tabular">生效于 {fmtUtc(row.current.effective_from)}</p>
-            <CardLines card={row.current.card} />
-            <BaselineSourceBadge revision={row.current} />
+            <div className="mt-3 grid gap-3 border-t border-border pt-3 sm:grid-cols-2">
+              <div className="min-w-0 text-[13px]">
+                <CardLines card={row.current.card} />
+              </div>
+              <div className="min-w-0">
+                <BaselineSourceBadge revision={row.current} />
+              </div>
+            </div>
           </div>
         ) : (
           <p className="baseline-unpriced">未定价</p>
@@ -556,10 +579,16 @@ function BaselinePanel({
           </div>
         )}
       </section>
-      <LibrarySyncOne modelId={row.model_id} canEdit={canEdit} current={row.current} onSynced={onSaved} />
-      <section className="baseline-now" aria-label="各分组售价">
-        <h3>各分组售价</h3>
-        <p className="hint">现行基准价乘以每个分组现行的换算率，按每百万 token 计；这是租户折扣之前的价格。</p>
+      <LibrarySyncOne
+        className="mt-6 border-t border-border pt-6"
+        modelId={row.model_id}
+        canEdit={canEdit}
+        current={row.current}
+        onSynced={onSaved}
+      />
+      <section className="mt-6 border-t border-border pt-6" aria-label="各分组售价">
+        <h3 className="mb-1 text-base">各分组售价</h3>
+        <p className="hint text-[13px]">现行基准价乘以每个分组现行的换算率，按每百万 token 计；这是租户折扣之前的价格。</p>
         <GroupMatrix row={prices} />
       </section>
     </SidePanel>

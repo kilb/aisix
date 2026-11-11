@@ -145,6 +145,8 @@ test("新建分组必须填写默认换算率；列表显示显示名、路由�
   const display = `新分组 ${suffix}`;
   await openGroups(page);
 
+  // The form opens from the page's own 新建分组 button.
+  await page.getByRole("button", { name: "新建分组", exact: true }).click();
   const form = page.getByRole("group", { name: "新建分组" });
   // The operator-only warning about what tenants read.
   await expect(form).toContainText("显示名和说明对租户可见，不要写入上游渠道名称");
@@ -251,6 +253,8 @@ test("换算率 0 需要二次确认", async ({ page }) => {
   const display = `免费分组 ${suffix}`;
   await openGroups(page);
 
+  // The form opens from the page's own 新建分组 button.
+  await page.getByRole("button", { name: "新建分组", exact: true }).click();
   const form = page.getByRole("group", { name: "新建分组" });
   await form.getByLabel("路由名").fill(routing);
   await form.getByLabel("显示名").fill(display);

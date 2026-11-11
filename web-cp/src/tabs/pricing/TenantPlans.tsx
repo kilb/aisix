@@ -18,6 +18,9 @@ import { Loading } from "../../ui/DataTable";
 import { Field, useRefusalFocus } from "../../ui/Field";
 import { useToast } from "../../ui/Toast";
 import { discountBps, fmtPercent } from "../../lib/percent";
+import { Card, CardHeader, PageHeader, Split } from "../../components/page";
+import { EmptyState } from "../../ui/EmptyState";
+import { CardFooter, FormGrid } from "./kit";
 
 export function TenantPlans({ canEdit }: TabProps) {
   const [list, setList] = useState<Tenant[] | null>(null);
@@ -29,32 +32,41 @@ export function TenantPlans({ canEdit }: TabProps) {
   }, []);
 
   return (
-    <div className="panel">
-      <h2>租户方案</h2>
-      <p className="hint">
-        折扣乘在按分组价计的每次计费上。模型的价格由这个租户的密钥所在的分组决定；价格只能从现在或将来开始生效。
-      </p>
+    <>
+      <PageHeader
+        title="租户方案"
+        description="折扣乘在按分组价计的每次计费上。模型的价格由这个租户的密钥所在的分组决定；价格只能从现在或将来开始生效。"
+        actions={
+          list !== null && (
+            <label className="f filter filter-wide">
+              <span>租户</span>
+              <select value={tenantId} onChange={(e) => setTenantId(e.target.value)}>
+                <option value="">请选择租户</option>
+                {list.map((t) => (
+                  <option key={t.id} value={t.id}>
+                    {t.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )
+        }
+      />
       {error && (
-        <div className="note crit" role="alert">
+        <div className="note crit mt-0" role="alert">
           {error}
         </div>
       )}
       {list === null ? (
         !error && <Loading />
+      ) : tenantId ? (
+        <Plan key={tenantId} tenantId={tenantId} canEdit={canEdit} />
       ) : (
-        <Field label="租户">
-          <select value={tenantId} onChange={(e) => setTenantId(e.target.value)}>
-            <option value="">请选择租户</option>
-            {list.map((t) => (
-              <option key={t.id} value={t.id}>
-                {t.name}
-              </option>
-            ))}
-          </select>
-        </Field>
+        <Card className="mb-0">
+          <EmptyState text="选择一个租户，查看和设置它的折扣。" mark="route" />
+        </Card>
       )}
-      {tenantId && <Plan key={tenantId} tenantId={tenantId} canEdit={canEdit} />}
-    </div>
+    </>
   );
 }
 
@@ -135,53 +147,78 @@ function Discounts({ tenantId, plan, canEdit, onSaved }: { tenantId: string; pla
   }
 
   const stray = details.filter((d) => d.path !== "/discount_bps" && d.path !== "/effective_from");
+  const shown = (
+    <Card className="mb-0" role="region" aria-label="折扣">
+      <CardHeader title="折扣" />
+      <div className="grid gap-4 sm:grid-cols-2">
+        <div className="rounded-lg border border-border bg-muted/50 p-4">
+          <div className="text-[13px] font-medium text-muted-foreground">现行折扣</div>
+          <div className="mt-2 text-2xl font-semibold tracking-tight tabular-nums">
+            <strong data-testid="current-discount" className="font-semibold">
+              {current ? fmtPercent(current.discount_bps) : "无折扣"}
+            </strong>
+          </div>
+          {current && <div className="hint mt-1 text-[13px] tabular">自 {fmtUtc(current.effective_from)} 起</div>}
+        </div>
+        <div className="rounded-lg border border-border bg-muted/50 p-4">
+          <div className="text-[13px] font-medium text-muted-foreground">即将生效</div>
+          {upcoming.length > 0 ? (
+            <ul className="mt-2 space-y-1 tabular" aria-label="即将生效的折扣">
+              {upcoming.map((d) => (
+                <li key={d.revision_id}>
+                  {fmtUtc(d.effective_from)} 起 {fmtPercent(d.discount_bps)}
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <div className="mt-2 text-2xl font-semibold tracking-tight text-muted-foreground">—</div>
+          )}
+        </div>
+      </div>
+    </Card>
+  );
+  if (!canEdit) return shown;
   return (
-    <section className="plan-section" aria-label="折扣">
-      <h3>折扣</h3>
-      <p>
-        现行折扣：<strong data-testid="current-discount">{current ? fmtPercent(current.discount_bps) : "无折扣"}</strong>
-        {current && <span className="hint">（自 {fmtUtc(current.effective_from)} 起）</span>}
-      </p>
-      {upcoming.length > 0 && (
-        <>
-          <p>即将生效：</p>
-          <ul className="plan-upcoming" aria-label="即将生效的折扣">
-            {upcoming.map((d) => (
-              <li key={d.revision_id}>
-                {fmtUtc(d.effective_from)} 起 {fmtPercent(d.discount_bps)}
-              </li>
-            ))}
-          </ul>
-        </>
-      )}
-      {canEdit && (
-        <form ref={form} className="plan-form" aria-label="新折扣" onSubmit={(e) => void save(e)} noValidate>
-          <Field label="折扣（%）" error={problemAt(details, (p) => p === "/discount_bps")}>
-            {(aria) => <input {...aria} inputMode="decimal" autoComplete="off" value={percent} onChange={(e) => setPercent(e.target.value)} />}
-          </Field>
-          <EffectiveFrom
-            onResolve={(r) => {
-              resolver.current = r;
-            }}
-            error={problemAt(details, (p) => p === "/effective_from")}
-          />
-          {stray.length > 0 && (
-            <div className="note crit" role="alert">
-              {stray.map((d) => d.message).join("；")}
-            </div>
-          )}
-          {failure && (
-            <div className="note crit" role="alert">
-              {failure}
-            </div>
-          )}
-          <p>
-            <Button type="submit" kind="primary" busy={saving} busyLabel="保存中…">
-              保存折扣
-            </Button>
-          </p>
-        </form>
-      )}
-    </section>
+    <Split
+      asideWidth="420px"
+      main={shown}
+      aside={
+        <Card className="mb-0">
+          <CardHeader title="新折扣" />
+          <form ref={form} aria-label="新折扣" onSubmit={(e) => void save(e)} noValidate>
+            <FormGrid>
+              <Field label="折扣（%）" error={problemAt(details, (p) => p === "/discount_bps")}>
+                {(aria) => (
+                  <input {...aria} inputMode="decimal" autoComplete="off" value={percent} onChange={(e) => setPercent(e.target.value)} />
+                )}
+              </Field>
+              <div className="flex flex-col gap-3 @lg:pt-7">
+                <EffectiveFrom
+                  onResolve={(r) => {
+                    resolver.current = r;
+                  }}
+                  error={problemAt(details, (p) => p === "/effective_from")}
+                />
+              </div>
+            </FormGrid>
+            {stray.length > 0 && (
+              <div className="note crit" role="alert">
+                {stray.map((d) => d.message).join("；")}
+              </div>
+            )}
+            {failure && (
+              <div className="note crit" role="alert">
+                {failure}
+              </div>
+            )}
+            <CardFooter>
+              <Button type="submit" kind="primary" busy={saving} busyLabel="保存中…">
+                保存折扣
+              </Button>
+            </CardFooter>
+          </form>
+        </Card>
+      }
+    />
   );
 }

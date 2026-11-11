@@ -20,7 +20,10 @@ import { EmptyState } from "../../ui/EmptyState";
 import { Field, useRefusalFocus } from "../../ui/Field";
 import { TwoStep } from "../../ui/TwoStep";
 import { useToast } from "../../ui/Toast";
+import { Card, CardHeader, PageHeader, Split } from "../../components/page";
+import { Lamp } from "../../ui/Lamp";
 import { PublicModelDetail } from "./PublicModelDetail";
+import { CardFooter, Count } from "./kit";
 
 /** How many accounts serve a model, and at which priorities: `2 个（优先级 5、0）`. */
 function tiersOf(model: PublicModel): string {
@@ -190,131 +193,145 @@ export function PublicModels({ canEdit }: TabProps) {
   }
 
   return (
-    <div className="panel">
-      <h2>
-        公共模型
-        <Button size="sm" type="button" icon="refresh" onClick={() => void load()}>
-          刷新
-        </Button>
-      </h2>
-      <p className="hint">
-        租户请求的模型名。标识只生成一次，授权、基准价和分组换算率都跟着它，所以名称不改、也不接管已有模型；显示名重复时请直接使用已有模型。
-      </p>
+    // The page's own box draws nothing (`contents`): its cards do. It holds
+    // the heading with the list and the form, as the specs read it.
+    <div className="panel contents">
+      <PageHeader
+        title="公共模型"
+        description="租户请求的模型名。标识只生成一次，授权、基准价和分组换算率都跟着它，所以名称不改、也不接管已有模型；显示名重复时请直接使用已有模型。"
+        actions={
+          <Button type="button" icon="refresh" onClick={() => void load()}>
+            刷新
+          </Button>
+        }
+      />
       {error && (
-        <div className="note crit" role="alert">
+        <div className="note crit mt-0" role="alert">
           读取失败：{error}
         </div>
       )}
       {refusal && !atName && (
-        <div className="note crit" role="alert">
+        <div className="note crit mt-0" role="alert">
           {refusal}
         </div>
       )}
-      {rows === null ? (
-        !error && <Loading />
-      ) : rows.length === 0 ? (
-        <EmptyState text="还没有公共模型。" />
-      ) : (
-        <DataTable label="公共模型">
-          <thead>
-            <tr>
-              <th>名称</th>
-              <th>服务账号</th>
-              <th>定价</th>
-              <th className="num">授权租户</th>
-              <th className="num">密钥</th>
-              <th>状态</th>
-              <th className="right">操作</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((m) => {
-              const priced = prices === null ? null : pricedState(m, prices.get(m.id), liveGroups);
-              const retired = m.retired_at !== null;
-              return (
-                <tr key={m.id} data-model={m.id}>
-                  <td>
-                    <button type="button" className="link-button" onClick={() => setSelected(m.id)}>
-                      {m.name}
-                    </button>
-                  </td>
-                  <td>{tiersOf(m)}</td>
-                  <td>
-                    {retired ? (
-                      "—"
-                    ) : priced === null ? (
-                      "…"
-                    ) : priced.kind === "priced" ? (
-                      "已定价"
-                    ) : (
-                      <>
-                        <span className="pm-unpriced">未定价</span>
-                        <div className="cell-note">{unpricedReason(priced)}</div>
-                      </>
-                    )}
-                  </td>
-                  <td className="num">{m.reachable_tenants}</td>
-                  <td className="num">{m.reachable_keys}</td>
-                  <td>{retired ? "已停用" : "在用"}</td>
-                  <td className="right">
-                    {canEdit && retired && (
-                      <TwoStep
-                        label="恢复"
-                        size="sm"
-                        busy={busy.has(m.id)}
-                        busyLabel="恢复中…"
-                        warning={restoreWarning(m)}
-                        onConfirm={() => void restore(m)}
-                      />
-                    )}
-                    {canEdit && !retired && (
-                      <TwoStep
-                        label="删除"
-                        size="sm"
-                        kind="danger"
-                        busy={busy.has(m.id)}
-                        busyLabel="删除中…"
-                        // Always asked: refused, it says why; accepted, it cannot be undone.
-                        ask={() => true}
-                        warning={deleteWarning(m)}
-                        onConfirm={() => void remove(m)}
-                      />
-                    )}
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </DataTable>
-      )}
-      {canEdit && (
-        <form ref={form} className="pm-create" aria-label="新建公共模型" onSubmit={(e) => void create(e)}>
-          <h3>新建公共模型</h3>
-          <div className="r">
-            <Field label="名称" error={nameRefusal}>
-              {(aria) => (
-                <input
-                  required
-                  value={name}
-                  disabled={creating}
-                  placeholder="租户请求时填写的模型名"
-                  onChange={(e) => {
-                    setName(e.target.value);
-                    setRefusal(null);
-                    setAtName(false);
-                  }}
-                  {...aria}
-                />
-              )}
-            </Field>
-          </div>
-          <p>
-            <Button kind="primary" type="submit" busy={creating} busyLabel="新建中…">
-              新建
-            </Button>
-          </p>
-        </form>
-      )}
+      <Split
+        asideWidth="360px"
+        main={
+          <Card className="mb-0">
+            <CardHeader className="mb-0" title={<>全部公共模型{rows && <Count n={rows.length} />}</>} />
+            {rows === null ? (
+              !error && <Loading />
+            ) : rows.length === 0 ? (
+              <EmptyState text="还没有公共模型。" />
+            ) : (
+              <DataTable label="公共模型">
+                <thead>
+                  <tr>
+                    <th>名称</th>
+                    <th>服务账号</th>
+                    <th>定价</th>
+                    <th className="num">授权租户</th>
+                    <th className="num">密钥</th>
+                    <th>状态</th>
+                    <th className="right">操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map((m) => {
+                    const priced = prices === null ? null : pricedState(m, prices.get(m.id), liveGroups);
+                    const retired = m.retired_at !== null;
+                    return (
+                      <tr key={m.id} data-model={m.id}>
+                        <td>
+                          <button type="button" className="link-button" onClick={() => setSelected(m.id)}>
+                            {m.name}
+                          </button>
+                        </td>
+                        <td className={m.served_by.some((s) => s.enabled) ? undefined : "text-muted-foreground"}>{tiersOf(m)}</td>
+                        <td>
+                          {retired ? (
+                            "—"
+                          ) : priced === null ? (
+                            "…"
+                          ) : priced.kind === "priced" ? (
+                            "已定价"
+                          ) : (
+                            <>
+                              <span className="pm-unpriced">未定价</span>
+                              <div className="cell-note">{unpricedReason(priced)}</div>
+                            </>
+                          )}
+                        </td>
+                        <td className="num">{m.reachable_tenants}</td>
+                        <td className="num">{m.reachable_keys}</td>
+                        <td>
+                          <Lamp state={retired ? "disabled" : "applied"}>{retired ? "已停用" : "在用"}</Lamp>
+                        </td>
+                        <td className="right">
+                          {canEdit && retired && (
+                            <TwoStep
+                              label="恢复"
+                              size="sm"
+                              busy={busy.has(m.id)}
+                              busyLabel="恢复中…"
+                              warning={restoreWarning(m)}
+                              onConfirm={() => void restore(m)}
+                            />
+                          )}
+                          {canEdit && !retired && (
+                            <TwoStep
+                              label="删除"
+                              size="sm"
+                              kind="danger"
+                              busy={busy.has(m.id)}
+                              busyLabel="删除中…"
+                              // Always asked: refused, it says why; accepted, it cannot be undone.
+                              ask={() => true}
+                              warning={deleteWarning(m)}
+                              onConfirm={() => void remove(m)}
+                            />
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </DataTable>
+            )}
+          </Card>
+        }
+        aside={
+          canEdit ? (
+            <Card className="mb-0">
+              <CardHeader title="新建公共模型" description="新建后，请在任一上游账号的「模型」里勾选它。" />
+              <form ref={form} aria-label="新建公共模型" onSubmit={(e) => void create(e)}>
+                <Field label="名称" error={nameRefusal}>
+                  {(aria) => (
+                    <input
+                      required
+                      value={name}
+                      disabled={creating}
+                      placeholder="租户请求时填写的模型名"
+                      onChange={(e) => {
+                        setName(e.target.value);
+                        setRefusal(null);
+                        setAtName(false);
+                      }}
+                      {...aria}
+                    />
+                  )}
+                </Field>
+                <CardFooter className="mt-2">
+                  <Button kind="primary" type="submit" busy={creating} busyLabel="新建中…">
+                    新建
+                  </Button>
+                </CardFooter>
+              </form>
+            </Card>
+          ) : undefined
+        }
+      />
     </div>
   );
 }

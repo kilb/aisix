@@ -35,27 +35,7 @@
   padding-left: var(--s-5);
 }
 
-/* One tier of a price card in the manual form, and each of its long-context
-   bands: the tier's name as a heading, the band a quiet inset under it. */
-.rate-tier {
-  margin: 0 0 var(--s-4);
-  padding: var(--s-3) 0 0;
-  border-top: 1px solid var(--divider);
-}
-.rate-tier > h4 {
-  display: flex;
-  align-items: center;
-  gap: var(--s-2);
-  margin: 0 0 var(--s-2);
-}
+/* A refusal at one tier of a price card, under the tier's heading. */
 .rate-tier > .note {
   margin: 0 0 var(--s-3);
-}
-.rate-band {
-  margin: 0 0 var(--s-3);
-  padding: var(--s-2) var(--s-3);
-  border-left: 2px solid var(--divider);
-}
-.rate-add-tier {
-  align-items: end;
 }
