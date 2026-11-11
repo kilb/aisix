@@ -1,3 +1,4 @@
+import { Plus, RefreshCw, Trash2, Waypoints } from "lucide-react";
 import { Fragment, useEffect, useId, useRef, useState, type ReactNode } from "react";
 import type { TabProps } from "../App";
 import { ConflictNote } from "../components/ConflictNote";
@@ -32,12 +33,15 @@ import {
 import { inUseText, retireWarning } from "../lib/retireWarning";
 import { defaultAt, enumAt, loadSchema } from "../lib/schema";
 import { useResource } from "../lib/useResource";
+import { Card, CardHeader, PageHeader } from "../components/page";
+import { cn } from "../lib/cn";
 import { Button } from "../ui/Button";
 import { DataTable, Loading } from "../ui/DataTable";
 import { EmptyState } from "../ui/EmptyState";
+import type { FieldAria } from "../ui/Field";
 import { TwoStep } from "../ui/TwoStep";
 import { UpstreamModelPicker } from "../ui/UpstreamModelPicker";
-// The upstream-name field's own styles live with the account page that introduced it.
+import { GroupBadges } from "./providers/GroupBadges";
 
 /** One routing target; fields this page does not edit (such as `tags`) are kept as stored. */
 interface Target {
@@ -139,12 +143,22 @@ function targetModel(t: Target, catalog: Catalog): Model | undefined {
   return [...catalog.models.values()].find((m) => m.doc.display_name === t.model);
 }
 
-/** The groups of the account a direct model dispatches through, or why there are none to show. */
-function groupsOf(m: Model | undefined, catalog: Catalog): string {
+/** The groups of the account a direct model dispatches through, as badges, or why there are none to show. */
+function groupsOf(m: Model | undefined, catalog: Catalog): ReactNode {
   if (!m || shapeOf(m.doc) !== "direct") return "—";
   const account = m.doc.provider_key_id ? catalog.accounts.get(m.doc.provider_key_id) : undefined;
   if (!account) return "—（上游账号不存在）";
-  return account.doc.groups?.length ? account.doc.groups.join("、") : "—（账号未设分组）";
+  return <GroupBadges groups={account.doc.groups ?? []} empty="—（账号未设分组）" />;
+}
+
+/** `可服务分组：` and the groups, on a line of their own under what they belong to. */
+function ServedGroups({ children, className }: { children: ReactNode; className?: string }) {
+  return (
+    <div className={cn("sub mt-1 flex flex-wrap items-center gap-x-1.5 gap-y-1 text-[12px]", className)}>
+      <span>可服务分组：</span>
+      {children}
+    </div>
+  );
 }
 
 /**
@@ -407,94 +421,105 @@ export function Models({ canEdit }: TabProps) {
     onClose: () => setOpen(null),
   };
 
+  // The form open beside the list, and whether it is one whose rows of
+  // fields need the wider column (a routing model's targets).
+  let editor: ReactNode = null;
+  let wide = false;
+  if (open?.mode === "new") {
+    editor = <ModelForm key={`new-${open.shape}`} model={null} shape={open.shape} readOnly={false} onReload={() => undefined} {...formProps} />;
+    wide = open.shape === "routing";
+  } else if (editing && editingPublic) {
+    editor = (
+      // Keyed by the public model alone: the reads a save or a removal
+      // starts must not throw away what is still typed in the form, which
+      // shows every untouched field as last read.
+      <PublicRoutingForm
+        key={editingPublic.id}
+        publicModel={editingPublic}
+        catalog={catalog}
+        schema={schema}
+        readOnly={!canEdit}
+        onClose={() => setOpen(null)}
+        onSaved={(view, complete) => {
+          // A save that left something unsaved says so in the form, at each refusal.
+          setNote(complete && view ? { kind: "ok", text: `已保存「${view.name}」的路由设置。` } : null);
+          if (view === null) return;
+          // The model as the save left it first, so the form shows the
+          // regenerated targets whichever read below lands first.
+          applyPublic(view);
+          void models.reload();
+          void loadPublics();
+        }}
+        onTargetRemoved={(where, view) => {
+          setNote({
+            kind: "ok",
+            text: `已移除账号「${where}」对「${editingPublic.name}」的映射，该目标已不在路由里。`,
+          });
+          if (view) applyPublic(view);
+          void models.reload();
+          void loadPublics();
+        }}
+      />
+    );
+    wide = true;
+  } else if (editing && editable && (shapeOf(editing.doc) === "direct" || shapeOf(editing.doc) === "routing")) {
+    const shape = shapeOf(editing.doc) as "direct" | "routing";
+    editor = (
+      // Keyed by version: a reload that finds a newer version starts the edit over.
+      <ModelForm
+        key={`${editing.id}:${editing.version}`}
+        model={editing}
+        shape={shape}
+        readOnly={!canEdit || modelSource(editing).kind === "public"}
+        onReload={() => void models.reload()}
+        {...formProps}
+      />
+    );
+    wide = shape === "routing";
+  }
+  // With a form beside it the list keeps the columns that find a row (its
+  // name, where it comes from, its state, its actions) and scrolls in its
+  // own box; the rest come back when the form closes.
+  const split = editor !== null;
+  const full = split ? "xl:hidden" : undefined;
+
   return (
     <>
-      {open?.mode === "new" && (
-        <ModelForm key={`new-${open.shape}`} model={null} shape={open.shape} readOnly={false} onReload={() => undefined} {...formProps} />
-      )}
-      {editing && editingPublic && (
-        // Keyed by the public model alone: the reads a save or a removal
-        // starts must not throw away what is still typed in the form, which
-        // shows every untouched field as last read.
-        <PublicRoutingForm
-          key={editingPublic.id}
-          publicModel={editingPublic}
-          catalog={catalog}
-          schema={schema}
-          readOnly={!canEdit}
-          onClose={() => setOpen(null)}
-          onSaved={(view, complete) => {
-            // A save that left something unsaved says so in the form, at each refusal.
-            setNote(complete && view ? { kind: "ok", text: `已保存「${view.name}」的路由设置。` } : null);
-            if (view === null) return;
-            // The model as the save left it first, so the form shows the
-            // regenerated targets whichever read below lands first.
-            applyPublic(view);
-            void models.reload();
-            void loadPublics();
-          }}
-          onTargetRemoved={(where, view) => {
-            setNote({
-              kind: "ok",
-              text: `已移除账号「${where}」对「${editingPublic.name}」的映射，该目标已不在路由里。`,
-            });
-            if (view) applyPublic(view);
-            void models.reload();
-            void loadPublics();
-          }}
-        />
-      )}
-      {editing && editable && !editingPublic && (shapeOf(editing.doc) === "direct" || shapeOf(editing.doc) === "routing") && (
-        // Keyed by version: a reload that finds a newer version starts the edit over.
-        <ModelForm
-          key={`${editing.id}:${editing.version}`}
-          model={editing}
-          shape={shapeOf(editing.doc) as "direct" | "routing"}
-          readOnly={!canEdit || modelSource(editing).kind === "public"}
-          onReload={() => void models.reload()}
-          {...formProps}
-        />
-      )}
-
-      <div className="panel">
-        <h2>
-          模型与路由
-          <Button
-            size="sm"
-            type="button"
-            icon="refresh"
-            onClick={refresh}
-          >
-            刷新
-          </Button>
-        </h2>
-        <p className="hint">
-          租户按对外名称调用模型。直连模型经一个上游账号调用上游模型；路由模型按选路策略在若干直连模型之间选择。每个模型可服务的分组来自它的上游账号：普通租户只能用到其分组内的账号。
-        </p>
-        <p className="hint">
-          要让租户看到和购买的模型，请在「上游账号 → 模型」中建为公共模型，它生成的直连模型只在内部使用；在这里新建的模型会出现在分组定价和租户授权中。
-        </p>
-        {canEdit && !open && (
-          <p>
-            <Button kind="primary" onClick={() => openForm({ mode: "new", shape: "direct" })}>
-              新增直连模型
-            </Button>{" "}
-            <Button kind="primary" onClick={() => openForm({ mode: "new", shape: "routing" })}>
-              新增路由模型
+      <PageHeader
+        title="模型与路由"
+        // Narrower than the default, so the three actions keep their place beside it at 1440px.
+        className="[&>div:first-child]:max-w-2xl"
+        description={
+          <>
+            租户按对外名称调用模型。直连模型经一个上游账号调用上游模型；路由模型按选路策略在若干直连模型之间选择。每个模型可服务的分组来自它的上游账号：普通租户只能用到其分组内的账号。
+            <span className="mt-1.5 block">
+              要让租户看到和购买的模型，请在「上游账号 → 模型」中建为公共模型，它生成的直连模型只在内部使用；在这里新建的模型会出现在分组定价和租户授权中。
+            </span>
+          </>
+        }
+        actions={
+          <>
+            <Button type="button" onClick={refresh}>
+              <RefreshCw aria-hidden />
+              刷新
             </Button>
-          </p>
-        )}
+            {canEdit && !open && (
+              <>
+                <Button onClick={() => openForm({ mode: "new", shape: "routing" })}>
+                  <Waypoints aria-hidden />
+                  新增路由模型
+                </Button>
+                <Button kind="primary" onClick={() => openForm({ mode: "new", shape: "direct" })}>
+                  <Plus aria-hidden />
+                  新增直连模型
+                </Button>
+              </>
+            )}
+          </>
+        }
+      />
+      <div className="mb-6 grid gap-3 empty:hidden [&>.note]:m-0">
         <Msg note={note} />
-        <div className="r">
-          <label className="f filter">
-            <input
-              type="checkbox"
-              checked={showInternal}
-              onChange={(e) => setShowInternal(e.target.checked)}
-            />{" "}
-            <span>显示内部直连模型（{counts.internal}）</span>
-          </label>
-        </div>
         {deleteFailure &&
           (deleteFailure.error.code === "version_mismatch" ? (
             <ConflictNote
@@ -537,147 +562,176 @@ export function Models({ canEdit }: TabProps) {
             公共模型读取失败，来源一列的名称无法显示：{publicsError}
           </div>
         )}
-        {models.items === null ? (
-          !models.error && <Loading />
-        ) : models.items.length === 0 ? (
-          <EmptyState text="还没有模型。" />
-        ) : shown.length === 0 ? (
-          <EmptyState text="没有模型。" />
-        ) : (
-          <DataTable>
-            <thead>
-              <tr>
-                <th>对外名称</th>
-                <th>分类</th>
-                <th>类型</th>
-                <th>上游账号 / 路由目标</th>
-                <th>状态</th>
-                <th className="right">操作</th>
-              </tr>
-            </thead>
-            <tbody>
-              {shown.map((m) => {
-                const shape = shapeOf(m.doc);
-                const hasForm = shape === "direct" || shape === "routing";
-                const src = modelSource(m);
-                const from = src.kind === "public" ? publicById?.get(src.id) : undefined;
-                return (
-                  <Fragment key={m.id}>
-                    <tr>
-                      <td>{nameOf(m)}</td>
-                      <td>
-                        <Source model={m} source={src} from={from} publicRead={publicById !== null} catalog={catalog} />
-                      </td>
-                      <td>{SHAPE_LABEL[shape]}</td>
-                      <td>
-                        <Upstream model={m} catalog={catalog} />
-                      </td>
-                      <td>
-                        <RolloutBadge rollout={m.rollout} />
-                      </td>
-                      <td className="right">
-                        {src.kind === "public" ? (
-                          <>
-                            {src.generated ? (
-                              // One account's mapping: it is edited as a target
-                              // of the routing row's form, so this is a view.
-                              <div className="sub">由公共模型生成，在「{from?.name ?? src.id}」的路由里改</div>
-                            ) : (
-                              <div className="sub">由公共模型生成，路由设置在这里改</div>
-                            )}
-                            {/* The routing document is the public name itself:
-                                its settings and its targets are this page's. */}
-                            <Button
-                              size="sm"
-                              onClick={() => openForm({ mode: "edit", id: m.id })}
-                              disabled={!src.generated && !from}
-                            >
-                              {canEdit && !src.generated ? "编辑" : "查看"}
-                            </Button>
-                            {/* A direct row is one account's mapping, so the one
-                                removal that fits it takes that account out of the
-                                routing model and leaves the name alone. Retiring the
-                                public model is the routing row's own action. */}
-                            {canEdit && src.generated && m.doc.provider_key_id && (
-                              <TwoStep
-                                label="移除该目标"
-                                size="sm"
-                                busy={removingTarget === m.id}
-                                busyLabel="移除中…"
-                                warning={`移除后「${
-                                  catalog.accounts.get(m.doc.provider_key_id)?.doc.display_name ??
-                                  m.doc.provider_key_id
-                                }」不再服务「${publicById?.get(src.id)?.name ?? src.id}」：本账号的映射被删除，它的直连文档随之移除。公共模型和其他账号不受影响。`}
-                                onConfirm={() => void removeTarget(m)}
-                              />
-                            )}
-                            {canEdit && !src.generated && from && (
-                              <TwoStep
-                                label="停用"
-                                size="sm"
-                                busy={retiring === src.id}
-                                busyLabel="停用中…"
-                                // Asked on the row the operator clicked: the warning says what goes,
-                                // or that the retire would be refused and why.
-                                warning={retireWarning(from)}
-                                onConfirm={() => void retire(src.id)}
-                              />
-                            )}
-                          </>
-                        ) : deleting?.id === m.id ? (
-                          <>
-                            <Button
-                              kind="danger"
-                              size="sm"
-                              disabled={busy || deleting.holders === null}
-                              busy={busy}
-                              busyLabel="确认删除"
-                              onClick={() => void remove(m)}
-                            >
-                              确认删除
-                            </Button>
-                            <Button size="sm" disabled={busy} onClick={cancelDelete}>
-                              取消
-                            </Button>
-                          </>
-                        ) : (
-                          <>
-                            {hasForm && (
-                              <Button size="sm" onClick={() => openForm({ mode: "edit", id: m.id })}>
-                                {canEdit ? "编辑" : "查看"}
-                              </Button>
-                            )}
-                            {canEdit && (
-                              <Button size="sm" disabled={busy} onClick={() => void startDelete(m)}>
-                                删除
-                              </Button>
-                            )}
-                          </>
-                        )}
-                      </td>
-                    </tr>
-                    {deleting?.id === m.id && (
-                      <tr className="dt-detail">
-                        <td colSpan={6}>
-                          <DeleteWarning holders={deleting.holders} />
-                        </td>
-                      </tr>
-                    )}
-                    {src.kind === "public" && !from && publicById !== null && (
-                      <tr className="dt-detail">
-                        <td colSpan={6}>
-                          <p className="hint">
-                            它的公共模型「{src.id}」已不在列表里，请刷新；这次停用不能在这里执行。
-                          </p>
-                        </td>
-                      </tr>
-                    )}
-                  </Fragment>
-                );
-              })}
-            </tbody>
-          </DataTable>
+      </div>
+
+      {/* In reading order the form comes first, as it did above the list;
+          from 1280px the list takes the left column and the form the right. */}
+      <div
+        className={cn(
+          "grid items-start gap-6",
+          split && (wide ? "xl:grid-cols-[minmax(0,4fr)_minmax(0,5fr)]" : "xl:grid-cols-[minmax(0,1fr)_minmax(26rem,34rem)]"),
         )}
+      >
+        {editor && <div className="min-w-0 xl:col-start-2 xl:row-start-1">{editor}</div>}
+        <Card className="mb-0 min-w-0 xl:col-start-1 xl:row-start-1">
+          <CardHeader
+            title="全部模型"
+            className="mb-0 items-center"
+            actions={
+              <label className="inline-flex cursor-pointer items-center gap-2 text-[13px] text-text-2">
+                <input type="checkbox" checked={showInternal} onChange={(e) => setShowInternal(e.target.checked)} />
+                <span>显示内部直连模型（{counts.internal}）</span>
+              </label>
+            }
+          />
+          {models.items === null ? (
+            !models.error && <Loading />
+          ) : models.items.length === 0 ? (
+            <EmptyState text="还没有模型。" />
+          ) : shown.length === 0 ? (
+            <EmptyState text="没有模型。" />
+          ) : (
+            <DataTable scroll={split}>
+              <thead>
+                <tr>
+                  <th>对外名称</th>
+                  <th>分类</th>
+                  <th className={full}>类型</th>
+                  <th className={full}>上游账号 / 路由目标</th>
+                  <th>状态</th>
+                  <th className="right">操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                {shown.map((m) => {
+                  const shape = shapeOf(m.doc);
+                  const hasForm = shape === "direct" || shape === "routing";
+                  const src = modelSource(m);
+                  const from = src.kind === "public" ? publicById?.get(src.id) : undefined;
+                  return (
+                    <Fragment key={m.id}>
+                      <tr className={editing?.id === m.id ? "bg-accent" : undefined}>
+                        <td className="font-medium">
+                          <span className={cn("block truncate", split ? "max-w-[12rem]" : "max-w-[20rem]")} title={nameOf(m)}>
+                            {nameOf(m)}
+                          </span>
+                        </td>
+                        <td className="whitespace-normal">
+                          <Source model={m} source={src} from={from} publicRead={publicById !== null} catalog={catalog} brief={split} />
+                        </td>
+                        <td className={cn("text-text-2", full)}>{SHAPE_LABEL[shape]}</td>
+                        <td className={cn("whitespace-normal", full)}>
+                          <div className="min-w-56">
+                            <Upstream model={m} catalog={catalog} />
+                          </div>
+                        </td>
+                        <td>
+                          <RolloutBadge rollout={m.rollout} />
+                        </td>
+                        <td className="right">
+                          {src.kind === "public" ? (
+                            <>
+                              {/* The routing document is the public name itself:
+                                  its settings and its targets are this page's. */}
+                              <Button
+                                size="sm"
+                                onClick={() => openForm({ mode: "edit", id: m.id })}
+                                disabled={!src.generated && !from}
+                              >
+                                {canEdit && !src.generated ? "编辑" : "查看"}
+                              </Button>
+                              {/* A direct row is one account's mapping, so the one
+                                  removal that fits it takes that account out of the
+                                  routing model and leaves the name alone. Retiring the
+                                  public model is the routing row's own action. */}
+                              {canEdit && src.generated && m.doc.provider_key_id && (
+                                <TwoStep
+                                  label="移除该目标"
+                                  size="sm"
+                                  busy={removingTarget === m.id}
+                                  busyLabel="移除中…"
+                                  warning={`移除后「${
+                                    catalog.accounts.get(m.doc.provider_key_id)?.doc.display_name ??
+                                    m.doc.provider_key_id
+                                  }」不再服务「${publicById?.get(src.id)?.name ?? src.id}」：本账号的映射被删除，它的直连文档随之移除。公共模型和其他账号不受影响。`}
+                                  onConfirm={() => void removeTarget(m)}
+                                />
+                              )}
+                              {canEdit && !src.generated && from && (
+                                <TwoStep
+                                  label="停用"
+                                  size="sm"
+                                  busy={retiring === src.id}
+                                  busyLabel="停用中…"
+                                  // Asked on the row the operator clicked: the warning says what goes,
+                                  // or that the retire would be refused and why.
+                                  warning={retireWarning(from)}
+                                  onConfirm={() => void retire(src.id)}
+                                />
+                              )}
+                              {src.generated ? (
+                                // One account's mapping: it is edited as a target
+                                // of the routing row's form, so this is a view.
+                                <span className={cn("cell-note ml-auto", full)}>由公共模型生成，在「{from?.name ?? src.id}」的路由里改</span>
+                              ) : (
+                                <span className={cn("cell-note ml-auto", full)}>由公共模型生成，路由设置在这里改</span>
+                              )}
+                            </>
+                          ) : deleting?.id === m.id ? (
+                            <>
+                              <Button
+                                kind="danger"
+                                size="sm"
+                                disabled={busy || deleting.holders === null}
+                                busy={busy}
+                                busyLabel="确认删除"
+                                onClick={() => void remove(m)}
+                              >
+                                确认删除
+                              </Button>
+                              <Button size="sm" disabled={busy} onClick={cancelDelete}>
+                                取消
+                              </Button>
+                            </>
+                          ) : (
+                            <>
+                              {hasForm && (
+                                <Button size="sm" onClick={() => openForm({ mode: "edit", id: m.id })}>
+                                  {canEdit ? "编辑" : "查看"}
+                                </Button>
+                              )}
+                              {canEdit && (
+                                <Button size="sm" kind="quiet" disabled={busy} onClick={() => void startDelete(m)}>
+                                  删除
+                                </Button>
+                              )}
+                            </>
+                          )}
+                        </td>
+                      </tr>
+                      {deleting?.id === m.id && (
+                        <tr className="dt-detail">
+                          <td colSpan={6} className="whitespace-normal">
+                            <DeleteWarning holders={deleting.holders} />
+                          </td>
+                        </tr>
+                      )}
+                      {src.kind === "public" && !from && publicById !== null && (
+                        <tr className="dt-detail">
+                          <td colSpan={6} className="whitespace-normal">
+                            <p className="hint text-[13px]">
+                              它的公共模型「{src.id}」已不在列表里，请刷新；这次停用不能在这里执行。
+                            </p>
+                          </td>
+                        </tr>
+                      )}
+                    </Fragment>
+                  );
+                })}
+              </tbody>
+            </DataTable>
+          )}
+        </Card>
       </div>
     </>
   );
@@ -691,20 +745,24 @@ function Upstream({ model, catalog }: { model: Model; catalog: Catalog }) {
       const account = doc.provider_key_id ? catalog.accounts.get(doc.provider_key_id) : undefined;
       return (
         <>
-          {account?.doc.display_name || doc.provider_key_id || "—"} · <code>{doc.model_name ?? "—"}</code>
-          <div className="sub">可服务分组：{groupsOf(model, catalog)}</div>
+          <div className="flex flex-wrap items-baseline gap-x-1.5">
+            <span>{account?.doc.display_name || doc.provider_key_id || "—"}</span>
+            <span className="text-muted-foreground">·</span>
+            <code className="text-[13px]">{doc.model_name ?? "—"}</code>
+          </div>
+          <ServedGroups>{groupsOf(model, catalog)}</ServedGroups>
         </>
       );
     }
     case "routing":
       return (
-        <ul className="targets">
+        <ul className="grid gap-2">
           {(doc.routing?.targets ?? []).map((t, i) => {
             const target = targetModel(t, catalog);
             return (
-              <li key={i}>
-                {target ? nameOf(target) : `${t.model_id ?? t.model ?? "—"}（模型不存在）`}
-                <span className="sub"> · 可服务分组：{groupsOf(target, catalog)}</span>
+              <li key={i} className="min-w-0">
+                <span>{target ? nameOf(target) : `${t.model_id ?? t.model ?? "—"}（模型不存在）`}</span>
+                <ServedGroups className="mt-0.5">{groupsOf(target, catalog)}</ServedGroups>
               </li>
             );
           })}
@@ -726,6 +784,7 @@ function Source({
   from,
   publicRead,
   catalog,
+  brief,
 }: {
   model: Model;
   source: ModelSource;
@@ -734,23 +793,32 @@ function Source({
   /** Whether that list was read: without it a missing name is not a missing model. */
   publicRead: boolean;
   catalog: Catalog;
+  /** Beside a form, from 1280px: the class alone, its notes left out. */
+  brief: boolean;
 }) {
-  if (source.kind === "manual") return <>手工创建</>;
+  const note = brief ? "xl:hidden" : undefined;
+  if (source.kind === "manual") return <span className="tag">手工创建</span>;
   const name = from?.name;
   const account = model.doc.provider_key_id ? catalog.accounts.get(model.doc.provider_key_id) : undefined;
   // The row a caller names is 对外; the per-account documents behind it are
   // 内部直连 — reachable only as that row's targets, never granted or priced.
   const shared = (
-    <div className="sub">{publicRead ? (name ?? `${source.id}（公共模型已不在列表）`) : "…"}</div>
+    <div className={cn("sub mt-1 max-w-[16rem] min-w-28 font-mono text-[12px] [overflow-wrap:anywhere]", note)}>
+      {publicRead ? (name ?? `${source.id}（公共模型已不在列表）`) : "…"}
+    </div>
   );
-  if (!source.generated) return <>对外{shared}</>;
+  if (!source.generated)
+    return (
+      <>
+        <span className="tag border-foreground/20 bg-card text-foreground">对外</span>
+        {shared}
+      </>
+    );
   return (
     <>
-      内部直连
+      <span className="tag border-dashed">内部直连</span>
       {shared}
-      <div className="sub">
-        {account ? `账号：${account.doc.display_name || account.id}` : "账号：已不存在"}
-      </div>
+      <div className={cn("sub text-[12px]", note)}>{account ? `账号：${account.doc.display_name || account.id}` : "账号：已不存在"}</div>
     </>
   );
 }
@@ -1007,30 +1075,26 @@ function ModelForm({
   const listed = details.filter((d) => !shown.includes(d.path));
 
   return (
-    <form ref={form} className="panel" aria-label={title} onSubmit={submit}>
-      <h2>{title}</h2>
-      <Field label="对外名称" error={at("/display_name")}>
-        {(aria) => <input required disabled={locked} value={name} onChange={(e) => setName(e.target.value)} {...aria} />}
-      </Field>
-      {!isNew && !readOnly && (
-        <p className="hint">
-          {RENAME_HINT}
-          {RENAME_BY_NAME}
-        </p>
-      )}
+    <form ref={form} className="panel @container mb-0" aria-label={title} onSubmit={submit}>
+      <CardHeader title={title} className="mb-5" />
+      <div className="grid gap-x-4 @md:grid-cols-2">
+        <div className="min-w-0 @md:col-span-2">
+          <Field label="对外名称" error={at("/display_name")}>
+            {(aria) => <input required disabled={locked} value={name} onChange={(e) => setName(e.target.value)} {...aria} />}
+          </Field>
+          {!isNew && !readOnly && (
+            <p className="hint -mt-2 mb-4 text-[13px]">
+              {RENAME_HINT}
+              {RENAME_BY_NAME}
+            </p>
+          )}
+        </div>
 
-      {shape === "direct" ? (
-        <>
-          <div className="r">
+        {shape === "direct" ? (
+          <>
             <Field label="上游账号" error={at("/provider_key_id")}>
               {(aria) => (
-                <select
-                  required
-                  disabled={locked}
-                  value={accountId}
-                  onChange={(e) => chooseAccount(e.target.value)}
-                  {...aria}
-                >
+                <select required disabled={locked} value={accountId} onChange={(e) => chooseAccount(e.target.value)} {...aria}>
                   <option value="">（选择上游账号）</option>
                   {accountOptions.map((o) => (
                     <option key={o.id} value={o.id}>
@@ -1045,133 +1109,147 @@ function ModelForm({
                 <input required disabled={locked} value={provider} onChange={(e) => setProvider(e.target.value)} {...aria} />
               )}
             </Field>
+            {account && (
+              <p className="hint -mt-2 mb-4 flex flex-wrap items-center gap-x-1.5 gap-y-1 text-[13px] @md:col-span-2">
+                <span>该账号可服务的分组：</span>
+                <GroupBadges groups={account.doc.groups ?? []} empty="—（账号未设分组）" />
+              </p>
+            )}
+            <div className="min-w-0 @md:col-span-2">
+              <Field label="上游模型" error={at("/model_name")}>
+                {(aria) => (
+                  <input
+                    required
+                    disabled={locked}
+                    className="font-mono text-[13px]"
+                    value={upstream}
+                    onChange={(e) => setUpstream(e.target.value)}
+                    {...aria}
+                  />
+                )}
+              </Field>
+            </div>
+          </>
+        ) : schema && "error" in schema ? (
+          <div className="f">
+            <span>选路策略</span>
+            <div className="note crit m-0" role="alert">
+              {schema.error}
+            </div>
           </div>
-          {account && (
-            <p className="hint">
-              该账号可服务的分组：{account.doc.groups?.length ? account.doc.groups.join("、") : "—（账号未设分组）"}
-            </p>
-          )}
-          <Field label="上游模型" error={at("/model_name")}>
+        ) : (
+          <Field label="选路策略" error={at("/routing/strategy")}>
             {(aria) => (
-              <input required disabled={locked} value={upstream} onChange={(e) => setUpstream(e.target.value)} {...aria} />
+              <select disabled={locked || strategies === null} value={shownStrategy} onChange={(e) => setStrategy(e.target.value)} {...aria}>
+                {strategyOptions.map((v) => (
+                  <option key={v} value={v}>
+                    {v}
+                  </option>
+                ))}
+              </select>
             )}
           </Field>
-        </>
-      ) : (
-        <>
-          {schema && "error" in schema ? (
-            <div className="f">
-              <span>选路策略</span>
-              <div className="note crit" role="alert">
-                {schema.error}
-              </div>
+        )}
+      </div>
+
+      {shape === "routing" && (
+        <div className="@container mt-2 border-t border-border pt-5">
+          <h4 className="mb-3 text-sm font-semibold">路由目标（{rows.length}）</h4>
+          <div className="overflow-hidden rounded-lg border border-border">
+            <div aria-hidden="true" className={cn(MANUAL_ROW, "hidden border-b border-border bg-muted px-3 py-2 text-xs font-medium text-muted-foreground @lg:grid")}>
+              <span>目标模型</span>
+              <span>权重</span>
+              <span>优先级</span>
+              <span />
             </div>
-          ) : (
-            <Field label="选路策略" error={at("/routing/strategy")}>
-              {(aria) => (
-                <select
-                  disabled={locked || strategies === null}
-                  value={shownStrategy}
-                  onChange={(e) => setStrategy(e.target.value)}
-                  {...aria}
-                >
-                  {strategyOptions.map((v) => (
-                    <option key={v} value={v}>
-                      {v}
-                    </option>
-                  ))}
-                </select>
-              )}
-            </Field>
-          )}
-          {rows.map((r, i) => {
-            const target = catalog.models.get(r.modelId);
-            return (
-              <div key={r.key} className="target" role="group" aria-label={`目标 ${i + 1}`}>
-                <div className="r">
-                  <Field label="目标模型" error={targetAt(r, "model_id")}>
-                    {(aria) => (
-                      <select
-                        required
-                        disabled={locked}
-                        value={r.modelId}
-                        onChange={(e) => setRow(r.key, { modelId: e.target.value })}
-                        {...aria}
-                      >
-                        <option value="">（选择直连模型）</option>
-                        {targetOptions(r).map((o) => (
-                          <option key={o.id} value={o.id}>
-                            {o.label}
-                          </option>
-                        ))}
-                      </select>
-                    )}
-                  </Field>
-                  <Field label="权重" error={targetAt(r, "weight")}>
+            {rows.map((r, i) => {
+              const target = catalog.models.get(r.modelId);
+              return (
+                <div key={r.key} className={cn(MANUAL_ROW, "border-border p-3 not-last:border-b")} role="group" aria-label={`目标 ${i + 1}`}>
+                  <div className="col-span-2 min-w-0 @lg:col-span-1">
+                    <RowField label="目标模型" error={targetAt(r, "model_id")}>
+                      {(aria) => (
+                        <select required disabled={locked} value={r.modelId} onChange={(e) => setRow(r.key, { modelId: e.target.value })} {...aria}>
+                          <option value="">（选择直连模型）</option>
+                          {targetOptions(r).map((o) => (
+                            <option key={o.id} value={o.id}>
+                              {o.label}
+                            </option>
+                          ))}
+                        </select>
+                      )}
+                    </RowField>
+                    {r.modelId && <ServedGroups className="mt-1.5">{groupsOf(target, catalog)}</ServedGroups>}
+                  </div>
+                  <RowField label="权重" error={targetAt(r, "weight")}>
                     {(aria) => (
                       <input
                         type="number"
                         min={0}
                         step={1}
+                        className="text-right tabular-nums"
                         disabled={locked}
                         value={r.weight}
                         onChange={(e) => setRow(r.key, { weight: e.target.value })}
                         {...aria}
                       />
                     )}
-                  </Field>
-                  <Field label="优先级" error={targetAt(r, "priority")}>
+                  </RowField>
+                  <RowField label="优先级" error={targetAt(r, "priority")}>
                     {(aria) => (
                       <input
                         type="number"
                         step={1}
+                        className="text-right tabular-nums"
                         disabled={locked}
                         value={r.priority}
                         onChange={(e) => setRow(r.key, { priority: e.target.value })}
                         {...aria}
                       />
                     )}
-                  </Field>
-                </div>
-                {r.modelId && <p className="sub">可服务分组：{groupsOf(target, catalog)}</p>}
-                {!readOnly && rows.length > 1 && (
-                  <p>
-                    {removing === r.key ? (
-                      <>
-                        <Button
-                          kind="danger"
-                          type="button"
-                          disabled={busy}
-                          onClick={() => {
-                            setRows((list) => list.filter((x) => x.key !== r.key));
-                            setRemoving(null);
-                          }}
-                        >
-                          确认移除
-                        </Button>{" "}
-                        <Button type="button" disabled={busy} onClick={() => setRemoving(null)}>
-                          取消
+                  </RowField>
+                  <div className="col-span-2 flex min-h-9 items-center justify-end gap-2 @lg:col-span-1">
+                    {!readOnly &&
+                      rows.length > 1 &&
+                      (removing === r.key ? (
+                        <>
+                          <Button
+                            kind="danger"
+                            size="sm"
+                            type="button"
+                            disabled={busy}
+                            onClick={() => {
+                              setRows((list) => list.filter((x) => x.key !== r.key));
+                              setRemoving(null);
+                            }}
+                          >
+                            确认移除
+                          </Button>
+                          <Button size="sm" type="button" disabled={busy} onClick={() => setRemoving(null)}>
+                            取消
+                          </Button>
+                        </>
+                      ) : (
+                        <Button size="sm" kind="quiet" type="button" disabled={busy} onClick={() => setRemoving(r.key)}>
+                          <Trash2 aria-hidden />
+                          移除
                         </Button>
-                      </>
-                    ) : (
-                      <Button type="button" disabled={busy} onClick={() => setRemoving(r.key)}>
-                        移除
-                      </Button>
-                    )}
-                  </p>
-                )}
-              </div>
-            );
-          })}
-          {!readOnly && (
-            <p>
-              <Button type="button" disabled={busy} onClick={addRow}>
+                      ))}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          <div className="mt-3 flex flex-wrap items-start justify-between gap-x-6 gap-y-3">
+            {!readOnly && (
+              <Button type="button" size="sm" disabled={busy} onClick={addRow}>
+                <Plus aria-hidden />
                 添加目标
               </Button>
-            </p>
-          )}
-          <p className="hint">权重、优先级留空时用网关的默认值。优先级高的一组先用，这一组都不可用时才用下一组。</p>
-        </>
+            )}
+            <p className="hint max-w-[44ch] text-[13px]">权重、优先级留空时用网关的默认值。优先级高的一组先用，这一组都不可用时才用下一组。</p>
+          </div>
+        </div>
       )}
 
       {conflict && <ConflictNote onReload={onReload} />}
@@ -1190,23 +1268,67 @@ function ModelForm({
         </div>
       )}
 
-      {readOnly ? (
-        <p>
+      <div className={FORM_FOOTER}>
+        {readOnly ? (
           <Button type="button" onClick={onClose}>
             关闭
           </Button>
-        </p>
-      ) : (
-        <p>
-          <Button kind="primary" type="submit" busy={busy} busyLabel="保存中…">
-            保存
-          </Button>{" "}
-          <Button type="button" disabled={busy} onClick={onClose}>
-            取消
-          </Button>
+        ) : (
+          <>
+            <Button type="button" disabled={busy} onClick={onClose}>
+              取消
+            </Button>
+            <Button kind="primary" type="submit" busy={busy} busyLabel="保存中…">
+              保存
+            </Button>
+          </>
+        )}
+      </div>
+    </form>
+  );
+}
+
+/** A manual routing model's target row: the model, its weight and priority, its removal. */
+const MANUAL_ROW = "grid grid-cols-2 items-start gap-x-3 gap-y-2 @lg:grid-cols-[minmax(0,1fr)_6.5rem_6.5rem_minmax(6rem,auto)]";
+
+/** A form card's closing bar: its buttons at the bottom right, on a muted strip the card's width. */
+const FORM_FOOTER =
+  "-mx-6 -mb-6 mt-6 flex max-w-none flex-wrap items-center justify-end gap-2 rounded-b-[calc(var(--radius)+3px)] border-t border-border bg-muted/40 px-6 py-3";
+
+/**
+ * A field in a row of fields: its label above it while the row is stacked,
+ * and only for assistive technology once the row is one line under a header
+ * that names its columns (the row's container query, `@lg`, or `@3xl` with
+ * `at="3xl"`). Its refusal, when there is one, is under it and describes it.
+ */
+function RowField({
+  label,
+  error,
+  at = "lg",
+  className,
+  children,
+}: {
+  label: string;
+  error?: string | null;
+  at?: "lg" | "3xl";
+  className?: string;
+  children: (aria: FieldAria) => ReactNode;
+}) {
+  const id = useId();
+  const errorId = `${id}-error`;
+  const aria: FieldAria = error ? { "aria-invalid": true, "aria-describedby": errorId } : {};
+  return (
+    <div className={cn("min-w-0", className)}>
+      <label className="flex flex-col gap-1.5">
+        <span className={cn("text-xs font-medium text-muted-foreground", at === "lg" ? "@lg:sr-only" : "@3xl:sr-only")}>{label}</span>
+        {children(aria)}
+      </label>
+      {error && (
+        <p className="field-problem" id={errorId}>
+          {error}
         </p>
       )}
-    </form>
+    </div>
   );
 }
 
@@ -1535,245 +1657,244 @@ function PublicRoutingForm({
         label: `${account.doc.display_name || account.id}（${account.doc.groups?.length ? account.doc.groups.join("、") : "未设分组"}）`,
       }));
   }
-  const groupsText = (groups: string[] | undefined) => (groups?.length ? groups.join("、") : "—（账号未设分组）");
+  const groupBadges = (groups: string[] | undefined) => <GroupBadges groups={groups ?? []} empty="—（账号未设分组）" />;
 
   return (
-    <form ref={form} className="panel" aria-label={title} onSubmit={submit}>
-      <h2>{title}</h2>
-      <p className="hint">
-        公共模型「{publicModel.name}」的路由：每个目标是一个为它服务的上游账号。选路设置和目标都在这里改，点「保存」一并写入；移除目标立即生效。
-      </p>
-      {bad && (
-        <div className="f">
-          <span>选路设置</span>
-          <div className="note crit" role="alert">
+    <form ref={form} className="panel mb-0" aria-label={title} onSubmit={submit}>
+      <CardHeader
+        title={title}
+        className="mb-5"
+        description={`公共模型「${publicModel.name}」的路由：每个目标是一个为它服务的上游账号。选路设置和目标都在这里改，点「保存」一并写入；移除目标立即生效。`}
+      />
+      <div className="@container">
+        <h4 className="mb-3 text-sm font-semibold">选路设置</h4>
+        {bad && (
+          <div className="note crit mt-0" role="alert">
             {bad}
           </div>
-        </div>
-      )}
-      <div className="r">
-        <Field label="选路策略" error={at("/routing/strategy")}>
-          {(aria) => (
-            <select
-              disabled={locked || strategies === null}
-              value={draft.strategy}
-              onChange={(e) => set("strategy", e.target.value)}
-              {...aria}
-            >
-              {[
-                ...(strategies ?? []),
-                ...(strategies?.includes(draft.strategy) || draft.strategy === "" ? [] : [draft.strategy]),
-              ].map((v) => (
-                <option key={v} value={v}>
-                  {v}
-                </option>
-              ))}
-            </select>
-          )}
-        </Field>
-        <Field label="全部不可用时的处理" error={at("/routing/when_all_unavailable")}>
-          {(aria) => (
-            <select
-              disabled={locked}
-              value={draft.whenAllUnavailable}
-              onChange={(e) => set("whenAllUnavailable", e.target.value)}
-              {...aria}
-            >
-              <option value="">（网关默认）</option>
-              <option value="fail">fail（返回 503）</option>
-              <option value="try_anyway">try_anyway（仍然尝试）</option>
-            </select>
-          )}
-        </Field>
-      </div>
-      <div className="r">
-        <Field label="重试次数" hint="留空用网关的默认值。" error={at("/routing/retries")}>
-          {(aria) => (
-            <input
-              type="number"
-              min={0}
-              step={1}
-              disabled={locked}
-              value={draft.retries}
-              onChange={(e) => set("retries", e.target.value)}
-              {...aria}
-            />
-          )}
-        </Field>
-        <Field label="最多切换几个目标" hint="留空表示后面的目标都可以试。" error={at("/routing/max_fallbacks")}>
-          {(aria) => (
-            <input
-              type="number"
-              min={0}
-              step={1}
-              disabled={locked}
-              value={draft.maxFallbacks}
-              onChange={(e) => set("maxFallbacks", e.target.value)}
-              {...aria}
-            />
-          )}
-        </Field>
-      </div>
-      <Field
-        label="额外重试的状态码"
-        hint="逗号分隔，例如 408, 429。上游用 4xx 表示临时故障时才有用；5xx 本来就会重试。"
-        error={at("/routing/fallback_on_statuses")}
-      >
-        {(aria) => (
-          <input
-            disabled={locked}
-            value={draft.statuses}
-            placeholder="（网关默认：不额外重试）"
-            onChange={(e) => set("statuses", e.target.value)}
-            {...aria}
-          />
         )}
-      </Field>
-      {draft.statuses.trim() !== "" && statuses === null && (
-        <p className="hint">状态码要写成数字，用逗号分隔。</p>
-      )}
-      <label className="f">
-        <input
-          type="checkbox"
-          disabled={locked}
-          checked={draft.retryOn429}
-          onChange={(e) => set("retryOn429", e.target.checked)}
-        />{" "}
-        <span>429 也参与重试和切换</span>
-      </label>
+        <div className="grid gap-x-4 @md:grid-cols-2 @3xl:grid-cols-3">
+          <Field label="选路策略" error={at("/routing/strategy")}>
+            {(aria) => (
+              <select disabled={locked || strategies === null} value={draft.strategy} onChange={(e) => set("strategy", e.target.value)} {...aria}>
+                {[
+                  ...(strategies ?? []),
+                  ...(strategies?.includes(draft.strategy) || draft.strategy === "" ? [] : [draft.strategy]),
+                ].map((v) => (
+                  <option key={v} value={v}>
+                    {v}
+                  </option>
+                ))}
+              </select>
+            )}
+          </Field>
+          <Field label="全部不可用时的处理" error={at("/routing/when_all_unavailable")}>
+            {(aria) => (
+              <select disabled={locked} value={draft.whenAllUnavailable} onChange={(e) => set("whenAllUnavailable", e.target.value)} {...aria}>
+                <option value="">（网关默认）</option>
+                <option value="fail">fail（返回 503）</option>
+                <option value="try_anyway">try_anyway（仍然尝试）</option>
+              </select>
+            )}
+          </Field>
+          <Field label="重试次数" hint="留空用网关的默认值。" error={at("/routing/retries")}>
+            {(aria) => (
+              <input
+                type="number"
+                min={0}
+                step={1}
+                disabled={locked}
+                value={draft.retries}
+                onChange={(e) => set("retries", e.target.value)}
+                {...aria}
+              />
+            )}
+          </Field>
+          <Field label="最多切换几个目标" hint="留空表示后面的目标都可以试。" error={at("/routing/max_fallbacks")}>
+            {(aria) => (
+              <input
+                type="number"
+                min={0}
+                step={1}
+                disabled={locked}
+                value={draft.maxFallbacks}
+                onChange={(e) => set("maxFallbacks", e.target.value)}
+                {...aria}
+              />
+            )}
+          </Field>
+          <div className="min-w-0 @md:col-span-2 @3xl:col-span-2">
+            <Field
+              label="额外重试的状态码"
+              hint="逗号分隔，例如 408, 429。上游用 4xx 表示临时故障时才有用；5xx 本来就会重试。"
+              error={at("/routing/fallback_on_statuses")}
+            >
+              {(aria) => (
+                <input
+                  disabled={locked}
+                  value={draft.statuses}
+                  placeholder="（网关默认：不额外重试）"
+                  onChange={(e) => set("statuses", e.target.value)}
+                  {...aria}
+                />
+              )}
+            </Field>
+            {draft.statuses.trim() !== "" && statuses === null && (
+              <p className="hint -mt-2 mb-4 text-[13px]">状态码要写成数字，用逗号分隔。</p>
+            )}
+          </div>
+        </div>
+        <label className="f mb-0">
+          <input type="checkbox" disabled={locked} checked={draft.retryOn429} onChange={(e) => set("retryOn429", e.target.checked)} />{" "}
+          <span>429 也参与重试和切换</span>
+        </label>
+      </div>
 
-      <h2>路由目标（{targets.length}）</h2>
-      {targets.length === 0 && additions.length === 0 ? (
-        <p className="hint">
-          还没有账号服务这个模型：请求会以「上游不可用」失败。{!readOnly && "用下面的「添加目标」加一个账号。"}
-        </p>
-      ) : (
-        <ul className="targets">
-          {targets.map((t) => {
-            const accountId = t.provider_key_id;
-            const accountName = t.display_name || "（账号已不存在）";
-            return (
-              <TargetRow
-                key={accountId}
-                label={`目标 ${accountName}`}
-                accountId={accountId}
-                draft={shownOf(t)}
-                publicName={publicModel.name}
-                locked={locked}
-                refusal={refusals[accountId]}
-                written={written.includes(accountId)}
-                onChange={(patch) => editTarget(t, patch)}
-                accountShown={false}
-                heading={
-                  <>
-                    <div>账号：{accountName}</div>
-                    <div className="sub">可服务分组：{groupsText(t.groups)}</div>
-                  </>
-                }
-              >
-                {!readOnly &&
-                  // Two steps held here rather than by `TwoStep`: a removal
-                  // reloads the targets behind this form, and the step has to
-                  // survive the re-render that causes.
-                  (removing === accountId ? (
-                    <div>
-                      <p role="alert">
-                        移除后，账号「{accountName}」不再为「{publicModel.name}」提供服务，它对该模型的映射也会删除。
-                      </p>
-                      <p>
-                        <Button
-                          kind="danger"
-                          size="sm"
-                          busy={removingBusy}
-                          busyLabel="移除中…"
-                          disabled={busy}
-                          onClick={() => void removeTarget(accountId, accountName)}
-                        >
-                          确认移除该目标
+      <div className="@container mt-6 border-t border-border pt-5">
+        <h4 className="mb-3 text-sm font-semibold">路由目标（{targets.length}）</h4>
+        {targets.length === 0 && additions.length === 0 ? (
+          <p className="hint rounded-lg border border-dashed border-border px-4 py-6 text-center text-[13px]">
+            还没有账号服务这个模型：请求会以「上游不可用」失败。{!readOnly && "用下面的「添加目标」加一个账号。"}
+          </p>
+        ) : (
+          <div className="overflow-hidden rounded-lg border border-border">
+            <div aria-hidden="true" className={cn(TARGET_ROW, "hidden border-b border-border bg-muted px-3 py-2 text-xs font-medium text-muted-foreground @3xl:grid")}>
+              <span>账号</span>
+              <span>上游模型名称</span>
+              <span>优先级</span>
+              <span>权重</span>
+              <span />
+            </div>
+            <ul>
+              {targets.map((t) => {
+                const accountId = t.provider_key_id;
+                const accountName = t.display_name || "（账号已不存在）";
+                return (
+                  <TargetRow
+                    key={accountId}
+                    label={`目标 ${accountName}`}
+                    accountId={accountId}
+                    draft={shownOf(t)}
+                    publicName={publicModel.name}
+                    locked={locked}
+                    refusal={refusals[accountId]}
+                    written={written.includes(accountId)}
+                    onChange={(patch) => editTarget(t, patch)}
+                    accountShown={false}
+                    heading={
+                      <>
+                        <div className="truncate pt-2 font-medium @3xl:pt-1.5" title={accountName}>
+                          <span className="font-normal text-muted-foreground">账号：</span>
+                          {accountName}
+                        </div>
+                        <ServedGroups>{groupBadges(t.groups)}</ServedGroups>
+                      </>
+                    }
+                    action={
+                      !readOnly &&
+                      removing !== accountId && (
+                        <Button size="sm" kind="quiet" disabled={removingBusy || busy} onClick={() => setRemoving(accountId)}>
+                          <Trash2 aria-hidden />
+                          移除该目标
                         </Button>
-                        <Button size="sm" disabled={removingBusy} onClick={() => setRemoving(null)}>
-                          取消
-                        </Button>
-                      </p>
-                    </div>
-                  ) : (
-                    <p>
-                      <Button size="sm" disabled={removingBusy || busy} onClick={() => setRemoving(accountId)}>
-                        移除该目标
-                      </Button>
-                    </p>
-                  ))}
-              </TargetRow>
-            );
-          })}
-          {additions.map((a, i) => {
-            const refusal = refusals[addedRow(a.key)];
-            const account = catalog.accounts.get(a.accountId);
-            return (
-              <TargetRow
-                key={addedRow(a.key)}
-                label={`新目标 ${i + 1}`}
-                accountId={a.accountId}
-                draft={a.draft}
-                publicName={publicModel.name}
-                locked={locked}
-                refusal={refusal}
-                written={false}
-                onChange={(patch) => editAddition(a.key, { draft: { ...a.draft, ...patch } })}
-                accountShown
-                heading={
-                  <>
-                    <Field label="上游账号" error={refusal?.fields.account}>
-                      {(aria) => (
-                        <select
-                          disabled={locked}
-                          value={a.accountId}
-                          onChange={(e) => chooseAccount(a, e.target.value)}
-                          {...aria}
-                        >
-                          <option value="">（选择上游账号）</option>
-                          {accountOptions(a).map((o) => (
-                            <option key={o.id} value={o.id}>
-                              {o.label}
-                            </option>
-                          ))}
-                        </select>
-                      )}
-                    </Field>
-                    {account && <div className="sub">可服务分组：{groupsText(account.doc.groups)}</div>}
-                    {disabledRows.has(a.accountId) && (
-                      <div className="sub">该账号对这个模型的映射已停用，保存后重新启用。</div>
-                    )}
-                  </>
-                }
-              >
-                <p>
-                  <Button
-                    size="sm"
-                    disabled={busy}
-                    onClick={() => {
-                      setAdditions((list) => list.filter((x) => x.key !== a.key));
-                      settle(addedRow(a.key));
-                    }}
+                      )
+                    }
                   >
-                    取消添加
-                  </Button>
-                </p>
-              </TargetRow>
-            );
-          })}
-        </ul>
-      )}
-      {!readOnly && (
-        <p>
-          <Button type="button" disabled={busy} onClick={addTarget}>
-            添加目标
-          </Button>
-        </p>
-      )}
-      <p className="hint">
-        优先级高的一组先用，这一组都不可用时才用下一组；同一组内按权重分配。上游模型名称留空即用公共模型的名称。
-      </p>
+                    {!readOnly &&
+                      // Two steps held here rather than by `TwoStep`: a removal
+                      // reloads the targets behind this form, and the step has to
+                      // survive the re-render that causes.
+                      removing === accountId && (
+                        <div className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-danger/30 bg-danger-soft px-3 py-2.5">
+                          <p role="alert" className="min-w-0 flex-1 basis-64 text-[13px]">
+                            移除后，账号「{accountName}」不再为「{publicModel.name}」提供服务，它对该模型的映射也会删除。
+                          </p>
+                          <div className="flex gap-2">
+                            <Button size="sm" disabled={removingBusy} onClick={() => setRemoving(null)}>
+                              取消
+                            </Button>
+                            <Button
+                              kind="danger"
+                              size="sm"
+                              busy={removingBusy}
+                              busyLabel="移除中…"
+                              disabled={busy}
+                              onClick={() => void removeTarget(accountId, accountName)}
+                            >
+                              确认移除该目标
+                            </Button>
+                          </div>
+                        </div>
+                      )}
+                  </TargetRow>
+                );
+              })}
+              {additions.map((a, i) => {
+                const refusal = refusals[addedRow(a.key)];
+                const account = catalog.accounts.get(a.accountId);
+                return (
+                  <TargetRow
+                    key={addedRow(a.key)}
+                    label={`新目标 ${i + 1}`}
+                    accountId={a.accountId}
+                    draft={a.draft}
+                    publicName={publicModel.name}
+                    locked={locked}
+                    refusal={refusal}
+                    written={false}
+                    onChange={(patch) => editAddition(a.key, { draft: { ...a.draft, ...patch } })}
+                    accountShown
+                    heading={
+                      <>
+                        <RowField label="上游账号" at="3xl" error={refusal?.fields.account}>
+                          {(aria) => (
+                            <select disabled={locked} value={a.accountId} onChange={(e) => chooseAccount(a, e.target.value)} {...aria}>
+                              <option value="">（选择上游账号）</option>
+                              {accountOptions(a).map((o) => (
+                                <option key={o.id} value={o.id}>
+                                  {o.label}
+                                </option>
+                              ))}
+                            </select>
+                          )}
+                        </RowField>
+                        {account && <ServedGroups className="mt-1.5">{groupBadges(account.doc.groups)}</ServedGroups>}
+                        {disabledRows.has(a.accountId) && (
+                          <div className="sub mt-1 text-[12px]">该账号对这个模型的映射已停用，保存后重新启用。</div>
+                        )}
+                      </>
+                    }
+                    action={
+                      <Button
+                        size="sm"
+                        kind="quiet"
+                        disabled={busy}
+                        onClick={() => {
+                          setAdditions((list) => list.filter((x) => x.key !== a.key));
+                          settle(addedRow(a.key));
+                        }}
+                      >
+                        取消添加
+                      </Button>
+                    }
+                  />
+                );
+              })}
+            </ul>
+          </div>
+        )}
+        <div className="mt-3 flex flex-wrap items-start justify-between gap-x-6 gap-y-3">
+          {!readOnly && (
+            <Button type="button" size="sm" disabled={busy} onClick={addTarget}>
+              <Plus aria-hidden />
+              添加目标
+            </Button>
+          )}
+          <p className="hint max-w-[52ch] text-[13px]">
+            优先级高的一组先用，这一组都不可用时才用下一组；同一组内按权重分配。上游模型名称留空即用公共模型的名称。
+          </p>
+        </div>
+      </div>
 
       {(outcome || err) && (
         <div className="note crit" role="alert">
@@ -1791,33 +1912,40 @@ function PublicRoutingForm({
         </div>
       )}
 
-      <p>
-        {!readOnly && (
-          <>
-            <Button
-              kind="primary"
-              type="submit"
-              busy={busy}
-              busyLabel="保存中…"
-              disabled={statuses === null || removingBusy || !dirty}
-              disabledReason={statuses !== null && !removingBusy && !dirty ? "没有要保存的改动" : undefined}
-            >
-              保存
-            </Button>{" "}
-          </>
-        )}
+      <div className={FORM_FOOTER}>
         <Button type="button" disabled={busy} onClick={onClose}>
           关闭
         </Button>
-      </p>
+        {!readOnly && (
+          <Button
+            kind="primary"
+            type="submit"
+            busy={busy}
+            busyLabel="保存中…"
+            disabled={statuses === null || removingBusy || !dirty}
+            disabledReason={statuses !== null && !removingBusy && !dirty ? "没有要保存的改动" : undefined}
+          >
+            保存
+          </Button>
+        )}
+      </div>
     </form>
   );
 }
 
 /**
+ * A public model's target row: stacked on a phone; from `@md` the account
+ * and its action on one line with the three fields under them; from `@3xl`
+ * one line under the header that names the columns.
+ */
+const TARGET_ROW =
+  "grid grid-cols-2 items-start gap-x-3 gap-y-2 @md:grid-cols-[minmax(0,1fr)_6rem_6rem] @3xl:grid-cols-[minmax(0,1fr)_minmax(0,1.3fr)_6rem_6rem_minmax(7rem,auto)]";
+
+/**
  * One target of a public model's routing form: who serves it (`heading`),
  * then the upstream name, priority and weight, each with its own refusal,
- * then whatever the row offers to do with it (`children`).
+ * the row's own action (`action`), and under them whatever the row asks
+ * about itself (`children`).
  */
 function TargetRow({
   label,
@@ -1830,6 +1958,7 @@ function TargetRow({
   refusal,
   written,
   onChange,
+  action,
   children,
 }: {
   /** The row's accessible name. */
@@ -1846,6 +1975,7 @@ function TargetRow({
   /** Written by a save that left something else unsaved. */
   written: boolean;
   onChange: (patch: Partial<TargetDraft>) => void;
+  action?: ReactNode;
   children?: ReactNode;
 }) {
   const id = useId();
@@ -1855,61 +1985,66 @@ function TargetRow({
     .filter((m): m is string => typeof m === "string" && m !== "")
     .join("；");
   return (
-    <li className="target" aria-label={label}>
-      {heading}
-      <div className="r">
-        <div className="field">
-          <div className="f">
-            <span className="f-label">上游模型名称</span>
-            <UpstreamModelPicker
-              accountId={accountId}
-              value={draft.upstream}
-              publicName={publicName}
-              label="上游模型名称"
-              onChange={(upstream) => onChange({ upstream })}
-              disabled={locked}
-              invalid={upstreamError !== null}
-              describedBy={upstreamError === null ? undefined : `${id}-upstream`}
-            />
-          </div>
-          {upstreamError !== null && (
-            <p className="field-problem" id={`${id}-upstream`}>
-              {upstreamError}
-            </p>
-          )}
+    <li className={cn(TARGET_ROW, "border-border p-3 not-last:border-b")} aria-label={label}>
+      <div className="col-span-2 min-w-0 @md:col-start-1 @md:row-start-1 @3xl:col-span-1">
+        {heading}
+        {written && <span className="tag mt-1.5 border-success/30 bg-success-soft text-success">已保存</span>}
+      </div>
+      <div className="col-span-2 min-w-0 @md:col-span-1 @md:col-start-1 @md:row-start-2 @3xl:col-start-2 @3xl:row-start-1">
+        <div className="flex flex-col gap-1.5">
+          <span className="text-xs font-medium text-muted-foreground @3xl:hidden">上游模型名称</span>
+          <UpstreamModelPicker
+            accountId={accountId}
+            value={draft.upstream}
+            publicName={publicName}
+            label="上游模型名称"
+            onChange={(upstream) => onChange({ upstream })}
+            disabled={locked}
+            invalid={upstreamError !== null}
+            describedBy={upstreamError === null ? undefined : `${id}-upstream`}
+          />
         </div>
-        <Field label="优先级" error={refusal?.fields.priority}>
-          {(aria) => (
-            <input
-              type="number"
-              step={1}
-              disabled={locked}
-              value={draft.priority}
-              onChange={(e) => onChange({ priority: e.target.value })}
-              {...aria}
-            />
-          )}
-        </Field>
-        <Field label="权重" error={refusal?.fields.weight}>
-          {(aria) => (
-            <input
-              type="number"
-              step={1}
-              disabled={locked}
-              value={draft.weight}
-              onChange={(e) => onChange({ weight: e.target.value })}
-              {...aria}
-            />
-          )}
-        </Field>
+        {upstreamError !== null && (
+          <p className="field-problem" id={`${id}-upstream`}>
+            {upstreamError}
+          </p>
+        )}
+      </div>
+      <RowField label="优先级" at="3xl" error={refusal?.fields.priority} className="@md:col-start-2 @md:row-start-2 @3xl:col-start-3 @3xl:row-start-1">
+        {(aria) => (
+          <input
+            type="number"
+            step={1}
+            className="text-right tabular-nums"
+            disabled={locked}
+            value={draft.priority}
+            onChange={(e) => onChange({ priority: e.target.value })}
+            {...aria}
+          />
+        )}
+      </RowField>
+      <RowField label="权重" at="3xl" error={refusal?.fields.weight} className="@md:col-start-3 @md:row-start-2 @3xl:col-start-4 @3xl:row-start-1">
+        {(aria) => (
+          <input
+            type="number"
+            step={1}
+            className="text-right tabular-nums"
+            disabled={locked}
+            value={draft.weight}
+            onChange={(e) => onChange({ weight: e.target.value })}
+            {...aria}
+          />
+        )}
+      </RowField>
+      <div className="col-span-2 flex min-h-9 items-center justify-end @md:col-span-1 @md:col-start-3 @md:row-start-1 @3xl:col-start-5">
+        {action}
       </div>
       {message !== "" && (
-        <div className="note crit" role="alert">
+        <div className="note crit col-span-full m-0" role="alert">
           {message}
         </div>
       )}
-      {written && <p className="sub">已保存</p>}
-      {children}
+      {children && <div className="col-span-full min-w-0">{children}</div>}
     </li>
   );
 }
