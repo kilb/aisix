@@ -106,6 +106,7 @@ describe("relayed audio streams are settled by how they end", () => {
   let overCapOpenId = "";
   let overCapStalledId = "";
   let overCapCompleteId = "";
+  let overCapReadErrorId = "";
   let etcdReachable = false;
 
   beforeAll(async () => {
@@ -156,6 +157,19 @@ describe("relayed audio streams are settled by how they end", () => {
       rawStreamFrames: [delta("twenty clean letters cross the cap"), DONE_EVENT],
       eventDelayMs: STALL_MS,
     });
+    // The cap-crossing frame lands and is read, then the connection drops:
+    // the drain that follows the refusal reads an error rather than the
+    // upstream's terminal event. The delay is what puts the drop AFTER the
+    // crossing frame — without it the socket closes before the gateway has
+    // read anything, which is an ordinary upstream failure, not a drain.
+    const overCapReadError = await startOpenAiUpstream({
+      rawStreamFrames: [
+        delta("twenty clean letters cross the cap"),
+        delta(" then gone"),
+      ],
+      eventDelayMs: 250,
+      disconnectAfterEvents: 1,
+    });
     const overCapComplete = await startOpenAiUpstream({
       rawStreamFrames: [
         delta("twenty clean letters cross the cap"),
@@ -164,7 +178,7 @@ describe("relayed audio streams are settled by how they end", () => {
       ],
       eventDelayMs: 20,
     });
-    upstreams.push(overCapStalled, overCapComplete);
+    upstreams.push(overCapStalled, overCapReadError, overCapComplete);
 
     upstreams.push(speechStall, transcriptStall, transcriptDoneThenOpen);
 
@@ -243,6 +257,7 @@ describe("relayed audio streams are settled by how they end", () => {
     overCapOpenId = await heldModel("settle-over-cap-open", overCapOpen, "fail_open");
     overCapStalledId = await heldModel("settle-over-cap-stalled", overCapStalled, "fail_closed");
     overCapCompleteId = await heldModel("settle-over-cap-complete", overCapComplete, "fail_closed");
+    overCapReadErrorId = await heldModel("settle-over-cap-read-error", overCapReadError, "fail_closed");
 
     // Seeded last: once it authenticates, every resource above is live.
     await seed.createApiKey({
@@ -254,6 +269,7 @@ describe("relayed audio streams are settled by how they end", () => {
         "settle-over-cap-open",
         "settle-over-cap-stalled",
         "settle-over-cap-complete",
+        "settle-over-cap-read-error",
       ],
     });
     const probe = new ProxyClient(app.proxyUrl, CALLER);
@@ -424,6 +440,38 @@ describe("relayed audio streams are settled by how they end", () => {
     expect(
       metricDelta(before, after, "aisix_deployment_failure_responses_total", {
         model: "settle-over-cap-complete",
+      }),
+    ).toBe(0);
+  }, 30_000);
+
+  test("a refused transcript whose drain hits a read error settles as a failure", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+    const before = await scrapeMetrics(app!.metricsUrl);
+    const res = await transcription("settle-over-cap-read-error");
+
+    // The caller's contract is unchanged: the gateway's own refusal.
+    expect(res.status, await res.clone().text()).toBe(422);
+    expect(await res.text()).toContain("output_buffer_exceeded");
+    // The upstream never finished the answer: a failure, never a success.
+    // (A read error on a 2xx body is not a health signal — `note_failure`
+    // leaves the cooldown alone — so the deployment counters are what this
+    // case can hold the settlement to.)
+    await waitConfigPropagation(async () => {
+      const after = await scrapeMetrics(app!.metricsUrl);
+      return (
+        metricDelta(before, after, "aisix_deployment_failure_responses_total", {
+          model: "settle-over-cap-read-error",
+        }) === 1
+      );
+    });
+    expect((await modelStatus(overCapReadErrorId))?.status).not.toBe("cooldown");
+    const after = await scrapeMetrics(app!.metricsUrl);
+    expect(
+      metricDelta(before, after, "aisix_deployment_success_responses_total", {
+        model: "settle-over-cap-read-error",
       }),
     ).toBe(0);
   }, 30_000);
