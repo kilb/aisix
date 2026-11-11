@@ -148,32 +148,37 @@ export function Gate({
   );
 
   return (
-    <div className="gate-page">
-      <div className="gate-tools">
+    <div className="gate-page flex min-h-screen flex-col bg-background">
+      <div className="gate-tools flex justify-end px-4 pt-3 sm:px-6">
         <ThemeToggle theme={theme} onToggle={onToggleTheme} />
       </div>
-      <div id="gate">
-        <header className="plate">
-          <h1>
-            <span className="mark">Routio</span> 组织门户
-          </h1>
-          <span className="sub">组织、成员与 API 密钥</span>
+      <div id="gate" className="mx-auto flex w-full max-w-[400px] flex-1 flex-col justify-center px-4 pt-6 pb-16">
+        <header className="plate mb-8 flex flex-col items-center gap-3 text-center">
+          <span className="brand-mark size-10 rounded-[10px] after:top-[15px] after:right-[10px] after:left-[10px] after:h-2.5" aria-hidden="true" />
+          <div>
+            <h1 className="text-xl font-semibold tracking-tight">
+              <span className="mark">Routio</span> 组织门户
+            </h1>
+            <p className="sub mt-1 text-[13px] text-muted-foreground">组织、成员与 API 密钥</p>
+          </div>
         </header>
 
         {notice && (
-          <div className="note warn" role="status">
+          <div className="note warn mb-4" role="status">
             {notice}
           </div>
         )}
 
         {invite !== null ? (
-          <div className="panel">
-            <h2>接受邀请</h2>
-            <p className="hint">设置口令后即加入邀请你的组织，之后用受邀的邮箱和这个口令登录。</p>
-            <form className="form gate-form" onSubmit={submit}>
+          <div className="panel p-6 shadow-sm">
+            <div>
+              <h2 className="text-base font-semibold tracking-tight">接受邀请</h2>
+              <p className="hint mt-1">设置口令后即加入邀请你的组织，之后用受邀的邮箱和这个口令登录。</p>
+            </div>
+            <form className="gate-form grid gap-4" onSubmit={submit}>
               {passwordField}
               {displayNameField}
-              <Button kind="primary" block type="submit" busy={busy}>
+              <Button kind="primary" block type="submit" busy={busy} className="mt-1">
                 接受邀请
               </Button>
             </form>
@@ -183,10 +188,16 @@ export function Gate({
             </Button>
           </div>
         ) : (
-          <div className="panel">
-            <RouteNav label="登录或注册" items={MODES} current={mode} onSelect={switchMode} />
-            <div id={`tab-${mode}`} role="tabpanel" aria-labelledby={`stop-${mode}`}>
-              <form className="form gate-form" onSubmit={submit}>
+          <div className="panel p-6 shadow-sm">
+            <RouteNav
+              label="登录或注册"
+              items={MODES}
+              current={mode}
+              onSelect={switchMode}
+              className="grid w-full grid-cols-2 [&>button]:w-full"
+            />
+            <div id={`tab-${mode}`} role="tabpanel" aria-labelledby={`stop-${mode}`} className="!mt-6">
+              <form className="gate-form grid gap-4" onSubmit={submit}>
                 {mode === "signup" && (
                   <Field label="组织名称">
                     <input
@@ -208,7 +219,7 @@ export function Gate({
                 </Field>
                 {passwordField}
                 {mode === "signup" && displayNameField}
-                <Button kind="primary" block type="submit" busy={busy}>
+                <Button kind="primary" block type="submit" busy={busy} className="mt-1">
                   {mode === "login" ? "登录" : "注册组织"}
                 </Button>
               </form>
@@ -218,7 +229,9 @@ export function Gate({
         )}
 
         {invite === null && mode === "signup" && (
-          <p className="foot">新注册的组织需要平台审核。审核通过前可以登录查看组织状态、修改口令。</p>
+          <p className="foot mt-4 px-2 text-center text-[13px] leading-relaxed text-balance text-muted-foreground">
+            新注册的组织需要平台审核。审核通过前可以登录查看组织状态、修改口令。
+          </p>
         )}
       </div>
     </div>
