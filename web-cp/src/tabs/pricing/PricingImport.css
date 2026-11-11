@@ -5,31 +5,7 @@
   margin-bottom: var(--s-6);
 }
 
-/* The batch, the search and the "same as current" switch, in one row while
-   there is room and stacked when there is not. */
-.import-controls {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--s-3) var(--s-5);
-  align-items: flex-end;
-  margin: var(--s-4) 0;
-}
-.import-controls > .field {
-  flex: 1 1 220px;
-  margin-bottom: 0;
-}
-.import-controls > .check {
-  padding-bottom: var(--s-2);
-}
-
-/* The selection's own attestation, above the table it applies to. */
-.import-bulk {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--s-3);
-  align-items: center;
-  margin: var(--s-3) 0;
-}
+/* The results of a confirmed selection, one line each. */
 .import-results {
   margin: 0;
   padding-left: var(--s-5);
@@ -55,9 +31,6 @@
 }
 .import-compare > .hint {
   margin-top: var(--s-2);
-}
-.import-decide {
-  margin-top: var(--s-4);
 }
 .import-decide > .check {
   margin-bottom: var(--s-2);

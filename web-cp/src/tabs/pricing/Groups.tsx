@@ -11,7 +11,10 @@ import { EmptyState } from "../../ui/EmptyState";
 import { Field, useRefusalFocus } from "../../ui/Field";
 import { TwoStep } from "../../ui/TwoStep";
 import { useToast } from "../../ui/Toast";
+import { Card, CardHeader, PageHeader } from "../../components/page";
+import { Sheet, SheetContent } from "../../components/ui/sheet";
 import { GroupDetail } from "./GroupDetail";
+import { Count, FormGrid } from "./kit";
 
 /** What the operator reads for each count a refusal carries, in the order the page shows them. */
 const COUNT_WORDS: [keyof GroupUseCounts, string][] = [
@@ -71,6 +74,7 @@ export function Groups({ canEdit }: TabProps) {
   const [error, setError] = useState<string | null>(null);
   const [refusal, setRefusal] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -91,18 +95,25 @@ export function Groups({ canEdit }: TabProps) {
   }
 
   return (
-    <div className="panel">
-      <h2>
-        分组
-        <Button size="sm" type="button" icon="refresh" onClick={() => void load()}>
-          刷新
-        </Button>
-      </h2>
-      <p className="hint">
-        一个分组给同一批上游账号定一个换算率：模型的官方美元价 × 这个分组在模型上的换算率（没有时为分组默认），就是租户付的人民币价（租户折扣另算）。密钥在创建时选一个分组，此后只路由到该分组的上游账号。
-      </p>
+    <>
+      <PageHeader
+        title="分组"
+        description="一个分组给同一批上游账号定一个换算率：模型的官方美元价 × 这个分组在模型上的换算率（没有时为分组默认），就是租户付的人民币价（租户折扣另算）。密钥在创建时选一个分组，此后只路由到该分组的上游账号。"
+        actions={
+          <>
+            <Button type="button" icon="refresh" onClick={() => void load()}>
+              刷新
+            </Button>
+            {canEdit && (
+              <Button type="button" kind="primary" icon="plus" onClick={() => setCreating(true)}>
+                新建分组
+              </Button>
+            )}
+          </>
+        }
+      />
       {error && (
-        <div className="note crit" role="alert">
+        <div className="note crit mt-0" role="alert">
           {error}{" "}
           <Button type="button" onClick={() => void load()}>
             重试
@@ -110,44 +121,64 @@ export function Groups({ canEdit }: TabProps) {
         </div>
       )}
       {refusal && (
-        <div className="note crit" role="alert">
+        <div className="note crit mt-0" role="alert">
           {refusal}
         </div>
       )}
-      {canEdit && <CreateGroup onCreated={load} />}
-      {rows === null ? (
-        !error && <Loading />
-      ) : rows.length === 0 ? (
-        <EmptyState text="还没有分组。" />
-      ) : (
-        <DataTable label="分组">
-          <thead>
-            <tr>
-              <th>显示名</th>
-              <th>路由名</th>
-              <th>说明</th>
-              <th className="num">默认换算率</th>
-              <th className="num">租户</th>
-              <th className="num">密钥</th>
-              <th className="num">上游账号</th>
-              <th className="right">操作</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((g) => (
-              <GroupRowView
-                key={g.id}
-                group={g}
-                canEdit={canEdit}
-                onOpen={() => setSelected(g.id)}
-                onRefused={(e) => setRefusal(inUseText(e))}
-                onChanged={load}
-              />
-            ))}
-          </tbody>
-        </DataTable>
+      <Card className="mb-0">
+        <CardHeader className="mb-0" title={<>全部分组{rows && <Count n={rows.length} />}</>} />
+        {rows === null ? (
+          !error && <Loading />
+        ) : rows.length === 0 ? (
+          <EmptyState text="还没有分组。" />
+        ) : (
+          <DataTable label="分组">
+            <thead>
+              <tr>
+                <th>显示名</th>
+                <th>路由名</th>
+                <th>说明</th>
+                <th className="num">默认换算率</th>
+                <th className="num">租户</th>
+                <th className="num">密钥</th>
+                <th className="num">上游账号</th>
+                <th className="right">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((g) => (
+                <GroupRowView
+                  key={g.id}
+                  group={g}
+                  canEdit={canEdit}
+                  onOpen={() => setSelected(g.id)}
+                  onRefused={(e) => setRefusal(inUseText(e))}
+                  onChanged={load}
+                />
+              ))}
+            </tbody>
+          </DataTable>
+        )}
+      </Card>
+      {canEdit && (
+        <Sheet open={creating} onOpenChange={setCreating}>
+          <SheetContent
+            title="新建分组"
+            onEscapeKeyDown={(e) => {
+              // Escape inside an open confirmation takes back the confirmation, not the whole form.
+              if (document.activeElement?.closest(".two-step.is-asking")) e.preventDefault();
+            }}
+          >
+            <CreateGroup
+              onCreated={async () => {
+                setCreating(false);
+                await load();
+              }}
+            />
+          </SheetContent>
+        </Sheet>
       )}
-    </div>
+    </>
   );
 }
 
@@ -214,8 +245,10 @@ function GroupRowView({
         <td>
           <span className="mono">{group.name}</span>
         </td>
-        <td className="trunc" title={group.description}>
-          {group.description || "—"}
+        <td>
+          <span className="trunc text-text-2" title={group.description}>
+            {group.description || "—"}
+          </span>
         </td>
         <td className="num">
           <span className="tabular">{currentRate(group.default_rate)}</span>
@@ -245,8 +278,8 @@ function GroupRowView({
         </td>
       </tr>
       {editing && canEdit && (
-        <tr className="grp-edit-row">
-          <td colSpan={8}>
+        <tr className="dt-detail">
+          <td colSpan={8} className="!px-6 !pb-4">
             <EditGroup
               group={group}
               onDone={async () => {
@@ -302,25 +335,32 @@ function EditGroup({
   }
 
   return (
-    <div ref={form} className="grp-form" role="group" aria-label="编辑分组">
-      <p className="hint">显示名和说明对租户可见，不要写入上游渠道名称。路由名创建后不能更改。</p>
-      <Field label="显示名" error={problemAt(details, (p) => p === "/display_name")}>
-        {(aria) => <input {...aria} value={display} onChange={(e) => setDisplay(e.target.value)} />}
-      </Field>
-      <Field label="说明" error={problemAt(details, (p) => p === "/description")}>
-        {(aria) => <textarea {...aria} rows={2} value={description} onChange={(e) => setDescription(e.target.value)} />}
-      </Field>
+    <div
+      ref={form}
+      className="whitespace-normal rounded-lg border border-border bg-muted/40 p-4"
+      role="group"
+      aria-label="编辑分组"
+    >
+      <p className="hint mb-4">显示名和说明对租户可见，不要写入上游渠道名称。路由名创建后不能更改。</p>
+      <FormGrid>
+        <Field label="显示名" error={problemAt(details, (p) => p === "/display_name")}>
+          {(aria) => <input {...aria} value={display} onChange={(e) => setDisplay(e.target.value)} />}
+        </Field>
+        <Field label="说明" error={problemAt(details, (p) => p === "/description")}>
+          {(aria) => <textarea {...aria} rows={2} value={description} onChange={(e) => setDescription(e.target.value)} />}
+        </Field>
+      </FormGrid>
       {failure && (
         <div className="note crit" role="alert">
           {failure}
         </div>
       )}
-      <p className="grp-actions">
+      <div className="mt-4 flex justify-end gap-2">
+        <Button onClick={onCancel}>关闭</Button>
         <Button kind="primary" busy={saving} busyLabel="保存中…" onClick={() => void save()}>
           保存
-        </Button>{" "}
-        <Button onClick={onCancel}>关闭</Button>
-      </p>
+        </Button>
+      </div>
     </div>
   );
 }
@@ -380,37 +420,43 @@ function CreateGroup({ onCreated }: { onCreated: () => Promise<void> }) {
   );
 
   return (
-    <div ref={form} className="grp-form grp-create" role="group" aria-label="新建分组">
-      <h3>新建分组</h3>
-      <p className="hint">显示名和说明对租户可见，不要写入上游渠道名称。</p>
-      <Field label="路由名" hint="密钥与上游账号按它匹配，创建后不能更改，只含小写字母、数字、下划线和连字符" error={problemAt(details, (p) => p === "/name")}>
-        {(aria) => (
-          <input {...aria} value={name} autoComplete="off" onChange={(e) => setName(e.target.value)} />
-        )}
-      </Field>
-      <Field label="显示名" error={problemAt(details, (p) => p === "/display_name")}>
-        {(aria) => <input {...aria} value={display} onChange={(e) => setDisplay(e.target.value)} />}
-      </Field>
-      <Field label="说明" error={problemAt(details, (p) => p === "/description")}>
-        {(aria) => (
-          <textarea {...aria} rows={2} value={description} onChange={(e) => setDescription(e.target.value)} />
-        )}
-      </Field>
-      <Field
-        label="默认换算率"
-        hint="1 美元等于多少人民币，0 到 100，最多四位小数；换算率 0 表示这个分组免费"
-        error={problemAt(details, (p) => p === "/default_cny_per_usd")}
-      >
-        {(aria) => (
-          <input {...aria} inputMode="decimal" autoComplete="off" value={rate} onChange={(e) => setRate(e.target.value)} />
-        )}
-      </Field>
-      <EffectiveFrom
-        onResolve={(r) => {
-          resolver.current = r;
-        }}
-        error={problemAt(details, (p) => p === "/effective_from")}
-      />
+    <div ref={form} role="group" aria-label="新建分组">
+      <p className="hint mb-5 text-[13px]">显示名和说明对租户可见，不要写入上游渠道名称。</p>
+      <FormGrid>
+        <Field
+          label="路由名"
+          wide
+          hint="密钥与上游账号按它匹配，创建后不能更改，只含小写字母、数字、下划线和连字符"
+          error={problemAt(details, (p) => p === "/name")}
+        >
+          {(aria) => (
+            <input {...aria} autoFocus value={name} autoComplete="off" onChange={(e) => setName(e.target.value)} />
+          )}
+        </Field>
+        <Field label="显示名" wide error={problemAt(details, (p) => p === "/display_name")}>
+          {(aria) => <input {...aria} value={display} onChange={(e) => setDisplay(e.target.value)} />}
+        </Field>
+        <Field label="说明" wide error={problemAt(details, (p) => p === "/description")}>
+          {(aria) => <textarea {...aria} rows={3} value={description} onChange={(e) => setDescription(e.target.value)} />}
+        </Field>
+        <Field
+          label="默认换算率"
+          hint="1 美元等于多少人民币，0 到 100，最多四位小数；换算率 0 表示这个分组免费"
+          error={problemAt(details, (p) => p === "/default_cny_per_usd")}
+        >
+          {(aria) => (
+            <input {...aria} inputMode="decimal" autoComplete="off" value={rate} onChange={(e) => setRate(e.target.value)} />
+          )}
+        </Field>
+        <div className="flex flex-col gap-3 @lg:pt-8">
+          <EffectiveFrom
+            onResolve={(r) => {
+              resolver.current = r;
+            }}
+            error={problemAt(details, (p) => p === "/effective_from")}
+          />
+        </div>
+      </FormGrid>
       {stray.length > 0 && (
         <div className="note crit" role="alert">
           {stray.map((d) => d.message).join("；")}
@@ -421,7 +467,7 @@ function CreateGroup({ onCreated }: { onCreated: () => Promise<void> }) {
           {failure}
         </div>
       )}
-      <p className="grp-actions">
+      <div className="right mt-6 flex justify-end border-t border-border pt-4">
         <TwoStep
           label="新建分组"
           kind="primary"
@@ -431,7 +477,7 @@ function CreateGroup({ onCreated }: { onCreated: () => Promise<void> }) {
           warning="换算率 0 表示这个分组下的调用不计价。确认无误再继续。"
           onConfirm={() => void submit()}
         />
-      </p>
+      </div>
     </div>
   );
 }

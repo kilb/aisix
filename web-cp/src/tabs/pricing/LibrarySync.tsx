@@ -27,6 +27,8 @@ import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
 import { EmptyState } from "../../ui/EmptyState";
 import { useToast } from "../../ui/Toast";
+import { cn } from "../../lib/cn";
+import { Card, CardHeader } from "../../components/page";
 
 /** The attestation's own words: the checkbox's text, as the import's confirmation gives it. */
 const ATTESTATION = "已对照官方价格页核对";
@@ -275,18 +277,31 @@ export function LibrarySync({ canEdit, generation }: { canEdit: boolean; generat
     }
   }
 
+  const counts: [string, string][] = [
+    ["将新增", "create"],
+    ["将更新", "update"],
+    ["一致", "same"],
+    ["多个匹配", "ambiguous"],
+    ["需手动录入", "flagged"],
+    ["无匹配", "unmatched"],
+  ];
   return (
-    <div className="panel" role="region" aria-label="同步基准价">
-      <h2>
-        同步基准价
-        <Button size="sm" type="button" icon="refresh" onClick={() => void load()}>
-          重新预览
-        </Button>
-      </h2>
-      <p className="hint">
-        按模型名称在价格库中查找对应条目：先找名称完全一致的，找不到再按数据集的 ID 与别名查找（不区分大小写，可带或不带「供应商/」前缀）。有多个候选时，先取模型自己的上游供应商的那一条，再取与上游账号协议相同的那一条；仍有多个时由你选择价格来源。同步按价格库的标价写入基准价，立即生效。
-      </p>
-      <p className="hint">{TIER_HINT}</p>
+    <Card className="mb-0" role="region" aria-label="同步基准价">
+      <CardHeader
+        as="h2"
+        title="同步基准价"
+        description={
+          <>
+            按模型名称在价格库中查找对应条目：先找名称完全一致的，找不到再按数据集的 ID 与别名查找（不区分大小写，可带或不带「供应商/」前缀）。有多个候选时，先取模型自己的上游供应商的那一条，再取与上游账号协议相同的那一条；仍有多个时由你选择价格来源。同步按价格库的标价写入基准价，立即生效。
+            <span className="mt-1 block">{TIER_HINT}</span>
+          </>
+        }
+        actions={
+          <Button size="sm" type="button" icon="refresh" onClick={() => void load()}>
+            重新预览
+          </Button>
+        }
+      />
       {error && (
         <div className="note crit" role="alert">
           {error}
@@ -300,19 +315,33 @@ export function LibrarySync({ canEdit, generation }: { canEdit: boolean; generat
         <EmptyState text="还没有可定价的模型。" />
       ) : (
         <>
-          <p className="library-counts" aria-label="同步概况">
-            将新增 {count("create")} · 将更新 {count("update")} · 一致 {count("same")} · 多个匹配 {count("ambiguous")} ·
-            需手动录入 {count("flagged")} · 无匹配 {count("unmatched")}
-          </p>
+          <div className="library-counts grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6" aria-label="同步概况">
+            {counts.map(([label, state]) => (
+              <div key={state} className="rounded-lg border border-border bg-muted/40 px-3 py-2">
+                <div className="text-xs text-muted-foreground">{label}</div>
+                <div className="text-lg font-semibold tabular-nums">{count(state)}</div>
+              </div>
+            ))}
+          </div>
           {canEdit && (
-            <div className="library-confirm" role="group" aria-label="确认同步">
-              <label className="check">
+            <div
+              className="library-confirm mt-4 mb-0 flex flex-wrap items-center gap-x-4 gap-y-2 rounded-lg border border-border bg-muted/40 px-4 py-3"
+              role="group"
+              aria-label="确认同步"
+            >
+              <label className="check mb-0">
                 <input type="checkbox" checked={attested} onChange={(e) => setAttested(e.target.checked)} />
                 <span>{ATTESTATION}</span>
               </label>
+              {writable > request.length && (
+                <span className="hint text-[13px]">
+                  共 {writable} 个模型待同步，一次最多同步 {preview.cap} 个；同步后再次确认剩下的。
+                </span>
+              )}
               <Button
                 type="button"
                 kind="primary"
+                className="ml-auto"
                 busy={syncing}
                 busyLabel="同步中…"
                 disabled={!attested || request.length === 0}
@@ -320,11 +349,6 @@ export function LibrarySync({ canEdit, generation }: { canEdit: boolean; generat
               >
                 同步 {request.length} 个模型
               </Button>
-              {writable > request.length && (
-                <span className="hint">
-                  共 {writable} 个模型待同步，一次最多同步 {preview.cap} 个；同步后再次确认剩下的。
-                </span>
-              )}
             </div>
           )}
           {failure && (
@@ -351,8 +375,10 @@ export function LibrarySync({ canEdit, generation }: { canEdit: boolean; generat
                     : longContextChange(row.entry?.card ?? null, item.current?.card ?? null);
                 return (
                   <tr key={item.model_id} data-model={item.name} data-state={item.state} data-shown={row.state}>
-                    <td className="trunc" title={item.name}>
-                      {item.name}
+                    <td className="font-medium">
+                      <span className="trunc" title={item.name}>
+                        {item.name}
+                      </span>
                       {item.state !== "ambiguous" && <Chosen item={item} onForget={() => void forget(item)} />}
                     </td>
                     <td>
@@ -376,8 +402,8 @@ export function LibrarySync({ canEdit, generation }: { canEdit: boolean; generat
                         </span>
                       )}
                     </td>
-                    <td>{item.current ? <CardLines card={item.current.card} /> : "未定价"}</td>
-                    <td>
+                    <td className="text-[13px]">{item.current ? <CardLines card={item.current.card} /> : "未定价"}</td>
+                    <td className="text-[13px]">
                       {row.state === "ambiguous" || row.state === "unmatched" ? "—" : <CardLines card={row.entry?.card} />}
                     </td>
                   </tr>
@@ -387,7 +413,7 @@ export function LibrarySync({ canEdit, generation }: { canEdit: boolean; generat
           </DataTable>
         </>
       )}
-    </div>
+    </Card>
   );
 }
 
@@ -401,7 +427,10 @@ export function LibrarySyncOne({
   canEdit,
   current,
   onSynced,
+  className,
 }: {
+  /** Spacing from what stands above it. */
+  className?: string;
   modelId: string;
   canEdit: boolean;
   /** The baseline in force as the page shows it, so the preview is read again when it changes. */
@@ -477,8 +506,8 @@ export function LibrarySyncOne({
   }
 
   return (
-    <section className="baseline-now library-one" aria-label="从价格库同步">
-      <h3>从价格库同步</h3>
+    <section className={cn("library-one", className)} aria-label="从价格库同步">
+      <h3 className="mb-3 text-base">从价格库同步</h3>
       {error && (
         <div className="note crit" role="alert">
           {error}
@@ -489,8 +518,8 @@ export function LibrarySyncOne({
       ) : !preview.library ? (
         <p className="hint">还没有价格库：在「价格 → 价格库」更新，或在「导入审核」上传数据集文件。</p>
       ) : !item ? null : (
-        <>
-          <p>
+        <div className="grid gap-3">
+          <div className="flex flex-wrap items-start gap-2">
             <span className="tag">{syncStateText(state ?? item.state)}</span>{" "}
             <EntryCell
               item={item}
@@ -501,7 +530,7 @@ export function LibrarySyncOne({
                 setAttested(false);
               }}
             />
-          </p>
+          </div>
           {item.binding && (
             <p className="library-chosen">
               <Chosen item={item} onForget={() => void forget(item)} />
@@ -510,7 +539,7 @@ export function LibrarySyncOne({
           {item.state === "ambiguous" && !chosen && <p className="hint">价格库中有多个候选条目：请选择价格来源。</p>}
           {item.state === "unmatched" && <p className="hint">价格库中没有与模型名称对应的条目。</p>}
           {entry && item.state !== "flagged" && (
-            <p className="library-card-block">
+            <p className="library-card-block rounded-lg border border-border bg-muted/40 p-3 text-[13px]">
               价格库价格（美元/百万 tokens）：
               <CardLines card={entry.card} />
             </p>
@@ -518,8 +547,12 @@ export function LibrarySyncOne({
           {entry && Object.keys(entry.card ?? {}).some((t) => t !== "default") && <p className="hint">{TIER_HINT}</p>}
           {warning && <p className="hint">{warning}</p>}
           {canEdit && writeable && (
-            <div className="library-confirm" role="group" aria-label="确认从价格库同步">
-              <label className="check">
+            <div
+              className="library-confirm m-0 flex flex-wrap items-center justify-between gap-3 border-t border-border pt-3"
+              role="group"
+              aria-label="确认从价格库同步"
+            >
+              <label className="check mb-0">
                 <input type="checkbox" checked={attested} onChange={(e) => setAttested(e.target.checked)} />
                 <span>{ATTESTATION}</span>
               </label>
@@ -540,7 +573,7 @@ export function LibrarySyncOne({
               同步失败：{failure}
             </div>
           )}
-        </>
+        </div>
       )}
     </section>
   );

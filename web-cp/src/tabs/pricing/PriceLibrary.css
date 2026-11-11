@@ -1,24 +1,5 @@
 /* 价格 · 价格库, and its per-model sync. Every value comes from the tokens. */
 
-.library-status {
-  margin: 0 0 var(--s-3);
-}
-
-/* The update, its note and the way to the offline upload, in one row while
-   there is room and stacked when there is not. */
-.library-update,
-.library-confirm {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--s-3);
-  align-items: center;
-  margin: var(--s-3) 0;
-}
-
-.library-counts {
-  margin: var(--s-3) 0 0;
-}
-
 /* A flagged entry's reasons are the point of its note, so they stay readable. */
 .library-flags {
   color: var(--text-2);
