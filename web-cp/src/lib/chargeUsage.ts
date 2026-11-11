@@ -107,7 +107,13 @@ export function lineUsd(line: ChargeLine): string | null {
  * discount, rounded up once, as the engine computes it. `null` when a rate
  * is unreadable or the rate in force is unknown.
  */
-export function chargeFromLines(lines: ChargeLine[], cnyPerUsdE4: number | null, discountBps: number): number | null {
+export function chargeFromLines(
+  lines: ChargeLine[] | null,
+  cnyPerUsdE4: number | null,
+  discountBps: number | null,
+): number | null {
+  // Unknown detail cannot be re-priced from: null, never a guess.
+  if (lines === null || discountBps === null) return null;
   if (cnyPerUsdE4 === null || !Number.isSafeInteger(cnyPerUsdE4) || !Number.isSafeInteger(discountBps)) return null;
   let sum = 0n;
   for (const line of lines) {

@@ -640,9 +640,13 @@ export interface CallCharge {
   /** The sum of the re-pricing corrections of this call; 0 when none. */
   adjusted_micro_cny: number;
   estimated: boolean;
-  /** The organisation's discount the charge was taken at, in basis points: 1000 is 10 % off. The lines' rates are before it. */
-  discount_bps: number;
-  lines: ChargeLine[];
+  /**
+   * The organisation's discount the charge was taken at, in basis points: 1000 is 10 % off. The lines' rates are before it.
+   * `null` when the correction that set the amount recorded no rate detail: the amount is known, the rate is not.
+   */
+  discount_bps: number | null;
+  /** `null` under the same condition as `discount_bps`; an empty list means the call had no billable item. */
+  lines: ChargeLine[] | null;
 }
 
 /** `Call`: one call of the organisation, with nothing of the platform's channel. */

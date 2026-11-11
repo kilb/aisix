@@ -322,7 +322,11 @@ function ChargeCheck({ c }: { c: Charge }) {
     <div className="grid gap-4 rounded-lg border border-border bg-muted/40 p-4 lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
       <section aria-label={`计费数量 ${c.event_id}`}>
         <h4 className="mb-2 text-[13px] font-semibold">计费数量</h4>
-        {c.lines.length === 0 ? (
+        {c.lines === null ? (
+          <p className="text-[13px] text-muted-foreground">
+            这次调用的金额由一次未记录费率明细的重新定价更正，费率明细不可知。
+          </p>
+        ) : c.lines.length === 0 ? (
           <p className="text-[13px] text-muted-foreground">这次调用没有计费的数量。</p>
         ) : (
           <table className="w-full text-[13px]">
@@ -346,10 +350,10 @@ function ChargeCheck({ c }: { c: Charge }) {
             </tbody>
           </table>
         )}
-        {c.lines.length > 0 && c.cny_per_usd_e4 !== null && (
+        {c.lines !== null && c.lines.length > 0 && c.cny_per_usd_e4 !== null && (
           <p className="mt-3 text-[13px] text-text-2">
             售价 = 小计合计 × 分组换算率 {rateText(c.cny_per_usd_e4)}
-            {c.discount_bps > 0 && <> × (1 − 折扣 {(c.discount_bps / 100).toFixed(2).replace(/\.?0+$/, "")}%)</>}，向上取整到 0.000001 元
+            {(c.discount_bps ?? 0) > 0 && <> × (1 − 折扣 {((c.discount_bps ?? 0) / 100).toFixed(2).replace(/\.?0+$/, "")}%)</>}，向上取整到 0.000001 元
             {recomputed !== null && (
               <>
                 {" "}= <span className="font-medium text-foreground">{fmtMicroCny(recomputed)}</span>

@@ -1031,10 +1031,13 @@ export interface Charge {
   /** The attempt's 0-based index within its request. */
   attempt_index: number;
   is_final_attempt: boolean | null;
-  /** The quantities and rates billed: one line per dimension, each rate USD per million units as a decimal string. */
-  lines: ChargeLine[];
-  /** The tenant discount applied, in basis points. */
-  discount_bps: number;
+  /**
+   * The quantities and rates billed: one line per dimension, each rate USD per million units as a decimal string.
+   * `null` when the latest re-pricing correction recorded no detail: its amount is known, the rate behind it is not.
+   */
+  lines: ChargeLine[] | null;
+  /** The tenant discount applied, in basis points; `null` under the same condition as `lines`. */
+  discount_bps: number | null;
   /** The upstream account that served the call; `null` when the row names none. */
   upstream_account_id: string | null;
   /** That account's display name; `null` once the account is gone. */

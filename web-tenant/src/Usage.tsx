@@ -523,7 +523,9 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
                     <tr className="usage-detail">
                       <td colSpan={9}>
                         <h3>计费明细</h3>
-                        {c.charge.lines.length === 0 ? (
+                        {c.charge.lines === null ? (
+                          <p className="hint">这次调用的金额由一次未记录费率明细的重新定价更正，费率明细不可知。</p>
+                        ) : c.charge.lines.length === 0 ? (
                           <p className="hint">这次调用没有计费项</p>
                         ) : (
                           <DataTable label="计费明细" compact>
@@ -545,9 +547,9 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
                             </tbody>
                           </DataTable>
                         )}
-                        {c.charge.discount_bps > 0 && (
+                        {(c.charge.discount_bps ?? 0) > 0 && (
                           <p className="hint">
-                            本次按组织折扣计费：在折扣前的价格上减免 {percentOf(c.charge.discount_bps)}。
+                            本次按组织折扣计费：在折扣前的价格上减免 {percentOf(c.charge.discount_bps ?? 0)}。
                           </p>
                         )}
                       </td>
