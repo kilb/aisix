@@ -960,6 +960,12 @@ struct RetirableSeries {
     /// every worker still caches, so it would never re-register, and the
     /// next rename away from it would leave it frozen.
     retired: bool,
+    /// Consecutive sweeps that found the series [`GaugeLiveness::Gone`].
+    /// A gone series is kept as a tombstone for [`GONE_TOMBSTONE_SWEEPS`]
+    /// sweeps rather than dropped at once, so a write that raced the sweep
+    /// is overwritten by the next one instead of surviving in a series
+    /// nothing tracks.
+    gone_sweeps: u8,
 }
 
 impl RetirableSeries {
@@ -1051,6 +1057,23 @@ const WORKER_CACHE_CAPACITY: usize = 1024;
 /// other family from being tracked, which is exactly the failure this
 /// whole mechanism exists to prevent.
 const RETIRABLE_CAPACITY: usize = 65_536;
+
+/// How many consecutive sweeps keep a [`GaugeLiveness::Gone`] series in the
+/// registry, re-marking it retired, before it is forgotten.
+///
+/// Dropping it on the first sweep leaves a window the retire epoch cannot
+/// close: a worker that read the epoch, then cached its handle, can have the
+/// sweep run between that read and its write, and the write lands on a
+/// series no later sweep knows about — a finite value asserting itself
+/// forever (the retired gauge "comes back"). Keeping the entry means the
+/// next sweep marks it again; two sweeps are enough because the sweep moves
+/// the epoch, so the racing worker's NEXT emit re-registers through
+/// `track_retirable` and lands in the registry again.
+///
+/// The cost is bounded: the tombstone count is entries the deployment
+/// already saw, and a series whose key is re-created is promoted back to
+/// live on the first registration (`track_retirable` clears the counter).
+const GONE_TOMBSTONE_SWEEPS: u8 = 2;
 
 /// Separator joining label values into a worker-cache key — a control
 /// byte that no bounded label vocabulary contains. A value that DOES
@@ -1503,7 +1526,12 @@ impl Metrics {
                 .map_or("unknown", |(_, v)| *v)
         });
         let mut map = self.inner.retirable.lock().expect("retirable registry");
-        if map.contains_key(key.as_str()) {
+        if let Some(series) = map.get_mut(key.as_str()) {
+            // A series that was retired and is being written again describes
+            // something that came back (a key re-created, a rename reverted).
+            // Stop counting it toward the tombstone's forget horizon, so it
+            // is not dropped out from under a live writer.
+            series.gone_sweeps = 0;
             return;
         }
         // Safety valve, same reasoning as `WORKER_CACHE_CAPACITY`: these
@@ -1521,6 +1549,7 @@ impl Metrics {
                 metric,
                 labels: labels.iter().map(|(n, v)| (*n, Box::from(*v))).collect(),
                 retired: false,
+                gone_sweeps: 0,
             },
         );
     }
@@ -1619,6 +1648,7 @@ impl Metrics {
                 let liveness = is_live(view).into();
                 if liveness == GaugeLiveness::Live {
                     series.retired = false;
+                    series.gone_sweeps = 0;
                     keep.push((key, series));
                     continue;
                 }
@@ -1650,8 +1680,20 @@ impl Metrics {
                     .collect();
                 metrics::gauge!(series.metric, labels).set(value);
                 series.retired = true;
-                if liveness == GaugeLiveness::Stale {
-                    keep.push((key, series));
+                match liveness {
+                    GaugeLiveness::Stale => keep.push((key, series)),
+                    GaugeLiveness::Gone => {
+                        // Kept one sweep past the retirement that dropped the
+                        // epoch: a worker between its epoch read and its write
+                        // still holds a handle to this series, and without the
+                        // entry the next sweep could never mark what it
+                        // wrote. See `GONE_TOMBSTONE_SWEEPS`.
+                        series.gone_sweeps = series.gone_sweeps.saturating_add(1);
+                        if series.gone_sweeps < GONE_TOMBSTONE_SWEEPS {
+                            keep.push((key, series));
+                        }
+                    }
+                    GaugeLiveness::Live => {}
                 }
             }
         });
@@ -2486,6 +2528,30 @@ impl Metrics {
         register: impl FnOnce() -> metrics::Gauge,
     ) {
         let seen = (Arc::as_ptr(&self.inner) as usize, self.retire_epoch());
+        WORKER_CACHE.with(|cell| {
+            let cache = &mut *cell.borrow_mut();
+            if cache.gauge_epoch != seen {
+                cache.gauges.clear();
+                cache.gauge_epoch = seen;
+            }
+        });
+        self.cached_gauge(site, value, build_key, register);
+    }
+
+    /// [`Self::cached_retirable_gauge`] with the epoch supplied by the
+    /// caller — the state a worker is in between reading the epoch and
+    /// writing its handle. Test-only, so the cross-epoch window can be
+    /// reproduced deterministically instead of by racing a real sweep.
+    #[cfg(test)]
+    fn cached_retirable_gauge_at_epoch(
+        &self,
+        seen: u64,
+        site: &'static str,
+        value: f64,
+        build_key: impl FnOnce(&mut WorkerKey<'_>),
+        register: impl FnOnce() -> metrics::Gauge,
+    ) {
+        let seen = (Arc::as_ptr(&self.inner) as usize, seen);
         WORKER_CACHE.with(|cell| {
             let cache = &mut *cell.borrow_mut();
             if cache.gauge_epoch != seen {
@@ -5325,6 +5391,18 @@ mod tests {
 
     /// Rendered value lines for one exact metric name (brace-delimited,
     /// so `aisix_x` never matches `aisix_x_count` and vice versa).
+    /// The value one rendered series carries, by `api_key_id`.
+    fn requests_value(m: &Metrics, metric: &str, key: &str) -> String {
+        series_lines(&m.render(), metric)
+            .into_iter()
+            .find(|l| l.contains(&format!("api_key_id=\"{key}\"")))
+            .unwrap_or_else(|| panic!("no {metric} series for {key}"))
+            .rsplit(' ')
+            .next()
+            .unwrap()
+            .to_owned()
+    }
+
     fn series_lines<'r>(rendered: &'r str, metric: &str) -> Vec<&'r str> {
         rendered
             .lines()
@@ -6116,6 +6194,120 @@ mod tests {
             m.render()
         );
         assert_eq!(requests(&m, "ak-live"), "8");
+    }
+
+    /// The cross-epoch race, deterministically: a worker caches a handle
+    /// under epoch E, a sweep retires and forgets the series and moves the
+    /// epoch to E+1, and the worker's write — already past its epoch check —
+    /// then lands through the stale handle. The retired series must not keep
+    /// that finite value: the next sweep retires it again, and one more scan
+    /// of the registry finds nothing left to resurrect. A live series
+    /// written the same way keeps its value.
+    #[test]
+    fn a_write_that_outran_its_epoch_check_is_retired_by_the_next_sweep() {
+        let m = Metrics::new(false);
+        let requests = |m: &Metrics, key: &str| {
+            series_lines(&m.render(), M_RATELIMIT_REMAINING_REQUESTS)
+                .into_iter()
+                .find(|l| l.contains(&format!("api_key_id=\"{key}\"")))
+                .unwrap_or_else(|| panic!("no series for {key}"))
+                .rsplit(' ')
+                .next()
+                .unwrap()
+                .to_owned()
+        };
+        let live = |series: LiveGaugeSeries<'_>| match series {
+            LiveGaugeSeries::RatelimitRemaining { api_key_id, .. } => api_key_id != "ak-gone",
+            _ => true,
+        };
+        // The worker's cached handles are taken under the epoch it then
+        // records — this is the worker's `seen` in
+        // `cached_retirable_gauge`, read BEFORE the race.
+        m.set_rate_limit_remaining("ak-gone", "unknown", "gpt", Some(5), None);
+        m.set_rate_limit_remaining("ak-live", "unknown", "gpt", Some(9), None);
+        let seen_epoch = m.retire_epoch();
+
+        // The sweep runs while the worker is between its epoch read and its
+        // write: one series gone, one live. It retires exactly the gone one.
+        assert_eq!(m.retire_stale_gauges(live), 1);
+        assert_ne!(m.retire_epoch(), seen_epoch, "the sweep moved the epoch");
+        assert_eq!(requests(&m, "ak-gone"), "NaN");
+
+        // The worker resumes with the epoch it read BEFORE the sweep: its
+        // epoch test passes, so its cached handle — taken under the old
+        // epoch — writes the retired series. (The production path would
+        // re-read the epoch here; this drives the read-then-write window the
+        // epoch mechanism cannot close on its own.)
+        m.cached_retirable_gauge_at_epoch(
+            seen_epoch,
+            M_RATELIMIT_REMAINING_REQUESTS,
+            6.0,
+            |k| {
+                k.label("ak-gone");
+                k.label("unknown");
+                k.label("gpt");
+            },
+            || {
+                m.track_retirable(
+                    GaugeFamily::RatelimitRemaining,
+                    M_RATELIMIT_REMAINING_REQUESTS,
+                    &[
+                        ("api_key_id", "ak-gone"),
+                        ("api_key_name", "unknown"),
+                        ("model", "gpt"),
+                    ],
+                );
+                metrics::gauge!(
+                    M_RATELIMIT_REMAINING_REQUESTS,
+                    "api_key_id" => "ak-gone".to_string(),
+                    "api_key_name" => "unknown".to_string(),
+                    "model" => "gpt".to_string(),
+                )
+            },
+        );
+        assert_eq!(requests(&m, "ak-gone"), "6", "the race wrote");
+
+        // The next sweep retires it again: no finite value survives.
+        m.retire_stale_gauges(live);
+        assert_eq!(requests(&m, "ak-gone"), "NaN", "a retired series came back");
+        // The live series the same race could have disturbed is untouched.
+        assert_eq!(requests(&m, "ak-live"), "9");
+    }
+
+    /// A gone series is kept as a tombstone for a bounded number of sweeps
+    /// and then forgotten, so the registry cannot grow by one permanent
+    /// entry per deleted key; and a series that comes back — the key
+    /// re-created — is promoted back to live instead of being dropped as a
+    /// tombstone under a live writer.
+    #[test]
+    fn a_gone_tombstone_is_forgotten_and_a_returning_series_is_promoted() {
+        let m = Metrics::new(false);
+        let live = |series: LiveGaugeSeries<'_>| match series {
+            LiveGaugeSeries::RatelimitRemaining { api_key_id, .. } => api_key_id != "ak-gone",
+            _ => true,
+        };
+        m.set_rate_limit_remaining("ak-gone", "unknown", "gpt", Some(5), None);
+        assert_eq!(m.retire_stale_gauges(live), 1);
+        // Still a tombstone after the sweep that retired it...
+        m.retire_stale_gauges(live);
+        // ...and forgotten one sweep later.
+        m.retire_stale_gauges(live);
+        m.set_rate_limit_remaining("ak-gone", "unknown", "gpt", Some(1), None);
+        assert_eq!(
+            m.retire_stale_gauges(live),
+            1,
+            "a forgotten tombstone re-registers as a new series"
+        );
+
+        // Promoted back to live: the counter resets on registration, so a
+        // series that flips live between sweeps is not dropped.
+        let alive = |_: LiveGaugeSeries<'_>| true;
+        m.set_rate_limit_remaining("ak-gone", "unknown", "gpt", Some(3), None);
+        assert_eq!(m.retire_stale_gauges(alive), 0);
+        assert_eq!(
+            requests_value(&m, M_RATELIMIT_REMAINING_REQUESTS, "ak-gone"),
+            "3"
+        );
     }
 
     /// Every sweep that forgets a series moves the retire epoch. The handles
