@@ -40,6 +40,12 @@ const UNIQUE_SECRET = `{"to":"${SECRET}"}`;
 const UNIQUE_ESCAPED = `{"to":"${ESCAPED}"}`;
 const ESCAPED_CLEAN = `{"to":"bob\\u0020smith"}`;
 const TOOL_OUT = "answer-with-a-tool-call";
+/** A legal argument document nested past `serde_json`'s default depth limit
+ * (128): the decoder cannot read it, so neither structured walk can judge a
+ * value the raw text does not spell out (R-070). Padded with a nesting run so
+ * the document itself stays valid JSON. */
+const deepArgs = (value: string) =>
+  `{"padding":${"[".repeat(130)}0${"]".repeat(130)},"x":"${value}"}`;
 const TOOL_OUT_ESCAPED = "answer-with-an-escaped-tool-call";
 const PT_KEY = "sk-repeated-key-passthrough";
 const PT_PREFIX = "/passthrough/repeated-key";
@@ -377,6 +383,43 @@ describe("an enforcing PII rule judges every value of a repeated tool-argument k
     const call = forwarded.messages[1].tool_calls?.[0] as { function: { arguments: string } };
     expect(call.function.arguments).toBe(REPEATED_CLEAN);
   });
+
+  // R-070: a valid document nested past the decoder's depth limit cannot be
+  // read structurally, and the raw-text pass cannot see an escape. Under both
+  // a mask and a block rule the gateway must not forward the escaped address:
+  // the rule could not be evaluated, and every enforcing row here is
+  // fail-closed, so the request is refused before the upstream is called.
+  for (const [rule, key, model] of [
+    ["mask", MASK_KEY, "repeated-key-mask"],
+    ["block", BLOCK_KEY, "repeated-key-block"],
+  ] as const) {
+    for (const [what, args] of [
+      ["an escaped address", deepArgs(ESCAPED)],
+      ["a plaintext address", deepArgs(SECRET)],
+      ["an escaped address in a repeated key", `{"padding":${"[".repeat(130)}0${"]".repeat(130)},"x":"${ESCAPED}","x":"safe"}`],
+    ] as const) {
+      test(`chat request, ${rule} rule: a depth-limited document carrying ${what} is refused`, async (ctx) => {
+        if (!etcdReachable) ctx.skip();
+        const res = await post("/v1/chat/completions", key, chatWithToolCall(model, args));
+        expectRefusedBeforeUpstream(res);
+      });
+    }
+
+    test(`a shallow document that matches nothing still goes through, ${rule} rule`, async (ctx) => {
+      if (!etcdReachable) ctx.skip();
+      // The control for the refusal above: the depth is what refuses, not the
+      // presence of a tool call or of an `x` key.
+      const shallow = '{"padding":[[0]],"x":"nothing to hide"}';
+      const res = await post("/v1/chat/completions", key, chatWithToolCall(model, shallow));
+      expect(res.status, res.body).toBe(200);
+      const sent = res.upstream();
+      expect(sent).toHaveLength(1);
+      const forwarded = JSON.parse(sent[0]) as { messages: Array<{ tool_calls?: Json[] }> };
+      const call = forwarded.messages[1].tool_calls?.[0] as { function: { arguments: string } };
+      // Nothing matched, so a mask row leaves it exactly as written.
+      if (rule === "mask") expect(call.function.arguments).toBe(shallow);
+    });
+  }
 
   test("a single-valued key is masked as before", async (ctx) => {
     if (!etcdReachable) ctx.skip();

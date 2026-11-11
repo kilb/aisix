@@ -156,6 +156,10 @@ fn reaches_remote_pass(role: aisix_guardrails::SegmentRole) -> bool {
 #[derive(Default)]
 struct SegmentCollector {
     segments: std::sync::Mutex<Vec<aisix_guardrails::ScanSegment>>,
+    /// A tool-argument document the walk found but could not decode at all
+    /// (R-070). It offers no slot, so without this flag the local pass would
+    /// answer "nothing to scan" for a body it never read.
+    unreadable_tool_arguments: std::sync::atomic::AtomicBool,
     /// Where each conversation message began, counted in the slots the remote
     /// pass reads (see [`Self::newest_from`]).
     message_starts: std::sync::Mutex<Vec<usize>>,
@@ -164,6 +168,13 @@ struct SegmentCollector {
 }
 
 impl SegmentCollector {
+    /// Whether an encoded argument document could not be decoded at all.
+    /// Read before taking, and settled by the moderation path's own policy.
+    fn saw_unreadable_tool_arguments(&self) -> bool {
+        self.unreadable_tool_arguments
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Everything collected, in walk order.
     fn take(&self) -> Vec<aisix_guardrails::ScanSegment> {
         std::mem::take(&mut *self.segments.lock().expect("collector poisoned"))
@@ -263,6 +274,10 @@ impl Guardrail for SegmentCollector {
     fn redact_output_echo(&self, text: &str) -> Option<aisix_guardrails::Redaction> {
         self.push(text, aisix_guardrails::SegmentRole::Echo, true);
         None
+    }
+    fn note_unreadable_tool_arguments(&self) {
+        self.unreadable_tool_arguments
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -599,9 +614,30 @@ async fn moderate_body_inner<R: Into<AnthropicRequestRedaction>>(
     }
     let collector = SegmentCollector::default();
     let _ = walk(&collector);
+    // R-070: a tool-argument document the walk could not decode offers no
+    // slot, so the passes below would judge a body they never read. Ask the
+    // chain what an unreadable body means here: a fail-closed member that
+    // reads this side refuses, and everything else goes on to record it as
+    // the bypass the walker already noted.
+    let unreadable_refusal = collector.saw_unreadable_tool_arguments()
+        && match dir {
+            Direction::Input | Direction::InputHistory => {
+                Guardrail::refuses_unevaluable_input(chain)
+            }
+            Direction::Output | Direction::OutputEcho => {
+                Guardrail::refuses_unevaluable_output(chain)
+            }
+        };
     let newest_from = collector.newest_from();
     let collected = collector.take();
-    let mut verdict = non_segment_verdict;
+    let mut verdict = if unreadable_refusal {
+        non_segment_verdict.merged_with(aisix_guardrails::GuardrailVerdict::block_unavailable(
+            "data-loss prevention could not read a tool argument document",
+            crate::error::TAG_UNSCANNABLE_BODY,
+        ))
+    } else {
+        non_segment_verdict
+    };
     // Both passes run even with zero collected slots. "Nothing to scan" is
     // not "nothing to decide": a segment-moderating member may hold a
     // verdict that does not depend on the text (a `kind: custom` policy
@@ -1050,6 +1086,47 @@ impl<'de> serde::de::Visitor<'de> for EveryValue<'_> {
     }
 }
 
+/// Nesting depth at which [`parse_every_value`] stops decoding: `serde_json`'s
+/// own default recursion limit (128, `de.rs` — one decrement per `{` or
+/// `[`). Kept, not lifted: the bound is what keeps a hostile payload from
+/// exhausting the stack in the first place.
+const JSON_DECODE_DEPTH_LIMIT: usize = 128;
+
+/// Whether `encoded` nests past [`JSON_DECODE_DEPTH_LIMIT`], and so cannot
+/// be decoded here at all.
+///
+/// Read from the bytes rather than from the failed parse, because the parse
+/// error does not say why it failed: `serde_json::Error` exposes only
+/// `classify()` — a nesting overflow is `Category::Syntax`, exactly like a
+/// trailing comma — and its `ErrorCode` is private. The scan is linear, runs
+/// only after a parse has already failed, and counts structure alone:
+/// brackets inside a string are text, and a backslash escape (including a
+/// `\\` pair) is one character.
+fn nests_past_decode_limit(encoded: &str) -> bool {
+    let mut depth: usize = 0;
+    let mut escaped = false;
+    let mut in_string = false;
+    for byte in encoded.bytes() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match byte {
+            b'\\' if in_string => escaped = true,
+            b'"' => in_string = !in_string,
+            b'{' | b'[' if !in_string => {
+                depth += 1;
+                if depth >= JSON_DECODE_DEPTH_LIMIT {
+                    return true;
+                }
+            }
+            b'}' | b']' if !in_string => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    false
+}
+
 /// `encoded` parsed as JSON, and whether an object in it repeats a key
 /// (see [`EveryValue`]). Without a repeated key the tree is the one
 /// `serde_json::from_str::<Value>` builds.
@@ -1106,6 +1183,42 @@ fn redact_json_encoded_structured(
                 }
             }
             unrewritable_tool_key
+        }
+        Err(_) if nests_past_decode_limit(encoded) => {
+            // A legal document nested past the decoder's depth limit. No
+            // structured walk can read it here, and the raw-text pass below
+            // is NOT a substitute for one: it sees `\u0040` where the
+            // upstream's parser sees `@`, so a rule matching the decoded
+            // value would find nothing and the request would reach the
+            // upstream with the match intact (R-070).
+            //
+            // So the rule could not be evaluated, and the chain's own
+            // policy decides — never the raw scan. `refuses_unevaluable_*`
+            // folds "a member reads this side" with "that member is
+            // fail-closed", so asking it here cannot disagree with the
+            // chain. Under fail-closed the payload is reported through the
+            // channel every family already refuses on, before dispatch;
+            // under fail-open and monitor the raw scan still masks what it
+            // can see, the request goes upstream, and the pass is recorded
+            // as a bypass so the row says part of it went unscreened rather
+            // than reading as a clean scan.
+            apply_to_string(chain, dir, encoded, counts);
+            chain.note_unreadable_tool_arguments();
+            match dir {
+                Direction::Input | Direction::InputHistory => {
+                    if Guardrail::refuses_unevaluable_input(chain) {
+                        return true;
+                    }
+                    chain.record_unreadable_input_bypass(crate::error::TAG_UNSCANNABLE_BODY);
+                }
+                Direction::Output | Direction::OutputEcho => {
+                    if Guardrail::refuses_unevaluable_output(chain) {
+                        return true;
+                    }
+                    chain.record_unreadable_output_bypass(crate::error::TAG_UNSCANNABLE_BODY);
+                }
+            }
+            false
         }
         Err(_) => {
             apply_to_string(chain, dir, encoded, counts);
@@ -5332,6 +5445,221 @@ mod tests {
                 args
             );
         }
+    }
+
+    /// A legal argument document nested past `serde_json`'s depth limit used
+    /// to fall through to the raw-text pass, which reads `@` rather than
+    /// the `@` the upstream's parser sees — so a matching rule found nothing
+    /// and the bytes went upstream untouched (R-070). The decoder's depth
+    /// bound stays; what changed is that a document it cannot read is now
+    /// unevaluable, and a fail-closed rule refuses it before dispatch.
+    ///
+    /// Padding is 130 levels deep, past the limit of 128 measured on this
+    /// crate's `serde_json` (depth 127 decodes, 128 does not).
+    fn deep_argument_document(inner: &str) -> String {
+        format!(
+            r#"{{"padding":{}0{},"x":"{inner}"}}"#,
+            "[".repeat(130),
+            "]".repeat(130),
+        )
+    }
+
+    /// Fail-closed: the payload cannot be read, so it is refused rather than
+    /// forwarded. Every family carrying an encoded arguments string reports
+    /// the same refusal.
+    #[test]
+    fn a_deep_argument_document_is_refused_under_fail_closed() {
+        let chain: Arc<dyn Guardrail> =
+            Arc::new(GuardrailChain::new(vec![Arc::new(PiiGuardrail::new(
+                vec![builtin_rule("email", PiiAction::Mask).unwrap()],
+                aisix_core::models::GuardrailHookPoint::Both,
+                262_144,
+                false,
+            ))]));
+        // Escape and plain text alike: neither is read by any structured walk
+        // here, so the escape is not what makes it unreadable.
+        for secret in [r"alice\u0040example.com", "alice@example.com"] {
+            let args = deep_argument_document(secret);
+            let mut chat: ChatFormat = serde_json::from_value(json!({
+                "model": "m",
+                "messages": [
+                    {"role": "user", "content": "send the note"},
+                    {"role": "assistant", "content": null, "tool_calls": [{
+                        "id": "call_1", "type": "function",
+                        "function": {"name": "send", "arguments": args}
+                    }]},
+                    {"role": "tool", "tool_call_id": "call_1", "content": "ok"}
+                ]
+            }))
+            .unwrap();
+            let redaction = redact_chat_format_structured(chain.as_ref(), &mut chat);
+            assert!(redaction.unrewritable_tool_key, "chat request {secret}");
+            // The raw pass still masks what it can see, so a plaintext copy is
+            // rewritten in place; the ESCAPED one is exactly what the raw pass
+            // cannot see, and the refusal is what stops it (the closing
+            // condition: a fail-closed refusal must not forward it).
+            let kept = chat.messages[1].extra["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .unwrap();
+            assert!(
+                !kept.contains("alice@example.com"),
+                "chat request kept a plaintext match: {kept}"
+            );
+
+            let mut body = json!({"input": [
+                {"type": "function_call", "call_id": "c", "name": "send", "arguments": args}
+            ]});
+            let redaction = redact_responses_request_structured(chain.as_ref(), &mut body);
+            assert!(
+                redaction.unrewritable_tool_key,
+                "responses request {secret}"
+            );
+            assert!(!body["input"][0]["arguments"]
+                .as_str()
+                .unwrap()
+                .contains("alice@example.com"));
+        }
+    }
+
+    /// The depth boundary is a refusal, not a blanket one: a document that
+    /// decodes normally is masked exactly as before, and one with nothing to
+    /// hide goes out byte for byte.
+    #[test]
+    fn a_shallow_argument_document_still_masks() {
+        let chain = both();
+        for (args, expect) in [
+            (
+                r#"{"to":"alice@example.com"}"#,
+                r#"{"to":"[EMAIL_REDACTED]"}"#,
+            ),
+            (
+                r#"{"to":"alice\u0040example.com"}"#,
+                r#"{"to":"[EMAIL_REDACTED]"}"#,
+            ),
+        ] {
+            let mut chat: ChatFormat = serde_json::from_value(json!({
+                "model": "m",
+                "messages": [{"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "call_1", "type": "function",
+                    "function": {"name": "send", "arguments": args}
+                }]}]
+            }))
+            .unwrap();
+            let redaction = redact_chat_format_structured(chain.as_ref(), &mut chat);
+            assert!(!redaction.unrewritable_tool_key, "{args}");
+            assert_eq!(
+                chat.messages[0].extra["tool_calls"][0]["function"]["arguments"],
+                expect
+            );
+        }
+        let clean = r#"{"to":"bob.smith","note":"nothing to hide"}"#;
+        let mut chat: ChatFormat = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "assistant", "content": null, "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": {"name": "send", "arguments": clean}
+            }]}]
+        }))
+        .unwrap();
+        let redaction = redact_chat_format_structured(chain.as_ref(), &mut chat);
+        assert!(!redaction.unrewritable_tool_key);
+        assert_eq!(
+            chat.messages[0].extra["tool_calls"][0]["function"]["arguments"],
+            clean
+        );
+    }
+
+    /// A BLOCK rule's verdict comes from the collect pass, which reads
+    /// collected slots rather than run rewrites. A document the walk cannot
+    /// decode offers no slot, so the rule would answer "nothing to scan" and
+    /// the request would go upstream with the escaped value intact (R-070).
+    /// The collect pass now reports it, and a fail-closed chain refuses.
+    #[tokio::test]
+    async fn a_block_rule_refuses_a_deep_argument_document() {
+        let chain: Arc<dyn Guardrail> =
+            Arc::new(GuardrailChain::new(vec![Arc::new(PiiGuardrail::new(
+                vec![builtin_rule("email", PiiAction::Block).unwrap()],
+                aisix_core::models::GuardrailHookPoint::Both,
+                262_144,
+                false,
+            ))]));
+        for secret in [r"alice\u0040example.com", "alice@example.com"] {
+            let mut chat: ChatFormat = serde_json::from_value(json!({
+                "model": "m",
+                "messages": [{"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "call_1", "type": "function",
+                    "function": {"name": "send", "arguments": deep_argument_document(secret)}
+                }]}]
+            }))
+            .unwrap();
+            let moderation = moderate_chat_format_structured(
+                chain.as_ref(),
+                None,
+                aisix_guardrails::GuardrailVerdict::Allow,
+                &mut chat,
+                &mut RedactionCounts::new(),
+                &mut Vec::new(),
+            )
+            .await;
+            assert!(moderation.verdict.is_block(), "{secret}");
+        }
+        // The control: a shallow document with nothing in it is allowed, so
+        // the refusal is the unreadable document and not the presence of one.
+        let mut chat: ChatFormat = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "assistant", "content": null, "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": {"name": "send", "arguments": r#"{"to":"bob.smith"}"#}
+            }]}]
+        }))
+        .unwrap();
+        let moderation = moderate_chat_format_structured(
+            chain.as_ref(),
+            None,
+            aisix_guardrails::GuardrailVerdict::Allow,
+            &mut chat,
+            &mut RedactionCounts::new(),
+            &mut Vec::new(),
+        )
+        .await;
+        assert!(!moderation.verdict.is_block());
+    }
+
+    /// Fail-open: the same payload is NOT refused, and the request goes out
+    /// with the bypass recorded, so a row says part of it went unscreened.
+    #[test]
+    fn a_deep_argument_document_is_a_recorded_bypass_under_fail_open() {
+        let audit = Arc::new(aisix_guardrails::GuardrailAuditLog::new());
+        let chain: Arc<dyn Guardrail> = Arc::new(
+            GuardrailChain::new(vec![Arc::new(
+                PiiGuardrail::new(
+                    vec![builtin_rule("email", PiiAction::Mask).unwrap()],
+                    aisix_core::models::GuardrailHookPoint::Both,
+                    262_144,
+                    false,
+                )
+                .with_fail_open(true),
+            )])
+            .with_audit_log(Some(Arc::clone(&audit))),
+        );
+        let args = deep_argument_document("alice\\u0040example.com");
+        let mut chat: ChatFormat = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "assistant", "content": null, "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": {"name": "send", "arguments": args}
+            }]}]
+        }))
+        .unwrap();
+        let redaction = redact_chat_format_structured(chain.as_ref(), &mut chat);
+        assert!(
+            !redaction.unrewritable_tool_key,
+            "a fail-open row never refuses"
+        );
+        assert_eq!(
+            audit.bypass_reason().as_deref(),
+            Some(crate::error::TAG_UNSCANNABLE_BODY)
+        );
     }
 
     /// Nothing matched: the repeated key is the caller's to send, so the

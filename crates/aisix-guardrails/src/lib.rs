@@ -930,6 +930,33 @@ pub trait Guardrail: Send + Sync + 'static {
     /// ([`GuardrailChain::record_bypass`]), so the default is a no-op.
     fn record_output_bypass(&self, _reason: &str) {}
 
+    /// Record that a request-side text field could not be given to the
+    /// structured scan — an encoded tool-argument document nested past the
+    /// decoder's depth limit — and the chain's own policy let it through
+    /// (R-070).
+    ///
+    /// A trait hook rather than a `GuardrailChain` method because the
+    /// redaction walkers hold the erased `&dyn Guardrail` every family hands
+    /// them; `GuardrailChain` forwards it and applies the fail-open and
+    /// reads-this-side gates, exactly as it does for
+    /// [`Self::record_output_bypass`]. The default is a no-op.
+    fn record_unreadable_input_bypass(&self, _reason: &str) {}
+
+    /// Response-side counterpart of
+    /// [`Self::record_unreadable_input_bypass`].
+    fn record_unreadable_output_bypass(&self, _reason: &str) {}
+
+    /// Note that an encoded tool-argument document could not be decoded at
+    /// all (R-070), so no structured walk judged it.
+    ///
+    /// The collect walk is the pass a Block-only chain's verdict comes from,
+    /// and it holds a [`SegmentCollector`] rather than the chain — the
+    /// collected slots are what its rules read. A document the walker cannot
+    /// decode offers no slot at all, so without this the collector answers
+    /// "nothing to scan" and the rule silently allows. The collector records
+    /// it and the moderation path settles the policy.
+    fn note_unreadable_tool_arguments(&self) {}
+
     /// The configured name of the row whose `max_buffer_bytes` is the cap
     /// [`Self::stream_output_policy`] folded to — the row an operator
     /// raises when held-back output outgrows it. Only [`GuardrailChain`]
