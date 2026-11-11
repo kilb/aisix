@@ -506,6 +506,93 @@ test("JSON 里写了字段视图读不了的价格卡：切回字段时留在 JS
   expect(stored.items.find((i: Json) => i.model_id === model.id).current.card).toEqual(fixed);
 });
 
+for (const { label, broken, path } of [
+  {
+    label: "基础价",
+    broken: { default: { base: { web_search: { toString: null } } } },
+    path: "/default/base/web_search",
+  },
+  {
+    label: "长上下文价格",
+    broken: { default: { long_context: [{ above_input_tokens: 200_000, rates: { web_search: { toString: null } } }] } },
+    path: "/default/long_context/0/rates/web_search",
+  },
+  {
+    label: "长上下文阈值",
+    broken: { default: { long_context: [{ above_input_tokens: { toString: null }, rates: { input: "2" } }] } },
+    path: "/default/long_context/0/above_input_tokens",
+  },
+]) {
+  test(`JSON 中${label}的对象值保留原文和局部错误，纠正后可编辑并保存`, async ({ page }, testInfo) => {
+    const pageErrors: string[] = [];
+    const consoleErrors: string[] = [];
+    page.on("pageerror", (error) => pageErrors.push(error.message));
+    page.on("console", (message) => {
+      if (message.type() === "error") consoleErrors.push(message.text());
+    });
+    const model = await newModel("rate-shape-base", "gpt-5.4-nano");
+    await openBaselines(page);
+    const panel = await openModel(page, model.name);
+    await panel.getByLabel("方式").selectOption("manual");
+    const card = panel.getByRole("group", { name: "价格卡（美元）" });
+    const toggle = card.getByRole("button", { name: "编辑完整价格卡（JSON）" });
+
+    // 同一页面的合法价格先能回到字段，确保错误场景确实经过切视图。
+    await toggle.click();
+    await card.getByLabel("资源文档").fill(JSON.stringify({ default: { base: { input: "1", output: "3", web_search: "10000" } } }));
+    await toggle.click();
+    await expect(card.getByRole("group", { name: "标准档 基础价", exact: true }).getByLabel("联网搜索（每千次）", { exact: true })).toHaveValue("10");
+
+    const original = JSON.stringify(broken);
+    await toggle.click();
+    await card.getByLabel("资源文档").fill(original);
+    await toggle.click();
+    await expect(panel, "结构错误不能卸载整个运维台").toBeVisible();
+    await expect(page.getByRole("heading", { name: "基准价", exact: true })).toBeVisible();
+    await expect(card.getByLabel("资源文档"), "原 JSON 应保留以便纠正").toHaveValue(original);
+    await expect(card.getByRole("alert")).toContainText(path);
+    await expect(page.locator("vite-error-overlay")).toHaveCount(0);
+    expect(pageErrors, "错误应在编辑器局部显示，不能产生渲染异常").toEqual([]);
+    expect(consoleErrors).toEqual([]);
+    await testInfo.attach("保留 JSON 与局部错误", { body: await page.screenshot(), contentType: "image/png" });
+
+    await panel.getByLabel("说明", { exact: true }).fill("纠正价格结构");
+    await panel.getByRole("button", { name: "保存" }).click();
+    await expect(card.getByRole("list", { name: "校验问题" })).toContainText("价格卡中有无法读取的内容，修改尚未生效；请先改正");
+    const refused = (await stack.admin.get("/admin/pricing/baselines")) as Json;
+    expect(refused.items.find((item: Json) => item.model_id === model.id).current).toBeNull();
+
+    await card.getByLabel("资源文档").fill(JSON.stringify({
+      default: {
+        base: { input: "1", output: "3", web_search: "10000" },
+        long_context: [{ above_input_tokens: 200_000, rates: { input: "2", output: "4", web_search: "20000" } }],
+      },
+    }));
+    // 上次提交的拒绝仍列在表单中；当前 JSON 的结构错误已随更正消失。
+    await expect(card.getByRole("alert").filter({ hasText: path })).toHaveCount(0);
+    await toggle.click();
+    await expect(card.getByLabel("资源文档")).toHaveCount(0);
+    const base = card.getByRole("group", { name: "标准档 基础价", exact: true });
+    await expect(base.getByLabel("输入", { exact: true })).toHaveValue("1");
+    const band = card.getByRole("group", { name: "标准档 长上下文档 1", exact: true });
+    await expect(band.getByLabel("输入超过（tokens）", { exact: true })).toHaveValue("200000");
+    await expect(band.getByLabel("联网搜索（每千次）", { exact: true })).toHaveValue("20");
+    await base.getByLabel("输出", { exact: true }).fill("5");
+    await panel.getByRole("button", { name: "保存" }).click();
+    await expect(page.getByText("已保存")).toBeVisible();
+    const stored = (await stack.admin.get("/admin/pricing/baselines")) as Json;
+    expect(stored.items.find((item: Json) => item.model_id === model.id).current.card).toEqual({
+      default: {
+        base: { input: "1", output: "5", web_search: "10000" },
+        long_context: [{ above_input_tokens: 200_000, rates: { input: "2", output: "4", web_search: "20000" } }],
+      },
+    });
+    expect(pageErrors).toEqual([]);
+    expect(consoleErrors).toEqual([]);
+    await testInfo.attach("纠正并保存后", { body: await page.screenshot(), contentType: "image/png" });
+  });
+}
+
 test("生效时间是日历上不存在的日子时报错且不写入；闰年的 2 月 29 日照常写入", async ({ page }) => {
   const model = await newModel("cal-base", "gpt-5.4-nano");
   await openBaselines(page);

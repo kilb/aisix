@@ -19,16 +19,33 @@ export function cardShapeProblem(card: unknown): string | null {
   for (const [tier, value] of Object.entries(card)) {
     const at = `/${segment(tier)}`;
     if (!isObject(value)) return `${at}：档位应是一个对象`;
-    if (value.base !== undefined && !isObject(value.base)) {
-      return `${at}/base：基础价应是一个对象，每个价格为字符串`;
+    if (value.base !== undefined) {
+      if (!isObject(value.base)) return `${at}/base：基础价应是一个对象，每个价格为字符串`;
+      const problem = rateProblem(value.base, `${at}/base`);
+      if (problem !== null) return problem;
     }
     if (value.long_context === undefined) continue;
     if (!Array.isArray(value.long_context)) return `${at}/long_context：长上下文档应是一个数组`;
     for (const [n, band] of (value.long_context as unknown[]).entries()) {
       const where = `${at}/long_context/${n}`;
       if (!isObject(band)) return `${where}：每个长上下文档应是一个对象，含 above_input_tokens 与 rates`;
-      if (band.rates !== undefined && !isObject(band.rates)) return `${where}/rates：长上下文档的价格应是一个对象`;
+      if (band.above_input_tokens !== null && typeof band.above_input_tokens === "object") {
+        return `${where}/above_input_tokens：阈值不能是对象或数组`;
+      }
+      if (band.rates !== undefined) {
+        if (!isObject(band.rates)) return `${where}/rates：长上下文档的价格应是一个对象`;
+        const problem = rateProblem(band.rates, `${where}/rates`);
+        if (problem !== null) return problem;
+      }
     }
+  }
+  return null;
+}
+
+// 只检查字段读取所需的类型，金额是否合法仍由控制面决定。
+function rateProblem(rates: Record<string, unknown>, at: string): string | null {
+  for (const [dimension, rate] of Object.entries(rates)) {
+    if (typeof rate !== "string") return `${at}/${segment(dimension)}：价格应是字符串`;
   }
   return null;
 }
