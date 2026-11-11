@@ -1,15 +1,17 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import type { TabProps } from "../../App";
 import { charges, tenants as tenantsApi, type AdminKey, type Charge, type ChargeFilter, type Tenant } from "../../lib/api";
 import { chargeReason } from "../../lib/chargeReason";
 import { errorText } from "../../lib/fmt";
 import { fmtMicroCny, fmtUtc } from "../../lib/money";
 import { modelText, reasonLabel, takeChargesFilter } from "../../lib/pricingStatus";
+import { chargeFromLines, dimensionLabel, lineUsd, rateText, reportedCounters, usageSummary } from "../../lib/chargeUsage";
+import { usdRateText } from "../../lib/rateUnits";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
 import { EmptyState } from "../../ui/EmptyState";
 import { Card, PageHeader } from "../../components/page";
-import { CardFooter } from "./kit";
+import { CardFooter } from "../pricing/kit";
 
 const STATUSES: [string, string][] = [
   ["charged", "已计价"],
@@ -21,7 +23,11 @@ const STATUSES: [string, string][] = [
 const statusLabel = (s: string) => STATUSES.find(([v]) => v === s)?.[1] ?? s;
 
 /**
- * 计费明细: every charge with its pricing reason, filterable and paged. A link
+ * 计费明细 (under 计费): every charge with its pricing reason, the upstream
+ * account and model that served it and its usage, filterable and paged. A
+ * row opens to what checks it: the billed quantities at their rates, the
+ * counters the upstream reported, and the charge recomputed from the lines
+ * by the engine's formula beside the amount billed. A link
  * from 计价状态 opens it on that kind's calls (its status, reason and model).
  * The charges list filters by none of the rest of a 计价状态 row's scope (its
  * group or tier, the last 24 hours, corrected calls left out), so the filter
@@ -36,6 +42,8 @@ export function Charges(_props: TabProps) {
   const [loadingMore, setLoadingMore] = useState(false);
   const [tenants, setTenants] = useState<Tenant[]>([]);
   const [keys, setKeys] = useState<AdminKey[]>([]);
+  // The charges whose check row is open, by seq.
+  const [open, setOpen] = useState<Set<number>>(() => new Set());
   const generation = useRef(0);
 
   const loadFirst = useCallback(async (f: ChargeFilter) => {
@@ -210,21 +218,61 @@ export function Charges(_props: TabProps) {
                 <th className="num">售价（元）</th>
                 <th className="num">成本（元）</th>
                 <th>档位</th>
+                <th>上游</th>
+                <th>用量</th>
+                <th className="right">
+                  <span className="vh">复核</span>
+                </th>
               </tr>
             </thead>
             <tbody>
-              {rows.map((c) => (
-                <tr key={c.seq}>
-                  <td className="tabular text-muted-foreground">{fmtUtc(c.occurred_at)}</td>
-                  <td>{tenantName(c.tenant_id)}</td>
-                  <td className="font-medium">{modelText(c.model_name, c.model_deleted)}</td>
-                  <td>{statusLabel(c.status)}</td>
-                  <td>{chargeReason(c)}</td>
-                  <td className="num">{c.charge_micro_cny === null ? "—" : fmtMicroCny(c.charge_micro_cny)}</td>
-                  <td className="num">{c.cost_micro_cny === null ? "—" : fmtMicroCny(c.cost_micro_cny)}</td>
-                  <td>{c.service_tier ?? "—"}</td>
-                </tr>
-              ))}
+              {rows.map((c) => {
+                const shown = open.has(c.seq);
+                return (
+                  <Fragment key={c.seq}>
+                    <tr>
+                      <td className="tabular text-muted-foreground">{fmtUtc(c.occurred_at)}</td>
+                      <td>{tenantName(c.tenant_id)}</td>
+                      <td className="font-medium">{modelText(c.model_name, c.model_deleted)}</td>
+                      <td>{statusLabel(c.status)}</td>
+                      <td>{chargeReason(c)}</td>
+                      <td className="num">{c.charge_micro_cny === null ? "—" : fmtMicroCny(c.charge_micro_cny)}</td>
+                      <td className="num">{c.cost_micro_cny === null ? "—" : fmtMicroCny(c.cost_micro_cny)}</td>
+                      <td>{c.service_tier ?? "—"}</td>
+                      <td>
+                        <Upstream c={c} />
+                      </td>
+                      <td className="tabular text-[13px]">{usageSummary(c.usage) ?? "—"}</td>
+                      <td className="right">
+                        <Button
+                          kind="quiet"
+                          size="sm"
+                          aria-expanded={shown}
+                          aria-controls={`charge-check-${c.seq}`}
+                          aria-label={`${shown ? "收起" : "展开"}用量明细 ${c.event_id}`}
+                          onClick={() =>
+                            setOpen((prev) => {
+                              const next = new Set(prev);
+                              if (next.has(c.seq)) next.delete(c.seq);
+                              else next.add(c.seq);
+                              return next;
+                            })
+                          }
+                        >
+                          {shown ? "收起" : "明细"}
+                        </Button>
+                      </td>
+                    </tr>
+                    {shown && (
+                      <tr className="dt-detail" id={`charge-check-${c.seq}`}>
+                        <td colSpan={11}>
+                          <ChargeCheck c={c} />
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
+                );
+              })}
             </tbody>
           </DataTable>
         )}
@@ -237,5 +285,98 @@ export function Charges(_props: TabProps) {
         )}
       </Card>
     </>
+  );
+}
+
+/** The upstream account that served the call, and the model it was asked for. */
+function Upstream({ c }: { c: Charge }) {
+  if (!c.upstream_account_id) return <span className="text-muted-foreground">—</span>;
+  const name = c.upstream_account_name ?? c.upstream_account_id.slice(0, 8);
+  return (
+    <span className="block leading-tight">
+      <span className="font-medium">
+        {name}
+        {c.upstream_account_deleted && "（已删除）"}
+      </span>
+      {c.upstream_model && <span className="cell-note font-mono">{c.upstream_model}</span>}
+    </span>
+  );
+}
+
+/**
+ * What checks one charge: the lines it billed (quantity × rate = USD), the
+ * counters the upstream reported, and the formula with its group rate and
+ * discount, recomputed beside the amount billed.
+ */
+function ChargeCheck({ c }: { c: Charge }) {
+  const reported = reportedCounters(c.usage);
+  const recomputed = chargeFromLines(c.lines, c.cny_per_usd_e4, c.discount_bps);
+  return (
+    <div className="grid gap-4 rounded-lg border border-border bg-muted/40 p-4 lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
+      <section aria-label={`计费数量 ${c.event_id}`}>
+        <h4 className="mb-2 text-[13px] font-semibold">计费数量</h4>
+        {c.lines.length === 0 ? (
+          <p className="text-[13px] text-muted-foreground">这次调用没有计费的数量。</p>
+        ) : (
+          <table className="w-full text-[13px]">
+            <thead className="text-muted-foreground">
+              <tr>
+                <th className="py-1 text-left font-medium">维度</th>
+                <th className="py-1 text-right font-medium">数量</th>
+                <th className="py-1 text-right font-medium">基准价</th>
+                <th className="py-1 text-right font-medium">小计（美元）</th>
+              </tr>
+            </thead>
+            <tbody>
+              {c.lines.map((l) => (
+                <tr key={l.dimension} className="border-t border-border">
+                  <td className="py-1.5">{dimensionLabel(l.dimension)}</td>
+                  <td className="py-1.5 text-right tabular-nums">{l.quantity.toLocaleString("en-US")}</td>
+                  <td className="py-1.5 text-right tabular-nums">{usdRateText(l.dimension, l.rate)}</td>
+                  <td className="py-1.5 text-right tabular-nums">{lineUsd(l) ?? "—"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+        {c.lines.length > 0 && c.cny_per_usd_e4 !== null && (
+          <p className="mt-3 text-[13px] text-text-2">
+            售价 = 小计合计 × 分组换算率 {rateText(c.cny_per_usd_e4)}
+            {c.discount_bps > 0 && <> × (1 − 折扣 {(c.discount_bps / 100).toFixed(2).replace(/\.?0+$/, "")}%)</>}，向上取整到 0.000001 元
+            {recomputed !== null && (
+              <>
+                {" "}= <span className="font-medium text-foreground">{fmtMicroCny(recomputed)}</span>
+                {c.charge_micro_cny !== null && (
+                  <span className={recomputed === c.charge_micro_cny ? "ml-2 text-success" : "ml-2 text-danger"}>
+                    {recomputed === c.charge_micro_cny ? "与实收一致" : `与实收 ${fmtMicroCny(c.charge_micro_cny)} 不一致`}
+                  </span>
+                )}
+              </>
+            )}
+          </p>
+        )}
+        {c.adjusted_micro_cny !== null && (
+          <p className="mt-1 text-[13px] text-text-2">重新计价已更正 {fmtMicroCny(c.adjusted_micro_cny)}。</p>
+        )}
+      </section>
+      <section aria-label={`上游报告的用量 ${c.event_id}`}>
+        <h4 className="mb-2 text-[13px] font-semibold">上游报告的用量</h4>
+        {reported.length === 0 ? (
+          <p className="text-[13px] text-muted-foreground">这次调用没有上游用量记录。</p>
+        ) : (
+          <dl className="grid grid-cols-[minmax(0,1fr)_auto] gap-x-6 text-[13px]">
+            {reported.map((r) => (
+              <Fragment key={r.key}>
+                <dt className="border-t border-border py-1.5 text-text-2">{r.label}</dt>
+                <dd className="border-t border-border py-1.5 text-right tabular-nums">{r.value.toLocaleString("en-US")}</dd>
+              </Fragment>
+            ))}
+          </dl>
+        )}
+        <p className="mt-3 text-[12px] text-muted-foreground">
+          事件 <code>{c.event_id}</code>
+        </p>
+      </section>
+    </div>
   );
 }

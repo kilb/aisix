@@ -32,6 +32,13 @@ const base: Charge = {
   attempt_kind: "initial",
   attempt_index: 0,
   is_final_attempt: true,
+  lines: [],
+  discount_bps: 0,
+  upstream_account_id: null,
+  upstream_account_name: null,
+  upstream_account_deleted: false,
+  upstream_model: null,
+  usage: null,
 };
 
 test("a failed upstream attempt says so, with its status and which retry it was", () => {

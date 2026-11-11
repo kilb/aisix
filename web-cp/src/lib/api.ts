@@ -989,6 +989,9 @@ export async function deleteOrgQuota(tenantId: string, id: string): Promise<void
 }
 
 /** One charge: what a stored usage row was billed in micro-cny, or why it could not be. */
+export type { ChargeLine, ReportedUsage } from "./chargeUsage";
+import type { ChargeLine, ReportedUsage } from "./chargeUsage";
+
 export interface Charge {
   seq: number;
   event_id: string;
@@ -1028,6 +1031,19 @@ export interface Charge {
   /** The attempt's 0-based index within its request. */
   attempt_index: number;
   is_final_attempt: boolean | null;
+  /** The quantities and rates billed: one line per dimension, each rate USD per million units as a decimal string. */
+  lines: ChargeLine[];
+  /** The tenant discount applied, in basis points. */
+  discount_bps: number;
+  /** The upstream account that served the call; `null` when the row names none. */
+  upstream_account_id: string | null;
+  /** That account's display name; `null` once the account is gone. */
+  upstream_account_name: string | null;
+  upstream_account_deleted: boolean;
+  /** The upstream model name the account was asked for. */
+  upstream_model: string | null;
+  /** The counters the upstream reported, only those the usage row carries; `null` without a usage row. */
+  usage: ReportedUsage | null;
 }
 
 export interface ChargeFilter {

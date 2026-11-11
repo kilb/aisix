@@ -4,7 +4,8 @@ import { STACK_START_TIMEOUT_MS, startStack, type Json, type Stack } from "./sta
 import { CALL_MICRO_CNY, chat, seedTenant } from "./world";
 
 /**
- * 价格 · 计费明细: every charge with its pricing reason. Real gateway, real
+ * 计费 · 计费明细: every charge with its pricing reason, its upstream and its
+ * usage (the owner moved it from 价格 to 计费 on 2026-11-11). Real gateway, real
  * control plane; the upstream stand-in is the only fake. Expected values come
  * from the scenario (which model was called, by whom), not from the product.
  */
@@ -25,7 +26,7 @@ async function openCharges(page: Page): Promise<void> {
   await page.getByLabel("邮箱").fill(stack.operator.email);
   await page.getByLabel("口令").fill(stack.operator.password);
   await page.getByRole("button", { name: "登录" }).click();
-  await page.getByRole("tab", { name: "价格", exact: true }).click();
+  await page.getByRole("tab", { name: "计费", exact: true }).click();
   await page.getByRole("button", { name: "计费明细" }).click();
 }
 
@@ -175,3 +176,44 @@ test("无需计费的行写明原因；模型删除后仍显示名称；可以�
   await expect(table.getByRole("row").nth(1)).toContainText(world.model.name);
   await expect(table.getByRole("row").filter({ hasText: "无需计费" })).toHaveCount(0);
 });
+
+test("计费明细写明实际调用的上游与用量，展开后能按公式复核售价", async ({ page }) => {
+  const world = await seedTenant(stack);
+  expect(await chat(stack, world.key.plaintext, world.model.name)).toBe(200);
+  await chargesFor(world.tenantId, 1);
+
+  await openCharges(page);
+  await page.getByLabel("租户").selectOption({ label: world.tenantName });
+  const table = page.getByRole("table", { name: "计费明细" });
+  await expect(table.getByRole("columnheader")).toContainText(["售价（元）", "成本（元）", "档位", "上游", "用量"]);
+  const row = table.getByRole("row").filter({ hasText: world.model.name });
+  await expect(row).toHaveCount(1);
+  // The world's model is account acct-ui-7c1's upstream-mdl-ui-9f3, and the
+  // stand-in reports 5 prompt and 3 completion tokens for every chat.
+  await expect(row.getByRole("cell").nth(8)).toContainText("acct-ui-7c1");
+  await expect(row.getByRole("cell").nth(8)).toContainText("upstream-mdl-ui-9f3");
+  await expect(row.getByRole("cell").nth(9)).toHaveText("输入 5 · 输出 3");
+
+  // Opened, the row shows what it billed: 5 input tokens at USD 1000/M and
+  // 3 output tokens at USD 2000/M, which at 1 CNY per USD is ¥0.011.
+  const toggle = row.getByRole("button", { name: /^展开用量明细/ });
+  await toggle.click();
+  await expect(row.getByRole("button", { name: /^收起用量明细/ })).toHaveAttribute("aria-expanded", "true");
+  const billed = page.getByRole("region", { name: /^计费数量/ });
+  const lines = billed.getByRole("row");
+  await expect(lines).toHaveCount(3);
+  await expect(lines.nth(1).getByRole("cell")).toHaveText(["输入", "5", "$1000 / 百万 tokens", "0.005"]);
+  await expect(lines.nth(2).getByRole("cell")).toHaveText(["输出", "3", "$2000 / 百万 tokens", "0.006"]);
+  await expect(billed).toContainText("分组换算率 1");
+  await expect(billed).toContainText("¥0.011");
+  await expect(billed).toContainText("与实收一致");
+  const reported = page.getByRole("region", { name: /^上游报告的用量/ });
+  await expect(reported).toContainText("输入5");
+  await expect(reported).toContainText("输出3");
+
+  // Closed again, the row is one row.
+  await row.getByRole("button", { name: /^收起用量明细/ }).click();
+  await expect(billed).toHaveCount(0);
+  await expect(table.getByRole("row")).toHaveCount(2);
+});
+

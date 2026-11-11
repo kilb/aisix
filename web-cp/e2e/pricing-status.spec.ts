@@ -4,7 +4,8 @@ import { STACK_START_TIMEOUT_MS, startStack, type Json, type Stack } from "./sta
 import { chat, seedTenant, type BillingWorld } from "./world";
 
 /**
- * 价格 · 计价状态 and the 概览 card: unpriced calls by reason. Real gateway and
+ * 价格 · 计价状态 and the 概览 card: unpriced calls by reason, and its links into
+ * 计费 · 计费明细. Real gateway and
  * control plane; the upstream stand-in is the only fake. Expected counts come
  * from the scenario (two calls to a model with no price).
  */
@@ -149,6 +150,8 @@ test("每种未计价写明模型和处理办法，可直接打开对应的计�
 
   await page.getByRole("button", { name: "刷新" }).click();
   await expect(charges.getByRole("row").nth(1).getByRole("cell").nth(4)).toHaveText("未定价 · 已通过重计价更正");
+  // 计费明细 is under 计费 (owner, 2026-11-11), so 计价状态 is a tab away.
+  await page.getByRole("tab", { name: "价格", exact: true }).click();
   await page.getByRole("button", { name: "计价状态" }).click();
   await expect(page.getByRole("status").filter({ hasText: "已通过重计价更正" })).toContainText("另有 2 次调用已通过重计价更正");
   await expect(page.getByRole("table", { name: "未计价的调用" }).getByRole("row").filter({ hasText: model.name })).toHaveCount(0);

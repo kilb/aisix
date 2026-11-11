@@ -100,7 +100,7 @@ export function PricingStatus({ onGoto }: TabProps) {
                           size="sm"
                           onClick={() => {
                             handChargesFilter(d.filter);
-                            onGoto("pricing", "charges");
+                            onGoto("billing", "charges");
                           }}
                         >
                           查看调用
@@ -119,7 +119,7 @@ export function PricingStatus({ onGoto }: TabProps) {
                           size="sm"
                           onClick={() => {
                             handChargesFilter(u.filter);
-                            onGoto("pricing", "charges");
+                            onGoto("billing", "charges");
                           }}
                         >
                           查看调用
