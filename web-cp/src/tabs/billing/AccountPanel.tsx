@@ -68,25 +68,35 @@ export function AccountState({ account }: { account: BillingAccount }) {
 function BalanceCard({ account }: RegionProps) {
   return (
     <Region label="余额">
-      <dl className="bl-facts">
-        <dt>计费方式</dt>
-        <dd>{MODE_LABEL[account.billing_mode] ?? account.billing_mode}</dd>
-        <dt>余额</dt>
-        <dd className="money">{fmtMicroCny(account.balance_micro_cny)}</dd>
-        <dt>信用额度</dt>
-        <dd className="money">{fmtMicroCny(account.credit_limit_micro_cny)}</dd>
-        <dt>可用</dt>
-        <dd className="money">{fmtMicroCny(account.available_micro_cny)}</dd>
+      <dl className="bl-tiles">
+        <div>
+          <dt>计费方式</dt>
+          <dd>{MODE_LABEL[account.billing_mode] ?? account.billing_mode}</dd>
+        </div>
+        <div>
+          <dt>余额</dt>
+          <dd className="money">{fmtMicroCny(account.balance_micro_cny)}</dd>
+        </div>
+        <div>
+          <dt>信用额度</dt>
+          <dd className="money">{fmtMicroCny(account.credit_limit_micro_cny)}</dd>
+        </div>
+        <div>
+          <dt>可用</dt>
+          <dd className="money">{fmtMicroCny(account.available_micro_cny)}</dd>
+        </div>
         {!account.is_internal && (
-          <>
+          <div>
             <dt>状态</dt>
             <dd>
               <AccountState account={account} />
             </dd>
-          </>
+          </div>
         )}
-        <dt>待审批充值</dt>
-        <dd>{account.pending_topups}</dd>
+        <div>
+          <dt>待审批充值</dt>
+          <dd className="tabular">{account.pending_topups}</dd>
+        </div>
       </dl>
     </Region>
   );
@@ -158,7 +168,7 @@ function CreditLimit({ account, canEdit, onChanged }: RegionProps) {
         <p className="money">{fmtMicroCny(account.credit_limit_micro_cny)}</p>
       ) : (
         <form ref={form} onSubmit={(e) => void save(e)} noValidate>
-          <div className="bl-controls">
+          <div className="bl-controls bl-inline">
             <Field label="信用额度（元）" hint={CREDIT_HINT} error={problem}>
               {(aria) => <input inputMode="decimal" value={draft} onChange={(e) => setDraft(e.target.value)} {...aria} />}
             </Field>
@@ -209,30 +219,33 @@ function BillingMode({ account, canEdit, onChanged }: RegionProps) {
 
   return (
     <Region label="计费方式">
-      <dl className="bl-facts">
-        <dt>计费方式</dt>
-        <dd>{MODE_LABEL[account.billing_mode] ?? account.billing_mode}</dd>
-      </dl>
-      <p className="hint">
-        {account.is_internal
-          ? "平台内部租户不受余额与信用额度限制，计费方式不影响它是否被停止。"
-          : "预付 = 余额 + 信用额度；后付 = 同上，月底结算。"}
-      </p>
-      {!account.is_internal && canEdit && (
-        <>
-          <div className="bl-controls">
+      <div className="flex flex-wrap items-start justify-between gap-x-6 gap-y-3">
+        <div className="min-w-0 flex-1 basis-60">
+          <dl className="bl-facts">
+            <dt>计费方式</dt>
+            <dd className="font-medium">{MODE_LABEL[account.billing_mode] ?? account.billing_mode}</dd>
+          </dl>
+          <p className="hint mt-1 text-[13px]">
+            {account.is_internal
+              ? "平台内部租户不受余额与信用额度限制，计费方式不影响它是否被停止。"
+              : "预付 = 余额 + 信用额度；后付 = 同上，月底结算。"}
+          </p>
+        </div>
+        {!account.is_internal && canEdit && (
+          <div className="right">
             <TwoStep
               label={`改为${MODE_LABEL[next]}`}
               kind="secondary"
+              size="sm"
               busy={busy}
               busyLabel="保存中…"
               warning={`切换后立即按${MODE_LABEL[next]}判断是否停止调用，余额与信用额度不变。`}
               onConfirm={() => void change()}
             />
           </div>
-          <Msg note={note} />
-        </>
-      )}
+        )}
+      </div>
+      {!account.is_internal && canEdit && <Msg note={note} />}
     </Region>
   );
 }
@@ -362,7 +375,7 @@ function Ledger({ account }: RegionProps) {
 
   return (
     <Region label="余额流水">
-      <div className="bl-controls">
+      <div className="bl-controls bl-filters">
         {days.fields}
         <Field label="类型">
           <select value={kind} onChange={(e) => setKind(e.target.value as LedgerItem["kind"] | "")}>
@@ -409,9 +422,11 @@ function Ledger({ account }: RegionProps) {
         </div>
       )}
       {next !== null && (
-        <Button type="button" busy={moreBusy} busyLabel="加载更多" onClick={() => void loadMore()}>
-          加载更多
-        </Button>
+        <div className="bl-more">
+          <Button type="button" size="sm" busy={moreBusy} busyLabel="加载更多" onClick={() => void loadMore()}>
+            加载更多
+          </Button>
+        </div>
       )}
     </Region>
   );
@@ -442,7 +457,7 @@ function Summary<T>({
   );
   return (
     <Region label={label}>
-      <div className="bl-controls">
+      <div className="bl-controls bl-filters">
         <Field label="汇总方式">
           <select value={group} onChange={(e) => setGroup(e.target.value as "day" | "month")}>
             <option value="day">按天</option>
@@ -451,7 +466,7 @@ function Summary<T>({
         </Field>
         {days.fields}
       </div>
-      <p className="hint">未选日期时，按天汇总最近 30 天，按月汇总最近 12 个月（UTC）。</p>
+      <p className="hint text-[13px]">未选日期时，按天汇总最近 30 天，按月汇总最近 12 个月（UTC）。</p>
       {rows.error ? (
         <Failed message={rows.error} onRetry={() => void rows.reload()} />
       ) : rows.data === null ? (

@@ -132,29 +132,33 @@ function Form({ account, onChanged }: RegionProps) {
   const reasonProblem = local.reason ?? refused?.at.get("/reason") ?? null;
   return (
     <Region label="直接入账">
-      <p className="hint">直接给这个租户入账，用于线下收款或补偿。入账后租户在自己的充值记录里看到这笔入账和原因。</p>
+      <p className="hint text-[13px]">直接给这个租户入账，用于线下收款或补偿。入账后租户在自己的充值记录里看到这笔入账和原因。</p>
       <form ref={form} onSubmit={(e) => e.preventDefault()} noValidate>
-        <Field label="金额（元）" error={amountProblem}>
-          {(aria) => (
-            <input inputMode="decimal" value={amount} disabled={busy || lock !== null} onChange={(e) => setAmount(e.target.value)} {...aria} />
-          )}
-        </Field>
+        <div className="grid gap-x-4 sm:grid-cols-2">
+          <Field label="金额（元）" error={amountProblem}>
+            {(aria) => (
+              <input inputMode="decimal" value={amount} disabled={busy || lock !== null} onChange={(e) => setAmount(e.target.value)} {...aria} />
+            )}
+          </Field>
+          <Field label="凭证号" error={refused?.at.get("/reference") ?? null}>
+            {(aria) => <input value={reference} maxLength={128} disabled={busy || lock !== null} onChange={(e) => setReference(e.target.value)} {...aria} />}
+          </Field>
+        </div>
         <Field label="原因" error={reasonProblem}>
           {(aria) => <input value={reason} maxLength={500} disabled={busy || lock !== null} onChange={(e) => setReason(e.target.value)} {...aria} />}
         </Field>
-        <Field label="凭证号" error={refused?.at.get("/reference") ?? null}>
-          {(aria) => <input value={reference} maxLength={128} disabled={busy || lock !== null} onChange={(e) => setReference(e.target.value)} {...aria} />}
-        </Field>
         {!unknown && (
-        <TwoStep
-          label="入账"
-          kind="primary"
-          disabled={elsewhere}
-          busy={busy}
-          ask={ask}
-          warning="将立即计入该租户余额"
-          onConfirm={() => void send()}
-        />
+          <div className="right flex justify-end">
+            <TwoStep
+              label="入账"
+              kind="primary"
+              disabled={elsewhere}
+              busy={busy}
+              ask={ask}
+              warning="将立即计入该租户余额"
+              onConfirm={() => void send()}
+            />
+          </div>
         )}
       </form>
       {elsewhere && (
@@ -170,7 +174,7 @@ function Form({ account, onChanged }: RegionProps) {
       {unknown && (
         <div className="note crit" role="alert">
           入账结果未知：请先在「计费 · 充值审批」中把状态选为「已批准」、来源选为「平台入账」，按租户、原因与凭证号确认这笔入账是否已记录，再决定是否重试。本面板「余额流水」里的「充值」条目不分租户申请的充值与平台入账，不能据此判断。
-          <div className="bl-row-actions">
+          <div className="bl-row-actions mt-3">
             <Button type="button" size="sm" busy={checking} busyLabel="刷新中…" onClick={() => void recheck()}>
               刷新余额与流水
             </Button>

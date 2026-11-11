@@ -4,7 +4,7 @@
 .tn-name {
   max-width: 220px;
 }
-/* The tenant whose detail is open: the hovered-row wash, with a Signal-yellow edge. */
+/* The tenant whose detail is open: the hovered-row wash, with an edge in the ink colour. */
 .dt tr:has(.tn-name[aria-expanded="true"]) {
   background: var(--row-hover);
 }
@@ -32,7 +32,7 @@ td > .tn-actions {
   white-space: normal;
 }
 
-/* The facts under a tenant's name. */
+/* The facts under a tenant's name (the style guide's one-line form). */
 .tn-facts {
   margin: var(--s-4) 0 0;
   padding: var(--s-3) 0;
@@ -41,7 +41,163 @@ td > .tn-actions {
   color: var(--text-2);
 }
 
-/* A part of the tenant's page: a heading over what it holds, 24px apart. */
+/* Beside an open detail or form, while the list is narrow, its secondary
+   columns step aside; they come back when it closes. */
+@media (min-width: 1280px) and (max-width: 1799px) {
+  .with-side.is-open .dt :is(th, td).side-opt,
+  .is-creating .dt :is(th, td).side-opt {
+    display: none;
+  }
+}
+
+/* The facts at the top of a tenant's detail: four cells in one ruled strip. */
+.tn-strip {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1px;
+  margin: 16px 0 0;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--border);
+}
+@media (min-width: 640px) {
+  .tn-strip {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+.tn-strip > div {
+  min-width: 0;
+  padding: 10px 14px;
+  background: var(--card);
+}
+.tn-strip dt {
+  color: var(--muted-foreground);
+  font-size: 12px;
+  font-weight: 500;
+}
+.tn-strip dd {
+  margin: 4px 0 0;
+  font-size: 14px;
+  font-weight: 500;
+}
+
+/* A part of the tenant's detail: a full-width band under a hairline, its
+   title and hint first, its save in a muted bar along its foot. */
+.tn-part {
+  min-width: 0;
+  margin: 24px -24px 0;
+  padding: 20px 24px;
+  border: 0;
+  border-top: 1px solid var(--border);
+}
+.tn-part > legend,
+.tn-part > h3,
+.tn-sub > legend {
+  float: left;
+  width: 100%;
+  margin: 0 0 4px;
+  padding: 0;
+  color: var(--foreground);
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.4;
+  letter-spacing: -0.01em;
+}
+.tn-part > legend + *,
+.tn-part > h3 + *,
+.tn-sub > legend + * {
+  clear: both;
+}
+.tn-part > .hint,
+.tn-sub > .hint {
+  margin: 0 0 14px;
+  font-size: 13px;
+  line-height: 1.55;
+}
+.tn-part + .tn-part,
+form + .tn-part,
+.tn-part + form > .tn-part {
+  margin-top: 0;
+}
+.side-panel > :last-child.tn-part {
+  margin-bottom: -24px;
+}
+/* A fieldset inside a card that is not a part of its own: a titled group. */
+.tn-sub {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+/* The key form beside the key list: its legend is the card's title, and
+   its two groups of choices read as fields. */
+.tn-create > legend {
+  margin-bottom: 16px;
+  font-size: 16px;
+}
+.tn-field {
+  margin: 0 0 16px;
+}
+.tn-field > legend {
+  margin: 0 0 2px;
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: 0;
+}
+.tn-field > .hint {
+  margin: 0 0 8px;
+  font-size: 12px;
+}
+.tn-field .f {
+  margin-bottom: 0;
+}
+.tn-checks.tn-box {
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+/* A part's actions: right-aligned in a muted bar that closes the part. */
+.tn-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: flex-end;
+  gap: 8px;
+  margin: 16px -24px -20px;
+  padding: 12px 24px;
+  border-top: 1px solid var(--border);
+  background: color-mix(in srgb, var(--muted) 55%, transparent);
+}
+.panel > .tn-foot:last-child,
+.panel > .tn-sub:last-child > .tn-foot:last-child {
+  margin-bottom: -24px;
+  border-radius: 0 0 calc(var(--radius) + 3px) calc(var(--radius) + 3px);
+}
+.tn-foot > .two-step.is-asking {
+  justify-items: end;
+}
+
+/* A table inside a part runs to the card's edges, closing the part. */
+.tn-bleed {
+  margin: 12px -24px 0;
+}
+.tn-bleed > .dt-wrap {
+  --dt-edge: 24px;
+  margin: 0;
+  border-top: 1px solid var(--border);
+}
+.tn-part > .tn-bleed:last-child {
+  margin-bottom: -20px;
+}
+.side-panel > .tn-part:last-child > .tn-bleed:last-child > .dt-wrap {
+  border-radius: 0 0 calc(var(--radius) + 3px) calc(var(--radius) + 3px);
+}
+
+/* The style guide's and other pages' part: a heading over what it holds. */
 .tn-section {
   min-width: 0;
   margin: var(--s-6) 0 0;
@@ -55,8 +211,8 @@ td > .tn-actions {
   margin: 0 0 var(--s-2);
   padding: 0;
   color: var(--text);
-  font-size: var(--fs-16);
-  font-weight: 700;
+  font-size: 15px;
+  font-weight: 600;
   line-height: var(--lh-heading);
 }
 .tn-section > legend + *,
@@ -65,11 +221,6 @@ td > .tn-actions {
 }
 .tn-section > .hint {
   margin-bottom: var(--s-3);
-}
-/* The members list is unrelated to the access parts above it: a hairline. */
-.tn-section.tn-sep {
-  padding-top: var(--s-6);
-  border-top: 1px solid var(--divider);
 }
 .tn-section .tn-section > legend {
   font-size: var(--fs-14);
@@ -80,32 +231,57 @@ td > .tn-actions {
   margin-top: var(--s-2);
 }
 
-/* The model scope: two radios on one line, above the list they govern. */
+/* The model scope: two choices drawn as a segmented pair, above the list they govern. */
 .tn-scope {
-  display: flex;
+  display: inline-flex;
   flex-wrap: wrap;
-  gap: var(--s-2) var(--s-4);
-  margin: var(--s-2) 0 0;
+  gap: 4px;
+  margin: 4px 0 12px;
+  padding: 3px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--muted);
 }
 .tn-scope label {
   display: inline-flex;
   align-items: center;
-  gap: var(--s-2);
+  gap: 8px;
+  height: 30px;
+  padding: 0 12px;
+  border-radius: calc(var(--radius) - 3px);
+  color: var(--text-2);
+  font-size: 13px;
+  font-weight: 500;
   cursor: pointer;
 }
+.tn-scope label:has(:checked) {
+  background: var(--card);
+  color: var(--foreground);
+  box-shadow: var(--shadow-xs);
+}
+.tn-scope label:has(:disabled) {
+  cursor: default;
+}
+
+/* A list of checkboxes: as many columns as the width holds. */
 .tn-checks {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-  gap: var(--s-2) var(--s-4);
-  margin: var(--s-3) 0 var(--s-4);
+  gap: 8px 16px;
+  margin: 0 0 4px;
   padding: 0;
   list-style: none;
+}
+.tn-checks > li {
+  min-width: 0;
 }
 .tn-checks label {
   display: inline-flex;
   align-items: center;
   gap: var(--s-2);
+  max-width: 100%;
   line-height: var(--lh-table);
+  overflow-wrap: anywhere;
   cursor: pointer;
 }
 .tn-checks .tn-note,
@@ -113,16 +289,33 @@ td > .tn-actions {
   display: block;
   margin: 2px 0 0 var(--s-6);
 }
-/* A list of groups: each with the accounts in it on a line under it. */
+/* A list of groups: one ruled row each, with the accounts in it under its name. */
 .tn-checks.tn-groups {
   grid-template-columns: minmax(0, 1fr);
+  gap: 0;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.tn-checks.tn-groups > li {
+  padding: 10px 14px;
+  background: var(--card);
+}
+.tn-checks.tn-groups > li + li {
+  border-top: 1px solid var(--border);
+}
+.tn-checks.tn-groups > li:has(:checked) {
+  background: color-mix(in srgb, var(--muted) 60%, var(--card));
+}
+.tn-checks.tn-groups label {
+  font-weight: 500;
 }
 /* A group's routing name beside its display name, as the documents store it. */
 .grp-route {
   margin-left: var(--s-2);
   color: var(--text-muted);
   font-family: var(--font-mono);
-  font-size: var(--fs-13);
+  font-size: 12px;
 }
 .tn-note {
   margin-left: var(--s-2);
@@ -152,12 +345,6 @@ td .tn-flag {
   margin: 2px 0 0;
 }
 
-.tn-limits {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
-  gap: 0 var(--s-4);
-  margin: var(--s-3) 0 0;
-}
 .tn-limits > div > .f {
   margin-bottom: var(--s-4);
 }
@@ -168,36 +355,38 @@ td .tn-flag {
 /* A one-time secret: selectable as a whole, wrapped rather than cut off. */
 .tn-token {
   display: block;
-  margin: var(--s-3) 0;
-  padding: var(--s-2) var(--s-3);
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+  padding: 7px 12px;
   border: 1px solid var(--border);
   border-radius: var(--r-input);
-  background: var(--well);
+  background: var(--card);
   color: var(--text);
   font-family: var(--font-mono);
   font-size: var(--fs-13);
+  line-height: 1.5;
   word-break: break-all;
   user-select: all;
 }
 
+/* The one-time group choice under a key's row. */
 .tn-override {
   min-width: 0;
-  margin: 0;
+  margin: 4px 0 0;
   padding: var(--s-4);
-  border: 1px solid var(--divider);
-  border-radius: var(--r-card);
-  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--muted) 45%, var(--card));
   white-space: normal;
 }
 .tn-override > legend {
   padding: 0 var(--s-1);
-  font-weight: 700;
+  font-weight: 600;
 }
 .tn-override > .hint {
-  margin-bottom: var(--s-2);
+  margin-bottom: var(--s-3);
 }
-
-/* The invite form's row: the address and role, then the action. */
-.tn-section .r > .btn {
-  flex: none;
+.tn-override > .tn-actions {
+  margin-top: var(--s-3);
 }
