@@ -1,7 +1,15 @@
-/* Design tokens: the wayfinding language shared by the operator Dashboard
-   (web-cp) and the tenant portal (web-tenant). Both apps carry a byte-equal
-   copy of this file; a unit test in each pins the two together, so change
-   them together.
+/* Design tokens shared by the operator Dashboard (web-cp) and the tenant
+   portal (web-tenant). Both apps carry a byte-equal copy of this file; a
+   unit test in each pins the two together, so change them together.
+
+   The language (2026-11 redesign): chrome is glass and content is paper.
+   The navigation and the bars that stay on screen are translucent layers
+   floating over the page; the lists, forms and figures underneath are
+   opaque, crisp and quiet. Corners are concentric (the rail holds panels,
+   panels hold fields, controls are capsules). Signal yellow, Routio's own
+   colour, appears in exactly two roles: the lens that marks where you are,
+   and the one primary action of a view. Figures are set in Mona Sans,
+   wide for the readings that matter.
 
    Light is the default whatever the system setting. Dark applies only when
    the viewer chooses it with the theme toggle, which sets
@@ -13,98 +21,125 @@
 :root {
   color-scheme: light;
 
-  /* Palette. Sign yellow is only ever a fill with Ink text on it. */
-  --ink: #1C2A39;
-  --concrete: #F5F7F4;
+  /* Palette. Signal yellow is only ever a fill with Ink text on it. */
+  --ink: #161A23;
+  --canvas: #EEF0F4;
   --paper: #FFFFFF;
   --sign: #FFC72C;
-  --sign-hover: #F5BA14;
-  --sign-press: #E5A900;
-  --line: #2B63D9;
-  --line-press: #1E4DB3;
-  --proceed: #18916A;
-  --stop: #D2433B;
-  --n1: #3B4A5A;
-  --n2: #66737F;
-  --n3: #A7B0B7;
-  --n4: #D5DBD8;
+  --sign-hover: #FFBE0F;
+  --sign-press: #ECAD00;
+  --line: #2A55E0;
+  --line-press: #1C40B8;
+  --proceed: #11845E;
+  --stop: #D2392F;
+  /* Neutral steps between Ink and Canvas: secondary text, muted text, a
+     disabled lamp, a quiet fill. */
+  --n1: #434A5A;
+  --n2: #5F6878;
+  --n3: #A3AAB8;
+  --n4: #D9DDE5;
   /* Hairlines are Ink at a low opacity, so they take the hue of whatever
-     they sit on instead of reading as a flat grey. Inner dividers are
-     lighter than panel edges. */
-  --hairline: rgba(28, 42, 57, 0.10);
-  --hairline-inner: rgba(28, 42, 57, 0.065);
+     they sit on. Inner dividers are lighter than panel edges. */
+  --hairline: rgba(22, 26, 35, 0.09);
+  --hairline-inner: rgba(22, 26, 35, 0.06);
 
-  /* Route colours: provider groups and routing lines, assigned by name
-     hash and shown as a short bar beside the name. Dashboard only. */
-  --route-1: #2B63D9;
-  --route-2: #18916A;
+  /* Route colours: provider groups, assigned by name hash and shown as a
+     short bar beside the name. Dashboard only. */
+  --route-1: #2A55E0;
+  --route-2: #11845E;
   --route-3: #C2410C;
   --route-4: #7C3AED;
   --route-5: #0E7490;
   --route-6: #B45309;
 
   /* Roles. Components read these, never the palette directly. */
-  --bg: var(--concrete);
+  --bg: var(--canvas);
   --surface: var(--paper);
-  /* A layer above a surface: a tooltip, a menu. The same white in light;
-     a step lighter in dark, where shadows do not read. */
+  /* A layer above a surface: a tooltip, a menu, a raised segment. */
   --surface-raised: var(--paper);
+  /* A quiet well inside a surface: a read-only field, a code block, the
+     track of a segmented switch. */
+  --well: #F3F4F7;
   --text: var(--ink);
   --text-2: var(--n1);
   --text-muted: var(--n2);
   --border: var(--hairline);
   --divider: var(--hairline-inner);
-  /* A field's boundary needs 3:1 against its surface (WCAG 1.4.11); the
-     hairline is about 1.4:1, so inputs take Neutral 2. */
-  --input-border: var(--n2);
+  /* A field's boundary needs 3:1 against its surface (WCAG 1.4.11). */
+  --input-border: #848B9B;
   --input-border-hover: var(--n1);
-  /* A checkbox's or radio's edge. */
-  --box-border: var(--n2);
+  --box-border: #848B9B;
+  /* The edge of a raised control (a secondary button, the chosen segment):
+     a hairline a step stronger than a panel's. */
+  --control-border: rgba(22, 26, 35, 0.14);
+  /* The brand mark's tile. */
+  --mark-tile: var(--ink);
+  /* A drawn line that carries meaning (the balance readout's levels). */
+  --route-line: var(--text);
   --focus: var(--line);
+  --focus-halo: rgba(42, 85, 224, 0.22);
   --link: var(--line);
   /* Error text is a step deeper than Stop red, so it keeps 4.5:1 on a
-     hovered or selected row (Concrete) as well as on Paper. Stop red stays
-     for fills, dots and markers. */
-  --error: #C23A32;
+     hovered row and on the page as well as on a panel. */
+  --error: #BE3129;
   --on-sign: var(--ink);
   /* The destructive fill keeps white text at AA in both themes. */
-  --stop-fill: #D2433B;
-  --stop-fill-hover: #BC3A33;
-  --stop-fill-press: #A3312B;
+  --stop-fill: #D2392F;
+  --stop-fill-hover: #BD3129;
+  --stop-fill-press: #A32A23;
   --on-stop: #FFFFFF;
-  --route-line: var(--ink);
 
-  /* Signal lamps: a dot beside a word, never colour alone. */
+  /* Signal lamps: a dot beside a word, never colour alone. Each lamp has a
+     soft halo of its own colour. */
   --lamp-applied: var(--proceed);
   --lamp-progress: var(--line);
   --lamp-pending: var(--text-2);
   --lamp-rejected: var(--stop);
   --lamp-disabled: var(--n3);
+  --halo: 0.18;
 
   /* Interaction washes. */
-  --hover: rgba(28, 42, 57, 0.05);
-  --press: rgba(28, 42, 57, 0.10);
-  --row-hover: var(--concrete);
-  --chip: rgba(28, 42, 57, 0.07);
-  --skeleton: rgba(28, 42, 57, 0.07);
-  --scrollbar: rgba(28, 42, 57, 0.28);
+  --hover: rgba(22, 26, 35, 0.045);
+  --press: rgba(22, 26, 35, 0.09);
+  --row-hover: #F4F5F8;
+  --chip: rgba(22, 26, 35, 0.06);
+  --skeleton: rgba(22, 26, 35, 0.07);
+  --scrollbar: rgba(22, 26, 35, 0.24);
   /* The shadow at the edge of a box whose content continues past it. */
-  --scroll-shadow: rgba(28, 42, 57, 0.16);
-  --selection: rgba(255, 199, 44, 0.35);
-  --inset: inset 0 1px 0 rgba(28, 42, 57, 0.18);
-  --tooltip-bg: var(--ink);
+  --scroll-shadow: rgba(22, 26, 35, 0.14);
+  --selection: rgba(255, 199, 44, 0.4);
+  --inset: inset 0 1px 1px rgba(22, 26, 35, 0.12);
+  --tooltip-bg: #1E2330;
   --tooltip-text: #FFFFFF;
 
-  /* Depth. Panels have a hairline and no shadow; only a floating layer
-     (menu, popover, toast) has one. */
-  --shadow-float: 0 1px 2px rgba(28, 42, 57, 0.06), 0 8px 24px rgba(28, 42, 57, 0.12);
+  /* Glass: the chrome that floats over the page (the navigation rail, the
+     top bar, the phone's tab bar). Translucent paper, blurred and lifted in
+     saturation so what passes underneath reads as colour, not as text; a
+     bright inner edge on top, a hairline outside, and a long soft shadow. */
+  --glass: rgba(255, 255, 255, 0.68);
+  --glass-strong: rgba(255, 255, 255, 0.86);
+  --glass-blur: blur(20px) saturate(1.8);
+  --glass-edge: inset 0 1px 0 rgba(255, 255, 255, 0.9), inset 0 0 0 1px rgba(255, 255, 255, 0.45);
+  --glass-border: rgba(22, 26, 35, 0.08);
+  --shadow-glass: 0 1px 2px rgba(22, 26, 35, 0.04), 0 16px 40px -12px rgba(22, 26, 35, 0.16);
+  /* The lens: the yellow capsule that marks the current section. */
+  --lens-shadow: 0 1px 1px rgba(120, 82, 0, 0.18), 0 4px 12px -2px rgba(236, 173, 0, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.55);
 
-  /* Shape. Radius follows hierarchy: fields and table rows, then buttons
-     and chips, then panels and dialogs. Full round is for lamps and stops. */
-  --r-input: 2px;
-  --r-button: 6px;
-  --r-chip: 6px;
-  --r-panel: 10px;
+  /* Depth. Panels have a hairline and no shadow; a raised control (a
+     secondary button, the chosen segment) has a whisper of one; only a
+     floating layer (menu, popover, toast) has a real one. */
+  --shadow-raise: 0 1px 1px rgba(22, 26, 35, 0.05), 0 1px 3px rgba(22, 26, 35, 0.06);
+  --shadow-float: 0 1px 2px rgba(22, 26, 35, 0.06), 0 12px 32px -6px rgba(22, 26, 35, 0.2);
+
+  /* Shape. Corners are concentric: the rail (22) holds panels (18), which
+     hold cards and notes (12), which hold fields (10); controls, chips and
+     the lens are capsules. */
+  --r-input: 10px;
+  --r-card: 12px;
+  --r-button: 999px;
+  --r-chip: 999px;
+  --r-panel: 18px;
+  --r-rail: 22px;
   --r-round: 999px;
 
   /* Spacing: a 4px grid, in these steps only. */
@@ -126,78 +161,98 @@
   --h-head: 36px;
   --icon: 16px;
 
-  /* Type. Overpass for Latin and figures, the system face for Chinese. */
-  --font-sans: "Overpass", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", "Noto Sans CJK SC", sans-serif;
-  --font-mono: "Overpass Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  /* Type. Mona Sans for Latin and figures (a variable face: weight 200–900,
+     width 75–125), the system face for Chinese. Monaspace Neon, from the
+     same family, for literal identifiers only. */
+  --font-sans: "Mona Sans", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", "Noto Sans CJK SC", system-ui, sans-serif;
+  --font-mono: "Monaspace Neon", ui-monospace, "SF Mono", Menlo, monospace;
   --fs-12: 12px;
   --fs-13: 13px;
-  --fs-15: 15px;
-  --fs-19: 19px;
-  --fs-23: 23px;
-  --fs-29: 29px;
-  --fs-36: 36px;
-  --fs-45: 45px;
+  --fs-14: 14px;
+  --fs-16: 16px;
+  --fs-20: 20px;
+  --fs-24: 24px;
+  --fs-32: 32px;
+  --fs-44: 44px;
   --lh-body: 1.6;
   --lh-table: 1.4;
-  --lh-heading: 1.2;
-  --tracking-heading: -0.01em;
+  --lh-heading: 1.25;
+  --tracking-heading: -0.012em;
+  /* Readings (a balance, an overview figure) are set wide and heavy; this
+     is the width they take. */
+  --wide: 116%;
 
   /* Motion. prefers-reduced-motion removes all of it (base.css). */
-  --t-fast: 120ms;
-  --t-panel: 160ms;
+  --t-fast: 140ms;
+  --t-panel: 180ms;
   --t-leave: 200ms;
+  --t-lens: 320ms;
+  --ease-out: cubic-bezier(0.2, 0.8, 0.2, 1);
+  /* A small overshoot, for the lens settling on a section. */
+  --ease-spring: cubic-bezier(0.34, 1.32, 0.64, 1);
 }
 
 :root[data-theme="dark"] {
   color-scheme: dark;
 
-  /* Signal colours lifted one step to read on the dark ground. Sign yellow
-     is unchanged, with Ink text on it. */
-  --line: #5B8BF0;
-  --line-press: #8AACF6;
-  --proceed: #2FB88A;
-  --stop: #E8665E;
-  --hairline: rgba(230, 236, 234, 0.12);
-  --hairline-inner: rgba(230, 236, 234, 0.075);
-  /* Route colours lifted the same step, so each bar keeps 3:1 on a dark
-     panel. */
-  --route-1: #5B8BF0;
-  --route-2: #2FB88A;
-  --route-3: #E8763E;
-  --route-4: #9B7BF5;
-  --route-5: #22A6C2;
-  --route-6: #D98A2B;
+  /* Signal colours lifted to read on the dark ground. Signal yellow is
+     unchanged, with Ink text on it. */
+  --line: #6F93FF;
+  --line-press: #9DB5FF;
+  --proceed: #33BF8C;
+  --stop: #F06A5F;
+  --hairline: rgba(232, 235, 241, 0.1);
+  --hairline-inner: rgba(232, 235, 241, 0.065);
+  --route-1: #6F93FF;
+  --route-2: #33BF8C;
+  --route-3: #EE7B45;
+  --route-4: #A385F7;
+  --route-5: #2DB0CC;
+  --route-6: #DE9134;
 
-  --bg: #121C27;
-  --surface: #1A2735;
-  --surface-raised: #243446;
-  --text: #E6ECEA;
-  --text-2: #C2CCD0;
-  --text-muted: #97A4AE;
-  --input-border: #7A8896;
-  --input-border-hover: #A3AFB8;
-  --box-border: #8B98A4;
-  --route-line: #E6ECEA;
+  --bg: #0C0F15;
+  --surface: #151922;
+  --surface-raised: #1D222D;
+  --well: #11151D;
+  --text: #E8EBF1;
+  --text-2: #B8BFCC;
+  --text-muted: #8D96A7;
+  --input-border: #6E7788;
+  --input-border-hover: #A3ABB9;
+  --box-border: #7D8697;
+  --control-border: rgba(232, 235, 241, 0.13);
+  --mark-tile: #2A3140;
+  --focus-halo: rgba(111, 147, 255, 0.3);
   /* Text in red or blue is lifted one more step than the signal, so it
      keeps 4.5:1 on a hovered row as well as on a panel. */
-  --error: #EE776F;
-  --link: #7199F2;
+  --error: #F47D73;
+  --link: #86A5FF;
 
-  --lamp-disabled: #6B7987;
+  --lamp-disabled: #5E6778;
+  --halo: 0.24;
 
-  --hover: rgba(230, 236, 234, 0.06);
-  --press: rgba(230, 236, 234, 0.11);
-  --row-hover: #203040;
-  --chip: rgba(230, 236, 234, 0.09);
-  --skeleton: rgba(230, 236, 234, 0.08);
-  --scrollbar: rgba(230, 236, 234, 0.24);
-  --scroll-shadow: rgba(0, 0, 0, 0.45);
+  --hover: rgba(232, 235, 241, 0.06);
+  --press: rgba(232, 235, 241, 0.1);
+  --row-hover: #1B202A;
+  --chip: rgba(232, 235, 241, 0.08);
+  --skeleton: rgba(232, 235, 241, 0.08);
+  --scrollbar: rgba(232, 235, 241, 0.22);
+  --scroll-shadow: rgba(0, 0, 0, 0.5);
   --selection: rgba(255, 199, 44, 0.85);
-  --inset: inset 0 1px 0 rgba(0, 0, 0, 0.35);
-  --tooltip-bg: #2C3D51;
-  --tooltip-text: #E6ECEA;
+  --inset: inset 0 1px 1px rgba(0, 0, 0, 0.4);
+  --tooltip-bg: #2A3140;
+  --tooltip-text: #E8EBF1;
 
-  /* Shadows do not read on a dark ground: a floating layer is a lighter
-     surface with a faint edge instead. */
-  --shadow-float: 0 0 0 1px rgba(230, 236, 234, 0.10);
+  --glass: rgba(24, 28, 38, 0.66);
+  --glass-strong: rgba(24, 28, 38, 0.86);
+  --glass-blur: blur(22px) saturate(1.6);
+  --glass-edge: inset 0 1px 0 rgba(255, 255, 255, 0.07), inset 0 0 0 1px rgba(255, 255, 255, 0.04);
+  --glass-border: rgba(232, 235, 241, 0.09);
+  --shadow-glass: 0 1px 2px rgba(0, 0, 0, 0.3), 0 18px 44px -12px rgba(0, 0, 0, 0.6);
+  --lens-shadow: 0 0 0 1px rgba(0, 0, 0, 0.2), 0 6px 18px -4px rgba(255, 199, 44, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.5);
+
+  /* Shadows do not read on a dark ground: a raised or floating layer is a
+     lighter surface with a faint edge instead. */
+  --shadow-raise: 0 0 0 1px rgba(232, 235, 241, 0.06);
+  --shadow-float: 0 0 0 1px rgba(232, 235, 241, 0.09), 0 16px 40px -8px rgba(0, 0, 0, 0.6);
 }

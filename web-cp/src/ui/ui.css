@@ -1,7 +1,7 @@
 /* The shared components (one implementation in this app): buttons, fields
    and native controls, tables, lamps, chips, notes, the two-step confirm,
    empty and loading states, toasts, the side panel, tooltips, icons and the
-   route-line navigation. Every value comes from ../theme/tokens.css.
+   navigation rail with its lens. Every value comes from ../theme/tokens.css.
 
    Every interactive element has all of its states: a 120ms colour change on
    hover, one step darker with a 1px inset when pressed, the focus ring from
@@ -39,8 +39,9 @@
   border-radius: var(--r-button);
   background: transparent;
   color: var(--fg);
-  font-size: var(--fs-15);
+  font-size: var(--fs-14);
   font-weight: 600;
+  letter-spacing: 0.005em;
   line-height: 16px;
   white-space: nowrap;
   text-decoration: none;
@@ -51,7 +52,12 @@
     background-color var(--t-fast) ease,
     border-color var(--t-fast) ease,
     color var(--t-fast) ease,
-    box-shadow var(--t-fast) ease;
+    box-shadow var(--t-fast) ease,
+    transform var(--t-fast) var(--ease-out);
+}
+/* Pressed: the capsule gives a little under the finger. */
+.btn:not(:disabled, [aria-disabled="true"]):is(:active, .is-active) {
+  transform: scale(0.97);
 }
 .btn-sm {
   height: var(--h-control-sm);
@@ -71,20 +77,25 @@
 .btn-primary {
   --fg: var(--on-sign);
   background: var(--sign);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.5), 0 1px 2px rgba(120, 82, 0, 0.18);
 }
 .btn-primary:not(:disabled, [aria-disabled="true"]):is(:hover, .is-hover) {
   background: var(--sign-hover);
 }
 .btn-primary:not(:disabled, [aria-disabled="true"]):is(:active, .is-active) {
   background: var(--sign-press);
-  box-shadow: inset 0 1px 0 rgba(28, 42, 57, 0.22);
+  box-shadow: inset 0 1px 1px rgba(120, 82, 0, 0.25);
 }
 
+/* Secondary: a raised paper capsule with a stronger hairline. */
 .btn-secondary {
-  border-color: var(--text);
+  border-color: var(--control-border);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-raise);
 }
 .btn-secondary:not(:disabled, [aria-disabled="true"]):is(:hover, .is-hover) {
-  background: var(--hover);
+  border-color: var(--input-border);
+  background: var(--row-hover);
 }
 .btn-secondary:not(:disabled, [aria-disabled="true"]):is(:active, .is-active) {
   background: var(--press);
@@ -117,7 +128,7 @@
 }
 .btn-danger:not(:disabled, [aria-disabled="true"]):is(:active, .is-active) {
   background: var(--stop-fill-press);
-  box-shadow: inset 0 1px 0 rgba(0, 0, 0, 0.24);
+  box-shadow: inset 0 1px 1px rgba(0, 0, 0, 0.24);
 }
 
 .btn:is(:disabled, [aria-disabled="true"]) {
@@ -177,7 +188,7 @@
   max-width: min(320px, 90vw);
   min-height: var(--h-control-sm);
   padding: var(--s-1) var(--s-3);
-  border-radius: var(--r-button);
+  border-radius: var(--r-input);
   background: var(--tooltip-bg);
   color: var(--tooltip-text);
   box-shadow: var(--shadow-float);
@@ -243,6 +254,8 @@
 .f > label > span:first-child,
 .f-label {
   color: var(--text-2);
+  font-size: var(--fs-13);
+  font-weight: 550;
   line-height: var(--lh-table);
 }
 .f > label {
@@ -295,11 +308,12 @@ textarea {
   border-radius: var(--r-input);
   background-color: var(--surface);
   color: var(--text);
-  font-size: var(--fs-15);
+  font-size: var(--fs-14);
   line-height: 20px;
   transition:
     border-color var(--t-fast) ease,
-    background-color var(--t-fast) ease;
+    background-color var(--t-fast) ease,
+    box-shadow var(--t-fast) ease;
 }
 input::placeholder,
 textarea::placeholder {
@@ -318,10 +332,12 @@ input[type="number"] {
 :is(input, select, textarea):not(:disabled):is(:hover, .is-hover) {
   border-color: var(--input-border-hover);
 }
+/* Focus: the edge turns Line blue and doubles, with a soft halo round it. */
 :is(input, select, textarea):is(:focus-visible, .is-focus) {
   border-color: var(--focus);
-  outline: 2px solid var(--focus);
-  outline-offset: 2px;
+  outline: 1px solid var(--focus);
+  outline-offset: 0;
+  box-shadow: 0 0 0 4px var(--focus-halo);
 }
 :is(input, select, textarea)[aria-invalid="true"] {
   border-color: var(--error);
@@ -329,27 +345,59 @@ input[type="number"] {
 :is(input, select, textarea):disabled {
   opacity: 0.45;
   cursor: not-allowed;
-  background-color: var(--bg);
+  background-color: var(--well);
 }
-input:read-only:not(:disabled, [type="checkbox"], [type="radio"]),
+input:read-only:not(:disabled, [type="checkbox"], [type="radio"], [type="file"]),
 textarea:read-only {
-  background-color: var(--bg);
+  background-color: var(--well);
 }
+/* A file input: the chosen file's name beside a secondary capsule. */
+input[type="file"] {
+  max-width: 100%;
+  color: var(--text-2);
+  font-size: var(--fs-13);
+  cursor: pointer;
+}
+input[type="file"]::file-selector-button {
+  height: var(--h-control-sm);
+  margin-right: var(--s-3);
+  padding: 0 var(--s-4);
+  border: 1px solid var(--control-border);
+  border-radius: var(--r-button);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-raise);
+  color: var(--text);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    background-color var(--t-fast) ease,
+    border-color var(--t-fast) ease;
+}
+input[type="file"]:not(:disabled):hover::file-selector-button {
+  border-color: var(--input-border);
+  background: var(--row-hover);
+}
+/* A text area is as tall as its rows; a document editor is a tall,
+   monospaced one. */
 textarea {
   height: auto;
+  padding: var(--s-2) var(--s-3);
+  line-height: var(--lh-body);
+  resize: vertical;
+}
+.json-editor textarea {
   min-height: 320px;
   padding: var(--s-3);
   font-family: var(--font-mono);
   font-size: var(--fs-13);
-  line-height: var(--lh-body);
-  resize: vertical;
 }
 
 /* A select is native, with a drawn chevron. */
 select {
   appearance: none;
   padding-right: var(--s-10);
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4.75 6.25 8 9.5l3.25-3.25' fill='none' stroke='%2366737F' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4.75 6.25 8 9.5l3.25-3.25' fill='none' stroke='%235F6878' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
   background-repeat: no-repeat;
   background-position: right var(--s-3) center;
   background-size: 16px 16px;
@@ -357,7 +405,7 @@ select {
   text-overflow: ellipsis;
 }
 :root[data-theme="dark"] select {
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4.75 6.25 8 9.5l3.25-3.25' fill='none' stroke='%2397A4AE' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4.75 6.25 8 9.5l3.25-3.25' fill='none' stroke='%238D96A7' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
 }
 select:not(:disabled):is(:active, .is-active) {
   background-color: var(--row-hover);
@@ -387,7 +435,7 @@ input[type="radio"] {
     border-color var(--t-fast) ease;
 }
 input[type="checkbox"] {
-  border-radius: var(--r-input);
+  border-radius: 5px;
 }
 input[type="radio"] {
   border-radius: 50%;
@@ -395,7 +443,7 @@ input[type="radio"] {
 input[type="checkbox"]:checked {
   border-color: var(--sign-press);
   background-color: var(--sign);
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 14 14'%3E%3Cpath d='M3.25 7.25 5.75 9.75 10.75 4.25' fill='none' stroke='%231C2A39' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 14 14'%3E%3Cpath d='M3.25 7.25 5.75 9.75 10.75 4.25' fill='none' stroke='%23161A23' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
 }
 input[type="radio"]:checked {
   border-color: var(--sign-press);
@@ -441,7 +489,9 @@ label:hover > :is(input[type="checkbox"], input[type="radio"]):checked:not(:disa
   height: 8px;
   border-radius: 50%;
   background: var(--c);
-  box-shadow: inset 0 0 0 1.5px var(--ring);
+  box-shadow:
+    inset 0 0 0 1.5px var(--ring),
+    0 0 0 3px color-mix(in srgb, var(--c) calc(var(--halo) * 100%), transparent);
 }
 .lamp[data-lamp="applied"] {
   --c: var(--lamp-applied);
@@ -486,8 +536,8 @@ label:hover > :is(input[type="checkbox"], input[type="radio"]):checked:not(:disa
 
 /* Beside a heading, a lamp keeps body type. */
 :is(h1, h2, h3) :is(.lamp, .rollout) {
-  font-size: var(--fs-15);
-  font-weight: 400;
+  font-size: var(--fs-14);
+  font-weight: 450;
   letter-spacing: 0;
   line-height: var(--lh-table);
 }
@@ -531,31 +581,34 @@ label:hover > :is(input[type="checkbox"], input[type="radio"]):checked:not(:disa
 .grp::before {
   content: "";
   flex: none;
-  width: 4px;
-  height: 12px;
-  border-radius: 1px;
+  width: 3px;
+  height: 14px;
+  border-radius: 2px;
   background: var(--c, var(--route-1));
 }
 
 /* ── Notes: a passage in a panel, marked by a bar on its left ─── */
+/* A note is a card tinted by its kind: neutral, done, careful, refused. */
 .note {
+  --k: var(--n3);
   margin: var(--s-4) 0;
   padding: var(--s-3) var(--s-4);
-  border: 1px solid var(--border);
-  border-left: 3px solid var(--n3);
-  border-radius: var(--r-button);
-  background: var(--surface);
+  border: 1px solid color-mix(in srgb, var(--k) 28%, transparent);
+  border-radius: var(--r-card);
+  background: color-mix(in srgb, var(--k) 9%, var(--surface));
   color: var(--text);
   line-height: var(--lh-body);
 }
 .note.ok {
-  border-left-color: var(--proceed);
+  --k: var(--proceed);
 }
 .note.warn {
-  border-left-color: var(--sign);
+  --k: var(--sign);
+  border-color: color-mix(in srgb, var(--sign-press) 45%, transparent);
+  background: color-mix(in srgb, var(--sign) 16%, var(--surface));
 }
 .note.crit {
-  border-left-color: var(--stop);
+  --k: var(--stop);
 }
 .note > p + p,
 .note > p + ul,
@@ -581,7 +634,7 @@ label:hover > :is(input[type="checkbox"], input[type="radio"]):checked:not(:disa
   margin-left: var(--s-1);
 }
 
-/* ── Tables: 36px header, 44px rows, hover in Concrete, no zebra ─ */
+/* ── Tables: 36px header, 44px rows, hover in a light wash, no zebra ─ */
 /* The table's box is the containing block of whatever is absolutely
    placed inside it (a tooltip, visually hidden text), so the box clips it
    instead of it widening the page past the screen. */
@@ -621,6 +674,7 @@ label:hover > :is(input[type="checkbox"], input[type="radio"]):checked:not(:disa
   color: var(--text-muted);
   font-size: var(--fs-12);
   font-weight: 600;
+  letter-spacing: 0.01em;
   text-align: left;
   white-space: nowrap;
   vertical-align: middle;
@@ -753,7 +807,7 @@ label:hover > :is(input[type="checkbox"], input[type="radio"]):checked:not(:disa
 .skeleton i {
   display: block;
   height: 12px;
-  border-radius: var(--r-input);
+  border-radius: var(--r-round);
   background: var(--skeleton);
 }
 
@@ -839,8 +893,8 @@ label:hover > :is(input[type="checkbox"], input[type="radio"]):checked:not(:disa
   align-items: center;
   gap: var(--s-2);
   min-height: 40px;
-  padding: var(--s-2) var(--s-4);
-  border-radius: var(--r-button);
+  padding: var(--s-2) var(--s-5) var(--s-2) var(--s-4);
+  border-radius: var(--r-round);
   background: var(--tooltip-bg);
   color: var(--tooltip-text);
   box-shadow: var(--shadow-float);
@@ -855,6 +909,7 @@ label:hover > :is(input[type="checkbox"], input[type="radio"]):checked:not(:disa
   height: 8px;
   border-radius: 50%;
   background: var(--lamp-applied);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--lamp-applied) 30%, transparent);
 }
 .toast.is-leaving {
   opacity: 0;
@@ -863,7 +918,7 @@ label:hover > :is(input[type="checkbox"], input[type="radio"]):checked:not(:disa
 @keyframes ui-toast-in {
   from {
     opacity: 0;
-    transform: translateY(8px);
+    transform: translateY(8px) scale(0.96);
   }
 }
 
@@ -895,7 +950,7 @@ label:hover > :is(input[type="checkbox"], input[type="radio"]):checked:not(:disa
 .side-head > h2 {
   min-width: 0;
   overflow: hidden;
-  font-size: var(--fs-23);
+  font-size: var(--fs-16);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -928,210 +983,174 @@ label:hover > :is(input[type="checkbox"], input[type="radio"]):checked:not(:disa
   }
 }
 
-/* ── Route-line navigation, the one bold element ─────────────── */
-.route-nav {
-  --rail-line: var(--route-line);
-  background: var(--surface);
-}
+/* ── The navigation: a glass rail, and the lens ──────────────── */
+/* Sections are quiet text on the rail; the current one sits in the lens, a
+   Signal-yellow capsule that glides between them (RouteNav.tsx places it).
+   The rail itself is drawn by the page (styles.css .rail); under 960px the
+   list is a floating bar along the bottom, drawn here. */
 .route-nav ol {
   position: relative;
   margin: 0;
   padding: 0;
   list-style: none;
 }
-.route-nav li {
-  position: relative;
+.route-nav .lens {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 0;
+  border-radius: var(--r-round);
+  background: var(--sign);
+  box-shadow: var(--lens-shadow);
+  pointer-events: none;
+}
+.route-nav .lens[data-ready] {
+  transition:
+    transform var(--t-lens) var(--ease-spring),
+    width var(--t-lens) var(--ease-spring),
+    height var(--t-lens) var(--ease-out),
+    opacity var(--t-fast) ease;
 }
 .route-stop {
   position: relative;
+  z-index: 1;
   display: flex;
   align-items: center;
-  gap: var(--s-3);
-  width: calc(100% - 2 * var(--s-2));
-  height: 40px;
-  margin: 0 var(--s-2);
-  padding: 0 var(--s-2);
+  gap: var(--s-2);
+  width: 100%;
+  height: 36px;
+  margin: 0;
+  padding: 0 var(--s-2) 0 var(--s-4);
   border: 0;
-  border-radius: var(--r-button);
+  border-radius: var(--r-round);
   background: none;
   color: var(--text-2);
+  font-size: var(--fs-14);
   text-align: left;
   cursor: pointer;
-  transition: color var(--t-fast) ease;
+  transition:
+    color var(--t-fast) ease,
+    background-color var(--t-fast) ease;
 }
+.route-nav li + li .route-stop {
+  margin-top: 2px;
+}
+/* The stop of the old route line, kept as the place an attention marker
+   hangs: nothing is drawn for it unless the section needs attention. */
 .stop-box {
+  order: 2;
   position: relative;
   flex: none;
   display: grid;
   place-items: center;
-  width: 24px;
-  height: 24px;
-}
-.stop {
   width: 16px;
   height: 16px;
-  border: 3px solid var(--rail-line);
-  border-radius: 50%;
-  background: var(--surface);
-  transition:
-    background-color var(--t-fast) ease,
-    width var(--t-fast) ease,
-    height var(--t-fast) ease;
+  margin-left: auto;
+}
+.stop {
+  display: none;
 }
 .stop-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
   line-height: var(--lh-table);
-  transition: color var(--t-fast) ease;
 }
-.route-stop:is(:hover, .is-hover) {
+.route-stop:is(:hover, .is-hover):not([aria-selected="true"]) {
+  background: var(--hover);
   color: var(--text);
 }
-.route-stop:is(:hover, .is-hover) .stop {
-  background: var(--row-hover);
-}
-.route-stop:active .stop {
-  background: var(--n4);
+.route-stop:active:not([aria-selected="true"]) {
+  background: var(--press);
 }
 .route-stop[aria-selected="true"] {
-  color: var(--text);
+  color: var(--on-sign);
+  font-weight: 650;
 }
-.route-stop[aria-selected="true"] .stop {
-  width: 24px;
-  height: 24px;
-  background: var(--sign);
-}
-.route-stop[aria-selected="true"] .stop-name {
-  font-weight: 700;
+.route-stop:focus-visible {
+  outline-offset: -2px;
 }
 /* Something needs attention in that section: a small Stop-red marker. */
 .route-stop[data-attention] .stop-box::after {
   content: "";
-  position: absolute;
-  top: 0;
-  right: 0;
   width: 8px;
   height: 8px;
   border-radius: 50%;
   background: var(--stop);
-  box-shadow: 0 0 0 2px var(--surface);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--stop) 22%, transparent);
 }
 .route-stop[data-attention][aria-selected="true"] .stop-box::after {
-  top: -2px;
-  right: -2px;
+  box-shadow: 0 0 0 2px var(--sign);
 }
 
-/* ≥ 720px: a vertical line down the left edge, one stop per section. */
-@media (min-width: 720px) {
-  /* The rail's surface runs the page's full height; the line itself stays
-     in view while the page scrolls. */
-  .route-nav {
-    align-self: stretch;
-    border-right: 1px solid var(--border);
-  }
-  .route-nav ol {
-    position: sticky;
-    top: 0;
-    padding: var(--s-4) 0;
-  }
-  .route-nav ol::before {
-    content: "";
-    position: absolute;
-    left: 26px;
-    top: 36px;
-    bottom: 36px;
-    width: 4px;
-    border-radius: 2px;
-    background: var(--rail-line);
-  }
-}
-/* 720–1199px: stops only; a stop's name shows beside it on hover or focus. */
-@media (min-width: 720px) and (max-width: 1199px) {
-  .route-stop {
-    width: 40px;
-  }
-  .stop-name {
-    position: absolute;
-    left: calc(100% + var(--s-3));
-    top: 4px;
-    z-index: 30;
-    display: flex;
-    align-items: center;
-    height: var(--h-control-sm);
-    padding: 0 var(--s-3);
-    border-radius: var(--r-button);
-    background: var(--surface-raised);
-    box-shadow: var(--shadow-float);
-    color: var(--text);
-    font-weight: 600;
-    opacity: 0;
-    pointer-events: none;
-    transition: opacity var(--t-fast) ease;
-  }
-  .route-stop:is(:hover, :focus-visible) .stop-name {
-    opacity: 1;
-  }
-}
-/* ≥ 1200px: names stay visible beside the line. */
-@media (min-width: 1200px) {
-  .route-nav ol {
-    max-height: 100vh;
-    overflow-y: auto;
-  }
-}
-/* Under 720px: the line runs along a bar at the bottom of the screen. */
-@media (max-width: 719px) {
+/* Under 960px: a floating glass bar along the bottom that scrolls sideways.
+   The list itself reaches the bottom edge (the glass is drawn inset above
+   its padding), so the bar is the last thing on the screen. */
+@media (max-width: 959px) {
   .route-nav {
     position: fixed;
     left: 0;
     right: 0;
     bottom: 0;
     z-index: 20;
-    overflow-x: auto;
-    border-top: 1px solid var(--border);
-    scrollbar-width: none;
+    pointer-events: none;
   }
-  .route-nav::-webkit-scrollbar {
-    display: none;
-  }
-  /* The bar scrolls sideways: its ends fade, so a stop cut at the edge
-     reads as more of the line, not as a broken label. */
-  .route-nav {
-    mask-image: linear-gradient(90deg, transparent, #000 24px, #000 calc(100% - 24px), transparent);
+  .route-nav::before {
+    content: "";
+    position: absolute;
+    left: var(--s-3);
+    right: var(--s-3);
+    bottom: calc(var(--s-3) + env(safe-area-inset-bottom, 0px));
+    height: 52px;
+    border: 1px solid var(--glass-border);
+    border-radius: var(--r-round);
+    background: var(--glass-strong);
+    box-shadow: var(--glass-edge), var(--shadow-glass);
+    -webkit-backdrop-filter: var(--glass-blur);
+    backdrop-filter: var(--glass-blur);
   }
   .route-nav ol {
     display: flex;
-    width: max-content;
-    padding: var(--s-2) var(--s-2) calc(var(--s-1) + env(safe-area-inset-bottom, 0px));
+    gap: 2px;
+    width: 100%;
+    overflow-x: auto;
+    padding: 0 calc(var(--s-3) + 6px) calc(var(--s-3) + 6px + env(safe-area-inset-bottom, 0px));
+    scrollbar-width: none;
+    pointer-events: auto;
+    /* The ends fade, so a section cut at the edge reads as more of the
+       bar, not as a broken label. */
+    mask-image: linear-gradient(90deg, transparent var(--s-3), #000 calc(var(--s-3) + 20px), #000 calc(100% - var(--s-3) - 20px), transparent calc(100% - var(--s-3)));
   }
-  .route-nav ol::before {
+  .route-nav ol::-webkit-scrollbar {
+    display: none;
+  }
+  .route-nav ol::after {
     content: "";
-    position: absolute;
-    left: 40px;
-    right: 40px;
-    top: 18px;
-    height: 4px;
-    border-radius: 2px;
-    background: var(--rail-line);
+    flex: none;
+    width: 1px;
+  }
+  .route-nav li {
+    flex: none;
+  }
+  .route-nav li + li .route-stop {
+    margin-top: 0;
   }
   .route-stop {
-    flex-direction: column;
-    gap: var(--s-1);
-    width: 64px;
-    height: auto;
-    margin: 0;
-    padding: 0 0 var(--s-1);
-    text-align: center;
+    width: auto;
+    height: 40px;
+    padding: 0 var(--s-4);
+    font-size: var(--fs-13);
   }
-  .stop-name {
-    color: var(--text-muted);
-    font-size: var(--fs-12);
+  .stop-box {
+    width: 8px;
+    margin-left: 0;
   }
-  .route-stop[aria-selected="true"] .stop-name {
-    color: var(--text);
-    font-weight: 600;
+  .route-stop:not([data-attention]) .stop-box {
+    display: none;
   }
   .toasts {
     left: var(--s-4);
-    bottom: 88px;
+    bottom: 84px;
   }
 }

@@ -8,7 +8,7 @@ export type ButtonKind = "primary" | "secondary" | "danger" | "quiet";
 
 export interface ButtonProps extends ComponentProps<"button"> {
   /**
-   * `primary` is a Sign-yellow fill with Ink text, one per view;
+   * `primary` is a Signal-yellow fill with Ink text, one per view;
    * `secondary`, the default, an Ink outline; `danger` the Stop-red fill a
    * destructive action takes in its second step only; `quiet` a text
    * button for headers and dense rows.

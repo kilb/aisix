@@ -33,7 +33,7 @@
   margin: var(--s-4) 0;
   padding: var(--s-4);
   border: 1px solid var(--divider);
-  border-radius: var(--r-button);
+  border-radius: var(--r-card);
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: var(--s-3) var(--s-4);
@@ -51,7 +51,7 @@
 }
 .grp-form > h3 {
   margin: 0;
-  font-size: var(--fs-15);
+  font-size: var(--fs-14);
 }
 .grp-form > .hint {
   margin: 0;

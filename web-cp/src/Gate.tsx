@@ -44,6 +44,7 @@ export function Gate({
     <div id="gate">
       <div className="gate-card">
         <div className="gate-plate">
+          <span className="brand-mark" aria-hidden="true" />
           <div className="gate-mark">
             <h1 className="display">Routio 运维台</h1>
             <span className="gate-sub">控制面 · 运维登录</span>
@@ -57,12 +58,6 @@ export function Gate({
           >
             {theme === "dark" ? "浅色" : "深色"}
           </Button>
-        </div>
-        {/* The route line: two stops passed, the sign at the end of it. */}
-        <div className="gate-line" aria-hidden="true">
-          <span />
-          <span />
-          <span />
         </div>
 
         <form className="gate-form panel" onSubmit={submit}>

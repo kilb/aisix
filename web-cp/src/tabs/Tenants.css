@@ -4,7 +4,7 @@
 .tn-name {
   max-width: 220px;
 }
-/* The tenant whose detail is open: Concrete, with a Sign-yellow edge. */
+/* The tenant whose detail is open: the hovered-row wash, with a Signal-yellow edge. */
 .dt tr:has(.tn-name[aria-expanded="true"]) {
   background: var(--row-hover);
 }
@@ -55,7 +55,7 @@ td > .tn-actions {
   margin: 0 0 var(--s-2);
   padding: 0;
   color: var(--text);
-  font-size: var(--fs-19);
+  font-size: var(--fs-16);
   font-weight: 700;
   line-height: var(--lh-heading);
 }
@@ -72,7 +72,7 @@ td > .tn-actions {
   border-top: 1px solid var(--divider);
 }
 .tn-section .tn-section > legend {
-  font-size: var(--fs-15);
+  font-size: var(--fs-14);
 }
 .tn-section > .btn,
 .tn-section > .two-step,
@@ -172,7 +172,7 @@ td .tn-flag {
   padding: var(--s-2) var(--s-3);
   border: 1px solid var(--border);
   border-radius: var(--r-input);
-  background: var(--bg);
+  background: var(--well);
   color: var(--text);
   font-family: var(--font-mono);
   font-size: var(--fs-13);
@@ -185,7 +185,7 @@ td .tn-flag {
   margin: 0;
   padding: var(--s-4);
   border: 1px solid var(--divider);
-  border-radius: var(--r-button);
+  border-radius: var(--r-card);
   background: var(--surface);
   white-space: normal;
 }

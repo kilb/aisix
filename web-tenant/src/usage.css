@@ -12,7 +12,7 @@
 }
 .usage-detail h3 {
   margin-bottom: var(--s-2);
-  font-size: var(--fs-15);
+  font-size: var(--fs-14);
 }
 .usage-qty {
   display: inline-flex;

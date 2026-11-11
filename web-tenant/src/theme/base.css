@@ -6,180 +6,49 @@
    byte-equal copy of this file, as they do of tokens.css. A unit test in
    web-tenant pins the two together, so change them together.
 
-   The faces are self-hosted from the two @fontsource packages: no font is
+   The faces are self-hosted from two @fontsource packages: no font is
    requested from anywhere else. Only the Latin subsets are loaded; Chinese
-   comes from the system stack in --font-sans. Their @font-face rules are
-   written here rather than imported, because Overpass's own vertical
-   metrics (ascent 0.883em, descent 0.383em) centre its content box 0.25em
-   above the baseline while caps centre at 0.35em, so Latin set beside
-   Chinese sits visibly low. Ascent 92% and descent 18% centre the box 0.37em
-   above the baseline, where both the cap height and the CJK em box are
-   centred, so mixed text shares one optical line with no padding tricks.
+   comes from the system stack in --font-sans. Mona Sans is one variable
+   file per subset carrying both its axes, weight (200–900) and width
+   (75–125%). Its own vertical metrics centre its box 0.385em above the
+   baseline, where the cap height and the CJK em box are centred too, so
+   Latin set beside Chinese shares one optical line with no overrides.
 
-   Weights 400, 600, 700 and 800 are loaded. Headings with Chinese text are
-   700, since system CJK faces have no true 800, and their Latin matches
-   them at 700; 800 is for Latin-only display lines. */
+   Headings with Chinese text are 650: the system CJK faces round it to
+   their bold, and the Latin beside them matches. */
 
 @font-face {
-  font-family: "Overpass";
+  font-family: "Mona Sans";
   font-style: normal;
-  font-weight: 400;
+  font-weight: 200 900;
+  font-stretch: 75% 125%;
   font-display: swap;
-  src: url("@fontsource/overpass/files/overpass-latin-400-normal.woff2") format("woff2");
-  unicode-range: U+0000-005F, U+0061-00B6, U+00B8-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
-  ascent-override: 92%;
-  descent-override: 18%;
-  line-gap-override: 0%;
+  src: url("@fontsource-variable/mona-sans/files/mona-sans-latin-standard-normal.woff2") format("woff2-variations");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
 }
 @font-face {
-  font-family: "Overpass";
+  font-family: "Mona Sans";
   font-style: normal;
-  font-weight: 400;
+  font-weight: 200 900;
+  font-stretch: 75% 125%;
   font-display: swap;
-  src: url("@fontsource/overpass/files/overpass-latin-ext-400-normal.woff2") format("woff2");
+  src: url("@fontsource-variable/mona-sans/files/mona-sans-latin-ext-standard-normal.woff2") format("woff2-variations");
   unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
-  ascent-override: 92%;
-  descent-override: 18%;
-  line-gap-override: 0%;
-}
-@font-face {
-  font-family: "Overpass";
-  font-style: normal;
-  font-weight: 600;
-  font-display: swap;
-  src: url("@fontsource/overpass/files/overpass-latin-600-normal.woff2") format("woff2");
-  unicode-range: U+0000-005F, U+0061-00B6, U+00B8-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
-  ascent-override: 92%;
-  descent-override: 18%;
-  line-gap-override: 0%;
-}
-@font-face {
-  font-family: "Overpass";
-  font-style: normal;
-  font-weight: 600;
-  font-display: swap;
-  src: url("@fontsource/overpass/files/overpass-latin-ext-600-normal.woff2") format("woff2");
-  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
-  ascent-override: 92%;
-  descent-override: 18%;
-  line-gap-override: 0%;
-}
-@font-face {
-  font-family: "Overpass";
-  font-style: normal;
-  font-weight: 700;
-  font-display: swap;
-  src: url("@fontsource/overpass/files/overpass-latin-700-normal.woff2") format("woff2");
-  unicode-range: U+0000-005F, U+0061-00B6, U+00B8-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
-  ascent-override: 92%;
-  descent-override: 18%;
-  line-gap-override: 0%;
-}
-@font-face {
-  font-family: "Overpass";
-  font-style: normal;
-  font-weight: 700;
-  font-display: swap;
-  src: url("@fontsource/overpass/files/overpass-latin-ext-700-normal.woff2") format("woff2");
-  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
-  ascent-override: 92%;
-  descent-override: 18%;
-  line-gap-override: 0%;
-}
-@font-face {
-  font-family: "Overpass";
-  font-style: normal;
-  font-weight: 800;
-  font-display: swap;
-  src: url("@fontsource/overpass/files/overpass-latin-800-normal.woff2") format("woff2");
-  unicode-range: U+0000-005F, U+0061-00B6, U+00B8-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
-  ascent-override: 92%;
-  descent-override: 18%;
-  line-gap-override: 0%;
-}
-@font-face {
-  font-family: "Overpass";
-  font-style: normal;
-  font-weight: 800;
-  font-display: swap;
-  src: url("@fontsource/overpass/files/overpass-latin-ext-800-normal.woff2") format("woff2");
-  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
-  ascent-override: 92%;
-  descent-override: 18%;
-  line-gap-override: 0%;
-}
-/* Overpass classes U+00B7 (and U+0060) as a combining mark, so a text
-   engine gives the middle dot no advance and draws it over the space after
-   it: "a · b" reads "a ·b". The Latin faces above leave both code points
-   out, and these take them from Overpass Mono, which spaces them. One rule
-   per loaded weight: a weight range would not be consulted for a weight
-   that has faces of its own. */
-@font-face {
-  font-family: "Overpass";
-  font-style: normal;
-  font-weight: 400;
-  font-display: swap;
-  src: url("@fontsource/overpass-mono/files/overpass-mono-latin-400-normal.woff2") format("woff2");
-  unicode-range: U+0060, U+00B7;
-  ascent-override: 92%;
-  descent-override: 18%;
-  line-gap-override: 0%;
-}
-@font-face {
-  font-family: "Overpass";
-  font-style: normal;
-  font-weight: 600;
-  font-display: swap;
-  src: url("@fontsource/overpass-mono/files/overpass-mono-latin-400-normal.woff2") format("woff2");
-  unicode-range: U+0060, U+00B7;
-  ascent-override: 92%;
-  descent-override: 18%;
-  line-gap-override: 0%;
-}
-@font-face {
-  font-family: "Overpass";
-  font-style: normal;
-  font-weight: 700;
-  font-display: swap;
-  src: url("@fontsource/overpass-mono/files/overpass-mono-latin-400-normal.woff2") format("woff2");
-  unicode-range: U+0060, U+00B7;
-  ascent-override: 92%;
-  descent-override: 18%;
-  line-gap-override: 0%;
-}
-@font-face {
-  font-family: "Overpass";
-  font-style: normal;
-  font-weight: 800;
-  font-display: swap;
-  src: url("@fontsource/overpass-mono/files/overpass-mono-latin-400-normal.woff2") format("woff2");
-  unicode-range: U+0060, U+00B7;
-  ascent-override: 92%;
-  descent-override: 18%;
-  line-gap-override: 0%;
 }
 /* Literal identifiers only (key prefixes, ids, request ids). */
 @font-face {
-  font-family: "Overpass Mono";
+  font-family: "Monaspace Neon";
   font-style: normal;
   font-weight: 400;
   font-display: swap;
-  src: url("@fontsource/overpass-mono/files/overpass-mono-latin-400-normal.woff2") format("woff2");
-  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
-  ascent-override: 92%;
-  descent-override: 18%;
-  line-gap-override: 0%;
+  src: url("@fontsource/monaspace-neon/files/monaspace-neon-latin-400-normal.woff2") format("woff2");
 }
 @font-face {
-  font-family: "Overpass Mono";
+  font-family: "Monaspace Neon";
   font-style: normal;
-  font-weight: 400;
+  font-weight: 600;
   font-display: swap;
-  src: url("@fontsource/overpass-mono/files/overpass-mono-latin-ext-400-normal.woff2") format("woff2");
-  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
-  ascent-override: 92%;
-  descent-override: 18%;
-  line-gap-override: 0%;
+  src: url("@fontsource/monaspace-neon/files/monaspace-neon-latin-600-normal.woff2") format("woff2");
 }
 
 *,
@@ -196,6 +65,8 @@
 html {
   -webkit-text-size-adjust: 100%;
   background: var(--bg);
+  /* No faux bold or italic: the variable face has every weight. */
+  font-synthesis: none;
 }
 
 body {
@@ -203,7 +74,7 @@ body {
   min-height: 100vh;
   background: var(--bg);
   color: var(--text);
-  font: 400 var(--fs-15) / var(--lh-body) var(--font-sans);
+  font: 400 var(--fs-14) / var(--lh-body) var(--font-sans);
   /* Chinese may break between characters, but splitting a word such as
      「客户端」 down the middle reads wrong. */
   line-break: strict;
@@ -217,21 +88,22 @@ body {
   color: var(--ink);
 }
 
-/* Headings: system CJK faces have no true 800, so text headings are 700;
-   a Latin-only display line (the brand, a balance) takes .display at 800. */
+/* Headings: 650, which the system CJK faces round to their bold. A
+   display line (the brand, a reading) takes .display: heavier, and set
+   wide where it is Latin. */
 h1,
 h2,
 h3,
 h4 {
   margin: 0;
-  font-weight: 700;
+  font-weight: 650;
   line-height: var(--lh-heading);
   letter-spacing: var(--tracking-heading);
   text-wrap: balance;
 }
 .display {
-  font-weight: 800;
-  letter-spacing: var(--tracking-heading);
+  font-weight: 720;
+  letter-spacing: -0.02em;
 }
 
 p {
@@ -260,9 +132,9 @@ kbd,
 samp,
 .mono {
   font-family: var(--font-mono);
-  font-size: var(--fs-13);
+  font-size: 0.9em;
   font-weight: 400;
-  letter-spacing: 0;
+  letter-spacing: -0.01em;
 }
 
 /* Figures align by place wherever digits stack. */
@@ -278,13 +150,25 @@ table,
 .unit {
   color: var(--text-muted);
   font-size: var(--fs-13);
-  font-weight: 400;
+  font-weight: 450;
+  font-stretch: 100%;
 }
 
 /* Keyboard focus is a 2px Line-blue ring at a 2px offset, never removed. */
 :focus-visible {
   outline: 2px solid var(--focus);
   outline-offset: 2px;
+}
+
+/* A reading: a figure that is the point of its panel (a balance, an
+   overview count). Heavy, wide and tight, with tabular figures so a
+   changing value does not jump. */
+.reading {
+  font-weight: 680;
+  font-stretch: var(--wide);
+  letter-spacing: -0.03em;
+  line-height: 1.05;
+  font-variant-numeric: tabular-nums lining-nums;
 }
 
 /* Present for assistive technology, absent from the screen. */

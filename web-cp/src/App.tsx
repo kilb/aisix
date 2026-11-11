@@ -356,14 +356,17 @@ export function App() {
 
   return (
     <div className="shell">
-      <RouteNav items={visible} current={current} attention={attention} label="Dashboard 分区" onSelect={(t) => setTab(t)} />
+      <aside className="rail">
+        <div className="brand">
+          <span className="brand-mark" aria-hidden="true" />
+          <h1 className="display">Routio 运维台</h1>
+          <span className="brand-sub">控制面</span>
+        </div>
+        <RouteNav items={visible} current={current} attention={attention} label="Dashboard 分区" onSelect={(t) => setTab(t)} />
+      </aside>
 
       <div className="shell-main">
         <header className="topbar">
-          <div className="brand">
-            <h1 className="display">Routio 运维台</h1>
-            <span className="brand-sub">控制面</span>
-          </div>
           {(shell.env || fleet) && (
             <div className="ctx">
               {shell.env && (

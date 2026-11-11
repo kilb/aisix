@@ -31,8 +31,8 @@
   list-style: none;
   background: var(--surface);
   border: 1px solid var(--divider);
-  border-radius: var(--r-button);
-  box-shadow: var(--shadow-pop, 0 4px 16px rgb(0 0 0 / 12%));
+  border-radius: var(--r-card);
+  box-shadow: var(--shadow-float);
 }
 .upicker-list > li[role="option"] {
   padding: var(--s-1) var(--s-3);

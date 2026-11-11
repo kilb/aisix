@@ -23,9 +23,9 @@ const PASSWORD = "visual-pass-7e4x";
 const OWNER = "owner@visual-7e4.test";
 const ORG = "Visual Org 7e4";
 
-/** The body's background in each theme: Concrete, and the dark page. */
-const LIGHT_BG = "rgb(245, 247, 244)";
-const DARK_BG = "rgb(18, 28, 39)";
+/** The body's background in each theme: Canvas, and the dark page. */
+const LIGHT_BG = "rgb(238, 240, 244)";
+const DARK_BG = "rgb(12, 15, 21)";
 const PHONE = { width: 360, height: 780 };
 
 test.beforeAll(async () => {

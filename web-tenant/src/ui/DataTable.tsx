@@ -5,7 +5,7 @@ import type { ReactNode } from "react";
 
 /**
  * A table: a sticky 36px header in 12px muted labels, 44px rows (56px with
- * a note line, 36px compact) that hover in Concrete, no zebra stripes.
+ * a note line, 36px compact) that hover in a light wash, no zebra stripes.
  * Numbers sit right-aligned in tabular figures (`className="num"` on the
  * cell and its header), as do a row's actions (`"right"`). The children
  * are its `thead` and `tbody`. It scrolls sideways inside its own box when

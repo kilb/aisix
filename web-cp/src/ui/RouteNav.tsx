@@ -1,4 +1,4 @@
-import { useEffect, useRef, type KeyboardEvent } from "react";
+import { useEffect, useLayoutEffect, useRef, type KeyboardEvent } from "react";
 
 export interface RouteItem<Id extends string> {
   id: Id;
@@ -6,10 +6,10 @@ export interface RouteItem<Id extends string> {
 }
 
 /**
- * The section navigation as a route line, one stop per section: vertical
- * down the left edge, with names beside the stops from 1200px and on hover
- * or focus below that; a bar along the bottom under 720px. The current
- * stop is the larger Sign-yellow one.
+ * The section navigation: a list of sections on the glass rail down the
+ * left edge, and under 960px a floating bar along the bottom that scrolls
+ * sideways. The current section sits in the lens, a Signal-yellow capsule
+ * that glides from the section left to the one opened.
  *
  * It is a `tablist` of `tab`s whose text is the section name and nothing
  * else. A section that needs attention carries a small Stop-red marker,
@@ -32,11 +32,42 @@ export function RouteNav<Id extends string>({
   onSelect: (id: Id) => void;
 }) {
   const list = useRef<HTMLOListElement>(null);
+  const lens = useRef<HTMLLIElement>(null);
   const tabs = () => [...(list.current?.querySelectorAll<HTMLButtonElement>('[role="tab"]') ?? [])];
 
-  // On a phone the line is a bar that scrolls sideways: keep the current stop in view.
+  // The lens covers the current section's tab. It is placed before the first
+  // paint with no transition, and glides only from then on; it is placed
+  // again whenever the list changes size (a font arriving, the rail turning
+  // into the bottom bar).
+  useLayoutEffect(() => {
+    const ol = list.current;
+    const mark = lens.current;
+    if (!ol || !mark) return;
+    const place = () => {
+      const tab = ol.querySelector<HTMLElement>('[aria-selected="true"]');
+      if (!tab) {
+        mark.style.opacity = "0";
+        return;
+      }
+      mark.style.opacity = "";
+      mark.style.width = `${tab.offsetWidth}px`;
+      mark.style.height = `${tab.offsetHeight}px`;
+      mark.style.transform = `translate(${tab.offsetLeft}px, ${tab.offsetTop}px)`;
+    };
+    place();
+    const frame = requestAnimationFrame(() => mark.setAttribute("data-ready", ""));
+    const resized = new ResizeObserver(place);
+    resized.observe(ol);
+    void document.fonts?.ready.then(place);
+    return () => {
+      cancelAnimationFrame(frame);
+      resized.disconnect();
+    };
+  }, [current, items]);
+
+  // As a bottom bar the list scrolls sideways: keep the current section in view.
   useEffect(() => {
-    if (!window.matchMedia("(max-width: 719px)").matches) return;
+    if (!window.matchMedia("(max-width: 959px)").matches) return;
     list.current
       ?.querySelector<HTMLElement>('[aria-selected="true"]')
       ?.scrollIntoView({ block: "nearest", inline: "center" });
@@ -63,10 +94,11 @@ export function RouteNav<Id extends string>({
 
   return (
     // The list carries the name, not the landmark too, so it is announced
-    // once. No aria-orientation: the line is vertical on a wide screen and a
-    // horizontal bar on a phone, and both arrow axes move along it.
+    // once. No aria-orientation: the list is vertical on a wide screen and a
+    // horizontal bar on a narrow one, and both arrow axes move along it.
     <nav className="route-nav">
       <ol ref={list} role="tablist" aria-label={label} onKeyDown={onKeyDown}>
+        <li ref={lens} className="lens" role="presentation" aria-hidden="true" />
         {items.map((t) => {
           const note = attention[t.id];
           return (

@@ -3,54 +3,98 @@
    theme/base.css and the shared components in ui/ui.css; nothing here
    defines a colour, font, radius or shadow of its own.
 
-   The language is wayfinding: the section navigation is a route line, the
-   one bold element, and everything else is quiet. Panels sit on Concrete
-   with a hairline; tables are left aligned with numbers on the right; state
-   is a signal lamp. */
+   The shell is two glass layers floating over the canvas: the rail on the
+   left (the brand and the sections, with the lens on the current one) and
+   the bar across the top (where this Dashboard is, the fleet's state, who
+   is signed in). Content is paper: panels with a hairline, tables left
+   aligned with numbers on the right, state as a lamp. */
 
-/* ── The shell: the route line, the header and the workspace ─── */
+/* ── The shell: the rail, the top bar and the workspace ────────── */
 .shell {
   display: grid;
-  grid-template-columns: 184px minmax(0, 1fr);
+  grid-template-columns: 252px minmax(0, 1fr);
   min-height: 100vh;
-}
-@media (min-width: 720px) and (max-width: 1199px) {
-  .shell {
-    grid-template-columns: 56px minmax(0, 1fr);
-  }
-}
-@media (max-width: 719px) {
-  .shell {
-    display: block;
-    /* Room for the navigation bar along the bottom. */
-    padding-bottom: 80px;
-  }
 }
 .shell-main {
   min-width: 0;
+  padding: var(--s-3) var(--s-5) 0 var(--s-4);
 }
 
+/* The rail: glass, inset from the window's edges, as tall as the window. */
+.rail {
+  position: sticky;
+  top: var(--s-3);
+  align-self: start;
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-5);
+  height: calc(100vh - 2 * var(--s-3));
+  margin: var(--s-3) 0 var(--s-3) var(--s-3);
+  padding: var(--s-5) var(--s-3) var(--s-4);
+  overflow-y: auto;
+  border: 1px solid var(--glass-border);
+  border-radius: var(--r-rail);
+  background: var(--glass);
+  box-shadow: var(--glass-edge), var(--shadow-glass);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  scrollbar-width: none;
+}
+.brand {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  column-gap: var(--s-3);
+  padding: 0 var(--s-2);
+}
+/* The mark: an Ink tile holding a small lens. */
+.brand-mark {
+  grid-row: span 2;
+  position: relative;
+  width: 32px;
+  height: 32px;
+  border-radius: 10px;
+  background: var(--mark-tile);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12), var(--shadow-raise);
+}
+.brand-mark::after {
+  content: "";
+  position: absolute;
+  left: 7px;
+  right: 7px;
+  top: 12px;
+  height: 8px;
+  border-radius: var(--r-round);
+  background: var(--sign);
+}
+.brand h1 {
+  font-size: var(--fs-16);
+  line-height: 1.2;
+  white-space: nowrap;
+}
+.brand-sub {
+  color: var(--text-muted);
+  font-size: var(--fs-12);
+  line-height: 1.4;
+}
+
+/* The top bar: glass, staying in view as the page scrolls under it. */
 .topbar {
+  position: sticky;
+  top: var(--s-3);
+  z-index: 15;
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: var(--s-2) var(--s-6);
-  min-height: 56px;
-  padding: var(--s-3) var(--s-4) var(--s-3) var(--s-6);
-  border-bottom: 1px solid var(--border);
-  background: var(--surface);
-}
-.brand {
-  display: inline-flex;
-  align-items: baseline;
-  gap: var(--s-2);
-  white-space: nowrap;
-}
-.brand h1 {
-  font-size: var(--fs-19);
-}
-.brand-sub {
-  color: var(--text-2);
+  gap: var(--s-2) var(--s-5);
+  min-height: 52px;
+  padding: var(--s-2) var(--s-2) var(--s-2) var(--s-5);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--r-panel);
+  background: var(--glass);
+  box-shadow: var(--glass-edge), var(--shadow-glass);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
 }
 .ctx {
   display: flex;
@@ -59,6 +103,7 @@
   gap: var(--s-1) var(--s-4);
   min-width: 0;
   color: var(--text-2);
+  font-size: var(--fs-13);
 }
 .ctx > * + * {
   padding-left: var(--s-4);
@@ -72,10 +117,11 @@
   align-items: center;
   gap: var(--s-2);
   color: var(--text);
+  font-size: var(--fs-14);
 }
 .ctx-note {
   color: var(--text-muted);
-  font-size: var(--fs-13);
+  font-size: var(--fs-12);
 }
 .who {
   display: flex;
@@ -96,21 +142,69 @@
 }
 
 .workspace {
-  padding: var(--s-4) var(--s-6) var(--s-12);
+  padding: var(--s-5) 0 var(--s-12);
+}
+/* Toasts rise beside the rail, not over it. */
+@media (min-width: 960px) {
+  .toasts {
+    left: calc(252px + var(--s-4));
+  }
+}
+/* A detail beside a list stays in view under the top bar. */
+@media (min-width: 1400px) {
+  .with-side.is-open > .side-panel {
+    top: 80px;
+    max-height: calc(100vh - 80px - var(--s-4));
+  }
 }
 
+/* Under 960px: no rail. The brand heads the page, the sections are the
+   floating bar along the bottom (ui.css), and the top bar is a plain row. */
+@media (max-width: 959px) {
+  .shell {
+    display: block;
+    /* Room for the navigation bar along the bottom. */
+    padding-bottom: 96px;
+  }
+  .rail {
+    position: static;
+    display: block;
+    height: auto;
+    margin: 0;
+    padding: var(--s-4) var(--s-4) 0;
+    overflow: visible;
+    border: 0;
+    border-radius: 0;
+    background: none;
+    box-shadow: none;
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+  .brand {
+    padding: 0;
+  }
+  .shell-main {
+    padding: var(--s-3) var(--s-3) 0;
+  }
+  .topbar {
+    position: static;
+  }
+}
 @media (max-width: 719px) {
   .topbar {
-    padding: var(--s-3) var(--s-4);
+    padding: var(--s-3) var(--s-3) var(--s-3) var(--s-4);
     gap: var(--s-2) var(--s-4);
   }
-  /* Two rows: the brand and the fleet's lamp, then the operator and their
-     buttons. The environment id and the control plane's version are on
-     概览, so the phone header leaves them out, and with them the
-     separators that would start a wrapped line. */
+  /* Two rows: the fleet's lamp, then the operator and their buttons. The
+     environment id and the control plane's version are on 概览, so the
+     phone leaves them out, and with them the separators that would start
+     a wrapped line. */
   .brand-sub,
   .ctx > :not(.fleet) {
     display: none;
+  }
+  .brand-mark {
+    grid-row: auto;
   }
   .ctx > * + * {
     padding-left: 0;
@@ -124,7 +218,7 @@
     max-width: 140px;
   }
   .workspace {
-    padding: var(--s-3) var(--s-3) var(--s-6);
+    padding: var(--s-3) 0 var(--s-6);
   }
   .panel {
     padding: var(--s-5) var(--s-4);
@@ -146,7 +240,8 @@
   align-items: center;
   gap: var(--s-3) var(--s-4);
   min-width: 0;
-  font-size: var(--fs-23);
+  font-size: var(--fs-20);
+  letter-spacing: -0.015em;
 }
 .panel > h2 > .btn:first-of-type,
 .panel > h2 > .two-step:first-of-type {
@@ -322,14 +417,18 @@ code.lab {
 .entry .lab {
   order: 0;
   color: var(--text-2);
-  font-size: var(--fs-15);
+  font-size: var(--fs-13);
+  font-weight: 550;
 }
+/* An overview figure is a reading: heavy, wide and tight. */
 .entry .val {
   order: 1;
-  font-size: var(--fs-29);
-  font-weight: 800;
-  letter-spacing: var(--tracking-heading);
-  line-height: var(--lh-heading);
+  margin: var(--s-1) 0;
+  font-size: var(--fs-32);
+  font-weight: 680;
+  font-stretch: var(--wide);
+  letter-spacing: -0.03em;
+  line-height: 1.05;
   font-variant-numeric: tabular-nums lining-nums;
 }
 .entry .foot {
@@ -439,7 +538,7 @@ code.lab {
 
 .bundle h3 {
   margin: var(--s-4) 0 var(--s-2);
-  font-size: var(--fs-15);
+  font-size: var(--fs-14);
 }
 .bundle pre {
   margin: 0;
@@ -447,8 +546,8 @@ code.lab {
   max-height: 320px;
   overflow: auto;
   border: 1px solid var(--border);
-  border-radius: var(--r-input);
-  background: var(--bg);
+  border-radius: var(--r-card);
+  background: var(--well);
   font-family: var(--font-mono);
   font-size: var(--fs-13);
   line-height: var(--lh-body);
@@ -470,15 +569,15 @@ code.lab {
   align-items: center;
   gap: var(--s-1);
   height: 28px;
-  padding: 0 var(--s-1) 0 var(--s-2);
+  padding: 0 var(--s-1) 0 var(--s-3);
   border-radius: var(--r-chip);
   background: var(--chip);
   color: var(--text);
   font-family: var(--font-mono);
-  font-size: var(--fs-13);
+  font-size: var(--fs-12);
 }
 .tags li:not(:has(button)) {
-  padding-right: var(--s-2);
+  padding-right: var(--s-3);
 }
 /* The glyph is drawn by CSS, so a chip's text is its name alone. */
 .tags button {
@@ -488,7 +587,7 @@ code.lab {
   height: 20px;
   padding: 0;
   border: 0;
-  border-radius: var(--r-input);
+  border-radius: var(--r-round);
   background: none;
   color: var(--text-muted);
   cursor: pointer;
@@ -551,8 +650,9 @@ code.lab {
 .target {
   margin: 0 0 var(--s-4);
   padding: var(--s-4);
-  border: 1px solid var(--divider);
-  border-radius: var(--r-button);
+  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+  background: var(--well);
 }
 .target .sub {
   margin: var(--s-2) 0 0;
@@ -581,7 +681,7 @@ code.lab {
 }
 .json-path {
   padding: 1px var(--s-1);
-  border-radius: var(--r-input);
+  border-radius: 6px;
   background: var(--chip);
   color: var(--text);
   font-family: var(--font-mono);
@@ -606,6 +706,7 @@ td select {
 }
 
 /* ── The cover (login gate) ──────────────────────────────────── */
+/* The brand, then the form as a floating card. */
 #gate {
   display: grid;
   place-content: center;
@@ -617,62 +718,41 @@ td select {
 }
 .gate-plate {
   display: flex;
-  align-items: flex-start;
-  gap: var(--s-4);
+  align-items: center;
+  gap: var(--s-3);
   margin-bottom: var(--s-6);
+  padding: 0 var(--s-1);
+}
+.gate-plate > .brand-mark {
+  width: 40px;
+  height: 40px;
+  border-radius: var(--r-card);
+}
+.gate-plate > .brand-mark::after {
+  left: 9px;
+  right: 9px;
+  top: 15px;
+  height: 10px;
 }
 .gate-mark {
   flex: 1;
   min-width: 0;
 }
 .gate-plate h1 {
-  font-size: var(--fs-29);
+  font-size: var(--fs-20);
 }
 .gate-sub {
   display: block;
-  margin-top: var(--s-2);
-  color: var(--text-2);
-}
-/* The route line under the title: three stops, the last one the sign. */
-.gate-line {
-  position: relative;
-  height: 24px;
-  margin: 0 0 var(--s-6);
-}
-.gate-line::before {
-  content: "";
-  position: absolute;
-  left: 8px;
-  right: 12px;
-  top: 10px;
-  height: 4px;
-  border-radius: 2px;
-  background: var(--route-line);
-}
-.gate-line > span {
-  position: absolute;
-  top: 4px;
-  width: 16px;
-  height: 16px;
-  border: 3px solid var(--route-line);
-  border-radius: 50%;
-  background: var(--surface);
-}
-.gate-line > span:nth-child(1) {
-  left: 0;
-}
-.gate-line > span:nth-child(2) {
-  left: calc(50% - 8px);
-}
-.gate-line > span:nth-child(3) {
-  right: 0;
-  top: 0;
-  width: 24px;
-  height: 24px;
-  background: var(--sign);
+  margin-top: 2px;
+  color: var(--text-muted);
+  font-size: var(--fs-13);
 }
 .gate-form {
   margin: 0;
+  padding: var(--s-8) var(--s-6) var(--s-6);
+  border-color: var(--glass-border);
+  border-radius: var(--r-rail);
+  box-shadow: var(--shadow-glass);
 }
 .gate-form > .btn {
   width: 100%;
@@ -690,9 +770,57 @@ td select {
 }
 
 /* ── A tab made of sections: the switch above the open section ── */
+/* A segmented switch: the sections sit in a quiet well, and the open one
+   is a raised paper capsule. Yellow stays with the lens and the primary
+   action, so the switch never competes with either. */
 .sections-switch {
   display: flex;
   flex-wrap: wrap;
-  gap: var(--s-2);
+  gap: 2px;
+  width: fit-content;
+  max-width: 100%;
   margin-bottom: var(--s-4);
+  padding: 3px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-round);
+  background: color-mix(in srgb, var(--surface) 55%, transparent);
+}
+.sections-switch > .btn {
+  --fg: var(--text-2);
+  height: 30px;
+  padding: 0 var(--s-4);
+  border-color: transparent;
+  background: transparent;
+  box-shadow: none;
+  font-weight: 550;
+}
+.sections-switch > .btn:not([aria-pressed="true"]):hover {
+  --fg: var(--text);
+  border-color: transparent;
+  background: var(--hover);
+}
+.sections-switch > .btn[aria-pressed="true"] {
+  --fg: var(--text);
+  border-color: var(--control-border);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-raise);
+  font-weight: 650;
+}
+.sections-switch > .btn[aria-pressed="true"]:hover {
+  background: var(--surface-raised);
+}
+/* Inside a panel the well sits on paper, so it takes the well colour. */
+.panel .sections-switch {
+  background: var(--well);
+}
+@media (max-width: 719px) {
+  .sections-switch {
+    flex-wrap: nowrap;
+    width: auto;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .sections-switch > .btn {
+    flex: none;
+  }
 }

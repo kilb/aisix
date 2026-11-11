@@ -10,8 +10,8 @@ test("令牌配色在两种主题下都达到 AA 对比度", () => {
   const css = readFileSync(new URL("../theme/tokens.css", import.meta.url), "utf8");
   const L = readTokens(css, "light"), D = readTokens(css, "dark");
   // text pairs ≥ 4.5
-  for (const [fg, bg] of [["--ink", "--paper"], ["--ink", "--concrete"], ["--ink", "--sign"], ["--n2", "--paper"],
-                          ["--n2", "--concrete"], ["--line", "--paper"], ["--stop", "--paper"]] as [string, string][])
+  for (const [fg, bg] of [["--ink", "--paper"], ["--ink", "--canvas"], ["--ink", "--sign"], ["--n2", "--paper"],
+                          ["--n2", "--canvas"], ["--line", "--paper"], ["--stop", "--paper"]] as [string, string][])
     assert.ok(contrastRatio(L[fg]!, L[bg]!) >= 4.5, `${fg} on ${bg}`);
   for (const [fg, bg] of [["--text", "--bg"], ["--text", "--surface"], ["--text-muted", "--surface"],
                           ["--line", "--surface"], ["--stop", "--surface"]] as [string, string][])

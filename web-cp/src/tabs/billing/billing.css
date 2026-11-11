@@ -7,7 +7,7 @@
 .bl-region > h3 {
   margin: 0 0 var(--s-2);
   color: var(--text);
-  font-size: var(--fs-19);
+  font-size: var(--fs-16);
   font-weight: 700;
   line-height: var(--lh-heading);
 }
@@ -42,7 +42,7 @@
   margin-bottom: var(--s-3);
 }
 
-/* The tenant whose panel is open: Concrete, with a Sign-yellow edge. */
+/* The tenant whose panel is open: the hovered-row wash, with a Signal-yellow edge. */
 .dt tr:has(.bl-name[aria-expanded="true"]) {
   background: var(--row-hover);
 }

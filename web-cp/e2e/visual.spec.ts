@@ -98,9 +98,9 @@ const PAGES: [string, string][] = [
   ["audit", "审计日志"],
 ];
 
-/** Concrete, the light page background, and the dark page background. */
-const LIGHT_BG = "rgb(245, 247, 244)";
-const DARK_BG = "rgb(18, 28, 39)";
+/** The light page background (Canvas) and the dark page background. */
+const LIGHT_BG = "rgb(238, 240, 244)";
+const DARK_BG = "rgb(12, 15, 21)";
 
 const PHONE = { width: 360, height: 780 };
 

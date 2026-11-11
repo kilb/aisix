@@ -11,11 +11,11 @@
   margin: var(--s-4) 0 0;
   padding: var(--s-4);
   border: 1px solid var(--divider);
-  border-radius: var(--r-button);
+  border-radius: var(--r-card);
 }
 .pm-create > h3 {
   margin: 0 0 var(--s-2);
-  font-size: var(--fs-15);
+  font-size: var(--fs-14);
 }
 .pm-create > .r {
   max-width: 32rem;

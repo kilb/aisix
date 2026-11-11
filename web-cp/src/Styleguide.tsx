@@ -31,10 +31,10 @@ const BUTTONS: { kind: ButtonKind; label: string; name: string; icon?: "refresh"
 ];
 
 const SWATCHES = [
-  ["--ink", "Ink", "文字、主线"],
-  ["--concrete", "Concrete", "页面底色"],
+  ["--ink", "Ink", "文字"],
+  ["--canvas", "Canvas", "页面底色"],
   ["--paper", "Paper", "面板、表格、表单"],
-  ["--sign", "Sign yellow", "主要操作、当前位置、选中"],
+  ["--sign", "Signal yellow", "当前位置（导航透镜）、主要操作"],
   ["--line", "Line blue", "链接、焦点、传播中"],
   ["--proceed", "Proceed green", "已应用、正常"],
   ["--stop", "Stop red", "被拒绝、危险确认"],
@@ -45,7 +45,7 @@ const SWATCHES = [
   ["--hairline-inner", "Hairline inner", "内部分隔"],
 ] as const;
 
-const SCALE = [45, 36, 29, 23, 19, 15, 13, 12] as const;
+const SCALE = [44, 32, 24, 20, 16, 14, 13, 12] as const;
 
 function Row({ title, children }: { title: string; children: ReactNode }) {
   return (
@@ -410,7 +410,7 @@ export default function Styleguide() {
         </div>
       </Row>
 
-      <Row title="详情面板与路线导航">
+      <Row title="详情面板与分区导航">
         <div className="sg-nav">
           <RouteNav
             items={[
@@ -461,18 +461,21 @@ export default function Styleguide() {
           {SCALE.map((px) => (
             <li key={px}>
               <span className="sg-px">{px}</span>
-              <span style={{ fontSize: px, fontWeight: px >= 36 ? 800 : px >= 19 ? 700 : 400, lineHeight: px >= 19 ? 1.2 : 1.6 }}>
-                {px >= 36 ? (
+              <span
+                className={px >= 32 ? "reading" : undefined}
+                style={{ fontSize: px, fontWeight: px >= 32 ? undefined : px >= 16 ? 650 : 400, lineHeight: px >= 16 ? 1.25 : 1.6 }}
+              >
+                {px >= 32 ? (
                   <span className="money">
-                    <span className="cur" style={{ fontSize: px >= 45 ? 29 : 23, fontWeight: 600, marginRight: 4 }}>
+                    <span className="cur" style={{ fontSize: px >= 44 ? 24 : 20, fontWeight: 500, marginRight: 4 }}>
                       $
                     </span>
                     2,418.36
                   </span>
-                ) : px >= 19 ? (
+                ) : px >= 16 ? (
                   "授权模型 Routing 12"
                 ) : (
-                  "停用租户会让它的全部密钥立即失效 Overpass 0123456789"
+                  "停用租户会让它的全部密钥立即失效 Mona Sans 0123456789"
                 )}
               </span>
             </li>

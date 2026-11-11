@@ -43,6 +43,7 @@
   background: transparent;
   color: var(--fg);
   font-weight: 600;
+  letter-spacing: 0.005em;
   line-height: 16px;
   white-space: nowrap;
   cursor: pointer;
@@ -51,7 +52,12 @@
     background-color var(--t-fast) ease,
     border-color var(--t-fast) ease,
     color var(--t-fast) ease,
-    box-shadow var(--t-fast) ease;
+    box-shadow var(--t-fast) ease,
+    transform var(--t-fast) var(--ease-out);
+}
+/* Pressed: the capsule gives a little under the finger. */
+.btn:not(:disabled, [aria-disabled="true"]):active {
+  transform: scale(0.97);
 }
 .btn-sm {
   height: var(--h-control-sm);
@@ -70,19 +76,24 @@
 .btn-primary {
   --fg: var(--on-sign);
   background: var(--sign);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.5), 0 1px 2px rgba(120, 82, 0, 0.18);
 }
 .btn-primary:not(:disabled, [aria-disabled="true"]):hover {
   background: var(--sign-hover);
 }
 .btn-primary:not(:disabled, [aria-disabled="true"]):active {
   background: var(--sign-press);
-  box-shadow: var(--inset);
+  box-shadow: inset 0 1px 1px rgba(120, 82, 0, 0.25);
 }
+/* Secondary: a raised paper capsule with a stronger hairline. */
 .btn-secondary {
-  border-color: var(--text);
+  border-color: var(--control-border);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-raise);
 }
 .btn-secondary:not(:disabled, [aria-disabled="true"]):hover {
-  background: var(--hover);
+  border-color: var(--input-border);
+  background: var(--row-hover);
 }
 .btn-secondary:not(:disabled, [aria-disabled="true"]):active {
   background: var(--press);
@@ -166,7 +177,7 @@
   max-width: min(320px, 90vw);
   min-height: var(--h-control-sm);
   padding: var(--s-1) var(--s-3);
-  border-radius: var(--r-button);
+  border-radius: var(--r-input);
   background: var(--tooltip-bg);
   color: var(--tooltip-text);
   box-shadow: var(--shadow-float);
@@ -198,6 +209,8 @@
 .f-label,
 .field > legend {
   color: var(--text-2);
+  font-size: var(--fs-13);
+  font-weight: 550;
   line-height: var(--lh-table);
 }
 fieldset.field {
@@ -235,7 +248,8 @@ fieldset.field > legend {
   line-height: 20px;
   transition:
     border-color var(--t-fast) ease,
-    background-color var(--t-fast) ease;
+    background-color var(--t-fast) ease,
+    box-shadow var(--t-fast) ease;
 }
 :where(input)::placeholder {
   color: var(--text-muted);
@@ -244,8 +258,12 @@ fieldset.field > legend {
 :where(input, select):not(:disabled):hover {
   border-color: var(--input-border-hover);
 }
+/* Focus: the edge turns Line blue and doubles, with a soft halo round it. */
 :where(input, select):not(:disabled):focus-visible {
   border-color: var(--focus);
+  outline: 1px solid var(--focus);
+  outline-offset: 0;
+  box-shadow: 0 0 0 4px var(--focus-halo);
 }
 :where(input, select)[aria-invalid="true"]:not(:disabled) {
   border-color: var(--error);
@@ -253,20 +271,20 @@ fieldset.field > legend {
 :where(input, select):disabled {
   opacity: 0.45;
   cursor: not-allowed;
-  background-color: var(--bg);
+  background-color: var(--well);
 }
 /* A native select with a drawn chevron. */
 :where(select) {
   appearance: none;
   padding-right: var(--s-10);
   cursor: pointer;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4.75 6.25 8 9.5l3.25-3.25' fill='none' stroke='%2366737F' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4.75 6.25 8 9.5l3.25-3.25' fill='none' stroke='%235F6878' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
   background-repeat: no-repeat;
   background-position: right var(--s-3) center;
   background-size: 16px 16px;
 }
 :root[data-theme="dark"] :where(select) {
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4.75 6.25 8 9.5l3.25-3.25' fill='none' stroke='%2397A4AE' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4.75 6.25 8 9.5l3.25-3.25' fill='none' stroke='%238D96A7' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
 }
 :where(select):not(:disabled):active {
   background-color: var(--row-hover);
@@ -282,7 +300,7 @@ input[type="radio"] {
   height: 16px;
   margin: 0;
   border: 1px solid var(--box-border);
-  border-radius: var(--r-input);
+  border-radius: 5px;
   background: var(--surface) no-repeat center / 14px 14px;
   vertical-align: middle;
   cursor: pointer;
@@ -296,7 +314,7 @@ input[type="radio"] {
 input[type="checkbox"]:checked {
   border-color: var(--sign-press);
   background-color: var(--sign);
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 14 14'%3E%3Cpath d='M3.25 7.25 5.75 9.75 10.75 4.25' fill='none' stroke='%231C2A39' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 14 14'%3E%3Cpath d='M3.25 7.25 5.75 9.75 10.75 4.25' fill='none' stroke='%23161A23' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
 }
 input[type="radio"]:checked {
   border-color: var(--sign-press);
@@ -358,7 +376,9 @@ label:hover > :is(input[type="checkbox"], input[type="radio"]):checked:not(:disa
   margin-top: -4px;
   border-radius: var(--r-round);
   background: var(--c);
-  box-shadow: inset 0 0 0 1.5px var(--ring);
+  box-shadow:
+    inset 0 0 0 1.5px var(--ring),
+    0 0 0 3px color-mix(in srgb, var(--c) calc(var(--halo) * 100%), transparent);
 }
 .lamp[data-lamp="applied"] {
   --c: var(--lamp-applied);
@@ -416,27 +436,29 @@ label:hover > :is(input[type="checkbox"], input[type="radio"]):checked:not(:disa
   white-space: nowrap;
 }
 
-/* ── Notes: a passage in a panel, marked by a bar on its left ─── */
+/* ── Notes: a card tinted by its kind ─────────────────────────── */
 /* The Dashboard's note. Here it has no margin of its own: the portal's
    panels and forms space their children by gap. */
 .note {
+  --k: var(--n3);
   margin: 0;
   padding: var(--s-3) var(--s-4);
-  border: 1px solid var(--border);
-  border-left: 3px solid var(--n3);
-  border-radius: var(--r-button);
-  background: var(--surface);
+  border: 1px solid color-mix(in srgb, var(--k) 28%, transparent);
+  border-radius: var(--r-card);
+  background: color-mix(in srgb, var(--k) 9%, var(--surface));
   color: var(--text);
   line-height: var(--lh-body);
 }
 .note.ok {
-  border-left-color: var(--proceed);
+  --k: var(--proceed);
 }
 .note.warn {
-  border-left-color: var(--sign);
+  --k: var(--sign);
+  border-color: color-mix(in srgb, var(--sign-press) 45%, transparent);
+  background: color-mix(in srgb, var(--sign) 16%, var(--surface));
 }
 .note.crit {
-  border-left-color: var(--stop);
+  --k: var(--stop);
 }
 .note > p + p,
 .note > strong + p {
@@ -570,7 +592,7 @@ label:hover > :is(input[type="checkbox"], input[type="radio"]):checked:not(:disa
 .skeleton i {
   display: block;
   height: 12px;
-  border-radius: var(--r-input);
+  border-radius: var(--r-round);
   background: var(--skeleton);
 }
 
@@ -654,8 +676,8 @@ label:hover > :is(input[type="checkbox"], input[type="radio"]):checked:not(:disa
   align-items: center;
   gap: var(--s-2);
   min-height: 40px;
-  padding: var(--s-2) var(--s-4);
-  border-radius: var(--r-button);
+  padding: var(--s-2) var(--s-5) var(--s-2) var(--s-4);
+  border-radius: var(--r-round);
   background: var(--tooltip-bg);
   color: var(--tooltip-text);
   box-shadow: var(--shadow-float);
@@ -670,6 +692,7 @@ label:hover > :is(input[type="checkbox"], input[type="radio"]):checked:not(:disa
   height: 8px;
   border-radius: var(--r-round);
   background: var(--lamp-applied);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--lamp-applied) 30%, transparent);
 }
 .toast.is-leaving {
   opacity: 0;
@@ -678,63 +701,74 @@ label:hover > :is(input[type="checkbox"], input[type="radio"]):checked:not(:disa
 @keyframes ui-toast-in {
   from {
     opacity: 0;
-    transform: translateY(8px);
+    transform: translateY(8px) scale(0.96);
   }
 }
 
-/* ── Route nav: stops on one Ink line ──────────────────────── */
+/* ── Route nav: a segmented glass bar with the lens ────────── */
+/* The tabs are quiet text in a glass capsule; the current one sits in the
+   lens, a Signal-yellow capsule that glides between them (RouteNav.tsx
+   places it). */
 .route {
-  /* A stop is filled with what it sits on, so the line stops at its rim. */
-  --stop-bg: var(--bg);
-  --tab-w: 96px;
   position: relative;
   display: flex;
-  width: calc(var(--stops) * var(--tab-w));
+  gap: 2px;
+  width: fit-content;
   max-width: 100%;
+  padding: 4px;
+  border: 1px solid var(--glass-border);
+  border-radius: var(--r-round);
+  background: var(--glass);
+  box-shadow: var(--glass-edge), var(--shadow-raise);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
 }
-/* The line runs from the first stop's centre to the last's, no further. */
 .panel .route {
-  --stop-bg: var(--surface);
+  background: var(--well);
+  box-shadow: none;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
 }
-.route::before {
-  content: "";
+.route > .lens {
   position: absolute;
-  top: 9px;
-  left: calc(100% / (2 * var(--stops)));
-  right: calc(100% / (2 * var(--stops)));
-  height: 2px;
-  background: var(--route-line);
+  top: 0;
+  left: 0;
+  border-radius: var(--r-round);
+  background: var(--sign);
+  box-shadow: var(--lens-shadow);
+  pointer-events: none;
+}
+.route > .lens[data-ready] {
+  transition:
+    transform var(--t-lens) var(--ease-spring),
+    width var(--t-lens) var(--ease-spring),
+    height var(--t-lens) var(--ease-out),
+    opacity var(--t-fast) ease;
 }
 .route > button {
   position: relative;
-  flex: 1 1 0;
+  z-index: 1;
+  flex: none;
   min-width: 0;
   display: flex;
-  flex-direction: column;
   align-items: center;
-  gap: var(--s-2);
-  padding: 0 0 var(--s-1);
+  justify-content: center;
+  height: 36px;
+  padding: 0 var(--s-5);
   border: 0;
-  border-radius: var(--r-button);
+  border-radius: var(--r-round);
   background: none;
   color: var(--text-2);
   cursor: pointer;
-  transition: color var(--t-fast) ease;
+  transition:
+    color var(--t-fast) ease,
+    background-color var(--t-fast) ease;
+}
+.route > button:focus-visible {
+  outline-offset: -2px;
 }
 .route .stop {
-  display: grid;
-  place-items: center;
-  width: 20px;
-  height: 20px;
-}
-.route .stop::before {
-  content: "";
-  width: 12px;
-  height: 12px;
-  border: 2px solid var(--route-line);
-  border-radius: var(--r-round);
-  background: var(--stop-bg);
-  transition: background-color var(--t-fast) ease;
+  display: none;
 }
 .route .name {
   max-width: 100%;
@@ -743,64 +777,65 @@ label:hover > :is(input[type="checkbox"], input[type="radio"]):checked:not(:disa
   white-space: nowrap;
   line-height: var(--lh-table);
 }
-.route > button:hover {
+.route > button:not([aria-selected="true"]):hover {
   color: var(--text);
+  background: var(--hover);
 }
-.route > button:hover .stop::before {
-  background: color-mix(in srgb, var(--route-line) 14%, var(--stop-bg));
-}
-.route > button:active .stop::before {
-  background: color-mix(in srgb, var(--route-line) 28%, var(--stop-bg));
+.route > button:not([aria-selected="true"]):active {
+  background: var(--press);
 }
 .route > [aria-selected="true"] {
-  color: var(--text);
-}
-.route > [aria-selected="true"] .stop::before,
-.route > [aria-selected="true"]:hover .stop::before {
-  width: 20px;
-  height: 20px;
-  background: var(--sign);
+  color: var(--on-sign);
 }
 .route > [aria-selected="true"] .name {
-  font-weight: 700;
+  font-weight: 650;
 }
 
-/* On a phone the docked route is a bar along the bottom edge. */
+/* On a phone the docked bar floats along the bottom edge. The bar itself
+   reaches the edge (the glass is drawn inset above its padding), so it is
+   the last thing on the screen. */
 @media (max-width: 719px) {
   .route.docked {
-    --stop-bg: var(--surface);
-    --pad: var(--s-2);
+    --bar-inset: var(--s-3);
     position: fixed;
     left: 0;
     right: 0;
     bottom: 0;
     z-index: 10;
     width: auto;
+    max-width: none;
     margin: 0;
-    padding: var(--pad) var(--pad) calc(var(--pad) + env(safe-area-inset-bottom));
-    border-top: 1px solid var(--border);
-    background: var(--surface);
+    padding: 0 calc(var(--bar-inset) + 5px) calc(var(--bar-inset) + 5px + env(safe-area-inset-bottom));
+    border: 0;
+    background: none;
+    box-shadow: none;
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
   }
   .route.docked::before {
-    top: calc(var(--pad) + 9px);
-    left: calc(var(--pad) + (100% - 2 * var(--pad)) / (2 * var(--stops)));
-    right: calc(var(--pad) + (100% - 2 * var(--pad)) / (2 * var(--stops)));
+    content: "";
+    position: absolute;
+    left: var(--bar-inset);
+    right: var(--bar-inset);
+    bottom: calc(var(--bar-inset) + env(safe-area-inset-bottom));
+    height: 50px;
+    border: 1px solid var(--glass-border);
+    border-radius: var(--r-round);
+    background: var(--glass-strong);
+    box-shadow: var(--glass-edge), var(--shadow-glass);
+    -webkit-backdrop-filter: var(--glass-blur);
+    backdrop-filter: var(--glass-blur);
   }
   .route.docked > button {
-    gap: var(--s-1);
-  }
-  .route.docked .name {
-    font-size: var(--fs-12);
-    color: var(--text-muted);
-  }
-  .route.docked > [aria-selected="true"] .name {
-    color: var(--text);
-    font-weight: 600;
+    flex: 1 1 0;
+    height: 40px;
+    padding: 0 var(--s-1);
+    font-size: var(--fs-13);
   }
   .toasts {
     left: var(--s-4);
   }
   body:has(.route.docked) .toasts {
-    bottom: 88px;
+    bottom: 84px;
   }
 }
