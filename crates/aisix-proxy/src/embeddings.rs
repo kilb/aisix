@@ -824,6 +824,13 @@ async fn dispatch(
     // embeds one text per upstream call): it is billed, and the answered
     // calls are not sent again, so the failure ends the dispatch.
     let served = std::sync::OnceLock::<u32>::new();
+    // What an attempt whose upstream calls were partly answered owes its
+    // token limits if the caller leaves before it ends: the note a multi-call
+    // provider leaves per answered call (`note_served_input_tokens`) is the
+    // one the success and failure paths clear, so a value still there at drop
+    // is a cancellation's to charge. Declared after the reservation so it is
+    // dropped (and charged) before the slots are released.
+    let _served_hold = crate::quota::ServedTokensHold::of(state, &reservation);
     let dispatched = crate::routing::dispatch_with_failover(
         state,
         snapshot,

@@ -132,6 +132,27 @@ describe("Bedrock Titan: a later text fails after an earlier one was served", ()
       display_name: "titan-member-group",
       routing: { strategy: "failover", targets: [{ model: "titan-member" }] },
     });
+    // R-109: a direct model and a group member, each capped at the eight
+    // tokens two answered texts cost, so a cancellation that charges them
+    // leaves the counter at its cap.
+    await seed.createModel({
+      display_name: "titan-quota-direct",
+      provider: "bedrock",
+      model_name: "amazon.titan-embed-text-v1",
+      provider_key_id: pk.id,
+      rate_limit: { tpm: 8, concurrency: 1 },
+    });
+    await seed.createModel({
+      display_name: "titan-quota-member",
+      provider: "bedrock",
+      model_name: "amazon.titan-embed-text-v1",
+      provider_key_id: pk.id,
+      rate_limit: { tpm: 8, concurrency: 1 },
+    });
+    await seed.createModel({
+      display_name: "titan-quota-group",
+      routing: { strategy: "failover", targets: [{ model: "titan-quota-member" }] },
+    });
     // Seeded last, so this key authenticating implies the whole seed set
     // has reached the gateway's snapshot.
     await seed.createApiKey({ key_hash: CALLER_KEY_HASH, allowed_models: ["*"] });
@@ -206,6 +227,54 @@ describe("Bedrock Titan: a later text fails after an earlier one was served", ()
     expect(row.get("prompt_tokens")).toBe("8");
     expect(Number(row.get("cost_usd") ?? "0")).toBeGreaterThan(0);
   });
+
+  // R-109: the tokens an abandoned request's answered texts were billed are
+  // charged to the token limits the request held them against, so a key that
+  // spent a whole window before its caller left does not get a second one.
+  test.for<["titan-quota-direct" | "titan-quota-group"]>([
+    "titan-quota-direct",
+    "titan-quota-group",
+  ])("%s: a cancellation charges what its answered texts were served", async (model, ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    await awaitWindowHeadroom();
+    const before = received.length;
+    const controller = new AbortController();
+    const abandoned = fetch(`${app.proxyUrl}/v1/embeddings`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${CALLER_PLAINTEXT}`, "content-type": "application/json" },
+      body: JSON.stringify({ model, input: ["served", "served", "hangs"] }),
+      signal: controller.signal,
+    }).then((res) => res.text());
+    for (let i = 0; i < 400 && !received.slice(before).includes("hangs"); i++) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    expect(received.slice(before)).toEqual(["served", "served", "hangs"]);
+    controller.abort();
+    await expect(abandoned).rejects.toThrow();
+
+    // The cancellation has settled once its 499 row is written; asking before
+    // that would race the charge.
+    await waitForSlsLog(
+      sls!,
+      LOGSTORE,
+      (log) => log.get("requested_model") === model && log.get("status_code") === "499",
+      `the 499 usage row of the abandoned ${model} request`,
+    );
+    // The two answered texts spent the window's whole eight tokens, so ONE
+    // follow-up request must be refused rather than served. Deliberately not
+    // retried: a served request spends tokens of its own, and a retry loop
+    // would exhaust the window itself and pass on the broken code.
+    const next = await fetch(`${app.proxyUrl}/v1/embeddings`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${CALLER_PLAINTEXT}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ model, input: ["served"] }),
+    });
+    const text = await next.text();
+    expect(next.status, text).toBe(429);
+  }, 60_000);
 
   test("a group member's own token limit is charged the texts it served before failing", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();

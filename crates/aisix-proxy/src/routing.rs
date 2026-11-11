@@ -814,6 +814,15 @@ where
                 continue;
             }
         };
+
+        // This target's own layers, charged for what its in-flight attempt
+        // had been served if the caller leaves before the attempt ends
+        // (#R-109). The request-level hold covers the key and policy layers;
+        // these are the target's — see `quota::ServedTokensHold`.
+        let _served_hold = member_reservation
+            .as_ref()
+            .map(|r| crate::quota::ServedTokensHold::of(state, r));
+
         let budget = effective_retries(
             &target.model,
             group_retries_of(&entry.value),

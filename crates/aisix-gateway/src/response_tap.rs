@@ -228,6 +228,14 @@ pub fn note_served_input_tokens(tokens: u32) {
     });
 }
 
+/// What [`note_served_input_tokens`] noted and nothing has taken, left in
+/// place. The reader for a caller that must not consume it — a request whose
+/// caller hung up still needs it for its usage row, and its limit
+/// reservation for the tokens it owes. `None` outside a request scope.
+pub fn served_input_tokens() -> Option<u32> {
+    TAP.try_with(|tap| tap.served_input_tokens()).ok().flatten()
+}
+
 /// What [`note_served_input_tokens`] noted since the last take, leaving
 /// nothing behind. `None` outside a request scope.
 pub fn take_served_input_tokens() -> Option<u32> {
