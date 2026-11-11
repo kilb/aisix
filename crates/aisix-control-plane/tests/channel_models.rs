@@ -4679,3 +4679,59 @@ async fn a_regeneration_orders_a_name_chain_across_two_accounts() {
     assert_eq!(display_name(&cp, x).await, "pub-chain-4b7#acct-chain-x-4b7");
     assert_eq!(display_name(&cp, y).await, "pub-chain-4b7#acct-chain-y-4b7");
 }
+
+/// A public model that stored `least_cost` — which this release refuses to
+/// store, because its generated targets carry no price and the strategy then
+/// ranks nothing — is repaired by the upgrade, not left reading as a
+/// price-ordered model. The key goes, which means the default strategy the
+/// gateway already dispatched in; every other stored setting stays, and a
+/// model that stored another strategy is untouched.
+#[tokio::test]
+async fn the_upgrade_retires_a_stored_least_cost_strategy() {
+    use support::migrate::{database_at, drop_database, migrate_rest};
+    let Some(db) = database_at(39).await else {
+        return;
+    };
+    let priced = Uuid::new_v4();
+    let kept = Uuid::new_v4();
+    let retired = Uuid::new_v4();
+    for sql in [
+        format!(
+            "INSERT INTO public_models (id, name, routing) VALUES \
+             ('{priced}', 'pub-least-cost-1a2', '{{\"strategy\": \"least_cost\"}}')"
+        ),
+        format!(
+            "INSERT INTO public_models (id, name, routing) VALUES \
+             ('{kept}', 'pub-failover-1a2', \
+              '{{\"strategy\": \"failover\", \"retries\": 2}}')"
+        ),
+        format!(
+            "INSERT INTO public_models (id, name, routing, retired_at) VALUES \
+             ('{retired}', 'pub-retired-least-cost-1a2', \
+              '{{\"strategy\": \"least_cost\", \"retries\": 3}}', now())"
+        ),
+    ] {
+        sqlx::query(&sql).execute(&db).await.expect(&sql);
+    }
+
+    migrate_rest(&db).await.expect("the rest migrates");
+
+    let routing = |id: Uuid| {
+        let db = db.clone();
+        async move {
+            sqlx::query_scalar::<_, Value>("SELECT routing FROM public_models WHERE id = $1")
+                .bind(id)
+                .fetch_one(&db)
+                .await
+                .expect("read the routing")
+        }
+    };
+    assert_eq!(routing(priced).await, json!({}), "{priced}");
+    assert_eq!(
+        routing(kept).await,
+        json!({"strategy": "failover", "retries": 2}),
+        "{kept}"
+    );
+    assert_eq!(routing(retired).await, json!({"retries": 3}), "{retired}");
+    drop_database(db).await;
+}
