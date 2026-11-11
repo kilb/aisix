@@ -711,9 +711,8 @@ fn responses_text_format_to_response_format(text: &Value) -> Option<Value> {
     }
 }
 
-/// The functions a client search loaded are declared in history rather than
-/// `tools`. Keep that inventory request-local; a later search may refresh one
-/// member of a namespace without replacing its other members.
+/// Responses Lite 和客户端搜索都能在 input 中声明工具；同一份请求内按顺序
+/// 合并，后续声明可更新命名空间成员，同时保留其余成员供调用和回复解码使用。
 fn request_tools(body: &Value) -> std::borrow::Cow<'_, [Value]> {
     let declared = body
         .get("tools")
@@ -727,10 +726,18 @@ fn request_tools(body: &Value) -> std::borrow::Cow<'_, [Value]> {
         .into_iter()
         .flatten()
     {
-        if item.get("type").and_then(Value::as_str) == Some("tool_search_output")
-            && item.get("execution").and_then(Value::as_str) == Some("client")
-        {
-            merge_tools(&mut tools, &loaded_tools(item));
+        match item.get("type").and_then(Value::as_str) {
+            Some("additional_tools") => {
+                if let Some(additional) = item.get("tools").and_then(Value::as_array) {
+                    merge_tools(&mut tools, additional);
+                }
+            }
+            Some("tool_search_output")
+                if item.get("execution").and_then(Value::as_str) == Some("client") =>
+            {
+                merge_tools(&mut tools, &loaded_tools(item));
+            }
+            _ => {}
         }
     }
     if tools.is_empty() {
@@ -4263,6 +4270,408 @@ mod tests {
                 },
             }],
         })
+    }
+
+    // 声明放进历史后仍须可调用，不能把没有 content 的声明项当成空消息丢掉。
+    // https://developers.openai.com/api/docs/guides/tools-tool-search#add-tools-at-a-specific-point-in-the-input
+    #[test]
+    fn additional_tools_functions_keep_their_schema_strict_and_auto_choice() {
+        let parameters = json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "options": {
+                    "type": "object",
+                    "properties": {
+                        "labels": {"type": "array", "items": {"type": "string"}},
+                        "limit": {"type": ["integer", "null"]},
+                    },
+                    "required": ["labels", "limit"],
+                    "additionalProperties": false,
+                },
+            },
+            "required": ["query", "options"],
+            "additionalProperties": false,
+        });
+        let body = json!({
+            "tool_choice": "auto",
+            "input": [
+                {"type": "additional_tools", "role": "developer", "tools": [{
+                    "type": "function", "name": "search_notes", "description": "Search saved notes.",
+                    "parameters": parameters, "strict": true,
+                }, {
+                    "type": "function", "name": "read_note", "description": "Read one saved note.",
+                    "parameters": {"type": "object", "properties": {"id": {"type": "string"}}},
+                    "strict": false,
+                }]},
+                {"role": "user", "content": "Find the saved release notes."},
+            ],
+        });
+        let chat = responses_request_to_chat("m", &body);
+        let tools = chat.extra.get("tools").and_then(Value::as_array).unwrap();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(chat.extra.get("tool_choice"), Some(&json!("auto")));
+        for declared in body["input"][0]["tools"].as_array().unwrap() {
+            let tool = tools
+                .iter()
+                .find(|tool| tool["function"]["name"] == declared["name"])
+                .unwrap();
+            assert_eq!(tool["type"], "function");
+            assert_eq!(tool["function"]["parameters"], declared["parameters"]);
+            assert_eq!(tool["function"]["strict"], declared["strict"]);
+            assert_eq!(tool["function"]["description"], declared["description"]);
+        }
+        assert_eq!(chat.messages.len(), 1);
+        assert_eq!(chat.messages[0].role, Role::User);
+        assert_eq!(
+            chat.messages[0].content_str(),
+            "Find the saved release notes."
+        );
+    }
+
+    fn additional_tools_exec_request() -> Value {
+        json!({
+            "tool_choice": "auto",
+            "input": [
+                {"type": "additional_tools", "role": "developer", "tools": [{
+                    "type": "namespace", "name": "functions", "description": "Runtime tools.",
+                    "tools": [{
+                        "type": "custom", "name": "exec", "description": "Run JavaScript code.",
+                        "format": {"type": "grammar", "syntax": "lark", "definition": "start: /[\\s\\S]+/"},
+                    }],
+                }]},
+                {"role": "user", "content": "Use JavaScript to discover calendar tools."},
+            ],
+        })
+    }
+
+    #[test]
+    fn additional_tools_namespace_exec_buffered_reply_and_replay_keep_javascript() {
+        let mut body = additional_tools_exec_request();
+        let chat = responses_request_to_chat("m", &body);
+        let tools = chat.extra.get("tools").and_then(Value::as_array).unwrap();
+        assert_eq!(tools.len(), 1);
+        let function = &tools[0]["function"];
+        let name = function["name"].as_str().unwrap();
+        let description = function["description"].as_str().unwrap();
+        assert!(description.contains("Run JavaScript code."));
+        assert!(description.contains("start: /[\\s\\S]+/"));
+        // 用出站公开 schema 构造上游调用，不把内部别名或包装参数名写死。
+        let parameter = function["parameters"]["properties"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .find(|(_, schema)| schema["type"] == "string")
+            .map(|(name, _)| name.clone())
+            .unwrap();
+        let javascript =
+            "const result = await tools.tool_search({query: \"calendar\"});\ntext(result);";
+        let mut arguments = Map::new();
+        arguments.insert(parameter, json!(javascript));
+        let arguments = Value::Object(arguments).to_string();
+        let response = chat_response_with(
+            None,
+            Some(json!([{"id": "call_exec", "type": "function", "function": {
+                "name": name, "arguments": arguments,
+            }}])),
+            FinishReason::ToolCalls,
+        );
+        let out = chat_response_to_responses_json(
+            &response,
+            "m",
+            1,
+            &ResponsesReplyContext::from_request(&body),
+        );
+        assert_eq!(out["output"].as_array().unwrap().len(), 1);
+        let item = &out["output"][0];
+        assert_eq!(item["type"], "custom_tool_call");
+        assert_eq!(item["namespace"], "functions");
+        assert_eq!(item["name"], "exec");
+        assert_eq!(item["call_id"], "call_exec");
+        assert_eq!(item["input"], javascript);
+        assert_eq!(item["status"], "completed");
+
+        let history = body["input"].as_array_mut().unwrap();
+        history.push(item.clone());
+        history.push(json!({
+            "type": "custom_tool_call_output", "call_id": "call_exec",
+            "output": "{\"tools\":[{\"name\":\"calendar_lookup\",\"description\":\"Find events.\"}]}",
+        }));
+        let replay = responses_request_to_chat("m", &body);
+        let assistant = replay
+            .messages
+            .iter()
+            .find(|m| m.role == Role::Assistant)
+            .unwrap();
+        assert_eq!(assistant.extra["tool_calls"][0]["id"], "call_exec");
+        assert_eq!(assistant.extra["tool_calls"][0]["function"]["name"], name);
+        assert_eq!(
+            assistant.extra["tool_calls"][0]["function"]["arguments"],
+            arguments
+        );
+        let result = replay
+            .messages
+            .iter()
+            .find(|m| m.role == Role::Tool)
+            .unwrap();
+        assert_eq!(result.tool_call_id.as_deref(), Some("call_exec"));
+        let result: Value = serde_json::from_str(&result.content_str()).unwrap();
+        assert_eq!(
+            result,
+            json!({"tools": [{"name": "calendar_lookup", "description": "Find events."}]})
+        );
+    }
+
+    #[test]
+    fn additional_tools_namespace_exec_stream_keeps_custom_identity_and_javascript() {
+        let body = additional_tools_exec_request();
+        let chat = responses_request_to_chat("m", &body);
+        let tools = chat.extra.get("tools").and_then(Value::as_array).unwrap();
+        assert_eq!(tools.len(), 1);
+        let function = &tools[0]["function"];
+        let parameter = function["parameters"]["properties"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .find(|(_, schema)| schema["type"] == "string")
+            .map(|(name, _)| name.clone())
+            .unwrap();
+        let javascript =
+            "const result = await tools.tool_search({query: \"calendar\"});\ntext(result);";
+        let mut arguments = Map::new();
+        arguments.insert(parameter, json!(javascript));
+        let arguments = Value::Object(arguments).to_string();
+        let split = arguments.find("tool_search").unwrap();
+        let mut enc = ResponsesSseEncoder::new(
+            "resp_exec",
+            "m",
+            0,
+            ResponsesReplyContext::from_request(&body),
+        );
+        let mut events = Vec::new();
+        for (call, finish) in [
+            (
+                json!({"index": 0, "id": "call_exec_stream", "type": "function", "function": {
+                    "name": function["name"], "arguments": &arguments[..split],
+                }}),
+                None,
+            ),
+            (
+                json!({"index": 0, "function": {"arguments": &arguments[split..]}}),
+                Some(FinishReason::ToolCalls),
+            ),
+        ] {
+            events.extend(enc.next_events(&ChatChunk {
+                choice_index: 0,
+                logprobs: None,
+                id: "c".into(),
+                model: "m".into(),
+                delta: ChatDelta {
+                    tool_calls: Some(vec![call]),
+                    ..Default::default()
+                },
+                finish_reason: finish,
+                usage: None,
+                service_tier: None,
+                accounting_usage: None,
+            }));
+        }
+        // 与真实流的 EOF 路径一致，缺少尾部 usage 帧时仍须完成编码器。
+        events.extend(enc.force_finish());
+        for kind in ["response.output_item.added", "response.output_item.done"] {
+            let item = &events
+                .iter()
+                .find(|event| event.event_type == kind)
+                .unwrap()
+                .data["item"];
+            assert_eq!(item["type"], "custom_tool_call");
+            assert_eq!(item["namespace"], "functions");
+            assert_eq!(item["name"], "exec");
+            assert_eq!(item["call_id"], "call_exec_stream");
+        }
+        let done = events
+            .iter()
+            .find(|event| event.event_type == "response.output_item.done")
+            .unwrap();
+        assert_eq!(done.data["item"]["input"], javascript);
+        assert_eq!(done.data["item"]["status"], "completed");
+        let input_done = events
+            .iter()
+            .find(|event| event.event_type == "response.custom_tool_call_input.done")
+            .unwrap();
+        assert_eq!(input_done.data["input"], javascript);
+        assert!(!types_of(&events)
+            .iter()
+            .any(|kind| kind.starts_with("response.function_call_arguments")));
+        let terminal = events.last().unwrap();
+        assert_eq!(terminal.event_type, "response.completed");
+        assert_eq!(terminal.data["response"]["output"][0], done.data["item"]);
+    }
+
+    #[test]
+    fn additional_tools_merge_with_search_history_and_current_declarations_win() {
+        let body = json!({
+            "tool_choice": "auto",
+            "tools": [{"type": "namespace", "name": "calendar", "description": "Calendar tools.", "tools": [{
+                "type": "function", "name": "lookup", "description": "LOOKUP_CURRENT",
+                "parameters": {"type": "object", "properties": {"date": {"type": "string"}}, "required": ["date"], "additionalProperties": false},
+                "strict": true,
+            }]}],
+            "input": [
+                {"type": "additional_tools", "role": "developer", "tools": [
+                    {"type": "tool_search", "execution": "client", "description": "Find tools by query.", "parameters": {
+                        "type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"], "additionalProperties": false,
+                    }},
+                    {"type": "namespace", "name": "calendar", "description": "Calendar tools.", "tools": [
+                        {"type": "function", "name": "lookup", "description": "LOOKUP_STALE", "parameters": {"type": "object", "properties": {"old_date": {"type": "string"}}}},
+                        {"type": "function", "name": "create", "description": "CREATE_RETAINED", "parameters": {"type": "object", "properties": {"title": {"type": "string"}}}},
+                    ]},
+                ]},
+                {"role": "user", "content": "Find calendar tools."},
+                {"type": "tool_search_call", "execution": "client", "call_id": "call_discovery", "status": "completed", "arguments": {"query": "calendar"}},
+                {"type": "tool_search_output", "execution": "client", "call_id": "call_discovery", "status": "completed", "tools": [{
+                    "type": "namespace", "name": "calendar", "description": "Calendar tools.", "tools": [
+                        {"type": "function", "name": "lookup", "description": "LOOKUP_SEARCH", "parameters": {"type": "object", "properties": {"search_date": {"type": "string"}}}},
+                        {"type": "function", "name": "get_timezone", "description": "TIMEZONE_STALE", "parameters": {"type": "object", "properties": {"old_zone": {"type": "string"}}}},
+                    ],
+                }]},
+                {"type": "additional_tools", "role": "developer", "tools": [{
+                    "type": "namespace", "name": "calendar", "description": "Calendar tools.", "tools": [
+                        {"type": "function", "name": "get_timezone", "description": "TIMEZONE_LATEST", "parameters": {"type": "object", "properties": {"zone": {"type": "string"}}}},
+                        {"type": "function", "name": "cancel", "description": "CANCEL_ADDED", "parameters": {"type": "object", "properties": {"event_id": {"type": "string"}}}},
+                    ],
+                }]},
+            ],
+        });
+        let chat = responses_request_to_chat("m", &body);
+        let tools = chat.extra.get("tools").and_then(Value::as_array).unwrap();
+        assert_eq!(tools.len(), 5);
+        assert_eq!(
+            tools
+                .iter()
+                .map(|tool| tool["function"]["name"].as_str().unwrap())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            5
+        );
+        for (description, property) in [
+            ("LOOKUP_CURRENT", "date"),
+            ("CREATE_RETAINED", "title"),
+            ("TIMEZONE_LATEST", "zone"),
+            ("CANCEL_ADDED", "event_id"),
+        ] {
+            let function = &tools
+                .iter()
+                .find(|tool| {
+                    tool["function"]["description"]
+                        .as_str()
+                        .is_some_and(|value| value.contains(description))
+                })
+                .unwrap()["function"];
+            assert!(function["parameters"]["properties"].get(property).is_some());
+        }
+        let lookup = tools
+            .iter()
+            .find(|tool| {
+                tool["function"]["parameters"]["properties"]
+                    .get("date")
+                    .is_some()
+            })
+            .unwrap();
+        assert_eq!(
+            lookup["function"]["parameters"],
+            body["tools"][0]["tools"][0]["parameters"]
+        );
+        assert_eq!(lookup["function"]["strict"], true);
+        assert_eq!(chat.extra.get("tool_choice"), Some(&json!("auto")));
+        let search = tools
+            .iter()
+            .find(|tool| {
+                tool["function"]["parameters"]["properties"]
+                    .get("query")
+                    .is_some()
+            })
+            .unwrap();
+        let replayed = chat
+            .messages
+            .iter()
+            .find(|message| message.role == Role::Assistant)
+            .unwrap();
+        assert_eq!(
+            replayed.extra["tool_calls"][0]["function"]["name"],
+            search["function"]["name"]
+        );
+        assert_eq!(replayed.extra["tool_calls"][0]["id"], "call_discovery");
+        let response = chat_response_with(
+            None,
+            Some(json!([{
+                "id": "call_discovery_again", "type": "function", "function": {
+                    "name": search["function"]["name"], "arguments": "{\"query\":\"calendar\"}",
+                },
+            }])),
+            FinishReason::ToolCalls,
+        );
+        let out = chat_response_to_responses_json(
+            &response,
+            "m",
+            1,
+            &ResponsesReplyContext::from_request(&body),
+        );
+        assert_eq!(out["output"][0]["type"], "tool_search_call");
+        assert_eq!(out["output"][0]["execution"], "client");
+        assert_eq!(out["output"][0]["call_id"], "call_discovery_again");
+        assert_eq!(out["output"][0]["arguments"], json!({"query": "calendar"}));
+    }
+
+    #[test]
+    fn additional_tools_hosted_credentials_never_become_model_input() {
+        let hosted = json!({
+            "type": "mcp", "server_label": "private", "server_url": "https://tools.example.test/mcp",
+            "authorization": "ADDITIONAL_HOSTED_AUTH_SENTINEL", "headers": {"x-key": "ADDITIONAL_HOSTED_HEADER_SENTINEL"},
+            "require_approval": "never",
+        });
+        let body = json!({
+            "input": [
+                {"type": "additional_tools", "role": "developer", "tools": [hosted.clone(), {
+                    "type": "function", "name": "read_note", "description": "Read a note.",
+                    "parameters": {"type": "object", "properties": {"id": {"type": "string"}}},
+                }, {
+                    "type": "tool_search", "execution": "client", "description": "Find tools.",
+                    "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+                }]},
+                {"role": "user", "content": "Find a calendar tool."},
+                {"type": "tool_search_call", "execution": "client", "call_id": "call_private_search", "status": "completed", "arguments": {"query": "calendar"}},
+                {"type": "tool_search_output", "execution": "client", "call_id": "call_private_search", "status": "completed", "tools": [hosted, {
+                    "type": "function", "name": "find_events", "description": "Find events.",
+                    "parameters": {"type": "object", "properties": {"date": {"type": "string"}}},
+                }]},
+            ],
+        });
+        let chat = responses_request_to_chat("m", &body);
+        let wire = serde_json::to_string(&chat).unwrap();
+        for secret in [
+            "ADDITIONAL_HOSTED_AUTH_SENTINEL",
+            "ADDITIONAL_HOSTED_HEADER_SENTINEL",
+        ] {
+            assert!(
+                !wire.contains(secret),
+                "hosted credentials became model input"
+            );
+        }
+        let tools = chat.extra.get("tools").and_then(Value::as_array).unwrap();
+        assert_eq!(tools.len(), 3);
+        for name in ["read_note", "find_events"] {
+            assert!(tools.iter().any(|tool| tool["function"]["name"] == name));
+        }
+        let result = chat
+            .messages
+            .iter()
+            .find(|message| message.role == Role::Tool)
+            .unwrap();
+        assert_eq!(result.tool_call_id.as_deref(), Some("call_private_search"));
+        let loaded: Value = serde_json::from_str(&result.content_str()).unwrap();
+        assert_eq!(loaded.as_array().unwrap().len(), 1);
+        assert_eq!(loaded[0]["name"], "find_events");
     }
 
     #[test]
