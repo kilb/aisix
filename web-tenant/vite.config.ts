@@ -1,12 +1,13 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
 
 /** The control plane's browser listener. The e2e stack passes its own. */
 const CP = process.env.CP_ORIGIN ?? "http://127.0.0.1:8090";
 const PROXY = { "/api": { target: CP, changeOrigin: true } };
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), tailwindcss()],
   // The portal's public path. Development and e2e serve it at the root; a
   // deployment that mounts it under a prefix builds with that prefix, and the
   // API prefix follows it (src/lib/api.ts).

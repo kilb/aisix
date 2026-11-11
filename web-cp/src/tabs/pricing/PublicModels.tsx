@@ -21,7 +21,6 @@ import { Field, useRefusalFocus } from "../../ui/Field";
 import { TwoStep } from "../../ui/TwoStep";
 import { useToast } from "../../ui/Toast";
 import { PublicModelDetail } from "./PublicModelDetail";
-import "./PublicModels.css";
 
 /** How many accounts serve a model, and at which priorities: `2 个（优先级 5、0）`. */
 function tiersOf(model: PublicModel): string {

@@ -36,7 +36,6 @@ import { GroupName } from "../ui/GroupName";
 import { Lamp, type LampState } from "../ui/Lamp";
 import { SidePanel } from "../ui/SidePanel";
 import { TwoStep } from "../ui/TwoStep";
-import "./Tenants.css";
 
 export const STATUS_LABEL: Record<Tenant["status"], string> = {
   pending: "待审核",

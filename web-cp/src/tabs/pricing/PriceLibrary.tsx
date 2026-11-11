@@ -15,7 +15,6 @@ import { useToast } from "../../ui/Toast";
 import { usdPerMillion } from "./Baselines";
 import { LibrarySync } from "./LibrarySync";
 import { CREDIT } from "./PricingImport";
-import "./PriceLibrary.css";
 
 /** How many entries one search lists. */
 const LISTED = 50;

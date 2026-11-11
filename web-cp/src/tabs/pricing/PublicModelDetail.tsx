@@ -8,7 +8,6 @@ import { DataTable } from "../../ui/DataTable";
 import { GroupList } from "../../ui/GroupName";
 import { useToast } from "../../ui/Toast";
 import { LibrarySyncOne } from "./LibrarySync";
-import "./PublicModels.css";
 
 /**
  * The accounts serving a model, as the routing document orders them: one

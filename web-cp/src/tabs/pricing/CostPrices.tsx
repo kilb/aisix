@@ -7,8 +7,6 @@ import { DataTable, Loading } from "../../ui/DataTable";
 import { EmptyState } from "../../ui/EmptyState";
 import { CostAccountDetail } from "./CostAccountDetail";
 import { scheduledWords } from "./GroupDetail";
-import "./Groups.css";
-import "./CostPrices.css";
 
 /**
  * 价格 · 成本价: every upstream account and its default cost rate, in CNY per

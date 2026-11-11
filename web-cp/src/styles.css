@@ -1,236 +1,28 @@
-/* The Dashboard's pages: the shell, page headings and the parts the P1b
-   pages share. Tokens are in theme/tokens.css, element defaults in
-   theme/base.css and the shared components in ui/ui.css; nothing here
-   defines a colour, font, radius or shadow of its own.
+/* The Dashboard's page parts that the pages' markup names by class: card
+   headings, hints, field rows, the overview's readings, credentials, chips,
+   targets, the login card. The shell itself is Tailwind classes in App.tsx.
+   Imported into the `legacy` layer (index.css), so a utility on an element
+   overrides anything here. */
 
-   The shell is two glass layers floating over the canvas: the rail on the
-   left (the brand and the sections, with the lens on the current one) and
-   the bar across the top (where this Dashboard is, the fleet's state, who
-   is signed in). Content is paper: panels with a hairline, tables left
-   aligned with numbers on the right, state as a lamp. */
-
-/* ── The shell: the rail, the top bar and the workspace ────────── */
-.shell {
-  display: grid;
-  grid-template-columns: 252px minmax(0, 1fr);
-  min-height: 100vh;
-}
-.shell-main {
-  min-width: 0;
-  padding: var(--s-3) var(--s-5) 0 var(--s-4);
-}
-
-/* The rail: glass, inset from the window's edges, as tall as the window. */
-.rail {
-  position: sticky;
-  top: var(--s-3);
-  align-self: start;
-  display: flex;
-  flex-direction: column;
-  gap: var(--s-5);
-  height: calc(100vh - 2 * var(--s-3));
-  margin: var(--s-3) 0 var(--s-3) var(--s-3);
-  padding: var(--s-5) var(--s-3) var(--s-4);
-  overflow-y: auto;
-  border: 1px solid var(--glass-border);
-  border-radius: var(--r-rail);
-  background: var(--glass);
-  box-shadow: var(--glass-edge), var(--shadow-glass);
-  -webkit-backdrop-filter: var(--glass-blur);
-  backdrop-filter: var(--glass-blur);
-  scrollbar-width: none;
-}
-.brand {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
-  align-items: center;
-  column-gap: var(--s-3);
-  padding: 0 var(--s-2);
-}
-/* The mark: an Ink tile holding a small lens. */
+/* Routio's mark: a near-black tile holding a short yellow capsule. */
 .brand-mark {
-  grid-row: span 2;
   position: relative;
-  width: 32px;
-  height: 32px;
-  border-radius: 10px;
+  flex: none;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
   background: var(--mark-tile);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12), var(--shadow-raise);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12);
 }
 .brand-mark::after {
   content: "";
   position: absolute;
   left: 7px;
   right: 7px;
-  top: 12px;
-  height: 8px;
-  border-radius: var(--r-round);
-  background: var(--sign);
-}
-.brand h1 {
-  font-size: var(--fs-16);
-  line-height: 1.2;
-  white-space: nowrap;
-}
-.brand-sub {
-  color: var(--text-muted);
-  font-size: var(--fs-12);
-  line-height: 1.4;
-}
-
-/* The top bar: glass, staying in view as the page scrolls under it. */
-.topbar {
-  position: sticky;
-  top: var(--s-3);
-  z-index: 15;
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--s-2) var(--s-5);
-  min-height: 52px;
-  padding: var(--s-2) var(--s-2) var(--s-2) var(--s-5);
-  border: 1px solid var(--glass-border);
-  border-radius: var(--r-panel);
-  background: var(--glass);
-  box-shadow: var(--glass-edge), var(--shadow-glass);
-  -webkit-backdrop-filter: var(--glass-blur);
-  backdrop-filter: var(--glass-blur);
-}
-.ctx {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--s-1) var(--s-4);
-  min-width: 0;
-  color: var(--text-2);
-  font-size: var(--fs-13);
-}
-.ctx > * + * {
-  padding-left: var(--s-4);
-  border-left: 1px solid var(--border);
-}
-.ctx code {
-  color: var(--text);
-}
-.fleet {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--s-2);
-  color: var(--text);
-  font-size: var(--fs-14);
-}
-.ctx-note {
-  color: var(--text-muted);
-  font-size: var(--fs-12);
-}
-.who {
-  display: flex;
-  align-items: center;
-  gap: var(--s-1);
-  margin-left: auto;
-  min-width: 0;
-  color: var(--text-2);
-}
-.who-name {
-  max-width: 240px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.who > .tag {
-  margin: 0 var(--s-2) 0 var(--s-1);
-}
-
-.workspace {
-  padding: var(--s-5) 0 var(--s-12);
-}
-/* Toasts rise beside the rail, not over it. */
-@media (min-width: 960px) {
-  .toasts {
-    left: calc(252px + var(--s-4));
-  }
-}
-/* A detail beside a list stays in view under the top bar. */
-@media (min-width: 1400px) {
-  .with-side.is-open > .side-panel {
-    top: 80px;
-    max-height: calc(100vh - 80px - var(--s-4));
-  }
-}
-
-/* Under 960px: no rail. The brand heads the page, the sections are the
-   floating bar along the bottom (ui.css), and the top bar is a plain row. */
-@media (max-width: 959px) {
-  .shell {
-    display: block;
-    /* Room for the navigation bar along the bottom. */
-    padding-bottom: 96px;
-  }
-  .rail {
-    position: static;
-    display: block;
-    height: auto;
-    margin: 0;
-    padding: var(--s-4) var(--s-4) 0;
-    overflow: visible;
-    border: 0;
-    border-radius: 0;
-    background: none;
-    box-shadow: none;
-    -webkit-backdrop-filter: none;
-    backdrop-filter: none;
-  }
-  .brand {
-    padding: 0;
-  }
-  .shell-main {
-    padding: var(--s-3) var(--s-3) 0;
-  }
-  .topbar {
-    position: static;
-  }
-}
-@media (max-width: 719px) {
-  .topbar {
-    padding: var(--s-3) var(--s-3) var(--s-3) var(--s-4);
-    gap: var(--s-2) var(--s-4);
-  }
-  /* Two rows: the fleet's lamp, then the operator and their buttons. The
-     environment id and the control plane's version are on 概览, so the
-     phone leaves them out, and with them the separators that would start
-     a wrapped line. */
-  .brand-sub,
-  .ctx > :not(.fleet) {
-    display: none;
-  }
-  .brand-mark {
-    grid-row: auto;
-  }
-  .ctx > * + * {
-    padding-left: 0;
-    border-left: 0;
-  }
-  .who {
-    margin-left: 0;
-    width: 100%;
-  }
-  .who-name {
-    max-width: 140px;
-  }
-  .workspace {
-    padding: var(--s-3) 0 var(--s-6);
-  }
-  .panel {
-    padding: var(--s-5) var(--s-4);
-  }
-  .panel > .dt-wrap {
-    --dt-edge: var(--s-4);
-    margin-left: calc(-1 * var(--s-4));
-    margin-right: calc(-1 * var(--s-4));
-  }
-  .panel > .dt-wrap:last-child {
-    margin-bottom: calc(-1 * var(--s-5));
-  }
+  top: 11px;
+  height: 6px;
+  border-radius: 9999px;
+  background: var(--brand);
 }
 
 /* ── A page's panels: the heading carries its actions ────────── */
@@ -240,8 +32,9 @@
   align-items: center;
   gap: var(--s-3) var(--s-4);
   min-width: 0;
-  font-size: var(--fs-20);
-  letter-spacing: -0.015em;
+  font-size: 18px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
 }
 .panel > h2 > .btn:first-of-type,
 .panel > h2 > .two-step:first-of-type {
@@ -260,8 +53,8 @@
   margin-top: var(--s-4);
 }
 .hint {
-  color: var(--text-2);
-  max-width: 72ch;
+  color: var(--muted-foreground);
+  max-width: 88ch;
 }
 .panel > .hint {
   margin-bottom: var(--s-4);
@@ -273,7 +66,7 @@
   color: var(--text);
 }
 .sub {
-  color: var(--text-muted);
+  color: var(--muted-foreground);
   font-size: var(--fs-13);
   line-height: var(--lh-table);
 }
@@ -297,15 +90,11 @@
 .r > .field > .field-problem {
   margin-top: var(--s-2);
 }
-/* Forms are single-column, at most 640px wide. */
-form.panel > :not(.note, h2),
+/* Forms read at most 960px wide; a row of fields sits side by side. */
+form.panel > :not(.note, h2, .dt-wrap, .targets),
 .panel > form,
 fieldset.tn-section > :not(.note, .dt-wrap, legend) {
-  max-width: 640px;
-}
-form.panel .r > .f,
-form.panel .r > .field {
-  flex-basis: 100%;
+  max-width: 960px;
 }
 /* Buttons at the end of a form or a part. */
 .panel p:has(> .btn),
@@ -397,52 +186,19 @@ code.lab {
 }
 
 /* ── Overview: the readings, then each problem as a list ─────── */
-.entries {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-  margin: var(--s-4) 0 0;
-  border-top: 1px solid var(--divider);
-  border-bottom: 1px solid var(--divider);
-}
-.entry {
-  display: flex;
-  flex-direction: column;
-  gap: var(--s-1);
-  padding: var(--s-4) var(--s-6) var(--s-4) 0;
-}
-.entry + .entry {
-  padding-left: var(--s-6);
-  border-left: 1px solid var(--divider);
-}
+/* The overview's readings: the figure large, its label and note small. */
 .entry .lab {
-  order: 0;
-  color: var(--text-2);
-  font-size: var(--fs-13);
-  font-weight: 550;
+  color: var(--muted-foreground);
+  font-size: 13px;
+  font-weight: 500;
 }
-/* An overview figure is a reading: heavy, wide and tight. */
 .entry .val {
-  order: 1;
-  margin: var(--s-1) 0;
-  font-size: var(--fs-32);
-  font-weight: 680;
-  font-stretch: var(--wide);
-  letter-spacing: -0.03em;
-  line-height: 1.05;
-  font-variant-numeric: tabular-nums lining-nums;
-}
-.entry .foot {
-  order: 2;
-  color: var(--text-muted);
-  font-size: var(--fs-13);
-  line-height: var(--lh-table);
-}
-@media (max-width: 719px) {
-  .entry + .entry {
-    padding-left: 0;
-    border-left: 0;
-    border-top: 1px solid var(--divider);
-  }
+  margin: 6px 0 4px;
+  font-size: 30px;
+  font-weight: 600;
+  letter-spacing: -0.04em;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
 }
 
 /* A list of problems inside a panel: one ruled row each. */
@@ -750,9 +506,7 @@ td select {
 .gate-form {
   margin: 0;
   padding: var(--s-8) var(--s-6) var(--s-6);
-  border-color: var(--glass-border);
-  border-radius: var(--r-rail);
-  box-shadow: var(--shadow-glass);
+  box-shadow: var(--shadow-sm);
 }
 .gate-form > .btn {
   width: 100%;
@@ -770,57 +524,50 @@ td select {
 }
 
 /* ── A tab made of sections: the switch above the open section ── */
-/* A segmented switch: the sections sit in a quiet well, and the open one
-   is a raised paper capsule. Yellow stays with the lens and the primary
-   action, so the switch never competes with either. */
+/* A tab of sections: Vercel's underline tabs across the page, the open
+   one in near-black with a 2px rule under it. */
 .sections-switch {
   display: flex;
-  flex-wrap: wrap;
-  gap: 2px;
-  width: fit-content;
-  max-width: 100%;
-  margin-bottom: var(--s-4);
-  padding: 3px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-round);
-  background: color-mix(in srgb, var(--surface) 55%, transparent);
+  gap: 4px;
+  margin: 0 0 24px;
+  overflow-x: auto;
+  border-bottom: 1px solid var(--border);
+  scrollbar-width: none;
 }
-.sections-switch > .btn {
-  --fg: var(--text-2);
-  height: 30px;
-  padding: 0 var(--s-4);
-  border-color: transparent;
-  background: transparent;
-  box-shadow: none;
-  font-weight: 550;
+.sections-switch > button {
+  position: relative;
+  flex: none;
+  height: 40px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 6px 6px 0 0;
+  background: none;
+  color: var(--muted-foreground);
+  font-size: 14px;
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: color 120ms ease;
 }
-.sections-switch > .btn:not([aria-pressed="true"]):hover {
-  --fg: var(--text);
-  border-color: transparent;
-  background: var(--hover);
+.sections-switch > button:hover {
+  color: var(--foreground);
 }
-.sections-switch > .btn[aria-pressed="true"] {
-  --fg: var(--text);
-  border-color: var(--control-border);
-  background: var(--surface-raised);
-  box-shadow: var(--shadow-raise);
-  font-weight: 650;
+.sections-switch > button[aria-pressed="true"] {
+  color: var(--foreground);
 }
-.sections-switch > .btn[aria-pressed="true"]:hover {
-  background: var(--surface-raised);
+.sections-switch > button[aria-pressed="true"]::after {
+  content: "";
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: -1px;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--foreground);
 }
-/* Inside a panel the well sits on paper, so it takes the well colour. */
+.sections-switch > button:focus-visible {
+  outline-offset: -2px;
+}
 .panel .sections-switch {
-  background: var(--well);
-}
-@media (max-width: 719px) {
-  .sections-switch {
-    flex-wrap: nowrap;
-    width: auto;
-    overflow-x: auto;
-    scrollbar-width: none;
-  }
-  .sections-switch > .btn {
-    flex: none;
-  }
+  margin-bottom: 16px;
 }

@@ -25,7 +25,6 @@ import { refusal, useLoad } from "../Tenants";
 import { FailModeNote } from "../../components/FailModeNote";
 import { CreditForm } from "./CreditForm";
 import { OrgQuota } from "./OrgQuota";
-import "./billing.css";
 
 /** What every region of the panel is given. */
 export interface RegionProps {

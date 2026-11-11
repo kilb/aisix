@@ -35,8 +35,6 @@ import { Field, useRefusalFocus } from "../../ui/Field";
 import { SidePanel } from "../../ui/SidePanel";
 import { useToast } from "../../ui/Toast";
 import { usdPerMillion } from "./Baselines";
-import "./PriceForms.css";
-import "./PricingImport.css";
 
 /**
  * The credit the dataset's authors ask for (its MIT licence, `LICENSE` beside
@@ -285,12 +283,12 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
           </h2>
           <p className="hint">{CREDIT}</p>
           <div className="sections-switch" role="group" aria-label="审核内容">
-            <Button size="sm" kind={view === "proposals" ? "primary" : "secondary"} aria-pressed={view === "proposals"} onClick={() => setView("proposals")}>
+            <button type="button" aria-pressed={view === "proposals"} onClick={() => setView("proposals")}>
               数据集提议
-            </Button>
-            <Button size="sm" kind={view === "updates" ? "primary" : "secondary"} aria-pressed={view === "updates"} onClick={() => setView("updates")}>
+            </button>
+            <button type="button" aria-pressed={view === "updates"} onClick={() => setView("updates")}>
               官方目录已更新（{updates.length}）
-            </Button>
+            </button>
           </div>
           {error && (
             <div className="note crit" role="alert">

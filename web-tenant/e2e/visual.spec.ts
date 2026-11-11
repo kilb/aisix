@@ -24,8 +24,8 @@ const OWNER = "owner@visual-7e4.test";
 const ORG = "Visual Org 7e4";
 
 /** The body's background in each theme: Canvas, and the dark page. */
-const LIGHT_BG = "rgb(238, 240, 244)";
-const DARK_BG = "rgb(12, 15, 21)";
+const LIGHT_BG = "rgb(250, 250, 250)";
+const DARK_BG = "rgb(10, 10, 10)";
 const PHONE = { width: 360, height: 780 };
 
 test.beforeAll(async () => {

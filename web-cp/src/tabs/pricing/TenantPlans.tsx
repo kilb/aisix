@@ -18,7 +18,6 @@ import { Loading } from "../../ui/DataTable";
 import { Field, useRefusalFocus } from "../../ui/Field";
 import { useToast } from "../../ui/Toast";
 import { discountBps, fmtPercent } from "../../lib/percent";
-import "./TenantPlans.css";
 
 export function TenantPlans({ canEdit }: TabProps) {
   const [list, setList] = useState<Tenant[] | null>(null);

@@ -11,8 +11,9 @@
 /* The designated default group, beside its display name. */
 .grp-default {
   margin-left: var(--s-2);
-  background: var(--sign);
-  color: var(--ink);
+  border-color: var(--primary);
+  background: var(--primary);
+  color: var(--primary-foreground);
 }
 
 /* A model's own rate, as opposed to the group's default. */

@@ -18,7 +18,6 @@ import { DataTable, Loading } from "./ui/DataTable";
 import { EmptyState } from "./ui/EmptyState";
 import { Field } from "./ui/Field";
 import { Lamp } from "./ui/Lamp";
-import "./usage.css";
 
 function failure(e: unknown): string {
   return e instanceof ApiError ? messageFor(e) : String(e);

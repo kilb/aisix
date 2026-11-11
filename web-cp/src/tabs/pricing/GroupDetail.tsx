@@ -22,7 +22,6 @@ import { EmptyState } from "../../ui/EmptyState";
 import { Field, useRefusalFocus } from "../../ui/Field";
 import { TwoStep } from "../../ui/TwoStep";
 import { useToast } from "../../ui/Toast";
-import "./Groups.css";
 
 /** How far back the margin is measured. */
 const MARGIN_DAYS = 30;

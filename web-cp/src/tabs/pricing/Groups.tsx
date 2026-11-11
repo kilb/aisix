@@ -12,7 +12,6 @@ import { Field, useRefusalFocus } from "../../ui/Field";
 import { TwoStep } from "../../ui/TwoStep";
 import { useToast } from "../../ui/Toast";
 import { GroupDetail } from "./GroupDetail";
-import "./Groups.css";
 
 /** What the operator reads for each count a refusal carries, in the order the page shows them. */
 const COUNT_WORDS: [keyof GroupUseCounts, string][] = [

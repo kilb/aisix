@@ -5,6 +5,7 @@ import { environment, pricingStatus, rollout, type Environment, type PricingStat
 import { errorText, fmtInt } from "../lib/fmt";
 import { statusView } from "../lib/pricingStatus";
 import { Button } from "../ui/Button";
+import { CardHeader, PageHeader } from "../components/page";
 import { Loading } from "../ui/DataTable";
 import { Lamp } from "../ui/Lamp";
 import { TwoStep } from "../ui/TwoStep";
@@ -125,39 +126,32 @@ export function Overview({ operator, onGoto }: TabProps) {
   const blocked = s?.projection_blocked;
   return (
     <>
-      <div className="panel">
-        <h2>运行概况</h2>
-        {envError ? (
-          <div className="note crit" role="alert">
-            读取环境信息失败：{envError}
-          </div>
-        ) : (
-          <p className="hint">
-            环境 <code>{env?.env_id ?? "…"}</code> · 控制面版本 <code>{env?.cp_version ?? "…"}</code>
-          </p>
-        )}
-        {error && (
-          <div className="note crit" role="alert">
-            读取失败：{error}
-          </div>
-        )}
-        <div className="entries">
-          <div className="entry">
-            <span className="lab">在线网关</span>
-            <span className="val">{s ? fmtInt(s.online_instances) : "…"}</span>
-            <span className="foot">近期发过心跳的网关实例</span>
-          </div>
-          <div className="entry">
-            <span className="lab">待下发</span>
-            <span className="val">{s ? fmtInt(s.pending) : "…"}</span>
-            <span className="foot">已保存、尚未写入 kine 的资源</span>
-          </div>
-          <div className="entry">
-            <span className="lab">下发中</span>
-            <span className="val">{s ? fmtInt(s.propagating) : "…"}</span>
-            <span className="foot">已写入 kine、还有在线网关没有应用的资源</span>
-          </div>
+      <PageHeader
+        title="运行概况"
+        description={
+          envError ? undefined : (
+            <>
+              环境 <code>{env?.env_id ?? "…"}</code> · 控制面版本 <code>{env?.cp_version ?? "…"}</code>
+            </>
+          )
+        }
+      />
+      {envError && (
+        <div className="note crit" role="alert">
+          读取环境信息失败：{envError}
         </div>
+      )}
+      {error && (
+        <div className="note crit" role="alert">
+          读取失败：{error}
+        </div>
+      )}
+      <div className="entries mb-6 grid gap-4 sm:grid-cols-3">
+        <Reading label="在线网关" value={s ? fmtInt(s.online_instances) : "…"} foot="近期发过心跳的网关实例" />
+        <Reading label="待下发" value={s ? fmtInt(s.pending) : "…"} foot="已保存、尚未写入 kine 的资源" />
+        <Reading label="下发中" value={s ? fmtInt(s.propagating) : "…"} foot="已写入 kine、还有在线网关没有应用的资源" />
+      </div>
+      <div>
         <Msg note={note} />
 
         {blocked && (
@@ -229,9 +223,23 @@ export function Overview({ operator, onGoto }: TabProps) {
         )}
       </div>
 
-      <div className="panel" role="region" aria-label="计价异常">
-        <h2>计价异常</h2>
-        <p className="hint">最近 24 小时没能计价的调用，以及计价引擎不能使用的价格版本。</p>
+      <div className="grid items-start gap-4 xl:grid-cols-3">
+      <div className="panel mb-0" role="region" aria-label="计价异常">
+        <CardHeader
+          as="h2"
+          title="计价异常"
+          description="最近 24 小时没能计价的调用，以及计价引擎不能使用的价格版本。"
+          actions={
+            <Button
+              size="sm"
+              onClick={() => {
+                onGoto("pricing", "status");
+              }}
+            >
+              去「价格 · 计价状态」
+            </Button>
+          }
+        />
         {pricingError && (
           <div className="note crit" role="alert">
             读取计价状态失败：{pricingError}
@@ -242,31 +250,14 @@ export function Overview({ operator, onGoto }: TabProps) {
             有调用没能计价或有价格版本不可用，请查看计价状态。
           </div>
         )}
-        <div className="entries">
-          <div className="entry">
-            <span className="lab">未计价调用</span>
-            <span className="val">{pricingView ? fmtInt(pricingView.unpricedTotal) : "…"}</span>
-            <span className="foot">最近 24 小时</span>
-          </div>
-          <div className="entry">
-            <span className="lab">不可用的价格版本</span>
-            <span className="val">{pricingView ? fmtInt(pricingView.invalid.length) : "…"}</span>
-            <span className="foot">计价引擎跳过的版本</span>
-          </div>
+        <div className="entries grid grid-cols-2 gap-3">
+          <Reading inset label="未计价调用" value={pricingView ? fmtInt(pricingView.unpricedTotal) : "…"} foot="最近 24 小时" />
+          <Reading inset label="不可用的价格版本" value={pricingView ? fmtInt(pricingView.invalid.length) : "…"} foot="计价引擎跳过的版本" />
         </div>
-        <Button
-          size="sm"
-          onClick={() => {
-            onGoto("pricing", "status");
-          }}
-        >
-          去「价格 · 计价状态」
-        </Button>
       </div>
 
-      <div className="panel">
-        <h2>被拒绝的资源</h2>
-        <p className="hint">网关加载时拒绝了这些资源，它们没有生效。原因由网关给出。</p>
+      <div className="panel mb-0">
+        <CardHeader as="h2" title="被拒绝的资源" description="网关加载时拒绝了这些资源，它们没有生效。原因由网关给出。" />
         {s === null ? (
           !error && <Loading />
         ) : s.rejected.length === 0 ? (
@@ -297,9 +288,8 @@ export function Overview({ operator, onGoto }: TabProps) {
         )}
       </div>
 
-      <div className="panel">
-        <h2>部分兼容</h2>
-        <p className="hint">网关加载了这些资源，但忽略了其中的部分字段。</p>
+      <div className="panel mb-0">
+        <CardHeader as="h2" title="部分兼容" description="网关加载了这些资源，但忽略了其中的部分字段。" />
         {s === null ? (
           !error && <Loading />
         ) : s.partially_compatible.length === 0 ? (
@@ -317,6 +307,24 @@ export function Overview({ operator, onGoto }: TabProps) {
           </ul>
         )}
       </div>
+      </div>
     </>
+  );
+}
+
+/** One figure of the overview: its label, the number, and what it counts. */
+function Reading({ label, value, foot, inset = false }: { label: string; value: string; foot: string; inset?: boolean }) {
+  return (
+    <div
+      className={
+        inset
+          ? "entry flex flex-col rounded-lg border border-border bg-muted/50 p-4"
+          : "entry flex flex-col rounded-xl border border-border bg-card p-5 shadow-xs"
+      }
+    >
+      <span className="lab">{label}</span>
+      <span className={inset ? "val !text-2xl" : "val"}>{value}</span>
+      <span className="foot text-[13px] text-muted-foreground">{foot}</span>
+    </div>
   );
 }

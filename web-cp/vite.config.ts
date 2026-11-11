@@ -1,5 +1,6 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
 
 /** The control plane's browser listener. The e2e stack passes its own. */
 const CP = process.env.CP_ORIGIN ?? "http://127.0.0.1:8090";
@@ -9,7 +10,7 @@ const PROXY = {
 };
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), tailwindcss()],
   build: {
     outDir: "dist",
     emptyOutDir: true,

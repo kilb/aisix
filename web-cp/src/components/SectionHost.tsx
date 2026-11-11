@@ -1,7 +1,6 @@
 import { useEffect, useState, type ComponentType } from "react";
 import type { TabProps } from "../App";
 import type { OperatorRole } from "../lib/api";
-import { Button } from "../ui/Button";
 import { EmptyState } from "../ui/EmptyState";
 
 /** One section of a tab that holds several: a page of its own, shown to operators of `minRole` and above. */
@@ -53,15 +52,9 @@ export function SectionHost({
       {shown.length > 1 && (
         <div className="sections-switch" role="group" aria-label={`${label}分区`}>
           {shown.map((s) => (
-            <Button
-              key={s.id}
-              size="sm"
-              kind={s.id === current.id ? "primary" : "secondary"}
-              aria-pressed={s.id === current.id}
-              onClick={() => setOpen(s.id)}
-            >
+            <button key={s.id} type="button" aria-pressed={s.id === current.id} onClick={() => setOpen(s.id)}>
               {s.label}
-            </Button>
+            </button>
           ))}
         </div>
       )}

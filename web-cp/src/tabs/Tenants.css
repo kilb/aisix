@@ -9,7 +9,7 @@
   background: var(--row-hover);
 }
 .dt tr:has(.tn-name[aria-expanded="true"]) > td:first-child {
-  box-shadow: inset 4px 0 0 var(--sign);
+  box-shadow: inset 2px 0 0 var(--primary);
 }
 .tn-mark {
   margin-left: var(--s-2);

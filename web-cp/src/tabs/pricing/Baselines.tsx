@@ -30,8 +30,6 @@ import { Field, useRefusalFocus } from "../../ui/Field";
 import { SidePanel } from "../../ui/SidePanel";
 import { useToast } from "../../ui/Toast";
 import { CardLines, LibrarySyncOne } from "./LibrarySync";
-import "./PriceForms.css";
-import "./Baselines.css";
 
 /** The rates of a baseline's `default` tier, when the card has both. */
 function headline(card: RateCard | null): { input: string; output: string } | null {

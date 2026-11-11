@@ -47,7 +47,7 @@
   background: var(--row-hover);
 }
 .dt tr:has(.bl-name[aria-expanded="true"]) > td:first-child {
-  box-shadow: inset 4px 0 0 var(--sign);
+  box-shadow: inset 2px 0 0 var(--primary);
 }
 .bl-name {
   max-width: var(--trunc, 200px);

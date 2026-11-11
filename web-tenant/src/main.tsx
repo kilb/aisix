@@ -2,10 +2,7 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App";
 import { ToastProvider } from "./ui/Toast";
-import "./theme/tokens.css";
-import "./theme/base.css";
-import "./ui/ui.css";
-import "./styles.css";
+import "./index.css";
 
 /**
  * The invitation token, if the page was opened from an invitation link

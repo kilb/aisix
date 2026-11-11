@@ -1,0 +1,82 @@
+/* The app's one stylesheet entry. Tailwind (with shadcn/ui's theme mapped
+   onto tokens.css) is the styling system; the stylesheets written before it
+   sit in their own `legacy` layer, between Tailwind's base and its
+   utilities, so a utility class on an element always wins over them. */
+@layer theme, base, legacy, components, utilities;
+
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "./theme/tokens.css";
+@import "./theme/base.css" layer(base);
+@import "./ui/ui.css" layer(legacy);
+@import "./styles.css" layer(legacy);
+@import "./Styleguide.css" layer(legacy);
+@import "./tabs/Tenants.css" layer(legacy);
+@import "./tabs/billing/billing.css" layer(legacy);
+@import "./tabs/pricing/Baselines.css" layer(legacy);
+@import "./tabs/pricing/CostPrices.css" layer(legacy);
+@import "./tabs/pricing/Groups.css" layer(legacy);
+@import "./tabs/pricing/PriceForms.css" layer(legacy);
+@import "./tabs/pricing/PriceLibrary.css" layer(legacy);
+@import "./tabs/pricing/PricingImport.css" layer(legacy);
+@import "./tabs/pricing/PublicModels.css" layer(legacy);
+@import "./tabs/pricing/TenantPlans.css" layer(legacy);
+@import "./tabs/providers/ChannelModels.css" layer(legacy);
+
+
+/* Dark is a choice the viewer makes with the toggle (<html data-theme>),
+   never the system setting. */
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-info: var(--info);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-danger: var(--danger);
+  --color-info-soft: var(--info-soft);
+  --color-success-soft: var(--success-soft);
+  --color-warning-soft: var(--warning-soft);
+  --color-danger-soft: var(--danger-soft);
+  --color-brand: var(--brand);
+  --color-brand-ink: var(--brand-ink);
+  --color-text-2: var(--text-2);
+  --color-divider: var(--divider);
+  --font-sans: var(--font-sans);
+  --font-mono: var(--font-mono);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --shadow-xs: var(--shadow-xs);
+  --shadow-sm: var(--shadow-sm);
+  --shadow-float: var(--shadow-float);
+}
+
+@layer base {
+  * {
+    border-color: var(--border);
+  }
+}

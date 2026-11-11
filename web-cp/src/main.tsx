@@ -1,10 +1,7 @@
 import { StrictMode, lazy, Suspense } from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App";
-import "./theme/tokens.css";
-import "./theme/base.css";
-import "./ui/ui.css";
-import "./styles.css";
+import "./index.css";
 import { ToastProvider } from "./ui/Toast";
 
 const root = document.getElementById("root");

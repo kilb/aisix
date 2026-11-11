@@ -27,7 +27,6 @@ import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
 import { EmptyState } from "../../ui/EmptyState";
 import { useToast } from "../../ui/Toast";
-import "./PriceLibrary.css";
 
 /** The attestation's own words: the checkbox's text, as the import's confirmation gives it. */
 const ATTESTATION = "已对照官方价格页核对";

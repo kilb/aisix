@@ -22,6 +22,22 @@ import { ChangePassword } from "./components/ChangePassword";
 import { Button } from "./ui/Button";
 import { Lamp, type LampState } from "./ui/Lamp";
 import { RouteNav } from "./ui/RouteNav";
+import {
+  Braces,
+  Building2,
+  DatabaseZap,
+  KeyRound,
+  LayoutDashboard,
+  Moon,
+  Plug,
+  ScrollText,
+  Server,
+  ShieldUser,
+  Sun,
+  Tag,
+  Wallet,
+  Waypoints,
+} from "lucide-react";
 import { Gate } from "./Gate";
 import { Audit } from "./tabs/Audit";
 import { Cache } from "./tabs/Cache";
@@ -37,18 +53,18 @@ import { Resources } from "./tabs/Resources";
 import { Tenants } from "./tabs/Tenants";
 
 const TABS = [
-  { id: "overview", label: "概览" },
-  { id: "gateways", label: "网关" },
-  { id: "providers", label: "上游账号" },
-  { id: "models", label: "模型与路由" },
-  { id: "pricing", label: "价格" },
-  { id: "tenants", label: "租户" },
-  { id: "billing", label: "计费" },
-  { id: "keys", label: "密钥" },
-  { id: "cache", label: "缓存策略" },
-  { id: "resources", label: "全部资源" },
-  { id: "operators", label: "运维账号", adminOnly: true },
-  { id: "audit", label: "审计日志" },
+  { id: "overview", label: "概览", icon: LayoutDashboard },
+  { id: "gateways", label: "网关", icon: Server },
+  { id: "providers", label: "上游账号", icon: Plug },
+  { id: "models", label: "模型与路由", icon: Waypoints },
+  { id: "pricing", label: "价格", icon: Tag },
+  { id: "tenants", label: "租户", icon: Building2 },
+  { id: "billing", label: "计费", icon: Wallet },
+  { id: "keys", label: "密钥", icon: KeyRound },
+  { id: "cache", label: "缓存策略", icon: DatabaseZap },
+  { id: "resources", label: "全部资源", icon: Braces },
+  { id: "operators", label: "运维账号", icon: ShieldUser, adminOnly: true },
+  { id: "audit", label: "审计日志", icon: ScrollText },
 ] as const;
 
 export type TabId = (typeof TABS)[number]["id"];
@@ -354,44 +370,67 @@ export function App() {
   }
   const fleet = shell.summary && fleetLamp(shell.summary);
 
+  const here = visible.find((t) => t.id === current);
   return (
-    <div className="shell">
-      <aside className="rail">
-        <div className="brand">
+    <div className="shell flex min-h-screen">
+      {/* The sidebar from 1024px. Below it the aside's box goes away: the
+          brand and the operator move to the top bar's row, and the sections
+          become the bar along the bottom (RouteNav). */}
+      <aside className="rail flex w-60 shrink-0 flex-col border-r border-sidebar-border bg-sidebar max-lg:contents lg:sticky lg:top-0 lg:h-screen">
+        <div className="brand flex h-14 shrink-0 items-center gap-2.5 px-4 max-lg:hidden">
           <span className="brand-mark" aria-hidden="true" />
-          <h1 className="display">Routio 运维台</h1>
-          <span className="brand-sub">控制面</span>
+          <h1 className="display text-[15px] font-semibold tracking-tight">Routio 运维台</h1>
+          <span className="brand-sub vh">控制面</span>
         </div>
-        <RouteNav items={visible} current={current} attention={attention} label="Dashboard 分区" onSelect={(t) => setTab(t)} />
-      </aside>
-
-      <div className="shell-main">
-        <header className="topbar">
-          {(shell.env || fleet) && (
-            <div className="ctx">
-              {shell.env && (
-                <>
-                  <span>
-                    环境 <code>{shell.env.env_id}</code>
-                  </span>
-                  <span>控制面 {shell.env.cp_version}</span>
-                </>
-              )}
-              {fleet && shell.summary && (
-                <span className="fleet">
-                  <Lamp state={fleet.state} title="配置下发状态">
-                    {fleet.text}
-                  </Lamp>
-                  <span className="ctx-note">在线网关 {fmtInt(shell.summary.online_instances)}</span>
-                </span>
-              )}
-            </div>
-          )}
-          <div className="who">
-            <span className="who-name" title={operator.email}>
+        <div className="flex-1 overflow-y-auto px-3 pb-3 max-lg:contents">
+          <RouteNav items={visible} current={current} attention={attention} label="Dashboard 分区" onSelect={(t) => setTab(t)} />
+        </div>
+        <div className="who flex shrink-0 items-center gap-2.5 border-t border-sidebar-border px-4 py-3 max-lg:hidden">
+          <span
+            aria-hidden="true"
+            className="grid size-8 shrink-0 place-items-center rounded-full bg-sidebar-accent text-xs font-semibold text-foreground uppercase"
+          >
+            {(operator.display_name || operator.email).slice(0, 1)}
+          </span>
+          <span className="min-w-0 flex-1 leading-tight">
+            <span className="who-name block truncate text-sm font-medium" title={operator.email}>
               {operator.display_name || operator.email}
             </span>
-            <span className="tag">{ROLE_LABEL[operator.role]}</span>
+            <span className="tag mt-1">{ROLE_LABEL[operator.role]}</span>
+          </span>
+        </div>
+      </aside>
+
+      <div className="shell-main min-w-0 flex-1">
+        <header className="topbar sticky top-0 z-30 flex h-14 items-center gap-3 border-b border-border bg-background/85 px-4 backdrop-blur sm:px-6 lg:px-8">
+          <span className="brand-mark lg:hidden" aria-hidden="true" />
+          <nav aria-label="位置" className="flex min-w-0 items-center gap-1.5 text-sm">
+            <span className="text-muted-foreground max-sm:hidden">运维台</span>
+            <span className="text-muted-foreground/60 max-sm:hidden" aria-hidden="true">
+              /
+            </span>
+            <span className="truncate font-medium">{here?.label}</span>
+          </nav>
+          <div className="ctx ml-auto flex min-w-0 items-center gap-2">
+            {shell.env && (
+              <span className="hidden items-center gap-2 rounded-md border border-border bg-card px-2.5 py-1 text-xs text-muted-foreground xl:inline-flex">
+                <span>
+                  环境 <code className="text-foreground">{shell.env.env_id}</code>
+                </span>
+                <span className="h-3 w-px bg-border" aria-hidden="true" />
+                <span>控制面 {shell.env.cp_version}</span>
+              </span>
+            )}
+            {fleet && shell.summary && (
+              <span className="fleet inline-flex items-center gap-2 rounded-md border border-border bg-card px-2.5 py-1 text-xs">
+                <Lamp state={fleet.state} title="配置下发状态">
+                  {fleet.text}
+                </Lamp>
+                <span className="ctx-note text-muted-foreground max-sm:hidden">在线网关 {fmtInt(shell.summary.online_instances)}</span>
+              </span>
+            )}
+          </div>
+          <div className="flex shrink-0 items-center gap-1">
             <Button
               kind="quiet"
               size="sm"
@@ -399,7 +438,8 @@ export function App() {
               aria-label={theme === "dark" ? "切换到浅色" : "切换到深色"}
               title={theme === "dark" ? "切换到浅色" : "切换到深色"}
             >
-              {theme === "dark" ? "浅色" : "深色"}
+              {theme === "dark" ? <Sun aria-hidden /> : <Moon aria-hidden />}
+              <span className="max-sm:hidden">{theme === "dark" ? "浅色" : "深色"}</span>
             </Button>
             <Button kind="quiet" size="sm" aria-expanded={passwordOpen} onClick={() => setPasswordOpen((o) => !o)}>
               修改口令
@@ -410,7 +450,7 @@ export function App() {
           </div>
         </header>
 
-        <div className="workspace">
+        <div className="workspace mx-auto w-full max-w-[1760px] px-4 pt-6 pb-24 sm:px-6 lg:px-8 lg:pt-8 lg:pb-12">
           {passwordOpen && <ChangePassword onClose={() => setPasswordOpen(false)} />}
 
           {signOutError && (

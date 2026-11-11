@@ -38,7 +38,6 @@ import { EmptyState } from "../ui/EmptyState";
 import { TwoStep } from "../ui/TwoStep";
 import { UpstreamModelPicker } from "../ui/UpstreamModelPicker";
 // The upstream-name field's own styles live with the account page that introduced it.
-import "./providers/ChannelModels.css";
 
 /** One routing target; fields this page does not edit (such as `tags`) are kept as stored. */
 interface Target {

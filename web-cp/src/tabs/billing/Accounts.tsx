@@ -7,7 +7,6 @@ import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
 import { EmptyState } from "../../ui/EmptyState";
 import { AccountPanel, AccountState, MODE_LABEL } from "./AccountPanel";
-import "./billing.css";
 
 /** 账户: every tenant's balance and credit limit, and one tenant's billing in a side panel. */
 export function Accounts({ canEdit, operator, onGoto }: TabProps) {

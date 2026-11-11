@@ -19,7 +19,6 @@ import { Field, useRefusalFocus } from "../../ui/Field";
 import { TwoStep } from "../../ui/TwoStep";
 import { useToast } from "../../ui/Toast";
 import { inForce, isZeroRate, scheduledWords } from "./GroupDetail";
-import "./Groups.css";
 
 /**
  * One upstream account's cost rates, as a group's detail shows its rates:

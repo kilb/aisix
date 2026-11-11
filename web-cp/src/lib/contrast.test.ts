@@ -6,40 +6,56 @@ import { contrastRatio, readTokens } from "./contrast.ts";
 // `npm run test:unit`. The token file is read as shipped, so a colour edit
 // that breaks AA fails here before any page is looked at.
 
+// Every text pair the pages draw, in both themes, at AA (4.5:1).
 test("令牌配色在两种主题下都达到 AA 对比度", () => {
-  const css = readFileSync(new URL("../theme/tokens.css", import.meta.url), "utf8");
-  const L = readTokens(css, "light"), D = readTokens(css, "dark");
-  // text pairs ≥ 4.5
-  for (const [fg, bg] of [["--ink", "--paper"], ["--ink", "--canvas"], ["--ink", "--sign"], ["--n2", "--paper"],
-                          ["--n2", "--canvas"], ["--line", "--paper"], ["--stop", "--paper"]] as [string, string][])
-    assert.ok(contrastRatio(L[fg]!, L[bg]!) >= 4.5, `${fg} on ${bg}`);
-  for (const [fg, bg] of [["--text", "--bg"], ["--text", "--surface"], ["--text-muted", "--surface"],
-                          ["--line", "--surface"], ["--stop", "--surface"]] as [string, string][])
-    assert.ok(contrastRatio(D[fg]!, D[bg]!) >= 4.5, `dark ${fg} on ${bg}`);
-  // non-text pairs (lamps, focus ring, input borders) ≥ 3
-  for (const [fg, bg] of [["--proceed", "--paper"], ["--line", "--paper"], ["--input-border", "--paper"]] as [string, string][])
-    assert.ok(contrastRatio(L[fg]!, L[bg]!) >= 3, `${fg} on ${bg}`);
-  assert.ok(contrastRatio(D["--proceed"]!, D["--surface"]!) >= 3);
-});
-
-// Red and blue text also sits on a hovered row and on the selected row,
-// both --row-hover, and on the page itself (--bg), not only on a panel.
-test("错误文字与链接在悬停行、选中行与页面底色上也达到 AA", () => {
   const css = readFileSync(new URL("../theme/tokens.css", import.meta.url), "utf8");
   for (const theme of ["light", "dark"] as const) {
     const T = readTokens(css, theme);
-    for (const [fg, bg] of [["--error", "--surface"], ["--error", "--row-hover"], ["--error", "--bg"],
-                            ["--link", "--surface"], ["--link", "--row-hover"], ["--link", "--bg"]] as [string, string][])
+    const pairs: [string, string][] = [
+      ["--foreground", "--background"],
+      ["--foreground", "--card"],
+      ["--foreground", "--muted"],
+      ["--foreground", "--secondary"],
+      ["--card-foreground", "--card"],
+      ["--popover-foreground", "--popover"],
+      ["--primary-foreground", "--primary"],
+      ["--destructive-foreground", "--destructive"],
+      ["--muted-foreground", "--background"],
+      ["--muted-foreground", "--card"],
+      ["--muted-foreground", "--muted"],
+      ["--text-2", "--card"],
+      ["--tooltip-text", "--tooltip-bg"],
+    ];
+    for (const [fg, bg] of pairs)
       assert.ok(contrastRatio(T[fg]!, T[bg]!) >= 4.5, `${theme} ${fg} on ${bg}: ${contrastRatio(T[fg]!, T[bg]!).toFixed(2)}`);
   }
 });
 
-test("线路色条与输入框边在两种主题的面板上都达到 3:1", () => {
+// State colours are text too: on a panel, on the page, on a hovered row and
+// on their own soft fill (a badge, a note).
+test("状态色文字在面板、页面、悬停行和自己的浅底上都达到 AA", () => {
   const css = readFileSync(new URL("../theme/tokens.css", import.meta.url), "utf8");
   for (const theme of ["light", "dark"] as const) {
     const T = readTokens(css, theme);
-    for (const fg of ["--route-1", "--route-2", "--route-3", "--route-4", "--route-5", "--route-6", "--input-border", "--box-border"])
-      assert.ok(contrastRatio(T[fg]!, T["--surface"]!) >= 3, `${theme} ${fg} on --surface`);
+    for (const fg of ["--info", "--success", "--warning", "--danger", "--link", "--error"])
+      for (const bg of ["--card", "--background", "--row-hover"])
+        assert.ok(contrastRatio(T[fg]!, T[bg]!) >= 4.5, `${theme} ${fg} on ${bg}: ${contrastRatio(T[fg]!, T[bg]!).toFixed(2)}`);
+    for (const k of ["info", "success", "warning", "danger"])
+      assert.ok(
+        contrastRatio(T[`--${k}`]!, T[`--${k}-soft`]!) >= 4.5,
+        `${theme} --${k} on --${k}-soft: ${contrastRatio(T[`--${k}`]!, T[`--${k}-soft`]!).toFixed(2)}`,
+      );
+  }
+});
+
+// Non-text: a field's edge, the focus ring and the group bars need 3:1.
+test("输入框边、焦点环与分组色条在两种主题的面板上都达到 3:1", () => {
+  const css = readFileSync(new URL("../theme/tokens.css", import.meta.url), "utf8");
+  for (const theme of ["light", "dark"] as const) {
+    const T = readTokens(css, theme);
+    for (const fg of ["--input", "--ring", "--route-1", "--route-2", "--route-3", "--route-4", "--route-5", "--route-6"])
+      for (const bg of ["--card", "--background"])
+        assert.ok(contrastRatio(T[fg]!, T[bg]!) >= 3, `${theme} ${fg} on ${bg}: ${contrastRatio(T[fg]!, T[bg]!).toFixed(2)}`);
   }
 });
 

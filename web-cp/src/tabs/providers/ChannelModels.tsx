@@ -20,7 +20,6 @@ import { TwoStep } from "../../ui/TwoStep";
 import { UpstreamModelPicker } from "../../ui/UpstreamModelPicker";
 import { upstreamNameProblem } from "../../lib/upstreamName";
 import { FetchUpstream } from "./FetchUpstream";
-import "./ChannelModels.css";
 
 /** The largest weight the control plane takes, as its own `channel_models` check does. */
 const MAX_WEIGHT = 65_535;
