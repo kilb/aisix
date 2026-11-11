@@ -32,6 +32,59 @@ use crate::auth::AuthenticatedKey;
 use crate::error::ProxyError;
 use crate::state::ProxyState;
 
+/// Charges what a cancelled request's in-flight attempt had already been
+/// served to that attempt's token limits.
+///
+/// A multi-call operation (Titan embeds one text per upstream call) notes the
+/// input its answered calls reported through
+/// `aisix_gateway::note_served_input_tokens`, and the failure path commits it
+/// when the attempt FAILS. A caller that hangs up first drops the handler
+/// future instead, so that commit never runs: the usage row still bills what
+/// the upstream charged (the cancel path reads the same note), but the
+/// request's TPM/TPD counters never see it, and the next request spends a
+/// window the cancelled one had already used up (#R-109).
+///
+/// The note is cleared by whoever consumes it — the success path at the end
+/// of the operation, the failure path in its error arm — so at drop time it
+/// holds a value exactly when nobody else took it, which is the cancellation
+/// this guard exists for. `keys` are the layers of the reservation this
+/// guard stands for; each layer is charged on its own reservation's keys, so
+/// a request-level guard and a routing member's guard never charge the same
+/// bucket twice.
+pub(crate) struct ServedTokensHold {
+    limiter: std::sync::Arc<aisix_ratelimit::Limiter>,
+    keys: Vec<String>,
+}
+
+impl ServedTokensHold {
+    /// Hold `keys` for the lifetime of the returned value: whatever the
+    /// upstreams served while it lives is charged to them if the request is
+    /// cancelled first.
+    pub(crate) fn new(
+        limiter: &std::sync::Arc<aisix_ratelimit::Limiter>,
+        keys: Vec<String>,
+    ) -> Self {
+        Self {
+            limiter: std::sync::Arc::clone(limiter),
+            keys,
+        }
+    }
+
+    /// Hold the layers of `reservation`.
+    pub(crate) fn of(state: &ProxyState, reservation: &MultiReservation) -> Self {
+        Self::new(&state.limiter, reservation.keys())
+    }
+}
+
+impl Drop for ServedTokensHold {
+    fn drop(&mut self) {
+        if let Some(tokens) = aisix_gateway::served_input_tokens() {
+            self.limiter
+                .add_tokens_post_stream_all(&self.keys, u64::from(tokens));
+        }
+    }
+}
+
 /// Optional model rate-limit info resolved by the caller before enforce.
 pub(crate) struct ModelRateLimit {
     pub name: String,
@@ -931,6 +984,54 @@ pub(crate) fn retry_after_of(err: &ProxyError) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a multi-call attempt was served is charged to the layers the hold
+    /// stands for when the request is cancelled, and to nothing when the
+    /// operation consumed the note itself (a whole answer, or a failure that
+    /// commits it) — the value is taken by whoever settles.
+    #[tokio::test]
+    async fn a_cancelled_attempts_served_tokens_are_charged_to_its_layers() {
+        let limiter = std::sync::Arc::new(aisix_ratelimit::Limiter::local_with_clock(
+            aisix_ratelimit::TestClock::new(1_000),
+        ));
+        let limits = aisix_core::RateLimit {
+            tpm: Some(100),
+            ..Default::default()
+        };
+        let keys = vec!["api_key:k1".to_string(), "model:m1".to_string()];
+
+        let served = |tokens: u32, consume: bool| {
+            let limiter = std::sync::Arc::clone(&limiter);
+            let keys = keys.clone();
+            aisix_gateway::response_tap::scope(
+                std::sync::Arc::new(aisix_gateway::ResponseHeaderTap::default()),
+                async move {
+                    let _hold = ServedTokensHold::new(&limiter, keys);
+                    aisix_gateway::note_served_input_tokens(tokens);
+                    if consume {
+                        let _ = aisix_gateway::take_served_input_tokens();
+                    }
+                },
+            )
+        };
+        for key in &keys {
+            limiter.pre_commit(key, &limits).await.unwrap();
+        }
+
+        // A cancellation: the note is still there when the hold drops.
+        served(8, false).await;
+        for key in &keys {
+            let status = limiter.peek(key, &limits).await.unwrap();
+            assert_eq!(status.tpm_used, 8, "{key}");
+        }
+
+        // An operation that settled its own note charges nothing twice.
+        served(4, true).await;
+        for key in &keys {
+            let status = limiter.peek(key, &limits).await.unwrap();
+            assert_eq!(status.tpm_used, 8, "{key}");
+        }
+    }
 
     fn make_policy(window: &str, max_req: Option<u64>, max_tok: Option<u64>) -> RateLimitPolicy {
         serde_json::from_value(serde_json::json!({

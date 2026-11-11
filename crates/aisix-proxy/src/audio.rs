@@ -1878,7 +1878,11 @@ async fn multipart_dispatch(
                             req = req.timeout(d);
                         }
                     }
-                    let connect_deadline = if stream_requested { stream_budget } else { None };
+                    let connect_deadline = if stream_requested {
+                        stream_budget
+                    } else {
+                        None
+                    };
                     async move {
                         // `reqwest_error_to_bridge`, not a bare `Transport`: an
                         // elapsed `timeout` has to surface as `BridgeError::Timeout`
@@ -1930,14 +1934,14 @@ async fn multipart_dispatch(
                             let held =
                                 read_held_transcription(resp, cap, fail_open, request_budget)
                                     .await
-                                .map_err(|be| {
-                                    crate::cooldown::note_failure(
-                                        tracker,
-                                        model_id,
-                                        cooldown_cfg,
-                                        be,
-                                    )
-                                })?;
+                                    .map_err(|be| {
+                                        crate::cooldown::note_failure(
+                                            tracker,
+                                            model_id,
+                                            cooldown_cfg,
+                                            be,
+                                        )
+                                    })?;
                             return Ok((upstream_headers, held));
                         }
                         let read = async {
@@ -2017,10 +2021,7 @@ async fn multipart_dispatch(
             crate::guardrail_stream::release_output_buffer_unscanned(&resolved_chain);
             (AudioUpstreamBody::Live(rest), Some(held))
         }
-        AudioUpstreamBody::OverCapRefused {
-            counters,
-            failure,
-        } => {
+        AudioUpstreamBody::OverCapRefused { counters, failure } => {
             tracing::warn!(
                 guardrail_name = crate::guardrail_stream::output_buffer_owner(&resolved_chain),
                 guardrail_hook = "output",
