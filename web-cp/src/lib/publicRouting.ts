@@ -78,3 +78,18 @@ export function routingBody(
   if (draft.whenAllUnavailable !== "") body.when_all_unavailable = draft.whenAllUnavailable;
   return body;
 }
+
+/** `value` as JSON with every object's keys sorted, so two equal sets compare equal. */
+function canonical(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonical(v)}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+/** Whether two settings sets say the same thing, whatever order their keys are in. */
+export function sameRouting(a: PublicModelRouting, b: PublicModelRouting): boolean {
+  return canonical(a) === canonical(b);
+}
