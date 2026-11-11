@@ -4,6 +4,8 @@ import {
   EtcdClient,
   ProxyClient,
   SeedClient,
+  metricDelta,
+  scrapeMetrics,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -28,6 +30,12 @@ const CALLER = "sk-audio-stream-settlement";
 const HASH = createHash("sha256").update(CALLER).digest("hex");
 const READ_TIMEOUT_MS = 300;
 const STALL_MS = 3_000;
+// A held transcription is bounded by the request budget only until it is
+// handed to the live relay; a healthy relay is bounded per frame instead.
+const REQUEST_TIMEOUT_MS = 400;
+const STREAM_TIMEOUT_MS = 1_000;
+const FRAME_GAP_MS = 250;
+const HOLD_CAP_BYTES = 16;
 
 const delta = (text: string) =>
   `data: ${JSON.stringify({ type: "transcript.text.delta", delta: text })}\n\n`;
@@ -95,6 +103,9 @@ describe("relayed audio streams are settled by how they end", () => {
   const upstreams: OpenAiUpstream[] = [];
   let speechStallId = "";
   let transcriptStallId = "";
+  let overCapOpenId = "";
+  let overCapStalledId = "";
+  let overCapCompleteId = "";
   let etcdReachable = false;
 
   beforeAll(async () => {
@@ -124,6 +135,37 @@ describe("relayed audio streams are settled by how they end", () => {
       ],
       eventDelayMs: 300,
     });
+    // A transcript that outgrows a small hold cap on its first frame and then
+    // keeps producing for longer than the request budget, well inside the
+    // stream budget between any two frames.
+    const overCapStream = async () => {
+      const upstream = await startOpenAiUpstream({
+        rawStreamFrames: [
+          delta("twenty clean letters cross the cap"),
+          delta(" then still producing"),
+          delta(" and still more"),
+          DONE_EVENT,
+        ],
+        eventDelayMs: FRAME_GAP_MS,
+      });
+      upstreams.push(upstream);
+      return upstream;
+    };
+    const overCapOpen = await overCapStream();
+    const overCapStalled = await startOpenAiUpstream({
+      rawStreamFrames: [delta("twenty clean letters cross the cap"), DONE_EVENT],
+      eventDelayMs: STALL_MS,
+    });
+    const overCapComplete = await startOpenAiUpstream({
+      rawStreamFrames: [
+        delta("twenty clean letters cross the cap"),
+        delta(" then finished"),
+        DONE_EVENT,
+      ],
+      eventDelayMs: 20,
+    });
+    upstreams.push(overCapStalled, overCapComplete);
+
     upstreams.push(speechStall, transcriptStall, transcriptDoneThenOpen);
 
     // The access-log line is `tracing::info!`.
@@ -165,10 +207,54 @@ describe("relayed audio streams are settled by how they end", () => {
       model_name: "gpt-4o-transcribe",
       provider_key_id: await pk("settle-transcript-done", transcriptDoneThenOpen),
     });
+    // One hold cap, two overflow policies, and the same upstream twice: the
+    // overflow under `fail_open` hands the rest to the live relay, under
+    // `fail_closed` the gateway refuses and drains it for its counters.
+    const heldModel = async (
+      name: string,
+      upstream: OpenAiUpstream,
+      policy: "fail_open" | "fail_closed",
+    ) => {
+      const model = await seed.createModel({
+        display_name: name,
+        provider: "openai",
+        model_name: "gpt-4o-transcribe",
+        provider_key_id: await pk(name, upstream),
+        timeout: REQUEST_TIMEOUT_MS,
+        stream_timeout: STREAM_TIMEOUT_MS,
+        retries: 0,
+        cooldown: { enabled: true, default_seconds: 60 },
+      });
+      const guard = await seed.createGuardrail(
+        {
+          name: `${name}-rule`,
+          enabled: true,
+          kind: "pii",
+          hook_point: "output",
+          detectors: [{ type: "email", action: "block" }],
+          max_buffer_bytes: HOLD_CAP_BYTES,
+          on_buffer_exceeded: policy,
+        },
+        { attach: false },
+      );
+      await seed.attachGuardrailToModel(guard.id, model.id);
+      return model.id;
+    };
+    overCapOpenId = await heldModel("settle-over-cap-open", overCapOpen, "fail_open");
+    overCapStalledId = await heldModel("settle-over-cap-stalled", overCapStalled, "fail_closed");
+    overCapCompleteId = await heldModel("settle-over-cap-complete", overCapComplete, "fail_closed");
+
     // Seeded last: once it authenticates, every resource above is live.
     await seed.createApiKey({
       key_hash: HASH,
-      allowed_models: ["settle-speech-stall", "settle-transcript-stall", "settle-transcript-done"],
+      allowed_models: [
+        "settle-speech-stall",
+        "settle-transcript-stall",
+        "settle-transcript-done",
+        "settle-over-cap-open",
+        "settle-over-cap-stalled",
+        "settle-over-cap-complete",
+      ],
     });
     const probe = new ProxyClient(app.proxyUrl, CALLER);
     await waitConfigPropagation(async () => (await probe.listModels()).status === 200);
@@ -252,4 +338,93 @@ describe("relayed audio streams are settled by how they end", () => {
     );
     expect(line).toContain("status_code=200");
   });
+
+  test("a held transcript that overflows under fail_open outlives the request budget and completes", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+    const before = await scrapeMetrics(app.metricsUrl);
+    const started = Date.now();
+    const res = await transcription("settle-over-cap-open");
+    expect(res.status).toBe(200);
+    const body = await drain(res);
+    const elapsed = Date.now() - started;
+
+    // Every frame reached the caller, the terminal one included, and the
+    // whole request took longer than the request budget.
+    expect(body).toContain("twenty clean letters cross the cap");
+    expect(body).toContain("then still producing");
+    expect(body).toContain("transcript.text.done");
+    expect(elapsed).toBeGreaterThan(REQUEST_TIMEOUT_MS);
+    // A healthy relay is not the upstream failing: no cooldown, no failure.
+    const row = await modelStatus(overCapOpenId);
+    expect(row?.status).not.toBe("cooldown");
+    const after = await scrapeMetrics(app.metricsUrl);
+    expect(
+      metricDelta(before, after, "aisix_deployment_success_responses_total", {
+        model: "settle-over-cap-open",
+      }),
+    ).toBe(1);
+    expect(
+      metricDelta(before, after, "aisix_deployment_failure_responses_total", {
+        model: "settle-over-cap-open",
+      }),
+    ).toBe(0);
+  }, 30_000);
+
+  test("a refused transcript whose drain times out settles as the upstream failing, not as a success", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+    const before = await scrapeMetrics(app.metricsUrl);
+    const res = await transcription("settle-over-cap-stalled");
+
+    // The refusal is still the gateway's local one.
+    expect(res.status, await res.clone().text()).toBe(422);
+    expect(await res.text()).toContain("output_buffer_exceeded");
+    // ...but the upstream never finished the answer the gateway was reading
+    // past the cap, and that is what its health and the counters say.
+    await waitConfigPropagation(async () => {
+      const row = await modelStatus(overCapStalledId);
+      return row?.status === "cooldown" && row.status_reason === "request_timeout";
+    });
+    const after = await scrapeMetrics(app.metricsUrl);
+    expect(
+      metricDelta(before, after, "aisix_deployment_failure_responses_total", {
+        model: "settle-over-cap-stalled",
+      }),
+    ).toBe(1);
+    expect(
+      metricDelta(before, after, "aisix_deployment_success_responses_total", {
+        model: "settle-over-cap-stalled",
+      }),
+    ).toBe(0);
+  }, 30_000);
+
+  test("a refused transcript the upstream finished settles as a success, as before", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+    const before = await scrapeMetrics(app.metricsUrl);
+    const res = await transcription("settle-over-cap-complete");
+
+    expect(res.status, await res.clone().text()).toBe(422);
+    expect(await res.text()).toContain("output_buffer_exceeded");
+    const row = await modelStatus(overCapCompleteId);
+    expect(row?.status).not.toBe("cooldown");
+    const after = await scrapeMetrics(app.metricsUrl);
+    expect(
+      metricDelta(before, after, "aisix_deployment_success_responses_total", {
+        model: "settle-over-cap-complete",
+      }),
+    ).toBe(1);
+    expect(
+      metricDelta(before, after, "aisix_deployment_failure_responses_total", {
+        model: "settle-over-cap-complete",
+      }),
+    ).toBe(0);
+  }, 30_000);
 });

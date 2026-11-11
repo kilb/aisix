@@ -174,7 +174,10 @@ describe("legacy completions stream timeout", () => {
   let doneTrailer: OpenAiUpstream | undefined;
   let malformedWithDone: OpenAiUpstream | undefined;
   let inBandError: OpenAiUpstream | undefined;
+  let inBandOneRead: OpenAiUpstream | undefined;
   let inBandModelId = "";
+  let inBandOverCapModelId = "";
+  let inBandHeldModelId = "";
   let slowModelId = "";
   let midModelId = "";
   let truncatedModelId = "";
@@ -246,6 +249,23 @@ describe("legacy completions stream timeout", () => {
         "data: [DONE]\n\n",
       ],
     });
+    // The same failure written in ONE read, with more text ahead of the error
+    // than a small output hold may keep: the read that crosses the hold's cap
+    // is the one that carries the upstream's report.
+    inBandOneRead = await startOpenAiUpstream({
+      rawSseChunks: [
+        `data: ${chunk("X".repeat(128))}\n\n` +
+          `data: ${JSON.stringify({
+            error: {
+              message: "engine failed mid-generation",
+              type: "InternalServerError",
+              param: null,
+              code: 500,
+            },
+          })}\n\n` +
+          "data: [DONE]\n\n",
+      ],
+    });
 
     app = await spawnApp();
     const seed = new SeedClient(etcd, app.etcdPrefix);
@@ -275,6 +295,7 @@ describe("legacy completions stream timeout", () => {
       doneTrailer,
     );
     const inBandPk = await providerKey("legacy-in-band-error", inBandError);
+    const inBandOneReadPk = await providerKey("legacy-in-band-one-read", inBandOneRead);
 
     const slowModel = await seed.createModel({
       display_name: "legacy-timeout-slow",
@@ -349,6 +370,36 @@ describe("legacy completions stream timeout", () => {
       cooldown: { enabled: true, default_seconds: 60 },
     });
     inBandModelId = inBandModel.id;
+    // Two holds over the same upstream: one whose cap the read crosses and
+    // that refuses past it, and one that holds the whole answer.
+    for (const [name, maxBufferBytes] of [
+      ["legacy-in-band-over-cap", 32],
+      ["legacy-in-band-held", 4096],
+    ] as const) {
+      const model = await seed.createModel({
+        display_name: name,
+        provider: "openai",
+        model_name: "gpt-3.5-turbo-instruct",
+        provider_key_id: inBandOneReadPk,
+        retries: 0,
+        cooldown: { enabled: true, default_seconds: 60 },
+      });
+      const guard = await seed.createGuardrail(
+        {
+          name: `${name}-guard`,
+          enabled: true,
+          kind: "pii",
+          hook_point: "output",
+          detectors: [{ type: "email", action: "mask" }],
+          max_buffer_bytes: maxBufferBytes,
+          on_buffer_exceeded: "fail_closed",
+        },
+        { attach: false },
+      );
+      await seed.attachGuardrailToModel(guard.id, model.id);
+      if (name === "legacy-in-band-over-cap") inBandOverCapModelId = model.id;
+      else inBandHeldModelId = model.id;
+    }
 
     // The caller key is the final revision. Authenticated model listing is a
     // propagation barrier without exercising the timeout behavior under test.
@@ -363,6 +414,8 @@ describe("legacy completions stream timeout", () => {
         "legacy-malformed-with-done",
         "legacy-done-with-trailer",
         "legacy-in-band-error",
+        "legacy-in-band-over-cap",
+        "legacy-in-band-held",
       ],
     });
     await waitConfigPropagation(async () => {
@@ -383,7 +436,9 @@ describe("legacy completions stream timeout", () => {
         ids.has("legacy-malformed-before-done") &&
         ids.has("legacy-malformed-with-done") &&
         ids.has("legacy-done-with-trailer") &&
-        ids.has("legacy-in-band-error")
+        ids.has("legacy-in-band-error") &&
+        ids.has("legacy-in-band-over-cap") &&
+        ids.has("legacy-in-band-held")
       );
     });
   });
@@ -399,6 +454,7 @@ describe("legacy completions stream timeout", () => {
       doneTrailer?.close(),
       malformedWithDone?.close(),
       inBandError?.close(),
+      inBandOneRead?.close(),
     ]);
   });
 
@@ -563,6 +619,55 @@ describe("legacy completions stream timeout", () => {
       "upstream_server_error",
     );
     expect(await usage2xxCounter()).toBe(successBaseline);
+  });
+
+  test("an in-band error in the read that crosses a fail-closed hold's cap still cools the target down", async (ctx) => {
+    if (!etcdReachable || !app || !inBandOneRead) {
+      ctx.skip();
+      return;
+    }
+    const upstreamBaseline = inBandOneRead.receivedRequests.length;
+    const successBaseline = await usage2xxCounter();
+
+    const response = await completion("legacy-in-band-over-cap");
+
+    // The gateway's refusal is unchanged: one failure frame, nothing held.
+    expect(response.status).toBe(200);
+    const body = await readCommittedStream(response);
+    expect(body).toMatch(/^event: error\ndata: /);
+    expect(body).toContain("output_buffer_exceeded");
+    expect(body).not.toContain("XXXX");
+    expect(body).not.toContain("engine failed mid-generation");
+    expect(inBandOneRead.receivedRequests).toHaveLength(upstreamBaseline + 1);
+    // The refusal's row is the 200 its head committed; the upstream's own end
+    // is what the target's health reads, and it reported a server error.
+    await waitConfigPropagation(
+      async () => (await usage2xxCounter()) === successBaseline + 1,
+    );
+    const row = await modelStatus(inBandOverCapModelId);
+    expect(row?.status).toBe("cooldown");
+    expect(row?.status_reason).toBe("upstream_server_error");
+  });
+
+  test("an in-band error under a hold that keeps the whole answer cools the target down", async (ctx) => {
+    if (!etcdReachable || !app || !inBandOneRead) {
+      ctx.skip();
+      return;
+    }
+    const usageBaseline = await usage5xxCounter();
+
+    const response = await completion("legacy-in-band-held");
+
+    expect(response.status).toBe(200);
+    const body = await readCommittedStream(response);
+    expect(body).toContain("XXXX");
+    expect(body).toContain("engine failed mid-generation");
+    await waitForTimeoutObservability(
+      inBandHeldModelId,
+      "legacy-in-band-held",
+      usageBaseline,
+      "upstream_server_error",
+    );
   });
 
   test("malformed SSE written together with DONE reaches the caller the same way", async (ctx) => {

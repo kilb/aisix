@@ -698,7 +698,13 @@ where
                     estimate_text: Some(estimate_text),
                     ..Default::default()
                 });
-                guard.drop_outcome = CompletionStreamOutcome::CleanEof;
+                // The refusal is the gateway's; how the upstream ended is still
+                // the upstream's. An error it reported in the reads seen so far
+                // ends the attempt as that error, as on every other path.
+                guard.drop_outcome = match &accumulator.in_band_error {
+                    Some(reported) => CompletionStreamOutcome::in_band(reported),
+                    None => CompletionStreamOutcome::CleanEof,
+                };
                 let frame = crate::error::guardrail_block_frame_payload(
                     owner,
                     Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED),
@@ -1634,6 +1640,74 @@ mod tests {
         let released = String::from_utf8_lossy(&released);
         assert!(released.contains("generation failed"), "{released}");
         assert_eq!(*outcome.lock().unwrap(), in_band_outcome());
+    }
+
+    /// The read that crosses a fail-closed cap can carry the upstream's own
+    /// report of a failure. The caller still gets the refusal and nothing held,
+    /// and the attempt still ends as the upstream's error, not a clean end.
+    #[tokio::test]
+    async fn a_fail_closed_overflow_keeps_an_in_band_error_seen_in_the_same_read() {
+        struct SmallHold;
+        #[async_trait::async_trait]
+        impl aisix_guardrails::Guardrail for SmallHold {
+            fn name(&self) -> &'static str {
+                "small-hold"
+            }
+            fn stream_output_policy(&self) -> aisix_guardrails::StreamOutputPolicy {
+                aisix_guardrails::StreamOutputPolicy::BufferFull {
+                    max_buffer_bytes: 8,
+                    on_exceeded_fail_open: false,
+                }
+            }
+        }
+        for (tail, expected) in [
+            (IN_BAND_ERROR_THEN_DONE, in_band_outcome()),
+            (&b"data: [DONE]\n\n"[..], Some(CompletionStreamOutcome::CleanEof)),
+        ] {
+            let mut body = frame(&"x".repeat(64), true);
+            body.extend_from_slice(tail);
+            let upstream: CompletionByteStream =
+                Box::pin(futures::stream::iter([Ok(bytes::Bytes::from(body))]));
+            let chain = Arc::new(aisix_guardrails::GuardrailChain::new(vec![
+                Arc::new(SmallHold) as Arc<dyn aisix_guardrails::Guardrail>,
+            ]));
+            let verdict = Arc::new(OnceLock::new());
+            let outcome = Arc::new(std::sync::Mutex::new(None));
+            let outcome_in_callback = Arc::clone(&outcome);
+            let stream = build_held_completion_stream(
+                upstream,
+                chain,
+                "model".to_string(),
+                "model".to_string(),
+                Instant::now(),
+                None,
+                None,
+                Arc::clone(&verdict),
+                move |accumulator, terminal, _| {
+                    *outcome_in_callback.lock().unwrap() =
+                        Some((terminal, accumulator.in_band_error.map(|e| e.to_string())));
+                },
+            );
+            futures::pin_mut!(stream);
+            let mut released = Vec::new();
+            while let Some(item) = stream.next().await {
+                released.extend_from_slice(&item.unwrap());
+            }
+            let released = String::from_utf8_lossy(&released);
+            assert!(released.starts_with("event: error\n"), "{released}");
+            assert!(!released.contains("xxxx"), "{released}");
+            assert!(!released.contains("generation failed"), "{released}");
+            assert!(
+                verdict.get().and_then(|v| v.refusal.as_ref()).is_some(),
+                "the overflow is still the gateway's refusal"
+            );
+            let (terminal, error) = outcome.lock().unwrap().take().expect("terminal fired");
+            assert_eq!(Some(terminal), expected);
+            assert_eq!(
+                error.is_some_and(|e| e.contains("generation failed")),
+                expected == in_band_outcome()
+            );
+        }
     }
 
     /// An upstream that pauses inside a frame leaves the heartbeat something

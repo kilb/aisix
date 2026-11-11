@@ -1404,8 +1404,8 @@ async fn proxy_content(
         .map_err(ProxyError::Bridge)?;
 
     let status = resp.status();
-    note_deployment(state, target, Ok(status.as_u16()));
     if !status.is_success() {
+        note_deployment(state, target, Ok(status.as_u16()));
         // Status checked BEFORE any body is constructed: an expired /
         // not-ready content URL must surface as a typed error envelope, never
         // as a truncated `video/mp4` stream. The read is bounded by the same
@@ -1434,6 +1434,132 @@ async fn proxy_content(
     let content_type = resp.headers().get(header::CONTENT_TYPE).cloned();
     let content_length = resp.headers().get(header::CONTENT_LENGTH).cloned();
 
+    // The body owns the attempt's final settlement (#R-107). A 200 head only
+    // proves the upstream answered — the bytes may still stall or be cut
+    // short — so the relay books the outcome from the body's own end: a
+    // complete transfer is a success, a read timeout or transport failure is
+    // the upstream failing (health, cooldown and the deployment counters), and
+    // a caller who leaves mid-download is a cancellation that says neither.
+    // The `Content-Length` the upstream declared is the second witness for a
+    // transfer reqwest believes it finished.
+    let expected_len = content_length
+        .as_ref()
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    let state_c = state.clone();
+    let model_id_c = target.model_entry.id.clone();
+    let display_name_c = target.model_entry.value.display_name.clone();
+    let cooldown_c = target.model_entry.value.cooldown.clone();
+    // Held by the guard for as long as the body lives; a body dropped with
+    // the relay still running releases the concurrency slot as it drops.
+    let settle = move |failure: Option<aisix_gateway::BridgeError>, delivered: u64, drained: bool| {
+        // A body that ends short of the length the upstream declared is the
+        // upstream failing to deliver it, not a finished download: reqwest
+        // usually reports it as a read error itself, and this is the witness
+        // for the transfer it believes it completed.
+        let failure = failure.or_else(|| {
+            expected_len
+                .filter(|len| delivered < *len)
+                .map(|_| aisix_gateway::BridgeError::StreamAborted)
+        });
+        // The upstream answered only if it delivered the whole transfer. A
+        // declared length is what ends it — the server stops polling a sized
+        // body once that many bytes are written, so the relay sees a drop,
+        // not an end — and an unsized one is whole when the relay drained
+        // it. Anything else was dropped mid-transfer and says nothing.
+        let whole = match expected_len {
+            Some(len) => delivered >= len,
+            None => drained,
+        };
+        let completed = failure.is_none() && whole;
+        let failed = failure.is_some();
+        let terminal = crate::stream_timeout::finish_bridge_stream(
+            &state_c.health,
+            &state_c.runtime_status,
+            &display_name_c,
+            &model_id_c,
+            cooldown_c.as_ref(),
+            failure,
+            completed,
+            200,
+            started,
+        );
+        // A download the caller abandoned is neither the target's success nor
+        // its failure, so it books no deployment sample at all — the same
+        // stance the route takes on the caller's own 499 row.
+        if completed || failed {
+            crate::attempt::RoutingTelemetry::record_deployment(
+                &state_c,
+                &model_id_c,
+                terminal.status,
+            );
+        }
+    };
+    // The body's own end settles it, and so does its DROP: a response whose
+    // declared length is reached stops being polled before the stream yields
+    // `None`, and a download the caller abandons is dropped at its suspension
+    // point, so a tail written after the loop would sometimes never run. The
+    // guard carries what the relay saw and settles exactly once when the body
+    // is finished or dropped; a drop with no failure recorded is a caller who
+    // left, which books nothing.
+    struct ContentSettlement<F: FnOnce(Option<aisix_gateway::BridgeError>, u64, bool)> {
+        slot: Option<F>,
+        delivered: u64,
+        failure: Option<aisix_gateway::BridgeError>,
+        /// The relay read the body to its end (rather than being dropped, or
+        /// stopped by a read failure).
+        drained: bool,
+        // Released when the body is, not when the handler returned its head.
+        _hold: Option<aisix_ratelimit::StreamConcurrencyGuard>,
+    }
+
+    impl<F: FnOnce(Option<aisix_gateway::BridgeError>, u64, bool)> Drop for ContentSettlement<F> {
+        fn drop(&mut self) {
+            if let Some(settle) = self.slot.take() {
+                settle(self.failure.take(), self.delivered, self.drained);
+            }
+        }
+    }
+
+    let upstream = crate::stream_timeout::with_read_timeout_bytes(resp.bytes_stream(), stream_budget);
+    let relay = async_stream::stream! {
+        futures::pin_mut!(upstream);
+        let mut guard = ContentSettlement {
+            slot: Some(settle),
+            delivered: 0,
+            failure: None,
+            drained: false,
+            _hold: hold,
+        };
+        let mut done = false;
+        while !done {
+            match futures::StreamExt::next(&mut upstream).await {
+                Some(Ok(bytes)) => {
+                    guard.delivered = guard.delivered.saturating_add(bytes.len() as u64);
+                    yield Ok(bytes);
+                }
+                Some(Err(error)) => {
+                    guard.failure = Some(match error {
+                        crate::stream_timeout::RawStreamError::Timeout { elapsed_ms } => {
+                            aisix_gateway::BridgeError::Timeout {
+                                elapsed_ms,
+                                cause: "stream body".to_string(),
+                            }
+                        }
+                        crate::stream_timeout::RawStreamError::Upstream(e) => {
+                            crate::dispatch::reqwest_error_to_bridge(&e, started)
+                        }
+                    });
+                    done = true;
+                }
+                None => {
+                    guard.drained = true;
+                    done = true;
+                }
+            }
+        }
+        drop(guard);
+    };
     // `in_request_span` so each `poll_next` re-enters the handler's request
     // span: without it the per-chunk read-timeout warnings lose their
     // request-id correlation, unlike every other streaming path in the crate
@@ -1443,14 +1569,7 @@ async fn proxy_content(
             dyn futures::Stream<Item = Result<bytes::Bytes, crate::stream_timeout::RawStreamError>>
                 + Send,
         >,
-    > = Box::pin(crate::request_id::in_request_span(futures::StreamExt::map(
-        crate::stream_timeout::with_read_timeout_bytes(resp.bytes_stream(), stream_budget),
-        // Owns the concurrency hold for as long as the body lives.
-        move |chunk| {
-            let _keep = &hold;
-            chunk
-        },
-    )));
+    > = Box::pin(crate::request_id::in_request_span(relay));
     let mut response = Response::new(axum::body::Body::from_stream(wrapped));
     let headers = response.headers_mut();
     headers.insert(

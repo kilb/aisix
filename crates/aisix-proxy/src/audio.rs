@@ -927,8 +927,12 @@ enum AudioUpstreamBody {
     },
     /// The same past the cap under `fail_closed`: the stream was read to its
     /// terminal event and nothing of its text kept, only the counters that
-    /// event reported (see [`drain_refused_transcription`]).
-    OverCapRefused(Bytes),
+    /// event reported (see [`drain_refused_transcription`]) — and, when the
+    /// upstream never got there, how it really ended.
+    OverCapRefused {
+        counters: Bytes,
+        failure: Option<aisix_gateway::BridgeError>,
+    },
 }
 
 /// Read a streamed transcription held back for an output guardrail, under
@@ -940,21 +944,29 @@ enum AudioUpstreamBody {
 /// cap, `fail_open` stops at the frame that crossed it and hands on the rest
 /// unread; `fail_closed` reads on to the terminal event for its counters
 /// alone, since the upstream bills the whole transcript either way.
+///
+/// `budget` is the request's whole-response deadline, and it lives HERE
+/// rather than on the `reqwest::Response`: a timer attached to the response
+/// keeps running after a fail-open overflow hands that same response to the
+/// live relay, cutting a healthy stream off at the request budget however
+/// fast its frames arrive (#R-105). As an instant the held phase carries,
+/// it ends with the held phase — the `OverCap` arm returns the rest of the
+/// stream unread, and the live relay bounds that by the stream budget per
+/// frame instead.
 async fn read_held_transcription(
     mut resp: reqwest::Response,
     max_buffer_bytes: usize,
     fail_open: bool,
+    budget: Option<Duration>,
 ) -> Result<AudioUpstreamBody, aisix_gateway::BridgeError> {
+    let started = Instant::now();
+    let deadline = budget.map(|d| started + d);
     let mut body: Vec<u8> = Vec::new();
     let mut decoder = aisix_gateway::SseDecoder::with_max_frame_bytes(usize::MAX);
     let mut held = crate::held_content::HeldBuffer::default();
     let (mut streamed, mut done) = (0usize, 0usize);
     let (mut counters, mut terminal): (Option<Value>, bool) = (None, false);
-    while let Some(chunk) = resp
-        .chunk()
-        .await
-        .map_err(|e| aisix_gateway::upstream_body_read_error(&e))?
-    {
+    while let Some(chunk) = next_held_chunk(&mut resp, deadline, started).await? {
         body.extend_from_slice(&chunk);
         let before = streamed.max(done);
         for event in decoder.feed(chunk.as_ref()).unwrap_or_default() {
@@ -987,14 +999,19 @@ async fn read_held_transcription(
             // Refused: none of what was held reaches anyone, so it is let go
             // before the rest is read.
             drop((body, held));
+            let mut failure = None;
             if !terminal {
-                counters = drain_refused_transcription(resp, decoder, counters).await;
+                let drain =
+                    drain_refused_transcription(resp, decoder, counters, deadline, started).await;
+                counters = drain.counters;
+                failure = drain.failure;
             }
-            return Ok(AudioUpstreamBody::OverCapRefused(
-                counters.map_or_else(Bytes::new, |counters| {
+            return Ok(AudioUpstreamBody::OverCapRefused {
+                counters: counters.map_or_else(Bytes::new, |counters| {
                     Bytes::from(format!("data: {counters}\n\n"))
                 }),
-            ));
+                failure,
+            });
         }
     }
     Ok(AudioUpstreamBody::Buffered(Bytes::from(body)))
@@ -1016,16 +1033,28 @@ fn transcription_counters(event: &Value) -> Option<Value> {
 /// the usage and duration readers find them where a whole body carries them.
 ///
 /// The read ends at the terminal event or the end of the body. The request
-/// timeout bounds it, as it bounds the read before the cap, and so does the
+/// budget bounds it, as it bounds the read before the cap, and so does the
 /// frame bound every relayed stream has: a frame that grows past
 /// [`aisix_gateway::sse::MAX_SSE_FRAME_BYTES`] without ending stops the read. So
 /// does a read that fails. Either way the refusal stands, billed with the
-/// counters seen by then.
+/// counters seen by then — and the ending is REPORTED, because the local
+/// refusal says nothing about the target's health: a drain that timed out or
+/// failed must not leave the attempt looking like an answer the upstream
+/// delivered (#R-106).
+struct RefusedDrain {
+    counters: Option<Value>,
+    /// How the upstream really ended, when it was not its terminal event:
+    /// a read timeout or a failed read. `None` for a whole answer.
+    failure: Option<aisix_gateway::BridgeError>,
+}
+
 async fn drain_refused_transcription(
     mut resp: reqwest::Response,
     mut decoder: aisix_gateway::SseDecoder,
     mut seen: Option<Value>,
-) -> Option<Value> {
+    deadline: Option<Instant>,
+    started: Instant,
+) -> RefusedDrain {
     // Keep the event's counters, if any; `true` at the terminal event.
     fn take(payload: &str, seen: &mut Option<Value>) -> bool {
         let Ok(event) = serde_json::from_str::<Value>(payload) else {
@@ -1034,8 +1063,17 @@ async fn drain_refused_transcription(
         *seen = transcription_counters(&event).or(seen.take());
         event.get("type").and_then(Value::as_str) == Some("transcript.text.done")
     }
+    let mut failure = None;
     let mut unframed = 0usize;
-    'read: while let Ok(Some(chunk)) = resp.chunk().await {
+    'read: loop {
+        let chunk = match next_held_chunk(&mut resp, deadline, started).await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(error) => {
+                failure = Some(error);
+                break;
+            }
+        };
         let events = decoder.feed(chunk.as_ref()).unwrap_or_default();
         if events.is_empty() {
             unframed = unframed.saturating_add(chunk.len());
@@ -1056,7 +1094,35 @@ async fn drain_refused_transcription(
     if let Ok(Some(aisix_gateway::SseEvent::Data(payload))) = decoder.finish() {
         take(&payload, &mut seen);
     }
-    seen
+    RefusedDrain {
+        counters: seen,
+        failure,
+    }
+}
+
+/// One chunk of a held read, bounded by the request's whole-response
+/// `deadline`. `Ok(None)` is the end of the body; `Err` is a failed read or
+/// the deadline itself, as the [`aisix_gateway::BridgeError::Timeout`] the
+/// same budget reports everywhere else.
+async fn next_held_chunk(
+    resp: &mut reqwest::Response,
+    deadline: Option<Instant>,
+    started: Instant,
+) -> Result<Option<Bytes>, aisix_gateway::BridgeError> {
+    let Some(deadline) = deadline else {
+        return resp
+            .chunk()
+            .await
+            .map_err(|e| aisix_gateway::upstream_body_read_error(&e));
+    };
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    match tokio::time::timeout(remaining, resp.chunk()).await {
+        Ok(chunk) => chunk.map_err(|e| aisix_gateway::upstream_body_read_error(&e)),
+        Err(_) => Err(aisix_gateway::BridgeError::Timeout {
+            elapsed_ms: started.elapsed().as_millis() as u64,
+            cause: "held audio stream body".to_string(),
+        }),
+    }
 }
 
 /// Whether an upstream response is an SSE stream.
@@ -1797,17 +1863,22 @@ async fn multipart_dispatch(
                     // request timeout like the other direct-upstream paths
                     // (count_tokens/rerank/responses), so a slow/blackholed audio
                     // provider fails over and the model's timeout cooldown can
-                    // engage. A relayed stream must NOT carry it: reqwest's
-                    // request-level timeout bounds the body read too, so it would
-                    // cut the transcript off mid-stream (#998). That path bounds the
-                    // connect phase and each chunk by the stream budget instead —
-                    // the same split `/v1/responses` uses.
-                    if !live_relay {
+                    // engage. A streamed request must NOT carry it: reqwest's
+                    // request-level timeout is attached to the response and bounds
+                    // every body read, so it would cut the transcript off
+                    // mid-stream (#998) — and, once a held stream overflows under
+                    // `fail_open`, it would keep cutting, at the request budget,
+                    // a healthy live relay whose frames each arrive well inside
+                    // the stream budget (#R-105). A streamed request bounds the
+                    // connect phase by the stream budget here, and the held read
+                    // carries the request budget as its own deadline
+                    // (`read_held_transcription`), which ends with the held phase.
+                    if !stream_requested {
                         if let Some(d) = request_budget {
                             req = req.timeout(d);
                         }
                     }
-                    let connect_deadline = if live_relay { stream_budget } else { None };
+                    let connect_deadline = if stream_requested { stream_budget } else { None };
                     async move {
                         // `reqwest_error_to_bridge`, not a bare `Transport`: an
                         // elapsed `timeout` has to surface as `BridgeError::Timeout`
@@ -1856,8 +1927,9 @@ async fn multipart_dispatch(
                         if let Some((cap, fail_open)) =
                             held_cap.filter(|_| is_event_stream(&upstream_headers))
                         {
-                            let held = read_held_transcription(resp, cap, fail_open)
-                                .await
+                            let held =
+                                read_held_transcription(resp, cap, fail_open, request_budget)
+                                    .await
                                 .map_err(|be| {
                                     crate::cooldown::note_failure(
                                         tracker,
@@ -1869,7 +1941,7 @@ async fn multipart_dispatch(
                             return Ok((upstream_headers, held));
                         }
                         let read = async {
-                            match stream_budget.filter(|_| live_relay) {
+                            match stream_budget.filter(|_| stream_requested) {
                                 // No request-level timeout was set on the live path,
                                 // so bound this read rather than leaving it open.
                                 Some(d) => tokio::time::timeout(d, resp.bytes())
@@ -1936,12 +2008,19 @@ async fn multipart_dispatch(
     // stream is relayed live without an output scan, recorded as an
     // `output_buffer_exceeded` bypass.
     let mut over_cap_refused = false;
+    // How a refused transcription's upstream really ended — a drain that
+    // timed out or failed is neither a healthy target nor a deployment
+    // success, whatever the local 422 says (#R-106).
+    let mut refused_failure = None;
     let (upstream_body, released_unscanned) = match upstream_body {
         AudioUpstreamBody::OverCap { held, rest } => {
             crate::guardrail_stream::release_output_buffer_unscanned(&resolved_chain);
             (AudioUpstreamBody::Live(rest), Some(held))
         }
-        AudioUpstreamBody::OverCapRefused(counters) => {
+        AudioUpstreamBody::OverCapRefused {
+            counters,
+            failure,
+        } => {
             tracing::warn!(
                 guardrail_name = crate::guardrail_stream::output_buffer_owner(&resolved_chain),
                 guardrail_hook = "output",
@@ -1950,29 +2029,44 @@ async fn multipart_dispatch(
             );
             aisix_guardrails::Guardrail::record_output_buffer_exceeded(&resolved_chain);
             over_cap_refused = true;
+            refused_failure = failure;
             (AudioUpstreamBody::Buffered(counters), None)
         }
         other => (other, None),
     };
 
-    // An answer read whole succeeded here, a transcript refused past the cap
-    // included: the upstream answered it in full. A relayed stream has only
-    // opened: its terminal callback settles the target's health, cooldown and
-    // deployment outcome once it knows how the stream ended. Decided after
-    // the cap, which is what turns a held stream into one or the other.
+    // An answer read whole succeeded here — unless the read that produced it
+    // was a refused transcription whose drain never reached the upstream's
+    // end: that one settles by how the upstream really ended, once, while the
+    // caller keeps the local refusal. A relayed stream has only opened: its
+    // terminal callback settles the target's health, cooldown and deployment
+    // outcome once it knows how the stream ended. Decided after the cap, which
+    // is what turns a held stream into one or the other.
     if let AudioUpstreamBody::Buffered(_) = &upstream_body {
+        let completed = refused_failure.is_none();
+        let terminal = crate::stream_timeout::finish_bridge_stream(
+            &state.health,
+            &state.runtime_status,
+            &target.model.display_name,
+            &target.id,
+            target.model.cooldown.as_ref(),
+            refused_failure.take(),
+            completed,
+            200,
+            attempt_started,
+        );
         if let Some(deferred) = &deferred {
-            deferred.finish(state, 200, true);
+            deferred.finish(
+                state,
+                terminal.status,
+                terminal.error_class.is_empty() && terminal.status < 400,
+            );
         }
-        state.health.record_success(&target.model.display_name);
-        state
-            .runtime_status
-            .mark_healthy(&target.id, attempt_started);
     }
 
     let body_bytes = match upstream_body {
         AudioUpstreamBody::Buffered(bytes) => bytes,
-        AudioUpstreamBody::OverCap { .. } | AudioUpstreamBody::OverCapRefused(_) => {
+        AudioUpstreamBody::OverCap { .. } | AudioUpstreamBody::OverCapRefused { .. } => {
             unreachable!("taken by the cap decision above")
         }
         // #998: forward the upstream's SSE frames as they arrive. The

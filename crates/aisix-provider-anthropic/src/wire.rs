@@ -3862,6 +3862,14 @@ fn tool_message_from_tool_result(
                             parts.push(serde_json::json!({"type": "text", "text": t}));
                         }
                     }
+                    // A document the source carries as text is TEXT, wherever
+                    // the tool result goes: dropping it would leave the result
+                    // empty and the model blind to what the tool returned.
+                    Some("document") if document_source_text(item).is_some() => {
+                        let t = document_source_text(item).unwrap_or_default();
+                        text.push_str(&t);
+                        parts.push(serde_json::json!({"type": "text", "text": t}));
+                    }
                     // Media only where the target's tool result carries it.
                     // Chat Completions rejects a `tool` message holding an
                     // image ("Image URLs are only allowed for messages with
@@ -10066,6 +10074,46 @@ mod tests {
         // A text-only result keeps its plain-string shape.
         assert_eq!(chat.messages[1].content_str(), "plain");
         assert!(chat.messages[1].content_blocks.is_none());
+    }
+
+    /// A document whose source carries its text is text, for a target that
+    /// takes media in a tool result and for one that does not: the tool
+    /// result's only content must not vanish.
+    #[test]
+    fn inbound_tool_result_text_documents_reach_both_kinds_of_target() {
+        for source in [
+            serde_json::json!({"type": "text", "media_type": "text/plain", "data": "contract v2"}),
+            serde_json::json!({"type": "content", "content": "contract v2"}),
+            serde_json::json!({"type": "content", "content": [
+                {"type": "text", "text": "contract "},
+                {"type": "text", "text": "v2"},
+            ]}),
+        ] {
+            let body = serde_json::json!({
+                "model": "claude",
+                "messages": [{"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": [
+                        {"type": "text", "text": "read: "},
+                        {"type": "document", "title": "r.txt", "source": source},
+                    ]},
+                    {"type": "tool_result", "tool_use_id": "t2", "content": [
+                        {"type": "document", "source": source},
+                    ]},
+                ]}],
+            });
+            for media in [ToolResultMedia::Drop, ToolResultMedia::Keep] {
+                let chat = parse_inbound_request_with(&body, CacheMarkers::Drop, media).unwrap();
+                let tool_msg = &chat.messages[0];
+                assert_eq!(tool_msg.content_str(), "read: contract v2", "{media:?}");
+                assert!(
+                    tool_msg.content_blocks.is_none(),
+                    "text needs no parts: {media:?}"
+                );
+                // The result whose ONLY content was the document must not
+                // arrive empty.
+                assert_eq!(chat.messages[1].content_str(), "contract v2", "{media:?}");
+            }
+        }
     }
 
     /// Dropping the media of a request parsed with it kept is the request
