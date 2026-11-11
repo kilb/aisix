@@ -1,5 +1,6 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { ApiError, upstreamModels, type UpstreamModelList } from "../lib/api";
+import { cn } from "../lib/cn";
 import { errorText } from "../lib/fmt";
 import { messageFor } from "../lib/errors";
 
@@ -66,6 +67,8 @@ export function UpstreamModelPicker({
   disabled = false,
   invalid = false,
   describedBy,
+  compact = false,
+  className,
 }: {
   /** The account whose list is offered; empty offers no list at all. */
   accountId: string;
@@ -80,6 +83,10 @@ export function UpstreamModelPicker({
   /** The field's own refusal, from its save. */
   invalid?: boolean;
   describedBy?: string;
+  /** The 32px height of a control inside a table row. */
+  compact?: boolean;
+  /** Classes for the box around the field and its list. */
+  className?: string;
 }) {
   const id = useId();
   const listId = `${id}-list`;
@@ -142,9 +149,10 @@ export function UpstreamModelPicker({
   const listed = phase === "listed";
 
   return (
-    <div className="upicker">
+    <div className={cn("upicker relative min-w-0", className)}>
       <input
         ref={input}
+        className={cn("w-full font-mono text-[13px]", compact && "h-8", phase === "loading" && "pr-16")}
         role="combobox"
         aria-label={label ?? "上游模型名称"}
         aria-expanded={listed && open}
@@ -170,17 +178,30 @@ export function UpstreamModelPicker({
           else if (e.key === "ArrowDown" && listed) setOpen(true);
         }}
       />
+      {/* The status sits over the field's end: it is not part of the disabled control. */}
       {phase === "loading" && (
-        <span className="upicker-loading" role="status">
+        <span
+          className={cn(
+            "upicker-loading pointer-events-none absolute top-0 right-3 flex items-center text-xs text-muted-foreground",
+            compact ? "h-8" : "h-9",
+          )}
+          role="status"
+        >
           载入中…
         </span>
       )}
       {listed && open && shown.length > 0 && (
-        <ul className="upicker-list" role="listbox" id={listId} aria-label="上游模型名称">
+        <ul
+          className="upicker-list absolute inset-x-0 z-20 mt-1 max-h-64 overflow-y-auto rounded-md border border-border bg-popover p-1 text-popover-foreground shadow-float"
+          role="listbox"
+          id={listId}
+          aria-label="上游模型名称"
+        >
           {shown.map((name) => (
             <li
               key={name}
               role="option"
+              className="cursor-pointer truncate rounded-sm px-2 py-1.5 font-mono text-[13px] hover:bg-accent aria-selected:bg-accent aria-selected:font-medium"
               aria-selected={name === value}
               // `mousedown` rather than `click`: the field's blur would close
               // the list before a click landed.
@@ -194,16 +215,16 @@ export function UpstreamModelPicker({
             </li>
           ))}
           {matches.length > shown.length && (
-            <li className="upicker-more" aria-hidden="true">
+            <li className="upicker-more px-2 py-1.5 text-xs text-muted-foreground" aria-hidden="true">
               共 {matches.length} 个，只列出前 {MAX_OPTIONS} 个；继续输入可缩小范围
             </li>
           )}
         </ul>
       )}
       {phase === "fallback" && (
-        <p className="hint upicker-fallback">
+        <p className="hint upicker-fallback mt-1 text-xs leading-snug whitespace-normal">
           {FALLBACK}
-          {reason !== null && <span className="upicker-reason">{reason}</span>}
+          {reason !== null && <span className="upicker-reason mt-0.5 block [overflow-wrap:anywhere]">{reason}</span>}
         </p>
       )}
     </div>
