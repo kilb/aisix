@@ -304,6 +304,13 @@ function Upstream({ c }: { c: Charge }) {
 }
 
 /**
+ * The check row sits inside the list's `.dt` table, whose cell rules reach
+ * every descendant cell; these utilities give its own table compact cells.
+ */
+const CELL = "static h-auto border-b border-border bg-transparent px-2 py-1.5 text-[12px] font-medium text-muted-foreground first:pl-0 last:pr-0";
+const ROW = "h-auto border-b border-border px-2 py-1.5 text-[13px] tabular-nums first:pl-0 last:pr-0";
+
+/**
  * What checks one charge: the lines it billed (quantity × rate = USD), the
  * counters the upstream reported, and the formula with its group rate and
  * discount, recomputed beside the amount billed.
@@ -321,19 +328,19 @@ function ChargeCheck({ c }: { c: Charge }) {
           <table className="w-full text-[13px]">
             <thead className="text-muted-foreground">
               <tr>
-                <th className="py-1 text-left font-medium">维度</th>
-                <th className="py-1 text-right font-medium">数量</th>
-                <th className="py-1 text-right font-medium">基准价</th>
-                <th className="py-1 text-right font-medium">小计（美元）</th>
+                <th className={`${CELL} text-left`}>维度</th>
+                <th className={`${CELL} text-right`}>数量</th>
+                <th className={`${CELL} text-right`}>基准价</th>
+                <th className={`${CELL} text-right`}>小计（美元）</th>
               </tr>
             </thead>
             <tbody>
               {c.lines.map((l) => (
-                <tr key={l.dimension} className="border-t border-border">
-                  <td className="py-1.5">{dimensionLabel(l.dimension)}</td>
-                  <td className="py-1.5 text-right tabular-nums">{l.quantity.toLocaleString("en-US")}</td>
-                  <td className="py-1.5 text-right tabular-nums">{usdRateText(l.dimension, l.rate)}</td>
-                  <td className="py-1.5 text-right tabular-nums">{lineUsd(l) ?? "—"}</td>
+                <tr key={l.dimension}>
+                  <td className={ROW}>{dimensionLabel(l.dimension)}</td>
+                  <td className={`${ROW} text-right`}>{l.quantity.toLocaleString("en-US")}</td>
+                  <td className={`${ROW} text-right`}>{usdRateText(l.dimension, l.rate)}</td>
+                  <td className={`${ROW} text-right`}>{lineUsd(l) ?? "—"}</td>
                 </tr>
               ))}
             </tbody>
