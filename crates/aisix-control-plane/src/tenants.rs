@@ -437,25 +437,29 @@ pub(crate) async fn all(conn: &mut PgConnection) -> Result<Vec<TenantRow>, ApiEr
 /// Fences a tenant's move onto [`ModelScope::All`] against a write that
 /// changes what every all-scope tenant reaches. Such a write takes it
 /// shared ([`lock_all_scope`]) before it reads which tenants are on `all`,
-/// and holds it to its commit; a move onto `all` takes it exclusive right
-/// after the tenant's own row (and account), before it projects the
-/// tenant's keys from the catalogue. So a tenant that joins `all` is either
-/// in the writer's census, its keys rewritten by the writer, or projected
-/// after the writer committed, from a catalogue that holds the writer's
-/// change. Without it a tenant could join between the census and the
-/// write and be rewritten by neither.
+/// and holds it to its commit; a tenant `PATCH` that names `model_scope:
+/// all` takes it exclusive as its first lock, before the tenant's own row
+/// (and account), and so before it projects the tenant's keys from the
+/// catalogue. So a tenant that joins `all` is either in the writer's
+/// census, its keys rewritten by the writer, or projected after the writer
+/// committed, from a catalogue that holds the writer's change. Without it a
+/// tenant could join between the census and the write and be rewritten by
+/// neither.
 ///
 /// A tenant's creation is a move onto `all` too (every customer starts
 /// there): [`create`] takes it exclusive as its first lock, since there is
 /// no tenant row yet.
 ///
-/// The writer takes it before any tenant row, the move after its tenant's
-/// row, and neither order can close a wait cycle: a writer waits only on
-/// rows of tenants already on `all`, and a move waits for the fence only
-/// while its tenant is not. A create holds nothing a writer waits on while
-/// it waits for the fence, and takes only the default groups' rows and the
-/// resources lock after it, which no writer holds while it waits for the
-/// fence.
+/// Every path that takes it takes it before any tenant row, account, group
+/// row, public model's row or the resources lock, so no holder of any of
+/// those waits for the fence and no wait cycle runs through it. A move
+/// that took its tenant's row first would close one: with a writer whose
+/// census still counts the tenant from before it left `all`, which then
+/// waits for that row, and with a writer waiting for an all-scope tenant's
+/// row that a re-pricing apply holds while the apply waits for the moving
+/// tenant's (`tenants::lock_many_billing` takes rows in id order, whatever
+/// their scope). The move takes it whether or not its tenant is on `all`
+/// already, since it decides before it reads the row.
 pub const SCOPE_LOCK_KEY: i64 = 0x6169_7369_7863_7034;
 
 /// Locks every tenant on [`ModelScope::All`], in ascending id order, so a
@@ -2016,22 +2020,28 @@ pub async fn update(
         .db
         .tx(move |conn| {
             async move {
+                // A move onto `all` waits for every catalogue write that
+                // counted the all-scope tenants without this one, and holds
+                // off the next until it commits ([`SCOPE_LOCK_KEY`]). It is
+                // taken before the tenant's row, holding nothing, whether
+                // or not the tenant is on `all` already: a move that held
+                // the row while it waited would close a wait cycle with a
+                // catalogue write that counted the tenant, or with one
+                // that waits on a row a re-pricing apply holds while the
+                // apply waits for this tenant's.
+                if scope == Some(ModelScope::All) {
+                    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                        .bind(SCOPE_LOCK_KEY)
+                        .execute(&mut *conn)
+                        .await
+                        .map_err(DbError::from)?;
+                }
                 let current = match billing {
                     BillingStep::Run => lock_billing(&mut *conn, id).await?.0,
                     BillingStep::Skip => lock(&mut *conn, id).await?,
                 };
                 if current.version != expected {
                     return Err(ApiError::version_mismatch(current.version));
-                }
-                // A move onto `all` waits for every catalogue write that
-                // counted the all-scope tenants without this one, and holds
-                // off the next until it commits ([`SCOPE_LOCK_KEY`]).
-                if scope == Some(ModelScope::All) && current.model_scope != ModelScope::All {
-                    sqlx::query("SELECT pg_advisory_xact_lock($1)")
-                        .bind(SCOPE_LOCK_KEY)
-                        .execute(&mut *conn)
-                        .await
-                        .map_err(DbError::from)?;
                 }
                 if groups.as_ref().is_some_and(Vec::is_empty) && !current.is_internal {
                     return Err(ApiError::validation(vec![no_groups(
