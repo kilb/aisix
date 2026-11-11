@@ -115,6 +115,50 @@ async fn serve(app: axum::Router) -> SocketAddr {
     addr
 }
 
+/// A real upstream MCP server listing one tool whose description is
+/// `description_bytes` long — each list fits one response, so only the
+/// aggregate can outgrow what a downstream client reads.
+#[derive(Clone)]
+struct LargeTool {
+    description_bytes: usize,
+}
+
+impl ServerHandler for LargeTool {
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
+        let schema = serde_json::json!({ "type": "object" });
+        let tool = Tool::new(
+            "big",
+            "x".repeat(self.description_bytes),
+            schema.as_object().expect("schema is an object").clone(),
+        );
+        Ok(ListToolsResult::with_all_items(vec![tool]))
+    }
+
+    fn get_info(&self) -> ServerConfig {
+        let mut info = ServerConfig::default();
+        info.capabilities = ServerCapabilities::builder().enable_tools().build();
+        info
+    }
+}
+
+/// A bridge to a fresh [`LargeTool`] upstream.
+async fn large_bridge(description_bytes: usize) -> Arc<dyn McpBridge> {
+    let service = StreamableHttpService::new(
+        move || Ok(LargeTool { description_bytes }),
+        Arc::new(LocalSessionManager::default()),
+        StreamableHttpServerConfig::default(),
+    );
+    let addr = serve(axum::Router::new().nest_service("/mcp", service)).await;
+    let bridge = RmcpBridge::connect(&McpUpstream::new(format!("http://{addr}/mcp")))
+        .await
+        .expect("connect upstream bridge");
+    Arc::new(bridge)
+}
+
 /// A bridge whose every operation fails — stands in for an unreachable or
 /// broken upstream so the graceful-skip path is deterministic.
 struct FailingBridge;
@@ -235,6 +279,60 @@ async fn skips_failing_upstream_keeping_the_rest() {
         names.contains(&"alpha__echo"),
         "alpha tool missing: {names:?}"
     );
+}
+
+/// Two upstreams whose lists each fit, but whose joined list is larger than
+/// a downstream client reads (the Rust SDK client stops at 16 MiB): the
+/// caller gets a JSON-RPC error it can act on, never a result its transport
+/// has to throw away.
+#[tokio::test]
+async fn an_aggregate_too_large_for_the_client_is_a_json_rpc_error() {
+    const NINE_MIB: usize = 9 * 1024 * 1024;
+    let gateway = McpGateway::new([
+        ("one".to_string(), large_bridge(NINE_MIB).await),
+        ("two".to_string(), large_bridge(NINE_MIB).await),
+    ]);
+    let gw_addr = spawn_gateway(gateway).await;
+    let client = ()
+        .serve(StreamableHttpClientTransport::from_uri(format!(
+            "http://{gw_addr}/mcp"
+        )))
+        .await
+        .expect("connect");
+
+    let err = client
+        .list_tools(None)
+        .await
+        .expect_err("an 18 MiB aggregate is refused");
+    match err {
+        rmcp::ServiceError::McpError(error) => {
+            assert!(error.message.contains("too large"), "{}", error.message)
+        }
+        other => panic!("expected a JSON-RPC error, got a transport failure: {other}"),
+    }
+}
+
+/// The control for the aggregate cap: a large joined list that fits is
+/// served whole.
+#[tokio::test]
+async fn a_large_aggregate_within_the_client_cap_is_served_whole() {
+    const SIX_MIB: usize = 6 * 1024 * 1024;
+    let gateway = McpGateway::new([
+        ("one".to_string(), large_bridge(SIX_MIB).await),
+        ("two".to_string(), large_bridge(SIX_MIB).await),
+    ]);
+    let gw_addr = spawn_gateway(gateway).await;
+    let client = ()
+        .serve(StreamableHttpClientTransport::from_uri(format!(
+            "http://{gw_addr}/mcp"
+        )))
+        .await
+        .expect("connect");
+
+    let tools = client.list_all_tools().await.expect("list tools");
+    let mut names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["one__big", "two__big"]);
 }
 
 #[tokio::test]

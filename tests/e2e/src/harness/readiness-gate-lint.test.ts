@@ -123,7 +123,6 @@ describe("readiness gates imply what the spec then asserts", () => {
       "mcp-anonymous-access-e2e.test.ts",
       "model-kind-dead-knobs-e2e.test.ts",
       "provider-key-tls-e2e.test.ts",
-      "responses-streaming-monitor-guardrail-e2e.test.ts",
       "semantic-routing-e2e.test.ts",
     ]);
 

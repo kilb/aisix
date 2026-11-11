@@ -507,6 +507,19 @@ impl SinkPipeline {
                             );
                             self.stats.set_error(detail);
                         }
+                        // The receiver accepted, but its acknowledgement
+                        // could not be read: what it kept is unknown, so
+                        // this is a diagnostic that outlives the delivery
+                        // rather than a warning cleared on the next one.
+                        Some(unknown) if unknown.acknowledgement_unknown => {
+                            let detail = masked_text(&unknown.detail, &self.redactor);
+                            tracing::warn!(
+                                sink = %self.sink.name(),
+                                error = %detail,
+                                "sink receiver accepted a batch but its acknowledgement is unreadable",
+                            );
+                            self.stats.set_error(detail);
+                        }
                         Some(warning) => {
                             self.stats.clear_error();
                             tracing::warn!(

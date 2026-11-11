@@ -1005,6 +1005,40 @@ const MAX_TOOL_LIST_PAGES: usize = 100;
 /// Most tools kept from one upstream's `tools/list`, across its pages.
 const MAX_LISTED_TOOLS: usize = 10_000;
 
+/// The most a tool list may serialize to, in bytes, counting names,
+/// descriptions and schemas.
+///
+/// MCP puts no byte cap on a `tools/list` result, but Streamable HTTP
+/// clients do, and mainstream SDKs read one HTTP response at a time with a
+/// fixed cap — 16 MiB in the Rust SDK this crate is built on, through its
+/// non-streaming response reader. Under it
+/// (<https://modelcontextprotocol.io/specification/2025-11-25/changelog>)
+/// such a client fails the read at its transport, where the caller sees a
+/// broken connection rather than a JSON-RPC error it can act on. So the
+/// gateway keeps every list it serves under the cap instead of passing an
+/// oversized one through: the pages of one upstream are joined only while
+/// they stay inside it, and so is the aggregate of every upstream.
+///
+/// Enforced below the client's 16 MiB: a list is assembled with the same
+/// serialization that reaches the client, and the margin leaves room for
+/// the JSON-RPC envelope and a smaller cap under a different runtime
+/// configuration.
+pub(crate) const MAX_TOOL_LIST_BYTES: usize = 14 * 1024 * 1024;
+
+/// What one tool's own fields serialize to, as an estimate of its share of
+/// a serialized `tools/list`: measured from the fields rather than from the
+/// wire shape, so it holds across protocol versions, which attach and strip
+/// other fields around these.
+pub(crate) fn tool_bytes(
+    name: &str,
+    description: Option<&str>,
+    input_schema: &serde_json::Map<String, serde_json::Value>,
+) -> usize {
+    name.len()
+        + description.map_or(0, str::len)
+        + serde_json::to_string(input_schema).map_or(0, |schema| schema.len())
+}
+
 #[async_trait]
 impl McpBridge for RmcpBridge {
     /// Every page of the upstream's tool list, read under one deadline.
@@ -1013,11 +1047,13 @@ impl McpBridge for RmcpBridge {
     /// tools behind it, fetched by sending the cursor back
     /// (<https://modelcontextprotocol.io/specification/2025-11-25/server/utilities/pagination>).
     /// The downstream list is one complete result, so the pages are joined
-    /// here; an upstream past [`MAX_TOOL_LIST_PAGES`] or [`MAX_LISTED_TOOLS`]
-    /// fails the list rather than serving part of it.
+    /// here; an upstream past [`MAX_TOOL_LIST_PAGES`], [`MAX_LISTED_TOOLS`]
+    /// or [`MAX_TOOL_LIST_BYTES`] fails the list rather than serving part of
+    /// it, or a result the client cannot read.
     async fn list_tools(&self) -> Result<Vec<McpTool>, McpError> {
         let list = async {
             let mut tools = Vec::new();
+            let mut bytes = 0;
             let mut params = None;
             for _ in 0..MAX_TOOL_LIST_PAGES {
                 let page = self
@@ -1025,10 +1061,24 @@ impl McpBridge for RmcpBridge {
                     .list_tools(params)
                     .await
                     .map_err(request_error)?;
-                tools.extend(page.tools.into_iter().map(into_mcp_tool));
+                for tool in page.tools {
+                    bytes += tool_bytes(
+                        tool.name.as_ref(),
+                        tool.description.as_deref(),
+                        &tool.input_schema,
+                    );
+                    tools.push(into_mcp_tool(tool));
+                }
                 if tools.len() > MAX_LISTED_TOOLS {
                     return Err(McpError::Request(format!(
                         "upstream tools/list returned more than {MAX_LISTED_TOOLS} tools"
+                    )));
+                }
+                // Checked on every page, before the next one is fetched: the
+                // budget exists to bound what is held, not just what is sent.
+                if bytes > MAX_TOOL_LIST_BYTES {
+                    return Err(McpError::Request(format!(
+                        "upstream tools/list exceeds {MAX_TOOL_LIST_BYTES} bytes"
                     )));
                 }
                 let Some(cursor) = page.next_cursor else {

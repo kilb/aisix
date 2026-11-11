@@ -90,6 +90,12 @@ pub struct PartialSuccess {
     pub rejected: u64,
     /// The receiver's account of it, as the sink renders it.
     pub detail: String,
+    /// The receiver answered success, but what it said it kept could not be
+    /// read (a response past the sink's cap, or a body that failed part-way).
+    /// Not retryable — resending an accepted request duplicates it — and not
+    /// a clean acknowledgement either, so it is a diagnostic the health
+    /// report keeps, unlike a warning on a delivery known to be whole.
+    pub acknowledgement_unknown: bool,
 }
 
 /// Why a delivery failed. Drives the pipeline's retry/backoff/drop logic.
@@ -204,18 +210,75 @@ pub(crate) const RESPONSE_BODY_LIMIT: usize = 16 * 1024;
 /// read, and dropping the response closes the connection. The cap counts the
 /// bytes after decompression, so a compressed body cannot expand past it
 /// either. A body that fails part-way yields what arrived before the failure.
-pub(crate) async fn read_body_prefix(mut resp: reqwest::Response, limit: usize) -> String {
+pub(crate) async fn read_body_prefix(resp: reqwest::Response, limit: usize) -> String {
+    read_limited(resp, limit).await.text
+}
+
+/// What reading a response body up to a cap produced: the text, and whether
+/// that text is the whole body — the difference between "this is what the
+/// receiver said" and "this is the first `limit` bytes of what it said".
+pub(crate) struct BodyRead {
+    pub text: String,
+    /// The body ended within the cap: `text` is all of it.
+    pub complete: bool,
+    /// The cap was reached with the body still running.
+    pub over_limit: bool,
+    /// Reading stopped because the body errored (a reset or a decompression
+    /// failure) rather than because it ended.
+    pub read_error: Option<String>,
+}
+
+impl BodyRead {
+    /// A body that ended within the cap.
+    pub fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    /// A body cut at the cap with more behind it.
+    pub fn is_over_limit(&self) -> bool {
+        self.over_limit
+    }
+}
+
+/// [`read_body_prefix`] with the read's outcome alongside the text.
+pub(crate) async fn read_limited(mut resp: reqwest::Response, limit: usize) -> BodyRead {
     let mut buf: Vec<u8> = Vec::with_capacity(limit.min(4096));
-    while buf.len() < limit {
+    let mut read_error = None;
+    loop {
+        if buf.len() >= limit {
+            return BodyRead {
+                text: String::from_utf8_lossy(&buf).into_owned(),
+                complete: false,
+                over_limit: true,
+                read_error: None,
+            };
+        }
         match resp.chunk().await {
             Ok(Some(chunk)) => {
                 let take = chunk.len().min(limit - buf.len());
                 buf.extend_from_slice(&chunk[..take]);
+                if take < chunk.len() {
+                    return BodyRead {
+                        text: String::from_utf8_lossy(&buf).into_owned(),
+                        complete: false,
+                        over_limit: true,
+                        read_error: None,
+                    };
+                }
             }
-            Ok(None) | Err(_) => break,
+            Ok(None) => break,
+            Err(e) => {
+                read_error = Some(e.to_string());
+                break;
+            }
         }
     }
-    String::from_utf8_lossy(&buf).into_owned()
+    BodyRead {
+        text: String::from_utf8_lossy(&buf).into_owned(),
+        complete: read_error.is_none(),
+        over_limit: false,
+        read_error,
+    }
 }
 
 /// Render an error together with its full `source()` chain.
@@ -302,6 +365,33 @@ pub(crate) mod endless_body {
     /// body open, so a reader that waits for its end still never gets one,
     /// without a test of the broken reader holding gigabytes.
     const SENT_CAP: usize = 64 << 20;
+
+    /// Serve `200 OK` on loopback and return `http://127.0.0.1:<port>`.
+    /// Every connection gets a chunked body that stops mid-way — the peer
+    /// hangs up without the terminal chunk — so a reader surfaces a
+    /// transport error rather than end-of-body.
+    pub(crate) async fn serve_reset() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut conn, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    let _ = conn.read(&mut buf).await;
+                    let head = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                                transfer-encoding: chunked\r\n\r\n";
+                    if conn.write_all(head.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    // An announced chunk of 64 KiB, of which 16 bytes arrive.
+                    let _ = conn.write_all(b"10000\r\n").await;
+                    let _ = conn.write_all(b"{\"partialSuccess\"").await;
+                    // Drop the connection: no chunk body, no terminal chunk.
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
 
     /// Serve on loopback and return `http://127.0.0.1:<port>`. `gzip` sends
     /// the body as a gzip stream, every chunk of which decompresses to a
