@@ -230,6 +230,7 @@ async fn a_body_round_trips_with_its_content_type() {
                         body: b"{\"ok\":true}".to_vec(),
                         prompt_tokens: 7,
                         completion_tokens: 3,
+                        origin_model_id: String::new(),
                     },
                     Duration::from_secs(60),
                 )
@@ -277,6 +278,7 @@ async fn the_chat_and_body_families_do_not_read_each_other() {
                         body: b"body shaped".to_vec(),
                         prompt_tokens: 0,
                         completion_tokens: 0,
+                        origin_model_id: String::new(),
                     },
                     Duration::from_secs(60),
                 )

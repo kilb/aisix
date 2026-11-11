@@ -113,6 +113,38 @@ struct ResponseDispatchSuccess {
 
 /// Dispatch error carrying the per-attempt telemetry accumulated before
 /// the request ultimately failed (#655). Mirrors `chat::DispatchFailure`.
+/// Whether a cached `/v1/responses` answer may be served to this caller
+/// (R-040).
+///
+/// A cached answer is only useful if it can be continued: the ids inside it
+/// are sealed to the target that produced them, and `admit_continuation`
+/// refuses a `previous_response_id` naming a target the key's provider groups
+/// no longer hold. That refusal is correct ACL and stays as it is — what must
+/// not happen is the gateway handing out an id the very next call refuses, for
+/// the rest of the entry's TTL.
+///
+/// So the origin is re-checked here, with the same predicate a continuation
+/// uses. An entry written before the origin was recorded carries an empty id
+/// and is served as before: it was stored under a fingerprint that already
+/// folds the caller's groups, so it only lacks this later test.
+pub(crate) fn cache_hit_origin_eligible(
+    snapshot: &aisix_core::AisixSnapshot,
+    auth: &crate::auth::AuthenticatedKey,
+    hit: &aisix_cache::CachedBody,
+) -> bool {
+    if hit.origin_model_id.is_empty() {
+        return true;
+    }
+    let allowed = &auth.key().allowed_provider_groups;
+    if allowed.is_empty() {
+        return true;
+    }
+    snapshot
+        .models
+        .get_by_id(&hit.origin_model_id)
+        .is_some_and(|entry| crate::routing::target_in_groups(snapshot, &entry.value, allowed))
+}
+
 /// Run the output chain over a cached `/v1/responses` body, returning the
 /// bytes to serve.
 ///
@@ -264,6 +296,7 @@ async fn store_in_cache(
             body: bytes.to_vec(),
             prompt_tokens,
             completion_tokens,
+            origin_model_id: success.model_id.clone(),
         })
         .await;
     }
@@ -1041,7 +1074,17 @@ async fn dispatch(
             &client.routing_tags,
             &client.source_ip,
         )?;
-        if let Some(hit) = gate.lookup().await {
+        // R-040: a hit that answered from a target the key can no longer
+        // reach is not served. Its sealed ids name that target, so the next
+        // `previous_response_id` is refused — the ACL is right, and the hit
+        // is what must stop. Dropping it here rather than after the output
+        // chain keeps the request on the ordinary miss path, so the series
+        // records a miss and the request is answered afresh.
+        let hit = match gate.lookup().await {
+            Some(hit) if cache_hit_origin_eligible(snapshot, auth, &hit) => Some(hit),
+            _ => None,
+        };
+        if let Some(hit) = hit {
             let cache = crate::response_cache::CacheTelemetry::hit(&hit);
             // The cache answered for the entry the caller addressed: set the
             // target attribution before the output chain below can refuse it,
@@ -5895,6 +5938,84 @@ fn emit_access_log(
 
 #[cfg(test)]
 mod tests {
+    /// R-040: a cached answer is served only while the target that produced
+    /// it is still one the caller's key can reach. The ids inside it are
+    /// sealed to that target, and `admit_continuation` refuses to continue
+    /// from a target outside the key's groups — so serving the hit would
+    /// hand out an id the next call refuses, for the rest of the TTL.
+    #[test]
+    fn a_cached_answer_is_withheld_once_its_origin_leaves_the_keys_groups() {
+        use aisix_core::ResourceEntry;
+        let snap = aisix_core::AisixSnapshot::new();
+        for (id, name, provider_key_id) in [
+            ("id-target-a", "target-a", "pk-alpha"),
+            ("id-target-b", "target-b", "pk-beta"),
+        ] {
+            let model: aisix_core::Model = serde_json::from_value(serde_json::json!({
+                "display_name": name,
+                "provider": "openai",
+                "model_name": "gpt-4o-mini",
+                "provider_key_id": provider_key_id,
+            }))
+            .unwrap();
+            snap.models.insert(ResourceEntry::new(id, model, 1));
+        }
+        for (id, name, groups) in [
+            ("pk-alpha", "pk-alpha", vec!["grp-alpha"]),
+            ("pk-beta", "pk-beta", vec!["grp-beta"]),
+        ] {
+            let pk: aisix_core::ProviderKey = serde_json::from_value(serde_json::json!({
+                "display_name": name,
+                "api_key": "sk-x",
+                "groups": groups,
+            }))
+            .unwrap();
+            snap.provider_keys.insert(ResourceEntry::new(id, pk, 1));
+        }
+        let key: aisix_core::ApiKey = serde_json::from_value(serde_json::json!({
+            "key_hash": "h",
+            "allowed_models": ["*"],
+            "allowed_provider_groups": ["grp-beta"],
+        }))
+        .unwrap();
+        let auth = crate::auth::AuthenticatedKey {
+            anonymous: false,
+            entry: std::sync::Arc::new(ResourceEntry::new("key-entry-1", key, 1)),
+            jwt: None,
+            owner: Default::default(),
+            tags: Default::default(),
+        };
+        let body = |origin: &str| aisix_cache::CachedBody {
+            content_type: "application/json".into(),
+            body: Vec::new(),
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            origin_model_id: origin.to_string(),
+        };
+
+        // The origin left the key's groups: the hit must not be served.
+        assert!(!super::cache_hit_origin_eligible(
+            &snap,
+            &auth,
+            &body("id-target-a")
+        ));
+        // A target still in them serves, so the test cannot pass by refusing
+        // everything.
+        assert!(super::cache_hit_origin_eligible(
+            &snap,
+            &auth,
+            &body("id-target-b")
+        ));
+        // A target that no longer exists cannot be shown to be reachable.
+        assert!(!super::cache_hit_origin_eligible(
+            &snap,
+            &auth,
+            &body("id-gone")
+        ));
+        // An entry from before the origin was recorded keeps serving.
+        assert!(super::cache_hit_origin_eligible(&snap, &auth, &body("")));
+    }
+
     /// Serializing the borrowed request with only `model` swapped gives the
     /// same bytes as cloning it, rewriting `model` and serializing the clone.
     #[test]

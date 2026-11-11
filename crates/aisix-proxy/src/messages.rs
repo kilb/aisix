@@ -4396,6 +4396,10 @@ async fn store_in_cache(
             body: bytes.to_vec(),
             prompt_tokens: outcome.metrics.prompt_tokens,
             completion_tokens: outcome.metrics.completion_tokens,
+            // A Messages answer carries no continuation id the gateway
+            // validates, so no hit needs the origin (R-040 is a
+            // `/v1/responses` concern).
+            origin_model_id: String::new(),
         })
         .await;
     }
