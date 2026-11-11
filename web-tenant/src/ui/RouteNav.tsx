@@ -8,19 +8,21 @@ export interface RouteItem<Id extends string> {
 }
 
 /**
- * Sections as a segmented glass bar: a `tablist` of `tab`s named exactly by
- * their labels, in order. The current tab sits in the lens, a Signal-yellow
- * capsule that glides from the tab left to the one opened; it is drawn
- * outside the tabs, so each tab's text is its label alone. Tab `<id>` is
- * `stop-<id>` and controls `tab-<id>`, the `tabpanel` the caller renders
- * for the open section, labelled by its tab.
+ * Sections as tabs: a `tablist` of `tab`s named exactly by their labels, in
+ * order. The open tab is marked by the lens, drawn outside the tabs and
+ * gliding from the tab left to the one opened, so each tab's text is its
+ * label alone. Tab `<id>` is `stop-<id>` and controls `tab-<id>`, the
+ * `tabpanel` the caller renders for the open section, labelled by its tab.
  *
  * Keyboard: Tab reaches the current stop; the arrow keys, Home and End move
  * between stops, and Enter or Space opens one.
  *
- * `docked` is the portal's section bar: under the header, and on a phone a
- * floating bar along the bottom edge of the screen. Without it the bar
- * stays where it is placed (the gate's 登录 / 注册组织).
+ * Looks (ui.css): `segment`, the default, is shadcn's Tabs, a muted track
+ * with the open tab a white segment (the gate's 登录 / 注册组织);
+ * `underline` is Vercel's tabs, quiet text with a 2px rule under the open
+ * one (a card's own tabs). `docked` is the portal's section bar: underline
+ * tabs across the page under the header, and on a phone a bar along the
+ * bottom edge of the screen.
  */
 export function RouteNav<Id extends string>({
   label,
@@ -28,12 +30,16 @@ export function RouteNav<Id extends string>({
   current,
   onSelect,
   docked,
+  look = "segment",
+  className,
 }: {
   label: string;
   items: readonly RouteItem<Id>[];
   current: Id;
   onSelect: (id: Id) => void;
   docked?: boolean;
+  look?: "segment" | "underline";
+  className?: string;
 }) {
   const bar = useRef<HTMLElement>(null);
   const lens = useRef<HTMLSpanElement>(null);
@@ -83,8 +89,15 @@ export function RouteNav<Id extends string>({
     tabs[next]?.focus();
   }
 
+  const kind = docked ? "route docked" : look === "underline" ? "route route-line" : "route route-seg";
   return (
-    <nav ref={bar} className={docked ? "route docked" : "route"} role="tablist" aria-label={label} onKeyDown={onKeyDown}>
+    <nav
+      ref={bar}
+      className={className ? `${kind} ${className}` : kind}
+      role="tablist"
+      aria-label={label}
+      onKeyDown={onKeyDown}
+    >
       <span ref={lens} className="lens" aria-hidden="true" />
       {items.map((t) => (
         <button

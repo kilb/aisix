@@ -24,6 +24,7 @@ import { Field, useRefusalFocus } from "./ui/Field";
 import { KeySecret } from "./ui/KeySecret";
 import { Lamp, type LampState } from "./ui/Lamp";
 import { TwoStep } from "./ui/TwoStep";
+import { Card, CardHeader, PageHeader, Split } from "./components/page";
 
 type Caps = Org["limits"];
 
@@ -151,153 +152,160 @@ export function Keys({
   }
 
   return (
-    <div className="stack">
-      {active && (
-        <NewKeyForm
-          me={member}
-          manager={manager}
-          catalog={catalog}
-          groups={groups}
-          caps={caps}
-          people={people}
-          readErr={readErr}
-          onInactive={onSelfChanged}
-          onCreated={(plaintext) => {
-            setMinted(plaintext);
-            void load();
-          }}
-        />
-      )}
-      <div className="panel list">
-        <div className="panel-head">
-          <h2>密钥</h2>
-        </div>
-        <div className="panel-notes">
-          {!active && <div className="note crit">组织已被停用，所有密钥暂时无法调用；这里只能吊销密钥。</div>}
-          {minted && (
-            <ShownOnce title="密钥明文（可再次复制）" value={minted} onDone={() => setMinted(null)}>
-              <span className="hint">密钥创建成功。之后可在下面的密钥列表里随时点「复制」再次获取明文。</span>
-            </ShownOnce>
-          )}
-          {listErr && (
-            <div className="note crit" role="alert">
-              {listErr}
-            </div>
-          )}
-          {actionErr && (
-            <div className="note crit" role="alert">
-              {actionErr}
-            </div>
-          )}
-        </div>
-        {items === null ? (
-          !listErr && <Loading />
-        ) : items.length === 0 ? (
-          <EmptyState mark="key" text="还没有密钥。" />
-        ) : (
-          <DataTable>
-            <thead>
-              <tr>
-                <th>名称</th>
-                <th>前缀</th>
-                <th>归属</th>
-                <th>模型</th>
-                <th>分组</th>
-                <th>限制</th>
-                <th>状态</th>
-                <th>
-                  <span className="vh">操作</span>
-                </th>
-              </tr>
-            </thead>
-            <tbody>
-              {items.map((k) => {
-                const state = stateOf(k);
-                const owner = ownerOf(k);
-                const models = modelsOf(k);
-                return (
-                  <tr key={k.id}>
-                    <td>
-                      <span className="trunc" style={{ "--trunc": "160px" } as CSSProperties} title={k.label}>
-                        {k.label}
-                      </span>
-                    </td>
-                    <td>
-                      <KeySecret
-                        prefix={k.prefix}
-                        className="acts"
-                        reveal={() => keyApi.reveal(k.id)}
-                        unavailable={
-                          k.plaintext_available ? null : "该密钥创建于旧版本，无法再次查看；如需明文请新建密钥"
-                        }
-                        onError={(e) =>
-                          setActionErr(
-                            e instanceof ApiError && e.code === "plaintext_unavailable"
-                              ? messageFor(e)
-                              : e instanceof ApiError
-                                ? formMessageFor(e)
-                                : failure(e),
-                          )
-                        }
-                      />
-                    </td>
-                    <td>
-                      <span className="trunc" style={{ "--trunc": "128px" } as CSSProperties} title={owner}>
-                        {owner}
-                      </span>
-                    </td>
-                    <td>
-                      <span className="trunc" style={{ "--trunc": "216px" } as CSSProperties} title={models}>
-                        {models}
-                      </span>
-                    </td>
-                    <td>
-                      <GroupCell
-                        k={k}
-                        groups={groups}
-                        active={active}
-                        busy={busy === k.id}
-                        acting={acting}
-                        onChoose={(groupId) => void act(k, "group", () => keyApi.setGroup(k.id, groupId, k.version))}
-                      />
-                    </td>
-                    <td className="tabular">{limitsOf(k)}</td>
-                    <td>
-                      <Lamp state={state.lamp}>{state.text}</Lamp>
-                      {state.note && <span className="hint cell-note">{state.note}</span>}
-                    </td>
-                    <td className="right">
-                      <span className="acts">
-                        {/* The organisation's own switch, which the platform's overrides. */}
-                        {active && !k.disabled_by_platform && (
-                          <Button
-                            size="sm"
-                            disabled={busy === k.id}
-                            busy={busy === k.id && acting === "switch"}
-                            busyLabel={k.disabled ? "启用" : "停用"}
-                            onClick={() => void act(k, "switch", () => keyApi.setDisabled(k.id, !k.disabled, k.version))}
-                          >
-                            {k.disabled ? "启用" : "停用"}
-                          </Button>
-                        )}
-                        <TwoStep
-                          label="吊销"
-                          size="sm"
-                          warning="吊销后立即失效，且无法恢复"
-                          disabled={busy === k.id}
-                          busy={busy === k.id && acting === "revoke"}
-                          onConfirm={() => void act(k, "revoke", () => keyApi.revoke(k.id, k.version))}
-                        />
-                      </span>
-                    </td>
+    <>
+      <PageHeader title="密钥" />
+      <Split
+        asideWidth="clamp(288px, 22.5vw, 380px)"
+        main={
+          <Card className="keys-list">
+            {!active && <div className="note crit">组织已被停用，所有密钥暂时无法调用；这里只能吊销密钥。</div>}
+            {minted && (
+              <ShownOnce title="密钥明文（可再次复制）" value={minted} onDone={() => setMinted(null)}>
+                <span className="hint">密钥创建成功。之后可在下面的密钥列表里随时点「复制」再次获取明文。</span>
+              </ShownOnce>
+            )}
+            {listErr && (
+              <div className="note crit" role="alert">
+                {listErr}
+              </div>
+            )}
+            {actionErr && (
+              <div className="note crit" role="alert">
+                {actionErr}
+              </div>
+            )}
+            {items === null ? (
+              !listErr && <Loading />
+            ) : items.length === 0 ? (
+              <EmptyState mark="key" text="还没有密钥。" />
+            ) : (
+              <DataTable>
+                <thead>
+                  <tr>
+                    <th>名称</th>
+                    <th>前缀</th>
+                    <th>归属</th>
+                    <th>模型</th>
+                    <th>分组</th>
+                    <th>限制</th>
+                    <th>状态</th>
+                    <th>
+                      <span className="vh">操作</span>
+                    </th>
                   </tr>
-                );
-              })}
-            </tbody>
-          </DataTable>
-        )}
-      </div>
-    </div>
+                </thead>
+                <tbody>
+                  {items.map((k) => {
+                    const state = stateOf(k);
+                    const owner = ownerOf(k);
+                    const models = modelsOf(k);
+                    return (
+                      <tr key={k.id}>
+                        <td>
+                          <span className="trunc [--trunc:144px] min-[1800px]:[--trunc:160px]" title={k.label}>
+                            {k.label}
+                          </span>
+                        </td>
+                        <td>
+                          <KeySecret
+                            prefix={k.prefix}
+                            className="acts mt-1.5 flex w-max justify-start min-[1800px]:mt-0 min-[1800px]:ml-2 min-[1800px]:inline-flex"
+                            reveal={() => keyApi.reveal(k.id)}
+                            unavailable={
+                              k.plaintext_available ? null : "该密钥创建于旧版本，无法再次查看；如需明文请新建密钥"
+                            }
+                            onError={(e) =>
+                              setActionErr(
+                                e instanceof ApiError && e.code === "plaintext_unavailable"
+                                  ? messageFor(e)
+                                  : e instanceof ApiError
+                                    ? formMessageFor(e)
+                                    : failure(e),
+                              )
+                            }
+                          />
+                        </td>
+                        <td>
+                          <span className="trunc" style={{ "--trunc": "128px" } as CSSProperties} title={owner}>
+                            {owner}
+                          </span>
+                        </td>
+                        <td>
+                          <span className="trunc [--trunc:120px] min-[1800px]:[--trunc:216px]" title={models}>
+                            {models}
+                          </span>
+                        </td>
+                        <td>
+                          <GroupCell
+                            k={k}
+                            groups={groups}
+                            active={active}
+                            busy={busy === k.id}
+                            acting={acting}
+                            onChoose={(groupId) => void act(k, "group", () => keyApi.setGroup(k.id, groupId, k.version))}
+                          />
+                        </td>
+                        <td className="tabular [word-break:keep-all] max-[1799px]:whitespace-normal">
+                          <span className="block min-w-[5.75rem] max-w-[6.5rem] min-[1800px]:max-w-none">{limitsOf(k)}</span>
+                        </td>
+                        <td>
+                          <Lamp state={state.lamp}>{state.text}</Lamp>
+                          {state.note && (
+                            <span className="hint cell-note max-w-[8rem] whitespace-normal min-[1800px]:max-w-none">{state.note}</span>
+                          )}
+                        </td>
+                        <td className="right">
+                          <span className="acts">
+                            {/* The organisation's own switch, which the platform's overrides. */}
+                            {active && !k.disabled_by_platform && (
+                              <Button
+                                size="sm"
+                                disabled={busy === k.id}
+                                busy={busy === k.id && acting === "switch"}
+                                busyLabel={k.disabled ? "启用" : "停用"}
+                                onClick={() => void act(k, "switch", () => keyApi.setDisabled(k.id, !k.disabled, k.version))}
+                              >
+                                {k.disabled ? "启用" : "停用"}
+                              </Button>
+                            )}
+                            <TwoStep
+                              label="吊销"
+                              size="sm"
+                              warning="吊销后立即失效，且无法恢复"
+                              disabled={busy === k.id}
+                              busy={busy === k.id && acting === "revoke"}
+                              onConfirm={() => void act(k, "revoke", () => keyApi.revoke(k.id, k.version))}
+                            />
+                          </span>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </DataTable>
+            )}
+          </Card>
+        }
+        aside={
+          active ? (
+            <NewKeyForm
+              me={member}
+              manager={manager}
+              catalog={catalog}
+              groups={groups}
+              caps={caps}
+              people={people}
+              readErr={readErr}
+              onInactive={onSelfChanged}
+              onCreated={(plaintext) => {
+                setMinted(plaintext);
+                void load();
+              }}
+            />
+          ) : undefined
+        }
+      />
+    </>
   );
 }
 
@@ -549,14 +557,14 @@ function NewKeyForm({
   const noGroup = groups !== null && groups.length === 0;
 
   return (
-    <div className="panel">
-      <h2>新建密钥</h2>
+    <Card>
+      <CardHeader title="新建密钥" />
       {readErr && (
         <div className="note crit" role="alert">
           {readErr}
         </div>
       )}
-      <form ref={form} className="form cols" onSubmit={submit} noValidate>
+      <form ref={form} className="grid gap-x-4 gap-y-5 sm:grid-cols-2 xl:grid-cols-1 min-[1800px]:grid-cols-2" onSubmit={submit} noValidate>
         <Field label="名称" wide error={errs.label}>
           {(aria) => <input value={label} onChange={(e) => setLabel(e.target.value)} {...aria} />}
         </Field>
@@ -673,14 +681,14 @@ function NewKeyForm({
           {(aria) => <input inputMode="numeric" value={rpm} onChange={(e) => setRpm(e.target.value)} {...aria} />}
         </Field>
 
-        <Field label="过期时间" hint="留空表示永不过期；按本机时区" error={errs.expires}>
+        <Field label="过期时间" wide hint="留空表示永不过期；按本机时区" error={errs.expires}>
           {(aria) => (
             <input type="datetime-local" value={expires} onChange={(e) => setExpires(e.target.value)} {...aria} />
           )}
         </Field>
 
         {manager && (
-          <Field label="归属成员" error={errs.owner}>
+          <Field label="归属成员" wide error={errs.owner}>
             {(aria) => (
               <select value={owner} onChange={(e) => setOwner(e.target.value)} {...aria}>
                 <option value="">我</option>
@@ -696,16 +704,16 @@ function NewKeyForm({
         )}
 
         {err && (
-          <div className="note crit" role="alert">
+          <div className="note crit col-span-full" role="alert">
             {err}
           </div>
         )}
-        <div className="form-actions">
+        <div className="col-span-full -mx-6 -mb-6 flex justify-end gap-2 rounded-b-xl border-t border-border bg-muted/40 px-6 py-3 max-[719px]:-mx-4 max-[719px]:-mb-4 max-[719px]:px-4">
           <Button kind="primary" type="submit" busy={busy} disabled={noGroup}>
             新建密钥
           </Button>
         </div>
       </form>
-    </div>
+    </Card>
   );
 }

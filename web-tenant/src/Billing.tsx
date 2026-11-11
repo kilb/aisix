@@ -24,6 +24,7 @@ import { EmptyState } from "./ui/EmptyState";
 import { Field, useRefusalFocus } from "./ui/Field";
 import { Lamp, type LampState } from "./ui/Lamp";
 import { useToast } from "./ui/Toast";
+import { Card, CardHeader, PageHeader, Split } from "./components/page";
 
 function failure(e: unknown): string {
   return e instanceof ApiError ? messageFor(e) : String(e);
@@ -35,30 +36,29 @@ const REFERENCE_MAX = 128;
 /** Top-ups listed at most: the control plane's page maximum. */
 const TOPUPS_SHOWN = 500;
 
-/** A labelled reading in a panel, as the organisation page shows its own. */
+/** One figure of the balance: its label over the amount, a tile of the card's grid. */
 function Reading({ label, value }: { label: string; value: ReactNode }) {
   return (
-    <div className="entry">
+    <div className="entry flex min-w-0 flex-col gap-1.5 rounded-lg border border-border bg-muted/50 px-4 py-3.5">
       <span className="lab">{label}</span>
-      <span className="val">{value}</span>
+      <span className="val text-2xl tracking-tight max-sm:text-xl">{value}</span>
     </div>
   );
 }
 
-/** A panel that is a region named by its heading. */
-function Section({ title, children, list = false }: { title: string; children: ReactNode; list?: boolean }) {
+/** A card that is a region named by its heading. */
+function Section({ title, actions, children }: { title: string; actions?: ReactNode; children: ReactNode }) {
   return (
-    <div className={list ? "panel list" : "panel"} role="region" aria-label={title}>
-      {list ? (
-        <div className="panel-head">
-          <h2>{title}</h2>
-        </div>
-      ) : (
-        <h2>{title}</h2>
-      )}
+    <Card role="region" aria-label={title}>
+      <CardHeader title={title} actions={actions} />
       {children}
-    </div>
+    </Card>
   );
+}
+
+/** The filters above a list: labelled controls on one wrapping row. */
+function Filters({ children }: { children: ReactNode }) {
+  return <div className="filters flex flex-wrap items-start gap-x-3 gap-y-4 [&>.field]:w-full sm:[&>.field]:w-48">{children}</div>;
 }
 
 /**
@@ -119,20 +119,33 @@ export function Billing({ member }: { member: SessionMember }) {
   }, [loadBalance, loadTopups, loadTeam]);
 
   return (
-    <div className="stack billing">
-      <div className="deck billing-top">
-        <BalancePanel balance={balance} team={team} teamErr={teamErr} onRetryTeam={() => void loadTeam()} err={balanceErr} />
-        <Readout member={member} balance={balance} team={team} teamErr={teamErr} onRetryTeam={() => void loadTeam()} />
+    <>
+      <PageHeader title="账户" />
+      <div className="billing grid gap-6">
+        {/* What the organisation holds, and what the next call can still spend. */}
+        <div className="grid items-start gap-6 xl:grid-cols-2">
+          <BalancePanel balance={balance} team={team} teamErr={teamErr} onRetryTeam={() => void loadTeam()} err={balanceErr} />
+          <Readout member={member} balance={balance} team={team} teamErr={teamErr} onRetryTeam={() => void loadTeam()} />
+        </div>
+        <Split
+          asideWidth="380px"
+          main={
+            <div className="grid gap-6">
+              <TopupList items={topups} err={topupsErr} />
+              <Ledger topups={topups} />
+            </div>
+          }
+          aside={
+            <TopupForm
+              onRequested={() => {
+                void loadTopups();
+                void loadBalance();
+              }}
+            />
+          }
+        />
       </div>
-      <TopupForm
-        onRequested={() => {
-          void loadTopups();
-          void loadBalance();
-        }}
-      />
-      <TopupList items={topups} err={topupsErr} />
-      <Ledger topups={topups} />
-    </div>
+    </>
   );
 }
 
@@ -182,7 +195,16 @@ function BalancePanel({
         ? "组织额度已用尽，调用已停止"
         : "可正常调用";
   return (
-    <Section title="余额">
+    <Card role="region" aria-label="余额">
+      {/* The heading, and on its right whether calls are accepted now. */}
+      <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-2">
+        <h3 className="text-base font-semibold tracking-tight">余额</h3>
+        {balance && (
+          <p className="balance-state text-[13px] font-medium" data-state={!known ? "unknown" : exhausted ? "exhausted" : "ok"}>
+            <Lamp state={!known ? "pending" : exhausted ? "rejected" : "applied"}>{stateText}</Lamp>
+          </p>
+        )}
+      </div>
       {err && (
         <div className="note crit" role="alert">
           {err}
@@ -190,11 +212,8 @@ function BalancePanel({
       )}
       {balance && (
         <>
-          <p className="balance-state" data-state={!known ? "unknown" : exhausted ? "exhausted" : "ok"}>
-            <Lamp state={!known ? "pending" : exhausted ? "rejected" : "applied"}>{stateText}</Lamp>
-          </p>
           {!known && teamErr && <TeamFailed err={teamErr} onRetry={onRetryTeam} />}
-          <div className="entries">
+          <div className="entries grid gap-3 sm:grid-cols-2">
             <Reading label="余额" value={<Money micro={balance.balance_micro_cny} />} />
             <Reading label="信用额度" value={<Money micro={balance.credit_limit_micro_cny} />} />
             <Reading label="可用额度" value={<Money micro={balance.available_micro_cny} />} />
@@ -203,7 +222,7 @@ function BalancePanel({
         </>
       )}
       {!balance && !err && <Loading />}
-    </Section>
+    </Card>
   );
 }
 
@@ -320,7 +339,7 @@ function Readout({
 
   const picker =
     manager && items.length > 0 ? (
-      <div className="readout-pick">
+      <div className="readout-pick w-full sm:w-56">
         <Field label="密钥">
           <select value={keyId ?? ""} onChange={(e) => setKeyId(e.target.value)}>
             {items.map((k) => (
@@ -420,7 +439,7 @@ function TopupForm({ onRequested }: { onRequested: () => void }) {
 
   return (
     <Section title="申请充值">
-      <form className="form cols" ref={form} onSubmit={submit} noValidate>
+      <form className="grid gap-4 md:grid-cols-2 xl:grid-cols-1" ref={form} onSubmit={submit} noValidate>
         <Field label="充值金额（元）" error={errors.amount} hint="最多两位小数">
           {(aria) => (
             <input inputMode="decimal" autoComplete="off" value={amount} onChange={(e) => setAmount(e.target.value)} {...aria} />
@@ -435,11 +454,11 @@ function TopupForm({ onRequested }: { onRequested: () => void }) {
           {(aria) => <input autoComplete="off" maxLength={NOTE_MAX} value={note} onChange={(e) => setNote(e.target.value)} {...aria} />}
         </Field>
         {general && (
-          <div className="note crit" role="alert">
+          <div className="note crit col-span-full" role="alert">
             {general}
           </div>
         )}
-        <div className="form-actions">
+        <div className="col-span-full -mx-6 -mb-6 mt-2 flex justify-end gap-2 rounded-b-[11px] border-t border-border bg-muted/40 px-6 py-3 max-[719px]:-mx-4 max-[719px]:-mb-4 max-[719px]:px-4">
           <Button kind="primary" type="submit" busy={busy} busyLabel="提交中…">
             提交申请
           </Button>
@@ -466,16 +485,14 @@ function explanation(t: Topup): string | null {
 
 function TopupList({ items, err }: { items: Topup[] | null; err: string | null }) {
   return (
-    <Section title="充值记录" list>
+    <Section title="充值记录">
       {err && (
-        <div className="panel-notes">
-          <div className="note crit" role="alert">
-            {err}
-          </div>
+        <div className="note crit" role="alert">
+          {err}
         </div>
       )}
       {items === null && !err && <Loading />}
-      {items !== null && items.length === 0 && <EmptyState text="还没有充值记录，在上方填写金额即可提交申请" mark="route" />}
+      {items !== null && items.length === 0 && <EmptyState text="还没有充值记录，在「申请充值」中填写金额即可提交申请" mark="route" />}
       {items !== null && items.length > 0 && (
         <DataTable label="充值记录">
           <thead>
@@ -503,8 +520,13 @@ function TopupList({ items, err }: { items: Topup[] | null; err: string | null }
                   </td>
                   <td>{t.origin === "operator" ? "平台入账" : "本组织申请"}</td>
                   <td>{t.requested_by ? (t.requested_by.display_name ?? "—") : "平台"}</td>
-                  <td className="tabular">{fmtUtc(t.requested_at)}</td>
-                  <td className="tabular">{t.decided_at ? fmtUtc(t.decided_at) : "—"}</td>
+                  {/* Below 1800px a time takes two lines, its date over its clock, so the list fits beside the form. */}
+                  <td className="tabular max-[1799px]:whitespace-normal">
+                    <span className="block max-[1799px]:max-w-[6.5rem]">{fmtUtc(t.requested_at)}</span>
+                  </td>
+                  <td className="tabular max-[1799px]:whitespace-normal">
+                    <span className="block max-[1799px]:max-w-[6.5rem]">{t.decided_at ? fmtUtc(t.decided_at) : "—"}</span>
+                  </td>
                   <td>
                     {why ? (
                       <span className="trunc" title={why}>
@@ -623,30 +645,28 @@ function Ledger({ topups }: { topups: Topup[] | null }) {
 
   return (
     <>
-      <Section title="余额流水" list>
-        <div className="panel-notes">
-          <div className="filters">
-            <Field label="开始日期（UTC）" error={range ? null : "结束日期不能早于开始日期"}>
-              <input type="date" value={fromDate} max={toDate || undefined} onChange={(e) => setFromDate(e.target.value)} />
-            </Field>
-            <Field label="结束日期（UTC）">
-              <input type="date" value={toDate} min={fromDate || undefined} onChange={(e) => setToDate(e.target.value)} />
-            </Field>
-            <Field label="类型">
-              <select value={kind} onChange={(e) => setKind(e.target.value as "" | LedgerKind)}>
-                <option value="">全部</option>
-                <option value="usage">扣费</option>
-                <option value="topup">充值</option>
-                <option value="adjustment">调整</option>
-              </select>
-            </Field>
+      <Section title="余额流水">
+        <Filters>
+          <Field label="开始日期（UTC）" error={range ? null : "结束日期不能早于开始日期"}>
+            <input type="date" value={fromDate} max={toDate || undefined} onChange={(e) => setFromDate(e.target.value)} />
+          </Field>
+          <Field label="结束日期（UTC）">
+            <input type="date" value={toDate} min={fromDate || undefined} onChange={(e) => setToDate(e.target.value)} />
+          </Field>
+          <Field label="类型">
+            <select value={kind} onChange={(e) => setKind(e.target.value as "" | LedgerKind)}>
+              <option value="">全部</option>
+              <option value="usage">扣费</option>
+              <option value="topup">充值</option>
+              <option value="adjustment">调整</option>
+            </select>
+          </Field>
+        </Filters>
+        {err && (
+          <div className="note crit" role="alert">
+            {err}
           </div>
-          {err && (
-            <div className="note crit" role="alert">
-              {err}
-            </div>
-          )}
-        </div>
+        )}
         {rows === null && range && <Loading />}
         {rows !== null && rows.length === 0 && !err && <EmptyState text="所选范围内没有流水" mark="route" />}
         {rows !== null && rows.length > 0 && (
@@ -682,8 +702,8 @@ function Ledger({ topups }: { topups: Topup[] | null }) {
           </DataTable>
         )}
         {next !== null && (
-          <div className="panel-more">
-            <Button busy={more} busyLabel="加载中…" onClick={() => void loadMore()}>
+          <div className="panel-more -mx-6 -mb-6 !mt-0 flex justify-center rounded-b-[11px] border-t border-border bg-muted/40 px-6 py-3 max-[719px]:-mx-4 max-[719px]:-mb-4">
+            <Button size="sm" busy={more} busyLabel="加载中…" onClick={() => void loadMore()}>
               加载更多
             </Button>
           </div>
@@ -730,25 +750,26 @@ function Summary({ range, fromDate, toDate }: { range: { from?: string; to?: str
   }, [group, fromDate, toDate]);
 
   return (
-    <Section title="按期汇总" list>
-      <div className="panel-notes">
-        <div className="filters">
-          <Field label="汇总方式">
-            <select value={group} onChange={(e) => setGroup(e.target.value as "day" | "month")}>
-              <option value="day">按天</option>
-              <option value="month">按月</option>
-            </select>
-          </Field>
+    <Section
+      title="按期汇总"
+      actions={
+        <label className="flex items-center gap-2">
+          <span className="f-label">汇总方式</span>
+          <select className="h-8 w-auto pr-8 text-[13px]" value={group} onChange={(e) => setGroup(e.target.value as "day" | "month")}>
+            <option value="day">按天</option>
+            <option value="month">按月</option>
+          </select>
+        </label>
+      }
+    >
+      <p className="hint">
+        {chosen ? "使用余额流水的日期范围（UTC）" : group === "day" ? "未选日期时汇总最近 30 天（UTC）" : "未选日期时汇总最近 12 个月（UTC）"}
+      </p>
+      {err && (
+        <div className="note crit" role="alert">
+          {err}
         </div>
-        <p className="hint">
-          {chosen ? "使用余额流水的日期范围（UTC）" : group === "day" ? "未选日期时汇总最近 30 天（UTC）" : "未选日期时汇总最近 12 个月（UTC）"}
-        </p>
-        {err && (
-          <div className="note crit" role="alert">
-            {err}
-          </div>
-        )}
-      </div>
+      )}
       {rows === null && range && <Loading />}
       {rows !== null && rows.length === 0 && !err && <EmptyState text="所选范围内没有汇总" mark="route" />}
       {rows !== null && rows.length > 0 && (

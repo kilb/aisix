@@ -19,6 +19,7 @@ import { Lamp } from "./ui/Lamp";
 import { TwoStep } from "./ui/TwoStep";
 import { when } from "./Keys";
 import { ROLE_LABEL } from "./Org";
+import { Card, CardHeader, PageHeader, Split } from "./components/page";
 
 function failure(e: unknown): string {
   return e instanceof ApiError ? messageFor(e) : String(e);
@@ -129,213 +130,217 @@ export function Members({
   const manages = (m: Member) => isOwner || m.role !== "owner";
 
   return (
-    <div className="stack">
-      {active && (
-        <InviteForm
-          roles={roles}
-          onInactive={onSelfChanged}
-          onIssued={(email, invite) => {
-            setIssued({ email, link: inviteLink(invite), expiresAt: invite.expires_at });
-            void load();
-          }}
-        />
-      )}
-      {issued && (
-        <ShownOnce title="邀请链接只显示这一次" value={issued.link} onDone={() => setIssued(null)}>
-          <span className="hint">
-            发给 {issued.email}，{when(issued.expiresAt)} 前有效。对方打开链接、设置口令即可加入。
-          </span>
-        </ShownOnce>
-      )}
-
-      <div className="panel list">
-        <div className="panel-head">
-          <h2>成员</h2>
-        </div>
-        <div className="panel-notes">
-          {!active && <div className="note crit">组织已被停用；这里只能移除成员。</div>}
-          {listErr && (
-            <div className="note crit" role="alert">
-              {listErr}
-            </div>
-          )}
-          {actionErr && (
-            <div className="note crit" role="alert">
-              {actionErr}
-            </div>
-          )}
-        </div>
-        {people === null ? (
-          !listErr && <Loading />
-        ) : (
-          <DataTable>
-            <thead>
-              <tr>
-                <th>显示名</th>
-                <th>邮箱</th>
-                <th>角色</th>
-                <th>状态</th>
-                <th>
-                  <span className="vh">操作</span>
-                </th>
-              </tr>
-            </thead>
-            <tbody>
-              {people.map((m) => {
-                const self = m.id === member.id;
-                const draft = drafts[m.id];
-                return (
-                  <tr key={m.id}>
-                    <td>
-                      <span className="trunc" title={m.display_name ?? undefined}>
-                        {m.display_name ?? "—"}
-                        {self && <span className="self">（我）</span>}
-                      </span>
-                    </td>
-                    <td>
-                      <span className="trunc" style={{ "--trunc": "240px" } as CSSProperties} title={m.email}>
-                        {m.email}
-                      </span>
-                    </td>
-                    <td>
-                      {active && manages(m) ? (
-                        <span className="acts">
-                          <select
-                            aria-label={`${m.email} 的角色`}
-                            value={draft ?? m.role}
-                            onChange={(e) => setDrafts({ ...drafts, [m.id]: e.target.value as MemberRole })}
-                          >
-                            {roles.map((r) => (
-                              <option key={r} value={r}>
-                                {ROLE_LABEL[r]}
-                              </option>
-                            ))}
-                          </select>
-                          {/* A role change takes a second step: one that takes access away is destructive. */}
-                          {draft && draft !== m.role && (
-                            <span className="role-confirm is-in">
-                              {draft === "billing" && (
-                                <span className="hint warn-inline">账单角色不持有密钥，该成员的密钥将停止工作</span>
-                              )}
-                              <Button
-                                kind="danger"
-                                size="sm"
-                                disabled={busy === m.id}
-                                busy={busy === m.id && acting === "role"}
-                                busyLabel="确认更改角色"
-                                onClick={() =>
-                                  // The step stays, busy, until the change is answered.
-                                  void act(
-                                    m.id,
-                                    "role",
-                                    () => memberApi.setRole(m.id, draft),
-                                    self ? onSelfChanged : undefined,
-                                  ).finally(() => dropDraft(m.id))
-                                }
-                              >
-                                确认更改角色
-                              </Button>
-                              <Button size="sm" disabled={busy === m.id} onClick={() => dropDraft(m.id)}>
-                                取消
-                              </Button>
+    <>
+      <PageHeader title="成员" />
+      <Split
+        asideWidth="400px"
+        main={
+          <div className="grid gap-6">
+            <Card>
+              {!active && <div className="note crit">组织已被停用；这里只能移除成员。</div>}
+              {listErr && (
+                <div className="note crit" role="alert">
+                  {listErr}
+                </div>
+              )}
+              {actionErr && (
+                <div className="note crit" role="alert">
+                  {actionErr}
+                </div>
+              )}
+              {people === null ? (
+                !listErr && <Loading />
+              ) : (
+                <DataTable>
+                  <thead>
+                    <tr>
+                      <th>显示名</th>
+                      <th>邮箱</th>
+                      <th>角色</th>
+                      <th>状态</th>
+                      <th>
+                        <span className="vh">操作</span>
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {people.map((m) => {
+                      const self = m.id === member.id;
+                      const draft = drafts[m.id];
+                      return (
+                        <tr key={m.id}>
+                          <td>
+                            <span className="trunc" title={m.display_name ?? undefined}>
+                              {m.display_name ?? "—"}
+                              {self && <span className="self">（我）</span>}
                             </span>
-                          )}
-                        </span>
-                      ) : (
-                        (ROLE_LABEL[m.role] ?? m.role)
-                      )}
-                    </td>
-                    <td>
-                      <Lamp state={m.disabled ? "disabled" : "applied"}>{m.disabled ? "已被平台停用" : "正常"}</Lamp>
-                    </td>
-                    <td className="right">
-                      {manages(m) && (
-                        <TwoStep
-                          label="移除"
-                          size="sm"
-                          warning="该成员的所有密钥会被吊销"
-                          disabled={busy === m.id}
-                          busy={busy === m.id && acting === "remove"}
-                          onConfirm={() => void act(m.id, "remove", () => memberApi.remove(m.id), self ? onLeft : undefined)}
-                        />
-                      )}
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </DataTable>
-        )}
-      </div>
+                          </td>
+                          <td>
+                            <span className="trunc" style={{ "--trunc": "240px" } as CSSProperties} title={m.email}>
+                              {m.email}
+                            </span>
+                          </td>
+                          <td>
+                            {active && manages(m) ? (
+                              <span className="acts">
+                                <select
+                                  aria-label={`${m.email} 的角色`}
+                                  value={draft ?? m.role}
+                                  onChange={(e) => setDrafts({ ...drafts, [m.id]: e.target.value as MemberRole })}
+                                >
+                                  {roles.map((r) => (
+                                    <option key={r} value={r}>
+                                      {ROLE_LABEL[r]}
+                                    </option>
+                                  ))}
+                                </select>
+                                {/* A role change takes a second step: one that takes access away is destructive. */}
+                                {draft && draft !== m.role && (
+                                  <span className="role-confirm is-in">
+                                    {draft === "billing" && (
+                                      <span className="hint warn-inline">账单角色不持有密钥，该成员的密钥将停止工作</span>
+                                    )}
+                                    <Button
+                                      kind="danger"
+                                      size="sm"
+                                      disabled={busy === m.id}
+                                      busy={busy === m.id && acting === "role"}
+                                      busyLabel="确认更改角色"
+                                      onClick={() =>
+                                        // The step stays, busy, until the change is answered.
+                                        void act(
+                                          m.id,
+                                          "role",
+                                          () => memberApi.setRole(m.id, draft),
+                                          self ? onSelfChanged : undefined,
+                                        ).finally(() => dropDraft(m.id))
+                                      }
+                                    >
+                                      确认更改角色
+                                    </Button>
+                                    <Button size="sm" disabled={busy === m.id} onClick={() => dropDraft(m.id)}>
+                                      取消
+                                    </Button>
+                                  </span>
+                                )}
+                              </span>
+                            ) : (
+                              (ROLE_LABEL[m.role] ?? m.role)
+                            )}
+                          </td>
+                          <td>
+                            <Lamp state={m.disabled ? "disabled" : "applied"}>{m.disabled ? "已被平台停用" : "正常"}</Lamp>
+                          </td>
+                          <td className="right">
+                            {manages(m) && (
+                              <TwoStep
+                                label="移除"
+                                size="sm"
+                                warning="该成员的所有密钥会被吊销"
+                                disabled={busy === m.id}
+                                busy={busy === m.id && acting === "remove"}
+                                onConfirm={() => void act(m.id, "remove", () => memberApi.remove(m.id), self ? onLeft : undefined)}
+                              />
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </DataTable>
+              )}
+            </Card>
 
-      {active && (
-        <div className="panel list">
-          <div className="panel-head">
-            <h2>待接受的邀请</h2>
-          </div>
-          <div className="panel-notes">
-            {invitesErr && (
-              <div className="note crit" role="alert">
-                {invitesErr}
-              </div>
+            {active && (
+              <Card>
+                <CardHeader title="待接受的邀请" />
+                {invitesErr && (
+                  <div className="note crit" role="alert">
+                    {invitesErr}
+                  </div>
+                )}
+                {invites === null ? (
+                  !invitesErr && <Loading />
+                ) : invites.length === 0 ? (
+                  <EmptyState mark="mail" text="没有待接受的邀请。" />
+                ) : (
+                  <DataTable>
+                    <thead>
+                      <tr>
+                        <th>邮箱</th>
+                        <th>角色</th>
+                        <th>邀请人</th>
+                        <th>有效期至</th>
+                        <th>
+                          <span className="vh">操作</span>
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {invites.map((inv) => {
+                        const by = inv.invited_by === null ? "平台" : (inv.invited_by.display_name ?? "成员");
+                        return (
+                          <tr key={inv.id}>
+                            <td>
+                              <span className="trunc" style={{ "--trunc": "240px" } as CSSProperties} title={inv.email}>
+                                {inv.email}
+                              </span>
+                            </td>
+                            <td>{ROLE_LABEL[inv.role] ?? inv.role}</td>
+                            <td>
+                              <span className="trunc" title={by}>
+                                {by}
+                              </span>
+                            </td>
+                            <td className="tabular">{when(inv.expires_at)}</td>
+                            <td className="right">
+                              {(isOwner || inv.role !== "owner") && (
+                                <Button
+                                  size="sm"
+                                  disabled={busy === inv.id}
+                                  busy={busy === inv.id && acting === "revoke"}
+                                  busyLabel="撤销"
+                                  onClick={() => void act(inv.id, "revoke", () => memberApi.revokeInvite(inv.id))}
+                                >
+                                  撤销
+                                </Button>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </DataTable>
+                )}
+              </Card>
             )}
           </div>
-          {invites === null ? (
-            !invitesErr && <Loading />
-          ) : invites.length === 0 ? (
-            <EmptyState mark="mail" text="没有待接受的邀请。" />
-          ) : (
-            <DataTable>
-              <thead>
-                <tr>
-                  <th>邮箱</th>
-                  <th>角色</th>
-                  <th>邀请人</th>
-                  <th>有效期至</th>
-                  <th>
-                    <span className="vh">操作</span>
-                  </th>
-                </tr>
-              </thead>
-              <tbody>
-                {invites.map((inv) => {
-                  const by = inv.invited_by === null ? "平台" : (inv.invited_by.display_name ?? "成员");
-                  return (
-                    <tr key={inv.id}>
-                      <td>
-                        <span className="trunc" style={{ "--trunc": "240px" } as CSSProperties} title={inv.email}>
-                          {inv.email}
-                        </span>
-                      </td>
-                      <td>{ROLE_LABEL[inv.role] ?? inv.role}</td>
-                      <td>
-                        <span className="trunc" title={by}>
-                          {by}
-                        </span>
-                      </td>
-                      <td className="tabular">{when(inv.expires_at)}</td>
-                      <td className="right">
-                        {(isOwner || inv.role !== "owner") && (
-                          <Button
-                            size="sm"
-                            disabled={busy === inv.id}
-                            busy={busy === inv.id && acting === "revoke"}
-                            busyLabel="撤销"
-                            onClick={() => void act(inv.id, "revoke", () => memberApi.revokeInvite(inv.id))}
-                          >
-                            撤销
-                          </Button>
-                        )}
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </DataTable>
-          )}
-        </div>
-      )}
-    </div>
+        }
+        aside={
+          active || issued ? (
+            <div className="grid gap-4">
+              {active && (
+                <InviteForm
+                  roles={roles}
+                  onInactive={onSelfChanged}
+                  onIssued={(email, invite) => {
+                    setIssued({ email, link: inviteLink(invite), expiresAt: invite.expires_at });
+                    void load();
+                  }}
+                />
+              )}
+              {issued && (
+                <ShownOnce title="邀请链接只显示这一次" value={issued.link} onDone={() => setIssued(null)}>
+                  <span className="hint">
+                    发给 {issued.email}，{when(issued.expiresAt)} 前有效。对方打开链接、设置口令即可加入。
+                  </span>
+                </ShownOnce>
+              )}
+            </div>
+          ) : undefined
+        }
+      />
+    </>
   );
 }
 
@@ -371,9 +376,9 @@ function InviteForm({
   }
 
   return (
-    <div className="panel">
-      <h2>邀请成员</h2>
-      <form className="form inline" onSubmit={submit}>
+    <Card>
+      <CardHeader title="邀请成员" />
+      <form className="grid gap-4 sm:grid-cols-[minmax(0,1fr)_9rem]" onSubmit={submit}>
         <Field label="邮箱">
           <input type="email" required value={email} onChange={(e) => setEmail(e.target.value)} />
         </Field>
@@ -386,15 +391,17 @@ function InviteForm({
             ))}
           </select>
         </Field>
-        <Button kind="primary" type="submit" busy={busy}>
-          邀请成员
-        </Button>
         {err && (
-          <div className="note crit" role="alert">
+          <div className="note crit col-span-full" role="alert">
             {err}
           </div>
         )}
+        <div className="col-span-full flex justify-end">
+          <Button kind="primary" type="submit" busy={busy}>
+            邀请成员
+          </Button>
+        </div>
       </form>
-    </div>
+    </Card>
   );
 }
