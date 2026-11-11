@@ -173,6 +173,17 @@ way.
   `409 managed_resource` and a regeneration cannot silently overwrite one.
   `only_the_resources_module_writes_gw_resources` (`tests/boot.rs`) enforces
   the write half.
+- **Housekeeping replaces grants of a channel's generated direct model before
+  it prunes any tombstone, and the prune keeps a generated model tombstone
+  while a tenant grant or a live key selection still names it.** That
+  tombstone (owner `public:<public_model_id>`, at the direct model's own id)
+  is the repair's only proof that such a grant came from a channel: pruning
+  it first would let the proof expire between two ticks of an instance that
+  prunes on boot, and a grant an older release stored can be older than that.
+  A grant whose tombstone is gone anyway is left as it is and reported
+  (`tenant.generated_grants_replaced`'s `unresolved`, and a WARN naming the
+  tenant and ids), never guessed at: an operator removes the id through a
+  grant edit, which re-projects the keys.
 - **The control plane makes two outbound calls, both operator-only,
   bounded and scrubbed: the upstream-model route, which writes nothing, and
   the price library's fetch, which writes only the library.**
@@ -524,18 +535,6 @@ statement.
   row that broke the rule before the fence existed is repaired through
   `write_resource` (`channels::repair_routing`, run by every housekeeping
   tick), never by the fence.
-
-- **Housekeeping replaces grants of a channel's generated direct model before
-  it prunes any tombstone, and the prune keeps a generated model tombstone
-  while a tenant grant or a live key selection still names it.** That
-  tombstone (owner `public:<public_model_id>`, at the direct model's own id)
-  is the repair's only proof that such a grant came from a channel: pruning
-  it first would let the proof expire between two ticks of an instance that
-  prunes on boot, and a grant an older release stored can be older than that.
-  A grant whose tombstone is gone anyway is left as it is and reported
-  (`tenant.generated_grants_replaced`'s `unresolved`, and a WARN naming the
-  tenant and ids), never guessed at: an operator removes the id through a
-  grant edit, which re-projects the keys.
 
 ## Defaults fail closed
 

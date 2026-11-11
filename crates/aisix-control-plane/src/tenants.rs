@@ -1189,8 +1189,8 @@ fn replace_generated(
 /// public model; a key that selected the direct model selects the public
 /// one, where its tenant then holds it. Where the public model is retired,
 /// or the channel was removed since (no channel row and no live document),
-/// the grant is withdrawn. Run at boot and by every housekeeping tick. A
-/// `_LOCK_KEY`-free read of the housekeeping order covers the rest.
+/// the grant is withdrawn. Run at boot and by every housekeeping tick,
+/// ahead of the tombstone prune (`housekeeping::tick`).
 ///
 /// A grant that names a model with no live document, no channel row and no
 /// generated tombstone is not withdrawn: nothing says it came from a
