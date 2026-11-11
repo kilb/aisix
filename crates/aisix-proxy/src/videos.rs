@@ -1452,49 +1452,50 @@ async fn proxy_content(
     let cooldown_c = target.model_entry.value.cooldown.clone();
     // Held by the guard for as long as the body lives; a body dropped with
     // the relay still running releases the concurrency slot as it drops.
-    let settle = move |failure: Option<aisix_gateway::BridgeError>, delivered: u64, drained: bool| {
-        // A body that ends short of the length the upstream declared is the
-        // upstream failing to deliver it, not a finished download: reqwest
-        // usually reports it as a read error itself, and this is the witness
-        // for the transfer it believes it completed.
-        let failure = failure.or_else(|| {
-            expected_len
-                .filter(|len| delivered < *len)
-                .map(|_| aisix_gateway::BridgeError::StreamAborted)
-        });
-        // The upstream answered only if it delivered the whole transfer. A
-        // declared length is what ends it — the server stops polling a sized
-        // body once that many bytes are written, so the relay sees a drop,
-        // not an end — and an unsized one is whole when the relay drained
-        // it. Anything else was dropped mid-transfer and says nothing.
-        let whole = match expected_len {
-            Some(len) => delivered >= len,
-            None => drained,
-        };
-        let completed = failure.is_none() && whole;
-        let failed = failure.is_some();
-        let terminal = crate::stream_timeout::finish_bridge_stream(
-            &state_c.health,
-            &state_c.runtime_status,
-            &display_name_c,
-            &model_id_c,
-            cooldown_c.as_ref(),
-            failure,
-            completed,
-            200,
-            started,
-        );
-        // A download the caller abandoned is neither the target's success nor
-        // its failure, so it books no deployment sample at all — the same
-        // stance the route takes on the caller's own 499 row.
-        if completed || failed {
-            crate::attempt::RoutingTelemetry::record_deployment(
-                &state_c,
+    let settle =
+        move |failure: Option<aisix_gateway::BridgeError>, delivered: u64, drained: bool| {
+            // A body that ends short of the length the upstream declared is the
+            // upstream failing to deliver it, not a finished download: reqwest
+            // usually reports it as a read error itself, and this is the witness
+            // for the transfer it believes it completed.
+            let failure = failure.or_else(|| {
+                expected_len
+                    .filter(|len| delivered < *len)
+                    .map(|_| aisix_gateway::BridgeError::StreamAborted)
+            });
+            // The upstream answered only if it delivered the whole transfer. A
+            // declared length is what ends it — the server stops polling a sized
+            // body once that many bytes are written, so the relay sees a drop,
+            // not an end — and an unsized one is whole when the relay drained
+            // it. Anything else was dropped mid-transfer and says nothing.
+            let whole = match expected_len {
+                Some(len) => delivered >= len,
+                None => drained,
+            };
+            let completed = failure.is_none() && whole;
+            let failed = failure.is_some();
+            let terminal = crate::stream_timeout::finish_bridge_stream(
+                &state_c.health,
+                &state_c.runtime_status,
+                &display_name_c,
                 &model_id_c,
-                terminal.status,
+                cooldown_c.as_ref(),
+                failure,
+                completed,
+                200,
+                started,
             );
-        }
-    };
+            // A download the caller abandoned is neither the target's success nor
+            // its failure, so it books no deployment sample at all — the same
+            // stance the route takes on the caller's own 499 row.
+            if completed || failed {
+                crate::attempt::RoutingTelemetry::record_deployment(
+                    &state_c,
+                    &model_id_c,
+                    terminal.status,
+                );
+            }
+        };
     // The body's own end settles it, and so does its DROP: a response whose
     // declared length is reached stops being polled before the stream yields
     // `None`, and a download the caller abandons is dropped at its suspension
@@ -1521,7 +1522,8 @@ async fn proxy_content(
         }
     }
 
-    let upstream = crate::stream_timeout::with_read_timeout_bytes(resp.bytes_stream(), stream_budget);
+    let upstream =
+        crate::stream_timeout::with_read_timeout_bytes(resp.bytes_stream(), stream_budget);
     let relay = async_stream::stream! {
         futures::pin_mut!(upstream);
         let mut guard = ContentSettlement {
