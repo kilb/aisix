@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { draftOf, routingBody, statusesOf } from "./publicRouting.ts";
+import { draftOf, routingBody, sameRouting, statusesOf } from "./publicRouting.ts";
 
 // `npm run test:unit`.
 
@@ -91,4 +91,15 @@ test("statuses are read from any separator, and anything that is not a number is
   assert.deepEqual(statusesOf(""), []);
   assert.equal(statusesOf("408, gone"), null);
   assert.equal(statusesOf("4o8"), null);
+});
+
+test("an untouched form says the same as what was stored, and a changed one does not", () => {
+  const stored = { strategy: "failover", retries: 2, fallback_on_statuses: [408, 429], hash_on: [{ type: "header", name: "x" }] };
+  const draft = draftOf(stored, DEFAULT);
+  assert.equal(sameRouting(routingBody(draft, stored, DEFAULT, statusesOf(draft.statuses)), stored), true);
+  // Key order is not a difference.
+  assert.equal(sameRouting({ retries: 2, strategy: "failover" }, { strategy: "failover", retries: 2 }), true);
+  draft.retries = "3";
+  assert.equal(sameRouting(routingBody(draft, stored, DEFAULT, statusesOf(draft.statuses)), stored), false);
+  assert.equal(sameRouting({ fallback_on_statuses: [429, 408] }, { fallback_on_statuses: [408, 429] }), false);
 });

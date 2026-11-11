@@ -717,12 +717,14 @@ test("公共模型生成的模型在这里只能停用：停用后两张文档�
   // `409 managed_resource` and left the row in place.)
   await expect(routeRow.getByRole("button", { name: "删除", exact: true })).toHaveCount(0);
   await expect(directRow.getByRole("button", { name: "删除", exact: true })).toHaveCount(0);
-  // The routing document is the public name itself, so its settings are edited
-  // here; the per-account document is one account's mapping, and its editable
-  // surface is that account's 模型 section, so this row only views it.
+  // The routing document is the public name itself, so its settings and its
+  // targets are edited here; the per-account document is one account's
+  // mapping, edited as a target of the routing row, so this row only views it
+  // and says where it is changed.
   await expect(routeRow.getByRole("button", { name: "编辑", exact: true })).toBeVisible();
   await expect(directRow.getByRole("button", { name: "查看", exact: true })).toBeVisible();
-  await expect(directRow).toContainText("账号的「模型」里改");
+  await expect(directRow).toContainText(`在「${publicName}」的路由里改`);
+  await expect(directRow).not.toContainText("账号的「模型」");
   // The per-account row's one removal takes that account out of the routing
   // model; retiring the public name stays the routing row's own action.
   await expect(directRow.getByRole("button", { name: "移除该目标" })).toBeVisible();
@@ -979,10 +981,10 @@ test("保存路由设置后接着改：模型列表先读回来也从刚保存�
   await form.getByLabel("重试次数").fill("2");
 
   // After the save, the public models' list is held back for a moment, so
-  // the model list's read — which remounts this form at the regenerated
-  // document's version — lands first. The request still reaches the real
-  // control plane and its answer is passed on unchanged; only when it
-  // arrives moves, to the order the race needs.
+  // the model list's read — which brings the regenerated document — lands
+  // first. The request still reaches the real control plane and its answer is
+  // passed on unchanged; only when it arrives moves, to the order the race
+  // needs.
   let hold = false;
   await page.route(/\/admin\/public-models$/, async (route) => {
     if (hold && route.request().method() === "GET") await new Promise((r) => setTimeout(r, 2_500));
@@ -995,7 +997,7 @@ test("保存路由设置后接着改：模型列表先读回来也从刚保存�
   await form.getByRole("button", { name: "保存" }).click();
   await expect(page.getByText(`已保存「${publicName}」的路由设置`)).toBeVisible();
   await modelsRead;
-  // The remounted form shows what was just saved, not the defaults.
+  // The form shows what was just saved, not the defaults.
   const again = page.getByRole("form", { name: `编辑模型「${publicName}」` });
   await expect(again.getByLabel("选路策略")).toHaveValue("failover");
   await expect(again.getByLabel("重试次数")).toHaveValue("2");
@@ -1044,4 +1046,286 @@ test("内部直连行的查看打开只读表单：名称、账号、上游模�
     await form.getByRole("button", { name: "关闭" }).click();
     await expect(form).toHaveCount(0);
   }
+});
+
+/** The target of a public model's routing form that the account `accountName` serves through. */
+function publicTarget(form: Locator, accountName: string): Locator {
+  return form.getByRole("listitem").filter({ hasText: `账号：${accountName}` });
+}
+
+/** The upstream-model field of a target, once it has finished reading the account's list. */
+async function readyUpstream(target: Locator): Promise<Locator> {
+  const field = target.getByRole("combobox", { name: "上游模型名称" });
+  await field.focus();
+  await expect(field).toBeEnabled();
+  return field;
+}
+
+/** The channel row `accountId` holds for `publicModelId`, as the account's own 模型 section reads it. */
+async function channelRow(accountId: string, publicModelId: string): Promise<Json> {
+  const { items } = await stack.admin.get(`/admin/provider-keys/${accountId}/channel-models`);
+  return (items as Json[]).find((i) => i.public_model_id === publicModelId);
+}
+
+/** One chat call through the gateway, and the upstream model the stand-in was asked for. */
+async function servedAs(key: string, model: string): Promise<string[]> {
+  await clearUpstream();
+  await chat(key, model);
+  return upstreamModels();
+}
+
+test("公共模型的路由表单里直接改目标的上游模型、优先级和权重：保存后路由文档、账号映射和重新打开的表单都是新值", async ({
+  page,
+}) => {
+  const suffix = randomUUID().slice(0, 8);
+  const firstName = `acct-tgt-edit-a-${suffix}`;
+  const secondName = `acct-tgt-edit-b-${suffix}`;
+  const first = await mockAccount(firstName, ["shared"]);
+  const second = await mockAccount(secondName, ["shared"]);
+  const publicName = `pub-tgt-edit-${suffix}`;
+  const pub = await newPublicModel(publicName);
+  await serve(first.id, pub.id);
+  await serve(second.id, pub.id);
+  const key = await internalKey(`tgt-edit-key-${suffix}`, [publicName]);
+
+  await openModels(page);
+  await modelRow(page, publicName).getByRole("button", { name: "编辑", exact: true }).click();
+  const form = page.getByRole("form", { name: `编辑模型「${publicName}」` });
+  // The page no longer sends the operator to the account for these.
+  await expect(form).not.toContainText("上游账号 → 模型");
+  await expect(form).not.toContainText("账号的「模型」");
+
+  const a = publicTarget(form, firstName);
+  const b = publicTarget(form, secondName);
+  await expect(a.getByLabel("优先级")).toHaveValue("1");
+  await expect(a.getByLabel("权重")).toHaveValue("1");
+  await a.getByLabel("优先级").fill("5");
+  await a.getByLabel("权重").fill("3");
+  await (await readyUpstream(a)).fill(`gpt-tgt-edit-up-${suffix}`);
+  await b.getByLabel("权重").fill("2");
+  await form.getByRole("button", { name: "保存" }).click();
+  await expect(page.getByText(`已保存「${publicName}」`)).toBeVisible();
+
+  // The routing document the gateway reads carries the new tiers.
+  const directA = await modelNamed(`${publicName}#${firstName}`);
+  const directB = await modelNamed(`${publicName}#${secondName}`);
+  await expect.poll(async () => (await routingOf(pub.id)).targets, { timeout: APPLIED_WITHIN_MS }).toEqual([
+    { model_id: directA.id, priority: 5, weight: 3 },
+    { model_id: directB.id, priority: 1, weight: 2 },
+  ]);
+  expect((await modelNamed(`${publicName}#${firstName}`)).doc.model_name).toBe(`gpt-tgt-edit-up-${suffix}`);
+  // They are the accounts' own mappings, which their 模型 sections show too.
+  expect(await channelRow(first.id, pub.id)).toMatchObject({
+    served: true,
+    upstream_model: `gpt-tgt-edit-up-${suffix}`,
+    priority: 5,
+    weight: 3,
+  });
+  expect(await channelRow(second.id, pub.id)).toMatchObject({ served: true, priority: 1, weight: 2 });
+  // The routing settings were not touched by a target edit.
+  expect((await publicView(pub.id)).routing).toEqual({});
+  // The higher tier serves, under the upstream name it was given.
+  await expect
+    .poll(() => servedAs(key, publicName), { timeout: APPLIED_WITHIN_MS })
+    .toEqual([`gpt-tgt-edit-up-${suffix}`]);
+
+  // A reload shows what was stored.
+  await page.reload();
+  await page.getByRole("tab", { name: "模型与路由" }).click();
+  await modelRow(page, publicName).getByRole("button", { name: "编辑", exact: true }).click();
+  const again = page.getByRole("form", { name: `编辑模型「${publicName}」` });
+  const a2 = publicTarget(again, firstName);
+  await expect(a2.getByLabel("优先级")).toHaveValue("5");
+  await expect(a2.getByLabel("权重")).toHaveValue("3");
+  await expect(a2.getByRole("combobox", { name: "上游模型名称" })).toHaveValue(`gpt-tgt-edit-up-${suffix}`);
+  await expect(publicTarget(again, secondName).getByLabel("权重")).toHaveValue("2");
+});
+
+test("在公共模型的路由表单里添加目标：选另一个上游账号并填写映射，保存后它出现在路由里", async ({ page }) => {
+  const suffix = randomUUID().slice(0, 8);
+  const servingName = `acct-tgt-add-a-${suffix}`;
+  const addedName = `acct-tgt-add-b-${suffix}`;
+  const serving = await mockAccount(servingName, ["shared"]);
+  const added = await mockAccount(addedName, ["grp-beta-3e9"]);
+  const publicName = `pub-tgt-add-${suffix}`;
+  const pub = await newPublicModel(publicName);
+  await serve(serving.id, pub.id);
+  const key = await internalKey(`tgt-add-key-${suffix}`, [publicName]);
+
+  await openModels(page);
+  await modelRow(page, publicName).getByRole("button", { name: "编辑", exact: true }).click();
+  const form = page.getByRole("form", { name: `编辑模型「${publicName}」` });
+  await expect(publicTarget(form, servingName)).toHaveCount(1);
+  await form.getByRole("button", { name: "添加目标" }).click();
+  const row = form.getByRole("listitem", { name: /^新目标/ });
+  await expect(row).toHaveCount(1);
+  // An account that already serves the model is not offered again.
+  await expect(row.getByLabel("上游账号").locator(`option[value="${serving.id}"]`)).toHaveCount(0);
+  await row.getByLabel("上游账号").selectOption(added.id);
+  // The operator sees which groups the chosen account serves.
+  await expect(row).toContainText("grp-beta-3e9");
+  await (await readyUpstream(row)).fill(`gpt-tgt-add-up-${suffix}`);
+  await row.getByLabel("优先级").fill("9");
+  await row.getByLabel("权重").fill("4");
+  // Nothing is written before the save.
+  expect((await channelRow(added.id, pub.id)).served).toBe(false);
+  await form.getByRole("button", { name: "保存" }).click();
+  await expect(page.getByText(`已保存「${publicName}」`)).toBeVisible();
+
+  // The account's mapping exists, with what was typed, and the routing
+  // document names its direct model first.
+  expect(await channelRow(added.id, pub.id)).toMatchObject({
+    served: true,
+    enabled: true,
+    upstream_model: `gpt-tgt-add-up-${suffix}`,
+    priority: 9,
+    weight: 4,
+  });
+  const directAdded = await modelNamed(`${publicName}#${addedName}`);
+  const directServing = await modelNamed(`${publicName}#${servingName}`);
+  expect(directAdded?.doc.model_name).toBe(`gpt-tgt-add-up-${suffix}`);
+  await expect.poll(async () => (await routingOf(pub.id)).targets, { timeout: APPLIED_WITHIN_MS }).toEqual([
+    { model_id: directAdded.id, priority: 9, weight: 4 },
+    { model_id: directServing.id, priority: 1, weight: 1 },
+  ]);
+
+  // The form reads the targets back: the new one is an ordinary target now.
+  const listed = publicTarget(form, addedName);
+  await expect(listed).toHaveCount(1);
+  await expect(listed.getByLabel("优先级")).toHaveValue("9");
+  await expect(listed.getByLabel("权重")).toHaveValue("4");
+  await expect(listed).toContainText("grp-beta-3e9");
+  await expect(form.getByRole("listitem", { name: /^新目标/ })).toHaveCount(0);
+
+  // And the gateway sends the top tier to the account just added.
+  await expect
+    .poll(() => servedAs(key, publicName), { timeout: APPLIED_WITHIN_MS })
+    .toEqual([`gpt-tgt-add-up-${suffix}`]);
+});
+
+test("路由表单保存时一个目标被拒：错误标在那一行，其他改动照常保存、不丢；改正后再保存只补剩下的", async ({ page }) => {
+  const suffix = randomUUID().slice(0, 8);
+  const goodName = `acct-tgt-part-a-${suffix}`;
+  const badName = `acct-tgt-part-b-${suffix}`;
+  const good = await mockAccount(goodName, ["shared"]);
+  const bad = await mockAccount(badName, ["shared"]);
+  const publicName = `pub-tgt-part-${suffix}`;
+  const pub = await newPublicModel(publicName);
+  await serve(good.id, pub.id);
+  await serve(bad.id, pub.id);
+  const writes: string[] = [];
+  page.on("request", (r) => {
+    const path = new URL(r.url()).pathname;
+    if (r.method() === "PUT" || r.method() === "PATCH") writes.push(`${r.method()} ${path}`);
+  });
+
+  await openModels(page);
+  await modelRow(page, publicName).getByRole("button", { name: "编辑", exact: true }).click();
+  const form = page.getByRole("form", { name: `编辑模型「${publicName}」` });
+  const a = publicTarget(form, goodName);
+  const b = publicTarget(form, badName);
+  await a.getByLabel("权重").fill("3");
+  // A weight cannot be negative.
+  await b.getByLabel("权重").fill("-1");
+  await form.getByLabel("重试次数").fill("2");
+  await form.getByRole("button", { name: "保存" }).click();
+
+  // The refusal is at the refused field, on its own row only.
+  const refused = b.getByLabel("权重");
+  await expect(refused).toHaveAttribute("aria-invalid", "true");
+  expect(await description(refused)).not.toBe("");
+  await expect(a.getByLabel("权重")).not.toHaveAttribute("aria-invalid", "true");
+  // Nothing typed is lost, and the row that was written says so.
+  await expect(refused).toHaveValue("-1");
+  await expect(a.getByLabel("权重")).toHaveValue("3");
+  await expect(form.getByLabel("重试次数")).toHaveValue("2");
+  await expect(a).toContainText("已保存");
+  await expect(b).not.toContainText("已保存");
+  // What was accepted is stored; the refused row is as it was.
+  const directA = await modelNamed(`${publicName}#${goodName}`);
+  const directB = await modelNamed(`${publicName}#${badName}`);
+  await expect.poll(() => routingOf(pub.id), { timeout: APPLIED_WITHIN_MS }).toMatchObject({
+    retries: 2,
+    targets: [
+      { model_id: directA.id, priority: 1, weight: 3 },
+      { model_id: directB.id, priority: 1, weight: 1 },
+    ],
+  });
+
+  // Fixing the refused value and saving again finishes the rest, and only the rest.
+  writes.length = 0;
+  await refused.fill("2");
+  await form.getByRole("button", { name: "保存" }).click();
+  await expect(page.getByText(`已保存「${publicName}」`)).toBeVisible();
+  await expect(refused).not.toHaveAttribute("aria-invalid", "true");
+  expect(writes).toEqual([`PUT /admin/provider-keys/${bad.id}/channel-models/${pub.id}`]);
+  await expect.poll(() => routingOf(pub.id), { timeout: APPLIED_WITHIN_MS }).toMatchObject({
+    retries: 2,
+    targets: [
+      { model_id: directA.id, priority: 1, weight: 3 },
+      { model_id: directB.id, priority: 1, weight: 2 },
+    ],
+  });
+});
+
+test("只读运维打开公共模型的路由：看得到每个目标的上游模型、优先级和权重，但不能修改、添加或移除", async ({ page }) => {
+  const suffix = randomUUID().slice(0, 8);
+  const accountName = `acct-tgt-view-${suffix}`;
+  const account = await mockAccount(accountName, ["grp-view-5e8"]);
+  const publicName = `pub-tgt-view-${suffix}`;
+  const pub = await newPublicModel(publicName);
+  await stack.admin.put(`/admin/provider-keys/${account.id}/channel-models/${pub.id}`, {
+    upstream_model: `gpt-tgt-view-up-${suffix}`,
+    priority: 2,
+    weight: 3,
+  });
+  const viewer = { email: `viewer-tgt-${suffix}@e2e.local`, password: "viewer-tgt-pass-6d3" };
+  const created = await stack.admin.request("POST", "/admin/operators", { ...viewer, role: "viewer" });
+  expect(created.status, created.text).toBe(201);
+
+  await openModels(page, viewer);
+  await modelRow(page, publicName).getByRole("button", { name: "查看", exact: true }).click();
+  const form = page.getByRole("form", { name: `模型「${publicName}」` });
+  const target = publicTarget(form, accountName);
+  await expect(target).toContainText("grp-view-5e8");
+  await expect(target.getByLabel("优先级")).toHaveValue("2");
+  await expect(target.getByLabel("优先级")).toBeDisabled();
+  await expect(target.getByLabel("权重")).toHaveValue("3");
+  await expect(target.getByLabel("权重")).toBeDisabled();
+  await expect(target.getByRole("combobox", { name: "上游模型名称" })).toHaveValue(`gpt-tgt-view-up-${suffix}`);
+  await expect(target.getByRole("combobox", { name: "上游模型名称" })).toBeDisabled();
+  for (const name of ["保存", "添加目标", "移除该目标"]) {
+    await expect(form.getByRole("button", { name, exact: true })).toHaveCount(0);
+  }
+  await expect(form.getByRole("button", { name: "关闭" })).toBeVisible();
+});
+
+test("手工路由模型的编辑表单：改目标的权重和优先级、添加目标，保存后文档就是改后的值", async ({ page }) => {
+  const suffix = randomUUID().slice(0, 8);
+  const account = await mockAccount(`acct-hand-edit-${suffix}`, ["shared"]);
+  const one = await directModel(`chat-hand-one-${suffix}`, account.id, "gpt-hand-one-up");
+  const two = await directModel(`chat-hand-two-${suffix}`, account.id, "gpt-hand-two-up");
+  const routeName = `route-hand-edit-${suffix}`;
+  await createModel({ display_name: routeName, routing: { targets: [{ model_id: one.id, weight: 1 }] } });
+  const route = await modelNamed(routeName);
+
+  await openModels(page);
+  await modelRow(page, routeName).getByRole("button", { name: "编辑", exact: true }).click();
+  const form = page.getByRole("form", { name: `编辑模型「${routeName}」` });
+  const first = targetRows(form).nth(0);
+  await first.getByLabel("权重").fill("5");
+  await first.getByLabel("优先级").fill("2");
+  await form.getByRole("button", { name: "添加目标" }).click();
+  const second = targetRows(form).nth(1);
+  await second.getByLabel("目标模型").selectOption({ label: `chat-hand-two-${suffix}` });
+  await second.getByLabel("优先级").fill("1");
+  await form.getByRole("button", { name: "保存" }).click();
+  await expect(form).toHaveCount(0);
+
+  expect((await stack.admin.get(`/admin/resources/models/${route.id}`)).doc.routing).toEqual({
+    targets: [
+      { model_id: one.id, weight: 5, priority: 2 },
+      { model_id: two.id, priority: 1 },
+    ],
+  });
 });
