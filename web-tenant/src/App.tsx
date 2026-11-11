@@ -109,6 +109,15 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
   /** The group a `#prices?group=<id>` link named, read when that page opens. */
   const [priceGroup, setPriceGroup] = useState<string | null>(null);
   const [theme, toggleTheme] = useTheme();
+  /** Whether the page has scrolled under the sticky header, which then shows its rule. */
+  const [scrolled, setScrolled] = useState(false);
+
+  useEffect(() => {
+    const read = () => setScrolled(window.scrollY > 0);
+    read();
+    window.addEventListener("scroll", read, { passive: true });
+    return () => window.removeEventListener("scroll", read);
+  }, []);
 
   // Any page's request that finds the session gone drops back to the gate:
   // what was on screen is no longer the member's to see or act on. (The
@@ -241,21 +250,28 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
   const { member, tenant } = me;
   const visible = TABS.filter((t) => canSee(t.id, member, tenant.status));
   const current: TabId = visible.some((t) => t.id === tab) ? tab : "org";
+  const who = member.display_name || member.email;
 
   return (
     <div className="shell">
-      <header className="topbar">
-        <div className="wrap">
+      <header className={scrolled ? "topbar is-scrolled" : "topbar"}>
+        <div className="topbar-in">
           <span className="brand">
-            <span className="mark">Routio</span> <span className="app">组织门户</span>
+            <span className="brand-mark" aria-hidden="true" />
+            <span className="brand-name">
+              <span className="mark">Routio</span> <span className="app">组织门户</span>
+            </span>
           </span>
+          <span className="slash" aria-hidden="true" />
           <h1 className="org-name" title={tenant.name}>
             {tenant.name}
           </h1>
           {/* The separator stays in the text (and in what a screen reader
-              hears); on screen the role reads as a tag after the name. */}
+              hears); on screen the role reads as a badge after the name.
+              The initial is drawn from an attribute, so it is not text. */}
           <span className="me" title={member.email}>
-            <span className="me-name">{member.display_name || member.email}</span>
+            <span className="avatar" data-initial={[...who][0] ?? ""} aria-hidden="true" />
+            <span className="me-name">{who}</span>
             <span className="vh"> · </span>
             <span className="tag">{ROLE_LABEL[member.role] ?? member.role}</span>
           </span>
@@ -268,21 +284,23 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
         </div>
       </header>
 
+      {visible.length > 0 && (
+        <div className="route-bar">
+          <div className="route-bar-in">
+            <RouteNav label="组织门户分区" items={visible} current={current} onSelect={openSection} docked />
+          </div>
+        </div>
+      )}
+
       {signOutError && (
-        <div className="wrap">
+        <div className="route-bar-in shell-note">
           <div className="note crit signout-err" role="alert">
             {signOutError}
           </div>
         </div>
       )}
 
-      {visible.length > 0 && (
-        <div className="wrap route-bar">
-          <RouteNav label="组织门户分区" items={visible} current={current} onSelect={openSection} docked />
-        </div>
-      )}
-
-      <main className="wrap page">
+      <main className="page">
         <section
           id={`tab-${current}`}
           role={visible.length > 0 ? "tabpanel" : undefined}
