@@ -67,8 +67,27 @@ pub(crate) fn is_acceptable(id: &str) -> bool {
 /// over a correlation id would be a worse outcome than correlating them by
 /// a minted one. The fallback is logged at debug so an operator chasing a
 /// missing id has something to find.
-fn client_request_id(headers: &axum::http::HeaderMap, accept: &[HeaderName]) -> Option<String> {
+fn client_request_id(
+    headers: &axum::http::HeaderMap,
+    accept: &[HeaderName],
+    snapshot: &aisix_core::AisixSnapshot,
+    _request: &Request,
+) -> Option<String> {
+    // R-111: A passthrough route's auth slot is authentication, not a
+    // correlation id. Adopting it would write the credential into the span
+    // and the request id, which logs and telemetry would then export.
+    let passthrough_auth_slots: std::collections::HashSet<_> = snapshot
+        .passthrough_routes
+        .entries()
+        .iter()
+        .filter(|e| e.value.enabled)
+        .filter_map(|e| e.value.auth_header_name.as_ref())
+        .filter_map(|name| axum::http::HeaderName::from_bytes(name.as_bytes()).ok())
+        .collect();
     for name in accept {
+        if passthrough_auth_slots.contains(name) {
+            continue;
+        }
         let Some(raw) = headers.get(name) else {
             continue;
         };
@@ -204,7 +223,15 @@ pub(crate) async fn ensure_request_id(
         .extensions()
         .get::<RequestId>()
         .map(|r| r.0.clone())
-        .or_else(|| client_request_id(request.headers(), &state.request_id_accept))
+        .or_else(|| {
+            let snapshot = state.snapshot.load();
+            client_request_id(
+                request.headers(),
+                &state.request_id_accept,
+                &snapshot,
+                &request,
+            )
+        })
         .unwrap_or_else(new_request_id);
     request.extensions_mut().insert(RequestId(id.clone()));
 
@@ -423,6 +450,46 @@ mod tests {
                 .map(String::as_str)
                 .collect::<Vec<_>>(),
         )
+    }
+
+    /// R-111: a passthrough route's auth header is authentication, not a
+    /// correlation id. Adopting it writes the credential into the span and
+    /// the request id, which logs and telemetry would export.
+    #[tokio::test]
+    async fn passthrough_auth_headers_are_excluded_from_request_id_adoption() {
+        use aisix_core::{PassthroughRoute, ResourceEntry};
+        let snap = aisix_core::AisixSnapshot::new();
+        snap.passthrough_routes.insert(ResourceEntry::new(
+            "route-1",
+            serde_json::from_value::<PassthroughRoute>(serde_json::json!({
+                "name": "route-1",
+                "enabled": true,
+                "path_prefix": "/passthrough",
+                "target_url": "http://localhost",
+                "provider_key_id": "pk-1",
+                "auth_mode": "header_key",
+                "auth_header_name": "X-Secret-Token",
+            }))
+            .unwrap(),
+            1,
+        ));
+        let state = state_accepting(&["X-Request-ID", "X-Secret-Token"]);
+        state.snapshot.store(snap);
+        let req = Request::builder()
+            .uri("/passthrough/endpoint")
+            .header("X-Secret-Token", "secret-credential-value")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let adopted = client_request_id(
+            req.headers(),
+            &state.request_id_accept,
+            &state.snapshot.load(),
+            &req,
+        );
+        assert!(
+            adopted.is_none(),
+            "the auth header must not be adopted as a request id"
+        );
     }
 
     fn app_with(state: ProxyState) -> Router {
