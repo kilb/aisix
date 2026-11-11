@@ -1662,7 +1662,10 @@ mod tests {
         }
         for (tail, expected) in [
             (IN_BAND_ERROR_THEN_DONE, in_band_outcome()),
-            (&b"data: [DONE]\n\n"[..], Some(CompletionStreamOutcome::CleanEof)),
+            (
+                &b"data: [DONE]\n\n"[..],
+                Some(CompletionStreamOutcome::CleanEof),
+            ),
         ] {
             let mut body = frame(&"x".repeat(64), true);
             body.extend_from_slice(tail);
