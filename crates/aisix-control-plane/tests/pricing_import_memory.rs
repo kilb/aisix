@@ -125,3 +125,66 @@ fn a_dataset_whose_tiers_multiply_out_is_refused_before_they_are_copied() {
     let card = all[0].card.as_ref().expect("a card");
     assert_eq!(card.0.len(), 6, "the default tier and five named ones");
 }
+
+/// One provider whose pricing page is `url_bytes` long, with one model whose
+/// prices change on `dates` later days: `dates + 1` proposals, each copying
+/// the whole page.
+fn repeated_page(url_bytes: usize, dates: usize) -> String {
+    let url = format!("https://p.example/{}", "a".repeat(url_bytes));
+    let entries = std::iter::once(r#"{"prices":{"input_mtok":1,"output_mtok":2}}"#.to_string())
+        .chain((1..=dates).map(|n| {
+            format!(
+                r#"{{"constraint":{{"start_date":"{}"}},"prices":{{"input_mtok":2,"output_mtok":3}}}}"#,
+                chrono::NaiveDate::from_ymd_opt(2026, 12, 1)
+                    .expect("a date")
+                    .checked_add_days(chrono::Days::new(n as u64))
+                    .expect("a date")
+            )
+        }))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        r#"[{{"id":"p","pricing_urls":["{url}"],"models":[{{"id":"repeated","prices":[{entries}]}}]}}]"#
+    )
+}
+
+/// A page repeated over many dates is refused before the parse copies it into
+/// every proposal: a body of about 1 MiB whose page is 1 MiB long, copied into
+/// 128 proposals, would retain 128 MiB. The body itself is held, and none of
+/// the copies.
+#[test]
+fn a_page_repeated_over_many_dates_is_refused_before_it_is_copied() {
+    let now = Utc.with_ymd_and_hms(2026, 11, 10, 12, 0, 0).unwrap();
+    let text = repeated_page(1 << 20, 127);
+    let body = RawValue::from_string(text.clone()).expect("valid JSON");
+    let (peak, parsed) = peak_of(|| parse(&body, now));
+    let err = parsed.expect_err("refused");
+    assert_eq!(err.status.as_u16(), 422, "{err:?}");
+    assert_eq!(
+        err.details
+            .iter()
+            .map(|d| d.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["/data"]
+    );
+    assert!(
+        err.details[0].message.contains("文字过多"),
+        "the refusal names the copied text: {err:?}"
+    );
+    // The body, the raw value it was turned into, and the decoded providers
+    // that borrow from it: a few times 1 MiB, not its 128 copies.
+    assert!(
+        peak < 16 << 20,
+        "the parse held {} MiB before it refused the body",
+        peak >> 20
+    );
+
+    // The same page over no later date is a dataset like any other.
+    let body = RawValue::from_string(repeated_page(1 << 20, 0)).expect("valid JSON");
+    let all = parse(&body, now).expect("a dataset");
+    assert_eq!(all.len(), 1);
+    assert_eq!(
+        all[0].pricing_url.as_ref().map(String::len),
+        Some((1 << 20) + "https://p.example/".len())
+    );
+}
