@@ -223,6 +223,7 @@ mod tests {
             body: vec![0x00, 0xff, 0x7b, 0x7d],
             prompt_tokens: 7,
             completion_tokens: 0,
+            origin_model_id: String::new(),
         }
     }
 

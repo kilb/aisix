@@ -1008,6 +1008,10 @@ async fn dispatch(
                             body: body_bytes.clone(),
                             prompt_tokens,
                             completion_tokens: 0,
+                            // An embedding carries no continuation id, so no
+                            // hit needs the origin (R-040 is a
+                            // `/v1/responses` concern).
+                            origin_model_id: String::new(),
                         })
                         .await;
                     }

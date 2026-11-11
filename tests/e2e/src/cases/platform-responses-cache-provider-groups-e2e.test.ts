@@ -33,6 +33,9 @@ const KEYS = {
   alphaTwin: "sk-platform-rc-groups-alpha-twin",
   /** Same tenant, the beta group only. */
   beta: "sk-platform-rc-groups-beta",
+  /** Same tenant, both groups: a target leaving ONE of them still leaves a
+   * reachable one, which is the R-040 case. */
+  both: "sk-platform-rc-groups-both",
 };
 const ROUTE = "rc-groups-route";
 
@@ -59,6 +62,8 @@ describe("platform mode: a cached Response is one the receiving key can continue
   let app: SpawnedApp | undefined;
   let alphaUpstream: OpenAiUpstream | undefined;
   let betaUpstream: OpenAiUpstream | undefined;
+  let alphaPk: { id: string; value: Record<string, unknown> } | undefined;
+  let seed: SeedClient | undefined;
 
   beforeAll(async () => {
     const etcd = new EtcdClient();
@@ -77,32 +82,34 @@ describe("platform mode: a cached Response is one the receiving key can continue
         [PLATFORM_SECRET_ENV]: PLATFORM_SECRET,
       },
     });
-    const seed = new SeedClient(etcd, app.etcdPrefix);
+    seed = new SeedClient(etcd, app.etcdPrefix);
+    const seedClient = seed;
     const target = async (name: string, groups: string[], upstream: OpenAiUpstream) => {
-      const pk = await seed.createProviderKey({
+      const pk = await seedClient.createProviderKey({
         display_name: `${name}-pk`,
         secret: "sk-mock",
         api_base: `${upstream.baseUrl}/v1`,
         groups,
       });
-      await seed.createModel({
+      await seedClient.createModel({
         display_name: name,
         provider: "openai",
         model_name: "gpt-4o-mini",
         provider_key_id: pk.id,
         retries: 0,
       });
+      return pk;
     };
-    await target("rc-groups-alpha", ["rc-grp-alpha"], alphaUpstream);
+    alphaPk = await target("rc-groups-alpha", ["rc-grp-alpha"], alphaUpstream);
     await target("rc-groups-beta", ["rc-grp-beta"], betaUpstream);
-    await seed.createModel({
+    await seedClient.createModel({
       display_name: ROUTE,
       routing: {
         strategy: "failover",
         targets: [{ model: "rc-groups-alpha" }, { model: "rc-groups-beta" }],
       },
     });
-    await seed.createCachePolicy({
+    await seedClient.createCachePolicy({
       name: "rc-groups-cache",
       enabled: true,
       backend: "memory",
@@ -112,23 +119,29 @@ describe("platform mode: a cached Response is one the receiving key can continue
     });
     // The keys last: once the last one authenticates, the rest is in.
     const team = randomUUID();
-    await seed.createApiKey({
+    await seedClient.createApiKey({
       key_hash: hash(KEYS.alpha),
       team_id: team,
       allowed_models: [ROUTE],
       allowed_provider_groups: ["rc-grp-alpha"],
     });
-    await seed.createApiKey({
+    await seedClient.createApiKey({
       key_hash: hash(KEYS.alphaTwin),
       team_id: team,
       allowed_models: [ROUTE],
       allowed_provider_groups: ["rc-grp-alpha"],
     });
-    await seed.createApiKey({
+    await seedClient.createApiKey({
       key_hash: hash(KEYS.beta),
       team_id: team,
       allowed_models: [ROUTE],
       allowed_provider_groups: ["rc-grp-beta"],
+    });
+    await seedClient.createApiKey({
+      key_hash: hash(KEYS.both),
+      team_id: team,
+      allowed_models: [ROUTE],
+      allowed_provider_groups: ["rc-grp-alpha", "rc-grp-beta"],
     });
     const last = new ProxyClient(app.proxyUrl, KEYS.beta);
     await waitConfigPropagation(async () => (await last.listModels()).status === 200);
@@ -180,5 +193,58 @@ describe("platform mode: a cached Response is one the receiving key can continue
     expect(next.status, next.text).toBe(200);
     expect(betaUpstream!.receivedRequests.length - b0).toBe(2);
     expect(alphaUpstream!.receivedRequests.length - a0).toBe(1);
+  });
+
+  // R-040. The entry a key is served must still be one it can continue FROM,
+  // not merely one whose fingerprint it shares. The fingerprint folds the
+  // caller's groups, and those do not change when the target that answered
+  // leaves them — so the entry stays reachable and, without this check, is
+  // replayed with an id whose continuation the gateway then refuses, for the
+  // rest of the TTL.
+  test("an entry whose target left the key's group is not replayed, and the fresh answer can be continued", async (ctx) => {
+    if (!etcdReachable) ctx.skip();
+    const input = `rc-groups moved ${randomUUID()}`;
+    const a0 = alphaUpstream!.receivedRequests.length;
+    const b0 = betaUpstream!.receivedRequests.length;
+
+    // Warm the entry on the routing group's first target, which this key may
+    // reach (it holds both groups).
+    const warm = await respond(KEYS.both, { input });
+    expect(warm.status, warm.text).toBe(200);
+    expect(alphaUpstream!.receivedRequests.length - a0).toBe(1);
+    expect(betaUpstream!.receivedRequests.length - b0).toBe(0);
+
+    // Move that account out of BOTH groups, so it is no longer a target the
+    // key may reach. The routing group still holds a reachable member, which
+    // is what makes the stale entry the only thing standing in the way.
+    await seed!.update("provider_keys", alphaPk!.id, {
+      ...alphaPk!.value,
+      groups: ["rc-grp-other"],
+    });
+    // A probe whose input nothing else has sent, so it cannot be answered
+    // from the cache and its arrival at the beta upstream proves the reload.
+    await waitConfigPropagation(async () => {
+      const probe = await respond(KEYS.both, { input: `probe ${randomUUID()}` });
+      return probe.status === 200 && betaUpstream!.receivedRequests.length - b0 >= 1;
+    });
+    const b1 = betaUpstream!.receivedRequests.length;
+
+    // The warmed input now has to be re-asked, because the entry names a
+    // target this key can no longer continue from.
+    const again = await respond(KEYS.both, { input });
+    expect(again.status, again.text).toBe(200);
+    expect(
+      betaUpstream!.receivedRequests.length - b1,
+      "the stale entry was replayed instead of re-asking the reachable target",
+    ).toBe(1);
+    expect(again.json().id).not.toBe(warm.json().id);
+
+    // And what it was handed is one it can go on from — the point of the
+    // whole check: a replayed id would answer 400 here instead.
+    const next = await respond(KEYS.both, {
+      input: "and then?",
+      previous_response_id: again.json().id,
+    });
+    expect(next.status, next.text).toBe(200);
   });
 });

@@ -58,6 +58,13 @@ pub struct CachedBody {
     pub prompt_tokens: u32,
     #[serde(default)]
     pub completion_tokens: u32,
+    /// UUID of the Model row that produced this entry (R-040). A hit is
+    /// served only when the origin is still eligible for the caller — the
+    /// same `target_in_groups` check a continuation applies. Empty for
+    /// entries written before this field was added; they are served to any
+    /// caller (the existing behaviour).
+    #[serde(default)]
+    pub origin_model_id: String,
 }
 
 /// Bodies are arbitrary bytes — including the binary surfaces — so they are
