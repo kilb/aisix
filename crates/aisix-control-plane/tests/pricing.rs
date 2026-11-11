@@ -1761,6 +1761,82 @@ async fn charges_are_listed_by_event_key_tenant_and_status() {
     assert_422_at(&r, "status");
 }
 
+/// A charge names the upstream account and model that served its call, and
+/// carries the counters the upstream reported beside the lines it billed, so
+/// an operator can check one against the other. An account the row names
+/// that is gone shows as deleted, with no name.
+#[tokio::test]
+async fn a_charge_names_its_upstream_and_the_counters_the_upstream_reported() {
+    let Some(w) = world().await else { return };
+    let account = seed_provider_key(&w.cp, &w.admin).await;
+    let r = as_op(
+        &w.cp,
+        &w.admin,
+        "GET",
+        &format!("/admin/resources/provider_keys/{account}"),
+        None,
+    )
+    .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let account_name = r.body["doc"]["display_name"]
+        .as_str()
+        .expect("the account's name")
+        .to_string();
+    let model = seed_model(&w.cp, &w.admin).await;
+    price(&w.cp, model).await;
+    let mut served = usage(&w, "u-served", model, tokens_680());
+    served["provider_key_id"] = json!(account.to_string());
+    served["upstream_model"] = json!("gpt-4o-mini-2024-07-18");
+    served["reasoning_tokens"] = json!(50);
+    let gone = Uuid::new_v4();
+    let mut orphan = usage(&w, "u-orphan", model, tokens_680());
+    orphan["provider_key_id"] = json!(gone.to_string());
+    let bare = usage(&w, "u-bare", model, tokens_680());
+    let r = deliver(&w.dp, Uuid::new_v4(), vec![served, orphan, bare]).await;
+    assert_eq!((r.status, r.body.clone()), (200, counts(3, 0, 0)), "{r:?}");
+
+    let one = |event_id: &'static str| {
+        let w = &w;
+        async move {
+            let r = as_op(
+                &w.cp,
+                &w.admin,
+                "GET",
+                &format!("/admin/pricing/charges?event_id={event_id}"),
+                None,
+            )
+            .await;
+            assert_eq!(r.status, 200, "{event_id}: {r:?}");
+            r.body["items"][0].clone()
+        }
+    };
+
+    let c = one("u-served").await;
+    assert_eq!(c["upstream_account_id"], json!(account.to_string()), "{c}");
+    assert_eq!(c["upstream_account_name"], json!(account_name), "{c}");
+    assert_eq!(c["upstream_account_deleted"], false, "{c}");
+    assert_eq!(c["upstream_model"], "gpt-4o-mini-2024-07-18", "{c}");
+    let usage = c["usage"].as_object().expect("the reported counters");
+    assert_eq!(usage.get("prompt_tokens"), Some(&json!(1000)), "{c}");
+    assert_eq!(usage.get("cached_prompt_tokens"), Some(&json!(800)), "{c}");
+    assert_eq!(usage.get("completion_tokens"), Some(&json!(200)), "{c}");
+    assert_eq!(usage.get("reasoning_tokens"), Some(&json!(50)), "{c}");
+    assert!(usage.values().all(Value::is_number), "{c}");
+    // The billed side is still the lines, beside the reported counters.
+    assert!(c["lines"].as_array().is_some_and(|l| !l.is_empty()), "{c}");
+
+    let c = one("u-orphan").await;
+    assert_eq!(c["upstream_account_id"], json!(gone.to_string()), "{c}");
+    assert_eq!(c["upstream_account_name"], Value::Null, "{c}");
+    assert_eq!(c["upstream_account_deleted"], true, "{c}");
+    assert_eq!(c["upstream_model"], Value::Null, "{c}");
+
+    let c = one("u-bare").await;
+    assert_eq!(c["upstream_account_id"], Value::Null, "{c}");
+    assert_eq!(c["upstream_account_name"], Value::Null, "{c}");
+    assert_eq!(c["upstream_account_deleted"], false, "{c}");
+}
+
 /// The `?status=` filter of the charge listing pages on `(status, seq)`, so
 /// it must not rely on the planner choosing another index: that pair has an
 /// index of its own.

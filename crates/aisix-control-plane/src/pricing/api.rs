@@ -294,14 +294,28 @@ struct ChargeRow {
 }
 
 /// The fields of a charge's usage row an operator reads beside it: what
-/// the caller sent and how the attempt ended.
+/// the caller sent, how the attempt ended, which upstream account and model
+/// served it, and the counters the upstream reported.
 const CHARGE_EVENT: &str = "jsonb_build_object(\
     'requested_model', ue.event->'requested_model', \
     'status_code', ue.event->'status_code', \
     'error_class', ue.event->'error_class', \
     'attempt_kind', ue.event->'attempt_kind', \
     'attempt_index', ue.event->'attempt_index', \
-    'is_final_attempt', ue.event->'is_final_attempt')";
+    'is_final_attempt', ue.event->'is_final_attempt', \
+    'provider_key_id', ue.event->'provider_key_id', \
+    'upstream_model', ue.event->'upstream_model', \
+    'usage', jsonb_build_object(\
+        'prompt_tokens', ue.event->'prompt_tokens', \
+        'completion_tokens', ue.event->'completion_tokens', \
+        'cached_prompt_tokens', ue.event->'cached_prompt_tokens', \
+        'cache_write_tokens', ue.event->'cache_write_tokens', \
+        'cache_creation_tokens', ue.event->'cache_creation_tokens', \
+        'cache_creation_1h_tokens', ue.event->'cache_creation_1h_tokens', \
+        'cache_read_tokens', ue.event->'cache_read_tokens', \
+        'reasoning_tokens', ue.event->'reasoning_tokens', \
+        'web_search_requests', ue.event->'web_search_requests', \
+        'total_tokens', ue.event->'total_tokens'))";
 
 /// A charge as the listing shows it: its row, the model it names, and how
 /// its call ended.
@@ -323,6 +337,20 @@ struct ChargeItem {
     /// The attempt's 0-based index within its request.
     attempt_index: u64,
     is_final_attempt: Option<bool>,
+    /// The upstream account that served the call, by id; `None` when the
+    /// row names none.
+    upstream_account_id: Option<String>,
+    /// That account's display name, kept while its document or tombstone
+    /// is; `None` when the account is gone or the row names none.
+    upstream_account_name: Option<String>,
+    /// Whether the account the row names is deleted.
+    upstream_account_deleted: bool,
+    /// The upstream model name the account was asked for.
+    upstream_model: Option<String>,
+    /// The counters the upstream reported, as the usage row stores them,
+    /// only those it carries: the raw side of `lines`, for checking one
+    /// against the other. `None` when the charge has no usage row.
+    usage: Option<Map<String, Value>>,
 }
 
 /// A text field of `ev`, `None` when it is missing or empty.
@@ -378,6 +406,44 @@ async fn model_names(
     Ok(names)
 }
 
+/// The display names of the upstream accounts `ids` name, live or deleted
+/// (a tombstone is kept for a day), and whether each is still live.
+async fn account_names(
+    conn: &mut PgConnection,
+    ids: &[Uuid],
+) -> Result<HashMap<Uuid, ModelName>, DbError> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let docs: Vec<(Uuid, Option<String>, bool)> = sqlx::query_as(
+        "SELECT id, doc->>'display_name', NOT deleted FROM gw_resources \
+         WHERE kind = $1 AND id = ANY($2)",
+    )
+    .bind(Kind::ProviderKeys.segment())
+    .bind(ids)
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(docs
+        .into_iter()
+        .map(|(id, name, live)| {
+            let name = name.filter(|n| !n.is_empty()).unwrap_or_default();
+            (id, ModelName { name, live })
+        })
+        .collect())
+}
+
+/// The counters a usage row carries, numbers only, absent ones left out.
+fn reported_usage(ev: &Value) -> Option<Map<String, Value>> {
+    let usage = ev.get("usage")?.as_object()?;
+    Some(
+        usage
+            .iter()
+            .filter(|(_, v)| v.is_number())
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+    )
+}
+
 /// The name and the deleted flag of the model `requested_model_id` names, by
 /// `names`, else by the name the call sent.
 fn shown_model(
@@ -421,7 +487,11 @@ fn model_ids<'a>(raw: impl Iterator<Item = &'a str>) -> Vec<Uuid> {
 /// when no run corrected it. `model_name` names its model even once the
 /// model is deleted (`model_deleted`); `status_code`, `error_class`,
 /// `attempt_kind`, `attempt_index` and `is_final_attempt` say how its call
-/// ended. These are operators' fields: no tenant view reads them.
+/// ended. `upstream_account_id`, `upstream_account_name` (`null` once the
+/// account is gone; `upstream_account_deleted`) and `upstream_model` say
+/// which upstream served it, and `usage` holds the counters the upstream
+/// reported (only those the row carries), the raw side of `lines`. These
+/// are operators' fields: no tenant view reads them.
 pub async fn list_charges(
     auth: OperatorAuth,
     State(state): State<AppState>,
@@ -501,6 +571,12 @@ pub async fn list_charges(
         &model_ids(rows.iter().map(|r| r.requested_model_id.as_str())),
     )
     .await?;
+    let account_ids = model_ids(
+        rows.iter()
+            .filter_map(|r| r.ev.as_ref())
+            .filter_map(|ev| ev.get("provider_key_id").and_then(Value::as_str)),
+    );
+    let accounts = account_names(&mut conn, &account_ids).await?;
     let items: Vec<ChargeItem> = rows
         .into_iter()
         .map(|row| {
@@ -510,7 +586,18 @@ pub async fn list_charges(
                 &row.requested_model_id,
                 ev_text(&ev, "requested_model"),
             );
+            let upstream_account_id = ev_text(&ev, "provider_key_id");
+            let account = upstream_account_id
+                .as_deref()
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .and_then(|id| accounts.get(&id));
             ChargeItem {
+                upstream_account_name: account.map(|a| a.name.clone()).filter(|n| !n.is_empty()),
+                upstream_account_deleted: upstream_account_id.is_some()
+                    && account.is_none_or(|a| !a.live),
+                upstream_account_id,
+                upstream_model: ev_text(&ev, "upstream_model"),
+                usage: reported_usage(&ev),
                 model_name,
                 model_deleted,
                 status_code: ev
