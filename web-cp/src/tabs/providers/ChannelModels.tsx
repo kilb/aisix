@@ -291,6 +291,23 @@ export function ChannelModels({
   }
 
   /**
+   * Drops one public model's row from what this section holds: its row, its
+   * draft and its baseline entry. Called once a removal is confirmed, so a
+   * read-back that fails cannot leave the removed row (and a stale edit of
+   * it) for the next save to write back.
+   */
+  function forget(id: string) {
+    baseline.current = baseline.current?.filter((r) => r.public_model_id !== id) ?? null;
+    setRows((prev) => prev?.filter((r) => r.public_model_id !== id) ?? prev);
+    setDrafts((prev) => {
+      if (prev[id] === undefined) return prev;
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+  }
+
+  /**
    * 删除模型: this account's mapping goes first, then the public model is
    * stopped — the two writes [removeThenRetire] names, kept apart in the
    * answer because the second can be refused after the first succeeded. A
@@ -311,6 +328,11 @@ export function ChannelModels({
       setRefusal(removalFailedText(name, outcome.error));
       return;
     }
+    // The removal is confirmed, so the row goes now, before the read-back:
+    // a read-back that fails would otherwise leave the row, and a draft the
+    // operator had edited, where the next save would write the mapping back
+    // as a new one. The read-back below still settles every other row.
+    if (outcome.kind !== "removal_unknown") forget(id);
     // This model's row takes what the server now says, whatever its draft
     // held; every other row keeps whatever was edited.
     const read = await load(true, [id]);

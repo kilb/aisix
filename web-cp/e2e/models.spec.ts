@@ -921,6 +921,64 @@ test("账号页删除模型被保留后，只保存另一行的改动：被移�
   expect(puts.some((r) => r.endsWith(`/${edited.id}`)), puts.join("\n")).toBe(true);
 });
 
+test("账号页删除模型后读回失败：被删掉的映射不会被后来的保存写回，其他草稿照旧保留", async ({ page }) => {
+  const suffix = randomUUID().slice(0, 8);
+  const accountName = `acct-del-readback-${suffix}`;
+  const account = await mockAccount(accountName, ["shared"]);
+  const other = await mockAccount(`acct-del-readback-other-${suffix}`, ["shared"]);
+  const removed = await newPublicModel(`pub-del-readback-p-${suffix}`);
+  const edited = await newPublicModel(`pub-del-readback-q-${suffix}`);
+  await serve(account.id, removed.id);
+  await serve(account.id, edited.id);
+  // Another account still serves P, so its retire is refused and P stays live:
+  // a write-back of this account's mapping would really recreate it.
+  await serve(other.id, removed.id);
+  const requests: string[] = [];
+  page.on("request", (r) => {
+    if (r.url().includes(`/admin/provider-keys/${account.id}/channel-models/`)) requests.push(`${r.method()} ${r.url()}`);
+  });
+
+  const section = await openAccountModels(page, accountName);
+  // A genuine edit of P before the delete, and one of Q that must survive it.
+  await accountRow(section, removed.name).getByRole("textbox", { name: `优先级 ${removed.name}` }).fill("7");
+  await accountRow(section, edited.name).getByRole("textbox", { name: `优先级 ${edited.name}` }).fill("5");
+
+  // The read-back after the confirmed removal fails: the request still
+  // reaches the control plane (whose answer is passed on unchanged); only
+  // this one answer is replaced, to reproduce the state the review found.
+  let failRead = false;
+  await page.route(new RegExp(`/admin/provider-keys/${account.id}/channel-models$`), async (route) => {
+    if (failRead) {
+      failRead = false;
+      await route.abort();
+      return;
+    }
+    await route.continue();
+  });
+  const pRow = accountRow(section, removed.name);
+  await pRow.getByRole("button", { name: "删除模型" }).click();
+  failRead = true;
+  await pRow.getByRole("button", { name: "确认删除模型" }).click();
+  // The partial outcome is still reported from the writes themselves.
+  await expect(section.getByRole("alert").filter({ hasText: "本账号的映射已移除" })).toContainText(
+    `「${removed.name}」没有停用，仍然存在`,
+  );
+  // The row is gone from the checklist even though the read-back failed.
+  await expect(accountRow(section, removed.name)).toHaveCount(0);
+  await expect(accountRow(section, edited.name).getByRole("textbox", { name: `优先级 ${edited.name}` })).toHaveValue("5");
+
+  await section.getByRole("button", { name: "写入映射" }).click();
+  await expect(section.getByText("已保存 1 个模型的映射。")).toBeVisible();
+  await page.unroute(new RegExp(`/admin/provider-keys/${account.id}/channel-models$`));
+  const table = await stack.admin.get(`/admin/provider-keys/${account.id}/channel-models`);
+  const rowOf = (id: string) => (table.items as Json[]).find((i) => i.public_model_id === id);
+  expect(rowOf(removed.id)?.served, "the removed mapping stayed removed").toBe(false);
+  expect(rowOf(edited.id)).toMatchObject({ served: true, priority: 5 });
+  const puts = requests.filter((r) => r.startsWith("PUT "));
+  expect(puts.some((r) => r.endsWith(`/${removed.id}`)), puts.join("\n")).toBe(false);
+  expect(puts.some((r) => r.endsWith(`/${edited.id}`)), puts.join("\n")).toBe(true);
+});
+
 test("账号页删除模型时它已被别人停用：说它已经停用，而不是说没有停用", async ({ page }) => {
   const suffix = randomUUID().slice(0, 8);
   const accountName = `acct-del-gone-${suffix}`;
@@ -1141,6 +1199,47 @@ test("公共模型的路由表单里直接改目标的上游模型、优先级�
   await expect(publicTarget(again, secondName).getByLabel("权重")).toHaveValue("2");
 });
 
+test("刷新后保存：只改权重的那个目标，别人改过的优先级在保存后仍然是别人的值", async ({ page }) => {
+  const suffix = randomUUID().slice(0, 8);
+  const firstName = `acct-tgt-refresh-a-${suffix}`;
+  const secondName = `acct-tgt-refresh-b-${suffix}`;
+  const first = await mockAccount(firstName, ["shared"]);
+  const second = await mockAccount(secondName, ["shared"]);
+  const publicName = `pub-tgt-refresh-${suffix}`;
+  const pub = await newPublicModel(publicName);
+  await serve(first.id, pub.id);
+  await serve(second.id, pub.id);
+
+  await openModels(page);
+  await modelRow(page, publicName).getByRole("button", { name: "编辑", exact: true }).click();
+  const form = page.getByRole("form", { name: `编辑模型「${publicName}」` });
+  const a = publicTarget(form, firstName);
+  await expect(a.getByLabel("优先级")).toHaveValue("1");
+  // This operator edits the weight and nothing else.
+  await a.getByLabel("权重").fill("3");
+
+  // Meanwhile another operator changes the same target's priority through the
+  // canonical API, and this page reads it again.
+  await stack.admin.put(`/admin/provider-keys/${first.id}/channel-models/${pub.id}`, { priority: 9 });
+  await page.getByRole("button", { name: "刷新", exact: true }).click();
+  // The untouched field now shows the other operator's value.
+  await expect(a.getByLabel("优先级")).toHaveValue("9");
+  await expect(a.getByLabel("权重")).toHaveValue("3");
+
+  await form.getByRole("button", { name: "保存" }).click();
+  await expect(page.getByText(`已保存「${publicName}」`)).toBeVisible();
+  // Both changes hold: the untouched priority was never sent back as 1.
+  expect(await channelRow(first.id, pub.id)).toMatchObject({ served: true, priority: 9, weight: 3 });
+  // The other account was not written at all.
+  expect(await channelRow(second.id, pub.id)).toMatchObject({ served: true, priority: 1, weight: 1 });
+  const directA = await modelNamed(`${publicName}#${firstName}`);
+  const directB = await modelNamed(`${publicName}#${secondName}`);
+  await expect.poll(async () => (await routingOf(pub.id)).targets, { timeout: APPLIED_WITHIN_MS }).toEqual([
+    { model_id: directA.id, priority: 9, weight: 3 },
+    { model_id: directB.id, priority: 1, weight: 1 },
+  ]);
+});
+
 test("在公共模型的路由表单里添加目标：选另一个上游账号并填写映射，保存后它出现在路由里", async ({ page }) => {
   const suffix = randomUUID().slice(0, 8);
   const servingName = `acct-tgt-add-a-${suffix}`;
@@ -1201,6 +1300,91 @@ test("在公共模型的路由表单里添加目标：选另一个上游账号�
   await expect
     .poll(() => servedAs(key, publicName), { timeout: APPLIED_WITHIN_MS })
     .toEqual([`gpt-tgt-add-up-${suffix}`]);
+});
+
+test("新目标换一个上游账号：新账号会被查询，前一个账号的列表与原因不带到新账号上，已输入的模型名保留", async ({
+  page,
+}) => {
+  const suffix = randomUUID().slice(0, 8);
+  // The loopback accounts' lists cannot be read here (the control plane
+  // refuses a loopback address, as it does in production). The bedrock one is
+  // a platform with no model list at all, so each account answers with its own
+  // reason and the two are distinguishable in the page.
+  const a = await mockAccount(`acct-picker-a-${suffix}`, ["shared"]);
+  // One account serves it from the start: a public model with no target
+  // generates no routing document, so the list would have no row to open.
+  const serving = await mockAccount(`acct-picker-s-${suffix}`, ["shared"]);
+  const b = await stack.admin.post("/admin/resources/provider_keys", {
+    doc: {
+      display_name: `acct-picker-b-${suffix}`,
+      provider: "bedrock",
+      adapter: "bedrock",
+      api_key: `sk-acct-picker-b-${suffix}`,
+      api_base: null,
+      groups: ["shared"],
+    },
+  });
+  const c = await mockAccount(`acct-picker-c-${suffix}`, ["shared"]);
+  const publicName = `pub-picker-${suffix}`;
+  const pub = await newPublicModel(publicName);
+  await serve(serving.id, pub.id);
+  const looked: string[] = [];
+  page.on("request", (r) => {
+    const m = /^\/admin\/provider-keys\/([^/]+)\/upstream-models$/.exec(new URL(r.url()).pathname);
+    if (m) looked.push(m[1]!);
+  });
+
+  await openModels(page);
+  await modelRow(page, publicName).getByRole("button", { name: "编辑", exact: true }).click();
+  const form = page.getByRole("form", { name: `编辑模型「${publicName}」` });
+  await form.getByRole("button", { name: "添加目标" }).click();
+  const row = form.getByRole("listitem", { name: /^新目标/ });
+  const account = row.getByLabel("上游账号");
+  await account.selectOption(a.id);
+  const field = row.getByRole("combobox", { name: "上游模型名称" });
+  await field.focus();
+  // The first account's answer: its list cannot be fetched from here.
+  await expect(row.locator(".upicker-fallback")).toContainText("无法连接该上游获取模型列表，请直接填写模型名称");
+  await expect(row.locator(".upicker-reason")).not.toHaveCount(0);
+  await field.fill(`typed-for-${suffix}`);
+
+  // The same row switches to the bedrock account: it is asked now, and what
+  // the first one answered is not what the second one shows.
+  await account.selectOption(b.id);
+  await row.getByRole("combobox", { name: "上游模型名称" }).focus();
+  await expect.poll(() => looked.filter((id) => id === b.id).length).toBeGreaterThan(0);
+  await expect(row.locator(".upicker-reason")).toContainText("该类型的上游不提供模型列表，请直接填写模型名称");
+  // The typed name survives the switch; the field is still free text.
+  await expect(row.getByRole("combobox", { name: "上游模型名称" })).toHaveValue(`typed-for-${suffix}`);
+
+  // And the same switch while the answer is still in flight: the late answer
+  // must not land on the account switched to either. The answer is held for a
+  // moment so the window is the one this test opens, not whichever one the
+  // network happened to provide; it still comes from the real control plane.
+  await page.route(new RegExp(`/admin/provider-keys/${c.id}/upstream-models$`), async (route) => {
+    await new Promise((r) => setTimeout(r, 2_500));
+    await route.continue();
+  });
+  await account.selectOption(c.id);
+  const pending = row.getByRole("combobox", { name: "上游模型名称" });
+  await pending.focus();
+  await expect(row.locator(".upicker-loading")).toBeVisible();
+  await account.selectOption(b.id);
+  await row.getByRole("combobox", { name: "上游模型名称" }).focus();
+  await expect(row.locator(".upicker-reason")).toContainText("该类型的上游不提供模型列表，请直接填写模型名称");
+  // Past the point the first account's answer has arrived.
+  await page.waitForTimeout(3_000);
+  await expect(row.locator(".upicker-reason")).toContainText("该类型的上游不提供模型列表，请直接填写模型名称");
+  await expect(row.locator(".upicker-reason")).not.toContainText("无法连接该上游");
+  await page.unroute(new RegExp(`/admin/provider-keys/${c.id}/upstream-models$`));
+
+  await row.getByLabel("优先级").fill("2");
+  await form.getByRole("button", { name: "保存" }).click();
+  await expect(page.getByText(`已保存「${publicName}」`)).toBeVisible();
+  expect(await channelRow(b.id, pub.id)).toMatchObject({ served: true, upstream_model: `typed-for-${suffix}` });
+  // Neither of the accounts switched away from was mapped.
+  expect(await channelRow(a.id, pub.id)).toMatchObject({ served: false });
+  expect(await channelRow(c.id, pub.id)).toMatchObject({ served: false });
 });
 
 test("路由表单保存时一个目标被拒：错误标在那一行，其他改动照常保存、不丢；改正后再保存只补剩下的", async ({ page }) => {
