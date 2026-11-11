@@ -1061,14 +1061,9 @@ const RETIRABLE_CAPACITY: usize = 65_536;
 /// How many consecutive sweeps keep a [`GaugeLiveness::Gone`] series in the
 /// registry, re-marking it retired, before it is forgotten.
 ///
-/// Dropping it on the first sweep leaves a window the retire epoch cannot
-/// close: a worker that read the epoch, then cached its handle, can have the
-/// sweep run between that read and its write, and the write lands on a
-/// series no later sweep knows about — a finite value asserting itself
-/// forever (the retired gauge "comes back"). Keeping the entry means the
-/// next sweep marks it again; two sweeps are enough because the sweep moves
-/// the epoch, so the racing worker's NEXT emit re-registers through
-/// `track_retirable` and lands in the registry again.
+/// 保留一轮墓碑，让通常的迟到写入在下次扫描被清掉。线程也可能暂停得
+/// 更久，因此有限轮数本身不提供同步保证；`cached_retirable_gauge` 在写后
+/// 重验 epoch，跨过遗忘边界的写入会立即重登记，不依赖下一次请求。
 ///
 /// The cost is bounded: the tombstone count is entries the deployment
 /// already saw, and a series whose key is re-created is promoted back to
@@ -1655,10 +1650,8 @@ impl Metrics {
                 if !series.retired {
                     retired += 1;
                 }
-                // A forgotten series must be registered again by whatever
-                // writes it next. Moved before the retiring write, so a
-                // write that still hits its cached handle lands before it
-                // and is overwritten.
+                // 先移动 epoch 再写退休值：迟到 writer 要么被这次写入覆盖，
+                // 要么在写后发现 epoch 已变并重登记，供后续扫描清理。
                 if liveness == GaugeLiveness::Gone && !epoch_moved {
                     self.inner
                         .retire_epoch
@@ -2518,48 +2511,45 @@ impl Metrics {
     /// series the registry forgot. Dropping them replaces each one in
     /// place: an epoch kept in the key instead would leave every earlier
     /// epoch's handles in the map until the capacity valve evicted them.
-    /// Re-registering a series that was never retired returns a handle to
-    /// the same storage.
+    /// 写后也重验 epoch：writer 可能在读完 epoch 后暂停，直到 registry 已经
+    /// 遗忘该 series。重登记并重写直至 epoch 稳定，保证最后一次写入仍可回收。
+    /// 稳定路径只多一次原子读取，counter、histogram 及其他 gauge 不受影响。
     fn cached_retirable_gauge(
         &self,
         site: &'static str,
         value: f64,
-        build_key: impl FnOnce(&mut WorkerKey<'_>),
-        register: impl FnOnce() -> metrics::Gauge,
+        build_key: impl Fn(&mut WorkerKey<'_>),
+        register: impl Fn() -> metrics::Gauge,
     ) {
-        let seen = (Arc::as_ptr(&self.inner) as usize, self.retire_epoch());
-        WORKER_CACHE.with(|cell| {
-            let cache = &mut *cell.borrow_mut();
-            if cache.gauge_epoch != seen {
-                cache.gauges.clear();
-                cache.gauge_epoch = seen;
-            }
-        });
-        self.cached_gauge(site, value, build_key, register);
+        self.cached_retirable_gauge_at_epoch(self.retire_epoch(), site, value, build_key, register);
     }
 
-    /// [`Self::cached_retirable_gauge`] with the epoch supplied by the
-    /// caller — the state a worker is in between reading the epoch and
-    /// writing its handle. Test-only, so the cross-epoch window can be
-    /// reproduced deterministically instead of by racing a real sweep.
-    #[cfg(test)]
+    /// 初次读取的 epoch 单独传入，测试可确定性地暂停在读完 epoch 后，
+    /// 同时始终执行生产路径的完整写入与重验。
     fn cached_retirable_gauge_at_epoch(
         &self,
         seen: u64,
         site: &'static str,
         value: f64,
-        build_key: impl FnOnce(&mut WorkerKey<'_>),
-        register: impl FnOnce() -> metrics::Gauge,
+        build_key: impl Fn(&mut WorkerKey<'_>),
+        register: impl Fn() -> metrics::Gauge,
     ) {
-        let seen = (Arc::as_ptr(&self.inner) as usize, seen);
-        WORKER_CACHE.with(|cell| {
-            let cache = &mut *cell.borrow_mut();
-            if cache.gauge_epoch != seen {
-                cache.gauges.clear();
-                cache.gauge_epoch = seen;
+        let mut seen = (Arc::as_ptr(&self.inner) as usize, seen);
+        loop {
+            WORKER_CACHE.with(|cell| {
+                let cache = &mut *cell.borrow_mut();
+                if cache.gauge_epoch != seen {
+                    cache.gauges.clear();
+                    cache.gauge_epoch = seen;
+                }
+            });
+            self.cached_gauge(site, value, &build_key, &register);
+            let current = self.retire_epoch();
+            if current == seen.1 {
+                return;
             }
-        });
-        self.cached_gauge(site, value, build_key, register);
+            seen.1 = current;
+        }
     }
 
     /// Record into a worker-cached histogram, same contract as
@@ -6272,6 +6262,80 @@ mod tests {
         assert_eq!(requests(&m, "ak-gone"), "NaN", "a retired series came back");
         // The live series the same race could have disturbed is untouched.
         assert_eq!(requests(&m, "ak-live"), "9");
+    }
+
+    // 捕获 writer 读完旧 epoch 后跨过整个 tombstone 生命周期才恢复的窗口。
+    // 若写后没有重验 epoch，最后一次旧写入会变成后续扫描找不到的有限值。
+    #[test]
+    fn a_write_paused_past_gone_tombstone_expiry_is_retired_without_another_emit() {
+        for sweeps in [2, 5] {
+            let m = Metrics::new(false);
+            let live = |series: LiveGaugeSeries<'_>| match series {
+                LiveGaugeSeries::RatelimitRemaining { api_key_id, .. } => api_key_id != "ak-gone",
+                _ => true,
+            };
+            m.set_rate_limit_remaining("ak-gone", "unknown", "gpt", Some(5), None);
+            m.set_rate_limit_remaining("ak-live", "unknown", "gpt", Some(9), None);
+            let seen_epoch = m.retire_epoch();
+            for _ in 0..sweeps {
+                m.retire_stale_gauges(live);
+            }
+            assert_eq!(
+                requests_value(&m, M_RATELIMIT_REMAINING_REQUESTS, "ak-gone"),
+                "NaN"
+            );
+            let registrations = std::cell::Cell::new(0);
+            m.cached_retirable_gauge_at_epoch(
+                seen_epoch,
+                M_RATELIMIT_REMAINING_REQUESTS,
+                6.0,
+                |k| {
+                    k.label("ak-gone");
+                    k.label("unknown");
+                    k.label("gpt");
+                },
+                || {
+                    m.track_retirable(
+                        GaugeFamily::RatelimitRemaining,
+                        M_RATELIMIT_REMAINING_REQUESTS,
+                        &[
+                            ("api_key_id", "ak-gone"),
+                            ("api_key_name", "unknown"),
+                            ("model", "gpt"),
+                        ],
+                    );
+                    let gauge = metrics::gauge!(
+                        M_RATELIMIT_REMAINING_REQUESTS,
+                        "api_key_id" => "ak-gone".to_string(),
+                        "api_key_name" => "unknown".to_string(),
+                        "model" => "gpt".to_string(),
+                    );
+                    // 恢复期间仍可能再次跨过遗忘边界，单次补登记也不够。
+                    // 前两次重新登记后各暂停两轮；最终值仍必须由下一轮清掉。
+                    registrations.set(registrations.get() + 1);
+                    if registrations.get() <= 2 {
+                        m.retire_stale_gauges(live);
+                        m.retire_stale_gauges(live);
+                    }
+                    gauge
+                },
+            );
+            assert_eq!(
+                requests_value(&m, M_RATELIMIT_REMAINING_REQUESTS, "ak-gone"),
+                "6",
+                "the paused writer resumed after {sweeps} sweeps"
+            );
+            m.retire_stale_gauges(live);
+            assert_eq!(
+                requests_value(&m, M_RATELIMIT_REMAINING_REQUESTS, "ak-gone"),
+                "NaN",
+                "the last write survived after {sweeps} sweeps"
+            );
+            assert_eq!(
+                requests_value(&m, M_RATELIMIT_REMAINING_REQUESTS, "ak-live"),
+                "9"
+            );
+        }
     }
 
     /// A gone series is kept as a tombstone for a bounded number of sweeps

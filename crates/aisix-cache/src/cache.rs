@@ -61,8 +61,8 @@ pub struct CachedBody {
     /// UUID of the Model row that produced this entry (R-040). A hit is
     /// served only when the origin is still eligible for the caller — the
     /// same `target_in_groups` check a continuation applies. Empty for
-    /// entries written before this field was added; they are served to any
-    /// caller (the existing behaviour).
+    /// entries written before this field was added; Responses 将它们按 miss
+    /// 处理，重新写入可验证 origin 的条目。
     #[serde(default)]
     pub origin_model_id: String,
 }

@@ -2587,12 +2587,8 @@ async fn dispatch(
                 routing_for_terminal.finish_staged(
                     &state_for_telem,
                     winner_idx,
-                    if comp.guardrail_blocked {
-                        200
-                    } else {
-                        terminal.status
-                    },
-                    deployment_success || comp.guardrail_blocked,
+                    terminal.status,
+                    deployment_success,
                 );
                 // Telemetry: emit with the actual upstream-reported counts,
                 // priced from the dispatched row when the operator configured

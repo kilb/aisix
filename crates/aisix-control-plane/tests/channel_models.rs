@@ -4476,7 +4476,7 @@ async fn a_grant_whose_generated_tombstone_is_gone_is_left_and_diagnosed() {
     // backdated rather than set to zero, so the row is old enough to prune
     // and only the grant's reference keeps it.
     sqlx::query(
-        "UPDATE gw_resources SET updated_at = now() - interval '2 days' \
+        "UPDATE gw_resources SET updated_at = now() - interval '2 days', projected_version = version \
                  WHERE kind = $1 AND id = $2",
     )
     .bind(Kind::Models.segment())
@@ -4680,12 +4680,118 @@ async fn a_regeneration_orders_a_name_chain_across_two_accounts() {
     assert_eq!(display_name(&cp, y).await, "pub-chain-4b7#acct-chain-y-4b7");
 }
 
-/// A public model that stored `least_cost` — which this release refuses to
-/// store, because its generated targets carry no price and the strategy then
-/// ranks nothing — is repaired by the upgrade, not left reading as a
-/// price-ordered model. The key goes, which means the default strategy the
-/// gateway already dispatched in; every other stored setting stays, and a
-/// model that stored another strategy is untouched.
+/// 历史账号已从 x→z、y→x 改名，但直连文档仍占用 x、y。只替换第二个账号，
+/// 或先撤销第一个渠道，也必须释放历史占名，同时保持文档 id 和 routing 引用。
+async fn recover_historical_name_chain(action: &str, priority: i32) {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let a = provider_key(&cp, &op, "acct-history-x-4b7").await;
+    let b = provider_key(&cp, &op, "acct-history-y-4b7").await;
+    let (public, _) = create_public(&cp, &op, "pub-history-4b7").await;
+    for (account, priority) in [(a, priority), (b, -priority)] {
+        let r = put_channel(&cp, &op, account, public, json!({"priority": priority})).await;
+        assert_eq!(r.status, 200, "{r:?}");
+    }
+    let a_direct = direct_of(&cp, a, public).await;
+    let b_direct = direct_of(&cp, b, public).await;
+    let old_a = live(&cp, Kind::Models, a_direct).await;
+    let old_b = live(&cp, Kind::Models, b_direct).await;
+    for (account, name) in [(a, "acct-history-z-4b7"), (b, "acct-history-x-4b7")] {
+        let r = rename_account(&cp, &op, account, name).await;
+        assert_eq!(r.status, 200, "{r:?}");
+    }
+    // 重放旧版本留下的直连名字，两个历史写入自身均满足唯一索引。
+    replace_model_doc(&cp, public, b_direct, old_b).await;
+    replace_model_doc(&cp, public, a_direct, old_a).await;
+    let before = live(&cp, Kind::Models, public).await;
+    let r = match action {
+        "replace" => rename_account(&cp, &op, b, "acct-history-x-4b7").await,
+        "disable" => put_channel(&cp, &op, a, public, json!({"enabled": false})).await,
+        "delete" => {
+            cp.send(
+                "DELETE",
+                &format!("/admin/provider-keys/{a}/channel-models/{public}"),
+                Some(op.cookie()),
+                Some(json!({})),
+            )
+            .await
+        }
+        _ => panic!("unknown recovery {action}"),
+    };
+    assert_eq!(
+        r.status,
+        if action == "delete" { 204 } else { 200 },
+        "{action}: {r:?}"
+    );
+    assert_eq!(direct_of(&cp, b, public).await, b_direct);
+    let b_doc = live(&cp, Kind::Models, b_direct).await;
+    assert_eq!(b_doc["display_name"], "pub-history-4b7#acct-history-x-4b7");
+    assert_eq!(b_doc["provider_key_id"], b.to_string());
+    let after = live(&cp, Kind::Models, public).await;
+    if action == "replace" {
+        assert_eq!(direct_of(&cp, a, public).await, a_direct);
+        assert_eq!(
+            display_name(&cp, a_direct).await,
+            "pub-history-4b7#acct-history-z-4b7"
+        );
+        assert_eq!(after, before);
+    } else {
+        assert!(!is_live(&cp, Kind::Models, a_direct).await);
+        assert_eq!(
+            after["routing"]["targets"],
+            json!([{
+                "model_id": b_direct, "priority": -priority, "weight": 1,
+            }])
+        );
+    }
+    for id in [public, a_direct, b_direct] {
+        assert_eq!(
+            stored(&cp, Kind::Models, id)
+                .await
+                .expect("same document id")
+                .2,
+            Some(format!("public:{public}")),
+        );
+    }
+    let freed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM gw_resources WHERE kind = 'models' AND NOT deleted \
+         AND managed_by = $1 AND identity LIKE '#freed#%'",
+    )
+    .bind(format!("public:{public}"))
+    .fetch_one(cp.db().pool())
+    .await
+    .expect("no temporary live name");
+    assert_eq!(freed, 0);
+}
+
+#[tokio::test]
+async fn an_account_replace_repairs_another_accounts_historical_name_holder() {
+    tokio::join!(
+        recover_historical_name_chain("replace", -7),
+        recover_historical_name_chain("replace", 7),
+    );
+}
+
+#[tokio::test]
+async fn disabling_a_channel_frees_its_historical_name_before_reusing_it() {
+    tokio::join!(
+        recover_historical_name_chain("disable", -7),
+        recover_historical_name_chain("disable", 7),
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_channel_frees_its_historical_name_before_reusing_it() {
+    tokio::join!(
+        recover_historical_name_chain("delete", -7),
+        recover_historical_name_chain("delete", 7),
+    );
+}
+
+/// 升级移除旧 least_cost 设置后，正常修复必须重写文档并送达 kine。
+/// targets、id 和 owner 保持；多可用目标会改用默认的加权轮询。
 #[tokio::test]
 async fn the_upgrade_retires_a_stored_least_cost_strategy() {
     use support::migrate::{database_at, drop_database, migrate_rest};
@@ -4695,6 +4801,31 @@ async fn the_upgrade_retires_a_stored_least_cost_strategy() {
     let priced = Uuid::new_v4();
     let kept = Uuid::new_v4();
     let retired = Uuid::new_v4();
+    let with_retries = Uuid::new_v4();
+    let account = Uuid::new_v4();
+    let account_b = Uuid::new_v4();
+    let direct_a = Uuid::new_v4();
+    let direct_b = Uuid::new_v4();
+    let targets = json!([
+        {"model_id": direct_a, "priority": 2, "weight": 3},
+        {"model_id": direct_b, "priority": 2, "weight": 1},
+    ]);
+    for (key, name) in [
+        (account, "acct-upgrade-1a2"),
+        (account_b, "acct-upgrade-b-1a2"),
+    ] {
+        let mut doc = json!({
+            "display_name": name, "provider": "openai", "api_key": "sk-upgrade-test",
+        });
+        aisix_control_plane::resources::secrets::seal(
+            &aisix_control_plane::crypto::MasterKey(support::TEST_MASTER_KEY),
+            Kind::ProviderKeys,
+            key,
+            &mut doc,
+        );
+        sqlx::query("INSERT INTO gw_resources (kind, id, doc, identity) VALUES ('provider_keys', $1, $2, $3)")
+            .bind(key).bind(doc).bind(name).execute(&db).await.expect("historical account");
+    }
     for sql in [
         format!(
             "INSERT INTO public_models (id, name, routing) VALUES \
@@ -4710,8 +4841,52 @@ async fn the_upgrade_retires_a_stored_least_cost_strategy() {
              ('{retired}', 'pub-retired-least-cost-1a2', \
               '{{\"strategy\": \"least_cost\", \"retries\": 3}}', now())"
         ),
+        format!(
+            "INSERT INTO public_models (id, name, routing) VALUES \
+             ('{with_retries}', 'pub-least-cost-retries-1a2', \
+              '{{\"strategy\": \"least_cost\", \"retries\": 2}}')"
+        ),
     ] {
         sqlx::query(&sql).execute(&db).await.expect(&sql);
+    }
+    for (key, direct, priority, weight, account_name) in [
+        (account, direct_a, 2, 3, "acct-upgrade-1a2"),
+        (account_b, direct_b, 2, 1, "acct-upgrade-b-1a2"),
+    ] {
+        let name = "pub-least-cost-1a2";
+        sqlx::query("INSERT INTO channel_models (provider_key_id, public_model_id, direct_model_id, priority, weight) VALUES ($1, $2, $3, $4, $5)")
+            .bind(key).bind(priced).bind(direct).bind(priority).bind(weight)
+            .execute(&db).await.expect("historical channel");
+        sqlx::query("INSERT INTO gw_resources (kind, id, doc, identity, managed_by) VALUES ('models', $1, $2, $3, $4)")
+            .bind(direct).bind(json!({"display_name": format!("{name}#{account_name}"), "provider": "openai", "provider_key_id": key, "model_name": name, "internal": true}))
+            .bind(format!("{name}#{account_name}")).bind(format!("public:{priced}"))
+            .execute(&db).await.expect("historical direct");
+    }
+    for (id, name, mut routing) in [
+        (
+            priced,
+            "pub-least-cost-1a2",
+            json!({"strategy": "least_cost", "targets": targets}),
+        ),
+        (
+            with_retries,
+            "pub-least-cost-retries-1a2",
+            json!({"strategy": "least_cost", "retries": 2}),
+        ),
+        (
+            kept,
+            "pub-failover-1a2",
+            json!({"strategy": "failover", "retries": 2}),
+        ),
+    ] {
+        routing
+            .as_object_mut()
+            .expect("routing")
+            .entry("targets")
+            .or_insert(json!([]));
+        sqlx::query("INSERT INTO gw_resources (kind, id, doc, identity, managed_by) VALUES ('models', $1, $2, $3, $4)")
+            .bind(id).bind(json!({"display_name": name, "routing": routing})).bind(name)
+            .bind(format!("public:{id}")).execute(&db).await.expect("historical routing");
     }
 
     migrate_rest(&db).await.expect("the rest migrates");
@@ -4733,5 +4908,79 @@ async fn the_upgrade_retires_a_stored_least_cost_strategy() {
         "{kept}"
     );
     assert_eq!(routing(retired).await, json!({"retries": 3}), "{retired}");
+    assert_eq!(routing(with_retries).await, json!({"retries": 2}));
+    let Some(endpoint) = support::gate_var("CP_TEST_KINE_ENDPOINT") else {
+        drop_database(db).await;
+        return;
+    };
+    let mut url =
+        reqwest::Url::parse(&support::gate_var("CP_TEST_DATABASE_URL").expect("test server"))
+            .expect("a URL");
+    url.set_path(db.connect_options().get_database().expect("test database"));
+    let cp = TestCp::start_with(|cfg| {
+        cfg.database_url = url.to_string();
+        cfg.kine_endpoint = endpoint.clone();
+    })
+    .await
+    .expect("same historical database boots");
+    // boot 和本次正常 repair 可并发，最终状态和审计都必须成立。
+    channels::repair_routing(cp.db(), &WriteCtx::of(cp.state()))
+        .await
+        .expect("normal repair");
+    for (id, name, expected_targets) in [
+        (priced, "pub-least-cost-1a2", targets),
+        (with_retries, "pub-least-cost-retries-1a2", json!([])),
+    ] {
+        let doc = live(&cp, Kind::Models, id).await;
+        assert_eq!(doc["routing"]["strategy"], "round_robin", "{doc}");
+        assert_eq!(doc["routing"]["targets"], expected_targets);
+        if id == with_retries {
+            assert_eq!(doc["routing"]["retries"], 2);
+        }
+        assert_eq!(
+            stored(&cp, Kind::Models, id).await.expect("same id").2,
+            Some(format!("public:{id}"))
+        );
+        assert_eq!(
+            audit_detail(&cp, "public_model.routing_regenerated", id).await,
+            json!({"name": name})
+        );
+        assert!(until_projected(&cp, Kind::Models, id).await);
+        use aisix_control_plane::kine::{KineClient, KineWriter};
+        let kine = KineClient::connect(&endpoint).await.expect("real kine");
+        let projected = kine
+            .get(&aisix_control_plane::projector::key_for(
+                cp.env(),
+                Kind::Models,
+                id,
+            ))
+            .await
+            .expect("read kine")
+            .expect("model projected");
+        let projected: Value = serde_json::from_slice(&projected.value).expect("model JSON");
+        assert_eq!(projected["routing"], doc["routing"]);
+    }
+    assert_eq!(
+        live(&cp, Kind::Models, kept).await["routing"]["strategy"],
+        "failover"
+    );
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    assert_422_at(
+        &patch_public(
+            &cp,
+            &op,
+            priced,
+            json!({"routing": {"strategy": "least_cost"}}),
+        )
+        .await,
+        "/routing/strategy",
+    );
+    assert_eq!(
+        channels::repair_routing(cp.db(), &WriteCtx::of(cp.state()))
+            .await
+            .expect("idempotent pass"),
+        channels::RoutingRepaired::default()
+    );
+    drop(cp);
     drop_database(db).await;
 }

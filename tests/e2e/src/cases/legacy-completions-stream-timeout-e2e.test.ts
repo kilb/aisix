@@ -58,6 +58,14 @@ async function usage2xxCounter(): Promise<number> {
   });
 }
 
+async function deploymentCounters(model: string): Promise<{ success: number; failure: number }> {
+  const samples = await scrapeMetrics(app!.metricsUrl);
+  return {
+    success: sumMetric(samples, "aisix_deployment_success_responses_total", { model }),
+    failure: sumMetric(samples, "aisix_deployment_failure_responses_total", { model }),
+  };
+}
+
 async function outputTokenCounter(model: string): Promise<number> {
   const response = await fetch(`${app!.metricsUrl}/metrics`);
   if (response.status !== 200) {
@@ -626,6 +634,8 @@ describe("legacy completions stream timeout", () => {
       ctx.skip();
       return;
     }
+    const deploymentBefore = await deploymentCounters("legacy-in-band-over-cap");
+    const failureBaseline = await usage5xxCounter();
     const upstreamBaseline = inBandOneRead.receivedRequests.length;
     const successBaseline = await usage2xxCounter();
 
@@ -647,6 +657,10 @@ describe("legacy completions stream timeout", () => {
     const row = await modelStatus(inBandOverCapModelId);
     expect(row?.status).toBe("cooldown");
     expect(row?.status_reason).toBe("upstream_server_error");
+    const deploymentAfter = await deploymentCounters("legacy-in-band-over-cap");
+    expect(deploymentAfter.failure).toBe(deploymentBefore.failure + 1);
+    expect(deploymentAfter.success).toBe(deploymentBefore.success);
+    expect(await usage5xxCounter()).toBe(failureBaseline);
   });
 
   test("an in-band error under a hold that keeps the whole answer cools the target down", async (ctx) => {
@@ -654,6 +668,8 @@ describe("legacy completions stream timeout", () => {
       ctx.skip();
       return;
     }
+    const deploymentBefore = await deploymentCounters("legacy-in-band-held");
+    const successBaseline = await usage2xxCounter();
     const usageBaseline = await usage5xxCounter();
 
     const response = await completion("legacy-in-band-held");
@@ -668,6 +684,10 @@ describe("legacy completions stream timeout", () => {
       usageBaseline,
       "upstream_server_error",
     );
+    const deploymentAfter = await deploymentCounters("legacy-in-band-held");
+    expect(deploymentAfter.failure).toBe(deploymentBefore.failure + 1);
+    expect(deploymentAfter.success).toBe(deploymentBefore.success);
+    expect(await usage2xxCounter()).toBe(successBaseline);
   });
 
   test("malformed SSE written together with DONE reaches the caller the same way", async (ctx) => {

@@ -75,20 +75,9 @@ pub async fn rewrite_request_uri(
     mut request: Request,
     next: Next,
 ) -> Response {
-    let host = crate::host::inbound_host(&request);
-    let fired = state.url_rewrites.iter().find_map(|rule| {
-        if let Some(hosts) = &rule.hosts {
-            if !host
-                .as_deref()
-                .is_some_and(|host| aisix_core::host::matches(hosts, host))
-            {
-                return None;
-            }
-        }
-        let path = request.uri().path();
-        rule.apply(path).map(|to| (rule, path.to_owned(), to))
-    });
-    if let Some((rule, from, to)) = fired {
+    let fired = matching_rewrite(&state.url_rewrites, &request);
+    if let Some((rule, to)) = fired {
+        let from = request.uri().path().to_owned();
         match with_path(request.uri(), &to) {
             Ok(uri) => {
                 tracing::debug!(rule = rule.label(), %from, %to, "url rewrite applied");
@@ -110,6 +99,32 @@ pub async fn rewrite_request_uri(
         }
     }
     next.run(request).await
+}
+
+// request-id 在改写日志之前建 span，提前匹配时与真正改写共用同一选择逻辑。
+pub(crate) fn rewritten_uri(rules: &[CompiledRewrite], request: &Request) -> http::Uri {
+    matching_rewrite(rules, request)
+        .and_then(|(_, to)| with_path(request.uri(), &to).ok())
+        .unwrap_or_else(|| request.uri().clone())
+}
+
+fn matching_rewrite<'a>(
+    rules: &'a [CompiledRewrite],
+    request: &Request,
+) -> Option<(&'a CompiledRewrite, String)> {
+    let host = crate::host::inbound_host(request);
+    rules.iter().find_map(|rule| {
+        if let Some(hosts) = &rule.hosts {
+            if !host
+                .as_deref()
+                .is_some_and(|host| aisix_core::host::matches(hosts, host))
+            {
+                return None;
+            }
+        }
+        let path = request.uri().path();
+        rule.apply(path).map(|to| (rule, to))
+    })
 }
 
 /// `uri` with its path replaced by `new_path`, query preserved.

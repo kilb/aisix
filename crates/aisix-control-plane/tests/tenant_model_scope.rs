@@ -1169,3 +1169,171 @@ async fn a_tenant_narrowed_and_moved_back_after_a_census_completes_beside_the_ed
         "B's key misses the model the edit made callable: {doc}"
     );
 }
+
+/// WARN lines on this current-thread test runtime, including its database
+/// transaction tasks.
+#[derive(Clone, Default)]
+struct RepairLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for RepairLogs {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .expect("the log buffer")
+            .extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// An unexplained old grant is diagnosed even when another generated grant
+/// makes the pass re-project real live keys and fail the reference check.
+/// Neither the grant nor either key changes until an operator saves the
+/// intended public model grants and selection through the normal APIs.
+#[tokio::test]
+async fn a_mixed_generated_grant_repair_diagnoses_unknown_ids_before_projection_fails() {
+    use aisix_control_plane::resources::write::WriteCtx;
+    use aisix_control_plane::tenants;
+
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let account = provider_key(&cp, &admin, "acct-mixed-diagnostic-8f1").await;
+    let a = public_model(&cp, &admin, "pub-mixed-live-8f1").await;
+    let b = public_model(&cp, &admin, "pub-mixed-gone-8f1").await;
+    serve(&cp, &admin, account, a).await;
+    serve(&cp, &admin, account, b).await;
+    let directs: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT direct_model_id FROM channel_models WHERE provider_key_id = $1 ORDER BY public_model_id",
+    )
+    .bind(account)
+    .fetch_all(cp.db().pool())
+    .await
+    .expect("both generated direct models");
+    assert_eq!(directs.len(), 2);
+    let orphan: Uuid = sqlx::query_scalar(
+        "SELECT direct_model_id FROM channel_models WHERE provider_key_id = $1 AND public_model_id = $2",
+    )
+    .bind(account)
+    .bind(b)
+    .fetch_one(cp.db().pool())
+    .await
+    .expect("B's generated direct model");
+    let created = operator_tenant(&cp, &admin, "mixed-diagnostic-8f1").await;
+    let r = patch(&cp, &admin, created, json!({"allowed_model_ids": [a, b]})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let follows = key(&cp, &admin, created, "mixed-follows-8f1").await;
+    let selected = key(&cp, &admin, created, "mixed-selected-8f1").await;
+
+    // Restore the rows an older writer could store while both referents
+    // still exist. A normal rename writes their real gateway documents.
+    sqlx::query("UPDATE tenants SET allowed_model_ids = $2 WHERE id = $1")
+        .bind(created)
+        .bind(&directs)
+        .execute(cp.db().pool())
+        .await
+        .expect("old generated grants");
+    sqlx::query("UPDATE tenant_keys SET model_ids = $2 WHERE id = $1")
+        .bind(selected)
+        .bind(&directs)
+        .execute(cp.db().pool())
+        .await
+        .expect("old generated selection");
+    let r = patch(
+        &cp,
+        &admin,
+        created,
+        json!({"name": "mixed-old-writer-8f1"}),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    for id in [follows, selected] {
+        assert_eq!(ids(&key_doc(&cp, &id).await), uuid_list(&directs));
+    }
+
+    let r = cp
+        .send(
+            "DELETE",
+            &format!("/admin/provider-keys/{account}/channel-models/{b}"),
+            Some(admin.cookie()),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(r.status, 204, "{r:?}");
+    // The old prune lost the only evidence of B's generated origin before
+    // this release. No invented UUID or bypass of the writer is involved.
+    let removed = sqlx::query("DELETE FROM gw_resources WHERE kind = $1 AND id = $2 AND deleted")
+        .bind(Kind::Models.segment())
+        .bind(orphan)
+        .execute(cp.db().pool())
+        .await
+        .expect("the old prune");
+    assert_eq!(removed.rows_affected(), 1);
+
+    let logs = RepairLogs::default();
+    let writer = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .finish();
+    let capture = tracing::subscriber::set_default(subscriber);
+    let ctx = WriteCtx::of(cp.state());
+    let result = tenants::replace_generated_grants(cp.db(), &ctx)
+        .await
+        .expect("the repair pass");
+    drop(capture);
+    assert_eq!(result.failed, 1, "{result:?}");
+    assert_eq!(result.tenants, 0, "a failed repair committed: {result:?}");
+    let after = tenant(&cp, &admin, created).await;
+    assert_eq!(after.body["allowed_model_ids"], json!(directs), "{after:?}");
+    for id in [follows, selected] {
+        assert_eq!(ids(&key_doc(&cp, &id).await), uuid_list(&directs));
+    }
+    let bytes = logs.0.lock().expect("the log buffer").clone();
+    let warning = String::from_utf8(bytes).expect("UTF-8 log lines");
+    assert!(
+        warning.lines().any(|line| {
+            line.contains(&created.to_string())
+                && line.contains(&orphan.to_string())
+                && line.contains("operator")
+        }),
+        "the failed repair did not diagnose the tenant and unexplained model id: {warning}"
+    );
+
+    // The operator explicitly keeps A through its public model and removes
+    // B, then saves the key's selection. The normal writers re-project both.
+    let r = patch(&cp, &admin, created, json!({"allowed_model_ids": [a]})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(ids(&key_doc(&cp, &follows).await), uuid_list(&[a]));
+    let r = cp
+        .send(
+            "GET",
+            &format!("/admin/keys/{selected}"),
+            Some(admin.cookie()),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let r = request(
+        &cp,
+        "PATCH",
+        &format!("/admin/keys/{selected}"),
+        Some(admin.cookie()),
+        r.body["version"].as_i64(),
+        Some(json!({"model_ids": [a]})),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    for id in [follows, selected] {
+        assert_eq!(ids(&key_doc(&cp, &id).await), uuid_list(&[a]));
+    }
+    let result = tenants::replace_generated_grants(cp.db(), &ctx)
+        .await
+        .expect("the next repair pass");
+    assert_eq!(result, tenants::GeneratedGrantsReplaced::default());
+}

@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 use axum::body::Body;
 use axum::http::Request;
 use axum::Router;
+use tracing_subscriber::layer::SubscriberExt as _;
 
 /// The access log's own `tracing` message. Counting its occurrences is how
 /// a test asks "how many lines did this request write" without matching the
@@ -41,13 +42,30 @@ impl tracing_subscriber::fmt::MakeWriter<'_> for LogBuf {
     }
 }
 
+// 请求 span 在 body 和结算 guard 都释放后关闭，作为精确日志计数的终止屏障。
+struct RequestClosed(Arc<tokio::sync::Notify>);
+
+impl<S> tracing_subscriber::Layer<S> for RequestClosed
+where
+    S: tracing::Subscriber + for<'lookup> tracing_subscriber::registry::LookupSpan<'lookup>,
+{
+    fn on_close(&self, id: tracing::span::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
+        if ctx
+            .span(&id)
+            .is_some_and(|span| span.metadata().name() == "request")
+        {
+            self.0.notify_one();
+        }
+    }
+}
+
 /// A capturing subscriber installed on THIS thread, plus its buffer.
 ///
 /// Thread-local rather than global: a `#[tokio::test]` runs its future on
-/// the calling thread, which is where the handler, the body polls and the
-/// guard drops all write from.
+/// the calling thread. 冷 tokenizer 的结算会转到阻塞线程，但继承此订阅器。
 pub(crate) struct Capture {
     buf: Arc<Mutex<Vec<u8>>>,
+    request_closed: Arc<tokio::sync::Notify>,
     _guard: tracing::subscriber::DefaultGuard,
 }
 
@@ -58,12 +76,28 @@ impl Capture {
             let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
         });
         let buf = Arc::new(Mutex::new(Vec::new()));
+        let request_closed = Arc::new(tokio::sync::Notify::new());
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
             .with_writer(LogBuf(buf.clone()))
-            .finish();
+            .finish()
+            .with(RequestClosed(request_closed.clone()));
         let _guard = tracing::subscriber::set_default(subscriber);
-        Self { buf, _guard }
+        Self {
+            buf,
+            request_closed,
+            _guard,
+        }
+    }
+
+    // 等整个请求结束再读日志，既不依赖 drop 同步，也不只等第一条日志。
+    async fn wait_for_request_end(&self) {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            self.request_closed.notified(),
+        )
+        .await
+        .expect("the request span must close before checking its access log");
     }
 
     /// Everything captured so far, for a test asking what a log says at all.
@@ -184,6 +218,7 @@ pub(crate) async fn three_stream_endings(
             frame.expect("the delivered stream must read cleanly to its end");
         }
         drop(body);
+        capture.wait_for_request_end().await;
         capture.only("a delivered stream")
     };
 
@@ -197,6 +232,7 @@ pub(crate) async fn three_stream_endings(
             "premise: the stream delivered no frame to abandon: {first:?}",
         );
         drop(body);
+        capture.wait_for_request_end().await;
         capture.only("a stream abandoned mid-flight")
     };
 
@@ -205,6 +241,7 @@ pub(crate) async fn three_stream_endings(
         let response = app.clone().oneshot(request()).await.unwrap();
         let (_parts, body) = response.into_parts();
         drop(body);
+        capture.wait_for_request_end().await;
         capture.only("a stream dropped before its first poll")
     };
 

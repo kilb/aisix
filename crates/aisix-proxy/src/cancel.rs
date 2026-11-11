@@ -166,6 +166,7 @@ pub(crate) fn emit(
     // they reach here with none — and their own events carry no source IP
     // or user agent either, which is exactly what the default renders.
     let client = ctx.client.clone().unwrap_or_default();
+    let client_type = state.client_classifier.classify(&client.user_agent);
     let snap = state.snapshot.load();
     // Same reason: this family's own events state their protocol outright,
     // and a host-matched route's path would otherwise report it as whatever
@@ -218,7 +219,7 @@ pub(crate) fn emit(
             rec.dispatched,
             resolved,
             endpoint,
-            &client.user_agent,
+            client_type,
         );
     }
 
@@ -360,7 +361,7 @@ pub(crate) fn emit(
         dispatched,
         resolved,
         endpoint,
-        &client.user_agent,
+        client_type,
     );
 }
 

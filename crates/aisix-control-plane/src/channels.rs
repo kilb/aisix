@@ -604,6 +604,33 @@ pub async fn regenerate(
             live,
         ));
     }
+    // 待撤销的历史文档也可能占用本次要写的名字；先改名保留 referent，
+    // routing 不再引用它后再撤销。只释放确实被复用的名字，避免重写无关旧文档。
+    let keep: Vec<Uuid> = std::iter::once(public_model_id)
+        .chain(served.iter().map(|(c, _, _)| c.direct_model_id))
+        .collect();
+    let retracting: Vec<ResourceRow> = store::owned_by(&mut *conn, std::slice::from_ref(&owner))
+        .await?
+        .into_iter()
+        .filter(|row| row.kind == Kind::Models && !row.deleted && !keep.contains(&row.id))
+        .collect();
+    let wanted: HashSet<&str> = writes
+        .iter()
+        .filter_map(|(_, doc, _)| doc.get("display_name").and_then(Value::as_str))
+        .collect();
+    for row in &retracting {
+        if !row
+            .doc
+            .get("display_name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| wanted.contains(name))
+        {
+            continue;
+        }
+        let mut doc = row.doc.clone();
+        doc["display_name"] = json!(freed_name(row.id));
+        crate::tenants::put(&mut *conn, ctx, Kind::Models, row.id, &doc, &owner).await?;
+    }
     // A name may be held by another live document of this model: an older
     // release could leave one direct document on another's name, and a
     // rewrite must give that name up before this one takes it, or the
@@ -629,13 +656,7 @@ pub async fn regenerate(
     // Retraction, after the routing document no longer names them: every
     // live model document this public model owns whose id is neither the
     // routing document nor a direct document of an enabled row.
-    let keep: Vec<Uuid> = std::iter::once(public_model_id)
-        .chain(channels.iter().map(|c| c.direct_model_id))
-        .collect();
-    for row in store::owned_by(&mut *conn, std::slice::from_ref(&owner)).await? {
-        if row.kind != Kind::Models || row.deleted || keep.contains(&row.id) {
-            continue;
-        }
+    for row in retracting {
         write_resource(
             conn,
             ctx,
@@ -661,17 +682,19 @@ pub async fn regenerate(
 }
 
 /// The public models whose live routing document does not carry every
-/// routing setting the model stores, each key present with its stored value:
-/// the predicate the `public_routing_kept` trigger (migration `0039`)
-/// refuses a write of the document by. `$1` is the models' kind segment and
-/// `$2` one public model's id, or `NULL` for all.
+/// routing setting the model stores, each key present with its stored value,
+/// or whose effective strategy differs after a setting was removed (`0040`).
+/// `$1` is the models' kind segment, `$2` one public model's id, or `NULL`
+/// for all, and `$3` the default strategy.
 const DIVERGED_ROUTING: &str = "SELECT p.id FROM public_models p \
      JOIN gw_resources r ON r.kind = $1 AND r.id = p.id \
      WHERE ($2::uuid IS NULL OR p.id = $2) AND p.retired_at IS NULL AND NOT r.deleted \
        AND r.managed_by = 'public:' || p.id::text \
        AND jsonb_typeof(p.routing) = 'object' \
-       AND EXISTS (SELECT 1 FROM jsonb_each(p.routing) AS s(key, value) \
-                   WHERE (r.doc -> 'routing' -> s.key) IS DISTINCT FROM s.value) \
+       AND (EXISTS (SELECT 1 FROM jsonb_each(p.routing) AS s(key, value) \
+                    WHERE (r.doc -> 'routing' -> s.key) IS DISTINCT FROM s.value) \
+            OR (r.doc -> 'routing' -> 'strategy') IS DISTINCT FROM \
+               COALESCE(NULLIF(p.routing -> 'strategy', 'null'::jsonb), to_jsonb($3::text))) \
      ORDER BY p.id";
 
 /// What one [`repair_routing`] pass did, in counts only.
@@ -697,6 +720,11 @@ pub struct RoutingRepaired {
 /// regenerated. Run at boot and by every housekeeping tick
 /// (`housekeeping::tick`).
 ///
+/// `0040` also removes an unpriced `least_cost`: its old document kept
+/// equal-price targets in declaration order, while the repaired default
+/// `round_robin` uses weighted rotation within each priority tier. Repair
+/// keeps the target ids, priorities and weights, but can change selection.
+///
 /// One transaction per public model, under a channel edit's locks: the
 /// scope fence and every all-scope tenant's row
 /// ([`crate::tenants::lock_all_scope`]), the public model's row, then the
@@ -711,6 +739,7 @@ pub async fn repair_routing(db: &Db, ctx: &WriteCtx) -> Result<RoutingRepaired, 
     let diverged: Vec<Uuid> = sqlx::query_scalar(DIVERGED_ROUTING)
         .bind(Kind::Models.segment())
         .bind(None::<Uuid>)
+        .bind(DEFAULT_STRATEGY)
         .fetch_all(db.pool())
         .await
         .map_err(DbError::from)?;
@@ -730,6 +759,7 @@ pub async fn repair_routing(db: &Db, ctx: &WriteCtx) -> Result<RoutingRepaired, 
                     let still: Option<Uuid> = sqlx::query_scalar(DIVERGED_ROUTING)
                         .bind(Kind::Models.segment())
                         .bind(Some(id))
+                        .bind(DEFAULT_STRATEGY)
                         .fetch_optional(&mut *conn)
                         .await
                         .map_err(DbError::from)?;
@@ -774,8 +804,8 @@ pub async fn repair_routing(db: &Db, ctx: &WriteCtx) -> Result<RoutingRepaired, 
     Ok(outcome)
 }
 
-/// Rewrites the direct documents of account `provider_key_id`'s enabled
-/// channel models from its document as it now stands (`doc`), in the
+/// Rewrites the live direct documents of the public models account
+/// `provider_key_id` serves, from each account's current document, in the
 /// caller's transaction, after a replace of the account: a direct document
 /// carries the account's display name and provider ([`direct_doc`]), so one
 /// left as it was keeps the old name, and an account given that name later
@@ -789,7 +819,9 @@ pub async fn repair_routing(db: &Db, ctx: &WriteCtx) -> Result<RoutingRepaired, 
 /// runs after this commits reads the new name, and one that ran before
 /// committed first, so the rows it wrote are rewritten here. No public
 /// model's row is taken, which would be after the resources lock: this
-/// changes no target and no channel row, only the documents' names.
+/// changes no target and no channel row, only the direct documents. Other
+/// accounts of the same public models are included because an older release
+/// may have left their documents holding a name this account now needs.
 pub async fn follow_account(
     conn: &mut PgConnection,
     ctx: &WriteCtx,
@@ -805,8 +837,10 @@ pub async fn follow_account(
     let (display_name, provider) = (text("display_name"), text("provider"));
     let channels: Vec<ChannelModelRow> = sqlx::query_as(&format!(
         "SELECT {CHANNEL_COLUMNS} FROM channel_models \
-         WHERE provider_key_id = $1 AND enabled \
-           AND public_model_id IN (SELECT id FROM public_models WHERE retired_at IS NULL) \
+         WHERE public_model_id IN \
+           (SELECT cm.public_model_id FROM channel_models cm \
+            JOIN public_models p ON p.id = cm.public_model_id AND p.retired_at IS NULL \
+            WHERE cm.provider_key_id = $1) \
          ORDER BY public_model_id, direct_model_id"
     ))
     .bind(provider_key_id)
@@ -814,7 +848,6 @@ pub async fn follow_account(
     .await
     .map_err(DbError::from)?;
     let mut writes = Vec::new();
-    let mut owners: HashMap<Uuid, String> = HashMap::new();
     for channel in channels {
         let public = read_public(&mut *conn, channel.public_model_id).await?;
         let owner = owner(public.id);
@@ -824,21 +857,25 @@ pub async fn follow_account(
         if !live {
             continue;
         }
-        owners.insert(channel.direct_model_id, owner);
+        let (display_name, provider) = if channel.provider_key_id == provider_key_id {
+            (display_name.clone(), provider.clone())
+        } else {
+            let Some(account) = provider_key_of(&mut *conn, channel.provider_key_id).await? else {
+                continue;
+            };
+            account
+        };
         writes.push((
             channel.direct_model_id,
             direct_doc(&channel, &public, &display_name, &provider),
             true,
+            owner,
         ));
     }
     // A chain across public models — this account renamed onto the name
     // another account's document of the same model carries, and that
     // document renamed off it — is written in the order that frees each name
     // first, exactly as [`regenerate`] writes one model's.
-    let writes = writes
-        .into_iter()
-        .filter_map(|(id, doc, live)| owners.remove(&id).map(|owner| (id, doc, live, owner)))
-        .collect();
     names_freed_first(&mut *conn, ctx, writes).await
 }
 

@@ -274,10 +274,10 @@ describe("Bedrock Titan: a later text fails after an earlier one was served", ()
   // R-109: the tokens an abandoned request's answered texts were billed are
   // charged to the token limits the request held them against, so a key that
   // spent a whole window before its caller left does not get a second one.
-  test.for<["titan-quota-direct" | "titan-quota-group"]>([
+  test.for<"titan-quota-direct" | "titan-quota-group">([
     "titan-quota-direct",
     "titan-quota-group",
-  ])("%s: a cancellation charges what its answered texts were served", async (model, ctx) => {
+  ])("%s: a cancellation charges what its answered texts were served", { timeout: 60_000 }, async (model, ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
     await awaitWindowHeadroom();
     const before = received.length;
@@ -317,7 +317,7 @@ describe("Bedrock Titan: a later text fails after an earlier one was served", ()
     });
     const text = await next.text();
     expect(next.status, text).toBe(429);
-  }, 60_000);
+  });
 
   test("a group member's own token limit is charged the texts it served before failing", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();

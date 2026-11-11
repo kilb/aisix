@@ -26,6 +26,9 @@ use aisix_gateway::{ChatFormat, ChatMessage, Role};
 use sha2::{Digest, Sha256};
 use std::hash::{Hash, Hasher};
 
+// 消息材料改变时必须升级编码域；旧 Redis 条目保留到 TTL，但不再参与新版本命中。
+const KEY_ENCODING_VERSION: u64 = 2;
+
 /// [`Hasher`] adapter over SHA-256, used only to derive cache fingerprints.
 ///
 /// The integer writes are pinned little-endian; the `Hasher` defaults use
@@ -190,6 +193,9 @@ impl CacheKey {
     /// [`CacheKey::scope_fingerprint`] so the two can never disagree on
     /// which fields scope an entry.
     fn hash_scope<H: Hasher>(&self, state: &mut H) {
+        // 旧编码以 UTF-8 model 开头；0xff 使新域与所有旧 model（含控制字符）不相交。
+        state.write(b"\xffaisix-cache-key");
+        KEY_ENCODING_VERSION.hash(state);
         self.model.hash(state);
         self.temperature_milli.hash(state);
         self.top_p_milli.hash(state);
@@ -479,13 +485,13 @@ mod tests {
         // intentional, updating these constants is the moment to note in the
         // release that the existing cache becomes unreachable (a flush, not a
         // correctness event).
-        assert_eq!(fp, "9906d6c9018861f530d1b8e30d488f1d");
+        assert_eq!(fp, "b6480e0d618dcc0ae0bb9c990477dd3c");
         assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
         assert_eq!(fp, key.fingerprint(), "must be deterministic");
 
         let scope = key.scope_fingerprint();
         assert_eq!(scope.len(), 32);
-        assert_eq!(scope, "9b5385c3cfa507a7d69286d4cbaab23a");
+        assert_eq!(scope, "35a62de6966d4dad8d6efa0643d7ecc3");
         assert_ne!(scope, fp, "the scope fingerprint excludes the messages");
 
         // Distinct requests stay distinct.
@@ -499,12 +505,9 @@ mod tests {
         );
     }
 
-    /// An environment-wide policy passes no scope value, which must hash
-    /// exactly as the absent caller scope always did, or every entry already
-    /// stored under `scope: env` becomes unreachable. The constants were
-    /// computed on the build before the scope value became generic.
+    /// env 仍以 None 作为共享边界；编码域升级会同时隔离 exact 和 semantic 暖条目。
     #[test]
-    fn no_scope_value_keeps_the_env_fingerprint() {
+    fn no_scope_value_keeps_the_env_boundary_in_the_current_encoding() {
         let key = CacheKey {
             model: "gpt-4o".into(),
             messages: vec![("user".into(), "hello".into())],
@@ -517,8 +520,8 @@ mod tests {
             scope_value: None,
         }
         .with_scope("policy-1", 3, None);
-        assert_eq!(key.fingerprint(), "77d81c27c3a73a84c65adb184ee0284a");
-        assert_eq!(key.scope_fingerprint(), "8c0377146f1f4c0d3869aa50807db87b");
+        assert_eq!(key.fingerprint(), "90967b2f8eb1c7bc133b5b071017b315");
+        assert_eq!(key.scope_fingerprint(), "d3749f0589aa620b2e46bc841f1c81d1");
     }
 
     /// Only `None` shares: an empty value that some scope produced is not a
@@ -1062,6 +1065,43 @@ mod tests {
         // Each form still hits its own entry.
         assert_eq!(CacheKey::from_request(&as_string).fingerprint(), fps[0]);
         assert_eq!(CacheKey::from_request(&as_blocks).fingerprint(), fps[1]);
+    }
+
+    #[test]
+    fn decorated_keys_cannot_alias_the_unversioned_encoding() {
+        let mut message = ChatMessage::user("hi");
+        message.name = Some("alice".into());
+        let key = CacheKey::from_request(&req("m", vec![message], None)).with_scope(
+            "p",
+            7,
+            Some("team:t1"),
+        );
+        // 269ac199^ 的具名消息 content="t:hi" 使用此材料和指纹。
+        // 当前 content="hi" 的材料相同，只有编码版本能隔离旧暖条目。
+        assert_eq!(
+            key.messages,
+            vec![(
+                "user".to_string(),
+                r#"j:{"content":"t:hi","extra":{},"name":"alice","tool_call_id":null}"#.to_string(),
+            )]
+        );
+        assert_ne!(key.fingerprint(), "1176e0fbc42b6f8e962bbec08837ddd4");
+        assert_ne!(key.scope_fingerprint(), "69e1d16407c24551a32fe64a87543f74");
+    }
+
+    #[test]
+    fn an_old_model_name_cannot_absorb_the_encoding_version() {
+        let mut message = ChatMessage::user("hi");
+        message.name = Some("alice".into());
+        let key = CacheKey::from_request(&req("m", vec![message], None)).with_scope(
+            "p",
+            7,
+            Some("team:t1"),
+        );
+        // 旧 model="\u{2}\0\0\0\0\0\0\0m" / content="t:hi" 吸收裸 u64 前缀。
+        // 域标记必须含 UTF-8 model 无法表示的字节，不能仅靠数字版本。
+        assert_ne!(key.fingerprint(), "ea7959edae24d590dad231394a057106");
+        assert_ne!(key.scope_fingerprint(), "2b6b68d83ae47b51999a2ec54f26e64d");
     }
 
     #[test]

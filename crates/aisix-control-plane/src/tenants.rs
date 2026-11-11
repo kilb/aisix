@@ -1272,13 +1272,6 @@ pub async fn replace_generated_grants(
                 outcome.unresolved_grants += done.unresolved.len() as u64;
                 if !done.unresolved.is_empty() {
                     outcome.unresolved_tenants += 1;
-                    tracing::warn!(
-                        tenant = %tenant,
-                        models = ?done.unresolved,
-                        "a tenant grants model ids that no live document, channel row or generated \
-                         tombstone answers; the grant is left as it is, and an operator removes \
-                         the id through a grant edit"
-                    );
                 }
             }
             Err(e) if compat::refused(&e) || e.status == StatusCode::SERVICE_UNAVAILABLE => {
@@ -1374,6 +1367,17 @@ async fn replace_generated_in(
         dead.into_iter().partition(|(_, known)| *known);
     let explained: Vec<Uuid> = explained.into_iter().map(|(id, _)| id).collect();
     let unresolved: Vec<Uuid> = unexplained.into_iter().map(|(id, _)| id).collect();
+    // Re-projecting another grant can fail while an unresolved id remains
+    // in a live key. Diagnose it before that failure rolls back the audit.
+    if !unresolved.is_empty() {
+        tracing::warn!(
+            tenant = %tenant_id,
+            models = ?unresolved,
+            "a tenant grant or live key selection names model ids that no live document, channel \
+             row or generated tombstone answers; the grant is left as it is, and an operator \
+             removes the id through a grant edit"
+        );
+    }
     if generated.is_empty() && explained.is_empty() && unresolved.is_empty() {
         return Ok(None);
     }

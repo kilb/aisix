@@ -29,7 +29,7 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 
 use aisix_gateway::{ChatChunk, ChatFormat, ChatResponse, Role};
-use aisix_guardrails::Guardrail;
+use aisix_guardrails::{nests_past_decode_limit, Guardrail};
 use serde_json::Value;
 
 /// detector name → masked-span count. Mirrors
@@ -614,27 +614,38 @@ async fn moderate_body_inner<R: Into<AnthropicRequestRedaction>>(
     }
     let collector = SegmentCollector::default();
     let _ = walk(&collector);
-    // R-070: a tool-argument document the walk could not decode offers no
-    // slot, so the passes below would judge a body they never read. Ask the
-    // chain what an unreadable body means here: a fail-closed member that
-    // reads this side refuses, and everything else goes on to record it as
-    // the bypass the walker already noted.
-    let unreadable_refusal = collector.saw_unreadable_tool_arguments()
-        && match dir {
-            Direction::Input | Direction::InputHistory => {
-                Guardrail::refuses_unevaluable_input(chain)
-            }
-            Direction::Output | Direction::OutputEcho => {
-                Guardrail::refuses_unevaluable_output(chain)
-            }
-        };
+    // R-070：collector 没有真实 chain 的 audit，纯 Block 也不会经过后续 rewrite。
+    // 因此在这里按当前 hook 统一记录未完成的检查，并禁止把放行内容当作安全捕获。
+    let unreadable = collector.saw_unreadable_tool_arguments();
+    let (reads_side, refuses_unreadable) = match dir {
+        Direction::Input | Direction::InputHistory => (
+            Guardrail::runs_on_input(chain),
+            Guardrail::refuses_unevaluable_input(chain),
+        ),
+        Direction::Output | Direction::OutputEcho => (
+            Guardrail::runs_on_output(chain),
+            Guardrail::refuses_unevaluable_output(chain),
+        ),
+    };
     let newest_from = collector.newest_from();
     let collected = collector.take();
-    let mut verdict = if unreadable_refusal {
+    let mut verdict = if unreadable && refuses_unreadable {
         non_segment_verdict.merged_with(aisix_guardrails::GuardrailVerdict::block_unavailable(
             "data-loss prevention could not read a tool argument document",
             crate::error::TAG_UNSCANNABLE_BODY,
         ))
+    } else if unreadable && reads_side {
+        match dir {
+            Direction::Input | Direction::InputHistory => {
+                chain.record_unreadable_input_bypass(crate::error::TAG_UNSCANNABLE_BODY);
+            }
+            Direction::Output | Direction::OutputEcho => {
+                chain.record_unreadable_output_bypass(crate::error::TAG_UNSCANNABLE_BODY);
+            }
+        }
+        non_segment_verdict.merged_with(aisix_guardrails::GuardrailVerdict::Bypass {
+            reason: crate::error::TAG_UNSCANNABLE_BODY.to_owned(),
+        })
     } else {
         non_segment_verdict
     };
@@ -1084,47 +1095,6 @@ impl<'de> serde::de::Visitor<'de> for EveryValue<'_> {
         }
         Ok(Value::Object(out))
     }
-}
-
-/// Nesting depth at which [`parse_every_value`] stops decoding: `serde_json`'s
-/// own default recursion limit (128, `de.rs` — one decrement per `{` or
-/// `[`). Kept, not lifted: the bound is what keeps a hostile payload from
-/// exhausting the stack in the first place.
-const JSON_DECODE_DEPTH_LIMIT: usize = 128;
-
-/// Whether `encoded` nests past [`JSON_DECODE_DEPTH_LIMIT`], and so cannot
-/// be decoded here at all.
-///
-/// Read from the bytes rather than from the failed parse, because the parse
-/// error does not say why it failed: `serde_json::Error` exposes only
-/// `classify()` — a nesting overflow is `Category::Syntax`, exactly like a
-/// trailing comma — and its `ErrorCode` is private. The scan is linear, runs
-/// only after a parse has already failed, and counts structure alone:
-/// brackets inside a string are text, and a backslash escape (including a
-/// `\\` pair) is one character.
-fn nests_past_decode_limit(encoded: &str) -> bool {
-    let mut depth: usize = 0;
-    let mut escaped = false;
-    let mut in_string = false;
-    for byte in encoded.bytes() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match byte {
-            b'\\' if in_string => escaped = true,
-            b'"' => in_string = !in_string,
-            b'{' | b'[' if !in_string => {
-                depth += 1;
-                if depth >= JSON_DECODE_DEPTH_LIMIT {
-                    return true;
-                }
-            }
-            b'}' | b']' if !in_string => depth = depth.saturating_sub(1),
-            _ => {}
-        }
-    }
-    false
 }
 
 /// `encoded` parsed as JSON, and whether an object in it repeats a key
@@ -5660,6 +5630,72 @@ mod tests {
             audit.bypass_reason().as_deref(),
             Some(crate::error::TAG_UNSCANNABLE_BODY)
         );
+    }
+
+    // R-070：检查真实 moderation 的 verdict/capture 状态；直接调用 Mask walker
+    // 会漏掉纯 Block 不做 rewrite 的分支。相反方向没有承诺检查，不能记 bypass。
+    #[tokio::test]
+    async fn unreadable_arguments_moderation_audits_only_the_hook_that_reads_them() {
+        use aisix_core::models::GuardrailHookPoint;
+        use aisix_guardrails::GuardrailVerdict;
+
+        for action in [PiiAction::Block, PiiAction::Mask] {
+            for hook in [GuardrailHookPoint::Input, GuardrailHookPoint::Output] {
+                for input in [true, false] {
+                    let audit = Arc::new(aisix_guardrails::GuardrailAuditLog::new());
+                    let chain = GuardrailChain::new(vec![Arc::new(
+                        PiiGuardrail::new(
+                            vec![builtin_rule("email", action).unwrap()],
+                            hook,
+                            262_144,
+                            false,
+                        )
+                        .with_fail_open(true),
+                    )])
+                    .with_audit_log(Some(Arc::clone(&audit)));
+                    let arguments = deep_argument_document(r"alice\u0040example.com");
+                    let item = json!({
+                        "type": "function_call", "call_id": "c", "name": "send",
+                        "arguments": arguments,
+                    });
+                    let mut body = if input {
+                        json!({"input": [item]})
+                    } else {
+                        json!({"output": [item]})
+                    };
+                    let moderation = if input {
+                        moderate_responses_request_structured(
+                            &chain,
+                            None,
+                            GuardrailVerdict::Allow,
+                            &mut body,
+                            &mut RedactionCounts::new(),
+                            &mut Vec::new(),
+                        )
+                        .await
+                    } else {
+                        moderate_responses_response_structured(
+                            &chain,
+                            GuardrailVerdict::Allow,
+                            &mut body,
+                            &mut RedactionCounts::new(),
+                            &mut Vec::new(),
+                        )
+                        .await
+                    };
+                    let reads_side = input == (hook == GuardrailHookPoint::Input);
+                    assert!(!moderation.verdict.is_block());
+                    assert_eq!(moderation.verdict.is_bypass(), reads_side);
+                    assert_eq!(moderation.capture_safe, !reads_side);
+                    assert_eq!(
+                        audit.bypass_reason().as_deref(),
+                        reads_side.then_some(crate::error::TAG_UNSCANNABLE_BODY),
+                    );
+                    let field = if input { "input" } else { "output" };
+                    assert_eq!(body[field][0]["arguments"], arguments);
+                }
+            }
+        }
     }
 
     /// Nothing matched: the repeated key is the caller's to send, so the

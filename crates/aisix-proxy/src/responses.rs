@@ -124,16 +124,14 @@ struct ResponseDispatchSuccess {
 /// the rest of the entry's TTL.
 ///
 /// So the origin is re-checked here, with the same predicate a continuation
-/// uses. An entry written before the origin was recorded carries an empty id
-/// and is served as before: it was stored under a fingerprint that already
-/// folds the caller's groups, so it only lacks this later test.
+/// uses. 旧条目没有 origin，无法证明目标仍然可达，按 miss 重新获取回答。
 pub(crate) fn cache_hit_origin_eligible(
     snapshot: &aisix_core::AisixSnapshot,
     auth: &crate::auth::AuthenticatedKey,
     hit: &aisix_cache::CachedBody,
 ) -> bool {
     if hit.origin_model_id.is_empty() {
-        return true;
+        return false;
     }
     let allowed = &auth.key().allowed_provider_groups;
     if allowed.is_empty() {
@@ -2300,8 +2298,8 @@ async fn responses_to_target(
                 if let Some(deferred) = &attempt_c.deferred {
                     deferred.finish(
                         &state_c,
-                        if refused { 200 } else { terminal.status },
-                        refused || (terminal.error_class.is_empty() && terminal.status < 400),
+                        terminal.status,
+                        terminal.error_class.is_empty() && terminal.status < 400,
                     );
                 }
                 let mut terminal_attempt = attempt_c;
@@ -2967,13 +2965,8 @@ async fn responses_cross_provider_to_target(
                 if let Some(deferred) = &attempt_c.deferred {
                     deferred.finish(
                         &state_c,
-                        if comp.guardrail_blocked {
-                            200
-                        } else {
-                            terminal.status
-                        },
-                        comp.guardrail_blocked
-                            || (terminal.error_class.is_empty() && terminal.status < 400),
+                        terminal.status,
+                        terminal.error_class.is_empty() && terminal.status < 400,
                     );
                 }
                 // A clean stream is a committed 200, and so is an
@@ -4526,7 +4519,8 @@ where
                 usage,
                 out_text,
                 monitor_hits: Vec::new(),
-                failure: None,
+                // 本地拒绝决定调用方的 200，不能抹掉本次读取已知的上游失败。
+                failure: guard.observed.failure,
             });
             yield Ok(responses_refusal_body(
                 reply,
@@ -5938,6 +5932,33 @@ fn emit_access_log(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_legacy_cached_answer_without_an_origin_is_not_replayed() {
+        use aisix_core::ResourceEntry;
+        let key: aisix_core::ApiKey = serde_json::from_value(serde_json::json!({
+            "key_hash": "h", "allowed_models": ["*"],
+        }))
+        .unwrap();
+        let auth = crate::auth::AuthenticatedKey {
+            anonymous: false,
+            entry: std::sync::Arc::new(ResourceEntry::new("key-entry-1", key, 1)),
+            jwt: None,
+            owner: Default::default(),
+            tags: Default::default(),
+        };
+        let legacy: aisix_cache::CachedBody = serde_json::from_value(serde_json::json!({
+            "content_type": "application/json", "body": "e30=",
+            "prompt_tokens": 1, "completion_tokens": 1,
+        }))
+        .unwrap();
+        assert!(legacy.origin_model_id.is_empty());
+        assert!(!super::cache_hit_origin_eligible(
+            &aisix_core::AisixSnapshot::new(),
+            &auth,
+            &legacy,
+        ));
+    }
+
     /// R-040: a cached answer is served only while the target that produced
     /// it is still one the caller's key can reach. The ids inside it are
     /// sealed to that target, and `admit_continuation` refuses to continue
@@ -6012,8 +6033,8 @@ mod tests {
             &auth,
             &body("id-gone")
         ));
-        // An entry from before the origin was recorded keeps serving.
-        assert!(super::cache_hit_origin_eligible(&snap, &auth, &body("")));
+        // 旧条目无法证明 origin，不能回放可能已无法续写的响应。
+        assert!(!super::cache_hit_origin_eligible(&snap, &auth, &body("")));
     }
 
     /// Serializing the borrowed request with only `model` swapped gives the

@@ -15,14 +15,122 @@
 
 #![cfg(feature = "redis")]
 
-use aisix_cache::{Cache, CachedBody, MemoryCache, RedisCache};
+use aisix_cache::{Cache, CacheKey, CachedBody, MemoryCache, RedisCache};
 use aisix_core::config::{RedisConnConfig, RedisMode};
-use aisix_gateway::{ChatMessage, ChatResponse, FinishReason, UsageStats};
+use aisix_gateway::{ChatFormat, ChatMessage, ChatResponse, FinishReason, UsageStats};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 static NS: AtomicU32 = AtomicU32::new(0);
+
+// 269ac199^：model=m、具名 alice/user/content="t:hi"、policy=p/7、team:t1。
+// 旧 decorated 编码没有内部类型前缀，材料恰好等于当前 content="hi"。
+const UNVERSIONED_NAMED_KEY: &str = "1176e0fbc42b6f8e962bbec08837ddd4";
+// 旧 model="\u{2}\0\0\0\0\0\0\0m" 能吸收裸 u64=2 版本前缀。
+const UNVERSIONED_PREFIXED_MODEL_KEY: &str = "ea7959edae24d590dad231394a057106";
+
+fn named_key() -> CacheKey {
+    let mut message = ChatMessage::user("hi");
+    message.name = Some("alice".into());
+    CacheKey::from_request(&ChatFormat::new("m", vec![message])).with_scope("p", 7, Some("team:t1"))
+}
+
+#[tokio::test]
+async fn redis_upgrade_and_rollback_do_not_replay_a_different_decorated_request() {
+    let redis = Redis::start().expect("Redis is required for the encoding-upgrade regression");
+    assert!(redis.wait_ready().await, "Redis must answer PING");
+    let cfg = RedisConnConfig {
+        mode: RedisMode::Single,
+        url: Some(redis.url.clone()),
+        ..RedisConnConfig::default()
+    };
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let prefix = format!("encoding-upgrade-{}-{nonce}", std::process::id());
+    let upgrade = RedisCache::connect(&cfg)
+        .await
+        .expect("connect")
+        .with_prefix(format!("{prefix}:upgrade"));
+    let rollback = RedisCache::connect(&cfg)
+        .await
+        .expect("connect")
+        .with_prefix(format!("{prefix}:rollback"));
+    let key = named_key();
+    let current = key.fingerprint();
+
+    // 升级前的 writer 预热旧 key；升级不清 Redis，也不能把别的请求当命中。
+    upgrade
+        .put(UNVERSIONED_NAMED_KEY, response("old request: t:hi"))
+        .await
+        .expect("warm old key");
+    upgrade
+        .put(
+            UNVERSIONED_PREFIXED_MODEL_KEY,
+            response("old prefixed-model request: t:hi"),
+        )
+        .await
+        .expect("warm old model that absorbs a bare version");
+    assert!(upgrade.get(&current).await.expect("new reader").is_none());
+    assert_eq!(
+        upgrade
+            .get(UNVERSIONED_NAMED_KEY)
+            .await
+            .expect("old reader")
+            .expect("old same-version hit")
+            .message
+            .content_str(),
+        "old request: t:hi"
+    );
+    upgrade
+        .put(&current, response("new request: hi"))
+        .await
+        .expect("warm current key");
+    assert_eq!(
+        upgrade
+            .get(&current)
+            .await
+            .expect("new reader")
+            .expect("new same-version hit")
+            .message
+            .content_str(),
+        "new request: hi"
+    );
+    for other in [
+        key.clone().with_scope("p", 7, Some("team:t2")),
+        key.clone().with_scope("p", 7, Some("key:k1")),
+        key.clone().with_scope("p", 7, None),
+        key.clone().with_scope("other-policy", 7, Some("team:t1")),
+        key.clone().with_scope("p", 8, Some("team:t1")),
+    ] {
+        assert_ne!(key.scope_fingerprint(), other.scope_fingerprint());
+        assert!(upgrade
+            .get(&other.fingerprint())
+            .await
+            .expect("other scope")
+            .is_none());
+    }
+
+    // 回滚方向独立 namespace：新版预热后，旧 reader 必须 miss，不能借旧值掩盖。
+    rollback
+        .put(&current, response("new request: hi"))
+        .await
+        .expect("warm current key before rollback");
+    for old_key in [UNVERSIONED_NAMED_KEY, UNVERSIONED_PREFIXED_MODEL_KEY] {
+        assert!(rollback
+            .get(old_key)
+            .await
+            .expect("rolled-back reader")
+            .is_none());
+    }
+    assert!(rollback
+        .get(&current)
+        .await
+        .expect("same-version reader")
+        .is_some());
+}
 
 struct Redis {
     owned: Option<(Child, std::path::PathBuf)>,

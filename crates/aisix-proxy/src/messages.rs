@@ -2004,13 +2004,8 @@ async fn anthropic_passthrough_dispatch(
                 if let Some(deferred) = &attempt_c.deferred {
                     deferred.finish(
                         &state_c,
-                        if usage.guardrail_blocked {
-                            200
-                        } else {
-                            terminal.status
-                        },
-                        usage.guardrail_blocked
-                            || (terminal.error_class.is_empty() && terminal.status < 400),
+                        terminal.status,
+                        terminal.error_class.is_empty() && terminal.status < 400,
                     );
                 }
                 let metrics = AnthropicUsageMetrics {
@@ -3150,13 +3145,8 @@ async fn cross_provider_dispatch(
                 if let Some(deferred) = &attempt_for_telem.deferred {
                     deferred.finish(
                         &state_for_telem,
-                        if comp.guardrail_blocked {
-                            200
-                        } else {
-                            terminal.status
-                        },
-                        comp.guardrail_blocked
-                            || (terminal.error_class.is_empty() && terminal.status < 400),
+                        terminal.status,
+                        terminal.error_class.is_empty() && terminal.status < 400,
                     );
                 }
 

@@ -661,20 +661,31 @@ mod tests {
         assert_ne!(a.body, b.body, "body keys shared: {a:?} {b:?}");
     }
 
-    /// Computed with the same inputs on the build before `team` existed, so
-    /// entries already stored under `api_key` and `env` stay reachable.
-    const LEGACY_API_KEY_FINGERPRINT: (&str, &str, &str) = (
+    // 编码域升级前的样本：chat exact/partition 应冷启，body 指纹保持不变。
+    const UNVERSIONED_API_KEY_FINGERPRINT: (&str, &str, &str) = (
         "c76ef486be681e1e49c7720465407255",
         "e0838d7341a70de5bbf2fa14c4fb68e5",
         "dc3096e47cbc7cd79cc54ba3cf79bc7e",
     );
-    const LEGACY_ENV_FINGERPRINT: (&str, &str, &str) = (
+    const UNVERSIONED_ENV_FINGERPRINT: (&str, &str, &str) = (
         "15c70090121c892939eb2f910f8e0e4c",
         "4a3f897c1b09e90ba260f062e3657e9b",
         "87cd351069ced1c945daf7b4f40e916a",
     );
 
-    fn legacy(fp: (&str, &str, &str)) -> Keys {
+    // 固定当前编码的三个样本，使同版本隔离断言不能借跨版本差异通过。
+    const VERSIONED_API_KEY_FINGERPRINT: (&str, &str, &str) = (
+        "6c7b66253d65c1a2bd3fc79b2b8a8848",
+        "d86454f622e63d43cf73bca59f2566e1",
+        "dc3096e47cbc7cd79cc54ba3cf79bc7e",
+    );
+    const VERSIONED_ENV_FINGERPRINT: (&str, &str, &str) = (
+        "d67694138a84f430520f3b5a6307d4c4",
+        "000c1e172ff34f69aa87e8c75c0b22a3",
+        "87cd351069ced1c945daf7b4f40e916a",
+    );
+
+    fn fixture_keys(fp: (&str, &str, &str)) -> Keys {
         Keys {
             exact: fp.0.to_string(),
             partition: fp.1.to_string(),
@@ -718,7 +729,7 @@ mod tests {
         );
         assert_eq!(
             key_for_in(false, CacheScope::Env, Some("t1"), "k1"),
-            legacy(LEGACY_ENV_FINGERPRINT)
+            fixture_keys(VERSIONED_ENV_FINGERPRINT)
         );
     }
 
@@ -784,7 +795,7 @@ mod tests {
     fn an_empty_scope_value_never_lands_in_the_shared_entries() {
         let req = aisix_gateway::ChatFormat::new("m", vec![ChatMessage::user("hi")]);
         let empty = aisix_cache::CacheKey::from_request(&req).with_scope("policy-1", 0, Some(""));
-        let shared = legacy(LEGACY_ENV_FINGERPRINT);
+        let shared = fixture_keys(VERSIONED_ENV_FINGERPRINT);
         assert_ne!(empty.fingerprint(), shared.exact);
         assert_ne!(empty.scope_fingerprint(), shared.partition);
 
@@ -794,15 +805,25 @@ mod tests {
     }
 
     #[test]
-    fn existing_api_key_and_env_keys_are_unchanged() {
-        assert_eq!(
-            key_for(CacheScope::ApiKey, Some("t1"), "k1"),
-            legacy(LEGACY_API_KEY_FINGERPRINT)
-        );
-        assert_eq!(
-            key_for(CacheScope::Env, Some("t1"), "k1"),
-            legacy(LEGACY_ENV_FINGERPRINT)
-        );
+    fn api_key_and_env_keys_are_stable_in_the_versioned_encoding() {
+        for (scope, versioned, unversioned) in [
+            (
+                CacheScope::ApiKey,
+                VERSIONED_API_KEY_FINGERPRINT,
+                UNVERSIONED_API_KEY_FINGERPRINT,
+            ),
+            (
+                CacheScope::Env,
+                VERSIONED_ENV_FINGERPRINT,
+                UNVERSIONED_ENV_FINGERPRINT,
+            ),
+        ] {
+            let current = key_for(scope, Some("t1"), "k1");
+            assert_eq!(current, fixture_keys(versioned));
+            assert_ne!(current.exact, unversioned.0);
+            assert_ne!(current.partition, unversioned.1);
+            assert_eq!(current.body, unversioned.2);
+        }
     }
 
     /// The semantic layer only compares a request against entries in its

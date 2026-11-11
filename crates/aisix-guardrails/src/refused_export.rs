@@ -19,7 +19,7 @@
 
 use serde_json::Value;
 
-use crate::Guardrail;
+use crate::{nests_past_decode_limit, Guardrail};
 
 /// `body`, in the representation the route captures, with every hit of the
 /// chain's input rules masked; `None` when the row must carry no body (module
@@ -54,6 +54,7 @@ fn masked_copy(chain: &dyn Guardrail, body: &str) -> Option<(String, bool)> {
             pass.value(&mut doc);
             doc.to_string()
         }
+        Err(_) if nests_past_decode_limit(body) => return None,
         Err(_) => pass.text(body),
     };
     (!pass.left_behind).then_some((masked, pass.located))
@@ -86,15 +87,18 @@ impl MaskPass<'_> {
             Value::String(s) => {
                 // A tool call's arguments are JSON inside a string, where an
                 // escape hides a match from the text pass below.
-                if let Ok(mut nested @ (Value::Object(_) | Value::Array(_))) =
-                    serde_json::from_str::<Value>(s)
-                {
-                    let located_before = std::mem::replace(&mut self.located, false);
-                    self.value(&mut nested);
-                    if self.located {
-                        *s = nested.to_string();
+                match serde_json::from_str::<Value>(s) {
+                    Ok(mut nested @ (Value::Object(_) | Value::Array(_))) => {
+                        let located_before = std::mem::replace(&mut self.located, false);
+                        self.value(&mut nested);
+                        if self.located {
+                            *s = nested.to_string();
+                        }
+                        self.located |= located_before;
                     }
-                    self.located |= located_before;
+                    // R-070：其他位置的明文命中不能证明这份不可读参数已安全遮盖。
+                    Err(_) if nests_past_decode_limit(s) => self.left_behind = true,
+                    _ => {}
                 }
                 *s = self.text(s);
             }
@@ -193,6 +197,35 @@ mod tests {
         let nested: serde_json::Value =
             serde_json::from_str(out["arguments"].as_str().unwrap()).unwrap();
         assert_eq!(nested, json!({"note": "keep [KEYWORD_REDACTED]", "n": 1}));
+    }
+
+    // R-070：已定位到明文命中，不代表同一请求里无法解码的参数也可安全导出。
+    #[test]
+    fn a_visible_hit_does_not_make_an_unreadable_argument_safe_to_export() {
+        for action in [PiiAction::Block, PiiAction::Mask] {
+            let c = chain(vec![Arc::new(PiiGuardrail::new(
+                vec![builtin_rule("email", action).unwrap()],
+                GuardrailHookPoint::Input,
+                1024,
+                false,
+            ))]);
+            let arguments = format!(
+                r#"{{"padding":{}0{},"to":"hidden\u0040example.com"}}"#,
+                "[".repeat(130),
+                "]".repeat(130),
+            );
+            for body in [
+                json!({
+                    "prompt": "contact visible@example.com",
+                    "arguments": arguments,
+                })
+                .to_string(),
+                format!(r#"{{"prompt":"contact visible@example.com","deep":{arguments}}}"#),
+            ] {
+                assert_eq!(mask_refused_request(&c, &body), None);
+                assert_eq!(mask_unscreened_request(&c, &body), None);
+            }
+        }
     }
 
     #[test]

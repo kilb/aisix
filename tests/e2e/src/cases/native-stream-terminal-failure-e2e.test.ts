@@ -17,15 +17,24 @@ const CALLER = "sk-native-terminal-failure";
 const MODELS = {
   messagesMalformed: "native-messages-malformed-sse",
   messagesInBand: "native-messages-in-band-error",
+  messagesOverCap: "native-messages-in-band-over-cap",
   responsesMalformed: "native-responses-malformed-sse",
   responsesTruncated: "native-responses-truncated-sse",
   responsesInBand: "native-responses-in-band-error",
+  responsesOverCap: "native-responses-in-band-over-cap",
 } as const;
 
 async function usage5xxCounter(app: SpawnedApp, handler: string): Promise<number> {
   return sumMetric(await scrapeMetrics(app.metricsUrl), "aisix_usage_events_emitted_total", {
     handler,
     status_code: "5xx",
+  });
+}
+
+async function usage2xxCounter(app: SpawnedApp, handler: string): Promise<number> {
+  return sumMetric(await scrapeMetrics(app.metricsUrl), "aisix_usage_events_emitted_total", {
+    handler,
+    status_code: "2xx",
   });
 }
 
@@ -169,6 +178,15 @@ describe("native stream protocol failures are not healthy completions", () => {
         'event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"provider overloaded"}}\n\n',
       ],
     });
+    upstreams.messagesOverCap = await startOpenAiUpstream({
+      rawSseChunks: [
+        'event: message_start\ndata: {"type":"message_start","message":{"id":"msg-cap-error","type":"message","role":"assistant","model":"claude","content":[],"usage":{"input_tokens":3,"output_tokens":1}}}\n\n' +
+          'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n' +
+          `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "X".repeat(128) } })}\n\n` +
+          'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":null},"usage":{"output_tokens":4}}\n\n' +
+          'event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"provider overloaded"}}\n\n',
+      ],
+    });
     upstreams.responsesMalformed = await startOpenAiUpstream({
       rawSseChunks: [
         'data: {"type":"response.created","response":{"id":"resp-malformed","status":"in_progress"}}\n\n',
@@ -188,6 +206,14 @@ describe("native stream protocol failures are not healthy completions", () => {
         'data: {"type":"response.output_text.delta","delta":"partial billed output"}\n\n',
         'data: {"type":"response.failed","response":{"id":"resp-error","status":"failed","output":[],"error":{"code":"server_error","message":"provider failed"},"usage":{"input_tokens":3,"output_tokens":4,"total_tokens":7}}}\n\n',
         "data: [DONE]\n\n",
+      ],
+    });
+    upstreams.responsesOverCap = await startOpenAiUpstream({
+      rawSseChunks: [
+        'data: {"type":"response.created","response":{"id":"resp-cap-error","status":"in_progress"}}\n\n' +
+          `data: ${JSON.stringify({ type: "response.output_text.delta", delta: "X".repeat(128) })}\n\n` +
+          'data: {"type":"response.failed","response":{"id":"resp-cap-error","status":"failed","output":[],"error":{"code":"server_error","message":"provider failed"},"usage":{"input_tokens":3,"output_tokens":4,"total_tokens":7}}}\n\n' +
+          "data: [DONE]\n\n",
       ],
     });
 
@@ -236,6 +262,21 @@ describe("native stream protocol failures are not healthy completions", () => {
         priority: 0,
         enabled: true,
       });
+    }
+    const capGuardrail = await seed.createGuardrail(
+      {
+        name: "native-terminal-small-cap",
+        enabled: true,
+        hook_point: "output",
+        kind: "pii",
+        detectors: [{ type: "email", action: "mask" }],
+        max_buffer_bytes: 32,
+        on_buffer_exceeded: "fail_closed",
+      },
+      { attach: false },
+    );
+    for (const key of ["messagesOverCap", "responsesOverCap"] as const) {
+      await seed.attachGuardrailToModel(capGuardrail.id, modelIds[key]!);
     }
     await seed.createApiKey({
       key_hash: createHash("sha256").update(CALLER).digest("hex"),
@@ -395,6 +436,7 @@ describe("native stream protocol failures are not healthy completions", () => {
         app,
         MODELS[scenario.modelKey],
       );
+      const deploymentBaseline = await scrapeMetrics(app.metricsUrl);
       const response = await post(scenario.endpoint, MODELS[scenario.modelKey]);
       expect(response.status).toBe(200);
       const body = await response.text();
@@ -411,6 +453,53 @@ describe("native stream protocol failures are not healthy completions", () => {
         outputBaseline,
         4,
       );
+      const deploymentAfter = await scrapeMetrics(app.metricsUrl);
+      expect(metricDelta(deploymentBaseline, deploymentAfter, "aisix_deployment_failure_responses_total", {
+        model: MODELS[scenario.modelKey],
+      })).toBe(1);
+      expect(metricDelta(deploymentBaseline, deploymentAfter, "aisix_deployment_success_responses_total", {
+        model: MODELS[scenario.modelKey],
+      })).toBe(0);
+    });
+  }
+
+  for (const scenario of [
+    { endpoint: "/v1/messages" as const, modelKey: "messagesOverCap" as const, reason: "upstream_server_error" },
+    { endpoint: "/v1/responses" as const, modelKey: "responsesOverCap" as const, reason: "upstream_in_band_error" },
+  ]) {
+    test(`${scenario.endpoint} local cap refusal preserves the known upstream deployment failure`, async (ctx) => {
+      const upstream = upstreams[scenario.modelKey];
+      if (!etcdReachable || !app || !upstream) {
+        ctx.skip();
+        return;
+      }
+      const handler = scenario.endpoint.slice(4);
+      const usageBaseline = await usage2xxCounter(app, handler);
+      const failureBaseline = await usage5xxCounter(app, handler);
+      const deploymentBaseline = await scrapeMetrics(app.metricsUrl);
+      const requestBaseline = upstream.receivedRequests.length;
+      const response = await post(scenario.endpoint, MODELS[scenario.modelKey]);
+      expect(response.status).toBe(200);
+      const body = await response.text();
+      expect(body).toContain("output_buffer_exceeded");
+      expect(body).not.toContain("XXXX");
+      expect(body).not.toContain("provider overloaded");
+      expect(body).not.toContain("provider failed");
+      expect(upstream.receivedRequests).toHaveLength(requestBaseline + 1);
+      await waitConfigPropagation(
+        async () => (await usage2xxCounter(app!, handler)) === usageBaseline + 1,
+      );
+      const status = await modelStatus(app, modelIds[scenario.modelKey]!);
+      expect(status?.status).toBe("cooldown");
+      expect(status?.status_reason).toBe(scenario.reason);
+      expect(await usage5xxCounter(app, handler)).toBe(failureBaseline);
+      const deploymentAfter = await scrapeMetrics(app.metricsUrl);
+      expect(metricDelta(deploymentBaseline, deploymentAfter, "aisix_deployment_failure_responses_total", {
+        model: MODELS[scenario.modelKey],
+      })).toBe(1);
+      expect(metricDelta(deploymentBaseline, deploymentAfter, "aisix_deployment_success_responses_total", {
+        model: MODELS[scenario.modelKey],
+      })).toBe(0);
     });
   }
 });

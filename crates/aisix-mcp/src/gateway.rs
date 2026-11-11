@@ -35,8 +35,8 @@ use std::sync::{Arc, OnceLock};
 
 use rmcp::model::{
     CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
-    ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerConfig,
-    Tool,
+    JsonRpcResponse, JsonRpcVersion2_0, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
+    ServerCapabilities, ServerConfig, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
@@ -848,39 +848,12 @@ impl ServerHandler for McpGateway {
                 }
             }
         }
+        let total = tools.len() as u32;
         // Per-tool ACL: expose only the tools this caller's key permits. Run
         // BEFORE the byte budget, so the budget bounds what this caller is
         // served, not what the upstream stores: a key permitted one small tool
         // on an upstream with a huge inventory keeps its list.
         tools.retain(|tool| self.tool_acl.permits(tool.name.as_ref()));
-        // The pages of every upstream together are one downstream result, and
-        // a client reads it through a transport with its own size cap: answer
-        // a permitted list past the budget with a JSON-RPC error the caller can
-        // act on, rather than one its client has to discard at the transport.
-        let aggregate_bytes: usize = tools
-            .iter()
-            .map(|tool| {
-                crate::bridge::tool_bytes(
-                    tool.name.as_ref(),
-                    tool.description.as_deref(),
-                    &tool.input_schema,
-                )
-            })
-            .sum();
-        if aggregate_bytes > crate::bridge::MAX_TOOL_LIST_BYTES {
-            return Err(ErrorData::internal_error(
-                format!("aggregated tools/list is too large: {aggregate_bytes} bytes"),
-                None,
-            ));
-        }
-        let total = tools.len() as u32;
-        // Recorded here rather than returned, because the handler's only
-        // channel back to the mount is the JSON-RPC result. `set` keeps the
-        // first write: one request is one `tools/list` on this transport.
-        let _ = self.tools_list.set(ToolsListCounts {
-            total,
-            returned: tools.len() as u32,
-        });
         // A scoped gateway serves its single upstream's tools under their
         // original names — the namespace prefix exists to disambiguate the
         // aggregate, and a single-server endpoint has nothing to disambiguate.
@@ -920,11 +893,36 @@ impl ServerHandler for McpGateway {
         let modern = context
             .protocol_version()
             .is_some_and(|v| v.as_str() >= ProtocolVersion::V_2026_07_28.as_str());
-        Ok(if modern {
+        let result = if modern {
             result.with_ttl_ms(0).with_cache_scope(CacheScope::Private)
         } else {
+            // SDK 同样会移除此字段；计数也使用旧版实际返回的形状。
+            let mut result = result;
+            result.result_type = None;
             result
-        })
+        };
+        // ACL、scoped 名称和版本字段确定后，计实际结果及请求 id 的 JSON-RPC 壳。
+        // 无缓冲计数到上限就停止，超限返回客户端可读的协议错误。
+        let response = JsonRpcResponse {
+            jsonrpc: JsonRpcVersion2_0,
+            id: context.id.clone(),
+            result: &result,
+        };
+        if crate::bridge::serialized_bytes(&response, crate::bridge::MAX_TOOL_LIST_BYTES).is_err() {
+            return Err(ErrorData::internal_error(
+                format!(
+                    "aggregated tools/list is too large: exceeds {} bytes",
+                    crate::bridge::MAX_TOOL_LIST_BYTES
+                ),
+                None,
+            ));
+        }
+        // total 保留 ACL 前的可用工具数，returned 才是调用者实际看见的数。
+        let _ = self.tools_list.set(ToolsListCounts {
+            total,
+            returned: result.tools.len() as u32,
+        });
+        Ok(result)
     }
 
     async fn call_tool(

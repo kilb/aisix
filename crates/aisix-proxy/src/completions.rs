@@ -974,14 +974,6 @@ async fn dispatch(
                                 (crate::CLIENT_CLOSED_REQUEST, "")
                             }
                         };
-                        // A refusal is the 200 its head committed, however the
-                        // upstream ended: a truncation counts against the upstream
-                        // above, not on the row.
-                        let terminal_status = if refusal.is_some() {
-                            200
-                        } else {
-                            terminal_status
-                        };
                         if let Some(deferred) = &deferred_for_stream {
                             deferred.finish(
                                 &state_for_stream,
@@ -989,6 +981,12 @@ async fn dispatch(
                                 terminal_status < 400,
                             );
                         }
+                        // 部署按上游终态结算；本地拒绝的调用方与 usage 仍保持已提交的 200。
+                        let terminal_status = if refusal.is_some() {
+                            200
+                        } else {
+                            terminal_status
+                        };
                         let output_text = held
                             .and_then(|held| held.estimate_text.clone())
                             .unwrap_or_else(|| accumulator.output_text());

@@ -12,6 +12,7 @@
 //! rmcp's still-moving API contained to this file.
 
 use std::collections::HashMap;
+use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,7 +21,10 @@ use aisix_gateway::redact_url_for_log;
 use async_trait::async_trait;
 use futures::future::{BoxFuture, FutureExt};
 use http::{HeaderName, HeaderValue};
-use rmcp::model::{CallToolRequestParams, CallToolResponse, ClientConfig, ProtocolVersion};
+use rmcp::model::{
+    CacheScope, CallToolRequestParams, CallToolResponse, ClientConfig, JsonRpcResponse,
+    JsonRpcVersion2_0, ListToolsResult, ProtocolVersion, RequestId,
+};
 use rmcp::service::{ClientInitializeError, RoleClient, RunningService, ServiceError};
 use rmcp::transport::streamable_http_client::{
     SseError, StreamableHttpClientTransportConfig, StreamableHttpError,
@@ -1025,18 +1029,36 @@ const MAX_LISTED_TOOLS: usize = 10_000;
 /// configuration.
 pub(crate) const MAX_TOOL_LIST_BYTES: usize = 14 * 1024 * 1024;
 
-/// What one tool's own fields serialize to, as an estimate of its share of
-/// a serialized `tools/list`: measured from the fields rather than from the
-/// wire shape, so it holds across protocol versions, which attach and strip
-/// other fields around these.
-pub(crate) fn tool_bytes(
-    name: &str,
-    description: Option<&str>,
-    input_schema: &serde_json::Map<String, serde_json::Value>,
-) -> usize {
-    name.len()
-        + description.map_or(0, str::len)
-        + serde_json::to_string(input_schema).map_or(0, |schema| schema.len())
+/// 直接计数真实 JSON 序列化的字节，包含转义；到预算立即停止，不生成中间字符串。
+pub(crate) fn serialized_bytes<T: serde::Serialize>(
+    value: &T,
+    limit: usize,
+) -> Result<usize, serde_json::Error> {
+    struct Counter {
+        bytes: usize,
+        limit: usize,
+    }
+
+    impl Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if bytes.len() > self.limit - self.bytes {
+                return Err(io::Error::new(
+                    io::ErrorKind::FileTooLarge,
+                    "JSON byte budget exceeded",
+                ));
+            }
+            self.bytes += bytes.len();
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut counter = Counter { bytes: 0, limit };
+    serde_json::to_writer(&mut counter, value)?;
+    Ok(counter.bytes)
 }
 
 #[async_trait]
@@ -1053,7 +1075,20 @@ impl McpBridge for RmcpBridge {
     async fn list_tools(&self) -> Result<Vec<McpTool>, McpError> {
         let list = async {
             let mut tools = Vec::new();
-            let mut bytes = 0;
+            let too_large = |_| {
+                McpError::Request(format!(
+                    "upstream tools/list exceeds {MAX_TOOL_LIST_BYTES} bytes"
+                ))
+            };
+            // 合并后的数组同时计入逗号、结果字段与 JSON-RPC 壳；最终下游还会计实际 id 和命名空间。
+            let empty = JsonRpcResponse {
+                jsonrpc: JsonRpcVersion2_0,
+                id: RequestId::Number(0),
+                result: ListToolsResult::default()
+                    .with_ttl_ms(0)
+                    .with_cache_scope(CacheScope::Private),
+            };
+            let mut bytes = serialized_bytes(&empty, MAX_TOOL_LIST_BYTES).map_err(too_large)?;
             let mut params = None;
             for _ in 0..MAX_TOOL_LIST_PAGES {
                 let page = self
@@ -1062,24 +1097,17 @@ impl McpBridge for RmcpBridge {
                     .await
                     .map_err(request_error)?;
                 for tool in page.tools {
-                    bytes += tool_bytes(
-                        tool.name.as_ref(),
-                        tool.description.as_deref(),
-                        &tool.input_schema,
-                    );
+                    if tools.len() == MAX_LISTED_TOOLS {
+                        return Err(McpError::Request(format!(
+                            "upstream tools/list returned more than {MAX_LISTED_TOOLS} tools"
+                        )));
+                    }
+                    let separator = usize::from(!tools.is_empty());
+                    let remaining = MAX_TOOL_LIST_BYTES.saturating_sub(bytes + separator);
+                    let size = serialized_bytes(&tool, remaining).map_err(too_large)?;
+                    bytes += separator + size;
+                    // 通过预算才复制到累积 DTO；每页本身仍由 SDK 的读取上限约束。
                     tools.push(into_mcp_tool(tool));
-                }
-                if tools.len() > MAX_LISTED_TOOLS {
-                    return Err(McpError::Request(format!(
-                        "upstream tools/list returned more than {MAX_LISTED_TOOLS} tools"
-                    )));
-                }
-                // Checked on every page, before the next one is fetched: the
-                // budget exists to bound what is held, not just what is sent.
-                if bytes > MAX_TOOL_LIST_BYTES {
-                    return Err(McpError::Request(format!(
-                        "upstream tools/list exceeds {MAX_TOOL_LIST_BYTES} bytes"
-                    )));
                 }
                 let Some(cursor) = page.next_cursor else {
                     return Ok(tools);

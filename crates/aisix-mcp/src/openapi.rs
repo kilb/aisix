@@ -314,10 +314,8 @@ impl OpenApiBridge {
 
         let query = build_query_pairs(tool, &args);
         let body = match &tool.body_media_type {
-            Some(_) => body_to_send(
-                tool.input_schema.pointer("/properties/body"),
-                args.get("body"),
-            ),
+            // 不猜测 schema 的准入规则：保留调用者的 JSON 值，只有缺省才不发 body。
+            Some(_) => args.get("body").cloned(),
             None => None,
         };
         // The media type the body schema was published under: reqwest's
@@ -657,109 +655,6 @@ fn scalar_to_string(value: &Value) -> String {
     match value {
         Value::String(s) => s.clone(),
         other => other.to_string(),
-    }
-}
-
-/// The JSON body to send for the `body` argument. A value the published body
-/// `schema` admits by its declared `type` is sent as given: an integer body is
-/// sent as that integer, and an explicit `null` as `null` where the schema
-/// allows one (`nullable` in OpenAPI 3.0, a `"null"` type in 3.1). Any other
-/// value goes through [`coerce_body`]; absent means no body.
-fn body_to_send(schema: Option<&Value>, value: Option<&Value>) -> Option<Value> {
-    let value = value?;
-    if schema.is_some_and(|schema| schema_admits(schema, value)) {
-        return Some(value.clone());
-    }
-    coerce_body(Some(value))
-}
-
-/// Whether `schema` admits `value`: its declared `type` (a primitive or a
-/// composition — `oneOf` admits a value any branch admits, `anyOf` the
-/// same, `allOf` one every declaring branch admits), its `enum`/`const`,
-/// and the `null` its `nullable` allows. A schema with none of those
-/// declares nothing, so it admits only a `null`.
-fn schema_admits(schema: &Value, value: &Value) -> bool {
-    match declared_admission(schema, value) {
-        Some(admits) => admits,
-        // Nothing declared: only the implicit `null`.
-        None => value.is_null(),
-    }
-}
-
-/// [`schema_admits`]'s judgement, or `None` when the schema declares no
-/// value type at all (a bare constraint, `{"minimum": 0}`, inside an
-/// `allOf`). A branch under `allOf` that declares nothing abstains; the
-/// top level of a body schema treats `None` as "admits only `null`".
-fn declared_admission(schema: &Value, value: &Value) -> Option<bool> {
-    if schema.get("nullable").and_then(Value::as_bool) == Some(true) && value.is_null() {
-        return Some(true);
-    }
-    if let Some(allowed) = schema.get("enum").and_then(Value::as_array) {
-        if allowed.contains(value) {
-            return Some(true);
-        }
-        // An `enum` is closed: a value outside it is refused whether or not
-        // the schema also declares a type.
-        if schema.get("oneOf").is_none()
-            && schema.get("anyOf").is_none()
-            && schema.get("allOf").is_none()
-        {
-            return Some(false);
-        }
-    }
-    if let Some(constant) = schema.get("const") {
-        return Some(constant == value);
-    }
-    if let Some(all) = schema.get("allOf").and_then(Value::as_array) {
-        let mut declared = false;
-        for branch in all {
-            match declared_admission(branch, value) {
-                Some(false) => return Some(false),
-                Some(true) => declared = true,
-                None => {}
-            }
-        }
-        if declared {
-            return Some(true);
-        }
-    }
-    for key in ["oneOf", "anyOf"] {
-        if let Some(branches) = schema.get(key).and_then(Value::as_array) {
-            return Some(branches.iter().any(|branch| schema_admits(branch, value)));
-        }
-    }
-    let types: Vec<&str> = match schema.get("type") {
-        Some(Value::String(t)) => vec![t.as_str()],
-        Some(Value::Array(ts)) => ts.iter().filter_map(Value::as_str).collect(),
-        _ => return None,
-    };
-    Some(types.iter().any(|t| match (*t, value) {
-        ("null", Value::Null) => true,
-        ("boolean", Value::Bool(_)) => true,
-        ("string", Value::String(_)) => true,
-        ("number", Value::Number(_)) => true,
-        ("integer", Value::Number(n)) => {
-            n.is_i64() || n.is_u64() || n.as_f64().is_some_and(|f| f.fract() == 0.0)
-        }
-        ("array", Value::Array(_)) => true,
-        ("object", Value::Object(_)) => true,
-        _ => false,
-    }))
-}
-
-/// Coerce the `body` argument into the JSON body to send, mirroring mainstream gateways:
-/// objects and arrays pass through; a string is parsed as JSON when possible
-/// and wrapped as `{"data": <string>}` otherwise; other scalars wrap the same
-/// way; null/absent means no body.
-fn coerce_body(value: Option<&Value>) -> Option<Value> {
-    match value? {
-        Value::Null => None,
-        v @ (Value::Object(_) | Value::Array(_)) => Some(v.clone()),
-        Value::String(s) => match serde_json::from_str::<Value>(s) {
-            Ok(parsed) => Some(parsed),
-            Err(_) => Some(json!({ "data": s })),
-        },
-        scalar => Some(json!({ "data": scalar })),
     }
 }
 
@@ -1139,66 +1034,6 @@ mod tests {
                 ("filter".to_string(), r#"{"k":"v"}"#.to_string()),
             ]
         );
-    }
-
-    /// A schema admits a value by what it declares: a primitive `type`, a
-    /// composition (any branch for `oneOf`/`anyOf`, every branch for
-    /// `allOf`), an `enum` or a `const`, plus the `null` `nullable` allows.
-    /// Nothing declared admits nothing but `null`.
-    #[test]
-    fn schema_admits_by_its_own_declarations() {
-        let one_of = json!({ "oneOf": [{ "type": "integer" }, { "type": "string" }] });
-        assert!(schema_admits(&one_of, &json!(7)));
-        assert!(schema_admits(&one_of, &json!("seven")));
-        assert!(!schema_admits(&one_of, &json!(true)));
-
-        let any_of = json!({ "anyOf": [{ "type": "object" }, { "type": "array" }] });
-        assert!(schema_admits(&any_of, &json!([])));
-        assert!(!schema_admits(&any_of, &json!("no")));
-
-        // A branch that only constrains (`minimum`) declares no value type,
-        // so it neither admits nor refuses one on its own.
-        let all_of = json!({ "allOf": [{ "type": "number" }, { "minimum": 0 }] });
-        assert!(schema_admits(&all_of, &json!(1.5)));
-        assert!(!schema_admits(&all_of, &json!("1.5")));
-
-        let enum_only = json!({ "enum": [7, 8] });
-        assert!(schema_admits(&enum_only, &json!(7)));
-        assert!(!schema_admits(&enum_only, &json!(9)));
-
-        let enum_with_type = json!({ "enum": ["a", "b"], "type": "string" });
-        assert!(!schema_admits(&enum_with_type, &json!("c")));
-
-        assert!(schema_admits(&json!({ "const": 3 }), &json!(3)));
-        assert!(!schema_admits(&json!({ "const": 3 }), &json!(4)));
-
-        // No declaration at all: only a null, which the caller never sends
-        // implicitly (absent means no body).
-        assert!(schema_admits(&json!({}), &Value::Null));
-        assert!(!schema_admits(&json!({}), &json!(7)));
-
-        let nullable = json!({ "oneOf": [{ "type": "integer" }, { "type": "null" }] });
-        assert!(schema_admits(&nullable, &Value::Null));
-        assert!(schema_admits(
-            &json!({ "type": "integer", "nullable": true }),
-            &Value::Null
-        ));
-    }
-
-    #[test]
-    fn coerce_body_matches_the_gateway_convention() {
-        assert_eq!(coerce_body(Some(&json!({"a": 1}))), Some(json!({"a": 1})));
-        assert_eq!(
-            coerce_body(Some(&json!(r#"{"parsed": true}"#))),
-            Some(json!({"parsed": true}))
-        );
-        assert_eq!(
-            coerce_body(Some(&json!("plain text"))),
-            Some(json!({"data": "plain text"}))
-        );
-        assert_eq!(coerce_body(Some(&json!(5))), Some(json!({"data": 5})));
-        assert_eq!(coerce_body(Some(&Value::Null)), None);
-        assert_eq!(coerce_body(None), None);
     }
 
     /// A failed upstream call's error lands in the gateway log, and

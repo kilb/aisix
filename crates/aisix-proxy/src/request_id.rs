@@ -70,22 +70,11 @@ pub(crate) fn is_acceptable(id: &str) -> bool {
 fn client_request_id(
     headers: &axum::http::HeaderMap,
     accept: &[HeaderName],
-    snapshot: &aisix_core::AisixSnapshot,
-    _request: &Request,
+    auth_slot: Option<&HeaderName>,
 ) -> Option<String> {
-    // R-111: A passthrough route's auth slot is authentication, not a
-    // correlation id. Adopting it would write the credential into the span
-    // and the request id, which logs and telemetry would then export.
-    let passthrough_auth_slots: std::collections::HashSet<_> = snapshot
-        .passthrough_routes
-        .entries()
-        .iter()
-        .filter(|e| e.value.enabled)
-        .filter_map(|e| e.value.auth_header_name.as_ref())
-        .filter_map(|name| axum::http::HeaderName::from_bytes(name.as_bytes()).ok())
-        .collect();
     for name in accept {
-        if passthrough_auth_slots.contains(name) {
+        // 只排除当前路由的认证槽，其他路由同名的普通关联头仍可采用。
+        if auth_slot == Some(name) {
             continue;
         }
         let Some(raw) = headers.get(name) else {
@@ -109,7 +98,13 @@ fn client_request_id(
 /// Screened by the same [`is_acceptable`] rule as an adopted id: this
 /// value is written into logs verbatim, so it has to be visible ASCII of
 /// bounded length whether or not the gateway ever hands it back.
-fn downstream_request_id(headers: &axum::http::HeaderMap) -> Option<&str> {
+fn downstream_request_id<'a>(
+    headers: &'a axum::http::HeaderMap,
+    auth_slot: Option<&HeaderName>,
+) -> Option<&'a str> {
+    if auth_slot == Some(&DOWNSTREAM_REQUEST_ID_HEADER) {
+        return None;
+    }
     headers
         .get(&DOWNSTREAM_REQUEST_ID_HEADER)
         .and_then(|raw| raw.to_str().ok())
@@ -123,6 +118,20 @@ fn downstream_request_id(headers: &axum::http::HeaderMap) -> Option<&str> {
 /// the few that don't take one use an `Extension<RequestId>` extractor.
 #[derive(Debug, Clone)]
 pub(crate) struct RequestId(pub String);
+
+// 复用真实 Axum 路由表，只探测 typed 路径优先级；三个出口均不执行业务逻辑。
+pub(crate) fn typed_route_probe(
+    router: axum::Router<ProxyState>,
+    state: ProxyState,
+) -> axum::Router {
+    router
+        .fallback(|| async { axum::http::StatusCode::NOT_FOUND })
+        .method_not_allowed_fallback(|| async { axum::http::StatusCode::NO_CONTENT })
+        .route_layer(axum::middleware::from_fn(|_: Request, _: Next| async {
+            axum::http::StatusCode::NO_CONTENT
+        }))
+        .with_state(state)
+}
 
 /// The downstream protocol, as a bounded label for the request span.
 ///
@@ -215,21 +224,34 @@ fn http_version_label(version: axum::http::Version) -> &'static str {
 /// so they fall outside the span. Generators that moderate streamed
 /// output re-attach it explicitly — see `chat::build_sse_stream`.
 pub(crate) async fn ensure_request_id(
-    State(state): State<ProxyState>,
+    State((state, typed_routes)): State<(ProxyState, axum::Router)>,
     mut request: Request,
     next: Next,
 ) -> Response {
+    // span 创建前按实际改写与选路规则识别认证槽，adoption 和 capture 共用结果。
+    let uri = crate::rewrite::rewritten_uri(&state.url_rewrites, &request);
+    let host = crate::host::inbound_host(&request);
+    let snapshot = state.snapshot.load();
+    let auth_slot = crate::passthrough_route::request_auth_header(
+        &snapshot,
+        request.method(),
+        host.as_deref(),
+        &uri,
+        &typed_routes,
+    )
+    .await;
+    request
+        .extensions_mut()
+        .insert(crate::passthrough_route::RouteSnapshot(snapshot));
     let id = request
         .extensions()
         .get::<RequestId>()
         .map(|r| r.0.clone())
         .or_else(|| {
-            let snapshot = state.snapshot.load();
             client_request_id(
                 request.headers(),
                 &state.request_id_accept,
-                &snapshot,
-                &request,
+                auth_slot.as_ref(),
             )
         })
         .unwrap_or_else(new_request_id);
@@ -241,7 +263,7 @@ pub(crate) async fn ensure_request_id(
     // `traceparent` continues the caller's trace; anything malformed —
     // or a duplicated header — degrades to a locally-rooted one, and the
     // caller's `tracestate` is only kept alongside a valid parent.
-    let remote = remote_trace_context(request.headers());
+    let remote = remote_trace_context(request.headers(), auth_slot.as_ref());
     let http = server_span_request(&request);
     request.extensions_mut().insert(std::sync::Arc::new(
         aisix_obs::RequestTraceBundle::new(remote).with_http_server(http),
@@ -263,7 +285,7 @@ pub(crate) async fn ensure_request_id(
     {
         span.record("peer", tracing::field::display(peer.0));
     }
-    if let Some(downstream) = downstream_request_id(request.headers()) {
+    if let Some(downstream) = downstream_request_id(request.headers(), auth_slot.as_ref()) {
         // Recorded as a string, not `display`: the value is caller-supplied
         // and `is_acceptable` permits `{`, `}` and `:` — the characters the
         // fmt subscriber delimits a span's field list with. As a string it
@@ -313,7 +335,14 @@ fn server_span_request(request: &Request) -> aisix_obs::HttpServerFacts {
 /// combine as a comma-joined list) is screened and kept only when the
 /// parent it travelled with was valid. Invalid → `None` → a
 /// locally-rooted trace, never a rejected request.
-fn remote_trace_context(headers: &axum::http::HeaderMap) -> Option<aisix_obs::RemoteTraceContext> {
+fn remote_trace_context(
+    headers: &axum::http::HeaderMap,
+    auth_slot: Option<&HeaderName>,
+) -> Option<aisix_obs::RemoteTraceContext> {
+    // 合法的 trace 形状也可能是当前路由的凭据，不能将其复制进关联元数据。
+    if auth_slot.is_some_and(|name| name.as_str() == aisix_obs::TRACEPARENT_HEADER) {
+        return None;
+    }
     let mut parents = headers.get_all(aisix_obs::TRACEPARENT_HEADER).iter();
     let parent = parents.next()?;
     if parents.next().is_some() {
@@ -326,7 +355,10 @@ fn remote_trace_context(headers: &axum::http::HeaderMap) -> Option<aisix_obs::Re
         tracing::debug!("unusable traceparent header; starting a local trace");
         return None;
     };
-    let tracestate = {
+    let tracestate = if auth_slot.is_some_and(|name| name.as_str() == aisix_obs::TRACESTATE_HEADER)
+    {
+        None
+    } else {
         // All-or-nothing: joining only the readable values would forward a
         // list the caller never sent. One unreadable value discards the
         // whole tracestate (the traceparent stays valid — the spec treats
@@ -452,6 +484,281 @@ mod tests {
         )
     }
 
+    #[test]
+    fn a_downstream_auth_slot_is_not_captured() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            DOWNSTREAM_REQUEST_ID_HEADER,
+            HeaderValue::from_static("synthetic-id"),
+        );
+        assert_eq!(downstream_request_id(&headers, None), Some("synthetic-id"));
+        assert!(downstream_request_id(&headers, Some(&DOWNSTREAM_REQUEST_ID_HEADER)).is_none());
+        assert_eq!(
+            downstream_request_id(&headers, Some(&REQUEST_ID_HEADER)),
+            Some("synthetic-id")
+        );
+    }
+
+    // 探针复用真实路由表，但任何匹配结果都不能触发原 handler 或 fallback。
+    #[tokio::test]
+    async fn the_route_probe_never_executes_a_handler() {
+        async fn never() -> &'static str {
+            panic!("the route probe executed a real handler")
+        }
+        let router = Router::new()
+            .route("/typed", get(never))
+            .route("/any", axum::routing::any(never))
+            .fallback(never)
+            .method_not_allowed_fallback(never);
+        let probe = typed_route_probe(router, default_state());
+        for (method, path, status) in [
+            ("GET", "/typed", 204),
+            ("POST", "/typed", 204),
+            ("TRACE", "/any", 204),
+            ("GET", "/missing", 404),
+        ] {
+            let response = probe
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), status, "{method} {path}");
+        }
+    }
+
+    fn reload_snapshot(upstream: &str, slot: Option<&str>, host: Option<&str>) -> AisixSnapshot {
+        let snapshot = AisixSnapshot::new();
+        snapshot.apikeys.insert(aisix_core::ResourceEntry::new(
+            "caller",
+            serde_json::from_value::<aisix_core::ApiKey>(serde_json::json!({
+                "key_hash": "8b6712790a2089c67aa97a2d80022df18cc65c7814350e33baebe79aab508891",
+                "allowed_models": ["*"], "allowed_routes": ["*"],
+            }))
+            .unwrap(),
+            1,
+        ));
+        snapshot.provider_keys.insert(aisix_core::ResourceEntry::new("pk", serde_json::from_value::<aisix_core::ProviderKey>(serde_json::json!({
+            "display_name": "pk", "provider": "openai", "adapter": "openai", "api_key": "sk-upstream", "api_base": upstream,
+        })).unwrap(), 1));
+        if let Some(slot) = slot {
+            let mut route = serde_json::json!({
+                "name": "reload-route", "enabled": true, "target_url": format!("{upstream}/v1"),
+                "provider_key_id": "pk", "auth_mode": "header_key", "auth_header_name": slot,
+            });
+            if let Some(host) = host {
+                route["hosts"] = serde_json::json!([host]);
+            } else {
+                route["path_prefix"] = serde_json::json!("/r111");
+            }
+            snapshot
+                .passthrough_routes
+                .insert(aisix_core::ResourceEntry::new(
+                    "route",
+                    serde_json::from_value::<aisix_core::PassthroughRoute>(route).unwrap(),
+                    1,
+                ));
+        }
+        snapshot
+    }
+
+    // 在 admission 与 host_dispatch 之间确定性发布 B，避免靠调度时机碰撞竞态。
+    fn app_reloading_after_admission(state: ProxyState, replacement: AisixSnapshot) -> Router {
+        let typed = Router::new()
+            .route("/typed", get(echo_extension_id))
+            .fallback(crate::passthrough_route::entry);
+        let probe = typed_route_probe(typed.clone(), state.clone());
+        let host_entry = crate::apply_shared_proxy_layers(
+            Router::new().fallback(crate::passthrough_route::entry),
+            &state,
+        )
+        .with_state(state.clone());
+        let routes = crate::apply_shared_proxy_layers(typed, &state).with_state(state.clone());
+        let publish = state.clone();
+        Router::new()
+            .fallback_service(routes)
+            .layer(axum::middleware::from_fn_with_state(
+                (state.clone(), host_entry),
+                crate::passthrough_route::host_dispatch,
+            ))
+            .layer(axum::middleware::from_fn(
+                move |request: Request, next: Next| {
+                    let publish = publish.clone();
+                    let replacement = replacement.clone();
+                    async move {
+                        publish.snapshot.store(replacement);
+                        next.run(request).await
+                    }
+                },
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                (state, probe),
+                ensure_request_id,
+            ))
+    }
+
+    #[tokio::test]
+    async fn a_reload_cannot_change_the_credential_slot_after_admission() {
+        use wiremock::{
+            matchers::{method, path},
+            Mock, MockServer, ResponseTemplate,
+        };
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/probe"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"peer": true})),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let state = default_state();
+        state
+            .snapshot
+            .store(reload_snapshot(&upstream.uri(), Some("x-old-auth"), None));
+        let app = app_reloading_after_admission(
+            state,
+            reload_snapshot(&upstream.uri(), Some("x-aisix-request-id"), None),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/r111/probe")
+                    .header("x-old-auth", "sk-caller")
+                    .header("x-aisix-request-id", "ordinary-before-reload")
+                    .body(axum::body::Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            response.headers()[REQUEST_ID_HEADER],
+            "ordinary-before-reload"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({"peer": true})
+        );
+        upstream.verify().await;
+    }
+
+    #[tokio::test]
+    async fn a_reload_cannot_add_a_host_route_after_admission() {
+        let upstream = wiremock::MockServer::builder().start().await;
+        let state = default_state();
+        state
+            .snapshot
+            .store(reload_snapshot(&upstream.uri(), None, None));
+        let app = app_reloading_after_admission(
+            state,
+            reload_snapshot(
+                &upstream.uri(),
+                Some("x-aisix-request-id"),
+                Some("r111-new.example"),
+            ),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/typed")
+                    .header("host", "r111-new.example")
+                    .header("x-aisix-request-id", "ordinary-before-reload")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), b"ordinary-before-reload");
+        assert!(upstream.received_requests().await.unwrap().is_empty());
+    }
+
+    async fn trace_context_with_slot(slot: &str, path: &str) -> (bool, bool) {
+        async fn trace_flags(request: Request) -> axum::Json<serde_json::Value> {
+            let trace = request
+                .extensions()
+                .get::<Arc<aisix_obs::RequestTraceBundle>>()
+                .unwrap();
+            let emitted = trace.emission(true, 0, 0, false);
+            axum::Json(
+                serde_json::json!({"remote": trace.has_remote_parent(), "state": emitted.tracestate.is_some()}),
+            )
+        }
+        let state = default_state();
+        state
+            .snapshot
+            .store(reload_snapshot("http://127.0.0.1:9", Some(slot), None));
+        let router = Router::new()
+            .route("/typed", get(trace_flags))
+            .fallback(trace_flags);
+        let probe = typed_route_probe(router.clone(), state.clone());
+        let app = router
+            .with_state(state.clone())
+            .layer(axum::middleware::from_fn_with_state(
+                (state, probe),
+                ensure_request_id,
+            ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header(
+                        "traceparent",
+                        "00-11111111111111111111111111111111-2222222222222222-01",
+                    )
+                    .header("tracestate", "vendor=synthetic")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let flags: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        (
+            flags["remote"].as_bool().unwrap(),
+            flags["state"].as_bool().unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_traceparent_auth_slot_does_not_become_a_remote_parent() {
+        assert_eq!(
+            trace_context_with_slot("traceparent", "/r111/probe").await,
+            (false, false)
+        );
+        assert_eq!(
+            trace_context_with_slot("traceparent", "/typed").await,
+            (true, true)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tracestate_auth_slot_does_not_become_trace_metadata() {
+        assert_eq!(
+            trace_context_with_slot("tracestate", "/r111/probe").await,
+            (true, false)
+        );
+        assert_eq!(
+            trace_context_with_slot("tracestate", "/typed").await,
+            (true, true)
+        );
+    }
+
     /// R-111: a passthrough route's auth header is authentication, not a
     /// correlation id. Adopting it writes the credential into the span and
     /// the request id, which logs and telemetry would export.
@@ -480,12 +787,19 @@ mod tests {
             .header("X-Secret-Token", "secret-credential-value")
             .body(axum::body::Body::empty())
             .unwrap();
-        let adopted = client_request_id(
-            req.headers(),
-            &state.request_id_accept,
-            &state.snapshot.load(),
-            &req,
+        let typed_routes = typed_route_probe(
+            Router::new().route("/", get(echo_extension_id)),
+            state.clone(),
         );
+        let slot = crate::passthrough_route::request_auth_header(
+            &state.snapshot.load(),
+            req.method(),
+            crate::host::inbound_host(&req).as_deref(),
+            req.uri(),
+            &typed_routes,
+        )
+        .await;
+        let adopted = client_request_id(req.headers(), &state.request_id_accept, slot.as_ref());
         assert!(
             adopted.is_none(),
             "the auth header must not be adopted as a request id"
@@ -493,9 +807,14 @@ mod tests {
     }
 
     fn app_with(state: ProxyState) -> Router {
-        Router::new().route("/", get(echo_extension_id)).layer(
-            axum::middleware::from_fn_with_state(state, ensure_request_id),
-        )
+        let router = Router::new().route("/", get(echo_extension_id));
+        let typed_routes = typed_route_probe(router.clone(), state.clone());
+        router
+            .with_state(state.clone())
+            .layer(axum::middleware::from_fn_with_state(
+                (state, typed_routes),
+                ensure_request_id,
+            ))
     }
 
     /// Drive one request and return (response header, id the handler saw).
@@ -651,9 +970,15 @@ mod tests {
 
     #[tokio::test]
     async fn preserves_a_handler_set_header() {
-        let app = Router::new().route("/", get(sets_own_header)).layer(
-            axum::middleware::from_fn_with_state(default_state(), ensure_request_id),
-        );
+        let state = default_state();
+        let router = Router::new().route("/", get(sets_own_header));
+        let typed_routes = typed_route_probe(router.clone(), state.clone());
+        let app = router
+            .with_state(state.clone())
+            .layer(axum::middleware::from_fn_with_state(
+                (state, typed_routes),
+                ensure_request_id,
+            ));
 
         let resp = app
             .oneshot(

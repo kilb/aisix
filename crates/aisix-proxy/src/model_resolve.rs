@@ -146,9 +146,8 @@ fn best_wildcard_row(
     // the sentinel only after the search completes.
     for entry in snapshot.models.wildcard_entries() {
         let model = &entry.value;
-        // Only direct Models can serve a wildcard alias — routers / ensembles /
-        // semantic routers have no upstream `model_name` to dispatch.
-        if model.is_routing() || model.is_ensemble() || model.is_semantic() {
+        // internal 行仅供内部目标引用；只有公开 direct 行可承接客户端别名。
+        if model.internal || model.is_routing() || model.is_ensemble() || model.is_semantic() {
             continue;
         }
         let Some(capture) = wildcard_capture(&model.display_name, requested) else {
@@ -426,6 +425,32 @@ mod tests {
         assert!(resolve_model(&snap, "claude-fable-5#wj-cc").is_none());
         // A name the glob covers but no internal row carries still resolves.
         assert_eq!(resolve_model(&snap, "claude-other").unwrap().id, "m-star");
+    }
+
+    // internal 模式行只能作为内部目标，不能为客户端物化不存在的别名。
+    #[test]
+    fn an_internal_wildcard_cannot_materialize_a_client_alias() {
+        let snap = snapshot_with(vec![(
+            "m-int",
+            internal_model("public#*", Some("upstream-*")),
+        )]);
+        assert!(resolve_model(&snap, "public#*").is_none());
+        assert!(resolve_model(&snap, "public#another-account").is_none());
+        assert!(wildcard_row_name(&snap, "public#another-account").is_none());
+        assert!(wildcard_row_identity(&snap, "public#another-account").is_none());
+        assert!(snap.models.get_by_id("m-int").is_some());
+    }
+
+    // 排名之前排除 internal 行，公开模式仍可按既有优先级承接别名。
+    #[test]
+    fn an_internal_wildcard_does_not_shadow_a_public_wildcard() {
+        let snap = snapshot_with(vec![
+            ("m-int", internal_model("public#*", Some("private-*"))),
+            ("m-public", direct_model("public*", Some("public-*"))),
+        ]);
+        let resolved = resolve_model(&snap, "public#alias").unwrap();
+        assert_eq!(resolved.id, "m-public");
+        assert_eq!(resolved.value.model_name.as_deref(), Some("public-#alias"));
     }
 
     /// Targets are resolved by id, never by this function, so an internal

@@ -1538,17 +1538,19 @@ async fn proxy_content(
                     yield Ok(bytes);
                 }
                 Some(Err(error)) => {
-                    guard.failure = Some(match error {
+                    guard.failure = Some(match &error {
                         crate::stream_timeout::RawStreamError::Timeout { elapsed_ms } => {
                             aisix_gateway::BridgeError::Timeout {
-                                elapsed_ms,
+                                elapsed_ms: *elapsed_ms,
                                 cause: "stream body".to_string(),
                             }
                         }
                         crate::stream_timeout::RawStreamError::Upstream(e) => {
-                            crate::dispatch::reqwest_error_to_bridge(&e, started)
+                            crate::dispatch::reqwest_error_to_bridge(e, started)
                         }
                     });
+                    // 保留结算失败后继续交给响应体，避免截断下载被当作正常 EOF。
+                    yield Err(error);
                     done = true;
                 }
                 None => {

@@ -157,6 +157,18 @@ describe("a proxied video download is settled by its body's ending", () => {
       ],
     });
 
+    const abrupt = await downstream({
+      scriptedResponses: [
+        completed("video_abrupt"),
+        {
+          rawBodyChunks: [HALF_BODY],
+          rawContentType: "video/mp4",
+          eventDelayMs: 100,
+          disconnectAfterChunks: true,
+        },
+      ],
+    });
+
     const seedModel = async (
       name: string,
       upstream: OpenAiUpstream,
@@ -225,6 +237,7 @@ describe("a proxied video download is settled by its body's ending", () => {
       ],
     });
     const sized = await downstream(sizedSlow("video_sized"));
+    await seedModel("content-abrupt", abrupt, READ_TIMEOUT_MS);
     await seedModel("content-complete", complete);
     await seedModel("content-cancelled", slow);
     await seedModel("content-cancelled-sized", sized);
@@ -234,7 +247,9 @@ describe("a proxied video download is settled by its body's ending", () => {
     // Seeded last: once it authenticates, every resource above is live.
     await seed.createApiKey({
       key_hash: CALLER_HASH,
+      rate_limit: { concurrency: 1 },
       allowed_models: [
+        "content-abrupt",
         "content-complete",
         "content-short",
         "content-stalled",
@@ -299,7 +314,9 @@ describe("a proxied video download is settled by its body's ending", () => {
     const before = await settlement("content-stalled");
     const res = await content("content-stalled", modelIds["content-stalled"]!);
     expect(res.status).toBe(200);
-    const { body } = await drain(res);
+    expect(res.headers.get("content-length")).toBeNull();
+    expect(res.headers.get("transfer-encoding")).toBe("chunked");
+    const { body, failed } = await drain(res);
     expect(body).toBe(HALF_BODY);
     await waitConfigPropagation(async () => {
       const row = await modelStatus(modelIds["content-stalled"]!);
@@ -309,6 +326,23 @@ describe("a proxied video download is settled by its body's ending", () => {
       async () => (await settlement("content-stalled")).failure === before.failure + 1,
     );
     expect((await settlement("content-stalled")).success).toBe(before.success + 1);
+    expect(failed).toBe(true);
+  }, 30_000);
+
+  test("an unsized chunked body that abruptly closes fails the download", async (ctx) => {
+    if (!etcdReachable) ctx.skip();
+    const before = await settlement("content-abrupt");
+    const res = await content("content-abrupt", modelIds["content-abrupt"]!);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-length")).toBeNull();
+    expect(res.headers.get("transfer-encoding")).toBe("chunked");
+    const { body, failed } = await drain(res);
+    expect(body).toBe(HALF_BODY);
+    await waitConfigPropagation(
+      async () => (await settlement("content-abrupt")).failure === before.failure + 1,
+    );
+    expect((await settlement("content-abrupt")).success).toBe(before.success + 1);
+    expect(failed).toBe(true);
   }, 30_000);
 
   test("a caller that leaves mid-download settles neither way and frees its slot", async (ctx) => {
@@ -319,6 +353,9 @@ describe("a proxied video download is settled by its body's ending", () => {
     const reader = res.body!.getReader();
     const first = await reader.read();
     expect(first.done).toBe(false);
+    const whileHeld = await content("content-cancelled", modelIds["content-cancelled"]!, "while-held");
+    const refusedBody = await whileHeld.text();
+    expect(whileHeld.status, refusedBody).toBe(429);
     await reader.cancel();
 
     // A cancellation is not an answer: nothing is booked either way.

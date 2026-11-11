@@ -157,6 +157,18 @@ const ALWAYS_STRIP: &[&str] = &[
 // Routing entry points
 // ---------------------------------------------------------------------------
 
+// 认证槽过滤与实际选路固定到同一配置，避免热更新把已记录的普通头重新解释为凭据。
+#[derive(Clone)]
+pub(crate) struct RouteSnapshot(pub Arc<aisix_core::AisixSnapshot>);
+
+fn request_snapshot(state: &ProxyState, request: &Request) -> Arc<aisix_core::AisixSnapshot> {
+    request
+        .extensions()
+        .get::<RouteSnapshot>()
+        .map(|snapshot| Arc::clone(&snapshot.0))
+        .unwrap_or_else(|| state.snapshot.load())
+}
+
 /// `true` when any enabled route's `hosts` matches the request's inbound
 /// host. The cheap pre-routing probe [`host_dispatch`] uses to decide
 /// whether the request belongs to a foreign-host route at all.
@@ -180,7 +192,7 @@ pub async fn host_dispatch(
     req: Request,
     next: Next,
 ) -> Response {
-    let snapshot = state.snapshot.load();
+    let snapshot = request_snapshot(&state, &req);
     let matched = has_host_match(&snapshot, inbound_host(&req).as_deref());
     drop(snapshot);
     if matched {
@@ -296,6 +308,36 @@ fn match_route(
     })
 }
 
+// 选路与真正 dispatch 共用 matcher；path-only 路由必须让位于 typed 路由（含 405）。
+pub(crate) async fn request_auth_header(
+    snapshot: &aisix_core::AisixSnapshot,
+    method: &Method,
+    host: Option<&str>,
+    uri: &axum::http::Uri,
+    typed_routes: &axum::Router,
+) -> Option<header::HeaderName> {
+    let matched = match_route(snapshot, host, uri.path())?;
+    if matched.entry.value.auth_mode != PassthroughAuthMode::HeaderKey {
+        return None;
+    }
+    let slot = matched.entry.value.auth_header_name.as_deref()?;
+    if !has_host_match(snapshot, host) {
+        use tower::ServiceExt;
+        // 探针只收到方法和改写后的 URI，不复制请求体或任何认证头。
+        let mut probe = Request::new(Body::empty());
+        *probe.method_mut() = method.clone();
+        *probe.uri_mut() = uri.clone();
+        let response = match typed_routes.clone().oneshot(probe).await {
+            Ok(response) => response,
+            Err(never) => match never {},
+        };
+        if response.status() == StatusCode::NO_CONTENT {
+            return None;
+        }
+    }
+    header::HeaderName::from_bytes(slot.as_bytes()).ok()
+}
+
 /// Router fallback + host-dispatch target. Resolves the route, runs the
 /// pipeline, and owns the request-level telemetry for both outcomes.
 pub async fn entry(
@@ -304,7 +346,7 @@ pub async fn entry(
     req: Request,
 ) -> Response {
     let started = Instant::now();
-    let snapshot = state.snapshot.load();
+    let snapshot = request_snapshot(&state, &req);
     let host = inbound_host(&req);
     let path = req.uri().path().to_string();
 

@@ -32,6 +32,7 @@ mod chain;
 mod chunk;
 mod custom;
 mod index;
+mod json_arguments;
 mod keyword;
 #[cfg(feature = "lakera")]
 mod lakera;
@@ -481,6 +482,7 @@ pub use build::{
 pub use call_error::error_chain;
 pub use chain::GuardrailChain;
 pub use index::{GuardrailIndex, RequestContext};
+pub use json_arguments::nests_past_decode_limit;
 pub use keyword::{KeywordBlocklist, KeywordRule};
 #[cfg(feature = "lakera")]
 pub use lakera::LakeraGuardrail;
