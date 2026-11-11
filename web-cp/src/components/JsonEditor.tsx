@@ -36,6 +36,7 @@ export function JsonEditor({
         spellCheck={false}
         readOnly={!onChange}
         value={value}
+        className="min-h-[360px] text-[13px] leading-relaxed"
         onChange={(e) => {
           setFormatError(null);
           onChange?.(e.target.value);
@@ -44,15 +45,19 @@ export function JsonEditor({
         aria-describedby={details.length > 0 ? problemsId : undefined}
       />
       {onChange && (
-        <div className="r">
-          <Button type="button" onClick={format}>
+        <div className="mt-2 flex justify-end">
+          <Button type="button" size="sm" onClick={format}>
             格式化
           </Button>
         </div>
       )}
       {formatError && <div className="note crit">{formatError}</div>}
       {details.length > 0 && (
-        <ul id={problemsId} className="json-problems" aria-label="校验问题">
+        <ul
+          id={problemsId}
+          className="json-problems mt-3 list-none rounded-lg border border-danger/30 bg-danger-soft py-2.5 pr-4 pl-4"
+          aria-label="校验问题"
+        >
           {details.map((d, i) => (
             <li key={i} data-path={d.path}>
               <mark className="json-path">{d.path || "（文档根）"}</mark> {d.message}

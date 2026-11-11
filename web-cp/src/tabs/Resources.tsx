@@ -11,6 +11,8 @@ import { Button } from "../ui/Button";
 import { useRefusalFocus } from "../ui/Field";
 import { DataTable, Loading } from "../ui/DataTable";
 import { EmptyState } from "../ui/EmptyState";
+import { CardHeader, PageHeader, Split } from "../components/page";
+import { Plus, RefreshCw } from "lucide-react";
 
 /**
  * Every gateway resource kind the control plane stores, by the segment
@@ -65,22 +67,22 @@ export function Resources({ canEdit, initialSection }: TabProps) {
   const info = KINDS.find((k) => k.kind === kind) ?? KINDS[0];
   return (
     <>
-      <div className="panel">
-        <h2>全部资源</h2>
-        <p className="hint">
-          按网关的资源定义直接编辑 JSON 文档。保存时由控制面按网关的规则校验，问题列在编辑框下方。
-        </p>
-        <label className="f filter filter-wide">
-          <span>资源类型</span>
-          <select value={kind} onChange={(e) => setKind(e.target.value)}>
-            {KINDS.map((k) => (
-              <option key={k.kind} value={k.kind}>
-                {k.label} · {k.kind}
-              </option>
-            ))}
-          </select>
-        </label>
-      </div>
+      <PageHeader
+        title="全部资源"
+        description="按网关的资源定义直接编辑 JSON 文档。保存时由控制面按网关的规则校验，问题列在编辑框下方。"
+        actions={
+          <label className="f filter filter-wide max-md:w-full">
+            <span>资源类型</span>
+            <select className="max-md:w-full" value={kind} onChange={(e) => setKind(e.target.value)}>
+              {KINDS.map((k) => (
+                <option key={k.kind} value={k.kind}>
+                  {k.label} · {k.kind}
+                </option>
+              ))}
+            </select>
+          </label>
+        }
+      />
       {/* Keyed by kind: a watch still running for the previous kind stops
           with the page it belongs to, instead of writing its rows here. */}
       <KindPage key={info.kind} info={info} canEdit={canEdit} />
@@ -207,122 +209,146 @@ function KindPage({ info, canEdit }: { info: KindInfo; canEdit: boolean }) {
   }
 
   const canCreate = writable && !(SINGLETONS.includes(info.kind) && (items?.length ?? 0) > 0);
+  const editingId = editing?.mode === "edit" ? editing.id : null;
 
-  return (
-    <>
-      <div className="panel">
-        <h2>
-          {info.label} <code className="lab">{info.kind}</code>
-        </h2>
-        {!info.writable && <div className="note">{MANAGED_NOTE}</div>}
-        {info.kind === "budget_policy" && items !== null && <FailModeView mode={failModeOf(items.map((i) => i.doc))} />}
-        <div className="r">
-          {canCreate && (
-            <Button kind="primary" type="button" onClick={startNew}>
-              新建
+  const list = (
+    <div className="panel mb-0">
+      <CardHeader
+        as="h2"
+        title={
+          <span className="inline-flex flex-wrap items-center gap-2">
+            {info.label} <code className="lab">{info.kind}</code>
+            {items !== null && items.length > 0 && <span className="tag">{items.length}</span>}
+          </span>
+        }
+        actions={
+          <>
+            <Button type="button" size="sm" onClick={() => void reload()}>
+              <RefreshCw aria-hidden />
+              刷新
             </Button>
-          )}
-          <Button type="button" icon="refresh" onClick={() => void reload()}>
-            刷新
-          </Button>
-        </div>
-        {error && (
-          <div className="note crit" role="alert">
-            {messageFor(error)}
-          </div>
-        )}
-        {items === null && !error && <Loading />}
-        {items !== null && items.length === 0 && <EmptyState text="暂无此类资源。" />}
-        {items !== null && items.length > 0 && (
-          <DataTable>
-            <thead>
-              <tr>
-                <th>名称</th>
-                <th>ID</th>
-                <th className="right">版本</th>
-                <th>管理方</th>
-                <th>下发状态</th>
-                <th />
-              </tr>
-            </thead>
-            <tbody>
-              {items.map((r) => (
-                <tr key={r.id}>
-                  <td>{nameOf(r.doc) ?? <span className="hint">（未命名）</span>}</td>
-                  <td>
-                    <code>{r.id}</code>
-                  </td>
-                  <td className="right">{r.version}</td>
-                  <td>{r.managed_by ?? "—"}</td>
-                  <td>
-                    <RolloutBadge rollout={r.rollout} />
-                  </td>
-                  <td className="right">
-                    <Button size="sm" type="button" onClick={() => open(r)}>
-                      {writable && r.managed_by === null ? "编辑" : "查看"}
-                    </Button>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </DataTable>
-        )}
-      </div>
-
-      {editing && (
-        <div ref={panel} className="panel">
-          <h2>
-            {editing.mode === "new" ? `新建${info.label}` : (current && nameOf(current.doc)) || editing.id}
-            {current && <RolloutBadge rollout={current.rollout} />}
-          </h2>
-          {editing.mode === "edit" && derived && <div className="note">{MANAGED_NOTE}</div>}
-          {editing.mode === "edit" && !derived && !canEdit && <p className="hint">当前账号只读。</p>}
-          <JsonEditor
-            value={text}
-            onChange={editing.mode === "new" || editable ? setText : undefined}
-            details={details}
-          />
-          {conflict && <ConflictNote onReload={() => void reloadEditing()} />}
-          {failure && (
-            <div className="note crit" role="alert">
-              {failure}
-            </div>
-          )}
-          <div className="r">
-            {editing.mode === "new" && (
-              <Button kind="primary" type="button" busy={busy} busyLabel="创建" onClick={() => void submit()}>
-                创建
+            {canCreate && (
+              <Button kind="primary" type="button" size="sm" onClick={startNew}>
+                <Plus aria-hidden />
+                新建
               </Button>
             )}
-            {editing.mode === "edit" && editable && !confirmDelete && (
-              <>
-                <Button kind="primary" type="button" busy={busy} busyLabel="保存" onClick={() => void submit()}>
-                  保存
-                </Button>
-                <Button type="button" disabled={busy} onClick={() => setConfirmDelete(true)}>
-                  删除
-                </Button>
-              </>
-            )}
-            {/* Ruling P1b-R6: a destructive action confirms inline, never in a dialog. */}
-            {editing.mode === "edit" && editable && confirmDelete && (
-              <>
-                <Button kind="danger" type="button" busy={busy} busyLabel="确认删除" onClick={() => void del()}>
-                  确认删除
-                </Button>
-                <Button type="button" disabled={busy} onClick={() => setConfirmDelete(false)}>
-                  取消
-                </Button>
-              </>
-            )}
-            {!confirmDelete && (
-              <Button type="button" onClick={close}>
-                {editing.mode === "new" || editable ? "取消" : "关闭"}
-              </Button>
-            )}
-          </div>
+          </>
+        }
+      />
+      {!info.writable && <div className="note mt-0">{MANAGED_NOTE}</div>}
+      {info.kind === "budget_policy" && items !== null && <FailModeView mode={failModeOf(items.map((i) => i.doc))} />}
+      {error && (
+        <div className="note crit" role="alert">
+          {messageFor(error)}
         </div>
       )}
-    </>
+      {items === null && !error && <Loading />}
+      {items !== null && items.length === 0 && <EmptyState text="暂无此类资源。" />}
+      {items !== null && items.length > 0 && (
+        <DataTable>
+          <thead>
+            <tr>
+              <th>名称</th>
+              <th>ID</th>
+              <th className="right">版本</th>
+              <th>管理方</th>
+              <th>下发状态</th>
+              <th />
+            </tr>
+          </thead>
+          <tbody>
+            {items.map((r) => (
+              <tr key={r.id} className={editingId === r.id ? "bg-muted" : undefined}>
+                <td className="font-medium">{nameOf(r.doc) ?? <span className="hint font-normal">（未命名）</span>}</td>
+                <td>
+                  <code
+                    className={editing ? "inline-block max-w-[24ch] truncate align-middle text-muted-foreground" : "text-muted-foreground"}
+                    title={r.id}
+                  >
+                    {r.id}
+                  </code>
+                </td>
+                <td className="right num">{r.version}</td>
+                <td>{r.managed_by ? <span className="tag">{r.managed_by}</span> : "—"}</td>
+                <td>
+                  <RolloutBadge rollout={r.rollout} />
+                </td>
+                <td className="right">
+                  <Button size="sm" type="button" onClick={() => open(r)}>
+                    {writable && r.managed_by === null ? "编辑" : "查看"}
+                  </Button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </DataTable>
+      )}
+    </div>
   );
+
+  const editor = editing && (
+    <div ref={panel} className="panel mb-0">
+      <CardHeader
+        as="h2"
+        title={
+          <span className="inline-flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 break-all">
+            {editing.mode === "new" ? `新建${info.label}` : (current && nameOf(current.doc)) || editing.id}
+            {current && <RolloutBadge rollout={current.rollout} />}
+          </span>
+        }
+        description={editing.mode === "edit" ? <code className="break-all">{editing.id}</code> : undefined}
+      />
+      {editing.mode === "edit" && derived && <div className="note mt-0">{MANAGED_NOTE}</div>}
+      {editing.mode === "edit" && !derived && !canEdit && <p className="hint mb-3">当前账号只读。</p>}
+      <JsonEditor
+        value={text}
+        onChange={editing.mode === "new" || editable ? setText : undefined}
+        details={details}
+      />
+      {conflict && <ConflictNote onReload={() => void reloadEditing()} />}
+      {failure && (
+        <div className="note crit" role="alert">
+          {failure}
+        </div>
+      )}
+      <div className="-mx-6 -mb-6 mt-6 flex flex-wrap items-center gap-2 rounded-b-xl border-t border-border bg-muted/40 px-6 py-3">
+        {editing.mode === "edit" && editable && !confirmDelete && (
+          <Button type="button" disabled={busy} onClick={() => setConfirmDelete(true)}>
+            删除
+          </Button>
+        )}
+        {/* Ruling P1b-R6: a destructive action confirms inline, never in a dialog. */}
+        {editing.mode === "edit" && editable && confirmDelete && (
+          <>
+            <Button kind="danger" type="button" busy={busy} busyLabel="确认删除" onClick={() => void del()}>
+              确认删除
+            </Button>
+            <Button type="button" disabled={busy} onClick={() => setConfirmDelete(false)}>
+              取消
+            </Button>
+          </>
+        )}
+        <span className="ml-auto flex gap-2">
+          {!confirmDelete && (
+            <Button type="button" onClick={close}>
+              {editing.mode === "new" || editable ? "取消" : "关闭"}
+            </Button>
+          )}
+          {editing.mode === "new" && (
+            <Button kind="primary" type="button" busy={busy} busyLabel="创建" onClick={() => void submit()}>
+              创建
+            </Button>
+          )}
+          {editing.mode === "edit" && editable && !confirmDelete && (
+            <Button kind="primary" type="button" busy={busy} busyLabel="保存" onClick={() => void submit()}>
+              保存
+            </Button>
+          )}
+        </span>
+      </div>
+    </div>
+  );
+
+  return <Split asideWidth="minmax(460px, 44%)" main={list} aside={editor || undefined} />;
 }

@@ -52,78 +52,90 @@ export function ChangePassword({ onClose }: { onClose: () => void }) {
 
   if (done) {
     return (
-      <div className="panel">
-        <div className="note" role="status">
+      <div className="panel mb-6 flex flex-wrap items-center justify-between gap-3">
+        <div className="note ok m-0 min-w-0 flex-1" role="status">
           口令已修改，此账号在其他浏览器或设备上的会话已全部退出。
         </div>
-        <div className="r">
-          <Button type="button" onClick={onClose}>
-            关闭
-          </Button>
-        </div>
+        <Button type="button" onClick={onClose}>
+          关闭
+        </Button>
       </div>
     );
   }
 
   return (
-    <form ref={form} className="panel" aria-label="修改口令" onSubmit={(e) => void submit(e)}>
-      <h2>修改口令</h2>
-      <p className="hint">修改后，此账号在其他浏览器或设备上的会话都会退出，当前会话保留。</p>
-      <label className="f">
-        <span>当前口令</span>
-        <input
-          type="password"
-          autoComplete="current-password"
-          required
-          value={current}
-          onChange={(e) => setCurrent(e.target.value)}
-        />
-      </label>
-      <label className="f">
-        <span>新口令</span>
-        <input
-          type="password"
-          autoComplete="new-password"
-          required
-          value={next}
-          aria-invalid={nextProblem ? true : undefined}
-          aria-describedby={nextProblem ? nextProblemId : undefined}
-          onChange={(e) => setNext(e.target.value)}
-        />
-      </label>
-      {nextProblem && (
-        <p id={nextProblemId} className="field-problem">
-          {nextProblem}
-        </p>
-      )}
-      <label className="f">
-        <span>确认新口令</span>
-        <input
-          type="password"
-          autoComplete="new-password"
-          required
-          value={again}
-          aria-invalid={mismatch ? true : undefined}
-          aria-describedby={mismatch ? againProblemId : undefined}
-          onChange={(e) => setAgain(e.target.value)}
-        />
-      </label>
-      {mismatch && (
-        <p id={againProblemId} className="field-problem">
-          两次输入的新口令不一致
-        </p>
-      )}
-      {failure && (
-        <div className="note crit" role="alert">
-          {failure}
+    <form ref={form} className="panel mb-6 max-w-none" aria-label="修改口令" onSubmit={(e) => void submit(e)}>
+      <div className="grid max-w-none gap-x-10 gap-y-4 lg:grid-cols-[minmax(220px,1fr)_minmax(0,3fr)]">
+        <div className="min-w-0">
+          <h2 className="text-base font-semibold tracking-tight">修改口令</h2>
+          <p className="hint mt-1 text-[13px] leading-relaxed">修改后，此账号在其他浏览器或设备上的会话都会退出，当前会话保留。</p>
         </div>
-      )}
-      <div className="r">
-        <Button kind="primary" type="submit" disabled={mismatch} busy={busy} busyLabel="保存新口令">
-          保存新口令
-        </Button>
+        <div className="min-w-0">
+          <div className="grid gap-x-4 md:grid-cols-3">
+            <div className="min-w-0">
+              <label className="f">
+                <span>当前口令</span>
+                <input
+                  type="password"
+                  autoComplete="current-password"
+                  required
+                  value={current}
+                  onChange={(e) => setCurrent(e.target.value)}
+                />
+              </label>
+            </div>
+            <div className="min-w-0">
+              <label className="f">
+                <span>新口令</span>
+                <input
+                  type="password"
+                  autoComplete="new-password"
+                  required
+                  value={next}
+                  aria-invalid={nextProblem ? true : undefined}
+                  aria-describedby={nextProblem ? nextProblemId : undefined}
+                  onChange={(e) => setNext(e.target.value)}
+                />
+              </label>
+              {nextProblem && (
+                <p id={nextProblemId} className="field-problem">
+                  {nextProblem}
+                </p>
+              )}
+            </div>
+            <div className="min-w-0">
+              <label className="f">
+                <span>确认新口令</span>
+                <input
+                  type="password"
+                  autoComplete="new-password"
+                  required
+                  value={again}
+                  aria-invalid={mismatch ? true : undefined}
+                  aria-describedby={mismatch ? againProblemId : undefined}
+                  onChange={(e) => setAgain(e.target.value)}
+                />
+              </label>
+              {mismatch && (
+                <p id={againProblemId} className="field-problem">
+                  两次输入的新口令不一致
+                </p>
+              )}
+            </div>
+          </div>
+          {failure && (
+            <div className="note crit mt-0" role="alert">
+              {failure}
+            </div>
+          )}
+        </div>
+      </div>
+      <div className="-mx-6 -mb-6 mt-2 flex max-w-none justify-end gap-2 rounded-b-xl border-t border-border bg-muted/40 px-6 py-3">
         <Button type="button" onClick={onClose}>
           取消
+        </Button>
+        <Button kind="primary" type="submit" disabled={mismatch} busy={busy} busyLabel="保存新口令">
+          保存新口令
         </Button>
       </div>
     </form>

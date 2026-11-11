@@ -6,6 +6,8 @@ import { errorText, fmtTime } from "../lib/fmt";
 import { Button } from "../ui/Button";
 import { DataTable, Loading } from "../ui/DataTable";
 import { EmptyState } from "../ui/EmptyState";
+import { PageHeader } from "../components/page";
+import { RefreshCw } from "lucide-react";
 
 /**
  * The `target_kind` values the control plane records, by the names this
@@ -50,7 +52,7 @@ function DetailSummary({ detail }: { detail: unknown }) {
   const entries = Object.entries(shown);
   if (entries.length === 0) return <span className="hint">—</span>;
   return (
-    <span className="audit-detail">
+    <span className="audit-detail min-w-[22ch] max-w-[72ch]">
       {entries.map(([k, v]) => (
         <span key={k} className="audit-field">
           <span className="lab">{k}</span> {valueText(v)}
@@ -125,94 +127,110 @@ export function Audit(_: TabProps) {
   const tenantName = (id: string) => tenants.find((t) => t.id === id)?.name ?? id;
 
   return (
-    <div className="panel">
-      <h2>审计日志</h2>
-      <p className="hint">每一项变更都与它的审计记录在同一事务里写入，最新的在前。详情只列字段名和非机密的值。</p>
-      <div className="r">
-        <label className="f filter">
-          <span>对象类型</span>
-          <select value={filter.kind} onChange={(e) => setFilter((f) => ({ ...f, kind: e.target.value }))}>
-            <option value="">全部</option>
-            {TARGET_KINDS.map((k) => (
-              <option key={k.kind} value={k.kind}>
-                {k.label} · {k.kind}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label className="f filter">
-          <span>租户</span>
-          <select value={filter.tenant} onChange={(e) => setFilter((f) => ({ ...f, tenant: e.target.value }))}>
-            <option value="">全部</option>
-            {tenants.map((t) => (
-              <option key={t.id} value={t.id}>
-                {t.name}
-                {t.is_internal ? "（平台内部）" : ""}
-              </option>
-            ))}
-          </select>
-        </label>
-        <Button type="button" size="sm" icon="refresh" onClick={() => void loadFirst(filter)}>
-          刷新
-        </Button>
-      </div>
-      {tenantsError && <div className="note crit">无法读取租户列表：{tenantsError}</div>}
-      {error && (
-        <div className="note crit" role="alert">
-          {error}
-        </div>
-      )}
-      {rows === null && !error && <Loading />}
-      {rows !== null && rows.length === 0 && <EmptyState mark="log" text="没有符合条件的记录。" />}
-      {rows !== null && rows.length > 0 && (
-        <DataTable scroll>
-          <thead>
-            <tr>
-              <th>编号</th>
-              <th>时间</th>
-              <th>操作者</th>
-              <th>动作</th>
-              <th>对象</th>
-              <th>租户</th>
-              <th>详情</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((r) => (
-              <tr key={r.id}>
-                <td>{r.id}</td>
-                <td title={r.at}>{fmtTime(r.at)}</td>
-                <td>
-                  {r.actor.email ?? ""}
-                  {ACTOR_KIND[r.actor.kind] && (
-                    <span className="hint">
-                      {r.actor.email ? " · " : ""}
-                      {ACTOR_KIND[r.actor.kind]}
-                    </span>
-                  )}
-                </td>
-                <td>
-                  <code>{r.action}</code>
-                </td>
-                <td>
-                  {r.target_kind ? <code>{r.target_kind}</code> : "—"} {r.target_id && <code>{r.target_id}</code>}
-                </td>
-                <td>{r.tenant_id ? tenantName(r.tenant_id) : "—"}</td>
-                <td>
-                  <DetailSummary detail={r.detail} />
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </DataTable>
-      )}
-      {next !== null && (
-        <div className="r">
-          <Button type="button" disabled={loadingMore} onClick={() => void loadMore()}>
-            加载更多
+    <>
+      <PageHeader
+        title="审计日志"
+        description="每一项变更都与它的审计记录在同一事务里写入，最新的在前。详情只列字段名和非机密的值。"
+        actions={
+          <Button type="button" onClick={() => void loadFirst(filter)}>
+            <RefreshCw aria-hidden />
+            刷新
           </Button>
+        }
+      />
+      <div className="panel mb-0">
+        <div className="flex flex-wrap items-center gap-x-6 gap-y-3">
+          <label className="f filter filter-wide">
+            <span>对象类型</span>
+            <select value={filter.kind} onChange={(e) => setFilter((f) => ({ ...f, kind: e.target.value }))}>
+              <option value="">全部</option>
+              {TARGET_KINDS.map((k) => (
+                <option key={k.kind} value={k.kind}>
+                  {k.label} · {k.kind}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="f filter filter-wide">
+            <span>租户</span>
+            <select value={filter.tenant} onChange={(e) => setFilter((f) => ({ ...f, tenant: e.target.value }))}>
+              <option value="">全部</option>
+              {tenants.map((t) => (
+                <option key={t.id} value={t.id}>
+                  {t.name}
+                  {t.is_internal ? "（平台内部）" : ""}
+                </option>
+              ))}
+            </select>
+          </label>
         </div>
-      )}
-    </div>
+        {tenantsError && <div className="note crit">无法读取租户列表：{tenantsError}</div>}
+        {error && (
+          <div className="note crit" role="alert">
+            {error}
+          </div>
+        )}
+        {rows === null && !error && <Loading />}
+        {rows !== null && rows.length === 0 && <EmptyState mark="log" text="没有符合条件的记录。" />}
+        {rows !== null && rows.length > 0 && (
+          <DataTable scroll>
+            <thead>
+              <tr>
+                <th className="num">编号</th>
+                <th>时间</th>
+                <th>操作者</th>
+                <th>动作</th>
+                <th>对象</th>
+                <th>租户</th>
+                <th>详情</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r) => (
+                <tr key={r.id}>
+                  <td className="num text-muted-foreground">{r.id}</td>
+                  <td className="whitespace-normal text-muted-foreground" title={r.at}>
+                    {fmtTime(r.at)}
+                  </td>
+                  <td className="whitespace-normal">
+                    <span className="whitespace-nowrap">{r.actor.email ?? ""}</span>
+                    {ACTOR_KIND[r.actor.kind] && (
+                      <span className="hint whitespace-nowrap">
+                        {r.actor.email ? " · " : ""}
+                        {ACTOR_KIND[r.actor.kind]}
+                      </span>
+                    )}
+                  </td>
+                  <td>
+                    <code className="rounded-md border border-border bg-muted px-1.5 py-0.5 text-xs">{r.action}</code>
+                  </td>
+                  <td>
+                    <span className="inline-flex flex-col gap-0.5 align-middle">
+                      {r.target_kind ? <code className="text-[13px]">{r.target_kind}</code> : "—"}{" "}
+                      {r.target_id && (
+                        <code className="block max-w-[19ch] text-xs break-all whitespace-normal text-muted-foreground">
+                          {r.target_id}
+                        </code>
+                      )}
+                    </span>
+                  </td>
+                  <td>{r.tenant_id ? tenantName(r.tenant_id) : "—"}</td>
+                  <td>
+                    <DetailSummary detail={r.detail} />
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </DataTable>
+        )}
+        {next !== null && (
+          <div className="-mx-6 -mb-6 flex justify-center rounded-b-xl border-t border-border bg-muted/40 px-6 py-3">
+            <Button type="button" size="sm" disabled={loadingMore} onClick={() => void loadMore()}>
+              加载更多
+            </Button>
+          </div>
+        )}
+      </div>
+    </>
   );
 }
