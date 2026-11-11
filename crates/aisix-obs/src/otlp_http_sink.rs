@@ -797,11 +797,20 @@ impl ObservabilitySink for OtlpSink {
                 let status = resp.status();
                 if status.is_success() {
                     // A receiver that kept only part of the request still
-                    // answers 200 and says what it dropped in the body.
-                    let body = crate::sink::read_body_prefix(resp, RESPONSE_BODY_LIMIT).await;
+                    // answers 200 and says what it dropped in the body. The
+                    // body only says that when it is read whole: a truncated
+                    // one cannot be told apart from an empty one, and taking
+                    // that as a clean acknowledgement would lose a rejection
+                    // the receiver actually reported.
+                    let read = crate::sink::read_limited(resp, OTLP_RESPONSE_BODY_LIMIT).await;
+                    let partial = if read.is_complete() {
+                        otlp_partial_success(&read.text, span_count)
+                    } else {
+                        Some(unreadable_acknowledgement(&read))
+                    };
                     return Ok(SinkAck {
                         accepted: batch.len(),
-                        partial: otlp_partial_success(&body, span_count),
+                        partial,
                         ..SinkAck::default()
                     });
                 }
@@ -852,6 +861,43 @@ impl ObservabilitySink for OtlpSink {
     }
 }
 
+/// The acknowledgement for a 2xx whose body could not be read whole.
+///
+/// Whatever the receiver kept, it kept — the spec forbids resending an
+/// accepted request — so this is not an error to retry. It is not a clean
+/// acknowledgement either: two rejections are reported the same way, as a
+/// diagnostic (zero rejected, a detail, which the pipeline logs and surfaces
+/// in the sink's health), never as `partialSuccess`.
+fn unreadable_acknowledgement(read: &crate::sink::BodyRead) -> PartialSuccess {
+    let detail = if read.is_over_limit() {
+        format!(
+            "receiver response exceeded {OTLP_RESPONSE_BODY_LIMIT} bytes: its acknowledgement could not be read, so what it kept is unknown"
+        )
+    } else {
+        match &read.read_error {
+            Some(error) => format!(
+                "receiver response could not be read ({error}): its acknowledgement is unknown"
+            ),
+            None => "receiver response was not read whole".to_string(),
+        }
+    };
+    PartialSuccess {
+        rejected: 0,
+        detail,
+        acknowledgement_unknown: true,
+    }
+}
+
+/// How much of an OTLP receiver's export response body is read.
+///
+/// A success body is an `ExportTraceServiceResponse` — a few dozen bytes.
+/// But `partialSuccess.errorMessage` is a free-form string with no bound in
+/// the spec, so a body past this is a body whose acknowledgement cannot be
+/// read whole; the sink then reports that rather than a clean
+/// acknowledgement. Far above any real envelope, so a large but legitimate
+/// message is still read.
+const OTLP_RESPONSE_BODY_LIMIT: usize = 1024 * 1024;
+
 /// The `partial_success` of an OTLP/HTTP export response, when the receiver
 /// set one (<https://opentelemetry.io/docs/specs/otlp/#partial-success-1>):
 /// `rejectedSpans` above zero is a partial rejection, zero with an
@@ -878,7 +924,11 @@ fn otlp_partial_success(body: &str, spans: usize) -> Option<PartialSuccess> {
         (_, true) => format!("receiver rejected {rejected} of {spans} spans"),
         (_, false) => format!("receiver rejected {rejected} of {spans} spans: {message}"),
     };
-    Some(PartialSuccess { rejected, detail })
+    Some(PartialSuccess {
+        rejected,
+        detail,
+        acknowledgement_unknown: false,
+    })
 }
 
 /// Encode a record without a trace snapshot as one CLIENT span: a caller that
@@ -3895,6 +3945,98 @@ mod tests {
             );
             assert_eq!(server.received_requests().await.unwrap().len(), 1, "{body}");
         }
+    }
+
+    /// A receiver answering 2xx with a body the sink cannot read whole is
+    /// neither retried (the request was accepted; resending duplicates it)
+    /// nor reported as a clean acknowledgement: what it kept is unknown, so
+    /// the delivery is a diagnostic the health report keeps.
+    #[tokio::test]
+    async fn a_success_response_read_only_part_way_is_not_a_clean_acknowledgement() {
+        let over_limit = "x".repeat(OTLP_RESPONSE_BODY_LIMIT + 1);
+        let server = wiremock::MockServer::builder().start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(over_limit),
+            )
+            .mount(&server)
+            .await;
+        let sink = OtlpSink::new(
+            "e",
+            format!("{}/v1/traces", server.uri()),
+            BTreeMap::new(),
+            otlp_test_client(),
+        );
+        let stats = stats_after_one_delivery(sink, 3).await;
+        let detail = stats.last_error.expect("an unreadable ack is a diagnostic");
+        assert!(
+            detail.contains("exceeded") && detail.contains("unknown"),
+            "{detail}"
+        );
+        assert_eq!(stats.rejected, 0, "{detail}");
+        assert_eq!(stats.sent, 3, "the receiver kept the request: {detail}");
+        assert_eq!((stats.delivered_batches, stats.dropped), (1, 0));
+        assert_eq!(stats.retries, 0, "an accepted request is never resent");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// The same for a 2xx whose body fails part-way — a reset receiver — as
+    /// opposed to one that keeps sending past the cap.
+    #[tokio::test]
+    async fn a_success_response_that_fails_mid_body_is_not_a_clean_acknowledgement() {
+        let base = crate::sink::endless_body::serve_reset().await;
+        let sink = OtlpSink::new(
+            "e",
+            format!("{base}/v1/traces"),
+            BTreeMap::new(),
+            otlp_test_client(),
+        );
+        let stats = stats_after_one_delivery(sink, 3).await;
+        let detail = stats.last_error.expect("an unreadable ack is a diagnostic");
+        assert!(detail.contains("could not be read"), "{detail}");
+        assert_eq!((stats.sent, stats.rejected, stats.retries), (3, 0, 0));
+        assert_eq!((stats.delivered_batches, stats.dropped), (1, 0));
+    }
+
+    /// A legitimate `partialSuccess` larger than a short excerpt (real
+    /// receiver messages can be kilobytes) is still read and still counts
+    /// its rejections.
+    #[tokio::test]
+    async fn a_large_partial_success_body_is_read_whole() {
+        let message = "attribute limit reached ".repeat(1400);
+        let body = serde_json::json!({
+            "partialSuccess": { "rejectedSpans": "1", "errorMessage": message }
+        })
+        .to_string();
+        assert!(body.len() > RESPONSE_BODY_LIMIT && body.len() < OTLP_RESPONSE_BODY_LIMIT);
+        let server = wiremock::MockServer::builder().start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+        let sink = OtlpSink::new(
+            "e",
+            format!("{}/v1/traces", server.uri()),
+            BTreeMap::new(),
+            otlp_test_client(),
+        );
+        let stats = stats_after_one_delivery(sink, 3).await;
+        assert_eq!(stats.rejected, 1);
+        assert!(
+            stats
+                .last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("receiver rejected 1 of 3 spans")),
+            "{:?}",
+            stats.last_error
+        );
+        assert_eq!(stats.retries, 0);
     }
 
     /// The `last_error` a pipeline records for `sink`'s first failed
