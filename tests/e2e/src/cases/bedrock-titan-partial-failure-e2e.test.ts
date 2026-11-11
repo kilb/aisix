@@ -5,8 +5,10 @@ import {
   awaitWindowHeadroom,
   EtcdClient,
   SeedClient,
+  scrapeMetrics,
   spawnApp,
   startMockSls,
+  sumMetric,
   waitConfigPropagation,
   waitForSlsLog,
   type MockSls,
@@ -201,6 +203,12 @@ describe("Bedrock Titan: a later text fails after an earlier one was served", ()
   test("a caller that hangs up mid-array is billed the texts already served", async (ctx) => {
     if (!etcdReachable || !app || !sls) return ctx.skip();
     const before = received.length;
+    const inputTokens = async () =>
+      sumMetric(await scrapeMetrics(app!.metricsUrl), "aisix_llm_input_tokens_total", {
+        endpoint: "/v1/embeddings",
+        model: "titan-cancel",
+      });
+    const tokensBefore = await inputTokens();
     const controller = new AbortController();
     const abandoned = fetch(`${app.proxyUrl}/v1/embeddings`, {
       method: "POST",
@@ -226,7 +234,42 @@ describe("Bedrock Titan: a later text fails after an earlier one was served", ()
     // AWS billed the two answered texts, 4 input tokens each.
     expect(row.get("prompt_tokens")).toBe("8");
     expect(Number(row.get("cost_usd") ?? "0")).toBeGreaterThan(0);
+    // R-112: and the tokens the row bills reach the Prometheus counters too —
+    // the handler's own emit, which would have written them, never ran.
+    await waitConfigPropagation(async () => (await inputTokens()) === tokensBefore + 8);
+    // One row, one charge: the cancel path runs once per request.
+    await new Promise((r) => setTimeout(r, 300));
+    expect(await inputTokens()).toBe(tokensBefore + 8);
   });
+
+  // R-112, the negative half: a request cancelled before any upstream call
+  // answered served nothing, so it must add no tokens to the counters.
+  test("a cancellation before anything was served adds no tokens", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    const inputTokens = async () =>
+      sumMetric(await scrapeMetrics(app!.metricsUrl), "aisix_llm_input_tokens_total", {
+        endpoint: "/v1/embeddings",
+        model: "titan-cancel",
+      });
+    const before = await inputTokens();
+    const controller = new AbortController();
+    const abandoned = fetch(`${app.proxyUrl}/v1/embeddings`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${CALLER_PLAINTEXT}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "titan-cancel", input: ["hangs"] }),
+      signal: controller.signal,
+    }).then((res) => res.text());
+    await new Promise((r) => setTimeout(r, 300));
+    controller.abort();
+    await expect(abandoned).rejects.toThrow();
+    await waitForSlsLog(
+      sls!,
+      LOGSTORE,
+      (log) => log.get("status_code") === "499" && log.get("prompt_tokens") === "0",
+      "the 499 usage row of the request that served nothing",
+    );
+    expect(await inputTokens()).toBe(before);
+  }, 30_000);
 
   // R-109: the tokens an abandoned request's answered texts were billed are
   // charged to the token limits the request held them against, so a key that

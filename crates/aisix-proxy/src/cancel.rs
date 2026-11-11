@@ -216,6 +216,9 @@ pub(crate) fn emit(
             trace,
             false,
             rec.dispatched,
+            resolved,
+            endpoint,
+            &client.user_agent,
         );
     }
 
@@ -355,6 +358,9 @@ pub(crate) fn emit(
         trace,
         true,
         dispatched,
+        resolved,
+        endpoint,
+        &client.user_agent,
     );
 }
 
@@ -468,8 +474,21 @@ fn emit_one(
     trace: Option<&std::sync::Arc<aisix_obs::RequestTraceBundle>>,
     terminal: bool,
     dispatched: bool,
+    // What the request resolved, for the token series' upstream labels — it
+    // names the target the event speaks for, which the event's own fields do
+    // not carry — plus the route label the request families use and the
+    // by-client dimension classified from the request's user agent.
+    resolved: &Resolved,
+    endpoint: &'static str,
+    client_type: &str,
 ) {
     let model = usage_attr::usage_event_model_label(snap, &event.requested_model).into_owned();
+    // The Prometheus token families too (R-112). A handler emits them from its
+    // own tail, which a cancelled request never reaches, so without this the
+    // tokens its row bills exist in the log and nowhere in `/metrics`. Both
+    // emitters read ONE event, so they cannot disagree about the dimensions,
+    // and the zeros a cancelled-before-serving request carries emit no series.
+    emit_token_metrics(state, snap, endpoint, &event, pk, resolved, client_type);
     usage_attr::emit_usage(
         state,
         snap,
@@ -480,5 +499,53 @@ fn emit_one(
         trace,
         terminal,
         dispatched,
+    );
+}
+
+/// The `aisix_llm_*_tokens_total` families for one cancelled row, off the
+/// event the row is written from: the counters a handler's
+/// `request_metrics::record_usage` would have reported for the same work.
+fn emit_token_metrics(
+    state: &ProxyState,
+    snap: &aisix_core::AisixSnapshot,
+    endpoint: &'static str,
+    event: &UsageEvent,
+    pk: &ResolvedPk<'_>,
+    resolved: &Resolved,
+    client_type: &str,
+) {
+    let completion = event.folded_completion_tokens();
+    let total = crate::usage_attr::total_tokens_with_cache(
+        event.prompt_tokens,
+        completion,
+        event.cache_creation_tokens,
+        event.cache_read_tokens,
+    );
+    // Nothing was served: the cancelled request bills no tokens, and the
+    // counters no-op on zero anyway — so is there nothing to emit.
+    if total == 0 {
+        return;
+    }
+    let caller = crate::request_metrics::Caller::from_api_key_id(snap, &event.api_key_id);
+    crate::request_metrics::record_usage(
+        state,
+        endpoint,
+        caller.as_caller(),
+        crate::request_metrics::Upstream {
+            provider: &resolved.provider,
+            model: &event.requested_model,
+            upstream_model: &resolved.upstream_model,
+            pk: pk.labels(),
+            ..Default::default()
+        },
+        crate::request_metrics::Tokens {
+            input: event.prompt_tokens,
+            output: completion,
+            total: total.min(u64::from(u32::MAX)) as u32,
+            cached: event.cached_prompt_tokens,
+            cache_read: event.cache_read_tokens,
+            cache_creation: event.cache_creation_tokens,
+            client_type,
+        },
     );
 }
