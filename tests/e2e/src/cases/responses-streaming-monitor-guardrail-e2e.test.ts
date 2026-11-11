@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
+  ProxyClient,
   SeedClient,
   spawnApp,
   startOpenAiUpstream,
@@ -22,17 +23,26 @@ import {
 // was 422 + 0 tokens + tens of seconds of latency on /v1/responses, while
 // short responses passed — "monitor mode is flaky".
 //
-// The test is self-gating against config-propagation races:
-//   1. block mode: the oversized stream 422s (proves the rule is loaded AND
-//      pins the block-mode fail-closed secure default, which must not
-//      change);
-//   2. flip the SAME rule to monitor: the same oversized stream returns 200
-//      with the full SSE released live — the block→monitor transition can
-//      only mean monitor semantics took effect.
+// Two phases, each behind a revision barrier rather than a probe of the
+// behavior under test:
+//   1. block mode: the oversized stream fails closed (pins the block-mode
+//      fail-closed secure default, which must not change);
+//   2. flip the SAME rule to monitor: the same oversized stream is released
+//      in full, live.
+// The response status cannot tell the two rules apart — a block-mode
+// buffer-cap rejection is also a 200, its failure frames riding the already
+// open SSE — so each phase waits on a caller key written AFTER the
+// configuration it needs: etcd watch events apply in revision order, so the
+// key authenticating proves everything written before it has landed.
 
 const CALLER_PLAINTEXT = "sk-issue-1010-monitor-stream";
 const CALLER_KEY_HASH = createHash("sha256")
   .update(CALLER_PLAINTEXT)
+  .digest("hex");
+// Written after the block→monitor flip, as that flip's revision barrier.
+const FLIP_BARRIER_PLAINTEXT = "sk-issue-1010-monitor-flip-barrier";
+const FLIP_BARRIER_KEY_HASH = createHash("sha256")
+  .update(FLIP_BARRIER_PLAINTEXT)
   .digest("hex");
 
 const FORBIDDEN_WORD = "BLOCKME";
@@ -130,14 +140,16 @@ describe("responses streaming with monitor-mode output guardrail (#1010)", () =>
       model_name: "gpt-5-codex",
       provider_key_id: pk.id,
     });
+    // Start in BLOCK mode so phase 1 proves the rule is enforcing before
+    // the flip.
+    const g = await seed.createGuardrail(guardrailBody("block"));
+    guardrailId = g.id as string;
+    // The caller key last, so it authenticating implies the provider key,
+    // the model, the guardrail and its attachment are all in the snapshot.
     await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["gr-1010-model"],
     });
-    // Start in BLOCK mode so phase 1 proves the rule is loaded + enforcing
-    // before the flip.
-    const g = await seed.createGuardrail(guardrailBody("block"));
-    guardrailId = g.id as string;
   });
 
   afterAll(async () => {
@@ -168,11 +180,10 @@ describe("responses streaming with monitor-mode output guardrail (#1010)", () =>
     }
 
     // 1. Block mode: the >256 KiB stream must fail closed (failure frames
-    //    naming content_filter) — the rule is loaded and the secure default
-    //    holds.
+    //    naming content_filter) — the secure default holds.
     await waitConfigPropagation(async () => {
-      const { body } = await streamOnce();
-      return body.includes("content_filter");
+      const probe = new ProxyClient(app!.proxyUrl, CALLER_PLAINTEXT);
+      return (await probe.listModels()).status === 200;
     });
     const metricsBeforeResponse = await fetch(`${app.metricsUrl}/metrics`);
     expect(metricsBeforeResponse.status).toBe(200);
@@ -238,15 +249,22 @@ describe("responses streaming with monitor-mode output guardrail (#1010)", () =>
         ),
     ).toBeGreaterThan(0);
 
-    // 2. Flip the SAME rule to monitor (full-resource PUT).
+    // 2. Flip the SAME rule to monitor (full-resource PUT), then write a
+    //    fresh caller key after it: that key authenticating proves the flip
+    //    is in the snapshot. The old rule also answers 200, so the stream's
+    //    status is no barrier.
     await seed.update("guardrails", guardrailId, guardrailBody("monitor"));
+    await seed.createApiKey({
+      key_hash: FLIP_BARRIER_KEY_HASH,
+      allowed_models: ["gr-1010-model"],
+    });
 
     // 3. Monitor mode: the same oversized stream is released in full — 200,
     //    live SSE, no content_filter rejection. Pre-#1010-fix this stayed
     //    422 forever.
     await waitConfigPropagation(async () => {
-      const { status } = await streamOnce();
-      return status === 200;
+      const probe = new ProxyClient(app!.proxyUrl, FLIP_BARRIER_PLAINTEXT);
+      return (await probe.listModels()).status === 200;
     });
     const released = await streamOnce();
     expect(released.status).toBe(200);
