@@ -848,6 +848,26 @@ impl ServerHandler for McpGateway {
                 }
             }
         }
+        // The pages of every upstream together are one downstream result, and
+        // a client reads it through a transport with its own size cap: answer
+        // a list past the budget with a JSON-RPC error the caller can act on,
+        // rather than one its client has to discard at the transport.
+        let aggregate_bytes: usize = tools
+            .iter()
+            .map(|tool| {
+                crate::bridge::tool_bytes(
+                    tool.name.as_ref(),
+                    tool.description.as_deref(),
+                    &tool.input_schema,
+                )
+            })
+            .sum();
+        if aggregate_bytes > crate::bridge::MAX_TOOL_LIST_BYTES {
+            return Err(ErrorData::internal_error(
+                format!("aggregated tools/list is too large: {aggregate_bytes} bytes"),
+                None,
+            ));
+        }
         let total = tools.len() as u32;
         // Per-tool ACL: expose only the tools this caller's key permits.
         tools.retain(|tool| self.tool_acl.permits(tool.name.as_ref()));

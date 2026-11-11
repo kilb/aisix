@@ -794,7 +794,14 @@ enum Paging {
     Endless,
     /// The first page answers; the second never does.
     StallsOnPageTwo,
+    /// This many pages, one tool each, every tool carrying a
+    /// [`LARGE_DESCRIPTION_BYTES`] description.
+    LargePages(usize),
 }
+
+/// A description size well inside one page's own transport cap, so only the
+/// pages added together can outgrow what a downstream client reads.
+const LARGE_DESCRIPTION_BYTES: usize = 6 * 1024 * 1024;
 
 /// A real MCP server that hands its tool list out a page at a time — the
 /// `nextCursor` contract of `tools/list`.
@@ -823,9 +830,17 @@ impl ServerHandler for PagedServer {
             .as_object()
             .expect("object")
             .clone();
-        let tool = Tool::new(format!("tool_{page}"), "paged", schema);
+        let description = match self.0 {
+            Paging::LargePages(_) => "x".repeat(LARGE_DESCRIPTION_BYTES),
+            _ => "paged".to_string(),
+        };
+        let tool = Tool::new(format!("tool_{page}"), description, schema);
         let mut result = ListToolsResult::with_all_items(vec![tool]);
-        let last = matches!(self.0, Paging::ThreePages) && page == 3;
+        let last = match self.0 {
+            Paging::ThreePages => page == 3,
+            Paging::LargePages(pages) => page == pages,
+            Paging::Endless | Paging::StallsOnPageTwo => false,
+        };
         if !last {
             result.next_cursor = Some(format!("page-{}", page + 1));
         }
@@ -897,6 +912,47 @@ async fn an_endless_cursor_fails_the_list_at_the_page_cap() {
         .await
         .expect_err("an endless list fails");
     assert!(err.to_string().contains("pages"), "{err}");
+}
+
+/// Pages that each fit their own transport cap but together outgrow what a
+/// downstream client reads fail the list, through a held session and the
+/// per-operation bridge alike, rather than being joined into a result no
+/// client can read.
+#[tokio::test]
+async fn pages_past_the_byte_budget_fail_the_list() {
+    let addr = spawn_paged_server(Paging::LargePages(3)).await;
+    let upstream = McpUpstream::new(format!("http://{addr}/mcp"));
+
+    // Print the tool count, not the tools: a failure must not dump 18 MiB.
+    let held = RmcpBridge::connect(&upstream).await.expect("connect");
+    let err = match held.list_tools().await {
+        Ok(tools) => panic!("18 MiB of tools ({}) must fail the list", tools.len()),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("bytes"), "{err}");
+
+    let err = match EphemeralBridge::new(upstream).list_tools().await {
+        Ok(tools) => panic!("18 MiB of tools ({}) must fail the list", tools.len()),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("bytes"), "{err}");
+}
+
+/// The control for the budget: large pages that stay inside it are all kept.
+#[tokio::test]
+async fn large_pages_within_the_byte_budget_are_all_kept() {
+    let addr = spawn_paged_server(Paging::LargePages(2)).await;
+    let upstream = McpUpstream::new(format!("http://{addr}/mcp"));
+    let bridge = RmcpBridge::connect(&upstream).await.expect("connect");
+    let tools = bridge
+        .list_tools()
+        .await
+        .expect("12 MiB of tools is listed");
+    let names: Vec<_> = tools.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(names, ["tool_1", "tool_2"]);
+    assert!(tools
+        .iter()
+        .all(|t| { t.description.as_deref().map(str::len) == Some(LARGE_DESCRIPTION_BYTES) }));
 }
 
 /// A later page that never answers fails the list at the operation's one
