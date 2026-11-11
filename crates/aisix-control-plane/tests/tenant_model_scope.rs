@@ -974,3 +974,198 @@ async fn a_tenant_created_while_a_model_becomes_callable_reaches_it() {
         "the new tenant's key misses the model the edit made callable: {doc}"
     );
 }
+
+/// Two tenants created by `admin`, as `(lower id, higher id)`: the order a
+/// path that locks several tenant rows takes them in.
+async fn ordered_tenants(cp: &TestCp, admin: &OperatorSession, prefix: &str) -> (Uuid, Uuid) {
+    let one = operator_tenant(cp, admin, &format!("{prefix}-one")).await;
+    let two = operator_tenant(cp, admin, &format!("{prefix}-two")).await;
+    (one.min(two), one.max(two))
+}
+
+/// A tenant's stored `model_scope`.
+async fn stored_scope(cp: &TestCp, id: Uuid) -> String {
+    sqlx::query_scalar("SELECT model_scope FROM tenants WHERE id = $1")
+        .bind(id)
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("read the scope")
+}
+
+/// Three writers at once, each in the order it locks: a re-pricing apply
+/// that holds all-scope tenant A (and its account) and next needs selected
+/// tenant B, a move of B onto `all`, and a channel edit that counted A
+/// among the all-scope tenants. A move that took B's row before the scope
+/// fence would close a wait cycle with the other two, and Postgres would
+/// abort one of them; every one of them must complete instead, and leave
+/// B on `all` with the model the edit made callable in both tenants' keys.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_move_onto_all_beside_a_repricing_and_a_channel_edit_completes_all_three() {
+    use support::world::{db_now, insert_unpriced_charges, price, seed_model};
+
+    let Some(cp) = TestCp::start_with(|cfg| cfg.db_lock_timeout_ms = 60_000).await else {
+        return;
+    };
+    let cp = std::sync::Arc::new(cp);
+    let operator = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let (a, b) = ordered_tenants(&cp, &operator, "reprice-race-5d2").await;
+    let r = patch(&cp, &operator, b, json!({"model_scope": "selected"})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let key_a = key(&cp, &operator, a, "reprice-race-a").await;
+    let key_b = key(&cp, &operator, b, "reprice-race-b").await;
+
+    // A previewed run that changes both tenants: one unpriced row each,
+    // priced now.
+    let model = seed_model(&cp, &operator).await;
+    let now = db_now(&cp).await;
+    let at = now - chrono::TimeDelta::minutes(30);
+    insert_unpriced_charges(cp.db(), "rr-a", 1, a, key_a, model, at).await;
+    insert_unpriced_charges(cp.db(), "rr-b", 1, b, key_b, model, at).await;
+    price(&cp, model).await;
+    let run = cp
+        .send(
+            "POST",
+            "/admin/billing/repricing",
+            Some(admin.cookie()),
+            Some(json!({
+                "from": now - chrono::TimeDelta::hours(1),
+                "to": db_now(&cp).await,
+                "reason": "补录漏配的价格 5d2",
+            })),
+        )
+        .await;
+    assert_eq!(run.status, 201, "{run:?}");
+    let run_id = run.body["id"].as_str().expect("a run id").to_string();
+
+    let account = provider_key(&cp, &operator, "acct-reprice-race-5d2").await;
+    let p = public_model(&cp, &operator, "pub-reprice-race-5d2").await;
+
+    // The apply takes A's row and then waits for A's account, held here.
+    let mut held = cp.db().pool().begin().await.expect("begin");
+    sqlx::query("SELECT 1 FROM billing_accounts WHERE tenant_id = $1 FOR UPDATE")
+        .bind(a)
+        .execute(&mut *held)
+        .await
+        .expect("hold A's account");
+    let applied = tokio::spawn({
+        let (cp, admin, run_id) = (cp.clone(), admin.clone(), run_id.clone());
+        async move {
+            cp.send(
+                "POST",
+                &format!("/admin/billing/repricing/{run_id}/apply"),
+                Some(admin.cookie()),
+                Some(json!({})),
+            )
+            .await
+        }
+    });
+    until_lock_waiters(&cp, 1).await;
+    // The channel edit takes the fence shared, counts A, and waits for A's
+    // row, which the apply holds.
+    let edit = tokio::spawn({
+        let (cp, operator) = (cp.clone(), operator.clone());
+        async move {
+            cp.send(
+                "PUT",
+                &format!("/admin/provider-keys/{account}/channel-models/{p}"),
+                Some(operator.cookie()),
+                Some(json!({})),
+            )
+            .await
+        }
+    });
+    until_lock_waiters(&cp, 2).await;
+    // The move of B onto `all` waits for the fence the edit holds.
+    let moved = tokio::spawn({
+        let (cp, operator) = (cp.clone(), operator.clone());
+        async move { patch(&cp, &operator, b, json!({"model_scope": "all"})).await }
+    });
+    until_lock_waiters(&cp, 3).await;
+    // The apply goes on to B.
+    held.rollback().await.expect("release A's account");
+
+    let applied = applied.await.expect("join");
+    let edit = edit.await.expect("join");
+    let moved = moved.await.expect("join");
+    assert_eq!(applied.status, 200, "the apply: {applied:?}");
+    assert_eq!(edit.status, 200, "the channel edit: {edit:?}");
+    assert_eq!(moved.status, 200, "the move: {moved:?}");
+    assert_eq!(moved.body["model_scope"], "all", "{moved:?}");
+
+    assert_eq!(stored_scope(&cp, b).await, "all");
+    for (tenant, k) in [(a, key_a), (b, key_b)] {
+        let doc = key_doc(&cp, &k).await;
+        assert!(
+            ids(&doc).contains(&p.to_string()),
+            "tenant {tenant}'s key misses the model the edit made callable: {doc}"
+        );
+    }
+    let adjusted: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT tenant_id FROM billing_ledger_cny WHERE kind = 'adjustment' ORDER BY tenant_id",
+    )
+    .fetch_all(cp.db().pool())
+    .await
+    .expect("read the ledger");
+    assert_eq!(adjusted, vec![a, b], "one adjustment entry per tenant");
+}
+
+/// A channel edit counts B among the all-scope tenants and, before it
+/// reaches B's row, B is narrowed to `selected` and moved back onto `all`.
+/// A move that held B's row while it waited for the fence would close a
+/// wait cycle with the edit, which then waits for that row; both must
+/// complete, and B's key must name the model the edit made callable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tenant_narrowed_and_moved_back_after_a_census_completes_beside_the_edit() {
+    let Some(cp) = TestCp::start_with(|cfg| cfg.db_lock_timeout_ms = 60_000).await else {
+        return;
+    };
+    let cp = std::sync::Arc::new(cp);
+    let admin = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let (a, b) = ordered_tenants(&cp, &admin, "census-race-8b1").await;
+    let k = key(&cp, &admin, b, "census-race-key").await;
+    let account = provider_key(&cp, &admin, "acct-census-race-8b1").await;
+    let p = public_model(&cp, &admin, "pub-census-race-8b1").await;
+
+    // The channel edit counts A and B, then waits for A's row, held here.
+    let mut held = cp.db().pool().begin().await.expect("begin");
+    sqlx::query("SELECT 1 FROM tenants WHERE id = $1 FOR UPDATE")
+        .bind(a)
+        .execute(&mut *held)
+        .await
+        .expect("hold A");
+    let edit = tokio::spawn({
+        let (cp, admin) = (cp.clone(), admin.clone());
+        async move {
+            cp.send(
+                "PUT",
+                &format!("/admin/provider-keys/{account}/channel-models/{p}"),
+                Some(admin.cookie()),
+                Some(json!({})),
+            )
+            .await
+        }
+    });
+    until_lock_waiters(&cp, 1).await;
+    // B leaves `all` after the census, which takes no fence ...
+    let narrowed = patch(&cp, &admin, b, json!({"model_scope": "selected"})).await;
+    assert_eq!(narrowed.status, 200, "{narrowed:?}");
+    // ... and moves back onto it, which waits for the fence the edit holds.
+    let moved = tokio::spawn({
+        let (cp, admin) = (cp.clone(), admin.clone());
+        async move { patch(&cp, &admin, b, json!({"model_scope": "all"})).await }
+    });
+    until_lock_waiters(&cp, 2).await;
+    held.rollback().await.expect("release A");
+
+    let edit = edit.await.expect("join");
+    let moved = moved.await.expect("join");
+    assert_eq!(edit.status, 200, "the channel edit: {edit:?}");
+    assert_eq!(moved.status, 200, "the move: {moved:?}");
+    assert_eq!(stored_scope(&cp, b).await, "all");
+    let doc = key_doc(&cp, &k).await;
+    assert!(
+        ids(&doc).contains(&p.to_string()),
+        "B's key misses the model the edit made callable: {doc}"
+    );
+}

@@ -34,7 +34,8 @@ way.
   anyway. `only_the_resources_module_writes_gw_resources` (`tests/boot.rs`)
   fails on one outside `src/resources/`, except the two that touch no
   document: the projector's projection columns and housekeeping's tombstone
-  prune.
+  prune, which deletes only a delete already projected and old, and keeps a
+  generated model tombstone a grant or live key still names.
 - Within one transaction, write referents before referrers, and delete
   referrers before referents. Each write checks its own references.
 - Every builder of a derived document has a test that loads what it builds on
@@ -42,7 +43,7 @@ way.
   `every_*_document_loads_on_the_lenient_schema` tests). A new builder adds
   one.
 
-## Lock order: tenant rows, billing accounts, group rows, then `RESOURCES_LOCK_KEY`
+## Lock order: the scope fence, tenant rows, billing accounts, group rows, then `RESOURCES_LOCK_KEY`
 
 - **A transaction that touches a tenant and a gateway document takes the tenant
   first**: `tenants::lock`, or `tenants::lock_many` (ascending id) for several,
@@ -142,20 +143,28 @@ way.
   lock (`a_selection_takes_its_public_models_before_the_resources_lock`). Never take a group or public-model row after
   the resources lock; a path that needs both takes the row first.
 - **A tenant's move onto `model_scope = all` is fenced against the
-  catalogue writers by `tenants::SCOPE_LOCK_KEY`.** Every writer that counts
-  the all-scope tenants (`tenants::lock_all_scope`: the channel edits, a
-  public model's `PATCH`, retire, delete and restore, a bulk apply, and the
-  housekeeping repair of a routing document, `channels::repair_routing`)
-  takes it shared before that count, ahead of every tenant row, and a
-  tenant `PATCH` that moves a tenant onto `all` takes it exclusive right
-  after the tenant's row (and account), before the groups and the resources
-  lock. A tenant's creation (`tenants::create`, operator and signup alike)
-  is a move onto `all`, since every customer starts there, and takes it
-  exclusive as its first lock. No wait cycle follows: a writer waits only
-  on rows of tenants already on `all`, a move waits for the fence only
-  while its tenant is not, and a create holds nothing while it waits
+  catalogue writers by `tenants::SCOPE_LOCK_KEY`, and the fence is the
+  first lock of every transaction that takes it, ahead of every tenant
+  row.** Every writer that counts the all-scope tenants
+  (`tenants::lock_all_scope`: the channel edits, a public model's `PATCH`,
+  retire, delete and restore, a bulk apply, and the housekeeping repair of
+  a routing document, `channels::repair_routing`) takes it shared before
+  that count. A tenant `PATCH` whose body names `model_scope: all` takes it
+  exclusive before the tenant's row (and account), whether or not the
+  tenant is on `all` already, since it decides before it reads the row. A
+  tenant's creation (`tenants::create`, operator and signup alike) is a
+  move onto `all`, since every customer starts there, and takes it
+  exclusive as its first lock too. So nothing waits for the fence while it
+  holds a row, and no wait cycle runs through it. A move that took its
+  tenant's row first closed two: with a writer whose census counted the
+  tenant before it was narrowed and moved back, which then waits for that
+  row; and with a re-pricing apply holding an all-scope tenant's row while
+  it waits for the moving tenant's (`lock_many_billing` goes in id order,
+  whatever the scope) and a writer waiting for the apply's
   (`a_tenant_moving_onto_all_while_a_model_becomes_callable_reaches_it`,
   `a_tenant_created_while_a_model_becomes_callable_reaches_it`,
+  `a_move_onto_all_beside_a_repricing_and_a_channel_edit_completes_all_three`,
+  `a_tenant_narrowed_and_moved_back_after_a_census_completes_beside_the_edit`,
   `tests/tenant_model_scope.rs`). Nothing else takes it.
 - **A generated document's owner is `public:<public_model_id>`, and only
   `src/channels.rs` writes one.** The direct and routing documents a public
@@ -515,6 +524,18 @@ statement.
   row that broke the rule before the fence existed is repaired through
   `write_resource` (`channels::repair_routing`, run by every housekeeping
   tick), never by the fence.
+
+- **Housekeeping replaces grants of a channel's generated direct model before
+  it prunes any tombstone, and the prune keeps a generated model tombstone
+  while a tenant grant or a live key selection still names it.** That
+  tombstone (owner `public:<public_model_id>`, at the direct model's own id)
+  is the repair's only proof that such a grant came from a channel: pruning
+  it first would let the proof expire between two ticks of an instance that
+  prunes on boot, and a grant an older release stored can be older than that.
+  A grant whose tombstone is gone anyway is left as it is and reported
+  (`tenant.generated_grants_replaced`'s `unresolved`, and a WARN naming the
+  tenant and ids), never guessed at: an operator removes the id through a
+  grant edit, which re-projects the keys.
 
 ## Defaults fail closed
 

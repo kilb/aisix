@@ -146,33 +146,38 @@ pub(super) const ADJUSTED: &str =
     "(SELECT SUM(pa.delta_micro_cny)::bigint FROM pricing_adjustments_cny pa \
      WHERE pa.event_id = pc.event_id)";
 
-/// The latest re-pricing adjustment of the charge `pc` that recorded what it
-/// priced the charge at, joined as `eff` (` LEFT JOIN LATERAL …`). A charge
-/// is written once, so one a run corrected is shown with that run's lines,
-/// rate, discount and tier ([`EFF_LINES`] and its siblings), the ones its
-/// corrected amount was computed from. `eff` is all NULL for a charge no run
-/// corrected, and for one corrected only before the adjustments recorded
-/// them (`0038`), whose own columns are read then.
+/// The latest re-pricing adjustment of the charge `pc`, joined as `eff`
+/// (` LEFT JOIN LATERAL …`). A charge is written once, so one a run
+/// corrected is shown with that run's lines, rate, discount and tier
+/// ([`EFF_LINES`] and its siblings), the ones its corrected amount was
+/// computed from — the **latest** adjustment's, whichever release wrote it.
+/// The selection is by `created_at` alone and never by whether a detail was
+/// recorded: an adjustment a release before `0038` wrote carries none, and
+/// filtering those out would show an earlier run's rate beside the latest
+/// run's amount. `eff` is all NULL only for a charge no run adjusted.
 pub(super) const EFFECTIVE: &str = " LEFT JOIN LATERAL (\
-    SELECT pa.lines, pa.cny_per_usd_e4, pa.discount_bps, pa.service_tier \
-    FROM pricing_adjustments_cny pa WHERE pa.event_id = pc.event_id AND pa.lines IS NOT NULL \
+    SELECT pa.lines, pa.cny_per_usd_e4, pa.discount_bps, pa.service_tier, pa.created_at \
+    FROM pricing_adjustments_cny pa WHERE pa.event_id = pc.event_id \
     ORDER BY pa.created_at DESC LIMIT 1) eff ON true";
 
-/// The charge's lines as [`EFFECTIVE`] corrects them.
+/// The charge's lines as [`EFFECTIVE`] corrects them; `NULL` when the latest
+/// adjustment recorded none, which a caller shows as unknown rather than
+/// substituting an earlier run's.
 pub(super) const EFF_LINES: &str =
-    "(CASE WHEN eff.lines IS NOT NULL THEN eff.lines ELSE pc.lines END)";
+    "(CASE WHEN eff.created_at IS NULL THEN pc.lines WHEN eff.lines IS NULL THEN NULL \
+      ELSE eff.lines END)";
 
 /// The charge's group rate as [`EFFECTIVE`] corrects it.
-const EFF_RATE: &str =
-    "(CASE WHEN eff.lines IS NOT NULL THEN eff.cny_per_usd_e4 ELSE pc.cny_per_usd_e4 END)";
+const EFF_RATE: &str = "(CASE WHEN eff.created_at IS NULL THEN pc.cny_per_usd_e4 \
+      WHEN eff.lines IS NULL THEN NULL ELSE eff.cny_per_usd_e4 END)";
 
 /// The charge's discount as [`EFFECTIVE`] corrects it.
-const EFF_DISCOUNT: &str =
-    "(CASE WHEN eff.lines IS NOT NULL THEN COALESCE(eff.discount_bps, 0) ELSE pc.discount_bps END)";
+const EFF_DISCOUNT: &str = "(CASE WHEN eff.created_at IS NULL THEN COALESCE(pc.discount_bps, 0) \
+      WHEN eff.lines IS NULL THEN NULL ELSE COALESCE(eff.discount_bps, 0) END)";
 
 /// The charge's served tier as [`EFFECTIVE`] corrects it.
-const EFF_TIER: &str =
-    "(CASE WHEN eff.lines IS NOT NULL THEN eff.service_tier ELSE pc.service_tier END)";
+const EFF_TIER: &str = "(CASE WHEN eff.created_at IS NULL THEN pc.service_tier \
+      WHEN eff.lines IS NULL THEN NULL ELSE eff.service_tier END)";
 
 /// The only keys read out of a usage row's event.
 pub(super) const EVENT_FIELDS: &str = "jsonb_build_object(\
@@ -279,8 +284,13 @@ pub struct ChargeView {
     pub adjusted_micro_cny: i64,
     pub service_tier: Option<String>,
     pub estimated: bool,
-    pub discount_bps: i64,
-    pub lines: Value,
+    /// The discount the charge was priced at. `null` when the run that
+    /// corrected it recorded none: the amount is the latest run's, and the
+    /// rate it was computed from is not known.
+    pub discount_bps: Option<i64>,
+    /// The charge's lines, `null` under the same condition as
+    /// `discount_bps`.
+    pub lines: Option<Value>,
 }
 
 /// One call of the tenant.
@@ -414,8 +424,8 @@ struct CallRow {
     charge_micro_cny: Option<i64>,
     service_tier: Option<String>,
     estimated: bool,
-    discount_bps: i64,
-    lines: Value,
+    discount_bps: Option<i64>,
+    lines: Option<Value>,
     cny_per_usd_e4: Option<i64>,
     group_id: Option<Uuid>,
     group_name: Option<String>,
@@ -653,7 +663,10 @@ pub async fn list_calls(
                     service_tier: r.service_tier,
                     estimated: r.estimated,
                     discount_bps: r.discount_bps,
-                    lines: tenant_lines(&r.lines, r.cny_per_usd_e4),
+                    lines: r
+                        .lines
+                        .as_ref()
+                        .map(|lines| tenant_lines(lines, r.cny_per_usd_e4)),
                 },
                 event_id: r.event_id,
                 occurred_at: r.occurred_at,

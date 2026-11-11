@@ -848,9 +848,23 @@ fn only_the_resources_module_writes_gw_resources() {
                                     PROJECTION_COLUMNS.contains(&column)
                                 })
                             }),
-                        "housekeeping.rs" => statement.starts_with(
-                            "delete from gw_resources where deleted and projected_version = version",
-                        ),
+                        // The tombstone prune, and no other delete: it keeps a
+                        // generated model tombstone a grant still names.
+                        "housekeeping.rs" => {
+                            let rest = statement
+                                .strip_prefix("delete from gw_resources r where ")
+                                .and_then(|rest| rest.split(" and not (").next());
+                            rest.is_some_and(|cond| {
+                                cond.split(" and ").all(|clause| {
+                                    matches!(
+                                        clause.trim(),
+                                        "r.deleted"
+                                            | "r.projected_version = r.version"
+                                            | "r.updated_at < now() - make_interval(secs => $1)"
+                                    )
+                                })
+                            })
+                        }
                         _ => false,
                     };
                     if !allowed {

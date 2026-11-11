@@ -107,7 +107,9 @@ struct Row {
     status: String,
     charge_micro_cny: Option<i64>,
     estimated: bool,
-    lines: Value,
+    /// `None` when the latest run that corrected the charge recorded no
+    /// detail: its quantities are unknown, never an earlier run's.
+    lines: Option<Value>,
     /// The sum of the charge's adjustments, `None` when it has none.
     adjusted: Option<i64>,
     ev: Value,
@@ -224,7 +226,7 @@ pub async fn request_cost(
             charge_status: view.charge_status,
             charge_micro_cny,
             estimated: r.estimated,
-            quantities: quantities(&r.lines),
+            quantities: r.lines.as_ref().map(quantities).unwrap_or_default(),
         });
     }
     if items.is_empty() {

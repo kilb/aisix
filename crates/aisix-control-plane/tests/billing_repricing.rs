@@ -1957,3 +1957,68 @@ async fn a_charge_corrected_twice_shows_the_later_runs_lines() {
     let calls = owner_get(&r, "/api/usage/calls").await;
     assert_eq!(calls.body["items"][0]["charge"]["adjusted_micro_cny"], 340);
 }
+
+/// A call corrected twice, the second time by a release before detail lines
+/// existed: the latest adjustment is the one whose amount is shown, and
+/// since it recorded no rate detail, the rate shown is unknown — never the
+/// earlier run's. The amount and the detail must never describe different
+/// runs.
+#[tokio::test]
+async fn a_detail_less_latest_adjustment_shows_its_amount_with_unknown_detail() {
+    let Some(r) = setup(true).await else { return };
+    let (cp, db) = (&r.w.cp, r.w.cp.db());
+    send(&r.w, vec![usage(&r.w, "nm1", r.model, tokens_680())]).await;
+    let (from, to) = last_hour(cp).await;
+    // The first run corrects the call (680 → 340 µ¥) and records its lines.
+    reprice_model(cp, r.model, card("0.5", "1", "0.05")).await;
+    let (first, _) = previewed(cp, &r.w.admin, run_body(from, to, json!({}))).await;
+    assert_eq!(apply(cp, &r.admin, &first).await.status, 200);
+    // A release with no detail columns corrects it again, later and for
+    // more: a row with no `lines`, written the way that release wrote one.
+    let (second, _) = previewed(
+        cp,
+        &r.w.admin,
+        run_body(from, to, json!({"reason": "旧版本写入的调整 3a9"})),
+    )
+    .await;
+    let second_id = Uuid::parse_str(&second).expect("a run id");
+    let first_id = Uuid::parse_str(&first).expect("a run id");
+    let (engine, reason): (i64, String) = sqlx::query_as(
+        "SELECT engine_version, reason FROM pricing_adjustments_cny WHERE run_id = $1",
+    )
+    .bind(first_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("read the first adjustment");
+    sqlx::query(
+        "INSERT INTO pricing_adjustments_cny \
+         (run_id, event_id, delta_micro_cny, engine_version, reason, created_by, created_at) \
+         VALUES ($1, 'nm1', -10, $2, $3, (SELECT id FROM operators ORDER BY id LIMIT 1), \
+                 now() + interval '1 second')",
+    )
+    .bind(second_id)
+    .bind(engine)
+    .bind(format!("{reason} "))
+    .execute(db.pool())
+    .await
+    .expect("the old writer's adjustment");
+
+    let owner = cp.member_login_seeded(r.w.tenant, MemberRole::Owner).await;
+    let calls = cp
+        .send("GET", "/api/usage/calls", Some(owner.cookie()), None)
+        .await;
+    assert_eq!(calls.status, 200, "the call log: {calls:?}");
+    let call = calls.body["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|c| c["event_id"] == "nm1")
+        .expect("the corrected call");
+    // The amount is the latest adjustment's, on top of the first.
+    assert_eq!(call["charge"]["amount_micro_cny"], 680, "{call}");
+    assert_eq!(call["charge"]["adjusted_micro_cny"], -350, "{call}");
+    // And the rate it came from is not known, not the earlier run's 0.5.
+    assert!(call["charge"]["lines"].is_null(), "{call}");
+    assert!(call["charge"]["discount_bps"].is_null(), "{call}");
+    assert!(call["charge"]["service_tier"].is_null(), "{call}");
+}

@@ -69,6 +69,14 @@
 //! built. The upload, the library's fetch and every read of the stored
 //! library parse through the same [`parse`], so the bound holds for all three.
 //!
+//! The text a parse copies is bounded beside those two, since a body is not a
+//! bound on it: a model's provider, ids, display name, aliases and first
+//! pricing page are copied into every proposal its dates make, and each tier's
+//! copy of the standard prices copies their field names, so one long URL
+//! repeated over many dates retains its length many times from a body that
+//! holds it once. Past [`MAX_IMPORT_COPY_BYTES`] copied bytes the body is
+//! refused at `/data` the same way, before the copy that would cross it.
+//!
 //! # Uploads and proposals
 //!
 //! `POST /admin/pricing/imports` writes the batch and its proposals in one
@@ -143,6 +151,24 @@ pub const MAX_TIERS_PER_FIELD: usize = 64;
 /// copy or card that would cross it is built. At the limit a parse holds at
 /// most this many rate sets, under 100 MiB.
 pub const MAX_IMPORT_WORK: u64 = 500_000;
+
+/// The most bytes one parse may copy into what it returns, counted as the
+/// bytes of text it copies plus [`COPIED_NAME_OVERHEAD`] for each name a
+/// BTreeMap keeps beside it.
+///
+/// A body up to [`MAX_IMPORT_BYTES`] bounds nothing here, because a parse
+/// copies some of it many times: a provider's first pricing page, a model's
+/// ids, its display name and its aliases go into every proposal the model's
+/// dates make, and a model with a date entry per day over a long page retains
+/// its bytes that many times. The published dataset (2,353 proposals, read on
+/// 2026-11-10) copies about 0.7 MiB, so the limit is far above what a real
+/// dataset asks and far below what one long page repeated would.
+pub const MAX_IMPORT_COPY_BYTES: u64 = 32 << 20;
+
+/// What one name a `BTreeMap` keeps costs beside the text itself: the key
+/// `String`'s header and a share of the node that sorts it. A `String`'s own
+/// buffer is its text's length.
+pub const COPIED_NAME_OVERHEAD: u64 = 48;
 
 /// Why a proposal cannot be confirmed as it stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -241,9 +267,10 @@ fn refused(path: &str, message: impl Into<String>) -> ApiError {
 ///
 /// Refused at `/data`: a body that is not an array of providers with their
 /// models, one that prices nothing, one that makes more than
-/// [`MAX_IMPORT_PROPOSALS`] proposals, and one whose cards would take more
-/// than [`MAX_IMPORT_WORK`] to build. Both limits are checked before the
-/// cards that would cross them are built.
+/// [`MAX_IMPORT_PROPOSALS`] proposals, one whose cards would take more than
+/// [`MAX_IMPORT_WORK`] to build, and one whose parse would copy more than
+/// [`MAX_IMPORT_COPY_BYTES`] of text. Every limit is checked before the copy,
+/// tier copy or card that would cross it is built.
 pub fn parse(data: &RawValue, now: DateTime<Utc>) -> Result<Vec<ParsedProposal>, ApiError> {
     let unrecognised = || refused("/data", "不是可识别的价格数据集");
     let providers: Vec<Provider<'_>> =
@@ -253,6 +280,7 @@ pub fn parse(data: &RawValue, now: DateTime<Utc>) -> Result<Vec<ParsedProposal>,
     let mut budget = Budget {
         proposals: MAX_IMPORT_PROPOSALS,
         work: MAX_IMPORT_WORK,
+        copies: MAX_IMPORT_COPY_BYTES,
     };
     for provider in &providers {
         // The page is shown as a link beside the attestation. Anything but a
@@ -269,17 +297,36 @@ pub fn parse(data: &RawValue, now: DateTime<Utc>) -> Result<Vec<ParsedProposal>,
             let comments = model.price_comments.as_deref();
             let entry = (provider.id.as_str(), model.id.as_str());
             let aliases = aliases(&model.id, model.matches.as_ref());
-            let dated = model_proposals(&entries, variants, today, entry, comments, &mut budget)
-                .map_err(|over| match over {
-                    Over::Proposals => refused(
-                        "/data",
-                        format!("价格数据集产生的提议超过 {MAX_IMPORT_PROPOSALS} 条"),
-                    ),
-                    Over::Work => refused(
-                        "/data",
-                        "价格数据集展开后的价格过多（服务档位、长上下文分段与生效日期的组合超过上限）",
-                    ),
-                })?;
+            let metadata = metadata_cost(
+                &provider.id,
+                &model.id,
+                model.name.as_deref(),
+                pricing_url.as_deref(),
+                &aliases,
+            );
+            let dated = model_proposals(
+                &entries,
+                variants,
+                today,
+                entry,
+                comments,
+                metadata,
+                &mut budget,
+            )
+            .map_err(|over| match over {
+                Over::Proposals => refused(
+                    "/data",
+                    format!("价格数据集产生的提议超过 {MAX_IMPORT_PROPOSALS} 条"),
+                ),
+                Over::Work => refused(
+                    "/data",
+                    "价格数据集展开后的价格过多（服务档位、长上下文分段与生效日期的组合超过上限）",
+                ),
+                Over::Copies => refused(
+                    "/data",
+                    "价格数据集重复引用的文字过多（同一页地址、名称或别名的长度乘以生效日期的数量超过上限）",
+                ),
+            })?;
             for (effective_from, card, flags, dropped) in dated {
                 proposals.push(ParsedProposal {
                     provider: provider.id.clone(),
@@ -1382,11 +1429,13 @@ type Dated = (
     Vec<String>,
 );
 
-/// What is left of one parse's limits: proposals, and work as
-/// [`MAX_IMPORT_WORK`] counts it.
+/// What is left of one parse's limits: proposals, work as
+/// [`MAX_IMPORT_WORK`] counts it, and bytes as [`MAX_IMPORT_COPY_BYTES`]
+/// counts them.
 struct Budget {
     proposals: usize,
     work: u64,
+    copies: u64,
 }
 
 /// Which limit a parse ran out of.
@@ -1394,6 +1443,8 @@ struct Budget {
 enum Over {
     Proposals,
     Work,
+    /// The text the parse would copy, as [`MAX_IMPORT_COPY_BYTES`] counts it.
+    Copies,
 }
 
 impl Budget {
@@ -1402,16 +1453,51 @@ impl Budget {
         self.work = self.work.checked_sub(steps).ok_or(Over::Work)?;
         Ok(())
     }
+
+    /// Takes `bytes` of copied text, or refuses without taking any.
+    fn spend_copies(&mut self, bytes: u64) -> Result<(), Over> {
+        self.copies = self.copies.checked_sub(bytes).ok_or(Over::Copies)?;
+        Ok(())
+    }
+}
+
+/// What copying `map`'s field names costs, each charged as a name:
+/// [`COPIED_NAME_OVERHEAD`] plus its text.
+fn names_widened<'a>(map: &PriceMap<'a>) -> u64 {
+    map.keys().fold(0u64, |sum, name| {
+        sum.saturating_add(name.len() as u64 + COPIED_NAME_OVERHEAD)
+    })
+}
+
+/// What one proposal copies of the provider's and the model's own text, each
+/// name charged as [`COPIED_NAME_OVERHEAD`] plus its text: the provider id,
+/// the model id, its display name, its first pricing page and its aliases.
+fn metadata_cost(
+    provider: &str,
+    model: &str,
+    name: Option<&str>,
+    pricing_url: Option<&str>,
+    aliases: &[String],
+) -> u64 {
+    let widened = |text: &str| text.len() as u64 + COPIED_NAME_OVERHEAD;
+    [Some(provider), Some(model), name, pricing_url]
+        .into_iter()
+        .flatten()
+        .fold(0u64, |sum, text| sum.saturating_add(widened(text)))
+        .saturating_add(aliases.iter().map(|a| widened(a)).sum::<u64>())
 }
 
 /// One model's proposals: for the moment of upload and for each later date.
-/// Takes them, and the work of each, from `budget` before building any.
+/// Takes them, and the work and copied bytes of each, from `budget` before
+/// building any. `metadata` is what one proposal's copies of the provider's
+/// and model's own text cost ([`metadata_cost`]).
 fn model_proposals(
     entries: &[Conditional<'_>],
     variants: &[Variant<'_>],
     today: NaiveDate,
     entry: (&str, &str),
     comments: Option<&str>,
+    metadata: u64,
     budget: &mut Budget,
 ) -> Result<Vec<Dated>, Over> {
     let entry_conditions: Vec<Condition> = entries
@@ -1444,6 +1530,9 @@ fn model_proposals(
     budget.proposals = budget.proposals.checked_sub(dates).ok_or(Over::Proposals)?;
     let walk = (entries.len() + variants.len()) as u64;
     budget.spend((dates as u64).saturating_mul(walk))?;
+    // Every date's proposal copies the provider's and model's own text, which
+    // one long page repeated over many dates multiplies.
+    budget.spend_copies(metadata.saturating_mul(dates as u64))?;
     std::iter::once(None)
         .chain(later.into_iter().map(Some))
         .map(|from| {
@@ -1487,6 +1576,12 @@ fn model_proposals(
                 .saturating_mul(standard.len() as u64)
                 .saturating_add(overrides.values().map(|p| p.len() as u64).sum());
             budget.spend(copies)?;
+            // Each copy carries the field names it is keyed by, widened by the
+            // names the variant prices add to it.
+            let copied_names = names_widened(standard)
+                .saturating_mul(overrides.len() as u64 + 1)
+                .saturating_add(overrides.values().map(names_widened).sum());
+            budget.spend_copies(copied_names)?;
             let mut tiers = BTreeMap::from([(ServiceTier::default_tier(), standard.clone())]);
             for (tier, prices) in overrides {
                 if tier == ServiceTier::default_tier() {
@@ -1767,6 +1862,7 @@ fn card(
             let Some((dimension, per)) = dimension(field) else {
                 flags.insert(Flag::UnsupportedField);
                 if left_off.insert(field) {
+                    budget.spend_copies(field.len() as u64 + COPIED_NAME_OVERHEAD)?;
                     dropped.push(field.clone());
                 }
                 continue;
@@ -1792,6 +1888,7 @@ fn card(
                     );
                     flags.insert(Flag::TruncatedField);
                     if left_off.insert(field) {
+                        budget.spend_copies(field.len() as u64 + COPIED_NAME_OVERHEAD)?;
                         dropped.push(field.clone());
                     }
                 }
@@ -2587,6 +2684,7 @@ mod tests {
                 now().date_naive(),
                 ("p", "wide"),
                 None,
+                0,
                 budget,
             )
         };
@@ -2594,6 +2692,7 @@ mod tests {
         let mut budget = Budget {
             proposals: 2,
             work: MAX_IMPORT_WORK,
+            copies: MAX_IMPORT_COPY_BYTES,
         };
         assert_eq!(run(&mut budget).err(), Some(Over::Proposals));
         assert_eq!(budget.work, MAX_IMPORT_WORK);
@@ -2601,6 +2700,7 @@ mod tests {
         let mut budget = Budget {
             proposals: 3,
             work: MAX_IMPORT_WORK,
+            copies: MAX_IMPORT_COPY_BYTES,
         };
         assert_eq!(run(&mut budget).map(|d| d.len()), Ok(3));
         let cost = MAX_IMPORT_WORK - budget.work;
@@ -2608,6 +2708,7 @@ mod tests {
         let mut budget = Budget {
             proposals: 3,
             work: cost - 1,
+            copies: MAX_IMPORT_COPY_BYTES,
         };
         assert_eq!(run(&mut budget).err(), Some(Over::Work));
     }

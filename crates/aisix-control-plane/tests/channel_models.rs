@@ -1630,6 +1630,7 @@ async fn a_stored_grant_of_a_channels_direct_document_becomes_its_public_model()
         json!({
             "replaced": [pair],
             "withdrawn": [],
+            "unresolved": [],
             "keys": [{"key_id": other_key, "replaced": [pair], "withdrawn": []}],
         })
     );
@@ -1639,6 +1640,7 @@ async fn a_stored_grant_of_a_channels_direct_document_becomes_its_public_model()
             "replaced": [],
             "withdrawn": [],
             "keys": [{"key_id": narrow_key, "replaced": [], "withdrawn": [direct]}],
+            "unresolved": [],
         })
     );
 
@@ -1690,6 +1692,8 @@ async fn a_held_tenant_holds_back_no_other_and_the_next_tick_replaces_its_grant(
             grants_replaced: 1,
             grants_withdrawn: 0,
             keys_changed: 0,
+            unresolved_tenants: 0,
+            unresolved_grants: 0,
             deferred: 1,
             failed: 0,
         }
@@ -4104,6 +4108,7 @@ async fn a_grant_of_only_removed_channels_is_withdrawn_at_the_next_boot() {
             "replaced": [],
             "withdrawn": [direct],
             "keys": [{"key_id": selecting, "replaced": [], "withdrawn": [direct]}],
+            "unresolved": [],
         })
     );
     // An ordinary edit re-projects the keys again.
@@ -4431,4 +4436,246 @@ async fn a_public_model_write_commits_before_it_counts_who_reaches_the_model() {
         late.is_empty(),
         "these did not commit before they read the keys: {late:?}"
     );
+}
+
+/// A grant of a removed channel's direct model whose generated tombstone was
+/// pruned before the upgrade is diagnosed, not guessed at: the tombstone is
+/// kept while a grant names it, and one deleted anyway (a database whose
+/// prune ran before this release, or a tombstone gone by another route)
+/// leaves a grant whose origin nothing records. The pass leaves it as it is,
+/// names it in an audit row and a log line, and an operator removes the id
+/// through a grant edit, after which the key documents re-project.
+#[tokio::test]
+async fn a_grant_whose_generated_tombstone_is_gone_is_left_and_diagnosed() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let account = provider_key(&cp, &op, "acct-gone-7f3").await;
+    let (public, _) = create_public(&cp, &op, "pub-gone-7f3").await;
+    let r = put_channel(&cp, &op, account, public, json!({})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let direct = direct_of(&cp, account, public).await;
+    let tenant = tenant_granted(&cp, &op, &[]).await;
+    let follows = new_key(&cp, &op, tenant).await;
+    store_old_grants(&cp, &op, tenant, &[direct], &[]).await;
+
+    let r = cp
+        .send(
+            "DELETE",
+            &format!("/admin/provider-keys/{account}/channel-models/{public}"),
+            Some(op.cookie()),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(r.status, 204, "{r:?}");
+    assert!(!is_live(&cp, Kind::Models, direct).await);
+
+    // A prune past the retention keeps the tombstone the grant names: it is
+    // the repair's proof that the grant was a channel's. The retention is
+    // backdated rather than set to zero, so the row is old enough to prune
+    // and only the grant's reference keeps it.
+    sqlx::query(
+        "UPDATE gw_resources SET updated_at = now() - interval '2 days' \
+                 WHERE kind = $1 AND id = $2",
+    )
+    .bind(Kind::Models.segment())
+    .bind(direct)
+    .execute(cp.db().pool())
+    .await
+    .expect("age the tombstone");
+    let kept = aisix_control_plane::housekeeping::prune_tombstones(
+        cp.db(),
+        std::time::Duration::from_secs(3600),
+    )
+    .await
+    .expect("prune");
+    assert_eq!(kept, 0, "the granted model's tombstone was pruned");
+
+    // A grant that survives its tombstone, as one written before this
+    // release's bounded prune leaves it.
+    sqlx::query("DELETE FROM gw_resources WHERE kind = $1 AND id = $2")
+        .bind(Kind::Models.segment())
+        .bind(direct)
+        .execute(cp.db().pool())
+        .await
+        .expect("drop the tombstone");
+
+    let ctx = aisix_control_plane::resources::write::WriteCtx::of(cp.state());
+    aisix_control_plane::housekeeping::tick(cp.db(), &ctx).await;
+    // Nothing was guessed: the grant and the key documents stand.
+    assert_eq!(grants(&cp, tenant).await, vec![direct]);
+    assert_eq!(key_grants(&cp, follows).await, vec![direct]);
+    let rows = replacement_rows(&cp).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, Some(tenant));
+    assert_eq!(
+        rows[0].2,
+        json!({"replaced": [], "withdrawn": [], "keys": [], "unresolved": [direct]})
+    );
+
+    // An operator removes the id through a grant edit, and the keys follow.
+    let stored = grants(&cp, tenant).await;
+    let kept: Vec<Uuid> = stored.into_iter().filter(|id| *id != direct).collect();
+    set_grants(&cp, &op, &tenant.to_string(), &kept).await;
+    assert_eq!(grants(&cp, tenant).await, Vec::<Uuid>::new());
+    assert_eq!(key_grants(&cp, follows).await, Vec::<Uuid>::new());
+}
+
+/// A grant and a live key selection that name a model nothing records any
+/// more do not stop the pass from repairing the rest of the tenant's grants
+/// in the same run.
+#[tokio::test]
+async fn a_diagnosed_grant_does_not_hold_back_the_repair_of_another() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let account = provider_key(&cp, &op, "acct-mix-2c9").await;
+    let (public, _) = create_public(&cp, &op, "pub-mix-2c9").await;
+    let r = put_channel(&cp, &op, account, public, json!({})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let direct = direct_of(&cp, account, public).await;
+    let tenant = tenant_granted(&cp, &op, &[]).await;
+    let orphan = Uuid::new_v4();
+    store_old_grants(&cp, &op, tenant, &[direct, orphan], &[]).await;
+
+    let ctx = aisix_control_plane::resources::write::WriteCtx::of(cp.state());
+    aisix_control_plane::housekeeping::tick(cp.db(), &ctx).await;
+    let stored = grants(&cp, tenant).await;
+    assert!(
+        stored.contains(&public),
+        "the generated grant was not replaced: {stored:?}"
+    );
+    assert!(
+        stored.contains(&orphan),
+        "the unexplained grant was changed: {stored:?}"
+    );
+    let rows = replacement_rows(&cp).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].2["unresolved"], json!([orphan]));
+}
+
+/// The document of model `id` through `write_resource`, as an older release
+/// wrote a direct document whose name did not follow its account.
+async fn replace_model_doc(cp: &TestCp, public: Uuid, id: Uuid, doc: Value) {
+    use aisix_control_plane::resources::write::{write_resource, ResourceWrite, WriteCtx, WriteOp};
+    let ctx = WriteCtx::of(cp.state());
+    cp.db()
+        .tx(move |conn| {
+            async move {
+                let owner = channels::owner(public);
+                write_resource(
+                    conn,
+                    &ctx,
+                    ResourceWrite {
+                        kind: Kind::Models,
+                        id,
+                        op: WriteOp::Replace(&doc),
+                        expected_version: None,
+                        managed_by: Some(&owner),
+                    },
+                )
+                .await
+            }
+            .boxed()
+        })
+        .await
+        .expect("write the document");
+}
+
+/// The display name of live model `id`'s document.
+async fn display_name(cp: &TestCp, id: Uuid) -> String {
+    live(cp, Kind::Models, id).await["display_name"]
+        .as_str()
+        .expect("a display name")
+        .to_string()
+}
+
+/// Two live direct documents of one public model whose names an older
+/// release left swapped: account x's document carries the name account y's
+/// should, and y's carries x's. A regeneration that wrote y's document first
+/// would take a name x's still holds and the unique index would roll the
+/// edit back with a 23505. The regeneration must write the document that
+/// gives the name up first, whatever order the channel rows are in, and both
+/// documents end on the names their accounts give them.
+#[tokio::test]
+async fn a_regeneration_orders_a_name_chain_across_two_accounts() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let account_x = provider_key(&cp, &op, "acct-chain-x-4b7").await;
+    let account_y = provider_key(&cp, &op, "acct-chain-y-4b7").await;
+    let (public, _) = create_public(&cp, &op, "pub-chain-4b7").await;
+    for account in [account_x, account_y] {
+        let r = put_channel(&cp, &op, account, public, json!({})).await;
+        assert_eq!(r.status, 200, "{r:?}");
+    }
+    let x = direct_of(&cp, account_x, public).await;
+    let y = direct_of(&cp, account_y, public).await;
+    // Account x's document carries y's name, and y's carries x's: what an
+    // account rename left before the documents followed it. Reached the way
+    // the renames happened, one write at a time, since the unique index
+    // would refuse the swap written in any single-step order.
+    replace_model_doc(
+        &cp,
+        public,
+        x,
+        json!({
+            "display_name": "pub-chain-4b7#temp-4b7",
+            "provider": "openai",
+            "model_name": "pub-chain-4b7",
+            "provider_key_id": account_x.to_string(),
+            "internal": true,
+        }),
+    )
+    .await;
+    replace_model_doc(
+        &cp,
+        public,
+        y,
+        json!({
+            "display_name": "pub-chain-4b7#acct-chain-x-4b7",
+            "provider": "openai",
+            "model_name": "pub-chain-4b7",
+            "provider_key_id": account_y.to_string(),
+            "internal": true,
+        }),
+    )
+    .await;
+    replace_model_doc(
+        &cp,
+        public,
+        x,
+        json!({
+            "display_name": "pub-chain-4b7#acct-chain-y-4b7",
+            "provider": "openai",
+            "model_name": "pub-chain-4b7",
+            "provider_key_id": account_x.to_string(),
+            "internal": true,
+        }),
+    )
+    .await;
+    replace_model_doc(
+        &cp,
+        public,
+        y,
+        json!({
+            "display_name": "pub-chain-4b7#acct-chain-x-4b7",
+            "provider": "openai",
+            "model_name": "pub-chain-4b7",
+            "provider_key_id": account_y.to_string(),
+            "internal": true,
+        }),
+    )
+    .await;
+    assert_eq!(display_name(&cp, x).await, "pub-chain-4b7#acct-chain-y-4b7");
+    assert_eq!(display_name(&cp, y).await, "pub-chain-4b7#acct-chain-x-4b7");
+
+    // A plain regeneration, through an edit that rewrites both documents.
+    let r = put_channel(&cp, &op, account_x, public, json!({"priority": 7})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(display_name(&cp, x).await, "pub-chain-4b7#acct-chain-x-4b7");
+    assert_eq!(display_name(&cp, y).await, "pub-chain-4b7#acct-chain-y-4b7");
 }

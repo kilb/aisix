@@ -594,29 +594,27 @@ pub async fn regenerate(
     // The documents that already exist are rewritten before any is created,
     // so a name a rewrite gives up (an account renamed before its direct
     // documents followed it) is free by the time a new one takes it.
-    let mut existing = Vec::with_capacity(served.len());
-    for (channel, _, _) in &served {
-        let live = store::get(&mut *conn, Kind::Models, channel.direct_model_id)
-            .await?
-            .is_some_and(|row| !row.deleted);
-        existing.push(live);
+    let mut writes: Vec<(Uuid, Value, bool)> = Vec::with_capacity(served.len());
+    for (channel, display_name, provider) in &served {
+        let row = store::get(&mut *conn, Kind::Models, channel.direct_model_id).await?;
+        let live = row.as_ref().is_some_and(|row| !row.deleted);
+        writes.push((
+            channel.direct_model_id,
+            direct_doc(channel, &public, display_name, provider),
+            live,
+        ));
     }
-    let mut ordered: Vec<(bool, &(ChannelModelRow, String, String))> =
-        existing.into_iter().zip(served.iter()).collect();
-    ordered.sort_by_key(|(live, _)| !*live);
+    // A name may be held by another live document of this model: an older
+    // release could leave one direct document on another's name, and a
+    // rewrite must give that name up before this one takes it, or the
+    // unique index refuses the write and the whole edit rolls back.
     // Direct documents first: the routing document names them by id, and a
     // reference must be live when the referrer is written.
-    for (_, (channel, display_name, provider)) in ordered {
-        crate::tenants::put(
-            conn,
-            ctx,
-            Kind::Models,
-            channel.direct_model_id,
-            &direct_doc(channel, &public, display_name, provider),
-            &owner,
-        )
-        .await?;
-    }
+    let writes = writes
+        .into_iter()
+        .map(|(id, doc, live)| (id, doc, live, owner.clone()))
+        .collect();
+    names_freed_first(&mut *conn, ctx, writes).await?;
     let channels: Vec<ChannelModelRow> = served.into_iter().map(|(c, _, _)| c).collect();
     crate::tenants::put(
         conn,
@@ -815,6 +813,8 @@ pub async fn follow_account(
     .fetch_all(&mut *conn)
     .await
     .map_err(DbError::from)?;
+    let mut writes = Vec::new();
+    let mut owners: HashMap<Uuid, String> = HashMap::new();
     for channel in channels {
         let public = read_public(&mut *conn, channel.public_model_id).await?;
         let owner = owner(public.id);
@@ -824,17 +824,84 @@ pub async fn follow_account(
         if !live {
             continue;
         }
-        crate::tenants::put(
-            conn,
-            ctx,
-            Kind::Models,
+        owners.insert(channel.direct_model_id, owner);
+        writes.push((
             channel.direct_model_id,
-            &direct_doc(&channel, &public, &display_name, &provider),
-            &owner,
-        )
-        .await?;
+            direct_doc(&channel, &public, &display_name, &provider),
+            true,
+        ));
+    }
+    // A chain across public models — this account renamed onto the name
+    // another account's document of the same model carries, and that
+    // document renamed off it — is written in the order that frees each name
+    // first, exactly as [`regenerate`] writes one model's.
+    let writes = writes
+        .into_iter()
+        .filter_map(|(id, doc, live)| owners.remove(&id).map(|owner| (id, doc, live, owner)))
+        .collect();
+    names_freed_first(&mut *conn, ctx, writes).await
+}
+
+/// Writes direct documents so that no write takes a name a live document
+/// still holds: every document whose name changes is first written under a
+/// name of its own (freed), and every document then takes its final name.
+/// A chain in which account x's document carries y's name and y's carries
+/// x's, which an account rename left before the documents followed it, is
+/// therefore swapped in one pass, and the unique index never sees two live
+/// documents on one name mid-transaction. A document whose name does not
+/// change is written once, at its final name.
+///
+/// The freeing name is `#freed#<id>`, which no account or public model can
+/// spell (a public model's name may not contain `#`, and neither may an
+/// account's display name, so no direct name does). Every write is in the
+/// caller's transaction, which the caller has also taken the resources lock
+/// in, so a failure anywhere leaves no freed name behind and no other writer
+/// takes a name meanwhile.
+async fn names_freed_first(
+    conn: &mut PgConnection,
+    ctx: &WriteCtx,
+    writes: Vec<(Uuid, Value, bool, String)>,
+) -> Result<(), ApiError> {
+    let mut held: HashMap<Uuid, String> = HashMap::new();
+    for (id, _, live, _) in &writes {
+        if !*live {
+            continue;
+        }
+        let Some(row) = store::get(&mut *conn, Kind::Models, *id).await? else {
+            continue;
+        };
+        if row.deleted {
+            continue;
+        }
+        if let Some(name) = row.doc.get("display_name").and_then(Value::as_str) {
+            held.insert(*id, name.to_string());
+        }
+    }
+    let want = |doc: &Value, id: Uuid| {
+        doc.get("display_name")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| freed_name(id))
+    };
+    let renaming: Vec<(Uuid, Value, String)> = writes
+        .iter()
+        .filter(|(id, doc, live, _)| *live && held.get(id) != Some(&want(doc, *id)))
+        .map(|(id, doc, _, owner)| (*id, doc.clone(), owner.clone()))
+        .collect();
+    for (id, mut doc, owner) in renaming {
+        doc["display_name"] = json!(freed_name(id));
+        crate::tenants::put(&mut *conn, ctx, Kind::Models, id, &doc, &owner).await?;
+    }
+    for (id, doc, _, owner) in writes {
+        crate::tenants::put(&mut *conn, ctx, Kind::Models, id, &doc, &owner).await?;
     }
     Ok(())
+}
+
+/// The name a direct document is written under while it gives its own up:
+/// one no direct document can carry as its final name.
+fn freed_name(id: Uuid) -> String {
+    format!("#freed#{id}")
 }
 
 /// Refuses the delete of a provider key any channel model names, `409

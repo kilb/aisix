@@ -437,25 +437,29 @@ pub(crate) async fn all(conn: &mut PgConnection) -> Result<Vec<TenantRow>, ApiEr
 /// Fences a tenant's move onto [`ModelScope::All`] against a write that
 /// changes what every all-scope tenant reaches. Such a write takes it
 /// shared ([`lock_all_scope`]) before it reads which tenants are on `all`,
-/// and holds it to its commit; a move onto `all` takes it exclusive right
-/// after the tenant's own row (and account), before it projects the
-/// tenant's keys from the catalogue. So a tenant that joins `all` is either
-/// in the writer's census, its keys rewritten by the writer, or projected
-/// after the writer committed, from a catalogue that holds the writer's
-/// change. Without it a tenant could join between the census and the
-/// write and be rewritten by neither.
+/// and holds it to its commit; a tenant `PATCH` that names `model_scope:
+/// all` takes it exclusive as its first lock, before the tenant's own row
+/// (and account), and so before it projects the tenant's keys from the
+/// catalogue. So a tenant that joins `all` is either in the writer's
+/// census, its keys rewritten by the writer, or projected after the writer
+/// committed, from a catalogue that holds the writer's change. Without it a
+/// tenant could join between the census and the write and be rewritten by
+/// neither.
 ///
 /// A tenant's creation is a move onto `all` too (every customer starts
 /// there): [`create`] takes it exclusive as its first lock, since there is
 /// no tenant row yet.
 ///
-/// The writer takes it before any tenant row, the move after its tenant's
-/// row, and neither order can close a wait cycle: a writer waits only on
-/// rows of tenants already on `all`, and a move waits for the fence only
-/// while its tenant is not. A create holds nothing a writer waits on while
-/// it waits for the fence, and takes only the default groups' rows and the
-/// resources lock after it, which no writer holds while it waits for the
-/// fence.
+/// Every path that takes it takes it before any tenant row, account, group
+/// row, public model's row or the resources lock, so no holder of any of
+/// those waits for the fence and no wait cycle runs through it. A move
+/// that took its tenant's row first would close one: with a writer whose
+/// census still counts the tenant from before it left `all`, which then
+/// waits for that row, and with a writer waiting for an all-scope tenant's
+/// row that a re-pricing apply holds while the apply waits for the moving
+/// tenant's (`tenants::lock_many_billing` takes rows in id order, whatever
+/// their scope). The move takes it whether or not its tenant is on `all`
+/// already, since it decides before it reads the row.
 pub const SCOPE_LOCK_KEY: i64 = 0x6169_7369_7863_7034;
 
 /// Locks every tenant on [`ModelScope::All`], in ascending id order, so a
@@ -1137,6 +1141,12 @@ pub struct GeneratedGrantsReplaced {
     pub grants_withdrawn: u64,
     /// Live keys whose model selection changed.
     pub keys_changed: u64,
+    /// Tenants with a grant or a live key selection naming a model whose
+    /// origin nothing records any more: left as it is, each logged with its
+    /// tenant and ids, for an operator to remove.
+    pub unresolved_tenants: u64,
+    /// Those grants and selections, in all.
+    pub unresolved_grants: u64,
     /// Tenants the gateway-version gate refused, or that stayed busy past
     /// the lock timeout, left for the next pass.
     pub deferred: u64,
@@ -1179,7 +1189,14 @@ fn replace_generated(
 /// public model; a key that selected the direct model selects the public
 /// one, where its tenant then holds it. Where the public model is retired,
 /// or the channel was removed since (no channel row and no live document),
-/// the grant is withdrawn. Run at boot and by every housekeeping tick.
+/// the grant is withdrawn. Run at boot and by every housekeeping tick. A
+/// `_LOCK_KEY`-free read of the housekeeping order covers the rest.
+///
+/// A grant that names a model with no live document, no channel row and no
+/// generated tombstone is not withdrawn: nothing says it came from a
+/// channel, and guessing an id would either widen a grant or drop a
+/// hand-made one. It is reported instead, tenant by tenant, for an operator
+/// to remove through a grant edit ([`update`]), which re-projects the keys.
 ///
 /// One transaction per tenant, so a tenant that fails holds back no other,
 /// and takes the locks of a grant edit and no more: the tenant's row, then
@@ -1199,38 +1216,35 @@ pub async fn replace_generated_grants(
     db: &Db,
     ctx: &WriteCtx,
 ) -> Result<GeneratedGrantsReplaced, ApiError> {
-    // A holder names a channel's direct model, or the direct model of a
-    // channel removed since: no channel row and no live document, but the
-    // tombstone of a document a public model generated as a target (owned by
-    // `public:<id>` at another id than the public model's own). That is the
-    // grant `replace_generated_in` withdraws; without it, a tenant whose last
-    // such channel is gone would never be found. The tombstone outlives the
-    // delete's projection by a day (`housekeeping::TOMBSTONE_RETENTION`),
-    // and the pass runs at boot and on every tick, so it is found well
-    // within that. An id with no such trace is no evidence of a grant this
-    // repair is for, and is not looked for.
+    // A holder names a channel's direct model, the direct model of a channel
+    // removed since, or an id no live document and no channel row answers. A
+    // removed channel leaves the tombstone of the document a public model
+    // generated as a target (owned by `public:<id>` at another id than the
+    // public model's own), which is the grant `replace_generated_in`
+    // withdraws. The tombstone is kept while a grant or a live selection
+    // names it (`housekeeping::prune_tombstones`), so this pass reads it
+    // before any prune and finds the grant however old it is. An id with no
+    // channel row and no tombstone is looked for too: the pass cannot tell
+    // where it came from, so it diagnoses it rather than leaving it silently
+    // in place.
     let holders: Vec<Uuid> = sqlx::query_scalar(
         "WITH named(id) AS ( \
            SELECT u.id FROM tenants t, unnest(t.allowed_model_ids) AS u(id) \
            UNION SELECT u.id FROM tenant_keys k, unnest(k.model_ids) AS u(id) \
              WHERE k.revoked_at IS NULL \
-         ), gone(id) AS ( \
+         ), dead(id) AS ( \
            SELECT n.id FROM named n \
            WHERE NOT EXISTS (SELECT 1 FROM gw_resources r \
                              WHERE r.kind = $1 AND r.id = n.id AND NOT r.deleted) \
              AND NOT EXISTS (SELECT 1 FROM channel_models cm WHERE cm.direct_model_id = n.id) \
-             AND EXISTS (SELECT 1 FROM gw_resources r \
-                         WHERE r.kind = $1 AND r.id = n.id AND r.deleted \
-                           AND r.managed_by LIKE 'public:%' \
-                           AND r.managed_by <> 'public:' || r.id::text) \
          ) \
          SELECT t.id FROM tenants t \
          WHERE EXISTS (SELECT 1 FROM channel_models cm WHERE cm.direct_model_id = ANY(t.allowed_model_ids)) \
-            OR EXISTS (SELECT 1 FROM gone g WHERE g.id = ANY(t.allowed_model_ids)) \
+            OR EXISTS (SELECT 1 FROM dead d WHERE d.id = ANY(t.allowed_model_ids)) \
          UNION SELECT k.tenant_id FROM tenant_keys k \
          WHERE k.revoked_at IS NULL \
            AND (EXISTS (SELECT 1 FROM channel_models cm WHERE cm.direct_model_id = ANY(k.model_ids)) \
-             OR EXISTS (SELECT 1 FROM gone g WHERE g.id = ANY(k.model_ids))) \
+             OR EXISTS (SELECT 1 FROM dead d WHERE d.id = ANY(k.model_ids))) \
          ORDER BY 1",
     )
     .bind(Kind::Models.segment())
@@ -1250,11 +1264,22 @@ pub async fn replace_generated_grants(
             .await;
         match changed {
             Ok(None) => {}
-            Ok(Some((replaced, withdrawn, keys))) => {
+            Ok(Some(done)) => {
                 outcome.tenants += 1;
-                outcome.grants_replaced += replaced;
-                outcome.grants_withdrawn += withdrawn;
-                outcome.keys_changed += keys;
+                outcome.grants_replaced += done.replaced;
+                outcome.grants_withdrawn += done.withdrawn;
+                outcome.keys_changed += done.keys;
+                outcome.unresolved_grants += done.unresolved.len() as u64;
+                if !done.unresolved.is_empty() {
+                    outcome.unresolved_tenants += 1;
+                    tracing::warn!(
+                        tenant = %tenant,
+                        models = ?done.unresolved,
+                        "a tenant grants model ids that no live document, channel row or generated \
+                         tombstone answers; the grant is left as it is, and an operator removes \
+                         the id through a grant edit"
+                    );
+                }
             }
             Err(e) if compat::refused(&e) || e.status == StatusCode::SERVICE_UNAVAILABLE => {
                 outcome.deferred += 1;
@@ -1272,14 +1297,29 @@ pub async fn replace_generated_grants(
     Ok(outcome)
 }
 
+/// A model id a grant or a live key selection names that no live document and
+/// no channel row answers, and whether a generated tombstone explains it.
+type DeadId = (Uuid, bool);
+
+/// What one tenant's pass did.
+struct GrantRepair {
+    replaced: u64,
+    withdrawn: u64,
+    keys: u64,
+    /// Model ids the tenant or a live key names that no live document, no
+    /// channel row and no generated tombstone answers: left in place, and
+    /// reported.
+    unresolved: Vec<Uuid>,
+}
+
 /// [`replace_generated_grants`] for one tenant, in the caller's
-/// transaction: `Some((grants replaced, grants withdrawn, keys changed))`
-/// when anything changed, `None` when nothing named such a model.
+/// transaction: `Some(..)` when it changed anything or found a grant it
+/// cannot explain, `None` when nothing named such a model.
 async fn replace_generated_in(
     conn: &mut PgConnection,
     ctx: &WriteCtx,
     tenant_id: Uuid,
-) -> Result<Option<(u64, u64, u64)>, ApiError> {
+) -> Result<Option<GrantRepair>, ApiError> {
     let tenant = lock(&mut *conn, tenant_id).await?;
     let selections: Vec<(Uuid, Vec<Uuid>)> = sqlx::query_as(
         "SELECT id, model_ids FROM tenant_keys \
@@ -1306,13 +1346,21 @@ async fn replace_generated_in(
     // An id that names no live model and no channel row is the direct model
     // of a channel an operator removed since: an untick, or a retire of its
     // public model, deletes the row and the document and leaves the grants.
-    // It reaches nothing, and a key document naming it fails the reference
-    // check, so it is withdrawn with the rest. It is not replaced: the
-    // operator stopped serving the model through that account. Read before
-    // anything returns early: a tenant whose every such channel is gone
-    // names nothing else here.
-    let dead: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT DISTINCT u.id FROM unnest($1::uuid[]) AS u(id) \
+    // One whose generated tombstone survives is the grant this repair
+    // withdraws: it reaches nothing, and a key document naming it fails the
+    // reference check. It is not replaced: the operator stopped serving the
+    // model through that account. One with no tombstone at all is a grant
+    // whose origin nothing on this database records any more, so it is not
+    // withdrawn either: guessing would either drop a hand-made grant or
+    // grant a model nobody chose. It is reported, and an operator removes it
+    // through a grant edit. Read before anything returns early: a tenant
+    // whose every such channel is gone names nothing else here.
+    let dead: Vec<DeadId> = sqlx::query_as(
+        "SELECT DISTINCT u.id, EXISTS (SELECT 1 FROM gw_resources r \
+                                       WHERE r.kind = $2 AND r.id = u.id AND r.deleted \
+                                         AND r.managed_by LIKE 'public:%' \
+                                         AND r.managed_by <> ('public:' || r.id::text)) \
+         FROM unnest($1::uuid[]) AS u(id) \
          WHERE NOT EXISTS (SELECT 1 FROM gw_resources r \
                            WHERE r.kind = $2 AND r.id = u.id AND NOT r.deleted) \
            AND NOT EXISTS (SELECT 1 FROM channel_models cm WHERE cm.direct_model_id = u.id)",
@@ -1322,7 +1370,11 @@ async fn replace_generated_in(
     .fetch_all(&mut *conn)
     .await
     .map_err(DbError::from)?;
-    if generated.is_empty() && dead.is_empty() {
+    let (explained, unexplained): (Vec<DeadId>, Vec<DeadId>) =
+        dead.into_iter().partition(|(_, known)| *known);
+    let explained: Vec<Uuid> = explained.into_iter().map(|(id, _)| id).collect();
+    let unresolved: Vec<Uuid> = unexplained.into_iter().map(|(id, _)| id).collect();
+    if generated.is_empty() && explained.is_empty() && unresolved.is_empty() {
         return Ok(None);
     }
     let mut publics: Vec<Uuid> = generated.iter().map(|(_, p)| *p).collect();
@@ -1347,7 +1399,7 @@ async fn replace_generated_in(
         .into_iter()
         .map(|(direct, public)| (direct, live.contains(&public).then_some(public)))
         .collect();
-    map.extend(dead.into_iter().map(|id| (id, None)));
+    map.extend(explained.into_iter().map(|id| (id, None)));
 
     let (grants, replaced, withdrawn) = replace_generated(&tenant.allowed_model_ids, &map);
     if !replaced.is_empty() || !withdrawn.is_empty() {
@@ -1385,10 +1437,14 @@ async fn replace_generated_in(
             "withdrawn": key_withdrawn,
         }));
     }
-    if replaced.is_empty() && withdrawn.is_empty() && keys.is_empty() {
+    let changed = !replaced.is_empty() || !withdrawn.is_empty() || !keys.is_empty();
+    if !changed && unresolved.is_empty() {
         return Ok(None);
     }
-    project_without_marks(&mut *conn, ctx, tenant_id).await?;
+    // Only a grant actually rewritten changes a document.
+    if changed {
+        project_without_marks(&mut *conn, ctx, tenant_id).await?;
+    }
     audit::record(
         &mut *conn,
         AuditEntry {
@@ -1401,15 +1457,17 @@ async fn replace_generated_in(
                 "replaced": pairs(&replaced),
                 "withdrawn": withdrawn,
                 "keys": keys,
+                "unresolved": unresolved,
             }),
         },
     )
     .await?;
-    Ok(Some((
-        replaced.len() as u64,
-        withdrawn.len() as u64,
-        keys.len() as u64,
-    )))
+    Ok(Some(GrantRepair {
+        replaced: replaced.len() as u64,
+        withdrawn: withdrawn.len() as u64,
+        keys: keys.len() as u64,
+        unresolved,
+    }))
 }
 
 /// `(generated direct model, public model)` pairs as audit detail.
@@ -2016,22 +2074,28 @@ pub async fn update(
         .db
         .tx(move |conn| {
             async move {
+                // A move onto `all` waits for every catalogue write that
+                // counted the all-scope tenants without this one, and holds
+                // off the next until it commits ([`SCOPE_LOCK_KEY`]). It is
+                // taken before the tenant's row, holding nothing, whether
+                // or not the tenant is on `all` already: a move that held
+                // the row while it waited would close a wait cycle with a
+                // catalogue write that counted the tenant, or with one
+                // that waits on a row a re-pricing apply holds while the
+                // apply waits for this tenant's.
+                if scope == Some(ModelScope::All) {
+                    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                        .bind(SCOPE_LOCK_KEY)
+                        .execute(&mut *conn)
+                        .await
+                        .map_err(DbError::from)?;
+                }
                 let current = match billing {
                     BillingStep::Run => lock_billing(&mut *conn, id).await?.0,
                     BillingStep::Skip => lock(&mut *conn, id).await?,
                 };
                 if current.version != expected {
                     return Err(ApiError::version_mismatch(current.version));
-                }
-                // A move onto `all` waits for every catalogue write that
-                // counted the all-scope tenants without this one, and holds
-                // off the next until it commits ([`SCOPE_LOCK_KEY`]).
-                if scope == Some(ModelScope::All) && current.model_scope != ModelScope::All {
-                    sqlx::query("SELECT pg_advisory_xact_lock($1)")
-                        .bind(SCOPE_LOCK_KEY)
-                        .execute(&mut *conn)
-                        .await
-                        .map_err(DbError::from)?;
                 }
                 if groups.as_ref().is_some_and(Vec::is_empty) && !current.is_internal {
                     return Err(ApiError::validation(vec![no_groups(
