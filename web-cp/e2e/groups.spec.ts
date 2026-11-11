@@ -445,9 +445,38 @@ test("毛利显示近 30 天的售价、成本与利润，成本未知的另列"
 
   // The charge lands asynchronously; the page reads the margin route, so wait
   // for the row there rather than for a timer.
-  const now = new Date();
-  const from = new Date(now.getTime() - 30 * 86_400_000);
-  const query = `from=${from.toISOString()}&to=${now.toISOString()}&group_id=${group.id}`;
+  //
+  // The bound is the last charge's own `occurred_at` plus a second, never a
+  // clock read here: the route's `to` is exclusive (`occurred_at < to`), so a
+  // bound taken at roughly the same moment can equal the last call's
+  // millisecond and leave it out for good, however long the poll waits. Both
+  // calls of the loop above routinely share one millisecond.
+  // Both calls are stored before the window is worked out; until they are
+  // there is no `occurred_at` to bound it by.
+  let recorded: Json[] = [];
+  await expect
+    .poll(
+      async () => {
+        recorded = ((await stack.admin.get(`/admin/pricing/charges?tenant_id=${tenantId}`)) as { items: Json[] }).items;
+        return recorded.length;
+      },
+      { timeout: 60_000 },
+    )
+    .toBe(2);
+  const last = Math.max(...recorded.map((c: Json) => Date.parse(c.occurred_at as string)));
+  const from = new Date(last - 30 * 86_400_000);
+  const to = new Date(last + 1_000);
+  const query = `from=${from.toISOString()}&to=${to.toISOString()}&group_id=${group.id}`;
+  // The route's `to` is exclusive, so a bound equal to the last call's own
+  // `occurred_at` drops that call — the failure the old bound hit whenever the
+  // clock read matched the last call's millisecond. That call is not the one
+  // the fixed window counts, so this bound sees strictly fewer rows.
+  const atTheCall = `from=${from.toISOString()}&to=${new Date(last).toISOString()}&group_id=${group.id}`;
+  const rowsAtTheCall = ((await stack.admin.get(`/admin/pricing/margin?${atTheCall}`)) as Json).items.reduce(
+    (n: number, i: Json) => n + (i.rows as number),
+    0,
+  );
+  expect(rowsAtTheCall, "a bound equal to the last call's occurred_at excludes that call").toBeLessThan(2);
   await expect
     .poll(
       async () => {
