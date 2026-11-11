@@ -60,7 +60,10 @@
   --radius-xl: calc(var(--radius) + 4px);
   --shadow-xs: var(--shadow-xs);
   --shadow-sm: var(--shadow-sm);
+  --shadow-card: var(--shadow-card);
   --shadow-float: var(--shadow-float);
+  --shadow-btn: var(--shadow-btn);
+  --radius-2xl: 1rem;
 }
 
 @layer base {

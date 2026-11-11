@@ -53,7 +53,15 @@ html {
 body {
   margin: 0;
   min-height: 100vh;
-  background: var(--background);
+  /* Two soft washes over the page colour, fixed so they light the screen
+     rather than the document: indigo from the upper left, the brand's yellow
+     from the upper right, both far too faint to read as colour. */
+  background-color: var(--background);
+  background-image:
+    radial-gradient(1100px 620px at 6% -12%, var(--wash-1), transparent 68%),
+    radial-gradient(900px 520px at 96% -18%, var(--wash-2), transparent 62%);
+  background-attachment: fixed;
+  background-repeat: no-repeat;
   color: var(--foreground);
   font-family: var(--font-sans);
   font-size: 14px;

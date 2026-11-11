@@ -90,10 +90,13 @@ export function RouteNav<Id extends string>({
                 type="button"
                 role="tab"
                 className={cn(
-                  "route-stop group relative flex w-full items-center gap-3 rounded-md px-3 text-left text-sm transition-colors",
-                  "h-9 text-text-2 hover:bg-sidebar-accent/70 hover:text-foreground",
-                  "aria-selected:bg-sidebar-accent aria-selected:font-medium aria-selected:text-foreground",
-                  "max-lg:h-auto max-lg:min-w-16 max-lg:flex-col max-lg:gap-1 max-lg:px-2 max-lg:py-1.5 max-lg:text-[11px] max-lg:text-muted-foreground max-lg:aria-selected:bg-sidebar-accent max-lg:aria-selected:text-foreground",
+                  // The open section is the one tinted row in the rail: a soft
+                  // indigo fill with the glyph and label in the accent, so it
+                  // reads on a rail that is otherwise almost white.
+                  "route-stop group relative flex w-full items-center gap-3 rounded-[10px] px-3 text-left text-sm transition-[color,background-color] duration-150",
+                  "h-9 text-text-2 hover:bg-sidebar-accent/60 hover:text-foreground",
+                  "aria-selected:bg-accent aria-selected:font-medium aria-selected:text-accent-foreground",
+                  "max-lg:h-auto max-lg:min-w-16 max-lg:flex-col max-lg:gap-1 max-lg:rounded-lg max-lg:px-2 max-lg:py-1.5 max-lg:text-[11px] max-lg:text-muted-foreground max-lg:aria-selected:bg-transparent max-lg:aria-selected:text-foreground max-lg:aria-selected:shadow-none",
                 )}
                 id={`stop-${t.id}`}
                 data-tab={t.id}
@@ -108,8 +111,8 @@ export function RouteNav<Id extends string>({
                   <Glyph
                     aria-hidden
                     className={cn(
-                      "size-4 shrink-0 text-muted-foreground group-hover:text-foreground",
-                      selected && "text-foreground",
+                      "size-4 shrink-0 text-muted-foreground transition-colors group-hover:text-text-2",
+                      selected && "text-primary group-hover:text-primary",
                       "max-lg:size-5",
                     )}
                   />

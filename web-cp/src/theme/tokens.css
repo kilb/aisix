@@ -2,11 +2,14 @@
    portal (web-tenant). Both apps carry a byte-equal copy of this file; a
    unit test in each pins the two together, so change them together.
 
-   The language (2026-11-11 rebuild, owner's choice): shadcn/ui on Tailwind,
-   in the manner of Vercel's dashboard on a light page. Near-black text and
-   primary actions, a quiet grey scale, 1px borders, small radii, one blue
-   for links and focus, and colour reserved for state. Routio's Signal
-   yellow survives in the brand mark only.
+   The language (2026-11-11, second pass): shadcn/ui on Tailwind, bright and
+   softly lit rather than grey. A cool lavender-white page carries a faint
+   aurora wash (indigo from the left, Routio's Signal yellow from the right);
+   cards are pure white, generously rounded (16px) and lifted by layered
+   shadows tinted with the accent's own hue, never black. The primary is a
+   vivid indigo, the one saturated colour in the interface besides state, and
+   the brand mark's tile takes that indigo so light yellow reads as a glint on
+   it.
 
    The first block uses shadcn's variable names (the Tailwind theme in each
    app's index.css maps them to utilities). The second keeps the role names
@@ -21,51 +24,58 @@
   color-scheme: light;
 
   /* ── shadcn variables ─────────────────────────────────────── */
-  --background: #FAFAFA;
-  --foreground: #171717;
+  --background: #F5F6FC;
+  --foreground: #151824;
   --card: #FFFFFF;
-  --card-foreground: #171717;
+  --card-foreground: #151824;
   --popover: #FFFFFF;
-  --popover-foreground: #171717;
-  --primary: #171717;
+  --popover-foreground: #151824;
+  --primary: #4F46E5;
   --primary-foreground: #FFFFFF;
-  --secondary: #F2F2F2;
-  --secondary-foreground: #171717;
-  --muted: #F5F5F5;
-  --muted-foreground: #666666;
-  --accent: #F2F2F2;
-  --accent-foreground: #171717;
-  --destructive: #CB2A2F;
+  --secondary: #EEEFF9;
+  --secondary-foreground: #151824;
+  --muted: #F1F2FA;
+  --muted-foreground: #5B6178;
+  --accent: #EEF0FE;
+  --accent-foreground: #3B34C9;
+  --destructive: #CB2A3C;
   --destructive-foreground: #FFFFFF;
-  /* Borders between surfaces; a field's edge needs 3:1 (WCAG 1.4.11), so
-     inputs take --input. */
-  --border: #EBEBEB;
-  --input: #8F8F8F;
-  --ring: #0068D6;
-  --radius: 0.5rem;
-  --sidebar: #FAFAFA;
-  --sidebar-foreground: #171717;
-  --sidebar-accent: #EBEBEB;
-  --sidebar-border: #EBEBEB;
+  /* Hairlines between surfaces are tinted, not grey, and stay just under the
+     point where they would read as a rule. A field's edge needs 3:1 (WCAG
+     1.4.11), so inputs take --input. */
+  --border: #E7E9F4;
+  --input: #838AA0;
+  --ring: #635BFF;
+  --radius: 0.75rem;
+  --sidebar: #FCFCFF;
+  --sidebar-foreground: #151824;
+  --sidebar-accent: #EEF0FE;
+  --sidebar-border: #ECEEF6;
 
-  /* State colours: text-safe on white and on the page (4.5:1). */
-  --info: #0068D6;
-  --success: #1A7F37;
-  --warning: #A35200;
-  --danger: #CB2A2F;
+  /* State colours: text-safe on white, on the page and on a hovered row
+     (4.5:1). */
+  --info: #2563EB;
+  --success: #0E7C48;
+  --warning: #96540A;
+  --danger: #CB2A3C;
   /* Their quiet fills, for badges and notes. */
-  --info-soft: #EBF4FF;
-  --success-soft: #E9F7EC;
-  --warning-soft: #FFF4E0;
-  --danger-soft: #FDECEC;
+  --info-soft: #EDF1FE;
+  --success-soft: #E6F6EC;
+  --warning-soft: #FFF3E1;
+  --danger-soft: #FDECEE;
 
-  /* Routio's mark. */
+  /* Routio's mark: yellow is a glint on an indigo tile, never a fill. */
   --brand: #FFC72C;
-  --brand-ink: #171717;
+  --brand-ink: #151824;
+
+  /* The page's aurora wash, drawn as two very low alphas over the canvas by
+     theme/base.css. Never a flat gradient: it should read as light. */
+  --wash-1: rgba(99, 91, 255, 0.1);
+  --wash-2: rgba(255, 199, 44, 0.14);
 
   /* Provider groups: a short bar beside the name, by name hash. */
-  --route-1: #0068D6;
-  --route-2: #1A7F37;
+  --route-1: #4F46E5;
+  --route-2: #0E7C48;
   --route-3: #C2410C;
   --route-4: #7C3AED;
   --route-5: #0E7490;
@@ -77,35 +87,38 @@
   --surface-raised: var(--popover);
   --well: var(--muted);
   --text: var(--foreground);
-  --text-2: #4D4D4D;
+  --text-2: #454B60;
   --text-muted: var(--muted-foreground);
-  --divider: #F2F2F2;
+  --divider: #F0F1F9;
   --input-border: var(--input);
-  --input-border-hover: #666666;
+  --input-border-hover: #5B6178;
   --box-border: var(--input);
   --focus: var(--ring);
-  --focus-halo: rgba(0, 104, 214, 0.18);
+  --focus-halo: rgba(99, 91, 255, 0.2);
   --link: var(--info);
   --error: var(--danger);
-  --hover: rgba(0, 0, 0, 0.04);
-  --press: rgba(0, 0, 0, 0.07);
-  --row-hover: #FAFAFA;
-  --chip: #F2F2F2;
-  --skeleton: #EDEDED;
-  --scrollbar: rgba(0, 0, 0, 0.22);
-  --scroll-shadow: rgba(0, 0, 0, 0.1);
-  --selection: rgba(0, 104, 214, 0.18);
-  --tooltip-bg: #171717;
+  --hover: rgba(21, 24, 36, 0.045);
+  --press: rgba(21, 24, 36, 0.075);
+  --row-hover: #F8F9FE;
+  --chip: #F1F2FA;
+  --skeleton: #EDEFF7;
+  --scrollbar: rgba(21, 24, 36, 0.2);
+  --scroll-shadow: rgba(20, 24, 60, 0.1);
+  --selection: rgba(99, 91, 255, 0.16);
+  --tooltip-bg: #151824;
   --tooltip-text: #FFFFFF;
   --route-line: var(--foreground);
   --lamp-applied: var(--success);
   --lamp-progress: var(--info);
   --lamp-pending: var(--muted-foreground);
   --lamp-rejected: var(--danger);
-  --lamp-disabled: #A1A1A1;
-  --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.04);
-  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.04), 0 1px 3px rgba(0, 0, 0, 0.04);
-  --shadow-float: 0 0 0 1px rgba(0, 0, 0, 0.06), 0 8px 24px -6px rgba(0, 0, 0, 0.14);
+  --lamp-disabled: #A6ABC0;
+  /* Shadows carry the accent's hue: a card should sit in its own light. */
+  --shadow-xs: 0 1px 2px rgba(20, 24, 60, 0.05);
+  --shadow-sm: 0 1px 2px rgba(20, 24, 60, 0.05), 0 2px 6px -2px rgba(20, 24, 60, 0.06);
+  --shadow-card: 0 1px 2px rgba(20, 24, 60, 0.04), 0 12px 28px -20px rgba(20, 24, 60, 0.22);
+  --shadow-float: 0 0 0 1px rgba(20, 24, 60, 0.06), 0 14px 36px -12px rgba(20, 24, 60, 0.2);
+  --shadow-btn: 0 1px 2px rgba(79, 70, 229, 0.3), 0 6px 16px -8px rgba(79, 70, 229, 0.5);
 
   /* ── The earlier scale, for the pages' own stylesheets ─────── */
   --ink: var(--foreground);
@@ -115,8 +128,7 @@
   --line-press: var(--info);
   --proceed: var(--success);
   --stop: var(--danger);
-  /* What the earlier language drew in Signal yellow (a selected row's edge,
-     a chosen option) is near-black here, as Vercel marks a selection. */
+  /* A selected row's edge and a chosen option take the primary. */
   --sign: var(--primary);
   --sign-hover: var(--primary);
   --sign-press: var(--primary);
@@ -125,16 +137,16 @@
   --stop-fill-hover: var(--destructive);
   --stop-fill-press: var(--destructive);
   --on-stop: var(--destructive-foreground);
-  --n1: #4D4D4D;
-  --n2: #666666;
-  --n3: #A1A1A1;
-  --n4: #EBEBEB;
+  --n1: #454B60;
+  --n2: #5B6178;
+  --n3: #A6ABC0;
+  --n4: #E7E9F4;
   --hairline: var(--border);
   --hairline-inner: var(--divider);
   --control-border: var(--border);
   --shadow-raise: var(--shadow-xs);
-  --inset: inset 0 1px 1px rgba(0, 0, 0, 0.08);
-  --mark-tile: #171717;
+  --inset: inset 0 1px 1px rgba(20, 24, 60, 0.08);
+  --mark-tile: #4F46E5;
   --wide: 100%;
   --s-1: 4px;
   --s-2: 8px;
@@ -156,13 +168,13 @@
   --lh-body: 1.6;
   --lh-table: 1.4;
   --lh-heading: 1.3;
-  --tracking-heading: -0.015em;
-  --r-input: 6px;
-  --r-card: 8px;
-  --r-button: 6px;
+  --tracking-heading: -0.02em;
+  --r-input: 10px;
+  --r-card: 16px;
+  --r-button: 10px;
   --r-chip: 9999px;
-  --r-panel: 12px;
-  --r-rail: 12px;
+  --r-panel: 18px;
+  --r-rail: 16px;
   --r-round: 9999px;
   --h-control: 36px;
   --h-control-sm: 32px;
@@ -185,68 +197,74 @@
 :root[data-theme="dark"] {
   color-scheme: dark;
 
-  --background: #0A0A0A;
-  --foreground: #EDEDED;
-  --card: #111111;
-  --card-foreground: #EDEDED;
-  --popover: #161616;
-  --popover-foreground: #EDEDED;
-  --primary: #EDEDED;
-  --primary-foreground: #0A0A0A;
-  --secondary: #1F1F1F;
-  --secondary-foreground: #EDEDED;
-  --muted: #1A1A1A;
-  --muted-foreground: #A1A1A1;
-  --accent: #1F1F1F;
-  --accent-foreground: #EDEDED;
-  --destructive: #D02B31;
-  --destructive-foreground: #FFFFFF;
-  --border: #262626;
-  --input: #6B6B6B;
-  --ring: #52A8FF;
-  --sidebar: #0A0A0A;
-  --sidebar-foreground: #EDEDED;
-  --sidebar-accent: #1F1F1F;
-  --sidebar-border: #262626;
+  --background: #0C0D16;
+  --foreground: #ECEFFA;
+  --card: #14161F;
+  --card-foreground: #ECEFFA;
+  --popover: #191C27;
+  --popover-foreground: #ECEFFA;
+  --primary: #8E8AFF;
+  --primary-foreground: #0C0D16;
+  --secondary: #1C1F2B;
+  --secondary-foreground: #ECEFFA;
+  --muted: #1A1D28;
+  --muted-foreground: #A6ABC0;
+  --accent: #1E2130;
+  --accent-foreground: #C9C6FF;
+  --destructive: #E5485C;
+  --destructive-foreground: #0C0D16;
+  --border: #242735;
+  --input: #6E7488;
+  --ring: #9A96FF;
+  --sidebar: #10121B;
+  --sidebar-foreground: #ECEFFA;
+  --sidebar-accent: #1E2130;
+  --sidebar-border: #212431;
 
-  --info: #52A8FF;
-  --success: #3FB950;
-  --warning: #F0A030;
-  --danger: #FF6166;
-  --info-soft: #0F1E33;
-  --success-soft: #0F2416;
-  --warning-soft: #2A1C08;
-  --danger-soft: #2E1112;
+  --info: #7EA6FF;
+  --success: #4CD08B;
+  --warning: #F0AB4A;
+  --danger: #FF7A86;
+  --info-soft: #131E33;
+  --success-soft: #102418;
+  --warning-soft: #2A1D08;
+  --danger-soft: #2E1217;
 
-  --route-1: #52A8FF;
-  --route-2: #3FB950;
+  --wash-1: rgba(99, 91, 255, 0.16);
+  --wash-2: rgba(255, 199, 44, 0.06);
+
+  --route-1: #8E8AFF;
+  --route-2: #4CD08B;
   --route-3: #EE7B45;
   --route-4: #A385F7;
   --route-5: #2DB0CC;
   --route-6: #DE9134;
 
-  --text-2: #C7C7C7;
-  --divider: #1C1C1C;
-  --input-border-hover: #A1A1A1;
-  --focus-halo: rgba(82, 168, 255, 0.25);
+  --text-2: #C8CCDC;
+  --divider: #1C1F2A;
+  --input-border-hover: #A6ABC0;
+  --focus-halo: rgba(154, 150, 255, 0.28);
   --hover: rgba(255, 255, 255, 0.05);
   --press: rgba(255, 255, 255, 0.09);
-  --row-hover: #161616;
-  --chip: #1F1F1F;
-  --skeleton: #1F1F1F;
+  --row-hover: #191C26;
+  --chip: #1E2130;
+  --skeleton: #1E2130;
   --scrollbar: rgba(255, 255, 255, 0.2);
   --scroll-shadow: rgba(0, 0, 0, 0.5);
-  --selection: rgba(82, 168, 255, 0.3);
-  --tooltip-bg: #EDEDED;
-  --tooltip-text: #0A0A0A;
-  --lamp-disabled: #6B6B6B;
-  --shadow-xs: 0 0 0 1px rgba(255, 255, 255, 0.04);
-  --shadow-sm: 0 0 0 1px rgba(255, 255, 255, 0.05);
-  --shadow-float: 0 0 0 1px rgba(255, 255, 255, 0.1), 0 12px 32px -8px rgba(0, 0, 0, 0.7);
-  --n1: #C7C7C7;
-  --n2: #A1A1A1;
-  --n3: #6B6B6B;
-  --n4: #262626;
+  --selection: rgba(142, 138, 255, 0.3);
+  --tooltip-bg: #ECEFFA;
+  --tooltip-text: #0C0D16;
+  --lamp-disabled: #6E7488;
+  --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4), 0 2px 6px -2px rgba(0, 0, 0, 0.5);
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.4), 0 12px 28px -20px rgba(0, 0, 0, 0.8);
+  --shadow-float: 0 0 0 1px rgba(255, 255, 255, 0.09), 0 16px 40px -12px rgba(0, 0, 0, 0.8);
+  --shadow-btn: 0 1px 2px rgba(0, 0, 0, 0.5), 0 6px 16px -8px rgba(142, 138, 255, 0.4);
+  --n1: #C8CCDC;
+  --n2: #A6ABC0;
+  --n3: #6E7488;
+  --n4: #242735;
   --inset: inset 0 1px 1px rgba(0, 0, 0, 0.4);
-  --mark-tile: #262626;
+  --mark-tile: #8E8AFF;
+  --brand-ink: #0C0D16;
 }

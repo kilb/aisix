@@ -317,7 +317,7 @@ export function LibrarySync({ canEdit, generation }: { canEdit: boolean; generat
         <>
           <div className="library-counts grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6" aria-label="同步概况">
             {counts.map(([label, state]) => (
-              <div key={state} className="rounded-lg border border-border bg-muted/40 px-3 py-2">
+              <div key={state} className="rounded-xl border border-border bg-muted/50 px-3 py-2">
                 <div className="text-xs text-muted-foreground">{label}</div>
                 <div className="text-lg font-semibold tabular-nums">{count(state)}</div>
               </div>
@@ -325,7 +325,7 @@ export function LibrarySync({ canEdit, generation }: { canEdit: boolean; generat
           </div>
           {canEdit && (
             <div
-              className="library-confirm mt-4 mb-0 flex flex-wrap items-center gap-x-4 gap-y-2 rounded-lg border border-border bg-muted/40 px-4 py-3"
+              className="library-confirm mt-4 mb-0 flex flex-wrap items-center gap-x-4 gap-y-2 rounded-xl border border-border bg-muted/50 px-4 py-3"
               role="group"
               aria-label="确认同步"
             >
@@ -539,7 +539,7 @@ export function LibrarySyncOne({
           {item.state === "ambiguous" && !chosen && <p className="hint">价格库中有多个候选条目：请选择价格来源。</p>}
           {item.state === "unmatched" && <p className="hint">价格库中没有与模型名称对应的条目。</p>}
           {entry && item.state !== "flagged" && (
-            <p className="library-card-block rounded-lg border border-border bg-muted/40 p-3 text-[13px]">
+            <p className="library-card-block rounded-xl border border-border bg-muted/50 p-3 text-[13px]">
               价格库价格（美元/百万 tokens）：
               <CardLines card={entry.card} />
             </p>

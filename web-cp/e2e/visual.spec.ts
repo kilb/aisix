@@ -99,8 +99,8 @@ const PAGES: [string, string][] = [
 ];
 
 /** The light page background (Canvas) and the dark page background. */
-const LIGHT_BG = "rgb(250, 250, 250)";
-const DARK_BG = "rgb(10, 10, 10)";
+const LIGHT_BG = "rgb(245, 246, 252)";
+const DARK_BG = "rgb(12, 13, 22)";
 
 const PHONE = { width: 360, height: 780 };
 

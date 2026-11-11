@@ -318,8 +318,8 @@ function Reading({ label, value, foot, inset = false }: { label: string; value: 
     <div
       className={
         inset
-          ? "entry flex flex-col rounded-lg border border-border bg-muted/50 p-4"
-          : "entry flex flex-col rounded-xl border border-border bg-card p-5 shadow-xs"
+          ? "entry flex flex-col rounded-xl border border-border bg-muted/50 p-4"
+          : "entry flex flex-col rounded-2xl border border-border bg-card p-5 shadow-card"
       }
     >
       <span className="lab">{label}</span>

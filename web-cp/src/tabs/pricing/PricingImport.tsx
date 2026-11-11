@@ -351,7 +351,7 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
 
                 {canEdit && (proposals ?? []).some(bulkable) && (
                   <div
-                    className="import-bulk mt-4 mb-0 flex flex-wrap items-center gap-x-4 gap-y-2 rounded-lg border border-border bg-muted/40 px-4 py-3"
+                    className="import-bulk mt-4 mb-0 flex flex-wrap items-center gap-x-4 gap-y-2 rounded-xl border border-border bg-muted/50 px-4 py-3"
                     role="group"
                     aria-label="批量确认"
                   >

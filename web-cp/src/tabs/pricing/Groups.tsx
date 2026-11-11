@@ -337,7 +337,7 @@ function EditGroup({
   return (
     <div
       ref={form}
-      className="whitespace-normal rounded-lg border border-border bg-muted/40 p-4"
+      className="whitespace-normal rounded-xl border border-border bg-muted/50 p-4"
       role="group"
       aria-label="编辑分组"
     >

@@ -39,7 +39,7 @@ const TOPUPS_SHOWN = 500;
 /** One figure of the balance: its label over the amount, a tile of the card's grid. */
 function Reading({ label, value }: { label: string; value: ReactNode }) {
   return (
-    <div className="entry flex min-w-0 flex-col gap-1.5 rounded-lg border border-border bg-muted/50 px-4 py-3.5">
+    <div className="entry flex min-w-0 flex-col gap-1.5 rounded-xl border border-border bg-muted/50 px-4 py-3.5">
       <span className="lab">{label}</span>
       <span className="val text-2xl tracking-tight max-sm:text-xl">{value}</span>
     </div>

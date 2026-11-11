@@ -151,7 +151,7 @@ function Discounts({ tenantId, plan, canEdit, onSaved }: { tenantId: string; pla
     <Card className="mb-0" role="region" aria-label="折扣">
       <CardHeader title="折扣" />
       <div className="grid gap-4 sm:grid-cols-2">
-        <div className="rounded-lg border border-border bg-muted/50 p-4">
+        <div className="rounded-xl border border-border bg-muted/50 p-4">
           <div className="text-[13px] font-medium text-muted-foreground">现行折扣</div>
           <div className="mt-2 text-2xl font-semibold tracking-tight tabular-nums">
             <strong data-testid="current-discount" className="font-semibold">
@@ -160,7 +160,7 @@ function Discounts({ tenantId, plan, canEdit, onSaved }: { tenantId: string; pla
           </div>
           {current && <div className="hint mt-1 text-[13px] tabular">自 {fmtUtc(current.effective_from)} 起</div>}
         </div>
-        <div className="rounded-lg border border-border bg-muted/50 p-4">
+        <div className="rounded-xl border border-border bg-muted/50 p-4">
           <div className="text-[13px] font-medium text-muted-foreground">即将生效</div>
           {upcoming.length > 0 ? (
             <ul className="mt-2 space-y-1 tabular" aria-label="即将生效的折扣">

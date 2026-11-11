@@ -67,7 +67,7 @@ export function Gate({
         </div>
 
         <form
-          className="gate-form panel m-0 grid gap-0 rounded-xl p-6 shadow-sm sm:p-8"
+          className="gate-form panel m-0 grid gap-0 rounded-2xl p-6 sm:p-8"
           onSubmit={submit}
         >
           {notice && (

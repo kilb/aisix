@@ -7,8 +7,9 @@ import { cn } from "../lib/cn";
  *
  * - PageHeader: the title, a one-paragraph description and the page's
  *   actions on the right.
- * - Card: a white card with a 1px border (keeps the `panel` class the
- *   specs and the older stylesheets know). CardHeader puts a title,
+ * - Card: a white card, generously rounded and lit by a tinted shadow,
+ *   behind a 1px hairline (keeps the `panel` class the specs and the older
+ *   stylesheets know). CardHeader puts a title,
  *   description and actions on one row; a DataTable straight inside a Card
  *   runs edge to edge.
  * - Split: the main column and an aside beside it from 1280px (a create
@@ -118,10 +119,10 @@ export function Stat({
   className?: string;
 }) {
   return (
-    <div className={cn("rounded-xl border border-border bg-card p-5 shadow-xs", className)}>
+    <div className={cn("rounded-2xl border border-border bg-card p-5 shadow-card", className)}>
       <div className="text-[13px] font-medium text-muted-foreground">{label}</div>
-      <div className="mt-2 text-3xl font-semibold tracking-tight tabular-nums">{value}</div>
-      {foot && <div className="mt-1.5 text-[13px] text-muted-foreground">{foot}</div>}
+      <div className="mt-2 text-[28px] leading-none font-semibold tracking-tight tabular-nums">{value}</div>
+      {foot && <div className="mt-2 text-[13px] text-muted-foreground">{foot}</div>}
     </div>
   );
 }

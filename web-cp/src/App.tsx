@@ -376,7 +376,7 @@ export function App() {
       {/* The sidebar from 1024px. Below it the aside's box goes away: the
           brand and the operator move to the top bar's row, and the sections
           become the bar along the bottom (RouteNav). */}
-      <aside className="rail flex w-60 shrink-0 flex-col border-r border-sidebar-border bg-sidebar max-lg:contents lg:sticky lg:top-0 lg:h-screen">
+      <aside className="rail flex w-60 shrink-0 flex-col border-r border-sidebar-border bg-sidebar/80 backdrop-blur-xl max-lg:contents lg:sticky lg:top-0 lg:h-screen">
         <div className="brand flex h-14 shrink-0 items-center gap-2.5 px-4 max-lg:hidden">
           <span className="brand-mark" aria-hidden="true" />
           <h1 className="display text-[15px] font-semibold tracking-tight">Routio 运维台</h1>
@@ -402,7 +402,7 @@ export function App() {
       </aside>
 
       <div className="shell-main min-w-0 flex-1">
-        <header className="topbar sticky top-0 z-30 flex h-14 items-center gap-3 border-b border-border bg-background/85 px-4 backdrop-blur sm:px-6 lg:px-8">
+        <header className="topbar sticky top-0 z-30 flex h-14 items-center gap-3 border-b border-border/70 bg-background/70 px-4 backdrop-blur-xl sm:px-6 lg:px-8">
           <span className="brand-mark lg:hidden" aria-hidden="true" />
           <nav aria-label="位置" className="flex min-w-0 items-center gap-1.5 text-sm">
             <span className="text-muted-foreground max-sm:hidden">运维台</span>
@@ -413,7 +413,7 @@ export function App() {
           </nav>
           <div className="ctx ml-auto flex min-w-0 items-center gap-2">
             {shell.env && (
-              <span className="hidden items-center gap-2 rounded-md border border-border bg-card px-2.5 py-1 text-xs text-muted-foreground xl:inline-flex">
+              <span className="hidden items-center gap-2 rounded-full border border-border bg-card/80 px-3 py-1 text-xs text-muted-foreground xl:inline-flex">
                 <span>
                   环境 <code className="text-foreground">{shell.env.env_id}</code>
                 </span>
@@ -422,7 +422,7 @@ export function App() {
               </span>
             )}
             {fleet && shell.summary && (
-              <span className="fleet inline-flex items-center gap-2 rounded-md border border-border bg-card px-2.5 py-1 text-xs">
+              <span className="fleet inline-flex items-center gap-2 rounded-full border border-border bg-card/80 px-3 py-1 text-xs">
                 <Lamp state={fleet.state} title="配置下发状态">
                   {fleet.text}
                 </Lamp>

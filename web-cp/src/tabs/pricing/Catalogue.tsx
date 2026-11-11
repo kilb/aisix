@@ -111,7 +111,7 @@ export function Catalogue(_props: TabProps) {
                     {expanded && (
                       <tr className="dt-detail">
                         <td colSpan={6} className="whitespace-normal">
-                          <div className="grid gap-6 rounded-lg border border-border bg-muted/40 p-4 lg:grid-cols-[minmax(0,2fr)_minmax(0,3fr)]">
+                          <div className="grid gap-6 rounded-xl border border-border bg-muted/50 p-4 lg:grid-cols-[minmax(0,2fr)_minmax(0,3fr)]">
                             <div className="min-w-0">
                               <p className="library-card-block">
                                 价格（美元/百万 tokens）：

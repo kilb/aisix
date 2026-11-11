@@ -269,7 +269,7 @@ export function Topups({ canEdit, refreshShell }: TabProps) {
                   <tr key={`${t.id}-reject`} className="dt-detail">
                     <td colSpan={8}>
                       <form
-                        className="mt-1 grid max-w-3xl items-start gap-x-3 rounded-lg border border-border bg-muted/40 p-4 whitespace-normal sm:grid-cols-[minmax(0,1fr)_auto]"
+                        className="mt-1 grid max-w-3xl items-start gap-x-3 rounded-xl border border-border bg-muted/50 p-4 whitespace-normal sm:grid-cols-[minmax(0,1fr)_auto]"
                         ref={form}
                         aria-label={`驳回 ${t.tenant_name} 的充值申请`}
                         onSubmit={(e) => {

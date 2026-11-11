@@ -519,7 +519,7 @@ function BaselinePanel({
       <section className={canEdit ? "mt-6 border-t border-border pt-6" : "mt-5"} aria-label="现行基准价">
         <h3 className="mb-3 text-base">现行与待生效</h3>
         {row.current ? (
-          <div className="rounded-lg border border-border bg-muted/40 p-4">
+          <div className="rounded-xl border border-border bg-muted/50 p-4">
             <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
               <div className="baseline-rates money tabular-nums">
                 {head ? (

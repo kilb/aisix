@@ -4,25 +4,30 @@
    Imported into the `legacy` layer (index.css), so a utility on an element
    overrides anything here. */
 
-/* Routio's mark: a near-black tile holding a short yellow capsule. */
+/* Routio's mark: a rounded indigo tile holding a short yellow capsule, lit
+   from above so it reads as a solid rather than a shape. */
 .brand-mark {
   position: relative;
   flex: none;
-  width: 28px;
-  height: 28px;
-  border-radius: 8px;
-  background: var(--mark-tile);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12);
+  width: 30px;
+  height: 30px;
+  border-radius: 10px;
+  background: linear-gradient(160deg, color-mix(in srgb, var(--mark-tile) 84%, white) 0%, var(--mark-tile) 62%);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.32),
+    inset 0 -1px 2px rgba(0, 0, 0, 0.16),
+    0 4px 10px -4px color-mix(in srgb, var(--mark-tile) 60%, transparent);
 }
 .brand-mark::after {
   content: "";
   position: absolute;
   left: 7px;
   right: 7px;
-  top: 11px;
+  top: 12px;
   height: 6px;
   border-radius: 9999px;
   background: var(--brand);
+  box-shadow: 0 0 8px rgba(255, 199, 44, 0.55);
 }
 
 /* ── A page's panels: the heading carries its actions ────────── */
@@ -563,7 +568,7 @@ td select {
   bottom: -1px;
   height: 2px;
   border-radius: 2px;
-  background: var(--foreground);
+  background: var(--primary);
 }
 .sections-switch > button:focus-visible {
   outline-offset: -2px;

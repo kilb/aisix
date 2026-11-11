@@ -306,7 +306,7 @@ function IssueForm({ onIssued, onCancel }: { onIssued: (b: IssuedCredential) => 
   const listed = details.filter((d) => !ISSUE_FIELDS.includes(d.path));
 
   return (
-    <form ref={form} onSubmit={submit} className="mt-2 rounded-lg border border-border bg-muted/40 p-4">
+    <form ref={form} onSubmit={submit} className="mt-2 rounded-xl border border-border bg-muted/50 p-4">
       <h3 className="mb-3 text-sm font-semibold">签发网关凭据</h3>
       <div className="grid gap-x-4 sm:grid-cols-2 xl:grid-cols-1">
         <Field label="名称" error={at("/name")}>

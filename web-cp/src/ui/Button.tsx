@@ -42,12 +42,14 @@ export interface ButtonProps extends ComponentProps<"button"> {
 
 /** shadcn/ui's button, in this app's four kinds and two sizes. */
 const buttonClass = cva(
-  "btn relative inline-flex shrink-0 cursor-pointer select-none items-center justify-center gap-2 whitespace-nowrap rounded-md text-sm font-medium leading-4 transition-[color,background-color,border-color,box-shadow,opacity] duration-150 disabled:cursor-not-allowed disabled:opacity-50 aria-disabled:cursor-not-allowed aria-disabled:opacity-50 [&_svg]:size-4 [&_svg]:shrink-0",
+  "btn relative inline-flex shrink-0 cursor-pointer select-none items-center justify-center gap-2 whitespace-nowrap rounded-[10px] text-sm font-medium leading-4 transition-[color,background-color,border-color,box-shadow,transform,opacity] duration-150 enabled:active:translate-y-px disabled:cursor-not-allowed disabled:opacity-50 aria-disabled:cursor-not-allowed aria-disabled:opacity-50 [&_svg]:size-4 [&_svg]:shrink-0",
   {
     variants: {
       kind: {
-        primary: "bg-primary text-primary-foreground shadow-xs enabled:hover:bg-primary/88",
-        secondary: "border border-border bg-card text-foreground shadow-xs enabled:hover:bg-accent",
+        // A filled action sits in its own coloured light; the outlined one is
+        // a white chip lifted a step off the page.
+        primary: "bg-primary text-primary-foreground shadow-btn enabled:hover:bg-primary/92",
+        secondary: "border border-border bg-card text-foreground shadow-sm enabled:hover:border-(--input) enabled:hover:bg-accent",
         danger: "bg-destructive text-destructive-foreground shadow-xs enabled:hover:bg-destructive/90",
         quiet: "text-text-2 enabled:hover:bg-accent enabled:hover:text-foreground",
       },

@@ -192,7 +192,7 @@ export function Charges(_props: TabProps) {
           </div>
         </form>
         {linked.length > 0 && (
-          <div className="mt-3 flex flex-wrap items-center gap-3 rounded-lg border border-border bg-muted/50 px-3 py-2" role="status">
+          <div className="mt-3 flex flex-wrap items-center gap-3 rounded-xl border border-border bg-muted/50 px-3 py-2" role="status">
             <span className="hint">只看 {linked.join("，")}（不限分组/档位与时间，也含已通过重计价更正的调用，条数可能与计价状态的次数不同）</span>
             <Button type="button" size="sm" className="ml-auto" onClick={() => set({ error_code: undefined, model_id: undefined })}>
               清除
@@ -319,7 +319,7 @@ function ChargeCheck({ c }: { c: Charge }) {
   const reported = reportedCounters(c.usage);
   const recomputed = chargeFromLines(c.lines, c.cny_per_usd_e4, c.discount_bps);
   return (
-    <div className="grid gap-4 rounded-lg border border-border bg-muted/40 p-4 lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
+    <div className="grid gap-4 rounded-xl border border-border bg-muted/50 p-4 lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
       <section aria-label={`计费数量 ${c.event_id}`}>
         <h4 className="mb-2 text-[13px] font-semibold">计费数量</h4>
         {c.lines.length === 0 ? (
