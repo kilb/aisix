@@ -4555,3 +4555,127 @@ async fn a_diagnosed_grant_does_not_hold_back_the_repair_of_another() {
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0].2["unresolved"], json!([orphan]));
 }
+
+/// The document of model `id` through `write_resource`, as an older release
+/// wrote a direct document whose name did not follow its account.
+async fn replace_model_doc(cp: &TestCp, public: Uuid, id: Uuid, doc: Value) {
+    use aisix_control_plane::resources::write::{write_resource, ResourceWrite, WriteCtx, WriteOp};
+    let ctx = WriteCtx::of(cp.state());
+    cp.db()
+        .tx(move |conn| {
+            async move {
+                let owner = channels::owner(public);
+                write_resource(
+                    conn,
+                    &ctx,
+                    ResourceWrite {
+                        kind: Kind::Models,
+                        id,
+                        op: WriteOp::Replace(&doc),
+                        expected_version: None,
+                        managed_by: Some(&owner),
+                    },
+                )
+                .await
+            }
+            .boxed()
+        })
+        .await
+        .expect("write the document");
+}
+
+/// The display name of live model `id`'s document.
+async fn display_name(cp: &TestCp, id: Uuid) -> String {
+    live(cp, Kind::Models, id).await["display_name"]
+        .as_str()
+        .expect("a display name")
+        .to_string()
+}
+
+/// Two live direct documents of one public model whose names an older
+/// release left swapped: account x's document carries the name account y's
+/// should, and y's carries x's. A regeneration that wrote y's document first
+/// would take a name x's still holds and the unique index would roll the
+/// edit back with a 23505. The regeneration must write the document that
+/// gives the name up first, whatever order the channel rows are in, and both
+/// documents end on the names their accounts give them.
+#[tokio::test]
+async fn a_regeneration_orders_a_name_chain_across_two_accounts() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let account_x = provider_key(&cp, &op, "acct-chain-x-4b7").await;
+    let account_y = provider_key(&cp, &op, "acct-chain-y-4b7").await;
+    let (public, _) = create_public(&cp, &op, "pub-chain-4b7").await;
+    for account in [account_x, account_y] {
+        let r = put_channel(&cp, &op, account, public, json!({})).await;
+        assert_eq!(r.status, 200, "{r:?}");
+    }
+    let x = direct_of(&cp, account_x, public).await;
+    let y = direct_of(&cp, account_y, public).await;
+    // Account x's document carries y's name, and y's carries x's: what an
+    // account rename left before the documents followed it. Reached the way
+    // the renames happened, one write at a time, since the unique index
+    // would refuse the swap written in any single-step order.
+    replace_model_doc(
+        &cp,
+        public,
+        x,
+        json!({
+            "display_name": "pub-chain-4b7#temp-4b7",
+            "provider": "openai",
+            "model_name": "pub-chain-4b7",
+            "provider_key_id": account_x.to_string(),
+            "internal": true,
+        }),
+    )
+    .await;
+    replace_model_doc(
+        &cp,
+        public,
+        y,
+        json!({
+            "display_name": "pub-chain-4b7#acct-chain-x-4b7",
+            "provider": "openai",
+            "model_name": "pub-chain-4b7",
+            "provider_key_id": account_y.to_string(),
+            "internal": true,
+        }),
+    )
+    .await;
+    replace_model_doc(
+        &cp,
+        public,
+        x,
+        json!({
+            "display_name": "pub-chain-4b7#acct-chain-y-4b7",
+            "provider": "openai",
+            "model_name": "pub-chain-4b7",
+            "provider_key_id": account_x.to_string(),
+            "internal": true,
+        }),
+    )
+    .await;
+    replace_model_doc(
+        &cp,
+        public,
+        y,
+        json!({
+            "display_name": "pub-chain-4b7#acct-chain-x-4b7",
+            "provider": "openai",
+            "model_name": "pub-chain-4b7",
+            "provider_key_id": account_y.to_string(),
+            "internal": true,
+        }),
+    )
+    .await;
+    assert_eq!(display_name(&cp, x).await, "pub-chain-4b7#acct-chain-y-4b7");
+    assert_eq!(display_name(&cp, y).await, "pub-chain-4b7#acct-chain-x-4b7");
+
+    // A plain regeneration, through an edit that rewrites both documents.
+    let r = put_channel(&cp, &op, account_x, public, json!({"priority": 7})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(display_name(&cp, x).await, "pub-chain-4b7#acct-chain-x-4b7");
+    assert_eq!(display_name(&cp, y).await, "pub-chain-4b7#acct-chain-y-4b7");
+}
