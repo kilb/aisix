@@ -549,6 +549,11 @@ struct Cell {
     upstream_clock: UpstreamClock,
     /// See [`RequestAttribution::capture_stream_output`].
     stream_output: Option<aisix_obs::OutputCollector>,
+    /// 仅四个 typed SSE 响应启用，测量结果留给正常终态和取消终态共用。
+    first_token: Option<crate::first_token::Observer>,
+    /// 只在 outer body 的单次 poll 中为真，绝不跨 Pending 保留。
+    body_poll: bool,
+    pending_usage: Vec<crate::usage_attr::PendingUsage>,
     /// A `/v1/responses` result's finish reason, read off what the caller
     /// received: the streamed frames (armed by the telemetry middleware)
     /// or a buffered body ([`note_responses_result`]).
@@ -909,16 +914,55 @@ impl RequestAttribution {
         self.bodies.capturing_output.store(true, Ordering::Relaxed);
     }
 
+    pub(crate) fn observe_first_token(&self, wire: crate::first_token::Wire, started: Instant) {
+        let mut cell = self.lock();
+        // Host passthrough 的原始路径可以与 typed endpoint 完全相同。
+        if cell.cancel.surface == Some(crate::operation::PASSTHROUGH) {
+            return;
+        }
+        cell.first_token = Some(crate::first_token::Observer::new(wire, started));
+        self.bodies.capturing_output.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn begin_body_poll(&self) {
+        let mut cell = self.lock();
+        cell.body_poll = cell.first_token.is_some();
+    }
+
+    pub(crate) fn finish_body_poll(&self) {
+        let pending = {
+            let mut cell = self.lock();
+            cell.body_poll = false;
+            std::mem::take(&mut cell.pending_usage)
+        };
+        // 发布会读取 attribution；先关窗口并释放锁，避免递归锁和重复入队。
+        for delivery in pending {
+            delivery.deliver();
+        }
+    }
+
     pub(crate) fn observe_response_output(&self, data: &[u8]) {
         if !self.bodies.capturing_output.load(Ordering::Relaxed) {
             return;
         }
         let mut cell = self.lock();
+        if let Some(observer) = cell.first_token.as_mut() {
+            observer.feed(data);
+        }
         if let Some(collector) = cell.stream_output.as_mut() {
             collector.feed_sse(data);
         }
         if let Some(observer) = cell.responses_finish.as_mut() {
             observer.feed_sse(data);
+        }
+        if cell.stream_output.is_none()
+            && cell.responses_finish.is_none()
+            && !cell
+                .first_token
+                .as_ref()
+                .is_some_and(crate::first_token::Observer::observing)
+        {
+            self.bodies.capturing_output.store(false, Ordering::Relaxed);
         }
     }
 
@@ -1843,6 +1887,36 @@ fn record_e2e_upstream(note: impl FnOnce(&mut Cell)) {
 /// one. Called from the terminal-usage-event chokepoint.
 pub(crate) fn emit_deferred_access_log(event: &aisix_obs::UsageEvent) {
     let _ = CURRENT.try_with(|a| a.emit_deferred_access_log(event));
+}
+
+pub(crate) fn first_token_latency_ms() -> Option<u32> {
+    CURRENT
+        .try_with(|a| {
+            a.lock()
+                .first_token
+                .as_ref()
+                .and_then(crate::first_token::Observer::latency_ms)
+        })
+        .ok()
+        .flatten()
+}
+
+pub(crate) fn body_poll_in_progress() -> bool {
+    CURRENT.try_with(|a| a.lock().body_poll).unwrap_or(false)
+}
+
+pub(crate) fn defer_body_usage(delivery: crate::usage_attr::PendingUsage) {
+    let mut delivery = Some(delivery);
+    let _ = CURRENT.try_with(|a| {
+        let mut cell = a.lock();
+        if cell.body_poll {
+            cell.pending_usage.extend(delivery.take());
+        }
+    });
+    // 没有 request scope 的独立调用也必须发布，不能把所有权吞掉。
+    if let Some(delivery) = delivery {
+        delivery.deliver();
+    }
 }
 
 /// Note that a usage event has just left the emission chokepoint on this

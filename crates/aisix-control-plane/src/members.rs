@@ -1000,6 +1000,83 @@ fn invite_answer(state: &AppState, id: Uuid, token: &str, expires_at: DateTime<U
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct CreateAccountRequest {
+    email: String,
+    password: String,
+    role: MemberRole,
+    display_name: Option<String>,
+}
+
+/// `POST /api/members` → `201 Member`：仅当前组织的管理员可创建账号，
+/// 仅所有者可授予所有者角色，不修改请求者的会话。
+pub async fn create_account(
+    auth: MemberAuth,
+    State(state): State<AppState>,
+    ApiJson(req): ApiJson<CreateAccountRequest>,
+) -> Result<(StatusCode, Json<MemberView>), ApiError> {
+    auth.require_active()?;
+    auth.require(&[MemberRole::Owner, MemberRole::Admin])?;
+    if req.role == MemberRole::Owner && auth.role != MemberRole::Owner {
+        return Err(ApiError::forbidden());
+    }
+    let mut problems = Vec::new();
+    let email = normalize_email(&req.email);
+    if email.is_none() {
+        problems.push(detail("/email", "邮箱格式不正确"));
+    }
+    if !password::long_enough(&req.password) {
+        problems.push(password_too_short("/password"));
+    }
+    let name = display_name(req.display_name.as_deref()).unwrap_or_else(|d| {
+        problems.push(d);
+        None
+    });
+    let (Some(email), true) = (email, problems.is_empty()) else {
+        return Err(ApiError::validation(problems));
+    };
+    let hash = state.passwords.hash(&req.password).await?;
+    let ctx = WriteCtx::of(&state);
+    let member = state
+        .db
+        .tx(move |conn| {
+            async move {
+                // 在组织锁下重读权限，防止等待期间降级或停用后继续创建。
+                let auth =
+                    current(&mut *conn, &auth, &[MemberRole::Owner, MemberRole::Admin]).await?;
+                if req.role == MemberRole::Owner && auth.role != MemberRole::Owner {
+                    return Err(ApiError::forbidden());
+                }
+                let member = create(
+                    &mut *conn,
+                    &ctx,
+                    auth.tenant_id,
+                    &email,
+                    &hash,
+                    name.as_deref(),
+                    req.role,
+                )
+                .await?;
+                audit::record(
+                    conn,
+                    member_entry(
+                        member_actor(&auth),
+                        "member.create",
+                        auth.tenant_id,
+                        member.id,
+                        json!({ "role": member.role }),
+                    ),
+                )
+                .await?;
+                Ok::<_, ApiError>(member.view())
+            }
+            .boxed()
+        })
+        .await?;
+    Ok((StatusCode::CREATED, Json(member)))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InviteRequest {
     email: String,
     role: MemberRole,

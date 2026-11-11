@@ -294,7 +294,8 @@ async fn api_prices_names_no_routing_name_and_no_channel() {
             "input_per_million",
             "model_id",
             "name",
-            "output_per_million"
+            "output_per_million",
+            "prices_by_tier"
         ],
         "{x}"
     );
@@ -384,4 +385,444 @@ async fn a_retired_group_is_not_offered() {
     let r = prices(&p.w.cp, &owner(&p.w).await).await;
     assert_eq!(r.status, 200, "{r:?}");
     assert_eq!(r.body["groups"], json!([]), "{r:?}");
+}
+
+// 完整报价合同仅通过 HTTP JSON 验证；旧服务缺少字段时必须真实失败。
+fn quote_rate<'a>(rates: &'a Value, dimension: &str) -> &'a Value {
+    rates
+        .as_array()
+        .expect("rates must exist as an array")
+        .iter()
+        .find(|r| r["dimension"] == dimension)
+        .unwrap_or_else(|| panic!("missing dimension {dimension}: {rates}"))
+}
+
+fn all_rates(input: &str, output: &str) -> Value {
+    json!({"input": input, "output": output, "cache_read":"1", "cache_write":"5",
+        "cache_write_1h":"8", "reasoning":"9", "audio_input":"10", "audio_output":"11",
+        "image_input":"12", "image_output":"13", "web_search":"1000"})
+}
+
+#[tokio::test]
+async fn full_quote_preserves_every_dimension_tier_band_and_group_discount() {
+    let Some(p) = setup().await else { return };
+    let now = db_now(&p.w.cp).await;
+    let card: RateCard = serde_json::from_value(json!({
+        "default":{"base":all_rates("4", "20"), "long_context":[
+            {"above_input_tokens":200000,"rates":all_rates("8", "40")},
+            {"above_input_tokens":400000,"rates":all_rates("12", "60")}]},
+        "batch":{"base":all_rates("2", "10"), "long_context":[
+            {"above_input_tokens":200000,"rates":all_rates("4", "20")},
+            {"above_input_tokens":400000,"rates":all_rates("6", "30")}]},
+        "custom-fast":{"base":all_rates("6", "30"), "long_context":[
+            {"above_input_tokens":200000,"rates":all_rates("12", "60")},
+            {"above_input_tokens":400000,"rates":all_rates("18", "90")}]}
+    }))
+    .expect("full card");
+    insert_baseline(&p.w.cp, p.x, now, card)
+        .await
+        .expect("full baseline");
+    let r = prices(&p.w.cp, &owner(&p.w).await).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(
+        r.body["discount_bps"], 1000,
+        "discount metadata is required"
+    );
+    assert!(
+        r.body["pricing_version"].as_i64().is_some_and(|v| v > 0),
+        "{r:?}"
+    );
+    assert!(
+        r.body["as_of"]
+            .as_str()
+            .and_then(|v| DateTime::parse_from_rfc3339(v).ok())
+            .is_some(),
+        "{r:?}"
+    );
+    assert!(r
+        .body
+        .as_object()
+        .expect("body")
+        .contains_key("valid_until"));
+    let x = model_of(&group_of(&r.body, p.a), p.x);
+    let tiers = &x["prices_by_tier"];
+    assert_eq!(tiers.as_object().expect("tiers").len(), 3);
+    let base = &tiers["default"]["base"];
+    assert_eq!(base.as_array().expect("base").len(), 11);
+    for (dimension, expected) in [
+        ("input", "25.92"),
+        ("output", "129.6"),
+        ("cache_read", "6.48"),
+        ("cache_write", "32.4"),
+        ("cache_write_1h", "51.84"),
+        ("reasoning", "58.32"),
+        ("audio_input", "64.8"),
+        ("audio_output", "71.28"),
+        ("image_input", "77.76"),
+        ("image_output", "84.24"),
+        ("web_search", "6480"),
+    ] {
+        let rate = quote_rate(base, dimension);
+        assert_eq!(
+            rate["price_cny_per_million"], expected,
+            "{dimension}: {rate}"
+        );
+        assert_eq!(
+            rate["unit"],
+            if dimension == "web_search" {
+                "request"
+            } else {
+                "token"
+            }
+        );
+        assert!(rate.get("fallback_from").is_none(), "explicit rate {rate}");
+        assert_eq!(
+            rate.as_object().expect("rate").len(),
+            3,
+            "no platform details: {rate}"
+        );
+    }
+    assert_eq!(
+        quote_rate(&tiers["batch"]["base"], "input")["price_cny_per_million"],
+        "12.96"
+    );
+    assert_eq!(
+        quote_rate(&tiers["custom-fast"]["base"], "input")["price_cny_per_million"],
+        "38.88"
+    );
+    let bands = tiers["default"]["long_context"].as_array().expect("bands");
+    assert_eq!(bands.len(), 2);
+    for (band, threshold, expected) in [(&bands[0], 200000, "51.84"), (&bands[1], 400000, "77.76")]
+    {
+        assert_eq!(band["above_input_tokens"], threshold);
+        assert_eq!(band["rates"].as_array().expect("rates").len(), 11);
+        assert_eq!(
+            quote_rate(&band["rates"], "input")["price_cny_per_million"],
+            expected
+        );
+    }
+    let b = model_of(&group_of(&r.body, p.b), p.x);
+    assert_eq!(
+        quote_rate(&b["prices_by_tier"]["default"]["base"], "input")["price_cny_per_million"],
+        "21.6"
+    );
+}
+
+#[tokio::test]
+async fn full_quote_distinguishes_fallback_missing_search_and_explicit_zero() {
+    let Some(p) = setup().await else { return };
+    let now = db_now(&p.w.cp).await;
+    let card: RateCard = serde_json::from_value(json!({"default":{
+        "base":{"input":"4","output":"0","cache_write":"5"},
+        "long_context":[{"above_input_tokens":200000,"rates":{"input":"8","output":"40","cache_write":"10"}}]},
+        "batch":{"base":{"input":"2","output":"10","cache_write":"2"},"long_context":[
+            {"above_input_tokens":200000,"rates":{"input":"4","output":"20","cache_write":"4"}}]}
+    })).expect("fallback card");
+    insert_baseline(&p.w.cp, p.x, now, card)
+        .await
+        .expect("fallback baseline");
+    let r = prices(&p.w.cp, &owner(&p.w).await).await;
+    let x = model_of(&group_of(&r.body, p.a), p.x);
+    let tiers = &x["prices_by_tier"];
+    let base = &tiers["default"]["base"];
+    assert_eq!(quote_rate(base, "output")["price_cny_per_million"], "0");
+    assert!(quote_rate(base, "output").get("fallback_from").is_none());
+    for (dimension, from, expected) in [
+        ("cache_read", "input", "25.92"),
+        ("cache_write_1h", "cache_write", "32.4"),
+        ("reasoning", "output", "0"),
+        ("audio_input", "input", "25.92"),
+        ("audio_output", "output", "0"),
+        ("image_input", "input", "25.92"),
+        ("image_output", "output", "0"),
+    ] {
+        let rate = quote_rate(base, dimension);
+        assert_eq!(rate["fallback_from"], from, "{rate}");
+        assert_eq!(rate["price_cny_per_million"], expected, "{rate}");
+    }
+    let search = quote_rate(base, "web_search");
+    assert!(search
+        .as_object()
+        .expect("search")
+        .contains_key("price_cny_per_million"));
+    assert!(search["price_cny_per_million"].is_null());
+    assert!(search.get("fallback_from").is_none());
+    assert_eq!(
+        quote_rate(&tiers["batch"]["base"], "cache_write_1h")["fallback_from"],
+        "cache_write"
+    );
+    assert_eq!(
+        quote_rate(&tiers["batch"]["base"], "cache_write_1h")["price_cny_per_million"],
+        "12.96"
+    );
+    assert_eq!(
+        quote_rate(
+            &tiers["default"]["long_context"][0]["rates"],
+            "cache_write_1h"
+        )["price_cny_per_million"],
+        "64.8"
+    );
+    discount(&p.w.cp, p.w.tenant, 10000).await;
+    let free = prices(&p.w.cp, &owner(&p.w).await).await;
+    assert_eq!(free.body["discount_bps"], 10000);
+    let free = model_of(&group_of(&free.body, p.a), p.x);
+    for rate in free["prices_by_tier"]["default"]["base"]
+        .as_array()
+        .expect("free rates")
+    {
+        if rate["dimension"] == "web_search" {
+            assert!(rate["price_cny_per_million"].is_null());
+        } else {
+            assert_eq!(rate["price_cny_per_million"], "0", "{rate}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn full_quote_reports_next_revision_boundary_without_using_future_prices() {
+    let Some(p) = setup().await else { return };
+    let future = db_now(&p.w.cp).await + chrono::TimeDelta::minutes(5);
+    insert_baseline(
+        &p.w.cp,
+        p.x,
+        future,
+        serde_json::from_value(json!({"default":{"base":{"input":"100","output":"200"}}}))
+            .expect("card"),
+    )
+    .await
+    .expect("future baseline");
+    let r = prices(&p.w.cp, &owner(&p.w).await).await;
+    assert_eq!(r.body["valid_until"], json!(future));
+    let at =
+        DateTime::parse_from_rfc3339(r.body["as_of"].as_str().expect("as_of")).expect("timestamp");
+    assert!(at < future);
+    let x = model_of(&group_of(&r.body, p.a), p.x);
+    assert_eq!(
+        quote_rate(&x["prices_by_tier"]["default"]["base"], "input")["price_cny_per_million"],
+        "25.92"
+    );
+}
+
+#[tokio::test]
+async fn full_quote_never_falls_back_from_an_invalid_current_revision() {
+    let Some(p) = setup().await else { return };
+    let before = prices(&p.w.cp, &owner(&p.w).await).await;
+    let x = model_of(&group_of(&before.body, p.a), p.x);
+    assert!(x["prices_by_tier"].is_object(), "full quote required: {x}");
+    // JSON 可解析但违反价卡语义，必须挡住旧 baseline。
+    sqlx::query("INSERT INTO pricing_baselines (engine_version,model_id,effective_from,card,source_kind,source) VALUES (2,$1,now(),$2,'manual',$3)")
+        .bind(p.x).bind(json!({"default":{"base":{"input":"4","output":"20"},"long_context":[
+            {"above_input_tokens":0,"rates":{"input":"8","output":"40"}}]}}))
+        .bind(json!({"note":"invalid quote test"}))
+        .execute(p.w.cp.db().pool()).await.expect("invalid revision");
+    sqlx::query("UPDATE cp_settings SET value = to_jsonb((value #>> '{}')::bigint + 1) WHERE key = 'pricing_version'")
+        .execute(p.w.cp.db().pool()).await.expect("bump book version");
+    let r = prices(&p.w.cp, &owner(&p.w).await).await;
+    for group in r.body["groups"].as_array().expect("groups") {
+        assert!(
+            group["models"]
+                .as_array()
+                .expect("models")
+                .iter()
+                .all(|m| m["model_id"] != json!(p.x)),
+            "invalid revision fell back: {r:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn full_quote_uses_the_shared_versioned_book_and_refreshes_after_price_write() {
+    let Some(p) = setup().await else { return };
+    let member = owner(&p.w).await;
+    let loads_before = p.w.cp.state().prices.loads();
+    let first = prices(&p.w.cp, &member).await;
+    assert!(
+        first.body["pricing_version"].as_i64().is_some(),
+        "version metadata required: {first:?}"
+    );
+    assert!(
+        p.w.cp.state().prices.loads() > loads_before,
+        "quotes must use the intake price book"
+    );
+    let cached_loads = p.w.cp.state().prices.loads();
+    let second = prices(&p.w.cp, &member).await;
+    assert_eq!(
+        second.body["pricing_version"],
+        first.body["pricing_version"]
+    );
+    assert_eq!(
+        p.w.cp.state().prices.loads(),
+        cached_loads,
+        "unchanged book reused"
+    );
+    rate(&p.w.cp, p.a, Some(p.x), "2").await;
+    let third = prices(&p.w.cp, &member).await;
+    let version: i64 = sqlx::query_scalar(
+        "SELECT (value::text)::bigint FROM cp_settings WHERE key='pricing_version'",
+    )
+    .fetch_one(p.w.cp.db().pool())
+    .await
+    .expect("version");
+    assert_eq!(third.body["pricing_version"], version);
+    assert!(third.body["pricing_version"].as_i64() > first.body["pricing_version"].as_i64());
+    assert!(p.w.cp.state().prices.loads() > cached_loads);
+    let x = model_of(&group_of(&third.body, p.a), p.x);
+    assert_eq!(
+        quote_rate(&x["prices_by_tier"]["default"]["base"], "input")["price_cny_per_million"],
+        "7.2"
+    );
+    assert_eq!(x["input_per_million"], "7.2");
+}
+
+// 卡与分组价在加载中同时变化时，HTTP 报价及版本必须来自同一份价格书。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn full_quote_never_mixes_revisions_when_a_price_write_races_its_book_load() {
+    use sqlx::Connection;
+    let Some(p) = setup().await else { return };
+    let member = owner(&p.w).await;
+    let new_from = db_now(&p.w.cp).await;
+    let mut holder = sqlx::PgConnection::connect(p.w.cp.database_url())
+        .await
+        .expect("connection");
+    sqlx::query("BEGIN")
+        .execute(&mut holder)
+        .await
+        .expect("begin");
+    sqlx::query("LOCK TABLE pricing_group_rates IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut holder)
+        .await
+        .expect("lock rates");
+    let response = prices(&p.w.cp, &member);
+    let race = async {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        loop {
+            let waiting: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query ILIKE '%FROM pricing_group_rates%')")
+                .fetch_one(p.w.cp.db().pool()).await.expect("waiting reader");
+            if waiting {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "quote never loaded the shared book"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let mut tx =
+            p.w.cp
+                .db()
+                .pool()
+                .begin()
+                .await
+                .expect("baseline transaction");
+        sqlx::query("INSERT INTO pricing_baselines (engine_version,model_id,effective_from,card,source_kind,source) VALUES (2,$1,$2,$3,'manual',$4)")
+            .bind(p.x).bind(new_from).bind(json!({"default":{"base":{"input":"8","output":"40"}}}))
+            .bind(json!({"note":"race quote card"})).execute(&mut *tx).await.expect("new baseline");
+        sqlx::query("UPDATE cp_settings SET value=to_jsonb((value::text)::bigint+1) WHERE key='pricing_version'")
+            .execute(&mut *tx).await.expect("baseline version");
+        tx.commit().await.expect("baseline commit");
+        sqlx::query("INSERT INTO pricing_group_rates (engine_version,group_id,model_id,effective_from,cny_per_usd_e4,note) VALUES (2,$1,NULL,$2,20000,'race quote rate')")
+            .bind(p.a).bind(new_from).execute(&mut holder).await.expect("new rate");
+        sqlx::query("UPDATE cp_settings SET value=to_jsonb((value::text)::bigint+1) WHERE key='pricing_version'")
+            .execute(&mut holder).await.expect("rate version");
+        sqlx::query("COMMIT")
+            .execute(&mut holder)
+            .await
+            .expect("rate commit");
+    };
+    let (r, ()) = tokio::join!(response, race);
+    assert_eq!(r.status, 200, "{r:?}");
+    let version: i64 = sqlx::query_scalar(
+        "SELECT (value::text)::bigint FROM cp_settings WHERE key='pricing_version'",
+    )
+    .fetch_one(p.w.cp.db().pool())
+    .await
+    .expect("version");
+    assert_eq!(
+        r.body["pricing_version"], version,
+        "response version must fence its prices"
+    );
+    let x = model_of(&group_of(&r.body, p.a), p.x);
+    assert_eq!(
+        x["input_per_million"], "14.4",
+        "old-card/new-rate mixture would be 7.2"
+    );
+    assert_eq!(
+        quote_rate(&x["prices_by_tier"]["default"]["base"], "input")["price_cny_per_million"],
+        "14.4"
+    );
+}
+
+#[tokio::test]
+async fn a_public_concrete_model_name_with_hash_keeps_its_catalog_and_quote() {
+    let Some(p) = setup().await else { return };
+    let name = format!("public#literal-{}", Uuid::new_v4().simple());
+    let provider_key = support::world::seed_provider_key(&p.w.cp, &p.w.admin).await;
+    let created =
+        p.w.cp
+            .send(
+                "POST",
+                "/admin/resources/models",
+                Some(p.w.admin.cookie()),
+                Some(
+                    json!({"doc":{"display_name":name,"internal":false,"provider":"openai",
+            "model_name":"gpt-4o-mini","provider_key_id":provider_key}}),
+                ),
+            )
+            .await;
+    assert_eq!(
+        created.status, 201,
+        "a public concrete name is accepted: {created:?}"
+    );
+    let model = Uuid::parse_str(created.body["id"].as_str().expect("model id")).expect("uuid");
+    let version: i64 = sqlx::query_scalar("SELECT version FROM tenants WHERE id=$1")
+        .bind(p.w.tenant)
+        .fetch_one(p.w.cp.db().pool())
+        .await
+        .expect("tenant version");
+    let assigned = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("HTTP client")
+        .patch(p.w.cp.url(&format!("/admin/tenants/{}", p.w.tenant)))
+        .header(reqwest::header::COOKIE, p.w.admin.cookie())
+        .header(reqwest::header::IF_MATCH, format!("\"{version}\""))
+        .json(&json!({"allowed_model_ids":[p.x,p.y,model]}))
+        .send()
+        .await
+        .expect("grant public model");
+    let status = assigned.status().as_u16();
+    let body = assigned.text().await.expect("grant response");
+    assert_eq!(
+        status, 200,
+        "the real grant writer accepts the concrete name: {body}"
+    );
+    insert_baseline(&p.w.cp, model, db_now(&p.w.cp).await, baseline_card())
+        .await
+        .expect("public baseline");
+    let member = owner(&p.w).await;
+    let catalog =
+        p.w.cp
+            .send("GET", "/api/models", Some(member.cookie()), None)
+            .await;
+    assert_eq!(catalog.status, 200, "{catalog:?}");
+    assert!(
+        catalog.body["items"]
+            .as_array()
+            .expect("catalog")
+            .iter()
+            .any(|m| m["id"] == json!(model) && m["name"] == name),
+        "public call name remains visible: {catalog:?}"
+    );
+    let r = prices(&p.w.cp, &member).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let quote = model_of(&group_of(&r.body, p.a), model);
+    assert_eq!(
+        quote["name"], name,
+        "copy must preserve the complete callable name"
+    );
+    assert_eq!(quote["input_per_million"], "25.92");
+    assert_eq!(
+        quote_rate(&quote["prices_by_tier"]["default"]["base"], "input")["price_cny_per_million"],
+        "25.92"
+    );
 }

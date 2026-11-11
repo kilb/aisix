@@ -613,3 +613,34 @@ async fn topups_and_adjustments_are_listed_and_summed_beside_usage() {
         "{r:?}"
     );
 }
+
+#[tokio::test]
+async fn ledger_calculation_keeps_signed_before_amount_after_at_full_precision() {
+    let Some(w) = world().await else { return };
+    raw_usage(
+        w.cp.db().pool(),
+        w.tenant,
+        "exact-ledger",
+        -9_007_199_254_740_993,
+        -9_007_199_254_741_003,
+        Utc::now(),
+    )
+    .await;
+    let owner = w.cp.member_login_seeded(w.tenant, MemberRole::Owner).await;
+    let r =
+        w.cp.send(
+            "GET",
+            "/api/billing/ledger?limit=1",
+            Some(owner.cookie()),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(
+        r.body["items"][0]["calculation"],
+        json!({
+            "before_micro_cny": "-10", "amount_micro_cny": "-9007199254740993",
+            "after_micro_cny": "-9007199254741003",
+        })
+    );
+}

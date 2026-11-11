@@ -30,8 +30,8 @@ use serde_json::{json, Value};
 use crate::auth::{MemberRole, OperatorRole, KEY_HOLDERS};
 use crate::error::{ApiError, Detail};
 use crate::{
-    audit, billing, channels, dp, gateways, groups, keys, members, operators, pricing, projector,
-    resources, rollout, tenants, upstream_models, usage, AppState,
+    audit, billing, channels, dp, gateways, groups, keys, member_usage, members, operators,
+    pricing, projector, resources, rollout, tenants, upstream_models, usage, AppState,
 };
 
 /// The largest request body either listener reads.
@@ -292,6 +292,8 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
     // What each of a tenant's groups charges, in CNY per million tokens.
     ("GET", "/api/prices", MinRole::Member(EVERY_MEMBER)),
     ("GET", "/api/members", MinRole::Member(MANAGERS)),
+    ("POST", "/api/members", MinRole::Member(MANAGERS)),
+    ("GET", "/api/members/usage", MinRole::Member(MANAGERS)),
     ("GET", "/api/members/invites", MinRole::Member(MANAGERS)),
     ("POST", "/api/members/invites", MinRole::Member(MANAGERS)),
     (
@@ -822,7 +824,8 @@ pub fn browser_router(state: AppState) -> Router {
         .route("/api/models", get(members::models))
         .route("/api/groups", get(groups::tenant_groups))
         .route("/api/prices", get(billing::tenant_prices::prices))
-        .route("/api/members", get(members::list))
+        .route("/api/members", get(members::list).post(members::create_account))
+        .route("/api/members/usage", get(member_usage::get))
         .route(
             "/api/members/invites",
             get(members::list_invites).post(members::invite),

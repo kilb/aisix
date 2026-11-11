@@ -159,7 +159,7 @@ export interface Stack {
   httpUrl: string;
   /** The managed gateway's proxy listener. */
   proxyUrl: string;
-  /** The upstream stand-in; an upstream account reaches it at `<url>/v1`. */
+  /** The upstream stand-in; an upstream account reaches it at `<url>/v1`. 未启用时为空。 */
   mockUpstreamUrl: string;
   /** The stack's first operator, an admin. */
   operator: { email: string; password: string };
@@ -197,7 +197,7 @@ interface ReadyLine {
   cpDatabase: string;
   operator: { email: string; password: string };
   gateway: { proxyUrl: string; dpId: string; name: string };
-  mockUpstream: { url: string };
+  mockUpstream?: { url: string };
 }
 
 function freePort(): Promise<number> {
@@ -324,14 +324,14 @@ function sqlAgainst(database: string, statement: string): string {
   return r.stdout;
 }
 
-export async function startStack(): Promise<Stack> {
+export async function startStack(options: { mockUpstream?: boolean } = {}): Promise<Stack> {
   assertBuilt();
   // stdin is held open: the stack stops when it closes, so a worker that
   // dies takes its databases with it. Its own progress and every child's
   // lines go to stderr, which is this worker's.
   const stackProc = spawn(
     process.execPath,
-    ["../scripts/cp-dev-stack.mjs", "--gateway", "../target/debug/aisix", "--mock-upstream"],
+    ["../scripts/cp-dev-stack.mjs", "--gateway", "../target/debug/aisix", ...(options.mockUpstream === false ? [] : ["--mock-upstream"])],
     { cwd: WEB_TENANT, stdio: ["pipe", "pipe", "inherit"], detached: true },
   );
   let preview: ChildProcess | undefined;
@@ -377,7 +377,7 @@ export async function startStack(): Promise<Stack> {
       previewUrl,
       httpUrl: ready.httpUrl,
       proxyUrl: ready.gateway.proxyUrl,
-      mockUpstreamUrl: ready.mockUpstream.url,
+      mockUpstreamUrl: ready.mockUpstream?.url ?? "",
       operator: ready.operator,
       admin,
       tenant: () => new ApiClient(ready.httpUrl),

@@ -1740,6 +1740,22 @@ async fn every_tenant_write_takes_the_tenant_before_the_resources_lock() {
             201,
         ),
         (
+            "POST /api/members",
+            Box::pin(fire(
+                cp.clone(),
+                "POST",
+                "/api/members".to_string(),
+                owner.cookie().to_string(),
+                None,
+                Some(json!({
+                    "email": format!("order-created-{}@tenant.test", Uuid::new_v4().simple()),
+                    "password": "order-created-password-7c1",
+                    "role": "member",
+                })),
+            )),
+            201,
+        ),
+        (
             "PATCH /admin/members/{id}",
             Box::pin(fire(
                 cp.clone(),

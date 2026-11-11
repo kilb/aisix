@@ -186,8 +186,66 @@ pub async fn balance(
 ) -> Result<Json<Value>, ApiError> {
     auth.require_active()?;
     auth.require(&[MemberRole::Owner, MemberRole::Admin, MemberRole::Billing])?;
-    let mut conn = state.db.pool().acquire().await.map_err(DbError::from)?;
-    let account = find(&mut conn, auth.tenant_id).await?;
+    balance_snapshot(
+        &state.db,
+        auth.tenant_id,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+// 每次测试局部传入的屏障；正常构建没有这个类型、参数或等待代码。
+#[cfg(test)]
+struct SnapshotPause {
+    reached: tokio::sync::oneshot::Sender<(String, String)>,
+    resume: tokio::sync::oneshot::Receiver<()>,
+}
+
+async fn balance_snapshot(
+    db: &crate::db::Db,
+    tenant: Uuid,
+    #[cfg(test)] pause: Option<SnapshotPause>,
+) -> Result<Json<Value>, ApiError> {
+    let mut tx = db.pool().begin().await.map_err(DbError::from)?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await
+        .map_err(DbError::from)?;
+    let account = find(&mut tx, tenant).await?;
+    #[cfg(test)]
+    if let Some(pause) = pause {
+        let properties: (String, String) = sqlx::query_as(
+            "SELECT current_setting('transaction_isolation'), current_setting('transaction_read_only')",
+        ).fetch_one(&mut *tx).await.map_err(DbError::from)?;
+        pause
+            .reached
+            .send(properties)
+            .map_err(|_| ApiError::internal("snapshot test observer dropped"))?;
+        pause
+            .resume
+            .await
+            .map_err(|_| ApiError::internal("snapshot test release dropped"))?;
+    }
+    // 累计收支使用 numeric 求和：总流量可超 i64，而净余额仍在其范围内。
+    let (topups, usage, adjustments, last_seq, as_of): (
+        String,
+        String,
+        String,
+        Option<String>,
+        chrono::DateTime<chrono::Utc>,
+    ) = sqlx::query_as(
+        "SELECT COALESCE(SUM(amount_micro_cny) FILTER (WHERE kind = 'topup'), 0)::numeric::text, \
+         (-COALESCE(SUM(amount_micro_cny) FILTER (WHERE kind = 'usage'), 0)::numeric)::text, \
+         COALESCE(SUM(amount_micro_cny) FILTER (WHERE kind = 'adjustment'), 0)::numeric::text, \
+         MAX(seq)::text, transaction_timestamp() \
+         FROM billing_ledger_cny WHERE tenant_id = $1",
+    )
+    .bind(tenant)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(DbError::from)?;
+    tx.commit().await.map_err(DbError::from)?;
     Ok(Json(json!({
         "billing_mode": account.billing_mode,
         "balance_micro_cny": account.balance_micro_cny,
@@ -195,5 +253,20 @@ pub async fn balance(
         "available_micro_cny": account.available_micro_cny,
         "exhausted": account.exhausted,
         "pending_topups": account.pending_topups,
+        "calculation": {
+            "topups_micro_cny": topups,
+            "usage_micro_cny": usage,
+            "adjustments_micro_cny": adjustments,
+            "balance_micro_cny": account.balance_micro_cny.to_string(),
+            "credit_limit_micro_cny": account.credit_limit_micro_cny.to_string(),
+            "available_micro_cny": account.available_micro_cny.to_string(),
+            "available_overflow": account.balance_micro_cny.checked_add(account.credit_limit_micro_cny).is_none(),
+            "last_ledger_seq": last_seq,
+            "as_of": as_of,
+        },
     })))
 }
+
+#[cfg(test)]
+#[path = "accounts_snapshot_tests.rs"]
+mod snapshot_tests;

@@ -447,6 +447,13 @@ pub struct UsageEvent {
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub downstream_latency_ms: u32,
 
+    /// 请求接收至首个实际交付的非空生成内容片段，单位毫秒。
+    /// 仅 typed token SSE 的文本、可见推理、拒绝文本或工具参数；
+    /// 元数据首帧、非流式、未交付内容与旧事件均不产生此字段。
+    /// 独立于既有首帧与完整响应时延，不由它们推算。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_token_latency_ms: Option<u32>,
+
     /// The part of `downstream_latency_ms` the gateway itself spent, in
     /// milliseconds: the same window (request arrival to the caller's first
     /// usable data) minus the time spent waiting on an upstream inside it —
@@ -1505,6 +1512,19 @@ impl UsageSink {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn first_token_latency_distinguishes_unknown_from_reported_zero() {
+        let mut event = super::UsageEvent::default();
+        let unknown = serde_json::to_value(&event).unwrap();
+        assert!(unknown.get("first_token_latency_ms").is_none());
+        event.first_token_latency_ms = Some(0);
+        let measured = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            measured.get("first_token_latency_ms"),
+            Some(&serde_json::json!(0))
+        );
+    }
+
     /// A Gemini thinking call whose thoughts sit beside the candidates.
     fn gemini_additive() -> UsageEvent {
         UsageEvent {

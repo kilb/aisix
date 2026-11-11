@@ -153,6 +153,11 @@ async fn ledger_of(
                     "kind": kind,
                     "amount_micro_cny": amount,
                     "balance_after_micro_cny": balance_after,
+                    "calculation": {
+                        "before_micro_cny": (i128::from(balance_after) - i128::from(amount)).to_string(),
+                        "amount_micro_cny": amount.to_string(),
+                        "after_micro_cny": balance_after.to_string(),
+                    },
                     "event_id": event_id,
                     "model": model,
                     "topup_id": topup_id,

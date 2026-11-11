@@ -48,6 +48,7 @@ mod endpoint_acl;
 mod ensemble;
 mod error;
 mod error_translate;
+mod first_token;
 #[cfg(test)]
 mod guardrail_blocked_telemetry;
 #[cfg(test)]
@@ -649,6 +650,7 @@ async fn record_request_telemetry(
     request: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
+    let started = std::time::Instant::now();
     // Normalize to a bounded route template BEFORE using the path as a
     // metric label. This middleware runs before authentication and before
     // route matching, so the raw `request.uri().path()` is fully
@@ -741,7 +743,7 @@ async fn record_request_telemetry(
     let mut response = attribution::scope(attribution, next.run(request)).await;
     // The head exists; from here the guard rides the body (see `GuardPhase`).
     guard.attribution.note_head_written();
-    capture_streamed_output(&state, endpoint, &response, &guard.attribution);
+    capture_streamed_output(&state, endpoint, &response, &guard.attribution, started);
     guard.phase = GuardPhase::Body {
         owed: response.status().is_success()
             && http_body::Body::size_hint(response.body())
@@ -769,13 +771,8 @@ fn capture_streamed_output(
     endpoint: &str,
     response: &Response,
     cell: &attribution::RequestAttribution,
+    started: std::time::Instant,
 ) {
-    let wire = match endpoint {
-        "/v1/chat/completions" => aisix_obs::OutputWire::OpenAiChat,
-        "/v1/messages" => aisix_obs::OutputWire::AnthropicMessages,
-        "/v1/responses" => aisix_obs::OutputWire::OpenAiResponses,
-        _ => return,
-    };
     let is_sse = response
         .headers()
         .get(axum::http::header::CONTENT_TYPE)
@@ -784,6 +781,15 @@ fn capture_streamed_output(
     if !is_sse || !response.status().is_success() {
         return;
     }
+    if let Some(wire) = first_token::Wire::for_endpoint(endpoint) {
+        cell.observe_first_token(wire, started);
+    }
+    let wire = match endpoint {
+        "/v1/chat/completions" => aisix_obs::OutputWire::OpenAiChat,
+        "/v1/messages" => aisix_obs::OutputWire::AnthropicMessages,
+        "/v1/responses" => aisix_obs::OutputWire::OpenAiResponses,
+        _ => return,
+    };
     if wire == aisix_obs::OutputWire::OpenAiResponses {
         cell.observe_responses_finish();
     }
@@ -848,7 +854,10 @@ impl Drop for TelemetryBody {
             // which the guard reads before deciding it owes a row. Then the
             // guard, then the drain count.
             if let (Some(inner), Some(guard)) = (inner, guard.as_ref()) {
-                attribution::sync_scope(&guard.attribution, move || drop(inner));
+                attribution::sync_scope(&guard.attribution, || {
+                    drop(inner);
+                    guard.attribution.finish_body_poll();
+                });
             }
             drop(guard);
             drop(drain);
@@ -894,22 +903,24 @@ impl axum::body::HttpBody for TelemetryBody {
         // log nothing at all. `Drop` covers the abandoned endings; this
         // covers the delivered one.
         let cell = &guard.attribution;
-        let polled = match this.inner.as_mut() {
-            Some(inner) => {
-                attribution::sync_scope(cell, || std::pin::Pin::new(inner).poll_frame(cx))
+        attribution::sync_scope(cell, || {
+            cell.begin_body_poll();
+            let polled = match this.inner.as_mut() {
+                Some(inner) => std::pin::Pin::new(inner).poll_frame(cx),
+                None => std::task::Poll::Ready(None),
+            };
+            // 只有 Ready 的 data frame 已交给 server；Pending 和首次 poll 都不是首内容。
+            if let std::task::Poll::Ready(Some(Ok(frame))) = &polled {
+                if let Some(data) = frame.data_ref() {
+                    cell.add_response_bytes(data.len() as u64);
+                    cell.observe_response_output(data);
+                }
             }
-            None => std::task::Poll::Ready(None),
-        };
-        // The access log's `response_body_bytes`: counted here, outside every
-        // wrapper a handler puts on its body, so SSE framing and keep-alive
-        // heartbeats are in it — it is what the server was handed.
-        if let std::task::Poll::Ready(Some(Ok(frame))) = &polled {
-            if let Some(data) = frame.data_ref() {
-                cell.add_response_bytes(data.len() as u64);
-                cell.observe_response_output(data);
-            }
-        }
-        polled
+            // completions 可先结算再 yield；先观测交付内容，再在本次 poll 内发布。
+            // Pending / EOF / error 同样立即 flush，绝不等客户端下一次读取。
+            cell.finish_body_poll();
+            polled
+        })
     }
 
     // `size_hint` is deliberately NOT forwarded, matching the `map_frame`

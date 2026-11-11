@@ -548,6 +548,7 @@ async fn the_prices_lookup_is_served_only_on_the_gateway_listener() {
 /// Raw-inserts a rate revision of `model` in `group` at `engine_version`,
 /// which the write path would refuse when it is newer.
 async fn raw_rate(cp: &TestCp, group: Uuid, model: Option<Uuid>, engine_version: i64) {
+    let mut tx = cp.db().pool().begin().await.expect("begin rate revision");
     sqlx::query(
         "INSERT INTO pricing_group_rates \
          (engine_version, group_id, model_id, effective_from, cny_per_usd_e4, note) \
@@ -556,9 +557,18 @@ async fn raw_rate(cp: &TestCp, group: Uuid, model: Option<Uuid>, engine_version:
     .bind(engine_version)
     .bind(group)
     .bind(model)
-    .execute(cp.db().pool())
+    .execute(&mut *tx)
     .await
     .expect("insert the rate");
+    // 模拟新版写入者：修订和版本必须原子提交，缓存才会读取这份非法修订。
+    sqlx::query(
+        "UPDATE cp_settings SET value = to_jsonb((value::text)::bigint + 1), updated_at = now() \
+         WHERE key = 'pricing_version'",
+    )
+    .execute(&mut *tx)
+    .await
+    .expect("bump the rate version");
+    tx.commit().await.expect("commit rate revision and version");
 }
 
 #[tokio::test]
@@ -580,25 +590,55 @@ async fn an_unreadable_revision_in_force_leaves_the_model_unpriced() {
     rate(&cp, &admin, group, None, now, "1").await;
     let r = prices(&dp, key).await;
     assert!(!entry(&r, a).is_null() && !entry(&r, b).is_null(), "{r:?}");
+    let version = r.body["pricing_version"].as_i64().expect("book version");
+    let loads = cp.state().prices.loads();
+    assert!(loads > 0, "the first lookup warms the shared book");
 
     // A model override a newer engine wrote: the engine prices nothing from
     // it and does not fall back to the group's default rate.
     raw_rate(&cp, group, Some(a), 999).await;
     let r = prices(&dp, key).await;
+    assert_eq!(r.body["pricing_version"], version + 1, "{r:?}");
+    assert!(
+        cp.state().prices.loads() > loads,
+        "new version reloads the book"
+    );
     assert!(entry(&r, a).is_null(), "{r:?}");
     assert!(!entry(&r, b).is_null(), "{r:?}");
 
     // A discount a newer engine wrote leaves every model of that tenant
     // unpriced: the discount cannot be read, so no final price exists.
+    let loads = cp.state().prices.loads();
+    let mut tx = cp
+        .db()
+        .pool()
+        .begin()
+        .await
+        .expect("begin discount revision");
     sqlx::query(
         "INSERT INTO pricing_discount_revisions (engine_version, tenant_id, effective_from, \
          discount_bps) VALUES (999, $1, now(), 1000)",
     )
     .bind(tenant)
-    .execute(cp.db().pool())
+    .execute(&mut *tx)
     .await
     .expect("insert the discount");
+    sqlx::query(
+        "UPDATE cp_settings SET value = to_jsonb((value::text)::bigint + 1), updated_at = now() \
+         WHERE key = 'pricing_version'",
+    )
+    .execute(&mut *tx)
+    .await
+    .expect("bump the discount version");
+    tx.commit()
+        .await
+        .expect("commit discount revision and version");
     let r = prices(&dp, key).await;
+    assert_eq!(r.body["pricing_version"], version + 2, "{r:?}");
+    assert!(
+        cp.state().prices.loads() > loads,
+        "new discount reloads the book"
+    );
     assert!(entry(&r, b).is_null(), "{r:?}");
 }
 

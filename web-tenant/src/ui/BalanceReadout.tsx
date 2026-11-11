@@ -17,7 +17,7 @@ const NOTE: Record<ReadoutLevel, string> = {
 };
 
 /** An amount with its currency sign muted and the minus before it: `-¥0.011`. */
-export function Money({ micro }: { micro: number }) {
+export function Money({ micro }: { micro: number | string | bigint }) {
   const text = fmtMicroCny(micro);
   const negative = text.startsWith("-");
   return (

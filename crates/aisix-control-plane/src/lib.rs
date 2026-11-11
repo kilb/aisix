@@ -5,6 +5,9 @@
 //! operators and tenants, the gateway listener (mTLS) the gateways, and a
 //! projector writes the gateway resources to kine.
 
+#[cfg(test)]
+extern crate self as aisix_control_plane;
+
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -29,6 +32,7 @@ pub mod housekeeping;
 pub mod http;
 pub mod keys;
 pub mod kine;
+pub mod member_usage;
 pub mod members;
 pub mod operators;
 pub mod pki;

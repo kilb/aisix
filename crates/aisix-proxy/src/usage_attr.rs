@@ -1729,11 +1729,18 @@ pub(crate) fn emit_usage(
     // emitters and the cancel guard itself both run.
     crate::attribution::note_usage_emitted(terminal, event.attempt_index);
     let provider_key_id = labels.provider_key_id;
-    state
-        .usage_sink
-        .try_emit(surface.handler, event.clone(), labels);
     let exporters = live_exporters(state, snap);
     if exporters.is_empty() {
+        deliver_usage(
+            state,
+            surface,
+            event,
+            labels,
+            None,
+            emission.as_ref(),
+            None,
+            &exporters,
+        );
         return;
     }
     // A streamed response's parts were read off the frames the caller got;
@@ -1785,14 +1792,117 @@ pub(crate) fn emit_usage(
                 },
             })
         });
-    state.otlp_fan_out.fan_out(
-        &event,
+    deliver_usage(
+        state,
+        surface,
+        event,
+        labels,
         content,
         emission.as_ref(),
         facts.as_ref(),
-        exporters.generation(),
-        exporters.iter().map(|e| &*e.value),
+        &exporters,
     );
+}
+
+/// 一个 outer body poll 内暂存的最终发布；不复制请求的资源快照。
+/// 取消去重和终态副作用已经发生，锁外发布时只补交付边界测得的新字段。
+pub(crate) struct PendingUsage {
+    sink: aisix_obs::UsageSink,
+    fan_out: aisix_obs::OtlpHttpFanOut,
+    surface: Surface,
+    event: UsageEvent,
+    labels: [String; 6],
+    content: Option<aisix_obs::CapturedContent>,
+    emission: Option<aisix_obs::TraceEmission>,
+    facts: Option<Arc<aisix_obs::SpanFacts>>,
+    exporters: LiveExporters,
+    span: tracing::Span,
+}
+
+impl PendingUsage {
+    pub(crate) fn deliver(mut self) {
+        // inner poll 的 stream span 已退出；发布日志必须重新挂回原请求。
+        let _entered = self.span.enter();
+        self.event.first_token_latency_ms = crate::attribution::first_token_latency_ms();
+        let labels = UsageEventLabels {
+            model: &self.labels[0],
+            provider_key_id: &self.labels[1],
+            provider_key_name: &self.labels[2],
+            user_id: &self.labels[3],
+            user_name: &self.labels[4],
+            upstream_protocol: &self.labels[5],
+        };
+        self.sink
+            .try_emit(self.surface.handler, self.event.clone(), labels);
+        if !self.exporters.is_empty() {
+            self.fan_out.fan_out(
+                &self.event,
+                self.content.as_ref(),
+                self.emission.as_ref(),
+                self.facts.as_ref(),
+                self.exporters.generation(),
+                self.exporters.iter().map(|e| &*e.value),
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn deliver_usage(
+    state: &ProxyState,
+    surface: Surface,
+    mut event: UsageEvent,
+    labels: UsageEventLabels<'_>,
+    content: Option<&aisix_obs::CapturedContent>,
+    emission: Option<&aisix_obs::TraceEmission>,
+    facts: Option<&Arc<aisix_obs::SpanFacts>>,
+    exporters: &LiveExporters,
+) {
+    let token_terminal = event.is_final_attempt && crate::first_token::token_surface(surface);
+    event.first_token_latency_ms = if token_terminal {
+        crate::attribution::first_token_latency_ms()
+    } else {
+        None
+    };
+    if token_terminal && crate::attribution::body_poll_in_progress() {
+        crate::attribution::defer_body_usage(PendingUsage {
+            sink: state.usage_sink.clone(),
+            fan_out: state.otlp_fan_out.clone(),
+            surface,
+            event,
+            labels: [
+                labels.model,
+                labels.provider_key_id,
+                labels.provider_key_name,
+                labels.user_id,
+                labels.user_name,
+                labels.upstream_protocol,
+            ]
+            .map(str::to_owned),
+            content: content.cloned(),
+            emission: emission.cloned(),
+            facts: facts.cloned(),
+            exporters: LiveExporters {
+                generation: exporters.generation,
+                entries: exporters.entries.clone(),
+            },
+            span: tracing::Span::current(),
+        });
+        return;
+    }
+    state
+        .usage_sink
+        .try_emit(surface.handler, event.clone(), labels);
+    if !exporters.is_empty() {
+        state.otlp_fan_out.fan_out(
+            &event,
+            content,
+            emission,
+            facts,
+            exporters.generation(),
+            exporters.iter().map(|e| &*e.value),
+        );
+    }
 }
 
 /// `gateway_overhead_ms` on the event that carries `downstream_latency_ms`,

@@ -14,6 +14,7 @@ import { Button } from "./ui/Button";
 import { Field } from "./ui/Field";
 import { Lamp, type LampState } from "./ui/Lamp";
 import { Card, CardHeader, PageHeader, Split, Stat, StatGrid } from "./components/page";
+import { CreateMember } from "./CreateMember";
 
 export const ROLE_LABEL: Record<MemberRole, string> = {
   owner: "所有者",
@@ -73,6 +74,8 @@ export function Org({ member, status }: { member: SessionMember; status: TenantS
   }, []);
 
   const shown = org?.status ?? status;
+  const canCreate = org?.status === "active" && (member.role === "owner" || member.role === "admin");
+  const roles: MemberRole[] = member.role === "owner" ? ["owner", "admin", "member", "billing"] : ["admin", "member", "billing"];
   return (
     <>
       <PageHeader title="组织" />
@@ -80,10 +83,10 @@ export function Org({ member, status }: { member: SessionMember; status: TenantS
         asideWidth="400px"
         main={
           <div className="grid gap-6">
-            {status === "pending" && (
+            {shown === "pending" && (
               <div className="note warn">组织正在等待平台审核，审核通过后即可创建密钥和邀请成员</div>
             )}
-            {status === "suspended" && <div className="note crit">组织已被停用，请联系平台</div>}
+            {shown === "suspended" && <div className="note crit">组织已被停用，请联系平台</div>}
             {err && (
               <div className="note crit" role="alert">
                 {err}
@@ -105,16 +108,25 @@ export function Org({ member, status }: { member: SessionMember; status: TenantS
               <Stat label="单个密钥的并发上限" value={org ? cap(org.limits.key_concurrency_max) : "—"} />
               <Stat label="单个密钥的每分钟请求上限" value={org ? cap(org.limits.key_rpm_max) : "—"} />
             </StatGrid>
+            {canCreate && (
+              <CreateMember
+                roles={roles}
+                labels={ROLE_LABEL}
+                onInactive={() => {
+                  void readOrg().then(setOrg, (e: unknown) => setErr(e instanceof ApiError ? messageFor(e) : String(e)));
+                }}
+              />
+            )}
           </div>
         }
-        aside={<PasswordForm />}
+        aside={<PasswordForm primary={!canCreate} />}
       />
     </>
   );
 }
 
 /** The caller's own password. A change ends their other sessions. */
-function PasswordForm() {
+function PasswordForm({ primary }: { primary: boolean }) {
   const [current, setCurrent] = useState("");
   const [next, setNext] = useState("");
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
@@ -172,7 +184,7 @@ function PasswordForm() {
           )}
         </Field>
         <div className="flex justify-end">
-          <Button kind="primary" type="submit" busy={busy}>
+          <Button kind={primary ? "primary" : "secondary"} type="submit" busy={busy}>
             修改口令
           </Button>
         </div>

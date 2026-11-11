@@ -17,7 +17,7 @@ function grouped(abs: bigint): string {
  * Every amount a tenant holds, is charged or is shown is micro-CNY, and every
  * one of them goes through this function; no page rounds a figure itself.
  */
-export function fmtMicroCny(micro: number): string {
+export function fmtMicroCny(micro: number | string | bigint): string {
   const value = BigInt(micro);
   const abs = value < 0n ? -value : value;
   let fraction = (abs % MICRO_PER_UNIT).toString().padStart(6, "0");

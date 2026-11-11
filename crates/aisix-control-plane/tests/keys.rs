@@ -14,7 +14,7 @@ use aisix_control_plane::housekeeping;
 use aisix_control_plane::keys::{self, KEY_DOC_VERSION};
 use aisix_control_plane::resources::write::WriteCtx;
 use aisix_control_plane::tenants::TenantStatus;
-use aisix_core::models::ApiKey;
+use aisix_core::models::{ApiKey, EndpointFamily};
 use serde_json::{json, Value};
 use sqlx::Connection;
 use support::members::MemberSession;
@@ -2065,6 +2065,7 @@ async fn operators_mint_and_manage_any_tenants_keys() {
         doc["allowed_endpoints"],
         json!([
             "chat_completions",
+            "completions",
             "messages",
             "count_tokens",
             "responses",
@@ -3610,4 +3611,306 @@ async fn api_groups_lists_the_tenants_assigned_groups() {
             assert!(!body.contains(token), "{token} in {body}");
         }
     }
+}
+
+/// 明确公开的七项合同，不从被测实现的白名单常量推导期望。
+fn customer_endpoints_with_completions() -> Value {
+    json!([
+        "chat_completions",
+        "completions",
+        "messages",
+        "count_tokens",
+        "responses",
+        "embeddings",
+        "models"
+    ])
+}
+
+/// 还原旧副本已写入且被数据面确认的六项文档与版本，状态在同一事务内可见。
+async fn restore_v3_endpoint_document(cp: &TestCp, key: &str) {
+    let old = json!([
+        "chat_completions",
+        "messages",
+        "count_tokens",
+        "responses",
+        "embeddings",
+        "models"
+    ]);
+    let mut tx = cp.db().pool().begin().await.expect("begin old key fixture");
+    let document = sqlx::query(
+        "UPDATE gw_resources SET doc = jsonb_set(doc, '{allowed_endpoints}', $2::jsonb), \
+           projected_version = version \
+         WHERE kind = 'api_keys' AND id = $1::uuid AND NOT deleted",
+    )
+    .bind(key)
+    .bind(&old)
+    .execute(&mut *tx)
+    .await
+    .expect("restore the old endpoint grant");
+    assert_eq!(document.rows_affected(), 1);
+    let row = sqlx::query(
+        "UPDATE tenant_keys SET doc_version = 3 WHERE id = $1::uuid AND revoked_at IS NULL",
+    )
+    .bind(key)
+    .execute(&mut *tx)
+    .await
+    .expect("restore the old document version");
+    assert_eq!(row.rows_affected(), 1);
+    tx.commit().await.expect("commit old key fixture");
+    assert_eq!(key_doc(cp, key).await["allowed_endpoints"], old);
+    assert_eq!(doc_version(cp, key).await, 3);
+    assert_projected_key_fixture(cp, key).await;
+}
+
+/// 已部署旧文档必须被确认过，不能把未投影关闭队列误当作下一序号场景。
+async fn assert_projected_key_fixture(cp: &TestCp, key: &str) {
+    let (version, projected): (i64, Option<i64>) = sqlx::query_as(
+        "SELECT version, projected_version FROM gw_resources WHERE kind = 'api_keys' AND id = $1::uuid",
+    )
+    .bind(key)
+    .fetch_one(cp.db().pool())
+    .await
+    .expect("read the deployed key fixture");
+    assert_eq!(projected, Some(version), "key {key} was not projected");
+}
+
+/// 遗漏 completions 或删掉整份端点限制都会失败；模型、分组和身份仍受约束。
+#[tokio::test]
+async fn completions_customer_keys_grant_exactly_the_seven_public_endpoint_families() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let ids = models(
+        &cp,
+        &admin,
+        &["completion-allowed-7c1", "completion-other-7c1"],
+    )
+    .await;
+    let tenant = cp.seed_tenant(TenantStatus::Active).await;
+    patch_tenant_ok(&cp, &admin, tenant, json!({"allowed_model_ids": [&ids[0]]})).await;
+    let owner = cp.member_login_seeded(tenant, MemberRole::Owner).await;
+    let (key, plaintext) = mint_ok(
+        &cp,
+        &owner,
+        json!({"label": "completion-public-7c1", "model_ids": [&ids[0]], "rate_limit": {"concurrency": 2, "rpm": 30}}),
+    )
+    .await;
+    let doc = key_doc(&cp, &key).await;
+    assert_eq!(
+        doc["allowed_endpoints"],
+        customer_endpoints_with_completions()
+    );
+    assert_eq!(doc["allowed_model_ids"], json!([&ids[0]]));
+    assert_eq!(doc["allowed_provider_groups"], json!(["shared"]));
+    assert_eq!(doc["user_id"], json!(owner.id));
+    assert_eq!(doc["team_id"], json!(tenant));
+    assert_eq!(doc["key_hash"], json!(ApiKey::hash_bearer(&plaintext)));
+    assert_eq!(doc["rate_limit"], json!({"concurrency": 2, "rpm": 30}));
+    assert_eq!(doc["disabled"], false);
+    assert_eq!(doc_version(&cp, &key).await, 4);
+    for absent in [
+        "allowed_models",
+        "allowed_agents",
+        "allowed_routes",
+        "mcp_access",
+    ] {
+        assert!(doc.get(absent).is_none(), "unexpected grant {absent}");
+    }
+    let projected: ApiKey = serde_json::from_value(doc).expect("the gateway key projection");
+    assert!(projected.can_call(EndpointFamily::Completions));
+    assert!(projected.can_call(EndpointFamily::ChatCompletions));
+    for closed in [
+        EndpointFamily::Images,
+        EndpointFamily::Audio,
+        EndpointFamily::Videos,
+        EndpointFamily::Files,
+        EndpointFamily::Batches,
+        EndpointFamily::FineTuning,
+        EndpointFamily::Mcp,
+        EndpointFamily::A2a,
+        EndpointFamily::Passthrough,
+    ] {
+        assert!(
+            !projected.can_call(closed),
+            "unexpected endpoint {closed:?}"
+        );
+    }
+    let refused = mint(
+        &cp,
+        &owner,
+        json!({"label": "completion-outside-model-7c1", "model_ids": [&ids[1]]}),
+    )
+    .await;
+    assert_eq!(refused.status, 422, "{refused:?}");
+    assert_eq!(refused.body["details"][0]["path"], "/model_ids/0");
+}
+
+/// 漏升文档版本会让真实旧六项文档在启动后仍停留版本 3。
+#[tokio::test]
+async fn completions_boot_upgrades_real_v3_key_documents_without_reopening_revoked_keys() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let ids = models(&cp, &admin, &["completion-upgrade-model-7c1"]).await;
+    let tenant = cp.seed_tenant(TenantStatus::Active).await;
+    patch_tenant_ok(&cp, &admin, tenant, json!({"allowed_model_ids": [&ids[0]]})).await;
+    let owner = cp.member_login_seeded(tenant, MemberRole::Owner).await;
+    let expires = (chrono::Utc::now() + chrono::TimeDelta::days(30))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let (bound, plaintext) = mint_ok(
+        &cp,
+        &owner,
+        json!({"label": "completion-bound-v3-7c1", "model_ids": [&ids[0]], "expires_at": expires, "rate_limit": {"rpm": 17}}),
+    )
+    .await;
+    let unbound = admin_mint(
+        &cp,
+        &admin,
+        tenant,
+        json!({"label": "completion-unbound-v3-7c1", "model_ids": [&ids[0]]}),
+    )
+    .await;
+    assert_eq!(unbound.status, 201, "{unbound:?}");
+    let unbound = text(&unbound.body, "/key/id");
+    let (disabled, _) = mint_ok(&cp, &owner, json!({"label": "completion-disabled-v3-7c1"})).await;
+    let closed = on_key(
+        &cp,
+        &owner,
+        "PATCH",
+        &disabled,
+        Some(json!({"disabled": true})),
+    )
+    .await;
+    assert_eq!(closed.status, 200, "{closed:?}");
+    let (revoked, _) = mint_ok(&cp, &owner, json!({"label": "completion-revoked-v3-7c1"})).await;
+    for key in [&bound, &unbound, &disabled, &revoked] {
+        restore_v3_endpoint_document(&cp, key).await;
+    }
+    let removed = on_key(&cp, &owner, "DELETE", &revoked, None).await;
+    assert_eq!(removed.status, 204, "{removed:?}");
+    let gone = stored(&cp, "api_keys", &revoked).await;
+    assert!(gone.deleted);
+    let mut before = Vec::new();
+    for key in [&bound, &unbound, &disabled] {
+        let old = stored(&cp, "api_keys", key).await;
+        assert_eq!(
+            old.doc["allowed_endpoints"],
+            json!([
+                "chat_completions",
+                "messages",
+                "count_tokens",
+                "responses",
+                "embeddings",
+                "models"
+            ]),
+            "key {key} must still have the old six endpoint families"
+        );
+        assert_eq!(doc_version(&cp, key).await, 3, "key {key}");
+        assert_projected_key_fixture(&cp, key).await;
+        before.push((key.clone(), old, key_version(&cp, key).await));
+    }
+    assert!(before[0].1.doc.get("user_id").is_some());
+    assert!(before[1].1.doc.get("user_id").is_none());
+    assert_eq!(before[2].1.doc["disabled"], true);
+
+    let restarted = cp.restart().await;
+    for (key, old, version) in before {
+        let after = stored(&restarted, "api_keys", &key).await;
+        assert!(!after.deleted);
+        assert_eq!(doc_version(&restarted, &key).await, 4, "{key}");
+        assert_eq!(
+            after.doc["allowed_endpoints"],
+            customer_endpoints_with_completions()
+        );
+        let mut expected = old.doc;
+        expected["allowed_endpoints"] = customer_endpoints_with_completions();
+        assert_eq!(
+            after.doc, expected,
+            "a catch-up changed a different key grant"
+        );
+        assert_eq!(after.managed_by, old.managed_by);
+        assert!(
+            after.seq > old.seq,
+            "key {key}, disabled={}, before_seq={}, after_seq={}",
+            after.doc["disabled"],
+            old.seq,
+            after.seq
+        );
+        assert_eq!(key_version(&restarted, &key).await, version);
+    }
+    let revealed = reveal(&restarted, &owner, &bound).await;
+    assert_eq!(revealed.status, 200, "{revealed:?}");
+    assert_eq!(text(&revealed.body, "/plaintext"), plaintext);
+    let after_gone = stored(&restarted, "api_keys", &revoked).await;
+    assert!(after_gone.deleted);
+    assert_eq!(after_gone.seq, gone.seq);
+    assert_eq!(doc_version(&restarted, &revoked).await, 3);
+}
+
+/// 旧副本回写的单个旧文档要追平；已正确的 key 和第二遍均不产生资源更新。
+#[tokio::test]
+async fn completions_catch_up_repairs_an_old_replica_write_once_and_leaves_current_keys_untouched()
+{
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let tenant = cp.seed_tenant(TenantStatus::Active).await;
+    let other = cp.seed_tenant(TenantStatus::Active).await;
+    let owner = cp.member_login_seeded(tenant, MemberRole::Owner).await;
+    let outsider = cp.member_login_seeded(other, MemberRole::Owner).await;
+    let (lagging, _) = mint_ok(&cp, &owner, json!({"label": "completion-old-replica-7c1"})).await;
+    let (current, _) = mint_ok(&cp, &owner, json!({"label": "completion-current-7c1"})).await;
+    let (another, _) = mint_ok(
+        &cp,
+        &outsider,
+        json!({"label": "completion-other-current-7c1"}),
+    )
+    .await;
+    let ctx = WriteCtx::of(cp.state());
+    // 准备明确版本 4 的文档，再模拟旧副本只回写并投影其中一行。
+    keys::catch_up(cp.db(), &ctx, 4)
+        .await
+        .expect("prepare version four documents");
+    assert_eq!(
+        key_doc(&cp, &current).await["allowed_endpoints"],
+        customer_endpoints_with_completions()
+    );
+    for key in [&lagging, &current, &another] {
+        assert_eq!(doc_version(&cp, key).await, 4);
+    }
+    restore_v3_endpoint_document(&cp, &lagging).await;
+    let lagging_before = stored(&cp, "api_keys", &lagging).await;
+    let current_before = stored(&cp, "api_keys", &current).await;
+    let another_before = stored(&cp, "api_keys", &another).await;
+    let pass = keys::catch_up(cp.db(), &ctx, 4)
+        .await
+        .expect("repair old replica write");
+    assert_eq!(
+        pass,
+        keys::CatchUp {
+            rewritten: 1,
+            ..keys::CatchUp::default()
+        }
+    );
+    assert_eq!(doc_version(&cp, &lagging).await, 4);
+    let repaired = stored(&cp, "api_keys", &lagging).await;
+    assert_eq!(
+        repaired.doc["allowed_endpoints"],
+        customer_endpoints_with_completions()
+    );
+    assert!(repaired.seq > lagging_before.seq);
+    for (key, before) in [(&current, current_before), (&another, another_before)] {
+        let after = stored(&cp, "api_keys", key).await;
+        assert_eq!(after.doc, before.doc);
+        assert_eq!(after.seq, before.seq);
+        assert_eq!(after.updated_at, before.updated_at);
+        assert_eq!(doc_version(&cp, key).await, 4);
+    }
+    let again = keys::catch_up(cp.db(), &ctx, 4)
+        .await
+        .expect("repeat catch-up");
+    assert_eq!(again, keys::CatchUp::default());
+    assert_eq!(stored(&cp, "api_keys", &lagging).await.seq, repaired.seq);
 }

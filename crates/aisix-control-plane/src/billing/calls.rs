@@ -67,6 +67,7 @@ pub enum TenantStatus {
 pub fn tenant_error(error_class: &str, error_message: &str) -> &'static str {
     match error_class {
         "model_not_found" => "model_not_found",
+        "client_disconnected" => "client_disconnected",
         "permission_denied" if error_message.starts_with("API key is not allowed to use model") => {
             "model_not_found"
         }
@@ -137,12 +138,12 @@ pub fn visible_to_tenant(is_final_attempt: bool, charge_status: &str, repriced: 
 }
 
 /// [`visible_to_tenant`] over the joined `pc` (charge) and `ue` (usage row).
-pub(super) const VISIBLE: &str =
+pub(crate) const VISIBLE: &str =
     "(ue.event->'is_final_attempt' = 'true'::jsonb OR pc.status = 'charged' \
      OR EXISTS (SELECT 1 FROM pricing_adjustments_cny pa WHERE pa.event_id = pc.event_id))";
 
 /// The sum of the adjustments of the charge `pc`, `NULL` when it has none.
-pub(super) const ADJUSTED: &str =
+pub(crate) const ADJUSTED: &str =
     "(SELECT SUM(pa.delta_micro_cny)::bigint FROM pricing_adjustments_cny pa \
      WHERE pa.event_id = pc.event_id)";
 
@@ -159,7 +160,7 @@ pub(super) const ADJUSTED: &str =
 /// the order is broken by `run_id` — part of the table's own key, and
 /// therefore the same row for every query that reads it. `eff` is all NULL
 /// only for a charge no run adjusted.
-pub(super) const EFFECTIVE: &str = " LEFT JOIN LATERAL (\
+pub(crate) const EFFECTIVE: &str = " LEFT JOIN LATERAL (\
     SELECT pa.lines, pa.cny_per_usd_e4, pa.discount_bps, pa.service_tier, pa.created_at \
     FROM pricing_adjustments_cny pa WHERE pa.event_id = pc.event_id \
     ORDER BY pa.created_at DESC, pa.run_id DESC LIMIT 1) eff ON true";
@@ -167,7 +168,7 @@ pub(super) const EFFECTIVE: &str = " LEFT JOIN LATERAL (\
 /// The charge's lines as [`EFFECTIVE`] corrects them; `NULL` when the latest
 /// adjustment recorded none, which a caller shows as unknown rather than
 /// substituting an earlier run's.
-pub(super) const EFF_LINES: &str =
+pub(crate) const EFF_LINES: &str =
     "(CASE WHEN eff.created_at IS NULL THEN pc.lines WHEN eff.lines IS NULL THEN NULL \
       ELSE eff.lines END)";
 
@@ -193,7 +194,9 @@ pub(super) const EVENT_FIELDS: &str = "jsonb_build_object(\
     'is_final_attempt', ue.event->'is_final_attempt', \
     'cache_status', ue.event->'cache_status', \
     'guardrail_blocked', ue.event->'guardrail_blocked', \
-    'downstream_latency_ms', ue.event->'downstream_latency_ms')";
+    'downstream_latency_ms', ue.event->'downstream_latency_ms', \
+    'first_token_latency_ms', ue.event->'first_token_latency_ms', \
+    'upstream_latency_ms', ue.event->'upstream_latency_ms')";
 
 /// A model as a tenant sees it: `id` only while the model is in the
 /// tenant's current grants.
@@ -295,6 +298,16 @@ pub struct ChargeView {
     /// The charge's lines, `null` under the same condition as
     /// `discount_bps`.
     pub lines: Option<Value>,
+    pub calculation: ChargeCalculation,
+}
+
+/// 金额以十进制字符串保留完整存储精度，未知金额保持 null。
+#[derive(Debug, Serialize)]
+pub struct ChargeCalculation {
+    pub original_micro_cny: Option<String>,
+    pub adjusted_micro_cny: String,
+    pub final_micro_cny: Option<String>,
+    pub rounding: &'static str,
 }
 
 /// One call of the tenant.
@@ -313,6 +326,9 @@ pub struct Call {
     pub cache_hit: bool,
     pub guardrail_blocked: bool,
     pub latency_ms: Option<u32>,
+    pub first_token_latency_ms: Option<u32>,
+    /// 本次模型请求的上游起点至结束，包含网络传输，不是请求级总耗时。
+    pub attempt_duration_ms: Option<u32>,
     pub charge: ChargeView,
 }
 
@@ -656,7 +672,28 @@ pub async fn list_calls(
                     .and_then(Value::as_u64)
                     .and_then(|ms| u32::try_from(ms).ok())
                     .filter(|ms| *ms > 0),
+                first_token_latency_ms: r
+                    .ev
+                    .get("first_token_latency_ms")
+                    .and_then(Value::as_u64)
+                    .and_then(|ms| u32::try_from(ms).ok()),
+                attempt_duration_ms: r
+                    .ev
+                    .get("upstream_latency_ms")
+                    .and_then(Value::as_u64)
+                    .and_then(|ms| u32::try_from(ms).ok())
+                    .filter(|ms| *ms > 0),
                 charge: ChargeView {
+                    calculation: ChargeCalculation {
+                        original_micro_cny: r.charge_micro_cny.map(|amount| amount.to_string()),
+                        adjusted_micro_cny: r.adjusted.unwrap_or(0).to_string(),
+                        final_micro_cny: (view.charge_status != "pending").then(|| {
+                            (i128::from(r.charge_micro_cny.unwrap_or(0))
+                                + i128::from(r.adjusted.unwrap_or(0)))
+                            .to_string()
+                        }),
+                        rounding: "ceil_micro_cny",
+                    },
                     status: view.charge_status,
                     amount_micro_cny: r.charge_micro_cny,
                     group: r

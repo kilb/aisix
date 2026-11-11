@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 use sqlx::PgConnection;
 use uuid::Uuid;
 
-use super::lookup_prices::{priced_models, PricedModel};
+use super::lookup_prices::{priced_models, PricedModel, QuoteContext};
 use super::money::CURRENCY;
 use crate::auth::MemberAuth;
 use crate::error::ApiError;
@@ -35,15 +35,18 @@ use crate::AppState;
 /// id, and the sort is stable). A model whose rate cannot be rendered is left
 /// out, never shown as 0.
 fn models_of(models: &[PricedModel]) -> Vec<Value> {
-    use aisix_pricing::cny_per_million;
+    use aisix_pricing::Dimension;
     let mut rows: Vec<(&str, Value)> = Vec::new();
     for model in models {
-        let per_million =
-            |rate: aisix_pricing::Rate| cny_per_million(rate, model.cny, model.discount_bps);
-        let (Some(input), Some(output)) = (
-            per_million(model.base.input),
-            per_million(model.base.output),
-        ) else {
+        let explicit = |dimension| {
+            model
+                .base()
+                .iter()
+                .find(|rate| rate.dimension == dimension && rate.fallback_from.is_none())
+                .and_then(|rate| rate.price_cny_per_million.as_ref())
+        };
+        let (Some(input), Some(output)) = (explicit(Dimension::Input), explicit(Dimension::Output))
+        else {
             continue;
         };
         let mut row = json!({
@@ -51,15 +54,14 @@ fn models_of(models: &[PricedModel]) -> Vec<Value> {
             "name": model.name,
             "input_per_million": input,
             "output_per_million": output,
+            "prices_by_tier": model.quote.prices_by_tier,
         });
-        // A cache rate is shown only while the baseline carries one: an
-        // absent one is not a price of 0.
-        for (field, rate) in [
-            ("cache_read_per_million", model.base.cache_read),
-            ("cache_write_per_million", model.base.cache_write),
-            ("cache_write_1h_per_million", model.base.cache_write_1h),
+        for (field, dimension) in [
+            ("cache_read_per_million", Dimension::CacheRead),
+            ("cache_write_per_million", Dimension::CacheWrite),
+            ("cache_write_1h_per_million", Dimension::CacheWrite1h),
         ] {
-            if let Some(text) = rate.and_then(per_million) {
+            if let Some(text) = explicit(dimension) {
                 row[field] = json!(text);
             }
         }
@@ -109,17 +111,34 @@ pub async fn prices(
     // cannot leave this handler behind.
     auth.require(EVERY_MEMBER)?;
     let tenant_id = auth.tenant_id;
+    let cache = state.prices.clone();
     let body = state
         .db
         .tx(move |conn| {
             async move {
+                let context = QuoteContext::load(&mut *conn, &cache).await?;
+                let discount_bps = context
+                    .book
+                    .customer_discount_bps(&tenant_id.to_string(), context.as_of)
+                    .ok();
                 let groups = assigned_groups(&mut *conn, tenant_id).await?;
                 let mut views = Vec::with_capacity(groups.len());
+                let mut valid_until = None;
                 for group in &groups {
-                    let priced = priced_models(&mut *conn, tenant_id, Some(group.id)).await?;
+                    let priced =
+                        priced_models(&mut *conn, &context, tenant_id, Some(group.id)).await?;
+                    if let Some(until) = priced.valid_until {
+                        valid_until = Some(
+                            valid_until.map_or(until, |current: chrono::DateTime<chrono::Utc>| {
+                                current.min(until)
+                            }),
+                        );
+                    }
                     views.push(group_view(group, &priced.models));
                 }
-                Ok::<_, ApiError>(json!({ "currency": CURRENCY, "groups": views }))
+                Ok::<_, ApiError>(json!({ "currency": CURRENCY, "groups": views,
+                    "discount_bps": discount_bps, "pricing_version": context.pricing_version,
+                    "as_of": context.as_of, "valid_until": valid_until }))
             }
             .boxed()
         })

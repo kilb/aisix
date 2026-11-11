@@ -13,6 +13,8 @@ import {
   type SessionMember,
   type TenantKey,
 } from "./lib/api";
+import { BudgetAccountAmounts, type BudgetAccountBalance } from "./BudgetAccountAmounts";
+import { formulaBalance } from "./lib/formulaApi";
 import { formMessageFor, messageFor } from "./lib/errors";
 import { fmtUtc, isCnyAmount, microCnyToInput } from "./lib/money";
 import { Money } from "./ui/BalanceReadout";
@@ -145,9 +147,12 @@ export function Budgets({ member }: { member: SessionMember }) {
   const role = member.role;
   const manager = role === "owner" || role === "admin";
   const creator = manager || role === "member";
+  const financial = manager || role === "billing";
 
   const [rows, setRows] = useState<Budget[] | null>(null);
   const [rowsErr, setRowsErr] = useState<string | null>(null);
+  const [balance, setBalance] = useState<BudgetAccountBalance | null>(null);
+  const [balanceErr, setBalanceErr] = useState<string | null>(null);
   const [keys, setKeys] = useState<TenantKey[] | null>(role === "billing" ? [] : null);
   const [people, setPeople] = useState<Member[]>([]);
   const [quotas, setQuotas] = useState<Record<string, KeyQuota>>({});
@@ -157,6 +162,27 @@ export function Budgets({ member }: { member: SessionMember }) {
   const [shown, setShown] = useState(KEYS_PER_VIEW);
   const [reloading, setReloading] = useState(true);
   const reload = useCallback(() => setTick((n) => n + 1), []);
+
+  // 账户与额外预算独立读取；普通成员不发起无权访问的财务请求。
+  useEffect(() => {
+    if (!financial) return;
+    let live = true;
+    formulaBalance().then(
+      (value) => {
+        if (!live) return;
+        setBalance(value);
+        setBalanceErr(null);
+      },
+      (e: unknown) => {
+        if (!live) return;
+        setBalance(null);
+        setBalanceErr(failure(e));
+      },
+    );
+    return () => {
+      live = false;
+    };
+  }, [financial, tick]);
 
   useEffect(() => {
     let live = true;
@@ -172,7 +198,6 @@ export function Budgets({ member }: { member: SessionMember }) {
         setRows(list.value);
         setRowsErr(null);
       } else {
-        setRows((r) => r ?? []);
         setRowsErr(failure(list.reason));
       }
       setKeys(keyList.status === "fulfilled" ? keyList.value : []);
@@ -224,30 +249,56 @@ export function Budgets({ member }: { member: SessionMember }) {
           <div className="grid gap-6">
             {rowsErr && (
               <div className="note crit" role="alert">
-                {rowsErr}
+                预算读取失败：{rowsErr}
               </div>
             )}
-            {role !== "member" && (
-              <Section title="组织额度（平台分配）">
-                <QuotaTable
-                  label="组织额度"
-                  rows={rows === null ? null : team}
-                  empty="平台还没有为组织设置额度"
-                  role={role}
-                  parentsOf={() => []}
-                  onChanged={reload}
-                />
-              </Section>
+            {financial && (
+              <>
+                <Section title="账户额度" actions={<a href="#billing">查看账户</a>}>
+                  {balanceErr ? (
+                    <div className="note crit" role="alert">
+                      账户额度读取失败：{balanceErr}
+                    </div>
+                  ) : balance === null ? (
+                    <Loading />
+                  ) : (
+                    <>
+                      <BudgetAccountAmounts balance={balance} />
+                      {balance.exhausted && (
+                        <div className="note warn">
+                          {balance.billing_mode === "postpaid" ? "账户已达信用额度" : "账户余额不足"}
+                        </div>
+                      )}
+                    </>
+                  )}
+                  <p className="hint">账户额度与额外预算上限分别生效；调用仍受组织、成员、密钥预算及其他限制约束。</p>
+                </Section>
+                <Section title="组织预算（平台设置）">
+                  <p className="hint">平台可额外设置按周期或一次性的组织预算上限，与账户余额和信用额度不同。</p>
+                  {!rowsErr && (
+                    <QuotaTable
+                      label="组织额度"
+                      rows={rows === null ? null : team}
+                      empty="未设置额外组织预算上限"
+                      role={role}
+                      parentsOf={() => []}
+                      onChanged={reload}
+                    />
+                  )}
+                </Section>
+              </>
             )}
             <Section title="成员额度">
-              <QuotaTable
-                label="成员额度"
-                rows={rows === null ? null : memberRows}
-                empty={manager ? "还没有成员额度，可在「新建额度」中新建" : role === "billing" ? "还没有成员额度" : "还没有给你设置成员额度"}
-                role={role}
-                parentsOf={() => team.map(termsOf)}
-                onChanged={reload}
-              />
+              {!rowsErr && (
+                <QuotaTable
+                  label="成员额度"
+                  rows={rows === null ? null : memberRows}
+                  empty={manager ? "还没有成员额度，可在「新建额度」中新建" : role === "billing" ? "还没有成员额度" : "还没有给你设置成员额度"}
+                  role={role}
+                  parentsOf={() => team.map(termsOf)}
+                  onChanged={reload}
+                />
+              )}
             </Section>
             <Section
               title="密钥额度"
@@ -263,19 +314,21 @@ export function Budgets({ member }: { member: SessionMember }) {
                 </div>
               )}
               <KeyFigures keys={keys} rows={keyRows} quotas={quotas} shown={shown} onMore={() => setShown((n) => n + KEYS_PER_VIEW)} />
-              <QuotaTable
-                label="密钥额度"
-                rows={rows === null ? null : keyRows}
-                empty={creator ? "还没有密钥额度，可在「新建额度」中新建" : "还没有密钥额度"}
-                role={role}
-                parentsOf={(b) => keyParents(quotas[b.target.id])}
-                onChanged={reload}
-              />
+              {!rowsErr && (
+                <QuotaTable
+                  label="密钥额度"
+                  rows={rows === null ? null : keyRows}
+                  empty={creator ? "还没有密钥额度，可在「新建额度」中新建" : "还没有密钥额度"}
+                  role={role}
+                  parentsOf={(b) => keyParents(quotas[b.target.id])}
+                  onChanged={reload}
+                />
+              )}
             </Section>
           </div>
         }
         aside={
-          creator ? (
+          creator && !rowsErr ? (
             <CreateForm role={role} keys={keys} people={people} team={team} quotas={quotas} onCreated={reload} />
           ) : undefined
         }

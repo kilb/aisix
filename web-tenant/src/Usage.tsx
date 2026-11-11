@@ -4,14 +4,14 @@ import {
   ApiError,
   keys as keyApi,
   models as modelApi,
-  usageCalls,
   usageSummary,
-  type Call,
   type PortalModel,
   type SessionMember,
   type TenantKey,
   type UsageSummaryRow,
 } from "./lib/api";
+import { formulaCalls as usageCalls, type FormulaCall as Call } from "./lib/formulaApi";
+import { discountedRate, feeMicroCny } from "./lib/formula";
 import { formMessageFor, messageFor } from "./lib/errors";
 import { fmtCnyPerMillion, fmtMicroCny, fmtUtc, perThousandOfPerMillion, periodLabel, todayUtc, utcRange } from "./lib/money";
 import { Button } from "./ui/Button";
@@ -55,9 +55,10 @@ function unitPrice(dimension: string, perMillion: string): string {
   return PER_CALL.has(dimension) ? `${fmtCnyPerMillion(perThousandOfPerMillion(perMillion))} / 千次` : fmtCnyPerMillion(perMillion);
 }
 
-/** What a failed call's reason is called; one not listed shows raw. */
+/** 租户可见的失败原因；未知类型使用通用说明。 */
 const ERROR_LABEL: Record<string, string> = {
   model_not_found: "模型不存在",
+  client_disconnected: "客户端断开连接",
   invalid_request: "请求无效",
   rate_limited: "请求过于频繁",
   budget_exceeded: "额度已用尽",
@@ -67,8 +68,8 @@ const ERROR_LABEL: Record<string, string> = {
 };
 
 /** A signed amount for a correction: `+¥0.002` or `-¥0.002`. */
-function signed(micro: number): string {
-  return micro > 0 ? `+${fmtMicroCny(micro)}` : fmtMicroCny(micro);
+function signed(micro: string): string {
+  return BigInt(micro) >= 0n ? `+${fmtMicroCny(micro)}` : fmtMicroCny(micro);
 }
 
 /** Basis points as the share taken off, in integer arithmetic: 1000 is `10%`, 1250 is `12.5%`. */
@@ -82,13 +83,9 @@ function chargeText(c: Call): string {
   const { charge } = c;
   switch (charge.status) {
     case "charged": {
-      // Unpriced when made, then corrected by re-pricing: the whole charge is the adjustment.
-      if (charge.amount_micro_cny === null && charge.adjusted_micro_cny !== 0) {
-        return `${fmtMicroCny(charge.adjusted_micro_cny)}（重新计价）${charge.estimated ? "（估算）" : ""}`;
-      }
-      const amount = charge.amount_micro_cny === null ? "—" : fmtMicroCny(charge.amount_micro_cny);
-      const adjusted = charge.adjusted_micro_cny !== 0 ? `（已调整 ${signed(charge.adjusted_micro_cny)}）` : "";
-      return `${amount}${adjusted}${charge.estimated ? "（估算）" : ""}`;
+      const amount = charge.calculation.final_micro_cny;
+      const adjusted = charge.calculation.adjusted_micro_cny !== "0" ? "（含调整）" : "";
+      return `${amount === null ? "金额未知" : fmtMicroCny(amount)}${adjusted}${charge.estimated ? "（估算）" : ""}`;
     }
     case "exempt":
       return c.cache_hit ? "不计费（缓存命中）" : "不计费";
@@ -105,8 +102,55 @@ function CallStatusLamp({ call }: { call: Call }) {
   if (call.status === "succeeded") return <Lamp state="applied">成功</Lamp>;
   if (call.status === "retried") return <Lamp state="pending">已重试</Lamp>;
   if (call.status !== "failed") return <Lamp state="pending">{call.status}</Lamp>;
-  const reason = call.error_class === null ? "失败" : (ERROR_LABEL[call.error_class] ?? call.error_class);
+  const reason = call.error_class === null ? "失败" : (ERROR_LABEL[call.error_class] ?? "调用未完成");
   return <Lamp state="rejected">{`失败（${reason}）`}</Lamp>;
+}
+
+/** 从保存的计价行复算；不请求目录现价，不将未知金额当作免费。 */
+function FeeCalculation({ call }: { call: Call }) {
+  const { charge } = call;
+  const f = charge.calculation;
+  const result = charge.lines === null ? null : feeMicroCny(charge.lines, charge.discount_bps);
+  const positive = f.final_micro_cny !== null && BigInt(f.final_micro_cny) > 0n;
+  return (
+    <section aria-label="费用计算" className="grid gap-2">
+      <h3>费用计算</h3>
+      {call.status === "failed" && (
+        <dl><div><dt>失败原因</dt><dd>{ERROR_LABEL[call.error_class ?? ""] ?? "调用未完成，请凭请求 ID 联系管理员"}</dd></div></dl>
+      )}
+      {call.status === "failed" && charge.status === "charged" && positive && (
+        <>
+          <p>调用未完成，但已产生用量，按已产生用量计费</p>
+          {charge.estimated && <p className="hint">本次包含估算用量。</p>}
+        </>
+      )}
+      {call.status === "retried" && <p className="hint">这里展示本次尝试的费用，同一请求的其他计费尝试单独记录。</p>}
+      {f.final_micro_cny === null ? <p>待计价，最终金额未知。</p> : (
+        <>
+          <dl className="grid gap-x-6 gap-y-1 sm:grid-cols-3">
+            <div><dt>原始费用</dt><dd>{f.original_micro_cny === null ? "原调用待计价，未形成原始费用" : fmtMicroCny(f.original_micro_cny)}</dd></div>
+            <div><dt>累计调整</dt><dd>{signed(f.adjusted_micro_cny)}</dd></div>
+            <div><dt>最终费用</dt><dd>{fmtMicroCny(f.final_micro_cny)}{charge.estimated ? "（估算）" : ""}</dd></div>
+          </dl>
+          <p className="tabular break-words">
+            {f.original_micro_cny === null ? "0（未形成原始费用）" : fmtMicroCny(f.original_micro_cny)} {signed(f.adjusted_micro_cny)} = {fmtMicroCny(f.final_micro_cny)}
+          </p>
+          {result === null ? <p className="hint">历史明细缺失或计量、折扣不支持精确复算，无法复算。</p> : (
+            <>
+              <p className="break-words">
+                按本次最终计价明细复算：（{charge.lines?.length ? charge.lines.map((line) =>
+                  `${dimensionLabel(line.dimension)} ${line.quantity} × ${line.rate_cny} 元/百万${PER_CALL.has(line.dimension) ? "次" : "token"}`,
+                ).join(" + ") : "无可计费项，0"}）× {percentOf(10000 - (charge.discount_bps ?? 0))}，整笔向上取整到微元 = {fmtMicroCny(result)}
+              </p>
+              {result !== f.final_micro_cny && <p className="note crit" role="alert">明细复算与记录的最终费用不一致，请凭请求 ID 联系管理员。</p>}
+            </>
+          )}
+        </>
+      )}
+      <p className="hint">首 token 延迟从请求接收到首次交付文本、推理或工具内容；无内容、非流式和旧记录未采集时显示 —。模型处理耗时为本次模型请求开始至结束，包含网络传输，不是整次请求总耗时。</p>
+      {call.latency_ms !== null && <p className="hint">响应延迟（旧采集口径）：{call.latency_ms} ms；不同调用协议的计时终点可能不同。</p>}
+    </section>
+  );
 }
 
 /** The UTC instants a pair of dates names, or null when the end is before the start. */
@@ -491,6 +535,8 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
               <th>请求 ID</th>
               <th>状态</th>
               <th>分组</th>
+              <th className="num">首 token 延迟</th>
+              <th className="num">模型处理耗时</th>
               <th className="num">费用</th>
             </tr>
           </thead>
@@ -521,16 +567,19 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
                       <CallStatusLamp call={c} />
                     </td>
                     <td>{c.charge.group ? c.charge.group.display_name : "—"}</td>
+                    <td className="num">{c.first_token_latency_ms === null ? "—" : `${c.first_token_latency_ms} ms`}</td>
+                    <td className="num">{c.attempt_duration_ms === null ? "—" : `${c.attempt_duration_ms} ms`}</td>
                     <td className="num">{chargeText(c)}</td>
                   </tr>
                   {expanded && (
                     <tr className="usage-detail">
-                      <td colSpan={9}>
+                      <td colSpan={11}>
+                        <FeeCalculation call={c} />
                         <h3>计费明细</h3>
                         {c.charge.lines === null ? (
                           <p className="hint">这次调用的金额由一次未记录费率明细的重新定价更正，费率明细不可知。</p>
                         ) : c.charge.lines.length === 0 ? (
-                          <p className="hint">这次调用没有计费项</p>
+                          <p className="hint">{c.charge.status === "pending" ? "尚未计价，计费项未知" : "这次调用没有计费项"}</p>
                         ) : (
                           <DataTable label="计费明细" compact>
                             <thead>
@@ -538,6 +587,7 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
                                 <th>计量</th>
                                 <th className="num">数量</th>
                                 <th className="num">折扣前单价（元/百万）</th>
+                                <th className="num">折后单价（元/百万）</th>
                               </tr>
                             </thead>
                             <tbody>
@@ -546,6 +596,10 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
                                   <td>{dimensionLabel(l.dimension)}</td>
                                   <td className="num">{l.quantity}</td>
                                   <td className="num">{l.rate_cny === null ? "—" : unitPrice(l.dimension, l.rate_cny)}</td>
+                                  <td className="num">{(() => {
+                                    const rate = l.rate_cny === null ? null : discountedRate(l.rate_cny, c.charge.discount_bps);
+                                    return rate === null ? "—" : unitPrice(l.dimension, rate);
+                                  })()}</td>
                                 </tr>
                               ))}
                             </tbody>

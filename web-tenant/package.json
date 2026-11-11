@@ -9,7 +9,9 @@
     "preview": "vite preview",
     "typecheck": "tsc -b --noEmit",
     "test:unit": "node --experimental-strip-types --test src/lib/*.test.ts",
-    "e2e": "playwright test"
+    "e2e": "playwright test",
+    "e2e:real": "playwright test --config=playwright.real.config.ts",
+    "e2e:real:internal": "playwright test --config=playwright.internal-real.config.ts"
   },
   "dependencies": {
     "@fontsource-variable/geist": "5.3.0",

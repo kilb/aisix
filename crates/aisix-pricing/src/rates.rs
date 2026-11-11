@@ -340,17 +340,27 @@ impl Rates {
     /// for reasoning, audio or image tokens those bill at the input or output
     /// rate of the side they are counted on.
     pub(crate) fn rate_for(&self, d: Dimension) -> Option<Rate> {
-        self.explicit(d).or(match d {
+        self.rate_with_source(d).map(|(rate, _)| rate)
+    }
+
+    // 来源与最终价格由同一次回退解析产生，报价不复制计费规则。
+    pub(crate) fn rate_with_source(&self, d: Dimension) -> Option<(Rate, Option<Dimension>)> {
+        if let Some(rate) = self.explicit(d) {
+            return Some((rate, None));
+        }
+        let source = match d {
             Dimension::CacheRead
             | Dimension::CacheWrite
             | Dimension::AudioInput
-            | Dimension::ImageInput => Some(self.input),
-            Dimension::CacheWrite1h => Some(self.cache_write.unwrap_or(self.input)),
+            | Dimension::ImageInput => Dimension::Input,
+            Dimension::CacheWrite1h if self.cache_write.is_some() => Dimension::CacheWrite,
+            Dimension::CacheWrite1h => Dimension::Input,
             Dimension::Reasoning | Dimension::AudioOutput | Dimension::ImageOutput => {
-                Some(self.output)
+                Dimension::Output
             }
-            Dimension::Input | Dimension::Output | Dimension::WebSearch => None,
-        })
+            Dimension::Input | Dimension::Output | Dimension::WebSearch => return None,
+        };
+        self.explicit(source).map(|rate| (rate, Some(source)))
     }
 
     /// The first optional rate `reference` carries that this set lacks.

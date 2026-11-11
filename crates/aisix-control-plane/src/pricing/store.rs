@@ -107,6 +107,14 @@ impl PriceBookCache {
     /// pricing from what the tables hold. The cache lock is never held across
     /// an await.
     pub async fn current(&self, conn: &mut PgConnection) -> Result<Arc<PriceBook>, DbError> {
+        self.current_with_version(conn).await.map(|(_, book)| book)
+    }
+
+    /// 返回与书本同一次版本栅栏确认的版本，防止给新价格贴上旧版本。
+    pub async fn current_with_version(
+        &self,
+        conn: &mut PgConnection,
+    ) -> Result<(i64, Arc<PriceBook>), DbError> {
         let Some(version) = pricing_version(&mut *conn).await? else {
             tracing::error!(
                 "cp_settings.pricing_version is missing or is not a whole number; the price \
@@ -115,10 +123,10 @@ impl PriceBookCache {
             // A book cached under an earlier version may predate price
             // writes made while the version could not move.
             *self.cached.write().unwrap_or_else(PoisonError::into_inner) = None;
-            return self.load(conn).await;
+            return self.load(conn).await.map(|book| (0, book));
         };
         if let Some(book) = self.cached_at(version) {
-            return Ok(book);
+            return Ok((version, book));
         }
         // One reader reloads; the rest wait here and then find its book.
         let _reloading = self.reload.lock().await;
@@ -126,16 +134,16 @@ impl PriceBookCache {
             // Read again: the reader that held the lock may have cached a
             // later version than the one read above.
             let Some(before) = pricing_version(&mut *conn).await? else {
-                return self.load(conn).await;
+                return self.load(conn).await.map(|book| (0, book));
             };
             if let Some(book) = self.cached_at(before) {
-                return Ok(book);
+                return Ok((before, book));
             }
             let book = self.load(conn).await?;
             if pricing_version(&mut *conn).await? == Some(before) {
                 *self.cached.write().unwrap_or_else(PoisonError::into_inner) =
                     Some((before, book.clone()));
-                return Ok(book);
+                return Ok((before, book));
             }
         }
         tracing::warn!(

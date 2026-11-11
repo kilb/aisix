@@ -62,12 +62,21 @@ pub fn tenant_fixture(method: &str, path: &str) -> (String, Option<Value>) {
             | "/api/groups"
             | "/api/prices"
             | "/api/members"
+            | "/api/members/usage"
             | "/api/members/invites",
         ) => (path.to_string(), None),
         ("POST", "/api/members/invites") => (
             path.to_string(),
             Some(json!({
                 "email": format!("fixture-{}@tenant.test", Uuid::new_v4().simple()),
+                "role": "member",
+            })),
+        ),
+        ("POST", "/api/members") => (
+            path.to_string(),
+            Some(json!({
+                "email": format!("fixture-{}@tenant.test", Uuid::new_v4().simple()),
+                "password": TEST_PASSWORD,
                 "role": "member",
             })),
         ),

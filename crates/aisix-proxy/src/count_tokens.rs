@@ -2175,9 +2175,10 @@ mod tests {
     /// A transport failure, the other arm that used to set a cooldown.
     #[tokio::test]
     async fn an_unreachable_count_upstream_leaves_the_model_out_of_cooldown() {
-        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        // 保持绑定但不监听，避免并行 mock 抢占已释放端口。
+        let closed = tokio::net::TcpSocket::new_v4().unwrap();
+        closed.bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let base = format!("http://{}", closed.local_addr().unwrap());
-        drop(closed);
         let (app, state) = cooldown_app(&base);
         let resp = app.oneshot(cooling_count_request()).await.unwrap();
         assert!(resp.status().is_server_error(), "{}", resp.status());
@@ -2185,6 +2186,7 @@ mod tests {
             state.runtime_status.status("m-ct-cool").status,
             crate::RuntimeStatus::Healthy
         );
+        drop(closed);
     }
 
     /// The other direction: a counted prompt says nothing about whether the

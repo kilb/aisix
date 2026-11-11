@@ -21,7 +21,7 @@ const UPSTREAM_MODEL: &str = "upstream-mdl-9f3";
 const UPSTREAM_ERROR: &str = "upstream secret 4b7";
 
 /// The keys of a `Call`, from the API section.
-const CALL_KEYS: [&str; 14] = [
+const CALL_KEYS: [&str; 16] = [
     "event_id",
     "occurred_at",
     "request_id",
@@ -35,11 +35,13 @@ const CALL_KEYS: [&str; 14] = [
     "cache_hit",
     "guardrail_blocked",
     "latency_ms",
+    "first_token_latency_ms",
+    "attempt_duration_ms",
     "charge",
 ];
 
 /// The keys of a `Call`'s `charge`.
-const CHARGE_KEYS: [&str; 8] = [
+const CHARGE_KEYS: [&str; 9] = [
     "status",
     "amount_micro_cny",
     "group",
@@ -48,6 +50,7 @@ const CHARGE_KEYS: [&str; 8] = [
     "estimated",
     "discount_bps",
     "lines",
+    "calculation",
 ];
 
 /// The keys of one line of a charge, as a tenant reads it.
@@ -649,4 +652,262 @@ async fn operators_read_any_tenants_usage_summary() {
         )
         .await;
     assert_eq!(r.status, 404, "{r:?}");
+}
+
+#[tokio::test]
+async fn delivered_first_token_is_nullable_and_never_inferred_from_first_frame() {
+    let Some(w) = world().await else { return };
+    let m = model(&w, "timed-call", Some(w.tenant)).await;
+    send_all(
+        &w,
+        vec![
+            row(
+                &w,
+                "timed",
+                m,
+                "timed-call",
+                json!({
+                    "first_token_latency_ms": 42, "upstream_ttft_ms": 2,
+                    "upstream_latency_ms": 90, "downstream_latency_ms": 8,
+                }),
+            ),
+            row(
+                &w,
+                "legacy",
+                m,
+                "timed-call",
+                json!({
+                    "upstream_ttft_ms": 3, "downstream_latency_ms": 9,
+                }),
+            ),
+            row(
+                &w,
+                "no-content",
+                m,
+                "timed-call",
+                json!({
+                    "first_token_latency_ms": null, "upstream_ttft_ms": 4,
+                }),
+            ),
+        ],
+    )
+    .await;
+    let o = owner(&w).await;
+    let r = get(&w.cp, "/api/usage/calls", &o).await;
+    let of = |id: &str| {
+        items(&r)
+            .iter()
+            .find(|c| c["event_id"] == id)
+            .expect("call")
+    };
+    assert_eq!(of("timed")["first_token_latency_ms"], 42);
+    assert_eq!(of("timed")["attempt_duration_ms"], 90);
+    assert_eq!(of("timed")["latency_ms"], 8);
+    for id in ["legacy", "no-content"] {
+        assert_eq!(of(id).get("first_token_latency_ms"), Some(&Value::Null));
+        assert_eq!(of(id).get("attempt_duration_ms"), Some(&Value::Null));
+    }
+}
+
+#[tokio::test]
+async fn historical_charge_calculation_is_exact_across_pages_and_repricing() {
+    use aisix_pricing::RateCard;
+    use support::world::{db_now, insert_baseline};
+    let Some(w) = world().await else { return };
+    let m = model(&w, "formula-call", Some(w.tenant)).await;
+    send_all(
+        &w,
+        vec![
+            row(&w, "formula1", m, "formula-call", tokens_680()),
+            row(&w, "formula2", m, "formula-call", tokens_680()),
+        ],
+    )
+    .await;
+    let o = owner(&w).await;
+    let first = get(&w.cp, "/api/usage/calls?limit=1", &o).await;
+    let before = first.body["next_before"].as_i64().expect("next page");
+    let second = get(
+        &w.cp,
+        &format!("/api/usage/calls?limit=1&before={before}"),
+        &o,
+    )
+    .await;
+    for page in [&first, &second] {
+        assert_eq!(
+            items(page)[0]["charge"]["calculation"],
+            json!({
+                "original_micro_cny": "680", "adjusted_micro_cny": "0",
+                "final_micro_cny": "680", "rounding": "ceil_micro_cny",
+            })
+        );
+    }
+    let card: RateCard = serde_json::from_value(json!({"default":{"base":{
+        "input":"2", "output":"4", "cache_read":"0.2"
+    }}}))
+    .expect("price card");
+    insert_baseline(&w.cp, m, db_now(&w.cp).await, card)
+        .await
+        .expect("future price");
+    let unchanged = get(&w.cp, "/api/usage/calls", &o).await;
+    assert!(items(&unchanged)
+        .iter()
+        .all(|c| c["charge"]["calculation"]["final_micro_cny"] == "680"));
+    let admin = w.cp.admin_login_seeded(OperatorRole::Admin).await;
+    let now = db_now(&w.cp).await;
+    let preview =
+        w.cp.send(
+            "POST",
+            "/admin/billing/repricing",
+            Some(w.admin.cookie()),
+            Some(json!({
+                "from": now - chrono::TimeDelta::hours(1), "to": now,
+                "tenant_id": w.tenant, "reason": "验证历史费用公式",
+            })),
+        )
+        .await;
+    assert_eq!(preview.status, 201, "{preview:?}");
+    let run = preview.body["id"].as_str().expect("run id");
+    let applied =
+        w.cp.send(
+            "POST",
+            &format!("/admin/billing/repricing/{run}/apply"),
+            Some(admin.cookie()),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(applied.status, 200, "{applied:?}");
+    let corrected = get(&w.cp, "/api/usage/calls", &o).await;
+    for c in items(&corrected) {
+        assert_eq!(
+            c["charge"]["calculation"],
+            json!({
+                "original_micro_cny": "680", "adjusted_micro_cny": "680",
+                "final_micro_cny": "1360", "rounding": "ceil_micro_cny",
+            })
+        );
+        let lines = c["charge"]["lines"].as_array().expect("lines");
+        assert_eq!(
+            lines
+                .iter()
+                .find(|l| l["dimension"] == "input")
+                .expect("input")["rate_cny"],
+            "2"
+        );
+    }
+}
+
+#[tokio::test]
+async fn charge_calculation_keeps_full_i64_precision_and_unknown_amounts() {
+    let Some(w) = world().await else { return };
+    let m = model(&w, "precise-call", Some(w.tenant)).await;
+    send_all(
+        &w,
+        vec![row(&w, "precise", m, "precise-call", tokens_680())],
+    )
+    .await;
+    // 金额边界是存储合同测试；不以浏览器的浮点数作为期望。
+    sqlx::query("UPDATE pricing_charges_cny SET charge_micro_cny = 9007199254740993 WHERE event_id = 'precise'")
+        .execute(w.cp.db().pool()).await.expect("i64 boundary");
+    let o = owner(&w).await;
+    let r = get(&w.cp, "/api/usage/calls", &o).await;
+    assert_eq!(
+        items(&r)[0]["charge"]["calculation"]["original_micro_cny"],
+        "9007199254740993"
+    );
+    assert_eq!(
+        items(&r)[0]["charge"]["calculation"]["final_micro_cny"],
+        "9007199254740993"
+    );
+    sqlx::query("UPDATE pricing_charges_cny SET status = 'unpriced', charge_micro_cny = NULL WHERE event_id = 'precise'")
+        .execute(w.cp.db().pool()).await.expect("unpriced boundary");
+    let r = get(&w.cp, "/api/usage/calls", &o).await;
+    assert_eq!(
+        items(&r)[0]["charge"]["calculation"].get("final_micro_cny"),
+        Some(&Value::Null)
+    );
+}
+
+#[tokio::test]
+async fn a_disconnected_billable_call_explains_its_safe_failure_reason() {
+    let Some(w) = world().await else { return };
+    let m = model(&w, "disconnected-call", Some(w.tenant)).await;
+    let mut fields = tokens_680();
+    fields["status_code"] = json!(499);
+    fields["error_class"] = json!("client_disconnected");
+    fields["error_message"] = json!("private-account.internal secret credential");
+    send_all(
+        &w,
+        vec![row(&w, "disconnected", m, "disconnected-call", fields)],
+    )
+    .await;
+    let o = owner(&w).await;
+    let r = get(&w.cp, "/api/usage/calls", &o).await;
+    let c = &items(&r)[0];
+    assert_eq!(c["status"], "failed");
+    assert_eq!(c["error_class"], "client_disconnected");
+    assert_eq!(c["charge"]["amount_micro_cny"], 680);
+    assert!(!r.body.to_string().contains("private-account"));
+    assert!(!r.body.to_string().contains("credential"));
+}
+
+#[tokio::test]
+async fn historical_formula_retains_fractional_rates_and_ceil_applies_once_after_discount() {
+    use aisix_control_plane::audit::Actor;
+    use aisix_control_plane::pricing::store::{self, NewDiscount};
+    use aisix_pricing::RateCard;
+    use futures::FutureExt;
+    use support::world::{db_now, insert_baseline};
+    let Some(w) = world().await else { return };
+    let m = model(&w, "rounding-call", Some(w.tenant)).await;
+    let card: RateCard = serde_json::from_value(json!({"default":{"base":{
+        "input":"0.4", "output":"0.4", "cache_read":"0.4"
+    }}}))
+    .expect("fractional price card");
+    insert_baseline(&w.cp, m, db_now(&w.cp).await, card)
+        .await
+        .expect("fractional price");
+    let tenant = w.tenant;
+    let effective_from = db_now(&w.cp).await;
+    w.cp.db()
+        .tx(move |c| {
+            async move {
+                store::insert_discount(
+                    c,
+                    &NewDiscount {
+                        tenant_id: tenant,
+                        effective_from,
+                        discount_bps: 1000,
+                    },
+                    Actor::System,
+                )
+                .await
+            }
+            .boxed()
+        })
+        .await
+        .expect("ten percent discount");
+    send_all(
+        &w,
+        vec![row(
+            &w,
+            "rounding",
+            m,
+            "rounding-call",
+            json!({
+                "prompt_tokens":1, "completion_tokens":1,
+            }),
+        )],
+    )
+    .await;
+    let o = owner(&w).await;
+    let r = get(&w.cp, "/api/usage/calls", &o).await;
+    let c = &items(&r)[0]["charge"];
+    assert_eq!(c["discount_bps"], 1000);
+    assert_eq!(c["calculation"]["final_micro_cny"], "1");
+    let lines = c["lines"].as_array().expect("historical lines");
+    assert_eq!(lines.len(), 2);
+    for l in lines {
+        assert_eq!(l["quantity"], 1);
+        assert_eq!(l["rate_cny"], "0.4");
+    }
 }

@@ -23,9 +23,9 @@
 //!
 //! This is a lookup on its own route: it never touches model traffic.
 
-use std::collections::HashMap;
+use std::sync::Arc;
 
-use aisix_pricing::{cny_per_token, CnyPerUsd, RateCard, ServiceTier, ENGINE_VERSION};
+use aisix_pricing::{CustomerQuote, Dimension, Payer, PriceBook, PriceRate, ServiceTier};
 use axum::extract::{Path, State};
 use axum::Json;
 use chrono::{DateTime, Utc};
@@ -36,13 +36,10 @@ use uuid::Uuid;
 
 use super::access::key_access;
 use super::money::CURRENCY;
-use super::plans::current_discount;
 use crate::db::DbError;
 use crate::dp::DpIdentity;
 use crate::error::ApiError;
-use crate::pricing::baselines::current_baselines;
-use crate::pricing::rates::rate_in_force;
-use crate::pricing::store::pricing_version;
+use crate::pricing::store::PriceBookCache;
 use crate::resources::Kind;
 use crate::AppState;
 
@@ -89,69 +86,63 @@ pub struct TenantPrices {
     pub items: Vec<ModelPrice>,
 }
 
-/// One granted model with everything needed to price it, as the engine reads
-/// it: its baseline card, the group's rate and the tenant's discount.
+// 同一响应的全部分组共享一个与实际收费相同的版本化书本和数据库时刻。
+pub(crate) struct QuoteContext {
+    pub pricing_version: i64,
+    pub as_of: DateTime<Utc>,
+    pub book: Arc<PriceBook>,
+}
+
+impl QuoteContext {
+    pub async fn load(conn: &mut PgConnection, cache: &PriceBookCache) -> Result<Self, DbError> {
+        let as_of = sqlx::query_scalar("SELECT now()")
+            .fetch_one(&mut *conn)
+            .await?;
+        let (pricing_version, book) = cache.current_with_version(conn).await?;
+        Ok(Self {
+            pricing_version,
+            as_of,
+            book,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct PricedModel {
     pub model_id: Uuid,
     pub name: String,
-    /// The baseline's `default` tier base rates.
-    pub base: aisix_pricing::Rates,
-    pub cny: CnyPerUsd,
-    pub discount_bps: u16,
+    pub quote: CustomerQuote,
 }
 
-/// What every granted model a key's group can price costs, now.
-#[derive(Debug, Clone, PartialEq)]
+impl PricedModel {
+    pub fn base(&self) -> &[PriceRate] {
+        self.quote
+            .prices_by_tier
+            .get(&ServiceTier::default_tier())
+            .map(|tier| tier.base.as_slice())
+            .unwrap_or(&[])
+    }
+}
+
 pub struct PricedModels {
-    pub pricing_version: i64,
-    /// The earliest instant one of these prices changes: a baseline of a
-    /// granted model, a rate in the group, or the tenant's discount.
     pub valid_until: Option<DateTime<Utc>>,
     pub models: Vec<PricedModel>,
 }
 
-/// A stored `engine_version` as the price book reads it: one no `u32` holds
-/// reads as the newest.
-fn engine_version(stored: i64) -> u32 {
-    u32::try_from(stored).unwrap_or(u32::MAX)
-}
-
-/// The `default` tier's base rates of `card`, `None` when the card carries no
-/// default tier.
-fn base_rates(card: &RateCard) -> Option<aisix_pricing::Rates> {
-    card.0
-        .get(&ServiceTier::default_tier())
-        .map(|t| t.base.clone())
-}
-
-/// Every granted model of `tenant_id` that has a baseline and a rate for
-/// `group_id` in force, at their prices now.
-///
-/// `None` for a key that does not resolve, which the route answers `404`. A
-/// tenant with no group prices nothing: a grouped key is the only way a
-/// customer has one, and its absence is a closed key rather than a guess at a
-/// rate.
-pub async fn priced_models(
+/// 仅投影已授权且可公开调用的具体名称；内部账号模型和模板从不进入响应。
+pub(crate) async fn priced_models(
     conn: &mut PgConnection,
+    context: &QuoteContext,
     tenant_id: Uuid,
     group_id: Option<Uuid>,
 ) -> Result<PricedModels, DbError> {
-    // Read first. Price writes bump it in their own transaction, and this
-    // transaction does not see one snapshot, so a write racing these reads
-    // can only leave the version older than the prices, never newer: a
-    // gateway that keys its cache on it then refetches, and never keeps
-    // stale prices under a fresh version.
-    let pricing_version = pricing_version(&mut *conn).await?.unwrap_or(0);
-    // What the tenant's model scope gives it: its stored list, or every
-    // live public model when the scope is all. Read here rather than from a
-    // row cached elsewhere, so a public model created since the gateway's
-    // last lookup is priced at this one.
-    let granted: Vec<Uuid> = crate::tenants::scope_model_ids(&mut *conn, tenant_id).await?;
-    // Granted models that still exist, with the name they are listed under.
+    let granted = crate::tenants::scope_model_ids(&mut *conn, tenant_id).await?;
     let granted: Vec<(Uuid, String)> = sqlx::query_as(
-        "SELECT id, COALESCE(doc->>'display_name', '') FROM gw_resources \
-         WHERE kind = $1 AND NOT deleted AND id = ANY($2) ORDER BY id",
+        "SELECT id, doc->>'display_name' FROM gw_resources \
+         WHERE kind = $1 AND NOT deleted AND id = ANY($2) \
+         AND COALESCE(doc->>'internal', 'false') <> 'true' \
+         AND COALESCE(doc->>'display_name', '') <> '' \
+         AND position('*' in doc->>'display_name') = 0 ORDER BY id",
     )
     .bind(Kind::Models.segment())
     .bind(&granted)
@@ -159,59 +150,30 @@ pub async fn priced_models(
     .await?;
     let Some(group_id) = group_id else {
         return Ok(PricedModels {
-            pricing_version,
             valid_until: None,
             models: Vec::new(),
         });
     };
     let ids: Vec<Uuid> = granted.iter().map(|(id, _)| *id).collect();
-    let baselines: HashMap<Uuid, RateCard> = current_baselines(&mut *conn, &ids)
-        .await?
-        .into_iter()
-        .filter(|b| engine_version(b.engine_version) <= ENGINE_VERSION)
-        .filter_map(|b| {
-            let card = serde_json::from_value::<RateCard>(b.card).ok()?;
-            Some((b.model_id, card))
-        })
-        .collect();
-    let discount: Option<u16> = match current_discount(&mut *conn, tenant_id).await? {
-        None => Some(0),
-        // A discount a newer engine wrote cannot be read, so no final price
-        // exists: every model of the tenant is absent rather than shown
-        // undiscounted.
-        Some(d) if engine_version(d.engine_version) > ENGINE_VERSION => None,
-        Some(d) => u16::try_from(d.discount_bps)
-            .ok()
-            .filter(|bps| *bps <= 10_000)
-            .map(Some)
-            .unwrap_or(None),
-    };
-    let Some(discount) = discount else {
-        return Ok(PricedModels {
-            pricing_version,
-            valid_until: None,
-            models: Vec::new(),
-        });
+    let payer = Payer {
+        tenant_id: tenant_id.to_string(),
+        group_id: Some(group_id.to_string()),
     };
     let mut models = Vec::new();
     for (model_id, name) in granted {
-        let Some(base) = baselines.get(&model_id).and_then(base_rates) else {
-            continue;
-        };
-        let Some((rate, _, _)) = rate_in_force(&mut *conn, group_id, Some(model_id)).await? else {
-            continue;
-        };
-        models.push(PricedModel {
-            model_id,
-            name,
-            base,
-            cny: rate,
-            discount_bps: discount,
-        });
+        if let Ok(quote) = context
+            .book
+            .customer_quote(&model_id.to_string(), &payer, context.as_of)
+        {
+            models.push(PricedModel {
+                model_id,
+                name,
+                quote,
+            });
+        }
     }
     Ok(PricedModels {
-        pricing_version,
-        valid_until: valid_until(&mut *conn, &ids, tenant_id, group_id).await?,
+        valid_until: valid_until(conn, &ids, tenant_id, group_id, context.as_of).await?,
         models,
     })
 }
@@ -224,25 +186,27 @@ async fn valid_until(
     models: &[Uuid],
     tenant_id: Uuid,
     group_id: Uuid,
+    as_of: DateTime<Utc>,
 ) -> Result<Option<DateTime<Utc>>, DbError> {
     Ok(sqlx::query_scalar(
         "SELECT min(effective_from) FROM ( \
            SELECT effective_from FROM pricing_baselines \
-            WHERE model_id = ANY($1) AND effective_from > now() \
+            WHERE model_id = ANY($1) AND effective_from > $4 \
            UNION ALL \
            SELECT effective_from FROM pricing_group_rates \
-            WHERE group_id = $2 AND model_id = ANY($1) AND effective_from > now() \
+            WHERE group_id = $2 AND model_id = ANY($1) AND effective_from > $4 \
            UNION ALL \
            SELECT effective_from FROM pricing_group_rates \
-            WHERE group_id = $2 AND model_id IS NULL AND effective_from > now() \
+            WHERE group_id = $2 AND model_id IS NULL AND effective_from > $4 \
            UNION ALL \
            SELECT effective_from FROM pricing_discount_revisions \
-            WHERE tenant_id = $3 AND effective_from > now() \
+            WHERE tenant_id = $3 AND effective_from > $4 \
          ) s",
     )
     .bind(models)
     .bind(group_id)
     .bind(tenant_id)
+    .bind(as_of)
     .fetch_one(&mut *conn)
     .await?)
 }
@@ -250,14 +214,21 @@ async fn valid_until(
 /// One model's price for the gateway's answer: each rate in CNY per token at
 /// `cny`, less `discount_bps`.
 fn model_price(model: &PricedModel) -> ModelPrice {
-    let show = |r: aisix_pricing::Rate| cny_per_token(r, model.cny, model.discount_bps);
+    // 兼容字段只保留独立配置的维度；全部来自同一份最终 CNY 报价。
+    let show = |dimension| {
+        model
+            .base()
+            .iter()
+            .find(|rate| rate.dimension == dimension && rate.fallback_from.is_none())
+            .and_then(PriceRate::per_token)
+    };
     ModelPrice {
         model_id: model.model_id,
-        input: show(model.base.input),
-        output: show(model.base.output),
-        input_cache_read: model.base.cache_read.and_then(show),
-        input_cache_write: model.base.cache_write.and_then(show),
-        input_cache_write_1h: model.base.cache_write_1h.and_then(show),
+        input: show(Dimension::Input),
+        output: show(Dimension::Output),
+        input_cache_read: show(Dimension::CacheRead),
+        input_cache_write: show(Dimension::CacheWrite),
+        input_cache_write_1h: show(Dimension::CacheWrite1h),
     }
 }
 
@@ -265,14 +236,16 @@ fn model_price(model: &PricedModel) -> ModelPrice {
 pub async fn tenant_prices(
     conn: &mut PgConnection,
     key_id: Uuid,
+    cache: &PriceBookCache,
 ) -> Result<Option<TenantPrices>, DbError> {
     let Some(access) = key_access(&mut *conn, key_id).await? else {
         return Ok(None);
     };
-    let priced = priced_models(&mut *conn, access.tenant_id, access.group_id).await?;
+    let context = QuoteContext::load(&mut *conn, cache).await?;
+    let priced = priced_models(&mut *conn, &context, access.tenant_id, access.group_id).await?;
     Ok(Some(TenantPrices {
         tenant_id: access.tenant_id,
-        pricing_version: priced.pricing_version,
+        pricing_version: context.pricing_version,
         currency: CURRENCY,
         valid_until: priced.valid_until,
         items: priced.models.iter().map(model_price).collect(),
@@ -288,26 +261,57 @@ pub async fn prices(
     let key_id = Uuid::parse_str(&key_id).map_err(|_| ApiError::not_found())?;
     // One transaction, so every query shares one `now()` (not one data
     // snapshot: see the order of the reads in `priced_models`).
+    let cache = state.prices.clone();
     let found = state
         .lookups
-        .tx(move |conn| async move { tenant_prices(conn, key_id).await }.boxed())
+        .tx(move |conn| async move { tenant_prices(conn, key_id, &cache).await }.boxed())
         .await?;
     found.map(Json).ok_or_else(ApiError::not_found)
 }
 
 #[cfg(test)]
 mod tests {
-    use aisix_pricing::Rate;
+    use aisix_pricing::{
+        BaselineRow, CnyPerUsd, DiscountRow, GroupRateRow, PriceRows, Rate, ENGINE_VERSION,
+    };
 
     use super::*;
 
     fn priced(base: aisix_pricing::Rates, cny: CnyPerUsd, discount_bps: u16) -> PricedModel {
+        let at = DateTime::UNIX_EPOCH;
+        let book = PriceBook::from_rows(PriceRows {
+            baselines: vec![BaselineRow {
+                revision_id: 1,
+                engine_version: ENGINE_VERSION,
+                model_id: "m".to_owned(),
+                effective_from: at,
+                card: serde_json::json!({"default": {"base": base}}),
+            }],
+            rates: vec![GroupRateRow {
+                revision_id: 2,
+                engine_version: ENGINE_VERSION,
+                group_id: "g".to_owned(),
+                model_id: None,
+                effective_from: at,
+                cny_per_usd_e4: Some(i64::from(cny.0)),
+            }],
+            cost_rates: Vec::new(),
+            discounts: vec![DiscountRow {
+                revision_id: 3,
+                engine_version: ENGINE_VERSION,
+                tenant_id: "t".to_owned(),
+                effective_from: at,
+                discount_bps: i64::from(discount_bps),
+            }],
+        });
+        let payer = Payer {
+            tenant_id: "t".to_owned(),
+            group_id: Some("g".to_owned()),
+        };
         PricedModel {
             model_id: Uuid::nil(),
-            name: "m".to_string(),
-            base,
-            cny,
-            discount_bps,
+            name: "m".to_owned(),
+            quote: book.customer_quote("m", &payer, at).expect("a quote"),
         }
     }
 

@@ -455,6 +455,9 @@ function NewKeyForm({
   // The group the key is bought in: what it is priced at, so it is chosen
   // with the key and never changed afterwards.
   const [group, setGroup] = useState("");
+  const [modelScope, setModelScope] = useState<"inherited" | "selected">("inherited");
+  const [modelsOpen, setModelsOpen] = useState(false);
+  const [modelSearch, setModelSearch] = useState("");
   const [picked, setPicked] = useState<string[]>([]);
   const [concurrency, setConcurrency] = useState("");
   const [rpm, setRpm] = useState("");
@@ -465,6 +468,8 @@ function NewKeyForm({
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [form, focusRefusal] = useRefusalFocus<HTMLFormElement>();
+  const noModels = modelScope === "selected" && picked.length === 0;
+  const modelsEmptyMessage = "请至少选择一个模型，或改为不限制模型";
 
   // One group is the organisation's only choice, so it is preselected; it is
   // still shown, since it is what the key is priced at.
@@ -480,6 +485,11 @@ function NewKeyForm({
     // backend's guess: with several offered, one is chosen or the submit is
     // refused here, and with none the button is disabled below.
     if (groups !== null && groups.length > 0 && group === "") found.group = "请选择分组";
+    if (noModels) {
+      found.models = modelsEmptyMessage;
+      setModelsOpen(true);
+      setModelSearch("");
+    }
     const c = limit(concurrency);
     const r = limit(rpm);
     if (c.problem) found.concurrency = c.problem;
@@ -496,11 +506,11 @@ function NewKeyForm({
       return;
     }
 
-    // Only what was set is sent: no model picked follows every grant, and a
-    // limit left empty follows the organisation's cap.
+    // 不限制模型时省略名单，继承组织当前及后续授权；指定模式始终发送所选 ID。
+    // 留空的限流值继续使用组织上限。
     const body: NewKey = { label };
     if (group !== "") body.group_id = group;
-    if (picked.length > 0) body.model_ids = picked;
+    if (modelScope === "selected") body.model_ids = picked;
     if (c.value !== undefined || r.value !== undefined) body.rate_limit = { concurrency: c.value, rpm: r.value };
     if (expiresAt) body.expires_at = expiresAt;
     if (manager && owner) body.member_id = owner;
@@ -509,6 +519,9 @@ function NewKeyForm({
       const { plaintext } = await keyApi.create(body);
       setLabel("");
       setGroup(groups !== null && groups.length === 1 ? (groups[0]?.id ?? "") : "");
+      setModelScope("inherited");
+      setModelsOpen(false);
+      setModelSearch("");
       setPicked([]);
       setConcurrency("");
       setRpm("");
@@ -526,6 +539,10 @@ function NewKeyForm({
           else rest.push(d.message);
         }
         setErrs(byField);
+        if (byField.models) {
+          setModelsOpen(true);
+          setModelSearch("");
+        }
         if (rest.length > 0) setErr(rest.join("；"));
         focusRefusal();
       } else if (e instanceof ApiError && e.code === "unavailable") {
@@ -544,6 +561,17 @@ function NewKeyForm({
   // The models are a fieldset rather than one Field: their hint and refusal are wired here.
   const modelsHint = `${id}-models-hint`;
   const modelsErr = `${id}-models-err`;
+  const modelsList = `${id}-models-list`;
+  const modelsEmpty = `${id}-models-empty`;
+  const modelsDescribedBy = [modelsHint, errs.models ? modelsErr : noModels ? modelsEmpty : null].filter(Boolean).join(" ");
+  const search = modelSearch.trim().toLocaleLowerCase();
+  const visibleModels = (catalog ?? []).filter((m) => m.name.toLocaleLowerCase().includes(search));
+  function clearModelsError() {
+    setErrs((was) => {
+      const { models: _, ...rest } = was;
+      return rest;
+    });
+  }
   const groupHint = `${id}-group-hint`;
   const groupErr = `${id}-group-err`;
   const choices = (people ?? []).filter((p) => p.id !== me.id && p.role !== "billing");
@@ -634,35 +662,91 @@ function NewKeyForm({
         </div>
 
         <div className="field wide">
-          <fieldset
-            className="field"
-            aria-describedby={errs.models ? `${modelsHint} ${modelsErr}` : modelsHint}
-            aria-invalid={errs.models ? true : undefined}
-          >
+          <fieldset className="field" aria-describedby={modelsDescribedBy}>
             <legend>可用模型</legend>
-            {catalog === null ? (
-              <span className="hint">载入中…</span>
-            ) : catalog.length === 0 ? (
-              <span className="hint">组织还没有获授权的模型</span>
-            ) : (
-              <div className="picks">
-                {catalog.map((m) => (
-                  <label key={m.id} className="pick">
-                    <input
-                      type="checkbox"
-                      checked={picked.includes(m.id)}
-                      onChange={(e) =>
-                        setPicked(e.target.checked ? [...picked, m.id] : picked.filter((p) => p !== m.id))
-                      }
-                    />
-                    {m.name}
-                  </label>
-                ))}
+            <div className="grid gap-3">
+              <label className="pick">
+                <input
+                  type="radio"
+                  name={`${id}-model-scope`}
+                  checked={modelScope === "inherited"}
+                  aria-describedby={modelsHint}
+                  onChange={() => {
+                    setModelScope("inherited");
+                    setModelsOpen(false);
+                    clearModelsError();
+                  }}
+                />
+                不限制模型（继承组织授权）
+              </label>
+              <label className="pick">
+                <input
+                  type="radio"
+                  name={`${id}-model-scope`}
+                  checked={modelScope === "selected"}
+                  aria-invalid={errs.models ? true : undefined}
+                  aria-describedby={modelsDescribedBy}
+                  onChange={() => {
+                    setModelScope("selected");
+                    clearModelsError();
+                  }}
+                />
+                指定模型
+              </label>
+            </div>
+            {modelScope === "selected" && (
+              <div className="grid min-w-0 gap-3">
+                <p className="hint" aria-live="polite">
+                  已选 {picked.length} 个模型
+                </p>
+                {noModels && !errs.models && <p className="hint" id={modelsEmpty}>{modelsEmptyMessage}</p>}
+                <div>
+                  <Button
+                    size="sm"
+                    aria-expanded={modelsOpen}
+                    aria-controls={modelsList}
+                    onClick={() => setModelsOpen((open) => !open)}
+                  >
+                    {modelsOpen ? "收起模型列表" : "展开模型列表"}
+                  </Button>
+                </div>
+                <div id={modelsList} hidden={!modelsOpen}>
+                  <div className="grid gap-3">
+                    <Field label="搜索模型">
+                      <input type="search" value={modelSearch} onChange={(e) => setModelSearch(e.target.value)} />
+                    </Field>
+                    {catalog === null ? (
+                      <span className="hint">载入中…</span>
+                    ) : catalog.length === 0 ? (
+                      <span className="hint">组织还没有获授权的模型</span>
+                    ) : visibleModels.length === 0 ? (
+                      <span className="hint">没有匹配的模型</span>
+                    ) : (
+                      <div className="picks max-h-64 overflow-y-auto [overflow-wrap:anywhere]">
+                        {visibleModels.map((m) => (
+                          <label key={m.id} className="pick min-w-0">
+                            <input
+                              type="checkbox"
+                              checked={picked.includes(m.id)}
+                              onChange={(e) => {
+                                const checked = e.target.checked;
+                                setPicked((was) => checked ? [...was, m.id] : was.filter((p) => p !== m.id));
+                                clearModelsError();
+                              }}
+                            />
+                            {m.name}
+                          </label>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
               </div>
             )}
           </fieldset>
           <p className="hint" id={modelsHint}>
-            不勾选即可使用组织获授权的全部模型，包括以后新授权的
+            不限制模型时，使用组织当前及后续获授权的模型；仍受组织权限和其他限制约束。
+            {modelScope === "inherited" && catalog?.length === 0 && "当前无可用模型，组织后续授权后自动可用。"}
           </p>
           {errs.models && (
             <p className="field-problem" id={modelsErr}>
@@ -709,7 +793,13 @@ function NewKeyForm({
           </div>
         )}
         <div className="col-span-full -mx-6 -mb-6 flex justify-end gap-2 rounded-b-xl border-t border-border bg-muted/40 px-6 py-3 max-[719px]:-mx-4 max-[719px]:-mb-4 max-[719px]:px-4">
-          <Button kind="primary" type="submit" busy={busy} disabled={noGroup}>
+          <Button
+            kind="primary"
+            type="submit"
+            busy={busy}
+            disabled={noGroup || noModels}
+            disabledReason={noModels ? modelsEmptyMessage : undefined}
+          >
             新建密钥
           </Button>
         </div>

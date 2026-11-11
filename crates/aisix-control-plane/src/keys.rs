@@ -70,10 +70,12 @@ use crate::tenants::{self, TenantRow, TenantStatus};
 use crate::AppState;
 
 /// The endpoint families a customer's key may call in the first phase:
-/// chat, messages and their token count, responses, embeddings and the
-/// model list, named as `aisix_core::models::EndpointFamily` names them.
-pub const FIRST_PHASE_ENDPOINTS: [&str; 6] = [
+/// chat and legacy completions, messages and their token count, responses,
+/// embeddings and the model list, named as `aisix_core::models::EndpointFamily`
+/// names them.
+pub const FIRST_PHASE_ENDPOINTS: [&str; 7] = [
     "chat_completions",
+    "completions",
     "messages",
     "count_tokens",
     "responses",
@@ -443,7 +445,9 @@ fn effective_disabled(t: &TenantRow, k: &KeyRow, member_active: bool) -> bool {
 /// 3: a tenant's model scope is resolved into the document, so a key of an
 /// all-scope tenant written as `[]` or as a stale list is rewritten to the
 /// live public models.
-pub const KEY_DOC_VERSION: i32 = 3;
+///
+/// 4：客户密钥增加 legacy completions，已有 live key 在启动和定期维护时追平。
+pub const KEY_DOC_VERSION: i32 = 4;
 
 /// The gateway `api_keys` document of key `k` of tenant `t`, whose member,
 /// if it has one, is `member_active`: neither disabled nor removed, and in
@@ -2179,6 +2183,7 @@ mod tests {
             families,
             [
                 EndpointFamily::ChatCompletions,
+                EndpointFamily::Completions,
                 EndpointFamily::Messages,
                 EndpointFamily::CountTokens,
                 EndpointFamily::Responses,

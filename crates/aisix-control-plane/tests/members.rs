@@ -2691,3 +2691,399 @@ async fn signups_are_counted_across_instances() {
     let r = signup(&cp, "counted-7c1", &fresh_email("later"), None).await;
     assert_eq!(r.status, 201, "{r:?}");
 }
+
+// 直接创建只增加当前组织的账号，不替换管理员的会话。
+async fn create_account(cp: &TestCp, by: &MemberSession, body: Value) -> Resp {
+    cp.send("POST", "/api/members", Some(by.cookie()), Some(body))
+        .await
+}
+
+#[tokio::test]
+async fn direct_account_owner_and_admin_create_login_ready_members_without_changing_session() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let tenant = cp.seed_tenant(TenantStatus::Active).await;
+    let owner = cp.member_login_seeded(tenant, MemberRole::Owner).await;
+    let admin = cp.member_login_seeded(tenant, MemberRole::Admin).await;
+    for (by, role) in [
+        (&owner, "owner"),
+        (&admin, "admin"),
+        (&admin, "member"),
+        (&admin, "billing"),
+    ] {
+        let email = fresh_email("direct");
+        let r = create_account(
+            &cp,
+            by,
+            json!({
+                "email": format!("  {}  ", email.to_ascii_uppercase()),
+                "password": "direct-created-password-7c1", "role": role,
+                "display_name": "Direct 7c1",
+            }),
+        )
+        .await;
+        assert_eq!(r.status, 201, "{r:?}");
+        assert!(r.set_cookie.is_none(), "管理员会话不得被替换");
+        let id = text(&r.body, "/id");
+        let created_at = text(&r.body, "/created_at");
+        assert_eq!(
+            r.body,
+            json!({"id": id, "email": email, "display_name": "Direct 7c1",
+            "role": role, "disabled": false, "created_at": created_at})
+        );
+        let login = cp.member_login(&email, "direct-created-password-7c1").await;
+        assert_eq!(login.status, 200, "{login:?}");
+        assert_eq!(login.body["member"]["id"], id);
+        assert_eq!(login.body["member"]["role"], role);
+        assert_eq!(login.body["tenant"]["id"], tenant.to_string());
+        let session = cp.get_with_cookie("/api/session", by.cookie()).await;
+        assert_eq!(session.body["member"]["id"], by.id.to_string());
+        assert!(listed_members(&cp, owner.cookie())
+            .await
+            .iter()
+            .any(|m| m["id"] == id));
+        let user = resource(&cp, "users", &id).await.expect("已投影用户");
+        assert!(!user.2);
+        assert_eq!(user.1, Some(format!("member:{id}")));
+        assert!(!user.0.to_string().contains(&email));
+        let hash: String =
+            sqlx::query_scalar("SELECT password_hash FROM members WHERE id = $1::uuid")
+                .bind(&id)
+                .fetch_one(cp.db().pool())
+                .await
+                .expect("密码哈希");
+        assert!(hash.starts_with("$argon2"));
+        assert!(!r.body.to_string().contains(&hash));
+        let audit = tenant_audit(&cp, &tenant.to_string()).await;
+        assert!(audit.iter().any(|a| a.0 == "member.create"
+            && a.2 == Some(by.id)
+            && a.3 == "member"
+            && a.4.as_deref() == Some(id.as_str())));
+        let stored = dump(&cp, &["members", "audit_log", "gw_resources"]).await;
+        assert!(!stored.contains("direct-created-password-7c1"));
+        assert!(!dump(&cp, &["audit_log", "gw_resources"])
+            .await
+            .contains(&hash));
+    }
+}
+
+#[tokio::test]
+async fn direct_account_requires_manager_and_only_owner_grants_owner() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let tenant = cp.seed_tenant(TenantStatus::Active).await;
+    let before_members = || async {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM members WHERE tenant_id = $1")
+            .bind(tenant)
+            .fetch_one(cp.db().pool())
+            .await
+            .expect("成员数")
+    };
+    let admin = cp.member_login_seeded(tenant, MemberRole::Admin).await;
+    let member = cp.member_login_seeded(tenant, MemberRole::Member).await;
+    let billing = cp.member_login_seeded(tenant, MemberRole::Billing).await;
+    let before = before_members().await;
+    let audit = audit_rows(&cp).await;
+    for (by, role) in [(&admin, "owner"), (&member, "member"), (&billing, "member")] {
+        let r = create_account(
+            &cp,
+            by,
+            json!({"email": fresh_email("refused-direct"),
+            "password": "refused-direct-password-7c1", "role": role}),
+        )
+        .await;
+        assert_eq!(r.status, 403, "{r:?}");
+        assert_eq!(r.body["code"], "forbidden");
+    }
+    assert_eq!(before_members().await, before);
+    assert_eq!(audit_rows(&cp).await, audit);
+}
+
+#[tokio::test]
+async fn direct_account_refuses_pending_and_suspended_tenants() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    for status in [TenantStatus::Pending, TenantStatus::Suspended] {
+        let tenant = cp.seed_tenant(status).await;
+        let owner = cp.member_login_seeded(tenant, MemberRole::Owner).await;
+        let before = audit_rows(&cp).await;
+        let email = fresh_email("inactive-direct");
+        let r = create_account(
+            &cp,
+            &owner,
+            json!({"email": email,
+            "password": "inactive-direct-password-7c1", "role": "member"}),
+        )
+        .await;
+        assert_eq!(r.status, 403, "{r:?}");
+        assert_eq!(r.body["code"], "tenant_not_active");
+        assert_eq!(audit_rows(&cp).await, before);
+        assert_eq!(
+            cp.member_login(&email, "inactive-direct-password-7c1")
+                .await
+                .status,
+            401
+        );
+    }
+}
+
+#[tokio::test]
+async fn direct_account_duplicate_email_never_changes_existing_credentials_or_tenant() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let tenant = cp.seed_tenant(TenantStatus::Active).await;
+    let other = cp.seed_tenant(TenantStatus::Active).await;
+    let owner = cp.member_login_seeded(tenant, MemberRole::Owner).await;
+    for victim_tenant in [tenant, other] {
+        let victim = cp.seed_member(victim_tenant, MemberRole::Billing).await;
+        let original = cp.member_login_as(&victim).await;
+        let before = dump(&cp, &["members", "gw_resources", "audit_log"]).await;
+        let r = create_account(&cp, &owner, json!({
+            "email": format!(" {} ", victim.email.to_ascii_uppercase()),
+            "password": "replacement-direct-password-7c1", "role": "owner", "display_name": "Overwrite",
+        })).await;
+        assert_eq!(r.status, 409, "{r:?}");
+        assert_eq!(r.body["code"], "email_taken");
+        assert_eq!(
+            dump(&cp, &["members", "gw_resources", "audit_log"]).await,
+            before
+        );
+        assert_eq!(
+            cp.member_login(&victim.email, TEST_PASSWORD).await.status,
+            200
+        );
+        assert_eq!(
+            cp.member_login(&victim.email, "replacement-direct-password-7c1")
+                .await
+                .status,
+            401
+        );
+        let s = cp.get_with_cookie("/api/session", original.cookie()).await;
+        assert_eq!(s.body["tenant"]["id"], victim_tenant.to_string());
+        assert_eq!(s.body["member"]["role"], "billing");
+    }
+}
+
+#[tokio::test]
+async fn direct_account_validates_fields_and_rejects_cross_tenant_override() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let tenant = cp.seed_tenant(TenantStatus::Active).await;
+    let other = cp.seed_tenant(TenantStatus::Active).await;
+    let owner = cp.member_login_seeded(tenant, MemberRole::Owner).await;
+    let base = json!({"email": fresh_email("invalid-direct"), "password": "valid-direct-password-7c1", "role": "member"});
+    let before = dump(&cp, &["members", "gw_resources", "audit_log"]).await;
+    for (field, value) in [
+        ("email", json!("invalid")),
+        ("password", json!("short")),
+        ("role", json!("operator")),
+        ("tenant_id", json!(other)),
+        ("display_name", json!("x".repeat(129))),
+    ] {
+        let mut body = base.clone();
+        body[field] = value;
+        let r = create_account(&cp, &owner, body).await;
+        assert_eq!(r.status, 422, "field={field}: {r:?}");
+        assert!(!r.body.to_string().contains("valid-direct-password-7c1"));
+        assert!(!r.body.to_string().contains("$argon2"));
+    }
+    assert_eq!(
+        dump(&cp, &["members", "gw_resources", "audit_log"]).await,
+        before
+    );
+    // 不带显示名也能创建，且只能进入调用者当前组织。
+    let r = create_account(&cp, &owner, base).await;
+    assert_eq!(r.status, 201, "{r:?}");
+    assert_eq!(r.body["display_name"], Value::Null);
+    let login = cp
+        .member_login(&text(&r.body, "/email"), "valid-direct-password-7c1")
+        .await;
+    assert_eq!(login.status, 200, "{login:?}");
+    assert_eq!(login.body["tenant"]["id"], tenant.to_string());
+}
+
+#[tokio::test]
+async fn direct_account_disabled_email_stays_reserved_without_password_reset() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let tenant = cp.seed_tenant(TenantStatus::Active).await;
+    let owner = cp.member_login_seeded(tenant, MemberRole::Owner).await;
+    let victim = cp.seed_member(tenant, MemberRole::Member).await;
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let r = admin_patch_member(&cp, &op, &victim.id.to_string(), json!({"disabled": true})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let before = dump(&cp, &["members", "gw_resources", "audit_log"]).await;
+    let r = create_account(
+        &cp,
+        &owner,
+        json!({"email": victim.email,
+        "password": "disabled-reset-password-7c1", "role": "admin"}),
+    )
+    .await;
+    assert_eq!(r.status, 409, "{r:?}");
+    assert_eq!(r.body["code"], "email_taken");
+    assert_eq!(
+        dump(&cp, &["members", "gw_resources", "audit_log"]).await,
+        before
+    );
+    let r = admin_patch_member(&cp, &op, &victim.id.to_string(), json!({"disabled": false})).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(
+        cp.member_login(&victim.email, TEST_PASSWORD).await.status,
+        200
+    );
+    assert_eq!(
+        cp.member_login(&victim.email, "disabled-reset-password-7c1")
+            .await
+            .status,
+        401
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn direct_account_concurrent_duplicate_creates_exactly_one_account() {
+    let Some(cp) = TestCp::start_with(patient).await else {
+        return;
+    };
+    let tenant = cp.seed_tenant(TenantStatus::Active).await;
+    let owner = cp.member_login_seeded(tenant, MemberRole::Owner).await;
+    let email = fresh_email("concurrent-direct");
+    let body =
+        json!({"email": email, "password": "concurrent-direct-password-7c1", "role": "member"});
+    let (a, b) = tokio::join!(
+        create_account(&cp, &owner, body.clone()),
+        create_account(&cp, &owner, body)
+    );
+    let mut statuses = [a.status, b.status];
+    statuses.sort();
+    assert_eq!(statuses, [201, 409], "{a:?}; {b:?}");
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM members WHERE email = $1")
+        .bind(&email)
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("唯一账号");
+    assert_eq!(count, 1);
+    assert_eq!(
+        cp.member_login(&email, "concurrent-direct-password-7c1")
+            .await
+            .status,
+        200
+    );
+    assert_eq!(
+        tenant_audit(&cp, &tenant.to_string())
+            .await
+            .iter()
+            .filter(|a| a.0 == "member.create")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn direct_account_rechecks_authority_after_waiting_for_tenant_lock() {
+    let Some(cp) = TestCp::start_with(patient).await else {
+        return;
+    };
+    let cp = Arc::new(cp);
+    let tenant = cp.seed_tenant(TenantStatus::Active).await;
+    let owner = cp.member_login_seeded(tenant, MemberRole::Owner).await;
+    let admin = cp.member_login_seeded(tenant, MemberRole::Admin).await;
+    let holder = hold_audit_inserts(&cp).await;
+    let demotion = tokio::spawn({
+        let (cp, owner, id) = (cp.clone(), owner.clone(), admin.id.to_string());
+        async move { patch_member(&cp, &owner, &id, "member").await }
+    });
+    until_lock_waiters(&cp, 1).await;
+    let email = fresh_email("raced-direct");
+    let creation = tokio::spawn({
+        let (cp, email) = (cp.clone(), email.clone());
+        async move {
+            create_account(
+                &cp,
+                &admin,
+                json!({"email": email,
+            "password": "raced-direct-password-7c1", "role": "member"}),
+            )
+            .await
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !creation.is_finished() && lock_waiters(&cp).await < 2 {
+        assert!(Instant::now() < deadline, "创建未到达组织锁");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    holder.rollback().await.expect("释放审计锁");
+    let demotion = demotion.await.expect("降级任务");
+    assert_eq!(demotion.status, 200, "{demotion:?}");
+    let r = creation.await.expect("创建任务");
+    assert_eq!(r.status, 403, "{r:?}");
+    assert_eq!(r.body["code"], "forbidden");
+    assert_eq!(
+        cp.member_login(&email, "raced-direct-password-7c1")
+            .await
+            .status,
+        401
+    );
+    assert!(!tenant_audit(&cp, &tenant.to_string())
+        .await
+        .iter()
+        .any(|a| a.0 == "member.create"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn direct_account_rechecks_owner_grant_after_owner_becomes_admin() {
+    let Some(cp) = TestCp::start_with(patient).await else {
+        return;
+    };
+    let cp = Arc::new(cp);
+    let tenant = cp.seed_tenant(TenantStatus::Active).await;
+    let owner = cp.member_login_seeded(tenant, MemberRole::Owner).await;
+    let second = cp.member_login_seeded(tenant, MemberRole::Owner).await;
+    let holder = hold_audit_inserts(&cp).await;
+    let demotion = tokio::spawn({
+        let (cp, owner, id) = (cp.clone(), owner.clone(), second.id.to_string());
+        async move { patch_member(&cp, &owner, &id, "admin").await }
+    });
+    until_lock_waiters(&cp, 1).await;
+    let email = fresh_email("owner-raced-direct");
+    let creation = tokio::spawn({
+        let (cp, email) = (cp.clone(), email.clone());
+        async move {
+            create_account(
+                &cp,
+                &second,
+                json!({"email": email,
+                "password": "owner-raced-direct-password-7c1", "role": "owner"}),
+            )
+            .await
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !creation.is_finished() && lock_waiters(&cp).await < 2 {
+        assert!(Instant::now() < deadline, "创建未到达组织锁");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    holder.rollback().await.expect("释放审计锁");
+    let demotion = demotion.await.expect("降级任务");
+    assert_eq!(demotion.status, 200, "{demotion:?}");
+    let r = creation.await.expect("创建任务");
+    assert_eq!(r.status, 403, "{r:?}");
+    assert_eq!(r.body["code"], "forbidden");
+    assert_eq!(owners(&cp, tenant).await, 1);
+    assert_eq!(
+        cp.member_login(&email, "owner-raced-direct-password-7c1")
+            .await
+            .status,
+        401
+    );
+    assert!(!tenant_audit(&cp, &tenant.to_string())
+        .await
+        .iter()
+        .any(|a| a.0 == "member.create"));
+}

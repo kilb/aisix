@@ -13,7 +13,7 @@
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::Serialize;
 
-use crate::book::PriceBook;
+use crate::book::{Baseline, PriceBook, RateInEffect};
 use crate::rates::{CnyPerUsd, Dimension, MicroCny, Rate, Rates, ServiceTier};
 use crate::usage::{quantities, BillableUsage, Inconsistency, Quantities};
 use crate::ENGINE_VERSION;
@@ -260,6 +260,58 @@ impl PricingError {
     }
 }
 
+// 报价与收费共享修订选择；保留收费路径既有的错误先后顺序。
+pub(crate) fn model_pricing<'a>(
+    book: &'a PriceBook,
+    model_id: &str,
+    payer: &Payer,
+    at: DateTime<Utc>,
+) -> Result<(Baseline<'a>, RateInEffect), PricingError> {
+    if payer.tenant_id.is_empty() {
+        return Err(PricingError::UnknownTenant);
+    }
+    if model_id.is_empty() {
+        return Err(PricingError::UnknownModel);
+    }
+    let Some(group_id) = &payer.group_id else {
+        return Err(PricingError::NoGroup);
+    };
+    let baseline = match book.baseline(model_id, at) {
+        None => {
+            return Err(PricingError::MissingPrice {
+                model_id: model_id.to_owned(),
+                at,
+            })
+        }
+        Some(Err(revision_id)) => return Err(PricingError::InvalidPrice { revision_id }),
+        Some(Ok(baseline)) => baseline,
+    };
+    let rate = match book.rate(group_id, model_id, at) {
+        None => {
+            return Err(PricingError::MissingRate {
+                group_id: group_id.clone(),
+                model_id: model_id.to_owned(),
+                at,
+            })
+        }
+        Some(Err(revision_id)) => return Err(PricingError::InvalidPrice { revision_id }),
+        Some(Ok(rate)) => rate,
+    };
+    Ok((baseline, rate))
+}
+
+pub(crate) fn discount_at(
+    book: &PriceBook,
+    tenant_id: &str,
+    at: DateTime<Utc>,
+) -> Result<Option<DiscountRef>, PricingError> {
+    match book.discount(tenant_id, at) {
+        None => Ok(None),
+        Some(Ok((revision_id, bps))) => Ok(Some(DiscountRef { revision_id, bps })),
+        Some(Err(revision_id)) => Err(PricingError::InvalidPrice { revision_id }),
+    }
+}
+
 /// Prices one stored usage row: the tenant's charge and, when the book knows
 /// the serving account's cost rate, the platform's cost.
 ///
@@ -372,36 +424,7 @@ pub fn price_event(
         return Ok(unbilled(u, payer, price_instant, nothing, warnings));
     }
 
-    if payer.tenant_id.is_empty() {
-        return Err(PricingError::UnknownTenant);
-    }
-    if u.requested_model_id.is_empty() {
-        return Err(PricingError::UnknownModel);
-    }
-    let Some(group_id) = &payer.group_id else {
-        return Err(PricingError::NoGroup);
-    };
-    let baseline = match book.baseline(&u.requested_model_id, price_instant) {
-        None => {
-            return Err(PricingError::MissingPrice {
-                model_id: u.requested_model_id.clone(),
-                at: price_instant,
-            })
-        }
-        Some(Err(revision_id)) => return Err(PricingError::InvalidPrice { revision_id }),
-        Some(Ok(baseline)) => baseline,
-    };
-    let rate = match book.rate(group_id, &u.requested_model_id, price_instant) {
-        None => {
-            return Err(PricingError::MissingRate {
-                group_id: group_id.clone(),
-                model_id: u.requested_model_id.clone(),
-                at: price_instant,
-            })
-        }
-        Some(Err(revision_id)) => return Err(PricingError::InvalidPrice { revision_id }),
-        Some(Ok(rate)) => rate,
-    };
+    let (baseline, rate) = model_pricing(book, &u.requested_model_id, payer, price_instant)?;
 
     let served = u.service_tier.as_deref();
     let input_total = q.input_total();
@@ -432,11 +455,7 @@ pub fn price_event(
     let lines = lines_at(selected.rates, &q)
         .map_err(|dimension| PricingError::MissingDimensionPrice { dimension })?;
 
-    let discount = match book.discount(&payer.tenant_id, price_instant) {
-        None => None,
-        Some(Ok((revision_id, bps))) => Some(DiscountRef { revision_id, bps }),
-        Some(Err(revision_id)) => return Err(PricingError::InvalidPrice { revision_id }),
-    };
+    let discount = discount_at(book, &payer.tenant_id, price_instant)?;
     let charge = charge_micro_cny(&lines, rate.cny, discount.map_or(0, |d| d.bps))?;
 
     let cost = cost_of(book, u, &lines, price_instant);

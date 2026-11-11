@@ -4,10 +4,8 @@ import {
   billing,
   budgets as budgetApi,
   keys as keyApi,
-  type Balance,
   type Budget,
   type KeyQuota,
-  type LedgerItem,
   type LedgerKind,
   type LedgerSummaryRow,
   type QuotaLevel,
@@ -15,8 +13,9 @@ import {
   type TenantKey,
   type Topup,
 } from "./lib/api";
+import { formulaBalance, formulaLedger, type FormulaBalance as Balance, type FormulaLedgerItem as LedgerItem } from "./lib/formulaApi";
 import { formMessageFor, messageFor } from "./lib/errors";
-import { fmtUtc, isCnyAmount, periodLabel, todayUtc, utcRange } from "./lib/money";
+import { fmtMicroCny, fmtUtc, isCnyAmount, periodLabel, todayUtc, utcRange } from "./lib/money";
 import { BalanceReadout, Money, type ReadoutStop } from "./ui/BalanceReadout";
 import { Button } from "./ui/Button";
 import { DataTable, Loading } from "./ui/DataTable";
@@ -74,7 +73,7 @@ export function Billing({ member }: { member: SessionMember }) {
 
   const loadBalance = useCallback(async () => {
     try {
-      setBalance(await billing.balance());
+      setBalance(await formulaBalance());
       setBalanceErr(null);
     } catch (e) {
       setBalanceErr(failure(e));
@@ -214,15 +213,33 @@ function BalancePanel({
         <>
           {!known && teamErr && <TeamFailed err={teamErr} onRetry={onRetryTeam} />}
           <div className="entries grid gap-3 sm:grid-cols-2">
-            <Reading label="余额" value={<Money micro={balance.balance_micro_cny} />} />
-            <Reading label="信用额度" value={<Money micro={balance.credit_limit_micro_cny} />} />
-            <Reading label="可用额度" value={<Money micro={balance.available_micro_cny} />} />
+            <Reading label="余额" value={<Money micro={balance.calculation.balance_micro_cny} />} />
+            <Reading label="信用额度" value={<Money micro={balance.calculation.credit_limit_micro_cny} />} />
+            <Reading label="可用额度" value={<Money micro={balance.calculation.available_micro_cny} />} />
             <Reading label="待审批的充值" value={`${balance.pending_topups} 笔`} />
           </div>
+          <BalanceCalculation balance={balance} />
         </>
       )}
       {!balance && !err && <Loading />}
     </Card>
+  );
+}
+
+/** 同一只读入账快照中的全量流水，不受下面流水分页或筛选影响。 */
+function BalanceCalculation({ balance }: { balance: Balance }) {
+  const f = balance.calculation;
+  const matches = BigInt(f.topups_micro_cny) - BigInt(f.usage_micro_cny) + BigInt(f.adjustments_micro_cny) === BigInt(f.balance_micro_cny);
+  return (
+    <section aria-label="余额计算" className="grid gap-2 border-t border-border pt-4 text-sm">
+      <h3>余额计算</h3>
+      <p className="break-words tabular">累计到账 {fmtMicroCny(f.topups_micro_cny)} − 原始扣费 {fmtMicroCny(f.usage_micro_cny)} + 余额调整（{fmtMicroCny(f.adjustments_micro_cny)}）{matches ? " = " : "；账户余额 "}{fmtMicroCny(f.balance_micro_cny)}</p>
+      {!matches && <p className="note crit" role="alert">流水合计与账户余额不一致，请联系管理员核对。</p>}
+      {f.available_overflow ? <p className="note crit" role="alert">余额加信用额度超出支持范围，可用额度显示上限值，调用已按现有规则停止。</p> : (
+        <p className="break-words tabular">余额 {fmtMicroCny(f.balance_micro_cny)} + 信用额度 {fmtMicroCny(f.credit_limit_micro_cny)} = 可用额度 {fmtMicroCny(f.available_micro_cny)}</p>
+      )}
+      <p className="hint">截至 {fmtUtc(f.as_of)} 的已入账快照。待审批充值与尚未入账用量不计入；信用额度是透支上限，预算限制另行生效。</p>
+    </section>
   );
 }
 
@@ -598,7 +615,7 @@ function Ledger({ topups }: { topups: Topup[] | null }) {
       return;
     }
     setRows(null);
-    billing.ledger({ ...range, ...(kind ? { kind } : {}) }).then(
+    formulaLedger({ ...range, ...(kind ? { kind } : {}) }).then(
       (p) => {
         if (mine !== ticket.current) return;
         setRows(p.items);
@@ -621,7 +638,7 @@ function Ledger({ topups }: { topups: Topup[] | null }) {
     const mine = ticket.current;
     setMore(true);
     try {
-      const p = await billing.ledger({ ...range, ...(kind ? { kind } : {}), before: next });
+      const p = await formulaLedger({ ...range, ...(kind ? { kind } : {}), before: next });
       if (mine !== ticket.current) return;
       // A page never repeats a seq, but a double click must not either.
       setRows((cur) => {
@@ -677,6 +694,7 @@ function Ledger({ topups }: { topups: Topup[] | null }) {
                 <th>类型</th>
                 <th className="num">金额</th>
                 <th className="num">余额</th>
+                <th>本笔余额计算</th>
                 <th>说明</th>
               </tr>
             </thead>
@@ -686,10 +704,13 @@ function Ledger({ topups }: { topups: Topup[] | null }) {
                   <td className="tabular">{fmtUtc(r.posted_at)}</td>
                   <td>{KIND_LABEL[r.kind] ?? r.kind}</td>
                   <td className="num">
-                    <Money micro={r.amount_micro_cny} />
+                    <Money micro={r.calculation.amount_micro_cny} />
                   </td>
                   <td className="num">
-                    <Money micro={r.balance_after_micro_cny} />
+                    <Money micro={r.calculation.after_micro_cny} />
+                  </td>
+                  <td className="tabular">
+                    {fmtMicroCny(r.calculation.before_micro_cny)} +（{fmtMicroCny(r.calculation.amount_micro_cny)}）= <Money micro={r.calculation.after_micro_cny} />
                   </td>
                   <td>
                     <span className="trunc" title={explain(r)}>

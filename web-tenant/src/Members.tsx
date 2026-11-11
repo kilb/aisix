@@ -1,7 +1,9 @@
-import { useCallback, useEffect, useState, type CSSProperties } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import {
   ApiError,
+  budgets as budgetApi,
   members as memberApi,
+  type Budget,
   type Invite,
   type IssuedInvite,
   type Member,
@@ -9,6 +11,8 @@ import {
   type SessionMember,
   type TenantStatus,
 } from "./lib/api";
+import { memberUsage, type MemberUsage, type MemberUsageSummary } from "./lib/memberUsage";
+import { fmtMicroCny, fmtUtc } from "./lib/money";
 import { formMessageFor, messageFor } from "./lib/errors";
 import { ShownOnce } from "./controls";
 import { Button } from "./ui/Button";
@@ -23,6 +27,60 @@ import { Card, CardHeader, PageHeader, Split } from "./components/page";
 
 function failure(e: unknown): string {
   return e instanceof ApiError ? messageFor(e) : String(e);
+}
+
+const QUANTITY_LABEL: Record<string, string> = {
+  input: "输入", output: "输出", cache_read: "缓存读", cache_write: "缓存写",
+  cache_write_1h: "1 小时缓存写", reasoning: "推理", audio_input: "音频输入",
+  audio_output: "音频输出", image_input: "图片输入", image_output: "图片输出", web_search: "联网搜索",
+};
+
+function UsageCell({ usage }: { usage: MemberUsage }) {
+  const incomplete = usage.unknown_quantity_requests > 0;
+  const quantities = Object.entries(usage.quantities);
+  const tokens = quantities
+    .filter(([dimension]) => dimension in QUANTITY_LABEL && dimension !== "web_search")
+    .reduce((total, [, quantity]) => total + BigInt(quantity), 0n);
+  return (
+    <>
+      <span className="tabular">{usage.requests.toLocaleString()} 次调用</span>
+      <span className="cell-note tabular">
+        {incomplete && quantities.length === 0 ? "计费用量未知" : `${incomplete ? "已知" : ""}计费用量 ${tokens.toString()} token`}
+      </span>
+      <span className="cell-note tabular">已计费 {fmtMicroCny(usage.charged_micro_cny)}</span>
+      {quantities.map(([dimension, quantity]) => (
+        <span className="cell-note tabular" key={dimension}>
+          {QUANTITY_LABEL[dimension] ?? dimension} {quantity.toLocaleString()} {dimension === "web_search" ? "次" : dimension in QUANTITY_LABEL ? "token" : ""}
+        </span>
+      ))}
+      {incomplete && <span className="cell-note hint">{usage.unknown_quantity_requests} 次用量明细未记录</span>}
+      {usage.unpriced_requests > 0 && <span className="cell-note hint">{usage.unpriced_requests} 次未计价，费用尚未包含</span>}
+      {usage.pending_requests > usage.unpriced_requests && (
+        <span className="cell-note hint">另有 {usage.pending_requests - usage.unpriced_requests} 次待计价</span>
+      )}
+      {usage.estimated_requests > 0 && <span className="cell-note hint">{usage.estimated_requests} 次含估算用量</span>}
+    </>
+  );
+}
+
+function BudgetCell({ budgets }: { budgets: Budget[] }) {
+  if (budgets.length === 0) return <span className="hint">未设置成员额度；仍受组织及密钥限制</span>;
+  const period = { day: "每日", week: "每周", month: "每月" };
+  return (
+    <div className="grid gap-3">
+      {budgets.map((budget) => (
+        <div key={budget.id}>
+          <span>{budget.kind === "cumulative" ? "累计" : period[budget.period ?? "month"]}额度</span>
+          <span className="cell-note tabular">限额 {fmtMicroCny(budget.limit_micro_cny)}</span>
+          <span className="cell-note tabular">本期已用 {fmtMicroCny(budget.spent_micro_cny)}</span>
+          <span className="cell-note tabular">剩余 {fmtMicroCny(budget.remaining_micro_cny)}{budget.exhausted && "（已用尽）"}</span>
+          <span className="cell-note hint">
+            {budget.kind === "cumulative" ? "累计自 " : "本期自 "}{fmtUtc(budget.counted_from ?? budget.period_start ?? budget.created_at)}
+          </span>
+        </div>
+      ))}
+    </div>
+  );
 }
 
 /**
@@ -66,6 +124,11 @@ export function Members({
   const [listErr, setListErr] = useState<string | null>(null);
   const [invites, setInvites] = useState<Invite[] | null>(null);
   const [invitesErr, setInvitesErr] = useState<string | null>(null);
+  const [usage, setUsage] = useState<MemberUsageSummary | null>(null);
+  const [usageErr, setUsageErr] = useState<string | null>(null);
+  const [budgets, setBudgets] = useState<Budget[] | null>(null);
+  const [budgetsErr, setBudgetsErr] = useState<string | null>(null);
+  const loadId = useRef(0);
   const [issued, setIssued] = useState<{ email: string; link: string; expiresAt: string } | null>(null);
   const [actionErr, setActionErr] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -73,27 +136,49 @@ export function Members({
   const [acting, setActing] = useState<"role" | "remove" | "revoke" | null>(null);
   /** A role picked for a member and not yet confirmed. */
   const [drafts, setDrafts] = useState<Record<string, MemberRole>>({});
+  const usageByMember = useMemo(() => new Map(usage?.items.map((row) => [row.member_id, row]) ?? []), [usage]);
+  const budgetsByMember = useMemo(() => {
+    const grouped = new Map<string, Budget[]>();
+    for (const budget of budgets ?? []) {
+      if (budget.scope !== "member") continue;
+      const rows = grouped.get(budget.target.id) ?? [];
+      rows.push(budget);
+      grouped.set(budget.target.id, rows);
+    }
+    return grouped;
+  }, [budgets]);
 
   const load = useCallback(async () => {
-    try {
-      setPeople(await memberApi.list());
-      setListErr(null);
-    } catch (e) {
-      setListErr(failure(e));
+    const id = ++loadId.current;
+    setUsage(null);
+    setBudgets(null);
+    setUsageErr(null);
+    setBudgetsErr(null);
+    async function read<T>(fetch: () => Promise<T>, success: (value: T) => void, refused: (message: string | null) => void) {
+      try {
+        const value = await fetch();
+        if (id !== loadId.current) return;
+        success(value);
+        refused(null);
+      } catch (e) {
+        if (id === loadId.current) refused(failure(e));
+      }
     }
-    if (!active) return;
-    try {
-      setInvites(await memberApi.invites());
-      setInvitesErr(null);
-    } catch (e) {
-      setInvitesErr(failure(e));
-    }
+    await Promise.all([
+      read(memberApi.list, setPeople, setListErr),
+      ...(active ? [
+        read(memberUsage, setUsage, setUsageErr),
+        read(budgetApi.list, setBudgets, setBudgetsErr),
+        read(memberApi.invites, setInvites, setInvitesErr),
+      ] : []),
+    ]);
   }, [active]);
 
   // Read again when the caller's own role changes (the session re-read after
   // a change to their own row): what they may see and do changed with it.
   useEffect(() => {
     void load();
+    return () => { loadId.current += 1; };
   }, [load, member.role]);
 
   /**
@@ -137,7 +222,10 @@ export function Members({
         main={
           <div className="grid gap-6">
             <Card>
+              <CardHeader title="组织成员" description={active ? "本月用量按 UTC 月初至当前时间统计；成员额度按各自周期计算。" : undefined} />
               {!active && <div className="note crit">组织已被停用；这里只能移除成员。</div>}
+              {active && usageErr && <div className="note crit" role="alert">成员用量读取失败：{usageErr}</div>}
+              {active && budgetsErr && <div className="note crit" role="alert">成员额度读取失败：{budgetsErr}</div>}
               {listErr && (
                 <div className="note crit" role="alert">
                   {listErr}
@@ -158,6 +246,8 @@ export function Members({
                       <th>邮箱</th>
                       <th>角色</th>
                       <th>状态</th>
+                      <th>本月用量</th>
+                      <th>成员额度</th>
                       <th>
                         <span className="vh">操作</span>
                       </th>
@@ -167,6 +257,7 @@ export function Members({
                     {people.map((m) => {
                       const self = m.id === member.id;
                       const draft = drafts[m.id];
+                      const memberUsageRow = usageByMember.get(m.id);
                       return (
                         <tr key={m.id}>
                           <td>
@@ -230,6 +321,16 @@ export function Members({
                           </td>
                           <td>
                             <Lamp state={m.disabled ? "disabled" : "applied"}>{m.disabled ? "已被平台停用" : "正常"}</Lamp>
+                          </td>
+                          <td>
+                            {!active ? <span className="hint">组织未启用，无法读取用量</span> : usageErr ? <span className="hint">用量读取失败</span>
+                              : usage === null ? <span className="hint">用量载入中…</span>
+                                : memberUsageRow ? <UsageCell usage={memberUsageRow} /> : <span className="hint">暂无用量数据</span>}
+                          </td>
+                          <td>
+                            {!active ? <span className="hint">组织未启用，无法读取额度</span> : budgetsErr ? <span className="hint">额度读取失败</span>
+                              : budgets === null ? <span className="hint">额度载入中…</span>
+                                : <BudgetCell budgets={budgetsByMember.get(m.id) ?? []} />}
                           </td>
                           <td className="right">
                             {manages(m) && (
