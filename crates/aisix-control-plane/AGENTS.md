@@ -34,7 +34,8 @@ way.
   anyway. `only_the_resources_module_writes_gw_resources` (`tests/boot.rs`)
   fails on one outside `src/resources/`, except the two that touch no
   document: the projector's projection columns and housekeeping's tombstone
-  prune.
+  prune, which deletes only a delete already projected and old, and keeps a
+  generated model tombstone a grant or live key still names.
 - Within one transaction, write referents before referrers, and delete
   referrers before referents. Each write checks its own references.
 - Every builder of a derived document has a test that loads what it builds on
@@ -523,6 +524,18 @@ statement.
   row that broke the rule before the fence existed is repaired through
   `write_resource` (`channels::repair_routing`, run by every housekeeping
   tick), never by the fence.
+
+- **Housekeeping replaces grants of a channel's generated direct model before
+  it prunes any tombstone, and the prune keeps a generated model tombstone
+  while a tenant grant or a live key selection still names it.** That
+  tombstone (owner `public:<public_model_id>`, at the direct model's own id)
+  is the repair's only proof that such a grant came from a channel: pruning
+  it first would let the proof expire between two ticks of an instance that
+  prunes on boot, and a grant an older release stored can be older than that.
+  A grant whose tombstone is gone anyway is left as it is and reported
+  (`tenant.generated_grants_replaced`'s `unresolved`, and a WARN naming the
+  tenant and ids), never guessed at: an operator removes the id through a
+  grant edit, which re-projects the keys.
 
 ## Defaults fail closed
 

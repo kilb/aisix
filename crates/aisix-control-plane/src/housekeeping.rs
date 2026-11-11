@@ -25,6 +25,7 @@ use tokio::time::MissedTickBehavior;
 use crate::billing::{ledger, marks};
 use crate::db::{Db, DbError};
 use crate::resources::write::{WriteCtx, RESOURCES_LOCK_KEY};
+use crate::resources::Kind;
 use crate::stopped;
 use crate::{channels, keys, tenants};
 
@@ -61,25 +62,27 @@ pub async fn run_once(db: &Db) -> Result<Pruned, DbError> {
     })
 }
 
-/// One tick: a pruning pass ([`run_once`]), then the key documents an
-/// older release wrote are caught up ([`keys::catch_up`]), then every tenant
-/// without a billing account gets one ([`ledger::backfill_accounts`]: an
-/// older release, during a rolling upgrade, creates tenants without one),
-/// then every grant of a channel's generated direct model is replaced by its
-/// public model ([`tenants::replace_generated_grants`]: an older release
-/// could grant one), then every public model's routing document that lacks
-/// the settings the model stores is regenerated ([`channels::repair_routing`]:
-/// a control plane older than `0037` wrote it before `0039` fenced it out),
-/// then every balance mark the rule in force would not write is flagged for
-/// the settler ([`marks::flag_stale_marks`]: an earlier rule, or an older
-/// replica, wrote it). Each part is logged on its own so
-/// that one failing leaves the others to run. A tenant the gateway-version
-/// gate refuses is caught up by a later tick.
+/// One tick: the key documents an older release wrote are caught up
+/// ([`keys::catch_up`]), then every tenant without a billing account gets one
+/// ([`ledger::backfill_accounts`]: an older release, during a rolling
+/// upgrade, creates tenants without one), then every grant of a channel's
+/// generated direct model is replaced by its public model
+/// ([`tenants::replace_generated_grants`]: an older release could grant one),
+/// then every public model's routing document that lacks the settings the
+/// model stores is regenerated ([`channels::repair_routing`]: a control
+/// plane older than `0037` wrote it before `0039` fenced it out), then every
+/// balance mark the rule in force would not write is flagged for the settler
+/// ([`marks::flag_stale_marks`]: an earlier rule, or an older replica, wrote
+/// it), and last a pruning pass ([`run_once`]).
+///
+/// The grants are replaced before any tombstone is pruned: a grant of a
+/// channel removed long ago is found by the generated tombstone of its
+/// direct document, which the prune deletes a day after the delete was
+/// projected. Pruning first would make the repair's proof of origin expire
+/// between two ticks of an instance that prunes on boot. Each part is
+/// logged on its own so that one failing leaves the others to run. A tenant
+/// the gateway-version gate refuses is caught up by a later tick.
 pub async fn tick(db: &Db, ctx: &WriteCtx) {
-    match run_once(db).await {
-        Ok(pruned) => tracing::debug!(?pruned, "housekeeping pass"),
-        Err(e) => tracing::warn!(error = %e, "a housekeeping pass failed"),
-    }
     match keys::catch_up(db, ctx, keys::KEY_DOC_VERSION).await {
         Ok(caught_up) => tracing::debug!(?caught_up, "key documents caught up"),
         Err(e) => tracing::warn!(code = e.code, "catching up key documents failed"),
@@ -95,6 +98,10 @@ pub async fn tick(db: &Db, ctx: &WriteCtx) {
              settler writes their marks again"
         ),
         Err(e) => tracing::warn!(error = %e, "looking for stale balance marks failed"),
+    }
+    match run_once(db).await {
+        Ok(pruned) => tracing::debug!(?pruned, "housekeeping pass"),
+        Err(e) => tracing::warn!(error = %e, "a housekeeping pass failed"),
     }
 }
 
@@ -191,8 +198,16 @@ pub fn spawn(db: Db, ctx: WriteCtx, mut shutdown: watch::Receiver<bool>) -> Join
 /// `budget_policy` is re-created on the same id), and must not find it gone
 /// halfway through. `updated_at` is when the delete was made, and
 /// `projected_version = version` says it has reached kine since.
+///
+/// A generated model tombstone is kept while a tenant grant or a live key
+/// selection still names it: it is the repair's only proof that such a grant
+/// came from a channel ([`tenants::replace_generated_grants`]), and a grant
+/// an older release stored can be older than this pass. The repair withdraws
+/// the grant and the selection, and the next prune after that finds nothing
+/// naming it. A model id no one names expires as any other tombstone does.
 pub async fn prune_tombstones(db: &Db, older_than: Duration) -> Result<u64, DbError> {
     let older_than = older_than.as_secs_f64();
+    let models = Kind::Models.segment();
     db.tx(move |conn| {
         async move {
             sqlx::query("SELECT pg_advisory_xact_lock($1)")
@@ -200,10 +215,18 @@ pub async fn prune_tombstones(db: &Db, older_than: Duration) -> Result<u64, DbEr
                 .execute(&mut *conn)
                 .await?;
             Ok(sqlx::query(
-                "DELETE FROM gw_resources WHERE deleted AND projected_version = version \
-                 AND updated_at < now() - make_interval(secs => $1)",
+                "DELETE FROM gw_resources r WHERE r.deleted AND r.projected_version = r.version \
+                 AND r.updated_at < now() - make_interval(secs => $1) \
+                 AND NOT (r.kind = $2 AND r.managed_by LIKE 'public:%' \
+                   AND r.managed_by <> ('public:' || r.id::text) \
+                   AND (EXISTS (SELECT 1 FROM tenants t WHERE r.id = ANY(t.allowed_model_ids)) \
+                     OR EXISTS (SELECT 1 FROM tenant_keys k \
+                                WHERE k.revoked_at IS NULL AND r.id = ANY(k.model_ids))) \
+                   AND NOT EXISTS (SELECT 1 FROM channel_models cm \
+                                   WHERE cm.direct_model_id = r.id))",
             )
             .bind(older_than)
+            .bind(models)
             .execute(&mut *conn)
             .await?
             .rows_affected())
