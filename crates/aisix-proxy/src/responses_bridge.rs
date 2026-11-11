@@ -49,6 +49,8 @@ const STREAM_ASSEMBLY_MESSAGE: &str =
 /// roles, tool calls, tool results, tools, and sampling params.
 pub fn responses_request_to_chat(model: &str, body: &Value) -> ChatFormat {
     let mut messages: Vec<ChatMessage> = Vec::new();
+    let tools = request_tools(body);
+    let search_name = tool_search_chat_name(&tools);
 
     // Top-level `instructions` is the Responses-API system prompt.
     if let Some(instructions) = body.get("instructions").and_then(|v| v.as_str()) {
@@ -65,7 +67,7 @@ pub fn responses_request_to_chat(model: &str, body: &Value) -> ChatFormat {
         }
         Some(Value::Array(items)) => {
             for item in items {
-                append_input_item(&mut messages, item);
+                append_input_item(&mut messages, item, &search_name, &tools);
             }
             messages = attach_replayed_reasoning(messages);
         }
@@ -94,12 +96,12 @@ pub fn responses_request_to_chat(model: &str, body: &Value) -> ChatFormat {
     // specified"), and the Responses API accepts requests that carry an
     // empty or hosted-tools-only list alongside one — a shape the Codex
     // CLI sends on every context compaction (AISIX-Cloud#1614).
-    match body.get("tools").and_then(responses_tools_to_chat) {
-        Some(tools) => {
-            chat.extra.insert("tools".to_string(), tools);
+    match responses_tools_to_chat(&tools) {
+        Some(chat_tools) => {
+            chat.extra.insert("tools".to_string(), chat_tools);
             if let Some(tc) = body
                 .get("tool_choice")
-                .and_then(responses_tool_choice_to_chat)
+                .and_then(|choice| responses_tool_choice_to_chat(choice, &tools))
             {
                 chat.extra.insert("tool_choice".to_string(), tc);
             }
@@ -137,7 +139,12 @@ pub fn responses_request_to_chat(model: &str, body: &Value) -> ChatFormat {
 }
 
 /// Append one Responses-API `input` array element as chat message(s).
-fn append_input_item(messages: &mut Vec<ChatMessage>, item: &Value) {
+fn append_input_item(
+    messages: &mut Vec<ChatMessage>,
+    item: &Value,
+    search_name: &str,
+    tools: &[Value],
+) {
     // A bare-string element is user text.
     if let Some(text) = item.as_str() {
         if !text.is_empty() {
@@ -166,7 +173,7 @@ fn append_input_item(messages: &mut Vec<ChatMessage>, item: &Value) {
                 .and_then(Value::as_str)
                 .filter(|ns| !ns.is_empty())
             {
-                Some(namespace) => namespace_chat_tool_name(namespace, name),
+                Some(namespace) => namespace_chat_tool_name(namespace, name, tools),
                 None => name.to_string(),
             };
             let arguments = item.get("arguments").and_then(|v| v.as_str()).unwrap_or("");
@@ -194,6 +201,14 @@ fn append_input_item(messages: &mut Vec<ChatMessage>, item: &Value) {
                 .get("name")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
+            let name = match item
+                .get("namespace")
+                .and_then(Value::as_str)
+                .filter(|ns| !ns.is_empty())
+            {
+                Some(namespace) => namespace_chat_tool_name(namespace, name, tools),
+                None => name.to_string(),
+            };
             let input = item.get("input").and_then(|v| v.as_str()).unwrap_or("");
             push_tool_call(
                 messages,
@@ -206,6 +221,36 @@ fn append_input_item(messages: &mut Vec<ChatMessage>, item: &Value) {
                     },
                 }),
             );
+        }
+        Some("tool_search_call")
+            if item.get("execution").and_then(Value::as_str) == Some("client") =>
+        {
+            push_tool_call(
+                messages,
+                json!({
+                    "id": item.get("call_id").and_then(Value::as_str).unwrap_or_default(),
+                    "type": "function",
+                    "function": {
+                        "name": search_name,
+                        "arguments": item.get("arguments").map(Value::to_string).unwrap_or_default(),
+                    },
+                }),
+            );
+        }
+        Some("tool_search_output")
+            if item.get("execution").and_then(Value::as_str) == Some("client") =>
+        {
+            messages.push(ChatMessage {
+                role: Role::Tool,
+                content: Some(Value::Array(loaded_tools(item)).to_string()),
+                content_blocks: None,
+                name: None,
+                tool_call_id: item
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                extra: Map::new(),
+            });
         }
         // The tool result fed back by the caller → a `tool` role message.
         // A custom tool's result item is the same shape under a different
@@ -666,6 +711,132 @@ fn responses_text_format_to_response_format(text: &Value) -> Option<Value> {
     }
 }
 
+/// The functions a client search loaded are declared in history rather than
+/// `tools`. Keep that inventory request-local; a later search may refresh one
+/// member of a namespace without replacing its other members.
+fn request_tools(body: &Value) -> std::borrow::Cow<'_, [Value]> {
+    let declared = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut tools = Vec::new();
+    for item in body
+        .get("input")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if item.get("type").and_then(Value::as_str) == Some("tool_search_output")
+            && item.get("execution").and_then(Value::as_str) == Some("client")
+        {
+            merge_tools(&mut tools, &loaded_tools(item));
+        }
+    }
+    if tools.is_empty() {
+        return std::borrow::Cow::Borrowed(declared);
+    }
+    // Explicit current definitions take precedence over replayed ones.
+    merge_tools(&mut tools, declared);
+    std::borrow::Cow::Owned(tools)
+}
+
+/// Hosted definitions cannot be executed on the chat bridge. In particular,
+/// an MCP definition's authorization must never become model-readable text.
+fn loaded_tools(item: &Value) -> Vec<Value> {
+    item.get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| match tool.get("type").and_then(Value::as_str) {
+            Some("function" | "custom") => Some(tool.clone()),
+            Some("namespace") => {
+                let members: Vec<Value> = tool
+                    .get("tools")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter(|m| {
+                        matches!(
+                            m.get("type").and_then(Value::as_str),
+                            Some("function" | "custom")
+                        )
+                    })
+                    .cloned()
+                    .collect();
+                if members.is_empty() {
+                    return None;
+                }
+                let mut namespace = tool.clone();
+                namespace["tools"] = Value::Array(members);
+                Some(namespace)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn merge_tools(tools: &mut Vec<Value>, additional: &[Value]) {
+    for tool in additional {
+        let existing = tools.iter_mut().find(|old| {
+            tool.get("name").is_some()
+                && old.get("name") == tool.get("name")
+                && old.get("type") == tool.get("type")
+        });
+        if let Some(old) = existing {
+            let members = if tool.get("type").and_then(Value::as_str) == Some("namespace") {
+                let mut members = old
+                    .get("tools")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                merge_tools(
+                    &mut members,
+                    tool.get("tools")
+                        .and_then(Value::as_array)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default(),
+                );
+                Some(members)
+            } else {
+                None
+            };
+            *old = tool.clone();
+            if let Some(members) = members {
+                old["tools"] = Value::Array(members);
+            }
+        } else {
+            tools.push(tool.clone());
+        }
+    }
+}
+
+/// The search shim must not take the name of a function the caller owns.
+fn tool_search_chat_name(tools: &[Value]) -> String {
+    let mut occupied: std::collections::BTreeSet<String> = top_level_function_names(tools)
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    for tool in tools
+        .iter()
+        .filter(|t| t.get("type").and_then(Value::as_str) == Some("namespace"))
+    {
+        occupied.extend(namespace_members(tool, tools).map(|(name, _, _)| name));
+    }
+    let mut name = "tool_search".to_string();
+    let mut suffix = 0;
+    while occupied.contains(&name) {
+        suffix += 1;
+        name = format!("tool_search_{suffix}");
+    }
+    name
+}
+
+fn client_tool_search(tool: &Value) -> bool {
+    tool.get("type").and_then(Value::as_str) == Some("tool_search")
+        && tool.get("execution").and_then(Value::as_str) == Some("client")
+}
+
 /// Translate Responses-API `tools` into OpenAI chat tools.
 ///
 ///   * `{type:"function", name, description, parameters}` →
@@ -677,32 +848,40 @@ fn responses_text_format_to_response_format(text: &Value) -> Option<Value> {
 ///     `format.definition` rides along in the description, the only place a
 ///     chat upstream will read it.
 ///   * `{type:"namespace", name, description, tools:[…]}` → one function
-///     tool per `function` sub-tool, named `<namespace>__<tool>` (see
+///     tool per function or custom sub-tool, named `<namespace>__<tool>` (see
 ///     [`namespace_chat_tool_name`]) and described by the namespace's
-///     description followed by the sub-tool's own. A sub-tool whose
-///     flattened name is already a top-level function's is left out, so
-///     the model is never offered two tools under one name.
+///     description followed by the sub-tool's own. Long or colliding
+///     names use a stable short alias that the reply context restores.
+///   * `{type:"tool_search", execution:"client", description, parameters}`
+///     → a function tool; its answer returns as a client search call.
 ///   * hosted tools (`web_search*`, `file_search`, `code_interpreter`,
 ///     `mcp`, `computer_use*`, `image_generation`, …) have no chat
 ///     equivalent and are dropped.
 ///
 /// Returns `None` when nothing translates so the field stays absent from
 /// the wire.
-fn responses_tools_to_chat(tools: &Value) -> Option<Value> {
-    let arr = tools.as_array()?;
-    let top_level_functions = top_level_function_names(arr);
+fn responses_tools_to_chat(arr: &[Value]) -> Option<Value> {
+    let search_name = tool_search_chat_name(arr);
     let out: Vec<Value> = arr
         .iter()
         .flat_map(|t| -> Vec<Value> {
             match t.get("type").and_then(|v| v.as_str()) {
                 Some("function") => function_chat_tool(t, None).into_iter().collect(),
-                Some("namespace") => namespace_members(t)
-                    .filter(|(chat_name, _, _)| !top_level_functions.contains(chat_name.as_str()))
+                Some("namespace") => namespace_members(t, arr)
                     .filter_map(|(chat_name, member, description)| {
-                        function_chat_tool(member, Some((chat_name, description)))
+                        if member.get("type").and_then(Value::as_str) == Some("custom") {
+                            custom_chat_tool(member, Some((chat_name, description)))
+                        } else {
+                            function_chat_tool(member, Some((chat_name, description)))
+                        }
                     })
                     .collect(),
-                Some("custom") => custom_chat_tool(t).into_iter().collect(),
+                Some("custom") => custom_chat_tool(t, None).into_iter().collect(),
+                Some("tool_search") if client_tool_search(t) => {
+                    let mut function = t.clone();
+                    function["name"] = json!(search_name);
+                    function_chat_tool(&function, None).into_iter().collect()
+                }
                 _ => Vec::new(),
             }
         })
@@ -745,24 +924,79 @@ fn function_chat_tool(t: &Value, rename: Option<(String, Option<String>)>) -> Op
 /// directions of the translation derive it here — the request side names
 /// the tool and re-names replayed calls with it, the reply side maps a call
 /// back through [`ResponsesReplyContext`].
-fn namespace_chat_tool_name(namespace: &str, tool: &str) -> String {
-    format!("{namespace}__{tool}")
+fn namespace_chat_tool_name(namespace: &str, tool: &str, tools: &[Value]) -> String {
+    let taken = |candidate: &str| {
+        tools
+            .iter()
+            .any(|entry| match entry.get("type").and_then(Value::as_str) {
+                Some("function" | "custom") => {
+                    entry.get("name").and_then(Value::as_str) == Some(candidate)
+                }
+                Some("namespace") => {
+                    let ns = entry
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    entry
+                        .get("tools")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .any(|member| {
+                            let name = member
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
+                            (ns != namespace || name != tool)
+                                && format!("{ns}__{name}") == candidate
+                        })
+                }
+                _ => false,
+            })
+    };
+    let name = format!("{namespace}__{tool}");
+    if name.len() <= 64 && !taken(&name) {
+        return name;
+    }
+    // Both legal Responses names can fill 64 characters; the Chat name
+    // still has one 64-character slot. Restore the original pair on reply.
+    use sha2::{Digest, Sha256};
+    let mut salt = 0u64;
+    loop {
+        let hash = format!(
+            "{:x}",
+            Sha256::digest(format!("{namespace}\0{tool}\0{salt}").as_bytes())
+        );
+        let alias = format!("ns_{}", &hash[..48]);
+        if !taken(&alias) {
+            return alias;
+        }
+        salt += 1;
+    }
 }
 
-/// Names of the top-level `function` tools a request declared.
+/// Names of the top-level function or custom tools a request declared.
 fn top_level_function_names(tools: &[Value]) -> std::collections::BTreeSet<&str> {
     tools
         .iter()
-        .filter(|t| t.get("type").and_then(Value::as_str) == Some("function"))
+        .filter(|t| {
+            matches!(
+                t.get("type").and_then(Value::as_str),
+                Some("function" | "custom")
+            )
+        })
         .filter_map(|t| t.get("name").and_then(Value::as_str))
         .collect()
 }
 
-/// The `function` sub-tools of one `namespace` tool, each as
+/// The function or custom sub-tools of one `namespace` tool, each as
 /// `(flattened chat name, sub-tool, description)`. The description is the
 /// namespace's followed by the sub-tool's, so the model still reads what
 /// the group is for; either alone when the other is missing.
-fn namespace_members(t: &Value) -> impl Iterator<Item = (String, &Value, Option<String>)> {
+fn namespace_members<'a>(
+    t: &'a Value,
+    tools: &'a [Value],
+) -> impl Iterator<Item = (String, &'a Value, Option<String>)> + 'a {
     let namespace = t.get("name").and_then(Value::as_str).unwrap_or_default();
     let namespace_description = t
         .get("description")
@@ -773,7 +1007,12 @@ fn namespace_members(t: &Value) -> impl Iterator<Item = (String, &Value, Option<
         .into_iter()
         .flatten()
         .filter(move |_| !namespace.is_empty())
-        .filter(|m| m.get("type").and_then(Value::as_str) == Some("function"))
+        .filter(|m| {
+            matches!(
+                m.get("type").and_then(Value::as_str),
+                Some("function" | "custom")
+            )
+        })
         .filter_map(move |m| {
             let name = m.get("name").and_then(Value::as_str)?;
             let own = m
@@ -785,25 +1024,35 @@ fn namespace_members(t: &Value) -> impl Iterator<Item = (String, &Value, Option<
                 (Some(ns), None) => Some(ns.to_string()),
                 (None, own) => own.map(str::to_string),
             };
-            Some((namespace_chat_tool_name(namespace, name), m, description))
+            Some((
+                namespace_chat_tool_name(namespace, name, tools),
+                m,
+                description,
+            ))
         })
 }
 
 /// A Responses `custom` tool as a chat function tool taking one string.
-fn custom_chat_tool(t: &Value) -> Option<Value> {
+fn custom_chat_tool(t: &Value, rename: Option<(String, Option<String>)>) -> Option<Value> {
     let name = t.get("name").and_then(|v| v.as_str())?;
     let mut description = t
         .get("description")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    let name = if let Some((renamed, combined)) = rename {
+        description = combined.unwrap_or_default();
+        renamed
+    } else {
+        name.to_string()
+    };
     description.push_str(&custom_tool_grammar_suffix(t.get("format")));
     let mut func = Map::new();
     func.insert("name".to_string(), json!(name));
     if !description.is_empty() {
         func.insert("description".to_string(), json!(description));
     }
-    func.insert("parameters".to_string(), custom_tool_parameters(name));
+    func.insert("parameters".to_string(), custom_tool_parameters(&name));
     Some(json!({"type": "function", "function": Value::Object(func)}))
 }
 
@@ -874,6 +1123,7 @@ fn unwrap_custom_tool_input(arguments: &str) -> String {
 #[derive(Debug, Clone)]
 pub struct ResponsesReplyContext {
     custom_tools: std::collections::BTreeSet<String>,
+    client_tool_search: Option<String>,
     /// Chat function name → `(namespace, sub-tool name)`.
     namespace_tools: std::collections::BTreeMap<String, (String, String)>,
     echo: Map<String, Value>,
@@ -882,7 +1132,11 @@ pub struct ResponsesReplyContext {
 /// How one chat tool call is returned to a Responses caller.
 enum ReplyToolCall<'a> {
     /// A `custom_tool_call` item.
-    Custom,
+    Custom {
+        name: &'a str,
+        namespace: Option<&'a str>,
+    },
+    ToolSearch,
     /// A `function_call` item, naming a namespace sub-tool when `namespace`
     /// is set.
     Function {
@@ -901,20 +1155,40 @@ impl Default for ResponsesReplyContext {
 
 impl ResponsesReplyContext {
     pub fn from_request(body: &Value) -> Self {
-        let tools: &[Value] = body
-            .get("tools")
-            .and_then(Value::as_array)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        let custom_tools = tools
+        let tools = request_tools(body);
+        let namespace_tools = namespace_tool_map(&tools);
+        let mut custom_tools: std::collections::BTreeSet<String> = tools
             .iter()
             .filter(|t| t.get("type").and_then(Value::as_str) == Some("custom"))
             .filter_map(|t| t.get("name").and_then(Value::as_str))
             .map(str::to_string)
             .collect();
+        for tool in tools
+            .iter()
+            .filter(|t| t.get("type").and_then(Value::as_str) == Some("namespace"))
+        {
+            let namespace = tool.get("name").and_then(Value::as_str).unwrap_or_default();
+            for (_, member, _) in namespace_members(tool, &tools)
+                .filter(|(_, m, _)| m.get("type").and_then(Value::as_str) == Some("custom"))
+            {
+                let name = member
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                for (chat_name, (ns, member_name)) in &namespace_tools {
+                    if ns == namespace && member_name == name {
+                        custom_tools.insert(chat_name.clone());
+                    }
+                }
+            }
+        }
         Self {
             custom_tools,
-            namespace_tools: namespace_tool_map(tools),
+            client_tool_search: tools
+                .iter()
+                .any(client_tool_search)
+                .then(|| tool_search_chat_name(&tools)),
+            namespace_tools,
             echo: response_echo_fields(body),
         }
     }
@@ -927,18 +1201,17 @@ impl ResponsesReplyContext {
     }
 
     fn tool_call<'a>(&'a self, chat_name: &'a str) -> ReplyToolCall<'a> {
-        if self.custom_tools.contains(chat_name) {
-            return ReplyToolCall::Custom;
+        if self.client_tool_search.as_deref() == Some(chat_name) {
+            return ReplyToolCall::ToolSearch;
         }
-        match self.namespace_tools.get(chat_name) {
-            Some((namespace, name)) => ReplyToolCall::Function {
-                name,
-                namespace: Some(namespace),
-            },
-            None => ReplyToolCall::Function {
-                name: chat_name,
-                namespace: None,
-            },
+        let (name, namespace) = match self.namespace_tools.get(chat_name) {
+            Some((namespace, name)) => (name.as_str(), Some(namespace.as_str())),
+            None => (chat_name, None),
+        };
+        if self.custom_tools.contains(chat_name) {
+            ReplyToolCall::Custom { name, namespace }
+        } else {
+            ReplyToolCall::Function { name, namespace }
         }
     }
 }
@@ -947,9 +1220,8 @@ impl ResponsesReplyContext {
 /// mapped to `(namespace, sub-tool name)`: the flattened name it was
 /// offered under, and — when no top-level function and no other namespace
 /// uses it — the sub-tool's bare name, which a model sometimes answers with
-/// instead. A flattened name that collides with a top-level function was
-/// never offered (see [`responses_tools_to_chat`]) and maps to nothing, so
-/// a call to that function stays a plain `function_call`.
+/// instead. A real Chat name always takes precedence over a bare fallback,
+/// and a caller's top-level function keeps its original name.
 fn namespace_tool_map(tools: &[Value]) -> std::collections::BTreeMap<String, (String, String)> {
     let top_level = top_level_function_names(tools);
     let members: Vec<(String, String)> = tools
@@ -957,7 +1229,7 @@ fn namespace_tool_map(tools: &[Value]) -> std::collections::BTreeMap<String, (St
         .filter(|t| t.get("type").and_then(Value::as_str) == Some("namespace"))
         .flat_map(|t| {
             let namespace = t.get("name").and_then(Value::as_str).unwrap_or_default();
-            namespace_members(t).filter_map(move |(_, member, _)| {
+            namespace_members(t, tools).filter_map(move |(_, member, _)| {
                 let name = member.get("name").and_then(Value::as_str)?;
                 Some((namespace.to_string(), name.to_string()))
             })
@@ -965,14 +1237,12 @@ fn namespace_tool_map(tools: &[Value]) -> std::collections::BTreeMap<String, (St
         .collect();
     let mut map = std::collections::BTreeMap::new();
     for (namespace, name) in &members {
-        let chat_name = namespace_chat_tool_name(namespace, name);
-        if !top_level.contains(chat_name.as_str()) {
-            map.insert(chat_name, (namespace.clone(), name.clone()));
-        }
+        let chat_name = namespace_chat_tool_name(namespace, name, tools);
+        map.insert(chat_name, (namespace.clone(), name.clone()));
     }
     for (namespace, name) in &members {
         let unique = members.iter().filter(|(_, n)| n == name).count() == 1;
-        if unique && !top_level.contains(name.as_str()) {
+        if unique && !top_level.contains(name.as_str()) && !map.contains_key(name) {
             map.insert(name.clone(), (namespace.clone(), name.clone()));
         }
     }
@@ -1008,7 +1278,7 @@ fn custom_tool_grammar_suffix(format: Option<&Value>) -> String {
 ///   * `{type:"any"}` → `"required"`
 ///   * a choice naming a hosted tool type, or anything else → `None`, so
 ///     the field stays off the wire
-fn responses_tool_choice_to_chat(tc: &Value) -> Option<Value> {
+fn responses_tool_choice_to_chat(tc: &Value, tools: &[Value]) -> Option<Value> {
     match tc {
         Value::String(s) => Some(Value::String(s.clone())),
         Value::Object(o) => match o.get("type").and_then(|v| v.as_str())? {
@@ -1020,7 +1290,7 @@ fn responses_tool_choice_to_chat(tc: &Value) -> Option<Value> {
                     .and_then(Value::as_str)
                     .filter(|ns| !ns.is_empty())
                 {
-                    Some(namespace) => namespace_chat_tool_name(namespace, name),
+                    Some(namespace) => namespace_chat_tool_name(namespace, name, tools),
                     None => name.to_string(),
                 };
                 Some(json!({"type": "function", "function": {"name": name}}))
@@ -1387,14 +1657,20 @@ fn build_output_items(
                 .and_then(|a| a.as_str())
                 .unwrap_or("");
             output.push(match reply.tool_call(name) {
-                ReplyToolCall::Custom => json!({
-                    "type": "custom_tool_call",
-                    "id": format!("ctc_{}", Uuid::new_v4().simple()),
-                    "call_id": call_id,
-                    "name": name,
-                    "input": unwrap_custom_tool_input(arguments),
-                    "status": "completed",
-                }),
+                ReplyToolCall::ToolSearch => tool_search_call_item(
+                    &format!("tsc_{}", Uuid::new_v4().simple()),
+                    call_id,
+                    arguments,
+                    "completed",
+                ),
+                ReplyToolCall::Custom { name, namespace } => custom_tool_call_item(
+                    &format!("ctc_{}", Uuid::new_v4().simple()),
+                    call_id,
+                    name,
+                    namespace,
+                    &unwrap_custom_tool_input(arguments),
+                    "completed",
+                ),
                 ReplyToolCall::Function { name, namespace } => function_call_item(
                     &format!("fc_{}", Uuid::new_v4().simple()),
                     call_id,
@@ -1428,6 +1704,32 @@ fn function_call_item(
         "arguments": arguments,
         "status": status,
     });
+    if let Some(namespace) = namespace {
+        item["namespace"] = json!(namespace);
+    }
+    item
+}
+
+/// Client search arguments are JSON values, unlike a function call's JSON
+/// string (official SDK `response_tool_search_call.py`). Keep malformed
+/// upstream arguments as their original string for the client's validation.
+fn tool_search_call_item(id: &str, call_id: &str, arguments: &str, status: &str) -> Value {
+    let arguments = serde_json::from_str::<Value>(arguments)
+        .unwrap_or_else(|_| Value::String(arguments.to_string()));
+    json!({"type": "tool_search_call", "id": id, "call_id": call_id,
+        "execution": "client", "arguments": arguments, "status": status})
+}
+
+fn custom_tool_call_item(
+    id: &str,
+    call_id: &str,
+    name: &str,
+    namespace: Option<&str>,
+    input: &str,
+    status: &str,
+) -> Value {
+    let mut item = json!({"type": "custom_tool_call", "id": id, "call_id": call_id,
+        "name": name, "input": input, "status": status});
     if let Some(namespace) = namespace {
         item["namespace"] = json!(namespace);
     }
@@ -1559,6 +1861,7 @@ struct ToolCallState {
     /// The call names one of the request's `custom` tools, so it streams as
     /// a `custom_tool_call` item rather than a `function_call` one.
     custom: bool,
+    search: bool,
     /// `(namespace, sub-tool name)` when the call names a flattened
     /// namespace sub-tool. Fixed when the item is announced, like `custom`.
     namespace: Option<(String, String)>,
@@ -1571,24 +1874,40 @@ impl ToolCallState {
     /// `fc_…` for a function call, `ctc_…` for a custom tool call — the two
     /// item-id prefixes the Responses API uses for the two item types.
     fn item_id(&self) -> String {
-        let prefix = if self.custom { "ctc" } else { "fc" };
+        let prefix = if self.search {
+            "tsc"
+        } else if self.custom {
+            "ctc"
+        } else {
+            "fc"
+        };
         format!("{prefix}_{}", self.item_uuid)
     }
 
     /// The completed output item for this call.
     fn done_item(&self) -> Value {
-        if self.custom {
-            json!({
-                "type": "custom_tool_call",
-                "id": self.item_id(),
-                "call_id": self.call_id,
-                "name": self.name,
-                "input": unwrap_custom_tool_input(&self.arguments),
-                "status": "completed",
-            })
+        if self.search {
+            tool_search_call_item(&self.item_id(), &self.call_id, &self.arguments, "completed")
+        } else if self.custom {
+            self.custom_call_item(&unwrap_custom_tool_input(&self.arguments), "completed")
         } else {
             self.function_call_item(&self.arguments, "completed")
         }
+    }
+
+    fn custom_call_item(&self, input: &str, status: &str) -> Value {
+        let (name, namespace) = match &self.namespace {
+            Some((namespace, name)) => (name.as_str(), Some(namespace.as_str())),
+            None => (self.name.as_str(), None),
+        };
+        custom_tool_call_item(
+            &self.item_id(),
+            &self.call_id,
+            name,
+            namespace,
+            input,
+            status,
+        )
     }
 
     /// This call as a `function_call` item, under the sub-tool name and
@@ -2229,6 +2548,7 @@ impl ResponsesSseEncoder {
                             call_id: String::new(),
                             name: String::new(),
                             custom: false,
+                            search: false,
                             namespace: None,
                             output_index,
                             arguments: String::new(),
@@ -2236,13 +2556,22 @@ impl ResponsesSseEncoder {
                         },
                     );
                 }
-                let (custom, namespace) = match self.reply.tool_call(name) {
-                    ReplyToolCall::Custom => (true, None),
+                let (custom, search, namespace) = match self.reply.tool_call(name) {
+                    ReplyToolCall::Custom { name, namespace } => (
+                        true,
+                        false,
+                        namespace.map(|ns| (ns.to_string(), name.to_string())),
+                    ),
+                    ReplyToolCall::ToolSearch => (false, true, None),
                     ReplyToolCall::Function {
                         name: sub_name,
                         namespace: Some(namespace),
-                    } => (false, Some((namespace.to_string(), sub_name.to_string()))),
-                    ReplyToolCall::Function { .. } => (false, None),
+                    } => (
+                        false,
+                        false,
+                        Some((namespace.to_string(), sub_name.to_string())),
+                    ),
+                    ReplyToolCall::Function { .. } => (false, false, None),
                 };
                 let state = self.tool_calls.get_mut(&oai_index).expect("just inserted");
                 if !id.is_empty() {
@@ -2259,6 +2588,7 @@ impl ResponsesSseEncoder {
                     // the client already read.
                     if !state.item_added {
                         state.custom = custom;
+                        state.search = search;
                         state.namespace = namespace;
                     }
                 }
@@ -2267,8 +2597,10 @@ impl ResponsesSseEncoder {
                 if !state.item_added && !state.call_id.is_empty() && !state.name.is_empty() {
                     state.item_added = true;
                     let output_index = state.output_index;
-                    let item = if state.custom {
-                        json!({"type": "custom_tool_call", "id": state.item_id(), "call_id": state.call_id, "name": state.name, "input": "", "status": "in_progress"})
+                    let item = if state.search {
+                        tool_search_call_item(&state.item_id(), &state.call_id, "{}", "in_progress")
+                    } else if state.custom {
+                        state.custom_call_item("", "in_progress")
                     } else {
                         state.function_call_item("", "in_progress")
                     };
@@ -2288,7 +2620,7 @@ impl ResponsesSseEncoder {
                     // Streaming the wrapper through would hand the client
                     // pieces of `{"content":"…"}` under an event type whose
                     // payload is supposed to be the input itself.
-                    if state.item_added && !state.custom {
+                    if state.item_added && !state.custom && !state.search {
                         let (item_id, output_index) = (state.item_id(), state.output_index);
                         events.push(self.event(
                             "response.function_call_arguments.delta",
@@ -2448,13 +2780,14 @@ impl ResponsesSseEncoder {
             .map(|(k, _)| *k)
             .collect();
         for k in pending {
-            let (item_id, arguments, output_index, custom, done_item) = {
+            let (item_id, arguments, output_index, custom, search, done_item) = {
                 let s = self.tool_calls.get(&k).expect("present");
                 (
                     s.item_id(),
                     s.arguments.clone(),
                     s.output_index,
                     s.custom,
+                    s.search,
                     s.done_item(),
                 )
             };
@@ -2479,7 +2812,7 @@ impl ResponsesSseEncoder {
                         "input": input,
                     }),
                 ));
-            } else {
+            } else if !search {
                 events.push(self.event(
                     "response.function_call_arguments.done",
                     json!({
@@ -3915,6 +4248,409 @@ mod tests {
             .as_array()
             .unwrap();
         assert_eq!(tcs.len(), 2);
+    }
+
+    fn client_tool_search_request() -> Value {
+        json!({
+            "input": "Find a calendar tool",
+            "tool_choice": "required",
+            "tools": [{
+                "type": "tool_search", "execution": "client",
+                "description": "Find tools by query",
+                "parameters": {
+                    "type": "object", "properties": {"query": {"type": "string"}},
+                    "required": ["query"], "additionalProperties": false,
+                },
+            }],
+        })
+    }
+
+    #[test]
+    fn client_tool_search_definition_reaches_chat() {
+        let body = client_tool_search_request();
+        let chat = responses_request_to_chat("m", &body);
+        let tools = chat.extra.get("tools").and_then(Value::as_array);
+        assert!(tools.is_some(), "client tool discovery was lost");
+        let tools = tools.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["function"]["name"], "tool_search");
+        assert_eq!(
+            tools[0]["function"]["parameters"],
+            body["tools"][0]["parameters"]
+        );
+        assert_eq!(chat.extra.get("tool_choice"), Some(&json!("required")));
+    }
+
+    #[test]
+    fn client_tool_search_reply_uses_the_client_executed_item() {
+        let reply = ResponsesReplyContext::from_request(&client_tool_search_request());
+        for arguments in [r#"{"query":"calendar"}"#, "invalid json"] {
+            let resp = chat_response_with(
+                None,
+                Some(json!([{
+                    "id": "call_search", "type": "function",
+                    "function": {"name": "tool_search", "arguments": arguments},
+                }])),
+                FinishReason::ToolCalls,
+            );
+            let out = chat_response_to_responses_json(&resp, "m", 1, &reply);
+            let item = &out["output"][0];
+            assert_eq!(item["type"], "tool_search_call");
+            assert_eq!(item["execution"], "client");
+            assert_eq!(item["call_id"], "call_search");
+            assert_eq!(item["status"], "completed");
+            let expected = serde_json::from_str::<Value>(arguments)
+                .unwrap_or_else(|_| Value::String(arguments.to_string()));
+            assert_eq!(item["arguments"], expected);
+            assert!(item.get("name").is_none());
+        }
+    }
+
+    #[test]
+    fn client_tool_search_history_loads_tools_and_keeps_the_call_result_pair() {
+        let mut body = client_tool_search_request();
+        let loaded = json!({
+            "type": "namespace", "name": "calendar", "description": "Calendar tools",
+            "tools": [{"type": "function", "name": "lookup", "defer_loading": true,
+                "parameters": {"type": "object", "properties": {"date": {"type": "string"}}}}],
+        });
+        body["input"] = json!([
+            {"role": "user", "content": "Find calendar tools"},
+            {"type": "tool_search_call", "execution": "client", "call_id": "call_search",
+                "arguments": {"query": "calendar"}, "status": "completed"},
+            {"type": "tool_search_output", "execution": "client", "call_id": "call_search",
+                "status": "completed", "tools": [loaded.clone()]},
+        ]);
+        let chat = responses_request_to_chat("m", &body);
+        assert_eq!(chat.messages.len(), 3);
+        assert_eq!(chat.messages[1].extra["tool_calls"][0]["id"], "call_search");
+        assert_eq!(
+            chat.messages[1].extra["tool_calls"][0]["function"]["name"],
+            "tool_search"
+        );
+        assert_eq!(
+            chat.messages[1].extra["tool_calls"][0]["function"]["arguments"],
+            r#"{"query":"calendar"}"#
+        );
+        assert_eq!(chat.messages[2].role, Role::Tool);
+        assert_eq!(
+            chat.messages[2].tool_call_id.as_deref(),
+            Some("call_search")
+        );
+        let result: Value = serde_json::from_str(&chat.messages[2].content_str()).unwrap();
+        assert_eq!(result, json!([loaded]));
+        let tools = chat.extra["tools"].as_array().unwrap();
+        assert!(tools
+            .iter()
+            .any(|t| t["function"]["name"] == "calendar__lookup"));
+        let reply = ResponsesReplyContext::from_request(&body);
+        let resp = chat_response_with(
+            None,
+            Some(json!([{
+                "id": "call_lookup", "type": "function", "function": {
+                    "name": "calendar__lookup", "arguments": "{}",
+                },
+            }])),
+            FinishReason::ToolCalls,
+        );
+        let out = chat_response_to_responses_json(&resp, "m", 1, &reply);
+        assert_eq!(out["output"][0]["name"], "lookup");
+        assert_eq!(out["output"][0]["namespace"], "calendar");
+    }
+
+    #[test]
+    fn client_tool_search_stream_emits_search_items_without_function_argument_events() {
+        let reply = ResponsesReplyContext::from_request(&client_tool_search_request());
+        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, reply);
+        let mut events = Vec::new();
+        for (call, finish) in [
+            (
+                json!({"index": 0, "id": "call_search", "type": "function",
+                "function": {"name": "tool_search", "arguments": "{\"query\":"}}),
+                None,
+            ),
+            (
+                json!({"index": 0, "function": {"arguments": "\"calendar\"}"}}),
+                Some(FinishReason::ToolCalls),
+            ),
+        ] {
+            events.extend(enc.next_events(&ChatChunk {
+                choice_index: 0,
+                logprobs: None,
+                id: "c".into(),
+                model: "m".into(),
+                delta: ChatDelta {
+                    tool_calls: Some(vec![call]),
+                    ..Default::default()
+                },
+                finish_reason: finish,
+                usage: Some(UsageStats::new(4, 6)),
+                service_tier: None,
+                accounting_usage: None,
+            }));
+        }
+        assert!(!types_of(&events)
+            .iter()
+            .any(|t| t.starts_with("response.function_call_arguments")));
+        let added = events
+            .iter()
+            .find(|e| e.event_type == "response.output_item.added")
+            .unwrap();
+        let done = events
+            .iter()
+            .find(|e| e.event_type == "response.output_item.done")
+            .unwrap();
+        assert_eq!(added.data["item"]["type"], "tool_search_call");
+        assert_eq!(done.data["item"]["type"], "tool_search_call");
+        assert_eq!(done.data["item"]["arguments"], json!({"query": "calendar"}));
+        assert_eq!(done.data["item"]["call_id"], "call_search");
+        let terminal = events.last().unwrap();
+        assert_eq!(terminal.event_type, "response.completed");
+        assert_eq!(terminal.data["response"]["output"][0], done.data["item"]);
+    }
+
+    #[test]
+    fn client_tool_search_does_not_take_an_existing_function_name() {
+        let mut body = client_tool_search_request();
+        body["tools"].as_array_mut().unwrap().push(json!({
+            "type": "function", "name": "tool_search",
+            "parameters": {"type": "object", "properties": {"category": {"type": "string"}}},
+        }));
+        let chat = responses_request_to_chat("m", &body);
+        let tools = chat.extra["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2);
+        let search = tools
+            .iter()
+            .find(|t| {
+                t["function"]["parameters"]["properties"]
+                    .get("query")
+                    .is_some()
+            })
+            .unwrap();
+        let name = search["function"]["name"].as_str().unwrap();
+        assert_ne!(name, "tool_search");
+        let reply = ResponsesReplyContext::from_request(&body);
+        for (name, expected) in [("tool_search", "function_call"), (name, "tool_search_call")] {
+            let resp = chat_response_with(
+                None,
+                Some(json!([{
+                    "id": "call_1", "type": "function", "function": {"name": name, "arguments": "{}"},
+                }])),
+                FinishReason::ToolCalls,
+            );
+            let out = chat_response_to_responses_json(&resp, "m", 1, &reply);
+            assert_eq!(out["output"][0]["type"], expected);
+        }
+    }
+
+    #[test]
+    fn client_tool_search_repeated_namespaces_keep_all_members_once() {
+        let mut body = client_tool_search_request();
+        body["input"] = json!([
+            {"type": "tool_search_output", "execution": "client", "call_id": "s1", "tools": [
+                {"type": "namespace", "name": "calendar", "tools": [
+                    {"type": "function", "name": "lookup", "description": "old"}
+                ]}
+            ]},
+            {"type": "tool_search_output", "execution": "client", "call_id": "s2", "tools": [
+                {"type": "namespace", "name": "calendar", "tools": [
+                    {"type": "function", "name": "lookup", "description": "current"},
+                    {"type": "function", "name": "create"}
+                ]}
+            ]},
+        ]);
+        let chat = responses_request_to_chat("m", &body);
+        let tools = chat.extra["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 3);
+        let lookups: Vec<_> = tools
+            .iter()
+            .filter(|t| t["function"]["name"] == "calendar__lookup")
+            .collect();
+        assert_eq!(lookups.len(), 1);
+        assert_eq!(lookups[0]["function"]["description"], "current");
+        assert!(tools
+            .iter()
+            .any(|t| t["function"]["name"] == "calendar__create"));
+    }
+
+    #[test]
+    fn client_tool_search_namespace_custom_replies_and_replays_its_original_input() {
+        let mut body = client_tool_search_request();
+        body["input"] = json!([
+            {"type": "tool_search_output", "execution": "client", "call_id": "s1", "tools": [
+                {"type": "namespace", "name": "workspace", "tools": [
+                    {"type": "custom", "name": "apply_patch", "description": "Edit files", "format": {"type": "text"}}
+                ]}
+            ]},
+            {"type": "custom_tool_call", "call_id": "c1", "namespace": "workspace", "name": "apply_patch", "input": "patch text"},
+            {"type": "custom_tool_call_output", "call_id": "c1", "output": "patched"},
+        ]);
+        let chat = responses_request_to_chat("m", &body);
+        let tools = chat.extra["tools"].as_array().unwrap();
+        assert!(tools
+            .iter()
+            .any(|t| t["function"]["name"] == "workspace__apply_patch"));
+        let assistant = chat
+            .messages
+            .iter()
+            .find(|m| m.role == Role::Assistant)
+            .unwrap();
+        assert_eq!(
+            assistant.extra["tool_calls"][0]["function"]["name"],
+            "workspace__apply_patch"
+        );
+        assert_eq!(
+            assistant.extra["tool_calls"][0]["function"]["arguments"],
+            r#"{"content":"patch text"}"#
+        );
+        let call = json!({"index": 0, "id": "c1", "type": "function",
+            "function": {"name": "workspace__apply_patch", "arguments": "{\"content\":\"patch text\"}"}});
+        let reply = ResponsesReplyContext::from_request(&body);
+        let resp = chat_response_with(None, Some(json!([call.clone()])), FinishReason::ToolCalls);
+        let out = chat_response_to_responses_json(&resp, "m", 1, &reply);
+        let mut enc = ResponsesSseEncoder::new("r", "m", 0, reply);
+        let events = enc.next_events(&ChatChunk {
+            choice_index: 0,
+            logprobs: None,
+            id: "c".into(),
+            model: "m".into(),
+            delta: ChatDelta {
+                tool_calls: Some(vec![call]),
+                ..Default::default()
+            },
+            finish_reason: Some(FinishReason::ToolCalls),
+            usage: Some(UsageStats::new(4, 6)),
+            service_tier: None,
+            accounting_usage: None,
+        });
+        for item in [
+            &out["output"][0],
+            &events.last().unwrap().data["response"]["output"][0],
+        ] {
+            assert_eq!(item["type"], "custom_tool_call");
+            assert_eq!(item["namespace"], "workspace");
+            assert_eq!(item["name"], "apply_patch");
+            assert_eq!(item["input"], "patch text");
+        }
+    }
+
+    #[test]
+    fn client_tool_search_long_namespace_names_roundtrip_through_a_short_alias() {
+        let mut body = client_tool_search_request();
+        let name = "lookup_calendar_details_and_free_slots_for_the_requested_date_now";
+        body["input"] = json!([
+            {"type": "tool_search_output", "execution": "client", "call_id": "s1", "tools": [
+                {"type": "namespace", "name": "mcp_calendar", "tools": [{
+                    "type": "function", "name": name,
+                    "parameters": {"type": "object", "properties": {"date": {"type": "string"}}}
+                }]}
+            ]},
+            {"type": "function_call", "call_id": "c1", "namespace": "mcp_calendar", "name": name, "arguments": "{}"},
+        ]);
+        body["tool_choice"] =
+            json!({"type": "function", "namespace": "mcp_calendar", "name": name});
+        let chat = responses_request_to_chat("m", &body);
+        let tool = chat.extra["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| {
+                t["function"]["parameters"]["properties"]
+                    .get("date")
+                    .is_some()
+            })
+            .unwrap();
+        let alias = tool["function"]["name"].as_str().unwrap();
+        assert!(
+            alias.len() <= 64,
+            "Chat tool names have a 64-character maximum"
+        );
+        assert_eq!(chat.extra["tool_choice"]["function"]["name"], alias);
+        assert_eq!(
+            chat.messages[1].extra["tool_calls"][0]["function"]["name"],
+            alias
+        );
+        assert_eq!(
+            responses_request_to_chat("m", &body).extra["tools"],
+            chat.extra["tools"]
+        );
+        let reply = ResponsesReplyContext::from_request(&body);
+        let resp = chat_response_with(
+            None,
+            Some(json!([{
+                "id": "c2", "type": "function", "function": {"name": alias, "arguments": "{}"}
+            }])),
+            FinishReason::ToolCalls,
+        );
+        let out = chat_response_to_responses_json(&resp, "m", 1, &reply);
+        assert_eq!(out["output"][0]["name"], name);
+        assert_eq!(out["output"][0]["namespace"], "mcp_calendar");
+    }
+
+    #[test]
+    fn client_tool_search_hosted_credentials_never_enter_the_chat_prompt() {
+        let mut body = client_tool_search_request();
+        body["input"] = json!([{
+            "type": "tool_search_output", "execution": "client", "call_id": "s1", "tools": [
+                {"type": "mcp", "server_label": "private", "server_url": "https://tools.example.test",
+                    "authorization": "HOSTED_AUTH_SENTINEL", "headers": {"x-key": "HOSTED_HEADER_SENTINEL"}},
+                {"type": "namespace", "name": "calendar", "tools": [
+                    {"type": "function", "name": "lookup"},
+                    {"type": "mcp", "server_label": "private", "authorization": "NESTED_AUTH_SENTINEL"}
+                ]}
+            ]
+        }]);
+        let chat = responses_request_to_chat("m", &body);
+        let wire = serde_json::to_string(&chat).unwrap();
+        for secret in [
+            "HOSTED_AUTH_SENTINEL",
+            "HOSTED_HEADER_SENTINEL",
+            "NESTED_AUTH_SENTINEL",
+        ] {
+            assert!(
+                !wire.contains(secret),
+                "hosted credentials became model input"
+            );
+        }
+        assert!(chat.extra["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["function"]["name"] == "calendar__lookup"));
+    }
+
+    #[test]
+    fn client_tool_search_namespace_aliases_keep_pairs_and_real_names_distinct() {
+        let body = json!({"tools": [
+            {"type": "namespace", "name": "a__b", "tools": [{"type": "function", "name": "c"}]},
+            {"type": "namespace", "name": "a", "tools": [{"type": "function", "name": "b__c"}]},
+            {"type": "namespace", "name": "other", "tools": [{"type": "function", "name": "calendar__lookup"}]},
+            {"type": "namespace", "name": "calendar", "tools": [{"type": "function", "name": "lookup"}]},
+        ]});
+        let chat = responses_request_to_chat("m", &body);
+        let tools = chat.extra["tools"].as_array().unwrap();
+        let names: BTreeSet<_> = tools
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names.len(), 4);
+        let reply = ResponsesReplyContext::from_request(&body);
+        for (index, (namespace, name)) in [
+            ("a__b", "c"),
+            ("a", "b__c"),
+            ("other", "calendar__lookup"),
+            ("calendar", "lookup"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let alias = tools[index]["function"]["name"].as_str().unwrap();
+            assert!(
+                matches!(reply.tool_call(alias), ReplyToolCall::Function { name: actual, namespace: Some(ns) } if actual == name && ns == namespace)
+            );
+        }
+        assert!(names.contains("calendar__lookup"));
     }
 
     #[test]
@@ -5870,7 +6606,8 @@ mod tests {
             [
                 "exec_command",
                 "multi_agent_v1__spawn_agent",
-                "multi_agent_v1__close_agent"
+                "multi_agent_v1__close_agent",
+                "multi_agent_v1__not_a_function"
             ]
         );
         assert_eq!(
@@ -5883,6 +6620,10 @@ mod tests {
         );
         assert_eq!(
             tools[1]["function"]["parameters"]["properties"]["task"]["type"],
+            "string"
+        );
+        assert_eq!(
+            tools[3]["function"]["parameters"]["properties"]["content"]["type"],
             "string"
         );
     }
@@ -5921,8 +6662,8 @@ mod tests {
         assert_eq!(strict("multi_agent_v1__close_agent"), None);
     }
 
-    /// A sub-tool whose flattened name a top-level function already has is
-    /// not offered twice, and a call to that name stays the top-level one.
+    /// A colliding namespace member gets its own alias; a call to the
+    /// caller's top-level name still calls the top-level function.
     #[test]
     fn a_flattened_name_taken_by_a_top_level_function_is_not_offered_twice() {
         let body = json!({"input": "go", "tools": [
@@ -5930,8 +6671,17 @@ mod tests {
             {"type": "namespace", "name": "ns", "tools": [{"type": "function", "name": "a"}]},
         ]});
         let chat = responses_request_to_chat("m", &body);
-        assert_eq!(chat.extra["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(chat.extra["tools"].as_array().unwrap().len(), 2);
+        let alias = chat.extra["tools"][1]["function"]["name"].as_str().unwrap();
+        assert_ne!(alias, "ns__a");
         let reply = ResponsesReplyContext::from_request(&body);
+        assert!(matches!(
+            reply.tool_call(alias),
+            ReplyToolCall::Function {
+                name: "a",
+                namespace: Some("ns")
+            }
+        ));
         assert!(matches!(
             reply.tool_call("ns__a"),
             ReplyToolCall::Function {
