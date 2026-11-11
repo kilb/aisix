@@ -83,13 +83,101 @@ const ERROR_MARKERS: &[&str] = &[
     "response.failed",
 ];
 
+/// A streamed shape's success is the canned reply, reassembled from its
+/// deltas (see [`streamed_reply`]), plus the dialect's terminal event: a
+/// stream that closes cleanly without ever emitting the content trained the
+/// relay loop but not the model-output path, so it is not this shape's
+/// success.
 const CHAT_DONE: &[&str] = &[REPLY, r#""finish_reason":"stop""#];
-const CHAT_STREAM_DONE: &[&str] = &[r#""finish_reason":"stop""#, "data: [DONE]"];
+const CHAT_STREAM_DONE: &[&str] = &[REPLY, r#""finish_reason":"stop""#, "data: [DONE]"];
 const MESSAGES_DONE: &[&str] = &[REPLY, r#""stop_reason":"end_turn""#];
-const MESSAGES_STREAM_DONE: &[&str] = &[r#""stop_reason":"end_turn""#, "event: message_stop"];
+const MESSAGES_STREAM_DONE: &[&str] =
+    &[REPLY, r#""stop_reason":"end_turn""#, "event: message_stop"];
 const RESPONSES_DONE: &[&str] = &[REPLY, r#""status":"completed""#];
-const RESPONSES_STREAM_DONE: &[&str] = &["response.completed"];
+const RESPONSES_STREAM_DONE: &[&str] = &[REPLY, "response.completed"];
 const EMBEDDINGS_DONE: &[&str] = &[r#""embedding":["#];
+
+/// The content deltas every streamed shape carries, in order: the canned
+/// reply as the first, then padding pieces so the stream is long enough to
+/// warm the relay loop. A real stream splits a model's reply across many
+/// deltas; the trainer's stays contiguous so a captured answer shows the
+/// reply the same way whichever side assembles it, and the cross-chunk case
+/// is covered by its own test.
+fn content_deltas() -> Vec<&'static str> {
+    std::iter::once(REPLY)
+        .chain(std::iter::repeat_n(" ", STREAM_FRAMES - 2))
+        .collect()
+}
+
+/// The content one SSE frame carries, in the frame's own dialect: the chat
+/// `choices[].delta.content`, the Responses `response.output_text.delta`
+/// `delta`, or the Anthropic `content_block_delta` `delta.text`. Anything
+/// else — a terminal frame, a non-event line, a frame that is not JSON —
+/// carries none.
+///
+/// Std-only on purpose (this tool builds with no dependencies): the trainer
+/// writes these frames itself, so the value is read with a string scan
+/// instead of a JSON parser.
+fn frame_content(frame: &str) -> String {
+    let Some(data) = frame.lines().find_map(|l| l.strip_prefix("data: ")) else {
+        return String::new();
+    };
+    // Chat: `"delta":{"content":"..."}`. Responses carries the text in a
+    // `"delta":"..."` at the frame's top level; Messages in
+    // `"delta":{"type":"text_delta","text":"..."}`.
+    for key in [r#""content":"#, r#""delta":"#, r#""text":"#] {
+        if let Some(value) = json_string_field(data.trim(), key) {
+            if !value.is_empty() {
+                return value;
+            }
+        }
+    }
+    String::new()
+}
+
+/// The value of the first JSON string field named exactly `key` (a quoted
+/// name plus its colon, e.g. `"content":`) in `data`, unescaped; `None` when
+/// the frame has no such field or the field is not a string.
+fn json_string_field(data: &str, key: &str) -> Option<String> {
+    let at = data.find(key)?;
+    let rest = data[at + key.len()..].trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let mut out = String::new();
+    let mut chars = rest.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return Some(out),
+            '\\' => match chars.next()? {
+                '"' => out.push('"'),
+                '\\' => out.push('\\'),
+                'n' => out.push('\n'),
+                't' => out.push('\t'),
+                'r' => out.push('\r'),
+                other => {
+                    out.push('\\');
+                    out.push(other);
+                }
+            },
+            other => out.push(other),
+        }
+    }
+    Some(out)
+}
+
+/// The canned reply as a streamed answer actually delivers it: the content of
+/// every frame, in order, joined. `None` for a body that is not a stream —
+/// a whole JSON body carries the reply as one piece, and the shapes that
+/// expect it match it directly.
+fn streamed_reply(text: &str) -> Option<String> {
+    if !text.starts_with("data: ") && !text.starts_with("event: ") {
+        return None;
+    }
+    // `split` yields each event block without its terminating blank line, so
+    // a block's last `data:` line runs to the block's end, and the content of
+    // one block joins the next's directly.
+    let joined: String = text.split("\n\n").map(frame_content).collect();
+    Some(joined)
+}
 
 /// Why `body` is not the shape's canned success, or `None` when it is.
 fn unexpected_body(shape: &Shape, body: &[u8]) -> Option<String> {
@@ -101,11 +189,18 @@ fn unexpected_body(shape: &Shape, body: &[u8]) -> Option<String> {
             excerpt()
         ));
     }
-    shape
-        .expect
-        .iter()
-        .find(|m| !text.contains(**m))
-        .map(|missing| format!("HTTP 200 without {missing:?}: {:?}", excerpt()))
+    // A streamed answer carries the reply in pieces, so its content is
+    // matched against the reassembled deltas; everything else is matched
+    // literally.
+    let reply = streamed_reply(&text).unwrap_or_else(|| text.to_string());
+    let missing = shape.expect.iter().find(|m| {
+        if **m == REPLY {
+            !reply.contains(REPLY)
+        } else {
+            !text.contains(**m)
+        }
+    });
+    missing.map(|missing| format!("HTTP 200 without {missing:?}: {:?}", excerpt()))
 }
 
 /// The v1 training matrix (#967, extended at the 2026-08-13 scenario review):
@@ -641,12 +736,11 @@ fn chat_sse_frames() -> Vec<String> {
         "\n\n"
     )
     .to_string());
-    for _ in 0..STREAM_FRAMES - 2 {
-        f.push(concat!(
-            r#"data: {"id":"chatcmpl-pgo","object":"chat.completion.chunk","created":0,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{"content":"chunk "},"finish_reason":null}]}"#,
+    for part in content_deltas() {
+        f.push(format!(
+            r#"data: {{"id":"chatcmpl-pgo","object":"chat.completion.chunk","created":0,"model":"gpt-4o-mini","choices":[{{"index":0,"delta":{{"content":"{part}"}},"finish_reason":null}}]}}{}"#,
             "\n\n"
-        )
-        .to_string());
+        ));
     }
     f.push(concat!(
         r#"data: {"id":"chatcmpl-pgo","object":"chat.completion.chunk","created":0,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":9,"completion_tokens":46,"total_tokens":55}}"#,
@@ -662,15 +756,10 @@ fn chat_sse_frames() -> Vec<String> {
 /// `[DONE]`.
 fn responses_sse_frames() -> Vec<String> {
     let mut f = Vec::with_capacity(STREAM_FRAMES + 1);
-    for _ in 0..STREAM_FRAMES - 1 {
-        f.push(
-            concat!(
-                "event: response.output_text.delta\n",
-                r#"data: {"type":"response.output_text.delta","delta":"chunk "}"#,
-                "\n\n"
-            )
-            .to_string(),
-        );
+    for part in content_deltas() {
+        f.push(format!(
+            "event: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"delta\":\"{part}\"}}\n\n"
+        ));
     }
     f.push(concat!(
         "event: response.completed\n",
@@ -698,13 +787,10 @@ fn anthropic_sse_frames() -> Vec<String> {
         "\n\n"
     )
     .to_string());
-    for _ in 0..STREAM_FRAMES - 5 {
-        f.push(concat!(
-            "event: content_block_delta\n",
-            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"chunk "}}"#,
-            "\n\n"
-        )
-        .to_string());
+    for part in content_deltas() {
+        f.push(format!(
+            "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{part}\"}}}}\n\n"
+        ));
     }
     f.push(
         concat!(
@@ -752,6 +838,92 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// The mock's own streams carry the canned reply in their deltas — so
+    /// `the_canned_answers_pass` above is a real check on the trainer's
+    /// traffic, not just on its terminal markers.
+    #[test]
+    fn every_streamed_mock_answer_carries_the_reply() {
+        for (name, frames) in [
+            ("chat-stream", chat_sse_frames()),
+            ("responses-stream", responses_sse_frames()),
+            ("native-messages-stream", anthropic_sse_frames()),
+        ] {
+            let body = frames.concat();
+            let joined = streamed_reply(&body).expect("a stream");
+            assert!(joined.contains(REPLY), "{name}: {joined:?}");
+        }
+    }
+
+    /// A 200 stream that carries its dialect's terminal event but none of
+    /// the canned content is not a success: the relay loop ran, but the
+    /// model output never did, so the shape would train a truncated path.
+    /// Covered for every streamed dialect, with the content put back in for
+    /// the control — and content split across chunks, which is how a real
+    /// stream arrives.
+    #[test]
+    fn a_stream_with_only_its_terminal_event_fails() {
+        let terminal_only = |frames: &[&str]| frames.concat();
+
+        let chat = terminal_only(&[
+            "data: {\"id\":\"chatcmpl-pgo\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-pgo\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ]);
+        assert!(
+            unexpected_body(shape("chat-stream"), chat.as_bytes()).is_some(),
+            "terminal-only chat counted as canned training traffic"
+        );
+        let chunked_chat = terminal_only(&[
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"PGO train\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ing reply.\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ]);
+        assert_eq!(
+            unexpected_body(shape("chat-stream"), chunked_chat.as_bytes()),
+            None,
+            "content split across chunks is a success"
+        );
+
+        let responses = terminal_only(&[
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-pgo\",\"status\":\"completed\",\"output\":[]}}\n\n",
+            "data: [DONE]\n\n",
+        ]);
+        assert!(
+            unexpected_body(shape("responses-stream"), responses.as_bytes()).is_some(),
+            "terminal-only Responses counted as canned training traffic"
+        );
+        let chunked_responses = terminal_only(&[
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"PGO train\"}\n\n",
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"ing reply.\"}\n\n",
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-pgo\",\"status\":\"completed\"}}\n\n",
+        ]);
+        assert_eq!(
+            unexpected_body(shape("responses-stream"), chunked_responses.as_bytes()),
+            None
+        );
+
+        let messages = terminal_only(&[
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-pgo\",\"content\":[]}}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ]);
+        assert!(
+            unexpected_body(shape("native-messages-stream"), messages.as_bytes()).is_some(),
+            "terminal-only Messages counted as canned training traffic"
+        );
+        let chunked_messages = terminal_only(&[
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"PGO train\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ing reply.\"}}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ]);
+        assert_eq!(
+            unexpected_body(shape("native-messages-stream"), chunked_messages.as_bytes()),
+            None
+        );
     }
 
     /// A 200 is not a success by itself: an empty body, a stream that is
