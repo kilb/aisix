@@ -50,6 +50,11 @@ export function Charges(_props: TabProps) {
     const g = ++generation.current;
     setRows(null);
     setError(null);
+    // A new first page has no cursor yet: the one on screen belongs to the
+    // filter it was read for, so a 加载更多 clicked while this loads would
+    // otherwise ask for this filter with the previous filter's cursor.
+    setNext(null);
+    setLoadingMore(false);
     try {
       const page = await charges.list(f);
       if (g !== generation.current) return;
@@ -80,7 +85,9 @@ export function Charges(_props: TabProps) {
   }, [filter.tenant_id]);
 
   async function loadMore() {
-    if (next === null) return;
+    // A continuation extends the page on screen; without one (its filter is
+    // still loading, or it failed) there is nothing to extend.
+    if (next === null || rows === null || loadingMore) return;
     const g = generation.current;
     setLoadingMore(true);
     setError(null);
@@ -92,7 +99,9 @@ export function Charges(_props: TabProps) {
     } catch (e) {
       if (g === generation.current) setError(errorText(e));
     } finally {
-      setLoadingMore(false);
+      // Only this generation's own continuation ends: one that a filter
+      // change has already superseded must not unlock the new one.
+      if (g === generation.current) setLoadingMore(false);
     }
   }
 
