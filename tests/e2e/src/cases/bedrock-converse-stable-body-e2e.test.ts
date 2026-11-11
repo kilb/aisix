@@ -234,4 +234,89 @@ describe("Bedrock Converse: identical requests send identical bodies", () => {
     expect(sent[0].raw).toContain("*.rs");
     expect(new Set(sent.map((s) => s.raw)).size).toBe(1);
   });
+
+  // R-108: a Messages `tool_result` carrying a document whose source is text.
+  // Converse takes the result's text beside its media, and the document's own
+  // text is text — a result that carried only that must not reach Bedrock
+  // empty.
+  test.for<[boolean]>([[false], [true]])(
+    "a tool result's text document reaches Converse as text (stream=%s)",
+    async ([stream], ctx) => {
+      if (!etcdReachable || !app) return ctx.skip();
+      const before = received.length;
+      const res = await fetch(`${app.proxyUrl}/v1/messages`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${CALLER_PLAINTEXT}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "stable-body-nova",
+          max_tokens: 256,
+          stream,
+          tools: [
+            {
+              name: "read_contract",
+              description: "read a contract",
+              input_schema: { type: "object", properties: {} },
+            },
+          ],
+          messages: [
+            { role: "user", content: QUESTION },
+            {
+              role: "assistant",
+              content: [
+                {
+                  type: "tool_use",
+                  id: "tooluse_doc",
+                  name: "read_contract",
+                  input: {},
+                },
+              ],
+            },
+            {
+              role: "user",
+              content: [
+                {
+                  type: "tool_result",
+                  tool_use_id: "tooluse_doc",
+                  content: [
+                    {
+                      type: "document",
+                      title: "contract.txt",
+                      source: {
+                        type: "text",
+                        media_type: "text/plain",
+                        data: "payment due in 30 days",
+                      },
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        }),
+      });
+      expect(res.status, await res.clone().text()).toBe(200);
+      await res.text();
+
+      const sent = received.slice(before);
+      expect(sent.length).toBe(1);
+      const body = JSON.parse(sent[0].raw) as {
+        messages: { role: string; content: unknown }[];
+      };
+      const toolResult = body.messages
+        .flatMap((m) => (Array.isArray(m.content) ? m.content : []))
+        .find(
+          (block): block is { toolResult: { content: { text?: string }[] } } =>
+            typeof block === "object" &&
+            block !== null &&
+            "toolResult" in block,
+        );
+      expect(toolResult).toBeDefined();
+      expect(
+        toolResult!.toolResult.content.map((c) => c.text ?? "").join(""),
+      ).toBe("payment due in 30 days");
+    },
+  );
 });

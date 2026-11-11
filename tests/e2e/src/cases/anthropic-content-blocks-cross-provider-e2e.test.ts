@@ -299,4 +299,118 @@ describe("anthropic content blocks → OpenAI upstream (#722)", () => {
     expect(content[1].type).toBe("image_url");
     expect(content[1].image_url?.url).toBe("data:image/png;base64,aGVsbG8=");
   });
+
+  // R-108: a tool result's `document` whose source carries its TEXT is text.
+  // Both source forms the Anthropic API documents reach the OpenAI-shape
+  // upstream, buffered and streamed, and a result whose only content was the
+  // document does not arrive empty.
+  test.for<[boolean]>([[false], [true]])(
+    "a tool result's text document reaches the OpenAI upstream (stream=%s)",
+    async ([stream], ctx) => {
+      if (!etcdReachable || !app || !seed) {
+        ctx.skip();
+        return;
+      }
+      const name = stream ? "blocks-doc-stream-model" : "blocks-doc-model";
+      const upstream = await modelBackedBy(name);
+      const resp = await fetch(`${app.proxyUrl}/v1/messages`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": CALLER_PLAINTEXT,
+          "anthropic-version": "2023-06-01",
+        },
+        body: JSON.stringify({
+          model: name,
+          max_tokens: 128,
+          stream,
+          tools: [
+            {
+              name: "read_contract",
+              description: "read a contract",
+              input_schema: { type: "object", properties: {} },
+            },
+          ],
+          messages: [
+            { role: "user", content: "read the contract" },
+            {
+              role: "assistant",
+              content: [
+                {
+                  type: "tool_use",
+                  id: "toolu_doc_text",
+                  name: "read_contract",
+                  input: {},
+                },
+                {
+                  type: "tool_use",
+                  id: "toolu_doc_content",
+                  name: "read_contract",
+                  input: {},
+                },
+              ],
+            },
+            {
+              role: "user",
+              content: [
+                {
+                  type: "tool_result",
+                  tool_use_id: "toolu_doc_text",
+                  content: [
+                    { type: "text", text: "clause 1: " },
+                    {
+                      type: "document",
+                      title: "contract.txt",
+                      source: {
+                        type: "text",
+                        media_type: "text/plain",
+                        data: "payment due in 30 days",
+                      },
+                    },
+                  ],
+                },
+                {
+                  type: "tool_result",
+                  tool_use_id: "toolu_doc_content",
+                  content: [
+                    {
+                      type: "document",
+                      title: "notes.txt",
+                      source: {
+                        type: "content",
+                        content: [
+                          { type: "text", text: "renewal " },
+                          { type: "text", text: "auto" },
+                        ],
+                      },
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        }),
+      });
+      expect(resp.status, await resp.clone().text()).toBe(200);
+      await resp.text();
+
+      const seen = upstream.receivedRequests.find((r) =>
+        r.path.includes("/chat/completions"),
+      );
+      expect(seen).toBeDefined();
+      const sent = JSON.parse(seen!.body) as {
+        messages: { role: string; content: unknown; tool_call_id?: string }[];
+      };
+      const toolMsg = (id: string) =>
+        sent.messages.find(
+          (m) => m.role === "tool" && m.tool_call_id === id,
+        );
+      expect(toolMsg("toolu_doc_text")?.content).toBe(
+        "clause 1: payment due in 30 days",
+      );
+      // Its only content was the document: an empty result would tell the
+      // model the tool returned nothing.
+      expect(toolMsg("toolu_doc_content")?.content).toBe("renewal auto");
+    },
+  );
 });
