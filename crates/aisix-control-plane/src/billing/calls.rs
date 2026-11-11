@@ -154,11 +154,15 @@ pub(super) const ADJUSTED: &str =
 /// The selection is by `created_at` alone and never by whether a detail was
 /// recorded: an adjustment a release before `0038` wrote carries none, and
 /// filtering those out would show an earlier run's rate beside the latest
-/// run's amount. `eff` is all NULL only for a charge no run adjusted.
+/// run's amount. Two adjustments of one charge can land in the same
+/// microsecond (a re-pricing retry beside a release that wrote no detail), so
+/// the order is broken by `run_id` — part of the table's own key, and
+/// therefore the same row for every query that reads it. `eff` is all NULL
+/// only for a charge no run adjusted.
 pub(super) const EFFECTIVE: &str = " LEFT JOIN LATERAL (\
     SELECT pa.lines, pa.cny_per_usd_e4, pa.discount_bps, pa.service_tier, pa.created_at \
     FROM pricing_adjustments_cny pa WHERE pa.event_id = pc.event_id \
-    ORDER BY pa.created_at DESC LIMIT 1) eff ON true";
+    ORDER BY pa.created_at DESC, pa.run_id DESC LIMIT 1) eff ON true";
 
 /// The charge's lines as [`EFFECTIVE`] corrects them; `NULL` when the latest
 /// adjustment recorded none, which a caller shows as unknown rather than

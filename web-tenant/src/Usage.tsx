@@ -204,7 +204,11 @@ export function Usage({ member }: { member: SessionMember }) {
 
 // ── usage summary (用量汇总) ────────────────────────────────────────────────────────────────
 
-function Quantities({ q }: { q: Record<string, number> }) {
+function Quantities({ q }: { q: Record<string, number> | null }) {
+  // Unknown, not zero: the latest correction to this charge recorded no detail,
+  // so what it billed cannot be shown. Say so rather than implying nothing was
+  // billed.
+  if (q === null) return <>明细不可知</>;
   const names = Object.keys(q).sort((a, b) => {
     const ia = DIMENSION_ORDER.indexOf(a);
     const ib = DIMENSION_ORDER.indexOf(b);

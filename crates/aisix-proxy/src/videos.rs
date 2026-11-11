@@ -1454,15 +1454,12 @@ async fn proxy_content(
     // the relay still running releases the concurrency slot as it drops.
     let settle =
         move |failure: Option<aisix_gateway::BridgeError>, delivered: u64, drained: bool| {
-            // A body that ends short of the length the upstream declared is the
-            // upstream failing to deliver it, not a finished download: reqwest
-            // usually reports it as a read error itself, and this is the witness
-            // for the transfer it believes it completed.
-            let failure = failure.or_else(|| {
-                expected_len
-                    .filter(|len| delivered < *len)
-                    .map(|_| aisix_gateway::BridgeError::StreamAborted)
-            });
+            // A body that ends short of the length the upstream declared is a
+            // failure only when the transport reports one: hyper surfaces an
+            // incomplete body as a read error, which reaches this guard as
+            // `failure`. A short body with NO failure is a caller who left
+            // mid-download, and fabricating a failure from the declared length
+            // here would book their cancel as the target's (and cool it down).
             // The upstream answered only if it delivered the whole transfer. A
             // declared length is what ends it — the server stops polling a sized
             // body once that many bytes are written, so the relay sees a drop,

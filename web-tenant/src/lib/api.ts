@@ -681,7 +681,8 @@ export interface UsageSummaryRow {
   requests: number;
   charged_micro_cny: number;
   estimated_requests: number;
-  quantities: Record<string, number>;
+  /** `null` when the latest correction recorded no detail: what was billed is unknown. */
+  quantities: Record<string, number> | null;
 }
 
 export interface UsageSummaryQuery {

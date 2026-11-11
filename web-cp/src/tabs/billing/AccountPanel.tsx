@@ -561,9 +561,11 @@ function UsageSummary({ account }: RegionProps) {
                 <td className="num">{r.requests}</td>
                 <td className="num">{fmtMicroCny(r.charged_micro_cny)}</td>
                 <td>
-                  {Object.entries(r.quantities)
-                    .map(([dimension, n]) => `${DIMENSION_LABEL[dimension] ?? dimension} ${n}`)
-                    .join("，")}
+                  {r.quantities === null
+                    ? "明细不可知"
+                    : Object.entries(r.quantities)
+                        .map(([dimension, n]) => `${DIMENSION_LABEL[dimension] ?? dimension} ${n}`)
+                        .join("，")}
                 </td>
               </tr>
             ))}

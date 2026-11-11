@@ -82,8 +82,9 @@ pub struct RequestRow {
     pub charge_micro_cny: Option<i64>,
     pub estimated: bool,
     /// The billed quantities by dimension, under the names the price listing
-    /// uses.
-    pub quantities: BTreeMap<String, u64>,
+    /// uses; `None` when the latest run that corrected the charge recorded no
+    /// detail, so its quantities are unknown rather than zero.
+    pub quantities: Option<BTreeMap<String, u64>>,
 }
 
 /// What one request id cost, as far as the key may see.
@@ -226,7 +227,7 @@ pub async fn request_cost(
             charge_status: view.charge_status,
             charge_micro_cny,
             estimated: r.estimated,
-            quantities: r.lines.as_ref().map(quantities).unwrap_or_default(),
+            quantities: r.lines.as_ref().map(quantities),
         });
     }
     if items.is_empty() {

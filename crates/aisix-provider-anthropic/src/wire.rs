@@ -3866,9 +3866,12 @@ fn tool_message_from_tool_result(
                     // the tool result goes: dropping it would leave the result
                     // empty and the model blind to what the tool returned.
                     Some("document") if document_source_text(item).is_some() => {
-                        let t = document_source_text(item).unwrap_or_default();
-                        text.push_str(&t);
-                        parts.push(serde_json::json!({"type": "text", "text": t}));
+                        // Read once: a text document can be large, and the
+                        // predicate above already proved there is one.
+                        if let Some(t) = document_source_text(item) {
+                            text.push_str(&t);
+                            parts.push(serde_json::json!({"type": "text", "text": t}));
+                        }
                     }
                     // Media only where the target's tool result carries it.
                     // Chat Completions rejects a `tool` message holding an

@@ -201,8 +201,33 @@ describe("a proxied video download is settled by its body's ending", () => {
       ],
     });
     const slow = await downstream(trickle("video_slow"));
+    // A body whose length IS declared, written slowly: the caller can hang up
+    // after the first chunk with the transfer legitimately incomplete. A
+    // declared length must not turn that abandonment into the target's
+    // failure — the witness for a truncated transfer is the transport's read
+    // error (the `content-short` case), never "fewer bytes than promised".
+    const sizedSlow = (task: string) => ({
+      scriptedResponses: [
+        completed(task),
+        {
+          rawBodyChunks: [HALF_BODY, FULL_BODY.slice(10)],
+          rawContentType: "video/mp4",
+          responseHeaders: { "content-length": String(FULL_BODY.length) },
+          eventDelayMs: 1_000,
+        },
+        completed(task),
+        {
+          rawBodyChunks: [HALF_BODY, FULL_BODY.slice(10)],
+          rawContentType: "video/mp4",
+          responseHeaders: { "content-length": String(FULL_BODY.length) },
+          eventDelayMs: 1_000,
+        },
+      ],
+    });
+    const sized = await downstream(sizedSlow("video_sized"));
     await seedModel("content-complete", complete);
     await seedModel("content-cancelled", slow);
+    await seedModel("content-cancelled-sized", sized);
     await seedModel("content-short", short);
     await seedModel("content-stalled", stalled, READ_TIMEOUT_MS);
 
@@ -214,6 +239,7 @@ describe("a proxied video download is settled by its body's ending", () => {
         "content-short",
         "content-stalled",
         "content-cancelled",
+        "content-cancelled-sized",
       ],
     });
     await waitConfigPropagation(async () => {
@@ -310,6 +336,31 @@ describe("a proxied video download is settled by its body's ending", () => {
     expect((await reader2.read()).done).toBe(false);
     await reader2.cancel();
     expect((await modelStatus(modelIds["content-cancelled"]!))?.status).not.toBe(
+      "cooldown",
+    );
+  }, 30_000);
+
+  test("a caller that leaves a download whose length WAS declared settles neither way either", async (ctx) => {
+    if (!etcdReachable) ctx.skip();
+    const before = await settlement("content-cancelled-sized");
+    const res = await content(
+      "content-cancelled-sized",
+      modelIds["content-cancelled-sized"]!,
+    );
+    expect(res.status).toBe(200);
+    const reader = res.body!.getReader();
+    const first = await reader.read();
+    expect(first.done).toBe(false);
+    await reader.cancel();
+
+    // Fewer bytes than the upstream declared, but nobody failed: the caller
+    // left. A fabricated failure here would cool down a healthy target after
+    // a handful of abandoned downloads, which is what this case pins.
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const after = await settlement("content-cancelled-sized");
+    expect(after.success).toBe(before.success + 1);
+    expect(after.failure).toBe(before.failure);
+    expect((await modelStatus(modelIds["content-cancelled-sized"]!))?.status).not.toBe(
       "cooldown",
     );
   }, 30_000);
