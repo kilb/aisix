@@ -1,3 +1,4 @@
+import { Plus, RefreshCw } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import type { TabProps } from "../App";
 import { ConflictNote } from "../components/ConflictNote";
@@ -10,12 +11,14 @@ import { messageFor, problemAt } from "../lib/errors";
 import { errorText, maskUrl } from "../lib/fmt";
 import { enumAt, loadSchema } from "../lib/schema";
 import { useResource } from "../lib/useResource";
+import { Card, CardHeader, PageHeader } from "../components/page";
+import { cn } from "../lib/cn";
 import { Button } from "../ui/Button";
 import { DataTable, Loading } from "../ui/DataTable";
 import { EmptyState } from "../ui/EmptyState";
-import { GroupList } from "../ui/GroupName";
 import { GroupPicker, groupChoices, useLoad, type GroupChoice } from "./Tenants";
 import { ChannelModels } from "./providers/ChannelModels";
+import { GroupBadges } from "./providers/GroupBadges";
 
 /** The fields of a `provider_key` this page edits; every other field is kept as stored. */
 interface ProviderKeyDoc {
@@ -46,6 +49,10 @@ const PROVIDER_HINT =
 type Open = { mode: "new"; groups: string[]; groupsNote: string | null } | { mode: "edit"; id: string };
 
 const GROUPS_HINT = "分组名只有运维可见；普通租户只能用到其分组内的上游账号";
+
+/** A form card's closing bar: its buttons at the bottom right, on a muted strip the card's width. */
+const FORM_FOOTER =
+  "-mx-6 -mb-6 mt-6 flex max-w-none flex-wrap items-center justify-end gap-2 rounded-b-[calc(var(--radius)+3px)] border-t border-border bg-muted/40 px-6 py-3";
 
 /** How a referrer's kind is named on this page. */
 const KIND_LABEL: Record<string, string> = { models: "模型" };
@@ -159,67 +166,33 @@ export function Providers({ canEdit }: TabProps) {
   const newChoices = groupChoices(groups.data, open?.mode === "new" ? open.groups : []);
   const editChoices = groupChoices(groups.data, editing?.doc.groups ?? []);
 
+  // From 1280px the open form sits beside the list, which then leaves out
+  // the columns it has no room for and scrolls in its own box, so the
+  // account's 模型 section below it stays within reach.
+  const split = open?.mode === "new" || editing !== undefined;
+  const roomy = split ? "xl:max-[1759px]:hidden" : undefined;
+
   return (
     <>
-      {open?.mode === "new" && (
-        <AccountForm
-          key="new"
-          account={null}
-          initialGroups={open.groups}
-          groupsNote={open.groupsNote}
-          choices={newChoices}
-          groupsError={groups.error}
-          schema={schema}
-          readOnly={false}
-          create={pk.create}
-          save={pk.save}
-          onSaved={saved}
-          onClose={() => setOpen(null)}
-          onReload={() => undefined}
-        />
-      )}
-      {editing && (
-        // Keyed by version: a reload that finds a newer version starts the edit over.
-        <AccountForm
-          key={`${editing.id}:${editing.version}`}
-          account={editing}
-          initialGroups={[]}
-          groupsNote={null}
-          choices={editChoices}
-          groupsError={groups.error}
-          schema={schema}
-          readOnly={!canEdit}
-          create={pk.create}
-          save={pk.save}
-          onSaved={saved}
-          onClose={() => setOpen(null)}
-          onReload={() => void pk.reload()}
-        />
-      )}
-      {editing && (
-        // A sibling of the form, not inside it: its own buttons must not submit
-        // the account, and its save writes channel rows, not the account's document.
-        <ChannelModels
-          key={`models:${editing.id}`}
-          accountId={editing.id}
-          groups={editing.doc.groups ?? []}
-          canEdit={canEdit}
-        />
-      )}
-
-      <div className="panel">
-        <h2>
-          上游账号
-          <Button size="sm" type="button" icon="refresh" onClick={() => void pk.reload()}>
-            刷新
-          </Button>
-        </h2>
-        <p className="hint">网关调用上游供应商所用的账号。密钥保存后不再显示。{GROUPS_HINT}。</p>
-        {canEdit && !open && (
-          <Button kind="primary" disabled={opening} onClick={() => void openNew()}>
-            新增上游账号
-          </Button>
-        )}
+      <PageHeader
+        title="上游账号"
+        description={<>网关调用上游供应商所用的账号。密钥保存后不再显示。{GROUPS_HINT}。</>}
+        actions={
+          <>
+            <Button type="button" onClick={() => void pk.reload()}>
+              <RefreshCw aria-hidden />
+              刷新
+            </Button>
+            {canEdit && !open && (
+              <Button kind="primary" disabled={opening} onClick={() => void openNew()}>
+                <Plus aria-hidden />
+                新增上游账号
+              </Button>
+            )}
+          </>
+        }
+      />
+      <div className="mb-6 grid gap-3 empty:hidden [&>.note]:m-0">
         <Msg note={note} />
         {deleteFailure &&
           (deleteFailure.error.code === "version_mismatch" ? (
@@ -256,78 +229,159 @@ export function Providers({ canEdit }: TabProps) {
             读取失败：{messageFor(pk.error)}
           </div>
         )}
-        {pk.items === null ? (
-          !pk.error && <Loading />
-        ) : pk.items.length === 0 ? (
-          <EmptyState text="还没有上游账号。" />
-        ) : (
-          <DataTable>
-            <thead>
-              <tr>
-                <th>名称</th>
-                <th>协议族</th>
-                <th>供应商标识</th>
-                <th>接口地址</th>
-                <th>分组</th>
-                <th>状态</th>
-                <th className="right">操作</th>
-              </tr>
-            </thead>
-            <tbody>
-              {pk.items.map((a) => (
-                <tr key={a.id}>
-                  <td>{nameOf(a)}</td>
-                  <td>{a.doc.adapter ?? "—"}</td>
-                  <td>{a.doc.provider || "—"}</td>
-                  <td>{a.doc.api_base ? <code>{maskUrl(a.doc.api_base)}</code> : "—"}</td>
-                  <td>{a.doc.groups?.length ? <GroupList groups={a.doc.groups} /> : "—"}</td>
-                  <td>
-                    <RolloutBadge rollout={a.rollout} />
-                  </td>
-                  <td className="right">
-                    {deleting === a.id ? (
-                      <>
-                        <Button kind="danger" size="sm" busy={busy} busyLabel="确认删除" onClick={() => void remove(a)}>
-                          确认删除
-                        </Button>
-                        <Button size="sm" disabled={busy} onClick={() => setDeleting(null)}>
-                          取消
-                        </Button>
-                      </>
-                    ) : (
-                      <>
-                        <Button
-                          size="sm"
-                          onClick={() => {
-                            setNote(null);
-                            // A group created since the page was opened must be
-                            // offered by this form, so the list is read again with it.
-                            void groups.reload();
-                            setOpen({ mode: "edit", id: a.id });
-                          }}
-                        >
-                          {canEdit ? "编辑" : "查看"}
-                        </Button>
-                        {canEdit && (
+      </div>
+
+      {/* In reading order the form comes first, then the account's models,
+          then the list; from 1280px the list takes the left column, the
+          form the right, and the models the full width under both. */}
+      <div className={cn("grid items-start gap-6", split && "xl:grid-cols-[minmax(0,1fr)_minmax(24rem,28rem)]")}>
+        {open?.mode === "new" && (
+          <div className="min-w-0 xl:col-start-2 xl:row-start-1">
+            <AccountForm
+              key="new"
+              account={null}
+              initialGroups={open.groups}
+              groupsNote={open.groupsNote}
+              choices={newChoices}
+              groupsError={groups.error}
+              schema={schema}
+              readOnly={false}
+              create={pk.create}
+              save={pk.save}
+              onSaved={saved}
+              onClose={() => setOpen(null)}
+              onReload={() => undefined}
+            />
+          </div>
+        )}
+        {editing && (
+          <div className="min-w-0 xl:col-start-2 xl:row-start-1">
+            {/* Keyed by version: a reload that finds a newer version starts the edit over. */}
+            <AccountForm
+              key={`${editing.id}:${editing.version}`}
+              account={editing}
+              initialGroups={[]}
+              groupsNote={null}
+              choices={editChoices}
+              groupsError={groups.error}
+              schema={schema}
+              readOnly={!canEdit}
+              create={pk.create}
+              save={pk.save}
+              onSaved={saved}
+              onClose={() => setOpen(null)}
+              onReload={() => void pk.reload()}
+            />
+          </div>
+        )}
+        {editing && (
+          // A sibling of the form, not inside it: its own buttons must not submit
+          // the account, and its save writes channel rows, not the account's document.
+          <div className="min-w-0 xl:col-span-2 xl:row-start-2">
+            <ChannelModels
+              key={`models:${editing.id}`}
+              accountId={editing.id}
+              accountName={nameOf(editing)}
+              groups={editing.doc.groups ?? []}
+              canEdit={canEdit}
+            />
+          </div>
+        )}
+
+        <Card className="mb-0 min-w-0 xl:col-start-1 xl:row-start-1">
+          <CardHeader
+            title="全部账号"
+            className="mb-0"
+            actions={pk.items && <span className="text-[13px] text-muted-foreground tabular-nums">{pk.items.length} 个</span>}
+          />
+          {pk.items === null ? (
+            !pk.error && <Loading />
+          ) : pk.items.length === 0 ? (
+            <EmptyState text="还没有上游账号。" />
+          ) : (
+            <DataTable scroll={split}>
+              <thead>
+                <tr>
+                  <th>名称</th>
+                  <th className={roomy}>协议族</th>
+                  <th className={roomy}>供应商标识</th>
+                  <th className={roomy}>接口地址</th>
+                  <th>分组</th>
+                  <th>状态</th>
+                  <th className="right">操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                {pk.items.map((a) => (
+                  <tr key={a.id} className={editing?.id === a.id ? "bg-accent" : undefined}>
+                    <td className="font-medium">
+                      <span className={cn("block truncate", split ? "max-w-[12rem]" : "max-w-[18rem]")} title={nameOf(a)}>
+                        {nameOf(a)}
+                      </span>
+                    </td>
+                    <td className={cn("font-mono text-[13px] text-text-2", roomy)}>{a.doc.adapter ?? "—"}</td>
+                    <td className={cn("font-mono text-[13px] text-text-2", roomy)}>{a.doc.provider || "—"}</td>
+                    <td className={roomy}>
+                      {a.doc.api_base ? (
+                        <code className="block max-w-[18rem] truncate text-[13px] text-text-2" title={maskUrl(a.doc.api_base)}>
+                          {maskUrl(a.doc.api_base)}
+                        </code>
+                      ) : (
+                        "—"
+                      )}
+                    </td>
+                    <td className="whitespace-normal">
+                      <GroupBadges groups={a.doc.groups ?? []} />
+                    </td>
+                    <td>
+                      <RolloutBadge rollout={a.rollout} />
+                    </td>
+                    <td className="right">
+                      {deleting === a.id ? (
+                        <>
+                          <Button kind="danger" size="sm" busy={busy} busyLabel="确认删除" onClick={() => void remove(a)}>
+                            确认删除
+                          </Button>
+                          <Button size="sm" disabled={busy} onClick={() => setDeleting(null)}>
+                            取消
+                          </Button>
+                        </>
+                      ) : (
+                        <>
                           <Button
                             size="sm"
-                            disabled={busy}
                             onClick={() => {
-                              setDeleteFailure(null);
-                              setDeleting(a.id);
+                              setNote(null);
+                              // A group created since the page was opened must be
+                              // offered by this form, so the list is read again with it.
+                              void groups.reload();
+                              setOpen({ mode: "edit", id: a.id });
                             }}
                           >
-                            删除
+                            {canEdit ? "编辑" : "查看"}
                           </Button>
-                        )}
-                      </>
-                    )}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </DataTable>
-        )}
+                          {canEdit && (
+                            <Button
+                              size="sm"
+                              kind="quiet"
+                              disabled={busy}
+                              onClick={() => {
+                                setDeleteFailure(null);
+                                setDeleting(a.id);
+                              }}
+                            >
+                              删除
+                            </Button>
+                          )}
+                        </>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </DataTable>
+          )}
+        </Card>
       </div>
     </>
   );
@@ -557,16 +611,17 @@ function AccountForm({
   }
 
   return (
-    <form ref={form} className="panel" aria-label={title} onSubmit={submit}>
-      <h2>{title}</h2>
-      <div className="r">
+    <form ref={form} className="panel @container mb-0" aria-label={title} onSubmit={submit}>
+      <CardHeader title={title} className="mb-5" />
+      {/* Two columns in the aside beside the list; four where the form has the page's width. */}
+      <div className="grid gap-x-4 @sm:grid-cols-2 @3xl:grid-cols-4">
         <Field label="名称" error={at("name")}>
           {(aria) => <input required disabled={locked} value={name} onChange={(e) => setName(e.target.value)} {...aria} />}
         </Field>
         {schema && "error" in schema ? (
           <div className="f">
             <span>协议族</span>
-            <div className="note crit" role="alert">
+            <div className="note crit m-0" role="alert">
               {schema.error}
             </div>
           </div>
@@ -588,33 +643,40 @@ function AccountForm({
             )}
           </Field>
         )}
-      </div>
-      <Field label="供应商标识" hint={PROVIDER_HINT} error={at("provider")}>
-        {(aria) => <input disabled={locked} value={provider} onChange={(e) => setProvider(e.target.value)} {...aria} />}
-      </Field>
-      <Field label="接口地址" error={at("apiBase")}>
-        {(aria) => (
-          <input
-            disabled={locked}
-            placeholder="https://…"
-            value={apiBase}
-            onChange={(e) => setApiBase(e.target.value)}
-            {...aria}
+        <div className="min-w-0 @sm:col-span-2">
+          <Field label="供应商标识" hint={PROVIDER_HINT} error={at("provider")}>
+            {(aria) => <input disabled={locked} value={provider} onChange={(e) => setProvider(e.target.value)} {...aria} />}
+          </Field>
+        </div>
+        <div className="min-w-0 @sm:col-span-2">
+          <Field label="接口地址" error={at("apiBase")}>
+            {(aria) => (
+              <input
+                disabled={locked}
+                className="font-mono text-[13px]"
+                placeholder="https://…"
+                value={apiBase}
+                onChange={(e) => setApiBase(e.target.value)}
+                {...aria}
+              />
+            )}
+          </Field>
+        </div>
+        <div className="min-w-0 @sm:col-span-2">
+          <SecretInput
+            label="密钥"
+            stored={stored}
+            required
+            readOnly={locked}
+            hint={stored && !readOnly ? "不替换则保留已保存的密钥。改动协议族、供应商标识或接口地址时，需要重新填写密钥。" : undefined}
+            problem={at("secret")}
+            onChange={setSecret}
           />
-        )}
-      </Field>
-      <SecretInput
-        label="密钥"
-        stored={stored}
-        required
-        readOnly={locked}
-        hint={stored && !readOnly ? "不替换则保留已保存的密钥。改动协议族、供应商标识或接口地址时，需要重新填写密钥。" : undefined}
-        problem={at("secret")}
-        onChange={setSecret}
-      />
-      <fieldset className="tn-section">
-        <legend>分组</legend>
-        <p className="hint">{GROUPS_HINT}；只能从已有的分组里选。</p>
+        </div>
+      </div>
+      <fieldset className="tn-section mt-2 border-t border-border pt-5 [&_.tn-groups]:grid-cols-[repeat(auto-fill,minmax(13rem,1fr))] [&_.tn-groups]:gap-x-6">
+        <legend className="text-sm font-semibold">分组</legend>
+        <p className="hint text-[13px]">{GROUPS_HINT}；只能从已有的分组里选。</p>
         {groupsError && (
           <div className="note crit" role="alert">
             分组读取失败：{groupsError}
@@ -652,7 +714,7 @@ function AccountForm({
       )}
 
       {removal ? (
-        <section className="note warn" aria-label="移除分组">
+        <section className="note warn mb-0" aria-label="移除分组">
           <p>
             <strong>将从该账号移除分组：{removal.dropped.join("、")}</strong>
           </p>
@@ -677,7 +739,10 @@ function AccountForm({
               </ul>
             </>
           )}
-          <p>
+          <div className="mt-3 flex flex-wrap justify-end gap-2">
+            <Button type="button" disabled={busy} onClick={() => setRemoval(null)}>
+              取消
+            </Button>
             <Button
               kind="danger"
               type="button"
@@ -687,27 +752,26 @@ function AccountForm({
               onClick={() => void write()}
             >
               确认移除分组
-            </Button>{" "}
-            <Button type="button" disabled={busy} onClick={() => setRemoval(null)}>
-              取消
             </Button>
-          </p>
+          </div>
         </section>
-      ) : readOnly ? (
-        <p>
-          <Button type="button" onClick={onClose}>
-            关闭
-          </Button>
-        </p>
       ) : (
-        <p>
-          <Button kind="primary" type="submit" busy={busy} busyLabel="保存中…">
-            保存
-          </Button>{" "}
-          <Button type="button" disabled={busy} onClick={onClose}>
-            取消
-          </Button>
-        </p>
+        <div className={FORM_FOOTER}>
+          {readOnly ? (
+            <Button type="button" onClick={onClose}>
+              关闭
+            </Button>
+          ) : (
+            <>
+              <Button type="button" disabled={busy} onClick={onClose}>
+                取消
+              </Button>
+              <Button kind="primary" type="submit" busy={busy} busyLabel="保存中…">
+                保存
+              </Button>
+            </>
+          )}
+        </div>
       )}
     </form>
   );

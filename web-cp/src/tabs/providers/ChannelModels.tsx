@@ -12,7 +12,8 @@ import {
   type Readback,
 } from "../../lib/retireOutcome";
 import { retireWarning, withoutServing } from "../../lib/retireWarning";
-import { GroupList } from "../../ui/GroupName";
+import { Plus, RefreshCw, Search } from "lucide-react";
+import { CardHeader } from "../../components/page";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
 import { EmptyState } from "../../ui/EmptyState";
@@ -20,6 +21,7 @@ import { TwoStep } from "../../ui/TwoStep";
 import { UpstreamModelPicker } from "../../ui/UpstreamModelPicker";
 import { upstreamNameProblem } from "../../lib/upstreamName";
 import { FetchUpstream } from "./FetchUpstream";
+import { GroupBadges } from "./GroupBadges";
 
 /** The largest weight the control plane takes, as its own `channel_models` check does. */
 const MAX_WEIGHT = 65_535;
@@ -82,10 +84,13 @@ function numberProblem(text: string, min: number, max: number, label: string): s
  */
 export function ChannelModels({
   accountId,
+  accountName,
   groups,
   canEdit,
 }: {
   accountId: string;
+  /** The account's name, beside the section's title: the section sits apart from the account's form. */
+  accountName: string;
   /** The groups this account lists, which the section states so a tier is readable. */
   groups: string[];
   canEdit: boolean;
@@ -356,223 +361,244 @@ export function ChannelModels({
   const canCreate = newName.trim() !== "" && !taken.has(newName.trim()) && upstreamNameProblem(newName) === null;
 
   return (
-    <section className="panel ch-section" aria-label="模型">
-      <h2>
-        模型
-        <Button size="sm" type="button" icon="refresh" disabled={busy} onClick={() => void load()}>
-          刷新
-        </Button>
-      </h2>
-      <p className="hint">
-        勾选该上游账号提供哪些公共模型，并写明它对上游使用的名称、优先级与权重。价格按公共模型计算，与具体账号无关；成本价要填的就是这里写的上游模型名称。
-        优先级相同的按权重分配，失败后按优先级从高到低依次尝试。账号分组：{groups.length > 0 ? <GroupList groups={groups} /> : "—"}。
-      </p>
-      {error && (
-        <div className="note crit" role="alert">
-          读取失败：{error}
+    <section className="ch-section grid gap-6" aria-label="模型">
+      <div className="panel mb-0">
+        <CardHeader
+          title={
+            <span className="flex flex-wrap items-center gap-2">
+              模型
+              <span className="tag font-mono font-normal">{accountName}</span>
+            </span>
+          }
+          description={
+            <>
+              勾选该上游账号提供哪些公共模型，并写明它对上游使用的名称、优先级与权重。价格按公共模型计算，与具体账号无关；成本价要填的就是这里写的上游模型名称。
+              优先级相同的按权重分配，失败后按优先级从高到低依次尝试。账号分组：<GroupBadges groups={groups} />。
+            </>
+          }
+          actions={
+            <Button size="sm" type="button" disabled={busy} onClick={() => void load()}>
+              <RefreshCw aria-hidden />
+              刷新
+            </Button>
+          }
+        />
+        {error && (
+          <div className="note crit" role="alert">
+            读取失败：{error}
+          </div>
+        )}
+        <div className="flex flex-wrap items-center gap-x-6 gap-y-3">
+          <label className="relative block w-full sm:w-80">
+            <span className="sr-only">搜索模型</span>
+            <Search aria-hidden className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
+            <input className="pl-9" value={query} onChange={(e) => setQuery(e.target.value)} placeholder="按公共模型名称或上游名称筛选" />
+          </label>
+          <label className="ch-tick gap-2 text-[13px]">
+            <input type="checkbox" checked={showAll} onChange={(e) => setShowAll(e.target.checked)} />
+            <span>显示全部公共模型（{unservedTotal}）</span>
+          </label>
         </div>
-      )}
-      <div className="ch-filter-row">
-        <label className="f">
-          <span className="f-label">搜索模型</span>
-          <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="按公共模型名称或上游名称筛选" />
-        </label>
-        <label className="ch-tick">
-          <input
-            type="checkbox"
-            checked={showAll}
-            onChange={(e) => setShowAll(e.target.checked)}
-          />
-          <span>显示全部公共模型（{unservedTotal}）</span>
-        </label>
-      </div>
-      {note && (
-        <div className="note" role="status">
-          {note}
-        </div>
-      )}
-      {refusal && (
-        <div className="note crit" role="alert">
-          {refusal}
-        </div>
-      )}
-      {rows === null ? (
-        !error && <Loading />
-      ) : (
-        <DataTable label="模型" scroll>
-          <thead>
-            <tr>
-              <th>服务</th>
-              <th>公共模型</th>
-              <th>上游模型名称</th>
-              <th className="num">优先级</th>
-              <th className="num">权重</th>
-              <th>启用</th>
-              <th>账号分组</th>
-              <th className="right">操作</th>
-            </tr>
-          </thead>
-          <tbody>
-            {shown.map((row) => {
-              const draft = drafts[row.public_model_id] ?? draftOf(row);
-              const model = modelOf.get(row.public_model_id);
-              return (
-                <tr key={row.public_model_id} data-model={row.public_model_id}>
-                  <td>
-                    <label className="ch-tick">
+        {note && (
+          <div className="note mb-0" role="status">
+            {note}
+          </div>
+        )}
+        {refusal && (
+          <div className="note crit mb-0" role="alert">
+            {refusal}
+          </div>
+        )}
+        {rows === null ? (
+          !error && <Loading />
+        ) : (
+          <DataTable label="模型" scroll>
+            <thead>
+              <tr>
+                <th className="w-12">服务</th>
+                <th>公共模型</th>
+                <th>上游模型名称</th>
+                <th className="num">优先级</th>
+                <th className="num">权重</th>
+                <th>启用</th>
+                <th>账号分组</th>
+                <th className="right">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {shown.map((row) => {
+                const draft = drafts[row.public_model_id] ?? draftOf(row);
+                const model = modelOf.get(row.public_model_id);
+                return (
+                  <tr key={row.public_model_id} data-model={row.public_model_id} className={draft.served ? undefined : "text-muted-foreground"}>
+                    <td>
+                      <label className="ch-tick">
+                        <input
+                          type="checkbox"
+                          aria-label={`服务 ${row.public_model_name}`}
+                          checked={draft.served}
+                          disabled={!canEdit || busy}
+                          onChange={(e) => {
+                            const on = e.target.checked;
+                            // Ticking an unserved model is the operator asking
+                            // for it to serve, so the row starts enabled; the
+                            // two boxes answer different questions only once
+                            // the row exists.
+                            set(row.public_model_id, { served: on, enabled: on });
+                          }}
+                        />
+                      </label>
+                    </td>
+                    <td>
+                      <span className="mono font-mono text-[13px] font-medium">{row.public_model_name}</span>
+                    </td>
+                    <td className="min-w-56 whitespace-normal">
+                      <UpstreamModelPicker
+                        accountId={accountId}
+                        value={draft.upstream}
+                        publicName={row.public_model_name}
+                        label={`上游模型名称 ${row.public_model_name}`}
+                        onChange={(next) => set(row.public_model_id, { upstream: next })}
+                        disabled={!canEdit || busy || !draft.served}
+                        invalid={rowErrors[row.public_model_id] !== undefined}
+                        compact
+                      />
+                    </td>
+                    <td className="num">
+                      <input
+                        className="ch-num h-8"
+                        aria-label={`优先级 ${row.public_model_name}`}
+                        value={draft.priority}
+                        inputMode="numeric"
+                        disabled={!canEdit || busy || !draft.served}
+                        onChange={(e) => set(row.public_model_id, { priority: e.target.value })}
+                      />
+                    </td>
+                    <td className="num">
+                      <input
+                        className="ch-num h-8"
+                        aria-label={`权重 ${row.public_model_name}`}
+                        value={draft.weight}
+                        inputMode="numeric"
+                        disabled={!canEdit || busy || !draft.served}
+                        onChange={(e) => set(row.public_model_id, { weight: e.target.value })}
+                      />
+                    </td>
+                    <td>
                       <input
                         type="checkbox"
-                        aria-label={`服务 ${row.public_model_name}`}
-                        checked={draft.served}
-                        disabled={!canEdit || busy}
-                        onChange={(e) => {
-                          const on = e.target.checked;
-                          // Ticking an unserved model is the operator asking
-                          // for it to serve, so the row starts enabled; the
-                          // two boxes answer different questions only once
-                          // the row exists.
-                          set(row.public_model_id, { served: on, enabled: on });
-                        }}
+                        aria-label={`启用 ${row.public_model_name}`}
+                        checked={draft.enabled}
+                        disabled={!canEdit || busy || !draft.served}
+                        onChange={(e) => set(row.public_model_id, { enabled: e.target.checked })}
                       />
-                    </label>
-                  </td>
-                  <td>
-                    <span className="mono">{row.public_model_name}</span>
-                  </td>
-                  <td>
-                    <UpstreamModelPicker
-                      accountId={accountId}
-                      value={draft.upstream}
-                      publicName={row.public_model_name}
-                      label={`上游模型名称 ${row.public_model_name}`}
-                      onChange={(next) => set(row.public_model_id, { upstream: next })}
-                      disabled={!canEdit || busy || !draft.served}
-                      invalid={rowErrors[row.public_model_id] !== undefined}
-                    />
-                  </td>
-                  <td className="num">
-                    <input
-                      className="ch-num"
-                      aria-label={`优先级 ${row.public_model_name}`}
-                      value={draft.priority}
-                      inputMode="numeric"
-                      disabled={!canEdit || busy || !draft.served}
-                      onChange={(e) => set(row.public_model_id, { priority: e.target.value })}
-                    />
-                  </td>
-                  <td className="num">
-                    <input
-                      className="ch-num"
-                      aria-label={`权重 ${row.public_model_name}`}
-                      value={draft.weight}
-                      inputMode="numeric"
-                      disabled={!canEdit || busy || !draft.served}
-                      onChange={(e) => set(row.public_model_id, { weight: e.target.value })}
-                    />
-                  </td>
-                  <td>
-                    <input
-                      type="checkbox"
-                      aria-label={`启用 ${row.public_model_name}`}
-                      checked={draft.enabled}
-                      disabled={!canEdit || busy || !draft.served}
-                      onChange={(e) => set(row.public_model_id, { enabled: e.target.checked })}
-                    />
-                  </td>
-                  <td className="ch-groups">
-                    {model && model.served_by.some((s) => s.provider_key_id === accountId) ? (
-                      <GroupList
+                    </td>
+                    <td className="whitespace-normal">
+                      <GroupBadges
                         groups={
-                          model.served_by.find((s) => s.provider_key_id === accountId)?.groups ?? []
+                          model && model.served_by.some((s) => s.provider_key_id === accountId)
+                            ? (model.served_by.find((s) => s.provider_key_id === accountId)?.groups ?? [])
+                            : groups
                         }
                       />
-                    ) : (
-                      groups.length > 0 ? <GroupList groups={groups} /> : "—"
-                    )}
-                  </td>
-                  <td className="right">
-                    {canEdit && row.served && (
-                      <TwoStep
-                        label="删除模型"
-                        size="sm"
-                        kind="secondary"
-                        busy={removing === row.public_model_id}
-                        busyLabel="删除中…"
-                        disabled={busy}
-                        warning={
-                          model === undefined ? (
-                            // The view was not read for it: say what the two writes do, without counts.
-                            `删除模型「${row.public_model_name}」：先移除本账号对它的映射，再停用它；停用后它的路由文档、各账号的直连文档和账号映射都会被删除，账号映射不能恢复（公共模型本身可以在「价格 → 公共模型」恢复）。若仍有租户授权、密钥或启用的账号指向它，它会被保留，随后的提示会写明要先解除哪些。`
-                          ) : (
-                            <>
-                              <span className="ch-warn-line">
-                                删除模型「{row.public_model_name}」：先移除本账号对它的映射，再停用它。
-                              </span>
-                              {/* The retire meets the state after this account's row is gone, so it is asked that way. */}
-                              {retireWarning(withoutServing(model, accountId))}
-                            </>
-                          )
-                        }
-                        onConfirm={() => void deleteModel(row)}
-                      />
-                    )}
+                    </td>
+                    <td className="right">
+                      {canEdit && row.served && (
+                        <TwoStep
+                          label="删除模型"
+                          size="sm"
+                          kind="secondary"
+                          busy={removing === row.public_model_id}
+                          busyLabel="删除中…"
+                          disabled={busy}
+                          warning={
+                            model === undefined ? (
+                              // The view was not read for it: say what the two writes do, without counts.
+                              `删除模型「${row.public_model_name}」：先移除本账号对它的映射，再停用它；停用后它的路由文档、各账号的直连文档和账号映射都会被删除，账号映射不能恢复（公共模型本身可以在「价格 → 公共模型」恢复）。若仍有租户授权、密钥或启用的账号指向它，它会被保留，随后的提示会写明要先解除哪些。`
+                            ) : (
+                              <>
+                                <span className="ch-warn-line">
+                                  删除模型「{row.public_model_name}」：先移除本账号对它的映射，再停用它。
+                                </span>
+                                {/* The retire meets the state after this account's row is gone, so it is asked that way. */}
+                                {retireWarning(withoutServing(model, accountId))}
+                              </>
+                            )
+                          }
+                          onConfirm={() => void deleteModel(row)}
+                        />
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+              {shown.length === 0 && (
+                <tr>
+                  <td colSpan={8} className="whitespace-normal">
+                    <EmptyState
+                      text={
+                        rows.length === 0
+                          ? "还没有公共模型。用下面的名称新建一个。"
+                          : !showAll && unservedTotal === rows.length
+                            ? "这个账号还没有服务任何模型。勾选「显示全部公共模型」来添加。"
+                            : "没有匹配的模型。"
+                      }
+                    />
                   </td>
                 </tr>
-              );
-            })}
-            {shown.length === 0 && (
-              <tr>
-                <td colSpan={8}>
-                  <EmptyState
-                    text={
-                      rows.length === 0
-                        ? "还没有公共模型。用下面的名称新建一个。"
-                        : !showAll && unservedTotal === rows.length
-                          ? "这个账号还没有服务任何模型。勾选「显示全部公共模型」来添加。"
-                          : "没有匹配的模型。"
+              )}
+            </tbody>
+          </DataTable>
+        )}
+        {Object.keys(rowErrors).length > 0 && (
+          <ul className="note crit ch-errors mb-0" role="alert">
+            {Object.entries(rowErrors).map(([id, text]) => (
+              <li key={id}>
+                {rows?.find((r) => r.public_model_id === id)?.public_model_name ?? id}：{text}
+              </li>
+            ))}
+          </ul>
+        )}
+        {(rows !== null || !canEdit) && (
+          // The save closes the card: what it will write on the left, the write on the right.
+          <div className="ch-save -mx-6 -mb-6 mt-6 flex flex-wrap items-start justify-end gap-x-4 gap-y-2 rounded-b-[calc(var(--radius)+3px)] border-t border-border bg-muted/40 px-6 py-3">
+            {canEdit ? (
+              <>
+                {changed.length > 0 && <span className="hint mr-auto self-center text-[13px]">将保存 {changed.length} 个模型的改动。</span>}
+                <div className="right">
+                  <TwoStep
+                    label={busy ? `写入中…（${done}/${total}）` : "写入映射"}
+                    kind="primary"
+                    busy={busy}
+                    busyLabel="保存中…"
+                    disabled={changed.length === 0}
+                    ask={() => unserved.length > 0}
+                    warning={
+                      unserved.length === 0 ? undefined : (
+                        <>
+                          {unserved.map((model) => (
+                            <span key={model.id} className="ch-warn-line">
+                              停用后「{model.name}」将没有可用账号：影响 {model.reachable_tenants} 个租户、{model.reachable_keys} 个密钥。
+                            </span>
+                          ))}
+                          停用后这些公共模型仍然保留，但请求会失败（无可用上游）。
+                        </>
+                      )
                     }
+                    onConfirm={() => void write()}
                   />
-                </td>
-              </tr>
+                </div>
+              </>
+            ) : (
+              <p className="hint mr-auto text-[13px]">只读角色只能查看，不能修改模型映射。</p>
             )}
-          </tbody>
-        </DataTable>
-      )}
-      {Object.keys(rowErrors).length > 0 && (
-        <ul className="note crit ch-errors" role="alert">
-          {Object.entries(rowErrors).map(([id, text]) => (
-            <li key={id}>
-              {rows?.find((r) => r.public_model_id === id)?.public_model_name ?? id}：{text}
-            </li>
-          ))}
-        </ul>
-      )}
+          </div>
+        )}
+      </div>
+
       {canEdit && rows !== null && (
-        <>
-          <p className="ch-save">
-            <TwoStep
-              label={busy ? `写入中…（${done}/${total}）` : "写入映射"}
-              kind="primary"
-              busy={busy}
-              busyLabel="保存中…"
-              disabled={changed.length === 0}
-              ask={() => unserved.length > 0}
-              warning={
-                unserved.length === 0 ? undefined : (
-                  <>
-                    {unserved.map((model) => (
-                      <span key={model.id} className="ch-warn-line">
-                        停用后「{model.name}」将没有可用账号：影响 {model.reachable_tenants} 个租户、{model.reachable_keys} 个密钥。
-                      </span>
-                    ))}
-                    停用后这些公共模型仍然保留，但请求会失败（无可用上游）。
-                  </>
-                )
-              }
-              onConfirm={() => void write()}
-            />
-            {changed.length > 0 && <span className="hint">将保存 {changed.length} 个模型的改动。</span>}
-          </p>
+        // The section's two tools, side by side: the account's own list, and one name typed in.
+        <div className="grid items-start gap-6 lg:grid-cols-2">
           <FetchUpstream
             accountId={accountId}
             rows={rows}
@@ -582,9 +608,14 @@ export function ChannelModels({
               await load();
             }}
           />
-          <div className="ch-create">
-            <p className="hint">上游有、公共模型还没有的名称可以在这里一并新建；价格仍然建在该公共模型上。</p>
-            <div className="ch-create-row">
+          <div className="panel ch-create mb-0">
+            <div className="flex items-start gap-3">
+              <span aria-hidden="true" className="grid size-9 shrink-0 place-items-center rounded-md border border-border bg-muted text-muted-foreground">
+                <Plus className="size-4" />
+              </span>
+              <p className="hint text-[13px]">上游有、公共模型还没有的名称可以在这里一并新建；价格仍然建在该公共模型上。</p>
+            </div>
+            <div className="mt-4 flex flex-wrap items-start gap-2">
               <UpstreamModelPicker
                 accountId={accountId}
                 value={newName}
@@ -592,6 +623,7 @@ export function ChannelModels({
                 label="新的公共模型名称"
                 onChange={setNewName}
                 disabled={creating || busy}
+                className="min-w-[14rem] flex-1"
               />
               <Button
                 type="button"
@@ -605,9 +637,8 @@ export function ChannelModels({
               </Button>
             </div>
           </div>
-        </>
+        </div>
       )}
-      {!canEdit && <p className="hint">只读角色只能查看，不能修改模型映射。</p>}
     </section>
   );
 }

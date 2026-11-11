@@ -54,16 +54,23 @@ export function SecretInput({
   if (mode === "keep" || mode === "clear") {
     return (
       <div className="f" role="group" aria-label={label} {...aria}>
-        <span>{label}</span>
-        <div className="secret">
+        <span className="f-label">{label}</span>
+        {/* Drawn as the field it stands for: the stored state where the text would be, the actions at its end. */}
+        <div className="secret h-9 min-h-0 flex-nowrap gap-2 rounded-md border border-input bg-muted/50 pr-1 pl-3">
           {mode === "keep" ? (
             <Lamp state="applied">已设置</Lamp>
           ) : (
             <Lamp state="pending">保存后清除</Lamp>
           )}
+          <span aria-hidden="true" className="min-w-0 flex-1 truncate font-mono text-xs tracking-widest text-muted-foreground">
+            {mode === "keep" ? "••••••••" : ""}
+          </span>
           {!readOnly && mode === "keep" && (
             <Button
               type="button"
+              size="sm"
+              kind="quiet"
+              className="h-7"
               onClick={() => {
                 setMode("replace");
                 onChange("");
@@ -75,6 +82,9 @@ export function SecretInput({
           {!readOnly && mode === "keep" && !required && (
             <Button
               type="button"
+              size="sm"
+              kind="quiet"
+              className="h-7"
               onClick={() => {
                 setMode("clear");
                 onChange(undefined);
@@ -84,7 +94,7 @@ export function SecretInput({
             </Button>
           )}
           {!readOnly && mode === "clear" && (
-            <Button type="button" onClick={keep}>
+            <Button type="button" size="sm" kind="quiet" className="h-7" onClick={keep}>
               撤销
             </Button>
           )}
@@ -98,7 +108,7 @@ export function SecretInput({
   return (
     <div className="f">
       <label>
-        <span>{label}</span>
+        <span className="f-label">{label}</span>
         <input
           type="password"
           autoComplete="new-password"
@@ -114,9 +124,9 @@ export function SecretInput({
         />
       </label>
       {stored && !readOnly && (
-        <button type="button" className="ghost secret-undo" onClick={keep}>
+        <Button type="button" size="sm" kind="quiet" className="secret-undo -ml-2 self-start" onClick={keep}>
           保留原密钥
-        </button>
+        </Button>
       )}
       {hint && <p className="hint">{hint}</p>}
       {why}

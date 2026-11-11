@@ -1,3 +1,4 @@
+import { CloudDownload, Search } from "lucide-react";
 import { useMemo, useState } from "react";
 import { ApiError, channelModels, upstreamModels, type ChannelModel, type PublicModel } from "../../lib/api";
 import { messageFor } from "../../lib/errors";
@@ -124,11 +125,14 @@ export function FetchUpstream({
 
   return (
     // A group, not a region: the section around it is the region named 模型.
-    <div className="ch-fetch" role="group" aria-label="获取上游模型">
-      <p className="hint">
-        从该账号的上游读取模型列表，勾选后一次写入映射：已有同名公共模型的直接复用，没有的以上游模型名称新建；该账号已映射的模型保持不变。
-      </p>
-      <p>
+    <div className="panel ch-fetch mb-0" role="group" aria-label="获取上游模型">
+      <div className="flex flex-wrap items-start gap-3">
+        <span aria-hidden="true" className="grid size-9 shrink-0 place-items-center rounded-md border border-border bg-muted text-muted-foreground">
+          <CloudDownload className="size-4" />
+        </span>
+        <p className="hint min-w-0 flex-1 basis-56 text-[13px]">
+          从该账号的上游读取模型列表，勾选后一次写入映射：已有同名公共模型的直接复用，没有的以上游模型名称新建；该账号已映射的模型保持不变。
+        </p>
         <Button
           type="button"
           icon="refresh"
@@ -139,19 +143,19 @@ export function FetchUpstream({
         >
           获取上游模型
         </Button>
-      </p>
+      </div>
       {phase === "failed" && failure !== null && (
-        <div className="note crit" role="alert">
+        <div className="note crit mb-0" role="alert">
           无法获取该上游的模型列表：{failure}
         </div>
       )}
       {applied && (
-        <div className="note ok" role="status">
+        <div className="note ok mb-0" role="status">
           {applied}
         </div>
       )}
       {refusal && (
-        <div className="note crit" role="alert">
+        <div className="note crit mb-0" role="alert">
           {refusal.message}
           {refusal.lines.length > 0 && (
             <ul>
@@ -162,91 +166,89 @@ export function FetchUpstream({
           )}
         </div>
       )}
-      {phase === "listed" && (
+      {phase === "listed" && listNote && <div className="note warn mb-0">{listNote}</div>}
+      {phase === "listed" && ids.length === 0 && <p className="hint mt-4">该上游没有返回任何模型名称。</p>}
+      {phase === "listed" && ids.length > 0 && (
         <>
-          {listNote && <div className="note warn">{listNote}</div>}
-          {ids.length === 0 ? (
-            <p className="hint">该上游没有返回任何模型名称。</p>
-          ) : (
-            <>
-              <div className="ch-fetch-bar">
-                <label className="f ch-filter">
-                  <span className="f-label">搜索上游模型</span>
-                  <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="按上游模型名称筛选" />
-                </label>
-                <label className="ch-tick">
-                  <input
-                    type="checkbox"
-                    checked={allShownChosen}
-                    disabled={disabled || busy || shownSelectable.length === 0}
-                    onChange={(e) => toggleShown(e.target.checked)}
-                  />
-                  全选筛选结果（{shownSelectable.length} 个可选）
-                </label>
-              </div>
-              <DataTable label="上游模型列表" scroll>
-                <thead>
-                  <tr>
-                    <th>选择</th>
-                    <th>上游模型</th>
-                    <th>映射</th>
+          <div className="mt-5 flex flex-wrap items-center gap-x-6 gap-y-3">
+            <label className="relative block w-full sm:w-72">
+              <span className="sr-only">搜索上游模型</span>
+              <Search aria-hidden className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
+              <input className="pl-9" value={query} onChange={(e) => setQuery(e.target.value)} placeholder="按上游模型名称筛选" />
+            </label>
+            <label className="ch-tick gap-2 text-[13px]">
+              <input
+                type="checkbox"
+                checked={allShownChosen}
+                disabled={disabled || busy || shownSelectable.length === 0}
+                onChange={(e) => toggleShown(e.target.checked)}
+              />
+              全选筛选结果（{shownSelectable.length} 个可选）
+            </label>
+          </div>
+          <DataTable label="上游模型列表" scroll compact>
+            <thead>
+              <tr>
+                <th className="w-12">选择</th>
+                <th>上游模型</th>
+                <th>映射</th>
+              </tr>
+            </thead>
+            <tbody>
+              {shown.map((id) => {
+                const state = states.get(id)!;
+                return (
+                  <tr key={id}>
+                    <td>
+                      <input
+                        type="checkbox"
+                        aria-label={`选择 ${id}`}
+                        checked={chosen.has(id) && selectable(state)}
+                        disabled={disabled || busy || !selectable(state)}
+                        onChange={(e) => toggle(id, e.target.checked)}
+                      />
+                    </td>
+                    <td>
+                      <span className="mono font-mono text-[13px]">{id}</span>
+                    </td>
+                    <td className={selectable(state) ? "text-[13px]" : "ch-fetch-muted text-[13px] text-muted-foreground"}>{stateText(state)}</td>
                   </tr>
-                </thead>
-                <tbody>
-                  {shown.map((id) => {
-                    const state = states.get(id)!;
-                    return (
-                      <tr key={id}>
-                        <td>
-                          <input
-                            type="checkbox"
-                            aria-label={`选择 ${id}`}
-                            checked={chosen.has(id) && selectable(state)}
-                            disabled={disabled || busy || !selectable(state)}
-                            onChange={(e) => toggle(id, e.target.checked)}
-                          />
-                        </td>
-                        <td>
-                          <span className="mono">{id}</span>
-                        </td>
-                        <td className={selectable(state) ? undefined : "ch-fetch-muted"}>{stateText(state)}</td>
-                      </tr>
-                    );
-                  })}
-                  {shown.length === 0 && (
-                    <tr>
-                      <td colSpan={3}>没有匹配的上游模型。</td>
-                    </tr>
-                  )}
-                </tbody>
-              </DataTable>
-              {matches.length > shown.length && (
-                <p className="hint">
-                  共 {matches.length} 个，只列出前 {MAX_SHOWN} 个；继续输入可缩小范围。
-                </p>
+                );
+              })}
+              {shown.length === 0 && (
+                <tr>
+                  <td colSpan={3} className="text-muted-foreground">
+                    没有匹配的上游模型。
+                  </td>
+                </tr>
               )}
-              {overCap && (
-                <div className="note warn" role="alert">
-                  一次最多映射 {MAX_BULK_MODELS} 个上游模型，已选 {picked.length} 个，请减少选择后再写入。
-                </div>
-              )}
-              <p className="ch-save">
-                <Button
-                  type="button"
-                  busy={busy}
-                  busyLabel="写入中…"
-                  disabled={disabled || picked.length === 0 || overCap}
-                  disabledReason={
-                    picked.length === 0 ? "先勾选要映射的上游模型" : overCap ? `一次最多 ${MAX_BULK_MODELS} 个` : undefined
-                  }
-                  onClick={() => void apply()}
-                >
-                  映射所选模型
-                </Button>
-                <span className="hint">已选 {picked.length} 个</span>
-              </p>
-            </>
+            </tbody>
+          </DataTable>
+          {matches.length > shown.length && (
+            <p className="hint mt-3 text-[13px]">
+              共 {matches.length} 个，只列出前 {MAX_SHOWN} 个；继续输入可缩小范围。
+            </p>
           )}
+          {overCap && (
+            <div className="note warn mb-0" role="alert">
+              一次最多映射 {MAX_BULK_MODELS} 个上游模型，已选 {picked.length} 个，请减少选择后再写入。
+            </div>
+          )}
+          <div className="ch-save -mx-6 -mb-6 mt-6 flex flex-wrap items-center justify-end gap-x-4 gap-y-2 rounded-b-[calc(var(--radius)+3px)] border-t border-border bg-muted/40 px-6 py-3">
+            <span className="hint mr-auto text-[13px] tabular-nums">已选 {picked.length} 个</span>
+            <Button
+              type="button"
+              busy={busy}
+              busyLabel="写入中…"
+              disabled={disabled || picked.length === 0 || overCap}
+              disabledReason={
+                picked.length === 0 ? "先勾选要映射的上游模型" : overCap ? `一次最多 ${MAX_BULK_MODELS} 个` : undefined
+              }
+              onClick={() => void apply()}
+            >
+              映射所选模型
+            </Button>
+          </div>
         </>
       )}
     </div>
