@@ -7,6 +7,7 @@ import { fmtMicroCny, fmtUtc } from "../../lib/money";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
 import { Field, useRefusalFocus } from "../../ui/Field";
+import { Card, CardHeader, PageHeader } from "../../components/page";
 import { Lamp } from "../../ui/Lamp";
 import { TwoStep } from "../../ui/TwoStep";
 
@@ -136,39 +137,52 @@ export function Topups({ canEdit, refreshShell }: TabProps) {
   const inFlight = flight !== null;
 
   return (
-    <div className="panel">
-      <h2>充值审批</h2>
-      <p className="hint">租户提交的充值申请。批准后金额立即计入该租户余额；驳回须写明原因，租户可以看到。</p>
-      <div className="r">
-        <Field label="状态">
-          <select value={status} onChange={(e) => setStatus(e.target.value as StatusFilter)}>
-            <option value="pending">待审批</option>
-            <option value="approved">已批准</option>
-            <option value="rejected">已驳回</option>
-            <option value="">全部</option>
-          </select>
-        </Field>
-        <Field label="来源">
-          <select value={origin} onChange={(e) => setOrigin(e.target.value as Topup["origin"] | "")}>
-            <option value="">全部</option>
-            <option value="tenant">{ORIGIN_LABEL.tenant}</option>
-            <option value="operator">{ORIGIN_LABEL.operator}</option>
-          </select>
-        </Field>
-        <Field label="租户">
-          <select value={tenantId} onChange={(e) => setTenantId(e.target.value)}>
-            <option value="">全部</option>
-            {tenantList.map((t) => (
-              <option key={t.id} value={t.id}>
-                {t.name}
-              </option>
-            ))}
-          </select>
-        </Field>
-        <Button type="button" icon="refresh" onClick={() => void load()}>
-          刷新
-        </Button>
-      </div>
+    <>
+      <PageHeader
+        title="充值审批"
+        description="租户提交的充值申请。批准后金额立即计入该租户余额；驳回须写明原因，租户可以看到。"
+        actions={
+          <Button type="button" icon="refresh" onClick={() => void load()}>
+            刷新
+          </Button>
+        }
+      />
+    <Card>
+      <CardHeader
+        title="充值申请"
+        actions={
+          <>
+            <label className="f filter">
+              <span>状态</span>
+              <select value={status} onChange={(e) => setStatus(e.target.value as StatusFilter)}>
+                <option value="pending">待审批</option>
+                <option value="approved">已批准</option>
+                <option value="rejected">已驳回</option>
+                <option value="">全部</option>
+              </select>
+            </label>
+            <label className="f filter">
+              <span>来源</span>
+              <select value={origin} onChange={(e) => setOrigin(e.target.value as Topup["origin"] | "")}>
+                <option value="">全部</option>
+                <option value="tenant">{ORIGIN_LABEL.tenant}</option>
+                <option value="operator">{ORIGIN_LABEL.operator}</option>
+              </select>
+            </label>
+            <label className="f filter">
+              <span>租户</span>
+              <select value={tenantId} onChange={(e) => setTenantId(e.target.value)}>
+                <option value="">全部</option>
+                {tenantList.map((t) => (
+                  <option key={t.id} value={t.id}>
+                    {t.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </>
+        }
+      />
       {outcome && (
         <div className={outcome.ok ? "note ok" : "note crit"} role={outcome.ok ? "status" : "alert"}>
           {outcome.text}
@@ -207,21 +221,23 @@ export function Topups({ canEdit, refreshShell }: TabProps) {
               const writing = rejecting?.id === t.id ? rejecting : null;
               return [
                 <tr key={t.id}>
-                  <td>{t.tenant_name}</td>
-                  <td className="num money">{fmtMicroCny(t.amount_micro_cny)}</td>
-                  <td>
+                  <td className="font-medium">{t.tenant_name}</td>
+                  <td className="num money font-medium">{fmtMicroCny(t.amount_micro_cny)}</td>
+                  <td className="min-w-32 whitespace-normal">
                     {t.origin === "operator" ? (t.credit_reason ?? t.note) : t.note}
                     {t.status === "rejected" && t.reject_reason && (
                       <span className="cell-note">驳回原因：{t.reject_reason}</span>
                     )}
                   </td>
-                  <td>{t.reference || "—"}</td>
-                  <td>{ORIGIN_LABEL[t.origin]}</td>
-                  <td>{t.requested_by?.display_name ?? "—"}</td>
-                  <td className="tabular">{fmtUtc(t.requested_at)}</td>
+                  <td className="text-text-2">{t.reference ? <code>{t.reference}</code> : "—"}</td>
+                  <td>
+                    <span className="tag">{ORIGIN_LABEL[t.origin]}</span>
+                  </td>
+                  <td className="text-text-2">{t.requested_by?.display_name ?? "—"}</td>
+                  <td className="tabular text-text-2">{fmtUtc(t.requested_at)}</td>
                   <td className="right">
                     {t.status === "pending" && t.origin === "tenant" && canEdit && (
-                      <>
+                      <span className="inline-flex items-start justify-end gap-2">
                         <TwoStep
                           label="批准"
                           size="sm"
@@ -230,7 +246,7 @@ export function Topups({ canEdit, refreshShell }: TabProps) {
                           disabled={inFlight}
                           busy={mine?.kind === "approve"}
                           onConfirm={() => void decide(t, "approve")}
-                        />{" "}
+                        />
                         <Button
                           size="sm"
                           type="button"
@@ -242,7 +258,7 @@ export function Topups({ canEdit, refreshShell }: TabProps) {
                         >
                           驳回
                         </Button>
-                      </>
+                      </span>
                     )}
                     {t.status !== "pending" && (
                       <Lamp state={t.status === "approved" ? "applied" : "rejected"}>{STATUS_LABEL[t.status]}</Lamp>
@@ -250,9 +266,10 @@ export function Topups({ canEdit, refreshShell }: TabProps) {
                   </td>
                 </tr>,
                 writing && (
-                  <tr key={`${t.id}-reject`}>
+                  <tr key={`${t.id}-reject`} className="dt-detail">
                     <td colSpan={8}>
                       <form
+                        className="mt-1 grid max-w-3xl items-start gap-x-3 rounded-lg border border-border bg-muted/40 p-4 whitespace-normal sm:grid-cols-[minmax(0,1fr)_auto]"
                         ref={form}
                         aria-label={`驳回 ${t.tenant_name} 的充值申请`}
                         onSubmit={(e) => {
@@ -271,7 +288,7 @@ export function Topups({ canEdit, refreshShell }: TabProps) {
                             />
                           )}
                         </Field>
-                        <div className="r">
+                        <div className="flex gap-2 sm:mt-6">
                           <Button
                             kind="danger"
                             type="submit"
@@ -296,12 +313,13 @@ export function Topups({ canEdit, refreshShell }: TabProps) {
         </DataTable>
       )}
       {items !== null && next !== null && (
-        <div className="r">
-          <Button type="button" disabled={inFlight} onClick={() => void load(next)}>
+        <div className="bl-card-foot">
+          <Button type="button" size="sm" disabled={inFlight} onClick={() => void load(next)}>
             加载更多
           </Button>
         </div>
       )}
-    </div>
+    </Card>
+    </>
   );
 }

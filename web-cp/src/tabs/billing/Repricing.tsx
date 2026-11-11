@@ -8,6 +8,8 @@ import { deltaWord, outcomeUnknown, previewAgainBody, utcInputToIso, utcInputVal
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
 import { Field, useRefusalFocus } from "../../ui/Field";
+import { Card, CardHeader, PageHeader } from "../../components/page";
+import { cn } from "../../lib/cn";
 import { Lamp } from "../../ui/Lamp";
 import { TwoStep } from "../../ui/TwoStep";
 
@@ -269,116 +271,117 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
   const isStale = shown ? stale.has(shown.id) : false;
   const unknown = mine?.kind === "unknown";
 
-  return (
-    <div className="panel">
-      <h2>重新计价</h2>
-      <p className="hint">
-        价格补录或改正之后，按现行价格重新计算过去的调用。先预览：看影响多少调用、各租户相差多少；确认无误后由管理员执行。预览不会改动任何费用。
-      </p>
-
-      {canEdit && (
-        <form
-          ref={formRef}
-          aria-label="新建重新计价"
-          onSubmit={(e) => {
-            e.preventDefault();
-            void submitPreview();
-          }}
-        >
-          <h3>新建重新计价</h3>
-          <div className="r">
-            <Field label="开始（UTC）" error={problems.from}>
-              {(aria) => (
-                <input
-                  {...aria}
-                  type="datetime-local"
-                  step={1}
-                  value={form.from}
-                  disabled={busy}
-                  onChange={(e) => set("from", e.target.value)}
-                />
-              )}
-            </Field>
-            <Field label="结束（UTC）" hint="不得晚于当前时间。" error={problems.to}>
-              {(aria) => (
-                <input
-                  {...aria}
-                  type="datetime-local"
-                  step={1}
-                  value={form.to}
-                  disabled={busy}
-                  onChange={(e) => set("to", e.target.value)}
-                />
-              )}
-            </Field>
-          </div>
-          <div className="r">
-            <Field label="模型">
-              <select value={form.model_id} disabled={busy} onChange={(e) => set("model_id", e.target.value)}>
-                <option value="">全部</option>
-                {models.map((m) => (
-                  <option key={m.id} value={m.id}>
-                    {m.name}
-                  </option>
-                ))}
-              </select>
-            </Field>
-            <Field label="租户">
-              <select value={form.tenant_id} disabled={busy} onChange={(e) => set("tenant_id", e.target.value)}>
-                <option value="">全部</option>
-                {tenantList.map((t) => (
-                  <option key={t.id} value={t.id}>
-                    {t.name}
-                  </option>
-                ))}
-              </select>
-            </Field>
-            <Field label="状态" error={problems.status}>
-              {(aria) => (
-                <select {...aria} value={form.status} disabled={busy} onChange={(e) => set("status", e.target.value)}>
-                  {STATUS_OPTIONS.map(([v, label]) => (
-                    <option key={v} value={v}>
-                      {label}
-                    </option>
-                  ))}
-                </select>
-              )}
-            </Field>
-          </div>
-          <Field label="原因" hint="记入这次运行，1–500 个字符。" error={problems.reason}>
+  const formCard = canEdit && (
+    <Card className="mb-0 xl:sticky xl:top-20">
+      <form
+        ref={formRef}
+        aria-label="新建重新计价"
+        onSubmit={(e) => {
+          e.preventDefault();
+          void submitPreview();
+        }}
+      >
+        <CardHeader title="新建重新计价" />
+        <div className="grid gap-x-4 sm:grid-cols-2 xl:grid-cols-1">
+          <Field label="开始（UTC）" error={problems.from}>
             {(aria) => (
               <input
                 {...aria}
-                maxLength={500}
-                value={form.reason}
+                type="datetime-local"
+                step={1}
+                value={form.from}
                 disabled={busy}
-                onChange={(e) => set("reason", e.target.value)}
+                onChange={(e) => set("from", e.target.value)}
               />
             )}
           </Field>
-          {formError && (
-            <div className="note crit" role="alert">
-              {formError}
-            </div>
+          <Field label="结束（UTC）" hint="不得晚于当前时间。" error={problems.to}>
+            {(aria) => (
+              <input
+                {...aria}
+                type="datetime-local"
+                step={1}
+                value={form.to}
+                disabled={busy}
+                onChange={(e) => set("to", e.target.value)}
+              />
+            )}
+          </Field>
+        </div>
+        <div className="grid gap-x-4 sm:grid-cols-3 xl:grid-cols-1 2xl:grid-cols-3">
+          <Field label="模型">
+            <select value={form.model_id} disabled={busy} onChange={(e) => set("model_id", e.target.value)}>
+              <option value="">全部</option>
+              {models.map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.name}
+                </option>
+              ))}
+            </select>
+          </Field>
+          <Field label="租户">
+            <select value={form.tenant_id} disabled={busy} onChange={(e) => set("tenant_id", e.target.value)}>
+              <option value="">全部</option>
+              {tenantList.map((t) => (
+                <option key={t.id} value={t.id}>
+                  {t.name}
+                </option>
+              ))}
+            </select>
+          </Field>
+          <Field label="状态" error={problems.status}>
+            {(aria) => (
+              <select {...aria} value={form.status} disabled={busy} onChange={(e) => set("status", e.target.value)}>
+                {STATUS_OPTIONS.map(([v, label]) => (
+                  <option key={v} value={v}>
+                    {label}
+                  </option>
+                ))}
+              </select>
+            )}
+          </Field>
+        </div>
+        <Field label="原因" hint="记入这次运行，1–500 个字符。" error={problems.reason}>
+          {(aria) => (
+            <input
+              {...aria}
+              maxLength={500}
+              value={form.reason}
+              disabled={busy}
+              onChange={(e) => set("reason", e.target.value)}
+            />
           )}
-          <div className="r">
-            <Button type="submit" kind="primary" busy={previewing} busyLabel="预览" disabled={busy}>
-              预览
-            </Button>
+        </Field>
+        {formError && (
+          <div className="note crit" role="alert">
+            {formError}
           </div>
-        </form>
-      )}
+        )}
+        <div className="-mx-6 -mb-6 mt-6 flex justify-end gap-2 rounded-b-xl border-t border-border bg-muted/40 px-6 py-3">
+          <Button type="submit" kind="primary" busy={previewing} busyLabel="预览" disabled={busy}>
+            预览
+          </Button>
+        </div>
+      </form>
+    </Card>
+  );
 
-      {shown && (
-        <section aria-label="预览结果">
-          <h3>{shown.status === "applied" ? "已执行的运行" : "预览结果"}</h3>
-          <p className="hint">
+  const result = shown && (
+    <Card aria-label="预览结果">
+      <CardHeader
+        title={shown.status === "applied" ? "已执行的运行" : "预览结果"}
+        description={
+          <>
             {fmtUtc(shown.filter.from)} 至 {fmtUtc(shown.filter.to)}
             {shown.filter.model_id && `，模型 ${modelName(shown.filter.model_id)}`}
             {shown.filter.tenant_id && `，租户 ${tenantName(shown.filter.tenant_id)}`}
             {shown.filter.group_id && `，分组 ${groupName(shown.filter.group_id)}`}
             {`，状态 ${shown.filter.status ? statusLabel(shown.filter.status) : "全部"}`}。原因：{shown.reason}
-          </p>
+          </>
+        }
+      />
+      <div className={cn("grid items-start gap-4", shown.by_tenant.length > 0 && "2xl:grid-cols-[minmax(260px,340px)_minmax(0,1fr)]")}>
+        <div className="bl-box max-w-md 2xl:max-w-none">
           <DataTable label="合计">
             <tbody>
               <tr>
@@ -399,16 +402,17 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
               </tr>
               <tr>
                 <th scope="row">合计差额</th>
-                <td className="num money">
+                <td className="num money font-semibold">
                   {fmtMicroCny(shown.delta_micro_cny)}
                   <span className="cell-note">{deltaWord(shown.delta_micro_cny)}</span>
                 </td>
               </tr>
             </tbody>
           </DataTable>
-          <p className="hint">差额为正是多收，为负是退还。「无归属」是没有归属租户的调用，只统计，不会计费。</p>
+        </div>
 
-          {shown.by_tenant.length > 0 && (
+        {shown.by_tenant.length > 0 && (
+          <div className="bl-box">
             <DataTable label="各租户差额">
               <thead>
                 <tr>
@@ -421,7 +425,7 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
               <tbody>
                 {shown.by_tenant.map((t) => (
                   <tr key={t.tenant_id}>
-                    <td>{t.tenant_name || t.tenant_id}</td>
+                    <td className="font-medium">{t.tenant_name || t.tenant_id}</td>
                     <td className="num">{t.events}</td>
                     <td className="num">{t.changed}</td>
                     <td className="num money">
@@ -432,62 +436,71 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
                 ))}
               </tbody>
             </DataTable>
-          )}
+          </div>
+        )}
+      </div>
+      <p className="hint mt-3 text-[13px]">差额为正是多收，为负是退还。「无归属」是没有归属租户的调用，只统计，不会计费。</p>
 
-          {mine && (
-            <div
-              className={mine.kind === "done" || mine.kind === "info" ? "note ok" : "note crit"}
-              role={mine.kind === "done" || mine.kind === "info" ? "status" : "alert"}
-            >
-              {mine.text}
-            </div>
-          )}
-
-          {shown.status === "previewed" && (
-            <div className="r">
-              {unknown ? (
-                <Button type="button" kind="primary" busy={reading} busyLabel="查看最新状态" disabled={busy} onClick={() => void recheck(shown)}>
-                  查看最新状态
-                </Button>
-              ) : isStale ? (
-                <Button type="button" kind="primary" busy={previewing} busyLabel="重新预览" disabled={busy} onClick={() => void previewAgain(shown)}>
-                  重新预览
-                </Button>
-              ) : isAdmin ? (
-                <TwoStep
-                  // Keyed by run: an armed 确认执行 never carries over to another run.
-                  key={shown.id}
-                  label="执行"
-                  kind="primary"
-                  warning={APPLY_WARNING}
-                  disabled={busy}
-                  busy={applying}
-                  onConfirm={() => void apply(shown)}
-                />
-              ) : (
-                <span className="hint">执行需要管理员权限，运维账号可以预览。</span>
-              )}
-            </div>
-          )}
-          {shown.status === "previewed" && isAdmin && !unknown && !isStale && (
-            <p className="hint">
-              执行可能需要几秒钟。调整记入执行当月的租户流水；在用量统计里，则计入这些调用发生的月份。
-            </p>
-          )}
-          {shown.status === "applied" && (
-            <p className="hint">
-              已由 {shown.applied_by?.email ?? "—"} 于 {shown.applied_at ? fmtUtc(shown.applied_at) : "—"} 执行。调整记入执行当月的租户流水；在用量统计里，则计入这些调用发生的月份。
-            </p>
-          )}
-        </section>
+      {mine && (
+        <div
+          className={mine.kind === "done" || mine.kind === "info" ? "note ok" : "note crit"}
+          role={mine.kind === "done" || mine.kind === "info" ? "status" : "alert"}
+        >
+          {mine.text}
+        </div>
       )}
 
-      <h3>运行记录</h3>
-      <div className="r">
-        <Button type="button" size="sm" icon="refresh" disabled={busy} onClick={() => void load()}>
-          刷新
-        </Button>
-      </div>
+      {shown.status === "previewed" && (
+        <div className="-mx-6 -mb-6 mt-6 flex flex-wrap items-start justify-between gap-x-6 gap-y-3 rounded-b-xl border-t border-border bg-muted/40 px-6 py-3">
+          <p className="hint max-w-xl self-center text-[13px]">
+            {isAdmin && !unknown && !isStale
+              ? "执行可能需要几秒钟。调整记入执行当月的租户流水；在用量统计里，则计入这些调用发生的月份。"
+              : null}
+          </p>
+          <div className="right ml-auto">
+            {unknown ? (
+              <Button type="button" kind="primary" busy={reading} busyLabel="查看最新状态" disabled={busy} onClick={() => void recheck(shown)}>
+                查看最新状态
+              </Button>
+            ) : isStale ? (
+              <Button type="button" kind="primary" busy={previewing} busyLabel="重新预览" disabled={busy} onClick={() => void previewAgain(shown)}>
+                重新预览
+              </Button>
+            ) : isAdmin ? (
+              <TwoStep
+                // Keyed by run: an armed 确认执行 never carries over to another run.
+                key={shown.id}
+                label="执行"
+                kind="primary"
+                warning={APPLY_WARNING}
+                disabled={busy}
+                busy={applying}
+                onConfirm={() => void apply(shown)}
+              />
+            ) : (
+              <span className="hint text-[13px]">执行需要管理员权限，运维账号可以预览。</span>
+            )}
+          </div>
+        </div>
+      )}
+      {shown.status === "applied" && (
+        <p className="hint text-[13px]">
+          已由 {shown.applied_by?.email ?? "—"} 于 {shown.applied_at ? fmtUtc(shown.applied_at) : "—"} 执行。调整记入执行当月的租户流水；在用量统计里，则计入这些调用发生的月份。
+        </p>
+      )}
+    </Card>
+  );
+
+  const history = (
+    <Card className="mb-0">
+      <CardHeader
+        title="运行记录"
+        actions={
+          <Button type="button" size="sm" icon="refresh" disabled={busy} onClick={() => void load()}>
+            刷新
+          </Button>
+        }
+      />
       {loadError && (
         <div className="note crit" role="alert">
           {loadError}
@@ -516,8 +529,8 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
             )}
             {runs.map((r) => (
               <tr key={r.id}>
-                <td className="tabular">{fmtUtc(r.created_at)}</td>
-                <td>
+                <td className="w-28 whitespace-normal tabular text-text-2">{fmtUtc(r.created_at)}</td>
+                <td className="min-w-56 whitespace-normal">
                   {fmtUtc(r.filter.from)} 至 {fmtUtc(r.filter.to)}
                   <span className="cell-note">
                     模型：{modelName(r.filter.model_id) ?? "全部"}；租户：{tenantName(r.filter.tenant_id) ?? "全部"}；
@@ -525,11 +538,11 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
                     {r.filter.status ? statusLabel(r.filter.status) : "全部"}
                   </span>
                 </td>
-                <td>{r.reason}</td>
+                <td className="min-w-28 whitespace-normal">{r.reason}</td>
                 <td>
                   <Lamp state={r.status === "applied" ? "applied" : "pending"}>{r.status === "applied" ? "已执行" : "已预览"}</Lamp>
                 </td>
-                <td className="num money">
+                <td className="num money min-w-20">
                   {fmtMicroCny(r.delta_micro_cny)}
                   <span className="cell-note">{deltaWord(r.delta_micro_cny)}</span>
                 </td>
@@ -544,12 +557,35 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
         </DataTable>
       )}
       {runs !== null && next !== null && (
-        <div className="r">
-          <Button type="button" disabled={busy} onClick={() => void load(next)}>
+        <div className="bl-card-foot">
+          <Button type="button" size="sm" disabled={busy} onClick={() => void load(next)}>
             加载更多
           </Button>
         </div>
       )}
-    </div>
+    </Card>
+  );
+
+  return (
+    <>
+      <PageHeader
+        title="重新计价"
+        description="价格补录或改正之后，按现行价格重新计算过去的调用。先预览：看影响多少调用、各租户相差多少；确认无误后由管理员执行。预览不会改动任何费用。"
+      />
+      {formCard ? (
+        <div className="grid items-start gap-6 xl:grid-cols-[340px_minmax(0,1fr)] 2xl:grid-cols-[420px_minmax(0,1fr)]">
+          {formCard}
+          <div className="min-w-0">
+            {result}
+            {history}
+          </div>
+        </div>
+      ) : (
+        <>
+          {result}
+          {history}
+        </>
+      )}
+    </>
   );
 }

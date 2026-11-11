@@ -1,22 +1,104 @@
 /* The billing pages: accounts and the tenant panel. Every value comes from the tokens. */
 
+/* A region of the tenant's billing panel: a full-width band under a
+   hairline, its title first; a table in it runs to the panel's edges. */
 .bl-region {
   min-width: 0;
-  margin: var(--s-6) 0 0;
+  margin: 0 -24px;
+  padding: 20px 24px;
+  border-top: 1px solid var(--border);
+}
+.side-panel > .bl-region:first-of-type {
+  margin-top: 16px;
+}
+.side-panel > .bl-region:last-child {
+  margin-bottom: -24px;
 }
 .bl-region > h3 {
-  margin: 0 0 var(--s-2);
-  color: var(--text);
-  font-size: var(--fs-16);
-  font-weight: 700;
-  line-height: var(--lh-heading);
+  margin: 0 0 12px;
+  color: var(--foreground);
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.4;
+  letter-spacing: -0.01em;
 }
 .bl-region > .note,
 .bl-region > .hint {
-  margin-bottom: var(--s-3);
+  margin: 0 0 12px;
 }
-.bl-region > .btn {
-  margin-top: var(--s-3);
+.bl-region > :last-child:is(.note, .hint) {
+  margin-bottom: 0;
+}
+.bl-region > .hint {
+  font-size: 13px;
+  line-height: 1.55;
+}
+.bl-region > .dt-wrap {
+  --dt-edge: 24px;
+  margin: 12px -24px 0;
+  border-top: 1px solid var(--border);
+}
+.bl-region > .dt-wrap:last-child {
+  margin-bottom: -20px;
+}
+.side-panel > .bl-region:last-child > .dt-wrap:last-child {
+  border-radius: 0 0 calc(var(--radius) + 3px) calc(var(--radius) + 3px);
+}
+.bl-region > .empty {
+  margin-top: 12px;
+  padding: 28px 16px;
+}
+.bl-region > .loading {
+  margin-top: 4px;
+}
+/* 加载更多 under a table: a bar of its own that closes the region. */
+.bl-more {
+  display: flex;
+  justify-content: center;
+  margin: 0 -24px -20px;
+  padding: 10px 24px;
+  border-top: 1px solid var(--border);
+}
+
+/* The account's figures: small tiles, two or three to a row. */
+.bl-tiles {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin: 0;
+}
+@media (min-width: 640px) {
+  .bl-tiles {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+.bl-tiles > div {
+  min-width: 0;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--muted) 45%, var(--card));
+}
+.bl-tiles dt {
+  color: var(--muted-foreground);
+  font-size: 12px;
+  font-weight: 500;
+}
+.bl-tiles dd {
+  margin: 6px 0 0;
+  overflow: hidden;
+  font-size: 18px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.bl-tiles dd .lamp {
+  font-size: 14px;
+  font-weight: 500;
+  letter-spacing: 0;
 }
 
 /* Name, figures and status of the account, as a small definition list. */
@@ -41,8 +123,28 @@
   gap: var(--s-3);
   margin-bottom: var(--s-3);
 }
+.bl-controls > .field {
+  flex: 1 1 160px;
+  margin: 0;
+}
+/* A field with its hint or refusal under it and its button beside it: the
+   button lines up with the control, not with the words under it. */
+.bl-controls.bl-inline {
+  align-items: flex-start;
+}
+.bl-controls.bl-inline > .btn {
+  margin-top: 24px;
+}
+/* A list's filters: equal columns that fill the region. */
+.bl-controls.bl-filters {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  align-items: start;
+  gap: 12px;
+  margin-bottom: 4px;
+}
 
-/* The tenant whose panel is open: the hovered-row wash, with a Signal-yellow edge. */
+/* The tenant whose panel is open: the hovered-row wash, with an edge in the ink colour. */
 .dt tr:has(.bl-name[aria-expanded="true"]) {
   background: var(--row-hover);
 }
@@ -52,15 +154,13 @@
 .bl-name {
   max-width: var(--trunc, 200px);
 }
-.bl-mark {
-  margin-left: var(--s-2);
-}
 
 /* 组织额度: the row's own controls sit on one line, wrapping when narrow. */
 .bl-row-actions {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
+  justify-content: flex-end;
   gap: var(--s-2);
 }
 
@@ -68,4 +168,40 @@
 .dt td.bl-wrap {
   white-space: normal;
   overflow-wrap: anywhere;
+}
+
+/* A small table on a page card, in a ruled box of its own. */
+.bl-box {
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.bl-box > .dt-wrap {
+  --dt-edge: 16px;
+  margin: 0;
+}
+.bl-box .dt th[scope="row"] {
+  position: static;
+  height: 40px;
+  border-bottom: 1px solid var(--border);
+  background: none;
+  color: var(--text-2);
+  font-size: 13px;
+  font-weight: 400;
+}
+.bl-box .dt tbody tr:last-child > th {
+  border-bottom: 0;
+}
+.bl-box .dt td {
+  height: 40px;
+}
+
+/* A page card whose table closes it, with a bar under it for 加载更多. */
+.bl-card-foot {
+  display: flex;
+  justify-content: center;
+  margin: 0 -24px -24px;
+  padding: 12px 24px;
+  border-top: 1px solid var(--border);
 }

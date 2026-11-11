@@ -58,7 +58,7 @@ function NewQuota({ account, onCreated }: { account: RegionProps["account"]; onC
 
   return (
     <form ref={form} onSubmit={(e) => void create(e)} noValidate>
-      <div className="bl-controls">
+      <div className="bl-controls bl-inline">
         <Field label="类型" error={refused?.at.get("/kind") ?? null}>
           {(aria) => (
             <select value={kind} disabled={busy} onChange={(e) => setKind(e.target.value as "periodic" | "cumulative")} {...aria}>
@@ -162,7 +162,7 @@ function RowActions({ tenantId, budget, onChanged }: { tenantId: string; budget:
     <div>
       {editing ? (
         <form ref={form} onSubmit={(e) => void save(e)} noValidate>
-          <div className="bl-controls">
+          <div className="bl-controls justify-end text-left">
             <Field label="新限额（元）" error={problem}>
               {(aria) => (
                 <input inputMode="decimal" value={draft} disabled={busy} autoFocus onChange={(e) => setDraft(e.target.value)} {...aria} />
@@ -240,7 +240,7 @@ export function OrgQuota({ account, canEdit, onQuotasChanged }: RegionProps) {
               <th className="num">已用</th>
               <th className="num">剩余</th>
               <th>状态</th>
-              {canEdit && <th>操作</th>}
+              {canEdit && <th className="right">操作</th>}
             </tr>
           </thead>
           <tbody>
@@ -257,7 +257,7 @@ export function OrgQuota({ account, canEdit, onQuotasChanged }: RegionProps) {
                   </span>
                 </td>
                 {canEdit && (
-                  <td>{b.set_by === "operator" ? <RowActions tenantId={account.tenant_id} budget={b} onChanged={reload} /> : null}</td>
+                  <td className="right">{b.set_by === "operator" ? <RowActions tenantId={account.tenant_id} budget={b} onChanged={reload} /> : null}</td>
                 )}
               </tr>
             ))}

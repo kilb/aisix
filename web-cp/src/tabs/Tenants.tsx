@@ -27,6 +27,7 @@ import {
 import { messageFor } from "../lib/errors";
 import { generatedDirect } from "../lib/generatedDirect";
 import { errorText, fmtInt, fmtTime } from "../lib/fmt";
+import { Card, CardHeader, PageHeader, Stat, StatGrid } from "../components/page";
 import { Button } from "../ui/Button";
 import { useRefusalFocus } from "../ui/Field";
 import { CopyButton } from "../ui/CopyButton";
@@ -319,9 +320,13 @@ export function unreachableWarning(groups: string[], whose: string): string {
   return `${groups.join("、")}：没有上游账号在此分组。保存后，${whose}找不到任何上游账号，无法调用模型。`;
 }
 
+/** The list beside an open detail: the detail takes the wider share it needs for its tables. */
+export const SIDE_OPEN = "with-side is-open gap-x-6 xl:grid-cols-[minmax(0,1fr)_minmax(460px,44%)]";
+
 export function Tenants({ operator, canEdit }: TabProps) {
   const [filter, setFilter] = useState<Tenant["status"] | "">("");
-  const [items, setItems] = useState<Tenant[] | null>(null);
+  // Every tenant, whatever the filter: the figures above the list count them all.
+  const [all, setAll] = useState<Tenant[] | null>(null);
   const [listError, setListError] = useState<string | null>(null);
   const [rowError, setRowError] = useState<{ id: string; error: unknown } | null>(null);
   const [acting, setActing] = useState<string | null>(null);
@@ -337,26 +342,29 @@ export function Tenants({ operator, canEdit }: TabProps) {
   const listSeq = useRef(0);
 
   const loadList = useCallback(async () => {
-    // A read for an earlier filter that answers late must not replace this one.
+    // A read that answers after a later one must not replace it.
     const mine = ++listSeq.current;
     try {
-      const list = await tenants.list(filter || undefined);
+      const list = await tenants.list();
       if (mine !== listSeq.current) return;
-      setItems(list);
+      setAll(list);
       setListError(null);
     } catch (e) {
       if (mine === listSeq.current) setListError(errorText(e));
     }
-  }, [filter]);
+  }, []);
 
   useEffect(() => {
     void loadList();
   }, [loadList]);
 
+  const items = useMemo(() => (all === null ? null : filter ? all.filter((t) => t.status === filter) : all), [all, filter]);
+  const count = (status: Tenant["status"]) => (all === null ? "…" : fmtInt(all.filter((t) => t.status === status).length));
+
   // A view replaces the one shown unless it is older: a read that raced a write.
   const applyView = useCallback((view: Tenant) => {
     const newer = (old: Tenant) => (old.id === view.id && view.version >= old.version ? view : old);
-    setItems((prev) => prev && prev.map(newer));
+    setAll((prev) => prev && prev.map(newer));
     setDetail((prev) => prev && newer(prev));
   }, []);
 
@@ -418,158 +426,177 @@ export function Tenants({ operator, canEdit }: TabProps) {
   }
 
   return (
-    <div className={detail ? "with-side is-open" : "with-side"}>
-      <div className="side-main">
-        <div className="panel">
-          <h2>
-            租户
-            <Button size="sm" type="button" icon="refresh" onClick={refreshAll}>
+    <>
+      <PageHeader
+        title="租户"
+        description="客户经租户门户自助注册后在这里审核；批准前它不能自行创建密钥，名下的密钥也都不可用。停用租户会让它的全部密钥立即失效，恢复后重新可用。"
+        actions={
+          <>
+            <Button type="button" icon="refresh" onClick={refreshAll}>
               刷新
             </Button>
             {operator.role === "admin" && (
-              <Button
-                size="sm"
-                type="button"
-                aria-expanded={showDefaults}
-                onClick={() => setShowDefaults((open) => !open)}
-              >
+              <Button type="button" aria-expanded={showDefaults} onClick={() => setShowDefaults((open) => !open)}>
                 新租户默认值
               </Button>
             )}
-          </h2>
-          <p className="hint">
-            客户经租户门户自助注册后在这里审核；批准前它不能自行创建密钥，名下的密钥也都不可用。停用租户会让它的全部密钥立即失效，恢复后重新可用。
-          </p>
-          <label className="f filter">
-            <span>按状态筛选</span>
-            <select value={filter} onChange={(e) => setFilter(e.target.value as Tenant["status"] | "")}>
-              <option value="">全部</option>
-              <option value="pending">待审核</option>
-              <option value="active">正常</option>
-              <option value="suspended">已停用</option>
-            </select>
-          </label>
-          {listError && (
+          </>
+        }
+      />
+
+      <StatGrid className="grid-cols-2">
+        <Stat label="全部租户" value={all === null ? "…" : fmtInt(all.length)} />
+        <Stat label="待审核" value={count("pending")} />
+        <Stat label="正常" value={count("active")} />
+        <Stat label="已停用" value={count("suspended")} />
+      </StatGrid>
+
+      {showDefaults && operator.role === "admin" && <DefaultsPanel />}
+
+      <div className={detail ? SIDE_OPEN : "with-side"}>
+        <div className="side-main min-w-0">
+          <Card className="mb-0">
+            <CardHeader
+              title={
+                <>
+                  租户列表
+                  {items !== null && <span className="tag ml-2 align-[2px]">{fmtInt(items.length)}</span>}
+                </>
+              }
+              actions={
+                <label className="f filter">
+                  <span>按状态筛选</span>
+                  <select value={filter} onChange={(e) => setFilter(e.target.value as Tenant["status"] | "")}>
+                    <option value="">全部</option>
+                    <option value="pending">待审核</option>
+                    <option value="active">正常</option>
+                    <option value="suspended">已停用</option>
+                  </select>
+                </label>
+              }
+            />
+            {listError && (
+              <div className="note crit" role="alert">
+                {listError}{" "}
+                <Button type="button" size="sm" onClick={() => void loadList()}>
+                  重试
+                </Button>
+              </div>
+            )}
+            {items === null ? (
+              !listError && <Loading />
+            ) : items.length === 0 ? (
+              <EmptyState text="没有符合条件的租户。" />
+            ) : (
+              <DataTable label="租户列表">
+                <thead>
+                  <tr>
+                    <th>名称</th>
+                    <th>状态</th>
+                    <th className="side-opt">计费方式</th>
+                    <th className="right side-opt">成员</th>
+                    <th className="right side-opt">密钥</th>
+                    <th>下发</th>
+                    {canEdit && <th className="right">操作</th>}
+                  </tr>
+                </thead>
+                <tbody>
+                  {items.map((t) => (
+                    <tr key={t.id}>
+                      <td>
+                        <span className="flex min-w-0 items-center gap-2">
+                          <button
+                            type="button"
+                            className="link-button tn-name"
+                            title={t.name}
+                            aria-expanded={selected === t.id}
+                            onClick={() => setSelected(t.id)}
+                          >
+                            {t.name}
+                          </button>
+                          {t.is_internal && <span className="tag">平台内部</span>}
+                        </span>
+                      </td>
+                      <td>
+                        <TenantStatus status={t.status} />
+                      </td>
+                      <td className="side-opt text-text-2">{BILLING_LABEL[t.billing_mode] ?? t.billing_mode}</td>
+                      <td className="right side-opt">{fmtInt(t.member_count)}</td>
+                      <td className="right side-opt">{fmtInt(t.key_count)}</td>
+                      <td>
+                        <RolloutBadge rollout={t.rollout} />
+                      </td>
+                      {canEdit && (
+                        <td className="right">
+                          <div className="tn-actions justify-end">
+                            {t.status === "pending" && (
+                              <Button
+                                size="sm"
+                                type="button"
+                                disabled={acting === t.id}
+                                busy={acting === t.id}
+                                busyLabel="批准"
+                                onClick={() => void act(t, tenants.approve)}
+                              >
+                                批准
+                              </Button>
+                            )}
+                            {/* The platform's own tenant holds the operators' keys; it is never suspended. */}
+                            {t.status === "active" && !t.is_internal && (
+                              <TwoStep
+                                label="停用"
+                                size="sm"
+                                disabled={acting === t.id}
+                                busy={acting === t.id}
+                                onConfirm={() => void act(t, tenants.suspend)}
+                              />
+                            )}
+                            {t.status === "suspended" && (
+                              <Button
+                                size="sm"
+                                type="button"
+                                disabled={acting === t.id}
+                                busy={acting === t.id}
+                                busyLabel="恢复"
+                                onClick={() => void act(t, tenants.reactivate)}
+                              >
+                                恢复
+                              </Button>
+                            )}
+                          </div>
+                          {rowError?.id === t.id && <Failure error={rowError.error} />}
+                        </td>
+                      )}
+                    </tr>
+                  ))}
+                </tbody>
+              </DataTable>
+            )}
+          </Card>
+
+          {selected && detailError && (
             <div className="note crit" role="alert">
-              {listError}{" "}
-              <Button type="button" onClick={() => void loadList()}>
+              {detailError}{" "}
+              <Button type="button" size="sm" onClick={() => void loadDetail(selected)}>
                 重试
               </Button>
             </div>
           )}
-          {items === null ? (
-            !listError && <Loading />
-          ) : items.length === 0 ? (
-            <EmptyState text="没有符合条件的租户。" />
-          ) : (
-            <DataTable label="租户列表">
-              <thead>
-                <tr>
-                  <th>名称</th>
-                  <th>状态</th>
-                  <th>计费方式</th>
-                  <th className="right">成员</th>
-                  <th className="right">密钥</th>
-                  <th>下发</th>
-                  {canEdit && <th>操作</th>}
-                </tr>
-              </thead>
-              <tbody>
-                {items.map((t) => (
-                  <tr key={t.id}>
-                    <td>
-                      <button
-                        type="button"
-                        className="link-button tn-name"
-                        title={t.name}
-                        aria-expanded={selected === t.id}
-                        onClick={() => setSelected(t.id)}
-                      >
-                        {t.name}
-                      </button>
-                      {t.is_internal && <span className="tag tn-mark">平台内部</span>}
-                    </td>
-                    <td>
-                      <TenantStatus status={t.status} />
-                    </td>
-                    <td>{BILLING_LABEL[t.billing_mode] ?? t.billing_mode}</td>
-                    <td className="right">{fmtInt(t.member_count)}</td>
-                    <td className="right">{fmtInt(t.key_count)}</td>
-                    <td>
-                      <RolloutBadge rollout={t.rollout} />
-                    </td>
-                    {canEdit && (
-                      <td>
-                        <div className="tn-actions">
-                          {t.status === "pending" && (
-                            <Button
-                              size="sm"
-                              type="button"
-                              disabled={acting === t.id}
-                              busy={acting === t.id}
-                              busyLabel="批准"
-                              onClick={() => void act(t, tenants.approve)}
-                            >
-                              批准
-                            </Button>
-                          )}
-                          {/* The platform's own tenant holds the operators' keys; it is never suspended. */}
-                          {t.status === "active" && !t.is_internal && (
-                            <TwoStep
-                              label="停用"
-                              size="sm"
-                              disabled={acting === t.id}
-                              busy={acting === t.id}
-                              onConfirm={() => void act(t, tenants.suspend)}
-                            />
-                          )}
-                          {t.status === "suspended" && (
-                            <Button
-                              size="sm"
-                              type="button"
-                              disabled={acting === t.id}
-                              busy={acting === t.id}
-                              busyLabel="恢复"
-                              onClick={() => void act(t, tenants.reactivate)}
-                            >
-                              恢复
-                            </Button>
-                          )}
-                        </div>
-                        {rowError?.id === t.id && <Failure error={rowError.error} />}
-                      </td>
-                    )}
-                  </tr>
-                ))}
-              </tbody>
-            </DataTable>
-          )}
         </div>
-
-        {showDefaults && operator.role === "admin" && <DefaultsPanel />}
-
-        {selected && detailError && (
-          <div className="note crit" role="alert">
-            {detailError}{" "}
-            <Button type="button" onClick={() => void loadDetail(selected)}>
-              重试
-            </Button>
-          </div>
+        {detail && (
+          <TenantDetail
+            key={detail.id}
+            tenant={detail}
+            canEdit={canEdit}
+            tick={tick}
+            onView={settle}
+            onRefresh={() => void refresh(detail.id)}
+            onReload={() => void loadDetail(detail.id)}
+            onClose={() => setSelected(null)}
+          />
         )}
       </div>
-      {detail && (
-        <TenantDetail
-          key={detail.id}
-          tenant={detail}
-          canEdit={canEdit}
-          tick={tick}
-          onView={settle}
-          onRefresh={() => void refresh(detail.id)}
-          onReload={() => void loadDetail(detail.id)}
-          onClose={() => setSelected(null)}
-        />
-      )}
-    </div>
+    </>
   );
 }
 
@@ -644,11 +671,27 @@ function TenantDetail({
       extra={<RolloutBadge rollout={tenant.rollout} />}
       onClose={onClose}
     >
-      <p className="hint tn-facts">
-        {STATUS_LABEL[tenant.status] ?? tenant.status} · {BILLING_LABEL[tenant.billing_mode] ?? tenant.billing_mode} ·
-        成员 {tenant.member_count} · 密钥 {tenant.key_count}
-        {tenant.is_internal && " · 平台内部租户：它的密钥是运维密钥，没有成员"}
-      </p>
+      <dl className="tn-strip">
+        <div>
+          <dt>状态</dt>
+          <dd>
+            <TenantStatus status={tenant.status} />
+          </dd>
+        </div>
+        <div>
+          <dt>计费方式</dt>
+          <dd>{BILLING_LABEL[tenant.billing_mode] ?? tenant.billing_mode}</dd>
+        </div>
+        <div>
+          <dt>成员</dt>
+          <dd className="tabular">{fmtInt(tenant.member_count)}</dd>
+        </div>
+        <div>
+          <dt>密钥</dt>
+          <dd className="tabular">{fmtInt(tenant.key_count)}</dd>
+        </div>
+      </dl>
+      {tenant.is_internal && <p className="hint mt-3 text-[13px]">平台内部租户：它的密钥是运维密钥，没有成员</p>}
 
       <GrantsPart
         {...part}
@@ -939,7 +982,7 @@ function GrantsPart({
   }
 
   return (
-    <fieldset ref={part} className="tn-section">
+    <fieldset ref={part} className="tn-part">
       <legend>授权模型</legend>
       <div className="tn-scope" role="radiogroup" aria-label="模型范围">
         <label>
@@ -1026,18 +1069,21 @@ function GrantsPart({
       {refused?.conflict && <ConflictNote onReload={onReload} />}
       <Msg note={note} />
       {canEdit && (
-        // Until the catalog is read the form shows no choices. A save that takes a
-        // grant away cuts every key of the tenant off from it, so it is confirmed
-        // first (ruling P1b-R6); one whose losses cannot be known yet waits.
-        <TwoStep
-          label="保存授权"
-          kind={(withdrawn?.length ?? 0) > 0 || granted ? "primary" : "secondary"}
-          disabled={busy || catalog === null || withdrawn === null}
-          busy={busy}
-          ask={() => (withdrawn?.length ?? 0) > 0}
-          warning={`将撤销 ${(withdrawn ?? []).map(nameOf).join("、")} 的授权。保存后，该租户的所有密钥都不能再调用这些模型。`}
-          onConfirm={() => void submit()}
-        />
+        <div className="tn-foot right">
+          {/* Until the catalog is read the form shows no choices. A save that takes a
+              grant away cuts every key of the tenant off from it, so it is confirmed
+              first (ruling P1b-R6); one whose losses cannot be known yet waits. */}
+          <TwoStep
+            label="保存授权"
+            size="sm"
+            kind={(withdrawn?.length ?? 0) > 0 || granted ? "primary" : "secondary"}
+            disabled={busy || catalog === null || withdrawn === null}
+            busy={busy}
+            ask={() => (withdrawn?.length ?? 0) > 0}
+            warning={`将撤销 ${(withdrawn ?? []).map(nameOf).join("、")} 的授权。保存后，该租户的所有密钥都不能再调用这些模型。`}
+            onConfirm={() => void submit()}
+          />
+        </div>
       )}
     </fieldset>
   );
@@ -1125,7 +1171,7 @@ function GroupsPart({
   // tenant with no group that holds an upstream account.
   const blocked = !picked.some(reachable);
   return (
-    <fieldset ref={part} className="tn-section">
+    <fieldset ref={part} className="tn-part">
       <legend>可用分组</legend>
       <p className="hint">
         租户按显示名看到分组。该租户的每个密钥只路由到它自己那一个分组里的上游账号；移除一个分组会停用该租户在这个分组下的密钥，再加回来时它们重新可用。
@@ -1158,32 +1204,35 @@ function GroupsPart({
       {canEdit && keysUnread && (
         <div className="note crit" role="alert">
           该租户的密钥列表读取失败，无法确认移除分组会停用多少个密钥，暂不能移除分组。
-          <Button size="sm" type="button" onClick={onReloadKeys}>
+          <Button size="sm" type="button" className="ml-2" onClick={onReloadKeys}>
             重新读取密钥
           </Button>
         </div>
       )}
-      {canEdit && keysLoading && <p className="hint">正在读取该租户的密钥，读取完成后才能移除分组。</p>}
       {canEdit && (
-        <TwoStep
-          label="保存分组"
-          kind={edited ? "primary" : "secondary"}
-          disabled={busy || keysUnread || keysLoading}
-          busy={busy}
-          ask={() => stopped.length > 0 || blocked}
-          warning={
-            <>
-              {stopLines.map((line) => (
-                <span key={line}>{line}</span>
-              ))}
-              {blocked &&
-                (unreachable.length > 0
-                  ? unreachableWarning(unreachable.map(labelOf), "该租户的密钥")
-                  : "没有选择任何分组。保存后，该租户的密钥找不到任何上游账号，无法调用模型。")}
-            </>
-          }
-          onConfirm={() => void submit()}
-        />
+        <div className="tn-foot right">
+          {keysLoading && <p className="hint mr-auto self-center text-left text-[13px]">正在读取该租户的密钥，读取完成后才能移除分组。</p>}
+          <TwoStep
+            label="保存分组"
+            size="sm"
+            kind={edited ? "primary" : "secondary"}
+            disabled={busy || keysUnread || keysLoading}
+            busy={busy}
+            ask={() => stopped.length > 0 || blocked}
+            warning={
+              <>
+                {stopLines.map((line) => (
+                  <span key={line}>{line}</span>
+                ))}
+                {blocked &&
+                  (unreachable.length > 0
+                    ? unreachableWarning(unreachable.map(labelOf), "该租户的密钥")
+                    : "没有选择任何分组。保存后，该租户的密钥找不到任何上游账号，无法调用模型。")}
+              </>
+            }
+            onConfirm={() => void submit()}
+          />
+        </div>
       )}
     </fieldset>
   );
@@ -1202,7 +1251,7 @@ function LimitInputs({
   errorFor: (field: keyof TenantLimits) => string | undefined;
 }) {
   return (
-    <div className="tn-limits">
+    <div className="tn-limits grid gap-x-4 sm:grid-cols-2 2xl:grid-cols-3">
       {LIMIT_FIELDS.map(({ field, label }) => (
         <LimitInput
           key={field}
@@ -1287,7 +1336,7 @@ function LimitsPart({ tenant, canEdit, save, onReload }: PartProps) {
   }
 
   return (
-    <fieldset ref={part} className="tn-section">
+    <fieldset ref={part} className="tn-part">
       <legend>限额</legend>
       <p className="hint">
         前三项限制整个租户（全部密钥合计）；后两项是单个密钥最多能设的值，密钥自己不设时就按这个上限。留空表示不限。
@@ -1306,15 +1355,18 @@ function LimitsPart({ tenant, canEdit, save, onReload }: PartProps) {
       {refused?.conflict && <ConflictNote onReload={onReload} />}
       <Msg note={note} />
       {canEdit && (
-        <Button
-          kind={JSON.stringify(draft) !== JSON.stringify(limitDraft(tenant.limits)) ? "primary" : "secondary"}
-          type="button"
-          busy={busy}
-          busyLabel="保存限额"
-          onClick={() => void submit()}
-        >
-          保存限额
-        </Button>
+        <div className="tn-foot">
+          <Button
+            kind={JSON.stringify(draft) !== JSON.stringify(limitDraft(tenant.limits)) ? "primary" : "secondary"}
+            type="button"
+            size="sm"
+            busy={busy}
+            busyLabel="保存限额"
+            onClick={() => void submit()}
+          >
+            保存限额
+          </Button>
+        </div>
       )}
     </fieldset>
   );
@@ -1347,7 +1399,7 @@ function MembersPart({
   }
 
   return (
-    <section className="tn-section tn-sep">
+    <section className="tn-part">
       <h3>成员</h3>
       <p className="hint">
         停用后该成员的所有密钥立即失效，其登录也随之结束；启用后这些密钥恢复（成员自己停用的除外）。计费角色不持有可用的密钥。
@@ -1362,6 +1414,7 @@ function MembersPart({
       ) : members.length === 0 ? (
         <p className="status-line">还没有成员。</p>
       ) : (
+        <div className="tn-bleed">
         <DataTable label="成员">
           <thead>
             <tr>
@@ -1369,21 +1422,23 @@ function MembersPart({
               <th>邮箱</th>
               <th>角色</th>
               <th>状态</th>
-              {canEdit && <th>操作</th>}
+              {canEdit && <th className="right">操作</th>}
             </tr>
           </thead>
           <tbody>
             {members.map((m) => (
               <tr key={m.id}>
-                <td>{m.display_name || "—"}</td>
-                <td>{m.email}</td>
-                <td>{ROLE_LABEL[m.role] ?? m.role}</td>
+                <td className="font-medium">{m.display_name || "—"}</td>
+                <td className="text-text-2">{m.email}</td>
+                <td>
+                  <span className="tag">{ROLE_LABEL[m.role] ?? m.role}</span>
+                </td>
                 <td>
                   <Lamp state={m.disabled ? "disabled" : "applied"}>{m.disabled ? "已停用" : "正常"}</Lamp>
                 </td>
                 {canEdit && (
-                  <td>
-                    <div className="tn-actions">
+                  <td className="right">
+                    <div className="tn-actions justify-end">
                       {m.disabled ? (
                         <Button
                           size="sm"
@@ -1412,6 +1467,7 @@ function MembersPart({
             ))}
           </tbody>
         </DataTable>
+        </div>
       )}
     </section>
   );
@@ -1451,20 +1507,27 @@ function InvitePart({ tenant }: { tenant: Tenant }) {
   return (
     // The control plane judges the address: its refusal is shown at the field.
     <form ref={form} onSubmit={(e) => void submit(e)} noValidate>
-      <fieldset className="tn-section">
+      <fieldset className="tn-part">
         <legend>邀请成员</legend>
         <p className="hint">生成一次性的邀请 token，交给受邀人在租户门户接受邀请、设置口令。</p>
-        <div className="r">
-          <label className="f">
-            <span>邮箱</span>
-            <input
-              type="email"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              aria-invalid={emailError ? true : undefined}
-              aria-describedby={emailError ? emailErrorId : undefined}
-            />
-          </label>
+        <div className="grid gap-x-4 sm:grid-cols-[minmax(0,1fr)_160px]">
+          <div>
+            <label className="f">
+              <span>邮箱</span>
+              <input
+                type="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                aria-invalid={emailError ? true : undefined}
+                aria-describedby={emailError ? emailErrorId : undefined}
+              />
+            </label>
+            {emailError && (
+              <span id={emailErrorId} className="tn-error -mt-2 mb-4" role="alert">
+                {emailError}
+              </span>
+            )}
+          </div>
           <label className="f">
             <span>角色</span>
             <select value={role} onChange={(e) => setRole(e.target.value as Member["role"])}>
@@ -1475,15 +1538,7 @@ function InvitePart({ tenant }: { tenant: Tenant }) {
               ))}
             </select>
           </label>
-          <Button kind="primary" type="submit" busy={busy} busyLabel="生成邀请">
-            生成邀请
-          </Button>
         </div>
-        {emailError && (
-          <span id={emailErrorId} className="tn-error" role="alert">
-            {emailError}
-          </span>
-        )}
         {refused?.general && (
           <div className="note crit" role="alert">
             {refused.general}
@@ -1492,22 +1547,29 @@ function InvitePart({ tenant }: { tenant: Tenant }) {
         {issued && (
           <div className="note warn">
             <strong>邀请 token 只显示这一次。</strong>请现在复制并交给受邀人；离开此页后无法再查看。
-            <code className="tn-token" aria-label="邀请 token">
-              {issued.invite_token}
-            </code>
-            <CopyButton text={issued.invite_token} onFailed={copyFailed} />
+            <div className="mt-3 flex items-start gap-2">
+              <code className="tn-token" aria-label="邀请 token">
+                {issued.invite_token}
+              </code>
+              <CopyButton text={issued.invite_token} onFailed={copyFailed} />
+            </div>
             {issued.invite_url && (
-              <>
+              <div className="mt-2 flex items-start gap-2">
                 <code className="tn-token" aria-label="邀请链接">
                   {issued.invite_url}
                 </code>
                 <CopyButton text={issued.invite_url} label="复制链接" onFailed={copyFailed} />
-              </>
+              </div>
             )}
-            <p className="hint">有效期至 {fmtTime(issued.expires_at)}。</p>
+            <p className="hint mt-2">有效期至 {fmtTime(issued.expires_at)}。</p>
             {copied && <p className="hint">{copied}</p>}
           </div>
         )}
+        <div className="tn-foot">
+          <Button kind="primary" size="sm" type="submit" busy={busy} busyLabel="生成邀请">
+            生成邀请
+          </Button>
+        </div>
       </fieldset>
     </form>
   );
@@ -1554,7 +1616,7 @@ function KeysPart({
     k.member_id ? (members?.find((m) => m.id === k.member_id)?.email ?? "成员") : "租户共用";
 
   return (
-    <section className="tn-section">
+    <section className="tn-part">
       <h3>密钥</h3>
       <p className="hint">
         每个密钥在创建时选定一个分组，之后不能更改；新建、停用与吊销在「密钥」页。分组被从租户移除时，该分组下的密钥停用，分组加回来时重新可用。
@@ -1569,6 +1631,7 @@ function KeysPart({
       ) : keys.length === 0 ? (
         <p className="status-line">该租户还没有密钥。</p>
       ) : (
+        <div className="tn-bleed">
         <DataTable label="密钥">
           <thead>
             <tr>
@@ -1577,18 +1640,18 @@ function KeysPart({
               <th>成员</th>
               <th>分组</th>
               <th>状态</th>
-              {canEdit && <th>操作</th>}
+              {canEdit && <th className="right">操作</th>}
             </tr>
           </thead>
           <tbody>
             {keys.map((k) => (
               <Fragment key={k.id}>
                 <tr>
-                  <td>{k.label}</td>
+                  <td className="font-medium">{k.label}</td>
                   <td>
                     <code>{k.prefix}…</code>
                   </td>
-                  <td>{ownerOf(k)}</td>
+                  <td className="text-text-2">{ownerOf(k)}</td>
                   <td>
                     <KeyGroupCell k={k} />
                     <StrayNote k={k} tenant={tenant} />
@@ -1604,7 +1667,7 @@ function KeysPart({
                     )}
                   </td>
                   {canEdit && (
-                    <td>
+                    <td className="right">
                       {k.group === null && (
                         <Button
                           size="sm"
@@ -1641,6 +1704,7 @@ function KeysPart({
             ))}
           </tbody>
         </DataTable>
+        </div>
       )}
     </section>
   );
@@ -1748,8 +1812,8 @@ function DefaultsPanel() {
   const groups = useLoad(() => groupsApi.list(), []);
   if (stored.data === null) {
     return (
-      <section className="panel" aria-label="新租户默认值">
-        <h2>新租户默认值</h2>
+      <Card aria-label="新租户默认值" className="mb-6">
+        <CardHeader title="新租户默认值" />
         {stored.error ? (
           <div className="note crit" role="alert">
             {stored.error}
@@ -1757,7 +1821,7 @@ function DefaultsPanel() {
         ) : (
           <Loading />
         )}
-      </section>
+      </Card>
     );
   }
   return <DefaultsForm stored={stored.data} available={groups.data} onSaved={stored.setData} />;
@@ -1808,35 +1872,41 @@ function DefaultsForm({
 
   const whole = refused?.at.get("/default_provider_groups");
   return (
-    <section ref={panel} className="panel" aria-label="新租户默认值">
-      <h2>新租户默认值</h2>
-      <p className="hint">新租户创建时复制这里的限额与默认分组；修改不影响已有租户。留空的限额表示不限。</p>
-      <LimitInputs draft={draft} onChange={setDraft} disabled={false} errorFor={(field) => refused?.at.get(`/${field}`)} />
-      <fieldset className="tn-section">
-        <legend>默认分组</legend>
-        <p className="hint">新租户的密钥只会路由到这些分组里的上游账号；至少要选一个。</p>
-        <GroupPicker
-          options={choices}
-          chosen={chosen}
-          onChange={setChosen}
-          disabled={false}
-          errorFor={(g) => refused?.at.get(`/default_provider_groups/${sent.indexOf(g)}`)}
-        />
-        {whole && (
-          <div className="note crit" role="alert">
-            {whole}
-          </div>
-        )}
-      </fieldset>
+    <section ref={panel} className="panel mb-6" aria-label="新租户默认值">
+      <CardHeader title="新租户默认值" description="新租户创建时复制这里的限额与默认分组；修改不影响已有租户。留空的限额表示不限。" />
+      <div className="grid items-start gap-x-8 gap-y-2 lg:grid-cols-2">
+        <div className="min-w-0">
+          <h4 className="mb-3 text-[13px] font-medium text-muted-foreground">限额</h4>
+          <LimitInputs draft={draft} onChange={setDraft} disabled={false} errorFor={(field) => refused?.at.get(`/${field}`)} />
+        </div>
+        <fieldset className="tn-sub">
+          <legend>默认分组</legend>
+          <p className="hint">新租户的密钥只会路由到这些分组里的上游账号；至少要选一个。</p>
+          <GroupPicker
+            options={choices}
+            chosen={chosen}
+            onChange={setChosen}
+            disabled={false}
+            errorFor={(g) => refused?.at.get(`/default_provider_groups/${sent.indexOf(g)}`)}
+          />
+          {whole && (
+            <div className="note crit" role="alert">
+              {whole}
+            </div>
+          )}
+        </fieldset>
+      </div>
       {refused?.general && (
         <div className="note crit" role="alert">
           {refused.general}
         </div>
       )}
       <Msg note={note} />
-      <Button kind="primary" type="button" busy={busy} busyLabel="保存默认值" onClick={() => void submit()}>
-        保存默认值
-      </Button>
+      <div className="tn-foot">
+        <Button kind="primary" type="button" busy={busy} busyLabel="保存默认值" onClick={() => void submit()}>
+          保存默认值
+        </Button>
+      </div>
     </section>
   );
 }

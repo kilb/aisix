@@ -13,7 +13,7 @@ import {
   type NewKey,
   type Tenant,
 } from "../lib/api";
-import { errorText, fmtTime } from "../lib/fmt";
+import { errorText, fmtInt, fmtTime } from "../lib/fmt";
 import { keyModels } from "../lib/keyModels";
 import {
   atList,
@@ -37,6 +37,7 @@ import {
   type GroupChoice,
   type Refusal,
 } from "./Tenants";
+import { Card, CardHeader, PageHeader, Split, Stat, StatGrid, Toolbar } from "../components/page";
 import { Button } from "../ui/Button";
 import { useRefusalFocus } from "../ui/Field";
 import { CopyButton } from "../ui/CopyButton";
@@ -69,11 +70,11 @@ export function Keys({ canEdit }: TabProps) {
 
   return (
     <>
-      <div className="panel">
-        <h2>
-          密钥
+      <PageHeader
+        title="密钥"
+        description="平台内部租户的密钥是运维自用的，可以按名称模式授权模型；其他租户的密钥只能使用该租户已授权的模型。平台内部租户的密钥明文可随时复制；客户租户的密钥在这里只显示前缀，明文由该租户在自己的门户里复制。"
+        actions={
           <Button
-            size="sm"
             type="button"
             icon="refresh"
             onClick={() => {
@@ -83,23 +84,22 @@ export function Keys({ canEdit }: TabProps) {
           >
             刷新
           </Button>
-        </h2>
-        <p className="hint">
-          平台内部租户的密钥是运维自用的，可以按名称模式授权模型；其他租户的密钥只能使用该租户已授权的模型。平台内部租户的密钥明文可随时复制；客户租户的密钥在这里只显示前缀，明文由该租户在自己的门户里复制。
-        </p>
-        {list.error && (
-          <div className="note crit" role="alert">
-            {list.error}{" "}
-            <Button type="button" onClick={() => void list.reload()}>
-              重试
-            </Button>
-          </div>
-        )}
-        {list.data === null ? (
-          !list.error && <Loading />
-        ) : ordered.length === 0 ? (
-          <EmptyState text="还没有租户。" />
-        ) : (
+        }
+      />
+      {list.error && (
+        <div className="note crit" role="alert">
+          {list.error}{" "}
+          <Button type="button" size="sm" onClick={() => void list.reload()}>
+            重试
+          </Button>
+        </div>
+      )}
+      {list.data === null ? (
+        !list.error && <Loading />
+      ) : ordered.length === 0 ? (
+        <EmptyState text="还没有租户。" />
+      ) : (
+        <Toolbar>
           <label className="f filter filter-wide">
             <span>租户</span>
             <select value={tenantId ?? ""} onChange={(e) => setChosen(e.target.value)}>
@@ -110,8 +110,8 @@ export function Keys({ canEdit }: TabProps) {
               ))}
             </select>
           </label>
-        )}
-      </div>
+        </Toolbar>
+      )}
       {/* Keyed by tenant: switching drops everything shown for the last one, a new key's plaintext included. */}
       {tenantId && <TenantKeys key={tenantId} tenantId={tenantId} canEdit={canEdit} tick={tick} />}
     </>
@@ -235,164 +235,199 @@ function TenantKeys({ tenantId, canEdit, tick }: { tenantId: string; canEdit: bo
 
   if (!tenant) {
     return (
-      <div className="panel">
+      <Card>
         {tenantError ? (
           <div className="note crit" role="alert">
             {tenantError}{" "}
-            <Button type="button" onClick={() => void refresh()}>
+            <Button type="button" size="sm" onClick={() => void refresh()}>
               重试
             </Button>
           </div>
         ) : (
           <Loading />
         )}
-      </div>
+      </Card>
     );
   }
 
   const columns = canEdit ? 9 : 8;
+  const keys = keyList.data;
+  const live = keys?.filter((k) => !k.effective_disabled && !(k.expires_at !== null && Date.parse(k.expires_at) <= Date.now()));
+  const open = creating && canEdit && tenant.status !== "pending";
   return (
-    <section className="panel" aria-label={`${tenant.name} 的密钥`}>
-      <h2>
-        {tenant.name}
-        <RolloutBadge rollout={tenant.rollout} />
-        {/* A pending tenant has no keys until it is approved; the control plane refuses one. */}
-        {canEdit && tenant.status !== "pending" && (
-          <Button
-            kind="primary"
-            size="sm"
-            type="button"
-            aria-expanded={creating}
-            onClick={() => setCreating((open) => !open)}
-          >
-            新建密钥
-          </Button>
-        )}
-      </h2>
-      <p className="hint">
-        {STATUS_LABEL[tenant.status] ?? tenant.status} · 可用分组 {groupsText(tenant.allowed_provider_groups, tenant)}
-        。密钥未设的限额按租户的单 key 上限；运维停用的密钥只有运维能重新启用。
-      </p>
-      {tenantError && (
-        <div className="note crit" role="alert">
-          {tenantError}
-        </div>
-      )}
+    <>
+      <StatGrid className="grid-cols-3 sm:grid-cols-3 xl:grid-cols-3">
+        <Stat label="密钥" value={keys ? fmtInt(keys.length) : "…"} />
+        <Stat label="正常" value={live ? fmtInt(live.length) : "…"} />
+        <Stat label="已停用" value={keys ? fmtInt(keys.filter((k) => k.effective_disabled).length) : "…"} />
+      </StatGrid>
+      <Split
+        asideWidth="380px"
+        // Stacked, the form comes first: it opens where 新建密钥 was pressed.
+        className={open ? "is-creating max-xl:[&>aside]:order-first" : undefined}
+        main={
+          <section className="panel mb-0" aria-label={`${tenant.name} 的密钥`}>
+            <CardHeader
+              className="sm:flex-nowrap [&>div:first-child]:flex-1"
+              title={
+                <span className="inline-flex flex-wrap items-center gap-x-3 gap-y-1">
+                  {tenant.name}
+                  <RolloutBadge rollout={tenant.rollout} />
+                </span>
+              }
+              description={
+                <>
+                  {STATUS_LABEL[tenant.status] ?? tenant.status} · 可用分组 {groupsText(tenant.allowed_provider_groups, tenant)}
+                  。密钥未设的限额按租户的单 key 上限；运维停用的密钥只有运维能重新启用。
+                </>
+              }
+              actions={
+                // A pending tenant has no keys until it is approved; the control plane refuses one.
+                canEdit &&
+                tenant.status !== "pending" && (
+                  <Button
+                    kind="primary"
+                    size="sm"
+                    type="button"
+                    icon="plus"
+                    aria-expanded={creating}
+                    onClick={() => setCreating((o) => !o)}
+                  >
+                    新建密钥
+                  </Button>
+                )
+              }
+            />
+            {tenantError && (
+              <div className="note crit" role="alert">
+                {tenantError}
+              </div>
+            )}
+            {minted && <MintedNote minted={minted} onClose={() => setMinted(null)} />}
 
-      {creating && canEdit && tenant.status !== "pending" && (
-        <CreateForm
-          tenant={tenant}
-          names={names}
-          catalogError={catalog.error}
-          choices={choices}
-          onMinted={(m) => {
-            setMinted(m);
-            setCreating(false);
-            keyList.setData((list) => (list ? [...list, m.key] : [m.key]));
-            void refresh();
-          }}
-          onCancel={() => setCreating(false)}
-        />
-      )}
-      {minted && <MintedNote minted={minted} onClose={() => setMinted(null)} />}
-
-      {keyList.error && (
-        <div className="note crit" role="alert">
-          密钥读取失败：{keyList.error}
-        </div>
-      )}
-      {plaintextError && (
-        <div className="note crit" role="alert">
-          {plaintextError}
-        </div>
-      )}
-      {members.error && (
-        <div className="note crit" role="alert">
-          成员读取失败：{members.error}
-        </div>
-      )}
-      {keyList.data === null ? (
-        !keyList.error && <Loading />
-      ) : keyList.data.length === 0 ? (
-        <EmptyState mark="key" text="该租户还没有密钥。" />
-      ) : (
-        <DataTable label="密钥列表">
-          <thead>
-            <tr>
-              <th>名称</th>
-              <th>前缀</th>
-              <th>成员</th>
-              <th>模型</th>
-              <th>分组</th>
-              <th>限额</th>
-              <th>状态</th>
-              <th>创建者</th>
-              {canEdit && <th>操作</th>}
-            </tr>
-          </thead>
-          <tbody>
-            {keyList.data.map((k) => (
-              <Fragment key={k.id}>
-                <tr>
-                  <td>{k.label}</td>
-                  <td>
-                    <KeySecretCell k={k} tenant={tenant} onError={setPlaintextError} />
-                  </td>
-                  <td>{ownerOf(k, tenant, members.data)}</td>
-                  <td>{modelsOf(k, tenant, names)}</td>
-                  <td>
-                    <KeyGroupCell k={k} />
-                    <StrayNote k={k} tenant={tenant} />
-                  </td>
-                  <td>{limitsOf(k)}</td>
-                  <td>
-                    <Status k={k} tenant={tenant} members={members.data} />
-                  </td>
-                  <td>
-                    <Creator k={k} members={members.data} />
-                  </td>
-                  {canEdit && (
-                    <td>
-                      <KeyActions
-                        k={k}
-                        editing={editing === k.id}
-                        onEdit={() => setEditing(editing === k.id ? null : k.id)}
-                        onSaved={saved}
-                        onRevoked={(gone) => {
-                          if (editing === gone.id) setEditing(null);
-                          keyList.setData((list) => list && list.filter((x) => x.id !== gone.id));
-                          void refresh();
-                        }}
-                        onReload={() => void keyList.reload()}
-                      />
-                    </td>
-                  )}
-                </tr>
-                {editing === k.id && (
-                  <tr className="dt-detail">
-                    <td colSpan={columns}>
-                      <ChooseGroup
-                        k={k}
-                        choices={choices}
-                        onSaved={(next) => {
-                          setEditing(null);
-                          saved(next);
-                        }}
-                        onCancel={() => setEditing(null)}
-                        onReload={() => {
-                          setEditing(null);
-                          void keyList.reload();
-                        }}
-                      />
-                    </td>
+            {keyList.error && (
+              <div className="note crit" role="alert">
+                密钥读取失败：{keyList.error}
+              </div>
+            )}
+            {plaintextError && (
+              <div className="note crit" role="alert">
+                {plaintextError}
+              </div>
+            )}
+            {members.error && (
+              <div className="note crit" role="alert">
+                成员读取失败：{members.error}
+              </div>
+            )}
+            {keys === null ? (
+              !keyList.error && <Loading />
+            ) : keys.length === 0 ? (
+              <EmptyState mark="key" text="该租户还没有密钥。" />
+            ) : (
+              <DataTable label="密钥列表">
+                <thead>
+                  <tr>
+                    <th>名称</th>
+                    <th>前缀</th>
+                    <th className="side-opt">成员</th>
+                    <th>模型</th>
+                    <th>分组</th>
+                    <th className="side-opt">限额</th>
+                    <th>状态</th>
+                    <th className="side-opt">创建者</th>
+                    {canEdit && <th className="right">操作</th>}
                   </tr>
-                )}
-              </Fragment>
-            ))}
-          </tbody>
-        </DataTable>
-      )}
-    </section>
+                </thead>
+                <tbody>
+                  {keys.map((k) => (
+                    <Fragment key={k.id}>
+                      <tr>
+                        <td className="font-medium">{k.label}</td>
+                        <td>
+                          <KeySecretCell k={k} tenant={tenant} onError={setPlaintextError} />
+                        </td>
+                        <td className="side-opt text-text-2">{ownerOf(k, tenant, members.data)}</td>
+                        <td>
+                          <span className="block max-w-[280px] truncate" title={modelsOf(k, tenant, names)}>
+                            {modelsOf(k, tenant, names)}
+                          </span>
+                        </td>
+                        <td>
+                          <KeyGroupCell k={k} />
+                          <StrayNote k={k} tenant={tenant} />
+                        </td>
+                        <td className="side-opt text-text-2">{limitsOf(k)}</td>
+                        <td>
+                          <Status k={k} tenant={tenant} members={members.data} />
+                        </td>
+                        <td className="side-opt text-text-2">
+                          <Creator k={k} members={members.data} />
+                        </td>
+                        {canEdit && (
+                          <td className="right">
+                            <KeyActions
+                              k={k}
+                              editing={editing === k.id}
+                              onEdit={() => setEditing(editing === k.id ? null : k.id)}
+                              onSaved={saved}
+                              onRevoked={(gone) => {
+                                if (editing === gone.id) setEditing(null);
+                                keyList.setData((list) => list && list.filter((x) => x.id !== gone.id));
+                                void refresh();
+                              }}
+                              onReload={() => void keyList.reload()}
+                            />
+                          </td>
+                        )}
+                      </tr>
+                      {editing === k.id && (
+                        <tr className="dt-detail">
+                          <td colSpan={columns}>
+                            <ChooseGroup
+                              k={k}
+                              choices={choices}
+                              onSaved={(next) => {
+                                setEditing(null);
+                                saved(next);
+                              }}
+                              onCancel={() => setEditing(null)}
+                              onReload={() => {
+                                setEditing(null);
+                                void keyList.reload();
+                              }}
+                            />
+                          </td>
+                        </tr>
+                      )}
+                    </Fragment>
+                  ))}
+                </tbody>
+              </DataTable>
+            )}
+          </section>
+        }
+        aside={
+          open ? (
+            <Card className="mb-0">
+              <CreateForm
+                tenant={tenant}
+                names={names}
+                catalogError={catalog.error}
+                choices={choices}
+                onMinted={(m) => {
+                  setMinted(m);
+                  setCreating(false);
+                  keyList.setData((list) => (list ? [...list, m.key] : [m.key]));
+                  void refresh();
+                }}
+                onCancel={() => setCreating(false)}
+              />
+            </Card>
+          ) : undefined
+        }
+      />
+    </>
   );
 }
 
@@ -469,7 +504,7 @@ function KeyActions({
 
   return (
     <>
-      <div className="tn-actions">
+      <div className="tn-actions justify-end">
         {k.disabled ? (
           <Button
             type="button"
@@ -523,16 +558,18 @@ function MintedNote({ minted, onClose }: { minted: MintedKey; onClose: () => voi
   return (
     <div className="note warn" role="region" aria-label="密钥已创建">
       <strong>密钥「{minted.key.label}」已创建。</strong>现在可以复制并交给使用方；之后也能在密钥列表里随时点「复制」再次获取明文，关闭本提示不影响。
-      <code className="tn-token" aria-label="密钥明文">
-        {minted.plaintext}
-      </code>
-      <div className="tn-actions">
-        <CopyButton text={minted.plaintext} onFailed={() => setCopied("无法写入剪贴板，请手动选中复制")} />
-        <Button type="button" onClick={onClose}>
-          关闭
-        </Button>
+      <div className="mt-3 flex flex-wrap items-start gap-2">
+        <code className="tn-token" aria-label="密钥明文">
+          {minted.plaintext}
+        </code>
+        <div className="tn-actions">
+          <CopyButton text={minted.plaintext} onFailed={() => setCopied("无法写入剪贴板，请手动选中复制")} />
+          <Button type="button" onClick={onClose}>
+            关闭
+          </Button>
+        </div>
       </div>
-      {copied && <p className="hint">{copied}</p>}
+      {copied && <p className="hint mt-2">{copied}</p>}
     </div>
   );
 }
@@ -556,7 +593,7 @@ function TextField({
 }) {
   const errorId = useId();
   return (
-    <div>
+    <div className="field">
       <label className="f">
         <span>{label}</span>
         <input
@@ -676,7 +713,7 @@ function CreateForm({
     .join("；");
 
   return (
-    <fieldset ref={part} className="tn-section">
+    <fieldset ref={part} className="tn-sub tn-create">
       <legend>新建密钥</legend>
       <TextField label="名称" value={label} onChange={setLabel} error={at("/label")} />
       {tenant.is_internal ? (
@@ -689,7 +726,7 @@ function CreateForm({
           error={patternsError || undefined}
         />
       ) : (
-        <fieldset className="tn-section">
+        <fieldset className="tn-sub tn-field">
           <legend>模型</legend>
           <p className="hint">只能从该租户已授权的模型里选。不选则可用租户的全部授权模型，包括之后新授权的。</p>
           {catalogError && (
@@ -700,7 +737,7 @@ function CreateForm({
           {grants.length === 0 ? (
             <p className="hint">该租户还没有授权模型；先在租户页授权。</p>
           ) : (
-            <ul className="tn-checks">
+            <ul className="tn-checks tn-box">
               {grants.map((m) => (
                 <Check
                   key={m.id}
@@ -715,7 +752,7 @@ function CreateForm({
           )}
         </fieldset>
       )}
-      <fieldset className="tn-section">
+      <fieldset className="tn-sub tn-field">
         <legend>分组</legend>
         <p className="hint">每个密钥只路由到这一个分组里的上游账号。分组创建后不能更改。</p>
         {choices.length === 0 ? (
@@ -740,18 +777,18 @@ function CreateForm({
           </div>
         )}
       </fieldset>
-      <div className="tn-limits">
+      <div className="tn-limits grid gap-x-4 sm:grid-cols-2">
         <LimitInput label="并发" value={concurrency} disabled={busy} onChange={setConcurrency} error={at("/rate_limit/concurrency")} />
         <LimitInput label="每分钟请求" value={rpm} disabled={busy} onChange={setRpm} error={at("/rate_limit/rpm")} />
-        <TextField
-          label="过期时间"
-          type="datetime-local"
-          value={expires}
-          onChange={setExpires}
-          hint="留空表示不过期。"
-          error={at("/expires_at")}
-        />
       </div>
+      <TextField
+        label="过期时间"
+        type="datetime-local"
+        value={expires}
+        onChange={setExpires}
+        hint="留空表示不过期。"
+        error={at("/expires_at")}
+      />
       {refused?.tooOld ? (
         <GatewayTooOld error={refused.tooOld} />
       ) : (
@@ -761,7 +798,10 @@ function CreateForm({
           </div>
         )
       )}
-      <div className="tn-actions">
+      <div className="tn-foot right">
+        <Button type="button" onClick={onCancel}>
+          取消
+        </Button>
         {/* A group with no upstream account leaves the key nothing to reach (ruling P1b-R6). */}
         <TwoStep
           label="创建"
@@ -772,9 +812,6 @@ function CreateForm({
           warning={unreachableWarning(choices.filter((g) => g.name === group).map((g) => g.display_name), "这个密钥")}
           onConfirm={() => void submit()}
         />
-        <Button type="button" onClick={onCancel}>
-          取消
-        </Button>
       </div>
     </fieldset>
   );
