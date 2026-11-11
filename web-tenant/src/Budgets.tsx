@@ -23,6 +23,7 @@ import { Field, useRefusalFocus } from "./ui/Field";
 import { Lamp } from "./ui/Lamp";
 import { useToast } from "./ui/Toast";
 import { TwoStep } from "./ui/TwoStep";
+import { Card, CardHeader, PageHeader, Split } from "./components/page";
 
 function failure(e: unknown): string {
   return e instanceof ApiError ? messageFor(e) : String(e);
@@ -123,19 +124,13 @@ function powers(b: Budget, role: SessionMember["role"]): { edit: boolean; del: b
 
 // ── the page ────────────────────────────────────────────────────────────────
 
-/** A panel that is a region named by its heading. */
-function Section({ title, children, list = false }: { title: string; children: ReactNode; list?: boolean }) {
+/** A card that is a region named by its heading, its actions beside the heading. */
+function Section({ title, actions, children }: { title: string; actions?: ReactNode; children: ReactNode }) {
   return (
-    <div className={list ? "panel list" : "panel"} role="region" aria-label={title}>
-      {list ? (
-        <div className="panel-head">
-          <h2>{title}</h2>
-        </div>
-      ) : (
-        <h2>{title}</h2>
-      )}
+    <Card role="region" aria-label={title}>
+      <CardHeader title={title} actions={actions} />
       {children}
-    </div>
+    </Card>
   );
 }
 
@@ -221,61 +216,71 @@ export function Budgets({ member }: { member: SessionMember }) {
   const keyRows = (rows ?? []).filter((b) => b.scope === "api_key");
 
   return (
-    <div className="stack">
-      {rowsErr && (
-        <div className="note crit" role="alert">
-          {rowsErr}
-        </div>
-      )}
-      {creator && (
-        <CreateForm role={role} keys={keys} people={people} team={team} quotas={quotas} onCreated={reload} />
-      )}
-      {role !== "member" && (
-        <Section title="组织额度（平台分配）" list>
-          <QuotaTable
-            label="组织额度"
-            rows={rows === null ? null : team}
-            empty="平台还没有为组织设置额度"
-            role={role}
-            parentsOf={() => []}
-            onChanged={reload}
-          />
-        </Section>
-      )}
-      <Section title="成员额度" list>
-        <QuotaTable
-          label="成员额度"
-          rows={rows === null ? null : memberRows}
-          empty={manager ? "还没有成员额度，在上方新建" : role === "billing" ? "还没有成员额度" : "还没有给你设置成员额度"}
-          role={role}
-          parentsOf={() => team.map(termsOf)}
-          onChanged={reload}
-        />
-      </Section>
-      <Section title="密钥额度" list>
-        <div className="panel-notes">
-          {quotaErr && (
-            <div className="note crit" role="alert">
-              {quotaErr}
-            </div>
-          )}
-          <div>
-            <Button size="sm" icon="refresh" busy={reloading} busyLabel="刷新中…" onClick={reload}>
-              刷新
-            </Button>
+    <>
+      <PageHeader title="预算" />
+      <Split
+        asideWidth="360px"
+        main={
+          <div className="grid gap-6">
+            {rowsErr && (
+              <div className="note crit" role="alert">
+                {rowsErr}
+              </div>
+            )}
+            {role !== "member" && (
+              <Section title="组织额度（平台分配）">
+                <QuotaTable
+                  label="组织额度"
+                  rows={rows === null ? null : team}
+                  empty="平台还没有为组织设置额度"
+                  role={role}
+                  parentsOf={() => []}
+                  onChanged={reload}
+                />
+              </Section>
+            )}
+            <Section title="成员额度">
+              <QuotaTable
+                label="成员额度"
+                rows={rows === null ? null : memberRows}
+                empty={manager ? "还没有成员额度，可在「新建额度」中新建" : role === "billing" ? "还没有成员额度" : "还没有给你设置成员额度"}
+                role={role}
+                parentsOf={() => team.map(termsOf)}
+                onChanged={reload}
+              />
+            </Section>
+            <Section
+              title="密钥额度"
+              actions={
+                <Button size="sm" icon="refresh" busy={reloading} busyLabel="刷新中…" onClick={reload}>
+                  刷新
+                </Button>
+              }
+            >
+              {quotaErr && (
+                <div className="note crit" role="alert">
+                  {quotaErr}
+                </div>
+              )}
+              <KeyFigures keys={keys} rows={keyRows} quotas={quotas} shown={shown} onMore={() => setShown((n) => n + KEYS_PER_VIEW)} />
+              <QuotaTable
+                label="密钥额度"
+                rows={rows === null ? null : keyRows}
+                empty={creator ? "还没有密钥额度，可在「新建额度」中新建" : "还没有密钥额度"}
+                role={role}
+                parentsOf={(b) => keyParents(quotas[b.target.id])}
+                onChanged={reload}
+              />
+            </Section>
           </div>
-        </div>
-        <KeyFigures keys={keys} rows={keyRows} quotas={quotas} shown={shown} onMore={() => setShown((n) => n + KEYS_PER_VIEW)} />
-        <QuotaTable
-          label="密钥额度"
-          rows={rows === null ? null : keyRows}
-          empty={creator ? "还没有密钥额度，在上方新建" : "还没有密钥额度"}
-          role={role}
-          parentsOf={(b) => keyParents(quotas[b.target.id])}
-          onChanged={reload}
-        />
-      </Section>
-    </div>
+        }
+        aside={
+          creator ? (
+            <CreateForm role={role} keys={keys} people={people} team={team} quotas={quotas} onCreated={reload} />
+          ) : undefined
+        }
+      />
+    </>
   );
 }
 
@@ -329,7 +334,7 @@ function KeyFigures({
       </tbody>
     </DataTable>
     {seen.length > shown && (
-      <div className="panel-notes">
+      <div className="!mt-0 flex justify-center border-t border-border pt-3">
         <Button size="sm" onClick={onMore}>
           显示更多
         </Button>
@@ -635,7 +640,7 @@ function CreateForm({
 
   return (
     <Section title="新建额度">
-      <form className="form cols" ref={form} onSubmit={submit} noValidate>
+      <form className="grid gap-4 md:grid-cols-2 xl:grid-cols-1" ref={form} onSubmit={submit} noValidate>
         <Field label="对象类型" error={errors.scope}>
           {(aria) => (
             <select
@@ -686,11 +691,11 @@ function CreateForm({
           {(aria) => <input inputMode="decimal" autoComplete="off" value={limit} onChange={(e) => setLimit(e.target.value)} {...aria} />}
         </Field>
         {general && (
-          <div className="note crit" role="alert">
+          <div className="note crit col-span-full" role="alert">
             {general}
           </div>
         )}
-        <div className="form-actions">
+        <div className="col-span-full -mx-6 -mb-6 mt-2 flex justify-end gap-2 rounded-b-[11px] border-t border-border bg-muted/40 px-6 py-3 max-[719px]:-mx-4 max-[719px]:-mb-4 max-[719px]:px-4">
           <Button kind="primary" type="submit" busy={busy} busyLabel="创建中…">
             创建
           </Button>

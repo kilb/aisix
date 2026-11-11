@@ -1,4 +1,5 @@
 import { Fragment, useEffect, useRef, useState, type ReactNode } from "react";
+import { ChevronRight } from "lucide-react";
 import {
   ApiError,
   keys as keyApi,
@@ -18,6 +19,7 @@ import { DataTable, Loading } from "./ui/DataTable";
 import { EmptyState } from "./ui/EmptyState";
 import { Field } from "./ui/Field";
 import { Lamp } from "./ui/Lamp";
+import { Card, CardHeader, PageHeader, Stat, StatGrid } from "./components/page";
 
 function failure(e: unknown): string {
   return e instanceof ApiError ? messageFor(e) : String(e);
@@ -129,15 +131,19 @@ function defaultRange(group: "day" | "month"): { from: string; to: string } {
 /** The longest span the control plane summarises: 92 days by day, 731 days by month. */
 const MAX_DAYS = { day: 92, month: 731 } as const;
 
+/** A card that is a region named by its heading. */
 function Section({ title, children }: { title: string; children: ReactNode }) {
   return (
-    <div className="panel list" role="region" aria-label={title}>
-      <div className="panel-head">
-        <h2>{title}</h2>
-      </div>
+    <Card role="region" aria-label={title}>
+      <CardHeader title={title} />
       {children}
-    </div>
+    </Card>
   );
+}
+
+/** The filters above a list: labelled controls on one wrapping row. */
+function Filters({ children }: { children: ReactNode }) {
+  return <div className="usage-filters flex flex-wrap items-start gap-x-3 gap-y-4 [&>.field]:w-full sm:[&>.field]:w-48">{children}</div>;
 }
 
 /** The key filter's options: every key an owner or admin sees, a member's own. A billing member holds none. */
@@ -181,15 +187,18 @@ export function Usage({ member }: { member: SessionMember }) {
   const keyList = keys ?? [];
   const showKeys = member.role !== "billing";
   return (
-    <div className="stack">
-      {readErr && (
-        <div className="note crit" role="alert">
-          {readErr}
-        </div>
-      )}
-      <Summary keys={keyList} showKeys={showKeys} />
-      <CallLog keys={keyList} showKeys={showKeys} models={granted} />
-    </div>
+    <>
+      <PageHeader title="用量" />
+      <div className="grid gap-6">
+        {readErr && (
+          <div className="note crit" role="alert">
+            {readErr}
+          </div>
+        )}
+        <Summary keys={keyList} showKeys={showKeys} />
+        <CallLog keys={keyList} showKeys={showKeys} models={granted} />
+      </div>
+    </>
   );
 }
 
@@ -258,10 +267,36 @@ function Summary({ keys, showKeys }: { keys: TenantKey[]; showKeys: boolean }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [group, fromDate, toDate, keyId, tooLong]);
 
+  // The figures the page leads with: the summary's own rows, added up.
+  const totals =
+    rows === null
+      ? null
+      : {
+          requests: rows.reduce((n, r) => n + r.requests, 0),
+          charged: rows.reduce((n, r) => n + r.charged_micro_cny, 0),
+          estimated: rows.some((r) => r.estimated_requests > 0),
+          models: new Set(rows.map((r) => r.model.id ?? r.model.name)).size,
+        };
+  const spanText =
+    fromDate === "" && toDate === ""
+      ? group === "day"
+        ? "最近 30 天（UTC）"
+        : "最近 12 个月（UTC）"
+      : `${fromDate || periodLabel(fallback.from, "day")} – ${toDate || todayUtc()}（UTC）`;
+
   return (
-    <Section title="用量汇总">
-      <div className="panel-notes">
-        <div className="usage-filters">
+    <>
+      <StatGrid className="mb-0 xl:grid-cols-3">
+        <Stat label="调用次数" value={totals ? totals.requests.toLocaleString("en-US") : "—"} foot={spanText} />
+        <Stat
+          label="费用"
+          value={totals ? fmtMicroCny(totals.charged) : "—"}
+          foot={totals?.estimated ? `${spanText}（含估算）` : spanText}
+        />
+        <Stat label="模型" value={totals ? totals.models.toLocaleString("en-US") : "—"} foot={spanText} />
+      </StatGrid>
+      <Section title="用量汇总">
+        <Filters>
           <Field label="汇总方式">
             <select value={group} onChange={(e) => setGroup(e.target.value as "day" | "month")}>
               <option value="day">按天</option>
@@ -275,7 +310,7 @@ function Summary({ keys, showKeys }: { keys: TenantKey[]; showKeys: boolean }) {
             <input type="date" value={toDate} min={fromDate || undefined} onChange={(e) => setToDate(e.target.value)} />
           </Field>
           {showKeys && <KeySelect keys={keys} value={keyId} onChange={setKeyId} />}
-        </div>
+        </Filters>
         <p className="hint">
           按用量发生的时间汇总，不是按计费入账的时间：重新计价后的调整，记在用量发生的那一期。
           {fromDate === "" && toDate === "" && (group === "day" ? "未选日期时汇总最近 30 天（UTC）。" : "未选日期时汇总最近 12 个月（UTC）。")}
@@ -285,39 +320,39 @@ function Summary({ keys, showKeys }: { keys: TenantKey[]; showKeys: boolean }) {
             {err}
           </div>
         )}
-      </div>
-      {rows === null && <Loading />}
-      {rows !== null && rows.length === 0 && !err && !tooLong && <EmptyState text="所选范围内没有用量" mark="route" />}
-      {rows !== null && rows.length > 0 && (
-        <DataTable label="用量汇总">
-          <thead>
-            <tr>
-              <th>期间</th>
-              <th>模型</th>
-              <th className="num">调用次数</th>
-              <th className="num">费用</th>
-              <th>计量</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((r) => (
-              <tr key={`${r.period_start}/${r.model.id ?? r.model.name}`}>
-                <td className="tabular">{periodLabel(r.period_start, group)}</td>
-                <td>{summaryModel(r)}</td>
-                <td className="num">{r.requests}</td>
-                <td className="num">
-                  {fmtMicroCny(r.charged_micro_cny)}
-                  {r.estimated_requests > 0 ? "（含估算）" : ""}
-                </td>
-                <td>
-                  <Quantities q={r.quantities} />
-                </td>
+        {rows === null && <Loading />}
+        {rows !== null && rows.length === 0 && !err && !tooLong && <EmptyState text="所选范围内没有用量" mark="route" />}
+        {rows !== null && rows.length > 0 && (
+          <DataTable label="用量汇总">
+            <thead>
+              <tr>
+                <th>期间</th>
+                <th>模型</th>
+                <th className="num">调用次数</th>
+                <th className="num">费用</th>
+                <th>计量</th>
               </tr>
-            ))}
-          </tbody>
-        </DataTable>
-      )}
-    </Section>
+            </thead>
+            <tbody>
+              {rows.map((r) => (
+                <tr key={`${r.period_start}/${r.model.id ?? r.model.name}`}>
+                  <td className="tabular">{periodLabel(r.period_start, group)}</td>
+                  <td>{summaryModel(r)}</td>
+                  <td className="num">{r.requests}</td>
+                  <td className="num">
+                    {fmtMicroCny(r.charged_micro_cny)}
+                    {r.estimated_requests > 0 ? "（含估算）" : ""}
+                  </td>
+                  <td>
+                    <Quantities q={r.quantities} />
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </DataTable>
+        )}
+      </Section>
+    </>
   );
 }
 
@@ -409,35 +444,33 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
 
   return (
     <Section title="调用记录">
-      <div className="panel-notes">
-        <div className="usage-filters">
-          <Field label="时间（UTC）起" error={range ? null : "结束日期不能早于开始日期"}>
-            <input type="date" value={fromDate} max={toDate || undefined} onChange={(e) => setFromDate(e.target.value)} />
-          </Field>
-          <Field label="时间（UTC）止">
-            <input type="date" value={toDate} min={fromDate || undefined} onChange={(e) => setToDate(e.target.value)} />
-          </Field>
-          {showKeys && <KeySelect keys={keys} value={keyId} onChange={setKeyId} />}
-          <Field label="模型">
-            <select value={modelId} onChange={(e) => setModelId(e.target.value)}>
-              <option value="">全部</option>
-              {models.map((m) => (
-                <option key={m.id} value={m.id}>
-                  {m.name}
-                </option>
-              ))}
-            </select>
-          </Field>
-          <Field label="请求 ID">
-            <input autoComplete="off" value={typed} onChange={(e) => setTyped(e.target.value)} />
-          </Field>
+      <Filters>
+        <Field label="时间（UTC）起" error={range ? null : "结束日期不能早于开始日期"}>
+          <input type="date" value={fromDate} max={toDate || undefined} onChange={(e) => setFromDate(e.target.value)} />
+        </Field>
+        <Field label="时间（UTC）止">
+          <input type="date" value={toDate} min={fromDate || undefined} onChange={(e) => setToDate(e.target.value)} />
+        </Field>
+        {showKeys && <KeySelect keys={keys} value={keyId} onChange={setKeyId} />}
+        <Field label="模型">
+          <select value={modelId} onChange={(e) => setModelId(e.target.value)}>
+            <option value="">全部</option>
+            {models.map((m) => (
+              <option key={m.id} value={m.id}>
+                {m.name}
+              </option>
+            ))}
+          </select>
+        </Field>
+        <Field label="请求 ID">
+          <input autoComplete="off" value={typed} onChange={(e) => setTyped(e.target.value)} />
+        </Field>
+      </Filters>
+      {err && (
+        <div className="note crit" role="alert">
+          {err}
         </div>
-        {err && (
-          <div className="note crit" role="alert">
-            {err}
-          </div>
-        )}
-      </div>
+      )}
       {rows === null && <Loading />}
       {rows !== null && rows.length === 0 && !err && <EmptyState text="所选条件下没有调用记录" mark="log" />}
       {rows !== null && rows.length > 0 && (
@@ -471,6 +504,7 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
                         aria-label={expanded ? "收起明细" : "展开明细"}
                         onClick={() => toggle(c.event_id)}
                       >
+                        <ChevronRight aria-hidden="true" className={expanded ? "rotate-90 transition-transform" : "transition-transform"} />
                         {expanded ? "收起" : "展开"}
                       </Button>
                     </td>
@@ -526,8 +560,8 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
         </DataTable>
       )}
       {next !== null && (
-        <div className="usage-more">
-          <Button busy={more} busyLabel="加载中…" onClick={() => void loadMore()}>
+        <div className="usage-more -mx-6 -mb-6 !mt-0 flex justify-center rounded-b-[11px] border-t border-border bg-muted/40 px-6 py-3 max-[719px]:-mx-4 max-[719px]:-mb-4">
+          <Button size="sm" busy={more} busyLabel="加载中…" onClick={() => void loadMore()}>
             加载更多
           </Button>
         </div>

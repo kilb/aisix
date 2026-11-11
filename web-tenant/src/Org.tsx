@@ -13,6 +13,7 @@ import { formMessageFor, messageFor } from "./lib/errors";
 import { Button } from "./ui/Button";
 import { Field } from "./ui/Field";
 import { Lamp, type LampState } from "./ui/Lamp";
+import { Card, CardHeader, PageHeader, Split, Stat, StatGrid } from "./components/page";
 
 export const ROLE_LABEL: Record<MemberRole, string> = {
   owner: "所有者",
@@ -38,11 +39,12 @@ function cap(value: number | undefined): string {
   return value === undefined ? "不限" : value.toLocaleString("en-US");
 }
 
+/** One reading of the organisation: its label over its value, a cell of the card's grid. */
 function Reading({ label, value, title }: { label: string; value: ReactNode; title?: string }) {
   return (
-    <div className="entry">
+    <div className="entry flex min-w-0 flex-col gap-1.5 px-6 py-5">
       <span className="lab">{label}</span>
-      <span className="val" title={title}>
+      <span className="val text-[15px]" title={title}>
         {value}
       </span>
     </div>
@@ -72,31 +74,42 @@ export function Org({ member, status }: { member: SessionMember; status: TenantS
 
   const shown = org?.status ?? status;
   return (
-    <div className="deck">
-      <div className="panel">
-        <h2>组织</h2>
-        {status === "pending" && (
-          <div className="note warn">组织正在等待平台审核，审核通过后即可创建密钥和邀请成员</div>
-        )}
-        {status === "suspended" && <div className="note crit">组织已被停用，请联系平台</div>}
-        {err && (
-          <div className="note crit" role="alert">
-            {err}
+    <>
+      <PageHeader title="组织" />
+      <Split
+        asideWidth="400px"
+        main={
+          <div className="grid gap-6">
+            {status === "pending" && (
+              <div className="note warn">组织正在等待平台审核，审核通过后即可创建密钥和邀请成员</div>
+            )}
+            {status === "suspended" && <div className="note crit">组织已被停用，请联系平台</div>}
+            {err && (
+              <div className="note crit" role="alert">
+                {err}
+              </div>
+            )}
+            {/* Who the organisation is, and the caller in it: one row of readings. */}
+            <Card className="p-0">
+              <div className="entries grid divide-border max-sm:divide-y sm:grid-cols-3 sm:divide-x">
+                <Reading label="名称" value={org?.name ?? "—"} title={org?.name} />
+                <Reading
+                  label="状态"
+                  value={STATUS_LAMP[shown] ? <Lamp state={STATUS_LAMP[shown]}>{STATUS_LABEL[shown]}</Lamp> : shown}
+                />
+                <Reading label="你的角色" value={ROLE_LABEL[member.role] ?? member.role} />
+              </div>
+            </Card>
+            {/* The caps a key may be given: the figures the key form is held to. */}
+            <StatGrid className="mb-0 xl:grid-cols-2">
+              <Stat label="单个密钥的并发上限" value={org ? cap(org.limits.key_concurrency_max) : "—"} />
+              <Stat label="单个密钥的每分钟请求上限" value={org ? cap(org.limits.key_rpm_max) : "—"} />
+            </StatGrid>
           </div>
-        )}
-        <div className="entries">
-          <Reading label="名称" value={org?.name ?? "—"} title={org?.name} />
-          <Reading
-            label="状态"
-            value={STATUS_LAMP[shown] ? <Lamp state={STATUS_LAMP[shown]}>{STATUS_LABEL[shown]}</Lamp> : shown}
-          />
-          <Reading label="你的角色" value={ROLE_LABEL[member.role] ?? member.role} />
-          <Reading label="单个密钥的并发上限" value={org ? cap(org.limits.key_concurrency_max) : "—"} />
-          <Reading label="单个密钥的每分钟请求上限" value={org ? cap(org.limits.key_rpm_max) : "—"} />
-        </div>
-      </div>
-      <PasswordForm />
-    </div>
+        }
+        aside={<PasswordForm />}
+      />
+    </>
   );
 }
 
@@ -134,9 +147,9 @@ function PasswordForm() {
   }
 
   return (
-    <div className="panel">
-      <h2>修改口令</h2>
-      <form className="form" onSubmit={submit}>
+    <Card>
+      <CardHeader title="修改口令" />
+      <form className="grid gap-4" onSubmit={submit}>
         <Field label="当前口令">
           <input
             type="password"
@@ -158,7 +171,7 @@ function PasswordForm() {
             />
           )}
         </Field>
-        <div className="form-actions">
+        <div className="flex justify-end">
           <Button kind="primary" type="submit" busy={busy}>
             修改口令
           </Button>
@@ -174,6 +187,6 @@ function PasswordForm() {
             {msg.text}
           </div>
         ))}
-    </div>
+    </Card>
   );
 }

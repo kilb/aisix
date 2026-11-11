@@ -5,6 +5,7 @@ import { fmtCnyPerMillion } from "./lib/money";
 import { DataTable, Loading } from "./ui/DataTable";
 import { EmptyState } from "./ui/EmptyState";
 import { RouteNav } from "./ui/RouteNav";
+import { Card, PageHeader } from "./components/page";
 
 function failure(e: unknown): string {
   return e instanceof ApiError ? messageFor(e) : String(e);
@@ -49,37 +50,63 @@ export function Prices({ initialGroup }: { initialGroup: string | null }) {
       ? null
       : (groups.find((g) => g.id === open) ?? groups.find((g) => g.id === initialGroup) ?? groups[0] ?? null);
 
+  const header = <PageHeader title="价格" />;
   if (err !== null) {
     return (
-      <div className="note crit" role="alert">
-        {err}
-      </div>
+      <>
+        {header}
+        <div className="note crit" role="alert">
+          {err}
+        </div>
+      </>
     );
   }
-  if (groups === null) return <Loading />;
+  if (groups === null) {
+    return (
+      <>
+        {header}
+        <Card>
+          <Loading />
+        </Card>
+      </>
+    );
+  }
   if (chosen === null) {
-    return <EmptyState text="运营尚未为本组织分配分组，暂时没有可查看的价格。" />;
+    return (
+      <>
+        {header}
+        <EmptyState text="运营尚未为本组织分配分组，暂时没有可查看的价格。" />
+      </>
+    );
   }
 
   return (
-    <div className="panel">
-      <h2>价格</h2>
-      <RouteNav
-        label="分组"
-        items={groups.map((g) => ({ id: g.id, label: g.display_name }))}
-        current={chosen.id}
-        onSelect={setOpen}
-      />
-      <section id={`tab-${chosen.id}`} role="tabpanel" aria-labelledby={`stop-${chosen.id}`} className="stack">
-        {chosen.description !== "" && <p className="hint">{chosen.description}</p>}
-        <p className="hint">价格以人民币计，按实际用量计费</p>
-        {chosen.models.length === 0 ? (
-          <EmptyState text="该分组暂时没有可计价的模型。" mark="route" />
-        ) : (
-          <PriceTable models={chosen.models} />
-        )}
-      </section>
-    </div>
+    <>
+      {header}
+      <Card>
+        {/* One underline tab per group, across the top of the card. */}
+        <div className="-mx-6 -mt-2 border-b border-border px-4 max-[719px]:-mx-4 max-[719px]:px-2">
+          <RouteNav
+            label="分组"
+            look="underline"
+            items={groups.map((g) => ({ id: g.id, label: g.display_name }))}
+            current={chosen.id}
+            onSelect={setOpen}
+          />
+        </div>
+        <section id={`tab-${chosen.id}`} role="tabpanel" aria-labelledby={`stop-${chosen.id}`} className="bleed">
+          <div className="flex flex-wrap items-baseline justify-between gap-x-6 gap-y-1">
+            {chosen.description !== "" && <p className="text-[14px] text-text-2">{chosen.description}</p>}
+            <p className="hint">价格以人民币计，按实际用量计费</p>
+          </div>
+          {chosen.models.length === 0 ? (
+            <EmptyState text="该分组暂时没有可计价的模型。" mark="route" />
+          ) : (
+            <PriceTable models={chosen.models} />
+          )}
+        </section>
+      </Card>
+    </>
   );
 }
 
