@@ -14,6 +14,8 @@ export default defineConfig({
   build: {
     outDir: "dist",
     emptyOutDir: true,
+    // 字体外置以满足 font-src 'self'；其它资产继续采用 Vite 默认内联策略。
+    assetsInlineLimit: (filePath) => /\.(?:woff2?|ttf|otf)$/i.test(filePath) ? false : undefined,
     rollupOptions: {
       output: {
         // Content hashes in the file names are the only cache invalidation
