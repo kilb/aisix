@@ -48,7 +48,7 @@ test("价格目录可浏览，带来源链接与日期", async ({ page }) => {
       if (entry.source_url) await expect(row.getByRole("link")).toHaveAttribute("href", entry.source_url);
       else await expect(row.getByRole("link")).toHaveCount(0);
       const date = entry.effective_from
-        ? `${new Date(Date.parse(entry.effective_from) + 8 * 3_600_000).toISOString().slice(0, 19).replace("T", " ")} 北京时间`
+        ? `${new Date(Date.parse(entry.effective_from) + 8 * 3_600_000).toISOString().slice(0, 19).replace("T", " ")}`
         : entry.as_of;
       if (date) await expect(row.getByRole("cell").nth(3)).toContainText(date);
     }

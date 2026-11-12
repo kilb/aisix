@@ -109,7 +109,7 @@ export function Org({ member, status }: { member: SessionMember; status: TenantS
   }, [access.usage, access.budgets, access.billing, member.id, member.role, range.from, range.to, refresh]);
 
   const summary = rows === null ? null : summarizeUsage(rows);
-  const rangeLabel = "最近 30 天（北京时间）";
+  const rangeLabel = "最近 30 天";
   const scopeLabel = member.role === "member" ? "你的密钥" : "全组织";
   const retry = () => setRefresh((value) => value + 1);
   const lead = access.usage && summary && !usageErr && summary.requests !== null

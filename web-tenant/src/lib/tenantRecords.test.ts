@@ -36,7 +36,7 @@ new Function("require", "module", "exports", compiled.outputFiles[0]!.text)(crea
 const { renderPage, when } = module.exports as { renderPage: (page: string, usagePage?: string) => string; when: (iso: string) => string };
 
 test("密钥时间跨日固定按北京时间显示", () => {
-  assert.equal(when("2026-11-11T16:05:06Z"), "2026-11-12 00:05:06 北京时间");
+  assert.equal(when("2026-11-11T16:05:06Z"), "2026-11-12 00:05:06");
 });
 
 test("密钥和成员首屏提供公开字段搜索，邀请独立筛选", () => {
@@ -44,7 +44,7 @@ test("密钥和成员首屏提供公开字段搜索，邀请独立筛选", () =>
   const members = renderPage("Members");
   assert.match(members, /搜索成员/);
   assert.match(members, /搜索邀请/);
-  assert.match(members, /北京时间月初/);
+  assert.match(members, /UTC\+8 月初/);
 });
 
 test("用量汇总和调用记录都有独立搜索并解释真实估算来源", () => {

@@ -831,7 +831,7 @@ function NewKeyForm({
           {(aria) => <input inputMode="numeric" value={rpm} onChange={(e) => setRpm(e.target.value)} {...aria} />}
         </Field>
 
-        <Field label="过期时间（北京时间）" wide hint="留空表示永不过期；按北京时间保存" error={errs.expires}>
+        <Field label="过期时间" wide hint="留空表示永不过期；时间采用 UTC+8" error={errs.expires}>
           {(aria) => (
             <input type="datetime-local" value={expires} onChange={(e) => setExpires(e.target.value)} {...aria} />
           )}

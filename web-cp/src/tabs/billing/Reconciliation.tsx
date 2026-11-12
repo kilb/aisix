@@ -261,7 +261,7 @@ export function Reconciliation(_props: TabProps) {
                       <th>凭据</th>
                       <th>实例</th>
                       <th>主机</th>
-                      <th>最近心跳（北京时间）</th>
+                      <th>最近心跳</th>
                       <th>丢弃明细</th>
                     </tr>
                   </thead>

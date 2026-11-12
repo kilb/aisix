@@ -402,3 +402,78 @@ test("key-only-analysis-to-calls-shows-id-and-can-clear-filter", async ({ page }
   const reads = (requests.get(page) ?? []).slice(beforeClear).filter(r => r.path === "/admin/pricing/charges");
   expect(reads.length).toBeGreaterThan(0); expect(new URLSearchParams(reads.at(-1)!.query).has("api_key_id")).toBe(false);
 });
+
+test("routing-default-placeholders-and-time-copy-preserve-values", async ({ page }) => {
+  await login(page);
+  await goto(page, "#analytics?view=requests&" + scope + "&tenant_id=b7928a9a-ba93-4209-92a4-c7fd806ffd9d");
+  for (const [label, instant] of [["开始时间", "2026-11-12T03:12:00.000Z"], ["结束时间", "2026-11-12T03:17:00.000Z"]]) {
+    const value = await page.getByLabel(label!, { exact: true }).inputValue();
+    expect(Date.parse(value + "+08:00")).toBe(Date.parse(instant!));
+  }
+  await expect(page.locator("main")).not.toContainText("北京时间");
+  await expect(page.getByText(/UTC\+8，结束时间不含/).first()).toBeVisible();
+  await metricOracle(page);
+  const before = await browserGet(page, baseUrl + "/admin/resources/models"); expect(before.status()).toBe(200);
+  const modelDocs = (answer: any) => answer.items.map((item: any) => ({ id: item.id, version: item.version, doc: item.doc })).sort((a: any, b: any) => a.id.localeCompare(b.id));
+  const unchanged = modelDocs(await before.json());
+  await goto(page, "#models");
+  await page.getByRole("button", { name: "新增路由模型", exact: true }).click();
+  const manual = page.getByRole("form", { name: "新增路由模型", exact: true });
+  for (const [label, placeholder] of [["权重", "1"], ["优先级", "0"]]) {
+    const field = manual.getByLabel(label!, { exact: true }).first();
+    await field.fill(""); await expect(field).toHaveValue(""); await expect(field).toHaveAttribute("placeholder", placeholder!);
+  }
+  await page.screenshot({ path: join(output, "screenshots", "admin-defaults-manual-1440.png"), fullPage: false });
+  await page.setViewportSize({ width: 390, height: 1000 });
+  await manual.getByLabel("权重", { exact: true }).first().scrollIntoViewIfNeeded();
+  await page.screenshot({ path: join(output, "screenshots", "admin-defaults-manual-390.png"), fullPage: false });
+  await goto(page, "#overview"); await goto(page, "#models");
+  await page.getByRole("button", { name: "新增直连模型", exact: true }).click();
+  const direct = page.getByRole("form", { name: "新增直连模型", exact: true });
+  await direct.getByRole("checkbox", { name: "故障冷却", exact: true }).check();
+  for (const [label, placeholder] of [["默认冷却秒数", "30"], ["Retry-After 上限秒数", "600"]]) {
+    const field = direct.getByLabel(label!, { exact: true }); await expect(field).toHaveValue(""); await expect(field).toHaveAttribute("placeholder", placeholder!);
+  }
+  const after = await browserGet(page, baseUrl + "/admin/resources/models"); expect(after.status()).toBe(200); expect(modelDocs(await after.json())).toEqual(unchanged);
+  await logout(page);
+  const routeSession = resolve(process.env.REFINED_QA_ROUTING_SESSION!);
+  const routeState = JSON.parse(readFileSync(join(routeSession, "public.json"), "utf8"));
+  const routeAuth = JSON.parse(readFileSync(join(routeSession, "local-auth.json"), "utf8"));
+  const fixture = JSON.parse(readFileSync(join(routeSession, "routing-fixture.json"), "utf8"));
+  await login(page, routeAuth.operator, routeState.adminUrl);
+  await page.goto(routeState.adminUrl + "/#public-routes"); await settle(page);
+  await page.getByRole("button", { name: fixture.publicModel.name, exact: true }).click(); await settle(page);
+  const form = page.getByRole("form", { name: `编辑模型「${fixture.publicModel.name}」`, exact: true });
+  const retries = form.getByLabel("重试次数", { exact: true }); const fallback = form.getByLabel("最多切换几个目标", { exact: true });
+  await expect(retries).toHaveValue(""); await expect(retries).toHaveAttribute("placeholder", /^目标未设且有后备时\s+0$/);
+  await expect(fallback).toHaveValue(""); await expect(fallback).toHaveAttribute("placeholder", "3");
+  const view = await browserGet(page, routeState.adminUrl + `/admin/public-models/${fixture.publicModel.id}`); expect(view.status()).toBe(200); const stored = await view.json();
+  expect(stored.effective_routing.targets).toHaveLength(4);
+  for (const key of ["retries", "max_fallbacks"]) expect(Object.hasOwn(stored.routing, key)).toBe(false);
+  const targetDocuments = await Promise.all(stored.effective_routing.targets.map(async (target: any) => {
+    expect(Object.hasOwn(target, "model_id")).toBe(true); expect(typeof target.model_id).toBe("string");
+    const response = await browserGet(page, routeState.adminUrl + `/admin/resources/models/${target.model_id}`); expect(response.status()).toBe(200);
+    const value = await response.json(); expect(Object.hasOwn(value, "doc")).toBe(true); expect(Object.hasOwn(value.doc, "provider_key_id")).toBe(true);
+    return { target, doc: value.doc };
+  }));
+  const matchingTargets = targetDocuments.filter(item => item.doc.provider_key_id === fixture.accounts[0].id); expect(matchingTargets).toHaveLength(1);
+  const targetModelId = matchingTargets[0]!.target.model_id; expect(typeof targetModelId).toBe("string");
+  const beforeTarget = stored.effective_routing.targets.find((target: any) => target.model_id === targetModelId); expect(beforeTarget).toBeTruthy();
+  expect(Object.hasOwn(beforeTarget, "weight")).toBe(true); expect(beforeTarget.weight).toBeGreaterThan(0);
+  const proposedWeight = beforeTarget.weight === 2 ? 3 : 2; expect(proposedWeight).not.toBe(beforeTarget.weight);
+  await form.getByRole("listitem").filter({ hasText: `账号：${fixture.accounts[0].name}` }).getByLabel("权重", { exact: true }).fill(String(proposedWeight));
+  const unsaved = await browserGet(page, routeState.adminUrl + `/admin/public-models/${fixture.publicModel.id}`); expect(unsaved.status()).toBe(200); expect((await unsaved.json()).effective_routing).toEqual(stored.effective_routing);
+  await retries.scrollIntoViewIfNeeded(); await page.screenshot({ path: join(output, "screenshots", "admin-defaults-public-390.png"), fullPage: false });
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  const writePath = `/admin/provider-keys/${fixture.accounts[0].id}/channel-models/${fixture.publicModel.id}`;
+  const write = page.waitForResponse(response => response.request().method() === "PUT" && new URL(response.url()).pathname === writePath);
+  await form.getByRole("button", { name: "保存", exact: true }).click();
+  const writeStatus = (await write).status(); expect(writeStatus).toBeGreaterThanOrEqual(200); expect(writeStatus).toBeLessThan(300); await settle(page);
+  for (const endpoint of [`/admin/public-models/${fixture.publicModel.id}`, `/admin/resources/models/${fixture.publicModel.id}`]) {
+    const answer = await browserGet(page, routeState.adminUrl + endpoint); expect(answer.status()).toBe(200); const value = await answer.json(); const routing = endpoint.includes("/resources/") ? value.doc.routing : value.routing;
+    const effective = endpoint.includes("/resources/") ? value.doc.routing : value.effective_routing;
+    const savedTarget = effective.targets.find((target: any) => target.model_id === targetModelId); expect(savedTarget).toBeTruthy();
+    expect(Object.hasOwn(savedTarget, "weight")).toBe(true); expect(savedTarget.weight).toBe(proposedWeight);
+    for (const key of ["retries", "max_fallbacks"]) expect(Object.hasOwn(routing, key)).toBe(false);
+  }
+});

@@ -352,7 +352,7 @@ function useCostRateWrite(account: CostAccount, onSaved: () => Promise<void>) {
         costRates.write(account.id, { model_id: modelId, cny_per_usd: rate, effective_from }),
       );
       if (sent === "invalid") {
-        setDetails([{ path: "/effective_from", message: "生效时间应写成 年-月-日 时:分，按北京时间计" }]);
+        setDetails([{ path: "/effective_from", message: "生效时间应写成 年-月-日 时:分，按 UTC+8 计" }]);
         focusRefusal();
         return;
       }

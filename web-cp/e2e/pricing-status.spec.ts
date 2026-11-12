@@ -105,7 +105,7 @@ test("每种未计价写明模型和处理办法，可直接打开对应的计�
   await page.getByRole("tab", { name: "价格", exact: true }).click();
   await page.getByRole("button", { name: "计价状态" }).click();
   const table = page.getByRole("table", { name: "未计价的调用" });
-  await expect(table.getByRole("columnheader")).toContainText(["原因", "次数", "模型", "档位 / 分组", "最近一次（北京时间）", "处理"]);
+  await expect(table.getByRole("columnheader")).toContainText(["原因", "次数", "模型", "档位 / 分组", "最近一次", "处理"]);
   // One row for this model: its reason, count, name and what to do about it.
   const row = table.getByRole("row").filter({ hasText: model.name });
   await expect(row).toHaveCount(1);

@@ -362,7 +362,7 @@ test("在生效时间输入框里按回车也绕不过核对声明", async ({ pa
   await expect(panel.getByLabel("模型")).toHaveValue(model.id);
   // A typable 生效时间, which is where a keyboard submit starts.
   await panel.getByRole("checkbox", { name: "立即生效" }).uncheck();
-  const when = panel.getByLabel("生效时间（北京时间）");
+  const when = panel.getByLabel("生效时间");
   // 输入北京墙上时间，预约的绝对时刻仍是一天以后。
   await when.fill(new Date(Date.now() + 86_400_000 + 8 * 3_600_000).toISOString().slice(0, 16).replace("T", " "));
 

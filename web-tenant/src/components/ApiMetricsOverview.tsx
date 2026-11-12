@@ -27,7 +27,7 @@ export function ApiMetricsOverview({ scope, from, to, data, error, onRetry, clas
   ];
   return <BentoGrid className={cn(span.d12, "min-w-0", className)} role="group" aria-label="API 指标概览" aria-busy={!error && !data}>
     <div className={cn(span.d12, "flex flex-wrap items-center justify-between gap-3")}>
-      <p className="text-caption text-muted">{fmtBeijing(data?.from ?? from)} — {fmtBeijing(data?.to ?? to)}（结束时间不含）</p>
+      <p className="text-caption text-muted">{fmtBeijing(data?.from ?? from)} — {fmtBeijing(data?.to ?? to)}（UTC+8，结束时间不含）</p>
       <a href={analysisHref} className="inline-flex min-h-11 min-w-11 items-center text-caption text-ink underline underline-offset-4">查看用量分析 →</a>
     </div>
     <Card className={span.d3} data-metric-kpi="requests">
@@ -58,7 +58,7 @@ export function ApiMetricsOverview({ scope, from, to, data, error, onRetry, clas
     {trends.map(trend => <Card key={trend.title} className={span.d6}>
       <CardHeader title={trend.title} />
       <div className="min-h-64">{data ? <TrendChart points={trend.points} accessibleLabel={trend.title} emptyLabel="所选范围没有可用期间数据" /> : <div aria-hidden="true" className="h-56 rounded-cell bg-ink/7" />}</div>
-      <p className="mt-4 text-caption text-muted">{trend.note}按北京时间汇总，精确值可用键盘逐期查看。</p>
+      <p className="mt-4 text-caption text-muted">{trend.note}按期间汇总，精确值可用键盘逐期查看。</p>
     </Card>)}
   </BentoGrid>;
 }

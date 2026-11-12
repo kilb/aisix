@@ -200,7 +200,7 @@ function BaselineVersion({ revision }: { revision: BaselineRevision }) {
       <p className="baseline-version-id">版本 <span className="tabular">#{revision.revision_id}</span></p>
       <dl className="baseline-version-meta">
         <div>
-          <dt>生效时间（北京时间）</dt>
+          <dt>生效时间</dt>
           <dd className="tabular"><time dateTime={revision.effective_from}>{fmtBeijing(revision.effective_from)}</time></dd>
         </div>
         <div>
@@ -364,7 +364,7 @@ export function Baselines({ canEdit, onGoto }: TabProps) {
                     <th className="num">输入</th>
                     <th className="num">输出</th>
                     <th>来源</th>
-                    <th>生效时间（北京时间）</th>
+                    <th>生效时间</th>
                     <th className="num">待生效</th>
                   </tr>
                 </thead>
@@ -511,7 +511,7 @@ function BaselinePanel({
         baselines.create({ model_id: row.model_id, effective_from, ...body }),
       );
       if (created === "invalid") {
-        setDetails([{ path: "/effective_from", message: "生效时间应写成 年-月-日 时:分，按北京时间计" }]);
+        setDetails([{ path: "/effective_from", message: "生效时间应写成 年-月-日 时:分，按 UTC+8 计" }]);
         focusRefusal();
         return;
       }

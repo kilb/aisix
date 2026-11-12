@@ -218,7 +218,7 @@ export function Topups({ canEdit, refreshShell }: TabProps) {
                 <th>凭证号</th>
                 <th>来源</th>
                 <th>提交人</th>
-                <th>提交时间（北京时间）</th>
+                <th>提交时间</th>
                 <th className="right">操作</th>
               </tr>
             </thead>

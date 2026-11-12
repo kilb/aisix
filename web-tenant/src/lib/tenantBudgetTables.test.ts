@@ -57,7 +57,7 @@ test("周期预算显示后端真实UTC结算起止换算的北京08点，分页
   }));
   const html = budget.quotas(rows);
   assert.equal((html.match(/<tr[ >]/g) ?? []).length, 26);
-  assert.match(html, /2026-11-11 08:00:00 北京时间 至 2026-11-12 08:00:00 北京时间（不含结束时刻）/);
+  assert.match(html, /2026-11-11 08:00:00 至 2026-11-12 08:00:00（不含结束时刻）/);
   assert.match(html, /共 61 条/);
   assert.doesNotMatch(html, /公开密钥-026/);
 });

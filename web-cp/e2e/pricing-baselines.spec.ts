@@ -158,7 +158,7 @@ test("从官方目录设置基准价，显示官方目录来源、来源页链�
     .toISOString()
     .slice(0, 19)
     .replace("T", " ");
-  await expect(priced).toContainText(`${shown} 北京时间`);
+  await expect(priced).toContainText(`${shown}`);
   expect(Date.parse(stored.current.effective_from)).toBeGreaterThanOrEqual(started - 1_000);
 });
 
@@ -205,7 +205,7 @@ test("预约的基准价显示在待生效中", async ({ page }) => {
   // Three days ahead: far enough that no clock skew can make it "now".
   const start = new Date(Date.now() + 3 * 86_400_000);
   const typed = new Date(start.getTime() + 8 * 3_600_000).toISOString().slice(0, 16).replace("T", " ");
-  await panel.getByLabel("生效时间（北京时间）").fill(typed);
+  await panel.getByLabel("生效时间").fill(typed);
   await panel.getByRole("button", { name: "保存" }).click();
   await expect(page.getByText("已保存")).toBeVisible();
 
@@ -215,7 +215,7 @@ test("预约的基准价显示在待生效中", async ({ page }) => {
   await expect(priced).toContainText("未定价");
   await expect(priced.locator("td").nth(5)).toHaveText("1");
   await expect(priced).toContainText("待生效");
-  await expect(priced).toContainText(`${typed}:00 北京时间`);
+  await expect(priced).toContainText(`${typed}:00`);
 
   const stored = (await stack.admin.get("/admin/pricing/baselines")) as Json;
   const listed = stored.items.find((i: Json) => i.model_id === model.id);
@@ -607,17 +607,17 @@ test("生效时间是日历上不存在的日子时报错且不写入；闰年�
   // 2037 is no leap year, April has 30 days, and a day has no 24:00. Each was
   // once read as a valid instant of another day and scheduled there.
   for (const typed of ["2037-02-29 00:00", "2037-04-31 10:00", "2037-01-01 24:00"]) {
-    await panel.getByLabel("生效时间（北京时间）").fill(typed);
+    await panel.getByLabel("生效时间").fill(typed);
     await panel.getByRole("button", { name: "保存" }).click();
-    await expect(panel.getByLabel("生效时间（北京时间）")).toHaveAttribute("aria-invalid", "true");
-    await expect(panel.getByText("生效时间应写成 年-月-日 时:分，按北京时间计")).toBeVisible();
+    await expect(panel.getByLabel("生效时间")).toHaveAttribute("aria-invalid", "true");
+    await expect(panel.getByText("生效时间应写成 年-月-日 时:分，按 UTC+8 计")).toBeVisible();
   }
   const refused = (await stack.admin.get("/admin/pricing/baselines")) as Json;
   const none = refused.items.find((i: Json) => i.model_id === model.id);
   expect(none.current).toBeNull();
   expect(none.upcoming).toHaveLength(0);
 
-  await panel.getByLabel("生效时间（北京时间）").fill("2036-02-29 00:00");
+  await panel.getByLabel("生效时间").fill("2036-02-29 00:00");
   await panel.getByRole("button", { name: "保存" }).click();
   await expect(page.getByText("已保存")).toBeVisible();
   const stored = (await stack.admin.get("/admin/pricing/baselines")) as Json;

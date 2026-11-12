@@ -735,7 +735,7 @@ function CreateForm({
 
   async function submit() {
     if (expires !== "" && parseBeijingInput(expires) === null) {
-      setRefused(refusal(new Error("请填写有效的北京时间"), placedInForm));
+      setRefused(refusal(new Error("请填写有效的时间"), placedInForm));
       focusRefusal();
       return;
     }
@@ -829,11 +829,11 @@ function CreateForm({
         <LimitInput label="每分钟请求" value={rpm} disabled={busy} onChange={setRpm} error={at("/rate_limit/rpm")} />
       </div>
       <TextField
-        label="过期时间（北京时间）"
+        label="过期时间"
         type="datetime-local"
         value={expires}
         onChange={setExpires}
-        hint="留空表示不过期。"
+        hint="留空表示不过期；时间采用 UTC+8。"
         error={at("/expires_at")}
       />
       {refused?.tooOld ? (

@@ -252,7 +252,7 @@ export function Charges(_props: TabProps) {
             <DataTable label="计费明细" scroll>
               <thead>
                 <tr>
-                  <th>时间（北京时间）</th>
+                  <th>时间</th>
                   <th>租户</th>
                   <th>模型</th>
                   <th>状态</th>

@@ -165,8 +165,8 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
     const from = parseBeijingInput(form.from);
     const to = parseBeijingInput(form.to);
     const found: Partial<Record<keyof Form, string>> = {};
-    if (!from) found.from = "请填写开始时间（北京时间）";
-    if (!to) found.to = "请填写结束时间（北京时间）";
+    if (!from) found.from = "请填写开始时间";
+    if (!to) found.to = "请填写结束时间";
     if (from && to && Date.parse(from) >= Date.parse(to)) found.to = "结束时间必须晚于开始时间";
     if (form.reason.trim() === "") found.reason = "请填写重新计价原因（1–500 个字符）";
     setProblems(found);
@@ -292,7 +292,7 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
       >
         <CardHeader number={1} title="新建重新计价" description="按现行价格重新计算过去的调用。预览不会改动费用；确认影响后，由管理员执行。" />
         <div className="grid gap-x-4 tablet:grid-cols-2 desktop:grid-cols-1">
-          <Field label="开始（北京时间）" error={problems.from}>
+          <Field label="开始" error={problems.from}>
             {(aria) => (
               <input
                 {...aria}
@@ -304,7 +304,7 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
               />
             )}
           </Field>
-          <Field label="结束（北京时间）" hint="不得晚于当前时间。" error={problems.to}>
+          <Field label="结束" hint="不得晚于当前时间。" error={problems.to}>
             {(aria) => (
               <input
                 {...aria}
@@ -536,7 +536,7 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
           <DataTable label="重新计价运行">
             <thead>
               <tr>
-                <th>时间（北京时间）</th>
+                <th>时间</th>
                 <th>范围</th>
                 <th>原因</th>
                 <th>状态</th>

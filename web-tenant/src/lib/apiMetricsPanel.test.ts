@@ -78,7 +78,8 @@ test("加载保留完整请求指标标签、期间说明和计数口径，不�
   const markup = renderToStaticMarkup(createElement(ApiMetricsPanel, props));
   const text = markup.replace(/<[^>]+>/g, "");
   for (const label of ["最终请求", "成功率", "失败率（已知结果）", "统计周期平均请求速率", "结果已知的请求", "成功请求", "失败请求", "结果未知的请求", "计费尝试", "最终状态未知的尝试"]) assert.ok(text.includes(label), `加载时仍有${label}位置`);
-  assert.match(text, /按北京时间小时汇总/);
+  assert.match(text, /按小时汇总/);
+  assert.equal((text.match(/UTC\+8/g) ?? []).length, 1);
   assert.match(text, /请求速率是整个查询周期的平均值，不是瞬时 RPS/);
   assert.match(text, /请求数按最终记录统计/);
   assert.doesNotMatch(text, /0%|0 次\/秒|¥0\.00/);
@@ -121,7 +122,8 @@ test("首屏摘要在加载和未知时保留全部指标位置，不用零伪�
 
 test("紧凑概览保留已知结果分母、未知计数和北京时间", () => {
   const text = renderToStaticMarkup(createElement(ApiMetricsPanel, { ...props, compact: true })).replace(/<[^>]+>/g, "");
-  for (const label of ["已知结果样本（分母）", "成功", "失败", "未知", "2026-11-01 08:00:00 北京时间", "无实测值", "待计价尝试"]) assert.ok(text.includes(label), label);
+  for (const label of ["已知结果样本（分母）", "成功", "失败", "未知", "2026-11-01 08:00:00", "无实测值", "待计价尝试"]) assert.ok(text.includes(label), label);
+  assert.equal((text.match(/UTC\+8/g) ?? []).length, 1);
 });
 
 test("固定摘要属于指标概览，不能冒充完整指标区域", () => {

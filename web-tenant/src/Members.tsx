@@ -310,7 +310,7 @@ export function Members({
           </CardFooter>
         </Card>}
         <Card className={span.d12}>
-          <CardHeader number={active ? 3 : 2} title="组织成员" description={active ? "本月用量按 北京时间月初至当前时间统计；成员额度按各自周期计算。" : undefined} />
+          <CardHeader number={active ? 3 : 2} title="组织成员" description={active ? "本月用量按 UTC+8 月初至当前时间统计；成员额度按各自周期计算。" : undefined} />
           {!active && <div className="note crit">组织已被停用；这里只能移除成员。</div>}
           {active && usageErr && <div className="note crit" role="alert">成员用量读取失败：{usageErr}</div>}
           {active && budgetsErr && <div className="note crit" role="alert">成员额度读取失败：{budgetsErr}</div>}

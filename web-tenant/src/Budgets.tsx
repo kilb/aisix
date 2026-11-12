@@ -248,7 +248,7 @@ export function Budgets({ member }: { member: SessionMember }) {
 
   return (
     <>
-      <PageHeader title="预算" eyebrow="BUDGETS · 分级额度" dataLead="账户额度与组织、成员、密钥预算独立生效。多条限制同时存在时，以先用尽者为准。" />
+      <PageHeader title="预算" eyebrow="BUDGETS · 分级额度" dataLead="账户额度与组织、成员、密钥预算独立生效。多条限制同时存在时，以先用尽者为准。周期按 UTC 边界结算，时间显示采用 UTC+8。" />
       <BentoGrid>
         {rowsErr && <div className={cn(span.d12, "note crit")} role="alert">预算读取失败：{rowsErr}</div>}
         {financial && <>
@@ -383,7 +383,7 @@ function QuotaTable({
           <th>对象</th>
           <th>设置方</th>
           <th>类型</th>
-          <th>结算周期（北京时间）</th>
+          <th>结算周期</th>
           <th className="num">限额</th>
           <th className="num">已用</th>
           <th className="num">剩余</th>

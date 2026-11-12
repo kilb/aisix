@@ -959,6 +959,7 @@ function ModelForm({
                         className="text-right tabular-nums"
                         disabled={locked}
                         value={r.weight}
+                        placeholder="1"
                         onChange={(e) => setRow(r.key, { weight: e.target.value })}
                         {...aria}
                       />
@@ -972,6 +973,7 @@ function ModelForm({
                         className="text-right tabular-nums"
                         disabled={locked}
                         value={r.priority}
+                        placeholder="0"
                         onChange={(e) => setRow(r.key, { priority: e.target.value })}
                         {...aria}
                       />

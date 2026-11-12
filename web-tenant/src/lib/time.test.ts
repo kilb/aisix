@@ -15,8 +15,8 @@ test("北京时间日期区间含首尾两天，API 保存 UTC instant", () => {
 });
 
 test("时间和周期标签使用北京日历，跨月跨年不依赖 UTC 日期前缀", () => {
-  assert.equal(fmtBeijing("2026-11-07T13:05:09.987654+00:00"), "2026-11-07 21:05:09 北京时间");
-  assert.equal(fmtBeijing("2026-11-08T01:05:09+08:00"), "2026-11-08 01:05:09 北京时间");
+  assert.equal(fmtBeijing("2026-11-07T13:05:09.987654+00:00"), "2026-11-07 21:05:09");
+  assert.equal(fmtBeijing("2026-11-08T01:05:09+08:00"), "2026-11-08 01:05:09");
   assert.equal(fmtBeijing("not-a-time"), "not-a-time");
   assert.equal(periodLabel("2026-12-31T16:00:00Z", "day"), "2027-01-01");
   assert.equal(periodLabel("2026-12-31T16:00:00Z", "month"), "2027-01");
@@ -51,9 +51,9 @@ test("北京日桶在16Z跨周月年闰日，细粒度边界保持绝对时刻",
 });
 
 test("预算真实UTC结算周期的北京起止仍为08点，不改成北京午夜", () => {
-  assert.equal(budgetPeriodRange("2026-12-01T00:00:00Z", "month"), "2026-12-01 08:00:00 北京时间 至 2027-01-01 08:00:00 北京时间（不含结束时刻）");
-  assert.equal(budgetPeriodRange("2026-11-09T00:00:00Z", "week"), "2026-11-09 08:00:00 北京时间 至 2026-11-16 08:00:00 北京时间（不含结束时刻）");
-  assert.equal(budgetPeriodRange("2028-02-29T00:00:00Z", "day"), "2028-02-29 08:00:00 北京时间 至 2028-03-01 08:00:00 北京时间（不含结束时刻）");
+  assert.equal(budgetPeriodRange("2026-12-01T00:00:00Z", "month"), "2026-12-01 08:00:00 至 2027-01-01 08:00:00（不含结束时刻）");
+  assert.equal(budgetPeriodRange("2026-11-09T00:00:00Z", "week"), "2026-11-09 08:00:00 至 2026-11-16 08:00:00（不含结束时刻）");
+  assert.equal(budgetPeriodRange("2028-02-29T00:00:00Z", "day"), "2028-02-29 08:00:00 至 2028-03-01 08:00:00（不含结束时刻）");
 });
 
 test("显式Asia/Shanghai在不同宿主时区输出一致，去掉timeZone会失败", () => {
@@ -61,7 +61,7 @@ test("显式Asia/Shanghai在不同宿主时区输出一致，去掉timeZone会�
   for (const zone of ["America/Los_Angeles", "Pacific/Kiritimati"]) {
     const result = spawnSync(process.execPath, ["--experimental-strip-types", "--input-type=module", "-e", code], { env: { ...process.env, TZ: zone }, encoding: "utf8" });
     assert.equal(result.status, 0, result.stderr);
-    assert.deepEqual(JSON.parse(result.stdout), ["2027-01-01 00:00:00 北京时间", "2026-12-31T16:00:00.000Z"], zone);
+    assert.deepEqual(JSON.parse(result.stdout), ["2027-01-01 00:00:00", "2026-12-31T16:00:00.000Z"], zone);
   }
 });
 

@@ -458,7 +458,7 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
                       <tr>
                         <th className="import-pick" aria-label="选择" />
                         <th>模型</th>
-                        <th>生效时间（北京时间）</th>
+                        <th>生效时间</th>
                         <th className="num">输入</th>
                         <th className="num">输出</th>
                         <th>标记</th>
@@ -875,7 +875,7 @@ function ConfirmForm({
         imports.confirm(batchId, proposal.id, { model_id: model, effective_from, attested: true });
       const answer = choosing ? await sendAt(resolver.current, send) : await send(proposal.effective_from!);
       if (answer === "invalid") {
-        setDetails([{ path: "/effective_from", message: "生效时间应写成 年-月-日 时:分，按北京时间计" }]);
+        setDetails([{ path: "/effective_from", message: "生效时间应写成 年-月-日 时:分，按 UTC+8 计" }]);
         focusRefusal();
         return;
       }

@@ -402,7 +402,7 @@ export function PublicRoutingForm({
               </select>
             )}
           </Field>
-          <Field label="重试次数" hint="留空用网关的默认值。" error={at("/routing/retries")}>
+          <Field label="重试次数" hint="留空时目标设值优先；目标未设置且仍有后备目标时为 0 次，最后一个目标继承网关配置。" error={at("/routing/retries")}>
             {(aria) => (
               <input
                 type="number"
@@ -410,6 +410,7 @@ export function PublicRoutingForm({
                 step={1}
                 disabled={locked}
                 value={draft.retries}
+                placeholder="目标未设且有后备时 0"
                 onChange={(e) => set("retries", e.target.value)}
                 {...aria}
               />
@@ -423,6 +424,7 @@ export function PublicRoutingForm({
                 step={1}
                 disabled={locked}
                 value={draft.maxFallbacks}
+                placeholder={String(Math.max(0, targets.length + additions.filter((row) => row.accountId !== "").length - 1))}
                 onChange={(e) => set("maxFallbacks", e.target.value)}
                 {...aria}
               />

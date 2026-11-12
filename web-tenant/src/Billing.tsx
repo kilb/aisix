@@ -624,8 +624,8 @@ function TopupList({ reloadKey, onLoaded }: { reloadKey: number; onLoaded: (item
               <th>状态</th>
               <th>来源</th>
               <th>提交人</th>
-              <th>提交时间（北京时间）</th>
-              <th>处理时间（北京时间）</th>
+              <th>提交时间</th>
+              <th>处理时间</th>
               <th>说明</th>
             </tr>
           </thead>
@@ -735,10 +735,10 @@ function Ledger({ topups }: { topups: Topup[] | null }) {
     <>
       <Section number={5} title="余额流水">
         <RecordTableToolbar search={{ value: records.query, onChange: records.setQuery, label: "搜索已加载余额流水", placeholder: "模型、事件 ID、类型" }}>
-          <Field label="开始日期（北京时间）" error={range ? null : "结束日期不能早于开始日期"}>
+          <Field label="开始日期" error={range ? null : "结束日期不能早于开始日期"}>
             <input type="date" value={fromDate} max={toDate || undefined} onChange={(e) => setFromDate(e.target.value)} />
           </Field>
-          <Field label="结束日期（北京时间）">
+          <Field label="结束日期">
             <input type="date" value={toDate} min={fromDate || undefined} onChange={(e) => setToDate(e.target.value)} />
           </Field>
           <Field label="类型">
@@ -763,7 +763,7 @@ function Ledger({ topups }: { topups: Topup[] | null }) {
           <DataTable label="余额流水">
             <thead>
               <tr>
-                <th>时间（北京时间）</th>
+                <th>时间</th>
                 <th>类型</th>
                 <th className="num">金额</th>
                 <th className="num">余额</th>
@@ -862,7 +862,7 @@ function Summary({ range, fromDate, toDate }: { range: { from?: string; to?: str
       }
     >
       <p className="hint">
-        {chosen ? "使用余额流水的日期范围（北京时间）" : group === "day" ? "未选日期时汇总最近 30 天（北京时间）" : "未选日期时汇总最近 12 个月（北京时间）"}
+        {chosen ? "使用余额流水的日期范围" : group === "day" ? "未选日期时汇总最近 30 天" : "未选日期时汇总最近 12 个月"}；时间采用 UTC+8。
       </p>
       <RecordTableToolbar search={{ value: table.query, onChange: table.setQuery, label: "搜索汇总期间", placeholder: "期间日期" }} />
       {err && (

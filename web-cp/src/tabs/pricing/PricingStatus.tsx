@@ -113,7 +113,7 @@ export function PricingStatus({ onGoto }: TabProps) {
                     <th className="num">次数</th>
                     <th>模型</th>
                     <th>档位 / 分组</th>
-                    <th>最近一次（北京时间）</th>
+                    <th>最近一次</th>
                     <th>处理</th>
                     <th className="right">操作</th>
                   </tr>

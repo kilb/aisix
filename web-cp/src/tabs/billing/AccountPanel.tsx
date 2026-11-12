@@ -281,10 +281,10 @@ function useDays(group?: "day" | "month") {
   const backwards = problem !== null;
   const fields = (
     <>
-      <Field label="开始日期（北京时间）">
+      <Field label="开始日期">
         <input type="date" value={from} onChange={(e) => setFrom(e.target.value)} />
       </Field>
-      <Field label="结束日期（北京时间）" error={problem}>
+      <Field label="结束日期" error={problem}>
         {(aria) => <input type="date" value={to} onChange={(e) => setTo(e.target.value)} {...aria} />}
       </Field>
     </>
@@ -397,7 +397,7 @@ function Ledger({ account }: RegionProps) {
           <DataTable label="余额流水" compact>
             <thead>
               <tr>
-                <th>时间（北京时间）</th>
+                <th>时间</th>
                 <th>类型</th>
                 <th className="num">金额</th>
                 <th className="num">余额</th>
@@ -466,7 +466,7 @@ function Summary<T>({
         </Field>
         {days.fields}
       </div>
-      <p className="hint text-caption">未选日期时，按天汇总最近 30 天，按月汇总最近 12 个月（北京时间）。</p>
+      <p className="hint text-caption">未选日期时，按天汇总最近 30 天，按月汇总最近 12 个月（UTC+8）。</p>
       {rows.error ? (
         <Failed message={rows.error} onRetry={() => void rows.reload()} />
       ) : rows.data === null ? (
@@ -605,7 +605,7 @@ function Quotas({ account, quotaRev }: RegionProps) {
   const table = useRecordTable({ items: (budgets.data ?? []).filter((b) => (!scopeFilter || b.scope === scopeFilter) && (!kindFilter || b.kind === kindFilter) && (!quotaStatus || (b.exhausted ? "exhausted" : "available") === quotaStatus)), searchText: (b) => [b.id, b.target.id, b.target.label], resetKey: `${account.tenant_id}:${scopeFilter}:${kindFilter}:${quotaStatus}` });
   return (
     <Region label="额度">
-      <p className="hint">周期预算继续按 UTC 边界结算，起止以北京时间显示。这个租户在每一级设置的额度。组织额度在下方的「组织额度」里设置；成员与密钥的额度由租户自己管理，这里只读。</p>
+      <p className="hint">周期预算继续按 UTC 边界结算，起止以 UTC+8 显示。这个租户在每一级设置的额度。组织额度在下方的「组织额度」里设置；成员与密钥的额度由租户自己管理，这里只读。</p>
       {budgets.error ? (
         <Failed message={budgets.error} onRetry={() => void budgets.reload()} />
       ) : budgets.data === null ? (
@@ -622,7 +622,7 @@ function Quotas({ account, quotaRev }: RegionProps) {
                 <th>对象</th>
                 <th>设置方</th>
                 <th>类型</th>
-                <th>周期（北京时间）</th>
+                <th>周期</th>
                 <th className="num">限额</th>
                 <th className="num">已用</th>
                 <th className="num">剩余</th>

@@ -38,8 +38,8 @@ export function EffectiveFrom({
       </label>
       {!immediate && (
         <Field
-          label="生效时间（北京时间）"
-          hint={<span id={noteId}>价格只能从现在或将来开始生效</span>}
+          label="生效时间"
+          hint={<span id={noteId}>价格只能从现在或将来开始生效；时间采用 UTC+8</span>}
           error={error}
         >
           {(aria) => (

@@ -217,7 +217,7 @@ export function OrgQuota({ account, canEdit, onQuotasChanged }: RegionProps) {
   };
   return (
     <Region label="组织额度">
-      <p className="hint">限制这个租户整个组织的花费，由运维分配。按周期的额度每个周期重新计算，一次性额度用完为止。</p>
+      <p className="hint">限制这个租户整个组织的花费，由运维分配。按周期的额度每个周期重新计算，一次性额度用完为止。周期按 UTC 边界结算，时间显示采用 UTC+8。</p>
       {canEdit && !account.is_internal && <NewQuota key={account.tenant_id} account={account} onCreated={reload} />}
       {account.is_internal ? (
         <p className="hint">平台内部租户不设额度。</p>
@@ -237,7 +237,7 @@ export function OrgQuota({ account, canEdit, onQuotasChanged }: RegionProps) {
           <thead>
             <tr>
               <th>类型</th>
-              <th>周期（北京时间）</th>
+              <th>周期</th>
               <th className="num">限额</th>
               <th className="num">已用</th>
               <th className="num">剩余</th>

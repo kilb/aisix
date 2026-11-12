@@ -325,9 +325,9 @@ function Summary({ keys, showKeys, ownScope, models }: { keys: TenantKey[]; show
   const spanText =
     fromDate === "" && toDate === ""
       ? group === "day"
-        ? "最近 30 天（北京时间）"
-        : "最近 12 个月（北京时间）"
-      : `${fromDate || periodLabel(fallback.from, "day")} – ${toDate || todayBeijing()}（北京时间）`;
+        ? "最近 30 天"
+        : "最近 12 个月"
+      : `${fromDate || periodLabel(fallback.from, "day")} – ${toDate || todayBeijing()}`;
 
   const visualError = !range ? "结束日期不能早于开始日期，请调整汇总筛选。" : tooLong ? "时间范围过大，请缩短汇总区间。" : err;
   const rangeLabel = `${spanText} · ${keyId ? "所选密钥" : ownScope ? "你的密钥" : "全组织"}`;
@@ -338,8 +338,8 @@ function Summary({ keys, showKeys, ownScope, models }: { keys: TenantKey[]; show
     <BentoGrid>
       <div className={span.d12}>
         <Filters>
-          <Field label="开始日期（北京时间）"><input type="date" value={fromDate} onChange={e => setFromDate(e.target.value)} /></Field>
-          <Field label="结束日期（北京时间）"><input type="date" value={toDate} onChange={e => setToDate(e.target.value)} /></Field>
+          <Field label="开始日期"><input type="date" value={fromDate} onChange={e => setFromDate(e.target.value)} /></Field>
+          <Field label="结束日期"><input type="date" value={toDate} onChange={e => setToDate(e.target.value)} /></Field>
           {showKeys && <KeySelect keys={keys} value={keyId} onChange={setKeyId} />}
           <Field label="模型"><select value={query.get("model_id") ?? ""} onChange={event => update({ model_id: event.target.value, from: metricsFrom, to: metricsTo })}><option value="">全部</option>{query.get("model_id") && !models.some(model => model.id === query.get("model_id")) && <option value={query.get("model_id")!}>已选模型（{query.get("model_id")}，当前列表未提供）</option>}{models.map(model => <option key={model.id} value={model.id}>{model.name}</option>)}</select></Field>
         </Filters>
@@ -366,7 +366,7 @@ function Summary({ keys, showKeys, ownScope, models }: { keys: TenantKey[]; show
         <p className="hint">
           按用量发生的时间汇总，不是按计费入账的时间：重新计价后的调整，记在用量发生的那一期。
           调用尝试次数包含最终尝试，以及已计费或重新计价的重试。
-          {fromDate === "" && toDate === "" && (group === "day" ? "未选日期时汇总最近 30 天（北京时间）。" : "未选日期时汇总最近 12 个月（北京时间）。")}
+          {fromDate === "" && toDate === "" && (group === "day" ? "未选日期时汇总最近 30 天。" : "未选日期时汇总最近 12 个月。")}
         </p>
         {err && (
           <div className="note crit" role="alert">
@@ -528,10 +528,10 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
   return (
     <Section title="调用记录" number={8}>
       <Filters>
-        <Field label="时间（北京时间）起" error={range ? null : "结束日期不能早于开始日期"}>
+        <Field label="时间起" error={range ? null : "结束日期不能早于开始日期"}>
           <input type="date" value={fromDate} max={toDate || undefined} onChange={(e) => setFromDate(e.target.value)} />
         </Field>
-        <Field label="时间（北京时间）止">
+        <Field label="时间止">
           <input type="date" value={toDate} min={fromDate || undefined} onChange={(e) => setToDate(e.target.value)} />
         </Field>
         {showKeys && <KeySelect keys={keys} value={keyId} onChange={setKeyId} />}
@@ -570,7 +570,7 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
               <th>
                 <span className="vh">明细</span>
               </th>
-              <th>时间（北京时间）</th>
+              <th>时间</th>
               <th>模型</th>
               <th>密钥</th>
               <th>成员</th>

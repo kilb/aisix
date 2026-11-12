@@ -405,3 +405,37 @@ test("unknown-url-key-and-model-stay-visible-and-never-become-all", async ({ pag
   for (const read of allCleared) { expect(new URLSearchParams(read.query).has("api_key_id")).toBe(false); expect(new URLSearchParams(read.query).has("model_id")).toBe(false); }
   await expect(page.getByRole("table", { name: "调用记录", exact: true }).locator("tbody tr")).toHaveCount(4);
 });
+
+test("time-label-copy-keeps-utc-plus-eight-values-and-budget-boundaries", async ({ page }) => {
+  await login(page); await goto(page, "#usage?view=requests&" + scope);
+  await expect(page.getByLabel("开始日期", { exact: true })).toHaveValue("2026-11-12");
+  await expect(page.getByLabel("结束日期", { exact: true })).toHaveValue("2026-11-12");
+  await expect(page.locator("main")).not.toContainText("北京时间");
+  await expect(page.getByText(/UTC\+8，结束时间不含/).first()).toBeVisible(); await metricOracle(page);
+  await goto(page, "#calls");
+  const table = page.getByRole("table", { name: "调用记录", exact: true }); await expect(table.locator("tbody tr")).toHaveCount(4);
+  await expect(page.getByLabel("时间起", { exact: true })).toHaveValue(""); await expect(page.getByLabel("时间止", { exact: true })).toHaveValue("");
+  const headings = await table.getByRole("columnheader").allTextContents(); const column = headings.findIndex(text => text.trim() === "时间"); expect(column).toBeGreaterThanOrEqual(0);
+  const answer = await browserGet(page, baseUrl + "/api/usage/calls?limit=25"); expect(answer.status()).toBe(200); const calls = (await answer.json()).items; expect(calls).toHaveLength(4);
+  const utc8 = (value: string) => new Date(Date.parse(value) + 8 * 3600_000).toISOString().slice(0, 19).replace("T", " ");
+  for (const call of calls) {
+    expect(Object.hasOwn(call, "occurred_at")).toBe(true); expect(Object.hasOwn(call, "request_id")).toBe(true);
+    const row = table.getByRole("row").filter({ hasText: call.request_id }); await expect(row).toHaveCount(1);
+    await expect(row.getByRole("cell").nth(column)).toHaveText(utc8(call.occurred_at));
+  }
+  await expect(page.locator("main")).not.toContainText("北京时间");
+  await page.screenshot({ path: join(output, "screenshots", "tenant-time-copy-1440.png"), fullPage: false });
+  await page.setViewportSize({ width: 390, height: 1000 }); await page.screenshot({ path: join(output, "screenshots", "tenant-time-copy-390.png"), fullPage: false });
+  await logout(page); await page.reload(); await expect(page.getByLabel("邮箱", { exact: true })).toBeVisible();
+  const owner = JSON.parse(readFileSync(join(session, "fixture-private.json"), "utf8")).owner; await login(page, owner); await goto(page, "#budgets");
+  const budgets = await browserGet(page, baseUrl + "/api/budgets"); expect(budgets.status()).toBe(200); const periodic = (await budgets.json()).items.filter((item: any) => item.kind === "periodic"); expect(periodic).toHaveLength(3);
+  for (const budget of periodic) {
+    for (const key of ["period_start", "period", "counted_from"]) expect(Object.hasOwn(budget, key)).toBe(true);
+    const start = new Date(budget.period_start); expect(start.getUTCHours()).toBe(0); expect(start.getUTCMinutes()).toBe(0);
+    const end = new Date(start); if (budget.period === "month") { expect(start.getUTCDate()).toBe(1); end.setUTCMonth(end.getUTCMonth() + 1); } else { expect(["day", "week"]).toContain(budget.period); end.setUTCDate(end.getUTCDate() + (budget.period === "week" ? 7 : 1)); }
+    const range = utc8(start.toISOString()) + " 至 " + utc8(end.toISOString()) + "（不含结束时刻）";
+    expect(range).toMatch(/08:00:00 至 .*08:00:00/);
+    const row = page.getByRole("row").filter({ hasText: budget.target.label }).filter({ hasText: range }); await expect(row).toHaveCount(1); await expect(row.getByRole("cell", { name: range, exact: true })).toHaveCount(1);
+  }
+  await expect(page.locator("main")).not.toContainText("北京时间");
+});

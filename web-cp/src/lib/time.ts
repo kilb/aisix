@@ -22,10 +22,10 @@ export function beijingInputValue(at: Date): string {
   return `${part("year").padStart(4, "0")}-${part("month")}-${part("day")}T${part("hour")}:${part("minute")}:${part("second")}`;
 }
 
-/** 展示时标出时区；无法解析的值仍按原样展示。 */
+/** 显示固定时区的日期和时间；无法解析的值仍按原样展示。 */
 export function fmtBeijing(iso: string): string {
   const at = new Date(iso);
-  return Number.isNaN(at.getTime()) ? iso : `${beijingInputValue(at).replace("T", " ")} 北京时间`;
+  return Number.isNaN(at.getTime()) ? iso : `${beijingInputValue(at).replace("T", " ")}`;
 }
 
 export function todayBeijing(now: Date = new Date()): string {
