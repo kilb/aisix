@@ -505,6 +505,131 @@ async fn an_upload_fills_the_library_and_the_browse_finds_by_name_or_provider() 
     assert!(cohere["total"].as_u64().unwrap_or_default() > 2, "{cohere}");
 }
 
+#[tokio::test]
+async fn browsing_pages_the_matching_library_in_stable_provider_model_order() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    // 打乱供应商和模型的输入顺序，保证去掉排序后检查会失败；价格原文保持不变。
+    let mut data: Vec<BTreeMap<String, Box<RawValue>>> =
+        serde_json::from_str(&snapshot()).expect("dataset providers");
+    data.reverse();
+    for provider in &mut data {
+        let raw_models = provider.get_mut("models").expect("provider models");
+        let mut models: Vec<Box<RawValue>> =
+            serde_json::from_str(raw_models.get()).expect("dataset models");
+        models.reverse();
+        *raw_models = RawValue::from_string(serde_json::to_string(&models).expect("models JSON"))
+            .expect("raw models JSON");
+    }
+    let upload_body = format!(
+        r#"{{"dataset_ref":"v2-7de757d-paging","data":{}}}"#,
+        serde_json::to_string(&data).expect("dataset JSON")
+    );
+    let uploaded = cp
+        .send_raw(
+            "POST",
+            UPLOAD,
+            Some(op.cookie()),
+            Some("application/json"),
+            Some(upload_body.into_bytes()),
+        )
+        .await;
+    assert_eq!(uploaded.status, 201, "{uploaded:?}");
+    let viewer = cp.admin_login_seeded(OperatorRole::Viewer).await;
+
+    // 从已提交的数据集独立取记录标识，不以产品解析器推导期望顺序。
+    #[derive(Deserialize)]
+    struct Provider {
+        id: String,
+        models: Vec<Model>,
+    }
+    #[derive(Deserialize)]
+    struct Model {
+        id: String,
+    }
+    let providers: Vec<Provider> = serde_json::from_str(&snapshot()).expect("dataset providers");
+    let mut expected: Vec<(String, String)> = providers
+        .into_iter()
+        .flat_map(|p| p.models.into_iter().map(move |m| (p.id.clone(), m.id)))
+        .collect();
+    expected.sort();
+    let keys = |page: &Value| -> Vec<(String, String)> {
+        page["items"]
+            .as_array()
+            .expect("items are present")
+            .iter()
+            .map(|entry| {
+                (
+                    entry["provider"].as_str().expect("provider").to_owned(),
+                    entry["model"].as_str().expect("model").to_owned(),
+                )
+            })
+            .collect()
+    };
+
+    let first = get(&cp, &viewer, &format!("{LIBRARY}?limit=4&offset=0")).await;
+    let second = get(&cp, &viewer, &format!("{LIBRARY}?limit=4&offset=4")).await;
+    assert_eq!(first["total"].as_u64(), Some(expected.len() as u64));
+    assert_eq!(second["total"], first["total"]);
+    assert_eq!(second["library"]["id"], first["library"]["id"]);
+    assert_eq!(keys(&first), expected[..4]);
+    assert_eq!(keys(&second), expected[4..8]);
+    assert_eq!(
+        keys(&get(&cp, &viewer, &format!("{LIBRARY}?limit=4")).await),
+        expected[..4],
+        "omitting offset still starts at the first matching entry"
+    );
+    assert_eq!(
+        keys(&get(&cp, &viewer, &format!("{LIBRARY}?limit=4&offset=4")).await),
+        expected[4..8],
+        "reading a page again keeps its order"
+    );
+
+    let matching: Vec<_> = expected
+        .iter()
+        .filter(|(provider, model)| provider.contains("cohere") || model.contains("cohere"))
+        .cloned()
+        .collect();
+    assert!(
+        matching.len() > 8 && matching.len() % 4 != 0,
+        "the fixture exercises a partial last page"
+    );
+    let mut read = Vec::new();
+    for offset in (0..matching.len()).step_by(4) {
+        let page = get(
+            &cp,
+            &viewer,
+            &format!("{LIBRARY}?q=COHERE&limit=4&offset={offset}"),
+        )
+        .await;
+        assert_eq!(page["total"].as_u64(), Some(matching.len() as u64));
+        read.extend(keys(&page));
+    }
+    assert_eq!(read, matching, "all matching rows are returned once");
+    let past_end = get(
+        &cp,
+        &viewer,
+        &format!("{LIBRARY}?q=cohere&limit=4&offset={}", matching.len()),
+    )
+    .await;
+    assert_eq!(past_end["total"].as_u64(), Some(matching.len() as u64));
+    assert!(keys(&past_end).is_empty());
+
+    for query in ["offset=-1", "offset=oops", "offset=0&unknown=1"] {
+        let response = cp
+            .send(
+                "GET",
+                &format!("{LIBRARY}?{query}"),
+                Some(viewer.cookie()),
+                None,
+            )
+            .await;
+        assert_eq!(response.status, 422, "{query}: {response:?}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Syncing.
 // ---------------------------------------------------------------------------

@@ -31,21 +31,30 @@ async function openCatalogue(page: Page): Promise<void> {
 test("价格目录可浏览，带来源链接与日期", async ({ page }) => {
   const { items } = (await stack.admin.get("/admin/pricing/catalogue")) as { items: Json[] };
   expect(items.length).toBeGreaterThan(1);
-  const first = items[0];
-  const last = items[items.length - 1];
-
   await openCatalogue(page);
   const table = page.getByRole("table", { name: "价格目录" });
   await expect(table.getByRole("columnheader")).toContainText(["条目", "别名", "来源", "日期", "说明"]);
-  // One row per entry, plus the header row.
-  await expect(table.getByRole("row")).toHaveCount(items.length + 1);
-
-  for (const entry of [first, last]) {
-    const row = table.getByRole("row", { name: new RegExp(entry.key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")) }).first();
-    await expect(row.getByRole("link")).toHaveAttribute("href", entry.source_url);
-    // The date column (the fourth cell), not the notes, which quote dates too.
-    await expect(row.getByRole("cell").nth(3)).toContainText(entry.effective_from ?? entry.as_of);
+  const pager = page.getByRole("navigation", { name: "价格目录分页" });
+  await pager.getByLabel("价格目录分页每页条数").selectOption("10");
+  // 逐页核对完整目录，不能把第一页当成全部，也不能漏掉同一标识的后续版本。
+  for (let offset = 0; offset < items.length; offset += 10) {
+    const segment = items.slice(offset, offset + 10);
+    const rows = table.locator("tbody > tr");
+    await expect(rows).toHaveCount(segment.length);
+    for (let index = 0; index < segment.length; index += 1) {
+      const entry = segment[index];
+      const row = rows.nth(index);
+      await expect(row.getByRole("cell").nth(0)).toHaveText(entry.key);
+      if (entry.source_url) await expect(row.getByRole("link")).toHaveAttribute("href", entry.source_url);
+      else await expect(row.getByRole("link")).toHaveCount(0);
+      const date = entry.effective_from
+        ? `${new Date(Date.parse(entry.effective_from) + 8 * 3_600_000).toISOString().slice(0, 19).replace("T", " ")} 北京时间`
+        : entry.as_of;
+      if (date) await expect(row.getByRole("cell").nth(3)).toContainText(date);
+    }
+    if (offset + 10 < items.length) await pager.getByRole("button", { name: "下一页" }).click();
   }
+  await expect(pager.getByRole("button", { name: "下一页" })).toBeDisabled();
 });
 
 test("展开一条，以只读 JSON 看到它的价目卡", async ({ page }) => {

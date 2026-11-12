@@ -1,6 +1,7 @@
 import type { UsageSummaryRow } from "../lib/api";
 import { exactRatio, normalizeExactValues, summarizeUsage } from "../lib/chartFormat";
-import { fmtMicroCny, periodLabel, todayUtc } from "../lib/money";
+import { fmtMicroCny } from "../lib/money";
+import { periodLabel, todayBeijing } from "../lib/time";
 import { RankBars, TrendChart } from "./charts";
 import { Card, CardFooter, CardHeader, CardMessage, ChartSkeleton, Metric, MetricSkeleton } from "./page";
 
@@ -28,7 +29,7 @@ function trendPoints(summary: Summary, field: "requests" | "chargedMicroCny", gr
 /** 只有真实当前期间使用强调色，历史查询的末期不自动视为今天。 */
 function currentPeriod(summary: Summary, group: "day" | "month"): number | undefined {
   const length = group === "day" ? 10 : 7;
-  const index = summary.periods.findIndex((period) => period.label.slice(0, length) === todayUtc().slice(0, length));
+  const index = summary.periods.findIndex((period) => periodLabel(period.label, group) === todayBeijing().slice(0, length));
   return index < 0 ? undefined : index;
 }
 

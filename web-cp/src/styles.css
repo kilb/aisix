@@ -4,7 +4,7 @@
    Imported into the `legacy` layer (index.css), so a utility on an element
    overrides anything here. */
 
-/* 标记与顶部导航沿用同一暖石设计；强调点只表示当前入口。 */
+/* 品牌保留深色方标与橙点，交互强调使用共享品牌色。 */
 .brand-mark {
   position: relative;
   display: inline-block;
@@ -12,7 +12,7 @@
   width: 32px;
   height: 32px;
   border-radius: var(--r-chip);
-  background: var(--primary);
+  background: var(--mark-tile);
 }
 .brand-mark::after {
   content: "";
@@ -22,7 +22,7 @@
   top: 8px;
   right: 7px;
   border-radius: var(--r-round);
-  background: var(--brand);
+  background: var(--brand-dot);
 }
 .cp-shell {
   min-height: 100vh;
@@ -849,3 +849,19 @@ td select {
   .bento-page-header { gap: 12px; margin-bottom: 20px; }
   .bento-page-header > :first-child { flex-basis: 100%; }
 }
+
+/* 账号设置使用资料与安全两栏；移动端按任务顺序纵向排列。 */
+.account-settings-grid { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); align-items: start; gap: 24px; }
+.account-settings-grid > .panel { margin: 0; }
+.account-profile-list { display: block; }
+.account-profile-list dd { overflow-wrap: anywhere; }
+.account-password-form { display: grid; gap: 16px; max-width: 560px; }
+.account-password-form > .field { margin: 0; }
+.account-form-actions { display: flex; justify-content: flex-start; gap: 8px; padding-top: 8px; }
+.account-session { grid-column: 1 / -1; }
+.account-session .bento-card-header { align-items: center; }
+.bento-card-index { display: none; }
+.bento-page-header .font-mono, .bento-card-header .font-mono, .bento-stat .font-mono { font-family: var(--font-sans); letter-spacing: 0; }
+.metric { font-weight: 500; }
+@media (max-width: 899px) { .account-settings-grid { grid-template-columns: minmax(0, 1fr); gap: 16px; } }
+@media (max-width: 719px) { .panel { --pad: 16px; } }

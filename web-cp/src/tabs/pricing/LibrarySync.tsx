@@ -11,7 +11,8 @@ import {
 } from "../../lib/api";
 import { messageFor } from "../../lib/errors";
 import { errorText } from "../../lib/fmt";
-import { fmtUtc } from "../../lib/money";
+import { fmtBeijing } from "../../lib/time";
+import { useRecordTable } from "../../lib/recordTable";
 import { droppedFieldText, flagText } from "../../lib/importReview";
 import {
   byState,
@@ -25,6 +26,7 @@ import { TIER_HINT } from "../../lib/rateUnits";
 import { safeHttpUrl } from "../../lib/safeUrl";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
+import { RecordTablePager, RecordTableToolbar } from "../../ui/RecordTable";
 import { EmptyState } from "../../ui/EmptyState";
 import { useToast } from "../../ui/Toast";
 import { cn } from "../../lib/cn";
@@ -80,7 +82,7 @@ function PriceComparison({ name, current, entry }: { name: string; current: Base
   return <div className="library-price-comparison">
     <Button type="button" kind="quiet" size="sm" aria-expanded={open} aria-controls={open ? id : undefined} aria-label={`${open ? "收起" : "展开"} ${name} 的完整价格对照`} onClick={() => setOpen((value) => !value)}>{open ? "收起完整价格对照" : "展开完整价格对照"}</Button>
     {open && <div id={id} className="library-price-comparison-grid" role="region" aria-label={`${name} 的完整价格对照`}>
-      <section><h3>现行基准价</h3>{current ? <><p className="cell-note">版本 #{current.revision_id} · 生效于 {fmtUtc(current.effective_from)}</p><PriceCardDetails card={current.card} label={`${name} 的现行完整基准价`} compact /></> : <p className="hint">未定价</p>}</section>
+      <section><h3>现行基准价</h3>{current ? <><p className="cell-note">版本 #{current.revision_id} · 生效于 {fmtBeijing(current.effective_from)}</p><PriceCardDetails card={current.card} label={`${name} 的现行完整基准价`} compact /></> : <p className="hint">未定价</p>}</section>
       <section><h3>价格库目标价</h3>{entry ? <><p className="cell-note">{entry.provider}/{entry.model}</p><PriceCardDetails card={entry.card} label={`${name} 的目标完整价格`} compact /></> : <p className="hint">选择价格来源后查看目标完整价格。</p>}</section>
     </div>}
   </div>;
@@ -208,10 +210,8 @@ function Chosen({ item, onForget }: { item: SyncItem; onForget: () => void }) {
  * choice is written with the sync so later ones need it again only when the
  * entry leaves the library. 重新选择 forgets it.
  *
- * The confirmation sends exactly the rows on screen, each with the entry and
- * the card shown, so the control plane writes those and nothing else: a model
- * that appeared, or a price that moved, since the preview is refused, and the
- * page reads the preview again.
+ * 确认范围是完整预览中的可写模型，不随筛选或翻页变化。每项携带预览的
+ * 条目与价格卡；预览后新增的模型或变化的价格会被拒绝并重新读取。
  */
 export function LibrarySync({ canEdit, generation, cardNumber = 4 }: { canEdit: boolean; generation: number; cardNumber?: number }) {
   const toast = useToast();
@@ -227,6 +227,7 @@ export function LibrarySync({ canEdit, generation, cardNumber = 4 }: { canEdit: 
    * Nothing is chosen by default.
    */
   const [chosenKeys, setChosenKeys] = useState<Record<string, string | undefined>>({});
+  const [stateFilter, setStateFilter] = useState("");
   /** The newest preview asked for: an answer to an older one is dropped. */
   const latest = useRef(0);
 
@@ -260,6 +261,14 @@ export function LibrarySync({ canEdit, generation, cardNumber = 4 }: { canEdit: 
     const c = chosen[item.model_id];
     return c ? { ...item, state: c.state, entry: c } : item;
   };
+  const table = useRecordTable({
+    items: items.filter((item) => !stateFilter || shown(item).state === stateFilter),
+    searchText: (item) => {
+      const entry = shown(item).entry;
+      return [item.name, item.model_id, entry ? keyOf(entry) : ""];
+    },
+    resetKey: `${preview?.library?.id ?? ""}/${generation}/${stateFilter}`,
+  });
 
   const request = preview ? syncRequest(items, preview.cap, chosen) : [];
   const writable = items.filter((i) => {
@@ -392,6 +401,10 @@ export function LibrarySync({ canEdit, generation, cardNumber = 4 }: { canEdit: 
               同步失败：{failure}
             </div>
           )}
+          <RecordTableToolbar search={{ value: table.query, onChange: table.setQuery, label: "搜索同步预览", placeholder: "按模型名称、ID 或供应商搜索" }}>
+            <label className="field mb-0"><span className="field-label">同步状态</span><select value={stateFilter} onChange={(e) => setStateFilter(e.target.value)}><option value="">全部状态</option>{counts.map(([label, state]) => <option key={state} value={state}>{label}</option>)}</select></label>
+            <p className="hint mb-0">已读取完整预览；筛选和翻页不改变同步范围。</p>
+          </RecordTableToolbar>
           <div className="library-sync-table"><DataTable label="同步预览">
             <thead>
               <tr>
@@ -403,7 +416,8 @@ export function LibrarySync({ canEdit, generation, cardNumber = 4 }: { canEdit: 
               </tr>
             </thead>
             <tbody>
-              {items.map((item) => {
+              {table.rows.length === 0 && <tr><td colSpan={5}><EmptyState text="没有符合筛选条件的同步预览" /></td></tr>}
+              {table.rows.map((item) => {
                 const row = shown(item);
                 const warning =
                   row.state === "ambiguous" || row.state === "unmatched"
@@ -450,6 +464,7 @@ export function LibrarySync({ canEdit, generation, cardNumber = 4 }: { canEdit: 
               })}
             </tbody>
           </DataTable></div>
+          <RecordTablePager page={table.page} pageSize={table.pageSize} onPageChange={table.setPage} onPageSizeChange={table.setPageSize} total={table.filteredCount} label="同步预览分页" />
         </>
       )}
     </Card>

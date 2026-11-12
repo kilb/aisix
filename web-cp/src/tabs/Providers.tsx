@@ -15,6 +15,8 @@ import { Card, CardHeader, PageHeader } from "../components/page";
 import { cn } from "../lib/cn";
 import { Button } from "../ui/Button";
 import { DataTable, Loading } from "../ui/DataTable";
+import { useRecordTable } from "../lib/recordTable";
+import { RecordTableToolbar, RecordTablePager } from "../ui/RecordTable";
 import { EmptyState } from "../ui/EmptyState";
 import { GroupPicker, groupChoices, useLoad, type GroupChoice } from "./Tenants";
 import { ChannelModels } from "./providers/ChannelModels";
@@ -96,6 +98,8 @@ export function Providers({ canEdit }: TabProps) {
   const [deleting, setDeleting] = useState<string | null>(null);
   const [deleteFailure, setDeleteFailure] = useState<{ name: string; error: ApiError } | null>(null);
   const [busy, setBusy] = useState(false);
+  const [adapterFilter, setAdapterFilter] = useState("");
+  const accountTable = useRecordTable({ items: (pk.items ?? []).filter((a) => adapterFilter === "" || a.doc.adapter === adapterFilter), resetKey: adapterFilter, searchText: (a) => [nameOf(a), a.id, a.doc.adapter ?? "", a.doc.provider ?? "", ...(a.doc.groups ?? [])] });
 
   useEffect(() => {
     let live = true;
@@ -300,6 +304,7 @@ export function Providers({ canEdit }: TabProps) {
             className="mb-0"
             actions={pk.items && <span className="text-caption text-muted tabular-nums">{pk.items.length} 个</span>}
           />
+          <RecordTableToolbar search={{ value: accountTable.query, onChange: accountTable.setQuery, label: "搜索上游账号", placeholder: "名称、标识、协议族、供应商或分组" }}><label className="text-caption">协议族<select value={adapterFilter} onChange={(e) => setAdapterFilter(e.target.value)}><option value="">全部协议族</option>{[...new Set((pk.items ?? []).map((a) => a.doc.adapter).filter((a): a is string => Boolean(a)))].sort().map((adapter) => <option key={adapter} value={adapter}>{adapter}</option>)}</select></label></RecordTableToolbar>
           {pk.items === null ? (
             !pk.error && <Loading />
           ) : pk.items.length === 0 ? (
@@ -318,7 +323,7 @@ export function Providers({ canEdit }: TabProps) {
                 </tr>
               </thead>
               <tbody>
-                {pk.items.map((a) => (
+                {accountTable.rows.map((a) => (
                   <tr key={a.id} className={editing?.id === a.id ? "bg-well" : undefined}>
                     <td className="font-medium">
                       <span className={cn("block truncate", split ? "max-w-[12rem]" : "max-w-[18rem]")} title={nameOf(a)}>
@@ -387,6 +392,7 @@ export function Providers({ canEdit }: TabProps) {
               </tbody>
             </DataTable>
           )}
+          <RecordTablePager {...accountTable} total={accountTable.filteredCount} onPageChange={accountTable.setPage} onPageSizeChange={accountTable.setPageSize} label="上游账号分页" />
         </Card>
         {editing && (
           // 模型映射独立于账号表单，操作按钮不会提交账号文档。

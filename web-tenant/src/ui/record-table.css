@@ -1,0 +1,69 @@
+.record-table-toolbar {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 12px;
+  margin: 16px 0;
+}
+.record-table-toolbar > * { min-width: 0; }
+.record-table-search {
+  flex: 1 1 240px;
+  max-width: 420px;
+}
+.record-table-toolbar :is(input, select),
+.record-table-pager select {
+  min-height: 44px;
+  max-width: 100%;
+}
+.record-table-pager {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+  font-size: 13px;
+}
+.record-table-count {
+  margin: 0;
+  color: var(--muted-foreground);
+  font-variant-numeric: tabular-nums;
+}
+.record-table-navigation {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.record-table-page-size {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted-foreground);
+}
+.record-table-page-size select {
+  min-width: 76px;
+  padding: 8px 12px;
+  border: 1px solid var(--input);
+  border-radius: var(--r-chip);
+  background: var(--card);
+  color: var(--foreground);
+  font-variant-numeric: tabular-nums;
+}
+.record-table-pager :is(button, select):focus-visible,
+.record-table-toolbar :is(input, select):focus-visible,
+.dt-wrap:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+.dt-wrap { min-width: 0; max-width: 100%; }
+@media (max-width: 719px) {
+  .record-table-search { max-width: none; }
+  .record-table-toolbar > :is(.field, .f, label) { flex: 1 1 100%; width: 100%; }
+  .record-table-navigation { width: 100%; }
+  .record-table-page-size { margin-right: auto; }
+}

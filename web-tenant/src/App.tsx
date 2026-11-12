@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useState } from "react";
 import {
   ApiError,
   logout,
@@ -7,12 +7,14 @@ import {
   type Session,
   type SessionMember,
   type SessionTenant,
-  type TenantStatus,
 } from "./lib/api";
 import { EXPECTED_API_CONTRACT } from "./lib/contract";
 import { messageFor } from "./lib/errors";
 import { useTheme } from "./lib/useTheme";
 import { Button } from "./ui/Button";
+import { UserRound } from "lucide-react";
+import { AccountSettings } from "./AccountSettings";
+import { PORTAL_TABS as TABS, canSeePortalTab, portalRouteOf as routeOf, type PortalTabId } from "./lib/navigation";
 import { RouteNav } from "./ui/RouteNav";
 import { SidebarMenuButton, SidebarShell } from "./ui/Sidebar";
 import { ThemeToggle } from "./ui/ThemeToggle";
@@ -25,67 +27,7 @@ import { Budgets } from "./Budgets";
 import { Prices } from "./Prices";
 import { Usage } from "./Usage";
 
-const TABS = [
-  { id: "org", label: "组织" },
-  { id: "keys", label: "密钥" },
-  { id: "prices", label: "价格" },
-  { id: "members", label: "成员" },
-  { id: "usage", label: "用量" },
-  { id: "budgets", label: "预算" },
-  { id: "billing", label: "账户" },
-] as const;
-
-export type TabId = (typeof TABS)[number]["id"];
-
-/**
- * What the address asks for, when it names a section: `#<tab>` or
- * `#<tab>?group=<id>`. The portal is one page whose sections are state, so
- * the fragment is the only part of the address a link can carry; it is read
- * once at boot (`#prices?group=<id>` from a key form's 查看价格) and again
- * whenever it changes while the page is open. A fragment that names no
- * known tab opens the organisation, as an absent one does.
- */
-function routeOf(hash: string): { tab: TabId; group: string | null } {
-  const [name, query = ""] = hash.replace(/^#/, "").split("?", 2);
-  const tab = TABS.find((t) => t.id === name)?.id ?? "org";
-  const group = new URLSearchParams(query).get("group");
-  return { tab, group: group === "" ? null : group };
-}
-
-/**
- * Whether `member` sees tab `id` of an organisation in state `status`. A
- * billing member holds no keys and only owners and admins manage members;
- * a role a newer control plane adds sees the organisation only, until this
- * build knows it.
- *
- * An active organisation has every page. A suspended one keeps its keys and
- * members pages, which then only close things (revoke a key, remove a
- * member): a key that leaked must not wait for the reactivation. A pending
- * one has neither, since nothing can exist there before the approval.
- *
- * The usage, budgets and account pages show only for an active organisation,
- * because their routes answer `403 tenant_not_active` otherwise: usage and
- * budgets to every known role, the account to those who see money (owner,
- * admin, billing).
- */
-function canSee(id: TabId, member: SessionMember, status: TenantStatus): boolean {
-  if (status !== "active" && status !== "suspended") return false;
-  if ((id === "usage" || id === "budgets" || id === "billing" || id === "prices") && status !== "active") return false;
-  switch (id) {
-    case "org":
-      return true;
-    case "keys":
-      return member.role === "owner" || member.role === "admin" || member.role === "member";
-    case "members":
-      return member.role === "owner" || member.role === "admin";
-    case "usage":
-    case "budgets":
-    case "prices":
-      return member.role === "owner" || member.role === "admin" || member.role === "member" || member.role === "billing";
-    case "billing":
-      return member.role === "owner" || member.role === "admin" || member.role === "billing";
-  }
-}
+export type TabId = PortalTabId;
 
 interface SignedIn {
   member: SessionMember;
@@ -202,6 +144,14 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
     setMe(null);
   }, []);
 
+  const visible = me ? TABS.filter((t) => canSeePortalTab(t.id, me.member.role, me.tenant.status)) : [];
+  const current: TabId = visible.some((t) => t.id === tab) ? tab : "org";
+
+  // 长列表进入新页时回到标题，避免把账号页等短页停在旧页的滚动位置。
+  useLayoutEffect(() => {
+    window.scrollTo({ top: 0, left: 0, behavior: "instant" });
+  }, [current, me?.tenant.id, me?.member.id]);
+
   if (bootError) {
     return (
       <div className="centered">
@@ -249,8 +199,6 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
   }
 
   const { member, tenant } = me;
-  const visible = TABS.filter((t) => canSee(t.id, member, tenant.status));
-  const current: TabId = visible.some((t) => t.id === tab) ? tab : "org";
   const who = member.display_name || member.email;
 
   return (
@@ -274,7 +222,7 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
       navigation={(close) => visible.length > 0 && (
         <RouteNav
           label="组织门户分区"
-          items={visible}
+          items={visible.filter((item) => item.id !== "account")}
           current={current}
           onSelect={(next) => {
             openSection(next);
@@ -283,14 +231,15 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
           docked
         />
       )}
-      footer={
-        <span className="shell-member" title={member.email}>
+      footer={(close) => (
+        <button type="button" id="stop-account" className="shell-account-link shell-member" title={member.email}
+          aria-current={current === "account" ? "page" : undefined}
+          onClick={() => { openSection("account"); close(); }}>
           <span className="avatar" data-initial={[...who][0] ?? ""} aria-hidden="true" />
           <span className="me-name">{who}</span>
-          <span className="vh"> · </span>
-          <span className="tag">{ROLE_LABEL[member.role] ?? member.role}</span>
-        </span>
-      }
+          <span className="shell-account-caption">{ROLE_LABEL[member.role] ?? member.role} · 账号设置</span>
+        </button>
+      )}
     >
       <header className={scrolled ? "shell-view-header is-scrolled" : "shell-view-header"}>
         <div className="shell-view-location">
@@ -302,8 +251,9 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
         </div>
         <div className="shell-user-tools">
           <ThemeToggle theme={theme} onToggle={toggleTheme} />
-          <Button kind="quiet" onClick={() => void signOut()}>
-            登出
+          <Button kind="quiet" onClick={() => openSection("account")} aria-label="账号设置">
+            <UserRound aria-hidden />
+            <span className="cp-account-label">账号</span>
           </Button>
         </div>
       </header>
@@ -320,10 +270,12 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
         <section
           key={`${tenant.id}:${member.id}:${member.role}:${tenant.status}`}
           id={`tab-${current}`}
-          role={visible.length > 0 ? "tabpanel" : undefined}
+          role={current === "account" ? "region" : "tabpanel"}
           aria-labelledby={visible.length > 0 ? `stop-${current}` : undefined}
         >
-          {current === "keys" ? (
+          {current === "account" ? (
+            <AccountSettings member={member} onSignOut={() => void signOut()} />
+          ) : current === "keys" ? (
             <Keys member={member} status={tenant.status} onSelfChanged={() => void boot()} />
           ) : current === "prices" ? (
             <Prices initialGroup={priceGroup} />

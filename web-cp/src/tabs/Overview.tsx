@@ -3,6 +3,7 @@ import type { TabId, TabProps } from "../App";
 import { Msg, type Note } from "../components/Msg";
 import { environment, pricingStatus, rollout, type Environment, type PricingStatus, type RolloutSummary } from "../lib/api";
 import { errorText, fmtInt } from "../lib/fmt";
+import { fmtBeijing } from "../lib/time";
 import { statusView } from "../lib/pricingStatus";
 import { Button } from "../ui/Button";
 import { BentoGrid, Card, CardFooter, CardHeader, CardMessage, Metric, MetricSkeleton, PageHeader, span } from "../components/page";
@@ -156,8 +157,8 @@ export function Overview({ operator, onGoto }: TabProps) {
         <div className={span.d12}>
           <div className="mb-5 flex flex-wrap items-end justify-between gap-4">
             <div className="min-w-0">
-              <p className="font-mono text-meta text-muted">API 请求统计</p>
-              <p className="mt-2 break-all font-mono text-micro text-muted">{metrics.from.slice(0, 16).replace("T", " ")} — {metrics.to.slice(0, 16).replace("T", " ")} UTC</p>
+              <p className="text-caption font-medium text-muted">API 请求统计</p>
+              <p className="mt-2 break-all text-micro tabular-nums text-muted">{fmtBeijing(metrics.from)} — {fmtBeijing(metrics.to)}</p>
             </div>
             <div className="flex max-w-full flex-wrap items-end gap-3">
               <label className="f filter m-0">
@@ -195,14 +196,14 @@ export function Overview({ operator, onGoto }: TabProps) {
           )}
           {error && s && <p className="note crit" role="alert">读取失败：{error}</p>}
           <div className="mt-5 grid gap-3 border-t border-ink/7 pt-5 tablet:grid-cols-2">
-            <div><p className="font-mono text-micro text-muted">环境</p><p className="mt-1 break-all font-mono text-caption">{env?.env_id ?? "—"}</p></div>
-            <div><p className="font-mono text-micro text-muted">控制面版本</p><p className="mt-1 break-all font-mono text-caption">{env?.cp_version ?? "—"}</p></div>
+            <div><p className="text-micro text-muted">环境</p><p className="mt-1 break-all font-mono text-caption">{env?.env_id ?? "—"}</p></div>
+            <div><p className="text-micro text-muted">控制面版本</p><p className="mt-1 break-all font-mono text-caption">{env?.cp_version ?? "—"}</p></div>
           </div>
           {envError && <p className="note crit" role="alert">读取环境信息失败：{envError}</p>}
         </Card>
 
         <Card className={span.d4} tone="inverse">
-          <CardHeader number={4} title="在线网关" actions={<span className="font-mono text-micro text-on-inverse-muted">当前心跳</span>} />
+          <CardHeader number={4} title="在线网关" actions={<span className="text-micro text-on-inverse-muted">当前心跳</span>} />
           {s ? <Metric size="display">{fmtInt(s.online_instances)}</Metric> : error ? <CardMessage onRetry={() => void readSummary()}>心跳数据暂不可用。</CardMessage> : <MetricSkeleton />}
           <p className="mt-4 text-caption text-on-inverse-muted">近期发过心跳的网关实例。离线详情与凭据在网关页查看。</p>
           <CardFooter>

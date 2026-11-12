@@ -2,6 +2,7 @@
 // this file, pinned by web-tenant/src/lib/tokenParity.test.ts; change both
 // together. The contract is in CONTRACT.md beside it.
 import type { ReactNode } from "react";
+import "./record-table.css";
 
 /**
  * 表头44px、普通行至少56px、compact至少48px，容纳44px操作控件；
@@ -24,7 +25,7 @@ export function DataTable({
   children: ReactNode;
 }) {
   return (
-    <div className={scroll ? "dt-wrap dt-scroll" : "dt-wrap"}>
+    <div className={scroll ? "dt-wrap dt-scroll" : "dt-wrap"} role="region" aria-label={label ? `${label}表格滚动区域` : "表格滚动区域"} tabIndex={0}>
       <table className={compact ? "dt dt-compact" : "dt"} aria-label={label}>
         {children}
       </table>

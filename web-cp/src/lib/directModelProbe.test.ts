@@ -166,3 +166,22 @@ test("能力抽测逐项区分通过、未通过和未测，错误状态不被�
   assert.equal(capabilityDuration({ ...capability, status: "not_tested", total_duration_ms: 0 }), "—");
   assert.equal(capabilityDuration({ ...capability, status: "unsupported", total_duration_ms: 0 }), "—");
 });
+
+// 删除历史恢复、误把能力 null 补 false 或把不同轮次拼接时，这些断言必须变红。
+test("最近已保存样本恢复独立整轮结果，保留过期与中断状态", async () => {
+  const helpers = await import("./directModelProbe.ts");
+  assert.equal(typeof helpers.savedProbeRows, "function", "刷新后必须能够从已保存记录恢复结果");
+  const target = { id: "a", name: "模型A", provider: "openai", upstream: "a", account: "账号" };
+  const result = available("a");
+  result.capability_check.checks = { json: true, instruction: false, arithmetic: null, sorting: null };
+  const record = { id: "9007199254740993", model_id: "a", provider_key_id: "account", model_version: "3", provider_key_version: "4", target: { name: "模型A", account: "账号" }, actor: { id: "operator", email: "operator@example.test" }, mode: "capability" as const, started_at: result.checked_at, finished_at: result.checked_at, state: "completed" as const, stale: true, result };
+  const [row] = helpers.savedProbeRows([target], [record]);
+  assert.ok(row);
+  assert.equal(row.result, result);
+  assert.equal(row.history?.id, "9007199254740993");
+  assert.equal(row.history?.stale, true);
+  assert.equal(row.result?.capability_check.checks.instruction, false);
+  assert.equal(row.result?.capability_check.checks.arithmetic, null);
+  assert.equal(helpers.savedProbeRows([target], [{ ...record, state: "interrupted", result: null }])[0]?.status, "not_tested");
+  assert.equal(helpers.savedProbeRows([target], [])[0]?.result, null);
+});

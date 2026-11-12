@@ -5,6 +5,8 @@ import { errorText, fmtInt } from "../../lib/fmt";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
 import { EmptyState } from "../../ui/EmptyState";
+import { useRecordTable } from "../../lib/recordTable";
+import { RecordTablePager, RecordTableToolbar } from "../../ui/RecordTable";
 import { BentoGrid, Card, CardHeader, CardMessage, Metric, MetricSkeleton, PageHeader, span } from "../../components/page";
 import { CostAccountDetail } from "./CostAccountDetail";
 import { Count } from "./kit";
@@ -35,6 +37,12 @@ export function CostPrices({ canEdit }: TabProps) {
     void load();
   }, [load]);
 
+  const [rateState, setRateState] = useState("");
+  const records = useRecordTable({
+    items: (rows ?? []).filter((row) => rateState === "" || (rateState === "configured" ? row.default.current?.cny_per_usd != null : rateState === "missing" ? row.default.current?.cny_per_usd == null : row.default.upcoming.length > 0)),
+    searchText: (row) => [row.account.display_name, row.account.id, row.account.provider],
+    resetKey: rateState,
+  });
   const open = rows?.find((r) => r.account.id === selected)?.account ?? null;
   if (open) {
     return <CostAccountDetail account={open} canEdit={canEdit} onBack={() => setSelected(null)} onChanged={load} />;
@@ -83,6 +91,10 @@ export function CostPrices({ canEdit }: TabProps) {
         ) : rows.length === 0 ? (
           <EmptyState text="还没有上游账号。先在「上游账号」中添加。" />
         ) : (
+          <>
+          <RecordTableToolbar search={{ value: records.query, onChange: records.setQuery, label: "搜索成本价账号", placeholder: "账号名称、ID 或供应商" }}>
+            <label className="f filter"><span>默认成本换算率</span><select value={rateState} onChange={(e) => setRateState(e.target.value)}><option value="">全部</option><option value="configured">已设置</option><option value="missing">未设置</option><option value="scheduled">有待生效版本</option></select></label>
+          </RecordTableToolbar>
           <DataTable label="上游账号成本价">
             <thead>
               <tr>
@@ -92,7 +104,8 @@ export function CostPrices({ canEdit }: TabProps) {
               </tr>
             </thead>
             <tbody>
-              {rows.map(({ account, default: plan }) => {
+              {records.rows.length === 0 && <tr><td colSpan={3}><EmptyState text="没有符合筛选条件的账号" /></td></tr>}
+              {records.rows.map(({ account, default: plan }) => {
                 const later = scheduledWords(plan, "");
                 return (
                   <tr key={account.id}>
@@ -118,6 +131,8 @@ export function CostPrices({ canEdit }: TabProps) {
               })}
             </tbody>
           </DataTable>
+          <RecordTablePager page={records.page} pageSize={records.pageSize} onPageChange={records.setPage} onPageSizeChange={records.setPageSize} total={records.filteredCount} label="上游账号成本价分页" />
+          </>
         )}
       </Card>
     </>

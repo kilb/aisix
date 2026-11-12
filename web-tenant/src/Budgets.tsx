@@ -16,7 +16,7 @@ import {
 import { BudgetAccountAmounts, type BudgetAccountBalance } from "./BudgetAccountAmounts";
 import { formulaBalance } from "./lib/formulaApi";
 import { formMessageFor, messageFor } from "./lib/errors";
-import { fmtUtc, isCnyAmount, microCnyToInput } from "./lib/money";
+import { isCnyAmount, microCnyToInput } from "./lib/money";
 import { Money } from "./ui/BalanceReadout";
 import { Button } from "./ui/Button";
 import { DataTable, Loading } from "./ui/DataTable";
@@ -29,6 +29,9 @@ import { BentoGrid, Card, CardFooter, CardHeader, CardMessage, Metric, PageHeade
 import { BudgetProgress } from "./components/charts";
 import { exactInteger, exactRatio } from "./lib/chartFormat";
 import { cn } from "./lib/cn";
+import { budgetPeriodRange, fmtBeijing } from "./lib/time";
+import { useRecordTable } from "./lib/recordTable";
+import { RecordTablePager, RecordTableToolbar } from "./ui/RecordTable";
 
 function failure(e: unknown): string {
   return e instanceof ApiError ? messageFor(e) : String(e);
@@ -51,8 +54,6 @@ function cnyToMicro(s: string): number {
 
 /** Quota reads in flight at once: the page's share of the control plane's small connection pool. */
 export const QUOTA_READS_IN_FLIGHT = 4;
-/** Keys the 实际可用 table lists before 显示更多; only the keys listed are read. */
-const KEYS_PER_VIEW = 25;
 
 /** `f` over `items`, at most `limit` at a time, settled like `Promise.allSettled`; stops starting reads once `live()` is false. */
 async function settledLimited<T, R>(
@@ -162,7 +163,10 @@ export function Budgets({ member }: { member: SessionMember }) {
   const [quotaErr, setQuotaErr] = useState<string | null>(null);
   const [tick, setTick] = useState(0);
   const [listed, setListed] = useState(0);
-  const [shown, setShown] = useState(KEYS_PER_VIEW);
+  const [visibleKeys, setVisibleKeys] = useState<string[]>([]);
+  const [visibleBudgetKeys, setVisibleBudgetKeys] = useState<string[]>([]);
+  const [formKey, setFormKey] = useState("");
+  const quotaIds = [...new Set([...visibleKeys, ...visibleBudgetKeys, ...(formKey ? [formKey] : [])])].sort().join("/");
   const [reloading, setReloading] = useState(true);
   const reload = useCallback(() => setTick((n) => n + 1), []);
 
@@ -205,6 +209,7 @@ export function Budgets({ member }: { member: SessionMember }) {
       }
       setKeys(keyList.status === "fulfilled" ? keyList.value : []);
       if (peopleList.status === "fulfilled") setPeople(peopleList.value);
+      setQuotas({});
       setListed((n) => n + 1);
     })();
     return () => {
@@ -212,15 +217,13 @@ export function Budgets({ member }: { member: SessionMember }) {
     };
   }, [role, manager, tick]);
 
-  // Each key's own answer: what is left on it and which level binds. Only the
-  // keys in view are read, and at most QUOTA_READS_IN_FLIGHT at a time.
+  // 只读取当前页与表单选中的密钥，至多四个并发；已读取额度跨页缓存。
   useEffect(() => {
     if (listed === 0 || keys === null) return;
     let live = true;
     void (async () => {
-      const ids = new Set(keyEntries(keys, (rows ?? []).filter((b) => b.scope === "api_key")).slice(0, shown).map(([id]) => id));
-      for (const b of rows ?? []) if (b.scope === "api_key" && b.target_live) ids.add(b.target.id);
-      const answers = await settledLimited([...ids], QUOTA_READS_IN_FLIGHT, () => live, (id) => billing.keyQuota(id));
+      const ids = quotaIds ? quotaIds.split("/").filter((id) => !quotas[id]) : [];
+      const answers = await settledLimited(ids, QUOTA_READS_IN_FLIGHT, () => live, (id) => billing.keyQuota(id));
       if (!live) return;
       const next: Record<string, KeyQuota> = {};
       let failed: unknown = null;
@@ -228,16 +231,16 @@ export function Budgets({ member }: { member: SessionMember }) {
         if (a.status === "fulfilled") next[a.value.key_id] = a.value;
         else failed = a.reason;
       });
-      setQuotas(next);
+      setQuotas((current) => ({ ...current, ...next }));
       setQuotaErr(failed === null ? null : failure(failed));
       setReloading(false);
     })();
     return () => {
       live = false;
     };
-    // `listed` moves once per list read; `rows` and `keys` are the ones it set.
+    // 列表重读会清空额度；翻页只补读当前可见且缓存缺失的密钥。
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [listed, shown]);
+  }, [listed, quotaIds]);
 
   const team = (rows ?? []).filter((b) => b.scope === "team");
   const memberRows = (rows ?? []).filter((b) => b.scope === "member");
@@ -268,15 +271,15 @@ export function Budgets({ member }: { member: SessionMember }) {
             empty={manager ? "还没有成员额度，可在「新建额度」中新建" : role === "billing" ? "还没有成员额度" : "还没有给你设置成员额度"}
             role={role} parentsOf={() => team.map(termsOf)} onChanged={reload} />}
         </Section>
-        {creator && !rowsErr && <CreateForm number={financial ? 4 : 2} role={role} keys={keys} people={people} team={team} quotas={quotas} onCreated={reload} />}
+        {creator && !rowsErr && <CreateForm number={financial ? 4 : 2} role={role} keys={keys} people={people} team={team} quotas={quotas} onTargetKey={setFormKey} onCreated={reload} />}
         <Section number={financial ? creator && !rowsErr ? 5 : 4 : creator && !rowsErr ? 3 : 2} title="密钥额度" className={span.d12}
           actions={<Button size="sm" icon="refresh" busy={reloading} busyLabel="刷新中…" onClick={reload}>刷新</Button>}>
-          <p className="text-caption text-muted">实际可用额度取账户与各级预算的最小剩余值；未设置限额时显示“不限”。每次展开最多增加 25 个密钥。</p>
+          <p className="text-caption text-muted">实际可用额度取账户与各级预算的最小剩余值；未设置限额时显示“不限”。仅为当前页密钥读取实际可用额度，未读取的值保持未知。</p>
           {quotaErr && <div className="note crit" role="alert">{quotaErr}</div>}
-          <KeyFigures keys={keys} rows={keyRows} quotas={quotas} shown={shown} onMore={() => setShown((n) => n + KEYS_PER_VIEW)} />
+          <KeyFigures keys={keys} rows={keyRows} quotas={quotas} onVisibleKeys={setVisibleKeys} />
           {!rowsErr && <QuotaTable label="密钥额度" rows={rows === null ? null : keyRows}
             empty={creator ? "还没有密钥额度，可在「新建额度」中新建" : "还没有密钥额度"}
-            role={role} parentsOf={(b) => keyParents(quotas[b.target.id])} onChanged={reload} />}
+            role={role} parentsOf={(b) => keyParents(quotas[b.target.id])} onVisibleKeys={setVisibleBudgetKeys} onChanged={reload} />}
         </Section>
       </BentoGrid>
     </>
@@ -290,21 +293,22 @@ function KeyFigures({
   keys,
   rows,
   quotas,
-  shown,
-  onMore,
+  onVisibleKeys,
 }: {
   keys: TenantKey[] | null;
   rows: Budget[];
   quotas: Record<string, KeyQuota>;
-  shown: number;
-  onMore: () => void;
+  onVisibleKeys: (ids: string[]) => void;
 }) {
-  if (keys === null) return <Loading />;
-  // A viewer who cannot list keys (billing) still reads the keys that carry a quota.
   const seen = keyEntries(keys, rows);
+  const table = useRecordTable({ items: seen, searchText: ([, label]) => label });
+  const visible = table.rows.map(([id]) => id).join("/");
+  useEffect(() => onVisibleKeys(visible ? visible.split("/") : []), [visible, onVisibleKeys]);
+  if (keys === null) return <Loading />;
   if (seen.length === 0) return null;
   return (
     <>
+    <RecordTableToolbar search={{ value: table.query, onChange: table.setQuery, label: "搜索实际可用密钥", placeholder: "密钥名称" }} />
     <DataTable label="密钥实际可用">
       <thead>
         <tr>
@@ -314,7 +318,7 @@ function KeyFigures({
         </tr>
       </thead>
       <tbody>
-        {seen.slice(0, shown).map(([id, label]) => {
+        {table.rows.map(([id, label]) => {
           const q = quotas[id];
           return (
             <tr key={id}>
@@ -332,13 +336,7 @@ function KeyFigures({
         })}
       </tbody>
     </DataTable>
-    {seen.length > shown && (
-      <div className="!mt-0 flex justify-center border-t border-border pt-3">
-        <Button size="sm" onClick={onMore}>
-          显示更多
-        </Button>
-      </div>
-    )}
+    <RecordTablePager page={table.page} pageSize={table.pageSize} onPageChange={table.setPage} onPageSizeChange={table.setPageSize} total={table.filteredCount} label="密钥实际可用" />
     </>
   );
 }
@@ -352,6 +350,7 @@ function QuotaTable({
   role,
   parentsOf,
   onChanged,
+  onVisibleKeys,
 }: {
   label: string;
   rows: Budget[] | null;
@@ -359,17 +358,32 @@ function QuotaTable({
   role: SessionMember["role"];
   parentsOf: (b: Budget) => Terms[];
   onChanged: () => void;
+  onVisibleKeys?: (ids: string[]) => void;
 }) {
+  const [kindFilter, setKindFilter] = useState("");
+  const [stateFilter, setStateFilter] = useState("");
+  const table = useRecordTable({
+    items: (rows ?? []).filter((budget) => (!kindFilter || (budget.period ?? budget.kind) === kindFilter) && (!stateFilter || (budget.exhausted ? "exhausted" : "ok") === stateFilter)),
+    searchText: (budget) => [budget.target.label, SET_BY[budget.set_by]],
+    resetKey: `${kindFilter}/${stateFilter}`,
+  });
+  const visible = table.rows.filter((budget) => budget.scope === "api_key" && budget.target_live).map((budget) => budget.target.id).join("/");
+  useEffect(() => onVisibleKeys?.(visible ? visible.split("/") : []), [visible, onVisibleKeys]);
   if (rows === null) return <Loading />;
   if (rows.length === 0) return <EmptyState text={empty} mark="route" />;
   return (
+    <>
+    <RecordTableToolbar search={{ value: table.query, onChange: table.setQuery, label: `搜索${label}`, placeholder: "对象或设置方" }}>
+      <Field label={`${label}周期`}><select value={kindFilter} onChange={(e) => setKindFilter(e.target.value)}><option value="">全部周期</option><option value="day">每天</option><option value="week">每周</option><option value="month">每月</option><option value="cumulative">一次性额度</option></select></Field>
+      <Field label={`${label}状态`}><select value={stateFilter} onChange={(e) => setStateFilter(e.target.value)}><option value="">全部状态</option><option value="ok">正常</option><option value="exhausted">已用尽</option></select></Field>
+    </RecordTableToolbar>
     <DataTable label={label}>
       <thead>
         <tr>
           <th>对象</th>
           <th>设置方</th>
           <th>类型</th>
-          <th>周期（UTC）</th>
+          <th>结算周期（北京时间）</th>
           <th className="num">限额</th>
           <th className="num">已用</th>
           <th className="num">剩余</th>
@@ -380,18 +394,20 @@ function QuotaTable({
         </tr>
       </thead>
       <tbody>
-        {rows.map((b) => (
+        {table.rows.map((b) => (
           <QuotaRow key={b.id} b={b} can={powers(b, role)} parents={parentsOf(b)} onChanged={onChanged} />
         ))}
       </tbody>
     </DataTable>
+    <RecordTablePager page={table.page} pageSize={table.pageSize} onPageChange={table.setPage} onPageSizeChange={table.setPageSize} total={table.filteredCount} label={label} />
+    </>
   );
 }
 
 /** A cumulative quota counts from the day it was set; a periodic one is its period. */
 function periodText(b: Budget): string {
-  if (b.kind === "cumulative") return b.counted_from ? `自 ${fmtUtc(b.counted_from).slice(0, 10)} 起` : "自设置起";
-  return b.period ? (PERIOD[b.period] ?? b.period) : "—";
+  if (b.kind === "cumulative") return b.counted_from ? `自 ${fmtBeijing(b.counted_from)} 起` : "自设置起";
+  return b.period && b.period_start ? budgetPeriodRange(b.period_start, b.period) : b.period ? PERIOD[b.period] : "—";
 }
 
 function QuotaRow({
@@ -560,6 +576,7 @@ function CreateForm({
   people,
   team,
   quotas,
+  onTargetKey,
   onCreated,
 }: {
   number: number;
@@ -568,6 +585,7 @@ function CreateForm({
   people: Member[];
   team: Budget[];
   quotas: Record<string, KeyQuota>;
+  onTargetKey: (id: string) => void;
   onCreated: () => void;
 }) {
   const manager = role === "owner" || role === "admin";
@@ -590,6 +608,7 @@ function CreateForm({
           label: manager ? `${k.label}（${k.owner ? (k.owner.display_name ?? "成员") : "组织"}）` : k.label,
         }));
   const chosen = options.some((o) => o.id === target) ? target : (options[0]?.id ?? "");
+  useEffect(() => onTargetKey(scope === "api_key" ? chosen : ""), [scope, chosen, onTargetKey]);
 
   // Warn as the amount is typed, against the levels above the chosen object.
   const text = limit.trim();

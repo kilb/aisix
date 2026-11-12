@@ -13,12 +13,15 @@ import {
 import { formulaCalls as usageCalls, type FormulaCall as Call } from "./lib/formulaApi";
 import { discountedRate, feeMicroCny } from "./lib/formula";
 import { formMessageFor, messageFor } from "./lib/errors";
-import { fmtCnyPerMillion, fmtMicroCny, fmtUtc, perThousandOfPerMillion, periodLabel, todayUtc, utcRange } from "./lib/money";
+import { fmtCnyPerMillion, fmtMicroCny, perThousandOfPerMillion } from "./lib/money";
+import { beijingRange, defaultCalendarRange, fmtBeijing, periodLabel, todayBeijing } from "./lib/time";
+import { useRecordTable } from "./lib/recordTable";
+import { RecordTablePager, RecordTableToolbar } from "./ui/RecordTable";
 import { Button } from "./ui/Button";
 import { DataTable } from "./ui/DataTable";
 import { Field } from "./ui/Field";
 import { Lamp } from "./ui/Lamp";
-import { BentoGrid, Card, CardFooter, CardHeader, CardMessage, ChartSkeleton, PageHeader, span } from "./components/page";
+import { BentoGrid, Card, CardHeader, CardMessage, ChartSkeleton, PageHeader, span } from "./components/page";
 import { UsageCostCard, UsageCostTrendCard, UsageModelsCard, UsageRequestCard } from "./components/UsageAnalytics";
 import { ApiMetricsPanel } from "./components/ApiMetricsPanel";
 
@@ -122,9 +125,10 @@ function FeeCalculation({ call }: { call: Call }) {
       {call.status === "failed" && charge.status === "charged" && positive && (
         <>
           <p>调用未完成，但已产生用量，按已产生用量计费</p>
-          {charge.estimated && <p className="hint">本次包含估算用量。</p>}
+
         </>
       )}
+      {charge.estimated && <p className="hint">含估算用量：上游未完整返回用量，部分 token 由网关估算，费用按该用量计费。</p>}
       {call.status === "retried" && <p className="hint">这里展示本次尝试的费用，同一请求的其他计费尝试单独记录。</p>}
       {f.final_micro_cny === null ? <p>待计价，最终金额未知。</p> : (
         <>
@@ -154,23 +158,18 @@ function FeeCalculation({ call }: { call: Call }) {
   );
 }
 
-/** The UTC instants a pair of dates names, or null when the end is before the start. */
+/** 北京日期范围转为 API 所用的 UTC instant，结束日期包含整天。 */
 function rangeOf(fromDate: string, toDate: string): { from?: string; to?: string } | null {
   if (fromDate && toDate && toDate < fromDate) return null;
   return {
-    ...(fromDate ? { from: utcRange(fromDate, fromDate).from } : {}),
-    ...(toDate ? { to: utcRange(toDate, toDate).to } : {}),
+    ...(fromDate ? { from: beijingRange(fromDate, fromDate).from } : {}),
+    ...(toDate ? { to: beijingRange(toDate, toDate).to } : {}),
   };
 }
 
 /** The summary's span when no date is chosen: the last 30 days by day, the last 12 months by month. */
 function defaultRange(group: "day" | "month"): { from: string; to: string } {
-  const now = new Date();
-  const start =
-    group === "day"
-      ? new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - 29))
-      : new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 11, 1));
-  return utcRange(start.toISOString().slice(0, 10), todayUtc(now));
+  return defaultCalendarRange(group);
 }
 
 /** The longest span the control plane summarises: 92 days by day, 731 days by month. */
@@ -317,19 +316,25 @@ function Summary({ keys, showKeys, ownScope }: { keys: TenantKey[]; showKeys: bo
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [group, fromDate, toDate, keyId, tooLong, refresh]);
 
+  const table = useRecordTable({
+    items: rows ?? [],
+    searchText: (row) => [summaryModel(row)],
+    resetKey: `${group}/${fromDate}/${toDate}/${keyId}`,
+  });
+
   const spanText =
     fromDate === "" && toDate === ""
       ? group === "day"
-        ? "最近 30 天（UTC）"
-        : "最近 12 个月（UTC）"
-      : `${fromDate || periodLabel(fallback.from, "day")} – ${toDate || todayUtc()}（UTC）`;
+        ? "最近 30 天（北京时间）"
+        : "最近 12 个月（北京时间）"
+      : `${fromDate || periodLabel(fallback.from, "day")} – ${toDate || todayBeijing()}（北京时间）`;
 
   const visualError = !range ? "结束日期不能早于开始日期，请调整汇总筛选。" : tooLong ? "时间范围过大，请缩短汇总区间。" : err;
   const rangeLabel = `${spanText} · ${keyId ? "所选密钥" : ownScope ? "你的密钥" : "全组织"}`;
   const retry = () => setRefresh((value) => value + 1);
   // 无效日期仍保留指标卡框，由指标组件解释范围错误并停止请求。
-  const metricsFrom = fromDate ? utcRange(fromDate, fromDate).from : fallback.from;
-  const metricsTo = toDate ? utcRange(toDate, toDate).to : fallback.to;
+  const metricsFrom = fromDate ? beijingRange(fromDate, fromDate).from : fallback.from;
+  const metricsTo = toDate ? beijingRange(toDate, toDate).to : fallback.to;
   return (
     <BentoGrid>
       <ApiMetricsPanel compact refreshKey={refresh} scope="tenant" enabled from={metricsFrom} to={metricsTo} apiKeyId={keyId || undefined} numberStart={1} className={span.d12} />
@@ -345,18 +350,20 @@ function Summary({ keys, showKeys, ownScope }: { keys: TenantKey[]; showKeys: bo
               <option value="month">按月</option>
             </select>
           </Field>
-          <Field label="开始日期（UTC）" error={range ? null : "结束日期不能早于开始日期"}>
+          <Field label="开始日期（北京时间）" error={range ? null : "结束日期不能早于开始日期"}>
             <input type="date" value={fromDate} max={toDate || undefined} onChange={(e) => setFromDate(e.target.value)} />
           </Field>
-          <Field label="结束日期（UTC）" error={tooLong ? `时间范围过大：按天最多 ${MAX_DAYS.day} 天，按月最多 ${MAX_DAYS.month} 天` : null}>
+          <Field label="结束日期（北京时间）" error={tooLong ? `时间范围过大：按天最多 ${MAX_DAYS.day} 天，按月最多 ${MAX_DAYS.month} 天` : null}>
             <input type="date" value={toDate} min={fromDate || undefined} onChange={(e) => setToDate(e.target.value)} />
           </Field>
           {showKeys && <KeySelect keys={keys} value={keyId} onChange={setKeyId} />}
         </Filters>
+        <RecordTableToolbar search={{ value: table.query, onChange: table.setQuery, label: "搜索汇总模型", placeholder: "模型名称" }} />
+        <p className="hint">含估算用量：上游未完整返回用量，部分 token 由网关估算，费用按该用量计费。</p>
         <p className="hint">
           按用量发生的时间汇总，不是按计费入账的时间：重新计价后的调整，记在用量发生的那一期。
           调用尝试次数包含最终尝试，以及已计费或重新计价的重试。
-          {fromDate === "" && toDate === "" && (group === "day" ? "未选日期时汇总最近 30 天（UTC）。" : "未选日期时汇总最近 12 个月（UTC）。")}
+          {fromDate === "" && toDate === "" && (group === "day" ? "未选日期时汇总最近 30 天（北京时间）。" : "未选日期时汇总最近 12 个月（北京时间）。")}
         </p>
         {err && (
           <div className="note crit" role="alert">
@@ -377,7 +384,7 @@ function Summary({ keys, showKeys, ownScope }: { keys: TenantKey[]; showKeys: bo
               </tr>
             </thead>
             <tbody>
-              {rows.map((r) => (
+              {table.rows.map((r) => (
                 <tr key={`${r.period_start}/${r.model.id ?? r.model.name}`}>
                   <td className="tabular">{periodLabel(r.period_start, group)}</td>
                   <td>{summaryModel(r)}</td>
@@ -394,6 +401,7 @@ function Summary({ keys, showKeys, ownScope }: { keys: TenantKey[]; showKeys: bo
             </tbody>
           </DataTable>
         )}
+        {rows !== null && <RecordTablePager page={table.page} pageSize={table.pageSize} onPageChange={table.setPage} onPageSizeChange={table.setPageSize} total={table.filteredCount} label="用量汇总" />}
       </Section>
     </BentoGrid>
   );
@@ -415,6 +423,15 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
   const [next, setNext] = useState<number | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [more, setMore] = useState(false);
+  const morePending = useRef(false);
+  const [statusFilter, setStatusFilter] = useState("");
+  const table = useRecordTable({
+    items: (rows ?? []).filter((call) => !statusFilter || call.status === statusFilter),
+    searchText: (call) => [call.model.name, call.api_key.label, call.api_key.prefix, call.member?.display_name ?? "", call.request_id ?? ""],
+    resetKey: `${fromDate}/${toDate}/${keyId}/${modelId}/${requestId}/${statusFilter}`,
+  });
+  const loadedSearch = useRef("");
+  loadedSearch.current = `${table.query}/${statusFilter}`;
   const [open, setOpen] = useState<Set<string>>(new Set());
   const range = rangeOf(fromDate, toDate);
   const ticket = useRef(0);
@@ -426,6 +443,7 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
 
   const filter = () => ({
     ...range,
+    limit: table.pageSize,
     ...(keyId ? { api_key_id: keyId } : {}),
     ...(modelId ? { model_id: modelId } : {}),
     ...(requestId ? { request_id: requestId } : {}),
@@ -433,6 +451,9 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
 
   useEffect(() => {
     const mine = ++ticket.current;
+    morePending.current = false;
+    setMore(false);
+    setOpen(new Set());
     if (!range) {
       setRows([]);
       setNext(null);
@@ -454,13 +475,16 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
         setErr(e instanceof ApiError ? formMessageFor(e) : String(e));
       },
     );
+    return () => { ticket.current += 1; };
     // `range` and `filter` derive from the state listed.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [fromDate, toDate, keyId, modelId, requestId]);
+  }, [fromDate, toDate, keyId, modelId, requestId, table.pageSize]);
 
   async function loadMore() {
-    if (next === null) return;
+    if (next === null || morePending.current) return;
     const mine = ticket.current;
+    const searchAtLoad = loadedSearch.current;
+    morePending.current = true;
     setMore(true);
     try {
       const p = await usageCalls({ ...filter(), before: next });
@@ -470,10 +494,17 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
         return [...(cur ?? []), ...p.items.filter((r) => !seen.has(r.event_id))];
       });
       setNext(p.next_before);
+      setErr(null);
+      if (loadedSearch.current === searchAtLoad) {
+        table.setPage(table.filteredCount >= table.page * table.pageSize ? table.page + 1 : table.page);
+      }
     } catch (e) {
-      setErr(failure(e));
+      if (mine === ticket.current) setErr(failure(e));
     } finally {
-      setMore(false);
+      if (mine === ticket.current) {
+        morePending.current = false;
+        setMore(false);
+      }
     }
   }
 
@@ -488,10 +519,10 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
   return (
     <Section title="调用记录" number={8}>
       <Filters>
-        <Field label="时间（UTC）起" error={range ? null : "结束日期不能早于开始日期"}>
+        <Field label="时间（北京时间）起" error={range ? null : "结束日期不能早于开始日期"}>
           <input type="date" value={fromDate} max={toDate || undefined} onChange={(e) => setFromDate(e.target.value)} />
         </Field>
-        <Field label="时间（UTC）止">
+        <Field label="时间（北京时间）止">
           <input type="date" value={toDate} min={fromDate || undefined} onChange={(e) => setToDate(e.target.value)} />
         </Field>
         {showKeys && <KeySelect keys={keys} value={keyId} onChange={setKeyId} />}
@@ -509,6 +540,10 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
           <input autoComplete="off" value={typed} onChange={(e) => setTyped(e.target.value)} />
         </Field>
       </Filters>
+      <RecordTableToolbar search={{ value: table.query, onChange: table.setQuery, label: "搜索已加载调用", placeholder: "模型、密钥、成员或请求 ID" }}>
+        <Field label="已加载调用状态"><select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}><option value="">全部状态</option><option value="succeeded">成功</option><option value="failed">失败</option><option value="retried">重试</option></select></Field>
+      </RecordTableToolbar>
+      <p className="hint">搜索和状态仅筛选已加载记录；继续下一页可读取更早记录。</p>
       <p className="mt-4 text-caption text-muted">调用记录按计费尝试逐条展示，同一请求可能有多条记录。{rows !== null ? `已加载 ${rows.length.toLocaleString("en-US")} 条${next !== null ? "，还有更多记录" : ""}；这些记录不代表整个汇总窗口的成功率或延迟分布。` : ""}</p>
       {err && (
         <div className="note crit" role="alert">
@@ -524,7 +559,7 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
               <th>
                 <span className="vh">明细</span>
               </th>
-              <th>时间（UTC）</th>
+              <th>时间（北京时间）</th>
               <th>模型</th>
               <th>密钥</th>
               <th>成员</th>
@@ -537,7 +572,7 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
             </tr>
           </thead>
           <tbody>
-            {rows.map((c) => {
+            {table.rows.map((c) => {
               const expanded = open.has(c.event_id);
               return (
                 <Fragment key={c.event_id}>
@@ -554,7 +589,7 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
                         {expanded ? "收起" : "展开"}
                       </Button>
                     </td>
-                    <td className="tabular">{fmtUtc(c.occurred_at)}</td>
+                    <td className="tabular">{fmtBeijing(c.occurred_at)}</td>
                     <td>{c.model.name || "—"}</td>
                     <td>{c.api_key.label || "—"}</td>
                     <td>{c.member ? (c.member.display_name ?? "成员") : "—"}</td>
@@ -615,13 +650,17 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
           </tbody>
         </DataTable>
       )}
-      {next !== null && (
-        <CardFooter className="usage-more flex justify-center border-t border-ink/7 pt-5">
-          <Button size="sm" busy={more} busyLabel="加载中…" onClick={() => void loadMore()}>
-            加载更多
-          </Button>
-        </CardFooter>
-      )}
+      {rows !== null && <RecordTablePager
+        page={table.page} pageSize={table.pageSize}
+        onPageChange={(page) => {
+          if (page <= table.pageCount) table.setPage(page);
+          else void loadMore();
+        }}
+        onPageSizeChange={table.setPageSize}
+        loadedCount={rows.length} hasNext={table.page < table.pageCount || next !== null}
+        busy={more} label="调用记录"
+      />}
+
     </Section>
   );
 }

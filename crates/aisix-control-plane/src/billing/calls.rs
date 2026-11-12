@@ -6,7 +6,7 @@
 //!   of the keys bound to them (the charge's `user_id`, which is the key's
 //!   member as the control plane recorded it).
 //! - `GET /api/usage/summary`: requests, charges and billed quantities by
-//!   UTC day or month and model, over the same rows.
+//!   Beijing calendar day or month and model, over the same rows.
 //! - `GET /admin/tenants/{id}/usage/summary`: the same summary for operators.
 //!
 //! Rows are found by `pricing_charges.tenant_id`, the tenant of the control
@@ -773,7 +773,7 @@ async fn summarize(
 
     let mut sql = QueryBuilder::<Postgres>::new("SELECT date_trunc(");
     sql.push_bind(unit).push(format!(
-        ", pc.occurred_at, 'UTC'), pc.requested_model_id, count(*)::bigint, \
+        ", pc.occurred_at, 'Asia/Shanghai'), pc.requested_model_id, count(*)::bigint, \
          COALESCE(sum(pc.charge_micro_cny) FILTER (WHERE pc.status = 'charged'), 0)::bigint \
            + sum(COALESCE({ADJUSTED}, 0))::bigint, \
          (count(*) FILTER (WHERE pc.estimated))::bigint"
@@ -788,7 +788,7 @@ async fn summarize(
 
     let mut sql = QueryBuilder::<Postgres>::new("SELECT date_trunc(");
     sql.push_bind(unit).push(
-        ", pc.occurred_at, 'UTC'), pc.requested_model_id, l->>'dimension', \
+        ", pc.occurred_at, 'Asia/Shanghai'), pc.requested_model_id, l->>'dimension', \
          COALESCE(sum((l->>'quantity')::bigint), 0)::bigint",
     );
     scope.push_from(&mut sql, true);

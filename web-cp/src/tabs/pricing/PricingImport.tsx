@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { TabProps } from "../../App";
 import { EffectiveFrom, sendAt, type EffectiveResolver } from "../../components/EffectiveFrom";
 import {
@@ -25,11 +25,13 @@ import {
   statusText,
   unshownParts,
 } from "../../lib/importReview";
-import { fmtUtc } from "../../lib/money";
+import { fmtBeijing } from "../../lib/time";
+import { useRecordTable } from "../../lib/recordTable";
 import { usdRateText } from "../../lib/rateUnits";
 import { safeHttpUrl } from "../../lib/safeUrl";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
+import { RecordTablePager, RecordTableToolbar } from "../../ui/RecordTable";
 import { EmptyState } from "../../ui/EmptyState";
 import { Field, useRefusalFocus } from "../../ui/Field";
 import { SidePanel } from "../../ui/SidePanel";
@@ -112,7 +114,8 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
   const [models, setModels] = useState<ResourceView<ModelDoc>[]>([]);
   const [updates, setUpdates] = useState<BaselineRow[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const [filter, setFilter] = useState("");
+  const [statusFilter, setStatusFilter] = useState("");
+  const [flaggedOnly, setFlaggedOnly] = useState(false);
   const [selected, setSelected] = useState<string | null>(null);
   /** The dataset's own notes for each entry, read from the file uploaded in this session. */
   const [comments, setComments] = useState<Record<string, string>>({});
@@ -188,11 +191,11 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
   const detail = proposals?.find((p) => p.id === selected) ?? null;
   const batch = batches?.find((b) => b.id === batchId) ?? null;
 
-  const shown = useMemo(() => {
-    const text = filter.trim().toLowerCase();
-    if (!text) return proposals ?? [];
-    return (proposals ?? []).filter((p) => `${p.provider}/${p.model}`.toLowerCase().includes(text));
-  }, [proposals, filter]);
+  const table = useRecordTable({
+    items: (proposals ?? []).filter((p) => (!statusFilter || p.status === statusFilter) && (!flaggedOnly || p.flags.length > 0)),
+    searchText: (p) => [`${p.provider}/${p.model}`, p.provider, p.model],
+    resetKey: `${batchId ?? ""}/${all}/${statusFilter}/${flaggedOnly}`,
+  });
 
   /** A decision was made: the list and the catalogue's updates are read again. */
   const afterDecision = useCallback(async () => {
@@ -283,7 +286,7 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
           {batches === null || (proposals === null && batchId) ? (error ? <CardMessage>提议读取失败</CardMessage> : <MetricSkeleton />) : (
             <>
               <Metric size="hero">{pending.length.toLocaleString("zh-CN")}</Metric>
-              <p className="mt-3 text-caption text-muted">当前读取 {(proposals?.length ?? 0).toLocaleString("zh-CN")} 条；搜索显示 {shown.length.toLocaleString("zh-CN")} 条。</p>
+              <p className="mt-3 text-caption text-muted">当前读取 {(proposals?.length ?? 0).toLocaleString("zh-CN")} 条；筛选匹配 {table.filteredCount.toLocaleString("zh-CN")} 条。</p>
               <dl className="import-review-counts">
                 <div><dt>可批量确认</dt><dd>{ready.toLocaleString("zh-CN")}</dd></div>
                 <div><dt>需选择模型</dt><dd>{needModel.toLocaleString("zh-CN")}</dd></div>
@@ -308,7 +311,9 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
           <ImportUpload
             canEdit={canEdit}
             onUploaded={async (batch, fileNotes) => {
-              setFilter("");
+              table.setQuery("");
+              setStatusFilter("");
+              setFlaggedOnly(false);
               switchBatch(batch.id);
               // Installed with the batch, not before it: a note is a claim about
               // the file this batch came from, so it is held with that batch's id.
@@ -348,16 +353,11 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
                       <select {...aria} value={batchId ?? ""} onChange={(e) => switchBatch(e.target.value)}>
                         {batches.map((b) => (
                           <option key={b.id} value={b.id}>
-                            {b.dataset_ref} · {fmtUtc(b.created_at)} · {b.status === "open" ? "待审" : "已被取代"} ·{" "}
+                            {b.dataset_ref} · {fmtBeijing(b.created_at)} · {b.status === "open" ? "待审" : "已被取代"} ·{" "}
                             {b.proposals} 条提议（{b.flagged} 条带标记）
                           </option>
                         ))}
                       </select>
-                    )}
-                  </Field>
-                  <Field label="筛选模型">
-                    {(aria) => (
-                      <input {...aria} autoComplete="off" placeholder="按提供方或模型名筛选" value={filter} onChange={(e) => setFilter(e.target.value)} />
                     )}
                   </Field>
                   <label className="check col-span-full mb-0 min-h-11">
@@ -376,11 +376,16 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
                     <span>显示与当前基准价相同的提议</span>
                   </label>
                 </FormGrid>
+                <RecordTableToolbar search={{ value: table.query, onChange: table.setQuery, label: "筛选模型", placeholder: "按提供方或模型名筛选" }}>
+                  <Field label="提议状态">{(aria) => <select {...aria} value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}><option value="">全部状态</option><option value="pending">待审</option><option value="confirmed">已确认</option><option value="rejected">已驳回</option><option value="superseded">已被取代</option></select>}</Field>
+                  <label className="check mb-0 min-h-11"><input type="checkbox" checked={flaggedOnly} onChange={(e) => setFlaggedOnly(e.target.checked)} /><span>只看带标记</span></label>
+                  <p className="hint mb-0">已读取当前批次完整列表；翻页不改变已选项。</p>
+                </RecordTableToolbar>
 
                 {batch && (
                   <p className="hint tabular mt-3 text-caption">
                     本次上传 {batch.proposals} 条提议，其中 {batch.flagged} 条带标记；由 {batch.created_by.email} 上传于{" "}
-                    {fmtUtc(batch.created_at)}。
+                    {fmtBeijing(batch.created_at)}。
                   </p>
                 )}
 
@@ -445,15 +450,15 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
 
                 {proposals === null ? (
                   error ? null : <Loading />
-                ) : shown.length === 0 ? (
-                  <EmptyState text="这一批没有待处理的提议。换一个批次，或勾选「显示与当前基准价相同的提议」。" />
+                ) : table.filteredCount === 0 ? (
+                  <EmptyState text="没有匹配的提议。可以调整筛选、换一个批次，或勾选「显示与当前基准价相同的提议」。" />
                 ) : (
-                  <DataTable label="提议" scroll>
+                  <><DataTable label="提议" scroll>
                     <thead>
                       <tr>
                         <th className="import-pick" aria-label="选择" />
                         <th>模型</th>
-                        <th>生效时间（UTC）</th>
+                        <th>生效时间（北京时间）</th>
                         <th className="num">输入</th>
                         <th className="num">输出</th>
                         <th>标记</th>
@@ -461,7 +466,7 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
                       </tr>
                     </thead>
                     <tbody>
-                      {shown.map((p) => {
+                      {table.rows.map((p) => {
                         const entry = `${p.provider}/${p.model}`;
                         const rates = headline(p.card);
                         return (
@@ -508,7 +513,7 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
                                 )}
                               </span>
                             </td>
-                            <td className="tabular">{p.effective_from ? fmtUtc(p.effective_from) : "立即生效"}</td>
+                            <td className="tabular">{p.effective_from ? fmtBeijing(p.effective_from) : "立即生效"}</td>
                             <td className="num tabular">{rates ? usdPerMillion(rates.input) : "—"}</td>
                             <td className="num tabular">{rates ? usdPerMillion(rates.output) : "—"}</td>
                             <td className="import-flags text-caption">
@@ -522,7 +527,7 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
                         );
                       })}
                     </tbody>
-                  </DataTable>
+                  </DataTable><RecordTablePager page={table.page} pageSize={table.pageSize} onPageChange={table.setPage} onPageSizeChange={table.setPageSize} total={table.filteredCount} label="提议分页" /></>
                 )}
               </>
             )}
@@ -743,7 +748,7 @@ function ProposalPanel({
         <div className="note" role="status">
           {statusText(proposal.status)}
           {proposal.reject_reason && <>：{proposal.reject_reason}</>}
-          {proposal.decided_at && <span className="cell-note tabular">（{fmtUtc(proposal.decided_at)}）</span>}
+          {proposal.decided_at && <span className="cell-note tabular">（{fmtBeijing(proposal.decided_at)}）</span>}
         </div>
       ) : !canEdit ? null : confirmable(proposal) ? (
         <ConfirmForm batchId={batchId} proposal={proposal} models={models} onDecided={decided} />
@@ -870,7 +875,7 @@ function ConfirmForm({
         imports.confirm(batchId, proposal.id, { model_id: model, effective_from, attested: true });
       const answer = choosing ? await sendAt(resolver.current, send) : await send(proposal.effective_from!);
       if (answer === "invalid") {
-        setDetails([{ path: "/effective_from", message: "生效时间应写成 年-月-日 时:分，按 UTC 计" }]);
+        setDetails([{ path: "/effective_from", message: "生效时间应写成 年-月-日 时:分，按北京时间计" }]);
         focusRefusal();
         return;
       }
@@ -943,7 +948,7 @@ function ConfirmForm({
         <>
           {dated && (
             <p className="hint tabular">
-              该提议的生效时间 {fmtUtc(proposal.effective_from!)} 已过；价格只能从现在或将来开始生效，请选择生效时间。
+              该提议的生效时间 {fmtBeijing(proposal.effective_from!)} 已过；价格只能从现在或将来开始生效，请选择生效时间。
             </p>
           )}
           <EffectiveFrom
@@ -955,7 +960,7 @@ function ConfirmForm({
           />
         </>
       ) : (
-        <p className="hint tabular">生效时间：{fmtUtc(proposal.effective_from!)}（该提议自己的生效时间）</p>
+        <p className="hint tabular">生效时间：{fmtBeijing(proposal.effective_from!)}（该提议自己的生效时间）</p>
       )}
       {/* The time field shows a refusal of a typed time itself; a start the form stamped has no field to show it in. */}
       {startRefused && !(choosing && !stamped) && (
@@ -1074,6 +1079,7 @@ function CatalogueUpdates({
   const toast = useToast();
   const [saving, setSaving] = useState<string | null>(null);
   const [failure, setFailure] = useState<string | null>(null);
+  const table = useRecordTable({ items: rows, searchText: (row) => [row.name, row.model_id, row.catalogue_update?.entry_key ?? ""] });
 
   async function confirm(row: BaselineRow) {
     const update = row.catalogue_update;
@@ -1106,6 +1112,7 @@ function CatalogueUpdates({
           {failure}
         </div>
       )}
+      <RecordTableToolbar search={{ value: table.query, onChange: table.setQuery, label: "搜索目录更新", placeholder: "按模型或目录条目搜索" }}><p className="hint mb-0">已读取完整更新列表。</p></RecordTableToolbar>
       <DataTable label="官方目录已更新" compact>
         <thead>
           <tr>
@@ -1118,7 +1125,8 @@ function CatalogueUpdates({
           </tr>
         </thead>
         <tbody>
-          {rows.map((row) => {
+          {table.rows.length === 0 && <tr><td colSpan={canEdit ? 6 : 5}><EmptyState text="没有符合筛选条件的目录更新" /></td></tr>}
+          {table.rows.map((row) => {
             const update = row.catalogue_update!;
             const first = update.entries[0] ?? null;
             const rates = headline(first?.card ?? null);
@@ -1147,6 +1155,7 @@ function CatalogueUpdates({
           })}
         </tbody>
       </DataTable>
+      <RecordTablePager page={table.page} pageSize={table.pageSize} onPageChange={table.setPage} onPageSizeChange={table.setPageSize} total={table.filteredCount} label="官方目录更新分页" />
     </section>
   );
 }

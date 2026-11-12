@@ -1,8 +1,23 @@
-import type { ApiMetricValues } from "../lib/apiMetrics";
+import { requestOutcomeShares, type ApiMetricValues } from "../lib/apiMetrics";
 import { formatCount, formatRatio } from "../lib/chartFormat";
 import { Metric } from "./page";
 
 export type SuccessSummaryTotals = Pick<ApiMetricValues, "requests" | "succeeded_requests" | "failed_requests" | "unknown_outcome_requests" | "known_outcome_requests" | "unknown_final_attempts" | "success_rate">;
+
+/** 构成条包含未知结果；成功率仍使用原有的已知结果分母。 */
+export function ApiOutcomeComposition({ totals }: { totals?: Pick<SuccessSummaryTotals, "requests" | "succeeded_requests" | "failed_requests" | "unknown_outcome_requests"> }) {
+  const shares = requestOutcomeShares(totals);
+  const parts = [
+    { label: "成功", count: totals?.succeeded_requests, className: "bg-[var(--success)]" },
+    { label: "失败", count: totals?.failed_requests, className: "bg-[var(--danger)]" },
+    { label: "未知", count: totals?.unknown_outcome_requests, className: "bg-muted" },
+  ] as const;
+  const description = `最终请求构成：成功 ${formatCount(parts[0].count)}，失败 ${formatCount(parts[1].count)}，未知 ${formatCount(parts[2].count)}，共 ${formatCount(totals?.requests)}`;
+  return <div role="group" aria-label="最终请求构成" className="mt-5">
+    {shares === null ? <div aria-hidden="true" className="h-2.5 rounded-full bg-ink/7" /> : <div role="img" aria-label={description} className="flex h-2.5 overflow-hidden rounded-full bg-ink/7">{shares.map((share, index) => <span key={index} className={parts[index]?.className} style={{ width: `${share * 100}%` }} />)}</div>}
+    <p className="mt-3 text-caption text-muted">请求构成：{parts.map(part => `${part.label} ${formatCount(part.count)}`).join(" · ")}。按全部最终请求展示，未知结果保留。</p>
+  </div>;
+}
 
 /** 成功率直接使用同次全范围响应；未知结果始终另列，不补零或混入分母。 */
 export function ApiSuccessSummary({ totals }: { totals?: SuccessSummaryTotals }) {
@@ -14,12 +29,13 @@ export function ApiSuccessSummary({ totals }: { totals?: SuccessSummaryTotals })
   ];
   return <div role="group" aria-label="请求成功率摘要" className="min-w-0">
     <dl className="m-0 grid grid-cols-2 gap-x-6 gap-y-4 desktop:grid-cols-4">
-      {items.map(item => <div key={item.label} className="min-w-0"><dt className="font-mono text-micro text-muted">{item.label}</dt><dd className="m-0 mt-2"><Metric size="value">{item.value}</Metric></dd></div>)}
+      {items.map(item => <div key={item.label} className="min-w-0"><dt className="text-micro text-muted">{item.label}</dt><dd className="m-0 mt-2"><Metric size="value">{item.value}</Metric></dd></div>)}
     </dl>
+    <ApiOutcomeComposition totals={totals} />
     <dl className="m-0 mt-5 flex flex-wrap gap-x-6 gap-y-2 border-t border-ink/7 pt-4 text-caption">
-      <div><dt className="text-muted">已知结果样本（分母）</dt><dd className="m-0 mt-1 font-mono tabular-nums">{formatCount(totals?.known_outcome_requests)}</dd></div>
-      <div><dt className="text-muted">最终请求</dt><dd className="m-0 mt-1 font-mono tabular-nums">{formatCount(totals?.requests)}</dd></div>
-      <div><dt className="text-muted">最终状态未知的尝试</dt><dd className="m-0 mt-1 font-mono tabular-nums">{formatCount(totals?.unknown_final_attempts)}</dd></div>
+      <div><dt className="text-muted">已知结果样本（分母）</dt><dd className="m-0 mt-1 tabular-nums">{formatCount(totals?.known_outcome_requests)}</dd></div>
+      <div><dt className="text-muted">最终请求</dt><dd className="m-0 mt-1 tabular-nums">{formatCount(totals?.requests)}</dd></div>
+      <div><dt className="text-muted">最终状态未知的尝试</dt><dd className="m-0 mt-1 tabular-nums">{formatCount(totals?.unknown_final_attempts)}</dd></div>
     </dl>
     <p className="mt-3 text-caption text-muted">成功 ÷（成功 + 失败）；未知结果单列，不进入成功率分母。</p>
   </div>;

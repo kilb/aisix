@@ -1,8 +1,11 @@
+import { useRecordTable } from "../../lib/recordTable";
+import { RecordTools, RecordPager } from "../../components/RecordTools";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { TabProps } from "../../App";
 import { ApiError, reconciliation, tenants, type Reconciliation as Answer, type Tenant } from "../../lib/api";
 import { errorText } from "../../lib/fmt";
-import { fmtMicroCny, fmtUtc } from "../../lib/money";
+import { fmtMicroCny } from "../../lib/money";
+import { fmtBeijing } from "../../lib/time";
 import { reasonLabel } from "../../lib/pricingStatus";
 import { checkLabel, dropLabel, failureText } from "../../lib/reconcile";
 import { Button } from "../../ui/Button";
@@ -70,13 +73,16 @@ export function Reconciliation(_props: TabProps) {
   const unpriced = answer?.unpriced_last_24h;
   const reasonEntries = Object.entries(unpriced?.by_code ?? {});
   const canChartReasons = reasonEntries.every(([, value]) => exactInteger(value) !== null);
+  const [checkFilter, setCheckFilter] = useState("");
+  const mismatchTable = useRecordTable({ items: (answer?.mismatches ?? []).filter((m) => !checkFilter || m.check === checkFilter), searchText: (m) => [m.tenant_id, m.tenant_name ?? "", m.check], resetKey: `${tenantId}:${checkFilter}` });
+  const instanceTable = useRecordTable({ items: loss?.instances ?? [], searchText: (i) => [i.instance_id, i.hostname, i.credential_name], resetKey: tenantId });
 
   return (
     <>
       <PageHeader
         title="对账"
         eyebrow="计费 / 只读核对"
-        dataLead={answer ? <>检查于 {fmtUtc(answer.checked_at)}；账实不符 <strong>{formatCount(answer.mismatches.length)}</strong> 项，已计费未入账 <strong>{formatCount(answer.charged_without_entry)}</strong> 笔。</> : error ? "对账结果读取失败，请重试。" : "正在读取账本、计费和网关用量核对结果。"}
+        dataLead={answer ? <>检查于 {fmtBeijing(answer.checked_at)}；账实不符 <strong>{formatCount(answer.mismatches.length)}</strong> 项，已计费未入账 <strong>{formatCount(answer.charged_without_entry)}</strong> 笔。</> : error ? "对账结果读取失败，请重试。" : "正在读取账本、计费和网关用量核对结果。"}
         description="核对账本与扣费、调整、充值是否一致，并列出网关报告丢弃的用量。这里只读，不会改动任何数据。"
         actions={
           <>
@@ -147,28 +153,32 @@ export function Reconciliation(_props: TabProps) {
               ) : (
                 <>
                   <p className="hint text-caption">「扣费与计费」不符时，已计费但未入账的调用也在其中，同时计入下方「已计费但未入账」。</p>
-                  <DataTable label="账实不符">
-                    <thead>
-                      <tr>
-                        <th>租户</th>
-                        <th>项目</th>
-                        <th className="num">应为</th>
-                        <th className="num">实为</th>
-                        <th className="num">流水号</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {answer.mismatches.map((m) => (
-                        <tr key={`${m.tenant_id}-${m.check}`}>
-                          <td className="font-medium">{m.tenant_name || m.tenant_id}</td>
-                          <td>{checkLabel(m.check)}</td>
-                          <td className="num money">{fmtMicroCny(m.expected_micro_cny)}</td>
-                          <td className="num money text-ink">{fmtMicroCny(m.actual_micro_cny)}</td>
-                          <td className="num">{m.seq ?? "—"}</td>
+                  <>
+                    <RecordTools table={mismatchTable} label="账实不符"><label className="f filter"><span>核对项目</span><select aria-label="核对项目" value={checkFilter} onChange={(e) => setCheckFilter(e.target.value)}><option value="">全部</option>{[...new Set((answer?.mismatches ?? []).map((m) => m.check))].map((c) => <option key={c} value={c}>{checkLabel(c)}</option>)}</select></label></RecordTools>
+                    <DataTable label="账实不符">
+                      <thead>
+                        <tr>
+                          <th>租户</th>
+                          <th>项目</th>
+                          <th className="num">应为</th>
+                          <th className="num">实为</th>
+                          <th className="num">流水号</th>
                         </tr>
-                      ))}
-                    </tbody>
-                  </DataTable>
+                      </thead>
+                      <tbody>
+                        {mismatchTable.rows.map((m) => (
+                          <tr key={`${m.tenant_id}-${m.check}`}>
+                            <td className="font-medium">{m.tenant_name || m.tenant_id}</td>
+                            <td>{checkLabel(m.check)}</td>
+                            <td className="num money">{fmtMicroCny(m.expected_micro_cny)}</td>
+                            <td className="num money text-ink">{fmtMicroCny(m.actual_micro_cny)}</td>
+                            <td className="num">{m.seq ?? "—"}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </DataTable>
+                    <RecordPager table={mismatchTable} label="账实不符" />
+                  </>
                 </>
               )}
             </Card>
@@ -243,41 +253,45 @@ export function Reconciliation(_props: TabProps) {
             {loss.instances.length === 0 ? (
               <p className="hint mt-4 text-caption">近 24 小时内没有网关实例上报过心跳。</p>
             ) : (
-              <DataTable label="各实例的丢弃明细">
-                <thead>
-                  <tr>
-                    <th>凭据</th>
-                    <th>实例</th>
-                    <th>主机</th>
-                    <th>最近心跳（UTC）</th>
-                    <th>丢弃明细</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {loss.instances.map((i) => {
-                    const reasons = Object.entries(i.drops).filter(([, n]) => n > 0);
-                    return (
-                      <tr key={i.dp_id + i.instance_id}>
-                        <td className="font-medium">{i.credential_name}</td>
-                        <td className="tabular bl-wrap font-mono text-caption">{i.instance_id}</td>
-                        <td className="bl-wrap">{i.hostname}</td>
-                        <td className="tabular text-text-2">{fmtUtc(i.last_seen_at)}</td>
-                        <td>
-                          {reasons.length === 0 ? (
-                            <span className="hint">无</span>
-                          ) : (
-                            reasons.map(([reason, n]) => (
-                              <span key={reason} className="cell-note">
-                                {dropLabel(reason)}：{formatCount(n)}
-                              </span>
-                            ))
-                          )}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </DataTable>
+              <>
+                <RecordTools table={instanceTable} label="各实例的丢弃明细"></RecordTools>
+                <DataTable label="各实例的丢弃明细">
+                  <thead>
+                    <tr>
+                      <th>凭据</th>
+                      <th>实例</th>
+                      <th>主机</th>
+                      <th>最近心跳（北京时间）</th>
+                      <th>丢弃明细</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {instanceTable.rows.map((i) => {
+                      const reasons = Object.entries(i.drops).filter(([, n]) => n > 0);
+                      return (
+                        <tr key={i.dp_id + i.instance_id}>
+                          <td className="font-medium">{i.credential_name}</td>
+                          <td className="tabular bl-wrap font-mono text-caption">{i.instance_id}</td>
+                          <td className="bl-wrap">{i.hostname}</td>
+                          <td className="tabular text-text-2">{fmtBeijing(i.last_seen_at)}</td>
+                          <td>
+                            {reasons.length === 0 ? (
+                              <span className="hint">无</span>
+                            ) : (
+                              reasons.map(([reason, n]) => (
+                                <span key={reason} className="cell-note">
+                                  {dropLabel(reason)}：{formatCount(n)}
+                                </span>
+                              ))
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </DataTable>
+                <RecordPager table={instanceTable} label="各实例的丢弃明细" />
+              </>
             )}
           </Card>
           </BentoGrid>

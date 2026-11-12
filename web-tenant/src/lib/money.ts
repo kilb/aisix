@@ -56,40 +56,6 @@ export function fmtCnyPerMillion(s: string): string {
   return `¥${grouped(BigInt(whole))}.${decimals}`;
 }
 
-/** The day after a `YYYY-MM-DD` date, as `YYYY-MM-DD`. */
-function nextDay(date: string): string {
-  const [y = 0, m = 1, d = 1] = date.split("-").map(Number);
-  return new Date(Date.UTC(y, m - 1, d + 1)).toISOString().slice(0, 10);
-}
-
-/**
- * The half-open UTC interval covering whole days `fromDate` to `toDate`,
- * both inclusive: from the first day's midnight to the midnight after the
- * last.
- */
-export function utcRange(fromDate: string, toDate: string): { from: string; to: string } {
-  return { from: `${fromDate}T00:00:00Z`, to: `${nextDay(toDate)}T00:00:00Z` };
-}
-
-/** The UTC date of `now`, as `YYYY-MM-DD`, whatever the viewer's time zone. */
-export function todayUtc(now: Date = new Date()): string {
-  return now.toISOString().slice(0, 10);
-}
-
-/** An ISO instant as `2026-11-07 13:05:09 UTC`. A value that is not a date is shown as it came. */
-export function fmtUtc(iso: string): string {
-  const at = new Date(iso);
-  if (Number.isNaN(at.getTime())) return iso;
-  return `${at.toISOString().slice(0, 19).replace("T", " ")} UTC`;
-}
-
-/** The label of a usage period: its UTC day (`2026-11-07`) or its UTC month (`2026-11`). */
-export function periodLabel(periodStart: string, group: "day" | "month"): string {
-  const at = new Date(periodStart);
-  const day = Number.isNaN(at.getTime()) ? periodStart.slice(0, 10) : at.toISOString().slice(0, 10);
-  return group === "day" ? day : day.slice(0, 7);
-}
-
 /**
  * The decimal `s` with its point moved `places` to the right (left when
  * negative): exact, since only the point moves, and in its shortest form.

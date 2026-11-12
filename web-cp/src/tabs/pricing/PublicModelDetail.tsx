@@ -3,13 +3,14 @@ import { ArrowLeft } from "lucide-react";
 import { ApiError, channelModels, type PublicModel, type ServedBy } from "../../lib/api";
 import { messageFor } from "../../lib/errors";
 import { errorText } from "../../lib/fmt";
-import { fmtUtc } from "../../lib/money";
+import { fmtBeijing } from "../../lib/time";
 import { Button } from "../../ui/Button";
 import { DataTable } from "../../ui/DataTable";
 import { GroupList } from "../../ui/GroupName";
 import { useToast } from "../../ui/Toast";
 import { BentoGrid, Card, CardHeader, Metric, PageHeader, span } from "../../components/page";
 import { Lamp } from "../../ui/Lamp";
+import { RoutePolicy } from "../../ui/RoutePolicy";
 import { LibrarySyncOne } from "./LibrarySync";
 import { CardFooter, Count, WithForms } from "./kit";
 
@@ -135,7 +136,7 @@ export function PublicModelDetail({
       <PageHeader
         eyebrow="公共模型 / 账号与定价"
         title={<span className="pm-model-title">{model.name}</span>}
-        dataLead={served.length > 0 ? <>由 {served.length.toLocaleString("zh-CN")} 个启用账号服务，分布在 {enabledPriorities.length.toLocaleString("zh-CN")} 个优先级层。优先级从高到低、同层按权重排序。</> : "当前没有启用的账号映射，请先到上游账号重新接入。"}
+        dataLead={served.length > 0 ? <>由 {served.length.toLocaleString("zh-CN")} 个启用账号服务，分布在 {enabledPriorities.length.toLocaleString("zh-CN")} 个优先级层。按优先级分层展示，实际选路见当前策略；表中优先级从高到低，同层按权重排列。</> : "当前没有启用的账号映射，请先到上游账号重新接入。"}
         actions={
           <Button type="button" onClick={onBack}>
             <ArrowLeft aria-hidden />
@@ -143,8 +144,9 @@ export function PublicModelDetail({
           </Button>
         }
       />
+      <div className="mb-4"><RoutePolicy routing={model.effective_routing} /></div>
       <p className="mb-6 text-body text-ink-soft">
-        标识 <code className="break-all">{model.id}</code>，创建于 {fmtUtc(model.created_at)}。授权租户 {model.reachable_tenants} 个、密钥 {model.reachable_keys} 个。
+        标识 <code className="break-all">{model.id}</code>，创建于 {fmtBeijing(model.created_at)}。授权租户 {model.reachable_tenants} 个、密钥 {model.reachable_keys} 个。
       </p>
       <BentoGrid className="mb-3" aria-label="公共模型账号概览">
         <Card className={span.d7}>

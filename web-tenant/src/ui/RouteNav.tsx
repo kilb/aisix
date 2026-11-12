@@ -6,6 +6,7 @@ import { cn } from "../lib/cn";
 export interface RouteItem<Id extends string> {
   id: Id;
   label: string;
+  group?: string;
 }
 
 /**
@@ -87,8 +88,9 @@ export function RouteNav<Id extends string>({
     return (
       <nav ref={bar} className={cn("shell-route-nav", className)} role="tablist" aria-label={label} aria-orientation="vertical" onKeyDown={onKeyDown}>
         <ol className="shell-route-list" role="presentation">
-          {items.map((t) => (
+          {items.map((t, index) => (
             <li key={t.id} className="shell-route-item" role="presentation">
+              {t.group && items[index - 1]?.group !== t.group && <div className="shell-route-group">{t.group}</div>}
               <button
                 type="button"
                 role="tab"
@@ -98,7 +100,7 @@ export function RouteNav<Id extends string>({
                 aria-selected={t.id === current}
                 aria-current={t.id === current ? "page" : undefined}
                 aria-controls={`tab-${t.id}`}
-                tabIndex={t.id === current ? 0 : -1}
+                tabIndex={t.id === current || (index === 0 && !items.some((item) => item.id === current)) ? 0 : -1}
                 onClick={() => onSelect(t.id)}
               >
                 <span className="stop-name">{t.label}</span>

@@ -2,8 +2,8 @@ import { expect, test, type Locator, type Page } from "@playwright/test";
 import { STACK_START_TIMEOUT_MS, startStack, type Stack } from "./stack";
 
 /**
- * The portal's prices page: one tab per group the organisation is assigned,
- * each showing what that group charges for every granted model it can price,
+ * The portal's prices page: one parent per granted model, listing each assigned
+ * group and what that group charges for the model,
  * in ¥ per million tokens, at the price the organisation is actually charged
  * — its baseline × the group's rate, less its discount.
  *
@@ -38,7 +38,8 @@ let unpricedModelId: string;
 
 test.beforeAll(async () => {
   test.setTimeout(STACK_START_TIMEOUT_MS);
-  stack = await startStack();
+  stack = await startStack({ mockUpstream: false });
+  expect(stack.mockUpstreamUrl).toBe("");
   for (const [group, rate] of [
     [GROUP_A, RATE_A],
     [GROUP_B, RATE_B],
@@ -56,7 +57,7 @@ test.beforeAll(async () => {
       display_name: "acct-price-3f7",
       provider: "openai",
       api_key: "sk-acct-price-3f7-upstream",
-      api_base: `${stack.mockUpstreamUrl}/v1`,
+      api_base: "https://api.example.test/v1",
       groups: [GROUP_A.name, GROUP_B.name, GROUP_ROUTE.name],
     },
   });
@@ -134,58 +135,46 @@ async function login(page: Page, email: string): Promise<void> {
   await expect(page.getByRole("button", { name: "登出" })).toBeVisible();
 }
 
-/** The prices page's own tab list: one stop per assigned group. */
-function groupTabs(page: Page) {
-  return page.getByRole("tablist", { name: "分组" });
+/** 每个模型只出现一次；分组行属于该模型，不随分页分离。 */
+function modelEntry(page: Page, model: string): Locator {
+  return page.getByRole("table", { name: "模型单价", exact: true }).locator("tbody[data-price-model]")
+    .filter({ has: page.getByText(model, { exact: true }) });
 }
 
-/** One model's row: its name, then input, output, cache read and cache write in that column order. */
-async function rowPrices(panel: Locator, model: string, rate: string): Promise<void> {
-  await expect(panel.getByRole("row", { name: new RegExp(model) }).getByRole("cell")).toHaveText([
-    model,
+function groupRow(page: Page, model: string, group: string): Locator {
+  return modelEntry(page, model).locator(":scope > tr[data-price-group]").filter({ hasText: group });
+}
+
+/** 数值仍来自独立的基准价、分组换算率与组织优惠。 */
+async function rowPrices(page: Page, model: string, group: string, rate: string): Promise<void> {
+  const row = groupRow(page, model, group);
+  for (const [index, expected] of [
     yuanPerMillion(CARD.input, rate, DISCOUNT_BPS),
     yuanPerMillion(CARD.output, rate, DISCOUNT_BPS),
     yuanPerMillion(CARD.cache_read, rate, DISCOUNT_BPS),
     yuanPerMillion(CARD.cache_write, rate, DISCOUNT_BPS),
-  ]);
+  ].entries()) await expect(row.getByRole("cell").nth(index + 1)).toHaveText(expected);
 }
 
-test("每个分组一个页签，列出已授权模型的人民币单价（含组织折扣）", async ({ page }) => {
+test("模型下同时列出各授权分组的人民币单价（含组织折扣）", async ({ page }) => {
   await activeOrg("Prices Org 1b9", "owner@prices-1b9.test", [GROUP_A.name, GROUP_B.name]);
   await login(page, "owner@prices-1b9.test");
   await page.getByRole("tab", { name: "价格", exact: true }).click();
-
-  // One tab per assigned group, by display name, and nothing else offered.
-  const tabs = groupTabs(page);
-  await expect(tabs.getByRole("tab")).toHaveText([GROUP_A.display, GROUP_B.display]);
-  await expect(tabs.getByRole("tab", { name: GROUP_A.display })).toHaveAttribute("aria-selected", "true");
-
-  // The first group's tab: its description, the note, and one row per model
-  // it can price, at baseline × rate less the discount.
-  const panel = page.getByRole("tabpanel", { name: GROUP_A.display });
-  await expect(panel).toContainText(GROUP_A.description);
-  await expect(panel).toContainText("价格以人民币计，按实际用量计费");
-  await rowPrices(panel, "chat-price-3f7", RATE_A);
-  // The unpriced model is unknown rather than free, so it is not a row at all.
-  await expect(panel).not.toContainText("chat-noprice-3f7");
-
-  // The second group, at its own rate: the same baseline, a different price.
-  await tabs.getByRole("tab", { name: GROUP_B.display }).click();
-  await expect(tabs.getByRole("tab", { name: GROUP_B.display })).toHaveAttribute("aria-selected", "true");
-  const second = page.getByRole("tabpanel", { name: GROUP_B.display });
-  await expect(second).toContainText(GROUP_B.description);
-  await rowPrices(second, "chat-price-3f7", RATE_B);
-
-  // The discount is the API's and appears once: neither the undiscounted
-  // price nor the same price discounted a second time may be shown.
+  const model = modelEntry(page, "chat-price-3f7");
+  await expect(model).toHaveCount(1);
+  await expect(model.locator(":scope > tr[data-price-group]")).toHaveCount(2);
+  await expect(model).toContainText(GROUP_A.description);
+  await expect(model).toContainText(GROUP_B.description);
+  await expect(page.getByText(/价格以人民币计，按实际用量计费/)).toBeVisible();
+  await rowPrices(page, "chat-price-3f7", GROUP_A.display, RATE_A);
+  await rowPrices(page, "chat-price-3f7", GROUP_B.display, RATE_B);
+  await expect(modelEntry(page, "chat-noprice-3f7")).toHaveCount(0);
   const shown = await page.locator("body").innerText();
   for (const wrong of [
     yuanPerMillion(CARD.input, RATE_A, 0),
     yuanPerMillion(CARD.output, RATE_A, 0),
     yuanPerMillion(CARD.input, RATE_A, DISCOUNT_BPS * 2),
-  ]) {
-    expect(shown).not.toContain(wrong);
-  }
+  ]) expect(shown).not.toContain(wrong);
 });
 
 test("成员角色也能看到价格页", async ({ page }) => {
@@ -195,8 +184,8 @@ test("成员角色也能看到价格页", async ({ page }) => {
 
   // The tab is there for a member, and the page answers with the prices.
   await page.getByRole("tab", { name: "价格", exact: true }).click();
-  await expect(groupTabs(page).getByRole("tab")).toHaveText([GROUP_A.display]);
-  await rowPrices(page.getByRole("tabpanel", { name: GROUP_A.display }), "chat-price-3f7", RATE_A);
+  await expect(page.getByLabel("分组筛选").getByRole("option")).toHaveText(["全部分组", GROUP_A.display]);
+  await rowPrices(page, "chat-price-3f7", GROUP_A.display, RATE_A);
 });
 
 test("创建密钥时的查看价格链接打开所选分组", async ({ page }) => {
@@ -211,13 +200,14 @@ test("创建密钥时的查看价格链接打开所选分组", async ({ page }) 
   await page.getByRole("link", { name: "查看价格" }).click();
 
   await expect(page.getByRole("tab", { name: "价格", exact: true })).toHaveAttribute("aria-selected", "true");
-  await expect(groupTabs(page).getByRole("tab", { name: GROUP_B.display })).toHaveAttribute("aria-selected", "true");
-  await rowPrices(page.getByRole("tabpanel", { name: GROUP_B.display }), "chat-price-3f7", RATE_B);
+  await expect(page.getByLabel("分组筛选").locator("option:checked")).toHaveText(GROUP_B.display);
+  await rowPrices(page, "chat-price-3f7", GROUP_B.display, RATE_B);
+  await expect(groupRow(page, "chat-price-3f7", GROUP_A.display)).toHaveCount(0);
 
   // The address says which group it shows, so it can be shared or reloaded.
   expect(page.url()).toContain("prices");
   await page.reload();
-  await expect(groupTabs(page).getByRole("tab", { name: GROUP_B.display })).toHaveAttribute("aria-selected", "true");
+  await expect(page.getByLabel("分组筛选").locator("option:checked")).toHaveText(GROUP_B.display);
 
   // Back to 密钥 through the nav, and the same link again: it opens the same
   // group a second time, and the address follows the nav in between.
@@ -226,7 +216,7 @@ test("创建密钥时的查看价格链接打开所选分组", async ({ page }) 
   await page.getByRole("group", { name: "分组" }).getByRole("radio", { name: new RegExp(GROUP_B.display) }).check();
   await page.getByRole("link", { name: "查看价格" }).click();
   await expect(page.getByRole("tab", { name: "价格", exact: true })).toHaveAttribute("aria-selected", "true");
-  await expect(groupTabs(page).getByRole("tab", { name: GROUP_B.display })).toHaveAttribute("aria-selected", "true");
+  await expect(page.getByLabel("分组筛选").locator("option:checked")).toHaveText(GROUP_B.display);
 });
 
 test("价格页不出现分组的路由名", async ({ page }) => {
@@ -235,8 +225,8 @@ test("价格页不出现分组的路由名", async ({ page }) => {
   await page.getByRole("tab", { name: "价格", exact: true }).click();
 
   // The display name and description are what the page shows.
-  await expect(groupTabs(page).getByRole("tab")).toHaveText([GROUP_ROUTE.display]);
-  await expect(page.getByRole("tabpanel", { name: GROUP_ROUTE.display })).toContainText(GROUP_ROUTE.description);
+  await expect(page.getByLabel("分组筛选").getByRole("option")).toHaveText(["全部分组", GROUP_ROUTE.display]);
+  await expect(groupRow(page, "chat-price-3f7", GROUP_ROUTE.display)).toContainText(GROUP_ROUTE.description);
   // The routing name, which decides what the group reaches, appears nowhere.
   const seen = [await page.locator("body").innerText(), await page.content()];
   for (const text of seen) expect.soft(text).not.toContain(GROUP_ROUTE.name);
@@ -268,16 +258,16 @@ test("基准价单列 1 小时缓存写时，价格页在缓存写下另列这�
 
   await login(page, "owner@prices-5f8.test");
   await page.getByRole("tab", { name: "价格", exact: true }).click();
-  const panel = page.getByRole("tabpanel", { name: GROUP_A.display });
-  await expect(panel.getByRole("row", { name: /chat-1h-3f7/ }).getByRole("cell")).toHaveText([
-    "chat-1h-3f7",
+  const row = groupRow(page, "chat-1h-3f7", GROUP_A.display);
+  await expect(row.getByRole("cell").nth(0)).toContainText("2.7×");
+  await expect(row.getByRole("cell").filter({ hasNot: page.locator(".price-multiplier-value") })).toHaveText([
     yuanPerMillion(card.input, RATE_A, DISCOUNT_BPS),
     yuanPerMillion(card.output, RATE_A, DISCOUNT_BPS),
     yuanPerMillion(card.cache_read, RATE_A, DISCOUNT_BPS),
     `${yuanPerMillion(card.cache_write, RATE_A, DISCOUNT_BPS)}1 小时缓存写 ${yuanPerMillion(card.cache_write_1h, RATE_A, DISCOUNT_BPS)}`,
   ]);
   // The model without a one-hour rate in the same table keeps its five plain cells.
-  await rowPrices(panel, "chat-price-3f7", RATE_A);
+  await rowPrices(page, "chat-price-3f7", GROUP_A.display, RATE_A);
 });
 
 /**
@@ -305,15 +295,14 @@ test("基准价没有缓存价时，价格页的缓存读写按输入价显示�
 
   await login(page, "owner@prices-6a1.test");
   await page.getByRole("tab", { name: "价格", exact: true }).click();
-  const panel = page.getByRole("tabpanel", { name: GROUP_A.display });
+  const row = groupRow(page, "chat-nocache-3f7", GROUP_A.display);
   const input = yuanPerMillion(card.input, RATE_A, DISCOUNT_BPS);
-  await expect(panel.getByRole("row", { name: /chat-nocache-3f7/ }).getByRole("cell")).toHaveText([
-    "chat-nocache-3f7",
+  await expect(row.getByRole("cell").filter({ hasNot: page.locator(".price-multiplier-value") })).toHaveText([
     input,
     yuanPerMillion(card.output, RATE_A, DISCOUNT_BPS),
-    `${input}同输入价`,
-    `${input}同输入价`,
+    `${input}按输入价计费`,
+    `${input}按输入价计费`,
   ]);
   // A model with its own cache rates keeps its plain cells.
-  await rowPrices(panel, "chat-price-3f7", RATE_A);
+  await rowPrices(page, "chat-price-3f7", GROUP_A.display, RATE_A);
 });

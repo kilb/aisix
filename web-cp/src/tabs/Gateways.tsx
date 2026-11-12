@@ -1,3 +1,5 @@
+import { useRecordTable } from "../lib/recordTable";
+import { RecordTools, RecordPager } from "../components/RecordTools";
 import { useCallback, useEffect, useState } from "react";
 import type { TabProps } from "../App";
 import { Field, useRefusalFocus } from "../ui/Field";
@@ -102,6 +104,9 @@ export function Gateways({ operator }: TabProps) {
     }
   }
 
+  const [onlineFilter, setOnlineFilter] = useState("");
+  const [versionFilter, setVersionFilter] = useState("");
+  const table = useRecordTable({ items: (instances ?? []).filter((i) => (!onlineFilter || (i.online ? "online" : "offline") === onlineFilter) && (!versionFilter || (i.version_matches_cp === null ? "unknown" : i.version_matches_cp ? "match" : "mismatch") === versionFilter)), searchText: (i) => [i.instance_id, i.hostname, i.credential_name, i.version], resetKey: `${onlineFilter}:${versionFilter}` });
   const online = instances?.filter((i) => i.online).length ?? 0;
   const skewed = instances?.filter((i) => i.version_matches_cp === false).length ?? 0;
   const valid = credentials?.filter((c) => !c.revoked_at).length ?? 0;
@@ -167,41 +172,45 @@ export function Gateways({ operator }: TabProps) {
             ) : instances.length === 0 ? (
               <EmptyState mark="gateway" text="还没有网关发来心跳。" />
             ) : (
-              <DataTable label="网关实例">
-                <thead>
-                  <tr>
-                    <th>凭据</th>
-                    <th>主机</th>
-                    <th>版本</th>
-                    <th className="right">已应用修订</th>
-                    <th>最近心跳</th>
-                    <th>状态</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {instances.map((i) => (
-                    <tr key={`${i.dp_id}/${i.instance_id}`}>
-                      <td className="font-medium">{i.credential_name}</td>
-                      <td>
-                        <code>{i.hostname}</code>
-                      </td>
-                      <td>
-                        <code>{i.version}</code>
-                        {i.version_matches_cp === false && (
-                          <span className="cell-note">
-                            <Lamp state="rejected">版本与控制面不一致</Lamp>
-                          </span>
-                        )}
-                      </td>
-                      <td className="right num">{i.applied_revision}</td>
-                      <td className="text-muted">{fmtTime(i.last_seen_at)}</td>
-                      <td>
-                        <Lamp state={i.online ? "applied" : "disabled"}>{i.online ? "在线" : "离线"}</Lamp>
-                      </td>
+              <>
+                <RecordTools table={table} label="网关实例"><label className="f filter"><span>在线状态</span><select aria-label="在线状态" value={onlineFilter} onChange={(e) => setOnlineFilter(e.target.value)}><option value="">全部</option><option value="online">在线</option><option value="offline">离线</option></select></label><label className="f filter"><span>版本状态</span><select aria-label="版本状态" value={versionFilter} onChange={(e) => setVersionFilter(e.target.value)}><option value="">全部</option><option value="match">一致</option><option value="mismatch">不一致</option><option value="unknown">无法比较</option></select></label></RecordTools>
+                <DataTable label="网关实例">
+                  <thead>
+                    <tr>
+                      <th>凭据</th>
+                      <th>主机</th>
+                      <th>版本</th>
+                      <th className="right">已应用修订</th>
+                      <th>最近心跳</th>
+                      <th>状态</th>
                     </tr>
-                  ))}
-                </tbody>
-              </DataTable>
+                  </thead>
+                  <tbody>
+                    {table.rows.map((i) => (
+                      <tr key={`${i.dp_id}/${i.instance_id}`}>
+                        <td className="font-medium">{i.credential_name}</td>
+                        <td>
+                          <code>{i.hostname}</code>
+                        </td>
+                        <td>
+                          <code>{i.version}</code>
+                          {i.version_matches_cp === false && (
+                            <span className="cell-note">
+                              <Lamp state="rejected">版本与控制面不一致</Lamp>
+                            </span>
+                          )}
+                        </td>
+                        <td className="right num">{i.applied_revision}</td>
+                        <td className="text-muted">{fmtTime(i.last_seen_at)}</td>
+                        <td>
+                          <Lamp state={i.online ? "applied" : "disabled"}>{i.online ? "在线" : "离线"}</Lamp>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </DataTable>
+                <RecordPager table={table} label="网关实例" />
+              </>
             )}
           </Card>
         }

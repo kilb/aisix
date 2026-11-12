@@ -141,11 +141,12 @@ pub struct ChannelModelRow {
     pub weight: i32,
     pub enabled: bool,
     pub direct_model_id: Uuid,
+    pub cooldown: Option<Value>,
 }
 
 /// The columns a [`ChannelModelRow`] is read from.
 const CHANNEL_COLUMNS: &str = "id, provider_key_id, public_model_id, upstream_model, priority, \
-                              weight, enabled, direct_model_id";
+                              weight, enabled, direct_model_id, cooldown";
 
 /// The display name of the direct document for `public_name` served by the
 /// account named `provider_key_display_name`: `<public name>#<account>`.
@@ -209,7 +210,7 @@ pub async fn priceable_models(conn: &mut PgConnection) -> Result<Vec<(Uuid, Stri
 ///
 /// `provider` and `provider_key_id` come from the account's own document;
 /// `model_name` is `upstream_model`, or the public name when the row sets
-/// none. No `cost`, `pricing_key`, `retries`, `cooldown` or
+/// none. No `cost`, `pricing_key`, `retries` or
 /// `background_model_check`: the control plane never prices a target, and
 /// per-account timeouts are not part of this shape.
 ///
@@ -224,7 +225,7 @@ pub fn direct_doc(
     provider_key_display_name: &str,
     provider: &str,
 ) -> Value {
-    json!({
+    let mut doc = json!({
         "display_name": direct_display_name(&public.name, provider_key_display_name),
         "provider": provider,
         "model_name": channel
@@ -233,7 +234,11 @@ pub fn direct_doc(
             .unwrap_or(public.name.as_str()),
         "provider_key_id": channel.provider_key_id.to_string(),
         "internal": true,
-    })
+    });
+    if let Some(cooldown) = &channel.cooldown {
+        doc["cooldown"] = cooldown.clone();
+    }
+    doc
 }
 
 /// The routing model document for `public` over `channels`.
@@ -1040,6 +1045,7 @@ pub struct ServedBy {
     pub priority: i32,
     pub weight: i32,
     pub enabled: bool,
+    pub cooldown: Option<Value>,
 }
 
 /// The channels of `public_model_id`, joined to each account's live document.
@@ -1086,6 +1092,7 @@ async fn served_by(
             priority: row.priority,
             weight: row.weight,
             enabled: row.enabled,
+            cooldown: row.cooldown,
         });
     }
     Ok(served)
@@ -1101,6 +1108,8 @@ pub struct PublicModelView {
     /// The routing settings the operator set, as stored; `{}` when none.
     /// `targets` is not part of it, and is read from `served_by`.
     pub routing: Value,
+    /// 当前生成资源里的真实路由；尚未生成或已撤销时为 null。
+    pub effective_routing: Option<Value>,
     /// [`PublicModelUse::tenants`]: what refuses a removal, which an
     /// all-scope tenant never does. Not who can call the model; that is
     /// `reachable_tenants`.
@@ -1200,12 +1209,17 @@ async fn view(
 ) -> Result<PublicModelView, ApiError> {
     let uses = references(conn, row.id).await?;
     let (reachable_tenants, reachable_keys) = reach.of(row);
+    let effective_routing = store::get(&mut *conn, Kind::Models, row.id)
+        .await?
+        .filter(|resource| !resource.deleted)
+        .and_then(|resource| resource.doc.get("routing").cloned());
     Ok(PublicModelView {
         id: row.id,
         name: row.name.clone(),
         enabled: row.enabled,
         served_by: served_by(conn, row.id).await?,
         routing: row.routing.clone(),
+        effective_routing,
         tenants: uses.tenants,
         keys: uses.keys,
         reachable_tenants,
@@ -1248,6 +1262,7 @@ pub struct ChannelModelView {
     pub enabled: bool,
     /// Whether this account serves the public model at all.
     pub served: bool,
+    pub cooldown: Option<Value>,
 }
 
 /// `GET /admin/public-models` → `{items: [PublicModel]}`.
@@ -1807,6 +1822,7 @@ pub async fn list_channels(
                             weight: row.map(|c| c.weight).unwrap_or(1),
                             enabled: row.map(|c| c.enabled).unwrap_or(false),
                             served: row.is_some(),
+                            cooldown: row.and_then(|c| c.cooldown.clone()),
                         })
                         .map_err(ApiError::internal)
                     })
@@ -1836,6 +1852,8 @@ pub struct PutBody {
     weight: Option<i32>,
     #[serde(default)]
     enabled: Option<bool>,
+    #[serde(default, deserialize_with = "present")]
+    cooldown: Option<Value>,
 }
 
 /// A field's value when the body gave it, `None` when it was absent: so
@@ -1883,7 +1901,38 @@ pub async fn put_channel(
         priority,
         weight,
         enabled,
+        cooldown,
     } = body;
+    // 保留原始 JSON 先按核心严格模型验证，不能经 typed 解析丢掉未知字段。
+    let cooldown = match cooldown {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(value) => {
+            let probe = json!({
+                "display_name": "cooldown",
+                "provider": "openai",
+                "model_name": "cooldown",
+                "provider_key_id": Uuid::nil().to_string(),
+                "cooldown": value,
+            });
+            crate::resources::validate::validate_strict(Kind::Models, &probe).map_err(
+                |details| {
+                    ApiError::validation(
+                        details
+                            .into_iter()
+                            .map(|mut detail| {
+                                if !detail.path.starts_with("/cooldown") {
+                                    detail.path = "/cooldown".to_string();
+                                }
+                                detail
+                            })
+                            .collect(),
+                    )
+                },
+            )?;
+            Some(Some(value))
+        }
+    };
     let mut problems = Vec::new();
     let given_upstream = match given_upstream(upstream_model.as_ref()) {
         Ok(given) => given,
@@ -1947,7 +1996,7 @@ pub async fn put_channel(
                         };
                         sqlx::query_as(&format!(
                             "UPDATE channel_models SET upstream_model = $2, priority = $3, \
-                               weight = $4, enabled = $5, updated_at = now() \
+                               weight = $4, enabled = $5, cooldown = $6, updated_at = now() \
                              WHERE id = $1 RETURNING {CHANNEL_COLUMNS}"
                         ))
                         .bind(row.id)
@@ -1955,6 +2004,7 @@ pub async fn put_channel(
                         .bind(priority.unwrap_or(row.priority))
                         .bind(weight.unwrap_or(row.weight))
                         .bind(enabled.unwrap_or(row.enabled))
+                        .bind(cooldown.clone().unwrap_or_else(|| row.cooldown.clone()))
                         .fetch_one(&mut *conn)
                         .await
                         .map_err(DbError::from)?
@@ -1962,8 +2012,8 @@ pub async fn put_channel(
                     None => sqlx::query_as(&format!(
                         "INSERT INTO channel_models \
                          (provider_key_id, public_model_id, upstream_model, priority, weight, \
-                          enabled, direct_model_id, created_by) \
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING {CHANNEL_COLUMNS}"
+                          enabled, direct_model_id, created_by, cooldown) \
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING {CHANNEL_COLUMNS}"
                     ))
                     .bind(provider_key_id)
                     .bind(public_model_id)
@@ -1976,6 +2026,7 @@ pub async fn put_channel(
                     .bind(enabled.unwrap_or(true))
                     .bind(Uuid::new_v4())
                     .bind(Some(auth.id))
+                    .bind(cooldown.clone().flatten())
                     .fetch_one(&mut *conn)
                     .await
                     .map_err(DbError::from)?,
@@ -1997,6 +2048,7 @@ pub async fn put_channel(
                             "weight": row.weight,
                             "enabled": row.enabled,
                             "created": created,
+                            "cooldown": row.cooldown,
                         }),
                     },
                 )
@@ -2010,6 +2062,7 @@ pub async fn put_channel(
                     "weight": row.weight,
                     "enabled": row.enabled,
                     "served": true,
+                    "cooldown": row.cooldown,
                     "warnings": [],
                 }))
             }

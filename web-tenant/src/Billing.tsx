@@ -2,12 +2,14 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from "react"
 import {
   ApiError,
   billing,
+  call,
   budgets as budgetApi,
   keys as keyApi,
   type Budget,
   type KeyQuota,
   type LedgerKind,
   type LedgerSummaryRow,
+  type Page,
   type QuotaLevel,
   type SessionMember,
   type TenantKey,
@@ -15,7 +17,10 @@ import {
 } from "./lib/api";
 import { formulaBalance, formulaLedger, type FormulaBalance as Balance, type FormulaLedgerItem as LedgerItem } from "./lib/formulaApi";
 import { formMessageFor, messageFor } from "./lib/errors";
-import { fmtMicroCny, fmtUtc, isCnyAmount, periodLabel, todayUtc, utcRange } from "./lib/money";
+import { fmtMicroCny, isCnyAmount } from "./lib/money";
+import { beijingRange, defaultCalendarRange, fmtBeijing, periodLabel } from "./lib/time";
+import { useRecordTable, type RecordPageSize } from "./lib/recordTable";
+import { RecordTablePager, RecordTableToolbar } from "./ui/RecordTable";
 import { BalanceReadout, Money, type ReadoutStop } from "./ui/BalanceReadout";
 import { Button } from "./ui/Button";
 import { DataTable, Loading } from "./ui/DataTable";
@@ -41,8 +46,6 @@ function moneyText(value: number | string | bigint): string {
 /** Longest a top-up's note and reference may be: the control plane's own limits. */
 const NOTE_MAX = 500;
 const REFERENCE_MAX = 128;
-/** Top-ups listed at most: the control plane's page maximum. */
-const TOPUPS_SHOWN = 500;
 
 /** One figure of the balance: its label over the amount, a tile of the card's grid. */
 function Reading({ label, value, hero = false }: { label: string; value: ReactNode; hero?: boolean }) {
@@ -64,11 +67,6 @@ function Section({ title, number, actions, children, className = span.d12, tone 
   );
 }
 
-/** The filters above a list: labelled controls on one wrapping row. */
-function Filters({ children }: { children: ReactNode }) {
-  return <div className="filters flex flex-wrap items-start gap-x-3 gap-y-4 [&>.field]:w-full sm:[&>.field]:w-48">{children}</div>;
-}
-
 /**
  * 「账户」: what the organisation can still spend, its top-up requests and
  * its ledger. Owners and admins read the readout for one of their keys;
@@ -78,7 +76,10 @@ export function Billing({ member }: { member: SessionMember }) {
   const [balance, setBalance] = useState<Balance | null>(null);
   const [balanceErr, setBalanceErr] = useState<string | null>(null);
   const [topups, setTopups] = useState<Topup[] | null>(null);
-  const [topupsErr, setTopupsErr] = useState<string | null>(null);
+  const [topupsVersion, setTopupsVersion] = useState(0);
+  const rememberTopups = useCallback((items: Topup[]) => {
+    setTopups((current) => [...new Map([...(current ?? []), ...items].map((item) => [item.id, item])).values()]);
+  }, []);
 
   const loadBalance = useCallback(async () => {
     try {
@@ -86,14 +87,6 @@ export function Billing({ member }: { member: SessionMember }) {
       setBalanceErr(null);
     } catch (e) {
       setBalanceErr(failure(e));
-    }
-  }, []);
-  const loadTopups = useCallback(async () => {
-    try {
-      setTopups((await billing.topups({ limit: TOPUPS_SHOWN })).items);
-      setTopupsErr(null);
-    } catch (e) {
-      setTopupsErr(failure(e));
     }
   }, []);
 
@@ -122,9 +115,8 @@ export function Billing({ member }: { member: SessionMember }) {
 
   useEffect(() => {
     void loadBalance();
-    void loadTopups();
     void loadTeam();
-  }, [loadBalance, loadTopups, loadTeam]);
+  }, [loadBalance, loadTeam]);
 
   return (
     <>
@@ -132,8 +124,8 @@ export function Billing({ member }: { member: SessionMember }) {
       <BentoGrid className="billing">
         <BalancePanel balance={balance} team={team} teamErr={teamErr} onRetryTeam={() => void loadTeam()} err={balanceErr} />
         <Readout member={member} balance={balance} team={team} teamErr={teamErr} onRetryTeam={() => void loadTeam()} />
-        <TopupList items={topups} err={topupsErr} />
-        <TopupForm onRequested={() => { void loadTopups(); void loadBalance(); }} />
+        <TopupList reloadKey={topupsVersion} onLoaded={rememberTopups} />
+        <TopupForm onRequested={() => { setTopupsVersion((version) => version + 1); void loadBalance(); }} />
         <Ledger topups={topups} />
       </BentoGrid>
     </>
@@ -231,7 +223,7 @@ function BalanceCalculation({ balance }: { balance: Balance }) {
       {f.available_overflow ? <p className="note crit" role="alert">余额加信用额度超出支持范围，可用额度显示上限值，调用已按现有规则停止。</p> : (
         <p className="break-words tabular">余额 {moneyText(f.balance_micro_cny)} + 信用额度 {moneyText(f.credit_limit_micro_cny)} = 可用额度 {moneyText(f.available_micro_cny)}</p>
       )}
-      <p className="hint">截至 {fmtUtc(f.as_of)} 的已入账快照。待审批充值与尚未入账用量不计入；信用额度是透支上限，预算限制另行生效。</p>
+      <p className="hint">截至 {fmtBeijing(f.as_of)} 的已入账快照。待审批充值与尚未入账用量不计入；信用额度是透支上限，预算限制另行生效。</p>
     </section>
   );
 }
@@ -484,6 +476,101 @@ function TopupForm({ onRequested }: { onRequested: () => void }) {
   );
 }
 
+/** 游标只从成功响应延续；本地搜索保留已加载页，下一页仍可继续读取更早记录。 */
+function useBillingRecords<T>({
+  fetchPage,
+  keyOf,
+  searchText,
+  resetKey,
+  enabled = true,
+  onLoaded,
+}: {
+  fetchPage: (before: number | undefined, limit: RecordPageSize) => Promise<Page<T>>;
+  keyOf: (item: T) => string | number;
+  searchText: (item: T) => string | readonly string[];
+  resetKey: string;
+  enabled?: boolean;
+  onLoaded?: (items: T[]) => void;
+}) {
+  const [pages, setPages] = useState<Page<T>[] | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const generation = useRef(0);
+  const loading = useRef(false);
+  const fetchRef = useRef(fetchPage);
+  const loadedRef = useRef(onLoaded);
+  fetchRef.current = fetchPage;
+  loadedRef.current = onLoaded;
+  const items = pages?.flatMap((page) => page.items) ?? [];
+  const table = useRecordTable({ items, searchText, resetKey, initialPageSize: 25 });
+  const next = pages?.at(-1)?.next_before ?? null;
+  const queryRef = useRef(table.query);
+  queryRef.current = table.query;
+
+  useEffect(() => {
+    const mine = ++generation.current;
+    setPages(enabled ? null : []);
+    setErr(null);
+    table.setPage(1);
+    loading.current = enabled;
+    setBusy(enabled);
+    if (enabled) {
+      fetchRef.current(undefined, table.pageSize).then(
+        (page) => {
+          if (mine !== generation.current) return;
+          setPages([page]);
+          loadedRef.current?.(page.items);
+        },
+        (error: unknown) => {
+          if (mine !== generation.current) return;
+          setPages([]);
+          setErr(failure(error));
+        },
+      ).finally(() => {
+        if (mine !== generation.current) return;
+        loading.current = false;
+        setBusy(false);
+      });
+    }
+    return () => { generation.current += 1; };
+    // 业务筛选和页大小才更换游标链；回调及本地搜索不改变服务端查询范围。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [resetKey, enabled, table.pageSize]);
+
+  async function changePage(page: number) {
+    if (loading.current) return;
+    if (page <= table.pageCount) {
+      table.setPage(page);
+      return;
+    }
+    if (page !== table.page + 1 || next === null) return;
+    const mine = generation.current;
+    const queryAtLoad = table.query;
+    loading.current = true;
+    setBusy(true);
+    setErr(null);
+    try {
+      const answer = await fetchRef.current(next, table.pageSize);
+      if (mine !== generation.current) return;
+      setPages((current) => {
+        const seen = new Set((current ?? []).flatMap((entry) => entry.items.map(keyOf)));
+        return [...(current ?? []), { ...answer, items: answer.items.filter((item) => !seen.has(keyOf(item))) }];
+      });
+      loadedRef.current?.(answer.items);
+      if (queryRef.current === queryAtLoad) table.setPage(table.filteredCount >= table.page * table.pageSize ? page : table.page);
+    } catch (error) {
+      if (mine === generation.current) setErr(failure(error));
+    } finally {
+      if (mine === generation.current) {
+        loading.current = false;
+        setBusy(false);
+      }
+    }
+  }
+
+  return { ...table, loaded: pages !== null, loadedCount: items.length, err, busy, hasNext: table.page < table.pageCount || next !== null, changePage };
+}
+
 // ── top-up history (充值记录) ────────────────────────────────────────────────────────────────
 
 const TOPUP_STATE: Record<Topup["status"], { text: string; lamp: LampState }> = {
@@ -499,18 +586,37 @@ function explanation(t: Topup): string | null {
   return t.note;
 }
 
-function TopupList({ items, err }: { items: Topup[] | null; err: string | null }) {
+function TopupList({ reloadKey, onLoaded }: { reloadKey: number; onLoaded: (items: Topup[]) => void }) {
+  const [status, setStatus] = useState<"" | Topup["status"]>("");
+  const records = useBillingRecords({
+    fetchPage: (before, limit) => billing.topups({ ...(status ? { status } : {}), before, limit }),
+    keyOf: (item) => item.id,
+    searchText: (item) => [item.origin === "tenant" ? item.reference ?? "" : "", item.requested_by?.display_name ?? ""],
+    resetKey: `${reloadKey}/${status}`,
+    onLoaded,
+  });
+  const { rows: items, err } = records;
   return (
     <Section number={3} title="充值记录" className={span.d7}>
-      <p className="text-caption text-muted">最多显示最近 {TOPUPS_SHOWN} 笔申请与平台入账记录；待审批总数见账户余额。</p>
+      <p className="text-caption text-muted">按时间读取申请与平台入账记录，搜索仅作用于已加载记录；待审批总数见账户余额。</p>
+      <RecordTableToolbar search={{ value: records.query, onChange: records.setQuery, label: "搜索已加载充值记录", placeholder: "付款凭证号、提交人" }}>
+        <Field label="充值状态">
+          <select value={status} onChange={(event) => setStatus(event.target.value as "" | Topup["status"])}>
+            <option value="">全部</option>
+            <option value="pending">待审批</option>
+            <option value="approved">已到账</option>
+            <option value="rejected">已驳回</option>
+          </select>
+        </Field>
+      </RecordTableToolbar>
       {err && (
         <div className="note crit" role="alert">
           {err}
         </div>
       )}
-      {items === null && !err && <Loading />}
-      {items !== null && items.length === 0 && <EmptyState text="还没有充值记录，在「申请充值」中填写金额即可提交申请" mark="route" />}
-      {items !== null && items.length > 0 && (
+      {!records.loaded && !err && <Loading />}
+      {records.loaded && items.length === 0 && !err && <EmptyState text={records.query ? "已加载记录中没有匹配的充值记录" : "所选范围内没有充值记录"} mark="route" />}
+      {items.length > 0 && (
         <DataTable label="充值记录">
           <thead>
             <tr>
@@ -518,8 +624,8 @@ function TopupList({ items, err }: { items: Topup[] | null; err: string | null }
               <th>状态</th>
               <th>来源</th>
               <th>提交人</th>
-              <th>提交时间（UTC）</th>
-              <th>处理时间（UTC）</th>
+              <th>提交时间（北京时间）</th>
+              <th>处理时间（北京时间）</th>
               <th>说明</th>
             </tr>
           </thead>
@@ -539,10 +645,10 @@ function TopupList({ items, err }: { items: Topup[] | null; err: string | null }
                   <td>{t.requested_by ? (t.requested_by.display_name ?? "—") : "平台"}</td>
                   {/* Below 1800px a time takes two lines, its date over its clock, so the list fits beside the form. */}
                   <td className="tabular max-[1799px]:whitespace-normal">
-                    <span className="block max-[1799px]:max-w-[6.5rem]">{fmtUtc(t.requested_at)}</span>
+                    <span className="block max-[1799px]:max-w-[6.5rem]">{fmtBeijing(t.requested_at)}</span>
                   </td>
                   <td className="tabular max-[1799px]:whitespace-normal">
-                    <span className="block max-[1799px]:max-w-[6.5rem]">{t.decided_at ? fmtUtc(t.decided_at) : "—"}</span>
+                    <span className="block max-[1799px]:max-w-[6.5rem]">{t.decided_at ? fmtBeijing(t.decided_at) : "—"}</span>
                   </td>
                   <td>
                     {why ? (
@@ -560,6 +666,7 @@ function TopupList({ items, err }: { items: Topup[] | null; err: string | null }
           </tbody>
         </DataTable>
       )}
+      <RecordTablePager label="充值记录分页" page={records.page} pageSize={records.pageSize} onPageChange={(page) => void records.changePage(page)} onPageSizeChange={records.setPageSize} loadedCount={records.loadedCount} hasNext={records.hasNext} busy={records.busy} />
     </Section>
   );
 }
@@ -568,23 +675,12 @@ function TopupList({ items, err }: { items: Topup[] | null; err: string | null }
 
 const KIND_LABEL: Record<LedgerKind, string> = { usage: "扣费", topup: "充值", adjustment: "调整" };
 
-/** The summary's range when no date is chosen: the last 30 days by day, the last 12 months by month. */
-function defaultRange(group: "day" | "month"): { from: string; to: string } {
-  const now = new Date();
-  const today = todayUtc(now);
-  const start =
-    group === "day"
-      ? new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - 29))
-      : new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 11, 1));
-  return utcRange(start.toISOString().slice(0, 10), today);
-}
-
 /** The instants a date filter names (either may be left empty), or null when the end is before the start. */
 function rangeOf(fromDate: string, toDate: string): { from?: string; to?: string } | null {
   if (fromDate && toDate && toDate < fromDate) return null;
   return {
-    ...(fromDate ? { from: utcRange(fromDate, fromDate).from } : {}),
-    ...(toDate ? { to: utcRange(toDate, toDate).to } : {}),
+    ...(fromDate ? { from: beijingRange(fromDate, fromDate).from } : {}),
+    ...(toDate ? { to: beijingRange(toDate, toDate).to } : {}),
   };
 }
 
@@ -592,82 +688,57 @@ function Ledger({ topups }: { topups: Topup[] | null }) {
   const [fromDate, setFromDate] = useState("");
   const [toDate, setToDate] = useState("");
   const [kind, setKind] = useState<"" | LedgerKind>("");
-  const [rows, setRows] = useState<LedgerItem[] | null>(null);
-  const [next, setNext] = useState<number | null>(null);
-  const [err, setErr] = useState<string | null>(null);
-  const [more, setMore] = useState(false);
   const range = rangeOf(fromDate, toDate);
-  // The latest first-page request: an answer to an older filter is dropped,
-  // and so is a later page of one.
-  const ticket = useRef(0);
-
+  const records = useBillingRecords({
+    fetchPage: (before, limit) => formulaLedger({ ...range, ...(kind ? { kind } : {}), before, limit }),
+    keyOf: (item) => item.seq,
+    searchText: (item) => [item.event_id ?? "", item.model?.name ?? "", KIND_LABEL[item.kind]],
+    resetKey: `${fromDate}/${toDate}/${kind}`,
+    enabled: range !== null,
+  });
+  const { rows, err } = records;
+  const [extraTopups, setExtraTopups] = useState<Topup[]>([]);
+  const originScope = `${fromDate}/${toDate}/${kind}/${records.pageSize}/${records.page}/${records.query}`;
+  const [originFailures, setOriginFailures] = useState<{ scope: string; items: Record<string, string> }>({ scope: "", items: {} });
+  const failedOrigins = originFailures.scope === originScope ? originFailures.items : {};
+  const originOf = new Map([...(topups ?? []), ...extraTopups].map((item) => [item.id, item.origin]));
+  const missingTopups = [...new Set(rows.flatMap((row) => row.topup_id && !originOf.has(row.topup_id) && !failedOrigins[row.topup_id] ? [row.topup_id] : []))];
+  const missingKey = missingTopups.join(",");
+  const originErr = rows.flatMap((row) => row.topup_id && failedOrigins[row.topup_id] ? [failedOrigins[row.topup_id]] : [])[0] ?? null;
   useEffect(() => {
-    const mine = ++ticket.current;
-    // A continuation of the old filter is not this one's: its busy state and
-    // its cursor go with it, so no next page is asked for until this
-    // filter's first page names one.
-    setMore(false);
-    setNext(null);
-    // An end before the start names nothing: the field says so, and no row shows.
-    if (!range) {
-      setRows([]);
-      setErr(null);
-      return;
-    }
-    setRows(null);
-    formulaLedger({ ...range, ...(kind ? { kind } : {}) }).then(
-      (p) => {
-        if (mine !== ticket.current) return;
-        setRows(p.items);
-        setNext(p.next_before);
-        setErr(null);
-      },
-      (e: unknown) => {
-        if (mine !== ticket.current) return;
-        setRows([]);
-        setNext(null);
-        setErr(failure(e));
-      },
-    );
-    // `range` is derived from the two dates.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [fromDate, toDate, kind]);
-
-  async function loadMore() {
-    if (!range || next === null) return;
-    const mine = ticket.current;
-    setMore(true);
-    try {
-      const p = await formulaLedger({ ...range, ...(kind ? { kind } : {}), before: next });
-      if (mine !== ticket.current) return;
-      // A page never repeats a seq, but a double click must not either.
-      setRows((cur) => {
-        const seen = new Set((cur ?? []).map((r) => r.seq));
-        return [...(cur ?? []), ...p.items.filter((r) => !seen.has(r.seq))];
+    if (!missingKey) return;
+    let live = true;
+    void Promise.allSettled(missingKey.split(",").map(async (id) => (await call<Topup>("GET", `/billing/topups/${encodeURIComponent(id)}`)).data)).then((answers) => {
+      if (!live) return;
+      const loaded = answers.flatMap((answer) => answer.status === "fulfilled" ? [answer.value] : []);
+      setExtraTopups((current) => [...new Map([...current, ...loaded].map((item) => [item.id, item])).values()]);
+      const ids = missingKey.split(",");
+      const failures: Record<string, string> = {};
+      answers.forEach((answer, index) => {
+        const id = ids[index];
+        if (id && answer.status === "rejected") failures[id] = failure(answer.reason);
       });
-      setNext(p.next_before);
-    } catch (e) {
-      if (mine === ticket.current) setErr(failure(e));
-    } finally {
-      if (mine === ticket.current) setMore(false);
-    }
-  }
-
-  const originOf = new Map((topups ?? []).map((t) => [t.id, t.origin]));
+      if (Object.keys(failures).length > 0) {
+        setOriginFailures((current) => ({ scope: originScope, items: { ...(current.scope === originScope ? current.items : {}), ...failures } }));
+      }
+    });
+    return () => { live = false; };
+  }, [missingKey, originScope]);
   const explain = (r: LedgerItem): string => {
     if (r.kind === "usage") return r.model?.name ?? "—";
     if (r.kind === "adjustment") return "重新计价调整";
-    return r.topup_id && originOf.get(r.topup_id) === "operator" ? "平台入账" : "充值";
+    if (!r.topup_id || !originOf.has(r.topup_id)) return "充值（来源未读取）";
+    return originOf.get(r.topup_id) === "operator" ? "平台入账" : "充值";
   };
 
   return (
     <>
       <Section number={5} title="余额流水">
-        <Filters>
-          <Field label="开始日期（UTC）" error={range ? null : "结束日期不能早于开始日期"}>
+        <RecordTableToolbar search={{ value: records.query, onChange: records.setQuery, label: "搜索已加载余额流水", placeholder: "模型、事件 ID、类型" }}>
+          <Field label="开始日期（北京时间）" error={range ? null : "结束日期不能早于开始日期"}>
             <input type="date" value={fromDate} max={toDate || undefined} onChange={(e) => setFromDate(e.target.value)} />
           </Field>
-          <Field label="结束日期（UTC）">
+          <Field label="结束日期（北京时间）">
             <input type="date" value={toDate} min={fromDate || undefined} onChange={(e) => setToDate(e.target.value)} />
           </Field>
           <Field label="类型">
@@ -678,19 +749,21 @@ function Ledger({ topups }: { topups: Topup[] | null }) {
               <option value="adjustment">调整</option>
             </select>
           </Field>
-        </Filters>
+        </RecordTableToolbar>
+        <p className="hint">搜索仅作用于已加载记录；日期和类型筛选由服务端执行，金额与余额快照不随分页重算。</p>
+        {originErr && <p className="note crit" role="alert">入账来源读取失败：{originErr}</p>}
         {err && (
           <div className="note crit" role="alert">
             {err}
           </div>
         )}
-        {rows === null && range && <Loading />}
-        {rows !== null && rows.length === 0 && !err && <EmptyState text="所选范围内没有流水" mark="route" />}
-        {rows !== null && rows.length > 0 && (
+        {!records.loaded && range && <Loading />}
+        {records.loaded && rows.length === 0 && !err && <EmptyState text={records.query ? "已加载记录中没有匹配的流水" : "所选范围内没有流水"} mark="route" />}
+        {rows.length > 0 && (
           <DataTable label="余额流水">
             <thead>
               <tr>
-                <th>时间（UTC）</th>
+                <th>时间（北京时间）</th>
                 <th>类型</th>
                 <th className="num">金额</th>
                 <th className="num">余额</th>
@@ -701,7 +774,7 @@ function Ledger({ topups }: { topups: Topup[] | null }) {
             <tbody>
               {rows.map((r) => (
                 <tr key={r.seq}>
-                  <td className="tabular">{fmtUtc(r.posted_at)}</td>
+                  <td className="tabular">{fmtBeijing(r.posted_at)}</td>
                   <td>{KIND_LABEL[r.kind] ?? r.kind}</td>
                   <td className="num">
                     <Money micro={r.calculation.amount_micro_cny} />
@@ -722,13 +795,7 @@ function Ledger({ topups }: { topups: Topup[] | null }) {
             </tbody>
           </DataTable>
         )}
-        {next !== null && (
-          <div className="flex justify-center border-t border-ink/7 pt-4">
-            <Button size="sm" busy={more} busyLabel="加载中…" onClick={() => void loadMore()}>
-              加载更多
-            </Button>
-          </div>
-        )}
+        <RecordTablePager label="余额流水分页" page={records.page} pageSize={records.pageSize} onPageChange={(page) => void records.changePage(page)} onPageSizeChange={records.setPageSize} loadedCount={records.loadedCount} hasNext={records.hasNext} busy={records.busy} />
       </Section>
       <Summary range={range} fromDate={fromDate} toDate={toDate} />
     </>
@@ -757,7 +824,7 @@ function Summary({ range, fromDate, toDate }: { range: { from?: string; to?: str
       return;
     }
     // A summary needs both ends: the dates left empty read as the default span.
-    const fallback = defaultRange(group);
+    const fallback = defaultCalendarRange(group);
     setRows(null);
     billing
       .ledgerSummary({ group, from: range.from ?? fallback.from, to: range.to ?? fallback.to })
@@ -777,6 +844,7 @@ function Summary({ range, fromDate, toDate }: { range: { from?: string; to?: str
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [group, fromDate, toDate]);
 
+  const table = useRecordTable({ items: rows ?? [], searchText: (row) => periodLabel(row.period_start, group), resetKey: `${group}/${fromDate}/${toDate}` });
   const points = ledgerSummaryChartPoints(rows ?? [], group);
 
   return (
@@ -794,8 +862,9 @@ function Summary({ range, fromDate, toDate }: { range: { from?: string; to?: str
       }
     >
       <p className="hint">
-        {chosen ? "使用余额流水的日期范围（UTC）" : group === "day" ? "未选日期时汇总最近 30 天（UTC）" : "未选日期时汇总最近 12 个月（UTC）"}
+        {chosen ? "使用余额流水的日期范围（北京时间）" : group === "day" ? "未选日期时汇总最近 30 天（北京时间）" : "未选日期时汇总最近 12 个月（北京时间）"}
       </p>
+      <RecordTableToolbar search={{ value: table.query, onChange: table.setQuery, label: "搜索汇总期间", placeholder: "期间日期" }} />
       {err && (
         <div className="note crit" role="alert">
           {err}
@@ -820,7 +889,7 @@ function Summary({ range, fromDate, toDate }: { range: { from?: string; to?: str
             </tr>
           </thead>
           <tbody>
-            {rows.map((r) => (
+            {table.rows.map((r) => (
               <tr key={r.period_start}>
                 <td className="tabular">{periodLabel(r.period_start, group)}</td>
                 <td className="num">
@@ -840,6 +909,8 @@ function Summary({ range, fromDate, toDate }: { range: { from?: string; to?: str
           </tbody>
         </DataTable>
       </>}
+      {rows !== null && rows.length > 0 && table.filteredCount === 0 && <EmptyState text="没有匹配的汇总期间" mark="route" />}
+      <RecordTablePager label="按期汇总分页" page={table.page} pageSize={table.pageSize} onPageChange={table.setPage} onPageSizeChange={table.setPageSize} total={table.filteredCount} busy={rows === null} />
     </Section>
   );
 }

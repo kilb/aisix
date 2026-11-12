@@ -3,10 +3,13 @@ import type { TabProps } from "../../App";
 import { JsonEditor } from "../../components/JsonEditor";
 import { pricing, type CatalogueEntry } from "../../lib/api";
 import { errorText, fmtInt } from "../../lib/fmt";
+import { fmtBeijing } from "../../lib/time";
 import { TIER_HINT } from "../../lib/rateUnits";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
 import { EmptyState } from "../../ui/EmptyState";
+import { useRecordTable } from "../../lib/recordTable";
+import { RecordTablePager, RecordTableToolbar } from "../../ui/RecordTable";
 import { BentoGrid, Card, CardHeader, CardMessage, Metric, MetricSkeleton, PageHeader, span } from "../../components/page";
 import { RankBars } from "../../components/charts";
 import { CardLines } from "./LibrarySync";
@@ -20,6 +23,12 @@ export function Catalogue(_props: TabProps) {
   const [items, setItems] = useState<CatalogueEntry[] | null>(null);
   const [failure, setFailure] = useState<string | null>(null);
   const [open, setOpen] = useState<string | null>(null);
+  const [source, setSource] = useState("");
+  const records = useRecordTable({
+    items: (items ?? []).filter((entry) => source === "" || Boolean(entry.source_url) === (source === "sourced")),
+    searchText: (entry) => [entry.key, ...entry.aliases],
+    resetKey: source,
+  });
 
   useEffect(() => {
     const live = { on: true };
@@ -64,6 +73,10 @@ export function Catalogue(_props: TabProps) {
         {!failure && items === null && <Loading />}
         {items !== null && items.length === 0 && <EmptyState text="目录里还没有条目" />}
         {items !== null && items.length > 0 && (
+          <>
+          <RecordTableToolbar search={{ value: records.query, onChange: records.setQuery, label: "搜索目录", placeholder: "目录标识或别名" }}>
+            <label className="f filter"><span>来源</span><select value={source} onChange={(e) => setSource(e.target.value)}><option value="">全部</option><option value="sourced">附来源链接</option><option value="missing">无来源链接</option></select></label>
+          </RecordTableToolbar>
           <DataTable label="价格目录">
             <thead>
               <tr>
@@ -76,7 +89,8 @@ export function Catalogue(_props: TabProps) {
               </tr>
             </thead>
             <tbody>
-              {items.map((e) => {
+              {records.rows.length === 0 && <tr><td colSpan={6}><EmptyState text="没有符合筛选条件的目录条目" /></td></tr>}
+              {records.rows.map((e) => {
                 const id = rowId(e);
                 const expanded = open === id;
                 return (
@@ -106,7 +120,7 @@ export function Catalogue(_props: TabProps) {
                         )}
                       </td>
                       <td className="tabular">
-                        {e.effective_from ? `${e.effective_from} 起` : (e.as_of ?? "—")}
+                        {e.effective_from ? `${fmtBeijing(e.effective_from)} 起` : (e.as_of ?? "—")}
                         {e.effective_from && e.as_of && <div className="cell-note">抄录于 {e.as_of}</div>}
                       </td>
                       {/* The notes take whatever width is left, cut to one line: their whole text is in the title and the expanded entry. */}
@@ -151,6 +165,8 @@ export function Catalogue(_props: TabProps) {
               })}
             </tbody>
           </DataTable>
+          <RecordTablePager page={records.page} pageSize={records.pageSize} onPageChange={records.setPage} onPageSizeChange={records.setPageSize} total={records.filteredCount} label="价格目录分页" />
+          </>
         )}
       </Card>
     </>

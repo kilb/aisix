@@ -1,21 +1,22 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { deltaWord, outcomeUnknown, previewAgainBody, utcInputToIso, utcInputValue } from "./repricing.ts";
+import { parseBeijingInput, beijingInputValue } from "./time.ts";
+import { deltaWord, outcomeUnknown, previewAgainBody } from "./repricing.ts";
 
 // Shaped like the client's `ApiError`, whose class needs a TypeScript transform to load here.
 const err = (status: number, code: string) => Object.assign(new Error("x"), { status, code });
 
-test("a datetime-local value is read as UTC, whatever the viewer's zone", () => {
-  assert.equal(utcInputToIso("2026-11-07T08:30"), "2026-11-07T08:30:00.000Z");
-  assert.equal(utcInputToIso("2026-11-07T08:30:15"), "2026-11-07T08:30:15.000Z");
-  assert.equal(utcInputValue(new Date("2026-11-07T08:30:15.999Z")), "2026-11-07T08:30:15");
+test("a datetime-local value is read as Beijing time, whatever the viewer's zone", () => {
+  assert.equal(parseBeijingInput("2026-11-07T08:30"), "2026-11-07T00:30:00.000Z");
+  assert.equal(parseBeijingInput("2026-11-07T08:30:15"), "2026-11-07T00:30:15.000Z");
+  assert.equal(beijingInputValue(new Date("2026-11-07T08:30:15.999Z")), "2026-11-07T16:30:15");
 });
 
 test("a value that is not a date is refused, not rolled over", () => {
-  assert.equal(utcInputToIso(""), null);
-  assert.equal(utcInputToIso("2026-02-30T00:00"), null);
-  assert.equal(utcInputToIso("2026-11-07"), null);
-  assert.equal(utcInputToIso("2026-11-07T25:00"), null);
+  assert.equal(parseBeijingInput(""), null);
+  assert.equal(parseBeijingInput("2026-02-30T00:00"), null);
+  assert.equal(parseBeijingInput("2026-11-07"), null);
+  assert.equal(parseBeijingInput("2026-11-07T25:00"), null);
 });
 
 test("the sign of a total says who is owed", () => {

@@ -1,3 +1,5 @@
+import { useRecordTable } from "../../lib/recordTable";
+import { RecordTools, RecordPager } from "../../components/RecordTools";
 import { useCallback, useEffect, useState } from "react";
 import type { TabProps } from "../../App";
 import { billing, type BillingAccount } from "../../lib/api";
@@ -36,6 +38,9 @@ export function Accounts({ canEdit, operator, onGoto }: TabProps) {
     setItems((list) => list && list.map((a) => (a.tenant_id === account.tenant_id ? account : a)));
   }, []);
 
+  const [modeFilter, setModeFilter] = useState("");
+  const [balanceFilter, setBalanceFilter] = useState("");
+  const table = useRecordTable({ items: (items ?? []).filter((a) => (!modeFilter || a.billing_mode === modeFilter) && (!balanceFilter || (a.exhausted ? "exhausted" : "available") === balanceFilter)), searchText: (a) => [a.tenant_id, a.tenant_name], resetKey: `${modeFilter}:${balanceFilter}` });
   const open = items?.find((a) => a.tenant_id === selected) ?? null;
   // The figures count the customer tenants: the platform's own is never stopped and carries no balance to watch.
   const customers = items?.filter((a) => !a.is_internal) ?? null;
@@ -132,45 +137,49 @@ export function Accounts({ canEdit, operator, onGoto }: TabProps) {
             ) : items.length === 0 ? (
               <EmptyState text="还没有已开通的租户。" />
             ) : (
-              <DataTable label="账户列表">
-                <thead>
-                  <tr>
-                    <th>租户</th>
-                    <th>模式</th>
-                    <th className="num">余额</th>
-                    <th className="num">信用额度</th>
-                    <th className="num">可用</th>
-                    <th>状态</th>
-                    <th className="num side-opt">待审批充值</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {items.map((a) => (
-                    <tr key={a.tenant_id}>
-                      <td>
-                        <span className="flex min-w-0 items-center gap-2">
-                          <button
-                            type="button"
-                            className="link-button bl-name"
-                            title={a.tenant_name}
-                            aria-expanded={selected === a.tenant_id}
-                            onClick={() => setSelected(a.tenant_id)}
-                          >
-                            {a.tenant_name}
-                          </button>
-                          {a.is_internal && <span className="tag">平台内部</span>}
-                        </span>
-                      </td>
-                      <td className="text-text-2">{MODE_LABEL[a.billing_mode] ?? a.billing_mode}</td>
-                      <td className="num">{fmtMicroCny(a.balance_micro_cny)}</td>
-                      <td className="num">{fmtMicroCny(a.credit_limit_micro_cny)}</td>
-                      <td className="num font-normal">{fmtMicroCny(a.available_micro_cny)}</td>
-                      <td>{a.is_internal ? <span className="text-muted-foreground">—</span> : <AccountState account={a} />}</td>
-                      <td className="num side-opt">{fmtInt(a.pending_topups)}</td>
+              <>
+                <RecordTools table={table} label="账户列表"><label className="f filter"><span>计费模式</span><select aria-label="计费模式" value={modeFilter} onChange={(e) => setModeFilter(e.target.value)}><option value="">全部</option><option value="prepaid">预付</option><option value="postpaid">后付</option></select></label><label className="f filter"><span>余额状态</span><select aria-label="余额状态" value={balanceFilter} onChange={(e) => setBalanceFilter(e.target.value)}><option value="">全部</option><option value="exhausted">额度已用尽</option><option value="available">额度未用尽</option></select></label></RecordTools>
+                <DataTable label="账户列表">
+                  <thead>
+                    <tr>
+                      <th>租户</th>
+                      <th>模式</th>
+                      <th className="num">余额</th>
+                      <th className="num">信用额度</th>
+                      <th className="num">可用</th>
+                      <th>状态</th>
+                      <th className="num side-opt">待审批充值</th>
                     </tr>
-                  ))}
-                </tbody>
-              </DataTable>
+                  </thead>
+                  <tbody>
+                    {table.rows.map((a) => (
+                      <tr key={a.tenant_id}>
+                        <td>
+                          <span className="flex min-w-0 items-center gap-2">
+                            <button
+                              type="button"
+                              className="link-button bl-name"
+                              title={a.tenant_name}
+                              aria-expanded={selected === a.tenant_id}
+                              onClick={() => setSelected(a.tenant_id)}
+                            >
+                              {a.tenant_name}
+                            </button>
+                            {a.is_internal && <span className="tag">平台内部</span>}
+                          </span>
+                        </td>
+                        <td className="text-text-2">{MODE_LABEL[a.billing_mode] ?? a.billing_mode}</td>
+                        <td className="num">{fmtMicroCny(a.balance_micro_cny)}</td>
+                        <td className="num">{fmtMicroCny(a.credit_limit_micro_cny)}</td>
+                        <td className="num font-normal">{fmtMicroCny(a.available_micro_cny)}</td>
+                        <td>{a.is_internal ? <span className="text-muted-foreground">—</span> : <AccountState account={a} />}</td>
+                        <td className="num side-opt">{fmtInt(a.pending_topups)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </DataTable>
+                <RecordPager table={table} label="账户列表" />
+              </>
             )}
           </Card>
         </div>

@@ -5,12 +5,13 @@ import { messageFor } from "../../lib/errors";
 import { errorText } from "../../lib/fmt";
 import { droppedFieldText, flagText } from "../../lib/importReview";
 import { longContextLines, longContextText } from "../../lib/library";
-import { fmtUtc } from "../../lib/money";
+import { fmtBeijing } from "../../lib/time";
 import { safeHttpUrl } from "../../lib/safeUrl";
 import { Button } from "../../ui/Button";
 import { DataTable } from "../../ui/DataTable";
 import { EmptyState } from "../../ui/EmptyState";
-import { Field } from "../../ui/Field";
+import type { RecordPageSize } from "../../lib/recordTable";
+import { RecordTablePager, RecordTableToolbar } from "../../ui/RecordTable";
 import { useToast } from "../../ui/Toast";
 import { usdPerMillion } from "./Baselines";
 import { LibrarySync } from "./LibrarySync";
@@ -19,24 +20,26 @@ import { BentoGrid, Card, CardHeader, CardMessage, ChartSkeleton, Metric, Metric
 import { CardFooter, Count } from "./kit";
 import { PriceCardDetails } from "./PriceCardDetails";
 
-/** How many entries one search lists. */
-const LISTED = 50;
-
 /** Where the library in use came from, in one line. */
 export function libraryWords(meta: LibraryMeta): string {
   const origin = meta.origin === "fetch" ? "在线获取" : meta.origin === "upload" ? "文件上传" : meta.origin;
   const revision = meta.source_ref ? `，版本 ${meta.source_ref}` : "";
-  return `${origin}${revision}，${meta.entries} 个条目，获取于 ${fmtUtc(meta.fetched_at)}（${meta.created_by.email}）`;
+  return `${origin}${revision}，${meta.entries} 个条目，获取于 ${fmtBeijing(meta.fetched_at)}（${meta.created_by.email}）`;
 }
 
 /** 价格 · 价格库: the stored copy of the public price dataset, its search, and the sync of baselines from it. */
 export function PriceLibrary({ canEdit, onGoto }: TabProps) {
   const toast = useToast();
   const [q, setQ] = useState("");
+  const [pageNumber, setPageNumber] = useState(1);
+  const [pageSize, setPageSize] = useState<RecordPageSize>(25);
+  const [loading, setLoading] = useState(false);
   const [page, setPage] = useState<LibraryPage | null>(null);
   const [expanded, setExpanded] = useState<string | null>(null);
   // 摘要标注最近一次成功读取的查询，输入变化时不把旧结果冒充新命中。
   const [loadedQuery, setLoadedQuery] = useState("");
+  const [loadedPage, setLoadedPage] = useState(1);
+  const [loadedPageSize, setLoadedPageSize] = useState<RecordPageSize>(25);
   const [error, setError] = useState<string | null>(null);
   const [fetching, setFetching] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
@@ -44,26 +47,44 @@ export function PriceLibrary({ canEdit, onGoto }: TabProps) {
   const [generation, setGeneration] = useState(0);
   /** The newest search sent: an answer to an older one is dropped. */
   const latest = useRef(0);
+  const libraryId = useRef<string | null>(null);
 
-  const load = useCallback(async (text: string) => {
+  const load = useCallback(async (text: string, number: number, size: RecordPageSize) => {
     const n = ++latest.current;
+    setLoading(true);
     try {
-      const next = await library.browse(text, LISTED);
+      const next = await library.browse(text, size, (number - 1) * size);
       if (n !== latest.current) return;
+      const replaced = libraryId.current !== null && libraryId.current !== next.library?.id;
+      libraryId.current = next.library?.id ?? null;
+      const lastPage = Math.max(1, Math.ceil(next.total / size));
+      if (number > 1 && (replaced || number > lastPage)) {
+        setPageNumber(replaced ? 1 : lastPage);
+        return;
+      }
       setPage(next);
       setLoadedQuery(text.trim());
+      setLoadedPage(number);
+      setLoadedPageSize(size);
       setError(null);
     } catch (e) {
       if (n !== latest.current) return;
       setError(errorText(e));
+    } finally {
+      if (n === latest.current) setLoading(false);
     }
   }, []);
 
   // A search is read once typing pauses.
   useEffect(() => {
-    const timer = setTimeout(() => void load(q), 250);
-    return () => clearTimeout(timer);
-  }, [q, load]);
+    const timer = setTimeout(() => void load(q, pageNumber, pageSize), 250);
+    return () => {
+      clearTimeout(timer);
+      latest.current += 1;
+    };
+  }, [q, pageNumber, pageSize, load]);
+
+  const refresh = () => load(q, pageNumber, pageSize);
 
   async function update() {
     if (fetching) return;
@@ -73,7 +94,8 @@ export function PriceLibrary({ canEdit, onGoto }: TabProps) {
       await library.fetch();
       toast("价格库已更新");
       setGeneration((g) => g + 1);
-      await load(q);
+      if (pageNumber === 1) await load(q, 1, pageSize);
+      else setPageNumber(1);
     } catch (e) {
       const detail = e instanceof ApiError && e.details.length > 0 ? `：${e.details.map((d) => d.message).join("；")}` : "";
       setFetchError(`${e instanceof ApiError ? messageFor(e) : errorText(e)}${detail}`);
@@ -93,7 +115,7 @@ export function PriceLibrary({ canEdit, onGoto }: TabProps) {
         title="价格库"
         dataLead={meta && page ? <>当前价格库包含 {meta.entries.toLocaleString("zh-CN")} 个条目；{loadedQuery ? `「${loadedQuery}」匹配` : "全部搜索范围有"} {page.total.toLocaleString("zh-CN")} 条，显示 {page.items.length.toLocaleString("zh-CN")} 条。核对完整价格与来源后再同步基准价。</> : "使用实际存储的价格库检索模型，核对来源与完整价格后再同步。"}
         actions={
-          <Button type="button" icon="refresh" onClick={() => void load(q)}>
+          <Button type="button" icon="refresh" onClick={() => void refresh()}>
             刷新
           </Button>
         }
@@ -102,7 +124,7 @@ export function PriceLibrary({ canEdit, onGoto }: TabProps) {
       <BentoGrid className="mb-3" aria-label="价格库概览">
         <Card className={span.d7}>
           <CardHeader number={1} title="当前价格库" description="实际存储版本 · 全部条目" />
-          {meta ? <Metric size="hero">{meta.entries.toLocaleString("zh-CN")}</Metric> : page ? <CardMessage>还没有价格库</CardMessage> : error ? <CardMessage onRetry={() => void load(q)}>未能读取价格库</CardMessage> : <MetricSkeleton />}
+          {meta ? <Metric size="hero">{meta.entries.toLocaleString("zh-CN")}</Metric> : page ? <CardMessage>还没有价格库</CardMessage> : error ? <CardMessage onRetry={() => void refresh()}>未能读取价格库</CardMessage> : <MetricSkeleton />}
           <p className="library-status mt-5 text-body text-ink-soft" aria-label="价格库状态">
             {page === null ? error ? "价格库读取失败。" : "正在读取价格库…" : meta ? <>当前价格库：{libraryWords(meta)}</> : "还没有价格库。"}
           </p>
@@ -127,8 +149,8 @@ export function PriceLibrary({ canEdit, onGoto }: TabProps) {
         </Card>
         <Card tone="inverse" className={span.d5Wide}>
           <CardHeader number={2} title="搜索命中" description={page ? loadedQuery ? `最近成功查询：${loadedQuery}` : "最近成功查询：全部条目" : "等待读取搜索结果"} />
-          {meta && page ? <Metric size="display">{page.total.toLocaleString("zh-CN")}</Metric> : page ? <CardMessage>更新或上传数据集后即可搜索</CardMessage> : error ? <CardMessage onRetry={() => void load(q)}>未能读取搜索结果</CardMessage> : <MetricSkeleton />}
-          <p className="mt-4 text-body text-on-inverse-muted">搜索支持名称、ID、别名与供应商。每次最多显示 {LISTED} 条；缩小搜索范围可定位其余模型。</p>
+          {meta && page ? <Metric size="display">{page.total.toLocaleString("zh-CN")}</Metric> : page ? <CardMessage>更新或上传数据集后即可搜索</CardMessage> : error ? <CardMessage onRetry={() => void refresh()}>未能读取搜索结果</CardMessage> : <MetricSkeleton />}
+          <p className="mt-4 text-body text-on-inverse-muted">搜索支持名称、ID、别名与供应商。结果按供应商和模型 ID 排序，可翻页查看全部命中。</p>
           {page && meta && <CardFooter className="justify-start border-surface/12 text-caption text-on-inverse-muted">当前显示 {page.items.length} 条，其中 {displayedLongContext} 条含长上下文价、{displayedFlagged} 条带审核标记。此计数仅覆盖当前显示条目。</CardFooter>}
         </Card>
       </BentoGrid>
@@ -137,18 +159,12 @@ export function PriceLibrary({ canEdit, onGoto }: TabProps) {
           number={3}
           title={<>价格库条目{page?.library && <Count n={page.total} />}</>}
           description="输入、输出为默认档基础价；完整价格卡保留所有维度、服务档与长上下文价格。"
-          actions={
-            <div className="w-full sm:w-80 [&_.field]:mb-0">
-              <Field label="搜索模型" hint="按模型名称、ID、别名或供应商">
-                {(aria) => <input {...aria} type="search" autoComplete="off" value={q} onChange={(e) => setQ(e.target.value)} />}
-              </Field>
-            </div>
-          }
         />
+        <RecordTableToolbar search={{ value: q, onChange: (value) => { latest.current += 1; setQ(value); setPageNumber(1); }, label: "搜索模型", placeholder: "模型名称、ID、别名或供应商" }} />
         {error && (
           <div className="note crit" role="alert">
             {error}{" "}
-            <Button type="button" onClick={() => void load(q)}>
+            <Button type="button" onClick={() => void refresh()}>
               重试
             </Button>
           </div>
@@ -161,7 +177,7 @@ export function PriceLibrary({ canEdit, onGoto }: TabProps) {
           <EmptyState text="没有匹配的模型。" />
         ) : (
           <>
-            <div className="library-browser-table"><DataTable label="价格库条目" scroll>
+            <div className="library-browser-table" aria-busy={loading}><DataTable label="价格库条目" scroll>
               <thead>
                 <tr>
                   <th>供应商</th>
@@ -209,7 +225,7 @@ export function PriceLibrary({ canEdit, onGoto }: TabProps) {
                       <td className="num tabular">{base?.output !== undefined ? usdPerMillion(base.output) : "—"}</td>
                       <td>
                         {e.card ? <Button type="button" kind="quiet" size="sm" aria-expanded={open} aria-controls={open ? detailId : undefined} aria-label={`${open ? "收起" : "展开"} ${entryId} 的完整价格卡`} onClick={() => setExpanded(open ? null : entryId)}>{open ? "收起价格" : "展开价格"}</Button> : <span className="text-muted">无可同步价格卡</span>}
-                        {e.prices_checked && <span className="cell-note">价格核对时间：{fmtUtc(e.prices_checked)}</span>}
+                        {e.prices_checked && <span className="cell-note">价格核对日期：{e.prices_checked}</span>}
                       </td>
                       <td>
                         {href ? (
@@ -240,11 +256,25 @@ export function PriceLibrary({ canEdit, onGoto }: TabProps) {
                 })}
               </tbody>
             </DataTable></div>
-            <CardFooter className="justify-start text-caption text-muted">
-              共 {page.total} 条{page.total > page.items.length ? `，显示前 ${page.items.length} 条；输入更多文字以缩小范围` : ""}
-            </CardFooter>
           </>
         )}
+        {page && meta && <RecordTablePager
+          page={loadedPage}
+          pageSize={loadedPageSize}
+          onPageChange={(number) => {
+            latest.current += 1;
+            if (number === pageNumber) void load(q, number, pageSize);
+            else setPageNumber(number);
+          }}
+          onPageSizeChange={(size) => {
+            latest.current += 1;
+            if (size === pageSize && pageNumber === 1) void load(q, 1, size);
+            else { setPageSize(size); setPageNumber(1); }
+          }}
+          total={page.total}
+          busy={loading || (error === null && (q.trim() !== loadedQuery || pageNumber !== loadedPage || pageSize !== loadedPageSize))}
+          label="价格库分页"
+        />}
       </Card>
       <LibrarySync canEdit={canEdit} generation={generation} cardNumber={4} />
     </>

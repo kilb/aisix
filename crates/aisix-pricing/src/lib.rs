@@ -27,8 +27,8 @@ pub use engine::{
 };
 pub use quote::{CustomerQuote, LongContextQuote, PriceRate, QuoteUnit, TierQuote};
 pub use rates::{
-    cny_per_million, cny_per_token, CnyPerUsd, Dimension, LongContextBand, MicroCny, Rate,
-    RateCard, RateCardError, Rates, ServiceTier, TierRates,
+    cny_per_million, cny_per_token, effective_multiplier, CnyPerUsd, Dimension, LongContextBand,
+    MicroCny, Rate, RateCard, RateCardError, Rates, ServiceTier, TierRates,
 };
 pub use usage::{BillableUsage, Inconsistency};
 

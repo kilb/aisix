@@ -1,3 +1,5 @@
+import { useRecordTable } from "../../lib/recordTable";
+import { RecordTools, RecordPager } from "../../components/RecordTools";
 import { createContext, useContext, useEffect, useRef, useState, type ComponentType, type ReactNode } from "react";
 import type { TabProps } from "../../App";
 import { Msg, type Note } from "../../components/Msg";
@@ -12,7 +14,8 @@ import {
   type UsageSummaryRow,
 } from "../../lib/api";
 import { errorText } from "../../lib/fmt";
-import { fmtMicroCny, fmtUtc, isCnyAmount, microCnyToInput, periodLabel, todayUtc, utcRange } from "../../lib/money";
+import { fmtMicroCny, isCnyAmount, microCnyToInput } from "../../lib/money";
+import { fmtBeijing, periodLabel, todayBeijing, beijingRange, defaultCalendarRange, budgetPeriodRange } from "../../lib/time";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
 import { EmptyState } from "../../ui/EmptyState";
@@ -262,17 +265,13 @@ function BillingMode({ account, canEdit, onChanged }: RegionProps) {
 /** The longest span the backend sums, by period (billing/range.rs). */
 const MAX_SUMMARY_DAYS = { day: 92, month: 731 } as const;
 
-/**
- * The two date fields: whole UTC days, inclusive at both ends. `group` is set for a summary,
- * whose span the backend caps: a range it would refuse is refused here, with its reason, so
- * 重试 never resends the same refused query.
- */
+// 日期控件按北京自然日包含首尾；汇总范围超限时先展示可修正的错误。
 function useDays(group?: "day" | "month") {
   const [from, setFrom] = useState("");
   const [to, setTo] = useState("");
   let problem: string | null = null;
   if (from !== "" && to !== "" && to < from) problem = "结束日期不能早于开始日期";
-  else if (from !== "" && to === "" && from > todayUtc()) problem = "开始日期不能晚于今天";
+  else if (from !== "" && to === "" && from > todayBeijing()) problem = "开始日期不能晚于今天";
   else if (group) {
     const range = summaryRange(group, from, to);
     const span = (Date.parse(range.to) - Date.parse(range.from)) / 86_400_000;
@@ -282,10 +281,10 @@ function useDays(group?: "day" | "month") {
   const backwards = problem !== null;
   const fields = (
     <>
-      <Field label="开始日期（UTC）">
+      <Field label="开始日期（北京时间）">
         <input type="date" value={from} onChange={(e) => setFrom(e.target.value)} />
       </Field>
-      <Field label="结束日期（UTC）" error={problem}>
+      <Field label="结束日期（北京时间）" error={problem}>
         {(aria) => <input type="date" value={to} onChange={(e) => setTo(e.target.value)} {...aria} />}
       </Field>
     </>
@@ -293,19 +292,10 @@ function useDays(group?: "day" | "month") {
   return { from, to, backwards, fields };
 }
 
-function utcDay(daysBack: number): string {
-  const now = new Date();
-  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - daysBack)).toISOString().slice(0, 10);
-}
-
-/** The range a summary covers when no dates are chosen: 30 days by day, 12 months by month, up to today (UTC). */
+// 默认查询最近30个北京自然日或12个月；API边界继续传标准时间。
 function summaryRange(group: "day" | "month", from: string, to: string): { from: string; to: string } {
-  const now = new Date();
-  const start =
-    group === "day"
-      ? utcDay(29)
-      : new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 11, 1)).toISOString().slice(0, 10);
-  return utcRange(from || start, to || todayUtc());
+  const defaults = defaultCalendarRange(group);
+  return { from: from ? beijingRange(from, from).from : defaults.from, to: to ? beijingRange(to, to).to : defaults.to };
 }
 
 function Failed({ message, onRetry }: { message: string; onRetry: () => void }) {
@@ -339,8 +329,8 @@ function Ledger({ account }: RegionProps) {
   // Bumped whenever the first page shown changes: a continuation started
   // under an earlier one is not this list's, so its answer is dropped.
   const moreSeq = useRef(0);
-  const range = days.from || days.to ? utcRange(days.from || "1970-01-01", days.to || todayUtc()) : {};
-  const query = { ...(days.from || days.to ? range : {}), ...(kind ? { kind } : {}) };
+  const range = days.from || days.to ? beijingRange(days.from || "1970-01-01", days.to || todayBeijing()) : {};
+  const query = { ...(days.from || days.to ? range : {}), ...(kind ? { kind } : {}), limit: 50 };
   // The filter as chosen, not the instants it resolves to (an open end moves
   // with the date).
   const key = JSON.stringify([days.from, days.to, kind]);
@@ -363,6 +353,8 @@ function Ledger({ account }: RegionProps) {
 
   const items = base ? [...base.page.items, ...(more?.items ?? [])] : null;
   const next = base === null ? null : more ? more.next : base.page.next_before;
+
+  const table = useRecordTable({ items: items ?? [], searchText: (i) => [i.event_id ?? "", i.model?.name ?? "", i.topup_id ?? "", i.repricing_run_id ?? ""], resetKey: `${account.tenant_id}:${key}` });
 
   async function loadMore() {
     if (base === null || next === null) return;
@@ -400,41 +392,39 @@ function Ledger({ account }: RegionProps) {
       ) : items.length === 0 ? (
         <EmptyState text="这个范围内没有流水。" />
       ) : (
-        <DataTable label="余额流水" compact>
-          <thead>
-            <tr>
-              <th>时间（UTC）</th>
-              <th>类型</th>
-              <th className="num">金额</th>
-              <th className="num">余额</th>
-              <th>说明</th>
-            </tr>
-          </thead>
-          <tbody>
-            {items.map((i) => (
-              <tr key={i.seq}>
-                <td className="tabular">{fmtUtc(i.posted_at)}</td>
-                <td>{KIND_LABEL[i.kind] ?? i.kind}</td>
-                <td className="num">{fmtMicroCny(i.amount_micro_cny)}</td>
-                <td className="num">{fmtMicroCny(i.balance_after_micro_cny)}</td>
-                <td>{entryNote(i)}</td>
+        <>
+          <RecordTools table={table} label="余额流水" loaded></RecordTools>
+          <DataTable label="余额流水" compact>
+            <thead>
+              <tr>
+                <th>时间（北京时间）</th>
+                <th>类型</th>
+                <th className="num">金额</th>
+                <th className="num">余额</th>
+                <th>说明</th>
               </tr>
-            ))}
-          </tbody>
-        </DataTable>
+            </thead>
+            <tbody>
+              {table.rows.map((i) => (
+                <tr key={i.seq}>
+                  <td className="tabular">{fmtBeijing(i.posted_at)}</td>
+                  <td>{KIND_LABEL[i.kind] ?? i.kind}</td>
+                  <td className="num">{fmtMicroCny(i.amount_micro_cny)}</td>
+                  <td className="num">{fmtMicroCny(i.balance_after_micro_cny)}</td>
+                  <td>{entryNote(i)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </DataTable>
+          <RecordPager table={table} label="余额流水" resetKey={`${account.tenant_id}:${key}`} hasMore={next !== null} onMore={loadMore} busy={moreBusy} />
+        </>
       )}
       {moreError && (
         <div className="note crit" role="alert">
           {moreError}
         </div>
       )}
-      {next !== null && (
-        <div className="bl-more">
-          <Button type="button" size="sm" busy={moreBusy} busyLabel="加载更多" onClick={() => void loadMore()}>
-            加载更多
-          </Button>
-        </div>
-      )}
+
     </Region>
   );
 }
@@ -448,6 +438,7 @@ function Summary<T>({
   stamp,
   load,
   render,
+  searchText,
 }: {
   label: string;
   tenantId: string;
@@ -455,6 +446,7 @@ function Summary<T>({
   stamp: number;
   load: (q: { group: "day" | "month"; from: string; to: string }) => Promise<T[]>;
   render: (rows: T[], group: "day" | "month") => ReactNode;
+  searchText: (row: T) => string | readonly string[];
 }) {
   const [group, setGroup] = useState<"day" | "month">("day");
   const days = useDays(group);
@@ -462,6 +454,7 @@ function Summary<T>({
     () => (days.backwards ? Promise.resolve(null) : load({ group, ...summaryRange(group, days.from, days.to) })),
     [tenantId, stamp, group, days.from, days.to, days.backwards],
   );
+  const table = useRecordTable({ items: rows.data ?? [], searchText, resetKey: `${tenantId}:${group}:${days.from}:${days.to}` });
   return (
     <Region label={label}>
       <div className="bl-controls bl-filters">
@@ -473,7 +466,7 @@ function Summary<T>({
         </Field>
         {days.fields}
       </div>
-      <p className="hint text-caption">未选日期时，按天汇总最近 30 天，按月汇总最近 12 个月（UTC）。</p>
+      <p className="hint text-caption">未选日期时，按天汇总最近 30 天，按月汇总最近 12 个月（北京时间）。</p>
       {rows.error ? (
         <Failed message={rows.error} onRetry={() => void rows.reload()} />
       ) : rows.data === null ? (
@@ -481,7 +474,11 @@ function Summary<T>({
       ) : rows.data.length === 0 ? (
         <EmptyState text="这个范围内没有数据。" />
       ) : (
-        render(rows.data, group)
+        <>
+          <RecordTools table={table} label={label} />
+          {render(table.rows, group)}
+          <RecordPager table={table} label={label} />
+        </>
       )}
     </Region>
   );
@@ -494,6 +491,7 @@ function PeriodSummary({ account }: RegionProps) {
       tenantId={account.tenant_id}
       stamp={account.balance_micro_cny}
       load={(q) => billing.ledgerSummary(account.tenant_id, q)}
+      searchText={(r) => [periodLabel(r.period_start, "day")]}
       render={(rows, group) => (
         <DataTable label="按期汇总" compact>
           <thead>
@@ -549,6 +547,7 @@ function UsageSummary({ account }: RegionProps) {
       tenantId={account.tenant_id}
       stamp={account.balance_micro_cny}
       load={(q) => billing.usageSummary(account.tenant_id, q)}
+      searchText={(r) => [periodLabel(r.period_start, "day"), r.model.id ?? "", usageModel(r.model)]}
       render={(rows, group) => (
         <DataTable label="用量汇总" compact>
           <thead>
@@ -594,15 +593,19 @@ export const PERIOD_LABEL: Record<NonNullable<Budget["period"]>, string> = {
 };
 
 export function budgetPeriod(b: Budget): string {
-  if (b.kind === "cumulative") return b.counted_from ? `自 ${periodLabel(b.counted_from, "day")} 起` : "—";
-  return b.period ? (PERIOD_LABEL[b.period] ?? b.period) : "—";
+  if (b.kind === "cumulative") return b.counted_from ? `自 ${fmtBeijing(b.counted_from)} 起` : "—";
+  return b.period ? `${PERIOD_LABEL[b.period]}${b.period_start ? `：${budgetPeriodRange(b.period_start, b.period)}` : ""}` : "—";
 }
 
 function Quotas({ account, quotaRev }: RegionProps) {
   const budgets = useLoad(() => billing.budgets(account.tenant_id), [account.tenant_id, account.balance_micro_cny, quotaRev]);
+  const [scopeFilter, setScopeFilter] = useState("");
+  const [kindFilter, setKindFilter] = useState("");
+  const [quotaStatus, setQuotaStatus] = useState("");
+  const table = useRecordTable({ items: (budgets.data ?? []).filter((b) => (!scopeFilter || b.scope === scopeFilter) && (!kindFilter || b.kind === kindFilter) && (!quotaStatus || (b.exhausted ? "exhausted" : "available") === quotaStatus)), searchText: (b) => [b.id, b.target.id, b.target.label], resetKey: `${account.tenant_id}:${scopeFilter}:${kindFilter}:${quotaStatus}` });
   return (
     <Region label="额度">
-      <p className="hint">这个租户在每一级设置的额度。组织额度在下方的「组织额度」里设置；成员与密钥的额度由租户自己管理，这里只读。</p>
+      <p className="hint">周期预算继续按 UTC 边界结算，起止以北京时间显示。这个租户在每一级设置的额度。组织额度在下方的「组织额度」里设置；成员与密钥的额度由租户自己管理，这里只读。</p>
       {budgets.error ? (
         <Failed message={budgets.error} onRetry={() => void budgets.reload()} />
       ) : budgets.data === null ? (
@@ -610,52 +613,56 @@ function Quotas({ account, quotaRev }: RegionProps) {
       ) : budgets.data.length === 0 ? (
         <EmptyState text="这个租户没有设置额度。" />
       ) : (
-        <DataTable label="额度" compact>
-          <thead>
-            <tr>
-              <th>层级</th>
-              <th>对象</th>
-              <th>设置方</th>
-              <th>类型</th>
-              <th>周期（UTC）</th>
-              <th className="num">限额</th>
-              <th className="num">已用</th>
-              <th className="num">剩余</th>
-              <th>状态</th>
-            </tr>
-          </thead>
-          <tbody>
-            {budgets.data.map((b) => (
-              <tr key={b.id}>
-                <td>{SCOPE_LABEL[b.scope] ?? b.scope}</td>
-                <td>
-                  <span className="trunc" title={b.target.label}>
-                    {b.target.label}
-                  </span>
-                  {!b.target_live && "（已失效）"}
-                </td>
-                <td>{SET_BY_LABEL[b.set_by] ?? b.set_by}</td>
-                <td>{b.kind === "cumulative" ? "一次性额度" : "按周期"}</td>
-                <td>{budgetPeriod(b)}</td>
-                <td className="num">{fmtMicroCny(b.limit_micro_cny)}</td>
-                <td className="num">
-                  {fmtMicroCny(b.spent_micro_cny)}
-                  <BudgetProgress
-                    value={exactRatio(b.spent_micro_cny, b.limit_micro_cny)}
-                    accessibleLabel={`${SCOPE_LABEL[b.scope] ?? b.scope}额度 ${b.target.label}：已用 ${fmtMicroCny(b.spent_micro_cny)}，限额 ${fmtMicroCny(b.limit_micro_cny)}`}
-                    className="mt-2 min-w-24"
-                  />
-                </td>
-                <td className="num">{fmtMicroCny(b.remaining_micro_cny)}</td>
-                <td>
-                  <span data-state={b.exhausted ? "exhausted" : "ok"}>
-                    <Lamp state={b.exhausted ? "rejected" : "applied"}>{b.exhausted ? "已用尽" : "正常"}</Lamp>
-                  </span>
-                </td>
+        <>
+          <RecordTools table={table} label="额度"><label className="f filter"><span>额度层级</span><select aria-label="额度层级" value={scopeFilter} onChange={(e) => setScopeFilter(e.target.value)}><option value="">全部</option><option value="team">组织</option><option value="member">成员</option><option value="api_key">密钥</option></select></label><label className="f filter"><span>额度类型</span><select aria-label="额度类型" value={kindFilter} onChange={(e) => setKindFilter(e.target.value)}><option value="">全部</option><option value="periodic">周期</option><option value="cumulative">一次性</option></select></label><label className="f filter"><span>额度状态</span><select aria-label="额度状态" value={quotaStatus} onChange={(e) => setQuotaStatus(e.target.value)}><option value="">全部</option><option value="exhausted">用尽</option><option value="available">正常</option></select></label></RecordTools>
+          <DataTable label="额度" compact>
+            <thead>
+              <tr>
+                <th>层级</th>
+                <th>对象</th>
+                <th>设置方</th>
+                <th>类型</th>
+                <th>周期（北京时间）</th>
+                <th className="num">限额</th>
+                <th className="num">已用</th>
+                <th className="num">剩余</th>
+                <th>状态</th>
               </tr>
-            ))}
-          </tbody>
-        </DataTable>
+            </thead>
+            <tbody>
+              {table.rows.map((b) => (
+                <tr key={b.id}>
+                  <td>{SCOPE_LABEL[b.scope] ?? b.scope}</td>
+                  <td>
+                    <span className="trunc" title={b.target.label}>
+                      {b.target.label}
+                    </span>
+                    {!b.target_live && "（已失效）"}
+                  </td>
+                  <td>{SET_BY_LABEL[b.set_by] ?? b.set_by}</td>
+                  <td>{b.kind === "cumulative" ? "一次性额度" : "按周期"}</td>
+                  <td>{budgetPeriod(b)}</td>
+                  <td className="num">{fmtMicroCny(b.limit_micro_cny)}</td>
+                  <td className="num">
+                    {fmtMicroCny(b.spent_micro_cny)}
+                    <BudgetProgress
+                      value={exactRatio(b.spent_micro_cny, b.limit_micro_cny)}
+                      accessibleLabel={`${SCOPE_LABEL[b.scope] ?? b.scope}额度 ${b.target.label}：已用 ${fmtMicroCny(b.spent_micro_cny)}，限额 ${fmtMicroCny(b.limit_micro_cny)}`}
+                      className="mt-2 min-w-24"
+                    />
+                  </td>
+                  <td className="num">{fmtMicroCny(b.remaining_micro_cny)}</td>
+                  <td>
+                    <span data-state={b.exhausted ? "exhausted" : "ok"}>
+                      <Lamp state={b.exhausted ? "rejected" : "applied"}>{b.exhausted ? "已用尽" : "正常"}</Lamp>
+                    </span>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </DataTable>
+          <RecordPager table={table} label="额度" />
+        </>
       )}
     </Region>
   );

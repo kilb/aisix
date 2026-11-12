@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useState } from "react";
 import {
   ApiError,
   environment,
@@ -18,7 +18,7 @@ import {
 import { EXPECTED_API_CONTRACT } from "./lib/contract";
 import { errorText, fmtInt } from "./lib/fmt";
 import { useTheme } from "./lib/useTheme";
-import { ChangePassword } from "./components/ChangePassword";
+import { AccountSettings } from "./components/AccountSettings";
 import { Button } from "./ui/Button";
 import { Lamp, type LampState } from "./ui/Lamp";
 import { RouteNav } from "./ui/RouteNav";
@@ -35,6 +35,7 @@ import {
   Server,
   ShieldUser,
   Sun,
+  UserRound,
   Tag,
   Wallet,
   Waypoints,
@@ -54,18 +55,19 @@ import { Resources } from "./tabs/Resources";
 import { Tenants } from "./tabs/Tenants";
 
 const TABS = [
-  { id: "overview", label: "概览", icon: LayoutDashboard },
-  { id: "gateways", label: "网关", icon: Server },
-  { id: "providers", label: "上游账号", icon: Plug },
-  { id: "models", label: "模型与路由", icon: Waypoints },
-  { id: "pricing", label: "价格", icon: Tag },
-  { id: "tenants", label: "租户", icon: Building2 },
-  { id: "billing", label: "计费", icon: Wallet },
-  { id: "keys", label: "密钥", icon: KeyRound },
-  { id: "cache", label: "缓存策略", icon: DatabaseZap },
-  { id: "resources", label: "全部资源", icon: Braces },
-  { id: "operators", label: "运维账号", icon: ShieldUser, adminOnly: true },
-  { id: "audit", label: "审计日志", icon: ScrollText },
+  { id: "overview", label: "概览", icon: LayoutDashboard, group: "运行" },
+  { id: "gateways", label: "网关", icon: Server, group: "运行" },
+  { id: "providers", label: "上游账号", icon: Plug, group: "接入" },
+  { id: "models", label: "模型与路由", icon: Waypoints, group: "接入" },
+  { id: "cache", label: "缓存策略", icon: DatabaseZap, group: "接入" },
+  { id: "tenants", label: "租户", icon: Building2, group: "组织与账务" },
+  { id: "pricing", label: "价格", icon: Tag, group: "组织与账务" },
+  { id: "billing", label: "计费", icon: Wallet, group: "组织与账务" },
+  { id: "keys", label: "密钥", icon: KeyRound, group: "组织与账务" },
+  { id: "resources", label: "全部资源", icon: Braces, group: "平台管理" },
+  { id: "operators", label: "运维账号", icon: ShieldUser, group: "平台管理", adminOnly: true },
+  { id: "audit", label: "审计日志", icon: ScrollText, group: "平台管理" },
+  { id: "account", label: "账号设置", icon: UserRound, group: "个人" },
 ] as const;
 
 export type TabId = (typeof TABS)[number]["id"];
@@ -243,11 +245,24 @@ export function App() {
     setTabOnly(t);
     setSection(s);
     if (s !== undefined) setSectionVisit((n) => n + 1);
+    window.history.replaceState(null, "", `#${t}${s ? `?section=${encodeURIComponent(s)}` : ""}`);
   }, []);
   const [sessionEnded, setSessionEnded] = useState(false);
-  const [passwordOpen, setPasswordOpen] = useState(false);
   const [theme, toggleTheme] = useTheme();
   const shell = useShellData(operator !== null && apiContract === EXPECTED_API_CONTRACT, tab);
+
+  // 个人账号和原业务入口均可重载；不将 hash 当作权限来源。
+  useEffect(() => {
+    const apply = () => {
+      const [name, query = ""] = window.location.hash.replace(/^#/, "").split("?", 2);
+      const target = TABS.find((item) => item.id === name)?.id ?? "overview";
+      setTabOnly(target);
+      setSection(new URLSearchParams(query).get("section") ?? undefined);
+    };
+    apply();
+    window.addEventListener("hashchange", apply);
+    return () => window.removeEventListener("hashchange", apply);
+  }, []);
 
   const boot = useCallback(async () => {
     setBootError(null);
@@ -285,7 +300,6 @@ export function App() {
     if (!operator) return;
     return onSessionEnded(() => {
       setOperator(null);
-      setPasswordOpen(false);
       setSessionEnded(true);
     });
   }, [operator]);
@@ -294,7 +308,6 @@ export function App() {
     setOperator(op);
     setSignOutError(null);
     setSessionEnded(false);
-    setPasswordOpen(false);
     setTab("overview");
   }, []);
 
@@ -313,6 +326,14 @@ export function App() {
     }
     setOperator(null);
   }, []);
+
+  const visible = TABS.filter((t) => !("adminOnly" in t) || operator?.role === "admin");
+  const current: TabId = visible.some((t) => t.id === tab) ? tab : "overview";
+
+  // 切换页面先回到标题；同页筛选、轮询和表单更新保留阅读位置。
+  useLayoutEffect(() => {
+    window.scrollTo({ top: 0, left: 0, behavior: "instant" });
+  }, [current, operator?.id]);
 
   if (bootError) {
     return (
@@ -362,8 +383,6 @@ export function App() {
     );
   }
 
-  const visible = TABS.filter((t) => !("adminOnly" in t) || operator.role === "admin");
-  const current: TabId = visible.some((t) => t.id === tab) ? tab : "overview";
   const attention: Partial<Record<TabId, string>> = {};
   for (const { tab: id, check } of ATTENTION) {
     const note = check(shell);
@@ -406,16 +425,18 @@ export function App() {
           )}
         </div>
       }
-      footer={
-        <div className="cp-identity" title={operator.email}>
+      footer={(close) => (
+        <button type="button" id="stop-account" className="shell-account-link cp-identity" title={operator.email}
+          aria-current={current === "account" ? "page" : undefined}
+          onClick={() => { setTab("account"); close(); }}>
           <span className="cp-avatar" aria-hidden="true">{[...who][0] ?? ""}</span>
           <span className="cp-identity-name">{who}</span>
-          <span className="tag">{ROLE_LABEL[operator.role]}</span>
-        </div>
-      }
+          <span className="shell-account-caption">{ROLE_LABEL[operator.role]} · 账号设置</span>
+        </button>
+      )}
       navigation={(close) => (
         <RouteNav
-          items={visible}
+          items={visible.filter((item) => item.id !== "account")}
           current={current}
           attention={attention}
           label="Dashboard 分区"
@@ -442,18 +463,17 @@ export function App() {
             {theme === "dark" ? <Sun aria-hidden /> : <Moon aria-hidden />}
             <span className="cp-theme-label">{theme === "dark" ? "浅色" : "深色"}</span>
           </Button>
-          <Button kind="quiet" size="sm" aria-expanded={passwordOpen} onClick={() => setPasswordOpen((o) => !o)}>
-            修改口令
+          <Button kind="quiet" size="sm" onClick={() => setTab("account")} aria-label="账号设置">
+            <UserRound aria-hidden />
+            <span className="cp-account-label">账号</span>
           </Button>
-          <Button kind="quiet" size="sm" onClick={() => void signOut()}>登出</Button>
         </div>
       </header>
       <div className="workspace shell-content">
-        {passwordOpen && <ChangePassword onClose={() => setPasswordOpen(false)} />}
         {signOutError && <div className="note crit" role="alert">{signOutError}</div>}
         <main>
-          <section id={`tab-${current}`} role="tabpanel" aria-labelledby={`stop-${current}`}>
-            <Page
+          <section id={`tab-${current}`} role={current === "account" ? "region" : "tabpanel"} aria-labelledby={`stop-${current}`}>
+            {current === "account" ? <AccountSettings operator={operator} roleLabel={ROLE_LABEL[operator.role]} onSignOut={() => void signOut()} /> : <Page
               tab={current}
               operator={operator}
               canEdit={operator.role !== "viewer"}
@@ -461,7 +481,7 @@ export function App() {
               refreshShell={shell.refresh}
               initialSection={section}
               sectionVisit={sectionVisit}
-            />
+            />}
           </section>
         </main>
       </div>

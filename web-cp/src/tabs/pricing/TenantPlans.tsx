@@ -12,7 +12,7 @@ import {
 } from "../../lib/api";
 import { messageFor, problemAt } from "../../lib/errors";
 import { errorText, fmtInt } from "../../lib/fmt";
-import { fmtUtc } from "../../lib/money";
+import { fmtBeijing } from "../../lib/time";
 import { Button } from "../../ui/Button";
 import { Field, useRefusalFocus } from "../../ui/Field";
 import { useToast } from "../../ui/Toast";
@@ -150,7 +150,7 @@ function Discounts({ tenantId, plan, canEdit, onSaved }: { tenantId: string; pla
         tenantPricing.createDiscount({ tenant_id: tenantId, effective_from, discount_bps: bps }),
       );
       if (created === "invalid") {
-        setDetails([{ path: "/effective_from", message: "生效时间应写成 年-月-日 时:分，按 UTC 计" }]);
+        setDetails([{ path: "/effective_from", message: "生效时间应写成 年-月-日 时:分，按北京时间计" }]);
         focusRefusal();
         return;
       }
@@ -175,7 +175,7 @@ function Discounts({ tenantId, plan, canEdit, onSaved }: { tenantId: string; pla
       <Card className={span.d7} role="region" aria-label="折扣">
         <CardHeader number={1} title="折扣" description="现行折扣 · 所选租户" />
         <Metric size="hero"><span data-testid="current-discount">{current ? fmtPercent(current.discount_bps) : "无折扣"}</span></Metric>
-        {current && <p className="mt-4 font-mono text-meta text-muted">自 {fmtUtc(current.effective_from)} 起</p>}
+        {current && <p className="mt-4 font-mono text-meta text-muted">自 {fmtBeijing(current.effective_from)} 起</p>}
         <p className="mt-6 border-t border-ink/7 pt-4 text-caption text-muted">折扣从实际分组售价中扣除；未设置折扣时按分组售价计费。</p>
       </Card>
       <Card tone="inverse" className={span.d5Wide}>
@@ -183,7 +183,7 @@ function Discounts({ tenantId, plan, canEdit, onSaved }: { tenantId: string; pla
         <Metric size="display">{fmtInt(upcoming.length)}</Metric>
         {upcoming.length > 0 ? (
           <ul className="mt-6 space-y-3 border-t border-surface/12 pt-4 text-body tabular-nums" aria-label="即将生效的折扣">
-            {upcoming.map((d) => <li key={d.revision_id}>{fmtUtc(d.effective_from)} 起 {fmtPercent(d.discount_bps)}</li>)}
+            {upcoming.map((d) => <li key={d.revision_id}>{fmtBeijing(d.effective_from)} 起 {fmtPercent(d.discount_bps)}</li>)}
           </ul>
         ) : <p className="mt-4 text-caption text-on-inverse-muted">没有预约的折扣版本。</p>}
       </Card>

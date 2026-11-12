@@ -1,5 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ApiError, channelModels, publicModels, type ChannelModel, type PublicModel } from "../../lib/api";
+import { ApiError, channelModels, publicModels, type ChannelModel, type CooldownSettings, type PublicModel } from "../../lib/api";
+import { sameRouting } from "../../lib/publicRouting";
+import { RoutePolicy } from "../../ui/RoutePolicy";
+import { CooldownEditor } from "../../ui/CooldownEditor";
 import { messageFor } from "../../lib/errors";
 import { errorText } from "../../lib/fmt";
 import {
@@ -22,6 +25,9 @@ import { UpstreamModelPicker } from "../../ui/UpstreamModelPicker";
 import { upstreamNameProblem } from "../../lib/upstreamName";
 import { FetchUpstream } from "./FetchUpstream";
 import { GroupBadges } from "./GroupBadges";
+import { useRecordTable } from "../../lib/recordTable";
+import { RecordTablePager } from "../../ui/RecordTable";
+import { cooldownProblem } from "../../lib/cooldown";
 
 /** The largest weight the control plane takes, as its own `channel_models` check does. */
 const MAX_WEIGHT = 65_535;
@@ -34,6 +40,8 @@ interface Draft {
   priority: string;
   weight: string;
   enabled: boolean;
+  cooldown: CooldownSettings | null;
+  cooldownProblem?: string | null;
 }
 
 function draftOf(row: ChannelModel): Draft {
@@ -43,11 +51,12 @@ function draftOf(row: ChannelModel): Draft {
     priority: String(row.priority),
     weight: String(row.weight),
     enabled: row.enabled,
+    cooldown: row.cooldown ?? null,
   };
 }
 
 function sameDraft(a: Draft, b: Draft): boolean {
-  return a.served === b.served && a.upstream === b.upstream && a.priority === b.priority && a.weight === b.weight && a.enabled === b.enabled;
+  return a.served === b.served && a.upstream === b.upstream && a.priority === b.priority && a.weight === b.weight && a.enabled === b.enabled && sameRouting({ cooldown: a.cooldown }, { cooldown: b.cooldown }) && !a.cooldownProblem && !b.cooldownProblem;
 }
 
 /** A whole number as typed: trimmed, digits only, with the range its column allows. */
@@ -223,6 +232,12 @@ export function ChannelModels({
   function problems(id: string): string | null {
     const draft = drafts[id];
     if (draft === undefined) return null;
+    if (draft.cooldownProblem) return draft.cooldownProblem;
+    const row = rows?.find((r) => r.public_model_id === id);
+    if (!sameRouting({ cooldown: draft.cooldown }, { cooldown: row?.cooldown ?? null })) {
+      const problem = cooldownProblem(draft.cooldown);
+      if (problem) return problem;
+    }
     const upstream = upstreamNameProblem(draft.upstream);
     if (upstream !== null) return upstream;
     if (!draft.served) return null;
@@ -258,6 +273,7 @@ export function ChannelModels({
             priority: Number(draft.priority),
             weight: Number(draft.weight),
             enabled: draft.enabled,
+            ...(!sameRouting({ cooldown: draft.cooldown }, { cooldown: row.cooldown ?? null }) ? { cooldown: draft.cooldown } : {}),
           });
         }
       } catch (e) {
@@ -266,10 +282,12 @@ export function ChannelModels({
       setDone((n) => n + 1);
     }
     setRowErrors(failures);
-    setBusy(false);
     const failed = Object.keys(failures).length;
-    setNote(failed === 0 ? `已保存 ${batch.length} 个模型的映射。` : `${batch.length} 个模型中有 ${failed} 个保存失败，见各行提示。`);
-    await load();
+    const loaded = await load(true, batch.filter((row) => failures[row.public_model_id] === undefined).map((row) => row.public_model_id));
+    setNote(loaded === null
+      ? `写入结果：${batch.length - failed} 个成功、${failed} 个失败；未能读回当前配置，请刷新后核对。`
+      : failed === 0 ? `已保存 ${batch.length} 个模型的映射。` : `${batch.length} 个模型中有 ${failed} 个保存失败，见各行提示。`);
+    setBusy(false);
   }
 
   async function createFromName() {
@@ -379,6 +397,7 @@ export function ChannelModels({
       (draft?.upstream ?? "").toLowerCase().includes(filter)
     );
   });
+  const table = useRecordTable({ items: shown, resetKey: `${accountId}:${showAll}:${query}` });
   const taken = new Set((publics ?? []).map((m) => m.name));
   const canCreate = newName.trim() !== "" && !taken.has(newName.trim()) && upstreamNameProblem(newName) === null;
 
@@ -396,7 +415,7 @@ export function ChannelModels({
           description={
             <>
               勾选该上游账号提供哪些公共模型，并写明它对上游使用的名称、优先级与权重。价格按公共模型计算，与具体账号无关；成本价要填的就是这里写的上游模型名称。
-              优先级相同的按权重分配，失败后按优先级从高到低依次尝试。账号分组：<GroupBadges groups={groups} />。
+              优先级从高到低依次尝试，同层选择遵循各模型显示的路由策略。账号分组：<GroupBadges groups={groups} />。
             </>
           }
           actions={
@@ -449,7 +468,7 @@ export function ChannelModels({
               </tr>
             </thead>
             <tbody>
-              {shown.map((row) => {
+              {table.rows.map((row) => {
                 const draft = drafts[row.public_model_id] ?? draftOf(row);
                 const model = modelOf.get(row.public_model_id);
                 return (
@@ -474,6 +493,7 @@ export function ChannelModels({
                     </td>
                     <td>
                       <span className="mono font-mono text-caption font-medium">{row.public_model_name}</span>
+                      <RoutePolicy routing={model?.effective_routing} compact />
                     </td>
                     <td className="min-w-56 whitespace-normal">
                       <UpstreamModelPicker
@@ -486,6 +506,7 @@ export function ChannelModels({
                         invalid={rowErrors[row.public_model_id] !== undefined}
                         compact
                       />
+                      <details className="mt-2 text-caption"><summary>故障冷却：{draft.cooldown?.enabled === true ? "已开启" : "未开启"}</summary><CooldownEditor value={draft.cooldown} disabled={!canEdit || busy || !draft.served} onChange={(cooldown) => set(row.public_model_id, { cooldown })} onValidityChange={(cooldownProblem) => set(row.public_model_id, { cooldownProblem })} /></details>
                     </td>
                     <td className="num">
                       <input
@@ -575,6 +596,7 @@ export function ChannelModels({
             </tbody>
           </DataTable>
         )}
+        <RecordTablePager {...table} total={table.filteredCount} onPageChange={table.setPage} onPageSizeChange={table.setPageSize} label="账号模型分页" />
         {Object.keys(rowErrors).length > 0 && (
           <ul className="note crit ch-errors mb-0" role="alert">
             {Object.entries(rowErrors).map(([id, text]) => (
@@ -630,7 +652,7 @@ export function ChannelModels({
             publics={everyPublic}
             disabled={busy || creating}
             onApplied={async () => {
-              await load();
+              if (await load() === null) throw new Error("映射已写入，但未能读回当前配置，请刷新后核对。");
             }}
           />
           <div className="panel ch-create mb-0">

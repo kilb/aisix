@@ -28,6 +28,9 @@ import { BentoGrid, Card, CardFooter, CardHeader, CardMessage, Metric, MetricSke
 import { RankBars } from "./components/charts";
 import { formatCount } from "./lib/chartFormat";
 import { cn } from "./lib/cn";
+import { fmtBeijing, parseBeijingInput } from "./lib/time";
+import { useRecordTable } from "./lib/recordTable";
+import { RecordTablePager, RecordTableToolbar } from "./ui/RecordTable";
 
 // 桌面：5 + 7 / 12 / 12；平板与手机按卡片顺序各占整行。
 
@@ -37,9 +40,9 @@ function failure(e: unknown): string {
   return e instanceof ApiError ? messageFor(e) : String(e);
 }
 
-/** A time from the API, in the viewer's own zone. */
+/** API 时间统一显示为北京时间。 */
 export function when(at: string): string {
-  return new Date(at).toLocaleString("zh-CN", { hour12: false });
+  return fmtBeijing(at);
 }
 
 /**
@@ -156,6 +159,14 @@ export function Keys({
     return parts.length > 0 ? parts.join(" · ") : "不限";
   }
 
+  const [stateFilter, setStateFilter] = useState("");
+  const [groupFilter, setGroupFilter] = useState("");
+  const table = useRecordTable({
+    items: (items ?? []).filter((key) => (!stateFilter || stateOf(key).text === stateFilter) && (!groupFilter || key.group?.id === groupFilter)),
+    searchText: (key) => [key.label, key.prefix, ownerOf(key), key.group?.display_name ?? ""],
+    resetKey: `${stateFilter}/${groupFilter}`,
+  });
+
   const visibleScope = manager ? "全组织密钥" : "我的密钥";
   const readyKeys = items?.filter((key) => stateOf(key).lamp === "applied").length;
   const stateCounts = items === null ? [] : [
@@ -186,6 +197,10 @@ export function Keys({
       <BentoGrid>
         <Card className={span.d5Wide}>
           <CardHeader number={1} title="当前可见密钥" />
+          <RecordTableToolbar search={{ value: table.query, onChange: table.setQuery, label: "搜索密钥", placeholder: "名称、公开前缀、归属或分组" }}>
+            <Field label="密钥状态"><select value={stateFilter} onChange={(e) => setStateFilter(e.target.value)}><option value="">全部状态</option>{["可用", "已被平台停用", "已停用", "已过期"].map((value) => <option key={value}>{value}</option>)}</select></Field>
+            <Field label="密钥分组"><select value={groupFilter} onChange={(e) => setGroupFilter(e.target.value)}><option value="">全部分组</option>{(groups ?? []).map((group) => <option key={group.id} value={group.id}>{group.display_name}</option>)}</select></Field>
+          </RecordTableToolbar>
           {items === null ? (listErr ? <CardMessage onRetry={() => void load()}>密钥读取失败，请重试。</CardMessage> : <MetricSkeleton />) : (
             <>
               <Metric size="hero">{formatCount(items.length)}</Metric>
@@ -248,7 +263,7 @@ export function Keys({
                 </tr>
               </thead>
               <tbody>
-                {items.map((k) => {
+                {table.rows.map((k) => {
                   const state = stateOf(k);
                   const owner = ownerOf(k);
                   const models = modelsOf(k);
@@ -337,6 +352,7 @@ export function Keys({
               </tbody>
             </DataTable>
           )}
+          {items !== null && <RecordTablePager page={table.page} pageSize={table.pageSize} onPageChange={table.setPage} onPageSizeChange={table.setPageSize} total={table.filteredCount} label="密钥" />}
         </Card>
         {active && (
           <NewKeyForm
@@ -546,9 +562,9 @@ function NewKeyForm({
     if (r.problem) found.rpm = r.problem;
     let expiresAt: string | undefined;
     if (expires) {
-      const at = new Date(expires);
-      if (Number.isNaN(at.getTime())) found.expires = "时间格式不正确";
-      else expiresAt = at.toISOString();
+      const at = parseBeijingInput(expires);
+      if (at === null) found.expires = "时间格式不正确";
+      else expiresAt = at;
     }
     setErrs(found);
     if (Object.keys(found).length > 0) {
@@ -815,7 +831,7 @@ function NewKeyForm({
           {(aria) => <input inputMode="numeric" value={rpm} onChange={(e) => setRpm(e.target.value)} {...aria} />}
         </Field>
 
-        <Field label="过期时间" wide hint="留空表示永不过期；按本机时区" error={errs.expires}>
+        <Field label="过期时间（北京时间）" wide hint="留空表示永不过期；按北京时间保存" error={errs.expires}>
           {(aria) => (
             <input type="datetime-local" value={expires} onChange={(e) => setExpires(e.target.value)} {...aria} />
           )}

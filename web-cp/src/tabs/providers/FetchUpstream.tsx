@@ -8,9 +8,8 @@ import { Button } from "../../ui/Button";
 import { CardHeader } from "../../components/page";
 import { DataTable } from "../../ui/DataTable";
 import { why } from "../../ui/UpstreamModelPicker";
-
-/** The most ids listed at once: a list of thousands is narrowed by searching, not by scrolling. */
-const MAX_SHOWN = 500;
+import { useRecordTable } from "../../lib/recordTable";
+import { RecordTablePager } from "../../ui/RecordTable";
 
 /**
  * 获取上游模型: the account's own model list as a searchable multi-select,
@@ -75,8 +74,10 @@ export function FetchUpstream({
 
   const filter = query.trim().toLowerCase();
   const matches = filter === "" ? ids : ids.filter((id) => id.toLowerCase().includes(filter));
-  const shown = matches.slice(0, MAX_SHOWN);
-  const shownSelectable = shown.filter((id) => selectable(states.get(id)!));
+  const table = useRecordTable({ items: matches, resetKey: `${accountId}:${query}` });
+  const shown = table.rows;
+  // 全选覆盖完整筛选结果，分页仅影响显示，不改变跨页选择集合。
+  const shownSelectable = matches.filter((id) => selectable(states.get(id)!));
   const allShownChosen = shownSelectable.length > 0 && shownSelectable.every((id) => chosen.has(id));
   // A tick survives a refresh only while its id is still selectable.
   const picked = ids.filter((id) => chosen.has(id) && selectable(states.get(id)!));
@@ -110,9 +111,9 @@ export function FetchUpstream({
     setRefusal(null);
     try {
       const items = await channelModels.bulk(accountId, batch);
-      setApplied(appliedText(items));
       setChosen(new Set());
       await onApplied();
+      setApplied(appliedText(items));
     } catch (e) {
       if (e instanceof ApiError) {
         setRefusal({ message: messageFor(e), lines: e.details.map((d) => d.message) });
@@ -228,11 +229,7 @@ export function FetchUpstream({
               )}
             </tbody>
           </DataTable>
-          {matches.length > shown.length && (
-            <p className="hint mt-3 text-caption">
-              共 {matches.length} 个，只列出前 {MAX_SHOWN} 个；继续输入可缩小范围。
-            </p>
-          )}
+          <RecordTablePager {...table} total={table.filteredCount} onPageChange={table.setPage} onPageSizeChange={table.setPageSize} label="上游模型分页" />
           {overCap && (
             <div className="note warn mb-0" role="alert">
               一次最多映射 {MAX_BULK_MODELS} 个上游模型，已选 {picked.length} 个，请减少选择后再写入。

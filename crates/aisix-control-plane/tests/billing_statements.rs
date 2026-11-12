@@ -230,14 +230,15 @@ fn rfc(t: DateTime<Utc>) -> String {
 }
 
 #[tokio::test]
-async fn a_ledger_summary_adds_up_by_utc_day() {
+async fn a_ledger_summary_adds_up_by_beijing_day() {
     let Some(w) = world().await else { return };
     let pool = w.cp.db().pool();
-    let today = Utc::now()
+    let today = (Utc::now() + TimeDelta::hours(8))
         .date_naive()
         .and_hms_opt(0, 0, 0)
         .expect("midnight")
-        .and_utc();
+        .and_utc()
+        - TimeDelta::hours(8);
     let day_before = today - TimeDelta::days(2);
     // The last second of one day and the first second of the next.
     raw_usage(
@@ -327,6 +328,50 @@ async fn a_ledger_summary_adds_up_by_utc_day() {
         items.last().expect("a month")["closing_balance_micro_cny"],
         -980
     );
+}
+
+#[tokio::test]
+async fn beijing_ledger_day_and_month_boundaries_preserve_actual_posting_instants() {
+    let Some(w) = world().await else { return };
+    let boundary = at("2025-12-31T16:00:00Z");
+    let from = boundary - TimeDelta::seconds(1);
+    let to = boundary + TimeDelta::days(1);
+    let mut balance = 0;
+    for (id, time, amount) in [
+        ("bj-before-from", from - TimeDelta::microseconds(1), -50),
+        ("bj-from", from, -100),
+        ("bj-midnight", boundary, -200),
+        ("bj-after", boundary + TimeDelta::seconds(1), -300),
+        ("bj-to", to, -900),
+    ] {
+        balance += amount;
+        raw_usage(w.cp.db().pool(), w.tenant, id, amount, balance, time).await;
+    }
+    let owner = w.cp.member_login_seeded(w.tenant, MemberRole::Owner).await;
+    for (group, starts) in [
+        ("day", ["2025-12-30T16:00:00Z", "2025-12-31T16:00:00Z"]),
+        ("month", ["2025-11-30T16:00:00Z", "2025-12-31T16:00:00Z"]),
+    ] {
+        for (path, cookie) in [
+            ("/api/billing/summary".to_string(), owner.cookie()),
+            (
+                format!("/admin/tenants/{}/billing/summary", w.tenant),
+                w.admin.cookie(),
+            ),
+        ] {
+            let path = format!("{path}?group={group}&from={}&to={}", rfc(from), rfc(to));
+            let r = w.cp.send("GET", &path, Some(cookie), None).await;
+            assert_eq!(r.status, 200, "{r:?}");
+            assert_eq!(
+                r.body["items"],
+                json!([
+                    {"period_start": starts[0], "usage_micro_cny": -100, "topups_micro_cny": 0, "adjustments_micro_cny": 0, "closing_balance_micro_cny": -150},
+                    {"period_start": starts[1], "usage_micro_cny": -500, "topups_micro_cny": 0, "adjustments_micro_cny": 0, "closing_balance_micro_cny": -650},
+                ]),
+                "北京月/年界且左闭右开：{group} {r:?}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -604,7 +649,7 @@ async fn topups_and_adjustments_are_listed_and_summed_beside_usage() {
     assert_eq!(
         r.body["items"],
         json!([{
-            "period_start": "2026-02-03T00:00:00Z",
+            "period_start": "2026-02-02T16:00:00Z",
             "usage_micro_cny": -100,
             "topups_micro_cny": 500,
             "adjustments_micro_cny": -7,

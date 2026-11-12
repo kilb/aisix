@@ -25,6 +25,98 @@ use uuid::Uuid;
 /// The operators' public-model routes.
 const PUBLICS: &str = "/admin/public-models";
 
+// 配置经真实 API、数据库和生成资源往返，拒绝的配置不能改动已有值。
+#[tokio::test]
+async fn channel_cooldown_round_trips_and_effective_routing_reads_the_saved_document() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let key = provider_key(&cp, &op, "acct-cooldown-ops").await;
+    let (id, initial) = create_public(&cp, &op, "pub-cooldown-ops").await;
+    assert!(initial.get("effective_routing").is_some(), "{initial}");
+    assert!(initial["effective_routing"].is_null());
+    let config = json!({"enabled": true, "default_seconds": 45, "max_seconds": 300});
+    let saved = put_channel(&cp, &op, key, id, json!({"cooldown": config})).await;
+    assert_eq!(saved.status, 200, "{saved:?}");
+    assert_eq!(saved.body["cooldown"], config);
+    let row: (Uuid, Option<Value>) = sqlx::query_as("SELECT direct_model_id, cooldown FROM channel_models WHERE provider_key_id = $1 AND public_model_id = $2")
+        .bind(key).bind(id).fetch_one(cp.db().pool()).await.expect("channel row");
+    assert_eq!(row.1, Some(config.clone()));
+    assert_eq!(live(&cp, Kind::Models, row.0).await["cooldown"], config);
+    // 旧控制面重新生成目标时不能静默抹掉新配置。
+    let old_writer = sqlx::query(
+        "UPDATE gw_resources SET doc = doc - 'cooldown' WHERE kind = 'models' AND id = $1",
+    )
+    .bind(row.0)
+    .execute(cp.db().pool())
+    .await;
+    let refused = old_writer.expect_err("an old writer erased cooldown");
+    assert_eq!(
+        refused.as_database_error().and_then(|e| e.constraint()),
+        Some("channel_cooldown_kept")
+    );
+    let view = public_model(&cp, &op, id).await;
+    assert_eq!(view["served_by"][0]["cooldown"], config);
+    assert_eq!(
+        view["effective_routing"],
+        live(&cp, Kind::Models, id).await["routing"]
+    );
+
+    let affinity = json!({"strategy": "consistent_hash", "hash_on": [{"type": "api_key"}]});
+    let saved = patch_public(&cp, &op, id, json!({"routing": affinity})).await;
+    assert_eq!(saved.status, 200, "{saved:?}");
+    assert_eq!(
+        saved.body["effective_routing"]["hash_on"],
+        affinity["hash_on"]
+    );
+    assert_eq!(
+        put_channel(&cp, &op, key, id, json!({"priority": 7}))
+            .await
+            .status,
+        200
+    );
+    assert_eq!(live(&cp, Kind::Models, row.0).await["cooldown"], config);
+    for invalid in [
+        json!({"enabled": "yes"}),
+        json!({"max_seconds": 0}),
+        json!({"unknown": true}),
+        json!({"default_seconds": -1}),
+        json!({"trigger_statuses": [99]}),
+        json!({"trigger_statuses": [600]}),
+        serde_json::from_str(r#"{"default_seconds":18446744073709551616}"#).expect("JSON number"),
+    ] {
+        let refused = put_channel(&cp, &op, key, id, json!({"cooldown": invalid})).await;
+        assert_eq!(refused.status, 422, "{refused:?}");
+        assert!(
+            refused.body["details"]
+                .as_array()
+                .expect("details")
+                .iter()
+                .all(|d| d["path"]
+                    .as_str()
+                    .is_some_and(|p| p.starts_with("/cooldown"))),
+            "{refused:?}"
+        );
+        assert_eq!(live(&cp, Kind::Models, row.0).await["cooldown"], config);
+    }
+    let disabled = json!({"enabled": false, "default_seconds": 45});
+    let saved = put_channel(&cp, &op, key, id, json!({"cooldown": disabled})).await;
+    assert_eq!(saved.status, 200, "{saved:?}");
+    assert_eq!(live(&cp, Kind::Models, row.0).await["cooldown"], disabled);
+    let cleared = put_channel(&cp, &op, key, id, json!({"cooldown": null})).await;
+    assert_eq!(cleared.status, 200, "{cleared:?}");
+    assert!(cleared.body.get("cooldown").is_some_and(Value::is_null));
+    assert!(live(&cp, Kind::Models, row.0)
+        .await
+        .get("cooldown")
+        .is_none());
+    assert_eq!(
+        public_model(&cp, &op, id).await["effective_routing"]["strategy"],
+        "consistent_hash"
+    );
+}
+
 /// The stored document of `kind`/`id`, live or not: `(doc, deleted,
 /// managed_by)`.
 async fn stored(cp: &TestCp, kind: Kind, id: Uuid) -> Option<(Value, bool, Option<String>)> {
@@ -2339,6 +2431,7 @@ fn the_routing_document_is_a_function_of_the_rows() {
         weight,
         enabled: true,
         direct_model_id: Uuid::from_u128(id),
+        cooldown: None,
     };
 
     // No targets is the served-nothing state, and stays a routing document.
@@ -2436,6 +2529,7 @@ fn every_generated_document_loads_on_both_schemas() {
         weight,
         enabled: true,
         direct_model_id: Uuid::new_v4(),
+        cooldown: None,
     };
     let mapped = channel(Some("gpt-4o-mini"), 1, 3);
     let plain = channel(None, 0, 1);
@@ -2485,6 +2579,7 @@ fn a_generated_direct_document_is_internal_and_its_routing_document_is_not() {
         weight: 1,
         enabled: true,
         direct_model_id: Uuid::new_v4(),
+        cooldown: None,
     };
     let direct = channels::direct_doc(&channel, &public, "acct-int-9a4", "openai");
     assert_eq!(direct["internal"], json!(true), "{direct}");

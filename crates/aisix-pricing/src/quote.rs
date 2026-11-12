@@ -7,7 +7,8 @@ use serde::Serialize;
 
 use crate::engine::{discount_at, model_pricing};
 use crate::{
-    cny_per_million, CnyPerUsd, Dimension, Payer, PriceBook, PricingError, Rates, ServiceTier,
+    cny_per_million, effective_multiplier, CnyPerUsd, Dimension, Payer, PriceBook, PricingError,
+    Rates, ServiceTier,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -64,6 +65,8 @@ pub struct TierQuote {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CustomerQuote {
     pub discount_bps: u16,
+    pub cny_per_usd: CnyPerUsd,
+    pub effective_multiplier: String,
     pub prices_by_tier: BTreeMap<ServiceTier, TierQuote>,
 }
 
@@ -106,6 +109,8 @@ impl PriceBook {
     ) -> Result<CustomerQuote, PricingError> {
         let (baseline, rate) = model_pricing(self, model_id, payer, at)?;
         let discount_bps = self.customer_discount_bps(&payer.tenant_id, at)?;
+        let effective_multiplier = effective_multiplier(rate.cny, discount_bps)
+            .ok_or(PricingError::DiscountAboveWhole { bps: discount_bps })?;
         let prices_by_tier = baseline
             .card
             .0
@@ -129,6 +134,8 @@ impl PriceBook {
             .collect();
         Ok(CustomerQuote {
             discount_bps,
+            cny_per_usd: rate.cny,
+            effective_multiplier,
             prices_by_tier,
         })
     }
@@ -187,6 +194,8 @@ mod tests {
     fn quoting_never_rounds_a_rate_before_an_event_is_charged() {
         let (book, payer, at) = book();
         let quote = book.customer_quote("m", &payer, at).expect("quote");
+        assert_eq!(quote.cny_per_usd, CnyPerUsd(72000));
+        assert_eq!(quote.effective_multiplier, "6.48");
         let base = &quote.prices_by_tier[&ServiceTier::default_tier()].base;
         let input = base
             .iter()
@@ -204,6 +213,25 @@ mod tests {
         let charged = price_event(&book, &usage, &payer, at).expect("charge");
         assert_eq!(charged.charge.0, 1);
         assert_eq!(charged.discount.map(|d| d.bps), Some(1000));
+    }
+
+    #[test]
+    fn the_multiplier_keeps_the_exact_conversion_and_discount_factors() {
+        for (conversion, discount, expected) in [
+            ("7.2", 1375, "6.21"),
+            ("7.2", 0, "7.2"),
+            ("7.2", 10000, "0"),
+            ("0", 1375, "0"),
+            ("0.0001", 9999, "0.00000001"),
+            ("100", 1, "99.99"),
+        ] {
+            let cny = CnyPerUsd::parse(conversion).expect("conversion");
+            assert_eq!(
+                effective_multiplier(cny, discount).as_deref(),
+                Some(expected)
+            );
+        }
+        assert_eq!(effective_multiplier(CnyPerUsd::ONE, 10001), None);
     }
 
     #[test]

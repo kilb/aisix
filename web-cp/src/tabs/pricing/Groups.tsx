@@ -4,11 +4,13 @@ import { EffectiveFrom, sendAt, type EffectiveResolver } from "../../components/
 import { ApiError, groups, type Detail, type Group } from "../../lib/api";
 import { messageFor, problemAt } from "../../lib/errors";
 import { errorText, fmtInt } from "../../lib/fmt";
-import { fmtUtc } from "../../lib/money";
+import { fmtBeijing } from "../../lib/time";
 import { exactInteger, formatCount } from "../../lib/chartFormat";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
 import { EmptyState } from "../../ui/EmptyState";
+import { useRecordTable } from "../../lib/recordTable";
+import { RecordTablePager, RecordTableToolbar } from "../../ui/RecordTable";
 import { Field, useRefusalFocus } from "../../ui/Field";
 import { TwoStep } from "../../ui/TwoStep";
 import { useToast } from "../../ui/Toast";
@@ -58,7 +60,7 @@ function currentRate(plan: Group["default_rate"]): string {
 
 /** The revisions a plan has scheduled after it, as their starts and rates. */
 function scheduled(plan: Group["default_rate"]): string {
-  return plan.upcoming.map((r) => `${fmtUtc(r.effective_from)} 起 ${r.cny_per_usd ?? "结束覆盖"}`).join("、");
+  return plan.upcoming.map((r) => `${fmtBeijing(r.effective_from)} 起 ${r.cny_per_usd ?? "结束覆盖"}`).join("、");
 }
 
 /** 引用总数逐项精确累加，接口已失去精度的计数保持未知。 */
@@ -102,6 +104,12 @@ export function Groups({ canEdit }: TabProps) {
     void load();
   }, [load]);
 
+  const [rateState, setRateState] = useState("");
+  const records = useRecordTable({
+    items: (rows ?? []).filter((group) => rateState === "" || (rateState === "configured" ? group.default_rate.current?.cny_per_usd != null : rateState === "missing" ? group.default_rate.current?.cny_per_usd == null : group.default_rate.upcoming.length > 0)),
+    searchText: (group) => [group.display_name, group.name, group.id],
+    resetKey: rateState,
+  });
   const open = rows?.find((g) => g.id === selected) ?? null;
   if (open) {
     return <GroupDetail group={open} canEdit={canEdit} onBack={() => setSelected(null)} onChanged={load} />;
@@ -165,6 +173,10 @@ export function Groups({ canEdit }: TabProps) {
         ) : rows.length === 0 ? (
           <EmptyState text="还没有分组。" />
         ) : (
+          <>
+          <RecordTableToolbar search={{ value: records.query, onChange: records.setQuery, label: "搜索分组", placeholder: "显示名、路由名或 ID" }}>
+            <label className="f filter"><span>默认换算率</span><select value={rateState} onChange={(e) => setRateState(e.target.value)}><option value="">全部</option><option value="configured">已设置</option><option value="missing">未设置</option><option value="scheduled">有待生效版本</option></select></label>
+          </RecordTableToolbar>
           <DataTable label="分组">
             <thead>
               <tr>
@@ -179,7 +191,8 @@ export function Groups({ canEdit }: TabProps) {
               </tr>
             </thead>
             <tbody>
-              {rows.map((g) => (
+              {records.rows.length === 0 && <tr><td colSpan={8}><EmptyState text="没有符合筛选条件的分组" /></td></tr>}
+              {records.rows.map((g) => (
                 <GroupRowView
                   key={g.id}
                   group={g}
@@ -191,6 +204,8 @@ export function Groups({ canEdit }: TabProps) {
               ))}
             </tbody>
           </DataTable>
+          <RecordTablePager page={records.page} pageSize={records.pageSize} onPageChange={records.setPage} onPageSizeChange={records.setPageSize} total={records.filteredCount} label="分组分页" />
+          </>
         )}
       </Card>
       {canEdit && (
@@ -426,7 +441,7 @@ function CreateGroup({ onCreated }: { onCreated: () => Promise<void> }) {
         groups.create({ name, display_name: display, description, default_cny_per_usd: rate, effective_from }),
       );
       if (sent === "invalid") {
-        setDetails([{ path: "/effective_from", message: "生效时间应写成 年-月-日 时:分，按 UTC 计" }]);
+        setDetails([{ path: "/effective_from", message: "生效时间应写成 年-月-日 时:分，按北京时间计" }]);
         focusRefusal();
         return;
       }

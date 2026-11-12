@@ -420,13 +420,14 @@ pub struct BrowseQuery {
     /// 1 to 200; 50 when left out.
     #[serde(default)]
     limit: Option<usize>,
+    /// 在完整匹配列表中跳过的条目数，默认从第一条开始。
+    #[serde(default)]
+    offset: usize,
 }
 
-/// `GET /admin/pricing/library?q=&limit=` → `{library, total, items}`: the
-/// library in use (`null` before the first fetch or upload), how many of its
-/// entries match `q`, and the first `limit` of them in the dataset's order,
-/// each with its card in effect now, its flags and its provider's pricing
-/// page.
+/// `GET /admin/pricing/library?q=&limit=&offset=` → `{library, total, items}`：
+/// 当前价格库（首次获取或上传前为 `null`）、完整匹配数，以及按供应商和模型标识
+/// 排序后跳过 `offset` 的至多 `limit` 个条目；各条目保留现行价格卡、标记和价格页面。
 pub async fn browse(
     auth: OperatorAuth,
     State(state): State<AppState>,
@@ -447,7 +448,7 @@ pub async fn browse(
     let now = db_now(&mut conn).await?;
     drop(conn);
     let entries = entries_at(data, now).await?;
-    let found: Vec<&ParsedProposal> = entries
+    let mut found: Vec<&ParsedProposal> = entries
         .iter()
         .filter(|p| {
             needle.is_empty()
@@ -458,7 +459,14 @@ pub async fn browse(
                     .any(|text| text.to_lowercase().contains(&needle))
         })
         .collect();
-    let items: Vec<EntryView<'_>> = found.iter().take(limit).copied().map(view).collect();
+    found.sort_by(|a, b| (&a.provider, &a.model).cmp(&(&b.provider, &b.model)));
+    let items: Vec<EntryView<'_>> = found
+        .iter()
+        .skip(q.offset)
+        .take(limit)
+        .copied()
+        .map(view)
+        .collect();
     Ok(Json(json!({
         "library": meta,
         "total": found.len(),

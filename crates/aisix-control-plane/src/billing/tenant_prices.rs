@@ -54,6 +54,8 @@ fn models_of(models: &[PricedModel]) -> Vec<Value> {
             "name": model.name,
             "input_per_million": input,
             "output_per_million": output,
+            "cny_per_usd": model.quote.cny_per_usd,
+            "effective_multiplier": model.quote.effective_multiplier,
             "prices_by_tier": model.quote.prices_by_tier,
         });
         for (field, dimension) in [

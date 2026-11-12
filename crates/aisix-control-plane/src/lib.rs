@@ -34,6 +34,7 @@ pub mod keys;
 pub mod kine;
 pub mod member_usage;
 pub mod members;
+pub mod model_probe_history;
 pub mod model_probes;
 pub mod operators;
 pub mod pki;

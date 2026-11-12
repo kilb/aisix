@@ -1,10 +1,13 @@
+import { useRecordTable } from "../../lib/recordTable";
+import { RecordTools, RecordPager } from "../../components/RecordTools";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { TabProps } from "../../App";
 import { ApiError, groups, repricing, resources, tenants, type Group, type RepricingRun, type Tenant } from "../../lib/api";
 import { messageFor, problemAt } from "../../lib/errors";
 import { errorText } from "../../lib/fmt";
-import { fmtMicroCny, fmtUtc } from "../../lib/money";
-import { deltaWord, outcomeUnknown, previewAgainBody, utcInputToIso, utcInputValue } from "../../lib/repricing";
+import { fmtMicroCny } from "../../lib/money";
+import { fmtBeijing, beijingInputValue, parseBeijingInput } from "../../lib/time";
+import { deltaWord, outcomeUnknown, previewAgainBody } from "../../lib/repricing";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
 import { Field, useRefusalFocus } from "../../ui/Field";
@@ -41,8 +44,8 @@ interface Form {
   reason: string;
 }
 
-function startOfTodayUtc(): string {
-  return `${utcInputValue(new Date()).slice(0, 10)}T00:00:00`;
+function startOfTodayBeijing(): string {
+  return `${beijingInputValue(new Date()).slice(0, 10)}T00:00:00`;
 }
 
 // 桌面：5 + 7；平板：12 + 12。右侧为预览和运行记录。
@@ -58,8 +61,8 @@ function startOfTodayUtc(): string {
 export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
   const isAdmin = operator.role === "admin";
   const [form, setForm] = useState<Form>(() => ({
-    from: startOfTodayUtc(),
-    to: utcInputValue(new Date()),
+    from: startOfTodayBeijing(),
+    to: beijingInputValue(new Date()),
     model_id: "",
     tenant_id: "",
     status: "unpriced",
@@ -87,6 +90,9 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
   // Held from before the request is sent until its answer: a second apply can never start.
   const sending = useRef(false);
   const latest = useRef(0);
+  const [runState, setRunState] = useState("");
+  const table = useRecordTable({ items: (runs ?? []).filter((r) => !runState || r.status === runState), searchText: (r) => [r.id, r.reason], resetKey: runState });
+  const tenantTable = useRecordTable({ items: shown?.by_tenant ?? [], searchText: (t) => [t.tenant_id, t.tenant_name ?? ""], resetKey: shown?.id });
 
   useEffect(() => {
     tenants.list().then(setTenantList, () => undefined);
@@ -100,7 +106,7 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
   const load = useCallback(async (before?: number) => {
     const mine = ++latest.current;
     try {
-      const page = await repricing.list(before);
+      const page = await repricing.list(before, 50);
       if (mine !== latest.current) return;
       setRuns((prev) => (before === undefined ? page.items : [...(prev ?? []), ...page.items]));
       setNext(page.next_before);
@@ -156,11 +162,11 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
 
   async function submitPreview() {
     if (previewing || sending.current) return;
-    const from = utcInputToIso(form.from);
-    const to = utcInputToIso(form.to);
+    const from = parseBeijingInput(form.from);
+    const to = parseBeijingInput(form.to);
     const found: Partial<Record<keyof Form, string>> = {};
-    if (!from) found.from = "请填写开始时间（UTC）";
-    if (!to) found.to = "请填写结束时间（UTC）";
+    if (!from) found.from = "请填写开始时间（北京时间）";
+    if (!to) found.to = "请填写结束时间（北京时间）";
     if (from && to && Date.parse(from) >= Date.parse(to)) found.to = "结束时间必须晚于开始时间";
     if (form.reason.trim() === "") found.reason = "请填写重新计价原因（1–500 个字符）";
     setProblems(found);
@@ -286,7 +292,7 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
       >
         <CardHeader number={1} title="新建重新计价" description="按现行价格重新计算过去的调用。预览不会改动费用；确认影响后，由管理员执行。" />
         <div className="grid gap-x-4 tablet:grid-cols-2 desktop:grid-cols-1">
-          <Field label="开始（UTC）" error={problems.from}>
+          <Field label="开始（北京时间）" error={problems.from}>
             {(aria) => (
               <input
                 {...aria}
@@ -298,7 +304,7 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
               />
             )}
           </Field>
-          <Field label="结束（UTC）" hint="不得晚于当前时间。" error={problems.to}>
+          <Field label="结束（北京时间）" hint="不得晚于当前时间。" error={problems.to}>
             {(aria) => (
               <input
                 {...aria}
@@ -376,7 +382,7 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
         title={shown.status === "applied" ? "已执行的运行" : "预览结果"}
         description={
           <>
-            {fmtUtc(shown.filter.from)} 至 {fmtUtc(shown.filter.to)}
+            {fmtBeijing(shown.filter.from)} 至 {fmtBeijing(shown.filter.to)}
             {shown.filter.model_id && `，模型 ${modelName(shown.filter.model_id)}`}
             {shown.filter.tenant_id && `，租户 ${tenantName(shown.filter.tenant_id)}`}
             {shown.filter.group_id && `，分组 ${groupName(shown.filter.group_id)}`}
@@ -424,29 +430,33 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
 
         {shown.by_tenant.length > 0 && (
           <div className="bl-box">
-            <DataTable label="各租户差额">
-              <thead>
-                <tr>
-                  <th>租户</th>
-                  <th className="num">选中的调用</th>
-                  <th className="num">有变化</th>
-                  <th className="num">差额</th>
-                </tr>
-              </thead>
-              <tbody>
-                {shown.by_tenant.map((t) => (
-                  <tr key={t.tenant_id}>
-                    <td className="font-medium">{t.tenant_name || t.tenant_id}</td>
-                    <td className="num">{t.events}</td>
-                    <td className="num">{t.changed}</td>
-                    <td className="num money">
-                      {fmtMicroCny(t.delta_micro_cny)}
-                      <span className="cell-note">{deltaWord(t.delta_micro_cny)}</span>
-                    </td>
+            <>
+              <RecordTools table={tenantTable} label="各租户差额"></RecordTools>
+              <DataTable label="各租户差额">
+                <thead>
+                  <tr>
+                    <th>租户</th>
+                    <th className="num">选中的调用</th>
+                    <th className="num">有变化</th>
+                    <th className="num">差额</th>
                   </tr>
-                ))}
-              </tbody>
-            </DataTable>
+                </thead>
+                <tbody>
+                  {tenantTable.rows.map((t) => (
+                    <tr key={t.tenant_id}>
+                      <td className="font-medium">{t.tenant_name || t.tenant_id}</td>
+                      <td className="num">{t.events}</td>
+                      <td className="num">{t.changed}</td>
+                      <td className="num money">
+                        {fmtMicroCny(t.delta_micro_cny)}
+                        <span className="cell-note">{deltaWord(t.delta_micro_cny)}</span>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </DataTable>
+              <RecordPager table={tenantTable} label="各租户差额" />
+            </>
           </div>
         )}
       </div>
@@ -496,7 +506,7 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
       )}
       {shown.status === "applied" && (
         <p className="hint text-caption">
-          已由 {shown.applied_by?.email ?? "—"} 于 {shown.applied_at ? fmtUtc(shown.applied_at) : "—"} 执行。调整记入执行当月的租户流水；在用量统计里，则计入这些调用发生的月份。
+          已由 {shown.applied_by?.email ?? "—"} 于 {shown.applied_at ? fmtBeijing(shown.applied_at) : "—"} 执行。调整记入执行当月的租户流水；在用量统计里，则计入这些调用发生的月份。
         </p>
       )}
     </Card>
@@ -521,61 +531,59 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
       )}
       {runs === null && !loadError && <Loading />}
       {runs !== null && (
-        <DataTable label="重新计价运行">
-          <thead>
-            <tr>
-              <th>时间（UTC）</th>
-              <th>范围</th>
-              <th>原因</th>
-              <th>状态</th>
-              <th className="num">差额</th>
-              <th className="right">操作</th>
-            </tr>
-          </thead>
-          <tbody>
-            {runs.length === 0 && (
+        <>
+          <RecordTools table={table} label="重新计价运行" loaded><label className="f filter"><span>运行状态</span><select aria-label="运行状态" value={runState} onChange={(e) => setRunState(e.target.value)}><option value="">全部</option><option value="previewed">已预览</option><option value="applied">已执行</option></select></label></RecordTools>
+          <DataTable label="重新计价运行">
+            <thead>
               <tr>
-                <td colSpan={6} className="hint">
-                  还没有重新计价的记录
-                </td>
+                <th>时间（北京时间）</th>
+                <th>范围</th>
+                <th>原因</th>
+                <th>状态</th>
+                <th className="num">差额</th>
+                <th className="right">操作</th>
               </tr>
-            )}
-            {runs.map((r) => (
-              <tr key={r.id}>
-                <td className="w-28 whitespace-normal tabular text-text-2">{fmtUtc(r.created_at)}</td>
-                <td className="min-w-56 whitespace-normal">
-                  {fmtUtc(r.filter.from)} 至 {fmtUtc(r.filter.to)}
-                  <span className="cell-note">
-                    模型：{modelName(r.filter.model_id) ?? "全部"}；租户：{tenantName(r.filter.tenant_id) ?? "全部"}；
-                    {r.filter.group_id && `分组：${groupName(r.filter.group_id)}；`}状态：
-                    {r.filter.status ? statusLabel(r.filter.status) : "全部"}
-                  </span>
-                </td>
-                <td className="min-w-28 whitespace-normal">{r.reason}</td>
-                <td>
-                  <Lamp state={r.status === "applied" ? "applied" : "pending"}>{r.status === "applied" ? "已执行" : "已预览"}</Lamp>
-                </td>
-                <td className="num money min-w-20">
-                  {fmtMicroCny(r.delta_micro_cny)}
-                  <span className="cell-note">{deltaWord(r.delta_micro_cny)}</span>
-                </td>
-                <td className="right">
-                  <Button size="sm" type="button" disabled={busy} onClick={() => void view(r.id)}>
-                    查看
-                  </Button>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </DataTable>
+            </thead>
+            <tbody>
+              {runs.length === 0 && (
+                <tr>
+                  <td colSpan={6} className="hint">
+                    还没有重新计价的记录
+                  </td>
+                </tr>
+              )}
+              {table.rows.map((r) => (
+                <tr key={r.id}>
+                  <td className="w-28 whitespace-normal tabular text-text-2">{fmtBeijing(r.created_at)}</td>
+                  <td className="min-w-56 whitespace-normal">
+                    {fmtBeijing(r.filter.from)} 至 {fmtBeijing(r.filter.to)}
+                    <span className="cell-note">
+                      模型：{modelName(r.filter.model_id) ?? "全部"}；租户：{tenantName(r.filter.tenant_id) ?? "全部"}；
+                      {r.filter.group_id && `分组：${groupName(r.filter.group_id)}；`}状态：
+                      {r.filter.status ? statusLabel(r.filter.status) : "全部"}
+                    </span>
+                  </td>
+                  <td className="min-w-28 whitespace-normal">{r.reason}</td>
+                  <td>
+                    <Lamp state={r.status === "applied" ? "applied" : "pending"}>{r.status === "applied" ? "已执行" : "已预览"}</Lamp>
+                  </td>
+                  <td className="num money min-w-20">
+                    {fmtMicroCny(r.delta_micro_cny)}
+                    <span className="cell-note">{deltaWord(r.delta_micro_cny)}</span>
+                  </td>
+                  <td className="right">
+                    <Button size="sm" type="button" disabled={busy} onClick={() => void view(r.id)}>
+                      查看
+                    </Button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </DataTable>
+          <RecordPager table={table} label="重新计价运行" resetKey={runState} hasMore={next !== null} onMore={() => load(next ?? undefined)} busy={busy} />
+        </>
       )}
-      {runs !== null && next !== null && (
-        <div className="bl-card-foot">
-          <Button type="button" size="sm" disabled={busy} onClick={() => void load(next)}>
-            加载更多
-          </Button>
-        </div>
-      )}
+
     </Card>
   );
 

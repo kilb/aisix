@@ -1,5 +1,5 @@
 //! A tenant's ledger read two ways: its entries page by page, newest first,
-//! and its totals per UTC day or month. Nothing here is stored: a summary is
+//! and its totals per Beijing calendar day or month. Nothing here is stored: a summary is
 //! added up from the entries when it is asked for, so it can never disagree
 //! with them. Operators read any tenant's
 //! (`/admin/tenants/{id}/billing/ledger`, `.../billing/summary`); a tenant's
@@ -169,7 +169,7 @@ async fn ledger_of(
     Ok(Json(json!({ "items": items, "next_before": next_before })))
 }
 
-/// `tenant`'s totals per UTC period of `[from, to)`, oldest first, as
+/// `tenant`'s totals per Beijing calendar period of `[from, to)`, oldest first, as
 /// `{items}`. A period with no entry is absent; the closing balance is the
 /// balance after the period's last entry in the range.
 async fn summary_of(
@@ -183,7 +183,7 @@ async fn summary_of(
         Group::Month => "month",
     };
     let rows: Vec<(DateTime<Utc>, i64, i64, i64, i64)> = sqlx::query_as(
-        "SELECT date_trunc($4, posted_at, 'UTC') AS period, \
+        "SELECT date_trunc($4, posted_at, 'Asia/Shanghai') AS period, \
                 COALESCE(SUM(amount_micro_cny) FILTER (WHERE kind = 'usage'), 0)::bigint, \
                 COALESCE(SUM(amount_micro_cny) FILTER (WHERE kind = 'topup'), 0)::bigint, \
                 COALESCE(SUM(amount_micro_cny) FILTER (WHERE kind = 'adjustment'), 0)::bigint, \

@@ -1,4 +1,4 @@
-import { exactInteger } from "./chartFormat.ts";
+import { exactInteger, exactRatio } from "./chartFormat.ts";
 
 export type MetricsScope = "tenant" | "admin";
 export type MetricsBucket = "minute" | "hour" | "day";
@@ -23,6 +23,7 @@ export interface MetricsLatency {
   avg: number | null;
   p50: number | null;
   p95: number | null;
+  p99: number | null;
 }
 export interface ApiMetricValues extends MetricCounts {
   success_rate: number | null;
@@ -62,7 +63,7 @@ function rate(value: unknown): number | null {
 }
 function latency(value: unknown): MetricsLatency {
   const row = record(value) ?? {};
-  return { sample_count: count(row.sample_count), missing_count: count(row.missing_count), avg: measurement(row.avg), p50: measurement(row.p50), p95: measurement(row.p95) };
+  return { sample_count: count(row.sample_count), missing_count: count(row.missing_count), avg: measurement(row.avg), p50: measurement(row.p50), p95: measurement(row.p95), p99: measurement(row.p99) };
 }
 function values(input: Record<string, unknown>): ApiMetricValues {
   const tokens = record(input.tokens) ?? {};
@@ -117,7 +118,7 @@ export function rankMetricModels(models: readonly ApiMetricModel[], field: "requ
 export function metricsRangeError(from: string, to: string, bucket?: MetricsBucket): string | null {
   const start = Date.parse(from);
   const end = Date.parse(to);
-  if (!Number.isFinite(start) || !Number.isFinite(end) || start >= end) return "请选择有效的 UTC 起止时间，结束时间须晚于开始时间。";
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start >= end) return "请选择有效的起止时间，结束时间须晚于开始时间。";
   if (end - start > 92 * 86_400_000) return "完整 API 指标最多查询 92 天。请缩小时间范围；下方历史明细仍按原范围显示。";
   const duration = bucket === "minute" ? 60_000 : bucket === "hour" ? 3_600_000 : bucket === "day" ? 86_400_000 : null;
   if (duration !== null && Math.ceil(end / duration) - Math.floor(start / duration) > 1500) return "当前粒度超过 1,500 个期间，请缩小范围或改用更粗粒度。";
@@ -163,4 +164,28 @@ export function requestRateSummary(requests: number | null, successRate: number 
     failureRate: successRate !== null && Number.isFinite(successRate) && successRate >= 0 && successRate <= 1 ? 1 - successRate : null,
     averageRps: requests !== null && Number.isSafeInteger(requests) && requests >= 0 && Number.isFinite(durationSeconds) && durationSeconds > 0 ? requests / durationSeconds : null,
   };
+}
+
+/** 分母仅为同口径的实测与缺失样本；无样本、旧字段与非法计数保持未知。 */
+export function sampleCoverage(samples: number | null | undefined, missing: number | null | undefined): number | null {
+  const known = count(samples);
+  const unknown = count(missing);
+  return known === null || unknown === null ? null : exactRatio(BigInt(known), BigInt(known) + BigInt(unknown));
+}
+
+/** 已记录 token 可为部分用量；只有未知记录的非空桶不能冒充实测零。 */
+export function tokenTrendValue(tokens: ApiMetricValues["tokens"] | undefined, field: "input_tokens" | "completion_tokens"): number | null {
+  const known = count(tokens?.known_usage_attempts);
+  const unknown = count(tokens?.unknown_usage_attempts);
+  return known === null || unknown === null || known === 0 && unknown > 0 ? null : count(tokens?.[field]);
+}
+
+/** 请求构成按全部最终请求；计数不完整或不一致时不推算缺失部分。 */
+export function requestOutcomeShares(totals?: Pick<ApiMetricValues, "requests" | "succeeded_requests" | "failed_requests" | "unknown_outcome_requests">): [number, number, number] | null {
+  const requests = count(totals?.requests);
+  const succeeded = count(totals?.succeeded_requests);
+  const failed = count(totals?.failed_requests);
+  const unknown = count(totals?.unknown_outcome_requests);
+  if (requests === null || succeeded === null || failed === null || unknown === null || BigInt(succeeded) + BigInt(failed) + BigInt(unknown) !== BigInt(requests)) return null;
+  return requests === 0 ? [0, 0, 0] : [succeeded / requests, failed / requests, unknown / requests];
 }

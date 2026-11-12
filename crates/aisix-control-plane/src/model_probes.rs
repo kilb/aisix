@@ -2,7 +2,7 @@
 //!
 //! 指标绑定被探测的存储行（含渠道生成的内部直连），组合模型与通配别名不能代替
 //! 一个确切目标。显式 embedding 走向量接口，其余直连执行文本协议探测；一次文本
-//! 失败不说明图像、音频等其它能力不可用。结果仅返回本次样本，不持久化健康状态。
+//! 失败不说明图像、音频等其它能力不可用。脱敏样本写入历史，不更改健康或正式用量。
 //!
 //! 首字只计非空可见正文，角色、推理、工具与 usage 均不计：
 //! <https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events>
@@ -31,12 +31,15 @@ use uuid::Uuid;
 use crate::auth::{OperatorAuth, OperatorRole};
 use crate::error::ApiError;
 use crate::http::ApiJson;
+use crate::model_probe_history::{self as history, Snapshot};
 use crate::resources::{self, store, Kind};
 use crate::AppState;
 
 pub const MAX_IN_FLIGHT: usize = 3;
 pub const TIMEOUT: Duration = Duration::from_secs(30);
 const TOTAL_BUDGET: Duration = Duration::from_secs(55);
+// 最后五秒只用于保存最终结果，不能再发出模型或凭据交换调用。
+const WORK_BUDGET: Duration = Duration::from_secs(50);
 const MAX_TOKENS: u32 = 64;
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_CHUNKS: usize = 4096;
@@ -169,9 +172,8 @@ pub async fn probe(
     let route_started = tokio::time::Instant::now();
     auth.require(OperatorRole::Admin)?;
     let result = ProbeResult::new(id);
-    let loading_budget =
-        total_remaining(route_started.elapsed()).ok_or_else(preparation_timeout)?;
-    let (model, account) = tokio::time::timeout(loading_budget, async {
+    let loading_budget = work_remaining(route_started.elapsed()).ok_or_else(preparation_timeout)?;
+    let (model, model_version, account) = tokio::time::timeout(loading_budget, async {
         let mut conn = state
             .db
             .pool()
@@ -184,19 +186,21 @@ pub async fn probe(
             .ok_or_else(ApiError::not_found)?;
         let model: Model = serde_json::from_value(row.doc)
             .map_err(|_| ApiError::internal("探测目标的模型配置无法读取"))?;
-        if unsupported_target(&model).is_some() {
-            return Ok::<_, ApiError>((model, None));
-        }
-        let pk_id = model
+        let Some(pk_id) = model
             .provider_key_id
             .as_deref()
             .and_then(|id| Uuid::parse_str(id).ok())
-            .ok_or_else(|| ApiError::internal("探测目标缺少有效上游账号"))?;
+        else {
+            if unsupported_target(&model).is_some() {
+                return Ok::<_, ApiError>((model, row.version, None));
+            }
+            return Err(ApiError::internal("探测目标缺少有效上游账号"));
+        };
         let pk = store::get(&mut conn, Kind::ProviderKeys, pk_id)
             .await?
             .filter(|row| !row.deleted)
             .ok_or_else(ApiError::not_found)?;
-        Ok((model, Some((pk_id, pk.doc))))
+        Ok((model, row.version, Some((pk_id, pk.version, pk.doc))))
     })
     .await
     .map_err(|_| preparation_timeout())??;
@@ -206,15 +210,53 @@ pub async fn probe(
             result.capability_check =
                 CapabilityResult::unsupported("该目标不支持能力抽测，未追加模型请求");
         }
-        return Ok(Json(result));
+        let history_id = history::begin(
+            &state.db,
+            Snapshot {
+                model_id: id,
+                model_version,
+                model_name: model.display_name,
+                provider_key_id: account.as_ref().map(|(id, _, _)| *id),
+                provider_key_version: account.as_ref().map(|(_, version, _)| *version),
+                account_name: account
+                    .as_ref()
+                    .and_then(|(_, _, doc)| doc.get("display_name"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+            },
+            auth.id,
+            body.capability_check,
+            route_started + WORK_BUDGET,
+        )
+        .await?;
+        return tokio::spawn(async move {
+            history::save(
+                &state.db,
+                history_id,
+                &result,
+                true,
+                route_started + TOTAL_BUDGET,
+            )
+            .await?;
+            Ok(Json(result))
+        })
+        .await
+        .map_err(|_| ApiError::internal("测试记录未能保存"))?;
     }
-    let (pk_id, mut pk_doc) = account.ok_or_else(|| ApiError::internal("探测目标缺少上游账号"))?;
+    let (pk_id, pk_version, mut pk_doc) =
+        account.ok_or_else(|| ApiError::internal("探测目标缺少上游账号"))?;
     // 全满立即拒绝；等待慢上游时既不占数据库连接，也不积累无界等待队列。
-    let _permit = state.model_probes.try_acquire().map_err(|_| ApiError {
-        status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
-        message: "模型测试服务繁忙，本次尚未调用上游".to_string(),
-        ..ApiError::busy()
-    })?;
+    let permit = Arc::clone(&state.model_probes)
+        .try_acquire_owned()
+        .map_err(|_| ApiError {
+            status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            message: "模型测试服务繁忙，本次尚未调用上游".to_string(),
+            ..ApiError::busy()
+        })?;
+    let account_name = pk_doc
+        .get("display_name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
     resources::secrets::unseal(
         &state.cfg.master_key,
         Kind::ProviderKeys,
@@ -224,6 +266,49 @@ pub async fn probe(
     .map_err(ApiError::internal)?;
     let pk: ProviderKey = serde_json::from_value(pk_doc)
         .map_err(|_| ApiError::internal("探测目标的上游账号配置无法读取"))?;
+    let history_id = history::begin(
+        &state.db,
+        Snapshot {
+            model_id: id,
+            model_version,
+            model_name: model.display_name.clone(),
+            provider_key_id: Some(pk_id),
+            provider_key_version: Some(pk_version),
+            account_name,
+        },
+        auth.id,
+        body.capability_check,
+        route_started + WORK_BUDGET,
+    )
+    .await?;
+    // 已接受的调用独立完成并保存；客户端断连只停止等待，不重发也不取消上游。
+    tokio::spawn(async move {
+        let _permit = permit;
+        execute_probe(
+            state,
+            model,
+            (pk_id, pk),
+            result,
+            body.capability_check,
+            route_started,
+            history_id,
+        )
+        .await
+    })
+    .await
+    .map_err(|_| ApiError::internal("测试执行中断，请从历史查看已保存结果"))?
+}
+
+async fn execute_probe(
+    state: AppState,
+    model: Model,
+    (pk_id, pk): (Uuid, ProviderKey),
+    result: ProbeResult,
+    capability_check: bool,
+    route_started: tokio::time::Instant,
+    history_id: i64,
+) -> Result<Json<ProbeResult>, ApiError> {
+    let id = result.model_id;
     let tap = Arc::new(ResponseHeaderTap::new(
         Vec::new(),
         false,
@@ -240,7 +325,7 @@ pub async fn probe(
         }
         let Some(phase_timeout) = phase_budget(route_started.elapsed()) else {
             result.status = Status::Timeout;
-            result.error = Some("整次探测 55 秒预算已用完，未发送基础模型请求".to_string());
+            result.error = Some("本次探测可用工作预算已用完，未发送基础模型请求".to_string());
             return;
         };
         let attempt = async {
@@ -298,7 +383,7 @@ pub async fn probe(
             Err(_) => {
                 result.status = Status::Timeout;
                 result.error =
-                    Some("基础探测已达到单次 30 秒或整次 55 秒时限，已停止等待".to_string());
+                    Some("基础探测已达到单次 30 秒或整次可用工作时限，已停止等待".to_string());
             }
         }
     })
@@ -321,15 +406,42 @@ pub async fn probe(
             .map(|tokens| f64::from(tokens) * 1000.0 / result.total_duration_ms);
     }
     // 首次测量在此已固定；能力调用不计入基础状态、首字、用量或速率。
+    if capability_check {
+        result.capability_check =
+            CapabilityResult::not_tested("基础结果已保存，能力抽测尚未取得最终结果");
+    }
+    history::save(
+        &state.db,
+        history_id,
+        &result,
+        !capability_check,
+        route_started
+            + if capability_check {
+                WORK_BUDGET
+            } else {
+                TOTAL_BUDGET
+            },
+    )
+    .await?;
     append_capability(
         &mut result,
-        body.capability_check,
+        capability_check,
         model.is_embedding(),
         target,
         tap,
         route_started,
     )
     .await;
+    if capability_check {
+        history::save(
+            &state.db,
+            history_id,
+            &result,
+            true,
+            route_started + TOTAL_BUDGET,
+        )
+        .await?;
+    }
     Ok(Json(result))
 }
 
@@ -356,7 +468,7 @@ async fn append_capability(
                     response_tap::scope(tap, check_capability(bridge.as_ref(), &ctx, budget)).await
                 }
                 None => {
-                    CapabilityResult::not_tested("整次探测 55 秒预算已用完，未追加能力模型请求")
+                    CapabilityResult::not_tested("本次探测可用工作预算已用完，未追加能力模型请求")
                 }
             }
         } else {
@@ -365,19 +477,19 @@ async fn append_capability(
     }
 }
 
-fn total_remaining(elapsed: Duration) -> Option<Duration> {
-    TOTAL_BUDGET
+fn work_remaining(elapsed: Duration) -> Option<Duration> {
+    WORK_BUDGET
         .checked_sub(elapsed)
         .filter(|left| !left.is_zero())
 }
 
 fn phase_budget(elapsed: Duration) -> Option<Duration> {
-    total_remaining(elapsed).map(|left| left.min(TIMEOUT))
+    work_remaining(elapsed).map(|left| left.min(TIMEOUT))
 }
 
 fn preparation_timeout() -> ApiError {
     ApiError {
-        message: "测试准备超出 55 秒总时限，本次未发送模型请求".to_string(),
+        message: "测试准备超出可用工作时限，本次未发送模型请求".to_string(),
         ..ApiError::unavailable()
     }
 }
@@ -715,13 +827,13 @@ mod tests {
         assert_eq!(phase_budget(Duration::ZERO), Some(Duration::from_secs(30)));
         assert_eq!(
             phase_budget(Duration::from_secs(29)),
-            Some(Duration::from_secs(26))
+            Some(Duration::from_secs(21))
         );
         assert_eq!(
-            phase_budget(Duration::from_secs(54)),
+            phase_budget(Duration::from_secs(49)),
             Some(Duration::from_secs(1))
         );
-        assert_eq!(phase_budget(Duration::from_secs(55)), None);
+        assert_eq!(phase_budget(Duration::from_secs(50)), None);
         assert_eq!(phase_budget(Duration::from_secs(56)), None);
     }
 
@@ -747,12 +859,108 @@ mod tests {
             1,
             "真实零首字依然允许追加一次"
         );
-        assert_eq!(route_started.elapsed(), TOTAL_BUDGET);
+        assert_eq!(route_started.elapsed(), WORK_BUDGET);
         assert_eq!(result.capability_check.status, CapabilityStatus::Timeout);
         assert_eq!(
             basic_fields(&result),
             original,
             "追加超时不能污染已完成的基础指标"
+        );
+    }
+
+    // 实跑异步等待与保存门，不能只靠减法证明工作和最终保存共享截止。
+    #[tokio::test(start_paused = true)]
+    async fn model_work_and_persistence_gates_share_the_55_second_deadline() {
+        let started = tokio::time::Instant::now();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        history::within_budget(
+            started + WORK_BUDGET,
+            async {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                Ok::<_, sqlx::Error>(())
+            },
+            "初始保存门超时",
+        )
+        .await
+        .expect("准备和初始保存消耗五秒");
+        tokio::time::timeout(
+            phase_budget(started.elapsed()).expect("基础预算"),
+            tokio::time::sleep(Duration::from_secs(29)),
+        )
+        .await
+        .expect("基础工作29秒");
+        let mut result = base_sample();
+        let original = basic_fields(&result);
+        history::within_budget(
+            started + WORK_BUDGET,
+            async {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                Ok::<_, sqlx::Error>(())
+            },
+            "基础保存门超时",
+        )
+        .await
+        .expect("中间保存也消耗工作预算");
+        let calls = Arc::new(AtomicUsize::new(0));
+        append_capability(
+            &mut result,
+            true,
+            false,
+            Some(prepared_unit_target(Arc::clone(&calls))),
+            Arc::new(ResponseHeaderTap::new(
+                Vec::new(),
+                false,
+                "persist-budget".into(),
+            )),
+            started,
+        )
+        .await;
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(50),
+            "模型工作必须给最终保存留五秒"
+        );
+        assert_eq!(result.capability_check.status, CapabilityStatus::Timeout);
+        assert_eq!(basic_fields(&result), original);
+        history::within_budget(
+            started + TOTAL_BUDGET,
+            async {
+                tokio::time::sleep(Duration::from_secs(4)).await;
+                Ok::<_, sqlx::Error>(())
+            },
+            "最终保存门超时",
+        )
+        .await
+        .expect("工作耗尽后仍有最终保存预算");
+        assert_eq!(started.elapsed(), Duration::from_secs(54));
+        let blocked = history::within_budget(
+            started + TOTAL_BUDGET,
+            std::future::pending::<Result<(), sqlx::Error>>(),
+            "保存门持续阻塞",
+        )
+        .await;
+        assert!(blocked.is_err());
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(55),
+            "不足五秒时不能另开五秒等待"
+        );
+        let polls = AtomicUsize::new(0);
+        assert!(history::within_budget(
+            started + TOTAL_BUDGET,
+            async {
+                polls.fetch_add(1, Ordering::Relaxed);
+                Ok::<_, sqlx::Error>(())
+            },
+            "预算耗尽"
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            polls.load(Ordering::Relaxed),
+            0,
+            "零预算不能 poll 数据库 future"
         );
     }
 

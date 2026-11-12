@@ -130,10 +130,16 @@ async fn managers_get_one_whitelisted_batch_with_key_record_ownership_and_zero_m
             .expect("时间");
         let now = Utc::now();
         assert_eq!(
-            from.date_naive(),
-            now.date_naive().with_day(1).expect("月初")
+            (from + TimeDelta::hours(8)).date_naive(),
+            (now + TimeDelta::hours(8))
+                .date_naive()
+                .with_day(1)
+                .expect("北京月初")
         );
-        assert_eq!(from.time(), chrono::NaiveTime::MIN);
+        assert_eq!(
+            from.time(),
+            chrono::NaiveTime::from_hms_opt(16, 0, 0).expect("北京午夜对应16Z")
+        );
         assert!(to > now - TimeDelta::minutes(1) && to <= now + TimeDelta::minutes(1));
     }
     let outsider_session = w.cp.member_login_as(&outsider).await;
@@ -211,9 +217,11 @@ async fn default_month_and_explicit_cross_month_windows_use_inclusive_from_and_e
     let Some(w) = world().await else { return };
     let model = seed_model(&w.cp, &w.admin).await;
     let now = Utc::now();
-    let month_start = (now.date_naive() - TimeDelta::days(i64::from(now.day0())))
+    let beijing = now + TimeDelta::hours(8);
+    let month_start = (beijing.date_naive() - TimeDelta::days(i64::from(beijing.day0())))
         .and_time(chrono::NaiveTime::MIN)
-        .and_utc();
+        .and_utc()
+        - TimeDelta::hours(8);
     insert_baseline_backdated(
         w.cp.db(),
         model,

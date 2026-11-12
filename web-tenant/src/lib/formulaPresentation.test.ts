@@ -19,6 +19,7 @@ async function component<Props>(file: string, name: string): Promise<ComponentTy
       loader: "tsx",
     },
     bundle: true, platform: "node", format: "cjs", jsx: "automatic", write: false,
+    loader: { ".css": "empty" },
     define: { "import.meta.env.BASE_URL": '"/"' },
   });
   const compiledModule = { exports: {} as Record<string, ComponentType<Props>> };

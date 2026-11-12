@@ -17,6 +17,8 @@ import { deleteRefusalText, deleteWarning } from "../../lib/retireWarning";
 import { Button } from "../../ui/Button";
 import { DataTable } from "../../ui/DataTable";
 import { EmptyState } from "../../ui/EmptyState";
+import { useRecordTable } from "../../lib/recordTable";
+import { RecordTablePager, RecordTableToolbar } from "../../ui/RecordTable";
 import { Field, useRefusalFocus } from "../../ui/Field";
 import { TwoStep } from "../../ui/TwoStep";
 import { useToast } from "../../ui/Toast";
@@ -115,6 +117,12 @@ export function PublicModels({ canEdit }: TabProps) {
     void load();
   }, [load]);
 
+  const [modelState, setModelState] = useState("");
+  const records = useRecordTable({
+    items: (rows ?? []).filter((model) => modelState === "" || (modelState === "live" ? model.retired_at === null : modelState === "retired" ? model.retired_at !== null : model.retired_at === null && !model.served_by.some((account) => account.enabled))),
+    searchText: (model) => [model.name, model.id],
+    resetKey: modelState,
+  });
   const open = rows?.find((m) => m.id === selected) ?? null;
   if (open) {
     return (
@@ -289,6 +297,10 @@ export function PublicModels({ canEdit }: TabProps) {
           ) : rows.length === 0 ? (
             <EmptyState text="还没有公共模型。" />
           ) : (
+            <>
+            <RecordTableToolbar search={{ value: records.query, onChange: records.setQuery, label: "搜索公共模型", placeholder: "模型名称或 ID" }}>
+              <label className="f filter"><span>模型状态</span><select value={modelState} onChange={(e) => setModelState(e.target.value)}><option value="">全部</option><option value="live">在用</option><option value="retired">已停用</option><option value="unavailable">在用但无可用账号</option></select></label>
+            </RecordTableToolbar>
             <DataTable label="公共模型" scroll>
               <thead>
                 <tr>
@@ -302,7 +314,8 @@ export function PublicModels({ canEdit }: TabProps) {
                 </tr>
               </thead>
               <tbody>
-                {rows.map((m) => {
+                {records.rows.length === 0 && <tr><td colSpan={7}><EmptyState text="没有符合筛选条件的公共模型" /></td></tr>}
+                {records.rows.map((m) => {
                   const priced = prices === null ? null : pricedState(m, prices.get(m.id), liveGroups);
                   const retired = m.retired_at !== null;
                   return (
@@ -363,6 +376,8 @@ export function PublicModels({ canEdit }: TabProps) {
                 })}
               </tbody>
             </DataTable>
+            <RecordTablePager page={records.page} pageSize={records.pageSize} onPageChange={records.setPage} onPageSizeChange={records.setPageSize} total={records.filteredCount} label="公共模型分页" />
+            </>
           )}
         </Card>
       </WithForms>

@@ -16,6 +16,7 @@ const compiled = await build({
     sourcefile: "billing-summary-chart.ts",
   },
   bundle: true,
+  loader: { ".css": "empty" },
   platform: "node",
   format: "cjs",
   jsx: "automatic",

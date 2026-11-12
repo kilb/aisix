@@ -48,8 +48,10 @@ impl Bucket {
     }
 
     fn floor(self, at: DateTime<Utc>) -> Result<DateTime<Utc>, ApiError> {
+        // 北京日界是 UTC 前一天16点；小时和分钟边界在东八区恰好不变。
+        let offset = 8 * 3600;
         DateTime::from_timestamp(
-            at.timestamp().div_euclid(self.seconds()) * self.seconds(),
+            (at.timestamp() + offset).div_euclid(self.seconds()) * self.seconds() - offset,
             0,
         )
         .ok_or_else(|| refused("/from", "时间不合法"))
@@ -75,6 +77,7 @@ pub struct LatencyMetrics {
     pub avg: Option<f64>,
     pub p50: Option<f64>,
     pub p95: Option<f64>,
+    pub p99: Option<f64>,
 }
 
 #[derive(Default, Deserialize, Serialize)]
@@ -234,7 +237,8 @@ fn latency(field: &str, eligible: &str) -> String {
         "jsonb_build_object('sample_count', {}, 'missing_count', {}, \
       'avg', avg({field}) FILTER (WHERE {eligible}), \
       'p50', percentile_cont(0.5) WITHIN GROUP (ORDER BY {field}) FILTER (WHERE {eligible}), \
-      'p95', percentile_cont(0.95) WITHIN GROUP (ORDER BY {field}) FILTER (WHERE {eligible}))",
+      'p95', percentile_cont(0.95) WITHIN GROUP (ORDER BY {field}) FILTER (WHERE {eligible}), \
+      'p99', percentile_cont(0.99) WITHIN GROUP (ORDER BY {field}) FILTER (WHERE {eligible}))",
         count(&sample),
         count(&format!("{eligible} AND {field} IS NULL"))
     )
@@ -345,7 +349,7 @@ async fn summarize(
     let mut sql = QueryBuilder::<Postgres>::new("WITH raw AS MATERIALIZED (SELECT ");
     sql.push("date_trunc(")
         .push_bind(bucket.unit())
-        .push(", pc.occurred_at, 'UTC') AS period_start, ");
+        .push(", pc.occurred_at, 'Asia/Shanghai') AS period_start, ");
     sql.push("CASE WHEN pc.requested_model_id = ANY(")
         .push_bind(ids)
         .push(") THEN pc.requested_model_id ELSE '' END AS model_id, ");
@@ -530,4 +534,41 @@ pub async fn admin_tenant(
         return Err(refused("/tenant_id", "租户范围与路径不一致"));
     }
     summarize(&state, q, Some(tenant), None).await
+}
+
+#[cfg(test)]
+mod timezone_tests {
+    use super::*;
+
+    #[test]
+    fn beijing_day_bucket_floor_and_window_count_use_sixteen_utc() {
+        for boundary in [
+            "2026-11-08T16:00:00Z",
+            "2025-12-31T16:00:00Z",
+            "2024-02-28T16:00:00Z",
+        ] {
+            let boundary = DateTime::parse_from_rfc3339(boundary)
+                .expect("北京时间午夜")
+                .with_timezone(&Utc);
+            assert_eq!(Bucket::Day.floor(boundary).expect("日桶"), boundary);
+            assert_eq!(
+                Bucket::Day
+                    .floor(boundary - TimeDelta::nanoseconds(1))
+                    .expect("前一日桶"),
+                boundary - TimeDelta::days(1)
+            );
+            for bucket in [Bucket::Minute, Bucket::Hour] {
+                assert_eq!(bucket.floor(boundary).expect("细粒度桶"), boundary);
+            }
+            let q = MetricsQuery {
+                from: Some(boundary),
+                to: Some(boundary + TimeDelta::days(1)),
+                bucket: Some(Bucket::Day),
+                ..MetricsQuery::default()
+            };
+            let (from, to, bucket) = checked_window(&q).expect("整北京日范围");
+            assert_eq!(bucket.floor(from).expect("起点"), from);
+            assert_eq!(bucket.floor(to).expect("终点"), to);
+        }
+    }
 }

@@ -19,7 +19,7 @@ export function SidebarShell({
   brand: ReactNode | ((close: () => void) => ReactNode);
   label: string;
   context?: ReactNode;
-  footer?: ReactNode;
+  footer?: ReactNode | ((close: () => void) => ReactNode);
   navigation: (close: () => void) => ReactNode;
   routeKey?: string;
   children: ReactNode;
@@ -72,7 +72,7 @@ export function SidebarShell({
       </div>
       {context && <div className="shell-sidebar-context">{context}</div>}
       <div className="shell-sidebar-navigation">{navigation(close)}</div>
-      {footer && <div className="shell-sidebar-footer">{footer}</div>}
+      {footer && <div className="shell-sidebar-footer">{typeof footer === "function" ? footer(close) : footer}</div>}
     </>
   );
 

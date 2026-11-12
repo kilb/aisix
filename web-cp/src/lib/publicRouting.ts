@@ -11,6 +11,7 @@ import type { PublicModelRouting } from "./api.ts";
  */
 export interface RoutingDraft {
   strategy: string;
+  affinity: "default" | "api_key" | "custom";
   retries: string;
   maxFallbacks: string;
   retryOn429: boolean;
@@ -23,6 +24,8 @@ export interface RoutingDraft {
 export function draftOf(routing: PublicModelRouting, defaultStrategy: string): RoutingDraft {
   return {
     strategy: typeof routing.strategy === "string" && routing.strategy !== "" ? routing.strategy : defaultStrategy,
+    affinity: routing.hash_on === undefined ? "default" :
+      sameRouting({ hash_on: routing.hash_on }, { hash_on: [{ type: "api_key" }] }) ? "api_key" : "custom",
     retries: routing.retries === undefined || routing.retries === null ? "" : String(routing.retries),
     maxFallbacks: routing.max_fallbacks === undefined || routing.max_fallbacks === null ? "" : String(routing.max_fallbacks),
     retryOn429: routing.retry_on_429 === true,
@@ -44,12 +47,12 @@ export function statusesOf(text: string): number[] | null {
 }
 
 /** The settings this form has a control for; every other key is carried over. */
-const EDITED = ["strategy", "retries", "max_fallbacks", "retry_on_429", "fallback_on_statuses", "when_all_unavailable"];
+const EDITED = ["strategy", "hash_on", "retries", "max_fallbacks", "retry_on_429", "fallback_on_statuses", "when_all_unavailable"];
 
 /**
  * The body to send for `draft`.
  *
- * A key the form does not show (`hash_on`, and any setting a later gateway
+ * A key the form does not show (including a setting a later gateway
  * adds) is carried over from `stored` exactly as read, so saving a strategy
  * never drops a field this form has no control for. Every key it does show is
  * decided here alone, so clearing a field clears what was stored rather than
@@ -71,6 +74,13 @@ export function routingBody(
     if (!EDITED.includes(key)) body[key] = value;
   }
   if (draft.strategy !== "" && draft.strategy !== defaultStrategy) body.strategy = draft.strategy;
+  if (draft.strategy === "consistent_hash") {
+    if (draft.affinity === "api_key") body.hash_on = [{ type: "api_key" }];
+    if (draft.affinity === "custom" && stored.hash_on !== undefined) body.hash_on = stored.hash_on;
+  } else if (draft.strategy === (stored.strategy ?? defaultStrategy) && stored.hash_on !== undefined) {
+    // 未切换策略时保留旧配置；切离哈希策略时才移除亲和来源。
+    body.hash_on = stored.hash_on;
+  }
   if (draft.retries.trim() !== "") body.retries = Number(draft.retries);
   if (draft.maxFallbacks.trim() !== "") body.max_fallbacks = Number(draft.maxFallbacks);
   if (draft.retryOn429) body.retry_on_429 = true;

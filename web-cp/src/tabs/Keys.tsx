@@ -1,3 +1,7 @@
+import { parseBeijingInput } from "../lib/time";
+import { keySearchText } from "../lib/operationalRecords";
+import { useRecordTable } from "../lib/recordTable";
+import { RecordTools, RecordPager } from "../components/RecordTools";
 /** 布局：[01 租户范围 12]；[02 密钥 6][03 正常 6]；[列表 12 / 创建时表单 5 + 列表 7]。 */
 import { Fragment, useCallback, useEffect, useId, useMemo, useState } from "react";
 import type { TabProps } from "../App";
@@ -238,6 +242,10 @@ function TenantKeys({ tenantId, canEdit, tick }: { tenantId: string; canEdit: bo
     return all.filter((g) => tenant.allowed_provider_groups.includes(g.name));
   }, [groups.data, tenant]);
 
+  const [keyStatus, setKeyStatus] = useState("");
+  const [keyGroup, setKeyGroup] = useState("");
+  const table = useRecordTable({ items: (keyList.data ?? []).filter((k) => (!keyStatus || (k.effective_disabled ? "disabled" : "enabled") === keyStatus) && (!keyGroup || k.group?.name === keyGroup)), searchText: (k) => [...keySearchText(k), k.member_id ? members.data?.find((m) => m.id === k.member_id)?.email ?? k.member_id : "租户共用"], resetKey: `${tenantId}:${keyStatus}:${keyGroup}` });
+
   const saved = (k: AdminKey) => {
     keyList.setData((list) => list && list.map((x) => (x.id === k.id ? k : x)));
     void refresh();
@@ -375,85 +383,89 @@ function TenantKeys({ tenantId, canEdit, tick }: { tenantId: string; canEdit: bo
           ) : keys.length === 0 ? (
             <EmptyState mark="key" text="该租户还没有密钥。" />
           ) : (
-            <DataTable label="密钥列表">
-              <thead>
-                <tr>
-                  <th>名称</th>
-                  <th>前缀</th>
-                  <th className="side-opt">成员</th>
-                  <th>模型</th>
-                  <th>分组</th>
-                  <th className="side-opt">限额</th>
-                  <th>状态</th>
-                  <th className="side-opt">创建者</th>
-                  {canEdit && <th className="right">操作</th>}
-                </tr>
-              </thead>
-              <tbody>
-                {keys.map((k) => (
-                  <Fragment key={k.id}>
-                    <tr>
-                      <td className="font-medium">{k.label}</td>
-                      <td>
-                        <KeySecretCell k={k} tenant={tenant} onError={setPlaintextError} />
-                      </td>
-                      <td className="side-opt text-text-2">{ownerOf(k, tenant, members.data)}</td>
-                      <td>
-                        <span className="block max-w-[280px] truncate" title={modelsOf(k, tenant, names)}>
-                          {modelsOf(k, tenant, names)}
-                        </span>
-                      </td>
-                      <td>
-                        <KeyGroupCell k={k} />
-                        <StrayNote k={k} tenant={tenant} />
-                      </td>
-                      <td className="side-opt text-text-2">{limitsOf(k)}</td>
-                      <td>
-                        <Status k={k} tenant={tenant} members={members.data} />
-                      </td>
-                      <td className="side-opt text-text-2">
-                        <Creator k={k} members={members.data} />
-                      </td>
-                      {canEdit && (
-                        <td className="right">
-                          <KeyActions
-                            k={k}
-                            editing={editing === k.id}
-                            onEdit={() => setEditing(editing === k.id ? null : k.id)}
-                            onSaved={saved}
-                            onRevoked={(gone) => {
-                              if (editing === gone.id) setEditing(null);
-                              keyList.setData((list) => list && list.filter((x) => x.id !== gone.id));
-                              void refresh();
-                            }}
-                            onReload={() => void keyList.reload()}
-                          />
+            <>
+              <RecordTools table={table} label="密钥列表"><label className="f filter"><span>密钥状态</span><select aria-label="密钥状态" value={keyStatus} onChange={(e) => setKeyStatus(e.target.value)}><option value="">全部</option><option value="enabled">可用</option><option value="disabled">停用</option></select></label><label className="f filter"><span>密钥分组</span><select aria-label="密钥分组" value={keyGroup} onChange={(e) => setKeyGroup(e.target.value)}><option value="">全部</option>{choices.map((g) => <option key={g.name} value={g.name}>{g.display_name}</option>)}</select></label></RecordTools>
+              <DataTable label="密钥列表">
+                <thead>
+                  <tr>
+                    <th>名称</th>
+                    <th>前缀</th>
+                    <th className="side-opt">成员</th>
+                    <th>模型</th>
+                    <th>分组</th>
+                    <th className="side-opt">限额</th>
+                    <th>状态</th>
+                    <th className="side-opt">创建者</th>
+                    {canEdit && <th className="right">操作</th>}
+                  </tr>
+                </thead>
+                <tbody>
+                  {table.rows.map((k) => (
+                    <Fragment key={k.id}>
+                      <tr>
+                        <td className="font-medium">{k.label}</td>
+                        <td>
+                          <KeySecretCell k={k} tenant={tenant} onError={setPlaintextError} />
                         </td>
-                      )}
-                    </tr>
-                    {editing === k.id && (
-                      <tr className="dt-detail">
-                        <td colSpan={columns}>
-                          <ChooseGroup
-                            k={k}
-                            choices={choices}
-                            onSaved={(next) => {
-                              setEditing(null);
-                              saved(next);
-                            }}
-                            onCancel={() => setEditing(null)}
-                            onReload={() => {
-                              setEditing(null);
-                              void keyList.reload();
-                            }}
-                          />
+                        <td className="side-opt text-text-2">{ownerOf(k, tenant, members.data)}</td>
+                        <td>
+                          <span className="block max-w-[280px] truncate" title={modelsOf(k, tenant, names)}>
+                            {modelsOf(k, tenant, names)}
+                          </span>
                         </td>
+                        <td>
+                          <KeyGroupCell k={k} />
+                          <StrayNote k={k} tenant={tenant} />
+                        </td>
+                        <td className="side-opt text-text-2">{limitsOf(k)}</td>
+                        <td>
+                          <Status k={k} tenant={tenant} members={members.data} />
+                        </td>
+                        <td className="side-opt text-text-2">
+                          <Creator k={k} members={members.data} />
+                        </td>
+                        {canEdit && (
+                          <td className="right">
+                            <KeyActions
+                              k={k}
+                              editing={editing === k.id}
+                              onEdit={() => setEditing(editing === k.id ? null : k.id)}
+                              onSaved={saved}
+                              onRevoked={(gone) => {
+                                if (editing === gone.id) setEditing(null);
+                                keyList.setData((list) => list && list.filter((x) => x.id !== gone.id));
+                                void refresh();
+                              }}
+                              onReload={() => void keyList.reload()}
+                            />
+                          </td>
+                        )}
                       </tr>
-                    )}
-                  </Fragment>
-                ))}
-              </tbody>
-            </DataTable>
+                      {editing === k.id && (
+                        <tr className="dt-detail">
+                          <td colSpan={columns}>
+                            <ChooseGroup
+                              k={k}
+                              choices={choices}
+                              onSaved={(next) => {
+                                setEditing(null);
+                                saved(next);
+                              }}
+                              onCancel={() => setEditing(null)}
+                              onReload={() => {
+                                setEditing(null);
+                                void keyList.reload();
+                              }}
+                            />
+                          </td>
+                        </tr>
+                      )}
+                    </Fragment>
+                  ))}
+                </tbody>
+              </DataTable>
+              <RecordPager table={table} label="密钥列表" />
+            </>
           )}
         </Card>
       </BentoGrid>
@@ -717,11 +729,16 @@ function CreateForm({
     if (concurrency.trim() !== "") limit.concurrency = Number(concurrency);
     if (rpm.trim() !== "") limit.rpm = Number(rpm);
     if (limit.concurrency !== undefined || limit.rpm !== undefined) b.rate_limit = limit;
-    if (expires !== "") b.expires_at = new Date(expires).toISOString();
+    if (expires !== "") b.expires_at = parseBeijingInput(expires) ?? undefined;
     return b;
   }
 
   async function submit() {
+    if (expires !== "" && parseBeijingInput(expires) === null) {
+      setRefused(refusal(new Error("请填写有效的北京时间"), placedInForm));
+      focusRefusal();
+      return;
+    }
     const b = body();
     setBusy(true);
     setRefused(null);
@@ -812,7 +829,7 @@ function CreateForm({
         <LimitInput label="每分钟请求" value={rpm} disabled={busy} onChange={setRpm} error={at("/rate_limit/rpm")} />
       </div>
       <TextField
-        label="过期时间"
+        label="过期时间（北京时间）"
         type="datetime-local"
         value={expires}
         onChange={setExpires}

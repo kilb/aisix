@@ -1,9 +1,12 @@
+import { useRecordTable } from "../../lib/recordTable";
+import { RecordTools, RecordPager } from "../../components/RecordTools";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { TabProps } from "../../App";
 import { ApiError, tenants, topups, type Tenant, type Topup } from "../../lib/api";
 import { messageFor } from "../../lib/errors";
 import { errorText } from "../../lib/fmt";
-import { fmtMicroCny, fmtUtc } from "../../lib/money";
+import { fmtMicroCny } from "../../lib/money";
+import { fmtBeijing } from "../../lib/time";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
 import { Field, useRefusalFocus } from "../../ui/Field";
@@ -53,6 +56,7 @@ export function Topups({ canEdit, refreshShell }: TabProps) {
   const [rejecting, setRejecting] = useState<{ id: string; reason: string; problem: string | null } | null>(null);
   const [form, focusRefusal] = useRefusalFocus<HTMLFormElement>();
   // A newer read makes an older one's answer stale.
+  const table = useRecordTable({ items: items ?? [], searchText: (t) => [t.id, t.reference, t.tenant_id, t.tenant_name], resetKey: `${status}:${origin}:${tenantId}` });
   const latest = useRef(0);
   const sending = useRef(false);
 
@@ -69,6 +73,7 @@ export function Topups({ canEdit, refreshShell }: TabProps) {
           origin: origin || undefined,
           tenant_id: tenantId || undefined,
           before,
+          limit: 50,
         });
         if (mine !== latest.current) return;
         setItems((prev) => (before === undefined ? page.items : [...(prev ?? []), ...page.items]));
@@ -202,130 +207,128 @@ export function Topups({ canEdit, refreshShell }: TabProps) {
       )}
       {items === null && !loadError && <Loading />}
       {items !== null && (
-        <DataTable label="充值申请">
-          <thead>
-            <tr>
-              <th>租户</th>
-              <th className="num">金额</th>
-              <th>备注</th>
-              <th>凭证号</th>
-              <th>来源</th>
-              <th>提交人</th>
-              <th>提交时间（UTC）</th>
-              <th className="right">操作</th>
-            </tr>
-          </thead>
-          <tbody>
-            {items.length === 0 && (
+        <>
+          <RecordTools table={table} label="充值申请" loaded></RecordTools>
+          <DataTable label="充值申请">
+            <thead>
               <tr>
-                <td colSpan={8} className="hint">
-                  没有符合条件的充值申请
-                </td>
+                <th>租户</th>
+                <th className="num">金额</th>
+                <th>备注</th>
+                <th>凭证号</th>
+                <th>来源</th>
+                <th>提交人</th>
+                <th>提交时间（北京时间）</th>
+                <th className="right">操作</th>
               </tr>
-            )}
-            {items.map((t) => {
-              const mine = flight?.id === t.id ? flight : null;
-              const writing = rejecting?.id === t.id ? rejecting : null;
-              return [
-                <tr key={t.id}>
-                  <td className="font-medium">{t.tenant_name}</td>
-                  <td className="num money font-normal">{fmtMicroCny(t.amount_micro_cny)}</td>
-                  <td className="min-w-32 whitespace-normal">
-                    {t.origin === "operator" ? (t.credit_reason ?? t.note) : t.note}
-                    {t.status === "rejected" && t.reject_reason && (
-                      <span className="cell-note">驳回原因：{t.reject_reason}</span>
-                    )}
+            </thead>
+            <tbody>
+              {items.length === 0 && (
+                <tr>
+                  <td colSpan={8} className="hint">
+                    没有符合条件的充值申请
                   </td>
-                  <td className="text-text-2">{t.reference ? <code>{t.reference}</code> : "—"}</td>
-                  <td>
-                    <span className="tag">{ORIGIN_LABEL[t.origin]}</span>
-                  </td>
-                  <td className="text-text-2">{t.requested_by?.display_name ?? "—"}</td>
-                  <td className="tabular text-text-2">{fmtUtc(t.requested_at)}</td>
-                  <td className="right">
-                    {t.status === "pending" && t.origin === "tenant" && canEdit && (
-                      <span className="inline-flex items-start justify-end gap-2">
-                        <TwoStep
-                          label="批准"
-                          size="sm"
-                          kind="primary"
-                          warning="批准后金额立即计入该租户余额"
-                          disabled={inFlight}
-                          busy={mine?.kind === "approve"}
-                          onConfirm={() => void decide(t, "approve")}
-                        />
-                        <Button
-                          size="sm"
-                          type="button"
-                          disabled={inFlight || writing !== null}
-                          onClick={() => {
-                            setOutcome(null);
-                            setRejecting({ id: t.id, reason: "", problem: null });
+                </tr>
+              )}
+              {table.rows.map((t) => {
+                const mine = flight?.id === t.id ? flight : null;
+                const writing = rejecting?.id === t.id ? rejecting : null;
+                return [
+                  <tr key={t.id}>
+                    <td className="font-medium">{t.tenant_name}</td>
+                    <td className="num money font-normal">{fmtMicroCny(t.amount_micro_cny)}</td>
+                    <td className="min-w-32 whitespace-normal">
+                      {t.origin === "operator" ? (t.credit_reason ?? t.note) : t.note}
+                      {t.status === "rejected" && t.reject_reason && (
+                        <span className="cell-note">驳回原因：{t.reject_reason}</span>
+                      )}
+                    </td>
+                    <td className="text-text-2">{t.reference ? <code>{t.reference}</code> : "—"}</td>
+                    <td>
+                      <span className="tag">{ORIGIN_LABEL[t.origin]}</span>
+                    </td>
+                    <td className="text-text-2">{t.requested_by?.display_name ?? "—"}</td>
+                    <td className="tabular text-text-2">{fmtBeijing(t.requested_at)}</td>
+                    <td className="right">
+                      {t.status === "pending" && t.origin === "tenant" && canEdit && (
+                        <span className="inline-flex items-start justify-end gap-2">
+                          <TwoStep
+                            label="批准"
+                            size="sm"
+                            kind="primary"
+                            warning="批准后金额立即计入该租户余额"
+                            disabled={inFlight}
+                            busy={mine?.kind === "approve"}
+                            onConfirm={() => void decide(t, "approve")}
+                          />
+                          <Button
+                            size="sm"
+                            type="button"
+                            disabled={inFlight || writing !== null}
+                            onClick={() => {
+                              setOutcome(null);
+                              setRejecting({ id: t.id, reason: "", problem: null });
+                            }}
+                          >
+                            驳回
+                          </Button>
+                        </span>
+                      )}
+                      {t.status !== "pending" && (
+                        <Lamp state={t.status === "approved" ? "applied" : "rejected"}>{STATUS_LABEL[t.status]}</Lamp>
+                      )}
+                    </td>
+                  </tr>,
+                  writing && (
+                    <tr key={`${t.id}-reject`} className="dt-detail">
+                      <td colSpan={8}>
+                        <form
+                          className="mt-1 grid max-w-3xl items-start gap-x-3 rounded-cell border border-border bg-well/50 p-4 whitespace-normal sm:grid-cols-[minmax(0,1fr)_auto]"
+                          ref={form}
+                          aria-label={`驳回 ${t.tenant_name} 的充值申请`}
+                          onSubmit={(e) => {
+                            e.preventDefault();
+                            confirmReject(t);
                           }}
                         >
-                          驳回
-                        </Button>
-                      </span>
-                    )}
-                    {t.status !== "pending" && (
-                      <Lamp state={t.status === "approved" ? "applied" : "rejected"}>{STATUS_LABEL[t.status]}</Lamp>
-                    )}
-                  </td>
-                </tr>,
-                writing && (
-                  <tr key={`${t.id}-reject`} className="dt-detail">
-                    <td colSpan={8}>
-                      <form
-                        className="mt-1 grid max-w-3xl items-start gap-x-3 rounded-cell border border-border bg-well/50 p-4 whitespace-normal sm:grid-cols-[minmax(0,1fr)_auto]"
-                        ref={form}
-                        aria-label={`驳回 ${t.tenant_name} 的充值申请`}
-                        onSubmit={(e) => {
-                          e.preventDefault();
-                          confirmReject(t);
-                        }}
-                      >
-                        <Field label="驳回原因" hint="租户会看到这段文字，1–500 个字符。" error={writing.problem}>
-                          {(aria) => (
-                            <input
-                              {...aria}
-                              maxLength={500}
-                              value={writing.reason}
-                              disabled={mine?.kind === "reject"}
-                              onChange={(e) => setRejecting({ ...writing, reason: e.target.value, problem: null })}
-                            />
-                          )}
-                        </Field>
-                        <div className="flex gap-2 sm:mt-6">
-                          <Button
-                            kind="danger"
-                            type="submit"
-                            size="sm"
-                            disabled={inFlight && mine?.kind !== "reject"}
-                            busy={mine?.kind === "reject"}
-                            busyLabel="确认驳回"
-                          >
-                            确认驳回
-                          </Button>
-                          <Button size="sm" type="button" disabled={inFlight} onClick={() => setRejecting(null)}>
-                            取消
-                          </Button>
-                        </div>
-                      </form>
-                    </td>
-                  </tr>
-                ),
-              ];
-            })}
-          </tbody>
-        </DataTable>
+                          <Field label="驳回原因" hint="租户会看到这段文字，1–500 个字符。" error={writing.problem}>
+                            {(aria) => (
+                              <input
+                                {...aria}
+                                maxLength={500}
+                                value={writing.reason}
+                                disabled={mine?.kind === "reject"}
+                                onChange={(e) => setRejecting({ ...writing, reason: e.target.value, problem: null })}
+                              />
+                            )}
+                          </Field>
+                          <div className="flex gap-2 sm:mt-6">
+                            <Button
+                              kind="danger"
+                              type="submit"
+                              size="sm"
+                              disabled={inFlight && mine?.kind !== "reject"}
+                              busy={mine?.kind === "reject"}
+                              busyLabel="确认驳回"
+                            >
+                              确认驳回
+                            </Button>
+                            <Button size="sm" type="button" disabled={inFlight} onClick={() => setRejecting(null)}>
+                              取消
+                            </Button>
+                          </div>
+                        </form>
+                      </td>
+                    </tr>
+                  ),
+                ];
+              })}
+            </tbody>
+          </DataTable>
+          <RecordPager table={table} label="充值申请" resetKey={`${status}:${origin}:${tenantId}`} hasMore={next !== null} onMore={() => load(next ?? undefined)} busy={inFlight} />
+        </>
       )}
-      {items !== null && next !== null && (
-        <div className="bl-card-foot">
-          <Button type="button" size="sm" disabled={inFlight} onClick={() => void load(next)}>
-            加载更多
-          </Button>
-        </div>
-      )}
+
     </Card>
     </BentoGrid>
     </>

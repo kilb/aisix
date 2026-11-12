@@ -127,6 +127,10 @@ test("真实请求、响应缓存与中断用量完整聚合，统计分母和�
   expect(metrics.totals.first_token_latency_ms.avg).toBeCloseTo((latencies[0] + latencies[1]) / 2, 8);
   expect(metrics.totals.first_token_latency_ms.p50).toBeCloseTo((latencies[0] + latencies[1]) / 2, 8);
   expect(metrics.totals.first_token_latency_ms.p95).toBeCloseTo(latencies[0] + (latencies[1] - latencies[0]) * 0.95, 8);
+  for (const field of ["first_token_latency_ms", "response_latency_ms", "attempt_duration_ms"]) {
+    expect(metrics.totals[field], `${field} exposes a measured or explicitly unknown P99`).toHaveProperty("p99");
+  }
+  expect(metrics.totals.first_token_latency_ms.p99).toBeCloseTo(latencies[0] + (latencies[1] - latencies[0]) * 0.99, 8);
 
   const raw = await stack.admin.get(`/admin/usage/events?${new URLSearchParams({ team_id: world.tenantId, limit: "200" })}`);
   expect(Array.isArray(raw.items)).toBe(true);
@@ -175,7 +179,7 @@ test("真实请求、响应缓存与中断用量完整聚合，统计分母和�
   expect((await world.api.get(`/api/usage/metrics?${query}&member_id=${member.id}`)).totals).toEqual(own.totals);
   for (const api of [unusedApi, outsider.api]) {
     const empty = await api.get(`/api/usage/metrics?${query}`);
-    expect(empty.totals).toMatchObject({ requests: 0, known_outcome_requests: 0, success_rate: null, charged_micro_cny: "0", first_token_latency_ms: { sample_count: 0, missing_count: 0, avg: null } });
+    expect(empty.totals).toMatchObject({ requests: 0, known_outcome_requests: 0, success_rate: null, charged_micro_cny: "0", first_token_latency_ms: { sample_count: 0, missing_count: 0, avg: null, p99: null } });
     expect(empty.models).toEqual([]);
   }
   const narrowed = await memberApi.get(`/api/usage/metrics?${query}&api_key_id=${ownerKey.id}`);
@@ -193,6 +197,7 @@ test("真实请求、响应缓存与中断用量完整聚合，统计分母和�
   await definition(health, "成功", "3");
   await definition(health, "失败", "1");
   await definition(health, "未知", "0");
+  await expect(health.getByRole("img", { name: "最终请求构成：成功 3，失败 1，未知 0，共 4", exact: true })).toBeVisible();
   await page.getByRole("button", { name: "请求", exact: true }).click();
   const panel = page.getByRole("region", { name: "完整 API 指标", exact: true });
   await expect(panel).toBeVisible();
@@ -221,7 +226,12 @@ test("真实请求、响应缓存与中断用量完整聚合，统计分母和�
   for (let index = 0; index < 120 && !await chartButton.evaluate((element) => element === document.activeElement); index += 1) await page.keyboard.press("Tab");
   expect(await chartButton.evaluate((element) => element === document.activeElement)).toBe(true);
   const points = displayedMetrics.series;
-  const pointText = (index: number): string => `${points[index].period_start.slice(0, 10)} · ${new Intl.NumberFormat("en-US").format(points[index].requests)}`;
+  const pointDay = (iso: string): string => {
+    const parts = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date(iso));
+    const part = (name: string) => parts.find(value => value.type === name)?.value;
+    return `${part("year")}-${part("month")}-${part("day")}`;
+  };
+  const pointText = (index: number): string => `${pointDay(points[index].period_start)} · ${new Intl.NumberFormat("en-US").format(points[index].requests)}`;
   await expect(card.getByText(pointText(points.length - 1), { exact: true })).toBeVisible();
   await page.keyboard.press("Home");
   await expect(card.getByText(pointText(0), { exact: true })).toBeVisible();
@@ -237,6 +247,7 @@ test("真实请求、响应缓存与中断用量完整聚合，统计分母和�
   await card.getByRole("combobox", { name: "耗时口径", exact: true }).selectOption({ label: "首 token 延迟" });
   await definition(card, "P50", duration((latencies[0] + latencies[1]) / 2));
   await definition(card, "P95", duration(latencies[0] + (latencies[1] - latencies[0]) * 0.95));
+  await definition(card, "P99", duration(latencies[0] + (latencies[1] - latencies[0]) * 0.99));
   await definition(card, "实测样本", "2");
   await definition(card, "无实测值", "2");
   await capture("latency");
@@ -244,6 +255,19 @@ test("真实请求、响应缓存与中断用量完整聚合，统计分母和�
     await card.getByRole("combobox", { name: "耗时口径", exact: true }).selectOption({ label });
     await expect(card.getByText(`${label} · 平均`, { exact: true })).toBeVisible();
   }
+  await panel.getByRole("button", { name: "token", exact: true }).click();
+  card = currentCard("token");
+  await card.getByRole("combobox", { name: "token 口径", exact: true }).selectOption({ label: "已记录输入 token" });
+  await expect(card.getByText("已记录输入 token", { exact: true }).locator("..").getByText(new Intl.NumberFormat("en-US").format(input), { exact: true })).toBeVisible();
+  const recordedUsage = displayedMetrics.totals.tokens.known_usage_attempts;
+  const missingUsage = displayedMetrics.totals.tokens.unknown_usage_attempts;
+  expect(recordedUsage + missingUsage).toBe(4);
+  await definition(card, "用量记录覆盖率", percent(recordedUsage / (recordedUsage + missingUsage)));
+  await definition(card, "有可用用量记录的尝试", new Intl.NumberFormat("en-US").format(recordedUsage));
+  await definition(card, "无可用用量记录的尝试", new Intl.NumberFormat("en-US").format(missingUsage));
+  await card.getByRole("combobox", { name: "token 口径", exact: true }).selectOption({ label: "已记录输出 token" });
+  await expect(card.getByText("已记录输出 token", { exact: true }).locator("..").getByText(new Intl.NumberFormat("en-US").format(expectedTokens.completion_tokens), { exact: true })).toBeVisible();
+  await capture("tokens");
   await panel.getByRole("button", { name: "缓存", exact: true }).click();
   card = currentCard("缓存");
   await definition(card, "已记录缓存读取", new Intl.NumberFormat("en-US").format(hitTokens));

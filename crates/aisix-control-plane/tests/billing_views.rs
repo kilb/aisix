@@ -9,6 +9,7 @@ mod support;
 use std::collections::BTreeSet;
 
 use aisix_control_plane::auth::{MemberRole, OperatorRole};
+use chrono::{DateTime, TimeDelta, Utc};
 use serde_json::{json, Value};
 use support::members::MemberSession;
 use support::world::{deliver, price, seed_key, seed_tenant, tokens_680, usage, world, World};
@@ -563,6 +564,75 @@ async fn rows_filed_under_another_tenant_never_appear() {
     let b = w.cp.member_login_as(&b_member).await;
     let r = get(&w.cp, "/api/usage/calls", &b).await;
     assert_eq!(event_ids(&r), ids(&["stray"]));
+}
+
+#[tokio::test]
+async fn beijing_usage_summaries_bucket_counts_money_and_quantities_across_the_year() {
+    let Some(w) = world().await else { return };
+    let m = model(&w, "beijing-summary", Some(w.tenant)).await;
+    let boundary = DateTime::parse_from_rfc3339("2025-12-31T16:00:00Z")
+        .expect("北京元旦午夜")
+        .with_timezone(&Utc);
+    support::world::insert_baseline_backdated(
+        w.cp.db(),
+        m,
+        serde_json::to_value(support::world::card()).expect("价格卡"),
+        boundary - TimeDelta::days(2),
+    )
+    .await;
+    let from = boundary - TimeDelta::seconds(1);
+    let to = boundary + TimeDelta::days(1);
+    let mut events = Vec::new();
+    for (id, at) in [
+        ("beijing-before-from", from - TimeDelta::microseconds(1)),
+        ("beijing-from", from),
+        ("beijing-midnight", boundary),
+        ("beijing-after", boundary + TimeDelta::seconds(1)),
+        ("beijing-to", to),
+    ] {
+        let mut e = row(&w, id, m, "beijing-summary", tokens_680());
+        e["occurred_at"] = json!(at);
+        events.push(e);
+    }
+    send_all(&w, events).await;
+    let owner = owner(&w).await;
+    for (group, starts) in [
+        ("day", ["2025-12-30T16:00:00Z", "2025-12-31T16:00:00Z"]),
+        ("month", ["2025-11-30T16:00:00Z", "2025-12-31T16:00:00Z"]),
+    ] {
+        let query = format!(
+            "group={group}&from={}&to={}",
+            from.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+            to.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+        );
+        for (path, cookie) in [
+            ("/api/usage/summary".to_string(), owner.cookie()),
+            (
+                format!("/admin/tenants/{}/usage/summary", w.tenant),
+                w.admin.cookie(),
+            ),
+        ] {
+            let r =
+                w.cp.send("GET", &format!("{path}?{query}"), Some(cookie), None)
+                    .await;
+            let rows = items(&r);
+            assert_eq!(rows.len(), 2, "北京跨年必须有两个{group}桶：{r:?}");
+            for (index, requests) in [1, 2].into_iter().enumerate() {
+                assert_eq!(rows[index]["period_start"], starts[index], "{path} {group}");
+                assert_eq!(rows[index]["requests"], requests, "{path} {group}");
+                assert_eq!(
+                    rows[index]["charged_micro_cny"],
+                    requests * 680,
+                    "{path} {group}"
+                );
+                assert_eq!(
+                    rows[index]["quantities"],
+                    json!({"input": requests * 200, "output": requests * 200, "cache_read": requests * 800}),
+                    "数量SQL必须与费用SQL使用相同北京桶：{path} {group}"
+                );
+            }
+        }
+    }
 }
 
 #[tokio::test]

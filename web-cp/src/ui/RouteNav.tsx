@@ -3,6 +3,7 @@ import { useEffect, useRef, type ComponentType, type KeyboardEvent } from "react
 export interface RouteItem<Id extends string> {
   id: Id;
   label: string;
+  group?: string;
   /** A lucide icon drawn before the label. */
   icon?: ComponentType<{ className?: string; "aria-hidden"?: boolean }>;
 }
@@ -61,12 +62,13 @@ export function RouteNav<Id extends string>({
         onKeyDown={onKeyDown}
         className="shell-route-list"
       >
-        {items.map((t) => {
+        {items.map((t, index) => {
           const note = attention[t.id];
           const selected = current === t.id;
           const Icon = t.icon;
           return (
             <li key={t.id} role="presentation" className="shell-route-item">
+              {t.group && items[index - 1]?.group !== t.group && <div className="shell-route-group">{t.group}</div>}
               <button
                 type="button"
                 role="tab"
@@ -79,7 +81,7 @@ export function RouteNav<Id extends string>({
                 aria-current={selected ? "page" : undefined}
                 aria-controls={`tab-${t.id}`}
                 aria-describedby={note ? `attention-${t.id}` : undefined}
-                tabIndex={selected ? 0 : -1}
+                tabIndex={selected || (index === 0 && !items.some((item) => item.id === current)) ? 0 : -1}
                 onClick={() => onSelect(t.id)}
               >
                 {Icon && <Icon className="shell-route-icon" aria-hidden />}

@@ -2,6 +2,49 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { decodeApiMetrics, maximumMetricIndex, metricsQuery, metricsRangeError, rankMetricModels, requestRateSummary } from "./apiMetrics.ts";
 
+const enhancements = await import("./apiMetrics.ts");
+
+// 去掉 P99 解码或把缺字段补 0，都会丢失尾延迟/未知语义。
+test("P99 preserves measured zero and remains unknown when absent or invalid", () => {
+  const data = decodeApiMetrics(payload({ first_token_latency_ms: { sample_count: 1, missing_count: 0, avg: 0, p50: 0, p95: 0, p99: 0 }, response_latency_ms: { p99: 199 } }));
+  assert.equal(data.totals.first_token_latency_ms.p99, 0);
+  assert.equal(data.totals.response_latency_ms.p99, 199);
+  assert.equal(data.totals.attempt_duration_ms.p99, null);
+  assert.equal(decodeApiMetrics(payload({ response_latency_ms: { p99: -1 } })).totals.response_latency_ms.p99, null);
+});
+
+// 改用请求数作分母、把无样本补 0%，或吞掉未知计数都会变红。
+test("sample coverage uses known plus missing attempts and keeps zero denominators unknown", () => {
+  assert.equal(typeof enhancements.sampleCoverage, "function");
+  assert.equal(enhancements.sampleCoverage(3, 1), 0.75);
+  assert.equal(enhancements.sampleCoverage(0, 1), 0);
+  assert.equal(enhancements.sampleCoverage(0, 0), null);
+  assert.equal(enhancements.sampleCoverage(3, null), null);
+  assert.equal(enhancements.sampleCoverage(undefined, 0), null);
+  assert.equal(enhancements.sampleCoverage(9007199254740992, 0), null);
+});
+
+// 无可用用量的非空桶不能画成已测得 0；真正空桶仍保留 0。
+test("token trends distinguish unavailable usage, partial records and measured zero", () => {
+  assert.equal(typeof enhancements.tokenTrendValue, "function");
+  const sample = (tokens: Record<string, unknown>) => decodeApiMetrics(payload({ tokens })).totals.tokens;
+  assert.equal(enhancements.tokenTrendValue(sample({ input_tokens: 0, known_usage_attempts: 0, unknown_usage_attempts: 1 }), "input_tokens"), null);
+  assert.equal(enhancements.tokenTrendValue(sample({ input_tokens: 0, known_usage_attempts: 0, unknown_usage_attempts: 0 }), "input_tokens"), 0);
+  assert.equal(enhancements.tokenTrendValue(sample({ input_tokens: 200, completion_tokens: 30, cached_prompt_tokens: 80, known_usage_attempts: 2, unknown_usage_attempts: 1 }), "input_tokens"), 200);
+  assert.equal(enhancements.tokenTrendValue(sample({ input_tokens: 200, completion_tokens: 30, known_usage_attempts: 2, unknown_usage_attempts: 0 }), "completion_tokens"), 30);
+  assert.equal(enhancements.tokenTrendValue(sample({ input_tokens: 0 }), "input_tokens"), null);
+});
+
+// 构成使用全部最终请求，不能拿成功率的已知结果分母，也不能由差值虚构未知。
+test("outcome composition includes unknown requests and rejects incomplete counts", () => {
+  assert.equal(typeof enhancements.requestOutcomeShares, "function");
+  const sample = (totals: Record<string, unknown>) => decodeApiMetrics(payload(totals)).totals;
+  assert.deepEqual(enhancements.requestOutcomeShares(sample({ requests: 4, succeeded_requests: 2, failed_requests: 1, unknown_outcome_requests: 1 })), [0.5, 0.25, 0.25]);
+  assert.deepEqual(enhancements.requestOutcomeShares(sample({ requests: 0, succeeded_requests: 0, failed_requests: 0, unknown_outcome_requests: 0 })), [0, 0, 0]);
+  assert.equal(enhancements.requestOutcomeShares(sample({ requests: 4, succeeded_requests: 2, failed_requests: 1 })), null);
+  assert.equal(enhancements.requestOutcomeShares(sample({ requests: 4, succeeded_requests: 2, failed_requests: 1, unknown_outcome_requests: 0 })), null);
+});
+
 const empty = { sample_count: 0, missing_count: 3, avg: null, p50: null, p95: null };
 function payload(totals: Record<string, unknown> = {}): unknown {
   return { from: "2026-11-01T00:00:00Z", to: "2026-11-02T00:00:00Z", bucket: "hour", totals, series: [], models: [] };

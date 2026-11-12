@@ -3,14 +3,10 @@ import { test } from "node:test";
 import {
   fmtCnyPerMillion,
   fmtMicroCny,
-  fmtUtc,
   isCnyAmount,
   microCnyToInput,
   perMillionOfPerThousand,
   perThousandOfPerMillion,
-  periodLabel,
-  todayUtc,
-  utcRange,
 } from "./money.ts";
 
 // `npm run test:unit`.
@@ -58,28 +54,6 @@ test("每百万 token 的单价按原样给出的小数位显示，不足两位�
   assert.equal(fmtCnyPerMillion("0.00000000000001"), "¥0.00000000000001");
   assert.equal(fmtCnyPerMillion("100000000"), "¥100,000,000.00");
   assert.equal(fmtCnyPerMillion("1234.5"), "¥1,234.50");
-});
-
-test("UTC 日期区间含首尾两天", () => {
-  assert.deepEqual(utcRange("2026-11-01", "2026-11-07"), { from: "2026-11-01T00:00:00Z", to: "2026-11-08T00:00:00Z" });
-  assert.equal(todayUtc(new Date("2026-11-07T23:30:00+08:00")), "2026-11-07");
-  assert.equal(todayUtc(new Date("2026-11-08T07:30:00+08:00")), "2026-11-07");
-});
-
-test("区间的结束日跨月、跨年、闰日都按日历进位", () => {
-  assert.equal(utcRange("2026-11-30", "2026-11-30").to, "2026-12-01T00:00:00Z");
-  assert.equal(utcRange("2026-12-31", "2026-12-31").to, "2027-01-01T00:00:00Z");
-  assert.equal(utcRange("2028-02-28", "2028-02-28").to, "2028-02-29T00:00:00Z");
-});
-
-test("时间与周期按 UTC 显示，不随浏览器时区", () => {
-  assert.equal(fmtUtc("2026-11-07T13:05:09Z"), "2026-11-07 13:05:09 UTC");
-  assert.equal(fmtUtc("2026-11-07T13:05:09.987654+00:00"), "2026-11-07 13:05:09 UTC");
-  assert.equal(fmtUtc("2026-11-08T01:05:09+08:00"), "2026-11-07 17:05:09 UTC");
-  assert.equal(fmtUtc("not-a-time"), "not-a-time");
-  assert.equal(periodLabel("2026-11-07T00:00:00Z", "day"), "2026-11-07");
-  assert.equal(periodLabel("2026-11-01T00:00:00Z", "month"), "2026-11");
-  assert.equal(periodLabel("2026-11-08T01:00:00+08:00", "day"), "2026-11-07");
 });
 
 test("每千次与每百万单位的价格互相换算是精确的十进制运算", () => {

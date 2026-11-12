@@ -29,6 +29,11 @@ test("门户与运维台的金额工具逐字节一致", () => {
   assert.ok(mine.equals(cp));
 });
 
+test("门户与运维台的记录筛选分页逻辑逐字节一致", () => {
+  const [mine, cp] = both("lib/recordTable.ts");
+  assert.ok(mine.equals(cp));
+});
+
 // The shared components and their contract: one set of props, states and
 // class names in both apps (web-cp/src/ui/CONTRACT.md).
 const SHARED_UI = [
@@ -40,6 +45,8 @@ const SHARED_UI = [
   "Lamp.tsx",
   "EmptyState.tsx",
   "DataTable.tsx",
+  "RecordTable.tsx",
+  "record-table.css",
   "Icon.tsx",
   "CopyButton.tsx",
   "KeySecret.tsx",

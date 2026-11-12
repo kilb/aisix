@@ -4,8 +4,11 @@ import { pricingStatus, type PricingStatus as Status } from "../../lib/api";
 import { errorText, fmtInt } from "../../lib/fmt";
 import { Button } from "../../ui/Button";
 import { DataTable } from "../../ui/DataTable";
+import { EmptyState } from "../../ui/EmptyState";
+import { RecordTablePager, RecordTableToolbar } from "../../ui/RecordTable";
 import { Lamp } from "../../ui/Lamp";
-import { fmtUtc } from "../../lib/money";
+import { fmtBeijing } from "../../lib/time";
+import { useRecordTable } from "../../lib/recordTable";
 import { handChargesFilter, statusView } from "../../lib/pricingStatus";
 import { BentoGrid, Card, CardHeader, CardMessage, Metric, MetricSkeleton, PageHeader, span } from "../../components/page";
 import { RankBars } from "../../components/charts";
@@ -22,6 +25,8 @@ export function PricingStatus({ onGoto }: TabProps) {
   const [status, setStatus] = useState<Status | null>(null);
   const [failure, setFailure] = useState<string | null>(null);
   const [reading, setReading] = useState(false);
+  const [reasonFilter, setReasonFilter] = useState("");
+  const [tableFilter, setTableFilter] = useState("");
 
   async function read() {
     setReading(true);
@@ -41,6 +46,19 @@ export function PricingStatus({ onGoto }: TabProps) {
 
   const view = status ? statusView(status) : null;
   const reasonValues = normalizeExactValues(view?.unpriced.map((r) => r.count) ?? []);
+  const unpricedTable = useRecordTable({
+    items: [
+      ...(view?.details ?? []).map((row) => ({ kind: "detail" as const, ...row })),
+      ...(view?.unlisted ?? []).map((row) => ({ kind: "unlisted" as const, ...row })),
+    ].filter((row) => !reasonFilter || row.code === reasonFilter),
+    searchText: (row) => [row.code, row.label, ...(row.kind === "detail" ? [row.model, row.scope, row.remedy] : [])],
+    resetKey: reasonFilter,
+  });
+  const invalidTable = useRecordTable({
+    items: (view?.invalid ?? []).filter((row) => !tableFilter || row.table === tableFilter),
+    searchText: (row) => [row.table, row.revision, row.reason],
+    resetKey: tableFilter,
+  });
   return (
     <>
       <PageHeader
@@ -79,57 +97,40 @@ export function PricingStatus({ onGoto }: TabProps) {
         <>
           <Card className="mb-3">
             <CardHeader number={3} className={view.unpricedTotal === 0 ? undefined : "mb-0"} title="最近 24 小时未计价" />
+            {view.unpricedTotal > 0 && <RecordTableToolbar search={{ value: unpricedTable.query, onChange: unpricedTable.setQuery, label: "搜索未计价分组", placeholder: "按模型、原因或分组搜索" }}>
+              <label className="field mb-0"><span className="field-label">未计价原因</span><select value={reasonFilter} onChange={(e) => setReasonFilter(e.target.value)}><option value="">全部原因</option>{view.unpriced.map((row) => <option key={row.code} value={row.code}>{row.label}</option>)}</select></label>
+              <p className="hint mb-0">未逐一列出的调用按原因汇总；合计包含全部未计价调用。</p>
+            </RecordTableToolbar>}
             {view.unpricedTotal === 0 ? (
               <p className="status-line">
                 <Lamp state="applied">最近 24 小时没有未计价的调用。</Lamp>
               </p>
             ) : (
-              <DataTable label="未计价的调用" scroll>
+              <><DataTable label="未计价的调用" scroll>
                 <thead>
                   <tr>
                     <th>原因</th>
                     <th className="num">次数</th>
                     <th>模型</th>
                     <th>档位 / 分组</th>
-                    <th>最近一次（UTC）</th>
+                    <th>最近一次（北京时间）</th>
                     <th>处理</th>
                     <th className="right">操作</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {view.details.map((d) => (
+                  {unpricedTable.rows.length === 0 && <tr><td colSpan={7}><EmptyState text="没有符合筛选条件的未计价分组" /></td></tr>}
+                  {unpricedTable.rows.map((d) => (
                     <tr key={d.key}>
                       <td className="font-medium">{d.label}</td>
                       <td className="num">{fmtInt(d.count)}</td>
-                      <td>{d.model}</td>
-                      <td>{d.scope}</td>
-                      <td className="tabular">{fmtUtc(d.latestAt)}</td>
-                      <td className="max-w-[28rem] whitespace-normal text-caption text-ink-soft">{d.remedy}</td>
+                      {d.kind === "detail" ? <><td>{d.model}</td><td>{d.scope}</td><td className="tabular">{fmtBeijing(d.latestAt)}</td><td className="max-w-[28rem] whitespace-normal text-caption text-ink-soft">{d.remedy}</td></> : <td colSpan={4}>其余 {fmtInt(d.count)} 次，未逐一列出</td>}
                       <td className="right">
                         <Button
                           type="button"
                           size="sm"
                           onClick={() => {
                             handChargesFilter(d.filter);
-                            onGoto("billing", "charges");
-                          }}
-                        >
-                          查看调用
-                        </Button>
-                      </td>
-                    </tr>
-                  ))}
-                  {view.unlisted.map((u) => (
-                    <tr key={u.key}>
-                      <td className="font-medium">{u.label}</td>
-                      <td className="num">{fmtInt(u.count)}</td>
-                      <td colSpan={4}>其余 {fmtInt(u.count)} 次，未逐一列出</td>
-                      <td className="right">
-                        <Button
-                          type="button"
-                          size="sm"
-                          onClick={() => {
-                            handChargesFilter(u.filter);
                             onGoto("billing", "charges");
                           }}
                         >
@@ -146,7 +147,7 @@ export function PricingStatus({ onGoto }: TabProps) {
                     <td colSpan={5} />
                   </tr>
                 </tbody>
-              </DataTable>
+              </DataTable><RecordTablePager page={unpricedTable.page} pageSize={unpricedTable.pageSize} onPageChange={unpricedTable.setPage} onPageSizeChange={unpricedTable.setPageSize} total={unpricedTable.filteredCount} label="未计价分组分页" /></>
             )}
             {view.detailsTruncated && (
               <p className="hint mt-4">种类太多，没有逐一列出全部；每种原因没有列出的次数合在它的「其余 … 次」一行里，合计仍是全部未计价的调用。</p>
@@ -160,12 +161,15 @@ export function PricingStatus({ onGoto }: TabProps) {
 
           <Card className="mb-0">
             <CardHeader number={4} className={view.invalid.length === 0 ? undefined : "mb-0"} title="不可用的价格版本" />
+            {view.invalid.length > 0 && <RecordTableToolbar search={{ value: invalidTable.query, onChange: invalidTable.setQuery, label: "搜索价格版本", placeholder: "按版本、表或原因搜索" }}>
+              <label className="field mb-0"><span className="field-label">价格表</span><select value={tableFilter} onChange={(e) => setTableFilter(e.target.value)}><option value="">全部价格表</option>{[...new Set(view.invalid.map((row) => row.table))].map((table) => <option key={table} value={table}>{table}</option>)}</select></label>
+            </RecordTableToolbar>}
             {view.invalid.length === 0 ? (
               <p className="status-line">
                 <Lamp state="applied">没有不可用的价格版本。</Lamp>
               </p>
             ) : (
-              <DataTable label="不可用的价格版本">
+              <><DataTable label="不可用的价格版本">
                 <thead>
                   <tr>
                     <th>表</th>
@@ -174,7 +178,8 @@ export function PricingStatus({ onGoto }: TabProps) {
                   </tr>
                 </thead>
                 <tbody>
-                  {view.invalid.map((r) => (
+                  {invalidTable.rows.length === 0 && <tr><td colSpan={3}><EmptyState text="没有符合筛选条件的价格版本" /></td></tr>}
+                  {invalidTable.rows.map((r) => (
                     <tr key={r.key}>
                       <td>{r.table}</td>
                       <td className="tabular">{r.revision}</td>
@@ -182,7 +187,7 @@ export function PricingStatus({ onGoto }: TabProps) {
                     </tr>
                   ))}
                 </tbody>
-              </DataTable>
+              </DataTable><RecordTablePager page={invalidTable.page} pageSize={invalidTable.pageSize} onPageChange={invalidTable.setPage} onPageSizeChange={invalidTable.setPageSize} total={invalidTable.filteredCount} label="不可用价格版本分页" /></>
             )}
           </Card>
         </>

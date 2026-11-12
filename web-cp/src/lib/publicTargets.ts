@@ -1,4 +1,6 @@
-import type { ChannelModelSaved, PublicModel, ServedBy } from "./api.ts";
+import type { ChannelModelSaved, CooldownSettings, PublicModel, ServedBy } from "./api.ts";
+import { sameRouting } from "./publicRouting.ts";
+import { cooldownProblem } from "./cooldown.ts";
 
 /**
  * A public model's routing targets, as 模型与路由 edits them in place.
@@ -18,6 +20,8 @@ export interface TargetDraft {
   upstream: string;
   priority: string;
   weight: string;
+  cooldown?: CooldownSettings | null;
+  cooldownProblem?: string | null;
 }
 
 /** What one target write sends; an absent field keeps what the mapping stores. */
@@ -26,10 +30,11 @@ export interface TargetBody {
   priority?: number;
   weight?: number;
   enabled?: boolean;
+  cooldown?: CooldownSettings | null;
 }
 
 /** The fields of the draft each write names, in the order a row shows them. */
-export type TargetField = "upstream" | "priority" | "weight";
+export type TargetField = "upstream" | "priority" | "weight" | "cooldown";
 
 /** The smallest and largest value a priority or weight can be sent as (a 32-bit integer). */
 const MIN_I32 = -2_147_483_648;
@@ -44,8 +49,8 @@ export function targetsOf(view: PublicModel): ServedBy[] {
 }
 
 /** The draft a stored mapping starts as. */
-export function draftOf(s: Pick<ServedBy, "upstream_model" | "priority" | "weight">): TargetDraft {
-  return { upstream: s.upstream_model ?? "", priority: String(s.priority), weight: String(s.weight) };
+export function draftOf(s: Pick<ServedBy, "upstream_model" | "priority" | "weight" | "cooldown">): TargetDraft {
+  return { upstream: s.upstream_model ?? "", priority: String(s.priority), weight: String(s.weight), ...(s.cooldown == null ? {} : { cooldown: s.cooldown }) };
 }
 
 /**
@@ -57,7 +62,7 @@ export function draftOf(s: Pick<ServedBy, "upstream_model" | "priority" | "weigh
  * the value it had when the row was first edited.
  */
 export function shownDraft(
-  stored: Pick<ServedBy, "upstream_model" | "priority" | "weight">,
+  stored: Pick<ServedBy, "upstream_model" | "priority" | "weight" | "cooldown">,
   typed: Partial<TargetDraft> | undefined,
 ): TargetDraft {
   return { ...draftOf(stored), ...typed };
@@ -78,6 +83,7 @@ export function changedBody(draft: TargetDraft, stored: ServedBy): TargetBody | 
   if (upstream !== (stored.upstream_model ?? null)) body.upstream_model = upstream;
   if (draft.priority.trim() !== String(stored.priority)) body.priority = Number(draft.priority);
   if (draft.weight.trim() !== String(stored.weight)) body.weight = Number(draft.weight);
+  if (!sameRouting({ cooldown: draft.cooldown ?? null }, { cooldown: stored.cooldown ?? null })) body.cooldown = draft.cooldown ?? null;
   return Object.keys(body).length === 0 ? null : body;
 }
 
@@ -88,6 +94,7 @@ export function addedBody(draft: TargetDraft): TargetBody {
     priority: Number(draft.priority),
     weight: Number(draft.weight),
     enabled: true,
+    ...(draft.cooldown === undefined ? {} : { cooldown: draft.cooldown }),
   };
 }
 
@@ -96,8 +103,13 @@ export function addedBody(draft: TargetDraft): TargetBody {
  * 32-bit integer. Every other rule (a weight's range, the upstream name's
  * shape) is the control plane's, and its refusal is shown at the field.
  */
-export function unsendable(draft: TargetDraft): Partial<Record<TargetField, string>> {
+export function unsendable(draft: TargetDraft, stored?: ServedBy): Partial<Record<TargetField, string>> {
   const problems: Partial<Record<TargetField, string>> = {};
+  if (draft.cooldownProblem) problems.cooldown = draft.cooldownProblem;
+  if (!stored || !sameRouting({ cooldown: draft.cooldown ?? null }, { cooldown: stored.cooldown ?? null })) {
+    const problem = cooldownProblem(draft.cooldown);
+    if (problem) problems.cooldown = problem;
+  }
   for (const [field, label] of [
     ["priority", "优先级"],
     ["weight", "权重"],
@@ -132,6 +144,7 @@ export function withSaved(
     priority: saved.priority,
     weight: saved.weight,
     enabled: saved.enabled,
+    ...(saved.cooldown === undefined ? {} : { cooldown: saved.cooldown }),
   };
   const served_by = [...view.served_by.filter((s) => s.provider_key_id !== accountId), entry].sort(
     (a, b) => b.priority - a.priority || b.weight - a.weight,

@@ -237,7 +237,7 @@ export function OrgQuota({ account, canEdit, onQuotasChanged }: RegionProps) {
           <thead>
             <tr>
               <th>类型</th>
-              <th>周期（UTC）</th>
+              <th>周期（北京时间）</th>
               <th className="num">限额</th>
               <th className="num">已用</th>
               <th className="num">剩余</th>

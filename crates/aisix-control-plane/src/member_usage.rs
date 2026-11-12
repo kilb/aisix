@@ -111,7 +111,14 @@ async fn summarize(
         .collect())
 }
 
-/// `GET /api/members/usage`；默认本月 UTC 月初到现在，范围最多 92 天，左闭右开。
+/// 统计月按北京时间月初开始，与预算实际采用的 UTC 结算周期无关。
+fn month_start_beijing(now: DateTime<Utc>) -> DateTime<Utc> {
+    let beijing = now + chrono::TimeDelta::hours(8);
+    let month_start = beijing.date_naive() - chrono::TimeDelta::days(i64::from(beijing.day0()));
+    month_start.and_time(chrono::NaiveTime::MIN).and_utc() - chrono::TimeDelta::hours(8)
+}
+
+/// `GET /api/members/usage`；默认北京时间月初到现在，范围最多 92 天，左闭右开。
 pub async fn get(
     auth: MemberAuth,
     State(state): State<AppState>,
@@ -121,8 +128,7 @@ pub async fn get(
     auth.require(&[MemberRole::Owner, MemberRole::Admin])?;
     let Query(q) = query.map_err(query_rejected)?;
     let now = Utc::now();
-    let month_start = now.date_naive() - chrono::TimeDelta::days(i64::from(now.day0()));
-    let default_from = month_start.and_time(chrono::NaiveTime::MIN).and_utc();
+    let default_from = month_start_beijing(now);
     let (from, to) = checked_range(
         q.from.unwrap_or(default_from),
         q.to.unwrap_or(now),
@@ -132,4 +138,26 @@ pub async fn get(
     Ok(Json(
         serde_json::json!({"from": from, "to": to, "items": items}),
     ))
+}
+
+#[cfg(test)]
+mod timezone_tests {
+    use super::*;
+
+    #[test]
+    fn beijing_month_start_changes_at_sixteen_utc_across_year_and_leap_day() {
+        for (now, expected) in [
+            ("2025-12-31T15:59:59Z", "2025-11-30T16:00:00Z"),
+            ("2025-12-31T16:00:00Z", "2025-12-31T16:00:00Z"),
+            ("2024-02-28T16:00:00Z", "2024-01-31T16:00:00Z"),
+            ("2024-02-29T16:00:00Z", "2024-02-29T16:00:00Z"),
+        ] {
+            let at = |value: &str| {
+                DateTime::parse_from_rfc3339(value)
+                    .expect("时间")
+                    .with_timezone(&Utc)
+            };
+            assert_eq!(month_start_beijing(at(now)), at(expected), "{now}");
+        }
+    }
 }

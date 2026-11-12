@@ -1,19 +1,19 @@
-/* 双端逐字节共享的 Bento 令牌。套件颜色只在这里定义；旧角色别名保留行为合同。
-   light 始终默认，dark 只由现有手动开关设置；不读取系统配色偏好。
-   --muted / --accent 是旧 CSS 的中性填充，不能用作 canonical text-muted / accent。 */
+/* 双端逐字节共享的运维语义令牌。浅色默认、深色仅由手动开关设置。
+   旧变量名保留兼容；橙点只标识品牌，钴蓝交互与结果状态分别表达。 */
 :root {
   color-scheme: light;
-  --bento-canvas: #ECEAE4;
-  --bento-surface: #FBFAF7;
-  --bento-well: #E1DED6;
-  --bento-stone: #D9D5CB;
-  --bento-line: #C9C5BB;
-  --bento-graphite: #7A7871;
-  --bento-ink: #121211;
-  --bento-ink-soft: #4A4944;
-  --bento-muted: #64635D;
-  --bento-inverse-muted: #A3A29B;
-  --bento-accent: #FF5A1F;
+  --bento-canvas: #F5F7FA;
+  --bento-surface: #FFFFFF;
+  --bento-well: #EEF2F7;
+  --bento-stone: #CBD5E3;
+  --bento-line: #D8DFE9;
+  --bento-graphite: #71819A;
+  --bento-ink: #172033;
+  --bento-ink-soft: #45546D;
+  --bento-muted: #53627A;
+  --bento-inverse-muted: #A8B7CB;
+  --bento-accent: #3156D3;
+  --brand-dot: #FF5A1F;
 
   --background: var(--bento-canvas);
   --foreground: var(--bento-ink);
@@ -21,7 +21,7 @@
   --card-foreground: var(--foreground);
   --popover: var(--card);
   --popover-foreground: var(--foreground);
-  --primary: var(--bento-ink);
+  --primary: var(--brand);
   --primary-foreground: var(--bento-surface);
   --secondary: var(--bento-canvas);
   --secondary-foreground: var(--foreground);
@@ -29,33 +29,33 @@
   --muted-foreground: var(--bento-muted);
   --accent: var(--bento-canvas);
   --accent-foreground: var(--foreground);
-  --destructive: var(--bento-ink);
+  --destructive: var(--danger);
   --destructive-foreground: var(--bento-surface);
-  --border: color-mix(in srgb, var(--foreground) 7%, transparent);
-  --input: var(--bento-graphite);
-  --ring: var(--bento-ink);
+  --border: var(--bento-line);
+  --input: #7F8EA4;
+  --ring: var(--brand);
   --radius: 10px;
   --sidebar: var(--card);
   --sidebar-foreground: var(--foreground);
   --sidebar-accent: var(--accent);
   --sidebar-border: var(--border);
 
-  /* 状态依靠文字、形状和确认流程识别；橙色只表达当前或重点。 */
-  --info: var(--bento-ink-soft);
-  --success: var(--bento-ink-soft);
-  --warning: var(--bento-ink-soft);
-  --danger: var(--bento-ink-soft);
-  --info-soft: var(--muted);
-  --success-soft: var(--muted);
-  --warning-soft: var(--muted);
-  --danger-soft: var(--muted);
+  /* 状态始终附文字与形状；品牌交互与结果语义分别着色。 */
+  --info: #3156D3;
+  --success: #15764B;
+  --warning: #9A6500;
+  --danger: #C93838;
+  --info-soft: #EEF3FF;
+  --success-soft: #EDF8F1;
+  --warning-soft: #FFF7E6;
+  --danger-soft: #FFF0F0;
   --brand: var(--bento-accent);
-  --brand-ink: var(--bento-ink);
+  --brand-ink: var(--brand);
   --wash-1: transparent;
   --wash-2: transparent;
-  --route-1: var(--bento-ink);
-  --route-2: var(--bento-ink-soft);
-  --route-3: var(--bento-muted);
+  --route-1: var(--brand);
+  --route-2: #188A83;
+  --route-3: #7E63B5;
   --route-4: var(--bento-graphite);
   --route-5: var(--bento-ink-soft);
   --route-6: var(--bento-muted);
@@ -76,7 +76,7 @@
   --box-border: var(--input);
   --focus: var(--ring);
   --focus-halo: transparent;
-  --link: var(--foreground);
+  --link: var(--brand);
   --error: var(--danger);
   --hover: color-mix(in srgb, var(--foreground) 5%, transparent);
   --press: color-mix(in srgb, var(--foreground) 8%, transparent);
@@ -89,15 +89,15 @@
   --tooltip-bg: var(--bento-ink);
   --tooltip-text: var(--bento-surface);
   --route-line: var(--foreground);
-  --lamp-applied: var(--foreground);
-  --lamp-progress: var(--text-2);
-  --lamp-pending: var(--muted-foreground);
-  --lamp-rejected: var(--foreground);
+  --lamp-applied: var(--success);
+  --lamp-progress: var(--info);
+  --lamp-pending: var(--warning);
+  --lamp-rejected: var(--danger);
   --lamp-disabled: var(--bento-graphite);
   --shadow-xs: none;
   --shadow-sm: none;
   --shadow-card: none;
-  --shadow-float: none;
+  --shadow-float: 0 12px 32px #1720331A;
   --shadow-btn: none;
 
   /* 旧页面角色继续指向同一主题，禁止新增第二套色值。 */
@@ -129,9 +129,9 @@
   --wide: 100%;
 
   /* 运营界面采用紧凑字级；旧 size API 仍保留，但不再生成巨型数字。 */
-  --type-title: 28px;
-  --type-hero: 36px;
-  --type-display: 32px;
+  --type-title: 26px;
+  --type-hero: 28px;
+  --type-display: 28px;
   --type-figure: 28px;
   --type-value: 24px;
   --type-lead: 14px;
@@ -158,12 +158,12 @@
   --lh-body: 1.5;
   --lh-table: 1.45;
   --lh-heading: 1.2;
-  --tracking-heading: -0.04em;
-  --r-input: 10px;
-  --r-card: 18px;
-  --r-button: 9999px;
-  --r-chip: 8px;
-  --r-panel: 18px;
+  --tracking-heading: -0.02em;
+  --r-input: 8px;
+  --r-card: 12px;
+  --r-button: 8px;
+  --r-chip: 6px;
+  --r-panel: 12px;
   --r-rail: 24px;
   --r-round: 9999px;
   --h-control: 44px;
@@ -182,46 +182,36 @@
   --font-mono: "Geist Mono", "Noto Sans SC", ui-monospace, "SF Mono", Menlo, monospace;
 }
 
-/* 深色保留手动主题合同，仅使用套件已有暖中性色。 */
+/* 深色按用途重新分层，保持相同语义和手动主题选择。 */
 :root[data-theme="dark"] {
   color-scheme: dark;
-  --background: var(--bento-ink);
-  --foreground: var(--bento-surface);
-  --card: var(--bento-ink-soft);
-  --primary: var(--bento-surface);
-  --primary-foreground: var(--bento-ink);
-  --secondary: var(--bento-ink);
-  --muted: var(--bento-ink);
-  --muted-foreground: var(--bento-canvas);
-  --accent: var(--bento-ink);
-  --destructive: var(--bento-surface);
-  --destructive-foreground: var(--bento-ink);
-  --border: color-mix(in srgb, var(--bento-surface) 12%, transparent);
-  --input: var(--bento-inverse-muted);
-  --ring: var(--bento-surface);
-  --info: var(--bento-surface);
-  --success: var(--bento-surface);
-  --warning: var(--bento-surface);
-  --danger: var(--bento-surface);
-  --route-1: var(--bento-surface);
-  --route-2: var(--bento-canvas);
-  --route-3: var(--bento-well);
-  --route-4: var(--bento-stone);
-  --route-5: var(--bento-line);
-  --route-6: var(--bento-inverse-muted);
-  --well: var(--bento-ink);
-  --stone: var(--bento-muted);
-  --graphite: var(--bento-line);
-  --ink-soft: var(--bento-canvas);
-  --text-2: var(--bento-canvas);
-  --row-hover: var(--bento-ink);
-  --skeleton: var(--bento-graphite);
-  --scrollbar: var(--bento-inverse-muted);
-  --tooltip-bg: var(--bento-surface);
-  --tooltip-text: var(--bento-ink);
-  --lamp-disabled: var(--bento-inverse-muted);
-  --n3: var(--bento-inverse-muted);
-  --n4: var(--bento-graphite);
+  --bento-canvas: #101722;
+  --bento-surface: #182231;
+  --bento-well: #202D3F;
+  --bento-stone: #4D5E75;
+  --bento-line: #354358;
+  --bento-graphite: #8799B0;
+  --bento-ink: #EAF0F8;
+  --bento-ink-soft: #BAC7D9;
+  --bento-muted: #A8B7CB;
+  --bento-accent: #91ACFF;
+  --primary-foreground: #101722;
+  --destructive-foreground: #101722;
+  --input: #71839D;
+  --info: #91ACFF;
+  --success: #6DD6A1;
+  --warning: #F0C369;
+  --danger: #FF9494;
+  --info-soft: #25345A;
+  --success-soft: #163C2C;
+  --warning-soft: #3F321D;
+  --danger-soft: #45272C;
+  --route-2: #76C8C1;
+  --route-3: #C2A7ED;
+  --tooltip-bg: #EAF0F8;
+  --tooltip-text: #101722;
+  --mark-tile: #101722;
+  --shadow-float: 0 12px 32px #00000040;
 }
 
 @media (max-width: 719px) {

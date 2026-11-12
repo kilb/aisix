@@ -25,11 +25,29 @@ await writeFile(entry, compiled.outputFiles[0]!.text);
 const { ApiMetricsPanel, ApiSuccessSummary } = require(entry) as { ApiMetricsPanel: ComponentType<ApiMetricsPanelProps>; ApiSuccessSummary: ComponentType<{ totals?: { requests: number | null; succeeded_requests: number | null; failed_requests: number | null; unknown_outcome_requests: number | null; known_outcome_requests: number | null; unknown_final_attempts: number | null; success_rate: number | null } }> };
 const props: ApiMetricsPanelProps = { scope: "tenant", enabled: true, from: "2026-11-01T00:00:00Z", to: "2026-11-02T00:00:00Z", numberStart: 5 };
 
+// 新入口和诊断在加载时也可发现；未知不能被 0% 或假用量替代。
+test("统计概览提供 token 入口、P99 与用量覆盖率位置", () => {
+  const markup = renderToStaticMarkup(createElement(ApiMetricsPanel, { ...props, compact: true }));
+  const text = markup.replace(/<[^>]+>/g, "");
+  for (const label of ["token", "首 token 延迟 P99", "用量记录覆盖率", "查看 token"]) assert.ok(text.includes(label), label);
+  assert.doesNotMatch(text, /覆盖率0%|P990 ms/);
+});
+
+// 成功率是 2/3，构成条却必须按全部 4 个请求画成 50/25/25。
+test("最终结果构成直接包含未知计数，不能沿用已知结果成功率作宽度", () => {
+  const markup = renderToStaticMarkup(createElement(ApiSuccessSummary, { totals: { requests: 4, succeeded_requests: 2, failed_requests: 1, unknown_outcome_requests: 1, known_outcome_requests: 3, unknown_final_attempts: 0, success_rate: 2 / 3 } }));
+  assert.match(markup, /aria-label="最终请求构成：成功 2，失败 1，未知 1，共 4"/);
+  assert.match(markup, /style="width:50%"/);
+  assert.equal((markup.match(/style="width:25%"/g) ?? []).length, 2);
+  const loading = renderToStaticMarkup(createElement(ApiSuccessSummary, {}));
+  assert.doesNotMatch(loading, /style="width:0%"/);
+});
+
 test("加载保留完整请求指标标签、期间说明和计数口径，不伪造零值", () => {
   const markup = renderToStaticMarkup(createElement(ApiMetricsPanel, props));
   const text = markup.replace(/<[^>]+>/g, "");
   for (const label of ["最终请求", "成功率", "失败率（已知结果）", "统计周期平均请求速率", "结果已知的请求", "成功请求", "失败请求", "结果未知的请求", "计费尝试", "最终状态未知的尝试"]) assert.ok(text.includes(label), `加载时仍有${label}位置`);
-  assert.match(text, /按 UTC 小时汇总/);
+  assert.match(text, /按北京时间小时汇总/);
   assert.match(text, /请求速率是整个查询周期的平均值，不是瞬时 RPS/);
   assert.match(text, /请求数按最终记录统计/);
   assert.doesNotMatch(text, /0%|0 次\/秒|¥0\.00/);
@@ -77,11 +95,11 @@ test("紧凑首屏直接呈现请求健康与延迟缓存入口，不先铺长�
   assert.match(text, /API 请求健康/);
   assert.match(markup, /role="group" aria-label="请求成功率摘要"/);
   assert.match(text, /已知结果样本（分母）/);
-  assert.match(text, /2026-11-01 00:00:00 UTC/);
+  assert.match(text, /2026-11-01 08:00:00 北京时间/);
   assert.match(text, /首 token 延迟/);
   assert.match(text, /查看延迟/);
   assert.match(text, /查看缓存/);
-  assert.doesNotMatch(text, /按 UTC 小时汇总/);
+  assert.doesNotMatch(text, /按北京时间小时汇总/);
 });
 
 test("收起的摘要属于指标概览，不能冒充完整指标区域", () => {

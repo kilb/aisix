@@ -1,11 +1,12 @@
 import { useEffect, useId, useState } from "react";
-import { parseUtc, type EffectiveResolver } from "../lib/effective";
+import type { EffectiveResolver } from "../lib/effective";
+import { parseBeijingInput } from "../lib/time";
 import { Field } from "../ui/Field";
 
 export { sendAt, type EffectiveResolver } from "../lib/effective";
 
 /**
- * When a price starts: `立即生效` (on by default), or a `生效时间（UTC）`.
+ * When a price starts: `立即生效` (on by default), or a `生效时间（北京时间）`.
  * With it on the time is not read until submit, so a form left open does not
  * send a start that has since passed. `onResolve` is given the resolver
  * whenever the choice changes; `error` is a refusal at `/effective_from`.
@@ -24,7 +25,7 @@ export function EffectiveFrom({
   useEffect(() => {
     onResolve({
       immediate,
-      stamp: () => (immediate ? new Date().toISOString() : parseUtc(text)),
+      stamp: () => (immediate ? new Date().toISOString() : parseBeijingInput(text)),
     });
     // onResolve is the form's setter; the choice is what changes.
   }, [immediate, text]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -37,7 +38,7 @@ export function EffectiveFrom({
       </label>
       {!immediate && (
         <Field
-          label="生效时间（UTC）"
+          label="生效时间（北京时间）"
           hint={<span id={noteId}>价格只能从现在或将来开始生效</span>}
           error={error}
         >

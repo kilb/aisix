@@ -18,6 +18,19 @@ function served(over: Partial<ServedBy> = {}): ServedBy {
   };
 }
 
+test("cooldown changes are saved without rewriting an untouched channel field", () => {
+  const stored = served({ cooldown: { enabled: true, default_seconds: 45, trigger_statuses: [429] } });
+  const draft = shownDraft(stored, { cooldown: { ...stored.cooldown, enabled: false } });
+  assert.deepEqual(changedBody(draft, stored), { cooldown: { enabled: false, default_seconds: 45, trigger_statuses: [429] } });
+});
+
+test("an unsafe stored duration cannot be rounded and resent when cooldown is toggled", () => {
+  const stored = served({ cooldown: { enabled: true, default_seconds: 9_007_199_254_740_992 } });
+  const changed = shownDraft(stored, { cooldown: { ...stored.cooldown, enabled: false } });
+  assert.equal(typeof unsendable(changed, stored).cooldown, "string");
+  assert.deepEqual(unsendable(shownDraft(stored, { priority: "2" }), stored), {});
+});
+
 function view(servedBy: ServedBy[]): PublicModel {
   return {
     id: "pub-1",

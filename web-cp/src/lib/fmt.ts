@@ -2,6 +2,7 @@
 
 import { ApiError } from "./api";
 import { messageFor } from "./errors";
+import { fmtBeijing } from "./time";
 
 /** Display formatting. */
 
@@ -19,7 +20,7 @@ export function errorText(e: unknown): string {
   return e instanceof ApiError ? messageFor(e) : String(e);
 }
 
-/** A timestamp in local time, on a 24-hour clock. */
+/** 界面时间统一显示北京时间，不使用浏览器本地时区。 */
 export function fmtTime(iso: string): string {
-  return new Date(iso).toLocaleString("zh-CN", { hour12: false });
+  return fmtBeijing(iso);
 }

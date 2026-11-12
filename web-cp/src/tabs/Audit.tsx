@@ -1,3 +1,6 @@
+import { auditSearchText } from "../lib/operationalRecords";
+import { useRecordTable } from "../lib/recordTable";
+import { RecordTools, RecordPager } from "../components/RecordTools";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { TabProps } from "../App";
 import { audit, tenants as tenantsApi, type AuditEntry, type Tenant } from "../lib/api";
@@ -103,7 +106,7 @@ export function Audit(_: TabProps) {
     setNext(null);
     setError(null);
     try {
-      const page = await audit.list(query(f));
+      const page = await audit.list({ ...query(f), limit: 50 });
       if (g !== generation.current) return;
       setRows(page.items);
       setNext(page.next_before);
@@ -126,7 +129,7 @@ export function Audit(_: TabProps) {
     setLoadingMore(true);
     setError(null);
     try {
-      const page = await audit.list({ ...query(filter), before: next });
+      const page = await audit.list({ ...query(filter), before: next, limit: 50 });
       if (g !== generation.current) return;
       setRows((prev) => [...(prev ?? []), ...page.items]);
       setNext(page.next_before);
@@ -137,6 +140,7 @@ export function Audit(_: TabProps) {
     }
   }
 
+  const table = useRecordTable({ items: rows ?? [], searchText: auditSearchText, resetKey: `${filter.kind}:${filter.tenant}` });
   const tenantName = (id: string) => tenants.find((t) => t.id === id)?.name ?? id;
   // 只汇总已加载的筛选结果；游标后的记录不进入任何统计。
   const kindCounts = new Map<string, number>();
@@ -239,64 +243,61 @@ export function Audit(_: TabProps) {
           {rows === null && !error && <Loading />}
           {rows !== null && rows.length === 0 && <EmptyState mark="log" text="没有符合条件的记录。" />}
           {rows !== null && rows.length > 0 && (
-            <DataTable scroll label="审计日志">
-              <thead>
-                <tr>
-                  <th className="num">编号</th>
-                  <th>时间</th>
-                  <th>操作者</th>
-                  <th>动作</th>
-                  <th>对象</th>
-                  <th>租户</th>
-                  <th>详情</th>
-                </tr>
-              </thead>
-              <tbody>
-                {rows.map((r) => (
-                  <tr key={r.id}>
-                    <td className="num text-muted-foreground">{r.id}</td>
-                    <td className="whitespace-normal text-muted-foreground" title={r.at}>
-                      {fmtTime(r.at)}
-                    </td>
-                    <td className="whitespace-normal">
-                      <span className="whitespace-nowrap">{r.actor.email ?? ""}</span>
-                      {ACTOR_KIND[r.actor.kind] && (
-                        <span className="hint whitespace-nowrap">
-                          {r.actor.email ? " · " : ""}
-                          {ACTOR_KIND[r.actor.kind]}
-                        </span>
-                      )}
-                    </td>
-                    <td>
-                      <code className="rounded-chip bg-well px-2 py-1 font-mono text-meta text-ink-soft">{r.action}</code>
-                    </td>
-                    <td>
-                      <span className="inline-flex flex-col gap-0.5 align-middle">
-                        {r.target_kind ? <code className="text-caption">{r.target_kind}</code> : "—"}{" "}
-                        {r.target_id && (
-                          <code className="block max-w-[19ch] text-meta break-all whitespace-normal text-muted-foreground">
-                            {r.target_id}
-                          </code>
-                        )}
-                      </span>
-                    </td>
-                    <td>{r.tenant_id ? tenantName(r.tenant_id) : "—"}</td>
-                    <td>
-                      <DetailSummary detail={r.detail} />
-                    </td>
+            <>
+              <RecordTools table={table} label="审计日志" loaded></RecordTools>
+              <DataTable scroll label="审计日志">
+                <thead>
+                  <tr>
+                    <th className="num">编号</th>
+                    <th>时间</th>
+                    <th>操作者</th>
+                    <th>动作</th>
+                    <th>对象</th>
+                    <th>租户</th>
+                    <th>详情</th>
                   </tr>
-                ))}
-              </tbody>
-            </DataTable>
+                </thead>
+                <tbody>
+                  {table.rows.map((r) => (
+                    <tr key={r.id}>
+                      <td className="num text-muted-foreground">{r.id}</td>
+                      <td className="whitespace-normal text-muted-foreground" title={fmtTime(r.at)}>
+                        {fmtTime(r.at)}
+                      </td>
+                      <td className="whitespace-normal">
+                        <span className="whitespace-nowrap">{r.actor.email ?? ""}</span>
+                        {ACTOR_KIND[r.actor.kind] && (
+                          <span className="hint whitespace-nowrap">
+                            {r.actor.email ? " · " : ""}
+                            {ACTOR_KIND[r.actor.kind]}
+                          </span>
+                        )}
+                      </td>
+                      <td>
+                        <code className="rounded-chip bg-well px-2 py-1 font-mono text-meta text-ink-soft">{r.action}</code>
+                      </td>
+                      <td>
+                        <span className="inline-flex flex-col gap-0.5 align-middle">
+                          {r.target_kind ? <code className="text-caption">{r.target_kind}</code> : "—"}{" "}
+                          {r.target_id && (
+                            <code className="block max-w-[19ch] text-meta break-all whitespace-normal text-muted-foreground">
+                              {r.target_id}
+                            </code>
+                          )}
+                        </span>
+                      </td>
+                      <td>{r.tenant_id ? tenantName(r.tenant_id) : "—"}</td>
+                      <td>
+                        <DetailSummary detail={r.detail} />
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </DataTable>
+              <RecordPager table={table} label="审计日志" resetKey={`${filter.kind}:${filter.tenant}`} hasMore={next !== null} onMore={loadMore} busy={loadingMore} />
+            </>
           )}
-          {next !== null && (
-            <CardFooter className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-ink/7 pt-4">
-              <span className="font-mono text-meta text-muted">已加载 {rows === null ? "—" : fmtInt(rows.length)} 条，更早记录尚未读取。</span>
-              <Button type="button" size="sm" disabled={loadingMore} busy={loadingMore} busyLabel="加载更多" onClick={() => void loadMore()}>
-                加载更多
-              </Button>
-            </CardFooter>
-          )}
+
         </Card>
       </BentoGrid>
     </>

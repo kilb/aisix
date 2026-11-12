@@ -21,11 +21,14 @@ import {
 import { messageFor, problemAt, warningText } from "../../lib/errors";
 import { errorText } from "../../lib/fmt";
 import { catalogueUpdateWords } from "../../lib/baselineUpdate";
-import { fmtCnyPerMillion, fmtUtc } from "../../lib/money";
+import { fmtCnyPerMillion } from "../../lib/money";
+import { fmtBeijing } from "../../lib/time";
 import { safeHttpUrl } from "../../lib/safeUrl";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
 import { EmptyState } from "../../ui/EmptyState";
+import { useRecordTable } from "../../lib/recordTable";
+import { RecordTablePager, RecordTableToolbar } from "../../ui/RecordTable";
 import { Field, useRefusalFocus } from "../../ui/Field";
 import { SidePanel } from "../../ui/SidePanel";
 import { useToast } from "../../ui/Toast";
@@ -169,7 +172,7 @@ export function BaselineSourceBadge({ revision }: { revision: BaselineRevision }
             {s.attested_at && (
               <>
                 {who && " · "}
-                <span className="tabular">确认于 {fmtUtc(s.attested_at)}</span>
+                <span className="tabular">确认于 {fmtBeijing(s.attested_at)}</span>
               </>
             )}
           </span>
@@ -197,8 +200,8 @@ function BaselineVersion({ revision }: { revision: BaselineRevision }) {
       <p className="baseline-version-id">版本 <span className="tabular">#{revision.revision_id}</span></p>
       <dl className="baseline-version-meta">
         <div>
-          <dt>生效时间（UTC）</dt>
-          <dd className="tabular"><time dateTime={revision.effective_from}>{fmtUtc(revision.effective_from)}</time></dd>
+          <dt>生效时间（北京时间）</dt>
+          <dd className="tabular"><time dateTime={revision.effective_from}>{fmtBeijing(revision.effective_from)}</time></dd>
         </div>
         <div>
           <dt>价格来源</dt>
@@ -232,6 +235,12 @@ export function Baselines({ canEdit, onGoto }: TabProps) {
   const [catalogue, setCatalogue] = useState<CatalogueEntry[]>([]);
   const [models, setModels] = useState<ResourceView<ModelDoc>[]>([]);
   const [prices, setPrices] = useState<ModelGroupPriceRow[]>([]);
+  const [status, setStatus] = useState("");
+  const records = useRecordTable({
+    items: (rows ?? []).filter((row) => status === "" || (status === "priced" ? row.current !== null : status === "unpriced" ? row.current === null : row.catalogue_update !== null)),
+    searchText: (row) => [row.name, row.model_id],
+    resetKey: status,
+  });
 
   const load = useCallback(async () => {
     try {
@@ -344,6 +353,10 @@ export function Baselines({ canEdit, onGoto }: TabProps) {
             ) : rows.length === 0 ? (
               <EmptyState text="还没有模型。先在「价格 → 公共模型」中新建公共模型，或在「上游账号 → 模型」中获取上游模型。" />
             ) : (
+              <>
+              <RecordTableToolbar search={{ value: records.query, onChange: records.setQuery, label: "搜索基准价模型", placeholder: "模型名称或 ID" }}>
+                <label className="f filter"><span>定价状态</span><select value={status} onChange={(e) => setStatus(e.target.value)}><option value="">全部</option><option value="priced">已定价</option><option value="unpriced">未定价</option><option value="changed">目录有更新</option></select></label>
+              </RecordTableToolbar>
               <DataTable label="基准价">
                 <thead>
                   <tr>
@@ -351,12 +364,13 @@ export function Baselines({ canEdit, onGoto }: TabProps) {
                     <th className="num">输入</th>
                     <th className="num">输出</th>
                     <th>来源</th>
-                    <th>生效时间（UTC）</th>
+                    <th>生效时间（北京时间）</th>
                     <th className="num">待生效</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {rows.map((r) => {
+                  {records.rows.length === 0 && <tr><td colSpan={6}><EmptyState text="没有符合筛选条件的模型" /></td></tr>}
+                  {records.rows.map((r) => {
                     const rates = headline(r.current?.card ?? null);
                     return (
                       <tr
@@ -392,10 +406,10 @@ export function Baselines({ canEdit, onGoto }: TabProps) {
                         </td>
                         <td>{r.current ? <BaselineSourceBadge revision={r.current} /> : "—"}</td>
                         <td className="tabular">
-                          {r.current ? fmtUtc(r.current.effective_from) : "—"}
+                          {r.current ? fmtBeijing(r.current.effective_from) : "—"}
                           {r.upcoming.length > 0 && (
                             <span className="cell-note">
-                              待生效 {r.upcoming.map((u) => fmtUtc(u.effective_from)).join("、")}
+                              待生效 {r.upcoming.map((u) => fmtBeijing(u.effective_from)).join("、")}
                             </span>
                           )}
                         </td>
@@ -405,6 +419,8 @@ export function Baselines({ canEdit, onGoto }: TabProps) {
                   })}
                 </tbody>
               </DataTable>
+              <RecordTablePager page={records.page} pageSize={records.pageSize} onPageChange={records.setPage} onPageSizeChange={records.setPageSize} total={records.filteredCount} label="基准价分页" />
+              </>
             )}
           </Card>
         </div>
@@ -495,7 +511,7 @@ function BaselinePanel({
         baselines.create({ model_id: row.model_id, effective_from, ...body }),
       );
       if (created === "invalid") {
-        setDetails([{ path: "/effective_from", message: "生效时间应写成 年-月-日 时:分，按 UTC 计" }]);
+        setDetails([{ path: "/effective_from", message: "生效时间应写成 年-月-日 时:分，按北京时间计" }]);
         focusRefusal();
         return;
       }
@@ -595,7 +611,7 @@ function BaselinePanel({
           {later.length > 0 && (
             <div className="note" role="status">
               目录中该条目之后的 {later.length} 个价格也已写入：
-              {later.map((r) => fmtUtc(r.effective_from)).join("、")}
+              {later.map((r) => fmtBeijing(r.effective_from)).join("、")}
             </div>
           )}
           {warnings.length > 0 && (

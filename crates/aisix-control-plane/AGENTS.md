@@ -215,14 +215,22 @@ way.
   one 256-token sample only after a successful basic probe with visible
   text; it has its own 30 s limit and separate results, and changes none
   of the basic measurements. Embeddings, failed targets and a successful
-  answer without visible text never add a sample. There is no retry, and
-  one of the three execution slots is held across both calls (at most
+  answer without visible text never add a capability sample. There is no
+  retry, and one of the three execution slots is held across both calls (at most
   55 s handler budget in total, including database reads and preparation;
-  each call is clamped to the remaining budget, and a call with no budget
-  is never started). The sample uses deterministic JSON, nonce,
-  arithmetic and sorting checks, not a model judge or identity proof. It
-  writes no stored health, usage, document or history. Its measurements run
-  from the control plane to the selected upstream, not along a customer's
+  model work and intermediate writes stop at 50 s, leaving the last 5 s for
+  final persistence. Every database wait is clamped to the remaining
+  deadline and at most 5 s; a call with no budget is never started). The
+  sample uses deterministic JSON, nonce, arithmetic and sorting checks, not a model judge or identity proof. It
+  stores bounded scrubbed result DTOs and target resource versions in
+  `model_probe_history`, never prompts, answer text or credentials; it
+  writes no stored health, usage or gateway document. An admitted call
+  finishes in its own bounded task after a browser disconnect, with the
+  baseline saved before the capability phase. Viewer operators may read
+  `GET /admin/model-probes`; tenants may not. The read marks changed
+  configurations stale and an unfinished row older than 60 s interrupted;
+  neither state replays a call. Records persist without automatic expiry.
+  Its measurements run from the control plane to the selected upstream, not along a customer's
   gateway path. A provider adapter's completed valid answer is success;
   this does not add strict wire-sentinel or byte-integrity validation. Only
   visible text gives a first-text latency; a completed answer without it
@@ -357,7 +365,7 @@ statement.
   `period_start` equals `start_of(now)`. A second computation (a SQL
   `date_trunc('week', …)`, a local-time conversion) that disagrees at a
   boundary writes a mark that is never in force, or counts spend in a period
-  no mark names. The summaries' `date_trunc(…, 'UTC')` day and month buckets
+  no mark names. The summaries' `date_trunc(…, 'Asia/Shanghai')` day and month buckets
   are display only and decide no mark. `a_period_starts_on_the_utc_calendar`
   (aisix-core), `periods_follow_the_utc_calendar` (aisix-proxy),
   `a_charge_on_the_boundary_counts_in_the_period_it_starts` and

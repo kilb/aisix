@@ -51,7 +51,7 @@ body {
 }
 ::selection { background: var(--selection); }
 h1, h2, h3, h4 {
-  font-weight: 500;
+  font-weight: 600;
   line-height: 1.3;
   letter-spacing: -0.015em;
   text-wrap: balance;
@@ -74,7 +74,7 @@ table, .num, .money, .tabular { font-variant-numeric: tabular-nums; }
   font-weight: 400;
 }
 
-/* 普通控件统一 44px。拒绝态依靠边型和原因文本，不借橙色表达失败。 */
+/* 普通控件统一 44px；拒绝态同时保留危险色、边型和原因文本。 */
 button { min-width: 44px; min-height: 44px; }
 input:not([type="checkbox"], [type="radio"], [type="range"], [type="color"], [type="file"]),
 select, textarea {
@@ -136,8 +136,7 @@ input[type="checkbox"]:checked {
   background-color: var(--primary);
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 6.25 4.75 8.5 9.5 3.5' fill='none' stroke='%23FBFAF7' stroke-width='1.75' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
 }
-:root[data-theme="dark"] input[type="checkbox"]:checked,
-.panel[data-tone="inverse"] input[type="checkbox"]:checked {
+:root[data-theme="dark"] input[type="checkbox"]:checked {
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 6.25 4.75 8.5 9.5 3.5' fill='none' stroke='%23121211' stroke-width='1.75' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
 }
 input[type="radio"]:checked { border: 5px solid var(--primary); }

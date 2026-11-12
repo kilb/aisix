@@ -12,7 +12,10 @@ import {
   type TenantStatus,
 } from "./lib/api";
 import { memberUsage, type MemberUsage, type MemberUsageSummary } from "./lib/memberUsage";
-import { fmtMicroCny, fmtUtc } from "./lib/money";
+import { fmtMicroCny } from "./lib/money";
+import { fmtBeijing, budgetPeriodRange } from "./lib/time";
+import { useRecordTable } from "./lib/recordTable";
+import { RecordTablePager, RecordTableToolbar } from "./ui/RecordTable";
 import { formMessageFor, messageFor } from "./lib/errors";
 import { ShownOnce } from "./controls";
 import { Button } from "./ui/Button";
@@ -86,7 +89,7 @@ function BudgetCell({ budgets }: { budgets: Budget[] }) {
             accessibleLabel={`该成员额度本期已用 ${fmtMicroCny(budget.spent_micro_cny)}，限额 ${fmtMicroCny(budget.limit_micro_cny)}`}
           />
           <span className="cell-note hint">
-            {budget.kind === "cumulative" ? "累计自 " : "本期自 "}{fmtUtc(budget.counted_from ?? budget.period_start ?? budget.created_at)}
+            {budget.kind === "cumulative" ? `累计自 ${fmtBeijing(budget.counted_from ?? budget.created_at)}` : budget.period && budget.period_start ? budgetPeriodRange(budget.period_start, budget.period) : "本期起止未知"}
           </span>
         </div>
       ))}
@@ -149,6 +152,19 @@ export function Members({
   const [acting, setActing] = useState<"role" | "remove" | "revoke" | null>(null);
   /** A role picked for a member and not yet confirmed. */
   const [drafts, setDrafts] = useState<Record<string, MemberRole>>({});
+  const [roleFilter, setRoleFilter] = useState("");
+  const [statusFilter, setStatusFilter] = useState("");
+  const [inviteRole, setInviteRole] = useState("");
+  const memberTable = useRecordTable({
+    items: (people ?? []).filter((person) => (!roleFilter || person.role === roleFilter) && (!statusFilter || (person.disabled ? "disabled" : "active") === statusFilter)),
+    searchText: (person) => [person.email, person.display_name ?? ""],
+    resetKey: `${roleFilter}/${statusFilter}`,
+  });
+  const inviteTable = useRecordTable({
+    items: (invites ?? []).filter((invite) => !inviteRole || invite.role === inviteRole),
+    searchText: (invite) => [invite.email, invite.invited_by?.display_name ?? "平台"],
+    resetKey: inviteRole,
+  });
   const usageByMember = useMemo(() => new Map(usage?.items.map((row) => [row.member_id, row]) ?? []), [usage]);
   const budgetsByMember = useMemo(() => {
     const grouped = new Map<string, Budget[]>();
@@ -259,6 +275,11 @@ export function Members({
       <BentoGrid>
         <Card className={active ? span.d5Wide : span.d12}>
           <CardHeader number={1} title="当前成员" />
+          <p className="hint">含估算用量：上游未完整返回用量，部分 token 由网关估算，费用按该用量计费。</p>
+          <RecordTableToolbar search={{ value: memberTable.query, onChange: memberTable.setQuery, label: "搜索成员", placeholder: "显示名或邮箱" }}>
+            <Field label="成员角色"><select value={roleFilter} onChange={(e) => setRoleFilter(e.target.value)}><option value="">全部角色</option>{(["owner", "admin", "member", "billing"] as const).map((role) => <option key={role} value={role}>{ROLE_LABEL[role]}</option>)}</select></Field>
+            <Field label="成员状态"><select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}><option value="">全部状态</option><option value="active">正常</option><option value="disabled">已被平台停用</option></select></Field>
+          </RecordTableToolbar>
           {people === null ? (listErr ? <CardMessage onRetry={() => void load()}>成员读取失败，请重试。</CardMessage> : <MetricSkeleton />) : <>
             <Metric size="hero">{formatCount(people.length)}</Metric>
             <CardFooter>
@@ -285,11 +306,11 @@ export function Members({
                     accessibleLabel={rankedUsage[0] ? `当前成员中，本月最高已计费费用为 ${fmtMicroCny(rankedUsage[0].amount)}，展示费用前 ${formatCount(rankedBars.length)} 位` : "当前没有组织成员"}
                     emptyLabel="当前没有成员费用"
                   />}
-            {usage && <p className="mt-4 break-words font-mono text-micro text-ink-soft">{fmtUtc(usage.from)} 至 {fmtUtc(usage.to)}，不含已离开成员及无成员归属的调用；不含未计价费用，可能含估算用量。</p>}
+            {usage && <p className="mt-4 break-words font-mono text-micro text-ink-soft">{fmtBeijing(usage.from)} 至 {fmtBeijing(usage.to)}，不含已离开成员及无成员归属的调用；不含未计价费用，可能含估算用量。</p>}
           </CardFooter>
         </Card>}
         <Card className={span.d12}>
-          <CardHeader number={active ? 3 : 2} title="组织成员" description={active ? "本月用量按 UTC 月初至当前时间统计；成员额度按各自周期计算。" : undefined} />
+          <CardHeader number={active ? 3 : 2} title="组织成员" description={active ? "本月用量按 北京时间月初至当前时间统计；成员额度按各自周期计算。" : undefined} />
           {!active && <div className="note crit">组织已被停用；这里只能移除成员。</div>}
           {active && usageErr && <div className="note crit" role="alert">成员用量读取失败：{usageErr}</div>}
           {active && budgetsErr && <div className="note crit" role="alert">成员额度读取失败：{budgetsErr}</div>}
@@ -321,7 +342,7 @@ export function Members({
                 </tr>
               </thead>
               <tbody>
-                {people.map((m) => {
+                {memberTable.rows.map((m) => {
                   const self = m.id === member.id;
                   const draft = drafts[m.id];
                   const memberUsageRow = usageByMember.get(m.id);
@@ -417,6 +438,7 @@ export function Members({
               </tbody>
             </DataTable>
           )}
+          {people !== null && <RecordTablePager page={memberTable.page} pageSize={memberTable.pageSize} onPageChange={memberTable.setPage} onPageSizeChange={memberTable.setPageSize} total={memberTable.filteredCount} label="成员" />}
         </Card>
 
         {active && (
@@ -427,6 +449,9 @@ export function Members({
                 {invitesErr}
               </div>
             )}
+            <RecordTableToolbar search={{ value: inviteTable.query, onChange: inviteTable.setQuery, label: "搜索邀请", placeholder: "邮箱或邀请人" }}>
+              <Field label="邀请角色"><select value={inviteRole} onChange={(e) => setInviteRole(e.target.value)}><option value="">全部角色</option>{roles.map((role) => <option key={role} value={role}>{ROLE_LABEL[role]}</option>)}</select></Field>
+            </RecordTableToolbar>
             {invites === null ? (
               !invitesErr && <Loading />
             ) : invites.length === 0 ? (
@@ -445,7 +470,7 @@ export function Members({
                   </tr>
                 </thead>
                 <tbody>
-                  {invites.map((inv) => {
+                  {inviteTable.rows.map((inv) => {
                     const by = inv.invited_by === null ? "平台" : (inv.invited_by.display_name ?? "成员");
                     return (
                       <tr key={inv.id}>
@@ -480,6 +505,7 @@ export function Members({
                 </tbody>
               </DataTable>
             )}
+            {invites !== null && <RecordTablePager page={inviteTable.page} pageSize={inviteTable.pageSize} onPageChange={inviteTable.setPage} onPageSizeChange={inviteTable.setPageSize} total={inviteTable.filteredCount} label="邀请" />}
           </Card>
         )}
         {active && (

@@ -1,3 +1,5 @@
+import { useRecordTable } from "../lib/recordTable";
+import { RecordTools, RecordPager } from "../components/RecordTools";
 import { useEffect, useId, useState } from "react";
 import type { TabProps } from "../App";
 import { ConflictNote } from "../components/ConflictNote";
@@ -82,6 +84,9 @@ function formOf(view: ResourceView<CachePolicyDoc>): Form {
 /** The cache policies, team-scoped by default, with a hand-laid form. */
 export function Cache({ canEdit, onGoto }: TabProps) {
   const policies = useResource<CachePolicyDoc>("cache_policies");
+  const [enabledFilter, setEnabledFilter] = useState("");
+  const [scopeFilter, setScopeFilter] = useState("");
+  const table = useRecordTable({ items: (policies.items ?? []).filter((p) => (!enabledFilter || ((p.doc.enabled ?? true) ? "enabled" : "disabled") === enabledFilter) && (!scopeFilter || p.doc.scope === scopeFilter)), searchText: (p) => [p.id, p.doc.name ?? "", p.doc.scope ?? "", p.doc.applies_to_model_id ?? "", p.doc.applies_to ?? ""], resetKey: `${enabledFilter}:${scopeFilter}` });
   const models = useResource<{ display_name?: string }>("models");
   const [options, setOptions] = useState<Options | null>(null);
   const [optionsError, setOptionsError] = useState<string | null>(null);
@@ -265,61 +270,65 @@ export function Cache({ canEdit, onGoto }: TabProps) {
       {policies.items === null && !policies.error && <Loading />}
       {policies.items !== null && policies.items.length === 0 && <EmptyState text="还没有缓存策略。" />}
       {policies.items !== null && policies.items.length > 0 && (
-        <DataTable label="缓存策略">
-          <thead>
-            <tr>
-              <th>名称</th>
-              <th>范围</th>
-              <th>作用于</th>
-              <th className="right">缓存时长（秒）</th>
-              <th>启用</th>
-              <th>下发状态</th>
-              <th />
-            </tr>
-          </thead>
-          <tbody>
-            {policies.items.map((p) => (
-              <tr key={p.id} className={form?.id === p.id ? "bg-well" : undefined}>
-                <td className="font-medium">{p.doc.name}</td>
-                <td>
-                  <code className="tag font-mono">{p.doc.scope ?? "—"}</code>
-                </td>
-                <td>{appliesToText(p.doc)}</td>
-                <td className="right num">{p.doc.ttl_seconds ?? "—"}</td>
-                <td>
-                  <Lamp state={p.doc.enabled === false ? "disabled" : "applied"}>{p.doc.enabled === false ? "否" : "是"}</Lamp>
-                </td>
-                <td>
-                  <RolloutBadge rollout={p.rollout} />
-                </td>
-                <td className="right">
-                  <Button size="sm" type="button" onClick={() => open(p)}>
-                    {canEdit && p.doc.scope !== ENV_SCOPE ? "编辑" : "查看"}
-                  </Button>
-                  {canEdit && (
-                    <TwoStep
-                      label="删除"
-                      size="sm"
-                      disabled={busy}
-                      busy={removing === p.id}
-                      warning={`删除「${p.doc.name ?? p.id}」后，它覆盖的请求不再由网关缓存应答。`}
-                      onConfirm={() => void remove(p)}
-                    />
-                  )}
-                  {deleteFailure?.id === p.id && (
-                    <Failure
-                      error={deleteFailure.error}
-                      onReload={() => {
-                        setDeleteFailure(null);
-                        void policies.reload();
-                      }}
-                    />
-                  )}
-                </td>
+        <>
+          <RecordTools table={table} label="缓存策略"><label className="f filter"><span>启用状态</span><select aria-label="启用状态" value={enabledFilter} onChange={(e) => setEnabledFilter(e.target.value)}><option value="">全部</option><option value="enabled">启用</option><option value="disabled">停用</option></select></label><label className="f filter"><span>作用范围</span><select aria-label="作用范围" value={scopeFilter} onChange={(e) => setScopeFilter(e.target.value)}><option value="">全部</option><option value="team">租户</option><option value="env">环境</option></select></label></RecordTools>
+          <DataTable label="缓存策略">
+            <thead>
+              <tr>
+                <th>名称</th>
+                <th>范围</th>
+                <th>作用于</th>
+                <th className="right">缓存时长（秒）</th>
+                <th>启用</th>
+                <th>下发状态</th>
+                <th />
               </tr>
-            ))}
-          </tbody>
-        </DataTable>
+            </thead>
+            <tbody>
+              {table.rows.map((p) => (
+                <tr key={p.id} className={form?.id === p.id ? "bg-well" : undefined}>
+                  <td className="font-medium">{p.doc.name}</td>
+                  <td>
+                    <code className="tag font-mono">{p.doc.scope ?? "—"}</code>
+                  </td>
+                  <td>{appliesToText(p.doc)}</td>
+                  <td className="right num">{p.doc.ttl_seconds ?? "—"}</td>
+                  <td>
+                    <Lamp state={p.doc.enabled === false ? "disabled" : "applied"}>{p.doc.enabled === false ? "否" : "是"}</Lamp>
+                  </td>
+                  <td>
+                    <RolloutBadge rollout={p.rollout} />
+                  </td>
+                  <td className="right">
+                    <Button size="sm" type="button" onClick={() => open(p)}>
+                      {canEdit && p.doc.scope !== ENV_SCOPE ? "编辑" : "查看"}
+                    </Button>
+                    {canEdit && (
+                      <TwoStep
+                        label="删除"
+                        size="sm"
+                        disabled={busy}
+                        busy={removing === p.id}
+                        warning={`删除「${p.doc.name ?? p.id}」后，它覆盖的请求不再由网关缓存应答。`}
+                        onConfirm={() => void remove(p)}
+                      />
+                    )}
+                    {deleteFailure?.id === p.id && (
+                      <Failure
+                        error={deleteFailure.error}
+                        onReload={() => {
+                          setDeleteFailure(null);
+                          void policies.reload();
+                        }}
+                      />
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </DataTable>
+          <RecordPager table={table} label="缓存策略" />
+        </>
       )}
     </div>
   );

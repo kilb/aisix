@@ -1,3 +1,5 @@
+import { useRecordTable } from "../lib/recordTable";
+import { RecordTools, RecordPager } from "../components/RecordTools";
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { Dialog } from "radix-ui";
 import type { TabProps } from "../App";
@@ -95,6 +97,9 @@ export function Operators({ operator }: TabProps) {
     void reload();
   }
 
+  const [roleFilter, setRoleFilter] = useState("");
+  const [statusFilter, setStatusFilter] = useState("");
+  const table = useRecordTable({ items: (items ?? []).filter((a) => (!roleFilter || a.role === roleFilter) && (!statusFilter || (a.disabled ? "disabled" : "enabled") === statusFilter)), searchText: (a) => [a.email, a.display_name ?? "", a.id], resetKey: `${roleFilter}:${statusFilter}` });
   const enabled = items?.filter((account) => !account.disabled) ?? null;
   const roles = ROLES.map(({ role, label }) => {
     const value = items?.filter((account) => account.role === role).length ?? 0;
@@ -126,133 +131,137 @@ export function Operators({ operator }: TabProps) {
       )}
       {items === null && !loadError && <Loading />}
       {items !== null && (
-        <DataTable label="全部运维账号">
-          <thead>
-            <tr>
-              <th>邮箱</th>
-              <th>显示名</th>
-              <th>角色</th>
-              <th>状态</th>
-              <th>创建时间</th>
-              <th />
-            </tr>
-          </thead>
-          <tbody>
-            {items.map((a) => {
-              const mine = pending?.id === a.id ? pending : null;
-              const shownRole = mine?.kind === "role" ? mine.role : a.role;
-              return (
-                <tr key={a.id}>
-                  <td>
-                    <span className="inline-flex items-center gap-2.5 align-middle">
-                      <span
-                        aria-hidden="true"
-                        className="grid size-11 shrink-0 place-items-center rounded-full bg-well text-meta font-medium text-ink-soft uppercase"
+        <>
+          <RecordTools table={table} label="全部运维账号"><label className="f filter"><span>筛选角色</span><select aria-label="筛选角色" value={roleFilter} onChange={(e) => setRoleFilter(e.target.value)}><option value="">全部</option><option value="admin">管理员</option><option value="operator">运维</option><option value="viewer">只读</option></select></label><label className="f filter"><span>筛选状态</span><select aria-label="筛选状态" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}><option value="">全部</option><option value="enabled">正常</option><option value="disabled">已停用</option></select></label></RecordTools>
+          <DataTable label="全部运维账号">
+            <thead>
+              <tr>
+                <th>邮箱</th>
+                <th>显示名</th>
+                <th>角色</th>
+                <th>状态</th>
+                <th>创建时间</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {table.rows.map((a) => {
+                const mine = pending?.id === a.id ? pending : null;
+                const shownRole = mine?.kind === "role" ? mine.role : a.role;
+                return (
+                  <tr key={a.id}>
+                    <td>
+                      <span className="inline-flex items-center gap-2.5 align-middle">
+                        <span
+                          aria-hidden="true"
+                          className="grid size-11 shrink-0 place-items-center rounded-full bg-well text-meta font-medium text-ink-soft uppercase"
+                        >
+                          {(a.display_name || a.email).slice(0, 1)}
+                        </span>
+                        <span className="flex flex-col leading-tight">
+                          <span className="font-medium">{a.email}</span>
+                          {a.id === operator.id && <span className="hint mt-0.5 text-meta">（当前账号）</span>}
+                        </span>
+                      </span>
+                    </td>
+                    <td>{a.display_name ?? <span className="text-muted-foreground">—</span>}</td>
+                    <td>
+                      <select
+                        aria-label="角色"
+                        className="select-sm"
+                        value={shownRole}
+                        disabled={busy || mine?.kind === "disable"}
+                        onChange={(e) => {
+                          const role = e.target.value as OperatorRole;
+                          setOutcome(null);
+                          setPending(role === a.role ? null : { id: a.id, kind: "role", role });
+                        }}
                       >
-                        {(a.display_name || a.email).slice(0, 1)}
-                      </span>
-                      <span className="flex flex-col leading-tight">
-                        <span className="font-medium">{a.email}</span>
-                        {a.id === operator.id && <span className="hint mt-0.5 text-meta">（当前账号）</span>}
-                      </span>
-                    </span>
-                  </td>
-                  <td>{a.display_name ?? <span className="text-muted-foreground">—</span>}</td>
-                  <td>
-                    <select
-                      aria-label="角色"
-                      className="select-sm"
-                      value={shownRole}
-                      disabled={busy || mine?.kind === "disable"}
-                      onChange={(e) => {
-                        const role = e.target.value as OperatorRole;
-                        setOutcome(null);
-                        setPending(role === a.role ? null : { id: a.id, kind: "role", role });
-                      }}
-                    >
-                      {ROLES.map((r) => (
-                        <option key={r.role} value={r.role}>
-                          {r.label}
-                        </option>
-                      ))}
-                    </select>
-                  </td>
-                  <td>
-                    <Lamp state={a.disabled ? "disabled" : "applied"}>{a.disabled ? "已停用" : "正常"}</Lamp>
-                  </td>
-                  <td className="text-muted-foreground">{fmtTime(a.created_at)}</td>
-                  <td className="right">
-                    <span className="inline-flex items-center justify-end gap-1.5">
-                      {mine?.kind === "role" && (
-                        <>
+                        {ROLES.map((r) => (
+                          <option key={r.role} value={r.role}>
+                            {r.label}
+                          </option>
+                        ))}
+                      </select>
+                    </td>
+                    <td>
+                      <Lamp state={a.disabled ? "disabled" : "applied"}>{a.disabled ? "已停用" : "正常"}</Lamp>
+                    </td>
+                    <td className="text-muted-foreground">{fmtTime(a.created_at)}</td>
+                    <td className="right">
+                      <span className="inline-flex items-center justify-end gap-1.5">
+                        {mine?.kind === "role" && (
+                          <>
+                            <Button
+                              kind="primary"
+                              size="sm"
+                              type="button"
+                              disabled={busy}
+                              busy={changing === a.id}
+                              busyLabel={`确认改为${roleLabel(mine.role)}`}
+                              onClick={() =>
+                                void change(a, { role: mine.role }, `${a.email} 已改为${roleLabel(mine.role)}`)
+                              }
+                            >
+                              确认改为{roleLabel(mine.role)}
+                            </Button>
+                            <Button size="sm" type="button" disabled={busy} onClick={() => setPending(null)}>
+                              取消
+                            </Button>
+                          </>
+                        )}
+                        {mine?.kind === "disable" && (
+                          <>
+                            <Button
+                              kind="danger"
+                              size="sm"
+                              type="button"
+                              disabled={busy}
+                              busy={changing === a.id}
+                              busyLabel="确认停用"
+                              onClick={() => void change(a, { disabled: true }, `${a.email} 已停用`)}
+                            >
+                              确认停用
+                            </Button>
+                            <Button size="sm" type="button" disabled={busy} onClick={() => setPending(null)}>
+                              取消
+                            </Button>
+                          </>
+                        )}
+                        {!mine && !a.disabled && (
                           <Button
-                            kind="primary"
+                            size="sm"
+                            type="button"
+                            disabled={busy}
+                            onClick={() => {
+                              setOutcome(null);
+                              setPending({ id: a.id, kind: "disable" });
+                            }}
+                          >
+                            停用
+                          </Button>
+                        )}
+                        {!mine && a.disabled && (
+                          <Button
                             size="sm"
                             type="button"
                             disabled={busy}
                             busy={changing === a.id}
-                            busyLabel={`确认改为${roleLabel(mine.role)}`}
-                            onClick={() =>
-                              void change(a, { role: mine.role }, `${a.email} 已改为${roleLabel(mine.role)}`)
-                            }
+                            busyLabel="启用"
+                            onClick={() => void change(a, { disabled: false }, `${a.email} 已启用`)}
                           >
-                            确认改为{roleLabel(mine.role)}
+                            启用
                           </Button>
-                          <Button size="sm" type="button" disabled={busy} onClick={() => setPending(null)}>
-                            取消
-                          </Button>
-                        </>
-                      )}
-                      {mine?.kind === "disable" && (
-                        <>
-                          <Button
-                            kind="danger"
-                            size="sm"
-                            type="button"
-                            disabled={busy}
-                            busy={changing === a.id}
-                            busyLabel="确认停用"
-                            onClick={() => void change(a, { disabled: true }, `${a.email} 已停用`)}
-                          >
-                            确认停用
-                          </Button>
-                          <Button size="sm" type="button" disabled={busy} onClick={() => setPending(null)}>
-                            取消
-                          </Button>
-                        </>
-                      )}
-                      {!mine && !a.disabled && (
-                        <Button
-                          size="sm"
-                          type="button"
-                          disabled={busy}
-                          onClick={() => {
-                            setOutcome(null);
-                            setPending({ id: a.id, kind: "disable" });
-                          }}
-                        >
-                          停用
-                        </Button>
-                      )}
-                      {!mine && a.disabled && (
-                        <Button
-                          size="sm"
-                          type="button"
-                          disabled={busy}
-                          busy={changing === a.id}
-                          busyLabel="启用"
-                          onClick={() => void change(a, { disabled: false }, `${a.email} 已启用`)}
-                        >
-                          启用
-                        </Button>
-                      )}
-                    </span>
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </DataTable>
+                        )}
+                      </span>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </DataTable>
+          <RecordPager table={table} label="全部运维账号" />
+        </>
       )}
     </Card>
   );

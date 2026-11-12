@@ -1,23 +1,5 @@
 import type { RepricingFilterInput, RepricingRun } from "./api";
 
-/** The value a `datetime-local` input takes for `at`: its UTC wall clock to the second. */
-export function utcInputValue(at: Date): string {
-  return at.toISOString().slice(0, 19);
-}
-
-/**
- * The instant a `datetime-local` value names when it is read as UTC, as an
- * ISO string; null when it is not a date. The browser's time zone plays no
- * part: the form says UTC and the control plane stores UTC.
- */
-export function utcInputToIso(value: string): string | null {
-  const m = /^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})(?::(\d{2}))?$/.exec(value);
-  if (!m) return null;
-  const iso = `${m[1]}T${m[2]}:${m[3] ?? "00"}Z`;
-  const at = new Date(iso);
-  return Number.isNaN(at.getTime()) || at.toISOString().slice(0, 16) !== iso.slice(0, 16) ? null : at.toISOString();
-}
-
 /** What a total delta means to the tenant: positive is charged more, negative is refunded. */
 export function deltaWord(micro: number): string {
   if (micro > 0) return "多收";

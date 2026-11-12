@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { parseUtc, sendAt, type EffectiveResolver } from "./effective.ts";
+import { parseBeijingInput } from "./time.ts";
+import { sendAt, type EffectiveResolver } from "./effective.ts";
 
 const past = Object.assign(new Error("past"), { status: 422, details: [{ path: "/effective_from", message: "x" }] });
 
@@ -9,19 +10,19 @@ function resolver(immediate: boolean, stamps: (string | null)[]): EffectiveResol
   return { immediate, stamp: () => stamps[Math.min(i++, stamps.length - 1)] ?? null };
 }
 
-test("parseUtc reads a UTC minute, with optional seconds and a T or Z", () => {
-  assert.equal(parseUtc("2030-01-02 03:04"), "2030-01-02T03:04:00.000Z");
-  assert.equal(parseUtc("2030-01-02T03:04:05Z"), "2030-01-02T03:04:05.000Z");
-  for (const bad of ["", "2030-01-02", "2030-13-45 03:04", "02/01/2030 03:04"]) assert.equal(parseUtc(bad), null, bad);
+test("parseBeijingInput reads a Beijing minute, with optional seconds or a T", () => {
+  assert.equal(parseBeijingInput("2030-01-02 03:04"), "2030-01-01T19:04:00.000Z");
+  assert.equal(parseBeijingInput("2030-01-02T03:04:05"), "2030-01-01T19:04:05.000Z");
+  for (const bad of ["", "2030-01-02", "2030-13-45 03:04", "02/01/2030 03:04"]) assert.equal(parseBeijingInput(bad), null, bad);
 });
 
-test("parseUtc refuses a day or a time the calendar does not have, rather than moving it", () => {
+test("parseBeijingInput refuses a day or a time the calendar does not have, rather than moving it", () => {
   for (const bad of ["2027-02-29 00:00", "2027-04-31 10:00", "2027-02-30 12:00", "2027-01-01 24:00", "2027-01-01 23:60", "2027-06-31T08:15:00Z"]) {
-    assert.equal(parseUtc(bad), null, bad);
+    assert.equal(parseBeijingInput(bad), null, bad);
   }
   // A leap year's 29 February, and the last minute of a month, are days like any other.
-  assert.equal(parseUtc("2028-02-29 00:00"), "2028-02-29T00:00:00.000Z");
-  assert.equal(parseUtc("2027-04-30 23:59:59"), "2027-04-30T23:59:59.000Z");
+  assert.equal(parseBeijingInput("2028-02-29 00:00"), "2028-02-28T16:00:00.000Z");
+  assert.equal(parseBeijingInput("2027-04-30 23:59:59"), "2027-04-30T15:59:59.000Z");
 });
 
 test("an invalid typed time is `invalid` and nothing is sent", async () => {

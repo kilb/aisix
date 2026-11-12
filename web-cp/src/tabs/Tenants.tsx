@@ -1,3 +1,6 @@
+import { keySearchText } from "../lib/operationalRecords";
+import { useRecordTable } from "../lib/recordTable";
+import { RecordTools, RecordPager } from "../components/RecordTools";
 /** 布局：[01 全部 6][02 正常 6]；[默认配置 12]；[列表 12 / 打开详情时 6 + 6]。 */
 import { Fragment, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import type { TabProps } from "../App";
@@ -331,6 +334,7 @@ export function Tenants({ operator, canEdit }: TabProps) {
   const [all, setAll] = useState<Tenant[] | null>(null);
   const [listError, setListError] = useState<string | null>(null);
   const [rowError, setRowError] = useState<{ id: string; error: unknown } | null>(null);
+
   const [acting, setActing] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [detail, setDetail] = useState<Tenant | null>(null);
@@ -362,6 +366,7 @@ export function Tenants({ operator, canEdit }: TabProps) {
 
   const items = useMemo(() => (all === null ? null : filter ? all.filter((t) => t.status === filter) : all), [all, filter]);
   const count = (status: Tenant["status"]) => (all === null ? "—" : fmtInt(all.filter((t) => t.status === status).length));
+  const table = useRecordTable({ items: items ?? [], searchText: (t) => [t.name, t.id], resetKey: filter });
   const statusItems = all === null ? null : (["active", "pending", "suspended"] as const).map((status) => ({
     label: STATUS_LABEL[status],
     value: all.filter((tenant) => tenant.status === status).length,
@@ -515,89 +520,93 @@ export function Tenants({ operator, canEdit }: TabProps) {
             ) : items.length === 0 ? (
               <EmptyState text="没有符合条件的租户。" />
             ) : (
-              <DataTable label="租户列表">
-                <thead>
-                  <tr>
-                    <th>名称</th>
-                    <th>状态</th>
-                    <th className="side-opt">计费方式</th>
-                    <th className="right side-opt">成员</th>
-                    <th className="right side-opt">密钥</th>
-                    <th>下发</th>
-                    {canEdit && <th className="right">操作</th>}
-                  </tr>
-                </thead>
-                <tbody>
-                  {items.map((t) => (
-                    <tr key={t.id}>
-                      <td>
-                        <span className="flex min-w-0 items-center gap-2">
-                          <button
-                            type="button"
-                            className="link-button tn-name"
-                            title={t.name}
-                            aria-expanded={selected === t.id}
-                            onClick={() => setSelected(t.id)}
-                          >
-                            {t.name}
-                          </button>
-                          {t.is_internal && <span className="tag">平台内部</span>}
-                        </span>
-                      </td>
-                      <td>
-                        <TenantStatus status={t.status} />
-                      </td>
-                      <td className="side-opt text-text-2">{BILLING_LABEL[t.billing_mode] ?? t.billing_mode}</td>
-                      <td className="right side-opt">{fmtInt(t.member_count)}</td>
-                      <td className="right side-opt">{fmtInt(t.key_count)}</td>
-                      <td>
-                        <RolloutBadge rollout={t.rollout} />
-                      </td>
-                      {canEdit && (
-                        <td className="right">
-                          <div className="tn-actions justify-end">
-                            {t.status === "pending" && (
-                              <Button
-                                size="sm"
-                                type="button"
-                                disabled={acting === t.id}
-                                busy={acting === t.id}
-                                busyLabel="批准"
-                                onClick={() => void act(t, tenants.approve)}
-                              >
-                                批准
-                              </Button>
-                            )}
-                            {/* The platform's own tenant holds the operators' keys; it is never suspended. */}
-                            {t.status === "active" && !t.is_internal && (
-                              <TwoStep
-                                label="停用"
-                                size="sm"
-                                disabled={acting === t.id}
-                                busy={acting === t.id}
-                                onConfirm={() => void act(t, tenants.suspend)}
-                              />
-                            )}
-                            {t.status === "suspended" && (
-                              <Button
-                                size="sm"
-                                type="button"
-                                disabled={acting === t.id}
-                                busy={acting === t.id}
-                                busyLabel="恢复"
-                                onClick={() => void act(t, tenants.reactivate)}
-                              >
-                                恢复
-                              </Button>
-                            )}
-                          </div>
-                          {rowError?.id === t.id && <Failure error={rowError.error} />}
-                        </td>
-                      )}
+              <>
+                <RecordTools table={table} label="租户列表"></RecordTools>
+                <DataTable label="租户列表">
+                  <thead>
+                    <tr>
+                      <th>名称</th>
+                      <th>状态</th>
+                      <th className="side-opt">计费方式</th>
+                      <th className="right side-opt">成员</th>
+                      <th className="right side-opt">密钥</th>
+                      <th>下发</th>
+                      {canEdit && <th className="right">操作</th>}
                     </tr>
-                  ))}
-                </tbody>
-              </DataTable>
+                  </thead>
+                  <tbody>
+                    {table.rows.map((t) => (
+                      <tr key={t.id}>
+                        <td>
+                          <span className="flex min-w-0 items-center gap-2">
+                            <button
+                              type="button"
+                              className="link-button tn-name"
+                              title={t.name}
+                              aria-expanded={selected === t.id}
+                              onClick={() => setSelected(t.id)}
+                            >
+                              {t.name}
+                            </button>
+                            {t.is_internal && <span className="tag">平台内部</span>}
+                          </span>
+                        </td>
+                        <td>
+                          <TenantStatus status={t.status} />
+                        </td>
+                        <td className="side-opt text-text-2">{BILLING_LABEL[t.billing_mode] ?? t.billing_mode}</td>
+                        <td className="right side-opt">{fmtInt(t.member_count)}</td>
+                        <td className="right side-opt">{fmtInt(t.key_count)}</td>
+                        <td>
+                          <RolloutBadge rollout={t.rollout} />
+                        </td>
+                        {canEdit && (
+                          <td className="right">
+                            <div className="tn-actions justify-end">
+                              {t.status === "pending" && (
+                                <Button
+                                  size="sm"
+                                  type="button"
+                                  disabled={acting === t.id}
+                                  busy={acting === t.id}
+                                  busyLabel="批准"
+                                  onClick={() => void act(t, tenants.approve)}
+                                >
+                                  批准
+                                </Button>
+                              )}
+                              {/* The platform's own tenant holds the operators' keys; it is never suspended. */}
+                              {t.status === "active" && !t.is_internal && (
+                                <TwoStep
+                                  label="停用"
+                                  size="sm"
+                                  disabled={acting === t.id}
+                                  busy={acting === t.id}
+                                  onConfirm={() => void act(t, tenants.suspend)}
+                                />
+                              )}
+                              {t.status === "suspended" && (
+                                <Button
+                                  size="sm"
+                                  type="button"
+                                  disabled={acting === t.id}
+                                  busy={acting === t.id}
+                                  busyLabel="恢复"
+                                  onClick={() => void act(t, tenants.reactivate)}
+                                >
+                                  恢复
+                                </Button>
+                              )}
+                            </div>
+                            {rowError?.id === t.id && <Failure error={rowError.error} />}
+                          </td>
+                        )}
+                      </tr>
+                    ))}
+                  </tbody>
+                </DataTable>
+                <RecordPager table={table} label="租户列表" />
+              </>
             )}
           </Card>
 
@@ -744,6 +753,7 @@ function TenantDetail({
 
       {!tenant.is_internal && (
         <MembersPart
+          tenantId={tenant.id}
           members={members.data}
           error={members.error}
           canEdit={canEdit}
@@ -1403,11 +1413,13 @@ function LimitsPart({ tenant, canEdit, save, onReload }: PartProps) {
 }
 
 function MembersPart({
+  tenantId,
   members,
   error,
   canEdit,
   onChanged,
 }: {
+  tenantId: string;
   members: Member[] | null;
   error: string | null;
   canEdit: boolean;
@@ -1415,6 +1427,10 @@ function MembersPart({
 }) {
   const [busy, setBusy] = useState<string | null>(null);
   const [rowError, setRowError] = useState<{ id: string; error: unknown } | null>(null);
+
+  const [memberRole, setMemberRole] = useState("");
+  const [memberStatus, setMemberStatus] = useState("");
+  const memberTable = useRecordTable({ items: (members ?? []).filter((m) => (!memberRole || m.role === memberRole) && (!memberStatus || (m.disabled ? "disabled" : "enabled") === memberStatus)), searchText: (m) => [m.email, m.display_name ?? "", m.id], resetKey: `${tenantId}:${memberRole}:${memberStatus}` });
 
   async function toggle(m: Member) {
     setBusy(m.id);
@@ -1445,58 +1461,62 @@ function MembersPart({
         <p className="status-line">还没有成员。</p>
       ) : (
         <div className="tn-bleed">
-        <DataTable label="成员">
-          <thead>
-            <tr>
-              <th>名称</th>
-              <th>邮箱</th>
-              <th>角色</th>
-              <th>状态</th>
-              {canEdit && <th className="right">操作</th>}
-            </tr>
-          </thead>
-          <tbody>
-            {members.map((m) => (
-              <tr key={m.id}>
-                <td className="font-medium">{m.display_name || "—"}</td>
-                <td className="text-text-2">{m.email}</td>
-                <td>
-                  <span className="tag">{ROLE_LABEL[m.role] ?? m.role}</span>
-                </td>
-                <td>
-                  <Lamp state={m.disabled ? "disabled" : "applied"}>{m.disabled ? "已停用" : "正常"}</Lamp>
-                </td>
-                {canEdit && (
-                  <td className="right">
-                    <div className="tn-actions justify-end">
-                      {m.disabled ? (
-                        <Button
-                          size="sm"
-                          type="button"
-                          disabled={busy === m.id}
-                          busy={busy === m.id}
-                          busyLabel="启用"
-                          onClick={() => void toggle(m)}
-                        >
-                          启用
-                        </Button>
-                      ) : (
-                        <TwoStep
-                          label="停用"
-                          size="sm"
-                          disabled={busy === m.id}
-                          busy={busy === m.id}
-                          onConfirm={() => void toggle(m)}
-                        />
-                      )}
-                    </div>
-                    {rowError?.id === m.id && <Failure error={rowError.error} />}
-                  </td>
-                )}
+        <>
+          <RecordTools table={memberTable} label="成员"><label className="f filter"><span>成员角色</span><select aria-label="成员角色" value={memberRole} onChange={(e) => setMemberRole(e.target.value)}><option value="">全部</option><option value="owner">所有者</option><option value="admin">管理员</option><option value="member">成员</option><option value="billing">计费</option></select></label><label className="f filter"><span>成员状态</span><select aria-label="成员状态" value={memberStatus} onChange={(e) => setMemberStatus(e.target.value)}><option value="">全部</option><option value="enabled">正常</option><option value="disabled">停用</option></select></label></RecordTools>
+          <DataTable label="成员">
+            <thead>
+              <tr>
+                <th>名称</th>
+                <th>邮箱</th>
+                <th>角色</th>
+                <th>状态</th>
+                {canEdit && <th className="right">操作</th>}
               </tr>
-            ))}
-          </tbody>
-        </DataTable>
+            </thead>
+            <tbody>
+              {memberTable.rows.map((m) => (
+                <tr key={m.id}>
+                  <td className="font-medium">{m.display_name || "—"}</td>
+                  <td className="text-text-2">{m.email}</td>
+                  <td>
+                    <span className="tag">{ROLE_LABEL[m.role] ?? m.role}</span>
+                  </td>
+                  <td>
+                    <Lamp state={m.disabled ? "disabled" : "applied"}>{m.disabled ? "已停用" : "正常"}</Lamp>
+                  </td>
+                  {canEdit && (
+                    <td className="right">
+                      <div className="tn-actions justify-end">
+                        {m.disabled ? (
+                          <Button
+                            size="sm"
+                            type="button"
+                            disabled={busy === m.id}
+                            busy={busy === m.id}
+                            busyLabel="启用"
+                            onClick={() => void toggle(m)}
+                          >
+                            启用
+                          </Button>
+                        ) : (
+                          <TwoStep
+                            label="停用"
+                            size="sm"
+                            disabled={busy === m.id}
+                            busy={busy === m.id}
+                            onConfirm={() => void toggle(m)}
+                          />
+                        )}
+                      </div>
+                      {rowError?.id === m.id && <Failure error={rowError.error} />}
+                    </td>
+                  )}
+                </tr>
+              ))}
+            </tbody>
+          </DataTable>
+          <RecordPager table={memberTable} label="成员" />
+        </>
         </div>
       )}
     </section>
@@ -1642,6 +1662,9 @@ function KeysPart({
 }) {
   const [editing, setEditing] = useState<string | null>(null);
   const columns = canEdit ? 6 : 5;
+  const [keyStatus, setKeyStatus] = useState("");
+  const [keyGroup, setKeyGroup] = useState("");
+  const keyTable = useRecordTable({ items: (keys ?? []).filter((k) => (!keyStatus || (k.effective_disabled ? "disabled" : "enabled") === keyStatus) && (!keyGroup || k.group?.name === keyGroup)), searchText: (k) => [...keySearchText(k), k.member_id ? members?.find((m) => m.id === k.member_id)?.email ?? k.member_id : "租户共用"], resetKey: `${tenant.id}:${keyStatus}:${keyGroup}` });
   const ownerOf = (k: AdminKey) =>
     k.member_id ? (members?.find((m) => m.id === k.member_id)?.email ?? "成员") : "租户共用";
 
@@ -1662,78 +1685,82 @@ function KeysPart({
         <p className="status-line">该租户还没有密钥。</p>
       ) : (
         <div className="tn-bleed">
-        <DataTable label="密钥">
-          <thead>
-            <tr>
-              <th>名称</th>
-              <th>前缀</th>
-              <th>成员</th>
-              <th>分组</th>
-              <th>状态</th>
-              {canEdit && <th className="right">操作</th>}
-            </tr>
-          </thead>
-          <tbody>
-            {keys.map((k) => (
-              <Fragment key={k.id}>
-                <tr>
-                  <td className="font-medium">{k.label}</td>
-                  <td>
-                    <code>{k.prefix}…</code>
-                  </td>
-                  <td className="text-text-2">{ownerOf(k)}</td>
-                  <td>
-                    <KeyGroupCell k={k} />
-                    <StrayNote k={k} tenant={tenant} />
-                  </td>
-                  <td>
-                    {k.effective_disabled ? (
-                      <>
-                        <Lamp state="disabled">已停用</Lamp>
-                        <span className="tn-note">{whyOff(k, tenant, members)}</span>
-                      </>
-                    ) : (
-                      <Lamp state="applied">正常</Lamp>
-                    )}
-                  </td>
-                  {canEdit && (
-                    <td className="right">
-                      {k.group === null && (
-                        <Button
-                          size="sm"
-                          type="button"
-                          aria-expanded={editing === k.id}
-                          onClick={() => setEditing(editing === k.id ? null : k.id)}
-                        >
-                          选择分组
-                        </Button>
+        <>
+          <RecordTools table={keyTable} label="密钥"><label className="f filter"><span>密钥状态</span><select aria-label="密钥状态" value={keyStatus} onChange={(e) => setKeyStatus(e.target.value)}><option value="">全部</option><option value="enabled">可用</option><option value="disabled">停用</option></select></label><label className="f filter"><span>密钥分组</span><select aria-label="密钥分组" value={keyGroup} onChange={(e) => setKeyGroup(e.target.value)}><option value="">全部</option>{choices.map((g) => <option key={g.name} value={g.name}>{g.display_name}</option>)}</select></label></RecordTools>
+          <DataTable label="密钥">
+            <thead>
+              <tr>
+                <th>名称</th>
+                <th>前缀</th>
+                <th>成员</th>
+                <th>分组</th>
+                <th>状态</th>
+                {canEdit && <th className="right">操作</th>}
+              </tr>
+            </thead>
+            <tbody>
+              {keyTable.rows.map((k) => (
+                <Fragment key={k.id}>
+                  <tr>
+                    <td className="font-medium">{k.label}</td>
+                    <td>
+                      <code>{k.prefix}…</code>
+                    </td>
+                    <td className="text-text-2">{ownerOf(k)}</td>
+                    <td>
+                      <KeyGroupCell k={k} />
+                      <StrayNote k={k} tenant={tenant} />
+                    </td>
+                    <td>
+                      {k.effective_disabled ? (
+                        <>
+                          <Lamp state="disabled">已停用</Lamp>
+                          <span className="tn-note">{whyOff(k, tenant, members)}</span>
+                        </>
+                      ) : (
+                        <Lamp state="applied">正常</Lamp>
                       )}
                     </td>
-                  )}
-                </tr>
-                {editing === k.id && (
-                  <tr className="dt-detail">
-                    <td colSpan={columns}>
-                      <ChooseGroup
-                        k={k}
-                        choices={choices}
-                        onSaved={(saved) => {
-                          setEditing(null);
-                          onSaved(saved);
-                        }}
-                        onCancel={() => setEditing(null)}
-                        onReload={() => {
-                          setEditing(null);
-                          onReload();
-                        }}
-                      />
-                    </td>
+                    {canEdit && (
+                      <td className="right">
+                        {k.group === null && (
+                          <Button
+                            size="sm"
+                            type="button"
+                            aria-expanded={editing === k.id}
+                            onClick={() => setEditing(editing === k.id ? null : k.id)}
+                          >
+                            选择分组
+                          </Button>
+                        )}
+                      </td>
+                    )}
                   </tr>
-                )}
-              </Fragment>
-            ))}
-          </tbody>
-        </DataTable>
+                  {editing === k.id && (
+                    <tr className="dt-detail">
+                      <td colSpan={columns}>
+                        <ChooseGroup
+                          k={k}
+                          choices={choices}
+                          onSaved={(saved) => {
+                            setEditing(null);
+                            onSaved(saved);
+                          }}
+                          onCancel={() => setEditing(null)}
+                          onReload={() => {
+                            setEditing(null);
+                            onReload();
+                          }}
+                        />
+                      </td>
+                    </tr>
+                  )}
+                </Fragment>
+              ))}
+            </tbody>
+          </DataTable>
+          <RecordPager table={keyTable} label="密钥" />
+        </>
         </div>
       )}
     </section>

@@ -9,6 +9,114 @@ use support::world::{deliver, price, seed_key, seed_model, seed_tenant, usage, w
 use support::Resp;
 use uuid::Uuid;
 
+#[tokio::test]
+async fn p99_keeps_null_zero_small_samples_and_full_range_percentiles() {
+    let Some(w) = world().await else { return };
+    let model = seed_model(&w.cp, &w.admin).await;
+    let owner = w.cp.member_login_seeded(w.tenant, MemberRole::Owner).await;
+    let empty =
+        w.cp.send("GET", "/api/usage/metrics", Some(owner.cookie()), None)
+            .await;
+    for field in [
+        "first_token_latency_ms",
+        "response_latency_ms",
+        "attempt_duration_ms",
+    ] {
+        // 显式存在性使删字段不能冒充 null；空样本不能填成测得零。
+        let value = totals(&empty)[field].get("p99").expect("P99 字段必须存在");
+        assert!(value.is_null(), "{field}: {value}");
+    }
+    let from = DateTime::from_timestamp(Utc::now().timestamp().div_euclid(3600) * 3600, 0)
+        .expect("time")
+        - TimeDelta::hours(3);
+    let mut rows = Vec::new();
+    for (index, (ttft, response, attempt)) in [(0, 10, 100), (100, 20, 200), (1000, 30, 300)]
+        .into_iter()
+        .enumerate()
+    {
+        let mut row = event(
+            &w,
+            &format!("p99-{index}"),
+            model,
+            json!({
+                "first_token_latency_ms": ttft, "downstream_latency_ms": response, "upstream_latency_ms": attempt,
+            }),
+        );
+        row["occurred_at"] = json!((from + TimeDelta::hours(index as i64)).to_rfc3339());
+        rows.push(row);
+    }
+    let mut missing = event(&w, "p99-missing", model, json!({}));
+    missing["occurred_at"] = json!((from + TimeDelta::hours(2)).to_rfc3339());
+    rows.push(missing);
+    intake(&w, rows).await;
+    let query = |start: DateTime<Utc>, end: DateTime<Utc>| {
+        format!(
+            "/api/usage/metrics?from={}&to={}&bucket=hour",
+            start.to_rfc3339_opts(SecondsFormat::Secs, true),
+            end.to_rfc3339_opts(SecondsFormat::Secs, true)
+        )
+    };
+    let response =
+        w.cp.send(
+            "GET",
+            &query(from, from + TimeDelta::hours(3)),
+            Some(owner.cookie()),
+            None,
+        )
+        .await;
+    let t = totals(&response);
+    near(
+        t["first_token_latency_ms"]
+            .get("p99")
+            .expect("完整范围 P99"),
+        982.0,
+    );
+    near(t["response_latency_ms"].get("p99").expect("响应 P99"), 29.8);
+    near(
+        t["attempt_duration_ms"].get("p99").expect("尝试 P99"),
+        298.0,
+    );
+    assert_eq!(t["first_token_latency_ms"]["sample_count"], 3);
+    assert_eq!(t["first_token_latency_ms"]["missing_count"], 1);
+    // 三个桶分别只有 0/100/1000；平均桶的 P99 会错误地变成 366.67。
+    near(
+        &response.body["models"][0]["first_token_latency_ms"]["p99"],
+        982.0,
+    );
+    near(
+        &response.body["series"][0]["first_token_latency_ms"]["p99"],
+        0.0,
+    );
+    let small =
+        w.cp.send(
+            "GET",
+            &query(from + TimeDelta::hours(1), from + TimeDelta::hours(3)),
+            Some(owner.cookie()),
+            None,
+        )
+        .await;
+    near(
+        totals(&small)["first_token_latency_ms"]
+            .get("p99")
+            .expect("小样本 P99"),
+        991.0,
+    );
+    let zero =
+        w.cp.send(
+            "GET",
+            &query(from, from + TimeDelta::hours(1)),
+            Some(owner.cookie()),
+            None,
+        )
+        .await;
+    near(
+        totals(&zero)["first_token_latency_ms"]
+            .get("p99")
+            .expect("实测零 P99"),
+        0.0,
+    );
+}
+
 async fn intake(w: &World, events: Vec<Value>) {
     for batch in events.chunks(500) {
         let response = deliver(&w.dp, Uuid::new_v4(), batch.to_vec()).await;
@@ -445,6 +553,69 @@ async fn positive_unpriced_usage_and_unknown_outcomes_have_explicit_coverage() {
     near(&t["success_rate"], 1.0);
     assert_eq!(t["unpriced_attempts"], 1, "正token且无价格不能当免费");
     assert_eq!(t["charged_micro_cny"], "0");
+}
+
+#[tokio::test]
+async fn beijing_day_buckets_cross_week_year_and_leap_day_at_sixteen_utc() {
+    let Some(w) = world().await else { return };
+    let model = seed_model(&w.cp, &w.admin).await;
+    let owner = w.cp.member_login_seeded(w.tenant, MemberRole::Owner).await;
+    for (case, midnight) in [
+        ("week", "2026-11-08T16:00:00Z"),
+        ("year", "2025-12-31T16:00:00Z"),
+        ("leap", "2024-02-28T16:00:00Z"),
+    ] {
+        let midnight = DateTime::parse_from_rfc3339(midnight)
+            .expect("北京时间午夜")
+            .with_timezone(&Utc);
+        let from = midnight - TimeDelta::seconds(1);
+        let to = midnight + TimeDelta::days(2);
+        let mut rows = Vec::new();
+        for (suffix, at) in [
+            ("before-from", from - TimeDelta::nanoseconds(1)),
+            ("at-from", from),
+            ("at-midnight", midnight),
+            ("after-midnight", midnight + TimeDelta::minutes(5)),
+            ("at-to", to),
+        ] {
+            let mut e = event(&w, &format!("{case}-{suffix}"), model, json!({}));
+            e["occurred_at"] = json!(at.to_rfc3339_opts(SecondsFormat::Nanos, true));
+            rows.push(e);
+        }
+        intake(&w, rows).await;
+        let range = format!(
+            "from={}&to={}&bucket=day",
+            from.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            to.to_rfc3339_opts(SecondsFormat::Nanos, true),
+        );
+        for (path, cookie) in [
+            ("/api/usage/metrics".to_string(), owner.cookie()),
+            ("/admin/usage/metrics".to_string(), w.admin.cookie()),
+            (
+                format!("/admin/tenants/{}/usage/metrics", w.tenant),
+                w.admin.cookie(),
+            ),
+        ] {
+            let r =
+                w.cp.send("GET", &format!("{path}?{range}"), Some(cookie), None)
+                    .await;
+            assert_eq!(totals(&r)["requests"], 3, "左闭右开：{case} {path}");
+            let series = r.body["series"].as_array().expect("完整日桶");
+            assert_eq!(series.len(), 3, "{case} {path}: {r:?}");
+            for (index, expected_requests) in [1, 2, 0].into_iter().enumerate() {
+                let start = midnight + TimeDelta::days(index as i64 - 1);
+                assert_eq!(
+                    series[index]["period_start"],
+                    start.to_rfc3339_opts(SecondsFormat::Secs, true),
+                    "北京时间日桶需在16Z开始：{case} {path}"
+                );
+                assert_eq!(
+                    series[index]["requests"], expected_requests,
+                    "{case} {path}: {r:?}"
+                );
+            }
+        }
+    }
 }
 
 #[tokio::test]

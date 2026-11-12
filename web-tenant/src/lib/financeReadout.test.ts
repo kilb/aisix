@@ -60,7 +60,7 @@ test("实际可用额度分别保留不限、零与未知，不丢失精确值",
   assert.match(text(render("9007199254740993")), /现在还能花¥9,007,199,254\.740993/);
 });
 
-test("约束层级标记绑定方，卡编号对辅助技术隐藏", () => {
+test("约束层级标记绑定方，标题不携带无语义编号", () => {
   const markup = readout({
     effectiveMicroCny: "0",
     binding: "key",
@@ -69,7 +69,8 @@ test("约束层级标记绑定方，卡编号对辅助技术隐藏", () => {
       { level: "key", label: "密钥", remainingMicroCny: 0 },
     ],
   });
-  assert.match(markup, /<h2[^>]*><span aria-hidden="true">02<\/span><span>可用额度<\/span><\/h2>/);
+  assert.match(markup, /<h2[^>]*><span>可用额度<\/span><\/h2>/);
+  assert.doesNotMatch(markup, /aria-hidden="true">02<\/span>/);
   assert.match(markup, /data-level="organization" data-binding="false"/);
   assert.match(markup, /data-level="key" data-binding="true"/);
   assert.equal((text(markup).match(/以此为准/g) ?? []).length, 1);

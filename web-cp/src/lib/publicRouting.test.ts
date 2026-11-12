@@ -9,12 +9,25 @@ const DEFAULT = "round_robin";
 test("a model that set nothing shows the gateway's strategy and empty fields", () => {
   assert.deepEqual(draftOf({}, DEFAULT), {
     strategy: DEFAULT,
+    affinity: "default",
     retries: "",
     maxFallbacks: "",
     retryOn429: false,
     statuses: "",
     whenAllUnavailable: "",
   });
+});
+
+test("API key affinity is explicit and is removed when another strategy is selected", () => {
+  const stored = { strategy: "consistent_hash", hash_on: [{ type: "header", name: "x-session" }] };
+  const draft = draftOf(stored, DEFAULT);
+  assert.equal(draft.affinity, "custom");
+  draft.affinity = "api_key";
+  assert.deepEqual(routingBody(draft, stored, DEFAULT, []), {
+    strategy: "consistent_hash", hash_on: [{ type: "api_key" }],
+  });
+  draft.strategy = "failover";
+  assert.deepEqual(routingBody(draft, stored, DEFAULT, []), { strategy: "failover" });
 });
 
 test("a stored setting is shown as it was stored", () => {

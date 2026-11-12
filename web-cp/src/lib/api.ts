@@ -617,11 +617,12 @@ export const audit = {
    * One page, newest first, at the control plane's own page size. `before`
    * is the previous page's `next_before`; the filters narrow every page.
    */
-  async list(q: { before?: number; target_kind?: string; tenant_id?: string }): Promise<AuditPage> {
+  async list(q: { before?: number; target_kind?: string; tenant_id?: string; limit?: number }): Promise<AuditPage> {
     const params = new URLSearchParams();
     if (q.before !== undefined) params.set("before", String(q.before));
     if (q.target_kind) params.set("target_kind", q.target_kind);
     if (q.tenant_id) params.set("tenant_id", q.tenant_id);
+    if (q.limit !== undefined) params.set("limit", String(q.limit));
     const query = params.toString();
     return (await call<AuditPage>("GET", `/admin/audit${query ? `?${query}` : ""}`)).data;
   },
@@ -949,12 +950,14 @@ export const topups = {
     origin?: Topup["origin"];
     tenant_id?: string;
     before?: number;
+    limit?: number;
   }): Promise<{ items: Topup[]; next_before: number | null }> {
     const params = new URLSearchParams();
     if (q.status) params.set("status", q.status);
     if (q.origin) params.set("origin", q.origin);
     if (q.tenant_id) params.set("tenant_id", q.tenant_id);
     if (q.before !== undefined) params.set("before", String(q.before));
+    if (q.limit !== undefined) params.set("limit", String(q.limit));
     const query = params.toString();
     return (
       await call<{ items: Topup[]; next_before: number | null }>("GET", `/admin/billing/topups${query ? `?${query}` : ""}`)
@@ -1062,6 +1065,7 @@ export interface ChargeFilter {
   error_code?: string;
   event_id?: string;
   before?: number;
+  limit?: number;
 }
 
 /** The per-call charges, newest first. */
@@ -1153,8 +1157,11 @@ export interface RepricingFilterInput {
 /** Re-pricing: correcting past charges at the prices in force now. */
 export const repricing = {
   /** One page of runs, newest first; `before` is the previous page's `next_before`. */
-  async list(before?: number): Promise<{ items: RepricingRun[]; next_before: number | null }> {
-    const query = before === undefined ? "" : `?before=${before}`;
+  async list(before?: number, limit?: number): Promise<{ items: RepricingRun[]; next_before: number | null }> {
+    const params = new URLSearchParams();
+    if (before !== undefined) params.set("before", String(before));
+    if (limit !== undefined) params.set("limit", String(limit));
+    const query = params.size ? `?${params}` : "";
     return (await call<{ items: RepricingRun[]; next_before: number | null }>("GET", `/admin/billing/repricing${query}`)).data;
   },
   /** Prices the selected calls again and stores the run as `previewed`. Posts nothing. */
@@ -1463,7 +1470,7 @@ export interface LibraryEntry {
 
 export interface LibraryPage {
   library: LibraryMeta | null;
-  /** How many entries match the search; `items` is the first page of them. */
+  /** How many entries match the search; `items` is the requested page. */
   total: number;
   items: LibraryEntry[];
 }
@@ -1510,10 +1517,11 @@ export interface SyncRequestItem {
 
 export const library = {
   /** The library in use and the entries matching `q` (name, id, alias or provider). */
-  async browse(q: string, limit?: number): Promise<LibraryPage> {
+  async browse(q: string, limit?: number, offset?: number): Promise<LibraryPage> {
     const params = new URLSearchParams();
     if (q.trim()) params.set("q", q.trim());
     if (limit !== undefined) params.set("limit", String(limit));
+    if (offset !== undefined) params.set("offset", String(offset));
     const query = params.toString();
     return (await call<LibraryPage>("GET", `/admin/pricing/library${query ? `?${query}` : ""}`)).data;
   },
@@ -1709,6 +1717,7 @@ export interface ServedBy {
   priority: number;
   weight: number;
   enabled: boolean;
+  cooldown?: CooldownSettings | null;
 }
 
 /**
@@ -1723,9 +1732,11 @@ export interface PublicModel {
   /**
    * The routing settings the operator set on the model's routing document, as
    * stored: `{}` when none, and never `targets`, which come from `served_by`.
-   * A key that is absent means the gateway's own default.
+   * 缺省策略遵循公共模型生成器，其余缺省项遵循网关默认；真实生成值见 effective_routing。
    */
   routing: PublicModelRouting;
+  /** 从当前生成资源读回；没有在用的路由文档时为 null。 */
+  effective_routing?: PublicModelRouting | null;
   /**
    * Selected-scope tenants whose list names it: what refuses a removal
    * (`409 public_model_in_use`). An all-scope tenant is never counted here;
@@ -1771,6 +1782,17 @@ export interface ChannelModel {
   weight: number;
   enabled: boolean;
   served: boolean;
+  cooldown?: CooldownSettings | null;
+}
+
+export interface CooldownSettings {
+  enabled?: boolean;
+  default_seconds?: number;
+  max_seconds?: number;
+  honor_retry_after?: boolean;
+  trigger_statuses?: number[];
+  trigger_on_timeout?: boolean;
+  trigger_on_transport?: boolean;
 }
 
 /**
@@ -1856,7 +1878,7 @@ export const channelModels = {
   async put(
     providerKeyId: string,
     publicModelId: string,
-    body: { upstream_model?: string | null; priority?: number; weight?: number; enabled?: boolean },
+    body: { upstream_model?: string | null; priority?: number; weight?: number; enabled?: boolean; cooldown?: CooldownSettings | null },
   ): Promise<ChannelModelSaved> {
     return (
       await call<ChannelModelSaved>(

@@ -15,10 +15,10 @@
   height: 100dvh;
   min-height: 0;
   flex-direction: column;
-  gap: 24px;
-  padding: 24px 16px;
+  gap: 16px;
+  padding: 20px 12px;
   border: 0;
-  border-right: 1px solid var(--line);
+  border-right: 1px solid var(--border);
   background: var(--card);
   color: var(--foreground);
 }
@@ -41,7 +41,10 @@
 
 .shell-sidebar-context {
   flex: none;
-  padding: 0 12px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-input);
+  background: var(--background);
   color: var(--ink-soft);
   font-size: var(--text-meta);
   line-height: 1.5;
@@ -51,11 +54,13 @@
   flex-direction: column;
   align-items: flex-start;
   justify-content: flex-start;
-  gap: 12px;
+  gap: 8px;
   font-size: var(--text-meta);
 }
 .shell-sidebar-context .fleet { gap: 6px; }
 .shell-sidebar-context .org-name { font-size: var(--text-body); }
+.shell-route-group { padding: 12px 12px 6px; color: var(--muted-foreground); font-size: 12px; font-weight: 500; line-height: 1.4; }
+.shell-route-item:first-child .shell-route-group { padding-top: 4px; }
 
 .shell-sidebar-navigation {
   min-height: 0;
@@ -95,11 +100,12 @@
 }
 .shell-route-stop:hover { background: var(--well); color: var(--foreground); }
 .shell-route-stop[aria-selected="true"] {
-  border-color: var(--line);
-  background: var(--well);
-  color: var(--foreground);
-  font-weight: 500;
+  border-color: transparent;
+  background: var(--info-soft);
+  color: var(--brand);
+  font-weight: 600;
 }
+.shell-route-stop[aria-selected="true"]::before { content: ""; position: absolute; left: 0; top: 12px; bottom: 12px; width: 3px; border-radius: 2px; background: var(--brand); }
 .shell-route-stop:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
 .shell-route-icon { width: 18px; height: 18px; flex: none; }
 .shell-route-stop .stop-name { min-width: 0; overflow-wrap: anywhere; }
@@ -136,14 +142,14 @@
   top: 0;
   z-index: 30;
   display: flex;
-  min-height: 76px;
+  min-height: 64px;
   flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 12px 24px;
-  padding: 16px 28px;
+  padding: 10px 28px;
   border-bottom: 1px solid var(--line);
-  background: var(--background);
+  background: var(--card);
 }
 .shell-view-location { display: flex; min-width: 0; align-items: center; gap: 12px; }
 .shell-location-text { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
@@ -195,4 +201,19 @@
   .sidebar-shell .shell-content { padding: 20px 16px 40px; }
   .sidebar-shell .shell-note { margin-inline: 16px; }
   .shell-current-context { max-width: 21ch; }
+}
+
+/* 个人身份同时提供账号设置入口，抽屉里沿用同一交互。 */
+.shell-sidebar-footer .shell-account-link {
+  width: 100%; min-width: 0; padding: 8px; border: 1px solid transparent;
+  border-radius: var(--r-input); background: transparent; color: var(--foreground); text-align: left; cursor: pointer;
+}
+.shell-account-link:hover { background: var(--well); }
+.shell-account-link[aria-current="page"] { background: var(--info-soft); border-color: var(--brand); }
+.shell-account-link:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+.shell-account-caption { grid-column: 2; color: var(--muted-foreground); font-size: 12px; line-height: 1.5; }
+@media (max-width: 719px) {
+  .cp-account-label, .cp-theme-label { display: none; }
+  .sidebar-shell .shell-view-header { flex-wrap: nowrap; }
+  .sidebar-shell .shell-user-tools { flex-wrap: nowrap; gap: 0; }
 }

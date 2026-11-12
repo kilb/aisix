@@ -30,9 +30,9 @@ use serde_json::{json, Value};
 use crate::auth::{MemberRole, OperatorRole, KEY_HOLDERS};
 use crate::error::{ApiError, Detail};
 use crate::{
-    audit, billing, channels, dp, gateways, groups, keys, member_usage, members, model_probes,
-    operators, pricing, projector, resources, rollout, tenants, upstream_models, usage,
-    usage_metrics, AppState,
+    audit, billing, channels, dp, gateways, groups, keys, member_usage, members,
+    model_probe_history, model_probes, operators, pricing, projector, resources, rollout, tenants,
+    upstream_models, usage, usage_metrics, AppState,
 };
 
 /// The largest request body either listener reads.
@@ -283,6 +283,11 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
         "POST",
         "/admin/models/{id}/probe",
         MinRole::Op(OperatorRole::Admin),
+    ),
+    (
+        "GET",
+        "/admin/model-probes",
+        MinRole::Op(OperatorRole::Viewer),
     ),
     // The tenant API.
     ("POST", "/api/signup", MinRole::Public),
@@ -832,6 +837,7 @@ pub fn browser_router(state: AppState) -> Router {
             get(upstream_models::list),
         )
         .route("/admin/models/{id}/probe", post(model_probes::probe))
+        .route("/admin/model-probes", get(model_probe_history::list))
         .route("/api/signup", post(members::signup))
         .route("/api/login", post(members::login))
         .route("/api/logout", post(members::logout))

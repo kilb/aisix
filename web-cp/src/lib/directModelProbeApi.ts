@@ -30,3 +30,37 @@ export async function probeDirectModel(id: string, capabilityCheck = false): Pro
     throw error;
   }
 }
+
+export interface ProbeHistoryQuery {
+  model_id?: string;
+  mode?: "baseline" | "capability";
+  status?: DirectProbeResult["status"];
+  latest?: boolean;
+  before?: string;
+  limit?: number;
+  from?: string;
+  to?: string;
+}
+export interface ProbeHistoryPage {
+  items: import("./directModelProbe").DirectProbeHistory[];
+  next_before: string | null;
+}
+
+/** 只读存档；筛选和游标均由服务端处理，不产生任何模型调用。 */
+export async function listProbeHistory(query: ProbeHistoryQuery = {}, signal?: AbortSignal): Promise<ProbeHistoryPage> {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(query)) if (value !== undefined) params.set(key, String(value));
+  return (await call<ProbeHistoryPage>("GET", `/admin/model-probes?${params}`, undefined, undefined, signal)).data;
+}
+
+/** 最新结果同样遍历真实游标，目标超过一页也不会遗漏。 */
+export async function latestProbeHistory(signal?: AbortSignal): Promise<import("./directModelProbe").DirectProbeHistory[]> {
+  const records: import("./directModelProbe").DirectProbeHistory[] = [];
+  let before: string | undefined;
+  do {
+    const page = await listProbeHistory({ latest: true, limit: 100, before }, signal);
+    records.push(...page.items);
+    before = page.next_before ?? undefined;
+  } while (before && !signal?.aborted);
+  return records;
+}

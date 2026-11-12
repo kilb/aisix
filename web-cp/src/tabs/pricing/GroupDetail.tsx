@@ -15,11 +15,14 @@ import {
 } from "../../lib/api";
 import { messageFor, problemAt } from "../../lib/errors";
 import { errorText, fmtInt } from "../../lib/fmt";
-import { fmtCnyPerMillion, fmtMicroCny, fmtUtc } from "../../lib/money";
+import { fmtCnyPerMillion, fmtMicroCny } from "../../lib/money";
+import { fmtBeijing } from "../../lib/time";
 import { BaselineSourceBadge } from "./Baselines";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
 import { EmptyState } from "../../ui/EmptyState";
+import { useRecordTable } from "../../lib/recordTable";
+import { RecordTablePager, RecordTableToolbar } from "../../ui/RecordTable";
 import { Field, useRefusalFocus } from "../../ui/Field";
 import { TwoStep } from "../../ui/TwoStep";
 import { useToast } from "../../ui/Toast";
@@ -69,7 +72,7 @@ type Plan = {
 
 /** A plan's scheduled revisions, as their starts and what takes effect then. */
 export function scheduledWords(plan: Plan, word: string): string {
-  return plan.upcoming.map((r) => `${fmtUtc(r.effective_from)} 起${word} ${r.cny_per_usd ?? "结束覆盖"}`).join("、");
+  return plan.upcoming.map((r) => `${fmtBeijing(r.effective_from)} 起${word} ${r.cny_per_usd ?? "结束覆盖"}`).join("、");
 }
 
 /** The rate a row shows: the model's override while one is in force, else the default. */
@@ -137,6 +140,12 @@ export function GroupDetail({
     const bp = prices.get(b.model_id)?.baseline.current ? 1 : 0;
     return ap - bp || a.name.localeCompare(b.name);
   }) : [];
+  const [priceState, setPriceState] = useState("");
+  const records = useRecordTable({
+    items: rows.filter((row) => priceState === "" || (priceState === "baseline" ? Boolean(prices.get(row.model_id)?.baseline.current) : priceState === "missing" ? !prices.get(row.model_id)?.baseline.current : row.rate.current?.cny_per_usd != null)),
+    searchText: (row) => [row.name, row.model_id],
+    resetKey: `${group.id}/${priceState}`,
+  });
 
   const forms =
     canEdit && rates ? (
@@ -226,6 +235,10 @@ export function GroupDetail({
           ) : rows.length === 0 ? (
             <EmptyState text="还没有模型。先在「价格 → 公共模型」中新建公共模型，或在「上游账号 → 模型」中获取上游模型。" />
           ) : (
+            <>
+            <RecordTableToolbar search={{ value: records.query, onChange: records.setQuery, label: "搜索分组模型", placeholder: "模型名称或 ID" }}>
+              <label className="f filter"><span>价格状态</span><select value={priceState} onChange={(e) => setPriceState(e.target.value)}><option value="">全部</option><option value="baseline">已有基准价</option><option value="missing">缺少基准价</option><option value="override">已设单模型覆盖</option></select></label>
+            </RecordTableToolbar>
             <DataTable label="分组换算率">
               <thead>
                 <tr>
@@ -241,7 +254,8 @@ export function GroupDetail({
                 </tr>
               </thead>
               <tbody>
-                {rows.map((row) => {
+                {records.rows.length === 0 && <tr><td colSpan={9}><EmptyState text="没有符合筛选条件的模型" /></td></tr>}
+                {records.rows.map((row) => {
                   const price = prices.get(row.model_id)?.groups.find((g) => g.group_id === group.id);
                   const baseline = prices.get(row.model_id)?.baseline.current ?? null;
                   const rate = inForce(row.rate, rates.default);
@@ -294,6 +308,8 @@ export function GroupDetail({
                 })}
               </tbody>
             </DataTable>
+            <RecordTablePager page={records.page} pageSize={records.pageSize} onPageChange={records.setPage} onPageSizeChange={records.setPageSize} total={records.filteredCount} label="分组模型换算率分页" />
+            </>
           )}
         </Card>
       </WithForms>
@@ -326,7 +342,7 @@ function DefaultRate({ group, plan, onSaved }: { group: Group; plan: RatePlan; o
         groups.writeRate(group.id, { model_id: null, cny_per_usd: rate, effective_from }),
       );
       if (sent === "invalid") {
-        setDetails([{ path: "/effective_from", message: "生效时间应写成 年-月-日 时:分，按 UTC 计" }]);
+        setDetails([{ path: "/effective_from", message: "生效时间应写成 年-月-日 时:分，按北京时间计" }]);
         focusRefusal();
         return;
       }
@@ -448,7 +464,7 @@ function ModelRate({
         }),
       );
       if (sent === "invalid") {
-        setDetails([{ path: "/effective_from", message: "生效时间应写成 年-月-日 时:分，按 UTC 计" }]);
+        setDetails([{ path: "/effective_from", message: "生效时间应写成 年-月-日 时:分，按北京时间计" }]);
         focusRefusal();
         return;
       }

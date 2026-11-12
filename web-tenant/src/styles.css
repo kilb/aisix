@@ -1,5 +1,4 @@
-/* 组织门户暖石外壳；共享控件与令牌由设计系统维护。
-   顶部文字导航在窄屏独立横滚，页面本身不横滚。 */
+/* 组织门户采用共享中性外壳与语义令牌；侧栏在窄屏转为抽屉。 */
 .brand-mark {
   position: relative;
   flex: none;
@@ -16,7 +15,7 @@
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: var(--bento-accent);
+  background: var(--brand-dot);
 }
 .boot,
 .centered {
@@ -528,3 +527,19 @@
   .bento-page-header { gap: 12px; margin-bottom: 20px; }
   .bento-page-header > :first-child { flex-basis: 100%; }
 }
+
+/* 账号设置使用资料与安全两栏；移动端按任务顺序纵向排列。 */
+.account-settings-grid { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); align-items: start; gap: 24px; }
+.account-settings-grid > .panel { margin: 0; }
+.account-profile-list { display: block; }
+.account-profile-list dd { overflow-wrap: anywhere; }
+.account-password-form { display: grid; gap: 16px; max-width: 560px; }
+.account-password-form > .field { margin: 0; }
+.account-form-actions { display: flex; justify-content: flex-start; gap: 8px; padding-top: 8px; }
+.account-session { grid-column: 1 / -1; }
+.account-session .bento-card-header { align-items: center; }
+.bento-card-index { display: none; }
+.bento-page-header .font-mono, .bento-card-header .font-mono, .bento-stat .font-mono { font-family: var(--font-sans); letter-spacing: 0; }
+.metric { font-weight: 500; }
+@media (max-width: 899px) { .account-settings-grid { grid-template-columns: minmax(0, 1fr); gap: 16px; } }
+@media (max-width: 719px) { .panel { --pad: 16px; } }

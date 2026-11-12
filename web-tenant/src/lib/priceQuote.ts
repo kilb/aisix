@@ -16,6 +16,8 @@ export interface TierQuote {
 }
 
 export interface QuotedModel extends PricedModel {
+  cny_per_usd: string;
+  effective_multiplier: string;
   prices_by_tier: Record<string, TierQuote>;
 }
 

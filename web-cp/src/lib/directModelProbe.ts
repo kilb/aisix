@@ -142,3 +142,42 @@ export async function runDirectProbeBatch({ targets, signal, probe, onUpdate }: 
   }
   await Promise.all(Array.from({ length: Math.min(3, targets.length) }, () => worker()));
 }
+
+/** 历史 id/配置版本按十进制字符串传输，不经 JS number。 */
+export interface DirectProbeHistory {
+  id: string;
+  model_id: string;
+  provider_key_id: string | null;
+  model_version: string;
+  provider_key_version: string | null;
+  target: { name: string; account: string | null };
+  actor: { id: string; email: string | null };
+  mode: "baseline" | "capability";
+  started_at: string;
+  finished_at: string | null;
+  state: "running" | "completed" | "interrupted";
+  stale: boolean;
+  result: DirectProbeResult | null;
+}
+
+export interface DirectProbeRow {
+  target: DirectProbeTarget;
+  status: "not_tested" | "running" | DirectProbeResult["status"];
+  result: DirectProbeResult | null;
+  error: string | null;
+  history: DirectProbeHistory | null;
+}
+
+/** 每条记录保留同一轮基础与能力结果，不借用其它轮次填空。 */
+export function savedProbeRows(targets: readonly DirectProbeTarget[], records: readonly DirectProbeHistory[]): DirectProbeRow[] {
+  const saved = new Map<string, DirectProbeHistory>();
+  for (const record of records) if (!saved.has(record.model_id)) saved.set(record.model_id, record);
+  return targets.map((target) => {
+    const history = saved.get(target.id) ?? null;
+    return {
+      target, history, result: history?.result ?? null,
+      status: history?.state === "running" ? "running" : history?.result?.status ?? "not_tested",
+      error: history?.state === "interrupted" ? "本次测试中断，未取得最终结果；已发调用仍可能完成。" : null,
+    };
+  });
+}

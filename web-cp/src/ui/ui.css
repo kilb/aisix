@@ -582,7 +582,7 @@ select.select-sm {
 }
 
 /* ── Cards (panels) and the side panel ───────────────────────── */
-/* 暖白卡片仅以细边线分层，不带投影。 */
+/* 面板仅以细边线分层，普通内容不加投影。 */
 .panel {
   min-width: 0;
   --pad: 28px;
@@ -668,55 +668,8 @@ main { counter-reset: bento-card; }
 .bento-metric-skeleton { width: 62%; height: 60px; }
 .bento-chart-skeleton { width: 100%; height: 192px; }
 .bento-card-message { min-width: 0; }
-/* inverse 的固定深底与橙文字不随主题交换，避免橙字落到浅底。 */
-.panel[data-tone="inverse"] {
-  --foreground: var(--bento-surface);
-  --card: var(--bento-ink);
-  --card-foreground: var(--bento-surface);
-  --surface: var(--bento-ink);
-  --surface-raised: var(--bento-ink);
-  --bg: var(--bento-ink);
-  --canvas: var(--bento-ink);
-  --paper: var(--bento-ink);
-  --ink: var(--bento-surface);
-  --popover: var(--bento-ink);
-  --popover-foreground: var(--bento-surface);
-  --secondary: var(--bento-ink);
-  --secondary-foreground: var(--bento-surface);
-  --muted: var(--bento-ink);
-  --accent: var(--bento-ink);
-  --accent-foreground: var(--bento-surface);
-  --well: var(--bento-ink);
-  --stone: var(--bento-graphite);
-  --graphite: var(--bento-inverse-muted);
-  --row-hover: var(--bento-ink);
-  --chip: var(--bento-ink);
-  --info: var(--bento-surface);
-  --success: var(--bento-surface);
-  --warning: var(--bento-surface);
-  --danger: var(--bento-surface);
-  --info-soft: var(--bento-ink);
-  --success-soft: var(--bento-ink);
-  --warning-soft: var(--bento-ink);
-  --danger-soft: var(--bento-ink);
-  --destructive: var(--bento-surface);
-  --destructive-foreground: var(--bento-ink);
-  --link: var(--bento-surface);
-  --error: var(--bento-surface);
-  --text: var(--bento-surface);
-  --text-muted: var(--bento-inverse-muted);
-  --text-2: var(--bento-inverse-muted);
-  --muted-foreground: var(--bento-inverse-muted);
-  --ink-soft: var(--bento-inverse-muted);
-  --primary: var(--bento-surface);
-  --primary-foreground: var(--bento-ink);
-  --input: var(--bento-inverse-muted);
-  --ring: var(--bento-surface);
-  --line: var(--bento-graphite);
-  --border: color-mix(in srgb, var(--bento-surface) 12%, transparent);
-  background: var(--bento-ink);
-  color: var(--bento-surface);
-}
+/* 旧 inverse 标记保留为兼容钩子，运维信息使用同一面板层级。 */
+.panel[data-tone="inverse"] { background: var(--card); color: var(--foreground); }
 @media (max-width: 719px) {
   .bento-page-header { gap: 20px; }
   .bento-page-header h1 { font-size: var(--fs-44); }

@@ -33,7 +33,7 @@ const REVISION = "genai-prices-v2-7de757d";
 interface SnapshotProvider {
   id: string;
   pricing_urls?: string[];
-  models: { id: string; prices: Record<string, number> }[];
+  models: { id: string; name?: string; aliases?: string[]; prices: Record<string, number> }[];
 }
 
 /** What the snapshot says of `provider`'s `model`: its flat input and output prices, and the provider's first page. */
@@ -138,6 +138,59 @@ test("离线上传数据集后，价格库按名称或供应商搜索，显示�
   const rows = page.getByRole("table", { name: "价格库条目" }).getByRole("rowgroup").last().getByRole("row");
   await expect(rows.filter({ hasNotText: /cohere/i })).toHaveCount(0);
   await expect(rows.filter({ has: page.getByRole("cell", { name: "cohere", exact: true }) }).first()).toBeVisible();
+});
+
+test("价格库真正续页，10、25、50条均无重复，搜索从第一页重新开始", async ({ page }) => {
+  const providers = JSON.parse(readFileSync(SNAPSHOT, "utf8")) as SnapshotProvider[];
+  const entries = providers.flatMap((provider) => provider.models.map((model) => ({
+    provider: provider.id,
+    model: model.id,
+    search: [provider.id, model.id, model.name ?? "", ...(model.aliases ?? [])],
+  }))).sort((a, b) => a.provider < b.provider ? -1 : a.provider > b.provider ? 1 : a.model < b.model ? -1 : a.model > b.model ? 1 : 0);
+  expect(entries.length).toBeGreaterThan(100);
+
+  await login(page);
+  await uploadDataset(page);
+  await section(page, "价格库");
+  const table = page.getByRole("table", { name: "价格库条目" });
+  const pager = page.getByRole("navigation", { name: "价格库分页" });
+  const sizeControl = pager.getByLabel("价格库分页每页条数", { exact: true });
+  const readPage = async (action: () => Promise<unknown>, size: number, offset: number, q = "") => {
+    // 真实 HTTP 请求必须携带续页参数，单纯切开已下载的前 N 条无法通过。
+    const received = page.waitForResponse((response) => {
+      const url = new URL(response.url());
+      return url.pathname === "/admin/pricing/library"
+        && url.searchParams.get("limit") === String(size)
+        && url.searchParams.get("offset") === String(offset)
+        && (url.searchParams.get("q") ?? "") === q;
+    });
+    await action();
+    expect((await received).status()).toBe(200);
+  };
+  const expectRows = async (expected: typeof entries) => {
+    const rows = table.locator("tbody > tr");
+    await expect(rows).toHaveCount(expected.length);
+    for (const [index, entry] of expected.entries()) {
+      await expect(rows.nth(index).getByRole("cell").nth(0)).toHaveText(entry.provider);
+      await expect(rows.nth(index).getByRole("cell").nth(1).getByText(entry.model, { exact: true })).toBeVisible();
+    }
+  };
+
+  await expectRows(entries.slice(0, 25));
+  for (const size of [10, 25, 50]) {
+    await readPage(() => sizeControl.selectOption(String(size)), size, 0);
+    await expectRows(entries.slice(0, size));
+    await readPage(() => pager.getByRole("button", { name: "下一页" }).click(), size, size);
+    await expectRows(entries.slice(size, size * 2));
+    await readPage(() => pager.getByRole("button", { name: "上一页" }).click(), size, 0);
+    await expectRows(entries.slice(0, size));
+  }
+  await readPage(() => pager.getByRole("button", { name: "下一页" }).click(), 50, 50);
+  const cohere = entries.filter((entry) => entry.search.some((field) => field.toLowerCase().includes("cohere")));
+  await readPage(() => page.getByLabel("搜索模型", { exact: true }).fill("cohere"), 50, 0, "cohere");
+  await expectRows(cohere.slice(0, 50));
+  await expect(pager.getByRole("button", { name: "上一页" })).toBeDisabled();
+  await expect(pager).toContainText(`共 ${cohere.length.toLocaleString("zh-CN")} 条`);
 });
 
 test("预览同步后一次确认：基准价写入，分组售价按换算率出现", async ({ page }) => {

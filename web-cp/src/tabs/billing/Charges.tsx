@@ -1,16 +1,19 @@
+import { useRecordTable } from "../../lib/recordTable";
+import { RecordTools, RecordPager } from "../../components/RecordTools";
 import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import type { TabProps } from "../../App";
 import { charges, tenants as tenantsApi, type AdminKey, type Charge, type ChargeFilter, type Tenant } from "../../lib/api";
 import { chargeReason } from "../../lib/chargeReason";
 import { errorText } from "../../lib/fmt";
-import { fmtMicroCny, fmtUtc } from "../../lib/money";
+import { fmtMicroCny } from "../../lib/money";
+import { fmtBeijing } from "../../lib/time";
 import { modelText, reasonLabel, takeChargesFilter } from "../../lib/pricingStatus";
 import { chargeFromLines, dimensionLabel, lineUsd, rateText, reportedCounters, usageSummary } from "../../lib/chargeUsage";
 import { usdRateText } from "../../lib/rateUnits";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
 import { EmptyState } from "../../ui/EmptyState";
-import { BentoGrid, Card, CardFooter, CardHeader, PageHeader, span } from "../../components/page";
+import { BentoGrid, Card, CardHeader, PageHeader, span } from "../../components/page";
 import { formatCount } from "../../lib/chartFormat";
 import { cn } from "../../lib/cn";
 
@@ -47,6 +50,7 @@ export function Charges(_props: TabProps) {
   // The charges whose check row is open, by seq.
   const [open, setOpen] = useState<Set<number>>(() => new Set());
   const generation = useRef(0);
+  const table = useRecordTable({ items: rows ?? [], searchText: (c) => [c.event_id, c.model_name ?? "", c.requested_model_id, c.tenant_id], resetKey: JSON.stringify(filter) });
 
   const loadFirst = useCallback(async (f: ChargeFilter) => {
     const g = ++generation.current;
@@ -58,7 +62,7 @@ export function Charges(_props: TabProps) {
     setNext(null);
     setLoadingMore(false);
     try {
-      const page = await charges.list(f);
+      const page = await charges.list({ ...f, limit: 50 });
       if (g !== generation.current) return;
       setRows(page.items);
       setNext(page.next_before);
@@ -94,7 +98,7 @@ export function Charges(_props: TabProps) {
     setLoadingMore(true);
     setError(null);
     try {
-      const page = await charges.list({ ...filter, before: next });
+      const page = await charges.list({ ...filter, before: next, limit: 50 });
       if (g !== generation.current) return;
       setRows((prev) => [...(prev ?? []), ...page.items]);
       setNext(page.next_before);
@@ -230,82 +234,80 @@ export function Charges(_props: TabProps) {
         {rows === null && !error && <Loading />}
         {rows !== null && rows.length === 0 && <EmptyState text="没有符合条件的计费记录。" />}
         {rows !== null && rows.length > 0 && (
-          <DataTable label="计费明细" scroll>
-            <thead>
-              <tr>
-                <th>时间（UTC）</th>
-                <th>租户</th>
-                <th>模型</th>
-                <th>状态</th>
-                <th>原因</th>
-                <th className="num">售价（元）</th>
-                <th className="num">成本（元）</th>
-                <th>档位</th>
-                <th>上游</th>
-                <th>用量</th>
-                <th className="right">
-                  <span className="vh">复核</span>
-                </th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((c) => {
-                const shown = open.has(c.seq);
-                return (
-                  <Fragment key={c.seq}>
-                    <tr>
-                      <td className="tabular text-muted-foreground">{fmtUtc(c.occurred_at)}</td>
-                      <td>{tenantName(c.tenant_id)}</td>
-                      <td className="font-medium">{modelText(c.model_name, c.model_deleted)}</td>
-                      <td>{statusLabel(c.status)}</td>
-                      <td>{chargeReason(c)}</td>
-                      <td className="num">{c.charge_micro_cny === null ? "—" : fmtMicroCny(c.charge_micro_cny)}</td>
-                      <td className="num">{c.cost_micro_cny === null ? "—" : fmtMicroCny(c.cost_micro_cny)}</td>
-                      <td>{c.service_tier ?? "—"}</td>
-                      <td>
-                        <Upstream c={c} />
-                      </td>
-                      <td className="tabular text-caption">{usageSummary(c.usage) ?? "—"}</td>
-                      <td className="right">
-                        <Button
-                          kind="quiet"
-                          size="sm"
-                          aria-expanded={shown}
-                          aria-controls={`charge-check-${c.seq}`}
-                          aria-label={`${shown ? "收起" : "展开"}用量明细 ${c.event_id}`}
-                          onClick={() =>
-                            setOpen((prev) => {
-                              const next = new Set(prev);
-                              if (next.has(c.seq)) next.delete(c.seq);
-                              else next.add(c.seq);
-                              return next;
-                            })
-                          }
-                        >
-                          {shown ? "收起" : "明细"}
-                        </Button>
-                      </td>
-                    </tr>
-                    {shown && (
-                      <tr className="dt-detail" id={`charge-check-${c.seq}`}>
-                        <td colSpan={11}>
-                          <ChargeCheck c={c} />
+          <>
+            <RecordTools table={table} label="计费明细" loaded></RecordTools>
+            <DataTable label="计费明细" scroll>
+              <thead>
+                <tr>
+                  <th>时间（北京时间）</th>
+                  <th>租户</th>
+                  <th>模型</th>
+                  <th>状态</th>
+                  <th>原因</th>
+                  <th className="num">售价（元）</th>
+                  <th className="num">成本（元）</th>
+                  <th>档位</th>
+                  <th>上游</th>
+                  <th>用量</th>
+                  <th className="right">
+                    <span className="vh">复核</span>
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {table.rows.map((c) => {
+                  const shown = open.has(c.seq);
+                  return (
+                    <Fragment key={c.seq}>
+                      <tr>
+                        <td className="tabular text-muted-foreground">{fmtBeijing(c.occurred_at)}</td>
+                        <td>{tenantName(c.tenant_id)}</td>
+                        <td className="font-medium">{modelText(c.model_name, c.model_deleted)}</td>
+                        <td>{statusLabel(c.status)}</td>
+                        <td>{chargeReason(c)}</td>
+                        <td className="num">{c.charge_micro_cny === null ? "—" : fmtMicroCny(c.charge_micro_cny)}</td>
+                        <td className="num">{c.cost_micro_cny === null ? "—" : fmtMicroCny(c.cost_micro_cny)}</td>
+                        <td>{c.service_tier ?? "—"}</td>
+                        <td>
+                          <Upstream c={c} />
+                        </td>
+                        <td className="tabular text-caption">{usageSummary(c.usage) ?? "—"}</td>
+                        <td className="right">
+                          <Button
+                            kind="quiet"
+                            size="sm"
+                            aria-expanded={shown}
+                            aria-controls={`charge-check-${c.seq}`}
+                            aria-label={`${shown ? "收起" : "展开"}用量明细 ${c.event_id}`}
+                            onClick={() =>
+                              setOpen((prev) => {
+                                const next = new Set(prev);
+                                if (next.has(c.seq)) next.delete(c.seq);
+                                else next.add(c.seq);
+                                return next;
+                              })
+                            }
+                          >
+                            {shown ? "收起" : "明细"}
+                          </Button>
                         </td>
                       </tr>
-                    )}
-                  </Fragment>
-                );
-              })}
-            </tbody>
-          </DataTable>
+                      {shown && (
+                        <tr className="dt-detail" id={`charge-check-${c.seq}`}>
+                          <td colSpan={11}>
+                            <ChargeCheck c={c} />
+                          </td>
+                        </tr>
+                      )}
+                    </Fragment>
+                  );
+                })}
+              </tbody>
+            </DataTable>
+            <RecordPager table={table} label="计费明细" resetKey={JSON.stringify(filter)} hasMore={next !== null} onMore={loadMore} busy={loadingMore} />
+          </>
         )}
-        {next !== null && (
-          <CardFooter className="mt-0 justify-center">
-            <Button type="button" busy={loadingMore} busyLabel="加载中…" onClick={() => void loadMore()}>
-              加载更多
-            </Button>
-          </CardFooter>
-        )}
+
       </Card>
       </BentoGrid>
     </>

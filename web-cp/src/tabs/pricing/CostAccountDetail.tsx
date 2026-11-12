@@ -14,10 +14,12 @@ import {
 } from "../../lib/api";
 import { messageFor, problemAt } from "../../lib/errors";
 import { errorText, fmtInt } from "../../lib/fmt";
-import { fmtUtc } from "../../lib/money";
+import { fmtBeijing } from "../../lib/time";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
 import { EmptyState } from "../../ui/EmptyState";
+import { useRecordTable } from "../../lib/recordTable";
+import { RecordTablePager, RecordTableToolbar } from "../../ui/RecordTable";
 import { Field, useRefusalFocus } from "../../ui/Field";
 import { TwoStep } from "../../ui/TwoStep";
 import { useToast } from "../../ui/Toast";
@@ -65,6 +67,12 @@ export function CostAccountDetail({
     void load();
   }, [load]);
 
+  const [priceState, setPriceState] = useState("");
+  const records = useRecordTable({
+    items: (rates?.models ?? []).filter((row) => priceState === "" || (priceState === "baseline" ? Boolean(prices.get(row.model_id)?.baseline.current) : priceState === "missing" ? !prices.get(row.model_id)?.baseline.current : row.rate.current?.cny_per_usd != null)),
+    searchText: (row) => [row.name, row.model_id],
+    resetKey: `${account.id}/${priceState}`,
+  });
   const name = account.display_name || account.id;
   const unknown = rates?.models.filter((row) => inForce(row.rate, rates.default).rate === null).length ?? 0;
   const forms =
@@ -143,6 +151,10 @@ export function CostAccountDetail({
           ) : rates.models.length === 0 ? (
             <EmptyState text="这个账号还没有模型。先在「上游账号 → 模型」中为它勾选公共模型。" />
           ) : (
+            <>
+            <RecordTableToolbar search={{ value: records.query, onChange: records.setQuery, label: "搜索成本价模型", placeholder: "模型名称或 ID" }}>
+              <label className="f filter"><span>价格状态</span><select value={priceState} onChange={(e) => setPriceState(e.target.value)}><option value="">全部</option><option value="baseline">已有基准价</option><option value="missing">缺少基准价</option><option value="override">已设单模型覆盖</option></select></label>
+            </RecordTableToolbar>
             <DataTable label="账号成本换算率">
               <colgroup>
                 <col className="cost-col-model" />
@@ -161,7 +173,8 @@ export function CostAccountDetail({
                 </tr>
               </thead>
               <tbody>
-                {rates.models.map((row) => {
+                {records.rows.length === 0 && <tr><td colSpan={5}><EmptyState text="没有符合筛选条件的模型" /></td></tr>}
+                {records.rows.map((row) => {
                   const plan = prices.get(row.model_id)?.baseline;
                   const baseline = plan?.current ?? null;
                   const head = baseline?.card?.default?.base;
@@ -230,6 +243,8 @@ export function CostAccountDetail({
                 })}
               </tbody>
             </DataTable>
+            <RecordTablePager page={records.page} pageSize={records.pageSize} onPageChange={records.setPage} onPageSizeChange={records.setPageSize} total={records.filteredCount} label="账号模型成本换算率分页" />
+            </>
           )}
         </Card>
       </WithForms>
@@ -268,7 +283,7 @@ function CostModelDetails({
         <dl className="cost-version-meta cost-rate-meta">
           <div><dt>换算率来源</dt><dd>{rate.label === "覆盖" ? "模型覆盖" : "账号默认"}</dd></div>
           <div><dt>人民币 / 美元</dt><dd className="cost-exact-rate">{rate.rate ?? "未设置"}</dd></div>
-          <div><dt>生效时间</dt><dd>{currentRate ? fmtUtc(currentRate.effective_from) : "—"}</dd></div>
+          <div><dt>生效时间</dt><dd>{currentRate ? fmtBeijing(currentRate.effective_from) : "—"}</dd></div>
         </dl>
         <p className="cost-detail-note">{rate.rate === null ? "成本未知：模型覆盖与账号默认均未设置可用的成本换算率。" : baseline ? "调用成本 = 模型的美元基准价 × 此成本换算率。" : "已设置换算率；模型没有现行基准价，调用成本仍记为未知。"}</p>
       </section>
@@ -281,7 +296,7 @@ function CostModelDetails({
         <h4 className="cost-upcoming-title">预约基准价 · {upcoming.length} 个版本</h4>
         {upcoming.length === 0 ? <p className="cost-detail-note">暂无预约基准价版本。</p> : upcoming.map((revision) => (
           <details className="cost-upcoming-baseline" key={revision.revision_id}>
-            <summary><span>{fmtUtc(revision.effective_from)} 起</span><span>版本 #{revision.revision_id}</span></summary>
+            <summary><span>{fmtBeijing(revision.effective_from)} 起</span><span>版本 #{revision.revision_id}</span></summary>
             <CostBaselineMeta revision={revision} />
             <PriceCardDetails card={revision.card} label={`${name} 预约基准价版本 ${revision.revision_id}`} />
           </details>
@@ -294,7 +309,7 @@ function CostModelDetails({
 function CostBaselineMeta({ revision }: { revision: BaselineRevision }) {
   return (
     <dl className="cost-version-meta">
-      <div><dt>生效时间 · 版本 #{revision.revision_id}</dt><dd>{fmtUtc(revision.effective_from)}</dd></div>
+      <div><dt>生效时间 · 版本 #{revision.revision_id}</dt><dd>{fmtBeijing(revision.effective_from)}</dd></div>
       <div><dt>价格来源</dt><dd><BaselineSourceBadge revision={revision} /></dd></div>
     </dl>
   );
@@ -308,7 +323,7 @@ function CostRateSchedule({ label, plan }: { label: string; plan: CostRatePlan }
         <ul className="cost-rate-revisions">
           {plan.upcoming.map((revision) => (
             <li key={revision.revision_id}>
-              <span>{fmtUtc(revision.effective_from)} 起</span>
+              <span>{fmtBeijing(revision.effective_from)} 起</span>
               <span className="cost-exact-rate">{revision.cny_per_usd === null ? "结束覆盖，回到账号默认" : `${revision.cny_per_usd} 人民币 / 美元`}</span>
             </li>
           ))}
@@ -337,7 +352,7 @@ function useCostRateWrite(account: CostAccount, onSaved: () => Promise<void>) {
         costRates.write(account.id, { model_id: modelId, cny_per_usd: rate, effective_from }),
       );
       if (sent === "invalid") {
-        setDetails([{ path: "/effective_from", message: "生效时间应写成 年-月-日 时:分，按 UTC 计" }]);
+        setDetails([{ path: "/effective_from", message: "生效时间应写成 年-月-日 时:分，按北京时间计" }]);
         focusRefusal();
         return;
       }

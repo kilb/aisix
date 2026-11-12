@@ -251,6 +251,71 @@ async fn api_prices_lists_each_assigned_groups_prices_after_the_discount() {
     );
 }
 
+#[tokio::test]
+async fn quotes_expose_the_exact_multiplier_for_each_model_group() {
+    let Some(p) = setup().await else { return };
+    discount(&p.w.cp, p.w.tenant, 1375).await;
+    let r = prices(&p.w.cp, &owner(&p.w).await).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(r.body["discount_bps"], 1375, "{r:?}");
+    // 同一模型按分组默认价或模型覆盖价分别报价；优惠是减免份额。
+    for (group, conversion, multiplier, input) in
+        [(p.a, "7.2", "6.21", "24.84"), (p.b, "6", "5.175", "20.7")]
+    {
+        let model = model_of(&group_of(&r.body, group), p.x);
+        assert_eq!(model["cny_per_usd"], conversion, "{model}");
+        assert_eq!(model["effective_multiplier"], multiplier, "{model}");
+        assert_eq!(model["input_per_million"], input, "{model}");
+    }
+}
+
+#[tokio::test]
+async fn quote_multipliers_preserve_zero_full_discount_and_the_smallest_fraction() {
+    let Some(p) = setup().await else { return };
+    for (bps, expected) in [(0, "7.2"), (10000, "0")] {
+        discount(&p.w.cp, p.w.tenant, bps).await;
+        let r = prices(&p.w.cp, &owner(&p.w).await).await;
+        assert_eq!(r.status, 200, "{r:?}");
+        let model = model_of(&group_of(&r.body, p.a), p.x);
+        assert_eq!(model["cny_per_usd"], "7.2", "{model}");
+        assert_eq!(model["effective_multiplier"], expected, "{model}");
+        if bps == 10000 {
+            assert_eq!(model["input_per_million"], "0", "{model}");
+        }
+    }
+    rate(&p.w.cp, p.a, Some(p.x), "0.0001").await;
+    discount(&p.w.cp, p.w.tenant, 9999).await;
+    let r = prices(&p.w.cp, &owner(&p.w).await).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let model = model_of(&group_of(&r.body, p.a), p.x);
+    assert_eq!(model["cny_per_usd"], "0.0001", "{model}");
+    assert_eq!(model["effective_multiplier"], "0.00000001", "{model}");
+    assert_eq!(model["input_per_million"], "0.00000004", "{model}");
+}
+
+#[tokio::test]
+async fn discounts_do_not_cross_tenants_that_share_model_groups() {
+    let Some(p) = setup().await else { return };
+    discount(&p.w.cp, p.w.tenant, 1375).await;
+    let other = seed_tenant(&p.w.cp, &p.w.admin).await;
+    grant(&p.w.cp, other, p.x).await;
+    assign(&p.w.cp, &p.w.admin, other, &[p.a, p.b]).await;
+    discount(&p.w.cp, other, 2500).await;
+    for (tenant, bps, a, b) in [
+        (p.w.tenant, 1375, "6.21", "5.175"),
+        (other, 2500, "5.4", "4.5"),
+    ] {
+        let member = p.w.cp.member_login_seeded(tenant, MemberRole::Owner).await;
+        let r = prices(&p.w.cp, &member).await;
+        assert_eq!(r.status, 200, "{r:?}");
+        assert_eq!(r.body["discount_bps"], bps, "{r:?}");
+        for (group, multiplier) in [(p.a, a), (p.b, b)] {
+            let model = model_of(&group_of(&r.body, group), p.x);
+            assert_eq!(model["effective_multiplier"], multiplier, "{model}");
+        }
+    }
+}
+
 /// The display name of `model`.
 async fn model_name(w: &World, model: Uuid) -> String {
     sqlx::query_scalar("SELECT doc->>'display_name' FROM gw_resources WHERE id = $1")
@@ -291,6 +356,8 @@ async fn api_prices_names_no_routing_name_and_no_channel() {
     assert_eq!(
         keys,
         [
+            "cny_per_usd",
+            "effective_multiplier",
             "input_per_million",
             "model_id",
             "name",

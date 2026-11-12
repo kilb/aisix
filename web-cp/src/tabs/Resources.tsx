@@ -1,3 +1,6 @@
+import { resourceSearchText } from "../lib/operationalRecords";
+import { useRecordTable } from "../lib/recordTable";
+import { RecordTools, RecordPager } from "../components/RecordTools";
 import { useState } from "react";
 import type { TabProps } from "../App";
 import { ConflictNote } from "../components/ConflictNote";
@@ -107,6 +110,9 @@ function KindPage({ info, canEdit }: { info: KindInfo; canEdit: boolean }) {
   const [busy, setBusy] = useState(false);
   const [panel, focusRefusal] = useRefusalFocus<HTMLDivElement>();
 
+  const [managedFilter, setManagedFilter] = useState("");
+  const [rolloutFilter, setRolloutFilter] = useState("");
+  const table = useRecordTable({ items: (items ?? []).filter((r) => (!managedFilter || (r.managed_by === null ? "manual" : "managed") === managedFilter) && (!rolloutFilter || r.rollout.state === rolloutFilter)), searchText: resourceSearchText, resetKey: `${info.kind}:${managedFilter}:${rolloutFilter}` });
   const current = editing?.mode === "edit" ? items?.find((i) => i.id === editing.id) : undefined;
   const writable = canEdit && info.writable;
   // A row a tenant, member or key derives stays read-only even in a kind
@@ -250,43 +256,47 @@ function KindPage({ info, canEdit }: { info: KindInfo; canEdit: boolean }) {
       {items === null && !error && <Loading />}
       {items !== null && items.length === 0 && <EmptyState text="暂无此类资源。" />}
       {items !== null && items.length > 0 && (
-        <DataTable label="资源文档">
-          <thead>
-            <tr>
-              <th>名称</th>
-              <th>ID</th>
-              <th className="right">版本</th>
-              <th>管理方</th>
-              <th>下发状态</th>
-              <th />
-            </tr>
-          </thead>
-          <tbody>
-            {items.map((r) => (
-              <tr key={r.id} className={editingId === r.id ? "bg-well" : undefined}>
-                <td className="font-medium">{nameOf(r.doc) ?? <span className="hint font-normal">（未命名）</span>}</td>
-                <td>
-                  <code
-                    className={editing ? "inline-block max-w-[24ch] truncate align-middle text-muted" : "text-muted"}
-                    title={r.id}
-                  >
-                    {r.id}
-                  </code>
-                </td>
-                <td className="right num">{r.version}</td>
-                <td>{r.managed_by ? <span className="tag">{r.managed_by}</span> : "—"}</td>
-                <td>
-                  <RolloutBadge rollout={r.rollout} />
-                </td>
-                <td className="right">
-                  <Button size="sm" type="button" onClick={() => open(r)}>
-                    {writable && r.managed_by === null ? "编辑" : "查看"}
-                  </Button>
-                </td>
+        <>
+          <RecordTools table={table} label="资源文档"><label className="f filter"><span>管理来源</span><select aria-label="管理来源" value={managedFilter} onChange={(e) => setManagedFilter(e.target.value)}><option value="">全部</option><option value="manual">手工管理</option><option value="managed">系统管理</option></select></label><label className="f filter"><span>下发状态</span><select aria-label="下发状态" value={rolloutFilter} onChange={(e) => setRolloutFilter(e.target.value)}><option value="">全部</option><option value="applied">applied</option><option value="pending">pending</option><option value="propagating">propagating</option><option value="rejected">rejected</option><option value="no_gateways">no_gateways</option></select></label></RecordTools>
+          <DataTable label="资源文档">
+            <thead>
+              <tr>
+                <th>名称</th>
+                <th>ID</th>
+                <th className="right">版本</th>
+                <th>管理方</th>
+                <th>下发状态</th>
+                <th />
               </tr>
-            ))}
-          </tbody>
-        </DataTable>
+            </thead>
+            <tbody>
+              {table.rows.map((r) => (
+                <tr key={r.id} className={editingId === r.id ? "bg-well" : undefined}>
+                  <td className="font-medium">{nameOf(r.doc) ?? <span className="hint font-normal">（未命名）</span>}</td>
+                  <td>
+                    <code
+                      className={editing ? "inline-block max-w-[24ch] truncate align-middle text-muted" : "text-muted"}
+                      title={r.id}
+                    >
+                      {r.id}
+                    </code>
+                  </td>
+                  <td className="right num">{r.version}</td>
+                  <td>{r.managed_by ? <span className="tag">{r.managed_by}</span> : "—"}</td>
+                  <td>
+                    <RolloutBadge rollout={r.rollout} />
+                  </td>
+                  <td className="right">
+                    <Button size="sm" type="button" onClick={() => open(r)}>
+                      {writable && r.managed_by === null ? "编辑" : "查看"}
+                    </Button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </DataTable>
+          <RecordPager table={table} label="资源文档" />
+        </>
       )}
     </div>
   );

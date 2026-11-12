@@ -32,7 +32,7 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
             path.to_string(),
             Some(json!({"current_password": TEST_PASSWORD, "new_password": "short"})),
         ),
-        ("GET", "/admin/operators") | ("GET", "/admin/audit") => (path.to_string(), None),
+        ("GET", "/admin/operators") | ("GET", "/admin/audit") | ("GET", "/admin/model-probes") => (path.to_string(), None),
         ("POST", "/admin/operators") => (
             path.to_string(),
             Some(json!({

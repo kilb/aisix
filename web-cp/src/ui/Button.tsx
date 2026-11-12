@@ -10,8 +10,8 @@ export type ButtonKind = "primary" | "secondary" | "danger" | "quiet";
 
 export interface ButtonProps extends ComponentProps<"button"> {
   /**
-   * `primary` 为深色主操作；`secondary` 为默认轮廓按钮；
-   * `danger` 仅用于破坏性操作第二步，以确认文字区分；`quiet` 为安静文本操作。
+   * `primary` 为品牌色主操作；`secondary` 为默认轮廓按钮；
+   * `danger` 仅用于破坏性操作第二步，以危险色与确认文字区分；`quiet` 为安静文本操作。
    */
   kind?: ButtonKind;
   /** 保留 sm 调用接口；两种尺寸均有 44px 命中区。 */
@@ -40,7 +40,7 @@ export interface ButtonProps extends ComponentProps<"button"> {
 
 /** shadcn/ui's button, in this app's four kinds and two sizes. */
 const buttonClass = cva(
-  "btn relative inline-flex shrink-0 cursor-pointer select-none items-center justify-center gap-2 whitespace-nowrap rounded-full text-body font-medium leading-4 transition-colors duration-150 disabled:cursor-not-allowed disabled:opacity-50 aria-disabled:cursor-not-allowed aria-disabled:opacity-50 [&_svg]:size-4 [&_svg]:shrink-0",
+  "btn relative inline-flex shrink-0 cursor-pointer select-none items-center justify-center gap-2 whitespace-nowrap rounded-(--r-button) text-body font-medium leading-4 transition-colors duration-150 disabled:cursor-not-allowed disabled:opacity-50 aria-disabled:cursor-not-allowed aria-disabled:opacity-50 [&_svg]:size-4 [&_svg]:shrink-0",
   {
     variants: {
       kind: {

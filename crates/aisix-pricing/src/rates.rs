@@ -190,6 +190,12 @@ pub fn cny_per_token(rate: Rate, cny: CnyPerUsd, discount_bps: u16) -> Option<St
     Some(exact_decimal(listed(rate, cny, discount_bps)?, 20))
 }
 
+/// 客户倍率：换算率乘以优惠后保留份额，与报价使用同一整数运算。
+/// 优惠超过 10000 基点时返回 `None`，不钳制或改为原价。
+pub fn effective_multiplier(cny: CnyPerUsd, discount_bps: u16) -> Option<String> {
+    cny_per_million(Rate(MILLION), cny, discount_bps)
+}
+
 /// `rate × cny × (10000 − bps)`, or `None` for a discount above 10000 bps.
 /// A reachable rate is at most `Rate::MAX` × `CnyPerUsd::MAX` × 10⁴ = 10²²,
 /// below 2⁷⁴, so it is exact for any rate this engine admits.

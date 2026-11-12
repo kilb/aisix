@@ -13,6 +13,7 @@ import {
   publicModels,
   tenants,
   type PublicModel,
+  type CooldownSettings,
   type ResourceView,
   type ServedBy,
   type Tenant,
@@ -43,6 +44,11 @@ import { DataTable, Loading } from "../ui/DataTable";
 import { EmptyState } from "../ui/EmptyState";
 import type { FieldAria } from "../ui/Field";
 import { TwoStep } from "../ui/TwoStep";
+import { RoutePolicy } from "../ui/RoutePolicy";
+import { CooldownEditor } from "../ui/CooldownEditor";
+import { useRecordTable } from "../lib/recordTable";
+import { RecordTableToolbar, RecordTablePager } from "../ui/RecordTable";
+import { cooldownProblem as validateCooldown } from "../lib/cooldown";
 import { UpstreamModelPicker } from "../ui/UpstreamModelPicker";
 import { GroupBadges } from "./providers/GroupBadges";
 import { InventorySummary, countGroups } from "./providers/OperationsBento";
@@ -63,6 +69,7 @@ interface ModelDoc {
   provider?: string;
   model_name?: string;
   provider_key_id?: string;
+  cooldown?: CooldownSettings | null;
   routing?: { strategy?: string; targets?: Target[]; [field: string]: unknown } | null;
   ensemble?: unknown;
   semantic?: unknown;
@@ -202,6 +209,7 @@ export function Models({ canEdit, operator }: TabProps) {
   // by 66 accounts is 93 rows, 66 of them plumbing). The operator's own
   // models and every 对外 row stay listed either way.
   const [showInternal, setShowInternal] = useState(false);
+  const [shapeFilter, setShapeFilter] = useState("");
   // The row whose `删除` was clicked once, with the tenants granted it (null while read).
   const [deleting, setDeleting] = useState<{ id: string; holders: Tenant[] | string | null } | null>(null);
   // The public model id whose `停用` is in flight.
@@ -398,6 +406,7 @@ export function Models({ canEdit, operator }: TabProps) {
   const counts: Record<ModelClass, number> = { facing: 0, internal: 0, manual: 0 };
   for (const m of all) counts[modelClass(m)] += 1;
   const shown = showInternal ? all : all.filter((m) => modelClass(m) !== "internal");
+  const table = useRecordTable({ items: shown.filter((m) => shapeFilter === "" || shapeOf(m.doc) === shapeFilter), resetKey: `${showInternal}:${shapeFilter}`, searchText: (m) => [nameOf(m), m.id, m.doc.model_name ?? "", m.doc.routing?.strategy ?? ""] });
 
   const editing = open?.mode === "edit" ? models.items?.find((m) => m.id === open.id) : undefined;
   // A model the operator wrote has the catalog form. A generated routing
@@ -605,11 +614,12 @@ export function Models({ canEdit, operator }: TabProps) {
               </label>
             }
           />
+          <RecordTableToolbar search={{ value: table.query, onChange: table.setQuery, label: "搜索模型", placeholder: "模型名称、标识、上游模型或策略" }}><label className="text-caption">模型类型<select value={shapeFilter} onChange={(e) => setShapeFilter(e.target.value)}><option value="">全部类型</option>{Object.entries(SHAPE_LABEL).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label></RecordTableToolbar>
           {models.items === null ? (
             !models.error && <Loading />
           ) : models.items.length === 0 ? (
             <EmptyState text="还没有模型。" />
-          ) : shown.length === 0 ? (
+          ) : table.filteredCount === 0 ? (
             <EmptyState text="没有模型。" />
           ) : (
             <DataTable label="全部模型" scroll={split}>
@@ -624,7 +634,7 @@ export function Models({ canEdit, operator }: TabProps) {
                 </tr>
               </thead>
               <tbody>
-                {shown.map((m) => {
+                {table.rows.map((m) => {
                   const shape = shapeOf(m.doc);
                   const hasForm = shape === "direct" || shape === "routing";
                   const src = modelSource(m);
@@ -640,7 +650,7 @@ export function Models({ canEdit, operator }: TabProps) {
                         <td className="whitespace-normal">
                           <Source model={m} source={src} from={from} publicRead={publicById !== null} catalog={catalog} />
                         </td>
-                        <td className="text-ink-soft">{SHAPE_LABEL[shape]}</td>
+                        <td className="text-ink-soft">{SHAPE_LABEL[shape]}{shape === "routing" && <RoutePolicy routing={m.doc.routing} defaultStrategy={schema && "preset" in schema ? schema.preset : null} compact />}</td>
                         <td className="whitespace-normal">
                           <div className="min-w-56">
                             <Upstream model={m} catalog={catalog} />
@@ -752,6 +762,7 @@ export function Models({ canEdit, operator }: TabProps) {
               </tbody>
             </DataTable>
           )}
+          <RecordTablePager {...table} total={table.filteredCount} onPageChange={table.setPage} onPageSizeChange={table.setPageSize} label="模型分页" />
         </Card>
       </div>
     </>
@@ -949,6 +960,9 @@ function ModelForm({
   const [provider, setProvider] = useState(initial.provider);
   const [upstream, setUpstream] = useState(initial.upstream);
   const [strategy, setStrategy] = useState(initial.strategy);
+  const [affinity, setAffinity] = useState(routingDraftOf(routing, "").affinity);
+  const [cooldown, setCooldown] = useState(doc.cooldown ?? null);
+  const [cooldownProblem, setCooldownProblem] = useState<string | null>(null);
   const [rows, setRows] = useState(initial.rows);
   // The target row whose `移除` was clicked once, awaiting `确认移除`.
   const [removing, setRemoving] = useState<number | null>(null);
@@ -1043,10 +1057,18 @@ function ModelForm({
       put("provider_key_id", accountId, initial.accountId);
       put("provider", provider, initial.provider);
       put("model_name", upstream, initial.upstream);
+      if (!sameRouting({ cooldown }, { cooldown: doc.cooldown ?? null })) {
+        if (cooldown === null) delete next.cooldown;
+        else next.cooldown = cooldown;
+      }
       return next;
     }
     const nextRouting = isNew ? {} : { ...routing };
     if (isNew ? shownStrategy !== "" : strategy !== initial.strategy) nextRouting.strategy = shownStrategy;
+    if (shownStrategy === "consistent_hash") {
+      if (affinity === "api_key") nextRouting.hash_on = [{ type: "api_key" }];
+      else if (affinity === "default") delete nextRouting.hash_on;
+    } else if (strategy !== initial.strategy) delete nextRouting.hash_on;
     const rowsChanged = rows.map(rowFields).join() !== initial.rows.map(rowFields).join();
     if (isNew || rowsChanged) nextRouting.targets = rows.map(targetOf);
     next.routing = nextRouting;
@@ -1055,6 +1077,10 @@ function ModelForm({
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
+    if (shape === "direct") {
+      const problem = cooldownProblem ?? validateCooldown(cooldown);
+      if (problem) { setErr(problem); return; }
+    }
     setBusy(true);
     setErr(null);
     setConflict(false);
@@ -1168,6 +1194,11 @@ function ModelForm({
           </Field>
         )}
       </div>
+
+      {shape === "direct" && <CooldownEditor value={cooldown} disabled={locked} onChange={setCooldown} onValidityChange={setCooldownProblem} error={at("/cooldown")} />}
+      {shape === "routing" && shownStrategy === "consistent_hash" && <Field label="亲和来源" hint="API key 资源 ID 保持稳定，不取密钥文本。">
+        {(aria) => <select disabled={locked} value={affinity} onChange={(e) => setAffinity(e.target.value as RoutingDraft["affinity"])} {...aria}><option value="default">网关默认：请求头 → API key ID</option><option value="api_key">API key 亲和</option>{routing.hash_on !== undefined && <option value="custom">保留已存自定义来源链</option>}</select>}
+      </Field>}
 
       {shape === "routing" && (
         <div className="@container mt-2 border-t border-line pt-5">
@@ -1295,7 +1326,7 @@ function ModelForm({
             <Button type="button" disabled={busy} onClick={onClose}>
               取消
             </Button>
-            <Button kind="primary" type="submit" busy={busy} busyLabel="保存中…">
+            <Button kind="primary" type="submit" busy={busy} busyLabel="保存中…" disabled={cooldownProblem !== null}>
               保存
             </Button>
           </>
@@ -1370,7 +1401,7 @@ function rowRefusal(e: unknown): RowRefusal {
   const fields: RowRefusal["fields"] = {};
   const rest: string[] = [];
   for (const d of e.details) {
-    const field = TARGET_PATHS[d.path];
+    const field = d.path.startsWith("/cooldown") ? "cooldown" : TARGET_PATHS[d.path];
     if (field === undefined) rest.push(d.message);
     else fields[field] = fields[field] ? `${fields[field]}；${d.message}` : d.message;
   }
@@ -1467,7 +1498,8 @@ function PublicRoutingForm({
   const title = readOnly ? `模型「${publicModel.name}」` : `编辑模型「${publicModel.name}」`;
   const locked = readOnly || busy;
 
-  const draft: RoutingDraft = { ...routingDraftOf(stored, GENERATED_STRATEGY), ...settings };
+  const effectiveStrategy = typeof publicModel.effective_routing?.strategy === "string" ? publicModel.effective_routing.strategy : GENERATED_STRATEGY;
+  const draft: RoutingDraft = { ...routingDraftOf(stored, effectiveStrategy), ...settings };
   const statuses = statusesOf(draft.statuses);
   const settingsBody = routingBody(draft, stored, GENERATED_STRATEGY, statuses);
   const settingsChanged = settings !== null && !sameRouting(settingsBody, stored);
@@ -1526,7 +1558,7 @@ function PublicRoutingForm({
     // What cannot be sent at all stops the save before anything is written.
     const unsent: Record<string, RowRefusal> = {};
     for (const { target, typed } of changedTargets) {
-      const fields = unsendable(typed);
+      const fields = unsendable(typed, target);
       if (Object.keys(fields).length > 0) unsent[target.provider_key_id] = { fields, message: null };
     }
     for (const a of additions) {
@@ -1585,12 +1617,14 @@ function PublicRoutingForm({
         settingsRefused = e instanceof ApiError ? e : String(e);
       }
     }
+    let readbackFailed = false;
     if (wrote.length > 0 && !settingsSaved) {
       try {
         view = await publicModels.get(publicModel.id);
       } catch {
         // The rows as their writes answered them stand in for the read:
         // what was written is shown as written, and is not sent again.
+        readbackFailed = true;
       }
     }
 
@@ -1598,7 +1632,7 @@ function PublicRoutingForm({
     setEdits((prev) => wrote.reduce((next, w) => (w.added === null ? without(next, w.accountId) : next), prev));
     setAdditions((prev) => prev.filter((a) => !wrote.some((w) => w.added === a.key)));
     if (settingsSaved) setSettings(null);
-    setErr(settingsRefused);
+    setErr(settingsRefused ?? (readbackFailed ? "目标已写入，但未能读回当前完整路由配置，请刷新后核对。" : null));
     setRefusals(refused);
     setWritten(failed > 0 ? wrote.map((w) => w.accountId) : []);
     setOutcome(
@@ -1609,7 +1643,7 @@ function PublicRoutingForm({
           : "没有保存：原因标在各自的位置。",
     );
     setBusy(false);
-    onSaved(wrote.length > 0 || settingsSaved ? view : null, failed === 0);
+    onSaved(wrote.length > 0 || settingsSaved ? view : null, failed === 0 && !readbackFailed);
     if (failed > 0) focusRefusal();
   }
 
@@ -1689,6 +1723,7 @@ function PublicRoutingForm({
         description={`公共模型「${publicModel.name}」的路由：每个目标是一个为它服务的上游账号。选路设置和目标都在这里改，点「保存」一并写入；移除目标立即生效。`}
       />
       <div className="@container">
+        <div className="mb-4"><RoutePolicy routing={publicModel.effective_routing} /></div>
         <h4 className="mb-3 text-body font-semibold">选路设置</h4>
         {bad && (
           <div className="note crit mt-0" role="alert">
@@ -1710,7 +1745,7 @@ function PublicRoutingForm({
               </select>
             )}
           </Field>
-          <Field label="全部不可用时的处理" error={at("/routing/when_all_unavailable")}>
+          <Field label="全部不可用时的处理" hint="只针对后台健康检查报告全部目标不健康。全部目标都在故障冷却时仍会尝试。" error={at("/routing/when_all_unavailable")}>
             {(aria) => (
               <select disabled={locked} value={draft.whenAllUnavailable} onChange={(e) => set("whenAllUnavailable", e.target.value)} {...aria}>
                 <option value="">（网关默认）</option>
@@ -1719,6 +1754,13 @@ function PublicRoutingForm({
               </select>
             )}
           </Field>
+          {draft.strategy === "consistent_hash" && <Field label="亲和来源" hint="API key 资源 ID 不受密钥轮换或调用方请求头影响。同一 key 尽量保持在同一健康目标。">
+            {(aria) => <select disabled={locked} value={draft.affinity} onChange={(e) => set("affinity", e.target.value as RoutingDraft["affinity"])} {...aria}>
+              <option value="default">网关默认：请求头 → API key ID</option>
+              <option value="api_key">API key 亲和</option>
+              {stored.hash_on !== undefined && <option value="custom">保留已存自定义来源链</option>}
+            </select>}
+          </Field>}
           <Field label="重试次数" hint="留空用网关的默认值。" error={at("/routing/retries")}>
             {(aria) => (
               <input
@@ -1913,7 +1955,7 @@ function PublicRoutingForm({
             </Button>
           )}
           <p className="hint max-w-[52ch] text-caption">
-            优先级高的一组先用，这一组都不可用时才用下一组；同一组内按权重分配。上游模型名称留空即用公共模型的名称。
+            优先级高的一组先用，这一组都不可用时才用下一组；同组选择遵循上面的已存策略。上游模型名称留空即用公共模型的名称。
           </p>
         </div>
       </div>
@@ -2065,6 +2107,7 @@ function TargetRow({
       <div className="col-span-2 flex min-h-11 items-center justify-end @md:col-span-1 @md:col-start-3 @md:row-start-1 @3xl:col-start-5">
         {action}
       </div>
+      <div className="col-span-full"><CooldownEditor value={draft.cooldown ?? null} disabled={locked} onChange={(cooldown) => onChange({ cooldown })} onValidityChange={(cooldownProblem) => onChange({ cooldownProblem })} error={refusal?.fields.cooldown} /></div>
       {message !== "" && (
         <div className="note crit col-span-full m-0" role="alert">
           {message}

@@ -4,7 +4,7 @@ import { Button } from "../ui/Button";
 
 /** 双端稳定页面原语：布局与呈现负责在这里，权限、数据和金额计算仍归业务页面。 */
 export function PageHeader({
-  title, description, eyebrow, dataLead, actions, className,
+  title, description, dataLead, actions, className,
 }: {
   title: ReactNode;
   description?: ReactNode;
@@ -16,8 +16,7 @@ export function PageHeader({
   return (
     <header className={cn("page-header bento-page-header", className)}>
       <div className="min-w-0">
-        {eyebrow != null && <div className="mb-2 font-mono text-micro text-muted">{eyebrow}</div>}
-        <h1 className="text-title font-medium">{title}</h1>
+        <h1 className="text-title font-semibold">{title}</h1>
         {(dataLead ?? description) != null && (
           <div className="bento-lead mt-2 text-lead font-normal text-ink-soft">{dataLead ?? description}</div>
         )}
@@ -49,7 +48,7 @@ export function Card({ className, tone = "surface", ...props }: ComponentProps<"
 }
 
 export function CardHeader({
-  title, description, actions, className, number, as: Heading = "h2",
+  title, description, actions, className, as: Heading = "h2",
 }: {
   title: ReactNode;
   description?: ReactNode;
@@ -61,10 +60,7 @@ export function CardHeader({
   return (
     <div className={cn("bento-card-header flex flex-wrap items-center justify-between gap-x-4 gap-y-2", className)}>
       <div className="min-w-0">
-        <Heading className="flex items-baseline gap-2 text-body font-medium text-foreground">
-          <span aria-hidden="true" className={number === undefined ? "bento-card-index" : undefined}>
-            {number === undefined ? null : String(number).padStart(2, "0")}
-          </span>
+        <Heading className="flex items-baseline gap-2 text-stat font-semibold text-foreground">
           <span>{title}</span>
         </Heading>
         {description && <p className="mt-1.5 text-caption text-muted">{description}</p>}
@@ -83,7 +79,7 @@ const metricSize = { hero: "text-hero", display: "text-display", figure: "text-f
 
 /** 不解析或缩写金额；调用方传入精确 formatter 的结果。 */
 export function Metric({ children, size = "value", className }: { children: ReactNode; size?: MetricSize; className?: string }) {
-  return <div className={cn("metric font-normal tabular-nums", metricSize[size], className)}>{children}</div>;
+  return <div className={cn("metric font-medium tabular-nums", metricSize[size], className)}>{children}</div>;
 }
 
 export function MetricSkeleton({ className, ...props }: ComponentProps<"div">) {
@@ -130,8 +126,7 @@ export function StatGrid({ className, ...props }: ComponentProps<"div">) {
 export function Stat({ label, value, foot, className }: { label: ReactNode; value: ReactNode; foot?: ReactNode; className?: string }) {
   return (
     <div className={cn("panel bento-stat", className)}>
-      <div className="flex items-baseline gap-3 font-mono text-meta text-muted">
-        <span className="bento-card-index" aria-hidden="true" />
+      <div className="flex items-baseline gap-3 text-caption text-muted">
         <span>{label}</span>
       </div>
       <Metric className="mt-3">{value}</Metric>
