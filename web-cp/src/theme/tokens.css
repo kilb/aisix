@@ -215,5 +215,10 @@
 }
 
 @media (max-width: 719px) {
-  :root { --type-title: 24px; }
+  :root {
+    --type-title: 24px;
+    --type-hero: 26px;
+    --type-display: 26px;
+    --type-figure: 26px;
+  }
 }

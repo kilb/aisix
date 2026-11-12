@@ -84,7 +84,7 @@ export function SidebarShell({
         ) : (
           <Dialog.Portal>
             <Dialog.Overlay className="shell-drawer-backdrop" />
-            <Dialog.Content className="shell-sidebar shell-drawer" aria-describedby={undefined}>
+            <Dialog.Content className="shell-sidebar shell-drawer" aria-modal="true" aria-describedby={undefined}>
               <Dialog.Title className="vh">{label}</Dialog.Title>
               {panel}
             </Dialog.Content>
