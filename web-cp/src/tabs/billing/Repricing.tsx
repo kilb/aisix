@@ -8,7 +8,9 @@ import { deltaWord, outcomeUnknown, previewAgainBody, utcInputToIso, utcInputVal
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
 import { Field, useRefusalFocus } from "../../ui/Field";
-import { Card, CardHeader, PageHeader } from "../../components/page";
+import { BentoGrid, Card, CardFooter, CardHeader, PageHeader, span } from "../../components/page";
+import { BudgetProgress } from "../../components/charts";
+import { exactRatio, formatCount } from "../../lib/chartFormat";
 import { cn } from "../../lib/cn";
 import { Lamp } from "../../ui/Lamp";
 import { TwoStep } from "../../ui/TwoStep";
@@ -43,6 +45,7 @@ function startOfTodayUtc(): string {
   return `${utcInputValue(new Date()).slice(0, 10)}T00:00:00`;
 }
 
+// 桌面：5 + 7；平板：12 + 12。右侧为预览和运行记录。
 /**
  * "重新计价": correct past charges at today's prices. An operator previews a
  * run over a window of calls and reads what it would change, in total and
@@ -272,7 +275,7 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
   const unknown = mine?.kind === "unknown";
 
   const formCard = canEdit && (
-    <Card className="mb-0 xl:sticky xl:top-20">
+    <Card className={span.d5Wide}>
       <form
         ref={formRef}
         aria-label="新建重新计价"
@@ -281,8 +284,8 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
           void submitPreview();
         }}
       >
-        <CardHeader title="新建重新计价" />
-        <div className="grid gap-x-4 sm:grid-cols-2 xl:grid-cols-1">
+        <CardHeader number={1} title="新建重新计价" description="按现行价格重新计算过去的调用。预览不会改动费用；确认影响后，由管理员执行。" />
+        <div className="grid gap-x-4 tablet:grid-cols-2 desktop:grid-cols-1">
           <Field label="开始（UTC）" error={problems.from}>
             {(aria) => (
               <input
@@ -308,7 +311,7 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
             )}
           </Field>
         </div>
-        <div className="grid gap-x-4 sm:grid-cols-3 xl:grid-cols-1 2xl:grid-cols-3">
+        <div className="grid gap-x-4 tablet:grid-cols-3 desktop:grid-cols-1">
           <Field label="模型">
             <select value={form.model_id} disabled={busy} onChange={(e) => set("model_id", e.target.value)}>
               <option value="">全部</option>
@@ -357,11 +360,11 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
             {formError}
           </div>
         )}
-        <div className="-mx-6 -mb-6 mt-6 flex justify-end gap-2 rounded-b-xl border-t border-border bg-muted/40 px-6 py-3">
+        <CardFooter className="flex justify-end border-t border-ink/7 pt-4">
           <Button type="submit" kind="primary" busy={previewing} busyLabel="预览" disabled={busy}>
             预览
           </Button>
-        </div>
+        </CardFooter>
       </form>
     </Card>
   );
@@ -369,6 +372,7 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
   const result = shown && (
     <Card aria-label="预览结果">
       <CardHeader
+        number={canEdit ? 2 : 1}
         title={shown.status === "applied" ? "已执行的运行" : "预览结果"}
         description={
           <>
@@ -379,6 +383,13 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
             {`，状态 ${shown.filter.status ? statusLabel(shown.filter.status) : "全部"}`}。原因：{shown.reason}
           </>
         }
+      />
+      <BudgetProgress
+        value={exactRatio(shown.changed, shown.events)}
+        accessibleLabel={`预览选中 ${formatCount(shown.events)} 次调用，其中 ${formatCount(shown.changed)} 次费用有变化`}
+        label="费用有变化的调用"
+        valueLabel={`${formatCount(shown.changed)} / ${formatCount(shown.events)}`}
+        className="mb-5"
       />
       <div className={cn("grid items-start gap-4", shown.by_tenant.length > 0 && "2xl:grid-cols-[minmax(260px,340px)_minmax(0,1fr)]")}>
         <div className="bl-box max-w-md 2xl:max-w-none">
@@ -402,7 +413,7 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
               </tr>
               <tr>
                 <th scope="row">合计差额</th>
-                <td className="num money font-semibold">
+                <td className="num money font-normal">
                   {fmtMicroCny(shown.delta_micro_cny)}
                   <span className="cell-note">{deltaWord(shown.delta_micro_cny)}</span>
                 </td>
@@ -439,7 +450,7 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
           </div>
         )}
       </div>
-      <p className="hint mt-3 text-[13px]">差额为正是多收，为负是退还。「无归属」是没有归属租户的调用，只统计，不会计费。</p>
+      <p className="hint mt-3 text-caption">差额为正是多收，为负是退还。「无归属」是没有归属租户的调用，只统计，不会计费。</p>
 
       {mine && (
         <div
@@ -451,8 +462,8 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
       )}
 
       {shown.status === "previewed" && (
-        <div className="-mx-6 -mb-6 mt-6 flex flex-wrap items-start justify-between gap-x-6 gap-y-3 rounded-b-xl border-t border-border bg-muted/40 px-6 py-3">
-          <p className="hint max-w-xl self-center text-[13px]">
+        <CardFooter className="flex flex-wrap items-start justify-between gap-x-6 gap-y-3 border-t border-ink/7 pt-4">
+          <p className="hint max-w-xl self-center text-caption">
             {isAdmin && !unknown && !isStale
               ? "执行可能需要几秒钟。调整记入执行当月的租户流水；在用量统计里，则计入这些调用发生的月份。"
               : null}
@@ -478,13 +489,13 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
                 onConfirm={() => void apply(shown)}
               />
             ) : (
-              <span className="hint text-[13px]">执行需要管理员权限，运维账号可以预览。</span>
+              <span className="hint text-caption">执行需要管理员权限，运维账号可以预览。</span>
             )}
           </div>
-        </div>
+        </CardFooter>
       )}
       {shown.status === "applied" && (
-        <p className="hint text-[13px]">
+        <p className="hint text-caption">
           已由 {shown.applied_by?.email ?? "—"} 于 {shown.applied_at ? fmtUtc(shown.applied_at) : "—"} 执行。调整记入执行当月的租户流水；在用量统计里，则计入这些调用发生的月份。
         </p>
       )}
@@ -494,7 +505,9 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
   const history = (
     <Card className="mb-0">
       <CardHeader
+        number={(canEdit ? 1 : 0) + (shown ? 1 : 0) + 1}
         title="运行记录"
+        description={<>预览不会改动费用，最终执行需要管理员确认。{runs === null ? (loadError ? "运行记录读取失败，请重试。" : "正在读取运行记录。") : `已加载 ${formatCount(runs.length)} 条${next !== null ? "，还有更多记录。" : "，已到记录末尾。"}`}</>}
         actions={
           <Button type="button" size="sm" icon="refresh" disabled={busy} onClick={() => void load()}>
             刷新
@@ -570,21 +583,22 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
     <>
       <PageHeader
         title="重新计价"
+        eyebrow="计费 / 费用更正"
+        dataLead={shown ? <>本次运行选中 <strong>{formatCount(shown.events)}</strong> 次调用，<strong>{formatCount(shown.changed)}</strong> 次费用有变化；合计差额 <strong>{fmtMicroCny(shown.delta_micro_cny)}</strong>。</> : "先预览影响范围与各租户差额，再由管理员确认执行。"}
         description="价格补录或改正之后，按现行价格重新计算过去的调用。先预览：看影响多少调用、各租户相差多少；确认无误后由管理员执行。预览不会改动任何费用。"
       />
       {formCard ? (
-        <div className="grid items-start gap-6 xl:grid-cols-[340px_minmax(0,1fr)] 2xl:grid-cols-[420px_minmax(0,1fr)]">
+        <BentoGrid className="items-start">
           {formCard}
-          <div className="min-w-0">
+          <div className={cn(span.d7, "min-w-0 grid gap-3")}>
             {result}
             {history}
           </div>
-        </div>
+        </BentoGrid>
       ) : (
-        <>
-          {result}
-          {history}
-        </>
+        <BentoGrid>
+          <div className={cn(span.d12, "grid min-w-0 gap-3")}>{result}{history}</div>
+        </BentoGrid>
       )}
     </>
   );

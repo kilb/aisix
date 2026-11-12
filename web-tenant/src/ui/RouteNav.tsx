@@ -8,21 +8,9 @@ export interface RouteItem<Id extends string> {
 }
 
 /**
- * Sections as tabs: a `tablist` of `tab`s named exactly by their labels, in
- * order. The open tab is marked by the lens, drawn outside the tabs and
- * gliding from the tab left to the one opened, so each tab's text is its
- * label alone. Tab `<id>` is `stop-<id>` and controls `tab-<id>`, the
- * `tabpanel` the caller renders for the open section, labelled by its tab.
- *
- * Keyboard: Tab reaches the current stop; the arrow keys, Home and End move
- * between stops, and Enter or Space opens one.
- *
- * Looks (ui.css): `segment`, the default, is shadcn's Tabs, a muted track
- * with the open tab a white segment (the gate's 登录 / 注册组织);
- * `underline` is Vercel's tabs, quiet text with a 2px rule under the open
- * one (a card's own tabs). `docked` is the portal's section bar: underline
- * tabs across the page under the header, and on a phone a bar along the
- * bottom edge of the screen.
+ * 文字导航保留手动激活的 tab 键盘模型：方向键、Home/End 移焦，Enter/Space 打开。
+ * docked 表示应用顶导航，窄屏仍在顶部独立横滚；其余用分段或下划线外观。
+ * tab 的 id、controls 和可访问名称沿用既有页面合同。
  */
 export function RouteNav<Id extends string>({
   label,
@@ -57,6 +45,13 @@ export function RouteNav<Id extends string>({
         mark.style.opacity = "0";
         return;
       }
+      if (docked) {
+        // 只滚动导航本身，深链或键盘激活末项不会移动整张页面。
+        const left = tab.offsetLeft;
+        const right = left + tab.offsetWidth;
+        if (left < nav.scrollLeft) nav.scrollLeft = left;
+        else if (right > nav.scrollLeft + nav.clientWidth) nav.scrollLeft = right - nav.clientWidth;
+      }
       mark.style.opacity = "";
       mark.style.width = `${tab.offsetWidth}px`;
       mark.style.height = `${tab.offsetHeight}px`;
@@ -71,7 +66,7 @@ export function RouteNav<Id extends string>({
       cancelAnimationFrame(frame);
       resized.disconnect();
     };
-  }, [current, items]);
+  }, [current, items, docked]);
 
   function onKeyDown(e: KeyboardEvent<HTMLElement>) {
     const tabs = [...e.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]')];
@@ -89,7 +84,7 @@ export function RouteNav<Id extends string>({
     tabs[next]?.focus();
   }
 
-  const kind = docked ? "route docked" : look === "underline" ? "route route-line" : "route route-seg";
+  const kind = docked ? "route route-topnav" : look === "underline" ? "route route-line" : "route route-seg";
   return (
     <nav
       ref={bar}
@@ -107,6 +102,7 @@ export function RouteNav<Id extends string>({
           id={`stop-${t.id}`}
           data-tab={t.id}
           aria-selected={t.id === current}
+          aria-current={docked && t.id === current ? "page" : undefined}
           aria-controls={`tab-${t.id}`}
           tabIndex={t.id === current ? 0 : -1}
           onClick={() => onSelect(t.id)}

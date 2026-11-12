@@ -14,7 +14,7 @@ import {
   type RatePlan,
 } from "../../lib/api";
 import { messageFor, problemAt } from "../../lib/errors";
-import { errorText } from "../../lib/fmt";
+import { errorText, fmtInt } from "../../lib/fmt";
 import { fmtCnyPerMillion, fmtMicroCny, fmtUtc } from "../../lib/money";
 import { BaselineSourceBadge } from "./Baselines";
 import { Button } from "../../ui/Button";
@@ -23,7 +23,7 @@ import { EmptyState } from "../../ui/EmptyState";
 import { Field, useRefusalFocus } from "../../ui/Field";
 import { TwoStep } from "../../ui/TwoStep";
 import { useToast } from "../../ui/Toast";
-import { Card, CardHeader, PageHeader, Stat, StatGrid } from "../../components/page";
+import { BentoGrid, Card, CardHeader, CardMessage, Metric, MetricSkeleton, PageHeader, span } from "../../components/page";
 import { CardFooter, Count, FormGrid, WithForms } from "./kit";
 
 /** How far back the margin is measured. */
@@ -163,13 +163,16 @@ export function GroupDetail({
       </>
     ) : null;
   const later = scheduledWords(group.default_rate, "默认");
+  const unpriced = rows.filter((row) => !prices.get(row.model_id)?.baseline.current).length;
 
   return (
     <div className="grp-detail" role="region" aria-label={`分组 ${group.display_name}`}>
       <PageHeader
+        eyebrow="价格 / 分组明细"
+        dataLead={rates ? `${group.display_name} 的 ${fmtInt(rows.length)} 个模型中，${fmtInt(unpriced)} 个缺少现行基准价。` : "读取分组模型换算率与最近 30 天毛利。"}
         title={
           <span className="inline-flex flex-wrap items-center gap-x-3 gap-y-1">
-            {group.display_name}
+            <span className="min-w-0 break-all">{group.display_name}</span>
             {group.is_default && <span className="tag grp-default ml-0">默认分组</span>}
           </span>
         }
@@ -189,16 +192,24 @@ export function GroupDetail({
           </Button>
         }
       />
-      <StatGrid className="grid-cols-2">
-        <Stat
-          label="默认换算率"
-          value={group.default_rate.current?.cny_per_usd ?? "未设置"}
-          foot={later ? `待生效 ${later}` : undefined}
-        />
-        <Stat label="租户" value={group.tenants} />
-        <Stat label="密钥" value={group.keys} />
-        <Stat label="上游账号" value={group.provider_keys.length} />
-      </StatGrid>
+      <BentoGrid className="mb-3">
+        <Card className={span.d7}>
+          <CardHeader number={1} title="默认换算率 · 当前分组" />
+          <Metric size={group.default_rate.current?.cny_per_usd == null ? "value" : "hero"}>{group.default_rate.current?.cny_per_usd ?? "未设置"}</Metric>
+          <p className="mt-4 text-caption text-muted">{later ? `待生效 ${later}` : "没有预约的默认换算率版本。"}</p>
+          <dl className="mt-6 grid grid-cols-3 gap-3 border-t border-ink/7 pt-4">
+            <div><dt className="font-mono text-micro text-muted">租户</dt><dd className="mt-1 text-stat tabular-nums">{fmtInt(group.tenants)}</dd></div>
+            <div><dt className="font-mono text-micro text-muted">密钥</dt><dd className="mt-1 text-stat tabular-nums">{fmtInt(group.keys)}</dd></div>
+            <div><dt className="font-mono text-micro text-muted">上游账号</dt><dd className="mt-1 text-stat tabular-nums">{fmtInt(group.provider_keys.length)}</dd></div>
+          </dl>
+        </Card>
+        <Card tone="inverse" className={span.d5Wide}>
+          <CardHeader number={2} title="缺少现行基准价的模型" />
+          {rates ? <Metric size="display">{fmtInt(unpriced)}</Metric> : error ? <CardMessage onRetry={() => void load()}>数据读取失败</CardMessage> : <MetricSkeleton />}
+          <p className="mt-4 text-caption text-on-inverse-muted">范围：此分组全部 {rates ? fmtInt(rows.length) : "—"} 个模型。未定价模型排在明细最前。</p>
+          <p className="mt-6 border-t border-surface/12 pt-4 text-caption text-on-inverse-muted">毛利明细只覆盖最近 30 天；已知成本与成本未知收入分开列出。</p>
+        </Card>
+      </BentoGrid>
       {error && (
         <div className="note crit mt-0" role="alert">
           {error}{" "}
@@ -209,7 +220,7 @@ export function GroupDetail({
       )}
       <WithForms wide forms={forms}>
         <Card className="mb-0">
-          <CardHeader className="mb-0" title={<>模型换算率{rates && <Count n={rows.length} />}</>} />
+          <CardHeader number={3} className="mb-0" title={<>模型换算率{rates && <Count n={rows.length} />}</>} />
           {rates === null ? (
             !error && <Loading />
           ) : rows.length === 0 ? (
@@ -339,11 +350,12 @@ function DefaultRate({ group, plan, onSaved }: { group: Group; plan: RatePlan; o
   return (
     <Card ref={form} role="group" aria-label="修改默认换算率">
       <CardHeader
+        number={4}
         title="默认换算率"
         description={
           <span className="tabular">
             现在 <span className="grp-now font-medium text-foreground">{plan.current?.cny_per_usd ?? "未设置"}</span>
-            {later && <span className="mt-0.5 block text-xs">待生效 {later}</span>}
+            {later && <span className="mt-0.5 block text-caption">待生效 {later}</span>}
           </span>
         }
       />
@@ -457,7 +469,7 @@ function ModelRate({
   const stray = details.filter((d) => !["/cny_per_usd", "/effective_from"].includes(d.path));
   return (
     <Card ref={form} className="scroll-mt-20" role="group" aria-label={ending ? "结束覆盖" : "设置覆盖"}>
-      <CardHeader title={ending ? "结束覆盖" : "设置覆盖"} description={<span className="tabular font-medium text-foreground">{model.name}</span>} />
+      <CardHeader number={5} title={ending ? "结束覆盖" : "设置覆盖"} description={<span className="tabular font-medium text-ink">{model.name}</span>} />
       {ending ? (
         <p className="hint mb-4">结束后这个模型回到分组的默认换算率。</p>
       ) : null}

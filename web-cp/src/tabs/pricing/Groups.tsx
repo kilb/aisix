@@ -3,15 +3,16 @@ import type { TabProps } from "../../App";
 import { EffectiveFrom, sendAt, type EffectiveResolver } from "../../components/EffectiveFrom";
 import { ApiError, groups, type Detail, type Group } from "../../lib/api";
 import { messageFor, problemAt } from "../../lib/errors";
-import { errorText } from "../../lib/fmt";
+import { errorText, fmtInt } from "../../lib/fmt";
 import { fmtUtc } from "../../lib/money";
+import { exactInteger, formatCount } from "../../lib/chartFormat";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
 import { EmptyState } from "../../ui/EmptyState";
 import { Field, useRefusalFocus } from "../../ui/Field";
 import { TwoStep } from "../../ui/TwoStep";
 import { useToast } from "../../ui/Toast";
-import { Card, CardHeader, PageHeader } from "../../components/page";
+import { BentoGrid, Card, CardHeader, CardMessage, Metric, MetricSkeleton, PageHeader, span } from "../../components/page";
 import { Sheet, SheetContent } from "../../components/ui/sheet";
 import { GroupDetail } from "./GroupDetail";
 import { Count, FormGrid } from "./kit";
@@ -60,6 +61,18 @@ function scheduled(plan: Group["default_rate"]): string {
   return plan.upcoming.map((r) => `${fmtUtc(r.effective_from)} 起 ${r.cny_per_usd ?? "结束覆盖"}`).join("、");
 }
 
+/** 引用总数逐项精确累加，接口已失去精度的计数保持未知。 */
+function referenceCount(rows: Group[] | null, field: "tenants" | "keys"): string {
+  if (rows === null) return "—";
+  let total = 0n;
+  for (const group of rows) {
+    const count = exactInteger(group[field]);
+    if (count === null) return "—";
+    total += count;
+  }
+  return formatCount(total);
+}
+
 /**
  * 价格 · 分组: every provider group, what still names it, and its default
  * rate. Selecting one opens its per-model rates.
@@ -93,11 +106,15 @@ export function Groups({ canEdit }: TabProps) {
   if (open) {
     return <GroupDetail group={open} canEdit={canEdit} onBack={() => setSelected(null)} onChanged={load} />;
   }
+  const unset = rows?.filter((g) => g.default_rate.current?.cny_per_usd == null).length ?? 0;
+  const scheduledCount = rows?.reduce((total, g) => total + g.default_rate.upcoming.length, 0) ?? 0;
 
   return (
     <>
       <PageHeader
         title="分组"
+        eyebrow="价格 / 分组"
+        dataLead={rows !== null ? `已载入全部 ${fmtInt(rows.length)} 个分组，${fmtInt(unset)} 个尚未设置现行默认换算率。` : "读取分组与现行默认换算率。"}
         description="一个分组给同一批上游账号定一个换算率：模型的官方美元价 × 这个分组在模型上的换算率（没有时为分组默认），就是租户付的人民币价（租户折扣另算）。密钥在创建时选一个分组，此后只路由到该分组的上游账号。"
         actions={
           <>
@@ -125,8 +142,24 @@ export function Groups({ canEdit }: TabProps) {
           {refusal}
         </div>
       )}
+      <BentoGrid className="mb-3">
+        <Card className={span.d7}>
+          <CardHeader number={1} title="分组 · 全部" />
+          {rows === null ? error ? <CardMessage onRetry={() => void load()}>数据读取失败</CardMessage> : <MetricSkeleton /> : <Metric size="hero">{fmtInt(rows.length)}</Metric>}
+          <dl className="mt-6 grid grid-cols-2 gap-4 border-t border-ink/7 pt-4">
+            <div><dt className="font-mono text-micro text-muted">租户引用</dt><dd className="mt-1 break-all text-stat tabular-nums">{referenceCount(rows, "tenants")}</dd></div>
+            <div><dt className="font-mono text-micro text-muted">密钥引用</dt><dd className="mt-1 break-all text-stat tabular-nums">{referenceCount(rows, "keys")}</dd></div>
+          </dl>
+        </Card>
+        <Card tone="inverse" className={span.d5Wide}>
+          <CardHeader number={2} title="默认换算率 · 待生效修订" />
+          {rows === null ? error ? <CardMessage onRetry={() => void load()}>数据读取失败</CardMessage> : <MetricSkeleton /> : <Metric size="display">{fmtInt(scheduledCount)}</Metric>}
+          <p className="mt-4 text-caption text-on-inverse-muted">只统计全部分组默认换算率的预约版本；单模型覆盖在分组明细查看。</p>
+          <p className="mt-6 border-t border-surface/12 pt-4 text-body">默认分组：{rows === null ? "—" : rows.find((g) => g.is_default)?.display_name ?? "未设置"}</p>
+        </Card>
+      </BentoGrid>
       <Card className="mb-0">
-        <CardHeader className="mb-0" title={<>全部分组{rows && <Count n={rows.length} />}</>} />
+        <CardHeader number={3} className="mb-0" title={<>全部分组{rows && <Count n={rows.length} />}</>} />
         {rows === null ? (
           !error && <Loading />
         ) : rows.length === 0 ? (
@@ -337,7 +370,7 @@ function EditGroup({
   return (
     <div
       ref={form}
-      className="whitespace-normal rounded-xl border border-border bg-muted/50 p-4"
+      className="whitespace-normal rounded-cell bg-well p-4"
       role="group"
       aria-label="编辑分组"
     >
@@ -421,7 +454,7 @@ function CreateGroup({ onCreated }: { onCreated: () => Promise<void> }) {
 
   return (
     <div ref={form} role="group" aria-label="新建分组">
-      <p className="hint mb-5 text-[13px]">显示名和说明对租户可见，不要写入上游渠道名称。</p>
+      <p className="hint mb-5 text-caption">显示名和说明对租户可见，不要写入上游渠道名称。</p>
       <FormGrid>
         <Field
           label="路由名"

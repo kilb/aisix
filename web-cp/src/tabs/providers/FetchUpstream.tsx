@@ -5,6 +5,7 @@ import { messageFor } from "../../lib/errors";
 import { errorText } from "../../lib/fmt";
 import { MAX_BULK_MODELS, appliedText, selectable, stateOf, stateText } from "../../lib/upstreamBulk";
 import { Button } from "../../ui/Button";
+import { CardHeader } from "../../components/page";
 import { DataTable } from "../../ui/DataTable";
 import { why } from "../../ui/UpstreamModelPicker";
 
@@ -126,11 +127,12 @@ export function FetchUpstream({
   return (
     // A group, not a region: the section around it is the region named 模型.
     <div className="panel ch-fetch mb-0" role="group" aria-label="获取上游模型">
+      <CardHeader number={6} title="获取上游模型" />
       <div className="flex flex-wrap items-start gap-3">
-        <span aria-hidden="true" className="grid size-9 shrink-0 place-items-center rounded-md border border-border bg-muted text-muted-foreground">
+        <span aria-hidden="true" className="grid size-11 shrink-0 place-items-center rounded-cell border border-line bg-well text-ink-soft">
           <CloudDownload className="size-4" />
         </span>
-        <p className="hint min-w-0 flex-1 basis-56 text-[13px]">
+        <p className="hint min-w-0 flex-1 basis-56 text-caption">
           从该账号的上游读取模型列表，勾选后一次写入映射：已有同名公共模型的直接复用，没有的以上游模型名称新建；该账号已映射的模型保持不变。
         </p>
         <Button
@@ -173,10 +175,10 @@ export function FetchUpstream({
           <div className="mt-5 flex flex-wrap items-center gap-x-6 gap-y-3">
             <label className="relative block w-full sm:w-72">
               <span className="sr-only">搜索上游模型</span>
-              <Search aria-hidden className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
+              <Search aria-hidden className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted" />
               <input className="pl-9" value={query} onChange={(e) => setQuery(e.target.value)} placeholder="按上游模型名称筛选" />
             </label>
-            <label className="ch-tick gap-2 text-[13px]">
+            <label className="ch-tick gap-2 text-caption">
               <input
                 type="checkbox"
                 checked={allShownChosen}
@@ -200,24 +202,26 @@ export function FetchUpstream({
                 return (
                   <tr key={id}>
                     <td>
-                      <input
-                        type="checkbox"
-                        aria-label={`选择 ${id}`}
-                        checked={chosen.has(id) && selectable(state)}
-                        disabled={disabled || busy || !selectable(state)}
-                        onChange={(e) => toggle(id, e.target.checked)}
-                      />
+                      <label className="ch-tick min-h-11 min-w-11 justify-center">
+                        <input
+                          type="checkbox"
+                          aria-label={`选择 ${id}`}
+                          checked={chosen.has(id) && selectable(state)}
+                          disabled={disabled || busy || !selectable(state)}
+                          onChange={(e) => toggle(id, e.target.checked)}
+                        />
+                      </label>
                     </td>
                     <td>
-                      <span className="mono font-mono text-[13px]">{id}</span>
+                      <span className="mono font-mono text-caption">{id}</span>
                     </td>
-                    <td className={selectable(state) ? "text-[13px]" : "ch-fetch-muted text-[13px] text-muted-foreground"}>{stateText(state)}</td>
+                    <td className={selectable(state) ? "text-caption" : "ch-fetch-muted text-caption text-muted"}>{stateText(state)}</td>
                   </tr>
                 );
               })}
               {shown.length === 0 && (
                 <tr>
-                  <td colSpan={3} className="text-muted-foreground">
+                  <td colSpan={3} className="text-muted">
                     没有匹配的上游模型。
                   </td>
                 </tr>
@@ -225,7 +229,7 @@ export function FetchUpstream({
             </tbody>
           </DataTable>
           {matches.length > shown.length && (
-            <p className="hint mt-3 text-[13px]">
+            <p className="hint mt-3 text-caption">
               共 {matches.length} 个，只列出前 {MAX_SHOWN} 个；继续输入可缩小范围。
             </p>
           )}
@@ -234,8 +238,8 @@ export function FetchUpstream({
               一次最多映射 {MAX_BULK_MODELS} 个上游模型，已选 {picked.length} 个，请减少选择后再写入。
             </div>
           )}
-          <div className="ch-save -mx-6 -mb-6 mt-6 flex flex-wrap items-center justify-end gap-x-4 gap-y-2 rounded-b-[calc(var(--radius)+3px)] border-t border-border bg-muted/40 px-6 py-3">
-            <span className="hint mr-auto text-[13px] tabular-nums">已选 {picked.length} 个</span>
+          <div className="ch-save -mx-7 -mb-7 mt-6 flex flex-wrap items-center justify-end gap-x-4 gap-y-2 rounded-b-card border-t border-line bg-well px-7 py-3 [&_.hint]:text-ink-soft">
+            <span className="hint mr-auto text-caption tabular-nums">已选 {picked.length} 个</span>
             <Button
               type="button"
               busy={busy}

@@ -18,8 +18,9 @@ import { DataTable, Loading } from "../ui/DataTable";
 import { EmptyState } from "../ui/EmptyState";
 import { Lamp } from "../ui/Lamp";
 import { TwoStep } from "../ui/TwoStep";
-import { Card, CardHeader, PageHeader, Split, Stat, StatGrid } from "../components/page";
+import { Card, CardHeader, PageHeader, Split } from "../components/page";
 import { Plus } from "lucide-react";
+import { InventorySummary } from "./providers/OperationsBento";
 
 /** How often the instances are read again: about one gateway heartbeat. */
 const REFRESH_MS = 5_000;
@@ -109,8 +110,9 @@ export function Gateways({ operator }: TabProps) {
   return (
     <>
       <PageHeader
+        eyebrow="GATEWAYS · 实例与凭据"
         title="网关"
-        description="网关实例的心跳，以及网关连接控制面所用的凭据。"
+        dataLead={instances ? <>已记录 {fmtInt(instances.length)} 个网关实例，其中 {fmtInt(online)} 个在线、{fmtInt(instances.length - online)} 个离线。</> : "查看网关的当前心跳、版本与连接凭据。"}
         actions={
           isAdmin &&
           !issuing && (
@@ -122,21 +124,26 @@ export function Gateways({ operator }: TabProps) {
         }
       />
 
-      <StatGrid className="grid-cols-2">
-        <Stat label="在线实例" value={instances ? fmtInt(online) : "…"} foot={instances ? `共 ${fmtInt(instances.length)} 个实例` : " "} />
-        <Stat
-          label="离线实例"
-          value={instances ? fmtInt(instances.length - online) : "…"}
-          foot="超过设定时间没有心跳"
-        />
-        <Stat
-          label="版本不一致"
-          value={instances ? fmtInt(skewed) : "…"}
-          foot="版本与控制面不一致的实例"
-          className={skewed > 0 ? "[&>div:nth-child(2)]:text-danger" : undefined}
-        />
-        <Stat label="有效凭据" value={credentials ? fmtInt(valid) : "…"} foot={credentials ? `已吊销 ${fmtInt(revoked)}` : " "} />
-      </StatGrid>
+      <InventorySummary
+        title="网关实例 · 当前心跳"
+        total={instances?.length ?? null}
+        totalLabel="已记录实例"
+        breakdown={instances ? [
+          { label: "在线", value: online, displayValue: fmtInt(online) },
+          { label: "离线", value: instances.length - online, displayValue: fmtInt(instances.length - online) },
+        ] : []}
+        breakdownLabel="已记录实例的在线状态"
+        secondaryTitle="未吊销的网关凭据"
+        secondaryValue={credentials ? valid : null}
+        secondaryFoot={credentials ? `共签发 ${fmtInt(credentials.length)} 份，已吊销 ${fmtInt(revoked)} 份。` : "凭据签发记录由控制面提供。"}
+        error={instancesError !== null}
+        secondaryError={credentialsError !== null}
+      >
+        <dl className="ops-facts">
+          <div><dt>版本与控制面不一致</dt><dd>{instances ? fmtInt(skewed) : "—"}</dd></div>
+          <div><dt>版本无法比较</dt><dd>{instances ? fmtInt(instances.filter((i) => i.version_matches_cp === null).length) : "—"}</dd></div>
+        </dl>
+      </InventorySummary>
 
       {bundle && <Bundle bundle={bundle} onClose={() => setBundle(null)} />}
 
@@ -145,6 +152,7 @@ export function Gateways({ operator }: TabProps) {
         main={
           <Card className="mb-0">
             <CardHeader
+              number={bundle ? 4 : 3}
               as="h2"
               title="网关实例"
               description="每个发过心跳的网关进程一行。超过控制面设定的时间没有心跳即为离线。"
@@ -159,7 +167,7 @@ export function Gateways({ operator }: TabProps) {
             ) : instances.length === 0 ? (
               <EmptyState mark="gateway" text="还没有网关发来心跳。" />
             ) : (
-              <DataTable>
+              <DataTable label="网关实例">
                 <thead>
                   <tr>
                     <th>凭据</th>
@@ -186,7 +194,7 @@ export function Gateways({ operator }: TabProps) {
                         )}
                       </td>
                       <td className="right num">{i.applied_revision}</td>
-                      <td className="text-muted-foreground">{fmtTime(i.last_seen_at)}</td>
+                      <td className="text-muted">{fmtTime(i.last_seen_at)}</td>
                       <td>
                         <Lamp state={i.online ? "applied" : "disabled"}>{i.online ? "在线" : "离线"}</Lamp>
                       </td>
@@ -200,6 +208,7 @@ export function Gateways({ operator }: TabProps) {
         aside={
           <Card className="mb-0">
             <CardHeader
+              number={bundle ? 5 : 4}
               as="h2"
               title={
                 <span className="inline-flex items-center gap-2">
@@ -231,9 +240,9 @@ export function Gateways({ operator }: TabProps) {
             ) : credentials.length === 0 ? (
               <EmptyState mark="gateway" text="还没有签发过网关凭据。" />
             ) : (
-              <ul className="-mx-6 -mb-6 mt-4 divide-y divide-border border-t border-border">
+              <ul className="-mx-7 -mb-7 mt-4 divide-y divide-border border-t border-line">
                 {credentials.map((c) => (
-                  <li key={c.dp_id} className="flex flex-col gap-1.5 px-6 py-3.5">
+                  <li key={c.dp_id} className="flex flex-col gap-1.5 px-7 py-3.5">
                     <div className="flex min-w-0 flex-wrap items-center justify-between gap-x-3 gap-y-1">
                       <strong className="min-w-0 font-medium break-all">{c.name}</strong>
                       {c.revoked_at ? (
@@ -242,11 +251,11 @@ export function Gateways({ operator }: TabProps) {
                         <Lamp state="applied">未吊销</Lamp>
                       )}
                     </div>
-                    <code className="truncate text-xs text-muted-foreground" title={c.dp_id}>
+                    <code className="truncate text-caption text-muted" title={c.dp_id}>
                       {c.dp_id}
                     </code>
                     <div className="flex flex-wrap items-start justify-between gap-x-3 gap-y-2">
-                      <span className="hint pt-1.5 text-xs">有效期至 {fmtTime(c.not_after)}</span>
+                      <span className="hint pt-1.5 text-caption">有效期至 {fmtTime(c.not_after)}</span>
                       {isAdmin && !c.revoked_at && (
                         <span className="right ml-auto min-w-0 max-w-full has-[.is-asking]:basis-full [&_.two-step]:max-w-full [&_.two-step-warn]:w-auto [&_.two-step-warn]:max-w-full">
                           <TwoStep
@@ -306,9 +315,9 @@ function IssueForm({ onIssued, onCancel }: { onIssued: (b: IssuedCredential) => 
   const listed = details.filter((d) => !ISSUE_FIELDS.includes(d.path));
 
   return (
-    <form ref={form} onSubmit={submit} className="mt-2 rounded-xl border border-border bg-muted/50 p-4">
-      <h3 className="mb-3 text-sm font-semibold">签发网关凭据</h3>
-      <div className="grid gap-x-4 sm:grid-cols-2 xl:grid-cols-1">
+    <form ref={form} onSubmit={submit} className="mt-2 rounded-cell border border-line bg-well p-4">
+      <h3 className="mb-3 text-body font-semibold">签发网关凭据</h3>
+      <div className="grid gap-x-4 tablet:grid-cols-2 desktop:grid-cols-1">
         <Field label="名称" error={at("/name")}>
           {(aria) => <input required value={name} onChange={(e) => setName(e.target.value)} {...aria} />}
         </Field>
@@ -353,7 +362,7 @@ function IssueForm({ onIssued, onCancel }: { onIssued: (b: IssuedCredential) => 
 }
 
 /** A bundle part: one line per line as issued, scrolled sideways rather than broken mid-line. */
-const PRE = "whitespace-pre break-normal text-xs leading-relaxed";
+const PRE = "whitespace-pre break-normal text-caption leading-relaxed";
 
 /** The deployment bundle, shown once: the answer to the issue is its only copy. */
 function Bundle({ bundle, onClose }: { bundle: IssuedCredential; onClose: () => void }) {
@@ -363,7 +372,8 @@ function Bundle({ bundle, onClose }: { bundle: IssuedCredential; onClose: () => 
   const copyFailed = () => setCopied({ kind: "crit", text: "浏览器不允许复制，请手动选中上面的内容复制。" });
 
   return (
-    <Card className="bundle mb-6 border-warning/40" aria-label="部署包">
+    <Card className="bundle mb-10" aria-label="部署包">
+      <CardHeader number={3} title="一次性部署包" />
       <div className="note warn mt-0">
         <p>
           <strong>部署包「{bundle.name}」：私钥只显示这一次</strong>
@@ -376,12 +386,12 @@ function Bundle({ bundle, onClose }: { bundle: IssuedCredential; onClose: () => 
           （Redis 地址）。部署包不含这两项，单副本可以不加。
         </p>
       </div>
-      <div className="grid items-start gap-6 xl:grid-cols-2">
+      <div className="grid items-start gap-3 desktop:grid-cols-2">
         <div className="min-w-0">
           <div className="mb-2 flex flex-wrap items-end justify-between gap-3">
             <div className="min-w-0">
-              <h3 className="m-0 text-sm font-semibold">环境变量</h3>
-              <p className="hint mt-1 text-[13px]">官方镜像以这些变量启动为托管模式的网关。多行的值用单引号括起。</p>
+              <h3 className="m-0 text-body font-semibold">环境变量</h3>
+              <p className="hint mt-1 text-caption">官方镜像以这些变量启动为托管模式的网关。多行的值用单引号括起。</p>
             </div>
             <CopyButton text={lines} label="复制全部" kind="primary" size="sm" onFailed={copyFailed} />
           </div>
@@ -390,20 +400,20 @@ function Bundle({ bundle, onClose }: { bundle: IssuedCredential; onClose: () => 
         </div>
         <div className="grid min-w-0 gap-4">
           <div className="min-w-0">
-            <h3 className="mt-0 mb-2 text-sm font-semibold">证书</h3>
+            <h3 className="mt-0 mb-2 text-body font-semibold">证书</h3>
             <pre className={PRE}>{bundle.cert_pem}</pre>
           </div>
           <div className="min-w-0">
-            <h3 className="mt-0 mb-2 text-sm font-semibold">私钥</h3>
+            <h3 className="mt-0 mb-2 text-body font-semibold">私钥</h3>
             <pre className={PRE}>{bundle.key_pem}</pre>
           </div>
           <div className="min-w-0">
-            <h3 className="mt-0 mb-2 text-sm font-semibold">CA 证书</h3>
+            <h3 className="mt-0 mb-2 text-body font-semibold">CA 证书</h3>
             <pre className={PRE}>{bundle.ca_pem}</pre>
           </div>
         </div>
       </div>
-      <div className="-mx-6 -mb-6 mt-6 flex justify-end gap-2 rounded-b-xl border-t border-border bg-muted/40 px-6 py-3">
+      <div className="-mx-7 -mb-7 mt-6 flex justify-end gap-2 rounded-b-card border-t border-line bg-well px-7 py-3 [&_.hint]:text-ink-soft">
         <Button type="button" onClick={onClose}>
           我已保存，关闭
         </Button>

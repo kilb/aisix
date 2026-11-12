@@ -1,23 +1,22 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Database } from "lucide-react";
 import type { TabProps } from "../../App";
 import { ApiError, library, type LibraryMeta, type LibraryPage } from "../../lib/api";
 import { messageFor } from "../../lib/errors";
 import { errorText } from "../../lib/fmt";
 import { droppedFieldText, flagText } from "../../lib/importReview";
-import { longContextLines, longContextText } from "../../lib/library";
+import { cardLines, longContextLines, longContextText } from "../../lib/library";
 import { fmtUtc } from "../../lib/money";
 import { safeHttpUrl } from "../../lib/safeUrl";
 import { Button } from "../../ui/Button";
-import { DataTable, Loading } from "../../ui/DataTable";
+import { DataTable } from "../../ui/DataTable";
 import { EmptyState } from "../../ui/EmptyState";
 import { Field } from "../../ui/Field";
 import { useToast } from "../../ui/Toast";
 import { usdPerMillion } from "./Baselines";
 import { LibrarySync } from "./LibrarySync";
 import { CREDIT } from "./PricingImport";
-import { Card, CardHeader, PageHeader } from "../../components/page";
-import { Count } from "./kit";
+import { BentoGrid, Card, CardHeader, CardMessage, ChartSkeleton, Metric, MetricSkeleton, PageHeader, span } from "../../components/page";
+import { CardFooter, Count } from "./kit";
 
 /** How many entries one search lists. */
 const LISTED = 50;
@@ -34,6 +33,8 @@ export function PriceLibrary({ canEdit, onGoto }: TabProps) {
   const toast = useToast();
   const [q, setQ] = useState("");
   const [page, setPage] = useState<LibraryPage | null>(null);
+  // 摘要标注最近一次成功读取的查询，输入变化时不把旧结果冒充新命中。
+  const [loadedQuery, setLoadedQuery] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [fetching, setFetching] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
@@ -48,6 +49,7 @@ export function PriceLibrary({ canEdit, onGoto }: TabProps) {
       const next = await library.browse(text, LISTED);
       if (n !== latest.current) return;
       setPage(next);
+      setLoadedQuery(text.trim());
       setError(null);
     } catch (e) {
       if (n !== latest.current) return;
@@ -79,53 +81,60 @@ export function PriceLibrary({ canEdit, onGoto }: TabProps) {
   }
 
   const meta = page?.library ?? null;
+  const sourceHref = safeHttpUrl(meta?.source_url);
+  const displayedLongContext = page?.items.filter((entry) => longContextLines(entry.card).length > 0).length ?? 0;
+  const displayedFlagged = page?.items.filter((entry) => entry.flags.length > 0).length ?? 0;
   return (
     <>
       <PageHeader
+        eyebrow="价格管理 / 价格库"
         title="价格库"
-        description={CREDIT}
+        dataLead={meta && page ? <>当前价格库包含 {meta.entries.toLocaleString("zh-CN")} 个条目；{loadedQuery ? `「${loadedQuery}」匹配` : "全部搜索范围有"} {page.total.toLocaleString("zh-CN")} 条，显示 {page.items.length.toLocaleString("zh-CN")} 条。核对完整价格与来源后再同步基准价。</> : "使用实际存储的价格库检索模型，核对来源与完整价格后再同步。"}
         actions={
           <Button type="button" icon="refresh" onClick={() => void load(q)}>
             刷新
           </Button>
         }
       />
-      <Card>
-        <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3 lg:flex-nowrap">
-          <div className="flex min-w-0 items-center gap-3">
-            <span className="grid size-9 shrink-0 place-items-center rounded-lg border border-border bg-muted text-muted-foreground" aria-hidden="true">
-              <Database className="size-4" />
-            </span>
-            <p className="library-status m-0 font-medium" aria-label="价格库状态">
-              {page === null ? "正在读取价格库…" : meta ? <>当前价格库：{libraryWords(meta)}</> : "还没有价格库。"}
-            </p>
-          </div>
-          {canEdit && (
-            <div className="flex shrink-0 flex-wrap items-center gap-2">
-              <Button type="button" onClick={() => onGoto("pricing", "imports")}>
-                去「导入审核」上传
-              </Button>
-              <Button type="button" kind="primary" busy={fetching} busyLabel="更新中…" onClick={() => void update()}>
-                更新价格库
-              </Button>
-            </div>
-          )}
-        </div>
-        {canEdit && (
-          <p className="hint mt-4 max-w-none border-t border-border pt-3 text-[13px]">
-            从数据集的发布地址获取最新数据。无法访问外网时，可在「导入审核」上传数据集文件，同样会更新价格库。
+      <p className="mb-6 text-body text-ink-soft">{CREDIT}</p>
+      <BentoGrid className="mb-3" aria-label="价格库概览">
+        <Card className={span.d7}>
+          <CardHeader number={1} title="当前价格库" description="实际存储版本 · 全部条目" />
+          {meta ? <Metric size="hero">{meta.entries.toLocaleString("zh-CN")}</Metric> : page ? <CardMessage>还没有价格库</CardMessage> : error ? <CardMessage onRetry={() => void load(q)}>未能读取价格库</CardMessage> : <MetricSkeleton />}
+          <p className="library-status mt-5 text-body text-ink-soft" aria-label="价格库状态">
+            {page === null ? error ? "价格库读取失败。" : "正在读取价格库…" : meta ? <>当前价格库：{libraryWords(meta)}</> : "还没有价格库。"}
           </p>
-        )}
-        {fetchError && (
-          <div className="note crit mb-0" role="alert">
-            更新失败：{fetchError}
-          </div>
-        )}
-      </Card>
+          {meta && (
+            <dl className="library-provenance mt-4 text-caption">
+              <div><dt>数据集</dt><dd className="mono">{meta.dataset}</dd></div>
+              <div><dt>来源版本</dt><dd className="mono">{meta.source_ref || "未提供版本"}</dd></div>
+              <div><dt>来源地址</dt><dd>{sourceHref ? <a href={sourceHref} target="_blank" rel="noopener noreferrer">{sourceHref}</a> : meta.source_url ? "来源地址不是可打开的 HTTP(S) 页面" : "未提供来源地址"}</dd></div>
+              <div><dt>内容校验</dt><dd className="mono">{meta.sha256}</dd></div>
+            </dl>
+          )}
+          {canEdit && (
+            <>
+              <p className="mt-4 text-caption text-muted">从数据集的发布地址获取最新数据。无法访问外网时，可在「导入审核」上传数据集文件，同样会更新价格库。</p>
+              <CardFooter>
+                <Button type="button" onClick={() => onGoto("pricing", "imports")}>去「导入审核」上传</Button>
+                <Button type="button" kind="primary" busy={fetching} busyLabel="更新中…" onClick={() => void update()}>更新价格库</Button>
+              </CardFooter>
+            </>
+          )}
+          {fetchError && <div className="note crit mb-0" role="alert">更新失败：{fetchError}</div>}
+        </Card>
+        <Card tone="inverse" className={span.d5Wide}>
+          <CardHeader number={2} title="搜索命中" description={page ? loadedQuery ? `最近成功查询：${loadedQuery}` : "最近成功查询：全部条目" : "等待读取搜索结果"} />
+          {meta && page ? <Metric size="display">{page.total.toLocaleString("zh-CN")}</Metric> : page ? <CardMessage>更新或上传数据集后即可搜索</CardMessage> : error ? <CardMessage onRetry={() => void load(q)}>未能读取搜索结果</CardMessage> : <MetricSkeleton />}
+          <p className="mt-4 text-body text-on-inverse-muted">搜索支持名称、ID、别名与供应商。每次最多显示 {LISTED} 条；缩小搜索范围可定位其余模型。</p>
+          {page && meta && <CardFooter className="justify-start border-surface/12 text-caption text-on-inverse-muted">当前显示 {page.items.length} 条，其中 {displayedLongContext} 条含长上下文价、{displayedFlagged} 条带审核标记。此计数仅覆盖当前显示条目。</CardFooter>}
+        </Card>
+      </BentoGrid>
       <Card>
         <CardHeader
-          className="mb-0"
+          number={3}
           title={<>价格库条目{page?.library && <Count n={page.total} />}</>}
+          description="输入、输出为默认档基础价；完整价格卡保留所有维度、服务档与长上下文价格。"
           actions={
             <div className="w-full sm:w-80 [&_.field]:mb-0">
               <Field label="搜索模型" hint="按模型名称、ID、别名或供应商">
@@ -143,7 +152,7 @@ export function PriceLibrary({ canEdit, onGoto }: TabProps) {
           </div>
         )}
         {page === null ? (
-          !error && <Loading />
+          !error && <ChartSkeleton />
         ) : !meta ? (
           <EmptyState text="还没有价格库。点「更新价格库」获取，或在「导入审核」上传数据集文件。" />
         ) : page.items.length === 0 ? (
@@ -157,6 +166,7 @@ export function PriceLibrary({ canEdit, onGoto }: TabProps) {
                   <th>模型</th>
                   <th className="num">输入</th>
                   <th className="num">输出</th>
+                  <th>完整价格卡</th>
                   <th>价格页面</th>
                 </tr>
               </thead>
@@ -164,9 +174,11 @@ export function PriceLibrary({ canEdit, onGoto }: TabProps) {
                 {page.items.map((e) => {
                   const base = e.card?.default?.base;
                   const href = safeHttpUrl(e.pricing_url);
+                  const lines = cardLines(e.card);
+                  const bands = longContextLines(e.card);
                   return (
                     <tr key={`${e.provider}/${e.model}`}>
-                      <td className="text-muted-foreground">{e.provider}</td>
+                      <td className="text-muted">{e.provider}</td>
                       <td>
                         <span className="mono font-medium">{e.model}</span>
                         {e.name && e.name !== e.model && <span className="cell-note">{e.name}</span>}
@@ -178,10 +190,10 @@ export function PriceLibrary({ canEdit, onGoto }: TabProps) {
                             未计入：{e.dropped.map(droppedFieldText).join("、")}
                           </span>
                         )}
-                        {longContextLines(e.card).length > 0 && (
+                        {bands.length > 0 && (
                           <span className="library-long-context mt-1">
                             <span className="tag">含长上下文价</span>
-                            {longContextLines(e.card).map((line) => (
+                            {bands.map((line) => (
                               <span key={`${line.tier}/${line.above_input_tokens}`} className="cell-note tabular">
                                 {longContextText(line)}
                               </span>
@@ -191,13 +203,21 @@ export function PriceLibrary({ canEdit, onGoto }: TabProps) {
                       </td>
                       <td className="num tabular">{base?.input !== undefined ? usdPerMillion(base.input) : "—"}</td>
                       <td className="num tabular">{base?.output !== undefined ? usdPerMillion(base.output) : "—"}</td>
+                      <td className="library-complete-card">
+                        {lines.length > 0 ? (
+                          <div className="library-card text-caption tabular">
+                            {lines.map((line, index) => <span key={index}>{line}</span>)}
+                          </div>
+                        ) : <span className="text-muted">无可同步价格卡</span>}
+                        {e.prices_checked && <span className="cell-note">价格核对时间：{fmtUtc(e.prices_checked)}</span>}
+                      </td>
                       <td>
                         {href ? (
                           <a href={href} target="_blank" rel="noopener noreferrer">
                             价格页面
                           </a>
                         ) : e.pricing_url ? (
-                          // Not an http(s) page: readable, and never a link.
+                          // 非 HTTP(S) 地址保留可读文本，不生成链接。
                           <span className="trunc" title={e.pricing_url}>
                             {e.pricing_url}
                           </span>
@@ -210,13 +230,13 @@ export function PriceLibrary({ canEdit, onGoto }: TabProps) {
                 })}
               </tbody>
             </DataTable>
-            <p className="hint -mx-6 -mb-6 mt-0 max-w-none rounded-b-[calc(var(--radius)+3px)] border-t border-border bg-muted/40 px-6 py-3 text-[13px]">
+            <CardFooter className="justify-start text-caption text-muted">
               共 {page.total} 条{page.total > page.items.length ? `，显示前 ${page.items.length} 条；输入更多文字以缩小范围` : ""}
-            </p>
+            </CardFooter>
           </>
         )}
       </Card>
-      <LibrarySync canEdit={canEdit} generation={generation} />
+      <LibrarySync canEdit={canEdit} generation={generation} cardNumber={4} />
     </>
   );
 }

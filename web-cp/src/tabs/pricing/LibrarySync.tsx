@@ -28,7 +28,7 @@ import { DataTable, Loading } from "../../ui/DataTable";
 import { EmptyState } from "../../ui/EmptyState";
 import { useToast } from "../../ui/Toast";
 import { cn } from "../../lib/cn";
-import { Card, CardHeader } from "../../components/page";
+import { Card, CardHeader, Metric } from "../../components/page";
 
 /** The attestation's own words: the checkbox's text, as the import's confirmation gives it. */
 const ATTESTATION = "已对照官方价格页核对";
@@ -56,7 +56,7 @@ export function CardLines({ card }: { card: unknown }) {
   const lines = cardLines((card ?? null) as Parameters<typeof cardLines>[0]);
   if (lines.length === 0) return <>—</>;
   return (
-    <span className="library-card">
+    <span className="library-card flex flex-col gap-1 text-caption [overflow-wrap:anywhere]">
       {lines.map((line) => (
         <span key={line} className="tabular">
           {line}
@@ -193,7 +193,7 @@ function Chosen({ item, onForget }: { item: SyncItem; onForget: () => void }) {
  * that appeared, or a price that moved, since the preview is refused, and the
  * page reads the preview again.
  */
-export function LibrarySync({ canEdit, generation }: { canEdit: boolean; generation: number }) {
+export function LibrarySync({ canEdit, generation, cardNumber = 4 }: { canEdit: boolean; generation: number; cardNumber?: number }) {
   const toast = useToast();
   const [preview, setPreview] = useState<SyncPreview | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -289,6 +289,7 @@ export function LibrarySync({ canEdit, generation }: { canEdit: boolean; generat
     <Card className="mb-0" role="region" aria-label="同步基准价">
       <CardHeader
         as="h2"
+        number={cardNumber}
         title="同步基准价"
         description={
           <>
@@ -315,26 +316,41 @@ export function LibrarySync({ canEdit, generation }: { canEdit: boolean; generat
         <EmptyState text="还没有可定价的模型。" />
       ) : (
         <>
-          <div className="library-counts grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6" aria-label="同步概况">
-            {counts.map(([label, state]) => (
-              <div key={state} className="rounded-xl border border-border bg-muted/50 px-3 py-2">
-                <div className="text-xs text-muted-foreground">{label}</div>
-                <div className="text-lg font-semibold tabular-nums">{count(state)}</div>
+          <div className="library-counts grid gap-6 desktop:grid-cols-12" aria-label="同步概况">
+            <div className="min-w-0 desktop:col-span-5">
+              <p className="mb-4 font-mono text-meta text-muted">待写入基准价 · 本次预览</p>
+              <Metric size="figure">{writable.toLocaleString("zh-CN")}</Metric>
+              <p className="mt-3 text-caption text-muted">共预览 {items.length.toLocaleString("zh-CN")} 个模型；本次可同步 {request.length.toLocaleString("zh-CN")} 个。</p>
+              <p className="mt-3 text-body text-ink-soft">{count("ambiguous") > 0 ? `${count("ambiguous").toLocaleString("zh-CN")} 个模型仍需选择价格来源。` : "已匹配的价格来源见下方清单。"} 需手动录入或无匹配的模型不会被同步。</p>
+            </div>
+            <div className="min-w-0 desktop:col-span-7">
+              <div className="mb-5 flex h-3 overflow-hidden rounded-full bg-well" role="img" aria-label={`本次预览 ${items.length} 个模型：${counts.map(([label, state]) => `${label} ${count(state)} 个`).join("，")}`}>
+                {counts.map(([label, state], i) => (
+                  <span key={state} title={`${label} ${count(state)}`} className={i === 0 ? "bg-ink" : i === 1 ? "bg-ink-soft" : i === 2 ? "bg-graphite" : i === 3 ? "bg-stone" : i === 4 ? "bg-line" : "bg-well"} style={{ width: `${count(state) / items.length * 100}%` }} />
+                ))}
               </div>
-            ))}
+              <dl className="grid grid-cols-2 gap-x-6 gap-y-3 tablet:grid-cols-3">
+                {counts.map(([label, state]) => (
+                  <div key={state} className="border-t border-ink/7 pt-3">
+                    <dt className="font-mono text-micro text-muted">{label}</dt>
+                    <dd className="mt-2 text-stat font-normal tabular-nums [overflow-wrap:anywhere]">{count(state).toLocaleString("zh-CN")}</dd>
+                  </div>
+                ))}
+              </dl>
+            </div>
           </div>
           {canEdit && (
             <div
-              className="library-confirm mt-4 mb-0 flex flex-wrap items-center gap-x-4 gap-y-2 rounded-xl border border-border bg-muted/50 px-4 py-3"
+              className="library-confirm mt-6 mb-0 flex flex-wrap items-center gap-x-4 gap-y-3 rounded-cell bg-well p-4 text-ink-soft"
               role="group"
               aria-label="确认同步"
             >
-              <label className="check mb-0">
+              <label className="check mb-0 min-h-11">
                 <input type="checkbox" checked={attested} onChange={(e) => setAttested(e.target.checked)} />
                 <span>{ATTESTATION}</span>
               </label>
               {writable > request.length && (
-                <span className="hint text-[13px]">
+                <span className="text-caption text-ink-soft">
                   共 {writable} 个模型待同步，一次最多同步 {preview.cap} 个；同步后再次确认剩下的。
                 </span>
               )}
@@ -402,8 +418,8 @@ export function LibrarySync({ canEdit, generation }: { canEdit: boolean; generat
                         </span>
                       )}
                     </td>
-                    <td className="text-[13px]">{item.current ? <CardLines card={item.current.card} /> : "未定价"}</td>
-                    <td className="text-[13px]">
+                    <td className="text-caption">{item.current ? <CardLines card={item.current.card} /> : "未定价"}</td>
+                    <td className="text-caption">
                       {row.state === "ambiguous" || row.state === "unmatched" ? "—" : <CardLines card={row.entry?.card} />}
                     </td>
                   </tr>
@@ -507,7 +523,7 @@ export function LibrarySyncOne({
 
   return (
     <section className={cn("library-one", className)} aria-label="从价格库同步">
-      <h3 className="mb-3 text-base">从价格库同步</h3>
+      <h3 className="mb-3 font-mono text-meta text-muted">从价格库同步</h3>
       {error && (
         <div className="note crit" role="alert">
           {error}
@@ -539,7 +555,7 @@ export function LibrarySyncOne({
           {item.state === "ambiguous" && !chosen && <p className="hint">价格库中有多个候选条目：请选择价格来源。</p>}
           {item.state === "unmatched" && <p className="hint">价格库中没有与模型名称对应的条目。</p>}
           {entry && item.state !== "flagged" && (
-            <p className="library-card-block rounded-xl border border-border bg-muted/50 p-3 text-[13px]">
+            <p className="library-card-block rounded-cell bg-well p-4 text-caption text-ink-soft">
               价格库价格（美元/百万 tokens）：
               <CardLines card={entry.card} />
             </p>
@@ -548,11 +564,11 @@ export function LibrarySyncOne({
           {warning && <p className="hint">{warning}</p>}
           {canEdit && writeable && (
             <div
-              className="library-confirm m-0 flex flex-wrap items-center justify-between gap-3 border-t border-border pt-3"
+              className="library-confirm m-0 flex flex-wrap items-center justify-between gap-3 border-t border-ink/7 pt-3"
               role="group"
               aria-label="确认从价格库同步"
             >
-              <label className="check mb-0">
+              <label className="check mb-0 min-h-11">
                 <input type="checkbox" checked={attested} onChange={(e) => setAttested(e.target.checked)} />
                 <span>{ATTESTATION}</span>
               </label>

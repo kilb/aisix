@@ -65,8 +65,8 @@ function withRate(map: RateMap, dimension: string, rate: string | undefined): Ra
   return next;
 }
 
-/** A set of rate fields: as many columns as the tier's box holds, two at the narrowest. */
-const RATE_GRID = "grid grid-cols-2 items-start gap-3 @md:grid-cols-3 @2xl:grid-cols-4 [&_.field]:mb-0";
+/** 费率字段随容器宽度分为一至三列，小屏保持完整输入宽度。 */
+const RATE_GRID = "grid grid-cols-1 items-start gap-3 @md:grid-cols-2 @2xl:grid-cols-3 [&_.field]:mb-0";
 
 /** The units the field view takes: a rate per call is typed per thousand. */
 const FIELD_UNITS = "token 价格按每百万 tokens 填写；联网搜索按每千次填写，例如「每 1,000 次 10 美元」填 10。";
@@ -264,14 +264,18 @@ export function RateCardEditor({
   }
 
   function toggleJson() {
+    // 无法换算的每千次单价只存在字段草稿中，先纠正再切换视图。
+    if (json === null && unread > 0) return;
     setDrafts({});
-    setJsonError(null);
     if (json === null) {
       // Opening the JSON view: the fields' card as a document.
+      setJsonError(null);
       setShapeError(null);
       setJson(JSON.stringify(value ?? {}, null, 2));
       return;
     }
+    // 语法错误时 value 仍是上次合法文档，不能用它切回字段并丢掉原始输入。
+    if (jsonError !== null) return;
     // Closing it: the fields can render only a card whose tiers, base rates
     // and bands are the shapes they read. A card that is not stays here, with
     // what is wrong named, so the text typed is not lost to a blank page.
@@ -285,9 +289,9 @@ export function RateCardEditor({
   }
 
   return (
-    <fieldset className="rate-card" aria-invalid={mine.length > 0 ? true : undefined} aria-describedby={above.length > 0 ? aboveId : undefined}>
+    <fieldset className="rate-card min-w-0 text-body" aria-invalid={mine.length > 0 ? true : undefined} aria-describedby={above.length > 0 ? aboveId : undefined}>
       <legend>价格卡（美元）</legend>
-      <p className="hint mb-3 text-[13px]">{json === null ? FIELD_UNITS : JSON_UNITS}</p>
+      <p className="hint mb-3 text-caption text-ink-soft">{json === null ? FIELD_UNITS : JSON_UNITS}</p>
       {above.length > 0 && (
         <div className="note crit" role="alert" id={aboveId}>
           {above.map((d) => d.message).join("；")}
@@ -304,12 +308,12 @@ export function RateCardEditor({
             return (
               <section
                 key={tier}
-                className="rate-tier @container m-0 mb-3 rounded-lg border border-border bg-card p-4"
+                className="rate-tier @container m-0 mb-3 rounded-3xl border border-line bg-surface p-7"
                 role="group"
                 aria-label={tierTitle(tier)}
               >
-                <div className="mb-3 flex min-h-8 items-center justify-between gap-3">
-                  <h4 className="m-0 text-sm">{tierTitle(tier)}</h4>
+                <div className="mb-4 flex min-h-11 flex-wrap items-center justify-between gap-3">
+                  <h4 className="m-0 font-mono text-meta font-medium text-ink">{tierTitle(tier)}</h4>
                   {tier !== "default" && (
                     <Button type="button" size="sm" kind="quiet" onClick={() => removeTier(tier)}>
                       移除档位
@@ -339,7 +343,7 @@ export function RateCardEditor({
                   return (
                     <div
                       key={n}
-                      className="rate-band mt-3 mb-0 rounded-md border border-border bg-muted/40 p-3"
+                      className="rate-band mt-3 mb-0 rounded-2xl border border-line bg-well p-4 text-ink-soft"
                       role="group"
                       aria-label={`${tierTitle(tier)} 长上下文档 ${n + 1}`}
                     >
@@ -381,7 +385,7 @@ export function RateCardEditor({
               </section>
             );
           })}
-          <div className="rate-add-tier flex flex-wrap items-end gap-3 [&_.field]:mb-0 [&_.field]:min-w-48 [&_.field]:flex-1">
+          <div className="rate-add-tier flex min-w-0 flex-wrap items-end gap-3 [&_.field]:mb-0 [&_.field]:min-w-0 [&_.field]:basis-48 [&_.field]:flex-1">
             <Field label="要添加的档位">
               <select value={picked} onChange={(e) => setAdding(e.target.value)}>
                 {offered.map((t) => (
@@ -401,7 +405,7 @@ export function RateCardEditor({
               添加档位
             </Button>
           </div>
-          <p className="hint mt-3 text-[13px]">{TIER_HINT}</p>
+          <p className="hint mt-3 text-caption text-ink-soft">{TIER_HINT}</p>
         </>
       ) : (
         <>

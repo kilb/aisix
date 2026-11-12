@@ -30,13 +30,13 @@ export function JsonEditor({
   }
 
   return (
-    <div className="json-editor">
+    <div className="json-editor min-w-0 text-body">
       <textarea
         aria-label="资源文档"
         spellCheck={false}
         readOnly={!onChange}
         value={value}
-        className="min-h-[360px] text-[13px] leading-relaxed"
+        className="min-h-90 w-full rounded-xl border border-line bg-surface font-mono text-caption leading-relaxed text-ink"
         onChange={(e) => {
           setFormatError(null);
           onChange?.(e.target.value);
@@ -55,12 +55,12 @@ export function JsonEditor({
       {details.length > 0 && (
         <ul
           id={problemsId}
-          className="json-problems mt-3 list-none rounded-lg border border-danger/30 bg-danger-soft py-2.5 pr-4 pl-4"
+          className="json-problems mt-3 list-none rounded-2xl border border-line bg-well px-4 py-3 text-caption text-ink-soft"
           aria-label="校验问题"
         >
           {details.map((d, i) => (
             <li key={i} data-path={d.path}>
-              <mark className="json-path">{d.path || "（文档根）"}</mark> {d.message}
+              <mark className="json-path rounded bg-stone px-1 py-0.5 font-mono text-meta text-ink">{d.path || "（文档根）"}</mark> {d.message}
             </li>
           ))}
         </ul>

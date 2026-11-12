@@ -1,18 +1,5 @@
-/* Element defaults on top of tokens.css and Tailwind's preflight: the faces,
-   the page, headings, figures, native controls, focus, selection and
-   motion. Each app's index.css imports this into Tailwind's base layer, so
-   any utility on an element overrides it.
-
-   Shared: the Dashboard (web-cp) and the tenant portal (web-tenant) carry a
-   byte-equal copy of this file, as they do of tokens.css. A unit test in
-   web-tenant pins the two together, so change them together.
-
-   The faces are self-hosted from two @fontsource packages (Geist and Geist
-   Mono, variable weight); only the Latin subsets are loaded, and Chinese
-   comes from the system stack in --font-sans. Geist's own metrics centre
-   its box 0.355em above the baseline, where the cap height and the CJK em
-   box are centred too, so mixed text shares one line with no overrides. */
-
+/* 双端基础样式同步维护。Geist 自托管 Latin，Noto Sans SC 由入口自托管导入。
+   混排保留 Latin 的半宽中点；本层低于页面 utility，不覆盖调用方布局。 */
 @font-face {
   font-family: "Geist";
   font-style: normal;
@@ -43,229 +30,135 @@
   scrollbar-width: thin;
   scrollbar-color: var(--scrollbar) transparent;
 }
-
 html {
   -webkit-text-size-adjust: 100%;
   background: var(--background);
   font-synthesis: none;
 }
-
 body {
   margin: 0;
+  min-width: 0;
   min-height: 100vh;
-  /* Two soft washes over the page colour, fixed so they light the screen
-     rather than the document: indigo from the upper left, the brand's yellow
-     from the upper right, both far too faint to read as colour. */
-  background-color: var(--background);
-  background-image:
-    radial-gradient(1100px 620px at 6% -12%, var(--wash-1), transparent 68%),
-    radial-gradient(900px 520px at 96% -18%, var(--wash-2), transparent 62%);
-  background-attachment: fixed;
-  background-repeat: no-repeat;
+  background: var(--background);
   color: var(--foreground);
   font-family: var(--font-sans);
   font-size: 14px;
-  line-height: 1.6;
-  /* Chinese may break between characters, but splitting a word such as
-     「客户端」 down the middle reads wrong. */
+  line-height: 1.5;
   line-break: strict;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   text-rendering: optimizeLegibility;
 }
-
-::selection {
-  background: var(--selection);
-}
-
-h1,
-h2,
-h3,
-h4 {
-  font-weight: 600;
+::selection { background: var(--selection); }
+h1, h2, h3, h4 {
+  font-weight: 500;
   line-height: 1.3;
-  letter-spacing: -0.015em;
+  letter-spacing: -0.02em;
   text-wrap: balance;
 }
-
-p {
-  text-wrap: pretty;
-}
-
+p { text-wrap: pretty; }
 a {
   color: var(--link);
   text-underline-offset: 3px;
   text-decoration-thickness: 1px;
 }
-
-code,
-kbd,
-samp,
-.mono {
+code, kbd, samp, .mono {
   font-family: var(--font-mono);
   font-size: 0.92em;
   letter-spacing: -0.01em;
 }
-
-/* Figures align by place wherever digits stack. */
-table,
-.num,
-.money,
-.tabular {
-  font-variant-numeric: tabular-nums;
-}
-
-/* Currency signs and units: muted, a step under the figure. */
-.cur,
-.unit {
+table, .num, .money, .tabular { font-variant-numeric: tabular-nums; }
+.cur, .unit {
   color: var(--muted-foreground);
   font-size: 0.86em;
   font-weight: 400;
 }
 
-/* ── Native controls, drawn as shadcn draws its Input and Select ── */
+/* 普通控件统一 44px。拒绝态依靠边型和原因文本，不借橙色表达失败。 */
+button { min-width: 44px; min-height: 44px; }
 input:not([type="checkbox"], [type="radio"], [type="range"], [type="color"], [type="file"]),
-select,
-textarea {
+select, textarea {
   width: 100%;
   min-width: 0;
-  height: 36px;
-  padding: 0 12px;
+  height: var(--h-control);
+  padding: 0 14px;
   border: 1px solid var(--input);
-  border-radius: calc(var(--radius) - 2px);
+  border-radius: var(--r-input);
   background-color: var(--card);
   color: var(--foreground);
   font-size: 14px;
   line-height: 20px;
-  box-shadow: var(--shadow-xs);
-  transition:
-    border-color 120ms ease,
-    box-shadow 120ms ease;
+  transition: border-color 120ms ease, background-color 120ms ease;
 }
-input::placeholder,
-textarea::placeholder {
-  color: var(--muted-foreground);
-  opacity: 1;
-}
-input::-webkit-inner-spin-button,
-input::-webkit-outer-spin-button {
-  -webkit-appearance: none;
-  margin: 0;
-}
-input[type="number"] {
-  -moz-appearance: textfield;
-  appearance: textfield;
-}
-:is(input, select, textarea):not(:disabled):hover {
-  border-color: var(--input-border-hover);
-}
+input::placeholder, textarea::placeholder { color: var(--muted-foreground); opacity: 1; }
+input::-webkit-inner-spin-button, input::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+input[type="number"] { -moz-appearance: textfield; appearance: textfield; }
+:is(input, select, textarea):not(:disabled):hover { border-color: var(--input-border-hover); }
 :is(input, select, textarea):focus-visible {
   border-color: var(--ring);
-  outline: none;
-  box-shadow: 0 0 0 3px var(--focus-halo);
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
 }
-:is(input, select, textarea)[aria-invalid="true"] {
-  border-color: var(--danger);
-}
-:is(input, select, textarea)[aria-invalid="true"]:focus-visible {
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger) 20%, transparent);
-}
-:is(input, select, textarea):disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-  background-color: var(--muted);
-}
-input:read-only:not(:disabled, [type="checkbox"], [type="radio"], [type="file"]),
-textarea:read-only {
-  background-color: var(--muted);
-}
-textarea {
-  height: auto;
-  padding: 8px 12px;
-  resize: vertical;
-}
+:is(input, select, textarea)[aria-invalid="true"] { border-color: var(--danger); border-style: dashed; }
+:is(input, select, textarea):disabled { opacity: 0.5; cursor: not-allowed; background-color: var(--muted); }
+input:read-only:not(:disabled, [type="checkbox"], [type="radio"], [type="file"]), textarea:read-only { background-color: var(--muted); }
+textarea { height: auto; min-height: var(--h-control); padding: 12px 14px; resize: vertical; }
 select {
   appearance: none;
   padding-right: 36px;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4.5 6.5 8 10l3.5-3.5' fill='none' stroke='%23666666' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4.5 6.5 8 10l3.5-3.5' fill='none' stroke='%2364635D' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
   background-repeat: no-repeat;
-  background-position: right 10px center;
+  background-position: right 12px center;
   background-size: 16px 16px;
   cursor: pointer;
   text-overflow: ellipsis;
 }
 :root[data-theme="dark"] select {
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4.5 6.5 8 10l3.5-3.5' fill='none' stroke='%23A1A1A1' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4.5 6.5 8 10l3.5-3.5' fill='none' stroke='%23ECEAE4' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
 }
-input[type="checkbox"],
-input[type="radio"] {
+input[type="checkbox"], input[type="radio"] {
   appearance: none;
   flex: none;
   display: inline-block;
-  width: 16px;
-  height: 16px;
+  width: 18px;
+  height: 18px;
   margin: 0;
   border: 1px solid var(--input);
   background: var(--card) no-repeat center / 12px 12px;
   vertical-align: middle;
   cursor: pointer;
-  transition:
-    background-color 120ms ease,
-    border-color 120ms ease;
+  transition: background-color 120ms ease, border-color 120ms ease;
 }
-input[type="checkbox"] {
-  border-radius: 4px;
-}
-input[type="radio"] {
-  border-radius: 50%;
-}
+input[type="checkbox"] { border-radius: var(--r-chip); }
+input[type="radio"] { border-radius: 50%; }
 input[type="checkbox"]:checked {
   border-color: var(--primary);
   background-color: var(--primary);
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 6.25 4.75 8.5 9.5 3.5' fill='none' stroke='white' stroke-width='1.75' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 6.25 4.75 8.5 9.5 3.5' fill='none' stroke='%23FBFAF7' stroke-width='1.75' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
 }
-:root[data-theme="dark"] input[type="checkbox"]:checked {
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 6.25 4.75 8.5 9.5 3.5' fill='none' stroke='%230A0A0A' stroke-width='1.75' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+:root[data-theme="dark"] input[type="checkbox"]:checked,
+.panel[data-tone="inverse"] input[type="checkbox"]:checked {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 6.25 4.75 8.5 9.5 3.5' fill='none' stroke='%23121211' stroke-width='1.75' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
 }
-input[type="radio"]:checked {
-  border-color: var(--primary);
-  background-image: radial-gradient(circle, var(--primary) 0 3.5px, transparent 4px);
-}
-:is(input[type="checkbox"], input[type="radio"]):focus-visible {
-  outline: 2px solid var(--ring);
-  outline-offset: 2px;
-}
-:is(input[type="checkbox"], input[type="radio"]):disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-input[type="file"] {
-  max-width: 100%;
-  color: var(--muted-foreground);
-  font-size: 13px;
-  cursor: pointer;
-}
+input[type="radio"]:checked { border: 5px solid var(--primary); }
+:is(input[type="checkbox"], input[type="radio"]):focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+:is(input[type="checkbox"], input[type="radio"]):disabled { opacity: 0.5; cursor: not-allowed; }
+/* 小型选择框由可点击标签承载足够命中区，避免把每个勾选方框画成大按钮。 */
+label:has(> input:is([type="checkbox"], [type="radio"])) { min-height: 44px; }
+input[type="file"] { max-width: 100%; color: var(--muted-foreground); font-size: 13px; cursor: pointer; }
 input[type="file"]::file-selector-button {
-  height: 32px;
+  height: var(--h-control);
   margin-right: 12px;
-  padding: 0 12px;
-  border: 1px solid var(--border);
-  border-radius: calc(var(--radius) - 2px);
+  padding: 0 16px;
+  border: 1px solid var(--input);
+  border-radius: var(--r-button);
   background: var(--card);
-  box-shadow: var(--shadow-xs);
   color: var(--foreground);
   font: inherit;
   font-weight: 500;
   cursor: pointer;
 }
-
-/* Keyboard focus, never removed. */
-:focus-visible {
-  outline: 2px solid var(--ring);
-  outline-offset: 2px;
-}
-
-/* Present for assistive technology, absent from the screen. */
+:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
 .vh {
   position: absolute !important;
   width: 1px;
@@ -278,23 +171,7 @@ input[type="file"]::file-selector-button {
   white-space: nowrap;
   border: 0;
 }
-
-/* Long names truncate with an ellipsis and never wrap mid-identifier; the
-   full text is in the element's title. --trunc sets the width. */
-.trunc {
-  display: block;
-  max-width: var(--trunc, 200px);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
+.trunc { display: block; max-width: var(--trunc, 200px); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 @media (prefers-reduced-motion: reduce) {
-  *,
-  *::before,
-  *::after {
-    animation: none !important;
-    transition: none !important;
-    scroll-behavior: auto !important;
-  }
+  *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
 }

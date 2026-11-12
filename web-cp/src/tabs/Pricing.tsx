@@ -10,7 +10,7 @@ import { PricingImport } from "./pricing/PricingImport";
 import { PublicModels } from "./pricing/PublicModels";
 import { PriceLibrary } from "./pricing/PriceLibrary";
 
-/** The sections of 「价格」, in order. Each task appends its own entry. */
+/** 价格分区保持既有顺序、权限与深链入口。 */
 export const SECTIONS: Section[] = [{ id: "groups", label: "分组", Component: Groups, minRole: "viewer" },
   { id: "plans", label: "租户方案", Component: TenantPlans, minRole: "viewer" },
   { id: "cost", label: "成本价", Component: CostPrices, minRole: "viewer" },
@@ -23,5 +23,5 @@ export const SECTIONS: Section[] = [{ id: "groups", label: "分组", Component: 
 ];
 
 export function Pricing(props: TabProps) {
-  return <SectionHost label="价格" sections={SECTIONS} {...props} />;
+  return <div className="pricing-workspace"><SectionHost label="价格" sections={SECTIONS} {...props} /></div>;
 }

@@ -10,13 +10,11 @@ export type ButtonKind = "primary" | "secondary" | "danger" | "quiet";
 
 export interface ButtonProps extends ComponentProps<"button"> {
   /**
-   * `primary` is the near-black fill, one per view; `secondary`, the
-   * default, the outlined white button; `danger` the red fill a destructive
-   * action takes in its second step only; `quiet` a text button for headers
-   * and dense rows.
+   * `primary` 为深色主操作；`secondary` 为默认轮廓按钮；
+   * `danger` 仅用于破坏性操作第二步，以确认文字区分；`quiet` 为安静文本操作。
    */
   kind?: ButtonKind;
-  /** `sm` is the 32px toolbar and table height; the default is 36px. */
+  /** 保留 sm 调用接口；两种尺寸均有 44px 命中区。 */
   size?: "sm";
   /** Takes the full width of its container. */
   block?: boolean;
@@ -42,26 +40,24 @@ export interface ButtonProps extends ComponentProps<"button"> {
 
 /** shadcn/ui's button, in this app's four kinds and two sizes. */
 const buttonClass = cva(
-  "btn relative inline-flex shrink-0 cursor-pointer select-none items-center justify-center gap-2 whitespace-nowrap rounded-[10px] text-sm font-medium leading-4 transition-[color,background-color,border-color,box-shadow,transform,opacity] duration-150 enabled:active:translate-y-px disabled:cursor-not-allowed disabled:opacity-50 aria-disabled:cursor-not-allowed aria-disabled:opacity-50 [&_svg]:size-4 [&_svg]:shrink-0",
+  "btn relative inline-flex shrink-0 cursor-pointer select-none items-center justify-center gap-2 whitespace-nowrap rounded-full text-body font-medium leading-4 transition-colors duration-150 disabled:cursor-not-allowed disabled:opacity-50 aria-disabled:cursor-not-allowed aria-disabled:opacity-50 [&_svg]:size-4 [&_svg]:shrink-0",
   {
     variants: {
       kind: {
-        // A filled action sits in its own coloured light; the outlined one is
-        // a white chip lifted a step off the page.
-        primary: "bg-primary text-primary-foreground shadow-btn enabled:hover:bg-primary/92",
-        secondary: "border border-border bg-card text-foreground shadow-sm enabled:hover:border-(--input) enabled:hover:bg-accent",
-        danger: "bg-destructive text-destructive-foreground shadow-xs enabled:hover:bg-destructive/90",
-        quiet: "text-text-2 enabled:hover:bg-accent enabled:hover:text-foreground",
+        primary: "border border-primary bg-primary text-primary-foreground enabled:hover:bg-primary/90",
+        secondary: "border border-line bg-card text-foreground enabled:hover:border-input enabled:hover:bg-foreground/5",
+        danger: "border border-destructive bg-destructive text-destructive-foreground enabled:hover:bg-destructive/90",
+        quiet: "border border-transparent text-text-2 enabled:hover:bg-foreground/6 enabled:hover:text-foreground",
       },
-      size: { md: "h-9 px-4", sm: "h-8 px-3 text-[13px]" },
+      size: { md: "h-11 min-w-11 px-5", sm: "h-11 min-w-11 px-4 text-caption" },
       iconOnly: { true: "px-0", false: "" },
       block: { true: "w-full", false: "" },
     },
     compoundVariants: [
-      { iconOnly: true, size: "md", className: "w-9" },
-      { iconOnly: true, size: "sm", className: "w-8" },
-      { kind: "quiet", iconOnly: false, size: "md", className: "px-3" },
-      { kind: "quiet", iconOnly: false, size: "sm", className: "px-2" },
+      { iconOnly: true, size: "md", className: "w-11" },
+      { iconOnly: true, size: "sm", className: "w-11" },
+      { kind: "quiet", iconOnly: false, size: "md", className: "px-4" },
+      { kind: "quiet", iconOnly: false, size: "sm", className: "px-3" },
     ],
   },
 );

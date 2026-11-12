@@ -42,8 +42,8 @@ export function Gate({
   }
 
   return (
-    <div id="gate" className="relative flex min-h-screen flex-col items-center justify-center bg-background px-4 py-16">
-      <div className="absolute top-4 right-4 sm:top-6 sm:right-6">
+    <div id="gate" className="cp-gate">
+      <div className="cp-gate-theme">
         <Button
           kind="quiet"
           size="sm"
@@ -56,20 +56,28 @@ export function Gate({
         </Button>
       </div>
 
-      <div className="w-full max-w-[400px]">
-        <div className="mb-8 flex flex-col items-center text-center">
-          <span
-            className="brand-mark size-11 rounded-[11px] shadow-xs after:top-[17px] after:right-[10px] after:left-[10px] after:h-[10px]"
-            aria-hidden="true"
-          />
-          <h1 className="display mt-5 text-2xl font-semibold tracking-tight">Routio 运维台</h1>
-          <p className="mt-1.5 text-sm text-muted-foreground">控制面 · 运维登录</p>
+      <header className="cp-gate-intro">
+        <div className="cp-gate-brand">
+          <span className="brand-mark" aria-hidden="true" />
+          <span>Routio</span>
         </div>
-
+        <span className="font-mono text-meta text-muted-foreground">运维工作空间</span>
+        <h1 className="cp-gate-title">Routio 运维台</h1>
+        <p>连接上游，管理路由。<br />在一个工作空间查看网关、配置与计费。</p>
+        <div className="cp-gate-meta">
+          <span>网关与路由</span><span>组织与账务</span><span>配置下发状态</span>
+        </div>
+      </header>
+      <div className="cp-gate-form">
         <form
-          className="gate-form panel m-0 grid gap-0 rounded-2xl p-6 sm:p-8"
+          className="gate-form panel grid gap-0"
           onSubmit={submit}
         >
+          <div className="mb-6">
+            <div className="mb-3 font-mono text-meta text-muted-foreground" aria-hidden="true">01 — 账户</div>
+            <h2 className="text-stat font-medium">运维登录</h2>
+            <p className="mt-2 text-caption text-muted-foreground">使用平台分配的运维账号继续。</p>
+          </div>
           {notice && (
             <div className="note warn mt-0 mb-5" role="status">
               {notice}

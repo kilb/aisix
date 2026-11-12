@@ -6,7 +6,7 @@ import { Button } from "../ui/Button";
  */
 export function ConflictNote({ onReload }: { onReload: () => void }) {
   return (
-    <div className="note warn" role="alert">
+    <div className="note warn text-body" role="alert">
       该资源已被他人修改。重新载入后再编辑。{" "}
       <Button type="button" size="sm" onClick={onReload}>
         重新载入

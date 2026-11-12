@@ -248,7 +248,8 @@ test("成员页汇总两名成员真实用量与各自预算，普通成员只�
   for (const [row, call] of [[aliceRow, aliceCall], [bobRow, bobCall]] as const) {
     await expect(row.getByText("1 次调用", { exact: true })).toBeVisible();
     const tokens = BigInt(call.usage.input_tokens) + BigInt(call.usage.output_tokens);
-    await expect(row.getByText(`计费用量 ${tokens} token`, { exact: true })).toBeVisible();
+    const shownTokens = tokens.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+    await expect(row.getByText(`计费用量 ${shownTokens} token`, { exact: true })).toBeVisible();
     const micro = BigInt(expectedMicroCny(call.usage));
     const decimal = `${micro / 1000000n}.${(micro % 1000000n).toString().padStart(6, "0")}`.replace(/0+$/, "").replace(/\.$/, "");
     await expect(row.getByText(`已计费 ¥${decimal}`, { exact: true })).toBeVisible();

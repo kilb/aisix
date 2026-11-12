@@ -1,9 +1,10 @@
-/* 上游账号 · 模型. The layout is Tailwind classes in the markup; these are
-   the few hooks it shares. Every value comes from the tokens. */
+/* 上游账号的模型映射使用设计系统 token，局部规则只处理表格控件。 */
 
 .ch-tick {
   display: inline-flex;
   align-items: center;
+  min-width: 44px;
+  min-height: 44px;
 }
 .ch-num {
   width: 5.5rem;
@@ -11,7 +12,7 @@
   font-variant-numeric: tabular-nums;
 }
 
-/* A row's own failure, listed together under the table. */
+/* 每行的写入错误集中列在表格下方。 */
 .ch-errors {
   margin: var(--s-3) 0;
   padding-left: var(--s-4);
@@ -20,7 +21,7 @@
   margin: var(--s-1) 0;
 }
 
-/* One line of a two-step's warning. */
+/* 两步确认中的每一条警告。 */
 .ch-warn-line {
   display: block;
 }

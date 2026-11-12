@@ -1,37 +1,75 @@
-/* 价格 · 价格库, and its per-model sync. Every value comes from the tokens. */
+/* 价格库与单模型同步共用完整价格行的排列。 */
 
-/* A flagged entry's reasons are the point of its note, so they stay readable. */
 .library-flags {
-  color: var(--text-2);
+  color: var(--color-ink-soft);
 }
 
-/* A card's lines and an entry's parts stack in their cell. */
 .library-card,
 .library-entry {
   display: flex;
   flex-direction: column;
-  gap: var(--s-1);
+  gap: 0.25rem;
 }
 
 .library-card-block {
   display: flex;
   flex-direction: column;
-  gap: var(--s-2);
+  gap: 0.5rem;
 }
 
-/* A long-context band's tag and its rates: marked on every entry that
-   carries one, so a price a baseline lacks is never silent. */
+/* 每个长上下文档保留阈值与费率，避免与默认基础价混淆。 */
 .library-long-context {
   display: flex;
   flex-direction: column;
-  gap: var(--s-1);
+  gap: 0.25rem;
   align-items: flex-start;
 }
 
-/* The entry chosen for an ambiguous model, and the way to choose again. */
+/* 多个匹配条目的已选来源与重新选择入口。 */
 .library-chosen {
   display: flex;
   flex-wrap: wrap;
-  gap: var(--s-2);
+  gap: 0.5rem;
   align-items: center;
+}
+
+.library-status,
+.library-provenance dd {
+  overflow-wrap: anywhere;
+}
+
+.library-provenance {
+  display: grid;
+  gap: 0;
+}
+
+.library-provenance > div {
+  display: grid;
+  grid-template-columns: 5rem minmax(0, 1fr);
+  gap: 0.75rem;
+  padding: 0.75rem 0;
+  border-top: 1px solid color-mix(in srgb, var(--color-ink) 7%, transparent);
+}
+
+.library-provenance dt {
+  color: var(--color-muted);
+}
+
+.library-provenance dd {
+  min-width: 0;
+  margin: 0;
+  color: var(--color-ink-soft);
+}
+
+/* 价格表在自身滚动容器内展开，完整档位与维度均保持可读。 */
+.library-complete-card {
+  min-inline-size: 24rem;
+  max-inline-size: 36rem;
+  white-space: normal;
+}
+
+.library-complete-card .library-card {
+  gap: 0.75rem;
+  color: var(--color-ink-soft);
+  overflow-wrap: anywhere;
 }

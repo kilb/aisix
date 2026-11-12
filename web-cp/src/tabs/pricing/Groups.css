@@ -1,4 +1,9 @@
-/* 价格 · 分组. Every value comes from the tokens. */
+/* 价格分区保留宽表的内部滚动，页面自身不扩宽。 */
+.pricing-workspace,
+.pricing-workspace > .sections {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
 
 /* The header's own actions, and a row's, sit together and do not wrap. */
 .row-actions {
@@ -11,19 +16,19 @@
 /* The designated default group, beside its display name. */
 .grp-default {
   margin-left: var(--s-2);
-  border-color: var(--primary);
-  background: var(--primary);
-  color: var(--primary-foreground);
+  border-color: transparent;
+  background: var(--color-ink);
+  color: var(--color-surface);
 }
 
 /* A model's own rate, as opposed to the group's default. */
 .grp-override {
-  background: var(--chip);
-  color: var(--text);
+  background: var(--color-well);
+  color: var(--color-ink-soft);
 }
 
-/* A model with no baseline: the word in the error red. */
+/* 未定价由明确文字表达，不借用强调色表示错误。 */
 .grp-unpriced {
-  color: var(--error);
-  font-weight: 700;
+  color: var(--color-ink);
+  font-weight: 500;
 }

@@ -1,23 +1,26 @@
 import { useId, type ReactNode } from "react";
 import { fmtMicroCny } from "../lib/money";
+import { cn } from "../lib/cn";
+import { Card, CardHeader, Metric, span } from "../components/page";
 
 export type ReadoutLevel = "organization" | "member" | "key";
 
 export interface ReadoutStop {
   level: ReadoutLevel;
   label: string;
-  remainingMicroCny: number | null;
+  remainingMicroCny: number | string | bigint | null;
 }
 
-/** What each level's remaining amount is, under its figure. */
+/** 各约束层级剩余额度的说明。 */
 const NOTE: Record<ReadoutLevel, string> = {
   organization: "组织余额与额度中较小的一项",
   member: "成员额度的剩余",
   key: "密钥额度的剩余",
 };
 
-/** An amount with its currency sign muted and the minus before it: `-¥0.011`. */
+/** 金额保持精确，货币符号弱化，负号放在符号之前。 */
 export function Money({ micro }: { micro: number | string | bigint }) {
+  if ((typeof micro === "number" && !Number.isSafeInteger(micro)) || (typeof micro === "string" && !/^-?\d+$/.test(micro))) return <>未知</>;
   const text = fmtMicroCny(micro);
   const negative = text.startsWith("-");
   return (
@@ -29,14 +32,7 @@ export function Money({ micro }: { micro: number | string | bigint }) {
   );
 }
 
-/**
- * The portal's one distinctive moment: what the caller can still spend,
- * large, and beneath it one tile for each level that limits a request
- * (organisation, member, key), each with what it has left. The level that
- * binds is the outlined tile marked 以此为准, so the reader sees which level
- * stops the next request. `null` for the effective amount means no level
- * limits it.
- */
+/** 实际可用额度与每一级约束；null 仅表示没有限额。 */
 export function BalanceReadout({
   effectiveMicroCny,
   stops,
@@ -44,45 +40,39 @@ export function BalanceReadout({
   picker,
   children,
 }: {
-  effectiveMicroCny: number | null;
+  effectiveMicroCny: number | string | bigint | null;
   stops: ReadoutStop[];
   binding: ReadoutLevel | null;
-  /** A control that chooses what the readout is for (the key), shown beside the heading. */
+  /** 选择要查看的密钥。 */
   picker?: ReactNode;
-  /** Notes under the levels. */
+  /** 各层级之后的说明。 */
   children?: ReactNode;
 }) {
   const heading = useId();
   return (
-    <div className="panel readout" role="region" aria-labelledby={heading}>
-      <div className="flex flex-wrap items-start justify-between gap-x-6 gap-y-3">
-        <div className="readout-figure min-w-0">
-          <h3 id={heading} className="text-base font-semibold tracking-tight">
-            可用额度
-          </h3>
-          <p className="readout-label mt-1 text-[13px] text-muted-foreground">现在还能花</p>
-        </div>
-        {picker}
-      </div>
-      <p className="readout-amt display" data-testid="readout-amount">
-        {effectiveMicroCny === null ? <span className="readout-open">不限</span> : <Money micro={effectiveMicroCny} />}
-      </p>
-      <ol className="levels" aria-label="每一级还剩多少">
+    <Card tone="inverse" className={cn(span.d4, "tablet:col-span-12")} role="region" aria-labelledby={heading}>
+      <div id={heading}><CardHeader number={2} title="可用额度" /></div>
+      <p className="text-caption text-on-inverse-muted">现在还能花</p>
+      {picker}
+      <div data-testid="readout-amount"><Metric size="display" className="break-all">
+        {effectiveMicroCny === null ? "不限" : <Money micro={effectiveMicroCny} />}
+      </Metric></div>
+      <ol className="grid gap-3" aria-label="每一级还剩多少">
         {stops.map((s) => {
           const binds = s.level === binding;
           return (
-            <li key={s.level} className={binds ? "bind" : undefined} data-level={s.level} data-binding={binds ? "true" : "false"}>
-              <span className="lv">
+            <li key={s.level} className="grid min-w-0 gap-2 border-t border-ink/12 pt-4" data-level={s.level} data-binding={binds ? "true" : "false"}>
+              <span className="flex flex-wrap items-center justify-between gap-2 text-meta font-mono text-on-inverse-muted">
                 {s.label}
-                {binds && <span className="bind-plate">以此为准</span>}
+                {binds && <span className="rounded-full bg-ink/12 px-3 py-1 text-caption text-ink">以此为准</span>}
               </span>
-              <span className="m">{s.remainingMicroCny === null ? "—" : <Money micro={s.remainingMicroCny} />}</span>
-              <span className="k">{NOTE[s.level]}</span>
+              <span className="break-all text-stat font-normal tabular-nums">{s.remainingMicroCny === null ? "—" : <Money micro={s.remainingMicroCny} />}</span>
+              <span className="text-caption text-on-inverse-muted">{NOTE[s.level]}</span>
             </li>
           );
         })}
       </ol>
       {children}
-    </div>
+    </Card>
   );
 }

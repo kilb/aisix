@@ -7,7 +7,6 @@ export function ThemeToggle({ theme, onToggle }: { theme: Theme; onToggle: () =>
   return (
     <Button
       kind="quiet"
-      size="sm"
       icon={theme === "dark" ? "sun" : "moon"}
       onClick={onToggle}
       aria-label={`切换到${next}`}

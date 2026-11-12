@@ -13,6 +13,7 @@ import { DataTable, Loading } from "../ui/DataTable";
 import { EmptyState } from "../ui/EmptyState";
 import { CardHeader, PageHeader, Split } from "../components/page";
 import { Plus, RefreshCw } from "lucide-react";
+import { InventorySummary, countGroups } from "./providers/OperationsBento";
 
 /**
  * Every gateway resource kind the control plane stores, by the segment
@@ -68,8 +69,9 @@ export function Resources({ canEdit, initialSection }: TabProps) {
   return (
     <>
       <PageHeader
+        eyebrow="RESOURCES · 完整配置"
         title="全部资源"
-        description="按网关的资源定义直接编辑 JSON 文档。保存时由控制面按网关的规则校验，问题列在编辑框下方。"
+        dataLead={<>当前查看「{info.label}」资源。保留完整 JSON、服务端校验与版本冲突恢复。</>}
         actions={
           <label className="f filter filter-wide max-md:w-full">
             <span>资源类型</span>
@@ -214,6 +216,8 @@ function KindPage({ info, canEdit }: { info: KindInfo; canEdit: boolean }) {
   const list = (
     <div className="panel mb-0">
       <CardHeader
+        number={3}
+        description="按网关的资源定义直接编辑 JSON 文档。保存时由控制面按网关的规则校验，问题列在编辑框下方。"
         as="h2"
         title={
           <span className="inline-flex flex-wrap items-center gap-2">
@@ -246,7 +250,7 @@ function KindPage({ info, canEdit }: { info: KindInfo; canEdit: boolean }) {
       {items === null && !error && <Loading />}
       {items !== null && items.length === 0 && <EmptyState text="暂无此类资源。" />}
       {items !== null && items.length > 0 && (
-        <DataTable>
+        <DataTable label="资源文档">
           <thead>
             <tr>
               <th>名称</th>
@@ -259,11 +263,11 @@ function KindPage({ info, canEdit }: { info: KindInfo; canEdit: boolean }) {
           </thead>
           <tbody>
             {items.map((r) => (
-              <tr key={r.id} className={editingId === r.id ? "bg-muted" : undefined}>
+              <tr key={r.id} className={editingId === r.id ? "bg-well" : undefined}>
                 <td className="font-medium">{nameOf(r.doc) ?? <span className="hint font-normal">（未命名）</span>}</td>
                 <td>
                   <code
-                    className={editing ? "inline-block max-w-[24ch] truncate align-middle text-muted-foreground" : "text-muted-foreground"}
+                    className={editing ? "inline-block max-w-[24ch] truncate align-middle text-muted" : "text-muted"}
                     title={r.id}
                   >
                     {r.id}
@@ -290,6 +294,7 @@ function KindPage({ info, canEdit }: { info: KindInfo; canEdit: boolean }) {
   const editor = editing && (
     <div ref={panel} className="panel mb-0">
       <CardHeader
+        number={4}
         as="h2"
         title={
           <span className="inline-flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 break-all">
@@ -312,7 +317,7 @@ function KindPage({ info, canEdit }: { info: KindInfo; canEdit: boolean }) {
           {failure}
         </div>
       )}
-      <div className="-mx-6 -mb-6 mt-6 flex flex-wrap items-center gap-2 rounded-b-xl border-t border-border bg-muted/40 px-6 py-3">
+      <div className="-mx-7 -mb-7 mt-6 flex flex-wrap items-center gap-2 rounded-b-card border-t border-line bg-well px-7 py-3 [&_.hint]:text-ink-soft">
         {editing.mode === "edit" && editable && !confirmDelete && (
           <Button type="button" disabled={busy} onClick={() => setConfirmDelete(true)}>
             删除
@@ -350,5 +355,31 @@ function KindPage({ info, canEdit }: { info: KindInfo; canEdit: boolean }) {
     </div>
   );
 
-  return <Split asideWidth="minmax(460px, 44%)" main={list} aside={editor || undefined} />;
+  const rolloutLabels: Record<string, string> = {
+    pending: "待下发", propagating: "下发中", applied: "已生效", rejected: "被拒绝", no_gateways: "无在线网关",
+  };
+  const derivedCount = items?.filter((r) => !info.writable || r.managed_by !== null).length ?? 0;
+  return (
+    <>
+      <InventorySummary
+        title={`${info.label} · 当前类型`}
+        total={items?.length ?? null}
+        totalLabel={`仅统计 ${info.kind}`}
+        breakdown={countGroups(items?.map((r) => rolloutLabels[r.rollout.state] ?? r.rollout.state) ?? [])}
+        breakdownLabel="当前类型的资源下发状态"
+        secondaryTitle="派生或只读的资源"
+        secondaryValue={items ? derivedCount : null}
+        secondaryFoot="派生文档在租户、密钥或公共模型等来源页维护；完整文档仍可在这里查看。"
+        error={error !== null}
+        secondaryError={error !== null}
+        onRetry={() => void reload()}
+      >
+        <dl className="ops-facts">
+          <div><dt>手工维护的资源</dt><dd>{items ? items.length - derivedCount : "—"}</dd></div>
+          <div><dt>当前类型操作</dt><dd>{writable ? "可编辑手工资源" : "只读"}</dd></div>
+        </dl>
+      </InventorySummary>
+      <Split asideWidth="minmax(460px, 44%)" main={list} aside={editor || undefined} />
+    </>
+  );
 }

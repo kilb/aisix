@@ -28,7 +28,7 @@ export function GatewayTooOld({ error }: { error: ApiError }) {
   const blockers = instances && blockingInstances(instances, minimums, Date.now());
 
   return (
-    <div className="note crit" role="alert">
+    <div className="note crit text-body" role="alert">
       <strong>{messageFor(error)}</strong>
       <ul>
         {error.details.map((d, i) => (
@@ -38,7 +38,7 @@ export function GatewayTooOld({ error }: { error: ApiError }) {
       {readError ? (
         <p>网关实例读取失败：{readError}</p>
       ) : blockers === null ? (
-        <p className="hint">正在读取网关实例…</p>
+        <p className="hint text-caption text-ink-soft">正在读取网关实例…</p>
       ) : blockers.length > 0 ? (
         <>
           <p>需要先升级这些网关实例：</p>
@@ -54,7 +54,7 @@ export function GatewayTooOld({ error }: { error: ApiError }) {
       ) : (
         <p>实例列表里没有低于该版本的实例；按上面的说明处理。</p>
       )}
-      <p className="hint">最近 24 小时内上报过的网关实例都会计入，离线的也算。升级后重试此操作。</p>
+      <p className="hint text-caption text-ink-soft">最近 24 小时内上报过的网关实例都会计入，离线的也算。升级后重试此操作。</p>
     </div>
   );
 }

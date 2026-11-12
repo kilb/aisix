@@ -2,17 +2,18 @@ import { useRef, useState } from "react";
 import { ApiError, MIN_PASSWORD_CHARS, type MemberRole } from "./lib/api";
 import { formMessageFor } from "./lib/errors";
 import { createMemberAccount } from "./lib/memberAccounts";
-import { Card, CardHeader } from "./components/page";
+import { Card, CardFooter, CardHeader } from "./components/page";
 import { Button } from "./ui/Button";
 import { Field, useRefusalFocus } from "./ui/Field";
 
 type AccountField = "email" | "password" | "display_name" | "role";
 type FieldErrors = Partial<Record<AccountField, string>>;
 
-export function CreateMember({ roles, labels, onInactive }: {
+export function CreateMember({ roles, labels, onInactive, number = 4 }: {
   roles: MemberRole[];
   labels: Record<MemberRole, string>;
   onInactive: () => void;
+  number?: number;
 }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -81,9 +82,9 @@ export function CreateMember({ roles, labels, onInactive }: {
   return (
     <section role="region" aria-label="创建账号">
       <Card>
-        <CardHeader title="创建账号" />
-        <p className="hint">新成员可直接使用邮箱和初始密码登录本组织。已有账号的密码不会被修改。</p>
-        <form ref={form} className="mt-4 grid gap-4 sm:grid-cols-2" onSubmit={submit}>
+        <CardHeader number={number} title="创建账号" description="直接为新成员设置邮箱、初始密码与角色。" />
+        <p className="text-body text-ink-soft">新成员可直接使用邮箱和初始密码登录本组织。已有账号的密码不会被修改。</p>
+        <form ref={form} className="mt-5 grid min-w-0 gap-x-7 gap-y-5 tablet:grid-cols-2" onSubmit={submit}>
           <Field label="显示名" error={errors.display_name}>
             {(aria) => <input autoComplete="off" value={displayName} onChange={(e) => setDisplayName(e.target.value)} disabled={busy} {...aria} />}
           </Field>
@@ -102,9 +103,9 @@ export function CreateMember({ roles, labels, onInactive }: {
           </Field>
           {error && <div className="note crit col-span-full" role="alert">{error}</div>}
           {created && <div className="note ok col-span-full" role="status">账号已创建，可使用邮箱和初始密码登录</div>}
-          <div className="col-span-full flex justify-end">
+          <CardFooter className="col-span-full flex justify-end border-t border-ink/7 pt-5">
             <Button kind="primary" type="submit" busy={busy} busyLabel="创建账号中…">创建账号</Button>
-          </div>
+          </CardFooter>
         </form>
       </Card>
     </section>

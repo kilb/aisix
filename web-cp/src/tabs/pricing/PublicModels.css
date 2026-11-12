@@ -1,7 +1,60 @@
-/* 价格 · 公共模型. Every value comes from the tokens. */
+/* 公共模型保留状态文字，以中性色呈现待处理项。 */
 
-/* A model with no baseline, or a group with no rate: the word in the error red. */
 .pm-unpriced {
-  color: var(--error);
-  font-weight: 700;
+  color: var(--color-ink);
+  font-weight: 500;
+}
+
+/* 模型名和稳定标识不截断，长值只在表格内部增加行高。 */
+.pm-model-id {
+  display: block;
+  max-inline-size: 28ch;
+  overflow-wrap: anywhere;
+}
+
+.pm-model-title {
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
+.pm-routing-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+.pm-routing-summary > div {
+  min-width: 0;
+  border-top: 1px solid color-mix(in srgb, var(--color-ink) 7%, transparent);
+  padding-top: 0.75rem;
+}
+
+.pm-routing-summary dt {
+  color: var(--color-muted);
+  font-size: var(--text-caption);
+}
+
+.pm-routing-summary dd {
+  margin: 0.5rem 0 0;
+  color: var(--color-ink);
+  font-size: var(--text-stat);
+  font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 719px) {
+  .pm-routing-summary {
+    grid-template-columns: 1fr;
+    gap: 0.75rem;
+  }
+
+  .pm-routing-summary > div {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 0.75rem;
+  }
+
+  .pm-routing-summary dd {
+    margin-top: 0;
+  }
 }

@@ -7,7 +7,8 @@ import { fmtMicroCny, fmtUtc } from "../../lib/money";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
 import { Field, useRefusalFocus } from "../../ui/Field";
-import { Card, CardHeader, PageHeader } from "../../components/page";
+import { BentoGrid, Card, CardHeader, PageHeader, span } from "../../components/page";
+import { formatCount } from "../../lib/chartFormat";
 import { Lamp } from "../../ui/Lamp";
 import { TwoStep } from "../../ui/TwoStep";
 
@@ -30,6 +31,7 @@ interface Flight {
   kind: "approve" | "reject";
 }
 
+// 桌面/平板：12 列审批表；确认与驳回原因保留在申请所在行。
 /**
  * "充值审批": tenants' top-up requests, newest first. An operator approves
  * one (the amount is posted to the tenant's balance at once) or rejects it
@@ -140,6 +142,8 @@ export function Topups({ canEdit, refreshShell }: TabProps) {
     <>
       <PageHeader
         title="充值审批"
+        eyebrow="计费 / 充值处理"
+        dataLead={items === null ? (loadError ? "充值申请读取失败，请重试。" : "正在读取充值申请。") : <>{loadError ? "读取失败，以下为最近成功读取记录。" : ""}当前筛选已加载 <strong>{formatCount(items.length)}</strong> 条申请{next !== null ? "，可继续加载。" : "，已到记录末尾。"}</>}
         description="租户提交的充值申请。批准后金额立即计入该租户余额；驳回须写明原因，租户可以看到。"
         actions={
           <Button type="button" icon="refresh" onClick={() => void load()}>
@@ -147,9 +151,12 @@ export function Topups({ canEdit, refreshShell }: TabProps) {
           </Button>
         }
       />
-    <Card>
+    <BentoGrid>
+    <Card className={span.d12}>
       <CardHeader
+        number={1}
         title="充值申请"
+        description="租户提交的充值申请。批准后金额立即计入该租户余额；驳回须写明原因，租户可以看到。"
         actions={
           <>
             <label className="f filter">
@@ -222,7 +229,7 @@ export function Topups({ canEdit, refreshShell }: TabProps) {
               return [
                 <tr key={t.id}>
                   <td className="font-medium">{t.tenant_name}</td>
-                  <td className="num money font-medium">{fmtMicroCny(t.amount_micro_cny)}</td>
+                  <td className="num money font-normal">{fmtMicroCny(t.amount_micro_cny)}</td>
                   <td className="min-w-32 whitespace-normal">
                     {t.origin === "operator" ? (t.credit_reason ?? t.note) : t.note}
                     {t.status === "rejected" && t.reject_reason && (
@@ -269,7 +276,7 @@ export function Topups({ canEdit, refreshShell }: TabProps) {
                   <tr key={`${t.id}-reject`} className="dt-detail">
                     <td colSpan={8}>
                       <form
-                        className="mt-1 grid max-w-3xl items-start gap-x-3 rounded-xl border border-border bg-muted/50 p-4 whitespace-normal sm:grid-cols-[minmax(0,1fr)_auto]"
+                        className="mt-1 grid max-w-3xl items-start gap-x-3 rounded-cell border border-border bg-well/50 p-4 whitespace-normal sm:grid-cols-[minmax(0,1fr)_auto]"
                         ref={form}
                         aria-label={`驳回 ${t.tenant_name} 的充值申请`}
                         onSubmit={(e) => {
@@ -320,6 +327,7 @@ export function Topups({ canEdit, refreshShell }: TabProps) {
         </div>
       )}
     </Card>
+    </BentoGrid>
     </>
   );
 }

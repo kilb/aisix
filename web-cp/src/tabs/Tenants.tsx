@@ -1,3 +1,4 @@
+/** 布局：[01 全部 6][02 正常 6]；[默认配置 12]；[列表 12 / 打开详情时 6 + 6]。 */
 import { Fragment, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import type { TabProps } from "../App";
 import { ConflictNote } from "../components/ConflictNote";
@@ -27,7 +28,8 @@ import {
 import { messageFor } from "../lib/errors";
 import { generatedDirect } from "../lib/generatedDirect";
 import { errorText, fmtInt, fmtTime } from "../lib/fmt";
-import { Card, CardHeader, PageHeader, Stat, StatGrid } from "../components/page";
+import { BentoGrid, Card, CardFooter, CardHeader, CardMessage, ChartSkeleton, Metric, MetricSkeleton, PageHeader, span } from "../components/page";
+import { RankBars } from "../components/charts";
 import { Button } from "../ui/Button";
 import { useRefusalFocus } from "../ui/Field";
 import { CopyButton } from "../ui/CopyButton";
@@ -320,8 +322,8 @@ export function unreachableWarning(groups: string[], whose: string): string {
   return `${groups.join("、")}：没有上游账号在此分组。保存后，${whose}找不到任何上游账号，无法调用模型。`;
 }
 
-/** The list beside an open detail: the detail takes the wider share it needs for its tables. */
-export const SIDE_OPEN = "with-side is-open gap-x-6 xl:grid-cols-[minmax(0,1fr)_minmax(460px,44%)]";
+/** 详情与列表保留独立状态；窄屏顺序堆叠，宽屏各占六列。 */
+export const SIDE_OPEN = "with-side is-open tn-bento-side";
 
 export function Tenants({ operator, canEdit }: TabProps) {
   const [filter, setFilter] = useState<Tenant["status"] | "">("");
@@ -359,7 +361,12 @@ export function Tenants({ operator, canEdit }: TabProps) {
   }, [loadList]);
 
   const items = useMemo(() => (all === null ? null : filter ? all.filter((t) => t.status === filter) : all), [all, filter]);
-  const count = (status: Tenant["status"]) => (all === null ? "…" : fmtInt(all.filter((t) => t.status === status).length));
+  const count = (status: Tenant["status"]) => (all === null ? "—" : fmtInt(all.filter((t) => t.status === status).length));
+  const statusItems = all === null ? null : (["active", "pending", "suspended"] as const).map((status) => ({
+    label: STATUS_LABEL[status],
+    value: all.filter((tenant) => tenant.status === status).length,
+    displayValue: count(status),
+  })).sort((a, b) => b.value - a.value);
 
   // A view replaces the one shown unless it is older: a read that raced a write.
   const applyView = useCallback((view: Tenant) => {
@@ -427,8 +434,11 @@ export function Tenants({ operator, canEdit }: TabProps) {
 
   return (
     <>
+      {/* 桌面与平板：6 + 6；列表和默认配置占 12，详情打开后 6 + 6。 */}
       <PageHeader
         title="租户"
+        eyebrow="客户管理"
+        dataLead={listError ? "租户列表读取失败；已有统计保留最近成功读取的值。" : all === null ? "读取租户的当前状态与授权范围。" : `当前共有 ${fmtInt(all.length)} 个租户，${count("pending")} 个待审核；下方筛选不改变总览统计。`}
         description="客户经租户门户自助注册后在这里审核；批准前它不能自行创建密钥，名下的密钥也都不可用。停用租户会让它的全部密钥立即失效，恢复后重新可用。"
         actions={
           <>
@@ -444,19 +454,36 @@ export function Tenants({ operator, canEdit }: TabProps) {
         }
       />
 
-      <StatGrid className="grid-cols-2">
-        <Stat label="全部租户" value={all === null ? "…" : fmtInt(all.length)} />
-        <Stat label="待审核" value={count("pending")} />
-        <Stat label="正常" value={count("active")} />
-        <Stat label="已停用" value={count("suspended")} />
-      </StatGrid>
+      <BentoGrid className="mb-3" aria-label="租户当前概况">
+        <Card className={span.d6}>
+          <CardHeader number={1} title="全部租户" description={listError ? "刷新失败，保留最近成功读取的完整列表" : "完整列表的当前快照"} />
+          {all === null && !listError ? <MetricSkeleton /> : <Metric size="hero">{all === null ? "—" : fmtInt(all.length)}</Metric>}
+          <CardFooter>
+            {statusItems === null ? (listError ? <CardMessage onRetry={() => void loadList()}>租户统计读取失败。</CardMessage> : <ChartSkeleton />) : (
+              <RankBars items={statusItems} accessibleLabel={`全部 ${fmtInt(all?.length ?? 0)} 个租户中，正常 ${count("active")} 个，待审核 ${count("pending")} 个，已停用 ${count("suspended")} 个。`} emptyLabel="当前没有租户。" />
+            )}
+          </CardFooter>
+        </Card>
+        <Card className={span.d6} tone="inverse">
+          <CardHeader number={2} title="正常租户" description={listError ? "读取失败；已有值来自最近成功读取" : "正常状态仍受模型授权、分组与账务限制"} />
+          {all === null && !listError ? <MetricSkeleton /> : <Metric size="display">{count("active")}</Metric>}
+          <CardFooter>
+            <dl className="grid grid-cols-2 gap-6 border-t border-surface/12 pt-5">
+              <div><dt className="font-mono text-meta text-on-inverse-muted">待审核</dt><dd className="mt-2"><Metric size="value">{count("pending")}</Metric></dd></div>
+              <div><dt className="font-mono text-meta text-on-inverse-muted">已停用</dt><dd className="mt-2"><Metric size="value">{count("suspended")}</Metric></dd></div>
+            </dl>
+          </CardFooter>
+        </Card>
+      </BentoGrid>
 
-      {showDefaults && operator.role === "admin" && <DefaultsPanel />}
+      {showDefaults && operator.role === "admin" && <DefaultsPanel number={3} />}
 
       <div className={detail ? SIDE_OPEN : "with-side"}>
         <div className="side-main min-w-0">
           <Card className="mb-0">
             <CardHeader
+              number={showDefaults && operator.role === "admin" ? 4 : 3}
+              description="客户经租户门户自助注册后在这里审核；批准前不能自行创建密钥，名下的密钥也不可用。停用会使该租户的全部密钥立即失效，恢复后重新可用。"
               title={
                 <>
                   租户列表
@@ -589,6 +616,7 @@ export function Tenants({ operator, canEdit }: TabProps) {
             tenant={detail}
             canEdit={canEdit}
             tick={tick}
+            number={showDefaults && operator.role === "admin" ? 5 : 4}
             onView={settle}
             onRefresh={() => void refresh(detail.id)}
             onReload={() => void loadDetail(detail.id)}
@@ -614,6 +642,7 @@ function TenantDetail({
   tenant,
   canEdit,
   tick,
+  number,
   onView,
   onRefresh,
   onReload,
@@ -623,6 +652,7 @@ function TenantDetail({
   canEdit: boolean;
   /** Changes when the operator asks for everything to be read again. */
   tick: number;
+  number: number;
   onView: (view: Tenant) => void;
   onRefresh: () => void;
   onReload: () => void;
@@ -666,7 +696,7 @@ function TenantDetail({
 
   return (
     <SidePanel
-      title={tenant.name}
+      title={<><span aria-hidden="true" className="mr-2 font-mono text-meta text-muted">{String(number).padStart(2, "0")} —</span><span title={tenant.name}>{tenant.name}</span></>}
       label={`租户详情：${tenant.name}`}
       extra={<RolloutBadge rollout={tenant.rollout} />}
       onClose={onClose}
@@ -691,7 +721,7 @@ function TenantDetail({
           <dd className="tabular">{fmtInt(tenant.key_count)}</dd>
         </div>
       </dl>
-      {tenant.is_internal && <p className="hint mt-3 text-[13px]">平台内部租户：它的密钥是运维密钥，没有成员</p>}
+      {tenant.is_internal && <p className="hint mt-3 text-caption">平台内部租户：它的密钥是运维密钥，没有成员</p>}
 
       <GrantsPart
         {...part}
@@ -1211,7 +1241,7 @@ function GroupsPart({
       )}
       {canEdit && (
         <div className="tn-foot right">
-          {keysLoading && <p className="hint mr-auto self-center text-left text-[13px]">正在读取该租户的密钥，读取完成后才能移除分组。</p>}
+          {keysLoading && <p className="hint mr-auto self-center text-left text-caption">正在读取该租户的密钥，读取完成后才能移除分组。</p>}
           <TwoStep
             label="保存分组"
             size="sm"
@@ -1807,13 +1837,13 @@ export function ChooseGroup({
 }
 
 /** The defaults new tenants copy when they are created (admins only). */
-function DefaultsPanel() {
+function DefaultsPanel({ number }: { number: number }) {
   const stored = useLoad(() => settings.tenantDefaults(), []);
   const groups = useLoad(() => groupsApi.list(), []);
   if (stored.data === null) {
     return (
-      <Card aria-label="新租户默认值" className="mb-6">
-        <CardHeader title="新租户默认值" />
+      <Card aria-label="新租户默认值" className="mb-3">
+        <CardHeader number={number} title="新租户默认值" />
         {stored.error ? (
           <div className="note crit" role="alert">
             {stored.error}
@@ -1824,14 +1854,16 @@ function DefaultsPanel() {
       </Card>
     );
   }
-  return <DefaultsForm stored={stored.data} available={groups.data} onSaved={stored.setData} />;
+  return <DefaultsForm number={number} stored={stored.data} available={groups.data} onSaved={stored.setData} />;
 }
 
 function DefaultsForm({
+  number,
   stored,
   available,
   onSaved,
 }: {
+  number: number;
   stored: TenantDefaults;
   available: Group[] | null;
   onSaved: (defaults: TenantDefaults) => void;
@@ -1872,11 +1904,11 @@ function DefaultsForm({
 
   const whole = refused?.at.get("/default_provider_groups");
   return (
-    <section ref={panel} className="panel mb-6" aria-label="新租户默认值">
-      <CardHeader title="新租户默认值" description="新租户创建时复制这里的限额与默认分组；修改不影响已有租户。留空的限额表示不限。" />
+    <section ref={panel} className="panel bento-card mb-3" aria-label="新租户默认值">
+      <CardHeader number={number} title="新租户默认值" description="新租户创建时复制这里的限额与默认分组；修改不影响已有租户。留空的限额表示不限。" />
       <div className="grid items-start gap-x-8 gap-y-2 lg:grid-cols-2">
         <div className="min-w-0">
-          <h4 className="mb-3 text-[13px] font-medium text-muted-foreground">限额</h4>
+          <h4 className="mb-3 text-caption font-medium text-muted">限额</h4>
           <LimitInputs draft={draft} onChange={setDraft} disabled={false} errorFor={(field) => refused?.at.get(`/${field}`)} />
         </div>
         <fieldset className="tn-sub">

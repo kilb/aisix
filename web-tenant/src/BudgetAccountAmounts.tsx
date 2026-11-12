@@ -1,6 +1,7 @@
 import type { Balance } from "./lib/api";
 import type { FormulaBalance } from "./lib/formulaApi";
 import { Money } from "./ui/BalanceReadout";
+import { Metric } from "./components/page";
 
 type AmountField = "available_micro_cny" | "credit_limit_micro_cny";
 export type BudgetAccountBalance = Balance & {
@@ -21,18 +22,14 @@ export function BudgetAccountAmounts({ balance }: { balance: BudgetAccountBalanc
   const available = amount(balance, "available_micro_cny");
   const credit = amount(balance, "credit_limit_micro_cny");
   return (
-    <dl className="grid gap-3 sm:grid-cols-2">
-      <div className="entry rounded-xl border border-border bg-muted/50 px-4 py-3">
-        <dt className="lab">账户可用额度</dt>
-        <dd className="val mt-1 text-2xl">
-          {available === null ? "未知" : <Money micro={available} />}
-        </dd>
+    <dl className="grid gap-6">
+      <div className="min-w-0">
+        <dt className="text-meta font-mono text-muted">账户可用额度</dt>
+        <dd className="mt-3"><Metric size="hero" className="break-all">{available === null ? "未知" : <Money micro={available} />}</Metric></dd>
       </div>
-      <div className="entry rounded-xl border border-border bg-muted/50 px-4 py-3">
-        <dt className="lab">信用额度</dt>
-        <dd className="val mt-1 text-2xl">
-          {credit === null ? "未知" : <Money micro={credit} />}
-        </dd>
+      <div className="min-w-0">
+        <dt className="text-meta font-mono text-muted">信用额度</dt>
+        <dd className="mt-2"><Metric size="value" className="break-all">{credit === null ? "未知" : <Money micro={credit} />}</Metric></dd>
       </div>
     </dl>
   );

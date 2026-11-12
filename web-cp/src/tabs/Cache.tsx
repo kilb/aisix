@@ -16,6 +16,7 @@ import { Lamp } from "../ui/Lamp";
 import { TwoStep } from "../ui/TwoStep";
 import { CardHeader, PageHeader, Split } from "../components/page";
 import { Plus, RefreshCw } from "lucide-react";
+import { InventorySummary, countGroups } from "./providers/OperationsBento";
 
 /** A cache policy document; fields the form does not show are kept as stored. */
 interface CachePolicyDoc {
@@ -246,6 +247,8 @@ export function Cache({ canEdit, onGoto }: TabProps) {
   const list = (
     <div className="panel mb-0">
       <CardHeader
+        number={3}
+        description="命中缓存的请求直接由网关应答，不再转发给上游。平台部署中缓存条目只在同一租户的 API 密钥之间共享（team 范围）。"
         as="h2"
         title={
           <span className="inline-flex items-center gap-2">
@@ -262,7 +265,7 @@ export function Cache({ canEdit, onGoto }: TabProps) {
       {policies.items === null && !policies.error && <Loading />}
       {policies.items !== null && policies.items.length === 0 && <EmptyState text="还没有缓存策略。" />}
       {policies.items !== null && policies.items.length > 0 && (
-        <DataTable>
+        <DataTable label="缓存策略">
           <thead>
             <tr>
               <th>名称</th>
@@ -276,7 +279,7 @@ export function Cache({ canEdit, onGoto }: TabProps) {
           </thead>
           <tbody>
             {policies.items.map((p) => (
-              <tr key={p.id} className={form?.id === p.id ? "bg-muted" : undefined}>
+              <tr key={p.id} className={form?.id === p.id ? "bg-well" : undefined}>
                 <td className="font-medium">{p.doc.name}</td>
                 <td>
                   <code className="tag font-mono">{p.doc.scope ?? "—"}</code>
@@ -324,6 +327,7 @@ export function Cache({ canEdit, onGoto }: TabProps) {
   const editor = form && (
     <div ref={panel} className="panel mb-0">
       <CardHeader
+        number={4}
         as="h2"
         title={
           <span className="inline-flex flex-wrap items-center gap-x-3 gap-y-1">
@@ -342,8 +346,8 @@ export function Cache({ canEdit, onGoto }: TabProps) {
           )}
         </div>
       )}
-      <div className="grid gap-x-4 sm:grid-cols-2 xl:grid-cols-1 2xl:grid-cols-2">
-        <label className="f sm:col-span-2 xl:col-span-1 2xl:col-span-2">
+      <div className="grid gap-x-4 tablet:grid-cols-2 desktop:grid-cols-1">
+        <label className="f tablet:col-span-2 desktop:col-span-1">
           <span>名称</span>
           <input value={form.name} disabled={readOnly} onChange={(e) => set({ name: e.target.value })} />
         </label>
@@ -374,7 +378,7 @@ export function Cache({ canEdit, onGoto }: TabProps) {
             </p>
           )}
           {options?.descriptions[form.scope] && (
-            <p className="hint -mt-2 mb-4 text-[13px]">{options.descriptions[form.scope]}</p>
+            <p className="hint -mt-2 mb-4 text-caption">{options.descriptions[form.scope]}</p>
           )}
         </div>
         <div className="min-w-0">
@@ -398,7 +402,7 @@ export function Cache({ canEdit, onGoto }: TabProps) {
             </p>
           )}
         </div>
-        <div className="min-w-0 sm:col-span-2 xl:col-span-1 2xl:col-span-2">
+        <div className="min-w-0 tablet:col-span-2 desktop:col-span-1">
           <label className="f">
             <span>作用于</span>
             {form.otherTarget !== null ? (
@@ -418,10 +422,10 @@ export function Cache({ canEdit, onGoto }: TabProps) {
             )}
           </label>
           {form.otherTarget !== null && (
-            <p className="hint -mt-2 mb-4 text-[13px]">这种写法的作用范围只能在「全部资源」页修改，保存时原样保留。</p>
+            <p className="hint -mt-2 mb-4 text-caption">这种写法的作用范围只能在「全部资源」页修改，保存时原样保留。</p>
           )}
         </div>
-        <label className="f sm:col-span-2 xl:col-span-1 2xl:col-span-2">
+        <label className="f tablet:col-span-2 desktop:col-span-1">
           <input
             type="checkbox"
             checked={form.enabled}
@@ -446,7 +450,7 @@ export function Cache({ canEdit, onGoto }: TabProps) {
           )}
         </div>
       )}
-      <div className="-mx-6 -mb-6 mt-2 flex justify-end gap-2 rounded-b-xl border-t border-border bg-muted/40 px-6 py-3">
+      <div className="-mx-7 -mb-7 mt-2 flex justify-end gap-2 rounded-b-card border-t border-line bg-well px-7 py-3 [&_.hint]:text-ink-soft">
         <Button type="button" onClick={() => setForm(null)}>
           {readOnly ? "关闭" : "取消"}
         </Button>
@@ -469,8 +473,9 @@ export function Cache({ canEdit, onGoto }: TabProps) {
   return (
     <>
       <PageHeader
+        eyebrow="CACHE · 应答缓存"
         title="缓存策略"
-        description="命中缓存的请求直接由网关应答，不再转发给上游。平台部署中缓存条目只在同一租户的 API 密钥之间共享（team 范围）。"
+        dataLead={policies.items ? <>已配置 {policies.items.length} 条缓存策略，其中 {policies.items.filter((p) => p.doc.enabled !== false).length} 条启用。命中后由网关直接应答。</> : "按租户范围与模型配置应答缓存。"}
         actions={
           <>
             <Button
@@ -492,6 +497,24 @@ export function Cache({ canEdit, onGoto }: TabProps) {
           </>
         }
       />
+      <InventorySummary
+        title="缓存策略 · 当前配置"
+        total={policies.items?.length ?? null}
+        totalLabel="已保存策略"
+        breakdown={countGroups(policies.items?.map((p) => p.doc.scope || "未声明范围") ?? [])}
+        breakdownLabel="按已保存的缓存范围统计"
+        secondaryTitle="已启用的缓存策略"
+        secondaryValue={policies.items ? policies.items.filter((p) => p.doc.enabled !== false).length : null}
+        secondaryFoot="启用状态来自策略配置；各网关是否已应用请查看下方下发状态。"
+        error={policies.error !== null}
+        secondaryError={policies.error !== null}
+        onRetry={() => void policies.reload()}
+      >
+        <dl className="ops-facts">
+          <div><dt>已停用</dt><dd>{policies.items ? policies.items.filter((p) => p.doc.enabled === false).length : "—"}</dd></div>
+          <div><dt>env 范围 · 此表单只读</dt><dd>{policies.items ? policies.items.filter((p) => p.doc.scope === ENV_SCOPE).length : "—"}</dd></div>
+        </dl>
+      </InventorySummary>
       {optionsError && (
         <div className="note crit" role="alert">
           {optionsError}

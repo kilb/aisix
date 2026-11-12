@@ -2,12 +2,25 @@ import { useCallback, useEffect, useId, useState } from "react";
 import type { TabProps } from "../App";
 import { ApiError, operators, type Detail, type OperatorAccount, type OperatorRole } from "../lib/api";
 import { messageFor } from "../lib/errors";
-import { errorText, fmtTime } from "../lib/fmt";
+import { errorText, fmtInt, fmtTime } from "../lib/fmt";
+import { cn } from "../lib/cn";
 import { Button } from "../ui/Button";
 import { useRefusalFocus } from "../ui/Field";
 import { DataTable, Loading } from "../ui/DataTable";
 import { Lamp } from "../ui/Lamp";
-import { CardHeader, PageHeader, Split } from "../components/page";
+import {
+  BentoGrid,
+  Card,
+  CardFooter,
+  CardHeader,
+  CardMessage,
+  ChartSkeleton,
+  Metric,
+  MetricSkeleton,
+  PageHeader,
+  span,
+} from "../components/page";
+import { RankBars } from "../components/charts";
 import { Plus, RefreshCw } from "lucide-react";
 
 /** The control plane's operator roles, highest first, by the names this page shows. */
@@ -81,14 +94,23 @@ export function Operators({ operator }: TabProps) {
     void reload();
   }
 
+  const enabled = items?.filter((account) => !account.disabled) ?? null;
+  const roles = ROLES.map(({ role, label }) => {
+    const value = items?.filter((account) => account.role === role).length ?? 0;
+    return { label, value, displayValue: fmtInt(value) };
+  }).sort((a, b) => b.value - a.value || a.label.localeCompare(b.label));
+
+  // 桌面和平板：概览 6 + 6；列表 12，创建时列表 7 + 表单 5（平板各占 12）。
   const list = (
-    <div className="panel mb-0">
+    <Card className={creating ? span.d7 : span.d12}>
       <CardHeader
+        number={3}
         as="h2"
+        description="管理员可以新建账号、调整角色、停用或启用。停用会立即结束该账号的全部会话；账号不会被删除，停用即收回访问。至少要保留一个可用的管理员。"
         title={
           <span className="inline-flex items-center gap-2">
             全部账号
-            {items && items.length > 0 && <span className="tag">{items.length}</span>}
+            {items && items.length > 0 && <span className="tag">{fmtInt(items.length)}</span>}
           </span>
         }
       />
@@ -104,7 +126,7 @@ export function Operators({ operator }: TabProps) {
       )}
       {items === null && !loadError && <Loading />}
       {items !== null && (
-        <DataTable>
+        <DataTable label="全部运维账号">
           <thead>
             <tr>
               <th>邮箱</th>
@@ -125,13 +147,13 @@ export function Operators({ operator }: TabProps) {
                     <span className="inline-flex items-center gap-2.5 align-middle">
                       <span
                         aria-hidden="true"
-                        className="grid size-7 shrink-0 place-items-center rounded-full bg-muted text-xs font-semibold text-text-2 uppercase"
+                        className="grid size-11 shrink-0 place-items-center rounded-full bg-well text-meta font-medium text-ink-soft uppercase"
                       >
                         {(a.display_name || a.email).slice(0, 1)}
                       </span>
                       <span className="flex flex-col leading-tight">
                         <span className="font-medium">{a.email}</span>
-                        {a.id === operator.id && <span className="hint mt-0.5 text-xs">（当前账号）</span>}
+                        {a.id === operator.id && <span className="hint mt-0.5 text-meta">（当前账号）</span>}
                       </span>
                     </span>
                   </td>
@@ -232,13 +254,17 @@ export function Operators({ operator }: TabProps) {
           </tbody>
         </DataTable>
       )}
-    </div>
+    </Card>
   );
 
   return (
     <>
       <PageHeader
         title="运维账号"
+        eyebrow="平台访问 · 当前账号快照"
+        dataLead={items === null
+          ? "读取账号状态后显示当前访问概况。"
+          : <>平台共有 {fmtInt(items.length)} 个运维账号，{fmtInt(enabled?.length ?? 0)} 个可用，{fmtInt(items.length - (enabled?.length ?? 0))} 个已停用。</>}
         description="管理员可以新建账号、调整角色、停用或启用。停用会立即结束该账号的全部会话；账号不会被删除，停用即收回访问。至少要保留一个可用的管理员。"
         actions={
           <>
@@ -262,11 +288,39 @@ export function Operators({ operator }: TabProps) {
           </>
         }
       />
-      <Split
-        asideWidth="minmax(340px, 28%)"
-        main={list}
-        aside={creating ? <CreateForm onCreated={created} onCancel={() => setCreating(false)} /> : undefined}
-      />
+      <BentoGrid>
+        <Card tone="inverse" className={span.d6}>
+          <CardHeader number={1} title="可用账号 · 全部运维账号" />
+          {enabled === null
+            ? (loadError ? <CardMessage onRetry={() => void reload()}>账号状态读取失败。</CardMessage> : <MetricSkeleton />)
+            : <Metric size="hero">{fmtInt(enabled.length)}</Metric>}
+          <CardFooter>
+            <dl className="grid grid-cols-2 gap-4 border-t border-surface/12 pt-4">
+              <div>
+                <dt className="font-mono text-micro text-on-inverse-muted">可用管理员</dt>
+                <dd className="mt-2"><Metric size="value">{enabled === null ? "—" : fmtInt(enabled.filter((account) => account.role === "admin").length)}</Metric></dd>
+              </div>
+              <div>
+                <dt className="font-mono text-micro text-on-inverse-muted">已停用账号</dt>
+                <dd className="mt-2"><Metric size="value">{items === null || enabled === null ? "—" : fmtInt(items.length - enabled.length)}</Metric></dd>
+              </div>
+            </dl>
+            <p className="mt-4 text-caption text-on-inverse-muted">停用会立即结束全部会话。至少保留一位可用管理员。</p>
+            {loadError && items !== null && <p className="mt-3 text-caption text-on-inverse-muted">刷新失败，显示最近成功读取的状态。</p>}
+          </CardFooter>
+        </Card>
+        <Card className={span.d6}>
+          <CardHeader number={2} title="角色分布 · 全部账号" description="包含可用与已停用账号；角色决定平台操作范围。" />
+          <CardFooter>
+            {items === null ? (loadError
+              ? <CardMessage onRetry={() => void reload()}>账号读取失败，重试后查看角色分布。</CardMessage>
+              : <ChartSkeleton />)
+              : <RankBars items={roles} accessibleLabel={`全部 ${fmtInt(items.length)} 个运维账号的角色分布：${roles.map((role) => `${role.label} ${role.displayValue} 个`).join("，")}`} emptyLabel="暂无运维账号" />}
+          </CardFooter>
+        </Card>
+        {list}
+        {creating && <CreateForm onCreated={created} onCancel={() => setCreating(false)} />}
+      </BentoGrid>
     </>
   );
 }
@@ -323,9 +377,9 @@ function CreateForm({
   const listed = failure?.details.filter((d) => !["/email", "/display_name", "/password"].includes(d.path)) ?? [];
 
   return (
-    <form ref={form} className="panel mb-0" aria-label="新建运维账号" onSubmit={(e) => void submit(e)}>
-      <CardHeader as="h2" title="新建运维账号" className="max-w-none" />
-      <div className="grid max-w-none gap-x-4 sm:grid-cols-2 xl:grid-cols-1">
+    <form ref={form} className={cn("panel bento-card", span.d5Wide)} aria-label="新建运维账号" onSubmit={(e) => void submit(e)}>
+      <CardHeader number={4} as="h2" title="新建运维账号" className="max-w-none" />
+      <div className="grid max-w-none gap-x-4 tablet:grid-cols-2 desktop:grid-cols-1">
         <div className="min-w-0">
           <label className="f">
             <span>邮箱</span>
@@ -372,7 +426,7 @@ function CreateForm({
               ))}
             </select>
           </label>
-          <p className="hint -mt-2 mb-4 text-[13px]">
+          <p className="hint -mt-2 mb-4 text-caption">
             只读：只能查看；运维：可修改网关资源、租户与密钥；管理员：另可管理运维账号、网关凭据与下发。
           </p>
         </div>
@@ -410,14 +464,14 @@ function CreateForm({
           )}
         </div>
       )}
-      <div className="-mx-6 -mb-6 mt-2 flex max-w-none justify-end gap-2 rounded-b-xl border-t border-border bg-muted/40 px-6 py-3">
+      <CardFooter className="mt-4 flex flex-wrap justify-end gap-2 border-t border-ink/7 pt-4">
         <Button type="button" onClick={onCancel}>
           取消
         </Button>
         <Button kind="primary" type="submit" busy={busy} busyLabel="创建">
           创建
         </Button>
-      </div>
+      </CardFooter>
     </form>
   );
 }

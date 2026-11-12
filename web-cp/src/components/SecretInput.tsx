@@ -56,13 +56,13 @@ export function SecretInput({
       <div className="f" role="group" aria-label={label} {...aria}>
         <span className="f-label">{label}</span>
         {/* Drawn as the field it stands for: the stored state where the text would be, the actions at its end. */}
-        <div className="secret h-9 min-h-0 flex-nowrap gap-2 rounded-md border border-input bg-muted/50 pr-1 pl-3">
+        <div className="secret min-h-11 flex-wrap gap-2 rounded-xl border border-line bg-well p-1 pl-3 text-ink-soft">
           {mode === "keep" ? (
             <Lamp state="applied">已设置</Lamp>
           ) : (
             <Lamp state="pending">保存后清除</Lamp>
           )}
-          <span aria-hidden="true" className="min-w-0 flex-1 truncate font-mono text-xs tracking-widest text-muted-foreground">
+          <span aria-hidden="true" className="min-w-0 flex-1 truncate font-mono text-meta tracking-widest text-ink-soft">
             {mode === "keep" ? "••••••••" : ""}
           </span>
           {!readOnly && mode === "keep" && (
@@ -70,7 +70,7 @@ export function SecretInput({
               type="button"
               size="sm"
               kind="quiet"
-              className="h-7"
+              className="h-11"
               onClick={() => {
                 setMode("replace");
                 onChange("");
@@ -84,7 +84,7 @@ export function SecretInput({
               type="button"
               size="sm"
               kind="quiet"
-              className="h-7"
+              className="h-11"
               onClick={() => {
                 setMode("clear");
                 onChange(undefined);
@@ -94,7 +94,7 @@ export function SecretInput({
             </Button>
           )}
           {!readOnly && mode === "clear" && (
-            <Button type="button" size="sm" kind="quiet" className="h-7" onClick={keep}>
+            <Button type="button" size="sm" kind="quiet" className="h-11" onClick={keep}>
               撤销
             </Button>
           )}

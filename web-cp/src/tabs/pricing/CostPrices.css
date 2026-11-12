@@ -1,7 +1,4 @@
-/* 价格 · 成本价. Every value comes from the tokens. */
-
-/* An account's provider: the identifier its documents carry, quieter than
-   the account's name beside it. */
+/* 提供方标识从属于账号名，使用中性文字。 */
 .cost-provider {
-  color: var(--text-2);
+  color: var(--color-ink-soft);
 }

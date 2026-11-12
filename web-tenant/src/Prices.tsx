@@ -1,14 +1,15 @@
 import { Fragment, useEffect, useId, useState } from "react";
 import { ApiError } from "./lib/api";
 import { messageFor } from "./lib/errors";
-import { fmtCnyPerMillion, perThousandOfPerMillion } from "./lib/money";
+import { fmtCnyPerMillion, fmtUtc, perThousandOfPerMillion } from "./lib/money";
 import { currentPrices, dimensionLabels, discountPercent, type Dimension, type PriceQuoteList, type PriceRate, type QuotedModel, type TierQuote } from "./lib/priceQuote";
 import { DataTable, Loading } from "./ui/DataTable";
 import { EmptyState } from "./ui/EmptyState";
 import { RouteNav } from "./ui/RouteNav";
 import { Button } from "./ui/Button";
 import { CopyButton } from "./ui/CopyButton";
-import { Card, PageHeader } from "./components/page";
+import { cn } from "./lib/cn";
+import { BentoGrid, Card, CardFooter, CardHeader, CardMessage, Metric, MetricSkeleton, PageHeader, span } from "./components/page";
 
 function failure(e: unknown): string {
   return e instanceof ApiError ? messageFor(e) : String(e);
@@ -46,31 +47,50 @@ export function Prices({ initialGroup }: { initialGroup: string | null }) {
   const groups = quote?.groups ?? null;
   const chosen = groups === null ? null :
     (groups.find((g) => g.id === open) ?? groups.find((g) => g.id === initialGroup) ?? groups[0] ?? null);
-  const header = <PageHeader title="价格" />;
-  if (err !== null) return <>{header}<div className="note crit" role="alert">{err}</div></>;
-  if (quote === null) return <>{header}<Card><Loading /></Card></>;
-  if (chosen === null) return <>{header}<EmptyState text="运营尚未为本组织分配分组，暂时没有可查看的价格。" /></>;
+  const header = <PageHeader title="价格" eyebrow="PRICING · 组织现价" dataLead="查看当前组织优惠与分组价格；所有单价按实际用量计费，历史账单保留调用当时的费率。" />;
+  if (err !== null) return <>{header}<Card><CardHeader number={1} title="当前价格" /><div role="alert"><CardMessage>{err}</CardMessage></div></Card></>;
+  if (quote === null) return <>{header}<BentoGrid>
+    <Card className={span.d8}><CardHeader number={1} title="当前组织优惠" /><MetricSkeleton className="h-24" /><p className="text-body text-muted">正在读取组织现价与报价时刻…</p></Card>
+    <Card tone="inverse" className={cn(span.d4, "tablet:col-span-12")}><CardHeader number={2} title="当前分组" /><MetricSkeleton /></Card>
+    <Card className={span.d12}><CardHeader number={3} title="模型价格目录" /><Loading /></Card>
+  </BentoGrid></>;
+  if (chosen === null) return <>{header}<Card><CardHeader number={1} title="当前价格" /><EmptyState text="运营尚未为本组织分配分组，暂时没有可查看的价格。" /></Card></>;
 
   return (
     <>
       {header}
-      <Card>
-        <div className="-mx-6 -mt-2 border-b border-border px-4 max-[719px]:-mx-4 max-[719px]:px-2">
+      <BentoGrid>
+        <Card className={span.d8}>
+          <CardHeader number={1} title="当前组织优惠" />
+          <Metric size="hero">{quote.discount_bps === null ? "未知" : discountPercent(quote.discount_bps)}</Metric>
+          <p className="text-stat text-ink-soft">当前组织价格，已含组织优惠{quote.discount_bps === null ? "（暂时无法读取）" : ""}</p>
+          <p className="text-body text-ink-soft">摘要为标准档基础价，单位为元/百万 token；展开可查看全部价格。当前价格不改变历史账单。</p>
+          <CardFooter className="grid gap-2 border-t border-ink/7 pt-4 text-meta font-mono text-muted">
+            <p>报价时刻 {fmtUtc(quote.as_of)}</p>
+            <p>{quote.valid_until === null ? "当前报价未设置失效时刻" : `有效至 ${fmtUtc(quote.valid_until)}`}</p>
+          </CardFooter>
+        </Card>
+        <Card tone="inverse" className={cn(span.d4, "tablet:col-span-12")}>
+          <CardHeader number={2} title="当前分组" />
+          <p className="break-words text-stat">{chosen.display_name}</p>
+          <Metric size="display">{chosen.models.length.toLocaleString("en-US")}</Metric>
+          <p className="text-caption text-on-inverse-muted">个可计价模型</p>
+          <CardFooter className="border-t border-ink/12 pt-4 text-caption text-on-inverse-muted">
+            组织已分配 {quote.groups.length.toLocaleString("en-US")} 个分组；下方可切换查看。
+          </CardFooter>
+        </Card>
+        <Card className={span.d12}>
+          <CardHeader number={3} title="模型价格目录" />
           <RouteNav label="分组" look="underline" items={quote.groups.map((g) => ({ id: g.id, label: g.display_name }))}
             current={chosen.id} onSelect={setOpen} />
-        </div>
-        <section id={`tab-${chosen.id}`} role="tabpanel" aria-labelledby={`stop-${chosen.id}`} className="bleed">
-          <div className="flex flex-wrap items-baseline justify-between gap-x-6 gap-y-1">
-            {chosen.description !== "" && <p className="text-[14px] text-text-2">{chosen.description}</p>}
-            <p className="hint">价格以人民币计，按实际用量计费</p>
-          </div>
-          <p className="text-sm">当前组织价格，已含组织优惠
-            {quote.discount_bps !== null ? ` ${discountPercent(quote.discount_bps)}` : "（暂时无法读取）"}</p>
-          <p className="hint">摘要为标准档基础价，单位为元/百万 token；展开可查看全部价格。当前价格不改变历史账单。</p>
-          {chosen.models.length === 0 ? <EmptyState text="该分组暂时没有可计价的模型。" mark="route" /> :
-            <PriceTable key={chosen.id} models={chosen.models} />}
-        </section>
-      </Card>
+          <section id={`tab-${chosen.id}`} role="tabpanel" aria-labelledby={`stop-${chosen.id}`} className="min-w-0 space-y-4">
+            {chosen.description !== "" && <p className="text-body text-ink-soft">{chosen.description}</p>}
+            <p className="text-caption text-muted">价格以人民币计，按实际用量计费</p>
+            {chosen.models.length === 0 ? <EmptyState text="该分组暂时没有可计价的模型。" mark="route" /> :
+              <PriceTable key={chosen.id} models={chosen.models} />}
+          </section>
+        </Card>
+      </BentoGrid>
     </>
   );
 }
@@ -97,7 +117,7 @@ function RateTable({ rates }: { rates: PriceRate[] }) {
 function TierPrices({ name, tier }: { name: string; tier: TierQuote }) {
   const first = tier.long_context[0];
   return <section className="space-y-3">
-    <h4 className="font-medium">{name === "default" ? "标准" : name}</h4>
+    <h4 className="text-stat font-medium">{name === "default" ? "标准" : name}</h4>
     <p className="hint">{first ? `基础价：输入 ≤ ${first.above_input_tokens.toLocaleString("en-US")} token` : "基础价"}</p>
     <RateTable rates={tier.base} />
     {tier.long_context.map((band, index) => {

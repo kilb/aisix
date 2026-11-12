@@ -10,6 +10,8 @@ import { TwoStep } from "../../ui/TwoStep";
 import { useToast } from "../../ui/Toast";
 import { refusal, useLoad } from "../Tenants";
 import { MONEY_HINT, PERIOD_LABEL, Region, budgetPeriod, type RegionProps } from "./AccountPanel";
+import { BudgetProgress } from "../../components/charts";
+import { exactRatio } from "../../lib/chartFormat";
 
 type Refusal = ReturnType<typeof refusal>;
 
@@ -249,7 +251,14 @@ export function OrgQuota({ account, canEdit, onQuotasChanged }: RegionProps) {
                 <td>{b.kind === "cumulative" ? "一次性额度" : "按周期"}</td>
                 <td>{budgetPeriod(b)}</td>
                 <td className="num">{fmtMicroCny(b.limit_micro_cny)}</td>
-                <td className="num">{fmtMicroCny(b.spent_micro_cny)}</td>
+                <td className="num">
+                  {fmtMicroCny(b.spent_micro_cny)}
+                  <BudgetProgress
+                    value={exactRatio(b.spent_micro_cny, b.limit_micro_cny)}
+                    accessibleLabel={`组织${budgetPeriod(b)}额度：已用 ${fmtMicroCny(b.spent_micro_cny)}，限额 ${fmtMicroCny(b.limit_micro_cny)}`}
+                    className="mt-2 min-w-24"
+                  />
+                </td>
                 <td className="num">{fmtMicroCny(b.remaining_micro_cny)}</td>
                 <td>
                   <span data-state={b.exhausted ? "exhausted" : "ok"}>

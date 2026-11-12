@@ -1,128 +1,141 @@
 import type { ComponentProps, ReactNode } from "react";
 import { cn } from "../lib/cn";
+import { Button } from "../ui/Button";
 
-/**
- * The page layout kit (2026-11-11 rebuild): every page is a PageHeader,
- * then its content laid out with these pieces, so pages share one rhythm.
- *
- * - PageHeader: the title, a one-paragraph description and the page's
- *   actions on the right.
- * - Card: a white card, generously rounded and lit by a tinted shadow,
- *   behind a 1px hairline (keeps the `panel` class the specs and the older
- *   stylesheets know). CardHeader puts a title,
- *   description and actions on one row; a DataTable straight inside a Card
- *   runs edge to edge.
- * - Split: the main column and an aside beside it from 1280px (a create
- *   form, a detail, a summary), stacked below that.
- * - Grid: equal columns that fill the width (2 / 3 / 4 at sm / lg / 2xl).
- * - StatGrid + Stat: the figures a page leads with.
- * - Toolbar: filters and actions above a list, on one wrapping row.
- * - DescList: label / value pairs, two columns where there is room.
- */
-
+/** 双端稳定页面原语：布局与呈现负责在这里，权限、数据和金额计算仍归业务页面。 */
 export function PageHeader({
-  title,
-  description,
-  actions,
-  className,
+  title, description, eyebrow, dataLead, actions, className,
 }: {
   title: ReactNode;
   description?: ReactNode;
+  eyebrow?: ReactNode;
+  dataLead?: ReactNode;
   actions?: ReactNode;
   className?: string;
 }) {
   return (
-    <div className={cn("page-header mb-6 flex flex-wrap items-start justify-between gap-x-8 gap-y-3", className)}>
-      <div className="min-w-0 max-w-3xl">
-        <h2 className="text-2xl font-semibold tracking-tight">{title}</h2>
-        {description && <p className="hint mt-1.5 text-[14px] leading-relaxed text-muted-foreground">{description}</p>}
+    <header className={cn("page-header bento-page-header", className)}>
+      <div className="min-w-0">
+        {eyebrow != null && <div className="mb-5 font-mono text-meta text-muted">{eyebrow}</div>}
+        <h1 className="text-title font-medium">{title}</h1>
+        {(dataLead ?? description) != null && (
+          <div className="bento-lead mt-5 text-lead font-light text-ink-soft">{dataLead ?? description}</div>
+        )}
+        {dataLead != null && description != null && <div className="mt-3 text-body text-muted">{description}</div>}
       </div>
-      {actions && <div className="flex flex-wrap items-center gap-2">{actions}</div>}
-    </div>
+      {actions && <div className="bento-page-actions flex flex-wrap items-center gap-2">{actions}</div>}
+    </header>
   );
 }
 
-export function Card({ className, ...props }: ComponentProps<"section">) {
-  return <section {...props} className={cn("panel", className)} />;
+/** 断点和列宽均为静态 class，构建时可完整扫描。 */
+export const span = {
+  d3: "col-span-12 tablet:col-span-6 desktop:col-span-3",
+  d4: "col-span-12 tablet:col-span-6 desktop:col-span-4",
+  d5: "col-span-12 tablet:col-span-6 desktop:col-span-5",
+  d5Wide: "col-span-12 tablet:col-span-12 desktop:col-span-5",
+  d6: "col-span-12 tablet:col-span-6 desktop:col-span-6",
+  d7: "col-span-12 tablet:col-span-12 desktop:col-span-7",
+  d8: "col-span-12 tablet:col-span-12 desktop:col-span-8",
+  d12: "col-span-12 tablet:col-span-12 desktop:col-span-12",
+} as const;
+
+export function BentoGrid({ className, ...props }: ComponentProps<"div">) {
+  return <div {...props} className={cn("bento-grid grid grid-cols-12 gap-3", className)} />;
+}
+
+export function Card({ className, tone = "surface", ...props }: ComponentProps<"section"> & { tone?: "surface" | "inverse" }) {
+  return <section {...props} data-tone={tone} className={cn("panel bento-card", className)} />;
 }
 
 export function CardHeader({
-  title,
-  description,
-  actions,
-  className,
-  as: Heading = "h3",
+  title, description, actions, className, number, as: Heading = "h2",
 }: {
   title: ReactNode;
   description?: ReactNode;
   actions?: ReactNode;
   className?: string;
+  number?: number;
   as?: "h2" | "h3";
 }) {
   return (
-    <div className={cn("mb-4 flex flex-wrap items-start justify-between gap-x-6 gap-y-2", className)}>
+    <div className={cn("bento-card-header flex flex-wrap items-start justify-between gap-x-6 gap-y-3", className)}>
       <div className="min-w-0">
-        <Heading className="text-base font-semibold tracking-tight">{title}</Heading>
-        {description && <p className="hint mt-1 text-[13px] leading-relaxed text-muted-foreground">{description}</p>}
+        <Heading className="flex items-baseline gap-3 font-mono text-meta font-normal text-muted">
+          <span aria-hidden="true" className={number === undefined ? "bento-card-index" : undefined}>
+            {number === undefined ? null : String(number).padStart(2, "0")}
+          </span>
+          <span>{title}</span>
+        </Heading>
+        {description && <p className="mt-2 text-caption text-muted">{description}</p>}
       </div>
       {actions && <div className="flex flex-wrap items-center gap-2">{actions}</div>}
     </div>
   );
 }
 
-export function Split({
-  main,
-  aside,
-  asideWidth = "380px",
-  className,
-}: {
+export function CardFooter({ className, ...props }: ComponentProps<"div">) {
+  return <div {...props} className={cn("bento-card-footer mt-auto", className)} />;
+}
+
+type MetricSize = "hero" | "display" | "figure" | "value";
+const metricSize = { hero: "text-hero", display: "text-display", figure: "text-figure", value: "text-value" } as const;
+
+/** 不解析或缩写金额；调用方传入精确 formatter 的结果。 */
+export function Metric({ children, size = "value", className }: { children: ReactNode; size?: MetricSize; className?: string }) {
+  return <div className={cn("metric font-normal tabular-nums", metricSize[size], className)}>{children}</div>;
+}
+
+export function MetricSkeleton({ className, ...props }: ComponentProps<"div">) {
+  return <div {...props} aria-hidden="true" className={cn("bento-metric-skeleton rounded-cell bg-foreground/7", className)} />;
+}
+
+export function ChartSkeleton({ className, ...props }: ComponentProps<"div">) {
+  return <div {...props} aria-hidden="true" className={cn("bento-chart-skeleton rounded-cell bg-foreground/7", className)} />;
+}
+
+export function CardMessage({ children, onRetry }: { children: ReactNode; onRetry?: () => void }) {
+  return (
+    <div className="bento-card-message flex min-h-40 flex-col items-start justify-center gap-4 text-body text-muted">
+      <div>{children}</div>
+      {onRetry && <Button onClick={onRetry}>重试</Button>}
+    </div>
+  );
+}
+
+export function Split({ main, aside, className }: {
   main: ReactNode;
   aside?: ReactNode;
-  /** The aside's width from 1280px. */
+  /** 兼容旧调用；详情宽度统一由 7+5 列网格决定，不再固定像素宽度。 */
   asideWidth?: string;
   className?: string;
 }) {
   if (!aside) return <div className={className}>{main}</div>;
   return (
-    <div
-      className={cn("grid items-start gap-6 xl:grid-cols-[minmax(0,1fr)_var(--aside)]", className)}
-      style={{ "--aside": asideWidth } as React.CSSProperties}
-    >
-      <div className="min-w-0">{main}</div>
-      <aside className="min-w-0 xl:sticky xl:top-20">{aside}</aside>
-    </div>
+    <BentoGrid className={cn("bento-split items-start", className)}>
+      <div className={cn("min-w-0", span.d7)}>{main}</div>
+      <aside className={cn("min-w-0 desktop:sticky desktop:top-6", span.d5Wide)}>{aside}</aside>
+    </BentoGrid>
   );
 }
 
 export function Grid({ className, ...props }: ComponentProps<"div">) {
-  return <div {...props} className={cn("grid gap-4 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4", className)} />;
+  return <div {...props} className={cn("grid gap-3 tablet:grid-cols-2 desktop:grid-cols-3", className)} />;
 }
 
 export function StatGrid({ className, ...props }: ComponentProps<"div">) {
-  return (
-    <div
-      {...props}
-      className={cn("mb-6 grid gap-4 sm:grid-cols-2 xl:grid-cols-4", className)}
-    />
-  );
+  return <div {...props} className={cn("bento-stat-grid mb-3 grid gap-3 tablet:grid-cols-2 desktop:grid-cols-4", className)} />;
 }
 
-export function Stat({
-  label,
-  value,
-  foot,
-  className,
-}: {
-  label: ReactNode;
-  value: ReactNode;
-  foot?: ReactNode;
-  className?: string;
-}) {
+export function Stat({ label, value, foot, className }: { label: ReactNode; value: ReactNode; foot?: ReactNode; className?: string }) {
   return (
-    <div className={cn("rounded-2xl border border-border bg-card p-5 shadow-card", className)}>
-      <div className="text-[13px] font-medium text-muted-foreground">{label}</div>
-      <div className="mt-2 text-[28px] leading-none font-semibold tracking-tight tabular-nums">{value}</div>
-      {foot && <div className="mt-2 text-[13px] text-muted-foreground">{foot}</div>}
+    <div className={cn("panel bento-stat", className)}>
+      <div className="flex items-baseline gap-3 font-mono text-meta text-muted">
+        <span className="bento-card-index" aria-hidden="true" />
+        <span>{label}</span>
+      </div>
+      <Metric className="mt-5">{value}</Metric>
+      {foot && <div className="mt-4 text-caption text-muted">{foot}</div>}
     </div>
   );
 }
@@ -131,19 +144,13 @@ export function Toolbar({ className, ...props }: ComponentProps<"div">) {
   return <div {...props} className={cn("mb-4 flex flex-wrap items-end gap-3", className)} />;
 }
 
-export function DescList({
-  items,
-  className,
-}: {
-  items: { label: ReactNode; value: ReactNode; key?: string }[];
-  className?: string;
-}) {
+export function DescList({ items, className }: { items: { label: ReactNode; value: ReactNode; key?: string }[]; className?: string }) {
   return (
-    <dl className={cn("grid gap-x-8 gap-y-0 sm:grid-cols-2", className)}>
+    <dl className={cn("grid gap-x-8 gap-y-0 tablet:grid-cols-2", className)}>
       {items.map((it, i) => (
-        <div key={it.key ?? i} className="flex items-baseline justify-between gap-6 border-b border-divider py-3">
-          <dt className="shrink-0 text-muted-foreground">{it.label}</dt>
-          <dd className="min-w-0 text-right font-medium">{it.value}</dd>
+        <div key={it.key ?? i} className="flex min-w-0 items-baseline justify-between gap-6 border-b border-divider py-3">
+          <dt className="shrink-0 text-muted">{it.label}</dt>
+          <dd className="min-w-0 text-right">{it.value}</dd>
         </div>
       ))}
     </dl>

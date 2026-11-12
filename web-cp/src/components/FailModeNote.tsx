@@ -16,13 +16,13 @@ export function failModeOf(docs: readonly { fail_mode?: unknown }[]): string {
 /** The note for a known mode. `onEdit` adds the link to the stored document. */
 export function FailModeView({ mode, onEdit }: { mode: string; onEdit?: () => void }) {
   return (
-    <div className="note" role="note" aria-label="预算失败模式">
+    <div className="note text-body" role="note" aria-label="预算失败模式">
       <p>
         预算失败模式：<strong>{`${mode}: ${MODE_LABEL[mode] ?? mode}`}</strong>
       </p>
       <p>{FAIL_MODE_TEXT}</p>
       {onEdit && (
-        <button type="button" className="link-button" onClick={onEdit}>
+        <button type="button" className="link-button min-h-11 px-3 text-body text-ink underline underline-offset-4" onClick={onEdit}>
           去修改
         </button>
       )}
@@ -46,7 +46,7 @@ export function FailModeNote({ onEdit }: { onEdit?: () => void }) {
   }, []);
   if (error) {
     return (
-      <div className="note crit" role="alert">
+      <div className="note crit text-body" role="alert">
         {error}
       </div>
     );

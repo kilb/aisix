@@ -31,7 +31,8 @@ use crate::auth::{MemberRole, OperatorRole, KEY_HOLDERS};
 use crate::error::{ApiError, Detail};
 use crate::{
     audit, billing, channels, dp, gateways, groups, keys, member_usage, members, operators,
-    pricing, projector, resources, rollout, tenants, upstream_models, usage, AppState,
+    pricing, projector, resources, rollout, tenants, upstream_models, usage, usage_metrics,
+    AppState,
 };
 
 /// The largest request body either listener reads.
@@ -454,6 +455,17 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
     // Call log and usage summaries.
     ("GET", "/api/usage/calls", MinRole::Member(EVERY_MEMBER)),
     ("GET", "/api/usage/summary", MinRole::Member(EVERY_MEMBER)),
+    ("GET", "/api/usage/metrics", MinRole::Member(EVERY_MEMBER)),
+    (
+        "GET",
+        "/admin/usage/metrics",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
+    (
+        "GET",
+        "/admin/tenants/{id}/usage/metrics",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
     (
         "GET",
         "/admin/tenants/{id}/usage/summary",
@@ -881,6 +893,9 @@ pub fn browser_router(state: AppState) -> Router {
         .route("/api/billing/summary", get(billing::statements::summary))
         .route("/api/usage/calls", get(billing::calls::list_calls))
         .route("/api/usage/summary", get(billing::calls::tenant_summary))
+        .route("/api/usage/metrics", get(usage_metrics::tenant))
+        .route("/admin/usage/metrics", get(usage_metrics::admin))
+        .route("/admin/tenants/{id}/usage/metrics", get(usage_metrics::admin_tenant))
         .route(
             "/admin/tenants/{id}/usage/summary",
             get(billing::calls::admin_summary),

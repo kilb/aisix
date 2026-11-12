@@ -161,6 +161,7 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
         ),
         // Stored usage.
         ("GET", "/admin/usage/events")
+        | ("GET", "/admin/usage/metrics")
         | ("GET", "/admin/usage/batches")
         | ("GET", "/admin/usage/rejects") => (path.to_string(), None),
         // Prices and charges. Each write is refused after the role check
@@ -233,6 +234,10 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
             None,
         ),
         // The tenant matches nothing: 404 once the role check passed.
+        ("GET", "/admin/tenants/{id}/usage/metrics") => (
+            format!("/admin/tenants/{}/usage/metrics", Uuid::nil()),
+            None,
+        ),
         ("GET", "/admin/tenants/{id}/usage/summary") => (
             format!(
                 "/admin/tenants/{}/usage/summary?group=day&from=2026-01-01T00:00:00Z&to=2026-01-02T00:00:00Z",

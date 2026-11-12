@@ -1,32 +1,36 @@
-/* 用量: a call's expanded detail and the billed quantities. Tokens only. */
+/* 用量展开保留完整公式，较窄屏幕由各表格独立滚动。 */
 .usage-detail > td {
-  padding: 12px var(--dt-edge, 24px) 16px;
-  background: var(--muted);
+  padding: 20px var(--dt-edge, 28px) 24px;
+  background: var(--color-well);
+  color: var(--color-ink);
   white-space: normal;
 }
 .dt tbody tr.usage-detail:hover {
-  background: var(--muted);
+  background: var(--color-well);
 }
 .dt tr:has(+ tr.usage-detail) > td {
   border-bottom: 0;
 }
 .usage-detail h3 {
   margin-bottom: 8px;
-  font-size: 13px;
-  font-weight: 600;
+  font-size: var(--text-meta);
+  line-height: var(--text-meta--line-height);
+  font-family: var(--font-mono);
+  font-weight: 400;
 }
 .usage-detail .dt-wrap {
   --dt-edge: 12px;
   max-width: 720px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  background: var(--card);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-cell);
+  background: var(--color-surface);
 }
 .usage-detail .dt th {
-  background: var(--card);
+  background: var(--color-surface);
 }
 .usage-detail .hint {
   margin-top: 8px;
+  color: var(--color-ink-soft);
 }
 .usage-qty {
   display: inline-flex;

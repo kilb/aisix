@@ -24,7 +24,12 @@ import { Field, useRefusalFocus } from "./ui/Field";
 import { KeySecret } from "./ui/KeySecret";
 import { Lamp, type LampState } from "./ui/Lamp";
 import { TwoStep } from "./ui/TwoStep";
-import { Card, CardHeader, PageHeader, Split } from "./components/page";
+import { BentoGrid, Card, CardFooter, CardHeader, CardMessage, Metric, MetricSkeleton, PageHeader, span } from "./components/page";
+import { RankBars } from "./components/charts";
+import { formatCount } from "./lib/chartFormat";
+import { cn } from "./lib/cn";
+
+// 桌面：5 + 7 / 12 / 12；平板与手机按卡片顺序各占整行。
 
 type Caps = Org["limits"];
 
@@ -134,10 +139,10 @@ export function Keys({
   function modelsOf(k: TenantKey): string {
     if (k.model_ids === null) return "全部授权模型";
     if (k.model_ids.length === 0) return "无";
-    if (!catalog) return `${k.model_ids.length} 个模型`;
+    if (!catalog) return `${formatCount(k.model_ids.length)} 个模型`;
     const names = k.model_ids.flatMap((id) => catalog.find((m) => m.id === id)?.name ?? []);
     const gone = k.model_ids.length - names.length;
-    return [...names, ...(gone > 0 ? [`${gone} 个已不在授权内`] : [])].join("、");
+    return [...names, ...(gone > 0 ? [`${formatCount(gone)} 个已不在授权内`] : [])].join("、");
   }
 
   function limitsOf(k: TenantKey): string {
@@ -151,167 +156,212 @@ export function Keys({
     return parts.length > 0 ? parts.join(" · ") : "不限";
   }
 
+  const visibleScope = manager ? "全组织密钥" : "我的密钥";
+  const readyKeys = items?.filter((key) => stateOf(key).lamp === "applied").length;
+  const stateCounts = items === null ? [] : [
+    { label: "配置可用", value: 0 },
+    { label: "平台停用", value: 0 },
+    { label: "主动停用", value: 0 },
+    { label: "已过期", value: 0 },
+    { label: "分组不可用", value: 0 },
+  ];
+  for (const key of items ?? []) {
+    const index = key.disabled_by_platform ? 1 : key.disabled ? 2
+      : key.expires_at && Date.parse(key.expires_at) <= Date.now() ? 3 : !key.group_available ? 4 : 0;
+    const bucket = stateCounts[index];
+    if (bucket) bucket.value += 1;
+  }
+
   return (
     <>
-      <PageHeader title="密钥" />
-      <Split
-        asideWidth="clamp(288px, 22.5vw, 380px)"
-        main={
-          <Card className="keys-list">
-            {!active && <div className="note crit">组织已被停用，所有密钥暂时无法调用；这里只能吊销密钥。</div>}
-            {minted && (
-              <ShownOnce title="密钥明文（可再次复制）" value={minted} onDone={() => setMinted(null)}>
-                <span className="hint">密钥创建成功。之后可在下面的密钥列表里随时点「复制」再次获取明文。</span>
-              </ShownOnce>
-            )}
-            {listErr && (
-              <div className="note crit" role="alert">
-                {listErr}
-              </div>
-            )}
-            {actionErr && (
-              <div className="note crit" role="alert">
-                {actionErr}
-              </div>
-            )}
-            {items === null ? (
-              !listErr && <Loading />
-            ) : items.length === 0 ? (
-              <EmptyState mark="key" text="还没有密钥。" />
-            ) : (
-              <DataTable>
-                <thead>
-                  <tr>
-                    <th>名称</th>
-                    <th>前缀</th>
-                    <th>归属</th>
-                    <th>模型</th>
-                    <th>分组</th>
-                    <th>限制</th>
-                    <th>状态</th>
-                    <th>
-                      <span className="vh">操作</span>
-                    </th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {items.map((k) => {
-                    const state = stateOf(k);
-                    const owner = ownerOf(k);
-                    const models = modelsOf(k);
-                    return (
-                      <tr key={k.id}>
-                        <td>
-                          <span className="trunc [--trunc:144px] min-[1800px]:[--trunc:160px]" title={k.label}>
-                            {k.label}
-                          </span>
-                        </td>
-                        <td>
-                          <KeySecret
-                            prefix={k.prefix}
-                            className="acts mt-1.5 flex w-max justify-start min-[1800px]:mt-0 min-[1800px]:ml-2 min-[1800px]:inline-flex"
-                            reveal={() => keyApi.reveal(k.id)}
-                            unavailable={
-                              k.plaintext_available ? null : "该密钥创建于旧版本，无法再次查看；如需明文请新建密钥"
-                            }
-                            onError={(e) =>
-                              setActionErr(
-                                e instanceof ApiError && e.code === "plaintext_unavailable"
-                                  ? messageFor(e)
-                                  : e instanceof ApiError
-                                    ? formMessageFor(e)
-                                    : failure(e),
-                              )
-                            }
-                          />
-                        </td>
-                        <td>
-                          <span className="trunc" style={{ "--trunc": "128px" } as CSSProperties} title={owner}>
-                            {owner}
-                          </span>
-                        </td>
-                        <td>
-                          <span className="trunc [--trunc:120px] min-[1800px]:[--trunc:216px]" title={models}>
-                            {models}
-                          </span>
-                        </td>
-                        <td>
-                          <GroupCell
-                            k={k}
-                            groups={groups}
-                            active={active}
-                            busy={busy === k.id}
-                            acting={acting}
-                            onChoose={(groupId) => void act(k, "group", () => keyApi.setGroup(k.id, groupId, k.version))}
-                          />
-                        </td>
-                        <td className="tabular [word-break:keep-all] max-[1799px]:whitespace-normal">
-                          <span className="block min-w-[5.75rem] max-w-[6.5rem] min-[1800px]:max-w-none">{limitsOf(k)}</span>
-                        </td>
-                        <td>
-                          <Lamp state={state.lamp}>{state.text}</Lamp>
-                          {state.note && (
-                            <span className="hint cell-note max-w-[8rem] whitespace-normal min-[1800px]:max-w-none">{state.note}</span>
-                          )}
-                        </td>
-                        <td className="right">
-                          <span className="acts">
-                            {/* The organisation's own switch, which the platform's overrides. */}
-                            {active && !k.disabled_by_platform && (
-                              <Button
-                                size="sm"
-                                disabled={busy === k.id}
-                                busy={busy === k.id && acting === "switch"}
-                                busyLabel={k.disabled ? "启用" : "停用"}
-                                onClick={() => void act(k, "switch", () => keyApi.setDisabled(k.id, !k.disabled, k.version))}
-                              >
-                                {k.disabled ? "启用" : "停用"}
-                              </Button>
-                            )}
-                            <TwoStep
-                              label="吊销"
-                              size="sm"
-                              warning="吊销后立即失效，且无法恢复"
-                              disabled={busy === k.id}
-                              busy={busy === k.id && acting === "revoke"}
-                              onConfirm={() => void act(k, "revoke", () => keyApi.revoke(k.id, k.version))}
-                            />
-                          </span>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </DataTable>
-            )}
-          </Card>
-        }
-        aside={
-          active ? (
-            <NewKeyForm
-              me={member}
-              manager={manager}
-              catalog={catalog}
-              groups={groups}
-              caps={caps}
-              people={people}
-              readErr={readErr}
-              onInactive={onSelfChanged}
-              onCreated={(plaintext) => {
-                setMinted(plaintext);
-                void load();
-              }}
-            />
-          ) : undefined
-        }
+      <PageHeader
+        title="密钥"
+        eyebrow={visibleScope}
+        dataLead={items === null ? "管理调用凭据、模型范围与使用限制。" : <>
+          当前可见 <span className="font-medium text-ink">{formatCount(items.length)}</span> 把密钥，
+          其中 <span className="font-medium text-ink">{formatCount(readyKeys ?? 0)}</span> 把配置可用。
+          {active ? "实际调用仍受组织授权和额度约束。" : "组织已停用，所有密钥暂时无法调用。"}
+        </>}
       />
+      <BentoGrid>
+        <Card className={span.d5Wide}>
+          <CardHeader number={1} title="当前可见密钥" />
+          {items === null ? (listErr ? <CardMessage onRetry={() => void load()}>密钥读取失败，请重试。</CardMessage> : <MetricSkeleton />) : (
+            <>
+              <Metric size="hero">{formatCount(items.length)}</Metric>
+              <CardFooter>
+                <p className="text-body text-ink-soft">{manager ? "组织成员及组织持有的全部密钥" : "仅包含归属你的密钥"}</p>
+                <p className="mt-2 font-mono text-meta text-ink-soft">完整可见列表 · 不包含已吊销密钥</p>
+              </CardFooter>
+            </>
+          )}
+        </Card>
+        <Card className={span.d7}>
+          <CardHeader number={2} title="密钥配置状态" description="每把密钥只计入一个状态；不代表实时调用结果。" />
+          <CardFooter>
+            {items === null ? (listErr ? <CardMessage onRetry={() => void load()}>状态读取失败，请重试。</CardMessage> : <Loading />) : (
+              <RankBars
+                items={stateCounts.map((item) => ({ ...item, displayValue: `${formatCount(item.value)} 把` }))}
+                accessibleLabel={`当前可见密钥中，${formatCount(readyKeys ?? 0)} 把配置可用，共 ${formatCount(items.length)} 把`}
+                emptyLabel="还没有密钥"
+              />
+            )}
+            <p className="mt-4 text-caption text-ink-soft">平台停用、主动停用、过期、分组不可用按此顺序归类。组织状态、预算及实时额度另行生效。</p>
+          </CardFooter>
+        </Card>
+        <Card className={cn(span.d12, "keys-list")}>
+          <CardHeader number={3} title="密钥列表" description="复制或查看明文会重新获取密钥；吊销后立即失效，无法恢复。" />
+          {!active && <div className="note crit">组织已被停用，所有密钥暂时无法调用；这里只能吊销密钥。</div>}
+          {minted && (
+            <ShownOnce title="密钥明文（可再次复制）" value={minted} onDone={() => setMinted(null)}>
+              <span className="hint">密钥创建成功。之后可在下面的密钥列表里随时点「复制」再次获取明文。</span>
+            </ShownOnce>
+          )}
+          {listErr && (
+            <div className="note crit" role="alert">
+              {listErr}
+            </div>
+          )}
+          {actionErr && (
+            <div className="note crit" role="alert">
+              {actionErr}
+            </div>
+          )}
+          {items === null ? (
+            !listErr && <Loading />
+          ) : items.length === 0 ? (
+            <EmptyState mark="key" text="还没有密钥。" />
+          ) : (
+            <DataTable>
+              <thead>
+                <tr>
+                  <th>名称</th>
+                  <th>前缀</th>
+                  <th>归属</th>
+                  <th>模型</th>
+                  <th>分组</th>
+                  <th>限制</th>
+                  <th>状态</th>
+                  <th>
+                    <span className="vh">操作</span>
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {items.map((k) => {
+                  const state = stateOf(k);
+                  const owner = ownerOf(k);
+                  const models = modelsOf(k);
+                  return (
+                    <tr key={k.id}>
+                      <td>
+                        <span className="trunc [--trunc:144px] min-[1800px]:[--trunc:160px]" title={k.label}>
+                          {k.label}
+                        </span>
+                      </td>
+                      <td>
+                        <KeySecret
+                          prefix={k.prefix}
+                          className="acts mt-1.5 flex w-max justify-start min-[1800px]:mt-0 min-[1800px]:ml-2 min-[1800px]:inline-flex"
+                          reveal={() => keyApi.reveal(k.id)}
+                          unavailable={
+                            k.plaintext_available ? null : "该密钥创建于旧版本，无法再次查看；如需明文请新建密钥"
+                          }
+                          onError={(e) =>
+                            setActionErr(
+                              e instanceof ApiError && e.code === "plaintext_unavailable"
+                                ? messageFor(e)
+                                : e instanceof ApiError
+                                  ? formMessageFor(e)
+                                  : failure(e),
+                            )
+                          }
+                        />
+                      </td>
+                      <td>
+                        <span className="trunc" style={{ "--trunc": "128px" } as CSSProperties} title={owner}>
+                          {owner}
+                        </span>
+                      </td>
+                      <td>
+                        <span className="trunc [--trunc:120px] min-[1800px]:[--trunc:216px]" title={models}>
+                          {models}
+                        </span>
+                      </td>
+                      <td>
+                        <GroupCell
+                          k={k}
+                          groups={groups}
+                          active={active}
+                          busy={busy === k.id}
+                          acting={acting}
+                          onChoose={(groupId) => void act(k, "group", () => keyApi.setGroup(k.id, groupId, k.version))}
+                        />
+                      </td>
+                      <td className="tabular [word-break:keep-all] max-[1799px]:whitespace-normal">
+                        <span className="block min-w-[5.75rem] max-w-[6.5rem] min-[1800px]:max-w-none">{limitsOf(k)}</span>
+                      </td>
+                      <td>
+                        <Lamp state={state.lamp}>{state.text}</Lamp>
+                        {state.note && (
+                          <span className="hint cell-note max-w-[8rem] whitespace-normal min-[1800px]:max-w-none">{state.note}</span>
+                        )}
+                      </td>
+                      <td className="right">
+                        <span className="acts">
+                          {/* The organisation's own switch, which the platform's overrides. */}
+                          {active && !k.disabled_by_platform && (
+                            <Button
+                              size="sm"
+                              disabled={busy === k.id}
+                              busy={busy === k.id && acting === "switch"}
+                              busyLabel={k.disabled ? "启用" : "停用"}
+                              onClick={() => void act(k, "switch", () => keyApi.setDisabled(k.id, !k.disabled, k.version))}
+                            >
+                              {k.disabled ? "启用" : "停用"}
+                            </Button>
+                          )}
+                          <TwoStep
+                            label="吊销"
+                            size="sm"
+                            warning="吊销后立即失效，且无法恢复"
+                            disabled={busy === k.id}
+                            busy={busy === k.id && acting === "revoke"}
+                            onConfirm={() => void act(k, "revoke", () => keyApi.revoke(k.id, k.version))}
+                          />
+                        </span>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </DataTable>
+          )}
+        </Card>
+        {active && (
+          <NewKeyForm
+            me={member}
+            manager={manager}
+            catalog={catalog}
+            groups={groups}
+            caps={caps}
+            people={people}
+            readErr={readErr}
+            onInactive={onSelfChanged}
+            onCreated={(plaintext) => {
+              setMinted(plaintext);
+              void load();
+            }}
+          />
+        )}
+      </BentoGrid>
     </>
   );
 }
 
 /** A count, with thousands separators. */
 function count(n: number): string {
-  return n.toLocaleString("en-US");
+  return formatCount(n);
 }
 
 /**
@@ -585,14 +635,14 @@ function NewKeyForm({
   const noGroup = groups !== null && groups.length === 0;
 
   return (
-    <Card>
-      <CardHeader title="新建密钥" />
+    <Card className={span.d12}>
+      <CardHeader number={4} title="新建密钥" description="先选择计价分组，再设置模型范围与限制。未填写的限制沿用组织上限。" />
       {readErr && (
         <div className="note crit" role="alert">
           {readErr}
         </div>
       )}
-      <form ref={form} className="grid gap-x-4 gap-y-5 sm:grid-cols-2 xl:grid-cols-1 min-[1800px]:grid-cols-2" onSubmit={submit} noValidate>
+      <form ref={form} className="grid min-w-0 gap-x-7 gap-y-5 tablet:grid-cols-2" onSubmit={submit} noValidate>
         <Field label="名称" wide error={errs.label}>
           {(aria) => <input value={label} onChange={(e) => setLabel(e.target.value)} {...aria} />}
         </Field>
@@ -649,7 +699,7 @@ function NewKeyForm({
               {group !== "" && (
                 <>
                   {" · "}
-                  <a href={`#prices?group=${encodeURIComponent(group)}`}>查看价格</a>
+                  <a className="inline-flex min-h-11 min-w-11 items-center" href={`#prices?group=${encodeURIComponent(group)}`}>查看价格</a>
                 </>
               )}
             </p>
@@ -697,7 +747,7 @@ function NewKeyForm({
             {modelScope === "selected" && (
               <div className="grid min-w-0 gap-3">
                 <p className="hint" aria-live="polite">
-                  已选 {picked.length} 个模型
+                  已选 {formatCount(picked.length)} 个模型
                 </p>
                 {noModels && !errs.models && <p className="hint" id={modelsEmpty}>{modelsEmptyMessage}</p>}
                 <div>
@@ -792,7 +842,7 @@ function NewKeyForm({
             {err}
           </div>
         )}
-        <div className="col-span-full -mx-6 -mb-6 flex justify-end gap-2 rounded-b-xl border-t border-border bg-muted/40 px-6 py-3 max-[719px]:-mx-4 max-[719px]:-mb-4 max-[719px]:px-4">
+        <div className="col-span-full flex justify-end gap-2 border-t border-ink/7 pt-5">
           <Button
             kind="primary"
             type="submit"

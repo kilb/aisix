@@ -4,8 +4,8 @@
 import type { ReactNode } from "react";
 
 /**
- * A table: a sticky 36px header in 12px muted labels, 44px rows (56px with
- * a note line, 36px compact) that hover in a light wash, no zebra stripes.
+ * 表头44px、普通行至少56px、compact至少48px，容纳44px操作控件；
+ * 灰色 mono 标签与中性 hover，无斑马条纹。
  * Numbers sit right-aligned in tabular figures (`className="num"` on the
  * cell and its header), as do a row's actions (`"right"`). The children
  * are its `thead` and `tbody`. It scrolls sideways inside its own box when

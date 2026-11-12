@@ -23,10 +23,19 @@ import { EmptyState } from "./ui/EmptyState";
 import { Field, useRefusalFocus } from "./ui/Field";
 import { Lamp, type LampState } from "./ui/Lamp";
 import { useToast } from "./ui/Toast";
-import { Card, CardHeader, PageHeader, Split } from "./components/page";
+import { BentoGrid, Card, CardHeader, Metric, PageHeader, span } from "./components/page";
+import { TrendChart } from "./components/charts";
+import { exactInteger, normalizeExactValues } from "./lib/chartFormat";
+import { cn } from "./lib/cn";
 
 function failure(e: unknown): string {
   return e instanceof ApiError ? messageFor(e) : String(e);
+}
+
+/** 图形和公式只显示可靠整数，不把旧接口舍入值显示为精确金额。 */
+function moneyText(value: number | string | bigint): string {
+  const integer = exactInteger(value);
+  return integer === null ? "未知" : fmtMicroCny(integer);
 }
 
 /** Longest a top-up's note and reference may be: the control plane's own limits. */
@@ -36,20 +45,20 @@ const REFERENCE_MAX = 128;
 const TOPUPS_SHOWN = 500;
 
 /** One figure of the balance: its label over the amount, a tile of the card's grid. */
-function Reading({ label, value }: { label: string; value: ReactNode }) {
+function Reading({ label, value, hero = false }: { label: string; value: ReactNode; hero?: boolean }) {
   return (
-    <div className="entry flex min-w-0 flex-col gap-1.5 rounded-xl border border-border bg-muted/50 px-4 py-3.5">
-      <span className="lab">{label}</span>
-      <span className="val text-2xl tracking-tight max-sm:text-xl">{value}</span>
+    <div className="entry min-w-0">
+      <span className="text-meta font-mono text-muted">{label}</span>
+      <div className="val"><Metric size={hero ? "hero" : "value"} className="mt-3 whitespace-normal break-all">{value}</Metric></div>
     </div>
   );
 }
 
-/** A card that is a region named by its heading. */
-function Section({ title, actions, children }: { title: string; actions?: ReactNode; children: ReactNode }) {
+/** 保留业务区域名称，编号只用于视觉阅读顺序。 */
+function Section({ title, number, actions, children, className = span.d12, tone }: { title: string; number: number; actions?: ReactNode; children: ReactNode; className?: string; tone?: "surface" | "inverse" }) {
   return (
-    <Card role="region" aria-label={title}>
-      <CardHeader title={title} actions={actions} />
+    <Card role="region" aria-label={title} className={className} tone={tone}>
+      <CardHeader number={number} title={title} actions={actions} />
       {children}
     </Card>
   );
@@ -119,31 +128,14 @@ export function Billing({ member }: { member: SessionMember }) {
 
   return (
     <>
-      <PageHeader title="账户" />
-      <div className="billing grid gap-6">
-        {/* What the organisation holds, and what the next call can still spend. */}
-        <div className="grid items-start gap-6 xl:grid-cols-2">
-          <BalancePanel balance={balance} team={team} teamErr={teamErr} onRetryTeam={() => void loadTeam()} err={balanceErr} />
-          <Readout member={member} balance={balance} team={team} teamErr={teamErr} onRetryTeam={() => void loadTeam()} />
-        </div>
-        <Split
-          asideWidth="380px"
-          main={
-            <div className="grid gap-6">
-              <TopupList items={topups} err={topupsErr} />
-              <Ledger topups={topups} />
-            </div>
-          }
-          aside={
-            <TopupForm
-              onRequested={() => {
-                void loadTopups();
-                void loadBalance();
-              }}
-            />
-          }
-        />
-      </div>
+      <PageHeader title="账户" eyebrow="BILLING · 组织账户" dataLead="余额来自全量已入账快照；可用额度同时受账户、组织、成员和密钥限制。待审批充值到账后才可使用。" />
+      <BentoGrid className="billing">
+        <BalancePanel balance={balance} team={team} teamErr={teamErr} onRetryTeam={() => void loadTeam()} err={balanceErr} />
+        <Readout member={member} balance={balance} team={team} teamErr={teamErr} onRetryTeam={() => void loadTeam()} />
+        <TopupList items={topups} err={topupsErr} />
+        <TopupForm onRequested={() => { void loadTopups(); void loadBalance(); }} />
+        <Ledger topups={topups} />
+      </BentoGrid>
     </>
   );
 }
@@ -194,16 +186,12 @@ function BalancePanel({
         ? "组织额度已用尽，调用已停止"
         : "可正常调用";
   return (
-    <Card role="region" aria-label="余额">
-      {/* The heading, and on its right whether calls are accepted now. */}
-      <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-2">
-        <h3 className="text-base font-semibold tracking-tight">余额</h3>
-        {balance && (
-          <p className="balance-state text-[13px] font-medium" data-state={!known ? "unknown" : exhausted ? "exhausted" : "ok"}>
-            <Lamp state={!known ? "pending" : exhausted ? "rejected" : "applied"}>{stateText}</Lamp>
-          </p>
-        )}
-      </div>
+    <Card role="region" aria-label="余额" className={span.d8}>
+      <CardHeader number={1} title="余额" actions={balance && (
+        <p className="balance-state text-caption" data-state={!known ? "unknown" : exhausted ? "exhausted" : "ok"}>
+          <Lamp state={!known ? "pending" : exhausted ? "rejected" : "applied"}>{stateText}</Lamp>
+        </p>
+      )} />
       {err && (
         <div className="note crit" role="alert">
           {err}
@@ -212,11 +200,13 @@ function BalancePanel({
       {balance && (
         <>
           {!known && teamErr && <TeamFailed err={teamErr} onRetry={onRetryTeam} />}
-          <div className="entries grid gap-3 sm:grid-cols-2">
-            <Reading label="余额" value={<Money micro={balance.calculation.balance_micro_cny} />} />
+          <div className="entries grid gap-6">
+            <Reading hero label="余额" value={<Money micro={balance.calculation.balance_micro_cny} />} />
+            <div className="grid gap-5 tablet:grid-cols-3">
             <Reading label="信用额度" value={<Money micro={balance.calculation.credit_limit_micro_cny} />} />
             <Reading label="可用额度" value={<Money micro={balance.calculation.available_micro_cny} />} />
-            <Reading label="待审批的充值" value={`${balance.pending_topups} 笔`} />
+            <Reading label="待审批的充值" value={`${balance.pending_topups.toLocaleString("en-US")} 笔`} />
+            </div>
           </div>
           <BalanceCalculation balance={balance} />
         </>
@@ -229,14 +219,17 @@ function BalancePanel({
 /** 同一只读入账快照中的全量流水，不受下面流水分页或筛选影响。 */
 function BalanceCalculation({ balance }: { balance: Balance }) {
   const f = balance.calculation;
-  const matches = BigInt(f.topups_micro_cny) - BigInt(f.usage_micro_cny) + BigInt(f.adjustments_micro_cny) === BigInt(f.balance_micro_cny);
+  const values = [f.topups_micro_cny, f.usage_micro_cny, f.adjustments_micro_cny, f.balance_micro_cny].map(exactInteger);
+  const [topups, usage, adjustments, total] = values;
+  const matches = topups == null || usage == null || adjustments == null || total == null ? null : topups - usage + adjustments === total;
   return (
-    <section aria-label="余额计算" className="grid gap-2 border-t border-border pt-4 text-sm">
-      <h3>余额计算</h3>
-      <p className="break-words tabular">累计到账 {fmtMicroCny(f.topups_micro_cny)} − 原始扣费 {fmtMicroCny(f.usage_micro_cny)} + 余额调整（{fmtMicroCny(f.adjustments_micro_cny)}）{matches ? " = " : "；账户余额 "}{fmtMicroCny(f.balance_micro_cny)}</p>
-      {!matches && <p className="note crit" role="alert">流水合计与账户余额不一致，请联系管理员核对。</p>}
+    <section aria-label="余额计算" className="grid gap-3 border-t border-ink/7 pt-4 text-body">
+      <h3 className="text-stat font-medium">余额计算</h3>
+      <p className="break-words tabular">累计到账 {moneyText(f.topups_micro_cny)} − 原始扣费 {moneyText(f.usage_micro_cny)} + 余额调整（{moneyText(f.adjustments_micro_cny)}）{matches ? " = " : "；账户余额 "}{moneyText(f.balance_micro_cny)}</p>
+      {matches === false && <p className="note crit" role="alert">流水合计与账户余额不一致，请联系管理员核对。</p>}
+      {matches === null && <p className="note crit" role="alert">余额计算金额未知，暂不能核对等式。</p>}
       {f.available_overflow ? <p className="note crit" role="alert">余额加信用额度超出支持范围，可用额度显示上限值，调用已按现有规则停止。</p> : (
-        <p className="break-words tabular">余额 {fmtMicroCny(f.balance_micro_cny)} + 信用额度 {fmtMicroCny(f.credit_limit_micro_cny)} = 可用额度 {fmtMicroCny(f.available_micro_cny)}</p>
+        <p className="break-words tabular">余额 {moneyText(f.balance_micro_cny)} + 信用额度 {moneyText(f.credit_limit_micro_cny)} = 可用额度 {moneyText(f.available_micro_cny)}</p>
       )}
       <p className="hint">截至 {fmtUtc(f.as_of)} 的已入账快照。待审批充值与尚未入账用量不计入；信用额度是透支上限，预算限制另行生效。</p>
     </section>
@@ -252,7 +245,7 @@ const SCOPE_LEVEL = { team: "organization", member: "member", api_key: "key" } a
 function stopsOf(q: KeyQuota): ReadoutStop[] {
   const least: Partial<Record<QuotaLevel, number>> = {};
   const lower = (level: QuotaLevel, micro: number) => {
-    const amount = Math.max(0, micro);
+    const amount = Number.isSafeInteger(micro) ? Math.max(0, micro) : Number.NaN;
     least[level] = Math.min(least[level] ?? amount, amount);
   };
   if (q.org) lower("organization", q.org.available_micro_cny);
@@ -311,7 +304,7 @@ function Readout({
 
   // The figures move as calls are made, so they are read again whenever the
   // key changes or the balance does.
-  const available = balance?.available_micro_cny;
+  const available = balance?.calculation.available_micro_cny;
   useEffect(() => {
     if (keyId === null) {
       setQuota(null);
@@ -333,7 +326,7 @@ function Readout({
 
   if (items === null || (balance === null && keyId === null)) {
     return (
-      <Section title="可用额度">
+      <Section number={2} title="可用额度" tone="inverse" className={cn(span.d4, "tablet:col-span-12")}>
         {err && (
           <div className="note crit" role="alert">
             {err}
@@ -344,19 +337,24 @@ function Readout({
     );
   }
 
-  let view: { effective: number | null; stops: ReadoutStop[]; binding: QuotaLevel | null } | null = null;
+  let view: { effective: number | string | bigint | null; stops: ReadoutStop[]; binding: QuotaLevel | null } | null = null;
   if (keyId !== null && quota && quota.key_id === keyId) {
     view = { effective: quota.effective_remaining_micro_cny, stops: stopsOf(quota), binding: quota.binding_level };
   } else if (keyId === null && balance && team !== null) {
     // No key to read (a billing member's case): the smaller of the organisation's
     // balance and its smallest remaining quota, once the quotas are read.
-    const left = Math.min(Math.max(0, balance.available_micro_cny), ...team.map((b) => Math.max(0, b.remaining_micro_cny)));
+    const amounts = [balance.calculation.available_micro_cny, ...team.map((b) => b.remaining_micro_cny)].map(exactInteger);
+    const knownAmounts = amounts.filter((value): value is bigint => value !== null);
+    const left = knownAmounts.length !== amounts.length ? Number.NaN : knownAmounts.reduce((least, value) => {
+      const nonnegative = value < 0n ? 0n : value;
+      return nonnegative < least ? nonnegative : least;
+    }, knownAmounts[0]! < 0n ? 0n : knownAmounts[0]!);
     view = { effective: left, stops: [{ level: "organization", label: "组织", remainingMicroCny: left }], binding: "organization" };
   }
 
   const picker =
     manager && items.length > 0 ? (
-      <div className="readout-pick w-full sm:w-56">
+      <div className="w-full">
         <Field label="密钥">
           <select value={keyId ?? ""} onChange={(e) => setKeyId(e.target.value)}>
             {items.map((k) => (
@@ -373,7 +371,7 @@ function Readout({
     // A billing member's figure waits on the organisation's quotas.
     const quotaErr = keyId === null && team === null ? teamErr : null;
     return (
-      <Section title="可用额度">
+      <Section number={2} title="可用额度" tone="inverse" className={cn(span.d4, "tablet:col-span-12")}>
         {picker}
         {err && (
           <div className="note crit" role="alert">
@@ -455,8 +453,9 @@ function TopupForm({ onRequested }: { onRequested: () => void }) {
   }
 
   return (
-    <Section title="申请充值">
-      <form className="grid gap-4 md:grid-cols-2 xl:grid-cols-1" ref={form} onSubmit={submit} noValidate>
+    <Section number={4} title="申请充值" className={span.d5Wide}>
+      <p className="text-caption text-muted">提交申请后由平台审批，审批通过才计入账户余额。</p>
+      <form className="grid gap-4" ref={form} onSubmit={submit} noValidate>
         <Field label="充值金额（元）" error={errors.amount} hint="最多两位小数">
           {(aria) => (
             <input inputMode="decimal" autoComplete="off" value={amount} onChange={(e) => setAmount(e.target.value)} {...aria} />
@@ -475,7 +474,7 @@ function TopupForm({ onRequested }: { onRequested: () => void }) {
             {general}
           </div>
         )}
-        <div className="col-span-full -mx-6 -mb-6 mt-2 flex justify-end gap-2 rounded-b-[11px] border-t border-border bg-muted/40 px-6 py-3 max-[719px]:-mx-4 max-[719px]:-mb-4 max-[719px]:px-4">
+        <div className="col-span-full mt-2 flex justify-end gap-2 border-t border-ink/7 pt-4">
           <Button kind="primary" type="submit" busy={busy} busyLabel="提交中…">
             提交申请
           </Button>
@@ -502,7 +501,8 @@ function explanation(t: Topup): string | null {
 
 function TopupList({ items, err }: { items: Topup[] | null; err: string | null }) {
   return (
-    <Section title="充值记录">
+    <Section number={3} title="充值记录" className={span.d7}>
+      <p className="text-caption text-muted">最多显示最近 {TOPUPS_SHOWN} 笔申请与平台入账记录；待审批总数见账户余额。</p>
       {err && (
         <div className="note crit" role="alert">
           {err}
@@ -662,7 +662,7 @@ function Ledger({ topups }: { topups: Topup[] | null }) {
 
   return (
     <>
-      <Section title="余额流水">
+      <Section number={5} title="余额流水">
         <Filters>
           <Field label="开始日期（UTC）" error={range ? null : "结束日期不能早于开始日期"}>
             <input type="date" value={fromDate} max={toDate || undefined} onChange={(e) => setFromDate(e.target.value)} />
@@ -723,7 +723,7 @@ function Ledger({ topups }: { topups: Topup[] | null }) {
           </DataTable>
         )}
         {next !== null && (
-          <div className="panel-more -mx-6 -mb-6 !mt-0 flex justify-center rounded-b-[11px] border-t border-border bg-muted/40 px-6 py-3 max-[719px]:-mx-4 max-[719px]:-mb-4">
+          <div className="flex justify-center border-t border-ink/7 pt-4">
             <Button size="sm" busy={more} busyLabel="加载中…" onClick={() => void loadMore()}>
               加载更多
             </Button>
@@ -733,6 +733,13 @@ function Ledger({ topups }: { topups: Topup[] | null }) {
       <Summary range={range} fromDate={fromDate} toDate={toDate} />
     </>
   );
+}
+
+/** 图表数据与表格行分开投影，显示金额保留原始精度。 */
+export function ledgerSummaryChartPoints(rows: readonly LedgerSummaryRow[], group: "day" | "month") {
+  const chartRows = [...rows].sort((a, b) => Date.parse(a.period_start) - Date.parse(b.period_start));
+  const geometry = normalizeExactValues(chartRows.map((row) => row.usage_micro_cny));
+  return chartRows.map((row, index) => ({ label: periodLabel(row.period_start, group), value: geometry[index] ?? null, displayValue: moneyText(row.usage_micro_cny) }));
 }
 
 function Summary({ range, fromDate, toDate }: { range: { from?: string; to?: string } | null; fromDate: string; toDate: string }) {
@@ -770,13 +777,16 @@ function Summary({ range, fromDate, toDate }: { range: { from?: string; to?: str
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [group, fromDate, toDate]);
 
+  const points = ledgerSummaryChartPoints(rows ?? [], group);
+
   return (
     <Section
+      number={6}
       title="按期汇总"
       actions={
         <label className="flex items-center gap-2">
           <span className="f-label">汇总方式</span>
-          <select className="h-8 w-auto pr-8 text-[13px]" value={group} onChange={(e) => setGroup(e.target.value as "day" | "month")}>
+          <select className="min-h-11 w-auto pr-8 text-body" value={group} onChange={(e) => setGroup(e.target.value as "day" | "month")}>
             <option value="day">按天</option>
             <option value="month">按月</option>
           </select>
@@ -793,7 +803,12 @@ function Summary({ range, fromDate, toDate }: { range: { from?: string; to?: str
       )}
       {rows === null && range && <Loading />}
       {rows !== null && rows.length === 0 && !err && <EmptyState text="所选范围内没有汇总" mark="route" />}
-      {rows !== null && rows.length > 0 && (
+      {rows !== null && rows.length > 0 && <>
+        <div className="grid gap-3 border-b border-ink/7 pb-5">
+          <h3 className="text-stat font-medium">期间扣费 · 入账口径</h3>
+          <p className="text-caption text-muted">与下表使用同一汇总范围，仅绘制已返回期间；未入账调用不计入，缺失期间不补零。</p>
+          <TrendChart points={points} accessibleLabel="所选期间的已入账扣费，各期间精确金额可从下方按期汇总表查看" />
+        </div>
         <DataTable label="按期汇总">
           <thead>
             <tr>
@@ -824,7 +839,7 @@ function Summary({ range, fromDate, toDate }: { range: { from?: string; to?: str
             ))}
           </tbody>
         </DataTable>
-      )}
+      </>}
     </Section>
   );
 }

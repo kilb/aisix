@@ -83,7 +83,7 @@ export function UpstreamModelPicker({
   /** The field's own refusal, from its save. */
   invalid?: boolean;
   describedBy?: string;
-  /** The 32px height of a control inside a table row. */
+  /** 表格内控件使用紧凑留白，同时保留 44px 的触达高度。 */
   compact?: boolean;
   /** Classes for the box around the field and its list. */
   className?: string;
@@ -152,7 +152,7 @@ export function UpstreamModelPicker({
     <div className={cn("upicker relative min-w-0", className)}>
       <input
         ref={input}
-        className={cn("w-full font-mono text-[13px]", compact && "h-8", phase === "loading" && "pr-16")}
+        className={cn("h-11 w-full font-mono text-caption", compact && "px-2", phase === "loading" && "pr-16")}
         role="combobox"
         aria-label={label ?? "上游模型名称"}
         aria-expanded={listed && open}
@@ -182,8 +182,7 @@ export function UpstreamModelPicker({
       {phase === "loading" && (
         <span
           className={cn(
-            "upicker-loading pointer-events-none absolute top-0 right-3 flex items-center text-xs text-muted-foreground",
-            compact ? "h-8" : "h-9",
+            "upicker-loading pointer-events-none absolute top-0 right-3 flex h-11 items-center font-mono text-meta text-ink-soft",
           )}
           role="status"
         >
@@ -192,7 +191,7 @@ export function UpstreamModelPicker({
       )}
       {listed && open && shown.length > 0 && (
         <ul
-          className="upicker-list absolute inset-x-0 z-20 mt-1 max-h-64 overflow-y-auto rounded-md border border-border bg-popover p-1 text-popover-foreground shadow-float"
+          className="upicker-list absolute inset-x-0 z-20 mt-1 max-h-64 overflow-y-auto rounded-2xl border border-line bg-surface p-1 text-ink"
           role="listbox"
           id={listId}
           aria-label="上游模型名称"
@@ -201,7 +200,7 @@ export function UpstreamModelPicker({
             <li
               key={name}
               role="option"
-              className="cursor-pointer truncate rounded-sm px-2 py-1.5 font-mono text-[13px] hover:bg-accent aria-selected:bg-accent aria-selected:font-medium"
+              className="block min-h-11 cursor-pointer truncate rounded-xl px-3 py-3 font-mono text-caption hover:bg-well aria-selected:bg-well aria-selected:font-medium"
               aria-selected={name === value}
               // `mousedown` rather than `click`: the field's blur would close
               // the list before a click landed.
@@ -215,14 +214,14 @@ export function UpstreamModelPicker({
             </li>
           ))}
           {matches.length > shown.length && (
-            <li className="upicker-more px-2 py-1.5 text-xs text-muted-foreground" aria-hidden="true">
+            <li className="upicker-more px-3 py-2 font-mono text-meta text-ink-soft" aria-hidden="true">
               共 {matches.length} 个，只列出前 {MAX_OPTIONS} 个；继续输入可缩小范围
             </li>
           )}
         </ul>
       )}
       {phase === "fallback" && (
-        <p className="hint upicker-fallback mt-1 text-xs leading-snug whitespace-normal">
+        <p className="hint upicker-fallback mt-2 text-caption leading-snug whitespace-normal text-ink-soft">
           {FALLBACK}
           {reason !== null && <span className="upicker-reason mt-0.5 block [overflow-wrap:anywhere]">{reason}</span>}
         </p>

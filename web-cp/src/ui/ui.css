@@ -1,8 +1,4 @@
-/* The shared components' class hooks, drawn as shadcn/ui draws its own
-   (Card, Badge, Alert, Table, Skeleton, Tooltip, Sonner): white cards on the
-   light page, 1px borders, small radii, colour only for state. Imported
-   into the `legacy` layer (index.css), so a Tailwind utility on an element
-   overrides anything here. Values come from theme/tokens.css. */
+/* Bento 控件样式；交互状态保持 CONTRACT.md，值来自共享 tokens.css。 */
 
 /* ── Icons ──────────────────────────────────────────────────── */
 .icon {
@@ -65,10 +61,9 @@
   width: max-content;
   max-width: min(320px, 90vw);
   padding: 6px 10px;
-  border-radius: 6px;
+  border-radius: var(--r-chip);
   background: var(--tooltip-bg);
   color: var(--tooltip-text);
-  box-shadow: var(--shadow-float);
   font-size: 12px;
   font-weight: 400;
   line-height: 1.45;
@@ -92,11 +87,14 @@
 
 /* A text action that reads as a link: a tenant's name in a list. */
 .link-button {
-  display: inline-block;
+  display: inline-flex;
+  align-items: center;
+  min-height: 44px;
+  min-width: 44px;
   max-width: 100%;
   padding: 0;
   border: 0;
-  border-radius: 4px;
+  border-radius: var(--r-chip);
   background: none;
   color: var(--foreground);
   font-weight: 500;
@@ -185,7 +183,7 @@ label.f:has(> input[type="radio"]:first-child) > span {
 }
 select.select-sm {
   width: auto;
-  height: 32px;
+  height: 44px;
   padding-left: 10px;
   padding-right: 32px;
   font-size: 13px;
@@ -226,31 +224,9 @@ select.select-sm {
 .lamp[data-lamp="rejected"] {
   --c: var(--lamp-rejected);
 }
+.lamp[data-lamp="rejected"]::before { border-radius: 2px; }
 .lamp[data-lamp="disabled"] {
   --c: var(--lamp-disabled);
-}
-.lamp[data-lamp="propagating"]::after {
-  content: "";
-  position: absolute;
-  left: 0;
-  top: 50%;
-  width: 8px;
-  height: 8px;
-  margin-top: -4px;
-  border-radius: 50%;
-  background: var(--c);
-  opacity: 0;
-  animation: ui-pulse 1.4s ease-out 1 both;
-}
-@keyframes ui-pulse {
-  from {
-    transform: scale(1);
-    opacity: 0.5;
-  }
-  to {
-    transform: scale(3);
-    opacity: 0;
-  }
 }
 :is(h1, h2, h3) :is(.lamp, .rollout) {
   font-size: 14px;
@@ -357,11 +333,7 @@ select.select-sm {
   position: relative;
   overflow-x: auto;
   margin: 16px 0 0;
-  background:
-    linear-gradient(to right, var(--card) 30%, transparent) left / 32px 100% no-repeat local,
-    linear-gradient(to left, var(--card) 30%, transparent) right / 32px 100% no-repeat local,
-    radial-gradient(farthest-side at 0 50%, var(--scroll-shadow), transparent) left / 10px 100% no-repeat scroll,
-    radial-gradient(farthest-side at 100% 50%, var(--scroll-shadow), transparent) right / 10px 100% no-repeat scroll;
+  background: var(--card);
 }
 .dt-wrap.dt-scroll {
   max-height: min(70vh, 720px);
@@ -377,20 +349,21 @@ select.select-sm {
   position: sticky;
   top: 0;
   z-index: 1;
-  height: 40px;
+  height: var(--h-head);
   padding: 0 12px;
   border-bottom: 1px solid var(--border);
   background: var(--muted);
   color: var(--muted-foreground);
   font-size: 12px;
-  font-weight: 500;
-  letter-spacing: 0.01em;
+  font-family: var(--font-mono);
+  font-weight: 400;
+  letter-spacing: 0.06em;
   text-align: left;
   white-space: nowrap;
   vertical-align: middle;
 }
 .dt td {
-  height: 48px;
+  height: var(--h-row);
   padding: 6px 12px;
   border-bottom: 1px solid var(--border);
   vertical-align: middle;
@@ -432,7 +405,7 @@ select.select-sm {
   font-variant-numeric: tabular-nums;
 }
 .dt.dt-compact td {
-  height: 40px;
+  height: var(--h-row-compact);
   padding-top: 4px;
   padding-bottom: 4px;
 }
@@ -473,13 +446,13 @@ select.select-sm {
 /* A table straight inside a card runs edge to edge, its outer cells padded
    to the card's own 24px, and closes the card at the bottom. */
 .panel > .dt-wrap {
-  --dt-edge: 24px;
-  margin-left: -24px;
-  margin-right: -24px;
+  --dt-edge: var(--pad, 28px);
+  margin-left: calc(-1 * var(--pad, 28px));
+  margin-right: calc(-1 * var(--pad, 28px));
   border-top: 1px solid var(--border);
 }
 .panel > .dt-wrap:last-child {
-  margin-bottom: -24px;
+  margin-bottom: calc(-1 * var(--pad, 28px));
   border-radius: 0 0 var(--r-card) var(--r-card);
 }
 .tn-section .dt-wrap,
@@ -551,10 +524,6 @@ select.select-sm {
   align-items: center;
   gap: 6px;
 }
-.two-step.is-swapping {
-  overflow: clip;
-  overflow-clip-margin: 4px;
-}
 .two-step-warn {
   width: max-content;
   max-width: 44ch;
@@ -569,14 +538,6 @@ select.select-sm {
 }
 .right .two-step-warn {
   text-align: right;
-}
-.is-in {
-  animation: ui-fade 120ms ease-out both;
-}
-@keyframes ui-fade {
-  from {
-    opacity: 0;
-  }
 }
 
 /* ── Toasts: shadcn's Sonner, bottom right ───────────────────── */
@@ -595,18 +556,17 @@ select.select-sm {
   display: inline-flex;
   align-items: center;
   gap: 10px;
-  min-width: 240px;
-  max-width: 420px;
+  min-width: min(240px, 100%);
+  max-width: min(420px, 100%);
   padding: 12px 16px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--popover);
   color: var(--popover-foreground);
-  box-shadow: var(--shadow-float);
   font-size: 14px;
   font-weight: 500;
   line-height: 1.45;
-  animation: ui-toast-in 180ms ease-out both;
+  animation: none;
 }
 .toast::before {
   content: "";
@@ -620,29 +580,21 @@ select.select-sm {
   opacity: 0;
   transition: opacity 200ms ease-in;
 }
-@keyframes ui-toast-in {
-  from {
-    opacity: 0;
-    transform: translateY(8px);
-  }
-}
 
 /* ── Cards (panels) and the side panel ───────────────────────── */
-/* A card is pure white on the tinted page, generously rounded, and lifted by
-   a shadow tinted with the accent's hue instead of black: that layering is
-   what makes the surface read as material rather than a drawn rectangle. */
+/* 暖白卡片仅以细边线分层，不带投影。 */
 .panel {
   min-width: 0;
-  margin: 0 0 16px;
-  padding: 24px;
+  --pad: 28px;
+  margin: 0 0 12px;
+  padding: var(--pad);
   border: 1px solid var(--border);
   border-radius: var(--r-card);
   background: var(--card);
   color: var(--card-foreground);
-  box-shadow: var(--shadow-card);
 }
 .side-panel {
-  animation: ui-slide 180ms ease-out both;
+  animation: none;
 }
 .side-panel:focus {
   outline: none;
@@ -667,23 +619,17 @@ select.select-sm {
 .side-head > .side-close {
   margin-left: auto;
 }
-@keyframes ui-slide {
-  from {
-    opacity: 0;
-    transform: translateX(16px);
-  }
-}
-/* The list and its detail: side by side from 1280px, stacked under it below. */
+/* 旧详情容器也采用同一1100断点与12列；平板/手机依次展开。 */
 .with-side {
   display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  gap: 0 16px;
+  grid-template-columns: repeat(12, minmax(0, 1fr));
+  gap: 12px;
   align-items: start;
 }
-@media (min-width: 1280px) {
-  .with-side.is-open {
-    grid-template-columns: minmax(0, 1fr) minmax(400px, 36%);
-  }
+.with-side > * { min-width: 0; grid-column: span 12 / span 12; }
+@media (min-width: 1100px) {
+  .with-side.is-open > :first-child { grid-column: span 7 / span 7; }
+  .with-side.is-open > .side-panel { grid-column: span 5 / span 5; }
   .with-side.is-open > .side-panel {
     position: sticky;
     top: 72px;
@@ -691,4 +637,88 @@ select.select-sm {
     overflow-y: auto;
     overscroll-behavior: contain;
   }
+}
+
+/* Bento 原语：编号不进入可访问名称，数字只负责呈现，不截断精确金额。 */
+main { counter-reset: bento-card; }
+.bento-grid { min-width: 0; }
+.bento-grid > * { min-width: 0; }
+.panel { counter-increment: bento-card; }
+.bento-card-index::before { content: counter(bento-card, decimal-leading-zero); }
+.bento-page-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 24px 32px;
+  margin-bottom: 40px;
+}
+.bento-page-header > :first-child { min-width: 0; flex: 1 1 620px; }
+.bento-page-header h1 { overflow-wrap: anywhere; }
+.bento-page-actions { max-width: 100%; }
+.bento-lead { max-width: 64ch; }
+.bento-lead strong { font-weight: 500; color: var(--foreground); }
+.bento-card { display: flex; flex-direction: column; gap: 24px; margin: 0; }
+.bento-stat, .bento-grid > .panel, .with-side > .panel { margin: 0; }
+.bento-card > * + * { margin-top: 0; }
+.bento-card > .bento-card-footer { margin-top: auto; }
+.bento-card-header { flex: none; }
+.bento-card-footer { min-width: 0; }
+.metric { max-width: 100%; font-weight: 400; overflow-wrap: anywhere; }
+.bento-metric-skeleton { width: 62%; height: 60px; }
+.bento-chart-skeleton { width: 100%; height: 192px; }
+.bento-card-message { min-width: 0; }
+/* inverse 的固定深底与橙文字不随主题交换，避免橙字落到浅底。 */
+.panel[data-tone="inverse"] {
+  --foreground: var(--bento-surface);
+  --card: var(--bento-ink);
+  --card-foreground: var(--bento-surface);
+  --surface: var(--bento-ink);
+  --surface-raised: var(--bento-ink);
+  --bg: var(--bento-ink);
+  --canvas: var(--bento-ink);
+  --paper: var(--bento-ink);
+  --ink: var(--bento-surface);
+  --popover: var(--bento-ink);
+  --popover-foreground: var(--bento-surface);
+  --secondary: var(--bento-ink);
+  --secondary-foreground: var(--bento-surface);
+  --muted: var(--bento-ink);
+  --accent: var(--bento-ink);
+  --accent-foreground: var(--bento-surface);
+  --well: var(--bento-ink);
+  --stone: var(--bento-graphite);
+  --graphite: var(--bento-inverse-muted);
+  --row-hover: var(--bento-ink);
+  --chip: var(--bento-ink);
+  --info: var(--bento-surface);
+  --success: var(--bento-surface);
+  --warning: var(--bento-surface);
+  --danger: var(--bento-surface);
+  --info-soft: var(--bento-ink);
+  --success-soft: var(--bento-ink);
+  --warning-soft: var(--bento-ink);
+  --danger-soft: var(--bento-ink);
+  --destructive: var(--bento-surface);
+  --destructive-foreground: var(--bento-ink);
+  --link: var(--bento-surface);
+  --error: var(--bento-surface);
+  --text: var(--bento-surface);
+  --text-muted: var(--bento-inverse-muted);
+  --text-2: var(--bento-inverse-muted);
+  --muted-foreground: var(--bento-inverse-muted);
+  --ink-soft: var(--bento-inverse-muted);
+  --primary: var(--bento-surface);
+  --primary-foreground: var(--bento-ink);
+  --input: var(--bento-inverse-muted);
+  --ring: var(--bento-surface);
+  --line: var(--bento-graphite);
+  --border: color-mix(in srgb, var(--bento-surface) 12%, transparent);
+  background: var(--bento-ink);
+  color: var(--bento-surface);
+}
+@media (max-width: 719px) {
+  .bento-page-header { gap: 20px; }
+  .bento-page-header h1 { font-size: var(--fs-44); }
+  .toasts { right: 16px; left: 16px; align-items: stretch; }
 }

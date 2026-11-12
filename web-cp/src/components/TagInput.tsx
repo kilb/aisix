@@ -34,7 +34,7 @@ export function TagInput({
 
   return (
     <div
-      className="f"
+      className="f text-body"
       role="group"
       aria-label={label}
       aria-invalid={problem ? true : undefined}
@@ -42,17 +42,18 @@ export function TagInput({
     >
       <span>{label}</span>
       {value.length === 0 ? (
-        <p className="hint">未设置</p>
+        <p className="hint text-caption text-ink-soft">未设置</p>
       ) : (
         <ul className="tags">
           {value.map((name) => (
-            <li key={name}>
+            <li key={name} className="h-auto min-h-11 max-w-full gap-1 rounded-full border border-line bg-well py-0 pr-0 pl-3 font-mono text-meta text-ink-soft [overflow-wrap:anywhere]">
               {name}
               {!readOnly && (
                 <button
                   type="button"
                   aria-label={`移除 ${name}`}
                   title={`移除 ${name}`}
+                  className="size-11 shrink-0 rounded-full text-ink-soft hover:bg-stone hover:text-ink"
                   onClick={() => onChange(value.filter((v) => v !== name))}
                 />
               )}
@@ -61,8 +62,9 @@ export function TagInput({
         </ul>
       )}
       {!readOnly && (
-        <div className="tag-add">
+        <div className="tag-add max-w-full">
           <input
+            className="min-w-0 flex-1"
             aria-label={`添加${label}`}
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
@@ -80,7 +82,7 @@ export function TagInput({
           </Button>
         </div>
       )}
-      {hint && <p className="hint">{hint}</p>}
+      {hint && <p className="hint text-caption text-ink-soft">{hint}</p>}
       {problem && (
         <p id={problemId} className="field-problem">
           {problem}

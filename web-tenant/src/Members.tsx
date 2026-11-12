@@ -23,7 +23,12 @@ import { Lamp } from "./ui/Lamp";
 import { TwoStep } from "./ui/TwoStep";
 import { when } from "./Keys";
 import { ROLE_LABEL } from "./Org";
-import { Card, CardHeader, PageHeader, Split } from "./components/page";
+import { BentoGrid, Card, CardFooter, CardHeader, CardMessage, ChartSkeleton, Metric, MetricSkeleton, PageHeader, span } from "./components/page";
+import { BudgetProgress, RankBars } from "./components/charts";
+import { exactRatio, formatCount, normalizeExactValues } from "./lib/chartFormat";
+import { rankCurrentMemberCosts } from "./lib/memberBento";
+
+// 桌面：5 + 7 / 12 / 7 + 5；平板与手机按阅读顺序各占整行。
 
 function failure(e: unknown): string {
   return e instanceof ApiError ? messageFor(e) : String(e);
@@ -43,22 +48,22 @@ function UsageCell({ usage }: { usage: MemberUsage }) {
     .reduce((total, [, quantity]) => total + BigInt(quantity), 0n);
   return (
     <>
-      <span className="tabular">{usage.requests.toLocaleString()} 次调用</span>
+      <span className="tabular">{formatCount(usage.requests)} 次调用</span>
       <span className="cell-note tabular">
-        {incomplete && quantities.length === 0 ? "计费用量未知" : `${incomplete ? "已知" : ""}计费用量 ${tokens.toString()} token`}
+        {incomplete && quantities.length === 0 ? "计费用量未知" : `${incomplete ? "已知" : ""}计费用量 ${formatCount(tokens)} token`}
       </span>
       <span className="cell-note tabular">已计费 {fmtMicroCny(usage.charged_micro_cny)}</span>
       {quantities.map(([dimension, quantity]) => (
         <span className="cell-note tabular" key={dimension}>
-          {QUANTITY_LABEL[dimension] ?? dimension} {quantity.toLocaleString()} {dimension === "web_search" ? "次" : dimension in QUANTITY_LABEL ? "token" : ""}
+          {QUANTITY_LABEL[dimension] ?? dimension} {formatCount(quantity)} {dimension === "web_search" ? "次" : dimension in QUANTITY_LABEL ? "token" : ""}
         </span>
       ))}
-      {incomplete && <span className="cell-note hint">{usage.unknown_quantity_requests} 次用量明细未记录</span>}
-      {usage.unpriced_requests > 0 && <span className="cell-note hint">{usage.unpriced_requests} 次未计价，费用尚未包含</span>}
+      {incomplete && <span className="cell-note hint">{formatCount(usage.unknown_quantity_requests)} 次用量明细未记录</span>}
+      {usage.unpriced_requests > 0 && <span className="cell-note hint">{formatCount(usage.unpriced_requests)} 次未计价，费用尚未包含</span>}
       {usage.pending_requests > usage.unpriced_requests && (
-        <span className="cell-note hint">另有 {usage.pending_requests - usage.unpriced_requests} 次待计价</span>
+        <span className="cell-note hint">另有 {formatCount(usage.pending_requests - usage.unpriced_requests)} 次待计价</span>
       )}
-      {usage.estimated_requests > 0 && <span className="cell-note hint">{usage.estimated_requests} 次含估算用量</span>}
+      {usage.estimated_requests > 0 && <span className="cell-note hint">{formatCount(usage.estimated_requests)} 次含估算用量</span>}
     </>
   );
 }
@@ -74,6 +79,11 @@ function BudgetCell({ budgets }: { budgets: Budget[] }) {
           <span className="cell-note tabular">限额 {fmtMicroCny(budget.limit_micro_cny)}</span>
           <span className="cell-note tabular">本期已用 {fmtMicroCny(budget.spent_micro_cny)}</span>
           <span className="cell-note tabular">剩余 {fmtMicroCny(budget.remaining_micro_cny)}{budget.exhausted && "（已用尽）"}</span>
+          <BudgetProgress
+            className="mt-2"
+            value={exactRatio(budget.spent_micro_cny, budget.limit_micro_cny)}
+            accessibleLabel={`该成员额度本期已用 ${fmtMicroCny(budget.spent_micro_cny)}，限额 ${fmtMicroCny(budget.limit_micro_cny)}`}
+          />
           <span className="cell-note hint">
             {budget.kind === "cumulative" ? "累计自 " : "本期自 "}{fmtUtc(budget.counted_from ?? budget.period_start ?? budget.created_at)}
           </span>
@@ -147,6 +157,15 @@ export function Members({
     }
     return grouped;
   }, [budgets]);
+  const rankedUsage = useMemo(() => {
+    if (people === null || usage === null) return null;
+    return rankCurrentMemberCosts(people, usage.items);
+  }, [people, usage]);
+  const rankedBars = useMemo(() => {
+    const rows = rankedUsage?.slice(0, 5) ?? [];
+    const values = normalizeExactValues(rows.map((row) => row.amount));
+    return rows.map((row, index) => ({ label: row.label, value: values[index] ?? 0, displayValue: fmtMicroCny(row.amount) }));
+  }, [rankedUsage]);
 
   const load = useCallback(async () => {
     const id = ++loadId.current;
@@ -216,231 +235,260 @@ export function Members({
 
   return (
     <>
-      <PageHeader title="成员" />
-      <Split
-        asideWidth="400px"
-        main={
-          <div className="grid gap-6">
-            <Card>
-              <CardHeader title="组织成员" description={active ? "本月用量按 UTC 月初至当前时间统计；成员额度按各自周期计算。" : undefined} />
-              {!active && <div className="note crit">组织已被停用；这里只能移除成员。</div>}
-              {active && usageErr && <div className="note crit" role="alert">成员用量读取失败：{usageErr}</div>}
-              {active && budgetsErr && <div className="note crit" role="alert">成员额度读取失败：{budgetsErr}</div>}
-              {listErr && (
-                <div className="note crit" role="alert">
-                  {listErr}
-                </div>
-              )}
-              {actionErr && (
-                <div className="note crit" role="alert">
-                  {actionErr}
-                </div>
-              )}
-              {people === null ? (
-                !listErr && <Loading />
-              ) : (
-                <DataTable>
-                  <thead>
-                    <tr>
-                      <th>显示名</th>
-                      <th>邮箱</th>
-                      <th>角色</th>
-                      <th>状态</th>
-                      <th>本月用量</th>
-                      <th>成员额度</th>
-                      <th>
-                        <span className="vh">操作</span>
-                      </th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {people.map((m) => {
-                      const self = m.id === member.id;
-                      const draft = drafts[m.id];
-                      const memberUsageRow = usageByMember.get(m.id);
-                      return (
-                        <tr key={m.id}>
-                          <td>
-                            <span className="trunc" title={m.display_name ?? undefined}>
-                              {m.display_name ?? "—"}
-                              {self && <span className="self">（我）</span>}
-                            </span>
-                          </td>
-                          <td>
-                            <span className="trunc" style={{ "--trunc": "240px" } as CSSProperties} title={m.email}>
-                              {m.email}
-                            </span>
-                          </td>
-                          <td>
-                            {active && manages(m) ? (
-                              <span className="acts">
-                                <select
-                                  aria-label={`${m.email} 的角色`}
-                                  value={draft ?? m.role}
-                                  onChange={(e) => setDrafts({ ...drafts, [m.id]: e.target.value as MemberRole })}
-                                >
-                                  {roles.map((r) => (
-                                    <option key={r} value={r}>
-                                      {ROLE_LABEL[r]}
-                                    </option>
-                                  ))}
-                                </select>
-                                {/* A role change takes a second step: one that takes access away is destructive. */}
-                                {draft && draft !== m.role && (
-                                  <span className="role-confirm is-in">
-                                    {draft === "billing" && (
-                                      <span className="hint warn-inline">账单角色不持有密钥，该成员的密钥将停止工作</span>
-                                    )}
-                                    <Button
-                                      kind="danger"
-                                      size="sm"
-                                      disabled={busy === m.id}
-                                      busy={busy === m.id && acting === "role"}
-                                      busyLabel="确认更改角色"
-                                      onClick={() =>
-                                        // The step stays, busy, until the change is answered.
-                                        void act(
-                                          m.id,
-                                          "role",
-                                          () => memberApi.setRole(m.id, draft),
-                                          self ? onSelfChanged : undefined,
-                                        ).finally(() => dropDraft(m.id))
-                                      }
-                                    >
-                                      确认更改角色
-                                    </Button>
-                                    <Button size="sm" disabled={busy === m.id} onClick={() => dropDraft(m.id)}>
-                                      取消
-                                    </Button>
-                                  </span>
-                                )}
-                              </span>
-                            ) : (
-                              (ROLE_LABEL[m.role] ?? m.role)
-                            )}
-                          </td>
-                          <td>
-                            <Lamp state={m.disabled ? "disabled" : "applied"}>{m.disabled ? "已被平台停用" : "正常"}</Lamp>
-                          </td>
-                          <td>
-                            {!active ? <span className="hint">组织未启用，无法读取用量</span> : usageErr ? <span className="hint">用量读取失败</span>
-                              : usage === null ? <span className="hint">用量载入中…</span>
-                                : memberUsageRow ? <UsageCell usage={memberUsageRow} /> : <span className="hint">暂无用量数据</span>}
-                          </td>
-                          <td>
-                            {!active ? <span className="hint">组织未启用，无法读取额度</span> : budgetsErr ? <span className="hint">额度读取失败</span>
-                              : budgets === null ? <span className="hint">额度载入中…</span>
-                                : <BudgetCell budgets={budgetsByMember.get(m.id) ?? []} />}
-                          </td>
-                          <td className="right">
-                            {manages(m) && (
-                              <TwoStep
-                                label="移除"
-                                size="sm"
-                                warning="该成员的所有密钥会被吊销"
-                                disabled={busy === m.id}
-                                busy={busy === m.id && acting === "remove"}
-                                onConfirm={() => void act(m.id, "remove", () => memberApi.remove(m.id), self ? onLeft : undefined)}
-                              />
-                            )}
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </DataTable>
-              )}
-            </Card>
-
-            {active && (
-              <Card>
-                <CardHeader title="待接受的邀请" />
-                {invitesErr && (
-                  <div className="note crit" role="alert">
-                    {invitesErr}
-                  </div>
-                )}
-                {invites === null ? (
-                  !invitesErr && <Loading />
-                ) : invites.length === 0 ? (
-                  <EmptyState mark="mail" text="没有待接受的邀请。" />
-                ) : (
-                  <DataTable>
-                    <thead>
-                      <tr>
-                        <th>邮箱</th>
-                        <th>角色</th>
-                        <th>邀请人</th>
-                        <th>有效期至</th>
-                        <th>
-                          <span className="vh">操作</span>
-                        </th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {invites.map((inv) => {
-                        const by = inv.invited_by === null ? "平台" : (inv.invited_by.display_name ?? "成员");
-                        return (
-                          <tr key={inv.id}>
-                            <td>
-                              <span className="trunc" style={{ "--trunc": "240px" } as CSSProperties} title={inv.email}>
-                                {inv.email}
-                              </span>
-                            </td>
-                            <td>{ROLE_LABEL[inv.role] ?? inv.role}</td>
-                            <td>
-                              <span className="trunc" title={by}>
-                                {by}
-                              </span>
-                            </td>
-                            <td className="tabular">{when(inv.expires_at)}</td>
-                            <td className="right">
-                              {(isOwner || inv.role !== "owner") && (
-                                <Button
-                                  size="sm"
-                                  disabled={busy === inv.id}
-                                  busy={busy === inv.id && acting === "revoke"}
-                                  busyLabel="撤销"
-                                  onClick={() => void act(inv.id, "revoke", () => memberApi.revokeInvite(inv.id))}
-                                >
-                                  撤销
-                                </Button>
-                              )}
-                            </td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </DataTable>
-                )}
-              </Card>
-            )}
-          </div>
-        }
-        aside={
-          active || issued ? (
-            <div className="grid gap-4">
-              {active && (
-                <InviteForm
-                  roles={roles}
-                  onInactive={onSelfChanged}
-                  onIssued={(email, invite) => {
-                    setIssued({ email, link: inviteLink(invite), expiresAt: invite.expires_at });
-                    void load();
-                  }}
-                />
-              )}
-              {issued && (
-                <ShownOnce title="邀请链接只显示这一次" value={issued.link} onDone={() => setIssued(null)}>
-                  <span className="hint">
-                    发给 {issued.email}，{when(issued.expiresAt)} 前有效。对方打开链接、设置口令即可加入。
-                  </span>
-                </ShownOnce>
-              )}
-            </div>
-          ) : undefined
-        }
+      <PageHeader
+        title="成员"
+        eyebrow="组织成员与权限"
+        dataLead={people === null ? "管理组织成员、访问角色与加入方式。" : <>
+          组织现有 <span className="font-medium text-ink">{formatCount(people.length)}</span> 位成员。
+          {active ? "本月费用按当前成员归属展示，成员额度各自独立生效。" : "组织已停用，目前仅支持移除成员。"}
+        </>}
       />
+      <BentoGrid>
+        <Card className={active ? span.d5Wide : span.d12}>
+          <CardHeader number={1} title="当前成员" />
+          {people === null ? (listErr ? <CardMessage onRetry={() => void load()}>成员读取失败，请重试。</CardMessage> : <MetricSkeleton />) : <>
+            <Metric size="hero">{formatCount(people.length)}</Metric>
+            <CardFooter>
+              <dl className="grid grid-cols-2 gap-x-7 gap-y-5">
+                {(["owner", "admin", "member", "billing"] as const).map((role) => (
+                  <div key={role} className="border-t border-ink/7 pt-3">
+                    <dt className="font-mono text-meta text-ink-soft">{ROLE_LABEL[role]}</dt>
+                    <dd className="mt-2 text-stat tabular-nums">{formatCount(people.filter((person) => person.role === role).length)} 人</dd>
+                  </div>
+                ))}
+              </dl>
+              <p className="mt-5 text-caption text-ink-soft">完整当前成员列表，包含平台已停用账号。只有组织所有者可以管理所有者。</p>
+            </CardFooter>
+          </>}
+        </Card>
+        {active && <Card className={span.d7}>
+          <CardHeader number={2} title="本月成员费用排行" description="当前成员的已计费费用前 5 位，按精确金额排序。" />
+          <CardFooter>
+            {usageErr || listErr ? <CardMessage onRetry={() => void load()}>成员费用读取失败，请重试。</CardMessage>
+              : usage === null || people === null ? <ChartSkeleton />
+                : rankedUsage === null ? <CardMessage>当前成员费用数据不完整，无法显示排行。请查看下方明细。</CardMessage>
+                  : <RankBars
+                    items={rankedBars}
+                    accessibleLabel={rankedUsage[0] ? `当前成员中，本月最高已计费费用为 ${fmtMicroCny(rankedUsage[0].amount)}，展示费用前 ${formatCount(rankedBars.length)} 位` : "当前没有组织成员"}
+                    emptyLabel="当前没有成员费用"
+                  />}
+            {usage && <p className="mt-4 break-words font-mono text-micro text-ink-soft">{fmtUtc(usage.from)} 至 {fmtUtc(usage.to)}，不含已离开成员及无成员归属的调用；不含未计价费用，可能含估算用量。</p>}
+          </CardFooter>
+        </Card>}
+        <Card className={span.d12}>
+          <CardHeader number={active ? 3 : 2} title="组织成员" description={active ? "本月用量按 UTC 月初至当前时间统计；成员额度按各自周期计算。" : undefined} />
+          {!active && <div className="note crit">组织已被停用；这里只能移除成员。</div>}
+          {active && usageErr && <div className="note crit" role="alert">成员用量读取失败：{usageErr}</div>}
+          {active && budgetsErr && <div className="note crit" role="alert">成员额度读取失败：{budgetsErr}</div>}
+          {listErr && (
+            <div className="note crit" role="alert">
+              {listErr}
+            </div>
+          )}
+          {actionErr && (
+            <div className="note crit" role="alert">
+              {actionErr}
+            </div>
+          )}
+          {people === null ? (
+            !listErr && <Loading />
+          ) : (
+            <DataTable>
+              <thead>
+                <tr>
+                  <th>显示名</th>
+                  <th>邮箱</th>
+                  <th>角色</th>
+                  <th>状态</th>
+                  <th>本月用量</th>
+                  <th>成员额度</th>
+                  <th>
+                    <span className="vh">操作</span>
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {people.map((m) => {
+                  const self = m.id === member.id;
+                  const draft = drafts[m.id];
+                  const memberUsageRow = usageByMember.get(m.id);
+                  return (
+                    <tr key={m.id}>
+                      <td>
+                        <span className="trunc" title={m.display_name ?? undefined}>
+                          {m.display_name ?? "—"}
+                          {self && <span className="self">（我）</span>}
+                        </span>
+                      </td>
+                      <td>
+                        <span className="trunc" style={{ "--trunc": "240px" } as CSSProperties} title={m.email}>
+                          {m.email}
+                        </span>
+                      </td>
+                      <td>
+                        {active && manages(m) ? (
+                          <span className="acts">
+                            <select
+                              aria-label={`${m.email} 的角色`}
+                              value={draft ?? m.role}
+                              onChange={(e) => setDrafts({ ...drafts, [m.id]: e.target.value as MemberRole })}
+                            >
+                              {roles.map((r) => (
+                                <option key={r} value={r}>
+                                  {ROLE_LABEL[r]}
+                                </option>
+                              ))}
+                            </select>
+                            {/* A role change takes a second step: one that takes access away is destructive. */}
+                            {draft && draft !== m.role && (
+                              <span className="role-confirm is-in">
+                                {draft === "billing" && (
+                                  <span className="hint warn-inline">账单角色不持有密钥，该成员的密钥将停止工作</span>
+                                )}
+                                <Button
+                                  kind="danger"
+                                  size="sm"
+                                  disabled={busy === m.id}
+                                  busy={busy === m.id && acting === "role"}
+                                  busyLabel="确认更改角色"
+                                  onClick={() =>
+                                    // The step stays, busy, until the change is answered.
+                                    void act(
+                                      m.id,
+                                      "role",
+                                      () => memberApi.setRole(m.id, draft),
+                                      self ? onSelfChanged : undefined,
+                                    ).finally(() => dropDraft(m.id))
+                                  }
+                                >
+                                  确认更改角色
+                                </Button>
+                                <Button size="sm" disabled={busy === m.id} onClick={() => dropDraft(m.id)}>
+                                  取消
+                                </Button>
+                              </span>
+                            )}
+                          </span>
+                        ) : (
+                          (ROLE_LABEL[m.role] ?? m.role)
+                        )}
+                      </td>
+                      <td>
+                        <Lamp state={m.disabled ? "disabled" : "applied"}>{m.disabled ? "已被平台停用" : "正常"}</Lamp>
+                      </td>
+                      <td>
+                        {!active ? <span className="hint">组织未启用，无法读取用量</span> : usageErr ? <span className="hint">用量读取失败</span>
+                          : usage === null ? <span className="hint">用量载入中…</span>
+                            : memberUsageRow ? <UsageCell usage={memberUsageRow} /> : <span className="hint">暂无用量数据</span>}
+                      </td>
+                      <td>
+                        {!active ? <span className="hint">组织未启用，无法读取额度</span> : budgetsErr ? <span className="hint">额度读取失败</span>
+                          : budgets === null ? <span className="hint">额度载入中…</span>
+                            : <BudgetCell budgets={budgetsByMember.get(m.id) ?? []} />}
+                      </td>
+                      <td className="right">
+                        {manages(m) && (
+                          <TwoStep
+                            label="移除"
+                            size="sm"
+                            warning="该成员的所有密钥会被吊销"
+                            disabled={busy === m.id}
+                            busy={busy === m.id && acting === "remove"}
+                            onConfirm={() => void act(m.id, "remove", () => memberApi.remove(m.id), self ? onLeft : undefined)}
+                          />
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </DataTable>
+          )}
+        </Card>
+
+        {active && (
+          <Card className={span.d7}>
+            <CardHeader number={4} title="待接受的邀请" description="邀请在被接受后才会成为组织成员。" />
+            {invitesErr && (
+              <div className="note crit" role="alert">
+                {invitesErr}
+              </div>
+            )}
+            {invites === null ? (
+              !invitesErr && <Loading />
+            ) : invites.length === 0 ? (
+              <EmptyState mark="mail" text="没有待接受的邀请。" />
+            ) : (
+              <DataTable>
+                <thead>
+                  <tr>
+                    <th>邮箱</th>
+                    <th>角色</th>
+                    <th>邀请人</th>
+                    <th>有效期至</th>
+                    <th>
+                      <span className="vh">操作</span>
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {invites.map((inv) => {
+                    const by = inv.invited_by === null ? "平台" : (inv.invited_by.display_name ?? "成员");
+                    return (
+                      <tr key={inv.id}>
+                        <td>
+                          <span className="trunc" style={{ "--trunc": "240px" } as CSSProperties} title={inv.email}>
+                            {inv.email}
+                          </span>
+                        </td>
+                        <td>{ROLE_LABEL[inv.role] ?? inv.role}</td>
+                        <td>
+                          <span className="trunc" title={by}>
+                            {by}
+                          </span>
+                        </td>
+                        <td className="tabular">{when(inv.expires_at)}</td>
+                        <td className="right">
+                          {(isOwner || inv.role !== "owner") && (
+                            <Button
+                              size="sm"
+                              disabled={busy === inv.id}
+                              busy={busy === inv.id && acting === "revoke"}
+                              busyLabel="撤销"
+                              onClick={() => void act(inv.id, "revoke", () => memberApi.revokeInvite(inv.id))}
+                            >
+                              撤销
+                            </Button>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </DataTable>
+            )}
+          </Card>
+        )}
+        {active && (
+          <InviteForm
+            roles={roles}
+            onInactive={onSelfChanged}
+            onIssued={(email, invite) => {
+              setIssued({ email, link: inviteLink(invite), expiresAt: invite.expires_at });
+              void load();
+            }}
+          />
+        )}
+        {issued && (
+          <div className={span.d12}>
+            <ShownOnce title="邀请链接只显示这一次" value={issued.link} onDone={() => setIssued(null)}>
+              <span className="hint">
+                发给 {issued.email}，{when(issued.expiresAt)} 前有效。对方打开链接、设置口令即可加入。
+              </span>
+            </ShownOnce>
+          </div>
+        )}
+      </BentoGrid>
     </>
   );
 }
@@ -477,9 +525,9 @@ function InviteForm({
   }
 
   return (
-    <Card>
-      <CardHeader title="邀请成员" />
-      <form className="grid gap-4 sm:grid-cols-[minmax(0,1fr)_9rem]" onSubmit={submit}>
+    <Card className={span.d5Wide}>
+      <CardHeader number={5} title="邀请成员" description="生成邀请链接，由新成员自行设置登录口令。" />
+      <form className="grid min-w-0 gap-5" onSubmit={submit}>
         <Field label="邮箱">
           <input type="email" required value={email} onChange={(e) => setEmail(e.target.value)} />
         </Field>
@@ -497,11 +545,11 @@ function InviteForm({
             {err}
           </div>
         )}
-        <div className="col-span-full flex justify-end">
+        <CardFooter className="col-span-full flex justify-end border-t border-ink/7 pt-5">
           <Button kind="primary" type="submit" busy={busy}>
             邀请成员
           </Button>
-        </div>
+        </CardFooter>
       </form>
     </Card>
   );

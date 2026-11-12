@@ -383,9 +383,10 @@ export function ChannelModels({
   const canCreate = newName.trim() !== "" && !taken.has(newName.trim()) && upstreamNameProblem(newName) === null;
 
   return (
-    <section className="ch-section grid gap-6" aria-label="模型">
+    <section className="ch-section grid gap-3" aria-label="模型">
       <div className="panel mb-0">
         <CardHeader
+          number={5}
           title={
             <span className="flex flex-wrap items-center gap-2">
               模型
@@ -413,10 +414,10 @@ export function ChannelModels({
         <div className="flex flex-wrap items-center gap-x-6 gap-y-3">
           <label className="relative block w-full sm:w-80">
             <span className="sr-only">搜索模型</span>
-            <Search aria-hidden className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
+            <Search aria-hidden className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted" />
             <input className="pl-9" value={query} onChange={(e) => setQuery(e.target.value)} placeholder="按公共模型名称或上游名称筛选" />
           </label>
-          <label className="ch-tick gap-2 text-[13px]">
+          <label className="ch-tick gap-2 text-caption">
             <input type="checkbox" checked={showAll} onChange={(e) => setShowAll(e.target.checked)} />
             <span>显示全部公共模型（{unservedTotal}）</span>
           </label>
@@ -452,7 +453,7 @@ export function ChannelModels({
                 const draft = drafts[row.public_model_id] ?? draftOf(row);
                 const model = modelOf.get(row.public_model_id);
                 return (
-                  <tr key={row.public_model_id} data-model={row.public_model_id} className={draft.served ? undefined : "text-muted-foreground"}>
+                  <tr key={row.public_model_id} data-model={row.public_model_id} className={draft.served ? undefined : "text-muted"}>
                     <td>
                       <label className="ch-tick">
                         <input
@@ -472,7 +473,7 @@ export function ChannelModels({
                       </label>
                     </td>
                     <td>
-                      <span className="mono font-mono text-[13px] font-medium">{row.public_model_name}</span>
+                      <span className="mono font-mono text-caption font-medium">{row.public_model_name}</span>
                     </td>
                     <td className="min-w-56 whitespace-normal">
                       <UpstreamModelPicker
@@ -488,7 +489,7 @@ export function ChannelModels({
                     </td>
                     <td className="num">
                       <input
-                        className="ch-num h-8"
+                        className="ch-num h-11"
                         aria-label={`优先级 ${row.public_model_name}`}
                         value={draft.priority}
                         inputMode="numeric"
@@ -498,7 +499,7 @@ export function ChannelModels({
                     </td>
                     <td className="num">
                       <input
-                        className="ch-num h-8"
+                        className="ch-num h-11"
                         aria-label={`权重 ${row.public_model_name}`}
                         value={draft.weight}
                         inputMode="numeric"
@@ -507,13 +508,15 @@ export function ChannelModels({
                       />
                     </td>
                     <td>
-                      <input
-                        type="checkbox"
-                        aria-label={`启用 ${row.public_model_name}`}
-                        checked={draft.enabled}
-                        disabled={!canEdit || busy || !draft.served}
-                        onChange={(e) => set(row.public_model_id, { enabled: e.target.checked })}
-                      />
+                      <label className="ch-tick min-h-11 min-w-11 justify-center">
+                        <input
+                          type="checkbox"
+                          aria-label={`启用 ${row.public_model_name}`}
+                          checked={draft.enabled}
+                          disabled={!canEdit || busy || !draft.served}
+                          onChange={(e) => set(row.public_model_id, { enabled: e.target.checked })}
+                        />
+                      </label>
                     </td>
                     <td className="whitespace-normal">
                       <GroupBadges
@@ -583,10 +586,10 @@ export function ChannelModels({
         )}
         {(rows !== null || !canEdit) && (
           // The save closes the card: what it will write on the left, the write on the right.
-          <div className="ch-save -mx-6 -mb-6 mt-6 flex flex-wrap items-start justify-end gap-x-4 gap-y-2 rounded-b-[calc(var(--radius)+3px)] border-t border-border bg-muted/40 px-6 py-3">
+          <div className="ch-save -mx-7 -mb-7 mt-6 flex flex-wrap items-start justify-end gap-x-4 gap-y-2 rounded-b-card border-t border-line bg-well px-7 py-3 [&_.hint]:text-ink-soft">
             {canEdit ? (
               <>
-                {changed.length > 0 && <span className="hint mr-auto self-center text-[13px]">将保存 {changed.length} 个模型的改动。</span>}
+                {changed.length > 0 && <span className="hint mr-auto self-center text-caption">将保存 {changed.length} 个模型的改动。</span>}
                 <div className="right">
                   <TwoStep
                     label={busy ? `写入中…（${done}/${total}）` : "写入映射"}
@@ -612,7 +615,7 @@ export function ChannelModels({
                 </div>
               </>
             ) : (
-              <p className="hint mr-auto text-[13px]">只读角色只能查看，不能修改模型映射。</p>
+              <p className="hint mr-auto text-caption">只读角色只能查看，不能修改模型映射。</p>
             )}
           </div>
         )}
@@ -620,7 +623,7 @@ export function ChannelModels({
 
       {canEdit && rows !== null && (
         // The section's two tools, side by side: the account's own list, and one name typed in.
-        <div className="grid items-start gap-6 lg:grid-cols-2">
+        <div className="grid items-start gap-3 desktop:grid-cols-2">
           <FetchUpstream
             accountId={accountId}
             rows={rows}
@@ -631,11 +634,12 @@ export function ChannelModels({
             }}
           />
           <div className="panel ch-create mb-0">
+            <CardHeader number={7} title="新建公共模型" />
             <div className="flex items-start gap-3">
-              <span aria-hidden="true" className="grid size-9 shrink-0 place-items-center rounded-md border border-border bg-muted text-muted-foreground">
+              <span aria-hidden="true" className="grid size-11 shrink-0 place-items-center rounded-cell border border-line bg-well text-ink-soft">
                 <Plus className="size-4" />
               </span>
-              <p className="hint text-[13px]">上游有、公共模型还没有的名称可以在这里一并新建；价格仍然建在该公共模型上。</p>
+              <p className="hint text-caption">上游有、公共模型还没有的名称可以在这里一并新建；价格仍然建在该公共模型上。</p>
             </div>
             <div className="mt-4 flex flex-wrap items-start gap-2">
               <UpstreamModelPicker

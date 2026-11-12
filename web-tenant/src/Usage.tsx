@@ -15,11 +15,12 @@ import { discountedRate, feeMicroCny } from "./lib/formula";
 import { formMessageFor, messageFor } from "./lib/errors";
 import { fmtCnyPerMillion, fmtMicroCny, fmtUtc, perThousandOfPerMillion, periodLabel, todayUtc, utcRange } from "./lib/money";
 import { Button } from "./ui/Button";
-import { DataTable, Loading } from "./ui/DataTable";
-import { EmptyState } from "./ui/EmptyState";
+import { DataTable } from "./ui/DataTable";
 import { Field } from "./ui/Field";
 import { Lamp } from "./ui/Lamp";
-import { Card, CardHeader, PageHeader, Stat, StatGrid } from "./components/page";
+import { BentoGrid, Card, CardFooter, CardHeader, CardMessage, ChartSkeleton, PageHeader, span } from "./components/page";
+import { UsageCostCard, UsageCostTrendCard, UsageModelsCard, UsageRequestCard } from "./components/UsageAnalytics";
+import { ApiMetricsPanel } from "./components/ApiMetricsPanel";
 
 function failure(e: unknown): string {
   return e instanceof ApiError ? messageFor(e) : String(e);
@@ -176,10 +177,10 @@ function defaultRange(group: "day" | "month"): { from: string; to: string } {
 const MAX_DAYS = { day: 92, month: 731 } as const;
 
 /** A card that is a region named by its heading. */
-function Section({ title, children }: { title: string; children: ReactNode }) {
+function Section({ title, number, children }: { title: string; number: number; children: ReactNode }) {
   return (
-    <Card role="region" aria-label={title}>
-      <CardHeader title={title} />
+    <Card role="region" aria-label={title} className={span.d12}>
+      <CardHeader number={number} title={title} />
       {children}
     </Card>
   );
@@ -232,14 +233,14 @@ export function Usage({ member }: { member: SessionMember }) {
   const showKeys = member.role !== "billing";
   return (
     <>
-      <PageHeader title="用量" />
-      <div className="grid gap-6">
+      <PageHeader title="用量" eyebrow="USAGE · 调用与费用" dataLead={member.role === "member" ? "查看你的密钥用量、模型费用与每次计费尝试。汇总与调用记录可分别筛选。" : "查看全组织用量、模型费用与每次计费尝试。汇总与调用记录可分别筛选。"} />
+      <div className="flex min-w-0 flex-col gap-3">
         {readErr && (
           <div className="note crit" role="alert">
             {readErr}
           </div>
         )}
-        <Summary keys={keyList} showKeys={showKeys} />
+        <Summary keys={keyList} showKeys={showKeys} ownScope={member.role === "member"} />
         <CallLog keys={keyList} showKeys={showKeys} models={granted} />
       </div>
     </>
@@ -276,18 +277,19 @@ function summaryModel(r: UsageSummaryRow): string {
   return r.model.name === "" ? "未授权或未知模型" : r.model.name;
 }
 
-function Summary({ keys, showKeys }: { keys: TenantKey[]; showKeys: boolean }) {
+function Summary({ keys, showKeys, ownScope }: { keys: TenantKey[]; showKeys: boolean; ownScope: boolean }) {
   const [group, setGroup] = useState<"day" | "month">("day");
   const [fromDate, setFromDate] = useState("");
   const [toDate, setToDate] = useState("");
   const [keyId, setKeyId] = useState("");
   const [rows, setRows] = useState<UsageSummaryRow[] | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const [refresh, setRefresh] = useState(0);
   const range = rangeOf(fromDate, toDate);
   // A summary needs both ends: a date left empty reads as the default span.
   const fallback = defaultRange(group);
-  const span = range ? (Date.parse(range.to ?? fallback.to) - Date.parse(range.from ?? fallback.from)) / 86_400_000 : 0;
-  const tooLong = span > MAX_DAYS[group];
+  const rangeDays = range ? (Date.parse(range.to ?? fallback.to) - Date.parse(range.from ?? fallback.from)) / 86_400_000 : 0;
+  const tooLong = rangeDays > MAX_DAYS[group];
   // The latest request: an answer to an older filter is dropped.
   const ticket = useRef(0);
 
@@ -313,18 +315,8 @@ function Summary({ keys, showKeys }: { keys: TenantKey[]; showKeys: boolean }) {
     );
     // `range` is derived from the two dates.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [group, fromDate, toDate, keyId, tooLong]);
+  }, [group, fromDate, toDate, keyId, tooLong, refresh]);
 
-  // The figures the page leads with: the summary's own rows, added up.
-  const totals =
-    rows === null
-      ? null
-      : {
-          requests: rows.reduce((n, r) => n + r.requests, 0),
-          charged: rows.reduce((n, r) => n + r.charged_micro_cny, 0),
-          estimated: rows.some((r) => r.estimated_requests > 0),
-          models: new Set(rows.map((r) => r.model.id ?? r.model.name)).size,
-        };
   const spanText =
     fromDate === "" && toDate === ""
       ? group === "day"
@@ -332,18 +324,20 @@ function Summary({ keys, showKeys }: { keys: TenantKey[]; showKeys: boolean }) {
         : "最近 12 个月（UTC）"
       : `${fromDate || periodLabel(fallback.from, "day")} – ${toDate || todayUtc()}（UTC）`;
 
+  const visualError = !range ? "结束日期不能早于开始日期，请调整汇总筛选。" : tooLong ? "时间范围过大，请缩短汇总区间。" : err;
+  const rangeLabel = `${spanText} · ${keyId ? "所选密钥" : ownScope ? "你的密钥" : "全组织"}`;
+  const retry = () => setRefresh((value) => value + 1);
+  // 无效日期仍保留指标卡框，由指标组件解释范围错误并停止请求。
+  const metricsFrom = fromDate ? utcRange(fromDate, fromDate).from : fallback.from;
+  const metricsTo = toDate ? utcRange(toDate, toDate).to : fallback.to;
   return (
-    <>
-      <StatGrid className="mb-0 xl:grid-cols-3">
-        <Stat label="调用次数" value={totals ? totals.requests.toLocaleString("en-US") : "—"} foot={spanText} />
-        <Stat
-          label="费用"
-          value={totals ? fmtMicroCny(totals.charged) : "—"}
-          foot={totals?.estimated ? `${spanText}（含估算）` : spanText}
-        />
-        <Stat label="模型" value={totals ? totals.models.toLocaleString("en-US") : "—"} foot={spanText} />
-      </StatGrid>
-      <Section title="用量汇总">
+    <BentoGrid>
+      <UsageRequestCard rows={rows} error={visualError} rangeLabel={rangeLabel} group={group} number={1} className={span.d8} onRetry={retry} />
+      <UsageCostCard rows={rows} error={visualError} rangeLabel={rangeLabel} group={group} number={2} className={span.d4} onRetry={retry} />
+      <UsageModelsCard rows={rows} error={visualError} rangeLabel={rangeLabel} group={group} number={3} className={span.d4} onRetry={retry} />
+      <UsageCostTrendCard rows={rows} error={visualError} rangeLabel={rangeLabel} group={group} number={4} className={span.d8} onRetry={retry} />
+      <ApiMetricsPanel refreshKey={refresh} scope="tenant" enabled from={metricsFrom} to={metricsTo} apiKeyId={keyId || undefined} numberStart={5} className={span.d12} />
+      <Section title="用量汇总" number={7}>
         <Filters>
           <Field label="汇总方式">
             <select value={group} onChange={(e) => setGroup(e.target.value as "day" | "month")}>
@@ -361,6 +355,7 @@ function Summary({ keys, showKeys }: { keys: TenantKey[]; showKeys: boolean }) {
         </Filters>
         <p className="hint">
           按用量发生的时间汇总，不是按计费入账的时间：重新计价后的调整，记在用量发生的那一期。
+          调用尝试次数包含最终尝试，以及已计费或重新计价的重试。
           {fromDate === "" && toDate === "" && (group === "day" ? "未选日期时汇总最近 30 天（UTC）。" : "未选日期时汇总最近 12 个月（UTC）。")}
         </p>
         {err && (
@@ -368,8 +363,8 @@ function Summary({ keys, showKeys }: { keys: TenantKey[]; showKeys: boolean }) {
             {err}
           </div>
         )}
-        {rows === null && <Loading />}
-        {rows !== null && rows.length === 0 && !err && !tooLong && <EmptyState text="所选范围内没有用量" mark="route" />}
+        {rows === null && <ChartSkeleton />}
+        {rows !== null && rows.length === 0 && !err && !tooLong && <CardMessage>所选范围内没有用量</CardMessage>}
         {rows !== null && rows.length > 0 && (
           <DataTable label="用量汇总">
             <thead>
@@ -388,7 +383,7 @@ function Summary({ keys, showKeys }: { keys: TenantKey[]; showKeys: boolean }) {
                   <td>{summaryModel(r)}</td>
                   <td className="num">{r.requests}</td>
                   <td className="num">
-                    {fmtMicroCny(r.charged_micro_cny)}
+                    {Number.isSafeInteger(r.charged_micro_cny) ? fmtMicroCny(r.charged_micro_cny) : "未知"}
                     {r.estimated_requests > 0 ? "（含估算）" : ""}
                   </td>
                   <td>
@@ -400,7 +395,7 @@ function Summary({ keys, showKeys }: { keys: TenantKey[]; showKeys: boolean }) {
           </DataTable>
         )}
       </Section>
-    </>
+    </BentoGrid>
   );
 }
 
@@ -491,7 +486,7 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
   }
 
   return (
-    <Section title="调用记录">
+    <Section title="调用记录" number={8}>
       <Filters>
         <Field label="时间（UTC）起" error={range ? null : "结束日期不能早于开始日期"}>
           <input type="date" value={fromDate} max={toDate || undefined} onChange={(e) => setFromDate(e.target.value)} />
@@ -514,13 +509,14 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
           <input autoComplete="off" value={typed} onChange={(e) => setTyped(e.target.value)} />
         </Field>
       </Filters>
+      <p className="mt-4 text-caption text-muted">调用记录按计费尝试逐条展示，同一请求可能有多条记录。{rows !== null ? `已加载 ${rows.length.toLocaleString("en-US")} 条${next !== null ? "，还有更多记录" : ""}；这些记录不代表整个汇总窗口的成功率或延迟分布。` : ""}</p>
       {err && (
         <div className="note crit" role="alert">
           {err}
         </div>
       )}
-      {rows === null && <Loading />}
-      {rows !== null && rows.length === 0 && !err && <EmptyState text="所选条件下没有调用记录" mark="log" />}
+      {rows === null && <ChartSkeleton />}
+      {rows !== null && rows.length === 0 && !err && <CardMessage>所选条件下没有调用记录</CardMessage>}
       {rows !== null && rows.length > 0 && (
         <DataTable label="调用记录">
           <thead>
@@ -620,11 +616,11 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
         </DataTable>
       )}
       {next !== null && (
-        <div className="usage-more -mx-6 -mb-6 !mt-0 flex justify-center rounded-b-[11px] border-t border-border bg-muted/40 px-6 py-3 max-[719px]:-mx-4 max-[719px]:-mb-4">
+        <CardFooter className="usage-more flex justify-center border-t border-ink/7 pt-5">
           <Button size="sm" busy={more} busyLabel="加载中…" onClick={() => void loadMore()}>
             加载更多
           </Button>
-        </div>
+        </CardFooter>
       )}
     </Section>
   );

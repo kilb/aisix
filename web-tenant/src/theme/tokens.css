@@ -1,134 +1,113 @@
-/* Design tokens shared by the operator Dashboard (web-cp) and the tenant
-   portal (web-tenant). Both apps carry a byte-equal copy of this file; a
-   unit test in each pins the two together, so change them together.
-
-   The language (2026-11-11, second pass): shadcn/ui on Tailwind, bright and
-   softly lit rather than grey. A cool lavender-white page carries a faint
-   aurora wash (indigo from the left, Routio's Signal yellow from the right);
-   cards are pure white, generously rounded (16px) and lifted by layered
-   shadows tinted with the accent's own hue, never black. The primary is a
-   vivid indigo, the one saturated colour in the interface besides state, and
-   the brand mark's tile takes that indigo so light yellow reads as a glint on
-   it.
-
-   The first block uses shadcn's variable names (the Tailwind theme in each
-   app's index.css maps them to utilities). The second keeps the role names
-   the pages' own stylesheets read, defined on top of the first, so a page
-   not yet rebuilt still takes the new look.
-
-   Light is the default whatever the system setting. Dark applies only when
-   the viewer chooses it with the theme toggle, which sets
-   <html data-theme="dark">. Nothing here reads prefers-color-scheme. */
-
+/* 双端逐字节共享的 Bento 令牌。套件颜色只在这里定义；旧角色别名保留行为合同。
+   light 始终默认，dark 只由现有手动开关设置；不读取系统配色偏好。
+   --muted / --accent 是旧 CSS 的中性填充，不能用作 canonical text-muted / accent。 */
 :root {
   color-scheme: light;
+  --bento-canvas: #ECEAE4;
+  --bento-surface: #FBFAF7;
+  --bento-well: #E1DED6;
+  --bento-stone: #D9D5CB;
+  --bento-line: #C9C5BB;
+  --bento-graphite: #7A7871;
+  --bento-ink: #121211;
+  --bento-ink-soft: #4A4944;
+  --bento-muted: #64635D;
+  --bento-inverse-muted: #A3A29B;
+  --bento-accent: #FF5A1F;
 
-  /* ── shadcn variables ─────────────────────────────────────── */
-  --background: #F5F6FC;
-  --foreground: #151824;
-  --card: #FFFFFF;
-  --card-foreground: #151824;
-  --popover: #FFFFFF;
-  --popover-foreground: #151824;
-  --primary: #4F46E5;
-  --primary-foreground: #FFFFFF;
-  --secondary: #EEEFF9;
-  --secondary-foreground: #151824;
-  --muted: #F1F2FA;
-  --muted-foreground: #5B6178;
-  --accent: #EEF0FE;
-  --accent-foreground: #3B34C9;
-  --destructive: #CB2A3C;
-  --destructive-foreground: #FFFFFF;
-  /* Hairlines between surfaces are tinted, not grey, and stay just under the
-     point where they would read as a rule. A field's edge needs 3:1 (WCAG
-     1.4.11), so inputs take --input. */
-  --border: #E7E9F4;
-  --input: #838AA0;
-  --ring: #635BFF;
-  --radius: 0.75rem;
-  --sidebar: #FCFCFF;
-  --sidebar-foreground: #151824;
-  --sidebar-accent: #EEF0FE;
-  --sidebar-border: #ECEEF6;
+  --background: var(--bento-canvas);
+  --foreground: var(--bento-ink);
+  --card: var(--bento-surface);
+  --card-foreground: var(--foreground);
+  --popover: var(--card);
+  --popover-foreground: var(--foreground);
+  --primary: var(--bento-ink);
+  --primary-foreground: var(--bento-surface);
+  --secondary: var(--bento-canvas);
+  --secondary-foreground: var(--foreground);
+  --muted: var(--bento-canvas);
+  --muted-foreground: var(--bento-muted);
+  --accent: var(--bento-canvas);
+  --accent-foreground: var(--foreground);
+  --destructive: var(--bento-ink);
+  --destructive-foreground: var(--bento-surface);
+  --border: color-mix(in srgb, var(--foreground) 7%, transparent);
+  --input: var(--bento-graphite);
+  --ring: var(--bento-ink);
+  --radius: 10px;
+  --sidebar: var(--card);
+  --sidebar-foreground: var(--foreground);
+  --sidebar-accent: var(--accent);
+  --sidebar-border: var(--border);
 
-  /* State colours: text-safe on white, on the page and on a hovered row
-     (4.5:1). */
-  --info: #2563EB;
-  --success: #0E7C48;
-  --warning: #96540A;
-  --danger: #CB2A3C;
-  /* Their quiet fills, for badges and notes. */
-  --info-soft: #EDF1FE;
-  --success-soft: #E6F6EC;
-  --warning-soft: #FFF3E1;
-  --danger-soft: #FDECEE;
+  /* 状态依靠文字、形状和确认流程识别；橙色只表达当前或重点。 */
+  --info: var(--bento-ink-soft);
+  --success: var(--bento-ink-soft);
+  --warning: var(--bento-ink-soft);
+  --danger: var(--bento-ink-soft);
+  --info-soft: var(--muted);
+  --success-soft: var(--muted);
+  --warning-soft: var(--muted);
+  --danger-soft: var(--muted);
+  --brand: var(--bento-accent);
+  --brand-ink: var(--bento-ink);
+  --wash-1: transparent;
+  --wash-2: transparent;
+  --route-1: var(--bento-ink);
+  --route-2: var(--bento-ink-soft);
+  --route-3: var(--bento-muted);
+  --route-4: var(--bento-graphite);
+  --route-5: var(--bento-ink-soft);
+  --route-6: var(--bento-muted);
 
-  /* Routio's mark: yellow is a glint on an indigo tile, never a fill. */
-  --brand: #FFC72C;
-  --brand-ink: #151824;
-
-  /* The page's aurora wash, drawn as two very low alphas over the canvas by
-     theme/base.css. Never a flat gradient: it should read as light. */
-  --wash-1: rgba(99, 91, 255, 0.1);
-  --wash-2: rgba(255, 199, 44, 0.14);
-
-  /* Provider groups: a short bar beside the name, by name hash. */
-  --route-1: #4F46E5;
-  --route-2: #0E7C48;
-  --route-3: #C2410C;
-  --route-4: #7C3AED;
-  --route-5: #0E7490;
-  --route-6: #B45309;
-
-  /* ── Role names the pages' stylesheets read ───────────────── */
   --bg: var(--background);
   --surface: var(--card);
   --surface-raised: var(--popover);
-  --well: var(--muted);
+  --well: var(--bento-well);
+  --stone: var(--bento-stone);
+  --graphite: var(--bento-graphite);
+  --ink-soft: var(--bento-ink-soft);
   --text: var(--foreground);
-  --text-2: #454B60;
+  --text-2: var(--bento-ink-soft);
   --text-muted: var(--muted-foreground);
-  --divider: #F0F1F9;
+  --divider: var(--border);
   --input-border: var(--input);
-  --input-border-hover: #5B6178;
+  --input-border-hover: var(--foreground);
   --box-border: var(--input);
   --focus: var(--ring);
-  --focus-halo: rgba(99, 91, 255, 0.2);
-  --link: var(--info);
+  --focus-halo: transparent;
+  --link: var(--foreground);
   --error: var(--danger);
-  --hover: rgba(21, 24, 36, 0.045);
-  --press: rgba(21, 24, 36, 0.075);
-  --row-hover: #F8F9FE;
-  --chip: #F1F2FA;
-  --skeleton: #EDEFF7;
-  --scrollbar: rgba(21, 24, 36, 0.2);
-  --scroll-shadow: rgba(20, 24, 60, 0.1);
-  --selection: rgba(99, 91, 255, 0.16);
-  --tooltip-bg: #151824;
-  --tooltip-text: #FFFFFF;
+  --hover: color-mix(in srgb, var(--foreground) 5%, transparent);
+  --press: color-mix(in srgb, var(--foreground) 8%, transparent);
+  --row-hover: var(--bento-canvas);
+  --chip: var(--muted);
+  --skeleton: var(--bento-well);
+  --scrollbar: var(--bento-graphite);
+  --scroll-shadow: transparent;
+  --selection: color-mix(in srgb, var(--foreground) 15%, transparent);
+  --tooltip-bg: var(--bento-ink);
+  --tooltip-text: var(--bento-surface);
   --route-line: var(--foreground);
-  --lamp-applied: var(--success);
-  --lamp-progress: var(--info);
+  --lamp-applied: var(--foreground);
+  --lamp-progress: var(--text-2);
   --lamp-pending: var(--muted-foreground);
-  --lamp-rejected: var(--danger);
-  --lamp-disabled: #A6ABC0;
-  /* Shadows carry the accent's hue: a card should sit in its own light. */
-  --shadow-xs: 0 1px 2px rgba(20, 24, 60, 0.05);
-  --shadow-sm: 0 1px 2px rgba(20, 24, 60, 0.05), 0 2px 6px -2px rgba(20, 24, 60, 0.06);
-  --shadow-card: 0 1px 2px rgba(20, 24, 60, 0.04), 0 12px 28px -20px rgba(20, 24, 60, 0.22);
-  --shadow-float: 0 0 0 1px rgba(20, 24, 60, 0.06), 0 14px 36px -12px rgba(20, 24, 60, 0.2);
-  --shadow-btn: 0 1px 2px rgba(79, 70, 229, 0.3), 0 6px 16px -8px rgba(79, 70, 229, 0.5);
+  --lamp-rejected: var(--foreground);
+  --lamp-disabled: var(--bento-graphite);
+  --shadow-xs: none;
+  --shadow-sm: none;
+  --shadow-card: none;
+  --shadow-float: none;
+  --shadow-btn: none;
 
-  /* ── The earlier scale, for the pages' own stylesheets ─────── */
+  /* 旧页面角色继续指向同一主题，禁止新增第二套色值。 */
   --ink: var(--foreground);
   --paper: var(--card);
   --canvas: var(--background);
-  --line: var(--info);
-  --line-press: var(--info);
+  --line: var(--bento-line);
+  --line-press: var(--foreground);
   --proceed: var(--success);
   --stop: var(--danger);
-  /* A selected row's edge and a chosen option take the primary. */
   --sign: var(--primary);
   --sign-hover: var(--primary);
   --sign-press: var(--primary);
@@ -137,16 +116,16 @@
   --stop-fill-hover: var(--destructive);
   --stop-fill-press: var(--destructive);
   --on-stop: var(--destructive-foreground);
-  --n1: #454B60;
-  --n2: #5B6178;
-  --n3: #A6ABC0;
-  --n4: #E7E9F4;
+  --n1: var(--text-2);
+  --n2: var(--muted-foreground);
+  --n3: var(--bento-graphite);
+  --n4: var(--bento-line);
   --hairline: var(--border);
   --hairline-inner: var(--divider);
-  --control-border: var(--border);
-  --shadow-raise: var(--shadow-xs);
-  --inset: inset 0 1px 1px rgba(20, 24, 60, 0.08);
-  --mark-tile: #4F46E5;
+  --control-border: var(--input);
+  --shadow-raise: none;
+  --inset: none;
+  --mark-tile: var(--bento-ink);
   --wide: 100%;
   --s-1: 4px;
   --s-2: 8px;
@@ -161,110 +140,75 @@
   --fs-13: 13px;
   --fs-14: 14px;
   --fs-16: 16px;
-  --fs-20: 18px;
+  --fs-20: 19px;
   --fs-24: 24px;
-  --fs-32: 30px;
-  --fs-44: 40px;
-  --lh-body: 1.6;
-  --lh-table: 1.4;
-  --lh-heading: 1.3;
-  --tracking-heading: -0.02em;
+  --fs-32: 32px;
+  --fs-44: 60px;
+  --lh-body: 1.5;
+  --lh-table: 1.45;
+  --lh-heading: 1.2;
+  --tracking-heading: -0.04em;
   --r-input: 10px;
-  --r-card: 16px;
-  --r-button: 10px;
-  --r-chip: 9999px;
-  --r-panel: 18px;
-  --r-rail: 16px;
+  --r-card: 24px;
+  --r-button: 9999px;
+  --r-chip: 8px;
+  --r-panel: 24px;
+  --r-rail: 24px;
   --r-round: 9999px;
-  --h-control: 36px;
-  --h-control-sm: 32px;
-  --h-row: 48px;
-  --h-row-compact: 40px;
-  --h-head: 40px;
+  --h-control: 44px;
+  --h-control-sm: 44px;
+  --h-row: 56px;
+  --h-row-compact: 48px;
+  --h-head: 44px;
   --icon: 16px;
   --t-fast: 120ms;
-  --t-panel: 180ms;
+  --t-panel: 0ms;
   --t-leave: 200ms;
-  --t-lens: 250ms;
-  --ease-out: cubic-bezier(0.2, 0.8, 0.2, 1);
-  --ease-spring: cubic-bezier(0.2, 0.8, 0.2, 1);
-
-  /* Type: Geist for Latin and figures, the system face for Chinese. */
-  --font-sans: "Geist", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", "Noto Sans CJK SC", system-ui, sans-serif;
-  --font-mono: "Geist Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --t-lens: 0ms;
+  --ease-out: ease-out;
+  --ease-spring: ease-out;
+  --font-sans: "Geist", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", system-ui, sans-serif;
+  --font-mono: "Geist Mono", "Noto Sans SC", ui-monospace, "SF Mono", Menlo, monospace;
 }
 
+/* 深色保留手动主题合同，仅使用套件已有暖中性色。 */
 :root[data-theme="dark"] {
   color-scheme: dark;
-
-  --background: #0C0D16;
-  --foreground: #ECEFFA;
-  --card: #14161F;
-  --card-foreground: #ECEFFA;
-  --popover: #191C27;
-  --popover-foreground: #ECEFFA;
-  --primary: #8E8AFF;
-  --primary-foreground: #0C0D16;
-  --secondary: #1C1F2B;
-  --secondary-foreground: #ECEFFA;
-  --muted: #1A1D28;
-  --muted-foreground: #A6ABC0;
-  --accent: #1E2130;
-  --accent-foreground: #C9C6FF;
-  --destructive: #E5485C;
-  --destructive-foreground: #0C0D16;
-  --border: #242735;
-  --input: #6E7488;
-  --ring: #9A96FF;
-  --sidebar: #10121B;
-  --sidebar-foreground: #ECEFFA;
-  --sidebar-accent: #1E2130;
-  --sidebar-border: #212431;
-
-  --info: #7EA6FF;
-  --success: #4CD08B;
-  --warning: #F0AB4A;
-  --danger: #FF7A86;
-  --info-soft: #131E33;
-  --success-soft: #102418;
-  --warning-soft: #2A1D08;
-  --danger-soft: #2E1217;
-
-  --wash-1: rgba(99, 91, 255, 0.16);
-  --wash-2: rgba(255, 199, 44, 0.06);
-
-  --route-1: #8E8AFF;
-  --route-2: #4CD08B;
-  --route-3: #EE7B45;
-  --route-4: #A385F7;
-  --route-5: #2DB0CC;
-  --route-6: #DE9134;
-
-  --text-2: #C8CCDC;
-  --divider: #1C1F2A;
-  --input-border-hover: #A6ABC0;
-  --focus-halo: rgba(154, 150, 255, 0.28);
-  --hover: rgba(255, 255, 255, 0.05);
-  --press: rgba(255, 255, 255, 0.09);
-  --row-hover: #191C26;
-  --chip: #1E2130;
-  --skeleton: #1E2130;
-  --scrollbar: rgba(255, 255, 255, 0.2);
-  --scroll-shadow: rgba(0, 0, 0, 0.5);
-  --selection: rgba(142, 138, 255, 0.3);
-  --tooltip-bg: #ECEFFA;
-  --tooltip-text: #0C0D16;
-  --lamp-disabled: #6E7488;
-  --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.4);
-  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4), 0 2px 6px -2px rgba(0, 0, 0, 0.5);
-  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.4), 0 12px 28px -20px rgba(0, 0, 0, 0.8);
-  --shadow-float: 0 0 0 1px rgba(255, 255, 255, 0.09), 0 16px 40px -12px rgba(0, 0, 0, 0.8);
-  --shadow-btn: 0 1px 2px rgba(0, 0, 0, 0.5), 0 6px 16px -8px rgba(142, 138, 255, 0.4);
-  --n1: #C8CCDC;
-  --n2: #A6ABC0;
-  --n3: #6E7488;
-  --n4: #242735;
-  --inset: inset 0 1px 1px rgba(0, 0, 0, 0.4);
-  --mark-tile: #8E8AFF;
-  --brand-ink: #0C0D16;
+  --background: var(--bento-ink);
+  --foreground: var(--bento-surface);
+  --card: var(--bento-ink-soft);
+  --primary: var(--bento-surface);
+  --primary-foreground: var(--bento-ink);
+  --secondary: var(--bento-ink);
+  --muted: var(--bento-ink);
+  --muted-foreground: var(--bento-canvas);
+  --accent: var(--bento-ink);
+  --destructive: var(--bento-surface);
+  --destructive-foreground: var(--bento-ink);
+  --border: color-mix(in srgb, var(--bento-surface) 12%, transparent);
+  --input: var(--bento-inverse-muted);
+  --ring: var(--bento-surface);
+  --info: var(--bento-surface);
+  --success: var(--bento-surface);
+  --warning: var(--bento-surface);
+  --danger: var(--bento-surface);
+  --route-1: var(--bento-surface);
+  --route-2: var(--bento-canvas);
+  --route-3: var(--bento-well);
+  --route-4: var(--bento-stone);
+  --route-5: var(--bento-line);
+  --route-6: var(--bento-inverse-muted);
+  --well: var(--bento-ink);
+  --stone: var(--bento-muted);
+  --graphite: var(--bento-line);
+  --ink-soft: var(--bento-canvas);
+  --text-2: var(--bento-canvas);
+  --row-hover: var(--bento-ink);
+  --skeleton: var(--bento-graphite);
+  --scrollbar: var(--bento-inverse-muted);
+  --tooltip-bg: var(--bento-surface);
+  --tooltip-text: var(--bento-ink);
+  --lamp-disabled: var(--bento-inverse-muted);
+  --n3: var(--bento-inverse-muted);
+  --n4: var(--bento-graphite);
 }

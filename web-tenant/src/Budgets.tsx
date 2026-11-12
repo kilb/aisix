@@ -25,7 +25,10 @@ import { Field, useRefusalFocus } from "./ui/Field";
 import { Lamp } from "./ui/Lamp";
 import { useToast } from "./ui/Toast";
 import { TwoStep } from "./ui/TwoStep";
-import { Card, CardHeader, PageHeader, Split } from "./components/page";
+import { BentoGrid, Card, CardFooter, CardHeader, CardMessage, Metric, PageHeader, span } from "./components/page";
+import { BudgetProgress } from "./components/charts";
+import { exactInteger, exactRatio } from "./lib/chartFormat";
+import { cn } from "./lib/cn";
 
 function failure(e: unknown): string {
   return e instanceof ApiError ? messageFor(e) : String(e);
@@ -127,10 +130,10 @@ function powers(b: Budget, role: SessionMember["role"]): { edit: boolean; del: b
 // ── the page ────────────────────────────────────────────────────────────────
 
 /** A card that is a region named by its heading, its actions beside the heading. */
-function Section({ title, actions, children }: { title: string; actions?: ReactNode; children: ReactNode }) {
+function Section({ title, number, actions, children, className, tone }: { title: string; number: number; actions?: ReactNode; children: ReactNode; className?: string; tone?: "surface" | "inverse" }) {
   return (
-    <Card role="region" aria-label={title}>
-      <CardHeader title={title} actions={actions} />
+    <Card role="region" aria-label={title} className={className} tone={tone}>
+      <CardHeader number={number} title={title} actions={actions} />
       {children}
     </Card>
   );
@@ -242,97 +245,40 @@ export function Budgets({ member }: { member: SessionMember }) {
 
   return (
     <>
-      <PageHeader title="预算" />
-      <Split
-        asideWidth="360px"
-        main={
-          <div className="grid gap-6">
-            {rowsErr && (
-              <div className="note crit" role="alert">
-                预算读取失败：{rowsErr}
-              </div>
-            )}
-            {financial && (
-              <>
-                <Section title="账户额度" actions={<a href="#billing">查看账户</a>}>
-                  {balanceErr ? (
-                    <div className="note crit" role="alert">
-                      账户额度读取失败：{balanceErr}
-                    </div>
-                  ) : balance === null ? (
-                    <Loading />
-                  ) : (
-                    <>
-                      <BudgetAccountAmounts balance={balance} />
-                      {balance.exhausted && (
-                        <div className="note warn">
-                          {balance.billing_mode === "postpaid" ? "账户已达信用额度" : "账户余额不足"}
-                        </div>
-                      )}
-                    </>
-                  )}
-                  <p className="hint">账户额度与额外预算上限分别生效；调用仍受组织、成员、密钥预算及其他限制约束。</p>
-                </Section>
-                <Section title="组织预算（平台设置）">
-                  <p className="hint">平台可额外设置按周期或一次性的组织预算上限，与账户余额和信用额度不同。</p>
-                  {!rowsErr && (
-                    <QuotaTable
-                      label="组织额度"
-                      rows={rows === null ? null : team}
-                      empty="未设置额外组织预算上限"
-                      role={role}
-                      parentsOf={() => []}
-                      onChanged={reload}
-                    />
-                  )}
-                </Section>
-              </>
-            )}
-            <Section title="成员额度">
-              {!rowsErr && (
-                <QuotaTable
-                  label="成员额度"
-                  rows={rows === null ? null : memberRows}
-                  empty={manager ? "还没有成员额度，可在「新建额度」中新建" : role === "billing" ? "还没有成员额度" : "还没有给你设置成员额度"}
-                  role={role}
-                  parentsOf={() => team.map(termsOf)}
-                  onChanged={reload}
-                />
-              )}
-            </Section>
-            <Section
-              title="密钥额度"
-              actions={
-                <Button size="sm" icon="refresh" busy={reloading} busyLabel="刷新中…" onClick={reload}>
-                  刷新
-                </Button>
-              }
-            >
-              {quotaErr && (
-                <div className="note crit" role="alert">
-                  {quotaErr}
-                </div>
-              )}
-              <KeyFigures keys={keys} rows={keyRows} quotas={quotas} shown={shown} onMore={() => setShown((n) => n + KEYS_PER_VIEW)} />
-              {!rowsErr && (
-                <QuotaTable
-                  label="密钥额度"
-                  rows={rows === null ? null : keyRows}
-                  empty={creator ? "还没有密钥额度，可在「新建额度」中新建" : "还没有密钥额度"}
-                  role={role}
-                  parentsOf={(b) => keyParents(quotas[b.target.id])}
-                  onChanged={reload}
-                />
-              )}
-            </Section>
-          </div>
-        }
-        aside={
-          creator && !rowsErr ? (
-            <CreateForm role={role} keys={keys} people={people} team={team} quotas={quotas} onCreated={reload} />
-          ) : undefined
-        }
-      />
+      <PageHeader title="预算" eyebrow="BUDGETS · 分级额度" dataLead="账户额度与组织、成员、密钥预算独立生效。多条限制同时存在时，以先用尽者为准。" />
+      <BentoGrid>
+        {rowsErr && <div className={cn(span.d12, "note crit")} role="alert">预算读取失败：{rowsErr}</div>}
+        {financial && <>
+          <Section number={1} title="账户额度" className={span.d8} actions={<a className="inline-flex min-h-11 items-center text-body" href="#billing">查看账户 ↗</a>}>
+            {balanceErr ? <div role="alert"><CardMessage>账户额度读取失败：{balanceErr}</CardMessage></div> : balance === null ? <Loading /> : <>
+              <BudgetAccountAmounts balance={balance} />
+              {balance.exhausted && <div className="note warn">{balance.billing_mode === "postpaid" ? "账户已达信用额度" : "账户余额不足"}</div>}
+            </>}
+            <CardFooter className="border-t border-ink/7 pt-4 text-caption text-muted">账户额度与额外预算上限分别生效；调用仍受组织、成员、密钥预算及其他限制约束。</CardFooter>
+          </Section>
+          <Section number={2} title="组织预算（平台设置）" tone="inverse" className={cn(span.d4, "tablet:col-span-12")}>
+            {rows !== null && !rowsErr && <><Metric size="display">{team.length.toLocaleString("en-US")}</Metric><p className="text-caption text-on-inverse-muted">条额外组织预算</p></>}
+            <p className="text-caption text-on-inverse-muted">平台可额外设置按周期或一次性的组织预算上限，与账户余额和信用额度不同。</p>
+            {!rowsErr && <QuotaTable label="组织额度" rows={rows === null ? null : team} empty="未设置额外组织预算上限" role={role} parentsOf={() => []} onChanged={reload} />}
+          </Section>
+        </>}
+        <Section number={financial ? 3 : 1} title="成员额度" className={creator && !rowsErr ? span.d7 : span.d12}>
+          <p className="text-caption text-muted">{manager || role === "billing" ? "组织中每个成员的独立额度" : "分配给我的成员额度"}；进度仅比较每条预算自身的已用与限额，不合并不同周期。</p>
+          {!rowsErr && <QuotaTable label="成员额度" rows={rows === null ? null : memberRows}
+            empty={manager ? "还没有成员额度，可在「新建额度」中新建" : role === "billing" ? "还没有成员额度" : "还没有给你设置成员额度"}
+            role={role} parentsOf={() => team.map(termsOf)} onChanged={reload} />}
+        </Section>
+        {creator && !rowsErr && <CreateForm number={financial ? 4 : 2} role={role} keys={keys} people={people} team={team} quotas={quotas} onCreated={reload} />}
+        <Section number={financial ? creator && !rowsErr ? 5 : 4 : creator && !rowsErr ? 3 : 2} title="密钥额度" className={span.d12}
+          actions={<Button size="sm" icon="refresh" busy={reloading} busyLabel="刷新中…" onClick={reload}>刷新</Button>}>
+          <p className="text-caption text-muted">实际可用额度取账户与各级预算的最小剩余值；未设置限额时显示“不限”。每次展开最多增加 25 个密钥。</p>
+          {quotaErr && <div className="note crit" role="alert">{quotaErr}</div>}
+          <KeyFigures keys={keys} rows={keyRows} quotas={quotas} shown={shown} onMore={() => setShown((n) => n + KEYS_PER_VIEW)} />
+          {!rowsErr && <QuotaTable label="密钥额度" rows={rows === null ? null : keyRows}
+            empty={creator ? "还没有密钥额度，可在「新建额度」中新建" : "还没有密钥额度"}
+            role={role} parentsOf={(b) => keyParents(quotas[b.target.id])} onChanged={reload} />}
+        </Section>
+      </BentoGrid>
     </>
   );
 }
@@ -469,6 +415,7 @@ function QuotaRow({
   const draftOk = isCnyAmount(draft.trim(), { allowZero: false });
   const limit = editing && draftOk ? cnyToMicro(draft.trim()) : b.limit_micro_cny;
   const over = exceeds({ ...termsOf(b), limit }, parents);
+  const progressNote = exactInteger(b.limit_micro_cny) === 0n ? "限额为零，不计算比例" : undefined;
 
   async function save() {
     const text = draft.trim();
@@ -531,6 +478,7 @@ function QuotaRow({
       </td>
       <td className="num">
         <Money micro={b.spent_micro_cny} />
+        <BudgetProgress value={exactRatio(b.spent_micro_cny, b.limit_micro_cny)} accessibleLabel={`${b.target.label}，${periodText(b)}预算已用进度`} valueLabel={progressNote} className="mt-2 min-w-24" />
       </td>
       <td className="num">
         <Money micro={b.remaining_micro_cny} />
@@ -606,6 +554,7 @@ const FIELD_OF: Record<string, FormField> = {
 };
 
 function CreateForm({
+  number,
   role,
   keys,
   people,
@@ -613,6 +562,7 @@ function CreateForm({
   quotas,
   onCreated,
 }: {
+  number: number;
   role: SessionMember["role"];
   keys: TenantKey[] | null;
   people: Member[];
@@ -692,8 +642,8 @@ function CreateForm({
   }
 
   return (
-    <Section title="新建额度">
-      <form className="grid gap-4 md:grid-cols-2 xl:grid-cols-1" ref={form} onSubmit={submit} noValidate>
+    <Section number={number} title="新建额度" className={span.d5Wide}>
+      <form className="grid gap-4" ref={form} onSubmit={submit} noValidate>
         <Field label="对象类型" error={errors.scope}>
           {(aria) => (
             <select
@@ -748,7 +698,7 @@ function CreateForm({
             {general}
           </div>
         )}
-        <div className="col-span-full -mx-6 -mb-6 mt-2 flex justify-end gap-2 rounded-b-[11px] border-t border-border bg-muted/40 px-6 py-3 max-[719px]:-mx-4 max-[719px]:-mb-4 max-[719px]:px-4">
+        <div className="col-span-full mt-2 flex justify-end gap-2 border-t border-ink/7 pt-4">
           <Button kind="primary" type="submit" busy={busy} busyLabel="创建中…">
             创建
           </Button>

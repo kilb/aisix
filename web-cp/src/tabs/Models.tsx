@@ -43,6 +43,7 @@ import type { FieldAria } from "../ui/Field";
 import { TwoStep } from "../ui/TwoStep";
 import { UpstreamModelPicker } from "../ui/UpstreamModelPicker";
 import { GroupBadges } from "./providers/GroupBadges";
+import { InventorySummary, countGroups } from "./providers/OperationsBento";
 
 /** One routing target; fields this page does not edit (such as `tags`) are kept as stored. */
 interface Target {
@@ -155,7 +156,7 @@ function groupsOf(m: Model | undefined, catalog: Catalog): ReactNode {
 /** `可服务分组：` and the groups, on a line of their own under what they belong to. */
 function ServedGroups({ children, className }: { children: ReactNode; className?: string }) {
   return (
-    <div className={cn("sub mt-1 flex flex-wrap items-center gap-x-1.5 gap-y-1 text-[12px]", className)}>
+    <div className={cn("sub mt-1 flex flex-wrap items-center gap-x-1.5 gap-y-1 font-mono text-meta", className)}>
       <span>可服务分组：</span>
       {children}
     </div>
@@ -422,13 +423,10 @@ export function Models({ canEdit }: TabProps) {
     onClose: () => setOpen(null),
   };
 
-  // The form open beside the list, and whether it is one whose rows of
-  // fields need the wider column (a routing model's targets).
+  // 编辑表单与列表并排，目标行始终保留完整字段。
   let editor: ReactNode = null;
-  let wide = false;
   if (open?.mode === "new") {
     editor = <ModelForm key={`new-${open.shape}`} model={null} shape={open.shape} readOnly={false} onReload={() => undefined} {...formProps} />;
-    wide = open.shape === "routing";
   } else if (editing && editingPublic) {
     editor = (
       // Keyed by the public model alone: the reads a save or a removal
@@ -462,7 +460,6 @@ export function Models({ canEdit }: TabProps) {
         }}
       />
     );
-    wide = true;
   } else if (editing && editable && (shapeOf(editing.doc) === "direct" || shapeOf(editing.doc) === "routing")) {
     const shape = shapeOf(editing.doc) as "direct" | "routing";
     editor = (
@@ -476,28 +473,16 @@ export function Models({ canEdit }: TabProps) {
         {...formProps}
       />
     );
-    wide = shape === "routing";
   }
-  // With a form beside it the list keeps the columns that find a row (its
-  // name, where it comes from, its state, its actions) and scrolls in its
-  // own box; the rest come back when the form closes.
+  // 编辑区打开时仍保留全部列，表格在卡片内部滚动。
   const split = editor !== null;
-  const full = split ? "xl:hidden" : undefined;
 
   return (
     <>
       <PageHeader
+        eyebrow="MODELS · 路由与目标"
         title="模型与路由"
-        // Narrower than the default, so the three actions keep their place beside it at 1440px.
-        className="[&>div:first-child]:max-w-2xl"
-        description={
-          <>
-            租户按对外名称调用模型。直连模型经一个上游账号调用上游模型；路由模型按选路策略在若干直连模型之间选择。每个模型可服务的分组来自它的上游账号：普通租户只能用到其分组内的账号。
-            <span className="mt-1.5 block">
-              要让租户看到和购买的模型，请在「上游账号 → 模型」中建为公共模型，它生成的直连模型只在内部使用；在这里新建的模型会出现在分组定价和租户授权中。
-            </span>
-          </>
-        }
+        dataLead={models.items ? <>当前有 {counts.facing} 个对外公共模型、{counts.manual} 个手工模型和 {counts.internal} 个内部直连目标。</> : "维护对外名称、路由策略和每个上游目标。"}
         actions={
           <>
             <Button type="button" onClick={refresh}>
@@ -519,6 +504,24 @@ export function Models({ canEdit }: TabProps) {
           </>
         }
       />
+      <InventorySummary
+        title="模型文档 · 当前配置"
+        total={models.items?.length ?? null}
+        totalLabel="含内部直连目标"
+        breakdown={countGroups(models.items?.map((m) => SHAPE_LABEL[shapeOf(m.doc)]) ?? [])}
+        breakdownLabel="完整模型集合的派发类型"
+        secondaryTitle="对外公共模型"
+        secondaryValue={models.items ? counts.facing : null}
+        secondaryFoot="由公共模型生成的对外路由文档。内部直连目标默认在下方列表中折叠。"
+        error={models.error !== null}
+        secondaryError={models.error !== null}
+        onRetry={refresh}
+      >
+        <dl className="ops-facts">
+          <div><dt>手工创建</dt><dd>{models.items ? counts.manual : "—"}</dd></div>
+          <div><dt>内部直连目标</dt><dd>{models.items ? counts.internal : "—"}</dd></div>
+        </dl>
+      </InventorySummary>
       <div className="mb-6 grid gap-3 empty:hidden [&>.note]:m-0">
         <Msg note={note} />
         {deleteFailure &&
@@ -565,21 +568,29 @@ export function Models({ canEdit }: TabProps) {
         )}
       </div>
 
-      {/* In reading order the form comes first, as it did above the list;
-          from 1280px the list takes the left column and the form the right. */}
+      {/* 编辑表单先于列表，视觉顺序与编号、键盘顺序一致。 */}
       <div
         className={cn(
-          "grid items-start gap-6",
-          split && (wide ? "xl:grid-cols-[minmax(0,4fr)_minmax(0,5fr)]" : "xl:grid-cols-[minmax(0,1fr)_minmax(26rem,34rem)]"),
+          "ops-editor-grid",
+          split && "ops-editor-open",
         )}
       >
-        {editor && <div className="min-w-0 xl:col-start-2 xl:row-start-1">{editor}</div>}
-        <Card className="mb-0 min-w-0 xl:col-start-1 xl:row-start-1">
+        {editor && <div className="ops-editor">{editor}</div>}
+        <Card className="ops-list mb-0">
           <CardHeader
+            number={editor ? 4 : 3}
             title="全部模型"
+            description={
+              <>
+                租户按对外名称调用模型。直连模型经一个上游账号调用上游模型；路由模型按选路策略在若干直连模型之间选择。每个模型可服务的分组来自它的上游账号：普通租户只能用到其分组内的账号。
+                <span className="mt-1.5 block">
+                  要让租户看到和购买的模型，请在「上游账号 → 模型」中建为公共模型，它生成的直连模型只在内部使用；在这里新建的模型会出现在分组定价和租户授权中。
+                </span>
+              </>
+            }
             className="mb-0 items-center"
             actions={
-              <label className="inline-flex cursor-pointer items-center gap-2 text-[13px] text-text-2">
+              <label className="inline-flex cursor-pointer items-center gap-2 text-caption text-ink-soft">
                 <input type="checkbox" checked={showInternal} onChange={(e) => setShowInternal(e.target.checked)} />
                 <span>显示内部直连模型（{counts.internal}）</span>
               </label>
@@ -592,13 +603,13 @@ export function Models({ canEdit }: TabProps) {
           ) : shown.length === 0 ? (
             <EmptyState text="没有模型。" />
           ) : (
-            <DataTable scroll={split}>
+            <DataTable label="全部模型" scroll={split}>
               <thead>
                 <tr>
                   <th>对外名称</th>
                   <th>分类</th>
-                  <th className={full}>类型</th>
-                  <th className={full}>上游账号 / 路由目标</th>
+                  <th>类型</th>
+                  <th>上游账号 / 路由目标</th>
                   <th>状态</th>
                   <th className="right">操作</th>
                 </tr>
@@ -611,17 +622,17 @@ export function Models({ canEdit }: TabProps) {
                   const from = src.kind === "public" ? publicById?.get(src.id) : undefined;
                   return (
                     <Fragment key={m.id}>
-                      <tr className={editing?.id === m.id ? "bg-accent" : undefined}>
+                      <tr className={editing?.id === m.id ? "bg-well" : undefined}>
                         <td className="font-medium">
                           <span className={cn("block truncate", split ? "max-w-[12rem]" : "max-w-[20rem]")} title={nameOf(m)}>
                             {nameOf(m)}
                           </span>
                         </td>
                         <td className="whitespace-normal">
-                          <Source model={m} source={src} from={from} publicRead={publicById !== null} catalog={catalog} brief={split} />
+                          <Source model={m} source={src} from={from} publicRead={publicById !== null} catalog={catalog} />
                         </td>
-                        <td className={cn("text-text-2", full)}>{SHAPE_LABEL[shape]}</td>
-                        <td className={cn("whitespace-normal", full)}>
+                        <td className="text-ink-soft">{SHAPE_LABEL[shape]}</td>
+                        <td className="whitespace-normal">
                           <div className="min-w-56">
                             <Upstream model={m} catalog={catalog} />
                           </div>
@@ -673,9 +684,9 @@ export function Models({ canEdit }: TabProps) {
                               {src.generated ? (
                                 // One account's mapping: it is edited as a target
                                 // of the routing row's form, so this is a view.
-                                <span className={cn("cell-note ml-auto", full)}>由公共模型生成，在「{from?.name ?? src.id}」的路由里改</span>
+                                <span className="cell-note ml-auto">由公共模型生成，在「{from?.name ?? src.id}」的路由里改</span>
                               ) : (
-                                <span className={cn("cell-note ml-auto", full)}>由公共模型生成，路由设置在这里改</span>
+                                <span className="cell-note ml-auto">由公共模型生成，路由设置在这里改</span>
                               )}
                             </>
                           ) : deleting?.id === m.id ? (
@@ -720,7 +731,7 @@ export function Models({ canEdit }: TabProps) {
                       {src.kind === "public" && !from && publicById !== null && (
                         <tr className="dt-detail">
                           <td colSpan={6} className="whitespace-normal">
-                            <p className="hint text-[13px]">
+                            <p className="hint text-caption">
                               它的公共模型「{src.id}」已不在列表里，请刷新；这次停用不能在这里执行。
                             </p>
                           </td>
@@ -748,8 +759,8 @@ function Upstream({ model, catalog }: { model: Model; catalog: Catalog }) {
         <>
           <div className="flex flex-wrap items-baseline gap-x-1.5">
             <span>{account?.doc.display_name || doc.provider_key_id || "—"}</span>
-            <span className="text-muted-foreground">·</span>
-            <code className="text-[13px]">{doc.model_name ?? "—"}</code>
+            <span className="text-muted">·</span>
+            <code className="text-caption">{doc.model_name ?? "—"}</code>
           </div>
           <ServedGroups>{groupsOf(model, catalog)}</ServedGroups>
         </>
@@ -785,7 +796,6 @@ function Source({
   from,
   publicRead,
   catalog,
-  brief,
 }: {
   model: Model;
   source: ModelSource;
@@ -794,24 +804,21 @@ function Source({
   /** Whether that list was read: without it a missing name is not a missing model. */
   publicRead: boolean;
   catalog: Catalog;
-  /** Beside a form, from 1280px: the class alone, its notes left out. */
-  brief: boolean;
 }) {
-  const note = brief ? "xl:hidden" : undefined;
   if (source.kind === "manual") return <span className="tag">手工创建</span>;
   const name = from?.name;
   const account = model.doc.provider_key_id ? catalog.accounts.get(model.doc.provider_key_id) : undefined;
   // The row a caller names is 对外; the per-account documents behind it are
   // 内部直连 — reachable only as that row's targets, never granted or priced.
   const shared = (
-    <div className={cn("sub mt-1 max-w-[16rem] min-w-28 font-mono text-[12px] [overflow-wrap:anywhere]", note)}>
+    <div className="sub mt-1 max-w-[16rem] min-w-28 font-mono text-meta [overflow-wrap:anywhere]">
       {publicRead ? (name ?? `${source.id}（公共模型已不在列表）`) : "…"}
     </div>
   );
   if (!source.generated)
     return (
       <>
-        <span className="tag border-foreground/20 bg-card text-foreground">对外</span>
+        <span className="tag border-ink/20 bg-surface text-ink">对外</span>
         {shared}
       </>
     );
@@ -819,7 +826,7 @@ function Source({
     <>
       <span className="tag border-dashed">内部直连</span>
       {shared}
-      <div className={cn("sub text-[12px]", note)}>{account ? `账号：${account.doc.display_name || account.id}` : "账号：已不存在"}</div>
+      <div className="sub font-mono text-meta">{account ? `账号：${account.doc.display_name || account.id}` : "账号：已不存在"}</div>
     </>
   );
 }
@@ -1077,14 +1084,14 @@ function ModelForm({
 
   return (
     <form ref={form} className="panel @container mb-0" aria-label={title} onSubmit={submit}>
-      <CardHeader title={title} className="mb-5" />
+      <CardHeader number={3} title={title} className="mb-5" />
       <div className="grid gap-x-4 @md:grid-cols-2">
         <div className="min-w-0 @md:col-span-2">
           <Field label="对外名称" error={at("/display_name")}>
             {(aria) => <input required disabled={locked} value={name} onChange={(e) => setName(e.target.value)} {...aria} />}
           </Field>
           {!isNew && !readOnly && (
-            <p className="hint -mt-2 mb-4 text-[13px]">
+            <p className="hint -mt-2 mb-4 text-caption">
               {RENAME_HINT}
               {RENAME_BY_NAME}
             </p>
@@ -1111,7 +1118,7 @@ function ModelForm({
               )}
             </Field>
             {account && (
-              <p className="hint -mt-2 mb-4 flex flex-wrap items-center gap-x-1.5 gap-y-1 text-[13px] @md:col-span-2">
+              <p className="hint -mt-2 mb-4 flex flex-wrap items-center gap-x-1.5 gap-y-1 text-caption @md:col-span-2">
                 <span>该账号可服务的分组：</span>
                 <GroupBadges groups={account.doc.groups ?? []} empty="—（账号未设分组）" />
               </p>
@@ -1122,7 +1129,7 @@ function ModelForm({
                   <input
                     required
                     disabled={locked}
-                    className="font-mono text-[13px]"
+                    className="font-mono text-caption"
                     value={upstream}
                     onChange={(e) => setUpstream(e.target.value)}
                     {...aria}
@@ -1154,10 +1161,10 @@ function ModelForm({
       </div>
 
       {shape === "routing" && (
-        <div className="@container mt-2 border-t border-border pt-5">
-          <h4 className="mb-3 text-sm font-semibold">路由目标（{rows.length}）</h4>
-          <div className="overflow-hidden rounded-lg border border-border">
-            <div aria-hidden="true" className={cn(MANUAL_ROW, "hidden border-b border-border bg-muted px-3 py-2 text-xs font-medium text-muted-foreground @lg:grid")}>
+        <div className="@container mt-2 border-t border-line pt-5">
+          <h4 className="mb-3 text-body font-semibold">路由目标（{rows.length}）</h4>
+          <div className="overflow-hidden rounded-cell border border-line">
+            <div aria-hidden="true" className={cn(MANUAL_ROW, "hidden border-b border-line bg-well px-3 py-2 text-caption font-medium text-ink-soft @lg:grid")}>
               <span>目标模型</span>
               <span>权重</span>
               <span>优先级</span>
@@ -1166,7 +1173,7 @@ function ModelForm({
             {rows.map((r, i) => {
               const target = catalog.models.get(r.modelId);
               return (
-                <div key={r.key} className={cn(MANUAL_ROW, "border-border p-3 not-last:border-b")} role="group" aria-label={`目标 ${i + 1}`}>
+                <div key={r.key} className={cn(MANUAL_ROW, "border-line p-3 not-last:border-b")} role="group" aria-label={`目标 ${i + 1}`}>
                   <div className="col-span-2 min-w-0 @lg:col-span-1">
                     <RowField label="目标模型" error={targetAt(r, "model_id")}>
                       {(aria) => (
@@ -1209,7 +1216,7 @@ function ModelForm({
                       />
                     )}
                   </RowField>
-                  <div className="col-span-2 flex min-h-9 items-center justify-end gap-2 @lg:col-span-1">
+                  <div className="col-span-2 flex min-h-11 items-center justify-end gap-2 @lg:col-span-1">
                     {!readOnly &&
                       rows.length > 1 &&
                       (removing === r.key ? (
@@ -1248,7 +1255,7 @@ function ModelForm({
                 添加目标
               </Button>
             )}
-            <p className="hint max-w-[44ch] text-[13px]">权重、优先级留空时用网关的默认值。优先级高的一组先用，这一组都不可用时才用下一组。</p>
+            <p className="hint max-w-[44ch] text-caption">权重、优先级留空时用网关的默认值。优先级高的一组先用，这一组都不可用时才用下一组。</p>
           </div>
         </div>
       )}
@@ -1294,7 +1301,7 @@ const MANUAL_ROW = "grid grid-cols-2 items-start gap-x-3 gap-y-2 @lg:grid-cols-[
 
 /** A form card's closing bar: its buttons at the bottom right, on a muted strip the card's width. */
 const FORM_FOOTER =
-  "-mx-6 -mb-6 mt-6 flex max-w-none flex-wrap items-center justify-end gap-2 rounded-b-[calc(var(--radius)+3px)] border-t border-border bg-muted/40 px-6 py-3";
+  "-mx-7 -mb-7 mt-6 flex max-w-none flex-wrap items-center justify-end gap-2 rounded-b-card border-t border-line bg-well px-7 py-3 [&_.hint]:text-ink-soft";
 
 /**
  * A field in a row of fields: its label above it while the row is stacked,
@@ -1321,7 +1328,7 @@ function RowField({
   return (
     <div className={cn("min-w-0", className)}>
       <label className="flex flex-col gap-1.5">
-        <span className={cn("text-xs font-medium text-muted-foreground", at === "lg" ? "@lg:sr-only" : "@3xl:sr-only")}>{label}</span>
+        <span className={cn("text-caption font-medium text-muted", at === "lg" ? "@lg:sr-only" : "@3xl:sr-only")}>{label}</span>
         {children(aria)}
       </label>
       {error && (
@@ -1667,12 +1674,13 @@ function PublicRoutingForm({
   return (
     <form ref={form} className="panel mb-0" aria-label={title} onSubmit={submit}>
       <CardHeader
+        number={3}
         title={title}
         className="mb-5"
         description={`公共模型「${publicModel.name}」的路由：每个目标是一个为它服务的上游账号。选路设置和目标都在这里改，点「保存」一并写入；移除目标立即生效。`}
       />
       <div className="@container">
-        <h4 className="mb-3 text-sm font-semibold">选路设置</h4>
+        <h4 className="mb-3 text-body font-semibold">选路设置</h4>
         {bad && (
           <div className="note crit mt-0" role="alert">
             {bad}
@@ -1745,7 +1753,7 @@ function PublicRoutingForm({
               )}
             </Field>
             {draft.statuses.trim() !== "" && statuses === null && (
-              <p className="hint -mt-2 mb-4 text-[13px]">状态码要写成数字，用逗号分隔。</p>
+              <p className="hint -mt-2 mb-4 text-caption">状态码要写成数字，用逗号分隔。</p>
             )}
           </div>
         </div>
@@ -1755,15 +1763,15 @@ function PublicRoutingForm({
         </label>
       </div>
 
-      <div className="@container mt-6 border-t border-border pt-5">
-        <h4 className="mb-3 text-sm font-semibold">路由目标（{targets.length}）</h4>
+      <div className="@container mt-6 border-t border-line pt-5">
+        <h4 className="mb-3 text-body font-semibold">路由目标（{targets.length}）</h4>
         {targets.length === 0 && additions.length === 0 ? (
-          <p className="hint rounded-lg border border-dashed border-border px-4 py-6 text-center text-[13px]">
+          <p className="hint rounded-cell border border-dashed border-line px-4 py-6 text-center text-caption">
             还没有账号服务这个模型：请求会以「上游不可用」失败。{!readOnly && "用下面的「添加目标」加一个账号。"}
           </p>
         ) : (
-          <div className="overflow-hidden rounded-lg border border-border">
-            <div aria-hidden="true" className={cn(TARGET_ROW, "hidden border-b border-border bg-muted px-3 py-2 text-xs font-medium text-muted-foreground @3xl:grid")}>
+          <div className="overflow-hidden rounded-cell border border-line">
+            <div aria-hidden="true" className={cn(TARGET_ROW, "hidden border-b border-line bg-well px-3 py-2 text-caption font-medium text-ink-soft @3xl:grid")}>
               <span>账号</span>
               <span>上游模型名称</span>
               <span>优先级</span>
@@ -1789,7 +1797,7 @@ function PublicRoutingForm({
                     heading={
                       <>
                         <div className="truncate pt-2 font-medium @3xl:pt-1.5" title={accountName}>
-                          <span className="font-normal text-muted-foreground">账号：</span>
+                          <span className="font-normal text-muted">账号：</span>
                           {accountName}
                         </div>
                         <ServedGroups>{groupBadges(t.groups)}</ServedGroups>
@@ -1810,8 +1818,8 @@ function PublicRoutingForm({
                       // reloads the targets behind this form, and the step has to
                       // survive the re-render that causes.
                       removing === accountId && (
-                        <div className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-danger/30 bg-danger-soft px-3 py-2.5">
-                          <p role="alert" className="min-w-0 flex-1 basis-64 text-[13px]">
+                        <div className="flex flex-wrap items-center justify-between gap-3 rounded-cell border border-line bg-well px-3 py-2.5">
+                          <p role="alert" className="min-w-0 flex-1 basis-64 text-caption">
                             移除后，账号「{accountName}」不再为「{publicModel.name}」提供服务，它对该模型的映射也会删除。
                           </p>
                           <div className="flex gap-2">
@@ -1865,7 +1873,7 @@ function PublicRoutingForm({
                         </RowField>
                         {account && <ServedGroups className="mt-1.5">{groupBadges(account.doc.groups)}</ServedGroups>}
                         {disabledRows.has(a.accountId) && (
-                          <div className="sub mt-1 text-[12px]">该账号对这个模型的映射已停用，保存后重新启用。</div>
+                          <div className="sub mt-1 text-meta">该账号对这个模型的映射已停用，保存后重新启用。</div>
                         )}
                       </>
                     }
@@ -1895,7 +1903,7 @@ function PublicRoutingForm({
               添加目标
             </Button>
           )}
-          <p className="hint max-w-[52ch] text-[13px]">
+          <p className="hint max-w-[52ch] text-caption">
             优先级高的一组先用，这一组都不可用时才用下一组；同一组内按权重分配。上游模型名称留空即用公共模型的名称。
           </p>
         </div>
@@ -1990,14 +1998,14 @@ function TargetRow({
     .filter((m): m is string => typeof m === "string" && m !== "")
     .join("；");
   return (
-    <li className={cn(TARGET_ROW, "border-border p-3 not-last:border-b")} aria-label={label}>
+    <li className={cn(TARGET_ROW, "border-line p-3 not-last:border-b")} aria-label={label}>
       <div className="col-span-2 min-w-0 @md:col-start-1 @md:row-start-1 @3xl:col-span-1">
         {heading}
-        {written && <span className="tag mt-1.5 border-success/30 bg-success-soft text-success">已保存</span>}
+        {written && <span className="tag mt-1.5 border-line bg-well text-ink">已保存</span>}
       </div>
       <div className="col-span-2 min-w-0 @md:col-span-1 @md:col-start-1 @md:row-start-2 @3xl:col-start-2 @3xl:row-start-1">
         <div className="flex flex-col gap-1.5">
-          <span className="text-xs font-medium text-muted-foreground @3xl:hidden">上游模型名称</span>
+          <span className="text-caption font-medium text-muted @3xl:hidden">上游模型名称</span>
           <UpstreamModelPicker
             // Keyed by the account: a row that switches accounts is a
             // different model list, so nothing the first account answered
@@ -2045,7 +2053,7 @@ function TargetRow({
           />
         )}
       </RowField>
-      <div className="col-span-2 flex min-h-9 items-center justify-end @md:col-span-1 @md:col-start-3 @md:row-start-1 @3xl:col-start-5">
+      <div className="col-span-2 flex min-h-11 items-center justify-end @md:col-span-1 @md:col-start-3 @md:row-start-1 @3xl:col-start-5">
         {action}
       </div>
       {message !== "" && (

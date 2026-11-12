@@ -1,17 +1,4 @@
-/* The shared components' class hooks, the portal's copy, drawn as shadcn/ui
-   draws its own (Card, Badge, Alert, Table, Skeleton, Tooltip, Sonner,
-   Tabs): white cards on the light page, 1px borders, small radii, colour
-   only for state. The components themselves (Button, Field, Toast,
-   TwoStep, Lamp, EmptyState, DataTable, Icon) are byte-equal with the
-   Dashboard's, and so are their class names (CONTRACT.md beside them).
-
-   Imported into the `legacy` layer (index.css), so a Tailwind utility on an
-   element overrides anything here. Values come from theme/tokens.css.
-
-   Where the portal differs from the Dashboard's sheet: a card spaces its
-   children 16px apart by itself and nothing here carries an outer margin,
-   so a page lays its cards out with grid gaps; and the route nav (the
-   portal's own RouteNav) is drawn here too. */
+/* Bento 控件样式；交互状态保持 CONTRACT.md，值来自共享 tokens.css。 */
 
 /* ── Icons ──────────────────────────────────────────────────── */
 .icon {
@@ -70,10 +57,9 @@
   width: max-content;
   max-width: min(320px, 90vw);
   padding: 6px 10px;
-  border-radius: 6px;
+  border-radius: var(--r-chip);
   background: var(--tooltip-bg);
   color: var(--tooltip-text);
-  box-shadow: var(--shadow-float);
   font-size: 12px;
   font-weight: 400;
   line-height: 1.45;
@@ -141,6 +127,7 @@ fieldset.field > legend {
   display: inline-flex;
   align-items: center;
   gap: 8px;
+  min-height: 44px;
   line-height: 1.4;
   cursor: pointer;
 }
@@ -179,31 +166,9 @@ fieldset.field > legend {
 .lamp[data-lamp="rejected"] {
   --c: var(--lamp-rejected);
 }
+.lamp[data-lamp="rejected"]::before { border-radius: 2px; }
 .lamp[data-lamp="disabled"] {
   --c: var(--lamp-disabled);
-}
-.lamp[data-lamp="propagating"]::after {
-  content: "";
-  position: absolute;
-  left: 0;
-  top: 50%;
-  width: 8px;
-  height: 8px;
-  margin-top: -4px;
-  border-radius: 50%;
-  background: var(--c);
-  opacity: 0;
-  animation: ui-pulse 1.4s ease-out 1 both;
-}
-@keyframes ui-pulse {
-  from {
-    transform: scale(1);
-    opacity: 0.5;
-  }
-  to {
-    transform: scale(3);
-    opacity: 0;
-  }
 }
 
 /* A badge: shadcn's secondary Badge. */
@@ -252,7 +217,7 @@ fieldset.field > legend {
 
 /* ── Cards: shadcn's Card, its children 16px apart ───────────── */
 .panel {
-  --pad: 24px;
+  --pad: 28px;
   display: block;
   min-width: 0;
   margin: 0;
@@ -261,7 +226,6 @@ fieldset.field > legend {
   border-radius: var(--r-card);
   background: var(--card);
   color: var(--card-foreground);
-  box-shadow: var(--shadow-card);
 }
 .panel > * + * {
   margin-top: 16px;
@@ -272,11 +236,7 @@ fieldset.field > legend {
   --dt-edge: 12px;
   position: relative;
   overflow-x: auto;
-  background:
-    linear-gradient(to right, var(--card) 30%, transparent) left / 32px 100% no-repeat local,
-    linear-gradient(to left, var(--card) 30%, transparent) right / 32px 100% no-repeat local,
-    radial-gradient(farthest-side at 0 50%, var(--scroll-shadow), transparent) left / 10px 100% no-repeat scroll,
-    radial-gradient(farthest-side at 100% 50%, var(--scroll-shadow), transparent) right / 10px 100% no-repeat scroll;
+  background: var(--card);
 }
 .dt-wrap.dt-scroll {
   max-height: min(70vh, 720px);
@@ -292,19 +252,20 @@ fieldset.field > legend {
   position: sticky;
   top: 0;
   z-index: 1;
-  height: 40px;
+  height: var(--h-head);
   padding: 0 12px;
   border-bottom: 1px solid var(--border);
   background: var(--muted);
   color: var(--muted-foreground);
   font-size: 12px;
-  font-weight: 500;
+  font-family: var(--font-mono);
+  font-weight: 400;
   text-align: left;
   white-space: nowrap;
   vertical-align: middle;
 }
 .dt td {
-  height: 48px;
+  height: var(--h-row);
   padding: 6px 12px;
   border-bottom: 1px solid var(--border);
   vertical-align: middle;
@@ -338,7 +299,7 @@ fieldset.field > legend {
   font-variant-numeric: tabular-nums lining-nums;
 }
 .dt.dt-compact td {
-  height: 40px;
+  height: var(--h-row-compact);
   padding-top: 4px;
   padding-bottom: 4px;
 }
@@ -366,26 +327,26 @@ fieldset.field > legend {
 }
 .acts > select {
   width: auto;
-  height: 32px;
+  height: 44px;
   font-size: 13px;
 }
 /* A table straight inside a card (or inside a card's full-width part,
    `.bleed`) runs edge to edge, its outer cells padded to the card's own
    inset, and closes the card at the bottom. */
 :is(.panel, .bleed) > .dt-wrap {
-  --dt-edge: var(--pad, 24px);
-  margin-left: calc(-1 * var(--pad, 24px));
-  margin-right: calc(-1 * var(--pad, 24px));
+  --dt-edge: var(--pad, 28px);
+  margin-left: calc(-1 * var(--pad, 28px));
+  margin-right: calc(-1 * var(--pad, 28px));
   border-top: 1px solid var(--border);
 }
 .panel > .dt-wrap:last-child,
 .panel > .bleed:last-child > .dt-wrap:last-child {
-  margin-bottom: calc(-1 * var(--pad, 24px));
+  margin-bottom: calc(-1 * var(--pad, 28px));
   border-radius: 0 0 var(--r-card) var(--r-card);
 }
 /* A card that is its table: the header row is the card's top edge. */
 .panel > .dt-wrap:first-child {
-  margin-top: calc(-1 * var(--pad, 24px));
+  margin-top: calc(-1 * var(--pad, 28px));
   border-top: 0;
   border-radius: var(--r-card) var(--r-card) 0 0;
 }
@@ -455,10 +416,6 @@ fieldset.field > legend {
   align-items: center;
   gap: 6px;
 }
-.two-step.is-swapping {
-  overflow: clip;
-  overflow-clip-margin: 4px;
-}
 .two-step-warn {
   width: max-content;
   max-width: 44ch;
@@ -473,14 +430,6 @@ fieldset.field > legend {
 }
 .right .two-step-warn {
   text-align: right;
-}
-.is-in {
-  animation: ui-fade 120ms ease-out both;
-}
-@keyframes ui-fade {
-  from {
-    opacity: 0;
-  }
 }
 
 /* ── Toasts: shadcn's Sonner, bottom right ───────────────────── */
@@ -499,18 +448,17 @@ fieldset.field > legend {
   display: inline-flex;
   align-items: center;
   gap: 10px;
-  min-width: 200px;
-  max-width: 420px;
+  min-width: min(200px, 100%);
+  max-width: min(420px, 100%);
   padding: 12px 16px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--popover);
   color: var(--popover-foreground);
-  box-shadow: var(--shadow-float);
   font-size: 14px;
   font-weight: 500;
   line-height: 1.45;
-  animation: ui-toast-in 180ms ease-out both;
+  animation: none;
 }
 .toast::before {
   content: "";
@@ -524,185 +472,107 @@ fieldset.field > legend {
   opacity: 0;
   transition: opacity 200ms ease-in;
 }
-@keyframes ui-toast-in {
-  from {
-    opacity: 0;
-    transform: translateY(8px);
-  }
-}
 
-/* ── Route nav (RouteNav.tsx): a tablist with a lens on the open tab ──
-   The lens is drawn outside the tabs and glides between them, so each
-   tab's text is its label alone. Two looks:
-   - `.route-seg`, shadcn's Tabs: a muted track, the open tab a white
-     segment (the gate's 登录 / 注册组织);
-   - `.route-line` and `.docked`, Vercel's underline tabs: quiet text, a
-     wash on hover, and a 2px near-black rule under the open tab (a card's
-     tabs, and the portal's sections across the page). */
-.route {
-  position: relative;
-  display: flex;
-  max-width: 100%;
-  overflow-x: auto;
-  scrollbar-width: none;
-}
-.route::-webkit-scrollbar {
-  display: none;
-}
-.route > .lens {
-  position: absolute;
-  top: 0;
-  left: 0;
-  pointer-events: none;
-}
-.route > .lens[data-ready] {
-  transition:
-    transform 200ms cubic-bezier(0.2, 0.8, 0.2, 1),
-    width 200ms cubic-bezier(0.2, 0.8, 0.2, 1),
-    opacity 120ms ease;
-}
+/* 卡内 tabs 与登录 segmented；主导航由独立 route-topnav 布局负责。 */
+.route { position: relative; display: flex; max-width: 100%; overflow-x: auto; scrollbar-width: thin; }
+.route > .lens { position: absolute; top: 0; left: 0; pointer-events: none; }
 .route > button {
-  position: relative;
-  z-index: 1;
-  flex: none;
+  position: relative; z-index: 1; flex: none; display: flex; align-items: center; justify-content: center;
+  min-width: 44px; min-height: 44px; padding: 0 14px; border: 0; border-radius: var(--r-button);
+  background: none; color: var(--text-2); font-size: 14px; white-space: nowrap; cursor: pointer;
+  transition: color 120ms ease, background-color 120ms ease;
+}
+.route > button:hover { color: var(--foreground); background: var(--hover); }
+.route > [aria-selected="true"] { color: var(--foreground); font-weight: 500; }
+.route > button:focus-visible { outline-offset: -2px; }
+.route .stop { display: none; }
+.route .name { line-height: 1.4; }
+.route-seg { width: fit-content; min-height: 44px; padding: 3px; border-radius: var(--r-button); background: var(--well); }
+.route-seg > .lens { border-radius: var(--r-button); background: var(--card); }
+.route-seg > button { min-height: 38px; color: var(--ink-soft); }
+.route-line { gap: 4px; }
+.route-line > .lens::after { content: ""; position: absolute; left: 14px; right: 14px; bottom: 0; height: 2px; background: var(--foreground); }
+
+/* Bento 原语：编号不进入可访问名称，数字只负责呈现，不截断精确金额。 */
+main { counter-reset: bento-card; }
+.bento-grid { min-width: 0; }
+.bento-grid > * { min-width: 0; }
+.panel { counter-increment: bento-card; }
+.bento-card-index::before { content: counter(bento-card, decimal-leading-zero); }
+.bento-page-header {
   display: flex;
-  align-items: center;
-  justify-content: center;
-  min-width: 0;
-  padding: 0;
-  border: 0;
-  background: none;
-  color: var(--muted-foreground);
-  font-size: 14px;
-  font-weight: 500;
-  white-space: nowrap;
-  cursor: pointer;
-  transition: color 120ms ease;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 24px 32px;
+  margin-bottom: 40px;
 }
-.route > button:hover,
-.route > [aria-selected="true"] {
-  color: var(--foreground);
+.bento-page-header > :first-child { min-width: 0; flex: 1 1 620px; }
+.bento-page-header h1 { overflow-wrap: anywhere; }
+.bento-page-actions { max-width: 100%; }
+.bento-lead { max-width: 64ch; }
+.bento-lead strong { font-weight: 500; color: var(--foreground); }
+.bento-card { display: flex; flex-direction: column; gap: 24px; margin: 0; }
+.bento-stat, .bento-grid > .panel, .with-side > .panel { margin: 0; }
+.bento-card > * + * { margin-top: 0; }
+.bento-card > .bento-card-footer { margin-top: auto; }
+.bento-card-header { flex: none; }
+.bento-card-footer { min-width: 0; }
+.metric { max-width: 100%; font-weight: 400; overflow-wrap: anywhere; }
+.bento-metric-skeleton { width: 62%; height: 60px; }
+.bento-chart-skeleton { width: 100%; height: 192px; }
+.bento-card-message { min-width: 0; }
+/* inverse 的固定深底与橙文字不随主题交换，避免橙字落到浅底。 */
+.panel[data-tone="inverse"] {
+  --foreground: var(--bento-surface);
+  --card: var(--bento-ink);
+  --card-foreground: var(--bento-surface);
+  --surface: var(--bento-ink);
+  --surface-raised: var(--bento-ink);
+  --bg: var(--bento-ink);
+  --canvas: var(--bento-ink);
+  --paper: var(--bento-ink);
+  --ink: var(--bento-surface);
+  --popover: var(--bento-ink);
+  --popover-foreground: var(--bento-surface);
+  --secondary: var(--bento-ink);
+  --secondary-foreground: var(--bento-surface);
+  --muted: var(--bento-ink);
+  --accent: var(--bento-ink);
+  --accent-foreground: var(--bento-surface);
+  --well: var(--bento-ink);
+  --stone: var(--bento-graphite);
+  --graphite: var(--bento-inverse-muted);
+  --row-hover: var(--bento-ink);
+  --chip: var(--bento-ink);
+  --info: var(--bento-surface);
+  --success: var(--bento-surface);
+  --warning: var(--bento-surface);
+  --danger: var(--bento-surface);
+  --info-soft: var(--bento-ink);
+  --success-soft: var(--bento-ink);
+  --warning-soft: var(--bento-ink);
+  --danger-soft: var(--bento-ink);
+  --destructive: var(--bento-surface);
+  --destructive-foreground: var(--bento-ink);
+  --link: var(--bento-surface);
+  --error: var(--bento-surface);
+  --text: var(--bento-surface);
+  --text-muted: var(--bento-inverse-muted);
+  --text-2: var(--bento-inverse-muted);
+  --muted-foreground: var(--bento-inverse-muted);
+  --ink-soft: var(--bento-inverse-muted);
+  --primary: var(--bento-surface);
+  --primary-foreground: var(--bento-ink);
+  --input: var(--bento-inverse-muted);
+  --ring: var(--bento-surface);
+  --line: var(--bento-graphite);
+  --border: color-mix(in srgb, var(--bento-surface) 12%, transparent);
+  background: var(--bento-ink);
+  color: var(--bento-surface);
 }
-.route > button:focus-visible {
-  outline-offset: -2px;
-}
-.route .stop {
-  display: none;
-}
-.route .name {
-  max-width: 100%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  line-height: 1.4;
-}
-
-/* Segmented. */
-.route-seg {
-  width: fit-content;
-  padding: 3px;
-  border-radius: 10px;
-  background: var(--muted);
-  box-shadow: inset 0 0 0 1px var(--border);
-}
-.route-seg > .lens {
-  border-radius: 7px;
-  background: var(--card);
-  box-shadow:
-    0 0 0 1px var(--border),
-    var(--shadow-sm);
-}
-.route-seg > button {
-  height: 30px;
-  padding: 0 14px;
-  border-radius: 7px;
-}
-
-/* Underline. */
-.route-line,
-.route.docked {
-  gap: 4px;
-}
-.route-line > button,
-.route.docked > button {
-  height: 44px;
-}
-.route.docked > button {
-  height: 46px;
-}
-.route-line .name,
-.route.docked .name {
-  padding: 5px 10px;
-  border-radius: 6px;
-  transition: background-color 120ms ease;
-}
-.route-line > button:hover .name,
-.route.docked > button:hover .name {
-  background: var(--accent);
-}
-.route-line > [aria-selected="true"] .name,
-.route.docked > [aria-selected="true"] .name {
-  color: var(--foreground);
-  font-weight: 600;
-}
-.route-line > .lens::after,
-.route.docked > .lens::after {
-  content: "";
-  position: absolute;
-  left: 8px;
-  right: 8px;
-  bottom: 0;
-  height: 2px;
-  border-radius: 2px;
-  background: var(--primary);
-}
-
-/* On a phone the sections are a bar along the bottom edge: equal tabs, the
-   open one marked by the rule along the bar's top. */
 @media (max-width: 719px) {
-  .route.docked {
-    position: fixed;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    z-index: 40;
-    gap: 0;
-    width: auto;
-    max-width: none;
-    margin: 0;
-    padding: 0 4px env(safe-area-inset-bottom);
-    border-top: 1px solid var(--border);
-    background: var(--card);
-    box-shadow: 0 -4px 12px -8px rgba(0, 0, 0, 0.12);
-  }
-  .route.docked > button {
-    flex: 1 1 0;
-    height: 56px;
-    font-size: 13px;
-  }
-  .route.docked .name {
-    padding: 4px 2px;
-  }
-  .route.docked > button:hover .name {
-    background: none;
-  }
-  .route.docked > .lens::after {
-    top: 0;
-    bottom: auto;
-    left: 25%;
-    right: 25%;
-  }
-  .toasts {
-    right: 16px;
-    left: 16px;
-    align-items: stretch;
-  }
-  body:has(.route.docked) .toasts {
-    bottom: 76px;
-  }
-  .panel {
-    --pad: 16px;
-  }
-  .empty {
-    padding: 32px 16px;
-  }
+  .bento-page-header { gap: 20px; }
+  .bento-page-header h1 { font-size: var(--fs-44); }
+  .toasts { right: 16px; left: 16px; align-items: stretch; }
 }

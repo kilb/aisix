@@ -1,285 +1,281 @@
-/* The tenant portal's own page parts, on the design system (tokens and
-   element styles in theme/, components in ui/ui.css): the shell in the
-   manner of Vercel's project layout (a white header, the sections as
-   underline tabs across the page under it, the content fluid and wide on
-   the light page), the sign-in card, and the parts the pages' markup names
-   by class (readings, the balance readout, a secret shown once, the group
-   cards). Page layout itself is Tailwind classes in each page.
-
-   Imported into the `legacy` layer (index.css), so a utility on an element
-   overrides anything here. Light whatever the system setting; dark only
-   through the header's toggle. */
-
-/* Routio's mark: a rounded indigo tile holding a short yellow capsule, lit
-   from above so it reads as a solid rather than a shape. */
+/* 组织门户暖石外壳；共享控件与令牌由设计系统维护。
+   顶部文字导航在窄屏独立横滚，页面本身不横滚。 */
 .brand-mark {
   position: relative;
   flex: none;
   width: 30px;
   height: 30px;
-  border-radius: 10px;
-  background: linear-gradient(160deg, color-mix(in srgb, var(--mark-tile) 84%, white) 0%, var(--mark-tile) 62%);
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.32),
-    inset 0 -1px 2px rgba(0, 0, 0, 0.16),
-    0 4px 10px -4px color-mix(in srgb, var(--mark-tile) 60%, transparent);
+  border-radius: var(--radius-chip);
+  background: var(--foreground);
 }
 .brand-mark::after {
   content: "";
   position: absolute;
-  left: 7px;
-  right: 7px;
-  top: 12px;
-  height: 6px;
-  border-radius: 9999px;
-  background: var(--brand);
-  box-shadow: 0 0 8px rgba(255, 199, 44, 0.55);
+  top: 6px;
+  right: 6px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--bento-accent);
 }
-
-.boot {
-  min-height: 100vh;
-  display: grid;
-  place-content: center;
-  padding: 40px;
-  color: var(--muted-foreground);
-}
+.boot,
 .centered {
-  min-height: 100vh;
   display: grid;
+  min-height: 100vh;
   place-content: center;
   padding: 40px 16px;
+  color: var(--text-2);
 }
-.centered .note {
-  max-width: 560px;
-}
-.centered .note p {
-  margin-top: 4px;
-}
-.centered .note .btn {
-  margin-left: 8px;
-  vertical-align: middle;
-}
+.centered .note { max-width: 560px; }
+.centered .note p { margin-top: 8px; }
+.centered .note .btn { margin-left: 8px; vertical-align: middle; }
 
-/* ── The shell ──────────────────────────────────────────────── */
-/* One column, fluid up to 1760px, inside the page gutter. */
+/* 外侧留白不计入十二列，内容最大宽度与套件一致。 */
+.shell,
+.gate-page {
+  min-height: 100vh;
+  padding: 32px 40px 48px;
+  background: var(--background);
+  color: var(--foreground);
+}
 .topbar-in,
 .route-bar-in,
-.page {
+.page,
+.gate-topbar,
+.gate-layout {
   width: 100%;
-  max-width: 1760px;
-  margin: 0 auto;
-  padding-left: 32px;
-  padding-right: 32px;
+  max-width: 1440px;
+  min-width: 0;
+  margin-inline: auto;
 }
-
-/* The header: frosted rather than white, so the page's light shows through
-   it as the content scrolls under; its rule appears once the page has
-   scrolled (the section tabs carry the rule while they are in view). */
 .topbar {
   position: sticky;
   top: 0;
   z-index: 30;
-  background: color-mix(in srgb, var(--card) 78%, transparent);
-  box-shadow: 0 1px 0 transparent;
-  transition: box-shadow 120ms ease;
+  background: var(--background);
+  border-bottom: 1px solid transparent;
 }
-@supports (backdrop-filter: blur(1px)) {
-  .topbar {
-    backdrop-filter: saturate(1.6) blur(14px);
-  }
-}
-.topbar.is-scrolled {
-  box-shadow: 0 1px 0 var(--border);
-}
+.topbar.is-scrolled { border-bottom-color: var(--border); }
 .topbar-in {
-  display: flex;
+  display: grid;
+  grid-template-columns: auto minmax(72px, 140px) minmax(0, 1fr) auto;
   align-items: center;
-  gap: 12px;
-  height: 56px;
+  gap: 20px;
+  min-height: 44px;
 }
 .brand {
   display: inline-flex;
   flex: none;
   align-items: center;
-  gap: 10px;
+  gap: 12px;
   white-space: nowrap;
 }
 .brand-name {
-  font-size: 15px;
+  display: inline-flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: var(--text-brand);
   font-weight: 600;
-  letter-spacing: -0.01em;
+  letter-spacing: -0.02em;
+  line-height: 1.2;
 }
 .brand-name .app {
-  color: var(--muted-foreground);
-  font-weight: 500;
+  color: var(--text-2);
+  font-family: var(--font-mono);
+  font-size: var(--text-micro);
+  font-weight: 400;
+  letter-spacing: 0.06em;
 }
-/* Vercel's breadcrumb slash between the product and the organisation. */
-.slash {
-  flex: none;
-  width: 1px;
-  height: 20px;
-  margin: 0 6px;
-  background: var(--border);
-  transform: rotate(20deg);
+.tenant-context {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+.tenant-context-label {
+  color: var(--muted-foreground);
+  font-family: var(--font-mono);
+  font-size: var(--text-micro);
+  line-height: 1.35;
 }
 .org-name {
   min-width: 0;
-  max-width: 40ch;
   overflow: hidden;
-  font-size: 14px;
-  font-weight: 600;
-  letter-spacing: 0;
-  line-height: 1.4;
+  font-size: var(--text-caption);
+  font-weight: 500;
+  line-height: 1.45;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-/* The signed-in member: an initial, the name, then the role as a badge. */
-.me {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
-  margin-left: auto;
-  color: var(--text-2);
-  font-size: 13px;
+.tenant-navigation { min-width: 0; }
+.route.route-topnav { gap: 4px; width: 100%; padding: 4px; }
+.route-topnav > .lens { display: none; }
+.route-topnav > button {
+  min-width: 44px;
+  min-height: 44px;
+  padding-inline: 12px;
+  color: var(--muted-foreground);
+  font-size: var(--text-body);
+  font-weight: 400;
 }
+.route-topnav > button:hover,
+.route-topnav > button[aria-selected="true"] { color: var(--foreground); }
+.route-topnav > button[aria-selected="true"] { font-weight: 500; }
+.route-topnav > button:focus-visible { outline-offset: 2px; }
+.route-topnav .stop {
+  position: absolute;
+  bottom: 5px;
+  left: calc(50% - 2px);
+  display: block;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: transparent;
+}
+.route-topnav [aria-selected="true"] .stop { background: var(--bento-accent); }
+.member-tools,
+.me,
+.tools { display: flex; align-items: center; }
+.member-tools { justify-self: end; min-width: 0; gap: 12px; }
+.me { min-width: 0; gap: 8px; color: var(--text-2); font-size: var(--text-caption); }
 .avatar {
   display: grid;
   flex: none;
   place-items: center;
-  width: 24px;
-  height: 24px;
+  width: 32px;
+  height: 32px;
   border-radius: 50%;
-  background: var(--secondary);
-  box-shadow: inset 0 0 0 1px var(--border);
+  background: var(--well);
   color: var(--foreground);
-  font-size: 11px;
-  font-weight: 600;
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
+  font-weight: 500;
   text-transform: uppercase;
 }
-.avatar::before {
-  content: attr(data-initial);
-}
+.avatar::before { content: attr(data-initial); }
 .me-name {
   min-width: 0;
-  max-width: 24ch;
+  max-width: 9ch;
   overflow: hidden;
-  font-weight: 500;
+  font-weight: 400;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.tools {
+.tools { flex: none; gap: 4px; }
+.shell-note { padding-top: 24px; }
+.page { padding-top: 40px; }
+
+/* 认证页用十二列；左侧仅说明真实能力，不放模拟统计。 */
+.gate-page { display: flex; flex-direction: column; gap: 40px; }
+.gate-topbar {
   display: flex;
-  flex: none;
   align-items: center;
-  gap: 4px;
-  padding-left: 12px;
-  border-left: 1px solid var(--border);
+  justify-content: space-between;
+  gap: 24px;
 }
+.gate-layout {
+  display: grid;
+  grid-template-columns: repeat(12, minmax(0, 1fr));
+  align-items: start;
+  gap: 12px;
+  margin-block: auto;
+  padding-block: 40px;
+}
+.gate-introduction { grid-column: span 7; min-width: 0; padding: 28px 40px 28px 0; }
+.gate-eyebrow {
+  color: var(--muted-foreground);
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
+  letter-spacing: 0.06em;
+  line-height: 1.4;
+}
+.gate-introduction h1 {
+  margin-top: 24px;
+  font-size: var(--text-title);
+  font-weight: 500;
+  letter-spacing: -0.04em;
+  line-height: 1;
+}
+.gate-lead {
+  max-width: 30em;
+  margin-top: 24px;
+  color: var(--text-2);
+  font-size: var(--text-lead);
+  font-weight: 300;
+  line-height: 1.6;
+}
+.gate-guide { display: grid; gap: 24px; max-width: 32em; margin-top: 40px; }
+.gate-guide > div { display: grid; gap: 8px; padding-top: 16px; border-top: 1px solid var(--border); }
+.gate-guide dt { color: var(--foreground); font-size: var(--text-body); font-weight: 500; }
+.gate-guide dt > span {
+  margin-right: 8px;
+  color: var(--muted-foreground);
+  font-family: var(--font-mono);
+  font-size: var(--text-micro);
+  font-weight: 400;
+}
+.gate-guide dd { color: var(--text-2); font-size: var(--text-caption); line-height: 1.45; }
+.gate-panel {
+  display: flex;
+  grid-column: span 5;
+  min-width: 0;
+  flex-direction: column;
+  gap: 24px;
+}
+.gate-panel-heading { display: grid; gap: 12px; }
+.gate-panel-heading h2 { font-size: var(--text-value); font-weight: 400; letter-spacing: -0.04em; line-height: 1; }
+.gate-form { display: grid; gap: 20px; }
+.gate-form :is(input, button) { min-height: 44px; }
+.gate-modes.route { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); width: 100%; }
+.gate-modes.route > button { min-height: 44px; color: var(--text-2); }
+.gate-modes.route > [aria-selected="true"] { color: var(--foreground); }
+.gate-foot { color: var(--text-2); font-size: var(--text-caption); line-height: 1.6; }
 
-/* The sections: underline tabs across the page, the first label lined up
-   with the content's edge; the rule under the bar and the lens on the open
-   stop take the primary. */
-.route-bar {
-  border-bottom: 1px solid var(--border);
-  background: color-mix(in srgb, var(--card) 70%, transparent);
-}
-.route-bar .route.docked {
-  margin-left: -10px;
-}
-.shell-note {
-  padding-top: 16px;
-}
-
-.page {
-  padding-top: 32px;
-  padding-bottom: 48px;
-}
-
-@media (max-width: 1023px) {
-  .topbar-in,
-  .route-bar-in,
-  .page {
-    padding-left: 24px;
-    padding-right: 24px;
+/* 待审核组织没有导航，身份和工具仍占正确的首行位置。 */
+@media (min-width: 1100px) {
+  .topbar-in:not(:has(.tenant-navigation)) {
+    grid-template-columns: auto minmax(0, 1fr) auto;
   }
 }
 
-/* A phone: the header in two rows and in the page's flow, 16px gutters,
-   and room under the page for the section bar along the bottom edge. */
+/* desktop 以下导航独占整行，成员身份与组织上下文仍可见。 */
+@media (max-width: 1099px) {
+  .topbar-in { grid-template-columns: minmax(0, 1fr) auto; gap: 12px 24px; }
+  .brand { grid-column: 1; grid-row: 1; }
+  .tenant-context { grid-column: 1; grid-row: 2; flex-direction: row; align-items: baseline; gap: 8px; }
+  .member-tools { grid-column: 2; grid-row: 1 / span 2; flex-wrap: wrap; justify-content: flex-end; max-width: 100%; }
+  .tenant-navigation { grid-column: 1 / -1; grid-row: 3; }
+  .gate-layout { padding-block: 0; }
+  .gate-introduction,
+  .gate-panel { grid-column: span 12; }
+  .gate-introduction { padding: 0 0 28px; }
+  .gate-guide { grid-template-columns: repeat(3, minmax(0, 1fr)); max-width: none; gap: 24px; margin-top: 32px; }
+}
 @media (max-width: 719px) {
-  .topbar-in,
-  .route-bar-in,
-  .page {
-    padding-left: 16px;
-    padding-right: 16px;
-  }
-  .topbar {
-    position: static;
-    background: var(--card);
-    box-shadow: 0 1px 0 var(--border);
-  }
-  .topbar-in {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
-    grid-template-areas:
-      "brand tools"
-      "org me";
-    gap: 6px 12px;
-    height: auto;
-    padding-top: 10px;
-    padding-bottom: 12px;
-  }
-  .brand {
-    grid-area: brand;
-  }
-  .slash {
-    display: none;
-  }
-  .tools {
-    grid-area: tools;
-    padding-left: 0;
-    border-left: 0;
-    margin-right: -6px;
-  }
-  .org-name {
-    grid-area: org;
-    max-width: none;
-  }
-  .me {
-    grid-area: me;
-    justify-self: end;
-    margin-left: 0;
-  }
-  .me-name {
-    max-width: 12ch;
-  }
-  .avatar {
-    display: none;
-  }
-  .route-bar {
-    border-bottom: 0;
-  }
-  .route-bar .route.docked {
-    margin-left: 0;
-  }
-  .page {
-    padding-top: 20px;
-    /* Room for the section bar fixed along the bottom edge. */
-    padding-bottom: calc(96px + env(safe-area-inset-bottom));
-  }
+  .shell,
+  .gate-page { padding: 20px 16px 32px; }
+  .topbar-in { gap: 12px; }
+  .tenant-context { grid-column: 1 / -1; grid-row: 3; }
+  .member-tools { grid-row: 1; gap: 8px; }
+  .me { gap: 6px; }
+  .me-name { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  .tools { gap: 0; }
+  .tools .btn { padding-inline: 8px; }
+  .tenant-navigation { grid-row: 4; }
+  .gate-guide { display: none; }
+  .gate-topbar { gap: 12px; }
 }
 
-/* ── Readings: a label over its figure ─────────────────────────── */
+/* 业务读数：标签在上，数值保持轻字重。 */
 .entry .lab {
   color: var(--muted-foreground);
-  font-size: 13px;
+  font-size: var(--text-caption);
   font-weight: 500;
 }
 .entry .val {
   min-width: 0;
   overflow: hidden;
-  font-weight: 600;
+  font-weight: 400;
   font-variant-numeric: tabular-nums;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -318,30 +314,31 @@
 }
 .warn-inline {
   max-width: 16em;
-  font-size: 12px;
+  font-size: var(--text-meta);
   line-height: 1.4;
   white-space: normal;
   text-align: right;
 }
 
 /* ── A secret shown once ───────────────────────────────────────── */
-/* The one time this secret is shown: an amber card, the value in mono. */
+/* 只显示一次的秘密采用中性凹面，文字保留提示强度。 */
 .secret {
   display: flex;
   flex-direction: column;
   gap: 10px;
   padding: 16px;
-  border: 1px solid color-mix(in srgb, var(--warning) 35%, transparent);
+  border: 1px solid var(--border);
   border-radius: var(--radius);
-  background: var(--warning-soft);
+  background: var(--well);
+  color: var(--text-2);
 }
 .secret > strong {
-  font-weight: 600;
+  font-weight: 400;
   line-height: 1.4;
 }
 .secret input {
   font-family: var(--font-mono);
-  font-size: 13px;
+  font-size: var(--text-caption);
   background-color: var(--card);
 }
 .secret .hint {
@@ -358,8 +355,8 @@
 /* What can still be spent, large, then one tile per level that limits a
    request; the level that binds is outlined in near-black and marked. */
 .readout-amt {
-  font-size: 40px;
-  font-weight: 600;
+  font-size: var(--text-value);
+  font-weight: 400;
   letter-spacing: -0.035em;
   line-height: 1.1;
   font-variant-numeric: tabular-nums lining-nums;
@@ -367,7 +364,7 @@
 }
 .readout-amt .cur {
   margin-right: 2px;
-  font-size: 24px;
+  font-size: var(--text-stat);
   font-weight: 500;
   letter-spacing: 0;
 }
@@ -396,7 +393,7 @@
   gap: 8px;
   min-height: 20px;
   color: var(--muted-foreground);
-  font-size: 13px;
+  font-size: var(--text-caption);
   font-weight: 500;
   line-height: 1.4;
   white-space: nowrap;
@@ -407,8 +404,8 @@
 .levels .m {
   overflow: hidden;
   color: var(--text-2);
-  font-size: 18px;
-  font-weight: 600;
+  font-size: var(--text-stat);
+  font-weight: 400;
   letter-spacing: -0.015em;
   line-height: 1.3;
   text-overflow: ellipsis;
@@ -416,16 +413,17 @@
   font-variant-numeric: tabular-nums;
 }
 .levels .m .cur {
-  font-size: 14px;
+  font-size: var(--text-body);
 }
 .levels .k {
   color: var(--muted-foreground);
-  font-size: 12px;
+  font-size: var(--text-meta);
   line-height: 1.45;
 }
 .levels .bind {
   border-color: var(--foreground);
-  box-shadow: 0 0 0 1px var(--foreground);
+  outline: 1px solid var(--foreground);
+  outline-offset: -1px;
 }
 .levels .bind .lv,
 .levels .bind .m {
@@ -440,7 +438,7 @@
   border-radius: 9999px;
   background: var(--primary);
   color: var(--primary-foreground);
-  font-size: 12px;
+  font-size: var(--text-meta);
   font-weight: 500;
   line-height: 1;
 }
@@ -457,6 +455,7 @@
   gap: 8px;
 }
 .picks-cards .pick {
+  min-height: 44px;
   align-items: flex-start;
   padding: 12px;
   border: 1px solid var(--border);
@@ -470,7 +469,8 @@
 }
 .picks-cards .pick:has(input:checked) {
   border-color: var(--foreground);
-  box-shadow: inset 0 0 0 1px var(--foreground);
+  outline: 1px solid var(--foreground);
+  outline-offset: -1px;
 }
 .picks-cards .pick input {
   margin-top: 2px;
@@ -485,9 +485,9 @@
 /* A phone: the readout's figure a step smaller. */
 @media (max-width: 719px) {
   .readout-amt {
-    font-size: 30px;
+    font-size: var(--text-value);
   }
   .readout-amt .cur {
-    font-size: 18px;
+    font-size: var(--text-stat);
   }
 }

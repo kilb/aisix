@@ -19,6 +19,7 @@ import { EmptyState } from "../ui/EmptyState";
 import { GroupPicker, groupChoices, useLoad, type GroupChoice } from "./Tenants";
 import { ChannelModels } from "./providers/ChannelModels";
 import { GroupBadges } from "./providers/GroupBadges";
+import { InventorySummary, countGroups } from "./providers/OperationsBento";
 
 /** The fields of a `provider_key` this page edits; every other field is kept as stored. */
 interface ProviderKeyDoc {
@@ -52,7 +53,7 @@ const GROUPS_HINT = "分组名只有运维可见；普通租户只能用到其�
 
 /** A form card's closing bar: its buttons at the bottom right, on a muted strip the card's width. */
 const FORM_FOOTER =
-  "-mx-6 -mb-6 mt-6 flex max-w-none flex-wrap items-center justify-end gap-2 rounded-b-[calc(var(--radius)+3px)] border-t border-border bg-muted/40 px-6 py-3";
+  "-mx-7 -mb-7 mt-6 flex max-w-none flex-wrap items-center justify-end gap-2 rounded-b-card border-t border-line bg-well px-7 py-3 [&_.hint]:text-ink-soft";
 
 /** How a referrer's kind is named on this page. */
 const KIND_LABEL: Record<string, string> = { models: "模型" };
@@ -166,17 +167,18 @@ export function Providers({ canEdit }: TabProps) {
   const newChoices = groupChoices(groups.data, open?.mode === "new" ? open.groups : []);
   const editChoices = groupChoices(groups.data, editing?.doc.groups ?? []);
 
-  // From 1280px the open form sits beside the list, which then leaves out
-  // the columns it has no room for and scrolls in its own box, so the
-  // account's 模型 section below it stays within reach.
+  // 编辑表单旁保留完整账号列，表格在自己的卡片中滚动。
   const split = open?.mode === "new" || editing !== undefined;
-  const roomy = split ? "xl:max-[1759px]:hidden" : undefined;
+
+  const assignedGroups = new Set(pk.items?.flatMap((a) => a.doc.groups ?? []) ?? []);
+  const ungrouped = pk.items?.filter((a) => (a.doc.groups?.length ?? 0) === 0).length ?? 0;
 
   return (
     <>
       <PageHeader
+        eyebrow="PROVIDERS · 上游连接"
         title="上游账号"
-        description={<>网关调用上游供应商所用的账号。密钥保存后不再显示。{GROUPS_HINT}。</>}
+        dataLead={pk.items ? <>已配置 {pk.items.length} 个上游账号，覆盖 {assignedGroups.size} 个分组。账号的协议、模型映射和密钥在此维护。</> : "维护上游连接、协议族、分组与模型映射。"}
         actions={
           <>
             <Button type="button" onClick={() => void pk.reload()}>
@@ -192,6 +194,24 @@ export function Providers({ canEdit }: TabProps) {
           </>
         }
       />
+      <InventorySummary
+        title="上游账号 · 当前配置"
+        total={pk.items?.length ?? null}
+        totalLabel="已配置账号"
+        breakdown={countGroups(pk.items?.map((a) => a.doc.adapter || "未声明协议族") ?? [])}
+        breakdownLabel="按已保存的协议族统计账号"
+        secondaryTitle="账号覆盖的分组"
+        secondaryValue={pk.items ? assignedGroups.size : null}
+        secondaryFoot="按账号中保存的分组名去重；分组只对运维可见。"
+        error={pk.error !== null}
+        secondaryError={pk.error !== null}
+        onRetry={() => void pk.reload()}
+      >
+        <dl className="ops-facts">
+          <div><dt>已分配分组的账号</dt><dd>{pk.items ? pk.items.length - ungrouped : "—"}</dd></div>
+          <div><dt>未分配分组的账号</dt><dd>{pk.items ? ungrouped : "—"}</dd></div>
+        </dl>
+      </InventorySummary>
       <div className="mb-6 grid gap-3 empty:hidden [&>.note]:m-0">
         <Msg note={note} />
         {deleteFailure &&
@@ -231,12 +251,10 @@ export function Providers({ canEdit }: TabProps) {
         )}
       </div>
 
-      {/* In reading order the form comes first, then the account's models,
-          then the list; from 1280px the list takes the left column, the
-          form the right, and the models the full width under both. */}
-      <div className={cn("grid items-start gap-6", split && "xl:grid-cols-[minmax(0,1fr)_minmax(24rem,28rem)]")}>
+      {/* 编辑表单先于列表朗读，账号模型映射在两者下方铺满一行。 */}
+      <div className={cn("ops-editor-grid", split && "ops-editor-open")}>
         {open?.mode === "new" && (
-          <div className="min-w-0 xl:col-start-2 xl:row-start-1">
+          <div className="ops-editor">
             <AccountForm
               key="new"
               account={null}
@@ -255,7 +273,7 @@ export function Providers({ canEdit }: TabProps) {
           </div>
         )}
         {editing && (
-          <div className="min-w-0 xl:col-start-2 xl:row-start-1">
+          <div className="ops-editor">
             {/* Keyed by version: a reload that finds a newer version starts the edit over. */}
             <AccountForm
               key={`${editing.id}:${editing.version}`}
@@ -274,38 +292,26 @@ export function Providers({ canEdit }: TabProps) {
             />
           </div>
         )}
-        {editing && (
-          // A sibling of the form, not inside it: its own buttons must not submit
-          // the account, and its save writes channel rows, not the account's document.
-          <div className="min-w-0 xl:col-span-2 xl:row-start-2">
-            <ChannelModels
-              key={`models:${editing.id}`}
-              accountId={editing.id}
-              accountName={nameOf(editing)}
-              groups={editing.doc.groups ?? []}
-              canEdit={canEdit}
-            />
-          </div>
-        )}
-
-        <Card className="mb-0 min-w-0 xl:col-start-1 xl:row-start-1">
+        <Card className="ops-list mb-0">
           <CardHeader
+            number={split ? 4 : 3}
             title="全部账号"
+            description={<>网关调用上游供应商所用的账号。密钥保存后不再显示。{GROUPS_HINT}。</>}
             className="mb-0"
-            actions={pk.items && <span className="text-[13px] text-muted-foreground tabular-nums">{pk.items.length} 个</span>}
+            actions={pk.items && <span className="text-caption text-muted tabular-nums">{pk.items.length} 个</span>}
           />
           {pk.items === null ? (
             !pk.error && <Loading />
           ) : pk.items.length === 0 ? (
             <EmptyState text="还没有上游账号。" />
           ) : (
-            <DataTable scroll={split}>
+            <DataTable label="上游账号" scroll={split}>
               <thead>
                 <tr>
                   <th>名称</th>
-                  <th className={roomy}>协议族</th>
-                  <th className={roomy}>供应商标识</th>
-                  <th className={roomy}>接口地址</th>
+                  <th>协议族</th>
+                  <th>供应商标识</th>
+                  <th>接口地址</th>
                   <th>分组</th>
                   <th>状态</th>
                   <th className="right">操作</th>
@@ -313,17 +319,17 @@ export function Providers({ canEdit }: TabProps) {
               </thead>
               <tbody>
                 {pk.items.map((a) => (
-                  <tr key={a.id} className={editing?.id === a.id ? "bg-accent" : undefined}>
+                  <tr key={a.id} className={editing?.id === a.id ? "bg-well" : undefined}>
                     <td className="font-medium">
                       <span className={cn("block truncate", split ? "max-w-[12rem]" : "max-w-[18rem]")} title={nameOf(a)}>
                         {nameOf(a)}
                       </span>
                     </td>
-                    <td className={cn("font-mono text-[13px] text-text-2", roomy)}>{a.doc.adapter ?? "—"}</td>
-                    <td className={cn("font-mono text-[13px] text-text-2", roomy)}>{a.doc.provider || "—"}</td>
-                    <td className={roomy}>
+                    <td className="font-mono text-caption text-ink-soft">{a.doc.adapter ?? "—"}</td>
+                    <td className="font-mono text-caption text-ink-soft">{a.doc.provider || "—"}</td>
+                    <td>
                       {a.doc.api_base ? (
-                        <code className="block max-w-[18rem] truncate text-[13px] text-text-2" title={maskUrl(a.doc.api_base)}>
+                        <code className="block max-w-[18rem] truncate text-caption text-ink-soft" title={maskUrl(a.doc.api_base)}>
                           {maskUrl(a.doc.api_base)}
                         </code>
                       ) : (
@@ -382,6 +388,18 @@ export function Providers({ canEdit }: TabProps) {
             </DataTable>
           )}
         </Card>
+        {editing && (
+          // 模型映射独立于账号表单，操作按钮不会提交账号文档。
+          <div className="ops-channel-models">
+            <ChannelModels
+              key={`models:${editing.id}`}
+              accountId={editing.id}
+              accountName={nameOf(editing)}
+              groups={editing.doc.groups ?? []}
+              canEdit={canEdit}
+            />
+          </div>
+        )}
       </div>
     </>
   );
@@ -612,7 +630,7 @@ function AccountForm({
 
   return (
     <form ref={form} className="panel @container mb-0" aria-label={title} onSubmit={submit}>
-      <CardHeader title={title} className="mb-5" />
+      <CardHeader number={3} title={title} className="mb-5" />
       {/* Two columns in the aside beside the list; four where the form has the page's width. */}
       <div className="grid gap-x-4 @sm:grid-cols-2 @3xl:grid-cols-4">
         <Field label="名称" error={at("name")}>
@@ -653,7 +671,7 @@ function AccountForm({
             {(aria) => (
               <input
                 disabled={locked}
-                className="font-mono text-[13px]"
+                className="font-mono text-caption"
                 placeholder="https://…"
                 value={apiBase}
                 onChange={(e) => setApiBase(e.target.value)}
@@ -674,9 +692,9 @@ function AccountForm({
           />
         </div>
       </div>
-      <fieldset className="tn-section mt-2 border-t border-border pt-5 [&_.tn-groups]:grid-cols-[repeat(auto-fill,minmax(13rem,1fr))] [&_.tn-groups]:gap-x-6">
-        <legend className="text-sm font-semibold">分组</legend>
-        <p className="hint text-[13px]">{GROUPS_HINT}；只能从已有的分组里选。</p>
+      <fieldset className="tn-section mt-2 border-t border-line pt-5 [&_.tn-groups]:grid-cols-[repeat(auto-fill,minmax(13rem,1fr))] [&_.tn-groups]:gap-x-6">
+        <legend className="text-body font-semibold">分组</legend>
+        <p className="hint text-caption">{GROUPS_HINT}；只能从已有的分组里选。</p>
         {groupsError && (
           <div className="note crit" role="alert">
             分组读取失败：{groupsError}

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ComponentType, type ReactNode } from "react";
+import { createContext, useContext, useEffect, useRef, useState, type ComponentType, type ReactNode } from "react";
 import type { TabProps } from "../../App";
 import { Msg, type Note } from "../../components/Msg";
 import {
@@ -25,6 +25,9 @@ import { refusal, useLoad } from "../Tenants";
 import { FailModeNote } from "../../components/FailModeNote";
 import { CreditForm } from "./CreditForm";
 import { OrgQuota } from "./OrgQuota";
+import { CardHeader } from "../../components/page";
+import { BudgetProgress } from "../../components/charts";
+import { exactRatio, formatCount } from "../../lib/chartFormat";
 
 /** What every region of the panel is given. */
 export interface RegionProps {
@@ -44,11 +47,15 @@ export interface RegionProps {
 
 export const MONEY_HINT = "请输入金额，最多两位小数";
 
+// 每个账户详情独立编号；区域本身不改变子表单的生命周期或写入锁。
+const RegionNumber = createContext<number | undefined>(undefined);
+
 /** A region of the panel under its own heading, a `region` named by it. */
 export function Region({ label, children }: { label: string; children: ReactNode }) {
+  const number = useContext(RegionNumber);
   return (
     <section className="bl-region" role="region" aria-label={label}>
-      <h3>{label}</h3>
+      <CardHeader as="h3" number={number} title={label} />
       {children}
     </section>
   );
@@ -95,7 +102,7 @@ function BalanceCard({ account }: RegionProps) {
         )}
         <div>
           <dt>待审批充值</dt>
-          <dd className="tabular">{account.pending_topups}</dd>
+          <dd className="tabular">{formatCount(account.pending_topups)}</dd>
         </div>
       </dl>
     </Region>
@@ -225,7 +232,7 @@ function BillingMode({ account, canEdit, onChanged }: RegionProps) {
             <dt>计费方式</dt>
             <dd className="font-medium">{MODE_LABEL[account.billing_mode] ?? account.billing_mode}</dd>
           </dl>
-          <p className="hint mt-1 text-[13px]">
+          <p className="hint mt-1 text-caption">
             {account.is_internal
               ? "平台内部租户不受余额与信用额度限制，计费方式不影响它是否被停止。"
               : "预付 = 余额 + 信用额度；后付 = 同上，月底结算。"}
@@ -466,7 +473,7 @@ function Summary<T>({
         </Field>
         {days.fields}
       </div>
-      <p className="hint text-[13px]">未选日期时，按天汇总最近 30 天，按月汇总最近 12 个月（UTC）。</p>
+      <p className="hint text-caption">未选日期时，按天汇总最近 30 天，按月汇总最近 12 个月（UTC）。</p>
       {rows.error ? (
         <Failed message={rows.error} onRetry={() => void rows.reload()} />
       ) : rows.data === null ? (
@@ -558,13 +565,13 @@ function UsageSummary({ account }: RegionProps) {
               <tr key={`${r.period_start}/${r.model.id ?? r.model.name}`}>
                 <td className="tabular">{periodLabel(r.period_start, group)}</td>
                 <td>{usageModel(r.model)}</td>
-                <td className="num">{r.requests}</td>
+                <td className="num">{formatCount(r.requests)}</td>
                 <td className="num">{fmtMicroCny(r.charged_micro_cny)}</td>
                 <td>
                   {r.quantities === null
                     ? "明细不可知"
                     : Object.entries(r.quantities)
-                        .map(([dimension, n]) => `${DIMENSION_LABEL[dimension] ?? dimension} ${n}`)
+                        .map(([dimension, n]) => `${DIMENSION_LABEL[dimension] ?? dimension} ${formatCount(n)}`)
                         .join("，")}
                 </td>
               </tr>
@@ -631,7 +638,14 @@ function Quotas({ account, quotaRev }: RegionProps) {
                 <td>{b.kind === "cumulative" ? "一次性额度" : "按周期"}</td>
                 <td>{budgetPeriod(b)}</td>
                 <td className="num">{fmtMicroCny(b.limit_micro_cny)}</td>
-                <td className="num">{fmtMicroCny(b.spent_micro_cny)}</td>
+                <td className="num">
+                  {fmtMicroCny(b.spent_micro_cny)}
+                  <BudgetProgress
+                    value={exactRatio(b.spent_micro_cny, b.limit_micro_cny)}
+                    accessibleLabel={`${SCOPE_LABEL[b.scope] ?? b.scope}额度 ${b.target.label}：已用 ${fmtMicroCny(b.spent_micro_cny)}，限额 ${fmtMicroCny(b.limit_micro_cny)}`}
+                    className="mt-2 min-w-24"
+                  />
+                </td>
                 <td className="num">{fmtMicroCny(b.remaining_micro_cny)}</td>
                 <td>
                   <span data-state={b.exhausted ? "exhausted" : "ok"}>
@@ -706,23 +720,24 @@ export function AccountPanel({
   }, [tenantId]);
   return (
     <SidePanel
-      title={account.tenant_name}
+      title={<><span aria-hidden="true" className="mr-3 font-mono text-meta font-normal text-muted">04</span><span title={account.tenant_name}>{account.tenant_name}</span></>}
       label={`租户计费：${account.tenant_name}`}
       extra={account.is_internal ? <span className="tag">平台内部</span> : undefined}
       onClose={onClose}
     >
       <Msg note={note} />
-      {PANEL_REGIONS.map(({ id, Component }) => (
-        <Component
-          key={`${tenantId}/${id}`}
-          account={account}
-          canEdit={canEdit}
-          isAdmin={isAdmin}
-          onChanged={onChanged}
-          onGoto={onGoto}
-          quotaRev={quotaRev}
-          onQuotasChanged={() => setQuotaRev((n) => n + 1)}
-        />
+      {PANEL_REGIONS.map(({ id, Component }, index) => (
+        <RegionNumber.Provider key={`${tenantId}/${id}`} value={index + 1 - (!isAdmin && index > 8 ? 1 : 0)}>
+          <Component
+            account={account}
+            canEdit={canEdit}
+            isAdmin={isAdmin}
+            onChanged={onChanged}
+            onGoto={onGoto}
+            quotaRev={quotaRev}
+            onQuotasChanged={() => setQuotaRev((n) => n + 1)}
+          />
+        </RegionNumber.Provider>
       ))}
     </SidePanel>
   );

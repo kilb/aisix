@@ -52,8 +52,8 @@ export function ChangePassword({ onClose }: { onClose: () => void }) {
 
   if (done) {
     return (
-      <div className="panel mb-6 flex flex-wrap items-center justify-between gap-3">
-        <div className="note ok m-0 min-w-0 flex-1" role="status">
+      <div className="panel mb-3 flex flex-wrap items-center justify-between gap-3">
+        <div className="note ok m-0 min-w-0 flex-1 text-body" role="status">
           口令已修改，此账号在其他浏览器或设备上的会话已全部退出。
         </div>
         <Button type="button" onClick={onClose}>
@@ -64,11 +64,11 @@ export function ChangePassword({ onClose }: { onClose: () => void }) {
   }
 
   return (
-    <form ref={form} className="panel mb-6 max-w-none" aria-label="修改口令" onSubmit={(e) => void submit(e)}>
-      <div className="grid max-w-none gap-x-10 gap-y-4 lg:grid-cols-[minmax(220px,1fr)_minmax(0,3fr)]">
+    <form ref={form} className="panel mb-3 max-w-none" aria-label="修改口令" onSubmit={(e) => void submit(e)}>
+      <div className="grid max-w-none gap-x-7 gap-y-4 lg:grid-cols-[minmax(220px,1fr)_minmax(0,3fr)]">
         <div className="min-w-0">
-          <h2 className="text-base font-semibold tracking-tight">修改口令</h2>
-          <p className="hint mt-1 text-[13px] leading-relaxed">修改后，此账号在其他浏览器或设备上的会话都会退出，当前会话保留。</p>
+          <h2 className="font-mono text-meta font-medium tracking-wide text-ink">修改口令</h2>
+          <p className="hint mt-2 text-caption leading-relaxed text-ink-soft">修改后，此账号在其他浏览器或设备上的会话都会退出，当前会话保留。</p>
         </div>
         <div className="min-w-0">
           <div className="grid gap-x-4 md:grid-cols-3">
@@ -124,13 +124,13 @@ export function ChangePassword({ onClose }: { onClose: () => void }) {
             </div>
           </div>
           {failure && (
-            <div className="note crit mt-0" role="alert">
+            <div className="note crit mt-0 text-body" role="alert">
               {failure}
             </div>
           )}
         </div>
       </div>
-      <div className="-mx-6 -mb-6 mt-2 flex max-w-none justify-end gap-2 rounded-b-xl border-t border-border bg-muted/40 px-6 py-3">
+      <div className="-mx-7 -mb-7 mt-4 flex max-w-none flex-wrap justify-end gap-2 rounded-b-3xl border-t border-line bg-well px-7 py-3 text-ink-soft">
         <Button type="button" onClick={onClose}>
           取消
         </Button>

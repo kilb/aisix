@@ -1,0 +1,71 @@
+/* 仅用于连接与配置页，公共卡片的几何由设计系统负责。 */
+.ops-summary {
+  margin-bottom: 40px;
+}
+
+.ops-summary > section {
+  min-width: 0;
+}
+
+.ops-metric-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 14px 24px;
+}
+
+.ops-facts {
+  display: grid;
+  gap: 0;
+}
+
+.ops-facts > div {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px 24px;
+  padding: 14px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.ops-facts dt {
+  color: var(--muted-foreground);
+  font-size: var(--fs-13);
+}
+
+.ops-facts dd {
+  margin: 0;
+  font-size: var(--fs-16);
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+}
+
+.ops-editor-grid {
+  display: grid;
+  grid-template-columns: repeat(12, minmax(0, 1fr));
+  align-items: start;
+  gap: 12px;
+}
+
+.ops-editor-grid > * {
+  min-width: 0;
+  grid-column: 1 / -1;
+}
+
+@media (min-width: 1100px) {
+  .ops-editor-grid.ops-editor-open > .ops-list {
+    grid-column: 8 / span 5;
+    grid-row: 1;
+  }
+
+  .ops-editor-grid.ops-editor-open > .ops-editor {
+    grid-column: 1 / span 7;
+    grid-row: 1;
+  }
+
+  .ops-editor-grid > .ops-channel-models {
+    grid-column: 1 / -1;
+    grid-row: 2;
+  }
+}

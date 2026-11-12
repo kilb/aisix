@@ -10,8 +10,9 @@ import { usdRateText } from "../../lib/rateUnits";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
 import { EmptyState } from "../../ui/EmptyState";
-import { Card, PageHeader } from "../../components/page";
-import { CardFooter } from "../pricing/kit";
+import { BentoGrid, Card, CardFooter, CardHeader, PageHeader, span } from "../../components/page";
+import { formatCount } from "../../lib/chartFormat";
+import { cn } from "../../lib/cn";
 
 const STATUSES: [string, string][] = [
   ["charged", "已计价"],
@@ -22,6 +23,7 @@ const STATUSES: [string, string][] = [
 
 const statusLabel = (s: string) => STATUSES.find(([v]) => v === s)?.[1] ?? s;
 
+// 桌面/平板：12 列完整记录表，窄屏在卡片内横向滚动。
 /**
  * 计费明细 (under 计费): every charge with its pricing reason, the upstream
  * account and model that served it and its usage, filterable and paged. A
@@ -117,6 +119,8 @@ export function Charges(_props: TabProps) {
     <>
       <PageHeader
         title="计费明细"
+        eyebrow="计费 / 调用记录"
+        dataLead="失败但已产生用量的调用，仍按实际用量计费；没有用量的调用不收费。"
         description={
           <>
             每一次调用的计价结果，最新的在前。售价和成本都以人民币计：成本是这次调用按上游账号的成本换算率算出的平台成本，未知时显示 —。
@@ -129,7 +133,17 @@ export function Charges(_props: TabProps) {
           </Button>
         }
       />
-      <Card className="mb-0">
+      <BentoGrid>
+      <Card className={span.d12}>
+        <CardHeader
+          number={1}
+          title="调用计费记录"
+          description={<>
+            {rows === null ? (error ? "当前筛选结果读取失败，请重试。" : "正在读取当前筛选结果。") : `当前筛选已加载 ${formatCount(rows.length)} 条${next === null ? "，已到记录末尾。" : "，可继续加载。"}`}
+            每一次调用的计价结果，最新的在前。售价和成本都以人民币计：成本是这次调用按上游账号的成本换算率算出的平台成本，未知时显示 —。
+            未计价的行写明原因；无需计费的行写明调用怎样结束（上游失败、没有可用的上游、调用方中断、网关出错、请求被拒绝或没有用量），这些行不收费。
+          </>}
+        />
         <form
           className="flex flex-wrap items-center gap-x-4 gap-y-3"
           onSubmit={(e) => {
@@ -189,7 +203,7 @@ export function Charges(_props: TabProps) {
             <label className="f filter min-w-0 flex-1">
               <span>事件</span>
               <input
-                className="h-8 min-w-0 text-[13px] md:w-56"
+                className="h-11 min-w-0 text-caption md:w-56"
                 value={eventDraft}
                 onChange={(e) => setEventDraft(e.target.value)}
                 placeholder="事件编号"
@@ -201,7 +215,7 @@ export function Charges(_props: TabProps) {
           </div>
         </form>
         {linked.length > 0 && (
-          <div className="mt-3 flex flex-wrap items-center gap-3 rounded-xl border border-border bg-muted/50 px-3 py-2" role="status">
+          <div className="mt-3 flex flex-wrap items-center gap-3 rounded-cell border border-border bg-well/50 px-3 py-2" role="status">
             <span className="hint">只看 {linked.join("，")}（不限分组/档位与时间，也含已通过重计价更正的调用，条数可能与计价状态的次数不同）</span>
             <Button type="button" size="sm" className="ml-auto" onClick={() => set({ error_code: undefined, model_id: undefined })}>
               清除
@@ -251,7 +265,7 @@ export function Charges(_props: TabProps) {
                       <td>
                         <Upstream c={c} />
                       </td>
-                      <td className="tabular text-[13px]">{usageSummary(c.usage) ?? "—"}</td>
+                      <td className="tabular text-caption">{usageSummary(c.usage) ?? "—"}</td>
                       <td className="right">
                         <Button
                           kind="quiet"
@@ -293,6 +307,7 @@ export function Charges(_props: TabProps) {
           </CardFooter>
         )}
       </Card>
+      </BentoGrid>
     </>
   );
 }
@@ -316,8 +331,8 @@ function Upstream({ c }: { c: Charge }) {
  * The check row sits inside the list's `.dt` table, whose cell rules reach
  * every descendant cell; these utilities give its own table compact cells.
  */
-const CELL = "static h-auto border-b border-border bg-transparent px-2 py-1.5 text-[12px] font-medium text-muted-foreground first:pl-0 last:pr-0";
-const ROW = "h-auto border-b border-border px-2 py-1.5 text-[13px] tabular-nums first:pl-0 last:pr-0";
+const CELL = "static h-auto border-b border-border bg-transparent px-2 py-1.5 text-meta font-medium text-muted-foreground first:pl-0 last:pr-0";
+const ROW = "h-auto border-b border-border px-2 py-1.5 text-caption tabular-nums first:pl-0 last:pr-0";
 
 /**
  * What checks one charge: the lines it billed (quantity × rate = USD), the
@@ -328,46 +343,46 @@ function ChargeCheck({ c }: { c: Charge }) {
   const reported = reportedCounters(c.usage);
   const recomputed = chargeFromLines(c.lines, c.cny_per_usd_e4, c.discount_bps);
   return (
-    <div className="grid gap-4 rounded-xl border border-border bg-muted/50 p-4 lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
+    <div className="grid gap-4 rounded-cell border border-border bg-well/50 p-4 text-ink-soft lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
       <section aria-label={`计费数量 ${c.event_id}`}>
-        <h4 className="mb-2 text-[13px] font-semibold">计费数量</h4>
+        <h4 className="mb-2 text-caption font-medium">计费数量</h4>
         {c.lines === null ? (
-          <p className="text-[13px] text-muted-foreground">
+          <p className="text-caption text-muted-foreground">
             这次调用的金额由一次未记录费率明细的重新定价更正，费率明细不可知。
           </p>
         ) : c.lines.length === 0 ? (
-          <p className="text-[13px] text-muted-foreground">这次调用没有计费的数量。</p>
+          <p className="text-caption text-muted-foreground">这次调用没有计费的数量。</p>
         ) : (
-          <table className="w-full text-[13px]">
+          <table className="w-full text-caption">
             <thead className="text-muted-foreground">
               <tr>
-                <th className={`${CELL} text-left`}>维度</th>
-                <th className={`${CELL} text-right`}>数量</th>
-                <th className={`${CELL} text-right`}>基准价</th>
-                <th className={`${CELL} text-right`}>小计（美元）</th>
+                <th className={cn(CELL, "text-left")}>维度</th>
+                <th className={cn(CELL, "text-right")}>数量</th>
+                <th className={cn(CELL, "text-right")}>基准价</th>
+                <th className={cn(CELL, "text-right")}>小计（美元）</th>
               </tr>
             </thead>
             <tbody>
               {c.lines.map((l) => (
                 <tr key={l.dimension}>
                   <td className={ROW}>{dimensionLabel(l.dimension)}</td>
-                  <td className={`${ROW} text-right`}>{l.quantity.toLocaleString("en-US")}</td>
-                  <td className={`${ROW} text-right`}>{usdRateText(l.dimension, l.rate)}</td>
-                  <td className={`${ROW} text-right`}>{lineUsd(l) ?? "—"}</td>
+                  <td className={cn(ROW, "text-right")}>{l.quantity.toLocaleString("en-US")}</td>
+                  <td className={cn(ROW, "text-right")}>{usdRateText(l.dimension, l.rate)}</td>
+                  <td className={cn(ROW, "text-right")}>{lineUsd(l) ?? "—"}</td>
                 </tr>
               ))}
             </tbody>
           </table>
         )}
         {c.lines !== null && c.lines.length > 0 && c.cny_per_usd_e4 !== null && (
-          <p className="mt-3 text-[13px] text-text-2">
+          <p className="mt-3 text-caption text-text-2">
             售价 = 小计合计 × 分组换算率 {rateText(c.cny_per_usd_e4)}
             {(c.discount_bps ?? 0) > 0 && <> × (1 − 折扣 {((c.discount_bps ?? 0) / 100).toFixed(2).replace(/\.?0+$/, "")}%)</>}，向上取整到 0.000001 元
             {recomputed !== null && (
               <>
-                {" "}= <span className="font-medium text-foreground">{fmtMicroCny(recomputed)}</span>
+                {" "}= <span className="font-normal text-foreground">{fmtMicroCny(recomputed)}</span>
                 {c.charge_micro_cny !== null && (
-                  <span className={recomputed === c.charge_micro_cny ? "ml-2 text-success" : "ml-2 text-danger"}>
+                  <span className="ml-2 text-ink">
                     {recomputed === c.charge_micro_cny ? "与实收一致" : `与实收 ${fmtMicroCny(c.charge_micro_cny)} 不一致`}
                   </span>
                 )}
@@ -376,15 +391,15 @@ function ChargeCheck({ c }: { c: Charge }) {
           </p>
         )}
         {c.adjusted_micro_cny !== null && (
-          <p className="mt-1 text-[13px] text-text-2">重新计价已更正 {fmtMicroCny(c.adjusted_micro_cny)}。</p>
+          <p className="mt-1 text-caption text-text-2">重新计价已更正 {fmtMicroCny(c.adjusted_micro_cny)}。</p>
         )}
       </section>
       <section aria-label={`上游报告的用量 ${c.event_id}`}>
-        <h4 className="mb-2 text-[13px] font-semibold">上游报告的用量</h4>
+        <h4 className="mb-2 text-caption font-medium">上游报告的用量</h4>
         {reported.length === 0 ? (
-          <p className="text-[13px] text-muted-foreground">这次调用没有上游用量记录。</p>
+          <p className="text-caption text-muted-foreground">这次调用没有上游用量记录。</p>
         ) : (
-          <dl className="grid grid-cols-[minmax(0,1fr)_auto] gap-x-6 text-[13px]">
+          <dl className="grid grid-cols-[minmax(0,1fr)_auto] gap-x-6 text-caption">
             {reported.map((r) => (
               <Fragment key={r.key}>
                 <dt className="border-t border-border py-1.5 text-text-2">{r.label}</dt>
@@ -393,7 +408,7 @@ function ChargeCheck({ c }: { c: Charge }) {
             ))}
           </dl>
         )}
-        <p className="mt-3 text-[12px] text-muted-foreground">
+        <p className="mt-3 text-meta text-muted-foreground">
           事件 <code>{c.event_id}</code>
         </p>
       </section>

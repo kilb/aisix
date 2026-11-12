@@ -35,7 +35,8 @@ import { Field, useRefusalFocus } from "../../ui/Field";
 import { SidePanel } from "../../ui/SidePanel";
 import { useToast } from "../../ui/Toast";
 import { usdPerMillion } from "./Baselines";
-import { Card, CardHeader, PageHeader } from "../../components/page";
+import { BentoGrid, Card, CardHeader, CardMessage, Metric, MetricSkeleton, PageHeader, span } from "../../components/page";
+import { CardFooter, FormGrid } from "./kit";
 
 /**
  * The credit the dataset's authors ask for (its MIT licence, `LICENSE` beside
@@ -212,6 +213,11 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
   const attested = attestedFor !== null && attestedFor === batchId;
   /** The notes this page may show: its own file's, and no other batch's. */
   const notes = commentsFor !== null && commentsFor === batchId ? comments : {};
+  // 批次总量与当前读取范围分开计数；筛选不会改变批量确认的选择。
+  const pending = (proposals ?? []).filter((p) => p.status === "pending");
+  const ready = pending.filter(bulkable).length;
+  const needReview = pending.filter((p) => !confirmable(p)).length;
+  const needModel = pending.filter((p) => confirmable(p) && p.suggested_model_id === null).length;
 
   /** Switching what is reviewed drops every claim about the last one. */
   function switchBatch(next: string | null) {
@@ -262,14 +268,42 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
     <>
       <PageHeader
         title="导入审核"
+        eyebrow="PRICING · IMPORT REVIEW"
         description={CREDIT}
+        dataLead={batch ? <>批次 {batch.dataset_ref} 共 {batch.proposals.toLocaleString("zh-CN")} 条提议，{batch.flagged.toLocaleString("zh-CN")} 条带标记。请核对来源后再确认价格。</> : "上传数据集，逐项核对来源、价格差异和生效时间，再确认写入基准价。"}
         actions={
           <Button type="button" icon="refresh" onClick={() => void loadBatches()}>
             刷新
           </Button>
         }
       />
-      <div className={detail ? "with-side is-open gap-y-4" : "with-side"}>
+      <BentoGrid className="mb-3" aria-label="导入审核概况">
+        <Card className={span.d7}>
+          <CardHeader number={1} title="当前读取范围 · 待处理提议" description={all ? "包含与当前基准价相同的提议；以下统计来自当前批次已读取的清单。" : "隐藏与当前基准价相同的提议；以下统计来自当前批次已读取的清单。"} />
+          {batches === null || (proposals === null && batchId) ? (error ? <CardMessage>提议读取失败</CardMessage> : <MetricSkeleton />) : (
+            <>
+              <Metric size="hero">{pending.length.toLocaleString("zh-CN")}</Metric>
+              <p className="mt-3 text-caption text-muted">当前读取 {(proposals?.length ?? 0).toLocaleString("zh-CN")} 条；搜索显示 {shown.length.toLocaleString("zh-CN")} 条。</p>
+              <dl className="import-review-counts">
+                <div><dt>可批量确认</dt><dd>{ready.toLocaleString("zh-CN")}</dd></div>
+                <div><dt>需选择模型</dt><dd>{needModel.toLocaleString("zh-CN")}</dd></div>
+                <div><dt>需手动核查</dt><dd>{needReview.toLocaleString("zh-CN")}</dd></div>
+              </dl>
+            </>
+          )}
+        </Card>
+        <Card tone="inverse" className={span.d5Wide}>
+          <CardHeader number={2} title={canEdit ? "当前选择 · 确认前检查" : "当前批次 · 只读审核"} />
+          <Metric size="display">{canEdit ? chosen.length.toLocaleString("zh-CN") : batch?.flagged.toLocaleString("zh-CN") ?? "—"}</Metric>
+          <p className="mt-3 text-body text-on-inverse-muted">{canEdit ? "条提议已选入批量确认。搜索隐藏的已选项仍会确认。" : "条提议带标记。当前角色可查看完整对照，管理员核对后才能确认或驳回。"}</p>
+          <div className="import-selection-note">
+            <span className="font-mono text-micro text-on-inverse-muted">官方价格页核对</span>
+            <p className="mt-2 text-stat">{!canEdit ? "由管理员确认核对" : attested ? "已核对当前批次" : "等待核对当前批次"}</p>
+            <p className="mt-3 text-caption text-on-inverse-muted">切换批次、显示范围或完成确认后，需要重新核对。带阻塞标记或无法完整对照的提议需逐项处理。</p>
+          </div>
+        </Card>
+      </BentoGrid>
+      <div className={detail ? "with-side import-workspace is-open" : "with-side import-workspace"}>
         <div className="side-main min-w-0">
           <ImportUpload
             canEdit={canEdit}
@@ -286,7 +320,8 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
           />
 
           <Card className="mb-0">
-            <div className="sections-switch -mx-6 -mt-2 px-4" role="group" aria-label="审核内容">
+            <CardHeader number={canEdit ? 4 : 3} title="审核清单" description="打开模型查看完整对照、来源与标记；逐项决定，或选择可批量确认的提议。" />
+            <div className="sections-switch import-view-switch" role="group" aria-label="审核内容">
               <button type="button" aria-pressed={view === "proposals"} onClick={() => setView("proposals")}>
                 数据集提议
               </button>
@@ -307,7 +342,7 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
               <EmptyState text="还没有上传过价格数据集。选择数据集文件并填写版本后上传。" mark="route" />
             ) : (
               <>
-                <div className="import-controls mt-0 grid gap-x-4 gap-y-3 md:grid-cols-[minmax(0,1.6fr)_minmax(0,1fr)] xl:grid-cols-[minmax(0,1.6fr)_minmax(0,1fr)_auto] xl:items-end [&_.field]:mb-0">
+                <FormGrid className="import-controls">
                   <Field label="上传批次">
                     {(aria) => (
                       <select {...aria} value={batchId ?? ""} onChange={(e) => switchBatch(e.target.value)}>
@@ -325,7 +360,7 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
                       <input {...aria} autoComplete="off" placeholder="按提供方或模型名筛选" value={filter} onChange={(e) => setFilter(e.target.value)} />
                     )}
                   </Field>
-                  <label className="check mb-0 xl:h-9">
+                  <label className="check col-span-full mb-0 min-h-11">
                     <input
                       type="checkbox"
                       checked={all}
@@ -340,10 +375,10 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
                     />
                     <span>显示与当前基准价相同的提议</span>
                   </label>
-                </div>
+                </FormGrid>
 
                 {batch && (
-                  <p className="hint tabular mt-3 text-[13px]">
+                  <p className="hint tabular mt-3 text-caption">
                     本次上传 {batch.proposals} 条提议，其中 {batch.flagged} 条带标记；由 {batch.created_by.email} 上传于{" "}
                     {fmtUtc(batch.created_at)}。
                   </p>
@@ -351,11 +386,11 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
 
                 {canEdit && (proposals ?? []).some(bulkable) && (
                   <div
-                    className="import-bulk mt-4 mb-0 flex flex-wrap items-center gap-x-4 gap-y-2 rounded-xl border border-border bg-muted/50 px-4 py-3"
+                    className="import-bulk mt-4 mb-0 flex flex-wrap items-center gap-x-4 gap-y-3 rounded-cell bg-well p-4 text-ink-soft"
                     role="group"
                     aria-label="批量确认"
                   >
-                    <label className="check">
+                    <label className="check min-h-11">
                       <input
                         type="checkbox"
                         checked={attested}
@@ -430,26 +465,28 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
                         const entry = `${p.provider}/${p.model}`;
                         const rates = headline(p.card);
                         return (
-                          <tr key={p.id} data-status={p.status}>
+                          <tr key={p.id} data-status={p.status} className={selected === p.id ? "bg-well" : undefined}>
                             <td className="import-pick">
                               {canEdit && bulkable(p) && (
-                                <input
-                                  type="checkbox"
-                                  aria-label={`选择 ${entry}`}
-                                  checked={picked.has(p.id)}
-                                  onChange={(e) =>
-                                    setPicked((old) => {
-                                      const next = new Set(old);
-                                      if (e.target.checked) next.add(p.id);
-                                      else next.delete(p.id);
-                                      return next;
-                                    })
-                                  }
-                                />
+                                <label className="inline-flex min-h-11 min-w-11 items-center justify-center">
+                                  <input
+                                    type="checkbox"
+                                    aria-label={`选择 ${entry}`}
+                                    checked={picked.has(p.id)}
+                                    onChange={(e) =>
+                                      setPicked((old) => {
+                                        const next = new Set(old);
+                                        if (e.target.checked) next.add(p.id);
+                                        else next.delete(p.id);
+                                        return next;
+                                      })
+                                    }
+                                  />
+                                </label>
                               )}
                             </td>
                             <td>
-                              {/* A long entry wraps rather than widening the list past its card. */}
+                              {/* 长模型名留在表格内换行，完整名称仍可复制。 */}
                               <button
                                 type="button"
                                 className="link-button whitespace-normal [overflow-wrap:anywhere]"
@@ -474,7 +511,7 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
                             <td className="tabular">{p.effective_from ? fmtUtc(p.effective_from) : "立即生效"}</td>
                             <td className="num tabular">{rates ? usdPerMillion(rates.input) : "—"}</td>
                             <td className="num tabular">{rates ? usdPerMillion(rates.output) : "—"}</td>
-                            <td className="import-flags text-[13px]">
+                            <td className="import-flags text-caption">
                               <div className="max-w-56 whitespace-normal">{p.flags.length > 0 ? p.flags.map(flagText).join("、") : "—"}</div>
                             </td>
                             <td>
@@ -577,13 +614,14 @@ function ImportUpload({
   }
 
   return (
-    <form ref={ref} className="panel import-upload" aria-label="上传价格数据集" onSubmit={(e) => void upload(e)} noValidate>
-      <CardHeader
-        title="上传价格数据集"
-        description="选择数据集文件并填写它的版本。上传后，它给出的每条价格都出现在下面的提议里，逐条审核。"
-      />
-      <div className="@container">
-        <div className="grid items-start gap-4 @2xl:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] [&_.field]:mb-0">
+    <Card className="import-upload">
+      <form ref={ref} aria-label="上传价格数据集" onSubmit={(e) => void upload(e)} noValidate>
+        <CardHeader
+          number={3}
+          title="上传价格数据集"
+          description="选择数据集文件并填写它的版本。上传后，它给出的每条价格都出现在下面的提议里，逐条审核。"
+        />
+        <FormGrid>
           <Field label="数据集文件" error={problemAt(details, (p) => p === "/file")}>
             {(aria) => (
               <input
@@ -609,19 +647,18 @@ function ImportUpload({
               />
             )}
           </Field>
-          <div className="flex justify-end @2xl:pt-[25px]">
-            <Button type="submit" kind="primary" busy={uploading} busyLabel="上传中…">
-              上传
-            </Button>
+        </FormGrid>
+        {failure && (
+          <div className="note crit mb-0" role="alert">
+            {failure}
           </div>
-        </div>
-      </div>
-      {failure && (
-        <div className="note crit mb-0" role="alert">
-          {failure}
-        </div>
-      )}
-    </form>
+        )}
+        <CardFooter>
+          <span className="mr-auto text-caption text-muted">JSON 文件 · 最大 8 MiB</span>
+          <Button type="submit" kind="primary" busy={uploading} busyLabel="上传中…">上传</Button>
+        </CardFooter>
+      </form>
+    </Card>
   );
 }
 
@@ -752,7 +789,7 @@ function PriceComparison({ proposal }: { proposal: Proposal }) {
   if (rows.length === 0) return null;
   return (
     <section className="import-compare mt-5" aria-label="价格对照">
-      <h3 className="text-sm">价格对照（token 按每百万 tokens，联网搜索按每千次）</h3>
+      <h3 className="font-mono text-meta text-muted">价格对照（token 按每百万 tokens，联网搜索按每千次）</h3>
       <DataTable label="价格对照" compact>
         <thead>
           <tr>
@@ -867,8 +904,8 @@ function ConfirmForm({
   const startRefused = problemAt(details, (p) => p === "/effective_from");
 
   return (
-    <form ref={formRef} aria-label="确认提议" className="import-decide mt-6 border-t border-border pt-5" onSubmit={(e) => void submit(e)} noValidate>
-      <h3 className="mb-3 text-base">确认</h3>
+    <form ref={formRef} aria-label="确认提议" className="import-decide mt-6 border-t border-ink/7 pt-5" onSubmit={(e) => void submit(e)} noValidate>
+      <h3 className="mb-3 font-mono text-meta text-muted">确认</h3>
       <Field label="模型" hint="确认后，这项价格成为该模型的基准价" error={problemAt(details, (p) => p === "/model_id")}>
         {(aria) => (
           <select {...aria} value={model} onChange={(e) => setModel(e.target.value)}>
@@ -884,7 +921,7 @@ function ConfirmForm({
           </select>
         )}
       </Field>
-      <label className="check">
+      <label className="check min-h-11">
         <input type="checkbox" checked={checked} onChange={(e) => setChecked(e.target.checked)} />
         <span>已对照官方价格页核对</span>
       </label>
@@ -946,11 +983,11 @@ function ConfirmForm({
           {failure}
         </div>
       )}
-      <div className="mt-4 flex justify-end">
+      <CardFooter>
         <Button type="submit" kind="primary" disabled={!checked} busy={saving} busyLabel="确认中…">
           确认
         </Button>
-      </div>
+      </CardFooter>
     </form>
   );
 }
@@ -1003,8 +1040,8 @@ function RejectForm({
   }
 
   return (
-    <form ref={ref} aria-label="驳回提议" className="import-decide mt-6 border-t border-border pt-5" onSubmit={(e) => void submit(e)} noValidate>
-      <h3 className="mb-3 text-base">驳回</h3>
+    <form ref={ref} aria-label="驳回提议" className="import-decide mt-6 border-t border-ink/7 pt-5" onSubmit={(e) => void submit(e)} noValidate>
+      <h3 className="mb-3 font-mono text-meta text-muted">驳回</h3>
       <Field label="拒绝原因" hint="最多 500 字，记入这条提议" error={problemAt(details, (p) => p === "/reason")}>
         {(aria) => (
           <textarea {...aria} rows={2} autoComplete="off" value={reason} onChange={(e) => setReason(e.target.value)} />
@@ -1015,11 +1052,11 @@ function RejectForm({
           {failure}
         </div>
       )}
-      <div className="mt-4 flex justify-end">
+      <CardFooter>
         <Button type="submit" busy={saving} busyLabel="驳回中…">
           驳回
         </Button>
-      </div>
+      </CardFooter>
     </form>
   );
 }

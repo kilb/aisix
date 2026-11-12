@@ -147,93 +147,110 @@ export function Gate({
     </div>
   );
 
+  const title = invite !== null ? "接受邀请" : mode === "login" ? "登录" : "注册组织";
+  const introduction = invite !== null
+    ? "接受邀请，加入团队的工作空间。用自己的口令管理访问。"
+    : mode === "login"
+      ? "在一个工作空间中管理成员与 API 密钥，核对调用的用量、费用与额度。"
+      : "创建组织与所有者账号。平台审核通过后，即可为团队创建密钥并管理调用。";
+
   return (
-    <div className="gate-page flex min-h-screen flex-col bg-background">
-      <div className="gate-tools flex justify-end px-4 pt-3 sm:px-6">
+    <div className="gate-page">
+      <header className="gate-topbar">
+        <span className="brand">
+          <span className="brand-mark" aria-hidden="true" />
+          <span className="brand-name"><span className="mark">Routio</span> <span className="app">组织门户</span></span>
+        </span>
         <ThemeToggle theme={theme} onToggle={onToggleTheme} />
-      </div>
-      <div id="gate" className="mx-auto flex w-full max-w-[400px] flex-1 flex-col justify-center px-4 pt-6 pb-16">
-        <header className="plate mb-8 flex flex-col items-center gap-3 text-center">
-          <span className="brand-mark size-10 rounded-[10px] after:top-[15px] after:right-[10px] after:left-[10px] after:h-2.5" aria-hidden="true" />
-          <div>
-            <h1 className="text-xl font-semibold tracking-tight">
-              <span className="mark">Routio</span> 组织门户
-            </h1>
-            <p className="sub mt-1 text-[13px] text-muted-foreground">组织、成员与 API 密钥</p>
-          </div>
-        </header>
-
-        {notice && (
-          <div className="note warn mb-4" role="status">
-            {notice}
-          </div>
-        )}
-
-        {invite !== null ? (
-          <div className="panel p-6 shadow-sm">
+      </header>
+      <main id="gate" className="gate-layout">
+        <section className="gate-introduction" aria-labelledby="gate-title">
+          <p className="gate-eyebrow">组织工作空间</p>
+          <h1 id="gate-title">组织门户</h1>
+          <p className="gate-lead">{introduction}</p>
+          <dl className="gate-guide">
             <div>
-              <h2 className="text-base font-semibold tracking-tight">接受邀请</h2>
-              <p className="hint mt-1">设置口令后即加入邀请你的组织，之后用受邀的邮箱和这个口令登录。</p>
+              <dt><span aria-hidden="true">01</span> 组织与成员</dt>
+              <dd>按角色管理访问，邀请成员或创建团队账号。</dd>
             </div>
-            <form className="gate-form grid gap-4" onSubmit={submit}>
-              {passwordField}
-              {displayNameField}
-              <Button kind="primary" block type="submit" busy={busy} className="mt-1">
-                接受邀请
-              </Button>
-            </form>
-            {alert}
-            <Button block onClick={leaveInvite}>
-              {signedIn ? "取消" : "返回登录"}
-            </Button>
+            <div>
+              <dt><span aria-hidden="true">02</span> 调用与费用</dt>
+              <dd>查看调用记录、用量与计费明细。</dd>
+            </div>
+            <div>
+              <dt><span aria-hidden="true">03</span> 密钥与额度</dt>
+              <dd>设置密钥的模型范围，查看适用的预算限制。</dd>
+            </div>
+          </dl>
+        </section>
+        <section className="panel gate-panel" aria-labelledby="gate-form-title">
+          <div className="gate-panel-heading">
+            <p className="gate-eyebrow">工作空间访问</p>
+            <h2 id="gate-form-title">{title}</h2>
           </div>
-        ) : (
-          <div className="panel p-6 shadow-sm">
-            <RouteNav
-              label="登录或注册"
-              items={MODES}
-              current={mode}
-              onSelect={switchMode}
-              className="grid w-full grid-cols-2 [&>button]:w-full"
-            />
-            <div id={`tab-${mode}`} role="tabpanel" aria-labelledby={`stop-${mode}`} className="!mt-6">
-              <form className="gate-form grid gap-4" onSubmit={submit}>
-                {mode === "signup" && (
-                  <Field label="组织名称">
-                    <input
-                      autoComplete="organization"
-                      required
-                      value={orgName}
-                      onChange={(e) => setOrgName(e.target.value)}
-                    />
-                  </Field>
-                )}
-                <Field label="邮箱">
-                  <input
-                    type="email"
-                    autoComplete="username"
-                    required
-                    value={email}
-                    onChange={(e) => setEmail(e.target.value)}
-                  />
-                </Field>
+          {notice && <div className="note warn" role="status">{notice}</div>}
+          {invite !== null ? (
+            <>
+              <p className="hint">设置口令后即加入邀请你的组织，之后用受邀的邮箱和这个口令登录。</p>
+              <form className="gate-form" onSubmit={submit}>
                 {passwordField}
-                {mode === "signup" && displayNameField}
-                <Button kind="primary" block type="submit" busy={busy} className="mt-1">
-                  {mode === "login" ? "登录" : "注册组织"}
+                {displayNameField}
+                <Button kind="primary" block type="submit" busy={busy}>
+                  接受邀请
                 </Button>
               </form>
-            </div>
-            {alert}
-          </div>
-        )}
-
-        {invite === null && mode === "signup" && (
-          <p className="foot mt-4 px-2 text-center text-[13px] leading-relaxed text-balance text-muted-foreground">
-            新注册的组织需要平台审核。审核通过前可以登录查看组织状态、修改口令。
-          </p>
-        )}
-      </div>
+              {alert}
+              <Button block onClick={leaveInvite}>
+                {signedIn ? "取消" : "返回登录"}
+              </Button>
+            </>
+          ) : (
+            <>
+              <RouteNav
+                label="登录或注册"
+                items={MODES}
+                current={mode}
+                onSelect={switchMode}
+                className="gate-modes"
+              />
+              <div id={`tab-${mode}`} role="tabpanel" aria-labelledby={`stop-${mode}`}>
+                <form className="gate-form" onSubmit={submit}>
+                  {mode === "signup" && (
+                    <Field label="组织名称">
+                      <input
+                        autoComplete="organization"
+                        required
+                        value={orgName}
+                        onChange={(e) => setOrgName(e.target.value)}
+                      />
+                    </Field>
+                  )}
+                  <Field label="邮箱">
+                    <input
+                      type="email"
+                      autoComplete="username"
+                      required
+                      value={email}
+                      onChange={(e) => setEmail(e.target.value)}
+                    />
+                  </Field>
+                  {passwordField}
+                  {mode === "signup" && displayNameField}
+                  <Button kind="primary" block type="submit" busy={busy}>
+                    {mode === "login" ? "登录" : "注册组织"}
+                  </Button>
+                </form>
+              </div>
+              {alert}
+              {mode === "signup" && (
+                <p className="gate-foot">
+                  新注册的组织需要平台审核。审核通过前可以登录查看组织状态、修改口令。
+                </p>
+              )}
+            </>
+          )}
+        </section>
+      </main>
     </div>
   );
 }

@@ -262,35 +262,32 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
               <span className="mark">Routio</span> <span className="app">组织门户</span>
             </span>
           </span>
-          <span className="slash" aria-hidden="true" />
-          <h1 className="org-name" title={tenant.name}>
-            {tenant.name}
-          </h1>
-          {/* The separator stays in the text (and in what a screen reader
-              hears); on screen the role reads as a badge after the name.
-              The initial is drawn from an attribute, so it is not text. */}
-          <span className="me" title={member.email}>
-            <span className="avatar" data-initial={[...who][0] ?? ""} aria-hidden="true" />
-            <span className="me-name">{who}</span>
-            <span className="vh"> · </span>
-            <span className="tag">{ROLE_LABEL[member.role] ?? member.role}</span>
+          <span className="tenant-context">
+            <span className="tenant-context-label">当前组织</span>
+            <span className="org-name" title={tenant.name}>{tenant.name}</span>
           </span>
-          <span className="tools">
-            <ThemeToggle theme={theme} onToggle={toggleTheme} />
-            <Button kind="quiet" size="sm" onClick={() => void signOut()}>
-              登出
-            </Button>
-          </span>
-        </div>
-      </header>
-
-      {visible.length > 0 && (
-        <div className="route-bar">
-          <div className="route-bar-in">
-            <RouteNav label="组织门户分区" items={visible} current={current} onSelect={openSection} docked />
+          {visible.length > 0 && (
+            <div className="tenant-navigation">
+              <RouteNav label="组织门户分区" items={visible} current={current} onSelect={openSection} docked />
+            </div>
+          )}
+          <div className="member-tools">
+            {/* 姓名和角色保留可访问文本，头像字母仅作视觉识别。 */}
+            <span className="me" title={member.email}>
+              <span className="avatar" data-initial={[...who][0] ?? ""} aria-hidden="true" />
+              <span className="me-name">{who}</span>
+              <span className="vh"> · </span>
+              <span className="tag">{ROLE_LABEL[member.role] ?? member.role}</span>
+            </span>
+            <span className="tools">
+              <ThemeToggle theme={theme} onToggle={toggleTheme} />
+              <Button kind="quiet" onClick={() => void signOut()}>
+                登出
+              </Button>
+            </span>
           </div>
         </div>
-      )}
+      </header>
 
       {signOutError && (
         <div className="route-bar-in shell-note">
@@ -302,6 +299,7 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
 
       <main className="page">
         <section
+          key={`${tenant.id}:${member.id}:${member.role}:${tenant.status}`}
           id={`tab-${current}`}
           role={visible.length > 0 ? "tabpanel" : undefined}
           aria-labelledby={visible.length > 0 ? `stop-${current}` : undefined}

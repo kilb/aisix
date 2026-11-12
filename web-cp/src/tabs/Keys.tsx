@@ -1,3 +1,4 @@
+/** 布局：[01 租户范围 12]；[02 密钥 6][03 正常 6]；[列表 12 / 创建时表单 5 + 列表 7]。 */
 import { Fragment, useCallback, useEffect, useId, useMemo, useState } from "react";
 import type { TabProps } from "../App";
 import { GatewayTooOld } from "../components/GatewayTooOld";
@@ -37,7 +38,8 @@ import {
   type GroupChoice,
   type Refusal,
 } from "./Tenants";
-import { Card, CardHeader, PageHeader, Split, Stat, StatGrid, Toolbar } from "../components/page";
+import { BentoGrid, Card, CardFooter, CardHeader, CardMessage, ChartSkeleton, Metric, MetricSkeleton, PageHeader, span } from "../components/page";
+import { RankBars } from "../components/charts";
 import { Button } from "../ui/Button";
 import { useRefusalFocus } from "../ui/Field";
 import { CopyButton } from "../ui/CopyButton";
@@ -70,8 +72,11 @@ export function Keys({ canEdit }: TabProps) {
 
   return (
     <>
+      {/* 桌面与平板：范围 12；概况 6 + 6；密钥表单与明细保留独立状态。 */}
       <PageHeader
         title="密钥"
+        eyebrow="客户管理"
+        dataLead={list.data === null ? "读取当前可管理的租户。" : `共有 ${fmtInt(ordered.length)} 个租户可查看；统计只包含当前选择的租户。`}
         description="平台内部租户的密钥是运维自用的，可以按名称模式授权模型；其他租户的密钥只能使用该租户已授权的模型。平台内部租户的密钥明文可随时复制；客户租户的密钥在这里只显示前缀，明文由该租户在自己的门户里复制。"
         actions={
           <Button
@@ -86,33 +91,38 @@ export function Keys({ canEdit }: TabProps) {
           </Button>
         }
       />
-      {list.error && (
-        <div className="note crit" role="alert">
-          {list.error}{" "}
-          <Button type="button" size="sm" onClick={() => void list.reload()}>
-            重试
-          </Button>
-        </div>
-      )}
-      {list.data === null ? (
-        !list.error && <Loading />
-      ) : ordered.length === 0 ? (
-        <EmptyState text="还没有租户。" />
-      ) : (
-        <Toolbar>
-          <label className="f filter filter-wide">
-            <span>租户</span>
-            <select value={tenantId ?? ""} onChange={(e) => setChosen(e.target.value)}>
-              {ordered.map((t) => (
-                <option key={t.id} value={t.id}>
-                  {tenantLabel(t)}
-                </option>
-              ))}
-            </select>
-          </label>
-        </Toolbar>
-      )}
-      {/* Keyed by tenant: switching drops everything shown for the last one, a new key's plaintext included. */}
+      <BentoGrid className="mb-3">
+        <Card className={span.d12}>
+          <CardHeader number={1} title="租户范围" description="平台内部密钥可按名称模式授权模型，明文可随时复制；客户密钥只能使用租户已授权的模型，在这里仅显示前缀，明文由客户在自己的门户复制。切换租户会清除当前显示的新密钥明文。" />
+          {list.error && (
+            <div className="note crit" role="alert">
+              {list.error}{" "}
+              <Button type="button" size="sm" onClick={() => void list.reload()}>
+                重试
+              </Button>
+            </div>
+          )}
+          {list.data === null ? (
+            !list.error && <Loading />
+          ) : ordered.length === 0 ? (
+            <EmptyState text="还没有租户。" />
+          ) : (
+            <div className="flex flex-wrap items-end gap-3">
+              <label className="f filter filter-wide">
+                <span>租户</span>
+                <select value={tenantId ?? ""} onChange={(e) => setChosen(e.target.value)}>
+                  {ordered.map((t) => (
+                    <option key={t.id} value={t.id}>
+                      {tenantLabel(t)}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+          )}
+        </Card>
+      </BentoGrid>
+      {/* 以租户作为实例键：切换时清除旧租户状态，包括一次性密钥明文。 */}
       {tenantId && <TenantKeys key={tenantId} tenantId={tenantId} canEdit={canEdit} tick={tick} />}
     </>
   );
@@ -236,6 +246,7 @@ function TenantKeys({ tenantId, canEdit, tick }: { tenantId: string; canEdit: bo
   if (!tenant) {
     return (
       <Card>
+        <CardHeader number={2} title="租户密钥" />
         {tenantError ? (
           <div className="note crit" role="alert">
             {tenantError}{" "}
@@ -252,181 +263,200 @@ function TenantKeys({ tenantId, canEdit, tick }: { tenantId: string; canEdit: bo
 
   const columns = canEdit ? 9 : 8;
   const keys = keyList.data;
-  const live = keys?.filter((k) => !k.effective_disabled && !(k.expires_at !== null && Date.parse(k.expires_at) <= Date.now()));
+  const snapshotTime = Date.now();
+  const live = keys?.filter((k) => !k.effective_disabled && !(k.expires_at !== null && Date.parse(k.expires_at) <= snapshotTime));
+  const disabled = keys?.filter((key) => key.effective_disabled);
+  const expired = keys?.filter((key) => !key.effective_disabled && key.expires_at !== null && Date.parse(key.expires_at) <= snapshotTime);
+  const stateItems = keys === null ? null : [
+    { label: "正常", value: live?.length ?? 0, displayValue: fmtInt(live?.length ?? 0) },
+    { label: "已停用", value: disabled?.length ?? 0, displayValue: fmtInt(disabled?.length ?? 0) },
+    { label: "已过期（未停用）", value: expired?.length ?? 0, displayValue: fmtInt(expired?.length ?? 0) },
+  ].sort((a, b) => b.value - a.value);
   const open = creating && canEdit && tenant.status !== "pending";
   return (
     <>
-      <StatGrid className="grid-cols-3 sm:grid-cols-3 xl:grid-cols-3">
-        <Stat label="密钥" value={keys ? fmtInt(keys.length) : "…"} />
-        <Stat label="正常" value={live ? fmtInt(live.length) : "…"} />
-        <Stat label="已停用" value={keys ? fmtInt(keys.filter((k) => k.effective_disabled).length) : "…"} />
-      </StatGrid>
-      <Split
-        asideWidth="380px"
-        // Stacked, the form comes first: it opens where 新建密钥 was pressed.
-        className={open ? "is-creating max-xl:[&>aside]:order-first" : undefined}
-        main={
-          <section className="panel mb-0" aria-label={`${tenant.name} 的密钥`}>
-            <CardHeader
-              className="sm:flex-nowrap [&>div:first-child]:flex-1"
-              title={
-                <span className="inline-flex flex-wrap items-center gap-x-3 gap-y-1">
-                  {tenant.name}
-                  <RolloutBadge rollout={tenant.rollout} />
-                </span>
-              }
-              description={
-                <>
-                  {STATUS_LABEL[tenant.status] ?? tenant.status} · 可用分组 {groupsText(tenant.allowed_provider_groups, tenant)}
-                  。密钥未设的限额按租户的单 key 上限；运维停用的密钥只有运维能重新启用。
-                </>
-              }
-              actions={
-                // A pending tenant has no keys until it is approved; the control plane refuses one.
-                canEdit &&
-                tenant.status !== "pending" && (
-                  <Button
-                    kind="primary"
-                    size="sm"
-                    type="button"
-                    icon="plus"
-                    aria-expanded={creating}
-                    onClick={() => setCreating((o) => !o)}
-                  >
-                    新建密钥
-                  </Button>
-                )
-              }
+      <BentoGrid className="mb-3" aria-label={`${tenant.name} 的密钥概况`}>
+        <Card className={span.d6}>
+          <CardHeader number={2} title="密钥" description={keyList.error ? "刷新失败，保留最近成功读取的当前租户密钥" : `${tenant.name} 的完整密钥列表`} />
+          {keys === null && !keyList.error ? <MetricSkeleton /> : <Metric size="hero">{keys === null ? "—" : fmtInt(keys.length)}</Metric>}
+          <CardFooter>
+            {stateItems === null ? (keyList.error ? <CardMessage onRetry={() => void keyList.reload()}>密钥统计读取失败。</CardMessage> : <ChartSkeleton />) : (
+              <RankBars items={stateItems} accessibleLabel={`当前租户共有 ${fmtInt(keys?.length ?? 0)} 把密钥；正常 ${fmtInt(live?.length ?? 0)} 把，已停用 ${fmtInt(disabled?.length ?? 0)} 把，未停用但已过期 ${fmtInt(expired?.length ?? 0)} 把。`} emptyLabel="当前租户没有密钥。" />
+            )}
+          </CardFooter>
+        </Card>
+        <Card className={span.d6} tone="inverse">
+          <CardHeader number={3} title="正常" description={keyList.error ? "读取失败；已有值来自最近成功读取" : "已停用与已过期的密钥均不计入"} />
+          {keys === null && !keyList.error ? <MetricSkeleton /> : <Metric size="display">{live ? fmtInt(live.length) : "—"}</Metric>}
+          <CardFooter>
+            <dl className="grid grid-cols-2 gap-6 border-t border-surface/12 pt-5">
+              <div><dt className="font-mono text-meta text-on-inverse-muted">已停用</dt><dd className="mt-2"><Metric size="value">{disabled ? fmtInt(disabled.length) : "—"}</Metric></dd></div>
+              <div><dt className="font-mono text-meta text-on-inverse-muted">已过期（未停用）</dt><dd className="mt-2"><Metric size="value">{expired ? fmtInt(expired.length) : "—"}</Metric></dd></div>
+            </dl>
+          </CardFooter>
+        </Card>
+      </BentoGrid>
+      <BentoGrid className={open ? "is-creating" : undefined}>
+        {open && (
+          <Card key="key-create" className={span.d5Wide}>
+            <CardHeader number={4} title="新建密钥" />
+            <CreateForm
+              tenant={tenant}
+              names={names}
+              catalogError={catalog.error}
+              choices={choices}
+              onMinted={(m) => {
+                setMinted(m);
+                setCreating(false);
+                keyList.setData((list) => (list ? [...list, m.key] : [m.key]));
+                void refresh();
+              }}
+              onCancel={() => setCreating(false)}
             />
-            {tenantError && (
-              <div className="note crit" role="alert">
-                {tenantError}
-              </div>
-            )}
-            {minted && <MintedNote minted={minted} onClose={() => setMinted(null)} />}
+          </Card>
+        )}
+        <Card key="key-list" className={open ? span.d7 : span.d12} aria-label={`${tenant.name} 的密钥`}>
+          <CardHeader
+            number={open ? 5 : 4}
+            className="sm:flex-nowrap [&>div:first-child]:flex-1"
+            title={
+              <span className="inline-flex flex-wrap items-center gap-x-3 gap-y-1">
+                {tenant.name}
+                <RolloutBadge rollout={tenant.rollout} />
+              </span>
+            }
+            description={
+              <>
+                {STATUS_LABEL[tenant.status] ?? tenant.status} · 可用分组 {groupsText(tenant.allowed_provider_groups, tenant)}
+                。密钥未设的限额按租户的单 key 上限；运维停用的密钥只有运维能重新启用。
+              </>
+            }
+            actions={
+              // A pending tenant has no keys until it is approved; the control plane refuses one.
+              canEdit &&
+              tenant.status !== "pending" && (
+                <Button
+                  kind="primary"
+                  size="sm"
+                  type="button"
+                  icon="plus"
+                  aria-expanded={creating}
+                  onClick={() => setCreating((o) => !o)}
+                >
+                  新建密钥
+                </Button>
+              )
+            }
+          />
+          {tenantError && (
+            <div className="note crit" role="alert">
+              {tenantError}
+            </div>
+          )}
+          {minted && <MintedNote minted={minted} onClose={() => setMinted(null)} />}
 
-            {keyList.error && (
-              <div className="note crit" role="alert">
-                密钥读取失败：{keyList.error}
-              </div>
-            )}
-            {plaintextError && (
-              <div className="note crit" role="alert">
-                {plaintextError}
-              </div>
-            )}
-            {members.error && (
-              <div className="note crit" role="alert">
-                成员读取失败：{members.error}
-              </div>
-            )}
-            {keys === null ? (
-              !keyList.error && <Loading />
-            ) : keys.length === 0 ? (
-              <EmptyState mark="key" text="该租户还没有密钥。" />
-            ) : (
-              <DataTable label="密钥列表">
-                <thead>
-                  <tr>
-                    <th>名称</th>
-                    <th>前缀</th>
-                    <th className="side-opt">成员</th>
-                    <th>模型</th>
-                    <th>分组</th>
-                    <th className="side-opt">限额</th>
-                    <th>状态</th>
-                    <th className="side-opt">创建者</th>
-                    {canEdit && <th className="right">操作</th>}
-                  </tr>
-                </thead>
-                <tbody>
-                  {keys.map((k) => (
-                    <Fragment key={k.id}>
-                      <tr>
-                        <td className="font-medium">{k.label}</td>
-                        <td>
-                          <KeySecretCell k={k} tenant={tenant} onError={setPlaintextError} />
+          {keyList.error && (
+            <div className="note crit" role="alert">
+              密钥读取失败：{keyList.error}
+            </div>
+          )}
+          {plaintextError && (
+            <div className="note crit" role="alert">
+              {plaintextError}
+            </div>
+          )}
+          {members.error && (
+            <div className="note crit" role="alert">
+              成员读取失败：{members.error}
+            </div>
+          )}
+          {keys === null ? (
+            !keyList.error && <Loading />
+          ) : keys.length === 0 ? (
+            <EmptyState mark="key" text="该租户还没有密钥。" />
+          ) : (
+            <DataTable label="密钥列表">
+              <thead>
+                <tr>
+                  <th>名称</th>
+                  <th>前缀</th>
+                  <th className="side-opt">成员</th>
+                  <th>模型</th>
+                  <th>分组</th>
+                  <th className="side-opt">限额</th>
+                  <th>状态</th>
+                  <th className="side-opt">创建者</th>
+                  {canEdit && <th className="right">操作</th>}
+                </tr>
+              </thead>
+              <tbody>
+                {keys.map((k) => (
+                  <Fragment key={k.id}>
+                    <tr>
+                      <td className="font-medium">{k.label}</td>
+                      <td>
+                        <KeySecretCell k={k} tenant={tenant} onError={setPlaintextError} />
+                      </td>
+                      <td className="side-opt text-text-2">{ownerOf(k, tenant, members.data)}</td>
+                      <td>
+                        <span className="block max-w-[280px] truncate" title={modelsOf(k, tenant, names)}>
+                          {modelsOf(k, tenant, names)}
+                        </span>
+                      </td>
+                      <td>
+                        <KeyGroupCell k={k} />
+                        <StrayNote k={k} tenant={tenant} />
+                      </td>
+                      <td className="side-opt text-text-2">{limitsOf(k)}</td>
+                      <td>
+                        <Status k={k} tenant={tenant} members={members.data} />
+                      </td>
+                      <td className="side-opt text-text-2">
+                        <Creator k={k} members={members.data} />
+                      </td>
+                      {canEdit && (
+                        <td className="right">
+                          <KeyActions
+                            k={k}
+                            editing={editing === k.id}
+                            onEdit={() => setEditing(editing === k.id ? null : k.id)}
+                            onSaved={saved}
+                            onRevoked={(gone) => {
+                              if (editing === gone.id) setEditing(null);
+                              keyList.setData((list) => list && list.filter((x) => x.id !== gone.id));
+                              void refresh();
+                            }}
+                            onReload={() => void keyList.reload()}
+                          />
                         </td>
-                        <td className="side-opt text-text-2">{ownerOf(k, tenant, members.data)}</td>
-                        <td>
-                          <span className="block max-w-[280px] truncate" title={modelsOf(k, tenant, names)}>
-                            {modelsOf(k, tenant, names)}
-                          </span>
-                        </td>
-                        <td>
-                          <KeyGroupCell k={k} />
-                          <StrayNote k={k} tenant={tenant} />
-                        </td>
-                        <td className="side-opt text-text-2">{limitsOf(k)}</td>
-                        <td>
-                          <Status k={k} tenant={tenant} members={members.data} />
-                        </td>
-                        <td className="side-opt text-text-2">
-                          <Creator k={k} members={members.data} />
-                        </td>
-                        {canEdit && (
-                          <td className="right">
-                            <KeyActions
-                              k={k}
-                              editing={editing === k.id}
-                              onEdit={() => setEditing(editing === k.id ? null : k.id)}
-                              onSaved={saved}
-                              onRevoked={(gone) => {
-                                if (editing === gone.id) setEditing(null);
-                                keyList.setData((list) => list && list.filter((x) => x.id !== gone.id));
-                                void refresh();
-                              }}
-                              onReload={() => void keyList.reload()}
-                            />
-                          </td>
-                        )}
-                      </tr>
-                      {editing === k.id && (
-                        <tr className="dt-detail">
-                          <td colSpan={columns}>
-                            <ChooseGroup
-                              k={k}
-                              choices={choices}
-                              onSaved={(next) => {
-                                setEditing(null);
-                                saved(next);
-                              }}
-                              onCancel={() => setEditing(null)}
-                              onReload={() => {
-                                setEditing(null);
-                                void keyList.reload();
-                              }}
-                            />
-                          </td>
-                        </tr>
                       )}
-                    </Fragment>
-                  ))}
-                </tbody>
-              </DataTable>
-            )}
-          </section>
-        }
-        aside={
-          open ? (
-            <Card className="mb-0">
-              <CreateForm
-                tenant={tenant}
-                names={names}
-                catalogError={catalog.error}
-                choices={choices}
-                onMinted={(m) => {
-                  setMinted(m);
-                  setCreating(false);
-                  keyList.setData((list) => (list ? [...list, m.key] : [m.key]));
-                  void refresh();
-                }}
-                onCancel={() => setCreating(false)}
-              />
-            </Card>
-          ) : undefined
-        }
-      />
+                    </tr>
+                    {editing === k.id && (
+                      <tr className="dt-detail">
+                        <td colSpan={columns}>
+                          <ChooseGroup
+                            k={k}
+                            choices={choices}
+                            onSaved={(next) => {
+                              setEditing(null);
+                              saved(next);
+                            }}
+                            onCancel={() => setEditing(null)}
+                            onReload={() => {
+                              setEditing(null);
+                              void keyList.reload();
+                            }}
+                          />
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
+                ))}
+              </tbody>
+            </DataTable>
+          )}
+        </Card>
+      </BentoGrid>
     </>
   );
 }
@@ -714,7 +744,7 @@ function CreateForm({
 
   return (
     <fieldset ref={part} className="tn-sub tn-create">
-      <legend>新建密钥</legend>
+      <legend className="sr-only">新建密钥</legend>
       <TextField label="名称" value={label} onChange={setLabel} error={at("/label")} />
       {tenant.is_internal ? (
         <TextField

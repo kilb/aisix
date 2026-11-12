@@ -4,11 +4,9 @@
 import { useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { Button } from "./Button";
 
-const SWAP_MS = 120;
-
 /**
  * A destructive action in two steps, in place (ruling P1b-R6): the first
- * click swaps the button for `确认<label>` in Stop red and `取消`, with
+ * click swaps the button for `确认<label>` and `取消`, with
  * `warning` on a line under them, and only the confirmation acts. Never
  * `window.confirm`, which leaves the page's own flow.
  *
@@ -16,12 +14,9 @@ const SWAP_MS = 120;
  * no, the first click acts. `kind` styles the first step only, and `danger`
  * makes the whole action read as destructive from its first click.
  *
- * The swap fades the new step in while the box eases from the old width
- * to the new one, over 120ms. Focus that was on the swapped control moves
- * to the safe choice, `取消`, when the step opens, so a second Enter takes
- * it back rather than acting, and back to the action when it closes.
- * Escape takes the step back too, and not the panel around it. The
- * warning is an `alert`, so it is heard when the step opens.
+ * 切换不播放入场动画。打开时把原控件持有的焦点交给安全选项“取消”，
+ * 再按 Enter 只会收回确认；关闭后归还操作。Escape 仅收回本确认，
+ * 不关闭外层面板。warning 使用 alert，展开时会读出。
  *
  * `busy` is the caller's request in flight (ruling 14). After 确认, the
  * step stays open while it is: the confirm button shows the spinner at its
@@ -56,23 +51,21 @@ export function TwoStep({
   warning?: ReactNode;
 }) {
   const [asking, setAsking] = useState(false);
-  const [swapped, setSwapped] = useState(false);
   // Confirmed, and open until the request it started has ended.
   const [confirmed, setConfirmed] = useState(false);
   const box = useRef<HTMLSpanElement>(null);
   const first = useRef<HTMLButtonElement>(null);
   const cancel = useRef<HTMLButtonElement>(null);
-  /** The box's width and whether it held focus, just before a swap. */
-  const before = useRef<{ width: number; focused: boolean } | null>(null);
+  /** 只记录切换前是否持有焦点，不动画测量宽度。 */
+  const before = useRef<{ focused: boolean } | null>(null);
   /** Whether the box held focus when the step was confirmed. */
   const held = useRef(false);
 
   function swap(next: boolean, focused?: boolean) {
     const el = box.current;
     before.current = el
-      ? { width: el.getBoundingClientRect().width, focused: focused ?? el.contains(document.activeElement) }
+      ? { focused: focused ?? el.contains(document.activeElement) }
       : null;
-    setSwapped(true);
     setAsking(next);
   }
 
@@ -95,11 +88,6 @@ export function TwoStep({
     const active = document.activeElement;
     const lost = active === null || active === document.body || el.contains(active);
     if (from.focused && lost) (asking ? cancel : first).current?.focus();
-    const to = el.getBoundingClientRect().width;
-    if (to === from.width || window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
-    el.classList.add("is-swapping");
-    const run = el.animate([{ width: `${from.width}px` }, { width: `${to}px` }], { duration: SWAP_MS, easing: "ease-out" });
-    run.onfinish = run.oncancel = () => el.classList.remove("is-swapping");
   }, [asking]);
 
   return (
@@ -121,14 +109,13 @@ export function TwoStep({
           disabled={disabled}
           busy={busy}
           busyLabel={busyLabel ?? label}
-          className={swapped ? "is-in" : undefined}
           onClick={() => (ask() ? swap(true) : onConfirm())}
         >
           {label}
         </Button>
       ) : (
         <>
-          <span className="two-step-confirm is-in">
+          <span className="two-step-confirm">
             <Button
               kind="danger"
               size={size}
@@ -148,7 +135,7 @@ export function TwoStep({
             </Button>
           </span>
           {warning && (
-            <span className="two-step-warn is-in" role="alert">
+            <span className="two-step-warn" role="alert">
               {warning}
             </span>
           )}

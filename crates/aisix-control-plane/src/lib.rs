@@ -45,6 +45,7 @@ pub mod tenants;
 pub mod upstream_http;
 pub mod upstream_models;
 pub mod usage;
+pub mod usage_metrics;
 
 use auth::password::{LoginThrottle, PasswordGate, ARGON2_GATE_PERMITS};
 use config::CpConfig;

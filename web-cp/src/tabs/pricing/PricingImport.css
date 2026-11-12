@@ -1,42 +1,103 @@
-/* 价格 · 导入审核. Every value comes from the tokens. */
-
-/* The upload sits above the list it feeds. */
+/* 导入审核：先展示当前读取范围，再逐批确认真实价格。 */
 .import-upload {
-  margin-bottom: var(--s-6);
+  margin-bottom: 12px;
 }
-
-/* The results of a confirmed selection, one line each. */
 .import-results {
   margin: 0;
-  padding-left: var(--s-5);
+  padding-left: 20px;
 }
-
-/* The checkbox column is a control, not a figure. */
 .dt .import-pick {
-  width: 32px;
+  width: 44px;
   padding-right: 0;
 }
-
-/* A flagged proposal's reasons are the point of its row, so they stay readable. */
 .import-flags {
-  color: var(--text-2);
+  color: var(--color-ink-soft);
 }
-
-/* One proposal's detail: where it came from, then what it holds. */
 .import-source {
-  margin: 0 0 var(--s-3);
+  margin: 16px 0 12px;
 }
 .import-compare {
-  margin: var(--s-4) 0;
+  margin: 16px 0;
 }
 .import-compare > .hint {
-  margin-top: var(--s-2);
+  margin-top: 8px;
 }
 .import-decide > .check {
-  margin-bottom: var(--s-2);
+  margin-bottom: 8px;
+}
+.import-updates {
+  margin-top: 16px;
 }
 
-/* The catalogue's own updates, shown in place of the proposals. */
-.import-updates {
-  margin-top: var(--s-4);
+.import-review-counts {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+  margin-top: 28px;
+  border-top: 1px solid color-mix(in srgb, var(--color-ink) 7%, transparent);
+  padding-top: 20px;
+}
+
+.import-review-counts > div + div {
+  border-left: 1px solid color-mix(in srgb, var(--color-ink) 7%, transparent);
+  padding-left: 16px;
+}
+
+.import-review-counts dt {
+  font-family: var(--font-mono);
+  font-size: var(--text-micro);
+  color: var(--color-muted);
+}
+
+.import-review-counts dd {
+  margin: 8px 0 0;
+  font-size: var(--text-stat);
+  line-height: 1.3;
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.import-selection-note {
+  margin-top: 24px;
+  border-top: 1px solid color-mix(in srgb, var(--color-surface) 12%, transparent);
+  padding-top: 20px;
+}
+
+.import-workspace {
+  gap: 12px;
+}
+
+.import-view-switch {
+  margin: 0 0 24px;
+  padding: 4px;
+  background: var(--color-well);
+  border: 0;
+  border-radius: 999px;
+}
+
+.import-view-switch > button {
+  min-height: 44px;
+  flex: 1 1 auto;
+  color: var(--color-ink-soft);
+}
+
+.import-view-switch > button[aria-pressed="true"] {
+  background: var(--color-surface);
+  color: var(--color-ink);
+  border-radius: 999px;
+}
+
+.import-view-switch > button[aria-pressed="true"]::after {
+  content: none;
+}
+
+.import-workspace .link-button {
+  min-height: 44px;
+}
+
+.import-bulk .cell-note,
+.import-bulk .hint {
+  color: var(--color-ink-soft);
+  overflow-wrap: anywhere;
 }

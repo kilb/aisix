@@ -132,7 +132,7 @@ function Form({ account, onChanged }: RegionProps) {
   const reasonProblem = local.reason ?? refused?.at.get("/reason") ?? null;
   return (
     <Region label="直接入账">
-      <p className="hint text-[13px]">直接给这个租户入账，用于线下收款或补偿。入账后租户在自己的充值记录里看到这笔入账和原因。</p>
+      <p className="hint text-caption">直接给这个租户入账，用于线下收款或补偿。入账后租户在自己的充值记录里看到这笔入账和原因。</p>
       <form ref={form} onSubmit={(e) => e.preventDefault()} noValidate>
         <div className="grid gap-x-4 sm:grid-cols-2">
           <Field label="金额（元）" error={amountProblem}>

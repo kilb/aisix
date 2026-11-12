@@ -30,10 +30,10 @@ export function RolloutBadge({ rollout }: { rollout: Rollout }) {
               : // A state a newer control plane added: shown as it is named.
                 String(state);
   return (
-    <span className="rollout" data-state={state}>
+    <span className="rollout text-caption" data-state={state}>
       <Lamp state={LAMP[state] ?? "disabled"}>{label}</Lamp>
       {state === "rejected" && rollout.rejections.length > 0 && (
-        <ul className="rollout-errors">
+        <ul className="rollout-errors text-caption text-ink-soft [overflow-wrap:anywhere]">
           {rollout.rejections.map((r) => (
             <li key={r.instance_id}>
               <code>{r.hostname || r.instance_id}</code>：{r.error}

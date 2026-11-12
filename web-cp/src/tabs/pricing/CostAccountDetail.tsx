@@ -12,14 +12,14 @@ import {
   type ModelGroupPriceRow,
 } from "../../lib/api";
 import { messageFor, problemAt } from "../../lib/errors";
-import { errorText } from "../../lib/fmt";
+import { errorText, fmtInt } from "../../lib/fmt";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
 import { EmptyState } from "../../ui/EmptyState";
 import { Field, useRefusalFocus } from "../../ui/Field";
 import { TwoStep } from "../../ui/TwoStep";
 import { useToast } from "../../ui/Toast";
-import { Card, CardHeader, PageHeader } from "../../components/page";
+import { BentoGrid, Card, CardHeader, CardMessage, Metric, MetricSkeleton, PageHeader, span } from "../../components/page";
 import { inForce, isZeroRate, scheduledWords } from "./GroupDetail";
 import { CardFooter, Count, FormGrid, WithForms } from "./kit";
 
@@ -61,6 +61,7 @@ export function CostAccountDetail({
   }, [load]);
 
   const name = account.display_name || account.id;
+  const unknown = rates?.models.filter((row) => inForce(row.rate, rates.default).rate === null).length ?? 0;
   const forms =
     canEdit && rates ? (
       <>
@@ -89,6 +90,8 @@ export function CostAccountDetail({
     <div className="grp-detail" role="region" aria-label={`上游账号 ${name}`}>
       <PageHeader
         title={name}
+        eyebrow="价格 / 账号成本明细"
+        dataLead={rates ? `${fmtInt(rates.models.length)} 个模型中，${fmtInt(unknown)} 个没有可用的成本换算率。` : "读取此账号的成本默认值与单模型覆盖。"}
         description={
           <>
             这个账号一次调用的成本是模型的官方美元价乘以这里的成本换算率。模型上的覆盖优先于账号默认；都没有时，成本记为未知。
@@ -112,9 +115,24 @@ export function CostAccountDetail({
           </Button>
         </div>
       )}
+      <BentoGrid className="mb-3">
+        <Card className={span.d7}>
+          <CardHeader number={1} title="账号服务模型 · 全部" />
+          {rates ? <Metric size="hero">{fmtInt(rates.models.length)}</Metric> : error ? <CardMessage onRetry={() => void load()}>数据读取失败</CardMessage> : <MetricSkeleton />}
+          <dl className="mt-6 border-t border-ink/7 pt-4">
+            <dt className="font-mono text-micro text-muted">现行默认成本换算率</dt>
+            <dd className="mt-1 text-stat tabular-nums">{rates === null ? "—" : rates.default.current?.cny_per_usd ?? "未设置"}</dd>
+          </dl>
+        </Card>
+        <Card tone="inverse" className={span.d5Wide}>
+          <CardHeader number={2} title="未设置成本换算率的模型" />
+          {rates ? <Metric size="display">{fmtInt(unknown)}</Metric> : error ? <CardMessage onRetry={() => void load()}>数据读取失败</CardMessage> : <MetricSkeleton />}
+          <p className="mt-4 text-caption text-on-inverse-muted">范围：此账号全部模型。默认与单模型覆盖均未设置时，成本记为未知；已设置换算率的调用仍需要生效的模型基准价。</p>
+        </Card>
+      </BentoGrid>
       <WithForms forms={forms}>
         <Card className="mb-0">
-          <CardHeader className="mb-0" title={<>模型成本换算率{rates && <Count n={rates.models.length} />}</>} />
+          <CardHeader number={3} className="mb-0" title={<>模型成本换算率{rates && <Count n={rates.models.length} />}</>} />
           {rates === null ? (
             !error && <Loading />
           ) : rates.models.length === 0 ? (
@@ -254,11 +272,12 @@ function DefaultCostRate({
   return (
     <Card ref={write.form} role="group" aria-label="修改默认成本换算率">
       <CardHeader
+        number={4}
         title="默认成本换算率"
         description={
           <span className="tabular">
             现在 <span className="grp-now font-medium text-foreground">{plan.current?.cny_per_usd ?? "未设置"}</span>
-            {later && <span className="mt-0.5 block text-xs">待生效 {later}</span>}
+            {later && <span className="mt-0.5 block text-caption">待生效 {later}</span>}
           </span>
         }
       />
@@ -337,7 +356,7 @@ function ModelCostRate({
 
   return (
     <Card ref={write.form} className="scroll-mt-20" role="group" aria-label={ending ? "结束覆盖" : "设置覆盖"}>
-      <CardHeader title={ending ? "结束覆盖" : "设置覆盖"} description={<span className="tabular font-medium text-foreground">{model.name}</span>} />
+      <CardHeader number={5} title={ending ? "结束覆盖" : "设置覆盖"} description={<span className="tabular font-medium text-ink">{model.name}</span>} />
       {ending ? <p className="hint mb-4">结束后这个模型回到账号的默认成本换算率。</p> : null}
       <FormGrid>
         {!ending && (
