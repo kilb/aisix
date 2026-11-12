@@ -229,7 +229,7 @@ export function PriceLibrary({ canEdit, onGoto }: TabProps) {
                       </td>
                       <td>
                         {href ? (
-                          <a href={href} target="_blank" rel="noopener noreferrer">
+                          <a href={href} target="_blank" rel="noopener noreferrer" className="inline-flex min-h-11 min-w-11 items-center">
                             价格页面
                           </a>
                         ) : e.pricing_url ? (
