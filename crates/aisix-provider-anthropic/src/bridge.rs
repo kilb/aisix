@@ -64,6 +64,11 @@ impl AnthropicBridge {
         }
     }
 
+    /// 返回消息请求实际使用的地址，包含声明的消息协议基础地址优先级。
+    pub fn outbound_url(pk: &aisix_core::ProviderKey) -> Result<String, BridgeError> {
+        Ok(format!("{}/v1/messages", resolve_base_for_key(pk)?))
+    }
+
     /// The client this dispatch runs on: the bridge's shared one, unless
     /// the resolved Provider Key carries its own connection overrides
     /// (TLS trust settings, a name-resolution address).
@@ -136,13 +141,16 @@ fn declared_messages_base(ctx: &BridgeContext) -> &str {
 /// together, or the translated and the verbatim path send one key to two
 /// different hosts.
 fn resolve_base(ctx: &BridgeContext) -> Result<String, BridgeError> {
+    resolve_base_for_key(&ctx.provider_key)
+}
+
+fn resolve_base_for_key(pk: &aisix_core::ProviderKey) -> Result<String, BridgeError> {
     // A Provider Key that declares `apis.messages` names where the
     // Anthropic wire lives on this upstream, which is where this bridge
     // dispatches — so the declaration has to reach here too, or the
     // `/v1/messages` passthrough and the translated path would send the
     // same upstream route to two different hosts.
-    if let Some(base) = ctx
-        .provider_key
+    if let Some(base) = pk
         .apis
         .as_ref()
         .and_then(|apis| apis.messages.as_ref())
@@ -154,7 +162,7 @@ fn resolve_base(ctx: &BridgeContext) -> Result<String, BridgeError> {
         aisix_gateway::validate_api_base("anthropic", base)?;
         return Ok(normalize_api_base(base));
     }
-    match ctx.provider_key.api_base.as_deref() {
+    match pk.api_base.as_deref() {
         Some(b) if !b.trim().is_empty() => {
             // Same check the Vertex and Azure bridges grew in #390.
             aisix_gateway::validate_api_base("anthropic", b.trim())?;
@@ -173,7 +181,7 @@ fn resolve_base(ctx: &BridgeContext) -> Result<String, BridgeError> {
             //
             // Pre-Phase-A rows (empty `ProviderKey.provider`) fall
             // through to the historical default-base path unchanged.
-            let pk_vendor_raw = ctx.provider_key.provider.as_str();
+            let pk_vendor_raw = pk.provider.as_str();
             let pk_vendor_normalized = pk_vendor_raw.trim().to_ascii_lowercase();
             if !pk_vendor_normalized.is_empty() && pk_vendor_normalized != "anthropic" {
                 // Operator-facing detail (route, provider topology,
@@ -184,7 +192,7 @@ fn resolve_base(ctx: &BridgeContext) -> Result<String, BridgeError> {
                 // wire contract a customer should depend on).
                 tracing::error!(
                     target: "aisix_provider_anthropic::bridge",
-                    pk_display_name = %ctx.provider_key.display_name,
+                    pk_display_name = %pk.display_name,
                     pk_vendor = %pk_vendor_raw,
                     "provider_key has no api_base; family bridge refusing fallback to \
                      api.anthropic.com. Operator action: populate `api_base` on the \

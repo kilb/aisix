@@ -39,7 +39,7 @@ export function WithForms({ forms, wide = false, children }: { forms: ReactNode;
     <BentoGrid className="items-start" data-wide-table={wide || undefined}>
       <div className={cn("min-w-0", span.d8)}>{children}</div>
       <div className={cn("min-w-0", span.d4, "tablet:col-span-12")}>
-        <div className="grid items-start gap-3 [&>.panel]:mb-0">
+        <div className="grid items-start gap-(--card-gap) [&>.panel]:mb-0">
           {forms}
         </div>
       </div>

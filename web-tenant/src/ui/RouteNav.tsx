@@ -1,6 +1,7 @@
 import { useLayoutEffect, useRef, type KeyboardEvent } from "react";
+import { cn } from "../lib/cn";
 
-// The portal's copy of the Dashboard's RouteNav (P2c-R4), horizontal.
+// 应用侧栏与卡内横向分组共用既有导航接口。
 
 export interface RouteItem<Id extends string> {
   id: Id;
@@ -9,7 +10,7 @@ export interface RouteItem<Id extends string> {
 
 /**
  * 文字导航保留手动激活的 tab 键盘模型：方向键、Home/End 移焦，Enter/Space 打开。
- * docked 表示应用顶导航，窄屏仍在顶部独立横滚；其余用分段或下划线外观。
+ * docked 表示侧栏或抽屉内的应用导航；其余保留分段或下划线外观。
  * tab 的 id、controls 和可访问名称沿用既有页面合同。
  */
 export function RouteNav<Id extends string>({
@@ -37,20 +38,18 @@ export function RouteNav<Id extends string>({
   // whenever the bar changes size (a font arriving, the phone layout).
   useLayoutEffect(() => {
     const nav = bar.current;
+    if (!nav) return;
+    if (docked) {
+      nav.querySelector<HTMLElement>('[aria-selected="true"]')?.scrollIntoView({ block: "nearest", inline: "nearest" });
+      return;
+    }
     const mark = lens.current;
-    if (!nav || !mark) return;
+    if (!mark) return;
     const place = () => {
       const tab = nav.querySelector<HTMLElement>('[aria-selected="true"]');
       if (!tab) {
         mark.style.opacity = "0";
         return;
-      }
-      if (docked) {
-        // 只滚动导航本身，深链或键盘激活末项不会移动整张页面。
-        const left = tab.offsetLeft;
-        const right = left + tab.offsetWidth;
-        if (left < nav.scrollLeft) nav.scrollLeft = left;
-        else if (right > nav.scrollLeft + nav.clientWidth) nav.scrollLeft = right - nav.clientWidth;
       }
       mark.style.opacity = "";
       mark.style.width = `${tab.offsetWidth}px`;
@@ -74,8 +73,8 @@ export function RouteNav<Id extends string>({
     if (at < 0) return;
     const last = tabs.length - 1;
     const next =
-      e.key === "ArrowRight" ? (at === last ? 0 : at + 1)
-      : e.key === "ArrowLeft" ? (at === 0 ? last : at - 1)
+      e.key === "ArrowRight" || (docked && e.key === "ArrowDown") ? (at === last ? 0 : at + 1)
+      : e.key === "ArrowLeft" || (docked && e.key === "ArrowUp") ? (at === 0 ? last : at - 1)
       : e.key === "Home" ? 0
       : e.key === "End" ? last
       : null;
@@ -84,11 +83,38 @@ export function RouteNav<Id extends string>({
     tabs[next]?.focus();
   }
 
-  const kind = docked ? "route route-topnav" : look === "underline" ? "route route-line" : "route route-seg";
+  if (docked) {
+    return (
+      <nav ref={bar} className={cn("shell-route-nav", className)} role="tablist" aria-label={label} aria-orientation="vertical" onKeyDown={onKeyDown}>
+        <ol className="shell-route-list" role="presentation">
+          {items.map((t) => (
+            <li key={t.id} className="shell-route-item" role="presentation">
+              <button
+                type="button"
+                role="tab"
+                className="shell-route-stop"
+                id={`stop-${t.id}`}
+                data-tab={t.id}
+                aria-selected={t.id === current}
+                aria-current={t.id === current ? "page" : undefined}
+                aria-controls={`tab-${t.id}`}
+                tabIndex={t.id === current ? 0 : -1}
+                onClick={() => onSelect(t.id)}
+              >
+                <span className="stop-name">{t.label}</span>
+              </button>
+            </li>
+          ))}
+        </ol>
+      </nav>
+    );
+  }
+
+  const kind = look === "underline" ? "route route-line" : "route route-seg";
   return (
     <nav
       ref={bar}
-      className={className ? `${kind} ${className}` : kind}
+      className={cn(kind, className)}
       role="tablist"
       aria-label={label}
       onKeyDown={onKeyDown}
@@ -102,7 +128,6 @@ export function RouteNav<Id extends string>({
           id={`stop-${t.id}`}
           data-tab={t.id}
           aria-selected={t.id === current}
-          aria-current={docked && t.id === current ? "page" : undefined}
           aria-controls={`tab-${t.id}`}
           tabIndex={t.id === current ? 0 : -1}
           onClick={() => onSelect(t.id)}

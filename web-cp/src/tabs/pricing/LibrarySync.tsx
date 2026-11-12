@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useId, useRef, useState } from "react";
 import {
   ApiError,
   library,
@@ -11,10 +11,10 @@ import {
 } from "../../lib/api";
 import { messageFor } from "../../lib/errors";
 import { errorText } from "../../lib/fmt";
+import { fmtUtc } from "../../lib/money";
 import { droppedFieldText, flagText } from "../../lib/importReview";
 import {
   byState,
-  cardLines,
   longContextChange,
   longContextLines,
   longContextText,
@@ -29,6 +29,8 @@ import { EmptyState } from "../../ui/EmptyState";
 import { useToast } from "../../ui/Toast";
 import { cn } from "../../lib/cn";
 import { Card, CardHeader, Metric } from "../../components/page";
+import { PriceCardDetails } from "./PriceCardDetails";
+import { cardDetails } from "./cardDetails";
 
 /** The attestation's own words: the checkbox's text, as the import's confirmation gives it. */
 const ATTESTATION = "已对照官方价格页核对";
@@ -51,19 +53,37 @@ function failureText(e: unknown): string {
   return details.length > 0 ? `${messageFor(e)}：${details.join("；")}` : messageFor(e);
 }
 
-/** The lines of a card, one per tier and band, or a dash. */
+/** 旧入口保留，完整价格改为按档位分组的只读表。 */
 export function CardLines({ card }: { card: unknown }) {
-  const lines = cardLines((card ?? null) as Parameters<typeof cardLines>[0]);
-  if (lines.length === 0) return <>—</>;
-  return (
-    <span className="library-card flex flex-col gap-1 text-caption [overflow-wrap:anywhere]">
-      {lines.map((line) => (
-        <span key={line} className="tabular">
-          {line}
-        </span>
-      ))}
-    </span>
-  );
+  return <PriceCardDetails card={card} compact />;
+}
+
+/** 批量清单只展示基础摘要，完整维度在对应模型的展开行中核对。 */
+function CardSummary({ card }: { card: unknown }) {
+  const view = cardDetails(card);
+  const tier = view.tiers[0];
+  if (view.problem) return <span className="cell-note">价格卡无法读取，请展开查看原文</span>;
+  if (!tier) return <span className="cell-note">未提供价格卡</span>;
+  const headline = tier.bands[0]?.rates.filter((rate) => ["input", "output", "web_search"].includes(rate.key)) ?? [];
+  const contexts = view.tiers.reduce((n, t) => n + t.bands.length - 1, 0);
+  return <div className="library-price-summary">
+    <span>{tier.label}档 · 基础价</span>
+    <span className="tabular">{headline.length ? headline.map((rate) => `${rate.label} ${rate.amount}${rate.key === "web_search" ? " / 千次" : ""}`).join(" · ") : "完整计量项见价格对照"}</span>
+    {headline.some((rate) => rate.key !== "web_search") && <span className="cell-note">token 单价：美元/百万 tokens</span>}
+    <span className="cell-note">{view.tiers.length} 个档位 · {contexts} 个长上下文分组</span>
+  </div>;
+}
+
+function PriceComparison({ name, current, entry }: { name: string; current: BaselineRevision | null; entry: LibraryEntry | null }) {
+  const [open, setOpen] = useState(false);
+  const id = useId();
+  return <div className="library-price-comparison">
+    <Button type="button" kind="quiet" size="sm" aria-expanded={open} aria-controls={open ? id : undefined} aria-label={`${open ? "收起" : "展开"} ${name} 的完整价格对照`} onClick={() => setOpen((value) => !value)}>{open ? "收起完整价格对照" : "展开完整价格对照"}</Button>
+    {open && <div id={id} className="library-price-comparison-grid" role="region" aria-label={`${name} 的完整价格对照`}>
+      <section><h3>现行基准价</h3>{current ? <><p className="cell-note">版本 #{current.revision_id} · 生效于 {fmtUtc(current.effective_from)}</p><PriceCardDetails card={current.card} label={`${name} 的现行完整基准价`} compact /></> : <p className="hint">未定价</p>}</section>
+      <section><h3>价格库目标价</h3>{entry ? <><p className="cell-note">{entry.provider}/{entry.model}</p><PriceCardDetails card={entry.card} label={`${name} 的目标完整价格`} compact /></> : <p className="hint">选择价格来源后查看目标完整价格。</p>}</section>
+    </div>}
+  </div>;
 }
 
 /** 「含长上下文价」 and its bands, when the card carries one; nothing otherwise. */
@@ -372,14 +392,14 @@ export function LibrarySync({ canEdit, generation, cardNumber = 4 }: { canEdit: 
               同步失败：{failure}
             </div>
           )}
-          <DataTable label="同步预览">
+          <div className="library-sync-table"><DataTable label="同步预览">
             <thead>
               <tr>
                 <th>模型</th>
                 <th>状态</th>
                 <th>价格库条目</th>
-                <th>现行基准价</th>
-                <th>价格库价格（美元/百万 tokens）</th>
+                <th>现行基准价（美元）</th>
+                <th>价格库价格（美元）</th>
               </tr>
             </thead>
             <tbody>
@@ -390,7 +410,7 @@ export function LibrarySync({ canEdit, generation, cardNumber = 4 }: { canEdit: 
                     ? null
                     : longContextChange(row.entry?.card ?? null, item.current?.card ?? null);
                 return (
-                  <tr key={item.model_id} data-model={item.name} data-state={item.state} data-shown={row.state}>
+                  <Fragment key={item.model_id}><tr data-model={item.name} data-state={item.state} data-shown={row.state}>
                     <td className="font-medium">
                       <span className="trunc" title={item.name}>
                         {item.name}
@@ -418,15 +438,18 @@ export function LibrarySync({ canEdit, generation, cardNumber = 4 }: { canEdit: 
                         </span>
                       )}
                     </td>
-                    <td className="text-caption">{item.current ? <CardLines card={item.current.card} /> : "未定价"}</td>
+                    <td className="text-caption">{item.current ? <CardSummary card={item.current.card} /> : "未定价"}</td>
                     <td className="text-caption">
-                      {row.state === "ambiguous" || row.state === "unmatched" ? "—" : <CardLines card={row.entry?.card} />}
+                      {row.state === "ambiguous" || row.state === "unmatched" ? "—" : <CardSummary card={row.entry?.card} />}
                     </td>
                   </tr>
+                  <tr className="library-sync-detail-row"><td colSpan={5}>
+                    <PriceComparison name={item.name} current={item.current} entry={row.state === "ambiguous" || row.state === "unmatched" ? null : row.entry} />
+                  </td></tr></Fragment>
                 );
               })}
             </tbody>
-          </DataTable>
+          </DataTable></div>
         </>
       )}
     </Card>
@@ -555,10 +578,10 @@ export function LibrarySyncOne({
           {item.state === "ambiguous" && !chosen && <p className="hint">价格库中有多个候选条目：请选择价格来源。</p>}
           {item.state === "unmatched" && <p className="hint">价格库中没有与模型名称对应的条目。</p>}
           {entry && item.state !== "flagged" && (
-            <p className="library-card-block rounded-cell bg-well p-4 text-caption text-ink-soft">
-              价格库价格（美元/百万 tokens）：
+            <div className="library-card-block rounded-cell bg-well p-4 text-caption text-ink-soft">
+              <p className="m-0 font-medium">价格库完整价格 · 美元</p>
               <CardLines card={entry.card} />
-            </p>
+            </div>
           )}
           {entry && Object.keys(entry.card ?? {}).some((t) => t !== "default") && <p className="hint">{TIER_HINT}</p>}
           {warning && <p className="hint">{warning}</p>}

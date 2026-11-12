@@ -7,7 +7,7 @@ export interface RouteItem<Id extends string> {
   icon?: ComponentType<{ className?: string; "aria-hidden"?: boolean }>;
 }
 
-/** 顶部文字分区导航，保留键盘漫游与需要关注事项的文字说明。 */
+/** 侧栏分区导航，保留键盘漫游与需要关注事项的文字说明。 */
 export function RouteNav<Id extends string>({
   items,
   current,
@@ -25,11 +25,11 @@ export function RouteNav<Id extends string>({
   const list = useRef<HTMLOListElement>(null);
   const tabs = () => [...(list.current?.querySelectorAll<HTMLButtonElement>('[role="tab"]') ?? [])];
 
-  // 当前入口始终在导航自己的横向滚动区域中可见。
+  // 当前入口始终在侧栏自己的滚动区域中可见。
   useEffect(() => {
     list.current
       ?.querySelector<HTMLElement>('[aria-selected="true"]')
-      ?.scrollIntoView({ block: "nearest", inline: "center" });
+      ?.scrollIntoView({ block: "nearest", inline: "nearest" });
   }, [current]);
 
   function onKeyDown(e: KeyboardEvent<HTMLOListElement>) {
@@ -52,27 +52,29 @@ export function RouteNav<Id extends string>({
   }
 
   return (
-    <nav className="cp-route-nav">
+    <nav className="shell-route-nav">
       <ol
         ref={list}
         role="tablist"
         aria-label={label}
-        aria-orientation="horizontal"
+        aria-orientation="vertical"
         onKeyDown={onKeyDown}
-        className="cp-route-list"
+        className="shell-route-list"
       >
         {items.map((t) => {
           const note = attention[t.id];
           const selected = current === t.id;
+          const Icon = t.icon;
           return (
-            <li key={t.id} role="presentation">
+            <li key={t.id} role="presentation" className="shell-route-item">
               <button
                 type="button"
                 role="tab"
-                className="route-stop cp-route-stop"
+                className="shell-route-stop"
                 id={`stop-${t.id}`}
                 data-tab={t.id}
                 data-attention={note ? "" : undefined}
+                aria-label={t.label}
                 aria-selected={selected}
                 aria-current={selected ? "page" : undefined}
                 aria-controls={`tab-${t.id}`}
@@ -80,6 +82,7 @@ export function RouteNav<Id extends string>({
                 tabIndex={selected ? 0 : -1}
                 onClick={() => onSelect(t.id)}
               >
+                {Icon && <Icon className="shell-route-icon" aria-hidden />}
                 <span className="stop-name">{t.label}</span>
                 {note && <span aria-hidden="true" className="cp-attention">!</span>}
               </button>

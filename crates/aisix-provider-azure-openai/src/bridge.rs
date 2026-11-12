@@ -90,13 +90,38 @@ impl AzureOpenAiBridge {
     /// share a connection pool with other bridges or pin custom
     /// timeouts. Public surface — not test-only.
     pub fn with_client(client: Client) -> Self {
+        Self::with_clients(client.clone(), client)
+    }
+
+    /// 分别指定模型连接和凭据交换连接；凭据端点不继承模型的 TLS 或地址覆盖。
+    pub fn with_clients(client: Client, credential_client: Client) -> Self {
         Self {
-            token_minter: Arc::new(TokenMinter::new(client.clone())),
+            token_minter: Arc::new(TokenMinter::new(credential_client)),
             client,
             name: "azure-openai",
             #[cfg(test)]
             url_override: None,
         }
+    }
+
+    /// 返回这次调用可能连接的模型和凭据地址，供调用方使用同一出站策略预检。
+    pub fn outbound_urls(
+        &self,
+        pk: &aisix_core::ProviderKey,
+        deployment: &str,
+        embedding: bool,
+    ) -> Result<(String, Option<String>), BridgeError> {
+        let upstream = AzureUpstreamRef::resolve(deployment, pk.api_base.as_deref())?;
+        let model = if embedding {
+            upstream.embeddings_url()
+        } else {
+            upstream.chat_completions_url()
+        };
+        let credential = match AzureSecret::parse(&pk.api_key)? {
+            AzureSecret::ApiKey(_) => None,
+            AzureSecret::Aad(creds) => Some(self.token_minter.resolve_token_endpoint(&creds)),
+        };
+        Ok((model, credential))
     }
 
     /// The client this dispatch runs on: the bridge's shared one, unless

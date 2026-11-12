@@ -65,7 +65,7 @@
 }
 
 .import-workspace {
-  gap: 12px;
+  gap: var(--card-gap);
 }
 
 .import-view-switch {

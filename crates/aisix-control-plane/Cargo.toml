@@ -14,14 +14,22 @@ aisix-core = { path = "../aisix-core" }
 # The pricing engine: each stored usage row is priced by it, inside the
 # transaction that stores the row.
 aisix-pricing = { path = "../aisix-pricing" }
-# The one outbound fetch the control plane makes (`upstream_http`): its
-# `ssrf` route check, its `response_tap` scope, and its error scrubber.
-# Default features: the `aws` feature exists for the Bedrock arms, which
-# this binary has no dispatch for.
+# 出站访问共用 SSRF、凭据捕获和脱敏；模型探测复用网关的适配器。
 aisix-gateway = { path = "../aisix-gateway" }
-# The one outbound client, for `GET /admin/provider-keys/{id}/upstream-models`.
-# No `stream`: the body is read to a cap and buffered, never streamed on.
-reqwest = { version = "0.12", default-features = false, features = ["json", "cookies", "rustls-tls"] }
+# 探测复用网关的协议适配，不维护第二套请求或流解析。
+aisix-provider-openai = { path = "../aisix-provider-openai" }
+aisix-provider-anthropic = { path = "../aisix-provider-anthropic" }
+aisix-provider-azure-openai = { path = "../aisix-provider-azure-openai" }
+aisix-provider-vertex = { path = "../aisix-provider-vertex" }
+aisix-provider-bedrock = { path = "../aisix-provider-bedrock" }
+# 模型列表有界缓冲，手动探测则按协议读取流。
+reqwest = { version = "0.12", default-features = false, features = ["json", "cookies", "rustls-tls", "stream"] }
+# Bedrock 探测沿用已受出站策略保护的连接，事件流不缓冲成完整响应。
+aws-smithy-runtime-api = { version = "1", features = ["client", "http-1x"] }
+aws-smithy-types = { version = "1", features = ["http-body-1-x"] }
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 # Runtime queries (`sqlx::query`), never the `query!` macros: those need a

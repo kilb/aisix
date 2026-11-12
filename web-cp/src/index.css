@@ -78,22 +78,22 @@
   --font-sans: var(--font-sans);
   --font-mono: var(--font-mono);
 
-  --text-hero: clamp(56px, 9vw, 104px);
-  --text-hero--line-height: 0.85;
-  --text-hero--letter-spacing: -0.06em;
-  --text-display: 72px;
-  --text-display--line-height: 0.88;
-  --text-display--letter-spacing: -0.05em;
-  --text-figure: 60px;
-  --text-figure--line-height: 0.9;
-  --text-figure--letter-spacing: -0.05em;
-  --text-value: 32px;
-  --text-value--line-height: 1;
-  --text-value--letter-spacing: -0.04em;
-  --text-title: 60px;
-  --text-title--line-height: 1;
-  --text-title--letter-spacing: -0.04em;
-  --text-lead: 19px;
+  --text-hero: var(--type-hero);
+  --text-hero--line-height: 1.1;
+  --text-hero--letter-spacing: -0.025em;
+  --text-display: var(--type-display);
+  --text-display--line-height: 1.15;
+  --text-display--letter-spacing: -0.025em;
+  --text-figure: var(--type-figure);
+  --text-figure--line-height: 1.2;
+  --text-figure--letter-spacing: -0.02em;
+  --text-value: var(--type-value);
+  --text-value--line-height: 1.25;
+  --text-value--letter-spacing: -0.015em;
+  --text-title: var(--type-title);
+  --text-title--line-height: 1.3;
+  --text-title--letter-spacing: -0.025em;
+  --text-lead: var(--type-lead);
   --text-lead--line-height: 1.6;
   --text-stat: 16px;
   --text-stat--line-height: 1.3;
@@ -110,7 +110,7 @@
   --text-micro: 11px;
   --text-micro--line-height: 1.35;
 
-  --radius-card: 24px;
+  --radius-card: var(--r-card);
   --radius-cell: 10px;
   --radius-chip: 8px;
   --radius-bar: 4px;

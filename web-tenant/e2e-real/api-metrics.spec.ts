@@ -187,6 +187,13 @@ test("真实请求、响应缓存与中断用量完整聚合，统计分母和�
   const displayedMetricsAnswer = page.waitForResponse((response) => new URL(response.url()).pathname.endsWith("/api/usage/metrics") && response.status() === 200);
   await page.getByRole("tab", { name: "用量", exact: true }).click();
   const displayedMetrics = await (await displayedMetricsAnswer).json();
+  const health = page.getByRole("group", { name: "请求成功率摘要", exact: true });
+  await expect(health).toBeVisible();
+  await definition(health, "成功率", "75%");
+  await definition(health, "成功", "3");
+  await definition(health, "失败", "1");
+  await definition(health, "未知", "0");
+  await page.getByRole("button", { name: "请求", exact: true }).click();
   const panel = page.getByRole("region", { name: "完整 API 指标", exact: true });
   await expect(panel).toBeVisible();
   await expect(panel.getByText("最终请求", { exact: true })).toBeVisible();

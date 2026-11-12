@@ -2,6 +2,8 @@ import { Plus, RefreshCw, Trash2, Waypoints } from "lucide-react";
 import { Fragment, useEffect, useId, useRef, useState, type ReactNode } from "react";
 import type { TabProps } from "../App";
 import { ConflictNote } from "../components/ConflictNote";
+import { DirectModelProbe } from "../components/DirectModelProbe";
+import { probeDirectModel } from "../lib/directModelProbeApi";
 import { Field, useRefusalFocus } from "../ui/Field";
 import { Msg, type Note } from "../components/Msg";
 import { RolloutBadge } from "../components/RolloutBadge";
@@ -186,7 +188,7 @@ function ServedGroups({ children, className }: { children: ReactNode; className?
  * routing document, every account's direct document and the account
  * mappings go, or the retire is refused with what still names the model.
  */
-export function Models({ canEdit }: TabProps) {
+export function Models({ canEdit, operator }: TabProps) {
   const models = useResource<ModelDoc>("models");
   const accounts = useResource<AccountDoc>("provider_keys");
   const [publics, setPublics] = useState<PublicModel[] | null>(null);
@@ -522,6 +524,13 @@ export function Models({ canEdit }: TabProps) {
           <div><dt>内部直连目标</dt><dd>{models.items ? counts.internal : "—"}</dd></div>
         </dl>
       </InventorySummary>
+      <DirectModelProbe
+        models={models.items}
+        accounts={accounts.items}
+        loadError={models.error !== null}
+        canProbe={operator.role === "admin"}
+        probe={probeDirectModel}
+      />
       <div className="mb-6 grid gap-3 empty:hidden [&>.note]:m-0">
         <Msg note={note} />
         {deleteFailure &&
@@ -1301,7 +1310,7 @@ const MANUAL_ROW = "grid grid-cols-2 items-start gap-x-3 gap-y-2 @lg:grid-cols-[
 
 /** A form card's closing bar: its buttons at the bottom right, on a muted strip the card's width. */
 const FORM_FOOTER =
-  "-mx-7 -mb-7 mt-6 flex max-w-none flex-wrap items-center justify-end gap-2 rounded-b-card border-t border-line bg-well px-7 py-3 [&_.hint]:text-ink-soft";
+  "-mx-[var(--pad)] -mb-[var(--pad)] mt-6 flex max-w-none flex-wrap items-center justify-end gap-2 rounded-b-card border-t border-line bg-well px-[var(--pad)] py-3 [&_.hint]:text-ink-soft";
 
 /**
  * A field in a row of fields: its label above it while the row is stacked,

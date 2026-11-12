@@ -25,7 +25,6 @@ import { BentoGrid, Card, CardFooter, CardHeader, CardMessage, Metric, MetricSke
 import { BudgetProgress } from "./components/charts";
 import { UsageCostCard, UsageModelsCard, UsageRequestCard } from "./components/UsageAnalytics";
 import { ApiMetricsPanel } from "./components/ApiMetricsPanel";
-import { CreateMember } from "./CreateMember";
 
 export const ROLE_LABEL: Record<MemberRole, string> = {
   owner: "所有者",
@@ -115,8 +114,6 @@ export function Org({ member, status }: { member: SessionMember; status: TenantS
     return () => { live = false; };
   }, [access.usage, access.budgets, access.billing, member.id, member.role, range.from, range.to, refresh]);
 
-  const canCreate = org?.status === "active" && (member.role === "owner" || member.role === "admin");
-  const roles: MemberRole[] = member.role === "owner" ? ["owner", "admin", "member", "billing"] : ["admin", "member", "billing"];
   const summary = rows === null ? null : summarizeUsage(rows);
   const rangeLabel = "最近 30 天（UTC）";
   const scopeLabel = member.role === "member" ? "你的密钥" : "全组织";
@@ -131,14 +128,15 @@ export function Org({ member, status }: { member: SessionMember; status: TenantS
       {shown === "suspended" && <div className="note crit mb-3">组织已被停用，请联系平台</div>}
       {err && <div className="note crit mb-3" role="alert">{err}</div>}
       <BentoGrid>
+        <ApiMetricsPanel compact refreshKey={refresh} scope="tenant" enabled={access.usage} from={range.from} to={range.to} numberStart={1} className={span.d12} />
         {access.usage && <>
-          <UsageRequestCard rows={rows} error={usageErr} rangeLabel={`${rangeLabel} · ${scopeLabel}`} number={1} className={span.d8} onRetry={retry} />
-          <UsageCostCard rows={rows} error={usageErr} rangeLabel={`${rangeLabel} · ${scopeLabel}`} number={2} className={span.d4} onRetry={retry} />
-          <OverviewBudgets budgets={budgets} error={budgetErr} balance={balance} balanceError={balanceErr} showBalance={access.billing} onRetry={retry} />
-          <UsageModelsCard rows={rows} error={usageErr} rangeLabel={`${rangeLabel} · ${scopeLabel}`} number={4} className={span.d3} onRetry={retry} />
+          <UsageRequestCard rows={rows} error={usageErr} rangeLabel={`${rangeLabel} · ${scopeLabel}`} number={3} className={span.d8} onRetry={retry} />
+          <UsageCostCard rows={rows} error={usageErr} rangeLabel={`${rangeLabel} · ${scopeLabel}`} number={4} className={span.d4} onRetry={retry} />
+          <OverviewBudgets number={5} budgets={budgets} error={budgetErr} balance={balance} balanceError={balanceErr} showBalance={access.billing} onRetry={retry} />
+          <UsageModelsCard rows={rows} error={usageErr} rangeLabel={`${rangeLabel} · ${scopeLabel}`} number={6} className={span.d3} onRetry={retry} />
         </>}
         <Card className={access.usage ? span.d4 : span.d6}>
-          <CardHeader number={access.usage ? 5 : 1} title="组织资料" />
+          <CardHeader number={access.usage ? 7 : 1} title="组织资料" />
           {org === null ? err ? <CardMessage onRetry={retry}>组织资料加载失败</CardMessage> : <MetricSkeleton /> : <dl>
             <Reading label="名称" value={org.name} title={org.name} />
             <Reading label="状态" value={STATUS_LAMP[shown] ? <Lamp state={STATUS_LAMP[shown]}>{STATUS_LABEL[shown]}</Lamp> : shown} />
@@ -147,17 +145,14 @@ export function Org({ member, status }: { member: SessionMember; status: TenantS
             <Reading label="单个密钥的每分钟请求上限" value={cap(org.limits.key_rpm_max)} />
           </dl>}
         </Card>
-        <ApiMetricsPanel refreshKey={refresh} scope="tenant" enabled={access.usage} from={range.from} to={range.to} numberStart={6} className={span.d12} />
-        {canCreate && <div className={span.d6}>
-          <CreateMember number={8} roles={roles} labels={ROLE_LABEL} onInactive={retry} />
-        </div>}
-        <PasswordForm primary={!canCreate} number={access.usage ? canCreate ? 9 : 8 : 2} className={access.usage && !canCreate ? span.d12 : span.d6} />
+        <PasswordForm primary={true} number={access.usage ? 8 : 2} className={access.usage ? span.d12 : span.d6} />
       </BentoGrid>
     </>
   );
 }
 
-export function OverviewBudgets({ budgets, error, balance, balanceError, showBalance, onRetry }: {
+export function OverviewBudgets({ budgets, error, balance, balanceError, showBalance, onRetry, number = 3 }: {
+  number?: number;
   budgets: Budget[] | null;
   error: string | null;
   balance: FormulaBalance | null;
@@ -170,7 +165,7 @@ export function OverviewBudgets({ budgets, error, balance, balanceError, showBal
   const credit = balance === null ? null : exactOverviewAmount(balance, "credit_limit_micro_cny");
   const shown = [...(budgets ?? [])].filter((budget) => budget.target_live).sort((a, b) => Number(b.exhausted) - Number(a.exhausted)).slice(0, 2);
   return <Card className={span.d5}>
-    <CardHeader number={3} title={showBalance ? "账户与预算" : "我的预算"} actions={<a className="inline-flex min-h-11 items-center text-caption underline underline-offset-4" href="#budgets">全部预算 ↗</a>} />
+    <CardHeader number={number} title={showBalance ? "账户与预算" : "我的预算"} actions={<a className="inline-flex min-h-11 items-center text-caption underline underline-offset-4" href="#budgets">全部预算 ↗</a>} />
     {showBalance && <div className="mb-6">
       <p className="text-micro text-muted">账户可用额度</p>
       {balanceError ? <CardMessage onRetry={onRetry}>{balanceError}</CardMessage> : balance === null ? <MetricSkeleton /> : <>

@@ -61,15 +61,29 @@
   color: var(--color-ink-soft);
 }
 
-/* 价格表在自身滚动容器内展开，完整档位与维度均保持可读。 */
-.library-complete-card {
-  min-inline-size: 24rem;
-  max-inline-size: 36rem;
-  white-space: normal;
-}
+/* 清单保留短摘要，完整价格在独立整行展开，避免撑大每个普通行。 */
+.library-browser-table { min-width: 0; max-width: 100%; container-type: inline-size; }
+.library-browser-table > .dt-wrap > .dt { table-layout: fixed; min-width: 62rem; }
+.library-browser-table > .dt-wrap > .dt > thead > tr > th:nth-child(1) { width: 7rem; }
+.library-browser-table > .dt-wrap > .dt > thead > tr > th:nth-child(2) { width: 20rem; }
+.library-browser-table > .dt-wrap > .dt > thead > tr > th:nth-child(3),
+.library-browser-table > .dt-wrap > .dt > thead > tr > th:nth-child(4) { width: 11rem; }
+.library-browser-table > .dt-wrap > .dt > thead > tr > th:nth-child(5) { width: 10rem; }
+.library-browser-table > .dt-wrap > .dt > tbody > tr > td:nth-child(2) { white-space: normal; overflow-wrap: anywhere; }
+.library-browser-table > .dt-wrap > .dt > tbody > tr > td.library-expanded-cell { padding: 0; }
+.library-expanded-price { box-sizing: border-box; width: min(100cqw, 64rem); max-width: 100%; padding: 20px 16px; contain: inline-size; }
+.library-expanded-price > header { margin-bottom: 16px; }
+.library-expanded-price > header h3 { margin: 0; font-size: var(--text-body); font-weight: 500; overflow-wrap: anywhere; }
+.library-expanded-price > header p { margin: 4px 0 0; color: var(--color-muted); font-size: var(--text-caption); overflow-wrap: anywhere; }
 
-.library-complete-card .library-card {
-  gap: 0.75rem;
-  color: var(--color-ink-soft);
-  overflow-wrap: anywhere;
-}
+/* 批量审核先扫摘要，再按模型展开；长矩阵不挤进普通清单单元格。 */
+.library-sync-table { min-width: 0; max-width: 100%; container-type: inline-size; }
+.library-price-summary { display: grid; gap: 4px; min-width: 12rem; max-width: 18rem; white-space: normal; overflow-wrap: anywhere; }
+.library-price-summary > span:first-child { font-size: var(--text-micro); color: var(--color-muted); }
+.library-sync-table > .dt-wrap > .dt > tbody > .library-sync-detail-row > td { padding-top: 0; padding-bottom: 12px; white-space: normal; }
+.library-price-comparison { box-sizing: border-box; width: calc(100cqw - 40px); max-width: 100%; contain: inline-size; }
+.library-price-comparison-grid { display: grid; min-width: 0; gap: 16px; margin-top: 12px; }
+.library-price-comparison-grid > section { min-width: 0; }
+.library-price-comparison-grid h3 { margin: 0 0 8px; font-size: var(--text-body); font-weight: 500; }
+.library-price-comparison-grid .cell-note { margin: 0 0 12px; }
+@container (min-width: 56rem) { .library-price-comparison-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }

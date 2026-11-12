@@ -450,7 +450,7 @@ export function Cache({ canEdit, onGoto }: TabProps) {
           )}
         </div>
       )}
-      <div className="-mx-7 -mb-7 mt-2 flex justify-end gap-2 rounded-b-card border-t border-line bg-well px-7 py-3 [&_.hint]:text-ink-soft">
+      <div className="-mx-[var(--pad)] -mb-[var(--pad)] mt-2 flex flex-wrap justify-end gap-2 rounded-b-card border-t border-line bg-well px-[var(--pad)] py-3 [&_.hint]:text-ink-soft">
         <Button type="button" onClick={() => setForm(null)}>
           {readOnly ? "关闭" : "取消"}
         </Button>

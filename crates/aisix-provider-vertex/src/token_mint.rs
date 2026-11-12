@@ -294,6 +294,8 @@ impl TokenMinter {
             .map_err(|e| BridgeError::Config(format!("vertex JWT sign failed: {e}")))?;
 
         let endpoint = self.resolve_token_endpoint(sa);
+        aisix_gateway::note_url_userinfo(&endpoint);
+        aisix_gateway::note_sent_credential(&jwt);
         let resp = self
             .client
             .post(&endpoint)
@@ -321,16 +323,16 @@ impl TokenMinter {
             // 429/503 from GCP flows the upstream backoff hint into the
             // cooldown layer.
             let retry_after = aisix_gateway::parse_retry_after(resp.headers());
-            // Cap body to 500 chars to keep error messages bounded.
-            // GCP returns OAuth-shape errors `{error, error_description}`
-            // — text is operator-actionable (invalid_grant etc.) and
-            // does not echo the SA's private key.
             let body =
                 aisix_gateway::read_body_capped(resp, aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES)
                     .await;
             let text = String::from_utf8_lossy(body.whole()).into_owned();
             let read_error = body.read_error;
-            let truncated: String = text.chars().take(500).collect();
+            // 先完整脱敏再截断，避免长断言被截成无法精确替换的片段。
+            let truncated: String = aisix_gateway::scrub_upstream_error_text(&text)
+                .chars()
+                .take(500)
+                .collect();
             let msg = format!("vertex token mint upstream returned HTTP {status}: {truncated}");
             // Audit MEDIUM (PR #387): classify 5xx as a transient
             // upstream failure (502 with cooldown semantics) rather
@@ -397,6 +399,74 @@ mod tests {
             private_key: private_pem.to_string(),
             client_email: "tester@my-proj.iam.gserviceaccount.com".into(),
             token_uri: token_uri.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn token_endpoint_errors_scrub_sent_credentials_before_truncating() {
+        for status in [400, 503] {
+            let (private_pem, _) = test_key_pair();
+            let server = MockServer::builder().start().await;
+            Mock::given(method("POST"))
+                .respond_with(move |req: &Request| {
+                    let body = std::str::from_utf8(&req.body).unwrap();
+                    let assertion = body
+                        .split('&')
+                        .find_map(|field| field.strip_prefix("assertion="))
+                        .unwrap();
+                    assert!(assertion.len() > 500);
+                    ResponseTemplate::new(status).set_body_string(format!(
+                        "invalid_grant assertion={assertion}; retry with updated credentials"
+                    ))
+                })
+                .mount(&server)
+                .await;
+            let sa = sample_sa(&private_pem, &server.uri());
+            let minter = TokenMinter::new(Client::new()).with_token_endpoint_override(server.uri());
+            let err = aisix_gateway::response_tap::scope(
+                Arc::new(aisix_gateway::response_tap::ResponseHeaderTap::default()),
+                minter.get_token(&sa),
+            )
+            .await
+            .unwrap_err();
+            for shown in [err.to_string(), format!("{err:?}")] {
+                assert!(
+                    shown.contains("assertion=<redacted>; retry with updated credentials"),
+                    "{shown}"
+                );
+                assert!(!shown.contains("eyJ"), "{shown}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn token_endpoint_errors_scrub_url_userinfo() {
+        let (private_pem, _) = test_key_pair();
+        let server = MockServer::builder().start().await;
+        let password = "opaque-mint-url-password".repeat(32);
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(format!(
+                "invalid_grant password={password}; update credentials"
+            )))
+            .mount(&server)
+            .await;
+        let endpoint = server
+            .uri()
+            .replacen("://", &format!("://tester:{password}@"), 1);
+        let minter = TokenMinter::new(Client::new()).with_token_endpoint_override(endpoint);
+        let sa = sample_sa(&private_pem, &server.uri());
+        let err = aisix_gateway::response_tap::scope(
+            Arc::new(aisix_gateway::response_tap::ResponseHeaderTap::default()),
+            minter.get_token(&sa),
+        )
+        .await
+        .unwrap_err();
+        for shown in [err.to_string(), format!("{err:?}")] {
+            assert!(
+                shown.contains("password=<redacted>; update credentials"),
+                "{shown}"
+            );
+            assert!(!shown.contains("opaque-mint-url-password"), "{shown}");
         }
     }
 

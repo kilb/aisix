@@ -1,8 +1,10 @@
 import { Fragment, useEffect, useId, useState } from "react";
+import "./Prices.css";
 import { ApiError } from "./lib/api";
 import { messageFor } from "./lib/errors";
-import { fmtCnyPerMillion, fmtUtc, perThousandOfPerMillion } from "./lib/money";
-import { currentPrices, dimensionLabels, discountPercent, type Dimension, type PriceQuoteList, type PriceRate, type QuotedModel, type TierQuote } from "./lib/priceQuote";
+import { fmtUtc } from "./lib/money";
+import { currentPrices, discountPercent, type Dimension, type PriceQuoteList, type QuotedModel } from "./lib/priceQuote";
+import { PriceDetails, PriceRateValue } from "./PriceDetails";
 import { DataTable, Loading } from "./ui/DataTable";
 import { EmptyState } from "./ui/EmptyState";
 import { RouteNav } from "./ui/RouteNav";
@@ -95,41 +97,6 @@ export function Prices({ initialGroup }: { initialGroup: string | null }) {
   );
 }
 
-function RateValue({ rate }: { rate: PriceRate | undefined }) {
-  if (rate?.price_cny_per_million == null) return <span className="hint">未提供价格</span>;
-  const amount = rate.unit === "request" ? perThousandOfPerMillion(rate.price_cny_per_million) : rate.price_cny_per_million;
-  return <>{fmtCnyPerMillion(amount)}{rate.fallback_from !== undefined &&
-    <span className="hint cell-note">按{dimensionLabels[rate.fallback_from]}价计费</span>}</>;
-}
-
-function RateTable({ rates }: { rates: PriceRate[] }) {
-  return (
-    <DataTable label="完整模型单价" compact>
-      <thead><tr><th>计价维度</th><th className="num">组织单价</th><th>单位</th></tr></thead>
-      <tbody>{rates.map((rate) => <tr key={rate.dimension}>
-        <td>{dimensionLabels[rate.dimension]}</td><td className="num"><RateValue rate={rate} /></td>
-        <td>{rate.unit === "request" ? "元/千次" : "元/百万 token"}</td>
-      </tr>)}</tbody>
-    </DataTable>
-  );
-}
-
-function TierPrices({ name, tier }: { name: string; tier: TierQuote }) {
-  const first = tier.long_context[0];
-  return <section className="space-y-3">
-    <h4 className="text-stat font-medium">{name === "default" ? "标准" : name}</h4>
-    <p className="hint">{first ? `基础价：输入 ≤ ${first.above_input_tokens.toLocaleString("en-US")} token` : "基础价"}</p>
-    <RateTable rates={tier.base} />
-    {tier.long_context.map((band, index) => {
-      const next = tier.long_context[index + 1];
-      return <div className="space-y-2" key={band.above_input_tokens}>
-        <p className="hint">输入 &gt; {band.above_input_tokens.toLocaleString("en-US")} token{next && `，且 ≤ ${next.above_input_tokens.toLocaleString("en-US")} token`}，整次请求使用本段价格</p>
-        <RateTable rates={band.rates} />
-      </div>;
-    })}
-  </section>;
-}
-
 function ModelRow({ model }: { model: QuotedModel }) {
   const [expanded, setExpanded] = useState(false);
   const [copyError, setCopyError] = useState<string | null>(null);
@@ -150,27 +117,23 @@ function ModelRow({ model }: { model: QuotedModel }) {
         </div>
         {copyError !== null && <p className="field-problem" role="alert">{copyError}</p>}
       </td>
-      <td className="num"><RateValue rate={rate("input")} /></td>
-      <td className="num"><RateValue rate={rate("output")} /></td>
-      <td className="num"><RateValue rate={rate("cache_read")} /></td>
-      <td className="num"><RateValue rate={rate("cache_write")} />
+      <td className="num"><PriceRateValue rate={rate("input")} /></td>
+      <td className="num"><PriceRateValue rate={rate("output")} /></td>
+      <td className="num"><PriceRateValue rate={rate("cache_read")} /></td>
+      <td className="num"><PriceRateValue rate={rate("cache_write")} />
         {oneHour?.fallback_from === undefined && oneHour?.price_cny_per_million != null &&
-          <span className="hint cell-note">1 小时缓存写 <RateValue rate={oneHour} /></span>}
+          <span className="hint cell-note">1 小时缓存写 <PriceRateValue rate={oneHour} /></span>}
       </td>
     </tr>
-    {expanded && <tr><td colSpan={5} id={detailsId}>
-      <div className="space-y-6 py-4">
-        <p className="hint">回退价格仅说明计费规则，不代表模型支持该模态。长上下文按包含缓存、音频和图像的整个输入 token 数选择价格段。</p>
-        {Object.entries(model.prices_by_tier).sort(([a], [b]) => a === "default" ? -1 : b === "default" ? 1 : a.localeCompare(b))
-          .map(([name, tier]) => <TierPrices key={name} name={name} tier={tier} />)}
-      </div>
+    {expanded && <tr><td colSpan={5} id={detailsId} className="price-detail-cell">
+      <PriceDetails tiers={model.prices_by_tier} />
     </td></tr>}
   </Fragment>;
 }
 
 function PriceTable({ models }: { models: QuotedModel[] }) {
-  return <DataTable label="模型单价">
+  return <div className="price-catalog"><DataTable label="模型单价">
     <thead><tr><th>模型</th><th className="num">输入</th><th className="num">输出</th><th className="num">缓存读</th><th className="num">缓存写</th></tr></thead>
     <tbody>{models.map((model) => <ModelRow key={model.model_id} model={model} />)}</tbody>
-  </DataTable>;
+  </DataTable></div>;
 }

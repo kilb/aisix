@@ -1,9 +1,9 @@
-import { useCallback, useEffect, useId, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { Dialog } from "radix-ui";
 import type { TabProps } from "../App";
 import { ApiError, operators, type Detail, type OperatorAccount, type OperatorRole } from "../lib/api";
 import { messageFor } from "../lib/errors";
 import { errorText, fmtInt, fmtTime } from "../lib/fmt";
-import { cn } from "../lib/cn";
 import { Button } from "../ui/Button";
 import { useRefusalFocus } from "../ui/Field";
 import { DataTable, Loading } from "../ui/DataTable";
@@ -21,7 +21,8 @@ import {
   span,
 } from "../components/page";
 import { RankBars } from "../components/charts";
-import { Plus, RefreshCw } from "lucide-react";
+import { Plus, RefreshCw, X } from "lucide-react";
+import "./Operators.css";
 
 /** The control plane's operator roles, highest first, by the names this page shows. */
 const ROLES: { role: OperatorRole; label: string }[] = [
@@ -100,9 +101,8 @@ export function Operators({ operator }: TabProps) {
     return { label, value, displayValue: fmtInt(value) };
   }).sort((a, b) => b.value - a.value || a.label.localeCompare(b.label));
 
-  // 桌面和平板：概览 6 + 6；列表 12，创建时列表 7 + 表单 5（平板各占 12）。
   const list = (
-    <Card className={creating ? span.d7 : span.d12}>
+    <Card className={span.d12}>
       <CardHeader
         number={3}
         as="h2"
@@ -258,7 +258,7 @@ export function Operators({ operator }: TabProps) {
   );
 
   return (
-    <>
+    <Dialog.Root open={creating} onOpenChange={setCreating}>
       <PageHeader
         title="运维账号"
         eyebrow="平台访问 · 当前账号快照"
@@ -272,19 +272,16 @@ export function Operators({ operator }: TabProps) {
               <RefreshCw aria-hidden />
               刷新
             </Button>
-            {!creating && (
+            <Dialog.Trigger asChild>
               <Button
                 kind="primary"
                 type="button"
-                onClick={() => {
-                  setOutcome(null);
-                  setCreating(true);
-                }}
+                onClick={() => setOutcome(null)}
               >
                 <Plus aria-hidden />
                 新建运维账号
               </Button>
-            )}
+            </Dialog.Trigger>
           </>
         }
       />
@@ -319,9 +316,9 @@ export function Operators({ operator }: TabProps) {
           </CardFooter>
         </Card>
         {list}
-        {creating && <CreateForm onCreated={created} onCancel={() => setCreating(false)} />}
       </BentoGrid>
-    </>
+      {creating && <CreateForm onCreated={created} onCancel={() => setCreating(false)} />}
+    </Dialog.Root>
   );
 }
 
@@ -339,11 +336,20 @@ function CreateForm({
   const [password, setPassword] = useState("");
   const [failure, setFailure] = useState<{ text: string; details: Detail[] } | null>(null);
   const [busy, setBusy] = useState(false);
-  const ids = { email: useId(), name: useId(), password: useId() };
+  const submitting = useRef(false);
+  const ids = { email: useId(), name: useId(), password: useId(), role: useId(), passwordHint: useId() };
   const [form, focusRefusal] = useRefusalFocus<HTMLFormElement>();
+  const refusal = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (busy || !failure || form.current?.querySelector('[aria-invalid="true"]')) return;
+    refusal.current?.focus();
+  }, [busy, failure, form]);
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
+    if (submitting.current) return;
+    submitting.current = true;
     setFailure(null);
     setBusy(true);
     try {
@@ -353,7 +359,7 @@ function CreateForm({
         role,
         password,
       });
-      // The admin typed it; it is never shown back.
+      // 管理员输入的口令只用于提交，创建成功后不再保留。
       setPassword("");
       onCreated(op.email, op.role);
     } catch (err) {
@@ -364,6 +370,7 @@ function CreateForm({
       );
       focusRefusal();
     } finally {
+      submitting.current = false;
       setBusy(false);
     }
   }
@@ -377,101 +384,139 @@ function CreateForm({
   const listed = failure?.details.filter((d) => !["/email", "/display_name", "/password"].includes(d.path)) ?? [];
 
   return (
-    <form ref={form} className={cn("panel bento-card", span.d5Wide)} aria-label="新建运维账号" onSubmit={(e) => void submit(e)}>
-      <CardHeader number={4} as="h2" title="新建运维账号" className="max-w-none" />
-      <div className="grid max-w-none gap-x-4 tablet:grid-cols-2 desktop:grid-cols-1">
-        <div className="min-w-0">
-          <label className="f">
-            <span>邮箱</span>
-            <input
-              type="email"
-              required
-              autoComplete="off"
-              value={email}
-              aria-invalid={fields.email ? true : undefined}
-              aria-describedby={fields.email ? ids.email : undefined}
-              onChange={(e) => setEmail(e.target.value)}
-            />
-          </label>
-          {fields.email && (
-            <p id={ids.email} className="field-problem">
-              {fields.email}
-            </p>
-          )}
+    <Dialog.Portal>
+      <Dialog.Overlay className="operators-dialog-overlay" />
+      <Dialog.Content
+        className="operators-dialog"
+        onOpenAutoFocus={(e) => {
+          e.preventDefault();
+          form.current?.querySelector<HTMLInputElement>('input[type="email"]')?.focus();
+        }}
+        onEscapeKeyDown={(e) => { if (submitting.current) e.preventDefault(); }}
+        onInteractOutside={(e) => { if (submitting.current) e.preventDefault(); }}
+      >
+        <div className="operators-dialog-header">
+          <div>
+            <Dialog.Title className="operators-dialog-title">新建运维账号</Dialog.Title>
+            <Dialog.Description className="operators-dialog-description">
+              设置登录信息与平台访问权限。新账号默认使用只读角色。
+            </Dialog.Description>
+          </div>
+          <Dialog.Close asChild>
+            <Button kind="quiet" type="button" aria-label="关闭新建运维账号" disabled={busy}>
+              <X aria-hidden />
+            </Button>
+          </Dialog.Close>
         </div>
-        <div className="min-w-0">
-          <label className="f">
-            <span>显示名</span>
-            <input
-              value={name}
-              aria-invalid={fields.name ? true : undefined}
-              aria-describedby={fields.name ? ids.name : undefined}
-              onChange={(e) => setName(e.target.value)}
-            />
-          </label>
-          {fields.name && (
-            <p id={ids.name} className="field-problem">
-              {fields.name}
-            </p>
-          )}
-        </div>
-        <div className="min-w-0">
-          <label className="f">
-            <span>角色</span>
-            <select value={role} onChange={(e) => setRole(e.target.value as OperatorRole)}>
-              {ROLES.map((r) => (
-                <option key={r.role} value={r.role}>
-                  {r.label}
-                </option>
-              ))}
-            </select>
-          </label>
-          <p className="hint -mt-2 mb-4 text-caption">
-            只读：只能查看；运维：可修改网关资源、租户与密钥；管理员：另可管理运维账号、网关凭据与下发。
-          </p>
-        </div>
-        <div className="min-w-0">
-          <label className="f">
-            <span>初始口令</span>
-            <input
-              type="password"
-              required
-              autoComplete="new-password"
-              value={password}
-              aria-invalid={fields.password ? true : undefined}
-              aria-describedby={fields.password ? ids.password : undefined}
-              onChange={(e) => setPassword(e.target.value)}
-            />
-          </label>
-          {fields.password && (
-            <p id={ids.password} className="field-problem">
-              {fields.password}
-            </p>
-          )}
-        </div>
-      </div>
-      {failure && (
-        <div className="note crit mt-0" role="alert">
-          {failure.text}
-          {listed.length > 0 && (
-            <ul className="json-problems">
-              {listed.map((d, i) => (
-                <li key={i} data-path={d.path}>
-                  <mark className="json-path">{d.path || "（请求根）"}</mark> {d.message}
-                </li>
-              ))}
-            </ul>
-          )}
-        </div>
-      )}
-      <CardFooter className="mt-4 flex flex-wrap justify-end gap-2 border-t border-ink/7 pt-4">
-        <Button type="button" onClick={onCancel}>
-          取消
-        </Button>
-        <Button kind="primary" type="submit" busy={busy} busyLabel="创建">
-          创建
-        </Button>
-      </CardFooter>
-    </form>
+        <form
+          ref={form}
+          className="operators-create-form"
+          aria-label="新建运维账号"
+          aria-busy={busy}
+          onSubmit={(e) => void submit(e)}
+        >
+          <div className="operators-create-body">
+            <fieldset className="operators-create-fields" disabled={busy}>
+              <legend className="vh">账号信息与权限</legend>
+              <div className="operators-create-grid">
+                <div className="operators-create-field">
+                  <label className="f">
+                    <span>邮箱</span>
+                    <input
+                      type="email"
+                      required
+                      autoComplete="off"
+                      value={email}
+                      aria-invalid={fields.email ? true : undefined}
+                      aria-describedby={fields.email ? ids.email : undefined}
+                      onChange={(e) => setEmail(e.target.value)}
+                    />
+                  </label>
+                  {fields.email && (
+                    <p id={ids.email} className="field-problem">
+                      {fields.email}
+                    </p>
+                  )}
+                </div>
+                <div className="operators-create-field">
+                  <label className="f">
+                    <span>显示名</span>
+                    <input
+                      value={name}
+                      aria-invalid={fields.name ? true : undefined}
+                      aria-describedby={fields.name ? ids.name : undefined}
+                      onChange={(e) => setName(e.target.value)}
+                    />
+                  </label>
+                  <p className="operators-field-hint">选填，用于识别账号。</p>
+                  {fields.name && (
+                    <p id={ids.name} className="field-problem">
+                      {fields.name}
+                    </p>
+                  )}
+                </div>
+              </div>
+              <div className="operators-create-field">
+                <label className="f">
+                  <span>角色</span>
+                  <select value={role} aria-describedby={ids.role} onChange={(e) => setRole(e.target.value as OperatorRole)}>
+                    {ROLES.map((r) => (
+                      <option key={r.role} value={r.role}>
+                        {r.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <p id={ids.role} className="operators-role-hint">
+                  只读：只能查看；运维：可修改网关资源、租户与密钥；管理员：另可管理运维账号、网关凭据与下发。
+                </p>
+              </div>
+              <div className="operators-create-field">
+                <label className="f">
+                  <span>初始口令</span>
+                  <input
+                    type="password"
+                    required
+                    autoComplete="new-password"
+                    value={password}
+                    aria-invalid={fields.password ? true : undefined}
+                    aria-describedby={[ids.passwordHint, fields.password ? ids.password : null].filter(Boolean).join(" ")}
+                    onChange={(e) => setPassword(e.target.value)}
+                  />
+                </label>
+                <p id={ids.passwordHint} className="operators-field-hint">创建后不再显示口令，请通过安全渠道交付。</p>
+                {fields.password && (
+                  <p id={ids.password} className="field-problem">
+                    {fields.password}
+                  </p>
+                )}
+              </div>
+            </fieldset>
+            {failure && (
+              <div ref={refusal} className="note crit mt-0" role="alert" tabIndex={-1}>
+                {failure.text}
+                {listed.length > 0 && (
+                  <ul className="json-problems">
+                    {listed.map((d, i) => (
+                      <li key={i} data-path={d.path}>
+                        <mark className="json-path">{d.path || "（请求根）"}</mark> {d.message}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
+          </div>
+          <div className="operators-dialog-footer">
+            <Button type="button" disabled={busy} onClick={onCancel}>
+              取消
+            </Button>
+            <Button kind="primary" type="submit" busy={busy} busyLabel="创建">
+              创建
+            </Button>
+          </div>
+        </form>
+      </Dialog.Content>
+    </Dialog.Portal>
   );
 }

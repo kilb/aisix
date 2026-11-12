@@ -14,6 +14,7 @@ import { messageFor } from "./lib/errors";
 import { useTheme } from "./lib/useTheme";
 import { Button } from "./ui/Button";
 import { RouteNav } from "./ui/RouteNav";
+import { SidebarMenuButton, SidebarShell } from "./ui/Sidebar";
 import { ThemeToggle } from "./ui/ThemeToggle";
 import { Gate } from "./Gate";
 import { Keys } from "./Keys";
@@ -253,39 +254,57 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
   const who = member.display_name || member.email;
 
   return (
-    <div className="shell">
-      <header className={scrolled ? "topbar is-scrolled" : "topbar"}>
-        <div className="topbar-in">
-          <span className="brand">
-            <span className="brand-mark" aria-hidden="true" />
-            <span className="brand-name">
-              <span className="mark">Routio</span> <span className="app">组织门户</span>
-            </span>
+    <SidebarShell
+      label="组织门户导航"
+      routeKey={`${tenant.id}:${current}:${priceGroup ?? ""}`}
+      brand={
+        <span className="brand">
+          <span className="brand-mark" aria-hidden="true" />
+          <span className="brand-name">
+            <span className="mark">Routio</span> <span className="app">组织门户</span>
           </span>
-          <span className="tenant-context">
-            <span className="tenant-context-label">当前组织</span>
-            <span className="org-name" title={tenant.name}>{tenant.name}</span>
+        </span>
+      }
+      context={
+        <span className="tenant-context">
+          <span className="tenant-context-label">当前组织</span>
+          <span className="org-name" title={tenant.name}>{tenant.name}</span>
+        </span>
+      }
+      navigation={(close) => visible.length > 0 && (
+        <RouteNav
+          label="组织门户分区"
+          items={visible}
+          current={current}
+          onSelect={(next) => {
+            openSection(next);
+            close();
+          }}
+          docked
+        />
+      )}
+      footer={
+        <span className="shell-member" title={member.email}>
+          <span className="avatar" data-initial={[...who][0] ?? ""} aria-hidden="true" />
+          <span className="me-name">{who}</span>
+          <span className="vh"> · </span>
+          <span className="tag">{ROLE_LABEL[member.role] ?? member.role}</span>
+        </span>
+      }
+    >
+      <header className={scrolled ? "shell-view-header is-scrolled" : "shell-view-header"}>
+        <div className="shell-view-location">
+          <SidebarMenuButton />
+          <span className="shell-location-text">
+            <span className="shell-current-label">{TABS.find((item) => item.id === current)?.label}</span>
+            <span className="shell-current-context" title={tenant.name}>{tenant.name}</span>
           </span>
-          {visible.length > 0 && (
-            <div className="tenant-navigation">
-              <RouteNav label="组织门户分区" items={visible} current={current} onSelect={openSection} docked />
-            </div>
-          )}
-          <div className="member-tools">
-            {/* 姓名和角色保留可访问文本，头像字母仅作视觉识别。 */}
-            <span className="me" title={member.email}>
-              <span className="avatar" data-initial={[...who][0] ?? ""} aria-hidden="true" />
-              <span className="me-name">{who}</span>
-              <span className="vh"> · </span>
-              <span className="tag">{ROLE_LABEL[member.role] ?? member.role}</span>
-            </span>
-            <span className="tools">
-              <ThemeToggle theme={theme} onToggle={toggleTheme} />
-              <Button kind="quiet" onClick={() => void signOut()}>
-                登出
-              </Button>
-            </span>
-          </div>
+        </div>
+        <div className="shell-user-tools">
+          <ThemeToggle theme={theme} onToggle={toggleTheme} />
+          <Button kind="quiet" onClick={() => void signOut()}>
+            登出
+          </Button>
         </div>
       </header>
 
@@ -297,7 +316,7 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
         </div>
       )}
 
-      <main className="page">
+      <main className="page shell-content">
         <section
           key={`${tenant.id}:${member.id}:${member.role}:${tenant.status}`}
           id={`tab-${current}`}
@@ -321,6 +340,6 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
           )}
         </section>
       </main>
-    </div>
+    </SidebarShell>
   );
 }

@@ -133,10 +133,10 @@ export function Catalogue(_props: TabProps) {
                         <td colSpan={6} className="whitespace-normal">
                           <div className="grid gap-6 rounded-cell bg-well p-4 desktop:grid-cols-[minmax(0,2fr)_minmax(0,3fr)]">
                             <div className="min-w-0">
-                              <p className="library-card-block">
-                                价格（美元/百万 tokens）：
+                              <div className="library-card-block">
+                                <p className="m-0 font-medium">完整价格 · 美元</p>
                                 <CardLines card={e.card} />
-                              </p>
+                              </div>
                               <p className="hint mt-3">卡上的价格以每百万单位存储：联网搜索的 10000 即每千次 10 美元。{TIER_HINT}</p>
                             </div>
                             <div className="min-w-0">

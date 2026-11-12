@@ -238,7 +238,7 @@ export function FetchUpstream({
               一次最多映射 {MAX_BULK_MODELS} 个上游模型，已选 {picked.length} 个，请减少选择后再写入。
             </div>
           )}
-          <div className="ch-save -mx-7 -mb-7 mt-6 flex flex-wrap items-center justify-end gap-x-4 gap-y-2 rounded-b-card border-t border-line bg-well px-7 py-3 [&_.hint]:text-ink-soft">
+          <div className="ch-save -mx-[var(--pad)] -mb-[var(--pad)] mt-6 flex flex-wrap items-center justify-end gap-x-4 gap-y-2 rounded-b-card border-t border-line bg-well px-[var(--pad)] py-3 [&_.hint]:text-ink-soft">
             <span className="hint mr-auto text-caption tabular-nums">已选 {picked.length} 个</span>
             <Button
               type="button"

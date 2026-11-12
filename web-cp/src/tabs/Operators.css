@@ -1,0 +1,149 @@
+.operators-dialog-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  background: color-mix(in srgb, var(--ink) 35%, transparent);
+}
+
+.operators-dialog {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  width: min(600px, calc(100% - 40px));
+  max-height: calc(100dvh - 48px);
+  overflow: hidden;
+  transform: translate(-50%, -50%);
+  border: 1px solid var(--line);
+  border-radius: var(--r-panel);
+  background: var(--surface);
+  color: var(--ink);
+}
+
+.operators-dialog-header {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 20px;
+  border-bottom: 1px solid var(--line);
+}
+
+.operators-dialog-header > div {
+  min-width: 0;
+}
+
+.operators-dialog-header > .btn {
+  width: 44px;
+  padding: 0;
+}
+
+.operators-dialog-title {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.operators-dialog-description {
+  margin: 6px 0 0;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.operators-create-form {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.operators-create-body {
+  padding: 20px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.operators-create-fields {
+  display: grid;
+  gap: 20px;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.operators-create-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+
+.operators-create-field {
+  min-width: 0;
+}
+
+.operators-create-field > .f {
+  margin: 0;
+}
+
+.operators-create-field > .field-problem {
+  margin: 6px 0 0;
+}
+
+.operators-field-hint,
+.operators-role-hint {
+  margin: 8px 0 0;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.operators-role-hint {
+  padding: 12px 14px;
+  border-radius: var(--r-input);
+  background: var(--well);
+  color: var(--ink-soft);
+}
+
+.operators-create-body > .note {
+  margin: 16px 0 0;
+}
+
+.operators-dialog-footer {
+  display: flex;
+  flex: 0 0 auto;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 16px 20px;
+  border-top: 1px solid var(--line);
+}
+
+@media (max-width: 540px) {
+  .operators-dialog {
+    top: auto;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    width: 100%;
+    max-height: calc(100dvh - 12px);
+    transform: none;
+    border-radius: var(--r-panel) var(--r-panel) 0 0;
+  }
+
+  .operators-create-grid {
+    grid-template-columns: 1fr;
+    gap: 20px;
+  }
+
+  .operators-dialog-footer {
+    padding-bottom: max(16px, env(safe-area-inset-bottom));
+  }
+
+  .operators-dialog-footer > .btn {
+    flex: 1;
+  }
+}

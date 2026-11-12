@@ -1,10 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import type { TabProps } from "../../App";
 import { ApiError, library, type LibraryMeta, type LibraryPage } from "../../lib/api";
 import { messageFor } from "../../lib/errors";
 import { errorText } from "../../lib/fmt";
 import { droppedFieldText, flagText } from "../../lib/importReview";
-import { cardLines, longContextLines, longContextText } from "../../lib/library";
+import { longContextLines, longContextText } from "../../lib/library";
 import { fmtUtc } from "../../lib/money";
 import { safeHttpUrl } from "../../lib/safeUrl";
 import { Button } from "../../ui/Button";
@@ -17,6 +17,7 @@ import { LibrarySync } from "./LibrarySync";
 import { CREDIT } from "./PricingImport";
 import { BentoGrid, Card, CardHeader, CardMessage, ChartSkeleton, Metric, MetricSkeleton, PageHeader, span } from "../../components/page";
 import { CardFooter, Count } from "./kit";
+import { PriceCardDetails } from "./PriceCardDetails";
 
 /** How many entries one search lists. */
 const LISTED = 50;
@@ -33,6 +34,7 @@ export function PriceLibrary({ canEdit, onGoto }: TabProps) {
   const toast = useToast();
   const [q, setQ] = useState("");
   const [page, setPage] = useState<LibraryPage | null>(null);
+  const [expanded, setExpanded] = useState<string | null>(null);
   // 摘要标注最近一次成功读取的查询，输入变化时不把旧结果冒充新命中。
   const [loadedQuery, setLoadedQuery] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -159,14 +161,14 @@ export function PriceLibrary({ canEdit, onGoto }: TabProps) {
           <EmptyState text="没有匹配的模型。" />
         ) : (
           <>
-            <DataTable label="价格库条目" scroll>
+            <div className="library-browser-table"><DataTable label="价格库条目" scroll>
               <thead>
                 <tr>
                   <th>供应商</th>
                   <th>模型</th>
                   <th className="num">输入</th>
                   <th className="num">输出</th>
-                  <th>完整价格卡</th>
+                  <th>价格详情</th>
                   <th>价格页面</th>
                 </tr>
               </thead>
@@ -174,10 +176,12 @@ export function PriceLibrary({ canEdit, onGoto }: TabProps) {
                 {page.items.map((e) => {
                   const base = e.card?.default?.base;
                   const href = safeHttpUrl(e.pricing_url);
-                  const lines = cardLines(e.card);
                   const bands = longContextLines(e.card);
+                  const entryId = `${e.provider}/${e.model}`;
+                  const open = expanded === entryId;
+                  const detailId = `library-price-${encodeURIComponent(entryId)}`;
                   return (
-                    <tr key={`${e.provider}/${e.model}`}>
+                    <Fragment key={entryId}><tr>
                       <td className="text-muted">{e.provider}</td>
                       <td>
                         <span className="mono font-medium">{e.model}</span>
@@ -203,12 +207,8 @@ export function PriceLibrary({ canEdit, onGoto }: TabProps) {
                       </td>
                       <td className="num tabular">{base?.input !== undefined ? usdPerMillion(base.input) : "—"}</td>
                       <td className="num tabular">{base?.output !== undefined ? usdPerMillion(base.output) : "—"}</td>
-                      <td className="library-complete-card">
-                        {lines.length > 0 ? (
-                          <div className="library-card text-caption tabular">
-                            {lines.map((line, index) => <span key={index}>{line}</span>)}
-                          </div>
-                        ) : <span className="text-muted">无可同步价格卡</span>}
+                      <td>
+                        {e.card ? <Button type="button" kind="quiet" size="sm" aria-expanded={open} aria-controls={open ? detailId : undefined} aria-label={`${open ? "收起" : "展开"} ${entryId} 的完整价格卡`} onClick={() => setExpanded(open ? null : entryId)}>{open ? "收起价格" : "展开价格"}</Button> : <span className="text-muted">无可同步价格卡</span>}
                         {e.prices_checked && <span className="cell-note">价格核对时间：{fmtUtc(e.prices_checked)}</span>}
                       </td>
                       <td>
@@ -226,10 +226,20 @@ export function PriceLibrary({ canEdit, onGoto }: TabProps) {
                         )}
                       </td>
                     </tr>
+                    {open && <tr className="dt-detail"><td colSpan={6} className="library-expanded-cell whitespace-normal">
+                      <section id={detailId} className="library-expanded-price" aria-label={`${entryId} 的完整价格卡`}>
+                        <header>
+                          <h3>{e.name || e.model}</h3>
+                          <p>{entryId} · 完整价格（美元）</p>
+                        </header>
+                        <PriceCardDetails card={e.card} label={`${entryId} 的全部档位与价格维度`} />
+                      </section>
+                    </td></tr>}
+                    </Fragment>
                   );
                 })}
               </tbody>
-            </DataTable>
+            </DataTable></div>
             <CardFooter className="justify-start text-caption text-muted">
               共 {page.total} 条{page.total > page.items.length ? `，显示前 ${page.items.length} 条；输入更多文字以缩小范围` : ""}
             </CardFooter>

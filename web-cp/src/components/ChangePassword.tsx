@@ -130,7 +130,7 @@ export function ChangePassword({ onClose }: { onClose: () => void }) {
           )}
         </div>
       </div>
-      <div className="-mx-7 -mb-7 mt-4 flex max-w-none flex-wrap justify-end gap-2 rounded-b-3xl border-t border-line bg-well px-7 py-3 text-ink-soft">
+      <div className="-mx-[var(--pad)] -mb-[var(--pad)] mt-4 flex max-w-none flex-wrap justify-end gap-2 rounded-b-card border-t border-line bg-well px-[var(--pad)] py-3 text-ink-soft">
         <Button type="button" onClick={onClose}>
           取消
         </Button>

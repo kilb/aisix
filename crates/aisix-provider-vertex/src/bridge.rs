@@ -137,13 +137,31 @@ impl VertexBridge {
     /// Construct with a caller-supplied [`reqwest::Client`]. Useful
     /// when downstream callers want to share a connection pool.
     pub fn with_client(client: Client) -> Self {
+        Self::with_clients(client.clone(), client)
+    }
+
+    /// 分别指定模型连接和凭据交换连接；凭据端点不继承模型的 TLS 或地址覆盖。
+    pub fn with_clients(client: Client, credential_client: Client) -> Self {
         Self {
-            token_minter: Arc::new(TokenMinter::new(client.clone())),
+            token_minter: Arc::new(TokenMinter::new(credential_client)),
             client,
             name: "vertex",
             #[cfg(test)]
             api_base_override: None,
         }
+    }
+
+    /// 返回所有模型轨共用的基础地址以及可选凭据端点，不发起凭据交换。
+    pub fn outbound_urls(
+        &self,
+        pk: &aisix_core::ProviderKey,
+    ) -> Result<(String, Option<String>), BridgeError> {
+        let creds = VertexSecret::parse(&pk.api_key)?;
+        validate_url_token("project", &creds.project)?;
+        validate_url_token("region", &creds.region)?;
+        let model = self.resolve_api_base(&creds.region, pk.api_base.as_deref())?;
+        let credential = creds.service_account_json.map(|sa| sa.token_uri);
+        Ok((model, credential))
     }
 
     /// The client this dispatch runs on: the bridge's shared one, unless

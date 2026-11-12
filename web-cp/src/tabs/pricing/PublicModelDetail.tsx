@@ -165,7 +165,7 @@ export function PublicModelDetail({
         </Card>
       </BentoGrid>
       <WithForms forms={aside}>
-        <Card className="mb-0">
+        <Card className="pm-mapping-card mb-0">
           <CardHeader
             number={3}
             title={<>服务账号<Count n={served.length} /></>}
@@ -179,6 +179,15 @@ export function PublicModelDetail({
           ) : null}
           {model.served_by.length > 0 && (
             <DataTable label={served.length === 0 ? "服务账号（全部停用）" : "服务账号"} compact scroll>
+              <colgroup>
+                <col className="pm-col-tier" />
+                <col className="pm-col-account" />
+                <col className="pm-col-number" />
+                <col className="pm-col-number" />
+                <col className="pm-col-upstream" />
+                <col className="pm-col-groups" />
+                <col className="pm-col-status" />
+              </colgroup>
               <thead>
                 <tr>
                   <th className="num">层</th>
@@ -200,10 +209,12 @@ export function PublicModelDetail({
                       className={at === 0 && index > 0 ? "[&>td]:border-t [&>td]:border-t-border" : undefined}
                     >
                       <td className="num font-medium">{at === 0 ? index + 1 : ""}</td>
-                      <td className="font-medium">{account.display_name || account.provider_key_id}</td>
+                      <td>
+                        <span className="pm-account-name">{account.display_name || account.provider_key_id}</span>
+                      </td>
                       <td className="num tabular">{account.priority}</td>
                       <td className="num tabular">{account.weight}</td>
-                      <td>
+                      <td className="pm-upstream-model">
                         {account.upstream_model === null ? (
                           <span className="cell-note">同名（{model.name}）</span>
                         ) : (

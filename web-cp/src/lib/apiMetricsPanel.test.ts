@@ -13,7 +13,7 @@ import type { ApiMetricsPanelProps } from "../components/ApiMetricsPanel";
 // 渲染真实产品组件；SSR 不执行网络 effect，不伪造成功响应来测试加载状态。
 const require = createRequire(import.meta.url);
 const compiled = await build({
-  stdin: { contents: 'export { ApiMetricsPanel } from "./components/ApiMetricsPanel.tsx";', resolveDir: fileURLToPath(new URL("../", import.meta.url)), sourcefile: "api-metrics-panel.tsx" },
+  stdin: { contents: 'export { ApiMetricsPanel } from "./components/ApiMetricsPanel.tsx"; export { ApiSuccessSummary } from "./components/ApiSuccessSummary.tsx";', resolveDir: fileURLToPath(new URL("../", import.meta.url)), sourcefile: "api-metrics-panel.tsx" },
   bundle: true, platform: "node", format: "cjs", jsx: "automatic", write: false,
   define: { "import.meta.env.BASE_URL": '"/"' },
   plugins: [{ name: "single-react-runtime", setup(builder) { builder.onResolve({ filter: /^react(?:\/.*)?$/ }, args => ({ path: require.resolve(args.path), external: true })); } }],
@@ -22,7 +22,7 @@ const temporary = await mkdtemp(join(tmpdir(), "aisix-api-metrics-panel-"));
 after(() => rm(temporary, { recursive: true, force: true }));
 const entry = join(temporary, "component.cjs");
 await writeFile(entry, compiled.outputFiles[0]!.text);
-const { ApiMetricsPanel } = require(entry) as { ApiMetricsPanel: ComponentType<ApiMetricsPanelProps> };
+const { ApiMetricsPanel, ApiSuccessSummary } = require(entry) as { ApiMetricsPanel: ComponentType<ApiMetricsPanelProps>; ApiSuccessSummary: ComponentType<{ totals?: { requests: number | null; succeeded_requests: number | null; failed_requests: number | null; unknown_outcome_requests: number | null; known_outcome_requests: number | null; unknown_final_attempts: number | null; success_rate: number | null } }> };
 const props: ApiMetricsPanelProps = { scope: "tenant", enabled: true, from: "2026-11-01T00:00:00Z", to: "2026-11-02T00:00:00Z", numberStart: 5 };
 
 test("加载保留完整请求指标标签、期间说明和计数口径，不伪造零值", () => {
@@ -47,4 +47,63 @@ test("范围不合法也保留指标框架和原因，不能变成较短的错�
 
 test("无访问范围时不渲染上一身份的指标面板", () => {
   assert.equal(renderToStaticMarkup(createElement(ApiMetricsPanel, { ...props, enabled: false })), "");
+});
+
+// 4个最终请求中只有3个结果已知；未知结果不能压低成功率或被算成失败。
+test("首屏成功率摘要并列成功失败未知，并公开已知结果分母", () => {
+  const markup = renderToStaticMarkup(createElement(ApiSuccessSummary, { totals: { requests: 4, succeeded_requests: 2, failed_requests: 1, unknown_outcome_requests: 1, known_outcome_requests: 3, unknown_final_attempts: 0, success_rate: 2 / 3 } }));
+  const text = markup.replace(/<[^>]+>/g, "");
+  assert.match(text, /成功率66\.7%/);
+  assert.match(text, /成功2/);
+  assert.match(text, /失败1/);
+  assert.match(text, /未知1/);
+  assert.match(text, /已知结果样本（分母）3/);
+  assert.match(text, /最终请求4/);
+  assert.doesNotMatch(text, /50%|75%/);
+});
+
+test("首屏摘要在加载和未知时保留全部指标位置，不用零伪装数据", () => {
+  const markup = renderToStaticMarkup(createElement(ApiSuccessSummary, {}));
+  const text = markup.replace(/<[^>]+>/g, "");
+  for (const label of ["成功率", "成功", "失败", "未知", "已知结果样本（分母）", "最终请求"]) assert.ok(text.includes(label));
+  assert.doesNotMatch(text, /0%|[成功失败未知]0/);
+  assert.match(text, /—/);
+});
+
+// 紧凑模式必须直接看到成功率和诊断入口，初始不展开长趋势与完整明细。
+test("紧凑首屏直接呈现请求健康与延迟缓存入口，不先铺长分析卡", () => {
+  const markup = renderToStaticMarkup(createElement(ApiMetricsPanel, { ...props, compact: true }));
+  const text = markup.replace(/<[^>]+>/g, "");
+  assert.match(text, /API 请求健康/);
+  assert.match(markup, /role="group" aria-label="请求成功率摘要"/);
+  assert.match(text, /已知结果样本（分母）/);
+  assert.match(text, /2026-11-01 00:00:00 UTC/);
+  assert.match(text, /首 token 延迟/);
+  assert.match(text, /查看延迟/);
+  assert.match(text, /查看缓存/);
+  assert.doesNotMatch(text, /按 UTC 小时汇总/);
+});
+
+test("收起的摘要属于指标概览，不能冒充完整指标区域", () => {
+  const markup = renderToStaticMarkup(createElement(ApiMetricsPanel, { ...props, compact: true }));
+  assert.match(markup, /role="group" aria-label="API 指标概览"/);
+  assert.doesNotMatch(markup, /role="region" aria-label="完整 API 指标"/);
+});
+
+test("完整指标区域唯一且不包含同名摘要指标", () => {
+  const markup = renderToStaticMarkup(createElement(ApiMetricsPanel, props));
+  assert.equal(markup.match(/role="region" aria-label="完整 API 指标"/g)?.length, 1);
+  assert.match(markup, /API 指标 · 请求/);
+  assert.doesNotMatch(markup, /aria-label="请求成功率摘要"/);
+});
+
+test("零请求摘要显示真实零计数，但没有已知结果时不伪造零成功率", () => {
+  const markup = renderToStaticMarkup(createElement(ApiSuccessSummary, { totals: { requests: 0, succeeded_requests: 0, failed_requests: 0, unknown_outcome_requests: 0, known_outcome_requests: 0, unknown_final_attempts: 0, success_rate: null } }));
+  const text = markup.replace(/<[^>]+>/g, "");
+  assert.match(text, /成功率—/);
+  assert.match(text, /成功0/);
+  assert.match(text, /失败0/);
+  assert.match(text, /未知0/);
+  assert.match(text, /已知结果样本（分母）0/);
+  assert.doesNotMatch(text, /0%/);
 });

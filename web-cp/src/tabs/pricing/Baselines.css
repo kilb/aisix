@@ -24,9 +24,109 @@
 }
 
 .baseline-rates {
-  font-size: var(--text-stat);
+  color: var(--color-ink-soft);
+  font-size: var(--text-caption);
   font-weight: 400;
   overflow-wrap: anywhere;
+}
+
+/* 现行与预约版本各自成区，元信息不占用价格列。 */
+.baseline-version-group + .baseline-version-group {
+  margin-top: 24px;
+}
+
+.baseline-group-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px 16px;
+  margin-bottom: 12px;
+}
+
+.baseline-group-heading h4 {
+  margin: 0;
+  font-size: var(--text-body);
+}
+
+.baseline-group-heading > span {
+  color: var(--color-muted);
+  font-size: var(--text-meta);
+}
+
+.baseline-version-list {
+  display: grid;
+  gap: 16px;
+}
+
+.baseline-version {
+  min-width: 0;
+  padding: 20px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-card);
+}
+
+.baseline-version-id {
+  margin: 0 0 16px;
+  color: var(--color-ink-soft);
+  font-size: var(--text-meta);
+}
+
+.baseline-version-meta {
+  display: grid;
+  gap: 16px;
+  margin: 0 0 20px;
+}
+
+.baseline-version-meta > div {
+  display: grid;
+  grid-template-columns: 6.5rem minmax(0, 1fr);
+  align-items: start;
+  gap: 12px;
+  min-width: 0;
+}
+
+.baseline-version-meta dt {
+  color: var(--color-muted);
+  font-size: var(--text-meta);
+  line-height: 1.6;
+}
+
+.baseline-version-meta dd {
+  min-width: 0;
+  margin: 0;
+  color: var(--color-ink-soft);
+  font-size: var(--text-caption);
+  overflow-wrap: anywhere;
+}
+
+/* 版本详情中的说明完整展开，清单里的来源仍保持原有省略方式。 */
+.baseline-version-meta .baseline-source .trunc {
+  max-width: none;
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+}
+
+.baseline-version-summary {
+  display: grid;
+  gap: 4px;
+  margin-bottom: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--color-border);
+  color: var(--color-muted);
+  font-size: var(--text-meta);
+}
+
+@media (max-width: 480px) {
+  .baseline-version {
+    padding: 16px;
+  }
+
+  .baseline-version-meta > div {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 4px;
+  }
 }
 
 .baseline-coverage-value {
@@ -101,8 +201,20 @@
 }
 
 .baseline-workspace {
-  gap: 12px;
+  gap: var(--card-gap);
 }
+
+/* 金额与日期不换行时，保留模型列宽，余量由清单自身横向滚动。 */
+.baseline-workspace > .side-main > .panel > .dt-wrap > .dt {
+  min-width: 72rem;
+  table-layout: fixed;
+}
+.baseline-workspace > .side-main > .panel > .dt-wrap > .dt > thead > tr > th:nth-child(1) { width: 14rem; }
+.baseline-workspace > .side-main > .panel > .dt-wrap > .dt > thead > tr > th:nth-child(2),
+.baseline-workspace > .side-main > .panel > .dt-wrap > .dt > thead > tr > th:nth-child(3) { width: 12rem; }
+.baseline-workspace > .side-main > .panel > .dt-wrap > .dt > thead > tr > th:nth-child(4) { width: 13rem; }
+.baseline-workspace > .side-main > .panel > .dt-wrap > .dt > thead > tr > th:nth-child(5) { width: 16rem; }
+.baseline-workspace > .side-main > .panel > .dt-wrap > .dt > thead > tr > th:nth-child(6) { width: 5rem; }
 
 .baseline-workspace .link-button {
   min-height: 44px;

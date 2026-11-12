@@ -156,11 +156,61 @@ pub fn resolve(spec: &AwsAuthSpec) -> AwsAuth {
                 spec: spec.clone(),
                 cached: tokio::sync::Mutex::new(None),
                 sdk_config: tokio::sync::OnceCell::new(),
+                http_override: None,
             });
             providers.insert(spec.clone(), provider.clone());
             AwsAuth::SigV4(provider)
         }
     }
+}
+
+/// 为单个调用隔离凭据交换传输，不读取或复用其它调用的全局凭据缓存。
+/// 只允许显式凭据；另一进程的环境凭据不能代表网关自身的身份。
+pub fn resolve_with_http_client(
+    spec: &AwsAuthSpec,
+    http: aws_smithy_runtime_api::client::http::SharedHttpClient,
+) -> Result<AwsAuth, CredentialsError> {
+    match (&spec.mode, &spec.assume_role) {
+        (AwsAuthMode::DefaultChain, _) => Err(CredentialsError::invalid_configuration(
+            "process AWS credentials cannot use an isolated credential transport",
+        )),
+        (
+            AwsAuthMode::AccessKey {
+                access_key_id,
+                secret_access_key,
+                session_token,
+            },
+            Some(_),
+        ) => {
+            // 基底会话令牌先于角色凭据发往 STS，必须在任何交换或错误日志之前登记。
+            if let Some(token) = session_token {
+                crate::response_tap::note_sent_credential(token);
+            }
+            Ok(AwsAuth::SigV4(SharedCredentialsProvider::new(
+                RefreshingCredentials {
+                    spec: spec.clone(),
+                    cached: tokio::sync::Mutex::new(None),
+                    sdk_config: tokio::sync::OnceCell::new(),
+                    http_override: Some(ExplicitCredentialTransport {
+                        http,
+                        base: Credentials::new(
+                            access_key_id,
+                            secret_access_key,
+                            session_token.clone(),
+                            None,
+                            PROVIDER_NAME,
+                        ),
+                    }),
+                },
+            )))
+        }
+        _ => Ok(resolve(spec)),
+    }
+}
+
+struct ExplicitCredentialTransport {
+    http: aws_smithy_runtime_api::client::http::SharedHttpClient,
+    base: Credentials,
 }
 
 /// Fetches credentials for the default chain and for AssumeRole, and keeps
@@ -170,6 +220,7 @@ struct RefreshingCredentials {
     /// The last credentials fetched, and when.
     cached: tokio::sync::Mutex<Option<(Credentials, SystemTime)>>,
     sdk_config: tokio::sync::OnceCell<SdkConfig>,
+    http_override: Option<ExplicitCredentialTransport>,
 }
 
 impl std::fmt::Debug for RefreshingCredentials {
@@ -190,6 +241,15 @@ impl ProvideCredentials for RefreshingCredentials {
 }
 
 impl RefreshingCredentials {
+    fn error_for_log(&self, error: impl std::fmt::Display) -> String {
+        let detail = error.to_string();
+        if self.http_override.is_some() {
+            crate::upstream_error_scrub::scrub_upstream_error_text(&detail)
+        } else {
+            detail
+        }
+    }
+
     async fn credentials(&self) -> Result<Credentials, CredentialsError> {
         let mut cached = self.cached.lock().await;
         let now = SystemTime::now();
@@ -211,11 +271,13 @@ impl RefreshingCredentials {
                 Ok(c)
             }
             Err(e) => {
+                let error =
+                    self.error_for_log(aws_smithy_types::error::display::DisplayErrorContext(&e));
                 tracing::warn!(
                     auth_type = self.spec.mode_name(),
                     role_arn = self.spec.assume_role.as_ref().map(|r| r.role_arn.as_str()),
                     region = %self.spec.region,
-                    error = %aws_smithy_types::error::display::DisplayErrorContext(&e),
+                    error = %error,
                     "could not obtain AWS credentials"
                 );
                 // A refresh that fails inside the margin keeps serving the
@@ -240,6 +302,17 @@ impl RefreshingCredentials {
                     None => timeouts = timeouts.disable_connect_timeout(),
                 }
                 let region = Region::new(self.spec.region.clone());
+                if let Some(transport) = &self.http_override {
+                    // 调用方逐请求检查真实 STS 地址；显式基底不加载环境凭据链。
+                    return aws_config::defaults(BehaviorVersion::latest())
+                        .region(region)
+                        .http_client(transport.http.clone())
+                        .credentials_provider(transport.base.clone())
+                        .retry_config(aws_smithy_types::retry::RetryConfig::disabled())
+                        .timeout_config(timeouts.build())
+                        .load()
+                        .await;
+                }
                 // The chain reaches its own credential endpoints directly
                 // and everything else — its STS calls included — through
                 // the proxy environment; its instance-metadata client is
@@ -404,8 +477,9 @@ impl RefreshingCredentials {
         match sts.get_caller_identity().send().await {
             Ok(out) => out.arn().and_then(role_identity) == Some(target),
             Err(e) => {
+                let error = self.error_for_log(aws_sdk_sts::error::DisplayErrorContext(&e));
                 tracing::debug!(
-                    error = %aws_sdk_sts::error::DisplayErrorContext(&e),
+                    error = %error,
                     "sts:GetCallerIdentity failed; assuming the configured role"
                 );
                 false
@@ -438,6 +512,127 @@ fn role_identity(arn: &str) -> Option<(&str, &str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn isolated_role_auth_notes_the_base_session_token_before_fetching() {
+        let token = "vF9qzP6mW3rB8cD1xK2sL7nJ4hG0yT5u";
+        let tap = std::sync::Arc::new(crate::response_tap::ResponseHeaderTap::new(
+            vec![],
+            false,
+            "probe-base-credentials".into(),
+        ));
+        crate::response_tap::scope(tap, async {
+            let spec = AwsAuthSpec {
+                mode: AwsAuthMode::AccessKey {
+                    access_key_id: "probe-access-key".into(),
+                    secret_access_key: "probe-secret-key".into(),
+                    session_token: Some(token.into()),
+                },
+                assume_role: Some(AssumeRole {
+                    role_arn: "arn:aws:iam::123456789012:role/probe".into(),
+                    external_id: None,
+                    role_session_name: None,
+                }),
+                region: "us-east-1".into(),
+            };
+            let http = aws_smithy_runtime_api::client::http::http_client_fn(|_, _| {
+                panic!("登记凭据的检查不发起网络请求")
+            });
+            assert!(resolve_with_http_client(&spec, http).is_ok());
+            let detail = format!("STS echoed {token}");
+            let scrubbed = crate::upstream_error_scrub::scrub_upstream_error_text(&detail);
+            assert!(
+                !scrubbed.contains(token),
+                "基底会话令牌必须在任何交换之前登记"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_injected_credential_transport_is_isolated_and_disables_sdk_retries() {
+        use aws_smithy_runtime_api::client::connector_metadata::ConnectorMetadata;
+        use aws_smithy_runtime_api::client::http::{
+            HttpClient, HttpConnectorSettings, SharedHttpClient, SharedHttpConnector,
+        };
+        use aws_smithy_runtime_api::client::runtime_components::RuntimeComponents;
+
+        #[derive(Debug)]
+        struct InspectionClient;
+        impl HttpClient for InspectionClient {
+            fn http_connector(
+                &self,
+                _: &HttpConnectorSettings,
+                _: &RuntimeComponents,
+            ) -> SharedHttpConnector {
+                panic!("纯配置检查不允许发起网络请求")
+            }
+
+            fn connector_metadata(&self) -> Option<ConnectorMetadata> {
+                Some(ConnectorMetadata::new("isolated-credential-policy", None))
+            }
+        }
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let provider = RefreshingCredentials {
+            spec: AwsAuthSpec {
+                mode: AwsAuthMode::AccessKey {
+                    access_key_id: "probe-explicit-access-key".into(),
+                    secret_access_key: "probe-explicit-secret-key".into(),
+                    session_token: None,
+                },
+                assume_role: Some(AssumeRole {
+                    role_arn: "arn:aws:iam::123456789012:role/probe".into(),
+                    external_id: None,
+                    role_session_name: None,
+                }),
+                region: "us-east-1".into(),
+            },
+            cached: tokio::sync::Mutex::new(None),
+            sdk_config: tokio::sync::OnceCell::new(),
+            http_override: Some(ExplicitCredentialTransport {
+                http: SharedHttpClient::new(InspectionClient),
+                base: Credentials::new(
+                    "probe-explicit-access-key",
+                    "probe-explicit-secret-key",
+                    None,
+                    None,
+                    PROVIDER_NAME,
+                ),
+            }),
+        };
+        let config = provider.sdk_config().await;
+        assert_eq!(
+            config
+                .http_client()
+                .and_then(|client| client.connector_metadata())
+                .map(|metadata| metadata.name()),
+            Some("isolated-credential-policy".into()),
+            "凭据请求必须使用调用方的地址检查传输"
+        );
+        assert_eq!(
+            config.retry_config().map(|retry| retry.max_attempts()),
+            Some(1),
+            "探测的凭据交换也不能有 SDK 隐式重试"
+        );
+        let configured = config
+            .credentials_provider()
+            .expect("显式凭据提供者")
+            .provide_credentials()
+            .await
+            .expect("静态凭据不发网络请求");
+        assert_eq!(configured.access_key_id(), "probe-explicit-access-key");
+        assert_eq!(configured.secret_access_key(), "probe-explicit-secret-key");
+        let process_spec = AwsAuthSpec {
+            mode: AwsAuthMode::DefaultChain,
+            assume_role: None,
+            region: "us-east-1".into(),
+        };
+        assert!(matches!(
+            resolve_with_http_client(&process_spec, SharedHttpClient::new(InspectionClient)),
+            Err(CredentialsError::InvalidConfiguration(_))
+        ));
+    }
 
     #[test]
     fn role_and_assumed_role_arns_name_the_same_identity() {

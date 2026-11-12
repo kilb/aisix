@@ -1,11 +1,12 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { ArrowLeft } from "lucide-react";
+import { Fragment, useCallback, useEffect, useRef, useState } from "react";
+import { ArrowLeft, ChevronDown } from "lucide-react";
 import { EffectiveFrom, sendAt, type EffectiveResolver } from "../../components/EffectiveFrom";
 import {
   ApiError,
   costRates,
   groupPrices,
   type AccountCostRates,
+  type BaselineRevision,
   type CostAccount,
   type CostRatePlan,
   type Detail,
@@ -13,6 +14,7 @@ import {
 } from "../../lib/api";
 import { messageFor, problemAt } from "../../lib/errors";
 import { errorText, fmtInt } from "../../lib/fmt";
+import { fmtUtc } from "../../lib/money";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
 import { EmptyState } from "../../ui/EmptyState";
@@ -21,6 +23,8 @@ import { TwoStep } from "../../ui/TwoStep";
 import { useToast } from "../../ui/Toast";
 import { BentoGrid, Card, CardHeader, CardMessage, Metric, MetricSkeleton, PageHeader, span } from "../../components/page";
 import { inForce, isZeroRate, scheduledWords } from "./GroupDetail";
+import { BaselineSourceBadge } from "./Baselines";
+import { PriceCardDetails } from "./PriceCardDetails";
 import { CardFooter, Count, FormGrid, WithForms } from "./kit";
 
 /**
@@ -44,6 +48,7 @@ export function CostAccountDetail({
   const [prices, setPrices] = useState<Map<string, ModelGroupPriceRow>>(new Map());
   const [error, setError] = useState<string | null>(null);
   const [picked, setPicked] = useState<{ modelId: string; name: string; mode: "override" | "end" } | null>(null);
+  const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
 
   const load = useCallback(async () => {
     try {
@@ -131,62 +136,96 @@ export function CostAccountDetail({
         </Card>
       </BentoGrid>
       <WithForms forms={forms}>
-        <Card className="mb-0">
-          <CardHeader number={3} className="mb-0" title={<>模型成本换算率{rates && <Count n={rates.models.length} />}</>} />
+        <Card className="cost-model-card mb-0">
+          <CardHeader number={3} className="mb-0" title={<>模型成本换算率{rates && <Count n={rates.models.length} />}</>} description="展开模型查看完整美元基准价、来源、生效时间与预约版本。" />
           {rates === null ? (
             !error && <Loading />
           ) : rates.models.length === 0 ? (
             <EmptyState text="这个账号还没有模型。先在「上游账号 → 模型」中为它勾选公共模型。" />
           ) : (
             <DataTable label="账号成本换算率">
+              <colgroup>
+                <col className="cost-col-model" />
+                <col className="cost-col-price" />
+                <col className="cost-col-price" />
+                <col className="cost-col-rate" />
+                <col className="cost-col-actions" />
+              </colgroup>
               <thead>
                 <tr>
                   <th>模型</th>
                   <th className="num">基准价 输入</th>
                   <th className="num">基准价 输出</th>
-                  <th>成本换算率</th>
+                  <th className="num">成本换算率</th>
                   <th className="right">操作</th>
                 </tr>
               </thead>
               <tbody>
                 {rates.models.map((row) => {
-                  const baseline = prices.get(row.model_id)?.baseline.current ?? null;
+                  const plan = prices.get(row.model_id)?.baseline;
+                  const baseline = plan?.current ?? null;
                   const head = baseline?.card?.default?.base;
                   const rate = inForce(row.rate, rates.default);
+                  const open = expanded.has(row.model_id);
+                  const detailId = `cost-price-${row.model_id}`;
                   const later = [scheduledWords(row.rate, "覆盖"), rate.label === "默认" ? scheduledWords(rates.default, "默认") : ""]
                     .filter(Boolean)
                     .join("、");
                   return (
-                    <tr key={row.model_id}>
-                      <td className="font-medium">
-                        <span className="trunc" title={row.name}>
-                          {row.name}
-                        </span>
-                      </td>
-                      <td className="num">
-                        {!baseline ? <span className="grp-unpriced">未定价</span> : head?.input ? `$${head.input} / 百万 tokens` : "—"}
-                      </td>
-                      <td className="num">{!baseline ? "—" : head?.output ? `$${head.output} / 百万 tokens` : "—"}</td>
-                      <td>
-                        <span className={rate.label === "覆盖" ? "tag grp-override" : "tag"}>{rate.label}</span>{" "}
-                        <span className="tabular">{rate.rate ?? "未设置"}</span>
-                        {later && <span className="cell-note">待生效 {later}</span>}
-                      </td>
-                      <td className="right">
-                        {canEdit && (
-                          <span className="row-actions">
-                            <Button size="sm" onClick={() => setPicked({ modelId: row.model_id, name: row.name, mode: "override" })}>
-                              设置覆盖
-                            </Button>
-                            {row.rate.current !== null && row.rate.current.cny_per_usd !== null && (
-                              <Button size="sm" onClick={() => setPicked({ modelId: row.model_id, name: row.name, mode: "end" })}>
-                                结束覆盖
+                    <Fragment key={row.model_id}>
+                      <tr>
+                        <td className="font-medium">
+                          <button
+                            type="button"
+                            className="cost-model-toggle"
+                            aria-label={`${open ? "收起" : "展开"} ${row.name} 的价格明细`}
+                            aria-expanded={open}
+                            aria-controls={detailId}
+                            onClick={() => setExpanded((previous) => {
+                              const next = new Set(previous);
+                              if (next.has(row.model_id)) next.delete(row.model_id);
+                              else next.add(row.model_id);
+                              return next;
+                            })}
+                          >
+                            <ChevronDown aria-hidden />
+                            <span>{row.name}</span>
+                          </button>
+                        </td>
+                        <td className="num">
+                          {!baseline ? <span className="grp-unpriced">未定价</span> : head?.input !== undefined ? <><span className="cost-price-amount">${head.input}</span><span className="cost-price-unit"> / 百万 tokens</span></> : "—"}
+                        </td>
+                        <td className="num">
+                          {!baseline ? "—" : head?.output !== undefined ? <><span className="cost-price-amount">${head.output}</span><span className="cost-price-unit"> / 百万 tokens</span></> : "—"}
+                        </td>
+                        <td className="num">
+                          <span className={rate.label === "覆盖" ? "tag grp-override" : "tag"}>{rate.label}</span>{" "}
+                          <span className="tabular">{rate.rate ?? "未设置"}</span>
+                          {later && <span className="cell-note">待生效 {later}</span>}
+                        </td>
+                        <td className="right">
+                          {canEdit && (
+                            <span className="row-actions cost-model-actions">
+                              <Button size="sm" onClick={() => setPicked({ modelId: row.model_id, name: row.name, mode: "override" })}>
+                                设置覆盖
                               </Button>
-                            )}
-                          </span>
-                        )}
-                      </td>
-                    </tr>
+                              {row.rate.current !== null && row.rate.current.cny_per_usd !== null && (
+                                <Button size="sm" onClick={() => setPicked({ modelId: row.model_id, name: row.name, mode: "end" })}>
+                                  结束覆盖
+                                </Button>
+                              )}
+                            </span>
+                          )}
+                        </td>
+                      </tr>
+                      {open && (
+                        <tr className="dt-detail cost-expanded-row">
+                          <td colSpan={5}>
+                            <CostModelDetails id={detailId} name={row.name} modelId={row.model_id} modelPlan={row.rate} defaultPlan={rates.default} baseline={baseline} upcoming={plan?.upcoming ?? []} />
+                          </td>
+                        </tr>
+                      )}
+                    </Fragment>
                   );
                 })}
               </tbody>
@@ -194,6 +233,87 @@ export function CostAccountDetail({
           )}
         </Card>
       </WithForms>
+    </div>
+  );
+}
+
+/** 完整价卡在展开行内展示，美元基准、成本换算率与预约版本分别阅读。 */
+function CostModelDetails({
+  id, name, modelId, modelPlan, defaultPlan, baseline, upcoming,
+}: {
+  id: string;
+  name: string;
+  modelId: string;
+  modelPlan: CostRatePlan;
+  defaultPlan: CostRatePlan;
+  baseline: BaselineRevision | null;
+  upcoming: BaselineRevision[];
+}) {
+  const rate = inForce(modelPlan, defaultPlan);
+  const currentRate = rate.label === "覆盖" ? modelPlan.current : defaultPlan.current;
+  return (
+    <div id={id} className="cost-model-details" role="region" aria-label={`${name} 成本与基准价明细`}>
+      <p className="cost-model-identity">模型标识 <code>{modelId}</code></p>
+      <section className="cost-detail-section" aria-label="现行完整基准价">
+        <h3>现行基准价 <span>美元 · USD</span></h3>
+        {baseline ? (
+          <>
+            <CostBaselineMeta revision={baseline} />
+            <PriceCardDetails card={baseline.card} label={`${name} 现行完整基准价`} />
+          </>
+        ) : <p className="cost-detail-note">未定价：这个模型没有现行基准价，调用成本记为未知。</p>}
+      </section>
+      <section className="cost-detail-section" aria-label="现行成本换算率">
+        <h3>现行成本换算率</h3>
+        <dl className="cost-version-meta cost-rate-meta">
+          <div><dt>换算率来源</dt><dd>{rate.label === "覆盖" ? "模型覆盖" : "账号默认"}</dd></div>
+          <div><dt>人民币 / 美元</dt><dd className="cost-exact-rate">{rate.rate ?? "未设置"}</dd></div>
+          <div><dt>生效时间</dt><dd>{currentRate ? fmtUtc(currentRate.effective_from) : "—"}</dd></div>
+        </dl>
+        <p className="cost-detail-note">{rate.rate === null ? "成本未知：模型覆盖与账号默认均未设置可用的成本换算率。" : baseline ? "调用成本 = 模型的美元基准价 × 此成本换算率。" : "已设置换算率；模型没有现行基准价，调用成本仍记为未知。"}</p>
+      </section>
+      <section className="cost-detail-section" aria-label="预约价格版本">
+        <h3>预约版本 <span>按各版本的生效时间切换</span></h3>
+        <div className="cost-rate-schedules">
+          <CostRateSchedule label="模型覆盖" plan={modelPlan} />
+          <CostRateSchedule label="账号默认" plan={defaultPlan} />
+        </div>
+        <h4 className="cost-upcoming-title">预约基准价 · {upcoming.length} 个版本</h4>
+        {upcoming.length === 0 ? <p className="cost-detail-note">暂无预约基准价版本。</p> : upcoming.map((revision) => (
+          <details className="cost-upcoming-baseline" key={revision.revision_id}>
+            <summary><span>{fmtUtc(revision.effective_from)} 起</span><span>版本 #{revision.revision_id}</span></summary>
+            <CostBaselineMeta revision={revision} />
+            <PriceCardDetails card={revision.card} label={`${name} 预约基准价版本 ${revision.revision_id}`} />
+          </details>
+        ))}
+      </section>
+    </div>
+  );
+}
+
+function CostBaselineMeta({ revision }: { revision: BaselineRevision }) {
+  return (
+    <dl className="cost-version-meta">
+      <div><dt>生效时间 · 版本 #{revision.revision_id}</dt><dd>{fmtUtc(revision.effective_from)}</dd></div>
+      <div><dt>价格来源</dt><dd><BaselineSourceBadge revision={revision} /></dd></div>
+    </dl>
+  );
+}
+
+function CostRateSchedule({ label, plan }: { label: string; plan: CostRatePlan }) {
+  return (
+    <div>
+      <h4>{label} · {plan.upcoming.length} 个预约版本</h4>
+      {plan.upcoming.length === 0 ? <p className="cost-detail-note">暂无预约版本。</p> : (
+        <ul className="cost-rate-revisions">
+          {plan.upcoming.map((revision) => (
+            <li key={revision.revision_id}>
+              <span>{fmtUtc(revision.effective_from)} 起</span>
+              <span className="cost-exact-rate">{revision.cny_per_usd === null ? "结束覆盖，回到账号默认" : `${revision.cny_per_usd} 人民币 / 美元`}</span>
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
   );
 }

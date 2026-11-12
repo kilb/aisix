@@ -590,14 +590,14 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
       {formCard ? (
         <BentoGrid className="items-start">
           {formCard}
-          <div className={cn(span.d7, "min-w-0 grid gap-3")}>
+          <div className={cn(span.d7, "min-w-0 grid gap-(--card-gap)")}>
             {result}
             {history}
           </div>
         </BentoGrid>
       ) : (
         <BentoGrid>
-          <div className={cn(span.d12, "grid min-w-0 gap-3")}>{result}{history}</div>
+          <div className={cn(span.d12, "grid min-w-0 gap-(--card-gap)")}>{result}{history}</div>
         </BentoGrid>
       )}
     </>

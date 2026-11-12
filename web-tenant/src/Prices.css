@@ -1,0 +1,136 @@
+/* 目录与矩阵均在局部滚动，展开内容不放大外层表格或页面。 */
+.price-catalog {
+  min-width: 0;
+  max-width: 100%;
+  container-type: inline-size;
+}
+.price-catalog [data-model-name] {
+  min-width: 14rem;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.5;
+}
+.price-catalog > .dt-wrap > .dt > tbody > tr > td {
+  vertical-align: top;
+}
+.price-catalog > .dt-wrap > .dt > tbody > tr > .price-detail-cell {
+  padding: 0;
+  white-space: normal;
+}
+.price-details {
+  box-sizing: border-box;
+  display: grid;
+  width: 100cqw;
+  min-width: 0;
+  max-width: 100%;
+  gap: 24px;
+  padding: 24px 16px;
+  contain: inline-size;
+}
+.price-details > p {
+  max-width: 80ch;
+  margin: 0;
+}
+.price-tier {
+  display: grid;
+  min-width: 0;
+  gap: 12px;
+}
+.price-tier + .price-tier {
+  border-top: 1px solid var(--border);
+  padding-top: 24px;
+}
+.price-tier-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px 20px;
+}
+.price-tier-header :is(h4, p) {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.price-matrix-scroll {
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+}
+.price-matrix {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+  font-size: var(--text-body);
+  line-height: 1.5;
+}
+.price-matrix .price-item-column { width: 12rem; }
+.price-matrix .price-unit-column { width: 8rem; }
+.price-matrix .price-amount-column { width: 12rem; }
+.price-matrix :is(th, td) {
+  position: static;
+  height: auto;
+  border-bottom: 1px solid var(--border);
+  padding: 12px 16px;
+  text-align: left;
+  vertical-align: top;
+  white-space: normal;
+}
+.price-matrix thead th {
+  border-top: 1px solid var(--border);
+  color: var(--text-2);
+  font-size: var(--text-caption);
+  font-weight: 400;
+}
+.price-matrix .price-band-heading,
+.price-matrix .price-amount {
+  text-align: right;
+}
+.price-band-name,
+.price-band-range {
+  display: block;
+}
+.price-band-name {
+  color: var(--foreground);
+  font-size: var(--text-body);
+  font-weight: 500;
+}
+.price-band-range {
+  margin-top: 4px;
+  font-size: var(--text-caption);
+  font-variant-numeric: tabular-nums;
+}
+.price-matrix .price-group-heading {
+  border-bottom: 0;
+  padding-top: 20px;
+  padding-bottom: 4px;
+  color: var(--text-2);
+  font-size: var(--text-caption);
+  font-weight: 500;
+}
+.price-matrix .price-unit {
+  color: var(--muted-foreground);
+  font-size: var(--text-caption);
+}
+.price-matrix .price-item {
+  background: transparent;
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  font-size: var(--text-body);
+  font-weight: 400;
+}
+.price-matrix .price-rate-amount {
+  display: block;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.price-matrix .price-rate-rule,
+.price-matrix .price-rate-unknown {
+  font-size: var(--text-caption);
+  line-height: 1.5;
+}
+.price-matrix tbody:last-child tr:last-child :is(th, td) {
+  border-bottom: 0;
+}

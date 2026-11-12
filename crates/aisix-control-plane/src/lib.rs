@@ -34,6 +34,7 @@ pub mod keys;
 pub mod kine;
 pub mod member_usage;
 pub mod members;
+pub mod model_probes;
 pub mod operators;
 pub mod pki;
 pub mod pricing;
@@ -95,6 +96,8 @@ pub struct AppState {
     /// ([`upstream_models::Cache`]).
     pub upstream: Arc<upstream_http::Client>,
     pub upstream_models: Arc<upstream_models::Cache>,
+    /// 手动模型探测全局有界，不占用数据库连接等待上游。
+    pub model_probes: Arc<Semaphore>,
     /// Where the price library is fetched from ([`pricing::library`]).
     pub library: Arc<pricing::library::Source>,
 }
@@ -351,6 +354,7 @@ where
         lookups,
         upstream: Arc::new(upstream),
         upstream_models: Arc::new(upstream_models::Cache::default()),
+        model_probes: Arc::new(Semaphore::new(model_probes::MAX_IN_FLIGHT)),
         library: Arc::new(library),
     };
 

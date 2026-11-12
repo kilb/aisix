@@ -382,6 +382,10 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
             format!("/admin/provider-keys/{}/upstream-models", Uuid::nil()),
             None,
         ),
+        ("POST", "/admin/models/{id}/probe") => (
+            format!("/admin/models/{}/probe", Uuid::nil()),
+            Some(json!({})),
+        ),
         // Deciding a proposal. Both ids match nothing: past the role check,
         // 404, so nothing is written.
         ("POST", "/admin/pricing/imports/{id}/proposals/{pid}/confirm") => (

@@ -73,10 +73,11 @@ test("有信用但无组织预算时明确区分可用额度与额外预算上�
 test("组织直接创建新账号并真实登录，重复邮箱不改变原密码", async ({ page, browser }) => {
   const world = await seedRealWorld(stack);
   await login(page, stack, world.owner);
-  await page.getByRole("tab", { name: "组织", exact: true }).click();
+  await page.getByRole("tab", { name: "成员", exact: true }).click();
+  await page.getByRole("button", { name: "创建账号", exact: true }).click();
   const heading = page.getByRole("heading", { name: "创建账号", exact: true });
   await expect(heading).toBeVisible();
-  const form = page.getByRole("region", { name: "创建账号", exact: true });
+  const form = page.getByRole("dialog", { name: "创建账号", exact: true });
   const email = `created-${Date.now()}@organization-real.test`;
   await form.getByLabel("显示名", { exact: true }).fill("真实创建成员");
   await form.getByLabel("邮箱", { exact: true }).fill(email);
@@ -92,6 +93,7 @@ test("组织直接创建新账号并真实登录，重复邮箱不改变原密�
     await expect(memberPage.getByRole("tab", { name: "成员", exact: true })).toHaveCount(0);
     await expect(memberPage.getByRole("tab", { name: "账户", exact: true })).toHaveCount(0);
     expect((await createdApi.request("POST", "/api/members", { email: `forbidden-${email}`, password: PASSWORD, role: "owner" })).status).toBe(403);
+    await page.getByRole("button", { name: "创建账号", exact: true }).click();
     await form.getByLabel("显示名", { exact: true }).fill("重复不重置");
     await form.getByLabel("邮箱", { exact: true }).fill(email);
     await form.getByLabel("初始密码", { exact: true }).fill("Changed-password-should-not-work");
@@ -105,7 +107,8 @@ test("组织直接创建新账号并真实登录，重复邮箱不改变原密�
     try {
       const adminPage = await adminContext.newPage();
       await login(adminPage, stack, admin);
-      await adminPage.getByRole("tab", { name: "组织", exact: true }).click();
+      await adminPage.getByRole("tab", { name: "成员", exact: true }).click();
+      await adminPage.getByRole("button", { name: "创建账号", exact: true }).click();
       await expect(adminPage.getByLabel("角色", { exact: true }).getByRole("option", { name: "所有者", exact: true })).toHaveCount(0);
     } finally {
       await adminContext.close();
@@ -134,7 +137,7 @@ test("完整组织价格含十一维、档位、长上下文和优惠，复制�
   expect(copiedRecord.model.name).toBe(copiedName);
   await row.getByRole("button", { name: "查看全部价格", exact: true }).click();
   for (const dimension of ["输入", "输出", "缓存读", "缓存写", "1 小时缓存写", "推理", "音频输入", "音频输出", "图像输入", "图像输出", "联网搜索"]) {
-    await expect(page.getByRole("cell", { name: dimension, exact: true }).first()).toBeVisible();
+    await expect(page.getByRole("rowheader", { name: dimension, exact: true }).first()).toBeVisible();
   }
   await expect(page.getByText("batch", { exact: true })).toBeVisible();
   await expect(page.getByText(/输入 > 200,000 token/).first()).toBeVisible();

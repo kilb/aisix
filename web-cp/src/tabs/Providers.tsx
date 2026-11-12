@@ -53,7 +53,7 @@ const GROUPS_HINT = "分组名只有运维可见；普通租户只能用到其�
 
 /** A form card's closing bar: its buttons at the bottom right, on a muted strip the card's width. */
 const FORM_FOOTER =
-  "-mx-7 -mb-7 mt-6 flex max-w-none flex-wrap items-center justify-end gap-2 rounded-b-card border-t border-line bg-well px-7 py-3 [&_.hint]:text-ink-soft";
+  "-mx-[var(--pad)] -mb-[var(--pad)] mt-6 flex max-w-none flex-wrap items-center justify-end gap-2 rounded-b-card border-t border-line bg-well px-[var(--pad)] py-3 [&_.hint]:text-ink-soft";
 
 /** How a referrer's kind is named on this page. */
 const KIND_LABEL: Record<string, string> = { models: "模型" };

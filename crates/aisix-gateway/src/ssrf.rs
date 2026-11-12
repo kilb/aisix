@@ -65,9 +65,8 @@ impl SsrfProtection {
         })
     }
 
-    /// As if no proxy were configured, whatever the environment says.
-    #[cfg(test)]
-    pub(crate) fn without_proxies(mut self) -> Self {
+    /// 对禁用代理的客户端按直连方式检查，不受进程代理环境影响。
+    pub fn without_proxies(mut self) -> Self {
         self.proxies = Arc::new(Matcher::builder().build());
         self
     }

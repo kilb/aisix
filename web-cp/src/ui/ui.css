@@ -623,7 +623,7 @@ select.select-sm {
 .with-side {
   display: grid;
   grid-template-columns: repeat(12, minmax(0, 1fr));
-  gap: 12px;
+  gap: var(--card-gap);
   align-items: start;
 }
 .with-side > * { min-width: 0; grid-column: span 12 / span 12; }

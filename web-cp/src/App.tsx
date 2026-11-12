@@ -22,6 +22,7 @@ import { ChangePassword } from "./components/ChangePassword";
 import { Button } from "./ui/Button";
 import { Lamp, type LampState } from "./ui/Lamp";
 import { RouteNav } from "./ui/RouteNav";
+import { SidebarMenuButton, SidebarShell } from "./ui/Sidebar";
 import {
   Braces,
   Building2,
@@ -372,54 +373,82 @@ export function App() {
 
   const who = operator.display_name || operator.email;
   return (
-    <div className="shell cp-shell">
-      <header className="cp-topbar">
-        <div className="cp-topbar-in">
-          <button type="button" className="cp-brand" onClick={() => setTab("overview")} aria-label="Routio 运维台概览">
-            <span className="brand-mark" aria-hidden="true" />
-            <span className="text-brand font-medium">Routio</span>
-            <span className="cp-brand-label">运维台</span>
-          </button>
-          <div className="cp-identity" title={operator.email}>
-            <span className="cp-avatar" aria-hidden="true">{[...who][0] ?? ""}</span>
-            <span className="cp-identity-name">{who}</span>
-            <span className="tag">{ROLE_LABEL[operator.role]}</span>
-          </div>
-          <div className="cp-tools">
-            <Button
-              kind="quiet"
-              size="sm"
-              onClick={toggleTheme}
-              aria-label={theme === "dark" ? "切换到浅色" : "切换到深色"}
-              title={theme === "dark" ? "切换到浅色" : "切换到深色"}
-            >
-              {theme === "dark" ? <Sun aria-hidden /> : <Moon aria-hidden />}
-              <span className="cp-theme-label">{theme === "dark" ? "浅色" : "深色"}</span>
-            </Button>
-            <Button kind="quiet" size="sm" aria-expanded={passwordOpen} onClick={() => setPasswordOpen((o) => !o)}>
-              修改口令
-            </Button>
-            <Button kind="quiet" size="sm" onClick={() => void signOut()}>登出</Button>
-          </div>
-          <div className="cp-navigation">
-            <RouteNav items={visible} current={current} attention={attention} label="Dashboard 分区" onSelect={(t) => setTab(t)} />
-          </div>
-          <div className="cp-context">
-            {shell.env && (
-              <span className="cp-environment" title={`环境 ${shell.env.env_id} · 控制面 ${shell.env.cp_version}`}>
-                <span>环境</span> <code>{shell.env.env_id}</code>
-              </span>
-            )}
-            {fleet && shell.summary && (
-              <span className="fleet">
-                <Lamp state={fleet.state} title="配置下发状态">{fleet.text}</Lamp>
-                <span className="cp-fleet-count">在线网关 {fmtInt(shell.summary.online_instances)}</span>
-              </span>
-            )}
-          </div>
+    <SidebarShell
+      brand={(close) => (
+        <button
+          type="button"
+          className="cp-brand"
+          onClick={() => {
+            setTab("overview");
+            close();
+          }}
+          aria-label="Routio 运维台概览"
+        >
+          <span className="brand-mark" aria-hidden="true" />
+          <span className="text-brand font-medium">Routio</span>
+          <span className="cp-brand-label">运维台</span>
+        </button>
+      )}
+      label="运维导航"
+      routeKey={`${current}:${section ?? ""}:${sectionVisit}`}
+      context={
+        <div className="cp-context">
+          {shell.env && (
+            <span className="cp-environment" title={`环境 ${shell.env.env_id} · 控制面 ${shell.env.cp_version}`}>
+              <span>环境</span> <code>{shell.env.env_id}</code>
+            </span>
+          )}
+          {fleet && shell.summary && (
+            <span className="fleet">
+              <Lamp state={fleet.state} title="配置下发状态">{fleet.text}</Lamp>
+              <span className="cp-fleet-count">在线网关 {fmtInt(shell.summary.online_instances)}</span>
+            </span>
+          )}
+        </div>
+      }
+      footer={
+        <div className="cp-identity" title={operator.email}>
+          <span className="cp-avatar" aria-hidden="true">{[...who][0] ?? ""}</span>
+          <span className="cp-identity-name">{who}</span>
+          <span className="tag">{ROLE_LABEL[operator.role]}</span>
+        </div>
+      }
+      navigation={(close) => (
+        <RouteNav
+          items={visible}
+          current={current}
+          attention={attention}
+          label="Dashboard 分区"
+          onSelect={(t) => {
+            setTab(t);
+            close();
+          }}
+        />
+      )}
+    >
+      <header className="shell-view-header">
+        <div className="shell-view-location">
+          <SidebarMenuButton />
+          <span className="shell-current-label">{visible.find((t) => t.id === current)?.label}</span>
+        </div>
+        <div className="cp-tools shell-user-tools">
+          <Button
+            kind="quiet"
+            size="sm"
+            onClick={toggleTheme}
+            aria-label={theme === "dark" ? "切换到浅色" : "切换到深色"}
+            title={theme === "dark" ? "切换到浅色" : "切换到深色"}
+          >
+            {theme === "dark" ? <Sun aria-hidden /> : <Moon aria-hidden />}
+            <span className="cp-theme-label">{theme === "dark" ? "浅色" : "深色"}</span>
+          </Button>
+          <Button kind="quiet" size="sm" aria-expanded={passwordOpen} onClick={() => setPasswordOpen((o) => !o)}>
+            修改口令
+          </Button>
+          <Button kind="quiet" size="sm" onClick={() => void signOut()}>登出</Button>
         </div>
       </header>
-      <div className="workspace">
+      <div className="workspace shell-content">
         {passwordOpen && <ChangePassword onClose={() => setPasswordOpen(false)} />}
         {signOutError && <div className="note crit" role="alert">{signOutError}</div>}
         <main>
@@ -436,6 +465,6 @@ export function App() {
           </section>
         </main>
       </div>
-    </div>
+    </SidebarShell>
   );
 }

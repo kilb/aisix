@@ -17,6 +17,61 @@
   overflow-wrap: anywhere;
 }
 
+/* 账号映射的列宽不随名称长度移动，长标识在所属列内换行。 */
+.pm-mapping-card > .dt-wrap > .dt {
+  min-inline-size: 60rem;
+  table-layout: fixed;
+}
+
+.pm-col-tier {
+  width: 5%;
+}
+
+.pm-col-account,
+.pm-col-upstream {
+  width: 23%;
+}
+
+.pm-col-number {
+  width: 8%;
+}
+
+.pm-col-groups {
+  width: 22%;
+}
+
+.pm-col-status {
+  width: 11%;
+}
+
+.pm-mapping-card > .dt-wrap > .dt > tbody > tr > td {
+  padding-block: 0.75rem;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  vertical-align: top;
+}
+
+.pm-account-name,
+.pm-upstream-model > .mono {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.pm-account-name {
+  font-weight: 500;
+}
+
+.pm-upstream-model > .cell-note {
+  margin-top: 0;
+}
+
+.pm-mapping-card .grp {
+  min-inline-size: 0;
+  max-inline-size: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
 .pm-routing-summary {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));

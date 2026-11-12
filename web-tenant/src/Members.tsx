@@ -27,6 +27,7 @@ import { BentoGrid, Card, CardFooter, CardHeader, CardMessage, ChartSkeleton, Me
 import { BudgetProgress, RankBars } from "./components/charts";
 import { exactRatio, formatCount, normalizeExactValues } from "./lib/chartFormat";
 import { rankCurrentMemberCosts } from "./lib/memberBento";
+import { CreateMemberDialog } from "./CreateMemberDialog";
 
 // 桌面：5 + 7 / 12 / 7 + 5；平板与手机按阅读顺序各占整行。
 
@@ -129,6 +130,7 @@ export function Members({
 }) {
   const active = status === "active";
   const isOwner = member.role === "owner";
+  const canCreate = active && (isOwner || member.role === "admin");
   const roles: MemberRole[] = isOwner ? ["owner", "admin", "member", "billing"] : ["admin", "member", "billing"];
   const [people, setPeople] = useState<Member[] | null>(null);
   const [listErr, setListErr] = useState<string | null>(null);
@@ -141,6 +143,7 @@ export function Members({
   const loadId = useRef(0);
   const [issued, setIssued] = useState<{ email: string; link: string; expiresAt: string } | null>(null);
   const [actionErr, setActionErr] = useState<string | null>(null);
+  const [createdNotice, setCreatedNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   // Which action on that member or invitation is in flight.
   const [acting, setActing] = useState<"role" | "remove" | "revoke" | null>(null);
@@ -242,7 +245,17 @@ export function Members({
           组织现有 <span className="font-medium text-ink">{formatCount(people.length)}</span> 位成员。
           {active ? "本月费用按当前成员归属展示，成员额度各自独立生效。" : "组织已停用，目前仅支持移除成员。"}
         </>}
+        actions={canCreate && <CreateMemberDialog
+          roles={roles}
+          labels={ROLE_LABEL}
+          onInactive={onSelfChanged}
+          onCreated={(created) => {
+            setCreatedNotice(`账号已创建：${created.email}，可使用邮箱和初始密码登录。`);
+            void load();
+          }}
+        />}
       />
+      {createdNotice && <div className="note ok mb-3" role="status">{createdNotice}</div>}
       <BentoGrid>
         <Card className={active ? span.d5Wide : span.d12}>
           <CardHeader number={1} title="当前成员" />

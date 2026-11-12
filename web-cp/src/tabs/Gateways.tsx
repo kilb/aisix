@@ -240,9 +240,9 @@ export function Gateways({ operator }: TabProps) {
             ) : credentials.length === 0 ? (
               <EmptyState mark="gateway" text="还没有签发过网关凭据。" />
             ) : (
-              <ul className="-mx-7 -mb-7 mt-4 divide-y divide-border border-t border-line">
+              <ul className="-mx-[var(--pad)] -mb-[var(--pad)] mt-4 divide-y divide-border border-t border-line">
                 {credentials.map((c) => (
-                  <li key={c.dp_id} className="flex flex-col gap-1.5 px-7 py-3.5">
+                  <li key={c.dp_id} className="flex flex-col gap-1.5 px-[var(--pad)] py-3.5">
                     <div className="flex min-w-0 flex-wrap items-center justify-between gap-x-3 gap-y-1">
                       <strong className="min-w-0 font-medium break-all">{c.name}</strong>
                       {c.revoked_at ? (
@@ -413,7 +413,7 @@ function Bundle({ bundle, onClose }: { bundle: IssuedCredential; onClose: () => 
           </div>
         </div>
       </div>
-      <div className="-mx-7 -mb-7 mt-6 flex justify-end gap-2 rounded-b-card border-t border-line bg-well px-7 py-3 [&_.hint]:text-ink-soft">
+      <div className="-mx-[var(--pad)] -mb-[var(--pad)] mt-6 flex flex-wrap justify-end gap-2 rounded-b-card border-t border-line bg-well px-[var(--pad)] py-3 [&_.hint]:text-ink-soft">
         <Button type="button" onClick={onClose}>
           我已保存，关闭
         </Button>

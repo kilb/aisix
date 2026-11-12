@@ -184,9 +184,9 @@ way.
   (`tenant.generated_grants_replaced`'s `unresolved`, and a WARN naming the
   tenant and ids), never guessed at: an operator removes the id through a
   grant edit, which re-projects the keys.
-- **The control plane makes two outbound calls, both operator-only,
-  bounded and scrubbed: the upstream-model route, which writes nothing, and
-  the price library's fetch, which writes only the library.**
+- **The control plane's outbound calls are bounded and scrubbed: the
+  upstream-model route and price-library fetch are operator-only; manual
+  model probes are admin-only.**
   `GET /admin/provider-keys/{id}/upstream-models` (`src/upstream_models.rs`)
   reaches the account's own configured host on that account's own credential,
   through the SSRF guard, with a 5 s timeout and a 1 MiB body cap behind a
@@ -208,6 +208,28 @@ way.
   same `Client::builder`), and scrubs its errors the same way. It writes the
   library (`pricing_library`, one copy kept) and its audit row and nothing
   else: a baseline comes from it only through a sync an operator attests.
+  `POST /admin/models/{id}/probe` (`src/model_probes.rs`) addresses one exact
+  direct model and its own upstream account, never a public alias or a
+  fallback. It may incur an upstream charge: one short model request by
+  default, with a 30 s limit. An explicit `capability_check: true` may add
+  one 256-token sample only after a successful basic probe with visible
+  text; it has its own 30 s limit and separate results, and changes none
+  of the basic measurements. Embeddings, failed targets and a successful
+  answer without visible text never add a sample. There is no retry, and
+  one of the three execution slots is held across both calls (at most
+  55 s handler budget in total, including database reads and preparation;
+  each call is clamped to the remaining budget, and a call with no budget
+  is never started). The sample uses deterministic JSON, nonce,
+  arithmetic and sorting checks, not a model judge or identity proof. It
+  writes no stored health, usage, document or history. Its measurements run
+  from the control plane to the selected upstream, not along a customer's
+  gateway path. A provider adapter's completed valid answer is success;
+  this does not add strict wire-sentinel or byte-integrity validation. Only
+  visible text gives a first-text latency; a completed answer without it
+  keeps that measurement null and explains why. Model and credential
+  exchanges use separate, policy-checked clients, including the actual
+  SDK-selected STS endpoint; provider connection overrides apply only on
+  the same transport rails that use them in the gateway.
 - **Advisory lock keys must be unique.** They are the `*_LOCK_KEY` constants,
   all `0x6169_7369_7863_70xx`: operators `7030`, projector `7031`, resources
   `7032`, boot `7033`, scope `7034`, signup `7073`, and the test harness's

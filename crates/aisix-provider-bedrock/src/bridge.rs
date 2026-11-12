@@ -102,6 +102,10 @@ pub struct BedrockBridge {
     /// HTTP client for the operation the SDK has no call for — the
     /// runtime's OpenAI-compatible Chat Completions endpoint.
     http: HttpClient,
+    /// 调用方显式指定的 SDK 传输；未指定时保持网关原有的共享连接池。
+    sdk_http: Option<aws_smithy_runtime_api::client::http::SharedHttpClient>,
+    /// 凭据交换的独立传输；不让 STS 越过调用方的出站策略。
+    credentials_http: Option<aws_smithy_runtime_api::client::http::SharedHttpClient>,
     /// Test-only endpoint URL override. When set, the SDK config's
     /// `endpoint_url` is pinned to this value so wiremock can stand
     /// in for `bedrock-runtime.<region>.amazonaws.com`. Credentials,
@@ -120,9 +124,77 @@ impl BedrockBridge {
                 aisix_gateway::client_builder(),
                 "bedrock",
             ),
+            sdk_http: None,
+            credentials_http: None,
             #[cfg(test)]
             endpoint_url_override: None,
         }
+    }
+
+    /// 将 HTTP 与 SDK 两条轨都交给调用方的受控连接，保留单次 SDK 尝试。
+    pub fn with_clients(
+        http: HttpClient,
+        sdk_http: aws_smithy_runtime_api::client::http::SharedHttpClient,
+    ) -> Self {
+        Self {
+            name: "bedrock",
+            http,
+            sdk_http: Some(sdk_http),
+            credentials_http: None,
+            #[cfg(test)]
+            endpoint_url_override: None,
+        }
+    }
+
+    /// 指定凭据交换专用连接，适用于模型 HTTP 和 SDK 两条轨。
+    pub fn with_credentials_http(
+        mut self,
+        http: aws_smithy_runtime_api::client::http::SharedHttpClient,
+    ) -> Self {
+        self.credentials_http = Some(http);
+        self
+    }
+
+    /// 进程环境凭据无法由另一进程代表；显式访问密钥和 API key 不依赖它。
+    pub fn uses_process_credentials(pk: &aisix_core::ProviderKey) -> Result<bool, BridgeError> {
+        let creds = BedrockSecret::parse(&pk.api_key)?;
+        Ok(matches!(creds.auth.mode, AwsAuthMode::DefaultChain))
+    }
+
+    /// 请求是否采用 HTTP Chat Completions 轨；其连接覆盖与 SDK 轨各自保持原语义。
+    pub fn uses_reqwest_transport(req: &ChatFormat, upstream_model: &str) -> bool {
+        crate::openai_compat::serves(req, upstream_model)
+    }
+
+    /// 复用 HTTP 轨的实际地址构造，供发出请求前做出站预检。
+    pub fn http_outbound_url(pk: &aisix_core::ProviderKey) -> Result<String, BridgeError> {
+        let creds = BedrockSecret::parse(&pk.api_key)?;
+        Ok(crate::openai_compat::endpoint_url(
+            pk.api_base.as_deref(),
+            creds.region(),
+        ))
+    }
+
+    /// 复用 SDK 的区域和分区解析，返回模型请求的基础地址，不获取凭据。
+    pub async fn outbound_url(pk: &aisix_core::ProviderKey) -> Result<String, BridgeError> {
+        use aws_sdk_bedrockruntime::config::endpoint::{DefaultResolver, Params, ResolveEndpoint};
+
+        let creds = BedrockSecret::parse(&pk.api_key)?;
+        let params = Params::builder()
+            .region(creds.region())
+            .use_fips(false)
+            .use_dual_stack(false)
+            .set_endpoint(pk.api_base.clone())
+            .build()
+            .map_err(|_| {
+                BridgeError::InvalidUpstreamConfig("bedrock endpoint parameters are invalid".into())
+            })?;
+        let endpoint = ResolveEndpoint::resolve_endpoint(&DefaultResolver::new(), &params)
+            .await
+            .map_err(|_| {
+                BridgeError::InvalidUpstreamConfig("bedrock endpoint cannot be resolved".into())
+            })?;
+        Ok(endpoint.url().to_string())
     }
 
     /// Test-only seam: rewrite the SDK's endpoint URL so wiremock can
@@ -548,6 +620,14 @@ impl BedrockSecret {
         &self,
         deadline: Option<std::time::Duration>,
     ) -> Result<RequestAuth, BridgeError> {
+        self.request_auth_with_http(deadline, None).await
+    }
+
+    pub(crate) async fn request_auth_with_http(
+        &self,
+        deadline: Option<std::time::Duration>,
+        http: Option<aws_smithy_runtime_api::client::http::SharedHttpClient>,
+    ) -> Result<RequestAuth, BridgeError> {
         use aws_credential_types::provider::error::CredentialsError;
         use aws_credential_types::provider::ProvideCredentials as _;
         if self.region().trim().is_empty() {
@@ -557,7 +637,17 @@ impl BedrockSecret {
                     .into(),
             ));
         }
-        let provider = match aisix_gateway::aws_auth::resolve(&self.auth) {
+        let resolved = match http {
+            Some(http) => aisix_gateway::aws_auth::resolve_with_http_client(&self.auth, http)
+                .map_err(|_| {
+                    BridgeError::InvalidUpstreamCredentials(
+                        "bedrock: process credentials cannot use an isolated credential transport"
+                            .into(),
+                    )
+                })?,
+            None => aisix_gateway::aws_auth::resolve(&self.auth),
+        };
+        let provider = match resolved {
             AwsAuth::Bearer(token) => {
                 aisix_gateway::note_sent_credential(&token);
                 return Ok(RequestAuth::Bearer(token));
@@ -693,6 +783,7 @@ fn build_client(
     hdr: &UpstreamHeaderContext<'_>,
     claude: bool,
     deadline: Option<std::time::Duration>,
+    http_client: Option<aws_smithy_runtime_api::client::http::SharedHttpClient>,
 ) -> Result<BedrockClient, BridgeError> {
     // The SDK enforces the deadlines the other bridges get from
     // `tokio::time::timeout` wrappers: the shared `upstream.connect_timeout`
@@ -723,7 +814,7 @@ fn build_client(
         // Bedrock-compatible endpoint behind a private CA is reachable
         // on the same setting every other upstream uses. Shared across
         // the process in production; see `sdk_http_client`.
-        .http_client(sdk_http_client())
+        .http_client(http_client.unwrap_or_else(sdk_http_client))
         // Retries belong to the gateway's own budget
         // (`routing::effective_retries`), which emits per-attempt telemetry
         // and honours per-model config. Left at its default the SDK would
@@ -1686,6 +1777,7 @@ impl BedrockBridge {
             creds,
             base,
             extra_headers: filtered_extra_headers(&ctx.header_ctx(), false),
+            credentials_http: self.credentials_http.clone(),
         })
     }
 
@@ -1714,7 +1806,9 @@ impl BedrockBridge {
         };
         // Converse paths carry no JSON body, but default_headers still apply
         // (header-level, publisher-agnostic) via the signing interceptor.
-        let auth = creds.request_auth(ctx.deadline).await?;
+        let auth = creds
+            .request_auth_with_http(ctx.deadline, self.credentials_http.clone())
+            .await?;
         let claude = upstream_model(ctx).is_ok_and(|id| {
             BedrockPublisher::from_model_id(id) == Some(BedrockPublisher::Anthropic)
         });
@@ -1725,6 +1819,7 @@ impl BedrockBridge {
             &ctx.header_ctx(),
             claude,
             ctx.deadline,
+            self.sdk_http.clone(),
         )
     }
 

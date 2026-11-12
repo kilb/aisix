@@ -317,7 +317,7 @@ function KindPage({ info, canEdit }: { info: KindInfo; canEdit: boolean }) {
           {failure}
         </div>
       )}
-      <div className="-mx-7 -mb-7 mt-6 flex flex-wrap items-center gap-2 rounded-b-card border-t border-line bg-well px-7 py-3 [&_.hint]:text-ink-soft">
+      <div className="-mx-[var(--pad)] -mb-[var(--pad)] mt-6 flex flex-wrap items-center gap-2 rounded-b-card border-t border-line bg-well px-[var(--pad)] py-3 [&_.hint]:text-ink-soft">
         {editing.mode === "edit" && editable && !confirmDelete && (
           <Button type="button" disabled={busy} onClick={() => setConfirmDelete(true)}>
             删除

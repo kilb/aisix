@@ -218,7 +218,7 @@ async fn inline_remote_images<'a>(
 /// The endpoint URL: the provider key's `api_base` when set, else the
 /// region's bedrock-runtime host, with the Chat Completions path appended
 /// unless the base already carries it.
-fn endpoint_url(base: Option<&str>, region: &str) -> String {
+pub(crate) fn endpoint_url(base: Option<&str>, region: &str) -> String {
     let base = match base.map(str::trim).filter(|b| !b.is_empty()) {
         Some(b) => b.trim_end_matches('/').to_string(),
         None => format!("https://bedrock-runtime.{region}.amazonaws.com"),
@@ -377,6 +377,7 @@ pub(crate) struct Endpoint {
     pub creds: BedrockSecret,
     pub base: Option<String>,
     pub extra_headers: Vec<(String, String)>,
+    pub credentials_http: Option<aws_smithy_runtime_api::client::http::SharedHttpClient>,
 }
 
 async fn send(
@@ -441,7 +442,10 @@ async fn send(
         ),
     ];
     headers.extend(endpoint.extra_headers.iter().cloned());
-    let auth = endpoint.creds.request_auth(ctx.deadline).await?;
+    let auth = endpoint
+        .creds
+        .request_auth_with_http(ctx.deadline, endpoint.credentials_http.clone())
+        .await?;
     let headers = authenticated_headers(&auth, endpoint.creds.region(), &url_text, headers, &body)?;
     let started = Instant::now();
     let client = endpoint.client.clone();

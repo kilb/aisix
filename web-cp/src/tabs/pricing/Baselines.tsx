@@ -30,7 +30,8 @@ import { Field, useRefusalFocus } from "../../ui/Field";
 import { SidePanel } from "../../ui/SidePanel";
 import { useToast } from "../../ui/Toast";
 import { BentoGrid, Card, CardHeader, CardMessage, Metric, MetricSkeleton, PageHeader, span } from "../../components/page";
-import { CardLines, LibrarySyncOne } from "./LibrarySync";
+import { LibrarySyncOne } from "./LibrarySync";
+import { PriceCardDetails } from "./PriceCardDetails";
 import { CardFooter, Count, FormGrid } from "./kit";
 
 /** The rates of a baseline's `default` tier, when the card has both. */
@@ -186,6 +187,35 @@ export function BaselineSourceBadge({ revision }: { revision: BaselineRevision }
         </div>
       );
   }
+}
+
+/** 每个版本的来源与生效时间独立呈现，完整价格卡保留整行宽度。 */
+function BaselineVersion({ revision }: { revision: BaselineRevision }) {
+  const rates = headline(revision.card);
+  return (
+    <article className="baseline-version" aria-label={`基准价版本 ${revision.revision_id}`}>
+      <p className="baseline-version-id">版本 <span className="tabular">#{revision.revision_id}</span></p>
+      <dl className="baseline-version-meta">
+        <div>
+          <dt>生效时间（UTC）</dt>
+          <dd className="tabular"><time dateTime={revision.effective_from}>{fmtUtc(revision.effective_from)}</time></dd>
+        </div>
+        <div>
+          <dt>价格来源</dt>
+          <dd><BaselineSourceBadge revision={revision} /></dd>
+        </div>
+      </dl>
+      {rates && (
+        <div className="baseline-version-summary">
+          <span>标准档摘要 · 输入 / 输出</span>
+          <span className="baseline-rates money tabular-nums">
+            {usdPerMillion(rates.input)}{" · "}{usdPerMillion(rates.output)}
+          </span>
+        </div>
+      )}
+      <PriceCardDetails card={revision.card} label="完整价格卡" />
+    </article>
+  );
 }
 
 /** The model document fields the page reads, to preselect its catalogue entry. */
@@ -495,7 +525,6 @@ function BaselinePanel({
       ),
   );
 
-  const head = row.current ? headline(row.current.card) : null;
   return (
     <SidePanel title={row.name} label={`${row.name} 的基准价`} onClose={onClose}>
       {canEdit && (
@@ -587,63 +616,24 @@ function BaselinePanel({
       )}
       <section className={canEdit ? "mt-6 border-t border-ink/7 pt-6" : "mt-5"} aria-label="现行基准价">
         <h3 className="mb-3 font-mono text-meta text-muted">现行与待生效</h3>
-        {row.current ? (
-          <div className="rounded-cell bg-well p-4 text-ink-soft">
-            <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
-              <div className="baseline-rates money tabular-nums">
-                {head ? (
-                  <>
-                    {usdPerMillion(head.input)}
-                    {" · "}
-                    {usdPerMillion(head.output)}
-                  </>
-                ) : (
-                  "价目卡无法读取"
-                )}
-              </div>
-              <p className="tabular text-caption text-ink-soft">生效于 {fmtUtc(row.current.effective_from)}</p>
-            </div>
-            <div className="mt-3 grid gap-3 border-t border-ink/7 pt-3 tablet:grid-cols-2">
-              <div className="min-w-0 text-caption">
-                <CardLines card={row.current.card} />
-              </div>
-              <div className="min-w-0">
-                <BaselineSourceBadge revision={row.current} />
-              </div>
-            </div>
+        <div className="baseline-version-group">
+          <div className="baseline-group-heading">
+            <h4>现行基准价</h4>
+            <span>当前计费依据</span>
           </div>
-        ) : (
-          <p className="baseline-unpriced">未定价</p>
-        )}
-        {row.upcoming.length > 0 && (
-          <DataTable label="待生效的基准价" compact>
-            <thead>
-              <tr>
-                <th>生效时间（UTC）</th>
-                <th>输入</th>
-                <th>输出</th>
-                <th>来源</th>
-                <th>完整价格卡</th>
-              </tr>
-            </thead>
-            <tbody>
-              {row.upcoming.map((u) => {
-                const rates = headline(u.card);
-                return (
-                  <tr key={u.revision_id}>
-                    <td className="tabular">{fmtUtc(u.effective_from)}</td>
-                    <td className="tabular">{rates ? usdPerMillion(rates.input) : "—"}</td>
-                    <td className="tabular">{rates ? usdPerMillion(rates.output) : "—"}</td>
-                    <td>
-                      <BaselineSourceBadge revision={u} />
-                    </td>
-                    <td className="text-caption"><CardLines card={u.card} /></td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </DataTable>
-        )}
+          {row.current ? <BaselineVersion revision={row.current} /> : <p className="baseline-unpriced">未定价</p>}
+        </div>
+        <section className="baseline-version-group" aria-label="待生效的基准价">
+          <div className="baseline-group-heading">
+            <h4>待生效版本<Count n={row.upcoming.length} /></h4>
+            <span>按预约时间生效</span>
+          </div>
+          {row.upcoming.length > 0 ? (
+            <div className="baseline-version-list">
+              {row.upcoming.map((revision) => <BaselineVersion key={revision.revision_id} revision={revision} />)}
+            </div>
+          ) : <p className="hint">暂无待生效版本</p>}
+        </section>
         {row.catalogue_update && (
           <div className="note warn" role="status">
             {catalogueUpdateWords(row.catalogue_update).panel}

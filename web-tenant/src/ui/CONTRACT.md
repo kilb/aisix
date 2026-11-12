@@ -4,7 +4,11 @@
 
 ## 视觉与主题
 
-暖石 canvas、暖白 surface、ink；唯一橙 accent 表示当前/重点，禁止用作成功或失败颜色。没有投影、装饰渐变、入场位移。颜色原值集中在 tokens.css，字号使用 hero/display/figure/value/title/lead/stat/brand/body/caption/meta/micro，半径使用 card/cell/chip/bar/full。主题默认浅色，即使系统要求深色；现有手动开关、两端各自 storage key、刷新前 preload 行为保留。深色以同组暖中性色映射语义角色，inverse 卡固定深 ink，确保橙文字只落在足够对比的深底。
+用户最新明确要求“前端页面改成侧边菜单栏比较好”“大字部分太大”，并强调“组织页面与管理后台都要改”。此指示覆盖旧套件的顶部导航、禁止侧栏及超大字级规则，两端统一采用以下紧凑合同；权限、精确金额、数据口径和可访问性合同保持。
+
+页面标题28px、手机24px；Metric 的 hero/display/figure/value 分别为36/32/28/24px，均400字重，不再生成56–104px展示数字。lead/正文14px，辅助说明13px，meta12px、micro11px不缩小。CardHeader标题14px/500字重，编号11px mono；卡片padding20px、内容gap16px、圆角18px。字级由tokens定义，Tailwind映射引用相同变量，避免旧utility覆盖。
+
+暖石 canvas、暖白 surface、ink；唯一橙 accent 表示当前/重点，禁止用作成功或失败颜色。没有投影、装饰渐变、入场位移。颜色原值集中在 tokens.css，字号使用 hero/display/figure/value/title/lead/stat/brand/body/caption/meta/micro，半径使用 card/cell/chip/bar/full。主题默认浅色，即使系统要求深色；现有手动开关、两端各自 storage key、刷新前 preload 行为保留。AA文本/控件边缘对比、44px控件命中区与焦点合同不变。所有字体保持同源独立文件，不内联为data字体URL。深色以同组暖中性色映射语义角色，inverse 卡固定深 ink，确保橙文字只落在足够对比的深底。
 
 注意：原始 CSS `--muted`、`--accent` 是历史填充别名；canonical Tailwind text-muted 是灰文本、accent 是橙。旧 bg-muted/bg-accent 调用应迁至 well 或低透明 foreground；well 上的小字使用 ink-soft，不能用对比不足的 muted。货币继续通过 lib/money.ts 的 BigInt/精确小数工具，Metric 不解析、不缩写、不舍入数据。未知不是零，未设置与无限额不等价。
 
@@ -28,13 +32,13 @@
 
 **EmptyState**：text/mark/action 不变；页面已有同名操作时不重复添加 action，保持 strict locator 唯一性。
 
-**Icon/Mark**：装饰 SVG currentColor、aria-hidden，控件承担可访问名称；Icon16px/1.5stroke、Mark32px，不混入文字导航。
+**Icon/Mark**：装饰 SVG currentColor、aria-hidden，控件承担可访问名称；Icon16px/1.5stroke、Mark32px；侧栏导航仍以可读文字命名，装饰图标不进入可访问名称。
 
 ## 页面原语
 
-PageHeader 保留 title/description/actions/className，新增 eyebrow/dataLead；唯一 h1，数据 lead 优先 description。Card 为 section，保持传入 aria 和其它原生 props，增加 tone=surface|inverse；padding28/radius24/gap24。CardHeader 保留 title/description/actions/as/className，默认 h2，number 可显式传入，否则读取页面卡片计数；编号在 aria-hidden span，不能改变标题可访问名称。CardFooter 将图表图例放在卡底。BentoGrid 12列、gap12；span.d3/d4/d5/d6 在tablet为6，其余 d5Wide/d7/d8/d12 为12；desktop>=1100 为指定列数，mobile<720 全12。各行列数由页面 owner 合满12。
+PageHeader 保留 title/description/actions/className，新增 eyebrow/dataLead；唯一 h1，dataLead为主摘要；同时提供description时另行完整显示说明。Card 为 section，保持传入 aria 和其它原生 props，增加 tone=surface|inverse；padding20/radius18/gap16。CardHeader 保留 title/description/actions/as/className，默认 h2，number 可显式传入，否则读取页面卡片计数；编号在 aria-hidden span，不能改变标题可访问名称。CardFooter 将图表图例放在卡底。BentoGrid 12列、主业务卡间距16px，与Grid/StatGrid/Split及卡片堆叠容器统一读取共享card-gap令牌；span.d3/d4/d5/d6 在tablet为6，其余 d5Wide/d7/d8/d12 为12；desktop>=1100 为指定列数，mobile<720 全12。各行列数由页面 owner 合满12。
 
-Metric 仅展示调用方已格式化 children，size hero/display/figure/value，weight400，hero每页最多一次，inverse每页最多一张；完整金额不截断。MetricSkeleton/ChartSkeleton 不生成业务值，CardMessage 可带真正重试回调。Split 接受旧 asideWidth 参数以兼容调用，新布局统一1100起7+5，tablet/mobile两块full；Grid/StatGrid/Stat/Toolbar/DescList 兼容保留。主导航为顶部文字行，窄屏内部横滚，保留 tablist/roving tabindex/方向键/Home/End/Enter/Space、data-tab 和 aria-controls，不回退侧栏或底部导航。
+Metric 仅展示调用方已格式化 children，size hero/display/figure/value对应36/32/28/24px，weight400，hero每页最多一次，inverse每页最多一张；完整金额不截断、不重新计算，必要时换行。MetricSkeleton/ChartSkeleton 不生成业务值，CardMessage 可带真正重试回调。Split 接受旧 asideWidth 参数以兼容调用，新布局统一1100起7+5，tablet/mobile两块full；Grid/StatGrid/Stat/Toolbar/DescList 兼容保留。主导航在桌面>=1100px采用224px侧栏，窄屏采用可打开/关闭的抽屉，不再沿用顶部横滚主导航。保留现有role、可访问名称、roving tabindex/方向键/Home/End/Enter/Space、data-tab、aria-controls、hash深链、角色可见性与会话行为；抽屉保持焦点管理、Escape关闭和关闭后焦点归还。
 
 ## 状态和样式钩子
 

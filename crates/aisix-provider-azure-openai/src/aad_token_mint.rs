@@ -338,7 +338,9 @@ impl TokenMinter {
     async fn mint(&self, creds: &AadCredentials) -> Result<(String, u64), BridgeError> {
         creds.validate()?;
         let endpoint = self.resolve_token_endpoint(creds);
-        let resp = self
+        aisix_gateway::note_url_userinfo(&endpoint);
+        aisix_gateway::note_sent_credential(&creds.client_secret);
+        let request = self
             .client
             .post(&endpoint)
             .timeout(self.mint_timeout)
@@ -347,19 +349,34 @@ impl TokenMinter {
                 ("client_id", &creds.client_id),
                 ("client_secret", &creds.client_secret),
                 ("scope", AZURE_OPENAI_SCOPE),
-            ])
-            .send()
-            .await
-            .map_err(|e| {
-                // This text reaches the usage event, so the cause goes to the log alone.
-                tracing::warn!(
-                    error = %aisix_gateway::transport_error_message(&e),
-                    "azure aad token mint request failed",
-                );
-                let endpoint = aisix_gateway::redact_url_for_log(&endpoint);
-                let e = e.without_url();
-                BridgeError::Transport(format!("azure aad token mint POST {endpoint}: {e}"))
-            })?;
+            ]);
+        let resp = async {
+            let request = request.build()?;
+            // 同时登记实际表单编码值，避免上游回显编码后的 secret 时漏脱敏。
+            if let Some(encoded_secret) = request
+                .body()
+                .and_then(|body| body.as_bytes())
+                .and_then(|body| std::str::from_utf8(body).ok())
+                .and_then(|body| {
+                    body.split('&')
+                        .find_map(|field| field.strip_prefix("client_secret="))
+                })
+            {
+                aisix_gateway::note_sent_credential(encoded_secret);
+            }
+            self.client.execute(request).await
+        }
+        .await
+        .map_err(|e| {
+            // This text reaches the usage event, so the cause goes to the log alone.
+            tracing::warn!(
+                error = %aisix_gateway::transport_error_message(&e),
+                "azure aad token mint request failed",
+            );
+            let endpoint = aisix_gateway::redact_url_for_log(&endpoint);
+            let e = e.without_url();
+            BridgeError::Transport(format!("azure aad token mint POST {endpoint}: {e}"))
+        })?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -370,11 +387,11 @@ impl TokenMinter {
                     .await;
             let text = String::from_utf8_lossy(body.whole()).into_owned();
             let read_error = body.read_error;
-            // Cap body to 500 chars. AAD error envelopes
-            // `{error: "invalid_client", error_description: "..."}` are
-            // operator-actionable; cap is defense-in-depth against a
-            // mis-deployed front-door that returns an HTML error page.
-            let truncated: String = text.chars().take(500).collect();
+            // 先完整脱敏再截断，避免长凭据被截成无法精确替换的片段。
+            let truncated: String = aisix_gateway::scrub_upstream_error_text(&text)
+                .chars()
+                .take(500)
+                .collect();
             let msg = format!("azure aad token mint upstream returned HTTP {status}: {truncated}");
             // Mirror Vertex audit MEDIUM (ai-gateway#387): 5xx is
             // transient upstream — should surface UpstreamStatus
@@ -413,7 +430,7 @@ impl TokenMinter {
     /// (bare http(s) origin, no query / fragment) before
     /// this runs, so the only normalisation needed here is trimming a
     /// trailing slash to avoid a `//{tenant}` double slash.
-    fn resolve_token_endpoint(&self, creds: &AadCredentials) -> String {
+    pub(crate) fn resolve_token_endpoint(&self, creds: &AadCredentials) -> String {
         #[cfg(test)]
         if let Some(base) = &self.token_endpoint_override {
             // Tests get a fixed URL — tenant id is still validated
@@ -443,6 +460,78 @@ mod tests {
             client_id: "22222222-2222-2222-2222-222222222222".into(),
             client_secret: "fake-secret-not-a-real-one".into(),
             authority_host: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn token_endpoint_errors_scrub_sent_credentials_before_truncating() {
+        for status in [400, 503] {
+            for encoded in [false, true] {
+                let server = MockServer::builder().start().await;
+                let mut creds = sample_creds();
+                creds.client_secret = "opaque+aad/secret=with spaces&".repeat(32);
+                let secret = creds.client_secret.clone();
+                Mock::given(method("POST"))
+                    .respond_with(move |req: &Request| {
+                        let body = std::str::from_utf8(&req.body).unwrap();
+                        let encoded_secret = body
+                            .split('&')
+                            .find_map(|field| field.strip_prefix("client_secret="))
+                            .unwrap();
+                        let echoed = if encoded { encoded_secret } else { &secret };
+                        assert!(echoed.len() > 500);
+                        ResponseTemplate::new(status).set_body_string(format!(
+                            "invalid_client credential={echoed}; retry with updated credentials"
+                        ))
+                    })
+                    .mount(&server)
+                    .await;
+                let minter =
+                    TokenMinter::new(Client::new()).with_token_endpoint_override(server.uri());
+                let err = aisix_gateway::response_tap::scope(
+                    Arc::new(aisix_gateway::response_tap::ResponseHeaderTap::default()),
+                    minter.get_token(&creds),
+                )
+                .await
+                .unwrap_err();
+                for shown in [err.to_string(), format!("{err:?}")] {
+                    assert!(
+                        shown.contains("credential=<redacted>; retry with updated credentials"),
+                        "{shown}"
+                    );
+                    assert!(!shown.contains("opaque+aad"), "{shown}");
+                    assert!(!shown.contains("opaque%2Baad"), "{shown}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn token_endpoint_errors_scrub_url_userinfo() {
+        let server = MockServer::builder().start().await;
+        let password = "opaque-mint-url-password".repeat(32);
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(format!(
+                "invalid_client password={password}; update credentials"
+            )))
+            .mount(&server)
+            .await;
+        let endpoint = server
+            .uri()
+            .replacen("://", &format!("://tester:{password}@"), 1);
+        let minter = TokenMinter::new(Client::new()).with_token_endpoint_override(endpoint);
+        let err = aisix_gateway::response_tap::scope(
+            Arc::new(aisix_gateway::response_tap::ResponseHeaderTap::default()),
+            minter.get_token(&sample_creds()),
+        )
+        .await
+        .unwrap_err();
+        for shown in [err.to_string(), format!("{err:?}")] {
+            assert!(
+                shown.contains("password=<redacted>; update credentials"),
+                "{shown}"
+            );
+            assert!(!shown.contains("opaque-mint-url-password"), "{shown}");
         }
     }
 

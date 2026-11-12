@@ -1,7 +1,7 @@
-//! The control plane's outbound HTTP clients: the model list of an upstream
-//! account (`GET /admin/provider-keys/{id}/upstream-models`), and the price
-//! library's fetch from its one fixed address ([`fixed_origin_client`],
-//! `POST /admin/pricing/library/fetch`). Both start from the same builder.
+//! The control plane's outbound HTTP clients: upstream model lists, manual
+//! model probes, and the price library's fetch from its one fixed address
+//! ([`fixed_origin_client`], `POST /admin/pricing/library/fetch`). All start
+//! from the same builder; probes bound their own streaming call separately.
 //!
 //! `api_base` is operator-set, so this is the first place the control plane
 //! dials a URL a person supplied. `outbound.ssrf_protection` applies, through
@@ -17,6 +17,8 @@
 //! before it is sent ([`response_tap::note_sent_credential`]), and never
 //! reaches an answer, a log or an audit row.
 
+use std::collections::BTreeMap;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use aisix_core::config::SsrfProtectionConfig;
@@ -25,6 +27,7 @@ use aisix_gateway::response_tap::{self, ResponseHeaderTap};
 use aisix_gateway::ssrf::{Refusal, Route, SsrfProtection};
 use aisix_gateway::upstream_error_scrub::scrub_upstream_error_text;
 use chrono::{DateTime, Utc};
+use reqwest::dns::Resolve;
 use reqwest::Url;
 
 use crate::error::ApiError;
@@ -112,7 +115,7 @@ impl Client {
     /// The client for `cfg`, which production takes from
     /// [`SsrfProtectionConfig::default`] — on, with no allowed hosts.
     pub fn new(cfg: &SsrfProtectionConfig) -> Result<Client, String> {
-        let ssrf = SsrfProtection::from_config(cfg)?;
+        let ssrf = SsrfProtection::from_config(cfg)?.without_proxies();
         let pinned = Self::builder()
             .dns_resolver(aisix_gateway::ssrf::direct_resolver(true))
             .build()
@@ -142,22 +145,157 @@ impl Client {
 
     /// The client `url` goes out on, or why it may not be dialled.
     async fn route(&self, url: &Url) -> Result<&reqwest::Client, ApiError> {
+        match self.route_kind(url).await? {
+            Route::Direct => Ok(&self.direct),
+            Route::Pinned | Route::Proxied => Ok(&self.pinned),
+        }
+    }
+
+    /// 为模型探测复用同一地址策略；独立时限不改变模型列表的五秒界限。
+    pub async fn probe_client(
+        &self,
+        url: &Url,
+        pk: &ProviderKey,
+        timeout: Duration,
+    ) -> Result<reqwest::Client, ApiError> {
+        self.probe_client_inner(std::slice::from_ref(url), Some(pk), timeout)
+            .await
+    }
+
+    /// 令牌交换只使用其自身地址，不能继承模型端点的证书或私网地址覆盖。
+    pub async fn credential_client(
+        &self,
+        urls: &[Url],
+        timeout: Duration,
+    ) -> Result<reqwest::Client, ApiError> {
+        self.probe_client_inner(urls, None, timeout).await
+    }
+
+    async fn probe_client_inner(
+        &self,
+        urls: &[Url],
+        pk: Option<&ProviderKey>,
+        timeout: Duration,
+    ) -> Result<reqwest::Client, ApiError> {
+        let pins = self.probe_pins(urls, pk).await?;
+        let mut builder = Self::builder()
+            .timeout(timeout)
+            // 单次探测不重放；SDK 层也单独禁用重试。
+            .retry(reqwest::retry::never())
+            // 已检查的目标逐个固定；意外的其它域名仍不能解析到私网。
+            .dns_resolver(aisix_gateway::ssrf::direct_resolver(true));
+        for (host, addresses) in pins {
+            builder = builder.resolve_to_addrs(&host, &addresses);
+        }
+        if let Some(tls) = pk.and_then(|pk| pk.tls.as_ref()) {
+            if let Some(pem) = tls.ca_cert.as_ref().filter(|pem| !pem.trim().is_empty()) {
+                let roots = reqwest::Certificate::from_pem_bundle(pem.as_bytes())
+                    .map_err(|_| ApiError::upstream_unreachable("该上游的 CA 证书无法读取"))?;
+                if roots.is_empty() {
+                    return Err(ApiError::upstream_unreachable("该上游的 CA 配置没有证书"));
+                }
+                for root in roots {
+                    builder = builder.add_root_certificate(root);
+                }
+            }
+            if !tls.verify {
+                builder = builder.danger_accept_invalid_certs(true);
+            }
+        }
+        builder.build().map_err(ApiError::internal)
+    }
+
+    /// 只解析一次并固定实际连接地址，保留请求的主机名、端口和用户信息。
+    async fn probe_pins(
+        &self,
+        urls: &[Url],
+        pk: Option<&ProviderKey>,
+    ) -> Result<BTreeMap<String, Vec<SocketAddr>>, ApiError> {
+        let connection = pk.and_then(ProviderKey::upstream_connection);
+        let public_only = SsrfProtection::from_config(&SsrfProtectionConfig::default())
+            .map_err(ApiError::internal)?
+            .without_proxies();
+        let mut pins = BTreeMap::<String, Vec<SocketAddr>>::new();
+        for url in urls {
+            if !matches!(url.scheme(), "http" | "https") {
+                return Err(ApiError::upstream_unreachable(
+                    "上游地址必须使用 http 或 https",
+                ));
+            }
+            let route = self.route_kind(url).await?;
+            let host = url
+                .host_str()
+                .ok_or_else(|| ApiError::upstream_unreachable("上游地址缺少主机名"))?;
+            if host.trim_matches(['[', ']']).parse::<IpAddr>().is_ok() {
+                // 地址字面量不经过 DNS；route_kind 已在这里检查它。
+                continue;
+            }
+            let configured = connection.as_ref().and_then(|connection| {
+                connection
+                    .resolve
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(host))
+                    .map(|(_, ips)| ips.iter().map(|ip| SocketAddr::new(*ip, 0)).collect())
+            });
+            let addresses =
+                match configured.or_else(|| pins.get(host).cloned()) {
+                    Some(addresses) => addresses,
+                    None => aisix_gateway::ssrf::direct_resolver(!matches!(route, Route::Direct))
+                        .resolve(host.parse().map_err(|_| {
+                            ApiError::upstream_unreachable("上游地址的主机名无法读取")
+                        })?)
+                        .await
+                        .map_err(|error| {
+                            if matches!(
+                                Refusal::from_error(error.as_ref()),
+                                Some(Refusal::Blocked(_))
+                            ) {
+                                ApiError::upstream_unreachable(Refusal::blocked_hint(Some(url)))
+                            } else {
+                                ApiError::upstream_unreachable("该上游的域名无法解析")
+                            }
+                        })?
+                        .collect(),
+                };
+            if addresses.is_empty() {
+                return Err(ApiError::upstream_unreachable("该上游的域名没有可用地址"));
+            }
+            if !matches!(route, Route::Direct) {
+                // 白名单按实际目标判断；没有豁免的域名不能用静态覆盖绕过检查。
+                for address in &addresses {
+                    let mut literal = url.clone();
+                    literal
+                        .set_ip_host(address.ip())
+                        .map_err(|_| ApiError::upstream_unreachable("上游地址的主机名无法读取"))?;
+                    if public_only.route(&literal).await.is_err() {
+                        return Err(ApiError::upstream_unreachable(Refusal::blocked_hint(Some(
+                            url,
+                        ))));
+                    }
+                }
+            }
+            pins.insert(host.to_string(), addresses);
+        }
+        Ok(pins)
+    }
+
+    async fn route_kind(&self, url: &Url) -> Result<Route, ApiError> {
         // Protection off checks nothing, so there is nothing for a guarded
         // resolver to enforce.
         if !self.guarded {
-            return Ok(&self.direct);
+            return Ok(Route::Direct);
         }
         match self.ssrf.route(url).await {
             // A public address literal, or a host the policy allows: both
             // already decided, and nothing is left to pin.
-            Ok(Route::Direct) => Ok(&self.direct),
+            Ok(Route::Direct) => Ok(Route::Direct),
             // A name whose addresses were checked and pinned. `Proxied` is
             // the same case read through the environment's proxy matcher,
             // which never applies to these clients (`no_proxy`): the only
             // path that reaches here with `allowed_hosts` empty — which the
             // route's own policy always is — is a name checked as wholly
             // public, so the pin is what has to hold.
-            Ok(Route::Pinned | Route::Proxied) => Ok(&self.pinned),
+            Ok(route @ (Route::Pinned | Route::Proxied)) => Ok(route),
             Err(Refusal::Unresolvable) => {
                 Err(ApiError::upstream_unreachable("该上游的域名无法解析"))
             }
@@ -584,6 +722,118 @@ mod tests {
             doc["api_base"] = serde_json::json!(base);
         }
         serde_json::from_value(doc).expect("a key")
+    }
+
+    #[tokio::test]
+    async fn probe_rejects_private_address_overrides_before_building_a_client() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = Client::new(&SsrfProtectionConfig::default()).expect("地址策略");
+        let mut pk = key(
+            Some(Adapter::Openai),
+            "openai",
+            Some("https://model.example/v1"),
+        );
+        pk.resolve_addresses = Some(vec!["127.0.0.1".parse().expect("回环地址")]);
+        let target = Url::parse("https://model.example/v1/chat/completions").expect("模型地址");
+        let result = client
+            .probe_client(&target, &pk, Duration::from_secs(30))
+            .await;
+        assert!(result.is_err(), "私网地址覆盖不能绕过 SSRF 策略");
+
+        let ip_allowed = Client::new(&SsrfProtectionConfig {
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            ..Default::default()
+        })
+        .expect("地址策略");
+        assert!(
+            ip_allowed
+                .probe_client(&target, &pk, Duration::from_secs(30))
+                .await
+                .is_err(),
+            "豁免必须属于实际目标主机，不能从覆盖后的 IP 继承"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_rejects_an_invalid_configured_ca_instead_of_ignoring_it() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = Client::new(&SsrfProtectionConfig::default()).expect("地址策略");
+        let mut pk = key(Some(Adapter::Openai), "openai", Some("https://8.8.8.8/v1"));
+        pk.tls = Some(aisix_core::models::provider_key::ProviderKeyTls {
+            ca_cert: Some("not a certificate".to_string()),
+            verify: true,
+        });
+        let target = Url::parse("https://8.8.8.8/v1/chat/completions").expect("模型地址");
+        let result = client
+            .probe_client(&target, &pk, Duration::from_secs(30))
+            .await;
+        assert!(result.is_err(), "配置的 CA 必须被应用，不能静默忽略");
+    }
+
+    #[tokio::test]
+    async fn probe_pins_the_configured_addresses_in_order_on_an_allowed_host() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = Client::new(&SsrfProtectionConfig {
+            allowed_hosts: vec!["model.example:443".to_string()],
+            ..Default::default()
+        })
+        .expect("地址策略");
+        let mut pk = key(
+            Some(Adapter::Openai),
+            "openai",
+            Some("https://model.example/v1"),
+        );
+        pk.resolve_addresses = Some(vec![
+            "127.0.0.2".parse().expect("第二个回环地址"),
+            "127.0.0.1".parse().expect("回环地址"),
+        ]);
+        let target = Url::parse("https://model.example/v1/chat/completions").expect("模型地址");
+        let pins = client
+            .probe_pins(std::slice::from_ref(&target), Some(&pk))
+            .await
+            .expect("白名单允许该主机的配置地址");
+        assert_eq!(
+            pins.get("model.example"),
+            Some(&vec![
+                "127.0.0.2:0".parse().expect("固定地址"),
+                "127.0.0.1:0".parse().expect("固定地址"),
+            ]),
+            "必须保留配置顺序和地址；端口仍来自实际 URL"
+        );
+        let mut other_port = target.clone();
+        other_port.set_port(Some(8443)).expect("端口");
+        assert!(
+            client
+                .probe_pins(&[target, other_port], Some(&pk))
+                .await
+                .is_err(),
+            "同一主机另一端口不能继承 443 的白名单"
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_endpoints_are_checked_individually_without_model_overrides() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = Client::new(&SsrfProtectionConfig {
+            allowed_hosts: vec!["model.example".to_string()],
+            ..Default::default()
+        })
+        .expect("地址策略");
+        let urls = [
+            Url::parse("https://8.8.8.8/token").expect("公开地址"),
+            Url::parse("http://127.0.0.1/token").expect("私网地址"),
+        ];
+        assert!(
+            client
+                .credential_client(&urls, Duration::from_secs(30))
+                .await
+                .is_err(),
+            "模型主机的白名单不能放行凭据地址，地址字面量也必须检查"
+        );
+        assert!(client
+            .credential_client(&urls[..1], Duration::from_secs(30))
+            .await
+            .is_ok());
     }
 
     fn url(pk: &ProviderKey) -> String {

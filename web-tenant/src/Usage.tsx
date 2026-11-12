@@ -332,11 +332,11 @@ function Summary({ keys, showKeys, ownScope }: { keys: TenantKey[]; showKeys: bo
   const metricsTo = toDate ? utcRange(toDate, toDate).to : fallback.to;
   return (
     <BentoGrid>
-      <UsageRequestCard rows={rows} error={visualError} rangeLabel={rangeLabel} group={group} number={1} className={span.d8} onRetry={retry} />
-      <UsageCostCard rows={rows} error={visualError} rangeLabel={rangeLabel} group={group} number={2} className={span.d4} onRetry={retry} />
-      <UsageModelsCard rows={rows} error={visualError} rangeLabel={rangeLabel} group={group} number={3} className={span.d4} onRetry={retry} />
-      <UsageCostTrendCard rows={rows} error={visualError} rangeLabel={rangeLabel} group={group} number={4} className={span.d8} onRetry={retry} />
-      <ApiMetricsPanel refreshKey={refresh} scope="tenant" enabled from={metricsFrom} to={metricsTo} apiKeyId={keyId || undefined} numberStart={5} className={span.d12} />
+      <ApiMetricsPanel compact refreshKey={refresh} scope="tenant" enabled from={metricsFrom} to={metricsTo} apiKeyId={keyId || undefined} numberStart={1} className={span.d12} />
+      <UsageRequestCard rows={rows} error={visualError} rangeLabel={rangeLabel} group={group} number={3} className={span.d8} onRetry={retry} />
+      <UsageCostCard rows={rows} error={visualError} rangeLabel={rangeLabel} group={group} number={4} className={span.d4} onRetry={retry} />
+      <UsageModelsCard rows={rows} error={visualError} rangeLabel={rangeLabel} group={group} number={5} className={span.d4} onRetry={retry} />
+      <UsageCostTrendCard rows={rows} error={visualError} rangeLabel={rangeLabel} group={group} number={6} className={span.d8} onRetry={retry} />
       <Section title="用量汇总" number={7}>
         <Filters>
           <Field label="汇总方式">

@@ -586,7 +586,7 @@ export function ChannelModels({
         )}
         {(rows !== null || !canEdit) && (
           // The save closes the card: what it will write on the left, the write on the right.
-          <div className="ch-save -mx-7 -mb-7 mt-6 flex flex-wrap items-start justify-end gap-x-4 gap-y-2 rounded-b-card border-t border-line bg-well px-7 py-3 [&_.hint]:text-ink-soft">
+          <div className="ch-save -mx-[var(--pad)] -mb-[var(--pad)] mt-6 flex flex-wrap items-start justify-end gap-x-4 gap-y-2 rounded-b-card border-t border-line bg-well px-[var(--pad)] py-3 [&_.hint]:text-ink-soft">
             {canEdit ? (
               <>
                 {changed.length > 0 && <span className="hint mr-auto self-center text-caption">将保存 {changed.length} 个模型的改动。</span>}

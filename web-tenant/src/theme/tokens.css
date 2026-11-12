@@ -127,6 +127,17 @@
   --inset: none;
   --mark-tile: var(--bento-ink);
   --wide: 100%;
+
+  /* 运营界面采用紧凑字级；旧 size API 仍保留，但不再生成巨型数字。 */
+  --type-title: 28px;
+  --type-hero: 36px;
+  --type-display: 32px;
+  --type-figure: 28px;
+  --type-value: 24px;
+  --type-lead: 14px;
+  --card-pad: 20px;
+  --card-gap: 16px;
+  --page-heading-gap: 24px;
   --s-1: 4px;
   --s-2: 8px;
   --s-3: 12px;
@@ -142,17 +153,17 @@
   --fs-16: 16px;
   --fs-20: 19px;
   --fs-24: 24px;
-  --fs-32: 32px;
-  --fs-44: 60px;
+  --fs-32: var(--type-display);
+  --fs-44: var(--type-title);
   --lh-body: 1.5;
   --lh-table: 1.45;
   --lh-heading: 1.2;
   --tracking-heading: -0.04em;
   --r-input: 10px;
-  --r-card: 24px;
+  --r-card: 18px;
   --r-button: 9999px;
   --r-chip: 8px;
-  --r-panel: 24px;
+  --r-panel: 18px;
   --r-rail: 24px;
   --r-round: 9999px;
   --h-control: 44px;
@@ -211,4 +222,8 @@
   --lamp-disabled: var(--bento-inverse-muted);
   --n3: var(--bento-inverse-muted);
   --n4: var(--bento-graphite);
+}
+
+@media (max-width: 719px) {
+  :root { --type-title: 24px; }
 }

@@ -153,8 +153,26 @@ export function Overview({ operator, onGoto }: TabProps) {
         dataLead={s ? <>当前有 {fmtInt(s.online_instances)} 个在线网关，{fmtInt(s.pending)} 个资源待下发、{fmtInt(s.propagating)} 个资源下发中。{error && "刷新失败，以下保留最近成功结果。"}</> : "查看环境、网关心跳、配置下发与最近 24 小时的计价健康。"}
       />
       <BentoGrid aria-label="运行概况">
+        <div className={span.d12}>
+          <div className="mb-5 flex flex-wrap items-end justify-between gap-4">
+            <div className="min-w-0">
+              <p className="font-mono text-meta text-muted">API 请求统计</p>
+              <p className="mt-2 break-all font-mono text-micro text-muted">{metrics.from.slice(0, 16).replace("T", " ")} — {metrics.to.slice(0, 16).replace("T", " ")} UTC</p>
+            </div>
+            <div className="flex max-w-full flex-wrap items-end gap-3">
+              <label className="f filter m-0">
+                <span>统计范围</span>
+                <select value={metrics.range} onChange={(e) => setMetrics(metricsWindow(e.target.value as MetricsRange))}>
+                  {METRICS_RANGES.map((r) => <option key={r.value} value={r.value}>{r.label}</option>)}
+                </select>
+              </label>
+              <Button onClick={() => setMetrics(metricsWindow(metrics.range))}>刷新统计</Button>
+            </div>
+          </div>
+          <ApiMetricsPanel scope="admin" enabled={true} from={metrics.from} to={metrics.to} numberStart={1} compact />
+        </div>
         <Card className={span.d8}>
-          <CardHeader number={1} title="配置下发 · 当前" actions={<Button onClick={() => void readSummary()}>刷新状态</Button>} />
+          <CardHeader number={3} title="配置下发 · 当前" actions={<Button onClick={() => void readSummary()}>刷新状态</Button>} />
           {s === null ? (
             error ? <CardMessage onRetry={() => void readSummary()}>读取下发状态失败：{error}</CardMessage> : <MetricSkeleton />
           ) : (
@@ -184,7 +202,7 @@ export function Overview({ operator, onGoto }: TabProps) {
         </Card>
 
         <Card className={span.d4} tone="inverse">
-          <CardHeader number={2} title="在线网关" actions={<span className="font-mono text-micro text-on-inverse-muted">当前心跳</span>} />
+          <CardHeader number={4} title="在线网关" actions={<span className="font-mono text-micro text-on-inverse-muted">当前心跳</span>} />
           {s ? <Metric size="display">{fmtInt(s.online_instances)}</Metric> : error ? <CardMessage onRetry={() => void readSummary()}>心跳数据暂不可用。</CardMessage> : <MetricSkeleton />}
           <p className="mt-4 text-caption text-on-inverse-muted">近期发过心跳的网关实例。离线详情与凭据在网关页查看。</p>
           <CardFooter>
@@ -197,7 +215,7 @@ export function Overview({ operator, onGoto }: TabProps) {
         </Card>
 
         <Card className={span.d5} aria-label="计价异常">
-          <CardHeader number={3} title="未计价调用 · 最近 24 小时" actions={<Button size="sm" onClick={() => onGoto("pricing", "status")}>去「价格 · 计价状态」</Button>} />
+          <CardHeader number={5} title="未计价调用 · 最近 24 小时" actions={<Button size="sm" onClick={() => onGoto("pricing", "status")}>去「价格 · 计价状态」</Button>} />
           {pricingView ? <Metric size="figure">{fmtInt(pricingView.unpricedTotal)}</Metric> : pricingError ? <CardMessage onRetry={() => void readPricing()}>读取计价状态失败：{pricingError}</CardMessage> : <MetricSkeleton />}
           {pricingView && (
             <CardFooter>
@@ -208,20 +226,20 @@ export function Overview({ operator, onGoto }: TabProps) {
         </Card>
 
         <Card className={span.d3}>
-          <CardHeader number={4} title="不可用价格版本" />
+          <CardHeader number={6} title="不可用价格版本" />
           {pricingView ? <Metric size="figure">{fmtInt(pricingView.invalid.length)}</Metric> : pricingError ? <CardMessage>暂不可用。</CardMessage> : <MetricSkeleton />}
           <p className="mt-4 text-caption text-muted">计价引擎会跳过这些版本。具体原因在计价状态页查看。</p>
           {pricingView && pricingView.invalid.length > 0 && <p className="note warn" role="status">有价格版本不可用，请查看计价状态。</p>}
         </Card>
 
         <Card className={span.d4}>
-          <CardHeader number={5} title="已更正计价 · 最近 24 小时" />
+          <CardHeader number={7} title="已更正计价 · 最近 24 小时" />
           {pricing ? pricing.corrected_last_24h ? <Metric size="figure">{fmtInt(pricing.corrected_last_24h.total)}</Metric> : <CardMessage>控制面未提供已更正计数。</CardMessage> : pricingError ? <CardMessage>暂不可用。</CardMessage> : <MetricSkeleton />}
           <p className="mt-4 text-caption text-muted">最近 24 小时已经通过重新计价更正的调用，不计入仍未计价的数量。</p>
         </Card>
 
         <Card className={span.d7}>
-          <CardHeader number={6} title="被拒绝的资源" description="网关加载时拒绝了这些资源，它们没有生效。原因由网关给出。" />
+          <CardHeader number={8} title="被拒绝的资源" description="网关加载时拒绝了这些资源，它们没有生效。原因由网关给出。" />
           {s === null ? error ? <CardMessage onRetry={() => void readSummary()}>读取失败，请重试。</CardMessage> : <MetricSkeleton /> : s.rejected.length === 0 ? (
             <CardMessage><Lamp state="applied">没有被拒绝的资源。</Lamp></CardMessage>
           ) : (
@@ -241,7 +259,7 @@ export function Overview({ operator, onGoto }: TabProps) {
         </Card>
 
         <Card className={span.d5Wide}>
-          <CardHeader number={7} title="部分兼容" description="网关加载了这些资源，但忽略了其中的部分字段。" />
+          <CardHeader number={9} title="部分兼容" description="网关加载了这些资源，但忽略了其中的部分字段。" />
           {s === null ? error ? <CardMessage onRetry={() => void readSummary()}>读取失败，请重试。</CardMessage> : <MetricSkeleton /> : s.partially_compatible.length === 0 ? (
             <CardMessage><Lamp state="applied">所有网关都完整加载了配置。</Lamp></CardMessage>
           ) : (
@@ -253,7 +271,7 @@ export function Overview({ operator, onGoto }: TabProps) {
 
         {hasRecovery && (
           <Card className={span.d12}>
-            <CardHeader number={8} title="下发恢复与必需字段" />
+            <CardHeader number={10} title="下发恢复与必需字段" />
             <Msg note={note} />
         {blocked && (
           <div className="note crit">
@@ -324,24 +342,6 @@ export function Overview({ operator, onGoto }: TabProps) {
         )}
           </Card>
         )}
-        <div className={span.d12}>
-          <div className="mb-5 flex flex-wrap items-end justify-between gap-4">
-            <div className="min-w-0">
-              <p className="font-mono text-meta text-muted">API 请求统计</p>
-              <p className="mt-2 break-all font-mono text-micro text-muted">{metrics.from.slice(0, 16).replace("T", " ")} — {metrics.to.slice(0, 16).replace("T", " ")} UTC</p>
-            </div>
-            <div className="flex max-w-full flex-wrap items-end gap-3">
-              <label className="f filter m-0">
-                <span>统计范围</span>
-                <select value={metrics.range} onChange={(e) => setMetrics(metricsWindow(e.target.value as MetricsRange))}>
-                  {METRICS_RANGES.map((r) => <option key={r.value} value={r.value}>{r.label}</option>)}
-                </select>
-              </label>
-              <Button onClick={() => setMetrics(metricsWindow(metrics.range))}>刷新统计</Button>
-            </div>
-          </div>
-          <ApiMetricsPanel scope="admin" enabled={true} from={metrics.from} to={metrics.to} numberStart={hasRecovery ? 9 : 8} />
-        </div>
       </BentoGrid>
     </>
   );

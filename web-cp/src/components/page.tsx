@@ -16,12 +16,12 @@ export function PageHeader({
   return (
     <header className={cn("page-header bento-page-header", className)}>
       <div className="min-w-0">
-        {eyebrow != null && <div className="mb-5 font-mono text-meta text-muted">{eyebrow}</div>}
+        {eyebrow != null && <div className="mb-2 font-mono text-micro text-muted">{eyebrow}</div>}
         <h1 className="text-title font-medium">{title}</h1>
         {(dataLead ?? description) != null && (
-          <div className="bento-lead mt-5 text-lead font-light text-ink-soft">{dataLead ?? description}</div>
+          <div className="bento-lead mt-2 text-lead font-normal text-ink-soft">{dataLead ?? description}</div>
         )}
-        {dataLead != null && description != null && <div className="mt-3 text-body text-muted">{description}</div>}
+        {dataLead != null && description != null && <div className="mt-1.5 text-caption text-muted">{description}</div>}
       </div>
       {actions && <div className="bento-page-actions flex flex-wrap items-center gap-2">{actions}</div>}
     </header>
@@ -41,7 +41,7 @@ export const span = {
 } as const;
 
 export function BentoGrid({ className, ...props }: ComponentProps<"div">) {
-  return <div {...props} className={cn("bento-grid grid grid-cols-12 gap-3", className)} />;
+  return <div {...props} className={cn("bento-grid grid grid-cols-12 gap-(--card-gap)", className)} />;
 }
 
 export function Card({ className, tone = "surface", ...props }: ComponentProps<"section"> & { tone?: "surface" | "inverse" }) {
@@ -59,15 +59,15 @@ export function CardHeader({
   as?: "h2" | "h3";
 }) {
   return (
-    <div className={cn("bento-card-header flex flex-wrap items-start justify-between gap-x-6 gap-y-3", className)}>
+    <div className={cn("bento-card-header flex flex-wrap items-center justify-between gap-x-4 gap-y-2", className)}>
       <div className="min-w-0">
-        <Heading className="flex items-baseline gap-3 font-mono text-meta font-normal text-muted">
+        <Heading className="flex items-baseline gap-2 text-body font-medium text-foreground">
           <span aria-hidden="true" className={number === undefined ? "bento-card-index" : undefined}>
             {number === undefined ? null : String(number).padStart(2, "0")}
           </span>
           <span>{title}</span>
         </Heading>
-        {description && <p className="mt-2 text-caption text-muted">{description}</p>}
+        {description && <p className="mt-1.5 text-caption text-muted">{description}</p>}
       </div>
       {actions && <div className="flex flex-wrap items-center gap-2">{actions}</div>}
     </div>
@@ -96,7 +96,7 @@ export function ChartSkeleton({ className, ...props }: ComponentProps<"div">) {
 
 export function CardMessage({ children, onRetry }: { children: ReactNode; onRetry?: () => void }) {
   return (
-    <div className="bento-card-message flex min-h-40 flex-col items-start justify-center gap-4 text-body text-muted">
+    <div className="bento-card-message flex min-h-24 flex-col items-start justify-center gap-3 text-caption text-muted">
       <div>{children}</div>
       {onRetry && <Button onClick={onRetry}>重试</Button>}
     </div>
@@ -120,11 +120,11 @@ export function Split({ main, aside, className }: {
 }
 
 export function Grid({ className, ...props }: ComponentProps<"div">) {
-  return <div {...props} className={cn("grid gap-3 tablet:grid-cols-2 desktop:grid-cols-3", className)} />;
+  return <div {...props} className={cn("grid gap-(--card-gap) tablet:grid-cols-2 desktop:grid-cols-3", className)} />;
 }
 
 export function StatGrid({ className, ...props }: ComponentProps<"div">) {
-  return <div {...props} className={cn("bento-stat-grid mb-3 grid gap-3 tablet:grid-cols-2 desktop:grid-cols-4", className)} />;
+  return <div {...props} className={cn("bento-stat-grid mb-(--card-gap) grid gap-(--card-gap) tablet:grid-cols-2 desktop:grid-cols-4", className)} />;
 }
 
 export function Stat({ label, value, foot, className }: { label: ReactNode; value: ReactNode; foot?: ReactNode; className?: string }) {
@@ -134,8 +134,8 @@ export function Stat({ label, value, foot, className }: { label: ReactNode; valu
         <span className="bento-card-index" aria-hidden="true" />
         <span>{label}</span>
       </div>
-      <Metric className="mt-5">{value}</Metric>
-      {foot && <div className="mt-4 text-caption text-muted">{foot}</div>}
+      <Metric className="mt-3">{value}</Metric>
+      {foot && <div className="mt-2 text-caption text-muted">{foot}</div>}
     </div>
   );
 }
