@@ -6,7 +6,7 @@ import "./Sidebar.css";
 
 const DESKTOP_QUERY = "(min-width: 1100px)";
 
-/** 桌面与抽屉共用同一份导航，避免重复的 tab id 与可访问入口。 */
+/** 桌面与抽屉共用同一份导航，避免重复的导航 id 与可访问入口。 */
 export function SidebarShell({
   brand,
   label,
@@ -51,7 +51,7 @@ export function SidebarShell({
       shell.current?.querySelector<HTMLElement>(".shell-menu-trigger")?.focus({ preventScroll: true });
     }
     if (!desktop) return;
-    const current = sidebar.current?.querySelector<HTMLElement>('[aria-selected="true"]');
+    const current = sidebar.current?.querySelector<HTMLElement>('[aria-current="page"]');
     current?.scrollIntoView({ block: "nearest", inline: "nearest" });
     if (!open) return;
     close();

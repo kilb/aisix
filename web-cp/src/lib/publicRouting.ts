@@ -1,4 +1,5 @@
 import type { PublicModelRouting } from "./api.ts";
+import { routingValueOf, type RoutingModeValue } from "./routingModes.ts";
 
 /**
  * The routing settings of a public model, as 模型与路由 edits them.
@@ -9,9 +10,7 @@ import type { PublicModelRouting } from "./api.ts";
  * field cleared here is a key left out, which is how a setting goes back to
  * the default rather than being pinned to a copy of it.
  */
-export interface RoutingDraft {
-  strategy: string;
-  affinity: "default" | "api_key" | "custom";
+export interface RoutingDraft extends RoutingModeValue {
   retries: string;
   maxFallbacks: string;
   retryOn429: boolean;
@@ -23,9 +22,7 @@ export interface RoutingDraft {
 /** The form's fields for a stored set. */
 export function draftOf(routing: PublicModelRouting, defaultStrategy: string): RoutingDraft {
   return {
-    strategy: typeof routing.strategy === "string" && routing.strategy !== "" ? routing.strategy : defaultStrategy,
-    affinity: routing.hash_on === undefined ? "default" :
-      sameRouting({ hash_on: routing.hash_on }, { hash_on: [{ type: "api_key" }] }) ? "api_key" : "custom",
+    ...routingValueOf(routing, defaultStrategy),
     retries: routing.retries === undefined || routing.retries === null ? "" : String(routing.retries),
     maxFallbacks: routing.max_fallbacks === undefined || routing.max_fallbacks === null ? "" : String(routing.max_fallbacks),
     retryOn429: routing.retry_on_429 === true,
@@ -58,10 +55,8 @@ const EDITED = ["strategy", "hash_on", "retries", "max_fallbacks", "retry_on_429
  * decided here alone, so clearing a field clears what was stored rather than
  * silently keeping it.
  *
- * An empty text field is a key left out, which the control plane stores as
- * "the gateway's default". A strategy equal to `defaultStrategy` is left out
- * too — the control plane drops it as well, and sending it would only say the
- * same thing twice.
+ * 清空字段恢复网关默认；没有改动的字段按原文保留，包括显式 false 和空数组。
+ * 新选的默认策略不必显式发送，控制面也会将其规范化为缺省值。
  */
 export function routingBody(
   draft: RoutingDraft,
@@ -86,6 +81,19 @@ export function routingBody(
   if (draft.retryOn429) body.retry_on_429 = true;
   if (statuses !== null && statuses.length > 0) body.fallback_on_statuses = statuses;
   if (draft.whenAllUnavailable !== "") body.when_all_unavailable = draft.whenAllUnavailable;
+  const initial = draftOf(stored, defaultStrategy);
+  const untouched = {
+    strategy: draft.strategy === initial.strategy,
+    hash_on: draft.strategy === initial.strategy && draft.affinity === initial.affinity,
+    retries: draft.retries === initial.retries,
+    max_fallbacks: draft.maxFallbacks === initial.maxFallbacks,
+    retry_on_429: draft.retryOn429 === initial.retryOn429,
+    fallback_on_statuses: draft.statuses === initial.statuses,
+    when_all_unavailable: draft.whenAllUnavailable === initial.whenAllUnavailable,
+  };
+  for (const [key, unchanged] of Object.entries(untouched)) {
+    if (unchanged && Object.hasOwn(stored, key)) body[key] = stored[key];
+  }
   return body;
 }
 

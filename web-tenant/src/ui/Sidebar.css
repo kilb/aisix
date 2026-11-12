@@ -2,6 +2,9 @@
 .sidebar-shell {
   display: grid;
   grid-template-columns: 224px minmax(0, 1fr);
+  align-items: start;
+  gap: 24px;
+  padding: 24px;
   min-height: 100dvh;
   background: var(--background);
   color: var(--foreground);
@@ -9,16 +12,16 @@
 
 .shell-sidebar {
   position: sticky;
-  top: 0;
+  top: 24px;
   display: flex;
   width: 224px;
-  height: 100dvh;
+  height: calc(100dvh - 48px);
   min-height: 0;
   flex-direction: column;
   gap: 16px;
   padding: 20px 12px;
-  border: 0;
-  border-right: 1px solid var(--border);
+  border: 1px solid var(--border);
+  border-radius: var(--r-rail);
   background: var(--card);
   color: var(--foreground);
 }
@@ -88,7 +91,7 @@
   min-height: 44px;
   align-items: center;
   gap: 10px;
-  padding: 10px 12px;
+  padding: 10px 22px 10px 12px;
   border: 1px solid transparent;
   border-radius: var(--r-input);
   background: transparent;
@@ -96,16 +99,17 @@
   font-size: var(--text-body);
   line-height: 1.5;
   text-align: left;
+  text-decoration: none;
   cursor: pointer;
 }
 .shell-route-stop:hover { background: var(--well); color: var(--foreground); }
-.shell-route-stop[aria-selected="true"] {
+.shell-route-stop:is([aria-selected="true"], [aria-current="page"]) {
   border-color: transparent;
-  background: var(--info-soft);
-  color: var(--brand);
-  font-weight: 600;
+  background: var(--well);
+  color: var(--foreground);
+  font-weight: 500;
 }
-.shell-route-stop[aria-selected="true"]::before { content: ""; position: absolute; left: 0; top: 12px; bottom: 12px; width: 3px; border-radius: 2px; background: var(--brand); }
+.shell-route-stop:is([aria-selected="true"], [aria-current="page"])::before { content: ""; position: absolute; right: 10px; top: calc(50% - 3px); width: 6px; height: 6px; border-radius: 50%; background: var(--brand-dot); }
 .shell-route-stop:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
 .shell-route-icon { width: 18px; height: 18px; flex: none; }
 .shell-route-stop .stop-name { min-width: 0; overflow-wrap: anywhere; }
@@ -147,9 +151,9 @@
   align-items: center;
   justify-content: space-between;
   gap: 12px 24px;
-  padding: 10px 28px;
-  border-bottom: 1px solid var(--line);
-  background: var(--card);
+  padding: 10px 0;
+  border-bottom: 0;
+  background: var(--background);
 }
 .shell-view-location { display: flex; min-width: 0; align-items: center; gap: 12px; }
 .shell-location-text { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
@@ -177,18 +181,19 @@
   max-width: 1440px;
   min-width: 0;
   margin-inline: auto;
-  padding: 28px 28px 48px;
+  padding: 24px 0 24px;
 }
-.sidebar-shell .shell-note { width: auto; max-width: none; margin-inline: 28px; padding-top: 20px; }
+.sidebar-shell .shell-note { width: auto; max-width: none; margin-inline: 0; padding-top: 20px; }
 .shell-menu-trigger { display: none; }
 
 @media (max-width: 1099px) {
-  .sidebar-shell { display: block; }
+  .sidebar-shell { display: block; padding: 0 24px; }
   .shell-menu-trigger { display: inline-flex; }
   .shell-drawer-backdrop { position: fixed; inset: 0; z-index: 60; background: color-mix(in srgb, var(--foreground) 35%, transparent); }
   .shell-drawer {
     position: fixed;
-    inset: 0 auto 0 0;
+    inset: 16px auto 16px 16px;
+    height: calc(100dvh - 32px);
     z-index: 61;
     width: min(288px, calc(100vw - 32px));
     outline: none;
@@ -197,9 +202,10 @@
 }
 
 @media (max-width: 719px) {
-  .sidebar-shell .shell-view-header { padding: 12px 16px; gap: 12px; }
-  .sidebar-shell .shell-content { padding: 20px 16px 40px; }
-  .sidebar-shell .shell-note { margin-inline: 16px; }
+  .sidebar-shell { padding-inline: 16px; }
+  .sidebar-shell .shell-view-header { padding: 12px 0; gap: 12px; }
+  .sidebar-shell .shell-content { padding: 20px 0 40px; }
+  .sidebar-shell .shell-note { margin-inline: 0; }
   .shell-current-context { max-width: 21ch; }
 }
 
@@ -209,7 +215,7 @@
   border-radius: var(--r-input); background: transparent; color: var(--foreground); text-align: left; cursor: pointer;
 }
 .shell-account-link:hover { background: var(--well); }
-.shell-account-link[aria-current="page"] { background: var(--info-soft); border-color: var(--brand); }
+.shell-account-link[aria-current="page"] { background: var(--well); border-color: var(--line); }
 .shell-account-link:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
 .shell-account-caption { grid-column: 2; color: var(--muted-foreground); font-size: 12px; line-height: 1.5; }
 @media (max-width: 719px) {

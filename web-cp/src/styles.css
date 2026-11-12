@@ -862,6 +862,6 @@ td select {
 .account-session .bento-card-header { align-items: center; }
 .bento-card-index { display: none; }
 .bento-page-header .font-mono, .bento-card-header .font-mono, .bento-stat .font-mono { font-family: var(--font-sans); letter-spacing: 0; }
-.metric { font-weight: 500; }
+.metric { font-weight: 400; }
 @media (max-width: 899px) { .account-settings-grid { grid-template-columns: minmax(0, 1fr); gap: 16px; } }
 @media (max-width: 719px) { .panel { --pad: 16px; } }

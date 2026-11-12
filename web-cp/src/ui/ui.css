@@ -1,5 +1,18 @@
 /* Bento 控件样式；交互状态保持 CONTRACT.md，值来自共享 tokens.css。 */
 
+/* 凹槽中的次级文字采用更深一档；嵌套暖白面板继承后仍保持 AA，状态色独立。 */
+.secret,
+.target,
+.tn-override,
+.tn-foot,
+.tn-checks.tn-groups > li:has(:checked),
+.shell-route-stop:is(:hover, [aria-selected="true"], [aria-current="page"]),
+.shell-account-link:is(:hover, [aria-current="page"]),
+.bg-well {
+  --muted-foreground: var(--ink-soft);
+  --text-muted: var(--ink-soft);
+}
+
 /* ── Icons ──────────────────────────────────────────────────── */
 .icon {
   flex: none;
@@ -352,12 +365,12 @@ select.select-sm {
   height: var(--h-head);
   padding: 0 12px;
   border-bottom: 1px solid var(--border);
-  background: var(--muted);
+  background: var(--card);
   color: var(--muted-foreground);
   font-size: 12px;
-  font-family: var(--font-mono);
+  font-family: var(--font-sans);
   font-weight: 400;
-  letter-spacing: 0.06em;
+  letter-spacing: 0;
   text-align: left;
   white-space: nowrap;
   vertical-align: middle;
@@ -585,10 +598,10 @@ select.select-sm {
 /* 面板仅以细边线分层，普通内容不加投影。 */
 .panel {
   min-width: 0;
-  --pad: 28px;
+  --pad: var(--card-pad);
   margin: 0 0 12px;
   padding: var(--pad);
-  border: 1px solid var(--border);
+  border: 1px solid color-mix(in srgb, var(--foreground) 8%, transparent);
   border-radius: var(--r-card);
   background: var(--card);
   color: var(--card-foreground);

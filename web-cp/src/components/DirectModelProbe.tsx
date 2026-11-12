@@ -36,7 +36,8 @@ const emptyRows = (targets: readonly DirectProbeTarget[]): DirectProbeRow[] => s
 const tokens = (value: number | null | undefined): string => value == null ? "—" : value.toLocaleString("zh-CN");
 
 /** 每轮固定完整直连清单；调用函数只由真实控制面 API 提供。 */
-export function DirectModelProbe({ models, accounts, loadError, canProbe, probe }: {
+export function DirectModelProbe({ models, accounts, loadError, canProbe, probe, section = "current" }: {
+  section?: "current" | "history";
   models: readonly DirectProbeResource[] | null;
   accounts: readonly DirectProbeResource[] | null;
   loadError: boolean;
@@ -153,6 +154,8 @@ export function DirectModelProbe({ models, accounts, loadError, canProbe, probe 
   const unavailableReason = loadError ? "模型清单读取失败，请先刷新后再测试。" : models === null ? "正在读取完整模型清单。" : targets.length === 0 ? "当前没有直连模型。" : undefined;
 
   return (
+    <>
+    <div id="model-tests-current" role="tabpanel" aria-labelledby="model-tests-current-tab" hidden={section !== "current"}>
     <Card className="direct-probe" aria-labelledby={headingId}>
       <CardHeader
         title={<span id={headingId}>直连模型测试</span>}
@@ -243,11 +246,16 @@ export function DirectModelProbe({ models, accounts, loadError, canProbe, probe 
             </DataTable>
           )}
           <RecordTablePager page={shownPage} pageSize={resultPageSize} onPageChange={setResultPage} onPageSizeChange={(size) => { setResultPageSize(size); setResultPage(1); }} total={filtered.length} label="最近测试结果分页" />
-          <ProbeHistory targets={targets} revision={historyRevision} />
           <p className="direct-probe-method">普通直连采用流式文本探测，显式向量模型走向量接口；一次文本探测失败不代表图像、音频等其它能力不可用。从控制平面发起本次探测开始计时，包含地址解析、连接及必要的凭据交换；测量控制平面到指定上游，不代表客户经网关请求的耗时。基础指标仅来自首次探测，能力抽测的额外耗时和用量单独列出。首字只计算首个非空可见文本，角色、推理或用量事件不算首字；协议正常结束但无正文时仍可用，首字显示 —。端到端输出速率 = 上游报告的输出 tokens ÷ 完整请求耗时（含等待，输出计数可能包含推理 tokens）；未报告用量时显示 —。</p>
         </>
       )}
     </Card>
+    </div>
+    {/* 两个面板始终挂载；切换历史只隐藏当前测试，不终止排队或丢失游标。 */}
+    <div id="model-tests-history" role="tabpanel" aria-labelledby="model-tests-history-tab" hidden={section !== "history"}>
+      <Card><ProbeHistory targets={targets} revision={historyRevision} /></Card>
+    </div>
+    </>
   );
 }
 

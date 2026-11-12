@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { ArrowLeft } from "lucide-react";
 import { ApiError, channelModels, type PublicModel, type ServedBy } from "../../lib/api";
+import { runPublicModelWrite, type PublicModelWriteGate } from "../../lib/publicModelWriteGate";
 import { messageFor } from "../../lib/errors";
 import { errorText } from "../../lib/fmt";
 import { fmtBeijing } from "../../lib/time";
@@ -52,7 +53,13 @@ export function PublicModelDetail({
   canEdit,
   onBack,
   onChanged,
+  routingEditor,
+  writeGate,
+  loadError,
 }: {
+  writeGate: PublicModelWriteGate;
+  loadError?: string | null;
+  routingEditor?: ReactNode;
   model: PublicModel;
   canEdit: boolean;
   onBack: () => void;
@@ -69,33 +76,35 @@ export function PublicModelDetail({
   const disabledCount = model.served_by.length - served.length;
 
   async function regenerate() {
-    setBusy(true);
-    setError(null);
-    setNote(null);
-    // Every served row, re-applied with its own values: the write path
-    // regenerates the documents from the table in the same transaction.
-    const rows = model.served_by;
-    try {
-      for (const row of rows) {
-        await channelModels.put(row.provider_key_id, model.id, {
-          upstream_model: row.upstream_model,
-          priority: row.priority,
-          weight: row.weight,
-          enabled: row.enabled,
-        });
+    await runPublicModelWrite(writeGate, async () => {
+      setBusy(true);
+      setError(null);
+      setNote(null);
+      // Every served row, re-applied with its own values: the write path
+      // regenerates the documents from the table in the same transaction.
+      const rows = model.served_by;
+      try {
+        for (const row of rows) {
+          await channelModels.put(row.provider_key_id, model.id, {
+            upstream_model: row.upstream_model,
+            priority: row.priority,
+            weight: row.weight,
+            enabled: row.enabled,
+          });
+        }
+        setNote(
+          rows.length === 0
+            ? "该公共模型还没有接入任何账号，没有文档可重写。"
+            : `已按当前表格重新应用 ${rows.length} 个账号的接入行，模型文档与表格一致。`,
+        );
+        toast("已重新生成");
+        await onChanged();
+      } catch (e) {
+        setError(e instanceof ApiError ? messageFor(e) : errorText(e));
+      } finally {
+        setBusy(false);
       }
-      setNote(
-        rows.length === 0
-          ? "该公共模型还没有接入任何账号，没有文档可重写。"
-          : `已按当前表格重新应用 ${rows.length} 个账号的接入行，模型文档与表格一致。`,
-      );
-      toast("已重新生成");
-      await onChanged();
-    } catch (e) {
-      setError(e instanceof ApiError ? messageFor(e) : errorText(e));
-    } finally {
-      setBusy(false);
-    }
+    });
   }
 
   const aside =
@@ -115,7 +124,7 @@ export function PublicModelDetail({
               </div>
             )}
             <CardFooter className="mt-2">
-              <Button type="button" busy={busy} busyLabel="重新生成中…" onClick={() => void regenerate()}>
+              <Button type="button" disabled={writeGate.busy} busy={busy} busyLabel="重新生成中…" onClick={() => void regenerate()}>
                 重新生成
               </Button>
             </CardFooter>
@@ -134,7 +143,7 @@ export function PublicModelDetail({
   return (
     <div className="public-model-detail" role="region" aria-label={`公共模型 ${model.name}`}>
       <PageHeader
-        eyebrow="公共模型 / 账号与定价"
+        eyebrow="公共模型与路由 / 账号与定价"
         title={<span className="pm-model-title">{model.name}</span>}
         dataLead={served.length > 0 ? <>由 {served.length.toLocaleString("zh-CN")} 个启用账号服务，分布在 {enabledPriorities.length.toLocaleString("zh-CN")} 个优先级层。按优先级分层展示，实际选路见当前策略；表中优先级从高到低，同层按权重排列。</> : "当前没有启用的账号映射，请先到上游账号重新接入。"}
         actions={
@@ -144,7 +153,8 @@ export function PublicModelDetail({
           </Button>
         }
       />
-      <div className="mb-4"><RoutePolicy routing={model.effective_routing} /></div>
+      {loadError && <div className="note crit" role="alert">完整列表读取失败，请刷新核对：{loadError}</div>}
+      {!routingEditor && <div className="mb-4"><RoutePolicy routing={model.effective_routing} /></div>}
       <p className="mb-6 text-body text-ink-soft">
         标识 <code className="break-all">{model.id}</code>，创建于 {fmtBeijing(model.created_at)}。授权租户 {model.reachable_tenants} 个、密钥 {model.reachable_keys} 个。
       </p>
@@ -167,7 +177,7 @@ export function PublicModelDetail({
         </Card>
       </BentoGrid>
       <WithForms forms={aside}>
-        <Card className="pm-mapping-card mb-0">
+        {routingEditor ?? <Card className="pm-mapping-card mb-0">
           <CardHeader
             number={3}
             title={<>服务账号<Count n={served.length} /></>}
@@ -233,7 +243,7 @@ export function PublicModelDetail({
               </tbody>
             </DataTable>
           )}
-        </Card>
+        </Card>}
       </WithForms>
     </div>
   );

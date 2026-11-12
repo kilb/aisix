@@ -1,0 +1,7 @@
+{
+  "extends": "./tsconfig.json",
+  "include": [
+    "e2e-real/refined.spec.ts",
+    "playwright.refined-real.config.ts"
+  ]
+}

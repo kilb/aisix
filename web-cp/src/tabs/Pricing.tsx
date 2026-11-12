@@ -7,7 +7,6 @@ import { Catalogue } from "./pricing/Catalogue";
 import { PricingStatus } from "./pricing/PricingStatus";
 import { Baselines } from "./pricing/Baselines";
 import { PricingImport } from "./pricing/PricingImport";
-import { PublicModels } from "./pricing/PublicModels";
 import { PriceLibrary } from "./pricing/PriceLibrary";
 
 /** 价格分区保持既有顺序、权限与深链入口。 */
@@ -18,7 +17,6 @@ export const SECTIONS: Section[] = [{ id: "groups", label: "分组", Component: 
   { id: "status", label: "计价状态", Component: PricingStatus, minRole: "viewer" },
   { id: "baselines", label: "基准价", Component: Baselines, minRole: "viewer" },
   { id: "imports", label: "导入审核", Component: PricingImport, minRole: "viewer" },
-  { id: "public-models", label: "公共模型", Component: PublicModels, minRole: "viewer" },
   { id: "library", label: "价格库", Component: PriceLibrary, minRole: "viewer" },
 ];
 

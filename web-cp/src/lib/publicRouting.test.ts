@@ -116,3 +116,31 @@ test("an untouched form says the same as what was stored, and a changed one does
   assert.equal(sameRouting(routingBody(draft, stored, DEFAULT, statusesOf(draft.statuses)), stored), false);
   assert.equal(sameRouting({ fallback_on_statuses: [429, 408] }, { fallback_on_statuses: [408, 429] }), false);
 });
+
+test("saving an untouched custom route preserves explicit false, empty statuses and unknown settings", () => {
+  // 丢弃显式 false、空数组或未知字段都必须让此往返断言失败。
+  const stored = {
+    strategy: "consistent_hash",
+    hash_on: [{ type: "header", name: "x-tenant" }, { type: "api_key" }],
+    retries: 0,
+    max_fallbacks: 0,
+    retry_on_429: false,
+    fallback_on_statuses: [],
+    future_settings: { enabled: false, values: [3, 1] },
+  };
+  const draft = draftOf(stored, DEFAULT);
+  assert.deepEqual(routingBody(draft, stored, DEFAULT, statusesOf(draft.statuses)), stored);
+});
+
+test("editing retries does not rewrite an unrelated saved strategy or dormant hash chain", () => {
+  const stored = {
+    strategy: DEFAULT,
+    hash_on: [{ type: "header", name: "x-tenant" }],
+    retry_on_429: false,
+    fallback_on_statuses: [],
+    future_policy: "keep",
+  };
+  const draft = draftOf(stored, DEFAULT);
+  draft.retries = "2";
+  assert.deepEqual(routingBody(draft, stored, DEFAULT, []), { ...stored, retries: 2 });
+});

@@ -2,8 +2,8 @@ import { useEffect, useId, useRef, useState } from "react";
 import { fetchApiMetrics, maximumMetricIndex, metricsRangeError, rankMetricModels, requestRateSummary, sampleCoverage, tokenTrendValue, type ApiMetricValues, type ApiMetricsResponse, type MetricsBucket, type MetricsLatency, type MetricsScope } from "../lib/apiMetrics";
 import { formatCount, formatDuration, formatRatio, normalizeExactValues } from "../lib/chartFormat";
 import { cn } from "../lib/cn";
-import { Button } from "../ui/Button";
-import { ApiOutcomeComposition, ApiSuccessSummary } from "./ApiSuccessSummary";
+import { ApiOutcomeComposition } from "./ApiSuccessSummary";
+import { ApiMetricsOverview } from "./ApiMetricsOverview";
 import { fmtMicroCny } from "../lib/money";
 import { bucketStart, fmtBeijing, metricPeriodLabel } from "../lib/time";
 import { RankBars, TrendChart, type TrendPoint } from "./charts";
@@ -24,13 +24,15 @@ export interface ApiMetricsPanelProps {
   refreshKey?: number;
   className?: string;
   compact?: boolean;
+  view?: ApiMetricView;
+  onViewChange?: (view: ApiMetricView) => void;
 }
 
-type View = "requests" | "latency" | "tokens" | "cache" | "cost";
+export type ApiMetricView = "requests" | "latency" | "tokens" | "cache" | "cost";
 type LatencyKind = "first_token_latency_ms" | "response_latency_ms" | "attempt_duration_ms";
 type CacheKind = "tokens" | "response";
 type TokenKind = "input_tokens" | "completion_tokens";
-const VIEWS: { value: View; label: string }[] = [{ value: "requests", label: "请求" }, { value: "latency", label: "延迟" }, { value: "tokens", label: "token" }, { value: "cache", label: "缓存" }, { value: "cost", label: "费用" }];
+const VIEWS: { value: ApiMetricView; label: string }[] = [{ value: "requests", label: "请求" }, { value: "latency", label: "延迟" }, { value: "tokens", label: "Token" }, { value: "cache", label: "缓存" }, { value: "cost", label: "费用" }];
 const TOKEN_LABELS: Record<TokenKind, string> = { input_tokens: "已记录输入 token", completion_tokens: "已记录输出 token" };
 const TOKEN_NOTE = "趋势只包含有可用用量记录的尝试，也包含已计费重试；缺失用量不当作零。可用记录可能含网关估算，不等于上游精确报告。输入合计为原始输入 + 额外缓存读取 + 额外缓存创建，输入内缓存子集不重复相加。";
 const LATENCY_LABELS: Record<LatencyKind, string> = { first_token_latency_ms: "首 token 延迟", response_latency_ms: "响应延迟", attempt_duration_ms: "上游尝试完整耗时" };
@@ -61,7 +63,7 @@ function LatencyFacts({ title, value, note }: { title: string; value: MetricsLat
 }
 
 /** 横轴来自服务器实际时间桶；位置归一化与精确金额显示互不回流。 */
-function trendPoints(data: ApiMetricsResponse, view: View, latencyKind: LatencyKind, cacheKind: CacheKind, tokenKind: TokenKind): TrendPoint[] {
+function trendPoints(data: ApiMetricsResponse, view: ApiMetricView, latencyKind: LatencyKind, cacheKind: CacheKind, tokenKind: TokenKind): TrendPoint[] {
   const costs = view === "cost" ? normalizeExactValues(data.series.map(row => row.charged_micro_cny)) : [];
   return data.series.map((row, index) => {
     const label = metricPeriodLabel(row.period_start, data.bucket);
@@ -134,25 +136,11 @@ function CacheFacts({ values }: { values: ApiMetricValues | undefined }) {
   </>;
 }
 
-/** 首页诊断只投影同次响应，延迟与两种缓存仍有直接可达的完整明细。 */
-function QuickDiagnostics({ totals, onView }: { totals?: ApiMetricValues; onView: (view: View) => void }) {
-  return <>
-    <dl className="m-0 grid gap-5">
-      <div className="flex min-w-0 items-start justify-between gap-5"><dt className="min-w-0 text-caption text-muted">首 token 延迟 P99<p className="mt-2 text-micro">平均 {formatDuration(totals?.first_token_latency_ms.avg)} · 实测 {formatCount(totals?.first_token_latency_ms.sample_count)} · 无值 {formatCount(totals?.first_token_latency_ms.missing_count)}</p></dt><dd className="m-0 min-w-0"><Metric size="value">{formatDuration(totals?.first_token_latency_ms.p99)}</Metric></dd></div>
-      <div className="flex min-w-0 items-start justify-between gap-5 border-t border-ink/7 pt-4"><dt className="min-w-0 text-caption text-muted">用量记录覆盖率<p className="mt-2 text-micro">有记录 {formatCount(totals?.tokens.known_usage_attempts)} · 无记录 {formatCount(totals?.tokens.unknown_usage_attempts)}</p></dt><dd className="m-0 min-w-0"><Metric size="value">{formatRatio(sampleCoverage(totals?.tokens.known_usage_attempts, totals?.tokens.unknown_usage_attempts))}</Metric></dd></div>
-      <div className="flex min-w-0 items-start justify-between gap-5 border-t border-ink/7 pt-4"><dt className="min-w-0 text-caption text-muted">已记录缓存 token 占输入比例</dt><dd className="m-0 min-w-0"><Metric size="value">{formatRatio(totals?.tokens.cache_hit_rate)}</Metric></dd></div>
-      <div className="flex min-w-0 items-start justify-between gap-5 border-t border-ink/7 pt-4"><dt className="min-w-0 text-caption text-muted">响应缓存命中率<p className="mt-2 text-micro">命中 + 未命中样本 {formatCount(sumCounts(totals?.response_cache.hit_requests, totals?.response_cache.miss_requests))}</p></dt><dd className="m-0 min-w-0"><Metric size="value">{formatRatio(totals?.response_cache.hit_rate)}</Metric></dd></div>
-    </dl>
-    <p className="text-caption text-muted">首 token 无值包含非流式与历史记录，小样本尾延迟需结合样本数判断；用量覆盖按可见尝试计算，可能含估算。缓存 token 比例不代表上游报告覆盖率。</p>
-    <div className="mt-auto flex flex-wrap gap-2 pt-2"><Button kind="quiet" onClick={() => onView("latency")}>查看延迟</Button><Button kind="quiet" onClick={() => onView("tokens")}>查看 token</Button><Button kind="quiet" onClick={() => onView("cache")}>查看缓存</Button></div>
-  </>;
-}
-
-/** 固定两张卡和连续编号；切换指标只改变真实度量，不改变查询范围。 */
-export function ApiMetricsPanel({ scope, enabled, from, to, bucket, modelId, memberId, apiKeyId, tenantId, numberStart = 1, refreshKey = 0, className, compact = false }: ApiMetricsPanelProps) {
-  const [view, setView] = useState<View>("requests");
-  const [detailsOpen, setDetailsOpen] = useState(false);
-  const viewButtons = useRef<Partial<Record<View, HTMLButtonElement>>>({});
+/** 概览固定展示，分析切换只投影同次响应，不改变查询范围。 */
+export function ApiMetricsPanel({ scope, enabled, from, to, bucket, modelId, memberId, apiKeyId, tenantId, numberStart = 1, refreshKey = 0, className, compact = false, view: controlledView, onViewChange }: ApiMetricsPanelProps) {
+  const [localView, setLocalView] = useState<ApiMetricView>("requests");
+  const view = controlledView ?? localView;
+  const viewButtons = useRef<Partial<Record<ApiMetricView, HTMLButtonElement>>>({});
   const [latencyKind, setLatencyKind] = useState<LatencyKind>("first_token_latency_ms");
   const [cacheKind, setCacheKind] = useState<CacheKind>("tokens");
   const [tokenKind, setTokenKind] = useState<TokenKind>("input_tokens");
@@ -188,26 +176,28 @@ export function ApiMetricsPanel({ scope, enabled, from, to, bucket, modelId, mem
   const sideTitle = view === "requests" ? "模型请求分布" : view === "cost" ? "模型费用分布" : view === "tokens" ? "用量记录与 token 构成" : view === "cache" ? "响应缓存与 token 明细" : "耗时样本与口径";
   const windowSeconds = (Date.parse(to) - Date.parse(from)) / 1000;
   const displayBucket = data?.bucket ?? bucket ?? (windowSeconds <= 6 * 3600 ? "minute" : windowSeconds <= 3 * 86400 ? "hour" : "day");
-  function selectView(value: View) {
-    setView(value);
-    if (compact) setDetailsOpen(true);
+  function selectView(value: ApiMetricView) {
+    setLocalView(value);
+    onViewChange?.(value);
   }
+  if (compact) return <ApiMetricsOverview scope={scope} from={from} to={to} data={data} error={error} onRetry={rangeError ? undefined : () => setRevision(value => value + 1)} className={className} />;
+  const panelId = `${choiceId}-panel`;
   return (
-    <BentoGrid className={cn(span.d12, "min-w-0", className)} role={compact && !detailsOpen ? "group" : "region"} aria-label={compact && !detailsOpen ? "API 指标概览" : "完整 API 指标"} aria-busy={!error && !data}>
+    <section className={cn(span.d12, "min-w-0", className)} role="region" aria-label="完整 API 指标" aria-busy={!error && !data}>
+      <div role="tablist" aria-label="指标视图" className="mb-6 flex max-w-full flex-wrap gap-1 rounded-cell bg-ink/7 p-1">
+        {VIEWS.map(item => <button key={item.value} id={`${choiceId}-${item.value}`} role="tab" data-view={item.value} aria-selected={view === item.value} aria-controls={panelId} tabIndex={view === item.value ? 0 : -1} type="button" ref={element => { viewButtons.current[item.value] = element ?? undefined; }} onClick={() => selectView(item.value)} onKeyDown={event => {
+          const index = VIEWS.findIndex(option => option.value === item.value);
+          const next = event.key === "Home" ? VIEWS[0] : event.key === "End" ? VIEWS[VIEWS.length - 1] : event.key === "ArrowRight" ? VIEWS[(index + 1) % VIEWS.length] : event.key === "ArrowLeft" ? VIEWS[(index - 1 + VIEWS.length) % VIEWS.length] : undefined;
+          if (next) { event.preventDefault(); selectView(next.value); viewButtons.current[next.value]?.focus(); }
+        }} className={cn("min-h-11 min-w-11 rounded-chip border-0 px-4 text-caption font-normal", view === item.value ? "bg-surface text-ink" : "bg-transparent text-ink-soft hover:text-ink")}>{item.label}</button>)}
+      </div>
+      <BentoGrid id={panelId} role="tabpanel" aria-labelledby={`${choiceId}-${view}`} tabIndex={0}>
       <Card className={span.d7}>
-        <CardHeader number={numberStart} title={compact && !detailsOpen ? "API 请求健康" : `API 指标 · ${VIEWS.find(item => item.value === view)?.label}`} description={`${fmtBeijing(data?.from ?? from)} — ${fmtBeijing(data?.to ?? to)}（结束时间不含）`} />
-        {compact && !detailsOpen && <ApiSuccessSummary totals={totals} />}
-        <div role="group" aria-label="指标视图" className="mb-6 flex w-fit max-w-full flex-wrap gap-1 rounded-full bg-ink/7 p-1">
-          {VIEWS.map(item => <button key={item.value} type="button" ref={element => { viewButtons.current[item.value] = element ?? undefined; }} aria-expanded={compact ? detailsOpen && view === item.value : undefined} aria-pressed={view === item.value && (!compact || detailsOpen)} onClick={() => selectView(item.value)} className={cn("min-h-11 min-w-11 rounded-full border-0 px-4 text-caption font-normal", view === item.value && (!compact || detailsOpen) ? "bg-surface text-ink" : "bg-transparent text-muted hover:text-ink")}>{item.label}</button>)}
-        </div>
-        {compact && <div className="flex min-h-11 flex-wrap items-center justify-between gap-3 text-caption text-muted">
-          {error ? <><span role="alert">{error}</span>{!rangeError && <Button onClick={() => setRevision(value => value + 1)}>重试</Button>}</> : !data ? <span role="status">正在加载当前范围的 API 指标</span> : <span>统计周期平均请求速率 {requestRates?.averageRps == null ? "未知" : `${new Intl.NumberFormat("en-US", { maximumSignificantDigits: 3 }).format(requestRates.averageRps)} 次/秒`}</span>}
-          {detailsOpen && <Button kind="quiet" onClick={() => { setDetailsOpen(false); viewButtons.current[view]?.focus(); }}>收起指标明细</Button>}
-        </div>}
-        {(!compact || detailsOpen) && view === "latency" && <label htmlFor={choiceId} className="mb-5 grid gap-2 text-caption text-muted">耗时口径<select id={choiceId} value={latencyKind} onChange={event => setLatencyKind(event.target.value as LatencyKind)}>{Object.entries(LATENCY_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>}
-        {(!compact || detailsOpen) && view === "tokens" && <label htmlFor={choiceId} className="mb-5 grid gap-2 text-caption text-muted">token 口径<select id={choiceId} value={tokenKind} onChange={event => setTokenKind(event.target.value as TokenKind)}>{Object.entries(TOKEN_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>}
-        {(!compact || detailsOpen) && view === "cache" && <label htmlFor={choiceId} className="mb-5 grid gap-2 text-caption text-muted">缓存口径<select id={choiceId} value={cacheKind} onChange={event => setCacheKind(event.target.value as CacheKind)}><option value="tokens">已记录缓存 token 占输入比例</option><option value="response">响应缓存命中率</option></select></label>}
-        {(!compact || detailsOpen) && <>
+        <CardHeader number={numberStart} title={`API 指标 · ${VIEWS.find(item => item.value === view)?.label}`} description={`${fmtBeijing(data?.from ?? from)} — ${fmtBeijing(data?.to ?? to)}（结束时间不含）`} />
+        {view === "latency" && <label htmlFor={choiceId} className="mb-5 grid gap-2 text-caption text-muted">耗时口径<select id={choiceId} value={latencyKind} onChange={event => setLatencyKind(event.target.value as LatencyKind)}>{Object.entries(LATENCY_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>}
+        {view === "tokens" && <label htmlFor={choiceId} className="mb-5 grid gap-2 text-caption text-muted">token 口径<select id={choiceId} value={tokenKind} onChange={event => setTokenKind(event.target.value as TokenKind)}>{Object.entries(TOKEN_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>}
+        {view === "cache" && <label htmlFor={choiceId} className="mb-5 grid gap-2 text-caption text-muted">缓存口径<select id={choiceId} value={cacheKind} onChange={event => setCacheKind(event.target.value as CacheKind)}><option value="tokens">已记录缓存 token 占输入比例</option><option value="response">响应缓存命中率</option></select></label>}
+        {<>
           <div className="mb-6 min-w-0"><div className="mb-3 text-micro text-muted">{metricTitle}{view === "latency" ? " · 平均" : ""}</div><Metric size={primary.length > 18 ? "value" : "figure"} className="break-all">{primary}</Metric></div>
           {view === "requests" && <Facts items={[
             { label: "成功率", value: formatRatio(totals?.success_rate) },
@@ -240,9 +230,10 @@ export function ApiMetricsPanel({ scope, enabled, from, to, bucket, modelId, mem
         </>}
       </Card>
       <Card className={span.d5Wide}>
-        <CardHeader number={numberStart + 1} title={compact && !detailsOpen ? "延迟、缓存与计量" : sideTitle} description="与左侧使用相同时间、身份和筛选范围" />
-        {compact && !detailsOpen ? <QuickDiagnostics totals={totals} onView={selectView} /> : view === "requests" || view === "cost" ? <ModelRanks data={data} field={view === "requests" ? "requests" : "charged_micro_cny"} /> : view === "tokens" ? <TokenFacts values={totals} /> : view === "cache" ? <CacheFacts values={totals} /> : <div className="grid gap-7"><LatencyFacts title="首 token 延迟" value={totals?.first_token_latency_ms} note="最终请求的首个生成内容；无样本包含非流式与历史记录。" /><div className="border-t border-ink/7 pt-6"><LatencyFacts title="响应延迟" value={totals?.response_latency_ms} note="最终请求至首个可用数据，不是完整响应时长。" /></div><div className="border-t border-ink/7 pt-6"><LatencyFacts title="上游尝试完整耗时" value={totals?.attempt_duration_ms} note="所有可见计费尝试各自的完整耗时，不能相加为客户端请求时长。" /></div></div>}
+        <CardHeader number={numberStart + 1} title={sideTitle} description="与左侧使用相同时间、身份和筛选范围" />
+        {view === "requests" || view === "cost" ? <ModelRanks data={data} field={view === "requests" ? "requests" : "charged_micro_cny"} /> : view === "tokens" ? <TokenFacts values={totals} /> : view === "cache" ? <CacheFacts values={totals} /> : <div className="grid gap-7"><LatencyFacts title="首 token 延迟" value={totals?.first_token_latency_ms} note="最终请求的首个生成内容；无样本包含非流式与历史记录。" /><div className="border-t border-ink/7 pt-6"><LatencyFacts title="响应延迟" value={totals?.response_latency_ms} note="最终请求至首个可用数据，不是完整响应时长。" /></div><div className="border-t border-ink/7 pt-6"><LatencyFacts title="上游尝试完整耗时" value={totals?.attempt_duration_ms} note="所有可见计费尝试各自的完整耗时，不能相加为客户端请求时长。" /></div></div>}
       </Card>
-    </BentoGrid>
+      </BentoGrid>
+    </section>
   );
 }

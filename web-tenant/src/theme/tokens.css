@@ -1,18 +1,18 @@
 /* 双端逐字节共享的运维语义令牌。浅色默认、深色仅由手动开关设置。
-   旧变量名保留兼容；橙点只标识品牌，钴蓝交互与结果状态分别表达。 */
+   旧变量名保留兼容；墨色承载交互，橙色只标记当前项与重点数据。 */
 :root {
   color-scheme: light;
-  --bento-canvas: #F5F7FA;
-  --bento-surface: #FFFFFF;
-  --bento-well: #EEF2F7;
-  --bento-stone: #CBD5E3;
-  --bento-line: #D8DFE9;
-  --bento-graphite: #71819A;
-  --bento-ink: #172033;
-  --bento-ink-soft: #45546D;
-  --bento-muted: #53627A;
-  --bento-inverse-muted: #A8B7CB;
-  --bento-accent: #3156D3;
+  --bento-canvas: #ECEAE4;
+  --bento-surface: #FBFAF7;
+  --bento-well: #E1DED6;
+  --bento-stone: #D9D5CB;
+  --bento-line: #C9C5BB;
+  --bento-graphite: #7A7871;
+  --bento-ink: #121211;
+  --bento-ink-soft: #4A4944;
+  --bento-muted: #64635D;
+  --bento-inverse-muted: #A3A29B;
+  --bento-accent: #FF5A1F;
   --brand-dot: #FF5A1F;
 
   --background: var(--bento-canvas);
@@ -32,7 +32,7 @@
   --destructive: var(--danger);
   --destructive-foreground: var(--bento-surface);
   --border: var(--bento-line);
-  --input: #7F8EA4;
+  --input: #827F76;
   --ring: var(--brand);
   --radius: 10px;
   --sidebar: var(--card);
@@ -41,21 +41,21 @@
   --sidebar-border: var(--border);
 
   /* 状态始终附文字与形状；品牌交互与结果语义分别着色。 */
-  --info: #3156D3;
+  --info: #121211;
   --success: #15764B;
-  --warning: #9A6500;
-  --danger: #C93838;
-  --info-soft: #EEF3FF;
+  --warning: #875900;
+  --danger: #B92E2E;
+  --info-soft: #E1DED6;
   --success-soft: #EDF8F1;
   --warning-soft: #FFF7E6;
   --danger-soft: #FFF0F0;
-  --brand: var(--bento-accent);
+  --brand: var(--bento-ink);
   --brand-ink: var(--brand);
   --wash-1: transparent;
   --wash-2: transparent;
   --route-1: var(--brand);
-  --route-2: #188A83;
-  --route-3: #7E63B5;
+  --route-2: #68665E;
+  --route-3: #777166;
   --route-4: var(--bento-graphite);
   --route-5: var(--bento-ink-soft);
   --route-6: var(--bento-muted);
@@ -97,7 +97,7 @@
   --shadow-xs: none;
   --shadow-sm: none;
   --shadow-card: none;
-  --shadow-float: 0 12px 32px #1720331A;
+  --shadow-float: none;
   --shadow-btn: none;
 
   /* 旧页面角色继续指向同一主题，禁止新增第二套色值。 */
@@ -129,11 +129,11 @@
   --wide: 100%;
 
   /* 运营界面采用紧凑字级；旧 size API 仍保留，但不再生成巨型数字。 */
-  --type-title: 26px;
-  --type-hero: 28px;
-  --type-display: 28px;
+  --type-title: 28px;
+  --type-hero: 36px;
+  --type-display: 32px;
   --type-figure: 28px;
-  --type-value: 24px;
+  --type-value: 28px;
   --type-lead: 14px;
   --card-pad: 20px;
   --card-gap: 16px;
@@ -160,10 +160,10 @@
   --lh-heading: 1.2;
   --tracking-heading: -0.02em;
   --r-input: 8px;
-  --r-card: 12px;
+  --r-card: 24px;
   --r-button: 8px;
   --r-chip: 6px;
-  --r-panel: 12px;
+  --r-panel: 24px;
   --r-rail: 24px;
   --r-round: 9999px;
   --h-control: 44px;
@@ -185,40 +185,48 @@
 /* 深色按用途重新分层，保持相同语义和手动主题选择。 */
 :root[data-theme="dark"] {
   color-scheme: dark;
-  --bento-canvas: #101722;
-  --bento-surface: #182231;
-  --bento-well: #202D3F;
-  --bento-stone: #4D5E75;
-  --bento-line: #354358;
-  --bento-graphite: #8799B0;
-  --bento-ink: #EAF0F8;
-  --bento-ink-soft: #BAC7D9;
-  --bento-muted: #A8B7CB;
-  --bento-accent: #91ACFF;
-  --primary-foreground: #101722;
-  --destructive-foreground: #101722;
-  --input: #71839D;
-  --info: #91ACFF;
+  --bento-canvas: #1B1B18;
+  --bento-surface: #242420;
+  --bento-well: #30302A;
+  --bento-stone: #605E55;
+  --bento-line: #4C4A42;
+  --bento-graphite: #A6A298;
+  --bento-ink: #F2F0E9;
+  --bento-ink-soft: #D4D0C5;
+  --bento-muted: #B9B6AD;
+  --bento-accent: #FF5A1F;
+  --primary-foreground: #1B1B18;
+  --destructive-foreground: #1B1B18;
+  --input: #99958A;
+  --info: #F2F0E9;
   --success: #6DD6A1;
   --warning: #F0C369;
   --danger: #FF9494;
-  --info-soft: #25345A;
+  --info-soft: #30302A;
   --success-soft: #163C2C;
   --warning-soft: #3F321D;
   --danger-soft: #45272C;
-  --route-2: #76C8C1;
-  --route-3: #C2A7ED;
-  --tooltip-bg: #EAF0F8;
-  --tooltip-text: #101722;
-  --mark-tile: #101722;
-  --shadow-float: 0 12px 32px #00000040;
+  --route-2: #B9B6AD;
+  --route-3: #CAC4B4;
+  --tooltip-bg: #F2F0E9;
+  --tooltip-text: #1B1B18;
+  --mark-tile: #1B1B18;
+  --shadow-float: none;
 }
 
 @media (max-width: 719px) {
   :root {
-    --type-title: 24px;
-    --type-hero: 26px;
-    --type-display: 26px;
-    --type-figure: 26px;
+    --type-title: 26px;
+    --type-hero: 32px;
+    --type-display: 28px;
+    --type-figure: 28px;
   }
+}
+
+/* 只在主题样式同步提交期间停止颜色插值；保留抽屉的位移和透明度过渡。 */
+[data-theme-changing],
+[data-theme-changing] *,
+[data-theme-changing] *::before,
+[data-theme-changing] *::after {
+  transition-property: opacity, transform, translate, scale, rotate, visibility !important;
 }

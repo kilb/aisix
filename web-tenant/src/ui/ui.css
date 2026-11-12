@@ -1,5 +1,18 @@
 /* Bento 控件样式；交互状态保持 CONTRACT.md，值来自共享 tokens.css。 */
 
+/* 凹槽中的次级文字采用更深一档；嵌套暖白面板继承后仍保持 AA，状态色独立。 */
+.secret,
+.target,
+.tn-override,
+.tn-foot,
+.tn-checks.tn-groups > li:has(:checked),
+.shell-route-stop:is(:hover, [aria-selected="true"], [aria-current="page"]),
+.shell-account-link:is(:hover, [aria-current="page"]),
+.bg-well {
+  --muted-foreground: var(--ink-soft);
+  --text-muted: var(--ink-soft);
+}
+
 /* ── Icons ──────────────────────────────────────────────────── */
 .icon {
   flex: none;
@@ -217,12 +230,12 @@ fieldset.field > legend {
 
 /* ── Cards: shadcn's Card, its children 16px apart ───────────── */
 .panel {
-  --pad: 28px;
+  --pad: var(--card-pad);
   display: block;
   min-width: 0;
   margin: 0;
   padding: var(--pad);
-  border: 1px solid var(--border);
+  border: 1px solid color-mix(in srgb, var(--foreground) 8%, transparent);
   border-radius: var(--r-card);
   background: var(--card);
   color: var(--card-foreground);
@@ -255,10 +268,10 @@ fieldset.field > legend {
   height: var(--h-head);
   padding: 0 12px;
   border-bottom: 1px solid var(--border);
-  background: var(--muted);
+  background: var(--card);
   color: var(--muted-foreground);
   font-size: 12px;
-  font-family: var(--font-mono);
+  font-family: var(--font-sans);
   font-weight: 400;
   text-align: left;
   white-space: nowrap;

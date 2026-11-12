@@ -63,3 +63,20 @@ test("对比度按 WCAG 公式计算", () => {
   assert.equal(contrastRatio("#000000", "#FFFFFF").toFixed(2), "21.00");
   assert.equal(contrastRatio("#FFFFFF", "#FFFFFF").toFixed(2), "1.00");
 });
+
+// 资源编辑行实际用 bg-well + text-muted；缺少局部语义时应抓住4.48:1回退。
+test("凹槽局部次级文字在浅深主题及嵌套面板上保持 AA", () => {
+  const css = readFileSync(new URL("../theme/tokens.css", import.meta.url), "utf8");
+  const ui = readFileSync(new URL("../ui/ui.css", import.meta.url), "utf8");
+  const scoped = /\.bg-well\s*\{([^}]+)\}/.exec(ui)?.[1] ?? "";
+  for (const theme of ["light", "dark"] as const) {
+    const global = readTokens(css, theme);
+    const local = readTokens(`${css}\n:root {${scoped}}`, theme);
+    for (const fg of ["--muted-foreground", "--text-muted"])
+      for (const bg of ["--well", "--card", "--background", "--info-soft", "--success-soft", "--warning-soft", "--danger-soft"])
+        assert.ok(contrastRatio(local[fg]!, local[bg]!) >= 4.5, `${theme} 凹槽 ${fg} on ${bg}: ${contrastRatio(local[fg]!, local[bg]!).toFixed(4)}`);
+    assert.equal(local["--bento-muted"], global["--bento-muted"]);
+    for (const semantic of ["--success", "--warning", "--danger"])
+      assert.equal(local[semantic], global[semantic]);
+  }
+});

@@ -16,8 +16,8 @@ const compiled = await build({
       export { when };
       const member = { id: "member-1", email: "owner@example.test", display_name: "Owner", role: "owner" };
       const props = { member, status: "active", onSelfChanged() {}, onLeft() {} };
-      export function renderPage(page) {
-        return renderToStaticMarkup(createElement({ Keys, Members, Usage }[page], props));
+      export function renderPage(page, usagePage = "analysis") {
+        return renderToStaticMarkup(createElement({ Keys, Members, Usage }[page], { ...props, page: usagePage }));
       }
     `,
     resolveDir: fileURLToPath(new URL("../", import.meta.url)),
@@ -33,7 +33,7 @@ const compiled = await build({
 });
 const module = { exports: {} };
 new Function("require", "module", "exports", compiled.outputFiles[0]!.text)(createRequire(import.meta.url), module, module.exports);
-const { renderPage, when } = module.exports as { renderPage: (page: string) => string; when: (iso: string) => string };
+const { renderPage, when } = module.exports as { renderPage: (page: string, usagePage?: string) => string; when: (iso: string) => string };
 
 test("密钥时间跨日固定按北京时间显示", () => {
   assert.equal(when("2026-11-11T16:05:06Z"), "2026-11-12 00:05:06 北京时间");
@@ -50,7 +50,10 @@ test("密钥和成员首屏提供公开字段搜索，邀请独立筛选", () =>
 test("用量汇总和调用记录都有独立搜索并解释真实估算来源", () => {
   const usage = renderPage("Usage");
   assert.match(usage, /搜索汇总模型/);
-  assert.match(usage, /搜索已加载调用/);
+  assert.doesNotMatch(usage, /搜索已加载调用/);
+  const calls = renderPage("Usage", "calls");
+  assert.match(calls, /搜索已加载调用/);
+  assert.doesNotMatch(calls, /搜索汇总模型/);
   assert.match(usage, /上游未完整返回用量，部分 token 由网关估算，费用按该用量计费/);
-  assert.doesNotMatch(usage, /日期（UTC）|时间（UTC）/);
+  assert.doesNotMatch(usage + calls, /日期（UTC）|时间（UTC）/);
 });

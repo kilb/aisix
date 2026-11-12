@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import type { TabProps } from "../../App";
 import {
   ApiError,
@@ -9,6 +9,7 @@ import {
   type ModelGroupPriceRow,
   type PublicModel,
 } from "../../lib/api";
+import { runPublicModelWrite, type PublicModelWriteGate } from "../../lib/publicModelWriteGate";
 import { isUnknownOutcome } from "../../lib/creditOutcome";
 import { messageFor, problemAt } from "../../lib/errors";
 import { errorText } from "../../lib/fmt";
@@ -72,7 +73,10 @@ function restoreWarning(model: PublicModel): string {
  * narrower references a delete is refused on, which the delete's own warning
  * states.
  */
-export function PublicModels({ canEdit }: TabProps) {
+export function PublicModels({ canEdit, onGoto, initialSection, sectionVisit, renderRouting, writeGate }: TabProps & {
+  writeGate: PublicModelWriteGate;
+  renderRouting?: (model: PublicModel, onChanged: () => Promise<boolean>, onClose: () => void, onApplied: (model: PublicModel) => void) => ReactNode;
+}) {
   const toast = useToast();
   const [rows, setRows] = useState<PublicModel[] | null>(null);
   const [prices, setPrices] = useState<Map<string, ModelGroupPriceRow> | null>(null);
@@ -81,7 +85,8 @@ export function PublicModels({ canEdit }: TabProps) {
   const [refusal, setRefusal] = useState<string | null>(null);
   /** The refusal belongs on the name field: a live model already holds the name. */
   const [atName, setAtName] = useState(false);
-  const [selected, setSelected] = useState<string | null>(null);
+  const [selected, setSelected] = useState<string | null>(initialSection ?? null);
+  useEffect(() => { setSelected(initialSection ?? null); }, [initialSection, sectionVisit]);
   const [name, setName] = useState("");
   const [creating, setCreating] = useState(false);
   /** The models a delete or restore is on its way for. */
@@ -94,14 +99,16 @@ export function PublicModels({ canEdit }: TabProps) {
     const n = ++latest.current;
     try {
       const [models, priced, groupList] = await Promise.all([publicModels.list(), groupPrices.list(), groupsApi.list()]);
-      if (n !== latest.current) return;
+      if (n !== latest.current) return false;
       setRows(models);
       setPrices(new Map(priced.map((p) => [p.model_id, p] as const)));
       setLiveGroups(groupList);
       setError(null);
+      return true;
     } catch (e) {
-      if (n !== latest.current) return;
+      if (n !== latest.current) return false;
       setError(errorText(e));
+      return false;
     }
   }, []);
 
@@ -123,14 +130,25 @@ export function PublicModels({ canEdit }: TabProps) {
     searchText: (model) => [model.name, model.id],
     resetKey: modelState,
   });
+  function select(model: string | null): void {
+    setSelected(model);
+    onGoto("public-routes", model ?? undefined);
+  }
   const open = rows?.find((m) => m.id === selected) ?? null;
   if (open) {
     return (
       <PublicModelDetail
         model={open}
+        writeGate={writeGate}
         canEdit={canEdit}
-        onBack={() => setSelected(null)}
-        onChanged={load}
+        onBack={() => select(null)}
+        onChanged={async () => { await load(); }}
+        loadError={error}
+        routingEditor={renderRouting?.(open, load, () => select(null), (model) => {
+          // 写入响应先于重读应用，旧的并发读取不能回退刚保存的目标与设置。
+          latest.current++;
+          setRows((previous) => previous?.map((row) => row.id === model.id ? model : row) ?? previous);
+        })}
       />
     );
   }
@@ -146,73 +164,84 @@ export function PublicModels({ canEdit }: TabProps) {
 
   async function create(e: React.FormEvent) {
     e.preventDefault();
-    setCreating(true);
-    setRefusal(null);
-    setAtName(false);
-    try {
-      const model = await publicModels.create(name);
-      setName("");
-      toast(`已新建公共模型「${model.name}」。请在任一上游账号的「模型」里勾选它。`);
-      await load();
-    } catch (err) {
-      if (err instanceof ApiError) {
-        const onName = problemAt(err.details, (p) => p === "/name");
-        setAtName(onName !== null);
-        setRefusal(onName ?? messageFor(err));
-      } else {
-        setRefusal(errorText(err));
+    if (!canEdit) return;
+    await runPublicModelWrite(writeGate, async () => {
+      setCreating(true);
+      setRefusal(null);
+      setAtName(false);
+      try {
+        const model = await publicModels.create(name);
+        setName("");
+        toast(`已新建公共模型「${model.name}」。请在路由中添加服务账号。`);
+        select(model.id);
+        await load();
+      } catch (err) {
+        if (err instanceof ApiError) {
+          const onName = problemAt(err.details, (p) => p === "/name");
+          setAtName(onName !== null);
+          setRefusal(onName ?? messageFor(err));
+        } else {
+          setRefusal(errorText(err));
+        }
+        focusRefusal();
+      } finally {
+        setCreating(false);
       }
-      focusRefusal();
-    } finally {
-      setCreating(false);
-    }
+    });
   }
 
   async function remove(model: PublicModel) {
-    mark(model.id, true);
-    setRefusal(null);
-    try {
-      await publicModels.delete(model.id);
-      toast(`已删除「${model.name}」，各账号对它的映射和它的文档都已移除。`);
-    } catch (e) {
-      setRefusal(
-        isUnknownOutcome(e)
-          ? `没能确认「${model.name}」是否已删除，已重新读取列表。`
-          : e instanceof ApiError
-            ? deleteRefusalText(e)
-            : errorText(e),
-      );
-    } finally {
-      await load();
-      mark(model.id, false);
-    }
+    if (!canEdit) return;
+    await runPublicModelWrite(writeGate, async () => {
+      mark(model.id, true);
+      setRefusal(null);
+      try {
+        await publicModels.delete(model.id);
+        toast(`已删除「${model.name}」，各账号对它的映射和它的文档都已移除。`);
+      } catch (e) {
+        setRefusal(
+          isUnknownOutcome(e)
+            ? `没能确认「${model.name}」是否已删除，已重新读取列表。`
+            : e instanceof ApiError
+              ? deleteRefusalText(e)
+              : errorText(e),
+        );
+      } finally {
+        await load();
+        mark(model.id, false);
+      }
+    });
   }
 
   async function restore(model: PublicModel) {
-    mark(model.id, true);
-    setRefusal(null);
-    try {
-      await publicModels.restore(model.id);
-      toast(`已恢复「${model.name}」。还没有账号服务它，请在上游账号的「模型」里重新映射。`);
-    } catch (e) {
-      setRefusal(
-        isUnknownOutcome(e)
-          ? `没能确认「${model.name}」是否已恢复，已重新读取列表。`
-          : e instanceof ApiError
-            ? `无法恢复「${model.name}」：${messageFor(e)}`
-            : errorText(e),
-      );
-    } finally {
-      await load();
-      mark(model.id, false);
-    }
+    if (!canEdit) return;
+    await runPublicModelWrite(writeGate, async () => {
+      mark(model.id, true);
+      setRefusal(null);
+      try {
+        await publicModels.restore(model.id);
+        toast(`已恢复「${model.name}」。还没有账号服务它，请在上游账号的「模型」里重新映射。`);
+      } catch (e) {
+        setRefusal(
+          isUnknownOutcome(e)
+            ? `没能确认「${model.name}」是否已恢复，已重新读取列表。`
+            : e instanceof ApiError
+              ? `无法恢复「${model.name}」：${messageFor(e)}`
+              : errorText(e),
+        );
+      } finally {
+        await load();
+        mark(model.id, false);
+      }
+    });
   }
+
 
   return (
     <div className="public-models panel contents">
       <PageHeader
-        eyebrow="模型管理 / 公共模型"
-        title="公共模型"
+        eyebrow="模型管理 / 公共模型与路由"
+        title="公共模型与路由"
         dataLead={live && unavailable ? <>当前有 {live.length.toLocaleString("zh-CN")} 个在用模型，其中 {unavailable.length.toLocaleString("zh-CN")} 个没有可用账号。先补齐账号映射，再核对基准价与服务分组换算率。</> : "读取完整模型列表后展示服务与定价状态。"}
         actions={
           <Button type="button" icon="refresh" onClick={() => void load()}>
@@ -262,7 +291,7 @@ export function PublicModels({ canEdit }: TabProps) {
         forms={
           canEdit ? (
             <Card className="mb-0">
-              <CardHeader number={4} title="新建公共模型" description="新建后，请在任一上游账号的「模型」里勾选它。" />
+              <CardHeader number={4} title="新建公共模型" description="新建后打开模型，在路由中添加服务账号。" />
               <form ref={form} aria-label="新建公共模型" onSubmit={(e) => void create(e)}>
                 <FormGrid>
                   <Field label="名称" error={nameRefusal}>
@@ -270,7 +299,7 @@ export function PublicModels({ canEdit }: TabProps) {
                       <input
                         required
                         value={name}
-                        disabled={creating}
+                        disabled={creating || writeGate.busy}
                         placeholder="租户请求时填写的模型名"
                         onChange={(e) => {
                           setName(e.target.value);
@@ -283,7 +312,7 @@ export function PublicModels({ canEdit }: TabProps) {
                   </Field>
                 </FormGrid>
                 <CardFooter>
-                  <Button kind="primary" type="submit" busy={creating} busyLabel="新建中…">新建</Button>
+                  <Button kind="primary" type="submit" disabled={writeGate.busy} busy={creating} busyLabel="新建中…">新建</Button>
                 </CardFooter>
               </form>
             </Card>
@@ -321,7 +350,7 @@ export function PublicModels({ canEdit }: TabProps) {
                   return (
                     <tr key={m.id} data-model={m.id}>
                       <td>
-                        <button type="button" className="link-button" onClick={() => setSelected(m.id)}>
+                        <button type="button" className="link-button" onClick={() => select(m.id)}>
                           {m.name}
                         </button>
                         <span className="pm-model-id cell-note mono">{m.id}</span>
@@ -351,6 +380,7 @@ export function PublicModels({ canEdit }: TabProps) {
                           <TwoStep
                             label="恢复"
                             size="sm"
+                            disabled={writeGate.busy}
                             busy={busy.has(m.id)}
                             busyLabel="恢复中…"
                             warning={restoreWarning(m)}
@@ -362,6 +392,7 @@ export function PublicModels({ canEdit }: TabProps) {
                             label="删除"
                             size="sm"
                             kind="danger"
+                            disabled={writeGate.busy}
                             busy={busy.has(m.id)}
                             busyLabel="删除中…"
                             // Always asked: refused, it says why; accepted, it cannot be undone.

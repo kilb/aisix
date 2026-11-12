@@ -1,40 +1,24 @@
+import { FORM_FOOTER, RowField, ServedGroups, GENERATED_STRATEGY, type Target, type ModelDoc, type AccountDoc, type Model, type Catalog, type SchemaInfo } from "./models/catalog";
+import { RoutingModeField } from "../ui/RoutingModeField";
 import { Plus, RefreshCw, Trash2, Waypoints } from "lucide-react";
-import { Fragment, useEffect, useId, useRef, useState, type ReactNode } from "react";
+import { Fragment, useEffect, useRef, useState, type ReactNode } from "react";
 import type { TabProps } from "../App";
 import { ConflictNote } from "../components/ConflictNote";
-import { DirectModelProbe } from "../components/DirectModelProbe";
-import { probeDirectModel } from "../lib/directModelProbeApi";
 import { Field, useRefusalFocus } from "../ui/Field";
 import { Msg, type Note } from "../components/Msg";
 import { RolloutBadge } from "../components/RolloutBadge";
 import {
   ApiError,
-  channelModels,
   publicModels,
   tenants,
   type PublicModel,
-  type CooldownSettings,
-  type ResourceView,
-  type ServedBy,
   type Tenant,
 } from "../lib/api";
 import { messageFor, problemAt } from "../lib/errors";
 import { errorText } from "../lib/fmt";
 import { modelClass, modelSource, type ModelClass, type ModelSource } from "../lib/modelSource";
-import { draftOf as routingDraftOf, routingBody, sameRouting, statusesOf, type RoutingDraft } from "../lib/publicRouting";
-import {
-  NEW_TARGET,
-  addedBody,
-  changedBody,
-  draftOf as targetDraftOf,
-  shownDraft,
-  targetsOf,
-  unsendable,
-  withSaved,
-  type TargetDraft,
-  type TargetField,
-} from "../lib/publicTargets";
-import { inUseText, retireWarning } from "../lib/retireWarning";
+import { draftOf as routingDraftOf, sameRouting } from "../lib/publicRouting";
+import { inUseText } from "../lib/retireWarning";
 import { defaultAt, enumAt, loadSchema } from "../lib/schema";
 import { useResource } from "../lib/useResource";
 import { Card, CardHeader, PageHeader } from "../components/page";
@@ -42,50 +26,14 @@ import { cn } from "../lib/cn";
 import { Button } from "../ui/Button";
 import { DataTable, Loading } from "../ui/DataTable";
 import { EmptyState } from "../ui/EmptyState";
-import type { FieldAria } from "../ui/Field";
-import { TwoStep } from "../ui/TwoStep";
 import { RoutePolicy } from "../ui/RoutePolicy";
 import { CooldownEditor } from "../ui/CooldownEditor";
 import { useRecordTable } from "../lib/recordTable";
 import { RecordTableToolbar, RecordTablePager } from "../ui/RecordTable";
 import { cooldownProblem as validateCooldown } from "../lib/cooldown";
-import { UpstreamModelPicker } from "../ui/UpstreamModelPicker";
 import { GroupBadges } from "./providers/GroupBadges";
+
 import { InventorySummary, countGroups } from "./providers/OperationsBento";
-
-/** One routing target; fields this page does not edit (such as `tags`) are kept as stored. */
-interface Target {
-  model_id?: string | null;
-  /** The display-name form of the reference, read only without `model_id`. */
-  model?: string;
-  weight?: number;
-  priority?: number;
-  [field: string]: unknown;
-}
-
-/** The fields of a `model` this page edits; every other field is kept as stored. */
-interface ModelDoc {
-  display_name?: string;
-  provider?: string;
-  model_name?: string;
-  provider_key_id?: string;
-  cooldown?: CooldownSettings | null;
-  routing?: { strategy?: string; targets?: Target[]; [field: string]: unknown } | null;
-  ensemble?: unknown;
-  semantic?: unknown;
-  [field: string]: unknown;
-}
-
-/** What this page reads of an upstream account. */
-interface AccountDoc {
-  display_name?: string;
-  provider?: string;
-  groups?: string[];
-  [field: string]: unknown;
-}
-
-type Model = ResourceView<ModelDoc>;
-type Account = ResourceView<AccountDoc>;
 
 /** The model's dispatch shape. Only direct and routing models have a form here. */
 type Shape = "direct" | "routing" | "ensemble" | "semantic";
@@ -97,24 +45,6 @@ const SHAPE_LABEL: Record<Shape, string> = {
   ensemble: "集成",
   semantic: "语义路由",
 };
-
-/** What the routing form reads from the gateway's `model` schema. */
-type SchemaInfo = { strategies: string[]; preset: string | null } | { error: string };
-
-/**
- * The strategy a public model's generated routing document dispatches on when
- * the operator set none (`channels::routing_doc` in the control plane). It is
- * not the schema's own default (`failover`), because `failover` would make a
- * target's `weight` inert, so the form shows this one for "not set".
- */
-const GENERATED_STRATEGY = "round_robin";
-
-/**
- * The strategy a public model cannot route by: it orders targets by price,
- * and the targets its accounts generate carry none (`channels::checked_routing`
- * refuses it).
- */
-const UNPRICED_STRATEGY = "least_cost";
 
 /** Which form is open: a new model of one shape, or one model. */
 type Open = { mode: "new"; shape: "direct" | "routing" } | { mode: "edit"; id: string };
@@ -142,12 +72,6 @@ function nameOf(m: Model): string {
   return m.doc.display_name || m.id;
 }
 
-/** The models and accounts a row or form names, by id. */
-interface Catalog {
-  models: Map<string, Model>;
-  accounts: Map<string, Account>;
-}
-
 /** The model a target names: by id, or by display name when it carries no id. */
 function targetModel(t: Target, catalog: Catalog): Model | undefined {
   if (t.model_id) return catalog.models.get(t.model_id);
@@ -162,40 +86,8 @@ function groupsOf(m: Model | undefined, catalog: Catalog): ReactNode {
   return <GroupBadges groups={account.doc.groups ?? []} empty="—（账号未设分组）" />;
 }
 
-/** `可服务分组：` and the groups, on a line of their own under what they belong to. */
-function ServedGroups({ children, className }: { children: ReactNode; className?: string }) {
-  return (
-    <div className={cn("sub mt-1 flex flex-wrap items-center gap-x-1.5 gap-y-1 font-mono text-meta", className)}>
-      <span>可服务分组：</span>
-      {children}
-    </div>
-  );
-}
-
-/**
- * The platform's model catalog (`models`): direct models on an upstream
- * account and routing models over them, each with the provider groups that
- * can reach it, its rollout, a form for both shapes and a two-step delete.
- * Ensemble and semantic models are listed and edited on 全部资源.
- *
- * Each row also says where it comes from. A model the operator wrote here is
- * edited and deleted here. One a public model generated is not: it is owned
- * by that public model, so a `DELETE` on it is refused as `managed_resource`.
- *
- * - A generated **routing** document is the public model's own name, and it
- *   is where that name's routing settings live, so its 「编辑」 opens a form
- *   for them (`PublicRoutingForm`) — saved through the public model's own
- *   `PATCH`, which regenerates the document — and for its targets, each
- *   edited, added or removed as that account's mapping. Everything the name
- *   needs can be done on this page.
- * - A generated **direct** document is one account's mapping, edited as a
- *   target of that routing form, so it stays read-only here: 查看 shows it.
- *
- * Removing the name itself is 停用, which retires the public model: the
- * routing document, every account's direct document and the account
- * mappings go, or the retire is refused with what still names the model.
- */
-export function Models({ canEdit, operator }: TabProps) {
+/** 模型目录保留清单和手工维护；公共模型的生命周期与映射在公共路由页维护。 */
+export function Models({ canEdit, onGoto }: TabProps) {
   const models = useResource<ModelDoc>("models");
   const accounts = useResource<AccountDoc>("provider_keys");
   const [publics, setPublics] = useState<PublicModel[] | null>(null);
@@ -212,11 +104,7 @@ export function Models({ canEdit, operator }: TabProps) {
   const [shapeFilter, setShapeFilter] = useState("");
   // The row whose `删除` was clicked once, with the tenants granted it (null while read).
   const [deleting, setDeleting] = useState<{ id: string; holders: Tenant[] | string | null } | null>(null);
-  // The public model id whose `停用` is in flight.
-  const [retiring, setRetiring] = useState<string | null>(null);
-  // The direct model row whose `移除该目标` is in flight.
-  const [removingTarget, setRemovingTarget] = useState<string | null>(null);
-  // A refused write: a manual delete, a retire, or a save.
+  // 手工模型删除或保存的拒绝原因。
   const [deleteFailure, setDeleteFailure] = useState<{ name: string; error: ApiError } | null>(null);
   const [busy, setBusy] = useState(false);
   // Numbers each holder lookup; a result is applied only while its number is the latest.
@@ -270,18 +158,6 @@ export function Models({ canEdit, operator }: TabProps) {
     } catch (e) {
       if (ticket === publicsRead.current) setPublicsError(errorText(e));
     }
-  }
-
-  /**
-   * A write's own answer for one public model, applied at once: it is newer
-   * than any read still in flight, which is therefore dropped. The routing
-   * form is keyed by its document's version, so the reload a save starts
-   * remounts it, and it must remount from these settings, not from a list
-   * read before the save.
-   */
-  function applyPublic(view: PublicModel) {
-    publicsRead.current++;
-    setPublics((list) => list?.map((p) => (p.id === view.id ? view : p)) ?? list);
   }
 
   // The public models, once per page: they are read to name the 来源 column
@@ -346,59 +222,6 @@ export function Models({ canEdit, operator }: TabProps) {
     }
   }
 
-  /**
-   * Retires the public model a generated row came from. Its answer is the
-   * whole outcome: on success the routing document, every account's direct
-   * document and the account mappings are gone; refused as
-   * `public_model_in_use`, the counts say what still names it.
-   */
-  async function retire(id: string) {
-    const named = publicById?.get(id)?.name;
-    setNote(null);
-    setDeleteFailure(null);
-    setRetiring(id);
-    try {
-      await publicModels.retire(id);
-      setNote({ kind: "ok", text: `已停用公共模型「${named ?? id}」，它生成的模型已删除。` });
-      refresh();
-    } catch (e) {
-      const error = e instanceof ApiError ? e : new ApiError(String(e), 0, "client", [], [], null);
-      setDeleteFailure({ name: named ?? id, error });
-    } finally {
-      setRetiring(null);
-    }
-  }
-
-  /**
-   * Takes one account out of a public model's routing: the account's mapping
-   * goes, which removes its direct document and rewrites the routing document
-   * without that target. The public model and every other account are left as
-   * they are — retiring the name is the routing row's own action.
-   */
-  async function removeTarget(m: Model) {
-    const source = modelSource(m);
-    const account = m.doc.provider_key_id;
-    if (source.kind !== "public" || !source.generated || !account) return;
-    setNote(null);
-    setDeleteFailure(null);
-    setRemovingTarget(m.id);
-    try {
-      await channelModels.remove(account, source.id);
-      setNote({
-        kind: "ok",
-        text: `已移除「${catalog.accounts.get(account)?.doc.display_name ?? account}」对「${
-          publicById?.get(source.id)?.name ?? source.id
-        }」的服务，该目标已不在路由里。`,
-      });
-      refresh();
-    } catch (e) {
-      const error = e instanceof ApiError ? e : new ApiError(String(e), 0, "client", [], [], null);
-      setDeleteFailure({ name: nameOf(m), error });
-    } finally {
-      setRemovingTarget(null);
-    }
-  }
-
   // The rows listed, and how many each class holds: the count beside the
   // toggle is what says the page is hiding rows rather than the operator
   // seeing a short list for no stated reason.
@@ -409,22 +232,9 @@ export function Models({ canEdit, operator }: TabProps) {
   const table = useRecordTable({ items: shown.filter((m) => shapeFilter === "" || shapeOf(m.doc) === shapeFilter), resetKey: `${showInternal}:${shapeFilter}`, searchText: (m) => [nameOf(m), m.id, m.doc.model_name ?? "", m.doc.routing?.strategy ?? ""] });
 
   const editing = open?.mode === "edit" ? models.items?.find((m) => m.id === open.id) : undefined;
-  // A model the operator wrote has the catalog form. A generated routing
-  // document is its public model's name, whose settings and targets this page
-  // owns (`PublicRoutingForm`); a generated direct document is one account's
-  // mapping, changed as a target of that form, so it opens read-only in the
-  // same catalog form.
+  // 公共生成的直连行只读，手工模型保留原编辑表单。
   const editingSource = editing ? modelSource(editing) : null;
-  const editingPublic =
-    editing && editingSource?.kind === "public" && !editingSource.generated
-      ? publicById?.get(editingSource.id)
-      : undefined;
-  const editable =
-    editing !== undefined &&
-    (editingSource?.kind === "manual" ||
-      editingPublic !== undefined ||
-      // Opened read-only below: the catalog form with every field locked.
-      (editingSource?.kind === "public" && editingSource.generated));
+  const editable = editing !== undefined && (editingSource?.kind === "manual" || editingSource?.kind === "public");
   const formProps = {
     catalog,
     schema,
@@ -438,39 +248,6 @@ export function Models({ canEdit, operator }: TabProps) {
   let editor: ReactNode = null;
   if (open?.mode === "new") {
     editor = <ModelForm key={`new-${open.shape}`} model={null} shape={open.shape} readOnly={false} onReload={() => undefined} {...formProps} />;
-  } else if (editing && editingPublic) {
-    editor = (
-      // Keyed by the public model alone: the reads a save or a removal
-      // starts must not throw away what is still typed in the form, which
-      // shows every untouched field as last read.
-      <PublicRoutingForm
-        key={editingPublic.id}
-        publicModel={editingPublic}
-        catalog={catalog}
-        schema={schema}
-        readOnly={!canEdit}
-        onClose={() => setOpen(null)}
-        onSaved={(view, complete) => {
-          // A save that left something unsaved says so in the form, at each refusal.
-          setNote(complete && view ? { kind: "ok", text: `已保存「${view.name}」的路由设置。` } : null);
-          if (view === null) return;
-          // The model as the save left it first, so the form shows the
-          // regenerated targets whichever read below lands first.
-          applyPublic(view);
-          void models.reload();
-          void loadPublics();
-        }}
-        onTargetRemoved={(where, view) => {
-          setNote({
-            kind: "ok",
-            text: `已移除账号「${where}」对「${editingPublic.name}」的映射，该目标已不在路由里。`,
-          });
-          if (view) applyPublic(view);
-          void models.reload();
-          void loadPublics();
-        }}
-      />
-    );
   } else if (editing && editable && (shapeOf(editing.doc) === "direct" || shapeOf(editing.doc) === "routing")) {
     const shape = shapeOf(editing.doc) as "direct" | "routing";
     editor = (
@@ -491,9 +268,9 @@ export function Models({ canEdit, operator }: TabProps) {
   return (
     <>
       <PageHeader
-        eyebrow="MODELS · 路由与目标"
-        title="模型与路由"
-        dataLead={models.items ? <>当前有 {counts.facing} 个对外公共模型、{counts.manual} 个手工模型和 {counts.internal} 个内部直连目标。</> : "维护对外名称、路由策略和每个上游目标。"}
+        eyebrow="MODELS · 模型目录"
+        title="模型目录"
+        dataLead={models.items ? <>当前有 {counts.facing} 个对外公共模型、{counts.manual} 个手工模型和 {counts.internal} 个内部直连目标。</> : "查看模型清单，维护手工模型与路由。"}
         actions={
           <>
             <Button type="button" onClick={refresh}>
@@ -533,13 +310,6 @@ export function Models({ canEdit, operator }: TabProps) {
           <div><dt>内部直连目标</dt><dd>{models.items ? counts.internal : "—"}</dd></div>
         </dl>
       </InventorySummary>
-      <DirectModelProbe
-        models={models.items}
-        accounts={accounts.items}
-        loadError={models.error !== null}
-        canProbe={operator.role === "admin"}
-        probe={probeDirectModel}
-      />
       <div className="mb-6 grid gap-3 empty:hidden [&>.note]:m-0">
         <Msg note={note} />
         {deleteFailure &&
@@ -662,51 +432,9 @@ export function Models({ canEdit, operator }: TabProps) {
                         <td className="right">
                           {src.kind === "public" ? (
                             <>
-                              {/* The routing document is the public name itself:
-                                  its settings and its targets are this page's. */}
-                              <Button
-                                size="sm"
-                                onClick={() => openForm({ mode: "edit", id: m.id })}
-                                disabled={!src.generated && !from}
-                              >
-                                {canEdit && !src.generated ? "编辑" : "查看"}
-                              </Button>
-                              {/* A direct row is one account's mapping, so the one
-                                  removal that fits it takes that account out of the
-                                  routing model and leaves the name alone. Retiring the
-                                  public model is the routing row's own action. */}
-                              {canEdit && src.generated && m.doc.provider_key_id && (
-                                <TwoStep
-                                  label="移除该目标"
-                                  size="sm"
-                                  busy={removingTarget === m.id}
-                                  busyLabel="移除中…"
-                                  warning={`移除后「${
-                                    catalog.accounts.get(m.doc.provider_key_id)?.doc.display_name ??
-                                    m.doc.provider_key_id
-                                  }」不再服务「${publicById?.get(src.id)?.name ?? src.id}」：本账号的映射被删除，它的直连文档随之移除。公共模型和其他账号不受影响。`}
-                                  onConfirm={() => void removeTarget(m)}
-                                />
-                              )}
-                              {canEdit && !src.generated && from && (
-                                <TwoStep
-                                  label="停用"
-                                  size="sm"
-                                  busy={retiring === src.id}
-                                  busyLabel="停用中…"
-                                  // Asked on the row the operator clicked: the warning says what goes,
-                                  // or that the retire would be refused and why.
-                                  warning={retireWarning(from)}
-                                  onConfirm={() => void retire(src.id)}
-                                />
-                              )}
-                              {src.generated ? (
-                                // One account's mapping: it is edited as a target
-                                // of the routing row's form, so this is a view.
-                                <span className="cell-note ml-auto">由公共模型生成，在「{from?.name ?? src.id}」的路由里改</span>
-                              ) : (
-                                <span className="cell-note ml-auto">由公共模型生成，路由设置在这里改</span>
-                              )}
+                              <Button size="sm" onClick={() => onGoto("public-routes", src.id)}>公共路由</Button>
+                              {src.generated && <Button size="sm" onClick={() => openForm({ mode: "edit", id: m.id })}>查看</Button>}
+                              <span className="cell-note ml-auto">由公共模型生成，在公共模型与路由中维护</span>
                             </>
                           ) : deleting?.id === m.id ? (
                             <>
@@ -751,7 +479,7 @@ export function Models({ canEdit, operator }: TabProps) {
                         <tr className="dt-detail">
                           <td colSpan={6} className="whitespace-normal">
                             <p className="hint text-caption">
-                              它的公共模型「{src.id}」已不在列表里，请刷新；这次停用不能在这里执行。
+                              它的公共模型「{src.id}」已不在列表里，请刷新或进入公共模型与路由核对。
                             </p>
                           </td>
                         </tr>
@@ -1004,10 +732,7 @@ function ModelForm({
 
   // The strategy options: the schema's, plus what is stored when the schema lacks it.
   const shownStrategy = strategy || preset || "";
-  const strategyOptions = [
-    ...(strategies ?? []),
-    ...(initial.strategy && !strategies?.includes(initial.strategy) ? [initial.strategy] : []),
-  ];
+
 
   function chooseAccount(id: string) {
     setAccountId(id);
@@ -1181,24 +906,20 @@ function ModelForm({
             </div>
           </div>
         ) : (
-          <Field label="选路策略" error={at("/routing/strategy")}>
-            {(aria) => (
-              <select disabled={locked || strategies === null} value={shownStrategy} onChange={(e) => setStrategy(e.target.value)} {...aria}>
-                {strategyOptions.map((v) => (
-                  <option key={v} value={v}>
-                    {v}
-                  </option>
-                ))}
-              </select>
-            )}
-          </Field>
+          <RoutingModeField
+            value={{ strategy: shownStrategy, affinity }}
+            onChange={(next) => { setStrategy(next.strategy); setAffinity(next.affinity); }}
+            disabled={locked || strategies === null}
+            strategies={strategies}
+            storedHashOn={routing.hash_on}
+            error={at("/routing/strategy")}
+            hashError={at("/routing/hash_on")}
+          />
         )}
       </div>
 
       {shape === "direct" && <CooldownEditor value={cooldown} disabled={locked} onChange={setCooldown} onValidityChange={setCooldownProblem} error={at("/cooldown")} />}
-      {shape === "routing" && shownStrategy === "consistent_hash" && <Field label="亲和来源" hint="API key 资源 ID 保持稳定，不取密钥文本。">
-        {(aria) => <select disabled={locked} value={affinity} onChange={(e) => setAffinity(e.target.value as RoutingDraft["affinity"])} {...aria}><option value="default">网关默认：请求头 → API key ID</option><option value="api_key">API key 亲和</option>{routing.hash_on !== undefined && <option value="custom">保留已存自定义来源链</option>}</select>}
-      </Field>}
+
 
       {shape === "routing" && (
         <div className="@container mt-2 border-t border-line pt-5">
@@ -1338,782 +1059,3 @@ function ModelForm({
 
 /** A manual routing model's target row: the model, its weight and priority, its removal. */
 const MANUAL_ROW = "grid grid-cols-2 items-start gap-x-3 gap-y-2 @lg:grid-cols-[minmax(0,1fr)_6.5rem_6.5rem_minmax(6rem,auto)]";
-
-/** A form card's closing bar: its buttons at the bottom right, on a muted strip the card's width. */
-const FORM_FOOTER =
-  "-mx-[var(--pad)] -mb-[var(--pad)] mt-6 flex max-w-none flex-wrap items-center justify-end gap-2 rounded-b-card border-t border-line bg-well px-[var(--pad)] py-3 [&_.hint]:text-ink-soft";
-
-/**
- * A field in a row of fields: its label above it while the row is stacked,
- * and only for assistive technology once the row is one line under a header
- * that names its columns (the row's container query, `@lg`, or `@3xl` with
- * `at="3xl"`). Its refusal, when there is one, is under it and describes it.
- */
-function RowField({
-  label,
-  error,
-  at = "lg",
-  className,
-  children,
-}: {
-  label: string;
-  error?: string | null;
-  at?: "lg" | "3xl";
-  className?: string;
-  children: (aria: FieldAria) => ReactNode;
-}) {
-  const id = useId();
-  const errorId = `${id}-error`;
-  const aria: FieldAria = error ? { "aria-invalid": true, "aria-describedby": errorId } : {};
-  return (
-    <div className={cn("min-w-0", className)}>
-      <label className="flex flex-col gap-1.5">
-        <span className={cn("text-caption font-medium text-muted", at === "lg" ? "@lg:sr-only" : "@3xl:sr-only")}>{label}</span>
-        {children(aria)}
-      </label>
-      {error && (
-        <p className="field-problem" id={errorId}>
-          {error}
-        </p>
-      )}
-    </div>
-  );
-}
-
-/** Where a target row's refusal goes: one of its fields, or the row itself. */
-interface RowRefusal {
-  fields: Partial<Record<TargetField | "account", string>>;
-  /** What none of the row's fields explains; null when they say it all. */
-  message: string | null;
-}
-
-/** The field of a target row each refusal path names. */
-const TARGET_PATHS: Record<string, TargetField | "account"> = {
-  "/upstream_model": "upstream",
-  "/priority": "priority",
-  "/weight": "weight",
-  "/provider_key_id": "account",
-};
-
-/** A target write's refusal, at the fields of the row it was for. */
-function rowRefusal(e: unknown): RowRefusal {
-  if (!(e instanceof ApiError)) return { fields: {}, message: errorText(e) };
-  const fields: RowRefusal["fields"] = {};
-  const rest: string[] = [];
-  for (const d of e.details) {
-    const field = d.path.startsWith("/cooldown") ? "cooldown" : TARGET_PATHS[d.path];
-    if (field === undefined) rest.push(d.message);
-    else fields[field] = fields[field] ? `${fields[field]}；${d.message}` : d.message;
-  }
-  if (rest.length > 0) return { fields, message: rest.join("；") };
-  return { fields, message: Object.keys(fields).length > 0 ? null : messageFor(e) };
-}
-
-/** A target the form is adding: an account that does not route this model yet. */
-interface Addition {
-  key: number;
-  /** Empty until the operator picks one. */
-  accountId: string;
-  draft: TargetDraft;
-}
-
-/** The refusal key of an added row; a served row's is its account id. */
-const addedRow = (key: number) => `new:${key}`;
-
-/** `record` without `key`. */
-function without<T>(record: Record<string, T>, key: string): Record<string, T> {
-  const next = { ...record };
-  delete next[key];
-  return next;
-}
-
-/**
- * One public model's routing: its settings, and its targets — one per
- * upstream account that serves it — each with the upstream name the account
- * is asked for, its priority and its weight.
- *
- * The settings are the model's own: saved through
- * `PATCH /admin/public-models/{id}`, which regenerates the routing document
- * in the same transaction, so a later account change cannot revert them. A
- * hand edit of the document could not do this — the document is owned by the
- * public model, and a save on it answers `409 managed_resource`.
- *
- * A target is that account's mapping of the model, so it is edited, added
- * and removed as the mapping (`PUT` / `DELETE
- * /admin/provider-keys/{account}/channel-models/{public model id}`), which
- * regenerates the document from the mappings. The account's own 模型 section
- * edits the same rows.
- *
- * One 保存 sends each changed or added target, in order, then the settings
- * if they changed: separate writes, so each keeps its own outcome. A refused
- * write is shown at the field its refusal names, on its own row; a row that
- * was written takes what the control plane now holds and is not sent again,
- * so saving again after a fix sends only what is left. A field the operator
- * has not touched always shows what was last read.
- */
-function PublicRoutingForm({
-  publicModel,
-  catalog,
-  schema,
-  readOnly,
-  onClose,
-  onSaved,
-  onTargetRemoved,
-}: {
-  publicModel: PublicModel;
-  catalog: Catalog;
-  schema: SchemaInfo | null;
-  readOnly: boolean;
-  onClose: () => void;
-  /**
-   * A save ended: `view` is the model as it now stands, or null when nothing
-   * was written; `complete` says nothing was refused.
-   */
-  onSaved: (view: PublicModel | null, complete: boolean) => void;
-  /** A target was removed; `view` is the model read back after it, or null when that read failed. */
-  onTargetRemoved: (accountName: string, view: PublicModel | null) => void;
-}) {
-  const stored = publicModel.routing ?? {};
-  // The settings the operator typed, or null while untouched: a field not
-  // here shows what was last read, and only what was typed is sent, so a
-  // reload after another operator's change neither hides it nor reverts it.
-  const [settings, setSettings] = useState<Partial<RoutingDraft> | null>(null);
-  // The target fields the operator typed, by account id; a field not here
-  // shows what the mapping last read, so an untouched field follows every
-  // later read and is never sent back as the value it had at first edit.
-  const [edits, setEdits] = useState<Record<string, Partial<TargetDraft>>>({});
-  const [additions, setAdditions] = useState<Addition[]>([]);
-  const nextKey = useRef(1);
-  const [form, focusRefusal] = useRefusalFocus<HTMLFormElement>();
-  const [busy, setBusy] = useState(false);
-  // The last save's outcome: the settings' refusal, each refused row's, the
-  // rows it wrote while something else was refused, and what it says overall.
-  const [err, setErr] = useState<ApiError | string | null>(null);
-  const [refusals, setRefusals] = useState<Record<string, RowRefusal>>({});
-  const [written, setWritten] = useState<string[]>([]);
-  const [outcome, setOutcome] = useState<string | null>(null);
-  // The account whose removal was clicked once.
-  const [removing, setRemoving] = useState<string | null>(null);
-  const [removingBusy, setRemovingBusy] = useState(false);
-  const title = readOnly ? `模型「${publicModel.name}」` : `编辑模型「${publicModel.name}」`;
-  const locked = readOnly || busy;
-
-  const effectiveStrategy = typeof publicModel.effective_routing?.strategy === "string" ? publicModel.effective_routing.strategy : GENERATED_STRATEGY;
-  const draft: RoutingDraft = { ...routingDraftOf(stored, effectiveStrategy), ...settings };
-  const statuses = statusesOf(draft.statuses);
-  const settingsBody = routingBody(draft, stored, GENERATED_STRATEGY, statuses);
-  const settingsChanged = settings !== null && !sameRouting(settingsBody, stored);
-
-  const targets = targetsOf(publicModel);
-  const shownOf = (t: ServedBy) => shownDraft(t, edits[t.provider_key_id]);
-  const changedTargets = targets.flatMap((t) => {
-    const body = changedBody(shownOf(t), t);
-    return body === null ? [] : [{ target: t, typed: shownOf(t), body }];
-  });
-  const dirty = settingsChanged || changedTargets.length > 0 || additions.length > 0;
-  // A disabled mapping is not a target; adding its account enables it again.
-  const disabledRows = new Map(
-    publicModel.served_by.filter((s) => !s.enabled).map((s) => [s.provider_key_id, s] as const),
-  );
-
-  function set<K extends keyof RoutingDraft>(key: K, value: RoutingDraft[K]) {
-    setSettings((d) => ({ ...d, [key]: value }));
-  }
-
-  /** Forgets the last save's word on one row: the operator is changing it. */
-  function settle(row: string) {
-    setRefusals((r) => without(r, row));
-    setWritten((w) => w.filter((id) => id !== row));
-  }
-
-  function editTarget(t: ServedBy, patch: Partial<TargetDraft>) {
-    // Only what was typed is held: an untouched field keeps following the
-    // stored mapping, so a reload's newer value is what a save compares.
-    setEdits((e) => ({ ...e, [t.provider_key_id]: { ...e[t.provider_key_id], ...patch } }));
-    settle(t.provider_key_id);
-  }
-
-  function editAddition(key: number, patch: Partial<Addition>) {
-    setAdditions((list) => list.map((a) => (a.key === key ? { ...a, ...patch } : a)));
-    settle(addedRow(key));
-  }
-
-  function chooseAccount(a: Addition, accountId: string) {
-    // An account whose mapping was disabled starts from what it stored, so
-    // enabling it again does not silently rewrite its upstream name.
-    const before = disabledRows.get(accountId);
-    editAddition(a.key, { accountId, draft: before ? targetDraftOf(before) : a.draft });
-  }
-
-  function addTarget() {
-    const key = nextKey.current++;
-    setAdditions((list) => [...list, { key, accountId: "", draft: NEW_TARGET }]);
-  }
-
-  async function submit(e: React.FormEvent) {
-    e.preventDefault();
-    // A removal in flight reloads the targets when it lands; a save from
-    // under it would race it on the same document.
-    if (removingBusy || !dirty) return;
-    // What cannot be sent at all stops the save before anything is written.
-    const unsent: Record<string, RowRefusal> = {};
-    for (const { target, typed } of changedTargets) {
-      const fields = unsendable(typed, target);
-      if (Object.keys(fields).length > 0) unsent[target.provider_key_id] = { fields, message: null };
-    }
-    for (const a of additions) {
-      const fields: RowRefusal["fields"] = unsendable(a.draft);
-      if (a.accountId === "") fields.account = "请选择上游账号";
-      if (Object.keys(fields).length > 0) unsent[addedRow(a.key)] = { fields, message: null };
-    }
-    if (Object.keys(unsent).length > 0) {
-      setRefusals(unsent);
-      setOutcome(null);
-      focusRefusal();
-      return;
-    }
-
-    // Fixed here: what this save writes does not change under it.
-    const batch = [
-      ...changedTargets.map(({ target, body }) => ({
-        row: target.provider_key_id,
-        accountId: target.provider_key_id,
-        body,
-        added: null as number | null,
-      })),
-      ...additions.map((a) => ({ row: addedRow(a.key), accountId: a.accountId, body: addedBody(a.draft), added: a.key })),
-    ];
-    const settingsSent = settingsChanged ? settingsBody : null;
-    setBusy(true);
-    setErr(null);
-    setRefusals({});
-    setWritten([]);
-    setOutcome(null);
-
-    let view = publicModel;
-    const refused: Record<string, RowRefusal> = {};
-    const wrote: typeof batch = [];
-    for (const w of batch) {
-      try {
-        const saved = await channelModels.put(w.accountId, publicModel.id, w.body);
-        const account = catalog.accounts.get(w.accountId);
-        view = withSaved(view, w.accountId, saved, {
-          display_name: account?.doc.display_name ?? w.accountId,
-          groups: account?.doc.groups ?? [],
-        });
-        wrote.push(w);
-      } catch (e) {
-        refused[w.row] = rowRefusal(e);
-      }
-    }
-    let settingsSaved = false;
-    let settingsRefused: ApiError | string | null = null;
-    if (settingsSent !== null) {
-      try {
-        // Answered after its own commit, so it is also the read-back of every target written above.
-        view = await publicModels.patchRouting(publicModel.id, settingsSent);
-        settingsSaved = true;
-      } catch (e) {
-        settingsRefused = e instanceof ApiError ? e : String(e);
-      }
-    }
-    let readbackFailed = false;
-    if (wrote.length > 0 && !settingsSaved) {
-      try {
-        view = await publicModels.get(publicModel.id);
-      } catch {
-        // The rows as their writes answered them stand in for the read:
-        // what was written is shown as written, and is not sent again.
-        readbackFailed = true;
-      }
-    }
-
-    const failed = Object.keys(refused).length + (settingsRefused === null ? 0 : 1);
-    setEdits((prev) => wrote.reduce((next, w) => (w.added === null ? without(next, w.accountId) : next), prev));
-    setAdditions((prev) => prev.filter((a) => !wrote.some((w) => w.added === a.key)));
-    if (settingsSaved) setSettings(null);
-    setErr(settingsRefused ?? (readbackFailed ? "目标已写入，但未能读回当前完整路由配置，请刷新后核对。" : null));
-    setRefusals(refused);
-    setWritten(failed > 0 ? wrote.map((w) => w.accountId) : []);
-    setOutcome(
-      failed === 0
-        ? null
-        : wrote.length > 0 || settingsSaved
-          ? `有 ${failed} 项没有保存，原因标在各自的位置；其余改动已保存。改正后再点「保存」。`
-          : "没有保存：原因标在各自的位置。",
-    );
-    setBusy(false);
-    onSaved(wrote.length > 0 || settingsSaved ? view : null, failed === 0 && !readbackFailed);
-    if (failed > 0) focusRefusal();
-  }
-
-  async function removeTarget(accountId: string, accountName: string) {
-    setRemovingBusy(true);
-    try {
-      await channelModels.remove(accountId, publicModel.id);
-    } catch (e) {
-      setRefusals((r) => ({ ...r, [accountId]: rowRefusal(e) }));
-      setRemovingBusy(false);
-      return;
-    }
-    let view: PublicModel | null = null;
-    try {
-      view = await publicModels.get(publicModel.id);
-    } catch {
-      // The page reads the list again after a removal either way.
-    }
-    setRemoving(null);
-    setEdits((e) => without(e, accountId));
-    settle(accountId);
-    setRemovingBusy(false);
-    onTargetRemoved(accountName, view);
-  }
-
-  const details = err instanceof ApiError ? err.details : [];
-  const at = (path: string) => problemAt(details, (p) => p === path);
-  // The strategy options come from the schema, never from a list here: the
-  // one the generator uses for "not set" leads, since an operator who wants it
-  // back cannot find it otherwise (it is not the schema's own default).
-  //
-  // `least_cost` is left out: it ranks targets by their price, a generated
-  // target carries none, and the control plane refuses it for a public model.
-  // A stored one is still shown, below, so the form reads what is there.
-  const fromSchema =
-    schema && "strategies" in schema ? schema.strategies.filter((v) => v !== UNPRICED_STRATEGY) : null;
-  const strategies =
-    fromSchema === null
-      ? null
-      : fromSchema.includes(GENERATED_STRATEGY)
-        ? fromSchema
-        : [GENERATED_STRATEGY, ...fromSchema];
-  const bad = schema && "error" in schema ? schema.error : null;
-  const shown = [
-    "/routing/strategy",
-    "/routing/retries",
-    "/routing/max_fallbacks",
-    "/routing/retry_on_429",
-    "/routing/fallback_on_statuses",
-    "/routing/when_all_unavailable",
-  ];
-  const listed = details.filter((d) => !shown.includes(d.path));
-
-  // The accounts an added row may pick: not one that routes the model
-  // already, nor one another added row has picked.
-  const routed = new Set(targets.map((t) => t.provider_key_id));
-  function accountOptions(a: Addition) {
-    const taken = new Set([
-      ...routed,
-      ...additions.filter((x) => x.key !== a.key && x.accountId !== "").map((x) => x.accountId),
-    ]);
-    return [...catalog.accounts.values()]
-      .filter((account) => !taken.has(account.id))
-      .map((account) => ({
-        id: account.id,
-        label: `${account.doc.display_name || account.id}（${account.doc.groups?.length ? account.doc.groups.join("、") : "未设分组"}）`,
-      }));
-  }
-  const groupBadges = (groups: string[] | undefined) => <GroupBadges groups={groups ?? []} empty="—（账号未设分组）" />;
-
-  return (
-    <form ref={form} className="panel mb-0" aria-label={title} onSubmit={submit}>
-      <CardHeader
-        number={3}
-        title={title}
-        className="mb-5"
-        description={`公共模型「${publicModel.name}」的路由：每个目标是一个为它服务的上游账号。选路设置和目标都在这里改，点「保存」一并写入；移除目标立即生效。`}
-      />
-      <div className="@container">
-        <div className="mb-4"><RoutePolicy routing={publicModel.effective_routing} /></div>
-        <h4 className="mb-3 text-body font-semibold">选路设置</h4>
-        {bad && (
-          <div className="note crit mt-0" role="alert">
-            {bad}
-          </div>
-        )}
-        <div className="grid gap-x-4 @md:grid-cols-2 @3xl:grid-cols-3">
-          <Field label="选路策略" error={at("/routing/strategy")}>
-            {(aria) => (
-              <select disabled={locked || strategies === null} value={draft.strategy} onChange={(e) => set("strategy", e.target.value)} {...aria}>
-                {[
-                  ...(strategies ?? []),
-                  ...(strategies?.includes(draft.strategy) || draft.strategy === "" ? [] : [draft.strategy]),
-                ].map((v) => (
-                  <option key={v} value={v}>
-                    {v}
-                  </option>
-                ))}
-              </select>
-            )}
-          </Field>
-          <Field label="全部不可用时的处理" hint="只针对后台健康检查报告全部目标不健康。全部目标都在故障冷却时仍会尝试。" error={at("/routing/when_all_unavailable")}>
-            {(aria) => (
-              <select disabled={locked} value={draft.whenAllUnavailable} onChange={(e) => set("whenAllUnavailable", e.target.value)} {...aria}>
-                <option value="">（网关默认）</option>
-                <option value="fail">fail（返回 503）</option>
-                <option value="try_anyway">try_anyway（仍然尝试）</option>
-              </select>
-            )}
-          </Field>
-          {draft.strategy === "consistent_hash" && <Field label="亲和来源" hint="API key 资源 ID 不受密钥轮换或调用方请求头影响。同一 key 尽量保持在同一健康目标。">
-            {(aria) => <select disabled={locked} value={draft.affinity} onChange={(e) => set("affinity", e.target.value as RoutingDraft["affinity"])} {...aria}>
-              <option value="default">网关默认：请求头 → API key ID</option>
-              <option value="api_key">API key 亲和</option>
-              {stored.hash_on !== undefined && <option value="custom">保留已存自定义来源链</option>}
-            </select>}
-          </Field>}
-          <Field label="重试次数" hint="留空用网关的默认值。" error={at("/routing/retries")}>
-            {(aria) => (
-              <input
-                type="number"
-                min={0}
-                step={1}
-                disabled={locked}
-                value={draft.retries}
-                onChange={(e) => set("retries", e.target.value)}
-                {...aria}
-              />
-            )}
-          </Field>
-          <Field label="最多切换几个目标" hint="留空表示后面的目标都可以试。" error={at("/routing/max_fallbacks")}>
-            {(aria) => (
-              <input
-                type="number"
-                min={0}
-                step={1}
-                disabled={locked}
-                value={draft.maxFallbacks}
-                onChange={(e) => set("maxFallbacks", e.target.value)}
-                {...aria}
-              />
-            )}
-          </Field>
-          <div className="min-w-0 @md:col-span-2 @3xl:col-span-2">
-            <Field
-              label="额外重试的状态码"
-              hint="逗号分隔，例如 408, 429。上游用 4xx 表示临时故障时才有用；5xx 本来就会重试。"
-              error={at("/routing/fallback_on_statuses")}
-            >
-              {(aria) => (
-                <input
-                  disabled={locked}
-                  value={draft.statuses}
-                  placeholder="（网关默认：不额外重试）"
-                  onChange={(e) => set("statuses", e.target.value)}
-                  {...aria}
-                />
-              )}
-            </Field>
-            {draft.statuses.trim() !== "" && statuses === null && (
-              <p className="hint -mt-2 mb-4 text-caption">状态码要写成数字，用逗号分隔。</p>
-            )}
-          </div>
-        </div>
-        <label className="f mb-0">
-          <input type="checkbox" disabled={locked} checked={draft.retryOn429} onChange={(e) => set("retryOn429", e.target.checked)} />{" "}
-          <span>429 也参与重试和切换</span>
-        </label>
-      </div>
-
-      <div className="@container mt-6 border-t border-line pt-5">
-        <h4 className="mb-3 text-body font-semibold">路由目标（{targets.length}）</h4>
-        {targets.length === 0 && additions.length === 0 ? (
-          <p className="hint rounded-cell border border-dashed border-line px-4 py-6 text-center text-caption">
-            还没有账号服务这个模型：请求会以「上游不可用」失败。{!readOnly && "用下面的「添加目标」加一个账号。"}
-          </p>
-        ) : (
-          <div className="overflow-hidden rounded-cell border border-line">
-            <div aria-hidden="true" className={cn(TARGET_ROW, "hidden border-b border-line bg-well px-3 py-2 text-caption font-medium text-ink-soft @3xl:grid")}>
-              <span>账号</span>
-              <span>上游模型名称</span>
-              <span>优先级</span>
-              <span>权重</span>
-              <span />
-            </div>
-            <ul>
-              {targets.map((t) => {
-                const accountId = t.provider_key_id;
-                const accountName = t.display_name || "（账号已不存在）";
-                return (
-                  <TargetRow
-                    key={accountId}
-                    label={`目标 ${accountName}`}
-                    accountId={accountId}
-                    draft={shownOf(t)}
-                    publicName={publicModel.name}
-                    locked={locked}
-                    refusal={refusals[accountId]}
-                    written={written.includes(accountId)}
-                    onChange={(patch) => editTarget(t, patch)}
-                    accountShown={false}
-                    heading={
-                      <>
-                        <div className="truncate pt-2 font-medium @3xl:pt-1.5" title={accountName}>
-                          <span className="font-normal text-muted">账号：</span>
-                          {accountName}
-                        </div>
-                        <ServedGroups>{groupBadges(t.groups)}</ServedGroups>
-                      </>
-                    }
-                    action={
-                      !readOnly &&
-                      removing !== accountId && (
-                        <Button size="sm" kind="quiet" disabled={removingBusy || busy} onClick={() => setRemoving(accountId)}>
-                          <Trash2 aria-hidden />
-                          移除该目标
-                        </Button>
-                      )
-                    }
-                  >
-                    {!readOnly &&
-                      // Two steps held here rather than by `TwoStep`: a removal
-                      // reloads the targets behind this form, and the step has to
-                      // survive the re-render that causes.
-                      removing === accountId && (
-                        <div className="flex flex-wrap items-center justify-between gap-3 rounded-cell border border-line bg-well px-3 py-2.5">
-                          <p role="alert" className="min-w-0 flex-1 basis-64 text-caption">
-                            移除后，账号「{accountName}」不再为「{publicModel.name}」提供服务，它对该模型的映射也会删除。
-                          </p>
-                          <div className="flex gap-2">
-                            <Button size="sm" disabled={removingBusy} onClick={() => setRemoving(null)}>
-                              取消
-                            </Button>
-                            <Button
-                              kind="danger"
-                              size="sm"
-                              busy={removingBusy}
-                              busyLabel="移除中…"
-                              disabled={busy}
-                              onClick={() => void removeTarget(accountId, accountName)}
-                            >
-                              确认移除该目标
-                            </Button>
-                          </div>
-                        </div>
-                      )}
-                  </TargetRow>
-                );
-              })}
-              {additions.map((a, i) => {
-                const refusal = refusals[addedRow(a.key)];
-                const account = catalog.accounts.get(a.accountId);
-                return (
-                  <TargetRow
-                    key={addedRow(a.key)}
-                    label={`新目标 ${i + 1}`}
-                    accountId={a.accountId}
-                    draft={a.draft}
-                    publicName={publicModel.name}
-                    locked={locked}
-                    refusal={refusal}
-                    written={false}
-                    onChange={(patch) => editAddition(a.key, { draft: { ...a.draft, ...patch } })}
-                    accountShown
-                    heading={
-                      <>
-                        <RowField label="上游账号" at="3xl" error={refusal?.fields.account}>
-                          {(aria) => (
-                            <select disabled={locked} value={a.accountId} onChange={(e) => chooseAccount(a, e.target.value)} {...aria}>
-                              <option value="">（选择上游账号）</option>
-                              {accountOptions(a).map((o) => (
-                                <option key={o.id} value={o.id}>
-                                  {o.label}
-                                </option>
-                              ))}
-                            </select>
-                          )}
-                        </RowField>
-                        {account && <ServedGroups className="mt-1.5">{groupBadges(account.doc.groups)}</ServedGroups>}
-                        {disabledRows.has(a.accountId) && (
-                          <div className="sub mt-1 text-meta">该账号对这个模型的映射已停用，保存后重新启用。</div>
-                        )}
-                      </>
-                    }
-                    action={
-                      <Button
-                        size="sm"
-                        kind="quiet"
-                        disabled={busy}
-                        onClick={() => {
-                          setAdditions((list) => list.filter((x) => x.key !== a.key));
-                          settle(addedRow(a.key));
-                        }}
-                      >
-                        取消添加
-                      </Button>
-                    }
-                  />
-                );
-              })}
-            </ul>
-          </div>
-        )}
-        <div className="mt-3 flex flex-wrap items-start justify-between gap-x-6 gap-y-3">
-          {!readOnly && (
-            <Button type="button" size="sm" disabled={busy} onClick={addTarget}>
-              <Plus aria-hidden />
-              添加目标
-            </Button>
-          )}
-          <p className="hint max-w-[52ch] text-caption">
-            优先级高的一组先用，这一组都不可用时才用下一组；同组选择遵循上面的已存策略。上游模型名称留空即用公共模型的名称。
-          </p>
-        </div>
-      </div>
-
-      {(outcome || err) && (
-        <div className="note crit" role="alert">
-          {outcome && <p>{outcome}</p>}
-          {err && (typeof err === "string" ? err : `路由设置：${messageFor(err)}`)}
-          {listed.length > 0 && (
-            <ul>
-              {listed.map((d) => (
-                <li key={d.path}>
-                  <code>{d.path}</code>：{d.message}
-                </li>
-              ))}
-            </ul>
-          )}
-        </div>
-      )}
-
-      <div className={FORM_FOOTER}>
-        <Button type="button" disabled={busy} onClick={onClose}>
-          关闭
-        </Button>
-        {!readOnly && (
-          <Button
-            kind="primary"
-            type="submit"
-            busy={busy}
-            busyLabel="保存中…"
-            disabled={statuses === null || removingBusy || !dirty}
-            disabledReason={statuses !== null && !removingBusy && !dirty ? "没有要保存的改动" : undefined}
-          >
-            保存
-          </Button>
-        )}
-      </div>
-    </form>
-  );
-}
-
-/**
- * A public model's target row: stacked on a phone; from `@md` the account
- * and its action on one line with the three fields under them; from `@3xl`
- * one line under the header that names the columns.
- */
-const TARGET_ROW =
-  "grid grid-cols-2 items-start gap-x-3 gap-y-2 @md:grid-cols-[minmax(0,1fr)_6rem_6rem] @3xl:grid-cols-[minmax(0,1fr)_minmax(0,1.3fr)_6rem_6rem_minmax(7rem,auto)]";
-
-/**
- * One target of a public model's routing form: who serves it (`heading`),
- * then the upstream name, priority and weight, each with its own refusal,
- * the row's own action (`action`), and under them whatever the row asks
- * about itself (`children`).
- */
-function TargetRow({
-  label,
-  accountId,
-  heading,
-  accountShown,
-  draft,
-  publicName,
-  locked,
-  refusal,
-  written,
-  onChange,
-  action,
-  children,
-}: {
-  /** The row's accessible name. */
-  label: string;
-  /** The account whose model list the upstream field offers; empty offers none. */
-  accountId: string;
-  heading: ReactNode;
-  /** Whether `heading` has an account field that shows a refusal of the account itself. */
-  accountShown: boolean;
-  draft: TargetDraft;
-  publicName: string;
-  locked: boolean;
-  refusal: RowRefusal | undefined;
-  /** Written by a save that left something else unsaved. */
-  written: boolean;
-  onChange: (patch: Partial<TargetDraft>) => void;
-  action?: ReactNode;
-  children?: ReactNode;
-}) {
-  const id = useId();
-  const upstreamError = refusal?.fields.upstream ?? null;
-  // A row without an account field takes a refusal of its account as its own.
-  const message = [refusal?.message, accountShown ? null : refusal?.fields.account]
-    .filter((m): m is string => typeof m === "string" && m !== "")
-    .join("；");
-  return (
-    <li className={cn(TARGET_ROW, "border-line p-3 not-last:border-b")} aria-label={label}>
-      <div className="col-span-2 min-w-0 @md:col-start-1 @md:row-start-1 @3xl:col-span-1">
-        {heading}
-        {written && <span className="tag mt-1.5 border-line bg-well text-ink">已保存</span>}
-      </div>
-      <div className="col-span-2 min-w-0 @md:col-span-1 @md:col-start-1 @md:row-start-2 @3xl:col-start-2 @3xl:row-start-1">
-        <div className="flex flex-col gap-1.5">
-          <span className="text-caption font-medium text-muted @3xl:hidden">上游模型名称</span>
-          <UpstreamModelPicker
-            // Keyed by the account: a row that switches accounts is a
-            // different model list, so nothing the first account answered
-            // (a list, a reason, a call still in flight) carries over.
-            key={accountId}
-            accountId={accountId}
-            value={draft.upstream}
-            publicName={publicName}
-            label="上游模型名称"
-            onChange={(upstream) => onChange({ upstream })}
-            disabled={locked}
-            invalid={upstreamError !== null}
-            describedBy={upstreamError === null ? undefined : `${id}-upstream`}
-          />
-        </div>
-        {upstreamError !== null && (
-          <p className="field-problem" id={`${id}-upstream`}>
-            {upstreamError}
-          </p>
-        )}
-      </div>
-      <RowField label="优先级" at="3xl" error={refusal?.fields.priority} className="@md:col-start-2 @md:row-start-2 @3xl:col-start-3 @3xl:row-start-1">
-        {(aria) => (
-          <input
-            type="number"
-            step={1}
-            className="text-right tabular-nums"
-            disabled={locked}
-            value={draft.priority}
-            onChange={(e) => onChange({ priority: e.target.value })}
-            {...aria}
-          />
-        )}
-      </RowField>
-      <RowField label="权重" at="3xl" error={refusal?.fields.weight} className="@md:col-start-3 @md:row-start-2 @3xl:col-start-4 @3xl:row-start-1">
-        {(aria) => (
-          <input
-            type="number"
-            step={1}
-            className="text-right tabular-nums"
-            disabled={locked}
-            value={draft.weight}
-            onChange={(e) => onChange({ weight: e.target.value })}
-            {...aria}
-          />
-        )}
-      </RowField>
-      <div className="col-span-2 flex min-h-11 items-center justify-end @md:col-span-1 @md:col-start-3 @md:row-start-1 @3xl:col-start-5">
-        {action}
-      </div>
-      <div className="col-span-full"><CooldownEditor value={draft.cooldown ?? null} disabled={locked} onChange={(cooldown) => onChange({ cooldown })} onValidityChange={(cooldownProblem) => onChange({ cooldownProblem })} error={refusal?.fields.cooldown} /></div>
-      {message !== "" && (
-        <div className="note crit col-span-full m-0" role="alert">
-          {message}
-        </div>
-      )}
-      {children && <div className="col-span-full min-w-0">{children}</div>}
-    </li>
-  );
-}

@@ -26,7 +26,14 @@ export function useTheme(): [Theme, () => void] {
   const [theme, setTheme] = useState<Theme>(stored);
 
   useLayoutEffect(() => {
-    document.documentElement.setAttribute("data-theme", theme);
+    const root = document.documentElement;
+    if (root.getAttribute("data-theme") === theme) return;
+    // 主题前景/背景须同时落地，不能在两套颜色之间插值成低对比度。
+    root.setAttribute("data-theme-changing", "");
+    root.setAttribute("data-theme", theme);
+    // 同步提交受保护的新样式，恢复正常 hover/抽屉过渡后再允许下一次绘制。
+    void root.offsetHeight;
+    root.removeAttribute("data-theme-changing");
   }, [theme]);
 
   const toggle = useCallback(() => {

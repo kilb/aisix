@@ -4,9 +4,11 @@
 
 ## 视觉与主题
 
-用户本轮要求双端建立有层次、有逻辑的运维工作台，个人改密归入账号管理。旧套件是增长分析展示稿；新合同保留其对齐与克制图表，替换暖灰满屏、装饰编号、英文 eyebrow 和默认 inverse 大黑卡。Routio 名称与橙点标识保留。冷中性画布、白面板、钴蓝交互；成功、警告、失败分别使用语义色，并始终附带状态文字或图形。颜色原值集中在 tokens.css，不在业务页面另建主题。
+双端使用 Refined 暖石灰视觉：画布 #ECEAE4、暖白面板 #FBFAF7、嵌套区 #E1DED6、墨色 #121211、次级文字 #64635D。主按钮、链接和焦点使用墨色；#FF5A1F 仅用于当前导航小点、实时点与重点图形，不用于浅底小字。成功、警告、失败仍附状态文字与图形。颜色原值集中在 tokens.css，不在业务页面另建主题。
 
-页面标题26px、手机24px；核心 hero/display/figure 为28px、value24px，指标500字重。正文与导航14px，描述13px，meta/micro最少12px。CardHeader为16px/600，页标题600。中文普通标签使用sans，等宽仅用于机器标识与代码。面板padding20px、手机16px；内容gap16px、区域24px、圆角12px，按钮与输入框圆角8px。控件命中区保持44px。面板用边线分层，只有浮层可轻微投影；没有装饰渐变或入场位移。
+页面标题28px、手机26px；hero36px、display32px、figure/value28px，手机hero32px、其余28px，指标400字重。正文与导航14px，描述13px，meta/micro最少12px。CardHeader为16px/600，页标题500。中文普通标签使用sans，等宽用于机器标识与代码。面板padding20px、手机16px；内容gap16px、区域24px、面板圆角24px，按钮与输入框圆角8px。控件命中区保持44px。面板用细边线分层，不使用投影、装饰渐变或入场位移。
+
+桌面侧栏224px，距离视口左、上、下24px，与主内容间距24px；圆角24px，暖白面板，菜单独立滚动，账号固定在底部。当前项采用淡墨底、墨字与橙点。页头融入画布；宽表只在自身容器滚动。窄屏使用保留焦点合同的抽屉，距离视口16px，内容按原断点重排。
 
 主题默认浅色，不读取系统主题；现有手动开关、两端独立storage key、preload与同源字体加载保持。深色按画布/面板/嵌套区分层，保留同样的颜色语义和AA对比要求。历史 `--muted` / `--accent` 仍是中性填充别名；canonical text-muted是次级文字，accent映射品牌。on-inverse-muted在旧卡片回归普通面板后映射次级文字，避免浅底浅字。
 
@@ -14,7 +16,7 @@
 
 ## 控件行为
 
-**Button**：kind 为 primary（品牌实底主操作）、secondary（默认轮廓）、danger（危险色破坏性第二步实底）或 quiet。两种 size（默认/sm）均至少44×44；sm 只减少横向 padding。block 填满容器；icon 装饰，无文字时须有 aria-label；type 默认为 button。busy 禁用重复提交、保持标签占位，读屏名称 busyLabel 默认“处理中…”。与 busy 共用锁的其它操作使用 disabled。disabledReason 用于屏幕没有解释的禁用原因：按钮保留焦点，以 aria-disabled 阻止点击，tooltip 同时支持 hover/键盘并接入 aria-describedby。焦点为2px+offset2，不用颜色或移动来制造按压效果。
+**Button**：kind 为 primary（墨色实底主操作）、secondary（默认轮廓）、danger（危险色破坏性第二步实底）或 quiet。两种 size（默认/sm）均至少44×44；sm 只减少横向 padding。block 填满容器；icon 装饰，无文字时须有 aria-label；type 默认为 button。busy 禁用重复提交、保持标签占位，读屏名称 busyLabel 默认“处理中…”。与 busy 共用锁的其它操作使用 disabled。disabledReason 用于屏幕没有解释的禁用原因：按钮保留焦点，以 aria-disabled 阻止点击，tooltip 同时支持 hover/键盘并接入 aria-describedby。焦点为2px+offset2，不用颜色或移动来制造按压效果。
 
 **Field**：label、hint、error、wide、children API 不变。children 可为 control 或接收 aria 的函数；有 hint/refusal 必须用函数并 spread。label 包裹控件；hint/error 由 useId 连接 aria-describedby；拒绝控件 aria-invalid 与虚线边框，原因文字在下方，危险色不替代原因说明。field-problem 没有 alert role，随字段读出。提交拒绝时 useRefusalFocus 将焦点移到第一处被拒字段，fieldset 选第一个可聚焦控件；没有字段拒绝则保留焦点，由表单 note.crit role=alert 说明。checkbox/radio 可保持18px视觉，但可点击 label 至少44px。
 
@@ -40,7 +42,7 @@ PageHeader 保留title/description/actions/className/eyebrow/dataLead接口；�
 
 BentoGrid为12列、间距16px；span.d3/d4/d5/d6在tablet为6，其余为12；desktop>=1100采用指定列数，mobile<720全12。Split保留asideWidth兼容参数，桌面7+5，其余纵向。Grid/StatGrid/Stat/Toolbar/DescList接口保留。骨架不生成业务数据，CardMessage重试使用真实回调。
 
-主导航桌面>=1100采用224px侧栏，其余为抽屉。入口按运行/接入/组织账务/平台管理分组；门户按工作空间/使用账务/组织管理分组。权限过滤后空组隐藏。保持tab id、role、label、data-tab、aria-controls、方向键/Home/End/Enter/Space和attention文字。个人账号页打开时，业务导航仍保留一个Tab键入口。抽屉支持Escape、焦点归还，账号入口同样关闭抽屉。
+主导航桌面>=1100采用224px侧栏，其余为抽屉。入口按运行/接入/组织账务/平台管理分组；门户按工作空间/使用账务/组织管理分组。权限过滤后空组隐藏。侧栏使用真实href链接与aria-current=page，保留label、data-tab和attention文字；Tab依次访问链接，方向键/Home/End移动焦点，Enter原生激活。页内tabs仍保留tab id、role、aria-controls与方向键/Home/End/Enter/Space的手动激活合同。个人账号页打开时，业务导航仍可通过Tab访问。抽屉支持Escape、焦点归还，账号入口同样关闭抽屉。
 
 双端个人账号设置使用#account，侧栏身份和顶栏账号按钮均可达。个人登录资料只读，修改口令仅在账号页；登出归入会话区。所有已登录角色都可改自己的口令，门户pending/suspended同样可达。运维账号管理保留admin权限，组织账务保留原权限，billing id不变且显示名为账务账户。原#prices?group深链、邀请优先于已登录页、登录/会话失效/API版本保护保持。
 

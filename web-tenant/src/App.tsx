@@ -90,11 +90,11 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
   // A section opened from the nav writes its own fragment, so the address
   // always names the section shown: a reload reopens it, and a link to the
   // section the address held before is a change again (a 查看价格 followed a
-  // second time). Replaced, not pushed: sections were never history entries.
+  // second time). Navigation entries also support the browser Back action.
   const openSection = useCallback((t: TabId) => {
     setTab(t);
     setPriceGroup(null);
-    window.history.replaceState(null, "", `#${t}`);
+    window.location.hash = `#${t}`;
   }, []);
 
   // The member removed themself, which ended their session on the control
@@ -270,7 +270,7 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
         <section
           key={`${tenant.id}:${member.id}:${member.role}:${tenant.status}`}
           id={`tab-${current}`}
-          role={current === "account" ? "region" : "tabpanel"}
+          role="region"
           aria-labelledby={visible.length > 0 ? `stop-${current}` : undefined}
         >
           {current === "account" ? (
@@ -281,8 +281,8 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
             <Prices initialGroup={priceGroup} />
           ) : current === "members" ? (
             <Members member={member} status={tenant.status} onSelfChanged={() => void boot()} onLeft={leave} />
-          ) : current === "usage" ? (
-            <Usage member={member} />
+          ) : current === "usage" || current === "calls" ? (
+            <Usage member={member} page={current === "calls" ? "calls" : "analysis"} />
           ) : current === "budgets" ? (
             <Budgets member={member} />
           ) : current === "billing" ? (

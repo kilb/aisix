@@ -24,18 +24,18 @@ export function RouteNav<Id extends string>({
   onSelect: (id: Id) => void;
 }) {
   const list = useRef<HTMLOListElement>(null);
-  const tabs = () => [...(list.current?.querySelectorAll<HTMLButtonElement>('[role="tab"]') ?? [])];
+  const tabs = () => [...(list.current?.querySelectorAll<HTMLAnchorElement>("a[href]") ?? [])];
 
   // 当前入口始终在侧栏自己的滚动区域中可见。
   useEffect(() => {
     list.current
-      ?.querySelector<HTMLElement>('[aria-selected="true"]')
+      ?.querySelector<HTMLElement>('[aria-current="page"]')
       ?.scrollIntoView({ block: "nearest", inline: "nearest" });
   }, [current]);
 
   function onKeyDown(e: KeyboardEvent<HTMLOListElement>) {
     const all = tabs();
-    const at = all.indexOf(document.activeElement as HTMLButtonElement);
+    const at = all.indexOf(document.activeElement as HTMLAnchorElement);
     if (at < 0) return;
     const to =
       e.key === "ArrowDown" || e.key === "ArrowRight"
@@ -53,12 +53,10 @@ export function RouteNav<Id extends string>({
   }
 
   return (
-    <nav className="shell-route-nav">
+    <nav className="shell-route-nav" aria-label={label}>
       <ol
         ref={list}
-        role="tablist"
         aria-label={label}
-        aria-orientation="vertical"
         onKeyDown={onKeyDown}
         className="shell-route-list"
       >
@@ -69,25 +67,25 @@ export function RouteNav<Id extends string>({
           return (
             <li key={t.id} role="presentation" className="shell-route-item">
               {t.group && items[index - 1]?.group !== t.group && <div className="shell-route-group">{t.group}</div>}
-              <button
-                type="button"
-                role="tab"
+              <a
+                href={`#${t.id}`}
                 className="shell-route-stop"
                 id={`stop-${t.id}`}
                 data-tab={t.id}
                 data-attention={note ? "" : undefined}
                 aria-label={t.label}
-                aria-selected={selected}
                 aria-current={selected ? "page" : undefined}
-                aria-controls={`tab-${t.id}`}
                 aria-describedby={note ? `attention-${t.id}` : undefined}
-                tabIndex={selected || (index === 0 && !items.some((item) => item.id === current)) ? 0 : -1}
-                onClick={() => onSelect(t.id)}
+                onClick={(event) => {
+                  if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+                  event.preventDefault();
+                  onSelect(t.id);
+                }}
               >
                 {Icon && <Icon className="shell-route-icon" aria-hidden />}
                 <span className="stop-name">{t.label}</span>
                 {note && <span aria-hidden="true" className="cp-attention">!</span>}
-              </button>
+              </a>
             </li>
           );
         })}

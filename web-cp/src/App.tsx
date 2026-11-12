@@ -40,6 +40,12 @@ import {
   Wallet,
   Waypoints,
 } from "lucide-react";
+import { takeChargesFilter } from "./lib/pricingStatus";
+import { adminRouteOf, adminHash, canSeeAdminTab } from "./lib/navigation";
+import { Analytics } from "./tabs/Analytics";
+import { Calls } from "./tabs/Calls";
+import { ModelTests } from "./tabs/ModelTests";
+import { PublicRoutes } from "./tabs/PublicRoutes";
 import { Gate } from "./Gate";
 import { Audit } from "./tabs/Audit";
 import { Cache } from "./tabs/Cache";
@@ -56,14 +62,18 @@ import { Tenants } from "./tabs/Tenants";
 
 const TABS = [
   { id: "overview", label: "概览", icon: LayoutDashboard, group: "运行" },
-  { id: "gateways", label: "网关", icon: Server, group: "运行" },
+  { id: "analytics", label: "用量分析", icon: LayoutDashboard, group: "运行" },
+  { id: "calls", label: "调用记录", icon: ScrollText, group: "运行" },
   { id: "providers", label: "上游账号", icon: Plug, group: "接入" },
-  { id: "models", label: "模型与路由", icon: Waypoints, group: "接入" },
+  { id: "models", label: "模型目录", icon: Waypoints, group: "接入" },
+  { id: "public-routes", label: "公共模型与路由", icon: Waypoints, group: "接入" },
+  { id: "model-tests", label: "模型测试", icon: Plug, group: "接入" },
   { id: "cache", label: "缓存策略", icon: DatabaseZap, group: "接入" },
   { id: "tenants", label: "租户", icon: Building2, group: "组织与账务" },
   { id: "pricing", label: "价格", icon: Tag, group: "组织与账务" },
   { id: "billing", label: "计费", icon: Wallet, group: "组织与账务" },
   { id: "keys", label: "密钥", icon: KeyRound, group: "组织与账务" },
+  { id: "gateways", label: "网关", icon: Server, group: "平台管理" },
   { id: "resources", label: "全部资源", icon: Braces, group: "平台管理" },
   { id: "operators", label: "运维账号", icon: ShieldUser, group: "平台管理", adminOnly: true },
   { id: "audit", label: "审计日志", icon: ScrollText, group: "平台管理" },
@@ -200,6 +210,14 @@ function NotBuilt({ label }: { label: string }) {
 /** The page of `tab`. Each tab's task replaces its own case. */
 function Page({ tab, ...props }: TabProps & { tab: TabId }) {
   switch (tab) {
+    case "analytics":
+      return <Analytics {...props} />;
+    case "calls":
+      return <Calls {...props} />;
+    case "public-routes":
+      return <PublicRoutes {...props} />;
+    case "model-tests":
+      return <ModelTests {...props} />;
     case "overview":
       return <Overview {...props} />;
     case "gateways":
@@ -242,10 +260,19 @@ export function App() {
   // must still switch, and the name alone would not change.
   const [sectionVisit, setSectionVisit] = useState(0);
   const setTab = useCallback((t: TabId, s?: string) => {
-    setTabOnly(t);
-    setSection(s);
+    const route = adminRouteOf(adminHash(t, s));
+    const handed = route.tab === "calls" ? takeChargesFilter() : null;
+    if (handed) {
+      for (const [key, value] of Object.entries(handed)) {
+        if (value !== undefined) route.query.set(key, String(value));
+      }
+    }
+    const search = route.query.toString();
+    const hash = `#${route.tab}${search ? `?${search}` : ""}`;
+    setTabOnly(route.tab);
+    setSection(route.query.get("section") ?? undefined);
     if (s !== undefined) setSectionVisit((n) => n + 1);
-    window.history.replaceState(null, "", `#${t}${s ? `?section=${encodeURIComponent(s)}` : ""}`);
+    window.location.hash = hash;
   }, []);
   const [sessionEnded, setSessionEnded] = useState(false);
   const [theme, toggleTheme] = useTheme();
@@ -254,10 +281,9 @@ export function App() {
   // 个人账号和原业务入口均可重载；不将 hash 当作权限来源。
   useEffect(() => {
     const apply = () => {
-      const [name, query = ""] = window.location.hash.replace(/^#/, "").split("?", 2);
-      const target = TABS.find((item) => item.id === name)?.id ?? "overview";
-      setTabOnly(target);
-      setSection(new URLSearchParams(query).get("section") ?? undefined);
+      const route = adminRouteOf(window.location.hash);
+      setTabOnly(route.tab);
+      setSection(route.query.get("section") ?? undefined);
     };
     apply();
     window.addEventListener("hashchange", apply);
@@ -327,7 +353,7 @@ export function App() {
     setOperator(null);
   }, []);
 
-  const visible = TABS.filter((t) => !("adminOnly" in t) || operator?.role === "admin");
+  const visible = TABS.filter((t) => canSeeAdminTab(t.id, operator?.role ?? ""));
   const current: TabId = visible.some((t) => t.id === tab) ? tab : "overview";
 
   // 切换页面先回到标题；同页筛选、轮询和表单更新保留阅读位置。
@@ -472,7 +498,7 @@ export function App() {
       <div className="workspace shell-content">
         {signOutError && <div className="note crit" role="alert">{signOutError}</div>}
         <main>
-          <section id={`tab-${current}`} role={current === "account" ? "region" : "tabpanel"} aria-labelledby={`stop-${current}`}>
+          <section id={`tab-${current}`} role="region" aria-labelledby={`stop-${current}`}>
             {current === "account" ? <AccountSettings operator={operator} roleLabel={ROLE_LABEL[operator.role]} onSignOut={() => void signOut()} /> : <Page
               tab={current}
               operator={operator}

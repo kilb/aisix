@@ -41,7 +41,7 @@ export function RouteNav<Id extends string>({
     const nav = bar.current;
     if (!nav) return;
     if (docked) {
-      nav.querySelector<HTMLElement>('[aria-selected="true"]')?.scrollIntoView({ block: "nearest", inline: "nearest" });
+      nav.querySelector<HTMLElement>('[aria-current="page"]')?.scrollIntoView({ block: "nearest", inline: "nearest" });
       return;
     }
     const mark = lens.current;
@@ -69,7 +69,7 @@ export function RouteNav<Id extends string>({
   }, [current, items, docked]);
 
   function onKeyDown(e: KeyboardEvent<HTMLElement>) {
-    const tabs = [...e.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]')];
+    const tabs = [...e.currentTarget.querySelectorAll<HTMLElement>(docked ? 'a[href]' : '[role="tab"]')];
     const at = tabs.findIndex((t) => t === document.activeElement);
     if (at < 0) return;
     const last = tabs.length - 1;
@@ -86,25 +86,25 @@ export function RouteNav<Id extends string>({
 
   if (docked) {
     return (
-      <nav ref={bar} className={cn("shell-route-nav", className)} role="tablist" aria-label={label} aria-orientation="vertical" onKeyDown={onKeyDown}>
+      <nav ref={bar} className={cn("shell-route-nav", className)} aria-label={label} onKeyDown={onKeyDown}>
         <ol className="shell-route-list" role="presentation">
           {items.map((t, index) => (
             <li key={t.id} className="shell-route-item" role="presentation">
               {t.group && items[index - 1]?.group !== t.group && <div className="shell-route-group">{t.group}</div>}
-              <button
-                type="button"
-                role="tab"
+              <a
+                href={`#${t.id}`}
                 className="shell-route-stop"
                 id={`stop-${t.id}`}
                 data-tab={t.id}
-                aria-selected={t.id === current}
                 aria-current={t.id === current ? "page" : undefined}
-                aria-controls={`tab-${t.id}`}
-                tabIndex={t.id === current || (index === 0 && !items.some((item) => item.id === current)) ? 0 : -1}
-                onClick={() => onSelect(t.id)}
+                onClick={(event) => {
+                  if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+                  event.preventDefault();
+                  onSelect(t.id);
+                }}
               >
                 <span className="stop-name">{t.label}</span>
-              </button>
+              </a>
             </li>
           ))}
         </ol>

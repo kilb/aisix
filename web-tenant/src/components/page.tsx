@@ -16,7 +16,7 @@ export function PageHeader({
   return (
     <header className={cn("page-header bento-page-header", className)}>
       <div className="min-w-0">
-        <h1 className="text-title font-semibold">{title}</h1>
+        <h1 className="text-title font-medium">{title}</h1>
         {(dataLead ?? description) != null && (
           <div className="bento-lead mt-2 text-lead font-normal text-ink-soft">{dataLead ?? description}</div>
         )}
@@ -79,7 +79,7 @@ const metricSize = { hero: "text-hero", display: "text-display", figure: "text-f
 
 /** 不解析或缩写金额；调用方传入精确 formatter 的结果。 */
 export function Metric({ children, size = "value", className }: { children: ReactNode; size?: MetricSize; className?: string }) {
-  return <div className={cn("metric font-medium tabular-nums", metricSize[size], className)}>{children}</div>;
+  return <div className={cn("metric font-normal tabular-nums", metricSize[size], className)}>{children}</div>;
 }
 
 export function MetricSkeleton({ className, ...props }: ComponentProps<"div">) {

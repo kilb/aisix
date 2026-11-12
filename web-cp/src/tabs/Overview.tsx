@@ -3,7 +3,6 @@ import type { TabId, TabProps } from "../App";
 import { Msg, type Note } from "../components/Msg";
 import { environment, pricingStatus, rollout, type Environment, type PricingStatus, type RolloutSummary } from "../lib/api";
 import { errorText, fmtInt } from "../lib/fmt";
-import { fmtBeijing } from "../lib/time";
 import { statusView } from "../lib/pricingStatus";
 import { Button } from "../ui/Button";
 import { BentoGrid, Card, CardFooter, CardHeader, CardMessage, Metric, MetricSkeleton, PageHeader, span } from "../components/page";
@@ -158,7 +157,6 @@ export function Overview({ operator, onGoto }: TabProps) {
           <div className="mb-5 flex flex-wrap items-end justify-between gap-4">
             <div className="min-w-0">
               <p className="text-caption font-medium text-muted">API 请求统计</p>
-              <p className="mt-2 break-all text-micro tabular-nums text-muted">{fmtBeijing(metrics.from)} — {fmtBeijing(metrics.to)}</p>
             </div>
             <div className="flex max-w-full flex-wrap items-end gap-3">
               <label className="f filter m-0">

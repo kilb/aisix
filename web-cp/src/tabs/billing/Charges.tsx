@@ -7,7 +7,7 @@ import { chargeReason } from "../../lib/chargeReason";
 import { errorText } from "../../lib/fmt";
 import { fmtMicroCny } from "../../lib/money";
 import { fmtBeijing } from "../../lib/time";
-import { modelText, reasonLabel, takeChargesFilter } from "../../lib/pricingStatus";
+import { modelText, reasonLabel } from "../../lib/pricingStatus";
 import { chargeFromLines, dimensionLabel, lineUsd, rateText, reportedCounters, usageSummary } from "../../lib/chargeUsage";
 import { usdRateText } from "../../lib/rateUnits";
 import { Button } from "../../ui/Button";
@@ -15,6 +15,9 @@ import { DataTable, Loading } from "../../ui/DataTable";
 import { EmptyState } from "../../ui/EmptyState";
 import { BentoGrid, Card, CardHeader, PageHeader, span } from "../../components/page";
 import { formatCount } from "../../lib/chartFormat";
+import { useHashQuery } from "../../lib/useHashQuery";
+import { currentQueryResult, type QueryResult } from "../../lib/queryResult";
+import { chargesQuery } from "../../lib/analysisNavigation";
 import { cn } from "../../lib/cn";
 
 const STATUSES: [string, string][] = [
@@ -39,11 +42,19 @@ const statusLabel = (s: string) => STATUSES.find(([v]) => v === s)?.[1] ?? s;
  * says it is wider and its rows need not add up to that row's count.
  */
 export function Charges(_props: TabProps) {
-  const [filter, setFilter] = useState<ChargeFilter>(() => takeChargesFilter() ?? {});
-  const [eventDraft, setEventDraft] = useState("");
-  const [rows, setRows] = useState<Charge[] | null>(null);
-  const [next, setNext] = useState<number | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [query, update] = useHashQuery();
+  const queryKey = query.toString();
+  const filter: ChargeFilter = chargesQuery(query);
+  const filterKey = JSON.stringify(filter);
+  const [eventDraft, setEventDraft] = useState(() => query.get("event_id") ?? "");
+  useEffect(() => setEventDraft(query.get("event_id") ?? ""), [queryKey]);
+  const [result, setResult] = useState<QueryResult<Charge> | null>(null);
+  const shown = currentQueryResult(result, filterKey);
+  const rows = shown?.rows ?? null;
+  const next = shown?.next ?? null;
+  const error = shown?.error ?? null;
+  const activeKey = useRef(filterKey);
+  activeKey.current = filterKey;
   const [loadingMore, setLoadingMore] = useState(false);
   const [tenants, setTenants] = useState<Tenant[]>([]);
   const [keys, setKeys] = useState<AdminKey[]>([]);
@@ -54,26 +65,25 @@ export function Charges(_props: TabProps) {
 
   const loadFirst = useCallback(async (f: ChargeFilter) => {
     const g = ++generation.current;
-    setRows(null);
-    setError(null);
+    const requestedKey = JSON.stringify(f);
+    setResult({ key: requestedKey, rows: null, next: null, error: null });
     // A new first page has no cursor yet: the one on screen belongs to the
     // filter it was read for, so a 加载更多 clicked while this loads would
     // otherwise ask for this filter with the previous filter's cursor.
-    setNext(null);
     setLoadingMore(false);
     try {
       const page = await charges.list({ ...f, limit: 50 });
-      if (g !== generation.current) return;
-      setRows(page.items);
-      setNext(page.next_before);
+      if (g !== generation.current || activeKey.current !== requestedKey) return;
+      setResult({ key: requestedKey, rows: page.items, next: page.next_before, error: null });
     } catch (e) {
-      if (g === generation.current) setError(errorText(e));
+      if (g === generation.current && activeKey.current === requestedKey) setResult({ key: requestedKey, rows: null, next: null, error: errorText(e) });
     }
   }, []);
 
   useEffect(() => {
     void loadFirst(filter);
-  }, [filter, loadFirst]);
+    return () => { generation.current += 1; };
+  }, [filterKey, loadFirst]);
 
   useEffect(() => {
     tenantsApi.list().then(setTenants, () => undefined);
@@ -93,17 +103,17 @@ export function Charges(_props: TabProps) {
   async function loadMore() {
     // A continuation extends the page on screen; without one (its filter is
     // still loading, or it failed) there is nothing to extend.
-    if (next === null || rows === null || loadingMore) return;
+    if (!shown || next === null || rows === null || loadingMore) return;
+    const requestedKey = filterKey;
     const g = generation.current;
     setLoadingMore(true);
-    setError(null);
+    setResult(current => current?.key === requestedKey ? { ...current, error: null } : current);
     try {
       const page = await charges.list({ ...filter, before: next, limit: 50 });
-      if (g !== generation.current) return;
-      setRows((prev) => [...(prev ?? []), ...page.items]);
-      setNext(page.next_before);
+      if (g !== generation.current || activeKey.current !== requestedKey) return;
+      setResult(current => current?.key === requestedKey ? { ...current, rows: [...(current.rows ?? []), ...page.items], next: page.next_before, error: null } : current);
     } catch (e) {
-      if (g === generation.current) setError(errorText(e));
+      if (g === generation.current && activeKey.current === requestedKey) setResult(current => current?.key === requestedKey ? { ...current, error: errorText(e) } : current);
     } finally {
       // Only this generation's own continuation ends: one that a filter
       // change has already superseded must not unlock the new one.
@@ -111,7 +121,7 @@ export function Charges(_props: TabProps) {
     }
   }
 
-  const set = (patch: ChargeFilter) => setFilter((f) => ({ ...f, ...patch }));
+  const set = (patch: ChargeFilter) => update(patch as Record<string, string | undefined>);
   const tenantName = (id: string) => tenants.find((t) => t.id === id)?.name ?? id;
   // The model and reason a link from 计价状态 set: the form has no field for them, so they are shown here.
   const linked = [
@@ -122,9 +132,9 @@ export function Charges(_props: TabProps) {
   return (
     <>
       <PageHeader
-        title="计费明细"
-        eyebrow="计费 / 调用记录"
-        dataLead="失败但已产生用量的调用，仍按实际用量计费；没有用量的调用不收费。"
+        title="调用记录"
+        eyebrow="CALLS · 计费尝试"
+        dataLead="按计费尝试逐条展示，同一请求可能有多条记录。失败但已产生用量的调用仍按实际用量计费。"
         description={
           <>
             每一次调用的计价结果，最新的在前。售价和成本都以人民币计：成本是这次调用按上游账号的成本换算率算出的平台成本，未知时显示 —。
@@ -137,6 +147,7 @@ export function Charges(_props: TabProps) {
           </Button>
         }
       />
+      {(query.has("from") || query.has("to") || query.has("member_id")) && <p className="note warn" role="status">调用记录接口不支持按时间或成员筛选；此处保留模型、组织和密钥筛选，记录范围比分析页更宽，不应用其时间或成员条件。</p>}
       <BentoGrid>
       <Card className={span.d12}>
         <CardHeader
@@ -173,6 +184,7 @@ export function Charges(_props: TabProps) {
               onChange={(e) => set({ tenant_id: e.target.value || undefined, api_key_id: undefined })}
             >
               <option value="">全部</option>
+              {filter.tenant_id && !tenants.some((tenant) => tenant.id === filter.tenant_id) && <option value={filter.tenant_id}>已选租户（{filter.tenant_id}，当前列表未提供）</option>}
               {tenants.map((t) => (
                 <option key={t.id} value={t.id}>
                   {t.name}
@@ -184,10 +196,11 @@ export function Charges(_props: TabProps) {
             <span>密钥</span>
             <select
               value={filter.api_key_id ?? ""}
-              disabled={!filter.tenant_id}
+              disabled={!filter.tenant_id && !filter.api_key_id}
               onChange={(e) => set({ api_key_id: e.target.value || undefined })}
             >
               <option value="">全部</option>
+              {filter.api_key_id && !keys.some((key) => key.id === filter.api_key_id) && <option value={filter.api_key_id}>已选密钥（{filter.api_key_id}，当前列表未提供）</option>}
               {keys.map((k) => (
                 <option key={k.id} value={k.id}>
                   {k.label} · {k.prefix}
