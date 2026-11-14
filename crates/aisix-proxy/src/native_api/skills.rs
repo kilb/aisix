@@ -1535,6 +1535,83 @@ pub(crate) async fn validate_anthropic_skill_references(
         .map(|_| ())
 }
 
+/// 只读取官方容器引用槽；未知字段里的同名字符串不授予消费意图。
+pub(crate) fn message_reference_ids(body: &Value) -> BTreeSet<(&'static str, String)> {
+    let mut ids = BTreeSet::new();
+    if let Some(id) = body.get("container").and_then(|container| {
+        container
+            .as_str()
+            .or_else(|| container.get("id").and_then(Value::as_str))
+    }) {
+        ids.insert(("container", id.to_owned()));
+    }
+    if let Some(skills) = body.pointer("/container/skills").and_then(Value::as_array) {
+        for id in skills
+            .iter()
+            .filter_map(|skill| skill.get("skill_id").and_then(Value::as_str))
+        {
+            ids.insert(("skill", id.to_owned()));
+        }
+    }
+    ids
+}
+
+/// 提供商覆盖可以调整普通容器配置，不能引入调用人未在官方槽中声明的对象。
+pub(crate) fn validate_message_reference_overrides(
+    canonical: &BTreeSet<(&'static str, String)>,
+    outbound: &Value,
+) -> Result<(), ProxyError> {
+    if message_reference_ids(outbound).is_subset(canonical) {
+        return Ok(());
+    }
+    Err(ProxyError::Bridge(
+        aisix_gateway::BridgeError::InvalidUpstreamConfig(
+            "request overrides cannot introduce native object references".into(),
+        ),
+    ))
+}
+
+/// 缓存命中没有选中的目标；有潜在引用注入的配置走正常派发及逐目标拒绝。
+pub(crate) fn messages_overrides_allow_cache(
+    snapshot: &AisixSnapshot,
+    model: &aisix_core::Model,
+    body: &Value,
+) -> bool {
+    let canonical = message_reference_ids(body);
+    let safe = |model: &aisix_core::Model| {
+        let Ok(key) = crate::dispatch::resolve_provider_key(snapshot, model) else {
+            return true;
+        };
+        let Some(request) = key.value.request.as_ref().filter(|request| {
+            request
+                .param_renames
+                .iter()
+                .any(|(from, to)| from == "container" || to == "container")
+                || request.default_body_fields.contains_key("container")
+        }) else {
+            return true;
+        };
+        let mut outbound = body.clone();
+        aisix_provider_openai::overrides::apply_param_renames(
+            &mut outbound,
+            &request.param_renames,
+        );
+        aisix_provider_openai::overrides::apply_default_body_fields(
+            &mut outbound,
+            &request.default_body_fields,
+        );
+        validate_message_reference_overrides(&canonical, &outbound).is_ok()
+    };
+    match model.routing.as_ref() {
+        Some(routing) => routing
+            .targets
+            .iter()
+            .filter_map(|target| snapshot.models.get_by_name(&target.model_ref(snapshot)))
+            .all(|entry| safe(&entry.value)),
+        None => safe(model),
+    }
+}
+
 /// 结果中的容器 ID 必须在离开网关前绑定；stream 的最终 message_delta 同样经过这里。
 pub(crate) struct MessageContainerAdmission {
     registration: anthropic::Registration,
