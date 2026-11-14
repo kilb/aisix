@@ -29,6 +29,7 @@ struct Registry {
     records: Mutex<HashMap<String, (Uuid, NativeRecord)>>,
     fail_bind_for: Mutex<HashSet<String>>,
     lookup_error: Mutex<Option<NativeRegistryError>>,
+    deny_lookup_after_bind: Mutex<HashSet<String>>,
     completed: Mutex<Vec<CompleteRequest>>,
     postponed: Mutex<Vec<LeaseRequest>>,
     typed_completed: Mutex<Vec<TypedCompleteRequest>>,
@@ -279,6 +280,14 @@ impl NativeObjectRegistry for Registry {
                 record.raw_id.clone(),
                 (operation.api_key_id, record.clone()),
             );
+            if self
+                .deny_lookup_after_bind
+                .lock()
+                .unwrap()
+                .contains(&record.raw_id)
+            {
+                *self.lookup_error.lock().unwrap() = Some(NativeRegistryError::NotFound);
+            }
             let mut reply = NativeReply::new("bound");
             reply.record = Some(record);
             Ok(reply)
@@ -1032,5 +1041,56 @@ async fn accepted_run_bind_failure_records_uncertainty_without_repeating_or_rele
         upstream.received_requests().await.unwrap().len(),
         2,
         "a post-accept authority failure must not resubmit inference"
+    );
+}
+
+#[tokio::test]
+async fn accepted_run_is_persisted_but_not_released_after_current_authority_is_withdrawn() {
+    let upstream = MockServer::start().await;
+    let registry = Arc::new(Registry::default());
+    let state = test_state(&upstream.uri(), registry.clone());
+    mount(
+        &upstream,
+        "POST",
+        "/v1/evals",
+        json!({"id":"eval_owned","object":"eval"}),
+    )
+    .await;
+    create_eval(&state).await;
+    registry
+        .deny_lookup_after_bind
+        .lock()
+        .unwrap()
+        .insert("run_accepted".to_string());
+    mount(
+        &upstream,
+        "POST",
+        "/v1/evals/eval_owned/runs",
+        json!({"id":"run_accepted","eval_id":"eval_owned","object":"eval.run","status":"queued"}),
+    )
+    .await;
+    let response = call(
+        &state,
+        "POST",
+        "/v1/evals/eval_owned/runs",
+        "caller",
+        Some(run_body()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert!(!String::from_utf8_lossy(&bytes).contains("run_accepted"));
+    assert!(
+        registry
+            .records
+            .lock()
+            .unwrap()
+            .contains_key("run_accepted"),
+        "withdrawing current authority must retain the accepted run for observation"
+    );
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 2);
+    assert!(
+        registry.reconciliations.lock().unwrap().is_empty(),
+        "a successfully bound run already has its durable observer identity"
     );
 }
