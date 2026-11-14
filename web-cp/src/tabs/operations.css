@@ -91,4 +91,4 @@
 .cp-operations .ops-editor .tn-checks.tn-groups { grid-template-columns: minmax(0, 1fr); }
 
 /* 账号名保持可读换行，不让模型区标题标签撑破编辑器。 */
-.cp-providers .ch-section .bento-card-header .tag { min-width: 0; max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
+.cp-providers .ch-section .bento-card-header :is(h2, h3) .tag { min-width: 0; max-width: 100%; height: auto; min-height: 20px; line-height: 18px; white-space: normal; overflow-wrap: anywhere; }
