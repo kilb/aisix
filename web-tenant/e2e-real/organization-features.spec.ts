@@ -135,7 +135,10 @@ test("完整组织价格含十一维、档位、长上下文和优惠，复制�
   const copiedRecord = await recorded(world.api, copiedCall.requestId);
   expect(copiedRecord.status).toBe("succeeded");
   expect(copiedRecord.model.name).toBe(copiedName);
-  await row.getByRole("button", { name: "查看全部价格", exact: true }).click();
+  await row.getByRole("button", { name: `查看 ${model.name} 的价格详情`, exact: true }).click();
+  const detail = page.getByRole("dialog", { name: model.name, exact: true });
+  await expect(detail.getByRole("group", { name: "详情价格分组", exact: true }).getByRole("button", { name: "Base USD", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await detail.getByRole("group", { name: "详情价格分组", exact: true }).locator('button[data-price-scope]:not([data-price-scope=""])').first().click();
   for (const dimension of ["输入", "输出", "缓存读", "缓存写", "1 小时缓存写", "推理", "音频输入", "音频输出", "图像输入", "图像输出", "联网搜索"]) {
     await expect(page.getByRole("rowheader", { name: dimension, exact: true }).first()).toBeVisible();
   }

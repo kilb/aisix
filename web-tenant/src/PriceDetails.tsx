@@ -1,6 +1,6 @@
 import { useId } from "react";
 import { fmtCnyPerMillion, perThousandOfPerMillion } from "./lib/money";
-import { dimensionLabels, type Dimension, type PriceRate, type TierQuote } from "./lib/priceQuote";
+import { dimensionLabels, type Dimension, type DisplayPriceRate, type TierQuote } from "./lib/priceQuote";
 
 const RATE_GROUPS: { label: string; dimensions: readonly Dimension[] }[] = [
   { label: "文本与推理", dimensions: ["input", "output", "reasoning"] },
@@ -10,11 +10,14 @@ const RATE_GROUPS: { label: string; dimensions: readonly Dimension[] }[] = [
   { label: "联网", dimensions: ["web_search"] },
 ];
 
-export function PriceRateValue({ rate }: { rate: PriceRate | undefined }) {
-  if (rate?.price_cny_per_million == null) return <span className="hint price-rate-unknown">未提供价格</span>;
-  const amount = rate.unit === "request" ? perThousandOfPerMillion(rate.price_cny_per_million) : rate.price_cny_per_million;
+export function PriceRateValue({ rate, currency = "CNY" }: { rate: DisplayPriceRate | undefined; currency?: "CNY" | "USD" }) {
+  const value = rate === undefined ? null : currency === "USD"
+    ? "price_usd_per_million" in rate ? rate.price_usd_per_million : null
+    : "price_cny_per_million" in rate ? rate.price_cny_per_million : null;
+  if (value == null || rate === undefined) return <span className="hint price-rate-unknown">未提供价格</span>;
+  const amount = rate.unit === "request" ? perThousandOfPerMillion(value) : value;
   return <>
-    <span className="price-rate-amount">{fmtCnyPerMillion(amount)}</span>
+    <span className="price-rate-amount">{currency === "USD" ? `$${fmtCnyPerMillion(amount).slice(1)}` : fmtCnyPerMillion(amount)}</span>
     {rate.fallback_from !== undefined && <span className="hint cell-note price-rate-rule">按{dimensionLabels[rate.fallback_from]}价计费</span>}
   </>;
 }
@@ -23,7 +26,7 @@ interface PriceColumn {
   label: string;
   above?: number;
   through?: number;
-  rates: PriceRate[];
+  rates: DisplayPriceRate[];
 }
 
 function PriceBandLabel({ column }: { column: PriceColumn }) {
@@ -38,7 +41,7 @@ function PriceBandLabel({ column }: { column: PriceColumn }) {
   </>;
 }
 
-function TierPrices({ name, tier }: { name: string; tier: TierQuote }) {
+function TierPrices({ name, tier, currency }: { name: string; tier: TierQuote<DisplayPriceRate>; currency: "CNY" | "USD" }) {
   const heading = useId();
   const columns: PriceColumn[] = [
     { label: "基础价", through: tier.long_context[0]?.above_input_tokens, rates: tier.base },
@@ -53,7 +56,7 @@ function TierPrices({ name, tier }: { name: string; tier: TierQuote }) {
   return <section className="price-tier" aria-labelledby={heading}>
     <header className="price-tier-header">
       <h4 id={heading} className="text-stat font-medium">{tierName}</h4>
-      <p className="text-caption text-muted">组织实际单价（已含优惠）</p>
+      <p className="text-caption text-muted">{currency === "USD" ? "美元基准单价" : "组织实际单价（已含优惠）"}</p>
     </header>
     <div className="price-matrix-scroll" role="region" aria-label={`${tierName}档完整模型单价`}>
       <table className="price-matrix" role="table" aria-label="完整模型单价">
@@ -75,10 +78,10 @@ function TierPrices({ name, tier }: { name: string; tier: TierQuote }) {
             const unit = rates.find((rate) => rate !== undefined)?.unit ?? (dimension === "web_search" ? "request" : "token");
             return <tr key={dimension}>
               <th scope="row" className="price-item">{dimensionLabels[dimension]}</th>
-              <td className="price-unit">{unit === "request" ? "元/千次" : "元/百万 token"}</td>
+              <td className="price-unit">{unit === "request" ? currency === "USD" ? "美元/千次" : "元/千次" : currency === "USD" ? "美元/百万 token" : "元/百万 token"}</td>
               {rates.map((rate, index) => <td key={index} className="price-amount" data-band={columns[index]!.label} data-range={columns[index]!.above === undefined
                 ? columns[index]!.through === undefined ? "全部输入长度" : `输入 ≤ ${columns[index]!.through!.toLocaleString("en-US")} token`
-                : `输入 > ${columns[index]!.above!.toLocaleString("en-US")} token${columns[index]!.through === undefined ? "" : `，且 ≤ ${columns[index]!.through!.toLocaleString("en-US")} token`}`}><PriceRateValue rate={rate} /></td>)}
+                : `输入 > ${columns[index]!.above!.toLocaleString("en-US")} token${columns[index]!.through === undefined ? "" : `，且 ≤ ${columns[index]!.through!.toLocaleString("en-US")} token`}`}><PriceRateValue rate={rate} currency={currency} /></td>)}
             </tr>;
           })}
         </tbody>)}
@@ -87,10 +90,10 @@ function TierPrices({ name, tier }: { name: string; tier: TierQuote }) {
   </section>;
 }
 
-export function PriceDetails({ tiers }: { tiers: Record<string, TierQuote> }) {
+export function PriceDetails({ tiers, currency = "CNY" }: { tiers: Record<string, TierQuote<DisplayPriceRate>>; currency?: "CNY" | "USD" }) {
   return <div className="price-details">
     <p className="text-caption text-muted">长上下文按包含缓存、音频和图像的整个输入 token 数选择价格列，整次请求使用本段价格。回退价格仅说明计费规则，不代表模型支持该模态。窄屏按计费项目逐项显示各上下文段的价格。</p>
     {Object.entries(tiers).sort(([a], [b]) => a === "default" ? -1 : b === "default" ? 1 : a.localeCompare(b))
-      .map(([name, tier]) => <TierPrices key={name} name={name} tier={tier} />)}
+      .map(([name, tier]) => <TierPrices key={name} name={name} tier={tier} currency={currency} />)}
   </div>;
 }

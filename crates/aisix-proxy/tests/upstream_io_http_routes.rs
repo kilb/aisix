@@ -3,7 +3,7 @@
 use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::{AisixSnapshot, ApiKey, Model, ProviderKey, ProxyConfig, ResourceEntry};
 use aisix_gateway::Hub;
-use aisix_obs::{UsageEvent, UsageSink};
+use aisix_obs::{UsageEvent, UsageIoAuditUpdate, UsageSink};
 use aisix_proxy::{build_router, ProxyState};
 use axum::body::{to_bytes, Body};
 use axum::extract::ConnectInfo;
@@ -36,7 +36,14 @@ impl Case {
     }
 }
 
-fn app(base: &str, provider: &str) -> TestResult<(axum::Router, Receiver<UsageEvent>)> {
+fn app(
+    base: &str,
+    provider: &str,
+) -> TestResult<(
+    axum::Router,
+    Receiver<UsageEvent>,
+    Receiver<UsageIoAuditUpdate>,
+)> {
     let snapshot = AisixSnapshot::new();
     let key: ProviderKey = serde_json::from_value(json!({
         "display_name":"component upstream", "api_key":"component-upstream-key",
@@ -81,10 +88,11 @@ fn app(base: &str, provider: &str) -> TestResult<(axum::Router, Receiver<UsageEv
     );
     let snapshot = SnapshotHandle::new(snapshot);
     let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let (io_tx, io_rx) = tokio::sync::mpsc::channel(16);
     let state = ProxyState::new(snapshot, hub, &config)
         .without_cache()
-        .with_usage_sink(UsageSink::new(tx));
-    Ok((build_router(state), rx))
+        .with_usage_sink(UsageSink::new(tx).with_io_audit_sender(io_tx));
+    Ok((build_router(state), rx, io_rx))
 }
 
 fn json_case(route: &'static str, provider: &'static str, request: Value, response: Value) -> Case {
@@ -162,7 +170,7 @@ async fn check(case: Case) -> TestResult {
         .expect(1)
         .mount(&upstream)
         .await;
-    let (router, mut events) = app(&upstream.uri(), case.provider)?;
+    let (router, mut events, mut io_updates) = app(&upstream.uri(), case.provider)?;
     let request = Request::builder()
         .method("POST")
         .uri(case.route)
@@ -223,6 +231,11 @@ async fn check(case: Case) -> TestResult {
     assert!(
         events.try_recv().is_err(),
         "{} duplicated usage",
+        case.route
+    );
+    assert!(
+        io_updates.try_recv().is_err(),
+        "{} must carry upstream bytes on the original token event, without a separate amendment",
         case.route
     );
     Ok(())

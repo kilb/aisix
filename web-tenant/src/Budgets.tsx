@@ -19,6 +19,7 @@ import { formulaBalance } from "./lib/formulaApi";
 import { formMessageFor, messageFor } from "./lib/errors";
 import { isCnyAmount, microCnyToInput } from "./lib/money";
 import { Money } from "./ui/BalanceReadout";
+import { FormDialog } from "./ui/FormDialog";
 import { Button } from "./ui/Button";
 import { DataTable, Loading } from "./ui/DataTable";
 import { EmptyState } from "./ui/EmptyState";
@@ -167,6 +168,8 @@ export function Budgets({ member }: { member: SessionMember }) {
   const [visibleKeys, setVisibleKeys] = useState<string[]>([]);
   const [visibleBudgetKeys, setVisibleBudgetKeys] = useState<string[]>([]);
   const [formKey, setFormKey] = useState("");
+  const [createOpen, setCreateOpen] = useState(false);
+  const [createBusy, setCreateBusy] = useState(false);
   const quotaIds = [...new Set([...visibleKeys, ...visibleBudgetKeys, ...(formKey ? [formKey] : [])])].sort().join("/");
   const [reloading, setReloading] = useState(true);
   const reload = useCallback(() => setTick((n) => n + 1), []);
@@ -249,7 +252,7 @@ export function Budgets({ member }: { member: SessionMember }) {
 
   return (
     <>
-      <PageHeader title="预算" eyebrow="BUDGETS · 分级额度" dataLead="账户额度与组织、成员、密钥预算独立生效。多条限制同时存在时，以先用尽者为准。周期按 UTC 边界结算，时间显示采用 UTC+8。" />
+      <PageHeader actions={creator && !rowsErr && <Button kind="primary" icon="plus" onClick={() => setCreateOpen(true)}>新建额度</Button>} title="预算" eyebrow="BUDGETS · 分级额度" dataLead="账户额度与组织、成员、密钥预算独立生效。多条限制同时存在时，以先用尽者为准。周期按 UTC 边界结算，时间显示采用 UTC+8。" />
       <BentoGrid className="tenant-budgets">
         {rowsErr && <div className={cn(span.d12, "note crit")} role="alert">预算读取失败：{rowsErr}</div>}
         {financial && <>
@@ -272,7 +275,7 @@ export function Budgets({ member }: { member: SessionMember }) {
             empty={manager ? "还没有成员额度，可在「新建额度」中新建" : role === "billing" ? "还没有成员额度" : "还没有给你设置成员额度"}
             role={role} parentsOf={() => team.map(termsOf)} onChanged={reload} />}
         </Section>
-        {creator && !rowsErr && <CreateForm number={financial ? 4 : 2} role={role} keys={keys} people={people} team={team} quotas={quotas} onTargetKey={setFormKey} onCreated={reload} />}
+        {creator && !rowsErr && <FormDialog open={createOpen} onOpenChange={setCreateOpen} busy={createBusy} title="新建额度" description="为成员或密钥设置预算上限；组织、账户和已有额度仍然独立生效。"><CreateForm number={financial ? 4 : 2} role={role} keys={keys} people={people} team={team} quotas={quotas} onTargetKey={setFormKey} onBusyChange={setCreateBusy} onCreated={() => { setCreateOpen(false); reload(); }} /></FormDialog>}
         <Section number={financial ? creator && !rowsErr ? 5 : 4 : creator && !rowsErr ? 3 : 2} title="密钥额度" className={span.d12}
           actions={<Button size="sm" icon="refresh" busy={reloading} busyLabel="刷新中…" onClick={reload}>刷新</Button>}>
           <p className="text-caption text-muted">实际可用额度取账户与各级预算的最小剩余值；未设置限额时显示“不限”。仅为当前页密钥读取实际可用额度，未读取的值保持未知。</p>
@@ -583,6 +586,7 @@ function CreateForm({
   quotas,
   onTargetKey,
   onCreated,
+  onBusyChange,
 }: {
   number: number;
   role: SessionMember["role"];
@@ -592,6 +596,7 @@ function CreateForm({
   quotas: Record<string, KeyQuota>;
   onTargetKey: (id: string) => void;
   onCreated: () => void;
+  onBusyChange: (busy: boolean) => void;
 }) {
   const manager = role === "owner" || role === "admin";
   const [scope, setScope] = useState<NewBudget["scope"]>(manager ? "member" : "api_key");
@@ -634,6 +639,7 @@ function CreateForm({
       return;
     }
     setBusy(true);
+    onBusyChange(true);
     try {
       await budgetApi.create({
         scope,
@@ -662,6 +668,7 @@ function CreateForm({
       }
     } finally {
       setBusy(false);
+      onBusyChange(false);
     }
   }
 

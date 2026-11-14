@@ -16,6 +16,7 @@ import {
 import { problemAt } from "../lib/errors";
 import { errorText, fmtInt, fmtTime } from "../lib/fmt";
 import { Button } from "../ui/Button";
+import { FormDialog } from "../ui/FormDialog";
 import { CopyButton } from "../ui/CopyButton";
 import { OperationalTable as DataTable, Loading } from "../components/OperationalTable";
 import { EmptyState } from "../ui/EmptyState";
@@ -120,8 +121,7 @@ export function Gateways({ operator }: TabProps) {
         title="网关"
         dataLead={instances ? <>已记录 {fmtInt(instances.length)} 个网关实例，其中 {fmtInt(online)} 个在线、{fmtInt(instances.length - online)} 个离线。</> : "查看网关的当前心跳、版本与连接凭据。"}
         actions={
-          isAdmin &&
-          !issuing && (
+          isAdmin && (
             <Button kind="primary" onClick={() => setIssuing(true)}>
               <Plus aria-hidden />
               签发网关凭据
@@ -228,7 +228,7 @@ export function Gateways({ operator }: TabProps) {
               }
               description="网关凭据是控制面签发的客户端证书，网关凭它连接控制面。"
             />
-            {isAdmin && issuing && (
+            {isAdmin && <FormDialog open={issuing} onOpenChange={setIssuing} title="签发网关凭据" description="签发用于连接控制面的客户端证书，不会改变现有网关。">
               <IssueForm
                 onCancel={() => setIssuing(false)}
                 onIssued={(b) => {
@@ -238,7 +238,7 @@ export function Gateways({ operator }: TabProps) {
                   void readCredentials();
                 }}
               />
-            )}
+            </FormDialog>}
             <Msg note={note} />
             {credentialsError && (
               <div className="note crit" role="alert">

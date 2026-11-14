@@ -10,9 +10,25 @@ export interface PriceRate {
   fallback_from?: Dimension;
 }
 
-export interface TierQuote {
-  base: PriceRate[];
-  long_context: { above_input_tokens: number; rates: PriceRate[] }[];
+export interface BasePriceRate {
+  dimension: Dimension;
+  unit: "token" | "request";
+  price_usd_per_million: string | null;
+  fallback_from?: Dimension;
+}
+
+export type DisplayPriceRate = PriceRate | BasePriceRate;
+
+export interface TierQuote<Rate extends DisplayPriceRate = PriceRate> {
+  base: Rate[];
+  long_context: { above_input_tokens: number; rates: Rate[] }[];
+}
+
+export interface BaseQuotedModel {
+  model_id: string;
+  name: string;
+  currency: "USD";
+  prices_by_tier: Record<string, TierQuote<BasePriceRate>>;
 }
 
 export interface QuotedModel extends PricedModel {
@@ -31,6 +47,8 @@ export interface QuotedGroup {
 export interface PriceQuoteList {
   currency: "CNY";
   groups: QuotedGroup[];
+  // 旧版控制平面缺少此字段时不可从人民币报价反推美元基准。
+  base_models?: BaseQuotedModel[];
   discount_bps: number | null;
   pricing_version: number;
   as_of: string;

@@ -4,7 +4,7 @@
   flex-wrap: wrap;
   align-items: flex-end;
   gap: 12px 16px;
-  margin: 16px 0;
+  margin: 4px 0;
 }
 .record-table-toolbar > * { min-width: 0; }
 .record-table-search { flex: 1 1 240px; max-width: 420px; }
@@ -108,3 +108,10 @@
   .dt :is(th, td).dt-date { width: auto; }
 }
 @media (prefers-reduced-motion: reduce) { .record-table-page-button::before { transition: none; } }
+
+.record-table-toolbar > .f.filter { display: flex; flex-direction: column; align-items: stretch; gap: 6px; min-width: 140px; }
+.record-table-toolbar > .f.filter > span { color: var(--muted-foreground); font-size: 12px; line-height: 18px; }
+.record-table-search > :is(span, .f-label) { color: var(--muted-foreground); font-size: 12px; line-height: 18px; }
+
+/* 搜索与筛选共享同一标签基线，不继承普通表单的段落底边。 */
+.record-table-toolbar > :is(.f, .field, label) { margin-bottom: 0; gap: 6px; }

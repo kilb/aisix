@@ -1,118 +1,68 @@
-/* 价格目录随页面自然延伸；按内容分配列宽，窄屏逐组重排。 */
-.price-catalog {
-  min-width: 0;
-  max-width: 100%;
-  container-type: inline-size;
-}
-.price-catalog > .dt-wrap {
-  width: 100%;
-  min-width: 0;
-  max-width: 100%;
-}
-.price-catalog > .dt-wrap > .dt {
-  width: 100%;
-  min-width: 0;
-  table-layout: fixed;
-}
-.price-summary-group { width: 22%; }
-.price-summary-multiplier { width: 22%; }
+/* 目录以模型为行，Base 与组织分组共用同一阅读轴。 */
+.tenant-prices .price-summary-compact { display: block; padding-block: 14px; }
+.price-summary-facts { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 2fr); gap: 12px 24px; margin: 0; }
+.price-summary-facts > div { min-width: 0; }
+.price-summary-facts dt { color: var(--muted-foreground); font-size: 12px; line-height: 18px; }
+.price-summary-facts dd { margin: 3px 0; color: var(--foreground); font-size: 24px; font-weight: 400; line-height: 32px; font-variant-numeric: tabular-nums; }
+.price-summary-facts .price-summary-time dd { font-size: 14px; line-height: 24px; }
+.price-summary-facts span { color: var(--muted-foreground); font-size: 12px; line-height: 18px; }
+.price-quote-explainer { margin-top: 12px; border-top: 1px solid var(--border); padding-top: 10px; font-size: 12px; color: var(--muted-foreground); }
+.price-quote-explainer summary { cursor: pointer; }
+.price-quote-explainer p { margin-top: 8px; max-width: 80ch; line-height: 1.6; }
+.price-scope-buttons { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 4px 0 16px; }
+.price-scope-buttons > button { display: inline-flex; align-items: center; justify-content: center; min-width: 44px; min-height: 44px; max-width: 100%; gap: 8px; padding: 8px 14px; border: 1px solid var(--border); border-radius: 8px; background: transparent; color: var(--muted-foreground); font: inherit; font-size: 13px; overflow-wrap: anywhere; cursor: pointer; }
+.price-scope-buttons > button:hover { background: var(--muted); color: var(--foreground); }
+.price-scope-buttons > button[aria-pressed="true"] { border-color: var(--foreground); background: var(--foreground); color: var(--card); }
+.price-scope-buttons > button:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+.price-catalog { min-width: 0; max-width: 100%; margin-top: 16px; container-type: inline-size; }
+.price-catalog > .dt-wrap, .price-catalog > .dt-wrap > .dt { width: 100%; min-width: 0; max-width: 100%; }
+.price-catalog > .dt-wrap > .dt { table-layout: fixed; }
+.price-summary-model { width: 30%; }
+.price-summary-multiplier { width: 14%; }
 .price-summary-amount { width: 14%; }
-.price-scroll-hint { display: none; }
-/* 固定列内保留完整精度，长金额换行而不覆盖相邻单价。 */
-.price-catalog .price-rate-amount {
-  display: block;
-  white-space: normal;
-  overflow-wrap: anywhere;
+.price-catalog .price-model-row > :is(th,td) { height: auto; padding: 8px 10px; vertical-align: middle; }
+.price-catalog .dt > tbody { border-bottom: 1px solid var(--border); }
+.price-catalog .price-model-row > th { position: static; z-index: auto; border: 0; text-align: left; background: transparent; color: var(--foreground); font-family: var(--font-sans); font-size: 14px; white-space: normal; }
+.price-catalog .price-rate-amount { display: block; white-space: normal; overflow-wrap: anywhere; font-weight: 400; font-variant-numeric: tabular-nums; }
+.price-catalog .price-model-bar { display: flex; align-items: center; justify-content: space-between; gap: 4px; min-width: 0; }
+.price-catalog .price-model-bar .btn { flex-shrink: 0; }
+.price-catalog .price-model-tier { color: var(--muted-foreground); font-size: 12px; font-weight: 400; line-height: 18px; }
+.price-catalog .price-multiplier-value { color: var(--foreground); font-weight: 400; white-space: normal; overflow-wrap: anywhere; }
+.price-catalog .price-multiplier .cell-note { white-space: normal; font-size: 12px; }
+.price-catalog :is(.num, .price-multiplier-value) { font-variant-numeric: tabular-nums; }
+.price-catalog .cell-note { white-space: normal; }
+.price-estimate-note { margin-top: 16px; border-top: 1px solid var(--border); padding-top: 12px; }
+.price-group-filter { display: grid; gap: 6px; font-size: 12px; color: var(--muted-foreground); }
+.price-group-filter > select { min-width: 140px; }
+.price-scope-note { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 16px; margin: 8px 0 0; color: var(--muted-foreground); font-size: 12px; line-height: 20px; }
+.price-scope-note p { margin: 0; }
+.price-sheet-scopes { border-bottom: 1px solid var(--border); padding-bottom: 16px; }
+.price-sheet-scopes .price-scope-buttons { margin: 0; align-items: stretch; }
+.price-sheet-scopes .price-scope-buttons > button { flex-direction: column; align-items: flex-start; gap: 2px; text-align: left; }
+.price-sheet-scopes .price-scope-buttons strong { font-size: 15px; line-height: 22px; font-weight: 500; font-variant-numeric: tabular-nums; }
+.price-sheet-scopes .price-scope-buttons span { font-size: 12px; line-height: 18px; }
+.price-sheet-scopes p { margin: 12px 0 0; color: var(--muted-foreground); font-size: 12px; line-height: 20px; }
+.price-sheet-group { padding-top: 20px; }
+.price-tier-header h4 { font-size: 15px; line-height: 24px; font-weight: 600; }
+.price-matrix .price-rate-unknown { color: var(--muted-foreground); font-weight: 400; }
+@container (max-width: 760px) {
+  .price-catalog > .dt-wrap > .dt { display: block; }
+  .price-catalog > .dt-wrap > .dt > colgroup { display: none; }
+  .price-catalog > .dt-wrap > .dt > thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+  .price-catalog > .dt-wrap > .dt > tbody { display: block; border: 0; }
+  .price-catalog .price-model-row { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 12px; padding: 12px 0 16px; border-bottom: 1px solid var(--border); }
+  .price-catalog .price-model-row > :is(th,td) { display: block; min-width: 0; height: auto; padding: 0; border: 0; text-align: left; }
+  .price-catalog .price-model-row > th { grid-column: 1 / 4; }
+  .price-catalog .price-model-row > .price-multiplier { text-align: right; }
+  .price-catalog .price-model-row > td[data-label]::before { display: block; margin-bottom: 4px; content: attr(data-label); color: var(--muted-foreground); font-size: 12px; line-height: 18px; }
 }
-.price-catalog [data-model-name] {
-  min-width: 0;
-  white-space: normal;
-  overflow-wrap: anywhere;
-  line-height: 1.5;
+@container (max-width: 440px) {
+  .price-catalog .price-model-row { grid-template-columns: repeat(2,minmax(0,1fr)); }
+  .price-catalog .price-model-row > th { grid-column: 1 / -1; }
+  .price-catalog .price-model-row > .price-multiplier { grid-column: 1 / -1; display: flex; align-items: baseline; gap: 8px; text-align: left; }
 }
-.price-catalog > .dt-wrap > .dt > tbody > tr > td {
-  vertical-align: top;
-}
-.price-quote-validity {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px 24px;
-  border-top: 1px solid var(--border);
-  padding-top: 16px;
-}
-.price-quote-validity p { margin: 0; }
-.price-group-filter {
-  display: grid;
-  min-width: 12rem;
-  gap: 6px;
-  font-size: var(--text-caption);
-  color: var(--muted-foreground);
-}
-.price-catalog .price-model-heading > td {
-  background: var(--muted);
-  border-top: 1px solid var(--border);
-  padding-block: 12px;
-}
-.price-model-bar,
-.price-model-actions {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px 16px;
-}
-.price-model-bar {
-  width: 100%;
-  max-width: 100%;
-  justify-content: space-between;
-}
-.price-model-bar [data-model-name] {
-  flex: 1 1 14rem;
-  max-width: 48rem;
-  font-weight: 500;
-}
-.price-catalog .price-group-name {
-  position: static;
-  z-index: auto;
-  min-width: 0;
-  max-width: 24rem;
-  padding-left: 24px;
-  text-align: left;
-  font-family: var(--font-sans);
-  font-weight: 400;
-  white-space: normal;
-  overflow-wrap: anywhere;
-}
-.price-multiplier { min-width: 0; }
-.price-multiplier-value {
-  color: var(--foreground);
-  font-size: var(--text-stat);
-  font-weight: 500;
-}
-.price-multiplier .cell-note { white-space: normal; overflow-wrap: anywhere; }
-.price-estimate-note {
-  border-top: 1px solid var(--border);
-  padding-top: 16px;
-}
-.price-detail-group {
-  margin: 0;
-  border-top: 1px solid var(--border);
-  padding: 20px 20px 0;
-  font-size: 15px;
-  line-height: 24px;
-}
-@media (max-width: 600px) {
-  .price-catalog .price-group-name {
-    min-width: 0;
-    max-width: none;
-    padding-inline: 12px;
-  }
-  .price-multiplier { min-width: 0; }
-  .price-multiplier .cell-note { white-space: normal; }
-}
-.price-catalog > .dt-wrap > .dt > tbody > tr > .price-detail-cell {
-  padding: 0;
-  white-space: normal;
-}
+@media (max-width: 719px) { .price-summary-facts { grid-template-columns: repeat(2,minmax(0,1fr)); } .price-summary-time { grid-column: 1 / -1; } }
+
 .price-details {
   box-sizing: border-box;
   display: grid;
@@ -233,59 +183,9 @@
   border-bottom: 0;
 }
 
-/* 优惠与模型范围组成一个摘要，目录与附着详情保持同一工作表面。 */
-.tenant-prices .price-summary {
-  display: grid;
-  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
-  gap: 32px;
-}
-.price-summary-discount,
-.price-summary-models { display: grid; min-width: 0; gap: 12px; align-content: start; }
-.price-summary-models { border-left: 1px solid var(--border); padding-left: 32px; }
-.price-summary :is(.bento-card-header, .bento-card-footer) { margin: 0; }
-.price-summary .metric { font-size: 32px; line-height: 40px; font-weight: 500; }
-.price-summary .price-quote-validity { margin-top: 4px; }
-.price-model-actions .btn { min-height: 44px; }
-.price-expand-icon { width: 16px; height: 16px; transition: transform 120ms ease; }
-.price-model-actions [aria-expanded="true"] .price-expand-icon { transform: rotate(180deg); }
-.price-expanded-row { background: color-mix(in srgb, var(--foreground) 2%, var(--background)); }
-.price-tier-header h4 { font-size: 15px; line-height: 24px; font-weight: 600; }
-.price-matrix .price-unit { font-size: 13px; line-height: 20px; }
-.price-matrix .price-rate-unknown { color: var(--muted-foreground); font-weight: 400; }
-.price-catalog :is(.num, .price-multiplier-value) { font-variant-numeric: tabular-nums; }
-.price-catalog:focus-visible,
-.price-matrix-scroll:focus-visible { outline: 2px solid var(--foreground); outline-offset: 2px; }
-@media (max-width: 719px) {
-  .tenant-prices .price-summary { grid-template-columns: minmax(0, 1fr); gap: 20px; }
-  .price-summary-models { border-left: 0; border-top: 1px solid var(--border); padding: 20px 0 0; }
-  .price-summary .metric { font-size: 28px; line-height: 36px; }
-  .price-details { padding: 16px; }
-  .price-detail-group { padding-inline: 16px; }
-  .price-model-bar { gap: 12px; }
-  .price-model-actions { gap: 8px; }
-}
-@media (prefers-reduced-motion: reduce) { .price-expand-icon { transition: none; } }
-
-/* 中等视口先重排摘要，每个分组的倍率与四项单价保持同屏可读。 */
-@media (max-width: 1050px) {
-  .price-catalog > .dt-wrap > .dt { display: block; }
-  .price-catalog > .dt-wrap > .dt > colgroup { display: none; }
-  .price-catalog > .dt-wrap > .dt > thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
-  .price-catalog > .dt-wrap > .dt > tbody { display: block; }
-  .price-model-heading, .price-expanded-row { display: block; }
-  .price-model-heading > td, .price-expanded-row > td { display: block; width: 100%; }
-  .price-group-row { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); padding: 16px; gap: 16px; border-bottom: 1px solid var(--border); }
-  .price-group-row > .price-group-name { grid-column: 1 / 3; padding: 0; }
-  .price-group-row > .price-multiplier { grid-column: 3 / 5; }
-  .price-catalog .price-group-row > td { display: block; min-width: 0; padding: 0; border: 0; text-align: left; }
-  .price-group-row > td::before { display: block; margin-bottom: 6px; content: attr(data-label); color: var(--muted-foreground); font-size: 12px; line-height: 18px; }
-  .price-group-row .price-rate-amount { font-size: 14px; line-height: 22px; }
-}
 
 /* 窄屏将上下文价格纵向列在同一计费项目下，数值不隐藏、不舍入。 */
 @media (max-width: 719px) {
-  .price-group-row { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
-  .price-group-row > .price-group-name, .price-group-row > .price-multiplier { grid-column: 1 / -1; }
   .price-matrix, .price-matrix > tbody { display: block; width: 100%; }
   .price-matrix > colgroup { display: none; }
   .price-matrix > thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
@@ -299,3 +199,30 @@
   .price-matrix .price-amount > span { grid-column: 2; min-width: 0; }
   .price-matrix .price-amount + .price-amount { border-top: 1px solid var(--border); }
 }
+
+
+/* 详情拥有独立滚动与焦点边界；列表位置和筛选保持原样。 */
+.price-model-link { min-width: 0; flex: 1; display: flex; flex-wrap: wrap; align-items: center; gap: 2px 8px; border: 0; background: none; padding: 4px 0; min-height: 44px; color: var(--foreground); font: inherit; font-weight: 500; text-align: left; cursor: pointer; overflow-wrap: anywhere; }
+.price-model-link [data-model-name] { min-width: 0; overflow-wrap: anywhere; }
+.price-model-link > svg { flex-shrink: 0; width: 14px; height: 14px; color: var(--muted-foreground); }
+.price-model-link .price-model-tier { flex-basis: 100%; margin: 0; }
+.price-model-link:focus-visible { outline: 2px solid var(--ring); outline-offset: 4px; border-radius: 4px; }
+.price-sheet-overlay { position: fixed; inset: 0; z-index: 70; background: rgb(0 0 0 / 35%); }
+.price-sheet { position: fixed; inset: 0 0 0 auto; z-index: 71; display: flex; flex-direction: column; width: min(900px, calc(100vw - 40px)); max-width: 100vw; background: var(--card); color: var(--foreground); border-left: 1px solid var(--border); outline: none; animation: price-sheet-enter 160ms ease-out; }
+.price-sheet-header { display: flex; align-items: flex-start; justify-content: space-between; flex: 0 0 auto; gap: 16px; border-bottom: 1px solid var(--border); padding: 22px 24px; }
+.price-sheet-header > div { min-width: 0; }
+.price-sheet-title { margin: 0; font-size: 20px; line-height: 28px; font-weight: 500; overflow-wrap: anywhere; }
+.price-sheet-description { margin: 6px 0 0; color: var(--muted-foreground); font-size: 13px; line-height: 20px; }
+.price-sheet-body { min-height: 0; min-width: 0; overflow-y: auto; overscroll-behavior: contain; padding: 24px; }
+.price-sheet-group-header { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px 16px; }
+.price-sheet-group-header h3 { margin: 0; font-size: 16px; font-weight: 500; }
+.price-sheet-group-header > span { font-size: 20px; font-variant-numeric: tabular-nums; }
+.price-sheet .price-details { padding: 16px 0 0; }
+@keyframes price-sheet-enter { from { transform: translateX(24px); opacity: .7; } to { transform: translateX(0); opacity: 1; } }
+@media (max-width: 719px) {
+  .price-sheet { width: calc(100vw - 12px); }
+  .price-sheet-header { padding: 16px; }
+  .price-sheet-title { font-size: 18px; line-height: 26px; }
+  .price-sheet-body { padding: 16px; }
+}
+@media (prefers-reduced-motion: reduce) { .price-sheet { animation: none; } }

@@ -13,7 +13,7 @@ import { errorText, maskUrl } from "../lib/fmt";
 import { enumAt, loadSchema } from "../lib/schema";
 import { useResource } from "../lib/useResource";
 import { Card, CardHeader, PageHeader } from "../components/page";
-import { cn } from "../lib/cn";
+import { FormDialog } from "../ui/FormDialog";
 import { Button } from "../ui/Button";
 import { OperationalTable as DataTable, Loading } from "../components/OperationalTable";
 import { useRecordTable } from "../lib/recordTable";
@@ -99,6 +99,9 @@ export function Providers({ canEdit }: TabProps) {
   const [schema, setSchema] = useState<SchemaInfo | null>(null);
   const [open, setOpen] = useState<Open | null>(null);
   const [opening, setOpening] = useState(false);
+  const createTrigger = useRef<HTMLButtonElement>(null);
+  const accountList = useRef<HTMLElement>(null);
+  const returnAccount = useRef<string | null>(null);
   const [note, setNote] = useState<Note | null>(null);
   // The row whose `删除` was clicked once, awaiting `确认删除`.
   const [deleting, setDeleting] = useState<string | null>(null);
@@ -172,13 +175,17 @@ export function Providers({ canEdit }: TabProps) {
   }
 
   const editing = open?.mode === "edit" ? pk.items?.find((a) => a.id === open.id) : undefined;
+  // 列表重挂载后按账号恢复操作位置；筛选已排除该账号时退回搜索框。
+  useEffect(() => {
+    if (editing || returnAccount.current === null) return;
+    const trigger = accountList.current?.querySelector<HTMLButtonElement>(`button[data-account-id="${CSS.escape(returnAccount.current)}"]`);
+    (trigger ?? accountList.current?.querySelector<HTMLInputElement>('input[type="search"]'))?.focus();
+    returnAccount.current = null;
+  }, [editing]);
   // The stored names are offered too: a group retired since the account was
   // saved must still be listed, so it can be taken away.
   const newChoices = groupChoices(groups.data, open?.mode === "new" ? open.groups : []);
   const editChoices = groupChoices(groups.data, editing?.doc.groups ?? []);
-
-  // 编辑表单旁保留完整账号列，表格在自己的卡片中滚动。
-  const split = open?.mode === "new" || editing !== undefined;
 
   const assignedGroups = new Set(pk.items?.flatMap((a) => a.doc.groups ?? []) ?? []);
   const ungrouped = pk.items?.filter((a) => (a.doc.groups?.length ?? 0) === 0).length ?? 0;
@@ -192,8 +199,8 @@ export function Providers({ canEdit }: TabProps) {
         actions={
           <>
             <Button type="button" className="ops-icon-button" aria-label="刷新" title="刷新上游账号" onClick={() => void pk.reload()}><RefreshCw aria-hidden /></Button>
-            {canEdit && !open && (
-              <Button kind="primary" disabled={opening} onClick={() => void openNew()}>
+            {canEdit && (!open || open.mode === "new") && (
+              <Button ref={createTrigger} kind="primary" disabled={opening} onClick={() => void openNew()}>
                 <Plus aria-hidden />
                 新增上游账号
               </Button>
@@ -258,10 +265,10 @@ export function Providers({ canEdit }: TabProps) {
         )}
       </div>
 
-      {/* 编辑表单先于列表朗读，账号模型映射在两者下方铺满一行。 */}
-      <div className={cn("ops-editor-grid", split && "ops-editor-open")}>
+      {/* 编辑时专注当前账号；保存或取消后回到全部账号列表。 */}
+      <div className="ops-editor-grid">
         {open?.mode === "new" && (
-          <div className="ops-editor">
+          <FormDialog open onOpenChange={(next) => { if (!next) setOpen(null); }} title="新建上游账号" returnFocusRef={createTrigger} description="选择协议族与凭据，保存后凭据不会再次显示。">
             <AccountForm
               key="new"
               account={null}
@@ -277,7 +284,7 @@ export function Providers({ canEdit }: TabProps) {
               onClose={() => setOpen(null)}
               onReload={() => undefined}
             />
-          </div>
+          </FormDialog>
         )}
         {editing && (
           <div className="ops-editor">
@@ -299,9 +306,9 @@ export function Providers({ canEdit }: TabProps) {
             />
           </div>
         )}
-        <Card className="ops-list mb-0">
+        {!editing && <Card ref={accountList} className="ops-list mb-0">
           <CardHeader
-            number={split ? 4 : 3}
+            number={3}
             title="全部账号"
             description={<>网关调用上游供应商所用的账号。密钥保存后不再显示。{GROUPS_HINT}。</>}
             className="mb-0"
@@ -313,7 +320,7 @@ export function Providers({ canEdit }: TabProps) {
           ) : pk.items.length === 0 ? (
             <EmptyState text="还没有上游账号。" />
           ) : (
-            <DataTable label="上游账号" scroll={split}>
+            <DataTable label="上游账号">
               <thead>
                 <tr>
                   <th>名称</th>
@@ -326,9 +333,9 @@ export function Providers({ canEdit }: TabProps) {
               </thead>
               <tbody>
                 {accountTable.rows.map((a) => (
-                  <tr key={a.id} className={editing?.id === a.id ? "bg-well" : undefined}>
+                  <tr key={a.id}>
                     <td className="font-medium">
-                      <span className={cn("block truncate", split ? "max-w-[12rem]" : "max-w-[18rem]")} title={nameOf(a)}>
+                      <span className="block max-w-[18rem] truncate" title={nameOf(a)}>
                         {nameOf(a)}
                       </span>
                     </td>
@@ -363,6 +370,7 @@ export function Providers({ canEdit }: TabProps) {
                           <Button
                             size="sm"
                             className="ops-table-action"
+                            data-account-id={a.id}
                             aria-label={canEdit ? "编辑" : "查看"}
                             title={canEdit ? "编辑账号" : "查看账号"}
                             onClick={() => {
@@ -370,6 +378,7 @@ export function Providers({ canEdit }: TabProps) {
                               // A group created since the page was opened must be
                               // offered by this form, so the list is read again with it.
                               void groups.reload();
+                              returnAccount.current = a.id;
                               setOpen({ mode: "edit", id: a.id });
                             }}
                           >
@@ -400,7 +409,7 @@ export function Providers({ canEdit }: TabProps) {
             </DataTable>
           )}
           <RecordTablePager {...accountTable} total={accountTable.filteredCount} onPageChange={accountTable.setPage} onPageSizeChange={accountTable.setPageSize} label="上游账号分页" />
-        </Card>
+        </Card>}
         {editing && (
           // 模型映射独立于账号表单，操作按钮不会提交账号文档。
           <div className="ops-channel-models">
@@ -547,6 +556,10 @@ function AccountForm({
   // Numbers each impact lookup; a result is applied only while its number is the latest.
   const lookup = useRef(0);
   const [form, focusRefusal] = useRefusalFocus<HTMLFormElement>();
+  // 编辑器替代原列表后，将键盘焦点移入首个可操作字段。
+  useEffect(() => {
+    if (!isNew) form.current?.querySelector<HTMLElement>('input:not(:disabled), select:not(:disabled), button:not(:disabled)')?.focus();
+  }, [isNew, readOnly, form]);
 
   // A new account takes the first protocol family once the schema arrives.
   useEffect(() => {
@@ -666,7 +679,7 @@ function AccountForm({
   return (
     <form ref={form} className="panel @container mb-0" aria-label={title} onSubmit={submit}>
       <CardHeader number={3} title={title} className="mb-5" />
-      {/* Two columns in the aside beside the list; four where the form has the page's width. */}
+      {/* 字段按可用宽度排为两列或四列。 */}
       <div className="grid gap-x-4 @sm:grid-cols-2 @3xl:grid-cols-4">
         <Field label="名称" error={at("name")}>
           {(aria) => <input required disabled={locked} value={name} onChange={(e) => setName(e.target.value)} {...aria} />}

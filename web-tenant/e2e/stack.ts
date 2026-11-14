@@ -331,7 +331,7 @@ export async function startStack(options: { mockUpstream?: boolean } = {}): Prom
   // lines go to stderr, which is this worker's.
   const stackProc = spawn(
     process.execPath,
-    ["../scripts/cp-dev-stack.mjs", "--gateway", "../target/debug/aisix", ...(options.mockUpstream === false ? [] : ["--mock-upstream"])],
+    ["../scripts/cp-dev-stack.mjs", "--gateway", process.env.CP_E2E_GATEWAY_BIN || "../target/debug/aisix", ...(options.mockUpstream === false ? [] : ["--mock-upstream"])],
     { cwd: WEB_TENANT, stdio: ["pipe", "pipe", "inherit"], detached: true },
   );
   let preview: ChildProcess | undefined;

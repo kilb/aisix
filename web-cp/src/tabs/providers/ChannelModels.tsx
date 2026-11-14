@@ -17,6 +17,7 @@ import {
 import { retireWarning, withoutServing } from "../../lib/retireWarning";
 import { Plus, RefreshCw, Search } from "lucide-react";
 import { CardHeader } from "../../components/page";
+import { FormDialog } from "../../ui/FormDialog";
 import { Button } from "../../ui/Button";
 import { OperationalTable as DataTable, Loading } from "../../components/OperationalTable";
 import { EmptyState } from "../../ui/EmptyState";
@@ -121,6 +122,8 @@ export function ChannelModels({
   const [total, setTotal] = useState(0);
   const [note, setNote] = useState<string | null>(null);
   const [newName, setNewName] = useState("");
+  const [createOpen, setCreateOpen] = useState(false);
+  const [fetchOpen, setFetchOpen] = useState(false);
   const [creating, setCreating] = useState(false);
   const [refusal, setRefusal] = useState<string | null>(null);
   // The public model id whose `删除模型` is in flight.
@@ -582,7 +585,7 @@ export function ChannelModels({
                     <EmptyState
                       text={
                         rows.length === 0
-                          ? "还没有公共模型。用下面的名称新建一个。"
+                          ? "还没有公共模型。点击「新建公共模型」添加。"
                           : !showAll && unservedTotal === rows.length
                             ? "这个账号还没有服务任何模型。勾选「显示全部公共模型」来添加。"
                             : "没有匹配的模型。"
@@ -641,9 +644,9 @@ export function ChannelModels({
         )}
       </div>
 
-      {canEdit && rows !== null && (
-        // The section's two tools, side by side: the account's own list, and one name typed in.
-        <div className="ch-tools grid items-start gap-5 desktop:grid-cols-2">
+      {canEdit && rows !== null && <>
+        <div className="flex flex-wrap justify-end gap-2"><Button onClick={() => setFetchOpen(true)} disabled={busy || creating}>获取上游模型</Button><Button kind="primary" icon="plus" onClick={() => setCreateOpen(true)} disabled={busy || creating}>新建公共模型</Button></div>
+        <FormDialog open={fetchOpen} onOpenChange={setFetchOpen} title="获取上游模型" description="从当前账号读取可用模型，再审阅并写入映射。" busy={busy || creating}>
           <FetchUpstream
             accountId={accountId}
             rows={rows}
@@ -653,13 +656,15 @@ export function ChannelModels({
               if (await load() === null) throw new Error("映射已写入，但未能读回当前配置，请刷新后核对。");
             }}
           />
+        </FormDialog>
+        <FormDialog open={createOpen} onOpenChange={setCreateOpen} title="新建公共模型" description="使用上游模型名称创建公共入口，价格仍在公共模型上维护。" busy={busy || creating}>
           <div className="panel ch-create mb-0">
             <CardHeader number={7} title="新建公共模型" />
             <div className="flex items-start gap-3">
               <span aria-hidden="true" className="grid size-11 shrink-0 place-items-center rounded-cell border border-line bg-well text-ink-soft">
                 <Plus className="size-4" />
               </span>
-              <p className="hint text-caption">上游有、公共模型还没有的名称可以在这里一并新建；价格仍然建在该公共模型上。</p>
+              <p className="hint text-caption" data-dialog-focus tabIndex={-1}>上游有、公共模型还没有的名称可以在这里一并新建；价格仍然建在该公共模型上。</p>
             </div>
             <div className="mt-4 flex flex-wrap items-start gap-2">
               <UpstreamModelPicker
@@ -683,8 +688,8 @@ export function ChannelModels({
               </Button>
             </div>
           </div>
-        </div>
-      )}
+        </FormDialog>
+      </>}
     </section>
   );
 }

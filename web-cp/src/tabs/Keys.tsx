@@ -4,7 +4,7 @@ import { keySearchText } from "../lib/operationalRecords";
 import { useRecordTable } from "../lib/recordTable";
 import { RecordTools, RecordPager } from "../components/RecordTools";
 /** 布局：[01 租户范围 12]；[02 密钥 6][03 正常 6]；[列表 12 / 创建时表单 5 + 列表 7]。 */
-import { Fragment, useCallback, useEffect, useId, useMemo, useState } from "react";
+import { Fragment, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import type { TabProps } from "../App";
 import { GatewayTooOld } from "../components/GatewayTooOld";
 import { RolloutBadge } from "../components/RolloutBadge";
@@ -43,9 +43,9 @@ import {
   type GroupChoice,
   type Refusal,
 } from "./Tenants";
-import { BentoGrid, Card, CardFooter, CardHeader, CardMessage, ChartSkeleton, Metric, MetricSkeleton, PageHeader, span } from "../components/page";
-import { RankBars } from "../components/charts";
+import { BentoGrid, Card, CardHeader, PageHeader, span } from "../components/page";
 import { Button } from "../ui/Button";
+import { FormDialog } from "../ui/FormDialog";
 import { useRefusalFocus } from "../ui/Field";
 import { CopyButton } from "../ui/CopyButton";
 import { KeySecret } from "../ui/KeySecret";
@@ -198,8 +198,11 @@ function TenantKeys({ tenantId, canEdit, tick }: { tenantId: string; canEdit: bo
   const catalog = useLoad(() => resources.list<{ display_name?: string }>("models"), [tick]);
   const groups = useLoad(() => groupsApi.list(), [tick]);
   const [creating, setCreating] = useState(false);
+  const [createBusy, setCreateBusy] = useState(false);
   // Held only here: switching tenant or leaving the tab drops it for good.
   const [minted, setMinted] = useState<MintedKey | null>(null);
+  const createdResult = useRef<HTMLDivElement>(null);
+  useEffect(() => { if (minted && creating) createdResult.current?.focus(); }, [minted, creating]);
   const [editing, setEditing] = useState<string | null>(null);
   // A reveal that was refused: shown above the table, beside the row's own
   // errors, never instead of it.
@@ -276,55 +279,25 @@ function TenantKeys({ tenantId, canEdit, tick }: { tenantId: string; canEdit: bo
   const live = keys?.filter((k) => !k.effective_disabled && !(k.expires_at !== null && Date.parse(k.expires_at) <= snapshotTime));
   const disabled = keys?.filter((key) => key.effective_disabled);
   const expired = keys?.filter((key) => !key.effective_disabled && key.expires_at !== null && Date.parse(key.expires_at) <= snapshotTime);
-  const stateItems = keys === null ? null : [
-    { label: "正常", value: live?.length ?? 0, displayValue: fmtInt(live?.length ?? 0) },
-    { label: "已停用", value: disabled?.length ?? 0, displayValue: fmtInt(disabled?.length ?? 0) },
-    { label: "已过期（未停用）", value: expired?.length ?? 0, displayValue: fmtInt(expired?.length ?? 0) },
-  ].sort((a, b) => b.value - a.value);
   const open = creating && canEdit && tenant.status !== "pending";
   return (
     <>
-      <BentoGrid className="mb-3" aria-label={`${tenant.name} 的密钥概况`}>
-        <Card className={`${span.d6} ops-snapshot`}>
-          <CardHeader number={2} title="密钥" description={keyList.error ? "刷新失败，保留最近成功读取的当前租户密钥" : `${tenant.name} 的完整密钥列表`} />
-          {keys === null && !keyList.error ? <MetricSkeleton /> : <Metric size="hero">{keys === null ? "—" : fmtInt(keys.length)}</Metric>}
-          <CardFooter>
-            {stateItems === null ? (keyList.error ? <CardMessage onRetry={() => void keyList.reload()}>密钥统计读取失败。</CardMessage> : <ChartSkeleton />) : (
-              <RankBars items={stateItems} accessibleLabel={`当前租户共有 ${fmtInt(keys?.length ?? 0)} 把密钥；正常 ${fmtInt(live?.length ?? 0)} 把，已停用 ${fmtInt(disabled?.length ?? 0)} 把，未停用但已过期 ${fmtInt(expired?.length ?? 0)} 把。`} emptyLabel="当前租户没有密钥。" />
-            )}
-          </CardFooter>
-        </Card>
-        <Card className={`${span.d6} ops-snapshot`}>
-          <CardHeader number={3} title="正常" description={keyList.error ? "读取失败；已有值来自最近成功读取" : "已停用与已过期的密钥均不计入"} />
-          {keys === null && !keyList.error ? <MetricSkeleton /> : <Metric size="display">{live ? fmtInt(live.length) : "—"}</Metric>}
-          <CardFooter>
-            <dl className="grid grid-cols-2 gap-6 border-t border-line pt-5">
-              <div><dt className="text-caption text-muted">已停用</dt><dd className="mt-2"><Metric size="value">{disabled ? fmtInt(disabled.length) : "—"}</Metric></dd></div>
-              <div><dt className="text-caption text-muted">已过期（未停用）</dt><dd className="mt-2"><Metric size="value">{expired ? fmtInt(expired.length) : "—"}</Metric></dd></div>
-            </dl>
-          </CardFooter>
-        </Card>
-      </BentoGrid>
+      <Card className="keys-overview mb-3" aria-label={`${tenant.name} 的密钥概况`}>
+        <dl className="compact-overview-facts">
+          <div><dt>密钥</dt><dd>{keys === null ? "—" : fmtInt(keys.length)}</dd></div>
+          <div><dt>正常</dt><dd>{live ? fmtInt(live.length) : "—"}</dd></div>
+          <div><dt>已停用</dt><dd>{disabled ? fmtInt(disabled.length) : "—"}</dd></div>
+          <div><dt>已过期（未停用）</dt><dd>{expired ? fmtInt(expired.length) : "—"}</dd></div>
+        </dl>
+      </Card>
       <BentoGrid className={open ? "is-creating" : undefined}>
-        {open && (
-          <Card key="key-create" className={span.d5Wide}>
-            <CardHeader number={4} title="新建密钥" />
-            <CreateForm
-              tenant={tenant}
-              names={names}
-              catalogError={catalog.error}
-              choices={choices}
-              onMinted={(m) => {
-                setMinted(m);
-                setCreating(false);
-                keyList.setData((list) => (list ? [...list, m.key] : [m.key]));
-                void refresh();
-              }}
-              onCancel={() => setCreating(false)}
-            />
-          </Card>
-        )}
-        <Card key="key-list" className={open ? span.d7 : span.d12} aria-label={`${tenant.name} 的密钥`}>
+        <FormDialog open={open} onOpenChange={(next) => { setCreating(next); if (!next) setMinted(null); }} busy={createBusy} title={minted ? "密钥已创建" : "新建密钥"} description="选择分组、模型范围与使用限制。未填写的限制沿用租户上限。">
+          {minted ? <div ref={createdResult} tabIndex={-1} aria-label="密钥已创建" className="key-created-result"><MintedNote minted={minted} onClose={() => { setCreating(false); setMinted(null); }} /></div> : <CreateForm tenant={tenant} names={names} catalogError={catalog.error} choices={choices}
+            onBusyChange={setCreateBusy}
+            onMinted={(m) => { setMinted(m); keyList.setData((list) => list ? [...list, m.key] : [m.key]); void refresh(); }}
+            onCancel={() => setCreating(false)} />}
+        </FormDialog>
+        <Card key="key-list" className={span.d12} aria-label={`${tenant.name} 的密钥`}>
           <CardHeader
             number={open ? 5 : 4}
             className="sm:flex-nowrap [&>div:first-child]:flex-1"
@@ -350,7 +323,7 @@ function TenantKeys({ tenantId, canEdit, tick }: { tenantId: string; canEdit: bo
                   type="button"
                   icon="plus"
                   aria-expanded={creating}
-                  onClick={() => setCreating((o) => !o)}
+                  onClick={() => { setMinted(null); setCreating(true); }}
                 >
                   新建密钥
                 </Button>
@@ -362,7 +335,6 @@ function TenantKeys({ tenantId, canEdit, tick }: { tenantId: string; canEdit: bo
               {tenantError}
             </div>
           )}
-          {minted && <MintedNote minted={minted} onClose={() => setMinted(null)} />}
 
           {keyList.error && (
             <div className="note crit" role="alert">
@@ -673,6 +645,7 @@ function CreateForm({
   choices,
   onMinted,
   onCancel,
+  onBusyChange,
 }: {
   tenant: Tenant;
   /** `null` until the catalogue is read: a key's models tell "not loaded" from "deleted" by it. */
@@ -682,6 +655,7 @@ function CreateForm({
   choices: GroupChoice[];
   onMinted: (minted: MintedKey) => void;
   onCancel: () => void;
+  onBusyChange: (busy: boolean) => void;
 }) {
   const [label, setLabel] = useState("");
   const [patterns, setPatterns] = useState("");
@@ -737,6 +711,7 @@ function CreateForm({
     }
     const b = body();
     setBusy(true);
+    onBusyChange(true);
     setRefused(null);
     setSent(b);
     try {
@@ -746,6 +721,7 @@ function CreateForm({
       focusRefusal();
     } finally {
       setBusy(false);
+      onBusyChange(false);
     }
   }
 

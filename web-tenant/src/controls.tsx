@@ -58,9 +58,7 @@ export function ShownOnce({
       <input readOnly value={value} aria-label={title} onFocus={(e) => e.currentTarget.select()} />
       {children}
       <span className="secret-acts">
-        <Button size="sm" icon={flash ? "check" : "copy"} onClick={() => void copy()}>
-          {flash ? "已复制" : "复制"}
-        </Button>
+        <Button size="sm" icon={flash ? "check" : "copy"} aria-label={flash ? "已复制" : "复制"} title={flash ? "已复制" : "复制"} onClick={() => void copy()} />
         <Button size="sm" onClick={onDone}>
           我已保存
         </Button>

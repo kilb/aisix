@@ -1657,6 +1657,70 @@ mod tests {
         .unwrap()
     }
 
+    #[tokio::test]
+    async fn reported_tokens_and_upstream_bytes_share_one_normal_telemetry_event() {
+        let posts = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+        let captured = posts.clone();
+        let server = local_server(move |_, body| {
+            captured.lock().unwrap().push(body.to_vec());
+            let mut reply = Reply::status(200);
+            reply.headers.push((USAGE_BATCH_DEDUP_HEADER, "1"));
+            reply
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(format!("{}/dp/telemetry", server.uri()), &dir);
+        let (stop, cancel) = watch::channel(false);
+        let (sink, worker) = spawn(cfg, Metrics::new(false), cancel);
+        let mut original = sample_event("tokens-and-bytes");
+        original.event_id = Uuid::new_v4().to_string();
+        original.prompt_tokens = 7;
+        original.completion_tokens = 3;
+        original.total_tokens = 10;
+        original.io_audit = Some(
+            serde_json::from_value(serde_json::json!({
+                "version":2,"boundary":"upstream_attempt","transport":"http_entity",
+                "exchange_count":1,"request_body_bytes":150,"response_body_bytes":180,
+                "request_complete":true,"response_complete":true,
+                "input_text":{"utf8_bytes":16,"unicode_scalars":8,"complete":true},
+                "output_text":{"utf8_bytes":10,"unicode_scalars":5,"complete":true}
+            }))
+            .unwrap(),
+        );
+        sink.try_emit("chat", original.clone(), UsageEventLabels::default());
+        stop.send(true).unwrap();
+        drop(sink);
+        tokio::time::timeout(Duration::from_secs(10), worker)
+            .await
+            .expect("normal telemetry drains")
+            .expect("telemetry worker joins");
+        let posts = posts.lock().unwrap();
+        assert_eq!(
+            posts.len(),
+            1,
+            "one combined normal batch, no length-only post"
+        );
+        let wire: serde_json::Value = serde_json::from_slice(&posts[0]).unwrap();
+        let rows = wire["events"].as_array().expect("explicit events");
+        assert_eq!(rows.len(), 1);
+        let event = &rows[0];
+        assert_eq!(
+            event.get("event_id"),
+            Some(&serde_json::json!(original.event_id))
+        );
+        assert!(
+            event.get("kind").is_none(),
+            "no separate IO amendment event"
+        );
+        assert_eq!(event.get("prompt_tokens"), Some(&serde_json::json!(7)));
+        assert_eq!(event.get("completion_tokens"), Some(&serde_json::json!(3)));
+        assert_eq!(event.get("total_tokens"), Some(&serde_json::json!(10)));
+        assert_eq!(
+            event.get("io_audit"),
+            Some(&serde_json::to_value(original.io_audit.unwrap()).unwrap())
+        );
+    }
+
     fn io_update(id: &str) -> UsageIoAuditUpdate {
         UsageIoAuditUpdate::new(id.into(), io_audit())
     }

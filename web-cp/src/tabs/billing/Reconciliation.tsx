@@ -190,7 +190,7 @@ export function Reconciliation(_props: TabProps) {
               </p>
             </Card>
 
-            <Card aria-label="近 24 小时未计价" className={span.d6}>
+            <Card aria-label="近 24 小时未计价" className={span.d12}>
               <CardHeader
                 number={3}
                 title="近 24 小时未计价"

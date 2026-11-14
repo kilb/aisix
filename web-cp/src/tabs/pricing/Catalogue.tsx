@@ -10,8 +10,7 @@ import { DataTable, Loading } from "../../ui/DataTable";
 import { EmptyState } from "../../ui/EmptyState";
 import { useRecordTable } from "../../lib/recordTable";
 import { RecordTablePager, RecordTableToolbar } from "../../ui/RecordTable";
-import { BentoGrid, Card, CardHeader, CardMessage, Metric, MetricSkeleton, PageHeader, span } from "../../components/page";
-import { RankBars } from "../../components/charts";
+import { Card, CardHeader, PageHeader } from "../../components/page";
 import { CardLines } from "./LibrarySync";
 import { Count } from "./kit";
 import { ChevronDown } from "lucide-react";
@@ -56,19 +55,14 @@ export function Catalogue(_props: TabProps) {
           {failure}
         </div>
       )}
-      <BentoGrid className="mb-3">
-        <Card className={span.d7}>
-          <CardHeader number={1} title="公开价格版本 · 全部目录" />
-          {items === null ? failure ? <CardMessage>目录读取失败，请刷新页面重试</CardMessage> : <MetricSkeleton /> : <Metric size="hero">{fmtInt(items.length)}</Metric>}
-          <p className="mt-4 text-caption text-muted">同一目录标识的不同生效版本分别计数；下方可以展开完整价格与原始文档。</p>
-          {items !== null && <div className="mt-6"><RankBars items={tiers.map(([label, value]) => ({ label, value, displayValue: `${fmtInt(value)} 个版本` }))} accessibleLabel="各服务档位在全部目录版本中的覆盖数量，一个版本可包含多个档位" emptyLabel="目录尚无价格档位" /></div>}
-        </Card>
-        <Card tone="inverse" className={span.d5Wide}>
-          <CardHeader number={2} title="附来源链接的版本" />
-          {items === null ? failure ? <CardMessage>目录读取失败，请刷新页面重试</CardMessage> : <MetricSkeleton /> : <Metric size="display">{fmtInt(sourced)}</Metric>}
-          <p className="mt-4 text-caption text-on-inverse-muted">范围：全部 {items === null ? "—" : fmtInt(items.length)} 个目录版本。来源页面、抄录日期、备注与价格原文完整保留。</p>
-        </Card>
-      </BentoGrid>
+      <Card className="pricing-catalogue-summary mb-3">
+        <dl className="compact-overview-facts">
+          <div><dt>公开价格版本</dt><dd>{items === null ? "—" : fmtInt(items.length)}</dd></div>
+          <div><dt>目录标识</dt><dd>{items === null ? "—" : fmtInt(new Set(items.map((entry) => entry.key)).size)}</dd></div>
+          <div><dt>附来源链接</dt><dd>{items === null ? "—" : fmtInt(sourced)}</dd></div>
+        </dl>
+        <div className="pricing-tier-coverage" aria-label="服务档位覆盖">{tiers.map(([tier, count]) => <span key={tier}>{tier} <strong>{fmtInt(count)}</strong></span>)}</div>
+      </Card>
       <Card className="catalogue-records mb-0">
         <CardHeader number={3} className="mb-0" title={<>目录条目{items && <Count n={items.length} />}</>} />
         {!failure && items === null && <Loading />}
@@ -79,6 +73,14 @@ export function Catalogue(_props: TabProps) {
             <label className="f filter"><span>来源</span><select value={source} onChange={(e) => setSource(e.target.value)}><option value="">全部</option><option value="sourced">附来源链接</option><option value="missing">无来源链接</option></select></label>
           </RecordTableToolbar>
           <DataTable label="价格目录">
+            <colgroup>
+              <col className="catalogue-col-name" />
+              <col className="catalogue-col-alias" />
+              <col className="catalogue-col-source" />
+              <col className="catalogue-col-date" />
+              <col className="catalogue-col-notes" />
+              <col className="catalogue-col-actions" />
+            </colgroup>
             <thead>
               <tr>
                 <th>条目</th>
@@ -124,9 +126,9 @@ export function Catalogue(_props: TabProps) {
                         {e.effective_from ? `${fmtBeijing(e.effective_from)} 起` : (e.as_of ?? "—")}
                         {e.effective_from && e.as_of && <div className="cell-note">抄录于 {e.as_of}</div>}
                       </td>
-                      {/* The notes take whatever width is left, cut to one line: their whole text is in the title and the expanded entry. */}
+                      {/* 说明先显示三行摘要，完整内容可在标题和展开条目中查看。 */}
                       <td data-label="说明" className="w-full max-w-0 text-caption text-muted">
-                        <span className="block truncate" title={e.notes ?? undefined}>
+                        <span className="line-clamp-3" title={e.notes ?? undefined}>
                           {e.notes ?? "—"}
                         </span>
                       </td>

@@ -49,7 +49,7 @@ function describeRows(node: ReactNode, headings: readonly string[], inHead = fal
 /** 宽屏按列比较，窄工作区按字段阅读；分页内容始终随页面自然展开。 */
 export function OperationalTable({ label, compact = false, children }: { label?: string; compact?: boolean; scroll?: boolean; children: ReactNode }) {
   const headings = headingsOf(children);
-  return <div className="dt-wrap ops-record-table" role="region" aria-label={label ? `${label}表格` : "记录表格"}>
+  return <div className="dt-wrap ops-record-table" tabIndex={0} role="region" aria-label={label ? `${label}表格` : "记录表格"}>
     <table role="table" className={compact ? "dt dt-compact" : "dt"} aria-label={label}>
       {describeRows(children, headings)}
     </table>

@@ -1,5 +1,7 @@
 /* 接入与平台管理局部布局；颜色和控件使用共享令牌。 */
 .cp-operations { min-width: 0; }
+/* 主表和补充卡片顺序占满工作区，避免共享拆分原语压缩表格。 */
+.cp-operations .bento-split > * { grid-column: 1 / -1; position: static; }
 .cp-operations .ops-icon-button { width: 44px; min-width: 44px; padding-inline: 0; border-color: transparent; background: transparent; }
 .cp-operations .ops-icon-button:hover { background: var(--well); }
 .cp-operations .ops-icon-button svg { width: 17px; height: 17px; }

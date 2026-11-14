@@ -116,7 +116,7 @@
 .usage-column-time { width: 15%; }
 .usage-column-request { width: auto; }
 .usage-column-state { width: 15%; }
-.usage-column-timing { width: 18%; }
+.usage-column-timing { width: 24%; }
 .usage-column-charge { width: 17%; }
 .usage-record-section .dt :is(td, th) { white-space: normal; min-width: 0; overflow-wrap: anywhere; }
 .usage-request-identity > strong { display: block; font-weight: 500; }
@@ -144,3 +144,6 @@
   .usage-record-section .dt > tbody > tr.usage-detail > td { padding: 16px; }
   .usage-detail .dt > tbody > tr { padding-inline: 12px; }
 }
+
+.usage-record-section .usage-request-identity .cell-note { margin-top: 2px; }
+@media (max-width: 1050px) { .usage-record-section .dt > tbody > tr { gap: 10px 14px; padding-block: 12px; } .usage-record-section td[data-label="响应性能"] { grid-column: 1 / -1; } .usage-record-section .usage-performance { text-align: left; max-width: 24rem; } }

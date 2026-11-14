@@ -3,7 +3,7 @@
   .charge-records .dt.charge-records-table { display: block; width: 100%; min-width: 0; }
   .charge-records .dt.charge-records-table > thead { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
   .charge-records .dt.charge-records-table > tbody { display: block; }
-  .charge-records .dt.charge-records-table > tbody > tr[data-finance-record] { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; padding: 20px 16px; border-bottom: 1px solid var(--border); }
+  .charge-records .dt.charge-records-table > tbody > tr[data-finance-record] { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 14px; padding: 12px 14px; border-bottom: 1px solid var(--border); }
   .charge-records .dt.charge-records-table > tbody > tr[data-finance-record] > td[data-label] { display: block; width: auto; min-width: 0; height: auto; padding: 0; border: 0; text-align: left; }
   .charge-records .dt.charge-records-table > tbody > tr[data-finance-record] > td::before { content: attr(data-label); display: block; margin-bottom: 6px; color: var(--muted-foreground); font-size: 12px; line-height: 18px; }
   .charge-records .dt.charge-records-table > tbody > tr[data-finance-record] > td:is(:first-child, [data-label="服务 / 档位"], [data-label="用量"], .right) { grid-column: 1 / -1; }
@@ -26,3 +26,36 @@
 @media (min-width: 900px) {
   .charge-records .finance-amount-value { white-space: nowrap; }
 }
+
+.charge-records-table { table-layout: fixed; }
+.charge-records-table th:first-child { width: 23%; }
+.charge-records-table th:nth-child(2) { width: 13%; }
+.charge-records-table th:nth-child(3) { width: 13%; }
+.charge-records-table th:nth-child(4) { width: 16%; }
+.charge-records-table th:nth-child(5) { width: 19%; }
+.charge-records-table th:last-child { width: 64px; }
+.charge-records .cell-note { margin-top: 2px; }
+.charge-records .io-token-reference { color: var(--muted-foreground); font-size: 12px; line-height: 18px; }
+@media (max-width: 899px) { .charge-records .usage-performance { text-align: left; max-width: 24rem; } }
+
+.charge-col-identity { width: 22%; }
+.charge-col-status { width: 12%; }
+.charge-col-money { width: 12%; }
+.charge-col-service { width: 15%; }
+.charge-col-performance { width: 22%; }
+.charge-col-action { width: 64px; }
+
+@media (min-width: 900px) { .charge-records .charge-records-table td.right { padding-inline: 10px; } }
+
+/* 主筛选共享一条标签基线，附加筛选与列表之间不重复堆叠大段说明。 */
+.charge-primary-filters { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 10px 12px; }
+.charge-primary-filters .f.filter { display: flex; flex-direction: column; gap: 6px; margin: 0; min-width: 0; }
+.charge-primary-filters .f.filter > span { color: var(--muted-foreground); font-size: 12px; line-height: 18px; }
+.charge-primary-filters > .f.filter { flex: 0 1 150px; }
+.charge-primary-filters > .f.filter:first-child { flex-basis: 128px; }
+.charge-primary-filters > .f.filter:has(input[type="checkbox"]) { flex-direction: row; align-items: center; min-height: 44px; flex-basis: auto; }
+.charge-primary-filters > div { align-items: flex-end; }
+.charge-workspace .usage-record-filters { margin-block: 10px; }
+.charge-workspace > details { margin-block: 10px; padding-block: 10px; }
+.charge-workspace .usage-record-filter-note { margin-top: 6px; }
+@media (max-width: 599px) { .charge-primary-filters > .f.filter { flex: 1 1 130px; } }

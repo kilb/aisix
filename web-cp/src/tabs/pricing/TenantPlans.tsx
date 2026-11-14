@@ -13,11 +13,12 @@ import {
 import { messageFor, problemAt } from "../../lib/errors";
 import { errorText, fmtInt } from "../../lib/fmt";
 import { fmtBeijing } from "../../lib/time";
+import { FormDialog } from "../../ui/FormDialog";
 import { Button } from "../../ui/Button";
 import { Field, useRefusalFocus } from "../../ui/Field";
 import { useToast } from "../../ui/Toast";
 import { discountBps, fmtPercent } from "../../lib/percent";
-import { BentoGrid, Card, CardHeader, CardMessage, Metric, MetricSkeleton, PageHeader, span } from "../../components/page";
+import { Card, CardHeader, CardMessage, MetricSkeleton, PageHeader } from "../../components/page";
 import { EmptyState } from "../../ui/EmptyState";
 import { CardFooter, FormGrid } from "./kit";
 
@@ -59,32 +60,11 @@ export function TenantPlans({ canEdit }: TabProps) {
         </div>
       )}
       {list === null ? (
-        <BentoGrid>
-          <Card className={span.d7}>
-            <CardHeader number={1} title="租户 · 当前列表" />
-            {error ? <CardMessage>租户列表读取失败，请刷新页面重试</CardMessage> : <MetricSkeleton />}
-          </Card>
-          <Card tone="inverse" className={span.d5Wide}>
-            <CardHeader number={2} title="折扣适用规则" />
-            <p className="text-lead">分组售价 × 实付比例</p>
-            <p className="mt-4 text-caption text-on-inverse-muted">选择租户后查看其现行折扣与预约版本。</p>
-          </Card>
-        </BentoGrid>
+        <Card><CardHeader title="租户折扣" />{error ? <CardMessage>租户列表读取失败，请刷新页面重试</CardMessage> : <MetricSkeleton />}</Card>
       ) : tenantId ? (
         <Plan key={tenantId} tenantId={tenantId} canEdit={canEdit} />
       ) : (
-        <BentoGrid>
-          <Card className={span.d7}>
-            <CardHeader number={1} title="租户 · 当前列表" />
-            <Metric size="hero">{fmtInt(list.length)}</Metric>
-            <EmptyState text="选择一个租户，查看和设置它的折扣。" mark="route" />
-          </Card>
-          <Card tone="inverse" className={span.d5Wide}>
-            <CardHeader number={2} title="折扣适用规则" />
-            <p className="text-lead">分组售价 × 实付比例</p>
-            <p className="mt-4 text-caption text-on-inverse-muted">折扣乘在该租户的实际分组计费上。选择租户后展示现行折扣和所有预约版本。</p>
-          </Card>
-        </BentoGrid>
+        <Card><dl className="compact-overview-facts"><div><dt>可选租户</dt><dd>{fmtInt(list.length)}</dd></div><div><dt>计费规则</dt><dd className="text-body">分组售价 × 实付比例</dd></div></dl><EmptyState text="选择一个租户，查看和设置它的折扣。" mark="route" /></Card>
       )}
     </>
   );
@@ -108,16 +88,7 @@ function Plan({ tenantId, canEdit }: { tenantId: string; canEdit: boolean }) {
 
   if (!plan || error) {
     return (
-      <BentoGrid>
-        <Card className={span.d7}>
-          <CardHeader number={1} title="折扣" description="现行折扣 · 所选租户" />
-          {error ? <CardMessage onRetry={() => void load()}><span role="alert">{error}</span></CardMessage> : <MetricSkeleton />}
-        </Card>
-        <Card tone="inverse" className={span.d5Wide}>
-          <CardHeader number={2} title="即将生效的折扣版本" />
-          {error ? <CardMessage>当前数据不可用</CardMessage> : <MetricSkeleton />}
-        </Card>
-      </BentoGrid>
+      <Card><CardHeader title="折扣" description="现行折扣与预约版本 · 所选租户" />{error ? <CardMessage onRetry={() => void load()}><span role="alert">{error}</span></CardMessage> : <MetricSkeleton />}</Card>
     );
   }
   return <Discounts tenantId={tenantId} plan={plan} canEdit={canEdit} onSaved={load} />;
@@ -131,6 +102,7 @@ function Discounts({ tenantId, plan, canEdit, onSaved }: { tenantId: string; pla
   const [details, setDetails] = useState<Detail[]>([]);
   const [failure, setFailure] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const [createOpen, setCreateOpen] = useState(false);
   const { current, upcoming } = plan.discount;
 
   async function save(e: React.FormEvent) {
@@ -157,6 +129,7 @@ function Discounts({ tenantId, plan, canEdit, onSaved }: { tenantId: string; pla
       toast("已保存");
       setPercent("");
       await onSaved();
+      setCreateOpen(false);
     } catch (err) {
       if (err instanceof ApiError && err.status === 422 && err.details.length > 0) {
         setDetails(err.details);
@@ -171,30 +144,23 @@ function Discounts({ tenantId, plan, canEdit, onSaved }: { tenantId: string; pla
 
   const stray = details.filter((d) => d.path !== "/discount_bps" && d.path !== "/effective_from");
   const shown = (
-    <BentoGrid className="mb-3">
-      <Card className={span.d7} role="region" aria-label="折扣">
-        <CardHeader number={1} title="折扣" description="现行折扣 · 所选租户" />
-        <Metric size="hero"><span data-testid="current-discount">{current ? fmtPercent(current.discount_bps) : "无折扣"}</span></Metric>
-        {current && <p className="mt-4 font-mono text-meta text-muted">自 {fmtBeijing(current.effective_from)} 起</p>}
-        <p className="mt-6 border-t border-ink/7 pt-4 text-caption text-muted">折扣从实际分组售价中扣除；未设置折扣时按分组售价计费。</p>
-      </Card>
-      <Card tone="inverse" className={span.d5Wide}>
-        <CardHeader number={2} title="即将生效的折扣版本" />
-        <Metric size="display">{fmtInt(upcoming.length)}</Metric>
-        {upcoming.length > 0 ? (
-          <ul className="mt-6 space-y-3 border-t border-surface/12 pt-4 text-body tabular-nums" aria-label="即将生效的折扣">
-            {upcoming.map((d) => <li key={d.revision_id}>{fmtBeijing(d.effective_from)} 起 {fmtPercent(d.discount_bps)}</li>)}
-          </ul>
-        ) : <p className="mt-4 text-caption text-on-inverse-muted">没有预约的折扣版本。</p>}
-      </Card>
-    </BentoGrid>
+    <Card className="mb-3" role="region" aria-label="折扣">
+      <dl className="compact-overview-facts">
+        <div><dt>现行折扣</dt><dd data-testid="current-discount">{current ? fmtPercent(current.discount_bps) : "无折扣"}</dd></div>
+        <div><dt>生效时间</dt><dd className="text-body">{current ? fmtBeijing(current.effective_from) : "未设置"}</dd></div>
+        <div><dt>预约版本</dt><dd>{fmtInt(upcoming.length)}</dd></div>
+      </dl>
+      <p className="text-caption text-muted">折扣从实际分组售价中扣除；未设置折扣时按分组售价计费。</p>
+      {upcoming.length > 0 ? <ul className="mt-3 space-y-2 border-t border-line pt-3 text-caption tabular-nums" aria-label="即将生效的折扣">{upcoming.map((d) => <li key={d.revision_id}>{fmtBeijing(d.effective_from)} 起 {fmtPercent(d.discount_bps)}</li>)}</ul> : <p className="mt-2 text-caption text-muted">没有预约的折扣版本。</p>}
+    </Card>
   );
   if (!canEdit) return shown;
   return (
     <>
       {shown}
+      <div className="flex justify-end"><Button kind="primary" icon="plus" onClick={() => setCreateOpen(true)}>新折扣</Button></div>
+      <FormDialog open={createOpen} onOpenChange={setCreateOpen} busy={saving} title="新折扣" description="只影响现在或将来开始生效的计费。历史账单保持原有价格。">
       <Card className="mb-0">
-          <CardHeader number={3} title="新折扣" description="只影响现在或将来开始生效的计费。" />
           <form ref={form} aria-label="新折扣" onSubmit={(e) => void save(e)} noValidate>
             <FormGrid>
               <Field label="折扣（%）" error={problemAt(details, (p) => p === "/discount_bps")}>
@@ -228,6 +194,7 @@ function Discounts({ tenantId, plan, canEdit, onSaved }: { tenantId: string; pla
             </CardFooter>
           </form>
       </Card>
+      </FormDialog>
     </>
   );
 }

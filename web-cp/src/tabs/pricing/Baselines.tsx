@@ -24,6 +24,7 @@ import { catalogueUpdateWords } from "../../lib/baselineUpdate";
 import { fmtCnyPerMillion } from "../../lib/money";
 import { fmtBeijing } from "../../lib/time";
 import { safeHttpUrl } from "../../lib/safeUrl";
+import { FormDialog } from "../../ui/FormDialog";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
 import { EmptyState } from "../../ui/EmptyState";
@@ -32,7 +33,7 @@ import { RecordTablePager, RecordTableToolbar } from "../../ui/RecordTable";
 import { Field, useRefusalFocus } from "../../ui/Field";
 import { SidePanel } from "../../ui/SidePanel";
 import { useToast } from "../../ui/Toast";
-import { BentoGrid, Card, CardHeader, CardMessage, Metric, MetricSkeleton, PageHeader, span } from "../../components/page";
+import { Card, CardHeader, PageHeader } from "../../components/page";
 import { LibrarySyncOne } from "./LibrarySync";
 import { PriceCardDetails } from "./PriceCardDetails";
 import { CardFooter, Count, FormGrid } from "./kit";
@@ -302,46 +303,16 @@ export function Baselines({ canEdit, onGoto }: TabProps) {
           </Button>
         </div>
       )}
-      <BentoGrid className="mb-3" aria-label="基准价概况">
-        <Card className={span.d7}>
-          <CardHeader number={1} title="现行基准价覆盖 · 全部模型" />
-          {rows === null ? (error ? <CardMessage onRetry={() => void load()}>基准价读取失败</CardMessage> : <MetricSkeleton />) : (
-            <>
-              <div className="baseline-coverage-value">
-                <Metric size="hero">{priced.toLocaleString("zh-CN")}</Metric>
-                <span className="font-mono text-meta text-muted">/ {rows.length.toLocaleString("zh-CN")} 个模型</span>
-              </div>
-              <div className="baseline-coverage-track" role="img" aria-label={`全部 ${rows.length} 个模型中，${priced} 个已有现行基准价，${unpriced.length} 个未定价`}>
-                <span style={{ width: `${rows.length === 0 ? 0 : priced / rows.length * 100}%` }} />
-              </div>
-              <dl className="baseline-source-counts">
-                {sources.map(({ kind, label }) => (
-                  <div key={kind}>
-                    <dt>{label}</dt>
-                    <dd>{rows.filter((r) => r.current?.source_kind === kind).length.toLocaleString("zh-CN")}</dd>
-                  </div>
-                ))}
-              </dl>
-              {unknownSources > 0 && <p className="mt-3 text-caption text-muted">另有 {unknownSources.toLocaleString("zh-CN")} 个现行版本来源未知，请核对来源。</p>}
-              <p className="mt-3 text-caption text-muted">来源统计仅含现行版本；完整价格卡、其他档位及长上下文价格在模型详情中查看。</p>
-            </>
-          )}
-        </Card>
-        <Card tone="inverse" className={span.d5Wide}>
-          <CardHeader number={2} title="待处理 · 定价缺口" />
-          {rows === null ? (error ? <CardMessage>定价缺口暂不可用</CardMessage> : <MetricSkeleton />) : (
-            <>
-              <Metric size="display">{unpriced.length.toLocaleString("zh-CN")}</Metric>
-              <p className="mt-3 text-body text-on-inverse-muted">未定价模型无法计费。先补充基准价，再核对分组换算率。</p>
-              <dl className="baseline-next-counts">
-                <div><dt>待生效版本</dt><dd>{upcoming.toLocaleString("zh-CN")}</dd></div>
-                <div><dt>目录更新待确认</dt><dd>{changed.toLocaleString("zh-CN")}</dd></div>
-              </dl>
-              {unpriced[0] && <CardFooter><Button type="button" onClick={() => setSelected(unpriced[0]!.model_id)}>查看首个未定价模型</Button></CardFooter>}
-            </>
-          )}
-        </Card>
-      </BentoGrid>
+      <Card className="mb-3" aria-label="基准价概况">
+        <dl className="compact-overview-facts">
+          <div><dt>现行基准价覆盖</dt><dd>{rows === null ? "—" : `${priced.toLocaleString("zh-CN")} / ${rows.length.toLocaleString("zh-CN")}`}</dd></div>
+          <div><dt>待处理 · 定价缺口</dt><dd>{rows === null ? "—" : unpriced.length.toLocaleString("zh-CN")}</dd></div>
+          <div><dt>待生效版本</dt><dd>{rows === null ? "—" : upcoming.toLocaleString("zh-CN")}</dd></div>
+          <div><dt>目录更新待确认</dt><dd>{rows === null ? "—" : changed.toLocaleString("zh-CN")}</dd></div>
+        </dl>
+        {rows !== null && <div className="pricing-tier-coverage" aria-label="现行基准价来源">{sources.map(({ kind, label }) => <span key={kind}>{label} <strong>{rows.filter((row) => row.current?.source_kind === kind).length.toLocaleString("zh-CN")}</strong></span>)}{unknownSources > 0 && <span>来源未知 <strong>{unknownSources.toLocaleString("zh-CN")}</strong></span>}</div>}
+        {unpriced[0] && <div><Button type="button" onClick={() => setSelected(unpriced[0]!.model_id)}>查看首个未定价模型</Button></div>}
+      </Card>
       <div className={detail ? "with-side baseline-workspace is-open" : "with-side baseline-workspace"}>
         <div className="side-main min-w-0">
           <Card className="mb-0">
@@ -468,6 +439,7 @@ function BaselinePanel({
   const resolver = useRef<EffectiveResolver>({ immediate: true, stamp: () => new Date().toISOString() });
   const [entry, setEntry] = useState(row.catalogue_update?.entry_key ?? "");
   const [saving, setSaving] = useState(false);
+  const [createOpen, setCreateOpen] = useState(false);
   const [details, setDetails] = useState<Detail[]>([]);
   const [failure, setFailure] = useState<string | null>(null);
   const [warnings, setWarnings] = useState<PriceWarning[]>([]);
@@ -541,9 +513,9 @@ function BaselinePanel({
 
   return (
     <SidePanel title={row.name} label={`${row.name} 的基准价`} onClose={onClose}>
-      {canEdit && (
+      {canEdit && <><Button kind="primary" icon="plus" onClick={() => setCreateOpen(true)}>新基准价</Button><FormDialog open={createOpen} onOpenChange={setCreateOpen} busy={saving} title="新基准价" description="选择目录或录入完整价卡，明确生效时间。只影响此后调用，历史账单不变。">
         <form ref={form} className="baseline-form mt-5" aria-label="新基准价" onSubmit={(e) => void save(e)} noValidate>
-          <h3 className="mb-4 font-mono text-meta text-muted">新基准价</h3>
+
           <FormGrid>
             <Field label="方式">
               {(aria) => (
@@ -627,7 +599,7 @@ function BaselinePanel({
             </Button>
           </CardFooter>
         </form>
-      )}
+      </FormDialog></>}
       <section className={canEdit ? "mt-6 border-t border-ink/7 pt-6" : "mt-5"} aria-label="现行基准价">
         <h3 className="mb-3 font-mono text-meta text-muted">现行与待生效</h3>
         <div className="baseline-version-group">

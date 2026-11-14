@@ -470,6 +470,428 @@ fn all_rates(input: &str, output: &str) -> Value {
         "image_input":"12", "image_output":"13", "web_search":"1000"})
 }
 
+// 删除 USD 投影、套用组织倍率或放宽公开授权过滤，必须令这些 HTTP 断言失败。
+fn base_model_of(body: &Value, id: Uuid) -> &Value {
+    body["base_models"]
+        .as_array()
+        .expect("base_models must exist as an array")
+        .iter()
+        .find(|m| m["model_id"] == json!(id))
+        .unwrap_or_else(|| panic!("missing Base USD model {id}: {body}"))
+}
+
+fn exact_keys(value: &Value, expected: &[&str]) {
+    let mut actual: Vec<&str> = value
+        .as_object()
+        .expect("an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    actual.sort_unstable();
+    assert_eq!(actual, expected, "unexpected public fields: {value}");
+}
+
+#[tokio::test]
+async fn base_quote_lists_only_authorized_public_priceable_models_once() {
+    let Some(p) = setup().await else { return };
+    let provider_key = support::world::seed_provider_key(&p.w.cp, &p.w.admin).await;
+    let mut excluded = vec![p.y];
+    for (name, internal, granted) in [
+        ("base-private", true, true),
+        ("base-wildcard-*", false, true),
+        ("base-unauthorized", false, false),
+    ] {
+        let created =
+            p.w.cp
+                .send(
+                    "POST",
+                    "/admin/resources/models",
+                    Some(p.w.admin.cookie()),
+                    Some(
+                        json!({"doc":{"display_name":name,"internal":internal,"provider":"openai",
+                "model_name":"gpt-4o-mini","provider_key_id":provider_key}}),
+                    ),
+                )
+                .await;
+        assert_eq!(created.status, 201, "{created:?}");
+        let id = Uuid::parse_str(created.body["id"].as_str().expect("model id")).expect("uuid");
+        insert_baseline(&p.w.cp, id, db_now(&p.w.cp).await, baseline_card())
+            .await
+            .expect("excluded model's baseline");
+        if granted {
+            grant(&p.w.cp, p.w.tenant, id).await;
+        }
+        excluded.push(id);
+    }
+    let r = prices(&p.w.cp, &owner(&p.w).await).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let models = r.body["base_models"].as_array().expect("Base USD models");
+    assert_eq!(
+        models.len(),
+        1,
+        "one baseline across both assigned groups: {r:?}"
+    );
+    for id in &excluded {
+        assert!(
+            models.iter().all(|m| m["model_id"] != json!(id)),
+            "excluded {id}: {r:?}"
+        );
+    }
+    exact_keys(
+        &r.body,
+        &[
+            "as_of",
+            "base_models",
+            "currency",
+            "discount_bps",
+            "groups",
+            "pricing_version",
+            "valid_until",
+        ],
+    );
+    let base = base_model_of(&r.body, p.x);
+    exact_keys(base, &["currency", "model_id", "name", "prices_by_tier"]);
+    assert_eq!(base["name"], model_name(&p.w, p.x).await);
+    assert_eq!(base["currency"], "USD");
+    exact_keys(
+        &base["prices_by_tier"]["default"],
+        &["base", "long_context"],
+    );
+    assert_eq!(base["prices_by_tier"]["default"]["long_context"], json!([]));
+    let input = quote_rate(&base["prices_by_tier"]["default"]["base"], "input");
+    exact_keys(input, &["dimension", "price_usd_per_million", "unit"]);
+    assert_eq!(input["price_usd_per_million"], "4");
+    let body = r.body.to_string();
+    for token in [
+        ROUTING_A,
+        "grp-b-",
+        "openai",
+        "gpt-4o-mini",
+        "acct-pricing",
+        "sk-pricing",
+        "source",
+        "revision",
+        "cost",
+        "provider_key",
+        "upstream",
+    ] {
+        assert!(!body.contains(token), "sensitive {token} in {body}");
+    }
+    // z 仅第二组可报价；误取首组或交集会漏掉它，x 跨组仍只能出现一次。
+    let z = seed_model(&p.w.cp, &p.w.admin).await;
+    insert_baseline(&p.w.cp, z, db_now(&p.w.cp).await, baseline_card())
+        .await
+        .expect("z's baseline");
+    grant(&p.w.cp, p.w.tenant, z).await;
+    sqlx::query(
+        "INSERT INTO pricing_group_rates \
+        (engine_version,group_id,model_id,effective_from,cny_per_usd_e4,note) \
+        VALUES ($1,$2,$3,now(),10000,'union coverage')",
+    )
+    .bind(i64::from(aisix_pricing::ENGINE_VERSION) + 1)
+    .bind(p.a)
+    .bind(z)
+    .execute(p.w.cp.db().pool())
+    .await
+    .expect("unsupported current override excludes z from A");
+    sqlx::query(
+        "UPDATE cp_settings SET \
+        value=to_jsonb((value::text)::bigint+1) WHERE key='pricing_version'",
+    )
+    .execute(p.w.cp.db().pool())
+    .await
+    .expect("refresh union quote book");
+    let union = prices(&p.w.cp, &owner(&p.w).await).await;
+    assert_eq!(union.status, 200, "{union:?}");
+    let groups = union.body["groups"].as_array().expect("groups");
+    assert_eq!(groups.len(), 2);
+    assert_eq!(groups[0]["id"], json!(p.a), "first group is A");
+    assert_eq!(groups[1]["id"], json!(p.b), "second group is B");
+    for (group, mut expected) in [(p.a, vec![p.x]), (p.b, vec![p.x, z])] {
+        let mut ids: Vec<Uuid> = group_of(&union.body, group)["models"]
+            .as_array()
+            .expect("group models")
+            .iter()
+            .map(|model| Uuid::parse_str(model["model_id"].as_str().expect("id")).expect("uuid"))
+            .collect();
+        ids.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(
+            ids, expected,
+            "group quote census must establish the union scenario"
+        );
+    }
+    let models = union.body["base_models"].as_array().expect("Base union");
+    assert_eq!(
+        models.len(),
+        2,
+        "Base USD includes the second group's unique model"
+    );
+    for id in [p.x, z] {
+        assert_eq!(
+            models
+                .iter()
+                .filter(|model| model["model_id"] == json!(id))
+                .count(),
+            1,
+            "one Base entry for {id}: {union:?}"
+        );
+    }
+    for id in &excluded {
+        assert!(
+            models.iter().all(|model| model["model_id"] != json!(id)),
+            "excluded {id} remains absent from the union: {union:?}"
+        );
+    }
+    let z_base = base_model_of(&union.body, z);
+    exact_keys(z_base, &["currency", "model_id", "name", "prices_by_tier"]);
+    assert_eq!(z_base["currency"], "USD");
+    assert_eq!(
+        quote_rate(&z_base["prices_by_tier"]["default"]["base"], "input")["price_usd_per_million"],
+        "4"
+    );
+    sqlx::query("UPDATE provider_groups SET retired_at = now() WHERE id = ANY($1)")
+        .bind(vec![p.a, p.b])
+        .execute(p.w.cp.db().pool())
+        .await
+        .expect("retire groups");
+    let empty = prices(&p.w.cp, &owner(&p.w).await).await;
+    assert_eq!(empty.status, 200, "{empty:?}");
+    assert_eq!(
+        empty.body.get("base_models"),
+        Some(&json!([])),
+        "no currently priceable group: {empty:?}"
+    );
+}
+
+#[tokio::test]
+async fn base_quote_preserves_every_dimension_tier_and_long_context_band() {
+    let Some(p) = setup().await else { return };
+    let mut card = serde_json::Map::new();
+    for (tier, input, output, middle_input, middle_output, long_input, long_output) in [
+        ("default", "4.123456", "20", "8", "40", "12", "60"),
+        ("batch", "2", "10", "4", "20", "6", "30"),
+        ("flex", "1", "5", "2", "10", "3", "15"),
+        ("priority", "8", "40", "16", "80", "24", "120"),
+        ("scale", "3", "15", "6", "30", "9", "45"),
+        ("custom-fast", "6", "30", "12", "60", "18", "90"),
+    ] {
+        card.insert(
+            tier.to_owned(),
+            json!({"base":all_rates(input, output), "long_context":[
+            {"above_input_tokens":200000,"rates":all_rates(middle_input, middle_output)},
+            {"above_input_tokens":400000,"rates":all_rates(long_input, long_output)}]}),
+        );
+    }
+    insert_baseline(
+        &p.w.cp,
+        p.x,
+        db_now(&p.w.cp).await,
+        serde_json::from_value(Value::Object(card)).expect("full card"),
+    )
+    .await
+    .expect("full baseline");
+    let r = prices(&p.w.cp, &owner(&p.w).await).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let tiers = &base_model_of(&r.body, p.x)["prices_by_tier"];
+    assert_eq!(tiers.as_object().expect("tiers").len(), 6);
+    for (tier, expected) in [
+        ("default", [("4.123456", "20"), ("8", "40"), ("12", "60")]),
+        ("batch", [("2", "10"), ("4", "20"), ("6", "30")]),
+        ("flex", [("1", "5"), ("2", "10"), ("3", "15")]),
+        ("priority", [("8", "40"), ("16", "80"), ("24", "120")]),
+        ("scale", [("3", "15"), ("6", "30"), ("9", "45")]),
+        ("custom-fast", [("6", "30"), ("12", "60"), ("18", "90")]),
+    ] {
+        exact_keys(&tiers[tier], &["base", "long_context"]);
+        let bands = tiers[tier]["long_context"].as_array().expect("bands");
+        assert_eq!(bands.len(), 2, "{tier}");
+        for (index, threshold) in [200000, 400000].into_iter().enumerate() {
+            exact_keys(&bands[index], &["above_input_tokens", "rates"]);
+            assert_eq!(bands[index]["above_input_tokens"], threshold, "{tier}");
+        }
+        for (rates, (input, output)) in
+            [&tiers[tier]["base"], &bands[0]["rates"], &bands[1]["rates"]]
+                .into_iter()
+                .zip(expected)
+        {
+            assert_eq!(rates.as_array().expect("11 dimensions").len(), 11, "{tier}");
+            for (dimension, value) in [
+                ("input", input),
+                ("output", output),
+                ("cache_read", "1"),
+                ("cache_write", "5"),
+                ("cache_write_1h", "8"),
+                ("reasoning", "9"),
+                ("audio_input", "10"),
+                ("audio_output", "11"),
+                ("image_input", "12"),
+                ("image_output", "13"),
+                ("web_search", "1000"),
+            ] {
+                let rate = quote_rate(rates, dimension);
+                exact_keys(rate, &["dimension", "price_usd_per_million", "unit"]);
+                assert_eq!(
+                    rate["price_usd_per_million"], value,
+                    "{tier}/{dimension}: {rate}"
+                );
+                assert_eq!(
+                    rate["unit"],
+                    if dimension == "web_search" {
+                        "request"
+                    } else {
+                        "token"
+                    }
+                );
+            }
+        }
+    }
+    let cny = model_of(&group_of(&r.body, p.a), p.x);
+    assert_eq!(
+        quote_rate(&cny["prices_by_tier"]["default"]["base"], "input")["price_cny_per_million"],
+        "26.71999488"
+    );
+}
+
+#[tokio::test]
+async fn base_quote_preserves_zero_null_and_fallback_without_group_or_discount_factors() {
+    let Some(p) = setup().await else { return };
+    let card = serde_json::from_value(
+        json!({"default":{"base":{"input":"4.123456","output":"0","cache_write":"5"}}}),
+    )
+    .expect("fallback card");
+    insert_baseline(&p.w.cp, p.x, db_now(&p.w.cp).await, card)
+        .await
+        .expect("baseline");
+    let member = owner(&p.w).await;
+    let first = prices(&p.w.cp, &member).await;
+    assert_eq!(first.status, 200, "{first:?}");
+    let baseline = base_model_of(&first.body, p.x);
+    let base = &baseline["prices_by_tier"]["default"]["base"];
+    assert_eq!(base.as_array().expect("rates").len(), 11);
+    let output = quote_rate(base, "output");
+    exact_keys(output, &["dimension", "price_usd_per_million", "unit"]);
+    assert_eq!(output["price_usd_per_million"], "0");
+    for (dimension, from, expected) in [
+        ("cache_read", "input", "4.123456"),
+        ("cache_write_1h", "cache_write", "5"),
+        ("reasoning", "output", "0"),
+        ("audio_input", "input", "4.123456"),
+        ("audio_output", "output", "0"),
+        ("image_input", "input", "4.123456"),
+        ("image_output", "output", "0"),
+    ] {
+        let rate = quote_rate(base, dimension);
+        exact_keys(
+            rate,
+            &[
+                "dimension",
+                "fallback_from",
+                "price_usd_per_million",
+                "unit",
+            ],
+        );
+        assert_eq!(rate["fallback_from"], from, "{rate}");
+        assert_eq!(rate["price_usd_per_million"], expected, "{rate}");
+    }
+    let search = quote_rate(base, "web_search");
+    exact_keys(search, &["dimension", "price_usd_per_million", "unit"]);
+    assert_eq!(search.get("price_usd_per_million"), Some(&Value::Null));
+    assert_eq!(search["unit"], "request");
+    discount(&p.w.cp, p.w.tenant, 10000).await;
+    let free = prices(&p.w.cp, &member).await;
+    assert_eq!(
+        base_model_of(&free.body, p.x),
+        baseline,
+        "full discount never changes USD"
+    );
+    assert_eq!(
+        model_of(&group_of(&free.body, p.a), p.x)["input_per_million"],
+        "0"
+    );
+    discount(&p.w.cp, p.w.tenant, 0).await;
+    rate(&p.w.cp, p.a, Some(p.x), "0").await;
+    rate(&p.w.cp, p.b, Some(p.x), "0").await;
+    let zero = prices(&p.w.cp, &member).await;
+    assert_eq!(
+        base_model_of(&zero.body, p.x),
+        baseline,
+        "zero group rates never change USD"
+    );
+    for group in [p.a, p.b] {
+        assert_eq!(
+            model_of(&group_of(&zero.body, group), p.x)["input_per_million"],
+            "0"
+        );
+    }
+}
+
+#[tokio::test]
+async fn base_quote_shares_the_current_baseline_version_and_future_boundary_with_cny() {
+    let Some(p) = setup().await else { return };
+    let future = db_now(&p.w.cp).await + chrono::TimeDelta::minutes(5);
+    insert_baseline(
+        &p.w.cp,
+        p.x,
+        future,
+        serde_json::from_value(json!({"default":{"base":{"input":"100","output":"200"}}}))
+            .expect("future card"),
+    )
+    .await
+    .expect("future baseline");
+    let member = owner(&p.w).await;
+    let first = prices(&p.w.cp, &member).await;
+    assert_eq!(first.status, 200, "{first:?}");
+    assert_eq!(first.body["valid_until"], json!(future));
+    let at = DateTime::parse_from_rfc3339(first.body["as_of"].as_str().expect("as_of"))
+        .expect("timestamp");
+    assert!(at < future);
+    assert_eq!(
+        quote_rate(
+            &base_model_of(&first.body, p.x)["prices_by_tier"]["default"]["base"],
+            "input"
+        )["price_usd_per_million"],
+        "4"
+    );
+    assert_eq!(
+        model_of(&group_of(&first.body, p.a), p.x)["input_per_million"],
+        "25.92"
+    );
+    insert_baseline(
+        &p.w.cp,
+        p.x,
+        db_now(&p.w.cp).await,
+        serde_json::from_value(json!({"default":{"base":{"input":"7","output":"21"}}}))
+            .expect("current card"),
+    )
+    .await
+    .expect("current baseline");
+    let changed = prices(&p.w.cp, &member).await;
+    assert_eq!(changed.status, 200, "{changed:?}");
+    assert!(
+        changed.body["pricing_version"].as_i64().expect("version")
+            > first.body["pricing_version"]
+                .as_i64()
+                .expect("first version")
+    );
+    assert_eq!(changed.body["valid_until"], json!(future));
+    assert_eq!(
+        quote_rate(
+            &base_model_of(&changed.body, p.x)["prices_by_tier"]["default"]["base"],
+            "input"
+        )["price_usd_per_million"],
+        "7"
+    );
+    assert_eq!(
+        model_of(&group_of(&changed.body, p.a), p.x)["input_per_million"],
+        "45.36"
+    );
+    assert_eq!(
+        model_of(&group_of(&changed.body, p.b), p.x)["input_per_million"],
+        "37.8"
+    );
+}
+
 #[tokio::test]
 async fn full_quote_preserves_every_dimension_tier_band_and_group_discount() {
     let Some(p) = setup().await else { return };
@@ -685,6 +1107,11 @@ async fn full_quote_never_falls_back_from_an_invalid_current_revision() {
     sqlx::query("UPDATE cp_settings SET value = to_jsonb((value #>> '{}')::bigint + 1) WHERE key = 'pricing_version'")
         .execute(p.w.cp.db().pool()).await.expect("bump book version");
     let r = prices(&p.w.cp, &owner(&p.w).await).await;
+    assert_eq!(
+        r.body.get("base_models"),
+        Some(&json!([])),
+        "invalid baseline must not expose stale USD: {r:?}"
+    );
     for group in r.body["groups"].as_array().expect("groups") {
         assert!(
             group["models"]
@@ -816,6 +1243,14 @@ async fn full_quote_never_mixes_revisions_when_a_price_write_races_its_book_load
     assert_eq!(
         quote_rate(&x["prices_by_tier"]["default"]["base"], "input")["price_cny_per_million"],
         "14.4"
+    );
+    assert_eq!(
+        quote_rate(
+            &base_model_of(&r.body, p.x)["prices_by_tier"]["default"]["base"],
+            "input"
+        )["price_usd_per_million"],
+        "8",
+        "USD and CNY must use the same versioned book"
     );
 }
 

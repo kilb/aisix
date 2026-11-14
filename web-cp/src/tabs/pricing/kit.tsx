@@ -32,13 +32,13 @@ export function Count({ n }: { n: number }) {
   return <span className="finance-count ml-2 inline-flex items-center px-2 py-1 text-caption font-normal tabular-nums text-ink-soft">{n.toLocaleString("zh-CN")}</span>;
 }
 
-/** 明细先于表单阅读；桌面分为八加四列，窄屏顺序堆叠。 */
+/** 明细与表单各占整行，表格保留完整工作区宽度。 */
 export function WithForms({ forms, wide = false, children }: { forms: ReactNode; wide?: boolean; children: ReactNode }) {
   if (!forms) return <>{children}</>;
   return (
     <BentoGrid className="items-start" data-wide-table={wide || undefined}>
-      <div className={cn("min-w-0", span.d8)}>{children}</div>
-      <div className={cn("min-w-0", span.d4, "tablet:col-span-12")}>
+      <div className={cn("min-w-0", span.d12)}>{children}</div>
+      <div className={cn("min-w-0", span.d12)}>
         <div className="grid items-start gap-(--card-gap) [&>.panel]:mb-0">
           {forms}
         </div>

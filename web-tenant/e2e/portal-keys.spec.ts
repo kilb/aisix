@@ -500,17 +500,17 @@ test("密钥明文可以再次复制：刷新后复制到剪贴板，用复制�
   await expect(listed).toBeVisible();
   await expect(listed).not.toContainText(minted);
 
-  // 显示 puts the plaintext in the row, and 隐藏 takes it away again.
-  await listed.getByRole("button", { name: "显示" }).click();
-  await expect(listed).toContainText(minted);
-  await listed.getByRole("button", { name: "隐藏" }).click();
+  // 正常状态只提供遮罩与复制图标，不显示明文或显隐开关。
+  await expect(listed.getByRole("button", { name: /^(显示|隐藏)$/ })).toHaveCount(0);
   await expect(listed).not.toContainText(minted);
   await expect(listed).toContainText(`${minted.slice(0, 12)}…`);
 
   // 复制 copies it in one click, and the toast says so.
   await page.evaluate(() => navigator.clipboard.writeText(""));
-  await listed.getByRole("button", { name: "复制" }).click();
+  await listed.getByRole("button", { name: "复制密钥", exact: true }).click();
   await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(minted);
+  await expect(listed.getByRole("button", { name: "已复制", exact: true })).toHaveText("");
+  await expect(listed).not.toContainText(minted);
   await expect(page.getByText("已复制", { exact: true }).first()).toBeVisible();
 
   // The value copied is the key the gateway serves.
@@ -532,7 +532,7 @@ test("密钥明文可以再次复制：刷新后复制到剪贴板，用复制�
   await page.reload();
   await openTab(page, "密钥");
   const stale = row(page, "old-key-5c1");
-  await expect(stale.getByRole("button", { name: "复制" })).toHaveAttribute("aria-disabled", "true");
+  await expect(stale.getByRole("button", { name: "复制密钥", exact: true })).toHaveAttribute("aria-disabled", "true");
   await expect(stale.getByRole("button", { name: "显示" })).toHaveCount(0);
 });
 

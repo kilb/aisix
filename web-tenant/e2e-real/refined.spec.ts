@@ -221,9 +221,9 @@ test("legacy-usage-prices-and-overview-remain-reachable", async ({ page }) => {
   const groups = fixture.groups.map((g: any) => typeof g === "string" ? g : g.id);
   expect(groups.length).toBeGreaterThanOrEqual(2);
   await goto(page, "#prices?group=" + encodeURIComponent(groups[0]));
-  await expect(page.getByRole("combobox", { name: /分组/ }).first()).toHaveValue(groups[0]);
+  await expect(page.getByRole("group", { name: "价格分组", exact: true }).locator(`button[data-price-scope="${groups[0]}"]`)).toHaveAttribute("aria-pressed", "true");
   await goto(page, "#prices?group=" + encodeURIComponent(groups[1]));
-  await expect(page.getByRole("combobox", { name: /分组/ }).first()).toHaveValue(groups[1]);
+  await expect(page.getByRole("group", { name: "价格分组", exact: true }).locator(`button[data-price-scope="${groups[1]}"]`)).toHaveAttribute("aria-pressed", "true");
   expect((requests.get(page) ?? []).filter(r => r.path.startsWith("/admin/"))).toEqual([]);
 });
 

@@ -8,6 +8,7 @@ import { errorText } from "../../lib/fmt";
 import { fmtMicroCny } from "../../lib/money";
 import { fmtBeijing, beijingInputValue, parseBeijingInput } from "../../lib/time";
 import { deltaWord, outcomeUnknown, previewAgainBody } from "../../lib/repricing";
+import { FormDialog } from "../../ui/FormDialog";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
 import { Field, useRefusalFocus } from "../../ui/Field";
@@ -82,6 +83,8 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
   const [loadError, setLoadError] = useState<string | null>(null);
 
   const [shown, setShown] = useState<RepricingRun | null>(null);
+  const [createOpen, setCreateOpen] = useState(false);
+  useEffect(() => { if (shown) setCreateOpen(false); }, [shown?.id]);
   const [notice, setNotice] = useState<Notice | null>(null);
   // Runs the control plane said are stale: they are never applied, only previewed again.
   const [stale, setStale] = useState<ReadonlySet<string>>(new Set());
@@ -290,7 +293,7 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
           void submitPreview();
         }}
       >
-        <CardHeader number={1} title="新建重新计价" description="按现行价格重新计算过去的调用。预览不会改动费用；确认影响后，由管理员执行。" />
+
         <div className="grid gap-x-4 tablet:grid-cols-2 desktop:grid-cols-1">
           <Field label="开始" error={problems.from}>
             {(aria) => (
@@ -588,24 +591,14 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
   return (
     <>
       <PageHeader
+        actions={canEdit && <Button kind="primary" icon="plus" onClick={() => setCreateOpen(true)}>新建重新计价</Button>}
         title="重新计价"
         eyebrow="计费 / 费用更正"
         dataLead={shown ? <>本次运行选中 <strong>{formatCount(shown.events)}</strong> 次调用，<strong>{formatCount(shown.changed)}</strong> 次费用有变化；合计差额 <strong>{fmtMicroCny(shown.delta_micro_cny)}</strong>。</> : "先预览影响范围与各租户差额，再由管理员确认执行。"}
         description="价格补录或改正之后，按现行价格重新计算过去的调用。先预览：看影响多少调用、各租户相差多少；确认无误后由管理员执行。预览不会改动任何费用。"
       />
-      {formCard ? (
-        <BentoGrid className="items-start">
-          {formCard}
-          <div className={cn(span.d7, "min-w-0 grid gap-(--card-gap)")}>
-            {result}
-            {history}
-          </div>
-        </BentoGrid>
-      ) : (
-        <BentoGrid>
-          <div className={cn(span.d12, "grid min-w-0 gap-(--card-gap)")}>{result}{history}</div>
-        </BentoGrid>
-      )}
+      {formCard && <FormDialog open={createOpen} onOpenChange={setCreateOpen} busy={busy} title="新建重新计价" description="先预览影响范围与差额。预览不会改动费用，之后仍需明确确认执行。">{formCard}</FormDialog>}
+      <BentoGrid><div className={cn(span.d12, "grid min-w-0 gap-(--card-gap)")}>{result}{history}</div></BentoGrid>
     </>
   );
 }
