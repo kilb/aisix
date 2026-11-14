@@ -156,6 +156,7 @@ impl StandaloneNativeStore {
         if existing != tag {
             return Err(Error::Conflict);
         }
+        super::standalone_realtime_store::initialize(&mut tx).await?;
         tx.commit().await.map_err(unavailable)?;
         Ok(Self {
             pool,
@@ -467,7 +468,7 @@ impl StandaloneNativeStore {
         Ok(templates)
     }
 
-    async fn begin_inner(
+    pub(super) async fn begin_inner(
         &self,
         conn: &mut SqliteConnection,
         mut request: BeginRelatedRequest,
@@ -831,7 +832,7 @@ impl StandaloneNativeStore {
         Ok(reply)
     }
 
-    async fn bind_inner(
+    pub(super) async fn bind_inner(
         &self,
         conn: &mut SqliteConnection,
         body: BindRelatedRequest,
@@ -1809,6 +1810,67 @@ impl StandaloneNativeStore {
 }
 
 impl NativeObjectRegistry for StandaloneNativeStore {
+    fn live_usage_authority(&self) -> super::registry::LiveUsageAuthority {
+        super::registry::LiveUsageAuthority::AggregateSink
+    }
+
+    fn mint_credential(
+        &self,
+        request: aisix_core::native_realtime::MintCredentialRequest,
+    ) -> BoxFuture<'_, Result<NativeReply>> {
+        Box::pin(super::standalone_realtime_store::mint_credential(
+            self, request,
+        ))
+    }
+    fn redeem_credential(
+        &self,
+        request: aisix_core::native_realtime::RedeemCredentialRequest,
+    ) -> BoxFuture<'_, Result<NativeReply>> {
+        Box::pin(super::standalone_realtime_store::redeem_credential(
+            self, request,
+        ))
+    }
+    fn create_live_session(
+        &self,
+        request: aisix_core::native_realtime::CreateLiveSessionRequest,
+    ) -> BoxFuture<'_, Result<NativeReply>> {
+        Box::pin(super::standalone_realtime_store::create_live_session(
+            self, request,
+        ))
+    }
+    fn append_live_usage(
+        &self,
+        request: aisix_core::native_realtime::AppendLiveUsageRequest,
+    ) -> BoxFuture<'_, Result<NativeReply>> {
+        Box::pin(super::standalone_realtime_store::append_live_usage(
+            self, request,
+        ))
+    }
+    fn checkpoint_live_session(
+        &self,
+        request: aisix_core::native_realtime::CheckpointLiveSessionRequest,
+    ) -> BoxFuture<'_, Result<NativeReply>> {
+        Box::pin(super::standalone_realtime_store::checkpoint_live_session(
+            self, request,
+        ))
+    }
+    fn claim_live_sessions(
+        &self,
+        request: aisix_core::native_realtime::ClaimLiveSessionsRequest,
+    ) -> BoxFuture<'_, Result<NativeReply>> {
+        Box::pin(super::standalone_realtime_store::claim_live_sessions(
+            self, request,
+        ))
+    }
+    fn signed_sip_intake(
+        &self,
+        request: aisix_core::native_realtime::SignedSipIntakeRequest,
+    ) -> BoxFuture<'_, Result<NativeReply>> {
+        Box::pin(super::standalone_realtime_store::signed_sip_intake(
+            self, request,
+        ))
+    }
+
     fn id_key(&self) -> Option<[u8; 32]> {
         Some(self.id_key)
     }
