@@ -683,7 +683,8 @@ pub(crate) async fn begin_operation(
     operation: &str,
     stage: InferenceStage,
 ) -> Result<Registration, ProxyError> {
-    begin_related_operation(
+    let requested = requested_model(state, target, &origin)?;
+    begin_requested(
         state,
         auth,
         target,
@@ -692,7 +693,9 @@ pub(crate) async fn begin_operation(
         parent_id,
         client,
         operation,
+        requested,
         stage,
+        false,
         Vec::new(),
         None,
     )
@@ -714,6 +717,30 @@ pub(crate) async fn begin_related_operation(
     references: Vec<AcceptedReference>,
     owner_parent_record_id: Option<Uuid>,
 ) -> Result<Registration, ProxyError> {
+    let requested = requested_model(state, target, &origin)?;
+    begin_requested(
+        state,
+        auth,
+        target,
+        origin,
+        kind,
+        parent_id,
+        client,
+        operation,
+        requested,
+        stage,
+        true,
+        references,
+        owner_parent_record_id,
+    )
+    .await
+}
+
+fn requested_model(
+    state: &ProxyState,
+    target: &JobTarget,
+    origin: &OriginBinding,
+) -> Result<(String, Uuid), ProxyError> {
     let requested = crate::attribution::current();
     let (requested_model, requested_model_id) =
         match requested.filter(|r| !r.requested_model_id.is_empty()) {
@@ -726,21 +753,7 @@ pub(crate) async fn begin_related_operation(
                 origin.model_id,
             ),
         };
-    begin_requested(
-        state,
-        auth,
-        target,
-        origin,
-        kind,
-        parent_id,
-        client,
-        operation,
-        (requested_model, requested_model_id),
-        stage,
-        references,
-        owner_parent_record_id,
-    )
-    .await
+    Ok((requested_model, requested_model_id))
 }
 
 /// 子对象保留创建来源的原始模型名称；当前名称只用于本次权限检查。
@@ -798,6 +811,7 @@ pub(crate) async fn begin_from_record_operation(
             source.requested_model_id.ok_or_else(dependency)?,
         ),
         stage,
+        false,
         Vec::new(),
         None,
     )
@@ -816,6 +830,7 @@ async fn begin_requested(
     operation: &str,
     requested: (String, Uuid),
     stage: InferenceStage,
+    related: bool,
     references: Vec<AcceptedReference>,
     owner_parent_record_id: Option<Uuid>,
 ) -> Result<Registration, ProxyError> {
@@ -848,7 +863,8 @@ async fn begin_requested(
         entries: Vec::new(),
         observation_headers: Default::default(),
     };
-    let reply = if references.is_empty() && owner_parent_record_id.is_none() {
+    // 明确选择关系事务时，即使没有引用也要在分派前固定其持久 manifest。
+    let reply = if !related && references.is_empty() && owner_parent_record_id.is_none() {
         registry.begin(submission).await
     } else {
         registry

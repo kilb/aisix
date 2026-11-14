@@ -646,6 +646,7 @@ pub(crate) async fn begin(
         None,
         operation,
         stage,
+        false,
         Vec::new(),
         None,
     )
@@ -664,16 +665,20 @@ pub(crate) async fn begin_operation(
     operation: &str,
     stage: InferenceStage,
 ) -> Result<Registration, ProxyError> {
-    begin_related_operation(
+    let requested = requested_model(state)?;
+    begin_for_requested(
         state,
         auth,
         target,
         origin,
         kind,
         parent_id,
+        Vec::new(),
         client,
+        requested,
         operation,
         stage,
+        false,
         Vec::new(),
         None,
     )
@@ -694,15 +699,7 @@ pub(crate) async fn begin_related_operation(
     references: Vec<AcceptedReference>,
     owner_parent_record_id: Option<Uuid>,
 ) -> Result<Registration, ProxyError> {
-    let requested = crate::attribution::current()
-        .filter(|resolved| !resolved.requested_model_id.is_empty())
-        .map(|resolved| {
-            Ok::<_, ProxyError>((
-                super::openai::resource_id(state, "models", &resolved.requested_model_id)?,
-                resolved.requested_model,
-            ))
-        })
-        .transpose()?;
+    let requested = requested_model(state)?;
     begin_for_requested(
         state,
         auth,
@@ -715,10 +712,24 @@ pub(crate) async fn begin_related_operation(
         requested,
         operation,
         stage,
+        true,
         references,
         owner_parent_record_id,
     )
     .await
+}
+
+fn requested_model(state: &ProxyState) -> Result<Option<(Uuid, String)>, ProxyError> {
+    let requested = crate::attribution::current()
+        .filter(|resolved| !resolved.requested_model_id.is_empty())
+        .map(|resolved| {
+            Ok::<_, ProxyError>((
+                super::openai::resource_id(state, "models", &resolved.requested_model_id)?,
+                resolved.requested_model,
+            ))
+        })
+        .transpose()?;
+    Ok(requested)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -749,6 +760,7 @@ pub(crate) async fn begin_from_record_operation(
         )),
         operation,
         stage,
+        false,
         Vec::new(),
         None,
     )
@@ -768,6 +780,7 @@ async fn begin_for_requested(
     requested: Option<(Uuid, String)>,
     operation: &str,
     stage: InferenceStage,
+    related: bool,
     references: Vec<AcceptedReference>,
     owner_parent_record_id: Option<Uuid>,
 ) -> Result<Registration, ProxyError> {
@@ -807,7 +820,8 @@ async fn begin_for_requested(
         entries,
         observation_headers: observation_headers(target, client)?,
     };
-    let reply = if references.is_empty() && owner_parent_record_id.is_none() {
+    // 关系绑定需要相同准入姿态，不能按引用集合是否为空退回普通事务。
+    let reply = if !related && references.is_empty() && owner_parent_record_id.is_none() {
         registry.begin(submission).await
     } else {
         registry
@@ -1299,6 +1313,7 @@ pub(crate) async fn register_output_files_at_origin(
             Some((requested_id, requested.value.display_name.clone())),
             "files",
             InferenceStage::Management,
+            false,
             Vec::new(),
             None,
         )
