@@ -258,7 +258,40 @@ impl ModelCaller for ProxyModelCaller<'_> {
                 std::borrow::Cow::Owned(mapped) => mapped,
                 std::borrow::Cow::Borrowed(_) => attempt_req,
             };
-            bridge.chat_cow(std::borrow::Cow::Owned(upstream_req), &ctx)
+            let bridge = &bridge;
+            let ctx = &ctx;
+            let pk_entry = &pk_entry;
+            let entry = &entry;
+            async move {
+                if bridge.wire_protocol() == "openai" {
+                    if let Some(voice) = crate::native_api::voices::chat_voice_after_overrides(
+                        &upstream_req,
+                        &pk_entry.value,
+                    )
+                    .map_err(|error| {
+                        BridgeError::upstream_status(error.status().as_u16(), error.to_string())
+                    })? {
+                        crate::native_api::voices::validate_voice_for_target(
+                            self.state,
+                            self.auth,
+                            self.client,
+                            &voice,
+                            &entry.id,
+                            &pk_entry.id,
+                            &pk_entry.value,
+                            aisix_core::native_objects::NativeOriginSurface::ChatCompletions,
+                            aisix_core::models::EndpointFamily::ChatCompletions,
+                        )
+                        .await
+                        .map_err(|error| {
+                            BridgeError::upstream_status(error.status().as_u16(), error.to_string())
+                        })?;
+                    }
+                }
+                bridge
+                    .chat_cow(std::borrow::Cow::Owned(upstream_req), ctx)
+                    .await
+            }
         })
         .await?;
         let effective = crate::chat::effective_subcall_usage(

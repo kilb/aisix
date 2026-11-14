@@ -2844,6 +2844,22 @@ async fn speech_dispatch(
             let provider = crate::dispatch::require_provider(model)?;
             let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
             let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
+            if let Some(voice) =
+                crate::native_api::voices::speech_voice_after_overrides(base_body, &pk_entry.value)?
+            {
+                crate::native_api::voices::validate_voice_for_target(
+                    state,
+                    auth,
+                    client_ctx,
+                    &voice,
+                    &target.id,
+                    &pk_entry.id,
+                    &pk_entry.value,
+                    aisix_core::native_objects::NativeOriginSurface::Objects,
+                    aisix_core::models::EndpointFamily::Audio,
+                )
+                .await?;
+            }
 
             let provider_label = provider.to_ascii_lowercase();
 

@@ -5,8 +5,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use aisix_core::native_objects::{
-    configured_native_origin, BeginRequest, BindRequest, LookupRequest, NativeChildObject,
-    NativeObjectKind, NativeProtocol, NativeRecord, ObjectLocator, OriginBinding,
+    configured_native_origin, configured_native_origin_at, BeginRequest, BindRequest,
+    LookupRequest, NativeChildObject, NativeObjectKind, NativeProtocol, NativeRecord,
+    ObjectLocator, OriginBinding,
 };
 use aisix_core::{AisixSnapshot, ProviderKey, ResourceEntry};
 use bytes::Bytes;
@@ -390,11 +391,13 @@ pub(crate) async fn admit_input_references(
     body: &mut Value,
     affinity: &mut crate::responses_affinity::ContextAffinity,
 ) -> Result<(), ProxyError> {
-    let Some(platform) = state.platform() else {
+    if state.platform().is_none() && state.native_objects.is_none() {
         return Ok(());
-    };
+    }
     let owner = crate::platform::tenant_owner(auth);
-    let sealer = crate::opaque_id::Sealer::of(platform, &owner);
+    let sealer = state
+        .platform()
+        .map(|platform| crate::opaque_id::Sealer::of(platform, &owner));
     if let Some(items) = body.get("input").and_then(Value::as_array) {
         for (index, item) in items.iter().enumerate() {
             if !crate::opaque_id::is_item_reference(item) {
@@ -403,7 +406,9 @@ pub(crate) async fn admit_input_references(
             let refused = || ProxyError::StoredObjectReference(format!("input[{index}].id"));
             let raw = item.get("id").and_then(Value::as_str).ok_or_else(refused)?;
             // 旧封装只恢复查找键，不能代替当前成员、模型和账号的持久归属证明。
-            let original = sealer.unseal(crate::opaque_id::IdKind::Item, raw);
+            let original = sealer
+                .as_ref()
+                .and_then(|sealer| sealer.unseal(crate::opaque_id::IdKind::Item, raw));
             let raw = original.as_deref().unwrap_or(raw);
             let reference =
                 match resolve_object_reference(state, auth, raw, NativeObjectKind::ResponseItem)
@@ -436,7 +441,8 @@ pub(crate) async fn admit_input_references(
             .ok_or(ProxyError::ResponseNotFound)?
             .to_owned();
         let original = sealer
-            .unseal(crate::opaque_id::IdKind::Container, &raw)
+            .as_ref()
+            .and_then(|sealer| sealer.unseal(crate::opaque_id::IdKind::Container, &raw))
             .unwrap_or(raw);
         let reference =
             resolve_object_reference(state, auth, &original, NativeObjectKind::ResponseContainer)
@@ -458,7 +464,9 @@ pub(crate) async fn admit_input_references(
         affinity.note_owned_container(checked_pointer);
     }
     // 已验证的存储引用与完整内联历史继续恢复协议 ID，二者不会互相授予权限。
-    let _ = crate::opaque_id::unseal_responses_input(platform, &owner, body);
+    if let Some(platform) = state.platform() {
+        let _ = crate::opaque_id::unseal_responses_input(platform, &owner, body);
+    }
     affinity.note_unopened_item_reference(None);
     Ok(())
 }
@@ -626,24 +634,21 @@ pub(crate) fn verify_origin(
     snapshot: &AisixSnapshot,
     origin: &OriginBinding,
 ) -> Result<(), ProxyError> {
-    let model = snapshot
-        .models
-        .get_by_id(&origin.model_id.to_string())
-        .ok_or(ProxyError::AccountUnavailable)?;
-    if model.value.provider_key_id.as_deref() != Some(origin.provider_key_id.to_string().as_str()) {
+    let model = super::openai::model_entry_by_id(state, snapshot, origin.model_id)?;
+    let provider = crate::dispatch::resolve_provider_key(snapshot, &model.value)?;
+    if super::openai::resource_id(state, "provider_keys", &provider.id)? != origin.provider_key_id {
         return Err(ProxyError::AccountUnavailable);
     }
-    let provider = snapshot
-        .provider_keys
-        .get_by_id(&origin.provider_key_id.to_string())
+    let key = state
+        .native_origin_key()
         .ok_or(ProxyError::AccountUnavailable)?;
-    let platform = state.platform().ok_or(ProxyError::AccountUnavailable)?;
-    let actual = configured_native_origin(
-        &platform.id_key,
+    let actual = configured_native_origin_at(
+        &key,
         origin.provider_key_id,
         &provider.value,
         NativeProtocol::Openai,
         NativeObjectKind::Response,
+        origin.surface,
     )
     .map_err(|_| ProxyError::AccountUnavailable)?;
     if actual != origin.boundary {
@@ -682,10 +687,10 @@ pub(crate) async fn resolve_object_reference(
         .native_objects
         .as_ref()
         .ok_or(ProxyError::ResponseNotFound)?;
-    let api_key_id = Uuid::parse_str(&auth.entry.id).map_err(|_| ProxyError::ResponseNotFound)?;
+    let api_key_id = super::openai::api_key_id(auth).map_err(|_| ProxyError::ResponseNotFound)?;
     let reply = registry
         .lookup(LookupRequest {
-            consumer_family: None,
+            consumer_family: Some(aisix_core::models::EndpointFamily::Responses),
             api_key_id,
             locator: ObjectLocator {
                 protocol: NativeProtocol::Openai,
@@ -721,14 +726,10 @@ pub(crate) async fn resolve_object_reference(
     let requested_id = record
         .requested_model_id
         .ok_or(ProxyError::AccountUnavailable)?;
-    let requested_model = snapshot
-        .models
-        .get_by_id(&requested_id.to_string())
-        .ok_or(ProxyError::ResponseNotFound)?;
-    let target = snapshot
-        .models
-        .get_by_id(&origin.model_id.to_string())
-        .ok_or(ProxyError::ResponseNotFound)?;
+    let requested_model = super::openai::model_entry_by_id(state, &snapshot, requested_id)
+        .map_err(|_| ProxyError::ResponseNotFound)?;
+    let target = super::openai::model_entry_by_id(state, &snapshot, origin.model_id)
+        .map_err(|_| ProxyError::ResponseNotFound)?;
     if !auth
         .key()
         .can_access(&snapshot, &requested_model.value.display_name)

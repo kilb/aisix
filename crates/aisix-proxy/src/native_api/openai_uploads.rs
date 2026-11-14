@@ -138,10 +138,38 @@ pub(crate) async fn admit_chat_files(
     client: &ClientContext,
     req: &aisix_gateway::ChatFormat,
 ) -> Result<(), ProxyError> {
-    if state.platform().is_none() {
-        return crate::stored_refs::refuse_in_chat(state.platform(), req);
-    }
     let mut checked = req.clone();
+    if let Some(voice) = checked
+        .extra
+        .get_mut("audio")
+        .and_then(|audio| audio.get_mut("voice"))
+        .filter(|voice| voice.is_object())
+    {
+        let id = voice
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                ProxyError::InvalidRequest("audio.voice.id must be a nonempty string".into())
+            })?;
+        // 缓存命中也须先证明持久归属；真实派发再验证本次选中的账号。
+        crate::attribution::detached(openai::lookup_reference(
+            state,
+            auth,
+            client,
+            id,
+            NativeObjectKind::Voice,
+            None,
+            EndpointFamily::ChatCompletions,
+        ))
+        .await?;
+        if let Some(voice) = voice.as_object_mut() {
+            voice.remove("id");
+        }
+    }
+    if state.platform().is_none() {
+        return crate::stored_refs::refuse_in_chat(state.platform(), &checked);
+    }
     let mut ids = Vec::new();
     for message in &mut checked.messages {
         for part in message.content_blocks.iter_mut().flatten() {
@@ -165,135 +193,19 @@ pub(crate) async fn admit_chat_files(
     .await
 }
 
-fn take_content_file_ids(content: &mut Value, ids: &mut Vec<String>) {
-    if let Some(parts) = content.as_array_mut() {
-        for part in parts {
-            if matches!(
-                part.get("type").and_then(Value::as_str),
-                Some("input_file" | "input_image")
-            ) {
-                take_file_id(part, ids);
-            }
-        }
-    }
-}
-
-fn take_file_ids(value: &mut Value, ids: &mut Vec<String>) {
-    let Some(object) = value.as_object_mut() else {
-        return;
-    };
-    let Some(files) = object.get("file_ids").and_then(Value::as_array) else {
-        return;
-    };
-    // 类型不符仍由原拒绝链处理，不能让一部分有效 ID 掩盖另一部分引用。
-    if files.iter().all(Value::is_string) {
-        ids.extend(
-            files
-                .iter()
-                .filter_map(Value::as_str)
-                .filter(|id| !id.is_empty())
-                .map(str::to_owned),
-        );
-        object.remove("file_ids");
-    }
-}
-
-fn take_shell_file_ids(value: &mut Value, ids: &mut Vec<String>) {
-    if value.get("type").and_then(Value::as_str) == Some("container_auto") {
-        // 只拿文件槽；同一环境里的 skill_reference 或 container_id 没有获得授权。
-        take_file_ids(value, ids);
-    }
-}
-
-fn take_tool_file_ids(tool: &mut Value, ids: &mut Vec<String>) {
-    match tool.get("type").and_then(Value::as_str) {
-        Some("image_generation") => {
-            if let Some(mask) = tool.get_mut("input_image_mask") {
-                take_file_id(mask, ids);
-            }
-        }
-        Some("code_interpreter") => {
-            if let Some(container) = tool.get_mut("container") {
-                if container.get("type").and_then(Value::as_str) == Some("auto") {
-                    take_file_ids(container, ids);
-                }
-            }
-        }
-        Some("shell") => {
-            if let Some(environment) = tool.get_mut("environment") {
-                take_shell_file_ids(environment, ids);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn take_tools_file_ids(tools: &mut Value, ids: &mut Vec<String>) {
-    if let Some(tools) = tools.as_array_mut() {
-        for tool in tools {
-            take_tool_file_ids(tool, ids);
-        }
-    }
-}
-
 /// 按官方输入项的内容槽准入，不递归放行工具参数、JSON Schema 或任意扩展键。
 pub(crate) async fn admit_responses_files(
     state: &ProxyState,
-    snapshot: &AisixSnapshot,
+    _snapshot: &AisixSnapshot,
     auth: &AuthenticatedKey,
     client: &ClientContext,
     body: &Value,
     allow_background: bool,
 ) -> Result<(), ProxyError> {
     let mut checked = body.clone();
-    let mut ids = Vec::new();
-    if state.platform().is_some() {
-        if let Some(tools) = checked.get_mut("tools") {
-            take_tools_file_ids(tools, &mut ids);
-        }
-        if let Some(choice) = checked.get_mut("tool_choice") {
-            if choice.get("type").and_then(Value::as_str) == Some("allowed_tools") {
-                if let Some(tools) = choice.get_mut("tools") {
-                    take_tools_file_ids(tools, &mut ids);
-                }
-            }
-        }
-        if let Some(items) = checked.get_mut("input").and_then(Value::as_array_mut) {
-            for item in items {
-                match item.get("type").and_then(Value::as_str) {
-                    Some("message") | None if item.get("role").is_some() => {
-                        if let Some(content) = item.get_mut("content") {
-                            take_content_file_ids(content, &mut ids);
-                        }
-                    }
-                    Some("function_call_output" | "custom_tool_call_output") => {
-                        if let Some(output) = item.get_mut("output") {
-                            take_content_file_ids(output, &mut ids);
-                        }
-                    }
-                    Some("computer_call_output") => {
-                        if let Some(output) = item.get_mut("output") {
-                            if output.get("type").and_then(Value::as_str)
-                                == Some("computer_screenshot")
-                            {
-                                take_file_id(output, &mut ids);
-                            }
-                        }
-                    }
-                    Some("additional_tools" | "tool_search_output") => {
-                        if let Some(tools) = item.get_mut("tools") {
-                            take_tools_file_ids(tools, &mut ids);
-                        }
-                    }
-                    Some("shell_call") => {
-                        if let Some(environment) = item.get_mut("environment") {
-                            take_shell_file_ids(environment, &mut ids);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
+    if state.native_objects.is_some() || state.platform().is_some() {
+        super::response_refs::resolve(state, auth, client, body, None).await?;
+        super::response_refs::take_references(&mut checked);
     }
     crate::opaque_id::with_own_containers(state.platform(), auth, &mut checked, |checked| {
         crate::stored_refs::refuse_in_responses_with_background(
@@ -301,21 +213,7 @@ pub(crate) async fn admit_responses_files(
             checked,
             allow_background,
         )
-    })?;
-    let wanted = body
-        .get("model")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    admit_files(
-        state,
-        snapshot,
-        auth,
-        client,
-        wanted,
-        NativeObjectKind::Response,
-        ids,
-    )
-    .await
+    })
 }
 
 fn reject_json(

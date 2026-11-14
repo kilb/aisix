@@ -79,7 +79,7 @@ fn reject_json(
 }
 
 /// 只访问官方协议节点；内联结果、参数、模式和文本不凭同名字段取得存储权限。
-fn take_references(value: &mut Value, refs: &mut Vec<(NativeObjectKind, String)>) {
+pub(crate) fn take_references(value: &mut Value, refs: &mut Vec<(NativeObjectKind, String)>) {
     let kind = value
         .get("type")
         .and_then(Value::as_str)
@@ -198,6 +198,9 @@ pub(crate) async fn admit_items(
     let mut accepted = Vec::new();
     let mut seen = BTreeSet::new();
     for (kind, raw) in references {
+        if kind == NativeObjectKind::Skill && super::skills::curated_openai_skill(&raw) {
+            continue;
+        }
         if !seen.insert((kind.as_str(), raw.clone())) {
             continue;
         }

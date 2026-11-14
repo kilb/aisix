@@ -853,6 +853,7 @@ async fn begin_requested(
     } else {
         registry
             .begin_related(BeginRelatedRequest {
+                entry_references: Default::default(),
                 lifecycle_context: None,
                 submission,
                 references,

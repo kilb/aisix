@@ -850,7 +850,12 @@ async fn dispatch(
     // the policy's scope: the default `api_key` keeps it to one caller and
     // `team` to the keys of one team; an operator who opts into `scope: env`
     // is asking for cross-caller reuse.
-    let cache_gate = if body.get("stream").and_then(Value::as_bool) == Some(true) {
+    let cache_gate = if body.get("stream").and_then(Value::as_bool) == Some(true)
+        || !crate::native_api::skills::messages_overrides_allow_cache(
+            snapshot,
+            &model_entry.value,
+            body,
+        ) {
         None
     } else {
         crate::response_cache::BodyCache::resolve(
@@ -1511,24 +1516,37 @@ async fn anthropic_passthrough_dispatch(
     input_capture_safe: bool,
 ) -> Result<DispatchOutcome, ProxyError> {
     let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
-    let output_file_origin = state.platform().and_then(|settings| {
-        let model_id = uuid::Uuid::parse_str(model_id).ok()?;
-        let provider_key_id = uuid::Uuid::parse_str(pk_id).ok()?;
-        let boundary = aisix_core::native_objects::configured_native_origin(
-            &settings.id_key,
-            provider_key_id,
-            pk_value,
-            aisix_core::native_objects::NativeProtocol::Anthropic,
-            aisix_core::native_objects::NativeObjectKind::MessageBatch,
-        )
-        .ok()?;
-        Some(aisix_core::native_objects::OriginBinding {
-            surface: None,
-            model_id,
-            provider_key_id,
-            boundary,
+    let native_origin = |kind| {
+        state.native_origin_key().and_then(|key| {
+            let model_id =
+                crate::native_api::openai::resource_id(state, "models", model_id).ok()?;
+            let provider_key_id =
+                crate::native_api::openai::resource_id(state, "provider_keys", pk_id).ok()?;
+            let surface = aisix_core::native_objects::NativeOriginSurface::Messages;
+            let boundary = aisix_core::native_objects::configured_native_origin_at(
+                &key,
+                provider_key_id,
+                pk_value,
+                aisix_core::native_objects::NativeProtocol::Anthropic,
+                kind,
+                Some(surface),
+            )
+            .ok()?;
+            Some(aisix_core::native_objects::OriginBinding {
+                surface: Some(surface),
+                model_id,
+                provider_key_id,
+                boundary,
+            })
         })
-    });
+    };
+    let output_file_origin =
+        native_origin(aisix_core::native_objects::NativeObjectKind::MessageBatch);
+    let message_container_origin =
+        native_origin(aisix_core::native_objects::NativeObjectKind::MessageContainer);
+    let canonical_references = crate::native_api::skills::message_reference_ids(&body);
+    let inspect_container = crate::native_api::skills::message_container_requested(&body)
+        || crate::native_api::skills::message_overrides_affect_container(pk_value);
 
     // The outbound body exists only as its wire bytes past this block: they
     // are what reqwest holds for the upstream wait, next to the caller's
@@ -1619,6 +1637,27 @@ async fn anthropic_passthrough_dispatch(
             // rather than parsing the bytes back.
             (bytes, is_stream, platform.is_some().then_some(body))
         }
+    };
+    // 覆盖规则全部完成后，按真实线格式与实际账号准入，原始请求仅保留消费意图。
+    let container_admission = if inspect_container {
+        let wire: Value = serde_json::from_slice(&body_bytes)
+            .map_err(|_| crate::native_api::openai::dependency())?;
+        crate::native_api::skills::validate_message_reference_overrides(
+            &canonical_references,
+            &wire,
+        )?;
+        crate::native_api::skills::admit_messages_dispatch(
+            state,
+            auth,
+            client_ctx,
+            &wire,
+            model_name,
+            &model.display_name,
+            message_container_origin.as_ref(),
+        )
+        .await?
+    } else {
+        None
     };
     let upstream_streams = is_stream && !synthetic_json;
 
@@ -2000,13 +2039,14 @@ async fn anthropic_passthrough_dispatch(
             model_name.to_string(),
             content_cap,
             Some(estimator),
-            state.platform().map(|_| NativeOutputFiles {
+            state.native_objects.as_ref().map(|_| NativeOutputFiles {
                 state: state.clone(),
                 auth: auth.clone(),
                 client: client_ctx.clone(),
                 requested_model: model_name.to_owned(),
                 direct_model: model.display_name.clone(),
                 origin: output_file_origin.clone(),
+                container_admission: container_admission.clone(),
             }),
             move |usage| {
                 // Streaming responses that got this far are 200 — the
@@ -2371,15 +2411,21 @@ async fn anthropic_passthrough_dispatch(
         }
 
         // 文件标识先绑定原账号；归属故障已发生在付费应答之后，不能重派或丢失用量。
-        if crate::native_api::anthropic::register_output_files_at_origin(
-            state,
-            auth,
-            client_ctx,
-            model_name,
-            &model.display_name,
-            output_file_origin.as_ref(),
-            &json_body,
-        )
+        if async {
+            if let Some(admission) = &container_admission {
+                admission.observe(&json_body).await?;
+            }
+            crate::native_api::anthropic::register_output_files_at_origin(
+                state,
+                auth,
+                client_ctx,
+                model_name,
+                &model.display_name,
+                output_file_origin.as_ref(),
+                &json_body,
+            )
+            .await
+        }
         .await
         .is_err()
         {
@@ -5492,6 +5538,8 @@ struct NativeOutputFiles {
     requested_model: String,
     direct_model: String,
     origin: Option<aisix_core::native_objects::OriginBinding>,
+    container_admission:
+        Option<std::sync::Arc<crate::native_api::skills::MessageContainerAdmission>>,
 }
 
 impl NativeOutputFiles {
@@ -5502,6 +5550,9 @@ impl NativeOutputFiles {
                 aisix_gateway::sse::find_frame_end_from(remaining, 0).unwrap_or(remaining.len());
             let (value, _) = crate::redact::parse_sse_json_event(&remaining[..end]);
             if let Some(value) = value {
+                if let Some(admission) = &self.container_admission {
+                    admission.observe(&value).await?;
+                }
                 crate::native_api::anthropic::register_output_files_at_origin(
                     &self.state,
                     &self.auth,

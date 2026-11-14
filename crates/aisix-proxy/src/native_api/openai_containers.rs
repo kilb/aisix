@@ -273,6 +273,8 @@ pub(crate) async fn create_container(
         let operation_id = Uuid::new_v4();
         let begin = registry
             .begin_related(BeginRelatedRequest {
+                lifecycle_context: None,
+                entry_references: Default::default(),
                 submission: BeginRequest {
                     upstream_input_text: None,
                     input_file_id: None,

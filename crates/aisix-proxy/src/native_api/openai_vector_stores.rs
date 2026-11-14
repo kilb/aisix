@@ -347,6 +347,7 @@ async fn begin_creation(
     };
     let reply = openai::registry(state)?
         .begin_related(BeginRelatedRequest {
+            entry_references: Default::default(),
             lifecycle_context: None,
             submission: BeginRequest {
                 upstream_input_text: None,

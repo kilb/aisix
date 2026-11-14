@@ -566,9 +566,19 @@ pub(crate) async fn responses_operation(
             }
         }
     }
-    if let Err(error) =
+    if let Err(error) = async {
         crate::native_api::origin::admit_input_references(&state, &auth, &mut body, &mut affinity)
-            .await
+            .await?;
+        crate::native_api::response_refs::admit_affinity(
+            &state,
+            &auth,
+            &client,
+            &body,
+            &mut affinity,
+        )
+        .await
+    }
+    .await
     {
         let error = affinity.at_caller_position(error);
         return crate::reject::reject_before_dispatch(
@@ -1588,6 +1598,7 @@ async fn dispatch(
                             attempt_started,
                             &model_name,
                             &auth.entry.id,
+                            auth,
                             client,
                             attempt,
                             &mut reservation,
@@ -2050,6 +2061,7 @@ async fn responses_to_target(
     attempt_started: Instant,
     requested_model: &str,
     api_key_id: &str,
+    auth: &AuthenticatedKey,
     client_ctx: &ClientContext,
     attempt: AttemptInfo,
     reservation: &mut Option<aisix_ratelimit::MultiReservation>,
@@ -2081,6 +2093,18 @@ async fn responses_to_target(
             .map(|e| &*e.value),
     );
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
+    crate::native_api::skills::validate_openai_skills_for_target(
+        state,
+        auth,
+        client_ctx,
+        body,
+        model_id,
+        &pk_entry.id,
+        &pk_entry.value,
+        aisix_core::native_objects::NativeOriginSurface::Responses,
+        aisix_core::models::EndpointFamily::Responses,
+    )
+    .await?;
     // Resolved PK id for per-PK telemetry attribution on the emitted
     // UsageEvent (#867).
     let provider_key_id = pk_entry.id.clone();

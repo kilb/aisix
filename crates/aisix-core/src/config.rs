@@ -52,6 +52,9 @@ pub struct Config {
     /// and with `managed.enabled`.
     #[serde(default)]
     pub resources_file: Option<String>,
+    /// 单机原生对象的持久归属；托管连接不使用本地后备。
+    #[serde(default)]
+    pub native_objects: Option<StandaloneNativeObjectsConfig>,
     pub proxy: ProxyConfig,
     /// Admin surface. Defaulted so managed-mode configs can omit this
     /// block entirely; the default values are NOT bound at runtime —
@@ -115,6 +118,14 @@ pub struct Config {
     /// See [`Config::ignored_keys`].
     #[serde(skip)]
     ignored_keys: Vec<(String, Option<String>)>,
+}
+
+/// 本地 SQLite 归属库与独立的稳定密钥；目录和文件须由操作者保护。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+pub struct StandaloneNativeObjectsConfig {
+    pub sqlite_path: String,
+    pub origin_secret_file: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2205,13 +2216,14 @@ impl Default for ShutdownConfig {
 /// injects such variables, rather than reported as an ignored key.
 /// `config_top_level_keys_match_the_struct` fails the build when a field
 /// is added or renamed without this list following.
-const TOP_LEVEL_ENV_KEYS: [&str; 13] = [
+const TOP_LEVEL_ENV_KEYS: [&str; 14] = [
     "admin",
     "bedrock_endpoint_url",
     "cache",
     "downstream",
     "etcd",
     "managed",
+    "native_objects",
     "observability",
     "outbound",
     "proxy",
@@ -2550,6 +2562,32 @@ impl Config {
             return Err(BootstrapError::Config(
                 "etcd.user and etcd.password_env must be set together".to_string(),
             ));
+        }
+
+        if let Some(native) = &self.native_objects {
+            if self.managed.is_managed() || self.proxy.platform.enabled {
+                return Err(BootstrapError::Config(
+                    "native_objects is only available without managed or platform mode".into(),
+                ));
+            }
+            for (name, value) in [
+                ("sqlite_path", &native.sqlite_path),
+                ("origin_secret_file", &native.origin_secret_file),
+            ] {
+                if value.trim() != value
+                    || !Path::new(value).is_absolute()
+                    || Path::new(value).file_name().is_none()
+                {
+                    return Err(BootstrapError::Config(format!(
+                        "native_objects.{name} must be an absolute file path"
+                    )));
+                }
+            }
+            if native.sqlite_path == native.origin_secret_file {
+                return Err(BootstrapError::Config(
+                    "native_objects database and origin secret must use different files".into(),
+                ));
+            }
         }
 
         if self.proxy.platform.enabled {
@@ -6318,5 +6356,26 @@ admin:
             .unwrap_err()
             .to_string();
         assert!(err.contains("proxy.workers"), "unexpected error: {err}");
+    }
+    #[test]
+    fn standalone_native_authority_requires_explicit_absolute_separate_files() {
+        let load = |extra: &str| {
+            let file = write_yaml(&format!("etcd:\n  endpoints: [\"http://127.0.0.1:2379\"]\nproxy:\n  addr: \"127.0.0.1:3000\"\n{extra}\n"));
+            Config::load_from_path(Some(file.path()))
+        };
+        let cfg = load("native_objects: {sqlite_path: /var/lib/aisix/native/objects.sqlite3, origin_secret_file: /run/secrets/native-origin}").unwrap();
+        assert_eq!(
+            serde_json::to_value(&cfg).unwrap()["native_objects"]["sqlite_path"],
+            "/var/lib/aisix/native/objects.sqlite3"
+        );
+        for block in [
+            "native_objects: {sqlite_path: relative.sqlite3, origin_secret_file: /run/secrets/native-origin}",
+            "native_objects: {sqlite_path: /var/lib/aisix/objects.sqlite3, origin_secret_file: relative-secret}",
+            "native_objects: {sqlite_path: /same, origin_secret_file: /same}",
+            "native_objects: {sqlite_path: /var/lib/aisix/objects.sqlite3, origin_secret_file: /run/secrets/native-origin}\nmanaged: {enabled: true}",
+        ] {
+            let error = load(block).unwrap_err().to_string();
+            assert!(error.contains("native_objects"), "{error}");
+        }
     }
 }

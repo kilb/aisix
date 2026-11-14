@@ -812,6 +812,7 @@ async fn begin_for_requested(
     } else {
         registry
             .begin_related(BeginRelatedRequest {
+                entry_references: Default::default(),
                 lifecycle_context: None,
                 submission,
                 references,
@@ -1117,6 +1118,15 @@ pub(crate) async fn refuse_messages_references(
     if let Some(messages) = sanitized.get_mut("messages") {
         scrub(messages, &mut ids)?;
     }
+    super::skills::admit_anthropic_owned_references(
+        state,
+        auth,
+        client,
+        body,
+        &mut sanitized,
+        consumer,
+    )
+    .await?;
     crate::stored_refs::refuse_in_messages(state.platform(), &sanitized)?;
     if ids.is_empty() {
         return Ok(());

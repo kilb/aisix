@@ -642,6 +642,7 @@ async fn begin(
         .unwrap_or_else(|| target.model_entry.value.display_name.clone());
     let reply = openai::registry(state)?
         .begin_related(BeginRelatedRequest {
+            entry_references: Default::default(),
             submission: BeginRequest {
                 upstream_input_text: None,
                 input_file_id: None,
@@ -815,16 +816,19 @@ async fn list(
     let run_id = parts.get(4).copied();
     let mut first_reply = None;
     loop {
-        let mut encoded = url::form_urlencoded::Serializer::new(String::new());
-        for (key, value) in &pairs {
-            if !matches!(key.as_str(), "model" | "after" | "limit") {
-                encoded.append_pair(key, value);
+        let encoded = {
+            let mut encoded = url::form_urlencoded::Serializer::new(String::new());
+            for (key, value) in &pairs {
+                if !matches!(key.as_str(), "model" | "after" | "limit") {
+                    encoded.append_pair(key, value);
+                }
             }
-        }
-        encoded.append_pair("limit", "100");
-        if let Some(raw) = after.as_deref() {
-            encoded.append_pair("after", raw);
-        }
+            encoded.append_pair("limit", "100");
+            if let Some(raw) = after.as_deref() {
+                encoded.append_pair("after", raw);
+            }
+            encoded.finish()
+        };
         let reply = openai::send_for_kind(
             state,
             target,
@@ -832,7 +836,7 @@ async fn list(
             kind,
             Method::GET,
             path.strip_prefix("/v1").ok_or_else(missing)?,
-            &encoded.finish(),
+            &encoded,
             Body::Empty,
         )
         .await?;
