@@ -256,7 +256,10 @@ async fn receive(rx: &mut mpsc::Receiver<DurableUsageRequest>) -> DurableUsageRe
 async fn real_outbox_ack_requires_a_committed_mtls_receipt_and_replay_charges_once() {
     let Some(w) = world().await else { return };
     let f = Terminal::new(&w).await;
-    let bundle = w.cp.issue_bundle(&w.admin, "durable-confirmation").await;
+    let issuer =
+        w.cp.admin_login_seeded(aisix_control_plane::auth::OperatorRole::Admin)
+            .await;
+    let bundle = w.cp.issue_bundle(&issuer, "durable-confirmation").await;
     let client = reqwest::Client::builder()
         .no_proxy()
         .identity(
