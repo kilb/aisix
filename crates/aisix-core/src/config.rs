@@ -5763,6 +5763,12 @@ observability:
             "defaults": expected,
             "optional_blocks": optional_blocks(&expected),
         });
+        let native = &expected["optional_blocks"]["native_objects"];
+        assert_eq!(native.get("sqlite_path"), Some(&serde_json::Value::Null));
+        assert_eq!(
+            native.get("origin_secret_file"),
+            Some(&serde_json::Value::Null)
+        );
         if std::env::var_os("UPDATE_CONFIG_REFERENCE").is_some() {
             let mut text = serde_json::to_string_pretty(&expected).unwrap();
             text.push('\n');
