@@ -107,6 +107,40 @@
       },
       "type": "object"
     },
+    "RealtimeSipBinding": {
+      "description": "一个签名入口固定绑定原调用密钥、直连模型和当前上游账号。",
+      "properties": {
+        "api_key_id": {
+          "description": "固定调用方密钥资源 ID，不能由来电正文或 SIP 头选择。",
+          "minLength": 1,
+          "type": "string"
+        },
+        "model_id": {
+          "description": "当前账号下精确直连模型的资源 ID，不是上游模型名或公开别名。",
+          "minLength": 1,
+          "type": "string"
+        },
+        "route_id": {
+          "description": "webhook 路径中的运维分配标识，在同一环境中唯一。",
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_-]+$",
+          "type": "string"
+        },
+        "webhook_secret": {
+          "description": "官方 webhook 签名密钥，按 Standard Webhooks 规则解释 whsec_ 前缀。",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "api_key_id",
+        "model_id",
+        "route_id",
+        "webhook_secret"
+      ],
+      "type": "object"
+    },
     "RequestOverrides": {
       "description": "Per-`ProviderKey` request-shape overrides. Use these fields to rename request body parameters, clamp supported numeric parameters, add fallback outbound headers, or add fallback outbound body fields.",
       "properties": {
@@ -315,6 +349,17 @@
       "default": "",
       "description": "Upstream provider identifier, such as `\"deepseek\"`, `\"openai\"`, or a model catalog ID. The gateway uses this value for provider-specific dispatch and base URL validation.",
       "type": "string"
+    },
+    "realtime_sip": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/RealtimeSipBinding"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "运维预绑定的可信 SIP webhook 入口；省略时不接收入站 SIP 来电。 一个上游项目的全部 SIP 来电归这里绑定的租户，不能用不可信 的 SIP To 或 sip_headers 把同一项目的来电拆分到多个租户。"
     },
     "request": {
       "anyOf": [
