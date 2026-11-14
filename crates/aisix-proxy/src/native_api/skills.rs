@@ -596,14 +596,17 @@ impl Deletion {
         Ok(())
     }
 
-    pub(crate) async fn resolve(&self, error: &ProxyError) -> Result<(), ProxyError> {
-        let upstream_rejected = matches!(
+    pub(crate) fn upstream_rejected(error: &ProxyError) -> bool {
+        matches!(
             error,
             ProxyError::Bridge(
                 aisix_gateway::BridgeError::UpstreamStatus { status, .. }
                 | aisix_gateway::BridgeError::UpstreamBodyUnread { status, .. }
             ) if (400..500).contains(status) && *status != 408
-        );
+        )
+    }
+
+    pub(crate) async fn resolve(&self, upstream_rejected: bool) -> Result<(), ProxyError> {
         let reply = self
             .registry
             .resolve_reservation(ResolveReservationRequest {
@@ -1209,8 +1212,9 @@ async fn handle(
         Ok((response(protocol, reply), target))
     }
     .await;
-    if let (Err(error), Some(reserved)) = (&result, deletion) {
-        if let Err(error) = reserved.resolve(error).await {
+    let upstream_rejected = result.as_ref().err().map(Deletion::upstream_rejected);
+    if let (Some(upstream_rejected), Some(reserved)) = (upstream_rejected, deletion) {
+        if let Err(error) = reserved.resolve(upstream_rejected).await {
             result = Err(error);
         }
     }

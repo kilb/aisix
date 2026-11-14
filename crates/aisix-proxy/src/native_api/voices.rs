@@ -273,8 +273,12 @@ async fn handle(
         Ok((skills::response(NativeProtocol::Openai, reply), target))
     }
     .await;
-    if let (Err(error), Some(reserved)) = (&result, deletion) {
-        if let Err(error) = reserved.resolve(error).await {
+    let upstream_rejected = result
+        .as_ref()
+        .err()
+        .map(skills::Deletion::upstream_rejected);
+    if let (Some(upstream_rejected), Some(reserved)) = (upstream_rejected, deletion) {
+        if let Err(error) = reserved.resolve(upstream_rejected).await {
             result = Err(error);
         }
     }
