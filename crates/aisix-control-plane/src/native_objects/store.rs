@@ -356,7 +356,7 @@ async fn operation(
     sqlx::query_as(&format!(
         "SELECT visibility_full, dp_id, tenant_id, api_key_id, member_id, submission, state FROM native_operations \
          WHERE environment_id = $1 AND operation_id = $2{}",
-        if lock { " FOR UPDATE" } else { "" },
+        if lock { " FOR NO KEY UPDATE" } else { "" },
     ))
     .bind(state.env.env_id)
     .bind(id)
