@@ -31,8 +31,8 @@ use crate::auth::{MemberRole, OperatorRole, KEY_HOLDERS};
 use crate::error::{ApiError, Detail};
 use crate::{
     audit, billing, channels, dp, gateways, groups, keys, member_usage, members, model_assessments,
-    model_probe_history, model_probes, operators, pricing, projector, resources, rollout, tenants,
-    upstream_models, usage, usage_metrics, AppState,
+    model_probe_history, model_probes, native_objects, operators, pricing, projector, resources,
+    rollout, tenants, upstream_models, usage, usage_metrics, AppState,
 };
 
 /// The largest request body either listener reads.
@@ -979,7 +979,7 @@ pub fn browser_router(state: AppState) -> Router {
         )
         .route("/api/keys/{id}/reveal", post(keys::reveal))
         .route("/admin/usage/events", get(usage::list_events))
-        .route("/admin/native-metering", get(crate::native_objects::metering_api::list))
+        .route("/admin/native-metering", get(native_objects::metering_api::list))
         .route("/admin/usage/batches", get(usage::list_batches))
         .route("/admin/usage/rejects", get(usage::list_rejects))
         .route("/admin/pricing/catalogue", get(pricing::api::catalogue))
