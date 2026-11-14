@@ -1270,6 +1270,13 @@ pub struct UsageSink {
     io_audit_tx: Option<tokio::sync::mpsc::Sender<UsageIoAuditUpdate>>,
 }
 
+/// 持久终态没有收到控制面确认，原 outbox 必须保留并重试。
+#[derive(Debug, thiserror::Error)]
+pub enum DurableUsageError {
+    #[error("durable usage delivery is unavailable")]
+    Unavailable,
+}
+
 /// 只携带标量长度，不能作为一条计费用量事件。
 #[derive(Debug, Clone, Serialize)]
 pub struct UsageIoAuditUpdate {
@@ -1413,6 +1420,11 @@ pub fn bounded_inbound_protocol(raw: &str) -> &'static str {
 }
 
 impl UsageSink {
+    /// 接口基线只显式报告实现缺失；排队不是持久交付确认。
+    pub async fn emit_durable(&self, _event: UsageEvent) -> Result<(), DurableUsageError> {
+        Err(DurableUsageError::Unavailable)
+    }
+
     /// Events waiting in the queue to the control plane, not counting a
     /// batch the reporter has already taken off it.
     pub fn queued(&self) -> u64 {

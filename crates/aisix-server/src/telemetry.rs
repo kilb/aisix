@@ -1521,6 +1521,8 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    include!("telemetry_durable_tests.rs");
+
     fn write_test_bundle(dir: &Path) -> MtlsBundle {
         let ca_kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
         let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
