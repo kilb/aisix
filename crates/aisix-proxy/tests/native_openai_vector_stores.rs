@@ -1676,7 +1676,7 @@ async fn responses_stream_preserves_search_details_and_citations_before_terminal
     assert_eq!(answer.status(), StatusCode::OK);
     let bytes = to_bytes(answer.into_body(), 1 << 20).await.unwrap();
     let frames = aisix_gateway::sse::SseDecoder::default()
-        .feed(&bytes)
+        .feed(bytes.as_slice())
         .unwrap();
     let completed = frames
         .into_iter()
