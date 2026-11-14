@@ -105,7 +105,59 @@ impl NativeObjectRegistry for Registry {
                 .unwrap()
                 .insert(key, (request.api_key_id, record.clone()));
             let mut reply = NativeReply::new("bound");
-            reply.record = Some(record);
+            reply.record = Some(record.clone());
+            let mut records = self.records.lock().unwrap();
+            for object in request.objects {
+                if operation.protocol != NativeProtocol::Openai
+                    || operation.kind != NativeObjectKind::Response
+                    || !matches!(
+                        object.kind,
+                        NativeObjectKind::ResponseItem | NativeObjectKind::ResponseContainer
+                    )
+                {
+                    return Err(NativeRegistryError::InvalidRequest);
+                }
+                let key = (
+                    operation.protocol.as_str().to_string(),
+                    object.kind.as_str().to_string(),
+                    object.raw_id.clone(),
+                );
+                let child = if let Some((owner, existing)) = records.get(&key) {
+                    if *owner != request.api_key_id
+                        || existing.deleted
+                        || existing.protocol != Some(operation.protocol)
+                        || existing.kind != Some(object.kind)
+                        || existing.parent_id.is_none()
+                        || !existing.origin.as_ref().is_some_and(|origin| {
+                            origin.provider_key_id == operation.origin.provider_key_id
+                                && origin.boundary == operation.origin.boundary
+                        })
+                    {
+                        return Err(NativeRegistryError::Conflict);
+                    }
+                    existing.clone()
+                } else {
+                    let mut derived = operation.clone();
+                    derived.operation_id = Uuid::new_v4();
+                    derived.kind = object.kind;
+                    derived.parent_id = Some(record.record_id);
+                    derived.asynchronous = false;
+                    let child: NativeRecord = serde_json::from_value(json!({
+                        "record_id":Uuid::new_v4(),"operation_id":derived.operation_id,
+                        "api_key_id":request.api_key_id,"requested_model_id":derived.requested_model_id,
+                        "requested_model":derived.requested_model,"origin":derived.origin,
+                        "protocol":derived.protocol,"kind":derived.kind,"raw_id":object.raw_id,
+                        "parent_id":record.record_id,"version":1
+                    })).unwrap();
+                    self.operations
+                        .lock()
+                        .unwrap()
+                        .insert(derived.operation_id, derived);
+                    records.insert(key, (request.api_key_id, child.clone()));
+                    child
+                };
+                reply.records.push(child);
+            }
             Ok(reply)
         })
     }
