@@ -1905,20 +1905,13 @@ macro_rules! resolve_observed_stream_completion {
 }
 pub(crate) use resolve_observed_stream_completion;
 
-/// 后台任务的 HTTP 接受结束不等于推理结束；原推理终态由持久观察器单独发出。
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn emit_usage_with_finality(
-    state: &ProxyState,
-    snap: &AisixSnapshot,
+/// 纯字段准备可用于首次持久终态；不读取当前资源或请求上下文，不重放观测副作用。
+pub(crate) fn prepare_usage_event_fields(
     surface: Surface,
     mut event: UsageEvent,
-    labels: UsageEventLabels<'_>,
-    content: Option<&aisix_obs::CapturedContent>,
-    trace: Option<&std::sync::Arc<aisix_obs::RequestTraceBundle>>,
-    terminal: bool,
     logical_final: bool,
     dispatched: bool,
-) {
+) -> UsageEvent {
     // Stamped here rather than at each construction site: this is the one
     // point every usage event passes through, so the operation cannot be
     // present on a family's success path and missing from its error or
@@ -1927,8 +1920,6 @@ pub(crate) fn emit_usage_with_finality(
     event.is_final_attempt = logical_final;
     // 与上游 span 使用同一派发事实；零耗时仍可能是一次实际调用。
     event.upstream_dispatched = Some(dispatched);
-    stamp_requested_model_id(&mut event);
-    stamp_billing_fields(snap, &mut event, labels.provider_key_id);
     // After the name has looked up its entry, and before the access log and
     // every consumer read the row.
     bound_outside_text(&mut event);
@@ -1956,6 +1947,26 @@ pub(crate) fn emit_usage_with_finality(
     if is_failure_row(&event) && event.error_message.trim().is_empty() {
         event.error_message = aisix_obs::request_failed_message(event.status_code);
     }
+    event
+}
+
+/// 后台任务的 HTTP 接受结束不等于推理结束；原推理终态由持久观察器单独发出。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_usage_with_finality(
+    state: &ProxyState,
+    snap: &AisixSnapshot,
+    surface: Surface,
+    mut event: UsageEvent,
+    labels: UsageEventLabels<'_>,
+    content: Option<&aisix_obs::CapturedContent>,
+    trace: Option<&std::sync::Arc<aisix_obs::RequestTraceBundle>>,
+    terminal: bool,
+    logical_final: bool,
+    dispatched: bool,
+) {
+    stamp_requested_model_id(&mut event);
+    stamp_billing_fields(snap, &mut event, labels.provider_key_id);
+    let mut event = prepare_usage_event_fields(surface, event, logical_final, dispatched);
     let mut upstream_error_body = None;
     if dispatched {
         let response = crate::attribution::take_attempt_upstream_response(event.attempt_index);

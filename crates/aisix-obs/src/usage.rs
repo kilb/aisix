@@ -1268,66 +1268,11 @@ pub struct UsageSink {
     metrics: Option<crate::metrics::Metrics>,
     drop_warnings: std::sync::Arc<DropWarnings>,
     io_audit_tx: Option<tokio::sync::mpsc::Sender<UsageIoAuditUpdate>>,
+    durable_tx: Option<tokio::sync::mpsc::Sender<DurableUsageRequest>>,
 }
 
-/// 持久终态没有收到控制面确认，原 outbox 必须保留并重试。
-#[derive(Debug, thiserror::Error)]
-pub enum DurableUsageError {
-    #[error("durable usage delivery is unavailable")]
-    Unavailable,
-    #[error("the canonical durable usage event is invalid")]
-    InvalidEvent,
-}
-
-/// 持久 outbox 的原始字节；构造后只能读取，交付不能重新填字段或改写事件。
-#[derive(Clone)]
-pub struct DurableUsageEvent {
-    event_id: String,
-    json: std::sync::Arc<str>,
-}
-
-impl std::fmt::Debug for DurableUsageEvent {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DurableUsageEvent")
-            .field("bytes", &self.json.len())
-            .finish_non_exhaustive()
-    }
-}
-
-impl DurableUsageEvent {
-    pub fn from_event(event: &UsageEvent) -> Result<Self, DurableUsageError> {
-        let json = serde_json::to_string(event).map_err(|_| DurableUsageError::InvalidEvent)?;
-        Self::from_saved_json(&event.event_id, json)
-    }
-
-    pub fn from_saved_json(event_id: &str, json: String) -> Result<Self, DurableUsageError> {
-        if event_id.is_empty() || event_id.chars().count() > 128 || json.len() > 256 << 10 {
-            return Err(DurableUsageError::InvalidEvent);
-        }
-        let value: serde_json::Value =
-            serde_json::from_str(&json).map_err(|_| DurableUsageError::InvalidEvent)?;
-        if value.get("event_id").and_then(serde_json::Value::as_str) != Some(event_id)
-            || !value
-                .get("occurred_at")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|at| chrono::DateTime::parse_from_rfc3339(at).is_ok())
-        {
-            return Err(DurableUsageError::InvalidEvent);
-        }
-        Ok(Self {
-            event_id: event_id.to_owned(),
-            json: json.into(),
-        })
-    }
-
-    pub fn event_id(&self) -> &str {
-        &self.event_id
-    }
-
-    pub fn as_json(&self) -> &str {
-        &self.json
-    }
-}
+mod durable;
+pub use durable::{DurableUsageError, DurableUsageEvent, DurableUsageRequest};
 
 /// 只携带标量长度，不能作为一条计费用量事件。
 #[derive(Debug, Clone, Serialize)]
@@ -1472,9 +1417,29 @@ pub fn bounded_inbound_protocol(raw: &str) -> &'static str {
 }
 
 impl UsageSink {
-    /// 接口基线只显式报告实现缺失；排队不是持久交付确认。
-    pub async fn emit_durable(&self, _event: DurableUsageEvent) -> Result<(), DurableUsageError> {
-        Err(DurableUsageError::Unavailable)
+    /// 只在控制面明确接收后成功；任何失败或取消都由原持久 outbox 重试。
+    pub async fn emit_durable(&self, event: DurableUsageEvent) -> Result<(), DurableUsageError> {
+        let tx = self
+            .durable_tx
+            .as_ref()
+            .ok_or(DurableUsageError::Unavailable)?;
+        let (request, receipt) = DurableUsageRequest::new(event);
+        tx.try_send(request).map_err(|error| match error {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => DurableUsageError::QueueFull,
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => DurableUsageError::QueueClosed,
+        })?;
+        tokio::time::timeout(std::time::Duration::from_secs(15), receipt)
+            .await
+            .map_err(|_| DurableUsageError::TimedOut)?
+            .map_err(|_| DurableUsageError::ReceiptLost)?
+    }
+
+    pub fn with_durable_sender(
+        mut self,
+        tx: tokio::sync::mpsc::Sender<DurableUsageRequest>,
+    ) -> Self {
+        self.durable_tx = Some(tx);
+        self
     }
 
     /// Events waiting in the queue to the control plane, not counting a
@@ -1494,6 +1459,7 @@ impl UsageSink {
             metrics: None,
             drop_warnings: Default::default(),
             io_audit_tx: None,
+            durable_tx: None,
         }
     }
 
@@ -1506,6 +1472,7 @@ impl UsageSink {
             metrics: None,
             drop_warnings: Default::default(),
             io_audit_tx: None,
+            durable_tx: None,
         }
     }
 
