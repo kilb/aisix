@@ -591,6 +591,7 @@ fn keeps_own_envelope(err: &ProxyError) -> bool {
             | ProxyError::RouteForbidden(_)
             | ProxyError::EndpointForbidden(_)
             | ProxyError::JobListRefused
+            | ProxyError::NativeOperationConflict
             | ProxyError::InvalidRequest(_)
             | ProxyError::RequestTooLarge { .. }
             | ProxyError::WebSocketUpgradeRequired { .. }
@@ -1590,6 +1591,7 @@ mod tests {
             | ProxyError::RouteForbidden(_)
             | ProxyError::EndpointForbidden(_)
             | ProxyError::JobListRefused
+            | ProxyError::NativeOperationConflict
             | ProxyError::InvalidRequest(_)
             | ProxyError::RequestTooLarge { .. }
             | ProxyError::WebSocketUpgradeRequired { .. }
@@ -1650,6 +1652,7 @@ mod tests {
             ProxyError::StoredObjectReference("conversation".into()),
             ProxyError::ModelSelectorRefused("models".into()),
             ProxyError::JobListRefused,
+            ProxyError::NativeOperationConflict,
             ProxyError::ModelForbidden("m".into()),
             ProxyError::ModelIpRestricted("m".into()),
             ProxyError::RouteIpRestricted("r".into()),
@@ -1698,6 +1701,21 @@ mod tests {
     /// Platform mode classes every variant but the gateway's own refusals
     /// that name no upstream: a variant left off that list is classed, so
     /// one added later fails closed.
+    // 本地生命周期冲突不携带上游细节；平台模式保留可重试的 409 和固定错误码。
+    #[test]
+    fn native_lifecycle_conflicts_keep_their_status_and_code_in_platform_mode() {
+        in_platform_mode(|| {
+            let error = ProxyError::NativeOperationConflict;
+            assert_eq!(caller_class(&error), None);
+            assert_eq!(error.status(), axum::http::StatusCode::CONFLICT);
+            let envelope = serde_json::to_value(error.envelope()).unwrap();
+            assert_eq!(
+                envelope.pointer("/error/code"),
+                Some(&json!("native_operation_conflict"))
+            );
+        });
+    }
+
     #[test]
     fn every_variant_is_classed_unless_it_keeps_its_own_envelope() {
         in_platform_mode(|| {
