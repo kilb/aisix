@@ -2,6 +2,7 @@ import "./operations.css";
 import { useEffect, useState } from "react";
 import type { TabProps } from "../App";
 import { DirectModelProbe } from "../components/DirectModelProbe";
+import { ModelCapabilityAssessment } from "../components/ModelCapabilityAssessment";
 import { PageHeader } from "../components/page";
 import { probeDirectModel } from "../lib/directModelProbeApi";
 import { useResource } from "../lib/useResource";
@@ -12,31 +13,42 @@ import type { AccountDoc, ModelDoc } from "./models/catalog";
 export function ModelTests({ operator, initialSection, sectionVisit, onGoto }: TabProps) {
   const models = useResource<ModelDoc>("models");
   const accounts = useResource<AccountDoc>("provider_keys");
-  const [section, setSection] = useState<"current" | "history">(initialSection === "history" ? "history" : "current");
-  useEffect(() => { setSection(initialSection === "history" ? "history" : "current"); }, [initialSection, sectionVisit]);
-  function select(next: "current" | "history"): void {
+  const canAssess = operator.role === "admin";
+  type Section = "current" | "history" | "assessment";
+  const requested = initialSection === "history" ? "history" : initialSection === "assessment" && canAssess ? "assessment" : "current";
+  const [section, setSection] = useState<Section>(requested);
+  useEffect(() => { setSection(requested); }, [requested, sectionVisit]);
+  const sections: Section[] = canAssess ? ["current", "history", "assessment"] : ["current", "history"];
+  function select(next: Section): void {
     setSection(next);
     onGoto("model-tests", next);
   }
   return <div className="cp-operations cp-modeltests">
     <PageHeader eyebrow="MODELS · 模型测试" title="模型测试" dataLead="显式发起直连测试，查看进度与已保存历史。测试可能产生上游费用。" />
     <div className="mb-4 flex flex-wrap gap-2" role="tablist" aria-label="模型测试视图">
-      {(["current", "history"] as const).map((value) => <Button
+      {(["current", "history", "assessment"] as const).map((value) => <Button
         key={value} type="button" role="tab" id={`model-tests-${value}-tab`}
         kind={section === value ? "primary" : "secondary"}
         aria-selected={section === value} aria-controls={`model-tests-${value}`}
         tabIndex={section === value ? 0 : -1}
+        disabled={value === "assessment" && !canAssess}
+        title={value === "assessment" && !canAssess ? "仅管理员可读取和发起能力对照" : undefined}
         onClick={() => select(value)}
         onKeyDown={(event) => {
           if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
             event.preventDefault();
-            const next = event.key === "Home" ? "current" : event.key === "End" ? "history" : value === "current" ? "history" : "current";
+            const index = sections.indexOf(value);
+            const next = event.key === "Home" ? sections[0]! : event.key === "End" ? sections[sections.length - 1]! : sections[(index + (event.key === "ArrowRight" ? 1 : -1) + sections.length) % sections.length]!;
             select(next);
             document.getElementById(`model-tests-${next}-tab`)?.focus();
           }
         }}
-      >{value === "current" ? "当前测试" : "测试历史"}</Button>)}
+      >{value === "current" ? "当前测试" : value === "history" ? "测试历史" : "能力对照"}</Button>)}
     </div>
-    <DirectModelProbe models={models.items} accounts={accounts.items} loadError={models.error !== null} canProbe={operator.role === "admin"} probe={probeDirectModel} section={section} />
+    {!canAssess && <p className="hint mb-4">能力对照的计划、运行、历史与导出仅管理员可用。</p>}
+    <div hidden={section === "assessment"}>
+      <DirectModelProbe models={models.items} accounts={accounts.items} loadError={models.error !== null} canProbe={operator.role === "admin"} probe={probeDirectModel} section={section === "history" ? "history" : "current"} />
+    </div>
+    {section === "assessment" && canAssess && <ModelCapabilityAssessment models={models.items} accounts={accounts.items} loadError={models.error !== null || accounts.error !== null} />}
   </div>;
 }

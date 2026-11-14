@@ -9,7 +9,7 @@
 //! <https://platform.claude.com/docs/en/build-with-claude/streaming>
 
 mod capability;
-mod providers;
+pub(crate) mod providers;
 mod sdk_http;
 
 use std::sync::Arc;

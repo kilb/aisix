@@ -317,6 +317,7 @@ impl TokenMinter {
                 BridgeError::Transport(format!("vertex token mint POST {endpoint}: {e}"))
             })?;
 
+        let resp = aisix_gateway::upstream_io::limit_untracked_response(resp);
         let status = resp.status();
         if !status.is_success() {
             // Read Retry-After BEFORE consuming the body via .text() so a
@@ -377,6 +378,132 @@ mod tests {
     use jsonwebtoken::{decode, DecodingKey, Validation};
     use wiremock::matchers::{body_string_contains, method};
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+    async fn assessment_token_http(
+        status: u16,
+        answer: impl FnOnce(&str) -> String + Send + 'static,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let header_end = loop {
+                let mut chunk = [0; 1024];
+                let n = socket.read(&mut chunk).await.unwrap();
+                assert!(n > 0);
+                request.extend_from_slice(&chunk[..n]);
+                if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let length = std::str::from_utf8(&request[..header_end])
+                .unwrap()
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':')
+                        .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                        .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            while request.len() < header_end + length {
+                let mut chunk = [0; 1024];
+                let n = socket.read(&mut chunk).await.unwrap();
+                assert!(n > 0);
+                request.extend_from_slice(&chunk[..n]);
+            }
+            let body =
+                answer(std::str::from_utf8(&request[header_end..header_end + length]).unwrap());
+            let head=format!("HTTP/1.1 {status} Component Response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRetry-After: 7\r\nConnection: close\r\n\r\n",body.len());
+            socket.write_all(head.as_bytes()).await.unwrap();
+            let _ = socket.write_all(body.as_bytes()).await;
+            let _ = socket.shutdown().await;
+        });
+        (format!("http://{address}/token"), task)
+    }
+
+    #[tokio::test]
+    async fn assessment_token_response_cap_rejects_large_real_http_and_leaves_default_none() {
+        use aisix_gateway::upstream_io::{scope_response_body_limit, ResponseBodyLimit};
+        for (maximum, size, reject) in [
+            (None, 65537, false),
+            (Some(65536), 65537, true),
+            (Some(4096), 6, false),
+        ] {
+            let (endpoint, server) = assessment_token_http(200, move |_| {
+                serde_json::json!({"access_token":"x".repeat(size),"expires_in":3600}).to_string()
+            })
+            .await;
+            let (pem, _) = test_key_pair();
+            let sa = sample_sa(&pem, &endpoint);
+            let minter = TokenMinter::new(Client::builder().no_proxy().build().unwrap());
+            let limit = maximum.map(ResponseBodyLimit::new);
+            let tap = Arc::new(aisix_gateway::response_tap::ResponseHeaderTap::default());
+            let result = scope_response_body_limit(
+                limit.clone(),
+                aisix_gateway::response_tap::scope(tap.clone(), minter.get_token(&sa)),
+            )
+            .await;
+            server.await.unwrap();
+            if reject {
+                assert!(matches!(result, Err(BridgeError::TokenExchangeDecode(_))));
+                let limit = limit.unwrap();
+                assert!(limit.exceeded());
+                assert!(limit.observed_bytes() > 65536);
+            } else {
+                assert_eq!(result.unwrap().len(), size);
+                assert!(limit.is_none_or(|limit| !limit.exceeded()));
+            }
+            assert!(
+                tap.upstream_io_observer().is_none(),
+                "OAuth交换不能登记为模型推理用量"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn assessment_token_response_cap_keeps_error_status_retry_and_credential_scrubbing() {
+        use aisix_gateway::upstream_io::{scope_response_body_limit, ResponseBodyLimit};
+        let (endpoint, server) = assessment_token_http(503, |form| {
+            let assertion = form
+                .split('&')
+                .find_map(|part| part.strip_prefix("assertion="))
+                .unwrap();
+            format!("credential={assertion}; refresh required")
+        })
+        .await;
+        let (pem, _) = test_key_pair();
+        let sa = sample_sa(&pem, &endpoint);
+        let minter = TokenMinter::new(Client::builder().no_proxy().build().unwrap());
+        let tap = Arc::new(aisix_gateway::response_tap::ResponseHeaderTap::default());
+        let limit = ResponseBodyLimit::new(4096);
+        let error = scope_response_body_limit(
+            Some(limit.clone()),
+            aisix_gateway::response_tap::scope(tap.clone(), minter.get_token(&sa)),
+        )
+        .await
+        .unwrap_err();
+        server.await.unwrap();
+        match error {
+            BridgeError::UpstreamStatus {
+                status,
+                message,
+                retry_after,
+                wire,
+                ..
+            } => {
+                assert_eq!(status, 503);
+                assert_eq!(retry_after, Some(Duration::from_secs(7)));
+                assert_eq!(wire, aisix_gateway::UpstreamWire::CredentialEndpoint);
+                assert!(message.contains("credential=<redacted>; refresh required"));
+                assert!(!message.contains("eyJ"));
+            }
+            _ => panic!("必须保留credential endpoint HTTP错误分类"),
+        }
+        assert!(!limit.exceeded());
+        assert!(tap.upstream_io_observer().is_none());
+    }
 
     /// Generate a fresh 2048-bit RSA key pair PEM-encoded for tests.
     /// Returns `(private_pem, public_pem)`. Uses jsonwebtoken's

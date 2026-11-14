@@ -20,10 +20,12 @@ use crate::error::ApiError;
 use crate::upstream_http;
 
 pub(super) fn client(client: reqwest::Client) -> SharedHttpClient {
+    let body_limit = aisix_gateway::upstream_io::response_body_limit();
     http_client_fn(move |settings, _| {
         SharedHttpConnector::new(Connector {
             transport: Transport::Prepared(client.clone()),
             read_timeout: settings.read_timeout(),
+            body_limit: body_limit.clone(),
         })
     })
 }
@@ -33,6 +35,7 @@ pub(super) fn credential_client(
     outbound: Arc<upstream_http::Client>,
     timeout: Duration,
 ) -> SharedHttpClient {
+    let body_limit = aisix_gateway::upstream_io::response_body_limit();
     http_client_fn(move |settings, _| {
         SharedHttpConnector::new(Connector {
             transport: Transport::Credentials {
@@ -40,6 +43,7 @@ pub(super) fn credential_client(
                 timeout,
             },
             read_timeout: settings.read_timeout(),
+            body_limit: body_limit.clone(),
         })
     })
 }
@@ -71,6 +75,7 @@ impl Transport {
 struct Connector {
     transport: Transport,
     read_timeout: Option<Duration>,
+    body_limit: Option<aisix_gateway::upstream_io::ResponseBodyLimit>,
 }
 
 impl std::fmt::Debug for Connector {
@@ -83,25 +88,34 @@ impl HttpConnector for Connector {
     fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
         let transport = self.transport.clone();
         let read_timeout = self.read_timeout;
-        HttpConnectorFuture::new(async move {
-            let request = request_into_reqwest(request)?;
-            let sending = async {
-                let client = transport.client_for(request.url()).await?;
-                client.execute(request).await.map_err(transport_error)
-            };
-            // 连接时限由受保护客户端固定为两秒，探测外层另有三十秒总界限。
-            // Smithy 的 read_timeout 只界定从发起请求到响应头，不能截断完整事件流。
-            let response = match read_timeout {
-                Some(timeout) => tokio::time::timeout(timeout, sending).await.map_err(|_| {
-                    ConnectorError::timeout(Box::new(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "模型探测等待上游响应超时",
-                    )))
-                })??,
-                None => sending.await?,
-            };
-            response_into_smithy(response)
-        })
+        let body_limit = self
+            .body_limit
+            .clone()
+            .or_else(aisix_gateway::upstream_io::response_body_limit);
+        HttpConnectorFuture::new(aisix_gateway::upstream_io::scope_response_body_limit(
+            body_limit,
+            async move {
+                let request = request_into_reqwest(request)?;
+                let sending = async {
+                    let client = transport.client_for(request.url()).await?;
+                    client.execute(request).await.map_err(transport_error)
+                };
+                // 连接时限由受保护客户端固定为两秒，探测外层另有三十秒总界限。
+                // Smithy 的 read_timeout 只界定从发起请求到响应头，不能截断完整事件流。
+                let response = match read_timeout {
+                    Some(timeout) => {
+                        tokio::time::timeout(timeout, sending).await.map_err(|_| {
+                            ConnectorError::timeout(Box::new(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "模型探测等待上游响应超时",
+                            )))
+                        })??
+                    }
+                    None => sending.await?,
+                };
+                response_into_smithy(response)
+            },
+        ))
     }
 }
 
@@ -128,6 +142,9 @@ fn request_into_reqwest(request: HttpRequest) -> Result<reqwest::Request, Connec
 }
 
 fn response_into_smithy(response: reqwest::Response) -> Result<HttpResponse, ConnectorError> {
+    // 只在能力对照显式安装预算时包原始HTTP body，先于Smithy事件/JSON解码。
+    // 独立观察不注册到正式用量；共享limit仍保留超额chunk的实际读取字节。
+    let response = aisix_gateway::upstream_io::limit_untracked_response(response);
     let status = response.status();
     let version = response.version();
     let headers = response.headers().clone();
@@ -170,6 +187,138 @@ mod tests {
     use futures::StreamExt;
     use http_body_util::BodyExt;
 
+    async fn assessment_http_body(wire: Vec<u8>) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("组件HTTP监听");
+        let address = listener.local_addr().expect("监听地址");
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("真实HTTP连接");
+            let mut request = [0; 4096];
+            let _ = socket.read(&mut request).await.expect("请求头");
+            let head = format!("HTTP/1.1 206 Partial Content\r\nContent-Type: application/vnd.amazon.eventstream\r\nContent-Length: {}\r\nX-Amzn-Requestid: assessment-component\r\nConnection: close\r\n\r\n",wire.len());
+            socket.write_all(head.as_bytes()).await.expect("发送响应头");
+            let _ = socket.write_all(&wire).await;
+            let _ = socket.shutdown().await;
+        });
+        (
+            format!("http://{address}/model/component/converse-stream"),
+            task,
+        )
+    }
+
+    #[tokio::test]
+    async fn assessment_smithy_http_body_limit_survives_connector_scope_and_keeps_default_unlimited(
+    ) {
+        use aisix_gateway::upstream_io::ResponseBodyLimit;
+        let cases = [
+            (None, vec![0u8; 65537], false),
+            (Some(0), vec![], false),
+            (Some(4), "A汉".as_bytes().to_vec(), false),
+            (Some(3), "A汉".as_bytes().to_vec(), true),
+            (Some(65536), vec![0u8; 65537], true),
+        ];
+        for (maximum, wire, must_reject) in cases {
+            let limit = maximum.map(ResponseBodyLimit::new);
+            let (url, server) = assessment_http_body(wire.clone()).await;
+            let connector = Connector {
+                transport: Transport::Prepared(
+                    reqwest::Client::builder()
+                        .no_proxy()
+                        .build()
+                        .expect("组件HTTP客户端"),
+                ),
+                read_timeout: Some(Duration::from_secs(2)),
+                body_limit: limit.clone(),
+            };
+            // body在Connector自己的task-local scope结束后才读取，不能丢失assessment预算。
+            let response = connector
+                .call(HttpRequest::get(url).expect("SDK请求"))
+                .await
+                .expect("HTTP响应");
+            assert_eq!(response.status().as_u16(), 206);
+            assert_eq!(
+                response.headers().get("x-amzn-requestid"),
+                Some("assessment-component")
+            );
+            let response = response.try_into_http1x().expect("HTTP body");
+            let mut body = response.into_body();
+            let mut delivered = Vec::new();
+            let mut errored = false;
+            while let Some(frame) = body.frame().await {
+                match frame {
+                    Ok(frame) => {
+                        if let Some(bytes) = frame.data_ref() {
+                            delivered.extend_from_slice(bytes);
+                        }
+                    }
+                    Err(_) => {
+                        errored = true;
+                        break;
+                    }
+                }
+            }
+            server.await.expect("组件服务结束");
+            assert_eq!(errored, must_reject);
+            if must_reject {
+                let maximum = maximum.expect("固定上限");
+                assert!(delivered.len() as u64 <= maximum);
+                let limit = limit.as_ref().expect("assessment预算");
+                assert!(limit.exceeded());
+                assert!(
+                    limit.observed_bytes() > maximum,
+                    "完整超额chunk仍记实际读取数"
+                );
+            } else {
+                assert_eq!(delivered, wire);
+            }
+            assert!(aisix_gateway::upstream_io::response_body_limit().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn assessment_smithy_outer_observer_counts_the_whole_rejected_transport_chunk() {
+        use aisix_gateway::upstream_io::{
+            scope_response_body_limit, ObservedBody, Protocol, ResponseBodyLimit,
+            UpstreamIoObserver,
+        };
+        let limit = ResponseBodyLimit::new(3);
+        let (url, server) = assessment_http_body("A汉".as_bytes().to_vec()).await;
+        let connector = Connector {
+            transport: Transport::Prepared(reqwest::Client::builder().no_proxy().build().unwrap()),
+            read_timeout: Some(Duration::from_secs(2)),
+            body_limit: Some(limit.clone()),
+        };
+        let response = connector
+            .call(HttpRequest::get(url).unwrap())
+            .await
+            .unwrap()
+            .try_into_http1x()
+            .unwrap();
+        let io = UpstreamIoObserver::new(Protocol::Converse);
+        let mut body = scope_response_body_limit(Some(limit.clone()), async {
+            ObservedBody::response(response.into_body(), io.clone())
+        })
+        .await;
+        let mut rejected = false;
+        while let Some(frame) = body.frame().await {
+            if frame.is_err() {
+                rejected = true;
+                break;
+            }
+        }
+        assert!(rejected);
+        server.await.unwrap();
+        assert_eq!(limit.observed_bytes(), 4);
+        assert_eq!(
+            io.snapshot().response_body_bytes,
+            Some(4),
+            "外层必须补记transport拒绝而未交出的完整chunk"
+        );
+        assert!(!io.snapshot().response_complete);
+    }
+
     #[tokio::test]
     async fn credential_requests_check_the_actual_sdk_url_before_dialing() {
         let outbound = Arc::new(
@@ -182,6 +331,7 @@ mod tests {
                 timeout: Duration::from_millis(50),
             },
             read_timeout: Some(Duration::from_secs(1)),
+            body_limit: None,
         };
         // 没有监听者的本地端口：删掉发送前的策略检查会变成连接错误，而不是策略拒绝。
         let request =

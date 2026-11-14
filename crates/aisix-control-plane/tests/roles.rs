@@ -27,6 +27,11 @@ use uuid::Uuid;
 /// creates something new each time.
 fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option<Value>) {
     match (method, path) {
+        ("GET", "/admin/model-assessment-suites") | ("GET", "/admin/model-assessments") => (path.to_string(), None),
+        ("GET", "/admin/model-assessments/{id}") | ("GET", "/admin/model-assessments/{id}/samples") | ("GET", "/admin/model-assessments/{id}/export") => (path.replace("{id}", &Uuid::nil().to_string()), None),
+        ("POST", "/admin/model-assessments/plan") => (path.to_string(), Some(json!({"reference":{"model_id":Uuid::new_v4(),"model_version":"1","provider_key_version":"1"},"candidate":{"model_id":Uuid::new_v4(),"model_version":"1","provider_key_version":"1"},"reference_source":{"kind":"direct_provider","note":"roles","verified_at":"2026-01-01T00:00:00Z","independence_confirmed":true},"mode":"quick","suite_id":"capability-v1","suite_version":"1"}))),
+        ("POST", "/admin/model-assessments/{id}/start") => (path.replace("{id}", &Uuid::nil().to_string()), Some(json!({"client_request_id":Uuid::new_v4(),"accept_unknown_price":true}))),
+        ("POST", "/admin/model-assessments/{id}/cancel") => (path.replace("{id}", &Uuid::nil().to_string()), Some(json!({}))),
         // Rejected as too short, after the role check.
         ("POST", "/admin/password") => (
             path.to_string(),

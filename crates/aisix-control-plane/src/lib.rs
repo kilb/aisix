@@ -34,6 +34,7 @@ pub mod keys;
 pub mod kine;
 pub mod member_usage;
 pub mod members;
+pub mod model_assessments;
 pub mod model_probe_history;
 pub mod model_probes;
 pub mod native_objects;
@@ -397,6 +398,7 @@ where
         stopping.clone(),
     ));
     tasks.push(native_objects::spawn(state.clone(), stopping.clone()));
+    tasks.push(model_assessments::spawn(state.clone(), stopping.clone()));
     if let Some((listener, tls, _)) = dp {
         tasks.push(tokio::spawn(dp::listener::serve_dp(
             listener,

@@ -30,7 +30,7 @@ use serde_json::{json, Value};
 use crate::auth::{MemberRole, OperatorRole, KEY_HOLDERS};
 use crate::error::{ApiError, Detail};
 use crate::{
-    audit, billing, channels, dp, gateways, groups, keys, member_usage, members,
+    audit, billing, channels, dp, gateways, groups, keys, member_usage, members, model_assessments,
     model_probe_history, model_probes, operators, pricing, projector, resources, rollout, tenants,
     upstream_models, usage, usage_metrics, AppState,
 };
@@ -79,6 +79,46 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
         MinRole::Op(OperatorRole::Admin),
     ),
     ("GET", "/admin/audit", MinRole::Op(OperatorRole::Viewer)),
+    (
+        "GET",
+        "/admin/model-assessment-suites",
+        MinRole::Op(OperatorRole::Admin),
+    ),
+    (
+        "POST",
+        "/admin/model-assessments/plan",
+        MinRole::Op(OperatorRole::Admin),
+    ),
+    (
+        "POST",
+        "/admin/model-assessments/{id}/start",
+        MinRole::Op(OperatorRole::Admin),
+    ),
+    (
+        "GET",
+        "/admin/model-assessments",
+        MinRole::Op(OperatorRole::Admin),
+    ),
+    (
+        "GET",
+        "/admin/model-assessments/{id}",
+        MinRole::Op(OperatorRole::Admin),
+    ),
+    (
+        "GET",
+        "/admin/model-assessments/{id}/samples",
+        MinRole::Op(OperatorRole::Admin),
+    ),
+    (
+        "POST",
+        "/admin/model-assessments/{id}/cancel",
+        MinRole::Op(OperatorRole::Admin),
+    ),
+    (
+        "GET",
+        "/admin/model-assessments/{id}/export",
+        MinRole::Op(OperatorRole::Admin),
+    ),
     (
         "GET",
         "/admin/environment",
@@ -852,6 +892,14 @@ pub fn browser_router(state: AppState) -> Router {
         )
         .route("/admin/models/{id}/probe", post(model_probes::probe))
         .route("/admin/model-probes", get(model_probe_history::list))
+        .route("/admin/model-assessment-suites", get(model_assessments::suites))
+        .route("/admin/model-assessments/plan", post(model_assessments::plan))
+        .route("/admin/model-assessments/{id}/start", post(model_assessments::start))
+        .route("/admin/model-assessments", get(model_assessments::list))
+        .route("/admin/model-assessments/{id}", get(model_assessments::get))
+        .route("/admin/model-assessments/{id}/samples", get(model_assessments::samples))
+        .route("/admin/model-assessments/{id}/cancel", post(model_assessments::cancel))
+        .route("/admin/model-assessments/{id}/export", get(model_assessments::export))
         .route("/api/signup", post(members::signup))
         .route("/api/login", post(members::login))
         .route("/api/logout", post(members::logout))

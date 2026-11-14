@@ -7,7 +7,7 @@ use reqwest::ResponseBuilderExt;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
 
@@ -32,6 +32,66 @@ pub enum Protocol {
 }
 
 static NEXT_EXCHANGE_ID: AtomicU64 = AtomicU64::new(1);
+
+tokio::task_local! {
+    static RESPONSE_BODY_LIMIT: ResponseBodyLimit;
+}
+
+/// 仅显式能力对照安装；上限是交付给解码器的body字节，不是socket物理读取量。
+#[derive(Clone, Debug)]
+pub struct ResponseBodyLimit {
+    maximum: u64,
+    exceeded: Arc<AtomicBool>,
+    observed_bytes: Arc<AtomicU64>,
+}
+
+impl ResponseBodyLimit {
+    pub fn new(maximum: u64) -> Self {
+        Self {
+            maximum,
+            exceeded: Arc::new(AtomicBool::new(false)),
+            observed_bytes: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    pub fn exceeded(&self) -> bool {
+        self.exceeded.load(Ordering::Relaxed)
+    }
+
+    /// 每个body已实际poll到的最大字节数；超限的完整chunk也计算，不截小计量。
+    pub fn observed_bytes(&self) -> u64 {
+        self.observed_bytes.load(Ordering::Relaxed)
+    }
+
+    fn observe(&self, received: u64) -> bool {
+        self.observed_bytes.fetch_max(received, Ordering::Relaxed);
+        let exceeded = received > self.maximum;
+        if exceeded {
+            self.exceeded.store(true, Ordering::Relaxed);
+        }
+        exceeded
+    }
+}
+
+pub fn response_body_limit() -> Option<ResponseBodyLimit> {
+    RESPONSE_BODY_LIMIT.try_with(Clone::clone).ok()
+}
+
+pub async fn scope_response_body_limit<F: std::future::Future>(
+    limit: Option<ResponseBodyLimit>,
+    future: F,
+) -> F::Output {
+    match limit {
+        Some(limit) => RESPONSE_BODY_LIMIT.scope(limit, future).await,
+        None => future.await,
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("assessment response body exceeds the decoder byte limit")]
+struct ResponseBodyLimitExceeded;
+
+type BodyError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 struct Exchange {
     id: u64,
@@ -485,6 +545,16 @@ impl UpstreamIoObserver {
         });
     }
 
+    fn observe_rejected_response_bytes(&self, bytes: usize) {
+        self.update(|exchange| {
+            *exchange.response_bytes.get_or_insert(0) = exchange
+                .response_bytes
+                .unwrap_or(0)
+                .saturating_add(bytes as u64);
+            exchange.output_partial = true;
+        });
+    }
+
     pub fn observe_response_json(&self, value: &Value) {
         self.update(|exchange| {
             exchange
@@ -748,6 +818,9 @@ pub struct ObservedBody<B> {
     direction: Direction,
     ended: bool,
     remaining: Option<u64>,
+    response_limit: Option<ResponseBodyLimit>,
+    received_response_bytes: u64,
+    limited_out: bool,
 }
 
 impl<B: Body<Data = Bytes>> ObservedBody<B> {
@@ -783,6 +856,13 @@ impl<B: Body<Data = Bytes>> ObservedBody<B> {
             direction,
             ended,
             remaining,
+            response_limit: if matches!(direction, Direction::Response) {
+                response_body_limit()
+            } else {
+                None
+            },
+            received_response_bytes: 0,
+            limited_out: false,
         }
     }
 
@@ -799,18 +879,40 @@ impl<B: Body<Data = Bytes>> ObservedBody<B> {
     }
 }
 
-impl<B: Body<Data = Bytes>> Body for ObservedBody<B> {
+impl<B: Body<Data = Bytes>> Body for ObservedBody<B>
+where
+    B::Error: Into<BodyError>,
+{
     type Data = Bytes;
-    type Error = B::Error;
+    type Error = BodyError;
 
     fn poll_frame(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = self.get_mut();
+        if this.limited_out {
+            return Poll::Ready(None);
+        }
         match this.inner.as_mut().poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(bytes) = frame.data_ref() {
+                    if matches!(this.direction, Direction::Response) {
+                        this.received_response_bytes = this
+                            .received_response_bytes
+                            .saturating_add(bytes.len() as u64);
+                        if this
+                            .response_limit
+                            .as_ref()
+                            .is_some_and(|limit| limit.observe(this.received_response_bytes))
+                        {
+                            // 先记实际已读的完整chunk；超额chunk不交给任何正文解码器。
+                            this.observer.observe_rejected_response_bytes(bytes.len());
+                            this.finish(true);
+                            this.limited_out = true;
+                            return Poll::Ready(Some(Err(Box::new(ResponseBodyLimitExceeded))));
+                        }
+                    }
                     match this.direction {
                         Direction::Request => this.observer.observe_request_body(bytes),
                         Direction::Response => this.observer.observe_response_body(bytes),
@@ -825,8 +927,27 @@ impl<B: Body<Data = Bytes>> Body for ObservedBody<B> {
                 Poll::Ready(Some(Ok(frame)))
             }
             Poll::Ready(Some(Err(error))) => {
+                if matches!(this.direction, Direction::Response) {
+                    if let Some(limit) = this
+                        .response_limit
+                        .as_ref()
+                        .filter(|limit| limit.exceeded())
+                    {
+                        // Smithy外层观察拿到的是传输层limit错误，超额frame未交给它；
+                        // 补记共享预算已观察的完整原始字节，避免把拒绝的chunk记成零。
+                        let actual = limit.observed_bytes();
+                        let missing = actual.saturating_sub(this.received_response_bytes);
+                        if missing > 0 {
+                            this.observer.observe_rejected_response_bytes(
+                                missing.min(usize::MAX as u64) as usize,
+                            );
+                            this.received_response_bytes = actual;
+                        }
+                        this.limited_out = true;
+                    }
+                }
                 this.finish(true);
-                Poll::Ready(Some(Err(error)))
+                Poll::Ready(Some(Err(error.into())))
             }
             Poll::Ready(None) => {
                 this.finish(false);
@@ -836,10 +957,18 @@ impl<B: Body<Data = Bytes>> Body for ObservedBody<B> {
         }
     }
     fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
+        self.limited_out || self.inner.is_end_stream()
     }
     fn size_hint(&self) -> SizeHint {
-        self.inner.size_hint()
+        let original = self.inner.size_hint();
+        let Some(limit) = &self.response_limit else {
+            return original;
+        };
+        let remaining = limit.maximum.saturating_sub(self.received_response_bytes);
+        let mut bounded = SizeHint::new();
+        bounded.set_lower(original.lower().min(remaining));
+        bounded.set_upper(original.upper().unwrap_or(remaining).min(remaining));
+        bounded
     }
 }
 
@@ -904,6 +1033,15 @@ pub fn wrap_response(
     .into()
 }
 
+/// 凭据交换与SDK传输只安装decoder上限，不注册为模型推理/正式用量交换。
+pub fn limit_untracked_response(response: reqwest::Response) -> reqwest::Response {
+    if response_body_limit().is_some() {
+        wrap_response(response, UpstreamIoObserver::new(Protocol::Unknown))
+    } else {
+        response
+    }
+}
+
 /// 在最终请求已构建、真正交给 client 前建立观察；不改变等待或正文读取时机。
 pub async fn send(
     req: reqwest::RequestBuilder,
@@ -934,6 +1072,134 @@ mod tests {
     use http_body_util::BodyExt;
     use reqwest::ResponseBuilderExt;
     use std::sync::Arc;
+
+    async fn assessment_http_body(
+        wire: Vec<u8>,
+        content_type: &'static str,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 4096];
+            let _ = socket.read(&mut request).await.unwrap();
+            let head = format!("HTTP/1.1 207 Multi-Status\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nX-Assessment-Component: real-http\r\nConnection: close\r\n\r\n", wire.len());
+            socket.write_all(head.as_bytes()).await.unwrap();
+            // 超限消费者可随时关闭连接，服务器写失败不等于产品错误。
+            let _ = socket.write_all(&wire).await;
+            let _ = socket.shutdown().await;
+        });
+        (format!("http://{address}/component-response"), task)
+    }
+
+    #[tokio::test]
+    async fn assessment_response_body_limit_controls_real_http_before_decoding() {
+        let oversized_sse = format!("data: {{\"text\":\"{}\"}}\n\n", "x".repeat(65536));
+        let cases = [
+            (
+                None,
+                oversized_sse.as_bytes().to_vec(),
+                "text/event-stream",
+                false,
+            ),
+            (Some(0), vec![], "application/json", false),
+            (Some(4), "A汉".as_bytes().to_vec(), "text/plain", false),
+            (Some(3), "A汉".as_bytes().to_vec(), "text/plain", true),
+            (
+                Some(16),
+                ": metadata-only SSE comment\n\n".repeat(4).into_bytes(),
+                "text/event-stream",
+                true,
+            ),
+            (
+                Some(65536),
+                oversized_sse.into_bytes(),
+                "text/event-stream",
+                true,
+            ),
+        ];
+        for (maximum, wire, content_type, must_reject) in cases {
+            let (url, server) = assessment_http_body(wire.clone(), content_type).await;
+            let limit = maximum.map(ResponseBodyLimit::new);
+            let tap = Arc::new(crate::ResponseHeaderTap::new(
+                vec![],
+                false,
+                "assessment-http-cap".into(),
+            ));
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let (delivered, errored) = scope_response_body_limit(
+                limit.clone(),
+                crate::response_tap::scope(tap.clone(), async {
+                    let response = send(client.get(url), Protocol::Chat).await.unwrap();
+                    assert_eq!(response.status(), 207);
+                    assert_eq!(response.headers()["x-assessment-component"], "real-http");
+                    let mut body = response.bytes_stream();
+                    let mut delivered = Vec::new();
+                    let mut errored = false;
+                    while let Some(frame) = futures::StreamExt::next(&mut body).await {
+                        match frame {
+                            Ok(bytes) => delivered.extend_from_slice(&bytes),
+                            Err(_) => {
+                                errored = true;
+                                break;
+                            }
+                        }
+                    }
+                    (delivered, errored)
+                }),
+            )
+            .await;
+            server.await.unwrap();
+            assert_eq!(errored, must_reject);
+            let audit = tap.upstream_io_observer().unwrap().snapshot();
+            if must_reject {
+                let maximum = maximum.unwrap();
+                assert!(
+                    delivered.len() as u64 <= maximum,
+                    "超额chunk不能交给decoder"
+                );
+                assert!(
+                    audit.response_body_bytes.unwrap() > maximum,
+                    "实际读到的完整超额chunk不能截小记账"
+                );
+                assert!(!audit.response_complete);
+                assert!(limit.as_ref().unwrap().exceeded());
+                assert_eq!(
+                    limit.as_ref().unwrap().observed_bytes(),
+                    audit.response_body_bytes.unwrap()
+                );
+            } else {
+                assert_eq!(delivered, wire);
+                assert_eq!(audit.response_body_bytes, Some(wire.len() as u64));
+                assert!(audit.response_complete);
+                assert!(limit.as_ref().is_none_or(|limit| !limit.exceeded()));
+            }
+            assert!(
+                response_body_limit().is_none(),
+                "assessment scope不能泄漏到普通请求"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn assessment_response_body_limit_rejects_a_whole_oversize_single_frame() {
+        let limit = ResponseBodyLimit::new(3);
+        let io = UpstreamIoObserver::new(Protocol::Chat);
+        let mut body = scope_response_body_limit(Some(limit.clone()), async {
+            ObservedBody::response(reqwest::Body::from("A汉"), io.clone())
+        })
+        .await;
+        assert_eq!(body.size_hint().upper(), Some(3));
+        assert!(
+            body.frame().await.unwrap().is_err(),
+            "不能交出UTF-8前缀来假装完整回答"
+        );
+        assert!(body.frame().await.is_none());
+        assert_eq!(io.snapshot().response_body_bytes, Some(4));
+        assert!(limit.exceeded());
+        assert_eq!(limit.observed_bytes(), 4);
+    }
 
     #[tokio::test]
     async fn request_frames_count_transformed_unicode_and_keep_exact_size_hint() {
@@ -1037,7 +1303,7 @@ mod tests {
         let mut body = ObservedBody::response(reqwest::Body::wrap_stream(source), io.clone());
         assert!(body.frame().await.unwrap().is_ok());
         let error = body.frame().await.unwrap().unwrap_err();
-        assert!(std::error::Error::source(&error).is_some());
+        assert!(std::error::Error::source(error.as_ref()).is_some());
         assert!(!io.snapshot().response_complete);
         assert_eq!(
             io.snapshot().output_text,
@@ -1166,8 +1432,11 @@ mod tests {
                 std::io::Error::from_raw_os_error(104),
             )]));
         let mut body = ObservedBody::request(source, io.clone());
+        let error = body.frame().await.unwrap().unwrap_err();
         assert_eq!(
-            body.frame().await.unwrap().unwrap_err().raw_os_error(),
+            error
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::raw_os_error),
             Some(104)
         );
         assert_eq!(io.snapshot().request_complete, Some(false));

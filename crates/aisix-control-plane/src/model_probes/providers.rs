@@ -268,7 +268,7 @@ fn check_probe_overrides(
     Ok(())
 }
 
-fn adapter(pk: &ProviderKey) -> Result<Adapter, PrepareError> {
+pub(crate) fn adapter(pk: &ProviderKey) -> Result<Adapter, PrepareError> {
     // 与 Hub 的两层分派一致，规范供应商优先于可选适配器字段。
     match pk.provider.as_str() {
         "openai" => Ok(Adapter::Openai),
@@ -277,6 +277,37 @@ fn adapter(pk: &ProviderKey) -> Result<Adapter, PrepareError> {
             .adapter
             .ok_or_else(|| PrepareError::Unsupported("该上游没有可用于探测的协议适配器".into())),
     }
+}
+
+/// 记录适配器实际选择的原生协议，不能把 Vertex 或 Bedrock 这个平台名当端点协议。
+pub(crate) fn native_protocol(
+    model: &Model,
+    request: &ChatFormat,
+    pk: &ProviderKey,
+) -> Result<&'static str, PrepareError> {
+    use aisix_provider_vertex::VertexPublisher;
+    Ok(match adapter(pk)? {
+        Adapter::Openai | Adapter::AzureOpenai => "openai.chat_completions",
+        Adapter::Anthropic => "anthropic.messages",
+        Adapter::Vertex => match model
+            .model_name
+            .as_deref()
+            .and_then(VertexPublisher::from_upstream_id)
+        {
+            Some(VertexPublisher::Google) => "google.generate_content",
+            Some(VertexPublisher::Anthropic) => "anthropic.messages",
+            _ => "openai.chat_completions",
+        },
+        Adapter::Bedrock
+            if BedrockBridge::uses_reqwest_transport(
+                request,
+                model.model_name.as_deref().unwrap_or_default(),
+            ) =>
+        {
+            "openai.chat_completions"
+        }
+        Adapter::Bedrock => "bedrock.converse",
+    })
 }
 
 fn parsed_url(raw: &str) -> Result<Url, BridgeError> {
