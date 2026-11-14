@@ -448,6 +448,8 @@ pub(crate) struct ContextAffinity {
     previous_unknown: bool,
     /// 持久归属查询确认的账号边界，不允许续接跨账号降级。
     registered_origin: Option<aisix_core::native_objects::OriginBinding>,
+    /// 原生归属尚待选定目标验证；缓存答案不能代替这次授权。
+    pending_reasoning_authority: bool,
     /// Platform mode: the index into `input[]` of the first item reference
     /// whose id is not this tenant's seal
     /// ([`crate::opaque_id::unseal_responses_input`]).
@@ -531,6 +533,14 @@ impl ContextAffinity {
             .get_or_insert_with(|| origin.model_id.to_string());
         self.registered_origin = Some(origin);
         Ok(())
+    }
+
+    pub(crate) fn defer_reasoning_authority(&mut self) {
+        self.pending_reasoning_authority = true;
+    }
+
+    pub(crate) fn has_pending_reasoning_authority(&self) -> bool {
+        self.pending_reasoning_authority
     }
 
     pub(crate) fn note_owned_container(&mut self, pointer: String) {

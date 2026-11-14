@@ -6,6 +6,43 @@ use aisix_core::native_objects::*;
 use futures::future::BoxFuture;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[tokio::test]
+async fn native_reasoning_gate_checks_ids_after_visible_text_is_removed() {
+    let snapshot = AisixSnapshot::new();
+    let key: aisix_core::ApiKey = serde_json::from_value(serde_json::json!({
+        "key_hash":aisix_core::ApiKey::hash_bearer("gate-caller"),"allowed_models":["*"]
+    }))
+    .unwrap();
+    let auth = AuthenticatedKey::new(
+        &snapshot,
+        Arc::new(ResourceEntry::new(Uuid::new_v4().to_string(), key, 1)),
+        None,
+        false,
+    );
+    let config: aisix_core::ProxyConfig = serde_json::from_value(serde_json::json!({
+        "addr":"127.0.0.1:0"
+    }))
+    .unwrap();
+    let state = ProxyState::new(
+        aisix_core::snapshot::SnapshotHandle::new(snapshot),
+        Arc::new(aisix_gateway::Hub::new()),
+        &config,
+    )
+    .with_platform(crate::platform::PlatformSettings::from_secret("gate-test"));
+    let model: aisix_core::Model = serde_json::from_value(serde_json::json!({
+        "display_name":"gate-model"
+    }))
+    .unwrap();
+    // 准入后可见文本可能被规范化；最终原生检查仍必须验证留下的存储 ID。
+    let body = serde_json::json!({"input":[{
+        "type":"reasoning","id":"rs_unknown","summary":[]
+    }]});
+    assert!(matches!(
+        admit_native_reasoning_references(&state, &state.snapshot.load(), &auth, &model, &body).await,
+        Err(ProxyError::StoredObjectReference(path)) if path == "input[0].id"
+    ));
+}
+
 struct Registry {
     calls: AtomicUsize,
     fail: bool,

@@ -405,15 +405,20 @@ pub(crate) async fn admit_input_references(
             let original = sealer.unseal(crate::opaque_id::IdKind::Item, raw);
             let raw = original.as_deref().unwrap_or(raw);
             let reference =
-                resolve_object_reference(state, auth, raw, NativeObjectKind::ResponseItem)
+                match resolve_object_reference(state, auth, raw, NativeObjectKind::ResponseItem)
                     .await
-                    .map_err(|error| {
-                        if matches!(error, ProxyError::ResponseNotFound) {
-                            refused()
-                        } else {
-                            error
-                        }
-                    })?;
+                {
+                    Ok(reference) => reference,
+                    // 已知原生历史仍固定原账号；可内联的文本没有登记时由实际目标决定。
+                    Err(ProxyError::ResponseNotFound | ProxyError::AccountUnavailable)
+                        if inline_reasoning_reference(item) =>
+                    {
+                        affinity.defer_reasoning_authority();
+                        continue;
+                    }
+                    Err(ProxyError::ResponseNotFound) => return Err(refused()),
+                    Err(error) => return Err(error),
+                };
             affinity.admit_object_origin(reference.origin.ok_or(ProxyError::ResponseNotFound)?)?;
         }
     }
@@ -454,6 +459,66 @@ pub(crate) async fn admit_input_references(
     // 已验证的存储引用与完整内联历史继续恢复协议 ID，二者不会互相授予权限。
     let _ = crate::opaque_id::unseal_responses_input(platform, &owner, body);
     affinity.note_unopened_item_reference(None);
+    Ok(())
+}
+
+// 可见 reasoning 既能内联翻译，也能在原生协议中读取存储状态；选定目标后再决定。
+fn inline_reasoning_reference(item: &Value) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("reasoning")
+        && crate::opaque_id::is_item_reference(item)
+        && crate::responses_bridge::replayed_reasoning_text(item).is_some()
+}
+
+/// 翻译目标只消费可见文本；每个原生尝试必须先证明同一存储对象及账号边界。
+pub(crate) async fn admit_native_reasoning_references(
+    state: &ProxyState,
+    snapshot: &AisixSnapshot,
+    auth: &AuthenticatedKey,
+    model: &aisix_core::Model,
+    body: &Value,
+) -> Result<(), ProxyError> {
+    let Some(platform) = state.platform() else {
+        return Ok(());
+    };
+    let Some(items) = body.get("input").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for (index, item) in items.iter().enumerate() {
+        if item.get("type").and_then(Value::as_str) != Some("reasoning")
+            || !crate::opaque_id::is_item_reference(item)
+        {
+            continue;
+        }
+        let refused = || ProxyError::StoredObjectReference(format!("input[{index}].id"));
+        let raw = item.get("id").and_then(Value::as_str).ok_or_else(refused)?;
+        let reference = resolve_object_reference(state, auth, raw, NativeObjectKind::ResponseItem)
+            .await
+            .map_err(|error| {
+                if matches!(error, ProxyError::ResponseNotFound) {
+                    refused()
+                } else {
+                    error
+                }
+            })?;
+        let origin = reference.origin.ok_or(ProxyError::AccountUnavailable)?;
+        let provider = model
+            .provider_key_id
+            .as_deref()
+            .and_then(|id| snapshot.provider_keys.get_by_id(id))
+            .filter(|provider| provider.id == origin.provider_key_id.to_string())
+            .ok_or_else(refused)?;
+        let boundary = configured_native_origin(
+            &platform.id_key,
+            origin.provider_key_id,
+            &provider.value,
+            NativeProtocol::Openai,
+            NativeObjectKind::Response,
+        )
+        .map_err(|_| ProxyError::AccountUnavailable)?;
+        if boundary != origin.boundary {
+            return Err(refused());
+        }
+    }
     Ok(())
 }
 

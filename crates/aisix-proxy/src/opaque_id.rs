@@ -300,15 +300,22 @@ impl Sealer {
         if id.len() < MIN_SEALED_LEN {
             return None;
         }
-        match kind {
+        let opened = match kind {
             // The payload's alphabet includes `_`, so an id sealed without a
             // prefix is also tried whole.
             IdKind::Item | IdKind::Container => id
                 .find('_')
                 .and_then(|end| self.open(kind, &id[..=end], &id[end + 1..]))
                 .or_else(|| self.open(kind, "", id)),
-            IdKind::Call => self.open(kind, CALL_PREFIX, id.strip_prefix(CALL_PREFIX)?),
-        }
+            IdKind::Call => id
+                .strip_prefix(CALL_PREFIX)
+                .and_then(|payload| self.open(kind, CALL_PREFIX, payload)),
+        };
+        opened.or_else(|| {
+            id.find('_')
+                .and_then(|end| self.open_legacy(&id[..=end], &id[end + 1..]))
+                .or_else(|| self.open_legacy("", id))
+        })
     }
 
     fn open(&self, kind: IdKind, prefix: &str, payload: &str) -> Option<String> {
@@ -329,6 +336,35 @@ impl Sealer {
             .ok()?;
         let plain = String::from_utf8(unpad(plain)?.to_vec()).ok()?;
         (kind.shown_prefix(&plain) == prefix && self.nonce(kind, &plain) == nonce).then_some(plain)
+    }
+
+    // 更早的封装绑定相同租户，但没有种类字节；这里只恢复别名，不授予存储对象权限。
+    fn open_legacy(&self, prefix: &str, payload: &str) -> Option<String> {
+        let raw = b64().decode(payload).ok()?;
+        if raw.len() < aead::NONCE_LEN + SEAL_BUCKET + aead::MAX_TAG_LEN {
+            return None;
+        }
+        let (nonce, sealed) = raw.split_at(aead::NONCE_LEN);
+        let mut buf = sealed.to_vec();
+        let aad = [self.owner.as_slice(), prefix.as_bytes()].concat();
+        let plain = self
+            .keys
+            .cipher
+            .open_in_place(
+                aead::Nonce::try_assume_unique_for_key(nonce).ok()?,
+                aead::Aad::from(aad),
+                &mut buf,
+            )
+            .ok()?;
+        let plain = String::from_utf8(unpad(plain)?.to_vec()).ok()?;
+        let mut expected_nonce = hmac::Context::with_key(&self.keys.nonce_key);
+        expected_nonce.update(b"seal");
+        expected_nonce.update(&[0]);
+        expected_nonce.update(&self.owner);
+        expected_nonce.update(plain.as_bytes());
+        (kept_prefix(&plain) == prefix
+            && expected_nonce.sign().as_ref()[..aead::NONCE_LEN] == *nonce)
+            .then_some(plain)
     }
 }
 
@@ -1003,6 +1039,57 @@ pub(crate) mod tests {
             assert_eq!(unseal_id(&K, T, foreign), None, "{foreign}");
         }
         assert_eq!(unseal_id(&[8u8; 32], T, &sealed), None, "another key");
+    }
+
+    #[test]
+    fn pre_kind_legacy_ids_keep_tenant_and_prefix_authentication() {
+        let platform = crate::platform::PlatformSettings::from_secret("responses-tenant-secret");
+        let own = Sealer::of(&platform, "team:raw-owner");
+        // 由旧版格式独立生成的固定向量，不依赖当前编码器。
+        let reasoning = "rs_xXyKXOK9xbY-nTqXUJVggYwiByF-ONeja0QUtt2sz6UoyAxZkOyvVrkatBpV0IbDNrpfQbSAFU9SSv-00RipKdHIicwpG-RtHQmetfihNcbA0GbLnkJi9YDXl7s";
+        let call = "call_491C9Xp9_E2ivfjNxK5kcvmBLCzr5HPmrWF3zPQaHicu7meN4vhVIdwfG2pPC5MlZT1Nj3u5vv_Y38-quXt57Tf7yExGTzuOmsKOExfR9O4w3jELncVUVYyfdQ4";
+        let original_prefix_call = "toolu_qS7aFeZo-nktJXXBwbAlznNfADpHkgjjNnZlokhNsmnc2RERqRJNOzbv8Bvj5RamQZUBGCHvB2F9We7k6SSOottbe3D50VS2Zhz948_2lV0-llIaETLSLQr-bu4";
+        assert_eq!(
+            own.unseal(IdKind::Item, reasoning).as_deref(),
+            Some("rs_legacy_470")
+        );
+        assert_eq!(
+            own.unseal(IdKind::Call, call).as_deref(),
+            Some("call_legacy_471")
+        );
+        assert_eq!(
+            own.unseal(IdKind::Call, original_prefix_call).as_deref(),
+            Some("toolu_legacy_call")
+        );
+        for owner in ["team:raw-foreign", "team:raw-owner-extra", "key:raw-owner"] {
+            assert_eq!(
+                Sealer::of(&platform, owner).unseal(IdKind::Item, reasoning),
+                None
+            );
+        }
+        let other = crate::platform::PlatformSettings::from_secret("different-platform-secret");
+        assert_eq!(
+            Sealer::of(&other, "team:raw-owner").unseal(IdKind::Item, reasoning),
+            None
+        );
+        assert_eq!(
+            own.unseal(IdKind::Item, &reasoning.replacen("rs_", "fc_", 1)),
+            None
+        );
+        let mut tampered = reasoning.as_bytes().to_vec();
+        tampered[20] = if tampered[20] == b'A' { b'B' } else { b'A' };
+        assert_eq!(
+            own.unseal(IdKind::Item, std::str::from_utf8(&tampered).unwrap()),
+            None
+        );
+        assert_eq!(
+            own.unseal(IdKind::Call, &own.seal(IdKind::Item, "rs_current")),
+            None
+        );
+        assert_eq!(
+            own.unseal(IdKind::Item, &own.seal(IdKind::Call, "call_current")),
+            None
+        );
     }
 
     /// The upstream account is shared by every tenant: an id one tenant was

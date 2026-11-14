@@ -812,4 +812,7 @@ mod raw_id_contract {
         ])
         .await;
     }
+
+    include!("responses_legacy_replay_tests.rs");
+    include!("responses_reasoning_cache_tests.rs");
 }

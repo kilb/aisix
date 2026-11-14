@@ -570,6 +570,7 @@ pub(crate) async fn responses_operation(
         crate::native_api::origin::admit_input_references(&state, &auth, &mut body, &mut affinity)
             .await
     {
+        let error = affinity.at_caller_position(error);
         return crate::reject::reject_before_dispatch(
             &state,
             operation.method().as_str(),
@@ -1189,24 +1190,26 @@ async fn dispatch(
     // a stream has no stored shape yet. Keyed on the post-redaction body —
     // what actually goes upstream — so entries follow the bytes the provider
     // saw.
-    let cache_gate =
-        if !operation.is_create() || body.get("stream").and_then(Value::as_bool) == Some(true) {
-            None
-        } else {
-            crate::response_cache::BodyCache::resolve(
-                state,
-                snapshot,
-                auth,
-                client,
-                "/v1/responses",
-                &model_name,
-                &model_entry.value,
-                || match crate::response_cache::continuation_partition(state, auth) {
-                    Some(groups) => format!("{body}\nallowed_provider_groups: {groups}"),
-                    None => body.to_string(),
-                },
-            )
-        };
+    let cache_gate = if !operation.is_create()
+        || body.get("stream").and_then(Value::as_bool) == Some(true)
+        || affinity.has_pending_reasoning_authority()
+    {
+        None
+    } else {
+        crate::response_cache::BodyCache::resolve(
+            state,
+            snapshot,
+            auth,
+            client,
+            "/v1/responses",
+            &model_name,
+            &model_entry.value,
+            || match crate::response_cache::continuation_partition(state, auth) {
+                Some(groups) => format!("{body}\nallowed_provider_groups: {groups}"),
+                None => body.to_string(),
+            },
+        )
+    };
     if let Some(gate) = cache_gate.as_ref() {
         crate::routing::check_group_access(
             snapshot,
@@ -1559,30 +1562,43 @@ async fn dispatch(
             );
             crate::attribution::note_translated_dispatch(!native);
             let result = if native {
-                responses_to_target(
+                match crate::native_api::origin::admit_native_reasoning_references(
                     state,
                     snapshot,
-                    operation,
-                    attempt_body,
-                    mark,
+                    auth,
                     &target.model,
-                    &target.id,
-                    timeouts,
-                    request_id,
-                    resolved_chain.clone(),
-                    started,
-                    attempt_started,
-                    &model_name,
-                    &auth.entry.id,
-                    client,
-                    attempt,
-                    &mut reservation,
-                    &mut member_reservation,
-                    redactions_out.clone(),
-                    monitor_hits_out.clone(),
-                    *failure_content_safe_out,
+                    body,
                 )
                 .await
+                {
+                    Err(error) => Err(affinity.at_caller_position(error)),
+                    Ok(()) => {
+                        responses_to_target(
+                            state,
+                            snapshot,
+                            operation,
+                            attempt_body,
+                            mark,
+                            &target.model,
+                            &target.id,
+                            timeouts,
+                            request_id,
+                            resolved_chain.clone(),
+                            started,
+                            attempt_started,
+                            &model_name,
+                            &auth.entry.id,
+                            client,
+                            attempt,
+                            &mut reservation,
+                            &mut member_reservation,
+                            redactions_out.clone(),
+                            monitor_hits_out.clone(),
+                            *failure_content_safe_out,
+                        )
+                        .await
+                    }
+                }
             } else if !operation.is_create() {
                 Err(ProxyError::TargetRefused(
                     "this operation requires a native Responses endpoint".into(),

@@ -450,7 +450,7 @@ const REASONING_CONTENT: &str = "reasoning_content";
 /// trimmed and the non-blank ones joined by newlines. `encrypted_content`
 /// is never read — it is another provider's ciphertext and means nothing to
 /// the upstream this request is going to.
-fn replayed_reasoning_text(item: &Value) -> Option<String> {
+pub(crate) fn replayed_reasoning_text(item: &Value) -> Option<String> {
     let parts_text = |parts: &Value, skip_opaque: bool| -> Option<String> {
         let parts = parts.as_array()?;
         let texts: Vec<&str> = parts
