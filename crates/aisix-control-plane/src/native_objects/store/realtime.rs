@@ -713,7 +713,7 @@ pub(super) async fn checkpoint(
     let mut authorization_lost = false;
     if !body.terminal {
         let authorized = match realtime_principal(&mut *conn, row.api_key_id).await {
-            Ok(current) => {
+            Ok(current) => async {
                 origin_for_consumer(
                     &mut *conn,
                     state,
@@ -721,8 +721,18 @@ pub(super) async fn checkpoint(
                     &submitted,
                     Some(EndpointFamily::Realtime),
                 )
-                .await
+                .await?;
+                let entries: Vec<Value> = sqlx::query_scalar("SELECT entry FROM native_live_entries WHERE environment_id=$1 AND operation_id=$2 ORDER BY entry_id")
+                    .bind(state.env.env_id).bind(row.operation_id).fetch_all(&mut *conn).await.map_err(unavailable)?;
+                for encoded in entries {
+                    let entry: NativeEntry = serde_json::from_value(encoded).map_err(unavailable)?;
+                    if !entry_model_current(&mut *conn, state, &current, &submitted, &entry).await? {
+                        return Err(conflict());
+                    }
+                }
+                Ok(())
             }
+            .await,
             Err(error) => Err(error),
         };
         if let Err(error) = authorized {
@@ -736,8 +746,8 @@ pub(super) async fn checkpoint(
             }
         }
     }
-    if !body.entries.is_empty() {
-        if row.state != "live" || row.deadline_at <= at || authorization_lost || body.terminal {
+    if !body.entries.is_empty() && !authorization_lost {
+        if row.state != "live" || row.deadline_at <= at || body.terminal {
             return Err(conflict());
         }
         let current = realtime_principal(&mut *conn, row.api_key_id).await?;
@@ -773,6 +783,38 @@ pub(super) async fn checkpoint(
     Ok(live_reply(&row, None))
 }
 
+// 条目的请求入口和实际目标均按当前授权重查；已接受的尾量仍由 append 读取历史快照。
+async fn entry_model_current(
+    conn: &mut PgConnection,
+    state: &AppState,
+    current: &Principal,
+    submitted: &BeginRequest,
+    entry: &NativeEntry,
+) -> Result<bool, ApiError> {
+    let mut target = submitted.clone();
+    target.origin.model_id = entry.model_id;
+    target.requested_model_id = entry.requested_model_id;
+    target.requested_model = entry.requested_model.clone();
+    target.upstream_model = entry.upstream_model.clone();
+    origin_for_consumer(
+        &mut *conn,
+        state,
+        Some(current),
+        &target,
+        Some(EndpointFamily::Realtime),
+    )
+    .await?;
+    let actual: Value = sqlx::query_scalar(
+        "SELECT doc FROM gw_resources WHERE kind='models' AND id=$1 AND NOT deleted",
+    )
+    .bind(entry.model_id)
+    .fetch_optional(conn)
+    .await
+    .map_err(unavailable)?
+    .ok_or_else(ApiError::not_found)?;
+    Ok(actual.get("model_name").and_then(Value::as_str) == Some(entry.upstream_model.as_str()))
+}
+
 async fn accept_entries(
     conn: &mut PgConnection,
     state: &AppState,
@@ -806,35 +848,17 @@ async fn accept_entries(
         let previous:Option<Value>=sqlx::query_scalar("SELECT entry FROM native_live_entries WHERE environment_id=$1 AND operation_id=$2 AND entry_id=$3")
             .bind(state.env.env_id).bind(submitted.operation_id).bind(&entry.entry_id)
             .fetch_optional(&mut *conn).await.map_err(unavailable)?;
-        if let Some(previous) = previous {
-            if previous != encoded {
-                return Err(conflict());
-            }
-            continue;
+        if previous
+            .as_ref()
+            .is_some_and(|previous| previous != &encoded)
+        {
+            return Err(conflict());
         }
-        let mut target = submitted.clone();
-        target.origin.model_id = entry.model_id;
-        target.requested_model_id = entry.requested_model_id;
-        target.requested_model = entry.requested_model.clone();
-        target.upstream_model = entry.upstream_model.clone();
-        origin_for_consumer(
-            &mut *conn,
-            state,
-            Some(current),
-            &target,
-            Some(EndpointFamily::Realtime),
-        )
-        .await?;
-        let actual: Value = sqlx::query_scalar(
-            "SELECT doc FROM gw_resources WHERE kind='models' AND id=$1 AND NOT deleted",
-        )
-        .bind(entry.model_id)
-        .fetch_optional(&mut *conn)
-        .await
-        .map_err(unavailable)?
-        .ok_or_else(ApiError::not_found)?;
-        if actual.get("model_name").and_then(Value::as_str) != Some(entry.upstream_model.as_str()) {
+        if !entry_model_current(&mut *conn, state, current, submitted, entry).await? {
             return Err(invalid("/entries/upstream_model"));
+        }
+        if previous.is_some() {
+            continue;
         }
         sqlx::query("INSERT INTO native_live_entries(environment_id,operation_id,entry_id,entry) VALUES ($1,$2,$3,$4)")
             .bind(state.env.env_id).bind(submitted.operation_id).bind(&entry.entry_id).bind(encoded)
