@@ -2081,7 +2081,12 @@ async fn operators_mint_and_manage_any_tenants_keys() {
             "batches",
             "fine_tuning",
             "moderations",
-            "content_provenance_checks"
+            "content_provenance_checks",
+            "conversations",
+            "containers",
+            "vector_stores",
+            "skills",
+            "evals"
         ])
     );
     let audit: (String, String) = sqlx::query_as(
@@ -3644,7 +3649,12 @@ fn customer_model_endpoints() -> Value {
         "batches",
         "fine_tuning",
         "moderations",
-        "content_provenance_checks"
+        "content_provenance_checks",
+        "conversations",
+        "containers",
+        "vector_stores",
+        "skills",
+        "evals"
     ])
 }
 
@@ -4017,7 +4027,12 @@ async fn native_model_customer_keys_project_all_safe_public_families_without_too
         "batches",
         "fine_tuning",
         "moderations",
-        "content_provenance_checks"
+        "content_provenance_checks",
+        "conversations",
+        "containers",
+        "vector_stores",
+        "skills",
+        "evals"
     ]);
     assert_eq!(doc.get("allowed_endpoints"), Some(&expected));
     assert_eq!(doc["team_id"], json!(tenant));
@@ -4025,7 +4040,7 @@ async fn native_model_customer_keys_project_all_safe_public_families_without_too
     assert_eq!(doc["key_hash"], ApiKey::hash_bearer(&plaintext));
     assert_eq!(doc["allowed_provider_groups"], json!(["shared"]));
     assert_eq!(doc["rate_limit"], json!({"rpm":23,"concurrency":10}));
-    assert_eq!(doc_version(&cp, &key).await, 5);
+    assert_eq!(doc_version(&cp, &key).await, 6);
     let decoded: ApiKey = serde_json::from_value(doc.clone()).expect("gateway key document");
     for family in expected.as_array().expect("families") {
         let family: EndpointFamily =
@@ -4086,7 +4101,7 @@ async fn native_model_boot_upgrades_v4_grants_and_preserves_disabled_and_revoked
     let cp = cp.restart().await;
     for (key, old) in [(&enabled, old_enabled), (&disabled, old_disabled)] {
         let after = stored(&cp, "api_keys", key).await;
-        assert_eq!(doc_version(&cp, key).await, 5);
+        assert_eq!(doc_version(&cp, key).await, 6);
         assert!(
             after.seq > old.seq,
             "old projected document was never rewritten"
@@ -4110,7 +4125,12 @@ async fn native_model_boot_upgrades_v4_grants_and_preserves_disabled_and_revoked
             "batches",
             "fine_tuning",
             "moderations",
-            "content_provenance_checks"
+            "content_provenance_checks",
+            "conversations",
+            "containers",
+            "vector_stores",
+            "skills",
+            "evals"
         ]);
         assert_eq!(after.doc, expected, "another security field changed");
     }
@@ -4162,7 +4182,7 @@ async fn native_model_grant_upgrade_waits_for_the_floor_without_blocking_key_nar
         .await
         .expect("upgrade endpoint grants");
     assert_eq!(pass.rewritten, 1);
-    assert_eq!(doc_version(&cp, &key).await, 5);
+    assert_eq!(doc_version(&cp, &key).await, 6);
     let projected: ApiKey =
         serde_json::from_value(key_doc(&cp, &key).await).expect("projected key");
     assert!(projected.can_call(EndpointFamily::Files));
@@ -4307,7 +4327,7 @@ async fn native_model_customer_file_access_remains_owner_and_current_account_bou
     assert_eq!(rotated.body["code"], "native_origin_changed");
 }
 
-// 去掉开发构建的扩展门槛会使启动追平过早开放18族；普通收紧仍须保留旧7族。
+// 去掉开发构建的扩展门槛会使启动追平过早开放23族；普通收紧仍须保留旧7族。
 #[tokio::test]
 async fn customer_endpoint_expansion_defers_boot_catch_up_and_keeps_edits_on_v4_until_the_build_is_proven(
 ) {
@@ -4411,12 +4431,12 @@ async fn customer_endpoint_expansion_defers_boot_catch_up_and_keeps_edits_on_v4_
         .await
         .expect("publish after the fleet proves support");
     assert_eq!((pass.rewritten, pass.deferred), (1, 0));
-    assert_eq!(doc_version(&upgraded, &fresh).await, 5);
+    assert_eq!(doc_version(&upgraded, &fresh).await, 6);
     assert_eq!(
         key_doc(&upgraded, &fresh).await.get("allowed_endpoints"),
         Some(&customer_model_endpoints())
     );
-    assert_eq!(doc_version(&upgraded, &key).await, 5);
+    assert_eq!(doc_version(&upgraded, &key).await, 6);
     let after = key_doc(&upgraded, &key).await;
     expected["allowed_endpoints"] = json!([
         "chat_completions",
@@ -4436,7 +4456,12 @@ async fn customer_endpoint_expansion_defers_boot_catch_up_and_keeps_edits_on_v4_
         "batches",
         "fine_tuning",
         "moderations",
-        "content_provenance_checks"
+        "content_provenance_checks",
+        "conversations",
+        "containers",
+        "vector_stores",
+        "skills",
+        "evals"
     ]);
     assert_eq!(
         after, expected,
@@ -4555,7 +4580,7 @@ async fn mint_customer_keys_on_both_apis(
     minted
 }
 
-// 只报告新构建的完整清单必须直接发18族，不能把回退变成永久降级。
+// 只报告新构建的完整清单必须直接发23族，不能把回退变成永久降级。
 #[tokio::test]
 async fn customer_key_mint_new_only_fleet_grants_all_public_families_on_both_apis() {
     const BUILD: &str = "dev+sha-12ab345";
@@ -4576,7 +4601,7 @@ async fn customer_key_mint_new_only_fleet_grants_all_public_families_on_both_api
         &owner,
         &ids[0],
         &customer_model_endpoints(),
-        5,
+        6,
     )
     .await;
 }
@@ -4645,7 +4670,7 @@ async fn customer_key_mint_mixed_fleet_uses_legacy_grants_and_later_catches_up_w
     let mut expected = before;
     expected["allowed_endpoints"] = customer_model_endpoints();
     assert_eq!(key_doc(&cp, &keys[0].0).await, expected);
-    assert_eq!(doc_version(&cp, &keys[0].0).await, 5);
+    assert_eq!(doc_version(&cp, &keys[0].0).await, 6);
     assert_eq!(doc_version(&cp, &keys[1].0).await, 4);
     let still_gone = stored(&cp, "api_keys", &keys[1].0).await;
     assert!(still_gone.deleted);
