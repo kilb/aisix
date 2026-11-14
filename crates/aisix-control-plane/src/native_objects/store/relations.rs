@@ -470,9 +470,17 @@ pub(super) async fn commit(
                 .iter()
                 .map(|record| record.record_id)
                 .collect();
-            let (parent, children) =
-                lock_objects(&mut *conn, state, reservation.parent_id, &child_ids).await?;
+            let parent = object(&mut *conn, state, reservation.parent_id).await?;
             authorized(&mut *conn, state, caller, &parent).await?;
+            // 归属不变的子对象沿用关系读取的无锁查询，不从子对象倒序锁父对象。
+            let children: Vec<ObjectRow> = sqlx::query_as(
+                "SELECT * FROM native_objects WHERE environment_id=$1 AND id=ANY($2) ORDER BY id",
+            )
+            .bind(state.env.env_id)
+            .bind(&child_ids)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(unavailable)?;
             let mut visible = BTreeSet::new();
             for child in &children {
                 if child_visible(&mut *conn, state, caller, &parent, child, None).await? {
