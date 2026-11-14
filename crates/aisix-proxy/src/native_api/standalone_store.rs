@@ -312,7 +312,7 @@ impl StandaloneNativeStore {
 
     async fn stored(conn: &mut SqliteConnection, id: Uuid) -> Result<Stored> {
         let row = sqlx::query("SELECT o.record,o.owner,p.submission,o.lease_worker,o.lease_until,o.lease_generation FROM native_objects o JOIN native_operations p USING(operation_id) WHERE o.record_id=?")
-            .bind(id.to_string()).fetch_optional(conn).await.map_err(unavailable)?.ok_or(Error::NotFound)?;
+            .bind(id.to_string()).fetch_optional(&mut *conn).await.map_err(unavailable)?.ok_or(Error::NotFound)?;
         let mut record: NativeRecord = decode(row.try_get("record").map_err(unavailable)?)?;
         let worker: Option<String> = row.try_get("lease_worker").map_err(unavailable)?;
         let generation: i64 = row.try_get("lease_generation").map_err(unavailable)?;
@@ -332,7 +332,7 @@ impl StandaloneNativeStore {
         sqlx::query("UPDATE native_objects SET record=? WHERE record_id=?")
             .bind(json(&stored.record)?)
             .bind(stored.record.record_id.to_string())
-            .execute(conn)
+            .execute(&mut *conn)
             .await
             .map_err(unavailable)?;
         Ok(())
@@ -346,7 +346,7 @@ impl StandaloneNativeStore {
             "SELECT owner,related,state,root_id FROM native_operations WHERE operation_id=?",
         )
         .bind(id.to_string())
-        .fetch_optional(conn)
+        .fetch_optional(&mut *conn)
         .await
         .map_err(unavailable)?
         .ok_or(Error::NotFound)?;
@@ -764,7 +764,7 @@ impl StandaloneNativeStore {
         sqlx::query("UPDATE native_operations SET state='bound',root_id=? WHERE operation_id=?")
             .bind(record.record_id.to_string())
             .bind(submitted.operation_id.to_string())
-            .execute(conn)
+            .execute(&mut *conn)
             .await
             .map_err(unavailable)?;
         Ok(Stored {
@@ -1016,7 +1016,7 @@ impl StandaloneNativeStore {
         }
         sqlx::query("UPDATE native_operation_parents SET active=0 WHERE operation_id=?")
             .bind(body.binding.operation_id.to_string())
-            .execute(conn)
+            .execute(&mut *conn)
             .await
             .map_err(unavailable)?;
         Ok(reply)
@@ -1104,7 +1104,7 @@ impl StandaloneNativeStore {
             version: 1,
         };
         sqlx::query("INSERT INTO native_memberships(membership_id,parent_id,child_id,relation,generation,operation_id) VALUES(?,?,?,?,?,?)")
-            .bind(membership.membership_id.to_string()).bind(parent.to_string()).bind(child.to_string()).bind(relation.as_str()).bind(generation).bind(operation.to_string()).execute(conn).await.map_err(unavailable)?;
+            .bind(membership.membership_id.to_string()).bind(parent.to_string()).bind(child.to_string()).bind(relation.as_str()).bind(generation).bind(operation.to_string()).execute(&mut *conn).await.map_err(unavailable)?;
         Ok(membership)
     }
 
@@ -1115,7 +1115,7 @@ impl StandaloneNativeStore {
         own: Option<Uuid>,
     ) -> Result<()> {
         let count: i64 = sqlx::query_scalar("SELECT count(*) FROM native_reservations WHERE parent_id=? AND exclusive=1 AND state IN ('reserved','uncertain') AND (? IS NULL OR operation_id<>?)")
-            .bind(parent.to_string()).bind(own.map(|v| v.to_string())).bind(own.map(|v| v.to_string())).fetch_one(conn).await.map_err(unavailable)?;
+            .bind(parent.to_string()).bind(own.map(|v| v.to_string())).bind(own.map(|v| v.to_string())).fetch_one(&mut *conn).await.map_err(unavailable)?;
         if count != 0 {
             return Err(Error::Conflict);
         }
@@ -1188,7 +1188,7 @@ impl StandaloneNativeStore {
             .bind(body.operation_id.to_string()).bind(&wire).bind(body.parent_record_id.to_string()).bind(body.expected_parent_version).bind(json(&parent.owner)?).bind(json(&parent.submission)?).bind(body.action != RelationAction::Discover).execute(&mut *conn).await.map_err(unavailable)?;
         let row = sqlx::query("SELECT request,state FROM native_reservations WHERE operation_id=?")
             .bind(body.operation_id.to_string())
-            .fetch_one(conn)
+            .fetch_one(&mut *conn)
             .await
             .map_err(unavailable)?;
         if row.get::<String, _>("request") != wire {
@@ -1351,7 +1351,7 @@ impl StandaloneNativeStore {
         )
         .bind(json(&(body, reply.clone()))?)
         .bind(reservation.operation_id.to_string())
-        .execute(conn)
+        .execute(&mut *conn)
         .await
         .map_err(unavailable)?;
         Ok(reply)
@@ -1552,7 +1552,7 @@ impl StandaloneNativeStore {
         sqlx::query("UPDATE native_objects SET pending=0,terminal=? WHERE record_id=?")
             .bind(wire)
             .bind(stored.record.record_id.to_string())
-            .execute(conn)
+            .execute(&mut *conn)
             .await
             .map_err(unavailable)?;
         let mut reply = NativeReply::new("completed");
@@ -2392,10 +2392,12 @@ fn canonical_terminal_event(
         cache_read_tokens: usage.cache_read_tokens,
         reasoning_tokens: usage.reasoning_tokens,
         total_tokens: usage.total_tokens,
-        prompt_audio_tokens: usage.prompt_audio_tokens,
-        prompt_image_tokens: usage.prompt_image_tokens,
-        completion_audio_tokens: usage.completion_audio_tokens,
-        completion_image_tokens: usage.completion_image_tokens,
+        modality_tokens: aisix_gateway::ModalityTokens {
+            prompt_audio_tokens: usage.prompt_audio_tokens,
+            prompt_image_tokens: usage.prompt_image_tokens,
+            completion_audio_tokens: usage.completion_audio_tokens,
+            completion_image_tokens: usage.completion_image_tokens,
+        },
         web_search_requests: usage.web_search_requests,
         usage_estimated: usage.usage_estimated,
         service_tier: usage.service_tier.clone(),
@@ -2505,7 +2507,7 @@ impl StandaloneNativeStore {
         sqlx::query("UPDATE native_memberships SET deleted=1,version=version+1 WHERE parent_id=? AND deleted=0").bind(request.record_id.to_string()).execute(&mut *conn).await.map_err(unavailable)?;
         sqlx::query("UPDATE native_deletions SET state='committed' WHERE operation_id=?")
             .bind(request.operation_id.to_string())
-            .execute(conn)
+            .execute(&mut *conn)
             .await
             .map_err(unavailable)?;
         Ok(NativeReply::new("deleted"))

@@ -1469,3 +1469,151 @@ async fn batch_entry_graph_cannot_borrow_another_entry_or_the_aggregate_referenc
         .await
         .is_err());
 }
+
+#[path = "standalone_store_graph_tests.rs"]
+mod accepted_graph;
+
+#[tokio::test]
+async fn authorized_parent_relation_lookup_returns_an_empty_visible_subset_for_an_unknown_child() {
+    let f = Fixture::new().await;
+    let parent = f
+        .create(
+            "key-a",
+            NativeObjectKind::ResponseContainer,
+            "cntr-direct-file-read",
+            false,
+        )
+        .await;
+    let request = LookupRelationsRequest {
+        api_key_id: stable_resource_id("apikeys", "key-a"),
+        parent_record_id: parent.record_id,
+        relation: NativeRelation::ContainerFile,
+        raw_ids: vec!["cfile-not-observed-yet".into()],
+        consumer_family: None,
+    };
+    let empty = f.store.lookup_relations(request.clone()).await.unwrap();
+    assert_eq!(empty.state, "related");
+    assert!(empty.records.is_empty());
+    assert!(empty.memberships.is_empty());
+    let mut foreign = request;
+    foreign.api_key_id = stable_resource_id("apikeys", "key-b");
+    assert_eq!(
+        f.store.lookup_relations(foreign).await.unwrap_err(),
+        Error::NotFound
+    );
+}
+
+#[tokio::test]
+async fn canonical_terminal_preserves_reported_modality_zero_and_never_invents_absent_counters_or_rebills(
+) {
+    let f = Fixture::new().await;
+    let record = f
+        .create(
+            "key-a",
+            NativeObjectKind::Response,
+            "resp-modality-exact",
+            true,
+        )
+        .await;
+    let leased = f
+        .store
+        .claim(ClaimRequest {
+            limit: 1,
+            record_id: Some(record.record_id),
+            protocol: None,
+            kind: None,
+        })
+        .await
+        .unwrap()
+        .records
+        .remove(0);
+    let mut usage = terminal_usage("");
+    usage.prompt_audio_tokens = Some(0);
+    usage.prompt_image_tokens = Some(4);
+    usage.completion_audio_tokens = Some(2);
+    usage.completion_image_tokens = Some(1);
+    let request = CompleteRequest {
+        lease: LeaseToken {
+            record_id: record.record_id,
+            generation: leased.lease_generation.unwrap(),
+        },
+        terminal_status: "completed".into(),
+        usage: vec![usage],
+        output_file_ids: vec![],
+    };
+    f.store.complete(request.clone()).await.unwrap();
+    f.store.complete(request).await.unwrap();
+    let claims = f.store.pending_terminals(10).await.unwrap();
+    assert_eq!(claims.len(), 1);
+    let event: serde_json::Value = serde_json::from_str(&claims[0].canonical_event).unwrap();
+    for (field, expected) in [
+        ("prompt_audio_tokens", 0),
+        ("prompt_image_tokens", 4),
+        ("completion_audio_tokens", 2),
+        ("completion_image_tokens", 1),
+        ("prompt_tokens", 15),
+        ("completion_tokens", 7),
+        ("total_tokens", 22),
+        ("cached_prompt_tokens", 7),
+    ] {
+        assert_eq!(
+            event.get(field),
+            Some(&json!(expected)),
+            "reported {field} remains exact, including an explicit zero"
+        );
+    }
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM native_terminal_outbox WHERE record_id=?")
+            .bind(record.record_id.to_string())
+            .fetch_one(&f.store.pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 1);
+    let absent = f
+        .create(
+            "key-a",
+            NativeObjectKind::Response,
+            "resp-modality-absent",
+            true,
+        )
+        .await;
+    let leased = f
+        .store
+        .claim(ClaimRequest {
+            limit: 1,
+            record_id: Some(absent.record_id),
+            protocol: None,
+            kind: None,
+        })
+        .await
+        .unwrap()
+        .records
+        .remove(0);
+    f.store
+        .complete(CompleteRequest {
+            lease: LeaseToken {
+                record_id: absent.record_id,
+                generation: leased.lease_generation.unwrap(),
+            },
+            terminal_status: "completed".into(),
+            usage: vec![terminal_usage("")],
+            output_file_ids: vec![],
+        })
+        .await
+        .unwrap();
+    let claims = f.store.pending_terminals(10).await.unwrap();
+    assert_eq!(claims.len(), 1);
+    let event: serde_json::Value = serde_json::from_str(&claims[0].canonical_event).unwrap();
+    for field in [
+        "prompt_audio_tokens",
+        "prompt_image_tokens",
+        "completion_audio_tokens",
+        "completion_image_tokens",
+    ] {
+        assert!(
+            event.get(field).is_none(),
+            "unreported {field} stays absent"
+        );
+    }
+    assert_eq!(event.get("total_tokens"), Some(&json!(22)));
+}
