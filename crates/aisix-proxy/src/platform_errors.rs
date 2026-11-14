@@ -1711,7 +1711,7 @@ mod tests {
             let envelope = serde_json::to_value(error.envelope()).unwrap();
             assert_eq!(
                 envelope.pointer("/error/code"),
-                Some(&json!("native_operation_conflict"))
+                Some(&serde_json::json!("native_operation_conflict"))
             );
         });
     }
