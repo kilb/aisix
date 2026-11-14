@@ -694,8 +694,11 @@ async fn items_call(
             RelationAction::Discover
         };
         let mut admitted = Vec::new();
-        if let Some(child) = &child {
-            admitted.push(child.record_id);
+        // 读取的子项已在 member 中按当前权限验证；Discover 预留只接收空子集。
+        if action != RelationAction::Discover {
+            if let Some(child) = &child {
+                admitted.push(child.record_id);
+            }
         }
         let operation = reserve(&state, &auth, &parent, action, admitted, references).await?;
         audit.registered_operation(operation, InferenceStage::Management);
