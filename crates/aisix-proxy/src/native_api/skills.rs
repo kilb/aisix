@@ -1135,7 +1135,7 @@ async fn handle(
 }
 
 /// 官方精确标识是公开能力，不能把任意相同前缀的私有对象当公开对象。
-fn curated_openai_skill(id: &str) -> bool {
+pub(crate) fn curated_openai_skill(id: &str) -> bool {
     // https://developers.openai.com/api/docs/guides/tools-skills#curated-skills
     id == "openai-spreadsheets"
 }
