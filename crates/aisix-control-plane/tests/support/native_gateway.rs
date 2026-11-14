@@ -19,7 +19,7 @@ use axum::{
 };
 use etcd_client::{Client, GetOptions};
 use futures::future::BoxFuture;
-use serde::Serialize;
+use serde::{de::IntoDeserializer, Serialize};
 use serde_json::{json, Value};
 
 use crate::support::{Bundle, DpClient, TestCp};
@@ -55,7 +55,14 @@ impl HttpRegistry {
         operation: &str,
         request: &T,
     ) -> Result<NativeReply, NativeRegistryError> {
-        let body = serde_json::to_value(request).map_err(|_| NativeRegistryError::Unavailable)?;
+        let diagnostics = std::env::var_os("CP_TEST_NATIVE_AUTHORITY_DIAGNOSTICS").is_some()
+            || std::env::var_os("AISIX_NATIVE_AUTHORITY_DIAGNOSTICS").is_some();
+        let body = serde_json::to_value(request).map_err(|_| {
+            if diagnostics {
+                eprintln!("native authority diagnostic: operation={operation} phase=encode failed");
+            }
+            NativeRegistryError::Unavailable
+        })?;
         let response = self
             .dp
             .try_send(
@@ -64,8 +71,17 @@ impl HttpRegistry {
                 Some(body),
             )
             .await
-            .map_err(|_| NativeRegistryError::Unavailable)?;
-        if std::env::var_os("AISIX_NATIVE_AUTHORITY_DIAGNOSTICS").is_some() {
+            .map_err(|error| {
+                if diagnostics {
+                    eprintln!(
+                        "native authority diagnostic: operation={operation} phase=transport timeout={} connect={}",
+                        error.is_timeout(),
+                        error.is_connect(),
+                    );
+                }
+                NativeRegistryError::Unavailable
+            })?;
+        if diagnostics {
             // 只输出固定协议槽和计数，避免把对象标识、请求正文或凭据写进诊断。
             eprintln!(
                 "native authority diagnostic: operation={operation} status={} code={} state={} origin_surface={}",
@@ -76,11 +92,29 @@ impl HttpRegistry {
             );
         }
         match response.status {
-            200 => {
-                serde_json::from_value(response.body).map_err(|_| NativeRegistryError::Unavailable)
-            }
+            200 => serde_path_to_error::deserialize(response.body.into_deserializer()).map_err(
+                |error| {
+                    if diagnostics {
+                        eprintln!(
+                            "native authority diagnostic: operation={operation} phase=decode path={}",
+                            diagnostic_path(&error.path().to_string()),
+                        );
+                    }
+                    NativeRegistryError::Unavailable
+                },
+            ),
             404 if response.body["code"] == "not_found" => Err(NativeRegistryError::NotFound),
             422 if response.body["code"] == "validation_failed" => {
+                if diagnostics {
+                    for detail in response.body["details"].as_array().into_iter().flatten() {
+                        if let Some(path) = detail["path"].as_str() {
+                            eprintln!(
+                                "native authority diagnostic: operation={operation} phase=validation path={}",
+                                diagnostic_path(path),
+                            );
+                        }
+                    }
+                }
                 Err(NativeRegistryError::InvalidRequest)
             }
             409 if matches!(
@@ -99,6 +133,52 @@ impl HttpRegistry {
             }
         }
     }
+}
+
+// 映射键可能来自调用者，只保留固定 DTO 字段名，不输出动态键、索引或原始值。
+fn diagnostic_path(path: &str) -> String {
+    const FIELDS: &[&str] = &[
+        "submission",
+        "origin",
+        "model_id",
+        "provider_key_id",
+        "boundary",
+        "surface",
+        "references",
+        "record_id",
+        "consumer_family",
+        "operation_id",
+        "api_key_id",
+        "requested_model_id",
+        "requested_model",
+        "upstream_model",
+        "protocol",
+        "kind",
+        "lifecycle_context",
+        "entries",
+        "entry_id",
+        "endpoint",
+        "model",
+        "group",
+        "state",
+        "target",
+        "lease",
+        "generation",
+        "request_id",
+        "parent_id",
+        "owner_parent_record_id",
+        "entry_references",
+        "raw_id",
+        "record",
+        "records",
+        "memberships",
+    ];
+    path.split(['.', '/', '[', ']'])
+        .filter(|part| !part.is_empty())
+        .take(16)
+        .map(|part| if FIELDS.contains(&part) { part } else { "#" })
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 macro_rules! authority_operation {
