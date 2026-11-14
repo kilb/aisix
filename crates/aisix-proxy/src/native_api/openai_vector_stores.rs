@@ -665,6 +665,12 @@ async fn run(
         };
         // 引用查验的归属不可覆盖本次管理请求的计量和审计目标。
         audit.resolved(&target);
+        // 新增存储检查提供商预算，已存对象的读取、元数据编辑和清理仍走管理授权。
+        if matches!(action, Action::Attach | Action::CreateBatch)
+            || matches!(action, Action::Create) && !files.is_empty()
+        {
+            crate::budget::gate(&state, &snapshot).check_provider_key(&target.pk_entry.id)?;
+        }
         let _reservation = crate::jobs::reserve_target(&state, &snapshot, &auth, &target).await?;
         let bytes = body
             .as_ref()
@@ -1104,7 +1110,13 @@ async fn list_owned(
     let mut visible = Vec::new();
     let mut seen = HashSet::new();
     let mut envelope = None;
+    let mut remaining_pages = 512;
     let (response_status, response_headers) = loop {
+        // 无法在总页数内确认可见窗口时失败关闭，不伪造一个已经结束的空页。
+        if remaining_pages == 0 {
+            return Err(openai::dependency());
+        }
+        remaining_pages -= 1;
         let query: String = url::form_urlencoded::Serializer::new(String::new())
             .extend_pairs(&pairs)
             .finish();
@@ -1208,6 +1220,10 @@ async fn list_owned(
             }
             allowed
         };
+        // before 的每页仍保持请求顺序；先从靠近游标的一端收集最近的可见项。
+        if backwards {
+            data.reverse();
+        }
         for item in data.drain(..) {
             if allowed.contains(raw_id(&item)?) {
                 validate(
@@ -1246,6 +1262,9 @@ async fn list_owned(
     };
     let has_more = visible.len() > limit;
     visible.truncate(limit);
+    if backwards {
+        visible.reverse();
+    }
     let first = visible
         .first()
         .and_then(|item| item.get("id"))
