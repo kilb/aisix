@@ -1055,6 +1055,7 @@ async fn dispatch(
         client,
         &affinity.stored_object_check_body(body),
         durable_background,
+        None,
     )
     .await
     .map_err(|err| affinity.at_caller_position(err))?;

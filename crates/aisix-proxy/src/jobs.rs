@@ -3361,6 +3361,19 @@ async fn managed_batch_input(
                 ProxyError::InvalidRequest("masked batch input body is not JSON".into())
             })?;
         }
+        if endpoint == "/v1/responses" {
+            // 上传与提交均检查最终 JSONL；所有引用必须属于本批次实际使用的账号。
+            crate::native_api::openai_uploads::admit_responses_files(
+                state,
+                snapshot,
+                auth,
+                client,
+                line.get("body").ok_or_else(openai::dependency)?,
+                true,
+                Some(&entry_origin),
+            )
+            .await?;
+        }
         let upstream = target
             .model_entry
             .value
