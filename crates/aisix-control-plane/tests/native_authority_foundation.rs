@@ -974,6 +974,117 @@ async fn discovery_of_an_unrelated_existing_child_rechecks_a_full_to_self_downgr
     discovery_does_not_release_unreadable_child(&observed, raw_file);
 }
 
+// 发现的幂等回包同样是一次读取，不能在成员降权后重新释放旧回包里的文件。
+#[tokio::test]
+async fn discovery_replay_rechecks_the_childs_current_visibility() {
+    let Some(f) = fixture().await else { return };
+    let raw_file = "file_discovery_replay_other_member_v15";
+    let file = bind_root(&f.dp, &root_submission(&f, "file"), raw_file).await;
+    let full_member = f.cp.seed_member(f.tenant, MemberRole::Admin).await.id;
+    let full_key = Uuid::parse_str(&seed_key(&f.cp, &f.admin, f.tenant, Some(full_member)).await)
+        .expect("the Full collection owner's key");
+    let raw_store = "vs_discovery_replay_created_full_v15";
+    let mut store_submission = root_submission(&f, "vector_store");
+    store_submission["api_key_id"] = json!(full_key);
+    let store = bind_root(&f.dp, &store_submission, raw_store).await;
+    let discovery = Uuid::new_v4();
+    let reserved = reserve_relation(
+        &f.dp,
+        full_key,
+        discovery,
+        &store,
+        "vector_store_file",
+        "discover",
+        &[],
+    )
+    .await;
+    assert_eq!(reserved.status, 200, "{reserved:?}");
+    let objects = json!([{"kind":"file","raw_id":raw_file}]);
+    let accepted = commit_relation(&f.dp, full_key, discovery, objects.clone()).await;
+    assert_eq!(accepted.status, 200, "{accepted:?}");
+    let membership = one_membership(&accepted, &store, &file, "vector_store_file");
+    let owner = f.cp.member_login_seeded(f.tenant, MemberRole::Owner).await;
+    let demoted =
+        f.cp.send(
+            "PATCH",
+            &format!("/api/members/{full_member}"),
+            Some(owner.cookie()),
+            Some(json!({"role":"member"})),
+        )
+        .await;
+    assert_eq!(demoted.status, 200, "{demoted:?}");
+    let denied = lookup(&f.dp, full_key, "file", raw_file).await;
+    assert_eq!(denied.status, 404, "{denied:?}");
+    no_membership(&related(&f.dp, full_key, &store, "vector_store_file", raw_file).await);
+    let parent = lookup(&f.dp, full_key, "vector_store", raw_store).await;
+    assert_eq!(parent.status, 200, "{parent:?}");
+    let replayed = commit_relation(&f.dp, full_key, discovery, objects).await;
+    discovery_does_not_release_unreadable_child(&replayed, raw_file);
+    let still_owned = lookup(&f.dp, f.key, "file", raw_file).await;
+    assert_eq!(still_owned.status, 200, "{still_owned:?}");
+    assert_eq!(still_owned.body["record"]["api_key_id"], json!(f.key));
+    let full_reader = f.cp.seed_member(f.tenant, MemberRole::Admin).await.id;
+    let full_reader =
+        Uuid::parse_str(&seed_key(&f.cp, &f.admin, f.tenant, Some(full_reader)).await)
+            .expect("another Full reader's key");
+    assert_eq!(
+        one_membership(
+            &related(&f.dp, full_reader, &store, "vector_store_file", raw_file).await,
+            &store,
+            &file,
+            "vector_store_file"
+        ),
+        membership,
+        "filtering a replay preserves the accepted membership"
+    );
+}
+
+// 当前 Full 可发现其他成员已存在的文件，父创建者的历史 Self 不能收窄读取者的权限。
+#[tokio::test]
+async fn discovery_by_full_uses_current_visibility_for_an_existing_child_of_a_self_parent() {
+    let Some(f) = fixture().await else { return };
+    let raw_file = "file_discovery_full_existing_v15";
+    let file = bind_root(&f.dp, &root_submission(&f, "file"), raw_file).await;
+    let parent_member = f.cp.seed_member(f.tenant, MemberRole::Member).await.id;
+    let parent_key =
+        Uuid::parse_str(&seed_key(&f.cp, &f.admin, f.tenant, Some(parent_member)).await)
+            .expect("the Self parent owner's key");
+    let mut store_submission = root_submission(&f, "vector_store");
+    store_submission["api_key_id"] = json!(parent_key);
+    let store = bind_root(&f.dp, &store_submission, "vs_discovery_self_parent_v15").await;
+    let full_member = f.cp.seed_member(f.tenant, MemberRole::Admin).await.id;
+    let full_key = Uuid::parse_str(&seed_key(&f.cp, &f.admin, f.tenant, Some(full_member)).await)
+        .expect("the current Full reader's key");
+    let visible = lookup(&f.dp, full_key, "file", raw_file).await;
+    assert_eq!(visible.status, 200, "{visible:?}");
+    assert_eq!(visible.body["record"]["record_id"], file["record_id"]);
+    let discovery = Uuid::new_v4();
+    let reserved = reserve_relation(
+        &f.dp,
+        full_key,
+        discovery,
+        &store,
+        "vector_store_file",
+        "discover",
+        &[],
+    )
+    .await;
+    assert_eq!(reserved.status, 200, "{reserved:?}");
+    let discovered = commit_relation(
+        &f.dp,
+        full_key,
+        discovery,
+        json!([{"kind":"file","raw_id":raw_file}]),
+    )
+    .await;
+    assert_eq!(discovered.status, 200, "{discovered:?}");
+    one_membership(&discovered, &store, &file, "vector_store_file");
+    assert_eq!(discovered.body["records"][0]["api_key_id"], json!(f.key));
+    let self_read = lookup(&f.dp, parent_key, "file", raw_file).await;
+    assert_eq!(self_read.status, 404, "{self_read:?}");
+    no_membership(&related(&f.dp, parent_key, &store, "vector_store_file", raw_file).await);
+}
+
 // 撤权不抹掉已接受的逐项产物；过期 worker 和部分失败都不能留下半份归属或账单。
 #[tokio::test]
 async fn reclaimed_batch_lease_atomically_binds_each_entries_artifacts_after_key_revocation() {
