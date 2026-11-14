@@ -588,6 +588,176 @@ async fn vector_create_requires_a_gateway_selector() {
     assert!(upstream.received_requests().await.unwrap().is_empty());
 }
 
+fn block_vector_input(snapshot: &AisixSnapshot) {
+    let guardrail: aisix_core::Guardrail = serde_json::from_value(json!({
+        "name":"block-all-vector-input","enabled":true,"kind":"custom",
+        "hook_point":"input","fail_open":false,"timeout_ms":5000,
+        "script":"export function checkInput() { return { action: 'block', reason_code: 'blocked' }; }"
+    })).unwrap();
+    snapshot
+        .guardrails
+        .insert(ResourceEntry::new("vector-input-block", guardrail, 1));
+    let attachment: aisix_core::models::GuardrailAttachment = serde_json::from_value(json!({
+        "guardrail_id":"vector-input-block","scope_type":"env","priority":100
+    }))
+    .unwrap();
+    snapshot.guardrail_attachments.insert(ResourceEntry::new(
+        "vector-input-block-attachment",
+        attachment,
+        1,
+    ));
+}
+
+// 删除任一个输入链调用，必须在相应403或上游触达计数断言处变红。
+#[tokio::test]
+async fn unconditional_input_guardrail_blocks_all_sixteen_vector_store_operations() {
+    let upstream = MockServer::builder().start().await;
+    let registry = Arc::new(Registry::default());
+    let (router, _) = app(&upstream.uri(), registry.clone());
+    create_store(router.clone(), &upstream, "vs_guardrail", json!({})).await;
+    let upload = b"--vector-input\r\nContent-Disposition: form-data; name=\"file\"; filename=\"input.txt\"\r\nContent-Type: text/plain\r\n\r\ndata\r\n--vector-input\r\nContent-Disposition: form-data; name=\"purpose\"\r\n\r\nassistants\r\n--vector-input--\r\n";
+    for id in ["file_guardrail", "file_batch_guardrail"] {
+        Mock::given(method("POST"))
+            .and(path("/v1/files"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id":id,"object":"file","bytes":4,"created_at":1730000000i64,
+                "filename":"input.txt","purpose":"assistants","status":"processed"
+            })))
+            .expect(1)
+            .up_to_n_times(1)
+            .mount(&upstream)
+            .await;
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/files?model=vector-model")
+                    .header("authorization", "Bearer caller")
+                    .header("x-aisix-model", "vector-model")
+                    .header("content-type", "multipart/form-data; boundary=vector-input")
+                    .body(Body::from(upload.as_slice()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let answer = value(response).await;
+        assert_eq!(status, StatusCode::OK, "bootstrap source upload: {answer}");
+        assert_eq!(answer["id"], id);
+    }
+    attach(router.clone(), &upstream, "vs_guardrail", "file_guardrail").await;
+    Mock::given(method("POST"))
+        .and(path("/v1/vector_stores/vs_guardrail/file_batches"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(file_batch(
+            "vsfb_guardrail",
+            "vs_guardrail",
+            "in_progress",
+        )))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let response = request(
+        router,
+        "POST",
+        "/v1/vector_stores/vs_guardrail/file_batches",
+        Some(json!({"file_ids":["file_batch_guardrail"]})),
+        "caller",
+        false,
+    )
+    .await;
+    let status = response.status();
+    let answer = value(response).await;
+    assert_eq!(status, StatusCode::OK, "bootstrap ingestion: {answer}");
+    assert_eq!(answer["id"], "vsfb_guardrail");
+    let accepted_calls = upstream.received_requests().await.unwrap().len();
+    assert_eq!(accepted_calls, 5);
+    let (router, _) = app_configured(&upstream.uri(), registry, block_vector_input);
+    for (verb, route, body, hint) in [
+        ("POST", "/v1/vector_stores", Some(json!({})), true),
+        ("GET", "/v1/vector_stores", None, true),
+        ("GET", "/v1/vector_stores/vs_guardrail", None, false),
+        (
+            "POST",
+            "/v1/vector_stores/vs_guardrail",
+            Some(json!({"metadata":{}})),
+            false,
+        ),
+        ("DELETE", "/v1/vector_stores/vs_guardrail", None, false),
+        (
+            "POST",
+            "/v1/vector_stores/vs_guardrail/search",
+            Some(json!({"query":""})),
+            false,
+        ),
+        (
+            "POST",
+            "/v1/vector_stores/vs_guardrail/files",
+            Some(json!({"file_id":"file_guardrail"})),
+            false,
+        ),
+        ("GET", "/v1/vector_stores/vs_guardrail/files", None, false),
+        (
+            "GET",
+            "/v1/vector_stores/vs_guardrail/files/file_guardrail",
+            None,
+            false,
+        ),
+        (
+            "POST",
+            "/v1/vector_stores/vs_guardrail/files/file_guardrail",
+            Some(json!({"attributes":{}})),
+            false,
+        ),
+        (
+            "DELETE",
+            "/v1/vector_stores/vs_guardrail/files/file_guardrail",
+            None,
+            false,
+        ),
+        (
+            "GET",
+            "/v1/vector_stores/vs_guardrail/files/file_guardrail/content",
+            None,
+            false,
+        ),
+        (
+            "POST",
+            "/v1/vector_stores/vs_guardrail/file_batches",
+            Some(json!({"file_ids":["file_batch_guardrail"]})),
+            false,
+        ),
+        (
+            "GET",
+            "/v1/vector_stores/vs_guardrail/file_batches/vsfb_guardrail",
+            None,
+            false,
+        ),
+        (
+            "POST",
+            "/v1/vector_stores/vs_guardrail/file_batches/vsfb_guardrail/cancel",
+            None,
+            false,
+        ),
+        (
+            "GET",
+            "/v1/vector_stores/vs_guardrail/file_batches/vsfb_guardrail/files",
+            None,
+            false,
+        ),
+    ] {
+        let response = request(router.clone(), verb, route, body, "caller", hint).await;
+        let status = response.status();
+        let answer = value(response).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{verb} {route}: {answer}");
+        assert_eq!(
+            upstream.received_requests().await.unwrap().len(),
+            accepted_calls,
+            "blocked {verb} {route} reached the provider"
+        );
+    }
+}
+
 #[tokio::test]
 async fn vector_create_persists_raw_id_and_preserves_official_wire() {
     let upstream = MockServer::builder().start().await;

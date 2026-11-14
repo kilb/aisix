@@ -946,3 +946,102 @@ async fn conversation_inline_tool_history_does_not_claim_or_dereference_citation
         body
     );
 }
+
+fn block_conversation_input(snapshot: &AisixSnapshot) {
+    let guardrail: aisix_core::Guardrail = serde_json::from_value(json!({
+        "name":"block-all-conversation-input","enabled":true,"kind":"custom",
+        "hook_point":"input","fail_open":false,"timeout_ms":5000,
+        "script":"export function checkInput() { return { action: 'block', reason_code: 'blocked' }; }"
+    }))
+    .unwrap();
+    snapshot
+        .guardrails
+        .insert(ResourceEntry::new("conversation-input-block", guardrail, 1));
+    let attachment: aisix_core::models::GuardrailAttachment = serde_json::from_value(json!({
+        "guardrail_id":"conversation-input-block","scope_type":"env","priority":100
+    }))
+    .unwrap();
+    snapshot.guardrail_attachments.insert(ResourceEntry::new(
+        "conversation-input-block-attachment",
+        attachment,
+        1,
+    ));
+}
+
+// 跳过任一管理操作的输入链（包括空 GET/DELETE），应暴露403或零上游触达断言失败。
+#[tokio::test]
+async fn unconditional_input_guardrail_blocks_all_eight_conversation_operations() {
+    let upstream = MockServer::builder().start().await;
+    let registry = Arc::new(Registry::default());
+    let (router, _) = app(&upstream.uri(), registry.clone());
+    create_conversation(router.clone(), &upstream, "conv_guardrail").await;
+    Mock::given(method("POST"))
+        .and(path("/v1/conversations/conv_guardrail/items"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(page(vec![item("msg_guardrail")], false)),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let response = request(
+        router,
+        "POST",
+        "/v1/conversations/conv_guardrail/items",
+        Some(json!({"items":[{"role":"user","content":"hello"}]})),
+        "caller",
+        false,
+    )
+    .await;
+    let status = response.status();
+    let answer = value(response).await;
+    assert_eq!(status, StatusCode::OK, "bootstrap append: {answer}");
+    assert_eq!(answer["data"][0]["id"], "msg_guardrail");
+    let accepted_calls = upstream.received_requests().await.unwrap().len();
+    assert_eq!(accepted_calls, 2);
+    let (router, _) = app_configured(&upstream.uri(), registry, block_conversation_input);
+    for (verb, route, body, hint) in [
+        (
+            "POST",
+            "/v1/conversations",
+            Some(json!({"metadata":{}})),
+            true,
+        ),
+        ("GET", "/v1/conversations/conv_guardrail", None, false),
+        (
+            "POST",
+            "/v1/conversations/conv_guardrail",
+            Some(json!({"metadata":{}})),
+            false,
+        ),
+        ("DELETE", "/v1/conversations/conv_guardrail", None, false),
+        (
+            "POST",
+            "/v1/conversations/conv_guardrail/items",
+            Some(json!({"items":[{"type":"item_reference","id":"msg_guardrail"}]})),
+            false,
+        ),
+        ("GET", "/v1/conversations/conv_guardrail/items", None, false),
+        (
+            "GET",
+            "/v1/conversations/conv_guardrail/items/msg_guardrail",
+            None,
+            false,
+        ),
+        (
+            "DELETE",
+            "/v1/conversations/conv_guardrail/items/msg_guardrail",
+            None,
+            false,
+        ),
+    ] {
+        let response = request(router.clone(), verb, route, body, "caller", hint).await;
+        let status = response.status();
+        let answer = value(response).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{verb} {route}: {answer}");
+        assert_eq!(
+            upstream.received_requests().await.unwrap().len(),
+            accepted_calls,
+            "blocked {verb} {route} reached the provider"
+        );
+    }
+}

@@ -969,3 +969,112 @@ async fn containers_wrong_parent_payload_is_not_discovered_and_delete_failure_ke
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert!(!registry.records.lock().unwrap()["cntr_owned"].deleted);
 }
+
+fn blocked_container_router(base: &str, registry: Arc<Registry>) -> axum::Router {
+    let (_, snapshot, _) = app(base, registry.clone());
+    let guardrail: aisix_core::Guardrail = serde_json::from_value(json!({
+        "name":"block-all-container-input","enabled":true,"kind":"custom",
+        "hook_point":"input","fail_open":false,"timeout_ms":5000,
+        "script":"export function checkInput() { return { action: 'block', reason_code: 'blocked' }; }"
+    })).unwrap();
+    snapshot
+        .load()
+        .guardrails
+        .insert(ResourceEntry::new("container-input-block", guardrail, 1));
+    let attachment: aisix_core::models::GuardrailAttachment = serde_json::from_value(json!({
+        "guardrail_id":"container-input-block","scope_type":"env","priority":100
+    }))
+    .unwrap();
+    snapshot
+        .load()
+        .guardrail_attachments
+        .insert(ResourceEntry::new(
+            "container-input-block-attachment",
+            attachment,
+            1,
+        ));
+    let guardrails = aisix_guardrails::LiveGuardrailIndex::new(snapshot.clone(), None);
+    let hub = Arc::new(Hub::new());
+    hub.register_specialized(
+        "openai",
+        Arc::new(aisix_provider_openai::OpenAiBridge::new()),
+    );
+    let config: ProxyConfig = serde_json::from_value(json!({
+        "addr":"127.0.0.1:0","request_body_limit_bytes":1048576
+    }))
+    .unwrap();
+    let state = ProxyState::new(snapshot, hub, &config)
+        .without_cache()
+        .with_guardrail_index(guardrails)
+        .with_platform(aisix_proxy::platform::PlatformSettings::from_secret(
+            "native-container-test",
+        ))
+        .with_native_objects(registry);
+    build_router(state)
+}
+
+// 空请求或二进制没有可扫描文本，也不能绕过无条件输入阻断。
+#[tokio::test]
+async fn unconditional_input_guardrail_blocks_all_nine_container_operations() {
+    let upstream = MockServer::start().await;
+    let registry = Arc::new(Registry::default());
+    let (router, _, _) = app(&upstream.uri(), registry.clone());
+    create(router.clone(), &upstream, "cntr_guardrail", "caller").await;
+    Mock::given(method("POST"))
+        .and(path("/v1/containers/cntr_guardrail/files"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(file("cfile_guardrail", "cntr_guardrail")),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let response = multipart(router, "/v1/containers/cntr_guardrail/files", "caller").await;
+    let status = response.status();
+    let answer = value(response).await;
+    assert_eq!(status, StatusCode::OK, "bootstrap upload: {answer}");
+    assert_eq!(answer["id"], "cfile_guardrail");
+    let accepted_calls = upstream.received_requests().await.unwrap().len();
+    assert_eq!(accepted_calls, 2);
+    let router = blocked_container_router(&upstream.uri(), registry);
+    for (verb, route, body) in [
+        (
+            "POST",
+            "/v1/containers?model=container-model",
+            Some(json!({"name":"workspace"})),
+        ),
+        ("GET", "/v1/containers?model=container-model", None),
+        ("GET", "/v1/containers/cntr_guardrail", None),
+        ("DELETE", "/v1/containers/cntr_guardrail", None),
+        ("POST", "/v1/containers/cntr_guardrail/files", None),
+        ("GET", "/v1/containers/cntr_guardrail/files", None),
+        (
+            "GET",
+            "/v1/containers/cntr_guardrail/files/cfile_guardrail",
+            None,
+        ),
+        (
+            "DELETE",
+            "/v1/containers/cntr_guardrail/files/cfile_guardrail",
+            None,
+        ),
+        (
+            "GET",
+            "/v1/containers/cntr_guardrail/files/cfile_guardrail/content",
+            None,
+        ),
+    ] {
+        let response = if verb == "POST" && route.ends_with("/files") {
+            multipart(router.clone(), route, "caller").await
+        } else {
+            request(router.clone(), verb, route, "caller", body).await
+        };
+        let status = response.status();
+        let answer = value(response).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{verb} {route}: {answer}");
+        assert_eq!(
+            upstream.received_requests().await.unwrap().len(),
+            accepted_calls,
+            "blocked {verb} {route} reached the provider"
+        );
+    }
+}
