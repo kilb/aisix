@@ -1,4 +1,4 @@
-//! 当前客户报价：仅包含已计入组织优惠的精确 CNY 单价。
+//! 当前客户报价：精确 USD 基准价，以及已计入组织优惠的 CNY 单价。
 
 use std::collections::BTreeMap;
 
@@ -62,6 +62,27 @@ pub struct TierQuote {
     pub long_context: Vec<LongContextQuote>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BaselinePriceRate {
+    pub dimension: Dimension,
+    pub unit: QuoteUnit,
+    pub price_usd_per_million: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_from: Option<Dimension>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BaselineLongContextQuote {
+    pub above_input_tokens: u64,
+    pub rates: Vec<BaselinePriceRate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BaselineTierQuote {
+    pub base: Vec<BaselinePriceRate>,
+    pub long_context: Vec<BaselineLongContextQuote>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CustomerQuote {
     pub discount_bps: u16,
@@ -90,7 +111,58 @@ fn rates_quote(rates: &Rates, cny: CnyPerUsd, discount_bps: u16) -> Vec<PriceRat
         .collect()
 }
 
+fn baseline_rates_quote(rates: &Rates) -> Vec<BaselinePriceRate> {
+    Dimension::ALL
+        .into_iter()
+        .map(|dimension| {
+            let resolved = rates.rate_with_source(dimension);
+            BaselinePriceRate {
+                dimension,
+                unit: if dimension == Dimension::WebSearch {
+                    QuoteUnit::Request
+                } else {
+                    QuoteUnit::Token
+                },
+                price_usd_per_million: resolved.map(|(rate, _)| rate.to_string()),
+                fallback_from: resolved.and_then(|(_, source)| source),
+            }
+        })
+        .collect()
+}
+
 impl PriceBook {
+    /// 请求入口模型在同一时刻的 USD 基准价；当前无价或非法时从不回退旧价。
+    pub fn baseline_quote(
+        &self,
+        model_id: &str,
+        at: DateTime<Utc>,
+    ) -> Option<BTreeMap<ServiceTier, BaselineTierQuote>> {
+        let baseline = self.baseline(model_id, at)?.ok()?;
+        Some(
+            baseline
+                .card
+                .0
+                .iter()
+                .map(|(tier, rates)| {
+                    (
+                        tier.clone(),
+                        BaselineTierQuote {
+                            base: baseline_rates_quote(&rates.base),
+                            long_context: rates
+                                .long_context
+                                .iter()
+                                .map(|band| BaselineLongContextQuote {
+                                    above_input_tokens: band.above_input_tokens,
+                                    rates: baseline_rates_quote(&band.rates),
+                                })
+                                .collect(),
+                        },
+                    )
+                })
+                .collect(),
+        )
+    }
+
     /// 与真实收费相同的组织优惠；非法当前修订从不回退为原价。
     pub fn customer_discount_bps(
         &self,

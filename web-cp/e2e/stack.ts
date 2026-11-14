@@ -199,7 +199,7 @@ interface ReadyLine {
   cpDatabase: string;
   operator: { email: string; password: string };
   gateway: { proxyUrl: string; metricsUrl: string; dpId: string; name: string };
-  mockUpstream: { url: string };
+  mockUpstream?: { url: string };
   telemetryRelay?: { controlUrl: string };
 }
 
@@ -329,14 +329,14 @@ async function waitServing(url: string): Promise<void> {
   }
 }
 
-export async function startStack(opts: { telemetryRelay?: boolean } = {}): Promise<Stack> {
+export async function startStack(opts: { telemetryRelay?: boolean; mockUpstream?: boolean } = {}): Promise<Stack> {
   assertBuilt();
   // stdin is held open: the stack stops when it closes, so a worker that
   // dies takes its databases with it. Its own progress and every child's
   // lines go to stderr, which is this worker's.
   const stackProc = spawn(
     process.execPath,
-    ["../scripts/cp-dev-stack.mjs", "--gateway", "../target/debug/aisix", "--mock-upstream", ...(opts.telemetryRelay ? ["--telemetry-relay"] : [])],
+    ["../scripts/cp-dev-stack.mjs", "--gateway", process.env.CP_E2E_GATEWAY_BIN || "../target/debug/aisix", ...(opts.mockUpstream === false ? [] : ["--mock-upstream"]), ...(opts.telemetryRelay ? ["--telemetry-relay"] : [])],
     { cwd: WEB_CP, stdio: ["pipe", "pipe", "inherit"], detached: true },
   );
   let preview: ChildProcess | undefined;
@@ -388,7 +388,7 @@ export async function startStack(opts: { telemetryRelay?: boolean } = {}): Promi
         pause: () => relayCall(control, "pause"),
         resume: () => relayCall(control, "resume"),
       },
-      mockUpstreamUrl: ready.mockUpstream.url,
+      mockUpstreamUrl: ready.mockUpstream?.url ?? "",
       operator: ready.operator,
       admin,
       tenant: () => new ApiClient(ready.httpUrl),

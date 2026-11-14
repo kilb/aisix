@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
-import type { Dimension, PriceRate, TierQuote } from "./priceQuote";
+import type { BasePriceRate, Dimension, DisplayPriceRate, PriceRate, TierQuote } from "./priceQuote";
 
 // 编译真实展开组件与渲染器，直接检查用户可读的价格矩阵。
 const compiled = await build({
@@ -14,7 +14,7 @@ const compiled = await build({
     contents: `import { createElement } from "react";
       import { renderToStaticMarkup } from "react-dom/server";
       import { PriceDetails } from "./PriceDetails.tsx";
-      export function render(tiers) { return renderToStaticMarkup(createElement(PriceDetails, { tiers })); }`,
+      export function render(tiers, currency) { return renderToStaticMarkup(createElement(PriceDetails, { tiers, currency })); }`,
     resolveDir: fileURLToPath(new URL("../", import.meta.url)),
     sourcefile: "price-details-component.ts",
   },
@@ -29,7 +29,7 @@ const temporary = await mkdtemp(join(tmpdir(), "aisix-price-details-"));
 after(() => rm(temporary, { recursive: true, force: true }));
 const entry = join(temporary, "component.cjs");
 await writeFile(entry, compiled.outputFiles[0]!.text);
-const { render } = createRequire(import.meta.url)(entry) as { render: (tiers: Record<string, TierQuote>) => string };
+const { render } = createRequire(import.meta.url)(entry) as { render: (tiers: Record<string, TierQuote<DisplayPriceRate>>, currency?: "CNY" | "USD") => string };
 
 function text(markup: string): string {
   return markup.replace(/<[^>]+>/g, "").replace(/&gt;/g, ">").replace(/&lt;/g, "<");
@@ -92,4 +92,30 @@ test("标准、批量及自定义服务档同时存在时都可查看各自完�
   assert.deepEqual(headings, ["标准", "batch", "custom.fast/v2"]);
   for (const amount of ["¥1.00", "¥0.50", "¥7.00", "¥70.00"]) assert.ok(text(markup).includes(amount), amount);
   assert.match(text(markup), /输入 > 600,000 token/);
+});
+
+
+test("美元基准保留六档十一维和两个价格段，不套用人民币金额或倍率", () => {
+  const dimensions: Dimension[] = ["input", "output", "cache_read", "cache_write", "cache_write_1h", "reasoning", "audio_input", "audio_output", "image_input", "image_output", "web_search"];
+  const tiers: Record<string, TierQuote<BasePriceRate>> = {};
+  for (const [index, name] of ["default", "standard", "fast", "priority", "batch", "flex"].entries()) {
+    const usdRate = (dimension: Dimension, amount: string | null): BasePriceRate => ({ dimension, unit: dimension === "web_search" ? "request" : "token", price_usd_per_million: amount });
+    const base = dimensions.map(dimension => usdRate(dimension, `${index + 1}.00000000000001`));
+    base[2] = usdRate("cache_read", "0");
+    base[8] = usdRate("image_input", null);
+    base[10] = usdRate("web_search", "1250");
+    tiers[name] = { base, long_context: [{ above_input_tokens: 200_000, rates: dimensions.map(dimension => usdRate(dimension, dimension === "web_search" ? "2500" : `${index + 11}.00000000000001`)) }] };
+  }
+  const markup = render(tiers, "USD");
+  const visible = text(markup);
+  assert.equal((markup.match(/<table\b/g) ?? []).length, 6);
+  assert.equal((markup.match(/scope="row"/g) ?? []).length, 66);
+  assert.equal((markup.match(/class="price-amount"/g) ?? []).length, 132);
+  for (let value = 1; value <= 6; value++) assert.ok(visible.includes(`$${value}.00000000000001`));
+  for (let value = 11; value <= 16; value++) assert.ok(visible.includes(`$${value}.00000000000001`));
+  assert.equal((visible.match(/未提供价格/g) ?? []).length, 6);
+  assert.equal((visible.match(/\$0\.00/g) ?? []).length, 6);
+  assert.equal((visible.match(/美元\/千次\$1\.25\$2\.50/g) ?? []).length, 6);
+  assert.doesNotMatch(visible, /¥|组织实际单价/);
+  assert.match(visible, /美元基准单价/);
 });

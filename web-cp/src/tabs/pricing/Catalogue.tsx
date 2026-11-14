@@ -73,6 +73,14 @@ export function Catalogue(_props: TabProps) {
             <label className="f filter"><span>来源</span><select value={source} onChange={(e) => setSource(e.target.value)}><option value="">全部</option><option value="sourced">附来源链接</option><option value="missing">无来源链接</option></select></label>
           </RecordTableToolbar>
           <DataTable label="价格目录">
+            <colgroup>
+              <col className="catalogue-col-name" />
+              <col className="catalogue-col-alias" />
+              <col className="catalogue-col-source" />
+              <col className="catalogue-col-date" />
+              <col className="catalogue-col-notes" />
+              <col className="catalogue-col-actions" />
+            </colgroup>
             <thead>
               <tr>
                 <th>条目</th>
@@ -118,9 +126,9 @@ export function Catalogue(_props: TabProps) {
                         {e.effective_from ? `${fmtBeijing(e.effective_from)} 起` : (e.as_of ?? "—")}
                         {e.effective_from && e.as_of && <div className="cell-note">抄录于 {e.as_of}</div>}
                       </td>
-                      {/* The notes take whatever width is left, cut to one line: their whole text is in the title and the expanded entry. */}
+                      {/* 说明先显示三行摘要，完整内容可在标题和展开条目中查看。 */}
                       <td data-label="说明" className="w-full max-w-0 text-caption text-muted">
-                        <span className="block truncate" title={e.notes ?? undefined}>
+                        <span className="line-clamp-3" title={e.notes ?? undefined}>
                           {e.notes ?? "—"}
                         </span>
                       </td>

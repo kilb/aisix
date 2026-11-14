@@ -1,16 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { Button } from "./Button";
-import { Icon } from "./Icon";
 import { useToast } from "./Toast";
 
 const DONE_MS = 1_500;
 
-/**
- * Copies `text` to the clipboard. On success the button itself says 已复制
- * with a check for 1.5s and a toast confirms it; a refusal goes to
- * `onFailed` with its cause, which the caller shows beside the text to copy
- * by hand.
- */
+/** 复制仅使用图标；读屏名称、提示和成功反馈保持可达。 */
 export function CopyButton({
   text,
   label = "复制",
@@ -42,6 +36,8 @@ export function CopyButton({
   useEffect(() => () => window.clearTimeout(timer.current), []);
 
   async function copy() {
+    setDone(false);
+    window.clearTimeout(timer.current);
     setFetching(true);
     let value: string;
     try {
@@ -74,19 +70,11 @@ export function CopyButton({
       disabledReason={disabledReason}
       busy={fetching}
       busyLabel={label}
+      icon={done ? "check" : "copy"}
+      iconOnly
+      aria-label={done ? "已复制" : label}
+      title={done ? "已复制" : label}
       onClick={() => void copy()}
-    >
-      {done ? (
-        <>
-          <Icon name="check" />
-          已复制
-        </>
-      ) : (
-        <>
-          <Icon name="copy" />
-          {label}
-        </>
-      )}
-    </Button>
+    />
   );
 }

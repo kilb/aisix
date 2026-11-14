@@ -25,7 +25,10 @@ pub use engine::{
     charge_micro_cny, price_event, BaselineRef, ChargeLine, CostPriced, DiscountRef, Exemption,
     Outcome, Payer, PricedEvent, PricingError, PricingWarning, RateRef,
 };
-pub use quote::{CustomerQuote, LongContextQuote, PriceRate, QuoteUnit, TierQuote};
+pub use quote::{
+    BaselineLongContextQuote, BaselinePriceRate, BaselineTierQuote, CustomerQuote,
+    LongContextQuote, PriceRate, QuoteUnit, TierQuote,
+};
 pub use rates::{
     cny_per_million, cny_per_token, effective_multiplier, CnyPerUsd, Dimension, LongContextBand,
     MicroCny, Rate, RateCard, RateCardError, Rates, ServiceTier, TierRates,

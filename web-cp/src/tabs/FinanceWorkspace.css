@@ -221,3 +221,17 @@
 .finance-workspace .finance-amount-label { margin-bottom: 2px; }
 .finance-workspace .sections-switch { margin-bottom: 16px; }
 .finance-workspace .finance-form-grid { row-gap: 16px; }
+
+/* 宽表保留列的阅读宽度，滚动限制在原有表格工作区。 */
+@media (min-width: 900px) {
+  .finance-workspace .dt:has(> thead > tr > th:nth-child(5)) { min-width: 960px; }
+  .finance-workspace .dt:has(> thead > tr > th:nth-child(7)) { min-width: 1120px; }
+  .finance-workspace .dt:has(> tbody > tr[data-finance-record] > td:nth-child(7)):not(.charge-records-table) { min-width: 0; }
+}
+/* 来源和说明拥有明确的列宽，不用其它列余下的空间承载整段文字。 */
+.catalogue-col-name { width: 22%; }
+.catalogue-col-alias { width: 10%; }
+.catalogue-col-source { width: 22%; }
+.catalogue-col-date { width: 12%; }
+.catalogue-col-notes { width: 28%; }
+.catalogue-col-actions { width: 6%; }

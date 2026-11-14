@@ -39,14 +39,6 @@ td > .tn-actions {
   color: var(--text-2);
 }
 
-/* 打开详情时次要列收起；完整详情仍可在侧面板查看。 */
-@media (min-width: 1100px) {
-  .with-side.is-open .dt :is(th, td).side-opt,
-  .is-creating .dt :is(th, td).side-opt {
-    display: none;
-  }
-}
-
 /* 租户详情的四项基本资料。 */
 .tn-strip {
   display: grid;
@@ -405,6 +397,6 @@ td .tn-flag {
   }
   .tn-bento-side > .side-main,
   .tn-bento-side > .side-panel {
-    grid-column: span 6;
+    grid-column: 1 / -1;
   }
 }

@@ -24,9 +24,9 @@
 
 **TwoStep**：label/onConfirm/disabled/kind/size/ask/warning/busy/busyLabel API 不变。first click 切到精确的“确认<label>”和“取消”；ask=false 时直接执行。确认文字体现破坏性，不依靠颜色。键盘打开后焦点移到取消，第二次 Enter 仅收回；关闭归还原操作，除非页面已将焦点移到拒绝字段。Escape 只收回当前确认、不关闭外层面板。warning role=alert。确认后保持展开，busy 禁用确认和取消，Escape 不得打断；请求结束才收回。busy 名称保留原标签，或采用 busyLabel。切换不播放宽度或淡入动画；上述询问、确认与焦点状态机保持。
 
-**CopyButton**：text 为字符串或按需请求，label 默认“复制”；size/kind/disabled/disabledReason 与 Button 一致；成功“已复制”1.5秒并 toast；请求中禁止重复。失败通过 onFailed 显示原因，保留手工选择复制路径。
+**CopyButton**：text 为字符串或按需请求，label 默认“复制”；size/kind/disabled/disabledReason 与 Button 一致；始终只显示 Copy/Check 图标，aria-label/title 保留操作与成功名称；成功 Check 持续1.5秒并 toast；请求中禁止重复。失败通过 onFailed 显示原因，保留手工选择复制路径。
 
-**KeySecret**：prefix/reveal/unavailable/onError API 不变，明文仅组件内存，刷新丢失，禁止存储/日志/额外缓存。复制按需 reveal 后一次复制；显示/隐藏只交换前缀和明文。没有明文时给禁用原因；clipboard 失败在按钮下显示。
+**KeySecret**：prefix/reveal/unavailable/onError API 不变，明文仅组件内存，刷新丢失，禁止存储/日志/额外缓存。正常只显示前缀遮罩与复制图标，复制按需 reveal 后一次复制；无显示/隐藏控件。没有明文时给禁用原因；clipboard 失败时在按钮下保留 readonly 明文供手动选择，刷新或离页清除。
 
 **Lamp**：state applied/propagating/pending/rejected/disabled 不变；图形为成功实点/警告空心/危险方点，状态文字始终在场，无脉冲入场。children 是真实状态；title 可选。属性保持 data-lamp，禁止改为 data-state（后者是 rollout 合同）。
 

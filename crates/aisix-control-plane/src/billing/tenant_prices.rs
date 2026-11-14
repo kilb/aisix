@@ -4,8 +4,10 @@
 //! A model's price is its official USD baseline times the rate in force for
 //! the group and that model (its own override, else the group's default),
 //! less the tenant's current discount. A listing price is therefore the
-//! final one: a tenant is shown what it is charged, never a list price it
+//! final one: a group's quote shows what the tenant is charged, not a list price it
 //! must discount itself.
+//!
+//! 同一响应的 `base_models` 另列原始 USD 基准价，不含分组换算或组织优惠。
 //!
 //! The answer is built field by field from named columns, so no routing name,
 //! provider, provider account or upstream model reaches it (the crate's
@@ -13,6 +15,8 @@
 //! retired group is not either. A model the group can price at nothing — no
 //! baseline, or no rate that covers it — is absent rather than shown at 0,
 //! so nothing reads as free that is merely unpriced.
+
+use std::collections::BTreeMap;
 
 use axum::extract::State;
 use axum::Json;
@@ -125,6 +129,7 @@ pub async fn prices(
                     .ok();
                 let groups = assigned_groups(&mut *conn, tenant_id).await?;
                 let mut views = Vec::with_capacity(groups.len());
+                let mut base_models = BTreeMap::new();
                 let mut valid_until = None;
                 for group in &groups {
                     let priced =
@@ -136,11 +141,39 @@ pub async fn prices(
                             }),
                         );
                     }
+                    // 沿用同一授权、公开且可报价集合；跨组去重后只投影同一本书的 USD。
+                    for model in &priced.models {
+                        if base_models.contains_key(&model.model_id) {
+                            continue;
+                        }
+                        if let Some(prices_by_tier) = context
+                            .book
+                            .baseline_quote(&model.model_id.to_string(), context.as_of)
+                        {
+                            base_models.insert(
+                                model.model_id,
+                                (
+                                    model.name.clone(),
+                                    json!({
+                                        "model_id": model.model_id,
+                                        "name": model.name,
+                                        "currency": "USD",
+                                        "prices_by_tier": prices_by_tier,
+                                    }),
+                                ),
+                            );
+                        }
+                    }
                     views.push(group_view(group, &priced.models));
                 }
-                Ok::<_, ApiError>(json!({ "currency": CURRENCY, "groups": views,
+                let mut base_models: Vec<_> = base_models.into_values().collect();
+                base_models.sort_by(|a, b| a.0.cmp(&b.0));
+                let base_models: Vec<_> = base_models.into_iter().map(|(_, row)| row).collect();
+                Ok::<_, ApiError>(
+                    json!({ "currency": CURRENCY, "groups": views, "base_models": base_models,
                     "discount_bps": discount_bps, "pricing_version": context.pricing_version,
-                    "as_of": context.as_of, "valid_until": valid_until }))
+                    "as_of": context.as_of, "valid_until": valid_until }),
+                )
             }
             .boxed()
         })

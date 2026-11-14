@@ -132,7 +132,7 @@ async function login(page: Page, email: string): Promise<void> {
   await page.getByLabel("邮箱").fill(email);
   await page.getByLabel("口令", { exact: true }).fill(PASSWORD);
   await page.getByRole("button", { name: "登录", exact: true }).click();
-  await expect(page.getByRole("button", { name: "登出" })).toBeVisible();
+  await expect(page.getByRole("link", { name: "模型与价格", exact: true })).toBeVisible();
 }
 
 /** 每个模型只出现一次；分组行属于该模型，不随分页分离。 */
@@ -142,7 +142,7 @@ function modelEntry(page: Page, model: string): Locator {
 }
 
 function groupRow(page: Page, model: string, group: string): Locator {
-  return modelEntry(page, model).locator(":scope > tr[data-price-group]").filter({ hasText: group });
+  return modelEntry(page, model).locator(`:scope > tr[data-group-name="${group}"]`);
 }
 
 /** 数值仍来自独立的基准价、分组换算率与组织优惠。 */
@@ -156,17 +156,19 @@ async function rowPrices(page: Page, model: string, group: string, rate: string)
   ].entries()) await expect(row.getByRole("cell").nth(index + 1)).toHaveText(expected);
 }
 
-test("模型下同时列出各授权分组的人民币单价（含组织折扣）", async ({ page }) => {
+test("默认美元基准价，可切换各授权分组的人民币单价（含组织折扣）", async ({ page }) => {
   await activeOrg("Prices Org 1b9", "owner@prices-1b9.test", [GROUP_A.name, GROUP_B.name]);
   await login(page, "owner@prices-1b9.test");
-  await page.getByRole("tab", { name: "价格", exact: true }).click();
+  await page.getByRole("link", { name: "模型与价格", exact: true }).click();
   const model = modelEntry(page, "chat-price-3f7");
   await expect(model).toHaveCount(1);
-  await expect(model.locator(":scope > tr[data-price-group]")).toHaveCount(2);
-  await expect(model).toContainText(GROUP_A.description);
-  await expect(model).toContainText(GROUP_B.description);
-  await expect(page.getByText(/价格以人民币计，按实际用量计费/)).toBeVisible();
+  await expect(model.locator(":scope > tr[data-price-group]")).toHaveCount(1);
+  await expect(model.locator('[data-price-group="base"] [data-label="输入"]')).toHaveText("$4.00");
+  await page.getByRole("group", { name: "价格分组", exact: true }).getByRole("button", { name: GROUP_A.display, exact: true }).click();
+  await expect(page.getByText(GROUP_A.description, { exact: true })).toBeVisible();
   await rowPrices(page, "chat-price-3f7", GROUP_A.display, RATE_A);
+  await page.getByRole("group", { name: "价格分组", exact: true }).getByRole("button", { name: GROUP_B.display, exact: true }).click();
+  await expect(page.getByText(GROUP_B.description, { exact: true })).toBeVisible();
   await rowPrices(page, "chat-price-3f7", GROUP_B.display, RATE_B);
   await expect(modelEntry(page, "chat-noprice-3f7")).toHaveCount(0);
   const shown = await page.locator("body").innerText();
@@ -183,15 +185,17 @@ test("成员角色也能看到价格页", async ({ page }) => {
   await login(page, "member@prices-2c4.test");
 
   // The tab is there for a member, and the page answers with the prices.
-  await page.getByRole("tab", { name: "价格", exact: true }).click();
-  await expect(page.getByLabel("分组筛选").getByRole("option")).toHaveText(["全部分组", GROUP_A.display]);
+  await page.getByRole("link", { name: "模型与价格", exact: true }).click();
+  await expect(page.getByRole("group", { name: "价格分组", exact: true }).getByRole("button")).toHaveText(["Base USD", GROUP_A.display]);
+  await page.getByRole("group", { name: "价格分组", exact: true }).getByRole("button", { name: GROUP_A.display, exact: true }).click();
   await rowPrices(page, "chat-price-3f7", GROUP_A.display, RATE_A);
 });
 
 test("创建密钥时的查看价格链接打开所选分组", async ({ page }) => {
   await activeOrg("Prices Link Org 3d5", "owner@prices-3d5.test", [GROUP_A.name, GROUP_B.name]);
   await login(page, "owner@prices-3d5.test");
-  await page.getByRole("tab", { name: "密钥", exact: true }).click();
+  await page.getByRole("link", { name: "API 密钥", exact: true }).click();
+  await page.getByRole("button", { name: "新建密钥", exact: true }).click();
 
   // The second group, the one that is not preselected and not the page's
   // first tab: the link must open that one and not A.
@@ -199,34 +203,36 @@ test("创建密钥时的查看价格链接打开所选分组", async ({ page }) 
   await picker.getByRole("radio", { name: new RegExp(GROUP_B.display) }).check();
   await page.getByRole("link", { name: "查看价格" }).click();
 
-  await expect(page.getByRole("tab", { name: "价格", exact: true })).toHaveAttribute("aria-selected", "true");
-  await expect(page.getByLabel("分组筛选").locator("option:checked")).toHaveText(GROUP_B.display);
+  await expect(page.getByRole("link", { name: "模型与价格", exact: true })).toHaveAttribute("aria-current", "page");
+  await expect(page.getByRole("group", { name: "价格分组", exact: true }).getByRole("button", { name: GROUP_B.display, exact: true })).toHaveAttribute("aria-pressed", "true");
   await rowPrices(page, "chat-price-3f7", GROUP_B.display, RATE_B);
   await expect(groupRow(page, "chat-price-3f7", GROUP_A.display)).toHaveCount(0);
 
   // The address says which group it shows, so it can be shared or reloaded.
   expect(page.url()).toContain("prices");
   await page.reload();
-  await expect(page.getByLabel("分组筛选").locator("option:checked")).toHaveText(GROUP_B.display);
+  await expect(page.getByRole("group", { name: "价格分组", exact: true }).getByRole("button", { name: GROUP_B.display, exact: true })).toHaveAttribute("aria-pressed", "true");
 
   // Back to 密钥 through the nav, and the same link again: it opens the same
   // group a second time, and the address follows the nav in between.
-  await page.getByRole("tab", { name: "密钥", exact: true }).click();
+  await page.getByRole("link", { name: "API 密钥", exact: true }).click();
   await expect.soft(page).toHaveURL(/#keys$/);
+  await page.getByRole("button", { name: "新建密钥", exact: true }).click();
   await page.getByRole("group", { name: "分组" }).getByRole("radio", { name: new RegExp(GROUP_B.display) }).check();
   await page.getByRole("link", { name: "查看价格" }).click();
-  await expect(page.getByRole("tab", { name: "价格", exact: true })).toHaveAttribute("aria-selected", "true");
-  await expect(page.getByLabel("分组筛选").locator("option:checked")).toHaveText(GROUP_B.display);
+  await expect(page.getByRole("link", { name: "模型与价格", exact: true })).toHaveAttribute("aria-current", "page");
+  await expect(page.getByRole("group", { name: "价格分组", exact: true }).getByRole("button", { name: GROUP_B.display, exact: true })).toHaveAttribute("aria-pressed", "true");
 });
 
 test("价格页不出现分组的路由名", async ({ page }) => {
   await activeOrg("Prices Route Org 4e6", "owner@prices-4e6.test", [GROUP_ROUTE.name]);
   await login(page, "owner@prices-4e6.test");
-  await page.getByRole("tab", { name: "价格", exact: true }).click();
+  await page.getByRole("link", { name: "模型与价格", exact: true }).click();
 
   // The display name and description are what the page shows.
-  await expect(page.getByLabel("分组筛选").getByRole("option")).toHaveText(["全部分组", GROUP_ROUTE.display]);
-  await expect(groupRow(page, "chat-price-3f7", GROUP_ROUTE.display)).toContainText(GROUP_ROUTE.description);
+  await expect(page.getByRole("group", { name: "价格分组", exact: true }).getByRole("button")).toHaveText(["Base USD", GROUP_ROUTE.display]);
+  await page.getByRole("group", { name: "价格分组", exact: true }).getByRole("button", { name: GROUP_ROUTE.display, exact: true }).click();
+  await expect(page.getByText(GROUP_ROUTE.description, { exact: true })).toBeVisible();
   // The routing name, which decides what the group reaches, appears nowhere.
   const seen = [await page.locator("body").innerText(), await page.content()];
   for (const text of seen) expect.soft(text).not.toContain(GROUP_ROUTE.name);
@@ -257,7 +263,8 @@ test("基准价单列 1 小时缓存写时，价格页在缓存写下另列这�
   await stack.admin.patch(`/admin/tenants/${id}`, { allowed_model_ids: [pricedModelId, model.id] }, current.version);
 
   await login(page, "owner@prices-5f8.test");
-  await page.getByRole("tab", { name: "价格", exact: true }).click();
+  await page.getByRole("link", { name: "模型与价格", exact: true }).click();
+  await page.getByRole("group", { name: "价格分组", exact: true }).getByRole("button", { name: GROUP_A.display, exact: true }).click();
   const row = groupRow(page, "chat-1h-3f7", GROUP_A.display);
   await expect(row.getByRole("cell").nth(0)).toContainText("2.7×");
   await expect(row.getByRole("cell").filter({ hasNot: page.locator(".price-multiplier-value") })).toHaveText([
@@ -294,7 +301,8 @@ test("基准价没有缓存价时，价格页的缓存读写按输入价显示�
   await stack.admin.patch(`/admin/tenants/${id}`, { allowed_model_ids: [pricedModelId, model.id] }, current.version);
 
   await login(page, "owner@prices-6a1.test");
-  await page.getByRole("tab", { name: "价格", exact: true }).click();
+  await page.getByRole("link", { name: "模型与价格", exact: true }).click();
+  await page.getByRole("group", { name: "价格分组", exact: true }).getByRole("button", { name: GROUP_A.display, exact: true }).click();
   const row = groupRow(page, "chat-nocache-3f7", GROUP_A.display);
   const input = yuanPerMillion(card.input, RATE_A, DISCOUNT_BPS);
   await expect(row.getByRole("cell").filter({ hasNot: page.locator(".price-multiplier-value") })).toHaveText([

@@ -209,15 +209,15 @@ test("内部密钥的明文可以再次复制；客户租户的密钥没有复�
   // A reload drops everything the page held; the list still has the key.
   await page.reload();
   await page.locator('[data-tab="keys"]').click();
-  // 显示 puts it in the row; 隐藏 takes it away.
-  await keyRow(page, "ops-reveal-t6").getByRole("button", { name: "显示" }).click();
-  await expect(keyRow(page, "ops-reveal-t6")).toContainText(minted);
-  await keyRow(page, "ops-reveal-t6").getByRole("button", { name: "隐藏" }).click();
+  // 正常状态只提供遮罩与复制图标，不显示明文或显隐开关。
+  await expect(keyRow(page, "ops-reveal-t6").getByRole("button", { name: /^(显示|隐藏)$/ })).toHaveCount(0);
   await expect(keyRow(page, "ops-reveal-t6")).not.toContainText(minted);
 
   // 复制 reveals it again and copies it in one click.
-  await keyRow(page, "ops-reveal-t6").getByRole("button", { name: "复制" }).click();
+  await keyRow(page, "ops-reveal-t6").getByRole("button", { name: "复制密钥", exact: true }).click();
   await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(minted);
+  await expect(keyRow(page, "ops-reveal-t6").getByRole("button", { name: "已复制", exact: true })).toHaveText("");
+  await expect(keyRow(page, "ops-reveal-t6")).not.toContainText(minted);
   // The value copied is the key the gateway serves.
   await expect.poll(() => chatStatus(minted), { timeout: KEY_READY_MS }).toBe(200);
 
@@ -240,7 +240,7 @@ test("内部密钥的明文可以再次复制；客户租户的密钥没有复�
   await page.getByLabel("租户").selectOption({ label: t.org });
   const theirs = keyRow(page, "customer-reveal-t6");
   await expect(theirs).toBeVisible();
-  await expect(theirs.getByRole("button", { name: "复制" })).toHaveCount(0);
+  await expect(theirs.getByRole("button", { name: "复制密钥", exact: true })).toHaveCount(0);
   await expect(theirs.getByRole("button", { name: "显示" })).toHaveCount(0);
 
   // An older key on the platform's own tenant offers the copy button off,
@@ -256,7 +256,7 @@ test("内部密钥的明文可以再次复制；客户租户的密钥没有复�
   await page.reload();
   await page.locator('[data-tab="keys"]').click();
   const stale = keyRow(page, "ops-old-t6");
-  await expect(stale.getByRole("button", { name: "复制" })).toHaveAttribute("aria-disabled", "true");
+  await expect(stale.getByRole("button", { name: "复制密钥", exact: true })).toHaveAttribute("aria-disabled", "true");
   await expect(stale.getByRole("button", { name: "显示" })).toHaveCount(0);
 });
 

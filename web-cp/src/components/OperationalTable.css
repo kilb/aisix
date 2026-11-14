@@ -1,5 +1,5 @@
 /* 记录由当前分页决定高度，不再把页面切成嵌套滚动窗口。 */
-.ops-record-table { width: 100%; min-width: 0; max-width: 100%; max-height: none; overflow: visible; container-type: inline-size; }
+.ops-record-table { width: 100%; min-width: 0; max-width: 100%; max-height: none; overflow-x: auto; overscroll-behavior-x: contain; container-type: inline-size; }
 .panel > .dt-wrap.ops-record-table { width: auto; }
 .ops-record-table > .dt { width: 100%; min-width: 0; table-layout: fixed; }
 .ops-record-table > .dt :is(th, td) { min-width: 0; max-width: none; white-space: normal; overflow-wrap: anywhere; vertical-align: top; }
@@ -39,7 +39,12 @@
 .ops-record-table .ops-number-field { display: grid; grid-template-columns: minmax(0, 1fr) minmax(44px, 60px); align-items: center; gap: 8px; text-align: left; font-size: 12px; color: var(--muted-foreground); }
 .ops-record-table .ops-number-field + .ops-number-field { margin-top: 6px; }
 .ops-record-table .ops-number-field input { width: 100%; min-width: 0; max-width: 100%; }
-/* 打开的编辑器也会压缩表格宽度，按容器而非整个窗口切换阅读方式。 */
+/* 表格保留可读列宽，宽度不足时只在表格区域滚动。 */
+@container (min-width: 761px) {
+  .ops-record-table > .dt:has(> thead > tr > th:nth-child(5)) { min-width: 900px; }
+  .ops-record-table > .dt:has(> thead > tr > th:nth-child(7)) { min-width: 1120px; }
+}
+/* 窄工作区按字段阅读，完整内容仍随页面展开。 */
 @container (max-width: 760px) {
   .ops-record-table > .dt { display: block; }
   .ops-record-table > .dt > thead { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }

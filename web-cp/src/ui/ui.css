@@ -635,7 +635,7 @@ select.select-sm {
 .side-head > .side-close {
   margin-left: auto;
 }
-/* 旧详情容器也采用同一1100断点与12列；平板/手机依次展开。 */
+/* 列表与详情各占一行，避免表格被侧栏挤压。 */
 .with-side {
   display: grid;
   grid-template-columns: repeat(12, minmax(0, 1fr));
@@ -643,17 +643,6 @@ select.select-sm {
   align-items: start;
 }
 .with-side > * { min-width: 0; grid-column: span 12 / span 12; }
-@media (min-width: 1100px) {
-  .with-side.is-open > :first-child { grid-column: span 7 / span 7; }
-  .with-side.is-open > .side-panel { grid-column: span 5 / span 5; }
-  .with-side.is-open > .side-panel {
-    position: sticky;
-    top: 72px;
-    max-height: calc(100vh - 88px);
-    overflow-y: auto;
-    overscroll-behavior: contain;
-  }
-}
 
 /* Bento 原语：编号不进入可访问名称，数字只负责呈现，不截断精确金额。 */
 main { counter-reset: bento-card; }
