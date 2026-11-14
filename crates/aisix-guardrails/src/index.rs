@@ -189,6 +189,22 @@ impl GuardrailIndex {
     ///
     /// Complexity: O(n) in the number of attachment entries.
     pub fn resolve(&self, ctx: &RequestContext<'_>) -> GuardrailChain {
+        self.resolve_for_models(ctx, &[])
+    }
+
+    /// 合并同一请求显式指定的多个模型；原上下文模型和其余作用域仍然保留。
+    /// 只扩展模型匹配集合，按既有优先级与规则ID去重，不逐模型重跑环境或密钥规则。
+    /// 模型ID由调用方明确给出，此处不扩展路由、语义或集成模型的隐式成员。
+    pub fn resolve_for_models(
+        &self,
+        ctx: &RequestContext<'_>,
+        model_ids: &[&str],
+    ) -> GuardrailChain {
+        let extra_models: HashSet<&str> = model_ids
+            .iter()
+            .copied()
+            .filter(|id| !id.is_empty())
+            .collect();
         let mut seen: HashSet<&str> = HashSet::new();
         let mut chain: Vec<(String, Arc<dyn Guardrail>, GuardrailInputMessages)> = Vec::new();
         // `applied` mirrors `chain` 1:1 — the `{kind, hook}` of each member
@@ -197,7 +213,13 @@ impl GuardrailIndex {
         let mut applied: Vec<AppliedGuardrail> = Vec::new();
 
         for entry in &self.entries {
-            if !entry.applies_to(ctx) {
+            if !entry.applies_to(ctx)
+                && !(entry.scope_kind == ScopeKind::Model
+                    && entry
+                        .scope_id
+                        .as_deref()
+                        .is_some_and(|id| extra_models.contains(id)))
+            {
                 continue;
             }
             if seen.contains(entry.guardrail_id.as_str()) {

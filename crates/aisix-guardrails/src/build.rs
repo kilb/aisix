@@ -2171,12 +2171,21 @@ impl LiveGuardrailIndex {
     /// chokepoint every endpoint family resolves through, so the fast
     /// path covers them all.
     pub fn resolve(&self, ctx: &RequestContext<'_>) -> GuardrailChain {
+        self.resolve_for_models(ctx, &[])
+    }
+
+    /// 同一请求的显式模型集合只解析一次，复用同一运行时实例、指标接收器和审计日志。
+    pub fn resolve_for_models(
+        &self,
+        ctx: &RequestContext<'_>,
+        model_ids: &[&str],
+    ) -> GuardrailChain {
         let index = self.current();
         if index.is_empty() {
             return GuardrailChain::empty();
         }
         let chain = index
-            .resolve(ctx)
+            .resolve_for_models(ctx, model_ids)
             .with_metrics_sink(self.metrics_sink.clone());
         // A fresh audit log per resolve — and a chain is resolved exactly
         // once per request — is what makes the log request-scoped

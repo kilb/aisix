@@ -1194,8 +1194,24 @@ impl Audit {
         blob: &[u8],
         mask: bool,
     ) -> Result<Option<Vec<u8>>, ProxyError> {
+        self.input_for_models(state, snapshot, auth, target, blob, mask, &[])
+            .await
+    }
+
+    /// 多模型作业在一次输入链中合并其显式模型；普通调用仍只使用原目标模型。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn input_for_models(
+        &mut self,
+        state: &ProxyState,
+        snapshot: &AisixSnapshot,
+        auth: &AuthenticatedKey,
+        target: &JobTarget,
+        blob: &[u8],
+        mask: bool,
+        model_ids: &[&str],
+    ) -> Result<Option<Vec<u8>>, ProxyError> {
         self.target = Some(target.clone());
-        crate::jobs::scan_input_blob(
+        crate::jobs::scan_input_blob_for_models(
             state,
             snapshot,
             auth,
@@ -1207,6 +1223,7 @@ impl Audit {
             &mut self.bypass,
             &mut self.applied,
             mask.then_some(&mut self.redactions),
+            model_ids,
         )
         .await
     }
