@@ -221,7 +221,9 @@ pub struct ApiKey {
     /// `/v1/systemone`), `realtime` (`/v1/realtime`), `files` (`/v1/files`
     /// and the routes under it), `batches` (`/v1/batches` and the routes
     /// under it), `fine_tuning` (`/v1/fine_tuning/jobs` and the routes under
-    /// it), `mcp` (`/mcp`, `/mcp/{server}`, `/mcp/{server}/oauth/credential`,
+    /// it), `conversations`, `containers`, `vector_stores`, `skills` and
+    /// `evals` (each `/v1` resource and the routes under it), `mcp` (`/mcp`,
+    /// `/mcp/{server}`, `/mcp/{server}/oauth/credential`,
     /// and `/mcp/{server}/oauth/token` when MCP sign-in authenticates the
     /// token request with this key), `a2a` (`/a2a/{agent}` and its agent
     /// card), and `passthrough` (every passthrough route, whether it matched
@@ -296,6 +298,11 @@ pub enum EndpointFamily {
     FineTuning,
     Moderations,
     ContentProvenanceChecks,
+    Conversations,
+    Containers,
+    VectorStores,
+    Skills,
+    Evals,
     Mcp,
     A2a,
     Passthrough,

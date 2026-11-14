@@ -12,6 +12,91 @@ fn env_of(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         .collect()
 }
 
+#[test]
+fn sip_file_binding_references_exact_local_ids_and_rejects_project_or_signing_key_reuse() {
+    let model = derive_id("models", "sip-model");
+    let caller = derive_id("api_keys", "sip-caller");
+    let source = format!(
+        r#"
+_format_version: "1"
+provider_keys:
+  - display_name: sip-account
+    provider: openai
+    api_key: upstream-local-only
+    request:
+      default_headers:
+        OpenAI-Project: proj_file_local
+    realtime_sip:
+      route_id: local-file-route
+      webhook_secret: local-signing-key
+      api_key_id: {caller}
+      model_id: {model}
+models:
+  - display_name: sip-model
+    provider: openai
+    model_name: gpt-realtime
+    provider_key: sip-account
+api_keys:
+  - display_name: sip-caller
+    key_hash: local-key-hash
+    allowed_models: [sip-model]
+"#
+    );
+    let snapshot = load(&source, &HashMap::new()).unwrap();
+    assert_eq!(
+        snapshot
+            .provider_keys
+            .get_by_name("sip-account")
+            .unwrap()
+            .realtime_sip
+            .as_ref()
+            .unwrap()
+            .model_id,
+        model
+    );
+    let missing = source.replace(&format!("model_id: {model}"), "model_id: nonexistent");
+    assert!(errors_of(load(&missing, &HashMap::new()))
+        .iter()
+        .any(|error| error.contains("model_id does not resolve")));
+    // 撤权必须能重载；入口逐次检查当前密钥，不能让旧绑定挡住撤权。
+    let revoked = source.replace(
+        "allowed_models: [sip-model]",
+        "allowed_models: []\n    disabled: true",
+    );
+    load(&revoked, &HashMap::new()).unwrap();
+    let duplicated = source.replace(
+        "models:\n",
+        &format!(
+            r#"  - display_name: second-sip-account
+    provider: openai
+    api_key: different-credential-same-project
+    request:
+      default_headers:
+        OpenAI-Project: proj_file_local
+    realtime_sip:
+      route_id: other-route
+      webhook_secret: whsec_bG9jYWwtc2lnbmluZy1rZXk=
+      api_key_id: {caller}
+      model_id: {model}
+models:
+"#
+        ),
+    );
+    let errors = errors_of(load(&duplicated, &HashMap::new()));
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("webhook_secret must not be reused")),
+        "{errors:?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("SIP calls must have one binding")),
+        "{errors:?}"
+    );
+}
+
 fn load(contents: &str, env: &HashMap<String, String>) -> Result<AisixSnapshot, FileSourceErrors> {
     load_from_str(contents, "resources.yaml", 1, &|name| {
         env.get(name).cloned()

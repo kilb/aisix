@@ -133,6 +133,7 @@ fn managed_state(state: ProxyState) -> ProxyState {
         .get_by_id(PROVIDER)
         .unwrap();
     let origin = OriginBinding {
+        surface: None,
         model_id: uuid::Uuid::parse_str(MODEL).unwrap(),
         provider_key_id: uuid::Uuid::parse_str(PROVIDER).unwrap(),
         boundary: configured_native_origin(

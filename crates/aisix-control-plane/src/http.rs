@@ -377,6 +377,11 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
             MemberRole::Member,
         ]),
     ),
+    (
+        "GET",
+        "/admin/native-metering",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
     // Stored usage.
     (
         "GET",
@@ -777,6 +782,52 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
     ("POST", "/dp/v1/native-objects/renew", MinRole::Dp),
     ("POST", "/dp/v1/native-objects/reschedule", MinRole::Dp),
     ("POST", "/dp/v1/native-objects/complete", MinRole::Dp),
+    ("POST", "/dp/v1/native-objects/related/begin", MinRole::Dp),
+    ("POST", "/dp/v1/native-objects/related/bind", MinRole::Dp),
+    (
+        "POST",
+        "/dp/v1/native-objects/relations/reserve",
+        MinRole::Dp,
+    ),
+    (
+        "POST",
+        "/dp/v1/native-objects/relations/commit",
+        MinRole::Dp,
+    ),
+    (
+        "POST",
+        "/dp/v1/native-objects/relations/lookup",
+        MinRole::Dp,
+    ),
+    (
+        "POST",
+        "/dp/v1/native-objects/relations/resolve",
+        MinRole::Dp,
+    ),
+    (
+        "POST",
+        "/dp/v1/native-objects/observed-artifacts",
+        MinRole::Dp,
+    ),
+    ("POST", "/dp/v1/native-objects/delete/reserve", MinRole::Dp),
+    ("POST", "/dp/v1/native-objects/delete/commit", MinRole::Dp),
+    ("POST", "/dp/v1/native-objects/complete-typed", MinRole::Dp),
+    ("POST", "/dp/v1/native-objects/reconciliation", MinRole::Dp),
+    (
+        "POST",
+        "/dp/v1/native-objects/credentials/mint",
+        MinRole::Dp,
+    ),
+    (
+        "POST",
+        "/dp/v1/native-objects/credentials/redeem",
+        MinRole::Dp,
+    ),
+    ("POST", "/dp/v1/native-objects/live/create", MinRole::Dp),
+    ("POST", "/dp/v1/native-objects/live/append", MinRole::Dp),
+    ("POST", "/dp/v1/native-objects/live/checkpoint", MinRole::Dp),
+    ("POST", "/dp/v1/native-objects/live/claim", MinRole::Dp),
+    ("POST", "/dp/v1/native-objects/live/sip-intake", MinRole::Dp),
 ];
 
 /// Every tenant role.
@@ -928,6 +979,7 @@ pub fn browser_router(state: AppState) -> Router {
         )
         .route("/api/keys/{id}/reveal", post(keys::reveal))
         .route("/admin/usage/events", get(usage::list_events))
+        .route("/admin/native-metering", get(crate::native_objects::metering_api::list))
         .route("/admin/usage/batches", get(usage::list_batches))
         .route("/admin/usage/rejects", get(usage::list_rejects))
         .route("/admin/pricing/catalogue", get(pricing::api::catalogue))
@@ -1103,6 +1155,24 @@ pub fn dp_router(state: AppState) -> Router {
         .route("/dp/v1/native-objects/lookup", post(dp::native_objects::lookup))
         .route("/dp/v1/native-objects/owned", post(dp::native_objects::owned))
         .route("/dp/v1/native-objects/tombstone", post(dp::native_objects::tombstone))
+        .route("/dp/v1/native-objects/related/begin", post(dp::native_objects::begin_related).layer(DefaultBodyLimit::max(dp::native_objects::MAX_BODY_BYTES)))
+        .route("/dp/v1/native-objects/related/bind", post(dp::native_objects::bind_related).layer(DefaultBodyLimit::max(dp::native_objects::MAX_BODY_BYTES)))
+        .route("/dp/v1/native-objects/relations/reserve", post(dp::native_objects::reserve_relations).layer(DefaultBodyLimit::max(dp::native_objects::MAX_BODY_BYTES)))
+        .route("/dp/v1/native-objects/relations/commit", post(dp::native_objects::commit_relations).layer(DefaultBodyLimit::max(dp::native_objects::MAX_BODY_BYTES)))
+        .route("/dp/v1/native-objects/relations/lookup", post(dp::native_objects::lookup_relations).layer(DefaultBodyLimit::max(dp::native_objects::MAX_BODY_BYTES)))
+        .route("/dp/v1/native-objects/relations/resolve", post(dp::native_objects::resolve_reservation).layer(DefaultBodyLimit::max(dp::native_objects::MAX_BODY_BYTES)))
+        .route("/dp/v1/native-objects/observed-artifacts", post(dp::native_objects::bind_observed_artifacts).layer(DefaultBodyLimit::max(dp::native_objects::MAX_BODY_BYTES)))
+        .route("/dp/v1/native-objects/delete/reserve", post(dp::native_objects::reserve_delete).layer(DefaultBodyLimit::max(dp::native_objects::MAX_BODY_BYTES)))
+        .route("/dp/v1/native-objects/delete/commit", post(dp::native_objects::commit_delete).layer(DefaultBodyLimit::max(dp::native_objects::MAX_BODY_BYTES)))
+        .route("/dp/v1/native-objects/complete-typed", post(dp::native_objects::complete_typed).layer(DefaultBodyLimit::max(dp::native_objects::MAX_BODY_BYTES)))
+        .route("/dp/v1/native-objects/reconciliation", post(dp::native_objects::mark_reconciliation).layer(DefaultBodyLimit::max(dp::native_objects::MAX_BODY_BYTES)))
+        .route("/dp/v1/native-objects/credentials/mint", post(dp::native_objects::mint_credential).layer(DefaultBodyLimit::max(dp::native_objects::MAX_BODY_BYTES)))
+        .route("/dp/v1/native-objects/credentials/redeem", post(dp::native_objects::redeem_credential).layer(DefaultBodyLimit::max(dp::native_objects::MAX_BODY_BYTES)))
+        .route("/dp/v1/native-objects/live/create", post(dp::native_objects::create_live_session).layer(DefaultBodyLimit::max(dp::native_objects::MAX_BODY_BYTES)))
+        .route("/dp/v1/native-objects/live/append", post(dp::native_objects::append_live_usage).layer(DefaultBodyLimit::max(dp::native_objects::MAX_BODY_BYTES)))
+        .route("/dp/v1/native-objects/live/checkpoint", post(dp::native_objects::checkpoint_live_session).layer(DefaultBodyLimit::max(dp::native_objects::MAX_BODY_BYTES)))
+        .route("/dp/v1/native-objects/live/claim", post(dp::native_objects::claim_live_sessions).layer(DefaultBodyLimit::max(dp::native_objects::MAX_BODY_BYTES)))
+        .route("/dp/v1/native-objects/live/sip-intake", post(dp::native_objects::signed_sip_intake).layer(DefaultBodyLimit::max(dp::native_objects::MAX_BODY_BYTES)))
         .route("/dp/v1/native-objects/claim", post(dp::native_objects::claim))
         .route("/dp/v1/native-objects/renew", post(dp::native_objects::renew))
         .route("/dp/v1/native-objects/reschedule", post(dp::native_objects::reschedule))

@@ -137,6 +137,18 @@ pub fn outgoing(kind: Kind, doc: &Value) -> Vec<Ref> {
 
     let field = |name: &str| doc.get(name);
     match kind {
+        Kind::ProviderKeys => {
+            push(
+                "/realtime_sip/api_key_id".into(),
+                Kind::ApiKeys,
+                doc.pointer("/realtime_sip/api_key_id"),
+            );
+            push(
+                "/realtime_sip/model_id".into(),
+                Kind::Models,
+                doc.pointer("/realtime_sip/model_id"),
+            );
+        }
         Kind::Models => push(
             "/provider_key_id".to_string(),
             Kind::ProviderKeys,

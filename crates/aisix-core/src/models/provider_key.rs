@@ -78,6 +78,12 @@ pub struct ProviderKey {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub apis: Option<ProviderApis>,
 
+    /// 运维预绑定的可信 SIP webhook 入口；省略时不接收入站 SIP 来电。
+    /// 一个上游项目的全部 SIP 来电归这里绑定的租户，不能用不可信
+    /// 的 SIP To 或 sip_headers 把同一项目的来电拆分到多个租户。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub realtime_sip: Option<RealtimeSipBinding>,
+
     /// Telemetry tags carried alongside the key for metric and log emission.
     #[serde(default)]
     pub telemetry_tags: TelemetryTags,
@@ -161,6 +167,51 @@ pub struct ProviderKey {
     /// Filled in by the snapshot loader from the etcd key path.
     #[serde(skip)]
     pub(crate) runtime_id: String,
+}
+
+/// 一个签名入口固定绑定原调用密钥、直连模型和当前上游账号。
+#[derive(Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+pub struct RealtimeSipBinding {
+    /// webhook 路径中的运维分配标识，在同一环境中唯一。
+    #[schemars(regex(pattern = "^[A-Za-z0-9_-]+$"), length(min = 1, max = 64))]
+    pub route_id: String,
+    /// 官方 webhook 签名密钥，按 Standard Webhooks 规则解释 whsec_ 前缀。
+    #[schemars(length(min = 1))]
+    pub webhook_secret: String,
+    /// 固定调用方密钥资源 ID，不能由来电正文或 SIP 头选择。
+    #[schemars(length(min = 1))]
+    pub api_key_id: String,
+    /// 当前账号下精确直连模型的资源 ID，不是上游模型名或公开别名。
+    #[schemars(length(min = 1))]
+    pub model_id: String,
+}
+
+impl RealtimeSipBinding {
+    /// SDK 的同一 HMAC key 不能借 raw / whsec_ 两种拼写跨入口复用。
+    pub fn signing_key(&self) -> Result<Vec<u8>, &'static str> {
+        use base64::Engine;
+        let key = match self.webhook_secret.strip_prefix("whsec_") {
+            Some(encoded) => base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|_| "Webhook 签名密钥的 whsec_ 内容必须是有效 Base64")?,
+            None => self.webhook_secret.as_bytes().to_vec(),
+        };
+        if key.is_empty() {
+            return Err("Webhook 签名密钥不能为空");
+        }
+        Ok(key)
+    }
+}
+
+impl std::fmt::Debug for RealtimeSipBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RealtimeSipBinding")
+            .field("route_id", &self.route_id)
+            .field("webhook_secret", &"[REDACTED]")
+            .field("api_key_id", &self.api_key_id)
+            .field("model_id", &self.model_id)
+            .finish()
+    }
 }
 
 /// The API surfaces a Provider Key can declare in [`ProviderKey::apis`].
@@ -332,6 +383,43 @@ impl UpstreamConnection {
 }
 
 impl ProviderKey {
+    /// SIP 项目命名空间来自运维配置的静态 OpenAI-Project，不能从来电选择。
+    /// 不含凭据的命名空间用于发现不同 API key 指向同一项目的重复绑定。
+    pub fn realtime_sip_namespace(&self) -> Result<(String, String), &'static str> {
+        let request = self
+            .request
+            .as_ref()
+            .ok_or("SIP 入口需要配置静态 OpenAI-Project 请求头")?;
+        if !request.forward_client_headers.is_empty() {
+            return Err("SIP 上游账号不能转发调用方提供的账号请求头");
+        }
+        let mut projects = request
+            .default_headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("OpenAI-Project"));
+        let project = projects
+            .next()
+            .map(|(_, value)| value.as_str())
+            .filter(|value| {
+                !value.is_empty()
+                    && value.len() <= 256
+                    && value.trim() == *value
+                    && !value.contains("${")
+                    && !value.chars().any(char::is_control)
+            })
+            .ok_or("SIP 入口需要配置静态 OpenAI-Project 请求头")?;
+        if projects.next().is_some() {
+            return Err("OpenAI-Project 请求头只能配置一次");
+        }
+        let endpoint = crate::native_objects::configured_native_endpoint(
+            self,
+            crate::native_objects::NativeProtocol::Openai,
+            crate::native_objects::NativeObjectKind::RealtimeCall,
+        )
+        .map_err(|_| "当前账号不支持稳定的原生 Realtime 项目边界")?;
+        Ok((endpoint, project.to_string()))
+    }
+
     /// The overrides this key's upstream connections are made with, or
     /// `None` when it configures none — the overwhelmingly common case,
     /// and the one that must keep sharing the gateway's connection pool.
@@ -647,6 +735,75 @@ impl Resource for ProviderKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sip_binding_credential_is_never_printed_and_sdk_spellings_share_one_key() {
+        let raw = RealtimeSipBinding {
+            route_id: "test-route".into(),
+            webhook_secret: "config-test-signing-key".into(),
+            api_key_id: "caller-id".into(),
+            model_id: "model-id".into(),
+        };
+        let mut encoded = raw.clone();
+        encoded.webhook_secret = "whsec_Y29uZmlnLXRlc3Qtc2lnbmluZy1rZXk=".into();
+        assert_eq!(raw.signing_key().unwrap(), encoded.signing_key().unwrap());
+        assert!(!format!("{raw:?}").contains(&raw.webhook_secret));
+        assert!(!format!("{encoded:?}").contains(&encoded.webhook_secret));
+        encoded.webhook_secret = "whsec_".into();
+        assert!(encoded.signing_key().is_err());
+    }
+
+    #[test]
+    fn sip_namespace_requires_one_static_project_and_ignores_credential_rotation() {
+        let mut key = pk(
+            serde_json::json!({"display_name":"account", "provider":"openai",
+            "api_key":"first", "api_base":"https://api.openai.com/v1",
+            "request":{"default_headers":{"OpenAI-Project":"proj_test"}}}),
+        );
+        let namespace = key.realtime_sip_namespace().unwrap();
+        key.api_key = "second".into();
+        assert_eq!(key.realtime_sip_namespace().unwrap(), namespace);
+        let request = key.request.as_mut().unwrap();
+        request
+            .default_headers
+            .insert("openai-project".into(), "proj_other".into());
+        assert!(key.realtime_sip_namespace().is_err());
+        key.request.as_mut().unwrap().default_headers.clear();
+        assert!(key.realtime_sip_namespace().is_err());
+    }
+
+    #[test]
+    fn sip_schema_pins_route_segment_and_requires_every_binding_field() {
+        let binding = serde_json::json!({"route_id":"safe-route_1", "webhook_secret":"hmac-key",
+            "api_key_id":"local-caller", "model_id":"local-model"});
+        let mut doc = serde_json::json!({"display_name":"account", "api_key":"upstream-key",
+            "realtime_sip":binding});
+        crate::models::schema::validate_provider_key(&doc).unwrap();
+        crate::models::schema::validate_provider_key_lenient(&doc).unwrap();
+        for field in ["route_id", "webhook_secret", "api_key_id", "model_id"] {
+            let mut missing = doc.clone();
+            missing["realtime_sip"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            assert!(
+                crate::models::schema::validate_provider_key(&missing).is_err(),
+                "{field}"
+            );
+            assert!(
+                crate::models::schema::validate_provider_key_lenient(&missing).is_err(),
+                "{field}"
+            );
+        }
+        doc["realtime_sip"]["route_id"] = serde_json::json!("bad/route");
+        assert!(crate::models::schema::validate_provider_key(&doc).is_err());
+        let old = pk(serde_json::json!({"display_name":"old", "api_key":"old-key"}));
+        assert!(old.realtime_sip.is_none());
+        assert!(serde_json::to_value(old)
+            .unwrap()
+            .get("realtime_sip")
+            .is_none());
+    }
 
     #[test]
     fn deserialises_minimal_provider_key() {
@@ -982,6 +1139,7 @@ mod tests {
             provider: String::new(),
             adapter: None,
             apis: None,
+            realtime_sip: None,
             telemetry_tags: TelemetryTags::default(),
             request: None,
             response: None,

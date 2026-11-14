@@ -164,7 +164,16 @@ fn keeps_position(kind: Kind, current: &ResourceRow, next: Option<&Value>) -> st
 fn non_holding_referrers(kind: Kind) -> (&'static [Kind], &'static [Kind]) {
     match kind {
         Kind::Models => (&[Kind::ApiKeys, Kind::Teams, Kind::Users], &[]),
-        Kind::Teams | Kind::Users | Kind::ApiKeys => (
+        Kind::ApiKeys => (
+            &[],
+            &[
+                Kind::CachePolicies,
+                Kind::GuardrailAttachments,
+                Kind::RateLimitPolicies,
+                Kind::ProviderKeys,
+            ],
+        ),
+        Kind::Teams | Kind::Users => (
             &[],
             &[
                 Kind::CachePolicies,
@@ -276,6 +285,7 @@ async fn prepare(
     refuse_self_reference(w, &doc)?;
     refuse_retired_groups(&refs::retired_groups(conn, w.kind, &doc).await?)?;
     refs::check_outgoing(conn, w.kind, &doc).await?;
+    super::realtime_sip::check(conn, ctx, w, &projected, stored).await?;
     compat::gate(conn, ctx, w.kind, &doc, stored).await?;
     secrets::seal(&ctx.mk, w.kind, w.id, &mut doc);
     Ok(doc)

@@ -1,12 +1,20 @@
 //! 托管原生对象归属的控制面客户端。
 
+use aisix_core::native_realtime::SignedSipIntakeRequest;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
+use aisix_core::native_metering::{ReconciliationRequest, TypedCompleteRequest};
 use aisix_core::native_objects::{
-    BeginRequest, BindRequest, ClaimRequest, CompleteRequest, LeaseRequest, LookupRequest,
-    NativeReply, OwnedRequest, TombstoneRequest,
+    BeginRelatedRequest, BeginRequest, BindObservedArtifactsRequest, BindRelatedRequest,
+    BindRequest, ClaimRequest, CommitRelationsRequest, CompleteRequest, LeaseRequest,
+    LookupRelationsRequest, LookupRequest, NativeReply, ObjectDeletionRequest, OwnedRequest,
+    ReserveRelationsRequest, ResolveReservationRequest, TombstoneRequest,
+};
+use aisix_core::native_realtime::{
+    AppendLiveUsageRequest, CheckpointLiveSessionRequest, ClaimLiveSessionsRequest,
+    CreateLiveSessionRequest, MintCredentialRequest, RedeemCredentialRequest,
 };
 use aisix_proxy::native_api::registry::{NativeObjectRegistry, NativeRegistryError};
 use reqwest::StatusCode;
@@ -146,6 +154,64 @@ impl NativeObjectRegistry for NativeObjectsClient {
 
     fn complete(&self, request: CompleteRequest) -> ReplyFuture<'_> {
         Box::pin(async move { self.post("complete", &request).await })
+    }
+    fn signed_sip_intake(&self, request: SignedSipIntakeRequest) -> ReplyFuture<'_> {
+        Box::pin(async move { self.post("live/sip-intake", &request).await })
+    }
+    fn mint_credential(&self, request: MintCredentialRequest) -> ReplyFuture<'_> {
+        Box::pin(async move { self.post("credentials/mint", &request).await })
+    }
+    fn redeem_credential(&self, request: RedeemCredentialRequest) -> ReplyFuture<'_> {
+        Box::pin(async move { self.post("credentials/redeem", &request).await })
+    }
+    fn create_live_session(&self, request: CreateLiveSessionRequest) -> ReplyFuture<'_> {
+        Box::pin(async move { self.post("live/create", &request).await })
+    }
+    fn append_live_usage(&self, request: AppendLiveUsageRequest) -> ReplyFuture<'_> {
+        Box::pin(async move { self.post("live/append", &request).await })
+    }
+    fn checkpoint_live_session(&self, request: CheckpointLiveSessionRequest) -> ReplyFuture<'_> {
+        Box::pin(async move { self.post("live/checkpoint", &request).await })
+    }
+    fn claim_live_sessions(&self, request: ClaimLiveSessionsRequest) -> ReplyFuture<'_> {
+        Box::pin(async move { self.post("live/claim", &request).await })
+    }
+    fn reserve_delete(&self, request: ObjectDeletionRequest) -> ReplyFuture<'_> {
+        Box::pin(async move { self.post("delete/reserve", &request).await })
+    }
+    fn commit_delete(&self, request: ObjectDeletionRequest) -> ReplyFuture<'_> {
+        Box::pin(async move { self.post("delete/commit", &request).await })
+    }
+    fn complete_typed(&self, request: TypedCompleteRequest) -> ReplyFuture<'_> {
+        Box::pin(async move { self.post("complete-typed", &request).await })
+    }
+    fn mark_reconciliation(&self, request: ReconciliationRequest) -> ReplyFuture<'_> {
+        Box::pin(async move { self.post("reconciliation", &request).await })
+    }
+    fn begin_related(&self, request: BeginRelatedRequest) -> ReplyFuture<'_> {
+        Box::pin(async move { self.post("related/begin", &request).await })
+    }
+    fn bind_related(&self, request: BindRelatedRequest) -> ReplyFuture<'_> {
+        Box::pin(async move { self.post("related/bind", &request).await })
+    }
+    fn reserve_relations(&self, request: ReserveRelationsRequest) -> ReplyFuture<'_> {
+        Box::pin(async move { self.post("relations/reserve", &request).await })
+    }
+
+    fn commit_relations(&self, request: CommitRelationsRequest) -> ReplyFuture<'_> {
+        Box::pin(async move { self.post("relations/commit", &request).await })
+    }
+
+    fn lookup_relations(&self, request: LookupRelationsRequest) -> ReplyFuture<'_> {
+        Box::pin(async move { self.post("relations/lookup", &request).await })
+    }
+
+    fn resolve_reservation(&self, request: ResolveReservationRequest) -> ReplyFuture<'_> {
+        Box::pin(async move { self.post("relations/resolve", &request).await })
+    }
+
+    fn bind_observed_artifacts(&self, request: BindObservedArtifactsRequest) -> ReplyFuture<'_> {
+        Box::pin(async move { self.post("observed-artifacts", &request).await })
     }
 }
 

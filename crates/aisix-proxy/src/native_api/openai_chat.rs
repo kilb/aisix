@@ -76,6 +76,7 @@ pub(crate) fn capture_creation(
             requested_model_id: Uuid::parse_str(requested_model_id).map_err(|_| dependency())?,
             requested_model: req.model.clone(),
             origin: OriginBinding {
+                surface: None,
                 model_id: Uuid::parse_str(target_model_id).map_err(|_| dependency())?,
                 provider_key_id,
                 boundary: configured_native_origin(

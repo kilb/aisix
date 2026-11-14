@@ -205,6 +205,7 @@ mod raw_id_contract {
                 .get_by_id(model.value.provider_key_id.as_deref().unwrap())
                 .unwrap();
             let origin = OriginBinding {
+                surface: None,
                 model_id: uuid::Uuid::parse_str(&model.id).unwrap(),
                 provider_key_id: uuid::Uuid::parse_str(&provider.id).unwrap(),
                 boundary: configured_native_origin(

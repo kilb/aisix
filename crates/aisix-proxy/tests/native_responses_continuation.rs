@@ -134,6 +134,7 @@ fn fixture(
     let platform =
         aisix_proxy::platform::PlatformSettings::from_secret("continuation-test-platform");
     let origin = OriginBinding {
+        surface: None,
         model_id: MODEL.parse().unwrap(),
         provider_key_id: PROVIDER.parse().unwrap(),
         boundary: configured_native_origin(

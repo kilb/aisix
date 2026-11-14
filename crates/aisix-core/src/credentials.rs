@@ -132,6 +132,20 @@ pub fn visit_credentials(
                 }
             }
             top_level(doc, "api_key", visit);
+            if let Some(sip) = doc.get_mut("realtime_sip") {
+                if let Some(value) = sip
+                    .get_mut("webhook_secret")
+                    .filter(|v| v.as_str().is_some_and(|secret| !secret.is_empty()))
+                {
+                    visit(
+                        &CredentialSlot {
+                            field_key: "REALTIME_SIP_WEBHOOK_SECRET".to_string(),
+                            label: "realtime_sip.webhook_secret".to_string(),
+                        },
+                        value,
+                    );
+                }
+            }
             if let Some(request) = doc.get_mut("request") {
                 string_map(request, "default_headers", "default header", visit);
                 string_map(request, "default_body_fields", "default body field", visit);
@@ -574,6 +588,23 @@ mod tests {
                 ("api_key".into(), "sk-1".into()),
             ],
         );
+    }
+
+    #[test]
+    fn provider_sip_signing_secret_is_a_canonical_credential_slot() {
+        let mut doc = json!({"api_key":"upstream", "realtime_sip":{
+            "route_id":"route", "api_key_id":"caller", "model_id":"model", "webhook_secret":"private-signing-key"
+        }});
+        let found = slots(CredentialKind::ProviderKey, doc.clone());
+        assert!(found.contains(&(
+            "REALTIME_SIP_WEBHOOK_SECRET".into(),
+            "private-signing-key".into()
+        )));
+        redact_credentials(CredentialKind::ProviderKey, &mut doc);
+        assert_eq!(doc["realtime_sip"]["webhook_secret"], REDACTED);
+        assert_eq!(doc["realtime_sip"]["api_key_id"], "caller");
+        assert_eq!(doc["realtime_sip"]["model_id"], "model");
+        assert!(!doc.to_string().contains("private-signing-key"));
     }
 
     #[test]

@@ -40,6 +40,7 @@
 //!   nothing else, so it governs nothing until something attaches it.
 
 mod desugar;
+mod realtime_sip;
 mod status;
 mod yaml;
 
@@ -1149,6 +1150,7 @@ pub fn load_from_str(
         }
     }
 
+    errors.extend(realtime_sip::check(&provider_keys, &models, &apikeys));
     if !errors.is_empty() {
         return Err(fail(errors));
     }

@@ -11,6 +11,7 @@
 pub mod api;
 pub mod kinds;
 pub mod normalize;
+mod realtime_sip;
 pub mod refs;
 pub mod secrets;
 pub mod store;

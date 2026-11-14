@@ -438,6 +438,7 @@ mod compat_tests {
                 ));
                 let provider = snapshot.provider_keys.get_by_id(PK_A).unwrap();
                 let origin = aisix_core::native_objects::OriginBinding {
+                    surface: None,
                     model_id,
                     provider_key_id: uuid::Uuid::parse_str(PK_A).unwrap(),
                     boundary: aisix_core::native_objects::configured_native_origin(

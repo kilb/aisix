@@ -213,6 +213,7 @@ fn resolve_for_requested_family(
     crate::budget::gate(state, snapshot).check_provider_key(&pk.id)?;
     let provider_key_id = Uuid::parse_str(&pk.id).map_err(|_| dependency())?;
     let origin = OriginBinding {
+        surface: None,
         model_id: Uuid::parse_str(&entry.id).map_err(|_| dependency())?,
         provider_key_id,
         boundary: configured_native_origin(

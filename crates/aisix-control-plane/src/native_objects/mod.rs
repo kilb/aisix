@@ -1,5 +1,6 @@
 //! 原生对象的持久归属、租约和终态发件箱，均由真实 Postgres 负责。
 
+pub mod metering_api;
 pub(crate) mod store;
 
 use std::time::Duration;
@@ -28,11 +29,18 @@ pub fn spawn(state: AppState, mut stopping: watch::Receiver<bool>) -> JoinHandle
                 _ = tick.tick() => {}
             }
             let state = state.clone();
+            let live_state = state.clone();
+            let live_db = state.native_objects.clone();
             let db = state.native_objects.clone();
             let result = db
                 .tx(move |conn| async move { store::deliver_one(conn, &state).await }.boxed())
                 .await;
-            if result.is_err() {
+            let live_result = live_db
+                .tx(move |conn| {
+                    async move { store::deliver_live_one(conn, &live_state).await }.boxed()
+                })
+                .await;
+            if result.is_err() || live_result.is_err() {
                 tracing::warn!("native terminal delivery will be retried");
             }
         }

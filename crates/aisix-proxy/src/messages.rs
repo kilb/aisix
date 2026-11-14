@@ -1523,6 +1523,7 @@ async fn anthropic_passthrough_dispatch(
         )
         .ok()?;
         Some(aisix_core::native_objects::OriginBinding {
+            surface: None,
             model_id,
             provider_key_id,
             boundary,

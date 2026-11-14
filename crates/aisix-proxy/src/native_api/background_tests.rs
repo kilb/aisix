@@ -241,6 +241,7 @@ fn fixture(base: &str) -> (ProxyState, Arc<Registry>, NativeRecord) {
     snapshot.models.insert(ResourceEntry::new(MODEL, model, 1));
     let mut owned = record();
     owned.origin = Some(OriginBinding {
+        surface: None,
         model_id: Uuid::parse_str(MODEL).unwrap(),
         provider_key_id: Uuid::parse_str(PROVIDER).unwrap(),
         boundary,

@@ -100,6 +100,7 @@ impl NativeObjectRegistry for Registry {
 
 fn registration(fail: bool) -> (OriginRegistration, Arc<Registry>) {
     let origin = OriginBinding {
+        surface: None,
         model_id: Uuid::new_v4(),
         provider_key_id: Uuid::new_v4(),
         boundary: native_origin_digest(

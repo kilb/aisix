@@ -24,18 +24,57 @@ pub enum NativeProtocol {
     Anthropic,
 }
 
-/// 文件引用借用实际消费接口的权限，不授予独立文件管理权限。
-pub fn native_file_consumer_allowed(protocol: NativeProtocol, family: EndpointFamily) -> bool {
-    match protocol {
-        NativeProtocol::Openai => matches!(
+/// 消费只借用实际入口权限；不授予该对象的管理权限。
+pub fn native_object_consumer_allowed(
+    protocol: NativeProtocol,
+    kind: NativeObjectKind,
+    family: EndpointFamily,
+) -> bool {
+    use EndpointFamily as F;
+    use NativeObjectKind as K;
+    match (protocol, kind) {
+        (NativeProtocol::Openai, K::File) => matches!(
             family,
-            EndpointFamily::ChatCompletions | EndpointFamily::Responses | EndpointFamily::Batches
+            F::ChatCompletions
+                | F::Responses
+                | F::Batches
+                | F::Containers
+                | F::VectorStores
+                | F::FineTuning
+                | F::Evals
+                | F::Videos
+                | F::Conversations
         ),
-        NativeProtocol::Anthropic => matches!(
+        (NativeProtocol::Anthropic, K::File) => {
+            matches!(family, F::Messages | F::CountTokens | F::Batches)
+        }
+        (NativeProtocol::Openai, K::ResponseItem | K::Conversation) => {
+            matches!(family, F::Responses | F::Conversations)
+        }
+        (NativeProtocol::Openai, K::ResponseContainer) => matches!(
             family,
-            EndpointFamily::Messages | EndpointFamily::CountTokens | EndpointFamily::Batches
+            F::Responses | F::Containers | F::Conversations | F::Evals
         ),
+        (NativeProtocol::Openai, K::VectorStore) => matches!(
+            family,
+            F::Responses | F::VectorStores | F::Conversations | F::Evals
+        ),
+        (NativeProtocol::Openai, K::Skill) => {
+            matches!(family, F::Responses | F::Containers | F::Conversations)
+        }
+        (NativeProtocol::Anthropic, K::Skill | K::MessageContainer) => family == F::Messages,
+        (NativeProtocol::Openai, K::Voice) => {
+            matches!(family, F::Audio | F::ChatCompletions | F::Realtime)
+        }
+        (NativeProtocol::Openai, K::VoiceConsent) => family == F::Audio,
+        (NativeProtocol::Openai, K::Video | K::VideoCharacter) => family == F::Videos,
+        (NativeProtocol::Openai, K::Response) => matches!(family, F::Responses | F::Evals),
+        _ => false,
     }
+}
+
+pub fn native_file_consumer_allowed(protocol: NativeProtocol, family: EndpointFamily) -> bool {
+    native_object_consumer_allowed(protocol, NativeObjectKind::File, family)
 }
 
 /// 推理生命周期独立于 HTTP 请求完成；管理调用和受理不代表推理成功。
@@ -67,6 +106,23 @@ pub enum NativeObjectKind {
     MessageBatch,
     ChatCompletion,
     Upload,
+    Conversation,
+    ContainerFile,
+    VectorStore,
+    VectorStoreFileBatch,
+    Skill,
+    Voice,
+    VoiceConsent,
+    MessageContainer,
+    Eval,
+    EvalRun,
+    EvalOutputItem,
+    FineTuningJob,
+    FineTuningCheckpoint,
+    FineTunedModel,
+    Video,
+    VideoCharacter,
+    RealtimeCall,
 }
 
 impl NativeObjectKind {
@@ -79,18 +135,45 @@ impl NativeObjectKind {
             Self::MessageBatch => "message_batch",
             Self::ChatCompletion => "chat_completion",
             Self::Upload => "upload",
+            Self::Conversation => "conversation",
+            Self::ContainerFile => "container_file",
+            Self::VectorStore => "vector_store",
+            Self::VectorStoreFileBatch => "vector_store_file_batch",
+            Self::Skill => "skill",
+            Self::Voice => "voice",
+            Self::VoiceConsent => "voice_consent",
+            Self::MessageContainer => "message_container",
+            Self::Eval => "eval",
+            Self::EvalRun => "eval_run",
+            Self::EvalOutputItem => "eval_output_item",
+            Self::FineTuningJob => "fine_tuning_job",
+            Self::FineTuningCheckpoint => "fine_tuning_checkpoint",
+            Self::FineTunedModel => "fine_tuned_model",
+            Self::Video => "video",
+            Self::VideoCharacter => "video_character",
+            Self::RealtimeCall => "realtime_call",
         }
     }
 
     pub fn endpoint_family(self) -> EndpointFamily {
         match self {
-            Self::Response | Self::ResponseItem | Self::ResponseContainer => {
-                EndpointFamily::Responses
-            }
+            Self::Response | Self::ResponseItem => EndpointFamily::Responses,
             Self::File => EndpointFamily::Files,
             Self::MessageBatch => EndpointFamily::Batches,
             Self::ChatCompletion => EndpointFamily::ChatCompletions,
             Self::Upload => EndpointFamily::Files,
+            Self::Conversation => EndpointFamily::Conversations,
+            Self::ResponseContainer | Self::ContainerFile => EndpointFamily::Containers,
+            Self::VectorStore | Self::VectorStoreFileBatch => EndpointFamily::VectorStores,
+            Self::Skill => EndpointFamily::Skills,
+            Self::Voice | Self::VoiceConsent => EndpointFamily::Audio,
+            Self::MessageContainer => EndpointFamily::Messages,
+            Self::Eval | Self::EvalRun | Self::EvalOutputItem => EndpointFamily::Evals,
+            Self::FineTuningJob | Self::FineTuningCheckpoint | Self::FineTunedModel => {
+                EndpointFamily::FineTuning
+            }
+            Self::Video | Self::VideoCharacter => EndpointFamily::Videos,
+            Self::RealtimeCall => EndpointFamily::Realtime,
         }
     }
 }
@@ -186,19 +269,44 @@ pub fn configured_native_origin(
     protocol: NativeProtocol,
     kind: NativeObjectKind,
 ) -> Result<OriginFingerprint, NativeOriginError> {
+    let (adapter, endpoint, headers) = configured_native_account(key, protocol, kind)?;
+    Ok(native_origin_digest(
+        platform_id_key,
+        provider_key_id,
+        protocol,
+        adapter,
+        &endpoint,
+        &key.api_key,
+        &headers,
+    ))
+}
+
+/// 返回与账号指纹完全相同的规范基址；实际派发必须使用此值。
+pub fn configured_native_endpoint(
+    key: &ProviderKey,
+    protocol: NativeProtocol,
+    kind: NativeObjectKind,
+) -> Result<String, NativeOriginError> {
+    configured_native_account(key, protocol, kind).map(|(_, endpoint, _)| endpoint)
+}
+
+fn configured_native_account(
+    key: &ProviderKey,
+    protocol: NativeProtocol,
+    kind: NativeObjectKind,
+) -> Result<(&'static str, String, BTreeMap<String, String>), NativeOriginError> {
     let (adapter, surface, default_base) = match protocol {
         NativeProtocol::Openai => {
             let surface = key.apis.as_ref().and_then(|apis| match kind {
                 NativeObjectKind::Response
                 | NativeObjectKind::ResponseItem
-                | NativeObjectKind::ResponseContainer => apis.responses.as_ref(),
+                | NativeObjectKind::ResponseContainer
+                | NativeObjectKind::ContainerFile => apis.responses.as_ref(),
                 _ => None,
             });
             if matches!(
                 kind,
-                NativeObjectKind::Response
-                    | NativeObjectKind::ResponseItem
-                    | NativeObjectKind::ResponseContainer
+                NativeObjectKind::Response | NativeObjectKind::ResponseItem
             ) && key.apis.is_some()
                 && surface.is_none()
             {
@@ -211,6 +319,7 @@ pub fn configured_native_origin(
                     NativeObjectKind::Response
                         | NativeObjectKind::ResponseItem
                         | NativeObjectKind::ResponseContainer
+                        | NativeObjectKind::ContainerFile
                 ) && surface.is_some())
             {
                 return Err(NativeOriginError);
@@ -220,13 +329,21 @@ pub fn configured_native_origin(
         NativeProtocol::Anthropic => {
             if !matches!(
                 kind,
-                NativeObjectKind::File | NativeObjectKind::MessageBatch
+                NativeObjectKind::File
+                    | NativeObjectKind::MessageBatch
+                    | NativeObjectKind::Skill
+                    | NativeObjectKind::MessageContainer
             ) {
                 return Err(NativeOriginError);
             }
-            let surface = (kind == NativeObjectKind::MessageBatch)
-                .then(|| key.apis.as_ref().and_then(|a| a.messages.as_ref()))
-                .flatten();
+            let surface = matches!(
+                kind,
+                NativeObjectKind::MessageBatch
+                    | NativeObjectKind::Skill
+                    | NativeObjectKind::MessageContainer
+            )
+            .then(|| key.apis.as_ref().and_then(|a| a.messages.as_ref()))
+            .flatten();
             if key.provider != "anthropic"
                 && key.adapter != Some(Adapter::Anthropic)
                 && surface.is_none()
@@ -286,15 +403,7 @@ pub fn configured_native_origin(
         if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
             return Err(NativeOriginError);
         }
-        return Ok(native_origin_digest(
-            platform_id_key,
-            provider_key_id,
-            protocol,
-            adapter,
-            &endpoint,
-            &key.api_key,
-            &headers,
-        ));
+        return Ok((adapter, endpoint, headers));
     }
     let mut base =
         url::Url::parse(raw_base.unwrap_or(default_base)).map_err(|_| NativeOriginError)?;
@@ -322,23 +431,117 @@ pub fn configured_native_origin(
     } else {
         base.as_str()
     };
-    Ok(native_origin_digest(
-        platform_id_key,
-        provider_key_id,
-        protocol,
-        adapter,
-        endpoint,
-        &key.api_key,
-        &headers,
-    ))
+    Ok((adapter, endpoint.to_string(), headers))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeOriginSurface {
+    Objects,
+    Responses,
+    Messages,
+    ChatCompletions,
+}
+
+pub fn native_origin_surface(
+    protocol: NativeProtocol,
+    kind: NativeObjectKind,
+) -> NativeOriginSurface {
+    match (protocol, kind) {
+        (
+            NativeProtocol::Openai,
+            NativeObjectKind::Response
+            | NativeObjectKind::ResponseItem
+            | NativeObjectKind::ResponseContainer
+            | NativeObjectKind::ContainerFile,
+        ) => NativeOriginSurface::Responses,
+        (NativeProtocol::Openai, NativeObjectKind::ChatCompletion) => {
+            NativeOriginSurface::ChatCompletions
+        }
+        (
+            NativeProtocol::Anthropic,
+            NativeObjectKind::MessageBatch
+            | NativeObjectKind::Skill
+            | NativeObjectKind::MessageContainer,
+        ) => NativeOriginSurface::Messages,
+        _ => NativeOriginSurface::Objects,
+    }
+}
+
+pub fn configured_native_origin_at(
+    platform_id_key: &[u8; 32],
+    provider_key_id: Uuid,
+    key: &ProviderKey,
+    protocol: NativeProtocol,
+    kind: NativeObjectKind,
+    surface: Option<NativeOriginSurface>,
+) -> Result<OriginFingerprint, NativeOriginError> {
+    let representative = surface_kind(protocol, kind, surface)?;
+    configured_native_origin(
+        platform_id_key,
+        provider_key_id,
+        key,
+        protocol,
+        representative,
+    )
+}
+
+pub fn configured_native_endpoint_at(
+    key: &ProviderKey,
+    protocol: NativeProtocol,
+    kind: NativeObjectKind,
+    surface: Option<NativeOriginSurface>,
+) -> Result<String, NativeOriginError> {
+    configured_native_endpoint(key, protocol, surface_kind(protocol, kind, surface)?)
+}
+
+fn surface_kind(
+    protocol: NativeProtocol,
+    kind: NativeObjectKind,
+    surface: Option<NativeOriginSurface>,
+) -> Result<NativeObjectKind, NativeOriginError> {
+    match surface {
+        None => Ok(kind),
+        Some(surface) if surface == native_origin_surface(protocol, kind) => Ok(kind),
+        Some(NativeOriginSurface::Objects) => Ok(NativeObjectKind::File),
+        Some(NativeOriginSurface::Responses) if protocol == NativeProtocol::Openai => Ok(
+            if matches!(
+                kind,
+                NativeObjectKind::Response | NativeObjectKind::ResponseItem
+            ) {
+                NativeObjectKind::Response
+            } else {
+                NativeObjectKind::ResponseContainer
+            },
+        ),
+        Some(NativeOriginSurface::Messages) if protocol == NativeProtocol::Anthropic => {
+            Ok(NativeObjectKind::MessageBatch)
+        }
+        Some(NativeOriginSurface::ChatCompletions) if protocol == NativeProtocol::Openai => {
+            Ok(NativeObjectKind::ChatCompletion)
+        }
+        _ => Err(NativeOriginError),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OriginBinding {
+    /// 仅供重建已选中的基址；不进入账号 HMAC，也不作为另一项授权。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface: Option<NativeOriginSurface>,
     pub model_id: Uuid,
     pub provider_key_id: Uuid,
     pub boundary: OriginFingerprint,
 }
+
+impl PartialEq for OriginBinding {
+    fn eq(&self, other: &Self) -> bool {
+        self.model_id == other.model_id
+            && self.provider_key_id == other.provider_key_id
+            && self.boundary == other.boundary
+    }
+}
+impl Eq for OriginBinding {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeEntry {
@@ -535,6 +738,214 @@ pub struct CompleteRequest {
     pub usage: Vec<TerminalUsage>,
 }
 
+/// 根创建与引用准入在一个事务；被引用对象不能仅存在于 handler 内存。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AcceptedReference {
+    pub record_id: Uuid,
+    pub consumer_family: EndpointFamily,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BeginRelatedRequest {
+    #[serde(default)]
+    pub lifecycle_context: Option<crate::native_metering::LifecycleContext>,
+    pub submission: BeginRequest,
+    #[serde(default)]
+    pub references: Vec<AcceptedReference>,
+    /// 仅允许 submission.parent_id 指定的已授权父对象；新产物继承父的 accepted owner。
+    #[serde(default)]
+    pub owner_parent_record_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum ArtifactSelector {
+    Root,
+    Record {
+        record_id: Uuid,
+    },
+    Observed {
+        kind: NativeObjectKind,
+        raw_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoundRelation {
+    pub parent: ArtifactSelector,
+    pub child: ArtifactSelector,
+    pub relation: NativeRelation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BindRelatedRequest {
+    pub binding: BindRequest,
+    #[serde(default)]
+    pub relations: Vec<BoundRelation>,
+}
+
+/// 关系是集合成员身份，不改变子对象的不可变来源和所有者。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeRelation {
+    ConversationItem,
+    ContainerFile,
+    VectorStoreFile,
+    VectorStoreBatch,
+    VectorStoreBatchFile,
+    ResponseOutput,
+    EvalRun,
+    EvalOutput,
+    FineTuningCheckpoint,
+    FineTuningResult,
+    FineTunedModel,
+    VideoSource,
+    VideoCharacter,
+}
+
+impl NativeRelation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ConversationItem => "conversation_item",
+            Self::ContainerFile => "container_file",
+            Self::VectorStoreFile => "vector_store_file",
+            Self::VectorStoreBatch => "vector_store_batch",
+            Self::VectorStoreBatchFile => "vector_store_batch_file",
+            Self::ResponseOutput => "response_output",
+            Self::EvalRun => "eval_run",
+            Self::EvalOutput => "eval_output",
+            Self::FineTuningCheckpoint => "fine_tuning_checkpoint",
+            Self::FineTuningResult => "fine_tuning_result",
+            Self::FineTunedModel => "fine_tuned_model",
+            Self::VideoSource => "video_source",
+            Self::VideoCharacter => "video_character",
+        }
+    }
+
+    pub fn permits(
+        self,
+        protocol: NativeProtocol,
+        parent: NativeObjectKind,
+        child: NativeObjectKind,
+    ) -> bool {
+        use NativeObjectKind as K;
+        protocol == NativeProtocol::Openai
+            && match self {
+                Self::ConversationItem => parent == K::Conversation && child == K::ResponseItem,
+                Self::ContainerFile => parent == K::ResponseContainer && child == K::ContainerFile,
+                Self::VectorStoreFile => parent == K::VectorStore && child == K::File,
+                Self::VectorStoreBatch => {
+                    parent == K::VectorStore && child == K::VectorStoreFileBatch
+                }
+                Self::VectorStoreBatchFile => parent == K::VectorStoreFileBatch && child == K::File,
+                Self::ResponseOutput => {
+                    parent == K::Response && matches!(child, K::ResponseItem | K::ResponseContainer)
+                }
+                Self::EvalRun => parent == K::Eval && child == K::EvalRun,
+                Self::EvalOutput => parent == K::EvalRun && child == K::EvalOutputItem,
+                Self::FineTuningCheckpoint => {
+                    parent == K::FineTuningJob && child == K::FineTuningCheckpoint
+                }
+                Self::FineTuningResult => parent == K::FineTuningJob && child == K::File,
+                Self::FineTunedModel => {
+                    matches!(parent, K::FineTuningJob | K::FineTuningCheckpoint)
+                        && child == K::FineTunedModel
+                }
+                Self::VideoSource => parent == K::Video && matches!(child, K::Video | K::File),
+                Self::VideoCharacter => parent == K::Video && child == K::VideoCharacter,
+            }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelationAction {
+    Attach,
+    Detach,
+    Discover,
+}
+
+/// 必须在首个上游副作用前保留；operation_id 是内部幂等身份，不是客户端对象 ID。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReserveRelationsRequest {
+    pub api_key_id: Uuid,
+    pub operation_id: Uuid,
+    pub parent_record_id: Uuid,
+    pub expected_parent_version: i64,
+    pub relation: NativeRelation,
+    pub action: RelationAction,
+    #[serde(default)]
+    pub child_record_ids: Vec<Uuid>,
+    #[serde(default)]
+    pub references: Vec<AcceptedReference>,
+}
+
+/// objects 只能来自已准入父端点的官方对象槽；已有引用须在 reserve 中逐项准入。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitRelationsRequest {
+    pub api_key_id: Uuid,
+    pub operation_id: Uuid,
+    #[serde(default)]
+    pub objects: Vec<NativeChildObject>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObjectDeletionRequest {
+    pub api_key_id: Uuid,
+    pub operation_id: Uuid,
+    pub record_id: Uuid,
+    pub version: i64,
+}
+
+/// 明确上游拒绝才能释放写入栅栏；不确定结果保留到受控对账完成。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolveReservationRequest {
+    pub api_key_id: Uuid,
+    pub operation_id: Uuid,
+    pub upstream_rejected: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LookupRelationsRequest {
+    pub api_key_id: Uuid,
+    pub parent_record_id: Uuid,
+    pub relation: NativeRelation,
+    #[serde(default)]
+    pub raw_ids: Vec<String>,
+    #[serde(default)]
+    pub consumer_family: Option<EndpointFamily>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeMembership {
+    pub membership_id: Uuid,
+    pub parent_record_id: Uuid,
+    pub child_record_id: Uuid,
+    pub relation: NativeRelation,
+    pub generation: i64,
+    pub version: i64,
+}
+
+/// 后台产物按 accepted entry 派生；不能借当前 worker 身份重写原 caller。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObservedArtifactEntry {
+    pub entry_id: String,
+    pub root: NativeChildObject,
+    #[serde(default)]
+    pub relations: Vec<BoundRelation>,
+    #[serde(default)]
+    pub objects: Vec<NativeChildObject>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BindObservedArtifactsRequest {
+    pub lease: LeaseToken,
+    pub entries: Vec<ObservedArtifactEntry>,
+    /// 提供时，所有产物、终态和 outbox 在同一事务提交。
+    #[serde(default)]
+    pub complete: Option<CompleteRequest>,
+}
+
 // 控制面响应宽松解码；执行器必须检查决策所需字段，不得用缺省值授权。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NativeRecord {
@@ -579,6 +990,14 @@ pub struct NativeRecord {
     #[serde(default)]
     pub parent_id: Option<Uuid>,
     #[serde(default)]
+    pub parent_raw_id: Option<String>,
+    #[serde(default)]
+    pub lifecycle_context: Option<crate::native_metering::LifecycleContext>,
+    #[serde(default)]
+    pub metering_state: Option<String>,
+    #[serde(default)]
+    pub reconciliation_reason: Option<String>,
+    #[serde(default)]
     pub version: i64,
     #[serde(default)]
     pub lease_generation: Option<i64>,
@@ -599,6 +1018,20 @@ pub struct NativeReply {
     pub record: Option<NativeRecord>,
     #[serde(default)]
     pub records: Vec<NativeRecord>,
+    #[serde(default)]
+    pub memberships: Vec<NativeMembership>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metering_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconciliation_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<crate::native_realtime::NativeCredential>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_session: Option<crate::native_realtime::LiveSessionRecord>,
+    #[serde(default)]
+    pub live_sessions: Vec<crate::native_realtime::LiveSessionRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub appended: Option<bool>,
 }
 
 impl NativeReply {
@@ -609,6 +1042,13 @@ impl NativeReply {
             origin: None,
             record: None,
             records: Vec::new(),
+            memberships: Vec::new(),
+            metering_state: None,
+            reconciliation_reason: None,
+            credential: None,
+            live_session: None,
+            live_sessions: Vec::new(),
+            appended: None,
         }
     }
 }
@@ -693,5 +1133,174 @@ mod chat_origin_tests {
             origin(&key, NativeObjectKind::ChatCompletion),
             origin(&versioned, NativeObjectKind::ChatCompletion)
         );
+    }
+}
+
+#[cfg(test)]
+mod authority_contract_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn split_account() -> ProviderKey {
+        serde_json::from_value(json!({
+            "display_name":"split-native", "provider":"openai", "api_key":"fixture-key",
+            "api_base":"https://objects.example/v1",
+            "apis":{"responses":{"base":"https://responses.example/v1"}}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn an_inherited_item_surface_rebuilds_the_original_objects_account() {
+        let provider = split_account();
+        let origin = |surface| {
+            configured_native_origin_at(
+                &[7; 32],
+                Uuid::from_u128(1),
+                &provider,
+                NativeProtocol::Openai,
+                NativeObjectKind::ResponseItem,
+                Some(surface),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            configured_native_endpoint_at(
+                &provider,
+                NativeProtocol::Openai,
+                NativeObjectKind::ResponseItem,
+                Some(NativeOriginSurface::Objects)
+            )
+            .unwrap(),
+            "https://objects.example/v1"
+        );
+        assert_eq!(
+            configured_native_endpoint_at(
+                &provider,
+                NativeProtocol::Openai,
+                NativeObjectKind::ResponseItem,
+                Some(NativeOriginSurface::Responses)
+            )
+            .unwrap(),
+            "https://responses.example/v1"
+        );
+        assert_ne!(
+            origin(NativeOriginSurface::Objects),
+            origin(NativeOriginSurface::Responses)
+        );
+    }
+
+    #[test]
+    fn adding_a_surface_discriminator_keeps_legacy_account_equality_and_hmac() {
+        let provider = split_account();
+        let boundary = configured_native_origin(
+            &[7; 32],
+            Uuid::from_u128(1),
+            &provider,
+            NativeProtocol::Openai,
+            NativeObjectKind::Response,
+        )
+        .unwrap();
+        let legacy:OriginBinding=serde_json::from_value(json!({"model_id":Uuid::from_u128(2),"provider_key_id":Uuid::from_u128(1),"boundary":boundary})).unwrap();
+        assert_eq!(legacy.surface, None);
+        let mut explicit = legacy.clone();
+        explicit.surface = Some(NativeOriginSurface::Responses);
+        assert_eq!(legacy, explicit);
+        assert_eq!(
+            configured_native_origin_at(
+                &[7; 32],
+                explicit.provider_key_id,
+                &provider,
+                NativeProtocol::Openai,
+                NativeObjectKind::Response,
+                explicit.surface
+            )
+            .unwrap(),
+            legacy.boundary
+        );
+    }
+
+    #[test]
+    fn an_explicit_response_surface_cannot_enable_an_undeclared_native_response_api() {
+        let provider:ProviderKey=serde_json::from_value(json!({"display_name":"objects", "provider":"openai", "api_key":"fixture-key", "api_base":"https://objects.example/v1", "apis":{}})).unwrap();
+        assert!(configured_native_endpoint_at(
+            &provider,
+            NativeProtocol::Openai,
+            NativeObjectKind::Response,
+            Some(NativeOriginSurface::Responses)
+        )
+        .is_err());
+        assert_eq!(
+            configured_native_endpoint_at(
+                &provider,
+                NativeProtocol::Openai,
+                NativeObjectKind::ResponseContainer,
+                Some(NativeOriginSurface::Responses)
+            )
+            .unwrap(),
+            "https://objects.example/v1"
+        );
+    }
+
+    #[test]
+    fn a_container_file_uses_its_containers_actual_surface() {
+        let provider = split_account();
+        assert_eq!(
+            configured_native_endpoint(
+                &provider,
+                NativeProtocol::Openai,
+                NativeObjectKind::ContainerFile
+            )
+            .unwrap(),
+            "https://responses.example/v1"
+        );
+        assert_eq!(
+            configured_native_origin(
+                &[7; 32],
+                Uuid::from_u128(1),
+                &provider,
+                NativeProtocol::Openai,
+                NativeObjectKind::ContainerFile
+            )
+            .unwrap(),
+            configured_native_origin(
+                &[7; 32],
+                Uuid::from_u128(1),
+                &provider,
+                NativeProtocol::Openai,
+                NativeObjectKind::ResponseContainer
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn consumption_never_grants_management_or_cross_protocol_object_rights() {
+        let key: crate::ApiKey = serde_json::from_value(
+            json!({"key_hash":"fixture", "allowed_endpoints":["responses"]}),
+        )
+        .unwrap();
+        assert!(native_object_consumer_allowed(
+            NativeProtocol::Openai,
+            NativeObjectKind::VectorStore,
+            EndpointFamily::Responses
+        ));
+        assert!(key.can_call(EndpointFamily::Responses));
+        assert!(!key.can_call(EndpointFamily::VectorStores));
+        assert!(!native_object_consumer_allowed(
+            NativeProtocol::Anthropic,
+            NativeObjectKind::VectorStore,
+            EndpointFamily::Responses
+        ));
+        assert!(!native_object_consumer_allowed(
+            NativeProtocol::Openai,
+            NativeObjectKind::Skill,
+            EndpointFamily::Audio
+        ));
+        assert!(!native_object_consumer_allowed(
+            NativeProtocol::Openai,
+            NativeObjectKind::FineTunedModel,
+            EndpointFamily::Models
+        ));
     }
 }

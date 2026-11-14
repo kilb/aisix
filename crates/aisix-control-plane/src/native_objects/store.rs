@@ -1,5 +1,6 @@
 //! 归属不可改写；读写按租户、提交、对象的顺序加锁，不拿资源全局锁。
 
+use aisix_core::native_realtime::SignedSipIntakeRequest;
 use std::collections::{BTreeSet, HashMap};
 
 use aisix_core::models::EndpointFamily;
@@ -21,6 +22,18 @@ use crate::AppState;
 
 use super::{LEASE_SECONDS, MAX_ENTRIES, MAX_PAGE};
 
+mod deletion;
+mod foundation;
+mod metering;
+mod realtime;
+mod relations;
+use aisix_core::native_metering::{ReconciliationRequest, TypedCompleteRequest};
+use aisix_core::native_realtime::{
+    AppendLiveUsageRequest, CheckpointLiveSessionRequest, ClaimLiveSessionsRequest,
+    CreateLiveSessionRequest, MintCredentialRequest, RedeemCredentialRequest,
+};
+use foundation::{derive_object, insert_membership};
+
 pub(crate) enum Command {
     Begin(Box<BeginRequest>),
     Bind(BindRequest),
@@ -31,6 +44,24 @@ pub(crate) enum Command {
     Renew(LeaseRequest),
     Reschedule(LeaseRequest),
     Complete(CompleteRequest),
+    BeginRelated(BeginRelatedRequest),
+    BindRelated(BindRelatedRequest),
+    ReserveRelations(ReserveRelationsRequest),
+    CommitRelations(CommitRelationsRequest),
+    LookupRelations(LookupRelationsRequest),
+    ResolveReservation(ResolveReservationRequest),
+    BindObservedArtifacts(BindObservedArtifactsRequest),
+    ReserveDelete(ObjectDeletionRequest),
+    CommitDelete(ObjectDeletionRequest),
+    SignedSipIntake(SignedSipIntakeRequest),
+    MintCredential(MintCredentialRequest),
+    RedeemCredential(RedeemCredentialRequest),
+    CreateLiveSession(CreateLiveSessionRequest),
+    AppendLiveUsage(AppendLiveUsageRequest),
+    CheckpointLiveSession(CheckpointLiveSessionRequest),
+    ClaimLiveSessions(ClaimLiveSessionsRequest),
+    CompleteTyped(TypedCompleteRequest),
+    Reconciliation(ReconciliationRequest),
 }
 
 pub(crate) fn unavailable<T>(_error: T) -> ApiError {
@@ -139,6 +170,16 @@ fn endpoint_permitted(
     key.can_call(consumer_family.unwrap_or_else(|| kind.endpoint_family()))
 }
 
+// 通配模型保存请求时的具体名称；普通模型仍跟随当前资源重命名。
+fn requested_authority_name<'a>(model: &'a Model, submitted: &'a BeginRequest) -> Option<&'a str> {
+    if model.display_name.contains('*') {
+        aisix_core::wildcard::wildcard_matches(&model.display_name, &submitted.requested_model)
+            .then_some(submitted.requested_model.as_str())
+    } else {
+        Some(model.display_name.as_str())
+    }
+}
+
 async fn origin_for_consumer(
     conn: &mut PgConnection,
     state: &AppState,
@@ -216,12 +257,45 @@ async fn origin_for_consumer(
     let provider: ProviderKey = serde_json::from_value(provider).map_err(unavailable)?;
     let id_key =
         aisix_core::native_objects::platform_id_key_from_secret(&state.pki.platform_id_key_hex());
-    let digest = configured_native_origin(
+    if submission.origin.surface.is_some_and(|surface| {
+        surface != native_origin_surface(submission.protocol, submission.kind)
+    }) {
+        let source: Option<Uuid> = sqlx::query_scalar("SELECT source_record_id FROM native_operation_origin_sources WHERE environment_id=$1 AND operation_id=$2")
+            .bind(state.env.env_id).bind(submission.operation_id).fetch_optional(&mut *conn).await.map_err(unavailable)?;
+        let source_id = source
+            .or(submission.parent_id)
+            .ok_or_else(|| invalid("/origin/surface"))?;
+        let source: ObjectRow =
+            sqlx::query_as("SELECT * FROM native_objects WHERE environment_id=$1 AND id=$2")
+                .bind(state.env.env_id)
+                .bind(source_id)
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(unavailable)?
+                .ok_or_else(ApiError::not_found)?;
+        let source_op = operation(&mut *conn, state, source.operation_id, false).await?;
+        let accepted_source = submission_from_source(&source_op)?;
+        let source_surface = accepted_source
+            .origin
+            .surface
+            .unwrap_or(native_origin_surface(
+                accepted_source.protocol,
+                accepted_source.kind,
+            ));
+        if Some(source_surface) != submission.origin.surface
+            || source.provider_key_id != submission.origin.provider_key_id
+            || source.boundary != submission.origin.boundary.as_str()
+        {
+            return Err(invalid("/origin/surface"));
+        }
+    }
+    let digest = configured_native_origin_at(
         &id_key,
         submission.origin.provider_key_id,
         &provider,
         submission.protocol,
         submission.kind,
+        submission.origin.surface,
     )
     .map_err(|_| ApiError::conflict("native_origin_changed", "无法确认原生对象所属账号"))?;
     if digest != submission.origin.boundary {
@@ -231,12 +305,14 @@ async fn origin_for_consumer(
         ));
     }
     if let Some(principal) = principal {
-        let allowed = match keys::reach(&principal.tenant, &principal.key) {
-            KeyReach::Ids(ids) => ids.contains(&submission.requested_model_id),
-            names => requested
-                .as_ref()
-                .is_some_and(|requested| names.names(&requested.display_name)),
-        };
+        let requested_name = requested
+            .as_ref()
+            .and_then(|model| requested_authority_name(model, submission));
+        let allowed = requested_name.is_some()
+            && match keys::reach(&principal.tenant, &principal.key) {
+                KeyReach::Ids(ids) => ids.contains(&submission.requested_model_id),
+                names => requested_name.is_some_and(|name| names.names(name)),
+            };
         let groups = keys::effective_groups(&principal.tenant, &principal.key);
         let key_doc: ApiKey =
             serde_json::from_value(keys::build_key_doc(&principal.tenant, &principal.key, true))
@@ -290,8 +366,12 @@ async fn operation(
     .ok_or_else(ApiError::not_found)
 }
 
-fn submission(row: &OperationRow) -> Result<BeginRequest, ApiError> {
+fn submission_from_source(row: &OperationRow) -> Result<BeginRequest, ApiError> {
     serde_json::from_value(row.submission.clone()).map_err(unavailable)
+}
+
+fn submission(row: &OperationRow) -> Result<BeginRequest, ApiError> {
+    submission_from_source(row)
 }
 
 #[derive(sqlx::FromRow)]
@@ -315,6 +395,7 @@ struct ObjectRow {
     lease_expires_at: Option<DateTime<Utc>>,
     lease_generation: i64,
     completed_at: Option<DateTime<Utc>>,
+    membership_epoch: i64,
 }
 
 impl ObjectRow {
@@ -323,7 +404,7 @@ impl ObjectRow {
             upstream_input_text: submitted.upstream_input_text,
             input_file_id: submitted.input_file_id.clone(),
             record_id: self.id,
-            api_key_id: Some(submitted.api_key_id),
+            api_key_id: Some(self.api_key_id),
             entries: submitted.entries.clone(),
             observation_headers: submitted.observation_headers.clone(),
             completed: self.completed_at.is_some(),
@@ -336,6 +417,7 @@ impl ObjectRow {
             request_id: submitted.request_id.clone(),
             requested_service_tier: submitted.requested_service_tier.clone(),
             origin: Some(OriginBinding {
+                surface: submitted.origin.surface,
                 model_id: self.model_id,
                 provider_key_id: self.provider_key_id,
                 boundary: serde_json::from_value(json!(self.boundary)).map_err(unavailable)?,
@@ -344,6 +426,10 @@ impl ObjectRow {
             kind: Some(serde_json::from_value(json!(self.kind)).map_err(unavailable)?),
             raw_id: self.raw_id.clone(),
             parent_id: self.parent_id,
+            parent_raw_id: None,
+            lifecycle_context: None,
+            metering_state: None,
+            reconciliation_reason: None,
             version: self.version,
             lease_generation: (self.lease_dp_id.is_some()).then_some(self.lease_generation),
             lease_expires_at: self.lease_expires_at,
@@ -401,6 +487,21 @@ async fn authorized_for_consumer(
         .await?;
     }
     let mut parent_id = row.parent_id;
+    if matches!(row.kind.as_str(), "response_item" | "response_container") {
+        if let Some(id) = parent_id {
+            let provenance: Option<String> = sqlx::query_scalar(
+                "SELECT kind FROM native_objects WHERE environment_id=$1 AND id=$2",
+            )
+            .bind(state.env.env_id)
+            .bind(id)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(unavailable)?;
+            if provenance.as_deref() == Some("response") {
+                parent_id = None;
+            }
+        }
+    }
     for _ in 0..32 {
         let Some(id) = parent_id else {
             return Ok(());
@@ -463,6 +564,21 @@ async fn begin(
     dp: DpIdentity,
     mut body: BeginRequest,
 ) -> Result<NativeReply, ApiError> {
+    // 新对象明确保存所选面；已发布种类缺省值保持旧线协议，供滚动升级重放。
+    if body.origin.surface.is_none()
+        && !matches!(
+            body.kind,
+            NativeObjectKind::Response
+                | NativeObjectKind::ResponseItem
+                | NativeObjectKind::ResponseContainer
+                | NativeObjectKind::File
+                | NativeObjectKind::MessageBatch
+                | NativeObjectKind::ChatCompletion
+                | NativeObjectKind::Upload
+        )
+    {
+        body.origin.surface = Some(native_origin_surface(body.protocol, body.kind));
+    }
     if !text_ok(&body.request_id, 256)
         || !text_ok(&body.requested_model, 256)
         || !text_ok(&body.upstream_model, 256)
@@ -482,8 +598,13 @@ async fn begin(
     if body.kind == NativeObjectKind::MessageBatch && body.entries.is_empty() {
         return Err(invalid("/entries"));
     }
-    if body.kind != NativeObjectKind::MessageBatch
-        && !(body.protocol == NativeProtocol::Openai && body.kind == NativeObjectKind::File)
+    if !matches!(
+        body.kind,
+        NativeObjectKind::MessageBatch
+            | NativeObjectKind::Eval
+            | NativeObjectKind::EvalRun
+            | NativeObjectKind::RealtimeCall
+    ) && !(body.protocol == NativeProtocol::Openai && body.kind == NativeObjectKind::File)
         && !body.entries.is_empty()
     {
         return Err(invalid("/entries"));
@@ -517,6 +638,18 @@ async fn begin(
     let mut entries = BTreeSet::new();
     let base_submission = body.clone();
     for entry in &mut body.entries {
+        if matches!(
+            body.kind,
+            NativeObjectKind::Eval | NativeObjectKind::EvalRun
+        ) != (entry.endpoint == "/v1/evals")
+        {
+            return Err(invalid("/entries/endpoint"));
+        }
+        if (body.kind == NativeObjectKind::RealtimeCall)
+            != (entry.endpoint == "/v1/audio/transcriptions")
+        {
+            return Err(invalid("/entries/endpoint"));
+        }
         if !text_ok(&entry.entry_id, 256)
             || entry
                 .upstream_input_text
@@ -526,6 +659,8 @@ async fn begin(
                 && !matches!(
                     entry.endpoint.as_str(),
                     "/v1/chat/completions"
+                        | "/v1/evals"
+                        | "/v1/audio/transcriptions"
                         | "/v1/completions"
                         | "/v1/responses"
                         | "/v1/embeddings"
@@ -624,12 +759,13 @@ async fn begin(
     let stored = operation(&mut *conn, state, body.operation_id, true).await?;
     if stored.tenant_id != principal.tenant.id
         || stored.api_key_id != principal.key.id
-        || stored.submission != wire
+        || submission(&stored)? != body
     {
         return Err(conflict());
     }
     if let Some(parent) = body.parent_id {
         let parent = object(&mut *conn, state, parent).await?;
+        foundation::assert_unfenced(&mut *conn, state, parent.id, Some(body.operation_id)).await?;
         authorized_for_consumer(&mut *conn, state, &principal, &parent, consumer_family).await?;
         if parent.boundary != body.origin.boundary.as_str() {
             return Err(invalid("/parent_id"));
@@ -693,6 +829,7 @@ async fn bind(
     }
     if let Some(parent) = submitted.parent_id {
         let parent = object(&mut *conn, state, parent).await?;
+        foundation::assert_unfenced(&mut *conn, state, parent.id, Some(body.operation_id)).await?;
         if parent.tenant_id != op.tenant_id || parent.boundary != submitted.origin.boundary.as_str()
         {
             return Err(conflict());
@@ -785,6 +922,15 @@ async fn bind(
             }
             let previous =
                 submission(&operation(&mut *conn, state, existing.operation_id, false).await?)?;
+            insert_membership(
+                &mut *conn,
+                state,
+                &row,
+                &existing,
+                NativeRelation::ResponseOutput,
+                body.operation_id,
+            )
+            .await?;
             children.push(existing.view(&previous)?);
             continue;
         }
@@ -812,6 +958,15 @@ async fn bind(
         .fetch_one(&mut *conn)
         .await
         .map_err(unavailable)?;
+        insert_membership(
+            &mut *conn,
+            state,
+            &row,
+            &child,
+            NativeRelation::ResponseOutput,
+            body.operation_id,
+        )
+        .await?;
         children.push(child.view(&derived)?);
     }
     let mut reply = NativeReply::new("bound");
@@ -830,8 +985,7 @@ async fn lookup_scoped(
         return Err(invalid("/locator/raw_id"));
     }
     if body.consumer_family.is_some_and(|family| {
-        body.locator.kind != NativeObjectKind::File
-            || !native_file_consumer_allowed(body.locator.protocol, family)
+        !native_object_consumer_allowed(body.locator.protocol, body.locator.kind, family)
     }) {
         return Err(invalid("/consumer_family"));
     }
@@ -878,7 +1032,9 @@ async fn lookup_scoped(
         return Err(ApiError::not_found());
     }
     let mut reply = NativeReply::new("found");
-    reply.record = Some(row.view(&submitted)?);
+    let mut view = row.view(&submitted)?;
+    foundation::enrich_record(&mut *conn, state, &mut view).await?;
+    reply.record = Some(view);
     Ok(reply)
 }
 
@@ -887,7 +1043,8 @@ async fn lookup(
     state: &AppState,
     body: LookupRequest,
 ) -> Result<NativeReply, ApiError> {
-    lookup_scoped(conn, state, body, false).await
+    let account_wide = body.consumer_family.is_some();
+    lookup_scoped(conn, state, body, account_wide).await
 }
 
 async fn owned(
@@ -943,6 +1100,7 @@ async fn tombstone(
     if row.version != body.version {
         return Err(conflict());
     }
+    foundation::assert_unfenced(&mut *conn, state, row.id, None).await?;
     if row.kind == "message_batch" && row.completed_at.is_none() {
         // 删除不能让尚未结算的批次失去后续观察依据。
         return Err(conflict());
@@ -997,7 +1155,19 @@ async fn claim(
              lease_generation = lease_generation + 1 WHERE id = $1 RETURNING *",
         ).bind(row.id).bind(dp.dp_id).bind(LEASE_SECONDS as f64)
             .fetch_one(&mut *conn).await.map_err(unavailable)?;
-        reply.records.push(row.view(&submitted)?);
+        let mut view = row.view(&submitted)?;
+        foundation::enrich_record(&mut *conn, state, &mut view).await?;
+        if let Some(parent) = row.parent_id {
+            view.parent_raw_id = sqlx::query_scalar(
+                "SELECT raw_id FROM native_objects WHERE environment_id=$1 AND id=$2",
+            )
+            .bind(state.env.env_id)
+            .bind(parent)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(unavailable)?;
+        }
+        reply.records.push(view);
     }
     Ok(reply)
 }
@@ -1061,9 +1231,12 @@ async fn complete(
     }
     let op = operation(&mut *conn, state, row.operation_id, false).await?;
     let submitted = submission(&op)?;
-    let statuses: &[&str] = match submitted.protocol {
-        NativeProtocol::Openai => &["completed", "failed", "cancelled", "incomplete", "expired"],
-        NativeProtocol::Anthropic => &["ended"],
+    let statuses: &[&str] = match (submitted.protocol, submitted.kind) {
+        (NativeProtocol::Openai, NativeObjectKind::EvalRun) => &["completed", "failed", "canceled"],
+        (NativeProtocol::Openai, _) => {
+            &["completed", "failed", "cancelled", "incomplete", "expired"]
+        }
+        (NativeProtocol::Anthropic, _) => &["ended"],
     };
     if !statuses.contains(&body.terminal_status.as_str()) {
         return Err(invalid("/terminal_status"));
@@ -1082,7 +1255,12 @@ async fn complete(
         .iter()
         .map(|entry| entry.entry_id.as_str())
         .collect();
-    if observed != expected || observed.len() != body.usage.len() {
+    let coverage_valid = if submitted.kind == NativeObjectKind::EvalRun {
+        !observed.is_empty() && observed.is_subset(&expected)
+    } else {
+        observed == expected
+    };
+    if !coverage_valid || observed.len() != body.usage.len() {
         return Err(invalid("/usage"));
     }
     if body.output_file_ids.len() > 2
@@ -1145,10 +1323,14 @@ async fn complete(
                 .is_some_and(|audit| audit.version != 2 || !audit.validate())
             || !(100..=599).contains(&usage.status_code)
             || usage.terminal_status.as_deref().is_some_and(|status| {
-                !matches!(
-                    status,
-                    "completed" | "failed" | "cancelled" | "expired" | "incomplete"
-                )
+                if submitted.kind == NativeObjectKind::EvalRun {
+                    !matches!(status, "completed" | "failed" | "canceled")
+                } else {
+                    !matches!(
+                        status,
+                        "completed" | "failed" | "cancelled" | "expired" | "incomplete"
+                    )
+                }
             })
             || usage.error_class.len() > 64
             || usage.error_message.len() > 4096
@@ -1223,7 +1405,7 @@ async fn complete(
         fields.insert("is_final_attempt".to_string(), json!(true));
         if matches!(
             submitted.kind,
-            NativeObjectKind::Response | NativeObjectKind::MessageBatch
+            NativeObjectKind::Response | NativeObjectKind::MessageBatch | NativeObjectKind::EvalRun
         ) {
             // 唯一终态由对象锁和永久 outbox 身份保证；不按调用方 request_id 合并。
             fields.insert("upstream_dispatched".to_string(), json!(true));
@@ -1269,6 +1451,24 @@ pub(crate) async fn execute(
         Command::Renew(body) => lease(conn, state, dp, body, true).await,
         Command::Reschedule(body) => lease(conn, state, dp, body, false).await,
         Command::Complete(body) => complete(conn, state, dp, body).await,
+        Command::BeginRelated(body) => foundation::begin_related(conn, state, dp, body).await,
+        Command::BindRelated(body) => foundation::bind_related(conn, state, dp, body).await,
+        Command::ReserveRelations(body) => relations::reserve(conn, state, dp, body).await,
+        Command::CommitRelations(body) => relations::commit(conn, state, dp, body).await,
+        Command::LookupRelations(body) => relations::lookup(conn, state, dp, body).await,
+        Command::ResolveReservation(body) => foundation::resolve(conn, state, dp, body).await,
+        Command::BindObservedArtifacts(body) => foundation::observed(conn, state, dp, body).await,
+        Command::ReserveDelete(body) => deletion::reserve(conn, state, dp, body).await,
+        Command::CommitDelete(body) => deletion::commit(conn, state, dp, body).await,
+        Command::SignedSipIntake(body) => realtime::sip_intake(conn, state, dp, body).await,
+        Command::MintCredential(body) => realtime::mint(conn, state, dp, body).await,
+        Command::RedeemCredential(body) => realtime::redeem(conn, state, dp, body).await,
+        Command::CreateLiveSession(body) => realtime::create(conn, state, dp, body).await,
+        Command::AppendLiveUsage(body) => realtime::append(conn, state, dp, body).await,
+        Command::CheckpointLiveSession(body) => realtime::checkpoint(conn, state, dp, body).await,
+        Command::ClaimLiveSessions(body) => realtime::claim(conn, state, dp, body).await,
+        Command::CompleteTyped(body) => metering::complete_typed(conn, state, dp, body).await,
+        Command::Reconciliation(body) => metering::mark_reconciliation(conn, state, dp, body).await,
     }
 }
 
@@ -1292,6 +1492,8 @@ pub(crate) async fn deliver_one(
     };
     let (batch_id, dp_id) = (*batch_id, *dp_id);
     let ids: Vec<Uuid> = rows.iter().map(|(id, _, _)| *id).collect();
+    let operation_ids:Vec<Uuid>=sqlx::query_scalar("SELECT DISTINCT objects.operation_id FROM native_terminal_outbox outbox JOIN native_objects objects ON objects.id=outbox.object_id WHERE outbox.event_id=ANY($1)")
+        .bind(&ids).fetch_all(&mut *conn).await?;
     let events = rows.into_iter().map(|(_, _, event)| event).collect();
     // 同一提交网关的一批事件一次接收，沿用原有账号锁的全局顺序。
     let outcome =
@@ -1304,12 +1506,39 @@ pub(crate) async fn deliver_one(
     }
     sqlx::query("UPDATE native_terminal_outbox SET delivered_at = clock_timestamp() WHERE event_id = ANY($1)")
         .bind(ids).execute(&mut *conn).await?;
+    metering::delivered(&mut *conn, state, &operation_ids, outcome.unpriced > 0).await?;
     Ok(true)
 }
 
 #[cfg(test)]
 mod consumer_endpoint_tests {
     use super::*;
+    #[test]
+    fn wildcard_model_authority_keeps_the_concrete_accepted_name() {
+        let accepted:BeginRequest=serde_json::from_value(json!({
+            "operation_id":Uuid::from_u128(1),"api_key_id":Uuid::from_u128(2),
+            "protocol":"openai","kind":"file",
+            "origin":{"model_id":Uuid::from_u128(3),"provider_key_id":Uuid::from_u128(4),"boundary":"v1:0000000000000000000000000000000000000000000000000000000000000000"},
+            "requested_model_id":Uuid::from_u128(3),"requested_model":"openai/gpt-4",
+            "upstream_model":"gpt-4","operation":"files","request_id":"wildcard-contract","asynchronous":false
+        })).unwrap();
+        let mut model: Model = serde_json::from_value(
+            json!({"display_name":"openai/*","provider":"openai","model_name":"gpt-4"}),
+        )
+        .unwrap();
+        assert_eq!(
+            requested_authority_name(&model, &accepted),
+            Some("openai/gpt-4")
+        );
+        model.display_name = "anthropic/*".into();
+        assert_eq!(requested_authority_name(&model, &accepted), None);
+        model.display_name = "renamed-model".into();
+        assert_eq!(
+            requested_authority_name(&model, &accepted),
+            Some("renamed-model")
+        );
+    }
+
     #[test]
     fn file_consumer_selects_only_its_actual_endpoint_without_granting_file_management() {
         let key: ApiKey =
@@ -1327,4 +1556,11 @@ mod consumer_endpoint_tests {
             Some(EndpointFamily::Responses)
         ));
     }
+}
+
+pub(crate) async fn deliver_live_one(
+    conn: &mut PgConnection,
+    state: &AppState,
+) -> Result<bool, DbError> {
+    realtime::deliver_one(conn, state).await
 }

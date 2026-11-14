@@ -71,7 +71,7 @@ use crate::AppState;
 
 /// 客户密钥明确开放已实现的模型接口；工具与透传仍关闭。
 /// 每次扩展同时提升 KEY_DOC_VERSION，并经兼容门槛追平已有密钥。
-pub const FIRST_PHASE_ENDPOINTS: [&str; 18] = [
+pub const FIRST_PHASE_ENDPOINTS: [&str; 23] = [
     "chat_completions",
     "completions",
     "messages",
@@ -90,6 +90,11 @@ pub const FIRST_PHASE_ENDPOINTS: [&str; 18] = [
     "fine_tuning",
     "moderations",
     "content_provenance_checks",
+    "conversations",
+    "containers",
+    "vector_stores",
+    "skills",
+    "evals",
 ];
 
 // 新族尚未通过兼容门槛时，新客户密钥沿用已发布的 v4 权限。
@@ -468,7 +473,8 @@ pub(crate) fn effective_disabled(t: &TenantRow, k: &KeyRow, member_active: bool)
 ///
 /// 4：客户密钥增加 legacy completions，已有 live key 在启动和定期维护时追平。
 /// 5：开放已隔离的模型数据面族；滚动升级期间保留旧列表供安全收紧。
-pub const KEY_DOC_VERSION: i32 = 5;
+/// 6：增加持久原生对象管理族，旧构建保留原授权列表，兼容后再追平。
+pub const KEY_DOC_VERSION: i32 = 6;
 
 /// The gateway `api_keys` document of key `k` of tenant `t`, whose member,
 /// if it has one, is `member_active`: neither disabled nor removed, and in
@@ -2274,6 +2280,11 @@ mod tests {
                 EndpointFamily::FineTuning,
                 EndpointFamily::Moderations,
                 EndpointFamily::ContentProvenanceChecks,
+                EndpointFamily::Conversations,
+                EndpointFamily::Containers,
+                EndpointFamily::VectorStores,
+                EndpointFamily::Skills,
+                EndpointFamily::Evals,
             ]
         );
     }

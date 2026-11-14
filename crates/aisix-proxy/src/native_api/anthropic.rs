@@ -136,6 +136,7 @@ fn resolve_target_for_request(
     let provider_key_id =
         Uuid::parse_str(&pk_entry.id).map_err(|_| ProxyError::AccountUnavailable)?;
     let origin = OriginBinding {
+        surface: None,
         model_id: Uuid::parse_str(&model_entry.id).map_err(|_| ProxyError::AccountUnavailable)?,
         provider_key_id,
         boundary: configured_native_origin(

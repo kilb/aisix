@@ -105,6 +105,7 @@ fn state(base: &str) -> Result<ProxyState, Box<dyn std::error::Error>> {
     let platform =
         aisix_proxy::platform::PlatformSettings::from_secret("responses-metrics-authority");
     let origin = OriginBinding {
+        surface: None,
         model_id: serde_json::from_value(json!(MODEL))?,
         provider_key_id: serde_json::from_value(json!(PROVIDER))?,
         boundary: configured_native_origin(

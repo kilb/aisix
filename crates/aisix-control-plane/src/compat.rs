@@ -130,6 +130,51 @@ pub const FIELD_FLOORS: &[FieldFloor] = &[
         widens: key_widens,
         why: "an older gateway ignores the field and lets the key reach every provider key",
     },
+    FieldFloor {
+        kind: Kind::ApiKeys,
+        pointer: "/allowed_endpoints",
+        trigger: Trigger::Contains("conversations"),
+        since: Since::ThisRelease,
+        widens: key_widens,
+        why:
+            "an older gateway does not recognize this native object family and withholds its grant",
+    },
+    FieldFloor {
+        kind: Kind::ApiKeys,
+        pointer: "/allowed_endpoints",
+        trigger: Trigger::Contains("containers"),
+        since: Since::ThisRelease,
+        widens: key_widens,
+        why:
+            "an older gateway does not recognize this native object family and withholds its grant",
+    },
+    FieldFloor {
+        kind: Kind::ApiKeys,
+        pointer: "/allowed_endpoints",
+        trigger: Trigger::Contains("vector_stores"),
+        since: Since::ThisRelease,
+        widens: key_widens,
+        why:
+            "an older gateway does not recognize this native object family and withholds its grant",
+    },
+    FieldFloor {
+        kind: Kind::ApiKeys,
+        pointer: "/allowed_endpoints",
+        trigger: Trigger::Contains("skills"),
+        since: Since::ThisRelease,
+        widens: key_widens,
+        why:
+            "an older gateway does not recognize this native object family and withholds its grant",
+    },
+    FieldFloor {
+        kind: Kind::ApiKeys,
+        pointer: "/allowed_endpoints",
+        trigger: Trigger::Contains("evals"),
+        since: Since::ThisRelease,
+        widens: key_widens,
+        why:
+            "an older gateway does not recognize this native object family and withholds its grant",
+    },
 ];
 
 /// How recently a gateway instance must have reported to count among the
@@ -197,6 +242,48 @@ fn supports_customer_endpoint_expansion(version: &str, cp_version: &str) -> bool
             || sha == CUSTOMER_ENDPOINT_EXPANSION_DEV_SHA
             || sha == &CUSTOMER_ENDPOINT_EXPANSION_DEV_SHA[..7]
     })
+}
+
+// 原生对象族不能复用较早接口扩展的开发构建豁免；已知基线即使同名也不支持它们。
+fn supports_native_endpoint_expansion(version: &str, cp_version: &str) -> bool {
+    if let (GatewayVersion::Release(version), Some(minimum)) = (
+        GatewayVersion::parse(version),
+        minimum(&Since::ThisRelease, cp_version),
+    ) {
+        return !version.cmp_precedence(&minimum).is_lt();
+    }
+    let dev_sha = |version: &str| {
+        version
+            .strip_prefix("dev+sha-")
+            .filter(|sha| {
+                (7..=40).contains(&sha.len()) && sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+            .map(str::to_ascii_lowercase)
+    };
+    let (Some(gateway), Some(control_plane)) = (dev_sha(version), dev_sha(cp_version)) else {
+        return false;
+    };
+    let legacy = [
+        CUSTOMER_ENDPOINT_EXPANSION_DEV_SHA,
+        "e411f9428fa1f744421c895f72a8c71940d5a4fc",
+    ];
+    gateway == control_plane && !legacy.iter().any(|sha| sha.starts_with(gateway.as_str()))
+}
+
+fn native_endpoint_expansion(kind: Kind, doc: &Value, stored: &Value) -> bool {
+    kind == Kind::ApiKeys
+        && doc
+            .get("allowed_endpoints")
+            .and_then(Value::as_array)
+            .is_some_and(|families| {
+                families.iter().any(|family| {
+                    matches!(
+                        family.as_str(),
+                        Some("conversations" | "containers" | "vector_stores" | "skills" | "evals")
+                    )
+                })
+            })
+        && (stored.is_null() || key_widens(stored, doc))
 }
 
 fn customer_endpoint_expansion(kind: Kind, doc: &Value, stored: &Value) -> bool {
@@ -507,12 +594,13 @@ pub async fn gate(
     stored: &Value,
 ) -> Result<(), ApiError> {
     let customer_expansion = customer_endpoint_expansion(kind, doc, stored);
+    let native_expansion = native_endpoint_expansion(kind, doc, stored);
     let floors: Vec<(&FieldFloor, Version)> = newly_triggered(FIELD_FLOORS, kind, doc, stored)
         .into_iter()
         .filter_map(|f| minimum(&f.since, &ctx.cp_version).map(|m| (f, m)))
         .collect();
     let first = floors.first();
-    if first.is_none() && !customer_expansion {
+    if first.is_none() && !customer_expansion && !native_expansion {
         return Ok(());
     }
     let versions: Vec<String> = sqlx::query_scalar(&format!(
@@ -533,6 +621,18 @@ pub async fn gate(
                     "客户接口扩展需要全部网关满足接口隔离版本，或使用已确认支持的已标记开发构建；\
                      当前有 {unsupported} 个实例无法确认支持"
                 ),
+            ));
+        }
+    }
+    if native_expansion {
+        let unsupported = versions
+            .iter()
+            .filter(|version| !supports_native_endpoint_expansion(version, &ctx.cp_version))
+            .count();
+        if unsupported > 0 {
+            return Err(too_old(
+                "/allowed_endpoints",
+                format!("原生对象接口扩展需要全部网关支持当前版本；当前有 {unsupported} 个实例无法确认支持"),
             ));
         }
     }
@@ -567,7 +667,7 @@ pub async fn gate(
         };
         return Err(too_old(pointer, message));
     }
-    if customer_expansion {
+    if customer_expansion || native_expansion {
         // 旧逻辑可无标记淘汰 Dev 实例；满额清单不能证明未遗漏旧构建。
         // 保留全部行判断，直到正常清理降到上限以下，不能仅统计最近 24 小时。
         let full: bool = sqlx::query_scalar(
@@ -1034,8 +1134,123 @@ mod tests {
                 (Kind::CachePolicies, "/scope"),
                 (Kind::ApiKeys, "/allowed_endpoints"),
                 (Kind::ApiKeys, "/allowed_provider_groups"),
+                (Kind::ApiKeys, "/allowed_endpoints"),
+                (Kind::ApiKeys, "/allowed_endpoints"),
+                (Kind::ApiKeys, "/allowed_endpoints"),
+                (Kind::ApiKeys, "/allowed_endpoints"),
+                (Kind::ApiKeys, "/allowed_endpoints"),
             ]
         );
+    }
+
+    #[test]
+    fn native_family_floors_are_value_specific_and_recheck_growth() {
+        for name in [
+            "conversations",
+            "containers",
+            "vector_stores",
+            "skills",
+            "evals",
+        ] {
+            let floors: Vec<FieldFloor> = FIELD_FLOORS
+                .iter()
+                .copied()
+                .filter(|floor| floor.trigger == Trigger::Contains(name))
+                .collect();
+            assert_eq!(floors.len(), 1, "{name}");
+            let native = json!({"allowed_endpoints":[name], "disabled":false});
+            let legacy = json!({"allowed_endpoints":["responses"]});
+            assert!(check_against(
+                &floors,
+                Kind::ApiKeys,
+                &native,
+                &versions(&["1.8.2"]),
+                "1.9.0"
+            )
+            .is_err());
+            assert_eq!(
+                check_against(
+                    &floors,
+                    Kind::ApiKeys,
+                    &legacy,
+                    &versions(&["1.8.2"]),
+                    "1.9.0"
+                ),
+                Ok(())
+            );
+            assert_eq!(
+                newly_triggered(&floors, Kind::ApiKeys, &native, &native).len(),
+                0
+            );
+            let disabled = json!({"allowed_endpoints":[name], "disabled":true});
+            assert!(native_endpoint_expansion(Kind::ApiKeys, &native, &disabled));
+            assert!(!native_endpoint_expansion(
+                Kind::ApiKeys,
+                &disabled,
+                &native
+            ));
+            assert!(!native_endpoint_expansion(Kind::ApiKeys, &native, &native));
+            assert_eq!(
+                newly_triggered(&floors, Kind::ApiKeys, &native, &disabled).len(),
+                1
+            );
+            assert_eq!(
+                newly_triggered(&floors, Kind::ApiKeys, &disabled, &native).len(),
+                0
+            );
+            let broader =
+                json!({"allowed_endpoints":[name],"allowed_model_ids":["model-a","model-b"]});
+            let narrow = json!({"allowed_endpoints":[name],"allowed_model_ids":["model-a"]});
+            assert_eq!(
+                newly_triggered(&floors, Kind::ApiKeys, &broader, &narrow).len(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn native_build_support_never_inherits_the_old_customer_exception() {
+        for gateway in [
+            "dev",
+            "dev+sha-",
+            "dev+sha-invalid",
+            "dev+sha-08ff931",
+            CUSTOMER_ENDPOINT_EXPANSION_DEV_SHA,
+            "dev+sha-e411f94",
+        ] {
+            assert!(
+                !supports_native_endpoint_expansion(gateway, "dev+sha-12ab345"),
+                "{gateway}"
+            );
+        }
+        for legacy in [
+            "08ff931",
+            CUSTOMER_ENDPOINT_EXPANSION_DEV_SHA,
+            "e411f94",
+            "e411f9428fa1f744421c895f72a8c71940d5a4fc",
+        ] {
+            let version = format!("dev+sha-{legacy}");
+            assert!(
+                !supports_native_endpoint_expansion(&version, &version),
+                "{legacy}"
+            );
+        }
+        assert!(supports_native_endpoint_expansion(
+            "dev+sha-12ab345",
+            "dev+sha-12ab345"
+        ));
+        assert!(supports_native_endpoint_expansion(
+            "1.9.0+sha-98cd765",
+            "1.9.0+sha-12ab345"
+        ));
+        assert!(!supports_native_endpoint_expansion(
+            "1.9.0-rc.1+sha-98cd765",
+            "1.9.0+sha-12ab345"
+        ));
+        assert!(!supports_native_endpoint_expansion(
+            "1.99.0+sha-98cd765",
+            "dev+sha-12ab345"
+        ));
     }
 
     #[test]

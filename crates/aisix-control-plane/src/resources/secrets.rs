@@ -219,6 +219,22 @@ fn changed_destination(kind: Kind, incoming: &Value, stored: &Value) -> bool {
 /// would otherwise be stored unsealed.
 pub fn restore(kind: Kind, incoming: &mut Value, stored: &Value) -> Result<(), Detail> {
     let moved = changed_destination(kind, incoming, stored);
+    // SIP 签名只授权固定绑定；改变路由或归属不要求重输无关的上游 API key。
+    let sip_moved = kind == Kind::ProviderKeys
+        && (["route_id", "api_key_id", "model_id"].iter().any(|field| {
+            let path = format!("/realtime_sip/{field}");
+            incoming.pointer(&path) != stored.pointer(&path)
+        }) || {
+            let headers = |doc: &Value| {
+                doc.pointer("/request/default_headers")
+                    .and_then(Value::as_object)
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            let (next, previous) = (headers(incoming), headers(stored));
+            next.keys().ne(previous.keys())
+                || next.values().any(|value| value.as_str() != Some(REDACTED))
+        });
     let rewrote = rewrote_a_script_input(kind, incoming, stored);
     // Keyed by field key and label: the label keeps apart names that
     // sanitize to one field key (`x-a` and `x_a`). `None` marks a key two
@@ -251,7 +267,9 @@ pub fn restore(kind: Kind, incoming: &mut Value, stored: &Value) -> Result<(), D
             return;
         }
         match kept.get(&(slot.field_key.clone(), slot.label.clone())) {
-            Some(Some(_)) if moved => {
+            Some(Some(_))
+                if moved || (sip_moved && slot.field_key == "REALTIME_SIP_WEBHOOK_SECRET") =>
+            {
                 problem = Some(Detail {
                     path: slot.label.clone(),
                     message: "发送机密的目标已更改，请重新填写该机密".to_string(),

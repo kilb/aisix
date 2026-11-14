@@ -66,6 +66,7 @@ pub(crate) async fn begin_response(
     let requested_model_id =
         Uuid::parse_str(&requested.id).map_err(|_| ProxyError::AccountUnavailable)?;
     let origin = OriginBinding {
+        surface: None,
         model_id,
         provider_key_id,
         boundary: configured_native_origin(

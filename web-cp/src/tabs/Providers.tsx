@@ -23,6 +23,8 @@ import { GroupPicker, groupChoices, useLoad, type GroupChoice } from "./Tenants"
 import { ChannelModels } from "./providers/ChannelModels";
 import { GroupBadges } from "./providers/GroupBadges";
 import { InventorySummary, countGroups } from "./providers/OperationsBento";
+import { RealtimeSipBindingForm } from "./providers/RealtimeSipBindingForm";
+import { isRealtimeSipProjectPath, realtimeSipBody, realtimeSipDraft, realtimeSipErrors, realtimeSipProjectBody, realtimeSipProjectDraft, realtimeSipProjectError, type RealtimeSipBinding, type RealtimeSipErrors, type RealtimeSipField, type RealtimeSipRequest } from "../lib/realtimeSipBinding";
 
 /** The fields of a `provider_key` this page edits; every other field is kept as stored. */
 interface ProviderKeyDoc {
@@ -34,6 +36,8 @@ interface ProviderKeyDoc {
   /** The former spelling of `api_key`, which the control plane renames on write. */
   secret?: string;
   groups?: string[];
+  realtime_sip?: RealtimeSipBinding | null;
+  request?: RealtimeSipRequest | null;
   [field: string]: unknown;
 }
 
@@ -73,6 +77,7 @@ const ACCOUNT_FIELDS = {
   apiBase: ["/api_base"],
   secret: ["api_key", "/api_key", "secret", "/secret"],
   groups: ["/groups"],
+  realtimeSip: ["/realtime_sip", "realtime_sip.webhook_secret"],
 };
 
 /** Whether `path` is at `field` or inside it. */
@@ -529,6 +534,10 @@ function AccountForm({
   const [apiBase, setApiBase] = useState(initial.apiBase);
   const [secret, setSecret] = useState<string | undefined>(stored ? REDACTED : "");
   const [groups, setGroups] = useState(initial.groups);
+  const [sip, setSip] = useState(() => realtimeSipDraft(doc.realtime_sip));
+  const [sipErrors, setSipErrors] = useState<RealtimeSipErrors>({});
+  const [sipProject, setSipProject] = useState<string | undefined>(() => realtimeSipProjectDraft(doc.request));
+  const [sipProjectError, setSipProjectError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<ApiError | string | null>(null);
   const [conflict, setConflict] = useState(false);
@@ -549,13 +558,15 @@ function AccountForm({
   const locked = readOnly || busy || removal !== null;
   const details = err instanceof ApiError ? err.details : [];
   const at = (field: keyof typeof ACCOUNT_FIELDS) => problemAt(details, within(ACCOUNT_FIELDS[field]));
+  const sipAt = (field: RealtimeSipField) => sipErrors[field] ?? problemAt(details, (path) =>
+    path === `/realtime_sip/${field}` || path === `realtime_sip.${field}`);
   /** A refusal this form shows beside the field of a list entry it names by index. */
   const entryAt = (field: keyof typeof ACCOUNT_FIELDS, index: number) => problemAt(details, (path) => path === `${field}/${index}`);
   // Without its schema the adapter has no field to show a refusal at.
   const shown = Object.entries(ACCOUNT_FIELDS).flatMap(([field, paths]) =>
     field === "adapter" && schema && "error" in schema ? [] : paths,
   );
-  const listed = details.filter((d) => !within(shown)(d.path));
+  const listed = details.filter((d) => !within(shown)(d.path) && !isRealtimeSipProjectPath(d.path));
 
   // The adapter's options: the schema's, plus what is stored when the
   // schema lacks it, plus "unset" for an existing account without one, so
@@ -588,6 +599,13 @@ function AccountForm({
       next.api_key = secret;
     }
     if (isNew ? groups.length > 0 : !sameList(groups, initial.groups)) next.groups = groups;
+    const binding = realtimeSipBody(sip, doc.realtime_sip);
+    if (binding) next.realtime_sip = binding;
+    else delete next.realtime_sip;
+    if (sip.enabled && sipProject !== undefined) {
+      const request = realtimeSipProjectBody(doc.request, sipProject);
+      if (request !== undefined) next.request = request;
+    }
     return next;
   }
 
@@ -612,6 +630,15 @@ function AccountForm({
   async function submit(e: React.FormEvent) {
     e.preventDefault();
     setErr(null);
+    const errors = realtimeSipErrors(sip, doc.realtime_sip,
+      provider !== initial.provider || adapter !== initial.adapter || apiBase !== initial.apiBase || sipProject !== REDACTED);
+    const projectError = realtimeSipProjectError(sip.enabled, sipProject);
+    setSipErrors(errors);
+    setSipProjectError(projectError);
+    if (Object.keys(errors).length > 0 || projectError !== null) {
+      focusRefusal();
+      return;
+    }
     if (apiBase !== initial.apiBase && /\/\/[^/@]*:\*\*\*@/.test(apiBase)) {
       setErr("接口地址中的口令显示为 ***：修改地址时请填写完整的口令。");
       return;
@@ -700,6 +727,17 @@ function AccountForm({
           />
         </div>
       </div>
+      <RealtimeSipBindingForm
+        draft={sip}
+        storedSecret={typeof doc.realtime_sip?.webhook_secret === "string" && doc.realtime_sip.webhook_secret !== ""}
+        disabled={locked}
+        errorAt={sipAt}
+        sectionError={problemAt(details, (path) => path === "/realtime_sip")}
+        onChange={(next) => { setSip(next); setSipErrors({}); }}
+        storedProject={realtimeSipProjectDraft(doc.request) === REDACTED}
+        projectError={sipProjectError ?? problemAt(details, isRealtimeSipProjectPath)}
+        onProjectChange={(value) => { setSipProject(value); setSipProjectError(null); }}
+      />
       <fieldset className="tn-section mt-2 border-t border-line pt-5 [&_.tn-groups]:grid-cols-[repeat(auto-fill,minmax(13rem,1fr))] [&_.tn-groups]:gap-x-6">
         <legend className="text-body font-semibold">分组</legend>
         <p className="hint text-caption">{GROUPS_HINT}；只能从已有的分组里选。</p>
