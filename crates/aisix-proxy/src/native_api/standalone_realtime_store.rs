@@ -1,5 +1,5 @@
 //! 实时凭据、会话和不可变本地日志；不保存供应商令牌，不增加计费投递器。
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use aisix_core::{
     models::EndpointFamily,
@@ -1088,20 +1088,11 @@ pub(super) async fn signed_sip_intake(
             .await
             .map_err(unavailable)?;
     if exists == 0 {
-        store
-            .begin_inner(
-                &mut tx,
-                BeginRelatedRequest {
-                    submission: authoritative.clone(),
-                    references: vec![],
-                    entry_references: BTreeMap::new(),
-                    response_conversation_id: None,
-                    entry_response_conversations: BTreeMap::new(),
-                    owner_parent_record_id: None,
-                    lifecycle_context: None,
-                },
-            )
-            .await?;
+        // 实时 intake 不设置图扩展标志，统一采用私有协议声明的缺省值。
+        let begin: BeginRelatedRequest =
+            serde_json::from_value(serde_json::json!({"submission":authoritative}))
+                .map_err(unavailable)?;
+        store.begin_inner(&mut tx, begin).await?;
     }
     let (submitted, owner, worker) = operation(&mut tx, body.operation_id).await?;
     current_operation(store, &snapshot, &current, &submitted, &owner, worker)?;
@@ -1127,24 +1118,13 @@ pub(super) async fn signed_sip_intake(
         true,
     )
     .await?;
-    let bound = store
-        .bind_inner(
-            &mut tx,
-            BindRelatedRequest {
-                binding: BindRequest {
-                    operation_id: body.operation_id,
-                    api_key_id: binding.key_id,
-                    raw_id: call.into(),
-                    existing_record_id: None,
-                    objects: vec![],
-                    provider_created_at: None,
-                    provider_expires_at: None,
-                },
-                relations: vec![],
-                claim_stream_lease: false,
-            },
-        )
-        .await?;
+    let graph_binding: BindRelatedRequest = serde_json::from_value(serde_json::json!({
+        "binding":BindRequest {
+            operation_id:body.operation_id,api_key_id:binding.key_id,raw_id:call.into(),
+            existing_record_id:None,objects:vec![],provider_created_at:None,provider_expires_at:None,
+        }
+    })).map_err(unavailable)?;
+    let bound = store.bind_inner(&mut tx, graph_binding).await?;
     sqlx::query("INSERT INTO native_sip_intakes(boundary,provider_event_id,webhook_id,call_id,route_id,provider_key_id,operation_id) VALUES(?,?,?,?,?,?,?)")
         .bind(authoritative.origin.boundary.as_str()).bind(event).bind(&body.webhook_id).bind(call).bind(&body.route_id).bind(binding.provider_id.to_string()).bind(body.operation_id.to_string()).execute(&mut *tx).await.map_err(unavailable)?;
     reply.record = bound.record;
