@@ -5,6 +5,7 @@ use std::sync::{
     Arc, Mutex,
 };
 
+use aisix_core::native_metering::{ReconciliationRequest, TypedCompleteRequest};
 use aisix_core::native_objects::*;
 use aisix_core::AisixSnapshot;
 use aisix_etcd::{build_snapshot, PrefixSet, RawEntry};
@@ -92,11 +93,14 @@ impl HttpRegistry {
 
 macro_rules! authority_operation {
     ($method:ident, $request:ty) => {
+        authority_operation!($method, $request, stringify!($method));
+    };
+    ($method:ident, $request:ty, $operation:expr) => {
         fn $method(
             &self,
             request: $request,
         ) -> BoxFuture<'_, Result<NativeReply, NativeRegistryError>> {
-            Box::pin(async move { self.post(stringify!($method), &request).await })
+            Box::pin(async move { self.post($operation, &request).await })
         }
     };
 }
@@ -111,6 +115,29 @@ impl NativeObjectRegistry for HttpRegistry {
     authority_operation!(renew, LeaseRequest);
     authority_operation!(reschedule, LeaseRequest);
     authority_operation!(complete, CompleteRequest);
+    authority_operation!(begin_related, BeginRelatedRequest, "related/begin");
+    authority_operation!(bind_related, BindRelatedRequest, "related/bind");
+    authority_operation!(
+        reserve_relations,
+        ReserveRelationsRequest,
+        "relations/reserve"
+    );
+    authority_operation!(commit_relations, CommitRelationsRequest, "relations/commit");
+    authority_operation!(lookup_relations, LookupRelationsRequest, "relations/lookup");
+    authority_operation!(
+        resolve_reservation,
+        ResolveReservationRequest,
+        "relations/resolve"
+    );
+    authority_operation!(
+        bind_observed_artifacts,
+        BindObservedArtifactsRequest,
+        "observed-artifacts"
+    );
+    authority_operation!(reserve_delete, ObjectDeletionRequest, "delete/reserve");
+    authority_operation!(commit_delete, ObjectDeletionRequest, "delete/commit");
+    authority_operation!(complete_typed, TypedCompleteRequest, "complete-typed");
+    authority_operation!(mark_reconciliation, ReconciliationRequest, "reconciliation");
 }
 
 // 真正投影到 kine 的文档经网关的生产加载器进入快照，避免手造权限模型。
