@@ -69,6 +69,25 @@ pub(crate) fn endpoint_family(path: &str) -> Option<EndpointFamily> {
         | "/v1/uploads/:id/parts"
         | "/v1/uploads/:id/complete"
         | "/v1/uploads/:id/cancel" => F::Files,
+        "/v1/conversations"
+        | "/v1/conversations/:id"
+        | "/v1/conversations/:id/items"
+        | "/v1/conversations/:id/items/:item_id" => F::Conversations,
+        "/v1/containers"
+        | "/v1/containers/:id"
+        | "/v1/containers/:id/files"
+        | "/v1/containers/:id/files/:file_id"
+        | "/v1/containers/:id/files/:file_id/content" => F::Containers,
+        "/v1/vector_stores"
+        | "/v1/vector_stores/:id"
+        | "/v1/vector_stores/:id/search"
+        | "/v1/vector_stores/:id/files"
+        | "/v1/vector_stores/:id/files/:file_id"
+        | "/v1/vector_stores/:id/files/:file_id/content"
+        | "/v1/vector_stores/:id/file_batches"
+        | "/v1/vector_stores/:id/file_batches/:batch_id"
+        | "/v1/vector_stores/:id/file_batches/:batch_id/cancel"
+        | "/v1/vector_stores/:id/file_batches/:batch_id/files" => F::VectorStores,
         "/v1/audio/transcriptions" | "/v1/audio/translations" | "/v1/audio/speech" => F::Audio,
         "/v1/videos" | "/v1/videos/:id" => F::Videos,
         "/v1/rerank" => F::Rerank,
@@ -133,7 +152,7 @@ mod tests {
     use EndpointFamily as F;
 
     /// Every family a route can be refused under: all but the catch-all.
-    const ROUTABLE_FAMILIES: [EndpointFamily; 21] = [
+    const ROUTABLE_FAMILIES: [EndpointFamily; 24] = [
         F::ChatCompletions,
         F::Completions,
         F::Embeddings,
@@ -152,6 +171,9 @@ mod tests {
         F::FineTuning,
         F::Moderations,
         F::ContentProvenanceChecks,
+        F::Conversations,
+        F::Containers,
+        F::VectorStores,
         F::Mcp,
         F::A2a,
         F::Passthrough,
@@ -200,6 +222,49 @@ mod tests {
         ("/v1/uploads/:id/parts", Family(F::Files)),
         ("/v1/uploads/:id/complete", Family(F::Files)),
         ("/v1/uploads/:id/cancel", Family(F::Files)),
+        ("/v1/conversations", Family(F::Conversations)),
+        ("/v1/conversations/:id", Family(F::Conversations)),
+        ("/v1/conversations/:id/items", Family(F::Conversations)),
+        (
+            "/v1/conversations/:id/items/:item_id",
+            Family(F::Conversations),
+        ),
+        ("/v1/containers", Family(F::Containers)),
+        ("/v1/containers/:id", Family(F::Containers)),
+        ("/v1/containers/:id/files", Family(F::Containers)),
+        ("/v1/containers/:id/files/:file_id", Family(F::Containers)),
+        (
+            "/v1/containers/:id/files/:file_id/content",
+            Family(F::Containers),
+        ),
+        ("/v1/vector_stores", Family(F::VectorStores)),
+        ("/v1/vector_stores/:id", Family(F::VectorStores)),
+        ("/v1/vector_stores/:id/search", Family(F::VectorStores)),
+        ("/v1/vector_stores/:id/files", Family(F::VectorStores)),
+        (
+            "/v1/vector_stores/:id/files/:file_id",
+            Family(F::VectorStores),
+        ),
+        (
+            "/v1/vector_stores/:id/files/:file_id/content",
+            Family(F::VectorStores),
+        ),
+        (
+            "/v1/vector_stores/:id/file_batches",
+            Family(F::VectorStores),
+        ),
+        (
+            "/v1/vector_stores/:id/file_batches/:batch_id",
+            Family(F::VectorStores),
+        ),
+        (
+            "/v1/vector_stores/:id/file_batches/:batch_id/cancel",
+            Family(F::VectorStores),
+        ),
+        (
+            "/v1/vector_stores/:id/file_batches/:batch_id/files",
+            Family(F::VectorStores),
+        ),
         ("/v1/messages", Family(F::Messages)),
         ("/v1/messages/count_tokens", Family(F::CountTokens)),
         ("/v1/rerank", Family(F::Rerank)),

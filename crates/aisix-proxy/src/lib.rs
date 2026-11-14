@@ -195,6 +195,25 @@ pub fn build_router(state: ProxyState) -> Router {
         .route("/v1/uploads/:id/parts", post(native_api::openai_uploads::create_part))
         .route("/v1/uploads/:id/complete", post(native_api::openai_uploads::complete_upload))
         .route("/v1/uploads/:id/cancel", post(native_api::openai_uploads::cancel_upload))
+        .route("/v1/conversations", post(native_api::openai_conversations::create))
+        .route("/v1/conversations/:id", get(native_api::openai_conversations::retrieve).post(native_api::openai_conversations::update).delete(native_api::openai_conversations::delete))
+        .route("/v1/conversations/:id/items", get(native_api::openai_conversations::list_items).post(native_api::openai_conversations::create_items))
+        .route("/v1/conversations/:id/items/:item_id", get(native_api::openai_conversations::retrieve_item).delete(native_api::openai_conversations::delete_item))
+        .route("/v1/containers", post(native_api::openai_containers::create_container).get(native_api::openai_containers::list_containers))
+        .route("/v1/containers/:id", get(native_api::openai_containers::retrieve_container).delete(native_api::openai_containers::delete_container))
+        .route("/v1/containers/:id/files", post(native_api::openai_containers::create_file).get(native_api::openai_containers::list_files))
+        .route("/v1/containers/:id/files/:file_id", get(native_api::openai_containers::retrieve_file).delete(native_api::openai_containers::delete_file))
+        .route("/v1/containers/:id/files/:file_id/content", get(native_api::openai_containers::file_content))
+        .route("/v1/vector_stores", post(native_api::openai_vector_stores::create).get(native_api::openai_vector_stores::list))
+        .route("/v1/vector_stores/:id", get(native_api::openai_vector_stores::get).post(native_api::openai_vector_stores::update).delete(native_api::openai_vector_stores::delete))
+        .route("/v1/vector_stores/:id/search", post(native_api::openai_vector_stores::search))
+        .route("/v1/vector_stores/:id/files", post(native_api::openai_vector_stores::attach_file).get(native_api::openai_vector_stores::list_files))
+        .route("/v1/vector_stores/:id/files/:file_id", get(native_api::openai_vector_stores::get_file).post(native_api::openai_vector_stores::update_file).delete(native_api::openai_vector_stores::detach_file))
+        .route("/v1/vector_stores/:id/files/:file_id/content", get(native_api::openai_vector_stores::file_content))
+        .route("/v1/vector_stores/:id/file_batches", post(native_api::openai_vector_stores::create_batch))
+        .route("/v1/vector_stores/:id/file_batches/:batch_id", get(native_api::openai_vector_stores::get_batch))
+        .route("/v1/vector_stores/:id/file_batches/:batch_id/cancel", post(native_api::openai_vector_stores::cancel_batch))
+        .route("/v1/vector_stores/:id/file_batches/:batch_id/files", get(native_api::openai_vector_stores::batch_files))
         .route("/v1/messages", post(messages::messages))
         .route(
             "/v1/messages/count_tokens",
@@ -482,6 +501,10 @@ fn normalize_endpoint_label(path: &str) -> &'static str {
         "/v1/moderations" => "/v1/moderations",
         "/v1/content_provenance_checks" => "/v1/content_provenance_checks",
         "/v1/uploads" => "/v1/uploads",
+        "/v1/conversations" => "/v1/conversations",
+        "/v1/containers" => "/v1/containers",
+        "/v1/vector_stores" => "/v1/vector_stores",
+
         "/v1/completions" => "/v1/completions",
         "/v1/embeddings" => "/v1/embeddings",
         "/v1/images/generations" => "/v1/images/generations",
@@ -511,6 +534,60 @@ fn normalize_endpoint_label(path: &str) -> &'static str {
                 (Some(id), None, None) if !id.is_empty() => "/v1/chat/completions/:id",
                 (Some(id), Some("messages"), None) if !id.is_empty() => {
                     "/v1/chat/completions/:id/messages"
+                }
+                _ => "other",
+            }
+        }
+        _ if path.starts_with("/v1/conversations/") => {
+            let parts: Vec<_> = path["/v1/conversations/".len()..].split('/').collect();
+            match parts.as_slice() {
+                [id] if !id.is_empty() => "/v1/conversations/:id",
+                [id, "items"] if !id.is_empty() => "/v1/conversations/:id/items",
+                [id, "items", item_id] if !id.is_empty() && !item_id.is_empty() => {
+                    "/v1/conversations/:id/items/:item_id"
+                }
+                _ => "other",
+            }
+        }
+        _ if path.starts_with("/v1/containers/") => {
+            let parts: Vec<_> = path["/v1/containers/".len()..].split('/').collect();
+            match parts.as_slice() {
+                [id] if !id.is_empty() => "/v1/containers/:id",
+                [id, "files"] if !id.is_empty() => "/v1/containers/:id/files",
+                [id, "files", file_id] if !id.is_empty() && !file_id.is_empty() => {
+                    "/v1/containers/:id/files/:file_id"
+                }
+                [id, "files", file_id, "content"] if !id.is_empty() && !file_id.is_empty() => {
+                    "/v1/containers/:id/files/:file_id/content"
+                }
+                _ => "other",
+            }
+        }
+        _ if path.starts_with("/v1/vector_stores/") => {
+            let parts: Vec<_> = path["/v1/vector_stores/".len()..].split('/').collect();
+            match parts.as_slice() {
+                [id] if !id.is_empty() => "/v1/vector_stores/:id",
+                [id, "search"] if !id.is_empty() => "/v1/vector_stores/:id/search",
+                [id, "files"] if !id.is_empty() => "/v1/vector_stores/:id/files",
+                [id, "files", file_id] if !id.is_empty() && !file_id.is_empty() => {
+                    "/v1/vector_stores/:id/files/:file_id"
+                }
+                [id, "files", file_id, "content"] if !id.is_empty() && !file_id.is_empty() => {
+                    "/v1/vector_stores/:id/files/:file_id/content"
+                }
+                [id, "file_batches"] if !id.is_empty() => "/v1/vector_stores/:id/file_batches",
+                [id, "file_batches", batch_id] if !id.is_empty() && !batch_id.is_empty() => {
+                    "/v1/vector_stores/:id/file_batches/:batch_id"
+                }
+                [id, "file_batches", batch_id, "cancel"]
+                    if !id.is_empty() && !batch_id.is_empty() =>
+                {
+                    "/v1/vector_stores/:id/file_batches/:batch_id/cancel"
+                }
+                [id, "file_batches", batch_id, "files"]
+                    if !id.is_empty() && !batch_id.is_empty() =>
+                {
+                    "/v1/vector_stores/:id/file_batches/:batch_id/files"
                 }
                 _ => "other",
             }

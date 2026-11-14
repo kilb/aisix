@@ -71,6 +71,10 @@ pub(crate) const DECISIONS: Surface = Surface::uniform("decisions");
 pub(crate) const REALTIME: Surface = Surface::uniform("realtime");
 pub(crate) const FILES: Surface = Surface::uniform("files");
 pub(crate) const UPLOADS: Surface = Surface::uniform("uploads");
+pub(crate) const CONVERSATIONS: Surface = Surface::uniform("conversations");
+pub(crate) const CONTAINERS: Surface = Surface::uniform("containers");
+pub(crate) const VECTOR_STORES: Surface = Surface::uniform("vector_stores");
+
 pub(crate) const BATCHES: Surface = Surface::uniform("batches");
 pub(crate) const FINE_TUNING: Surface = Surface::uniform("fine_tuning");
 pub(crate) const MCP: Surface = Surface::uniform("mcp");
@@ -146,6 +150,25 @@ pub(crate) fn surface_for_endpoint(endpoint: &str) -> Option<Surface> {
         | "/v1/uploads/:id/parts"
         | "/v1/uploads/:id/complete"
         | "/v1/uploads/:id/cancel" => UPLOADS,
+        "/v1/conversations"
+        | "/v1/conversations/:id"
+        | "/v1/conversations/:id/items"
+        | "/v1/conversations/:id/items/:item_id" => CONVERSATIONS,
+        "/v1/containers"
+        | "/v1/containers/:id"
+        | "/v1/containers/:id/files"
+        | "/v1/containers/:id/files/:file_id"
+        | "/v1/containers/:id/files/:file_id/content" => CONTAINERS,
+        "/v1/vector_stores"
+        | "/v1/vector_stores/:id"
+        | "/v1/vector_stores/:id/search"
+        | "/v1/vector_stores/:id/files"
+        | "/v1/vector_stores/:id/files/:file_id"
+        | "/v1/vector_stores/:id/files/:file_id/content"
+        | "/v1/vector_stores/:id/file_batches"
+        | "/v1/vector_stores/:id/file_batches/:batch_id"
+        | "/v1/vector_stores/:id/file_batches/:batch_id/cancel"
+        | "/v1/vector_stores/:id/file_batches/:batch_id/files" => VECTOR_STORES,
         "/v1/messages" => MESSAGES,
         "/v1/messages/count_tokens" => COUNT_TOKENS,
         "/v1/rerank" => RERANK,
@@ -246,6 +269,52 @@ mod tests {
         ("/v1/uploads/:id/parts", Emits::Usage(UPLOADS)),
         ("/v1/uploads/:id/complete", Emits::Usage(UPLOADS)),
         ("/v1/uploads/:id/cancel", Emits::Usage(UPLOADS)),
+        ("/v1/conversations", Emits::Usage(CONVERSATIONS)),
+        ("/v1/conversations/:id", Emits::Usage(CONVERSATIONS)),
+        ("/v1/conversations/:id/items", Emits::Usage(CONVERSATIONS)),
+        (
+            "/v1/conversations/:id/items/:item_id",
+            Emits::Usage(CONVERSATIONS),
+        ),
+        ("/v1/containers", Emits::Usage(CONTAINERS)),
+        ("/v1/containers/:id", Emits::Usage(CONTAINERS)),
+        ("/v1/containers/:id/files", Emits::Usage(CONTAINERS)),
+        (
+            "/v1/containers/:id/files/:file_id",
+            Emits::Usage(CONTAINERS),
+        ),
+        (
+            "/v1/containers/:id/files/:file_id/content",
+            Emits::Usage(CONTAINERS),
+        ),
+        ("/v1/vector_stores", Emits::Usage(VECTOR_STORES)),
+        ("/v1/vector_stores/:id", Emits::Usage(VECTOR_STORES)),
+        ("/v1/vector_stores/:id/search", Emits::Usage(VECTOR_STORES)),
+        ("/v1/vector_stores/:id/files", Emits::Usage(VECTOR_STORES)),
+        (
+            "/v1/vector_stores/:id/files/:file_id",
+            Emits::Usage(VECTOR_STORES),
+        ),
+        (
+            "/v1/vector_stores/:id/files/:file_id/content",
+            Emits::Usage(VECTOR_STORES),
+        ),
+        (
+            "/v1/vector_stores/:id/file_batches",
+            Emits::Usage(VECTOR_STORES),
+        ),
+        (
+            "/v1/vector_stores/:id/file_batches/:batch_id",
+            Emits::Usage(VECTOR_STORES),
+        ),
+        (
+            "/v1/vector_stores/:id/file_batches/:batch_id/cancel",
+            Emits::Usage(VECTOR_STORES),
+        ),
+        (
+            "/v1/vector_stores/:id/file_batches/:batch_id/files",
+            Emits::Usage(VECTOR_STORES),
+        ),
         ("/v1/messages", Emits::Usage(MESSAGES)),
         ("/v1/messages/count_tokens", Emits::Usage(COUNT_TOKENS)),
         ("/v1/rerank", Emits::Usage(RERANK)),
@@ -465,6 +534,9 @@ mod tests {
             (REALTIME, "realtime"),
             (FILES, "files"),
             (UPLOADS, "uploads"),
+            (CONVERSATIONS, "conversations"),
+            (CONTAINERS, "containers"),
+            (VECTOR_STORES, "vector_stores"),
             (BATCHES, "batches"),
             (FINE_TUNING, "fine_tuning"),
             (MCP, "mcp"),

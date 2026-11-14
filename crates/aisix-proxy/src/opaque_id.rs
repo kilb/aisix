@@ -218,6 +218,11 @@ impl Sealer {
         Self::with_keys(platform.seal_keys().clone(), owner)
     }
 
+    /// 原生归属密钥使用同一派生规则构造游标封装，不改写公开对象 ID。
+    pub(crate) fn from_native_key(key: &[u8; 32], owner: &str) -> Self {
+        Self::with_keys(std::sync::Arc::new(SealKeys::new(&seal_key(key))), owner)
+    }
+
     /// A sealer under keys set up from `key` for this one sealer.
     #[cfg(test)]
     pub(crate) fn new(key: &[u8; 32], owner: &str) -> Self {
