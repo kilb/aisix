@@ -51,7 +51,7 @@ struct Fixture {
     binding: Value,
 }
 
-async fn fixture() -> Fixture {
+async fn fixture(asynchronous: bool) -> Fixture {
     let cp = TestCp::start()
         .await
         .expect("CP_TEST_DATABASE_URL must name the isolated test Postgres server");
@@ -122,6 +122,7 @@ async fn fixture() -> Fixture {
     submission["operation_id"] = json!(Uuid::new_v4());
     submission["kind"] = json!("vector_store_file_batch");
     submission["parent_id"] = json!(parent);
+    submission["asynchronous"] = json!(asynchronous);
     let admission = json!({
         "submission":submission, "owner_parent_record_id":parent,
         "references":[{"record_id":parent,"consumer_family":"vector_stores"}]
@@ -165,7 +166,7 @@ async fn until_waiting_on(pool: &PgPool, blocker: i32, waiter: Option<i32>) -> i
 }
 
 async fn replay_racing_bind(plain: bool) {
-    let f = fixture().await;
+    let f = fixture(false).await;
     let operation = uuid_at(&f.admission["submission"], "operation_id");
     let mut holder =
         f.cp.db()
@@ -278,4 +279,130 @@ async fn related_admission_replay_and_accepted_bind_complete_without_deadlock() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn related_admission_replay_and_plain_accepted_bind_complete_without_deadlock() {
     replay_racing_bind(true).await;
+}
+
+// 首个缺量 receipt 的外键会锁提交；它不能和先锁提交的 bind 形成反序。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn object_metering_receipt_and_accepted_bind_complete_without_foreign_key_deadlock() {
+    let f = fixture(true).await;
+    let operation = uuid_at(&f.admission["submission"], "operation_id");
+    let root =
+        f.dp.send(
+            "POST",
+            "/dp/v1/native-objects/bind",
+            Some(f.binding["binding"].clone()),
+        )
+        .await;
+    assert_eq!(root.status, 200, "{root:?}");
+    let root = uuid_at(&root.body["record"], "record_id");
+    let claim =
+        f.dp.send(
+            "POST",
+            "/dp/v1/native-objects/claim",
+            Some(json!({"limit":1,"record_id":root})),
+        )
+        .await;
+    assert_eq!(claim.status, 200, "{claim:?}");
+    let claimed = claim.body["records"]
+        .as_array()
+        .expect("explicit claimed objects");
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0]["record_id"], json!(root));
+    let generation = claimed[0]["lease_generation"]
+        .as_i64()
+        .expect("an explicit current lease generation");
+
+    let mut holder =
+        f.cp.db()
+            .pool()
+            .begin()
+            .await
+            .expect("begin the receipt checkpoint blocker");
+    let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *holder)
+        .await
+        .expect("the receipt blocker's backend");
+    // 停在已经拿到 lease 对象锁、尚未插入首条计量记录的真实事务边界。
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
+        .bind(format!("native-metering:{}:{operation}", f.cp.env().env_id))
+        .execute(&mut *holder)
+        .await
+        .expect("hold the receipt checkpoint");
+    let dp = f.dp.clone();
+    let meter = tokio::spawn(async move {
+        dp.send(
+            "POST",
+            "/dp/v1/native-objects/reconciliation",
+            Some(json!({
+                "target":{"target":"object","lease":{"record_id":root,"generation":generation}},
+                "reason":"missing_usage", "observed_usage":[]
+            })),
+        )
+        .await
+    });
+    let meter_pid = until_waiting_on(f.cp.db().pool(), holder_pid, None).await;
+    let dp = f.dp.clone();
+    let binding = f.binding.clone();
+    let bind = tokio::spawn(async move { dp.send("POST", RELATED_BIND, Some(binding)).await });
+    until_waiting_on(f.cp.db().pool(), meter_pid, None).await;
+    holder
+        .commit()
+        .await
+        .expect("release the receipt checkpoint");
+    let (metered, bound) = tokio::join!(meter, bind);
+    let metered = metered.expect("the object receipt task");
+    let bound = bound.expect("the accepted binding task");
+    assert_eq!(metered.status, 200, "the first object receipt must survive bind's submission lock: {metered:?}; bind: {bound:?}");
+    assert_eq!(
+        bound.status, 200,
+        "accepted bind must finish after the receipt: {bound:?}"
+    );
+    assert_eq!(metered.body["operation_id"], json!(operation));
+    assert_eq!(metered.body["metering_state"].as_str(), Some("unknown"));
+    assert_eq!(
+        metered.body["reconciliation_reason"].as_str(),
+        Some("missing_usage")
+    );
+    assert_eq!(bound.body["record"]["record_id"], json!(root));
+    let memberships = bound.body["memberships"]
+        .as_array()
+        .expect("explicit accepted memberships");
+    assert_eq!(memberships.len(), 1);
+    assert_eq!(memberships[0]["parent_record_id"], json!(f.parent));
+    assert_eq!(memberships[0]["child_record_id"], json!(root));
+    assert_eq!(memberships[0]["generation"].as_i64(), Some(1));
+    let replayed =
+        f.dp.send("POST", RELATED_BIND, Some(f.binding.clone()))
+            .await;
+    assert_eq!(replayed.status, 200, "{replayed:?}");
+    assert_eq!(replayed.body, bound.body);
+    let stored: (String, Option<String>, i64, Uuid, Value) = sqlx::query_as(
+        "SELECT state,reason,receipt_version,object_id,observed_usage FROM native_metering_records WHERE environment_id=$1 AND operation_id=$2",
+    ).bind(f.cp.env().env_id).bind(operation).fetch_one(f.cp.db().pool()).await.expect("the durable first object receipt");
+    assert_eq!(
+        stored,
+        (
+            "unknown".into(),
+            Some("missing_usage".into()),
+            1,
+            root,
+            json!([])
+        )
+    );
+    let receipts: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM native_metering_receipts WHERE environment_id=$1 AND operation_id=$2",
+    )
+    .bind(f.cp.env().env_id)
+    .bind(operation)
+    .fetch_one(f.cp.db().pool())
+    .await
+    .expect("the immutable receipt count");
+    assert_eq!(receipts, 1);
+    let outbox: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM native_terminal_outbox WHERE object_id=$1")
+            .bind(root)
+            .fetch_one(f.cp.db().pool())
+            .await
+            .expect("unknown usage cannot fabricate a bill");
+    assert_eq!(outbox, 0);
 }
