@@ -592,14 +592,6 @@ async fn prepare_body(
             .await?;
         }
     }
-    if body
-        .pointer("/data_source/input_messages/type")
-        .and_then(Value::as_str)
-        == Some("item_reference")
-    {
-        // 动态轨迹无法在当前投影里逐槽证明引用归属，不能交给共享账号解释。
-        return Err(openai::dependency());
-    }
     for pointer in [
         "/data_source/input_messages/template",
         "/data_source/sampling_params/tools",
