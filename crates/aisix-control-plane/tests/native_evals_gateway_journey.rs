@@ -297,7 +297,42 @@ async fn accepted_eval_survives_real_authority_restart_and_settles_once_after_wi
     let (state_a, mut events_a) = gateway(&cp, &gateway_a, snapshot.clone());
     let (state_b, mut events_b) = gateway(&cp, &gateway_b, projected_snapshot(&cp).await);
     let (status, eval) = send(&state_a, "POST", &format!("/v1/evals?model={MODEL_NAME}"), &bearer, Some(json!({"name":"classification","data_source_config":{"type":"custom","item_schema":{"type":"object","properties":{"answer":{"type":"string"}}}},"testing_criteria":[{"type":"string_check","name":"match","input":"{{sample.output_text}}","reference":"{{item.answer}}","operation":"eq"}]}))).await;
-    assert_eq!(status, StatusCode::OK, "{eval}");
+    let creation_diagnostics = if status != StatusCode::OK {
+        let provider_posts = provider
+            .state
+            .requests
+            .lock()
+            .expect("request list")
+            .iter()
+            .filter(|(method, _)| method == "POST")
+            .count();
+        let counts: Option<(i64, i64)> = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM native_operations WHERE environment_id=$1), \
+             (SELECT count(*) FROM native_objects WHERE environment_id=$1)",
+        )
+        .bind(cp.env().env_id)
+        .fetch_one(cp.db().pool())
+        .await
+        .ok();
+        // 只输出固定枚举和聚合数量，不输出标识、提交正文或凭据。
+        let operations: Option<Vec<(String, String, i64)>> = sqlx::query_as(
+            "SELECT CASE state WHEN 'pending_submission' THEN 'pending_submission' \
+             WHEN 'bound' THEN 'bound' WHEN 'uncertain' THEN 'uncertain' ELSE 'other' END, \
+             CASE submission#>>'{origin,surface}' WHEN 'objects' THEN 'objects' \
+             WHEN 'responses' THEN 'responses' WHEN 'messages' THEN 'messages' \
+             WHEN 'chat_completions' THEN 'chat_completions' ELSE 'missing_or_other' END, \
+             count(*) FROM native_operations WHERE environment_id=$1 \
+             GROUP BY 1,2 ORDER BY 1,2 LIMIT 8",
+        )
+        .bind(cp.env().env_id)
+        .fetch_all(cp.db().pool())
+        .await
+        .ok();
+        format!("provider_posts={provider_posts}, native_operation_object_counts={counts:?}, operation_state_origin_surface_counts={operations:?}")
+    } else {
+        String::new()
+    };
+    assert_eq!(status, StatusCode::OK, "{creation_diagnostics}");
     assert_eq!(eval.get("id"), Some(&json!(EVAL)));
     let (status, run) = send(&state_a, "POST", &format!("/v1/evals/{EVAL}/runs"), &bearer, Some(json!({"data_source":{"type":"completions","model":MODEL_NAME,"input_messages":{"type":"template","template":[{"role":"user","content":"Reply yes"}]},"source":{"type":"file_content","content":[{"item":{"answer":"yes"}}]}}}))).await;
     assert_eq!(status, StatusCode::OK, "{run}");
