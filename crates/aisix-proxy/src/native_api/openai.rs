@@ -79,6 +79,25 @@ pub(crate) fn model_entry_by_id(
     Ok(entry)
 }
 
+/// 已接受任务只按稳定身份恢复原账号；同一身份存在多份当前配置时拒绝猜选。
+pub(crate) fn provider_entry_by_id(
+    state: &ProxyState,
+    snapshot: &AisixSnapshot,
+    id: Uuid,
+) -> Result<Arc<aisix_core::ResourceEntry<aisix_core::ProviderKey>>, ProxyError> {
+    let registry = registry(state)?;
+    let mut matching = snapshot
+        .provider_keys
+        .entries()
+        .into_iter()
+        .filter(|entry| registry.resource_id("provider_keys", &entry.id).ok() == Some(id));
+    let entry = matching.next().ok_or_else(not_found)?;
+    if matching.next().is_some() {
+        return Err(not_found());
+    }
+    Ok(entry)
+}
+
 fn native_protocol(state: &ProxyState, key: &aisix_core::ProviderKey) -> bool {
     crate::dispatch::resolve_bridge(&state.hub, key).map_or_else(
         || aisix_gateway::hub::upstream_protocol(key) == "openai",
