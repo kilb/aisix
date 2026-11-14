@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
 use aisix_core::models::EndpointFamily;
+use aisix_core::native_metering::{MeteringTarget, ReconciliationReason, ReconciliationRequest};
 use aisix_core::native_objects::*;
 use axum::extract::{OriginalUri, RawQuery, State};
 use axum::http::Method;
@@ -340,8 +341,22 @@ async fn dispatch(
         },
     )
     .await?;
-    let value: Value =
-        serde_json::from_slice(&reply.bytes).map_err(|_| openai::invalid_identity())?;
+    let paid_operation = registration.filter(|_| kind == NativeObjectKind::EvalRun);
+    if let Some(operation) = paid_operation {
+        // 供应商已接受运行；本地后续失败不能把它登记成终态零消耗。
+        *stage = InferenceStage::Accepted;
+        audit.registered_operation(operation, *stage);
+    }
+    let value: Value = match serde_json::from_slice(&reply.bytes) {
+        Ok(value) => value,
+        Err(_) => {
+            if let Some(operation) = paid_operation {
+                submission_uncertain(state, auth, operation).await?;
+            }
+            return Err(openai::invalid_identity());
+        }
+    };
+    let mut accepted_record = None;
     if *method == Method::DELETE {
         let identity_field = if kind == NativeObjectKind::Eval {
             "eval_id"
@@ -360,23 +375,33 @@ async fn dispatch(
             check_identity(&value, kind, &record.raw_id, eval_id, run_id)?;
         }
         if let Some(operation) = registration {
-            let raw = value
-                .get("id")
-                .and_then(Value::as_str)
-                .ok_or_else(openai::invalid_identity)?;
-            check_identity(&value, kind, raw, eval_id, run_id)?;
-            bind(
-                state,
-                auth,
-                operation,
-                &origin,
-                kind,
-                parent.as_ref(),
-                &value,
-            )
-            .await?;
-            if kind == NativeObjectKind::EvalRun {
-                *stage = InferenceStage::Accepted;
+            let binding = async {
+                let raw = value
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(openai::invalid_identity)?;
+                check_identity(&value, kind, raw, eval_id, run_id)?;
+                bind(
+                    state,
+                    auth,
+                    operation,
+                    &origin,
+                    kind,
+                    parent.as_ref(),
+                    &value,
+                )
+                .await
+            }
+            .await;
+            match binding {
+                Ok(record) if paid_operation.is_some() => accepted_record = Some(record),
+                Ok(_) => {}
+                Err(error) => {
+                    if paid_operation.is_some() {
+                        submission_uncertain(state, auth, operation).await?;
+                    }
+                    return Err(error);
+                }
             }
         }
     }
@@ -390,10 +415,51 @@ async fn dispatch(
         }
     }
     audit.output(state, auth, &target, &reply.bytes).await?;
+    if let Some(bound) = accepted_record {
+        // 已绑定运行仍交由后台观察；只有当前可见性再次通过后才能释放标识。
+        let (_, current_origin, current) = openai::lookup_management(
+            state,
+            auth,
+            client,
+            &bound.raw_id,
+            NativeObjectKind::EvalRun,
+            bound.parent_id,
+        )
+        .await?;
+        if current.record_id != bound.record_id || current_origin != origin {
+            return Err(missing());
+        }
+        authorize_entries(state, auth, client, &current, &current_origin)?;
+    }
     Ok((
         openai::raw_body(reply.status, &reply.headers, reply.bytes),
         target,
     ))
+}
+
+async fn submission_uncertain(
+    state: &ProxyState,
+    auth: &AuthenticatedKey,
+    operation_id: Uuid,
+) -> Result<(), ProxyError> {
+    let reply = openai::registry(state)?
+        .mark_reconciliation(ReconciliationRequest {
+            target: MeteringTarget::Operation {
+                operation_id,
+                api_key_id: openai::api_key_id(auth)?,
+            },
+            terminal_status: None,
+            reason: ReconciliationReason::UncertainSubmission,
+            observed_usage: Vec::new(),
+            raw_usage: None,
+            artifacts: Vec::new(),
+        })
+        .await
+        .map_err(openai::registry_error)?;
+    if reply.state != "reconciliation" {
+        return Err(openai::dependency());
+    }
+    Ok(())
 }
 
 fn authorize_entries(
