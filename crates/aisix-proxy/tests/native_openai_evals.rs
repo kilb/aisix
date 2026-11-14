@@ -871,10 +871,10 @@ fn seed_owned_file(registry: &Registry, raw_id: &str) {
 }
 
 #[tokio::test]
-async fn explicit_item_trajectory_preserves_wire_and_checks_every_rows_references() {
+async fn explicit_item_trajectory_preserves_official_messages_and_opaque_dataset_fields() {
     let upstream = MockServer::start().await;
     let registry = Arc::new(Registry::default());
-    let state = test_state(&upstream.uri(), registry.clone());
+    let state = test_state(&upstream.uri(), registry);
     mount(
         &upstream,
         "POST",
@@ -883,7 +883,6 @@ async fn explicit_item_trajectory_preserves_wire_and_checks_every_rows_reference
     )
     .await;
     create_eval(&state).await;
-    seed_owned_file(&registry, "file_owned");
     mount(
         &upstream,
         "POST",
@@ -891,14 +890,14 @@ async fn explicit_item_trajectory_preserves_wire_and_checks_every_rows_reference
         json!({"id":"run_owned","eval_id":"eval_owned","object":"eval.run","status":"queued"}),
     )
     .await;
-    let trajectory =
-        json!([{"role":"user","content":[{"type":"input_file","file_id":"file_owned"}]}]);
     let mut body = run_body();
     body["data_source"]["type"] = json!("responses");
     body["data_source"]["input_messages"] =
         json!({"type":"item_reference","item_reference":"item.input_trajectory"});
-    body["data_source"]["source"] =
-        json!({"type":"file_content","content":[{"item":{"input_trajectory":trajectory}}]});
+    body["data_source"]["source"] = json!({"type":"file_content","content":[
+        {"item":{"answer":"yes","file_id":"file_foreign","input_trajectory":[{"role":"user","content":"Reply yes"}]}},
+        {"item":{"answer":"yes","metadata":{"file_id":"file_foreign"},"input_trajectory":[{"role":"assistant","content":[{"type":"output_text","text":"yes"}]},{"role":"user","content":[{"type":"input_text","text":"Repeat yes"}]}]}}
+    ]});
     decoded(
         call(
             &state,
@@ -918,29 +917,13 @@ async fn explicit_item_trajectory_preserves_wire_and_checks_every_rows_reference
         body["data_source"]["input_messages"]
     );
     assert_eq!(wire["data_source"]["source"], body["data_source"]["source"]);
-    let before = requests.len();
-    body["data_source"]["source"]["content"].as_array_mut().unwrap().push(json!({"item":{"input_trajectory":[{"role":"user","content":[{"type":"input_file","file_id":"file_foreign"}]}]}}));
-    assert_eq!(
-        call(
-            &state,
-            "POST",
-            "/v1/evals/eval_owned/runs",
-            "caller",
-            Some(body)
-        )
-        .await
-        .status(),
-        StatusCode::NOT_FOUND
-    );
-    assert_eq!(
-        upstream.received_requests().await.unwrap().len(),
-        before,
-        "a foreign reference in the last dataset row must fail before submission"
-    );
+    assert_eq!(requests.len(), 2, "opaque dataset fields are data; only definition creation and run submission may reach the provider");
+    assert_eq!(requests[1].method, "POST");
+    assert_eq!(requests[1].url.path(), "/v1/evals/eval_owned/runs");
 }
 
 #[tokio::test]
-async fn item_trajectory_in_owned_jsonl_is_checked_before_the_run_is_submitted() {
+async fn item_trajectory_uses_owned_jsonl_and_rejects_foreign_source_before_dispatch() {
     let upstream = MockServer::start().await;
     let registry = Arc::new(Registry::default());
     let state = test_state(&upstream.uri(), registry.clone());
@@ -953,18 +936,45 @@ async fn item_trajectory_in_owned_jsonl_is_checked_before_the_run_is_submitted()
     .await;
     create_eval(&state).await;
     seed_owned_file(&registry, "file_dataset");
-    seed_owned_file(&registry, "file_owned");
-    let dataset = json!({"item":{"input_trajectory":[{"role":"user","content":[{"type":"input_file","file_id":"file_foreign"}]}]}}).to_string()+"\n";
-    Mock::given(method("GET"))
-        .and(path("/v1/files/file_dataset/content"))
-        .respond_with(ResponseTemplate::new(200).set_body_raw(dataset, "application/jsonl"))
-        .mount(&upstream)
-        .await;
+    mount(
+        &upstream,
+        "POST",
+        "/v1/evals/eval_owned/runs",
+        json!({"id":"run_owned","eval_id":"eval_owned","object":"eval.run","status":"queued"}),
+    )
+    .await;
     let mut body = run_body();
     body["data_source"]["type"] = json!("responses");
     body["data_source"]["input_messages"] =
         json!({"type":"item_reference","item_reference":"item.input_trajectory"});
     body["data_source"]["source"] = json!({"type":"file_id","id":"file_dataset"});
+    decoded(
+        call(
+            &state,
+            "POST",
+            "/v1/evals/eval_owned/runs",
+            "caller",
+            Some(body.clone()),
+        )
+        .await,
+        StatusCode::OK,
+    )
+    .await;
+    let requests = upstream.received_requests().await.unwrap();
+    assert_eq!(
+        requests.len(),
+        2,
+        "owned source files are admitted without reinterpreting their opaque dataset contents"
+    );
+    assert_eq!(requests[1].method, "POST");
+    assert_eq!(requests[1].url.path(), "/v1/evals/eval_owned/runs");
+    let wire: Value = serde_json::from_slice(&requests[1].body).unwrap();
+    assert_eq!(
+        wire["data_source"]["input_messages"],
+        body["data_source"]["input_messages"]
+    );
+    assert_eq!(wire["data_source"]["source"], body["data_source"]["source"]);
+    body["data_source"]["source"]["id"] = json!("file_foreign");
     assert_eq!(
         call(
             &state,
@@ -977,13 +987,7 @@ async fn item_trajectory_in_owned_jsonl_is_checked_before_the_run_is_submitted()
         .status(),
         StatusCode::NOT_FOUND
     );
-    let requests = upstream.received_requests().await.unwrap();
-    assert_eq!(
-        requests.len(),
-        2,
-        "only owned dataset content may be read after definition creation"
-    );
-    assert_eq!(requests[1].url.path(), "/v1/files/file_dataset/content");
+    assert_eq!(upstream.received_requests().await.unwrap().len(), requests.len(), "the protocol-defined source file slot remains subject to current ownership before dispatch");
 }
 
 #[tokio::test]
