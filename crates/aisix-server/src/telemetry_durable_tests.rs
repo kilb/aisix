@@ -7,6 +7,10 @@ fn durable_test_event() -> UsageEvent {
     }
 }
 
+fn durable_test_envelope(event: &UsageEvent) -> aisix_obs::usage::DurableUsageEvent {
+    aisix_obs::usage::DurableUsageEvent::from_event(event).unwrap()
+}
+
 async fn durable_stop_worker(stop: watch::Sender<bool>, worker: tokio::task::JoinHandle<()>) {
     stop.send(true).unwrap();
     tokio::time::timeout(Duration::from_secs(3), worker)
@@ -60,7 +64,10 @@ async fn durable_delivery_waits_for_control_plane_receipt() {
         Metrics::new(false),
         cancel,
     );
-    let delivery = tokio::spawn(async move { sink.emit_durable(durable_test_event()).await });
+    let delivery = tokio::spawn(async move {
+        sink.emit_durable(durable_test_envelope(&durable_test_event()))
+            .await
+    });
     tokio::time::timeout(Duration::from_secs(3), arrived.notified())
         .await
         .expect("the durable event must reach the transport before it can be acknowledged");
@@ -117,7 +124,9 @@ async fn durable_delivery_requires_an_explicit_complete_receipt() {
             Metrics::new(false),
             cancel,
         );
-        let result = sink.emit_durable(durable_test_event()).await;
+        let result = sink
+            .emit_durable(durable_test_envelope(&durable_test_event()))
+            .await;
         assert!(
             result.is_err(),
             "a refused or unconfirmed row stays in its durable outbox: {answer:?}"
@@ -154,9 +163,10 @@ async fn durable_delivery_preserves_event_and_batch_identity_across_retries() {
     );
     let event = durable_test_event();
     let expected = serde_json::to_value(&event).unwrap();
-    assert!(sink.emit_durable(event.clone()).await.is_err());
-    assert!(sink.emit_durable(event.clone()).await.is_ok());
-    assert!(sink.emit_durable(event).await.is_ok());
+    let canonical = durable_test_envelope(&event);
+    assert!(sink.emit_durable(canonical.clone()).await.is_err());
+    assert!(sink.emit_durable(canonical.clone()).await.is_ok());
+    assert!(sink.emit_durable(canonical).await.is_ok());
     let recorded = posts.lock().unwrap().clone();
     assert_eq!(recorded.len(), 3);
     assert_eq!(recorded[0].0, recorded[1].0);
@@ -177,7 +187,10 @@ async fn durable_delivery_worker_abort_cannot_confirm_an_inflight_event() {
         Metrics::new(false),
         cancel,
     );
-    let delivery = tokio::spawn(async move { sink.emit_durable(durable_test_event()).await });
+    let delivery = tokio::spawn(async move {
+        sink.emit_durable(durable_test_envelope(&durable_test_event()))
+            .await
+    });
     tokio::time::timeout(Duration::from_secs(3), arrived.notified())
         .await
         .expect("the worker must hold a real unconfirmed transport attempt");
