@@ -21,6 +21,7 @@ use axum::extract::State;
 use axum::http::{Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
+use http_body_util::{BodyExt, Limited};
 use native_gateway::{projected_snapshot, HttpRegistry};
 use serde_json::{json, Value};
 use support::members::MemberSession;
@@ -268,11 +269,17 @@ struct Reply {
     bytes: Vec<u8>,
 }
 
-async fn read(response: Response) -> Reply {
+async fn read<B>(response: http::Response<B>) -> Reply
+where
+    B: http_body::Body<Data = bytes::Bytes>,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
     let status = response.status();
-    let bytes = to_bytes(response.into_body(), 2 << 20)
+    let bytes = Limited::new(response.into_body(), 2 << 20)
+        .collect()
         .await
         .expect("the complete response body")
+        .to_bytes()
         .to_vec();
     let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     Reply {
@@ -368,9 +375,11 @@ async fn scrape(state: &ProxyState) -> String {
     .expect("the production metrics handler answers");
     assert_eq!(response.status(), StatusCode::OK);
     String::from_utf8(
-        to_bytes(response.into_body(), 8 << 20)
+        Limited::new(response.into_body(), 8 << 20)
+            .collect()
             .await
             .expect("the metrics exposition")
+            .to_bytes()
             .to_vec(),
     )
     .expect("UTF-8 Prometheus text")
