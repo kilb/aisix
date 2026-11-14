@@ -602,6 +602,146 @@ async fn dynamically_authorized_asr_entries_survive_revocation_without_using_the
     );
 }
 
+async fn assert_secondary_asr_revocation(f: &Fixture, reuse_entry: bool) {
+    let asr=f.cp.send("POST","/admin/resources/models",Some(f.admin.cookie()),Some(json!({"doc":{
+        "display_name":"realtime-revoked-asr-model","provider":"openai","model_name":"gpt-4o-mini-transcribe",
+        "provider_key_id":f.provider
+    }}))).await;
+    assert_eq!(asr.status, 201, "{asr:?}");
+    let asr = id(&asr.body, "/id");
+    grant(&f.cp, &f.admin, f.tenant, &[f.model, asr]).await;
+    support::world::price(&f.cp, asr).await;
+    let (accepted, session) = create(&f.dp, &f.template, None).await;
+    let entry = json!({"entry_id":"asr.before.revoke","endpoint":"/v1/audio/transcriptions",
+        "requested_model_id":asr,"requested_model":"realtime-revoked-asr-model","model_id":asr,
+        "upstream_model":"gpt-4o-mini-transcribe","upstream_provider":"openai"});
+    let checkpoint = json!({"lease":session["lease"],"coverage":"partial","entries":[entry]});
+    let registered = post(&f.dp, "live/checkpoint", checkpoint.clone()).await;
+    assert_eq!(registered.status, 200, "{registered:?}");
+    assert_eq!(registered.body["live_session"]["state"], "live");
+    assert_eq!(
+        registered.body["live_session"].get("requires_stop"),
+        Some(&json!(false))
+    );
+
+    grant(&f.cp, &f.admin, f.tenant, &[f.model]).await;
+    let grants: Vec<Uuid> = sqlx::query_scalar("SELECT allowed_model_ids FROM tenants WHERE id=$1")
+        .bind(f.tenant)
+        .fetch_one(f.cp.db().pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        grants,
+        vec![f.model],
+        "only the secondary ASR grant was withdrawn"
+    );
+    begin(&f.dp, &f.template).await;
+
+    let checkpoint = if reuse_entry {
+        checkpoint
+    } else {
+        json!({"lease":session["lease"],"coverage":"partial"})
+    };
+    let checked = post(&f.dp, "live/checkpoint", checkpoint).await;
+    if reuse_entry && checked.status == 404 {
+        assert_eq!(
+            checked.body.get("code"),
+            Some(&json!("not_found")),
+            "{checked:?}"
+        );
+    } else {
+        assert_eq!(
+            checked.status, 200,
+            "an observer must receive an actionable verdict: {checked:?}"
+        );
+        assert_eq!(
+            checked.body["live_session"].get("requires_stop"),
+            Some(&json!(true)),
+            "withdrawing ASR alone must prevent continued inference: {checked:?}"
+        );
+        assert_eq!(checked.body["live_session"]["state"], "requires_stop");
+        assert_eq!(checked.body["live_session"]["coverage"], "unknown");
+        assert_eq!(
+            checked.body["live_session"]["deadline_at"],
+            session["deadline_at"]
+        );
+    }
+
+    let mut tail = usage(
+        &accepted,
+        &session,
+        "revoked.asr.tail",
+        "revoked.asr.item:0",
+    );
+    tail["coverage"] = json!("partial");
+    tail["usage"][0]["entry_id"] = json!("asr.before.revoke");
+    tail["usage"][0]["meter"]["usage"]["entry_id"] = json!("asr.before.revoke");
+    tail["usage"][0]["upstream_model"] = json!("gpt-4o-mini-transcribe");
+    let appended = post(&f.dp, "live/append", tail.clone()).await;
+    assert_eq!(
+        appended.status, 200,
+        "accepted ASR work remains billable: {appended:?}"
+    );
+    assert_eq!(appended.body.get("appended"), Some(&json!(true)));
+    for event in ["revoked.asr.tail", "revoked.asr.tail.redelivery"] {
+        tail["event_id"] = json!(event);
+        let repeated = post(&f.dp, "live/append", tail.clone()).await;
+        assert_eq!(repeated.status, 200, "{repeated:?}");
+        assert_eq!(repeated.body.get("appended"), Some(&json!(false)));
+    }
+    let closed = post(
+        &f.dp,
+        "live/checkpoint",
+        json!({"lease":session["lease"],
+        "coverage":"unknown","terminal":true}),
+    )
+    .await;
+    assert_eq!(closed.status, 200, "cleanup remains reachable: {closed:?}");
+    assert_eq!(closed.body["live_session"]["state"], "closed");
+    assert_eq!(
+        closed.body["live_session"]["accounting_state"],
+        "awaiting_reconciliation"
+    );
+    let event: Value = sqlx::query_scalar("SELECT event FROM native_live_outbox outbox JOIN native_live_journal journal ON journal.id=outbox.journal_id WHERE journal.operation_id=$1")
+        .bind(id(&accepted,"/operation_id")).fetch_one(f.cp.db().pool()).await.unwrap();
+    assert_eq!(event.get("model_id"), Some(&json!(asr)));
+    assert_eq!(event.get("requested_model_id"), Some(&json!(asr)));
+    assert_eq!(
+        event.get("upstream_model"),
+        Some(&json!("gpt-4o-mini-transcribe"))
+    );
+    assert_eq!(event.get("operation"), Some(&json!("transcription")));
+    assert_eq!(event.get("prompt_tokens"), Some(&json!(10)));
+    assert_eq!(event.get("cached_prompt_tokens"), Some(&json!(2)));
+    assert_eq!(event.get("completion_tokens"), Some(&json!(3)));
+    assert_eq!(event.get("total_tokens"), Some(&json!(13)));
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let delivered: i64 = sqlx::query_scalar("SELECT count(*) FROM native_live_outbox outbox JOIN native_live_journal journal ON journal.id=outbox.journal_id JOIN billing_ledger_cny ledger ON ledger.event_id=outbox.event_id::text WHERE journal.operation_id=$1")
+                .bind(id(&accepted,"/operation_id")).fetch_one(f.cp.db().pool()).await.unwrap();
+            if delivered == 1 { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }).await.expect("accepted ASR tail must reach the real billing ledger after model revocation");
+    let counts: (i64, i64, i64, i64) = sqlx::query_as("SELECT (SELECT count(*) FROM native_live_journal WHERE operation_id=$1), (SELECT count(*) FROM native_live_outbox outbox JOIN native_live_journal journal ON journal.id=outbox.journal_id WHERE journal.operation_id=$1), count(*), COALESCE(sum(-ledger.amount_micro_cny),0)::bigint FROM native_live_outbox outbox JOIN native_live_journal journal ON journal.id=outbox.journal_id JOIN billing_ledger_cny ledger ON ledger.event_id=outbox.event_id::text WHERE journal.operation_id=$1")
+        .bind(id(&accepted,"/operation_id")).fetch_one(f.cp.db().pool()).await.unwrap();
+    assert_eq!(counts, (1, 1, 1, 15), "one accepted ASR tail, one outbox event and one debit; the unpriced main model cannot substitute");
+}
+
+// 主模型仍可 begin；只撤 ASR 授权也必须停止会话，尾量仍按接受时的 ASR 身份入账一次。
+#[tokio::test]
+async fn heartbeat_after_asr_model_revocation_requires_stop_and_bills_tail_once() {
+    let Some(f) = fixture().await else { return };
+    assert_secondary_asr_revocation(&f, false).await;
+}
+
+// 相同 entry 的幂等重放不是继续推理的授权，不能绕过撤权检查。
+#[tokio::test]
+async fn reused_asr_entry_after_model_revocation_requires_stop_and_bills_tail_once() {
+    let Some(f) = fixture().await else { return };
+    assert_secondary_asr_revocation(&f, true).await;
+}
+
 // 删除 journal 永久身份，会在普通 usage 保留期结束后重新插入并重新计价。
 #[tokio::test]
 async fn live_outbox_uses_the_normal_intake_and_permanent_dedup_survives_usage_retention() {
