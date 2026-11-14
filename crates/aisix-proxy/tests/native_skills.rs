@@ -1253,3 +1253,29 @@ async fn cached_message_cannot_skip_a_new_private_reference_override() {
     assert!(!body.contains("container_foreign"));
     assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn batch_input_does_not_export_a_foreign_skill_to_the_shared_account() {
+    let upstream = MockServer::start().await;
+    mount_json(&upstream,"POST","/v1/files",json!({"id":"file_leaked_batch","object":"file","purpose":"batch","filename":"batch.jsonl","bytes":512,"created_at":1793491200,"status":"processed"})).await;
+    let (router, _) = app("openai", &upstream.uri(), Arc::new(Registry::default()));
+    let input = json!({"custom_id":"skill-batch","method":"POST","url":"/v1/responses","body":{"model":"native-model","tools":[{"type":"shell","environment":{"type":"container_auto","skills":[{"type":"skill_reference","skill_id":"skill_foreign","version":"1"}]}}],"input":"Use the private skill"}}).to_string()+"\n";
+    let response = request(
+        router,
+        "openai",
+        "POST",
+        "/v1/files",
+        "caller",
+        Some(form(&[
+            ("purpose", None, b"batch"),
+            ("file", Some("batch.jsonl"), input.as_bytes()),
+        ])),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(!answer(response)
+        .await
+        .to_string()
+        .contains("file_leaked_batch"));
+    assert!(upstream.received_requests().await.unwrap().is_empty());
+}
