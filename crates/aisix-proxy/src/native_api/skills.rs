@@ -1571,6 +1571,30 @@ pub(crate) fn validate_message_reference_overrides(
     ))
 }
 
+pub(crate) fn message_container_requested(body: &Value) -> bool {
+    body.get("container").is_some_and(|value| !value.is_null())
+        || body
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| {
+                tools.iter().any(|tool| {
+                    tool.get("type")
+                        .and_then(Value::as_str)
+                        .is_some_and(|kind| kind.starts_with("code_execution_"))
+                })
+            })
+}
+
+pub(crate) fn message_overrides_affect_container(key: &aisix_core::ProviderKey) -> bool {
+    key.request.as_ref().is_some_and(|request| {
+        request
+            .param_renames
+            .iter()
+            .any(|(from, to)| from == "container" || to == "container")
+            || request.default_body_fields.contains_key("container")
+    })
+}
+
 /// 缓存命中没有选中的目标；有潜在引用注入的配置走正常派发及逐目标拒绝。
 pub(crate) fn messages_overrides_allow_cache(
     snapshot: &AisixSnapshot,
@@ -1582,13 +1606,12 @@ pub(crate) fn messages_overrides_allow_cache(
         let Ok(key) = crate::dispatch::resolve_provider_key(snapshot, model) else {
             return true;
         };
-        let Some(request) = key.value.request.as_ref().filter(|request| {
-            request
-                .param_renames
-                .iter()
-                .any(|(from, to)| from == "container" || to == "container")
-                || request.default_body_fields.contains_key("container")
-        }) else {
+        let Some(request) = key
+            .value
+            .request
+            .as_ref()
+            .filter(|_| message_overrides_affect_container(&key.value))
+        else {
             return true;
         };
         let mut outbound = body.clone();
@@ -1660,18 +1683,7 @@ pub(crate) async fn admit_messages_dispatch(
     direct_model: &str,
     expected: Option<&OriginBinding>,
 ) -> Result<Option<Arc<MessageContainerAdmission>>, ProxyError> {
-    let needs_container = body.get("container").is_some_and(|value| !value.is_null())
-        || body
-            .get("tools")
-            .and_then(Value::as_array)
-            .is_some_and(|tools| {
-                tools.iter().any(|tool| {
-                    tool.get("type")
-                        .and_then(Value::as_str)
-                        .is_some_and(|kind| kind.starts_with("code_execution_"))
-                })
-            });
-    if !needs_container {
+    if !message_container_requested(body) {
         return Ok(None);
     }
     let expected = expected.ok_or_else(openai::dependency)?;
