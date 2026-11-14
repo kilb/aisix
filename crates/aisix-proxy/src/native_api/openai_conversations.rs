@@ -184,6 +184,19 @@ pub(crate) async fn admit_items(
 ) -> Result<Vec<AcceptedReference>, ProxyError> {
     let mut checked = json!({"input":body.get("items").cloned().unwrap_or(Value::Null)});
     let mut references = Vec::new();
+    // 仅在items协议槽补齐可省略或为null的type，业务JSON的id不作引用。
+    if let Some(items) = checked["input"].as_array_mut() {
+        for item in items {
+            if matches!(item.get("type"), None | Some(Value::Null))
+                && crate::opaque_id::is_item_reference(item)
+            {
+                if let Some(raw) = item.get("id").and_then(Value::as_str) {
+                    references.push((NativeObjectKind::ResponseItem, raw.to_owned()));
+                    item["id"] = Value::Null;
+                }
+            }
+        }
+    }
     take_references(&mut checked["input"], &mut references);
     crate::stored_refs::refuse_in_responses_with_background(state.platform(), &checked, true)
         .map_err(|error| match error {

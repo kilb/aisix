@@ -260,6 +260,7 @@ pub(crate) async fn create_container(
         let (target, origin) =
             openai::resolve_management(&state, &snapshot, &auth, &client, &wanted, CONTAINER)?;
         audit.resolved(&target);
+        crate::budget::gate(&state, &snapshot).check_provider_key(&target.pk_entry.id)?;
         let references = create_references(&state, &auth, &client, &body, &origin).await?;
         let _quota = crate::jobs::reserve_target(&state, &snapshot, &auth, &target).await?;
         let bytes = Bytes::from(body.to_string());
