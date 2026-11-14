@@ -94,6 +94,8 @@ function PriceCatalog({ quote, groupId, onGroupChange }: { quote: PriceQuoteList
   const table = useRecordTable({ items: models, searchText: searchModel, resetKey: groupId });
   const [tier, setTier] = useState("default");
   const tiers = [...new Set(models.flatMap((model) => model.groups.flatMap((group) => Object.keys(group.quote.prices_by_tier))))].sort((a, b) => (a === "default" ? -1 : b === "default" ? 1 : a.localeCompare(b)));
+  // 保留用户偏好；当前分组不支持时，选择框与报价共同显示标准档。
+  const effectiveTier = tiers.includes(tier) ? tier : "default";
   return <>
     <RecordTableToolbar search={{ value: table.query, onChange: table.setQuery, label: "搜索模型价格", placeholder: "模型名、分组或说明" }}>
       <label className="price-group-filter">分组筛选
@@ -102,7 +104,7 @@ function PriceCatalog({ quote, groupId, onGroupChange }: { quote: PriceQuoteList
           {quote.groups.map((group) => <option key={group.id} value={group.id}>{group.display_name}</option>)}
         </select>
       </label>
-      <label className="price-group-filter">服务档位<select aria-label="服务档位" value={tier} onChange={(event) => setTier(event.target.value)}><option value="default">标准</option>{tiers.filter((value) => value !== "default").map((value) => <option key={value} value={value}>{tierName(value)}</option>)}</select></label>
+      <label className="price-group-filter">服务档位<select aria-label="服务档位" value={effectiveTier} onChange={(event) => setTier(event.target.value)}><option value="default">标准</option>{tiers.filter((value) => value !== "default").map((value) => <option key={value} value={value}>{tierName(value)}</option>)}</select></label>
     </RecordTableToolbar>
     {table.rows.length === 0 ? <EmptyState text={table.query || groupId ? "没有符合筛选条件的模型价格。" : "当前分组暂时没有可计价的模型。"} mark="route" /> : <>
       <div className="price-catalog" role="region" aria-label="模型价格"><DataTable label="模型单价">
@@ -110,7 +112,7 @@ function PriceCatalog({ quote, groupId, onGroupChange }: { quote: PriceQuoteList
           {Array.from({ length: 4 }, (_, index) => <col key={index} className="price-summary-amount" />)}
         </colgroup>
         <thead><tr><th>模型 / 分组</th><th className="num">倍率</th><th className="num">输入</th><th className="num">输出</th><th className="num">缓存读</th><th className="num">缓存写</th></tr></thead>
-        {table.rows.map((model) => <ModelRows key={model.model_id} model={model} tier={tier} discountBps={quote.discount_bps} />)}
+        {table.rows.map((model) => <ModelRows key={model.model_id} model={model} tier={effectiveTier} discountBps={quote.discount_bps} />)}
       </DataTable></div>
     </>}
     <RecordTablePager page={table.page} pageSize={table.pageSize} onPageChange={table.setPage} onPageSizeChange={table.setPageSize} total={table.filteredCount} label="模型价格分页" />
