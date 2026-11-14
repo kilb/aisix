@@ -101,6 +101,26 @@ fn same_account(parent: &ObjectRow, child: &ObjectRow) -> bool {
         && parent.boundary == child.boundary
 }
 
+async fn child_visible(
+    conn: &mut PgConnection,
+    state: &AppState,
+    caller: &Principal,
+    parent: &ObjectRow,
+    child: &ObjectRow,
+    requested: Option<EndpointFamily>,
+) -> Result<bool, ApiError> {
+    let consumer = match child_consumer(parent, child, requested) {
+        Ok(consumer) => consumer,
+        Err(error) if error.status == axum::http::StatusCode::NOT_FOUND => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    match authorized_for_consumer(conn, state, caller, child, consumer).await {
+        Ok(()) => Ok(true),
+        Err(error) if error.status == axum::http::StatusCode::NOT_FOUND => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 async fn lock_operation(
     conn: &mut PgConnection,
     state: &AppState,
@@ -119,12 +139,14 @@ async fn reservation(
     conn: &mut PgConnection,
     state: &AppState,
     operation_id: Uuid,
+    lock: bool,
 ) -> Result<Option<ReservationRow>, ApiError> {
-    sqlx::query_as(
+    sqlx::query_as(&format!(
         "SELECT operation_id,dp_id,api_key_id,parent_id,relation,action,parent_epoch,\
          parent_version,child_ids,state,payload FROM native_relation_reservations \
-         WHERE environment_id=$1 AND operation_id=$2 FOR UPDATE",
-    )
+         WHERE environment_id=$1 AND operation_id=$2{}",
+        if lock { " FOR UPDATE" } else { "" },
+    ))
     .bind(state.env.env_id)
     .bind(operation_id)
     .fetch_optional(conn)
@@ -225,7 +247,7 @@ pub(super) async fn reserve(
     if !parent_permitted(&parent, body.relation)? {
         return Err(invalid("/relation"));
     }
-    if let Some(previous) = reservation(&mut *conn, state, body.operation_id).await? {
+    if let Some(previous) = reservation(&mut *conn, state, body.operation_id, true).await? {
         if previous.dp_id != dp.dp_id
             || previous.api_key_id != body.api_key_id
             || previous.parent_id != body.parent_record_id
@@ -410,12 +432,27 @@ pub(super) async fn commit(
     {
         return Err(invalid("/objects"));
     }
+    // 先无锁识别读取型发现，再按租户、操作、对象顺序稳定当前权限。
+    let previous = reservation(&mut *conn, state, body.operation_id, false)
+        .await?
+        .ok_or_else(ApiError::not_found)?;
+    if previous.dp_id != dp.dp_id || previous.api_key_id != body.api_key_id {
+        return Err(ApiError::not_found());
+    }
+    let discoverer = if previous.action == "discover" {
+        Some(principal(&mut *conn, body.api_key_id).await?)
+    } else {
+        None
+    };
     lock_operation(&mut *conn, state, body.operation_id).await?;
-    let reservation = reservation(&mut *conn, state, body.operation_id)
+    let reservation = reservation(&mut *conn, state, body.operation_id, true)
         .await?
         .ok_or_else(ApiError::not_found)?;
     if reservation.dp_id != dp.dp_id || reservation.api_key_id != body.api_key_id {
         return Err(ApiError::not_found());
+    }
+    if reservation.action != previous.action {
+        return Err(conflict());
     }
     let request = serde_json::to_value(&body).map_err(unavailable)?;
     if reservation.state == "committed" {
@@ -423,8 +460,33 @@ pub(super) async fn commit(
         if payload.get("request") != Some(&request) {
             return Err(conflict());
         }
-        return serde_json::from_value(payload.get("reply").cloned().ok_or_else(conflict)?)
-            .map_err(unavailable);
+        let mut reply: NativeReply =
+            serde_json::from_value(payload.get("reply").cloned().ok_or_else(conflict)?)
+                .map_err(unavailable)?;
+        if let Some(caller) = &discoverer {
+            // 幂等回包不重新写关系，但每次读取都重新裁决父子对象的当前权限。
+            let child_ids: Vec<_> = reply
+                .records
+                .iter()
+                .map(|record| record.record_id)
+                .collect();
+            let (parent, children) =
+                lock_objects(&mut *conn, state, reservation.parent_id, &child_ids).await?;
+            authorized(&mut *conn, state, caller, &parent).await?;
+            let mut visible = BTreeSet::new();
+            for child in &children {
+                if child_visible(&mut *conn, state, caller, &parent, child, None).await? {
+                    visible.insert(child.id);
+                }
+            }
+            reply
+                .records
+                .retain(|record| visible.contains(&record.record_id));
+            reply
+                .memberships
+                .retain(|membership| visible.contains(&membership.child_record_id));
+        }
+        return Ok(reply);
     }
     if !matches!(reservation.state.as_str(), "reserved" | "uncertain") {
         return Err(conflict());
@@ -452,6 +514,9 @@ pub(super) async fn commit(
     admitted_ids.extend(proofs.iter().map(|proof| proof.0));
     let (parent, admitted) =
         lock_objects(&mut *conn, state, reservation.parent_id, &admitted_ids).await?;
+    if let Some(caller) = &discoverer {
+        authorized(&mut *conn, state, caller, &parent).await?;
+    }
     for (id, version, epoch) in proofs {
         let referenced = if id == parent.id {
             &parent
@@ -532,10 +597,15 @@ pub(super) async fn commit(
         let related:Option<ObjectRow>=sqlx::query_as("SELECT child.* FROM native_object_memberships membership JOIN native_objects child ON child.id=membership.child_id WHERE membership.environment_id=$1 AND membership.parent_id=$2 AND membership.relation=$3 AND membership.deleted_at IS NULL AND child.protocol=$4 AND child.kind=$5 AND child.boundary=$6 AND child.raw_id=$7 AND child.deleted_at IS NULL FOR UPDATE OF child")
             .bind(state.env.env_id).bind(parent.id).bind(relation.as_str()).bind(&parent.protocol).bind(observed.kind.as_str()).bind(&parent.boundary).bind(&observed.raw_id).fetch_optional(&mut *conn).await.map_err(unavailable)?;
         if let Some(related) = related {
-            let visible = caller_scope.visibility_full
-                || related.api_key_id == caller_scope.api_key_id
-                || (caller_scope.member_id.is_some()
-                    && related.member_id == caller_scope.member_id);
+            let visible = discoverer.as_ref().map_or_else(
+                || {
+                    caller_scope.visibility_full
+                        || related.api_key_id == caller_scope.api_key_id
+                        || (caller_scope.member_id.is_some()
+                            && related.member_id == caller_scope.member_id)
+                },
+                |caller| owns(caller, &related),
+            );
             if !visible {
                 if reservation.action == "discover" {
                     continue;
@@ -548,16 +618,25 @@ pub(super) async fn commit(
             continue;
         }
         // owner 来自已准入父对象，Full 调用人的第一次 list 不能抢走 Self 产物。
-        let child = derive_object(
+        let child = match derive_object(
             &mut *conn,
             state,
             &parent,
             &submitted,
-            observed.kind,
-            &observed.raw_id,
+            observed,
             None,
+            discoverer.as_ref(),
         )
-        .await?;
+        .await
+        {
+            Ok(child) => child,
+            Err(error)
+                if discoverer.is_some() && error.status == axum::http::StatusCode::NOT_FOUND =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         if !children.iter().any(|previous| previous.id == child.id) {
             children.push(child);
         }
@@ -575,6 +654,11 @@ pub(super) async fn commit(
             )
         {
             return Err(conflict());
+        }
+        if let Some(caller) = &discoverer {
+            if !child_visible(&mut *conn, state, caller, &parent, child, None).await? {
+                continue;
+            }
         }
         let membership = if reservation.action == "detach" {
             let removed: Option<MembershipRow> = sqlx::query_as(
@@ -723,15 +807,17 @@ pub(super) async fn lookup(
         {
             return Err(ApiError::unavailable());
         }
-        let consumer = match child_consumer(&parent, &child, body.consumer_family) {
-            Ok(consumer) => consumer,
-            Err(error) if error.status == axum::http::StatusCode::NOT_FOUND => continue,
-            Err(error) => return Err(error),
-        };
-        match authorized_for_consumer(&mut *conn, state, &caller, &child, consumer).await {
-            Ok(()) => {}
-            Err(error) if error.status == axum::http::StatusCode::NOT_FOUND => continue,
-            Err(error) => return Err(error),
+        if !child_visible(
+            &mut *conn,
+            state,
+            &caller,
+            &parent,
+            &child,
+            body.consumer_family,
+        )
+        .await?
+        {
+            continue;
         }
         reply
             .records
@@ -748,7 +834,7 @@ pub(super) async fn resolve(
     body: ResolveReservationRequest,
 ) -> Result<NativeReply, ApiError> {
     lock_operation(&mut *conn, state, body.operation_id).await?;
-    let previous = reservation(&mut *conn, state, body.operation_id)
+    let previous = reservation(&mut *conn, state, body.operation_id, true)
         .await?
         .ok_or_else(ApiError::not_found)?;
     if previous.dp_id != dp.dp_id || previous.api_key_id != body.api_key_id {

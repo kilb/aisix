@@ -47,10 +47,12 @@ pub(super) async fn derive_object(
     state: &AppState,
     owner: &ObjectRow,
     accepted: &BeginRequest,
-    kind: NativeObjectKind,
-    raw_id: &str,
+    child: &NativeChildObject,
     parent_id: Option<Uuid>,
+    discoverer: Option<&Principal>,
 ) -> Result<ObjectRow, ApiError> {
+    let kind = child.kind;
+    let raw_id = child.raw_id.as_str();
     if !text_ok(raw_id, 512) {
         return Err(invalid("/objects/raw_id"));
     }
@@ -71,14 +73,25 @@ pub(super) async fn derive_object(
     let existing: Option<ObjectRow> = sqlx::query_as("SELECT * FROM native_objects WHERE environment_id=$1 AND protocol=$2 AND kind=$3 AND boundary=$4 AND raw_id=$5 FOR UPDATE")
         .bind(state.env.env_id).bind(accepted.protocol.as_str()).bind(kind.as_str()).bind(accepted.origin.boundary.as_str()).bind(raw_id).fetch_optional(&mut *conn).await.map_err(unavailable)?;
     if let Some(row) = existing {
+        // 发现复用当前读取者的可见性；已接受产物仍按原 owner 的历史快照落库。
+        let visible = discoverer.map_or_else(
+            || {
+                owner_op.visibility_full
+                    || row.api_key_id == owner.api_key_id
+                    || (owner.member_id.is_some() && row.member_id == owner.member_id)
+            },
+            |caller| owns(caller, &row),
+        );
         if row.tenant_id != owner.tenant_id
-            || (!owner_op.visibility_full
-                && row.api_key_id != owner.api_key_id
-                && !(owner.member_id.is_some() && row.member_id == owner.member_id))
+            || !visible
             || row.provider_key_id != accepted.origin.provider_key_id
             || row.deleted_at.is_some()
         {
-            return Err(conflict());
+            return Err(if discoverer.is_some() {
+                ApiError::not_found()
+            } else {
+                conflict()
+            });
         }
         return Ok(row);
     }
@@ -364,9 +377,9 @@ async fn bind_graph(
                 state,
                 root,
                 submitted,
-                child.kind,
-                &child.raw_id,
+                &child,
                 provenance_parent,
+                None,
             )
             .await?,
         );
@@ -605,8 +618,8 @@ pub(super) async fn observed(
                 state,
                 &owner,
                 &per_entry,
-                entry.root.kind,
-                &entry.root.raw_id,
+                &entry.root,
+                None,
                 None,
             )
             .await?
