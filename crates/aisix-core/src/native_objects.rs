@@ -752,6 +752,9 @@ pub struct BeginRelatedRequest {
     pub submission: BeginRequest,
     #[serde(default)]
     pub references: Vec<AcceptedReference>,
+    /// 每个已受理 Responses 批次条目只借用自己准入的存储引用。
+    #[serde(default)]
+    pub entry_references: BTreeMap<String, Vec<AcceptedReference>>,
     /// 仅允许 submission.parent_id 指定的已授权父对象；新产物继承父的 accepted owner。
     #[serde(default)]
     pub owner_parent_record_id: Option<Uuid>,
