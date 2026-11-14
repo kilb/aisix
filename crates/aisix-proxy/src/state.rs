@@ -785,6 +785,14 @@ impl ProxyState {
         self
     }
 
+    /// 归属密钥独立于平台错误隐藏策略；本地 registry 优先。
+    pub fn native_origin_key(&self) -> Option<[u8; 32]> {
+        self.native_objects
+            .as_ref()
+            .and_then(|registry| registry.id_key())
+            .or_else(|| self.platform().map(|settings| settings.id_key))
+    }
+
     /// 安装使用托管连接的原生对象归属客户端。
     pub fn with_native_objects(
         mut self,

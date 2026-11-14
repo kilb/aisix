@@ -71,6 +71,7 @@ pub(crate) const DECISIONS: Surface = Surface::uniform("decisions");
 pub(crate) const REALTIME: Surface = Surface::uniform("realtime");
 pub(crate) const FILES: Surface = Surface::uniform("files");
 pub(crate) const UPLOADS: Surface = Surface::uniform("uploads");
+pub(crate) const EVALS: Surface = Surface::uniform("evals");
 pub(crate) const CONVERSATIONS: Surface = Surface::uniform("conversations");
 pub(crate) const CONTAINERS: Surface = Surface::uniform("containers");
 pub(crate) const VECTOR_STORES: Surface = Surface::uniform("vector_stores");
@@ -110,6 +111,8 @@ pub(crate) const PASSTHROUGH: Surface = Surface::split("passthrough_route", "pas
 /// spend, and folding the two would make batch cost unseparable from the
 /// traffic that submitted it.
 pub(crate) const BATCH_COMPLETION: Surface = Surface::split("batch", "batch_completion");
+/// 后台评估的真实计量与管理调用分开，避免轮询重复计费。
+pub(crate) const EVAL_COMPLETION: Surface = Surface::split("evals", "eval_completion");
 
 /// The surface a request on this route reports when the caller walks away,
 /// keyed by [`crate::normalize_endpoint_label`] output.
@@ -169,6 +172,23 @@ pub(crate) fn surface_for_endpoint(endpoint: &str) -> Option<Surface> {
         | "/v1/vector_stores/:id/file_batches/:batch_id"
         | "/v1/vector_stores/:id/file_batches/:batch_id/cancel"
         | "/v1/vector_stores/:id/file_batches/:batch_id/files" => VECTOR_STORES,
+        "/v1/skills" => crate::native_api::skills::SURFACE,
+        "/v1/skills/:id" => crate::native_api::skills::SURFACE,
+        "/v1/skills/:id/content" => crate::native_api::skills::SURFACE,
+        "/v1/skills/:id/versions" => crate::native_api::skills::SURFACE,
+        "/v1/skills/:id/versions/:version" => crate::native_api::skills::SURFACE,
+        "/v1/skills/:id/versions/:version/content" => crate::native_api::skills::SURFACE,
+        "/v1/audio/voice_consents" => crate::native_api::voices::CONSENTS_SURFACE,
+        "/v1/audio/voice_consents/:id" => crate::native_api::voices::CONSENTS_SURFACE,
+        "/v1/audio/voices" => crate::native_api::voices::VOICES_SURFACE,
+        "/v1/audio/voices/:id" => crate::native_api::voices::VOICES_SURFACE,
+        "/v1/evals" => EVALS,
+        "/v1/evals/:eval_id" => EVALS,
+        "/v1/evals/:eval_id/runs" => EVALS,
+        "/v1/evals/:eval_id/runs/:run_id" => EVALS,
+        "/v1/evals/:eval_id/runs/:run_id/cancel" => EVALS,
+        "/v1/evals/:eval_id/runs/:run_id/output_items" => EVALS,
+        "/v1/evals/:eval_id/runs/:run_id/output_items/:output_item_id" => EVALS,
         "/v1/messages" => MESSAGES,
         "/v1/messages/count_tokens" => COUNT_TOKENS,
         "/v1/rerank" => RERANK,
@@ -314,6 +334,62 @@ mod tests {
         (
             "/v1/vector_stores/:id/file_batches/:batch_id/files",
             Emits::Usage(VECTOR_STORES),
+        ),
+        (
+            "/v1/skills",
+            Emits::Usage(crate::native_api::skills::SURFACE),
+        ),
+        (
+            "/v1/skills/:id",
+            Emits::Usage(crate::native_api::skills::SURFACE),
+        ),
+        (
+            "/v1/skills/:id/content",
+            Emits::Usage(crate::native_api::skills::SURFACE),
+        ),
+        (
+            "/v1/skills/:id/versions",
+            Emits::Usage(crate::native_api::skills::SURFACE),
+        ),
+        (
+            "/v1/skills/:id/versions/:version",
+            Emits::Usage(crate::native_api::skills::SURFACE),
+        ),
+        (
+            "/v1/skills/:id/versions/:version/content",
+            Emits::Usage(crate::native_api::skills::SURFACE),
+        ),
+        (
+            "/v1/audio/voice_consents",
+            Emits::Usage(crate::native_api::voices::CONSENTS_SURFACE),
+        ),
+        (
+            "/v1/audio/voice_consents/:id",
+            Emits::Usage(crate::native_api::voices::CONSENTS_SURFACE),
+        ),
+        (
+            "/v1/audio/voices",
+            Emits::Usage(crate::native_api::voices::VOICES_SURFACE),
+        ),
+        (
+            "/v1/audio/voices/:id",
+            Emits::Usage(crate::native_api::voices::VOICES_SURFACE),
+        ),
+        ("/v1/evals", Emits::Usage(EVALS)),
+        ("/v1/evals/:eval_id", Emits::Usage(EVALS)),
+        ("/v1/evals/:eval_id/runs", Emits::Usage(EVALS)),
+        ("/v1/evals/:eval_id/runs/:run_id", Emits::Usage(EVALS)),
+        (
+            "/v1/evals/:eval_id/runs/:run_id/cancel",
+            Emits::Usage(EVALS),
+        ),
+        (
+            "/v1/evals/:eval_id/runs/:run_id/output_items",
+            Emits::Usage(EVALS),
+        ),
+        (
+            "/v1/evals/:eval_id/runs/:run_id/output_items/:output_item_id",
+            Emits::Usage(EVALS),
         ),
         ("/v1/messages", Emits::Usage(MESSAGES)),
         ("/v1/messages/count_tokens", Emits::Usage(COUNT_TOKENS)),
@@ -534,6 +610,7 @@ mod tests {
             (REALTIME, "realtime"),
             (FILES, "files"),
             (UPLOADS, "uploads"),
+            (EVALS, "evals"),
             (CONVERSATIONS, "conversations"),
             (CONTAINERS, "containers"),
             (VECTOR_STORES, "vector_stores"),
@@ -552,6 +629,7 @@ mod tests {
             (VIDEO_GENERATION, "videos"),
             (PASSTHROUGH, "passthrough_route"),
             (BATCH_COMPLETION, "batch"),
+            (EVAL_COMPLETION, "evals"),
         ] {
             assert_eq!(
                 surface.handler, handler,

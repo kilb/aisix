@@ -6,11 +6,15 @@ pub mod openai_batch_worker;
 pub(crate) mod openai_chat;
 pub(crate) mod openai_containers;
 pub(crate) mod openai_conversations;
+pub mod openai_eval_worker;
+pub(crate) mod openai_evals;
 pub(crate) mod openai_uploads;
 pub(crate) mod openai_vector_stores;
 pub(crate) mod origin;
 pub mod registry;
 pub(crate) mod responses;
+pub(crate) mod skills;
+pub(crate) mod voices;
 
 pub(crate) mod anthropic;
 pub mod anthropic_batch_worker;

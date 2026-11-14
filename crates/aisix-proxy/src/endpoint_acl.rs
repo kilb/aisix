@@ -88,6 +88,23 @@ pub(crate) fn endpoint_family(path: &str) -> Option<EndpointFamily> {
         | "/v1/vector_stores/:id/file_batches/:batch_id"
         | "/v1/vector_stores/:id/file_batches/:batch_id/cancel"
         | "/v1/vector_stores/:id/file_batches/:batch_id/files" => F::VectorStores,
+        "/v1/skills" => F::Skills,
+        "/v1/skills/:id" => F::Skills,
+        "/v1/skills/:id/content" => F::Skills,
+        "/v1/skills/:id/versions" => F::Skills,
+        "/v1/skills/:id/versions/:version" => F::Skills,
+        "/v1/skills/:id/versions/:version/content" => F::Skills,
+        "/v1/audio/voice_consents" => F::Audio,
+        "/v1/audio/voice_consents/:id" => F::Audio,
+        "/v1/audio/voices" => F::Audio,
+        "/v1/audio/voices/:id" => F::Audio,
+        "/v1/evals" => F::Evals,
+        "/v1/evals/:eval_id" => F::Evals,
+        "/v1/evals/:eval_id/runs" => F::Evals,
+        "/v1/evals/:eval_id/runs/:run_id" => F::Evals,
+        "/v1/evals/:eval_id/runs/:run_id/cancel" => F::Evals,
+        "/v1/evals/:eval_id/runs/:run_id/output_items" => F::Evals,
+        "/v1/evals/:eval_id/runs/:run_id/output_items/:output_item_id" => F::Evals,
         "/v1/audio/transcriptions" | "/v1/audio/translations" | "/v1/audio/speech" => F::Audio,
         "/v1/videos" | "/v1/videos/:id" => F::Videos,
         "/v1/rerank" => F::Rerank,
@@ -152,7 +169,7 @@ mod tests {
     use EndpointFamily as F;
 
     /// Every family a route can be refused under: all but the catch-all.
-    const ROUTABLE_FAMILIES: [EndpointFamily; 24] = [
+    const ROUTABLE_FAMILIES: [EndpointFamily; 26] = [
         F::ChatCompletions,
         F::Completions,
         F::Embeddings,
@@ -174,6 +191,8 @@ mod tests {
         F::Conversations,
         F::Containers,
         F::VectorStores,
+        F::Skills,
+        F::Evals,
         F::Mcp,
         F::A2a,
         F::Passthrough,
@@ -264,6 +283,32 @@ mod tests {
         (
             "/v1/vector_stores/:id/file_batches/:batch_id/files",
             Family(F::VectorStores),
+        ),
+        ("/v1/skills", Family(F::Skills)),
+        ("/v1/skills/:id", Family(F::Skills)),
+        ("/v1/skills/:id/content", Family(F::Skills)),
+        ("/v1/skills/:id/versions", Family(F::Skills)),
+        ("/v1/skills/:id/versions/:version", Family(F::Skills)),
+        (
+            "/v1/skills/:id/versions/:version/content",
+            Family(F::Skills),
+        ),
+        ("/v1/audio/voice_consents", Family(F::Audio)),
+        ("/v1/audio/voice_consents/:id", Family(F::Audio)),
+        ("/v1/audio/voices", Family(F::Audio)),
+        ("/v1/audio/voices/:id", Family(F::Audio)),
+        ("/v1/evals", Family(F::Evals)),
+        ("/v1/evals/:eval_id", Family(F::Evals)),
+        ("/v1/evals/:eval_id/runs", Family(F::Evals)),
+        ("/v1/evals/:eval_id/runs/:run_id", Family(F::Evals)),
+        ("/v1/evals/:eval_id/runs/:run_id/cancel", Family(F::Evals)),
+        (
+            "/v1/evals/:eval_id/runs/:run_id/output_items",
+            Family(F::Evals),
+        ),
+        (
+            "/v1/evals/:eval_id/runs/:run_id/output_items/:output_item_id",
+            Family(F::Evals),
         ),
         ("/v1/messages", Family(F::Messages)),
         ("/v1/messages/count_tokens", Family(F::CountTokens)),
