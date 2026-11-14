@@ -113,6 +113,7 @@ dependencies = [
 name = "aisix-control-plane"
 version = "0.1.0"
 dependencies = [
+ "aisix-admin",
  "aisix-core",
  "aisix-etcd",
  "aisix-gateway",
@@ -546,6 +547,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "sqlx",
  "tempfile",
  "thiserror 1.0.69",
  "tiktoken-rs",
@@ -626,6 +628,7 @@ dependencies = [
  "rand 0.8.7",
  "rcgen",
  "reqwest 0.12.28",
+ "rustix",
  "rustls",
  "rustls-pemfile",
  "serde",
@@ -3165,6 +3168,7 @@ version = "0.30.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2e99fb7a497b1e3339bc746195567ed8d3e24945ecd636e3619d20b9de9e9149"
 dependencies = [
+ "cc",
  "pkg-config",
  "vcpkg",
 ]

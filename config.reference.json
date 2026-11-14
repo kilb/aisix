@@ -42,6 +42,7 @@
       "snapshot_cache_enabled": false,
       "snapshot_cache_path": null
     },
+    "native_objects": null,
     "observability": {
       "access_log": true,
       "debug": {
@@ -168,6 +169,10 @@
       "client_cert_file": null,
       "client_key_file": null,
       "domain_name": null
+    },
+    "native_objects": {
+      "origin_secret_file": null,
+      "sqlite_path": null
     },
     "observability.metrics.client_type_rules[]": {
       "client": null,
