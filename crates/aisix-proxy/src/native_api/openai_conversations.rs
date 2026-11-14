@@ -748,13 +748,7 @@ async fn items_call(
                 .commit_relations(CommitRelationsRequest {
                     api_key_id: openai::api_key_id(&auth)?,
                     operation_id: operation,
-                    objects: ids
-                        .iter()
-                        .map(|raw_id| NativeChildObject {
-                            kind: NativeObjectKind::ResponseItem,
-                            raw_id: raw_id.clone(),
-                        })
-                        .collect(),
+                    objects: Vec::new(),
                 })
                 .await
                 .map_err(|_| openai::dependency())?;
