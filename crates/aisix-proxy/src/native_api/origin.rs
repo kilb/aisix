@@ -58,14 +58,12 @@ pub(crate) async fn begin_response(
         return Ok(None);
     };
     let platform = state.platform().ok_or(ProxyError::AccountUnavailable)?;
-    let api_key_id = Uuid::parse_str(api_key_id).map_err(|_| ProxyError::AccountUnavailable)?;
-    let model_id = Uuid::parse_str(model_id).map_err(|_| ProxyError::AccountUnavailable)?;
-    let provider_key_id =
-        Uuid::parse_str(&provider.id).map_err(|_| ProxyError::AccountUnavailable)?;
+    let api_key_id = super::openai::resource_id(state, "apikeys", api_key_id)?;
+    let model_id = super::openai::resource_id(state, "models", model_id)?;
+    let provider_key_id = super::openai::resource_id(state, "provider_keys", &provider.id)?;
     let requested = crate::model_resolve::resolve_model(snapshot, requested_model)
         .ok_or(ProxyError::AccountUnavailable)?;
-    let requested_model_id =
-        Uuid::parse_str(&requested.id).map_err(|_| ProxyError::AccountUnavailable)?;
+    let requested_model_id = super::openai::resource_id(state, "models", &requested.id)?;
     let origin = OriginBinding {
         surface: None,
         model_id,
@@ -145,7 +143,7 @@ pub(crate) fn resume_response(
     Ok(Some(OriginRegistration {
         registry: Arc::clone(registry),
         operation_id: record.operation_id.ok_or(ProxyError::AccountUnavailable)?,
-        api_key_id: Uuid::parse_str(api_key_id).map_err(|_| ProxyError::AccountUnavailable)?,
+        api_key_id: super::openai::resource_id(state, "apikeys", api_key_id)?,
         existing_record_id: Some(record.record_id),
         origin: record
             .origin
@@ -514,7 +512,10 @@ pub(crate) async fn admit_native_reasoning_references(
             .provider_key_id
             .as_deref()
             .and_then(|id| snapshot.provider_keys.get_by_id(id))
-            .filter(|provider| provider.id == origin.provider_key_id.to_string())
+            .filter(|provider| {
+                super::openai::resource_id(state, "provider_keys", &provider.id).ok()
+                    == Some(origin.provider_key_id)
+            })
             .ok_or_else(refused)?;
         let boundary = configured_native_origin(
             &platform.id_key,

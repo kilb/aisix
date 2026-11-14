@@ -12,7 +12,6 @@ use axum::http::Method;
 use axum::response::Response;
 use bytes::Bytes;
 use serde_json::Value;
-use uuid::Uuid;
 
 use super::anthropic::{self, Audit, Body};
 use crate::auth::{AnthropicAuthenticatedKey, AuthenticatedKey};
@@ -193,8 +192,11 @@ pub(crate) async fn create(
                 entry_id: id,
                 requested_model: requested.clone(),
                 requested_service_tier: requested_tier,
-                requested_model_id: Uuid::parse_str(&target.model_entry.id)
-                    .map_err(|_| dependency())?,
+                requested_model_id: super::openai::resource_id(
+                    &state,
+                    "models",
+                    &target.model_entry.id,
+                )?,
                 model_id: origin.model_id,
                 upstream_model: upstream.clone(),
                 upstream_provider: target.pk_entry.value.provider.clone(),
@@ -444,14 +446,11 @@ async fn rewrite_results(
                 let model = message.get_mut("model").ok_or_else(decode)?;
                 *model = entry.requested_model.clone().into();
                 let snapshot = state.snapshot.load();
-                let direct = snapshot
-                    .models
-                    .get_by_id(&entry.model_id.to_string())
-                    .ok_or_else(dependency)?;
-                let requested = snapshot
-                    .models
-                    .get_by_id(&entry.requested_model_id.to_string())
-                    .ok_or_else(dependency)?;
+                let direct = super::openai::model_entry_by_id(state, &snapshot, entry.model_id)
+                    .map_err(|_| dependency())?;
+                let requested =
+                    super::openai::model_entry_by_id(state, &snapshot, entry.requested_model_id)
+                        .map_err(|_| dependency())?;
                 let (entry_target, entry_origin) = anthropic::resolve_target(
                     state,
                     &snapshot,
@@ -461,7 +460,8 @@ async fn rewrite_results(
                     KIND,
                 )?;
                 let persisted = record.origin.as_ref().ok_or_else(dependency)?;
-                if entry_target.model_entry.id != entry.model_id.to_string()
+                if super::openai::resource_id(state, "models", &entry_target.model_entry.id)?
+                    != entry.model_id
                     || entry_origin.provider_key_id != persisted.provider_key_id
                     || entry_origin.boundary != persisted.boundary
                 {

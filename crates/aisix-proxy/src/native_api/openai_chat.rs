@@ -71,13 +71,13 @@ pub(crate) fn capture_creation(
     Some((|| {
         openai::registry(state)?;
         let platform = state.platform().ok_or_else(dependency)?;
-        let provider_key_id = Uuid::parse_str(provider_key_id).map_err(|_| dependency())?;
+        let provider_key_id = openai::resource_id(state, "provider_keys", provider_key_id)?;
         Ok(CreationBinding {
-            requested_model_id: Uuid::parse_str(requested_model_id).map_err(|_| dependency())?,
+            requested_model_id: openai::resource_id(state, "models", requested_model_id)?,
             requested_model: req.model.clone(),
             origin: OriginBinding {
                 surface: None,
-                model_id: Uuid::parse_str(target_model_id).map_err(|_| dependency())?,
+                model_id: openai::resource_id(state, "models", target_model_id)?,
                 provider_key_id,
                 boundary: configured_native_origin(
                     &platform.id_key,
@@ -106,14 +106,10 @@ pub(crate) async fn register_created(
     crate::jobs::require_safe_upstream_id(raw_id).map_err(|_| invalid_response())?;
     let snapshot = state.snapshot.load();
     let auth = openai::current_auth(&snapshot, auth)?;
-    let requested = snapshot
-        .models
-        .get_by_id(&binding.requested_model_id.to_string())
-        .ok_or_else(dependency)?;
-    let target = snapshot
-        .models
-        .get_by_id(&binding.origin.model_id.to_string())
-        .ok_or_else(dependency)?;
+    let requested = openai::model_entry_by_id(state, &snapshot, binding.requested_model_id)
+        .map_err(|_| dependency())?;
+    let target = openai::model_entry_by_id(state, &snapshot, binding.origin.model_id)
+        .map_err(|_| dependency())?;
     let provider = crate::dispatch::resolve_provider_key(&snapshot, &target.value)?;
     let platform = state.platform().ok_or_else(dependency)?;
     let current = configured_native_origin(
@@ -124,7 +120,7 @@ pub(crate) async fn register_created(
         NativeObjectKind::ChatCompletion,
     )
     .map_err(|_| dependency())?;
-    if provider.id != binding.origin.provider_key_id.to_string()
+    if openai::resource_id(state, "provider_keys", &provider.id)? != binding.origin.provider_key_id
         || current != binding.origin.boundary
         || target.value.upstream_model().unwrap_or_default() != binding.upstream_model
         || !auth
@@ -634,7 +630,7 @@ pub(crate) async fn list(
                         && r.protocol == Some(NativeProtocol::Openai)
                         && r.parent_id.is_none()
                         && r.requested_model_id
-                            .and_then(|id| snapshot.models.get_by_id(&id.to_string()))
+                            .and_then(|id| openai::model_entry_by_id(&state, &snapshot, id).ok())
                             .is_some_and(|entry| {
                                 auth.key().can_access(&snapshot, &entry.value.display_name)
                             })

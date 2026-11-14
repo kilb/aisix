@@ -3154,14 +3154,10 @@ fn managed_current_target_for_consumer(
 ) -> Result<JobTarget, ProxyError> {
     use crate::native_api::openai;
     let not_found = || ProxyError::JobResourceNotFound("native object".into());
-    let requested = snapshot
-        .models
-        .get_by_id(&requested_id.to_string())
-        .ok_or_else(not_found)?;
-    let direct = snapshot
-        .models
-        .get_by_id(&origin.model_id.to_string())
-        .ok_or_else(not_found)?;
+    let requested =
+        openai::model_entry_by_id(state, snapshot, requested_id).map_err(|_| not_found())?;
+    let direct =
+        openai::model_entry_by_id(state, snapshot, origin.model_id).map_err(|_| not_found())?;
     let (target, current) = match consumer_family {
         Some(family) => openai::resolve_file_reference_for_requested(
             state,
@@ -3264,14 +3260,10 @@ async fn managed_batch_input(
             if raw_model != saved.requested_model && raw_model != saved.upstream_model {
                 return Err(openai::invalid_identity());
             }
-            let direct = snapshot
-                .models
-                .get_by_id(&saved.model_id.to_string())
-                .ok_or_else(openai::dependency)?;
-            let requested = snapshot
-                .models
-                .get_by_id(&saved.requested_model_id.to_string())
-                .ok_or_else(openai::dependency)?;
+            let direct = openai::model_entry_by_id(state, snapshot, saved.model_id)
+                .map_err(|_| openai::dependency())?;
+            let requested = openai::model_entry_by_id(state, snapshot, saved.requested_model_id)
+                .map_err(|_| openai::dependency())?;
             let (target, origin) = openai::resolve_file_reference_for_requested(
                 state,
                 snapshot,
@@ -3284,9 +3276,8 @@ async fn managed_batch_input(
             (saved.requested_model.clone(), target, origin)
         } else {
             let requested = if crate::model_resolve::resolve_model(snapshot, &raw_model).is_none() {
-                snapshot
-                    .models
-                    .get_by_id(&origin.model_id.to_string())
+                openai::model_entry_by_id(state, snapshot, origin.model_id)
+                    .ok()
                     .filter(|entry| entry.value.upstream_model() == Some(raw_model.as_str()))
                     .map(|entry| entry.value.display_name.clone())
                     .unwrap_or(raw_model.clone())

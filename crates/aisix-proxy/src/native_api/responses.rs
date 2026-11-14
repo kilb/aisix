@@ -112,16 +112,19 @@ impl NativeResponseOperation {
         let Some(origin) = &self.origin else {
             return Ok(());
         };
-        if origin.model_id.to_string() != model_id
-            || model.provider_key_id.as_deref() != Some(origin.provider_key_id.to_string().as_str())
+        if super::openai::resource_id(state, "models", model_id)? != origin.model_id
+            || model
+                .provider_key_id
+                .as_deref()
+                .map(|id| super::openai::resource_id(state, "provider_keys", id))
+                .transpose()?
+                != Some(origin.provider_key_id)
         {
             return Err(ProxyError::ProviderUnavailable);
         }
         let platform = state.platform().ok_or(ProxyError::ProviderUnavailable)?;
-        let pk = snapshot
-            .provider_keys
-            .get_by_id(&origin.provider_key_id.to_string())
-            .ok_or(ProxyError::ProviderUnavailable)?;
+        let pk = super::openai::provider_entry_by_id(state, snapshot, origin.provider_key_id)
+            .map_err(|_| ProxyError::ProviderUnavailable)?;
         let boundary = aisix_core::native_objects::configured_native_origin(
             &platform.id_key,
             origin.provider_key_id,
@@ -333,7 +336,8 @@ async fn addressed(
             .await;
     if kind == ResponseOperationKind::Delete && response.status().is_success() {
         if let (Some(registry), Some(record)) = (&state.native_objects, record) {
-            let Ok(api_key_id) = uuid::Uuid::parse_str(&auth.entry.id) else {
+            let Ok(api_key_id) = super::openai::resource_id(&state, "apikeys", &auth.entry.id)
+            else {
                 return ProxyError::ProviderUnavailable.into_response();
             };
             let result = registry

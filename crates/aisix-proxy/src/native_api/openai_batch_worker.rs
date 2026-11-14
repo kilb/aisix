@@ -221,10 +221,8 @@ fn upstream(state: &ProxyState, record: &NativeRecord) -> Result<Upstream, Nativ
     let binding = record.origin.as_ref().ok_or_else(unavailable)?;
     let platform = state.platform().ok_or_else(unavailable)?;
     let snapshot = state.snapshot.load();
-    let provider = snapshot
-        .provider_keys
-        .get_by_id(&binding.provider_key_id.to_string())
-        .ok_or_else(unavailable)?;
+    let provider = super::openai::provider_entry_by_id(state, &snapshot, binding.provider_key_id)
+        .map_err(|_| unavailable())?;
     let boundary = configured_native_origin(
         &platform.id_key,
         binding.provider_key_id,
