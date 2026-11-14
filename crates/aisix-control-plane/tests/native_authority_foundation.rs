@@ -781,6 +781,199 @@ async fn stale_discovery_cannot_revive_detached_membership_or_affect_another_sto
     );
 }
 
+// 同一对象换到可信观察入口，也不能绕过当前已经生效的读取拒绝。
+fn discovery_does_not_release_unreadable_child(response: &Resp, raw: &str) {
+    match response.status {
+        200 => no_membership(response),
+        404 => assert_eq!(
+            response.body["code"].as_str(),
+            Some("not_found"),
+            "{response:?}"
+        ),
+        _ => {
+            panic!("discovery must omit an unreadable child or refuse it as missing: {response:?}")
+        }
+    }
+    assert!(
+        !response.body.to_string().contains(raw),
+        "an unreadable child ID was released: {response:?}"
+    );
+}
+
+// 已有关联不替代当前模型权限：撤销 B 后，A 的集合发现也不能释放 B 的文件。
+#[tokio::test]
+async fn discovery_of_an_existing_membership_rechecks_the_childs_current_model_grant() {
+    let Some(f) = fixture().await else { return };
+    let model_a = uuid_at(&f.submission, "/origin/model_id");
+    let model_b = f.cp.send("POST", "/admin/resources/models", Some(f.admin.cookie()), Some(json!({"doc":{
+        "display_name":"discovery-child-model-b-v14", "provider":"openai",
+        "model_name":"discovery-child-upstream-b-v14", "provider_key_id":f.submission["origin"]["provider_key_id"]
+    }}))).await;
+    assert_eq!(model_b.status, 201, "{model_b:?}");
+    let model_b = uuid_at(&model_b.body, "/id");
+    grant(&f.cp, &f.admin, f.tenant, &[model_a, model_b]).await;
+    let raw_file = "file_discovery_revoked_model_b_v14";
+    let mut file_submission = root_submission(&f, "file");
+    file_submission["origin"]["model_id"] = json!(model_b);
+    file_submission["requested_model_id"] = json!(model_b);
+    file_submission["requested_model"] = json!("discovery-child-model-b-v14");
+    file_submission["upstream_model"] = json!("discovery-child-upstream-b-v14");
+    let file = bind_root(&f.dp, &file_submission, raw_file).await;
+    let full_member = f.cp.seed_member(f.tenant, MemberRole::Admin).await.id;
+    let full_key = Uuid::parse_str(&seed_key(&f.cp, &f.admin, f.tenant, Some(full_member)).await)
+        .expect("the Full collection owner's key");
+    let raw_store = "vs_discovery_owner_model_a_v14";
+    let mut store_submission = root_submission(&f, "vector_store");
+    store_submission["api_key_id"] = json!(full_key);
+    let store = bind_root(&f.dp, &store_submission, raw_store).await;
+    let visible = lookup(&f.dp, full_key, "file", raw_file).await;
+    assert_eq!(
+        visible.status, 200,
+        "Full can read B before withdrawal: {visible:?}"
+    );
+    assert_eq!(visible.body["record"]["record_id"], file["record_id"]);
+    let attach = Uuid::new_v4();
+    let reserved = reserve_relation(
+        &f.dp,
+        full_key,
+        attach,
+        &store,
+        "vector_store_file",
+        "attach",
+        &[uuid_at(&file, "/record_id")],
+    )
+    .await;
+    assert_eq!(reserved.status, 200, "{reserved:?}");
+    let attached = commit_relation(&f.dp, full_key, attach, json!([])).await;
+    assert_eq!(attached.status, 200, "{attached:?}");
+    one_membership(
+        &related(&f.dp, full_key, &store, "vector_store_file", raw_file).await,
+        &store,
+        &file,
+        "vector_store_file",
+    );
+    let parent = lookup(&f.dp, full_key, "vector_store", raw_store).await;
+    assert_eq!(parent.status, 200, "{parent:?}");
+    let parent = parent.body["record"].clone();
+    parent["version"]
+        .as_i64()
+        .expect("the explicit current parent version after attachment");
+
+    grant(&f.cp, &f.admin, f.tenant, &[model_a]).await;
+    let denied = lookup(&f.dp, full_key, "file", raw_file).await;
+    assert_eq!(
+        denied.status, 404,
+        "B's file is no longer readable: {denied:?}"
+    );
+    no_membership(&related(&f.dp, full_key, &parent, "vector_store_file", raw_file).await);
+    let current_parent = lookup(&f.dp, full_key, "vector_store", raw_store).await;
+    assert_eq!(
+        current_parent.status, 200,
+        "A's collection remains readable: {current_parent:?}"
+    );
+    assert_eq!(current_parent.body["record"]["version"], parent["version"]);
+    let discover = Uuid::new_v4();
+    let reserved = reserve_relation(
+        &f.dp,
+        full_key,
+        discover,
+        &parent,
+        "vector_store_file",
+        "discover",
+        &[],
+    )
+    .await;
+    assert_eq!(
+        reserved.status, 200,
+        "the current parent admits discovery: {reserved:?}"
+    );
+    assert_eq!(reserved.body["state"].as_str(), Some("reserved"));
+    let observed = commit_relation(
+        &f.dp,
+        full_key,
+        discover,
+        json!([{"kind":"file","raw_id":raw_file}]),
+    )
+    .await;
+    discovery_does_not_release_unreadable_child(&observed, raw_file);
+}
+
+// 创建父对象时的 Full 不可成为降为 Self 后读取另一成员既有文件的永久授权。
+#[tokio::test]
+async fn discovery_of_an_unrelated_existing_child_rechecks_a_full_to_self_downgrade() {
+    let Some(f) = fixture().await else { return };
+    let raw_file = "file_discovery_other_member_v14";
+    let file = bind_root(&f.dp, &root_submission(&f, "file"), raw_file).await;
+    let full_member = f.cp.seed_member(f.tenant, MemberRole::Admin).await.id;
+    let full_key = Uuid::parse_str(&seed_key(&f.cp, &f.admin, f.tenant, Some(full_member)).await)
+        .expect("the Full collection owner's key");
+    let raw_store = "vs_created_while_full_v14";
+    let mut store_submission = root_submission(&f, "vector_store");
+    store_submission["api_key_id"] = json!(full_key);
+    let store = bind_root(&f.dp, &store_submission, raw_store).await;
+    let visible = lookup(&f.dp, full_key, "file", raw_file).await;
+    assert_eq!(
+        visible.status, 200,
+        "Full can initially read the other member's file: {visible:?}"
+    );
+    assert_eq!(visible.body["record"]["record_id"], file["record_id"]);
+    no_membership(&related(&f.dp, full_key, &store, "vector_store_file", raw_file).await);
+    let owner = f.cp.member_login_seeded(f.tenant, MemberRole::Owner).await;
+    let demoted =
+        f.cp.send(
+            "PATCH",
+            &format!("/api/members/{full_member}"),
+            Some(owner.cookie()),
+            Some(json!({"role":"member"})),
+        )
+        .await;
+    assert_eq!(
+        demoted.status, 200,
+        "the role downgrade is committed through the real API: {demoted:?}"
+    );
+    let denied = lookup(&f.dp, full_key, "file", raw_file).await;
+    assert_eq!(
+        denied.status, 404,
+        "Self cannot read the other member's file: {denied:?}"
+    );
+    let still_owned = lookup(&f.dp, f.key, "file", raw_file).await;
+    assert_eq!(
+        still_owned.status, 200,
+        "the file remains readable to its actual owner: {still_owned:?}"
+    );
+    assert_eq!(still_owned.body["record"]["record_id"], file["record_id"]);
+    no_membership(&related(&f.dp, full_key, &store, "vector_store_file", raw_file).await);
+    let parent = lookup(&f.dp, full_key, "vector_store", raw_store).await;
+    assert_eq!(
+        parent.status, 200,
+        "Self still owns the original collection: {parent:?}"
+    );
+    let discover = Uuid::new_v4();
+    let reserved = reserve_relation(
+        &f.dp,
+        full_key,
+        discover,
+        &parent.body["record"],
+        "vector_store_file",
+        "discover",
+        &[],
+    )
+    .await;
+    assert_eq!(
+        reserved.status, 200,
+        "the current owner may discover the collection: {reserved:?}"
+    );
+    assert_eq!(reserved.body["state"].as_str(), Some("reserved"));
+    let observed = commit_relation(
+        &f.dp,
+        full_key,
+        discover,
+        json!([{"kind":"file","raw_id":raw_file}]),
+    )
+    .await;
+    discovery_does_not_release_unreadable_child(&observed, raw_file);
+}
+
 // 撤权不抹掉已接受的逐项产物；过期 worker 和部分失败都不能留下半份归属或账单。
 #[tokio::test]
 async fn reclaimed_batch_lease_atomically_binds_each_entries_artifacts_after_key_revocation() {
