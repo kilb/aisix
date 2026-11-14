@@ -1528,6 +1528,8 @@ async fn canonical_terminal_preserves_reported_modality_zero_and_never_invents_a
         .records
         .remove(0);
     let mut usage = terminal_usage("");
+    usage.prompt_tokens = 15;
+    usage.completion_tokens = 7;
     usage.prompt_audio_tokens = Some(0);
     usage.prompt_image_tokens = Some(4);
     usage.completion_audio_tokens = Some(2);
