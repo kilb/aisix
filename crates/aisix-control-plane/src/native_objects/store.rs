@@ -1,4 +1,4 @@
-//! 归属不可改写；读写按租户、提交、对象的顺序加锁，不拿资源全局锁。
+//! 归属不可改写；提交写先串行同一操作，再按租户、提交、对象加锁，不拿资源全局锁。
 
 use aisix_core::native_realtime::SignedSipIntakeRequest;
 use std::collections::{BTreeSet, HashMap};
@@ -27,7 +27,7 @@ mod foundation;
 mod metering;
 mod realtime;
 mod relations;
-use aisix_core::native_metering::{ReconciliationRequest, TypedCompleteRequest};
+use aisix_core::native_metering::{MeteringTarget, ReconciliationRequest, TypedCompleteRequest};
 use aisix_core::native_realtime::{
     AppendLiveUsageRequest, CheckpointLiveSessionRequest, ClaimLiveSessionsRequest,
     CreateLiveSessionRequest, MintCredentialRequest, RedeemCredentialRequest,
@@ -1441,6 +1441,47 @@ pub(crate) async fn execute(
         .execute(&mut *conn)
         .await
         .map_err(unavailable)?;
+    // 同一提交可跨普通、引用、管理及实时入口重放，必须先于任何行锁串行。
+    let operation_id = match &command {
+        Command::Begin(body) => Some(body.operation_id),
+        Command::Bind(body) => Some(body.operation_id),
+        Command::BeginRelated(body) => Some(body.submission.operation_id),
+        Command::BindRelated(body) => Some(body.binding.operation_id),
+        Command::ReserveRelations(body) => Some(body.operation_id),
+        Command::CommitRelations(body) => Some(body.operation_id),
+        Command::ResolveReservation(body) => Some(body.operation_id),
+        Command::ReserveDelete(body) => Some(body.operation_id),
+        Command::CommitDelete(body) => Some(body.operation_id),
+        Command::SignedSipIntake(body) => Some(body.operation_id),
+        Command::MintCredential(body) => Some(body.operation_id),
+        Command::CreateLiveSession(body) => Some(body.operation_id),
+        Command::AppendLiveUsage(body) => Some(body.operation_id),
+        Command::CheckpointLiveSession(body) => Some(body.lease.operation_id),
+        Command::CompleteTyped(TypedCompleteRequest { target, .. })
+        | Command::Reconciliation(ReconciliationRequest { target, .. }) => match target {
+            MeteringTarget::Operation { operation_id, .. } => Some(*operation_id),
+            MeteringTarget::Object { .. } => None,
+        },
+        Command::Lookup(_)
+        | Command::Owned(_)
+        | Command::Tombstone(_)
+        | Command::Claim(_)
+        | Command::Renew(_)
+        | Command::Reschedule(_)
+        | Command::Complete(_)
+        | Command::LookupRelations(_)
+        | Command::BindObservedArtifacts(_)
+        | Command::RedeemCredential(_)
+        | Command::ClaimLiveSessions(_) => None,
+    };
+    if let Some(operation_id) = operation_id {
+        let identity = format!("native-operation:{}:{operation_id}", state.env.env_id);
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
+            .bind(identity)
+            .execute(&mut *conn)
+            .await
+            .map_err(unavailable)?;
+    }
     match command {
         Command::Begin(body) => begin(conn, state, dp, *body).await,
         Command::Bind(body) => bind(conn, state, dp, body).await,
