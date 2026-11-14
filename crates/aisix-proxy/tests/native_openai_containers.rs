@@ -530,6 +530,7 @@ async fn create(router: axum::Router, upstream: &MockServer, id: &str, caller: &
         .and(path("/v1/containers"))
         .respond_with(ResponseTemplate::new(200).set_body_json(container(id)))
         .expect(1)
+        .up_to_n_times(1)
         .mount(upstream)
         .await;
     let response = request(

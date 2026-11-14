@@ -563,6 +563,7 @@ async fn create_conversation(router: axum::Router, upstream: &MockServer, id: &s
         .and(path("/v1/conversations"))
         .respond_with(ResponseTemplate::new(200).set_body_json(conversation(id)))
         .expect(1)
+        .up_to_n_times(1)
         .mount(upstream)
         .await;
     let response = request(
@@ -852,6 +853,7 @@ async fn conversation_initial_automatic_items_are_discovered_from_owned_parent_a
         .and(path("/v1/conversations/conv_initial/items"))
         .respond_with(ResponseTemplate::new(200).set_body_json(page(vec![item("msg_auto")], true)))
         .expect(1)
+        .up_to_n_times(1)
         .mount(&upstream)
         .await;
     let (router, _) = app(&upstream.uri(), registry.clone());
