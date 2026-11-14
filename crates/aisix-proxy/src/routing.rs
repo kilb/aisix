@@ -68,6 +68,8 @@ const FALLBACK_ALL_UNHEALTHY_RETRY_AFTER: Duration = Duration::from_secs(30);
 /// which preserves the historical behavior exactly.
 pub fn is_retryable(err: &BridgeError, retry_on_429: bool, fallback_on_statuses: &[u16]) -> bool {
     match err {
+        // 本地归属服务故障不能触发已接受调用的重复派发。
+        BridgeError::DependencyUnavailable => false,
         BridgeError::UpstreamStatus { status, .. } => {
             if fallback_on_statuses.contains(status) {
                 return true;
@@ -4614,6 +4616,20 @@ mod tests {
         assert!(reg
             .pick_targets("v", &routing, &routing.targets, "")
             .is_empty());
+    }
+
+    #[test]
+    fn compat_dependency_failure_never_retries_or_cools_an_upstream() {
+        let error = BridgeError::DependencyUnavailable;
+        let config = aisix_core::CooldownConfig::default();
+        assert!(!is_retryable(&error, true, &[503]));
+        assert!(!bridge_target_unusable(&error));
+        assert!(crate::cooldown::decide_cooldown(&error, Some(&config)).is_none());
+        assert!(is_retryable(
+            &BridgeError::upstream_status(503, "unavailable"),
+            true,
+            &[503],
+        ));
     }
 
     #[test]

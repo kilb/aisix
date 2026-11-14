@@ -14,6 +14,7 @@ import { BentoGrid, Card, CardHeader, CardMessage, Metric, MetricSkeleton, PageH
 import { RankBars } from "../../components/charts";
 import { CardLines } from "./LibrarySync";
 import { Count } from "./kit";
+import { ChevronDown } from "lucide-react";
 
 /** A row's identity: a key can appear again with a later `effective_from`. */
 const rowId = (e: CatalogueEntry) => `${e.key}@${e.effective_from ?? ""}`;
@@ -68,7 +69,7 @@ export function Catalogue(_props: TabProps) {
           <p className="mt-4 text-caption text-on-inverse-muted">范围：全部 {items === null ? "—" : fmtInt(items.length)} 个目录版本。来源页面、抄录日期、备注与价格原文完整保留。</p>
         </Card>
       </BentoGrid>
-      <Card className="mb-0">
+      <Card className="catalogue-records mb-0">
         <CardHeader number={3} className="mb-0" title={<>目录条目{items && <Count n={items.length} />}</>} />
         {!failure && items === null && <Loading />}
         {items !== null && items.length === 0 && <EmptyState text="目录里还没有条目" />}
@@ -95,16 +96,16 @@ export function Catalogue(_props: TabProps) {
                 const expanded = open === id;
                 return (
                   <Fragment key={id}>
-                    <tr>
-                      <td>
+                    <tr data-finance-record>
+                      <td data-label="条目">
                         <code>{e.key}</code>
                       </td>
-                      <td>
+                      <td data-label="别名">
                         <span className="trunc [--trunc:11rem]" title={e.aliases.join("、")}>
                           {e.aliases.length ? e.aliases.join("、") : "—"}
                         </span>
                       </td>
-                      <td>
+                      <td data-label="来源">
                         {e.source_url ? (
                           <a
                             href={e.source_url}
@@ -119,33 +120,35 @@ export function Catalogue(_props: TabProps) {
                           "—"
                         )}
                       </td>
-                      <td className="tabular">
+                      <td data-label="日期" className="tabular">
                         {e.effective_from ? `${fmtBeijing(e.effective_from)} 起` : (e.as_of ?? "—")}
                         {e.effective_from && e.as_of && <div className="cell-note">抄录于 {e.as_of}</div>}
                       </td>
                       {/* The notes take whatever width is left, cut to one line: their whole text is in the title and the expanded entry. */}
-                      <td className="w-full max-w-0 text-caption text-muted">
+                      <td data-label="说明" className="w-full max-w-0 text-caption text-muted">
                         <span className="block truncate" title={e.notes ?? undefined}>
                           {e.notes ?? "—"}
                         </span>
                       </td>
-                      <td className="right">
+                      <td data-label="操作" className="right">
                         <Button
                           size="sm"
                           kind="quiet"
                           type="button"
                           aria-expanded={expanded}
                           aria-label={`${expanded ? "收起" : "展开"} ${e.key}`}
+                          title={expanded ? "收起完整价格" : "展开完整价格"}
+                          className="finance-icon-button"
                           onClick={() => setOpen(expanded ? null : id)}
                         >
-                          {expanded ? "收起" : "展开"}
+                          <ChevronDown aria-hidden style={{ transform: expanded ? "rotate(180deg)" : undefined }} />
                         </Button>
                       </td>
                     </tr>
                     {expanded && (
                       <tr className="dt-detail">
                         <td colSpan={6} className="whitespace-normal">
-                          <div className="grid gap-6 rounded-cell bg-well p-4 desktop:grid-cols-[minmax(0,2fr)_minmax(0,3fr)]">
+                          <div className="catalogue-entry-detail grid gap-6 p-4">
                             <div className="min-w-0">
                               <div className="library-card-block">
                                 <p className="m-0 font-medium">完整价格 · 美元</p>

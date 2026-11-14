@@ -264,32 +264,32 @@ export function GroupDetail({
                     .join("、");
                   const head = baseline?.card?.default?.base;
                   return (
-                    <tr key={row.model_id} data-state={baseline ? "priced" : "unpriced"}>
-                      <td className="font-medium">
+                    <tr data-finance-record key={row.model_id} data-state={baseline ? "priced" : "unpriced"}>
+                      <td data-label="模型" className="font-medium">
                         <span className="trunc" title={row.name}>
                           {row.name}
                         </span>
                       </td>
-                      <td className="num">
+                      <td data-label="基准价 输入" className="num">
                         {!baseline ? <span className="grp-unpriced">未定价</span> : head?.input ? `$${head.input} / 百万 tokens` : "—"}
                       </td>
-                      <td className="num">{!baseline ? "—" : head?.output ? `$${head.output} / 百万 tokens` : "—"}</td>
-                      <td>{baseline ? <BaselineSourceBadge revision={baseline} /> : "—"}</td>
-                      <td>
+                      <td data-label="基准价 输出" className="num">{!baseline ? "—" : head?.output ? `$${head.output} / 百万 tokens` : "—"}</td>
+                      <td data-label="来源">{baseline ? <BaselineSourceBadge revision={baseline} /> : "—"}</td>
+                      <td data-label="换算率">
                         <span className={rate.label === "覆盖" ? "tag grp-override" : "tag"}>{rate.label}</span>{" "}
                         <span className="tabular">{rate.rate ?? "未设置"}</span>
                         {later && <span className="cell-note">待生效 {later}</span>}
                       </td>
-                      <td className="num tabular">
+                      <td data-label="¥/百万 输入" className="num tabular">
                         {price?.input_per_million_cny === undefined ? "—" : fmtCnyPerMillion(price.input_per_million_cny)}
                       </td>
-                      <td className="num tabular">
+                      <td data-label="¥/百万 输出" className="num tabular">
                         {price?.output_per_million_cny === undefined ? "—" : fmtCnyPerMillion(price.output_per_million_cny)}
                       </td>
-                      <td className="num tabular">
+                      <td data-label="毛利（30 天）" className="num tabular">
                         <MarginCell row={margins.get(row.model_id)} />
                       </td>
-                      <td className="right">
+                      <td data-label="操作" className="right">
                         {canEdit && (
                           <span className="row-actions">
                             <Button size="sm" onClick={() => setPicked({ modelId: row.model_id, name: row.name, mode: "override" })}>

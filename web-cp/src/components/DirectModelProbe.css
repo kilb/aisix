@@ -6,7 +6,7 @@
 .direct-probe-capability-toggle { display: inline-flex; align-items: center; gap: 10px; min-height: 44px; cursor: pointer; font-size: var(--fs-14); }
 .direct-probe-capability-toggle input { width: 18px; height: 18px; flex: none; accent-color: var(--ink); }
 .direct-probe-capability-toggle:has(input:disabled) { color: var(--text-muted); cursor: wait; }
-.direct-probe-options > p { max-width: 100ch; color: var(--text-muted); font-size: var(--fs-13); line-height: 1.65; }
+.direct-probe-options > p { max-width: 100ch; color: var(--ink); font-size: var(--fs-13); line-height: 1.65; }
 .direct-probe-cost {
   margin: 12px 0 20px;
   max-width: 100ch;
@@ -52,14 +52,15 @@
 .direct-probe-bar::-webkit-progress-bar { background: var(--well); }
 .direct-probe-bar::-webkit-progress-value { background: var(--ink); }
 .direct-probe-bar::-moz-progress-bar { background: var(--ink); }
-.direct-probe .dt-wrap { max-width: 100%; border-top: 1px solid var(--divider); }
-.direct-probe .dt { min-width: 1320px; }
-.direct-probe .dt th { white-space: nowrap; }
-.direct-probe .dt .direct-probe-model { min-width: 220px; max-width: 320px; white-space: normal; overflow-wrap: anywhere; }
+.direct-probe .ops-record-table { border-top: 1px solid var(--divider); }
+.direct-probe .dt { min-width: 0; }
+.direct-probe .dt th { white-space: normal; }
+.direct-probe .dt .direct-probe-model { min-width: 0; white-space: normal; overflow-wrap: anywhere; }
 .direct-probe-model strong { display: block; font-weight: 500; }
 .direct-probe-model > span, .direct-probe-model code { display: block; margin-top: 4px; color: var(--text-muted); font-size: var(--fs-13); }
-.direct-probe .dt .direct-probe-detail { min-width: 240px; max-width: 380px; white-space: normal; overflow-wrap: anywhere; }
-.direct-probe .dt .direct-probe-capability { min-width: 240px; max-width: 340px; white-space: normal; overflow-wrap: anywhere; }
+.direct-probe-model > .direct-probe-status { display: inline-flex; margin-top: 8px; }
+.direct-probe .dt .direct-probe-detail { min-width: 0; white-space: normal; overflow-wrap: anywhere; }
+.direct-probe .dt .direct-probe-capability { min-width: 0; white-space: normal; overflow-wrap: anywhere; }
 .direct-probe-capability-result > strong { display: block; font-weight: 500; }
 .direct-probe-capability-result dl { margin-top: 8px; }
 .direct-probe-capability-result dl > div { display: flex; justify-content: space-between; gap: 12px; font-size: var(--fs-13); }
@@ -80,3 +81,39 @@
 .direct-probe-history label { display: grid; gap: 6px; font-size: var(--fs-13); color: var(--text-2); }
 .direct-probe-history select, .direct-probe-history input { min-height: 44px; max-width: 240px; }
 .direct-probe-detail > span, .direct-probe-detail > strong, .direct-probe-detail > code { display: block; margin-top: 4px; }
+
+/* 操作与费用说明在测试之前，输出采用可独立横向滚动的数据工作区。 */
+.direct-probe-options {
+  padding: 12px 16px;
+  border-left: 2px solid var(--line);
+  background: var(--well);
+}
+.direct-probe-options > p { max-width: 76ch; margin-top: 4px; }
+.direct-probe-cost { max-width: 80ch; margin-block: 16px 20px; }
+.direct-probe-metrics { gap: 0; padding-block: 16px; }
+.direct-probe-metrics > div { min-width: 0; padding-inline: 20px; }
+.direct-probe-metrics > div:first-child { padding-left: 0; }
+.direct-probe-metrics > div + div { border-left: 1px solid var(--line); }
+.direct-probe-metrics .metric { font-size: 28px; font-weight: 500; line-height: 36px; }
+.direct-probe-metrics p { margin-bottom: 6px; }
+.direct-probe-status { font-weight: 500; }
+.direct-probe-status[data-status="available"] { color: var(--success); }
+.direct-probe-status[data-status="failed"],
+.direct-probe-status[data-status="timeout"] { color: var(--danger); }
+.direct-probe-capability-result dl > div { gap: 16px; padding-block: 4px; border-bottom: 1px solid var(--line); }
+.direct-probe-capability-result dd { margin: 0; color: var(--ink); font-variant-numeric: tabular-nums; }
+.direct-probe-method { max-width: 88ch; }
+.direct-probe-history { margin-top: 0; padding-top: 0; border-top: 0; }
+.direct-probe-history h3 { font-size: 17px; line-height: 26px; }
+.direct-probe-history > .direct-probe-method { margin-top: 8px; }
+.direct-probe-history label { min-width: 0; gap: 8px; }
+.direct-probe-history select,
+.direct-probe-history input { max-width: 100%; }
+.direct-probe-history .dt { min-width: 0; }
+@media (max-width: 720px) {
+  .direct-probe-metrics { row-gap: 16px; }
+  .direct-probe-metrics > div { padding-inline: 16px; }
+  .direct-probe-metrics > div:nth-child(3) { padding-left: 0; border-left: 0; }
+  .direct-probe-metrics .metric { font-size: 24px; line-height: 32px; }
+  .direct-probe-history label { width: 100%; }
+}

@@ -1,3 +1,4 @@
+import "./operations.css";
 import { keySearchText } from "../lib/operationalRecords";
 import { useRecordTable } from "../lib/recordTable";
 import { RecordTools, RecordPager } from "../components/RecordTools";
@@ -36,7 +37,7 @@ import { RankBars } from "../components/charts";
 import { Button } from "../ui/Button";
 import { useRefusalFocus } from "../ui/Field";
 import { CopyButton } from "../ui/CopyButton";
-import { DataTable, Loading } from "../ui/DataTable";
+import { OperationalTable as DataTable, Loading } from "../components/OperationalTable";
 import { EmptyState } from "../ui/EmptyState";
 import { GroupName } from "../ui/GroupName";
 import { Lamp, type LampState } from "../ui/Lamp";
@@ -438,7 +439,7 @@ export function Tenants({ operator, canEdit }: TabProps) {
   }
 
   return (
-    <>
+    <div className="cp-operations cp-tenants">
       {/* 桌面与平板：6 + 6；列表和默认配置占 12，详情打开后 6 + 6。 */}
       <PageHeader
         title="租户"
@@ -460,7 +461,7 @@ export function Tenants({ operator, canEdit }: TabProps) {
       />
 
       <BentoGrid className="mb-3" aria-label="租户当前概况">
-        <Card className={span.d6}>
+        <Card className={`${span.d6} ops-snapshot`}>
           <CardHeader number={1} title="全部租户" description={listError ? "刷新失败，保留最近成功读取的完整列表" : "完整列表的当前快照"} />
           {all === null && !listError ? <MetricSkeleton /> : <Metric size="hero">{all === null ? "—" : fmtInt(all.length)}</Metric>}
           <CardFooter>
@@ -469,13 +470,13 @@ export function Tenants({ operator, canEdit }: TabProps) {
             )}
           </CardFooter>
         </Card>
-        <Card className={span.d6} tone="inverse">
+        <Card className={`${span.d6} ops-snapshot`}>
           <CardHeader number={2} title="正常租户" description={listError ? "读取失败；已有值来自最近成功读取" : "正常状态仍受模型授权、分组与账务限制"} />
           {all === null && !listError ? <MetricSkeleton /> : <Metric size="display">{count("active")}</Metric>}
           <CardFooter>
-            <dl className="grid grid-cols-2 gap-6 border-t border-surface/12 pt-5">
-              <div><dt className="font-mono text-meta text-on-inverse-muted">待审核</dt><dd className="mt-2"><Metric size="value">{count("pending")}</Metric></dd></div>
-              <div><dt className="font-mono text-meta text-on-inverse-muted">已停用</dt><dd className="mt-2"><Metric size="value">{count("suspended")}</Metric></dd></div>
+            <dl className="grid grid-cols-2 gap-6 border-t border-line pt-5">
+              <div><dt className="text-caption text-muted">待审核</dt><dd className="mt-2"><Metric size="value">{count("pending")}</Metric></dd></div>
+              <div><dt className="text-caption text-muted">已停用</dt><dd className="mt-2"><Metric size="value">{count("suspended")}</Metric></dd></div>
             </dl>
           </CardFooter>
         </Card>
@@ -528,8 +529,7 @@ export function Tenants({ operator, canEdit }: TabProps) {
                       <th>名称</th>
                       <th>状态</th>
                       <th className="side-opt">计费方式</th>
-                      <th className="right side-opt">成员</th>
-                      <th className="right side-opt">密钥</th>
+                      <th className="side-opt">成员 / 密钥</th>
                       <th>下发</th>
                       {canEdit && <th className="right">操作</th>}
                     </tr>
@@ -555,8 +555,7 @@ export function Tenants({ operator, canEdit }: TabProps) {
                           <TenantStatus status={t.status} />
                         </td>
                         <td className="side-opt text-text-2">{BILLING_LABEL[t.billing_mode] ?? t.billing_mode}</td>
-                        <td className="right side-opt">{fmtInt(t.member_count)}</td>
-                        <td className="right side-opt">{fmtInt(t.key_count)}</td>
+                        <td className="side-opt"><dl className="ops-cell-facts"><div><dt>成员</dt><dd>{fmtInt(t.member_count)}</dd></div><div><dt>密钥</dt><dd>{fmtInt(t.key_count)}</dd></div></dl></td>
                         <td>
                           <RolloutBadge rollout={t.rollout} />
                         </td>
@@ -633,7 +632,7 @@ export function Tenants({ operator, canEdit }: TabProps) {
           />
         )}
       </div>
-    </>
+    </div>
   );
 }
 
@@ -651,7 +650,6 @@ function TenantDetail({
   tenant,
   canEdit,
   tick,
-  number,
   onView,
   onRefresh,
   onReload,
@@ -705,7 +703,7 @@ function TenantDetail({
 
   return (
     <SidePanel
-      title={<><span aria-hidden="true" className="mr-2 font-mono text-meta text-muted">{String(number).padStart(2, "0")} —</span><span title={tenant.name}>{tenant.name}</span></>}
+      title={<span title={tenant.name}>{tenant.name}</span>}
       label={`租户详情：${tenant.name}`}
       extra={<RolloutBadge rollout={tenant.rollout} />}
       onClose={onClose}

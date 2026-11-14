@@ -72,4 +72,6 @@ mod aad_token_mint;
 mod bridge;
 mod wire;
 
-pub use bridge::{resolve_credential, AzureCredential, AzureOpenAiBridge, AzureUpstreamRef};
+pub use bridge::{
+    media_request_parts, resolve_credential, AzureCredential, AzureOpenAiBridge, AzureUpstreamRef,
+};

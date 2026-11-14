@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use ring::aead;
-use sha2::{Digest, Sha256};
 
 /// Settings read once at startup when `proxy.platform.enabled` is true.
 ///
@@ -25,7 +24,7 @@ pub struct PlatformSettings {
 impl PlatformSettings {
     /// 由平台密钥派生 id_key（SHA-256），并一次派生出各个封装所用的密钥。
     pub fn from_secret(secret: &str) -> PlatformSettings {
-        let id_key: [u8; 32] = Sha256::digest(secret.as_bytes()).into();
+        let id_key = aisix_core::native_objects::platform_id_key_from_secret(secret);
         PlatformSettings {
             seal_keys: Arc::new(crate::opaque_id::SealKeys::new(
                 &crate::opaque_id::seal_key(&id_key),

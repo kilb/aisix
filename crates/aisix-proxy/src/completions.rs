@@ -19,6 +19,7 @@
 
 mod stream;
 
+use crate::request_json::Json;
 use aisix_core::AppliedGuardrail;
 use aisix_gateway::{
     BridgeCapability, BridgeError, ChatMessage, ChatResponse, CompletionByteStream, FinishReason,
@@ -28,7 +29,6 @@ use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, UsageEvent};
 use axum::extract::State;
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use futures::StreamExt;
 use serde_json::Value;
 use std::sync::Arc;
@@ -139,6 +139,7 @@ struct CompletionUsage {
     /// inferred.
     cached_prompt_tokens: u32,
     cache_write_tokens: Option<u32>,
+    cache_usage_reported: Option<bool>,
     modality: aisix_gateway::ModalityTokens,
     /// `completion_tokens_details.reasoning_tokens` and `total_tokens`,
     /// recorded exactly as `/v1/chat/completions` records them; 0 when the
@@ -164,7 +165,7 @@ pub async fn completions(
     // cap) maps to the OpenAI envelope instead of axum's stock
     // text/plain rejection — same discriminate-then-map pattern as
     // chat.rs / messages.rs.
-    body: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
+    body: Result<Json<Value>, crate::request_json::JsonRejection>,
 ) -> Response {
     let started = Instant::now();
     let Json(body) = match body {
@@ -1221,6 +1222,7 @@ async fn dispatch(
                     completion_tokens: 0,
                     cached_prompt_tokens: 0,
                     cache_write_tokens: None,
+                    cache_usage_reported: None,
                     modality: Default::default(),
                     reasoning_tokens: 0,
                     upstream_total_tokens: 0,
@@ -1284,6 +1286,7 @@ async fn dispatch(
             let mut output_capture_safe = true;
             if !resolved_chain.is_empty() {
                 let synth = ChatResponse {
+                    native_envelope: None,
                     logprobs: None,
                     more_choices: Vec::new(),
                     id: String::new(),
@@ -1454,6 +1457,7 @@ impl CompletionUsage {
             completion_tokens: self.completion_tokens,
             cached_prompt_tokens: self.cached_prompt_tokens,
             cache_write_tokens: self.cache_write_tokens,
+            cache_usage_reported: self.cache_usage_reported,
             modality: self.modality,
             reasoning_tokens: self.reasoning_tokens,
             upstream_total_tokens: self.upstream_total_tokens,
@@ -1511,11 +1515,19 @@ fn extract_completion_usage(body: &Value) -> Option<CompletionUsage> {
             .and_then(Value::as_u64)
             .map_or(0, |n| n.min(u32::MAX as u64) as u32)
     };
+    let cache_usage_reported = Some(
+        usage
+            .pointer("/prompt_tokens_details/cached_tokens")
+            .and_then(Value::as_u64)
+            .is_some()
+            || cache_write_tokens.is_some(),
+    );
     Some(CompletionUsage {
         prompt_tokens,
         completion_tokens,
         cached_prompt_tokens,
         cache_write_tokens,
+        cache_usage_reported,
         modality: aisix_gateway::ModalityTokens::from_openai_details(
             usage.get("prompt_tokens_details"),
             usage.get("completion_tokens_details"),
@@ -1537,6 +1549,7 @@ pub(crate) fn completion_usage_stats(body: &Value) -> Option<UsageStats> {
     Some(UsageStats {
         cached_prompt_tokens: u.cached_prompt_tokens,
         cache_write_tokens: u.cache_write_tokens,
+        cache_usage_reported: u.cache_usage_reported,
         modality: u.modality,
         reasoning_tokens: u.reasoning_tokens,
         upstream_total_tokens: u.upstream_total_tokens,
@@ -1642,6 +1655,7 @@ fn emit_usage_event(
         completion_tokens: usage.completion_tokens,
         cached_prompt_tokens: usage.cached_prompt_tokens,
         cache_write_tokens: usage.cache_write_tokens,
+        cache_usage_reported: usage.cache_usage_reported,
         modality_tokens: usage.modality,
         reasoning_tokens: usage.reasoning_tokens,
         total_tokens: usage.upstream_total_tokens,
@@ -1870,6 +1884,21 @@ mod tests {
     use std::sync::Arc;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn legacy_cache_presence_survives_the_usage_stats_conversion() {
+        for (details, expected) in [
+            (serde_json::json!({"cached_tokens":0}), true),
+            (serde_json::json!({}), false),
+        ] {
+            let usage = super::completion_usage_stats(&serde_json::json!({"usage":{
+                "prompt_tokens":100,"completion_tokens":1,"prompt_tokens_details":details
+            }}))
+            .unwrap();
+            assert_eq!(usage.cache_usage_reported(), Some(expected));
+            assert_eq!(usage.cached_prompt_tokens, 0);
+        }
+    }
 
     fn cfg() -> ProxyConfig {
         ProxyConfig {
@@ -2817,6 +2846,85 @@ mod tests {
         let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["object"], "text_completion");
+    }
+
+    #[tokio::test]
+    async fn io_audit_completions_counts_every_upstream_choice_on_original_event() {
+        use tower::ServiceExt;
+
+        let upstream = MockServer::builder().start().await;
+        let upstream_wire = serde_json::to_string(&serde_json::json!({
+                "id":"cmpl-audit", "object":"text_completion", "created":1,
+                "model":"gpt-3.5-turbo-instruct",
+                "choices":[
+                    {"index":0,"text":"A汉😀","finish_reason":"stop"},
+                    {"index":1,"text":"Z","finish_reason":"stop"}
+                ],
+                "usage":{"prompt_tokens":10,"completion_tokens":4,"total_tokens":14}
+        }))
+        .unwrap();
+        Mock::given(method("POST"))
+            .and(path("/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(upstream_wire.clone()),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("instruct"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let (audit_tx, mut updates) = tokio::sync::mpsc::channel(4);
+        let app = crate::build_router(
+            crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+                .without_cache()
+                .with_usage_sink(aisix_obs::UsageSink::new(tx).with_io_audit_sender(audit_tx)),
+        );
+        let request = serde_json::json!({"model":"instruct","prompt":["A","汉😀"],"n":2});
+        let response = app.oneshot(make_req(request)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let event = rx
+            .try_recv()
+            .expect("upstream original precedes client body polling");
+        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(response["choices"].as_array().unwrap().len(), 2);
+        assert!(event.is_final_attempt);
+        assert!(!event.event_id.is_empty());
+        assert_eq!((event.prompt_tokens, event.completion_tokens), (10, 4));
+        let requests = upstream.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let upstream_request: serde_json::Value =
+            serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(upstream_request["prompt"], serde_json::json!(["A", "汉😀"]));
+        let audit = event
+            .io_audit
+            .expect("original event includes upstream audit");
+        let audit = serde_json::to_value(audit).unwrap();
+        assert_eq!(audit["version"], 2);
+        assert_eq!(audit["boundary"], "upstream_attempt");
+        assert_eq!(audit["transport"], "http_entity");
+        assert_eq!(audit["exchange_count"], 1);
+        assert_eq!(audit["request_complete"], true);
+        assert_eq!(audit["request_body_bytes"], requests[0].body.len() as u64);
+        assert_eq!(audit["response_body_bytes"], upstream_wire.len() as u64);
+        assert_eq!(audit["response_complete"], true);
+        assert_eq!(audit["input_text"]["utf8_bytes"], 8);
+        assert_eq!(audit["input_text"]["unicode_scalars"], 3);
+        assert_eq!(audit["input_text"]["complete"], true);
+        assert_eq!(audit["output_text"]["utf8_bytes"], 9);
+        assert_eq!(audit["output_text"]["unicode_scalars"], 4);
+        assert_eq!(audit["output_text"]["complete"], true);
+        assert!(rx.try_recv().is_err(), "one original per exchange");
+        assert!(
+            updates.try_recv().is_err(),
+            "original v2 audit needs no sidecar amendment"
+        );
     }
 
     #[tokio::test]

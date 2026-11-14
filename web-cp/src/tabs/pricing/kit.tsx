@@ -9,7 +9,7 @@ export function FormGrid({ cols = 2, className, ...props }: ComponentProps<"div"
       <div
         {...props}
         className={cn(
-          "grid items-start gap-x-4 gap-y-4 @lg:grid-cols-2 [&_.field]:mb-0 [&_label.check]:mb-0 [&>.field.wide]:col-span-full",
+          "finance-form-grid grid items-start gap-x-4 gap-y-5 @lg:grid-cols-2 [&_.field]:mb-0 [&_label.check]:mb-0 [&>.field.wide]:col-span-full",
           cols === 3 && "@3xl:grid-cols-3",
           className,
         )}
@@ -29,7 +29,7 @@ export function CardFooter({ className, children }: { className?: string; childr
 
 /** 卡片标题旁的完整条目计数。 */
 export function Count({ n }: { n: number }) {
-  return <span className="ml-2 inline-flex rounded-full bg-ink/6 px-2 py-1 font-mono text-micro font-normal tabular-nums text-ink-soft">{n.toLocaleString("zh-CN")}</span>;
+  return <span className="finance-count ml-2 inline-flex items-center px-2 py-1 text-caption font-normal tabular-nums text-ink-soft">{n.toLocaleString("zh-CN")}</span>;
 }
 
 /** 明细先于表单阅读；桌面分为八加四列，窄屏顺序堆叠。 */

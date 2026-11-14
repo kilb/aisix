@@ -26,8 +26,8 @@ use aisix_gateway::{ChatFormat, ChatMessage, Role};
 use sha2::{Digest, Sha256};
 use std::hash::{Hash, Hasher};
 
-// 消息材料改变时必须升级编码域；旧 Redis 条目保留到 TTL，但不再参与新版本命中。
-const KEY_ENCODING_VERSION: u64 = 2;
+// Chat 原生 envelope 的持久化形状改变，旧 exact/semantic 条目保留到 TTL，但不再命中。
+const KEY_ENCODING_VERSION: u64 = 3;
 
 /// [`Hasher`] adapter over SHA-256, used only to derive cache fingerprints.
 ///
@@ -458,6 +458,36 @@ fn quantise_milli(v: f64) -> u32 {
 #[cfg(test)]
 mod tests {
 
+    fn compat_chat_previous_cache_fixture() -> super::CacheKey {
+        super::CacheKey {
+            model: "gpt-4o".into(),
+            messages: vec![("user".into(), "hello".into())],
+            temperature_milli: Some(700),
+            top_p_milli: None,
+            max_tokens: Some(256),
+            extras: vec![("seed".into(), "42".into())],
+            policy_id: "policy-1".into(),
+            purge_generation: 3,
+            scope_value: Some("key-1".into()),
+        }
+    }
+
+    #[test]
+    fn compat_chat_native_envelope_exact_cache_isolated_from_previous_payload_encoding() {
+        assert_ne!(
+            compat_chat_previous_cache_fixture().fingerprint(),
+            "b6480e0d618dcc0ae0bb9c990477dd3c"
+        );
+    }
+
+    #[test]
+    fn compat_chat_native_envelope_semantic_cache_isolated_from_previous_payload_encoding() {
+        assert_ne!(
+            compat_chat_previous_cache_fixture().scope_fingerprint(),
+            "35a62de6966d4dad8d6efa0643d7ecc3"
+        );
+    }
+
     /// The Redis backend is shared and persistent, so the fingerprint must be
     /// stable by construction — not merely stable within one build. Rust
     /// documents `DefaultHasher`'s algorithm as unspecified across releases;
@@ -485,13 +515,13 @@ mod tests {
         // intentional, updating these constants is the moment to note in the
         // release that the existing cache becomes unreachable (a flush, not a
         // correctness event).
-        assert_eq!(fp, "b6480e0d618dcc0ae0bb9c990477dd3c");
+        assert_eq!(fp, "84b2e08e59daea1d8864162fe1ca2b82");
         assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
         assert_eq!(fp, key.fingerprint(), "must be deterministic");
 
         let scope = key.scope_fingerprint();
         assert_eq!(scope.len(), 32);
-        assert_eq!(scope, "35a62de6966d4dad8d6efa0643d7ecc3");
+        assert_eq!(scope, "86b948d9d50964c99bd29395039e4f73");
         assert_ne!(scope, fp, "the scope fingerprint excludes the messages");
 
         // Distinct requests stay distinct.
@@ -520,8 +550,8 @@ mod tests {
             scope_value: None,
         }
         .with_scope("policy-1", 3, None);
-        assert_eq!(key.fingerprint(), "90967b2f8eb1c7bc133b5b071017b315");
-        assert_eq!(key.scope_fingerprint(), "d3749f0589aa620b2e46bc841f1c81d1");
+        assert_eq!(key.fingerprint(), "d1f036e122ac023a214d33027bf5206f");
+        assert_eq!(key.scope_fingerprint(), "50a1ce7e253dde98f3ae45355d1ddc4c");
     }
 
     /// Only `None` shares: an empty value that some scope produced is not a

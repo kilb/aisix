@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useId, useState, type CSSProperties } from "react";
+import { Pause, Play } from "lucide-react";
 import {
   ApiError,
   groups as groupApi,
@@ -186,7 +187,7 @@ export function Keys({
   return (
     <>
       <PageHeader
-        title="密钥"
+        title="API 密钥"
         eyebrow={visibleScope}
         dataLead={items === null ? "管理调用凭据、模型范围与使用限制。" : <>
           当前可见 <span className="font-medium text-ink">{formatCount(items.length)}</span> 把密钥，
@@ -194,19 +195,15 @@ export function Keys({
           {active ? "实际调用仍受组织授权和额度约束。" : "组织已停用，所有密钥暂时无法调用。"}
         </>}
       />
-      <BentoGrid>
+      <BentoGrid className="tenant-keys">
         <Card className={span.d5Wide}>
           <CardHeader number={1} title="当前可见密钥" />
-          <RecordTableToolbar search={{ value: table.query, onChange: table.setQuery, label: "搜索密钥", placeholder: "名称、公开前缀、归属或分组" }}>
-            <Field label="密钥状态"><select value={stateFilter} onChange={(e) => setStateFilter(e.target.value)}><option value="">全部状态</option>{["可用", "已被平台停用", "已停用", "已过期"].map((value) => <option key={value}>{value}</option>)}</select></Field>
-            <Field label="密钥分组"><select value={groupFilter} onChange={(e) => setGroupFilter(e.target.value)}><option value="">全部分组</option>{(groups ?? []).map((group) => <option key={group.id} value={group.id}>{group.display_name}</option>)}</select></Field>
-          </RecordTableToolbar>
           {items === null ? (listErr ? <CardMessage onRetry={() => void load()}>密钥读取失败，请重试。</CardMessage> : <MetricSkeleton />) : (
             <>
               <Metric size="hero">{formatCount(items.length)}</Metric>
               <CardFooter>
                 <p className="text-body text-ink-soft">{manager ? "组织成员及组织持有的全部密钥" : "仅包含归属你的密钥"}</p>
-                <p className="mt-2 font-mono text-meta text-ink-soft">完整可见列表 · 不包含已吊销密钥</p>
+                <p className="mt-2 text-caption text-ink-soft">完整可见列表 · 不包含已吊销密钥</p>
               </CardFooter>
             </>
           )}
@@ -226,6 +223,10 @@ export function Keys({
         </Card>
         <Card className={cn(span.d12, "keys-list")}>
           <CardHeader number={3} title="密钥列表" description="复制或查看明文会重新获取密钥；吊销后立即失效，无法恢复。" />
+          <RecordTableToolbar search={{ value: table.query, onChange: table.setQuery, label: "搜索密钥", placeholder: "名称、公开前缀、归属或分组" }}>
+            <Field label="密钥状态"><select value={stateFilter} onChange={(e) => setStateFilter(e.target.value)}><option value="">全部状态</option>{["可用", "已被平台停用", "已停用", "已过期"].map((value) => <option key={value}>{value}</option>)}</select></Field>
+            <Field label="密钥分组"><select value={groupFilter} onChange={(e) => setGroupFilter(e.target.value)}><option value="">全部分组</option>{(groups ?? []).map((group) => <option key={group.id} value={group.id}>{group.display_name}</option>)}</select></Field>
+          </RecordTableToolbar>
           {!active && <div className="note crit">组织已被停用，所有密钥暂时无法调用；这里只能吊销密钥。</div>}
           {minted && (
             <ShownOnce title="密钥明文（可再次复制）" value={minted} onDone={() => setMinted(null)}>
@@ -247,7 +248,7 @@ export function Keys({
           ) : items.length === 0 ? (
             <EmptyState mark="key" text="还没有密钥。" />
           ) : (
-            <DataTable>
+            <DataTable label="密钥列表">
               <thead>
                 <tr>
                   <th>名称</th>
@@ -269,12 +270,12 @@ export function Keys({
                   const models = modelsOf(k);
                   return (
                     <tr key={k.id}>
-                      <td>
+                      <td data-label="名称">
                         <span className="trunc [--trunc:144px] min-[1800px]:[--trunc:160px]" title={k.label}>
                           {k.label}
                         </span>
                       </td>
-                      <td>
+                      <td data-label="前缀">
                         <KeySecret
                           prefix={k.prefix}
                           className="acts mt-1.5 flex w-max justify-start min-[1800px]:mt-0 min-[1800px]:ml-2 min-[1800px]:inline-flex"
@@ -293,17 +294,17 @@ export function Keys({
                           }
                         />
                       </td>
-                      <td>
+                      <td data-label="归属">
                         <span className="trunc" style={{ "--trunc": "128px" } as CSSProperties} title={owner}>
                           {owner}
                         </span>
                       </td>
-                      <td>
+                      <td data-label="模型">
                         <span className="trunc [--trunc:120px] min-[1800px]:[--trunc:216px]" title={models}>
                           {models}
                         </span>
                       </td>
-                      <td>
+                      <td data-label="分组">
                         <GroupCell
                           k={k}
                           groups={groups}
@@ -313,27 +314,31 @@ export function Keys({
                           onChoose={(groupId) => void act(k, "group", () => keyApi.setGroup(k.id, groupId, k.version))}
                         />
                       </td>
-                      <td className="tabular [word-break:keep-all] max-[1799px]:whitespace-normal">
-                        <span className="block min-w-[5.75rem] max-w-[6.5rem] min-[1800px]:max-w-none">{limitsOf(k)}</span>
+                      <td className="tabular" data-label="限制">
+                        <span className="block">{limitsOf(k)}</span>
                       </td>
-                      <td>
+                      <td data-label="状态">
                         <Lamp state={state.lamp}>{state.text}</Lamp>
                         {state.note && (
                           <span className="hint cell-note max-w-[8rem] whitespace-normal min-[1800px]:max-w-none">{state.note}</span>
                         )}
                       </td>
-                      <td className="right">
+                      <td className="right" data-label="操作">
                         <span className="acts">
                           {/* The organisation's own switch, which the platform's overrides. */}
                           {active && !k.disabled_by_platform && (
                             <Button
                               size="sm"
+                              kind="quiet"
+                              className="tenant-icon-action"
+                              aria-label={k.disabled ? "启用" : "停用"}
+                              title={k.disabled ? "启用" : "停用"}
                               disabled={busy === k.id}
                               busy={busy === k.id && acting === "switch"}
                               busyLabel={k.disabled ? "启用" : "停用"}
                               onClick={() => void act(k, "switch", () => keyApi.setDisabled(k.id, !k.disabled, k.version))}
                             >
-                              {k.disabled ? "启用" : "停用"}
+                              {k.disabled ? <Play aria-hidden="true" /> : <Pause aria-hidden="true" />}
                             </Button>
                           )}
                           <TwoStep
@@ -651,14 +656,14 @@ function NewKeyForm({
   const noGroup = groups !== null && groups.length === 0;
 
   return (
-    <Card className={span.d12}>
+    <Card className={cn(span.d12, "tenant-key-create")}>
       <CardHeader number={4} title="新建密钥" description="先选择计价分组，再设置模型范围与限制。未填写的限制沿用组织上限。" />
       {readErr && (
         <div className="note crit" role="alert">
           {readErr}
         </div>
       )}
-      <form ref={form} className="grid min-w-0 gap-x-7 gap-y-5 tablet:grid-cols-2" onSubmit={submit} noValidate>
+      <form ref={form} className="tenant-form tenant-key-form grid min-w-0 gap-x-7 gap-y-5 tablet:grid-cols-2" onSubmit={submit} noValidate>
         <Field label="名称" wide error={errs.label}>
           {(aria) => <input value={label} onChange={(e) => setLabel(e.target.value)} {...aria} />}
         </Field>
@@ -858,7 +863,7 @@ function NewKeyForm({
             {err}
           </div>
         )}
-        <div className="col-span-full flex justify-end gap-2 border-t border-ink/7 pt-5">
+        <div className="tenant-form-actions col-span-full">
           <Button
             kind="primary"
             type="submit"

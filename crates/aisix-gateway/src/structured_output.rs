@@ -563,13 +563,33 @@ pub fn unwrap_json_tool_call(resp: &mut ChatResponse) {
     if !real_calls_remain {
         resp.message.extra.remove("tool_calls");
         resp.finish_reason = FinishReason::Stop;
-        resp.message.content = Some(json);
-        return;
+        resp.message.content = Some(json.clone());
+    } else {
+        resp.message.content = Some(match resp.message.content.take() {
+            Some(text) if !text.is_empty() => format!("{text}\n{json}"),
+            _ => json.clone(),
+        });
     }
-    resp.message.content = Some(match resp.message.content.take() {
-        Some(text) if !text.is_empty() => format!("{text}\n{json}"),
-        _ => json,
-    });
+    // 原生载体也必须反映合成工具的解包，否则假流会再次发出已移除的调用。
+    if let Some(blocks) = &mut resp.message.content_blocks {
+        blocks.retain(|block| {
+            let kind = block.get("type").and_then(serde_json::Value::as_str);
+            (real_calls_remain || kind != Some("text"))
+                && !(kind == Some("tool_use")
+                    && block.get("name").and_then(serde_json::Value::as_str)
+                        == Some(JSON_TOOL_NAME))
+        });
+        let text = if real_calls_remain
+            && blocks
+                .iter()
+                .any(|block| block.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+        {
+            format!("\n{json}")
+        } else {
+            json
+        };
+        blocks.push(serde_json::json!({"type":"text","text":text}));
+    }
 }
 
 /// Render a complete response as the chunk sequence a streaming client
@@ -583,9 +603,10 @@ pub fn unwrap_json_tool_call(resp: &mut ChatResponse) {
 /// accounting and every downstream encoder see an ordinary stream.
 pub fn response_into_fake_stream_chunks(resp: ChatResponse) -> Vec<ChatChunk> {
     let ChatResponse {
+        native_envelope: _,
         id,
         model,
-        message,
+        mut message,
         finish_reason,
         logprobs,
         // Only the bridges whose upstream answers with one choice fake a
@@ -595,6 +616,7 @@ pub fn response_into_fake_stream_chunks(resp: ChatResponse) -> Vec<ChatChunk> {
         service_tier,
     } = resp;
     let chunk = |delta, finish_reason, usage| ChatChunk {
+        native_envelope: None,
         id: id.clone(),
         model: model.clone(),
         choice_index: 0,
@@ -627,21 +649,53 @@ pub fn response_into_fake_stream_chunks(resp: ChatResponse) -> Vec<ChatChunk> {
                 })
                 .collect()
         });
-    let reasoning = message
+    let content_text = message.content_str().into_owned();
+    let mut content_blocks = message.content_blocks.take();
+    let reasoning_text = message
         .extra
         .get("reasoning_content")
         .and_then(|r| r.as_str())
-        .filter(|r| !r.is_empty())
-        .map(|r| {
-            chunk(
-                ChatDelta {
-                    reasoning_content: Some(r.to_string()),
-                    ..ChatDelta::default()
-                },
-                None,
-                None,
+        .filter(|r| !r.is_empty());
+    // 连续思考前缀与投影同帧；交错载体必须整帧发送才能保留原始块顺序。
+    let thinking_prefix = content_blocks.as_ref().map_or(0, |blocks| {
+        blocks
+            .iter()
+            .take_while(|block| {
+                matches!(
+                    block.get("type").and_then(serde_json::Value::as_str),
+                    Some("thinking" | "redacted_thinking")
+                )
+            })
+            .count()
+    });
+    let interleaved_thinking = content_blocks.as_ref().is_some_and(|blocks| {
+        blocks[thinking_prefix..].iter().any(|block| {
+            matches!(
+                block.get("type").and_then(serde_json::Value::as_str),
+                Some("thinking" | "redacted_thinking")
             )
-        });
+        })
+    });
+    let reasoning = reasoning_text.filter(|_| !interleaved_thinking).map(|r| {
+        let mut reasoning = chunk(
+            ChatDelta {
+                reasoning_content: Some(r.to_string()),
+                ..ChatDelta::default()
+            },
+            None,
+            None,
+        );
+        if thinking_prefix > 0 {
+            if let Some(blocks) = &mut content_blocks {
+                let prefix: Vec<_> = blocks.drain(..thinking_prefix).collect();
+                reasoning
+                    .delta
+                    .extra
+                    .insert("content_blocks".into(), prefix.into());
+            }
+        }
+        reasoning
+    });
     let mut chunks = vec![chunk(
         ChatDelta {
             role: Some(Role::Assistant),
@@ -653,13 +707,21 @@ pub fn response_into_fake_stream_chunks(resp: ChatResponse) -> Vec<ChatChunk> {
     chunks.extend(reasoning);
     let mut content = chunk(
         ChatDelta {
-            content: Some(message.content.unwrap_or_default()),
+            content: Some(content_text),
+            reasoning_content: interleaved_thinking
+                .then(|| reasoning_text.unwrap_or_default().to_owned()),
             tool_calls,
             ..ChatDelta::default()
         },
         None,
         None,
     );
+    if let Some(blocks) = content_blocks.filter(|blocks| !blocks.is_empty()) {
+        content
+            .delta
+            .extra
+            .insert("content_blocks".into(), serde_json::Value::Array(blocks));
+    }
     content.logprobs = logprobs;
     chunks.extend([
         content,
@@ -667,6 +729,153 @@ pub fn response_into_fake_stream_chunks(resp: ChatResponse) -> Vec<ChatChunk> {
         chunk(ChatDelta::default(), None, Some(usage)),
     ]);
     chunks
+}
+
+#[cfg(test)]
+mod compat_chat_replay_stream_tests {
+    use super::*;
+
+    #[test]
+    fn compat_chat_fake_stream_keeps_signed_thinking_with_its_native_carrier() {
+        let blocks = serde_json::json!([
+            {"type": "thinking", "thinking": "first", "signature": "first-signature"},
+            {"type": "redacted_thinking", "data": "ciphertext"},
+            {"type": "text", "text": "between"},
+            {"type": "thinking", "thinking": "second", "signature": "second-signature"},
+            {"type": "text", "text": "answer"}
+        ]);
+        let mut message = crate::ChatMessage::assistant("betweenanswer");
+        message.content_blocks = Some(blocks.as_array().unwrap().clone());
+        message
+            .extra
+            .insert("reasoning_content".into(), "first\nsecond".into());
+        let response = ChatResponse {
+            native_envelope: None,
+            id: "msg_signed".into(),
+            model: "m".into(),
+            message,
+            finish_reason: crate::FinishReason::Stop,
+            logprobs: None,
+            more_choices: vec![],
+            usage: crate::UsageStats::new(7, 3),
+            service_tier: None,
+        };
+        let chunks = response_into_fake_stream_chunks(response);
+        let reasoning: Vec<_> = chunks
+            .iter()
+            .filter(|chunk| chunk.delta.reasoning_content.is_some())
+            .collect();
+        assert_eq!(reasoning.len(), 1);
+        assert_eq!(
+            reasoning[0].delta.reasoning_content.as_deref(),
+            Some("first\nsecond")
+        );
+        assert_eq!(reasoning[0].delta.extra.get("content_blocks"), Some(&blocks),
+            "an aggregate emitted before its native blocks cannot later regain each signature boundary");
+        assert_eq!(
+            chunks
+                .iter()
+                .filter(|chunk| chunk.delta.extra.contains_key("content_blocks"))
+                .count(),
+            1
+        );
+        let usage = chunks.last().unwrap().usage.as_ref().unwrap();
+        assert_eq!((usage.prompt_tokens, usage.completion_tokens), (7, 3));
+    }
+
+    #[test]
+    fn compat_chat_fake_stream_without_native_blocks_keeps_reasoning_before_content() {
+        let mut message = crate::ChatMessage::assistant("answer");
+        message
+            .extra
+            .insert("reasoning_content".into(), "reason".into());
+        let chunks = response_into_fake_stream_chunks(ChatResponse {
+            native_envelope: None,
+            id: "chat_1".into(),
+            model: "m".into(),
+            message,
+            finish_reason: crate::FinishReason::Stop,
+            logprobs: None,
+            more_choices: vec![],
+            usage: crate::UsageStats::new(2, 3),
+            service_tier: None,
+        });
+        assert_eq!(chunks.len(), 5);
+        assert_eq!(chunks[1].delta.reasoning_content.as_deref(), Some("reason"));
+        assert!(chunks[1].delta.content.is_none());
+        assert_eq!(chunks[2].delta.content.as_deref(), Some("answer"));
+        assert!(chunks[2].delta.reasoning_content.is_none());
+    }
+
+    #[test]
+    fn compat_chat_json_tool_unwrap_updates_the_native_carrier() {
+        let blocks = serde_json::json!([
+            {"type":"thinking","thinking":"reason","signature":"signed"},
+            {"type":"text","text":"preface"},
+            {"type":"tool_use","id":"json_call","name":JSON_TOOL_NAME,"input":{"ok":true}}
+        ]);
+        let mut message = crate::ChatMessage::assistant("preface");
+        message.content_blocks = Some(blocks.as_array().unwrap().clone());
+        message
+            .extra
+            .insert("reasoning_content".into(), "reason".into());
+        message.extra.insert("tool_calls".into(), serde_json::json!([{
+            "id":"json_call","type":"function","function":{"name":JSON_TOOL_NAME,"arguments":"{\"ok\":true}"}
+        }]));
+        let mut response = ChatResponse {
+            native_envelope: None,
+            id: "msg_json".into(),
+            model: "m".into(),
+            message,
+            finish_reason: crate::FinishReason::ToolCalls,
+            logprobs: None,
+            more_choices: vec![],
+            usage: crate::UsageStats::new(2, 3),
+            service_tier: None,
+        };
+        unwrap_json_tool_call(&mut response);
+        assert_eq!(response.message.content.as_deref(), Some(r#"{"ok":true}"#));
+        assert_eq!(
+            serde_json::json!(response.message.content_blocks),
+            serde_json::json!([
+                {"type":"thinking","thinking":"reason","signature":"signed"},
+                {"type":"text","text":r#"{"ok":true}"#}
+            ])
+        );
+    }
+
+    #[test]
+    fn compat_chat_fake_stream_carries_complete_replay_blocks_once() {
+        let blocks = serde_json::json!([
+            {"type": "thinking", "thinking": "reason", "signature": "opaque-signature"},
+            {"type": "redacted_thinking", "data": "opaque-data"},
+            {"type": "text", "text": "hello"}
+        ]);
+        let mut message = crate::ChatMessage::assistant("hello");
+        message.content_blocks = Some(blocks.as_array().unwrap().clone());
+        let response = ChatResponse {
+            native_envelope: None,
+            id: "msg_1".into(),
+            model: "m".into(),
+            message,
+            finish_reason: crate::FinishReason::Stop,
+            logprobs: None,
+            more_choices: vec![],
+            usage: crate::UsageStats::new(2, 3),
+            service_tier: None,
+        };
+        let chunks = response_into_fake_stream_chunks(response);
+        let carried: Vec<_> = chunks
+            .iter()
+            .filter_map(|chunk| chunk.delta.extra.get("content_blocks"))
+            .collect();
+        assert_eq!(carried, vec![&blocks]);
+        let text: String = chunks
+            .iter()
+            .filter_map(|chunk| chunk.delta.content.as_deref())
+            .collect();
+        assert_eq!(text, "hello");
+    }
 }
 
 #[cfg(test)]

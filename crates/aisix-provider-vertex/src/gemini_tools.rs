@@ -389,7 +389,10 @@ pub(crate) fn function_call_parts(
         let name = function
             .get("name")
             .and_then(Value::as_str)
-            .unwrap_or_default();
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                BridgeError::InvalidRequest("assistant tool call.function.name is required".into())
+            })?;
         let args = match function.get("arguments") {
             None | Some(Value::Null) => json!({}),
             Some(Value::String(s)) if s.is_empty() => json!({}),

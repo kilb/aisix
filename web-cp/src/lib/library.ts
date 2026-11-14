@@ -1,6 +1,7 @@
 import type { RateCard, SyncCandidate, SyncItem, SyncRequestItem, SyncState } from "./api.ts";
 import { dimensionText, tierText } from "./importReview.ts";
 import { compactRateText } from "./rateUnits.ts";
+import { cardShapeProblem } from "./rateCardShape.ts";
 
 /**
  * The price library's words for a sync's preview. Kept beside their own test
@@ -156,4 +157,16 @@ export function longContextChange(card: RateCard | null, current: RateCard | nul
   const now = longContextLines(current).length > 0;
   if (entry === now) return null;
   return entry ? "当前基准价缺少长上下文档，同步后将补上" : "价格库条目没有长上下文档，同步将去掉它";
+}
+
+/** 只比较可读取的完整卡，不从缺失或损坏的价格推断档位删除。 */
+export function removedTierWarning(card: unknown, current: unknown): string | null {
+  if (card === null || current === null || typeof card !== "object" || typeof current !== "object" || cardShapeProblem(card) !== null || cardShapeProblem(current) !== null) return null;
+  if (![card, current].every((value) => Object.values(value).every((tier: { base?: Record<string, string> }) => tier.base && Object.keys(tier.base).length > 0))) return null;
+  const next = Object.keys(card);
+  const previous = Object.keys(current);
+  if (next.length === 0 || previous.length === 0) return null;
+  const removed = previous.filter((tier) => !Object.hasOwn(card, tier)).sort();
+  if (removed.length === 0) return null;
+  return `同步将移除档位${removed.map((tier) => `「${tierText(tier)}」`).join("、")}；整卡替换后，这些档位的请求将无法计价。`;
 }

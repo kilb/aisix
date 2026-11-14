@@ -18,7 +18,7 @@ import { retireWarning, withoutServing } from "../../lib/retireWarning";
 import { Plus, RefreshCw, Search } from "lucide-react";
 import { CardHeader } from "../../components/page";
 import { Button } from "../../ui/Button";
-import { DataTable, Loading } from "../../ui/DataTable";
+import { OperationalTable as DataTable, Loading } from "../../components/OperationalTable";
 import { EmptyState } from "../../ui/EmptyState";
 import { TwoStep } from "../../ui/TwoStep";
 import { UpstreamModelPicker } from "../../ui/UpstreamModelPicker";
@@ -409,7 +409,7 @@ export function ChannelModels({
           title={
             <span className="flex flex-wrap items-center gap-2">
               模型
-              <span className="tag font-mono font-normal">{accountName}</span>
+              <span className="tag font-normal">{accountName}</span>
             </span>
           }
           description={
@@ -457,11 +457,9 @@ export function ChannelModels({
           <DataTable label="模型" scroll>
             <thead>
               <tr>
-                <th className="w-12">服务</th>
-                <th>公共模型</th>
+                <th>服务 / 公共模型</th>
                 <th>上游模型名称</th>
-                <th className="num">优先级</th>
-                <th className="num">权重</th>
+                <th>优先级 / 权重</th>
                 <th>启用</th>
                 <th>账号分组</th>
                 <th className="right">操作</th>
@@ -490,8 +488,6 @@ export function ChannelModels({
                           }}
                         />
                       </label>
-                    </td>
-                    <td>
                       <span className="mono font-mono text-caption font-medium">{row.public_model_name}</span>
                       <RoutePolicy routing={model?.effective_routing} compact />
                     </td>
@@ -509,6 +505,7 @@ export function ChannelModels({
                       <details className="mt-2 text-caption"><summary>故障冷却：{draft.cooldown?.enabled === true ? "已开启" : "未开启"}</summary><CooldownEditor value={draft.cooldown} disabled={!canEdit || busy || !draft.served} onChange={(cooldown) => set(row.public_model_id, { cooldown })} onValidityChange={(cooldownProblem) => set(row.public_model_id, { cooldownProblem })} /></details>
                     </td>
                     <td className="num">
+                      <label className="ops-number-field"><span>优先级</span>
                       <input
                         className="ch-num h-11"
                         aria-label={`优先级 ${row.public_model_name}`}
@@ -517,8 +514,8 @@ export function ChannelModels({
                         disabled={!canEdit || busy || !draft.served}
                         onChange={(e) => set(row.public_model_id, { priority: e.target.value })}
                       />
-                    </td>
-                    <td className="num">
+                      </label>
+                      <label className="ops-number-field"><span>权重</span>
                       <input
                         className="ch-num h-11"
                         aria-label={`权重 ${row.public_model_name}`}
@@ -527,6 +524,7 @@ export function ChannelModels({
                         disabled={!canEdit || busy || !draft.served}
                         onChange={(e) => set(row.public_model_id, { weight: e.target.value })}
                       />
+                      </label>
                     </td>
                     <td>
                       <label className="ch-tick min-h-11 min-w-11 justify-center">
@@ -580,7 +578,7 @@ export function ChannelModels({
               })}
               {shown.length === 0 && (
                 <tr>
-                  <td colSpan={8} className="whitespace-normal">
+                  <td colSpan={6} className="whitespace-normal">
                     <EmptyState
                       text={
                         rows.length === 0
@@ -608,7 +606,7 @@ export function ChannelModels({
         )}
         {(rows !== null || !canEdit) && (
           // The save closes the card: what it will write on the left, the write on the right.
-          <div className="ch-save -mx-[var(--pad)] -mb-[var(--pad)] mt-6 flex flex-wrap items-start justify-end gap-x-4 gap-y-2 rounded-b-card border-t border-line bg-well px-[var(--pad)] py-3 [&_.hint]:text-ink-soft">
+          <div className="ch-save ops-form-footer -mx-[var(--pad)] -mb-[var(--pad)] mt-6 flex flex-wrap items-start justify-end gap-x-4 gap-y-2 rounded-b-card border-t border-line bg-well px-[var(--pad)] py-3 [&_.hint]:text-ink-soft">
             {canEdit ? (
               <>
                 {changed.length > 0 && <span className="hint mr-auto self-center text-caption">将保存 {changed.length} 个模型的改动。</span>}
@@ -645,7 +643,7 @@ export function ChannelModels({
 
       {canEdit && rows !== null && (
         // The section's two tools, side by side: the account's own list, and one name typed in.
-        <div className="grid items-start gap-3 desktop:grid-cols-2">
+        <div className="ch-tools grid items-start gap-5 desktop:grid-cols-2">
           <FetchUpstream
             accountId={accountId}
             rows={rows}
@@ -671,7 +669,7 @@ export function ChannelModels({
                 label="新的公共模型名称"
                 onChange={setNewName}
                 disabled={creating || busy}
-                className="min-w-[14rem] flex-1"
+                className="min-w-0 w-full flex-1 sm:min-w-[14rem]"
               />
               <Button
                 type="button"

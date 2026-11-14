@@ -50,7 +50,7 @@ function sumCounts(left: number | null | undefined, right: number | null | undef
 function modelName(name: string): string { return name || "未授权或未知模型"; }
 
 function Facts({ items }: { items: { label: string; value: string }[] }) {
-  return <dl className="m-0 grid min-w-0 grid-cols-2 gap-x-6 gap-y-4">{items.map(item => <div key={item.label} className="min-w-0"><dt className="text-micro text-muted">{item.label}</dt><dd className="m-0 mt-1 min-w-0 break-all text-stat font-normal tabular-nums text-ink">{item.value}</dd></div>)}</dl>;
+  return <dl className="metric-facts">{items.map(item => <div key={item.label} className="min-w-0"><dt className="text-muted">{item.label}</dt><dd className="min-w-0 break-all tabular-nums text-ink">{item.value}</dd></div>)}</dl>;
 }
 
 function LatencyFacts({ title, value, note }: { title: string; value: MetricsLatency | undefined; note: string }) {
@@ -183,22 +183,22 @@ export function ApiMetricsPanel({ scope, enabled, from, to, bucket, modelId, mem
   if (compact) return <ApiMetricsOverview scope={scope} from={from} to={to} data={data} error={error} onRetry={rangeError ? undefined : () => setRevision(value => value + 1)} className={className} />;
   const panelId = `${choiceId}-panel`;
   return (
-    <section className={cn(span.d12, "min-w-0", className)} role="region" aria-label="完整 API 指标" aria-busy={!error && !data}>
-      <div role="tablist" aria-label="指标视图" className="mb-6 flex max-w-full flex-wrap gap-1 rounded-cell bg-ink/7 p-1">
+    <section className={cn(span.d12, "metric-analysis min-w-0", className)} role="region" aria-label="完整 API 指标" aria-busy={!error && !data}>
+      <div role="tablist" aria-label="指标视图" className="metric-tabs">
         {VIEWS.map(item => <button key={item.value} id={`${choiceId}-${item.value}`} role="tab" data-view={item.value} aria-selected={view === item.value} aria-controls={panelId} tabIndex={view === item.value ? 0 : -1} type="button" ref={element => { viewButtons.current[item.value] = element ?? undefined; }} onClick={() => selectView(item.value)} onKeyDown={event => {
           const index = VIEWS.findIndex(option => option.value === item.value);
           const next = event.key === "Home" ? VIEWS[0] : event.key === "End" ? VIEWS[VIEWS.length - 1] : event.key === "ArrowRight" ? VIEWS[(index + 1) % VIEWS.length] : event.key === "ArrowLeft" ? VIEWS[(index - 1 + VIEWS.length) % VIEWS.length] : undefined;
           if (next) { event.preventDefault(); selectView(next.value); viewButtons.current[next.value]?.focus(); }
-        }} className={cn("min-h-11 min-w-11 rounded-chip border-0 px-4 text-caption font-normal", view === item.value ? "bg-surface text-ink" : "bg-transparent text-ink-soft hover:text-ink")}>{item.label}</button>)}
+        }} className="metric-tab">{item.label}</button>)}
       </div>
       <BentoGrid id={panelId} role="tabpanel" aria-labelledby={`${choiceId}-${view}`} tabIndex={0}>
-      <Card className={span.d7}>
+      <Card className={cn(span.d7, "metric-analysis-main")}>
         <CardHeader number={numberStart} title={`API 指标 · ${VIEWS.find(item => item.value === view)?.label}`} description={`${fmtBeijing(data?.from ?? from)} — ${fmtBeijing(data?.to ?? to)}（UTC+8，结束时间不含）`} />
         {view === "latency" && <label htmlFor={choiceId} className="mb-5 grid gap-2 text-caption text-muted">耗时口径<select id={choiceId} value={latencyKind} onChange={event => setLatencyKind(event.target.value as LatencyKind)}>{Object.entries(LATENCY_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>}
         {view === "tokens" && <label htmlFor={choiceId} className="mb-5 grid gap-2 text-caption text-muted">token 口径<select id={choiceId} value={tokenKind} onChange={event => setTokenKind(event.target.value as TokenKind)}>{Object.entries(TOKEN_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>}
         {view === "cache" && <label htmlFor={choiceId} className="mb-5 grid gap-2 text-caption text-muted">缓存口径<select id={choiceId} value={cacheKind} onChange={event => setCacheKind(event.target.value as CacheKind)}><option value="tokens">已记录缓存 token 占输入比例</option><option value="response">响应缓存命中率</option></select></label>}
         {<>
-          <div className="mb-6 min-w-0"><div className="mb-3 text-micro text-muted">{metricTitle}{view === "latency" ? " · 平均" : ""}</div><Metric size={primary.length > 18 ? "value" : "figure"} className="break-all">{primary}</Metric></div>
+          <div className="metric-primary"><div className="mb-3 text-micro text-muted">{metricTitle}{view === "latency" ? " · 平均" : ""}</div><Metric size={primary.length > 18 ? "value" : "display"} className="break-all font-medium">{primary}</Metric></div>
           {view === "requests" && <Facts items={[
             { label: "成功率", value: formatRatio(totals?.success_rate) },
             { label: "失败率（已知结果）", value: formatRatio(requestRates?.failureRate) },
@@ -229,7 +229,7 @@ export function ApiMetricsPanel({ scope, enabled, from, to, bucket, modelId, mem
           <p className="mt-3 text-caption text-muted">请求数按最终记录统计，费用与 token 还包含已计费重试。计费尝试包含免费与未定价的最终记录，不等于请求数。</p>
         </>}
       </Card>
-      <Card className={span.d5Wide}>
+      <Card className={cn(span.d5Wide, "metric-analysis-aside")}>
         <CardHeader number={numberStart + 1} title={sideTitle} description="与左侧使用相同时间、身份和筛选范围" />
         {view === "requests" || view === "cost" ? <ModelRanks data={data} field={view === "requests" ? "requests" : "charged_micro_cny"} /> : view === "tokens" ? <TokenFacts values={totals} /> : view === "cache" ? <CacheFacts values={totals} /> : <div className="grid gap-7"><LatencyFacts title="首 token 延迟" value={totals?.first_token_latency_ms} note="最终请求的首个生成内容；无样本包含非流式与历史记录。" /><div className="border-t border-ink/7 pt-6"><LatencyFacts title="响应延迟" value={totals?.response_latency_ms} note="最终请求至首个可用数据，不是完整响应时长。" /></div><div className="border-t border-ink/7 pt-6"><LatencyFacts title="上游尝试完整耗时" value={totals?.attempt_duration_ms} note="所有可见计费尝试各自的完整耗时，不能相加为客户端请求时长。" /></div></div>}
       </Card>

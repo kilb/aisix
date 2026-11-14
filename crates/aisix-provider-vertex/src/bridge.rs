@@ -25,6 +25,7 @@
 //! `https://aiplatform.<us|eu>.rep.googleapis.com` for the `us` / `eu`
 //! multi-region locations).
 
+use aisix_gateway::upstream_io::{self, Protocol};
 use aisix_gateway::{
     chat::ChatChoice,
     sse::{SseDecoder, SseEvent},
@@ -784,6 +785,15 @@ impl Bridge for VertexBridge {
         })
     }
 
+    fn reads_file_uris(&self, _req: &ChatFormat, ctx: &BridgeContext) -> bool {
+        upstream_model(ctx).is_ok_and(|id| {
+            matches!(
+                VertexPublisher::from_upstream_id(id),
+                Some(VertexPublisher::Google | VertexPublisher::Anthropic)
+            )
+        })
+    }
+
     async fn chat(
         &self,
         req: &ChatFormat,
@@ -984,13 +994,12 @@ impl Bridge for VertexBridge {
         let model_echo = req.model.clone();
 
         with_deadline(ctx.deadline, started, async move {
-            let resp = url
-                .post_on(&client)
-                .headers(headers)
-                .body(body)
-                .send()
-                .await
-                .map_err(aisix_gateway::send_error)?;
+            let resp = upstream_io::send(
+                url.post_on(&client).headers(headers).body(body),
+                Protocol::Embeddings,
+            )
+            .await
+            .map_err(aisix_gateway::send_error)?;
             aisix_gateway::note_upstream_response(resp.headers());
             let status = resp.status();
             if !status.is_success() {
@@ -1139,13 +1148,12 @@ impl VertexBridge {
         let client = self.client_for(ctx);
 
         with_deadline(ctx.deadline, started, async move {
-            let resp = url
-                .post_on(&client)
-                .headers(headers)
-                .body(body)
-                .send()
-                .await
-                .map_err(aisix_gateway::send_error)?;
+            let resp = upstream_io::send(
+                url.post_on(&client).headers(headers).body(body),
+                Protocol::Gemini,
+            )
+            .await
+            .map_err(aisix_gateway::send_error)?;
 
             aisix_gateway::note_upstream_response(resp.headers());
             let status = resp.status();
@@ -1282,13 +1290,12 @@ impl VertexBridge {
         let client = self.client_for(ctx);
 
         with_deadline(ctx.deadline, started, async move {
-            let resp = url
-                .post_on(&client)
-                .headers(headers)
-                .body(body_value)
-                .send()
-                .await
-                .map_err(aisix_gateway::send_error)?;
+            let resp = upstream_io::send(
+                url.post_on(&client).headers(headers).body(body_value),
+                Protocol::Messages,
+            )
+            .await
+            .map_err(aisix_gateway::send_error)?;
 
             aisix_gateway::note_upstream_response(resp.headers());
             let status = resp.status();
@@ -1412,12 +1419,12 @@ impl VertexBridge {
         let client = self.client_for(ctx);
 
         let resp = with_deadline(ctx.deadline, started, async move {
-            url.post_on(&client)
-                .headers(headers)
-                .body(body_value)
-                .send()
-                .await
-                .map_err(aisix_gateway::send_error)
+            upstream_io::send(
+                url.post_on(&client).headers(headers).body(body_value),
+                Protocol::Messages,
+            )
+            .await
+            .map_err(aisix_gateway::send_error)
         })
         .await?;
 
@@ -1439,9 +1446,9 @@ impl VertexBridge {
         // from `message_start`), emit any chunk, and stop on the
         // terminal `message_stop`. Anthropic emits no `[DONE]` sentinel.
         let byte_stream = resp.bytes_stream();
+        let mut state = StreamState::observed();
         let stream = async_stream::try_stream! {
             let mut decoder = SseDecoder::new();
-            let mut state = StreamState::default();
             let mut byte_stream = Box::pin(byte_stream);
             // `message_stop` ends the stream below. A `stop_reason` already
             // said the answer is complete, so a body that ends after one is
@@ -1568,13 +1575,12 @@ impl VertexBridge {
         let client = self.client_for(ctx);
 
         with_deadline(ctx.deadline, started, async move {
-            let resp = url
-                .post_on(&client)
-                .headers(headers)
-                .body(body)
-                .send()
-                .await
-                .map_err(aisix_gateway::send_error)?;
+            let resp = upstream_io::send(
+                url.post_on(&client).headers(headers).body(body),
+                Protocol::Chat,
+            )
+            .await
+            .map_err(aisix_gateway::send_error)?;
             aisix_gateway::note_upstream_response(resp.headers());
             let status = resp.status();
             if !status.is_success() {
@@ -1639,12 +1645,12 @@ impl VertexBridge {
         let client = self.client_for(ctx);
 
         let resp = with_deadline(ctx.deadline, started, async move {
-            url.post_on(&client)
-                .headers(headers)
-                .body(body)
-                .send()
-                .await
-                .map_err(aisix_gateway::send_error)
+            upstream_io::send(
+                url.post_on(&client).headers(headers).body(body),
+                Protocol::Chat,
+            )
+            .await
+            .map_err(aisix_gateway::send_error)
         })
         .await?;
 
@@ -1825,13 +1831,12 @@ impl VertexBridge {
         let client = self.client_for(ctx);
 
         with_deadline(ctx.deadline, started, async move {
-            let resp = url
-                .post_on(&client)
-                .headers(headers)
-                .body(body)
-                .send()
-                .await
-                .map_err(aisix_gateway::send_error)?;
+            let resp = upstream_io::send(
+                url.post_on(&client).headers(headers).body(body),
+                Protocol::Chat,
+            )
+            .await
+            .map_err(aisix_gateway::send_error)?;
             aisix_gateway::note_upstream_response(resp.headers());
             let status = resp.status();
             if !status.is_success() {
@@ -1912,12 +1917,12 @@ impl VertexBridge {
         let client = self.client_for(ctx);
 
         let resp = with_deadline(ctx.deadline, started, async move {
-            url.post_on(&client)
-                .headers(headers)
-                .body(body)
-                .send()
-                .await
-                .map_err(aisix_gateway::send_error)
+            upstream_io::send(
+                url.post_on(&client).headers(headers).body(body),
+                Protocol::Chat,
+            )
+            .await
+            .map_err(aisix_gateway::send_error)
         })
         .await?;
 
@@ -2075,12 +2080,12 @@ impl VertexBridge {
         let client = self.client_for(ctx);
 
         let resp = with_deadline(ctx.deadline, started, async move {
-            url.post_on(&client)
-                .headers(headers)
-                .body(body)
-                .send()
-                .await
-                .map_err(aisix_gateway::send_error)
+            upstream_io::send(
+                url.post_on(&client).headers(headers).body(body),
+                Protocol::Gemini,
+            )
+            .await
+            .map_err(aisix_gateway::send_error)
         })
         .await?;
 
@@ -2244,6 +2249,7 @@ fn gemini_chunk_into_chat_chunks(
         .map(GeminiUsageMetadata::into_usage_stats);
 
     let chunk = |choice_index: u32, delta: ChatDelta, state: &GeminiStreamState| ChatChunk {
+        native_envelope: None,
         choice_index,
         logprobs: None,
         id: state.response_id.clone().unwrap_or_default(),
@@ -3010,6 +3016,10 @@ fn build_gemini_request_with(
     upstream_model: &str,
     fetched: &FetchedMedia,
 ) -> Result<GeminiGenerateContentRequest, BridgeError> {
+    // 所有构造入口复用相同历史清理；生产入口已处理过时为借用快路径。
+    let (req, _) =
+        aisix_gateway::tool_calls::legacy_functions_as_tools(std::borrow::Cow::Borrowed(req))?;
+    let req = req.as_ref();
     let mut system_parts: Vec<String> = Vec::new();
     let mut contents: Vec<GeminiContent> = Vec::new();
     let mut tool_responses: Vec<GeminiPart> = Vec::new();
@@ -3105,10 +3115,48 @@ fn build_gemini_request_with(
             parts: vec![GeminiPart::text(system_parts.join("\n\n"))],
         })
     };
-    let tools = match req.extra.get("tools") {
+    let mut tools = match req.extra.get("tools") {
         Some(tools) => gemini_tools(tools, upstream_model)?,
         None => None,
     };
+    if let Some(allowed) = req
+        .extra
+        .get("tool_choice")
+        .filter(|choice| {
+            choice.get("type").and_then(serde_json::Value::as_str) == Some("allowed_tools")
+        })
+        .and_then(|choice| choice.pointer("/allowed_tools/tools"))
+        .and_then(serde_json::Value::as_array)
+    {
+        if let Some(tools) = tools.as_mut() {
+            // AUTO 不能使用 allowedFunctionNames；收窄声明同样保留文本回答能力。
+            for tool in tools.iter_mut() {
+                if let Some(declarations) = tool
+                    .get_mut("functionDeclarations")
+                    .and_then(serde_json::Value::as_array_mut)
+                {
+                    declarations.retain(|declaration| {
+                        allowed.iter().any(|entry| {
+                            entry.get("type").and_then(serde_json::Value::as_str)
+                                == Some("function")
+                                && entry
+                                    .pointer("/function/name")
+                                    .or_else(|| entry.get("name"))
+                                    == declaration.get("name")
+                        })
+                    });
+                }
+            }
+            tools.retain(|tool| {
+                tool.get("functionDeclarations")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|declarations| !declarations.is_empty())
+            });
+        }
+        if tools.as_ref().is_some_and(Vec::is_empty) {
+            tools = None;
+        }
+    }
     // Checked even when no tool is sent, so an illegal choice is refused
     // the same way on every request. A calling mode with nothing to call
     // is meaningless; the choice is dropped with the (absent) tools.
@@ -3368,7 +3416,7 @@ struct GeminiUsageMetadata {
     /// `UsageStats::cached_prompt_tokens` and must not be added to the
     /// prompt total (AISIX-Cloud#1404).
     #[serde(default, rename = "cachedContentTokenCount")]
-    cached_content_token_count: u32,
+    cached_content_token_count: Option<u32>,
     /// Thinking tokens. Gemini bills these as output but reports them
     /// in their own counter, and — depending on model version — either
     /// inside `candidatesTokenCount` or beside it. OpenAI accounting has
@@ -3408,7 +3456,7 @@ impl GeminiUsageMetadata {
         self.prompt_token_count > 0
             || self.candidates_token_count > 0
             || self.total_token_count > 0
-            || self.cached_content_token_count > 0
+            || self.cached_content_token_count.is_some()
             || self.thoughts_token_count > 0
             || self.tool_use_prompt_token_count > 0
     }
@@ -3466,7 +3514,8 @@ impl GeminiUsageMetadata {
             prompt_tokens,
             completion_tokens,
             total_tokens: prompt_tokens.saturating_add(completion_tokens),
-            cached_prompt_tokens: self.cached_content_token_count,
+            cached_prompt_tokens: self.cached_content_token_count.unwrap_or(0),
+            cache_usage_reported: Some(self.cached_content_token_count.is_some()),
             reasoning_tokens: self.thoughts_token_count,
             upstream_total_tokens: self.total_token_count,
             reasoning_folded_into_completion,
@@ -3500,6 +3549,7 @@ fn gemini_response_into_chat_response(
             FinishReason::Stop
         };
         ChatChoice {
+            extra: Default::default(),
             index: 0,
             message,
             finish_reason,
@@ -3516,6 +3566,7 @@ fn gemini_response_into_chat_response(
         .map(GeminiUsageMetadata::into_usage_stats)
         .unwrap_or_default();
     ChatResponse {
+        native_envelope: None,
         logprobs: first.logprobs,
         more_choices,
         id: raw.response_id.unwrap_or_default(),
@@ -3558,6 +3609,7 @@ fn gemini_candidate_into_choice(index: u32, c: GeminiCandidate) -> ChatChoice {
         finish_with_tool_calls(c.finish_reason.as_deref())
     };
     ChatChoice {
+        extra: Default::default(),
         index,
         message,
         finish_reason,
@@ -3617,6 +3669,21 @@ fn map_gemini_finish_reason(reason: Option<&str>) -> FinishReason {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gemini_cache_count_preserves_explicit_zero_presence() {
+        for (cache, expected) in [(Some(0), true), (None, false)] {
+            let mut wire = serde_json::json!({"promptTokenCount":100,"candidatesTokenCount":1});
+            if let Some(cache) = cache {
+                wire["cachedContentTokenCount"] = serde_json::json!(cache);
+            }
+            let usage = serde_json::from_value::<GeminiUsageMetadata>(wire)
+                .unwrap()
+                .into_usage_stats();
+            assert_eq!(usage.cached_prompt_tokens, 0);
+            assert_eq!(usage.cache_usage_reported(), Some(expected));
+        }
+    }
 
     impl GeminiPart {
         fn as_text(&self) -> &str {
@@ -8862,5 +8929,172 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
             finish("MALFORMED_FUNCTION_CALL"),
             FinishReason::Other("MALFORMED_FUNCTION_CALL".into())
         );
+    }
+
+    mod compat_gemini_tools {
+        use super::*;
+
+        #[test]
+        fn compat_vertex_file_uri_support_follows_actual_publisher_dispatch() {
+            let bridge = VertexBridge::new();
+            let req = ChatFormat::new("alias", vec![ChatMessage::user("read document")]);
+            for (id, expected) in [
+                ("gemini-2.5-flash", true),
+                ("claude-sonnet-4@20250514", true),
+                ("meta/llama-3.3-70b-instruct-maas", false),
+                ("mistral-large-2411", false),
+                ("jamba-1.5-large", false),
+                ("unrecognized-provider", false),
+            ] {
+                let ctx = BridgeContext::new(
+                    "compat",
+                    sample_model_with(id),
+                    sample_pk_with_secret(valid_secret_json()),
+                );
+                assert_eq!(bridge.reads_file_uris(&req, &ctx), expected, "{id}");
+            }
+        }
+
+        fn request(mode: &str, names: &[&str]) -> ChatFormat {
+            serde_json::from_value(serde_json::json!({"model":"alias","messages":[{"role":"user","content":"lookup"}],
+                "tools":[
+                    {"type":"function","function":{"name":"safe_lookup","parameters":{"type":"object"}}},
+                    {"type":"function","function":{"name":"delete_record","parameters":{"type":"object"}}}
+                ],
+                "tool_choice":{"type":"allowed_tools","allowed_tools":{"mode":mode,
+                    "tools":names.iter().map(|name| serde_json::json!({"type":"function","function":{"name":name}})).collect::<Vec<_>>()}}
+            })).unwrap()
+        }
+
+        fn body(req: &ChatFormat) -> serde_json::Value {
+            serde_json::to_value(build_gemini_request(req, "gemini-2.5-flash").unwrap()).unwrap()
+        }
+
+        #[test]
+        fn compat_gemini_tools_allowed_auto_limits_actual_declarations() {
+            let body = body(&request("auto", &["safe_lookup"]));
+            assert_eq!(
+                body["tools"][0]["functionDeclarations"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|tool| tool["name"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                ["safe_lookup"]
+            );
+            assert_ne!(
+                body.pointer("/toolConfig/functionCallingConfig/mode")
+                    .and_then(serde_json::Value::as_str),
+                Some("ANY")
+            );
+        }
+
+        #[test]
+        fn compat_gemini_tools_allowed_required_limits_actual_declarations() {
+            let body = body(&request("required", &["safe_lookup"]));
+            assert_eq!(
+                body["tools"][0]["functionDeclarations"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|tool| tool["name"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                ["safe_lookup"]
+            );
+            assert_eq!(
+                body.pointer("/toolConfig/functionCallingConfig/mode")
+                    .and_then(serde_json::Value::as_str),
+                Some("ANY")
+            );
+            assert_eq!(
+                body.pointer("/toolConfig/functionCallingConfig/allowedFunctionNames"),
+                Some(&serde_json::json!(["safe_lookup"]))
+            );
+        }
+
+        #[test]
+        fn compat_gemini_tools_empty_allowed_set_does_not_expose_tools() {
+            let body = body(&request("auto", &[]));
+            assert!(body.get("tools").is_none(), "{body}");
+            assert!(body.get("toolConfig").is_none(), "{body}");
+        }
+
+        fn history(with_function: bool) -> ChatFormat {
+            let mut req = request("auto", &["safe_lookup"]);
+            let mut calls = vec![
+                serde_json::json!({"id":"custom_1","type":"custom","custom":{"name":"calculator","input":"2+2"}}),
+            ];
+            if with_function {
+                calls.push(serde_json::json!({"id":"function_1","type":"function","function":{"name":"safe_lookup","arguments":"{}"}}));
+            }
+            req.messages = serde_json::from_value(serde_json::json!([
+                {"role":"user","content":"calculate"},
+                {"role":"assistant","content":if with_function {Some("Checking.")} else {None},"tool_calls":calls},
+                {"role":"tool","tool_call_id":"custom_1","content":"4"}
+            ])).unwrap();
+            if with_function {
+                req.messages.push(serde_json::from_value(serde_json::json!({"role":"tool","tool_call_id":"function_1","content":"found"})).unwrap());
+            }
+            req.messages.push(ChatMessage::user("answer now"));
+            req
+        }
+
+        #[test]
+        fn compat_gemini_tools_custom_history_keeps_function_pair_and_text() {
+            let body = body(&history(true));
+            let parts: Vec<_> = body["contents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|message| message["parts"].as_array().unwrap())
+                .collect();
+            let calls: Vec<_> = parts
+                .iter()
+                .filter_map(|part| part.get("functionCall"))
+                .collect();
+            let results: Vec<_> = parts
+                .iter()
+                .filter_map(|part| part.get("functionResponse"))
+                .collect();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0]["name"], "safe_lookup");
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0]["name"], "safe_lookup");
+            assert!(parts
+                .iter()
+                .any(|part| part.get("text").and_then(serde_json::Value::as_str)
+                    == Some("Checking.")));
+        }
+
+        #[test]
+        fn compat_gemini_tools_custom_only_history_has_no_empty_model_turn() {
+            let body = body(&history(false));
+            let contents = body["contents"].as_array().unwrap();
+            assert!(contents.iter().all(|message| message["role"] == "user"));
+            assert!(contents
+                .iter()
+                .flat_map(|message| message["parts"].as_array().unwrap())
+                .all(|part| part.get("functionCall").is_none()
+                    && part.get("functionResponse").is_none()));
+            assert_eq!(
+                contents
+                    .iter()
+                    .flat_map(|message| message["parts"].as_array().unwrap())
+                    .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
+                    .collect::<Vec<_>>(),
+                ["calculate", "answer now"]
+            );
+        }
+
+        #[test]
+        fn compat_gemini_tools_malformed_function_still_names_missing_field() {
+            let mut req = history(true);
+            req.messages[1].extra["tool_calls"] =
+                serde_json::json!([{"id":"bad","type":"function","function":{"arguments":"{}"}}]);
+            let error = build_gemini_request(&req, "gemini-2.5-flash").unwrap_err();
+            assert!(
+                matches!(error, BridgeError::InvalidRequest(message) if message.contains("function.name"))
+            );
+        }
     }
 }

@@ -1,3 +1,4 @@
+import "./OperationalFields.css";
 import { useId, useState } from "react";
 import { Button } from "../ui/Button";
 import { Lamp } from "../ui/Lamp";
@@ -37,8 +38,14 @@ export function SecretInput({
 }) {
   const [mode, setMode] = useState<"keep" | "replace" | "clear">(stored ? "keep" : "replace");
   const [typed, setTyped] = useState("");
-  const problemId = useId();
-  const aria = problem ? { "aria-invalid": true as const, "aria-describedby": problemId } : {};
+  const id = useId();
+  const problemId = `${id}-problem`;
+  const hintId = `${id}-hint`;
+  const describedBy = [hint ? hintId : null, problem ? problemId : null].filter(Boolean).join(" ");
+  const aria = {
+    ...(problem ? { "aria-invalid": true as const } : {}),
+    ...(describedBy ? { "aria-describedby": describedBy } : {}),
+  };
   const why = problem && (
     <p id={problemId} className="field-problem">
       {problem}
@@ -53,10 +60,10 @@ export function SecretInput({
 
   if (mode === "keep" || mode === "clear") {
     return (
-      <div className="f" role="group" aria-label={label} {...aria}>
+      <div className="f operational-field operational-secret" role="group" aria-label={label} {...aria}>
         <span className="f-label">{label}</span>
         {/* Drawn as the field it stands for: the stored state where the text would be, the actions at its end. */}
-        <div className="secret min-h-11 flex-wrap gap-2 rounded-xl border border-line bg-well p-1 pl-3 text-ink-soft">
+        <div className="secret min-h-11 flex-wrap gap-2 rounded-cell border border-line bg-well p-1 pl-3 text-ink-soft">
           {mode === "keep" ? (
             <Lamp state="applied">已设置</Lamp>
           ) : (
@@ -99,14 +106,14 @@ export function SecretInput({
             </Button>
           )}
         </div>
-        {hint && <p className="hint">{hint}</p>}
+        {hint && <p id={hintId} className="hint">{hint}</p>}
         {why}
       </div>
     );
   }
 
   return (
-    <div className="f">
+    <div className="f operational-field operational-secret">
       <label>
         <span className="f-label">{label}</span>
         <input
@@ -128,7 +135,7 @@ export function SecretInput({
           保留原密钥
         </Button>
       )}
-      {hint && <p className="hint">{hint}</p>}
+      {hint && <p id={hintId} className="hint">{hint}</p>}
       {why}
     </div>
   );

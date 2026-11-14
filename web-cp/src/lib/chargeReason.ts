@@ -59,7 +59,7 @@ function attemptText(c: Attempt): string | null {
  * the gateway refused (「请求被拒绝 · 404」), or a call that reported no usage
  * (「无用量」).
  */
-export function nothingToBillReason(c: Pick<Charge, "status_code" | "error_class" | "attempt_kind" | "attempt_index">): string {
+export function nothingToBillReason(c: Pick<Charge, "status_code" | "error_class" | "attempt_kind" | "attempt_index" | "operation">): string {
   const attempt = attemptText(c);
   const cls = c.error_class ?? "";
   const status = c.status_code !== null && c.status_code > 0 ? c.status_code : null;
@@ -74,6 +74,9 @@ export function nothingToBillReason(c: Pick<Charge, "status_code" | "error_class
   }
   if (cls !== "" || (status !== null && status >= 400)) {
     return ["请求被拒绝", status !== null ? String(status) : null, attempt].filter(Boolean).join(" · ");
+  }
+  if (c.operation === "count_tokens" && status !== null && status >= 200 && status < 300) {
+    return ["Token 统计，不产生生成费用", attempt].filter(Boolean).join(" · ");
   }
   return ["无用量", attempt].filter(Boolean).join(" · ");
 }

@@ -8,6 +8,7 @@
 use std::time::Instant;
 
 use aisix_gateway::media_fetch::{fetch_urls, Encoding};
+use aisix_gateway::upstream_io::{self, Protocol};
 use aisix_gateway::{BridgeContext, BridgeError, NativeMessages};
 use aisix_provider_anthropic::platform::{self, Platform};
 use futures::StreamExt;
@@ -89,6 +90,7 @@ impl VertexBridge {
             .resolve_access_token(&self.token_minter, ctx.deadline, started)
             .await?;
         let mut headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
+        apply_caller_version(&mut body, &headers, ctx);
         // Every `anthropic-beta` value reaching Vertex AI — the caller's
         // own, and any an operator header adds — is filtered to the ones it
         // takes; an unknown one is a 400 there.
@@ -107,12 +109,12 @@ impl VertexBridge {
 
         let client = self.client_for(ctx);
         let resp = with_deadline(ctx.deadline, started, async {
-            url.post_on(&client)
-                .headers(headers)
-                .body(bytes)
-                .send()
-                .await
-                .map_err(aisix_gateway::send_error)
+            upstream_io::send(
+                url.post_on(&client).headers(headers).body(bytes),
+                Protocol::Messages,
+            )
+            .await
+            .map_err(aisix_gateway::send_error)
         })
         .await?;
         aisix_gateway::note_upstream_response(resp.headers());
@@ -150,7 +152,6 @@ impl VertexBridge {
         // (`claude-sonnet-4-6@default`).
         let upstream_id = upstream_model(ctx)?;
         let model = upstream_id.split('@').next().unwrap_or(upstream_id);
-        let body = platform::vertex_count_tokens_body(&body, model);
         let url =
             self.anthropic_url(ctx, &creds, "count-tokens", "vertex/anthropic-count-tokens")?;
         let started = Instant::now();
@@ -158,18 +159,24 @@ impl VertexBridge {
             .resolve_access_token(&self.token_minter, ctx.deadline, started)
             .await?;
         let mut headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
-        // Token counting takes no beta, and an unknown one is a 400.
+        let mut betas = platform::header_betas(ctx.client_headers.as_deref());
+        betas.extend(platform::header_betas(Some(&headers)));
+        let (body, betas) = platform::vertex_count_tokens_body_with_betas(&body, model, betas);
         headers.remove("anthropic-beta");
+        if !betas.is_empty() {
+            let beta = HeaderValue::from_str(&betas.join(","))
+                .map_err(|e| BridgeError::Config(format!("anthropic-beta header: {e}")))?;
+            headers.insert(HeaderName::from_static("anthropic-beta"), beta);
+        }
         let bytes = outbound_bytes(&body)?;
         let client = self.client_for(ctx);
         with_deadline(ctx.deadline, started, async {
-            let resp = url
-                .post_on(&client)
-                .headers(headers)
-                .body(bytes)
-                .send()
-                .await
-                .map_err(aisix_gateway::send_error)?;
+            let resp = upstream_io::send(
+                url.post_on(&client).headers(headers).body(bytes),
+                Protocol::Messages,
+            )
+            .await
+            .map_err(aisix_gateway::send_error)?;
             aisix_gateway::note_upstream_response(resp.headers());
             let status = resp.status();
             if !status.is_success() {
@@ -190,5 +197,91 @@ impl VertexBridge {
             Ok(serde_json::json!({"input_tokens": tokens}))
         })
         .await
+    }
+}
+
+// Google 托管请求把 API 版本放在正文；显式正文值与运维头规则优先。
+// https://platform.claude.com/docs/en/build-with-claude/claude-models-on-google-cloud/google-managed
+fn apply_caller_version(body: &mut Value, headers: &http::HeaderMap, ctx: &BridgeContext) {
+    let version = headers
+        .get("anthropic-version")
+        .or_else(|| {
+            ctx.client_headers
+                .as_ref()
+                .and_then(|headers| headers.get("anthropic-version"))
+        })
+        .and_then(|version| version.to_str().ok());
+    if let (Some(obj), Some(version)) = (body.as_object_mut(), version) {
+        obj.entry("anthropic_version")
+            .or_insert_with(|| Value::String(version.to_string()));
+    }
+}
+#[cfg(test)]
+mod compat_claude_native_tests {
+    use super::*;
+    use std::sync::Arc;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn context() -> BridgeContext {
+        let model = serde_json::from_value(serde_json::json!({
+            "display_name":"native-claude","provider":"vertex","provider_key_id":"pk",
+            "model_name":"claude-opus-5-5"
+        }))
+        .unwrap();
+        let pk=serde_json::from_value(serde_json::json!({"display_name":"native-pk",
+            "api_key":r#"{"access_token":"synthetic-token","project":"my-proj","region":"us-central1"}"#})).unwrap();
+        let mut ctx = BridgeContext::new("req-native-vertex", Arc::new(model), Arc::new(pk));
+        let mut headers = http::HeaderMap::new();
+        headers.insert("anthropic-version", "2026-10-21".parse().unwrap());
+        headers.insert("anthropic-beta", "compact-2026-09-04".parse().unwrap());
+        ctx.client_headers = Some(Arc::new(headers));
+        ctx
+    }
+
+    #[tokio::test]
+    async fn compat_claude_native_vertex_count_preserves_compaction_beta() {
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST")).and(path("/v1/projects/my-proj/locations/us-central1/publishers/anthropic/models/count-tokens:rawPredict"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"input_tokens":77})))
+            .mount(&server).await;
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let history = serde_json::json!([{"role":"assistant","content":[{"type":"compaction","content":"summary","signature":"opaque-signature"}]}]);
+        let result = bridge
+            .native_count_tokens(serde_json::json!({"messages":history}), &context())
+            .await
+            .unwrap();
+        assert_eq!(result["input_tokens"], 77);
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0]
+                .headers
+                .get("anthropic-beta")
+                .and_then(|v| v.to_str().ok()),
+            Some("compact-2026-09-04")
+        );
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["messages"], history);
+    }
+
+    #[tokio::test]
+    async fn compat_claude_native_vertex_maps_caller_version_to_body() {
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST")).and(path("/v1/projects/my-proj/locations/us-central1/publishers/anthropic/models/claude-opus-5-5:rawPredict"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"type":"message","role":"assistant","content":[],"usage":{"input_tokens":1,"output_tokens":1}})))
+            .mount(&server).await;
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        bridge
+            .native_messages(
+                serde_json::json!({"max_tokens":64,"messages":[{"role":"user","content":"hi"}]}),
+                &context(),
+            )
+            .await
+            .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["anthropic_version"], "2026-10-21");
     }
 }

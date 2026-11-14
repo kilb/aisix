@@ -17,8 +17,7 @@ import {
 
 // E2E: how a Bedrock provider key and a Bedrock guardrail authenticate.
 //
-// - `auth_type: "api_key"` sends the Bedrock API key as a bearer token, with
-//   no SigV4 signature, on every Bedrock operation the gateway calls.
+// - API key 在 runtime 使用 Bearer，在 Mantle 计数使用 x-api-key；均不签名。
 // - `auth_type: "default_chain"` signs with the gateway process's own AWS
 //   credentials (here: AWS_* environment variables).
 // - `role_arn` exchanges the base credentials through sts:AssumeRole (a mock
@@ -214,7 +213,15 @@ function bedrockReply(r: Received): { status?: number; headers?: Record<string, 
     if (r.path.includes("opus-5-5")) return { status: 400, body: { message: "model not supported" } };
     return { body: { inputTokens: 11 } };
   }
-  if (r.path.endsWith("/anthropic/v1/messages/count_tokens")) return { body: { input_tokens: 77 } };
+  if (r.path.endsWith("/anthropic/v1/messages/count_tokens")) {
+    // Mantle 的官方认证面与 runtime 不同。
+    const scope = CREDENTIAL_RE.exec(r.headers.authorization ?? "");
+    const apiKey = r.headers["x-api-key"] === API_KEY && !r.headers.authorization;
+    if (!apiKey && scope?.[3] !== "bedrock-mantle") {
+      return { status: 403, body: { type: "error", error: { type: "authentication_error", message: "invalid Mantle authentication" } } };
+    }
+    return { body: { input_tokens: 77 } };
+  }
   if (r.path.endsWith("/invoke")) {
     if (r.body.texts) {
       return {
@@ -368,14 +375,19 @@ describe("Bedrock provider key authentication modes", () => {
   const chat = (model: string, stream = false) =>
     post("/v1/chat/completions", { model, stream, messages: [{ role: "user", content: "hello" }] });
 
-  test("an API key is sent as a bearer token, never SigV4, on every Bedrock operation", async (ctx) => {
+  test("an API key uses runtime Bearer and Mantle x-api-key without SigV4", async (ctx) => {
     if (skip(ctx)) return;
     const run = async (label: string, p: Promise<{ status: number; text: string; sent: Received[] }>, paths: string[]) => {
       const r = await p;
       expect(r.status, `${label}: ${r.text}`).toBe(200);
       expect(r.sent.map((s) => s.path), label).toEqual(paths);
       for (const s of r.sent) {
-        expect(s.headers.authorization, `${label} ${s.path}`).toBe(`Bearer ${API_KEY}`);
+        if (s.path === "/anthropic/v1/messages/count_tokens") {
+          expect(s.headers["x-api-key"], `${label} ${s.path}`).toBe(API_KEY);
+          expect(s.headers.authorization, `${label} ${s.path}`).toBeUndefined();
+        } else {
+          expect(s.headers.authorization, `${label} ${s.path}`).toBe(`Bearer ${API_KEY}`);
+        }
         expect(s.headers["x-amz-date"], `${label} ${s.path}`).toBeUndefined();
         expect(s.headers["x-amz-security-token"], `${label} ${s.path}`).toBeUndefined();
       }
@@ -417,7 +429,12 @@ describe("Bedrock provider key authentication modes", () => {
       const r = await req();
       expect(r.status, `${label}: ${r.text}`).toBe(200);
       expect(r.sent.length, label).toBeGreaterThan(0);
-      for (const s of r.sent) expect(signer(s), `${label} ${s.path}`).toBe(AMBIENT_KEY);
+      for (const s of r.sent) {
+        expect(signer(s), `${label} ${s.path}`).toBe(AMBIENT_KEY);
+        if (s.path === "/anthropic/v1/messages/count_tokens") {
+          expect(CREDENTIAL_RE.exec(s.headers.authorization ?? "")?.[3], `${label} ${s.path}`).toBe("bedrock-mantle");
+        }
+      }
     }
   });
 

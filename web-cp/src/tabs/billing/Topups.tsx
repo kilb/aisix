@@ -151,9 +151,7 @@ export function Topups({ canEdit, refreshShell }: TabProps) {
         dataLead={items === null ? (loadError ? "充值申请读取失败，请重试。" : "正在读取充值申请。") : <>{loadError ? "读取失败，以下为最近成功读取记录。" : ""}当前筛选已加载 <strong>{formatCount(items.length)}</strong> 条申请{next !== null ? "，可继续加载。" : "，已到记录末尾。"}</>}
         description="租户提交的充值申请。批准后金额立即计入该租户余额；驳回须写明原因，租户可以看到。"
         actions={
-          <Button type="button" icon="refresh" onClick={() => void load()}>
-            刷新
-          </Button>
+          <Button className="finance-icon-button" aria-label="刷新" title="刷新" type="button" icon="refresh" onClick={() => void load()}></Button>
         }
       />
     <BentoGrid>
@@ -234,22 +232,22 @@ export function Topups({ canEdit, refreshShell }: TabProps) {
                 const mine = flight?.id === t.id ? flight : null;
                 const writing = rejecting?.id === t.id ? rejecting : null;
                 return [
-                  <tr key={t.id}>
-                    <td className="font-medium">{t.tenant_name}</td>
-                    <td className="num money font-normal">{fmtMicroCny(t.amount_micro_cny)}</td>
-                    <td className="min-w-32 whitespace-normal">
+                  <tr data-finance-record key={t.id}>
+                    <td data-label="租户" className="font-medium">{t.tenant_name}</td>
+                    <td data-label="金额" className="num money font-normal">{fmtMicroCny(t.amount_micro_cny)}</td>
+                    <td data-label="备注" className="min-w-32 whitespace-normal">
                       {t.origin === "operator" ? (t.credit_reason ?? t.note) : t.note}
                       {t.status === "rejected" && t.reject_reason && (
                         <span className="cell-note">驳回原因：{t.reject_reason}</span>
                       )}
                     </td>
-                    <td className="text-text-2">{t.reference ? <code>{t.reference}</code> : "—"}</td>
-                    <td>
+                    <td data-label="凭证号" className="text-text-2">{t.reference ? <code>{t.reference}</code> : "—"}</td>
+                    <td data-label="来源">
                       <span className="tag">{ORIGIN_LABEL[t.origin]}</span>
                     </td>
-                    <td className="text-text-2">{t.requested_by?.display_name ?? "—"}</td>
-                    <td className="tabular text-text-2">{fmtBeijing(t.requested_at)}</td>
-                    <td className="right">
+                    <td data-label="提交人" className="text-text-2">{t.requested_by?.display_name ?? "—"}</td>
+                    <td data-label="提交时间" className="tabular text-text-2">{fmtBeijing(t.requested_at)}</td>
+                    <td data-label="操作" className="right">
                       {t.status === "pending" && t.origin === "tenant" && canEdit && (
                         <span className="inline-flex items-start justify-end gap-2">
                           <TwoStep

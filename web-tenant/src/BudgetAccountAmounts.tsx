@@ -22,13 +22,13 @@ export function BudgetAccountAmounts({ balance }: { balance: BudgetAccountBalanc
   const available = amount(balance, "available_micro_cny");
   const credit = amount(balance, "credit_limit_micro_cny");
   return (
-    <dl className="grid gap-6">
+    <dl className="budget-account-amounts grid gap-6">
       <div className="min-w-0">
-        <dt className="text-meta font-mono text-muted">账户可用额度</dt>
+        <dt className="text-caption text-muted">账户可用额度</dt>
         <dd className="mt-3"><Metric size="hero" className="break-all">{available === null ? "未知" : <Money micro={available} />}</Metric></dd>
       </div>
       <div className="min-w-0">
-        <dt className="text-meta font-mono text-muted">信用额度</dt>
+        <dt className="text-caption text-muted">信用额度</dt>
         <dd className="mt-2"><Metric size="value" className="break-all">{credit === null ? "未知" : <Money micro={credit} />}</Metric></dd>
       </div>
     </dl>

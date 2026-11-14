@@ -190,7 +190,7 @@ export function PublicModelDetail({
             </div>
           ) : null}
           {model.served_by.length > 0 && (
-            <DataTable label={served.length === 0 ? "服务账号（全部停用）" : "服务账号"} compact scroll>
+            <DataTable label={served.length === 0 ? "服务账号（全部停用）" : "服务账号"} compact>
               <colgroup>
                 <col className="pm-col-tier" />
                 <col className="pm-col-account" />
@@ -214,27 +214,27 @@ export function PublicModelDetail({
               <tbody>
                 {ordered.map((tier, index) =>
                   tier.accounts.map((account, at) => (
-                    <tr
+                    <tr data-finance-record
                       key={account.provider_key_id}
                       data-tier={tier.priority}
                       data-enabled={account.enabled}
                       className={at === 0 && index > 0 ? "[&>td]:border-t [&>td]:border-t-border" : undefined}
                     >
-                      <td className="num font-medium">{at === 0 ? index + 1 : ""}</td>
-                      <td>
+                      <td data-label="层" className="num font-medium">{at === 0 ? index + 1 : ""}</td>
+                      <td data-label="上游账号">
                         <span className="pm-account-name">{account.display_name || account.provider_key_id}</span>
                       </td>
-                      <td className="num tabular">{account.priority}</td>
-                      <td className="num tabular">{account.weight}</td>
-                      <td className="pm-upstream-model">
+                      <td data-label="优先级" className="num tabular">{account.priority}</td>
+                      <td data-label="权重" className="num tabular">{account.weight}</td>
+                      <td data-label="上游模型名称" className="pm-upstream-model">
                         {account.upstream_model === null ? (
                           <span className="cell-note">同名（{model.name}）</span>
                         ) : (
                           <span className="mono">{account.upstream_model}</span>
                         )}
                       </td>
-                      <td>{account.groups.length > 0 ? <GroupList groups={account.groups} /> : "—"}</td>
-                      <td>
+                      <td data-label="账号分组">{account.groups.length > 0 ? <GroupList groups={account.groups} /> : "—"}</td>
+                      <td data-label="状态">
                         <Lamp state={account.enabled ? "applied" : "disabled"}>{account.enabled ? "启用" : "已停用"}</Lamp>
                       </td>
                     </tr>

@@ -26,6 +26,9 @@ import { currentQueryResult, type QueryResult } from "./lib/queryResult";
 import { useHashQuery } from "./lib/useHashQuery";
 import { usageRange, usageDateValue, usageRequestKey, metricViewOf } from "./lib/usageNavigation";
 import { ApiMetricsPanel } from "./components/ApiMetricsPanel";
+import { UsageIoAuditDetails } from "./components/UsageIoAuditDetails";
+import { UsageRecordFilters } from "./components/UsageRecordFilters";
+import { usageRecordFilterParams, usageRecordFilterValues } from "./lib/usageRecordFilters";
 
 function failure(e: unknown): string {
   return e instanceof ApiError ? messageFor(e) : String(e);
@@ -107,6 +110,7 @@ function chargeText(c: Call): string {
 function CallStatusLamp({ call }: { call: Call }) {
   if (call.status === "succeeded") return <Lamp state="applied">成功</Lamp>;
   if (call.status === "retried") return <Lamp state="pending">已重试</Lamp>;
+  if (call.status === "unknown") return <Lamp state="pending">结果未知</Lamp>;
   if (call.status !== "failed") return <Lamp state="pending">{call.status}</Lamp>;
   const reason = call.error_class === null ? "失败" : (ERROR_LABEL[call.error_class] ?? "调用未完成");
   return <Lamp state="rejected">{`失败（${reason}）`}</Lamp>;
@@ -156,6 +160,7 @@ function FeeCalculation({ call }: { call: Call }) {
       )}
       <p className="hint">首 token 延迟从请求接收到首次交付文本、推理或工具内容；无内容、非流式和旧记录未采集时显示 —。模型处理耗时为本次模型请求开始至结束，包含网络传输，不是整次请求总耗时。</p>
       {call.latency_ms !== null && <p className="hint">响应延迟（旧采集口径）：{call.latency_ms} ms；不同调用协议的计时终点可能不同。</p>}
+      <UsageIoAuditDetails data={call} />
     </section>
   );
 }
@@ -171,7 +176,7 @@ const MAX_DAYS = { day: 92, month: 731 } as const;
 /** A card that is a region named by its heading. */
 function Section({ title, number, children }: { title: string; number: number; children: ReactNode }) {
   return (
-    <Card role="region" aria-label={title} className={span.d12}>
+    <Card role="region" aria-label={title} className={`${span.d12} usage-record-section`}>
       <CardHeader number={number} title={title} />
       {children}
     </Card>
@@ -180,7 +185,7 @@ function Section({ title, number, children }: { title: string; number: number; c
 
 /** The filters above a list: labelled controls on one wrapping row. */
 function Filters({ children }: { children: ReactNode }) {
-  return <div className="usage-filters flex flex-wrap items-start gap-x-3 gap-y-4 [&>.field]:w-full sm:[&>.field]:w-48">{children}</div>;
+  return <div className="usage-filters">{children}</div>;
 }
 
 /** The key filter's options: every key an owner or admin sees, a member's own. A billing member holds none. */
@@ -225,8 +230,8 @@ export function Usage({ member, page = "analysis" }: { member: SessionMember; pa
   const keyList = keys ?? [];
   const showKeys = member.role !== "billing";
   return (
-    <>
-      <PageHeader title={page === "calls" ? "调用记录" : "用量分析"} eyebrow={page === "calls" ? "CALLS · 计费尝试" : "ANALYTICS · API 请求"} dataLead={member.role === "member" ? "查看你的密钥范围；每次计费尝试单独记录。" : "查看全组织用量与费用；每次计费尝试单独记录。"} />
+    <div className="measurement-page">
+      <PageHeader title={page === "calls" ? "调用记录" : "用量分析"} dataLead={member.role === "member" ? "查看你的密钥范围；每次计费尝试单独记录。" : "查看全组织用量与费用；每次计费尝试单独记录。"} />
       <div className="flex min-w-0 flex-col gap-3">
         {readErr && (
           <div className="note crit" role="alert">
@@ -235,7 +240,7 @@ export function Usage({ member, page = "analysis" }: { member: SessionMember; pa
         )}
         {page === "analysis" ? <Summary keys={keyList} showKeys={showKeys} ownScope={member.role === "member"} models={granted} /> : <CallLog keys={keyList} showKeys={showKeys} models={granted} />}
       </div>
-    </>
+    </div>
   );
 }
 
@@ -336,17 +341,17 @@ function Summary({ keys, showKeys, ownScope, models }: { keys: TenantKey[]; show
   const metricsTo = range?.to ?? (query.get("to") || fallback.to);
   return (
     <BentoGrid>
-      <div className={span.d12}>
+      <div className={`${span.d12} metric-scope`}>
         <Filters>
           <Field label="开始日期"><input type="date" value={fromDate} onChange={e => setFromDate(e.target.value)} /></Field>
           <Field label="结束日期"><input type="date" value={toDate} onChange={e => setToDate(e.target.value)} /></Field>
           {showKeys && <KeySelect keys={keys} value={keyId} onChange={setKeyId} />}
           <Field label="模型"><select value={query.get("model_id") ?? ""} onChange={event => update({ model_id: event.target.value, from: metricsFrom, to: metricsTo })}><option value="">全部</option>{query.get("model_id") && !models.some(model => model.id === query.get("model_id")) && <option value={query.get("model_id")!}>已选模型（{query.get("model_id")}，当前列表未提供）</option>}{models.map(model => <option key={model.id} value={model.id}>{model.name}</option>)}</select></Field>
+          <Button onClick={() => setRefresh(value => value + 1)}>刷新分析</Button>
+          <a className="metric-scope-action" href={`#calls?${new URLSearchParams({ ...Object.fromEntries(query), from: metricsFrom, to: metricsTo })}`}>查看调用记录</a>
         </Filters>
-        <Button onClick={() => setRefresh(value => value + 1)}>刷新分析</Button>
         <p className="hint">分析最多查询 92 天或 1500 个时间桶，超出范围请调整。按月汇总仍可查询原有历史范围。</p>
         <p className="hint">{fmtBeijing(metricsFrom)} — {fmtBeijing(metricsTo)}</p>
-        <a className="inline-flex min-h-11 min-w-11 items-center" href={`#calls?${new URLSearchParams({ ...Object.fromEntries(query), from: metricsFrom, to: metricsTo })}`}>查看调用记录</a>
       </div>
       <ApiMetricsPanel refreshKey={refresh} scope="tenant" enabled={range !== null} from={metricsFrom} to={metricsTo} apiKeyId={keyId || undefined} modelId={query.get("model_id") || undefined} memberId={query.get("member_id") || undefined} view={metricViewOf(query.get("view"))} onViewChange={view => update({ view, from: metricsFrom, to: metricsTo })} numberStart={1} className={span.d12} />
       <Section title="用量汇总" number={7}>
@@ -389,14 +394,14 @@ function Summary({ keys, showKeys, ownScope, models }: { keys: TenantKey[]; show
             <tbody>
               {table.rows.map((r) => (
                 <tr key={`${r.period_start}/${r.model.id ?? r.model.name}`}>
-                  <td className="tabular">{periodLabel(r.period_start, group)}</td>
-                  <td>{summaryModel(r)}</td>
-                  <td className="num">{r.requests}</td>
-                  <td className="num">
+                  <td className="tabular" data-label="期间">{periodLabel(r.period_start, group)}</td>
+                  <td data-label="模型">{summaryModel(r)}</td>
+                  <td className="num" data-label="调用次数">{r.requests}</td>
+                  <td className="num" data-label="费用">
                     {Number.isSafeInteger(r.charged_micro_cny) ? fmtMicroCny(r.charged_micro_cny) : "未知"}
                     {r.estimated_requests > 0 ? "（含估算）" : ""}
                   </td>
-                  <td>
+                  <td data-label="计量">
                     <Quantities q={r.quantities} />
                   </td>
                 </tr>
@@ -433,8 +438,8 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
   const [pageSize, setPageSize] = useState<RecordPageSize>(25);
   const [more, setMore] = useState(false);
   const morePending = useRef(false);
-  const statusFilter = query.get("status") ?? "";
-  const setStatusFilter = (value: string) => update({ status: value });
+  // 旧状态深链映射到服务端结果筛选，首次操作写入新的标准参数。
+  const recordFilters = { ...usageRecordFilterValues(query), outcome: query.get("outcome") ?? query.get("status") ?? "" };
   const range = usageRange(query);
   const request = {
     ...range,
@@ -442,6 +447,8 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
     ...(keyId ? { api_key_id: keyId } : {}),
     ...(modelId ? { model_id: modelId } : {}),
     ...(requestId ? { request_id: requestId } : {}),
+    ...(query.get("member_id") ? { member_id: query.get("member_id")! } : {}),
+    ...usageRecordFilterParams(recordFilters, "tenant"),
   };
   const requestKey = usageRequestKey(query, request);
   const shown = currentQueryResult(result, requestKey);
@@ -452,12 +459,12 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
   activeKey.current = requestKey;
   const searchQuery = query.get("q") ?? "";
   const table = useRecordTable({
-    items: filterRecords((rows ?? []).filter(call => !statusFilter || call.status === statusFilter), searchQuery,
+    items: filterRecords(rows ?? [], searchQuery,
       call => [call.model.name, call.api_key.label, call.api_key.prefix, call.member?.display_name ?? "", call.request_id ?? ""]),
-    resetKey: `${requestKey}/${statusFilter}/${searchQuery}`,
+    resetKey: `${requestKey}/${searchQuery}`,
   });
   const loadedSearch = useRef("");
-  loadedSearch.current = `${searchQuery}/${statusFilter}`;
+  loadedSearch.current = searchQuery;
   const [open, setOpen] = useState<Set<string>>(new Set());
   const ticket = useRef(0);
 
@@ -550,11 +557,10 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
           <input autoComplete="off" value={typed} onChange={(e) => { setTyped(e.target.value); setRequestEditing(true); }} />
         </Field>
       </Filters>
-      <RecordTableToolbar search={{ value: searchQuery, onChange: value => update({ q: value }), label: "搜索已加载调用", placeholder: "模型、密钥、成员或请求 ID" }}>
-        <Field label="已加载调用状态"><select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}><option value="">全部状态</option><option value="succeeded">成功</option><option value="failed">失败</option><option value="retried">重试</option></select></Field>
-      </RecordTableToolbar>
-      {query.has("member_id") && <p className="note warn">调用记录接口不支持成员 ID 筛选；可在已加载记录内搜索成员。</p>}
-      <p className="hint">搜索和状态仅筛选已加载记录；继续下一页可读取更早记录。</p>
+      <UsageRecordFilters scope="tenant" value={recordFilters} onChange={patch => update({ outcome: recordFilters.outcome, ...patch, status: undefined })} />
+      <RecordTableToolbar search={{ value: searchQuery, onChange: value => update({ q: value }), label: "搜索已加载调用", placeholder: "模型、密钥、成员或请求 ID" }} />
+      {query.get("member_id") && <p className="hint" role="status">已按成员 {query.get("member_id")} 筛选。</p>}
+      <p className="hint">文字搜索仅筛选已加载记录；调用结果与更多筛选作用于全部匹配记录。</p>
       <p className="mt-4 text-caption text-muted">调用记录按计费尝试逐条展示，同一请求可能有多条记录。{rows !== null ? `已加载 ${rows.length.toLocaleString("en-US")} 条${next !== null ? "，还有更多记录" : ""}；这些记录不代表整个汇总窗口的成功率或延迟分布。` : ""}</p>
       {err && (
         <div className="note crit" role="alert">
@@ -565,20 +571,16 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
       {rows !== null && rows.length === 0 && !err && <CardMessage>所选条件下没有调用记录</CardMessage>}
       {rows !== null && rows.length > 0 && (
         <DataTable label="调用记录">
+          <colgroup><col className="usage-column-action" /><col className="usage-column-time" /><col className="usage-column-request" /><col className="usage-column-state" /><col className="usage-column-timing" /><col className="usage-column-charge" /></colgroup>
           <thead>
             <tr>
               <th>
                 <span className="vh">明细</span>
               </th>
               <th>时间</th>
-              <th>模型</th>
-              <th>密钥</th>
-              <th>成员</th>
-              <th>请求 ID</th>
+              <th>模型 / 请求</th>
               <th>状态</th>
-              <th>分组</th>
-              <th className="num">首 token 延迟</th>
-              <th className="num">模型处理耗时</th>
+              <th className="num">响应性能</th>
               <th className="num">费用</th>
             </tr>
           </thead>
@@ -588,34 +590,35 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
               return (
                 <Fragment key={c.event_id}>
                   <tr>
-                    <td>
+                    <td className="usage-row-action">
                       <Button
                         kind="quiet"
                         size="sm"
                         aria-expanded={expanded}
                         aria-label={expanded ? "收起明细" : "展开明细"}
+                        title={expanded ? "收起明细" : "展开明细"}
+                        className="tenant-icon-action"
                         onClick={() => toggle(c.event_id)}
                       >
                         <ChevronRight aria-hidden="true" className={expanded ? "rotate-90 transition-transform" : "transition-transform"} />
-                        {expanded ? "收起" : "展开"}
                       </Button>
                     </td>
-                    <td className="tabular">{fmtBeijing(c.occurred_at)}</td>
-                    <td>{c.model.name || "—"}</td>
-                    <td>{c.api_key.label || "—"}</td>
-                    <td>{c.member ? (c.member.display_name ?? "成员") : "—"}</td>
-                    <td>{c.request_id ? <code>{c.request_id}</code> : "—"}</td>
-                    <td>
-                      <CallStatusLamp call={c} />
+                    <td className="tabular" data-label="时间">{fmtBeijing(c.occurred_at)}</td>
+                    <td data-label="模型 / 请求" className="usage-request-identity">
+                      <strong>{c.model.name || "—"}</strong>
+                      <span className="cell-note">密钥 {c.api_key.label || "—"} · 成员 {c.member ? (c.member.display_name ?? "成员") : "—"}</span>
+                      <span className="cell-note">{c.request_id ? <code>{c.request_id}</code> : "—"}</span>
                     </td>
-                    <td>{c.charge.group ? c.charge.group.display_name : "—"}</td>
-                    <td className="num">{c.first_token_latency_ms === null ? "—" : `${c.first_token_latency_ms} ms`}</td>
-                    <td className="num">{c.attempt_duration_ms === null ? "—" : `${c.attempt_duration_ms} ms`}</td>
-                    <td className="num">{chargeText(c)}</td>
+                    <td data-label="状态">
+                      <CallStatusLamp call={c} />
+                      <span className="cell-note">分组 {c.charge.group ? c.charge.group.display_name : "—"}</span>
+                    </td>
+                    <td className="num" data-label="响应性能"><span className="usage-timing-value"><span>首 token</span>{c.first_token_latency_ms === null ? "—" : `${c.first_token_latency_ms} ms`}</span><span className="usage-timing-value cell-note"><span>处理耗时</span>{c.attempt_duration_ms === null ? "—" : `${c.attempt_duration_ms} ms`}</span></td>
+                    <td className="num" data-label="费用">{chargeText(c)}</td>
                   </tr>
                   {expanded && (
                     <tr className="usage-detail">
-                      <td colSpan={11}>
+                      <td colSpan={6}>
                         <FeeCalculation call={c} />
                         <h3>计费明细</h3>
                         {c.charge.lines === null ? (
@@ -635,10 +638,10 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
                             <tbody>
                               {c.charge.lines.map((l) => (
                                 <tr key={l.dimension}>
-                                  <td>{dimensionLabel(l.dimension)}</td>
-                                  <td className="num">{l.quantity}</td>
-                                  <td className="num">{l.rate_cny === null ? "—" : unitPrice(l.dimension, l.rate_cny)}</td>
-                                  <td className="num">{(() => {
+                                  <td data-label="计量">{dimensionLabel(l.dimension)}</td>
+                                  <td className="num" data-label="数量">{l.quantity}</td>
+                                  <td className="num" data-label="折扣前单价（元/百万）">{l.rate_cny === null ? "—" : unitPrice(l.dimension, l.rate_cny)}</td>
+                                  <td className="num" data-label="折后单价（元/百万）">{(() => {
                                     const rate = l.rate_cny === null ? null : discountedRate(l.rate_cny, c.charge.discount_bps);
                                     return rate === null ? "—" : unitPrice(l.dimension, rate);
                                   })()}</td>

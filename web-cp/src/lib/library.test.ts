@@ -7,6 +7,7 @@ import {
   longContextChange,
   longContextLines,
   longContextText,
+  removedTierWarning,
   syncRequest,
   syncStateText,
 } from "./library.ts";
@@ -185,4 +186,30 @@ test("多匹配的模型只按选定的候选发送，没选就不发送", () =>
   // A candidate that would only confirm what holds is never sent.
   const same: SyncCandidate = { ...candidate, state: "same" };
   assert.deepEqual(syncRequest([ambiguous], 10, { a: same }), []);
+});
+
+test("整卡同步明确列出将被移除的档位及无法计价的影响", () => {
+  const current: RateCard = {
+    default: { base: { input: "4", output: "20" } },
+    priority: { base: { input: "12", output: "60" } },
+    fast: { base: { input: "8", output: "40" } },
+    batch: { base: { input: "2", output: "10" } },
+  };
+  const target: RateCard = { default: current.default!, batch: current.batch! };
+  assert.equal(removedTierWarning(target, current), "同步将移除档位「fast」、「priority」；整卡替换后，这些档位的请求将无法计价。");
+  assert.equal(removedTierWarning({ ...target, fast: current.fast! }, current), "同步将移除档位「priority」；整卡替换后，这些档位的请求将无法计价。");
+  assert.equal(removedTierWarning(current, target), null);
+  assert.equal(removedTierWarning(current, current), null);
+  assert.equal(current.fast!.base.input, "8", "比较不得修改现行卡");
+  assert.equal(Object.hasOwn(target, "fast"), false, "比较不得补入旧档位");
+});
+
+test("缺失或无法读取的卡不推断档位被移除，未知档位按原名提示", () => {
+  const card: RateCard = { default: { base: { input: "0", output: "0" } }, future_tier: { base: { input: "1", output: "2" } } };
+  const target = { default: card.default! };
+  for (const unknown of [null, undefined, [], "invalid", {}, { fast: null }, { default: {} }, { default: { base: {} } }, { fast: { base: [] } }, { fast: { base: { input: 2 } } }]) {
+    assert.equal(removedTierWarning(unknown, card), null);
+    assert.equal(removedTierWarning(target, unknown), null);
+  }
+  assert.equal(removedTierWarning(target, card), "同步将移除档位「future_tier」；整卡替换后，这些档位的请求将无法计价。");
 });

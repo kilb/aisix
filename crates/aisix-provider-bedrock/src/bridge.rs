@@ -41,9 +41,10 @@ use aws_sdk_bedrockruntime::types::{
     DocumentBlock, DocumentFormat, DocumentSource, ImageBlock, ImageFormat, ImageSource,
     InferenceConfiguration, JsonSchemaDefinition, Message as BedrockMessage, OutputConfig,
     OutputFormat, OutputFormatStructure, OutputFormatType, ReasoningContentBlock,
-    ReasoningContentBlockDelta, SpecificToolChoice, StopReason as SdkStopReason,
-    SystemContentBlock, Tool, ToolChoice, ToolConfiguration, ToolInputSchema, ToolResultBlock,
-    ToolResultContentBlock, ToolSpecification, ToolUseBlock, VideoBlock, VideoFormat, VideoSource,
+    ReasoningContentBlockDelta, ReasoningTextBlock, SpecificToolChoice,
+    StopReason as SdkStopReason, SystemContentBlock, Tool, ToolChoice, ToolConfiguration,
+    ToolInputSchema, ToolResultBlock, ToolResultContentBlock, ToolResultStatus, ToolSpecification,
+    ToolUseBlock, VideoBlock, VideoFormat, VideoSource,
 };
 use aws_sdk_bedrockruntime::Client as BedrockClient;
 use base64::Engine as _;
@@ -84,7 +85,9 @@ use aws_sdk_bedrockruntime::config::{ConfigBag, Intercept, RuntimeComponents};
 use aws_smithy_runtime_api::box_error::BoxError;
 
 use crate::convert::{document_to_json, json_to_document};
+use crate::upstream_io::UpstreamIoInterceptor;
 use crate::wire;
+use aisix_gateway::upstream_io::Protocol;
 
 /// Anthropic-on-Bedrock body-shape version pin per
 /// <https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters-anthropic-claude-messages.html>.
@@ -706,12 +709,38 @@ pub(crate) fn auth_headers(
     headers: &[(String, String)],
     body: &[u8],
 ) -> Result<Vec<(String, String)>, BridgeError> {
+    auth_headers_for(auth, region, url, headers, body, "bedrock", false)
+}
+
+/// Mantle 计数使用独立的密钥头和签名服务。
+/// <https://docs.aws.amazon.com/bedrock/latest/userguide/count-tokens.html#count-tokens-mantle>
+pub(crate) fn mantle_auth_headers(
+    auth: &RequestAuth,
+    region: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> Result<Vec<(String, String)>, BridgeError> {
+    auth_headers_for(auth, region, url, headers, body, "bedrock-mantle", true)
+}
+
+fn auth_headers_for(
+    auth: &RequestAuth,
+    region: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+    service: &'static str,
+    mantle: bool,
+) -> Result<Vec<(String, String)>, BridgeError> {
     let creds = match auth {
         RequestAuth::Bearer(token) => {
-            return Ok(vec![(
-                "authorization".to_string(),
-                format!("Bearer {token}"),
-            )])
+            aisix_gateway::note_sent_credential(token);
+            return Ok(vec![if mantle {
+                ("x-api-key".to_string(), token.clone())
+            } else {
+                ("authorization".to_string(), format!("Bearer {token}"))
+            }]);
         }
         RequestAuth::SigV4(creds) => creds,
     };
@@ -719,7 +748,7 @@ pub(crate) fn auth_headers(
     let params = aws_sigv4::sign::v4::SigningParams::builder()
         .identity(&identity)
         .region(region)
-        .name("bedrock")
+        .name(service)
         .time(std::time::SystemTime::now())
         .settings(aws_sigv4::http_request::SigningSettings::default())
         .build()
@@ -1240,6 +1269,10 @@ impl Bridge for BedrockBridge {
         })
     }
 
+    fn reads_file_uris(&self, req: &ChatFormat, ctx: &BridgeContext) -> bool {
+        upstream_model(ctx).is_ok_and(|id| !crate::openai_compat::serves(req, id))
+    }
+
     async fn chat(
         &self,
         req: &ChatFormat,
@@ -1375,6 +1408,8 @@ impl Bridge for BedrockBridge {
                     .content_type("application/json")
                     .accept("application/json")
                     .body(Blob::new(body_bytes))
+                    .customize()
+                    .interceptor(UpstreamIoInterceptor::new(Protocol::Embeddings))
                     .send();
                 let resp = within_attempt(deadline, started, async {
                     send.await
@@ -1441,6 +1476,8 @@ impl Bridge for BedrockBridge {
                 .content_type("application/json")
                 .accept("application/json")
                 .body(Blob::new(body_bytes))
+                .customize()
+                .interceptor(UpstreamIoInterceptor::new(Protocol::Embeddings))
                 .send();
             let resp = within_attempt(deadline, started, async {
                 send.await
@@ -1735,6 +1772,8 @@ impl BedrockBridge {
             call = call.service_tier(tier.r#type().clone());
         }
         let resp = call
+            .customize()
+            .interceptor(UpstreamIoInterceptor::new(Protocol::Messages))
             .send()
             .await
             .map_err(|e| crate::errors::sdk_error(e, started, deadline))?;
@@ -1911,6 +1950,7 @@ impl BedrockBridge {
         let resp = call
             .customize()
             .interceptor(interceptor)
+            .interceptor(UpstreamIoInterceptor::new(Protocol::Converse))
             .send()
             .await
             .map_err(|e| crate::errors::sdk_error(e, started, deadline))?;
@@ -2007,9 +2047,11 @@ impl BedrockBridge {
 
         // The owned request is not needed past its wire bytes.
         drop(req);
+        let io = UpstreamIoInterceptor::new(Protocol::Converse);
         let mut resp = call
             .customize()
             .interceptor(interceptor)
+            .interceptor(io.clone())
             .send()
             .await
             .map_err(|e| crate::errors::sdk_error(e, started, deadline))?;
@@ -2026,6 +2068,7 @@ impl BedrockBridge {
             loop {
                 match resp.stream.recv().await {
                     Ok(Some(event)) => {
+                        io.converse_event(&event);
                         for mut chunk in emit_converse_chunk(event, &upstream_id_owned, &mut state) {
                             chunk.id = request_id.clone();
                             semantic_terminal_seen |= chunk.finish_reason.is_some();
@@ -2066,6 +2109,9 @@ impl ConverseParts {
         guarded: bool,
         ctx: &BridgeContext,
     ) -> Result<Self, BridgeError> {
+        let (normalized, _legacy) =
+            aisix_gateway::tool_calls::legacy_functions_as_tools(std::borrow::Cow::Borrowed(req))?;
+        let req = normalized.as_ref();
         check_history_tool_calls(req)?;
         let auto_cache_ttl = auto_prompt_caching_ttl(&ctx.model);
         let publisher = BedrockPublisher::from_model_id(upstream_id);
@@ -2136,11 +2182,8 @@ fn build_converse_inputs(
     let mut pending_tool_results: Vec<ContentBlock> = Vec::new();
 
     for (index, msg) in req.messages.iter().enumerate() {
-        // Converse has no slot for replayed reasoning, and a turn that
-        // holds only that would become a blank text block, which Converse
-        // rejects. Skipped before the flush below, so tool results on
-        // either side of it still coalesce as if it were not there.
-        if msg.is_reasoning_only() {
+        // 无签名的推理文本不能当作普通 assistant 文本回放。
+        if msg.is_reasoning_only() && !has_native_reasoning(msg) {
             continue;
         }
         // Flush buffered tool results as one user message before any
@@ -2209,6 +2252,7 @@ fn build_converse_inputs(
                     claude,
                     fetched,
                     tool_result_images_inline(upstream_id),
+                    tool_result_status_supported(upstream_id),
                 )?);
                 if let Some(point) = cache.point(tool_message_cache_control(msg)) {
                     pending_tool_results.push(ContentBlock::CachePoint(point));
@@ -2591,6 +2635,22 @@ fn tool_result_images_inline(upstream_id: &str) -> bool {
 const TOOL_RESULT_IMAGE_PLACEHOLDER: &str =
     "[Tool returned an image - see the following user message]";
 
+/// AWS 的 status 槽仅对 Nova 和 Claude 3/4 定义。
+/// <https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ToolResultBlock.html>
+fn tool_result_status_supported(model: &str) -> bool {
+    let id = strip_region_prefix(capability_id(model));
+    id.starts_with("amazon.nova-")
+        || [
+            "anthropic.claude-3",
+            "anthropic.claude-4",
+            "anthropic.claude-sonnet-4",
+            "anthropic.claude-opus-4",
+            "anthropic.claude-haiku-4",
+        ]
+        .iter()
+        .any(|prefix| id.starts_with(prefix))
+}
+
 /// One `role:"tool"` message as a Converse `toolResult` block — its text,
 /// images and documents — followed by any images the model only takes
 /// beside the result.
@@ -2601,6 +2661,7 @@ fn tool_result_blocks(
     claude: bool,
     fetched: &FetchedMedia,
     images_inline: bool,
+    supports_status: bool,
 ) -> Result<Vec<ContentBlock>, BridgeError> {
     let parts: Vec<ContentBlock> = match msg.content_blocks.as_deref() {
         None => vec![ContentBlock::Text(msg.content_str().to_string())],
@@ -2653,6 +2714,22 @@ fn tool_result_blocks(
     let block = ToolResultBlock::builder()
         .tool_use_id(id)
         .set_content(Some(content))
+        .set_status(
+            supports_status
+                .then(|| {
+                    msg.extra
+                        .get("is_error")
+                        .and_then(serde_json::Value::as_bool)
+                })
+                .flatten()
+                .map(|error| {
+                    if error {
+                        ToolResultStatus::Error
+                    } else {
+                        ToolResultStatus::Success
+                    }
+                }),
+        )
         .build()
         .map_err(|e| BridgeError::Config(format!("bedrock converse: build tool_result: {e}")))?;
     let mut out = vec![ContentBlock::ToolResult(block)];
@@ -2743,33 +2820,45 @@ fn assistant_content_blocks(
     msg: &ChatMessage,
     cache: CachePoints,
 ) -> Result<Vec<ContentBlock>, BridgeError> {
+    let native = msg.content_blocks.as_deref().filter(|_| {
+        has_native_reasoning(msg)
+            || msg.content_blocks.iter().flatten().any(|part| {
+                part.get("type").and_then(serde_json::Value::as_str) == Some("tool_use")
+            })
+    });
     let tool_calls = msg
         .extra
         .get("tool_calls")
         .and_then(|v| v.as_array())
         .filter(|calls| !calls.is_empty());
-    let mut blocks: Vec<ContentBlock> = Vec::new();
-    match marked_text_parts(msg, cache) {
-        Some(parts) => {
-            for part in parts {
-                if let Some(text) = part_text(part) {
-                    blocks.push(ContentBlock::Text(text.to_string()));
-                }
-                if let Some(point) = cache.point(part.get("cache_control")) {
-                    if matches!(blocks.last(), Some(ContentBlock::Text(_))) {
-                        blocks.push(ContentBlock::CachePoint(point));
+    let mut blocks: Vec<ContentBlock> = native
+        .into_iter()
+        .flatten()
+        .filter_map(native_assistant_block_to_converse)
+        .collect::<Result<_, _>>()?;
+    if native.is_none() {
+        match marked_text_parts(msg, cache) {
+            Some(parts) => {
+                for part in parts {
+                    if let Some(text) = part_text(part) {
+                        blocks.push(ContentBlock::Text(text.to_string()));
+                    }
+                    if let Some(point) = cache.point(part.get("cache_control")) {
+                        if matches!(blocks.last(), Some(ContentBlock::Text(_))) {
+                            blocks.push(ContentBlock::CachePoint(point));
+                        }
                     }
                 }
             }
-        }
-        // No tool calls: preserve the original single-text-block shape.
-        None if tool_calls.is_none() => {
-            return Ok(vec![ContentBlock::Text(msg.content_str().to_string())]);
-        }
-        None => {
-            let text = msg.content_str();
-            if !text.is_empty() {
-                blocks.push(ContentBlock::Text(text.to_string()));
+            // No tool calls: preserve the original single-text-block shape.
+            None if tool_calls.is_none() => {
+                return Ok(vec![ContentBlock::Text(msg.content_str().to_string())]);
+            }
+            None => {
+                let text = msg.content_str();
+                if !text.is_empty() {
+                    blocks.push(ContentBlock::Text(text.to_string()));
+                }
             }
         }
     }
@@ -2779,6 +2868,12 @@ fn assistant_content_blocks(
     for call in tool_calls {
         let function = call.get("function");
         let id = call.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+        if blocks
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolUse(tool) if tool.tool_use_id() == id))
+        {
+            continue;
+        }
         let name = function
             .and_then(|f| f.get("name"))
             .and_then(|v| v.as_str())
@@ -2808,6 +2903,115 @@ fn assistant_content_blocks(
     Ok(blocks)
 }
 
+/// 签名推理和加密块按平台原生槽回放；纯可读推理仍保持原来的跳过行为。
+fn has_native_reasoning(msg: &ChatMessage) -> bool {
+    msg.content_blocks.iter().flatten().any(|part| {
+        match part.get("type").and_then(serde_json::Value::as_str) {
+            Some("thinking") => {
+                part.get("thinking")
+                    .is_some_and(serde_json::Value::is_string)
+                    && part
+                        .get("signature")
+                        .is_some_and(serde_json::Value::is_string)
+            }
+            Some("redacted_thinking") => part.get("data").is_some_and(serde_json::Value::is_string),
+            _ => false,
+        }
+    })
+}
+
+fn native_assistant_block_to_converse(
+    part: &serde_json::Value,
+) -> Option<Result<ContentBlock, BridgeError>> {
+    let invalid =
+        |field: &str| BridgeError::InvalidRequest(format!("content_blocks.{field} is required"));
+    Some(
+        match part.get("type").and_then(serde_json::Value::as_str)? {
+            "text" => part
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .map(|text| ContentBlock::Text(text.to_string()))
+                .ok_or_else(|| invalid("text")),
+            "thinking" => (|| {
+                let text = part
+                    .get("thinking")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| invalid("thinking"))?;
+                let signature = part
+                    .get("signature")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                let text = ReasoningTextBlock::builder()
+                    .text(text)
+                    .set_signature(signature)
+                    .build()
+                    .map_err(|error| {
+                        BridgeError::InvalidRequest(format!("content_blocks.thinking: {error}"))
+                    })?;
+                Ok(ContentBlock::ReasoningContent(
+                    ReasoningContentBlock::ReasoningText(text),
+                ))
+            })(),
+            "redacted_thinking" => (|| {
+                let data = part
+                    .get("data")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| invalid("data"))?;
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .map_err(|_| {
+                        BridgeError::InvalidRequest("content_blocks.data must be base64".into())
+                    })?;
+                Ok(ContentBlock::ReasoningContent(
+                    ReasoningContentBlock::RedactedContent(Blob::new(bytes)),
+                ))
+            })(),
+            "tool_use" => (|| {
+                let id = part
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| invalid("id"))?;
+                let name = part
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| invalid("name"))?;
+                let input = part.get("input").ok_or_else(|| invalid("input"))?;
+                let call = ToolUseBlock::builder()
+                    .tool_use_id(id)
+                    .name(name)
+                    .input(json_to_document(input))
+                    .build()
+                    .map_err(|error| {
+                        BridgeError::InvalidRequest(format!("content_blocks.tool_use: {error}"))
+                    })?;
+                Ok(ContentBlock::ToolUse(call))
+            })(),
+            _ => return None,
+        },
+    )
+}
+
+fn converse_block_to_native(block: &ContentBlock) -> Option<serde_json::Value> {
+    Some(match block {
+        ContentBlock::Text(text) => serde_json::json!({"type":"text","text":text}),
+        ContentBlock::ToolUse(call) => {
+            serde_json::json!({"type":"tool_use","id":call.tool_use_id(),
+            "name":call.name(),"input":document_to_json(call.input())})
+        }
+        ContentBlock::ReasoningContent(ReasoningContentBlock::ReasoningText(text)) => {
+            let mut block = serde_json::json!({"type":"thinking","thinking":text.text()});
+            if let Some(signature) = text.signature() {
+                block["signature"] = signature.into();
+            }
+            block
+        }
+        ContentBlock::ReasoningContent(ReasoningContentBlock::RedactedContent(bytes)) => {
+            serde_json::json!({"type":"redacted_thinking","data":base64::engine::general_purpose::STANDARD.encode(bytes.as_ref())})
+        }
+        _ => return None,
+    })
+}
+
 /// Where a Converse answer's `additionalModelResponseFields` reach the caller:
 /// an OpenAI-shape response has no slot of its own for them, so they travel on
 /// the message under Converse's own name.
@@ -2831,9 +3035,7 @@ fn converse_output_into_chat_response(
                     ContentBlock::Text(t) => text.push_str(t),
                     // #560: translate Converse `toolUse` → OpenAI `tool_calls`.
                     ContentBlock::ToolUse(tu) => tool_calls.push(tool_use_to_openai(tu)),
-                    // Same shape as the Claude `/invoke` path: the text only,
-                    // blocks joined by a newline; the signature and redacted
-                    // ciphertext are dropped.
+                    // 可读推理保留标准投影；签名和加密内容另存于原生块。
                     ContentBlock::ReasoningContent(ReasoningContentBlock::ReasoningText(r))
                         if !r.text().is_empty() =>
                     {
@@ -2843,6 +3045,12 @@ fn converse_output_into_chat_response(
                 }
             }
             let mut message = build_assistant_message(text, tool_calls);
+            let blocks: Vec<_> = msg
+                .content()
+                .iter()
+                .filter_map(converse_block_to_native)
+                .collect();
+            message.content_blocks = (!blocks.is_empty()).then_some(blocks);
             if !reasoning.is_empty() {
                 message.extra.insert(
                     "reasoning_content".to_string(),
@@ -2881,6 +3089,11 @@ fn converse_output_into_chat_response(
             // fields. `cached_prompt_tokens` is OpenAI's subset field and is
             // subtracted from the prompt — using it here would refund tokens
             // the caller did spend.
+            openai_details: aisix_gateway::OpenAiUsageDetails {
+                cached_tokens_reported: u.cache_read_input_tokens().is_some(),
+                cache_creation_tokens_reported: u.cache_write_input_tokens().is_some(),
+                ..Default::default()
+            },
             cache_read_tokens: u.cache_read_input_tokens().unwrap_or(0).max(0) as u32,
             cache_creation_tokens: u.cache_write_input_tokens().unwrap_or(0).max(0) as u32,
             cache_creation_ttl: converse_cache_creation_ttl(
@@ -2891,6 +3104,7 @@ fn converse_output_into_chat_response(
         })
         .unwrap_or_default();
     ChatResponse {
+        native_envelope: None,
         logprobs: None,
         more_choices: Vec::new(),
         id: String::new(),
@@ -2991,6 +3205,43 @@ struct ConverseStreamState {
     /// text, so a second block starts on a new line — the non-streaming
     /// Claude path joins thinking blocks with `\n`.
     reasoning_block: Option<i32>,
+    native_blocks: std::collections::BTreeMap<i32, NativeConverseBlock>,
+}
+
+/// 原生块在 stop 时完成，客户端将每次收到的数组追加到历史中。
+enum NativeConverseBlock {
+    Text(String),
+    Thinking {
+        text: String,
+        signature: Option<String>,
+    },
+    Redacted(Vec<u8>),
+    Tool {
+        id: String,
+        name: String,
+        input: String,
+    },
+}
+
+impl NativeConverseBlock {
+    fn into_native(self) -> Option<serde_json::Value> {
+        Some(match self {
+            Self::Text(text) => serde_json::json!({"type":"text","text":text}),
+            Self::Thinking { text, signature } => {
+                let mut block = serde_json::json!({"type":"thinking","thinking":text});
+                if let Some(signature) = signature {
+                    block["signature"] = signature.into();
+                }
+                block
+            }
+            Self::Redacted(bytes) => serde_json::json!({"type":"redacted_thinking",
+                "data":base64::engine::general_purpose::STANDARD.encode(bytes)}),
+            Self::Tool { id, name, input } => {
+                serde_json::json!({"type":"tool_use","id":id,"name":name,
+                "input":if input.is_empty() {serde_json::json!({})} else {serde_json::from_str::<serde_json::Value>(&input).ok()?}})
+            }
+        })
+    }
 }
 
 /// Translate one Converse stream event into zero, one, or two
@@ -3004,7 +3255,7 @@ struct ConverseStreamState {
 ///   `arguments` fragment (#560)
 /// - `ContentBlockDelta` (reasoningContent text) → `reasoning_content`
 ///   chunk, in the shape the non-streaming Claude path (`/invoke`)
-///   returns it: the signature and redacted ciphertext are dropped
+///   returns it; native signed blocks are appended when complete
 /// - `ContentBlockStop` of a tool-use block that streamed no input → the
 ///   `"{}"` arguments a whole response reports for such a call
 /// - `MessageStop` → finish-reason chunk
@@ -3021,6 +3272,7 @@ fn emit_converse_chunk(
             if !state.emitted_role {
                 state.emitted_role = true;
                 out.push(ChatChunk {
+                    native_envelope: None,
                     choice_index: 0,
                     logprobs: None,
                     id: String::new(),
@@ -3044,6 +3296,14 @@ fn emit_converse_chunk(
             if let Some(ContentBlockStart::ToolUse(tu)) = s.start {
                 let oai_index = state.tool_blocks.len() as i32;
                 state.tool_blocks.push((block_index, false));
+                state.native_blocks.insert(
+                    block_index,
+                    NativeConverseBlock::Tool {
+                        id: tu.tool_use_id().to_string(),
+                        name: tu.name().to_string(),
+                        input: String::new(),
+                    },
+                );
                 out.push(tool_call_chunk(
                     upstream_id,
                     oai_index,
@@ -3057,7 +3317,15 @@ fn emit_converse_chunk(
             let block_index = d.content_block_index;
             match d.delta {
                 Some(ContentBlockDelta::Text(text)) => {
+                    if let NativeConverseBlock::Text(full) = state
+                        .native_blocks
+                        .entry(block_index)
+                        .or_insert_with(|| NativeConverseBlock::Text(String::new()))
+                    {
+                        full.push_str(&text);
+                    }
                     out.push(ChatChunk {
+                        native_envelope: None,
                         choice_index: 0,
                         logprobs: None,
                         id: String::new(),
@@ -3075,6 +3343,11 @@ fn emit_converse_chunk(
                 // #560: a tool-use `arguments` fragment. Correlate to the
                 // call opened by ContentBlockStart via the block index.
                 Some(ContentBlockDelta::ToolUse(tu)) => {
+                    if let Some(NativeConverseBlock::Tool { input, .. }) =
+                        state.native_blocks.get_mut(&block_index)
+                    {
+                        input.push_str(tu.input());
+                    }
                     if let Some(pos) = state.tool_blocks.iter().position(|b| b.0 == block_index) {
                         state.tool_blocks[pos].1 |= !tu.input().is_empty();
                         out.push(tool_call_chunk(
@@ -3089,11 +3362,22 @@ fn emit_converse_chunk(
                 Some(ContentBlockDelta::ReasoningContent(ReasoningContentBlockDelta::Text(
                     text,
                 ))) if !text.is_empty() => {
+                    if let NativeConverseBlock::Thinking { text: full, .. } = state
+                        .native_blocks
+                        .entry(block_index)
+                        .or_insert_with(|| NativeConverseBlock::Thinking {
+                            text: String::new(),
+                            signature: None,
+                        })
+                    {
+                        full.push_str(&text);
+                    }
                     let new_block = state
                         .reasoning_block
                         .is_some_and(|last| last != block_index);
                     state.reasoning_block = Some(block_index);
                     out.push(ChatChunk {
+                        native_envelope: None,
                         choice_index: 0,
                         logprobs: None,
                         id: String::new(),
@@ -3112,6 +3396,33 @@ fn emit_converse_chunk(
                         accounting_usage: None,
                     });
                 }
+                Some(ContentBlockDelta::ReasoningContent(
+                    ReasoningContentBlockDelta::Signature(fragment),
+                )) => {
+                    if let NativeConverseBlock::Thinking { signature, .. } = state
+                        .native_blocks
+                        .entry(block_index)
+                        .or_insert_with(|| NativeConverseBlock::Thinking {
+                            text: String::new(),
+                            signature: None,
+                        })
+                    {
+                        signature
+                            .get_or_insert_with(String::new)
+                            .push_str(&fragment);
+                    }
+                }
+                Some(ContentBlockDelta::ReasoningContent(
+                    ReasoningContentBlockDelta::RedactedContent(fragment),
+                )) => {
+                    if let NativeConverseBlock::Redacted(bytes) = state
+                        .native_blocks
+                        .entry(block_index)
+                        .or_insert_with(|| NativeConverseBlock::Redacted(Vec::new()))
+                    {
+                        bytes.extend_from_slice(fragment.as_ref());
+                    }
+                }
                 _ => {}
             }
         }
@@ -3122,6 +3433,30 @@ fn emit_converse_chunk(
                 .position(|b| *b == (stop.content_block_index, false))
             {
                 out.push(tool_call_chunk(upstream_id, pos as i32, None, None, "{}"));
+            }
+            if let Some(block) = state
+                .native_blocks
+                .remove(&stop.content_block_index)
+                .and_then(NativeConverseBlock::into_native)
+            {
+                out.push(ChatChunk {
+                    native_envelope: None,
+                    choice_index: 0,
+                    logprobs: None,
+                    id: String::new(),
+                    model: upstream_id.to_string(),
+                    delta: ChatDelta {
+                        extra: serde_json::Map::from_iter([(
+                            "content_blocks".into(),
+                            serde_json::json!([block]),
+                        )]),
+                        ..Default::default()
+                    },
+                    finish_reason: None,
+                    usage: None,
+                    service_tier: None,
+                    accounting_usage: None,
+                });
             }
         }
         ConverseStreamOutput::MessageStop(m) => {
@@ -3138,6 +3473,7 @@ fn emit_converse_chunk(
                 })
                 .unwrap_or_default();
             out.push(ChatChunk {
+                native_envelope: None,
                 choice_index: 0,
                 logprobs: None,
                 id: String::new(),
@@ -3158,6 +3494,7 @@ fn emit_converse_chunk(
             let service_tier = converse_service_tier(m.service_tier());
             if let Some(u) = m.usage {
                 out.push(ChatChunk {
+                    native_envelope: None,
                     choice_index: 0,
                     logprobs: None,
                     id: String::new(),
@@ -3172,6 +3509,11 @@ fn emit_converse_chunk(
                         // Same as the non-streaming path — the metadata event
                         // carries the identical `TokenUsage`, and a cache-heavy
                         // streamed request is exactly as billable.
+                        openai_details: aisix_gateway::OpenAiUsageDetails {
+                            cached_tokens_reported: u.cache_read_input_tokens.is_some(),
+                            cache_creation_tokens_reported: u.cache_write_input_tokens.is_some(),
+                            ..Default::default()
+                        },
                         cache_read_tokens: u.cache_read_input_tokens.unwrap_or(0).max(0) as u32,
                         cache_creation_tokens: u.cache_write_input_tokens.unwrap_or(0).max(0)
                             as u32,
@@ -3228,6 +3570,7 @@ fn tool_call_chunk(
     }
     call.insert("function".to_string(), serde_json::Value::Object(function));
     ChatChunk {
+        native_envelope: None,
         choice_index: 0,
         logprobs: None,
         id: String::new(),
@@ -3622,7 +3965,23 @@ fn build_tool_config(
         Some(_) => return Err(BridgeError::InvalidRequest("tools must be an array".into())),
     };
     let mut tools: Vec<Tool> = Vec::new();
+    let allowed = req
+        .extra
+        .get("tool_choice")
+        .filter(|choice| {
+            choice.get("type").and_then(serde_json::Value::as_str) == Some("allowed_tools")
+        })
+        .and_then(|choice| choice.pointer("/allowed_tools/tools"))
+        .and_then(serde_json::Value::as_array);
     for (i, entry) in tools_json.iter().enumerate() {
+        if allowed.is_some_and(|allowed| {
+            !allowed.iter().any(|tool| {
+                tool.get("type").and_then(serde_json::Value::as_str) != Some("custom")
+                    && tool.pointer("/function/name") == entry.pointer("/function/name")
+            })
+        }) {
+            continue;
+        }
         // A `custom` tool takes free-form text, which Converse has no tool
         // shape for.
         if entry
@@ -3749,7 +4108,16 @@ fn map_tool_choice(choice: Option<&serde_json::Value>) -> Result<Option<ToolChoi
                     .ok()
                     .map(ToolChoice::Tool))
             }
-            Some("allowed_tools" | "custom") => Ok(None),
+            Some("allowed_tools") => match map
+                .get("allowed_tools")
+                .and_then(|allowed| allowed.get("mode"))
+                .and_then(serde_json::Value::as_str)
+            {
+                Some("required") => Ok(Some(ToolChoice::Any(AnyToolChoice::builder().build()))),
+                Some("auto") => Ok(None),
+                _ => Err(invalid()),
+            },
+            Some("custom") => Ok(None),
             _ => Err(invalid()),
         },
         Some(_) => Err(invalid()),
@@ -7138,10 +7506,16 @@ mod tests {
                 [ConversationRole::User, ConversationRole::Assistant],
                 "{parts}"
             );
-            assert!(matches!(
-                messages[1].content(),
-                [ContentBlock::Text(t)] if t == "a"
-            ));
+            if parts[0].get("signature").is_some() {
+                // AWS 要求已签名的推理文本与签名保持原样回放。
+                // https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ReasoningTextBlock.html
+                assert!(matches!(messages[1].content(), [
+                    ContentBlock::ReasoningContent(ReasoningContentBlock::ReasoningText(text)),
+                    ContentBlock::Text(answer)
+                ] if text.text() == "t" && text.signature() == Some("s") && answer == "a"));
+            } else {
+                assert!(matches!(messages[1].content(), [ContentBlock::Text(t)] if t == "a"));
+            }
         }
     }
 
@@ -8872,6 +9246,566 @@ mod tests {
                 reads,
                 "{id} {extra}"
             );
+        }
+    }
+
+    mod compat_bedrock {
+        use super::*;
+
+        #[test]
+        fn compat_bedrock_file_uri_support_follows_actual_dispatch() {
+            let bridge = BedrockBridge::new();
+            let plain = serde_json::json!({});
+            let tools =
+                serde_json::json!({"tools":[{"type":"function","function":{"name":"lookup"}}]});
+            let no_reasoning = serde_json::json!({"tools":[{"type":"function","function":{"name":"lookup"}}],"reasoning_effort":"none"});
+            let native = serde_json::json!({"requestMetadata":{"team":"a"}});
+            for (id, extra, expected) in [
+                ("amazon.nova-pro-v1:0", &plain, true),
+                ("anthropic.claude-sonnet-4-20250514-v1:0", &plain, true),
+                ("us.openai.gpt-5.6-sol", &plain, false),
+                ("us.openai.gpt-5.6-sol", &tools, true),
+                ("us.openai.gpt-5.6-sol", &no_reasoning, false),
+                ("us.xai.grok-4-1-fast-v1:0", &plain, false),
+                ("us.xai.grok-4-1-fast-v1:0", &native, true),
+                ("openai.gpt-5.6-sol", &plain, true),
+            ] {
+                let mut req = ChatFormat::new("alias", vec![ChatMessage::user("read document")]);
+                req.extra = extra.as_object().unwrap().clone();
+                let ctx = BridgeContext::new(
+                    "compat",
+                    sample_model_with(id),
+                    sample_pk_with_secret(valid_secret_json()),
+                );
+                assert_eq!(bridge.reads_file_uris(&req, &ctx), expected, "{id} {extra}");
+            }
+        }
+
+        use aws_sdk_bedrockruntime::types::{
+            ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
+            ConverseStreamMetadataEvent, ReasoningTextBlock, TokenUsage, ToolUseBlockDelta,
+            ToolUseBlockStart,
+        };
+
+        const CLAUDE: &str = "anthropic.claude-sonnet-4-20250514-v1:0";
+        const NOVA: &str = "amazon.nova-pro-v1:0";
+
+        fn replay_blocks() -> Vec<serde_json::Value> {
+            vec![
+                serde_json::json!({"type":"thinking","thinking":"reasoning ü","signature":"sig+/=原样"}),
+                serde_json::json!({"type":"redacted_thinking","data":"AP+A/w=="}),
+                serde_json::json!({"type":"text","text":"Checking."}),
+                serde_json::json!({"type":"tool_use","id":"call_lookup","name":"safe_lookup","input":{"city":"Paris"}}),
+            ]
+        }
+
+        fn signed_output() -> aws_sdk_bedrockruntime::operation::converse::ConverseOutput {
+            let content = vec![
+                ContentBlock::ReasoningContent(ReasoningContentBlock::ReasoningText(
+                    ReasoningTextBlock::builder()
+                        .text("reasoning ü")
+                        .signature("sig+/=原样")
+                        .build()
+                        .unwrap(),
+                )),
+                ContentBlock::ReasoningContent(ReasoningContentBlock::RedactedContent(Blob::new(
+                    vec![0, 255, 128, 255],
+                ))),
+                ContentBlock::Text("Checking.".into()),
+                ContentBlock::ToolUse(
+                    ToolUseBlock::builder()
+                        .tool_use_id("call_lookup")
+                        .name("safe_lookup")
+                        .input(json_to_document(&serde_json::json!({"city":"Paris"})))
+                        .build()
+                        .unwrap(),
+                ),
+            ];
+            aws_sdk_bedrockruntime::operation::converse::ConverseOutput::builder()
+                .output(aws_sdk_bedrockruntime::types::ConverseOutput::Message(
+                    build_message(ConversationRole::Assistant, content).unwrap(),
+                ))
+                .stop_reason(SdkStopReason::ToolUse)
+                .build()
+                .unwrap()
+        }
+
+        fn input_blocks(message: ChatMessage) -> Vec<ContentBlock> {
+            let req = ChatFormat::new("alias", vec![ChatMessage::user("lookup"), message]);
+            let (_, messages) = build_converse_inputs(
+                &req,
+                Some(BedrockPublisher::Anthropic),
+                CLAUDE,
+                &FetchedMedia::default(),
+                None,
+                false,
+            )
+            .unwrap();
+            assert_eq!(messages.len(), 2, "signed assistant history must survive");
+            messages[1].content().to_vec()
+        }
+
+        fn assert_signed_blocks(blocks: &[ContentBlock]) {
+            assert_eq!(
+                blocks.len(),
+                4,
+                "native blocks must remain ordered and not duplicate standard mirrors"
+            );
+            assert!(matches!(&blocks[0], ContentBlock::ReasoningContent(
+                ReasoningContentBlock::ReasoningText(text)) if text.text() == "reasoning ü"
+                && text.signature() == Some("sig+/=原样")));
+            assert!(matches!(&blocks[1], ContentBlock::ReasoningContent(
+                ReasoningContentBlock::RedactedContent(bytes)) if bytes.as_ref() == [0,255,128,255]));
+            assert!(matches!(&blocks[2], ContentBlock::Text(text) if text == "Checking."));
+            assert!(
+                matches!(&blocks[3], ContentBlock::ToolUse(call) if call.tool_use_id() == "call_lookup"
+                && call.name() == "safe_lookup" && document_to_json(call.input()) == serde_json::json!({"city":"Paris"}))
+            );
+        }
+
+        #[test]
+        fn compat_bedrock_buffered_native_blocks_preserve_order_and_opaque_bytes() {
+            let response = converse_output_into_chat_response(signed_output(), CLAUDE);
+            assert_eq!(response.message.content_blocks, Some(replay_blocks()));
+            assert_eq!(response.message.content_str(), "Checking.");
+            assert_eq!(response.message.extra["reasoning_content"], "reasoning ü");
+            assert_eq!(response.message.extra["tool_calls"][0]["id"], "call_lookup");
+        }
+
+        #[test]
+        fn compat_bedrock_request_replays_native_blocks_without_standard_duplicates() {
+            let mut message = ChatMessage::assistant("Checking.");
+            message.content_blocks = Some(replay_blocks());
+            message.extra.insert("tool_calls".into(), serde_json::json!([{
+                "id":"call_lookup","type":"function","function":{"name":"safe_lookup","arguments":"{\"city\":\"Paris\"}"}
+            }]));
+            assert_signed_blocks(&input_blocks(message));
+        }
+
+        #[test]
+        fn compat_bedrock_signed_reasoning_only_extension_is_not_skipped() {
+            let mut message = ChatMessage::assistant("");
+            message.content_blocks = Some(vec![replay_blocks()[0].clone()]);
+            let blocks = input_blocks(message);
+            assert_eq!(blocks.len(), 1);
+            assert!(matches!(&blocks[0], ContentBlock::ReasoningContent(
+                ReasoningContentBlock::ReasoningText(text)) if text.signature() == Some("sig+/=原样")));
+        }
+
+        fn delta(index: i32, value: ContentBlockDelta) -> ConverseStreamOutput {
+            ConverseStreamOutput::ContentBlockDelta(
+                ContentBlockDeltaEvent::builder()
+                    .content_block_index(index)
+                    .delta(value)
+                    .build()
+                    .unwrap(),
+            )
+        }
+
+        fn stop(index: i32) -> ConverseStreamOutput {
+            ConverseStreamOutput::ContentBlockStop(
+                ContentBlockStopEvent::builder()
+                    .content_block_index(index)
+                    .build()
+                    .unwrap(),
+            )
+        }
+
+        #[test]
+        fn compat_bedrock_stream_appends_completed_native_blocks_once() {
+            let mut state = ConverseStreamState::default();
+            let events = vec![
+                delta(
+                    0,
+                    ContentBlockDelta::ReasoningContent(ReasoningContentBlockDelta::Text(
+                        "reason".into(),
+                    )),
+                ),
+                delta(
+                    0,
+                    ContentBlockDelta::ReasoningContent(ReasoningContentBlockDelta::Text(
+                        "ing ü".into(),
+                    )),
+                ),
+                delta(
+                    0,
+                    ContentBlockDelta::ReasoningContent(ReasoningContentBlockDelta::Signature(
+                        "sig+/=".into(),
+                    )),
+                ),
+                delta(
+                    0,
+                    ContentBlockDelta::ReasoningContent(ReasoningContentBlockDelta::Signature(
+                        "原样".into(),
+                    )),
+                ),
+                stop(0),
+                delta(
+                    1,
+                    ContentBlockDelta::ReasoningContent(
+                        ReasoningContentBlockDelta::RedactedContent(Blob::new(vec![0, 255])),
+                    ),
+                ),
+                delta(
+                    1,
+                    ContentBlockDelta::ReasoningContent(
+                        ReasoningContentBlockDelta::RedactedContent(Blob::new(vec![128, 255])),
+                    ),
+                ),
+                stop(1),
+                delta(2, ContentBlockDelta::Text("Checking.".into())),
+                stop(2),
+                ConverseStreamOutput::ContentBlockStart(
+                    ContentBlockStartEvent::builder()
+                        .content_block_index(3)
+                        .start(ContentBlockStart::ToolUse(
+                            ToolUseBlockStart::builder()
+                                .tool_use_id("call_lookup")
+                                .name("safe_lookup")
+                                .build()
+                                .unwrap(),
+                        ))
+                        .build()
+                        .unwrap(),
+                ),
+                delta(
+                    3,
+                    ContentBlockDelta::ToolUse(
+                        ToolUseBlockDelta::builder()
+                            .input("{\"city\":")
+                            .build()
+                            .unwrap(),
+                    ),
+                ),
+                delta(
+                    3,
+                    ContentBlockDelta::ToolUse(
+                        ToolUseBlockDelta::builder()
+                            .input("\"Paris\"}")
+                            .build()
+                            .unwrap(),
+                    ),
+                ),
+                stop(3),
+                stop(3),
+            ];
+            let chunks: Vec<_> = events
+                .into_iter()
+                .flat_map(|event| emit_converse_chunk(event, CLAUDE, &mut state))
+                .collect();
+            let blocks: Vec<_> = chunks
+                .iter()
+                .flat_map(|chunk| {
+                    chunk
+                        .delta
+                        .extra
+                        .get("content_blocks")
+                        .and_then(serde_json::Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .cloned()
+                })
+                .collect();
+            assert_eq!(blocks, replay_blocks());
+            let text: String = chunks
+                .iter()
+                .filter_map(|chunk| chunk.delta.content.as_deref())
+                .collect();
+            let reasoning: String = chunks
+                .iter()
+                .filter_map(|chunk| chunk.delta.reasoning_content.as_deref())
+                .collect();
+            assert_eq!(text, "Checking.");
+            assert_eq!(reasoning, "reasoning ü");
+            let mut message = ChatMessage::assistant(text);
+            message.content_blocks = Some(blocks);
+            assert_signed_blocks(&input_blocks(message));
+        }
+
+        fn allowed_request(mode: &str, names: &[&str]) -> ChatFormat {
+            serde_json::from_value(serde_json::json!({"model":"alias","messages":[{"role":"user","content":"lookup"}],
+                "tools":[
+                    {"type":"function","function":{"name":"safe_lookup","parameters":{"type":"object"}}},
+                    {"type":"function","function":{"name":"delete_record","parameters":{"type":"object"}}}
+                ],
+                "tool_choice":{"type":"allowed_tools","allowed_tools":{"mode":mode,
+                    "tools":names.iter().map(|name| serde_json::json!({"type":"function","function":{"name":name}})).collect::<Vec<_>>()}}
+            })).unwrap()
+        }
+
+        fn tool_names(config: &ToolConfiguration) -> Vec<&str> {
+            config
+                .tools()
+                .iter()
+                .filter_map(|tool| match tool {
+                    Tool::ToolSpec(spec) => Some(spec.name()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        #[test]
+        fn compat_bedrock_allowed_tools_auto_filters_actual_callable_set() {
+            let config = build_tool_config(
+                &allowed_request("auto", &["safe_lookup"]),
+                None,
+                Some(BedrockPublisher::AmazonNova),
+                NOVA,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(tool_names(&config), ["safe_lookup"]);
+            assert!(!matches!(config.tool_choice(), Some(ToolChoice::Any(_))));
+        }
+
+        #[test]
+        fn compat_bedrock_allowed_tools_required_filters_and_requires() {
+            let config = build_tool_config(
+                &allowed_request("required", &["safe_lookup"]),
+                None,
+                Some(BedrockPublisher::AmazonNova),
+                NOVA,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(tool_names(&config), ["safe_lookup"]);
+            assert!(matches!(config.tool_choice(), Some(ToolChoice::Any(_))));
+        }
+
+        #[test]
+        fn compat_bedrock_allowed_tools_empty_subset_never_widens() {
+            let config = build_tool_config(
+                &allowed_request("auto", &[]),
+                None,
+                Some(BedrockPublisher::AmazonNova),
+                NOVA,
+            )
+            .unwrap();
+            assert!(
+                config.is_none(),
+                "an empty allowed set cannot expose any declared tool"
+            );
+        }
+
+        fn custom_history(with_function: bool) -> ChatFormat {
+            let mut calls = vec![serde_json::json!({"id":"custom_1","type":"custom",
+                "custom":{"name":"calculator","input":"2+2"}})];
+            if with_function {
+                calls.push(serde_json::json!({"id":"function_1","type":"function",
+                    "function":{"name":"safe_lookup","arguments":"{}"}}));
+            }
+            let mut messages = vec![
+                serde_json::json!({"role":"user","content":"calculate"}),
+                serde_json::json!({"role":"assistant","content":if with_function {Some("Checking.")} else {None},"tool_calls":calls}),
+                serde_json::json!({"role":"tool","tool_call_id":"custom_1","content":"4"}),
+            ];
+            if with_function {
+                messages.push(serde_json::json!({"role":"tool","tool_call_id":"function_1","content":"found"}));
+            }
+            messages.push(serde_json::json!({"role":"user","content":"answer now"}));
+            serde_json::from_value(serde_json::json!({"model":"alias","messages":messages,
+                "tools":[{"type":"function","function":{"name":"safe_lookup","parameters":{"type":"object"}}}]
+            })).unwrap()
+        }
+
+        fn converse_parts(req: &ChatFormat) -> Result<ConverseParts, BridgeError> {
+            let config = build_tool_config(req, None, Some(BedrockPublisher::AmazonNova), NOVA)?;
+            let ctx = BridgeContext::new(
+                "compat",
+                sample_model_with(NOVA),
+                sample_pk_with_secret(valid_secret_json()),
+            );
+            ConverseParts::build(
+                req,
+                NOVA,
+                &FetchedMedia::default(),
+                config.as_ref(),
+                false,
+                &ctx,
+            )
+        }
+
+        #[test]
+        fn compat_bedrock_custom_history_drops_only_unsupported_call_and_result() {
+            let parts = converse_parts(&custom_history(true))
+                .expect("valid custom history is not a malformed function");
+            let blocks: Vec<_> = parts
+                .messages
+                .iter()
+                .flat_map(|message| message.content())
+                .collect();
+            let calls: Vec<_> = blocks
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::ToolUse(call) => Some(call.tool_use_id()),
+                    _ => None,
+                })
+                .collect();
+            let results: Vec<_> = blocks
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::ToolResult(result) => Some(result.tool_use_id()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(calls, ["function_1"]);
+            assert_eq!(results, ["function_1"]);
+            assert!(blocks
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Text(text) if text == "Checking.")));
+        }
+
+        #[test]
+        fn compat_bedrock_custom_only_history_has_no_phantom_assistant_or_result() {
+            let parts = converse_parts(&custom_history(false))
+                .expect("legal unsupported custom history is dropped");
+            assert_eq!(parts.messages.len(), 1);
+            assert_eq!(parts.messages[0].role(), &ConversationRole::User);
+            assert_eq!(
+                parts.messages[0].content(),
+                &[
+                    ContentBlock::Text("calculate".into()),
+                    ContentBlock::Text("answer now".into())
+                ]
+            );
+        }
+
+        #[test]
+        fn compat_bedrock_malformed_function_history_still_names_missing_field() {
+            let mut req = custom_history(true);
+            req.messages[1].extra["tool_calls"] =
+                serde_json::json!([{"id":"bad","type":"function","function":{"arguments":"{}"}}]);
+            let error = converse_parts(&req)
+                .err()
+                .expect("malformed function remains invalid");
+            assert!(
+                matches!(error, BridgeError::InvalidRequest(message) if message.contains("function.name"))
+            );
+        }
+
+        #[test]
+        fn compat_bedrock_tool_result_error_status_follows_supported_target_slot() {
+            for (model, expected) in [
+                (NOVA, true),
+                (CLAUDE, true),
+                ("meta.llama3-3-70b-instruct-v1:0", false),
+            ] {
+                for is_error in [None, Some(false), Some(true)] {
+                    let mut result = serde_json::json!({"role":"tool","tool_call_id":"call_1","content":"database unavailable"});
+                    if let Some(flag) = is_error {
+                        result["is_error"] = flag.into();
+                    }
+                    let req: ChatFormat = serde_json::from_value(serde_json::json!({"model":"alias","messages":[
+                        {"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"safe_lookup","arguments":"{}"}}]}, result
+                    ]})).unwrap();
+                    let (_, messages) = build_converse_inputs(
+                        &req,
+                        BedrockPublisher::from_model_id(model),
+                        model,
+                        &FetchedMedia::default(),
+                        None,
+                        false,
+                    )
+                    .unwrap();
+                    let ContentBlock::ToolResult(result) = &messages[1].content()[0] else {
+                        panic!("tool result missing")
+                    };
+                    let status = result.status().map(|status| status.as_str());
+                    assert_eq!(
+                        status,
+                        if expected {
+                            is_error.map(|flag| if flag { "error" } else { "success" })
+                        } else {
+                            None
+                        },
+                        "{model} {is_error:?}"
+                    );
+                }
+            }
+        }
+
+        fn usage(read: Option<i32>, write: Option<i32>) -> TokenUsage {
+            TokenUsage::builder()
+                .input_tokens(3)
+                .output_tokens(1)
+                .total_tokens(4)
+                .set_cache_read_input_tokens(read)
+                .set_cache_write_input_tokens(write)
+                .build()
+                .unwrap()
+        }
+
+        fn buffered_usage(read: Option<i32>, write: Option<i32>) -> UsageStats {
+            converse_output_into_chat_response(
+                aws_sdk_bedrockruntime::operation::converse::ConverseOutput::builder()
+                    .stop_reason(SdkStopReason::EndTurn)
+                    .usage(usage(read, write))
+                    .build()
+                    .unwrap(),
+                NOVA,
+            )
+            .usage
+        }
+
+        fn streamed_usage(read: Option<i32>, write: Option<i32>) -> UsageStats {
+            emit_converse_chunk(
+                ConverseStreamOutput::Metadata(
+                    ConverseStreamMetadataEvent::builder()
+                        .usage(usage(read, write))
+                        .build(),
+                ),
+                NOVA,
+                &mut ConverseStreamState::default(),
+            )
+            .into_iter()
+            .find_map(|chunk| chunk.usage)
+            .unwrap()
+        }
+
+        #[test]
+        fn compat_bedrock_buffered_cache_read_zero_keeps_presence() {
+            assert!(
+                buffered_usage(Some(0), None)
+                    .openai_details
+                    .cached_tokens_reported
+            );
+            assert!(
+                !buffered_usage(None, None)
+                    .openai_details
+                    .cached_tokens_reported
+            );
+        }
+
+        #[test]
+        fn compat_bedrock_buffered_cache_write_zero_differs_from_absent() {
+            let reported = buffered_usage(None, Some(0));
+            let absent = buffered_usage(None, None);
+            assert_ne!(reported.openai_details, absent.openai_details);
+            assert_eq!(reported.cache_creation_tokens, absent.cache_creation_tokens);
+            assert_eq!(reported.upstream_total_tokens, absent.upstream_total_tokens);
+        }
+
+        #[test]
+        fn compat_bedrock_stream_cache_read_zero_keeps_presence() {
+            assert!(
+                streamed_usage(Some(0), None)
+                    .openai_details
+                    .cached_tokens_reported
+            );
+            assert!(
+                !streamed_usage(None, None)
+                    .openai_details
+                    .cached_tokens_reported
+            );
+        }
+
+        #[test]
+        fn compat_bedrock_stream_cache_write_zero_differs_from_absent() {
+            let reported = streamed_usage(None, Some(0));
+            let absent = streamed_usage(None, None);
+            assert_ne!(reported.openai_details, absent.openai_details);
+            assert_eq!(reported.cache_creation_tokens, absent.cache_creation_tokens);
+            assert_eq!(reported.upstream_total_tokens, absent.upstream_total_tokens);
         }
     }
 }

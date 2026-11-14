@@ -1,3 +1,4 @@
+import "./OperationalFields.css";
 import { useId, useState } from "react";
 import { Button } from "../ui/Button";
 
@@ -34,7 +35,7 @@ export function TagInput({
 
   return (
     <div
-      className="f text-body"
+      className="f operational-field operational-tags text-body"
       role="group"
       aria-label={label}
       aria-invalid={problem ? true : undefined}
@@ -46,7 +47,7 @@ export function TagInput({
       ) : (
         <ul className="tags">
           {value.map((name) => (
-            <li key={name} className="h-auto min-h-11 max-w-full gap-1 rounded-full border border-line bg-well py-0 pr-0 pl-3 font-mono text-meta text-ink-soft [overflow-wrap:anywhere]">
+            <li key={name} className="h-auto min-h-11 max-w-full gap-1 rounded-cell border border-line bg-well py-0 pr-0 pl-3 text-caption text-ink-soft [overflow-wrap:anywhere]">
               {name}
               {!readOnly && (
                 <button

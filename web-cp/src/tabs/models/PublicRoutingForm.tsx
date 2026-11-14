@@ -368,7 +368,7 @@ export function PublicRoutingForm({
   const groupBadges = (groups: string[] | undefined) => <GroupBadges groups={groups ?? []} empty="—（账号未设分组）" />;
 
   return (
-    <form ref={form} className="panel mb-0" aria-label={title} onSubmit={submit}>
+    <form ref={form} className="panel ops-routing-form mb-0" aria-label={title} onSubmit={submit}>
       <CardHeader
         number={3}
         title={title}
@@ -457,14 +457,14 @@ export function PublicRoutingForm({
         </label>
       </div>
 
-      <div className="@container mt-6 border-t border-line pt-5">
+      <div className="ops-form-section @container">
         <h4 className="mb-3 text-body font-semibold">路由目标（{targets.length}）</h4>
         {targets.length === 0 && additions.length === 0 ? (
           <p className="hint rounded-cell border border-dashed border-line px-4 py-6 text-center text-caption">
             还没有账号服务这个模型：请求会以「上游不可用」失败。{!readOnly && "用下面的「添加目标」加一个账号。"}
           </p>
         ) : (
-          <div className="overflow-hidden rounded-cell border border-line">
+          <div className="ops-target-list overflow-hidden rounded-cell border border-line">
             <div aria-hidden="true" className={cn(TARGET_ROW, "hidden border-b border-line bg-well px-3 py-2 text-caption font-medium text-ink-soft @3xl:grid")}>
               <span>账号</span>
               <span>上游模型名称</span>
@@ -692,7 +692,7 @@ function TargetRow({
     .filter((m): m is string => typeof m === "string" && m !== "")
     .join("；");
   return (
-    <li className={cn(TARGET_ROW, "border-line p-3 not-last:border-b")} aria-label={label}>
+    <li className={cn(TARGET_ROW, "ops-target-row border-line p-3 not-last:border-b")} aria-label={label}>
       <div className="col-span-2 min-w-0 @md:col-start-1 @md:row-start-1 @3xl:col-span-1">
         {heading}
         {written && <span className="tag mt-1.5 border-line bg-well text-ink">已保存</span>}

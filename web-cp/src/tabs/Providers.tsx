@@ -1,4 +1,5 @@
-import { Plus, RefreshCw } from "lucide-react";
+import "./operations.css";
+import { Eye, Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import type { TabProps } from "../App";
 import { ConflictNote } from "../components/ConflictNote";
@@ -14,7 +15,7 @@ import { useResource } from "../lib/useResource";
 import { Card, CardHeader, PageHeader } from "../components/page";
 import { cn } from "../lib/cn";
 import { Button } from "../ui/Button";
-import { DataTable, Loading } from "../ui/DataTable";
+import { OperationalTable as DataTable, Loading } from "../components/OperationalTable";
 import { useRecordTable } from "../lib/recordTable";
 import { RecordTableToolbar, RecordTablePager } from "../ui/RecordTable";
 import { EmptyState } from "../ui/EmptyState";
@@ -55,7 +56,7 @@ const GROUPS_HINT = "分组名只有运维可见；普通租户只能用到其�
 
 /** A form card's closing bar: its buttons at the bottom right, on a muted strip the card's width. */
 const FORM_FOOTER =
-  "-mx-[var(--pad)] -mb-[var(--pad)] mt-6 flex max-w-none flex-wrap items-center justify-end gap-2 rounded-b-card border-t border-line bg-well px-[var(--pad)] py-3 [&_.hint]:text-ink-soft";
+  "ops-form-footer -mx-[var(--pad)] -mb-[var(--pad)] mt-6 flex max-w-none flex-wrap items-center justify-end gap-2 rounded-b-card border-t border-line bg-well px-[var(--pad)] py-3 [&_.hint]:text-ink-soft";
 
 /** How a referrer's kind is named on this page. */
 const KIND_LABEL: Record<string, string> = { models: "模型" };
@@ -178,17 +179,14 @@ export function Providers({ canEdit }: TabProps) {
   const ungrouped = pk.items?.filter((a) => (a.doc.groups?.length ?? 0) === 0).length ?? 0;
 
   return (
-    <>
+    <div className="cp-operations cp-providers">
       <PageHeader
         eyebrow="PROVIDERS · 上游连接"
         title="上游账号"
         dataLead={pk.items ? <>已配置 {pk.items.length} 个上游账号，覆盖 {assignedGroups.size} 个分组。账号的协议、模型映射和密钥在此维护。</> : "维护上游连接、协议族、分组与模型映射。"}
         actions={
           <>
-            <Button type="button" onClick={() => void pk.reload()}>
-              <RefreshCw aria-hidden />
-              刷新
-            </Button>
+            <Button type="button" className="ops-icon-button" aria-label="刷新" title="刷新上游账号" onClick={() => void pk.reload()}><RefreshCw aria-hidden /></Button>
             {canEdit && !open && (
               <Button kind="primary" disabled={opening} onClick={() => void openNew()}>
                 <Plus aria-hidden />
@@ -314,8 +312,7 @@ export function Providers({ canEdit }: TabProps) {
               <thead>
                 <tr>
                   <th>名称</th>
-                  <th>协议族</th>
-                  <th>供应商标识</th>
+                  <th>协议 / 供应商</th>
                   <th>接口地址</th>
                   <th>分组</th>
                   <th>状态</th>
@@ -330,8 +327,7 @@ export function Providers({ canEdit }: TabProps) {
                         {nameOf(a)}
                       </span>
                     </td>
-                    <td className="font-mono text-caption text-ink-soft">{a.doc.adapter ?? "—"}</td>
-                    <td className="font-mono text-caption text-ink-soft">{a.doc.provider || "—"}</td>
+                    <td><span className="ops-cell-main">{a.doc.adapter ?? "—"}</span><span className="ops-cell-secondary">{a.doc.provider || "—"}</span></td>
                     <td>
                       {a.doc.api_base ? (
                         <code className="block max-w-[18rem] truncate text-caption text-ink-soft" title={maskUrl(a.doc.api_base)}>
@@ -361,6 +357,9 @@ export function Providers({ canEdit }: TabProps) {
                         <>
                           <Button
                             size="sm"
+                            className="ops-table-action"
+                            aria-label={canEdit ? "编辑" : "查看"}
+                            title={canEdit ? "编辑账号" : "查看账号"}
                             onClick={() => {
                               setNote(null);
                               // A group created since the page was opened must be
@@ -369,19 +368,22 @@ export function Providers({ canEdit }: TabProps) {
                               setOpen({ mode: "edit", id: a.id });
                             }}
                           >
-                            {canEdit ? "编辑" : "查看"}
+                            {canEdit ? <Pencil aria-hidden /> : <Eye aria-hidden />}
                           </Button>
                           {canEdit && (
                             <Button
                               size="sm"
                               kind="quiet"
+                              className="ops-table-action"
+                              aria-label="删除"
+                              title="删除账号"
                               disabled={busy}
                               onClick={() => {
                                 setDeleteFailure(null);
                                 setDeleting(a.id);
                               }}
                             >
-                              删除
+                              <Trash2 aria-hidden />
                             </Button>
                           )}
                         </>
@@ -407,7 +409,7 @@ export function Providers({ canEdit }: TabProps) {
           </div>
         )}
       </div>
-    </>
+    </div>
   );
 }
 

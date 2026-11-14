@@ -155,13 +155,23 @@ use crate::error::ProxyError;
 
 /// Refuse a `/v1/responses` request naming an object stored upstream, or
 /// choosing its own model.
+#[cfg(test)]
 pub(crate) fn refuse_in_responses(
     platform: Option<&crate::platform::PlatformSettings>,
     body: &Value,
 ) -> Result<(), ProxyError> {
+    refuse_in_responses_with_background(platform, body, false)
+}
+
+/// 持久原生后台路径可放行 background，其他选择器和对象引用仍逐项检查。
+pub(crate) fn refuse_in_responses_with_background(
+    platform: Option<&crate::platform::PlatformSettings>,
+    body: &Value,
+    allow_background: bool,
+) -> Result<(), ProxyError> {
     refuse(
         platform,
-        || responses_selector(body),
+        || responses_selector(body, allow_background),
         || responses_reference(body),
     )
 }
@@ -234,14 +244,15 @@ fn model_selector(members: &serde_json::Map<String, Value>) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn responses_selector(body: &Value) -> Option<String> {
+fn responses_selector(body: &Value, allow_background: bool) -> Option<String> {
     body.as_object()
         .and_then(model_selector)
         .or_else(|| find_in(body, "tools", &responses_model_node))
         .or_else(|| find_in(body, "tool_choice", &responses_model_node))
         .or_else(|| find_in(body, "input", &responses_model_node))
         .or_else(|| {
-            (body.get("background") == Some(&Value::Bool(true))).then(|| "background".into())
+            (!allow_background && body.get("background") == Some(&Value::Bool(true)))
+                .then(|| "background".into())
         })
 }
 

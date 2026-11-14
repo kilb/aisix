@@ -31,12 +31,14 @@ const OPENAI_UNTRANSLATED: &[&str] = &[
     "logit_bias",
     "logprobs",
     "metadata",
+    "moderation",
     "modalities",
     "n",
     "parallel_tool_calls",
     "prediction",
     "presence_penalty",
     "prompt_cache_key",
+    "prompt_cache_options",
     "prompt_cache_retention",
     "response_format",
     "safety_identifier",
@@ -809,5 +811,34 @@ mod tests {
             );
         }
         check_max_completion_tokens(&req(serde_json::json!({"max_completion_tokens": 0}))).unwrap();
+    }
+
+    #[test]
+    fn compat_bedrock_unsupported_openai_extras_do_not_become_native_fields() {
+        let r = req(serde_json::json!({
+            "moderation": {"model": "omni-moderation-latest"},
+            "prompt_cache_options": {"mode": "explicit", "ttl": "30m"},
+            "documented_native_knob": {"unchanged": true},
+            "additionalModelRequestFields": {"caller_native_knob": 7}
+        }));
+        for target in [
+            "amazon.nova-pro-v1:0",
+            "anthropic.claude-sonnet-4-20250514-v1:0",
+        ] {
+            let fields = caller_additional_fields(&r, target);
+            assert!(!fields.contains_key("moderation"), "{target}: {fields:?}");
+            assert!(
+                !fields.contains_key("prompt_cache_options"),
+                "{target}: {fields:?}"
+            );
+            assert_eq!(
+                fields.get("documented_native_knob"),
+                Some(&serde_json::json!({"unchanged": true}))
+            );
+            assert_eq!(
+                fields.get("caller_native_knob"),
+                Some(&serde_json::json!(7))
+            );
+        }
     }
 }

@@ -3,67 +3,108 @@
   min-width: 0;
   flex-wrap: wrap;
   align-items: flex-end;
-  gap: 12px;
+  gap: 12px 16px;
   margin: 16px 0;
 }
 .record-table-toolbar > * { min-width: 0; }
-.record-table-search {
-  flex: 1 1 240px;
-  max-width: 420px;
-}
-.record-table-toolbar :is(input, select),
-.record-table-pager select {
-  min-height: 44px;
-  max-width: 100%;
-}
+.record-table-search { flex: 1 1 240px; max-width: 420px; }
+.record-table-toolbar :is(input, select) { min-height: 44px; max-width: 100%; }
 .record-table-pager {
   display: flex;
   min-width: 0;
   flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  margin-top: 16px;
-  padding-top: 16px;
+  gap: 4px 16px;
+  margin-top: 12px;
+  padding-top: 8px;
   border-top: 1px solid var(--border);
-  font-size: 13px;
+  font-size: 12px;
+  line-height: 20px;
 }
 .record-table-count {
   margin: 0;
   color: var(--muted-foreground);
   font-variant-numeric: tabular-nums;
 }
-.record-table-navigation {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-}
+.record-table-navigation,
+.record-table-page-controls { display: flex; align-items: center; }
+.record-table-navigation { min-width: 0; flex-wrap: wrap; gap: 4px 12px; }
+.record-table-page-controls { gap: 0; }
 .record-table-page-size {
   display: flex;
+  min-height: 44px;
   align-items: center;
-  gap: 8px;
+  gap: 4px;
   color: var(--muted-foreground);
 }
 .record-table-page-size select {
-  min-width: 76px;
-  padding: 8px 12px;
-  border: 1px solid var(--input);
-  border-radius: var(--r-chip);
-  background: var(--card);
+  width: auto;
+  min-width: 64px;
+  min-height: 44px;
+  padding: 6px 24px 6px 8px;
+  border: 1px solid transparent;
+  border-radius: var(--r-input);
+  background-color: transparent;
   color: var(--foreground);
+  font-size: 12px;
   font-variant-numeric: tabular-nums;
 }
+.record-table-page-size select:enabled:hover { background-color: var(--well); }
+.record-table-page-position {
+  min-width: 44px;
+  padding-inline: 4px;
+  color: var(--foreground);
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+.record-table-page-position > span { color: var(--muted-foreground); }
+/* 外层保留44px命中区，箭头按钮的可见表面收为32px。 */
+.record-table-page-button.btn {
+  position: relative;
+  width: 44px;
+  min-width: 44px;
+  height: 44px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--foreground);
+}
+.record-table-page-button::before {
+  content: "";
+  position: absolute;
+  inset: 6px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--card);
+  transition: background-color 120ms ease, border-color 120ms ease;
+}
+.record-table-page-button.btn:enabled:hover { background: transparent; }
+.record-table-page-button:enabled:hover::before { border-color: var(--input); background: var(--well); }
+.record-table-page-button:enabled:active::before { background: var(--row-hover); }
+.record-table-page-button > svg { position: relative; width: 16px; height: 16px; }
+.record-table-page-button.btn:disabled { opacity: .35; }
 .record-table-pager :is(button, select):focus-visible,
 .record-table-toolbar :is(input, select):focus-visible,
-.dt-wrap:focus-visible {
-  outline: 2px solid var(--ring);
-  outline-offset: 2px;
-}
+.dt-wrap:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
 .dt-wrap { min-width: 0; max-width: 100%; }
+/* 普通记录按内容分配宽度，补充信息在原单元格内折行，不截掉精确值。 */
+.dt :is(th, td).dt-name { width: 32%; white-space: normal; overflow-wrap: anywhere; }
+.dt :is(th, td).dt-meta { white-space: normal; overflow-wrap: anywhere; }
+.dt :is(th, td).dt-date { width: 10rem; white-space: normal; font-variant-numeric: tabular-nums; }
+.dt :is(th, td).dt-number { text-align: right; font-variant-numeric: tabular-nums; }
+.dt :is(th, td).dt-actions { width: 1%; text-align: right; white-space: normal; }
+.dt-actions > :is(.acts, .row-actions) { display: flex; flex-wrap: wrap; justify-content: flex-end; }
+.dt-cell-primary { display: block; min-width: 0; color: var(--foreground); overflow-wrap: anywhere; }
+.dt-cell-secondary { display: block; margin-top: 4px; color: var(--muted-foreground); font-size: 12px; line-height: 18px; white-space: normal; overflow-wrap: anywhere; }
+/* 表格工作面延伸到容器边缘，必要的横向滚动仍留在局部。 */
+.panel > .dt-wrap { max-width: calc(100% + var(--pad) * 2); }
 @media (max-width: 719px) {
   .record-table-search { max-width: none; }
   .record-table-toolbar > :is(.field, .f, label) { flex: 1 1 100%; width: 100%; }
-  .record-table-navigation { width: 100%; }
-  .record-table-page-size { margin-right: auto; }
+  .record-table-count { flex-basis: 100%; }
+  .record-table-navigation { width: 100%; justify-content: space-between; gap: 4px 8px; }
+  .record-table-page-size { gap: 2px; }
+  .dt :is(th, td).dt-date { width: auto; }
 }
+@media (prefers-reduced-motion: reduce) { .record-table-page-button::before { transition: none; } }

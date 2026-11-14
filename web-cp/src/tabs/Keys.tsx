@@ -1,3 +1,4 @@
+import "./operations.css";
 import { parseBeijingInput } from "../lib/time";
 import { keySearchText } from "../lib/operationalRecords";
 import { useRecordTable } from "../lib/recordTable";
@@ -48,7 +49,7 @@ import { Button } from "../ui/Button";
 import { useRefusalFocus } from "../ui/Field";
 import { CopyButton } from "../ui/CopyButton";
 import { KeySecret } from "../ui/KeySecret";
-import { DataTable, Loading } from "../ui/DataTable";
+import { OperationalTable as DataTable, Loading } from "../components/OperationalTable";
 import { EmptyState } from "../ui/EmptyState";
 import { Lamp } from "../ui/Lamp";
 import { TwoStep } from "../ui/TwoStep";
@@ -75,7 +76,7 @@ export function Keys({ canEdit }: TabProps) {
   const [tick, setTick] = useState(0);
 
   return (
-    <>
+    <div className="cp-operations cp-keys">
       {/* 桌面与平板：范围 12；概况 6 + 6；密钥表单与明细保留独立状态。 */}
       <PageHeader
         title="密钥"
@@ -128,7 +129,7 @@ export function Keys({ canEdit }: TabProps) {
       </BentoGrid>
       {/* 以租户作为实例键：切换时清除旧租户状态，包括一次性密钥明文。 */}
       {tenantId && <TenantKeys key={tenantId} tenantId={tenantId} canEdit={canEdit} tick={tick} />}
-    </>
+    </div>
   );
 }
 
@@ -269,7 +270,7 @@ function TenantKeys({ tenantId, canEdit, tick }: { tenantId: string; canEdit: bo
     );
   }
 
-  const columns = canEdit ? 9 : 8;
+  const columns = canEdit ? 7 : 6;
   const keys = keyList.data;
   const snapshotTime = Date.now();
   const live = keys?.filter((k) => !k.effective_disabled && !(k.expires_at !== null && Date.parse(k.expires_at) <= snapshotTime));
@@ -284,7 +285,7 @@ function TenantKeys({ tenantId, canEdit, tick }: { tenantId: string; canEdit: bo
   return (
     <>
       <BentoGrid className="mb-3" aria-label={`${tenant.name} 的密钥概况`}>
-        <Card className={span.d6}>
+        <Card className={`${span.d6} ops-snapshot`}>
           <CardHeader number={2} title="密钥" description={keyList.error ? "刷新失败，保留最近成功读取的当前租户密钥" : `${tenant.name} 的完整密钥列表`} />
           {keys === null && !keyList.error ? <MetricSkeleton /> : <Metric size="hero">{keys === null ? "—" : fmtInt(keys.length)}</Metric>}
           <CardFooter>
@@ -293,13 +294,13 @@ function TenantKeys({ tenantId, canEdit, tick }: { tenantId: string; canEdit: bo
             )}
           </CardFooter>
         </Card>
-        <Card className={span.d6} tone="inverse">
+        <Card className={`${span.d6} ops-snapshot`}>
           <CardHeader number={3} title="正常" description={keyList.error ? "读取失败；已有值来自最近成功读取" : "已停用与已过期的密钥均不计入"} />
           {keys === null && !keyList.error ? <MetricSkeleton /> : <Metric size="display">{live ? fmtInt(live.length) : "—"}</Metric>}
           <CardFooter>
-            <dl className="grid grid-cols-2 gap-6 border-t border-surface/12 pt-5">
-              <div><dt className="font-mono text-meta text-on-inverse-muted">已停用</dt><dd className="mt-2"><Metric size="value">{disabled ? fmtInt(disabled.length) : "—"}</Metric></dd></div>
-              <div><dt className="font-mono text-meta text-on-inverse-muted">已过期（未停用）</dt><dd className="mt-2"><Metric size="value">{expired ? fmtInt(expired.length) : "—"}</Metric></dd></div>
+            <dl className="grid grid-cols-2 gap-6 border-t border-line pt-5">
+              <div><dt className="text-caption text-muted">已停用</dt><dd className="mt-2"><Metric size="value">{disabled ? fmtInt(disabled.length) : "—"}</Metric></dd></div>
+              <div><dt className="text-caption text-muted">已过期（未停用）</dt><dd className="mt-2"><Metric size="value">{expired ? fmtInt(expired.length) : "—"}</Metric></dd></div>
             </dl>
           </CardFooter>
         </Card>
@@ -388,14 +389,12 @@ function TenantKeys({ tenantId, canEdit, tick }: { tenantId: string; canEdit: bo
               <DataTable label="密钥列表">
                 <thead>
                   <tr>
-                    <th>名称</th>
-                    <th>前缀</th>
+                    <th>名称 / 前缀</th>
                     <th className="side-opt">成员</th>
                     <th>模型</th>
                     <th>分组</th>
                     <th className="side-opt">限额</th>
                     <th>状态</th>
-                    <th className="side-opt">创建者</th>
                     {canEdit && <th className="right">操作</th>}
                   </tr>
                 </thead>
@@ -403,9 +402,9 @@ function TenantKeys({ tenantId, canEdit, tick }: { tenantId: string; canEdit: bo
                   {table.rows.map((k) => (
                     <Fragment key={k.id}>
                       <tr>
-                        <td className="font-medium">{k.label}</td>
-                        <td>
+                        <td><span className="ops-cell-main">{k.label}</span>
                           <KeySecretCell k={k} tenant={tenant} onError={setPlaintextError} />
+                          <span className="ops-cell-secondary">创建者：<Creator k={k} members={members.data} /></span>
                         </td>
                         <td className="side-opt text-text-2">{ownerOf(k, tenant, members.data)}</td>
                         <td>
@@ -420,9 +419,6 @@ function TenantKeys({ tenantId, canEdit, tick }: { tenantId: string; canEdit: bo
                         <td className="side-opt text-text-2">{limitsOf(k)}</td>
                         <td>
                           <Status k={k} tenant={tenant} members={members.data} />
-                        </td>
-                        <td className="side-opt text-text-2">
-                          <Creator k={k} members={members.data} />
                         </td>
                         {canEdit && (
                           <td className="right">

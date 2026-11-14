@@ -53,7 +53,7 @@ export function ShownOnce({
   }
 
   return (
-    <div className="secret" role="region" aria-label={title}>
+    <div className="secret tenant-shown-once" role="region" aria-label={title}>
       <strong>{title}</strong>
       <input readOnly value={value} aria-label={title} onFocus={(e) => e.currentTarget.select()} />
       {children}

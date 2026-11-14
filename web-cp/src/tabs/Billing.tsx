@@ -1,3 +1,4 @@
+import "./FinanceWorkspace.css";
 import type { TabProps } from "../App";
 import { SectionHost, type Section } from "../components/SectionHost";
 import { Accounts } from "./billing/Accounts";
@@ -14,5 +15,5 @@ export const SECTIONS: Section[] = [
 ];
 
 export function Billing(props: TabProps) {
-  return <SectionHost label="计费" sections={SECTIONS} {...props} />;
+  return <div className="finance-workspace billing-workspace"><SectionHost label="计费" sections={SECTIONS} {...props} /></div>;
 }

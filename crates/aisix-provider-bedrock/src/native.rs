@@ -8,7 +8,9 @@
 use std::sync::OnceLock;
 use std::time::Instant;
 
+use crate::upstream_io::UpstreamIoInterceptor;
 use aisix_gateway::media_fetch::{fetch_urls, Encoding};
+use aisix_gateway::upstream_io::Protocol;
 use aisix_gateway::{BridgeContext, BridgeError, NativeMessages};
 use aisix_provider_anthropic::platform::{self, Platform};
 use aws_sdk_bedrockruntime::error::SdkError;
@@ -67,6 +69,8 @@ impl BedrockBridge {
                 .content_type("application/json")
                 .accept("application/json")
                 .body(Blob::new(bytes))
+                .customize()
+                .interceptor(UpstreamIoInterceptor::new(Protocol::Messages))
                 .send()
                 .await
                 .map_err(|e| crate::errors::sdk_error(e, started, deadline))?;
@@ -75,12 +79,15 @@ impl BedrockBridge {
             return Ok(NativeMessages::Json(json));
         }
 
+        let io = UpstreamIoInterceptor::new(Protocol::Messages);
         let mut resp = client
             .invoke_model_with_response_stream()
             .model_id(upstream_id)
             .content_type("application/json")
             .accept("application/json")
             .body(Blob::new(bytes))
+            .customize()
+            .interceptor(io.clone())
             .send()
             .await
             .map_err(|e| crate::errors::sdk_error(e, started, deadline))?;
@@ -98,7 +105,7 @@ impl BedrockBridge {
             None => resp.body.recv().await,
         };
         let first = match first {
-            Ok(Some(event)) => event_bytes(event),
+            Ok(Some(event)) => event_bytes(event, &io),
             Ok(None) => return Err(BridgeError::StreamAborted),
             Err(e) => return Err(stream_error(&e).into_bridge_error()),
         };
@@ -109,7 +116,7 @@ impl BedrockBridge {
             loop {
                 match resp.body.recv().await {
                     Ok(Some(event)) => {
-                        if let Some(frame) = event_bytes(event) {
+                        if let Some(frame) = event_bytes(event, &io) {
                             yield Ok(frame);
                         }
                     }
@@ -136,7 +143,11 @@ impl BedrockBridge {
         // ARN path.
         let tail = upstream_id.rsplit('/').next().unwrap_or(upstream_id);
         let model_id = strip_region_prefix(tail);
-        let invoke = platform::bedrock_count_tokens_invoke_body(&body, upstream_id);
+        let mut betas = platform::header_betas(ctx.client_headers.as_deref());
+        betas.extend(crate::bridge::header_betas(ctx));
+        let invoke =
+            platform::bedrock_count_tokens_invoke_body_with_betas(&body, upstream_id, betas);
+        let io = UpstreamIoInterceptor::new(Protocol::Messages).with_model_input(&invoke);
         let bytes = Vec::from(
             aisix_gateway::json_body(&invoke)
                 .map_err(|e| BridgeError::Config(format!("serialize request body: {e}")))?,
@@ -153,6 +164,8 @@ impl BedrockBridge {
             .count_tokens()
             .model_id(model_id)
             .input(input)
+            .customize()
+            .interceptor(io)
             .send()
             .await
             .map_err(|e| crate::errors::sdk_error(e, started, ctx.deadline));
@@ -200,9 +213,7 @@ fn mantle_count_tokens_url(region: &str) -> String {
 
 /// Count on Bedrock Mantle's Anthropic `count_tokens`: the base model id,
 /// the request's messages, `system` and `tools`, and the options counting
-/// reads (`thinking`, `tool_choice`, `output_config`), authenticated like
-/// every other Bedrock call on the provider key: its bearer API key, or
-/// SigV4 (service `bedrock`).
+/// reads, authenticated with an API key or SigV4 for the Mantle surface.
 async fn mantle_count_tokens(
     body: &Value,
     model_id: &str,
@@ -218,6 +229,8 @@ async fn mantle_count_tokens(
         "thinking",
         "tool_choice",
         "output_config",
+        "compaction",
+        "context_management",
     ] {
         if let Some(v) = body.get(key).filter(|v| !v.is_null()) {
             count.insert(key.to_string(), v.clone());
@@ -233,12 +246,34 @@ async fn mantle_count_tokens(
     );
     let url = mantle_count_tokens_url(creds.region());
 
-    let unsigned = [
+    let mut unsigned = vec![
         ("content-type".to_string(), "application/json".to_string()),
-        ("anthropic-version".to_string(), "2023-06-01".to_string()),
+        (
+            "anthropic-version".to_string(),
+            ctx.client_headers
+                .as_ref()
+                .and_then(|headers| headers.get("anthropic-version"))
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("2023-06-01")
+                .to_string(),
+        ),
     ];
+    let mut betas = platform::header_betas(ctx.client_headers.as_deref());
+    betas.extend(crate::bridge::header_betas(ctx));
+    let shaped = platform::bedrock_count_tokens_invoke_body_with_betas(body, model_id, betas);
+    if let Some(betas) = shaped.get("anthropic_beta").and_then(Value::as_array) {
+        let betas = betas
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(",");
+        if !betas.is_empty() {
+            unsigned.push(("anthropic-beta".to_string(), betas));
+        }
+    }
     let auth = creds.request_auth(ctx.deadline).await?;
-    let signed = crate::bridge::auth_headers(&auth, creds.region(), &url, &unsigned, &bytes)?;
+    let signed =
+        crate::bridge::mantle_auth_headers(&auth, creds.region(), &url, &unsigned, &bytes)?;
 
     let client = aisix_gateway::upstream_tls::raw_client_for_provider_key(
         ctx.provider_key.upstream_connection().as_ref(),
@@ -257,7 +292,9 @@ async fn mantle_count_tokens(
         req = req.timeout(d);
     }
     let started = Instant::now();
-    let resp = req.send().await.map_err(aisix_gateway::send_error)?;
+    let resp = aisix_gateway::upstream_io::send(req, Protocol::Messages)
+        .await
+        .map_err(aisix_gateway::send_error)?;
     aisix_gateway::note_upstream_response(resp.headers());
     let status = resp.status();
     if !status.is_success() {
@@ -295,9 +332,14 @@ async fn mantle_count_tokens(
 
 /// One stream event as an Anthropic SSE frame. A `chunk` carries the
 /// Anthropic event JSON itself.
-fn event_bytes(event: ResponseStream) -> Option<bytes::Bytes> {
+fn event_bytes(event: ResponseStream, io: &UpstreamIoInterceptor) -> Option<bytes::Bytes> {
     match event {
-        ResponseStream::Chunk(part) => part.bytes.map(|b| platform::event_frame(b.as_ref())),
+        ResponseStream::Chunk(part) => part.bytes.map(|b| {
+            if let Some(io) = io.observer() {
+                crate::upstream_io::observe_native_event(io, b.as_ref());
+            }
+            platform::event_frame(b.as_ref())
+        }),
         _ => None,
     }
 }
@@ -378,7 +420,6 @@ impl StreamException {
         }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,5 +441,96 @@ mod tests {
         ] {
             assert!(!serves_anthropic_messages(id), "{id}");
         }
+    }
+}
+
+#[cfg(test)]
+mod compat_claude_native_tests {
+    use super::*;
+    use std::sync::Arc;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn context(secret: &str) -> BridgeContext {
+        let model = serde_json::from_value(serde_json::json!({
+            "display_name":"native-claude","provider":"bedrock","provider_key_id":"pk",
+            "model_name":"us.anthropic.claude-opus-5-5"
+        }))
+        .unwrap();
+        let pk = serde_json::from_value(
+            serde_json::json!({"display_name":"native-pk","api_key":secret}),
+        )
+        .unwrap();
+        BridgeContext::new("req-native-auth", Arc::new(model), Arc::new(pk))
+    }
+
+    #[tokio::test]
+    async fn compat_claude_native_mantle_authentication_after_runtime_fallback() {
+        let server = MockServer::builder().start().await;
+        init_mantle_endpoint(Some(server.uri()));
+        Mock::given(method("POST")).and(path("/model/anthropic.claude-opus-5-5/count-tokens"))
+            .respond_with(ResponseTemplate::new(400).insert_header("x-amzn-errortype","ValidationException").set_body_json(serde_json::json!({"message":"The provided model does not support counting tokens."})))
+            .mount(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/anthropic/v1/messages/count_tokens"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"input_tokens":77})),
+            )
+            .mount(&server)
+            .await;
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        for secret in [
+            r#"{"auth_type":"api_key","api_key":"ABSK-native-test","region":"us-east-1"}"#,
+            r#"{"access_key_id":"AKIA-native-test","secret_access_key":"synthetic-secret","region":"us-east-1"}"#,
+        ] {
+            let result = bridge
+                .native_count_tokens(
+                    serde_json::json!({"messages":[{"role":"user","content":"hi"}]}),
+                    &context(secret),
+                )
+                .await
+                .unwrap();
+            assert_eq!(result["input_tokens"], 77);
+        }
+        let requests = server.received_requests().await.unwrap();
+        let mantle = requests
+            .iter()
+            .filter(|r| r.url.path() == "/anthropic/v1/messages/count_tokens")
+            .collect::<Vec<_>>();
+        assert_eq!(mantle.len(), 2);
+        assert_eq!(
+            mantle[0]
+                .headers
+                .get("x-api-key")
+                .and_then(|v| v.to_str().ok()),
+            Some("ABSK-native-test")
+        );
+        assert!(!mantle[0].headers.contains_key("authorization"));
+        let scope = mantle[1]
+            .headers
+            .get("authorization")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            scope.contains("/us-east-1/bedrock-mantle/aws4_request"),
+            "{scope}"
+        );
+        let runtime = requests
+            .iter()
+            .filter(|r| r.url.path().ends_with("/count-tokens"))
+            .collect::<Vec<_>>();
+        assert_eq!(runtime.len(), 2);
+        assert_eq!(
+            runtime[0].headers.get("authorization").unwrap(),
+            "Bearer ABSK-native-test"
+        );
+        assert!(runtime[1]
+            .headers
+            .get("authorization")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("/us-east-1/bedrock/aws4_request"));
     }
 }

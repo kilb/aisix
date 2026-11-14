@@ -783,7 +783,7 @@ where
         if let Some((_, held)) = guard.slot.as_mut() {
             std::mem::swap(held, &mut accumulator);
         }
-        let synth = ChatResponse {
+        let synth = ChatResponse { native_envelope: None,
             logprobs: None,
             more_choices: Vec::new(),
             id: String::new(),
@@ -1121,6 +1121,7 @@ async fn observe_completion_stream_output(
         };
     }
     let mut synth = ChatResponse {
+        native_envelope: None,
         logprobs: None,
         more_choices: Vec::new(),
         id: String::new(),

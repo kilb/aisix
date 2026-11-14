@@ -1,4 +1,4 @@
-export const ADMIN_TAB_IDS = ["overview", "analytics", "calls", "providers", "models", "public-routes", "model-tests", "cache", "tenants", "pricing", "billing", "keys", "gateways", "resources", "operators", "audit", "account"] as const;
+export const ADMIN_TAB_IDS = ["overview", "analytics", "calls", "upstream-monitoring", "providers", "models", "public-routes", "model-tests", "cache", "tenants", "pricing", "billing", "keys", "gateways", "resources", "operators", "audit", "account"] as const;
 export type AdminTabId = (typeof ADMIN_TAB_IDS)[number];
 
 /** 旧书签仅迁移已拆分的子页，其余账务入口保持含义。 */

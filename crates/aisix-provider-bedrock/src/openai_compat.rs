@@ -450,12 +450,12 @@ async fn send(
     let started = Instant::now();
     let client = endpoint.client.clone();
     let resp = with_deadline(deadline, started, async move {
-        url.post_on(&client)
-            .headers(headers)
-            .body(body)
-            .send()
-            .await
-            .map_err(aisix_gateway::send_error)
+        aisix_gateway::upstream_io::send(
+            url.post_on(&client).headers(headers).body(body),
+            aisix_gateway::upstream_io::Protocol::Chat,
+        )
+        .await
+        .map_err(aisix_gateway::send_error)
     })
     .await?;
     aisix_gateway::note_upstream_response(resp.headers());

@@ -263,12 +263,39 @@ for (const role of ["admin", "operator", "viewer"]) {
   });
 }
 
+// 保留旧隔离世界，只额外允许本轮专属且进程绑定一致的数据库对。
+function assertDedicatedRoutingWorld(routeState: any, routeSession: string): void {
+  const original = routeState.database === "refined_ui_1112_qa6_cp" && routeState.kineDatabase === "refined_ui_1112_qa6_kine";
+  const owned = routeState.database === "ui_polish_1112_routing" && routeState.kineDatabase === "ui_polish_1112_routing_kine"
+    && (routeState.originalSession ?? routeSession) === "/home/ubuntu/aisix-work/ui-polish-1112-evidence/qa/routing-session";
+  if (!routeState.ready || routeState.mockUpstream !== false || (!original && !owned)) throw new Error("Dedicated real routing configuration world required");
+  if (!owned) return;
+  if (routeState.backendSha256 !== "a0f4fd282b8712d17ff01c7f9ce7e5bef982b24fb2b29c846102817c75f97cc4") throw new Error("Owned routing backend binding changed");
+  for (const target of [routeState.httpUrl, routeState.kineEndpoint]) {
+    if (new URL(target).hostname !== "127.0.0.1") throw new Error("Owned routing services must stay on loopback");
+  }
+  for (const label of ["cp", "kine"]) {
+    const child = (routeState.foundationChildren ?? routeState.children).find((item: any) => item.label === label);
+    if (!child || child.exit) throw new Error("Owned routing service binding missing");
+    const stat = readFileSync(`/proc/${child.pid}/stat`, "utf8");
+    if (stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19] !== child.startticks) throw new Error("Owned routing service identity changed");
+    if (label === "cp") {
+      const env = readFileSync(`/proc/${child.pid}/environ`, "utf8").split("\0");
+      if (!env.includes(`CP_DATABASE_URL=postgres://postgres@127.0.0.1:27921/${routeState.database}`)
+        || !env.includes(`CP_KINE_ENDPOINT=${routeState.kineEndpoint}`)) throw new Error("Owned routing control-plane database binding changed");
+    } else {
+      const args = readFileSync(`/proc/${child.pid}/cmdline`, "utf8").split("\0");
+      if (!args.includes(`postgres://postgres@127.0.0.1:27921/${routeState.kineDatabase}?sslmode=disable`)) throw new Error("Owned routing Kine database binding changed");
+    }
+  }
+}
+
 test("routing-saves-weighted-api-key-affinity-and-roundtrip", async ({ page }) => {
   const routeSession = resolve(process.env.REFINED_QA_ROUTING_SESSION!);
   const routeState = JSON.parse(readFileSync(join(routeSession, "public.json"), "utf8"));
   const routeAuth = JSON.parse(readFileSync(join(routeSession, "local-auth.json"), "utf8"));
   const fixture = JSON.parse(readFileSync(join(routeSession, "routing-fixture.json"), "utf8"));
-  if (!routeState.ready || routeState.mockUpstream !== false || routeState.database !== "refined_ui_1112_qa6_cp") throw new Error("Dedicated real routing configuration world required");
+  assertDedicatedRoutingWorld(routeState, routeSession);
   const url = routeState.adminUrl;
   await login(page, routeAuth.operator, url);
   await page.goto(url + "/#public-routes"); await settle(page);
@@ -298,8 +325,10 @@ test("routing-saves-weighted-api-key-affinity-and-roundtrip", async ({ page }) =
 });
 
 
-async function holdRoutingRow(database: string, id: string): Promise<() => Promise<void>> {
-  if (database !== "refined_ui_1112_qa6_cp" || !/^[a-f0-9-]{36}$/.test(id)) throw new Error("Only dedicated routing fixture rows may be locked");
+async function holdRoutingRow(database: string, id: string, kineDatabase: string): Promise<() => Promise<void>> {
+  const original = database === "refined_ui_1112_qa6_cp" && kineDatabase === "refined_ui_1112_qa6_kine";
+  const owned = database === "ui_polish_1112_routing" && kineDatabase === "ui_polish_1112_routing_kine";
+  if ((!original && !owned) || !/^[a-f0-9-]{36}$/.test(id)) throw new Error("Only dedicated routing fixture rows may be locked");
   const child = spawn("psql", [`postgres://postgres@127.0.0.1:27921/${database}`, "-X", "-Atq", "-v", "ON_ERROR_STOP=1"], { stdio: ["pipe", "pipe", "pipe"] });
   let done = false;
   const closed = new Promise<void>(resolve => child.once("exit", () => { done = true; resolve(); }));
@@ -319,6 +348,7 @@ for (const direction of ["save-first", "regenerate-first"]) {
   test(`routing-${direction}-mutual-exclusion`, async ({ page }) => {
     const routeSession = resolve(process.env.REFINED_QA_ROUTING_SESSION!);
     const routeState = JSON.parse(readFileSync(join(routeSession, "public.json"), "utf8"));
+    assertDedicatedRoutingWorld(routeState, routeSession);
     const routeAuth = JSON.parse(readFileSync(join(routeSession, "local-auth.json"), "utf8"));
     const fixture = JSON.parse(readFileSync(join(routeSession, "routing-fixture.json"), "utf8"));
     const url = routeState.adminUrl;
@@ -332,7 +362,7 @@ for (const direction of ["save-first", "regenerate-first"]) {
     const save = form.getByRole("button", { name: "保存", exact: true });
     const regenerate = page.getByRole("button", { name: "重新生成", exact: true });
     await expect(save).toBeEnabled(); await expect(regenerate).toBeEnabled();
-    const release = await holdRoutingRow(routeState.database, fixture.publicModel.id);
+    const release = await holdRoutingRow(routeState.database, fixture.publicModel.id, routeState.kineDatabase);
     try {
       const pending = page.waitForRequest(r => r.method() !== "GET" && r.url().includes(fixture.publicModel.id));
       await (direction === "save-first" ? save : regenerate).click(); await pending;

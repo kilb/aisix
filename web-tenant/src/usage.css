@@ -37,3 +37,110 @@
   flex-wrap: wrap;
   gap: 4px 12px;
 }
+
+/* 筛选、记录与解释各有一条清晰的阅读线，费用不作截断。 */
+.usage-filters {
+  display: flex;
+  min-width: 0;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: 16px 12px;
+  margin-bottom: 16px;
+}
+.usage-filters > .field {
+  width: 192px;
+  max-width: 100%;
+  min-width: 0;
+  margin: 0;
+}
+.usage-filters .f {
+  margin: 0;
+}
+.usage-filters :is(input, select) {
+  width: 100%;
+  min-width: 0;
+}
+.usage-record-section > .record-table-toolbar {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--color-line);
+}
+.usage-record-section > .dt-wrap {
+  margin-top: 20px;
+}
+.usage-record-section > .hint,
+.metric-scope > .hint {
+  margin-top: 8px;
+  font-size: 13px;
+  line-height: 20px;
+}
+.usage-detail h3 {
+  margin-top: 16px;
+  font-family: inherit;
+  font-size: 15px;
+  line-height: 24px;
+  font-weight: 600;
+}
+.usage-detail [aria-label="费用计算"] {
+  margin-bottom: 20px;
+  padding-bottom: 20px;
+  border-bottom: 1px solid var(--color-line);
+}
+.usage-detail [aria-label="费用计算"] :is(p, dd) {
+  overflow-wrap: anywhere;
+}
+.usage-detail [aria-label="费用计算"] dt {
+  color: var(--color-muted);
+  font-size: 13px;
+  line-height: 20px;
+}
+.usage-detail [aria-label="费用计算"] dd {
+  margin: 4px 0 0;
+  font-variant-numeric: tabular-nums;
+}
+@media (max-width: 599px) {
+  .usage-filters {
+    gap: 16px 12px;
+  }
+  .usage-filters > .field {
+    width: 100%;
+  }
+  .usage-detail > td {
+    padding: 16px;
+  }
+}
+
+/* 请求身份合并为一列，性能值分两行，主表保持六列而不是横向十一列。 */
+.usage-record-section .dt { table-layout: fixed; }
+.usage-column-action { width: 52px; }
+.usage-column-time { width: 15%; }
+.usage-column-request { width: auto; }
+.usage-column-state { width: 15%; }
+.usage-column-timing { width: 18%; }
+.usage-column-charge { width: 17%; }
+.usage-record-section .dt :is(td, th) { white-space: normal; min-width: 0; overflow-wrap: anywhere; }
+.usage-request-identity > strong { display: block; font-weight: 500; }
+.usage-request-identity .cell-note { display: block; margin-top: 6px; color: var(--muted-foreground); font-size: 12px; line-height: 18px; }
+.usage-request-identity code { font-size: 11px; line-height: 17px; overflow-wrap: anywhere; }
+.usage-timing-value { display: block; font-variant-numeric: tabular-nums; white-space: normal; }
+.usage-timing-value > span { display: block; margin-bottom: 2px; color: var(--muted-foreground); font-size: 12px; line-height: 18px; }
+.usage-row-action .btn { width: 44px; padding-inline: 0; }
+.usage-record-section td[data-label="状态"] .lamp { max-width: 100%; white-space: normal; }
+.usage-detail .dt-wrap { max-width: 100%; }
+
+@media (max-width: 1050px) {
+  .usage-record-section .dt { display: block; width: 100%; }
+  .usage-record-section .dt > colgroup { display: none; }
+  .usage-record-section .dt > thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+  .usage-record-section .dt > tbody { display: block; }
+  .usage-record-section .dt > tbody > tr { position: relative; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; padding: 20px 12px; border-bottom: 1px solid var(--color-line); }
+  .usage-record-section .dt > tbody > tr > td { display: block; width: auto; min-height: 0; height: auto; padding: 0; border: 0; text-align: left; }
+  .usage-record-section .dt > tbody > tr > td[data-label]::before { display: block; margin-bottom: 6px; content: attr(data-label); color: var(--muted-foreground); font-size: 12px; line-height: 18px; }
+  .usage-record-section .dt > tbody > tr > .usage-row-action { grid-column: 2; grid-row: 1; justify-self: end; }
+  .usage-record-section .dt > tbody > tr > td[data-label="时间"] { grid-column: 1; grid-row: 1; }
+  .usage-record-section .dt > tbody > tr > .usage-request-identity { grid-column: 1 / -1; }
+  .usage-record-section .dt > tbody > tr > td[data-label="费用"] { grid-column: 1 / -1; }
+  .usage-record-section .dt > tbody > tr.usage-detail { display: block; padding: 0; }
+  .usage-record-section .dt > tbody > tr.usage-detail > td { padding: 16px; }
+  .usage-detail .dt > tbody > tr { padding-inline: 12px; }
+}

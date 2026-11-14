@@ -20,7 +20,9 @@ use base64::Engine as _;
 use ring::{aead, hmac};
 use serde_json::Value;
 
-use crate::json_splice::{PathSeg, Retain};
+#[cfg(test)]
+use crate::json_splice::PathSeg;
+use crate::json_splice::Retain;
 
 fn hmac_parts(key: &[u8], parts: &[&[u8]]) -> hmac::Tag {
     let mut ctx = hmac::Context::with_key(&hmac::Key::new(hmac::HMAC_SHA256, key));
@@ -419,6 +421,7 @@ fn for_each_item_id(item: &mut Value, mut visit: impl FnMut(IdKind, &mut String)
 
 /// Seal every item id of a Responses `Response` object. The response-level
 /// `id` is not an item id and is left alone, and so is every other field.
+#[cfg(test)]
 pub(crate) fn seal_responses_body(sealer: &Sealer, body: &mut Value) {
     if let Some(items) = body.get_mut("output").and_then(Value::as_array_mut) {
         for item in items {
@@ -427,6 +430,7 @@ pub(crate) fn seal_responses_body(sealer: &Sealer, body: &mut Value) {
     }
 }
 
+#[cfg(test)]
 fn seal_item(sealer: &Sealer, item: &mut Value) {
     for_each_item_id(item, |kind, slot| {
         if !slot.is_empty() {
@@ -438,6 +442,7 @@ fn seal_item(sealer: &Sealer, item: &mut Value) {
 /// [`seal_responses_body`] for one parsed Responses stream event: the item of
 /// `response.output_item.*`, the `item_id` of every per-item event, and the
 /// Response object of the snapshot events.
+#[cfg(test)]
 pub(crate) fn seal_responses_event(sealer: &Sealer, event: &mut Value) {
     if let Some(item) = event.get_mut("item") {
         seal_item(sealer, item);
@@ -467,6 +472,7 @@ pub(crate) fn drop_bridged_usage_extensions(response: &mut Value) {
 
 /// The paths [`seal_responses_event`] seals, with the kind of id each holds,
 /// for a byte splice over a Responses stream event.
+#[cfg(test)]
 pub(crate) fn responses_event_id_kind(path: &[PathSeg]) -> Option<IdKind> {
     fn item_field(rest: &[PathSeg]) -> Option<IdKind> {
         match rest {
@@ -640,7 +646,7 @@ pub(crate) fn with_own_containers<E>(
 /// A `reasoning` item with an `id` and no `encrypted_content` is one too:
 /// the upstream looks its reasoning up by that id ("Item with id 'rs_…' not
 /// found", see [`unseal_responses_input`]).
-fn is_item_reference(item: &Value) -> bool {
+pub(crate) fn is_item_reference(item: &Value) -> bool {
     match item.get("type") {
         Some(Value::String(t)) if t == "reasoning" => {
             item.get("id").is_some()

@@ -28,7 +28,7 @@
   align-items: flex-start;
   justify-content: space-between;
   gap: 16px;
-  padding: 20px;
+  padding: 24px;
   border-bottom: 1px solid var(--line);
 }
 
@@ -43,7 +43,7 @@
 
 .operators-dialog-title {
   margin: 0;
-  font-size: 20px;
+  font-size: 17px;
   font-weight: 600;
   line-height: 1.4;
 }
@@ -62,7 +62,7 @@
 }
 
 .operators-create-body {
-  padding: 20px;
+  padding: 24px;
   overflow-y: auto;
   overscroll-behavior: contain;
 }
@@ -118,7 +118,7 @@
   flex: 0 0 auto;
   justify-content: flex-end;
   gap: 8px;
-  padding: 16px 20px;
+  padding: 16px 24px;
   border-top: 1px solid var(--line);
 }
 
@@ -146,4 +146,11 @@
   .operators-dialog-footer > .btn {
     flex: 1;
   }
+}
+
+/* 窄屏弹层保留完整字段与安全区，关闭和保存均有44px命中区。 */
+@media (max-width: 540px) {
+  .operators-dialog-header,
+  .operators-create-body { padding: 16px; }
+  .operators-dialog-footer { padding-inline: 16px; }
 }

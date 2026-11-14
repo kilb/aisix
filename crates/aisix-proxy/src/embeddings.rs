@@ -14,13 +14,13 @@
 //! Providers that don't implement embeddings return a 501 with
 //! `"type": "not_implemented"`.
 
+use crate::request_json::Json;
 use aisix_core::AppliedGuardrail;
 use aisix_gateway::{BridgeCapability, BridgeError, ChatFormat, EmbeddingRequest};
 use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, UsageEvent};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde::Deserialize;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -191,7 +191,7 @@ pub async fn embeddings(
     // OpenAI — every SDK that branches on 400 vs 422 sees different
     // semantics here than it does talking to api.openai.com. Same
     // discriminate-then-map pattern chat.rs uses for #324.
-    body: Result<Json<EmbeddingRequestBody>, axum::extract::rejection::JsonRejection>,
+    body: Result<Json<EmbeddingRequestBody>, crate::request_json::JsonRejection>,
 ) -> Response {
     let started = Instant::now();
     let request_id = client.request_id.clone();

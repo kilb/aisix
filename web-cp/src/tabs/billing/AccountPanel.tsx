@@ -406,12 +406,12 @@ function Ledger({ account }: RegionProps) {
             </thead>
             <tbody>
               {table.rows.map((i) => (
-                <tr key={i.seq}>
-                  <td className="tabular">{fmtBeijing(i.posted_at)}</td>
-                  <td>{KIND_LABEL[i.kind] ?? i.kind}</td>
-                  <td className="num">{fmtMicroCny(i.amount_micro_cny)}</td>
-                  <td className="num">{fmtMicroCny(i.balance_after_micro_cny)}</td>
-                  <td>{entryNote(i)}</td>
+                <tr data-finance-record key={i.seq}>
+                  <td data-label="时间" className="tabular">{fmtBeijing(i.posted_at)}</td>
+                  <td data-label="类型">{KIND_LABEL[i.kind] ?? i.kind}</td>
+                  <td data-label="金额" className="num">{fmtMicroCny(i.amount_micro_cny)}</td>
+                  <td data-label="余额" className="num">{fmtMicroCny(i.balance_after_micro_cny)}</td>
+                  <td data-label="说明">{entryNote(i)}</td>
                 </tr>
               ))}
             </tbody>
@@ -505,12 +505,12 @@ function PeriodSummary({ account }: RegionProps) {
           </thead>
           <tbody>
             {rows.map((r) => (
-              <tr key={r.period_start}>
-                <td className="tabular">{periodLabel(r.period_start, group)}</td>
-                <td className="num">{fmtMicroCny(r.usage_micro_cny)}</td>
-                <td className="num">{fmtMicroCny(r.topups_micro_cny)}</td>
-                <td className="num">{fmtMicroCny(r.adjustments_micro_cny)}</td>
-                <td className="num">{fmtMicroCny(r.closing_balance_micro_cny)}</td>
+              <tr data-finance-record key={r.period_start}>
+                <td data-label="期间" className="tabular">{periodLabel(r.period_start, group)}</td>
+                <td data-label="扣费" className="num">{fmtMicroCny(r.usage_micro_cny)}</td>
+                <td data-label="充值" className="num">{fmtMicroCny(r.topups_micro_cny)}</td>
+                <td data-label="调整" className="num">{fmtMicroCny(r.adjustments_micro_cny)}</td>
+                <td data-label="期末余额" className="num">{fmtMicroCny(r.closing_balance_micro_cny)}</td>
               </tr>
             ))}
           </tbody>
@@ -561,12 +561,12 @@ function UsageSummary({ account }: RegionProps) {
           </thead>
           <tbody>
             {rows.map((r) => (
-              <tr key={`${r.period_start}/${r.model.id ?? r.model.name}`}>
-                <td className="tabular">{periodLabel(r.period_start, group)}</td>
-                <td>{usageModel(r.model)}</td>
-                <td className="num">{formatCount(r.requests)}</td>
-                <td className="num">{fmtMicroCny(r.charged_micro_cny)}</td>
-                <td>
+              <tr data-finance-record key={`${r.period_start}/${r.model.id ?? r.model.name}`}>
+                <td data-label="期间" className="tabular">{periodLabel(r.period_start, group)}</td>
+                <td data-label="模型">{usageModel(r.model)}</td>
+                <td data-label="调用次数" className="num">{formatCount(r.requests)}</td>
+                <td data-label="费用" className="num">{fmtMicroCny(r.charged_micro_cny)}</td>
+                <td data-label="计量">
                   {r.quantities === null
                     ? "明细不可知"
                     : Object.entries(r.quantities)
@@ -631,19 +631,19 @@ function Quotas({ account, quotaRev }: RegionProps) {
             </thead>
             <tbody>
               {table.rows.map((b) => (
-                <tr key={b.id}>
-                  <td>{SCOPE_LABEL[b.scope] ?? b.scope}</td>
-                  <td>
+                <tr data-finance-record key={b.id}>
+                  <td data-label="层级">{SCOPE_LABEL[b.scope] ?? b.scope}</td>
+                  <td data-label="对象">
                     <span className="trunc" title={b.target.label}>
                       {b.target.label}
                     </span>
                     {!b.target_live && "（已失效）"}
                   </td>
-                  <td>{SET_BY_LABEL[b.set_by] ?? b.set_by}</td>
-                  <td>{b.kind === "cumulative" ? "一次性额度" : "按周期"}</td>
-                  <td>{budgetPeriod(b)}</td>
-                  <td className="num">{fmtMicroCny(b.limit_micro_cny)}</td>
-                  <td className="num">
+                  <td data-label="设置方">{SET_BY_LABEL[b.set_by] ?? b.set_by}</td>
+                  <td data-label="类型">{b.kind === "cumulative" ? "一次性额度" : "按周期"}</td>
+                  <td data-label="周期">{budgetPeriod(b)}</td>
+                  <td data-label="限额" className="num">{fmtMicroCny(b.limit_micro_cny)}</td>
+                  <td data-label="已用" className="num">
                     {fmtMicroCny(b.spent_micro_cny)}
                     <BudgetProgress
                       value={exactRatio(b.spent_micro_cny, b.limit_micro_cny)}
@@ -651,8 +651,8 @@ function Quotas({ account, quotaRev }: RegionProps) {
                       className="mt-2 min-w-24"
                     />
                   </td>
-                  <td className="num">{fmtMicroCny(b.remaining_micro_cny)}</td>
-                  <td>
+                  <td data-label="剩余" className="num">{fmtMicroCny(b.remaining_micro_cny)}</td>
+                  <td data-label="状态">
                     <span data-state={b.exhausted ? "exhausted" : "ok"}>
                       <Lamp state={b.exhausted ? "rejected" : "applied"}>{b.exhausted ? "已用尽" : "正常"}</Lamp>
                     </span>

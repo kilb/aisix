@@ -473,6 +473,11 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
     ),
     (
         "GET",
+        "/admin/usage/direct-models",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
+    (
+        "GET",
         "/admin/tenants/{id}/usage/metrics",
         MinRole::Op(OperatorRole::Viewer),
     ),
@@ -723,6 +728,15 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
     ("GET", "/dp/v1/keys/{key_id}/requests", MinRole::Dp),
     ("ANY", "/dp/store/v1/{*rest}", MinRole::Dp),
     ("POST", "/dp/telemetry", MinRole::Dp),
+    ("POST", "/dp/v1/native-objects/begin", MinRole::Dp),
+    ("POST", "/dp/v1/native-objects/bind", MinRole::Dp),
+    ("POST", "/dp/v1/native-objects/lookup", MinRole::Dp),
+    ("POST", "/dp/v1/native-objects/owned", MinRole::Dp),
+    ("POST", "/dp/v1/native-objects/tombstone", MinRole::Dp),
+    ("POST", "/dp/v1/native-objects/claim", MinRole::Dp),
+    ("POST", "/dp/v1/native-objects/renew", MinRole::Dp),
+    ("POST", "/dp/v1/native-objects/reschedule", MinRole::Dp),
+    ("POST", "/dp/v1/native-objects/complete", MinRole::Dp),
 ];
 
 /// Every tenant role.
@@ -907,6 +921,7 @@ pub fn browser_router(state: AppState) -> Router {
         .route("/api/usage/summary", get(billing::calls::tenant_summary))
         .route("/api/usage/metrics", get(usage_metrics::tenant))
         .route("/admin/usage/metrics", get(usage_metrics::admin))
+        .route("/admin/usage/direct-models", get(usage_metrics::admin_direct_models))
         .route("/admin/tenants/{id}/usage/metrics", get(usage_metrics::admin_tenant))
         .route(
             "/admin/tenants/{id}/usage/summary",
@@ -1032,6 +1047,21 @@ pub fn browser_router(state: AppState) -> Router {
 /// each connection's certificate identity to its requests.
 pub fn dp_router(state: AppState) -> Router {
     Router::new()
+        .route(
+            "/dp/v1/native-objects/begin",
+            post(dp::native_objects::begin).layer(DefaultBodyLimit::max(dp::native_objects::MAX_BODY_BYTES)),
+        )
+        .route("/dp/v1/native-objects/bind", post(dp::native_objects::bind))
+        .route("/dp/v1/native-objects/lookup", post(dp::native_objects::lookup))
+        .route("/dp/v1/native-objects/owned", post(dp::native_objects::owned))
+        .route("/dp/v1/native-objects/tombstone", post(dp::native_objects::tombstone))
+        .route("/dp/v1/native-objects/claim", post(dp::native_objects::claim))
+        .route("/dp/v1/native-objects/renew", post(dp::native_objects::renew))
+        .route("/dp/v1/native-objects/reschedule", post(dp::native_objects::reschedule))
+        .route(
+            "/dp/v1/native-objects/complete",
+            post(dp::native_objects::complete).layer(DefaultBodyLimit::max(dp::native_objects::MAX_BODY_BYTES)),
+        )
         .route("/dp/heartbeat", post(dp::heartbeat::heartbeat))
         .route(
             "/dp/v1/keys/{key_id}/prices",

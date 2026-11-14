@@ -2,6 +2,7 @@
 //! 所有分组、百分位和金额求和均由同一数据库快照完成，Rust 只补齐空时间桶。
 //! 模型维度使用调用者请求的入口：direct / embedding 为自身，routing / semantic /
 //! ensemble 为父入口，wildcard 为解析到的配置行；不按尝试派发的上游目标分组。
+//! 独立的运维直连监测读取实际尝试目标，并保留未知派发与结果。
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -72,7 +73,7 @@ pub struct MetricsQuery {
 #[derive(Default, Deserialize, Serialize)]
 pub struct LatencyMetrics {
     pub sample_count: i64,
-    /// 首 token / 响应指标的基数是所有最终事件，包含非流式与旧事件；尝试耗时基数是可见尝试。
+    /// 请求指标以最终事件为基数；直连监测以实际派发尝试为基数，缺失单独计数。
     pub missing_count: i64,
     pub avg: Option<f64>,
     pub p50: Option<f64>,
@@ -534,6 +535,481 @@ pub async fn admin_tenant(
         return Err(refused("/tenant_id", "租户范围与路径不一致"));
     }
     summarize(&state, q, Some(tenant), None).await
+}
+
+/// 直连模型监测读取每次尝试，与客户端请求和收费可见性口径独立。
+#[derive(Default, Deserialize)]
+pub struct DirectModelsQuery {
+    from: Option<DateTime<Utc>>,
+    to: Option<DateTime<Utc>>,
+    bucket: Option<Bucket>,
+    tenant_id: Option<Uuid>,
+    model_id: Option<Uuid>,
+    provider_key_id: Option<Uuid>,
+    api_key_id: Option<Uuid>,
+    service_tier: Option<String>,
+    outcome: Option<DirectOutcome>,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectOutcome {
+    Succeeded,
+    Failed,
+    Unknown,
+}
+
+impl DirectOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Default, Deserialize, Serialize)]
+pub struct DirectMetrics {
+    pub attributed_attempts: i64,
+    pub attempts: i64,
+    pub excluded_attempts: i64,
+    pub unmeasured_attempts: i64,
+    pub succeeded_attempts: i64,
+    pub failed_attempts: i64,
+    pub unknown_outcome_attempts: i64,
+    pub success_rate: Option<f64>,
+    pub failure_rate: Option<f64>,
+    pub upstream_ttft_ms: LatencyMetrics,
+    pub first_token_latency_ms: LatencyMetrics,
+    pub attempt_duration_ms: LatencyMetrics,
+    pub tokens: DirectTokenMetrics,
+    /// 整体平均由输出间隔加权；百分位来自各请求的实测 TPS。
+    pub throughput_tps: LatencyMetrics,
+}
+
+#[derive(Default, Deserialize, Serialize)]
+pub struct DirectTokenMetrics {
+    #[serde(flatten)]
+    pub totals: TokenMetrics,
+    /// 缓存率只使用明确上报缓存计数的样本，缺失不当作未命中。
+    pub cache_measured_attempts: i64,
+    pub cache_missing_attempts: i64,
+    pub cache_measured_input_tokens: i64,
+    pub cache_measured_hit_tokens: i64,
+}
+
+#[derive(Serialize)]
+pub struct DirectMetricsPeriod {
+    pub period_start: DateTime<Utc>,
+    #[serde(flatten)]
+    pub metrics: DirectMetrics,
+}
+
+#[derive(Serialize)]
+pub struct DirectMetricsModel {
+    pub model: ModelRef,
+    pub provider_key: ModelRef,
+    #[serde(flatten)]
+    pub metrics: DirectMetrics,
+}
+
+#[derive(Serialize)]
+pub struct DirectMetricsResponse {
+    pub from: DateTime<Utc>,
+    pub to: DateTime<Utc>,
+    pub bucket: Bucket,
+    pub totals: DirectMetrics,
+    pub series: Vec<DirectMetricsPeriod>,
+    pub models: Vec<DirectMetricsModel>,
+}
+
+/// TPOT 仅接受有效的正数；先按 numeric 验界，避免历史 JSON 转换溢出。
+fn direct_tpot() -> &'static str {
+    "CASE WHEN jsonb_typeof(ue.event->'upstream_tpot_ms') = 'number' \
+     THEN CASE WHEN (ue.event->>'upstream_tpot_ms')::numeric BETWEEN 1e-100 AND 1e100 \
+       THEN (ue.event->>'upstream_tpot_ms')::double precision END END"
+}
+
+fn direct_token_sum(field: &str) -> String {
+    format!(
+        "COALESCE(sum(CASE WHEN dispatched AND known_usage THEN {field} ELSE 0 END)::bigint, 0)"
+    )
+}
+
+fn direct_cache_sum(field: &str) -> String {
+    format!(
+        "COALESCE(sum(CASE WHEN dispatched AND known_usage AND cache_reported \
+         THEN {field} ELSE 0 END)::bigint, 0)"
+    )
+}
+
+fn direct_aggregates() -> String {
+    let attempts = count("dispatched");
+    let succeeded = count("dispatched AND outcome = 'succeeded'");
+    let failed = count("dispatched AND outcome = 'failed'");
+    let input = direct_token_sum(
+        "prompt_tokens + COALESCE(cache_read_tokens, 0) + COALESCE(cache_creation_tokens, 0)",
+    );
+    let cached =
+        direct_token_sum("COALESCE(cached_prompt_tokens, 0) + COALESCE(cache_read_tokens, 0)");
+    let cache_input = direct_cache_sum(
+        "prompt_tokens + COALESCE(cache_read_tokens, 0) + COALESCE(cache_creation_tokens, 0)",
+    );
+    let cache_hits =
+        direct_cache_sum("COALESCE(cached_prompt_tokens, 0) + COALESCE(cache_read_tokens, 0)");
+    let mut tokens: Vec<String> = [
+        "prompt_tokens",
+        "completion_tokens",
+        "reasoning_tokens",
+        "cached_prompt_tokens",
+        "cache_read_tokens",
+        "cache_creation_tokens",
+    ]
+    .iter()
+    .map(|field| format!("'{field}', {}", direct_token_sum(field)))
+    .collect();
+    tokens.push(format!(
+        "'input_tokens', {input}, 'cache_hit_tokens', {cached}, \
+         'cache_hit_rate', {cache_hits}::double precision / NULLIF({cache_input}, 0), \
+         'known_usage_attempts', {}, 'unknown_usage_attempts', {}, \
+         'cache_measured_attempts', {}, 'cache_missing_attempts', {}, \
+         'cache_measured_input_tokens', {cache_input}, 'cache_measured_hit_tokens', {cache_hits}",
+        count("dispatched AND known_usage"),
+        count("dispatched AND NOT known_usage"),
+        count("dispatched AND known_usage AND cache_reported"),
+        count("dispatched AND (NOT known_usage OR NOT cache_reported)")
+    ));
+    let throughput = "jsonb_build_object(\
+        'sample_count', count(*) FILTER (WHERE tps IS NOT NULL), \
+        'missing_count', count(*) FILTER (WHERE dispatched AND tps IS NULL), \
+        'avg', 1000.0 * sum(CASE WHEN tps IS NOT NULL THEN output_tokens - 1 END)::numeric \
+          / NULLIF(sum(CASE WHEN tps IS NOT NULL THEN tpot * (output_tokens - 1) END)::numeric, 0), \
+        'p50', percentile_cont(0.5) WITHIN GROUP (ORDER BY tps), \
+        'p95', percentile_cont(0.95) WITHIN GROUP (ORDER BY tps), \
+        'p99', percentile_cont(0.99) WITHIN GROUP (ORDER BY tps))";
+    format!(
+        "jsonb_build_object(\
+         'attributed_attempts', count(*), 'attempts', {attempts}, \
+         'excluded_attempts', {}, 'unmeasured_attempts', {}, \
+         'succeeded_attempts', {succeeded}, 'failed_attempts', {failed}, \
+         'unknown_outcome_attempts', {}, \
+         'success_rate', {succeeded}::double precision / NULLIF({succeeded} + {failed}, 0), \
+         'failure_rate', {failed}::double precision / NULLIF({succeeded} + {failed}, 0), \
+         'upstream_ttft_ms', {}, 'first_token_latency_ms', {}, 'attempt_duration_ms', {}, \
+         'tokens', jsonb_build_object({}), 'throughput_tps', {throughput})",
+        count("excluded"),
+        count("NOT dispatched AND NOT excluded"),
+        count("dispatched AND outcome = 'unknown'"),
+        latency("upstream_ttft", "dispatched"),
+        latency("ttft", "dispatched"),
+        latency("attempt_duration", "dispatched"),
+        tokens.join(", ")
+    )
+}
+
+#[derive(sqlx::FromRow)]
+struct DirectAggregateRow {
+    grouping: i32,
+    period_start: Option<DateTime<Utc>>,
+    model_id: Option<String>,
+    provider_key_id: Option<String>,
+    metrics: sqlx::types::Json<DirectMetrics>,
+}
+
+async fn summarize_direct_models(
+    state: &AppState,
+    q: DirectModelsQuery,
+) -> Result<Json<DirectMetricsResponse>, ApiError> {
+    let (from, to, bucket) = checked_window(&MetricsQuery {
+        from: q.from,
+        to: q.to,
+        bucket: q.bucket,
+        ..MetricsQuery::default()
+    })?;
+    if q.service_tier.as_ref().is_some_and(|s| s.len() > 128) {
+        return Err(refused("/service_tier", "服务档位过长"));
+    }
+    let mut tx = state.db.pool().begin().await.map_err(DbError::from)?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await
+        .map_err(DbError::from)?;
+    let configured: Vec<(Uuid, serde_json::Value, bool)> =
+        sqlx::query_as("SELECT id, doc, deleted FROM gw_resources WHERE kind = 'models'")
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(DbError::from)?;
+    let account_rows: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT id, COALESCE(doc->>'display_name', '') FROM gw_resources \
+         WHERE kind = 'provider_keys' AND NOT deleted",
+    )
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(DbError::from)?;
+    let accounts: HashMap<String, String> = account_rows
+        .into_iter()
+        .map(|(id, name)| (id.to_string(), name))
+        .collect();
+    let mut names = HashMap::new();
+    let mut known_ids = Vec::new();
+    let mut direct_ids = Vec::new();
+    let mut idle = BTreeMap::new();
+    for (id, doc, deleted) in configured {
+        let model: aisix_core::Model = serde_json::from_value(doc)
+            .map_err(|_| ApiError::internal("存储模型格式无效，无法读取监测配置"))?;
+        let id = id.to_string();
+        known_ids.push(id.clone());
+        if model.is_routing() || model.is_ensemble() || model.is_semantic() {
+            continue;
+        }
+        direct_ids.push(id.clone());
+        if deleted {
+            continue;
+        }
+        names.insert(id.clone(), model.display_name);
+        let account = model.provider_key_id.unwrap_or_default();
+        if q.model_id.is_none_or(|filter| filter.to_string() == id)
+            && q.provider_key_id
+                .is_none_or(|filter| filter.to_string() == account)
+        {
+            idle.insert((id, account), DirectMetrics::default());
+        }
+    }
+
+    let mut sql = QueryBuilder::<Postgres>::new("WITH raw AS MATERIALIZED (SELECT date_trunc(");
+    sql.push_bind(bucket.unit()).push(
+        ", ue.occurred_at, 'Asia/Shanghai') AS period_start, \
+          ue.event->>'model_id' AS model_id, \
+          COALESCE(ue.event->>'provider_key_id', '') AS provider_key_id, \
+          COALESCE(ue.event->>'error_class', '') AS error_class, \
+          ue.event->>'cache_status' AS cache_status, \
+          ue.event->>'inference_stage' AS inference_stage, \
+          ue.event->>'native_terminal_status' AS native_terminal_status, \
+          CASE WHEN jsonb_typeof(ue.event->'upstream_dispatched') = 'boolean' \
+            THEN (ue.event->>'upstream_dispatched')::boolean END AS explicit_dispatch, ",
+    );
+    let mut columns: Vec<String> = [
+        "prompt_tokens",
+        "completion_tokens",
+        "reasoning_tokens",
+        "total_tokens",
+        "cached_prompt_tokens",
+        "cache_read_tokens",
+        "cache_creation_tokens",
+        "cache_write_tokens",
+    ]
+    .iter()
+    .map(|field| format!("{} AS {field}", counter(field)))
+    .collect();
+    columns.extend([
+        format!("{} AS raw_status", counter("status_code")),
+        format!("{} AS ttft", counter("first_token_latency_ms")),
+        format!(
+            "NULLIF({}, 0) AS upstream_ttft",
+            counter("upstream_ttft_ms")
+        ),
+        format!(
+            "NULLIF({}, 0) AS attempt_duration",
+            counter("upstream_latency_ms")
+        ),
+        format!("{} AS tpot", direct_tpot()),
+    ]);
+    let optional_usage = [
+        "reasoning_tokens",
+        "cached_prompt_tokens",
+        "cache_read_tokens",
+        "cache_creation_tokens",
+        "cache_write_tokens",
+    ]
+    .iter()
+    .map(|field| {
+        let nullable = if *field == "cache_write_tokens" {
+            "ue.event->'cache_write_tokens' = 'null'::jsonb OR "
+        } else {
+            ""
+        };
+        format!(
+            "(NOT (ue.event ? '{field}') OR {nullable}({}) IS NOT NULL)",
+            counter(field)
+        )
+    })
+    .collect::<Vec<_>>()
+    .join(" AND ");
+    columns.push(format!("({optional_usage}) AS valid_optional_usage"));
+    columns.push("CASE WHEN jsonb_typeof(ue.event->'cache_usage_reported') = 'boolean' THEN (ue.event->>'cache_usage_reported')::boolean WHEN ue.event ? 'cache_usage_reported' THEN FALSE END AS explicit_cache_reported".to_string());
+    sql.push(columns.join(", "))
+        .push(" FROM usage_events ue WHERE ue.occurred_at >= ")
+        .push_bind(from)
+        .push(" AND ue.occurred_at < ")
+        .push_bind(to)
+        .push(
+            " AND ue.event->>'model_id' ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' \
+              AND (ue.event->>'model_id' = ANY(",
+        )
+        .push_bind(direct_ids)
+        .push(") OR (NOT (ue.event->>'model_id' = ANY(")
+        .push_bind(known_ids)
+        .push(")) AND ue.event->>'provider_key_id' ~* \
+            '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'))");
+    for (column, value) in [
+        ("ue.event->>'model_id'", q.model_id),
+        ("ue.event->>'provider_key_id'", q.provider_key_id),
+        ("ue.api_key_id", q.api_key_id),
+    ] {
+        if let Some(value) = value {
+            sql.push(format!(" AND {column} = "))
+                .push_bind(value.to_string());
+        }
+    }
+    if let Some(tenant) = q.tenant_id {
+        // 每条摄入记录都有核定归属，无论最终与否、是否收费；不相信遥测自报的 team_id。
+        sql.push(
+            " AND EXISTS (SELECT 1 FROM pricing_charges_cny pc \
+            WHERE pc.event_id = ue.event_id AND pc.tenant_id = ",
+        )
+        .push_bind(tenant.to_string())
+        .push(")");
+    }
+    if let Some(tier) = q.service_tier {
+        sql.push(" AND ue.event->>'service_tier' = ")
+            .push_bind(tier);
+    }
+    sql.push(
+        "), measured AS (SELECT *, \
+         CASE WHEN raw_status BETWEEN 100 AND 599 THEN raw_status END AS status_code, \
+         COALESCE(explicit_cache_reported, cached_prompt_tokens IS NOT NULL OR cache_read_tokens IS NOT NULL \
+           OR cache_creation_tokens IS NOT NULL OR cache_write_tokens IS NOT NULL) AS cache_reported, \
+         prompt_tokens IS NOT NULL AND completion_tokens IS NOT NULL AND valid_optional_usage \
+           AND COALESCE(cached_prompt_tokens, 0) + COALESCE(cache_write_tokens, 0) <= prompt_tokens \
+           AS known_usage, \
+         CASE WHEN inference_stage IN ('accepted', 'management') THEN FALSE \
+           WHEN cache_status = 'hit' THEN FALSE \
+           WHEN explicit_dispatch IS NOT NULL THEN explicit_dispatch \
+           WHEN attempt_duration IS NOT NULL OR upstream_ttft IS NOT NULL OR tpot IS NOT NULL \
+             OR error_class IN ('timeout', 'upstream_status', 'upstream_decode', 'upstream_in_band', \
+                'transport', 'stream_aborted') THEN TRUE ELSE FALSE END AS dispatched, \
+         COALESCE(cache_status = 'hit', FALSE) AS cache_hit \
+         FROM raw), classified AS (SELECT *, \
+         NOT dispatched AND (COALESCE(inference_stage IN ('accepted', 'management'), FALSE) \
+           OR COALESCE(explicit_dispatch = FALSE, FALSE) OR cache_hit OR error_class IN (\
+           'invalid_request_error', 'config', 'invalid_config', 'invalid_credentials', \
+           'invalid_api_key', 'authentication_error', 'permission_denied', 'model_not_found', \
+           'resource_not_found', 'response_not_found', 'video_not_found', \
+           'websocket_upgrade_required', 'provider_unavailable', 'all_candidates_unavailable', \
+           'semantic_decision_failed', 'content_filter', 'billing_error', 'rate_limit_exceeded', \
+           'dependency_unavailable')) AS excluded, \
+         CASE WHEN inference_stage = 'terminal' AND native_terminal_status = 'cancelled' THEN 'unknown' \
+           WHEN inference_stage = 'terminal' AND native_terminal_status IN ('failed', 'expired') THEN 'failed' \
+           WHEN error_class IN ('timeout', 'upstream_status', 'upstream_decode', \
+              'upstream_in_band', 'transport', 'stream_aborted') THEN 'failed' \
+           WHEN error_class <> '' THEN 'unknown' \
+           WHEN status_code BETWEEN 200 AND 299 THEN 'succeeded' \
+           WHEN status_code BETWEEN 300 AND 599 THEN 'failed' ELSE 'unknown' END AS outcome, \
+         completion_tokens + CASE WHEN COALESCE(total_tokens, 0) > 0 AND COALESCE(reasoning_tokens, 0) > 0 \
+           AND prompt_tokens + completion_tokens + reasoning_tokens = total_tokens \
+           AND prompt_tokens + completion_tokens <> total_tokens \
+           THEN reasoning_tokens ELSE 0 END AS output_tokens \
+         FROM measured), scoped AS (SELECT *, \
+         CASE WHEN dispatched AND outcome = 'succeeded' AND known_usage \
+           AND output_tokens > 1 AND tpot IS NOT NULL THEN 1000.0 / tpot END AS tps \
+         FROM classified",
+    );
+    if let Some(outcome) = q.outcome {
+        sql.push(" WHERE dispatched AND outcome = ")
+            .push_bind(outcome.as_str());
+    }
+    sql.push(
+        ") SELECT CASE WHEN GROUPING(period_start) = 0 THEN 1 \
+        WHEN GROUPING(model_id) = 0 THEN 2 ELSE 0 END AS grouping, \
+        period_start, model_id, provider_key_id, ",
+    )
+    .push(direct_aggregates())
+    .push(
+        " AS metrics FROM scoped GROUP BY GROUPING SETS \
+          ((), (period_start), (model_id, provider_key_id)) \
+          ORDER BY grouping, period_start, model_id, provider_key_id",
+    );
+    let rows: Vec<DirectAggregateRow> = sql
+        .build_query_as()
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(DbError::from)?;
+    tx.commit().await.map_err(DbError::from)?;
+
+    let mut totals = DirectMetrics::default();
+    let mut periods = BTreeMap::new();
+    for row in rows {
+        match row.grouping {
+            0 => totals = row.metrics.0,
+            1 => {
+                if let Some(at) = row.period_start {
+                    periods.insert(at, row.metrics.0);
+                }
+            }
+            2 => {
+                idle.insert(
+                    (
+                        row.model_id.unwrap_or_default(),
+                        row.provider_key_id.unwrap_or_default(),
+                    ),
+                    row.metrics.0,
+                );
+            }
+            _ => {}
+        }
+    }
+    let mut models: Vec<DirectMetricsModel> = idle
+        .into_iter()
+        .map(|((id, account), metrics)| DirectMetricsModel {
+            model: ModelRef {
+                id: Uuid::parse_str(&id).ok(),
+                name: names.get(&id).cloned().unwrap_or_default(),
+            },
+            provider_key: ModelRef {
+                id: Uuid::parse_str(&account).ok(),
+                name: accounts.get(&account).cloned().unwrap_or_default(),
+            },
+            metrics,
+        })
+        .collect();
+    models.sort_by(|a, b| {
+        a.model
+            .name
+            .cmp(&b.model.name)
+            .then_with(|| a.model.id.cmp(&b.model.id))
+            .then_with(|| a.provider_key.id.cmp(&b.provider_key.id))
+    });
+    let mut series = Vec::new();
+    let mut period = bucket.floor(from)?;
+    while period < to {
+        series.push(DirectMetricsPeriod {
+            period_start: period,
+            metrics: periods.remove(&period).unwrap_or_default(),
+        });
+        period = period
+            .checked_add_signed(TimeDelta::seconds(bucket.seconds()))
+            .ok_or_else(|| refused("/to", "时间不合法"))?;
+    }
+    Ok(Json(DirectMetricsResponse {
+        from,
+        to,
+        bucket,
+        totals,
+        series,
+        models,
+    }))
+}
+
+/// 上游标识只向运维账号开放，租户继续使用请求入口维度的指标。
+pub async fn admin_direct_models(
+    auth: OperatorAuth,
+    State(state): State<AppState>,
+    query: Result<Query<DirectModelsQuery>, QueryRejection>,
+) -> Result<Json<DirectMetricsResponse>, ApiError> {
+    auth.require(OperatorRole::Viewer)?;
+    let Query(q) = query.map_err(query_rejected)?;
+    summarize_direct_models(&state, q).await
 }
 
 #[cfg(test)]

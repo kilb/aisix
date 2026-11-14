@@ -148,17 +148,16 @@ export function Overview({ operator, onGoto }: TabProps) {
   return (
     <>
       <PageHeader
-        eyebrow="OPERATIONS · 当前环境"
         title="运行概况"
         dataLead={s ? <>当前有 {fmtInt(s.online_instances)} 个在线网关，{fmtInt(s.pending)} 个资源待下发、{fmtInt(s.propagating)} 个资源下发中。{error && "刷新失败，以下保留最近成功结果。"}</> : "查看环境、网关心跳、配置下发与最近 24 小时的计价健康。"}
       />
       <BentoGrid aria-label="运行概况">
         <div className={span.d12}>
-          <div className="mb-5 flex flex-wrap items-end justify-between gap-4">
+          <div className="metric-toolbar">
             <div className="min-w-0">
               <p className="text-caption font-medium text-muted">API 请求统计</p>
             </div>
-            <div className="flex max-w-full flex-wrap items-end gap-3">
+            <div className="metric-toolbar-controls">
               <label className="f filter m-0">
                 <span>统计范围</span>
                 <select value={metrics.range} onChange={(e) => setMetrics(metricsWindow(e.target.value as MetricsRange))}>

@@ -467,6 +467,7 @@ mod tests {
 
     fn answer(finish_reason: FinishReason) -> ChatResponse {
         ChatResponse {
+            native_envelope: None,
             logprobs: None,
             more_choices: Vec::new(),
             id: "id".to_string(),
@@ -675,13 +676,13 @@ mod tests {
 
     // 固定当前编码的三个样本，使同版本隔离断言不能借跨版本差异通过。
     const VERSIONED_API_KEY_FINGERPRINT: (&str, &str, &str) = (
-        "6c7b66253d65c1a2bd3fc79b2b8a8848",
-        "d86454f622e63d43cf73bca59f2566e1",
+        "2005fbcca82ec13753f6001a8a7f4ede",
+        "8b109896d6c80cb670885a6c4c6bd78a",
         "dc3096e47cbc7cd79cc54ba3cf79bc7e",
     );
     const VERSIONED_ENV_FINGERPRINT: (&str, &str, &str) = (
-        "d67694138a84f430520f3b5a6307d4c4",
-        "000c1e172ff34f69aa87e8c75c0b22a3",
+        "7a01890a70dde257ea70dbfbefafcb72",
+        "ffc20f4c3df07cf0ba98a4f1ab981a78",
         "87cd351069ced1c945daf7b4f40e916a",
     );
 

@@ -14,6 +14,7 @@
 //! Only OpenAI models support this endpoint. Non-OpenAI models receive a
 //! 400 with an explanatory message.
 
+use crate::request_json::Json;
 use aisix_gateway::{ChatFormat, ChatMessage, Role};
 use aisix_obs::{
     content_capture_cap, AccessLog, CapturedContent, LatencyLabels, UsageEvent, UsageLabels,
@@ -21,7 +22,6 @@ use aisix_obs::{
 use axum::extract::State;
 use axum::http::{HeaderName, HeaderValue};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use futures::StreamExt;
 use serde_json::Value;
 use std::borrow::Cow;
@@ -38,6 +38,7 @@ use crate::chat::sanitize_tag;
 use crate::client_ip::ClientContext;
 use crate::error::ProxyError;
 use crate::guardrail_stream::{synth_chat_response, EosOutputScan};
+use crate::native_api::responses::{NativeResponseOperation, ResponseOperationKind};
 use crate::state::ProxyState;
 use crate::usage_attr::{total_tokens_with_cache, ResolvedPk};
 
@@ -327,6 +328,10 @@ impl From<ProxyError> for ResponsesDispatchError {
 /// the ones below.
 #[derive(Default, Clone)]
 struct ResponseUsage {
+    /// HTTP 接受或查询日志由本请求收尾，原后台推理的 final 归持久终态所有。
+    defer_inference_final: bool,
+    inference_stage: Option<aisix_core::native_objects::InferenceStage>,
+    native_operation_id: Option<Uuid>,
     /// `true` once the upstream emitted a successful semantic terminal event,
     /// i.e. `response.completed` or `response.incomplete`. Stays `false` when
     /// the consumer went away first, which is what the telemetry closure turns
@@ -339,6 +344,9 @@ struct ResponseUsage {
     reached_end: bool,
     prompt_tokens: u32,
     completion_tokens: u32,
+    /// 原生 Responses 逐项保留报告状态；明确的零不能变成本地估算。
+    prompt_tokens_reported: bool,
+    completion_tokens_reported: bool,
     /// True when any token counter was filled by the local estimator
     /// because the upstream reported no usage (#1074).
     usage_estimated: bool,
@@ -347,10 +355,13 @@ struct ResponseUsage {
     /// `usage.output_tokens_details.reasoning_tokens`. Zero for
     /// models that don't expose this.
     reasoning_tokens: u32,
+    /// 上游明确报告的收费搜索次数，独立于模型 token 与输出动作。
+    web_search_requests: u32,
     /// OpenAI prompt-cache hit count, subset of `prompt_tokens`,
     /// surfaced via `usage.input_tokens_details.cached_tokens`.
     cached_prompt_tokens: u32,
     cache_write_tokens: Option<u32>,
+    cache_usage_reported: Option<bool>,
     modality: aisix_gateway::ModalityTokens,
     cache_creation_ttl: aisix_gateway::CacheCreationTtl,
     /// Anthropic `cache_creation_input_tokens` (cache write). Always 0 on
@@ -389,9 +400,56 @@ struct ResponseUsage {
     /// The tier the upstream reported serving on: the Response object's
     /// `service_tier`, or the bridged upstream's on the #825 path.
     service_tier: Option<String>,
-    /// The upstream failure that ended a stream after its `200` went out.
-    /// `None` on the non-streaming paths, whose failures never get this far.
+    /// The failure ending a committed stream or local post-accept work.
+    /// An accepted non-streaming answer keeps its reported usage here even
+    /// when persisting the response identity subsequently fails.
     failure: Option<crate::attempt::StreamFailure>,
+}
+
+impl ResponseUsage {
+    fn clear_tokens(&mut self) {
+        self.prompt_tokens = 0;
+        self.completion_tokens = 0;
+        self.prompt_tokens_reported = false;
+        self.completion_tokens_reported = false;
+        self.reasoning_tokens = 0;
+        self.web_search_requests = 0;
+        self.cached_prompt_tokens = 0;
+        self.cache_write_tokens = None;
+        self.cache_usage_reported = None;
+        self.modality = Default::default();
+        self.cache_creation_ttl = Default::default();
+        self.cache_creation_tokens = 0;
+        self.cache_read_tokens = 0;
+        self.upstream_total_tokens = 0;
+        self.reasoning_folded_into_completion = 0;
+        self.usage_estimated = false;
+    }
+
+    fn estimate_unreported_tokens(
+        &mut self,
+        estimator: &crate::token_estimate::Estimator,
+        output_text: &str,
+    ) {
+        if !self.prompt_tokens_reported
+            && self.prompt_tokens == 0
+            && self.cache_read_tokens == 0
+            && self.cache_creation_tokens == 0
+        {
+            let estimate = estimator.count_prompt();
+            if estimate > 0 {
+                self.prompt_tokens = estimate;
+                self.usage_estimated = true;
+            }
+        }
+        if !self.completion_tokens_reported && self.completion_tokens == 0 {
+            let estimate = estimator.count_output(output_text);
+            if estimate > 0 {
+                self.completion_tokens = estimate;
+                self.usage_estimated = true;
+            }
+        }
+    }
 }
 
 pub async fn responses(
@@ -400,10 +458,10 @@ pub async fn responses(
     client: ClientContext,
     // Result-wrapped so an extractor-layer 413 maps to the OpenAI
     // envelope — see completions.rs.
-    body: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
+    body: Result<Json<Value>, crate::request_json::JsonRejection>,
 ) -> Response {
     let started = Instant::now();
-    let Json(mut body) = match body {
+    let Json(body) = match body {
         Ok(json) => json,
         // Answer through `reject` — see completions.rs.
         Err(rej) => {
@@ -422,10 +480,28 @@ pub async fn responses(
             );
         }
     };
+    responses_operation(
+        state,
+        auth,
+        client,
+        body,
+        NativeResponseOperation::default(),
+    )
+    .await
+}
+
+pub(crate) async fn responses_operation(
+    state: ProxyState,
+    auth: AuthenticatedKey,
+    client: ClientContext,
+    mut body: Value,
+    operation: NativeResponseOperation,
+) -> Response {
+    let started = Instant::now();
     // Before anything reads the body: no gateway context tag may reach a
     // guardrail, a log, or an upstream. In platform mode the tags are sealed
     // to the tenant they were handed to: the key's team, or the key itself.
-    let affinity = match state.platform() {
+    let mut affinity = match state.platform() {
         Some(platform) => {
             let owner = crate::platform::tenant_owner(&auth);
             let tenant = match crate::responses_affinity::TenantSeal::new(platform, &owner) {
@@ -434,8 +510,8 @@ pub async fn responses(
                 Err(err) => {
                     return crate::reject::reject_before_dispatch(
                         &state,
-                        "POST",
-                        "/v1/responses",
+                        operation.method().as_str(),
+                        operation.path(),
                         &client.request_id,
                         Some(&auth.entry.id),
                         started,
@@ -444,20 +520,67 @@ pub async fn responses(
                     );
                 }
             };
-            let mut affinity = crate::responses_affinity::ContextAffinity::unwrap_sealed_request(
-                &mut body, tenant,
-            );
-            // The item ids a client echoes from an earlier answer leave here
-            // sealed; the upstream gets back the ones it issued, for the
-            // tenant they were handed to only. An item reference that names
-            // anything else is refused below, with the other stored objects.
-            affinity.note_unopened_item_reference(crate::opaque_id::unseal_responses_input(
-                platform, &owner, &mut body,
-            ));
-            affinity
+            crate::responses_affinity::ContextAffinity::unwrap_sealed_request(&mut body, tenant)
         }
         None => crate::responses_affinity::ContextAffinity::unwrap_request(&mut body),
     };
+    if affinity.needs_registered_previous()
+        || (state.platform().is_some()
+            && body
+                .get("previous_response_id")
+                .is_some_and(Value::is_string))
+    {
+        let admitted = match body.get("previous_response_id").and_then(Value::as_str) {
+            Some(id) => crate::native_api::origin::resolve_reference(&state, &auth, id).await,
+            None => Err(ProxyError::ResponseNotFound),
+        };
+        match admitted {
+            Ok(reference) => match reference.origin {
+                Some(origin) if reference.record.is_some() => {
+                    affinity.admit_registered_response(origin);
+                }
+                _ => {
+                    return crate::reject::reject_before_dispatch(
+                        &state,
+                        operation.method().as_str(),
+                        operation.path(),
+                        &client.request_id,
+                        Some(&auth.entry.id),
+                        started,
+                        crate::reject::Envelope::OpenAi,
+                        ProxyError::ResponseNotFound,
+                    )
+                }
+            },
+            Err(error) => {
+                return crate::reject::reject_before_dispatch(
+                    &state,
+                    operation.method().as_str(),
+                    operation.path(),
+                    &client.request_id,
+                    Some(&auth.entry.id),
+                    started,
+                    crate::reject::Envelope::OpenAi,
+                    error,
+                )
+            }
+        }
+    }
+    if let Err(error) =
+        crate::native_api::origin::admit_input_references(&state, &auth, &mut body, &mut affinity)
+            .await
+    {
+        return crate::reject::reject_before_dispatch(
+            &state,
+            operation.method().as_str(),
+            operation.path(),
+            &client.request_id,
+            Some(&auth.entry.id),
+            started,
+            crate::reject::Envelope::OpenAi,
+            error,
+        );
+    }
     let request_id = client.request_id.clone();
     crate::span_facts::note_request(
         &client,
@@ -499,6 +622,7 @@ pub async fn responses(
         &state,
         &snapshot,
         &auth,
+        &operation,
         &mut body,
         &affinity,
         &request_id,
@@ -559,8 +683,8 @@ pub async fn responses(
                 // that emitter's status, tokens and message (AISIX-Cloud#1571).
                 crate::attribution::defer_access_log(
                     crate::attribution::PendingAccessLog::new(
-                        "POST",
-                        "/v1/responses",
+                        operation.method().as_str(),
+                        operation.path(),
                         &request_id,
                         &api_key_id,
                         started,
@@ -569,7 +693,7 @@ pub async fn responses(
                     .with_routing(&success.routing),
                     crate::request_metrics::PendingRequestMetrics::at_stream_end(
                         &state,
-                        "/v1/responses",
+                        operation.path(),
                         crate::request_metrics::Caller::new(&auth),
                         request_upstream,
                         started,
@@ -577,6 +701,8 @@ pub async fn responses(
                 );
             } else {
                 emit_access_log(
+                    operation.method().as_str(),
+                    operation.path(),
                     &model_name,
                     &success.provider,
                     &api_key_id,
@@ -592,7 +718,7 @@ pub async fn responses(
                 );
                 crate::request_metrics::record(
                     &state,
-                    "/v1/responses",
+                    operation.path(),
                     crate::request_metrics::Caller::new(&auth),
                     request_upstream,
                     terminal_status,
@@ -603,6 +729,7 @@ pub async fn responses(
             // Per #655: one zero-token UsageEvent per failed attempt that
             // preceded the winner (non-streaming failover).
             emit_failed_attempts(
+                &operation,
                 &state,
                 &snapshot,
                 &request_id,
@@ -634,6 +761,13 @@ pub async fn responses(
             // against a double-emit; `usage` is `None` on that path.
             if !success.usage_handled_by_stream {
                 if let Some(mut usage) = success.usage {
+                    if usage.inference_stage.is_none() {
+                        usage.inference_stage = Some(if operation.bills_tokens() {
+                            aisix_core::native_objects::InferenceStage::Attempt
+                        } else {
+                            aisix_core::native_objects::InferenceStage::Management
+                        });
+                    }
                     // Non-streaming: the caller waited for the complete
                     // response, which is exactly the request clock. Streamed
                     // responses stamp this from inside the stream and never
@@ -724,6 +858,8 @@ pub async fn responses(
             let attributed = crate::attribution::current().unwrap_or_default();
             let last_target = crate::request_metrics::LastTarget::new(&snapshot, &attributed);
             emit_access_log(
+                operation.method().as_str(),
+                operation.path(),
                 &model_name,
                 last_target.provider(),
                 &api_key_id,
@@ -744,7 +880,7 @@ pub async fn responses(
             // key's successes landed on the real one.
             crate::request_metrics::record(
                 &state,
-                "/v1/responses",
+                operation.path(),
                 crate::request_metrics::Caller::new(&auth),
                 last_target.upstream(
                     metric_model.as_ref(),
@@ -774,6 +910,7 @@ pub async fn responses(
             // Per #655: emit one zero-token UsageEvent per FAILED attempt so
             // the dashboard's Logs tab surfaces each failed upstream try.
             emit_failed_attempts(
+                &operation,
                 &state,
                 &snapshot,
                 &request_id,
@@ -796,6 +933,7 @@ pub async fn responses(
             // was already emitted.
             if routing.attempts.is_empty() {
                 emit_zero_token_event(
+                    &operation,
                     &state,
                     &snapshot,
                     &request_id,
@@ -835,6 +973,7 @@ async fn dispatch(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
+    operation: &NativeResponseOperation,
     // `&mut` so mask-action PII guardrails (#932) can rewrite the request
     // text in place before it reaches the upstream.
     body: &mut Value,
@@ -894,9 +1033,19 @@ async fn dispatch(
 
     // Platform mode: nothing the request names may be an object stored
     // upstream for another tenant. A container it was handed is its own.
-    crate::opaque_id::with_own_containers(state.platform(), auth, body, |body| {
-        crate::stored_refs::refuse_in_responses(state.platform(), body)
-    })
+    let durable_background = operation.is_create()
+        && state.platform().is_some()
+        && state.native_objects.is_some()
+        && body.get("background").and_then(Value::as_bool) == Some(true);
+    crate::native_api::openai_uploads::admit_responses_files(
+        state,
+        snapshot,
+        auth,
+        client,
+        &affinity.stored_object_check_body(body),
+        durable_background,
+    )
+    .await
     .map_err(|err| affinity.at_caller_position(err))?;
     affinity.refuse_unopened_item_reference()?;
 
@@ -1040,23 +1189,24 @@ async fn dispatch(
     // a stream has no stored shape yet. Keyed on the post-redaction body —
     // what actually goes upstream — so entries follow the bytes the provider
     // saw.
-    let cache_gate = if body.get("stream").and_then(Value::as_bool) == Some(true) {
-        None
-    } else {
-        crate::response_cache::BodyCache::resolve(
-            state,
-            snapshot,
-            auth,
-            client,
-            "/v1/responses",
-            &model_name,
-            &model_entry.value,
-            || match crate::response_cache::continuation_partition(state, auth) {
-                Some(groups) => format!("{body}\nallowed_provider_groups: {groups}"),
-                None => body.to_string(),
-            },
-        )
-    };
+    let cache_gate =
+        if !operation.is_create() || body.get("stream").and_then(Value::as_bool) == Some(true) {
+            None
+        } else {
+            crate::response_cache::BodyCache::resolve(
+                state,
+                snapshot,
+                auth,
+                client,
+                "/v1/responses",
+                &model_name,
+                &model_entry.value,
+                || match crate::response_cache::continuation_partition(state, auth) {
+                    Some(groups) => format!("{body}\nallowed_provider_groups: {groups}"),
+                    None => body.to_string(),
+                },
+            )
+        };
     if let Some(gate) = cache_gate.as_ref() {
         crate::routing::check_group_access(
             snapshot,
@@ -1203,7 +1353,10 @@ async fn dispatch(
     // verbatim passthrough; every other target is bridged through ChatFormat
     // (#825), so a group can mix and fail over across both kinds.
     let budget_gate = crate::budget::gate(state, snapshot);
-    let attempt_models = crate::routing::resolve_attempt_models(
+    let native_capability = |model: &aisix_core::Model| {
+        crate::dispatch::serves_natively(snapshot, model, aisix_core::ApiSurface::Responses)
+    };
+    let mut attempt_models = crate::routing::resolve_attempt_models(
         &state.routing,
         &state.runtime_status,
         &state.pricing,
@@ -1218,10 +1371,30 @@ async fn dispatch(
             source_ip: &client.source_ip,
             context_origin: affinity.origin(),
             budget: Some(&budget_gate),
-            serves: None,
+            serves: (!operation.is_create()
+                || durable_background
+                || affinity.registered_origin().is_some())
+            .then_some(&native_capability as &dyn Fn(&aisix_core::Model) -> bool),
             allowed_groups: &auth.key().allowed_provider_groups,
         },
     )?;
+    if let Some(origin) = affinity.registered_origin() {
+        // 当前模型仍按自身 ACL 解析；已存历史只在原账号边界内可读。
+        crate::native_api::origin::verify_origin(state, snapshot, origin)?;
+        let provider_key_id = origin.provider_key_id.to_string();
+        attempt_models.retain(|target| {
+            target.model.provider_key_id.as_deref() == Some(provider_key_id.as_str())
+        });
+        if attempt_models.is_empty() {
+            return Err(ProxyError::ResponseNotFound.into());
+        }
+    }
+    if let Some(origin) = &operation.origin {
+        attempt_models.retain(|target| target.id == origin.model_id.to_string());
+    }
+    if !operation.is_create() && attempt_models.is_empty() {
+        return Err(ProxyError::ProviderUnavailable.into());
+    }
     let retry_on_429 = model_entry
         .value
         .routing
@@ -1265,12 +1438,17 @@ async fn dispatch(
         // Same-target retries before failing over, honoured exactly like
         // chat.rs / messages.rs (#641) and resolved per target so a direct
         // model gets a budget too.
-        let budget = crate::routing::effective_retries(
+        let mut budget = crate::routing::effective_retries(
             &target.model,
             crate::routing::group_retries_of(&model_entry.value),
             state.default_retries,
             target_idx + 1 < attempt_models.len(),
         );
+        // 原生子操作只向选定账号发送一次；对象生命周期不能跨账号重试。
+        if !operation.is_create() {
+            budget.attempts = 0;
+        }
+        operation.validate_target(state, snapshot, &target.id, &target.model)?;
         // Deadlines resolved target → group → deployment default, next to
         // the retry budget so the two knobs stay in lockstep.
         let timeouts = crate::routing::effective_timeouts(
@@ -1384,6 +1562,7 @@ async fn dispatch(
                 responses_to_target(
                     state,
                     snapshot,
+                    operation,
                     attempt_body,
                     mark,
                     &target.model,
@@ -1404,6 +1583,10 @@ async fn dispatch(
                     *failure_content_safe_out,
                 )
                 .await
+            } else if !operation.is_create() {
+                Err(ProxyError::TargetRefused(
+                    "this operation requires a native Responses endpoint".into(),
+                ))
             } else {
                 responses_cross_provider_to_target(
                     state,
@@ -1439,13 +1622,22 @@ async fn dispatch(
                         .as_ref()
                         .and_then(|u| u.failure.as_ref())
                         .map(|failure| failure.status);
+                    let local_post_accept_failure = success
+                        .usage
+                        .as_ref()
+                        .and_then(|usage| usage.failure.as_ref())
+                        .is_some_and(|failure| failure.error_class == "dependency_unavailable");
                     let record = AttemptRecord {
                         index: idx,
                         kind,
                         target_model: target_model.clone(),
                         target_model_id: target.id.clone(),
                         provider_key_id: pk_id.clone(),
-                        status: success.response.status().as_u16(),
+                        status: if local_post_accept_failure {
+                            200
+                        } else {
+                            success.response.status().as_u16()
+                        },
                         success: true,
                         error_class: String::new(),
                         error_message: String::new(),
@@ -1455,7 +1647,9 @@ async fn dispatch(
                     if success.usage_handled_by_stream {
                         routing.stage(record);
                         deferred_attempt.install(&routing, idx);
-                    } else if let Some(status) = terminal_status {
+                    } else if let Some(status) =
+                        terminal_status.filter(|_| !local_post_accept_failure)
+                    {
                         // The handler emits the buffered winner's billed
                         // UsageEvent below. Keep that winner as the single
                         // attempt event, but classify the deployment metric
@@ -1504,10 +1698,12 @@ async fn dispatch(
                     return Ok(success);
                 }
                 Err(e) => {
-                    let retryable = matches!(
-                        &e,
-                        ProxyError::Bridge(be) if crate::routing::is_retryable(be, retry_on_429, fallback_statuses)
-                    );
+                    let retryable = operation.is_create()
+                        && crate::responses_ws::may_retry()
+                        && matches!(
+                            &e,
+                            ProxyError::Bridge(be) if crate::routing::is_retryable(be, retry_on_429, fallback_statuses)
+                        );
                     crate::routing::log_attempt_failure(
                         request_id,
                         &target.model.display_name,
@@ -1549,7 +1745,7 @@ async fn dispatch(
                     // same target until `retries` is exhausted, then fall over
                     // to the next target (the outer loop advances).
                     if !retryable {
-                        if unusable {
+                        if unusable && operation.is_create() {
                             break;
                         }
                         break 'targets;
@@ -1815,6 +2011,7 @@ fn responses_item_without_handles(item: &Value) -> Value {
 async fn responses_to_target(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
+    operation: &NativeResponseOperation,
     body: &Value,
     // The context tags this attempt's response carries back.
     mark: crate::responses_affinity::ResponseMark,
@@ -1874,6 +2071,11 @@ async fn responses_to_target(
     let api_key = crate::dispatch::require_api_key(&pk_entry.value, model)?.to_string();
     let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
 
+    let asynchronous = operation.is_create()
+        && state.native_objects.is_some()
+        && body.get("background").and_then(Value::as_bool) == Some(true);
+    let bill_tokens = operation.bills_tokens() && !asynchronous;
+    let estimate_usage = operation.is_create() && bill_tokens;
     // Only the outbound wire bytes outlive this block: the caller keeps its
     // body for fail-over, and reqwest holds these until the response head,
     // so a `Value` copy alive across the await would be a third copy of the
@@ -1944,25 +2146,79 @@ async fn responses_to_target(
         }
     };
 
-    let url = aisix_gateway::url_cache::cached_endpoint_url(
-        &pk_entry.id,
-        "proxy/responses",
-        // Every resolve_base_url_for input (#1017) via the shared constructor.
-        &crate::dispatch::pk_surface_url_fingerprint(
-            &pk_entry.value,
-            aisix_core::ApiSurface::Responses,
-        ),
-        || {
-            let base = crate::dispatch::resolve_base_url_for(
+    // 最终模型正文定型后保存文本标量；真正发送前仍先固定持久归属。
+    let mut registration = if operation.is_create() {
+        crate::native_api::origin::begin_response(
+            state,
+            snapshot,
+            api_key_id,
+            requested_model,
+            model_id,
+            &pk_entry,
+            &upstream_model,
+            body,
+            request_id,
+            if asynchronous {
+                let io = aisix_gateway::upstream_io::UpstreamIoObserver::new(
+                    aisix_gateway::upstream_io::Protocol::Responses,
+                );
+                io.observe_request_body(&body_bytes);
+                io.finish_request();
+                io.snapshot().input_text
+            } else {
+                None
+            },
+        )
+        .await?
+    } else if matches!(
+        operation.kind,
+        ResponseOperationKind::Retrieve
+            | ResponseOperationKind::Cancel
+            | ResponseOperationKind::InputItems
+    ) {
+        match operation.record.as_ref() {
+            Some(record) => crate::native_api::origin::resume_response(state, api_key_id, record)?,
+            None => None,
+        }
+    } else {
+        None
+    };
+    let inference_stage = if !operation.bills_tokens() {
+        aisix_core::native_objects::InferenceStage::Management
+    } else if asynchronous {
+        aisix_core::native_objects::InferenceStage::Accepted
+    } else {
+        aisix_core::native_objects::InferenceStage::Attempt
+    };
+    let native_operation_id = registration
+        .as_ref()
+        .map(crate::native_api::origin::OriginRegistration::operation_id)
+        .or_else(|| {
+            operation
+                .record
+                .as_ref()
+                .and_then(|record| record.operation_id)
+        });
+
+    let create_url = if operation.is_create() && operation.query.is_empty() {
+        Some(aisix_gateway::url_cache::cached_endpoint_url(
+            &pk_entry.id,
+            "proxy/responses",
+            &crate::dispatch::pk_surface_url_fingerprint(
                 &pk_entry.value,
                 aisix_core::ApiSurface::Responses,
-            )?;
-            Ok::<_, crate::error::ProxyError>(crate::dispatch::build_openai_url(
-                &base,
-                "/responses",
-            ))
-        },
-    )?;
+            ),
+            || {
+                let base = crate::dispatch::resolve_base_url_for(
+                    &pk_entry.value,
+                    aisix_core::ApiSurface::Responses,
+                )?;
+                Ok::<_, ProxyError>(crate::dispatch::build_openai_url(&base, "/responses"))
+            },
+        )?)
+    } else {
+        None
+    };
 
     // Build headers explicitly so the PK's `request.default_headers` and
     // `request.forward_client_headers` can inject operator/client headers.
@@ -1997,11 +2253,31 @@ async fn responses_to_target(
         ),
     );
 
+    // 协议协商和流恢复头不改变账号边界；账号头只来自配置。
+    for name in ["openai-beta", "last-event-id"] {
+        if let Some(value) = client_ctx.headers.get(name) {
+            headers.insert(HeaderName::from_static(name), value.clone());
+        }
+    }
     let client = crate::http_client::client_for(pk_entry.value.upstream_connection().as_ref());
-    let mut req = url
-        .post_on(&client)
-        .headers(headers)
-        .body(body_bytes.clone());
+    let mut req = if let Some(url) = create_url {
+        url.post_on(&client)
+    } else {
+        let base = crate::dispatch::resolve_base_url_for(
+            &pk_entry.value,
+            aisix_core::ApiSurface::Responses,
+        )?;
+        let mut url = crate::dispatch::build_openai_url(&base, &operation.upstream_path());
+        if !operation.query.is_empty() {
+            url.push(if url.contains('?') { '&' } else { '?' });
+            url.push_str(&operation.query);
+        }
+        client.request(operation.method(), url)
+    }
+    .headers(headers);
+    if operation.sends_body() {
+        req = req.body(body_bytes.clone());
+    }
     // #554: non-streaming gets the E2E request timeout via reqwest's
     // request-level timeout. Streaming must NOT use it (it would cap the
     // whole stream); the streaming branch below enforces the per-chunk
@@ -2022,21 +2298,20 @@ async fn responses_to_target(
     // request-level timeout can't be used — it would cap the whole stream);
     // non-streaming relies on the request-level timeout set above.
     let connect_deadline = if is_stream { timeouts.stream } else { None };
-    let upstream_resp =
-        crate::stream_timeout::send_with_deadline(req, connect_deadline, send_started)
-            .await
-            .map_err(|be| {
-                if be.http_status() >= 500 {
-                    state.health.record_failure(&model.display_name);
-                }
-                crate::cooldown::note_failure(
-                    &state.runtime_status,
-                    model_id,
-                    model.cooldown.as_ref(),
-                    be,
-                )
-            })
-            .map_err(ProxyError::Bridge)?;
+    let upstream_resp = crate::responses_ws::send_native(req, connect_deadline, send_started)
+        .await
+        .map_err(|be| {
+            if be.http_status() >= 500 {
+                state.health.record_failure(&model.display_name);
+            }
+            crate::cooldown::note_failure(
+                &state.runtime_status,
+                model_id,
+                model.cooldown.as_ref(),
+                be,
+            )
+        })
+        .map_err(ProxyError::Bridge)?;
     // Serialized once the upstream has answered, not before: a copy made
     // up front would be alive for the whole upstream wait.
     let captured_prompt = content_cap.map(|_| serde_json::to_string(body).unwrap_or_default());
@@ -2117,13 +2392,71 @@ async fn responses_to_target(
                 upstream_resp.bytes_stream(),
                 stream_budget,
             ));
+        // 终态计量先于本地归属等待保存，不将未绑定的帧释放给调用方。
+        let observed_usage = Arc::new(std::sync::Mutex::new(None::<ResponseUsage>));
+        let observed_usage_c = Arc::clone(&observed_usage);
+        let observed_state = state.clone();
+        let observed_model_id = model_id.to_owned();
+        let observed_defer = asynchronous || operation.record.is_some();
+        let wrapped = crate::native_api::origin::register_stream_observed(
+            registration.take(),
+            wrapped,
+            move |event| {
+                if let Some(mut usage) = parse_responses_terminal_usage(event) {
+                    if bill_tokens {
+                        crate::attribution::note_answered_usage(
+                            usage.answered(&observed_state.snapshot.load(), &observed_model_id),
+                        );
+                    } else {
+                        usage.clear_tokens();
+                        usage.defer_inference_final = observed_defer;
+                    }
+                    *observed_usage_c
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(usage);
+                }
+            },
+        );
         let body_stream: RawResponsesByteStream = if timeouts.stream_configured {
             let mut wrapped = wrapped;
             let first_bytes = match wrapped.next().await {
                 Some(Ok(b)) => b,
                 Some(Err(e)) => {
                     let err = e.into_bridge(send_started);
-                    state.health.record_failure(&model.display_name);
+                    if matches!(
+                        err,
+                        aisix_gateway::BridgeError::DependencyUnavailable
+                            | aisix_gateway::BridgeError::UpstreamDecode(_)
+                    ) {
+                        let mut usage = observed_usage
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .take()
+                            .unwrap_or_default();
+                        usage.failure = Some(crate::attempt::StreamFailure::from_bridge(&err));
+                        usage.defer_inference_final = observed_defer;
+                        usage.inference_stage = Some(inference_stage);
+                        usage.native_operation_id = native_operation_id;
+                        return Ok(ResponseDispatchSuccess {
+                            response: ProxyError::Bridge(err).into_response(),
+                            provider: provider_label,
+                            usage: Some(usage),
+                            model_id: model_id.to_owned(),
+                            provider_key_id,
+                            upstream_model,
+                            routing: RoutingTelemetry::default(),
+                            guardrail_blocked: false,
+                            guardrail_block_message: String::new(),
+                            usage_handled_by_stream: false,
+                            output_redactions: crate::redact::RedactionCounts::new(),
+                            output_monitor_hits: Vec::new(),
+                            captured_content: None,
+                            cache: crate::response_cache::CacheTelemetry::default(),
+                        });
+                    }
+                    if !matches!(err, aisix_gateway::BridgeError::DependencyUnavailable) {
+                        state.health.record_failure(&model.display_name);
+                    }
                     if let Some((ttl, reason)) =
                         crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
                     {
@@ -2146,6 +2479,15 @@ async fn responses_to_target(
             // the first frame fails over like a failed status would, as it
             // does on the bridged paths.
             if let Some(err) = crate::dispatch::first_sse_frame_json(&first_bytes)
+                .filter(|frame| {
+                    // 已有 Response 身份代表受理；同步、后台和续接都不能因首帧失败重新派发。
+                    !frame.get("response").is_some_and(|response| {
+                        response
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .is_some_and(|id| !id.is_empty())
+                    })
+                })
                 .and_then(|frame| responses_in_band_error(&frame))
             {
                 if err.http_status() >= 500 {
@@ -2235,6 +2577,7 @@ async fn responses_to_target(
             &upstream_model,
             crate::token_estimate::PromptInput::ResponsesWire(body_bytes.clone()),
         );
+        let defer_inference_final = asynchronous || operation.record.is_some();
         let held_verdict = Arc::new(std::sync::OnceLock::new());
         let held_verdict_c = Arc::clone(&held_verdict);
         let on_complete =
@@ -2243,6 +2586,21 @@ async fn responses_to_target(
                   output_hits: Vec<aisix_core::GuardrailMonitorHit>,
                   output_capture_safe: bool,
                   stream_failure: Option<crate::stream_timeout::RawStreamFailure>| {
+                if !usage.reached_end {
+                    if let Some(mut reported) = observed_usage
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take()
+                    {
+                        reported.upstream_ttft_ms = usage.upstream_ttft_ms;
+                        reported.upstream_ttft = usage.upstream_ttft;
+                        reported.downstream_latency_ms = usage.downstream_latency_ms;
+                        reported.failure = usage.failure.take();
+                        // 已报告计量不等于调用方收到终态；绑定等待中的断开仍记为取消。
+                        reported.reached_end = usage.reached_end;
+                        usage = reported;
+                    }
+                }
                 let held: Option<&HeldResponseVerdict> = held_verdict_c.get();
                 let refusal = held.and_then(|held| held.refusal.as_ref());
                 let refused = refusal.is_some();
@@ -2254,22 +2612,15 @@ async fn responses_to_target(
                 // that omits usage) fills the missing counters from the
                 // request + the assembled output text, BEFORE the TPM
                 // accounting and the emit below.
-                if usage.prompt_tokens == 0 || usage.completion_tokens == 0 {
-                    let filled = crate::token_estimate::fill_missing(
-                        &estimator_c,
-                        usage.prompt_tokens,
-                        usage
-                            .cache_read_tokens
-                            .saturating_add(usage.cache_creation_tokens),
-                        usage.completion_tokens,
-                        Some(&out_text),
-                    );
-                    if filled.estimated {
-                        usage.prompt_tokens = filled.prompt_tokens;
-                        usage.completion_tokens = filled.completion_tokens;
-                        usage.usage_estimated = true;
-                    }
+                if estimate_usage {
+                    usage.estimate_unreported_tokens(&estimator_c, &out_text);
                 }
+                if !bill_tokens {
+                    usage.clear_tokens();
+                    usage.defer_inference_final = defer_inference_final;
+                }
+                usage.inference_stage = Some(inference_stage);
+                usage.native_operation_id = native_operation_id;
                 // #688: apply the terminal token cost to TPM/TPD and release the
                 // concurrency hold now the stream has ended (sync analog of the
                 // reservation's async `commit_tokens`, which this closure can't await).
@@ -2296,10 +2647,19 @@ async fn responses_to_target(
                     attempt_started,
                 );
                 if let Some(deferred) = &attempt_c.deferred {
+                    let local_post_accept_failure = matches!(
+                        stream_failure,
+                        Some(crate::stream_timeout::RawStreamFailure::DependencyUnavailable)
+                    );
                     deferred.finish(
                         &state_c,
-                        terminal.status,
-                        terminal.error_class.is_empty() && terminal.status < 400,
+                        if local_post_accept_failure {
+                            200
+                        } else {
+                            terminal.status
+                        },
+                        local_post_accept_failure
+                            || (terminal.error_class.is_empty() && terminal.status < 400),
                     );
                 }
                 let mut terminal_attempt = attempt_c;
@@ -2419,6 +2779,10 @@ async fn responses_to_target(
             crate::sse_keepalive::with_heartbeat(parsed_stream, crate::sse_keepalive::interval()),
         ));
         apply_passthrough_headers(&mut response, &headers, request_id, state.platform());
+        *response.status_mut() = status;
+        if !operation.is_create() {
+            crate::native_api::responses::relay_headers(&mut response, &headers);
+        }
 
         Ok(ResponseDispatchSuccess {
             response,
@@ -2440,26 +2804,27 @@ async fn responses_to_target(
             cache: crate::response_cache::CacheTelemetry::default(),
         })
     } else {
-        let json_body: Value =
-            crate::dispatch::json_body_within(upstream_resp, buffered_body_deadline)
+        let upstream_headers = upstream_resp.headers().clone();
+        let (json_body, original_bytes) = if operation.is_create() {
+            let json = crate::dispatch::json_body_within(upstream_resp, buffered_body_deadline)
                 .await
-                .and_then(|body| match responses_body_in_band_error(&body) {
-                    Some(err) => Err(err),
-                    None => Ok(body),
-                })
-                .map_err(|be| {
-                    state.health.record_failure(&model.display_name);
-                    crate::cooldown::note_failure(
-                        &state.runtime_status,
-                        model_id,
-                        model.cooldown.as_ref(),
-                        be,
-                    )
-                })
                 .map_err(ProxyError::Bridge)?;
-        state.health.record_success(&model.display_name);
-        state.runtime_status.mark_healthy(model_id, attempt_started);
-
+            (json, None)
+        } else {
+            let (json, bytes) = crate::native_api::responses::read_body(
+                upstream_resp,
+                buffered_body_deadline,
+                matches!(
+                    operation.kind,
+                    ResponseOperationKind::Delete | ResponseOperationKind::Cancel
+                ),
+            )
+            .await?;
+            (json, Some(bytes))
+        };
+        if let Some(error) = responses_body_in_band_error(&json_body) {
+            return Err(ProxyError::Bridge(error));
+        }
         // Extract the upstream-reported usage block for telemetry
         // emission. Pulled here (before the response is moved into
         // `Json::into_response`) so the success struct can carry
@@ -2480,39 +2845,95 @@ async fn responses_to_target(
             if u.service_tier.is_none() {
                 u.service_tier = response_service_tier(&json_body);
             }
-            if u.prompt_tokens == 0 || u.completion_tokens == 0 {
+            if estimate_usage && (!u.prompt_tokens_reported || !u.completion_tokens_reported) {
                 let est = crate::token_estimate::Estimator::new(
                     &upstream_model,
                     crate::token_estimate::PromptInput::Responses(crate::util::outbound_value(
                         &body_bytes,
                     )),
                 );
-                let filled = crate::token_estimate::fill_missing(
-                    &est,
-                    u.prompt_tokens,
-                    u.cache_read_tokens.saturating_add(u.cache_creation_tokens),
-                    u.completion_tokens,
-                    Some(&responses_output_text(&json_body)),
-                );
-                if filled.estimated {
-                    u.prompt_tokens = filled.prompt_tokens;
-                    u.completion_tokens = filled.completion_tokens;
-                    u.usage_estimated = true;
-                }
+                u.estimate_unreported_tokens(&est, &responses_output_text(&json_body));
             }
+            if !bill_tokens {
+                u.clear_tokens();
+                u.defer_inference_final = asynchronous || operation.record.is_some();
+            }
+            u.inference_stage = Some(inference_stage);
+            u.native_operation_id = native_operation_id;
             Some(u)
         };
         // Billed from here on: a caller that leaves during the scan below, or
         // the commit and cache write after it, still owes this answer.
-        if let Some(u) = usage.as_ref() {
-            crate::attribution::note_answered_usage(u.answered(snapshot, model_id));
+        if bill_tokens {
+            if let Some(u) = usage.as_ref() {
+                crate::attribution::note_answered_usage(u.answered(snapshot, model_id));
+            }
         }
+
+        // 先保存已接受调用的用量，归属服务故障不能丢账或再次派发。
+        let post_accept = async {
+            if let Some(registration) = &mut registration {
+                if operation.kind == ResponseOperationKind::InputItems {
+                    registration.bind_input_items(&json_body).await?;
+                } else {
+                    registration.bind_response(&json_body).await?;
+                }
+                if asynchronous {
+                    if let Some(record) = registration.bound_record() {
+                        crate::native_api::background::observe(state, record, &json_body).await?;
+                    }
+                }
+            }
+            if let Some(record) = &operation.record {
+                crate::native_api::background::observe(state, record, &json_body).await?;
+            }
+            Ok::<(), ProxyError>(())
+        }
+        .await;
+        if let Err(error) = post_accept {
+            let mut usage = usage;
+            if let Some(usage) = &mut usage {
+                usage.failure = Some(match &error {
+                    ProxyError::Bridge(error) => crate::attempt::StreamFailure::from_bridge(error),
+                    _ => crate::attempt::StreamFailure::from_bridge(
+                        &aisix_gateway::BridgeError::DependencyUnavailable,
+                    ),
+                });
+            }
+            return Ok(ResponseDispatchSuccess {
+                response: error.into_response(),
+                provider: provider_label,
+                usage,
+                model_id: model_id.to_string(),
+                provider_key_id,
+                upstream_model,
+                routing: RoutingTelemetry::default(),
+                guardrail_blocked: false,
+                guardrail_block_message: String::new(),
+                usage_handled_by_stream: false,
+                output_redactions: crate::redact::RedactionCounts::new(),
+                output_monitor_hits: Vec::new(),
+                captured_content: None,
+                cache: crate::response_cache::CacheTelemetry::default(),
+            });
+        }
+        let original_json = original_bytes.as_ref().map(|_| json_body.clone());
+        state.health.record_success(&model.display_name);
+        state.runtime_status.mark_healthy(model_id, attempt_started);
 
         // #719: run the output guardrail chain on the assistant's text so a
         // configured output block isn't bypassable by calling /v1/responses
         // (the input half is enforced in `dispatch`). Only when an
         // output-hook guardrail is attached; otherwise this is a no-op.
         let mut json_body = json_body;
+        let input_items = operation.kind == ResponseOperationKind::InputItems;
+        if input_items {
+            if let Some(object) = json_body.as_object_mut() {
+                if let Some(items) = object.remove("data") {
+                    object.insert("output".into(), items);
+                }
+            }
+        }
         let mut output_seg_counts = crate::redact::RedactionCounts::new();
         let mut output_monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
         let mut output_capture_safe = true;
@@ -2625,9 +3046,29 @@ async fn responses_to_target(
         // copy keeps the upstream's own `error` and only the caller's is a
         // platform class.
         crate::platform_errors::relayed_failed_response(&mut json_body);
-        mark.apply_to_body(&mut json_body);
+        if input_items {
+            mark.apply_to_input_items_body(&mut json_body);
+        } else {
+            mark.apply_to_body(&mut json_body);
+        }
+        if input_items {
+            if let Some(object) = json_body.as_object_mut() {
+                if let Some(items) = object.remove("output") {
+                    object.insert("data".into(), items);
+                }
+            }
+        }
+        let mut response = if original_json.as_ref() == Some(&json_body) {
+            Response::new(axum::body::Body::from(original_bytes.unwrap_or_default()))
+        } else {
+            Json(json_body).into_response()
+        };
+        *response.status_mut() = status;
+        if !operation.is_create() {
+            crate::native_api::responses::relay_headers(&mut response, &upstream_headers);
+        }
         Ok(ResponseDispatchSuccess {
-            response: Json(json_body).into_response(),
+            response,
             provider: provider_label,
             usage,
             model_id: model_id.to_string(),
@@ -2716,9 +3157,21 @@ async fn responses_cross_provider_to_target(
     // Faithful Responses → ChatFormat transform; `chat.model` stays the
     // operator-facing name so the bridge re-resolves the upstream id via
     // `ctx.model.upstream_model()` exactly like chat.rs.
+    let mut ctx = crate::dispatch::bridge_ctx(
+        request_id,
+        model_id,
+        Arc::clone(model),
+        &provider_key_id,
+        Arc::clone(&pk_entry.value),
+        Some(client_ctx),
+    );
     let outbound_body = crate::effort_mapping::responses_request(body, model);
-    let mut chat =
-        crate::responses_bridge::responses_request_to_chat(requested_model, outbound_body.as_ref());
+    let mut chat = crate::responses_bridge::responses_request_to_chat_for_bridge(
+        requested_model,
+        outbound_body.as_ref(),
+        bridge.as_ref(),
+        &ctx,
+    );
     chat.thoughts_requested =
         aisix_gateway::chat::effort_asks_for_thoughts(body.pointer("/reasoning/effort"));
     // A rewritten body is a whole-request copy; the translation above is
@@ -2734,14 +3187,6 @@ async fn responses_cross_provider_to_target(
     }
 
     let is_stream = chat.is_streaming();
-    let mut ctx = crate::dispatch::bridge_ctx(
-        request_id,
-        model_id,
-        Arc::clone(model),
-        &provider_key_id,
-        Arc::clone(&pk_entry.value),
-        Some(client_ctx),
-    );
     let connect_deadline = if is_stream {
         timeouts.stream
     } else {
@@ -2766,6 +3211,12 @@ async fn responses_cross_provider_to_target(
     let in_flight = state.runtime_status.begin_in_flight(model_id);
 
     if is_stream {
+        let mut accounting_keys = reservation.as_ref().map(|r| r.keys()).unwrap_or_default();
+        if let Some(member) = member_reservation.as_ref() {
+            accounting_keys.extend(member.keys());
+        }
+        let mut accounting_hold =
+            crate::usage_attr::ObservedStreamTokensHold::new(state, attempt.index, accounting_keys);
         let upstream = bridge
             .chat_stream_cow(std::borrow::Cow::Owned(chat), &ctx)
             .await
@@ -2780,6 +3231,7 @@ async fn responses_cross_provider_to_target(
                 }
                 ProxyError::Bridge(err)
             })?;
+        accounting_hold.bind();
         // Serialized once the upstream has answered, not before: a copy made
         // up front would be alive for the whole upstream wait.
         let captured_prompt = content_cap.map(|_| serde_json::to_string(body).unwrap_or_default());
@@ -2910,6 +3362,8 @@ async fn responses_cross_provider_to_target(
             content_cap,
             Some(estimator),
             move |mut comp| {
+                crate::usage_attr::resolve_observed_stream_completion!(comp, attempt_c.index);
+                accounting_hold.disarm();
                 // #688: apply the terminal token cost to TPM/TPD and release the
                 // concurrency hold now the stream has ended (sync analog of the
                 // reservation's async `commit_tokens`). Tokens count even on an
@@ -2926,12 +3380,19 @@ async fn responses_cross_provider_to_target(
                 // in-flight.
                 drop(in_flight);
                 let usage = ResponseUsage {
+                    defer_inference_final: false,
+                    inference_stage: None,
+                    native_operation_id: None,
                     reached_end: comp.reached_end,
                     prompt_tokens: comp.prompt_tokens,
                     completion_tokens: comp.completion_tokens,
+                    prompt_tokens_reported: false,
+                    completion_tokens_reported: false,
                     reasoning_tokens: comp.reasoning_tokens,
+                    web_search_requests: comp.web_search_requests,
                     cached_prompt_tokens: comp.cached_prompt_tokens,
                     cache_write_tokens: comp.cache_write_tokens,
+                    cache_usage_reported: comp.cache_usage_reported,
                     modality: comp.modality,
                     cache_creation_ttl: comp.cache_creation_ttl,
                     cache_creation_tokens: comp.cache_creation_tokens,
@@ -3105,14 +3566,21 @@ async fn responses_cross_provider_to_target(
 
     let usage = {
         let mut u = ResponseUsage {
+            defer_inference_final: false,
+            inference_stage: None,
+            native_operation_id: None,
             // Non-streaming: the response was received in full or this code
             // would not run.
             reached_end: true,
             prompt_tokens: resp.usage.prompt_tokens,
             completion_tokens: resp.usage.completion_tokens,
+            prompt_tokens_reported: false,
+            completion_tokens_reported: false,
             reasoning_tokens: resp.usage.reasoning_tokens,
+            web_search_requests: resp.usage.web_search_requests,
             cached_prompt_tokens: resp.usage.cached_prompt_tokens,
             cache_write_tokens: resp.usage.cache_write_tokens,
+            cache_usage_reported: resp.usage.cache_usage_reported(),
             modality: resp.usage.modality,
             cache_creation_ttl: resp.usage.cache_creation_ttl,
             cache_creation_tokens: resp.usage.cache_creation_tokens,
@@ -3312,26 +3780,18 @@ async fn responses_cross_provider_to_target(
     })
 }
 
-/// Pull the usage counters out of a Responses-API non-streaming
-/// response body. Returns `None` only when:
-///   - The `usage` block is missing entirely, OR
-///   - `usage.input_tokens` is missing / non-numeric
-///
-/// The caller then estimates the counts locally (AISIX-Cloud#1074). The
-/// `input_tokens` gate distinguishes "no upstream usage at all" from a
-/// legitimate reply.
-///
-/// `output_tokens`, by contrast, defaults to 0 when absent: a 200 that
-/// reports an input side but omits the output side is still a real
-/// billable call and must be recorded. A missing completion/output side
-/// coerces to 0 and the event is still logged/billed
-/// (#429 follow-up; mirrors the tolerant wire-layer decode of
-/// #474). Spec:
+/// 读取模型和工具的独立用量；两者都没有可用计数时才返回 None。
+/// 模型输入或输出计数缺失时保留未报告状态，让调用方估算，
+/// 已报告的收费搜索次数则始终原样进入记账，不能被 token 缺失吞掉。
 /// <https://platform.openai.com/docs/api-reference/responses/object>
 fn extract_response_usage(body: &Value) -> Option<ResponseUsage> {
-    let usage = body.get("usage")?;
-    let prompt_tokens =
-        crate::usage_attr::token_count(usage.get("input_tokens").and_then(|v| v.as_u64())?);
+    let usage = body.get("usage").unwrap_or(&Value::Null);
+    let reported_prompt = usage.get("input_tokens").and_then(Value::as_u64);
+    let reported_searches = reported_response_web_search_requests(body);
+    if reported_prompt.is_none() && reported_searches.is_none() {
+        return None;
+    }
+    let prompt_tokens = reported_prompt.map_or(0, crate::usage_attr::token_count);
     let completion_tokens = usage
         .get("output_tokens")
         .and_then(|v| v.as_u64())
@@ -3353,20 +3813,34 @@ fn extract_response_usage(body: &Value) -> Option<ResponseUsage> {
         .pointer("/input_tokens_details/cache_write_tokens")
         .and_then(Value::as_u64)
         .map(crate::usage_attr::token_count);
+    let cache_usage_reported = Some(
+        usage
+            .pointer("/input_tokens_details/cached_tokens")
+            .and_then(Value::as_u64)
+            .is_some()
+            || cache_write_tokens.is_some(),
+    );
     let upstream_total_tokens = usage
         .get("total_tokens")
         .and_then(Value::as_u64)
         .map_or(0, crate::usage_attr::token_count);
     Some(ResponseUsage {
+        defer_inference_final: false,
+        inference_stage: None,
+        native_operation_id: None,
         // Parsed from a fully buffered response body, so by definition the
         // response was delivered in full.
         reached_end: true,
         prompt_tokens,
         completion_tokens,
+        prompt_tokens_reported: reported_prompt.is_some(),
+        completion_tokens_reported: usage.get("output_tokens").and_then(Value::as_u64).is_some(),
         usage_estimated: false,
         reasoning_tokens,
+        web_search_requests: reported_searches.unwrap_or(0),
         cached_prompt_tokens,
         cache_write_tokens,
+        cache_usage_reported,
         modality: aisix_gateway::ModalityTokens::from_openai_details(
             usage.get("input_tokens_details"),
             usage.get("output_tokens_details"),
@@ -3390,6 +3864,14 @@ fn extract_response_usage(body: &Value) -> Option<ResponseUsage> {
         service_tier: response_service_tier(body),
         failure: None,
     })
+}
+
+/// 顶层工具用量独立于模型 usage；缺失时不按输出动作推算收费次数。
+/// https://github.com/openai/openai-python/blob/141a89aa7fbb7f13a979bda930831a5fe38bc3a4/src/openai/types/responses/response.py#L617-L630
+pub(crate) fn reported_response_web_search_requests(body: &Value) -> Option<u32> {
+    body.pointer("/tool_usage/web_search/num_requests")
+        .and_then(Value::as_u64)
+        .map(crate::usage_attr::token_count)
 }
 
 /// A Response object's top-level `service_tier` — the tier the upstream
@@ -3457,10 +3939,12 @@ impl ResponseUsage {
             prompt_tokens: self.prompt_tokens,
             completion_tokens: self.completion_tokens,
             reasoning_tokens: self.reasoning_tokens,
+            web_search_requests: self.web_search_requests,
             upstream_total_tokens: self.upstream_total_tokens,
             reasoning_folded_into_completion: self.reasoning_folded_into_completion,
             cached_prompt_tokens: self.cached_prompt_tokens,
             cache_write_tokens: self.cache_write_tokens,
+            cache_usage_reported: self.cache_usage_reported,
             cache_creation_tokens: self.cache_creation_tokens,
             cache_creation_ttl: self.cache_creation_ttl,
             cache_read_tokens: self.cache_read_tokens,
@@ -3488,9 +3972,11 @@ impl ResponseUsage {
         aisix_gateway::UsageStats {
             cached_prompt_tokens: self.cached_prompt_tokens,
             cache_write_tokens: self.cache_write_tokens,
+            cache_usage_reported: self.cache_usage_reported,
             modality: self.modality,
             cache_creation_ttl: self.cache_creation_ttl,
             reasoning_tokens: self.reasoning_tokens,
+            web_search_requests: self.web_search_requests,
             cache_creation_tokens: self.cache_creation_tokens,
             cache_read_tokens: self.cache_read_tokens,
             upstream_total_tokens: self.upstream_total_tokens,
@@ -3590,18 +4076,36 @@ fn responses_in_band_status(event: &Value) -> Option<u16> {
 /// the stream themselves, since the OpenAI SDKs reject one that does not open
 /// with `response.created`; otherwise they carry on its response id and
 /// numbering.
+fn responses_sse_raw_response_id(bytes: &[u8]) -> Option<String> {
+    crate::redact::parse_sse_json_stream(bytes)
+        .0
+        .iter()
+        .find_map(|event| {
+            event
+                .pointer("/response/id")
+                .or_else(|| event.get("response_id"))
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned)
+        })
+}
+
 fn responses_stream_error_body(
     failure: crate::stream_timeout::RawStreamFailure,
     reply: crate::responses_bridge::ResponsesReplyContext,
     requested_model: &str,
     mark: &crate::responses_affinity::ResponseMark,
     delivered: &[u8],
+    observed_response_id: Option<&str>,
 ) -> Vec<u8> {
     let error = failure.bridge_error();
     let events = crate::redact::parse_sse_json_stream(delivered).0;
-    let response_id = events
-        .iter()
-        .find_map(|event| event.pointer("/response/id").and_then(Value::as_str))
+    let response_id = observed_response_id
+        .or_else(|| {
+            events
+                .iter()
+                .find_map(|event| event.pointer("/response/id").and_then(Value::as_str))
+        })
         .map_or_else(
             || format!("resp_{}", Uuid::new_v4().simple()),
             str::to_owned,
@@ -3645,11 +4149,16 @@ fn responses_refusal_body(
     reply: crate::responses_bridge::ResponsesReplyContext,
     requested_model: &str,
     mark: &crate::responses_affinity::ResponseMark,
+    observed_response_id: Option<&str>,
     guardrail_name: Option<&str>,
     unavailable: Option<&str>,
 ) -> bytes::Bytes {
     let mut encoder = crate::responses_bridge::ResponsesSseEncoder::new(
-        mark.response_id(format!("resp_{}", Uuid::new_v4().simple())),
+        mark.response_id(
+            observed_response_id
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("resp_{}", Uuid::new_v4().simple())),
+        ),
         requested_model,
         chrono::Utc::now().timestamp(),
         reply,
@@ -3797,20 +4306,7 @@ fn held_refusal_usage(
         upstream_model,
         crate::token_estimate::PromptInput::Responses(crate::util::outbound_value(outbound_body)),
     );
-    let filled = crate::token_estimate::fill_missing(
-        &est,
-        usage.prompt_tokens,
-        usage
-            .cache_read_tokens
-            .saturating_add(usage.cache_creation_tokens),
-        usage.completion_tokens,
-        Some(output_text),
-    );
-    if filled.estimated {
-        usage.prompt_tokens = filled.prompt_tokens;
-        usage.completion_tokens = filled.completion_tokens;
-        usage.usage_estimated = true;
-    }
+    usage.estimate_unreported_tokens(&est, output_text);
     usage
 }
 
@@ -3820,17 +4316,7 @@ fn raw_stream_bridge_error(
     error: &crate::stream_timeout::RawStreamError,
     started: Instant,
 ) -> aisix_gateway::BridgeError {
-    match error {
-        crate::stream_timeout::RawStreamError::Timeout { elapsed_ms } => {
-            aisix_gateway::BridgeError::Timeout {
-                elapsed_ms: *elapsed_ms,
-                cause: String::new(),
-            }
-        }
-        crate::stream_timeout::RawStreamError::Upstream(e) => {
-            crate::dispatch::reqwest_error_to_bridge(e, started)
-        }
-    }
+    error.as_bridge(started)
 }
 
 fn responses_sse_has_done(bytes: &[u8]) -> bool {
@@ -4399,6 +4885,16 @@ where
                         Some(crate::stream_timeout::RawStreamFailure::UpstreamDecode);
                     break;
                 }
+                Err(error) => {
+                    let failure = error.failure();
+                    let bridge = error.as_bridge(attempt_started);
+                    crate::attempt::StreamFailure::record(
+                        &mut observed.usage.get_or_insert_with(Default::default).failure,
+                        &bridge,
+                    );
+                    observed.failure = Some(failure);
+                    break;
+                }
             };
             push_capped_lossy_bytes(&mut observed.raw, &chunk);
             buf.extend_from_slice(&chunk);
@@ -4526,6 +5022,7 @@ where
                 reply,
                 &requested_model,
                 &mark,
+                responses_sse_raw_response_id(&buf).as_deref(),
                 None,
                 Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED),
             ));
@@ -4618,6 +5115,7 @@ where
                 reply,
                 &requested_model,
                 &mark,
+                responses_sse_raw_response_id(&buf).as_deref(),
                 None,
                 Some(crate::error::TAG_UNSCANNABLE_BODY),
             ));
@@ -4629,7 +5127,7 @@ where
         // first-frame latency.
         //
         // Token-estimation fallback (#1074): a buffered
-        // stream with zero/missing usage fills the counters locally —
+        // stream with missing usage fills only unreported counters locally —
         // telemetry only, the buffered bytes forward untouched.
         let mut usage = responses_sse_usage(&buf).unwrap_or_default();
         // 首帧时刻是上面边读边缓冲时量的，事后重新解析缓冲区得不到；
@@ -4653,27 +5151,14 @@ where
             usage.provider_request_id = responses_sse_provider_request_id(&buf);
         }
         let out_text_estimate = responses_sse_output_text(&buf);
-        if usage.prompt_tokens == 0 || usage.completion_tokens == 0 {
+        if !usage.prompt_tokens_reported || !usage.completion_tokens_reported {
             let est = crate::token_estimate::Estimator::new(
                 &upstream_model,
                 crate::token_estimate::PromptInput::Responses(crate::util::outbound_value(
                     &body_bytes,
                 )),
             );
-            let filled = crate::token_estimate::fill_missing(
-                &est,
-                usage.prompt_tokens,
-                usage
-                    .cache_read_tokens
-                    .saturating_add(usage.cache_creation_tokens),
-                usage.completion_tokens,
-                Some(&out_text_estimate),
-            );
-            if filled.estimated {
-                usage.prompt_tokens = filled.prompt_tokens;
-                usage.completion_tokens = filled.completion_tokens;
-                usage.usage_estimated = true;
-            }
+            usage.estimate_unreported_tokens(&est, &out_text_estimate);
         }
         // The upstream's part of this is over, whatever the verdict says.
         usage.reached_end = true;
@@ -4775,6 +5260,7 @@ where
                 reply,
                 &requested_model,
                 &mark,
+                responses_sse_raw_response_id(&buf).as_deref(),
                 guardrail_name.as_deref(),
                 unavailable.as_deref(),
             ));
@@ -4821,13 +5307,16 @@ where
             _ => None,
         };
         use crate::stream_timeout::RawStreamFailure;
+        let observed_response_id = responses_sse_raw_response_id(&buf);
         let released = match terminal_failure {
             // The read failed, or a frame could not be understood: what
             // was held is not sent alongside the gateway's terminal
             // error. Its usage is kept for billing.
             Some(
-                failure @ (RawStreamFailure::Timeout { .. } | RawStreamFailure::UpstreamDecode),
-            ) => responses_stream_error_body(failure, reply, &requested_model, &mark, &[]),
+                failure @ (RawStreamFailure::Timeout { .. }
+                    | RawStreamFailure::UpstreamDecode
+                    | RawStreamFailure::DependencyUnavailable),
+            ) => responses_stream_error_body(failure, reply, &requested_model, &mark, &[], observed_response_id.as_deref()),
             other => {
                 let mut finish = aisix_obs::ResponsesFinishObserver::default();
                 finish.feed_sse(&buf);
@@ -4838,7 +5327,7 @@ where
                 let closing = other
                     .filter(|failure| matches!(failure, RawStreamFailure::Upstream))
                     .map(|failure| {
-                        responses_stream_error_body(failure, reply, &requested_model, &mark, &buf)
+                        responses_stream_error_body(failure, reply, &requested_model, &mark, &buf, observed_response_id.as_deref())
                     });
                 // After every telemetry read above, which records the
                 // upstream's own ids.
@@ -5558,6 +6047,8 @@ fn emit_usage_event(
     let tags = pk.telemetry_tags();
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
+        inference_stage: usage.inference_stage,
+        native_operation_id: usage.native_operation_id,
         occurred_at: aisix_obs::UsageEvent::occurred_at_now(),
         model_id: model_id.to_string(),
         api_key_id: caller.api_key_id.to_string(),
@@ -5595,9 +6086,11 @@ fn emit_usage_event(
         ),
         cached_prompt_tokens: usage.cached_prompt_tokens,
         cache_write_tokens: usage.cache_write_tokens,
+        cache_usage_reported: usage.cache_usage_reported,
         modality_tokens: usage.modality,
         cache_creation_ttl: usage.cache_creation_ttl,
         reasoning_tokens: usage.reasoning_tokens,
+        web_search_requests: usage.web_search_requests,
         // Anthropic cache counters (#825 cross-provider path); 0 on the
         // verbatim OpenAI path.
         cache_creation_tokens: usage.cache_creation_tokens,
@@ -5636,9 +6129,10 @@ fn emit_usage_event(
     event.reasoning_unfolded_from_completion = usage
         .completion_tokens
         .saturating_sub(event.completion_tokens);
+    crate::usage_attr::resolve_observed_stream_event(&mut event, snap);
     crate::usage_attr::apply_caller_identity(&mut event, client.jwt.as_ref(), &client.caller);
     let usage_model = crate::usage_attr::usage_event_model_label(snap, &event.requested_model);
-    crate::usage_attr::emit_usage(
+    crate::usage_attr::emit_usage_with_finality(
         state,
         snap,
         crate::operation::RESPONSES,
@@ -5647,6 +6141,7 @@ fn emit_usage_event(
         content,
         client.trace.as_ref(),
         terminal,
+        terminal && !usage.defer_inference_final,
         dispatched,
     );
     // #1044: token volume by inbound client type × model. Codex
@@ -5660,10 +6155,10 @@ fn emit_usage_event(
     // #1002: cache-inclusive total via the shared helper — cache counters are
     // non-zero only on the #825 Anthropic bridge path.
     let total_all = total_tokens_with_cache(
-        usage.prompt_tokens,
-        usage.completion_tokens,
-        usage.cache_creation_tokens,
-        usage.cache_read_tokens,
+        event.prompt_tokens,
+        event.folded_completion_tokens(),
+        event.cache_creation_tokens,
+        event.cache_read_tokens,
     );
     crate::request_metrics::record_usage(
         state,
@@ -5677,12 +6172,12 @@ fn emit_usage_event(
             ..Default::default()
         },
         crate::request_metrics::Tokens {
-            input: usage.prompt_tokens,
-            output: usage.completion_tokens,
+            input: event.prompt_tokens,
+            output: event.folded_completion_tokens(),
             total: total_all.min(u64::from(u32::MAX)) as u32,
-            cached: usage.cached_prompt_tokens,
-            cache_read: usage.cache_read_tokens,
-            cache_creation: usage.cache_creation_tokens,
+            cached: event.cached_prompt_tokens,
+            cache_read: event.cache_read_tokens,
+            cache_creation: event.cache_creation_tokens,
             client_type: state.client_classifier.classify(&client.user_agent),
         },
     );
@@ -5732,6 +6227,7 @@ fn emit_usage_event(
 /// (#655). Tokens stay 0; `status_code` + `error_*` carry the failure.
 #[allow(clippy::too_many_arguments)]
 fn emit_zero_token_event(
+    operation: &NativeResponseOperation,
     state: &ProxyState,
     snap: &aisix_core::AisixSnapshot,
     request_id: &str,
@@ -5770,6 +6266,15 @@ fn emit_zero_token_event(
     let tags = pk.telemetry_tags();
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
+        inference_stage: Some(if operation.bills_tokens() {
+            aisix_core::native_objects::InferenceStage::Attempt
+        } else {
+            aisix_core::native_objects::InferenceStage::Management
+        }),
+        native_operation_id: operation
+            .record
+            .as_ref()
+            .and_then(|record| record.operation_id),
         occurred_at: aisix_obs::UsageEvent::occurred_at_now(),
         model_id: model_id.to_string(),
         api_key_id: api_key_id.to_string(),
@@ -5803,6 +6308,18 @@ fn emit_zero_token_event(
         guardrail_blocked: terminal && guardrail_blocked,
         ..Default::default()
     };
+    crate::usage_attr::record_observed_stream_failure(
+        state,
+        snap,
+        "/v1/responses",
+        requested_model,
+        model_id,
+        api_key_id,
+        event.attempt_index,
+        client,
+        &pk,
+    );
+    crate::usage_attr::resolve_observed_stream_event(&mut event, snap);
     crate::usage_attr::apply_caller_identity(&mut event, client.jwt.as_ref(), &client.caller);
     let usage_model = crate::usage_attr::usage_event_model_label(snap, &event.requested_model);
     crate::usage_attr::emit_usage(
@@ -5822,6 +6339,7 @@ fn emit_zero_token_event(
 /// request (#655). The winner / terminal event is emitted separately.
 #[allow(clippy::too_many_arguments)]
 fn emit_failed_attempts(
+    operation: &NativeResponseOperation,
     state: &ProxyState,
     snap: &aisix_core::AisixSnapshot,
     request_id: &str,
@@ -5848,6 +6366,7 @@ fn emit_failed_attempts(
         .filter(|(_, a)| !a.success)
     {
         emit_zero_token_event(
+            operation,
             state,
             snap,
             request_id,
@@ -5879,6 +6398,8 @@ fn emit_failed_attempts(
 
 #[allow(clippy::too_many_arguments)]
 fn emit_access_log(
+    method: &str,
+    path: &str,
     model: &str,
     provider: &str,
     api_key_id: &str,
@@ -5903,8 +6424,8 @@ fn emit_access_log(
     let summary = routing.access_log_summary();
     let target = crate::attribution::AccessLogTarget::current();
     crate::attribution::emit_access_log(AccessLog {
-        method: "POST",
-        path: "/v1/responses",
+        method,
+        path,
         status,
         latency: elapsed,
         duration: elapsed,
@@ -5932,6 +6453,230 @@ fn emit_access_log(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn responses_report_only_the_explicit_billable_web_search_counter() {
+        // 丢失顶层计数、误读 usage 内字段或按输出动作推算，都会使断言失败。
+        for (reported, expected) in [(None, 0), (Some(0), 0), (Some(3), 3), (Some(9), 9)] {
+            let mut response = serde_json::json!({
+                "id":"resp_search_counter", "status":"completed",
+                "output":[{"type":"web_search_call","action":{"type":"open_page","url":"https://example.com"}}],
+                "usage":{"input_tokens":17,"output_tokens":5,"total_tokens":22,
+                    "tool_usage":{"web_search":{"num_requests":97}}}
+            });
+            if let Some(count) = reported {
+                response["tool_usage"] = serde_json::json!({"web_search":{"num_requests":count}});
+            }
+            assert_eq!(
+                response
+                    .pointer("/tool_usage/web_search/num_requests")
+                    .and_then(serde_json::Value::as_u64),
+                reported,
+            );
+            let stats = super::response_usage_stats(&response).unwrap();
+            assert_eq!(stats.web_search_requests, expected);
+            assert_eq!((stats.prompt_tokens, stats.completion_tokens), (17, 5));
+            for kind in [
+                "response.completed",
+                "response.incomplete",
+                "response.failed",
+            ] {
+                let event = serde_json::json!({"type":kind,"response":response});
+                let stats = super::responses_terminal_usage_stats(&event).unwrap();
+                assert_eq!(stats.web_search_requests, expected, "{kind}");
+            }
+        }
+    }
+
+    #[test]
+    fn responses_answered_search_usage_survives_cancellation_and_clears_for_management() {
+        // 取消收尾读 AnsweredUsage；管理日志清零后不能再次收取后台工具费用。
+        let mut usage = super::extract_response_usage(&serde_json::json!({
+            "usage":{"input_tokens":17,"output_tokens":5},
+            "tool_usage":{"web_search":{"num_requests":7}}
+        }))
+        .unwrap();
+        let mut cancelled = aisix_obs::UsageEvent::default();
+        usage
+            .answered(&AisixSnapshot::new(), "")
+            .apply(&mut cancelled);
+        let wire = serde_json::to_value(&cancelled).unwrap();
+        assert_eq!(wire.get("web_search_requests"), Some(&serde_json::json!(7)));
+        usage.clear_tokens();
+        assert_eq!(usage.usage_stats().web_search_requests, 0);
+    }
+
+    #[test]
+    fn responses_report_search_usage_without_base_model_usage() {
+        // 工具计费独立于模型 token；usage 缺失时仍不能丢掉已报告的搜索费用。
+        for (reported, expected) in [(None, None), (Some(0), Some(0)), (Some(5), Some(5))] {
+            let mut response = serde_json::json!({
+                "id":"resp_search_only", "status":"failed", "usage":null
+            });
+            if let Some(count) = reported {
+                response["tool_usage"] = serde_json::json!({"web_search":{"num_requests":count}});
+            }
+            let stats = super::response_usage_stats(&response);
+            assert_eq!(
+                stats.as_ref().map(|stats| stats.web_search_requests),
+                expected
+            );
+            if let Some(stats) = stats {
+                assert_eq!((stats.prompt_tokens, stats.completion_tokens), (0, 0));
+            }
+            let event = serde_json::json!({"type":"response.failed","response":response});
+            let stats = super::responses_terminal_usage_stats(&event);
+            assert_eq!(
+                stats.as_ref().map(|stats| stats.web_search_requests),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_usage_events_preserve_native_and_bridged_search_counts() {
+        // 真实 router、提供方解析与终态发件箱都参与；漏掉任一协议分支会得到零。
+        for (native, streaming, expected) in [
+            (true, false, 3),
+            (true, true, 7),
+            (false, false, 5),
+            (false, true, 11),
+        ] {
+            let upstream = MockServer::builder().start().await;
+            let native_response = serde_json::json!({
+                "id":"resp_search_counter", "object":"response", "status":"completed",
+                "model":"gpt-4o", "output":[],
+                "usage":{"input_tokens":17,"output_tokens":5,"total_tokens":22},
+                "tool_usage":{"web_search":{"num_requests":expected}}
+            });
+            let anthropic_usage = serde_json::json!({
+                "input_tokens":17,"output_tokens":5,
+                "server_tool_use":{"web_search_requests":expected}
+            });
+            let template = if streaming {
+                let events = if native {
+                    vec![
+                        serde_json::json!({"type":"response.completed","response":native_response}),
+                    ]
+                } else {
+                    vec![
+                        serde_json::json!({"type":"message_start","message":{
+                            "id":"msg_search_counter","type":"message","role":"assistant",
+                            "model":"claude-3-haiku-20240307","content":[],"stop_reason":null,
+                            "usage":anthropic_usage
+                        }}),
+                        serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+                        serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"answer"}}),
+                        serde_json::json!({"type":"content_block_stop","index":0}),
+                        serde_json::json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}),
+                        serde_json::json!({"type":"message_stop"}),
+                    ]
+                };
+                let sse = events
+                    .iter()
+                    .map(|event| format!("data: {event}\n\n"))
+                    .collect::<String>();
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse)
+            } else if native {
+                ResponseTemplate::new(200).set_body_json(native_response)
+            } else {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id":"msg_search_counter","type":"message","role":"assistant",
+                    "model":"claude-3-haiku-20240307","stop_reason":"end_turn",
+                    "content":[{"type":"text","text":"answer"}],"usage":anthropic_usage
+                }))
+            };
+            Mock::given(method("POST"))
+                .and(path(if native {
+                    "/v1/responses"
+                } else {
+                    "/v1/messages"
+                }))
+                .respond_with(template)
+                .mount(&upstream)
+                .await;
+            let snap = if native {
+                new_snap_openai(&upstream.uri())
+            } else {
+                new_snap_anthropic_at(&upstream.uri())
+            };
+            snap.models.insert(if native {
+                openai_model("search-counter")
+            } else {
+                anthropic_model("search-counter")
+            });
+            snap.apikeys.insert(apikey_entry(&["*"]));
+            let hub = Arc::new(Hub::new());
+            hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+            hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+                .without_cache()
+                .with_usage_sink(aisix_obs::UsageSink::new(tx));
+            let response = crate::build_router(state)
+                .oneshot(make_req(serde_json::json!({
+                    "model":"search-counter","input":"hello","stream":streaming
+                })))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            to_bytes(response.into_body(), 65536).await.unwrap();
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let wire = serde_json::to_value(&event).unwrap();
+            assert_eq!(
+                wire.get("web_search_requests"),
+                Some(&serde_json::json!(expected)),
+                "native={native}, streaming={streaming}"
+            );
+            assert_eq!((event.prompt_tokens, event.completion_tokens), (17, 5));
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn reported_zero_native_usage_survives_held_refusal_estimation() {
+        let reported = super::extract_response_usage(&serde_json::json!({
+            "usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}
+        }));
+        assert!(reported.is_some());
+        let body = br#"{"model":"gpt-4o","input":"a prompt with billable tokens"}"#;
+        let usage = super::held_refusal_usage(reported, "gpt-4o", body, "generated content");
+        assert_eq!((usage.prompt_tokens, usage.completion_tokens), (0, 0));
+        assert!(!usage.usage_estimated);
+        let missing = super::held_refusal_usage(None, "gpt-4o", body, "generated content");
+        assert!(missing.prompt_tokens > 0 && missing.completion_tokens > 0);
+        assert!(missing.usage_estimated);
+    }
+
+    #[test]
+    fn native_usage_estimates_only_the_unreported_counter() {
+        let body = br#"{"model":"gpt-4o","input":"a prompt with billable tokens"}"#;
+        let observed = super::extract_response_usage(&serde_json::json!({
+            "usage":{"input_tokens":0}
+        }));
+        assert!(observed.is_some());
+        let usage = super::held_refusal_usage(observed, "gpt-4o", body, "generated content");
+        assert_eq!(usage.prompt_tokens, 0);
+        assert!(usage.completion_tokens > 0);
+        assert!(usage.usage_estimated);
+    }
+
+    #[test]
+    fn responses_cache_presence_survives_zero_and_usage_stats_conversion() {
+        for reported in [false, true] {
+            let mut usage = serde_json::json!({"input_tokens":100,"output_tokens":1});
+            if reported {
+                usage["input_tokens_details"] = serde_json::json!({"cached_tokens":0});
+            }
+            let stats = super::response_usage_stats(&serde_json::json!({"usage":usage})).unwrap();
+            assert_eq!(stats.cache_usage_reported(), Some(reported));
+            assert_eq!(stats.cached_prompt_tokens, 0);
+        }
+    }
     #[test]
     fn a_legacy_cached_answer_without_an_origin_is_not_replayed() {
         use aisix_core::ResourceEntry;
@@ -7779,10 +8524,12 @@ mod tests {
     #[tokio::test]
     async fn output_guardrail_blocks_streaming_response_holds_back() {
         let upstream = MockServer::builder().start().await;
-        let sse = "event: response.output_text.delta\n\
+        let sse = "event: response.created\n\
+                   data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_guardrail_raw\",\"output\":[]}}\n\n\
+                   event: response.output_text.delta\n\
                    data: {\"type\":\"response.output_text.delta\",\"delta\":\"sure: BLOCKME\"}\n\n\
                    event: response.completed\n\
-                   data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"sure: BLOCKME\"}]}]}}\n\n\
+                   data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_guardrail_raw\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"sure: BLOCKME\"}]}]}}\n\n\
                    data: [DONE]\n\n";
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
@@ -7815,6 +8562,16 @@ mod tests {
             "streamed content leaked despite output block",
         );
         assert_held_refusal_frames(&bytes);
+        let events = crate::redact::parse_sse_json_stream(&bytes).0;
+        let snapshots: Vec<_> = events
+            .iter()
+            .filter_map(|event| event.get("response"))
+            .collect();
+        assert!(!snapshots.is_empty());
+        for response in snapshots {
+            assert_eq!(response["id"], "resp_guardrail_raw");
+            assert_eq!(response["output"], serde_json::json!([]));
+        }
     }
 
     /// Streaming refusals use their own delta and aggregate events. The
@@ -10914,6 +11671,7 @@ data: [DONE]\n\n";
             "no refused request reaches the upstream"
         );
 
+        let app = raw_id_contract::legacy_item_router(two_tenants(&upstream.uri()));
         let resp = app
             .oneshot(request_as("sk-caller", referencing(&sealed)))
             .await
@@ -10982,10 +11740,13 @@ data: [DONE]\n\n";
             .and(body_partial_json(
                 serde_json::json!({"previous_response_id": "resp_up"}),
             ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "resp_bdrk_next", "object": "response",
-                "previous_response_id": "resp_up", "output": []
-            })))
+            .respond_with({
+                let sequence=std::sync::atomic::AtomicUsize::new(0);
+                move |_: &wiremock::Request| ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": format!("resp_bdrk_next_{}",sequence.fetch_add(1,std::sync::atomic::Ordering::SeqCst)),
+                    "object":"response","previous_response_id":"resp_up","output":[]
+                }))
+            })
             .expect(2)
             .mount(&upstream)
             .await;
@@ -10996,15 +11757,15 @@ data: [DONE]\n\n";
             "sk-tenant-a-second",
             serde_json::json!({"team_id": "team-a"}),
         ));
-        let app = build_platform_app(snap);
+        let app = raw_id_contract::legacy_router(snap, &[("m-1", "resp_up")]);
         let sent = crate::responses_affinity::seal_response_id(
             &response_key(),
             TENANT_A,
-            "m-1",
+            raw_id_contract::MODEL,
             "resp_up",
         );
 
-        for plaintext in ["sk-caller", "sk-tenant-a-second"] {
+        for (index, plaintext) in ["sk-caller", "sk-tenant-a-second"].into_iter().enumerate() {
             let resp = app
                 .clone()
                 .oneshot(request_as(
@@ -11017,18 +11778,14 @@ data: [DONE]\n\n";
             assert_eq!(resp.status(), StatusCode::OK);
             let v: serde_json::Value =
                 serde_json::from_slice(&to_bytes(resp.into_body(), 65536).await.unwrap()).unwrap();
-            assert_eq!(v["previous_response_id"], sent.as_str());
+            assert_eq!(v["previous_response_id"], "resp_up");
             let id = v["id"].as_str().unwrap();
-            assert!(!id.contains("resp_bdrk_next"), "{id}");
-            assert_eq!(
-                crate::responses_affinity::open_response_id(&response_key(), TENANT_A, id),
-                Some(("m-1".into(), "resp_bdrk_next".into()))
-            );
+            assert_eq!(id, format!("resp_bdrk_next_{index}"));
         }
     }
 
     #[tokio::test]
-    async fn platform_mode_seals_every_frame_of_a_stream_to_one_id_of_the_tenant() {
+    async fn platform_mode_preserves_upstream_response_id_in_every_stream_frame() {
         let upstream = MockServer::builder().start().await;
         let sse = "event: response.created\n\
                    data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_bdrk_s\",\"status\":\"in_progress\",\"output\":[]}}\n\n\
@@ -11061,7 +11818,7 @@ data: [DONE]\n\n";
             assert_eq!(resp.status(), StatusCode::OK);
             let body = String::from_utf8(to_bytes(resp.into_body(), 65536).await.unwrap().to_vec())
                 .unwrap();
-            assert!(!body.contains("resp_bdrk_s"), "{body}");
+            assert!(body.contains("resp_bdrk_s"), "{body}");
             let ids: Vec<String> = crate::redact::parse_sse_json_stream(body.as_bytes())
                 .0
                 .iter()
@@ -11070,16 +11827,12 @@ data: [DONE]\n\n";
                 .collect();
             assert_eq!(ids.len(), 3, "{body}");
             assert!(ids.iter().all(|id| *id == ids[0]), "{ids:?}");
-            assert_eq!(
-                crate::responses_affinity::open_response_id(&response_key(), TENANT_A, &ids[0]),
-                Some(("m-1".into(), "resp_bdrk_s".into())),
-                "guarded: {guarded}"
-            );
+            assert_eq!(ids[0], "resp_bdrk_s", "guarded: {guarded}");
         }
     }
 
     #[tokio::test]
-    async fn platform_mode_seals_a_translated_answers_id_to_the_tenant() {
+    async fn platform_mode_preserves_translated_upstream_response_id() {
         let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
@@ -11091,6 +11844,17 @@ data: [DONE]\n\n";
             })))
             .mount(&upstream)
             .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(body_partial_json(serde_json::json!({"stream":true})))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(concat!(
+                "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_bdrk_1\",\"model\":\"claude-3-haiku-20240307\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
+                "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+                "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+                "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+            ),"text/event-stream"))
+            .with_priority(1)
+            .mount(&upstream).await;
         let snap = new_snap_anthropic_at(&upstream.uri());
         snap.models.insert(anthropic_model("claude-resp"));
         snap.apikeys.insert(tenant_key(
@@ -11109,26 +11873,7 @@ data: [DONE]\n\n";
         assert_eq!(resp.status(), StatusCode::OK);
         let v: serde_json::Value =
             serde_json::from_slice(&to_bytes(resp.into_body(), 65536).await.unwrap()).unwrap();
-        let (target, minted) = crate::responses_affinity::open_response_id(
-            &response_key(),
-            TENANT_A,
-            v["id"].as_str().unwrap(),
-        )
-        .unwrap();
-        assert_eq!(target, "m-2");
-        // Sealed once: what the seal holds is the gateway's own minted id,
-        // not another seal.
-        assert_eq!(
-            crate::responses_affinity::open_response_id(&response_key(), TENANT_A, &minted),
-            None,
-            "{minted}"
-        );
-        assert!(
-            minted
-                .strip_prefix("resp_")
-                .is_some_and(|hex| hex.len() == 32 && hex.bytes().all(|b| b.is_ascii_hexdigit())),
-            "{minted}"
-        );
+        assert_eq!(v["id"], "msg_bdrk_1");
 
         let resp = app
             .oneshot(make_req(
@@ -11146,15 +11891,7 @@ data: [DONE]\n\n";
             .collect();
         assert!(ids.len() >= 2, "{body}");
         assert!(ids.iter().all(|id| *id == ids[0]), "{ids:?}");
-        let (target, minted) =
-            crate::responses_affinity::open_response_id(&response_key(), TENANT_A, &ids[0])
-                .unwrap();
-        assert_eq!(target, "m-2");
-        assert_eq!(
-            crate::responses_affinity::open_response_id(&response_key(), TENANT_A, &minted),
-            None,
-            "{minted}"
-        );
+        assert_eq!(ids[0], "msg_bdrk_1");
     }
 
     /// A key restricted to provider groups continues only through a target
@@ -11197,12 +11934,13 @@ data: [DONE]\n\n";
             "sk-caller",
             serde_json::json!({"team_id": "team-a", "allowed_provider_groups": ["gb"]}),
         ));
-        let app = build_platform_app(snap);
+        let app =
+            raw_id_contract::legacy_router(snap, &[("m-1", "resp_up_ga"), ("m-3", "resp_up_gb")]);
         let from_ga = crate::responses_affinity::seal_response_id(
             &response_key(),
             TENANT_A,
-            "m-1",
-            "resp_up",
+            raw_id_contract::MODEL,
+            "resp_up_ga",
         );
         let resp = app
             .clone()
@@ -11218,8 +11956,8 @@ data: [DONE]\n\n";
         let from_gb = crate::responses_affinity::seal_response_id(
             &response_key(),
             TENANT_A,
-            "m-3",
-            "resp_up",
+            raw_id_contract::OTHER_MODEL,
+            "resp_up_gb",
         );
         let resp = app
             .oneshot(make_req(
@@ -11413,6 +12151,117 @@ data: [DONE]\n\n";
                     "{body:?}"
                 );
             }
+        }
+    }
+    include!("responses_raw_ids_tests.rs");
+}
+
+#[cfg(test)]
+mod resumed_raw_failure_tests {
+    use super::*;
+    use futures::StreamExt;
+    use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn held_native_failures_keep_class_and_replace_partial_content() {
+        use crate::stream_timeout::{RawStreamError, RawStreamFailure};
+        use aisix_core::models::GuardrailHookPoint;
+        use aisix_guardrails::{builtin_rule, Guardrail, GuardrailChain, PiiAction, PiiGuardrail};
+
+        for (error, expected, status) in [
+            (
+                RawStreamError::DependencyUnavailable,
+                RawStreamFailure::DependencyUnavailable,
+                503,
+            ),
+            (
+                RawStreamError::UpstreamDecode,
+                RawStreamFailure::UpstreamDecode,
+                502,
+            ),
+        ] {
+            let pii = PiiGuardrail::new(
+                vec![builtin_rule("email", PiiAction::Mask).unwrap()],
+                GuardrailHookPoint::Output,
+                262_144,
+                false,
+            );
+            let chain = Arc::new(GuardrailChain::new(vec![
+                Arc::new(pii) as Arc<dyn Guardrail>
+            ]));
+            let raw = concat!(
+                r#"data: {"type":"response.created","response":{"id":"resp_hold","output":[]}}"#,
+                "\n\n",
+                r#"data: {"type":"response.output_text.delta","delta":"private@example.com"}"#,
+                "\n\n",
+            );
+            let upstream: RawResponsesByteStream = Box::pin(futures::stream::iter([
+                Ok::<_, RawStreamError>(bytes::Bytes::from_static(raw.as_bytes())),
+                Err(error),
+            ]));
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let captured_out = Arc::clone(&captured);
+            let now = Instant::now();
+            let mark =
+                crate::responses_affinity::ContextAffinity::default().response_mark("m", false);
+            let stream = build_held_responses_stream(
+                upstream,
+                chain,
+                now,
+                now,
+                None,
+                None,
+                Default::default(),
+                "alias".into(),
+                "gpt-4o".into(),
+                bytes::Bytes::from_static(br#"{"input":"hi"}"#),
+                "model".into(),
+                mark,
+                Arc::new(std::sync::OnceLock::new()),
+                move |usage, _, _, _, failure| captured_out.lock().unwrap().push((usage, failure)),
+            );
+            let wire = stream.map(|item| item.unwrap().to_vec()).concat().await;
+            let text = String::from_utf8(wire).unwrap();
+            assert!(!text.contains("private@example.com"));
+            let events = crate::redact::parse_sse_json_stream(text.as_bytes()).0;
+            assert!(events.iter().any(|event| event["type"] == "error"));
+            assert!(!events
+                .iter()
+                .any(|event| event["type"] == "response.completed"));
+            for event in events
+                .iter()
+                .filter(|event| event.get("response").is_some())
+            {
+                assert_eq!(event["response"]["id"], "resp_hold");
+                assert_eq!(event["response"]["output"], serde_json::json!([]));
+            }
+            let rows = captured.lock().unwrap();
+            assert_eq!(rows.len(), 1);
+            let (usage, failure) = &rows[0];
+            assert_eq!(*failure, Some(expected));
+            assert_eq!(usage.failure.as_ref().unwrap().status, status);
+        }
+    }
+    #[test]
+    fn held_refusal_keeps_the_known_response_id_without_blocked_output() {
+        let mark = crate::responses_affinity::ContextAffinity::default().response_mark("m", false);
+        let bytes = responses_refusal_body(
+            Default::default(),
+            "alias",
+            &mark,
+            Some("resp_known_raw"),
+            None,
+            None,
+        );
+        let events = crate::redact::parse_sse_json_stream(&bytes).0;
+        let snapshots: Vec<_> = events
+            .iter()
+            .filter_map(|event| event.get("response"))
+            .collect();
+        assert!(!snapshots.is_empty());
+        for response in snapshots {
+            assert_eq!(response["id"], "resp_known_raw");
+            assert_eq!(response["output"], serde_json::json!([]));
         }
     }
 }

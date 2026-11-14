@@ -67,9 +67,7 @@ export function Accounts({ canEdit, operator, onGoto }: TabProps) {
         dataLead={customers !== null ? <>{error ? "刷新失败，以下为最近成功读取值。" : ""}全部客户租户 <strong>{fmtInt(customers.length)}</strong> 个，其中 <strong>{fmtInt(stopped ?? 0)}</strong> 个额度已用尽。</> : error ? "账户快照读取失败，请重试。" : "正在读取全部账户快照。"}
         description="可用额度 = 余额 + 信用额度，用尽即停止调用（预付透支到 0，后付同样透支到 0，月底结算）。平台内部租户不受限制，排在最后。"
         actions={
-          <Button type="button" icon="refresh" onClick={() => void load()}>
-            刷新
-          </Button>
+          <Button type="button" icon="refresh" className="finance-icon-button" aria-label="刷新" title="刷新账户" onClick={() => void load()} />
         }
       />
       <BentoGrid className="mb-3" aria-label="账户概况">
@@ -143,18 +141,16 @@ export function Accounts({ canEdit, operator, onGoto }: TabProps) {
                   <thead>
                     <tr>
                       <th>租户</th>
-                      <th>模式</th>
                       <th className="num">余额</th>
                       <th className="num">信用额度</th>
                       <th className="num">可用</th>
                       <th>状态</th>
-                      <th className="num side-opt">待审批充值</th>
                     </tr>
                   </thead>
                   <tbody>
                     {table.rows.map((a) => (
-                      <tr key={a.tenant_id}>
-                        <td>
+                      <tr data-finance-record key={a.tenant_id}>
+                        <td data-label="租户">
                           <span className="flex min-w-0 items-center gap-2">
                             <button
                               type="button"
@@ -167,13 +163,14 @@ export function Accounts({ canEdit, operator, onGoto }: TabProps) {
                             </button>
                             {a.is_internal && <span className="tag">平台内部</span>}
                           </span>
+                          <span className="cell-note">{MODE_LABEL[a.billing_mode] ?? a.billing_mode}</span>
                         </td>
-                        <td className="text-text-2">{MODE_LABEL[a.billing_mode] ?? a.billing_mode}</td>
-                        <td className="num">{fmtMicroCny(a.balance_micro_cny)}</td>
-                        <td className="num">{fmtMicroCny(a.credit_limit_micro_cny)}</td>
-                        <td className="num font-normal">{fmtMicroCny(a.available_micro_cny)}</td>
-                        <td>{a.is_internal ? <span className="text-muted-foreground">—</span> : <AccountState account={a} />}</td>
-                        <td className="num side-opt">{fmtInt(a.pending_topups)}</td>
+                        <td data-label="余额" className="num">{fmtMicroCny(a.balance_micro_cny)}</td>
+                        <td data-label="信用额度" className="num">{fmtMicroCny(a.credit_limit_micro_cny)}</td>
+                        <td data-label="可用" className="num font-normal">{fmtMicroCny(a.available_micro_cny)}</td>
+                        <td data-label="状态">{a.is_internal ? <span className="text-muted-foreground">—</span> : <AccountState account={a} />}
+                          <span className="cell-note">待审批充值 {fmtInt(a.pending_topups)}</span>
+                        </td>
                       </tr>
                     ))}
                   </tbody>

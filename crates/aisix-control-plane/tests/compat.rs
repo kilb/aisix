@@ -613,3 +613,442 @@ async fn an_api_key_with_endpoint_families_waits_for_the_gateways_that_read_them
         .await
         .expect("a family withdrawn is not refused");
 }
+
+// 删除客户扩展的独立门槛会让旧开发构建立即获授已知但不隔离的族。
+#[tokio::test]
+async fn customer_endpoint_expansion_refuses_unproven_development_gateway_builds() {
+    for cp_version in ["dev+sha-12ab345", "dev", "dev+sha-", "1.9.0+sha-12ab345"] {
+        let Some(cp) = TestCp::start_stamped(cp_version).await else {
+            return;
+        };
+        let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+        let gw = Gateway::issue(&cp, &admin).await;
+        for gateway in [
+            "dev+sha-f0f2360",
+            "dev",
+            "dev+sha-",
+            "dev+sha-not-a-commit",
+            "garbled",
+            "1.8.2+sha-f0f2360",
+        ] {
+            gw.beat("customer-expansion-unproven-v9", gateway).await;
+            for family in [
+                "images",
+                "audio",
+                "videos",
+                "rerank",
+                "decisions",
+                "realtime",
+                "files",
+                "batches",
+                "fine_tuning",
+                "moderations",
+                "content_provenance_checks",
+            ] {
+                let id = Uuid::new_v4();
+                let result = write_key(
+                    &cp,
+                    id,
+                    json!({
+                        "key_hash": format!("customer-unproven-{id}"),
+                        "allowed_model_ids": [],
+                        "allowed_endpoints": ["chat_completions", family],
+                    }),
+                    false,
+                )
+                .await;
+                let error =
+                    result.expect_err(&format!("{cp_version} must defer {family} on {gateway}"));
+                assert_eq!(
+                    (error.status.as_u16(), error.code),
+                    (422, "gateway_too_old")
+                );
+                assert_eq!(error.details[0].path, "/allowed_endpoints");
+                let stored: i64 =
+                    sqlx::query_scalar("SELECT count(*) FROM gw_resources WHERE id = $1")
+                        .bind(id)
+                        .fetch_one(cp.db().pool())
+                        .await
+                        .expect("count refused key");
+                assert_eq!(stored, 0, "a refused grant must not be stored");
+            }
+        }
+    }
+}
+
+// 精确提交标识可证明同一构建；发行版则仍按本次发行的语义版本比较。
+#[tokio::test]
+async fn customer_endpoint_expansion_accepts_proven_builds_and_preserves_generic_dev_semantics() {
+    for (cp_version, gateway) in [
+        ("dev+sha-12ab345", "dev+sha-12ab345"),
+        ("1.9.0+sha-12ab345", "1.9.0+sha-98cd765"),
+        ("1.9.0+sha-12ab345", "1.10.0+sha-98cd765"),
+    ] {
+        let Some(cp) = TestCp::start_stamped(cp_version).await else {
+            return;
+        };
+        let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+        let gw = Gateway::issue(&cp, &admin).await;
+        gw.beat("customer-expansion-proven-v9", gateway).await;
+        for family in ["files", "batches", "videos"] {
+            let id = Uuid::new_v4();
+            write_key(
+                &cp,
+                id,
+                json!({
+                    "key_hash": format!("customer-proven-{id}"),
+                    "allowed_model_ids": [], "allowed_endpoints": [family],
+                }),
+                false,
+            )
+            .await
+            .expect("a proven build can receive the expanded family");
+        }
+    }
+    let Some(cp) = TestCp::start_stamped("dev+sha-12ab345").await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let gw = Gateway::issue(&cp, &admin).await;
+    gw.beat("customer-old-contract-v9", "dev+sha-f0f2360").await;
+    let id = Uuid::new_v4();
+    write_key(&cp, id, json!({
+        "key_hash": "customer-old-contract-v9", "allowed_model_ids": [],
+        "allowed_endpoints": ["chat_completions", "completions", "messages", "count_tokens", "responses", "embeddings", "models"],
+    }), false).await.expect("the existing seven-family contract remains unchanged");
+    let policy = create(
+        &cp,
+        &admin,
+        "cache_policies",
+        team_policy("customer-unrelated-v9"),
+    )
+    .await;
+    assert_eq!(
+        policy.status, 201,
+        "the generic Dev contract stays in place: {policy:?}"
+    );
+}
+
+// 不得把所有开发版本都当作同一构建，也不得把开发控制面当作已知发行门槛。
+#[tokio::test]
+async fn customer_endpoint_expansion_requires_a_real_shared_development_build_identity() {
+    for (cp_version, gateway) in [
+        ("dev", "dev"),
+        ("dev+sha-", "dev+sha-"),
+        ("dev+sha-not-a-commit", "dev+sha-not-a-commit"),
+        ("dev+sha-12ab345", "1.99.0+sha-98cd765"),
+        ("1.9.0+sha-12ab345", "dev+sha-12ab345"),
+        ("1.9.0+sha-12ab345", "1.9.0-rc.1+sha-98cd765"),
+    ] {
+        let Some(cp) = TestCp::start_stamped(cp_version).await else {
+            return;
+        };
+        let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+        let gw = Gateway::issue(&cp, &admin).await;
+        gw.beat("customer-no-proof-v9", gateway).await;
+        let id = Uuid::new_v4();
+        let error = write_key(
+            &cp,
+            id,
+            json!({
+                "key_hash": format!("customer-no-proof-{id}"), "allowed_model_ids": [],
+                "allowed_endpoints": ["files"],
+            }),
+            false,
+        )
+        .await
+        .expect_err(&format!("{cp_version} cannot prove support on {gateway}"));
+        assert_eq!(error.code, "gateway_too_old");
+    }
+}
+
+// 保留族后重新启用也必须再判断；关闭和撤销族本身不能受阻。
+#[tokio::test]
+async fn customer_endpoint_expansion_preserves_narrowing_but_rechecks_reenable() {
+    let Some(cp) = TestCp::start_stamped("dev+sha-12ab345").await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let gw = Gateway::issue(&cp, &admin).await;
+    gw.beat("customer-reenable-v9", "dev+sha-12ab345").await;
+    let id = Uuid::new_v4();
+    let key = |disabled: bool, families: Value| {
+        json!({
+            "key_hash": "customer-reenable-v9", "allowed_model_ids": [],
+            "allowed_endpoints": families, "disabled": disabled,
+        })
+    };
+    write_key(&cp, id, key(false, json!(["files", "batches"])), false)
+        .await
+        .expect("initial key");
+    gw.beat("customer-reenable-v9", "dev+sha-f0f2360").await;
+    write_key(&cp, id, key(true, json!(["files", "batches"])), true)
+        .await
+        .expect("disabling still works");
+    let error = write_key(&cp, id, key(false, json!(["files", "batches"])), true)
+        .await
+        .expect_err("re-enabling must be judged again");
+    assert_eq!(error.code, "gateway_too_old");
+    write_key(&cp, id, key(true, json!(["files"])), true)
+        .await
+        .expect("withdrawing a family still works");
+    let stored: Value = sqlx::query_scalar("SELECT doc FROM gw_resources WHERE id = $1")
+        .bind(id)
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("read narrowed key");
+    assert_eq!(stored["disabled"], true);
+    assert_eq!(stored["allowed_endpoints"], json!(["files"]));
+}
+
+// 实例上限导致清单不完整，即使已记录实例同构建也不能发布新权限。
+#[tokio::test]
+async fn customer_endpoint_expansion_refuses_an_incomplete_fleet_even_with_a_matching_build() {
+    let Some(cp) = TestCp::start_stamped("dev+sha-12ab345").await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let gw = Gateway::issue(&cp, &admin).await;
+    gw.beat("customer-capped-v9", "dev+sha-12ab345").await;
+    let changed =
+        sqlx::query("UPDATE dp_credentials SET instance_cap_hit_at = now() WHERE dp_id = $1::uuid")
+            .bind(&gw.dp_id)
+            .execute(cp.db().pool())
+            .await
+            .expect("record an incomplete test fleet");
+    assert_eq!(changed.rows_affected(), 1);
+    let id = Uuid::new_v4();
+    let error = write_key(&cp, id, json!({
+        "key_hash": "customer-capped-v9", "allowed_model_ids": [], "allowed_endpoints": ["videos"],
+    }), false).await.expect_err("the cap prevents proving all gateways support expansion");
+    assert_eq!(error.code, "gateway_too_old");
+}
+
+// 离线实例在完整24小时窗口内仍算数，不能以在线状态或已撤销凭据绕过。
+#[tokio::test]
+async fn customer_endpoint_expansion_keeps_recent_offline_and_revoked_instances_in_the_fleet() {
+    let Some(cp) = TestCp::start_stamped("dev+sha-12ab345").await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let old = Gateway::issue(&cp, &admin).await;
+    old.beat("customer-old-window-v9", "dev+sha-f0f2360").await;
+    age_instance(&cp, "customer-old-window-v9", "23 hours 59 minutes").await;
+    let changed =
+        sqlx::query("UPDATE dp_credentials SET revoked_at = now() WHERE dp_id = $1::uuid")
+            .bind(&old.dp_id)
+            .execute(cp.db().pool())
+            .await
+            .expect("revoke the test credential");
+    assert_eq!(changed.rows_affected(), 1);
+    let new = Gateway::issue(&cp, &admin).await;
+    new.beat("customer-new-window-v9", "dev+sha-12ab345").await;
+    let id = Uuid::new_v4();
+    let doc = json!({"key_hash": "customer-window-v9", "allowed_model_ids": [], "allowed_endpoints": ["batches"]});
+    let error = write_key(&cp, id, doc.clone(), false)
+        .await
+        .expect_err("the old heartbeat still counts");
+    assert_eq!(error.code, "gateway_too_old");
+    age_instance(&cp, "customer-old-window-v9", "24 hours 1 minute").await;
+    write_key(&cp, id, doc, false)
+        .await
+        .expect("the honestly aged test fleet now supports expansion");
+}
+
+// 旧开发实例可被既有逻辑无标记淘汰；当前满额清单仍不能证明从未遗漏。
+#[tokio::test]
+async fn customer_endpoint_expansion_refuses_a_full_fleet_that_can_have_lost_an_unsafe_dev_row() {
+    const BUILD: &str = "dev+sha-12ab345";
+    let Some(cp) = TestCp::start_stamped(BUILD).await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let gw = Gateway::issue(&cp, &admin).await;
+    at_the_cap_with_a_quiet_instance(&cp, &gw, "dev+sha-f0f2360", "10 minutes").await;
+    let online = aisix_control_plane::dp::heartbeat::MAX_INSTANCES - 1;
+    let changed = sqlx::query("UPDATE dp_instances SET version = $2 WHERE dp_id = $1::uuid AND instance_id LIKE 'online-7ca-%'")
+        .bind(&gw.dp_id).bind(BUILD).execute(cp.db().pool()).await.expect("stamp the real test instances");
+    assert_eq!(changed.rows_affected(), online as u64);
+    gw.beat("customer-replacement-v9", BUILD).await;
+    assert!(
+        !instance_exists(&cp, "quiet-7ca").await,
+        "the old row was really evicted"
+    );
+    assert_eq!(
+        cap_hit_at(&cp, &gw).await,
+        None,
+        "the existing generic Dev policy leaves no marker"
+    );
+    let versions: Vec<String> =
+        sqlx::query_scalar("SELECT version FROM dp_instances WHERE dp_id = $1::uuid")
+            .bind(&gw.dp_id)
+            .fetch_all(cp.db().pool())
+            .await
+            .expect("read the remaining instances");
+    assert_eq!(versions.len(), 128);
+    assert!(
+        versions.iter().all(|version| version == BUILD),
+        "all visible instances now prove support"
+    );
+    let id = Uuid::new_v4();
+    let error = write_key(&cp, id, json!({
+        "key_hash": "customer-evicted-dev-v9", "allowed_model_ids": [], "allowed_endpoints": ["files"],
+    }), false).await.expect_err("a full credential may have omitted an unsafe recent Dev instance");
+    assert_eq!(error.code, "gateway_too_old");
+}
+// 缺省与 null 原本开放所有族；改成明确18族只收紧，不能误当新授权。
+#[tokio::test]
+async fn customer_endpoint_expansion_allows_an_existing_wildcard_to_narrow_to_explicit_families() {
+    let Some(cp) = TestCp::start_stamped("dev+sha-12ab345").await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let gw = Gateway::issue(&cp, &admin).await;
+    let mut keys = Vec::new();
+    for endpoints in [None, Some(Value::Null)] {
+        let id = Uuid::new_v4();
+        let mut before = json!({
+            "key_hash": format!("customer-wildcard-{id}"),
+            "allowed_model_ids": [], "disabled": false,
+        });
+        if let Some(endpoints) = endpoints {
+            before["allowed_endpoints"] = endpoints;
+        }
+        write_key(&cp, id, before.clone(), false)
+            .await
+            .expect("an existing unrestricted key");
+        keys.push((id, before));
+    }
+    gw.beat("customer-wildcard-old-v9", "dev+sha-f0f2360").await;
+    for (id, before) in keys {
+        let mut narrowed = before;
+        narrowed["allowed_endpoints"] = json!([
+            "chat_completions",
+            "completions",
+            "messages",
+            "count_tokens",
+            "responses",
+            "embeddings",
+            "models",
+            "images",
+            "audio",
+            "videos",
+            "rerank",
+            "decisions",
+            "realtime",
+            "files",
+            "batches",
+            "fine_tuning",
+            "moderations",
+            "content_provenance_checks"
+        ]);
+        write_key(&cp, id, narrowed.clone(), true)
+            .await
+            .expect("restricting a wildcard to explicit families must save");
+        let stored: Value = sqlx::query_scalar("SELECT doc FROM gw_resources WHERE id = $1")
+            .bind(id)
+            .fetch_one(cp.db().pool())
+            .await
+            .expect("read the restricted key");
+        assert_eq!(stored, narrowed, "the complete restriction must be stored");
+    }
+}
+
+// 关闭密钥、撤回透传路由和提前到期都应立即保存，即使同时写出明确族列表。
+#[tokio::test]
+async fn customer_endpoint_expansion_allows_disabling_and_other_narrowing_of_an_existing_wildcard()
+{
+    let Some(cp) = TestCp::start_stamped("dev+sha-12ab345").await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let gw = Gateway::issue(&cp, &admin).await;
+    let mut keys = Vec::new();
+    for endpoints in [None, Some(Value::Null)] {
+        let id = Uuid::new_v4();
+        let mut before = json!({
+            "key_hash": format!("customer-wildcard-close-{id}"), "allowed_model_ids": [],
+            "allowed_routes": ["customer-route-withdrawn-v9"], "disabled": false,
+            "expires_at": "2030-11-14T00:00:00Z",
+        });
+        if let Some(endpoints) = endpoints {
+            before["allowed_endpoints"] = endpoints;
+        }
+        write_key(&cp, id, before.clone(), false)
+            .await
+            .expect("an existing unrestricted key");
+        keys.push((id, before));
+    }
+    gw.beat("customer-wildcard-close-old-v9", "dev+sha-f0f2360")
+        .await;
+    for (id, before) in keys {
+        let mut narrowed = before;
+        narrowed["allowed_endpoints"] = json!(["files"]);
+        narrowed["allowed_routes"] = json!([]);
+        narrowed["disabled"] = json!(true);
+        narrowed["expires_at"] = json!("2029-11-14T00:00:00Z");
+        write_key(&cp, id, narrowed.clone(), true)
+            .await
+            .expect("a simultaneous close and restriction must save");
+        let stored: Value = sqlx::query_scalar("SELECT doc FROM gw_resources WHERE id = $1")
+            .bind(id)
+            .fetch_one(cp.db().pool())
+            .await
+            .expect("read the closed key");
+        assert_eq!(stored, narrowed, "all restrictions must be stored together");
+    }
+}
+
+// 旧丢弃计数保护行可比被淘汰实例更早离开24小时窗口，满额判断须保留全部行。
+#[tokio::test]
+async fn customer_endpoint_expansion_counts_old_protected_rows_when_recent_rows_fall_below_the_cap()
+{
+    const BUILD: &str = "dev+sha-12ab345";
+    let Some(cp) = TestCp::start_stamped(BUILD).await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let gw = Gateway::issue(&cp, &admin).await;
+    at_the_cap_with_a_quiet_instance(&cp, &gw, "dev+sha-f0f2360", "10 minutes").await;
+    let changed = sqlx::query("UPDATE dp_instances SET version = $2 WHERE dp_id = $1::uuid AND instance_id LIKE 'online-7ca-%'")
+        .bind(&gw.dp_id).bind(BUILD).execute(cp.db().pool()).await.expect("stamp the retained test instances");
+    assert_eq!(changed.rows_affected(), 127);
+    let protected = sqlx::query(
+        "UPDATE dp_instances SET last_seen_at = now() - interval '23 hours 59 minutes', usage_event_drops = $2 \
+         WHERE dp_id = $1::uuid AND instance_id = 'online-7ca-1'",
+    ).bind(&gw.dp_id).bind(json!({"sink_full": 1})).execute(cp.db().pool()).await.expect("seed the older protected report");
+    assert_eq!(protected.rows_affected(), 1);
+    gw.beat("customer-protected-replacement-v9", BUILD).await;
+    assert!(
+        !instance_exists(&cp, "quiet-7ca").await,
+        "the unsafe recent Dev row was evicted"
+    );
+    assert!(
+        instance_exists(&cp, "online-7ca-1").await,
+        "the older drop report was retained"
+    );
+    assert_eq!(
+        cap_hit_at(&cp, &gw).await,
+        None,
+        "generic Dev eviction leaves no marker"
+    );
+    age_instance(&cp, "online-7ca-1", "25 hours").await;
+    let counts: (i64, i64) = sqlx::query_as(
+        "SELECT count(*), count(*) FILTER (WHERE last_seen_at > now() - interval '24 hours') \
+         FROM dp_instances WHERE dp_id = $1::uuid",
+    )
+    .bind(&gw.dp_id)
+    .fetch_one(cp.db().pool())
+    .await
+    .expect("count all and recent reports");
+    assert_eq!(
+        counts,
+        (128, 127),
+        "the recent-only count would miss the full credential"
+    );
+    let id = Uuid::new_v4();
+    let error = write_key(&cp, id, json!({
+        "key_hash": "customer-protected-cap-v9", "allowed_model_ids": [], "allowed_endpoints": ["batches"],
+    }), false).await.expect_err("old protected rows still require the conservative capacity gate");
+    assert_eq!(error.code, "gateway_too_old");
+}

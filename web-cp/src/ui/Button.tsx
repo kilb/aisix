@@ -20,6 +20,8 @@ export interface ButtonProps extends ComponentProps<"button"> {
   block?: boolean;
   /** An icon before the label, or, with no children and an `aria-label`, the whole button. */
   icon?: IconName;
+  /** 使用领域 SVG 时显式指定仅图标；可访问名称由 aria-label 提供。 */
+  iconOnly?: boolean;
   /**
    * In flight: the button is disabled, so a second click cannot send the
    * request again, and a spinner takes the label's place at the same
@@ -40,7 +42,7 @@ export interface ButtonProps extends ComponentProps<"button"> {
 
 /** shadcn/ui's button, in this app's four kinds and two sizes. */
 const buttonClass = cva(
-  "btn relative inline-flex shrink-0 cursor-pointer select-none items-center justify-center gap-2 whitespace-nowrap rounded-(--r-button) text-body font-medium leading-4 transition-colors duration-150 disabled:cursor-not-allowed disabled:opacity-50 aria-disabled:cursor-not-allowed aria-disabled:opacity-50 [&_svg]:size-4 [&_svg]:shrink-0",
+  "btn relative inline-flex shrink-0 cursor-pointer select-none items-center justify-center gap-2 whitespace-nowrap rounded-(--r-button) text-body font-medium leading-5 transition-colors duration-120 disabled:cursor-not-allowed disabled:opacity-50 aria-disabled:cursor-not-allowed aria-disabled:opacity-50 [&_svg]:size-4 [&_svg]:shrink-0",
   {
     variants: {
       kind: {
@@ -49,7 +51,7 @@ const buttonClass = cva(
         danger: "border border-destructive bg-destructive text-destructive-foreground enabled:hover:bg-destructive/90",
         quiet: "border border-transparent text-text-2 enabled:hover:bg-foreground/6 enabled:hover:text-foreground",
       },
-      size: { md: "h-11 min-w-11 px-5", sm: "h-11 min-w-11 px-4 text-caption" },
+      size: { md: "h-11 min-w-11 px-5", sm: "h-11 min-w-11 px-4 text-body" },
       iconOnly: { true: "px-0", false: "" },
       block: { true: "w-full", false: "" },
     },
@@ -71,6 +73,7 @@ export function Button({
   size,
   block = false,
   icon,
+  iconOnly: explicitIconOnly,
   busy = false,
   busyLabel = "处理中…",
   disabledReason,
@@ -83,7 +86,7 @@ export function Button({
   ...rest
 }: ButtonProps) {
   const tipId = useId();
-  const iconOnly = icon !== undefined && (children === undefined || children === null || children === false);
+  const iconOnly = explicitIconOnly ?? (icon !== undefined && (children === undefined || children === null || children === false));
   // Disabled with a stated reason: focusable, so the reason reaches the keyboard too.
   const reasoned = disabled && !busy && disabledReason !== undefined;
   const classes = cn(

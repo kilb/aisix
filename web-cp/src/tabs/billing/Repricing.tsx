@@ -443,11 +443,11 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
                 </thead>
                 <tbody>
                   {tenantTable.rows.map((t) => (
-                    <tr key={t.tenant_id}>
-                      <td className="font-medium">{t.tenant_name || t.tenant_id}</td>
-                      <td className="num">{t.events}</td>
-                      <td className="num">{t.changed}</td>
-                      <td className="num money">
+                    <tr data-finance-record key={t.tenant_id}>
+                      <td data-label="租户" className="font-medium">{t.tenant_name || t.tenant_id}</td>
+                      <td data-label="选中的调用" className="num">{t.events}</td>
+                      <td data-label="有变化" className="num">{t.changed}</td>
+                      <td data-label="差额" className="num money">
                         {fmtMicroCny(t.delta_micro_cny)}
                         <span className="cell-note">{deltaWord(t.delta_micro_cny)}</span>
                       </td>
@@ -519,9 +519,7 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
         title="运行记录"
         description={<>预览不会改动费用，最终执行需要管理员确认。{runs === null ? (loadError ? "运行记录读取失败，请重试。" : "正在读取运行记录。") : `已加载 ${formatCount(runs.length)} 条${next !== null ? "，还有更多记录。" : "，已到记录末尾。"}`}</>}
         actions={
-          <Button type="button" size="sm" icon="refresh" disabled={busy} onClick={() => void load()}>
-            刷新
-          </Button>
+          <Button type="button" size="sm" icon="refresh" className="finance-icon-button" aria-label="刷新" title="刷新重新计价运行" disabled={busy} onClick={() => void load()} />
         }
       />
       {loadError && (
@@ -553,9 +551,9 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
                 </tr>
               )}
               {table.rows.map((r) => (
-                <tr key={r.id}>
-                  <td className="w-28 whitespace-normal tabular text-text-2">{fmtBeijing(r.created_at)}</td>
-                  <td className="min-w-56 whitespace-normal">
+                <tr data-finance-record key={r.id}>
+                  <td data-label="时间" className="w-28 whitespace-normal tabular text-text-2">{fmtBeijing(r.created_at)}</td>
+                  <td data-label="范围" className="min-w-56 whitespace-normal">
                     {fmtBeijing(r.filter.from)} 至 {fmtBeijing(r.filter.to)}
                     <span className="cell-note">
                       模型：{modelName(r.filter.model_id) ?? "全部"}；租户：{tenantName(r.filter.tenant_id) ?? "全部"}；
@@ -563,15 +561,15 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
                       {r.filter.status ? statusLabel(r.filter.status) : "全部"}
                     </span>
                   </td>
-                  <td className="min-w-28 whitespace-normal">{r.reason}</td>
-                  <td>
+                  <td data-label="原因" className="min-w-28 whitespace-normal">{r.reason}</td>
+                  <td data-label="状态">
                     <Lamp state={r.status === "applied" ? "applied" : "pending"}>{r.status === "applied" ? "已执行" : "已预览"}</Lamp>
                   </td>
-                  <td className="num money min-w-20">
+                  <td data-label="差额" className="num money min-w-20">
                     {fmtMicroCny(r.delta_micro_cny)}
                     <span className="cell-note">{deltaWord(r.delta_micro_cny)}</span>
                   </td>
-                  <td className="right">
+                  <td data-label="操作" className="right">
                     <Button size="sm" type="button" disabled={busy} onClick={() => void view(r.id)}>
                       查看
                     </Button>

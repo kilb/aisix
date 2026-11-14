@@ -498,6 +498,7 @@ mod tests {
 
     fn resp(content: &str) -> ChatResponse {
         ChatResponse {
+            native_envelope: None,
             logprobs: None,
             more_choices: Vec::new(),
             id: "r".into(),

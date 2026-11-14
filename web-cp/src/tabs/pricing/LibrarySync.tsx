@@ -19,6 +19,7 @@ import {
   longContextChange,
   longContextLines,
   longContextText,
+  removedTierWarning,
   syncRequest,
   syncStateText,
 } from "../../lib/library";
@@ -271,6 +272,11 @@ export function LibrarySync({ canEdit, generation, cardNumber = 4 }: { canEdit: 
   });
 
   const request = preview ? syncRequest(items, preview.cap, chosen) : [];
+  const tierWarnings = request.flatMap((target) => {
+    const item = items.find((item) => item.model_id === target.model_id);
+    const warning = removedTierWarning(target.card, item?.current?.card);
+    return warning && item ? [{ model_id: item.model_id, name: item.name, warning }] : [];
+  });
   const writable = items.filter((i) => {
     const s = shown(i).state;
     return s === "create" || s === "update";
@@ -369,32 +375,37 @@ export function LibrarySync({ canEdit, generation, cardNumber = 4 }: { canEdit: 
             </div>
           </div>
           {canEdit && (
-            <div
-              className="library-confirm mt-6 mb-0 flex flex-wrap items-center gap-x-4 gap-y-3 rounded-cell bg-well p-4 text-ink-soft"
-              role="group"
-              aria-label="确认同步"
-            >
-              <label className="check mb-0 min-h-11">
-                <input type="checkbox" checked={attested} onChange={(e) => setAttested(e.target.checked)} />
-                <span>{ATTESTATION}</span>
-              </label>
-              {writable > request.length && (
-                <span className="text-caption text-ink-soft">
-                  共 {writable} 个模型待同步，一次最多同步 {preview.cap} 个；同步后再次确认剩下的。
-                </span>
-              )}
-              <Button
-                type="button"
-                kind="primary"
-                className="ml-auto"
-                busy={syncing}
-                busyLabel="同步中…"
-                disabled={!attested || request.length === 0}
-                onClick={() => void sync()}
+            <>
+              {tierWarnings.length > 0 && <div className="note" role="note" aria-label="本次同步将移除的价格档位">
+                {tierWarnings.map(({ model_id, name, warning }) => <p key={model_id}>{name}：{warning}</p>)}
+              </div>}
+              <div
+                className="library-confirm mt-6 mb-0 flex flex-wrap items-center gap-x-4 gap-y-3 rounded-cell bg-well p-4 text-ink-soft"
+                role="group"
+                aria-label="确认同步"
               >
-                同步 {request.length} 个模型
-              </Button>
-            </div>
+                <label className="check mb-0 min-h-11">
+                  <input type="checkbox" checked={attested} onChange={(e) => setAttested(e.target.checked)} />
+                  <span>{ATTESTATION}</span>
+                </label>
+                {writable > request.length && (
+                  <span className="text-caption text-ink-soft">
+                    共 {writable} 个模型待同步，一次最多同步 {preview.cap} 个；同步后再次确认剩下的。
+                  </span>
+                )}
+                <Button
+                  type="button"
+                  kind="primary"
+                  className="ml-auto"
+                  busy={syncing}
+                  busyLabel="同步中…"
+                  disabled={!attested || request.length === 0}
+                  onClick={() => void sync()}
+                >
+                  同步 {request.length} 个模型
+                </Button>
+              </div>
+            </>
           )}
           {failure && (
             <div className="note crit" role="alert">
@@ -423,19 +434,21 @@ export function LibrarySync({ canEdit, generation, cardNumber = 4 }: { canEdit: 
                   row.state === "ambiguous" || row.state === "unmatched"
                     ? null
                     : longContextChange(row.entry?.card ?? null, item.current?.card ?? null);
+                const tierWarning = row.state === "update" ? removedTierWarning(row.entry?.card, item.current?.card) : null;
                 return (
-                  <Fragment key={item.model_id}><tr data-model={item.name} data-state={item.state} data-shown={row.state}>
-                    <td className="font-medium">
+                  <Fragment key={item.model_id}><tr data-finance-record data-model={item.name} data-state={item.state} data-shown={row.state}>
+                    <td data-label="模型" className="font-medium">
                       <span className="trunc" title={item.name}>
                         {item.name}
                       </span>
                       {item.state !== "ambiguous" && <Chosen item={item} onForget={() => void forget(item)} />}
                     </td>
-                    <td>
+                    <td data-label="状态">
                       <span className="tag">{syncStateText(row.state)}</span>
                       {warning && <span className="cell-note library-flags">{warning}</span>}
+                      {tierWarning && <span className="cell-note library-flags">{tierWarning}</span>}
                     </td>
-                    <td>
+                    <td data-label="价格库条目">
                       <EntryCell
                         item={item}
                         chosen={chosen[item.model_id]}
@@ -452,8 +465,8 @@ export function LibrarySync({ canEdit, generation, cardNumber = 4 }: { canEdit: 
                         </span>
                       )}
                     </td>
-                    <td className="text-caption">{item.current ? <CardSummary card={item.current.card} /> : "未定价"}</td>
-                    <td className="text-caption">
+                    <td data-label="现行基准价（美元）" className="text-caption">{item.current ? <CardSummary card={item.current.card} /> : "未定价"}</td>
+                    <td data-label="价格库价格（美元）" className="text-caption">
                       {row.state === "ambiguous" || row.state === "unmatched" ? "—" : <CardSummary card={row.entry?.card} />}
                     </td>
                   </tr>
@@ -529,6 +542,7 @@ export function LibrarySyncOne({
   const writeable = state === "create" || state === "update";
   const warning =
     entry && state !== "flagged" ? longContextChange(entry.card, current?.card ?? null) : null;
+  const tierWarning = writeable ? removedTierWarning(entry?.card, current?.card) : null;
 
   async function forget(item: SyncItem) {
     setFailure(null);
@@ -600,6 +614,7 @@ export function LibrarySyncOne({
           )}
           {entry && Object.keys(entry.card ?? {}).some((t) => t !== "default") && <p className="hint">{TIER_HINT}</p>}
           {warning && <p className="hint">{warning}</p>}
+          {tierWarning && <p className="note" role="note">{tierWarning}</p>}
           {canEdit && writeable && (
             <div
               className="library-confirm m-0 flex flex-wrap items-center justify-between gap-3 border-t border-ink/7 pt-3"

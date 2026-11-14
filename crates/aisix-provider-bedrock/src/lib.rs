@@ -101,7 +101,11 @@ mod convert;
 mod errors;
 mod native;
 mod openai_compat;
+mod upstream_io;
 mod wire;
 
 pub use bridge::{BedrockBridge, BedrockPublisher};
 pub use native::init_mantle_endpoint;
+
+#[cfg(test)]
+mod upstream_io_tests;

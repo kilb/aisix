@@ -1,3 +1,4 @@
+import "./operations.css";
 import { useRecordTable } from "../lib/recordTable";
 import { RecordTools, RecordPager } from "../components/RecordTools";
 import { useCallback, useEffect, useId, useRef, useState } from "react";
@@ -8,7 +9,7 @@ import { messageFor } from "../lib/errors";
 import { errorText, fmtInt, fmtTime } from "../lib/fmt";
 import { Button } from "../ui/Button";
 import { useRefusalFocus } from "../ui/Field";
-import { DataTable, Loading } from "../ui/DataTable";
+import { OperationalTable as DataTable, Loading } from "../components/OperationalTable";
 import { Lamp } from "../ui/Lamp";
 import {
   BentoGrid,
@@ -136,8 +137,7 @@ export function Operators({ operator }: TabProps) {
           <DataTable label="全部运维账号">
             <thead>
               <tr>
-                <th>邮箱</th>
-                <th>显示名</th>
+                <th>账号</th>
                 <th>角色</th>
                 <th>状态</th>
                 <th>创建时间</th>
@@ -160,11 +160,11 @@ export function Operators({ operator }: TabProps) {
                         </span>
                         <span className="flex flex-col leading-tight">
                           <span className="font-medium">{a.email}</span>
+                          <span className="ops-cell-secondary">{a.display_name ?? "—"}</span>
                           {a.id === operator.id && <span className="hint mt-0.5 text-meta">（当前账号）</span>}
                         </span>
                       </span>
                     </td>
-                    <td>{a.display_name ?? <span className="text-muted-foreground">—</span>}</td>
                     <td>
                       <select
                         aria-label="角色"
@@ -268,6 +268,7 @@ export function Operators({ operator }: TabProps) {
 
   return (
     <Dialog.Root open={creating} onOpenChange={setCreating}>
+      <div className="cp-operations cp-operators">
       <PageHeader
         title="运维账号"
         eyebrow="平台访问 · 当前账号快照"
@@ -277,10 +278,7 @@ export function Operators({ operator }: TabProps) {
         description="管理员可以新建账号、调整角色、停用或启用。停用会立即结束该账号的全部会话；账号不会被删除，停用即收回访问。至少要保留一个可用的管理员。"
         actions={
           <>
-            <Button type="button" onClick={() => void reload()}>
-              <RefreshCw aria-hidden />
-              刷新
-            </Button>
+            <Button type="button" className="ops-icon-button" aria-label="刷新" title="刷新运维账号" onClick={() => void reload()}><RefreshCw aria-hidden /></Button>
             <Dialog.Trigger asChild>
               <Button
                 kind="primary"
@@ -295,27 +293,27 @@ export function Operators({ operator }: TabProps) {
         }
       />
       <BentoGrid>
-        <Card tone="inverse" className={span.d6}>
+        <Card className={`${span.d6} ops-snapshot`}>
           <CardHeader number={1} title="可用账号 · 全部运维账号" />
           {enabled === null
             ? (loadError ? <CardMessage onRetry={() => void reload()}>账号状态读取失败。</CardMessage> : <MetricSkeleton />)
             : <Metric size="hero">{fmtInt(enabled.length)}</Metric>}
           <CardFooter>
-            <dl className="grid grid-cols-2 gap-4 border-t border-surface/12 pt-4">
+            <dl className="grid grid-cols-2 gap-4 border-t border-line pt-4">
               <div>
-                <dt className="font-mono text-micro text-on-inverse-muted">可用管理员</dt>
+                <dt className="text-caption text-muted">可用管理员</dt>
                 <dd className="mt-2"><Metric size="value">{enabled === null ? "—" : fmtInt(enabled.filter((account) => account.role === "admin").length)}</Metric></dd>
               </div>
               <div>
-                <dt className="font-mono text-micro text-on-inverse-muted">已停用账号</dt>
+                <dt className="text-caption text-muted">已停用账号</dt>
                 <dd className="mt-2"><Metric size="value">{items === null || enabled === null ? "—" : fmtInt(items.length - enabled.length)}</Metric></dd>
               </div>
             </dl>
-            <p className="mt-4 text-caption text-on-inverse-muted">停用会立即结束全部会话。至少保留一位可用管理员。</p>
-            {loadError && items !== null && <p className="mt-3 text-caption text-on-inverse-muted">刷新失败，显示最近成功读取的状态。</p>}
+            <p className="mt-4 text-caption text-muted">停用会立即结束全部会话。至少保留一位可用管理员。</p>
+            {loadError && items !== null && <p className="mt-3 text-caption text-muted">刷新失败，显示最近成功读取的状态。</p>}
           </CardFooter>
         </Card>
-        <Card className={span.d6}>
+        <Card className={`${span.d6} ops-snapshot`}>
           <CardHeader number={2} title="角色分布 · 全部账号" description="包含可用与已停用账号；角色决定平台操作范围。" />
           <CardFooter>
             {items === null ? (loadError
@@ -326,6 +324,7 @@ export function Operators({ operator }: TabProps) {
         </Card>
         {list}
       </BentoGrid>
+      </div>
       {creating && <CreateForm onCreated={created} onCancel={() => setCreating(false)} />}
     </Dialog.Root>
   );

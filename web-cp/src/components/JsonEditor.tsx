@@ -1,3 +1,4 @@
+import "./OperationalFields.css";
 import { useId, useState } from "react";
 import type { Detail } from "../lib/api";
 import { Button } from "../ui/Button";
@@ -18,6 +19,7 @@ export function JsonEditor({
   details: Detail[];
 }) {
   const problemsId = useId();
+  const formatErrorId = `${problemsId}-format`;
   const [formatError, setFormatError] = useState<string | null>(null);
 
   function format() {
@@ -36,13 +38,13 @@ export function JsonEditor({
         spellCheck={false}
         readOnly={!onChange}
         value={value}
-        className="min-h-90 w-full rounded-xl border border-line bg-surface font-mono text-caption leading-relaxed text-ink"
+        className="min-h-90 w-full rounded-cell border border-line bg-surface font-mono text-caption leading-relaxed text-ink"
         onChange={(e) => {
           setFormatError(null);
           onChange?.(e.target.value);
         }}
-        aria-invalid={details.length > 0 ? true : undefined}
-        aria-describedby={details.length > 0 ? problemsId : undefined}
+        aria-invalid={details.length > 0 || formatError ? true : undefined}
+        aria-describedby={[details.length > 0 ? problemsId : null, formatError ? formatErrorId : null].filter(Boolean).join(" ") || undefined}
       />
       {onChange && (
         <div className="mt-2 flex justify-end">
@@ -51,11 +53,11 @@ export function JsonEditor({
           </Button>
         </div>
       )}
-      {formatError && <div className="note crit">{formatError}</div>}
+      {formatError && <div id={formatErrorId} className="note crit" role="alert">{formatError}</div>}
       {details.length > 0 && (
         <ul
           id={problemsId}
-          className="json-problems mt-3 list-none rounded-2xl border border-line bg-well px-4 py-3 text-caption text-ink-soft"
+          className="json-problems mt-3 list-none rounded-cell border border-line bg-well px-4 py-3 text-caption text-ink-soft"
           aria-label="校验问题"
         >
           {details.map((d, i) => (

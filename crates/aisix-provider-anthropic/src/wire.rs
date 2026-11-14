@@ -223,20 +223,33 @@ impl<'a> AnthropicMessage<'a> {
         blocks: Option<&[serde_json::Value]>,
         tool_calls: Option<&[serde_json::Value]>,
     ) -> Self {
-        // Text only, deliberately: an Anthropic assistant turn carries what
-        // the model produced (text / tool_use / thinking), and `image` is not
-        // among those shapes. Mapping a media part into one — as the user
-        // turn does — would turn a replay that previously worked into an
-        // upstream 400.
-        let mut content: Vec<serde_json::Value> = match blocks {
-            Some(blocks) => anthropic_text_blocks(blocks),
+        // 已签名的原生历史必须完整、原序回放，不能过滤其中任何一块。
+        let mut content = match blocks {
+            Some(blocks) if has_native_thinking(blocks) => blocks.to_vec(),
+            Some(blocks) => blocks
+                .iter()
+                .filter_map(
+                    |block| match block.get("type").and_then(serde_json::Value::as_str) {
+                        Some("tool_use") => Some(block.clone()),
+                        Some("text") => anthropic_text_block(block),
+                        _ => None,
+                    },
+                )
+                .collect(),
             None => Vec::new(),
         };
         if content.is_empty() && !text.is_empty() {
             content.push(serde_json::json!({"type": "text", "text": text}));
         }
         if let Some(tcs) = tool_calls {
-            content.extend(tool_use_blocks_from_openai(tcs));
+            for block in tool_use_blocks_from_openai(tcs) {
+                if !content.iter().any(|existing| {
+                    existing.get("type").and_then(serde_json::Value::as_str) == Some("tool_use")
+                        && existing.get("id") == block.get("id")
+                }) {
+                    content.push(block);
+                }
+            }
         }
         if content.is_empty() {
             content.push(serde_json::json!({"type": "text", "text": ""}));
@@ -247,6 +260,25 @@ impl<'a> AnthropicMessage<'a> {
             _lifetime: std::marker::PhantomData,
         }
     }
+}
+
+fn has_native_thinking(blocks: &[serde_json::Value]) -> bool {
+    blocks.iter().any(
+        |block| match block.get("type").and_then(serde_json::Value::as_str) {
+            Some("thinking") => {
+                block
+                    .get("thinking")
+                    .is_some_and(serde_json::Value::is_string)
+                    && block
+                        .get("signature")
+                        .is_some_and(serde_json::Value::is_string)
+            }
+            Some("redacted_thinking") => {
+                block.get("data").is_some_and(serde_json::Value::is_string)
+            }
+            _ => false,
+        },
+    )
 }
 
 /// Forward the `{type:"text", …}` blocks of an OpenAI-shape content
@@ -576,7 +608,7 @@ pub fn split_system_with<'a>(
         // holds only that would become an empty text block, which the
         // upstream rejects. The user turns it separated fold together
         // below.
-        if m.is_reasoning_only() {
+        if m.is_reasoning_only() && !m.content_blocks.as_deref().is_some_and(has_native_thinking) {
             continue;
         }
         match m.role {
@@ -816,6 +848,34 @@ pub fn build_request<'a>(
         .remove("tools")
         .and_then(translate_openai_tools_to_anthropic);
     let requested_tool_choice = extras.remove("tool_choice");
+    if let Some(allowed) = requested_tool_choice
+        .as_ref()
+        .filter(|choice| {
+            choice.get("type").and_then(serde_json::Value::as_str) == Some("allowed_tools")
+        })
+        .and_then(|choice| choice.pointer("/allowed_tools/tools"))
+        .and_then(serde_json::Value::as_array)
+    {
+        if let Some(declarations) = tools.as_mut() {
+            declarations.retain(|tool| {
+                // 原生 server tools 不是 OpenAI function 子集中的声明。
+                if tool
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|kind| kind != "custom")
+                {
+                    return true;
+                }
+                allowed.iter().any(|entry| {
+                    entry.get("type").and_then(serde_json::Value::as_str) == Some("function")
+                        && entry.pointer("/function/name") == tool.get("name")
+                })
+            });
+            if declarations.is_empty() {
+                tools = None;
+            }
+        }
+    }
     if tools.is_none() && requested_tool_choice.is_some() {
         tracing::debug!("dropping tool_choice: no tool survived translation to Anthropic");
     }
@@ -959,6 +1019,8 @@ const OPENAI_ONLY_FIELDS: &[&str] = &[
     "logit_bias",
     "logprobs",
     "modalities",
+    "moderation",
+    "prompt_cache_options",
     "n",
     "prediction",
     "presence_penalty",
@@ -1822,10 +1884,8 @@ pub fn translate_openai_tools_to_anthropic(
 ///   {type:"function",                   {"type":"tool",
 ///    function:{name:"X"}}           →    "name":"X"}
 ///
-/// `null` and the shapes naming something Claude cannot be offered — an
-/// `allowed_tools` subset, a `custom` tool — set no choice. Any other
-/// shape is not a valid OpenAI `tool_choice` and is refused, naming the
-/// field.
+/// allowed_tools 的模式在此映射，实际声明由 build_request 收窄。
+/// custom 工具无目标槽而丢弃；非法自身协议形状返回带字段名的错误。
 pub fn translate_openai_tool_choice_to_anthropic(
     v: serde_json::Value,
 ) -> Result<Option<serde_json::Value>, BridgeError> {
@@ -1855,7 +1915,18 @@ pub fn translate_openai_tool_choice_to_anthropic(
                     })?;
                 Ok(Some(serde_json::json!({"type": "tool", "name": name})))
             }
-            Some("allowed_tools" | "custom") => Ok(None),
+            Some("allowed_tools") => {
+                let mode = o
+                    .get("allowed_tools")
+                    .and_then(|allowed| allowed.get("mode"))
+                    .and_then(serde_json::Value::as_str);
+                match mode {
+                    Some("auto") => Ok(Some(serde_json::json!({"type":"auto"}))),
+                    Some("required") => Ok(Some(serde_json::json!({"type":"any"}))),
+                    _ => Err(invalid()),
+                }
+            }
+            Some("custom") => Ok(None),
             _ => Err(invalid()),
         },
         _ => Err(invalid()),
@@ -2240,7 +2311,7 @@ pub struct AnthropicResponse {
     pub id: String,
     pub model: String,
     #[serde(default)]
-    pub content: Vec<AnthropicResponseBlock>,
+    pub content: Vec<serde_json::Value>,
     #[serde(default)]
     pub stop_reason: Option<String>,
     #[serde(default)]
@@ -2263,50 +2334,13 @@ fn usage_service_tier(
     ))
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type")]
-pub enum AnthropicResponseBlock {
-    #[serde(rename = "text")]
-    Text { text: String },
-    /// Anthropic's `tool_use` content block. The model is asking to
-    /// invoke a tool: `id` is the call id, `name` is the tool name,
-    /// and `input` is a JSON object with the tool's arguments. Per
-    /// docs §6 outbound-axis table ("tool_use ↔ tool_calls"), the
-    /// gateway translates this into OpenAI's `tool_calls` shape on
-    /// the response so OpenAI-SDK callers (and every agent framework
-    /// built on that shape) work transparently against Anthropic
-    /// upstreams.
-    /// <https://docs.anthropic.com/en/api/messages#example-of-tool-use>
-    #[serde(rename = "tool_use")]
-    ToolUse {
-        id: String,
-        name: String,
-        #[serde(default)]
-        input: serde_json::Value,
-    },
-    /// Extended-thinking output. Its readable text surfaces as the
-    /// OpenAI-shape `message.reasoning_content`; the `signature` has no
-    /// slot on that wire and is not read.
-    /// <https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking>
-    #[serde(rename = "thinking")]
-    Thinking {
-        #[serde(default)]
-        thinking: String,
-    },
-    /// Other content-block types (`redacted_thinking`, server-tool
-    /// blocks, future additions). Not surfaced; accepted so unknown
-    /// block types don't fail the whole response parse.
-    #[serde(other)]
-    Other,
-}
-
 // `#[serde(default)]` at the container level so a response missing any
 // token counter deserializes to 0 rather than failing the whole body
 // decode (same bug class as OpenAI usage, #474).
 
 /// The breakdown of `output_tokens`, per
 /// <https://platform.claude.com/docs/en/build-with-claude/extended-thinking>.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 pub struct AnthropicOutputDetails {
     /// The part of `output_tokens` that was the model's reasoning.
     #[serde(default)]
@@ -2323,7 +2357,7 @@ pub struct AnthropicOutputDetails {
 /// additional charge. The free one is still worth carrying — it says the
 /// model reached out to a URL, which is the signal an operator wants when
 /// the tool's own documentation calls it an exfiltration vector.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 pub struct AnthropicServerToolUse {
     #[serde(default)]
     pub web_search_requests: u32,
@@ -2331,15 +2365,11 @@ pub struct AnthropicServerToolUse {
     pub web_fetch_requests: u32,
 }
 
-/// A token counter that may be sent as `null`, which reads as `0`. `default`
-/// alone covers only an absent field.
-fn nullable_count<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u32, D::Error> {
-    Ok(Option::<u32>::deserialize(deserializer)?.unwrap_or(0))
-}
-
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AnthropicUsage {
+    #[serde(default)]
+    pub iterations: Option<Vec<serde_json::Value>>,
     pub input_tokens: u32,
     pub output_tokens: u32,
     #[serde(default)]
@@ -2351,11 +2381,11 @@ pub struct AnthropicUsage {
     /// Tokens written to the prompt cache (1.25× input rate). Optional
     /// — present only on requests with cache_control segments, and typed
     /// nullable by the SDK.
-    #[serde(default, deserialize_with = "nullable_count")]
-    pub cache_creation_input_tokens: u32,
+    #[serde(default)]
+    pub cache_creation_input_tokens: Option<u32>,
     /// Tokens served from the prompt cache (0.10× input rate).
-    #[serde(default, deserialize_with = "nullable_count")]
-    pub cache_read_input_tokens: u32,
+    #[serde(default)]
+    pub cache_read_input_tokens: Option<u32>,
     /// `cache_creation_input_tokens` split by cache lifetime.
     #[serde(default)]
     pub cache_creation: Option<serde_json::Value>,
@@ -2365,17 +2395,100 @@ pub struct AnthropicUsage {
     pub service_tier: Option<serde_json::Value>,
 }
 
+/// Anthropic 顶层用量加额外 compaction，用于账务；不改写原生响应。
+/// <https://platform.claude.com/docs/en/build-with-claude/compaction-threshold#understanding-usage>
+pub fn anthropic_usage_stats(usage: &serde_json::Value) -> UsageStats {
+    let mut accumulator = AnthropicUsageAccumulator::default();
+    accumulator.update(usage);
+    accumulator.stats()
+}
+
+/// 将顶层累计与各 compaction 累计分开，避免重复帧加倍或部分帧抹掉旧值。
+#[derive(Debug, Default)]
+pub struct AnthropicUsageAccumulator {
+    top: UsageStats,
+    compactions: std::collections::BTreeMap<usize, UsageStats>,
+}
+
+impl AnthropicUsageAccumulator {
+    pub fn update(&mut self, usage: &serde_json::Value) {
+        self.top = self.top.max_fieldwise(&anthropic_token_usage(usage));
+        if let Some(iterations) = usage
+            .get("iterations")
+            .and_then(serde_json::Value::as_array)
+        {
+            for (index, iteration) in iterations.iter().enumerate() {
+                if iteration.get("type").and_then(serde_json::Value::as_str) == Some("compaction") {
+                    let current = self.compactions.entry(index).or_default();
+                    *current = current.max_fieldwise(&anthropic_token_usage(iteration));
+                }
+            }
+        }
+    }
+
+    pub fn stats(&self) -> UsageStats {
+        let mut stats = self
+            .compactions
+            .values()
+            .fold(self.top.clone(), |total, usage| total.saturating_add(usage));
+        // 各帧可能只报告部分累计字段，总量必须由合并后的互斥计数重算。
+        // 这是客户端总量；上游未报告的 upstream_total_tokens 保持为零。
+        stats.total_tokens = stats
+            .prompt_tokens
+            .saturating_add(stats.completion_tokens)
+            .saturating_add(stats.cache_creation_tokens)
+            .saturating_add(stats.cache_read_tokens);
+        stats
+    }
+}
+
+fn anthropic_token_usage(usage: &serde_json::Value) -> UsageStats {
+    let reported = |field: &str| usage.get(field).and_then(serde_json::Value::as_u64);
+    let count = |value: Option<u64>| {
+        value
+            .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
+            .unwrap_or(0)
+    };
+    let mut stats = UsageStats::with_cache(
+        count(reported("input_tokens")),
+        count(reported("output_tokens")),
+        count(reported("cache_creation_input_tokens")),
+        count(reported("cache_read_input_tokens")),
+    );
+    stats.cache_creation_ttl = CacheCreationTtl::from_anthropic(usage.get("cache_creation"));
+    stats.openai_details.cached_tokens_reported = reported("cache_read_input_tokens").is_some();
+    stats.openai_details.cache_creation_tokens_reported =
+        reported("cache_creation_input_tokens").is_some();
+    let thinking = usage
+        .pointer("/output_tokens_details/thinking_tokens")
+        .and_then(serde_json::Value::as_u64);
+    stats.reasoning_tokens = count(thinking);
+    stats.openai_details.reasoning_tokens_reported = thinking.is_some();
+    stats.web_search_requests = count(
+        usage
+            .pointer("/server_tool_use/web_search_requests")
+            .and_then(serde_json::Value::as_u64),
+    );
+    stats.web_fetch_requests = count(
+        usage
+            .pointer("/server_tool_use/web_fetch_requests")
+            .and_then(serde_json::Value::as_u64),
+    );
+    stats
+}
+
 pub fn response_into_chat_response(raw: AnthropicResponse) -> ChatResponse {
     let mut saw_text_block = false;
     let text = raw
         .content
         .iter()
-        .filter_map(|b| match b {
-            AnthropicResponseBlock::Text { text } => {
+        .filter_map(|b| {
+            if b.get("type").and_then(serde_json::Value::as_str) == Some("text") {
                 saw_text_block = true;
-                Some(text.as_str())
+                b.get("text").and_then(serde_json::Value::as_str)
+            } else {
+                None
             }
-            _ => None,
         })
         .collect::<Vec<_>>()
         .join("");
@@ -2404,16 +2517,18 @@ pub fn response_into_chat_response(raw: AnthropicResponse) -> ChatResponse {
     let tool_calls: Vec<serde_json::Value> = raw
         .content
         .iter()
-        .filter_map(|b| match b {
-            AnthropicResponseBlock::ToolUse { id, name, input } => Some(serde_json::json!({
-                "id": id,
+        .filter_map(|b| {
+            if b.get("type").and_then(serde_json::Value::as_str) != Some("tool_use") {
+                return None;
+            }
+            Some(serde_json::json!({
+                "id": b.get("id")?.as_str()?,
                 "type": "function",
                 "function": {
-                    "name": name,
-                    "arguments": tool_arguments(input),
+                    "name": b.get("name")?.as_str()?,
+                    "arguments": tool_arguments(b.get("input").unwrap_or(&serde_json::Value::Null)),
                 },
-            })),
-            _ => None,
+            }))
         })
         .collect();
     let mut extra = serde_json::Map::new();
@@ -2426,12 +2541,9 @@ pub fn response_into_chat_response(raw: AnthropicResponse) -> ChatResponse {
     let reasoning = raw
         .content
         .iter()
-        .filter_map(|b| match b {
-            AnthropicResponseBlock::Thinking { thinking } if !thinking.is_empty() => {
-                Some(thinking.as_str())
-            }
-            _ => None,
-        })
+        .filter(|b| b.get("type").and_then(serde_json::Value::as_str) == Some("thinking"))
+        .filter_map(|b| b.get("thinking").and_then(serde_json::Value::as_str))
+        .filter(|thinking| !thinking.is_empty())
         .collect::<Vec<_>>()
         .join("\n");
     if !reasoning.is_empty() {
@@ -2447,37 +2559,14 @@ pub fn response_into_chat_response(raw: AnthropicResponse) -> ChatResponse {
         .and_then(|u| usage_service_tier(&u.speed, &u.service_tier));
     let usage = raw
         .usage
-        .map(|u| {
-            // Anthropic bills cache_creation / cache_read as input classes
-            // *on top of* input_tokens, so `total_tokens` must fold them
-            // in — `input + output` alone under-counts (#906). Cache
-            // counters stay separate; Anthropic doesn't use OpenAI's
-            // cached-prompt / reasoning taxonomy (those default to 0).
-            let mut usage = UsageStats {
-                cache_creation_ttl: CacheCreationTtl::from_anthropic(u.cache_creation.as_ref()),
-                ..UsageStats::with_cache(
-                    u.input_tokens,
-                    u.output_tokens,
-                    u.cache_creation_input_tokens,
-                    u.cache_read_input_tokens,
-                )
-            };
-            // Server-tool counters are NOT token classes and deliberately
-            // stay out of `total_tokens`: web search bills per search on
-            // top of tokens, so folding it into a token total would both
-            // inflate the token figure and hide the charge.
-            if let Some(stu) = u.server_tool_use.as_ref() {
-                usage.web_search_requests = stu.web_search_requests;
-                usage.web_fetch_requests = stu.web_fetch_requests;
-            }
-            if let Some(thinking) = u.output_tokens_details.and_then(|d| d.thinking_tokens) {
-                usage.reasoning_tokens = thinking;
-            }
-            usage
-        })
+        .as_ref()
+        .map(|u| anthropic_usage_stats(&serde_json::json!(u)))
         .unwrap_or_default();
+    // 原序保留整条 assistant，签名与密文不作重建或修改。
+    let content_blocks = has_native_thinking(&raw.content).then_some(raw.content);
 
     ChatResponse {
+        native_envelope: None,
         logprobs: None,
         more_choices: Vec::new(),
         id: raw.id,
@@ -2485,7 +2574,7 @@ pub fn response_into_chat_response(raw: AnthropicResponse) -> ChatResponse {
         message: ChatMessage {
             role: Role::Assistant,
             content,
-            content_blocks: None,
+            content_blocks,
             name: None,
             tool_call_id: None,
             extra,
@@ -2726,8 +2815,16 @@ pub struct AnthropicStreamStartMessage {
     pub usage: Option<AnthropicStreamStartUsage>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct AnthropicStreamStartUsage {
+    #[serde(default)]
+    pub output_tokens: Option<u32>,
+    /// 首帧同样可以报告工具用量，必须保留到累计记账与终帧。
+    /// https://github.com/anthropics/anthropic-sdk-python/blob/5139cf2e7d07aa618a6c30b7e0c712f10ccb5ad9/src/anthropic/types/usage.py#L40-L41
+    #[serde(default)]
+    pub server_tool_use: Option<AnthropicServerToolUse>,
+    #[serde(default)]
+    pub iterations: Option<Vec<serde_json::Value>>,
     #[serde(default)]
     pub input_tokens: Option<u32>,
     /// Cache write / read counters ride on `message_start` alongside
@@ -2751,11 +2848,11 @@ pub struct AnthropicStreamStartUsage {
 pub enum AnthropicStreamDelta {
     #[serde(rename = "text_delta")]
     TextDelta { text: String },
-    /// Extended-thinking text, surfaced as `delta.reasoning_content`.
-    /// `signature_delta` stays in [`Self::Other`]: the OpenAI wire has no
-    /// slot for it.
+    /// 可读推理走 reasoning_content；签名单独累积到完成的原生块。
     #[serde(rename = "thinking_delta")]
     ThinkingDelta { thinking: String },
+    #[serde(rename = "signature_delta")]
+    SignatureDelta { signature: String },
     /// A fragment of a `tool_use` block's JSON input.
     #[serde(rename = "input_json_delta")]
     InputJsonDelta {
@@ -2772,8 +2869,10 @@ pub struct AnthropicStreamMessageDelta {
     pub stop_reason: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct AnthropicStreamUsage {
+    #[serde(default)]
+    pub iterations: Option<Vec<serde_json::Value>>,
     #[serde(default)]
     pub output_tokens: Option<u32>,
     /// Sent on the final `message_delta` only.
@@ -2807,6 +2906,13 @@ pub struct AnthropicStreamUsage {
 /// carries them.
 #[derive(Debug, Default)]
 pub struct StreamState {
+    usage_stats: AnthropicUsageAccumulator,
+    usage_observer: Option<aisix_gateway::response_tap::StreamUsageObserver>,
+    native_thinking_seen: bool,
+    native_blocks: std::collections::BTreeMap<Option<u64>, serde_json::Value>,
+    native_arguments: std::collections::BTreeMap<Option<u64>, String>,
+    pending_native_blocks: Vec<serde_json::Value>,
+    completed_blocks: Vec<serde_json::Value>,
     pub id: String,
     pub model: String,
     /// Prompt tokens captured from `message_start`; folded into the usage
@@ -2850,37 +2956,99 @@ pub struct StreamState {
 }
 
 impl StreamState {
+    /// 返回流之前绑定本次响应；首个内容到来前也能保存已报告用量，不增发 chunk。
+    pub fn observed() -> Self {
+        Self {
+            usage_observer: aisix_gateway::response_tap::stream_usage_observer(),
+            ..Self::default()
+        }
+    }
+
     pub fn update(&mut self, event: &AnthropicStreamEvent) {
         self.event_tool = None;
+        self.completed_blocks.clear();
+        match event {
+            AnthropicStreamEvent::MessageStart { message } => {
+                self.native_thinking_seen = false;
+                self.native_blocks.clear();
+                self.native_arguments.clear();
+                self.pending_native_blocks.clear();
+                self.usage_stats = AnthropicUsageAccumulator::default();
+                if let Some(usage) = &message.usage {
+                    self.usage_stats.update(&serde_json::json!(usage));
+                }
+            }
+            AnthropicStreamEvent::ContentBlockStart {
+                index,
+                content_block,
+            } => {
+                if has_native_thinking(std::slice::from_ref(content_block)) {
+                    self.native_thinking_seen = true;
+                    self.completed_blocks = std::mem::take(&mut self.pending_native_blocks);
+                }
+                self.native_blocks.insert(*index, content_block.clone());
+            }
+            AnthropicStreamEvent::ContentBlockDelta { index, delta } => {
+                if let Some(block) = self.native_blocks.get_mut(index) {
+                    let append = match delta {
+                        AnthropicStreamDelta::TextDelta { text } => Some(("text", text)),
+                        AnthropicStreamDelta::ThinkingDelta { thinking } => {
+                            Some(("thinking", thinking))
+                        }
+                        AnthropicStreamDelta::SignatureDelta { signature } => {
+                            Some(("signature", signature))
+                        }
+                        _ => None,
+                    };
+                    if let Some((field, fragment)) = append {
+                        let mut text = block
+                            .get(field)
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        text.push_str(fragment);
+                        block[field] = text.into();
+                    }
+                    if let AnthropicStreamDelta::InputJsonDelta { partial_json } = delta {
+                        self.native_arguments
+                            .entry(*index)
+                            .or_default()
+                            .push_str(partial_json);
+                    }
+                }
+            }
+            AnthropicStreamEvent::ContentBlockStop { index } => {
+                if let Some(mut block) = self.native_blocks.remove(index) {
+                    if let Some(arguments) = self.native_arguments.remove(index) {
+                        if let Ok(input) = serde_json::from_str::<serde_json::Value>(&arguments) {
+                            block["input"] = input;
+                        }
+                    }
+                    self.pending_native_blocks.push(block);
+                    // 纯文本流不增发空 chunk；首个签名块出现后连同之前的历史原序交付。
+                    if self.native_thinking_seen {
+                        self.completed_blocks = std::mem::take(&mut self.pending_native_blocks);
+                    }
+                }
+            }
+            AnthropicStreamEvent::MessageDelta {
+                usage: Some(usage), ..
+            } => {
+                self.usage_stats.update(&serde_json::json!(usage));
+            }
+            _ => {}
+        }
         match event {
             AnthropicStreamEvent::MessageStart { message } => {
                 self.tool_blocks.clear();
                 self.open_tool = None;
                 self.id = message.id.clone();
                 self.model = message.model.clone();
-                // Reset on every message_start so a later message_start without
-                // usage can't leave a stale prompt-token count from a prior one.
-                self.input_tokens = message
-                    .usage
-                    .as_ref()
-                    .and_then(|u| u.input_tokens)
-                    .unwrap_or(0);
-                self.cache_creation_tokens = message
-                    .usage
-                    .as_ref()
-                    .and_then(|u| u.cache_creation_input_tokens)
-                    .unwrap_or(0);
-                self.cache_read_tokens = message
-                    .usage
-                    .as_ref()
-                    .and_then(|u| u.cache_read_input_tokens)
-                    .unwrap_or(0);
-                self.cache_creation_ttl = CacheCreationTtl::from_anthropic(
-                    message
-                        .usage
-                        .as_ref()
-                        .and_then(|u| u.cache_creation.as_ref()),
-                );
+                let stats = self.usage_stats.stats();
+                self.input_tokens = stats.prompt_tokens;
+                self.cache_creation_tokens = stats.cache_creation_tokens;
+                self.cache_read_tokens = stats.cache_read_tokens;
+                self.cache_creation_ttl = stats.cache_creation_ttl;
                 if let Some(tier) = message
                     .usage
                     .as_ref()
@@ -2888,15 +3056,7 @@ impl StreamState {
                 {
                     self.service_tier = Some(tier);
                 }
-                self.start_usage = message.usage.as_ref().map(|_| UsageStats {
-                    cache_creation_ttl: self.cache_creation_ttl,
-                    ..UsageStats::with_cache(
-                        self.input_tokens,
-                        0,
-                        self.cache_creation_tokens,
-                        self.cache_read_tokens,
-                    )
-                });
+                self.start_usage = message.usage.as_ref().map(|_| self.usage_stats.stats());
             }
             AnthropicStreamEvent::ContentBlockDelta {
                 index,
@@ -2944,20 +3104,11 @@ impl StreamState {
             AnthropicStreamEvent::MessageDelta {
                 usage: Some(usage), ..
             } => {
-                if let Some(t) = usage.input_tokens {
-                    self.input_tokens = self.input_tokens.max(t);
-                }
-                if let Some(t) = usage.cache_creation_input_tokens {
-                    self.cache_creation_tokens = self.cache_creation_tokens.max(t);
-                }
-                if let Some(t) = usage.cache_read_input_tokens {
-                    self.cache_read_tokens = self.cache_read_tokens.max(t);
-                }
-                self.cache_creation_ttl =
-                    self.cache_creation_ttl
-                        .max_fieldwise(&CacheCreationTtl::from_anthropic(
-                            usage.cache_creation.as_ref(),
-                        ));
+                let stats = self.usage_stats.stats();
+                self.input_tokens = stats.prompt_tokens;
+                self.cache_creation_tokens = stats.cache_creation_tokens;
+                self.cache_read_tokens = stats.cache_read_tokens;
+                self.cache_creation_ttl = stats.cache_creation_ttl;
                 if let Some(tier) = usage_service_tier(&usage.speed, &usage.service_tier) {
                     self.service_tier = Some(tier);
                 }
@@ -2975,6 +3126,7 @@ impl StreamState {
 
     fn tool_call_chunk(&self, call: serde_json::Value) -> ChatChunk {
         ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: self.id.clone(),
@@ -2998,6 +3150,26 @@ impl StreamState {
     /// upstream reported, rather than an estimate.
     pub fn next_chunk(&mut self, event: &AnthropicStreamEvent) -> Option<ChatChunk> {
         self.update(event);
+        let reported = match event {
+            AnthropicStreamEvent::MessageStart { message } => message
+                .usage
+                .as_ref()
+                .map(|usage| (usage.input_tokens.is_some(), false)),
+            AnthropicStreamEvent::MessageDelta { usage, .. } => usage
+                .as_ref()
+                .map(|usage| (usage.input_tokens.is_some(), usage.output_tokens.is_some())),
+            _ => None,
+        };
+        if let (Some(observer), Some((prompt_reported, completion_reported))) =
+            (self.usage_observer.as_ref(), reported)
+        {
+            observer.record(aisix_gateway::response_tap::ObservedStreamUsage {
+                stats: self.usage_stats.stats(),
+                prompt_reported,
+                completion_reported,
+                service_tier: self.service_tier.clone(),
+            });
+        }
         let mut chunk = self.to_chunk(event)?;
         if let Some(start) = self.start_usage.take() {
             if chunk.usage.is_none() {
@@ -3015,7 +3187,33 @@ impl StreamState {
     /// 0"). It rides the first chunk emitted anyway rather than an empty one
     /// at `message_start`, so time-to-first-token is unchanged.
     pub fn to_chunk(&mut self, event: &AnthropicStreamEvent) -> Option<ChatChunk> {
-        let mut chunk = self.translate(event)?;
+        // 终帧自身报告累计用量；兼容直接转换终帧的调用，并保持重复处理幂等。
+        if let AnthropicStreamEvent::MessageDelta {
+            usage: Some(usage), ..
+        } = event
+        {
+            self.usage_stats.update(&serde_json::json!(usage));
+        }
+        let mut chunk = self.translate(event).or_else(|| {
+            (!self.completed_blocks.is_empty()).then(|| ChatChunk {
+                native_envelope: None,
+                choice_index: 0,
+                logprobs: None,
+                id: self.id.clone(),
+                model: self.model.clone(),
+                delta: ChatDelta::default(),
+                finish_reason: None,
+                usage: None,
+                service_tier: self.service_tier.clone(),
+                accounting_usage: None,
+            })
+        })?;
+        if !self.completed_blocks.is_empty() {
+            chunk.delta.extra.insert(
+                "content_blocks".into(),
+                serde_json::json!(self.completed_blocks),
+            );
+        }
         if !self.role_sent {
             self.role_sent = true;
             chunk.delta.role = Some(Role::Assistant);
@@ -3051,6 +3249,7 @@ impl StreamState {
                 delta: AnthropicStreamDelta::TextDelta { text },
                 ..
             } => Some(ChatChunk {
+                native_envelope: None,
                 choice_index: 0,
                 logprobs: None,
                 id: self.id.clone(),
@@ -3073,6 +3272,7 @@ impl StreamState {
                 delta: AnthropicStreamDelta::ThinkingDelta { thinking },
                 ..
             } if !thinking.is_empty() => Some(ChatChunk {
+                native_envelope: None,
                 choice_index: 0,
                 logprobs: None,
                 id: self.id.clone(),
@@ -3101,36 +3301,14 @@ impl StreamState {
                     .as_deref()
                     .map(|r| map_stop_reason(Some(r)));
                 let usage = usage.as_ref().and_then(|u| {
-                    u.output_tokens.map(|n| {
-                        let mut stats = UsageStats {
-                            cache_creation_ttl: self.cache_creation_ttl,
-                            ..UsageStats::with_cache(
-                                self.input_tokens,
-                                n,
-                                self.cache_creation_tokens,
-                                self.cache_read_tokens,
-                            )
-                        };
-                        // Server-tool counters ride this terminal frame, the
-                        // same one that carries the final token counts.
-                        if let Some(stu) = u.server_tool_use.as_ref() {
-                            stats.web_search_requests = stu.web_search_requests;
-                            stats.web_fetch_requests = stu.web_fetch_requests;
-                        }
-                        if let Some(thinking) = u
-                            .output_tokens_details
-                            .as_ref()
-                            .and_then(|d| d.thinking_tokens)
-                        {
-                            stats.reasoning_tokens = thinking;
-                        }
-                        stats
-                    })
+                    (u.output_tokens.is_some() || u.iterations.is_some())
+                        .then(|| self.usage_stats.stats())
                 });
                 if finish.is_none() && usage.is_none() {
                     return None;
                 }
                 Some(ChatChunk {
+                    native_envelope: None,
                     choice_index: 0,
                     logprobs: None,
                     id: self.id.clone(),
@@ -3755,7 +3933,13 @@ fn document_source_text(block: &serde_json::Value) -> Option<String> {
             .map(str::to_owned),
         "content" => match source.get("content")? {
             Value::String(text) => Some(text.clone()),
-            Value::Array(blocks) => Some(concat_text_blocks(blocks)),
+            Value::Array(blocks)
+                if blocks
+                    .iter()
+                    .all(|block| block.get("type").and_then(Value::as_str) == Some("text")) =>
+            {
+                Some(concat_text_blocks(blocks))
+            }
             _ => None,
         },
         _ => None,
@@ -3763,29 +3947,33 @@ fn document_source_text(block: &serde_json::Value) -> Option<String> {
 }
 
 /// Translate one Anthropic `image` or `document` block into an OpenAI content
-/// part. Base64 sources become `data:` URLs, in an `image_url` part except for
-/// a PDF, which chat takes in a `file` part
-/// (<https://platform.openai.com/docs/api-reference/chat/create>); URL sources
-/// pass through as `image_url`.
+/// part。图片仍为 image_url；document 始终进入 canonical File 槽。
+/// <https://platform.claude.com/docs/en/build-with-claude/pdf-support>
 fn openai_media_part_from_anthropic(block: &serde_json::Value) -> Option<serde_json::Value> {
     let source = block.get("source")?;
-    if block.get("type").and_then(serde_json::Value::as_str) == Some("document")
-        && source.get("type").and_then(serde_json::Value::as_str) == Some("base64")
-        && source.get("media_type").and_then(serde_json::Value::as_str) == Some("application/pdf")
-    {
-        let data = source.get("data").and_then(serde_json::Value::as_str)?;
+    if block.get("type").and_then(serde_json::Value::as_str) == Some("document") {
         let filename = block
             .get("title")
             .and_then(serde_json::Value::as_str)
             .filter(|title| !title.is_empty())
             .unwrap_or("document.pdf");
-        return Some(serde_json::json!({
-            "type": "file",
-            "file": {
-                "filename": filename,
-                "file_data": format!("data:application/pdf;base64,{data}"),
-            },
-        }));
+        let file = match source.get("type").and_then(serde_json::Value::as_str) {
+            Some("base64") => {
+                let data = source.get("data").and_then(serde_json::Value::as_str)?;
+                let mime = source
+                    .get("media_type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("application/pdf");
+                serde_json::json!({"filename": filename, "file_data": format!("data:{mime};base64,{data}")})
+            }
+            Some("url") => {
+                let url = source.get("url").and_then(serde_json::Value::as_str)?;
+                // canonical URI 文件槽；各目标决定能否表示，不能降成图片。
+                serde_json::json!({"filename": filename, "file_id": url})
+            }
+            _ => return None,
+        };
+        return Some(serde_json::json!({"type":"file", "file": file}));
     }
     let url = match source.get("type").and_then(serde_json::Value::as_str) {
         Some("base64") => {
@@ -3803,6 +3991,43 @@ fn openai_media_part_from_anthropic(block: &serde_json::Value) -> Option<serde_j
         _ => return None,
     };
     Some(serde_json::json!({"type": "image_url", "image_url": {"url": url}}))
+}
+
+// 自定义 document 的 content 是有序 text/image union，递归保留其媒体。
+fn openai_parts_from_anthropic(block: &serde_json::Value) -> Vec<serde_json::Value> {
+    if block.get("type").and_then(serde_json::Value::as_str) == Some("text") {
+        return block
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .map(|text| vec![serde_json::json!({"type":"text", "text": text})])
+            .unwrap_or_default();
+    }
+    if let Some(text) = document_source_text(block) {
+        return vec![serde_json::json!({"type":"text", "text":text})];
+    }
+    if block.get("type").and_then(serde_json::Value::as_str) == Some("document")
+        && block
+            .pointer("/source/type")
+            .and_then(serde_json::Value::as_str)
+            == Some("content")
+    {
+        return block
+            .pointer("/source/content")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .flat_map(openai_parts_from_anthropic)
+            .collect();
+    }
+    if matches!(
+        block.get("type").and_then(serde_json::Value::as_str),
+        Some("image" | "document")
+    ) {
+        return openai_media_part_from_anthropic(block)
+            .into_iter()
+            .collect();
+    }
+    Vec::new()
 }
 
 /// Translate one Anthropic assistant `tool_use` block into an OpenAI
@@ -3855,45 +4080,13 @@ fn tool_message_from_tool_result(
             let mut parts: Vec<Value> = Vec::new();
             let mut has_media = false;
             for item in items {
-                match item.get("type").and_then(Value::as_str) {
-                    Some("text") => {
-                        if let Some(t) = item.get("text").and_then(Value::as_str) {
-                            text.push_str(t);
-                            parts.push(serde_json::json!({"type": "text", "text": t}));
-                        }
-                    }
-                    // A document the source carries as text is TEXT, wherever
-                    // the tool result goes: dropping it would leave the result
-                    // empty and the model blind to what the tool returned.
-                    Some("document") if document_source_text(item).is_some() => {
-                        // Read once: a text document can be large, and the
-                        // predicate above already proved there is one.
-                        if let Some(t) = document_source_text(item) {
-                            text.push_str(&t);
-                            parts.push(serde_json::json!({"type": "text", "text": t}));
-                        }
-                    }
-                    // Media only where the target's tool result carries it.
-                    // Chat Completions rejects a `tool` message holding an
-                    // image ("Image URLs are only allowed for messages with
-                    // role 'user'"), so it goes nowhere else.
-                    Some("image" | "document") if media == ToolResultMedia::Keep => {
-                        match openai_media_part_from_anthropic(item) {
-                            Some(part) => {
-                                parts.push(part);
-                                has_media = true;
-                            }
-                            None => tracing::debug!(
-                                "dropping tool_result media with unsupported source on \
-                                 cross-provider dispatch",
-                            ),
-                        }
-                    }
-                    other => {
-                        tracing::debug!(
-                            block_type = ?other,
-                            "dropping unsupported tool_result item on cross-provider dispatch",
-                        );
+                for part in openai_parts_from_anthropic(item) {
+                    if let Some(t) = part.get("text").and_then(Value::as_str) {
+                        text.push_str(t);
+                        parts.push(part);
+                    } else if media == ToolResultMedia::Keep {
+                        parts.push(part);
+                        has_media = true;
                     }
                 }
             }
@@ -3916,6 +4109,9 @@ fn tool_message_from_tool_result(
             .find_map(|item| item.get("cache_control"))
     });
     let mut extra = serde_json::Map::new();
+    if let Some(error) = block.get("is_error").and_then(Value::as_bool) {
+        extra.insert("is_error".into(), error.into());
+    }
     if let (CacheMarkers::Keep, Some(marker)) = (markers, marker) {
         extra.insert("cache_control".into(), marker.clone());
     }
@@ -3972,14 +4168,14 @@ fn translate_user_blocks(
                 non_text |= marked;
             }
             Some("image") | Some("document") => {
-                if let Some(p) = openai_media_part_from_anthropic(block) {
-                    parts.push(with_marker_of(p, block, markers));
-                    non_text = true;
-                } else {
-                    tracing::debug!(
-                        "dropping image/document block with unsupported source on \
-                         cross-provider dispatch",
-                    );
+                for part in openai_parts_from_anthropic(block) {
+                    if let Some(t) = part.get("text").and_then(Value::as_str) {
+                        text.push_str(t);
+                    } else {
+                        non_text = true;
+                    }
+                    parts.push(with_marker_of(part, block, markers));
+                    non_text |= marked;
                 }
             }
             Some("tool_result") => {
@@ -4081,7 +4277,9 @@ fn translate_assistant_blocks(
     }
 
     let mut msg = ChatMessage::assistant(text);
-    if marked_text {
+    if purpose == InboundUse::Dispatch && has_native_thinking(blocks) {
+        msg.content_blocks = Some(blocks.to_vec());
+    } else if marked_text {
         // The marker sits on one text block of the turn, so the turn keeps
         // its text as parts.
         msg.content_blocks = Some(text_parts);
@@ -4131,6 +4329,8 @@ struct AnthropicInputUsage {
     input_tokens: u32,
     cache_creation_input_tokens: u32,
     cache_read_input_tokens: u32,
+    cache_creation_reported: bool,
+    cache_read_reported: bool,
 }
 
 impl AnthropicInputUsage {
@@ -4139,6 +4339,8 @@ impl AnthropicInputUsage {
             input_tokens: u.anthropic_input_tokens(),
             cache_creation_input_tokens: u.anthropic_cache_creation_input_tokens(),
             cache_read_input_tokens: u.anthropic_cache_read_input_tokens(),
+            cache_creation_reported: u.openai_details.cache_creation_tokens_reported,
+            cache_read_reported: u.openai_details.cached_tokens_reported,
         }
     }
 
@@ -4147,13 +4349,13 @@ impl AnthropicInputUsage {
     /// must not be handed a fabricated `0` the client would read as
     /// "cache reported, nothing hit".
     fn insert_cache_fields(&self, usage: &mut serde_json::Map<String, serde_json::Value>) {
-        if self.cache_creation_input_tokens > 0 {
+        if self.cache_creation_input_tokens > 0 || self.cache_creation_reported {
             usage.insert(
                 "cache_creation_input_tokens".into(),
                 self.cache_creation_input_tokens.into(),
             );
         }
-        if self.cache_read_input_tokens > 0 {
+        if self.cache_read_input_tokens > 0 || self.cache_read_reported {
             usage.insert(
                 "cache_read_input_tokens".into(),
                 self.cache_read_input_tokens.into(),
@@ -4180,13 +4382,20 @@ pub fn chat_response_into_anthropic_json(
         .filter(|s| !s.is_empty());
     let stop_reason = anthropic_stop_reason(&resp.finish_reason, refusal.is_some());
 
-    let mut content: Vec<serde_json::Value> = Vec::new();
+    let native = resp
+        .message
+        .content_blocks
+        .as_deref()
+        .filter(|blocks| has_native_thinking(blocks));
+    // 原生块已包含可见文本和工具调用，不能与标准投影重复拼接。
+    let mut content: Vec<serde_json::Value> =
+        native.map(|blocks| blocks.to_vec()).unwrap_or_default();
 
     // The upstream's reasoning leads, as Anthropic orders a thinking block
     // ahead of the text and tool_use it produced. It carries no signature
     // — the upstream issued none — so `signature` is the empty string the
     // block shape still requires.
-    if let Some(reasoning) = resp.message.reasoning_text() {
+    if let Some(reasoning) = resp.message.reasoning_text().filter(|_| native.is_none()) {
         content.push(serde_json::json!({
             "type": "thinking",
             "thinking": reasoning,
@@ -4194,7 +4403,11 @@ pub fn chat_response_into_anthropic_json(
         }));
     }
 
-    if let Some(text) = resp.message.text().filter(|s| !s.is_empty()) {
+    if let Some(text) = resp
+        .message
+        .text()
+        .filter(|s| !s.is_empty() && native.is_none())
+    {
         content.push(serde_json::json!({"type": "text", "text": text}));
     }
     // A refusal is the model's answer in its own field; Claude writes its
@@ -4211,6 +4424,7 @@ pub fn chat_response_into_anthropic_json(
         .extra
         .get("tool_calls")
         .and_then(|v| v.as_array())
+        .filter(|_| native.is_none())
     {
         content.extend(tool_use_blocks_from_openai(tool_calls));
     }
@@ -4336,8 +4550,12 @@ pub struct AnthropicSseEncoder {
     sent_message_start: bool,
     /// Index of the open thinking content block (if any).
     thinking_block_index: Option<usize>,
+    /// 已经按标准投影发送的当前块文本，原生完整块到达时只补未发送部分。
+    thinking_emitted_bytes: usize,
     /// Index of the open text content block (if any).
     text_block_index: Option<usize>,
+    text_emitted_bytes: usize,
+    native_thinking_completed: bool,
     finished: bool,
     /// Next content-block index to assign (shared across thinking, text
     /// and tool_use blocks).
@@ -4367,6 +4585,8 @@ pub struct AnthropicSseEncoder {
     seen_cached_prompt_tokens: u32,
     seen_cache_creation_tokens: u32,
     seen_cache_read_tokens: u32,
+    cache_creation_reported: bool,
+    cache_read_reported: bool,
     usage_seen: bool,
     /// Locally estimated `(input, output)` counts for the ones the upstream
     /// left at zero, applied when the closing pair is built
@@ -4391,7 +4611,10 @@ impl AnthropicSseEncoder {
             initial_input_tokens,
             sent_message_start: false,
             thinking_block_index: None,
+            thinking_emitted_bytes: 0,
             text_block_index: None,
+            text_emitted_bytes: 0,
+            native_thinking_completed: false,
             finished: false,
             next_block_index: 0,
             tool_calls: std::collections::BTreeMap::new(),
@@ -4403,6 +4626,8 @@ impl AnthropicSseEncoder {
             seen_cached_prompt_tokens: 0,
             seen_cache_creation_tokens: 0,
             seen_cache_read_tokens: 0,
+            cache_creation_reported: false,
+            cache_read_reported: false,
             usage_seen: false,
             estimate: None,
         }
@@ -4426,6 +4651,8 @@ impl AnthropicSseEncoder {
             self.seen_cache_creation_tokens =
                 self.seen_cache_creation_tokens.max(u.cache_creation_tokens);
             self.seen_cache_read_tokens = self.seen_cache_read_tokens.max(u.cache_read_tokens);
+            self.cache_creation_reported |= u.openai_details.cache_creation_tokens_reported;
+            self.cache_read_reported |= u.openai_details.cached_tokens_reported;
         }
 
         // Closing pair withheld at the stop chunk: only the trailing
@@ -4442,11 +4669,27 @@ impl AnthropicSseEncoder {
 
         let mut events = Vec::new();
 
-        let has_reasoning = chunk
+        let native_blocks = chunk
             .delta
-            .reasoning_content
-            .as_deref()
-            .is_some_and(|s| !s.is_empty());
+            .extra
+            .get("content_blocks")
+            .and_then(|v| v.as_array());
+        let carries = |kind| {
+            native_blocks.is_some_and(|blocks| {
+                blocks
+                    .iter()
+                    .any(|block| block.get("type").and_then(|v| v.as_str()) == Some(kind))
+            })
+        };
+        let reasoning = chunk.delta.reasoning_content.as_deref().map(|reasoning| {
+            // 标准 Chat 投影在两个原生思考块之间插入换行；原生块不含该分隔符。
+            if self.native_thinking_completed && self.thinking_block_index.is_none() {
+                reasoning.strip_prefix('\n').unwrap_or(reasoning)
+            } else {
+                reasoning
+            }
+        });
+        let has_reasoning = reasoning.is_some_and(|s| !s.is_empty()) && !carries("thinking");
         // A refusal streams in its own delta field; Claude writes it as
         // text.
         let refusal = chunk
@@ -4459,7 +4702,11 @@ impl AnthropicSseEncoder {
             self.refused = true;
         }
         let text: Option<String> = match (
-            chunk.delta.content.as_deref().filter(|s| !s.is_empty()),
+            chunk
+                .delta
+                .content
+                .as_deref()
+                .filter(|s| !s.is_empty() && !carries("text")),
             refusal,
         ) {
             (Some(c), Some(r)) => Some(format!("{c}{r}")),
@@ -4468,15 +4715,26 @@ impl AnthropicSseEncoder {
             (None, None) => None,
         };
         let has_content = text.is_some();
-        let has_tool_calls = chunk
-            .delta
-            .tool_calls
-            .as_ref()
-            .is_some_and(|v| !v.is_empty());
+        let has_tool_calls = chunk.delta.tool_calls.as_ref().is_some_and(|calls| {
+            calls.iter().any(|call| {
+                let carried = native_blocks.is_some_and(|blocks| {
+                    blocks.iter().any(|block| {
+                        block.get("type").and_then(|v| v.as_str()) == Some("tool_use")
+                            && block.get("id").and_then(|v| v.as_str())
+                                == call.get("id").and_then(|v| v.as_str())
+                    })
+                });
+                !carried
+            })
+        });
         let has_finish = chunk.finish_reason.is_some();
 
         if !self.sent_message_start
-            && (has_reasoning || has_content || has_tool_calls || has_finish)
+            && (has_reasoning
+                || has_content
+                || has_tool_calls
+                || has_finish
+                || native_blocks.is_some_and(|blocks| !blocks.is_empty()))
         {
             events.push(self.message_start_event());
             self.sent_message_start = true;
@@ -4490,8 +4748,7 @@ impl AnthropicSseEncoder {
         // close.
         let tool_block_open = self.tool_calls.values().any(|t| t.started);
         if has_reasoning && tool_block_open {
-            self.held_reasoning
-                .push_str(chunk.delta.reasoning_content.as_deref().unwrap_or_default());
+            self.held_reasoning.push_str(reasoning.unwrap_or_default());
         }
         if has_reasoning && !tool_block_open {
             if self.thinking_block_index.is_none() {
@@ -4515,10 +4772,13 @@ impl AnthropicSseEncoder {
                     "index": self.thinking_block_index,
                     "delta": {
                         "type": "thinking_delta",
-                        "thinking": chunk.delta.reasoning_content.as_deref().unwrap_or_default(),
+                        "thinking": reasoning.unwrap_or_default(),
                     },
                 }),
             });
+            self.thinking_emitted_bytes = self
+                .thinking_emitted_bytes
+                .saturating_add(reasoning.unwrap_or_default().len());
         }
         if has_content || has_tool_calls {
             self.close_thinking_block(&mut events);
@@ -4534,6 +4794,9 @@ impl AnthropicSseEncoder {
 
         if has_content {
             let idx = self.text_block_index.unwrap_or(0);
+            self.text_emitted_bytes = self
+                .text_emitted_bytes
+                .saturating_add(text.as_deref().unwrap_or_default().len());
             events.push(AnthropicSseEvent {
                 event: "content_block_delta",
                 data: serde_json::json!({
@@ -4563,6 +4826,16 @@ impl AnthropicSseEncoder {
                     .and_then(|f| f.get("arguments"))
                     .and_then(|a| a.as_str())
                     .unwrap_or("");
+                // 假流的完整原生工具块与标准工具投影同帧；只在已经打开时补最后参数。
+                let carried = native_blocks.is_some_and(|blocks| {
+                    blocks.iter().any(|block| {
+                        block.get("type").and_then(|v| v.as_str()) == Some("tool_use")
+                            && block.get("id").and_then(|v| v.as_str()) == Some(id)
+                    })
+                });
+                if carried && !self.tool_calls.contains_key(&oai_index) {
+                    continue;
+                }
 
                 let state = self
                     .tool_calls
@@ -4595,6 +4868,10 @@ impl AnthropicSseEncoder {
             }
         }
 
+        if let Some(blocks) = native_blocks {
+            self.emit_native_blocks(blocks, &mut events);
+        }
+
         // ── Finish ──
         if let Some(fr) = &chunk.finish_reason {
             self.close_open_blocks(&mut events);
@@ -4613,6 +4890,133 @@ impl AnthropicSseEncoder {
         }
 
         events
+    }
+
+    /// 完整原生块在 block_stop 到达；补签名、密文和缺失部分，不重复已经发送的标准投影。
+    fn emit_native_blocks(
+        &mut self,
+        blocks: &[serde_json::Value],
+        events: &mut Vec<AnthropicSseEvent>,
+    ) {
+        for block in blocks {
+            match block.get("type").and_then(|v| v.as_str()) {
+                Some("thinking") => {
+                    let idx = match self.thinking_block_index {
+                        Some(idx) => idx,
+                        None => {
+                            self.close_open_blocks(events);
+                            let idx = self.next_block_index;
+                            self.next_block_index += 1;
+                            self.thinking_block_index = Some(idx);
+                            let mut start = block.clone();
+                            start["thinking"] = "".into();
+                            start["signature"] = "".into();
+                            events.push(AnthropicSseEvent {
+                                event: "content_block_start",
+                                data: serde_json::json!({
+                                    "type":"content_block_start","index":idx,"content_block":start,
+                                }),
+                            });
+                            idx
+                        }
+                    };
+                    let thinking = block
+                        .get("thinking")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    if let Some(remaining) = thinking
+                        .get(self.thinking_emitted_bytes..)
+                        .filter(|s| !s.is_empty())
+                    {
+                        events.push(AnthropicSseEvent { event: "content_block_delta", data: serde_json::json!({
+                            "type":"content_block_delta","index":idx,"delta":{"type":"thinking_delta","thinking":remaining},
+                        }) });
+                    }
+                    if let Some(signature) = block.get("signature").and_then(|v| v.as_str()) {
+                        events.push(AnthropicSseEvent { event: "content_block_delta", data: serde_json::json!({
+                            "type":"content_block_delta","index":idx,"delta":{"type":"signature_delta","signature":signature},
+                        }) });
+                    }
+                    self.close_thinking_block(events);
+                    self.native_thinking_completed = true;
+                }
+                Some("text") if self.text_block_index.is_some() => {
+                    let idx = self.text_block_index.take().unwrap_or_default();
+                    let text = block
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    if let Some(remaining) = text
+                        .get(self.text_emitted_bytes..)
+                        .filter(|s| !s.is_empty())
+                    {
+                        events.push(AnthropicSseEvent { event: "content_block_delta", data: serde_json::json!({
+                            "type":"content_block_delta","index":idx,"delta":{"type":"text_delta","text":remaining},
+                        }) });
+                    }
+                    self.text_emitted_bytes = 0;
+                    events.push(content_block_stop_event(idx));
+                }
+                Some("tool_use") => {
+                    let id = block.get("id").and_then(|v| v.as_str());
+                    let existing = self.tool_calls.iter().find_map(|(index, state)| {
+                        (Some(state.id.as_str()) == id && state.started).then_some(*index)
+                    });
+                    if let Some(index) = existing {
+                        if let Some(state) = self.tool_calls.remove(&index) {
+                            events.push(content_block_stop_event(state.content_block_index));
+                        }
+                    } else {
+                        self.close_open_blocks(events);
+                        self.emit_complete_block(block, events);
+                    }
+                }
+                _ => {
+                    self.close_open_blocks(events);
+                    self.emit_complete_block(block, events);
+                }
+            }
+        }
+    }
+
+    fn emit_complete_block(
+        &mut self,
+        block: &serde_json::Value,
+        events: &mut Vec<AnthropicSseEvent>,
+    ) {
+        let idx = self.next_block_index;
+        self.next_block_index += 1;
+        let mut start = block.clone();
+        let delta = match block.get("type").and_then(|v| v.as_str()) {
+            Some("text") => {
+                start["text"] = "".into();
+                Some(
+                    serde_json::json!({"type":"text_delta","text":block.get("text").and_then(|v| v.as_str()).unwrap_or_default()}),
+                )
+            }
+            Some("tool_use") => {
+                start["input"] = serde_json::json!({});
+                Some(
+                    serde_json::json!({"type":"input_json_delta","partial_json":tool_arguments(block.get("input").unwrap_or(&serde_json::Value::Null))}),
+                )
+            }
+            _ => None,
+        };
+        events.push(AnthropicSseEvent {
+            event: "content_block_start",
+            data: serde_json::json!({
+                "type":"content_block_start","index":idx,"content_block":start,
+            }),
+        });
+        if let Some(delta) = delta {
+            events.push(AnthropicSseEvent {
+                event: "content_block_delta",
+                data: serde_json::json!({
+                    "type":"content_block_delta","index":idx,"delta":delta,
+                }),
+            });
+        }
+        events.push(content_block_stop_event(idx));
     }
 
     /// Adopt locally-estimated token counts as the client-visible usage,
@@ -4672,6 +5076,11 @@ impl AnthropicSseEncoder {
             cache_read_tokens: self.seen_cache_read_tokens,
             ..UsageStats::default()
         });
+        let input = AnthropicInputUsage {
+            cache_creation_reported: self.cache_creation_reported,
+            cache_read_reported: self.cache_read_reported,
+            ..input
+        };
         let mut usage = serde_json::Map::new();
         // Gate on the RAW prompt count, not the cache-adjusted one: a
         // fully-cached prompt is a real `input_tokens: 0`, distinct from
@@ -4736,6 +5145,7 @@ impl AnthropicSseEncoder {
         if let Some(idx) = self.thinking_block_index.take() {
             events.push(content_block_stop_event(idx));
         }
+        self.thinking_emitted_bytes = 0;
     }
 
     /// Close every open content block, in index order, then write the
@@ -4754,6 +5164,8 @@ impl AnthropicSseEncoder {
         let mut open: Vec<usize> = Vec::new();
         open.extend(self.thinking_block_index.take());
         open.extend(self.text_block_index.take());
+        self.thinking_emitted_bytes = 0;
+        self.text_emitted_bytes = 0;
         open.extend(
             self.tool_calls
                 .values()
@@ -5351,7 +5763,6 @@ mod tests {
     fn a_reasoning_parts_only_assistant_turn_is_skipped() {
         for parts in [
             serde_json::json!([{"type": "thinking", "thinking": [{"type": "text", "text": "t"}]}]),
-            serde_json::json!([{"type": "thinking", "thinking": "t", "signature": "s"}]),
             serde_json::json!([{"type": "reasoning",
                 "summary": [{"type": "summary_text", "text": "t", "signature": "s"}]}]),
         ] {
@@ -6869,6 +7280,7 @@ mod tests {
             serde_json::json!("I can't help with that."),
         );
         let resp = ChatResponse {
+            native_envelope: None,
             logprobs: None,
             more_choices: Vec::new(),
             id: "x".into(),
@@ -7105,7 +7517,8 @@ mod tests {
             match build_request(&req, "c-name", None, messages, false) {
                 Ok(built) => {
                     assert!(!refused, "{choice} was accepted");
-                    assert!(built.tools.is_some());
+                    // 空允许集合不能恢复为全部工具声明。
+                    assert!(built.tools.is_none(), "{choice}");
                     assert!(built.tool_choice.is_none());
                     assert!(!built.extra.contains_key("tool_choice"));
                 }
@@ -7640,6 +8053,80 @@ mod tests {
         // double-count cost in the control plane's pricing formula, which bills
         // cache_read as its own term.
         assert_eq!(usage.cached_prompt_tokens, 0);
+    }
+
+    #[test]
+    fn stream_state_preserves_start_server_tool_counts_through_accounting_and_terminal_usage() {
+        // 首帧反序列化吞字段、后帧缺失/零值覆盖累计或重复帧相加，都会使断言失败。
+        for (initial, later, expected_searches, expected_fetches) in [
+            (Some((11, 3)), None, 11, 3),
+            (Some((0, 0)), None, 0, 0),
+            (None, None, 0, 0),
+            (Some((3, 2)), Some((7, 5)), 7, 5),
+            (Some((11, 3)), Some((0, 0)), 11, 3),
+            (None, Some((7, 5)), 7, 5),
+        ] {
+            let mut start = serde_json::json!({
+                "type":"message_start", "message":{
+                    "id":"msg_tool_counts", "model":"claude", "type":"message",
+                    "role":"assistant", "content":[], "stop_reason":null,
+                    "usage":{"input_tokens":17,"output_tokens":0}
+                }
+            });
+            if let Some((searches, fetches)) = initial {
+                start["message"]["usage"]["server_tool_use"] = serde_json::json!({
+                    "web_search_requests":searches,"web_fetch_requests":fetches
+                });
+            }
+            let start: AnthropicStreamEvent = serde_json::from_value(start).unwrap();
+            let AnthropicStreamEvent::MessageStart { message } = &start else {
+                panic!("expected message_start");
+            };
+            let wire = serde_json::to_value(message.usage.as_ref().unwrap()).unwrap();
+            assert_eq!(
+                wire.pointer("/server_tool_use/web_search_requests")
+                    .and_then(serde_json::Value::as_u64),
+                initial.map(|(searches, _)| searches as u64),
+                "明确零必须仍是已报告字段，不能与缺失都默认为零",
+            );
+            let mut state = StreamState::default();
+            assert!(state.next_chunk(&start).is_none());
+            let text: AnthropicStreamEvent = serde_json::from_value(serde_json::json!({
+                "type":"content_block_delta", "index":0,
+                "delta":{"type":"text_delta","text":"answer"}
+            }))
+            .unwrap();
+            let first = state.next_chunk(&text).unwrap();
+            let accounting = first.accounting_usage.unwrap();
+            assert_eq!(
+                accounting.web_search_requests,
+                initial.map_or(0, |(searches, _)| searches)
+            );
+            assert_eq!(
+                accounting.web_fetch_requests,
+                initial.map_or(0, |(_, fetches)| fetches)
+            );
+            assert_eq!(accounting.prompt_tokens, 17);
+            let mut end = serde_json::json!({
+                "type":"message_delta", "delta":{"stop_reason":"end_turn"},
+                "usage":{"output_tokens":5}
+            });
+            if let Some((searches, fetches)) = later {
+                end["usage"]["server_tool_use"] = serde_json::json!({
+                    "web_search_requests":searches,"web_fetch_requests":fetches
+                });
+            }
+            let end: AnthropicStreamEvent = serde_json::from_value(end).unwrap();
+            for _ in 0..2 {
+                let final_usage = state.next_chunk(&end).unwrap().usage.unwrap();
+                assert_eq!(final_usage.web_search_requests, expected_searches);
+                assert_eq!(final_usage.web_fetch_requests, expected_fetches);
+                assert_eq!(
+                    (final_usage.prompt_tokens, final_usage.completion_tokens),
+                    (17, 5)
+                );
+            }
+        }
     }
 
     /// Feed `events` through a fresh StreamState and collect every
@@ -8518,6 +9005,7 @@ mod tests {
     #[test]
     fn render_anthropic_response_basic_shape() {
         let resp = ChatResponse {
+            native_envelope: None,
             logprobs: None,
             more_choices: Vec::new(),
             id: "cmpl-1".into(),
@@ -8544,6 +9032,7 @@ mod tests {
     fn render_anthropic_response_finish_reason_mappings() {
         let mk = |fr: FinishReason| {
             let resp = ChatResponse {
+                native_envelope: None,
                 logprobs: None,
                 more_choices: Vec::new(),
                 id: "x".into(),
@@ -8574,6 +9063,7 @@ mod tests {
         // `cache_read_input_tokens` — pre-fix it vanished entirely and
         // an Anthropic client billed the whole prompt at full rate.
         let resp = ChatResponse {
+            native_envelope: None,
             logprobs: None,
             more_choices: Vec::new(),
             id: "chatcmpl-cache-test".into(),
@@ -8612,6 +9102,7 @@ mod tests {
         // reports `prompt_tokens` EXCLUDING cache, so the counters ride
         // on top and nothing is subtracted.
         let resp = ChatResponse {
+            native_envelope: None,
             logprobs: None,
             more_choices: Vec::new(),
             id: "x".into(),
@@ -8630,6 +9121,7 @@ mod tests {
     #[test]
     fn render_anthropic_response_omits_cache_fields_when_upstream_reports_none() {
         let resp = ChatResponse {
+            native_envelope: None,
             logprobs: None,
             more_choices: Vec::new(),
             id: "x".into(),
@@ -8648,6 +9140,7 @@ mod tests {
     #[test]
     fn render_anthropic_response_fully_cached_prompt_reports_zero_input() {
         let resp = ChatResponse {
+            native_envelope: None,
             logprobs: None,
             more_choices: Vec::new(),
             id: "x".into(),
@@ -8685,6 +9178,7 @@ mod tests {
             }]),
         );
         let resp = ChatResponse {
+            native_envelope: None,
             logprobs: None,
             more_choices: Vec::new(),
             id: "cmpl-tc".into(),
@@ -8707,6 +9201,7 @@ mod tests {
 
     fn delta_chunk(text: &str) -> ChatChunk {
         ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "cmpl-1".into(),
@@ -8729,6 +9224,7 @@ mod tests {
 
     fn finish_chunk(out_tokens: u32) -> ChatChunk {
         ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "cmpl-1".into(),
@@ -8799,6 +9295,7 @@ mod tests {
 
         // Stop chunk with NO usage — only the content block closes.
         let stop_no_usage = ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "cmpl-1".into(),
@@ -8817,6 +9314,7 @@ mod tests {
         // The trailing usage-only frame releases the closing pair,
         // carrying both input and output tokens.
         let usage_only = ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "cmpl-1".into(),
@@ -8908,6 +9406,7 @@ mod tests {
         let mut enc = AnthropicSseEncoder::new("msg_01", "tencent-minimax-m3", 0);
         let _ = enc.next_events(&delta_chunk("ok"));
         let stop_no_usage = ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "chatcmpl-cache-test".into(),
@@ -8921,6 +9420,7 @@ mod tests {
         let _ = enc.next_events(&stop_no_usage);
 
         let usage_only = ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "chatcmpl-cache-test".into(),
@@ -8950,6 +9450,7 @@ mod tests {
         let mut enc = AnthropicSseEncoder::new("msg_01", "m", 0);
         let _ = enc.next_events(&delta_chunk("ok"));
         let stop_with_usage = ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "c".into(),
@@ -8975,6 +9476,7 @@ mod tests {
         let mut enc = AnthropicSseEncoder::new("msg_01", "m", 0);
         let _ = enc.next_events(&delta_chunk("ok"));
         let events = enc.next_events(&ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "c".into(),
@@ -9004,6 +9506,7 @@ mod tests {
         let mut enc = AnthropicSseEncoder::new("msg_01", "alias", 0);
         let _ = enc.next_events(&delta_chunk("hi"));
         let stop_no_usage = ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "cmpl-1".into(),
@@ -9092,6 +9595,7 @@ mod tests {
             tc["function"] = serde_json::Value::Object(func);
         }
         ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "cmpl-1".into(),
@@ -9114,6 +9618,7 @@ mod tests {
 
     fn tool_finish_chunk() -> ChatChunk {
         ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "cmpl-1".into(),
@@ -9221,6 +9726,7 @@ mod tests {
 
     fn reasoning_chunk(text: &str) -> ChatChunk {
         ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "cmpl-1".into(),
@@ -9264,6 +9770,7 @@ mod tests {
                 "function": {"name": "f", "arguments": "{}"}}]),
         );
         let resp = ChatResponse {
+            native_envelope: None,
             logprobs: None,
             more_choices: Vec::new(),
             id: "cmpl".into(),
@@ -9289,6 +9796,7 @@ mod tests {
 
     fn tool_delta(call: serde_json::Value, finish: Option<FinishReason>) -> ChatChunk {
         ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "c".into(),
@@ -9358,6 +9866,7 @@ mod tests {
         let mut msg = ChatMessage::assistant("hi");
         msg.extra.insert("reasoning_content".into(), "".into());
         let resp = ChatResponse {
+            native_envelope: None,
             logprobs: None,
             more_choices: Vec::new(),
             id: "cmpl".into(),
@@ -10186,8 +10695,11 @@ mod tests {
         assert_eq!(msg["content"], "answer");
         assert_eq!(msg["reasoning_content"], "first chain\nsecond chain");
         assert_eq!(msg["tool_calls"][0]["id"], "t1");
-        // Neither the signatures nor the redacted ciphertext travel.
-        let wire = msg.to_string();
+        // 普通 Chat 投影只承载可读推理；独立原生载体保留完整、原序历史。
+        assert_eq!(msg["content_blocks"], body["messages"][0]["content"]);
+        let mut projection = msg.clone();
+        projection.as_object_mut().unwrap().remove("content_blocks");
+        let wire = projection.to_string();
         assert!(!wire.contains("sig"), "{wire}");
         assert!(!wire.contains("opaque"), "{wire}");
     }
@@ -11225,5 +11737,722 @@ mod request_contract_tests {
         )
         .unwrap();
         assert_eq!(call["function"]["name"], name.as_str());
+    }
+}
+
+#[cfg(test)]
+mod compat_anthropic_wire_regressions {
+    use super::*;
+    use serde_json::{json, Value};
+
+    fn response(content: Value, usage: Value) -> ChatResponse {
+        response_into_chat_response(
+            serde_json::from_value(json!({
+                "id":"msg_compat", "model":"claude-test", "type":"message", "role":"assistant",
+                "content":content, "stop_reason":"tool_use", "usage":usage,
+            }))
+            .unwrap(),
+        )
+    }
+
+    fn signed_blocks() -> Value {
+        json!([
+            {"type":"thinking", "thinking":"choose a tool", "signature":"opaque+sig/one=="},
+            {"type":"redacted_thinking", "data":"opaque+redacted/bytes=="},
+            {"type":"text", "text":"checking"},
+            {"type":"tool_use", "id":"toolu_weather", "name":"weather", "input":{"city":"Paris"}},
+            {"type":"thinking", "thinking":"after tool", "signature":"opaque-second=="},
+        ])
+    }
+
+    fn replay(message: ChatMessage) -> Value {
+        let restored: ChatMessage =
+            serde_json::from_value(serde_json::to_value(message).unwrap()).unwrap();
+        let req = ChatFormat::new("claude-test", vec![ChatMessage::user("weather"), restored]);
+        let (_, messages) = split_system(&req).unwrap();
+        json!(messages[1].content)
+    }
+
+    fn built(extra: Value) -> Value {
+        let mut req = ChatFormat::new("claude-test", vec![ChatMessage::user("hello")]);
+        req.extra = extra.as_object().unwrap().clone();
+        let (system, messages) = split_system(&req).unwrap();
+        serde_json::to_value(build_request(&req, "claude-test", system, messages, false).unwrap())
+            .unwrap()
+    }
+
+    fn compaction_usage(input: u32, output: u32) -> Value {
+        json!({"input_tokens":input, "output_tokens":output,
+        "iterations":[
+            {"type":"message", "input_tokens":input, "output_tokens":output},
+            {"type":"compaction", "input_tokens":100, "output_tokens":7,
+             "cache_read_input_tokens":80, "cache_creation_input_tokens":10,
+             "cache_creation":{"ephemeral_1h_input_tokens":10}}
+        ]})
+    }
+
+    fn stream(events: Vec<Value>) -> Vec<ChatChunk> {
+        let mut state = StreamState::default();
+        events
+            .into_iter()
+            .filter_map(|raw| {
+                let event = serde_json::from_value(raw).unwrap();
+                state.next_chunk(&event)
+            })
+            .collect()
+    }
+
+    fn start() -> Value {
+        json!({"type":"message_start", "message":{"id":"msg_compat", "model":"claude-test",
+            "usage":{"input_tokens":23,"output_tokens":0}}})
+    }
+
+    #[test]
+    fn compat_anthropic_wire_buffered_signed_carrier_keeps_native_order() {
+        let expected = signed_blocks();
+        let chat = response(
+            expected.clone(),
+            json!({"input_tokens":23,"output_tokens":5}),
+        );
+        assert_eq!(
+            serde_json::to_value(&chat.message.content_blocks).unwrap(),
+            expected
+        );
+        assert_eq!(chat.message.extra["tool_calls"][0]["id"], "toolu_weather");
+        assert_eq!(chat.message.content.as_deref(), Some("checking"));
+    }
+
+    #[test]
+    fn compat_anthropic_wire_buffered_signed_replay_keeps_bytes_and_no_duplicate_tool() {
+        let expected = signed_blocks();
+        let chat = response(
+            expected.clone(),
+            json!({"input_tokens":23,"output_tokens":5}),
+        );
+        assert_eq!(replay(chat.message), expected);
+    }
+
+    #[test]
+    fn compat_anthropic_wire_stream_signature_fragments_replay_in_native_order() {
+        let chunks = stream(vec![
+            start(),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"choose a tool"}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"opaque+sig/"}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"one=="}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"redacted_thinking","data":"opaque+redacted/bytes=="}}),
+            json!({"type":"content_block_stop","index":1}),
+            json!({"type":"content_block_start","index":2,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"checking"}}),
+            json!({"type":"content_block_stop","index":2}),
+            json!({"type":"content_block_start","index":3,"content_block":{"type":"tool_use","id":"toolu_weather","name":"weather","input":{}}}),
+            json!({"type":"content_block_delta","index":3,"delta":{"type":"input_json_delta","partial_json":"{\"city\":\"Paris\"}"}}),
+            json!({"type":"content_block_stop","index":3}),
+        ]);
+        let blocks: Vec<Value> = chunks
+            .iter()
+            .flat_map(|chunk| {
+                chunk
+                    .delta
+                    .extra
+                    .get("content_blocks")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .cloned()
+            })
+            .collect();
+        let mut expected = signed_blocks().as_array().unwrap().clone();
+        expected.pop();
+        assert_eq!(blocks, expected);
+        let mut message = ChatMessage::assistant("checking");
+        message.content_blocks = Some(blocks);
+        assert_eq!(replay(message), json!(expected));
+    }
+
+    #[test]
+    fn compat_anthropic_wire_known_openai_only_extras_are_absent() {
+        let body = built(json!({"moderation":{"policy":{"input":{"mode":"score"}}},
+            "prompt_cache_options":{"mode":"explicit","ttl":"30m"},
+            "verbosity":"high", "prompt_cache_key":"key", "prompt_cache_retention":"24h"}));
+        for key in [
+            "moderation",
+            "prompt_cache_options",
+            "verbosity",
+            "prompt_cache_key",
+            "prompt_cache_retention",
+        ] {
+            assert!(
+                !body.as_object().unwrap().contains_key(key),
+                "{key}: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn compat_anthropic_wire_shared_responses_fields_map_by_target_contract() {
+        let body = built(
+            json!({"safety_identifier":"safe-id", "user":"user-id", "metadata":{"tag":"discard"},
+            "service_tier":"default", "context_management":{"edits":[]}}),
+        );
+        assert_eq!(body["metadata"], json!({"user_id":"safe-id"}));
+        assert_eq!(body["service_tier"], "standard_only");
+        assert_eq!(body["context_management"], json!({"edits":[]}));
+        assert!(!body.as_object().unwrap().contains_key("safety_identifier"));
+        assert!(!body.as_object().unwrap().contains_key("user"));
+    }
+
+    fn allowed_body(mode: &str, names: &[&str]) -> Value {
+        let refs: Vec<Value> = names
+            .iter()
+            .map(|name| json!({"type":"function","function":{"name":name}}))
+            .collect();
+        built(json!({"tools":[
+            {"type":"function","function":{"name":"alpha","parameters":{"type":"object"}}},
+            {"type":"function","function":{"name":"beta","parameters":{"type":"object"}}},
+            {"type":"function","function":{"name":"gamma","parameters":{"type":"object"}}}
+        ],"tool_choice":{"type":"allowed_tools","allowed_tools":{"mode":mode,"tools":refs}}}))
+    }
+
+    #[test]
+    fn compat_anthropic_wire_allowed_tools_auto_filters_actual_declarations() {
+        let body = allowed_body("auto", &["alpha", "gamma"]);
+        assert_eq!(body["tool_choice"], json!({"type":"auto"}));
+        let names: Vec<&str> = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["alpha", "gamma"]);
+    }
+
+    #[test]
+    fn compat_anthropic_wire_allowed_tools_required_filters_actual_declarations() {
+        let body = allowed_body("required", &["gamma"]);
+        assert_eq!(body["tool_choice"], json!({"type":"any"}));
+        assert_eq!(body["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(body["tools"][0]["name"], "gamma");
+    }
+
+    #[test]
+    fn compat_anthropic_wire_empty_allowed_subset_never_expands_to_all_tools() {
+        let body = allowed_body("auto", &[]);
+        assert!(body
+            .get("tools")
+            .is_none_or(|tools| tools.as_array().is_some_and(Vec::is_empty)));
+        assert!(body.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn compat_anthropic_wire_compaction_threshold_usage_is_additional() {
+        let stats = response(
+            json!([{"type":"text","text":"ok"}]),
+            compaction_usage(23, 5),
+        )
+        .usage;
+        assert_eq!(
+            (
+                stats.prompt_tokens,
+                stats.completion_tokens,
+                stats.cache_read_tokens,
+                stats.cache_creation_tokens
+            ),
+            (123, 12, 80, 10)
+        );
+        assert_eq!(stats.cache_creation_ttl.cache_creation_1h_tokens, Some(10));
+        assert_eq!(stats.upstream_total_tokens, 0);
+        assert_eq!(stats.openai_prompt_tokens(), 213);
+    }
+
+    #[test]
+    fn compat_anthropic_wire_compaction_zero_top_on_demand_is_reported() {
+        let stats = response(json!([]), compaction_usage(0, 0)).usage;
+        assert_eq!((stats.prompt_tokens, stats.completion_tokens), (100, 7));
+    }
+
+    #[test]
+    fn compat_anthropic_wire_message_and_fallback_iterations_are_not_added() {
+        let stats = response(json!([]), json!({"input_tokens":523,"output_tokens":105,"iterations":[
+            {"type":"message","input_tokens":23,"output_tokens":5},
+            {"type":"fallback_message","model":"claude-sonnet-4-6","input_tokens":500,"output_tokens":100}]})).usage;
+        assert_eq!((stats.prompt_tokens, stats.completion_tokens), (523, 105));
+    }
+
+    #[test]
+    fn compat_anthropic_wire_compaction_stream_repeated_and_partial_frames_do_not_lose_or_double() {
+        let chunks = stream(vec![
+            start(),
+            json!({"type":"message_delta","delta":{},"usage":compaction_usage(23,5)}),
+            json!({"type":"message_delta","delta":{},"usage":compaction_usage(23,5)}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":31,"output_tokens":8}}),
+        ]);
+        let stats = chunks.last().unwrap().usage.as_ref().unwrap();
+        assert_eq!(
+            (
+                stats.prompt_tokens,
+                stats.completion_tokens,
+                stats.cache_read_tokens,
+                stats.cache_creation_tokens
+            ),
+            (131, 15, 80, 10)
+        );
+        assert_eq!(stats.upstream_total_tokens, 0);
+    }
+
+    #[test]
+    fn compat_anthropic_wire_split_usage_totals_follow_merged_counters() {
+        let mut usage = AnthropicUsageAccumulator::default();
+        usage.update(&json!({
+            "input_tokens":10, "output_tokens":1,
+            "cache_creation_input_tokens":200, "cache_read_input_tokens":800
+        }));
+        usage.update(&json!({"output_tokens":4}));
+        let merged = usage.stats();
+        assert_eq!(merged.total_tokens, 1_014);
+        assert_eq!(merged.openai_total_tokens(), 1_014);
+        assert_eq!(merged.upstream_total_tokens, 0);
+
+        usage.update(&json!({"input_tokens":12}));
+        usage.update(&json!({"output_tokens":3}));
+        let merged = usage.stats();
+        assert_eq!(merged.total_tokens, 1_016);
+        assert_eq!(merged.completion_tokens, 4);
+        assert_eq!(merged.upstream_total_tokens, 0);
+    }
+
+    #[test]
+    fn compat_anthropic_wire_split_compaction_totals_are_idempotent_and_saturating() {
+        let mut usage = AnthropicUsageAccumulator::default();
+        usage.update(&compaction_usage(23, 5));
+        let partial = json!({"output_tokens":8, "iterations":[
+            {"type":"message", "output_tokens":8},
+            {"type":"compaction", "output_tokens":9}
+        ]});
+        usage.update(&partial);
+        usage.update(&partial);
+        let merged = usage.stats();
+        assert_eq!((merged.prompt_tokens, merged.completion_tokens), (123, 17));
+        assert_eq!(
+            (merged.cache_creation_tokens, merged.cache_read_tokens),
+            (10, 80)
+        );
+        assert_eq!(merged.total_tokens, 230);
+        assert_eq!(merged.upstream_total_tokens, 0);
+
+        usage.update(&json!({"input_tokens":u32::MAX}));
+        assert_eq!(usage.stats().total_tokens, u32::MAX);
+        assert_eq!(usage.stats().upstream_total_tokens, 0);
+    }
+
+    fn nested_document() -> Value {
+        json!({"type":"document","source":{"type":"content","content":[
+            {"type":"text","text":"before"},
+            {"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}},
+            {"type":"text","text":"after"}
+        ]}})
+    }
+
+    #[test]
+    fn compat_anthropic_wire_nested_document_user_keeps_image_and_order() {
+        let mut messages = Vec::new();
+        translate_user_blocks(
+            &[nested_document()],
+            CacheMarkers::Drop,
+            ToolResultMedia::Drop,
+            &mut messages,
+        );
+        let parts = messages[0].content_blocks.as_ref().unwrap();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0]["text"], "before");
+        assert_eq!(
+            parts[1]["image_url"]["url"],
+            "data:image/png;base64,iVBORw0KGgo="
+        );
+        assert_eq!(parts[2]["text"], "after");
+    }
+
+    #[test]
+    fn compat_anthropic_wire_nested_document_tool_result_keeps_image_where_supported() {
+        let message = tool_message_from_tool_result(
+            &json!({"type":"tool_result","tool_use_id":"toolu_1", "content":[nested_document()]}),
+            CacheMarkers::Drop,
+            ToolResultMedia::Keep,
+        );
+        let parts = message.content_blocks.as_ref().unwrap();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(
+            parts[1]["image_url"]["url"],
+            "data:image/png;base64,iVBORw0KGgo="
+        );
+        assert_eq!(parts[2]["text"], "after");
+    }
+
+    #[test]
+    fn compat_anthropic_wire_url_document_keeps_canonical_file_identity() {
+        let part = openai_media_part_from_anthropic(&json!({"type":"document","title":"report.pdf", "source":{"type":"url","url":"https://example.org/report.pdf"}})).unwrap();
+        let media = match parse_part(&part).unwrap() {
+            ContentPart::Media(media) => media,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(media.kind, MediaKind::File);
+        assert!(matches!(
+            media.source,
+            MediaSource::Uri {
+                uri: "https://example.org/report.pdf",
+                ..
+            }
+        ));
+        assert!(part.get("image_url").is_none());
+    }
+
+    #[test]
+    fn compat_anthropic_wire_tool_result_error_presence_is_preserved() {
+        for value in [Some(true), Some(false), None] {
+            let mut block =
+                json!({"type":"tool_result","tool_use_id":"toolu_1","content":"result"});
+            if let Some(flag) = value {
+                block["is_error"] = json!(flag);
+            }
+            let message =
+                tool_message_from_tool_result(&block, CacheMarkers::Drop, ToolResultMedia::Drop);
+            assert_eq!(
+                message.extra.get("is_error").cloned(),
+                value.map(Value::Bool)
+            );
+        }
+    }
+
+    fn zero_cache_response(reported: bool) -> ChatResponse {
+        let mut chat = response(
+            json!([{"type":"text","text":"ok"}]),
+            json!({"input_tokens":23,"output_tokens":5}),
+        );
+        chat.usage.openai_details.cached_tokens_reported = reported;
+        chat
+    }
+
+    #[test]
+    fn compat_anthropic_wire_buffered_reported_zero_cache_remains_present() {
+        let body = chat_response_into_anthropic_json(&zero_cache_response(true), "alias");
+        assert_eq!(
+            body["usage"].get("cache_read_input_tokens"),
+            Some(&json!(0))
+        );
+        let absent = chat_response_into_anthropic_json(&zero_cache_response(false), "alias");
+        assert!(absent["usage"].get("cache_read_input_tokens").is_none());
+    }
+
+    #[test]
+    fn compat_anthropic_wire_stream_reported_zero_cache_remains_present() {
+        let chat = zero_cache_response(true);
+        let chunk = ChatChunk {
+            native_envelope: None,
+            choice_index: 0,
+            logprobs: None,
+            id: chat.id,
+            model: chat.model,
+            delta: ChatDelta::default(),
+            finish_reason: Some(FinishReason::Stop),
+            usage: Some(chat.usage),
+            service_tier: None,
+            accounting_usage: None,
+        };
+        let events = AnthropicSseEncoder::new("msg_compat", "alias", 0).next_events(&chunk);
+        let closing = events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .unwrap();
+        assert_eq!(
+            closing.data["usage"].get("cache_read_input_tokens"),
+            Some(&json!(0))
+        );
+    }
+}
+
+#[cfg(test)]
+mod compat_anthropic_wire_native_render_regressions {
+    use super::*;
+    use serde_json::{json, Value};
+
+    fn native_response() -> ChatResponse {
+        response_into_chat_response(
+            serde_json::from_value(json!({
+                "id":"msg_signed","model":"claude-test","content":[
+                    {"type":"thinking","thinking":"checking","signature":"opaque+sig=="},
+                    {"type":"redacted_thinking","data":"opaque/data=="},
+                    {"type":"text","text":"answer"},
+                    {"type":"tool_use","id":"call1","name":"read","input":{"path":"notes"}}
+                ],"stop_reason":"tool_use","usage":{"input_tokens":23,"output_tokens":5}
+            }))
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn compat_anthropic_wire_messages_renderer_preserves_signed_native_sequence() {
+        let response = native_response();
+        let rendered = chat_response_into_anthropic_json(&response, "alias");
+        assert_eq!(
+            rendered["content"],
+            json!([
+                {"type":"thinking","thinking":"checking","signature":"opaque+sig=="},
+                {"type":"redacted_thinking","data":"opaque/data=="},
+                {"type":"text","text":"answer"},
+                {"type":"tool_use","id":"call1","name":"read","input":{"path":"notes"}}
+            ])
+        );
+    }
+
+    fn chunk(delta: ChatDelta) -> ChatChunk {
+        ChatChunk {
+            native_envelope: None,
+            choice_index: 0,
+            logprobs: None,
+            id: "msg_signed".into(),
+            model: "claude-test".into(),
+            delta,
+            finish_reason: None,
+            usage: None,
+            service_tier: None,
+            accounting_usage: None,
+        }
+    }
+
+    fn reconstructed_blocks(events: &[AnthropicSseEvent]) -> Vec<Value> {
+        let mut blocks = std::collections::BTreeMap::<u64, Value>::new();
+        for event in events {
+            let Some(index) = event.data.get("index").and_then(Value::as_u64) else {
+                continue;
+            };
+            if event.event == "content_block_start" {
+                assert!(blocks
+                    .insert(index, event.data["content_block"].clone())
+                    .is_none());
+                continue;
+            }
+            if event.event != "content_block_delta" {
+                continue;
+            }
+            let block = blocks.get_mut(&index).unwrap();
+            let delta = &event.data["delta"];
+            let field = match delta["type"].as_str().unwrap() {
+                "thinking_delta" => "thinking",
+                "signature_delta" => "signature",
+                "text_delta" => "text",
+                "input_json_delta" => {
+                    let text = block
+                        .get("partial_input")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string()
+                        + delta["partial_json"].as_str().unwrap();
+                    block["partial_input"] = text.into();
+                    continue;
+                }
+                other => panic!("unexpected block delta {other}"),
+            };
+            let text = block
+                .get(field)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+                + delta[field].as_str().unwrap();
+            block[field] = text.into();
+        }
+        blocks
+            .into_values()
+            .map(|mut block| {
+                if let Some(input) = block.as_object_mut().unwrap().remove("partial_input") {
+                    block["input"] = serde_json::from_str(input.as_str().unwrap()).unwrap();
+                }
+                block
+            })
+            .collect()
+    }
+
+    #[test]
+    fn compat_anthropic_wire_messages_stream_roundtrip_keeps_all_native_blocks_once() {
+        let expected = json!([
+            {"type":"thinking","thinking":"checking","signature":"opaque+sig=="},
+            {"type":"redacted_thinking","data":"opaque/data=="},
+            {"type":"thinking","thinking":"second","signature":"second/sig=="},
+            {"type":"text","text":"answer"},
+            {"type":"text","text":" continuation"},
+            {"type":"tool_use","id":"call1","name":"read","input":{"path":"notes"}},
+            {"type":"tool_use","id":"call2","name":"write","input":{"ok":true}}
+        ]);
+        let mut source = vec![
+            json!({"type":"message_start","message":{"id":"msg_signed","model":"claude-test","usage":{"input_tokens":23,"output_tokens":0}}}),
+        ];
+        for (index, block) in expected.as_array().unwrap().iter().enumerate() {
+            let mut start = block.clone();
+            let mut deltas = Vec::new();
+            match block["type"].as_str().unwrap() {
+                "thinking" => {
+                    start["thinking"] = "".into();
+                    start["signature"] = "".into();
+                    deltas.push(json!({"type":"thinking_delta","thinking":block["thinking"]}));
+                    deltas.push(json!({"type":"signature_delta","signature":block["signature"]}));
+                }
+                "text" => {
+                    start["text"] = "".into();
+                    deltas.push(json!({"type":"text_delta","text":block["text"]}));
+                }
+                "tool_use" => {
+                    start["input"] = json!({});
+                    deltas.push(json!({"type":"input_json_delta","partial_json":serde_json::to_string(&block["input"]).unwrap()}));
+                }
+                _ => {}
+            }
+            source.push(json!({"type":"content_block_start","index":index,"content_block":start}));
+            source.extend(
+                deltas
+                    .into_iter()
+                    .map(|delta| json!({"type":"content_block_delta","index":index,"delta":delta})),
+            );
+            source.push(json!({"type":"content_block_stop","index":index}));
+        }
+        source.push(json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":5}}));
+        let mut upstream = StreamState::default();
+        let mut encoder = AnthropicSseEncoder::new("msg_signed", "alias", 0);
+        let mut events = Vec::new();
+        for source in source {
+            let event = serde_json::from_value(source).unwrap();
+            if let Some(chunk) = upstream.next_chunk(&event) {
+                events.extend(encoder.next_events(&chunk));
+            }
+        }
+        events.extend(encoder.force_finish());
+        assert_eq!(json!(reconstructed_blocks(&events)), expected);
+        let stops: Vec<_> = events
+            .iter()
+            .filter(|event| event.event == "content_block_stop")
+            .map(|event| event.data["index"].as_u64().unwrap())
+            .collect();
+        assert_eq!(stops, (0..7).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn compat_anthropic_wire_messages_signed_stream_keeps_preceding_text_blocks() {
+        let source = vec![
+            json!({"type":"message_start","message":{"id":"msg_signed","model":"claude-test","usage":{"input_tokens":1,"output_tokens":0}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"before"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"thinking","thinking":"","signature":""}}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":"check"}}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"signature_delta","signature":"opaque=="}}),
+            json!({"type":"content_block_stop","index":1}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}),
+        ];
+        let mut upstream = StreamState::default();
+        let mut encoder = AnthropicSseEncoder::new("msg_signed", "alias", 0);
+        let mut events = Vec::new();
+        let mut carried = Vec::new();
+        for raw in source {
+            let event = serde_json::from_value(raw).unwrap();
+            if let Some(chunk) = upstream.next_chunk(&event) {
+                if let Some(blocks) = chunk
+                    .delta
+                    .extra
+                    .get("content_blocks")
+                    .and_then(Value::as_array)
+                {
+                    carried.extend(blocks.iter().cloned());
+                }
+                events.extend(encoder.next_events(&chunk));
+            }
+        }
+        events.extend(encoder.force_finish());
+        let expected = json!([
+            {"type":"text","text":"before"},
+            {"type":"thinking","thinking":"check","signature":"opaque=="},
+        ]);
+        assert_eq!(json!(carried), expected);
+        assert_eq!(json!(reconstructed_blocks(&events)), expected);
+    }
+
+    #[test]
+    fn compat_anthropic_wire_messages_carrier_and_standard_projection_do_not_duplicate() {
+        let response = native_response();
+        let expected = json!(response.message.content_blocks.as_ref().unwrap());
+        let mut delta = ChatDelta {
+            reasoning_content: Some("checking".into()),
+            content: Some("answer".into()),
+            tool_calls: Some(vec![
+                json!({"index":0,"id":"call1","function":{"name":"read","arguments":"{\"path\":\"notes\"}"}}),
+            ]),
+            ..Default::default()
+        };
+        delta
+            .extra
+            .insert("content_blocks".into(), expected.clone());
+        let mut encoder = AnthropicSseEncoder::new("msg_signed", "alias", 0);
+        let mut events = encoder.next_events(&chunk(delta));
+        events.extend(encoder.force_finish());
+        assert_eq!(json!(reconstructed_blocks(&events)), expected);
+    }
+
+    #[test]
+    fn compat_anthropic_wire_messages_sse_carries_signature_and_redacted_ciphertext() {
+        let mut encoder = AnthropicSseEncoder::new("msg_signed", "alias", 0);
+        let mut events = encoder.next_events(&chunk(ChatDelta {
+            reasoning_content: Some("checking".into()),
+            ..Default::default()
+        }));
+        let mut delta = ChatDelta::default();
+        delta.extra.insert(
+            "content_blocks".into(),
+            json!([
+                {"type":"thinking","thinking":"checking","signature":"opaque+sig=="},
+                {"type":"redacted_thinking","data":"opaque/data=="}
+            ]),
+        );
+        events.extend(encoder.next_events(&chunk(delta)));
+        events.extend(encoder.force_finish());
+        let signature: Vec<&Value> = events
+            .iter()
+            .filter(|event| {
+                event.data.pointer("/delta/type").and_then(Value::as_str) == Some("signature_delta")
+            })
+            .map(|event| &event.data["delta"]["signature"])
+            .collect();
+        assert_eq!(signature, vec![&json!("opaque+sig==")]);
+        let redacted: Vec<&Value> = events
+            .iter()
+            .filter(|event| {
+                event
+                    .data
+                    .pointer("/content_block/type")
+                    .and_then(Value::as_str)
+                    == Some("redacted_thinking")
+            })
+            .map(|event| &event.data["content_block"]["data"])
+            .collect();
+        assert_eq!(redacted, vec![&json!("opaque/data==")]);
+        let thinking_text: String = events
+            .iter()
+            .filter_map(|event| {
+                event
+                    .data
+                    .pointer("/delta/thinking")
+                    .and_then(Value::as_str)
+            })
+            .collect();
+        assert_eq!(thinking_text, "checking");
+    }
+
+    #[test]
+    fn compat_anthropic_wire_inbound_signed_history_replays_without_loss() {
+        let blocks = json!([
+            {"type":"thinking","thinking":"checking","signature":"opaque+sig=="},
+            {"type":"redacted_thinking","data":"opaque/data=="},
+            {"type":"tool_use","id":"call1","name":"read","input":{"path":"notes"}}
+        ]);
+        let request=parse_inbound_request(&json!({"model":"claude-test","max_tokens":10,"messages":[{"role":"assistant","content":blocks}]})).unwrap();
+        let (_, messages) = split_system(&request).unwrap();
+        assert_eq!(json!(messages[0].content), blocks);
     }
 }

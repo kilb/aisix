@@ -46,7 +46,7 @@
 //! with reason `foreign_duplicate`, and is not counted as refused
 //! ([`crate::pricing::flag_foreign_duplicates`]).
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use axum::extract::rejection::QueryRejection;
@@ -65,6 +65,7 @@ use crate::db::{Db, DbError};
 use crate::error::{ApiError, Detail};
 use crate::pricing::{self, store::PriceBookCache, StoredEvent};
 use crate::AppState;
+use aisix_core::usage_io::UsageIoAudit;
 
 /// The most characters an `event_id` may have.
 const MAX_EVENT_ID_CHARS: usize = 128;
@@ -110,6 +111,61 @@ struct Reject {
     raw: Value,
 }
 
+/// 补充消息只承载 IO 元数据，不得夹带原始用量、时间或计价字段。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IoAuditUpdate {
+    #[serde(rename = "kind")]
+    _kind: String,
+    event_id: String,
+    io_audit: UsageIoAudit,
+}
+
+struct Classified {
+    rows: Vec<Row>,
+    updates: Vec<IoAuditUpdate>,
+    rejects: Vec<Reject>,
+    rejected_usage: usize,
+}
+
+fn classify_items(events: Vec<Value>) -> Classified {
+    let mut classified = Classified {
+        rows: Vec::new(),
+        updates: Vec::new(),
+        rejects: Vec::new(),
+        rejected_usage: 0,
+    };
+    for event in events {
+        if event.get("kind").and_then(Value::as_str) == Some("io_audit_update") {
+            let event = without_nul(event);
+            match serde_json::from_value::<IoAuditUpdate>(event.clone()) {
+                Ok(update)
+                    if !update.event_id.is_empty()
+                        && update.event_id.chars().count() <= MAX_EVENT_ID_CHARS
+                        && update.io_audit.version == 1
+                        && update.io_audit.boundary == "client_exchange"
+                        && update.io_audit.validate() =>
+                {
+                    classified.updates.push(update);
+                }
+                _ => classified.rejects.push(Reject {
+                    reason: "io_audit_update_invalid",
+                    raw: event,
+                }),
+            }
+        } else {
+            match classify(event) {
+                Ok(row) => classified.rows.push(row),
+                Err(reject) => {
+                    classified.rejected_usage += 1;
+                    classified.rejects.push(reject);
+                }
+            }
+        }
+    }
+    classified
+}
+
 /// A row the intake insert stored, as it returns it: `event_id`,
 /// `occurred_at`, `event`, `received_at` and `request_id`.
 type Fresh = (String, DateTime<Utc>, Value, DateTime<Utc>, Option<String>);
@@ -131,17 +187,11 @@ pub async fn ingest(
     slot: OwnedSemaphorePermit,
 ) -> Result<IngestOutcome, DbError> {
     let total = events.len();
-    let (mut rows, mut rejects) = (Vec::new(), Vec::new());
-    for event in events {
-        match classify(event) {
-            Ok(row) => rows.push(row),
-            Err(reject) => rejects.push(reject),
-        }
-    }
+    let classified = classify_items(events);
     db.tx(move |conn| {
         async move {
             let _slot = slot;
-            store(conn, &prices, dp_id, batch_id, total, rows, rejects).await
+            store(conn, &prices, dp_id, batch_id, total, classified).await
         }
         .boxed()
     })
@@ -154,9 +204,14 @@ async fn store(
     dp_id: Uuid,
     batch_id: Uuid,
     total: usize,
-    rows: Vec<Row>,
-    rejects: Vec<Reject>,
+    classified: Classified,
 ) -> Result<IngestOutcome, DbError> {
+    let Classified {
+        rows,
+        updates,
+        rejects,
+        rejected_usage,
+    } = classified;
     // A row this statement inserted has no xmax; one it updated carries
     // this transaction's. A delivery that found the row uncommitted waited
     // for it first, and sees it as updated once it has committed, with the
@@ -178,7 +233,6 @@ async fn store(
         });
     }
 
-    let rejected = rejects.len();
     if !rejects.is_empty() {
         let (reasons, raws): (Vec<&str>, Vec<Value>) =
             rejects.into_iter().map(|r| (r.reason, r.raw)).unzip();
@@ -197,6 +251,7 @@ async fn store(
     }
 
     let valid = rows.len();
+    let normal_ids: Vec<String> = rows.iter().map(|row| row.event_id.clone()).collect();
     let mut inserted = 0;
     let mut priced = pricing::Priced::default();
     if !rows.is_empty() {
@@ -256,10 +311,11 @@ async fn store(
             .collect();
         priced = pricing::price_stored(conn, prices, dp_id, batch_id, fresh).await?;
     }
+    amend_io_audits(conn, dp_id, normal_ids, updates).await?;
     let outcome = IngestOutcome {
         inserted,
         duplicates: (valid as u64).saturating_sub(inserted),
-        rejected: rejected as u64,
+        rejected: rejected_usage as u64,
         batch_duplicate: false,
         charged: priced.charged,
         unpriced: priced.unpriced,
@@ -278,6 +334,73 @@ async fn store(
     .execute(&mut *conn)
     .await?;
     Ok(outcome)
+}
+
+/// 常规用量先结算，再用同一来源的事件身份补充一个 JSON 键。
+async fn amend_io_audits(
+    conn: &mut PgConnection,
+    dp_id: Uuid,
+    normal_ids: Vec<String>,
+    updates: Vec<IoAuditUpdate>,
+) -> Result<(), DbError> {
+    let mut measurements: BTreeMap<String, Option<Value>> =
+        normal_ids.into_iter().map(|id| (id, None)).collect();
+    for update in updates {
+        measurements.insert(update.event_id, Some(json!(update.io_audit)));
+    }
+    if measurements.is_empty() {
+        return Ok(());
+    }
+    let (ids, audits): (Vec<String>, Vec<Option<Value>>) = measurements.into_iter().unzip();
+    // 空占位同样锁住身份：并发补充若先提交，原始行随后仍能读取它，反之亦然。
+    // 排序与用量插入一致；占位不先于结算，且在此事务结束前清除。
+    sqlx::query(
+        "INSERT INTO usage_io_audit_pending (dp_id, event_id, io_audit) \
+         SELECT $1, u.event_id, u.io_audit FROM unnest($2::text[], $3::jsonb[]) \
+         AS u(event_id, io_audit) ORDER BY u.event_id \
+         ON CONFLICT (dp_id, event_id) DO UPDATE SET \
+           io_audit = COALESCE(EXCLUDED.io_audit, usage_io_audit_pending.io_audit)",
+    )
+    .bind(dp_id)
+    .bind(&ids)
+    .bind(audits)
+    .execute(&mut *conn)
+    .await?;
+    // 旧客户端补充不能替换随原事件提交的上游快照；先到的持久补充同样受此约束。
+    sqlx::query(
+        "UPDATE usage_events ue SET event = jsonb_set(ue.event, '{io_audit}', p.io_audit, true) \
+         FROM usage_io_audit_pending p WHERE p.dp_id = $1 AND p.event_id = ANY($2) \
+           AND p.io_audit IS NOT NULL AND ue.dp_id = p.dp_id AND ue.event_id = p.event_id \
+           AND NOT COALESCE(ue.event->'io_audit' @> \
+             '{\"version\":2,\"boundary\":\"upstream_attempt\"}'::jsonb, false)",
+    )
+    .bind(dp_id)
+    .bind(&ids)
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query(
+        "DELETE FROM usage_io_audit_pending p WHERE p.dp_id = $1 AND p.event_id = ANY($2) \
+         AND (p.io_audit IS NULL OR EXISTS (SELECT 1 FROM usage_events ue \
+              WHERE ue.event_id = p.event_id))",
+    )
+    .bind(dp_id)
+    .bind(ids)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// 原生终态的持久发件箱在同一事务内复用正常接收和计费路径。
+pub(crate) async fn ingest_transaction(
+    conn: &mut PgConnection,
+    prices: &PriceBookCache,
+    dp_id: Uuid,
+    batch_id: Uuid,
+    events: Vec<Value>,
+) -> Result<IngestOutcome, DbError> {
+    let total = events.len();
+    let classified = classify_items(events);
+    store(conn, prices, dp_id, batch_id, total, classified).await
 }
 
 /// The rows to store, a column at a time, as `unnest` takes them.
@@ -408,6 +531,144 @@ pub(crate) fn query_rejected(_: QueryRejection) -> ApiError {
         path: "query".to_string(),
         message: "查询参数不合法".to_string(),
     }])
+}
+
+// 松散存储的遥测不能直接 cast：字符串、超大数和缺失值都不是合法 HTTP 状态。
+const CALL_HTTP_STATUS: &str = "(CASE WHEN jsonb_typeof(ue.event->'status_code') = 'number' \
+    AND ue.event->>'status_code' ~ '^[1-5][0-9]{2}$' \
+    THEN (ue.event->>'status_code')::integer ELSE NULL END)";
+const CALL_ERROR: &str = "(CASE WHEN jsonb_typeof(ue.event->'error_class') = 'string' \
+    THEN ue.event->>'error_class' ELSE '' END)";
+
+/// 列表共用的调用筛选；所有谓词在排序和 LIMIT 之前追加。
+#[derive(Default)]
+pub(crate) struct CallFilters {
+    pub(crate) outcome: Option<String>,
+    pub(crate) http_status: Option<u16>,
+    pub(crate) error_class: Option<String>,
+    pub(crate) cache_hit: Option<bool>,
+    pub(crate) service_tier: Option<String>,
+    pub(crate) operation: Option<String>,
+    pub(crate) final_attempt: Option<bool>,
+}
+
+impl CallFilters {
+    pub(crate) fn validate(&self, tenant: bool) -> Result<(), ApiError> {
+        let refused = |path: &str, message: &str| {
+            ApiError::validation(vec![Detail {
+                path: path.to_owned(),
+                message: message.to_owned(),
+            }])
+        };
+        if self
+            .outcome
+            .as_deref()
+            .is_some_and(|v| !["succeeded", "failed", "retried", "unknown"].contains(&v))
+        {
+            return Err(refused("/outcome", "未知的调用结果"));
+        }
+        if self
+            .http_status
+            .is_some_and(|v| !(100..600).contains(&v) || (tenant && !(200..300).contains(&v)))
+        {
+            return Err(refused("/http_status", "响应状态码不可用于筛选"));
+        }
+        if tenant
+            && self
+                .error_class
+                .as_deref()
+                .is_some_and(|v| !crate::billing::calls::is_tenant_error(v))
+        {
+            return Err(refused("/error_class", "未知的公开错误分类"));
+        }
+        for (path, value) in [
+            ("/error_class", &self.error_class),
+            ("/service_tier", &self.service_tier),
+            ("/operation", &self.operation),
+        ] {
+            if value.as_deref().is_some_and(|v| {
+                v.is_empty() || v.chars().count() > MAX_FILTER_CHARS || v.contains('\0')
+            }) {
+                return Err(refused(path, "筛选值不合法"));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn push(
+        &self,
+        sql: &mut QueryBuilder<'_, Postgres>,
+        effective_tier: &str,
+        tenant: bool,
+    ) {
+        let outcome = format!(
+            "(CASE WHEN ue.event->'is_final_attempt' = 'false'::jsonb THEN \
+               CASE WHEN ue.event->>'inference_stage' IN ('accepted', 'pending') \
+                    THEN 'unknown' ELSE 'retried' END \
+             WHEN ue.event->'is_final_attempt' = 'true'::jsonb THEN \
+               CASE WHEN {CALL_ERROR} <> '' THEN 'failed' \
+                    WHEN {CALL_HTTP_STATUS} BETWEEN 200 AND 299 THEN 'succeeded' \
+                    WHEN {CALL_HTTP_STATUS} IS NOT NULL THEN 'failed' ELSE 'unknown' END \
+             ELSE 'unknown' END)"
+        );
+        if let Some(value) = &self.outcome {
+            sql.push(" AND ")
+                .push(&outcome)
+                .push(" = ")
+                .push_bind(value.clone());
+        }
+        if let Some(status) = self.http_status {
+            sql.push(" AND ")
+                .push(CALL_HTTP_STATUS)
+                .push(" = ")
+                .push_bind(i32::from(status));
+            if tenant {
+                // 失败流可能记录 200，但该原始状态不对租户公开。
+                sql.push(" AND ").push(&outcome).push(" = 'succeeded'");
+            }
+        }
+        if let Some(error) = &self.error_class {
+            sql.push(" AND ");
+            if tenant {
+                sql.push(&outcome).push(" = 'failed' AND (");
+                sql.push(crate::billing::calls::tenant_error_sql());
+                sql.push(")");
+            } else {
+                sql.push(CALL_ERROR);
+            }
+            sql.push(" = ").push_bind(error.clone());
+        }
+        if let Some(hit) = self.cache_hit {
+            sql.push(if hit {
+                " AND ue.event->>'cache_status' = 'hit'"
+            } else {
+                " AND ue.event->>'cache_status' IN ('miss', 'bypass', 'disabled')"
+            });
+        }
+        if let Some(tier) = &self.service_tier {
+            sql.push(" AND COALESCE(NULLIF(")
+                .push(effective_tier)
+                .push(
+                    ", ''), CASE WHEN jsonb_typeof(ue.event->'service_tier') = 'string' \
+                       THEN NULLIF(ue.event->>'service_tier', '') END) = ",
+                )
+                .push_bind(tier.clone());
+        }
+        if let Some(operation) = &self.operation {
+            sql.push(
+                " AND jsonb_typeof(ue.event->'operation') = 'string' \
+                      AND ue.event->>'operation' = ",
+            )
+            .push_bind(operation.clone());
+        }
+        if let Some(final_attempt) = self.final_attempt {
+            sql.push(if final_attempt {
+                " AND ue.event->'is_final_attempt' = 'true'::jsonb"
+            } else {
+                " AND ue.event->'is_final_attempt' = 'false'::jsonb"
+            });
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -696,5 +957,28 @@ mod tests {
             value,
             json!({"a\u{fffd}": ["x\u{fffd}y", {"k": "\u{fffd}"}], "n": 1})
         );
+    }
+
+    #[test]
+    fn scalar_io_updates_accept_only_the_legacy_client_exchange_boundary() {
+        for (version, boundary, accepted) in [
+            (1, "client_exchange", true),
+            (2, "upstream_attempt", false),
+            (2, "client_exchange", false),
+            (1, "upstream_attempt", false),
+            (255, "upstream_attempt", false),
+        ] {
+            let raw = json!({"kind":"io_audit_update","event_id":"legacy-only",
+                "io_audit":{"version":version,"boundary":boundary,"response_complete":false}});
+            let classified = classify_items(vec![raw.clone()]);
+            assert!(classified.rows.is_empty());
+            assert_eq!(classified.rejected_usage, 0);
+            assert_eq!(classified.updates.len(), usize::from(accepted));
+            assert_eq!(classified.rejects.len(), usize::from(!accepted));
+            if !accepted {
+                assert_eq!(classified.rejects[0].reason, "io_audit_update_invalid");
+                assert_eq!(classified.rejects[0].raw, raw);
+            }
+        }
     }
 }

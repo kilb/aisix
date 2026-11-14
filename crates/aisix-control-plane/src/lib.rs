@@ -36,6 +36,7 @@ pub mod member_usage;
 pub mod members;
 pub mod model_probe_history;
 pub mod model_probes;
+pub mod native_objects;
 pub mod operators;
 pub mod pki;
 pub mod pricing;
@@ -93,6 +94,8 @@ pub struct AppState {
     /// they never take the connections usage intake needs
     /// ([`billing::access::LOOKUP_POOL_SIZE`]).
     pub lookups: Db,
+    /// 原生对象操作和发件箱用独立池，不占用心跳或用量接收连接。
+    pub native_objects: Db,
     /// The one outbound client, and the model lists it has fetched
     /// ([`upstream_models::Cache`]).
     pub upstream: Arc<upstream_http::Client>,
@@ -337,6 +340,8 @@ where
         billing::access::LOOKUP_POOL_SIZE,
         billing::access::LOOKUP_ACQUIRE_TIMEOUT,
     );
+    let native_objects =
+        db.dedicated_within(native_objects::POOL_SIZE, native_objects::ACQUIRE_TIMEOUT);
     let upstream = upstream_http::Client::new(outbound).map_err(BootError::OutboundPolicy)?;
     let library = pricing::library::Source::new(library).map_err(BootError::LibrarySource)?;
     let state = AppState {
@@ -353,6 +358,7 @@ where
         telemetry_bodies: Arc::new(Semaphore::new(dp::telemetry::MAX_BODIES_IN_FLIGHT)),
         prices: Arc::new(PriceBookCache::new(catalogue)),
         lookups,
+        native_objects,
         upstream: Arc::new(upstream),
         upstream_models: Arc::new(upstream_models::Cache::default()),
         model_probes: Arc::new(Semaphore::new(model_probes::MAX_IN_FLIGHT)),
@@ -390,6 +396,7 @@ where
         WriteCtx::of(&state),
         stopping.clone(),
     ));
+    tasks.push(native_objects::spawn(state.clone(), stopping.clone()));
     if let Some((listener, tls, _)) = dp {
         tasks.push(tokio::spawn(dp::listener::serve_dp(
             listener,

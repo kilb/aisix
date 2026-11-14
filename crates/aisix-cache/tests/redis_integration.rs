@@ -65,6 +65,7 @@ fn sentinel_cfg() -> Option<RedisConnConfig> {
 
 fn sample(content: &str) -> ChatResponse {
     ChatResponse {
+        native_envelope: None,
         logprobs: None,
         more_choices: Vec::new(),
         id: "cmpl-int-1".into(),
@@ -116,6 +117,7 @@ async fn put_then_get_preserves_null_content_through_cache() {
         serde_json::from_str(r#"{"role":"assistant","content":null}"#).unwrap();
     assert!(message.content.is_none());
     let resp = ChatResponse {
+        native_envelope: None,
         logprobs: None,
         more_choices: Vec::new(),
         id: "cmpl-null-1".into(),

@@ -848,6 +848,9 @@ impl ProxyError {
             ProxyError::BudgetExceeded(r) => env.with_code("budget_exceeded").with_budget(r),
             ProxyError::BudgetUnverified => env.with_code("budget_unverified"),
             ProxyError::AccountUnavailable => env.with_code("control_plane_unavailable"),
+            ProxyError::Bridge(aisix_gateway::BridgeError::DependencyUnavailable) => {
+                env.with_code("control_plane_unavailable")
+            }
             // Attribution for policy-layer 429s (#892): the
             // OpenAI envelope names the offending policy. The Anthropic
             // envelope keeps its strict {type,message} shape.
@@ -1469,9 +1472,15 @@ impl ProxyError {
 ///   AND any future variant axum adds, defaulting to a 400
 ///   `invalid_request_error` until each gets an explicit policy.
 pub(crate) fn proxy_error_from_json_rejection(
-    rej: axum::extract::rejection::JsonRejection,
+    rej: impl Into<crate::request_json::JsonRejection>,
     limit_bytes: usize,
 ) -> ProxyError {
+    let rej = match rej.into() {
+        crate::request_json::JsonRejection::Axum(rej) => rej,
+        crate::request_json::JsonRejection::InvalidJson => {
+            return ProxyError::InvalidRequest("invalid JSON request body".into());
+        }
+    };
     use axum::extract::rejection::JsonRejection;
     match rej {
         JsonRejection::BytesRejection(inner) if inner.status() == StatusCode::PAYLOAD_TOO_LARGE => {

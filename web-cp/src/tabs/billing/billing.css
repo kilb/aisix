@@ -1,15 +1,15 @@
-/* 账务页面复用 Bento 令牌；详情仍按原顺序保留十个独立业务区域。 */
+/* 账务详情沿用面板内距，业务区域以连续分隔线排列。 */
 .bl-region {
   min-width: 0;
-  margin: 0 -28px;
-  padding: 28px;
+  margin: 0 calc(-1 * var(--pad, 24px));
+  padding: var(--pad, 24px);
   border-top: 1px solid var(--border);
 }
 .side-panel > .bl-region:first-of-type {
   margin-top: 20px;
 }
 .side-panel > .bl-region:last-child {
-  margin-bottom: -28px;
+  margin-bottom: calc(-1 * var(--pad, 24px));
 }
 .bl-region > .bento-card-header {
   margin-bottom: 16px;
@@ -26,19 +26,19 @@
   line-height: var(--text-caption--line-height);
 }
 .bl-region > .dt-wrap {
-  --dt-edge: 28px;
-  margin: 16px -28px 0;
+  --dt-edge: var(--pad, 24px);
+  margin: 16px calc(-1 * var(--pad, 24px)) 0;
   border-top: 1px solid var(--border);
 }
 .bl-region > .dt-wrap:last-child {
-  margin-bottom: -28px;
+  margin-bottom: calc(-1 * var(--pad, 24px));
 }
 .side-panel > .bl-region:last-child > .dt-wrap:last-child {
   border-radius: 0 0 var(--r-card) var(--r-card);
 }
 .bl-region > .empty {
   margin-top: 12px;
-  padding: 28px 16px;
+  padding: 24px 16px;
 }
 .bl-region > .loading {
   margin-top: 4px;
@@ -48,8 +48,8 @@
 .bl-more {
   display: flex;
   justify-content: center;
-  margin: 0 -28px -28px;
-  padding: 14px 28px;
+  margin: 0 calc(-1 * var(--pad, 24px)) calc(-1 * var(--pad, 24px));
+  padding: 16px var(--pad, 24px);
   border-top: 1px solid var(--border);
 }
 
@@ -57,30 +57,33 @@
 .bl-tiles {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 12px;
+  gap: 0 20px;
   margin: 0;
 }
 .bl-tiles > div {
   min-width: 0;
-  padding: 16px;
-  border-radius: var(--radius);
-  background: var(--well);
+  padding: 16px 0;
+  border-top: 1px solid var(--border);
 }
 .bl-tiles dt {
   color: var(--ink-soft);
-  font-family: var(--font-mono);
-  font-size: var(--text-meta);
+  font-family: var(--font-sans);
+  font-size: var(--text-caption);
   line-height: var(--text-meta--line-height);
   font-weight: 400;
 }
 .bl-tiles dd {
-  margin: 12px 0 0;
+  margin: 8px 0 0;
   overflow-wrap: anywhere;
-  font-size: var(--text-value);
+  font-size: 20px;
   font-weight: 400;
   letter-spacing: var(--text-value--letter-spacing);
-  line-height: var(--text-value--line-height);
+  line-height: 28px;
   font-variant-numeric: tabular-nums;
+}
+.bl-tiles dd.money {
+  font-size: 28px;
+  line-height: 36px;
 }
 .bl-tiles dd .lamp {
   font-size: var(--text-body);
@@ -137,6 +140,7 @@
   border-inline-start: 2px solid var(--foreground);
 }
 .bl-name {
+  min-height: 44px;
   max-width: var(--trunc, 200px);
 }
 .bl-row-actions {
@@ -180,7 +184,15 @@
 .bl-card-foot {
   display: flex;
   justify-content: center;
-  margin: 0 -28px -28px;
-  padding: 14px 28px;
+  margin: 0 calc(-1 * var(--pad, 24px)) calc(-1 * var(--pad, 24px));
+  padding: 16px var(--pad, 24px);
   border-top: 1px solid var(--border);
+}
+
+/* 窄屏表单按钮独占末行，避免字段错误或辅助文字挤压操作。 */
+@media (max-width: 600px) {
+  .bl-controls.bl-inline > .btn { margin-top: 0; }
+  .bl-controls.bl-inline > .field { flex-basis: 100%; }
+  .bl-facts { grid-template-columns: minmax(0, 1fr); gap: 4px; }
+  .bl-facts dd + dt { margin-top: 12px; }
 }

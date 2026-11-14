@@ -1246,6 +1246,7 @@ pub(crate) struct AnsweredUsage {
     pub reasoning_folded_into_completion: u32,
     pub cached_prompt_tokens: u32,
     pub cache_write_tokens: Option<u32>,
+    pub cache_usage_reported: Option<bool>,
     pub cache_creation_tokens: u32,
     pub cache_creation_ttl: aisix_gateway::CacheCreationTtl,
     pub cache_read_tokens: u32,
@@ -1262,6 +1263,20 @@ pub(crate) struct AnsweredUsage {
 }
 
 impl AnsweredUsage {
+    pub(crate) fn from_observed_stream(
+        observed: &aisix_gateway::response_tap::ObservedStreamUsage,
+    ) -> Self {
+        let mut usage = Self::from_stats(&observed.stats);
+        if !observed.completion_reported {
+            usage.completion_tokens = 0;
+        }
+        usage.service_tier = observed
+            .service_tier
+            .as_ref()
+            .map(|tier| tier.as_str().to_owned());
+        usage
+    }
+
     /// Every counter of `stats`, as the chat and messages success rows
     /// record a [`aisix_gateway::UsageStats`]. The caller sets what the row
     /// takes from elsewhere: an estimated count, the cost, the response's
@@ -1275,6 +1290,7 @@ impl AnsweredUsage {
             reasoning_folded_into_completion: stats.reasoning_folded_into_completion,
             cached_prompt_tokens: stats.cached_prompt_tokens,
             cache_write_tokens: stats.cache_write_tokens,
+            cache_usage_reported: stats.cache_usage_reported(),
             cache_creation_tokens: stats.cache_creation_tokens,
             cache_creation_ttl: stats.cache_creation_ttl,
             cache_read_tokens: stats.cache_read_tokens,
@@ -1304,6 +1320,7 @@ impl AnsweredUsage {
         event.total_tokens = self.upstream_total_tokens;
         event.cached_prompt_tokens = self.cached_prompt_tokens;
         event.cache_write_tokens = self.cache_write_tokens;
+        event.cache_usage_reported = self.cache_usage_reported;
         event.cache_creation_tokens = self.cache_creation_tokens;
         event.cache_creation_ttl = self.cache_creation_ttl;
         event.cache_read_tokens = self.cache_read_tokens;
@@ -1596,11 +1613,310 @@ pub(crate) fn emit_usage(
     state: &ProxyState,
     snap: &AisixSnapshot,
     surface: Surface,
+    event: UsageEvent,
+    labels: UsageEventLabels<'_>,
+    content: Option<&aisix_obs::CapturedContent>,
+    trace: Option<&std::sync::Arc<aisix_obs::RequestTraceBundle>>,
+    terminal: bool,
+    dispatched: bool,
+) {
+    emit_usage_with_finality(
+        state, snap, surface, event, labels, content, trace, terminal, terminal, dispatched,
+    );
+}
+
+/// 源端已报告的累计值优先于估算；未结算输出仍保留流消费者的部分输出估算。
+pub(crate) fn reconcile_observed_stream_usage(
+    current: &mut AnsweredUsage,
+    observed: &aisix_gateway::response_tap::ObservedStreamUsage,
+) {
+    let previous = std::mem::take(current);
+    let stats = &observed.stats;
+    let estimated = previous.usage_estimated;
+    let mut usage = AnsweredUsage::from_observed_stream(observed);
+    usage.prompt_tokens = if observed.prompt_reported {
+        if estimated {
+            stats.prompt_tokens
+        } else {
+            stats.prompt_tokens.max(previous.prompt_tokens)
+        }
+    } else {
+        previous.prompt_tokens
+    };
+    usage.completion_tokens = if observed.completion_reported {
+        if estimated {
+            stats.completion_tokens
+        } else {
+            stats.completion_tokens.max(previous.completion_tokens)
+        }
+    } else {
+        previous.completion_tokens
+    };
+    usage.reasoning_tokens = usage.reasoning_tokens.max(previous.reasoning_tokens);
+    usage.upstream_total_tokens = previous
+        .upstream_total_tokens
+        .max(stats.upstream_total_tokens);
+    usage.reasoning_folded_into_completion = usage
+        .reasoning_folded_into_completion
+        .max(previous.reasoning_folded_into_completion);
+    usage.cached_prompt_tokens = usage
+        .cached_prompt_tokens
+        .max(previous.cached_prompt_tokens);
+    usage.cache_write_tokens = usage.cache_write_tokens.max(previous.cache_write_tokens);
+    usage.cache_usage_reported = match (usage.cache_usage_reported, previous.cache_usage_reported) {
+        (Some(a), Some(b)) => Some(a || b),
+        (a, b) => a.or(b),
+    };
+    usage.cache_creation_tokens = usage
+        .cache_creation_tokens
+        .max(previous.cache_creation_tokens);
+    usage.cache_read_tokens = usage.cache_read_tokens.max(previous.cache_read_tokens);
+    usage.cache_creation_ttl = usage
+        .cache_creation_ttl
+        .max_fieldwise(&previous.cache_creation_ttl);
+    usage.modality = usage.modality.max_fieldwise(&previous.modality);
+    usage.web_search_requests = usage.web_search_requests.max(previous.web_search_requests);
+    usage.web_fetch_requests = usage.web_fetch_requests.max(previous.web_fetch_requests);
+    usage.audio_duration_seconds = previous.audio_duration_seconds;
+    usage.usage_estimated = estimated
+        && ((!observed.prompt_reported && usage.prompt_tokens > 0)
+            || (!observed.completion_reported && usage.completion_tokens > 0));
+    usage.service_tier = usage
+        .service_tier
+        .or(previous.service_tier)
+        .map(crate::chat::sanitize_tag)
+        .filter(|tier| !tier.is_empty());
+    usage.provider_request_id = previous.provider_request_id;
+    usage.provider_model_version = previous.provider_model_version;
+    usage.cost_usd = previous.cost_usd;
+    *current = usage;
+}
+
+pub(crate) fn apply_observed_stream_usage(
+    event: &mut UsageEvent,
+    observed: &aisix_gateway::response_tap::ObservedStreamUsage,
+    snap: &AisixSnapshot,
+) {
+    let mut usage = AnsweredUsage {
+        prompt_tokens: event.prompt_tokens,
+        completion_tokens: event.folded_completion_tokens(),
+        reasoning_tokens: event.reasoning_tokens,
+        upstream_total_tokens: event.total_tokens,
+        reasoning_folded_into_completion: event.reasoning_unfolded_from_completion,
+        cached_prompt_tokens: event.cached_prompt_tokens,
+        cache_write_tokens: event.cache_write_tokens,
+        cache_usage_reported: event.cache_usage_reported,
+        cache_creation_tokens: event.cache_creation_tokens,
+        cache_creation_ttl: event.cache_creation_ttl,
+        cache_read_tokens: event.cache_read_tokens,
+        modality: event.modality_tokens,
+        web_search_requests: event.web_search_requests,
+        web_fetch_requests: event.web_fetch_requests,
+        audio_duration_seconds: event.audio_duration_seconds,
+        usage_estimated: event.usage_estimated,
+        cost_usd: event.cost_usd,
+        service_tier: event.service_tier.clone(),
+        provider_request_id: event.provider_request_id.clone(),
+        provider_model_version: event.provider_model_version.clone(),
+    };
+    reconcile_observed_stream_usage(&mut usage, observed);
+    usage.cost_usd = request_cost_usd(
+        snap,
+        &event.model_id,
+        input_tokens_from_counts(
+            usage.prompt_tokens,
+            usage.cached_prompt_tokens,
+            usage.cache_write_tokens,
+            usage.cache_read_tokens,
+            usage.cache_creation_tokens,
+            usage.cache_creation_ttl,
+        ),
+        u64::from(usage.completion_tokens),
+    );
+    usage.apply(event);
+}
+
+/// 副作用之前读取同一份源端快照；中央发射仍保留取消路径的兜底。
+pub(crate) fn resolve_observed_stream_event(event: &mut UsageEvent, snap: &AisixSnapshot) {
+    if let Some(observed) = crate::attribution::observed_stream_usage(event.attempt_index) {
+        apply_observed_stream_usage(event, &observed, snap);
+    }
+}
+
+/// 首帧前失败没有流完成回调；仅已有源端报告时记录同一份 token 指标。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_observed_stream_failure(
+    state: &ProxyState,
+    snap: &AisixSnapshot,
+    endpoint: &'static str,
+    requested_model: &str,
+    model_id: &str,
+    api_key_id: &str,
+    attempt_index: u32,
+    client: &ClientContext,
+    pk: &ResolvedPk<'_>,
+) {
+    let Some(observed) = crate::attribution::observed_stream_usage(attempt_index) else {
+        return;
+    };
+    let usage = AnsweredUsage::from_observed_stream(&observed);
+    let target = snap.models.get_by_id(model_id);
+    let caller = crate::request_metrics::Caller::from_api_key_id(snap, api_key_id);
+    crate::request_metrics::record_usage(
+        state,
+        endpoint,
+        caller.as_caller(),
+        crate::request_metrics::Upstream {
+            provider: target
+                .as_ref()
+                .and_then(|e| e.value.provider.as_deref())
+                .unwrap_or("unknown"),
+            model: requested_model,
+            upstream_model: target
+                .as_ref()
+                .and_then(|e| e.value.upstream_model())
+                .unwrap_or("unknown"),
+            pk: pk.labels(),
+            stream: true,
+            ..Default::default()
+        },
+        crate::request_metrics::Tokens {
+            input: usage.prompt_tokens,
+            output: usage.completion_tokens,
+            total: total_tokens_with_cache(
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.cache_creation_tokens,
+                usage.cache_read_tokens,
+            )
+            .min(u64::from(u32::MAX)) as u32,
+            cached: usage.cached_prompt_tokens,
+            cache_read: usage.cache_read_tokens,
+            cache_creation: usage.cache_creation_tokens,
+            client_type: state.client_classifier.classify(&client.user_agent),
+        },
+    );
+}
+
+/// 首帧等待被取消或失败时，已报告的用量仍须结算原 reservation 的 token 层。
+pub(crate) struct ObservedStreamTokensHold {
+    attribution: Option<std::sync::Arc<crate::attribution::RequestAttribution>>,
+    observer: Option<aisix_gateway::response_tap::StreamUsageObserver>,
+    attempt_index: u32,
+    limiter: std::sync::Arc<aisix_ratelimit::Limiter>,
+    keys: Vec<String>,
+}
+
+impl ObservedStreamTokensHold {
+    pub(crate) fn new(state: &ProxyState, attempt_index: u32, keys: Vec<String>) -> Self {
+        Self {
+            attribution: crate::attribution::stream_usage_attribution(),
+            observer: None,
+            attempt_index,
+            limiter: std::sync::Arc::clone(&state.limiter),
+            keys,
+        }
+    }
+
+    pub(crate) fn bind(&mut self) {
+        self.observer = self
+            .attribution
+            .as_ref()
+            .and_then(|a| a.stream_usage_observer(self.attempt_index));
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.observer = None;
+        self.attribution = None;
+    }
+}
+
+impl Drop for ObservedStreamTokensHold {
+    fn drop(&mut self) {
+        if let Some(observed) = self
+            .observer
+            .as_ref()
+            .and_then(|usage| usage.get())
+            .or_else(|| {
+                self.attribution
+                    .as_ref()
+                    .and_then(|a| a.observed_stream_usage(self.attempt_index))
+            })
+        {
+            let usage = AnsweredUsage::from_observed_stream(&observed);
+            self.limiter.add_tokens_post_stream_all(
+                &self.keys,
+                total_tokens_with_cache(
+                    usage.prompt_tokens,
+                    usage.completion_tokens,
+                    usage.cache_creation_tokens,
+                    usage.cache_read_tokens,
+                ),
+            );
+        }
+    }
+}
+
+/// 三个流消费者在原有扣量和指标之前归并；不改变客户端帧与首 token 时点。
+macro_rules! resolve_observed_stream_completion {
+    ($comp:expr, $index:expr $(, $fetch:ident)?) => {{
+        if let Some(observed) = crate::attribution::observed_stream_usage($index) {
+            let mut usage = crate::usage_attr::AnsweredUsage {
+                prompt_tokens: $comp.prompt_tokens,
+                completion_tokens: $comp.completion_tokens,
+                upstream_total_tokens: $comp.upstream_total_tokens.unwrap_or(0),
+                reasoning_tokens: $comp.reasoning_tokens,
+                reasoning_folded_into_completion: $comp.reasoning_folded_into_completion,
+                cached_prompt_tokens: $comp.cached_prompt_tokens,
+                cache_write_tokens: $comp.cache_write_tokens,
+                cache_usage_reported: $comp.cache_usage_reported,
+                cache_creation_tokens: $comp.cache_creation_tokens,
+                cache_read_tokens: $comp.cache_read_tokens,
+                cache_creation_ttl: $comp.cache_creation_ttl,
+                modality: $comp.modality,
+                web_search_requests: $comp.web_search_requests,
+                $(web_fetch_requests: $comp.$fetch,)?
+                usage_estimated: $comp.usage_estimated,
+                service_tier: $comp.service_tier.clone(),
+                ..Default::default()
+            };
+            crate::usage_attr::reconcile_observed_stream_usage(&mut usage, &observed);
+            $comp.prompt_tokens = usage.prompt_tokens;
+            $comp.completion_tokens = usage.completion_tokens;
+            $comp.upstream_total_tokens = $comp.upstream_total_tokens.or((usage.upstream_total_tokens > 0).then_some(usage.upstream_total_tokens));
+            $comp.reasoning_tokens = usage.reasoning_tokens;
+            $comp.reasoning_folded_into_completion = usage.reasoning_folded_into_completion;
+            $comp.cached_prompt_tokens = usage.cached_prompt_tokens;
+            $comp.cache_write_tokens = usage.cache_write_tokens;
+            $comp.cache_usage_reported = usage.cache_usage_reported;
+            $comp.cache_creation_tokens = usage.cache_creation_tokens;
+            $comp.cache_read_tokens = usage.cache_read_tokens;
+            $comp.cache_creation_ttl = usage.cache_creation_ttl;
+            $comp.modality = usage.modality;
+            $comp.web_search_requests = usage.web_search_requests;
+            $($comp.$fetch = usage.web_fetch_requests;)?
+            $comp.usage_estimated = usage.usage_estimated;
+            $comp.service_tier = usage.service_tier;
+            true
+        } else {
+            false
+        }
+    }};
+}
+pub(crate) use resolve_observed_stream_completion;
+
+/// 后台任务的 HTTP 接受结束不等于推理结束；原推理终态由持久观察器单独发出。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_usage_with_finality(
+    state: &ProxyState,
+    snap: &AisixSnapshot,
+    surface: Surface,
     mut event: UsageEvent,
     labels: UsageEventLabels<'_>,
     content: Option<&aisix_obs::CapturedContent>,
     trace: Option<&std::sync::Arc<aisix_obs::RequestTraceBundle>>,
     terminal: bool,
+    logical_final: bool,
     dispatched: bool,
 ) {
     // Stamped here rather than at each construction site: this is the one
@@ -1608,7 +1924,9 @@ pub(crate) fn emit_usage(
     // present on a family's success path and missing from its error or
     // streaming one (AISIX-Cloud#1461).
     event.operation = surface.operation.to_string();
-    event.is_final_attempt = terminal;
+    event.is_final_attempt = logical_final;
+    // 与上游 span 使用同一派发事实；零耗时仍可能是一次实际调用。
+    event.upstream_dispatched = Some(dispatched);
     stamp_requested_model_id(&mut event);
     stamp_billing_fields(snap, &mut event, labels.provider_key_id);
     // After the name has looked up its entry, and before the access log and
@@ -1641,6 +1959,13 @@ pub(crate) fn emit_usage(
     let mut upstream_error_body = None;
     if dispatched {
         let response = crate::attribution::take_attempt_upstream_response(event.attempt_index);
+        // 长度只取本次实际上游交换；客户端渲染及交付进度不能覆盖它。
+        if event.io_audit.is_none() {
+            event.io_audit = response.io.as_ref().map(|io| io.snapshot());
+        }
+        if let Some(observed) = response.stream_usage.as_ref().and_then(|usage| usage.get()) {
+            apply_observed_stream_usage(&mut event, &observed, snap);
+        }
         upstream_error_body = response.error_body;
         // A surface that runs detached from the request scope (`/v1/realtime`)
         // read its own off the upgrade response.
@@ -1655,6 +1980,7 @@ pub(crate) fn emit_usage(
             event.provider_request_id = sanitize_provider_response_id(&response.request_id);
         }
     } else {
+        event.io_audit = None;
         // The `upstream_*` latencies time one upstream attempt. An event that
         // reached no upstream has none, whatever duration its builder had at
         // hand (a cache hit's or a refusal's handler time).
@@ -1740,6 +2066,7 @@ pub(crate) fn emit_usage(
             emission.as_ref(),
             None,
             &exporters,
+            terminal,
         );
         return;
     }
@@ -1801,6 +2128,7 @@ pub(crate) fn emit_usage(
         emission.as_ref(),
         facts.as_ref(),
         &exporters,
+        terminal,
     );
 }
 
@@ -1815,15 +2143,29 @@ pub(crate) struct PendingUsage {
     content: Option<aisix_obs::CapturedContent>,
     emission: Option<aisix_obs::TraceEmission>,
     facts: Option<Arc<aisix_obs::SpanFacts>>,
-    exporters: LiveExporters,
+    snapshot: aisix_core::SnapshotHandle<AisixSnapshot>,
     span: tracing::Span,
+    token_terminal: bool,
 }
 
 impl PendingUsage {
     pub(crate) fn deliver(mut self) {
         // inner poll 的 stream span 已退出；发布日志必须重新挂回原请求。
+        self.event.first_token_latency_ms = self
+            .token_terminal
+            .then(crate::attribution::first_token_latency_ms)
+            .flatten();
+        self.publish();
+    }
+
+    fn publish(self) {
         let _entered = self.span.enter();
-        self.event.first_token_latency_ms = crate::attribution::first_token_latency_ms();
+        // 正文传递期间被撤回的 exporter 不能继续收到旧授权下的内容。
+        let view = self.snapshot.load_versioned();
+        let exporters = LiveExporters {
+            generation: view.version,
+            entries: view.snapshot.observability_exporters.entries(),
+        };
         let labels = UsageEventLabels {
             model: &self.labels[0],
             provider_key_id: &self.labels[1],
@@ -1834,14 +2176,14 @@ impl PendingUsage {
         };
         self.sink
             .try_emit(self.surface.handler, self.event.clone(), labels);
-        if !self.exporters.is_empty() {
+        if !exporters.is_empty() {
             self.fan_out.fan_out(
                 &self.event,
                 self.content.as_ref(),
                 self.emission.as_ref(),
                 self.facts.as_ref(),
-                self.exporters.generation(),
-                self.exporters.iter().map(|e| &*e.value),
+                exporters.generation(),
+                exporters.iter().map(|e| &*e.value),
             );
         }
     }
@@ -1857,6 +2199,7 @@ fn deliver_usage(
     emission: Option<&aisix_obs::TraceEmission>,
     facts: Option<&Arc<aisix_obs::SpanFacts>>,
     exporters: &LiveExporters,
+    _terminal: bool,
 ) {
     let token_terminal = event.is_final_attempt && crate::first_token::token_surface(surface);
     event.first_token_latency_ms = if token_terminal {
@@ -1865,7 +2208,7 @@ fn deliver_usage(
         None
     };
     if token_terminal && crate::attribution::body_poll_in_progress() {
-        crate::attribution::defer_body_usage(PendingUsage {
+        let pending = PendingUsage {
             sink: state.usage_sink.clone(),
             fan_out: state.otlp_fan_out.clone(),
             surface,
@@ -1882,12 +2225,11 @@ fn deliver_usage(
             content: content.cloned(),
             emission: emission.cloned(),
             facts: facts.cloned(),
-            exporters: LiveExporters {
-                generation: exporters.generation,
-                entries: exporters.entries.clone(),
-            },
+            snapshot: state.snapshot.clone(),
             span: tracing::Span::current(),
-        });
+            token_terminal,
+        };
+        crate::attribution::defer_body_usage(pending);
         return;
     }
     state
@@ -1953,6 +2295,369 @@ fn attach_gateway_embedding_audit(event: &mut UsageEvent) {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn observed_stream_hold_keeps_peek_cancel_debits_in_the_original_attempt() {
+        // 删除 bind 或在发射时清空 observer，会使取消后的首个 bucket 丢量。
+        let (mut state, _rx) = state_reading_rows(AisixSnapshot::new());
+        state.limiter = std::sync::Arc::new(aisix_ratelimit::Limiter::local_with_clock(
+            aisix_ratelimit::TestClock::new(120),
+        ));
+        let limits: aisix_core::RateLimit =
+            serde_json::from_value(serde_json::json!({"tpm":1000})).unwrap();
+        drop(state.limiter.pre_commit("first", &limits).await.unwrap());
+        drop(state.limiter.pre_commit("second", &limits).await.unwrap());
+        let cell = std::sync::Arc::new(crate::attribution::RequestAttribution::default());
+        let start = |index| {
+            crate::attribution::note_attempt_started(crate::attribution::InFlightAttempt {
+                index,
+                kind: "initial",
+                target_model: String::new(),
+                model_id: format!("m-{index}"),
+                started: std::time::Instant::now(),
+                answered: None,
+                served_input_tokens: None,
+            })
+        };
+        let report = |prompt| aisix_gateway::response_tap::ObservedStreamUsage {
+            stats: aisix_gateway::UsageStats::with_cache(prompt, 0, 11, 23),
+            prompt_reported: true,
+            completion_reported: false,
+            service_tier: aisix_gateway::ServiceTier::native(Some("fast".into())),
+        };
+        let (first_hold, second_hold) = crate::attribution::scope(cell.clone(), async {
+            start(0);
+            aisix_gateway::note_upstream_response(&axum::http::HeaderMap::new());
+            let first = aisix_gateway::response_tap::stream_usage_observer().unwrap();
+            let mut first_hold = ObservedStreamTokensHold::new(&state, 0, vec!["first".into()]);
+            first_hold.bind();
+            first.record(report(37));
+            let cancelled = cell.take_cancel_context();
+            let answered = cancelled.in_flight.unwrap().answered.unwrap();
+            assert_eq!(answered.usage.prompt_tokens, 37);
+            assert_eq!(answered.usage.service_tier.as_deref(), Some("fast"));
+            start(1);
+            aisix_gateway::note_upstream_response(&axum::http::HeaderMap::new());
+            let second = aisix_gateway::response_tap::stream_usage_observer().unwrap();
+            let mut second_hold = ObservedStreamTokensHold::new(&state, 1, vec!["second".into()]);
+            second_hold.bind();
+            second.record(report(53));
+            first.record(report(41));
+            assert_eq!(
+                crate::attribution::observed_stream_usage(1)
+                    .unwrap()
+                    .stats
+                    .prompt_tokens,
+                53
+            );
+            assert_eq!(
+                crate::attribution::observed_stream_usage(0)
+                    .unwrap()
+                    .stats
+                    .prompt_tokens,
+                41
+            );
+            (first_hold, second_hold)
+        })
+        .await;
+        // 在 request scope 和 cancel context 均已离开后，仍只扣原 attempt 的层。
+        drop(first_hold);
+        assert_eq!(
+            state.limiter.peek("first", &limits).await.unwrap().tpm_used,
+            75
+        );
+        assert_eq!(
+            state
+                .limiter
+                .peek("second", &limits)
+                .await
+                .unwrap()
+                .tpm_used,
+            0
+        );
+        let mut second_hold = second_hold;
+        second_hold.disarm();
+        state
+            .limiter
+            .add_tokens_post_stream_all(&["second".into()], 87);
+        drop(second_hold);
+        assert_eq!(
+            state
+                .limiter
+                .peek("second", &limits)
+                .await
+                .unwrap()
+                .tpm_used,
+            87,
+            "完成回调只扣一次"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn observed_stream_usage_retains_fast_tier_cache_ttl_and_partial_output_provenance() {
+        // 去掉源端覆盖会留下 prompt 估算；把 start 输出当终态则会抹掉部分输出估算。
+        let raw = serde_json::json!({
+            "input_tokens":37,"output_tokens":0,
+            "cache_creation_input_tokens":11,"cache_read_input_tokens":23,
+            "cache_creation":{"ephemeral_5m_input_tokens":11,"ephemeral_1h_input_tokens":0},
+            "server_tool_use":{"web_search_requests":7,"web_fetch_requests":3},
+            "speed":"fast","service_tier":"standard"
+        });
+        let observer = aisix_gateway::response_tap::StreamUsageObserver::default();
+        observer.record(aisix_gateway::response_tap::ObservedStreamUsage {
+            stats: aisix_provider_anthropic::wire::anthropic_usage_stats(&raw),
+            prompt_reported: true,
+            completion_reported: false,
+            service_tier: aisix_gateway::ServiceTier::native(
+                aisix_gateway::chat::anthropic_usage_service_tier(&raw),
+            ),
+        });
+        let observed = observer.get().unwrap();
+        let mut event = UsageEvent::default();
+        event.prompt_tokens = 900;
+        event.usage_estimated = true;
+        event.requested_service_tier = Some("auto".into());
+        event.provider_request_id = "upstream-call".into();
+        apply_observed_stream_usage(&mut event, &observed, &AisixSnapshot::new());
+        assert_eq!((event.prompt_tokens, event.completion_tokens), (37, 0));
+        assert_eq!(
+            (event.cache_creation_tokens, event.cache_read_tokens),
+            (11, 23)
+        );
+        assert_eq!(event.cached_prompt_tokens, 0);
+        assert_eq!(event.cache_usage_reported, Some(true));
+        assert_eq!(event.cache_creation_ttl.cache_creation_5m_tokens, Some(11));
+        assert_eq!(event.cache_creation_ttl.cache_creation_1h_tokens, Some(0));
+        assert_eq!(
+            (event.web_search_requests, event.web_fetch_requests),
+            (7, 3)
+        );
+        assert!(!event.usage_estimated);
+        assert_eq!(event.service_tier.as_deref(), Some("fast"));
+        assert_eq!(event.requested_service_tier.as_deref(), Some("auto"));
+        assert_eq!(event.provider_request_id, "upstream-call");
+        assert_eq!(event.total_tokens, 0, "不能把客户端重算总量写成上游报告");
+        assert!(event.first_token_latency_ms.is_none());
+        event.prompt_tokens = 900;
+        event.completion_tokens = 9;
+        event.usage_estimated = true;
+        apply_observed_stream_usage(&mut event, &observed, &AisixSnapshot::new());
+        assert_eq!((event.prompt_tokens, event.completion_tokens), (37, 9));
+        assert!(event.usage_estimated, "未报告终态输出时仍保留部分输出估算");
+        let final_raw = serde_json::json!({"input_tokens":41,"output_tokens":5,
+            "speed":"standard","service_tier":"standard"});
+        observer.record(aisix_gateway::response_tap::ObservedStreamUsage {
+            stats: aisix_provider_anthropic::wire::anthropic_usage_stats(&final_raw),
+            prompt_reported: true,
+            completion_reported: true,
+            service_tier: aisix_gateway::ServiceTier::native(
+                aisix_gateway::chat::anthropic_usage_service_tier(&final_raw),
+            ),
+        });
+        apply_observed_stream_usage(&mut event, &observer.take().unwrap(), &AisixSnapshot::new());
+        assert_eq!((event.prompt_tokens, event.completion_tokens), (41, 5));
+        assert_eq!(
+            (event.cache_creation_tokens, event.cache_read_tokens),
+            (11, 23)
+        );
+        assert_eq!(
+            (event.web_search_requests, event.web_fetch_requests),
+            (7, 3)
+        );
+        assert_eq!(event.service_tier.as_deref(), Some("standard"));
+        assert_eq!(event.requested_service_tier.as_deref(), Some("auto"));
+        assert!(!event.usage_estimated);
+        assert_eq!(event.total_tokens, 0);
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn observed_stream_usage_keeps_reported_zero_and_cache_representations_separate() {
+        let raw = serde_json::json!({"input_tokens":0,"output_tokens":0,
+            "cache_creation_input_tokens":0,"cache_read_input_tokens":0});
+        let observed = aisix_gateway::response_tap::ObservedStreamUsage {
+            stats: aisix_provider_anthropic::wire::anthropic_usage_stats(&raw),
+            prompt_reported: true,
+            completion_reported: true,
+            service_tier: None,
+        };
+        let mut event = UsageEvent::default();
+        event.prompt_tokens = 17;
+        event.completion_tokens = 5;
+        event.usage_estimated = true;
+        apply_observed_stream_usage(&mut event, &observed, &AisixSnapshot::new());
+        assert_eq!((event.prompt_tokens, event.completion_tokens), (0, 0));
+        assert_eq!(event.cache_usage_reported, Some(true));
+        assert!(!event.usage_estimated);
+        let mut subset = aisix_gateway::UsageStats::new(37, 5);
+        subset.cached_prompt_tokens = 13;
+        subset.openai_details.cached_tokens_reported = true;
+        let observed = aisix_gateway::response_tap::ObservedStreamUsage {
+            stats: subset,
+            prompt_reported: true,
+            completion_reported: true,
+            service_tier: None,
+        };
+        apply_observed_stream_usage(&mut event, &observed, &AisixSnapshot::new());
+        assert_eq!((event.prompt_tokens, event.completion_tokens), (37, 5));
+        assert_eq!(event.cached_prompt_tokens, 13);
+        assert_eq!(
+            (event.cache_creation_tokens, event.cache_read_tokens),
+            (0, 0)
+        );
+        assert_eq!(event.total_tokens, 0);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::field_reassign_with_default)]
+    async fn io_audit_each_upstream_attempt_emits_before_client_body_completion() {
+        let (state, mut rx) = state_reading_rows(AisixSnapshot::new());
+        let cell = std::sync::Arc::new(crate::attribution::RequestAttribution::default());
+        cell.track(tracing::Span::none());
+        cell.note_head_written();
+        let requests = [
+            r#"{"messages":[{"role":"user","content":"first"}]}"#,
+            r#"{"messages":[{"role":"user","content":"汉😀"}]}"#,
+        ];
+        let responses = [
+            r#"{"choices":[{"message":{"content":"A"}}]}"#,
+            r#"{"choices":[{"message":{"content":"Z汉😀"}}]}"#,
+        ];
+        crate::attribution::scope(cell.clone(), async {
+            let snap = state.snapshot.load();
+            let mut event_ids = Vec::new();
+            for index in 0..2 {
+                crate::usage_io::observe_test_exchange(
+                    aisix_gateway::upstream_io::Protocol::Chat,
+                    requests[index].as_bytes(),
+                    responses[index].as_bytes(),
+                )
+                .await;
+                let mut event = UsageEvent::default();
+                event.attempt_index = index as u32;
+                event.prompt_tokens = 7;
+                event.completion_tokens = 3;
+                event.total_tokens = 10;
+                emit_usage(
+                    &state,
+                    &snap,
+                    crate::operation::CHAT,
+                    event,
+                    UsageEventLabels::default(),
+                    None,
+                    None,
+                    index == 1,
+                    true,
+                );
+                let row = rx
+                    .try_recv()
+                    .expect("upstream attempt emits before client EOF");
+                assert_eq!(row.attempt_index, index as u32);
+                assert_eq!(row.is_final_attempt, index == 1);
+                assert_eq!(
+                    (row.prompt_tokens, row.completion_tokens, row.total_tokens),
+                    (7, 3, 10)
+                );
+                assert!(!row.event_id.is_empty());
+                event_ids.push(row.event_id);
+                let audit = row
+                    .io_audit
+                    .expect("each dispatched attempt has its own audit");
+                assert_eq!(audit.version, 2);
+                assert_eq!(audit.boundary, "upstream_attempt");
+                assert_eq!(audit.transport.as_deref(), Some("http_entity"));
+                assert_eq!(audit.exchange_count, Some(1));
+                assert_eq!(audit.request_body_bytes, Some(requests[index].len() as u64));
+                assert_eq!(
+                    audit.response_body_bytes,
+                    Some(responses[index].len() as u64)
+                );
+                assert_eq!(audit.request_complete, Some(true));
+                assert!(audit.response_complete);
+                let input = audit.input_text.expect("request text observed upstream");
+                let output = audit.output_text.expect("response text observed upstream");
+                assert_eq!(
+                    (input.utf8_bytes, input.unicode_scalars),
+                    if index == 0 { (5, 5) } else { (7, 2) }
+                );
+                assert_eq!(
+                    (output.utf8_bytes, output.unicode_scalars),
+                    if index == 0 { (1, 1) } else { (8, 3) }
+                );
+                assert!(input.complete && output.complete);
+            }
+            assert_ne!(event_ids[0], event_ids[1]);
+            cell.add_request_bytes(111);
+            cell.note_request_complete();
+            cell.add_response_bytes(777);
+            cell.finish();
+        })
+        .await;
+        assert!(
+            rx.try_recv().is_err(),
+            "client EOF cannot emit another usage event"
+        );
+    }
+
+    #[tokio::test]
+    async fn io_audit_background_accepted_exchange_is_original_even_without_logical_finality() {
+        let (state, mut rx) = state_reading_rows(AisixSnapshot::new());
+        let cell = std::sync::Arc::new(crate::attribution::RequestAttribution::default());
+        cell.track(tracing::Span::none());
+        cell.note_head_written();
+        let request = r#"{"input":"A汉😀"}"#;
+        let response =
+            r#"{"output":[{"type":"message","content":[{"type":"output_text","text":"Z"}]}]}"#;
+        crate::attribution::scope(cell.clone(), async {
+            crate::usage_io::observe_test_exchange(
+                aisix_gateway::upstream_io::Protocol::Responses,
+                request.as_bytes(),
+                response.as_bytes(),
+            )
+            .await;
+            let snap = state.snapshot.load();
+            emit_usage_with_finality(
+                &state,
+                &snap,
+                crate::operation::RESPONSES,
+                UsageEvent::default(),
+                UsageEventLabels::default(),
+                None,
+                None,
+                true,
+                false,
+                true,
+            );
+            let row = rx
+                .try_recv()
+                .expect("accepted exchange emits before client EOF");
+            assert!(!row.is_final_attempt);
+            assert!(!row.event_id.is_empty());
+            let audit = row
+                .io_audit
+                .expect("accepted upstream exchange has an audit");
+            assert_eq!(audit.version, 2);
+            assert_eq!(audit.boundary, "upstream_attempt");
+            assert_eq!(audit.transport.as_deref(), Some("http_entity"));
+            assert_eq!(audit.exchange_count, Some(1));
+            assert_eq!(audit.request_body_bytes, Some(request.len() as u64));
+            assert_eq!(audit.response_body_bytes, Some(response.len() as u64));
+            assert_eq!(audit.request_complete, Some(true));
+            assert!(audit.response_complete);
+            let input = audit.input_text.expect("upstream input text");
+            let output = audit.output_text.expect("upstream output text");
+            assert_eq!((input.utf8_bytes, input.unicode_scalars), (8, 3));
+            assert_eq!((output.utf8_bytes, output.unicode_scalars), (1, 1));
+            assert!(input.complete && output.complete);
+            cell.finish();
+        })
+        .await;
+        assert!(
+            rx.try_recv().is_err(),
+            "one original event per accepted exchange"
+        );
+    }
+
     /// 每个请求收多少钱，最终都落在这个函数把 usage 拆成三个桶的方式上。
     /// 此前它一条直接测试都没有——有测试的是 `InputTokens` 上那两个没有
     /// 任何调用方的构造器，而它们的算术与这里并不一致。测试在给一个不
@@ -2410,6 +3115,109 @@ mod tests {
         .without_cache()
         .with_usage_sink(aisix_obs::UsageSink::new(tx));
         (state, rx)
+    }
+
+    #[tokio::test]
+    async fn dispatch_fact_is_stamped_from_the_emitter_even_without_measurable_latency() {
+        let (state, mut rx) = state_reading_rows(AisixSnapshot::new());
+        let snap = state.snapshot.load();
+        let pk = ResolvedPk::unresolved();
+        for surface in [
+            crate::operation::CHAT,
+            crate::operation::MESSAGES,
+            crate::operation::RESPONSES,
+            crate::operation::COMPLETIONS,
+            crate::operation::EMBEDDINGS,
+            crate::operation::RERANK,
+            crate::operation::IMAGE_GENERATION,
+            crate::operation::IMAGE_EDIT,
+            crate::operation::TRANSCRIPTION,
+            crate::operation::TRANSLATION,
+            crate::operation::SPEECH,
+            crate::operation::VIDEO_GENERATION,
+            crate::operation::REALTIME,
+            crate::operation::FILES,
+            crate::operation::BATCHES,
+            crate::operation::FINE_TUNING,
+            crate::operation::MCP,
+            crate::operation::A2A,
+            crate::operation::PASSTHROUGH,
+        ] {
+            for dispatched in [true, false] {
+                let fixture = UsageEvent::default();
+                let event = UsageEvent {
+                    status_code: 200,
+                    // 零耗时的真实调用和带本地处理耗时的未派发事件不能由耗时猜测。
+                    upstream_latency_ms: if dispatched { 0 } else { 41 },
+                    upstream_ttft_ms: if dispatched { 0 } else { 13 },
+                    request_headers: fixture.request_headers,
+                    // NO-GUARDRAIL-CHAIN: 纯派发事实测试没有运行防护链。
+                    // NO-CALLER-IDENTITY: 纯派发事实测试没有认证调用方。
+                    ..fixture
+                };
+                emit_usage(
+                    &state,
+                    &snap,
+                    surface,
+                    event,
+                    usage_event_labels("m", &pk),
+                    None,
+                    None,
+                    true,
+                    dispatched,
+                );
+                let row = rx.try_recv().expect("the row reaches the sink");
+                let wire = serde_json::to_value(&row).unwrap();
+                assert_eq!(
+                    wire.get("upstream_dispatched"),
+                    Some(&serde_json::json!(dispatched)),
+                    "{} must preserve the caller's dispatch fact",
+                    surface.operation,
+                );
+                assert_eq!(row.upstream_latency_ms, 0);
+                assert_eq!(row.upstream_ttft_ms, 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_fact_does_not_depend_on_http_or_inference_finality() {
+        let (state, mut rx) = state_reading_rows(AisixSnapshot::new());
+        let snap = state.snapshot.load();
+        let pk = ResolvedPk::unresolved();
+        for terminal in [true, false] {
+            for logical_final in [true, false] {
+                for dispatched in [true, false] {
+                    let fixture = UsageEvent::default();
+                    let event = UsageEvent {
+                        status_code: 200,
+                        request_headers: fixture.request_headers,
+                        // NO-GUARDRAIL-CHAIN: 终态正交性测试没有运行防护链。
+                        // NO-CALLER-IDENTITY: 终态正交性测试没有认证调用方。
+                        ..fixture
+                    };
+                    emit_usage_with_finality(
+                        &state,
+                        &snap,
+                        crate::operation::RESPONSES,
+                        event,
+                        usage_event_labels("m", &pk),
+                        None,
+                        None,
+                        terminal,
+                        logical_final,
+                        dispatched,
+                    );
+                    let row = rx.try_recv().expect("the row reaches the sink");
+                    let wire = serde_json::to_value(&row).unwrap();
+                    assert_eq!(
+                        wire.get("upstream_dispatched"),
+                        Some(&serde_json::json!(dispatched))
+                    );
+                    assert_eq!(row.is_final_attempt, logical_final);
+                }
+            }
+        }
     }
 
     /// Hand `event` to the chokepoint as an attempt made with the

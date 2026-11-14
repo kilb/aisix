@@ -2070,7 +2070,18 @@ async fn operators_mint_and_manage_any_tenants_keys() {
             "count_tokens",
             "responses",
             "embeddings",
-            "models"
+            "models",
+            "images",
+            "audio",
+            "videos",
+            "rerank",
+            "decisions",
+            "realtime",
+            "files",
+            "batches",
+            "fine_tuning",
+            "moderations",
+            "content_provenance_checks"
         ])
     );
     let audit: (String, String) = sqlx::query_as(
@@ -3613,8 +3624,8 @@ async fn api_groups_lists_the_tenants_assigned_groups() {
     }
 }
 
-/// 明确公开的七项合同，不从被测实现的白名单常量推导期望。
-fn customer_endpoints_with_completions() -> Value {
+/// 明确公开的模型接口合同，不从被测实现的白名单常量推导期望。
+fn customer_model_endpoints() -> Value {
     json!([
         "chat_completions",
         "completions",
@@ -3622,7 +3633,18 @@ fn customer_endpoints_with_completions() -> Value {
         "count_tokens",
         "responses",
         "embeddings",
-        "models"
+        "models",
+        "images",
+        "audio",
+        "videos",
+        "rerank",
+        "decisions",
+        "realtime",
+        "files",
+        "batches",
+        "fine_tuning",
+        "moderations",
+        "content_provenance_checks"
     ])
 }
 
@@ -3676,7 +3698,7 @@ async fn assert_projected_key_fixture(cp: &TestCp, key: &str) {
 
 /// 遗漏 completions 或删掉整份端点限制都会失败；模型、分组和身份仍受约束。
 #[tokio::test]
-async fn completions_customer_keys_grant_exactly_the_seven_public_endpoint_families() {
+async fn customer_keys_grant_exactly_the_public_model_endpoint_families() {
     let Some(cp) = TestCp::start().await else {
         return;
     };
@@ -3697,10 +3719,7 @@ async fn completions_customer_keys_grant_exactly_the_seven_public_endpoint_famil
     )
     .await;
     let doc = key_doc(&cp, &key).await;
-    assert_eq!(
-        doc["allowed_endpoints"],
-        customer_endpoints_with_completions()
-    );
+    assert_eq!(doc["allowed_endpoints"], customer_model_endpoints());
     assert_eq!(doc["allowed_model_ids"], json!([&ids[0]]));
     assert_eq!(doc["allowed_provider_groups"], json!(["shared"]));
     assert_eq!(doc["user_id"], json!(owner.id));
@@ -3708,7 +3727,7 @@ async fn completions_customer_keys_grant_exactly_the_seven_public_endpoint_famil
     assert_eq!(doc["key_hash"], json!(ApiKey::hash_bearer(&plaintext)));
     assert_eq!(doc["rate_limit"], json!({"concurrency": 2, "rpm": 30}));
     assert_eq!(doc["disabled"], false);
-    assert_eq!(doc_version(&cp, &key).await, 4);
+    assert_eq!(doc_version(&cp, &key).await, KEY_DOC_VERSION);
     for absent in [
         "allowed_models",
         "allowed_agents",
@@ -3720,13 +3739,25 @@ async fn completions_customer_keys_grant_exactly_the_seven_public_endpoint_famil
     let projected: ApiKey = serde_json::from_value(doc).expect("the gateway key projection");
     assert!(projected.can_call(EndpointFamily::Completions));
     assert!(projected.can_call(EndpointFamily::ChatCompletions));
-    for closed in [
+    for opened in [
         EndpointFamily::Images,
         EndpointFamily::Audio,
         EndpointFamily::Videos,
+        EndpointFamily::Rerank,
+        EndpointFamily::Decisions,
+        EndpointFamily::Realtime,
         EndpointFamily::Files,
         EndpointFamily::Batches,
         EndpointFamily::FineTuning,
+        EndpointFamily::Moderations,
+        EndpointFamily::ContentProvenanceChecks,
+    ] {
+        assert!(
+            projected.can_call(opened),
+            "unreachable model endpoint {opened:?}"
+        );
+    }
+    for closed in [
         EndpointFamily::Mcp,
         EndpointFamily::A2a,
         EndpointFamily::Passthrough,
@@ -3819,13 +3850,14 @@ async fn completions_boot_upgrades_real_v3_key_documents_without_reopening_revok
     for (key, old, version) in before {
         let after = stored(&restarted, "api_keys", &key).await;
         assert!(!after.deleted);
-        assert_eq!(doc_version(&restarted, &key).await, 4, "{key}");
         assert_eq!(
-            after.doc["allowed_endpoints"],
-            customer_endpoints_with_completions()
+            doc_version(&restarted, &key).await,
+            KEY_DOC_VERSION,
+            "{key}"
         );
+        assert_eq!(after.doc["allowed_endpoints"], customer_model_endpoints());
         let mut expected = old.doc;
-        expected["allowed_endpoints"] = customer_endpoints_with_completions();
+        expected["allowed_endpoints"] = customer_model_endpoints();
         assert_eq!(
             after.doc, expected,
             "a catch-up changed a different key grant"
@@ -3869,22 +3901,22 @@ async fn completions_catch_up_repairs_an_old_replica_write_once_and_leaves_curre
     )
     .await;
     let ctx = WriteCtx::of(cp.state());
-    // 准备明确版本 4 的文档，再模拟旧副本只回写并投影其中一行。
-    keys::catch_up(cp.db(), &ctx, 4)
+    // 准备明确当前版本 的文档，再模拟旧副本只回写并投影其中一行。
+    keys::catch_up(cp.db(), &ctx, KEY_DOC_VERSION)
         .await
-        .expect("prepare version four documents");
+        .expect("prepare current documents");
     assert_eq!(
         key_doc(&cp, &current).await["allowed_endpoints"],
-        customer_endpoints_with_completions()
+        customer_model_endpoints()
     );
     for key in [&lagging, &current, &another] {
-        assert_eq!(doc_version(&cp, key).await, 4);
+        assert_eq!(doc_version(&cp, key).await, KEY_DOC_VERSION);
     }
     restore_v3_endpoint_document(&cp, &lagging).await;
     let lagging_before = stored(&cp, "api_keys", &lagging).await;
     let current_before = stored(&cp, "api_keys", &current).await;
     let another_before = stored(&cp, "api_keys", &another).await;
-    let pass = keys::catch_up(cp.db(), &ctx, 4)
+    let pass = keys::catch_up(cp.db(), &ctx, KEY_DOC_VERSION)
         .await
         .expect("repair old replica write");
     assert_eq!(
@@ -3894,11 +3926,11 @@ async fn completions_catch_up_repairs_an_old_replica_write_once_and_leaves_curre
             ..keys::CatchUp::default()
         }
     );
-    assert_eq!(doc_version(&cp, &lagging).await, 4);
+    assert_eq!(doc_version(&cp, &lagging).await, KEY_DOC_VERSION);
     let repaired = stored(&cp, "api_keys", &lagging).await;
     assert_eq!(
         repaired.doc["allowed_endpoints"],
-        customer_endpoints_with_completions()
+        customer_model_endpoints()
     );
     assert!(repaired.seq > lagging_before.seq);
     for (key, before) in [(&current, current_before), (&another, another_before)] {
@@ -3906,11 +3938,504 @@ async fn completions_catch_up_repairs_an_old_replica_write_once_and_leaves_curre
         assert_eq!(after.doc, before.doc);
         assert_eq!(after.seq, before.seq);
         assert_eq!(after.updated_at, before.updated_at);
-        assert_eq!(doc_version(&cp, key).await, 4);
+        assert_eq!(doc_version(&cp, key).await, KEY_DOC_VERSION);
     }
-    let again = keys::catch_up(cp.db(), &ctx, 4)
+    let again = keys::catch_up(cp.db(), &ctx, KEY_DOC_VERSION)
         .await
         .expect("repeat catch-up");
     assert_eq!(again, keys::CatchUp::default());
     assert_eq!(stored(&cp, "api_keys", &lagging).await.seq, repaired.seq);
+}
+
+// 保持真实旧7族文档及其身份/模型/分组字段，模拟已被旧数据面读取的v4。
+async fn restore_v4_endpoint_document(cp: &TestCp, key: &str) {
+    let old = json!([
+        "chat_completions",
+        "completions",
+        "messages",
+        "count_tokens",
+        "responses",
+        "embeddings",
+        "models"
+    ]);
+    let mut tx = cp.db().pool().begin().await.expect("begin old key fixture");
+    let document = sqlx::query(
+        "UPDATE gw_resources SET doc = jsonb_set(doc, '{allowed_endpoints}', $2::jsonb), \
+           projected_version = version \
+         WHERE kind = 'api_keys' AND id = $1::uuid AND NOT deleted",
+    )
+    .bind(key)
+    .bind(&old)
+    .execute(&mut *tx)
+    .await
+    .expect("restore v4 endpoints");
+    assert_eq!(document.rows_affected(), 1);
+    let row = sqlx::query(
+        "UPDATE tenant_keys SET doc_version = 4 WHERE id = $1::uuid AND revoked_at IS NULL",
+    )
+    .bind(key)
+    .execute(&mut *tx)
+    .await
+    .expect("restore v4 version");
+    assert_eq!(row.rows_affected(), 1);
+    tx.commit().await.expect("commit v4 fixture");
+    assert_eq!(key_doc(cp, key).await["allowed_endpoints"], old);
+    assert_eq!(doc_version(cp, key).await, 4);
+    assert_projected_key_fixture(cp, key).await;
+}
+
+// 新密钥要显式列出每一族；遗漏字段或全部开放均会失败。
+#[tokio::test]
+async fn native_model_customer_keys_project_all_safe_public_families_without_tool_access() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let tenant = cp.seed_tenant(TenantStatus::Active).await;
+    let owner = cp.member_login_seeded(tenant, MemberRole::Owner).await;
+    let (key, plaintext) = mint_ok(
+        &cp,
+        &owner,
+        json!({"label":"native-grants-v6","rate_limit":{"rpm":23}}),
+    )
+    .await;
+    let doc = key_doc(&cp, &key).await;
+    let expected = json!([
+        "chat_completions",
+        "completions",
+        "messages",
+        "count_tokens",
+        "responses",
+        "embeddings",
+        "models",
+        "images",
+        "audio",
+        "videos",
+        "rerank",
+        "decisions",
+        "realtime",
+        "files",
+        "batches",
+        "fine_tuning",
+        "moderations",
+        "content_provenance_checks"
+    ]);
+    assert_eq!(doc.get("allowed_endpoints"), Some(&expected));
+    assert_eq!(doc["team_id"], json!(tenant));
+    assert_eq!(doc["user_id"], json!(owner.id));
+    assert_eq!(doc["key_hash"], ApiKey::hash_bearer(&plaintext));
+    assert_eq!(doc["allowed_provider_groups"], json!(["shared"]));
+    assert_eq!(doc["rate_limit"], json!({"rpm":23,"concurrency":10}));
+    assert_eq!(doc_version(&cp, &key).await, 5);
+    let decoded: ApiKey = serde_json::from_value(doc.clone()).expect("gateway key document");
+    for family in expected.as_array().expect("families") {
+        let family: EndpointFamily =
+            serde_json::from_value(family.clone()).expect("canonical family");
+        assert_ne!(
+            family,
+            EndpointFamily::Unknown,
+            "unknown family cannot prove reachability"
+        );
+        assert!(decoded.can_call(family), "family {family:?}");
+    }
+    for closed in [
+        EndpointFamily::Mcp,
+        EndpointFamily::A2a,
+        EndpointFamily::Passthrough,
+        EndpointFamily::Unknown,
+    ] {
+        assert!(!decoded.can_call(closed), "unexpected grant {closed:?}");
+    }
+    for absent in [
+        "allowed_agents",
+        "allowed_routes",
+        "mcp_access",
+        "allowed_models",
+    ] {
+        assert!(doc.get(absent).is_none(), "unexpected tool grant {absent}");
+    }
+}
+
+// 漏掉文档版本提升，旧7族的已投影文档就不会被启动追平。
+#[tokio::test]
+async fn native_model_boot_upgrades_v4_grants_and_preserves_disabled_and_revoked_keys() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let tenant = cp.seed_tenant(TenantStatus::Active).await;
+    let owner = cp.member_login_seeded(tenant, MemberRole::Owner).await;
+    let (enabled, _) = mint_ok(&cp, &owner, json!({"label":"native-enabled-v4"})).await;
+    let (disabled, _) = mint_ok(&cp, &owner, json!({"label":"native-disabled-v4"})).await;
+    let (revoked, _) = mint_ok(&cp, &owner, json!({"label":"native-revoked-v4"})).await;
+    let closed = on_key(
+        &cp,
+        &owner,
+        "PATCH",
+        &disabled,
+        Some(json!({"disabled":true})),
+    )
+    .await;
+    assert_eq!(closed.status, 200, "{closed:?}");
+    for key in [&enabled, &disabled, &revoked] {
+        restore_v4_endpoint_document(&cp, key).await;
+    }
+    let removed = on_key(&cp, &owner, "DELETE", &revoked, None).await;
+    assert_eq!(removed.status, 204, "{removed:?}");
+    let gone = stored(&cp, "api_keys", &revoked).await;
+    let old_enabled = stored(&cp, "api_keys", &enabled).await;
+    let old_disabled = stored(&cp, "api_keys", &disabled).await;
+    let cp = cp.restart().await;
+    for (key, old) in [(&enabled, old_enabled), (&disabled, old_disabled)] {
+        let after = stored(&cp, "api_keys", key).await;
+        assert_eq!(doc_version(&cp, key).await, 5);
+        assert!(
+            after.seq > old.seq,
+            "old projected document was never rewritten"
+        );
+        let mut expected = old.doc;
+        expected["allowed_endpoints"] = json!([
+            "chat_completions",
+            "completions",
+            "messages",
+            "count_tokens",
+            "responses",
+            "embeddings",
+            "models",
+            "images",
+            "audio",
+            "videos",
+            "rerank",
+            "decisions",
+            "realtime",
+            "files",
+            "batches",
+            "fine_tuning",
+            "moderations",
+            "content_provenance_checks"
+        ]);
+        assert_eq!(after.doc, expected, "another security field changed");
+    }
+    assert_eq!(key_doc(&cp, &disabled).await["disabled"], true);
+    let after_gone = stored(&cp, "api_keys", &revoked).await;
+    assert!(after_gone.deleted);
+    assert_eq!(after_gone.seq, gone.seq);
+    assert_eq!(doc_version(&cp, &revoked).await, 4);
+}
+
+// 旧数据面存在时扩权等待；收紧身份/模型仍须立刻保存，且不偷渡新族。
+#[tokio::test]
+async fn native_model_grant_upgrade_waits_for_the_floor_without_blocking_key_narrowing() {
+    let Some(cp) = TestCp::start_stamped(CP_VERSION).await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let gw = register_gateway(&cp, &admin).await;
+    beat(&gw, "native-current-v6", "1.9.0+sha-current").await;
+    let ids = models(&cp, &admin, &["native-kept-v6", "native-withdrawn-v6"]).await;
+    let tenant = cp.seed_tenant(TenantStatus::Active).await;
+    patch_tenant_ok(&cp, &admin, tenant, json!({"allowed_model_ids":ids})).await;
+    let owner = cp.member_login_seeded(tenant, MemberRole::Owner).await;
+    let (key, _) = mint_ok(&cp, &owner, json!({"label":"native-floor-v6"})).await;
+    restore_v4_endpoint_document(&cp, &key).await;
+    let old_endpoints = key_doc(&cp, &key).await["allowed_endpoints"].clone();
+    beat(&gw, "native-old-v6", "1.8.2+sha-old").await;
+    let ctx = WriteCtx::of(cp.state());
+    let pass = keys::catch_up(cp.db(), &ctx, KEY_DOC_VERSION)
+        .await
+        .expect("defer unsafe growth");
+    assert_eq!(pass.deferred, 1);
+    assert_eq!(pass.rewritten, 0);
+    assert_eq!(doc_version(&cp, &key).await, 4);
+    patch_tenant_ok(&cp, &admin, tenant, json!({"allowed_model_ids":[ids[0]]})).await;
+    let doc = key_doc(&cp, &key).await;
+    assert_eq!(doc["allowed_model_ids"], json!([ids[0]]));
+    assert_eq!(doc["allowed_endpoints"], old_endpoints);
+    assert_eq!(doc_version(&cp, &key).await, 4);
+    let closed = on_key(&cp, &owner, "PATCH", &key, Some(json!({"disabled":true}))).await;
+    assert_eq!(closed.status, 200, "{closed:?}");
+    assert_eq!(key_doc(&cp, &key).await["disabled"], true);
+    assert_eq!(key_doc(&cp, &key).await["allowed_endpoints"], old_endpoints);
+    let reopened = on_key(&cp, &owner, "PATCH", &key, Some(json!({"disabled":false}))).await;
+    assert_eq!(reopened.status, 503, "{reopened:?}");
+    assert_eq!(key_doc(&cp, &key).await["disabled"], true);
+    beat(&gw, "native-old-v6", "1.9.0+sha-upgraded").await;
+    let pass = keys::catch_up(cp.db(), &ctx, KEY_DOC_VERSION)
+        .await
+        .expect("upgrade endpoint grants");
+    assert_eq!(pass.rewritten, 1);
+    assert_eq!(doc_version(&cp, &key).await, 5);
+    let projected: ApiKey =
+        serde_json::from_value(key_doc(&cp, &key).await).expect("projected key");
+    assert!(projected.can_call(EndpointFamily::Files));
+    assert!(projected.can_call(EndpointFamily::Batches));
+    assert!(
+        projected.disabled,
+        "catch-up must never reopen a closed key"
+    );
+}
+
+// 普通客户经真实控制面获授 Files 后，归属与账号轮换仍须在重启后生效。
+#[tokio::test]
+async fn native_model_customer_file_access_remains_owner_and_current_account_bound() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let ids = models(&cp, &admin, &["native-file-owner-v6"]).await;
+    let tenant = cp.seed_tenant(TenantStatus::Active).await;
+    let foreign_tenant = cp.seed_tenant(TenantStatus::Active).await;
+    for id in [tenant, foreign_tenant] {
+        patch_tenant_ok(&cp, &admin, id, json!({"allowed_model_ids":ids})).await;
+    }
+    let owner = cp.member_login_seeded(tenant, MemberRole::Member).await;
+    let foreign = cp
+        .member_login_seeded(foreign_tenant, MemberRole::Member)
+        .await;
+    let (key, _) = mint_ok(&cp, &owner, json!({"label":"native-file-owner-v6"})).await;
+    let (foreign_key, _) = mint_ok(&cp, &foreign, json!({"label":"native-file-foreign-v6"})).await;
+    let projected: ApiKey =
+        serde_json::from_value(key_doc(&cp, &key).await).expect("customer projection");
+    assert!(projected.can_call(EndpointFamily::Files));
+    let model = cp
+        .send(
+            "GET",
+            &format!("/admin/resources/models/{}", ids[0]),
+            Some(admin.cookie()),
+            None,
+        )
+        .await;
+    assert_eq!(model.status, 200, "{model:?}");
+    let provider = text(&model.body, "/doc/provider_key_id");
+    let identity_key = aisix_core::native_objects::platform_id_key_from_secret(
+        &cp.state().pki.platform_id_key_hex(),
+    );
+    let boundary = aisix_core::native_objects::native_origin_digest(
+        &identity_key,
+        Uuid::parse_str(&provider).expect("provider UUID"),
+        aisix_core::native_objects::NativeProtocol::Openai,
+        "openai",
+        "https://api.openai.com/v1",
+        "sk-keys-upstream-7c1",
+        &Default::default(),
+    );
+    let operation = Uuid::new_v4();
+    let dp = cp.issue_dp_client("gw-customer-files-v6").await;
+    let begun = dp
+        .send(
+            "POST",
+            "/dp/v1/native-objects/begin",
+            Some(json!({
+                "operation_id":operation,"api_key_id":key,
+                "protocol":"openai","kind":"file",
+                "origin":{"model_id":ids[0],"provider_key_id":provider,"boundary":boundary},
+                "parent_id":null,"requested_model_id":ids[0],
+                "requested_model":"native-file-owner-v6","upstream_model":"gpt-4o-mini",
+                "operation":"files","request_id":"req-customer-file-v6","asynchronous":false
+            })),
+        )
+        .await;
+    assert_eq!(begun.status, 200, "{begun:?}");
+    let bound = dp
+        .send(
+            "POST",
+            "/dp/v1/native-objects/bind",
+            Some(json!({
+                "operation_id":operation,"api_key_id":key,"raw_id":"file-customer-v6"
+            })),
+        )
+        .await;
+    assert_eq!(bound.status, 200, "{bound:?}");
+    let record = text(&bound.body, "/record/record_id");
+
+    let cp = cp.restart().await;
+    let dp = cp.issue_dp_client("gw-customer-files-restarted-v6").await;
+    let lookup = |key: &str, raw_id: &str| {
+        json!({"api_key_id":key,"locator":{
+            "protocol":"openai","kind":"file","raw_id":raw_id
+        }})
+    };
+    let found = dp
+        .send(
+            "POST",
+            "/dp/v1/native-objects/lookup",
+            Some(lookup(&key, "file-customer-v6")),
+        )
+        .await;
+    assert_eq!(found.status, 200, "{found:?}");
+    assert_eq!(found.body["record"]["record_id"], record);
+    let refused = dp
+        .send(
+            "POST",
+            "/dp/v1/native-objects/lookup",
+            Some(lookup(&foreign_key, "file-customer-v6")),
+        )
+        .await;
+    let missing = dp
+        .send(
+            "POST",
+            "/dp/v1/native-objects/lookup",
+            Some(lookup(&foreign_key, "file-customer-missing-v6")),
+        )
+        .await;
+    assert_eq!(refused.status, 404, "{refused:?}");
+    assert_eq!(missing.status, 404, "{missing:?}");
+    assert_eq!(refused.body, missing.body);
+
+    let admin = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let path = format!("/admin/resources/provider_keys/{provider}");
+    let current = cp.send("GET", &path, Some(admin.cookie()), None).await;
+    assert_eq!(current.status, 200, "{current:?}");
+    let mut doc = current.body["doc"].clone();
+    doc["api_key"] = json!("sk-customer-files-rotated-v6");
+    let changed = cp
+        .send_conditional(
+            "PUT",
+            &path,
+            admin.cookie(),
+            current.body["version"].as_i64().expect("provider version"),
+            json!({"doc":doc}),
+        )
+        .await;
+    assert_eq!(changed.status, 200, "{changed:?}");
+    let rotated = dp
+        .send(
+            "POST",
+            "/dp/v1/native-objects/lookup",
+            Some(lookup(&key, "file-customer-v6")),
+        )
+        .await;
+    assert_eq!(rotated.status, 409, "{rotated:?}");
+    assert_eq!(rotated.body["code"], "native_origin_changed");
+}
+
+// 去掉开发构建的扩展门槛会使启动追平过早开放18族；普通收紧仍须保留旧7族。
+#[tokio::test]
+async fn customer_endpoint_expansion_defers_boot_catch_up_and_keeps_edits_on_v4_until_the_build_is_proven(
+) {
+    const NEW_BUILD: &str = "dev+sha-12ab345";
+    let Some(cp) = TestCp::start_stamped(NEW_BUILD).await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let ids = models(
+        &cp,
+        &admin,
+        &["customer-build-kept-v9", "customer-build-withdrawn-v9"],
+    )
+    .await;
+    let tenant = cp.seed_tenant(TenantStatus::Active).await;
+    patch_tenant_ok(&cp, &admin, tenant, json!({"allowed_model_ids": ids})).await;
+    let owner = cp.member_login_seeded(tenant, MemberRole::Owner).await;
+    let (key, plaintext) = mint_ok(
+        &cp,
+        &owner,
+        json!({"label": "customer-build-v9", "rate_limit": {"rpm": 23}}),
+    )
+    .await;
+    restore_v4_endpoint_document(&cp, &key).await;
+    let before = key_doc(&cp, &key).await;
+    let gw = register_gateway(&cp, &admin).await;
+    beat(&gw, "customer-still-serving-v9", "dev+sha-f0f2360").await;
+    let upgraded = cp.restart_stamped(NEW_BUILD).await;
+    assert_eq!(
+        doc_version(&upgraded, &key).await,
+        4,
+        "boot must defer expansion"
+    );
+    assert_eq!(
+        key_doc(&upgraded, &key).await,
+        before,
+        "boot must preserve the complete existing grant"
+    );
+    let ctx = WriteCtx::of(upgraded.state());
+    let pass = keys::catch_up(upgraded.db(), &ctx, KEY_DOC_VERSION)
+        .await
+        .expect("defer a periodic pass");
+    assert_eq!((pass.rewritten, pass.deferred), (0, 1));
+    assert!(pass.failed.is_empty());
+    patch_tenant_ok(
+        &upgraded,
+        &admin,
+        tenant,
+        json!({"allowed_model_ids": [ids[0]]}),
+    )
+    .await;
+    let closed = on_key(
+        &upgraded,
+        &owner,
+        "PATCH",
+        &key,
+        Some(json!({"disabled": true})),
+    )
+    .await;
+    assert_eq!(closed.status, 200, "{closed:?}");
+    let narrowed = key_doc(&upgraded, &key).await;
+    let mut expected = before.clone();
+    expected["allowed_model_ids"] = json!([ids[0]]);
+    expected["disabled"] = json!(true);
+    assert_eq!(
+        narrowed, expected,
+        "no endpoint, secret, group, identity or limit may widen"
+    );
+    assert_eq!(doc_version(&upgraded, &key).await, 4);
+    let before_mint = (
+        upgraded.count("tenant_keys").await,
+        audit_rows(&upgraded).await,
+    );
+    let refused = mint(&upgraded, &owner, json!({"label": "customer-waits-v9"})).await;
+    assert_eq!(refused.status, 503, "{refused:?}");
+    assert_eq!(refused.body["code"], "unavailable");
+    let fields: BTreeSet<&str> = refused
+        .body
+        .as_object()
+        .expect("an error")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        fields,
+        BTreeSet::from(["code", "error"]),
+        "neutral tenant error only"
+    );
+    assert_eq!(
+        (
+            upgraded.count("tenant_keys").await,
+            audit_rows(&upgraded).await
+        ),
+        before_mint,
+        "the failed mint rolls back"
+    );
+    let revealed = reveal(&upgraded, &owner, &key).await;
+    assert_eq!(revealed.status, 200, "{revealed:?}");
+    assert_eq!(revealed.body["plaintext"], plaintext);
+    beat(&gw, "customer-still-serving-v9", NEW_BUILD).await;
+    let pass = keys::catch_up(upgraded.db(), &ctx, KEY_DOC_VERSION)
+        .await
+        .expect("publish after the fleet proves support");
+    assert_eq!((pass.rewritten, pass.deferred), (1, 0));
+    assert_eq!(doc_version(&upgraded, &key).await, 5);
+    let after = key_doc(&upgraded, &key).await;
+    expected["allowed_endpoints"] = json!([
+        "chat_completions",
+        "completions",
+        "messages",
+        "count_tokens",
+        "responses",
+        "embeddings",
+        "models",
+        "images",
+        "audio",
+        "videos",
+        "rerank",
+        "decisions",
+        "realtime",
+        "files",
+        "batches",
+        "fine_tuning",
+        "moderations",
+        "content_provenance_checks"
+    ]);
+    assert_eq!(
+        after, expected,
+        "only the endpoint grant changes after proof"
+    );
 }

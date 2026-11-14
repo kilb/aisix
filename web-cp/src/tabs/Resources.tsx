@@ -1,3 +1,4 @@
+import "./operations.css";
 import { resourceSearchText } from "../lib/operationalRecords";
 import { useRecordTable } from "../lib/recordTable";
 import { RecordTools, RecordPager } from "../components/RecordTools";
@@ -12,10 +13,10 @@ import { messageFor } from "../lib/errors";
 import { useResource } from "../lib/useResource";
 import { Button } from "../ui/Button";
 import { useRefusalFocus } from "../ui/Field";
-import { DataTable, Loading } from "../ui/DataTable";
+import { OperationalTable as DataTable, Loading } from "../components/OperationalTable";
 import { EmptyState } from "../ui/EmptyState";
 import { CardHeader, PageHeader, Split } from "../components/page";
-import { Plus, RefreshCw } from "lucide-react";
+import { Eye, Pencil, Plus, RefreshCw } from "lucide-react";
 import { InventorySummary, countGroups } from "./providers/OperationsBento";
 
 /**
@@ -70,7 +71,7 @@ export function Resources({ canEdit, initialSection }: TabProps) {
   );
   const info = KINDS.find((k) => k.kind === kind) ?? KINDS[0];
   return (
-    <>
+    <div className="cp-operations cp-resources">
       <PageHeader
         eyebrow="RESOURCES · 完整配置"
         title="全部资源"
@@ -91,7 +92,7 @@ export function Resources({ canEdit, initialSection }: TabProps) {
       {/* Keyed by kind: a watch still running for the previous kind stops
           with the page it belongs to, instead of writing its rows here. */}
       <KindPage key={info.kind} info={info} canEdit={canEdit} />
-    </>
+    </div>
   );
 }
 
@@ -233,10 +234,7 @@ function KindPage({ info, canEdit }: { info: KindInfo; canEdit: boolean }) {
         }
         actions={
           <>
-            <Button type="button" size="sm" onClick={() => void reload()}>
-              <RefreshCw aria-hidden />
-              刷新
-            </Button>
+            <Button type="button" size="sm" className="ops-icon-button" aria-label="刷新" title="刷新资源文档" onClick={() => void reload()}><RefreshCw aria-hidden /></Button>
             {canCreate && (
               <Button kind="primary" type="button" size="sm" onClick={startNew}>
                 <Plus aria-hidden />
@@ -261,8 +259,7 @@ function KindPage({ info, canEdit }: { info: KindInfo; canEdit: boolean }) {
           <DataTable label="资源文档">
             <thead>
               <tr>
-                <th>名称</th>
-                <th>ID</th>
+                <th>名称 / ID</th>
                 <th className="right">版本</th>
                 <th>管理方</th>
                 <th>下发状态</th>
@@ -272,10 +269,9 @@ function KindPage({ info, canEdit }: { info: KindInfo; canEdit: boolean }) {
             <tbody>
               {table.rows.map((r) => (
                 <tr key={r.id} className={editingId === r.id ? "bg-well" : undefined}>
-                  <td className="font-medium">{nameOf(r.doc) ?? <span className="hint font-normal">（未命名）</span>}</td>
-                  <td>
+                  <td><span className="ops-cell-main">{nameOf(r.doc) ?? <span className="hint font-normal">（未命名）</span>}</span>
                     <code
-                      className={editing ? "inline-block max-w-[24ch] truncate align-middle text-muted" : "text-muted"}
+                      className="ops-cell-secondary"
                       title={r.id}
                     >
                       {r.id}
@@ -287,8 +283,8 @@ function KindPage({ info, canEdit }: { info: KindInfo; canEdit: boolean }) {
                     <RolloutBadge rollout={r.rollout} />
                   </td>
                   <td className="right">
-                    <Button size="sm" type="button" onClick={() => open(r)}>
-                      {writable && r.managed_by === null ? "编辑" : "查看"}
+                    <Button size="sm" type="button" className="ops-table-action" aria-label={writable && r.managed_by === null ? "编辑" : "查看"} title={writable && r.managed_by === null ? "编辑资源" : "查看资源"} onClick={() => open(r)}>
+                      {writable && r.managed_by === null ? <Pencil aria-hidden /> : <Eye aria-hidden />}
                     </Button>
                   </td>
                 </tr>

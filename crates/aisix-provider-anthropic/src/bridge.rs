@@ -14,6 +14,7 @@
 //! Error mapping is identical to OpenAi — the `BridgeError` contract from
 //! PR #6 applies verbatim.
 
+use aisix_gateway::upstream_io::{send, Protocol};
 use aisix_gateway::url_cache::cached_endpoint_url;
 use aisix_gateway::{
     Bridge, BridgeContext, BridgeError, ChatChunk, ChatChunkStream, ChatFormat, ChatResponse,
@@ -407,6 +408,11 @@ impl Bridge for AnthropicBridge {
         true
     }
 
+    // 文档 URL 进入现有原生 source.url 转换，保持文件类型与引用。
+    fn reads_file_uris(&self, _req: &ChatFormat, _ctx: &BridgeContext) -> bool {
+        true
+    }
+
     async fn chat(
         &self,
         req: &ChatFormat,
@@ -461,13 +467,12 @@ impl Bridge for AnthropicBridge {
             build_request_headers(key, self.api_version, &request_id, false, &ctx.header_ctx())?;
 
         with_deadline(ctx.deadline, started, async move {
-            let resp = url
-                .post_on(&client)
-                .headers(headers)
-                .body(body)
-                .send()
-                .await
-                .map_err(aisix_gateway::send_error)?;
+            let resp = send(
+                url.post_on(&client).headers(headers).body(body),
+                Protocol::Messages,
+            )
+            .await
+            .map_err(aisix_gateway::send_error)?;
 
             aisix_gateway::note_upstream_response(resp.headers());
             let status = resp.status();
@@ -556,12 +561,12 @@ impl Bridge for AnthropicBridge {
             build_request_headers(key, self.api_version, &request_id, true, &ctx.header_ctx())?;
 
         let resp = with_deadline(ctx.deadline, started, async move {
-            url.post_on(&client)
-                .headers(headers)
-                .body(body)
-                .send()
-                .await
-                .map_err(aisix_gateway::send_error)
+            send(
+                url.post_on(&client).headers(headers).body(body),
+                Protocol::Messages,
+            )
+            .await
+            .map_err(aisix_gateway::send_error)
         })
         .await?;
 
@@ -588,10 +593,10 @@ fn build_chunk_stream<S>(
 where
     S: futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send + 'static,
 {
+    let mut state = StreamState::observed();
     async_stream::try_stream! {
         let mut decoder = SseDecoder::new();
         let mut stream = Box::pin(byte_stream);
-        let mut state = StreamState::default();
         // `message_stop` ends the stream below. A `stop_reason` already said
         // the answer is complete, so a body that ends after one (and before
         // `message_stop`) is whole; one that ends before either is truncated.
@@ -657,6 +662,118 @@ mod tests {
 
     fn sse(event: &str, data: serde_json::Value) -> String {
         format!("event: {event}\ndata: {data}\n\n")
+    }
+
+    fn accounting_start_frame() -> bytes::Bytes {
+        bytes::Bytes::from(sse(
+            "message_start",
+            serde_json::json!({
+                "type":"message_start","message":{
+                    "id":"msg_early_usage","model":"claude","type":"message",
+                    "role":"assistant","content":[],"stop_reason":null,
+                    "usage":{"input_tokens":37,"output_tokens":0,
+                        "cache_creation_input_tokens":11,"cache_read_input_tokens":23,
+                        "cache_creation":{"ephemeral_5m_input_tokens":11,"ephemeral_1h_input_tokens":0},
+                        "server_tool_use":{"web_search_requests":7,"web_fetch_requests":3},
+                        "speed":"fast","service_tier":"standard"}
+                }
+            }),
+        ))
+    }
+
+    #[tokio::test]
+    async fn start_usage_survives_error_eof_and_pending_drop_without_a_synthetic_chunk() {
+        // 官方 error 可在任意迭代到达；保留首帧账务不应让 next() 提前产生客户端内容。
+        for overloaded in [false, true] {
+            let tap = Arc::new(aisix_gateway::ResponseHeaderTap::new(
+                Vec::new(),
+                false,
+                "r".into(),
+            ));
+            let mut frames = vec![Ok::<_, reqwest::Error>(accounting_start_frame())];
+            if overloaded {
+                frames.push(Ok(bytes::Bytes::from(sse(
+                    "error",
+                    serde_json::json!({
+                        "type":"error","error":{"type":"overloaded_error","message":"Overloaded"}
+                    }),
+                ))));
+            }
+            let (items, capture) = aisix_gateway::response_tap::scope(tap.clone(), async {
+                let stream = build_chunk_stream(futures::stream::iter(frames));
+                let capture = tap.take();
+                (stream.collect::<Vec<_>>().await, capture)
+            })
+            .await;
+            assert_eq!(items.len(), 1);
+            assert!(items[0].is_err(), "不能为保留记账合成一个 chunk");
+            let observed = capture.stream_usage.as_ref().unwrap().get().unwrap();
+            assert_eq!(
+                (
+                    observed.stats.prompt_tokens,
+                    observed.stats.completion_tokens
+                ),
+                (37, 0)
+            );
+            assert_eq!(
+                (
+                    observed.stats.cache_creation_tokens,
+                    observed.stats.cache_read_tokens
+                ),
+                (11, 23)
+            );
+            assert_eq!(observed.stats.web_search_requests, 7);
+            assert_eq!(observed.stats.web_fetch_requests, 3);
+            assert_eq!(observed.stats.upstream_total_tokens, 0);
+            assert_eq!(
+                observed.service_tier.as_ref().map(|tier| tier.as_str()),
+                Some("fast")
+            );
+            assert!(observed.prompt_reported);
+            assert!(!observed.completion_reported);
+        }
+        let tap = Arc::new(aisix_gateway::ResponseHeaderTap::new(
+            Vec::new(),
+            false,
+            "r".into(),
+        ));
+        aisix_gateway::response_tap::scope(tap.clone(), async {
+            let raw = futures::stream::once(std::future::ready(Ok::<_, reqwest::Error>(
+                accounting_start_frame(),
+            )))
+            .chain(futures::stream::pending());
+            let mut stream = Box::pin(build_chunk_stream(raw));
+            let capture = tap.take();
+            {
+                let pending = stream.next();
+                futures::pin_mut!(pending);
+                assert!(futures::poll!(&mut pending).is_pending());
+            }
+            assert_eq!(
+                capture
+                    .stream_usage
+                    .as_ref()
+                    .unwrap()
+                    .get()
+                    .unwrap()
+                    .stats
+                    .prompt_tokens,
+                37
+            );
+            drop(stream);
+            assert_eq!(
+                capture
+                    .stream_usage
+                    .as_ref()
+                    .unwrap()
+                    .take()
+                    .unwrap()
+                    .stats
+                    .web_search_requests,
+                7
+            );
+        })
+        .await;
     }
 
     /// A last chunk that completes a frame and then outgrows the frame bound

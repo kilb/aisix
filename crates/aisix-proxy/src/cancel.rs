@@ -174,7 +174,7 @@ pub(crate) fn emit(
     let inbound_protocol = if surface == crate::operation::PASSTHROUGH {
         "passthrough"
     } else {
-        crate::inbound_protocol_for_endpoint(endpoint)
+        crate::request_metrics::inbound_protocol(endpoint)
     };
 
     // The attempts that had already failed. Non-terminal, exactly as the
@@ -467,7 +467,7 @@ fn emit_one(
     state: &ProxyState,
     snap: &aisix_core::AisixSnapshot,
     surface: crate::operation::Surface,
-    event: UsageEvent,
+    mut event: UsageEvent,
     pk: &ResolvedPk<'_>,
     // The request body the request noted before it was abandoned; `Drop` runs
     // outside the request scope a failure row would otherwise read it from.
@@ -483,6 +483,7 @@ fn emit_one(
     endpoint: &'static str,
     client_type: &str,
 ) {
+    usage_attr::resolve_observed_stream_event(&mut event, snap);
     let model = usage_attr::usage_event_model_label(snap, &event.requested_model).into_owned();
     // The Prometheus token families too (R-112). A handler emits them from its
     // own tail, which a cancelled request never reaches, so without this the
@@ -549,4 +550,257 @@ fn emit_token_metrics(
             client_type,
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancelled_active_retry_preserves_its_priced_capture_after_a_failed_attempt() {
+        // A 已结算使 attempts_settled 为 true；若不保存当前 B capture，其价格与头仍会丢失。
+        let models = aisix_core::snapshot::ResourceTable::default();
+        let model: aisix_core::Model = serde_json::from_value(serde_json::json!({
+            "display_name":"m","provider":"anthropic","model_name":"upstream","provider_key_id":"pk",
+            "cost":{"input_per_1k":1.0,"output_per_1k":10.0,"cached_input_per_1k":0.5,"cache_write_per_1k":2.0}
+        })).unwrap();
+        models.insert(aisix_core::resource::ResourceEntry::new("model", model, 1));
+        let snapshot = aisix_core::AisixSnapshot {
+            models,
+            ..Default::default()
+        };
+        let config = serde_json::from_value(serde_json::json!({"addr":"127.0.0.1:0"})).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let state = ProxyState::new(
+            aisix_core::snapshot::SnapshotHandle::new(snapshot),
+            std::sync::Arc::new(aisix_gateway::Hub::new()),
+            &config,
+        )
+        .with_usage_sink(aisix_obs::UsageSink::new(tx));
+        let cell = std::sync::Arc::new(
+            crate::attribution::RequestAttribution::with_response_headers(
+                vec!["x-observed-attempt".into()],
+                false,
+                "request".into(),
+            ),
+        );
+        crate::attribution::scope(cell.clone(), async {
+            let start = |index, kind| {
+                crate::attribution::note_attempt_started(crate::attribution::InFlightAttempt {
+                    index,
+                    kind,
+                    target_model: String::new(),
+                    model_id: "model".into(),
+                    started: std::time::Instant::now(),
+                    answered: None,
+                    served_input_tokens: None,
+                })
+            };
+            let report =
+                |prompt, creation, read| aisix_gateway::response_tap::ObservedStreamUsage {
+                    stats: aisix_gateway::UsageStats::with_cache(prompt, 0, creation, read),
+                    prompt_reported: true,
+                    completion_reported: false,
+                    service_tier: aisix_gateway::ServiceTier::native(Some("fast".into())),
+                };
+            let headers = |id: &'static str, attempt: &'static str| {
+                let mut headers = axum::http::HeaderMap::new();
+                headers.insert("request-id", axum::http::HeaderValue::from_static(id));
+                headers.insert(
+                    "x-observed-attempt",
+                    axum::http::HeaderValue::from_static(attempt),
+                );
+                headers
+            };
+            start(0, "initial");
+            aisix_gateway::note_upstream_response(&headers("req-a", "A"));
+            aisix_gateway::response_tap::stream_usage_observer()
+                .unwrap()
+                .record(report(13, 0, 0));
+            crate::attribution::note_attempt_settled(&crate::attempt::AttemptRecord {
+                index: 0,
+                kind: "initial",
+                target_model: String::new(),
+                target_model_id: "model".into(),
+                provider_key_id: "pk".into(),
+                status: 502,
+                success: false,
+                error_class: "upstream_in_band".into(),
+                error_message: "upstream stream failed".into(),
+                latency_ms: 5,
+                dispatched: true,
+            });
+            start(1, "retry");
+            aisix_gateway::note_upstream_response(&headers("req-b", "B"));
+            aisix_gateway::response_tap::stream_usage_observer()
+                .unwrap()
+                .record(report(37, 11, 23));
+            crate::attribution::with_cancel_for_test(|ctx| {
+                ctx.api_key_id = "key".into();
+                ctx.client = Some(ClientContext::default());
+                ctx.surface = Some(crate::operation::CHAT);
+                ctx.requested_service_tier = Some("auto".into());
+            });
+            let ctx = cell.take_cancel_context();
+            assert_eq!(ctx.failed_attempts.len(), 1);
+            assert_eq!(ctx.in_flight.as_ref().unwrap().index, 1);
+            emit(
+                &state,
+                "/v1/chat/completions",
+                "request",
+                &Resolved {
+                    requested_model: "m".into(),
+                    provider: "anthropic".into(),
+                    upstream_model: "upstream".into(),
+                    provider_key_id: "pk".into(),
+                    ..Default::default()
+                },
+                ctx,
+                Phase::BeforeHead,
+                None,
+            );
+        })
+        .await;
+        let failed = rx.try_recv().unwrap();
+        let retry = rx.try_recv().unwrap();
+        assert_eq!((failed.attempt_index, failed.prompt_tokens), (0, 13));
+        assert!((failed.cost_usd - 0.013).abs() < 1e-12);
+        assert_eq!(failed.provider_request_id, "req-a");
+        assert_eq!(
+            failed
+                .upstream_response_headers
+                .get("x-observed-attempt")
+                .map(String::as_str),
+            Some("A")
+        );
+        assert_eq!(
+            (
+                retry.attempt_index,
+                retry.prompt_tokens,
+                retry.completion_tokens
+            ),
+            (1, 37, 0)
+        );
+        assert_eq!(
+            (retry.cache_creation_tokens, retry.cache_read_tokens),
+            (11, 23)
+        );
+        assert!(
+            (retry.cost_usd - 0.0705).abs() < 1e-12,
+            "reported cost was {}",
+            retry.cost_usd
+        );
+        assert_eq!(retry.provider_request_id, "req-b");
+        assert_eq!(
+            retry
+                .upstream_response_headers
+                .get("x-observed-attempt")
+                .map(String::as_str),
+            Some("B")
+        );
+        assert_eq!(retry.service_tier.as_deref(), Some("fast"));
+        assert_eq!(retry.requested_service_tier.as_deref(), Some("auto"));
+        assert_eq!(retry.status_code, 499);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn cancelled_retry_backoff_replays_failed_start_usage_before_token_metrics() {
+        // 去掉 emit_one 的源端归并，只会修复账单行，下面的实际指标仍为零。
+        let config = serde_json::from_value(serde_json::json!({"addr":"127.0.0.1:0"})).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let state = ProxyState::new(
+            aisix_core::snapshot::SnapshotHandle::new(aisix_core::AisixSnapshot::new()),
+            std::sync::Arc::new(aisix_gateway::Hub::new()),
+            &config,
+        )
+        .with_usage_sink(aisix_obs::UsageSink::new(tx));
+        let cell = std::sync::Arc::new(crate::attribution::RequestAttribution::default());
+        crate::attribution::scope(cell.clone(), async {
+            crate::attribution::note_attempt_started(crate::attribution::InFlightAttempt {
+                index: 0,
+                kind: "initial",
+                target_model: String::new(),
+                model_id: "model-a".into(),
+                started: std::time::Instant::now(),
+                answered: None,
+                served_input_tokens: None,
+            });
+            aisix_gateway::note_upstream_response(&axum::http::HeaderMap::new());
+            let observer = aisix_gateway::response_tap::stream_usage_observer().unwrap();
+            observer.record(aisix_gateway::response_tap::ObservedStreamUsage {
+                stats: aisix_gateway::UsageStats::with_cache(37, 0, 11, 23),
+                prompt_reported: true,
+                completion_reported: false,
+                service_tier: aisix_gateway::ServiceTier::native(Some("fast".into())),
+            });
+            crate::attribution::note_attempt_settled(&crate::attempt::AttemptRecord {
+                index: 0,
+                kind: "initial",
+                target_model: String::new(),
+                target_model_id: "model-a".into(),
+                provider_key_id: String::new(),
+                status: 502,
+                success: false,
+                error_class: "upstream_in_band".into(),
+                error_message: "upstream stream failed".into(),
+                latency_ms: 5,
+                dispatched: true,
+            });
+            crate::attribution::with_cancel_for_test(|ctx| {
+                ctx.api_key_id = "key".into();
+                ctx.client = Some(ClientContext::default());
+                ctx.surface = Some(crate::operation::CHAT);
+            });
+            let ctx = cell.take_cancel_context();
+            assert!(ctx.in_flight.is_none() && ctx.won.is_none());
+            assert_eq!(ctx.failed_attempts.len(), 1);
+            emit(
+                &state,
+                "/v1/chat/completions",
+                "request",
+                &Resolved {
+                    requested_model: "m".into(),
+                    provider: "anthropic".into(),
+                    upstream_model: "upstream".into(),
+                    ..Default::default()
+                },
+                ctx,
+                Phase::BeforeHead,
+                None,
+            );
+        })
+        .await;
+        let failed = rx.try_recv().unwrap();
+        let terminal = rx.try_recv().unwrap();
+        assert_eq!((failed.attempt_index, failed.prompt_tokens), (0, 37));
+        assert_eq!(
+            (failed.cache_creation_tokens, failed.cache_read_tokens),
+            (11, 23)
+        );
+        assert_eq!(failed.service_tier.as_deref(), Some("fast"));
+        assert_eq!((terminal.attempt_index, terminal.prompt_tokens), (1, 0));
+        assert_eq!(terminal.status_code, 499);
+        assert!(rx.try_recv().is_err(), "每条失败记录与逻辑终态各发一次");
+        let scrape = state.metrics.render();
+        let sum = |name: &str| -> f64 {
+            scrape
+                .lines()
+                .filter(|line| line.starts_with(&format!("{name}{{")))
+                .map(|line| line.rsplit_once(' ').unwrap().1.parse::<f64>().unwrap())
+                .sum()
+        };
+        assert_eq!(sum("aisix_llm_input_tokens_total"), 37.0, "{scrape}");
+        assert_eq!(
+            sum("aisix_llm_cache_creation_input_tokens_total"),
+            11.0,
+            "{scrape}"
+        );
+        assert_eq!(
+            sum("aisix_llm_cache_read_input_tokens_total"),
+            23.0,
+            "{scrape}"
+        );
+        assert_eq!(sum("aisix_llm_total_tokens_total"), 71.0, "{scrape}");
+    }
 }

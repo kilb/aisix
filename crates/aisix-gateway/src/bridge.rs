@@ -310,6 +310,8 @@ pub enum BridgeCapability {
     /// [`Bridge::anthropic_messages`] and [`Bridge::anthropic_count_tokens`]
     /// — `/v1/messages` served on the platform's own Claude routes.
     AnthropicMessages,
+    /// 原生存储响应的后续生命周期操作。
+    StoredResponses,
 }
 
 impl BridgeCapability {
@@ -320,6 +322,7 @@ impl BridgeCapability {
             Self::TextCompletions => "text completions",
             Self::ImageGeneration => "image generation",
             Self::AnthropicMessages => "Anthropic messages",
+            Self::StoredResponses => "stored Responses lifecycle",
         }
     }
 }
@@ -335,6 +338,9 @@ impl std::fmt::Display for BridgeCapability {
 /// layer can translate without further inspection.
 #[derive(Debug, thiserror::Error)]
 pub enum BridgeError {
+    /// 本地对象归属服务不可用；不能再次派发已被上游接受的请求。
+    #[error("service temporarily unavailable")]
+    DependencyUnavailable,
     /// An upstream call exceeded a time budget.
     ///
     /// `cause` names the transport-layer reason when reqwest reported one,
@@ -1015,6 +1021,7 @@ impl BridgeError {
     /// its OpenAI-compatible `{error:{message,type,...}}` envelope.
     pub fn http_status(&self) -> u16 {
         match self {
+            BridgeError::DependencyUnavailable => 503,
             BridgeError::Timeout { .. } => 504,
             BridgeError::UpstreamStatus { status, .. } => {
                 // We only forward 4xx directly; everything else collapses
@@ -1080,6 +1087,7 @@ impl BridgeError {
             | BridgeError::Transport(_)
             | BridgeError::StreamAborted => true,
             BridgeError::Config(_)
+            | BridgeError::DependencyUnavailable
             | BridgeError::UnsupportedCapability(_)
             | BridgeError::InvalidUpstreamConfig(_)
             | BridgeError::InvalidRequest(_)
@@ -1091,6 +1099,7 @@ impl BridgeError {
     /// Stable error-type token for the error envelope's `type` field.
     pub fn error_type(&self) -> &'static str {
         match self {
+            BridgeError::DependencyUnavailable => "api_error",
             BridgeError::Timeout { .. } => "timeout",
             BridgeError::UpstreamStatus { .. } => "upstream_error",
             BridgeError::UpstreamDecode(_)
@@ -1176,6 +1185,12 @@ pub trait Bridge: Send + Sync + 'static {
     /// Chat Completions takes text alone in a `tool` message and answers an
     /// image there with a 400. The default is `false`.
     fn reads_tool_result_media(&self, _req: &ChatFormat, _ctx: &BridgeContext) -> bool {
+        false
+    }
+
+    /// 当前目标路径能否处理原生文件 URI；Responses 的 file_url 仅在该契约下转换。
+    /// 选择依据是实际派发路径，不能将 URI 写成 Chat Completions 的上传文件 ID。
+    fn reads_file_uris(&self, _req: &ChatFormat, _ctx: &BridgeContext) -> bool {
         false
     }
 
@@ -1544,6 +1559,7 @@ mod tests {
             _ctx: &BridgeContext,
         ) -> Result<ChatResponse, BridgeError> {
             Ok(ChatResponse {
+                native_envelope: None,
                 logprobs: None,
                 more_choices: Vec::new(),
                 id: String::new(),
@@ -1883,6 +1899,15 @@ mod tests {
     fn parse_retry_after_returns_none_when_absent() {
         let h = http::HeaderMap::new();
         assert_eq!(parse_retry_after(&h), None);
+    }
+
+    #[test]
+    fn compat_dependency_unavailable_is_local_and_503() {
+        let error = BridgeError::DependencyUnavailable;
+        assert_eq!(error.http_status(), 503);
+        assert_eq!(error.error_type(), "api_error");
+        assert!(!error.reached_upstream());
+        assert_eq!(error.to_string(), "service temporarily unavailable");
     }
 
     #[test]

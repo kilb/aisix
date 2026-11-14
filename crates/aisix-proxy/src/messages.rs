@@ -37,6 +37,7 @@
 //! status-to-type mapping. (`/v1/chat/completions` continues to emit
 //! the OpenAI-shape envelope with its DP-stable taxonomy.)
 
+use crate::request_json::Json;
 use aisix_core::AppliedGuardrail;
 use aisix_obs::{
     content_capture_cap, AccessLog, CapturedContent, LatencyLabels, UsageEvent, UsageLabels,
@@ -44,7 +45,6 @@ use aisix_obs::{
 use axum::extract::State;
 use axum::http::{HeaderName, HeaderValue};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use serde_json::Value;
@@ -60,33 +60,31 @@ use crate::attempt::{
     attempt_error_from_proxy, attempt_reached_upstream, ms_since, AttemptInfo, AttemptRecord,
     DeferredAttempt, RoutingTelemetry,
 };
-use crate::auth::AuthenticatedKey;
+use crate::auth::{AnthropicAuthenticatedKey, AuthenticatedKey};
 use crate::chat::sanitize_tag;
 use crate::client_ip::ClientContext;
 use crate::error::ProxyError;
 use crate::state::ProxyState;
 use crate::usage_attr::total_tokens_with_cache;
 
-/// Anthropic API version header value injected on every forwarded request.
-/// Shared with the `/v1/messages/count_tokens` handler so both Anthropic
-/// passthrough paths pin the same version.
+/// 调用方未指定 API 版本时，两个原生入口共用的兼容默认值。
 pub(crate) const ANTHROPIC_VERSION: &str = "2023-06-01";
+
+pub(crate) fn client_anthropic_version(client: &ClientContext) -> HeaderValue {
+    client
+        .headers
+        .get("anthropic-version")
+        .cloned()
+        .unwrap_or_else(|| HeaderValue::from_static(ANTHROPIC_VERSION))
+}
 
 pub async fn messages(
     State(state): State<ProxyState>,
-    auth: Result<AuthenticatedKey, ProxyError>,
+    AnthropicAuthenticatedKey(auth): AnthropicAuthenticatedKey,
     client: ClientContext,
-    body: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
+    body: Result<Json<Value>, crate::request_json::JsonRejection>,
 ) -> Response {
-    // Catch extractor rejections (auth fail / malformed JSON) HERE
-    // and re-wrap as Anthropic envelope. Without this, axum's default
-    // `IntoResponse for ProxyError` emits the OpenAI shape, which the
-    // Claude SDK can't parse on a /v1/messages 401/400 response
-    // (#336). Same envelope policy as dispatch-side errors below.
-    let auth = match auth {
-        Ok(a) => a,
-        Err(e) => return e.into_anthropic_response(),
-    };
+    // 认证提取器先短路失败；这里只将请求体解析错误转成 Anthropic 错误形状。
     let started = Instant::now();
     let Json(mut body) = match body {
         Ok(j) => j,
@@ -192,6 +190,7 @@ pub async fn messages(
             output_monitor_hits,
             cache,
             refusal,
+            final_error,
         }) => {
             // #932: fold the non-streaming response-side mask counts into
             // the per-request total before the terminal emit below.
@@ -250,7 +249,7 @@ pub async fn messages(
                     &request_id,
                     Some(metrics.provider_request_id.as_str()),
                     &routing,
-                    None,
+                    final_error.as_ref(),
                 );
                 crate::request_metrics::record(
                     &state,
@@ -258,7 +257,12 @@ pub async fn messages(
                     crate::request_metrics::Caller::new(&auth),
                     request_upstream,
                     status,
-                    crate::attempt::answered_error_source(guardrail_blocked, &routing),
+                    final_error
+                        .as_ref()
+                        .map(crate::attempt::error_source)
+                        .unwrap_or_else(|| {
+                            crate::attempt::answered_error_source(guardrail_blocked, &routing)
+                        }),
                     elapsed,
                 );
             }
@@ -302,6 +306,10 @@ pub async fn messages(
                 // row names the refusal, like a buffered failure row does.
                 if let Some(refusal) = &refusal {
                     refusal.apply_to(&mut attempt);
+                }
+                if let Some(error) = &final_error {
+                    attempt.error_class = crate::attempt::error_class(error).to_string();
+                    attempt.error_message = error.to_string();
                 }
                 // `latency_ms` is scoped to the winning attempt: the failed
                 // attempts before it emitted their own events above, so
@@ -630,7 +638,15 @@ async fn dispatch(
 
     // Platform mode: nothing the request names may be an object stored
     // upstream for another tenant.
-    crate::stored_refs::refuse_in_messages(state.platform(), body)?;
+    crate::native_api::anthropic::refuse_messages_references(
+        state,
+        snapshot,
+        auth,
+        client,
+        body,
+        aisix_core::models::EndpointFamily::Messages,
+    )
+    .await?;
 
     // #448 (#22): /v1/messages must run input guardrails like
     // /v1/chat/completions — previously prompts reached the upstream without
@@ -951,6 +967,7 @@ async fn dispatch(
                 crate::chat::CacheStatus::Hit,
             );
             return Ok(DispatchOutcome {
+                final_error: None,
                 response,
                 // The entry is decoupled from whichever target produced it,
                 // so a hit is attributed to the requested row.
@@ -1149,6 +1166,7 @@ async fn dispatch(
                 started,
                 attempt_started,
                 &auth.entry.id,
+                auth,
                 &crate::request_metrics::Owned::from_auth(auth),
                 resolved_chain.clone(),
                 client,
@@ -1316,6 +1334,7 @@ async fn dispatch_to_target(
     // non-streaming winner (`usage.rs` #655 contract).
     attempt_started: Instant,
     api_key_id: &str,
+    auth: &AuthenticatedKey,
     // The authenticated caller's metric identity, names included —
     // resolved once from the principal rather than looked up again.
     caller: &crate::request_metrics::Owned,
@@ -1435,6 +1454,7 @@ async fn dispatch_to_target(
         started,
         attempt_started,
         api_key_id,
+        auth,
         caller,
         resolved_chain,
         client,
@@ -1474,6 +1494,7 @@ async fn anthropic_passthrough_dispatch(
     // When THIS attempt began — see `dispatch_to_target`.
     attempt_started: Instant,
     api_key_id: &str,
+    auth: &AuthenticatedKey,
     // The authenticated caller's metric identity, names included —
     // resolved once from the principal rather than looked up again.
     caller: &crate::request_metrics::Owned,
@@ -1490,6 +1511,23 @@ async fn anthropic_passthrough_dispatch(
     input_capture_safe: bool,
 ) -> Result<DispatchOutcome, ProxyError> {
     let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
+    let output_file_origin = state.platform().and_then(|settings| {
+        let model_id = uuid::Uuid::parse_str(model_id).ok()?;
+        let provider_key_id = uuid::Uuid::parse_str(pk_id).ok()?;
+        let boundary = aisix_core::native_objects::configured_native_origin(
+            &settings.id_key,
+            provider_key_id,
+            pk_value,
+            aisix_core::native_objects::NativeProtocol::Anthropic,
+            aisix_core::native_objects::NativeObjectKind::MessageBatch,
+        )
+        .ok()?;
+        Some(aisix_core::native_objects::OriginBinding {
+            model_id,
+            provider_key_id,
+            boundary,
+        })
+    });
 
     // The outbound body exists only as its wire bytes past this block: they
     // are what reqwest holds for the upstream wait, next to the caller's
@@ -1642,7 +1680,7 @@ async fn anthropic_passthrough_dispatch(
             headers.insert(HeaderName::from_static("x-api-key"), api_key_hv);
             headers.insert(
                 HeaderName::from_static("anthropic-version"),
-                HeaderValue::from_static(ANTHROPIC_VERSION),
+                client_anthropic_version(client_ctx),
             );
             headers.insert(
                 axum::http::header::CONTENT_TYPE,
@@ -1674,10 +1712,11 @@ async fn anthropic_passthrough_dispatch(
                     req_builder = req_builder.timeout(d);
                 }
             }
-            let upstream_resp = crate::stream_timeout::send_with_deadline(
+            let upstream_resp = crate::stream_timeout::send_with_deadline_observed(
                 req_builder,
                 connect_deadline,
                 send_started,
+                aisix_gateway::upstream_io::Protocol::Messages,
             )
             .await
             .map_err(|be| {
@@ -1952,7 +1991,7 @@ async fn anthropic_passthrough_dispatch(
             &upstream_model,
             crate::token_estimate::PromptInput::AnthropicWire(body_bytes.clone()),
         );
-        let parsed_stream = build_anthropic_passthrough_stream(
+        let parsed_stream = build_anthropic_passthrough_stream_with_files(
             body_stream,
             started,
             attempt_started,
@@ -1960,6 +1999,14 @@ async fn anthropic_passthrough_dispatch(
             model_name.to_string(),
             content_cap,
             Some(estimator),
+            state.platform().map(|_| NativeOutputFiles {
+                state: state.clone(),
+                auth: auth.clone(),
+                client: client_ctx.clone(),
+                requested_model: model_name.to_owned(),
+                direct_model: model.display_name.clone(),
+                origin: output_file_origin.clone(),
+            }),
             move |usage| {
                 // Streaming responses that got this far are 200 — the
                 // !status.is_success() guard above returned early on
@@ -2015,6 +2062,7 @@ async fn anthropic_passthrough_dispatch(
                     // `cache_read_input_tokens`, never the OpenAI-shape subset.
                     cached_prompt_tokens: 0,
                     cache_write_tokens: None,
+                    cache_usage_reported: usage.cache_usage_reported,
                     modality: Default::default(),
                     cache_creation_ttl: usage.cache_creation_ttl,
                     cache_creation_tokens: usage.cache_creation_tokens,
@@ -2148,6 +2196,7 @@ async fn anthropic_passthrough_dispatch(
         // `metrics` here is unused on this path (the stream computes
         // the real counts at end-of-stream).
         Ok(DispatchOutcome {
+            final_error: None,
             response,
             provider_label,
             upstream_protocol: wire_protocol,
@@ -2219,6 +2268,7 @@ async fn anthropic_passthrough_dispatch(
             let out_text = anthropic_inspection_text(&json_body);
 
             let synth = aisix_gateway::ChatResponse {
+                native_envelope: None,
                 logprobs: None,
                 more_choices: Vec::new(),
                 id: String::new(),
@@ -2296,6 +2346,7 @@ async fn anthropic_passthrough_dispatch(
             );
             crate::usage_attr::note_client_error_body(snapshot, || err.anthropic_body());
             return Ok(DispatchOutcome {
+                final_error: None,
                 response: err.into_anthropic_response(),
                 provider_label,
                 upstream_protocol: wire_protocol,
@@ -2315,6 +2366,40 @@ async fn anthropic_passthrough_dispatch(
                     guardrail_name.as_deref(),
                     unavailable.as_deref(),
                 )),
+            });
+        }
+
+        // 文件标识先绑定原账号；归属故障已发生在付费应答之后，不能重派或丢失用量。
+        if crate::native_api::anthropic::register_output_files_at_origin(
+            state,
+            auth,
+            client_ctx,
+            model_name,
+            &model.display_name,
+            output_file_origin.as_ref(),
+            &json_body,
+        )
+        .await
+        .is_err()
+        {
+            let error = ProxyError::Bridge(aisix_gateway::BridgeError::DependencyUnavailable);
+            crate::usage_attr::note_client_error_body(snapshot, || error.anthropic_body());
+            let response = (error.status(), Json(error.anthropic_body())).into_response();
+            return Ok(DispatchOutcome {
+                final_error: Some(error),
+                response,
+                provider_label,
+                upstream_protocol: wire_protocol,
+                provider_key_id: pk_id.to_string(),
+                upstream_model,
+                metrics,
+                usage_handled_by_stream: false,
+                routing: RoutingTelemetry::default(),
+                captured_content: None,
+                output_redactions,
+                output_monitor_hits,
+                cache: crate::response_cache::CacheTelemetry::default(),
+                refusal: None,
             });
         }
 
@@ -2353,6 +2438,7 @@ async fn anthropic_passthrough_dispatch(
         });
 
         Ok(DispatchOutcome {
+            final_error: None,
             response: Json(json_body).into_response(),
             provider_label,
             upstream_protocol: wire_protocol,
@@ -2374,8 +2460,8 @@ async fn anthropic_passthrough_dispatch(
 /// it is part of the Messages contract, naming the beta features the body
 /// relies on. A value the operator configured on the ProviderKey
 /// (`default_headers`, `forward_client_headers`) was applied first and
-/// stands. `anthropic-version` is not forwarded; the gateway speaks one
-/// version of the wire.
+/// stands. The caller's version is selected before that operator pipeline
+/// by [`client_anthropic_version`].
 pub(crate) fn forward_client_anthropic_beta(
     headers: &mut axum::http::HeaderMap,
     client: &ClientContext,
@@ -2628,6 +2714,7 @@ async fn guard_cached_response(
     // a rule that matches inside a `tool_use` argument blocks the response
     // that stored the entry, then passes every replay of it.
     let synth = aisix_gateway::ChatResponse {
+        native_envelope: None,
         logprobs: None,
         more_choices: Vec::new(),
         id: String::new(),
@@ -2755,42 +2842,24 @@ fn server_tool_count(usage: Option<&Value>, field: &str) -> u32 {
 /// Best-effort: missing fields land as zero / empty string.
 fn anthropic_metrics_from_response_json(body: &Value) -> AnthropicUsageMetrics {
     let usage = body.get("usage");
+    let stats = usage
+        .map(aisix_provider_anthropic::wire::anthropic_usage_stats)
+        .unwrap_or_default();
     AnthropicUsageMetrics {
         usage_estimated: false,
         // Anthropic upstream: see the streaming sibling — no OpenAI-shape subset.
         cached_prompt_tokens: 0,
         cache_write_tokens: None,
+        cache_usage_reported: stats.cache_usage_reported(),
         modality: Default::default(),
-        cache_creation_ttl: aisix_gateway::CacheCreationTtl::from_anthropic(
-            usage.and_then(|u| u.get("cache_creation")),
-        ),
-        reasoning_tokens: usage
-            .and_then(|u| u.pointer("/output_tokens_details/thinking_tokens"))
-            .and_then(Value::as_u64)
-            .map(crate::usage_attr::token_count)
-            .unwrap_or(0),
-        upstream_total_tokens: 0,
-        reasoning_folded_into_completion: 0,
-        prompt_tokens: usage
-            .and_then(|u| u.get("input_tokens"))
-            .and_then(Value::as_u64)
-            .map(crate::usage_attr::token_count)
-            .unwrap_or(0),
-        completion_tokens: usage
-            .and_then(|u| u.get("output_tokens"))
-            .and_then(Value::as_u64)
-            .map(crate::usage_attr::token_count)
-            .unwrap_or(0),
-        cache_creation_tokens: usage
-            .and_then(|u| u.get("cache_creation_input_tokens"))
-            .and_then(Value::as_u64)
-            .map(crate::usage_attr::token_count)
-            .unwrap_or(0),
-        cache_read_tokens: usage
-            .and_then(|u| u.get("cache_read_input_tokens"))
-            .and_then(Value::as_u64)
-            .map(crate::usage_attr::token_count)
-            .unwrap_or(0),
+        cache_creation_ttl: stats.cache_creation_ttl,
+        reasoning_tokens: stats.reasoning_tokens,
+        upstream_total_tokens: stats.upstream_total_tokens,
+        reasoning_folded_into_completion: stats.reasoning_folded_into_completion,
+        prompt_tokens: stats.prompt_tokens,
+        completion_tokens: stats.completion_tokens,
+        cache_creation_tokens: stats.cache_creation_tokens,
+        cache_read_tokens: stats.cache_read_tokens,
         // `usage.server_tool_use` — a cost basis of its own, not a token
         // class, so it is read here and never folded into a token total.
         web_search_requests: server_tool_count(usage, "web_search_requests"),
@@ -2969,6 +3038,12 @@ async fn cross_provider_dispatch(
     let in_flight = state.runtime_status.begin_in_flight(model_id);
 
     if is_stream {
+        let mut accounting_keys = reservation.as_ref().map(|r| r.keys()).unwrap_or_default();
+        if let Some(member) = member_reservation.as_ref() {
+            accounting_keys.extend(member.keys());
+        }
+        let mut accounting_hold =
+            crate::usage_attr::ObservedStreamTokensHold::new(state, attempt.index, accounting_keys);
         let upstream = bridge
             .chat_stream_cow(std::borrow::Cow::Owned(chat), &ctx)
             .await
@@ -2983,6 +3058,7 @@ async fn cross_provider_dispatch(
                 }
                 ProxyError::Bridge(err)
             })?;
+        accounting_hold.bind();
         // #554: when a streaming budget is configured (`stream_timeout`,
         // falling back to `timeout`), peek the first chunk so a slow/erroring
         // first token fails over (the caller loops to the next target) before
@@ -3109,6 +3185,12 @@ async fn cross_provider_dispatch(
             content_cap,
             Some(estimator),
             move |mut comp| {
+                crate::usage_attr::resolve_observed_stream_completion!(
+                    comp,
+                    attempt_for_telem.index,
+                    web_fetch_requests
+                );
+                accounting_hold.disarm();
                 // #688: apply the terminal token cost to TPM/TPD and release the
                 // concurrency hold now the stream has ended (sync analog of the
                 // reservation's async `commit_tokens`, which this closure can't
@@ -3155,6 +3237,7 @@ async fn cross_provider_dispatch(
                     completion_tokens: comp.completion_tokens,
                     cached_prompt_tokens: comp.cached_prompt_tokens,
                     cache_write_tokens: comp.cache_write_tokens,
+                    cache_usage_reported: comp.cache_usage_reported,
                     modality: comp.modality,
                     cache_creation_ttl: comp.cache_creation_ttl,
                     cache_creation_tokens: comp.cache_creation_tokens,
@@ -3259,6 +3342,7 @@ async fn cross_provider_dispatch(
                 .insert(HeaderName::from_static("x-aisix-request-id"), hv);
         }
         return Ok(DispatchOutcome {
+            final_error: None,
             response,
             provider_label,
             upstream_protocol: aisix_gateway::upstream_protocol(provider_key),
@@ -3309,6 +3393,7 @@ async fn cross_provider_dispatch(
         completion_tokens: resp.usage.completion_tokens,
         cached_prompt_tokens: resp.usage.cached_prompt_tokens,
         cache_write_tokens: resp.usage.cache_write_tokens,
+        cache_usage_reported: resp.usage.cache_usage_reported(),
         modality: resp.usage.modality,
         cache_creation_ttl: resp.usage.cache_creation_ttl,
         cache_creation_tokens: resp.usage.cache_creation_tokens,
@@ -3406,6 +3491,7 @@ async fn cross_provider_dispatch(
         );
         crate::usage_attr::note_client_error_body(snapshot, || err.anthropic_body());
         return Ok(DispatchOutcome {
+            final_error: None,
             response: err.into_anthropic_response(),
             provider_label,
             upstream_protocol: aisix_gateway::upstream_protocol(provider_key),
@@ -3478,6 +3564,7 @@ async fn cross_provider_dispatch(
             .insert(crate::response_cache::UnstorableAnswer);
     }
     Ok(DispatchOutcome {
+        final_error: None,
         response,
         provider_label,
         upstream_protocol: aisix_gateway::upstream_protocol(provider_key),
@@ -3612,6 +3699,7 @@ fn build_anthropic_sse_stream(
                             comp.prompt_tokens = comp.prompt_tokens.max(u.prompt_tokens);
                             comp.completion_tokens =
                                 comp.completion_tokens.max(u.completion_tokens);
+                            comp.cache_usage_reported = Some(comp.cache_usage_reported == Some(true) || u.cache_usage_reported() == Some(true));
                             comp.cache_write_tokens =
                                 comp.cache_write_tokens.max(u.cache_write_tokens);
                             comp.modality = comp.modality.max_fieldwise(&u.modality);
@@ -3890,7 +3978,7 @@ fn build_anthropic_sse_stream(
                     serde_json::Value::Array(std::mem::take(&mut tool_call_fragments)),
                 );
             }
-            let mut synth = aisix_gateway::ChatResponse {
+            let mut synth = aisix_gateway::ChatResponse { native_envelope: None,
                 logprobs: None,
                 more_choices: Vec::new(),
                 id: String::new(),
@@ -4178,6 +4266,7 @@ struct AnthropicStreamCompletion {
     /// See [`AnthropicUsageMetrics::cached_prompt_tokens`].
     cached_prompt_tokens: u32,
     cache_write_tokens: Option<u32>,
+    cache_usage_reported: Option<bool>,
     modality: aisix_gateway::ModalityTokens,
     cache_creation_ttl: aisix_gateway::CacheCreationTtl,
     cache_creation_tokens: u32,
@@ -4399,6 +4488,8 @@ async fn store_in_cache(
 }
 
 struct DispatchOutcome {
+    /// 上游已应答后的归属故障仍携带实际用量，不允许重派。
+    final_error: Option<ProxyError>,
     response: Response,
     provider_label: String,
     /// The wire the winning attempt actually spoke, which is not always
@@ -4483,6 +4574,7 @@ struct AnthropicUsageMetrics {
     /// which sit ON TOP of `prompt_tokens`.
     cached_prompt_tokens: u32,
     cache_write_tokens: Option<u32>,
+    cache_usage_reported: Option<bool>,
     modality: aisix_gateway::ModalityTokens,
     cache_creation_ttl: aisix_gateway::CacheCreationTtl,
     cache_creation_tokens: u32,
@@ -4532,6 +4624,7 @@ impl AnthropicUsageMetrics {
             reasoning_folded_into_completion: self.reasoning_folded_into_completion,
             cached_prompt_tokens: self.cached_prompt_tokens,
             cache_write_tokens: self.cache_write_tokens,
+            cache_usage_reported: self.cache_usage_reported,
             cache_creation_tokens: self.cache_creation_tokens,
             cache_creation_ttl: self.cache_creation_ttl,
             cache_read_tokens: self.cache_read_tokens,
@@ -4656,6 +4749,7 @@ fn emit_anthropic_usage_event(
         total_tokens: metrics.upstream_total_tokens,
         cached_prompt_tokens: metrics.cached_prompt_tokens,
         cache_write_tokens: metrics.cache_write_tokens,
+        cache_usage_reported: metrics.cache_usage_reported,
         modality_tokens: metrics.modality,
         cache_creation_ttl: metrics.cache_creation_ttl,
         // A cost basis of its own: the provider bills per search on top of
@@ -4728,6 +4822,7 @@ fn emit_anthropic_usage_event(
         .saturating_sub(event.completion_tokens);
     // Handler label "messages" — Anthropic /v1/messages inbound
     // path. Bucketed prometheus counter (#408).
+    crate::usage_attr::resolve_observed_stream_event(&mut event, snap);
     crate::usage_attr::apply_caller_identity(&mut event, client.jwt.as_ref(), &client.caller);
     let usage_model = crate::usage_attr::usage_event_model_label(snap, &event.requested_model);
     // The metric code below still reads `event`, so the chokepoint gets
@@ -4748,10 +4843,10 @@ fn emit_anthropic_usage_event(
     // cached traffic (#995/#906). Shared by the LLM-usage total metric and the
     // by-client total (#1002) so the two can't drift.
     let total_tokens_all = total_tokens_with_cache(
-        metrics.prompt_tokens,
-        metrics.completion_tokens,
-        metrics.cache_creation_tokens,
-        metrics.cache_read_tokens,
+        event.prompt_tokens,
+        event.folded_completion_tokens(),
+        event.cache_creation_tokens,
+        event.cache_read_tokens,
     );
     // Covers streaming and non-streaming — every /v1/messages usage event
     // flows through here.
@@ -4767,12 +4862,12 @@ fn emit_anthropic_usage_event(
             ..Default::default()
         },
         crate::request_metrics::Tokens {
-            input: metrics.prompt_tokens,
-            output: metrics.completion_tokens,
+            input: event.prompt_tokens,
+            output: event.folded_completion_tokens(),
             total: total_tokens_all.min(u64::from(u32::MAX)) as u32,
-            cached: metrics.cached_prompt_tokens,
-            cache_read: metrics.cache_read_tokens,
-            cache_creation: metrics.cache_creation_tokens,
+            cached: event.cached_prompt_tokens,
+            cache_read: event.cache_read_tokens,
+            cache_creation: event.cache_creation_tokens,
             client_type: state.client_classifier.classify(&client.user_agent),
         },
     );
@@ -4836,6 +4931,8 @@ fn emit_anthropic_usage_event(
 /// corresponding frame.
 #[derive(Default)]
 struct AnthropicStreamUsage {
+    // 原始累计计数与压缩迭代分别保存，避免后续局部帧抹掉已观察到的用量。
+    usage_accumulator: aisix_provider_anthropic::wire::AnthropicUsageAccumulator,
     /// `usage.output_tokens_details.thinking_tokens`, on the final
     /// `message_delta`: the reasoning share of `completion_tokens`.
     reasoning_tokens: u32,
@@ -4865,8 +4962,8 @@ struct AnthropicStreamUsage {
     cache_creation_tokens: u32,
     cache_creation_ttl: aisix_gateway::CacheCreationTtl,
     cache_read_tokens: u32,
-    /// Server tools the provider ran, read off the same terminal
-    /// `message_delta` that carries the final token counts.
+    cache_usage_reported: Option<bool>,
+    /// 首帧或后续累计用量中报告的服务端工具次数。
     web_search_requests: u32,
     web_fetch_requests: u32,
     /// True once a `message_delta` carried a numeric `output_tokens`.
@@ -4984,6 +5081,19 @@ fn update_anthropic_usage(
         acc.upstream_ttft = Some(ttft);
         crate::attribution::note_upstream_first_frame();
     }
+    if let Some(usage) = anthropic_event_usage(json) {
+        acc.usage_accumulator.update(usage);
+        let stats = acc.usage_accumulator.stats();
+        acc.prompt_tokens = stats.prompt_tokens;
+        acc.completion_tokens = stats.completion_tokens;
+        acc.cache_creation_tokens = stats.cache_creation_tokens;
+        acc.cache_read_tokens = stats.cache_read_tokens;
+        acc.cache_usage_reported = stats.cache_usage_reported();
+        acc.cache_creation_ttl = stats.cache_creation_ttl;
+        acc.reasoning_tokens = stats.reasoning_tokens;
+        acc.web_search_requests = stats.web_search_requests;
+        acc.web_fetch_requests = stats.web_fetch_requests;
+    }
     match json.get("type").and_then(Value::as_str) {
         // Anthropic reports a failure inside a committed stream as an
         // in-band `error` event, forwarded to the caller as-is.
@@ -5024,28 +5134,6 @@ fn update_anthropic_usage(
             if let Some(usage) = msg.and_then(|m| m.get("usage")) {
                 if let Some(tier) = aisix_gateway::chat::anthropic_usage_service_tier(usage) {
                     acc.service_tier = Some(tier);
-                }
-                if let Some(t) = usage.get("input_tokens").and_then(Value::as_u64) {
-                    acc.prompt_tokens = crate::usage_attr::token_count(t);
-                }
-                if let Some(t) = usage
-                    .get("cache_creation_input_tokens")
-                    .and_then(Value::as_u64)
-                {
-                    acc.cache_creation_tokens = crate::usage_attr::token_count(t);
-                }
-                acc.cache_creation_ttl =
-                    aisix_gateway::CacheCreationTtl::from_anthropic(usage.get("cache_creation"));
-                if let Some(t) = usage.get("cache_read_input_tokens").and_then(Value::as_u64) {
-                    acc.cache_read_tokens = crate::usage_attr::token_count(t);
-                }
-                // message_start carries an initial output_tokens (often
-                // 1); take it as a floor — message_delta supersedes with
-                // the real total. max-wins guards against a provider that
-                // double-emits or re-orders.
-                if let Some(t) = usage.get("output_tokens").and_then(Value::as_u64) {
-                    acc.completion_tokens =
-                        acc.completion_tokens.max(crate::usage_attr::token_count(t));
                 }
             }
             if let Some(id) = msg.and_then(|m| m.get("id")).and_then(Value::as_str) {
@@ -5123,17 +5211,8 @@ fn update_anthropic_usage(
                 if let Some(tier) = aisix_gateway::chat::anthropic_usage_service_tier(usage) {
                     acc.service_tier = Some(tier);
                 }
-                if let Some(t) = usage
-                    .pointer("/output_tokens_details/thinking_tokens")
-                    .and_then(Value::as_u64)
-                {
-                    acc.reasoning_tokens =
-                        acc.reasoning_tokens.max(crate::usage_attr::token_count(t));
-                }
                 if let Some(v) = usage.get("output_tokens") {
-                    if let Some(t) = v.as_u64() {
-                        acc.completion_tokens =
-                            acc.completion_tokens.max(crate::usage_attr::token_count(t));
+                    if v.as_u64().is_some() {
                         acc.output_tokens_from_delta = true;
                     } else {
                         // PR #436 audit LOW-1: a `usage` object present but
@@ -5147,30 +5226,6 @@ fn update_anthropic_usage(
                              is non-numeric; completion_tokens left at floor"
                         );
                     }
-                }
-                // #952: newer Anthropic wire (and some relays)
-                // report cumulative input/cache counts on message_delta —
-                // for some backends that is the ONLY place they appear
-                // (message_start ships no usable usage), which recorded
-                // prompt_tokens=0. Harvest them here too, max-wins with
-                // the message_start values (mainstream gateways read both frames).
-                if let Some(t) = usage.get("input_tokens").and_then(Value::as_u64) {
-                    acc.prompt_tokens = acc.prompt_tokens.max(crate::usage_attr::token_count(t));
-                }
-                if let Some(t) = usage
-                    .get("cache_creation_input_tokens")
-                    .and_then(Value::as_u64)
-                {
-                    acc.cache_creation_tokens = acc
-                        .cache_creation_tokens
-                        .max(crate::usage_attr::token_count(t));
-                }
-                acc.cache_creation_ttl = acc.cache_creation_ttl.max_fieldwise(
-                    &aisix_gateway::CacheCreationTtl::from_anthropic(usage.get("cache_creation")),
-                );
-                if let Some(t) = usage.get("cache_read_input_tokens").and_then(Value::as_u64) {
-                    acc.cache_read_tokens =
-                        acc.cache_read_tokens.max(crate::usage_attr::token_count(t));
                 }
                 // Cumulative for the turn, same as the counters above, so a
                 // later frame's figure supersedes an earlier one.
@@ -5206,43 +5261,24 @@ fn update_anthropic_usage(
 /// ([`anthropic_metrics_from_response_json`]), shared with passthrough routes
 /// relaying the same envelope. `None` when the body carries no `usage`.
 pub(crate) fn anthropic_usage_stats(body: &Value) -> Option<aisix_gateway::UsageStats> {
-    body.get("usage")?;
-    let m = anthropic_metrics_from_response_json(body);
-    Some(aisix_gateway::UsageStats {
-        cache_creation_ttl: m.cache_creation_ttl,
-        reasoning_tokens: m.reasoning_tokens,
-        ..aisix_gateway::UsageStats::with_cache(
-            m.prompt_tokens,
-            m.completion_tokens,
-            m.cache_creation_tokens,
-            m.cache_read_tokens,
-        )
-    })
+    body.get("usage")
+        .map(aisix_provider_anthropic::wire::anthropic_usage_stats)
 }
 
-/// The usage one streamed Anthropic event reports, read by this endpoint's
-/// own accumulator ([`update_anthropic_usage`]). Only `message_start` and
-/// `message_delta` carry usage; every other event is `None`. A caller that
-/// folds several events takes the field-wise max, as the accumulator does.
+/// 单帧用量视图；跨帧读取必须保留提供方的累计状态。
 pub(crate) fn anthropic_stream_usage_stats(event: &Value) -> Option<aisix_gateway::UsageStats> {
-    let usage = match event.get("type").and_then(Value::as_str) {
-        Some("message_start") => event.get("message").and_then(|m| m.get("usage")),
+    anthropic_event_usage(event).map(aisix_provider_anthropic::wire::anthropic_usage_stats)
+}
+
+pub(crate) fn anthropic_event_usage(event: &Value) -> Option<&Value> {
+    match event.get("type").and_then(Value::as_str) {
+        Some("message_start") => event
+            .get("message")
+            .and_then(|message| message.get("usage")),
         Some("message_delta") => event.get("usage"),
         _ => None,
-    };
-    usage.filter(|u| u.is_object())?;
-    let mut acc = AnthropicStreamUsage::default();
-    update_anthropic_usage(&mut acc, event, Instant::now(), &mut true, 0);
-    Some(aisix_gateway::UsageStats {
-        cache_creation_ttl: acc.cache_creation_ttl,
-        reasoning_tokens: acc.reasoning_tokens,
-        ..aisix_gateway::UsageStats::with_cache(
-            acc.prompt_tokens,
-            acc.completion_tokens,
-            acc.cache_creation_tokens,
-            acc.cache_read_tokens,
-        )
-    })
+    }
+    .filter(|usage| usage.is_object())
 }
 
 /// Drain every complete SSE frame from `buf`, updating `acc` and
@@ -5447,8 +5483,43 @@ impl Stream for AnthropicDeliveryCounter {
 /// could not scan — an unterminated frame at EOF, or one that ran past the
 /// frame cap. See the two arms below; on the live-forward path neither
 /// applies and every byte is delivered.
+#[derive(Clone)]
+struct NativeOutputFiles {
+    state: ProxyState,
+    auth: AuthenticatedKey,
+    client: ClientContext,
+    requested_model: String,
+    direct_model: String,
+    origin: Option<aisix_core::native_objects::OriginBinding>,
+}
+
+impl NativeOutputFiles {
+    async fn register(&self, frames: &[u8]) -> Result<(), ProxyError> {
+        let mut remaining = frames;
+        while !remaining.is_empty() {
+            let end =
+                aisix_gateway::sse::find_frame_end_from(remaining, 0).unwrap_or(remaining.len());
+            let (value, _) = crate::redact::parse_sse_json_event(&remaining[..end]);
+            if let Some(value) = value {
+                crate::native_api::anthropic::register_output_files_at_origin(
+                    &self.state,
+                    &self.auth,
+                    &self.client,
+                    &self.requested_model,
+                    &self.direct_model,
+                    self.origin.as_ref(),
+                    &value,
+                )
+                .await?;
+            }
+            remaining = &remaining[end..];
+        }
+        Ok(())
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn build_anthropic_passthrough_stream<S, F>(
+fn build_anthropic_passthrough_stream_with_files<S, F>(
     upstream: S,
     // Request clock — what the CALLER waited for
     // (`downstream_latency_ms`), spanning every earlier attempt.
@@ -5464,6 +5535,7 @@ fn build_anthropic_passthrough_stream<S, F>(
     // Token-estimation fallback context (#1074); see
     // `AnthropicStreamGuard::estimator`.
     estimator: Option<crate::token_estimate::Estimator>,
+    file_registration: Option<NativeOutputFiles>,
     on_complete: F,
 ) -> AnthropicDeliveryCounter
 where
@@ -5531,17 +5603,7 @@ where
                 // hold-back mode an Err lands here too: it is forwarded and
                 // the held (unscanned) content is dropped — fail closed.
                 Err(error) => {
-                    let bridge = match &error {
-                        crate::stream_timeout::RawStreamError::Upstream(e) => {
-                            crate::dispatch::reqwest_error_to_bridge(e, attempt_started)
-                        }
-                        crate::stream_timeout::RawStreamError::Timeout { elapsed_ms } => {
-                            aisix_gateway::BridgeError::Timeout {
-                                elapsed_ms: *elapsed_ms,
-                                cause: String::new(),
-                            }
-                        }
-                    };
+                    let bridge = error.as_bridge(attempt_started);
                     let usage = guard.usage();
                     crate::attempt::StreamFailure::record(&mut usage.failure, &bridge);
                     usage.stream_failure = Some(error.failure());
@@ -5635,6 +5697,20 @@ where
                 forward.append(&mut buf);
                 scanned = 0;
             }
+            if let Some(registration) = file_registration.as_ref() {
+                if registration.register(&forward).await.is_err() {
+                    let bridge = aisix_gateway::BridgeError::DependencyUnavailable;
+                    let usage = guard.usage();
+                    crate::attempt::StreamFailure::record(&mut usage.failure, &bridge);
+                    usage.stream_failure = Some(crate::stream_timeout::RawStreamFailure::DependencyUnavailable);
+                    usage.response_capture_safe = false;
+                    usage.response_text.clear();
+                    if let Some(frame) = crate::platform_errors::anthropic_stream_frame(&bridge) {
+                        yield Ok(Bytes::from(frame));
+                    }
+                    return;
+                }
+            }
             if let Some((max_hold, fail_open)) = hold {
                 // Hold-back: withhold the bytes until the end-of-stream
                 // scan clears (and masks) them.
@@ -5721,6 +5797,20 @@ where
                     &mut first_token_seen,
                     response_text_cap,
                 );
+            }
+            if let Some(registration) = file_registration.as_ref() {
+                if registration.register(&tail).await.is_err() {
+                    let bridge = aisix_gateway::BridgeError::DependencyUnavailable;
+                    let usage = guard.usage();
+                    crate::attempt::StreamFailure::record(&mut usage.failure, &bridge);
+                    usage.stream_failure = Some(crate::stream_timeout::RawStreamFailure::DependencyUnavailable);
+                    usage.response_capture_safe = false;
+                    usage.response_text.clear();
+                    if let Some(frame) = crate::platform_errors::anthropic_stream_frame(&bridge) {
+                        yield Ok(Bytes::from(frame));
+                    }
+                    return;
+                }
             }
             if let Some((max_hold, fail_open)) = hold {
                 // Scanned like every other frame — hold it with them, but
@@ -5912,7 +6002,7 @@ where
             // An upstream failure with no output is the provider's answer, and
             // reaches the client as such.
             if !text.is_empty() || guard.usage().failure.is_none() {
-                let synth = aisix_gateway::ChatResponse { logprobs: None, more_choices: Vec::new(),
+                let synth = aisix_gateway::ChatResponse { native_envelope: None, logprobs: None, more_choices: Vec::new(),
                     id: String::new(),
                     model: model_label.clone(),
                     message: aisix_gateway::ChatMessage::assistant(text),
@@ -6164,6 +6254,34 @@ fn emit_access_log(
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn build_anthropic_passthrough_stream<S, F>(
+    upstream: S,
+    started: Instant,
+    attempt_started: Instant,
+    output_guardrail: Option<Arc<aisix_guardrails::GuardrailChain>>,
+    model_label: String,
+    content_cap: Option<u32>,
+    estimator: Option<crate::token_estimate::Estimator>,
+    on_complete: F,
+) -> AnthropicDeliveryCounter
+where
+    S: Stream<Item = Result<Bytes, crate::stream_timeout::RawStreamError>> + Send + 'static,
+    F: FnOnce(AnthropicStreamUsage) + Send + 'static,
+{
+    build_anthropic_passthrough_stream_with_files(
+        upstream,
+        started,
+        attempt_started,
+        output_guardrail,
+        model_label,
+        content_cap,
+        estimator,
+        None,
+        on_complete,
+    )
+}
 
 #[cfg(test)]
 mod stream_failure_tests {
@@ -6264,6 +6382,209 @@ mod stream_failure_tests {
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn native_messages_and_chat_preserve_start_only_server_tool_counts() {
+        // 相同上游首帧分别经原生消息和 Chat 桥接；任一分支丢字段都会使收费记录失败。
+        for endpoint in ["/v1/messages", "/v1/chat/completions"] {
+            let upstream = MockServer::builder().start().await;
+            let events = [
+                serde_json::json!({"type":"message_start","message":{
+                    "id":"msg_start_tools","type":"message","role":"assistant",
+                    "model":"claude-3-haiku-20240307","content":[],"stop_reason":null,
+                    "usage":{"input_tokens":17,"output_tokens":0,
+                        "server_tool_use":{"web_search_requests":11,"web_fetch_requests":3}}
+                }}),
+                serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+                serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"answer"}}),
+                serde_json::json!({"type":"content_block_stop","index":0}),
+                serde_json::json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}),
+                serde_json::json!({"type":"message_stop"}),
+            ];
+            let sse = events
+                .iter()
+                .map(|event| format!("data: {event}\n\n"))
+                .collect::<String>();
+            Mock::given(method("POST"))
+                .and(path("/v1/messages"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string(sse),
+                )
+                .mount(&upstream)
+                .await;
+            let snap = new_snap_anthropic(&upstream.uri());
+            snap.models.insert(anthropic_model("start-tools"));
+            snap.apikeys.insert(apikey_entry(&["*"]));
+            let hub = Arc::new(Hub::new());
+            hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+                .without_cache()
+                .with_usage_sink(aisix_obs::UsageSink::new(tx));
+            let mut request = make_req(serde_json::json!({
+                "model":"start-tools","messages":[{"role":"user","content":"hello"}],
+                "max_tokens":100,"stream":true
+            }));
+            *request.uri_mut() = endpoint.parse().unwrap();
+            let response = crate::build_router(state).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            to_bytes(response.into_body(), 65536).await.unwrap();
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let wire = serde_json::to_value(&event).unwrap();
+            assert_eq!(
+                wire.get("web_search_requests"),
+                Some(&serde_json::json!(11)),
+                "{endpoint}"
+            );
+            assert_eq!(
+                wire.get("web_fetch_requests"),
+                Some(&serde_json::json!(3)),
+                "{endpoint}"
+            );
+            assert_eq!((event.prompt_tokens, event.completion_tokens), (17, 5));
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    fn compat_claude_native_compaction_usage() -> serde_json::Value {
+        serde_json::json!({
+            "input_tokens":23,"output_tokens":5,
+            "iterations":[
+                {"type":"message","input_tokens":23,"output_tokens":5},
+                {"type":"compaction","input_tokens":100,"output_tokens":7,
+                 "cache_read_input_tokens":80,"cache_creation_input_tokens":10,
+                 "cache_creation":{"ephemeral_1h_input_tokens":10}}
+            ]
+        })
+    }
+
+    #[test]
+    fn compat_claude_native_json_compaction_accounting() {
+        let body = serde_json::json!({"usage":compat_claude_native_compaction_usage()});
+        let before = body.clone();
+        let stats = super::anthropic_usage_stats(&body).unwrap();
+        assert_eq!(
+            (
+                stats.prompt_tokens,
+                stats.completion_tokens,
+                stats.cache_read_tokens,
+                stats.cache_creation_tokens,
+                stats.cache_creation_ttl.cache_creation_1h_tokens,
+                stats.upstream_total_tokens
+            ),
+            (123, 12, 80, 10, Some(10), 0)
+        );
+        assert_eq!(body, before);
+        assert_eq!(body["usage"]["input_tokens"], 23);
+    }
+
+    #[test]
+    fn compat_claude_native_stream_compaction_partial_and_repeat() {
+        let mut usage = super::AnthropicStreamUsage::default();
+        let first = serde_json::json!({"type":"message_delta","usage":compat_claude_native_compaction_usage()});
+        for event in [
+            &first,
+            &first,
+            &serde_json::json!({"type":"message_delta","usage":{"input_tokens":30,"output_tokens":6}}),
+        ] {
+            super::update_anthropic_usage(
+                &mut usage,
+                event,
+                std::time::Instant::now(),
+                &mut true,
+                0,
+            );
+        }
+        assert_eq!(
+            (
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.cache_read_tokens,
+                usage.cache_creation_tokens
+            ),
+            (130, 13, 80, 10)
+        );
+        assert_eq!(usage.cache_creation_ttl.cache_creation_1h_tokens, Some(10));
+    }
+
+    #[test]
+    fn compat_claude_native_on_demand_usage_is_not_estimated() {
+        let mut usage = super::AnthropicStreamUsage::default();
+        super::update_anthropic_usage(
+            &mut usage,
+            &serde_json::json!({"type":"message_delta","usage":{
+                "input_tokens":0,"output_tokens":0,
+                "iterations":[{"type":"compaction","input_tokens":100,"output_tokens":7}]
+            }}),
+            std::time::Instant::now(),
+            &mut true,
+            0,
+        );
+        let capture = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let capture_out = capture.clone();
+        drop(super::AnthropicStreamGuard {
+            slot: Some((
+                move |u: super::AnthropicStreamUsage| {
+                    *capture_out.lock().unwrap() = Some(u);
+                },
+                usage,
+            )),
+            delivered: std::sync::Arc::new(super::AtomicU32::new(1)),
+            estimator: Some(crate::token_estimate::Estimator::new(
+                "relay-claude",
+                crate::token_estimate::PromptInput::Anthropic(
+                    serde_json::json!({"messages":[{"role":"user","content":"hello"}]}),
+                ),
+            )),
+        });
+        let observed = capture.lock().unwrap().take().unwrap();
+        assert_eq!(
+            (observed.prompt_tokens, observed.completion_tokens),
+            (100, 7)
+        );
+        assert!(!observed.usage_estimated);
+    }
+
+    #[tokio::test]
+    async fn compat_claude_native_messages_preserves_version() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_response()))
+            .mount(&upstream)
+            .await;
+        for version in [None, Some("2023-06-01"), Some("2026-10-21")] {
+            let snap = new_snap_anthropic(&upstream.uri());
+            snap.models.insert(anthropic_model("claude"));
+            snap.apikeys.insert(apikey_entry(&["*"]));
+            let mut req = make_req(
+                serde_json::json!({"model":"claude","max_tokens":0,"messages":[{"role":"user","content":"hi"}]}),
+            );
+            if let Some(v) = version {
+                req.headers_mut()
+                    .insert("anthropic-version", v.parse().unwrap());
+            }
+            let response = build_app(snap).oneshot(req).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let _ = to_bytes(response.into_body(), 65536).await.unwrap();
+            let requests = upstream.received_requests().await.unwrap();
+            assert_eq!(
+                requests
+                    .last()
+                    .unwrap()
+                    .headers
+                    .get("anthropic-version")
+                    .unwrap(),
+                version.unwrap_or("2023-06-01")
+            );
+        }
+    }
+
     /// The reasoning share of the output is read wherever Claude's usage is:
     /// on a whole answer, and on the stream's final frame.
     #[test]
@@ -6284,6 +6605,39 @@ mod tests {
             (streamed.completion_tokens, streamed.reasoning_tokens),
             (40, 30)
         );
+    }
+
+    #[test]
+    fn native_cache_presence_survives_buffered_and_streamed_zero_counts() {
+        for reported in [false, true] {
+            let mut usage = serde_json::json!({"input_tokens":100,"output_tokens":1});
+            if reported {
+                usage["cache_read_input_tokens"] = serde_json::json!(0);
+                usage["cache_creation_input_tokens"] = serde_json::json!(0);
+            }
+            let buffered =
+                super::anthropic_metrics_from_response_json(&serde_json::json!({"usage":usage}));
+            assert_eq!(buffered.cache_usage_reported, Some(reported));
+            let mut streamed = super::AnthropicStreamUsage::default();
+            let mut first = false;
+            super::update_anthropic_usage(
+                &mut streamed,
+                &serde_json::json!({"type":"message_start","message":{"usage":usage}}),
+                std::time::Instant::now(),
+                &mut first,
+                0,
+            );
+            super::update_anthropic_usage(
+                &mut streamed,
+                &serde_json::json!({"type":"message_delta","usage":{"output_tokens":2}}),
+                std::time::Instant::now(),
+                &mut first,
+                0,
+            );
+            assert_eq!(streamed.cache_usage_reported, Some(reported));
+            assert_eq!(streamed.cache_read_tokens, 0);
+            assert_eq!(streamed.cache_creation_tokens, 0);
+        }
     }
 
     use aisix_core::resource::ResourceEntry;
@@ -6821,6 +7175,118 @@ mod tests {
             "a streamed request is outside the gate, so it carries no cache header",
         );
         // Both mocks' `.expect(1)` assert the stream reached the upstream.
+    }
+
+    #[tokio::test]
+    async fn io_audit_messages_tracks_actual_upstream_unicode_and_entity_bytes() {
+        for stream in [false, true] {
+            let upstream = MockServer::builder().start().await;
+            let upstream_wire = if stream {
+                concat!(
+                        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-audit\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n",
+                        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"A汉😀\"}}\n\n",
+                        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n",
+                        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+                ).to_owned()
+            } else {
+                let mut answer = anthropic_response();
+                answer["content"][0]["text"] = serde_json::json!("A汉😀");
+                serde_json::to_string(&answer).unwrap()
+            };
+            let response = ResponseTemplate::new(200)
+                .insert_header(
+                    "content-type",
+                    if stream {
+                        "text/event-stream"
+                    } else {
+                        "application/json"
+                    },
+                )
+                .set_body_string(upstream_wire.clone());
+            Mock::given(method("POST"))
+                .and(path("/v1/messages"))
+                .respond_with(response)
+                .expect(1)
+                .mount(&upstream)
+                .await;
+            let snap = new_snap_anthropic(&upstream.uri());
+            snap.models.insert(anthropic_model("claude-haiku"));
+            snap.apikeys.insert(apikey_entry(&["*"]));
+            let hub = Arc::new(Hub::new());
+            hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+            let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+            let (audit_tx, mut updates) = tokio::sync::mpsc::channel(4);
+            let app = crate::build_router(
+                crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+                    .without_cache()
+                    .with_usage_sink(aisix_obs::UsageSink::new(tx).with_io_audit_sender(audit_tx)),
+            );
+            let raw = format!(
+                r#"{{"model":"claude-haiku","messages":[{{"role":"user","content":"A\u6c49\ud83d\ude00"}}],"max_tokens":100,"stream":{stream}}}"#
+            );
+            let request = Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(raw))
+                .unwrap();
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let buffered_event = if stream {
+                None
+            } else {
+                Some(
+                    rx.try_recv()
+                        .expect("buffered upstream event precedes client body polling"),
+                )
+            };
+            let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+            assert!(!bytes.is_empty());
+            let event = match buffered_event {
+                Some(event) => event,
+                None => tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                    .await
+                    .expect("stream terminal event deadline")
+                    .expect("one original stream event"),
+            };
+            assert!(!event.event_id.is_empty());
+            assert_eq!((event.prompt_tokens, event.completion_tokens), (10, 3));
+            let requests = upstream.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 1);
+            let upstream_request: serde_json::Value =
+                serde_json::from_slice(&requests[0].body).unwrap();
+            assert_eq!(upstream_request["messages"][0]["content"], "A汉😀");
+            let audit = event
+                .io_audit
+                .clone()
+                .expect("original event includes upstream audit");
+            assert!(event.is_final_attempt);
+            let audit = serde_json::to_value(audit).unwrap();
+            assert_eq!(audit["version"], 2);
+            assert_eq!(audit["boundary"], "upstream_attempt");
+            assert_eq!(audit["transport"], "http_entity");
+            assert_eq!(audit["exchange_count"], 1);
+            assert_eq!(audit["request_complete"], true);
+            assert_eq!(audit["request_body_bytes"], requests[0].body.len() as u64);
+            assert_eq!(audit["response_body_bytes"], upstream_wire.len() as u64);
+            assert_eq!(audit["response_complete"], true);
+            for direction in ["input_text", "output_text"] {
+                let text = audit.get(direction).unwrap_or_else(|| {
+                    panic!("known text must be present: stream={stream}, direction={direction}, audit={audit}")
+                });
+                assert_eq!(text["utf8_bytes"], 8, "{stream}: {direction}");
+                assert_eq!(text["unicode_scalars"], 3, "{stream}: {direction}");
+                assert_eq!(text["complete"], true, "{stream}: {direction}");
+            }
+            assert!(rx.try_recv().is_err(), "one original per exchange");
+            assert!(
+                updates.try_recv().is_err(),
+                "original v2 audit needs no sidecar amendment"
+            );
+        }
     }
 
     #[tokio::test]
@@ -8629,6 +9095,70 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
         assert!(usage.response_text.is_empty());
     }
 
+    #[tokio::test]
+    async fn held_native_failures_keep_class_and_do_not_release_unscanned_content() {
+        use crate::stream_timeout::{RawStreamError, RawStreamFailure};
+        use aisix_core::models::GuardrailHookPoint;
+        use aisix_guardrails::{builtin_rule, Guardrail, GuardrailChain, PiiAction, PiiGuardrail};
+        use futures::StreamExt;
+        use std::sync::{Arc, Mutex};
+
+        for (error, expected, status) in [
+            (
+                RawStreamError::DependencyUnavailable,
+                RawStreamFailure::DependencyUnavailable,
+                503,
+            ),
+            (
+                RawStreamError::UpstreamDecode,
+                RawStreamFailure::UpstreamDecode,
+                502,
+            ),
+        ] {
+            let pii = PiiGuardrail::new(
+                vec![builtin_rule("email", PiiAction::Mask).unwrap()],
+                GuardrailHookPoint::Output,
+                262_144,
+                false,
+            );
+            let chain = Arc::new(GuardrailChain::new(vec![
+                Arc::new(pii) as Arc<dyn Guardrail>
+            ]));
+            let upstream = futures::stream::iter([
+                Ok::<_, RawStreamError>(bytes::Bytes::from_static(concat!(
+                    r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"private@example.com"}}"#,
+                    "\n\n"
+                ).as_bytes())),
+                Err(error),
+            ]);
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let captured_out = Arc::clone(&captured);
+            let now = std::time::Instant::now();
+            let stream = super::build_anthropic_passthrough_stream(
+                upstream,
+                now,
+                now,
+                Some(chain),
+                "alias".into(),
+                Some(4096),
+                None,
+                move |usage| captured_out.lock().unwrap().push(usage),
+            );
+            let items = stream.collect::<Vec<_>>().await;
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].as_ref().unwrap_err().failure(), expected);
+            let rows = captured.lock().unwrap();
+            assert_eq!(rows.len(), 1);
+            let usage = &rows[0];
+            assert_eq!(usage.stream_failure, Some(expected));
+            assert_eq!(usage.failure.as_ref().unwrap().status, status);
+            assert_eq!(usage.chunks_delivered, 0);
+            assert!(!usage.response_capture_safe);
+            assert!(usage.response_text.is_empty());
+            assert!(!usage.reached_end);
+        }
+    }
+
     /// A verdict that never comes back, so a test can leave during it.
     struct SlowVerdict;
 
@@ -8717,6 +9247,7 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
         use aisix_gateway::{ChatChunk, ChatChunkStream, ChatDelta, FinishReason, UsageStats};
         use std::sync::{Arc, Mutex};
         let chunk = ChatChunk {
+            native_envelope: None,
             id: "c".into(),
             model: "m".into(),
             delta: ChatDelta {
@@ -8790,6 +9321,7 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
         let mut extra = serde_json::Map::new();
         extra.insert("refusal".into(), "the SECRET".into());
         let chunk = ChatChunk {
+            native_envelope: None,
             id: "c".into(),
             model: "m".into(),
             delta: ChatDelta {
@@ -9089,6 +9621,7 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
         for (guardrail, expect_exported) in [(None, true), (Some(chain), false)] {
             let upstream: ChatChunkStream = Box::pin(futures::stream::iter(vec![
                 Ok(ChatChunk {
+                    native_envelope: None,
                     id: "chunk-1".into(),
                     model: "upstream-model".into(),
                     delta: ChatDelta {
@@ -9207,6 +9740,7 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
         usage: Option<aisix_gateway::UsageStats>,
     ) -> aisix_gateway::ChatChunk {
         aisix_gateway::ChatChunk {
+            native_envelope: None,
             id: "chunk".into(),
             model: "upstream-model".into(),
             delta: aisix_gateway::ChatDelta {
@@ -9355,6 +9889,7 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
         // copy of this attacker-controlled argument.
         let raw_argument = "x".repeat(1024 * 1024);
         let chunk = ChatChunk {
+            native_envelope: None,
             id: "chunk_tool_only".into(),
             model: "gpt-4o-mini".into(),
             delta: ChatDelta {
@@ -9442,6 +9977,7 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
         ]));
         let huge = "x".repeat(2 * 1024 * 1024);
         let chunk = ChatChunk {
+            native_envelope: None,
             id: format!("oversized-id-{huge}"),
             model: format!("oversized-model-{huge}"),
             delta: ChatDelta::default(),

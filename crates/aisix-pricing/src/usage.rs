@@ -679,6 +679,8 @@ mod tests {
             completion_tokens: _,
             cached_prompt_tokens: _,
             cache_write_tokens: _,
+            // 监测采样元数据，不参与计价。
+            cache_usage_reported: _,
             reasoning_tokens: _,
             cache_creation_tokens: _,
             cache_read_tokens: _,
@@ -719,6 +721,7 @@ mod tests {
             cache_creation_1h_tokens: _,
         } = cache_creation_ttl;
         let aisix_gateway::OpenAiUsageDetails {
+            cache_creation_tokens_reported: _,
             // Not billed: the client-facing projection only, never on the
             // row. The two flags mark presence; the text counts are each
             // side less its audio and image tokens, which `quantities` works

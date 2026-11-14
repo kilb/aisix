@@ -22,6 +22,76 @@ use crate::{
 /// Separates a tool-call id from the thought signature appended to it.
 pub const THOUGHT_SIGNATURE_SEPARATOR: &str = "__thought__";
 
+#[cfg(test)]
+mod compat_chat_custom_history_tests {
+    use super::*;
+
+    fn history() -> ChatFormat {
+        serde_json::from_value(json!({
+            "model": "translated", "messages": [
+                {"role": "user", "content": "use tools"},
+                {"role": "assistant", "content": "working", "tool_calls": [
+                    {"id": "custom_1", "type": "custom", "custom": {"name": "calculator", "input": "2+2"}},
+                    {"id": "function_1", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "custom_1", "content": "4"},
+                {"role": "tool", "tool_call_id": "function_1", "content": "found"},
+                {"role": "user", "content": "answer"}
+            ]
+        })).unwrap()
+    }
+
+    #[test]
+    fn compat_chat_custom_history_drops_only_unrepresentable_call_and_result() {
+        let req = history();
+        let original = serde_json::to_value(&req).unwrap();
+        let (mapped, _) = legacy_functions_as_tools(Cow::Borrowed(&req)).unwrap();
+        assert_eq!(mapped.messages.len(), 4);
+        assert_eq!(mapped.messages[1].content_str(), "working");
+        assert_eq!(
+            mapped.messages[1].extra["tool_calls"],
+            json!([
+                {"id": "function_1", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}
+            ])
+        );
+        assert_eq!(
+            mapped.messages[2].tool_call_id.as_deref(),
+            Some("function_1")
+        );
+        assert_eq!(mapped.messages[2].content_str(), "found");
+        assert_eq!(mapped.messages[3].content_str(), "answer");
+        assert_eq!(serde_json::to_value(&req).unwrap(), original);
+    }
+
+    #[test]
+    fn compat_chat_custom_only_history_leaves_no_empty_assistant_placeholder() {
+        let req: ChatFormat = serde_json::from_value(json!({
+            "model": "translated", "messages": [
+                {"role": "user", "content": "calculate"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "custom_1", "type": "custom", "custom": {"name": "calculator", "input": "2+2"}}
+                ]},
+                {"role": "tool", "tool_call_id": "custom_1", "content": "4"},
+                {"role": "user", "content": "answer"}
+            ]
+        })).unwrap();
+        let (mapped, _) = legacy_functions_as_tools(Cow::Borrowed(&req)).unwrap();
+        assert_eq!(mapped.messages.len(), 2);
+        assert_eq!(mapped.messages[0].content_str(), "calculate");
+        assert_eq!(mapped.messages[1].content_str(), "answer");
+    }
+
+    #[test]
+    fn compat_chat_custom_history_malformed_input_names_its_own_field() {
+        let mut req = history();
+        req.messages[1].extra["tool_calls"][0]["custom"]["input"] = json!(123);
+        assert!(matches!(
+            legacy_functions_as_tools(Cow::Borrowed(&req)),
+            Err(BridgeError::InvalidRequest(message)) if message.contains("custom.input")
+        ));
+    }
+}
+
 /// `id` split into its base id and the thought signature appended to it.
 pub fn split_thought_signature(id: &str) -> (&str, Option<&str>) {
     match id.split_once(THOUGHT_SIGNATURE_SEPARATOR) {
@@ -165,6 +235,7 @@ pub struct LegacyFunctionCalling {
 pub fn legacy_functions_as_tools(
     req: Cow<'_, ChatFormat>,
 ) -> Result<(Cow<'_, ChatFormat>, LegacyFunctionCalling), BridgeError> {
+    let req = without_custom_tool_history(req)?;
     // A legacy field set to `null` is absent: an SDK replaying a turn it
     // dumped writes `function_call: null` beside its content.
     const LEGACY: [&str; 2] = ["functions", "function_call"];
@@ -267,6 +338,76 @@ pub fn legacy_functions_as_tools(
         }
     }
     Ok((Cow::Owned(req), LegacyFunctionCalling { legacy_reply }))
+}
+
+// 这些调用点的目标协议只有 function 槽位；原生 OpenAI 路径不经过此转换。
+fn without_custom_tool_history(
+    req: Cow<'_, ChatFormat>,
+) -> Result<Cow<'_, ChatFormat>, BridgeError> {
+    let mut dropped_ids = std::collections::BTreeSet::new();
+    for (message_index, message) in req.messages.iter().enumerate() {
+        let Some(calls) = message.extra.get("tool_calls").and_then(Value::as_array) else {
+            continue;
+        };
+        for (call_index, call) in calls.iter().enumerate() {
+            if call.get("type").and_then(Value::as_str) != Some("custom") {
+                continue;
+            }
+            let field = |path: &str| {
+                BridgeError::InvalidRequest(format!(
+                    "`messages[{message_index}].tool_calls[{call_index}].{path}` must be a string"
+                ))
+            };
+            let id = call
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| field("id"))?;
+            for key in ["name", "input"] {
+                if call
+                    .get("custom")
+                    .and_then(|c| c.get(key))
+                    .and_then(Value::as_str)
+                    .is_none()
+                {
+                    return Err(field(&format!("custom.{key}")));
+                }
+            }
+            dropped_ids.insert(id.to_owned());
+        }
+    }
+    if dropped_ids.is_empty() {
+        return Ok(req);
+    }
+    let mut req = req.into_owned();
+    req.messages.retain_mut(|message| {
+        if message.role == Role::Tool
+            && message
+                .tool_call_id
+                .as_ref()
+                .is_some_and(|id| dropped_ids.contains(id))
+        {
+            return false;
+        }
+        let mut removed = false;
+        if let Some(calls) = message
+            .extra
+            .get_mut("tool_calls")
+            .and_then(Value::as_array_mut)
+        {
+            let before = calls.len();
+            calls.retain(|call| call.get("type").and_then(Value::as_str) != Some("custom"));
+            removed = before != calls.len();
+            if removed && calls.is_empty() {
+                message.extra.remove("tool_calls");
+            }
+        }
+        !(removed
+            && message.role == Role::Assistant
+            && message.content_str().is_empty()
+            && message.content_blocks.is_none()
+            && message.extra.is_empty())
+    });
+    Ok(Cow::Owned(req))
 }
 
 impl LegacyFunctionCalling {
@@ -472,6 +613,7 @@ mod tests {
             json!([{"id": "t", "type": "function", "function": {"name": "w", "arguments": "{}"}}]),
         );
         let resp = legacy.reply(ChatResponse {
+            native_envelope: None,
             id: "r".into(),
             model: "m".into(),
             message,

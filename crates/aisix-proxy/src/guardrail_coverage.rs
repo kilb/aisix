@@ -175,12 +175,33 @@ pub(crate) const POSTURE: &[(&str, Posture)] = &[
         "/v1/fine_tuning/jobs/:id/cancel",
         Posture::NoUpstreamContent("cancels by id; carries no caller text"),
     ),
+    (
+        "/v1/responses/:id",
+        Posture::NoUpstreamContent("GET/DELETE by owned id; input was screened at creation"),
+    ),
+    (
+        "/v1/responses/:id/cancel",
+        Posture::NoUpstreamContent("cancels an owned response by id; carries no new caller text"),
+    ),
+    (
+        "/v1/responses/:id/input_items",
+        Posture::NoUpstreamContent("lists an owned response's input by id; carries no new caller text"),
+    ),
     // --- content-bearing surfaces --------------------------------------
     ("/v1/chat/completions", Posture::Enforced),
+    ("/v1/chat/completions/:id", Posture::EnforcedNotDrivableInCrate("原生存储对象需托管注册表；native_openai_stored_chat 验证元数据更新的审查拒绝。")),
+    ("/v1/chat/completions/:id/messages", Posture::NoUpstreamContent("读取已归属的消息；不提交新的调用方内容。")),
     ("/v1/completions", Posture::Enforced),
     ("/v1/embeddings", Posture::Enforced),
     ("/v1/images/generations", Posture::Enforced),
     ("/v1/images/edits", Posture::Enforced),
+    ("/v1/images/variations", Posture::Enforced),
+    ("/v1/moderations", Posture::Enforced),
+    ("/v1/content_provenance_checks", Posture::Enforced),
+    ("/v1/uploads", Posture::EnforcedNotDrivableInCrate("原生上传需托管注册表；native_openai_uploads 验证各写入步骤的审查拒绝。")),
+    ("/v1/uploads/:id/parts", Posture::EnforcedNotDrivableInCrate("原生上传需托管注册表；native_openai_uploads 验证分片的审查拒绝。")),
+    ("/v1/uploads/:id/complete", Posture::EnforcedNotDrivableInCrate("原生上传需托管注册表；native_openai_uploads 验证完成字段的审查拒绝。")),
+    ("/v1/uploads/:id/cancel", Posture::EnforcedNotDrivableInCrate("原生上传需托管注册表；native_openai_uploads 验证取消请求扩展正文的审查拒绝。")),
     ("/v1/messages", Posture::Enforced),
     ("/v1/messages/count_tokens", Posture::Enforced),
     ("/v1/rerank", Posture::Enforced),
@@ -201,6 +222,8 @@ pub(crate) const POSTURE: &[(&str, Posture)] = &[
         ),
     ),
     ("/v1/responses", Posture::Enforced),
+    ("/v1/responses/compact", Posture::Enforced),
+    ("/v1/responses/input_tokens", Posture::Enforced),
     ("/v1/audio/transcriptions", Posture::Enforced),
     ("/v1/audio/translations", Posture::Enforced),
     ("/v1/audio/speech", Posture::Enforced),
@@ -218,6 +241,24 @@ pub(crate) const POSTURE: &[(&str, Posture)] = &[
     ),
     ("/v1/files", Posture::Enforced),
     ("/v1/batches", Posture::Enforced),
+    (
+        "/v1/messages/batches",
+        Posture::EnforcedNotDrivableInCrate(
+            "原生批次创建需要托管归属注册表；native_anthropic_batches 组件测试逐项验证审查拒绝。",
+        ),
+    ),
+    (
+        "/v1/messages/batches/:id",
+        Posture::NoUpstreamContent("读取或删除已归属批次，不含新输入"),
+    ),
+    (
+        "/v1/messages/batches/:id/cancel",
+        Posture::NoUpstreamContent("取消已归属批次，不含新输入"),
+    ),
+    (
+        "/v1/messages/batches/:id/results",
+        Posture::NoUpstreamContent("读取已审查批次结果，输出仍经过审查"),
+    ),
     ("/v1/fine_tuning/jobs", Posture::Enforced),
     (
         FALLBACK_SURFACE,
@@ -616,6 +657,15 @@ pub(crate) fn fixture(surface: &str) -> Option<Request<Body>> {
         // No `prompt` part at all — the exact shape that used to skip the
         // chain outright.
         "/v1/images/edits" => form(surface, &[("model", "census-openai"), ("image", "x")]),
+        "/v1/images/variations" => form(surface, &[("model", "census-openai"), ("image", "x")]),
+        "/v1/moderations" => json(
+            surface,
+            serde_json::json!({"model":"census-openai","input":""}),
+        ),
+        "/v1/content_provenance_checks" => form(
+            "/v1/content_provenance_checks?model=census-openai",
+            &[("file", "x")],
+        ),
         "/v1/messages" => anthropic(
             surface,
             serde_json::json!({
@@ -635,7 +685,7 @@ pub(crate) fn fixture(surface: &str) -> Option<Request<Body>> {
             surface,
             serde_json::json!({ "model": "census-openai", "query": "", "documents": [""] }),
         ),
-        "/v1/responses" => json(
+        "/v1/responses" | "/v1/responses/compact" | "/v1/responses/input_tokens" => json(
             surface,
             serde_json::json!({ "model": "census-openai", "input": "" }),
         ),

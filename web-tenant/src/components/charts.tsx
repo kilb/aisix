@@ -42,7 +42,7 @@ export function TrendChart({ points, accessibleLabel, formatValue = formatCount,
   const y = (value: number) => 12 + (maximum - value) / range * 176;
   const baseline = y(0);
   const slot = 640 / points.length;
-  const barWidth = Math.max(0.5, slot * 0.72);
+  const barWidth = Math.max(0.5, Math.min(28, slot * 0.72));
   const selectedIndex = activeIndex === null ? null : Math.min(activeIndex, points.length - 1);
   const selected = selectedIndex === null ? undefined : points[selectedIndex];
   const labels = [...new Set([0, Math.floor((points.length - 1) / 2), points.length - 1])];
@@ -58,7 +58,7 @@ export function TrendChart({ points, accessibleLabel, formatValue = formatCount,
     }
   }
   return (
-    <div className={cn("min-w-0", className)}>
+    <div className={cn("metric-chart min-w-0", className)}>
       <div className="relative">
         <svg role="img" aria-label={accessibleLabel} viewBox="0 0 640 200" preserveAspectRatio="none" className="block h-56 w-full overflow-visible">
           <g aria-hidden="true">
@@ -66,9 +66,9 @@ export function TrendChart({ points, accessibleLabel, formatValue = formatCount,
             {minimum < 0 && <line x1="0" x2="640" y1={baseline} y2={baseline} className="stroke-ink/30" strokeWidth="1" vectorEffect="non-scaling-stroke" />}
             {points.map((point, index) => {
               const x = index * slot + (slot - barWidth) / 2;
-              if (!knownNumber(point.value)) return <path key={index} d={`M${x} ${baseline}h${barWidth}`} className="stroke-muted" strokeDasharray="2 3" vectorEffect="non-scaling-stroke" />;
+              if (!knownNumber(point.value)) return null;
               const height = Math.abs(y(point.value) - baseline);
-              return <rect key={index} x={x} y={Math.min(y(point.value), baseline)} width={barWidth} height={height || 1} rx="4" className={index === currentIndex ? "fill-accent" : index >= points.length - 7 ? "fill-ink" : "fill-stone"} />;
+              return <rect key={index} x={x} y={Math.min(y(point.value), baseline)} width={barWidth} height={height || 1} rx="2" className={index === currentIndex ? "fill-accent" : "fill-ink"} />;
             })}
             {selectedIndex !== null && <line x1={(selectedIndex + 0.5) * slot} x2={(selectedIndex + 0.5) * slot} y1="6" y2="194" className="stroke-muted" strokeDasharray="3 4" vectorEffect="non-scaling-stroke" />}
           </g>
@@ -87,9 +87,9 @@ export function TrendChart({ points, accessibleLabel, formatValue = formatCount,
           onPointerLeave={event => { if (document.activeElement !== event.currentTarget) setActiveIndex(null); }}
           onKeyDown={navigate}
         />
-        {selected && <div id={tooltipId} role="tooltip" className="pointer-events-none absolute inset-x-0 top-0 mx-auto w-fit max-w-full break-all rounded-chip border border-line bg-surface px-3 py-2 font-mono text-micro font-normal text-ink">{selected.label} · {pointDisplay(selected, formatValue)}</div>}
+        {selected && <div id={tooltipId} role="tooltip" className="pointer-events-none absolute inset-x-0 top-0 mx-auto w-fit max-w-full break-all rounded-chip border border-line bg-surface px-3 py-2 tabular-nums text-micro font-normal text-ink">{selected.label} · {pointDisplay(selected, formatValue)}</div>}
       </div>
-      <div aria-hidden="true" className="mt-2 flex min-w-0 justify-between gap-2 font-mono text-micro text-muted">
+      <div aria-hidden="true" className="mt-2 flex min-w-0 justify-between gap-2 tabular-nums text-micro text-muted">
         {labels.map(index => <span key={index} className="min-w-0 break-all">{points[index]?.label}</span>)}
       </div>
       <p className="sr-only">按 Tab 进入图表后，可用左右方向键、Home 和 End 查看各期原值。未知期间不作为零值绘制。</p>
@@ -129,7 +129,7 @@ export function RankBars({ items, accessibleLabel, emptyLabel = "暂无排行数
                 <li key={index} className="min-w-0">
                   <div className="mb-2 flex min-w-0 flex-wrap items-baseline justify-between gap-x-4 gap-y-1 text-caption">
                     <span className="min-w-0 break-all text-ink">{item.label}</span>
-                    <span className="min-w-0 break-all font-mono font-normal tabular-nums text-ink">{item.displayValue}</span>
+                    <span className="min-w-0 break-all font-normal tabular-nums text-ink">{item.displayValue}</span>
                   </div>
                   <svg aria-hidden="true" viewBox="0 0 100 10" preserveAspectRatio="none" className="block h-2.5 w-full overflow-visible">
                     <rect width="100" height="10" rx="5" className="fill-ink/7" />
@@ -160,12 +160,12 @@ export function BudgetProgress({ value, accessibleLabel, label, valueLabel, clas
   const display = valueLabel ?? (ratio === null ? "未知" : formatRatio(ratio));
   return (
     <div className={cn("min-w-0", className)}>
-      {(label || valueLabel) && <div className="mb-2 flex min-w-0 flex-wrap items-baseline justify-between gap-x-4 gap-y-1 text-caption text-ink"><span>{label}</span><span className="min-w-0 break-all font-mono font-normal tabular-nums">{display}</span></div>}
+      {(label || valueLabel) && <div className="mb-2 flex min-w-0 flex-wrap items-baseline justify-between gap-x-4 gap-y-1 text-caption text-ink"><span>{label}</span><span className="min-w-0 break-all font-normal tabular-nums">{display}</span></div>}
       <svg role={ratio === null ? "img" : "progressbar"} aria-label={ratio === null ? `${accessibleLabel}；${display}` : accessibleLabel} aria-valuemin={ratio === null ? undefined : 0} aria-valuemax={ratio === null ? undefined : 100} aria-valuenow={ratio === null ? undefined : ratio * 100} aria-valuetext={display} viewBox="0 0 100 10" preserveAspectRatio="none" className="block h-2.5 w-full overflow-visible">
         <rect width="100" height="10" rx="5" className="fill-ink/7" />
         {ratio !== null && <rect width={ratio * 100} height="10" rx="5" className="fill-ink" />}
       </svg>
-      {ratio === null && !label && !valueLabel && <p className="mt-2 font-mono text-micro text-muted">未知</p>}
+      {ratio === null && !label && !valueLabel && <p className="mt-2 tabular-nums text-micro text-muted">未知</p>}
     </div>
   );
 }

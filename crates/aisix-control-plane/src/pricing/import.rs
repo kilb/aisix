@@ -29,6 +29,8 @@
 //!   that repeats the standard prices changes nothing; one that differs, a
 //!   name the rate model refuses as a tier, and any other condition are
 //!   flagged `unsupported_variant`.
+//!   OpenAI 的 `fast` 与 `priority` 仅在另一个档位缺失时共享导入价格；
+//!   已分别给出的价格原样保留，其他供应商的档位不互相补充。
 //! - **Tiers.** `{base, tiers: [{start, price}]}` applies a tier's price to
 //!   every token once the prompt is strictly longer than `start`, as a
 //!   long-context band does. Each distinct `start` across the card is one
@@ -1568,6 +1570,24 @@ fn model_proposals(
                     prices.entry(field.clone()).or_insert(value);
                 }
             }
+            // OpenAI 的 fast 请求以 priority 回报；导入时只补缺失别名，不覆盖显式价格。
+            // 文档：https://developers.openai.com/api/docs/guides/fast-mode
+            if entry.0 == "openai" {
+                if let Some((fast, priority)) = tier_named("fast").zip(tier_named("priority")) {
+                    let alias = match (overrides.get(&fast), overrides.get(&priority)) {
+                        (Some(prices), None) => Some((priority, prices)),
+                        (None, Some(prices)) => Some((fast, prices)),
+                        _ => None,
+                    };
+                    if let Some((alias, prices)) = alias {
+                        // 别名多复制一次覆盖项；须先计入工作量与字段名字节预算。
+                        budget.spend(prices.len() as u64)?;
+                        budget.spend_copies(names_widened(prices))?;
+                        let prices = prices.clone();
+                        overrides.insert(alias, prices);
+                    }
+                }
+            }
             // Each tier is a copy of the standard prices with its own over
             // them: the copies are taken before the first is made, since a
             // standard map of many fields beside many tiers is their product
@@ -1998,6 +2018,224 @@ mod tests {
 
     fn default_base(p: &ParsedProposal) -> &aisix_pricing::Rates {
         &p.card.as_ref().expect("a card").0[&ServiceTier::default_tier()].base
+    }
+
+    #[test]
+    fn compat_fast_billing_openai_import_carries_the_documented_fast_priority_alias() {
+        for (reported, alias) in [("fast", "priority"), ("priority", "fast")] {
+            let body = json!([{
+                "id": "openai", "models": [{
+                    "id": "gpt-6-astra",
+                    "prices": {"input_mtok": 10, "output_mtok": 50, "cache_read_mtok": 1},
+                    "price_variants": [{
+                        "when": {"service_tier": reported},
+                        "prices": {"input_mtok": 20, "output_mtok": 100, "cache_read_mtok": 2}
+                    }]
+                }]
+            }]);
+            let all = proposals(&body.to_string());
+            let proposal = current(&all, "gpt-6-astra");
+            assert!(proposal.flags.is_empty(), "{proposal:?}");
+            let card = card_json(proposal);
+            assert_eq!(
+                card.get(reported),
+                Some(&json!({"base": {
+                    "input": "20", "output": "100", "cache_read": "2"
+                }}))
+            );
+            assert_eq!(
+                card.get(alias),
+                card.get(reported),
+                "OpenAI reports priority for a fast request"
+            );
+            assert_eq!(card["default"]["base"]["input"], "10");
+        }
+    }
+
+    #[test]
+    fn compat_fast_billing_import_keeps_other_protocol_tiers_and_explicit_prices_distinct() {
+        let body = json!([
+            {"id": "anthropic", "models": [{"id": "claude-opus-5-5",
+                "prices": {"input_mtok": 4, "output_mtok": 20},
+                "price_variants": [{"when": {"service_tier": "fast"}, "prices": {"input_mtok": 8, "output_mtok": 40}}]}]},
+            {"id": "openai", "models": [{"id": "explicit-prices",
+                "prices": {"input_mtok": 1, "output_mtok": 2},
+                "price_variants": [
+                    {"when": {"service_tier": "fast"}, "prices": {"input_mtok": 3, "output_mtok": 4}},
+                    {"when": {"service_tier": "priority"}, "prices": {"input_mtok": 5, "output_mtok": 6}}]}]}
+        ]);
+        let all = proposals(&body.to_string());
+        let claude = card_json(current(&all, "claude-opus-5-5"));
+        assert!(claude.get("priority").is_none());
+        assert_eq!(claude["fast"]["base"]["input"], "8");
+        let explicit = card_json(current(&all, "explicit-prices"));
+        assert_eq!(explicit["fast"]["base"]["input"], "3");
+        assert_eq!(explicit["priority"]["base"]["input"], "5");
+    }
+
+    #[test]
+    fn compat_fast_billing_aliases_keep_dated_bands_and_bill_the_served_tier() {
+        let body = json!([{"id": "openai", "models": [{
+            "id": "dated-fast",
+            "prices": [
+                {"prices": {"input_mtok": 10, "output_mtok": 50, "cache_read_mtok": 1}},
+                {"constraint": {"start_date": "2027-01-01"},
+                 "prices": {"input_mtok": 11, "output_mtok": 55, "cache_read_mtok": 1.5}}
+            ],
+            "price_variants": [{
+                "constraint": {"start_date": "2027-01-01"},
+                "when": {"service_tier": "fast"},
+                "prices": {
+                    "input_mtok": {"base": 20, "tiers": [{"start": 200000, "price": 40}]},
+                    "output_mtok": {"base": 100, "tiers": [{"start": 200000, "price": 150}]},
+                    "cache_read_mtok": 2
+                }
+            }]
+        }]}]);
+        let all = proposals(&body.to_string());
+        assert_eq!(all.len(), 2);
+        let present = card_json(current(&all, "dated-fast"));
+        assert!(present.get("fast").is_none());
+        assert!(present.get("priority").is_none());
+        let later = all
+            .iter()
+            .find(|p| p.effective_from.is_some())
+            .expect("a dated proposal");
+        let card = card_json(later);
+        let expected = json!({
+            "base": {"input": "20", "output": "100", "cache_read": "2"},
+            "long_context": [{"above_input_tokens": 200000,
+                              "rates": {"input": "40", "output": "150", "cache_read": "2"}}]
+        });
+        assert_eq!(card.get("fast"), Some(&expected));
+        assert_eq!(card.get("priority"), Some(&expected));
+        assert_eq!(card["default"]["base"]["input"], "11");
+        assert_eq!(card["default"]["base"]["output"], "55");
+        let at = Utc.with_ymd_and_hms(2027, 1, 1, 0, 0, 1).unwrap();
+        let rows: aisix_pricing::PriceRows = serde_json::from_value(json!({
+            "baselines": [{"revision_id": 1, "engine_version": aisix_pricing::ENGINE_VERSION,
+                "model_id": "public-requested", "effective_from": later.effective_from,
+                "card": card}],
+            "rates": [{"revision_id": 1, "engine_version": aisix_pricing::ENGINE_VERSION,
+                "group_id": "group", "model_id": null, "effective_from": later.effective_from,
+                "cny_per_usd_e4": 10000}],
+            "cost_rates": [], "discounts": []
+        }))
+        .expect("price rows");
+        let book = aisix_pricing::PriceBook::from_rows(rows);
+        let usage = aisix_pricing::BillableUsage {
+            event_id: "fast-served-priority".into(),
+            occurred_at: at,
+            requested_model_id: "public-requested".into(),
+            operation: "chat".into(),
+            status_code: 200,
+            prompt_tokens: 200001,
+            completion_tokens: 100,
+            service_tier: Some("priority".into()),
+            requested_service_tier: Some("fast".into()),
+            upstream_provider: Some("openai".into()),
+            upstream_model: Some("upstream-model".into()),
+            ..Default::default()
+        };
+        let payer = aisix_pricing::Payer {
+            tenant_id: "tenant".into(),
+            group_id: Some("group".into()),
+        };
+        let priced = aisix_pricing::price_event(&book, &usage, &payer, at)
+            .expect("the served tier is priced");
+        // 人工计算：200001 × 40 + 100 × 150 = 8015040 微元，倍率为 1。
+        assert_eq!(priced.outcome, aisix_pricing::Outcome::Charged);
+        assert_eq!(priced.charge.0, 8015040);
+        assert_eq!(priced.long_context_above, Some(200000));
+        assert_eq!(
+            priced.service_tier.as_ref().map(ServiceTier::as_str),
+            Some("priority")
+        );
+        assert_eq!(priced.requested_service_tier.as_deref(), Some("fast"));
+        assert_eq!(priced.requested_model_id, "public-requested");
+
+        let mut served_fast = usage.clone();
+        served_fast.event_id = "fast-served-fast".into();
+        served_fast.service_tier = Some("fast".into());
+        let fast = aisix_pricing::price_event(&book, &served_fast, &payer, at)
+            .expect("the explicit fast tier is priced");
+        assert_eq!(fast.outcome, aisix_pricing::Outcome::Charged);
+        assert_eq!(fast.charge.0, 8015040);
+        assert_eq!(
+            fast.service_tier.as_ref().map(ServiceTier::as_str),
+            Some("fast")
+        );
+
+        // 请求快档不能覆盖实际普通档；两种普通档回报均按其自己的价格收费。
+        for served in ["default", "standard"] {
+            let mut ordinary = usage.clone();
+            ordinary.event_id = format!("fast-served-{served}");
+            ordinary.service_tier = Some(served.into());
+            let priced = aisix_pricing::price_event(&book, &ordinary, &payer, at)
+                .expect("the reported ordinary tier is priced");
+            // 人工计算：200001 × 11 + 100 × 55 = 2205511 微元。
+            assert_eq!(priced.outcome, aisix_pricing::Outcome::Charged);
+            assert_eq!(priced.charge.0, 2205511, "{served}");
+            assert_eq!(priced.long_context_above, Some(200000));
+            assert_eq!(
+                priced.service_tier.as_ref().map(ServiceTier::as_str),
+                Some("default"),
+                "{served}"
+            );
+            assert_eq!(priced.requested_service_tier.as_deref(), Some("fast"));
+            assert_eq!(priced.requested_model_id, "public-requested");
+        }
+    }
+
+    #[test]
+    fn compat_fast_billing_alias_copy_obeys_both_import_budgets() {
+        let text = json!([{"id": "openai", "models": [{
+            "id": "bounded-fast", "prices": {"input_mtok": 1, "output_mtok": 2},
+            "price_variants": [{"when": {"service_tier": "fast"},
+                                "prices": {"input_mtok": 3, "output_mtok": 4}}]
+        }]}])
+        .to_string();
+        let providers: Vec<Provider<'_>> = serde_json::from_str(&text).expect("dataset");
+        let model = &providers[0].models[0];
+        let entries = conditionals(model.prices).expect("prices");
+        let variants = model.price_variants.as_deref().unwrap_or_default();
+        let run = |budget: &mut Budget| {
+            model_proposals(
+                &entries,
+                variants,
+                now().date_naive(),
+                ("openai", "bounded-fast"),
+                None,
+                0,
+                budget,
+            )
+        };
+        let mut full = Budget {
+            proposals: 1,
+            work: MAX_IMPORT_WORK,
+            copies: MAX_IMPORT_COPY_BYTES,
+        };
+        let parsed = run(&mut full).expect("enough budget");
+        assert_eq!(parsed.len(), 1);
+        let card = parsed[0].1.as_ref().expect("a card");
+        assert!(card.0.contains_key(&tier_named("fast").expect("tier")));
+        assert!(card.0.contains_key(&tier_named("priority").expect("tier")));
+        let used_work = MAX_IMPORT_WORK - full.work;
+        let used_copies = MAX_IMPORT_COPY_BYTES - full.copies;
+        assert!(used_work > 0);
+        assert!(used_copies > 0);
+        let mut short_work = Budget {
+            proposals: 1,
+            work: used_work - 1,
+            copies: MAX_IMPORT_COPY_BYTES,
+        };
+        assert_eq!(run(&mut short_work).err(), Some(Over::Work));
+        let mut short_copies = Budget {
+            proposals: 1,
+            work: MAX_IMPORT_WORK,
+            copies: used_copies - 1,
+        };
+        assert_eq!(run(&mut short_copies).err(), Some(Over::Copies));
     }
 
     #[test]

@@ -1684,6 +1684,7 @@ async fn apply_output_guardrails(
         scanned.join("\n")
     };
     let resp = aisix_gateway::ChatResponse {
+        native_envelope: None,
         logprobs: None,
         more_choices: Vec::new(),
         id: String::new(),

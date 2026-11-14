@@ -115,6 +115,9 @@ pub struct GatewayEmbeddingCall {
 /// the control plane parser expects.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct UsageEvent {
+    /// 仅一次客户端交换的终态带长度观察；旧事件缺失保持未知。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub io_audit: Option<aisix_core::usage_io::UsageIoAudit>,
     /// DP-supplied request id (idempotency key). Use the same id the
     /// `x-aisix-call-id` response header carries so logs join.
     pub request_id: String,
@@ -240,10 +243,12 @@ pub struct UsageEvent {
 
     /// OpenAI prompt-cache hit count. Subset of `prompt_tokens`.
     /// Defaults to 0 for providers that don't expose prompt caching.
-    /// Serialised with `omitempty`-equivalent behaviour: the control plane accepts
-    /// the absent-or-zero case identically.
+    /// 零计数省略，是否报告由 cache_usage_reported 单独保留。
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub cached_prompt_tokens: u32,
+    /// 上游是否明确报告了缓存计数；真实零值也算已报告。缺省兼容旧事件。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_usage_reported: Option<bool>,
     /// Raw OpenAI cache-write count; it is not additive to prompt tokens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_write_tokens: Option<u32>,
@@ -387,6 +392,19 @@ pub struct UsageEvent {
     /// 0 ("not measured") on an event that reached no upstream: a cache
     /// hit, or a request refused before its first attempt.
     pub upstream_latency_ms: u32,
+
+    /// 本行描述的工作是否实际派发至上游；旧事件和离线聚合未声明时保持未知。
+    /// 不能从零耗时、HTTP 成功或模型身份推断；未派发的缓存与本地拒绝明确为 false。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_dispatched: Option<bool>,
+
+    /// 后台受理和对象管理不计入推理结果；旧事件缺失时沿用保守判定。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inference_stage: Option<aisix_core::native_objects::InferenceStage>,
+
+    /// 网关生成并持久化的原生操作身份，不能使用调用方可复用的 request_id。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_operation_id: Option<uuid::Uuid>,
 
     /// Time to the upstream's first streamed frame, in milliseconds —
     /// measured from the start of THIS attempt to the first SSE frame
@@ -788,7 +806,8 @@ pub struct UsageEvent {
     /// What the caller asked the gateway to DO, from a fixed set:
     /// `chat`, `messages`, `count_tokens`, `responses`, `completions`,
     /// `embeddings`, `rerank`, `systemone`, `decisions`, `image_generation`,
-    /// `image_edit`, `transcription`, `translation`, `speech`, `video_generation`,
+    /// `image_edit`, `image_variation`, `moderations`, `content_provenance_checks`,
+    /// `uploads`, `transcription`, `translation`, `speech`, `video_generation`,
     /// `realtime`, `files`, `batches`, `fine_tuning`, `batch_completion`,
     /// `mcp`, `a2a`, `passthrough`.
     ///
@@ -1248,6 +1267,28 @@ pub struct UsageSink {
     tx: Option<tokio::sync::mpsc::Sender<UsageEvent>>,
     metrics: Option<crate::metrics::Metrics>,
     drop_warnings: std::sync::Arc<DropWarnings>,
+    io_audit_tx: Option<tokio::sync::mpsc::Sender<UsageIoAuditUpdate>>,
+}
+
+/// 只携带标量长度，不能作为一条计费用量事件。
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageIoAuditUpdate {
+    kind: &'static str,
+    pub event_id: String,
+    pub io_audit: aisix_core::usage_io::UsageIoAudit,
+    #[serde(skip)]
+    pub queued_at: std::time::Instant,
+}
+
+impl UsageIoAuditUpdate {
+    pub fn new(event_id: String, io_audit: aisix_core::usage_io::UsageIoAudit) -> Self {
+        Self {
+            kind: "io_audit_update",
+            event_id,
+            io_audit,
+            queued_at: std::time::Instant::now(),
+        }
+    }
 }
 
 /// How often the log may say that the queue dropped events. A queue that
@@ -1388,6 +1429,7 @@ impl UsageSink {
             tx: Some(tx),
             metrics: None,
             drop_warnings: Default::default(),
+            io_audit_tx: None,
         }
     }
 
@@ -1399,6 +1441,7 @@ impl UsageSink {
             tx: None,
             metrics: None,
             drop_warnings: Default::default(),
+            io_audit_tx: None,
         }
     }
 
@@ -1410,6 +1453,25 @@ impl UsageSink {
     pub fn with_metrics(mut self, metrics: crate::metrics::Metrics) -> Self {
         self.metrics = Some(metrics);
         self
+    }
+
+    pub fn with_io_audit_sender(
+        mut self,
+        tx: tokio::sync::mpsc::Sender<UsageIoAuditUpdate>,
+    ) -> Self {
+        self.io_audit_tx = Some(tx);
+        self
+    }
+
+    pub fn io_audit_updates_enabled(&self) -> bool {
+        self.io_audit_tx.is_some()
+    }
+
+    /// 长度补注使用独立有界队列，不挤占原用量事件或改变其健康状态。
+    pub fn try_amend_io(&self, event_id: String, audit: aisix_core::usage_io::UsageIoAudit) {
+        if let Some(tx) = &self.io_audit_tx {
+            let _ = tx.try_send(UsageIoAuditUpdate::new(event_id, audit));
+        }
     }
 
     /// Non-blocking emit. Returns immediately:
@@ -1512,6 +1574,149 @@ impl UsageSink {
 
 #[cfg(test)]
 mod tests {
+    fn audit() -> aisix_core::usage_io::UsageIoAudit {
+        aisix_core::usage_io::UsageIoAudit {
+            version: 1,
+            boundary: "client_exchange".into(),
+            request_complete: None,
+            exchange_count: None,
+            transport: None,
+            request_body_bytes: Some(0),
+            response_body_bytes: Some(8),
+            response_complete: true,
+            input_text: None,
+            output_text: None,
+        }
+    }
+
+    #[test]
+    fn io_audit_queue_cannot_consume_original_admission_capacity() {
+        let (tx, mut originals) = tokio::sync::mpsc::channel(1);
+        let (audit_tx, mut updates) = tokio::sync::mpsc::channel(1);
+        let sink = super::UsageSink::new(tx).with_io_audit_sender(audit_tx);
+        sink.try_emit(
+            "test",
+            super::UsageEvent::default(),
+            crate::UsageEventLabels::default(),
+        );
+        originals.try_recv().expect("first original drains");
+        sink.try_amend_io("first".into(), audit());
+        sink.try_amend_io("audit queue full".into(), audit());
+        assert_eq!(sink.queued(), 0, "metadata is outside the usage queue");
+        sink.try_emit(
+            "test",
+            super::UsageEvent::default(),
+            crate::UsageEventLabels::default(),
+        );
+        originals
+            .try_recv()
+            .expect("metadata cannot displace second original");
+        assert_eq!(updates.try_recv().unwrap().event_id, "first");
+        assert!(updates.try_recv().is_err());
+    }
+
+    #[test]
+    fn io_audit_amendments_are_opt_in_and_have_no_billing_fields() {
+        let (tx, mut originals) = tokio::sync::mpsc::channel(4);
+        let sink = super::UsageSink::new(tx);
+        sink.try_amend_io("event-1".into(), audit());
+        assert!(originals.try_recv().is_err());
+        let (audit_tx, mut updates) = tokio::sync::mpsc::channel(4);
+        let sink = sink.with_io_audit_sender(audit_tx);
+        let original = super::UsageEvent {
+            event_id: "event-1".into(),
+            prompt_tokens: 41,
+            completion_tokens: 7,
+            ..Default::default()
+        };
+        sink.try_emit("test", original, crate::UsageEventLabels::default());
+        sink.try_amend_io("event-1".into(), audit());
+        let original = originals.try_recv().expect("one original usage");
+        let update = updates.try_recv().expect("one metadata update");
+        assert_eq!(
+            (original.prompt_tokens, original.completion_tokens),
+            (41, 7)
+        );
+        assert_eq!(update.event_id, original.event_id);
+        assert_eq!(update.io_audit, audit());
+        let wire = serde_json::to_value(&update).unwrap();
+        assert_eq!(wire.as_object().unwrap().len(), 3);
+        assert_eq!(wire["kind"], "io_audit_update");
+        for field in [
+            "prompt_tokens",
+            "completion_tokens",
+            "total_tokens",
+            "cost_usd",
+            "queued_at",
+        ] {
+            assert!(wire.get(field).is_none(), "metadata cannot carry {field}");
+        }
+        assert!(originals.try_recv().is_err());
+        assert!(updates.try_recv().is_err());
+    }
+
+    #[test]
+    fn inference_lifecycle_is_optional_and_uses_an_internal_operation_identity() {
+        use aisix_core::native_objects::InferenceStage;
+        let mut event = super::UsageEvent::default();
+        let legacy = serde_json::to_value(&event).unwrap();
+        assert!(legacy.get("inference_stage").is_none());
+        assert!(legacy.get("native_operation_id").is_none());
+        let operation = uuid::Uuid::new_v4();
+        event.native_operation_id = Some(operation);
+        event.request_id = "caller-may-repeat-this".into();
+        for (stage, expected) in [
+            (InferenceStage::Attempt, "attempt"),
+            (InferenceStage::Accepted, "accepted"),
+            (InferenceStage::Management, "management"),
+            (InferenceStage::Terminal, "terminal"),
+        ] {
+            event.inference_stage = Some(stage);
+            let wire = serde_json::to_value(&event).unwrap();
+            assert_eq!(wire["inference_stage"], expected);
+            assert_eq!(wire["native_operation_id"], operation.to_string());
+            assert_ne!(wire["native_operation_id"], wire["request_id"]);
+        }
+    }
+
+    #[test]
+    fn cache_presence_survives_zero_counter_serialization() {
+        let mut event = super::UsageEvent::default();
+        let absent = serde_json::to_value(&event).unwrap();
+        assert!(absent.get("cache_usage_reported").is_none());
+        for reported in [false, true] {
+            event.cache_usage_reported = Some(reported);
+            let wire = serde_json::to_value(&event).unwrap();
+            assert_eq!(wire["cache_usage_reported"], reported);
+            for field in [
+                "cached_prompt_tokens",
+                "cache_read_tokens",
+                "cache_creation_tokens",
+            ] {
+                assert!(wire.get(field).is_none(), "{wire}");
+            }
+        }
+        event.cached_prompt_tokens = 80;
+        let wire = serde_json::to_value(&event).unwrap();
+        assert_eq!(wire["cached_prompt_tokens"], 80);
+        assert!(wire.get("cache_read_tokens").is_none());
+    }
+
+    #[test]
+    fn dispatch_fact_distinguishes_unknown_from_explicit_false_and_true() {
+        let mut event = super::UsageEvent::default();
+        let unknown = serde_json::to_value(&event).unwrap();
+        assert!(unknown.get("upstream_dispatched").is_none());
+        for dispatched in [false, true] {
+            event.upstream_dispatched = Some(dispatched);
+            let known = serde_json::to_value(&event).unwrap();
+            assert_eq!(
+                known.get("upstream_dispatched"),
+                Some(&serde_json::json!(dispatched)),
+            );
+        }
+    }
+
     #[test]
     fn first_token_latency_distinguishes_unknown_from_reported_zero() {
         let mut event = super::UsageEvent::default();

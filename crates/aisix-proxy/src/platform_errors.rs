@@ -271,6 +271,7 @@ pub(crate) fn classify(err: &ProxyError) -> PlatformErrorClass {
 /// [`classify`] for an upstream-side failure.
 pub(crate) fn classify_bridge(err: &BridgeError) -> PlatformErrorClass {
     match err {
+        BridgeError::DependencyUnavailable => PlatformErrorClass::UpstreamUnavailable,
         BridgeError::UpstreamStatus {
             status,
             message,

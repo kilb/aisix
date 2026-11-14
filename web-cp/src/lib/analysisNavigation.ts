@@ -2,10 +2,10 @@ export function metricViewOf(value: string | null): "requests" | "latency" | "to
   return value === "latency" || value === "tokens" || value === "cache" || value === "cost" ? value : "requests";
 }
 
-/** 记录接口不支持时间筛选，不将分析时间写成已应用的过滤条件。 */
+/** 分析深链接与调用记录使用相同的服务端筛选；其他 URL 字段不扩大范围。 */
 export function chargesQuery(query: URLSearchParams): Record<string, string> {
   const filter: Record<string, string> = {};
-  for (const key of ["tenant_id", "api_key_id", "model_id", "error_code", "event_id"]) {
+  for (const key of ["tenant_id", "api_key_id", "model_id", "error_code", "event_id", "from", "to", "member_id", "provider_key_id", "request_id", "outcome", "http_status", "error_class", "cache_hit", "service_tier", "operation", "final_attempt"]) {
     const value = query.get(key);
     if (value) filter[key] = value;
   }

@@ -22,7 +22,7 @@ const UPSTREAM_MODEL: &str = "upstream-mdl-9f3";
 const UPSTREAM_ERROR: &str = "upstream secret 4b7";
 
 /// The keys of a `Call`, from the API section.
-const CALL_KEYS: [&str; 16] = [
+const CALL_KEYS: [&str; 21] = [
     "event_id",
     "occurred_at",
     "request_id",
@@ -38,6 +38,11 @@ const CALL_KEYS: [&str; 16] = [
     "latency_ms",
     "first_token_latency_ms",
     "attempt_duration_ms",
+    "usage",
+    "usage_estimated",
+    "usage_input_tokens",
+    "io_audit",
+    "io_token_reference",
     "charge",
 ];
 

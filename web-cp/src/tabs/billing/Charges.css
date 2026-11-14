@@ -1,0 +1,28 @@
+/* 窄屏按调用分组，模型与上游身份使用整行，避免挤成逐字竖排。 */
+@media (max-width: 899px) {
+  .charge-records .dt.charge-records-table { display: block; width: 100%; min-width: 0; }
+  .charge-records .dt.charge-records-table > thead { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  .charge-records .dt.charge-records-table > tbody { display: block; }
+  .charge-records .dt.charge-records-table > tbody > tr[data-finance-record] { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; padding: 20px 16px; border-bottom: 1px solid var(--border); }
+  .charge-records .dt.charge-records-table > tbody > tr[data-finance-record] > td[data-label] { display: block; width: auto; min-width: 0; height: auto; padding: 0; border: 0; text-align: left; }
+  .charge-records .dt.charge-records-table > tbody > tr[data-finance-record] > td::before { content: attr(data-label); display: block; margin-bottom: 6px; color: var(--muted-foreground); font-size: 12px; line-height: 18px; }
+  .charge-records .dt.charge-records-table > tbody > tr[data-finance-record] > td:is(:first-child, [data-label="服务 / 档位"], [data-label="用量"], .right) { grid-column: 1 / -1; }
+  .charge-records .dt.charge-records-table > tbody > tr[data-finance-record] > td:first-child > .font-medium { display: block; }
+  .charge-records .charge-records-table .cell-note { max-width: none; }
+  .charge-records .dt.charge-records-table > tbody > tr[data-finance-record] > td[data-label].right { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  .charge-records .dt.charge-records-table > tbody > tr[data-finance-record] > td.right::before { margin-bottom: 0; }
+  .charge-records .charge-records-table .finance-icon-button { width: 44px; min-width: 44px; min-height: 44px; padding-inline: 0; }
+  .charge-records .dt.charge-records-table > tbody > tr.dt-detail { display: block; }
+  .charge-records .dt.charge-records-table > tbody > tr.dt-detail > td { display: block; width: 100%; height: auto; min-height: 0; padding: 0 16px 20px; box-sizing: border-box; }
+  .charge-records .charge-quantities-table { display: block; width: 100%; }
+  .charge-records .charge-quantities-table > thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+  .charge-records .charge-quantities-table > tbody { display: block; }
+  .charge-records .charge-quantities-table > tbody > tr { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 16px; padding: 14px 0; border-bottom: 1px solid var(--border); }
+  .charge-records .charge-quantities-table > tbody > tr > td { display: block; width: auto; height: auto; padding: 0; border: 0; text-align: left; }
+  .charge-records .charge-quantities-table > tbody > tr > td:nth-child(n+3) { grid-column: 1 / -1; }
+  .charge-records .charge-quantities-table > tbody > tr > td::before { content: attr(data-label); display: block; margin-bottom: 5px; color: var(--muted-foreground); font-size: 12px; line-height: 18px; }
+}
+
+@media (min-width: 900px) {
+  .charge-records .finance-amount-value { white-space: nowrap; }
+}

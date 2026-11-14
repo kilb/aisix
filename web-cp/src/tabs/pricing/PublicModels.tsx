@@ -244,9 +244,7 @@ export function PublicModels({ canEdit, onGoto, initialSection, sectionVisit, re
         title="公共模型与路由"
         dataLead={live && unavailable ? <>当前有 {live.length.toLocaleString("zh-CN")} 个在用模型，其中 {unavailable.length.toLocaleString("zh-CN")} 个没有可用账号。先补齐账号映射，再核对基准价与服务分组换算率。</> : "读取完整模型列表后展示服务与定价状态。"}
         actions={
-          <Button type="button" icon="refresh" onClick={() => void load()}>
-            刷新
-          </Button>
+          <Button className="finance-icon-button" aria-label="刷新" title="刷新" type="button" icon="refresh" onClick={() => void load()}></Button>
         }
       />
       <p className="mb-6 max-w-3xl text-body text-ink-soft">租户请求的模型名。标识只生成一次，授权、基准价和分组换算率都跟着它，所以名称不改、也不接管已有模型；显示名重复时请直接使用已有模型。</p>
@@ -330,7 +328,7 @@ export function PublicModels({ canEdit, onGoto, initialSection, sectionVisit, re
             <RecordTableToolbar search={{ value: records.query, onChange: records.setQuery, label: "搜索公共模型", placeholder: "模型名称或 ID" }}>
               <label className="f filter"><span>模型状态</span><select value={modelState} onChange={(e) => setModelState(e.target.value)}><option value="">全部</option><option value="live">在用</option><option value="retired">已停用</option><option value="unavailable">在用但无可用账号</option></select></label>
             </RecordTableToolbar>
-            <DataTable label="公共模型" scroll>
+            <DataTable label="公共模型">
               <thead>
                 <tr>
                   <th>名称</th>
@@ -348,15 +346,15 @@ export function PublicModels({ canEdit, onGoto, initialSection, sectionVisit, re
                   const priced = prices === null ? null : pricedState(m, prices.get(m.id), liveGroups);
                   const retired = m.retired_at !== null;
                   return (
-                    <tr key={m.id} data-model={m.id}>
-                      <td>
+                    <tr data-finance-record key={m.id} data-model={m.id}>
+                      <td data-label="名称">
                         <button type="button" className="link-button" onClick={() => select(m.id)}>
                           {m.name}
                         </button>
                         <span className="pm-model-id cell-note mono">{m.id}</span>
                       </td>
-                      <td className={m.served_by.some((s) => s.enabled) ? undefined : "text-muted"}>{tiersOf(m)}</td>
-                      <td>
+                      <td data-label="服务账号" className={m.served_by.some((s) => s.enabled) ? undefined : "text-muted"}>{tiersOf(m)}</td>
+                      <td data-label="定价">
                         {retired ? (
                           "—"
                         ) : priced === null ? (
@@ -370,12 +368,12 @@ export function PublicModels({ canEdit, onGoto, initialSection, sectionVisit, re
                           </>
                         )}
                       </td>
-                      <td className="num">{m.reachable_tenants}</td>
-                      <td className="num">{m.reachable_keys}</td>
-                      <td>
+                      <td data-label="授权租户" className="num">{m.reachable_tenants}</td>
+                      <td data-label="密钥" className="num">{m.reachable_keys}</td>
+                      <td data-label="状态">
                         <Lamp state={retired ? "disabled" : "applied"}>{retired ? "已停用" : "在用"}</Lamp>
                       </td>
-                      <td className="right">
+                      <td data-label="操作" className="right">
                         {canEdit && retired && (
                           <TwoStep
                             label="恢复"

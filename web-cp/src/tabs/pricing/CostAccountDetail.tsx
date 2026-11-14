@@ -186,8 +186,8 @@ export function CostAccountDetail({
                     .join("、");
                   return (
                     <Fragment key={row.model_id}>
-                      <tr>
-                        <td className="font-medium">
+                      <tr data-finance-record>
+                        <td data-label="模型" className="font-medium">
                           <button
                             type="button"
                             className="cost-model-toggle"
@@ -205,18 +205,18 @@ export function CostAccountDetail({
                             <span>{row.name}</span>
                           </button>
                         </td>
-                        <td className="num">
+                        <td data-label="基准价 输入" className="num">
                           {!baseline ? <span className="grp-unpriced">未定价</span> : head?.input !== undefined ? <><span className="cost-price-amount">${head.input}</span><span className="cost-price-unit"> / 百万 tokens</span></> : "—"}
                         </td>
-                        <td className="num">
+                        <td data-label="基准价 输出" className="num">
                           {!baseline ? "—" : head?.output !== undefined ? <><span className="cost-price-amount">${head.output}</span><span className="cost-price-unit"> / 百万 tokens</span></> : "—"}
                         </td>
-                        <td className="num">
+                        <td data-label="成本换算率" className="num">
                           <span className={rate.label === "覆盖" ? "tag grp-override" : "tag"}>{rate.label}</span>{" "}
                           <span className="tabular">{rate.rate ?? "未设置"}</span>
                           {later && <span className="cell-note">待生效 {later}</span>}
                         </td>
-                        <td className="right">
+                        <td data-label="操作" className="right">
                           {canEdit && (
                             <span className="row-actions cost-model-actions">
                               <Button size="sm" onClick={() => setPicked({ modelId: row.model_id, name: row.name, mode: "override" })}>

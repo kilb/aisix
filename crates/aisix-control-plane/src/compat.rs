@@ -85,6 +85,9 @@ impl FieldFloor {
     }
 }
 
+// allowed_endpoints 的通用门槛与客户新增族共用发行版本，正式发布只固定这一处。
+const API_KEY_ENDPOINTS_SINCE: Since = Since::ThisRelease;
+
 /// Every field older gateways would misread in a way that opens what it
 /// closes, or that quietly withholds what it grants. A new field whose
 /// absence is fail-open on an older gateway gets a row here, and so does a
@@ -112,7 +115,7 @@ pub const FIELD_FLOORS: &[FieldFloor] = &[
         kind: Kind::ApiKeys,
         pointer: "/allowed_endpoints",
         trigger: Trigger::Present,
-        since: Since::ThisRelease,
+        since: API_KEY_ENDPOINTS_SINCE,
         widens: key_widens,
         why: "an older gateway ignores the field and lets the key call every endpoint",
     },
@@ -168,6 +171,52 @@ pub fn minimum(since: &Since, cp_version: &str) -> Option<Version> {
             GatewayVersion::Dev | GatewayVersion::Unrecognized => None,
         },
     }
+}
+
+// 开发构建单独核实真实标识，不改变通用 Dev 版本语义。
+fn supports_customer_endpoint_expansion(version: &str, cp_version: &str) -> bool {
+    if let (GatewayVersion::Release(version), Some(minimum)) = (
+        GatewayVersion::parse(version),
+        minimum(&API_KEY_ENDPOINTS_SINCE, cp_version),
+    ) {
+        return !version.cmp_precedence(&minimum).is_lt();
+    }
+    fn dev_sha(version: &str) -> Option<&str> {
+        version.strip_prefix("dev+sha-").filter(|sha| {
+            (7..=40).contains(&sha.len()) && sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+    }
+    dev_sha(cp_version).is_some_and(|sha| dev_sha(version) == Some(sha))
+}
+
+fn customer_endpoint_expansion(kind: Kind, doc: &Value, stored: &Value) -> bool {
+    let grants_expanded_family = |doc: &Value| {
+        doc.get("allowed_endpoints")
+            .and_then(Value::as_array)
+            .is_some_and(|families| {
+                families.iter().any(|family| {
+                    matches!(
+                        family.as_str(),
+                        Some(
+                            "images"
+                                | "audio"
+                                | "videos"
+                                | "rerank"
+                                | "decisions"
+                                | "realtime"
+                                | "files"
+                                | "batches"
+                                | "fine_tuning"
+                                | "moderations"
+                                | "content_provenance_checks"
+                        )
+                    )
+                })
+            })
+    };
+    kind == Kind::ApiKeys
+        && grants_expanded_family(doc)
+        && (stored.is_null() || key_widens(stored, doc))
 }
 
 /// A floor some gateways do not meet: `below` release gateways are older
@@ -439,6 +488,7 @@ fn too_old(pointer: &str, message: String) -> ApiError {
 /// has been incomplete within that window. With no gateway registered the
 /// write passes. A write that sets no floored field, or only fields whose
 /// minimum this control plane cannot judge, reads nothing.
+/// 客户新增族扩权不适用上述不读库约定，必须另外核实真实构建支持。
 pub async fn gate(
     conn: &mut PgConnection,
     ctx: &WriteCtx,
@@ -446,19 +496,36 @@ pub async fn gate(
     doc: &Value,
     stored: &Value,
 ) -> Result<(), ApiError> {
+    let customer_expansion = customer_endpoint_expansion(kind, doc, stored);
     let floors: Vec<(&FieldFloor, Version)> = newly_triggered(FIELD_FLOORS, kind, doc, stored)
         .into_iter()
         .filter_map(|f| minimum(&f.since, &ctx.cp_version).map(|m| (f, m)))
         .collect();
-    let Some((first, first_minimum)) = floors.first() else {
+    let first = floors.first();
+    if first.is_none() && !customer_expansion {
         return Ok(());
-    };
+    }
     let versions: Vec<String> = sqlx::query_scalar(&format!(
         "SELECT version FROM dp_instances WHERE last_seen_at > now() - {FLEET_WINDOW}"
     ))
     .fetch_all(&mut *conn)
     .await
     .map_err(DbError::from)?;
+    if customer_expansion {
+        let unsupported = versions
+            .iter()
+            .filter(|version| !supports_customer_endpoint_expansion(version, &ctx.cp_version))
+            .count();
+        if unsupported > 0 {
+            return Err(too_old(
+                "/allowed_endpoints",
+                format!(
+                    "客户接口扩展需要全部网关满足接口隔离版本，或与控制面使用相同的已标记开发构建；\
+                     当前有 {unsupported} 个实例无法确认支持"
+                ),
+            ));
+        }
+    }
     let fleet: Vec<GatewayVersion> = versions
         .iter()
         .map(|version| GatewayVersion::parse(version))
@@ -474,13 +541,38 @@ pub async fn gate(
     .await
     .map_err(DbError::from)?;
     if capped {
-        return Err(too_old(
-            first.pointer,
-            format!(
-                "需要网关版本 ≥ {first_minimum}；24 小时内有网关凭据达到实例上限，\
+        let (pointer, message) = if let Some((first, first_minimum)) = first {
+            (
+                first.pointer,
+                format!(
+                    "需要网关版本 ≥ {first_minimum}；24 小时内有网关凭据达到实例上限，\
                  部分网关实例未被记录，无法确认全部网关实例的版本"
-            ),
-        ));
+                ),
+            )
+        } else {
+            (
+                "/allowed_endpoints",
+                "24 小时内有网关凭据达到实例上限，无法确认全部网关支持客户接口扩展".to_string(),
+            )
+        };
+        return Err(too_old(pointer, message));
+    }
+    if customer_expansion {
+        // 旧逻辑可无标记淘汰 Dev 实例；满额清单不能证明未遗漏旧构建。
+        // 保留全部行判断，直到正常清理降到上限以下，不能仅统计最近 24 小时。
+        let full: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM dp_instances GROUP BY dp_id HAVING count(*) >= $1)",
+        )
+        .bind(crate::dp::heartbeat::MAX_INSTANCES)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(DbError::from)?;
+        if full {
+            return Err(too_old(
+                "/allowed_endpoints",
+                "网关凭据的实例记录已达上限，无法确认全部网关支持客户接口扩展".to_string(),
+            ));
+        }
     }
     Ok(())
 }

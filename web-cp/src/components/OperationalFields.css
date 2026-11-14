@@ -1,0 +1,31 @@
+/* 专用复合字段仍沿用 label / control / helper / error 的同一层级。 */
+.operational-field { min-width: 0; margin-bottom: 20px; }
+.operational-field > .hint { margin-top: 6px; line-height: 20px; }
+.operational-field > .field-problem { margin-top: 6px; line-height: 20px; }
+.operational-secret > label { gap: 8px; }
+.operational-secret .secret {
+  min-height: 44px;
+  border-radius: 8px;
+  background: var(--well);
+}
+.operational-secret .secret-undo { margin-top: 4px; margin-bottom: 0; }
+.operational-tags .tags { gap: 8px; }
+.operational-tags .tags li {
+  max-width: 100%;
+  min-height: 44px;
+  border-radius: 8px;
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 20px;
+  overflow-wrap: anywhere;
+}
+.operational-tags .tag-add { width: 100%; gap: 8px; margin-top: 8px; }
+.operational-tags .tag-add > input { min-width: 0; }
+.json-editor { min-width: 0; }
+.json-editor > textarea { border-radius: 8px; tab-size: 2; }
+.json-editor .json-problems { border-radius: 8px; overflow-wrap: anywhere; }
+.json-editor .json-problems li + li { margin-top: 8px; }
+.json-editor .json-path { box-decoration-break: clone; }
+@media (max-width: 539px) {
+  .json-editor > textarea { min-height: 280px; }
+}

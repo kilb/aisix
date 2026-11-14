@@ -1,4 +1,4 @@
-import { Check, CircleHelp, LoaderCircle, Play, Square } from "lucide-react";
+import { Check, CircleHelp, LoaderCircle, Play, RefreshCw, Square } from "lucide-react";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import {
   directProbeTargets,
@@ -23,7 +23,7 @@ import { latestProbeHistory, listProbeHistory } from "../lib/directModelProbeApi
 import { fmtBeijing, beijingRange } from "../lib/time";
 import { RecordTableToolbar, RecordTablePager, type RecordPageSize } from "../ui/RecordTable";
 import { Button } from "../ui/Button";
-import { DataTable, Loading } from "../ui/DataTable";
+import { OperationalTable as DataTable, Loading } from "./OperationalTable";
 import { Card, CardHeader, Metric } from "./page";
 import "./DirectModelProbe.css";
 
@@ -203,26 +203,27 @@ export function DirectModelProbe({ models, accounts, loadError, canProbe, probe,
           <progress className="direct-probe-bar" max={Math.max(1, displayed.length)} value={completed} aria-label={`本轮已完成 ${completed} 个，共 ${displayed.length} 个模型`} />
           {historyError && <p className="note crit" role="alert">已保存结果读取失败，请刷新记录后重试；这不代表模型未测试。</p>}
           <RecordTableToolbar search={{ value: search, onChange: (value) => { setSearch(value); setResultPage(1); }, label: "筛选最近测试结果", placeholder: "搜索模型、上游账号或上游模型" }}>
-            <Button type="button" onClick={() => { setRows(null); setHistoryRevision((previous) => previous + 1); }} disabled={running}>刷新记录</Button>
+            <Button type="button" className="ops-icon-button" aria-label="刷新记录" title="刷新测试记录" onClick={() => { setRows(null); setHistoryRevision((previous) => previous + 1); }} disabled={running}><RefreshCw aria-hidden /></Button>
           </RecordTableToolbar>
           {displayed.length === 0 ? <p className="direct-probe-empty">当前没有直连模型。</p> : (
             <DataTable label={rows ? "本次直连模型测试结果" : "最近已保存测试结果"} scroll>
               <thead><tr>
-                <th>直连模型 / 上游账号</th><th>基础状态</th><th className="num">基础首字延迟</th><th className="num">基础总耗时</th>
-                <th className="num">基础输入 / 输出 tokens</th><th className="num">基础端到端速率</th><th>能力抽测</th><th>基础结果说明</th><th>记录 / 配置</th>
+                <th>直连模型 / 上游账号</th><th>基础性能</th><th>能力抽测</th><th>基础结果说明</th><th>记录 / 配置</th>
               </tr></thead>
               <tbody>{visibleRows.map(({ target, status, result, error, history }) => {
                 const measurements = probeMeasurements(result);
                 return <tr key={target.id}>
-                  <td className="direct-probe-model"><strong>{target.name}</strong><span>{target.account || "—"}</span><code>{target.upstream || target.id}</code></td>
-                  <td><span className="direct-probe-status" data-status={status}>
+                  <td className="direct-probe-model"><strong>{target.name}</strong><span>{target.account || "—"}</span><code>{target.upstream || target.id}</code>
+                  <span className="direct-probe-status" data-status={status}>
                     {status === "running" ? <LoaderCircle className="animate-spin motion-reduce:animate-none" aria-hidden /> : status === "available" ? <Check aria-hidden /> : <CircleHelp aria-hidden />}
                     {STATUS_LABEL[status]}
                   </span></td>
-                  <td className="num">{measurements.ttft}</td>
-                  <td className="num">{measurements.duration}</td>
-                  <td className="num">{tokens(result?.usage?.input_tokens)} / {tokens(result?.usage?.output_tokens)}</td>
-                  <td className="num">{measurements.rate}</td>
+                  <td><dl className="ops-cell-facts">
+                    <div><dt>基础首字延迟</dt><dd>{measurements.ttft}</dd></div>
+                    <div><dt>基础总耗时</dt><dd>{measurements.duration}</dd></div>
+                    <div><dt>基础输入 / 输出 tokens</dt><dd>{tokens(result?.usage?.input_tokens)} / {tokens(result?.usage?.output_tokens)}</dd></div>
+                    <div><dt>基础端到端速率</dt><dd>{measurements.rate}</dd></div>
+                  </dl></td>
                   <td className="direct-probe-capability">
                     <CapabilityResult
                       capability={result?.capability_check ?? null}

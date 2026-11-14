@@ -2,31 +2,32 @@
 // this file, pinned by web-tenant/src/lib/tokenParity.test.ts; change both
 // together. The contract is in CONTRACT.md beside it.
 import type { ReactNode } from "react";
+import { cn } from "../lib/cn";
 import "./record-table.css";
 
 /**
- * 表头44px、普通行至少56px、compact至少48px，容纳44px操作控件；
- * 灰色 mono 标签与中性 hover，无斑马条纹。
- * Numbers sit right-aligned in tabular figures (`className="num"` on the
- * cell and its header), as do a row's actions (`"right"`). The children
- * are its `thead` and `tbody`. It scrolls sideways inside its own box when
- * the screen is narrower than its columns; `scroll` also gives a long list
- * its own vertical scroll area, so the header stays in view.
+ * 表头44px、数据行至少48px，行内操作保留44px命中区。
+ * 名称与说明可换行，数字和操作各自对齐；必要的横向滚动只发生在表格区域。
+ * 分页记录自然撑开页面；scroll 保留旧调用接口，不限制内容高度。
  */
 export function DataTable({
   label,
   compact = false,
   scroll = false,
+  className,
+  tableClassName,
   children,
 }: {
   label?: string;
   compact?: boolean;
   scroll?: boolean;
+  className?: string;
+  tableClassName?: string;
   children: ReactNode;
 }) {
   return (
-    <div className={scroll ? "dt-wrap dt-scroll" : "dt-wrap"} role="region" aria-label={label ? `${label}表格滚动区域` : "表格滚动区域"} tabIndex={0}>
-      <table className={compact ? "dt dt-compact" : "dt"} aria-label={label}>
+    <div className={cn("dt-wrap", scroll && "dt-scroll", className)} role="region" aria-label={label ? `${label}表格滚动区域` : "表格滚动区域"} tabIndex={0}>
+      <table className={cn("dt", compact && "dt-compact", tableClassName)} aria-label={label}>
         {children}
       </table>
     </div>
@@ -46,7 +47,7 @@ const WIDTHS = [
  */
 export function Loading() {
   return (
-    <div className="loading">
+    <div className="loading" role="status">
       <div className="skeleton" aria-hidden="true">
         {WIDTHS.map((row, i) => (
           <span key={i}>

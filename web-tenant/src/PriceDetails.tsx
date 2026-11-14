@@ -55,12 +55,12 @@ function TierPrices({ name, tier }: { name: string; tier: TierQuote }) {
       <h4 id={heading} className="text-stat font-medium">{tierName}</h4>
       <p className="text-caption text-muted">组织实际单价（已含优惠）</p>
     </header>
-    <div className="price-matrix-scroll" role="region" aria-label={`${tierName}档完整模型单价，可横向滚动`} tabIndex={0}>
-      <table className="price-matrix" aria-label="完整模型单价" style={{ minWidth: `${20 + columns.length * 12}rem` }}>
+    <div className="price-matrix-scroll" role="region" aria-label={`${tierName}档完整模型单价`}>
+      <table className="price-matrix" role="table" aria-label="完整模型单价">
         <colgroup>
           <col className="price-item-column" />
           <col className="price-unit-column" />
-          {columns.map((_, index) => <col key={index} className="price-amount-column" />)}
+          {columns.map((_, index) => <col key={index} className="price-amount-column" style={{ width: `${64 / columns.length}%` }} />)}
         </colgroup>
         <thead><tr>
           <th scope="col">计费项目</th>
@@ -76,7 +76,9 @@ function TierPrices({ name, tier }: { name: string; tier: TierQuote }) {
             return <tr key={dimension}>
               <th scope="row" className="price-item">{dimensionLabels[dimension]}</th>
               <td className="price-unit">{unit === "request" ? "元/千次" : "元/百万 token"}</td>
-              {rates.map((rate, index) => <td key={index} className="price-amount"><PriceRateValue rate={rate} /></td>)}
+              {rates.map((rate, index) => <td key={index} className="price-amount" data-band={columns[index]!.label} data-range={columns[index]!.above === undefined
+                ? columns[index]!.through === undefined ? "全部输入长度" : `输入 ≤ ${columns[index]!.through!.toLocaleString("en-US")} token`
+                : `输入 > ${columns[index]!.above!.toLocaleString("en-US")} token${columns[index]!.through === undefined ? "" : `，且 ≤ ${columns[index]!.through!.toLocaleString("en-US")} token`}`}><PriceRateValue rate={rate} /></td>)}
             </tr>;
           })}
         </tbody>)}
@@ -87,7 +89,7 @@ function TierPrices({ name, tier }: { name: string; tier: TierQuote }) {
 
 export function PriceDetails({ tiers }: { tiers: Record<string, TierQuote> }) {
   return <div className="price-details">
-    <p className="text-caption text-muted">长上下文按包含缓存、音频和图像的整个输入 token 数选择价格列，整次请求使用本段价格。回退价格仅说明计费规则，不代表模型支持该模态。窄屏可在表内横向滚动查看价格。</p>
+    <p className="text-caption text-muted">长上下文按包含缓存、音频和图像的整个输入 token 数选择价格列，整次请求使用本段价格。回退价格仅说明计费规则，不代表模型支持该模态。窄屏按计费项目逐项显示各上下文段的价格。</p>
     {Object.entries(tiers).sort(([a], [b]) => a === "default" ? -1 : b === "default" ? 1 : a.localeCompare(b))
       .map(([name, tier]) => <TierPrices key={name} name={name} tier={tier} />)}
   </div>;

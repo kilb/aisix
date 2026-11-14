@@ -1,3 +1,5 @@
+import type { UsageAuditData } from "./usageIoAudit";
+import type { UsageRecordApiFilters } from "./usageRecordFilters";
 /**
  * A thin client for the control plane's operator API (`/admin/*`).
  *
@@ -996,7 +998,7 @@ export async function deleteOrgQuota(tenantId: string, id: string): Promise<void
 export type { ChargeLine, ReportedUsage } from "./chargeUsage";
 import type { ChargeLine, ReportedUsage } from "./chargeUsage";
 
-export interface Charge {
+export interface Charge extends UsageAuditData {
   seq: number;
   event_id: string;
   tenant_id: string;
@@ -1026,6 +1028,8 @@ export interface Charge {
   model_name: string | null;
   /** Whether the model the charge names by id no longer exists. */
   model_deleted: boolean;
+  /** 调用操作；兼容尚未返回该字段的控制面和未报告操作的旧记录。 */
+  operation?: string | null;
   /** The call's HTTP status; `null` when its usage row records none. */
   status_code: number | null;
   /** The failed attempt's error class; `null` for a success. */
@@ -1053,7 +1057,12 @@ export interface Charge {
   usage: ReportedUsage | null;
 }
 
-export interface ChargeFilter {
+export interface ChargeFilter extends UsageRecordApiFilters {
+  from?: string;
+  to?: string;
+  member_id?: string;
+  provider_key_id?: string;
+  request_id?: string;
   status?: string;
   /** Every status but this one. */
   exclude_status?: string;

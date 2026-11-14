@@ -1,3 +1,4 @@
+import "./FinanceWorkspace.css";
 import type { TabProps } from "../App";
 import { SectionHost, type Section } from "../components/SectionHost";
 import { Groups } from "./pricing/Groups";
@@ -21,5 +22,5 @@ export const SECTIONS: Section[] = [{ id: "groups", label: "分组", Component: 
 ];
 
 export function Pricing(props: TabProps) {
-  return <div className="pricing-workspace"><SectionHost label="价格" sections={SECTIONS} {...props} /></div>;
+  return <div className="finance-workspace pricing-workspace"><SectionHost label="价格" sections={SECTIONS} {...props} /></div>;
 }

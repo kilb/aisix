@@ -45,6 +45,7 @@ pub mod upstream_dial;
 pub mod upstream_error_scrub;
 pub mod upstream_headers;
 pub mod upstream_http;
+pub mod upstream_io;
 pub mod upstream_tls;
 pub mod url_cache;
 

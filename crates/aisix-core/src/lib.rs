@@ -27,11 +27,13 @@ pub mod host;
 pub mod log_value;
 pub mod mcp_openapi;
 pub mod models;
+pub mod native_objects;
 pub mod resource;
 pub mod sched;
 pub mod similarity;
 pub mod snapshot;
 pub mod url_redact;
+pub mod usage_io;
 pub mod version;
 pub mod wildcard;
 

@@ -65,7 +65,8 @@ pub use trace::{
 };
 pub use usage::{
     bounded_inbound_protocol, GatewayEmbeddingCall, GatewayEmbeddingOutcome,
-    GatewayEmbeddingPurpose, GatewayEmbeddingUsageSource, UsageEvent, UsageSink,
+    GatewayEmbeddingPurpose, GatewayEmbeddingUsageSource, UsageEvent, UsageIoAuditUpdate,
+    UsageSink,
 };
 pub use usage_delivery::UsageDeliveryHealth;
 

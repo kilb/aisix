@@ -235,6 +235,22 @@ mod tests {
     }
 
     #[test]
+    fn compat_sent_short_credentials_are_scrubbed_without_masking_unsent_values() {
+        assert_eq!(
+            with_sent(&["az-key"], || scrub_upstream_error_text("invalid az-key")),
+            format!("invalid {REDACTED}")
+        );
+        assert_eq!(
+            with_sent(&[], || scrub_upstream_error_text("invalid az-key")),
+            "invalid az-key"
+        );
+        assert_eq!(
+            with_sent(&["", "   "], || scrub_upstream_error_text("invalid prompt")),
+            "invalid prompt"
+        );
+    }
+
+    #[test]
     fn a_credential_sent_on_this_request_is_taken_out_whatever_its_shape() {
         const KEY: &str = "plainkey0Z9Y8X7W6V5U4T3S";
         let echoed = format!("Upstream saw Authorization: Bearer {KEY}, x-api-key: {KEY}.");

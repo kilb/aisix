@@ -1,3 +1,4 @@
+import "./operations.css";
 import { auditSearchText } from "../lib/operationalRecords";
 import { useRecordTable } from "../lib/recordTable";
 import { RecordTools, RecordPager } from "../components/RecordTools";
@@ -7,7 +8,7 @@ import { audit, tenants as tenantsApi, type AuditEntry, type Tenant } from "../l
 import { redacted } from "../lib/auditDetail";
 import { errorText, fmtInt, fmtTime } from "../lib/fmt";
 import { Button } from "../ui/Button";
-import { DataTable, Loading } from "../ui/DataTable";
+import { OperationalTable as DataTable, Loading } from "../components/OperationalTable";
 import { EmptyState } from "../ui/EmptyState";
 import {
   BentoGrid,
@@ -68,7 +69,7 @@ function DetailSummary({ detail }: { detail: unknown }) {
   const entries = Object.entries(shown);
   if (entries.length === 0) return <span className="hint">—</span>;
   return (
-    <span className="audit-detail min-w-[22ch] max-w-[72ch]">
+    <span className="audit-detail">
       {entries.map(([k, v]) => (
         <span key={k} className="audit-field">
           <span className="lab">{k}</span> {valueText(v)}
@@ -160,7 +161,7 @@ export function Audit(_: TabProps) {
 
   // 桌面和平板：范围 6 + 对象分布 6；筛选与完整记录 12。
   return (
-    <>
+    <div className="cp-operations cp-audit">
       <PageHeader
         title="审计日志"
         eyebrow="变更追踪 · 当前筛选结果"
@@ -169,35 +170,32 @@ export function Audit(_: TabProps) {
           : <>当前已加载 {fmtInt(rows.length)} 条记录，{next === null ? "已到当前筛选结果末尾。" : "更早的记录可继续加载。"}</>}
         description="每一项变更都与它的审计记录在同一事务里写入，最新的在前。详情只列字段名和非机密的值。"
         actions={
-          <Button type="button" onClick={() => void loadFirst(filter)}>
-            <RefreshCw aria-hidden />
-            刷新
-          </Button>
+          <Button type="button" className="ops-icon-button" aria-label="刷新" title="刷新审计日志" onClick={() => void loadFirst(filter)}><RefreshCw aria-hidden /></Button>
         }
       />
       <BentoGrid>
-        <Card tone="inverse" className={span.d6}>
+        <Card className={`${span.d6} ops-snapshot`}>
           <CardHeader number={1} title="已加载记录 · 当前筛选" />
           {rows === null
             ? (error ? <CardMessage onRetry={() => void loadFirst(filter)}>审计记录读取失败。</CardMessage> : <MetricSkeleton />)
             : <Metric size="hero">{fmtInt(rows.length)}</Metric>}
           <CardFooter>
-            <p className="text-caption text-on-inverse-muted">{rows === null ? "读取记录后显示当前范围。" : next === null ? "已加载当前筛选下的全部记录。" : "当前为部分记录，不能代表全部审计量。"}</p>
+            <p className="text-caption text-muted">{rows === null ? "读取记录后显示当前范围。" : next === null ? "已加载当前筛选下的全部记录。" : "当前为部分记录，不能代表全部审计量。"}</p>
             {newest !== null && oldest !== null && (
-              <dl className="mt-4 grid gap-4 border-t border-surface/12 pt-4 tablet:grid-cols-2">
+              <dl className="mt-4 grid gap-4 border-t border-line pt-4 tablet:grid-cols-2">
                 <div>
-                  <dt className="font-mono text-micro text-on-inverse-muted">本次加载 · 最新</dt>
+                  <dt className="text-caption text-muted">本次加载 · 最新</dt>
                   <dd className="mt-2 text-caption"><time dateTime={newest.at}>{fmtTime(newest.at)}</time></dd>
                 </div>
                 <div>
-                  <dt className="font-mono text-micro text-on-inverse-muted">本次加载 · 最早</dt>
+                  <dt className="text-caption text-muted">本次加载 · 最早</dt>
                   <dd className="mt-2 text-caption"><time dateTime={oldest.at}>{fmtTime(oldest.at)}</time></dd>
                 </div>
               </dl>
             )}
           </CardFooter>
         </Card>
-        <Card className={span.d6}>
+        <Card className={`${span.d6} ops-snapshot`}>
           <CardHeader number={2} title="对象类型 · 已加载记录前五" description="仅汇总当前已加载记录；不包含尚未读取的更早记录。" />
           <CardFooter>
             {rows === null ? (error
@@ -248,8 +246,7 @@ export function Audit(_: TabProps) {
               <DataTable scroll label="审计日志">
                 <thead>
                   <tr>
-                    <th className="num">编号</th>
-                    <th>时间</th>
+                    <th>时间 / 编号</th>
                     <th>操作者</th>
                     <th>动作</th>
                     <th>对象</th>
@@ -260,15 +257,14 @@ export function Audit(_: TabProps) {
                 <tbody>
                   {table.rows.map((r) => (
                     <tr key={r.id}>
-                      <td className="num text-muted-foreground">{r.id}</td>
                       <td className="whitespace-normal text-muted-foreground" title={fmtTime(r.at)}>
                         {fmtTime(r.at)}
+                        <span className="ops-cell-secondary">#{r.id}</span>
                       </td>
                       <td className="whitespace-normal">
-                        <span className="whitespace-nowrap">{r.actor.email ?? ""}</span>
+                        <span className="ops-cell-main">{r.actor.email ?? ""}</span>
                         {ACTOR_KIND[r.actor.kind] && (
-                          <span className="hint whitespace-nowrap">
-                            {r.actor.email ? " · " : ""}
+                          <span className="ops-cell-secondary">
                             {ACTOR_KIND[r.actor.kind]}
                           </span>
                         )}
@@ -300,6 +296,6 @@ export function Audit(_: TabProps) {
 
         </Card>
       </BentoGrid>
-    </>
+    </div>
   );
 }

@@ -340,7 +340,7 @@ const UNOWNED_SEAL: &str = "-";
 /// seals them: its own, or [`UNOWNED_SEAL`] for a key without one on a provider
 /// key that owned keys reach. `None` mints unsealed ids, as a single-tenant
 /// provider key always has.
-fn owner_seal<'a>(
+pub(crate) fn owner_seal<'a>(
     auth: &AuthenticatedKey,
     snapshot: &aisix_core::AisixSnapshot,
     target: &'a JobTarget,
@@ -393,11 +393,11 @@ pub(crate) struct JobTarget {
     /// because it OVERWRITES its slots while `extra_headers` merges with
     /// skip-if-present — a forwarded credential is meant to displace the
     /// gateway's own.
-    forwarded_client: aisix_gateway::ForwardedClientHeaders,
+    pub(crate) forwarded_client: aisix_gateway::ForwardedClientHeaders,
 }
 
 impl JobTarget {
-    fn display_name(&self) -> &str {
+    pub(crate) fn display_name(&self) -> &str {
         &self.model_entry.value.display_name
     }
     fn provider_label(&self) -> &str {
@@ -561,7 +561,11 @@ pub(crate) fn resolve_target(
 ///
 /// `query` is the pre-filtered client query string to forward (routing
 /// hints already removed).
-fn upstream_url(target: &JobTarget, path: &str, query: &str) -> Result<String, ProxyError> {
+pub(crate) fn upstream_url(
+    target: &JobTarget,
+    path: &str,
+    query: &str,
+) -> Result<String, ProxyError> {
     match target.adapter {
         Adapter::Openai => {
             let base = crate::dispatch::resolve_base_url(&target.pk_entry.value)?;
@@ -608,20 +612,49 @@ fn upstream_url(target: &JobTarget, path: &str, query: &str) -> Result<String, P
     }
 }
 
-/// Client query pairs forwarded upstream — routing hints are gateway-only.
-fn forwardable_query(raw_query: Option<&str>) -> String {
-    raw_query
-        .unwrap_or("")
-        .split('&')
-        .filter(|pair| {
-            let key = pair.split('=').next().unwrap_or("");
-            !pair.is_empty() && key != "model" && key != "provider"
-        })
-        .collect::<Vec<_>>()
-        .join("&")
+/// 只改正式游标与网关路由参数，其余 query 对保持原字节和顺序。
+fn forwardable_query(
+    raw_query: Option<&str>,
+    auth: &AuthenticatedKey,
+    snapshot: &aisix_core::AisixSnapshot,
+    target: &JobTarget,
+) -> Result<String, ProxyError> {
+    let mut pairs = Vec::new();
+    for pair in raw_query.unwrap_or("").split('&').filter(|p| !p.is_empty()) {
+        let Some((key, value)) = url::form_urlencoded::parse(pair.as_bytes()).next() else {
+            continue;
+        };
+        if key == "model" || key == "provider" {
+            continue;
+        }
+        if key != "after" {
+            pairs.push(pair.to_string());
+            continue;
+        }
+        let routed = decode_routed_id(&value);
+        if value.starts_with(ROUTED_ID_PREFIX) && routed.is_none() {
+            return Err(ProxyError::JobResourceNotFound(value.into_owned()));
+        }
+        let raw = routed.as_ref().map_or(value.as_ref(), |id| id.raw.as_str());
+        if routed
+            .as_ref()
+            .is_some_and(|id| id.model != target.display_name())
+        {
+            return Err(ProxyError::JobResourceNotFound(raw.to_string()));
+        }
+        require_job_owner(auth, snapshot, target, raw, routed.as_ref())?;
+        pairs.push(if routed.is_some() {
+            url::form_urlencoded::Serializer::new(String::new())
+                .append_pair("after", raw)
+                .finish()
+        } else {
+            pair.to_string()
+        });
+    }
+    Ok(pairs.join("&"))
 }
 
-enum UpstreamBody {
+pub(crate) enum UpstreamBody {
     Empty,
     Json(Bytes),
     Multipart(reqwest::multipart::Form),
@@ -629,11 +662,12 @@ enum UpstreamBody {
 
 /// One upstream request with per-adapter auth and the operator and client
 /// headers, so every round-trip on this surface sends the same set (#1112).
-fn upstream_request(
+pub(crate) fn upstream_request(
     target: &JobTarget,
     method: reqwest::Method,
     url: &str,
     request_id: &str,
+    rebuilds_body: bool,
 ) -> reqwest::RequestBuilder {
     let client =
         crate::http_client::client_for(target.pk_entry.value.upstream_connection().as_ref());
@@ -665,6 +699,11 @@ fn upstream_request(
     // credential into the slot the gateway just filled is choosing it over
     // the gateway's, and the upstream must receive exactly one.
     target.forwarded_client.apply(&mut headers);
+    if rebuilds_body {
+        // 表示头属于最终请求体；multipart 必须用实际 boundary，JSON 也不能沿用旧长度。
+        headers.remove(header::CONTENT_TYPE);
+        headers.remove(header::CONTENT_LENGTH);
+    }
 
     client.request(method, url).headers(headers)
 }
@@ -686,6 +725,7 @@ async fn send_upstream(
             .map_err(|_| ProxyError::InvalidRequest("unsupported method".into()))?,
         url,
         request_id,
+        !matches!(&body, UpstreamBody::Empty),
     );
 
     builder = match body {
@@ -704,7 +744,9 @@ async fn send_upstream(
     }
 
     crate::attribution::note_upstream_wait_begin();
-    let sent = builder.send().await;
+    let sent =
+        aisix_gateway::upstream_io::send(builder, aisix_gateway::upstream_io::Protocol::Unknown)
+            .await;
     if sent.is_err() {
         crate::attribution::note_upstream_wait_end(false);
     }
@@ -843,7 +885,7 @@ fn inspection_text(blob: &[u8]) -> String {
 }
 
 /// 按这个目标模型的限流预留一次请求：这条面上每个转发都要占的那一格。
-async fn reserve_target(
+pub(crate) async fn reserve_target(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
@@ -887,7 +929,7 @@ async fn reserve_before_costly_scan(
 /// Run the resolved input-guardrail chain over an opaque blob (whole-body
 /// lossy text scan — the `/passthrough` precedent from #911 [6]).
 #[allow(clippy::too_many_arguments)]
-async fn scan_input_blob(
+pub(crate) async fn scan_input_blob(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
@@ -933,12 +975,16 @@ async fn scan_input_blob(
         target.display_name(),
         vec![aisix_gateway::ChatMessage::user(inspection_text(blob))],
     );
-    let (verdict, hits) =
-        aisix_guardrails::Guardrail::check_input_unmaskable_observed(&chain, &chat).await;
+    let (verdict, hits) = if redactions.is_some() {
+        aisix_guardrails::Guardrail::check_input_observed(&chain, &chat).await
+    } else {
+        aisix_guardrails::Guardrail::check_input_unmaskable_observed(&chain, &chat).await
+    };
     monitor_hits.extend(hits);
     let failed_open = verdict.is_bypass();
     // Drained BEFORE the block branch: a `blocked` hit is exactly the one
     // that leaves through `Err`, and the caller's `?` would drop it.
+    let hit_start = enforced_hits.len();
     enforced_hits.extend(chain.enforced_hits());
     scores.extend(chain.scores());
     if bypass.is_empty() {
@@ -988,50 +1034,56 @@ async fn scan_input_blob(
     if !aisix_guardrails::Guardrail::redacts_input(&chain) {
         return Ok(None);
     }
-    // 改写是在文本 span 上做替换，所以 blob 得能按 UTF-8 读回来。把 lossy
-    // 转换的结果写回去会毁掉一个非文本上传 —— 那种 blob 只查不改。
-    let Ok(text) = std::str::from_utf8(blob) else {
-        // 可也不能因此不经遮蔽就转发：一个 0xFF 字节就能让一整份 PII 原样过
-        // 去。遮蔽规则在审查读的文本里有任何命中，就拒绝上传。
-        if aisix_guardrails::Guardrail::redact_input_text(&chain, &inspection_text(blob)).is_some()
+    let result = (|| {
+        // 改写是在文本 span 上做替换，所以 blob 得能按 UTF-8 读回来。把 lossy
+        // 转换的结果写回去会毁掉一个非文本上传 —— 那种 blob 只查不改。
+        let Ok(text) = std::str::from_utf8(blob) else {
+            // 可也不能因此不经遮蔽就转发：一个 0xFF 字节就能让一整份 PII 原样过
+            // 去。遮蔽规则在审查读的文本里有任何命中，就拒绝上传。
+            if aisix_guardrails::Guardrail::redact_input_text(&chain, &inspection_text(blob))
+                .is_some()
+            {
+                return Err(crate::error::guardrail_block_error("request", None, None));
+            }
+            return Ok(None);
+        };
+        // 严格解析不了、却带转义的行，字符串改写不回去：遮蔽规则命中它们解码后的
+        // 内容就拒绝上传。
+        let unparsed = unparsed_escaped_literals(text);
+        if !unparsed.is_empty()
+            && aisix_guardrails::Guardrail::redact_input_text(&chain, &unparsed).is_some()
         {
             return Err(crate::error::guardrail_block_error("request", None, None));
         }
-        return Ok(None);
-    };
-    // 严格解析不了、却带转义的行，字符串改写不回去：遮蔽规则命中它们解码后的
-    // 内容就拒绝上传。
-    let unparsed = unparsed_escaped_literals(text);
-    if !unparsed.is_empty()
-        && aisix_guardrails::Guardrail::redact_input_text(&chain, &unparsed).is_some()
-    {
-        return Err(crate::error::guardrail_block_error("request", None, None));
-    }
-    // batch / 微调文件是 JSONL：逐行按请求内容改写，协议字段不动；协议字段
-    // 本身或对象的键命中 mask 规则时拒绝上传（与其它端点对结构字段的处理一致）。
-    // 有的行是 JSON 对象、有的行不是的文件也拒绝：两种改写方式都不对。
-    if let Some(r) = crate::redact::redact_jsonl_upload(&chain, text) {
-        if r.unrewritable {
-            return Err(crate::error::guardrail_block_error("request", None, None));
+        // batch / 微调文件是 JSONL：逐行按请求内容改写，协议字段不动；协议字段
+        // 本身或对象的键命中 mask 规则时拒绝上传（与其它端点对结构字段的处理一致）。
+        // 有的行是 JSON 对象、有的行不是的文件也拒绝：两种改写方式都不对。
+        if let Some(r) = crate::redact::redact_jsonl_upload(&chain, text) {
+            if r.unrewritable {
+                return Err(crate::error::guardrail_block_error("request", None, None));
+            }
+            // 转发的是逐行重新序列化、检查过的那份，改没改都一样（见
+            // `redact_jsonl_upload`）。
+            crate::redact::merge_counts(redactions, r.counts);
+            return Ok(Some(r.text.into_bytes()));
         }
-        // 转发的是逐行重新序列化、检查过的那份，改没改都一样（见
-        // `redact_jsonl_upload`）。
+        // 没有一行是 JSON 对象的文件是纯文本，没有协议字段，整段改写。
+        let Some(r) = aisix_guardrails::Guardrail::redact_input_text(&chain, text) else {
+            return Ok(None);
+        };
         crate::redact::merge_counts(redactions, r.counts);
-        return Ok(Some(r.text.into_bytes()));
-    }
-    // 没有一行是 JSON 对象的文件是纯文本，没有协议字段，整段改写。
-    let Some(r) = aisix_guardrails::Guardrail::redact_input_text(&chain, text) else {
-        return Ok(None);
-    };
-    crate::redact::merge_counts(redactions, r.counts);
-    Ok(Some(r.text.into_bytes()))
+        Ok(Some(r.text.into_bytes()))
+    })();
+    enforced_hits.truncate(hit_start);
+    enforced_hits.extend(chain.enforced_hits());
+    result
 }
 
 /// Run the resolved output-guardrail chain over an upstream body, as one
 /// synthetic assistant turn. The body is decoded best-effort and relayed
 /// as the provider sent it.
 #[allow(clippy::too_many_arguments)]
-async fn scan_output_blob(
+pub(crate) async fn scan_output_blob(
     state: &ProxyState,
     auth: &AuthenticatedKey,
     target: &JobTarget,
@@ -1064,6 +1116,7 @@ async fn scan_output_blob(
         *applied = chain.applied().to_vec();
     }
     let synth = aisix_gateway::ChatResponse {
+        native_envelope: None,
         logprobs: None,
         more_choices: Vec::new(),
         id: String::new(),
@@ -1129,7 +1182,7 @@ fn strip_gateway_markers(v: &mut Value) {
     }
 }
 
-fn rewrite_response_ids(v: &mut Value, model: &str, owner: Option<(&str, &str)>) {
+pub(crate) fn rewrite_response_ids(v: &mut Value, model: &str, owner: Option<(&str, &str)>) {
     strip_gateway_markers(v);
     let Some(obj) = v.as_object_mut() else { return };
     for field in ID_FIELDS {
@@ -1218,6 +1271,7 @@ fn emit_job_usage_event(
         upstream_latency_ms: crate::attempt::measured_ms(elapsed),
         downstream_latency_ms: crate::attempt::measured_ms(elapsed),
         inbound_protocol: "openai".to_string(),
+        inference_stage: Some(aisix_core::native_objects::InferenceStage::Management),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
         request_headers: client.request_headers.clone(),
@@ -1250,7 +1304,7 @@ fn emit_job_usage_event(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn emit_access_log(
+pub(crate) fn emit_access_log(
     method: &Method,
     path: &str,
     target: Option<&JobTarget>,
@@ -1313,6 +1367,7 @@ async fn finish(
     started: Instant,
     request_id: String,
     result: Result<(Response, JobTarget), ProxyError>,
+    resolved: Option<JobTarget>,
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     redactions: crate::redact::RedactionCounts,
     enforced_hits: Vec<aisix_core::GuardrailEnforcedHit>,
@@ -1393,12 +1448,18 @@ async fn finish(
             resp
         }
         Err(err) => {
+            let target = resolved.as_ref();
+            let attributed = crate::attribution::current().unwrap_or_default();
+            let pk_id = target
+                .map(|target| target.pk_entry.id.as_str())
+                .unwrap_or(&attributed.provider_key_id);
+            let pk = crate::usage_attr::ResolvedPk::resolve(snapshot, pk_id);
             let status = err.status().as_u16();
             crate::usage_attr::note_client_error(snapshot, &err);
             emit_access_log(
                 &method,
                 &path,
-                None,
+                target,
                 &auth.entry.id,
                 status,
                 elapsed,
@@ -1410,21 +1471,24 @@ async fn finish(
                 endpoint,
                 crate::request_metrics::Caller::new(auth),
                 crate::request_metrics::Upstream {
-                    provider: "",
-                    model: surface.handler,
+                    provider: target.map(JobTarget::provider_label).unwrap_or_default(),
+                    model: target
+                        .map(JobTarget::display_name)
+                        .unwrap_or(surface.handler),
+                    upstream_model: target
+                        .and_then(|target| target.model_entry.value.upstream_model())
+                        .unwrap_or_default(),
+                    pk: pk.labels(),
                     ..Default::default()
                 },
                 status,
                 crate::attempt::error_source(&err),
                 elapsed,
             );
-            crate::usage_attr::emit_error_usage_event(
-                state,
-                snapshot,
-                surface,
+            let mut event = crate::usage_attr::build_error_usage_event(
                 "openai",
                 &request_id,
-                "",
+                target.map(JobTarget::display_name).unwrap_or_default(),
                 &auth.entry.id,
                 status,
                 crate::usage_attr::EventError::of(&err),
@@ -1435,7 +1499,47 @@ async fn finish(
                 scores,
                 bypass,
             );
+            event.inference_stage = Some(aisix_core::native_objects::InferenceStage::Management);
+            if let Some(target) = target {
+                event.model_id = target.model_entry.id.clone();
+                event.requested_model_id = target.model_entry.id.clone();
+            }
+            crate::usage_attr::apply_pk_telemetry(&mut event, &pk);
+            crate::usage_attr::apply_caller_identity(&mut event, auth.jwt.as_ref(), &auth.caller());
+            let model =
+                crate::usage_attr::usage_event_model_label(snapshot, &event.requested_model)
+                    .into_owned();
+            crate::usage_attr::emit_prepared_usage_event(
+                state,
+                snapshot,
+                surface,
+                event,
+                crate::usage_attr::usage_event_labels(&model, &pk),
+                client.trace.as_ref(),
+            );
             err.into_response()
+        }
+    }
+}
+
+/// 仅中继原生协议需要的头，不传播凭据、账号信息或重写前的长度。
+pub(crate) fn relay_job_response_headers(
+    resp: &mut Response,
+    upstream: &HeaderMap,
+    status: StatusCode,
+) {
+    if resp.status() == status && matches!(status.as_u16(), 429 | 503) {
+        for name in ["retry-after", "retry-after-ms"] {
+            if let Some(value) = upstream.get(name) {
+                resp.headers_mut().insert(name, value.clone());
+            }
+        }
+    }
+    if !crate::platform_errors::active() {
+        for name in ["x-request-id", "content-disposition"] {
+            if let Some(value) = upstream.get(name) {
+                resp.headers_mut().insert(name, value.clone());
+            }
         }
     }
 }
@@ -1453,7 +1557,9 @@ fn json_response(
     // never as the upstream's own body; the row keeps that body.
     if !status.is_success() {
         if let Some(class) = crate::platform_errors::relayed_error(status.as_u16(), &bytes) {
-            return class.into_response();
+            let mut resp = class.into_response();
+            relay_job_response_headers(&mut resp, upstream_headers, status);
+            return resp;
         }
     }
     let body = match (rewrite_model, serde_json::from_slice::<Value>(&bytes).ok()) {
@@ -1484,6 +1590,7 @@ fn json_response(
         .cloned()
         .unwrap_or_else(|| HeaderValue::from_static("application/json"));
     resp.headers_mut().insert(header::CONTENT_TYPE, ct);
+    relay_job_response_headers(&mut resp, upstream_headers, status);
     resp
 }
 
@@ -1505,12 +1612,19 @@ fn routed_model_hint(
 
 pub(crate) async fn create_file(
     State(state): State<ProxyState>,
-    auth: AuthenticatedKey,
+    crate::native_api::anthropic::FilesAuthenticatedKey(auth): crate::native_api::anthropic::FilesAuthenticatedKey,
     client: ClientContext,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
     multipart: Result<Multipart, axum::extract::multipart::MultipartRejection>,
 ) -> Response {
+    if crate::native_api::anthropic::is_anthropic(&headers) {
+        return crate::native_api::anthropic::create_file(
+            state, auth, client, params, query, multipart,
+        )
+        .await;
+    }
     let started = Instant::now();
     let request_id = client.request_id.clone();
 
@@ -1542,6 +1656,7 @@ pub(crate) async fn create_file(
     // `audio::multipart_dispatch` (#941 audit M2).
     let mut snapshot = None;
 
+    let mut resolved = None;
     let result = async {
         // Re-build the outbound multipart form, extracting the gateway-only
         // `model` routing field. Text fields (purpose, expires_after[...])
@@ -1626,7 +1741,14 @@ pub(crate) async fn create_file(
             ));
         }
 
-        let target = resolve_target(snapshot, &auth, wanted.as_deref(), &client)?;
+        let selected = resolve_target(snapshot, &auth, wanted.as_deref(), &client)?;
+        let (target, native_origin) = if state.platform().is_some() {
+            let (target,origin)=crate::native_api::openai::resolve(&state,snapshot,&auth,&client,
+                selected.display_name(),aisix_core::native_objects::NativeObjectKind::File)?;
+            (target,Some(origin))
+        } else { (selected,None) };
+        resolved = Some(target.clone());
+        let is_batch=fields.iter().any(|field|matches!(field,UploadField::Text(name,value) if name=="purpose"&&value=="batch"));
 
         // Batch/fine-tune input files carry end-user content — scan them
         // like any other inbound payload. 这也是这条面上唯一承载最终用户
@@ -1649,6 +1771,7 @@ pub(crate) async fn create_file(
                     drop(reserve_target(&state, snapshot, &auth, &target).await?);
                 }
                 file_parts += 1;
+                if native_origin.is_some() && is_batch { continue; }
                 if let Some(m) = scan_input_blob(
                     &state,
                     snapshot,
@@ -1669,6 +1792,22 @@ pub(crate) async fn create_file(
             }
         }
 
+        let mut native_entries=Vec::new();
+        if let Some(origin)=native_origin.as_ref().filter(|_|is_batch) {
+            if file_parts!=1 {return Err(ProxyError::InvalidRequest("batch upload requires one file".into()));}
+            for (index,field) in fields.iter().enumerate() {
+                if let UploadField::File {bytes,..}=field {
+                    let bytes=masked.get(&index).map_or(bytes.as_ref(),Vec::as_slice);
+                    let (rewritten,entries)=managed_batch_input(&state,snapshot,&auth,&client,origin,bytes,&mut monitor_hits,&mut enforced_hits,&mut scores,&mut bypass,&mut applied,&mut redactions,BatchInputAdmission::Upload).await?;
+                    masked.insert(index,rewritten.to_vec());native_entries=entries;
+                }
+            }
+        }
+        let registration=match native_origin.as_ref() {
+            Some(origin)=>Some(managed_begin(&state,&auth,&client,&target,origin,
+                aisix_core::native_objects::NativeObjectKind::File,None,native_entries,false,None).await?),
+            None=>None,
+        };
         let mut form = reqwest::multipart::Form::new();
         for (i, field) in fields.into_iter().enumerate() {
             match field {
@@ -1708,6 +1847,13 @@ pub(crate) async fn create_file(
             &request_id,
         )
         .await?;
+        if let (Some(operation),Some(origin))=(registration,native_origin.as_ref()) {
+            if status.is_success() {
+                let value:Value=serde_json::from_slice(&bytes).map_err(|_|crate::native_api::openai::invalid_identity())?;
+                managed_bind(&state,&auth,operation,origin,aisix_core::native_objects::NativeObjectKind::File,&value).await?;
+            }
+            return Ok((crate::native_api::openai::raw_body(status,&resp_headers,bytes),target));
+        }
         let model = target.display_name().to_string();
         Ok((
             json_response(
@@ -1737,6 +1883,7 @@ pub(crate) async fn create_file(
         started,
         request_id,
         result,
+        resolved,
         monitor_hits,
         redactions,
         enforced_hits,
@@ -1749,12 +1896,22 @@ pub(crate) async fn create_file(
 
 pub(crate) async fn list_files(
     State(state): State<ProxyState>,
-    auth: AuthenticatedKey,
+    crate::native_api::anthropic::FilesAuthenticatedKey(auth): crate::native_api::anthropic::FilesAuthenticatedKey,
     client: ClientContext,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
     req: axum::extract::Request,
 ) -> Response {
+    if crate::native_api::anthropic::is_anthropic(&headers) {
+        return crate::native_api::anthropic::list_files(
+            state,
+            auth,
+            client,
+            params,
+            req.uri().query().map(str::to_owned),
+        )
+        .await;
+    }
     forward_simple(
         state,
         auth,
@@ -1778,12 +1935,25 @@ pub(crate) async fn list_files(
 
 pub(crate) async fn get_file(
     State(state): State<ProxyState>,
-    auth: AuthenticatedKey,
+    crate::native_api::anthropic::FilesAuthenticatedKey(auth): crate::native_api::anthropic::FilesAuthenticatedKey,
     client: ClientContext,
     AisixPath(id): AisixPath<String>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
 ) -> Response {
+    if crate::native_api::anthropic::is_anthropic(&headers) {
+        return crate::native_api::anthropic::addressed_file(
+            state,
+            auth,
+            client,
+            id,
+            query,
+            Method::GET,
+            false,
+        )
+        .await;
+    }
     let (raw, embedded, routed) = routed_model_hint(&id, &params, &headers);
     forward_simple(
         state,
@@ -1808,12 +1978,25 @@ pub(crate) async fn get_file(
 
 pub(crate) async fn delete_file(
     State(state): State<ProxyState>,
-    auth: AuthenticatedKey,
+    crate::native_api::anthropic::FilesAuthenticatedKey(auth): crate::native_api::anthropic::FilesAuthenticatedKey,
     client: ClientContext,
     AisixPath(id): AisixPath<String>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
 ) -> Response {
+    if crate::native_api::anthropic::is_anthropic(&headers) {
+        return crate::native_api::anthropic::addressed_file(
+            state,
+            auth,
+            client,
+            id,
+            query,
+            Method::DELETE,
+            false,
+        )
+        .await;
+    }
     let (raw, embedded, routed) = routed_model_hint(&id, &params, &headers);
     forward_simple(
         state,
@@ -1838,12 +2021,25 @@ pub(crate) async fn delete_file(
 
 pub(crate) async fn file_content(
     State(state): State<ProxyState>,
-    auth: AuthenticatedKey,
+    crate::native_api::anthropic::FilesAuthenticatedKey(auth): crate::native_api::anthropic::FilesAuthenticatedKey,
     client: ClientContext,
     AisixPath(id): AisixPath<String>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
 ) -> Response {
+    if crate::native_api::anthropic::is_anthropic(&headers) {
+        return crate::native_api::anthropic::addressed_file(
+            state,
+            auth,
+            client,
+            id,
+            query,
+            Method::GET,
+            true,
+        )
+        .await;
+    }
     let (raw, embedded, routed) = routed_model_hint(&id, &params, &headers);
     forward_simple(
         state,
@@ -1899,6 +2095,9 @@ pub(crate) async fn create_batch(
             );
         }
     };
+    if state.platform().is_some() {
+        return managed_create_batch(state, auth, client, body).await;
+    }
     let request_id = client.request_id.clone();
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     // 控制体路线只查不改：计数表恒空，仍然交给 `finish`，这样签名只有一份。
@@ -1921,6 +2120,7 @@ pub(crate) async fn create_batch(
         explicit_model(&params, &headers).as_deref(),
     );
 
+    let mut resolved = None;
     let result = async {
         let mut req_json: Value = serde_json::from_slice(&body)
             .map_err(|e| ProxyError::InvalidRequest(format!("invalid JSON body: {e}")))?;
@@ -1953,6 +2153,7 @@ pub(crate) async fn create_batch(
             .or_else(|| explicit_model(&params, &headers));
         crate::usage_attr::hold_ahead_of_chain(&state, &snapshot, &auth, wanted.as_deref());
         let target = resolve_target(&snapshot, &auth, wanted.as_deref(), &client)?;
+        resolved = Some(target.clone());
         // A job built on a file is a read of that file.
         require_job_owner(&auth, &snapshot, &target, &raw_file_id, routed.as_ref())?;
 
@@ -2047,6 +2248,7 @@ pub(crate) async fn create_batch(
         started,
         request_id,
         result,
+        resolved,
         monitor_hits,
         redactions,
         enforced_hits,
@@ -2065,6 +2267,28 @@ pub(crate) async fn get_batch(
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
+    if state.platform().is_some() {
+        let (raw, embedded, routed) = routed_model_hint(&id, &params, &headers);
+        return managed_forward(
+            state,
+            auth,
+            client,
+            params,
+            headers,
+            FwdSpec {
+                surface: crate::operation::BATCHES,
+                method: Method::GET,
+                log_path: format!("/v1/batches/{id}"),
+                upstream_path: format!("/batches/{raw}"),
+                raw_query: None,
+                body: None,
+                id: Some((raw, embedded, routed)),
+                rewrite_ids: false,
+                relay_raw_body: false,
+            },
+        )
+        .await;
+    }
     let started = Instant::now();
     let request_id = client.request_id.clone();
     let (raw, embedded, routed) = routed_model_hint(&id, &params, &headers);
@@ -2079,10 +2303,12 @@ pub(crate) async fn get_batch(
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
 
+    let mut resolved = None;
     let result = async {
         require_safe_upstream_id(&raw)?;
         let wanted = embedded.or_else(|| explicit_model(&params, &headers));
         let target = resolve_target(&snapshot, &auth, wanted.as_deref(), &client)?;
+        resolved = Some(target.clone());
         require_job_owner(&auth, &snapshot, &target, &raw, routed.as_ref())?;
         let _reservation = crate::quota::enforce(
             &state,
@@ -2155,6 +2381,7 @@ pub(crate) async fn get_batch(
         started,
         request_id,
         result,
+        resolved,
         monitor_hits,
         redactions,
         enforced_hits,
@@ -2279,6 +2506,7 @@ pub(crate) async fn create_ft_job(
         explicit_model(&params, &headers).as_deref(),
     );
 
+    let mut resolved = None;
     let result = async {
         let mut req_json: Value = serde_json::from_slice(&body)
             .map_err(|e| ProxyError::InvalidRequest(format!("invalid JSON body: {e}")))?;
@@ -2305,6 +2533,7 @@ pub(crate) async fn create_ft_job(
         let wanted = embedded.or_else(|| explicit_model(&params, &headers));
         crate::usage_attr::hold_ahead_of_chain(&state, &snapshot, &auth, wanted.as_deref());
         let target = resolve_target(&snapshot, &auth, wanted.as_deref(), &client)?;
+        resolved = Some(target.clone());
         // See `create_batch`.
         require_job_owner(&auth, &snapshot, &target, &raw_training, routed.as_ref())?;
 
@@ -2395,6 +2624,7 @@ pub(crate) async fn create_ft_job(
         started,
         request_id,
         result,
+        resolved,
         monitor_hits,
         redactions,
         enforced_hits,
@@ -2521,6 +2751,14 @@ async fn forward_simple(
     headers: HeaderMap,
     spec: FwdSpec,
 ) -> Response {
+    if state.platform().is_some()
+        && matches!(
+            spec.surface,
+            crate::operation::FILES | crate::operation::BATCHES
+        )
+    {
+        return managed_forward(state, auth, client, params, headers, spec).await;
+    }
     let started = Instant::now();
     let request_id = client.request_id.clone();
     let method = spec.method.clone();
@@ -2548,6 +2786,7 @@ async fn forward_simple(
         crate::usage_attr::hold_ahead_of_chain(&state, &snapshot, &auth, model.as_deref());
     }
 
+    let mut resolved = None;
     let result = async {
         let embedded = match &spec.id {
             Some((raw, embedded, _)) => {
@@ -2556,8 +2795,23 @@ async fn forward_simple(
             }
             None => None,
         };
-        let wanted = embedded.or_else(|| explicit_model(&params, &headers));
+        let wanted = embedded
+            .or_else(|| explicit_model(&params, &headers))
+            .or_else(|| {
+                // 已返回的游标固定目标；未显式选模型时也不能回落到另一个账号。
+                spec.id
+                    .is_none()
+                    .then(|| {
+                        url::form_urlencoded::parse(
+                            spec.raw_query.as_deref().unwrap_or("").as_bytes(),
+                        )
+                        .filter(|(key, _)| key == "after")
+                        .find_map(|(_, value)| decode_routed_id(&value).map(|id| id.model))
+                    })
+                    .flatten()
+            });
         let target = resolve_target(&snapshot, &auth, wanted.as_deref(), &client)?;
+        resolved = Some(target.clone());
         match &spec.id {
             Some((raw, _, routed)) => {
                 require_job_owner(&auth, &snapshot, &target, raw, routed.as_ref())?
@@ -2589,7 +2843,7 @@ async fn forward_simple(
         };
         crate::budget::gate(&state, &snapshot).check_provider_key(&target.pk_entry.id)?;
 
-        let query = forwardable_query(spec.raw_query.as_deref());
+        let query = forwardable_query(spec.raw_query.as_deref(), &auth, &snapshot, &target)?;
         let url = upstream_url(&target, &spec.upstream_path, &query)?;
         let body = match spec.body {
             Some(b) => UpstreamBody::Json(b),
@@ -2623,7 +2877,7 @@ async fn forward_simple(
         let platform_refusal = (!status.is_success())
             .then(|| crate::platform_errors::relayed_error(status.as_u16(), &bytes))
             .flatten();
-        let resp = if let Some(class) = platform_refusal {
+        let mut resp = if let Some(class) = platform_refusal {
             class.into_response()
         } else if spec.relay_raw_body {
             let mut resp = Response::builder()
@@ -2646,6 +2900,7 @@ async fn forward_simple(
                     .map(|(owner, secret)| (owner.as_str(), *secret)),
             )
         };
+        relay_job_response_headers(&mut resp, &resp_headers, status);
         Ok((resp, target))
     }
     .await;
@@ -2661,12 +2916,1068 @@ async fn forward_simple(
         started,
         request_id,
         result,
+        resolved,
         monitor_hits,
         redactions,
         enforced_hits,
         scores,
         bypass,
         applied,
+    )
+    .await
+}
+
+// 托管 OpenAI 对象由控制面授权；上游原始 ID 或客户端 metadata 不构成归属证明。
+#[allow(clippy::too_many_arguments)]
+async fn managed_begin(
+    state: &ProxyState,
+    auth: &AuthenticatedKey,
+    client: &ClientContext,
+    target: &JobTarget,
+    origin: &aisix_core::native_objects::OriginBinding,
+    kind: aisix_core::native_objects::NativeObjectKind,
+    parent_id: Option<uuid::Uuid>,
+    entries: Vec<aisix_core::native_objects::NativeEntry>,
+    asynchronous: bool,
+    input_file_id: Option<String>,
+) -> Result<uuid::Uuid, ProxyError> {
+    use crate::native_api::openai;
+    use aisix_core::native_objects::{BeginRequest, NativeProtocol};
+    let operation_id = uuid::Uuid::new_v4();
+    let batch_input = kind == aisix_core::native_objects::NativeObjectKind::File
+        && input_file_id.is_some()
+        && !entries.is_empty();
+    let reply = openai::registry(state)?
+        .begin(BeginRequest {
+            upstream_input_text: None,
+            input_file_id,
+            operation_id,
+            api_key_id: openai::api_key_id(auth)?,
+            protocol: NativeProtocol::Openai,
+            kind,
+            origin: origin.clone(),
+            parent_id,
+            requested_model_id: origin.model_id,
+            requested_model: target.display_name().into(),
+            upstream_model: target
+                .model_entry
+                .value
+                .upstream_model()
+                .unwrap_or_default()
+                .into(),
+            upstream_provider: target.pk_entry.value.provider.clone(),
+            operation: if batch_input {
+                "batch_input"
+            } else if asynchronous {
+                "batch_completion"
+            } else {
+                "files"
+            }
+            .into(),
+            request_id: client.request_id.clone(),
+            asynchronous,
+            requested_service_tier: None,
+            entries,
+            observation_headers: Default::default(),
+        })
+        .await
+        .map_err(openai::registry_error)?;
+    if reply.state != "pending_submission"
+        || reply.operation_id != Some(operation_id)
+        || reply.origin.as_ref() != Some(origin)
+    {
+        return Err(openai::dependency());
+    }
+    Ok(operation_id)
+}
+
+async fn managed_bind(
+    state: &ProxyState,
+    auth: &AuthenticatedKey,
+    operation_id: uuid::Uuid,
+    origin: &aisix_core::native_objects::OriginBinding,
+    kind: aisix_core::native_objects::NativeObjectKind,
+    value: &Value,
+) -> Result<aisix_core::native_objects::NativeRecord, ProxyError> {
+    use crate::native_api::openai;
+    use aisix_core::native_objects::{BindRequest, NativeProtocol};
+    let raw = value
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(openai::invalid_identity)?;
+    require_safe_upstream_id(raw).map_err(|_| openai::invalid_identity())?;
+    let timestamp = |field| {
+        value
+            .get(field)
+            .and_then(Value::as_i64)
+            .and_then(|seconds| chrono::DateTime::from_timestamp(seconds, 0))
+    };
+    let reply = openai::registry(state)?
+        .bind(BindRequest {
+            existing_record_id: None,
+            objects: Vec::new(),
+            operation_id,
+            api_key_id: openai::api_key_id(auth)?,
+            raw_id: raw.into(),
+            provider_created_at: timestamp("created_at"),
+            provider_expires_at: timestamp("expires_at"),
+        })
+        .await
+        .map_err(openai::registry_error)?;
+    reply
+        .record
+        .filter(|record| {
+            reply.state == "bound"
+                && record.operation_id == Some(operation_id)
+                && record.protocol == Some(NativeProtocol::Openai)
+                && record.kind == Some(kind)
+                && record.raw_id == raw
+                && record.origin.as_ref() == Some(origin)
+                && !record.deleted
+        })
+        .ok_or_else(openai::dependency)
+}
+
+async fn managed_lookup(
+    state: &ProxyState,
+    auth: &AuthenticatedKey,
+    client: &ClientContext,
+    raw: &str,
+    kind: aisix_core::native_objects::NativeObjectKind,
+) -> Result<
+    (
+        JobTarget,
+        aisix_core::native_objects::OriginBinding,
+        aisix_core::native_objects::NativeRecord,
+    ),
+    ProxyError,
+> {
+    use crate::native_api::openai;
+    use aisix_core::native_objects::{LookupRequest, NativeProtocol, ObjectLocator};
+    require_safe_upstream_id(raw).map_err(|_| ProxyError::JobResourceNotFound(raw.into()))?;
+    let reply = openai::registry(state)?
+        .lookup(LookupRequest {
+            consumer_family: None,
+            api_key_id: openai::api_key_id(auth)?,
+            locator: ObjectLocator {
+                protocol: NativeProtocol::Openai,
+                kind,
+                raw_id: raw.into(),
+                origin: None,
+                parent_id: None,
+            },
+        })
+        .await
+        .map_err(openai::registry_error)?;
+    let record = reply
+        .record
+        .filter(|record| {
+            reply.state == "found"
+                && !record.deleted
+                && record.raw_id == raw
+                && record.protocol == Some(NativeProtocol::Openai)
+                && record.kind == Some(kind)
+                && !(kind == aisix_core::native_objects::NativeObjectKind::File
+                    && record.operation == "batch_input")
+        })
+        .ok_or_else(|| ProxyError::JobResourceNotFound(raw.into()))?;
+    let (target, origin) = managed_validate_record(state, auth, client, kind, &record, None)?;
+    Ok((target, origin, record))
+}
+fn managed_validate_record(
+    state: &ProxyState,
+    auth: &AuthenticatedKey,
+    client: &ClientContext,
+    kind: aisix_core::native_objects::NativeObjectKind,
+    record: &aisix_core::native_objects::NativeRecord,
+    consumer_family: Option<aisix_core::models::EndpointFamily>,
+) -> Result<(JobTarget, aisix_core::native_objects::OriginBinding), ProxyError> {
+    use crate::native_api::openai;
+    let origin = record.origin.clone().ok_or_else(openai::dependency)?;
+    let snapshot = state.snapshot.load();
+    let target = managed_current_target_for_consumer(
+        state,
+        &snapshot,
+        auth,
+        client,
+        &origin,
+        record.requested_model_id.ok_or_else(openai::dependency)?,
+        kind,
+        consumer_family,
+    )?;
+    for entry in &record.entries {
+        let mut entry_origin = origin.clone();
+        entry_origin.model_id = entry.model_id;
+        managed_current_target_for_consumer(
+            state,
+            &snapshot,
+            auth,
+            client,
+            &entry_origin,
+            entry.requested_model_id,
+            kind,
+            consumer_family,
+        )?;
+    }
+    Ok((target, origin))
+}
+fn managed_current_target(
+    state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
+    auth: &AuthenticatedKey,
+    client: &ClientContext,
+    origin: &aisix_core::native_objects::OriginBinding,
+    requested_id: uuid::Uuid,
+    kind: aisix_core::native_objects::NativeObjectKind,
+) -> Result<JobTarget, ProxyError> {
+    managed_current_target_for_consumer(
+        state,
+        snapshot,
+        auth,
+        client,
+        origin,
+        requested_id,
+        kind,
+        None,
+    )
+}
+#[allow(clippy::too_many_arguments)]
+fn managed_current_target_for_consumer(
+    state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
+    auth: &AuthenticatedKey,
+    client: &ClientContext,
+    origin: &aisix_core::native_objects::OriginBinding,
+    requested_id: uuid::Uuid,
+    kind: aisix_core::native_objects::NativeObjectKind,
+    consumer_family: Option<aisix_core::models::EndpointFamily>,
+) -> Result<JobTarget, ProxyError> {
+    use crate::native_api::openai;
+    let not_found = || ProxyError::JobResourceNotFound("native object".into());
+    let requested = snapshot
+        .models
+        .get_by_id(&requested_id.to_string())
+        .ok_or_else(not_found)?;
+    let direct = snapshot
+        .models
+        .get_by_id(&origin.model_id.to_string())
+        .ok_or_else(not_found)?;
+    let (target, current) = match consumer_family {
+        Some(family) => openai::resolve_file_reference_for_requested(
+            state,
+            snapshot,
+            auth,
+            client,
+            &direct.value.display_name,
+            &requested.value.display_name,
+            family,
+        ),
+        None => openai::resolve_for_requested(
+            state,
+            snapshot,
+            auth,
+            client,
+            &direct.value.display_name,
+            &requested.value.display_name,
+            kind,
+        ),
+    }
+    .map_err(|_| not_found())?;
+    if current != *origin {
+        return Err(not_found());
+    }
+    Ok(target)
+}
+
+#[derive(Clone, Copy)]
+enum BatchInputAdmission<'a> {
+    Upload,
+    Submit(&'a [aisix_core::native_objects::NativeEntry]),
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn managed_batch_input(
+    state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
+    auth: &AuthenticatedKey,
+    client: &ClientContext,
+    origin: &aisix_core::native_objects::OriginBinding,
+    bytes: &[u8],
+    monitor_hits: &mut Vec<aisix_core::GuardrailMonitorHit>,
+    enforced_hits: &mut Vec<aisix_core::GuardrailEnforcedHit>,
+    scores: &mut Vec<aisix_core::GuardrailScore>,
+    bypass: &mut String,
+    applied: &mut Vec<aisix_core::AppliedGuardrail>,
+    redactions: &mut crate::redact::RedactionCounts,
+    admission: BatchInputAdmission<'_>,
+) -> Result<(Bytes, Vec<aisix_core::native_objects::NativeEntry>), ProxyError> {
+    use crate::native_api::openai;
+    use aisix_core::native_objects::{NativeEntry, NativeObjectKind};
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut entries = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut changed = false;
+    let (saved_entries, consumer_family) = match admission {
+        BatchInputAdmission::Upload => (None, None),
+        BatchInputAdmission::Submit(entries) => (
+            Some(entries),
+            Some(aisix_core::models::EndpointFamily::Batches),
+        ),
+    };
+    for line in bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
+    {
+        let mut line: Value = serde_json::from_slice(line)
+            .map_err(|_| ProxyError::InvalidRequest("invalid batch input JSONL".into()))?;
+        let id = line
+            .get("custom_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty() && id.len() <= 256)
+            .ok_or_else(|| ProxyError::InvalidRequest("batch input custom_id is required".into()))?
+            .to_owned();
+        if !seen.insert(id.clone()) {
+            return Err(ProxyError::InvalidRequest(
+                "batch input custom_id must be unique".into(),
+            ));
+        }
+        let endpoint = line
+            .get("url")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ProxyError::InvalidRequest("batch input url is required".into()))?
+            .to_owned();
+        let raw_model = line
+            .pointer("/body/model")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ProxyError::InvalidRequest("batch input body.model is required".into()))?
+            .to_owned();
+        let saved = saved_entries
+            .filter(|entries| !entries.is_empty())
+            .map(|entries| {
+                entries
+                    .iter()
+                    .find(|entry| entry.entry_id == id)
+                    .ok_or_else(openai::invalid_identity)
+            })
+            .transpose()?;
+        let (requested, target, entry_origin) = if let Some(saved) = saved {
+            if raw_model != saved.requested_model && raw_model != saved.upstream_model {
+                return Err(openai::invalid_identity());
+            }
+            let direct = snapshot
+                .models
+                .get_by_id(&saved.model_id.to_string())
+                .ok_or_else(openai::dependency)?;
+            let requested = snapshot
+                .models
+                .get_by_id(&saved.requested_model_id.to_string())
+                .ok_or_else(openai::dependency)?;
+            let (target, origin) = openai::resolve_file_reference_for_requested(
+                state,
+                snapshot,
+                auth,
+                client,
+                &direct.value.display_name,
+                &requested.value.display_name,
+                aisix_core::models::EndpointFamily::Batches,
+            )?;
+            (saved.requested_model.clone(), target, origin)
+        } else {
+            let requested = if crate::model_resolve::resolve_model(snapshot, &raw_model).is_none() {
+                snapshot
+                    .models
+                    .get_by_id(&origin.model_id.to_string())
+                    .filter(|entry| entry.value.upstream_model() == Some(raw_model.as_str()))
+                    .map(|entry| entry.value.display_name.clone())
+                    .unwrap_or(raw_model.clone())
+            } else {
+                raw_model.clone()
+            };
+            let (target, origin) = match consumer_family {
+                Some(family) => openai::resolve_file_reference_for_requested(
+                    state, snapshot, auth, client, &requested, &requested, family,
+                ),
+                None => openai::resolve(
+                    state,
+                    snapshot,
+                    auth,
+                    client,
+                    &requested,
+                    NativeObjectKind::File,
+                ),
+            }?;
+            (requested, target, origin)
+        };
+        if entry_origin.provider_key_id != origin.provider_key_id
+            || entry_origin.boundary != origin.boundary
+        {
+            return Err(ProxyError::InvalidRequest(
+                "batch input models must share the selected account".into(),
+            ));
+        }
+        if !matches!(
+            endpoint.as_str(),
+            "/v1/chat/completions"
+                | "/v1/completions"
+                | "/v1/responses"
+                | "/v1/embeddings"
+                | "/v1/moderations"
+                | "/v1/images/generations"
+                | "/v1/images/edits"
+        ) {
+            return Err(ProxyError::InvalidRequest(
+                "batch input url is not a supported batch endpoint".into(),
+            ));
+        }
+        let requested_service_tier = line
+            .pointer("/body/service_tier")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if saved.is_some_and(|entry| entry.requested_service_tier != requested_service_tier) {
+            return Err(openai::invalid_identity());
+        }
+        let body =
+            serde_json::to_vec(line.get("body").ok_or_else(|| {
+                ProxyError::InvalidRequest("batch input body is required".into())
+            })?)
+            .map_err(|_| openai::dependency())?;
+        if let Some(masked) = scan_input_blob(
+            state,
+            snapshot,
+            auth,
+            &target,
+            &body,
+            monitor_hits,
+            enforced_hits,
+            scores,
+            bypass,
+            applied,
+            Some(redactions),
+        )
+        .await?
+        {
+            changed = true;
+            line["body"] = serde_json::from_slice(&masked).map_err(|_| {
+                ProxyError::InvalidRequest("masked batch input body is not JSON".into())
+            })?;
+        }
+        let upstream = target
+            .model_entry
+            .value
+            .upstream_model()
+            .ok_or(ProxyError::AccountUnavailable)?
+            .to_owned();
+        let protocol = match endpoint.as_str() {
+            "/v1/chat/completions" => aisix_gateway::upstream_io::Protocol::Chat,
+            "/v1/completions" => aisix_gateway::upstream_io::Protocol::Completions,
+            "/v1/responses" => aisix_gateway::upstream_io::Protocol::Responses,
+            "/v1/embeddings" => aisix_gateway::upstream_io::Protocol::Embeddings,
+            "/v1/images/generations" | "/v1/images/edits" => {
+                aisix_gateway::upstream_io::Protocol::Images
+            }
+            _ => aisix_gateway::upstream_io::Protocol::Unknown,
+        };
+        let io = aisix_gateway::upstream_io::UpstreamIoObserver::new(protocol);
+        io.observe_request_json(line.get("body").ok_or_else(openai::dependency)?);
+        entries.push(NativeEntry {
+            upstream_input_text: io.snapshot().input_text,
+            endpoint,
+            entry_id: id,
+            requested_model: requested,
+            requested_model_id: saved
+                .map_or(entry_origin.model_id, |entry| entry.requested_model_id),
+            model_id: entry_origin.model_id,
+            upstream_model: upstream.clone(),
+            requested_service_tier,
+            upstream_provider: target.pk_entry.value.provider.clone(),
+        });
+        if matches!(admission, BatchInputAdmission::Submit(_)) && raw_model != upstream {
+            line["body"]["model"] = Value::String(upstream);
+            changed = true;
+        }
+        serde_json::to_writer(&mut out, &line).map_err(|_| openai::dependency())?;
+        out.push(b'\n');
+        if entries.len() > 1000 {
+            return Err(ProxyError::InvalidRequest(
+                "batch input exceeds the durable entry limit".into(),
+            ));
+        }
+    }
+    if entries.is_empty() {
+        return Err(ProxyError::InvalidRequest(
+            "batch input must contain a request".into(),
+        ));
+    }
+    if saved_entries.is_some_and(|saved| !saved.is_empty() && saved.len() != entries.len()) {
+        return Err(openai::invalid_identity());
+    }
+    Ok((
+        if changed {
+            Bytes::from(out)
+        } else {
+            Bytes::copy_from_slice(bytes)
+        },
+        entries,
+    ))
+}
+
+async fn managed_create_batch(
+    state: ProxyState,
+    auth: AuthenticatedKey,
+    client: ClientContext,
+    body: Bytes,
+) -> Response {
+    use crate::native_api::openai;
+    use aisix_core::native_objects::NativeObjectKind;
+    let started = Instant::now();
+    let snapshot = state.snapshot.load();
+    let mut audit = openai::Audit::default();
+    let mut stage = aisix_core::native_objects::InferenceStage::Management;
+    let result = async {
+        let mut value: Value = serde_json::from_slice(&body)
+            .map_err(|_| ProxyError::InvalidRequest("invalid JSON body".into()))?;
+        let raw = value
+            .get("input_file_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ProxyError::InvalidRequest("input_file_id is required".into()))?
+            .to_owned();
+        let (_, _, input) = openai::lookup_file_reference(
+            &state,
+            &auth,
+            &client,
+            &raw,
+            aisix_core::models::EndpointFamily::Batches,
+        )
+        .await?;
+        let (target, origin) = managed_validate_record(
+            &state,
+            &auth,
+            &client,
+            NativeObjectKind::File,
+            &input,
+            Some(aisix_core::models::EndpointFamily::Batches),
+        )?;
+        audit.resolved(&target);
+        let endpoint = value
+            .get("endpoint")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ProxyError::InvalidRequest("endpoint is required".into()))?
+            .to_owned();
+        if input.entries.iter().any(|entry| entry.endpoint != endpoint) {
+            return Err(ProxyError::InvalidRequest(
+                "endpoint must match every request in the batch input file".into(),
+            ));
+        }
+        let _reservation = reserve_target(&state, &snapshot, &auth, &target).await?;
+        audit
+            .input(&state, &snapshot, &auth, &target, &body, false)
+            .await?;
+        let saved_entries = input.entries;
+        let mut submitted_file = raw.clone();
+        let entries;
+        {
+            // 分片上传的原文件不可改写；创建批次前在已授权账号内补全逐项清单。
+            let metadata = openai::send(
+                &state,
+                &target,
+                &client,
+                Method::GET,
+                &format!("/files/{raw}"),
+                "",
+                openai::Body::Empty,
+            )
+            .await?;
+            let metadata: Value =
+                serde_json::from_slice(&metadata.bytes).map_err(|_| openai::invalid_identity())?;
+            if metadata.get("id").and_then(Value::as_str) != Some(raw.as_str()) {
+                return Err(openai::invalid_identity());
+            }
+            let purpose = metadata
+                .get("purpose")
+                .and_then(Value::as_str)
+                .ok_or_else(openai::invalid_identity)?;
+            let content = openai::send(
+                &state,
+                &target,
+                &client,
+                Method::GET,
+                &format!("/files/{raw}/content"),
+                "",
+                openai::Body::Empty,
+            )
+            .await?;
+            if !content.status.is_success() {
+                return Ok((
+                    openai::raw_body(content.status, &content.headers, content.bytes),
+                    target,
+                ));
+            }
+            if content.bytes.len() > 200 * 1024 * 1024 {
+                return Err(ProxyError::InvalidRequest(
+                    "batch input file exceeds 200 MB".into(),
+                ));
+            }
+            let (rewritten, manifest) = managed_batch_input(
+                &state,
+                &snapshot,
+                &auth,
+                &client,
+                &origin,
+                &content.bytes,
+                &mut audit.monitor,
+                &mut audit.enforced,
+                &mut audit.scores,
+                &mut audit.bypass,
+                &mut audit.applied,
+                &mut audit.redactions,
+                BatchInputAdmission::Submit(&saved_entries),
+            )
+            .await?;
+            entries = manifest;
+            if entries.iter().any(|entry| entry.endpoint != endpoint) {
+                return Err(ProxyError::InvalidRequest(
+                    "endpoint must match every request in the batch input file".into(),
+                ));
+            }
+            if rewritten != content.bytes {
+                // 只新建派生输入；原文件、客户端可继续使用的 ID 与已受理批次均不重派。
+                let operation = managed_begin(
+                    &state,
+                    &auth,
+                    &client,
+                    &target,
+                    &origin,
+                    NativeObjectKind::File,
+                    Some(input.record_id),
+                    entries.clone(),
+                    false,
+                    Some(raw.clone()),
+                )
+                .await?;
+                let part = reqwest::multipart::Part::bytes(rewritten.to_vec())
+                    .file_name("batch-input.jsonl")
+                    .mime_str("application/jsonl")
+                    .map_err(|_| openai::dependency())?;
+                let form = reqwest::multipart::Form::new()
+                    .text("purpose", purpose.to_owned())
+                    .part("file", part);
+                let uploaded = openai::send(
+                    &state,
+                    &target,
+                    &client,
+                    Method::POST,
+                    "/files",
+                    "",
+                    openai::Body::Multipart(form),
+                )
+                .await?;
+                if !uploaded.status.is_success() {
+                    return Ok((
+                        openai::raw_body(uploaded.status, &uploaded.headers, uploaded.bytes),
+                        target,
+                    ));
+                }
+                let uploaded: Value = serde_json::from_slice(&uploaded.bytes)
+                    .map_err(|_| openai::invalid_identity())?;
+                let derived = managed_bind(
+                    &state,
+                    &auth,
+                    operation,
+                    &origin,
+                    NativeObjectKind::File,
+                    &uploaded,
+                )
+                .await?;
+                submitted_file = derived.raw_id;
+            }
+        }
+        if entries.iter().any(|entry| entry.endpoint != endpoint) {
+            return Err(ProxyError::InvalidRequest(
+                "endpoint must match every request in the batch input file".into(),
+            ));
+        }
+        value["input_file_id"] = Value::String(submitted_file);
+        if let Some(object) = value.as_object_mut() {
+            object.remove("model");
+            object.remove("provider");
+        }
+        let operation = managed_begin(
+            &state,
+            &auth,
+            &client,
+            &target,
+            &origin,
+            NativeObjectKind::MessageBatch,
+            None,
+            entries,
+            true,
+            Some(raw.clone()),
+        )
+        .await?;
+        let mut response = openai::send(
+            &state,
+            &target,
+            &client,
+            Method::POST,
+            "/batches",
+            "",
+            openai::Body::Json(Bytes::from(
+                serde_json::to_vec(&value).map_err(|_| openai::dependency())?,
+            )),
+        )
+        .await?;
+        if response.status.is_success() {
+            stage = aisix_core::native_objects::InferenceStage::Accepted;
+            let mut value: Value =
+                serde_json::from_slice(&response.bytes).map_err(|_| openai::invalid_identity())?;
+            let record = managed_bind(
+                &state,
+                &auth,
+                operation,
+                &origin,
+                NativeObjectKind::MessageBatch,
+                &value,
+            )
+            .await?;
+            if record.input_file_id.as_deref() != Some(raw.as_str()) {
+                return Err(openai::dependency());
+            }
+            if value.get("input_file_id").is_some() {
+                value["input_file_id"] = Value::String(raw);
+            }
+            response.bytes =
+                Bytes::from(serde_json::to_vec(&value).map_err(|_| openai::dependency())?);
+        }
+        audit
+            .output(&state, &auth, &target, &response.bytes)
+            .await?;
+        Ok((
+            openai::raw_body(response.status, &response.headers, response.bytes),
+            target,
+        ))
+    }
+    .await;
+    openai::finish(
+        &state,
+        &snapshot,
+        crate::operation::BATCHES,
+        Method::POST,
+        "/v1/batches",
+        &auth,
+        &client,
+        started,
+        result,
+        audit,
+        stage,
+        None,
+    )
+    .await
+}
+
+const BATCH_RESULT_OPERATION: &str = "batch_result";
+
+async fn managed_result_line(
+    state: &ProxyState,
+    auth: &AuthenticatedKey,
+    client: &ClientContext,
+    record: &aisix_core::native_objects::NativeRecord,
+    line: &[u8],
+    seen: &mut std::collections::HashSet<String>,
+    audit: &mut crate::native_api::openai::Audit,
+) -> Result<Value, ProxyError> {
+    use crate::native_api::openai;
+    use aisix_core::native_objects::NativeObjectKind;
+    let mut value: Value = serde_json::from_slice(line).map_err(|_| openai::invalid_identity())?;
+    let id = value
+        .get("custom_id")
+        .and_then(Value::as_str)
+        .ok_or_else(openai::invalid_identity)?;
+    let entry = record
+        .entries
+        .iter()
+        .find(|entry| entry.entry_id == id)
+        .ok_or_else(openai::invalid_identity)?;
+    if !seen.insert(id.to_owned()) {
+        return Err(openai::invalid_identity());
+    }
+    if let Some(response) = value.get_mut("response").filter(|value| !value.is_null()) {
+        let status = response
+            .get("status_code")
+            .and_then(Value::as_u64)
+            .filter(|status| (100..=599).contains(status))
+            .ok_or_else(openai::invalid_identity)? as u16;
+        let body = response
+            .get_mut("body")
+            .ok_or_else(openai::invalid_identity)?;
+        if (200..=299).contains(&status) {
+            if body.get("model").is_some() {
+                body["model"] = Value::String(entry.requested_model.clone());
+            }
+            let snapshot = state.snapshot.load();
+            let mut origin = record.origin.clone().ok_or_else(openai::dependency)?;
+            origin.model_id = entry.model_id;
+            let target = managed_current_target(
+                state,
+                &snapshot,
+                auth,
+                client,
+                &origin,
+                entry.requested_model_id,
+                NativeObjectKind::File,
+            )?;
+            audit
+                .output(
+                    state,
+                    auth,
+                    &target,
+                    &serde_json::to_vec(body).map_err(|_| openai::invalid_identity())?,
+                )
+                .await?;
+        } else {
+            let raw =
+                Bytes::from(serde_json::to_vec(body).map_err(|_| openai::invalid_identity())?);
+            let upstream = aisix_gateway::upstream_status_of_body(
+                status,
+                &raw,
+                None,
+                aisix_gateway::UpstreamWire::OpenAI,
+                aisix_provider_openai::parse_openai_error_envelope,
+            );
+            if crate::platform_errors::active()
+                && crate::platform_errors::relayed_status(&upstream).is_none()
+            {
+                let class = crate::platform_errors::classify_bridge(&upstream);
+                let status = class.status().as_u16();
+                *body = serde_json::to_value(class.envelope())
+                    .map_err(|_| openai::invalid_identity())?;
+                response["status_code"] = Value::from(status);
+            } else {
+                *body = serde_json::from_slice(&aisix_gateway::scrub_upstream_error_body(&raw))
+                    .map_err(|_| openai::invalid_identity())?;
+            }
+        }
+    } else {
+        let error = value
+            .get_mut("error")
+            .filter(|value| value.is_object())
+            .ok_or_else(openai::invalid_identity)?;
+        let raw = Bytes::from(
+            serde_json::to_vec(&serde_json::json!({"error":error}))
+                .map_err(|_| openai::invalid_identity())?,
+        );
+        // 批次自身的过期错误没有 HTTP 状态，保留原生 code/message 供调用方重提该项。
+        if error.get("code").and_then(Value::as_str) == Some("batch_expired") {
+            *error =
+                serde_json::from_slice::<Value>(&aisix_gateway::scrub_upstream_error_body(&raw))
+                    .map_err(|_| openai::invalid_identity())?["error"]
+                    .clone();
+        } else {
+            let upstream = aisix_gateway::upstream_status_of_body(
+                500,
+                &raw,
+                None,
+                aisix_gateway::UpstreamWire::OpenAI,
+                aisix_provider_openai::parse_openai_error_envelope,
+            );
+            let class = crate::platform_errors::classify_bridge(&upstream);
+            *error = serde_json::json!({"code":class.code(),"message":crate::platform_errors::platform_message(&class)});
+        }
+    }
+    Ok(value)
+}
+
+async fn managed_result_content(
+    state: &ProxyState,
+    auth: &AuthenticatedKey,
+    client: &ClientContext,
+    record: &aisix_core::native_objects::NativeRecord,
+    bytes: &[u8],
+    audit: &mut crate::native_api::openai::Audit,
+) -> Result<Bytes, ProxyError> {
+    use crate::native_api::openai;
+    if record.parent_id.is_none() || record.entries.is_empty() {
+        return Err(openai::dependency());
+    }
+    let mut pending = Vec::new();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut seen = std::collections::HashSet::new();
+    // 传输总量沿用原生文件的硬上限；逐块分行，任何一行都不能绕过独立字节上限。
+    for mut chunk in bytes.chunks(16 * 1024) {
+        while !chunk.is_empty() {
+            let end = memchr::memchr(b'\n', chunk);
+            let take = end.map_or(chunk.len(), |index| index + 1);
+            if take > aisix_gateway::sse::MAX_SSE_FRAME_BYTES.saturating_sub(pending.len()) {
+                return Err(openai::invalid_identity());
+            }
+            pending.extend_from_slice(&chunk[..take]);
+            chunk = &chunk[take..];
+            if end.is_some() {
+                if !pending.iter().all(u8::is_ascii_whitespace) {
+                    let value = managed_result_line(
+                        state, auth, client, record, &pending, &mut seen, audit,
+                    )
+                    .await?;
+                    serde_json::to_writer(&mut output, &value)
+                        .map_err(|_| openai::invalid_identity())?;
+                    output.push(b'\n');
+                }
+                pending.clear();
+            }
+        }
+    }
+    if !pending.iter().all(u8::is_ascii_whitespace) {
+        let value =
+            managed_result_line(state, auth, client, record, &pending, &mut seen, audit).await?;
+        serde_json::to_writer(&mut output, &value).map_err(|_| openai::invalid_identity())?;
+        output.push(b'\n');
+    }
+    Ok(Bytes::from(output))
+}
+
+fn same_job_account(
+    a: &aisix_core::native_objects::OriginBinding,
+    b: &aisix_core::native_objects::OriginBinding,
+) -> bool {
+    a.provider_key_id == b.provider_key_id && a.boundary == b.boundary
+}
+
+async fn managed_forward(
+    state: ProxyState,
+    auth: AuthenticatedKey,
+    client: ClientContext,
+    params: HashMap<String, String>,
+    headers: HeaderMap,
+    spec: FwdSpec,
+) -> Response {
+    use crate::native_api::openai;
+    use aisix_core::native_objects::{
+        NativeObjectKind, NativeProtocol, OwnedRequest, TombstoneRequest,
+    };
+    let started = Instant::now();
+    let snapshot = state.snapshot.load();
+    let mut audit = openai::Audit::default();
+    let kind = if spec.surface == crate::operation::FILES {
+        NativeObjectKind::File
+    } else {
+        NativeObjectKind::MessageBatch
+    };
+    let result=async {
+        let (target,origin,record)=if let Some((raw,_,_))=&spec.id {
+            let (target,origin,record)=managed_lookup(&state,&auth,&client,raw,kind).await?;(target,origin,Some(record))
+        }else{
+            let selected=explicit_model(&params,&headers);
+            if selected.is_none() && params.contains_key("after") {
+                let (target,origin,_)=managed_lookup(&state,&auth,&client,&params["after"],kind).await?;(target,origin,None)
+            }else{
+                let selected=resolve_target(&snapshot,&auth,selected.as_deref(),&client)?;
+                let (target,origin)=openai::resolve(&state,&snapshot,&auth,&client,selected.display_name(),kind)?;
+                (target,origin,None)
+            }
+        };
+        audit.resolved(&target);
+        let _reservation=reserve_target(&state,&snapshot,&auth,&target).await?;
+        audit.input(&state,&snapshot,&auth,&target,spec.body.as_deref().unwrap_or_default(),false).await?;
+        let mut query=openai::strip_model_query(spec.raw_query.as_deref());
+        let mut reply=if record.is_none(){
+            let mut pairs:Vec<(String,String)>=url::form_urlencoded::parse(query.as_bytes()).map(|(a,b)|(a.into_owned(),b.into_owned())).collect();
+            let cursor=pairs.iter().find(|(key,_)|key=="after").map(|(_,value)|value.clone());
+            if let Some(cursor)=cursor {
+                let (_,cursor_origin,_)=managed_lookup(&state,&auth,&client,&cursor,kind).await?;
+                if !same_job_account(&cursor_origin,&origin){return Err(ProxyError::JobResourceNotFound(cursor));}
+            }
+            let default=if kind==NativeObjectKind::File {10000}else{20};
+            let limit=pairs.iter().find(|(key,_)|key=="limit").map(|(_,value)|value.parse::<usize>()).transpose()
+                .map_err(|_|ProxyError::InvalidRequest("limit must be an integer".into()))?.unwrap_or(default);
+            if limit==0||limit>if kind==NativeObjectKind::File {10000}else{100}{return Err(ProxyError::InvalidRequest("limit is outside the supported range".into()));}
+            pairs.retain(|(key,_)|key!="limit"&&key!="provider");
+            let raw_pairs:Vec<_>=query.split('&').filter(|pair| !pair.is_empty()).filter(|pair|{
+                !url::form_urlencoded::parse(pair.as_bytes()).next().is_some_and(|(key,_)|matches!(key.as_ref(),"model"|"provider"|"limit"|"after"))
+            }).map(str::to_owned).collect();
+            let mut visible=Vec::new();let mut pages=0;let mut cursors=std::collections::HashSet::new();
+            loop {
+                pages+=1;if pages>1000{return Err(openai::dependency());}
+                let page_query={
+                    let mut serializer=url::form_urlencoded::Serializer::new(String::new());
+                    for (name,value) in &pairs{if name=="after"{serializer.append_pair(name,value);}}
+                    serializer.append_pair("limit","100");
+                    serializer.finish()
+                };
+                let mut query_parts=raw_pairs.clone();query_parts.push(page_query);query=query_parts.join("&");
+                let reply=openai::send(&state,&target,&client,Method::GET,&spec.upstream_path,&query,openai::Body::Empty).await?;
+                if !reply.status.is_success(){break reply;}
+                let mut page:Value=serde_json::from_slice(&reply.bytes).map_err(|_|openai::invalid_identity())?;
+                let data=page.get("data").and_then(Value::as_array).ok_or_else(openai::invalid_identity)?;
+                let ids:Vec<String>=data.iter().map(|row|row.get("id").and_then(Value::as_str).map(str::to_owned).ok_or_else(openai::invalid_identity)).collect::<Result<_,_>>()?;
+                for id in &ids{require_safe_upstream_id(id).map_err(|_|openai::invalid_identity())?;}
+                if ids.len()>1000{return Err(openai::invalid_identity());}
+                let owned=openai::registry(&state)?.owned(OwnedRequest {api_key_id:openai::api_key_id(&auth)?,protocol:NativeProtocol::Openai,kind,origin:origin.clone(),parent_id:None,raw_ids:ids.clone()}).await.map_err(openai::registry_error)?;
+                if owned.state!="owned"{return Err(openai::dependency());}
+                let owned:std::collections::HashMap<_,_>=owned.records.into_iter().filter(|record|!record.deleted&&record.protocol==Some(NativeProtocol::Openai)&&record.kind==Some(kind)&&record.operation!="batch_input"&&record.origin.as_ref().is_some_and(|actual|same_job_account(actual,&origin))).map(|record|(record.raw_id.clone(),record)).collect();
+                for row in data {
+                    if let Some(owned)=row.get("id").and_then(Value::as_str).and_then(|id|owned.get(id)){
+                        match managed_validate_record(&state,&auth,&client,kind,owned,None){
+                            Ok(_)=>{},Err(ProxyError::JobResourceNotFound(_))=>continue,Err(error)=>return Err(error),
+                        }
+                        let mut row=row.clone();
+                        if kind==NativeObjectKind::MessageBatch && row.get("input_file_id").is_some(){
+                            if let Some(raw)=&owned.input_file_id{row["input_file_id"]=Value::String(raw.clone());}
+                        }
+                        visible.push(row);
+                    }
+                }
+                let has_more=page.get("has_more").and_then(Value::as_bool).ok_or_else(openai::invalid_identity)?;
+                if visible.len()>limit||!has_more{
+                    let more=visible.len()>limit;visible.truncate(limit);
+                    let first=visible.first().and_then(|row|row.get("id")).cloned().unwrap_or(Value::Null);
+                    let last=visible.last().and_then(|row|row.get("id")).cloned().unwrap_or(Value::Null);
+                    page=serde_json::json!({"object":"list","data":visible,"first_id":first,"last_id":last,"has_more":more});
+                    break openai::Reply {bytes:Bytes::from(serde_json::to_vec(&page).map_err(|_|openai::dependency())?),..reply};
+                }
+                let after=ids.last().ok_or_else(openai::invalid_identity)?;
+                if !cursors.insert(after.clone()){return Err(openai::invalid_identity());}
+                pairs.retain(|(key,_)|key!="after");pairs.push(("after".into(),after.clone()));
+            }
+        }else{
+            openai::send(&state,&target,&client,spec.method.clone(),&spec.upstream_path,&query,match &spec.body {Some(body)=>openai::Body::Json(body.clone()),None=>openai::Body::Empty}).await?
+        };
+        if reply.status.is_success(){
+            if let Some(record)=record.as_ref(){
+                if kind==NativeObjectKind::File && spec.relay_raw_body && record.operation==BATCH_RESULT_OPERATION {
+                    reply.bytes=managed_result_content(&state,&auth,&client,record,&reply.bytes,&mut audit).await?;
+                }
+                if spec.method==Method::DELETE {
+                    let tombstone=openai::registry(&state)?.tombstone(TombstoneRequest {api_key_id:openai::api_key_id(&auth)?,record_id:record.record_id,version:record.version}).await.map_err(openai::registry_error)?;
+                    if tombstone.state!="deleted"{return Err(openai::dependency());}
+                }
+                if kind==NativeObjectKind::MessageBatch {
+                    let mut body:Value=serde_json::from_slice(&reply.bytes).map_err(|_|openai::invalid_identity())?;
+                    if body.get("id").and_then(Value::as_str)!=Some(record.raw_id.as_str()){return Err(openai::invalid_identity());}
+                    if matches!(body.get("status").and_then(Value::as_str),Some("completed"|"failed"|"expired"|"cancelled")) {
+                        crate::native_api::openai_batch_worker::settle_record(&state,record).await.map_err(openai::registry_error)?;
+                    }
+                    if body.get("input_file_id").is_some(){
+                        if let Some(raw)=&record.input_file_id{body["input_file_id"]=Value::String(raw.clone());}
+                    }
+                    reply.bytes=Bytes::from(serde_json::to_vec(&body).map_err(|_|openai::dependency())?);
+                }
+            }
+        }
+        if kind==NativeObjectKind::MessageBatch {audit.output(&state,&auth,&target,&reply.bytes).await?;}
+        Ok((openai::raw_body(reply.status,&reply.headers,reply.bytes),target))
+    }.await;
+    openai::finish(
+        &state,
+        &snapshot,
+        spec.surface,
+        spec.method,
+        &spec.log_path,
+        &auth,
+        &client,
+        started,
+        result,
+        audit,
+        aisix_core::native_objects::InferenceStage::Management,
+        None,
     )
     .await
 }
@@ -2796,6 +4107,7 @@ struct BatchAttribution {
     price: Option<aisix_core::models::model::ModelCost>,
     raw_batch_id: String,
     output_file_id: String,
+    endpoint: Option<String>,
     ended_at: Option<f64>,
     request_id: String,
     /// 观察到它的那次请求的头。观察者不是付钱的人时不带：那些头描述的是别人。
@@ -2863,6 +4175,10 @@ fn prepare_batch_attribution(
         price,
         raw_batch_id: raw_batch_id.to_string(),
         output_file_id,
+        endpoint: batch
+            .get("endpoint")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         ended_at,
         request_id: client.request_id.clone(),
         request_headers,
@@ -3031,11 +4347,13 @@ fn watch_batch(
 /// 读一次批次的当前状态。读不到不算什么：下一轮再读，不进熔断也不进部署指标。
 async fn poll_batch(target: &JobTarget, raw_batch_id: &str, request_id: &str) -> Option<Value> {
     let url = upstream_url(target, &format!("/batches/{raw_batch_id}"), "").ok()?;
-    let resp = upstream_request(target, reqwest::Method::GET, &url, request_id)
-        .timeout(BATCH_ATTRIBUTION_TIMEOUT)
-        .send()
-        .await
-        .ok()?;
+    let resp = aisix_gateway::upstream_io::send(
+        upstream_request(target, reqwest::Method::GET, &url, request_id, false)
+            .timeout(BATCH_ATTRIBUTION_TIMEOUT),
+        aisix_gateway::upstream_io::Protocol::Unknown,
+    )
+    .await
+    .ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -3098,11 +4416,19 @@ async fn attribute_batch_usage(job: &BatchAttribution) -> Result<(), String> {
         "",
     )
     .map_err(|e| e.to_string())?;
-    let resp = upstream_request(&job.target, reqwest::Method::GET, &url, &job.request_id)
-        .timeout(BATCH_ATTRIBUTION_TIMEOUT)
-        .send()
-        .await
-        .map_err(|e| aisix_gateway::transport_error_message(&e))?;
+    let resp = aisix_gateway::upstream_io::send(
+        upstream_request(
+            &job.target,
+            reqwest::Method::GET,
+            &url,
+            &job.request_id,
+            false,
+        )
+        .timeout(BATCH_ATTRIBUTION_TIMEOUT),
+        aisix_gateway::upstream_io::Protocol::Unknown,
+    )
+    .await
+    .map_err(|e| aisix_gateway::transport_error_message(&e))?;
     if !resp.status().is_success() {
         return Err(format!("output file download returned {}", resp.status()));
     }
@@ -3113,7 +4439,9 @@ async fn attribute_batch_usage(job: &BatchAttribution) -> Result<(), String> {
         prompt: u64,
         completion: u64,
         cached: u64,
-        cache_write: u64,
+        cache_write: Option<u64>,
+        cache_missing: bool,
+        reasoning: u64,
         modality: aisix_gateway::ModalityTokens,
         total: crate::usage_attr::ReportedTotalSum,
         lines: u64,
@@ -3129,31 +4457,53 @@ async fn attribute_batch_usage(job: &BatchAttribution) -> Result<(), String> {
         };
         let resp_body = &v["response"]["body"];
         let usage = &resp_body["usage"];
-        let prompt = usage["prompt_tokens"].as_u64().unwrap_or(0);
-        let completion = usage["completion_tokens"].as_u64().unwrap_or(0);
-        let cached = usage["prompt_tokens_details"]["cached_tokens"]
-            .as_u64()
-            .unwrap_or(0);
-        let cache_write = usage["prompt_tokens_details"]["cache_write_tokens"]
-            .as_u64()
-            .unwrap_or(0);
-        if prompt == 0 && completion == 0 {
-            return; // errored line or embeddings-shape without usage
+        // endpoint 是批次合同的一部分，不根据非零字段猜测协议；旧记录缺省仍按 Chat。
+        let stats = match job.endpoint.as_deref().unwrap_or("/v1/chat/completions") {
+            "/v1/responses" => crate::responses::response_usage_stats(resp_body),
+            "/v1/embeddings" => crate::embeddings::embedding_usage_stats(resp_body),
+            "/v1/chat/completions" => {
+                if usage.get("prompt_tokens").is_none() && usage.get("completion_tokens").is_none()
+                {
+                    return;
+                }
+                serde_json::from_value::<aisix_provider_openai::wire::OpenAiUsage>(usage.clone())
+                    .ok()
+                    .map(aisix_provider_openai::wire::into_usage)
+            }
+            _ => None,
+        };
+        let Some(stats) = stats else { return };
+        if stats.prompt_tokens == 0 && stats.completion_tokens == 0 {
+            return;
         }
         let model = resp_body["model"].as_str().unwrap_or("").to_string();
         let agg = per_model.entry(model).or_default();
-        agg.prompt += prompt;
-        agg.completion += completion;
-        agg.cached += cached;
-        agg.cache_write += cache_write;
-        // Lines that counted nothing were skipped above.
+        agg.prompt = agg.prompt.saturating_add(u64::from(stats.prompt_tokens));
+        agg.completion = agg.completion.saturating_add(u64::from(
+            aisix_gateway::chat::recorded_completion_tokens(
+                stats.prompt_tokens,
+                stats.completion_tokens,
+                stats.reasoning_tokens,
+                stats.reasoning_folded_into_completion,
+                stats.upstream_total_tokens,
+            ),
+        ));
+        agg.cache_missing |= stats.cache_usage_reported() != Some(true);
+        agg.cached = agg
+            .cached
+            .saturating_add(u64::from(stats.cached_prompt_tokens));
+        if let Some(write) = stats.cache_write_tokens {
+            agg.cache_write = Some(
+                agg.cache_write
+                    .unwrap_or(0)
+                    .saturating_add(u64::from(write)),
+            );
+        }
+        agg.reasoning = agg
+            .reasoning
+            .saturating_add(u64::from(stats.reasoning_tokens));
         agg.total.add(usage, true);
-        agg.modality =
-            agg.modality
-                .saturating_add(&aisix_gateway::ModalityTokens::from_openai_details(
-                    usage.get("prompt_tokens_details"),
-                    usage.get("completion_tokens_details"),
-                ));
+        agg.modality = agg.modality.saturating_add(&stats.modality);
         agg.lines += 1;
         agg.service_tier.observe(resp_body["service_tier"].as_str());
     };
@@ -3239,7 +4589,7 @@ async fn attribute_batch_usage(job: &BatchAttribution) -> Result<(), String> {
                 crate::usage_attr::input_tokens_for_pricing(
                     agg.prompt,
                     agg.cached,
-                    agg.cache_write,
+                    agg.cache_write.unwrap_or(0),
                     0,
                     0,
                 ),
@@ -3275,8 +4625,9 @@ async fn attribute_batch_usage(job: &BatchAttribution) -> Result<(), String> {
             completion_tokens: agg.completion.min(u32::MAX as u64) as u32,
             total_tokens: agg.total.recorded(),
             cached_prompt_tokens: agg.cached.min(u32::MAX as u64) as u32,
-            cache_write_tokens: (agg.cache_write > 0)
-                .then(|| agg.cache_write.min(u32::MAX as u64) as u32),
+            cache_write_tokens: agg.cache_write.map(|n| n.min(u32::MAX as u64) as u32),
+            cache_usage_reported: Some(!agg.cache_missing),
+            reasoning_tokens: agg.reasoning.min(u32::MAX as u64) as u32,
             modality_tokens: agg.modality,
             status_code: 200,
             provider_model_version: provider_model.clone(),
@@ -6717,4 +8068,5 @@ mod tests {
         let v: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["error"]["type"], "content_filter", "{v}");
     }
+    include!("jobs_compat_tests.rs");
 }

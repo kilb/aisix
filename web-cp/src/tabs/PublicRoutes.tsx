@@ -1,3 +1,4 @@
+import "./operations.css";
 import { useEffect, useRef, useState } from "react";
 import type { TabProps } from "../App";
 import { createPublicModelWriteGate } from "../lib/publicModelWriteGate";
@@ -34,7 +35,7 @@ export function PublicRoutes(props: TabProps) {
     models: new Map((models.items ?? []).map((model) => [model.id, model])),
     accounts: new Map((accounts.items ?? []).map((account) => [account.id, account])),
   };
-  return <>
+  return <div className="cp-operations cp-publicroutes">
     <Msg note={note} />
     {accounts.error && <p className="note crit" role="alert">上游账号读取失败，请刷新后再添加目标：{errorText(accounts.error)}</p>}
     <PublicModels {...props} writeGate={writeGate} renderRouting={(model, reload, close, apply) => model.retired_at ? undefined : <PublicRoutingForm
@@ -54,5 +55,5 @@ export function PublicRoutes(props: TabProps) {
         if (!await reload()) setNote({ kind: "warn", text: `已移除账号「${account}」的映射，但完整列表读回失败，请刷新核对。` });
       }}
     />} />
-  </>;
+  </div>;
 }

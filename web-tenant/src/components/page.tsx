@@ -16,7 +16,7 @@ export function PageHeader({
   return (
     <header className={cn("page-header bento-page-header", className)}>
       <div className="min-w-0">
-        <h1 className="text-title font-medium">{title}</h1>
+        <h1 className="text-title font-semibold">{title}</h1>
         {(dataLead ?? description) != null && (
           <div className="bento-lead mt-2 text-lead font-normal text-ink-soft">{dataLead ?? description}</div>
         )}
@@ -60,7 +60,7 @@ export function CardHeader({
   return (
     <div className={cn("bento-card-header flex flex-wrap items-center justify-between gap-x-4 gap-y-2", className)}>
       <div className="min-w-0">
-        <Heading className="flex items-baseline gap-2 text-stat font-semibold text-foreground">
+        <Heading className={cn("flex items-baseline gap-2 font-semibold text-foreground", Heading === "h3" ? "text-[15px] leading-6" : "text-stat")}>
           <span>{title}</span>
         </Heading>
         {description && <p className="mt-1.5 text-caption text-muted">{description}</p>}

@@ -43,6 +43,8 @@ pub struct ChatCompletion {
     /// OpenAI-shape upstream and omitted when it sent none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -52,6 +54,8 @@ pub struct NonStreamChoice {
     pub finish_reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<serde_json::Value>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -86,11 +90,35 @@ pub enum RenderedContent {
 }
 
 impl RenderedMessage {
-    fn from_message(message: aisix_gateway::ChatMessage) -> Self {
-        let content = match (message.content, message.content_blocks) {
-            (Some(text), _) => Some(RenderedContent::Text(text)),
-            (None, Some(parts)) => Some(RenderedContent::Parts(parts)),
-            (None, None) => None,
+    fn from_message(mut message: aisix_gateway::ChatMessage, translated: bool) -> Self {
+        let replay = translated
+            && message.content_blocks.as_ref().is_some_and(|blocks| {
+                blocks.iter().any(|block| {
+                    matches!(
+                        block.get("type").and_then(serde_json::Value::as_str),
+                        Some("thinking" | "redacted_thinking" | "tool_use")
+                    )
+                })
+            });
+        let content = if replay {
+            // 缓存反序列化会移除派生文本，读取 accessor 才能重建标准 content。
+            let has_text = message.content.is_some()
+                || message.content_blocks.iter().flatten().any(|block| {
+                    block.get("type").and_then(serde_json::Value::as_str) == Some("text")
+                });
+            let text = has_text.then(|| RenderedContent::Text(message.content_str().into_owned()));
+            if let Some(blocks) = message.content_blocks.take() {
+                message
+                    .extra
+                    .insert("content_blocks".into(), serde_json::Value::Array(blocks));
+            }
+            text
+        } else {
+            match (message.content, message.content_blocks) {
+                (Some(text), _) => Some(RenderedContent::Text(text)),
+                (None, Some(parts)) => Some(RenderedContent::Parts(parts)),
+                (None, None) => None,
+            }
         };
         Self {
             role: role_to_str(message.role),
@@ -228,7 +256,9 @@ impl Usage {
             text_tokens: reported.prompt_text_tokens,
             image_tokens: u.modality.prompt_image_tokens,
             cache_write_tokens: u.cache_write_tokens,
-            cache_creation_tokens: (cache_creation_tokens > 0).then_some(cache_creation_tokens),
+            cache_creation_tokens: (cache_creation_tokens > 0
+                || reported.cache_creation_tokens_reported)
+                .then_some(cache_creation_tokens),
         };
         let completion = CompletionTokensDetails {
             reasoning_tokens: (u.reasoning_tokens > 0 || reported.reasoning_tokens_reported)
@@ -280,6 +310,8 @@ pub struct ChatCompletionChunk {
     /// See [`ChatCompletion::service_tier`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -290,6 +322,8 @@ pub struct StreamChoice {
     pub finish_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<serde_json::Value>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -354,7 +388,11 @@ pub fn render_response(
     client_facing_model: &str,
     platform: Option<&crate::platform::PlatformSettings>,
 ) -> ChatCompletion {
-    let message = RenderedMessage::from_message;
+    let native = resp.native_envelope.is_some();
+    let envelope = resp.native_envelope.unwrap_or_default();
+    let empty_choices = native && envelope.choice.is_none();
+    let first = envelope.choice.unwrap_or_default();
+    let message = |message| RenderedMessage::from_message(message, !native);
     // `resp.model` is whatever the upstream returned (`gpt-4o`,
     // `claude-3-5-sonnet-20241022`, etc.). The wire-level contract is
     // to echo the customer's requested name — see module-level docs.
@@ -365,23 +403,27 @@ pub fn render_response(
             resp.id
         },
         object: "chat.completion",
-        created: created_unix_ts,
+        created: envelope.created.unwrap_or(created_unix_ts),
         model: client_facing_model.to_string(),
         choices: std::iter::once(NonStreamChoice {
-            index: 0,
+            index: first.index,
             message: message(resp.message),
             finish_reason: finish_to_str(&resp.finish_reason).to_string(),
             logprobs: resp.logprobs,
+            extra: first.extra,
         })
+        .take(usize::from(!empty_choices))
         .chain(resp.more_choices.into_iter().map(|c| NonStreamChoice {
             index: c.index,
             message: message(c.message),
             finish_reason: finish_to_str(&c.finish_reason).to_string(),
             logprobs: c.logprobs,
+            extra: c.extra,
         }))
         .collect(),
         usage: Usage::for_client(&resp.usage, platform.is_some()),
         service_tier: openai_service_tier(resp.service_tier.as_ref()),
+        extra: envelope_extra_for_client(envelope.extra, platform.is_some()),
     }
 }
 
@@ -395,7 +437,11 @@ pub fn render_chunk(
 ) -> ChatCompletionChunk {
     // A frame that carries only usage is the `include_usage` terminal
     // frame, which OpenAI sends with an empty `choices` array.
-    let usage_only = chunk.is_usage_only();
+    let usage_only = chunk.native_envelope.as_ref().map_or_else(
+        || chunk.is_usage_only(),
+        |envelope| envelope.choice.is_none(),
+    );
+    let envelope = chunk.native_envelope.unwrap_or_default();
     let choices = if usage_only {
         Vec::new()
     } else {
@@ -415,6 +461,9 @@ pub fn render_chunk(
                 .as_ref()
                 .map(|f| finish_to_str(f).to_string()),
             logprobs: chunk.logprobs,
+            extra: envelope
+                .choice
+                .map_or_else(Default::default, |choice| choice.extra),
         }]
     };
     // Same contract as `render_response`: every chunk's `model` field
@@ -424,7 +473,7 @@ pub fn render_chunk(
     ChatCompletionChunk {
         id: chunk.id,
         object: "chat.completion.chunk",
-        created: created_unix_ts,
+        created: envelope.created.unwrap_or(created_unix_ts),
         model: client_facing_model.to_string(),
         choices,
         usage: chunk
@@ -432,11 +481,380 @@ pub fn render_chunk(
             .as_ref()
             .map(|u| Usage::for_client(u, platform.is_some())),
         service_tier: openai_service_tier(chunk.service_tier.as_ref()),
+        extra: envelope_extra_for_client(envelope.extra, platform.is_some()),
     }
+}
+
+fn envelope_extra_for_client(
+    mut extra: serde_json::Map<String, serde_json::Value>,
+    platform: bool,
+) -> serde_json::Map<String, serde_json::Value> {
+    if platform {
+        extra.remove("system_fingerprint");
+    }
+    extra
 }
 
 fn openai_service_tier(tier: Option<&aisix_gateway::ServiceTier>) -> Option<String> {
     tier.and_then(|t| t.openai_value()).map(str::to_owned)
+}
+
+#[cfg(test)]
+mod compat_chat_envelope_tests {
+    use super::*;
+    use aisix_provider_openai::wire;
+    use serde_json::{json, Value};
+
+    fn response_body() -> Value {
+        json!({
+            "id": "chatcmpl-envelope", "object": "chat.completion",
+            "created": 1_700_000_000, "model": "upstream-model",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "hello"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+        })
+    }
+
+    fn render_native(body: Value, cached: bool, platform: bool) -> Value {
+        let raw: wire::OpenAiResponse = serde_json::from_value(body).unwrap();
+        let mut response = wire::response_into_chat_response(raw);
+        if cached {
+            response = serde_json::from_slice(&serde_json::to_vec(&response).unwrap()).unwrap();
+        }
+        let settings = crate::platform::PlatformSettings::from_secret("compat-envelope-test");
+        serde_json::to_value(render_response(
+            42,
+            response,
+            "public-model",
+            platform.then_some(&settings),
+        ))
+        .unwrap()
+    }
+
+    fn render_native_frame(body: Value, platform: bool) -> Vec<Value> {
+        let raw: wire::OpenAiStreamChunk = serde_json::from_value(body).unwrap();
+        let mut indexer = wire::ToolCallIndexer::default();
+        let settings = crate::platform::PlatformSettings::from_secret("compat-envelope-test");
+        wire::stream_chunk_into_chat_chunks(raw, &mut indexer)
+            .into_iter()
+            .map(|chunk| {
+                serde_json::to_value(render_chunk(
+                    42,
+                    chunk,
+                    "public-model",
+                    platform.then_some(&settings),
+                ))
+                .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn compat_chat_native_created_survives_decode_render_and_storage() {
+        for cached in [false, true] {
+            let body = render_native(response_body(), cached, false);
+            assert_eq!(
+                body.get("created"),
+                Some(&json!(1_700_000_000)),
+                "cached={cached}"
+            );
+            assert_eq!(body["model"], "public-model");
+        }
+    }
+
+    #[test]
+    fn compat_chat_native_metadata_survives_decode_render_and_storage() {
+        for cached in [false, true] {
+            let mut upstream = response_body();
+            upstream["metadata"] = json!({"audit": "compat"});
+            let body = render_native(upstream.clone(), cached, false);
+            assert_eq!(
+                body.get("metadata"),
+                upstream.get("metadata"),
+                "cached={cached}"
+            );
+        }
+        assert!(render_native(response_body(), false, false)
+            .get("metadata")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn compat_chat_native_envelope_survives_exact_and_semantic_store_roundtrips() {
+        use aisix_cache::{Cache, MemoryCache, MemorySemanticCache, SemanticCacheStore};
+        use std::time::Duration;
+
+        let mut upstream = response_body();
+        upstream["metadata"] = json!({"audit": "cache-roundtrip"});
+        upstream["choices"][0]["content_filter_results"] =
+            json!({"hate": {"filtered": false, "severity": "safe"}});
+        let decoded =
+            wire::response_into_chat_response(serde_json::from_value(upstream.clone()).unwrap());
+        let persisted: ChatResponse =
+            serde_json::from_slice(&serde_json::to_vec(&decoded).unwrap()).unwrap();
+        let exact = MemoryCache::with_defaults();
+        exact.put("compat-exact", persisted.clone()).await.unwrap();
+        let exact_hit = exact.get("compat-exact").await.unwrap().unwrap();
+        let semantic = MemorySemanticCache::new();
+        semantic
+            .store(
+                "compat-policy",
+                0,
+                "compat-scope",
+                "compat-exact",
+                vec![1.0, 0.0],
+                persisted,
+                Duration::from_secs(60),
+                4,
+            )
+            .await
+            .unwrap();
+        let semantic_hit = semantic
+            .lookup("compat-policy", 0, "compat-scope", &[1.0, 0.0], 0.99)
+            .await
+            .unwrap()
+            .unwrap()
+            .response;
+        for hit in [exact_hit, semantic_hit] {
+            let body =
+                serde_json::to_value(render_response(42, hit, "public-model", None)).unwrap();
+            assert_eq!(body.get("metadata"), upstream.get("metadata"));
+            assert_eq!(body.get("created"), upstream.get("created"));
+            assert_eq!(
+                body["choices"][0].get("content_filter_results"),
+                upstream["choices"][0].get("content_filter_results")
+            );
+        }
+    }
+
+    #[test]
+    fn compat_chat_native_moderation_success_and_error_survive_storage() {
+        for result in [
+            json!({"type": "moderation_results", "model": "omni-moderation-latest", "results": []}),
+            json!({"type": "error", "code": "moderation_unavailable", "message": "Moderation temporarily unavailable"}),
+        ] {
+            for cached in [false, true] {
+                let mut upstream = response_body();
+                upstream["moderation"] = json!({"input": result, "output": result});
+                let body = render_native(upstream.clone(), cached, false);
+                assert_eq!(
+                    body.get("moderation"),
+                    upstream.get("moderation"),
+                    "cached={cached}"
+                );
+            }
+        }
+        assert!(render_native(response_body(), false, false)
+            .get("moderation")
+            .is_none());
+    }
+
+    #[test]
+    fn compat_chat_native_fingerprint_is_hidden_only_in_platform_mode() {
+        for cached in [false, true] {
+            let mut upstream = response_body();
+            upstream["system_fingerprint"] = json!("fp_backend");
+            upstream["metadata"] = json!({"audit": "compat"});
+            let body = render_native(upstream.clone(), cached, false);
+            assert_eq!(
+                body.get("system_fingerprint"),
+                upstream.get("system_fingerprint")
+            );
+            let body = render_native(upstream.clone(), cached, true);
+            assert!(body.get("system_fingerprint").is_none());
+            assert_eq!(body.get("metadata"), upstream.get("metadata"));
+        }
+    }
+
+    #[test]
+    fn compat_chat_native_filter_results_stay_at_their_original_levels() {
+        let mut upstream = response_body();
+        upstream["prompt_filter_results"] = json!([{"prompt_index": 0, "content_filter_results": {"hate": {"filtered": false, "severity": "safe"}}}]);
+        upstream["choices"][0]["content_filter_results"] =
+            json!({"hate": {"filtered": false, "severity": "safe"}});
+        upstream["choices"].as_array_mut().unwrap().push(json!({
+            "index": 1, "message": {"role": "assistant", "content": "second"}, "finish_reason": "stop",
+            "content_filter_results": {"violence": {"filtered": false, "severity": "safe"}}
+        }));
+        for cached in [false, true] {
+            let body = render_native(upstream.clone(), cached, false);
+            assert_eq!(
+                body.get("prompt_filter_results"),
+                upstream.get("prompt_filter_results")
+            );
+            for index in 0..2 {
+                assert_eq!(
+                    body["choices"][index].get("content_filter_results"),
+                    upstream["choices"][index].get("content_filter_results")
+                );
+                assert!(body["choices"][index]["message"]
+                    .get("content_filter_results")
+                    .is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn compat_chat_native_stream_created_obfuscation_and_filters_survive() {
+        let upstream = json!({
+            "id": "chatcmpl-envelope", "object": "chat.completion.chunk", "created": 1_700_000_000,
+            "model": "upstream-model", "obfuscation": "padding-value", "system_fingerprint": "fp_backend",
+            "choices": [{"index": 0, "delta": {"content": "hello"}, "content_filter_results": {"hate": {"filtered": false, "severity": "safe"}}}]
+        });
+        for platform in [false, true] {
+            let frames = render_native_frame(upstream.clone(), platform);
+            assert_eq!(frames.len(), 1);
+            let frame = &frames[0];
+            assert_eq!(frame.get("created"), upstream.get("created"));
+            assert_eq!(frame.get("obfuscation"), upstream.get("obfuscation"));
+            assert_eq!(
+                frame["choices"][0].get("content_filter_results"),
+                upstream["choices"][0].get("content_filter_results")
+            );
+            assert_eq!(frame.get("system_fingerprint").is_some(), !platform);
+            assert_eq!(frame["model"], "public-model");
+        }
+    }
+
+    #[test]
+    fn compat_chat_native_moderation_only_frame_keeps_empty_choices() {
+        let upstream = json!({
+            "id": "chatcmpl-envelope", "object": "chat.completion.chunk", "created": 1_700_000_000,
+            "model": "upstream-model", "choices": [], "obfuscation": "padding-value",
+            "moderation": {"input": {"type": "error", "code": "moderation_unavailable", "message": "Moderation temporarily unavailable"},
+                "output": {"type": "error", "code": "moderation_unavailable", "message": "Moderation temporarily unavailable"}}
+        });
+        let frames = render_native_frame(upstream.clone(), false);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].get("choices"), Some(&json!([])));
+        assert_eq!(frames[0].get("moderation"), upstream.get("moderation"));
+        assert_eq!(frames[0].get("obfuscation"), upstream.get("obfuscation"));
+    }
+
+    #[test]
+    fn compat_chat_zero_usage_details_are_present_only_when_reported() {
+        use aisix_provider_anthropic::wire as anthropic;
+        for reported in [false, true] {
+            let mut usage = json!({"input_tokens": 3, "output_tokens": 2});
+            if reported {
+                usage["cache_creation_input_tokens"] = json!(0);
+                usage["cache_read_input_tokens"] = json!(0);
+                usage["output_tokens_details"] = json!({"thinking_tokens": 0});
+            }
+            let raw: anthropic::AnthropicResponse = serde_json::from_value(json!({
+                "id": "msg-detail", "model": "claude", "type": "message", "role": "assistant",
+                "content": [{"type": "text", "text": "hello"}], "stop_reason": "end_turn", "usage": usage
+            })).unwrap();
+            let response = anthropic::response_into_chat_response(raw);
+            let body =
+                serde_json::to_value(render_response(42, response, "public-model", None)).unwrap();
+            for path in [
+                "/usage/prompt_tokens_details/cached_tokens",
+                "/usage/prompt_tokens_details/cache_creation_tokens",
+                "/usage/completion_tokens_details/reasoning_tokens",
+            ] {
+                assert_eq!(
+                    body.pointer(path),
+                    reported.then_some(&json!(0)),
+                    "reported={reported} path={path}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compat_chat_native_replay_blocks_render_beside_standard_text() {
+        let blocks = json!([
+            {"type": "thinking", "thinking": "reason", "signature": "opaque-signature"},
+            {"type": "text", "text": "hello"},
+            {"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {"q": "hi"}}
+        ]);
+        let response = translated_replay_response(Some("hello"), &blocks);
+        let body =
+            serde_json::to_value(render_response(42, response, "public-model", None)).unwrap();
+        assert_eq!(body["choices"][0]["message"]["content"], "hello");
+        assert_eq!(
+            body["choices"][0]["message"].get("content_blocks"),
+            Some(&blocks)
+        );
+    }
+
+    fn translated_replay_response(content: Option<&str>, blocks: &Value) -> ChatResponse {
+        let mut message = aisix_gateway::ChatMessage::assistant("");
+        message.content = content.map(str::to_owned);
+        message.content_blocks = Some(blocks.as_array().unwrap().clone());
+        ChatResponse {
+            native_envelope: None,
+            id: "msg-replay".into(),
+            model: "claude".into(),
+            message,
+            finish_reason: FinishReason::Stop,
+            logprobs: None,
+            more_choices: vec![],
+            usage: aisix_gateway::UsageStats::new(3, 2),
+            service_tier: None,
+        }
+    }
+
+    #[test]
+    fn compat_chat_native_replay_without_text_keeps_standard_content_null() {
+        let blocks = json!([
+            {"type": "thinking", "thinking": "reason", "signature": "opaque-signature"},
+            {"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {"q": "hi"}}
+        ]);
+        for cached in [false, true] {
+            let mut response = translated_replay_response(None, &blocks);
+            if cached {
+                response = serde_json::from_slice(&serde_json::to_vec(&response).unwrap()).unwrap();
+            }
+            let body =
+                serde_json::to_value(render_response(42, response, "public-model", None)).unwrap();
+            assert_eq!(
+                body["choices"][0]["message"].get("content"),
+                Some(&Value::Null)
+            );
+            assert_eq!(
+                body["choices"][0]["message"].get("content_blocks"),
+                Some(&blocks)
+            );
+        }
+    }
+
+    #[test]
+    fn compat_chat_cached_replay_derives_standard_text_without_losing_blocks() {
+        let blocks = json!([
+            {"type": "thinking", "thinking": "reason", "signature": "opaque-signature"},
+            {"type": "text", "text": "hello"}
+        ]);
+        let response = translated_replay_response(Some("hello"), &blocks);
+        let cached: ChatResponse =
+            serde_json::from_slice(&serde_json::to_vec(&response).unwrap()).unwrap();
+        let body = serde_json::to_value(render_response(42, cached, "public-model", None)).unwrap();
+        assert_eq!(
+            body["choices"][0]["message"].get("content"),
+            Some(&json!("hello"))
+        );
+        assert_eq!(
+            body["choices"][0]["message"].get("content_blocks"),
+            Some(&blocks)
+        );
+    }
+
+    #[test]
+    fn compat_chat_native_actual_content_array_keeps_its_wire_position() {
+        let mut upstream = response_body();
+        let parts = json!([
+            {"type": "thinking", "thinking": "reason", "signature": "opaque-signature"},
+            {"type": "text", "text": "hello"}
+        ]);
+        upstream["choices"][0]["message"]["content"] = parts.clone();
+        for cached in [false, true] {
+            let body = render_native(upstream.clone(), cached, false);
+            assert_eq!(body["choices"][0]["message"].get("content"), Some(&parts));
+            assert!(body["choices"][0]["message"]
+                .get("content_blocks")
+                .is_none());
+        }
+    }
 }
 
 /// Inject the `x-ratelimit-*` response headers that OpenAI SDK clients
@@ -523,6 +941,7 @@ mod tests {
     #[test]
     fn render_response_matches_openai_shape() {
         let r = ChatResponse {
+            native_envelope: None,
             logprobs: None,
             more_choices: Vec::new(),
             id: "cmpl-1".into(),
@@ -556,6 +975,7 @@ mod tests {
     fn service_tier_passes_through_only_from_an_openai_shape_upstream() {
         use aisix_gateway::ServiceTier;
         let resp = |tier| ChatResponse {
+            native_envelope: None,
             logprobs: None,
             more_choices: Vec::new(),
             id: "c".into(),
@@ -577,6 +997,7 @@ mod tests {
             .is_none());
 
         let chunk = |tier| ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "c".into(),
@@ -621,6 +1042,7 @@ mod tests {
             extra,
         };
         let r = ChatResponse {
+            native_envelope: None,
             logprobs: None,
             more_choices: Vec::new(),
             id: "cmpl-1".into(),
@@ -664,6 +1086,7 @@ mod tests {
             ..UsageStats::default()
         };
         let r = ChatResponse {
+            native_envelope: None,
             logprobs: None,
             more_choices: Vec::new(),
             id: "cmpl-1".into(),
@@ -702,6 +1125,7 @@ mod tests {
             ..UsageStats::default()
         };
         let r = ChatResponse {
+            native_envelope: None,
             logprobs: None,
             more_choices: Vec::new(),
             id: "cmpl-ds".into(),
@@ -736,6 +1160,7 @@ mod tests {
             ..UsageStats::default()
         };
         let chunk = ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "c".into(),
@@ -767,6 +1192,7 @@ mod tests {
     #[test]
     fn render_response_uses_client_facing_model_not_upstream_raw() {
         let r = ChatResponse {
+            native_envelope: None,
             logprobs: None,
             more_choices: Vec::new(),
             id: "cmpl-1".into(),
@@ -789,6 +1215,7 @@ mod tests {
     #[test]
     fn render_chunk_omits_finish_reason_when_absent() {
         let chunk = ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "c".into(),
@@ -821,6 +1248,7 @@ mod tests {
     #[test]
     fn render_chunk_uses_client_facing_model_not_upstream_raw() {
         let chunk = ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "c".into(),
@@ -846,6 +1274,7 @@ mod tests {
 
     fn upstream_chunk(id: &str, tool_call_id: Option<&str>) -> ChatChunk {
         ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: id.into(),
@@ -940,6 +1369,7 @@ mod tests {
                 "function": {"name": "f", "arguments": "{}"}}]),
         );
         let r = ChatResponse {
+            native_envelope: None,
             logprobs: None,
             more_choices: Vec::new(),
             id: "chatcmpl-up".into(),
@@ -972,8 +1402,10 @@ mod tests {
             let mut second = ChatMessage::assistant("");
             second.extra.insert("tool_calls".into(), calls.clone());
             ChatResponse {
+                native_envelope: None,
                 logprobs: None,
                 more_choices: vec![aisix_gateway::chat::ChatChoice {
+                    extra: Default::default(),
                     index: 1,
                     message: second,
                     finish_reason: FinishReason::ToolCalls,
@@ -1023,6 +1455,7 @@ mod tests {
     #[test]
     fn finish_reason_other_serialises_verbatim() {
         let r = ChatResponse {
+            native_envelope: None,
             logprobs: None,
             more_choices: Vec::new(),
             id: "cmpl".into(),

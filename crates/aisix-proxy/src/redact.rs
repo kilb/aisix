@@ -1336,6 +1336,23 @@ fn redact_chat_format_impl(
         }
         if let Some(blocks) = msg.content_blocks.as_mut() {
             for block in blocks {
+                match block.get("type").and_then(Value::as_str) {
+                    Some("redacted_thinking") => continue,
+                    Some("tool_use") => {
+                        unrewritable_tool_key |= redact_chat_replay_blocks(
+                            chain,
+                            dir,
+                            std::slice::from_mut(block),
+                            &mut counts,
+                            detect_keys,
+                            false,
+                            false,
+                        )
+                        .0;
+                        continue;
+                    }
+                    _ => {}
+                }
                 if block.get("type").and_then(Value::as_str) == Some("text") {
                     if let Some(text) = block.get_mut("text") {
                         apply_to_value_string(chain, dir, text, &mut counts);
@@ -3472,6 +3489,69 @@ pub fn redact_completions_response(chain: &dyn Guardrail, body: &mut Value) -> R
 
 // ─── Response side (non-streaming) ───────────────────────────────────────────
 
+// 只改写回放载荷的普通文本和工具输入；签名、思考文本和密文保持原样。
+fn redact_chat_replay_blocks(
+    chain: &dyn Guardrail,
+    dir: Direction,
+    blocks: &mut [Value],
+    counts: &mut RedactionCounts,
+    detect_keys: bool,
+    echo_text: bool,
+    echo_tools: bool,
+) -> (bool, bool) {
+    let mut unrewritable = false;
+    let mut rewritten = false;
+    for block in blocks {
+        let kind = block.get("type").and_then(Value::as_str).map(str::to_owned);
+        let echo = matches!(dir, Direction::Output)
+            && match kind.as_deref() {
+                Some("text") => echo_text,
+                Some("tool_use") => echo_tools,
+                _ => false,
+            };
+        let direction = if echo { Direction::OutputEcho } else { dir };
+        let mut local = RedactionCounts::new();
+        match kind.as_deref() {
+            Some("text") => {
+                if let Some(text) = block.get_mut("text") {
+                    apply_to_value_string(chain, direction, text, &mut local);
+                }
+            }
+            Some("tool_use") => {
+                if detect_keys {
+                    if let Some(id) = block.get("id") {
+                        offer_call_handle(chain, direction, id);
+                    }
+                    unrewritable |= detect_named_structural_fields(
+                        chain,
+                        direction,
+                        block,
+                        &["name"],
+                        &mut local,
+                    );
+                } else {
+                    offer_tool_name(chain, direction, block.get("name"));
+                }
+                if let Some(input) = block.get_mut("input") {
+                    unrewritable |= redact_tool_arguments_value(
+                        chain,
+                        direction,
+                        input,
+                        &mut local,
+                        detect_keys,
+                    );
+                }
+            }
+            _ => {}
+        }
+        rewritten |= masked_spans(&local) != 0;
+        if !echo {
+            merge_counts(counts, local);
+        }
+    }
+    (unrewritable, rewritten)
+}
+
 /// Mask a normalised [`ChatResponse`] in place: assistant `content` plus
 /// `tool_calls` function arguments (the same surface
 /// `guardrail_output_text` scans). Reasoning content is excluded from
@@ -3491,15 +3571,24 @@ fn redact_chat_response_impl(
     let mut unrewritable_tool_key = false;
     for (message, logprobs) in resp.choices_mut() {
         let before = masked_spans(&counts);
+        let echo_text = message.content.is_some();
+        let echo_tools = message.extra.contains_key("tool_calls");
         if let Some(content) = message.content.as_mut() {
             apply_to_string(chain, Direction::Output, content, &mut counts);
-        } else if let Some(parts) = message.content_blocks.as_mut() {
-            for part in parts.iter_mut() {
-                if part.get("type").and_then(Value::as_str) == Some("text") {
-                    if let Some(text) = part.get_mut("text") {
-                        apply_to_value_string(chain, Direction::Output, text, &mut counts);
-                    }
-                }
+        }
+        if let Some(parts) = message.content_blocks.as_mut() {
+            let (unrewritable, rewritten) = redact_chat_replay_blocks(
+                chain,
+                Direction::Output,
+                parts,
+                &mut counts,
+                detect_keys,
+                echo_text,
+                echo_tools,
+            );
+            unrewritable_tool_key |= unrewritable;
+            if rewritten {
+                *logprobs = None;
             }
         }
         if let Some(refusal) = message.extra.get_mut("refusal") {
@@ -3986,7 +4075,32 @@ fn redact_chat_chunks_impl(
         }
     }
 
+    let tool_choices: std::collections::BTreeSet<u32> = chunks
+        .iter()
+        .filter(|chunk| chunk.delta.tool_calls.is_some())
+        .map(|chunk| chunk.choice_index)
+        .collect();
     for chunk in chunks.iter_mut() {
+        if let Some(blocks) = chunk
+            .delta
+            .extra
+            .get_mut("content_blocks")
+            .and_then(Value::as_array_mut)
+        {
+            let (unrewritable, rewritten) = redact_chat_replay_blocks(
+                chain,
+                Direction::Output,
+                blocks,
+                &mut counts,
+                detect_keys,
+                content_channels.contains_key(&chunk.choice_index),
+                tool_choices.contains(&chunk.choice_index),
+            );
+            unrewritable_tool_key |= unrewritable;
+            if rewritten {
+                rewritten_choices.insert(chunk.choice_index);
+            }
+        }
         if rewritten_choices.contains(&chunk.choice_index) {
             chunk.logprobs = None;
         }
@@ -5332,6 +5446,116 @@ mod tests {
         mask_chain(aisix_core::models::GuardrailHookPoint::Both)
     }
 
+    fn compat_chat_replay_blocks() -> Vec<Value> {
+        vec![
+            json!({"type": "thinking", "thinking": "alice@example.com", "signature": "signed-alice@example.com"}),
+            json!({"type": "redacted_thinking", "data": "opaque-alice@example.com"}),
+            json!({"type": "text", "text": "mail alice@example.com"}),
+            json!({"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {"email": "alice@example.com"}}),
+        ]
+    }
+
+    fn compat_chat_assert_replay_masked(blocks: &[Value]) {
+        assert_eq!(blocks[2]["text"], "mail [EMAIL_REDACTED]");
+        assert_eq!(blocks[3]["input"]["email"], "[EMAIL_REDACTED]");
+        assert_eq!(blocks[0], compat_chat_replay_blocks()[0]);
+        assert_eq!(blocks[1], compat_chat_replay_blocks()[1]);
+    }
+
+    #[test]
+    fn compat_chat_replay_response_masks_both_standard_and_native_payloads() {
+        let mut message = ChatMessage::assistant("mail alice@example.com");
+        message.content_blocks = Some(compat_chat_replay_blocks());
+        message.extra.insert(
+            "tool_calls".into(),
+            json!([{
+                "id": "toolu_1", "type": "function",
+                "function": {"name": "lookup", "arguments": "{\"email\":\"alice@example.com\"}"}
+            }]),
+        );
+        let mut response = ChatResponse {
+            native_envelope: None,
+            id: "msg_1".into(),
+            model: "m".into(),
+            message,
+            finish_reason: aisix_gateway::FinishReason::ToolCalls,
+            logprobs: None,
+            more_choices: vec![],
+            usage: aisix_gateway::UsageStats::new(2, 3),
+            service_tier: None,
+        };
+        let result = redact_chat_response_structured(both().as_ref(), &mut response);
+        assert!(!result.unrewritable_tool_key);
+        assert_eq!(
+            response.message.content.as_deref(),
+            Some("mail [EMAIL_REDACTED]")
+        );
+        let args: Value = serde_json::from_str(
+            response.message.extra["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(args["email"], "[EMAIL_REDACTED]");
+        compat_chat_assert_replay_masked(response.message.content_blocks.as_deref().unwrap());
+    }
+
+    #[test]
+    fn compat_chat_replay_stream_masks_complete_carrier_and_preserves_opaque_blocks() {
+        let mut chunks: Vec<ChatChunk> = vec![serde_json::from_value(json!({
+            "id": "msg_1", "model": "m", "delta": {
+                "content": "mail alice@example.com",
+                "tool_calls": [{"index": 0, "id": "toolu_1", "type": "function", "function": {"name": "lookup", "arguments": "{\"email\":\"alice@example.com\"}"}}]
+            }
+        })).unwrap()];
+        chunks.push(serde_json::from_value(json!({
+            "id": "msg_1", "model": "m", "delta": {"content_blocks": compat_chat_replay_blocks()}
+        })).unwrap());
+        let result = redact_chat_chunks_structured(both().as_ref(), &mut chunks);
+        assert!(!result.unrewritable_tool_key);
+        assert_eq!(
+            chunks[0].delta.content.as_deref(),
+            Some("mail [EMAIL_REDACTED]")
+        );
+        let args: Value = serde_json::from_str(
+            chunks[0].delta.tool_calls.as_ref().unwrap()[0]["function"]["arguments"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(args["email"], "[EMAIL_REDACTED]");
+        compat_chat_assert_replay_masked(
+            chunks[1].delta.extra["content_blocks"].as_array().unwrap(),
+        );
+    }
+
+    #[test]
+    fn compat_chat_replay_input_masks_native_tool_input_without_rewriting_signature() {
+        let mut request: ChatFormat = serde_json::from_value(json!({
+            "model": "m", "messages": [{"role": "assistant", "content": "mail alice@example.com", "content_blocks": compat_chat_replay_blocks()}]
+        })).unwrap();
+        let result = redact_chat_format_structured(both().as_ref(), &mut request);
+        assert!(!result.unrewritable_tool_key);
+        assert_eq!(request.messages[0].content_str(), "mail [EMAIL_REDACTED]");
+        compat_chat_assert_replay_masked(request.messages[0].content_blocks.as_deref().unwrap());
+    }
+
+    #[test]
+    fn compat_chat_replay_opaque_bytes_count_toward_raw_hold_budget() {
+        let mut chunk: ChatChunk = serde_json::from_value(json!({
+            "id": "msg_1", "model": "m", "delta": {"content": "hello"}
+        }))
+        .unwrap();
+        let before = crate::held_content::chat_chunk_raw(&chunk);
+        chunk.delta.extra.insert(
+            "content_blocks".into(),
+            json!([{
+                "type": "thinking", "thinking": "reason", "signature": "x".repeat(4096)
+            }]),
+        );
+        assert!(crate::held_content::chat_chunk_raw(&chunk) >= before + 4096);
+    }
+
     /// Without a repeated key the tree is the one `serde_json` builds, so the
     /// ordinary path is unchanged; with one, every value is kept.
     #[test]
@@ -5394,6 +5618,7 @@ mod tests {
             assert_eq!(body["input"][0]["arguments"], args);
 
             let mut resp = ChatResponse {
+                native_envelope: None,
                 logprobs: None,
                 more_choices: Vec::new(),
                 id: String::new(),
@@ -6653,6 +6878,7 @@ mod tests {
         let chain = both();
         let call = |name: &str, arguments: &str| json!({"name": name, "arguments": arguments});
         let chunk = |delta: ChatDelta| ChatChunk {
+            native_envelope: None,
             id: "c".into(),
             model: "m".into(),
             choice_index: 0,
@@ -6780,6 +7006,7 @@ mod tests {
     fn input_only_chain_skips_output_and_vice_versa() {
         let input_only = mask_chain(aisix_core::models::GuardrailHookPoint::Input);
         let mut resp = ChatResponse {
+            native_envelope: None,
             logprobs: None,
             more_choices: Vec::new(),
             id: "r".into(),
@@ -6822,6 +7049,7 @@ mod tests {
             json!({"name": "legacy", "arguments": "{\"mail\":\"d@w.dev\"}"}),
         );
         let mut resp = ChatResponse {
+            native_envelope: None,
             logprobs: None,
             more_choices: Vec::new(),
             id: "r".into(),
@@ -6866,6 +7094,7 @@ mod tests {
             }]),
         );
         let mut resp = ChatResponse {
+            native_envelope: None,
             logprobs: None,
             more_choices: Vec::new(),
             service_tier: None,
@@ -6900,6 +7129,7 @@ mod tests {
             let mut msg = ChatMessage::assistant("");
             msg.extra.insert("tool_calls".into(), json!([call]));
             let mut resp = ChatResponse {
+                native_envelope: None,
                 logprobs: None,
                 more_choices: Vec::new(),
                 service_tier: None,
@@ -6933,6 +7163,7 @@ mod tests {
             json!({"id": "audio_1", "data": "encoded", "transcript": "call a@x.com"}),
         );
         let mut resp = ChatResponse {
+            native_envelope: None,
             logprobs: None,
             more_choices: Vec::new(),
             service_tier: None,
@@ -6963,6 +7194,7 @@ mod tests {
             }]),
         );
         let mut resp = ChatResponse {
+            native_envelope: None,
             logprobs: None,
             more_choices: Vec::new(),
             service_tier: None,
@@ -7004,6 +7236,7 @@ mod tests {
             json!({"name": "legacy", "arguments": {"owner": "c@z.io"}}),
         );
         let mut response = ChatResponse {
+            native_envelope: None,
             logprobs: None,
             more_choices: Vec::new(),
             service_tier: None,
@@ -7201,6 +7434,7 @@ mod tests {
             }]),
         );
         let mut response = ChatResponse {
+            native_envelope: None,
             logprobs: None,
             more_choices: Vec::new(),
             service_tier: None,
@@ -7219,6 +7453,7 @@ mod tests {
 
         let mut chunks = vec![
             ChatChunk {
+                native_envelope: None,
                 choice_index: 0,
                 logprobs: None,
                 service_tier: None,
@@ -7237,6 +7472,7 @@ mod tests {
                 usage: None,
             },
             ChatChunk {
+                native_envelope: None,
                 choice_index: 0,
                 logprobs: None,
                 service_tier: None,
@@ -8270,6 +8506,7 @@ mod tests {
 
     fn content_chunk(text: &str) -> ChatChunk {
         ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "c".into(),
@@ -8314,6 +8551,7 @@ mod tests {
         let chain = both();
         let mut chunks = vec![
             ChatChunk {
+                native_envelope: None,
                 choice_index: 0,
                 logprobs: None,
                 id: "c".into(),
@@ -8331,6 +8569,7 @@ mod tests {
                 accounting_usage: None,
             },
             ChatChunk {
+                native_envelope: None,
                 choice_index: 0,
                 logprobs: None,
                 id: "c".into(),
@@ -8366,6 +8605,7 @@ mod tests {
         let chain = both();
         let mut chunks = vec![
             ChatChunk {
+                native_envelope: None,
                 choice_index: 0,
                 logprobs: None,
                 service_tier: None,
@@ -8383,6 +8623,7 @@ mod tests {
                 usage: None,
             },
             ChatChunk {
+                native_envelope: None,
                 choice_index: 0,
                 logprobs: None,
                 service_tier: None,
@@ -8414,6 +8655,7 @@ mod tests {
     fn stream_chunks_mask_decoded_modern_and_legacy_arguments() {
         let chain = both();
         let mut chunks = vec![ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             service_tier: None,
@@ -8452,6 +8694,7 @@ mod tests {
         let chain = both();
         let mut chunks = vec![
             ChatChunk {
+                native_envelope: None,
                 choice_index: 0,
                 logprobs: None,
                 service_tier: None,
@@ -8469,6 +8712,7 @@ mod tests {
                 usage: None,
             },
             ChatChunk {
+                native_envelope: None,
                 choice_index: 0,
                 logprobs: None,
                 service_tier: None,
@@ -10308,6 +10552,7 @@ mod tests {
             }]),
         );
         let mut resp = ChatResponse {
+            native_envelope: None,
             logprobs: None,
             more_choices: Vec::new(),
             service_tier: None,
@@ -10330,6 +10575,7 @@ mod tests {
         assert!(!moderation.capture_safe);
 
         let mut chunks = vec![ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             service_tier: None,
@@ -10754,6 +11000,7 @@ mod tests {
             panic_if_called: false,
         });
         let mut response = ChatResponse {
+            native_envelope: None,
             logprobs: None,
             more_choices: Vec::new(),
             service_tier: None,
@@ -10795,6 +11042,7 @@ mod tests {
         );
 
         let mut local_only_response = ChatResponse {
+            native_envelope: None,
             logprobs: None,
             more_choices: Vec::new(),
             service_tier: None,

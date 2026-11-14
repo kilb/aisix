@@ -60,7 +60,7 @@ export function ChangePassword({ onClose, minimumLength }: { onClose?: () => voi
       {done ? <>
         <div className="note ok m-0" role="status">口令已修改，此账号在其他浏览器或设备上的会话已全部退出。</div>
         <div><Button onClick={onClose ?? (() => setDone(false))}>{onClose ? "关闭" : "继续修改"}</Button></div>
-      </> : <form ref={form} className="account-password-form" aria-label="修改口令" onSubmit={(e) => void submit(e)}>
+      </> : <form ref={form} className="account-password-form tenant-form" aria-label="修改口令" onSubmit={(e) => void submit(e)}>
         <Field label="当前口令" error={currentProblem}>
           {(aria) => <input {...aria} type="password" autoComplete="current-password" required value={current}
             onChange={(e) => setCurrent(e.target.value)} />}

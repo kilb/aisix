@@ -50,8 +50,8 @@ const REFERENCE_MAX = 128;
 /** One figure of the balance: its label over the amount, a tile of the card's grid. */
 function Reading({ label, value, hero = false }: { label: string; value: ReactNode; hero?: boolean }) {
   return (
-    <div className="entry min-w-0">
-      <span className="text-meta font-mono text-muted">{label}</span>
+    <div className="entry min-w-0 billing-reading">
+      <span className="text-caption text-muted">{label}</span>
       <div className="val"><Metric size={hero ? "hero" : "value"} className="mt-3 whitespace-normal break-all">{value}</Metric></div>
     </div>
   );
@@ -120,8 +120,8 @@ export function Billing({ member }: { member: SessionMember }) {
 
   return (
     <>
-      <PageHeader title="账户" eyebrow="BILLING · 组织账户" dataLead="余额来自全量已入账快照；可用额度同时受账户、组织、成员和密钥限制。待审批充值到账后才可使用。" />
-      <BentoGrid className="billing">
+      <PageHeader title="账务账户" dataLead="余额来自全量已入账快照；可用额度同时受账户、组织、成员和密钥限制。待审批充值到账后才可使用。" />
+      <BentoGrid className="billing tenant-billing">
         <BalancePanel balance={balance} team={team} teamErr={teamErr} onRetryTeam={() => void loadTeam()} err={balanceErr} />
         <Readout member={member} balance={balance} team={team} teamErr={teamErr} onRetryTeam={() => void loadTeam()} />
         <TopupList reloadKey={topupsVersion} onLoaded={rememberTopups} />
@@ -192,7 +192,7 @@ function BalancePanel({
       {balance && (
         <>
           {!known && teamErr && <TeamFailed err={teamErr} onRetry={onRetryTeam} />}
-          <div className="entries grid gap-6">
+          <div className="entries billing-entries grid gap-6">
             <Reading hero label="余额" value={<Money micro={balance.calculation.balance_micro_cny} />} />
             <div className="grid gap-5 tablet:grid-cols-3">
             <Reading label="信用额度" value={<Money micro={balance.calculation.credit_limit_micro_cny} />} />
@@ -318,7 +318,7 @@ function Readout({
 
   if (items === null || (balance === null && keyId === null)) {
     return (
-      <Section number={2} title="可用额度" tone="inverse" className={cn(span.d4, "tablet:col-span-12")}>
+      <Section number={2} title="可用额度" className={cn(span.d4, "tablet:col-span-12")}>
         {err && (
           <div className="note crit" role="alert">
             {err}
@@ -363,7 +363,7 @@ function Readout({
     // A billing member's figure waits on the organisation's quotas.
     const quotaErr = keyId === null && team === null ? teamErr : null;
     return (
-      <Section number={2} title="可用额度" tone="inverse" className={cn(span.d4, "tablet:col-span-12")}>
+      <Section number={2} title="可用额度" className={cn(span.d4, "tablet:col-span-12")}>
         {picker}
         {err && (
           <div className="note crit" role="alert">
@@ -447,7 +447,7 @@ function TopupForm({ onRequested }: { onRequested: () => void }) {
   return (
     <Section number={4} title="申请充值" className={span.d5Wide}>
       <p className="text-caption text-muted">提交申请后由平台审批，审批通过才计入账户余额。</p>
-      <form className="grid gap-4" ref={form} onSubmit={submit} noValidate>
+      <form className="tenant-form grid gap-4" ref={form} onSubmit={submit} noValidate>
         <Field label="充值金额（元）" error={errors.amount} hint="最多两位小数">
           {(aria) => (
             <input inputMode="decimal" autoComplete="off" value={amount} onChange={(e) => setAmount(e.target.value)} {...aria} />
@@ -466,7 +466,7 @@ function TopupForm({ onRequested }: { onRequested: () => void }) {
             {general}
           </div>
         )}
-        <div className="col-span-full mt-2 flex justify-end gap-2 border-t border-ink/7 pt-4">
+        <div className="tenant-form-actions col-span-full">
           <Button kind="primary" type="submit" busy={busy} busyLabel="提交中…">
             提交申请
           </Button>
@@ -597,7 +597,7 @@ function TopupList({ reloadKey, onLoaded }: { reloadKey: number; onLoaded: (item
   });
   const { rows: items, err } = records;
   return (
-    <Section number={3} title="充值记录" className={span.d7}>
+    <Section number={3} title="充值记录" className={span.d12}>
       <p className="text-caption text-muted">按时间读取申请与平台入账记录，搜索仅作用于已加载记录；待审批总数见账户余额。</p>
       <RecordTableToolbar search={{ value: records.query, onChange: records.setQuery, label: "搜索已加载充值记录", placeholder: "付款凭证号、提交人" }}>
         <Field label="充值状态">
@@ -635,22 +635,22 @@ function TopupList({ reloadKey, onLoaded }: { reloadKey: number; onLoaded: (item
               const why = explanation(t);
               return (
                 <tr key={t.id}>
-                  <td className="num">
+                  <td className="num" data-label="金额">
                     <Money micro={t.amount_micro_cny} />
                   </td>
-                  <td>
+                  <td data-label="状态">
                     <Lamp state={state.lamp}>{state.text}</Lamp>
                   </td>
-                  <td>{t.origin === "operator" ? "平台入账" : "本组织申请"}</td>
-                  <td>{t.requested_by ? (t.requested_by.display_name ?? "—") : "平台"}</td>
+                  <td data-label="来源">{t.origin === "operator" ? "平台入账" : "本组织申请"}</td>
+                  <td data-label="提交人">{t.requested_by ? (t.requested_by.display_name ?? "—") : "平台"}</td>
                   {/* Below 1800px a time takes two lines, its date over its clock, so the list fits beside the form. */}
-                  <td className="tabular max-[1799px]:whitespace-normal">
+                  <td className="tabular max-[1799px]:whitespace-normal" data-label="提交时间">
                     <span className="block max-[1799px]:max-w-[6.5rem]">{fmtBeijing(t.requested_at)}</span>
                   </td>
-                  <td className="tabular max-[1799px]:whitespace-normal">
+                  <td className="tabular max-[1799px]:whitespace-normal" data-label="处理时间">
                     <span className="block max-[1799px]:max-w-[6.5rem]">{t.decided_at ? fmtBeijing(t.decided_at) : "—"}</span>
                   </td>
-                  <td>
+                  <td data-label="说明">
                     {why ? (
                       <span className="trunc" title={why}>
                         {why}
@@ -774,18 +774,18 @@ function Ledger({ topups }: { topups: Topup[] | null }) {
             <tbody>
               {rows.map((r) => (
                 <tr key={r.seq}>
-                  <td className="tabular">{fmtBeijing(r.posted_at)}</td>
-                  <td>{KIND_LABEL[r.kind] ?? r.kind}</td>
-                  <td className="num">
+                  <td className="tabular" data-label="时间">{fmtBeijing(r.posted_at)}</td>
+                  <td data-label="类型">{KIND_LABEL[r.kind] ?? r.kind}</td>
+                  <td className="num" data-label="金额">
                     <Money micro={r.calculation.amount_micro_cny} />
                   </td>
-                  <td className="num">
+                  <td className="num" data-label="余额">
                     <Money micro={r.calculation.after_micro_cny} />
                   </td>
-                  <td className="tabular">
+                  <td className="tabular" data-label="本笔余额计算">
                     {fmtMicroCny(r.calculation.before_micro_cny)} +（{fmtMicroCny(r.calculation.amount_micro_cny)}）= <Money micro={r.calculation.after_micro_cny} />
                   </td>
-                  <td>
+                  <td data-label="说明">
                     <span className="trunc" title={explain(r)}>
                       {explain(r)}
                     </span>
@@ -891,17 +891,17 @@ function Summary({ range, fromDate, toDate }: { range: { from?: string; to?: str
           <tbody>
             {table.rows.map((r) => (
               <tr key={r.period_start}>
-                <td className="tabular">{periodLabel(r.period_start, group)}</td>
-                <td className="num">
+                <td className="tabular" data-label="期间">{periodLabel(r.period_start, group)}</td>
+                <td className="num" data-label="扣费">
                   <Money micro={r.usage_micro_cny} />
                 </td>
-                <td className="num">
+                <td className="num" data-label="充值">
                   <Money micro={r.topups_micro_cny} />
                 </td>
-                <td className="num">
+                <td className="num" data-label="调整">
                   <Money micro={r.adjustments_micro_cny} />
                 </td>
-                <td className="num">
+                <td className="num" data-label="期末余额">
                   <Money micro={r.closing_balance_micro_cny} />
                 </td>
               </tr>

@@ -16,6 +16,7 @@ import {
 import { messageFor, problemAt } from "../../lib/errors";
 import { errorText } from "../../lib/fmt";
 import { generatedDirect } from "../../lib/generatedDirect";
+import { removedTierWarning } from "../../lib/library";
 import {
   COMPARED_DIMENSIONS,
   datasetNotes,
@@ -113,6 +114,7 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
   const [proposals, setProposals] = useState<Proposal[] | null>(null);
   const [models, setModels] = useState<ResourceView<ModelDoc>[]>([]);
   const [updates, setUpdates] = useState<BaselineRow[]>([]);
+  const [baselineRows, setBaselineRows] = useState<BaselineRow[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [statusFilter, setStatusFilter] = useState("");
   const [flaggedOnly, setFlaggedOnly] = useState(false);
@@ -173,7 +175,10 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
   /** The catalogue's outstanding updates, and the models a proposal may name. */
   const loadSide = useCallback(async () => {
     baselines.list().then(
-      (rows) => setUpdates(rows.filter((r) => r.catalogue_update)),
+      (rows) => {
+        setUpdates(rows.filter((r) => r.catalogue_update));
+        setBaselineRows(rows);
+      },
       () => undefined,
     );
     resources.list<ModelDoc>("models").then(setModels, () => undefined);
@@ -275,9 +280,7 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
         description={CREDIT}
         dataLead={batch ? <>批次 {batch.dataset_ref} 共 {batch.proposals.toLocaleString("zh-CN")} 条提议，{batch.flagged.toLocaleString("zh-CN")} 条带标记。请核对来源后再确认价格。</> : "上传数据集，逐项核对来源、价格差异和生效时间，再确认写入基准价。"}
         actions={
-          <Button type="button" icon="refresh" onClick={() => void loadBatches()}>
-            刷新
-          </Button>
+          <Button className="finance-icon-button" aria-label="刷新" title="刷新" type="button" icon="refresh" onClick={() => void loadBatches()}></Button>
         }
       />
       <BentoGrid className="mb-3" aria-label="导入审核概况">
@@ -425,6 +428,16 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
                         })}
                       </span>
                     )}
+                    {chosen.some((p) => removedTierWarning(p.card, p.current_baseline?.card)) && (
+                      <div className="note warn basis-full min-w-0 [overflow-wrap:anywhere]" role="status" aria-label="所选提议将移除的档位">
+                        <ul>
+                          {chosen.map((p) => {
+                            const warning = removedTierWarning(p.card, p.current_baseline?.card);
+                            return warning ? <li key={p.id}>{p.provider}/{p.model}：{warning}</li> : null;
+                          })}
+                        </ul>
+                      </div>
+                    )}
                     <Button
                       type="button"
                       kind="primary"
@@ -453,7 +466,7 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
                 ) : table.filteredCount === 0 ? (
                   <EmptyState text="没有匹配的提议。可以调整筛选、换一个批次，或勾选「显示与当前基准价相同的提议」。" />
                 ) : (
-                  <><DataTable label="提议" scroll>
+                  <><DataTable label="提议">
                     <thead>
                       <tr>
                         <th className="import-pick" aria-label="选择" />
@@ -469,9 +482,10 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
                       {table.rows.map((p) => {
                         const entry = `${p.provider}/${p.model}`;
                         const rates = headline(p.card);
+                        const tierWarning = removedTierWarning(p.card, p.current_baseline?.card);
                         return (
-                          <tr key={p.id} data-status={p.status} className={selected === p.id ? "bg-well" : undefined}>
-                            <td className="import-pick">
+                          <tr data-finance-record key={p.id} data-status={p.status} className={selected === p.id ? "bg-well" : undefined}>
+                            <td data-label="选择" className="import-pick">
                               {canEdit && bulkable(p) && (
                                 <label className="inline-flex min-h-11 min-w-11 items-center justify-center">
                                   <input
@@ -490,7 +504,7 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
                                 </label>
                               )}
                             </td>
-                            <td>
+                            <td data-label="模型">
                               {/* 长模型名留在表格内换行，完整名称仍可复制。 */}
                               <button
                                 type="button"
@@ -513,13 +527,14 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
                                 )}
                               </span>
                             </td>
-                            <td className="tabular">{p.effective_from ? fmtBeijing(p.effective_from) : "立即生效"}</td>
-                            <td className="num tabular">{rates ? usdPerMillion(rates.input) : "—"}</td>
-                            <td className="num tabular">{rates ? usdPerMillion(rates.output) : "—"}</td>
-                            <td className="import-flags text-caption">
+                            <td data-label="生效时间" className="tabular">{p.effective_from ? fmtBeijing(p.effective_from) : "立即生效"}</td>
+                            <td data-label="输入" className="num tabular">{rates ? usdPerMillion(rates.input) : "—"}</td>
+                            <td data-label="输出" className="num tabular">{rates ? usdPerMillion(rates.output) : "—"}</td>
+                            <td data-label="标记" className="import-flags text-caption">
                               <div className="max-w-56 whitespace-normal">{p.flags.length > 0 ? p.flags.map(flagText).join("、") : "—"}</div>
+                              {tierWarning && <p className="cell-note whitespace-normal [overflow-wrap:anywhere]">{tierWarning}</p>}
                             </td>
-                            <td>
+                            <td data-label="状态">
                               {statusText(p.status)}
                               {p.reject_reason && <span className="cell-note trunc" title={p.reject_reason}>{p.reject_reason}</span>}
                             </td>
@@ -540,6 +555,7 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
             proposal={detail}
             comment={notes[`${detail.provider}/${detail.model}`] ?? null}
             models={models}
+            baselineRows={baselineRows}
             canEdit={canEdit}
             onClose={() => setSelected(null)}
             onDecided={afterDecision}
@@ -673,6 +689,7 @@ function ProposalPanel({
   proposal,
   comment,
   models,
+  baselineRows,
   canEdit,
   onClose,
   onDecided,
@@ -682,6 +699,7 @@ function ProposalPanel({
   proposal: Proposal;
   comment: string | null;
   models: ResourceView<ModelDoc>[];
+  baselineRows: BaselineRow[];
   canEdit: boolean;
   onClose: () => void;
   onDecided: () => Promise<void>;
@@ -751,7 +769,7 @@ function ProposalPanel({
           {proposal.decided_at && <span className="cell-note tabular">（{fmtBeijing(proposal.decided_at)}）</span>}
         </div>
       ) : !canEdit ? null : confirmable(proposal) ? (
-        <ConfirmForm batchId={batchId} proposal={proposal} models={models} onDecided={decided} />
+        <ConfirmForm batchId={batchId} proposal={proposal} models={models} baselineRows={baselineRows} onDecided={decided} />
       ) : (
         <>
           {/* A card whose whole bill the comparison cannot show is refused,
@@ -806,11 +824,11 @@ function PriceComparison({ proposal }: { proposal: Proposal }) {
         </thead>
         <tbody>
           {rows.map(([dimension, label]) => (
-            <tr key={dimension}>
-              <td>{label}</td>
-              <td className="num tabular">{shownRate(dataset, dimension)}</td>
-              <td className="num tabular">{shownRate(current, dimension)}</td>
-              <td className="num tabular">{shownRate(catalogue, dimension)}</td>
+            <tr data-finance-record key={dimension}>
+              <td data-label="价格项">{label}</td>
+              <td data-label="数据集" className="num tabular">{shownRate(dataset, dimension)}</td>
+              <td data-label="现行基准价" className="num tabular">{shownRate(current, dimension)}</td>
+              <td data-label="官方目录" className="num tabular">{shownRate(catalogue, dimension)}</td>
             </tr>
           ))}
         </tbody>
@@ -829,11 +847,13 @@ function ConfirmForm({
   batchId,
   proposal,
   models,
+  baselineRows,
   onDecided,
 }: {
   batchId: string;
   proposal: Proposal;
   models: ResourceView<ModelDoc>[];
+  baselineRows: BaselineRow[];
   /** After a decision; `notice` when it was someone else's, made first. */
   onDecided: (notice?: string) => Promise<void>;
 }) {
@@ -845,6 +865,10 @@ function ConfirmForm({
   const [details, setDetails] = useState<Detail[]>([]);
   const [failure, setFailure] = useState<string | null>(null);
   const resolver = useRef<EffectiveResolver>({ immediate: true, stamp: () => new Date().toISOString() });
+  // 改选模型后只使用该模型的现行价；不能沿用提议原匹配模型的档位。
+  const selectedBaseline = baselineRows.find((row) => row.model_id === model);
+  const currentCard = selectedBaseline ? selectedBaseline.current?.card ?? null : proposal.current_baseline?.model_id === model ? proposal.current_baseline.card : null;
+  const tierWarning = removedTierWarning(proposal.card, currentCard);
 
   /** The proposal's own date, when it has one: nothing earlier may be confirmed. */
   const dated = proposal.effective_from !== null;
@@ -926,6 +950,7 @@ function ConfirmForm({
           </select>
         )}
       </Field>
+      {tierWarning && <p className="note warn whitespace-normal [overflow-wrap:anywhere]" role="status">{tierWarning}</p>}
       <label className="check min-h-11">
         <input type="checkbox" checked={checked} onChange={(e) => setChecked(e.target.checked)} />
         <span>已对照官方价格页核对</span>
@@ -1130,15 +1155,20 @@ function CatalogueUpdates({
             const update = row.catalogue_update!;
             const first = update.entries[0] ?? null;
             const rates = headline(first?.card ?? null);
+            // 目录确认也会写入后续日期的完整卡，逐次比较，避免未来修订静默移除档位。
+            const tierWarnings = update.entries.flatMap((entry, index) => {
+              const warning = removedTierWarning(entry.card, index === 0 ? row.current?.card : update.entries[index - 1]?.card);
+              return warning ? [{ at: entry.effective_from, warning }] : [];
+            });
             return (
-              <tr key={row.model_id}>
-                <td>{row.name}</td>
-                <td className="tabular">{update.entry_key}</td>
-                <td className="tabular">{update.catalogue_version}</td>
-                <td className="num tabular">{rates ? usdPerMillion(rates.input) : "—"}</td>
-                <td className="num tabular">{rates ? usdPerMillion(rates.output) : "—"}</td>
+              <tr data-finance-record key={row.model_id}>
+                <td data-label="模型">{row.name}{tierWarnings.map(({ at, warning }, index) => <p key={index} className="cell-note whitespace-normal [overflow-wrap:anywhere]">{at ? `${fmtBeijing(at)}：` : ""}{warning}</p>)}</td>
+                <td data-label="目录条目" className="tabular">{update.entry_key}</td>
+                <td data-label="目录版本" className="tabular">{update.catalogue_version}</td>
+                <td data-label="输入" className="num tabular">{rates ? usdPerMillion(rates.input) : "—"}</td>
+                <td data-label="输出" className="num tabular">{rates ? usdPerMillion(rates.output) : "—"}</td>
                 {canEdit && (
-                  <td className="right">
+                  <td data-label="操作" className="right">
                     <Button
                       size="sm"
                       type="button"

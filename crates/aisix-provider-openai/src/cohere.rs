@@ -20,6 +20,17 @@ pub fn is_cohere(provider: &str) -> bool {
     provider.trim().eq_ignore_ascii_case("cohere")
 }
 
+/// 兼容聊天契约不接受持久化和元数据字段；最终正文静默移除，不冒充存储支持。
+/// 契约：https://docs.cohere.com/docs/compatibility-api
+pub fn drop_unsupported_chat_fields(provider: &str, body: &mut serde_json::Value) {
+    if is_cohere(provider) {
+        if let Some(object) = body.as_object_mut() {
+            object.remove("store");
+            object.remove("metadata");
+        }
+    }
+}
+
 /// The host root of a Cohere `api_base`: trailing slashes and a
 /// `/compatibility/v1`, `/v1` or `/v2` suffix removed.
 pub fn api_root(base: &str) -> &str {

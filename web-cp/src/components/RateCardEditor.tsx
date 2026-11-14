@@ -1,3 +1,4 @@
+import "../tabs/pricing/RateCardEditor.css";
 import { useEffect, useId, useState } from "react";
 import type { Detail, RateCard, RateMap, TierRates } from "../lib/api";
 import { problemAt } from "../lib/errors";
@@ -13,14 +14,14 @@ import { JsonEditor } from "./JsonEditor";
  * band. Any other rate a card carries is kept as it is and edited in the
  * JSON view.
  */
-const RATES: { dimension: string; label: string }[] = [
-  { dimension: "input", label: "输入" },
-  { dimension: "output", label: "输出" },
-  { dimension: "cache_read", label: "缓存读" },
-  { dimension: "cache_write", label: "缓存写" },
-  { dimension: "cache_write_1h", label: "1 小时缓存写" },
-  { dimension: "reasoning", label: "推理" },
-  { dimension: "web_search", label: "联网搜索（每千次）" },
+const RATES: { dimension: string; label: string; group: string }[] = [
+  { dimension: "input", group: "文本与推理", label: "输入" },
+  { dimension: "output", group: "文本与推理", label: "输出" },
+  { dimension: "cache_read", group: "缓存", label: "缓存读" },
+  { dimension: "cache_write", group: "缓存", label: "缓存写" },
+  { dimension: "cache_write_1h", group: "缓存", label: "1 小时缓存写" },
+  { dimension: "reasoning", group: "文本与推理", label: "推理" },
+  { dimension: "web_search", group: "联网", label: "联网搜索（每千次）" },
 ];
 
 /** The tiers 添加档位 offers by name; any other name a served tier can carry is typed in. */
@@ -65,8 +66,8 @@ function withRate(map: RateMap, dimension: string, rate: string | undefined): Ra
   return next;
 }
 
-/** 费率字段随容器宽度分为一至三列，小屏保持完整输入宽度。 */
-const RATE_GRID = "grid grid-cols-1 items-start gap-3 @md:grid-cols-2 @2xl:grid-cols-3 [&_.field]:mb-0";
+/** 字段按计量含义分组，保留既有字段集及完整 JSON 入口。 */
+const RATE_GROUPS = ["文本与推理", "缓存", "联网"];
 
 /** The units the field view takes: a rate per call is typed per thousand. */
 const FIELD_UNITS = "token 价格按每百万 tokens 填写；联网搜索按每千次填写，例如「每 1,000 次 10 美元」填 10。";
@@ -249,6 +250,20 @@ export function RateCardEditor({
     );
   }
 
+  /** 同一组字段复用于基础价和每个长上下文档，不改变费率写入。 */
+  function rateGroups(path: string, map: RateMap, set: (dimension: string, rate: string | undefined) => void) {
+    return <div className="rate-groups">
+      {RATE_GROUPS.map((group) => <section className="rate-dimension-group" key={group} aria-label={group}>
+        <h5>{group}</h5>
+        <div className="rate-field-grid">
+          {RATES.filter((r) => r.group === group).map((r) =>
+            rateField(`${path}/${r.dimension}`, r.dimension, r.label, map, (rate) => set(r.dimension, rate)),
+          )}
+        </div>
+      </section>)}
+    </div>;
+  }
+
   function setJsonText(text: string) {
     setJson(text);
     try {
@@ -308,12 +323,12 @@ export function RateCardEditor({
             return (
               <section
                 key={tier}
-                className="rate-tier @container m-0 mb-3 rounded-3xl border border-line bg-surface p-7"
+                className="rate-tier"
                 role="group"
                 aria-label={tierTitle(tier)}
               >
-                <div className="mb-4 flex min-h-11 flex-wrap items-center justify-between gap-3">
-                  <h4 className="m-0 font-mono text-meta font-medium text-ink">{tierTitle(tier)}</h4>
+                <div className="rate-tier-heading">
+                  <h4 className="rate-tier-title">{tierTitle(tier)}</h4>
                   {tier !== "default" && (
                     <Button type="button" size="sm" kind="quiet" onClick={() => removeTier(tier)}>
                       移除档位
@@ -325,11 +340,9 @@ export function RateCardEditor({
                     {tierProblem}
                   </div>
                 )}
-                <div className={RATE_GRID} role="group" aria-label={`${tierTitle(tier)} 基础价`}>
-                  {RATES.map((r) =>
-                    rateField(`${path}/base/${r.dimension}`, r.dimension, r.label, t.base ?? {}, (rate) =>
-                      setTier(tier, { ...t, base: withRate(t.base ?? {}, r.dimension, rate) }),
-                    ),
+                <div role="group" aria-label={`${tierTitle(tier)} 基础价`}>
+                  {rateGroups(`${path}/base`, t.base ?? {}, (dimension, rate) =>
+                    setTier(tier, { ...t, base: withRate(t.base ?? {}, dimension, rate) }),
                   )}
                 </div>
                 {bandsProblem && (
@@ -343,11 +356,11 @@ export function RateCardEditor({
                   return (
                     <div
                       key={n}
-                      className="rate-band mt-3 mb-0 rounded-2xl border border-line bg-well p-4 text-ink-soft"
+                      className="rate-band"
                       role="group"
                       aria-label={`${tierTitle(tier)} 长上下文档 ${n + 1}`}
                     >
-                      <div className={RATE_GRID}>
+                      <div className="rate-band-threshold">
                         <Field label="输入超过（tokens）" error={at(threshold)}>
                           {(aria) => (
                             <input
@@ -360,15 +373,10 @@ export function RateCardEditor({
                             />
                           )}
                         </Field>
-                        {RATES.map((r) =>
-                          rateField(`${bandPath}/rates/${r.dimension}`, r.dimension, r.label, band.rates ?? {}, (rate) =>
-                            setBands(
-                              tier,
-                              bands.map((b, i) => (i === n ? { ...b, rates: withRate(b.rates ?? {}, r.dimension, rate) } : b)),
-                            ),
-                          ),
-                        )}
                       </div>
+                      {rateGroups(`${bandPath}/rates`, band.rates ?? {}, (dimension, rate) =>
+                        setBands(tier, bands.map((b, i) => (i === n ? { ...b, rates: withRate(b.rates ?? {}, dimension, rate) } : b))),
+                      )}
                       <div className="mt-2 flex justify-end">
                         <Button type="button" size="sm" kind="quiet" onClick={() => removeBand(tier, n)}>
                           移除这个长上下文档

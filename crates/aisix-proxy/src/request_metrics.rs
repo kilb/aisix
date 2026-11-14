@@ -355,6 +355,8 @@ impl<'a> LastTarget<'a> {
 ///   families, exactly once, like that endpoint; an opaque relay, or a shape
 ///   no typed endpoint serves, stays proxy-only.
 /// - `/v1/files`, `/v1/batches`, `/v1/fine_tuning/jobs` — management calls.
+/// - `/v1/responses/:id`, `/v1/responses/:id/cancel` and
+///   `/v1/responses/:id/input_items` — 查询或管理已提交的推理，不再次计作推理请求。
 ///
 /// `/v1/realtime` was in that list until the token families reached it too.
 /// It was held out because it fed none of them, so counting it here would
@@ -367,12 +369,17 @@ const LLM_ENDPOINTS: &[&str] = &[
     "/v1/embeddings",
     "/v1/images/generations",
     "/v1/images/edits",
+    "/v1/images/variations",
+    "/v1/moderations",
+    "/v1/content_provenance_checks",
     "/v1/messages",
     "/v1/messages/count_tokens",
     "/v1/rerank",
     "/v1/systemone",
     "/v1/decisions",
     "/v1/responses",
+    "/v1/responses/compact",
+    "/v1/responses/input_tokens",
     "/v1/audio/transcriptions",
     "/v1/audio/translations",
     "/v1/audio/speech",
@@ -393,6 +400,25 @@ const LLM_ENDPOINTS: &[&str] = &[
 /// and cost average built on these counters.
 fn is_llm_endpoint(endpoint: &str) -> bool {
     LLM_ENDPOINTS.contains(&endpoint)
+}
+
+/// 共享路径的 GET 分别是已保存聊天列表和 WebSocket 握手；后者每轮另经 POST 计量。
+/// 其余方法保留端点分类，包括既有 405 的分母和 Realtime 的会话语义。
+pub(crate) fn is_llm_request(endpoint: &str, method: &axum::http::Method) -> bool {
+    is_llm_endpoint(endpoint)
+        && !(method == axum::http::Method::GET
+            && matches!(endpoint, "/v1/chat/completions" | "/v1/responses"))
+}
+
+/// 请求开始时确定的分类；直接调用发射器的上下文外路径沿用端点默认值。
+fn current_is_llm_request(endpoint: &str) -> bool {
+    crate::attribution::counts_as_llm().unwrap_or_else(|| is_llm_endpoint(endpoint))
+}
+
+/// 共享路径复用请求开始时固定的协议，不将原始路径或协议头值写入标签。
+pub(crate) fn inbound_protocol(endpoint: &str) -> &'static str {
+    crate::attribution::inbound_protocol()
+        .unwrap_or_else(|| crate::inbound_protocol_for_endpoint(endpoint))
 }
 
 /// The one request-metric emit, shared by every handler.
@@ -417,7 +443,7 @@ pub(crate) fn record(
     record_in_tier(
         state,
         endpoint,
-        is_llm_endpoint(endpoint),
+        current_is_llm_request(endpoint),
         caller,
         upstream,
         status,
@@ -470,7 +496,7 @@ pub(crate) fn record_undispatched(
     record_bounded(
         state,
         endpoint,
-        is_llm_endpoint(endpoint),
+        current_is_llm_request(endpoint),
         caller,
         upstream,
         status,
@@ -496,7 +522,7 @@ pub(crate) fn record_spanning_body(
     record_bounded(
         state,
         endpoint,
-        is_llm_endpoint(endpoint),
+        current_is_llm_request(endpoint),
         caller,
         upstream,
         status,
@@ -533,6 +559,7 @@ fn record_bounded(
     emit(
         &state.metrics,
         endpoint,
+        inbound_protocol(endpoint),
         llm,
         caller,
         upstream,
@@ -583,6 +610,7 @@ const NO_E2E_ENDPOINTS: &[&str] = &["/v1/realtime"];
 fn emit(
     metrics: &std::sync::Arc<aisix_obs::Metrics>,
     endpoint: &'static str,
+    inbound_protocol: &'static str,
     llm: bool,
     caller: Caller<'_>,
     upstream: Upstream<'_>,
@@ -595,10 +623,8 @@ fn emit(
     metrics.record_request(upstream.provider, upstream.model, status, outcome, elapsed);
     let labels = RequestLabels {
         endpoint,
-        // Derived from the endpoint rather than passed in, so the detailed
-        // families can't disagree with `aisix_proxy_in_flight_requests`
-        // about which protocol a route speaks.
-        inbound_protocol: crate::inbound_protocol_for_endpoint(endpoint),
+        // 与 in-flight 复用同一请求事实，共享 Files 路径不能仅按端点分类。
+        inbound_protocol,
         // Read off the SAME ProviderKey row that produced the id and name
         // beside it (`usage_attr::ResolvedPk`), so a request can never be
         // labelled with one key's identity and another's protocol.
@@ -628,7 +654,7 @@ fn emit(
     if NO_E2E_ENDPOINTS.contains(&endpoint) {
         return;
     }
-    let latency = latency_labels(endpoint, caller, upstream, status);
+    let latency = latency_labels(endpoint, inbound_protocol, caller, upstream, status);
     match e2e {
         E2eSides::Both => record_e2e_downstream(metrics, latency, elapsed),
         E2eSides::DownstreamOnly => {
@@ -663,6 +689,8 @@ fn emit(
 pub(crate) struct PendingRequestMetrics {
     metrics: std::sync::Arc<aisix_obs::Metrics>,
     endpoint: &'static str,
+    inbound_protocol: &'static str,
+    llm: bool,
     upstream_protocol: &'static str,
     provider: String,
     model: String,
@@ -698,6 +726,8 @@ impl PendingRequestMetrics {
         Self {
             metrics: state.metrics.clone(),
             endpoint,
+            inbound_protocol: inbound_protocol(endpoint),
+            llm: current_is_llm_request(endpoint),
             upstream_protocol: upstream.pk.protocol(),
             provider: upstream.provider.to_owned(),
             model: model.into_owned(),
@@ -730,7 +760,8 @@ impl PendingRequestMetrics {
         emit(
             &self.metrics,
             self.endpoint,
-            is_llm_endpoint(self.endpoint),
+            self.inbound_protocol,
+            self.llm,
             self.caller.as_caller(),
             upstream,
             status,
@@ -775,6 +806,7 @@ fn with_latency_labels(
         crate::usage_attr::metric_model_label_pair(snap, upstream.model, upstream.upstream_model);
     f(latency_labels(
         endpoint,
+        inbound_protocol(endpoint),
         caller,
         Upstream {
             model: model.as_ref(),
@@ -788,6 +820,7 @@ fn with_latency_labels(
 /// The latency families' labels for an already-bounded `upstream`.
 fn latency_labels<'a>(
     endpoint: &'static str,
+    inbound_protocol: &'static str,
     caller: Caller<'a>,
     upstream: Upstream<'a>,
     status: u16,
@@ -800,7 +833,7 @@ fn latency_labels<'a>(
         streaming: upstream.stream,
         details: UsageLabels {
             endpoint,
-            inbound_protocol: crate::inbound_protocol_for_endpoint(endpoint),
+            inbound_protocol,
             upstream_protocol: upstream.pk.protocol(),
             provider: upstream.provider,
             model: upstream.model,
@@ -973,7 +1006,7 @@ pub(crate) fn record_usage(
     state.metrics.record_llm_usage(
         UsageLabels {
             endpoint,
-            inbound_protocol: crate::inbound_protocol_for_endpoint(endpoint),
+            inbound_protocol: inbound_protocol(endpoint),
             upstream_protocol: upstream.pk.protocol(),
             provider: upstream.provider,
             model: upstream.model,
@@ -1137,6 +1170,62 @@ mod tests {
 
     use aisix_core::{Model, ResourceEntry};
 
+    #[tokio::test]
+    async fn parked_metrics_keep_request_facts_after_the_scope_ends(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for (endpoint, protocol) in [
+            ("/v1/files", "anthropic"),
+            ("/v1/chat/completions", "openai"),
+        ] {
+            let config = serde_json::from_value(serde_json::json!({"addr":"127.0.0.1:0"}))?;
+            let state = ProxyState::new(
+                aisix_core::snapshot::SnapshotHandle::new(AisixSnapshot::new()),
+                std::sync::Arc::new(aisix_gateway::Hub::new()),
+                &config,
+            );
+            let cell = std::sync::Arc::new(
+                crate::attribution::RequestAttribution::default()
+                    .with_inbound_protocol(protocol)
+                    .with_llm_inference(false),
+            );
+            let pending = crate::attribution::scope(cell, async {
+                PendingRequestMetrics::at_stream_end(
+                    &state,
+                    endpoint,
+                    Caller::unattributed(None),
+                    Upstream::default(),
+                    std::time::Instant::now(),
+                )
+            })
+            .await;
+            assert_eq!(crate::attribution::inbound_protocol(), None);
+            assert_eq!(crate::attribution::counts_as_llm(), None);
+            pending.record_terminal(200, ErrorSource::None);
+            let scrape = state.metrics.render();
+            let requests: Vec<_> = scrape
+                .lines()
+                .filter(|line| line.starts_with("aisix_proxy_requests_total{"))
+                .collect();
+            assert_eq!(requests.len(), 1, "{scrape}");
+            assert!(
+                requests[0].contains(&format!("inbound_protocol=\"{protocol}\"")),
+                "{}",
+                requests[0]
+            );
+            assert_eq!(
+                requests[0].rsplit_once(' ').map(|(_, count)| count),
+                Some("1")
+            );
+            assert!(
+                !scrape
+                    .lines()
+                    .any(|line| line.starts_with("aisix_llm_requests_total{")),
+                "a parked management request became inference: {scrape}"
+            );
+        }
+        Ok(())
+    }
+
     fn snapshot_with(display_name: &str, body: serde_json::Value) -> AisixSnapshot {
         let model: Model = serde_json::from_value(body).unwrap();
         let snap = AisixSnapshot::new();
@@ -1244,16 +1333,26 @@ mod tests {
         "/mcp-oauth/consent",
         "/a2a/some-agent/.well-known/agent-card.json",
         "/v1/chat/completions",
+        "/v1/chat/completions/chatcmpl_sample",
+        "/v1/chat/completions/chatcmpl_sample/messages",
         "/v1/completions",
         "/v1/embeddings",
         "/v1/images/generations",
         "/v1/images/edits",
+        "/v1/images/variations",
+        "/v1/moderations",
+        "/v1/content_provenance_checks",
         "/v1/messages",
         "/v1/messages/count_tokens",
         "/v1/rerank",
         "/v1/systemone",
         "/v1/decisions",
         "/v1/responses",
+        "/v1/responses/compact",
+        "/v1/responses/input_tokens",
+        "/v1/responses/resp_sample",
+        "/v1/responses/resp_sample/cancel",
+        "/v1/responses/resp_sample/input_items",
         "/v1/audio/transcriptions",
         "/v1/audio/translations",
         "/v1/audio/speech",
@@ -1264,9 +1363,17 @@ mod tests {
         "/v1/files",
         "/v1/files/file_abc123",
         "/v1/files/file_abc123/content",
+        "/v1/uploads",
+        "/v1/uploads/upload_sample/parts",
+        "/v1/uploads/upload_sample/complete",
+        "/v1/uploads/upload_sample/cancel",
         "/v1/batches",
         "/v1/batches/batch_abc123",
         "/v1/batches/batch_abc123/cancel",
+        "/v1/messages/batches",
+        "/v1/messages/batches/msgbatch_sample",
+        "/v1/messages/batches/msgbatch_sample/cancel",
+        "/v1/messages/batches/msgbatch_sample/results",
         "/v1/fine_tuning/jobs",
         "/v1/fine_tuning/jobs/ft_abc123",
         "/v1/fine_tuning/jobs/ft_abc123/cancel",
@@ -1491,9 +1598,14 @@ mod tests {
         for route in [
             "/v1/chat/completions",
             "/v1/responses",
+            "/v1/responses/compact",
+            "/v1/responses/input_tokens",
             "/v1/messages/count_tokens",
             "/v1/embeddings",
             "/v1/images/edits",
+            "/v1/images/variations",
+            "/v1/moderations",
+            "/v1/content_provenance_checks",
             "/v1/audio/speech",
             "/v1/videos/vid_abc123/content",
             // Moved in once realtime started reporting its tokens + cost.
@@ -1508,6 +1620,15 @@ mod tests {
             "/mcp/some-server",
             "/a2a/some-agent",
             "/v1/batches/batch_abc123",
+            "/v1/chat/completions/chatcmpl_sample",
+            "/v1/chat/completions/chatcmpl_sample/messages",
+            "/v1/uploads",
+            "/v1/uploads/upload_sample/parts",
+            "/v1/uploads/upload_sample/complete",
+            "/v1/uploads/upload_sample/cancel",
+            "/v1/responses/resp_sample",
+            "/v1/responses/resp_sample/cancel",
+            "/v1/responses/resp_sample/input_items",
             "/passthrough/openai/v1/anything",
             "/livez",
         ] {

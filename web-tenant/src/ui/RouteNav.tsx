@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef, type KeyboardEvent } from "react";
+import { useLayoutEffect, useRef, type ComponentType, type KeyboardEvent } from "react";
 import { cn } from "../lib/cn";
 
 // 应用侧栏与卡内横向分组共用既有导航接口。
@@ -7,6 +7,7 @@ export interface RouteItem<Id extends string> {
   id: Id;
   label: string;
   group?: string;
+  icon?: ComponentType<{ className?: string; "aria-hidden"?: boolean }>;
 }
 
 /**
@@ -88,8 +89,9 @@ export function RouteNav<Id extends string>({
     return (
       <nav ref={bar} className={cn("shell-route-nav", className)} aria-label={label} onKeyDown={onKeyDown}>
         <ol className="shell-route-list" role="presentation">
-          {items.map((t, index) => (
-            <li key={t.id} className="shell-route-item" role="presentation">
+          {items.map((t, index) => {
+            const Icon = t.icon;
+            return <li key={t.id} className="shell-route-item" role="presentation">
               {t.group && items[index - 1]?.group !== t.group && <div className="shell-route-group">{t.group}</div>}
               <a
                 href={`#${t.id}`}
@@ -103,10 +105,11 @@ export function RouteNav<Id extends string>({
                   onSelect(t.id);
                 }}
               >
+                {Icon && <Icon className="shell-route-icon" aria-hidden />}
                 <span className="stop-name">{t.label}</span>
               </a>
-            </li>
-          ))}
+            </li>;
+          })}
         </ol>
       </nav>
     );

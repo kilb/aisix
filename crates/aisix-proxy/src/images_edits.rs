@@ -33,17 +33,16 @@
 //!    block (gpt-image-*) feeds the UsageEvent + TPM/TPD commit exactly like
 //!    generations (#911 [21]).
 //!
-//! `stream=true` (partial-image SSE) is rejected 400 for now: buffering
-//! a stream the caller asked to watch grow is silent degradation, and
-//! the live-relay plumbing (#998) is a follow-up, not a Phase 1 rider.
+//! JSON 引用与 multipart 上传共用原生编辑协议；SSE 的终态数量和生命周期
+//! 与图像生成使用同一结算通道，输出拒绝规则仍在释放字节前生效。
 
+use crate::request_json::Json;
 use aisix_core::AppliedGuardrail;
 use aisix_obs::{content_capture_cap, CapturedContent};
 use axum::body::Bytes;
-use axum::extract::{Multipart, State};
+use axum::extract::{FromRequest as _, Multipart, State};
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use reqwest::multipart;
 use serde_json::Value;
 use std::time::Instant;
@@ -59,6 +58,7 @@ const ENDPOINT: &str = "/v1/images/edits";
 /// generations handler consumes, minus `upstream_called` (this route has
 /// no 501 half-success: every `Ok` came back from the upstream).
 struct EditsDispatchSuccess {
+    usage_handled_by_stream: bool,
     response: Response,
     model_name: String,
     provider: String,
@@ -80,8 +80,31 @@ pub async fn image_edits(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     client: ClientContext,
-    multipart: Result<Multipart, axum::extract::multipart::MultipartRejection>,
+    request: axum::extract::Request,
 ) -> Response {
+    if request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
+        })
+    {
+        let body = Json::<Value>::from_request(request, &state).await;
+        return crate::images::image_json(
+            state,
+            auth,
+            client,
+            body,
+            ENDPOINT,
+            crate::operation::IMAGE_EDIT,
+        )
+        .await;
+    }
+    let multipart = Multipart::from_request(request, &state).await;
     let started = Instant::now();
     let request_id = client.request_id.clone();
     let api_key_id = auth.entry.id.clone();
@@ -130,6 +153,22 @@ pub async fn image_edits(
     {
         Ok(success) => {
             let snapshot = snapshot.unwrap_or_else(|| state.snapshot.load());
+            if success.usage_handled_by_stream {
+                let mut response = success.response;
+                let limits = auth.key().rate_limit.clone().unwrap_or_default();
+                crate::request_metrics::publish_rate_limit_window(
+                    &state.metrics,
+                    &state.limiter,
+                    &snapshot,
+                    &api_key_id,
+                    &limits,
+                    &success.model_name,
+                    &success.upstream_model,
+                    &mut response,
+                )
+                .await;
+                return response;
+            }
             let elapsed = started.elapsed();
             let status = success.response.status().as_u16();
             crate::images::emit_access_log(
@@ -203,6 +242,7 @@ pub async fn image_edits(
                 &audit,
                 true,
                 routing.winner(),
+                None,
             );
             // Same window /v1/images/generations publishes, so an SDK client
             // can schedule back-off from real numbers.
@@ -351,6 +391,15 @@ fn captured_edit_fields(fields: &[(String, Option<String>, Option<String>, Bytes
 /// Collect all multipart fields, resolve the model, swap in the upstream
 /// model id, then rebuild and forward the multipart form. See audio's
 /// `multipart_dispatch` for the pattern this follows (minus streaming).
+enum EditAnswer {
+    Json(Value),
+    Stream(
+        reqwest::Response,
+        Option<std::time::Duration>,
+        Option<std::time::Duration>,
+    ),
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn dispatch(
     state: &ProxyState,
@@ -365,6 +414,7 @@ async fn dispatch(
     audit_out: &mut crate::usage_attr::GuardrailAudit,
     routing_out: &mut crate::attempt::RoutingTelemetry,
 ) -> Result<EditsDispatchSuccess, ProxyError> {
+    let request_started = Instant::now();
     // Collect all fields first so we can find `model` before building the
     // outgoing reqwest multipart.
     let mut fields: Vec<(String, Option<String>, Option<String>, Bytes)> = Vec::new();
@@ -409,20 +459,9 @@ async fn dispatch(
     // Client-IP allowlist gate (#557): reject before guardrails / upstream.
     crate::dispatch::check_ip_access(&model_entry.value, &client_ctx.source_ip)?;
 
-    // Partial-image SSE (`stream=true`) is not relayed yet — reject
-    // rather than buffer a stream the caller asked to watch grow (see
-    // the module doc). Rejected AFTER model resolution so an unknown
-    // model still answers 404 (matching the JSON endpoints' precedence)
-    // and the error carries the attribution `resolve_model` recorded,
-    // BEFORE any quota reservation.
-    if fields.iter().any(|(name, _, _, data)| {
+    let stream_requested = fields.iter().any(|(name, _, _, data)| {
         name == "stream" && std::str::from_utf8(data).map(str::trim) == Ok("true")
-    }) {
-        return Err(ProxyError::InvalidRequest(
-            "`stream` is not supported on /v1/images/edits".into(),
-        ));
-    }
-
+    });
     // #1016: a `prompt` part that is not valid UTF-8 would be skipped by
     // the guardrail scan below yet forwarded verbatim — reject it before
     // the guardrail pass instead of leaving that asymmetry.
@@ -544,7 +583,7 @@ async fn dispatch(
     crate::dispatch::require_dispatchable_entry(&model_entry.value)?;
     *routing_out = crate::attempt::RoutingTelemetry::for_request(&model_entry.value.display_name)
         .with_trace(client_ctx.trace.clone());
-    let dispatched = crate::routing::dispatch_with_failover(
+    let dispatched = crate::routing::dispatch_stream_with_failover(
         state,
         snapshot,
         auth,
@@ -559,43 +598,32 @@ async fn dispatch(
             async move {
                 let model = &target.model;
 
-                // Per #168's reasoning on generations: only OpenAI's API documents
-                // the `/v1/images/edits` route + form shape. Routing another provider
-                // here would dispatch to an upstream that 404s — reject explicitly at
-                // the gateway boundary instead. Cross-provider editing wires
-                // (Gemini / Vertex / BFL) are the AISIX-Cloud#1360 Phase 2 follow-up.
-                if model.provider.as_deref() != Some("openai") {
-                    return Err(ProxyError::TargetRefused(format!(
-                        "{} is not an OpenAI provider; \
-                         /v1/images/edits requires OpenAI",
-                        crate::routing::refused_model_label(model_name)
-                    )));
-                }
-
                 let provider = crate::dispatch::require_provider(model)?.to_string();
                 let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
                 let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
-                let api_key = crate::dispatch::require_api_key(&pk_entry.value, model)?;
-
-                let url = aisix_gateway::url_cache::cached_endpoint_url(
-                    &pk_entry.id,
-                    "proxy/images/edits",
-                    // Every resolve_base_url input, via the shared constructor
-                    // (#1017), plus the endpoint path.
-                    &{
-                        let [base, vendor, adapter] =
-                            crate::dispatch::pk_url_fingerprint(&pk_entry.value);
-                        [base, vendor, adapter, "/images/edits"]
-                    },
-                    || {
-                        let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
-                        Ok::<_, crate::error::ProxyError>(crate::dispatch::build_openai_url(
-                            &base,
-                            "/images/edits",
-                        ))
-                    },
-                )?;
+                let azure = pk_entry.value.adapter == Some(aisix_core::Adapter::AzureOpenai);
+                if model.provider.as_deref() != Some("openai") && !azure {
+                    return Err(ProxyError::TargetRefused(format!(
+                        "{} is not an OpenAI provider; /v1/images/edits requires OpenAI",
+                        crate::routing::refused_model_label(model_name)
+                    )));
+                }
                 let provider_label = provider.to_ascii_lowercase();
+                let mut ctx = crate::dispatch::bridge_ctx(
+                    request_id,
+                    &target.id,
+                    std::sync::Arc::clone(model),
+                    &pk_entry.id,
+                    std::sync::Arc::clone(&pk_entry.value),
+                    Some(client_ctx),
+                );
+                if let Some(deadline) = if stream_requested {
+                    timeouts.stream
+                } else {
+                    timeouts.request
+                } {
+                    ctx = ctx.with_deadline(deadline);
+                }
 
                 // Rebuild the multipart form with `model` rewritten. A `multipart::Form`
                 // is single-use (sending consumes it), so this is a closure: each retry
@@ -629,42 +657,6 @@ async fn dispatch(
                     form
                 };
 
-                // Headers built explicitly so the PK's `request.default_headers` and
-                // `request.forward_client_headers` apply (AISIX-Cloud#867). The body is
-                // a multipart form, so JSON body-field overrides don't apply — only
-                // headers do. Content-Type is left to `.multipart()` (it sets the
-                // boundary). Reserved auth headers are protected by
-                // `apply_request_headers`.
-                let mut headers = axum::http::HeaderMap::new();
-                let auth_hv =
-                    header::HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|e| {
-                        ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
-                            "api key contains invalid header chars: {e}"
-                        )))
-                    })?;
-                headers.insert(header::AUTHORIZATION, auth_hv);
-                let rid_hv = header::HeaderValue::from_str(request_id).map_err(|e| {
-                    ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
-                        "request_id contains invalid header chars: {e}"
-                    )))
-                })?;
-                headers.insert(
-                    header::HeaderName::from_static("x-aisix-request-id"),
-                    rid_hv,
-                );
-                aisix_gateway::apply_request_headers(
-                    &mut headers,
-                    &crate::dispatch::upstream_header_ctx(
-                        &pk_entry.value,
-                        &pk_entry.id,
-                        model,
-                        &target.id,
-                        client_ctx,
-                    ),
-                );
-
-                let client =
-                    crate::http_client::client_for(pk_entry.value.upstream_connection().as_ref());
                 let tracker = &state.runtime_status;
                 let model_id: &str = &target.id;
                 let cooldown_cfg = model.cooldown.as_ref();
@@ -672,26 +664,33 @@ async fn dispatch(
                 // buffered exchange, like the other direct-upstream paths.
                 let request_budget = timeouts.request;
                 let resp_json = match {
-                    let mut req = url
-                        .clone()
-                        .post_on(&client)
-                        .headers(headers.clone())
+                    let send_started = Instant::now();
+                    let mut req = crate::media_upstream::request(&ctx, "/images/edits", None)
+                        .await?
                         .multipart(build_form());
-                    if let Some(d) = request_budget {
-                        req = req.timeout(d);
+                    if !stream_requested {
+                        if let Some(d) = request_budget {
+                            req = req.timeout(d.saturating_sub(send_started.elapsed()));
+                        }
                     }
                     async move {
                         // `reqwest_error_to_bridge`: an elapsed `timeout` must surface
                         // as `BridgeError::Timeout`, not transport — the distinction
                         // decides whether the default retry budget covers it.
-                        let send_started = Instant::now();
-                        let resp = req.send().await.map_err(|e| {
-                            crate::cooldown::note_failure(
-                                tracker,
-                                model_id,
-                                cooldown_cfg,
-                                crate::dispatch::reqwest_error_to_bridge(&e, send_started),
-                            )
+                        let resp = crate::stream_timeout::send_with_deadline_observed(
+                            req,
+                            if stream_requested {
+                                timeouts.stream
+                            } else {
+                                timeouts.request
+                            }
+                            .map(|budget| budget.saturating_sub(send_started.elapsed())),
+                            send_started,
+                            aisix_gateway::upstream_io::Protocol::Images,
+                        )
+                        .await
+                        .map_err(|error| {
+                            crate::cooldown::note_failure(tracker, model_id, cooldown_cfg, error)
                         })?;
                         aisix_gateway::note_upstream_response(resp.headers());
                         let status = resp.status();
@@ -702,6 +701,9 @@ async fn dispatch(
                                 cooldown_cfg,
                                 aisix_provider_openai::held_route_http_error(resp).await,
                             ));
+                        }
+                        if crate::media_upstream::event_stream(resp.headers()) {
+                            return Ok(EditAnswer::Stream(resp, timeouts.stream, timeouts.request));
                         }
                         let body_bytes = resp.bytes().await.map_err(|e| {
                             crate::cooldown::note_failure(
@@ -727,16 +729,18 @@ async fn dispatch(
                                 err,
                             ));
                         }
-                        serde_json::from_slice::<Value>(&body_bytes).map_err(|e| {
-                            crate::cooldown::note_failure(
-                                tracker,
-                                model_id,
-                                cooldown_cfg,
-                                aisix_gateway::BridgeError::UpstreamDecode(format!(
-                                    "image edits response is not JSON: {e}"
-                                )),
-                            )
-                        })
+                        serde_json::from_slice::<Value>(&body_bytes)
+                            .map(EditAnswer::Json)
+                            .map_err(|e| {
+                                crate::cooldown::note_failure(
+                                    tracker,
+                                    model_id,
+                                    cooldown_cfg,
+                                    aisix_gateway::BridgeError::UpstreamDecode(format!(
+                                        "image edits response is not JSON: {e}"
+                                    )),
+                                )
+                            })
                     }
                 }
                 .await
@@ -755,11 +759,12 @@ async fn dispatch(
     )
     .await;
     let crate::routing::Dispatched {
-        value: (mut resp_json, provider_label, pk_id, upstream_model),
+        value: (resp_json, provider_label, pk_id, upstream_model),
         target,
         attempt_started,
         member_reservation,
-        ..
+        in_flight,
+        deferred,
     } = match dispatched {
         Ok(d) => d,
         Err(e) => {
@@ -774,6 +779,62 @@ async fn dispatch(
         reservation.merge(member);
     }
 
+    let mut resp_json = match resp_json {
+        EditAnswer::Stream(response, stream_budget, request_budget) => {
+            let response = crate::media_upstream::image_response(
+                state,
+                snapshot,
+                auth,
+                client_ctx,
+                ENDPOINT,
+                crate::operation::IMAGE_EDIT,
+                request_id,
+                &model_name,
+                &target.id,
+                std::sync::Arc::clone(&target.model),
+                &provider_label,
+                &pk_id,
+                &upstream_model,
+                applied_guardrails.clone(),
+                resolved_chain,
+                audit_out.clone(),
+                redactions,
+                monitor_hits,
+                response,
+                reservation,
+                in_flight,
+                deferred,
+                request_started,
+                attempt_started,
+                routing_out,
+                captured_prompt,
+                content_cap,
+                input_capture_safe,
+                stream_budget,
+                request_budget,
+            )
+            .await;
+            return Ok(EditsDispatchSuccess {
+                usage_handled_by_stream: true,
+                response,
+                model_name,
+                provider: provider_label,
+                model_id: target.id,
+                provider_key_id: pk_id,
+                upstream_model,
+                applied_guardrails,
+                usage: None,
+                redactions: Default::default(),
+                monitor_hits: Vec::new(),
+                guardrail_blocked: false,
+                captured_content: None,
+            });
+        }
+        EditAnswer::Json(value) => value,
+    };
+    if let Some(deferred) = &deferred {
+        deferred.finish(state, 200, true);
+    }
     state.health.record_success(&target.model.display_name);
     state
         .runtime_status
@@ -827,6 +888,7 @@ async fn dispatch(
         }
     };
     Ok(EditsDispatchSuccess {
+        usage_handled_by_stream: false,
         response,
         model_name,
         provider: provider_label,
@@ -1336,31 +1398,14 @@ mod tests {
         );
     }
 
-    /// `stream=true` (partial-image SSE) is not relayed yet — explicit
-    /// 400, not a silently buffered stream.
+    // 已交付的流契约取代旧版“尚未实现”的拒绝；缺字段等负例仍独立保留。
     #[tokio::test]
-    async fn stream_true_rejected_400() {
-        let snap = new_snap("http://unused");
-        snap.models.insert(model_entry("img-edit-prod"));
-        snap.apikeys.insert(apikey_entry(&["*"]));
-
-        let body = "--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nimg-edit-prod\r\n\
-             --b\r\nContent-Disposition: form-data; name=\"stream\"\r\n\r\ntrue\r\n\
-             --b\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nhi\r\n--b--\r\n";
-        let req = Request::builder()
-            .method("POST")
-            .uri("/v1/images/edits")
-            .header("authorization", "Bearer sk-caller")
-            .header("content-type", "multipart/form-data; boundary=b")
-            .body(axum::body::Body::from(body))
-            .unwrap();
-
-        let app = build_app(snap);
-        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert!(v["error"]["message"].as_str().unwrap().contains("stream"));
+    async fn stream_true_delivers_partial_then_completed() {
+        crate::audio::compat_media_image_peer::stream_case(
+            crate::audio::compat_media_image_peer::Form::EditMultipart,
+            crate::audio::compat_media_image_peer::Ending::Eof,
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -1383,7 +1428,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_multipart_content_type_returns_envelope_400() {
+    async fn unsupported_content_type_returns_envelope_400() {
         let snap = new_snap("http://unused");
         snap.models.insert(model_entry("img-edit-prod"));
         snap.apikeys.insert(apikey_entry(&["*"]));
@@ -1392,7 +1437,7 @@ mod tests {
             .method("POST")
             .uri("/v1/images/edits")
             .header("authorization", "Bearer sk-caller")
-            .header("content-type", "application/json")
+            .header("content-type", "text/plain")
             .body(axum::body::Body::from(r#"{"model":"img-edit-prod"}"#))
             .unwrap();
 
@@ -1790,5 +1835,386 @@ mod tests {
         assert_eq!(ev.guardrail_enforced_hits[0].action, "masked");
         let wire = serde_json::to_string(&ev).unwrap();
         assert!(!wire.contains("9.9.9"), "{wire}");
+    }
+}
+#[cfg(test)]
+mod compat_media_edit_stream_tests {
+    use crate::audio::compat_media_image_peer::{large_partial_case, stream_case, Ending, Form};
+
+    #[tokio::test]
+    async fn compat_media_edit_json_sse_partial_live_and_usage_eof() {
+        stream_case(Form::EditJson, Ending::Eof).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_edit_json_sse_completed_close_success() {
+        stream_case(Form::EditJson, Ending::CompletedClose).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_edit_json_sse_early_cancel_once() {
+        stream_case(Form::EditJson, Ending::Cancel).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_edit_json_sse_premature_eof_failure() {
+        stream_case(Form::EditJson, Ending::Truncated).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_edit_json_sse_inband_error_no_retry() {
+        stream_case(Form::EditJson, Ending::Error).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_edit_json_sse_read_timeout_failure() {
+        stream_case(Form::EditJson, Ending::Timeout).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_edit_json_sse_quota_lifetime() {
+        stream_case(Form::EditJson, Ending::Concurrency).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_edit_json_sse_output_custom_block() {
+        stream_case(Form::EditJson, Ending::OutputBlock).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_edit_json_sse_monitor_output_live() {
+        stream_case(Form::EditJson, Ending::Monitor).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_edit_json_sse_large_partial_keeps_terminal_usage() {
+        large_partial_case(Form::EditJson).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_edit_multipart_sse_partial_live_and_usage_eof() {
+        stream_case(Form::EditMultipart, Ending::Eof).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_edit_multipart_sse_completed_close_success() {
+        stream_case(Form::EditMultipart, Ending::CompletedClose).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_edit_multipart_sse_early_cancel_once() {
+        stream_case(Form::EditMultipart, Ending::Cancel).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_edit_multipart_sse_premature_eof_failure() {
+        stream_case(Form::EditMultipart, Ending::Truncated).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_edit_multipart_sse_inband_error_no_retry() {
+        stream_case(Form::EditMultipart, Ending::Error).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_edit_multipart_sse_read_timeout_failure() {
+        stream_case(Form::EditMultipart, Ending::Timeout).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_edit_multipart_sse_quota_lifetime() {
+        stream_case(Form::EditMultipart, Ending::Concurrency).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_edit_multipart_sse_output_custom_block() {
+        stream_case(Form::EditMultipart, Ending::OutputBlock).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_edit_multipart_sse_monitor_output_live() {
+        stream_case(Form::EditMultipart, Ending::Monitor).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_edit_multipart_sse_large_partial_keeps_terminal_usage() {
+        large_partial_case(Form::EditMultipart).await;
+    }
+}
+
+#[cfg(test)]
+mod compat_media_edit_json_tests {
+    use crate::audio::compat_media_test_peer::*;
+    use aisix_core::resource::ResourceEntry;
+    use axum::body::{to_bytes, Bytes};
+    use axum::http::StatusCode;
+    use serde_json::{json, Value};
+    use tower::ServiceExt as _;
+
+    const ENDPOINT: &str = "/v1/images/edits";
+
+    fn response() -> Value {
+        json!({"created":1700000000,"data":[{"b64_json":"ZmluYWw=","revised_prompt":"A red border.","native_item":{"retained":true}}],
+            "usage":{"input_tokens":37,"output_tokens":53,"total_tokens":90,"input_tokens_details":{"text_tokens":10,"image_tokens":27}},
+            "native_top":{"retained":[1,2,3]}})
+    }
+
+    // JSON 引用不得下载或变成 multipart；删掉 JSON 分派后状态和对端内容均会失败。
+    async fn reference_case(reference: Value) {
+        let expected_response = response();
+        let peer = Peer::start(
+            "application/json",
+            vec![Bytes::from(expected_response.to_string())],
+            false,
+        )
+        .await;
+        peer.release(1);
+        let native = json!({"model":ALIAS,"images":[reference.clone()],"mask":reference,"prompt":"Add a red border.","quality":"high",
+            "native_request_option":{"retained":[true,17,"x"]}});
+        let (app, _, _, mut rx) = app(snapshot(&peer.base, "gpt-image-2"));
+        let response = app
+            .oneshot(json_request(ENDPOINT, native.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "官方 JSON 编辑表单必须可达"
+        );
+        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&bytes).unwrap(),
+            expected_response
+        );
+        let requests = peer.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].uri, "/v1/images/edits");
+        assert_eq!(requests[0].headers["content-type"], "application/json");
+        let mut expected = native;
+        expected["model"] = json!("gpt-image-2");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&requests[0].body).unwrap(),
+            expected
+        );
+        let event = terminal(&mut rx).await;
+        assert_usage(&event, 37, 53, 90);
+        assert_eq!(event.status_code, 200);
+    }
+
+    #[tokio::test]
+    async fn compat_media_edit_json_file_and_mask_references_native() {
+        reference_case(json!({"file_id":"file-component-reference"})).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_edit_json_https_and_mask_references_native() {
+        reference_case(json!({"image_url":"https://example.invalid/source.png"})).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_edit_json_data_and_mask_references_native() {
+        use base64::Engine as _;
+        reference_case(json!({"image_url":format!("data:image/png;base64,{}",base64::engine::general_purpose::STANDARD.encode(png()))})).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_edit_json_input_block_prevents_upstream() {
+        let peer = Peer::start(
+            "application/json",
+            vec![Bytes::from(response().to_string())],
+            false,
+        )
+        .await;
+        peer.release(1);
+        let snap = snapshot(&peer.base, "gpt-image-2");
+        let guardrail: aisix_core::Guardrail = serde_json::from_value(json!({"name":"component-input-rule","enabled":true,"kind":"custom","hook_point":"input","fail_open":false,
+            "script":"export function checkInput() { return { action: 'block', reason_code: 'component' }; }","timeout_ms":5000})).unwrap();
+        crate::seed_env_scoped_guardrail(
+            &snap,
+            ResourceEntry::new("media-input-rule", guardrail, 1),
+        );
+        let (app, _, _, mut rx) = app(snap);
+        let response = app.oneshot(json_request(ENDPOINT, json!({"model":ALIAS,"images":[{"file_id":"file-component-reference"}],"prompt":"Add a red border."}))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["type"], "content_filter");
+        assert!(peer.requests().is_empty());
+        let event = terminal(&mut rx).await;
+        assert_eq!(event.status_code, 422);
+        assert!(event.guardrail_blocked);
+    }
+
+    #[tokio::test]
+    async fn compat_media_edit_json_input_mask_rewrites_actual_prompt() {
+        let peer = Peer::start(
+            "application/json",
+            vec![Bytes::from(response().to_string())],
+            false,
+        )
+        .await;
+        peer.release(1);
+        let snap = snapshot(&peer.base, "gpt-image-2");
+        let guardrail: aisix_core::Guardrail = serde_json::from_value(
+            json!({"name":"component-email-mask","enabled":true,"kind":"pii","hook_point":"input",
+            "detectors":[{"type":"email","action":"mask"}]}),
+        )
+        .unwrap();
+        crate::seed_env_scoped_guardrail(
+            &snap,
+            ResourceEntry::new("media-input-rule", guardrail, 1),
+        );
+        let (app, _, _, mut rx) = app(snap);
+        let response = app.oneshot(json_request(ENDPOINT, json!({"model":ALIAS,"images":[{"file_id":"file-component-reference"}],"prompt":"Contact alice@example.com for a red border."}))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = to_bytes(response.into_body(), 65536).await.unwrap();
+        let requests = peer.requests();
+        assert_eq!(requests.len(), 1);
+        let outbound: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let prompt = outbound["prompt"].as_str().unwrap();
+        assert!(prompt.starts_with("Contact ") && prompt.ends_with(" for a red border."));
+        assert!(!prompt.contains("alice@example.com"));
+        assert!(prompt.len() > "Contact  for a red border.".len());
+        let event = terminal(&mut rx).await;
+        assert_eq!(event.redacted_entity_counts.get("email"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn compat_media_edit_multipart_repeats_and_native_response_control() {
+        let expected_response = response();
+        let peer = Peer::start(
+            "application/json",
+            vec![Bytes::from(expected_response.to_string())],
+            false,
+        )
+        .await;
+        peer.release(1);
+        let (app, _, _, mut rx) = app(snapshot(&peer.base, "gpt-image-2"));
+        let mut fields = image_fields(false);
+        fields.push(text_part("prompt", "Repeated prompt."));
+        let response = app
+            .oneshot(multipart_request(ENDPOINT, &fields))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&to_bytes(response.into_body(), 65536).await.unwrap())
+                .unwrap(),
+            expected_response
+        );
+        let requests = peer.requests();
+        assert_eq!(requests.len(), 1);
+        fields[0].3 = Bytes::from_static(b"gpt-image-2");
+        assert_eq!(multipart_parts(&requests[0]).await, fields);
+        assert_usage(&terminal(&mut rx).await, 37, 53, 90);
+    }
+
+    #[tokio::test]
+    async fn compat_media_edit_multipart_owns_content_headers() {
+        let peer = Peer::start(
+            "application/json",
+            vec![Bytes::from(response().to_string())],
+            false,
+        )
+        .await;
+        peer.release(1);
+        let snap = snapshot(&peer.base, "gpt-image-2");
+        let pk: aisix_core::ProviderKey = serde_json::from_value(json!({
+            "display_name":"component-media-peer","api_key":"component-upstream-secret","api_base":peer.base,"provider":"openai","adapter":"openai",
+            "request":{"default_headers":{"cOnTeNt-TyPe":"application/json","Content-Length":"7","x-component-sentinel":"kept"}}
+        })).unwrap();
+        snap.provider_keys.insert(ResourceEntry::new(PK_ID, pk, 2));
+        let (app, _, _, _) = app(snap);
+        let mut fields = image_fields(false);
+        let response = app
+            .oneshot(multipart_request(ENDPOINT, &fields))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "操作员内容头不能破坏重建表单"
+        );
+        let _ = to_bytes(response.into_body(), 65536).await.unwrap();
+        let requests = peer.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].headers["x-component-sentinel"], "kept");
+        fields[0].3 = Bytes::from_static(b"gpt-image-2");
+        assert_eq!(multipart_parts(&requests[0]).await, fields);
+    }
+}
+
+#[cfg(test)]
+mod compat_media_image_quantity_presence_tests {
+    use crate::audio::compat_media_image_peer::{usage_presence_case, Form};
+
+    #[tokio::test]
+    async fn compat_media_edit_json_reported_zero_detail_preserved() {
+        usage_presence_case(Form::EditJson, true).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_edit_json_missing_usage_not_fabricated() {
+        usage_presence_case(Form::EditJson, false).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_edit_multipart_reported_zero_detail_preserved() {
+        usage_presence_case(Form::EditMultipart, true).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_edit_multipart_missing_usage_not_fabricated() {
+        usage_presence_case(Form::EditMultipart, false).await;
+    }
+}
+
+#[cfg(test)]
+mod compat_media_output_policy_tests {
+    use crate::audio::compat_media_image_peer::{output_mask_case, output_overflow_case, Form};
+
+    #[tokio::test]
+    async fn compat_media_edit_json_output_overflow_fail_open() {
+        output_overflow_case(Form::EditJson, true).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_edit_json_output_overflow_fail_closed() {
+        output_overflow_case(Form::EditJson, false).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_edit_json_output_mask_changes_actual_sse_metadata() {
+        output_mask_case(Form::EditJson).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_edit_multipart_output_overflow_fail_open() {
+        output_overflow_case(Form::EditMultipart, true).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_edit_multipart_output_overflow_fail_closed() {
+        output_overflow_case(Form::EditMultipart, false).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_edit_multipart_output_mask_changes_actual_sse_metadata() {
+        output_mask_case(Form::EditMultipart).await;
+    }
+}
+
+#[cfg(test)]
+mod compat_media_large_completed_tests {
+    use crate::audio::compat_media_image_peer::{large_completed_case, Form};
+
+    #[tokio::test]
+    async fn compat_media_edit_json_large_completed_still_reports_usage() {
+        large_completed_case(Form::EditJson).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_edit_multipart_large_completed_still_reports_usage() {
+        large_completed_case(Form::EditMultipart).await;
     }
 }

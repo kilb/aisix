@@ -48,14 +48,27 @@ use crate::error::ProxyError;
 pub(crate) fn endpoint_family(path: &str) -> Option<EndpointFamily> {
     use EndpointFamily as F;
     Some(match crate::normalize_endpoint_label(path) {
-        "/v1/chat/completions" => F::ChatCompletions,
+        "/v1/chat/completions"
+        | "/v1/chat/completions/:id"
+        | "/v1/chat/completions/:id/messages" => F::ChatCompletions,
         "/v1/completions" => F::Completions,
         "/v1/embeddings" => F::Embeddings,
         "/v1/messages" => F::Messages,
         "/v1/messages/count_tokens" => F::CountTokens,
-        "/v1/responses" => F::Responses,
+        "/v1/responses"
+        | "/v1/responses/compact"
+        | "/v1/responses/input_tokens"
+        | "/v1/responses/:id"
+        | "/v1/responses/:id/cancel"
+        | "/v1/responses/:id/input_items" => F::Responses,
         "/v1/models" | "/v1/models/:id" => F::Models,
-        "/v1/images/generations" | "/v1/images/edits" => F::Images,
+        "/v1/images/generations" | "/v1/images/edits" | "/v1/images/variations" => F::Images,
+        "/v1/moderations" => F::Moderations,
+        "/v1/content_provenance_checks" => F::ContentProvenanceChecks,
+        "/v1/uploads"
+        | "/v1/uploads/:id/parts"
+        | "/v1/uploads/:id/complete"
+        | "/v1/uploads/:id/cancel" => F::Files,
         "/v1/audio/transcriptions" | "/v1/audio/translations" | "/v1/audio/speech" => F::Audio,
         "/v1/videos" | "/v1/videos/:id" => F::Videos,
         "/v1/rerank" => F::Rerank,
@@ -63,6 +76,10 @@ pub(crate) fn endpoint_family(path: &str) -> Option<EndpointFamily> {
         "/v1/realtime" => F::Realtime,
         "/v1/files" | "/v1/files/:id" => F::Files,
         "/v1/batches" | "/v1/batches/:id" => F::Batches,
+        "/v1/messages/batches"
+        | "/v1/messages/batches/:id"
+        | "/v1/messages/batches/:id/cancel"
+        | "/v1/messages/batches/:id/results" => F::Batches,
         "/v1/fine_tuning/jobs" | "/v1/fine_tuning/jobs/:id" => F::FineTuning,
         "/mcp"
         | "/mcp/{server}"
@@ -116,7 +133,7 @@ mod tests {
     use EndpointFamily as F;
 
     /// Every family a route can be refused under: all but the catch-all.
-    const ROUTABLE_FAMILIES: [EndpointFamily; 19] = [
+    const ROUTABLE_FAMILIES: [EndpointFamily; 21] = [
         F::ChatCompletions,
         F::Completions,
         F::Embeddings,
@@ -133,6 +150,8 @@ mod tests {
         F::Files,
         F::Batches,
         F::FineTuning,
+        F::Moderations,
+        F::ContentProvenanceChecks,
         F::Mcp,
         F::A2a,
         F::Passthrough,
@@ -162,16 +181,36 @@ mod tests {
         ("/v1/key", Account),
         ("/v1/generation", Account),
         ("/v1/chat/completions", Family(F::ChatCompletions)),
+        ("/v1/chat/completions/:id", Family(F::ChatCompletions)),
+        (
+            "/v1/chat/completions/:id/messages",
+            Family(F::ChatCompletions),
+        ),
         ("/v1/completions", Family(F::Completions)),
         ("/v1/embeddings", Family(F::Embeddings)),
         ("/v1/images/generations", Family(F::Images)),
         ("/v1/images/edits", Family(F::Images)),
+        ("/v1/images/variations", Family(F::Images)),
+        ("/v1/moderations", Family(F::Moderations)),
+        (
+            "/v1/content_provenance_checks",
+            Family(F::ContentProvenanceChecks),
+        ),
+        ("/v1/uploads", Family(F::Files)),
+        ("/v1/uploads/:id/parts", Family(F::Files)),
+        ("/v1/uploads/:id/complete", Family(F::Files)),
+        ("/v1/uploads/:id/cancel", Family(F::Files)),
         ("/v1/messages", Family(F::Messages)),
         ("/v1/messages/count_tokens", Family(F::CountTokens)),
         ("/v1/rerank", Family(F::Rerank)),
         ("/v1/systemone", Family(F::Decisions)),
         ("/v1/decisions", Family(F::Decisions)),
         ("/v1/responses", Family(F::Responses)),
+        ("/v1/responses/compact", Family(F::Responses)),
+        ("/v1/responses/input_tokens", Family(F::Responses)),
+        ("/v1/responses/:id", Family(F::Responses)),
+        ("/v1/responses/:id/cancel", Family(F::Responses)),
+        ("/v1/responses/:id/input_items", Family(F::Responses)),
         ("/v1/audio/transcriptions", Family(F::Audio)),
         ("/v1/audio/translations", Family(F::Audio)),
         ("/v1/audio/speech", Family(F::Audio)),
@@ -185,6 +224,10 @@ mod tests {
         ("/v1/batches", Family(F::Batches)),
         ("/v1/batches/:id", Family(F::Batches)),
         ("/v1/batches/:id/cancel", Family(F::Batches)),
+        ("/v1/messages/batches", Family(F::Batches)),
+        ("/v1/messages/batches/:id", Family(F::Batches)),
+        ("/v1/messages/batches/:id/cancel", Family(F::Batches)),
+        ("/v1/messages/batches/:id/results", Family(F::Batches)),
         ("/v1/fine_tuning/jobs", Family(F::FineTuning)),
         ("/v1/fine_tuning/jobs/:id", Family(F::FineTuning)),
         ("/v1/fine_tuning/jobs/:id/cancel", Family(F::FineTuning)),
@@ -316,6 +359,27 @@ mod tests {
         // may own it, and checks itself.
         assert_eq!(endpoint_family("/passthrough/openai/v1/embeddings"), None);
         assert_eq!(endpoint_family("/definitely/not/a/route"), None);
+    }
+
+    #[test]
+    fn native_response_operations_keep_the_responses_family() {
+        for route in [
+            "/v1/responses/compact",
+            "/v1/responses/input_tokens",
+            "/v1/responses/resp_owned",
+            "/v1/responses/resp_owned/cancel",
+            "/v1/responses/resp_owned/input_items",
+        ] {
+            assert_eq!(endpoint_family(route), Some(F::Responses), "{route}");
+        }
+        for route in [
+            "/v1/responses/",
+            "/v1/responses//cancel",
+            "/v1/responses/resp_owned/unregistered",
+            "/v1/responses/resp_owned/input_items/extra",
+        ] {
+            assert_eq!(endpoint_family(route), None, "{route}");
+        }
     }
 
     /// Census: every route `build_router` mounts maps to the family its row

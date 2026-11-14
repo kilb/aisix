@@ -615,6 +615,7 @@ mod tests {
         // outage must still block the OUTPUT hook.
         let g = build(&server.uri(), true);
         let resp = aisix_gateway::ChatResponse {
+            native_envelope: None,
             logprobs: None,
             more_choices: Vec::new(),
             id: "r".into(),

@@ -20,7 +20,7 @@
   height: 16px;
   fill: none;
   stroke: currentColor;
-  stroke-width: 1.5;
+  stroke-width: 1.7;
   stroke-linecap: round;
   stroke-linejoin: round;
 }
@@ -99,12 +99,13 @@
   min-width: 0;
   margin: 0;
 }
+.f { gap: 8px; }
 .f-label,
 .field > legend {
   color: var(--foreground);
-  font-size: 13px;
+  font-size: 14px;
   font-weight: 500;
-  line-height: 1.4;
+  line-height: 20px;
 }
 fieldset.field {
   padding: 0;
@@ -191,7 +192,7 @@ fieldset.field > legend {
   height: 20px;
   padding: 0 8px;
   border: 1px solid var(--border);
-  border-radius: 9999px;
+  border-radius: var(--r-chip);
   background: var(--muted);
   color: var(--text-2);
   font-size: 12px;
@@ -235,7 +236,7 @@ fieldset.field > legend {
   min-width: 0;
   margin: 0;
   padding: var(--pad);
-  border: 1px solid color-mix(in srgb, var(--foreground) 8%, transparent);
+  border: 1px solid var(--border);
   border-radius: var(--r-card);
   background: var(--card);
   color: var(--card-foreground);
@@ -252,8 +253,8 @@ fieldset.field > legend {
   background: var(--card);
 }
 .dt-wrap.dt-scroll {
-  max-height: min(70vh, 720px);
-  overflow-y: auto;
+  max-height: none;
+  overflow-y: visible;
 }
 .dt {
   width: 100%;
@@ -268,21 +269,22 @@ fieldset.field > legend {
   height: var(--h-head);
   padding: 0 12px;
   border-bottom: 1px solid var(--border);
-  background: var(--card);
+  background: color-mix(in srgb, var(--background) 45%, var(--card));
   color: var(--muted-foreground);
   font-size: 12px;
   font-family: var(--font-sans);
-  font-weight: 400;
+  font-weight: 500;
   text-align: left;
-  white-space: nowrap;
+  white-space: normal;
   vertical-align: middle;
 }
 .dt td {
   height: var(--h-row);
-  padding: 6px 12px;
+  padding: 2px 12px;
   border-bottom: 1px solid var(--border);
   vertical-align: middle;
-  white-space: nowrap;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 .dt tr:has(.cell-note) > td {
   padding-top: 10px;
@@ -313,11 +315,12 @@ fieldset.field > legend {
 }
 .dt.dt-compact td {
   height: var(--h-row-compact);
-  padding-top: 4px;
-  padding-bottom: 4px;
+  padding-top: 2px;
+  padding-bottom: 2px;
 }
 .dt code {
-  white-space: nowrap;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 /* Secondary text under a value: a second line in 12px. */
 .cell-note {
@@ -390,7 +393,7 @@ fieldset.field > legend {
   height: 10px;
   border-radius: 9999px;
   background: var(--skeleton);
-  animation: ui-shimmer 1.6s ease-in-out infinite;
+  animation: none;
 }
 @keyframes ui-shimmer {
   50% {
@@ -405,8 +408,8 @@ fieldset.field > legend {
   align-items: center;
   gap: 12px;
   padding: 40px 24px;
-  border: 1px dashed var(--border);
-  border-radius: var(--radius);
+  border: 0;
+  border-radius: 0;
   color: var(--muted-foreground);
   text-align: center;
 }
@@ -517,15 +520,15 @@ main { counter-reset: bento-card; }
   flex-wrap: wrap;
   align-items: flex-end;
   justify-content: space-between;
-  gap: 24px 32px;
-  margin-bottom: 40px;
+  gap: 16px 24px;
+  margin-bottom: var(--page-heading-gap);
 }
-.bento-page-header > :first-child { min-width: 0; flex: 1 1 620px; }
+.bento-page-header > :first-child { min-width: 0; flex: 1 1 360px; }
 .bento-page-header h1 { overflow-wrap: anywhere; }
 .bento-page-actions { max-width: 100%; }
 .bento-lead { max-width: 64ch; }
 .bento-lead strong { font-weight: 500; color: var(--foreground); }
-.bento-card { display: flex; flex-direction: column; gap: 24px; margin: 0; }
+.bento-card { display: flex; flex-direction: column; gap: var(--card-gap); margin: 0; }
 .bento-stat, .bento-grid > .panel, .with-side > .panel { margin: 0; }
 .bento-card > * + * { margin-top: 0; }
 .bento-card > .bento-card-footer { margin-top: auto; }
@@ -541,4 +544,32 @@ main { counter-reset: bento-card; }
   .bento-page-header { gap: 20px; }
   .bento-page-header h1 { font-size: var(--fs-44); }
   .toasts { right: 16px; left: 16px; align-items: stretch; }
+}
+
+/* 计量台的文字层级与操作反馈；不对数据或权限分支作推断。 */
+.bento-page-header { align-items: center; }
+.bento-lead { max-width: 76ch; }
+.bento-card-header :is(h2, h3) { letter-spacing: -0.01em; }
+.bento-metric-skeleton { width: min(14ch, 70%); height: 36px; }
+.bento-chart-skeleton { height: 160px; }
+.bento-card-message { padding-block: 12px; }
+.bento-card-index { display: none; }
+.bento-page-header .font-mono, .bento-card-header .font-mono, .bento-stat .font-mono { font-family: var(--font-sans); letter-spacing: 0; }
+.btn:active:not(:disabled, [aria-disabled="true"]) { filter: brightness(.94); }
+.dt tr:focus-within { background: var(--row-hover); }
+.dt tr.dt-detail > td { padding: 0 var(--dt-edge) 20px; background: var(--card); }
+.dt tr:has(+ tr.dt-detail) > td { border-bottom: 0; }
+.dt tr.dt-detail:hover { background: var(--card); }
+.empty p { max-width: 54ch; line-height: 22px; }
+.side-panel { scroll-margin-top: 88px; }
+.side-head { padding-bottom: 16px; border-bottom: 1px solid var(--border); }
+.side-head > h2 { overflow: visible; white-space: normal; overflow-wrap: anywhere; }
+@media (max-width: 719px) {
+  .panel { --pad: 16px; }
+  .bento-page-header { gap: 12px; margin-bottom: 20px; }
+  .bento-page-header > :first-child { flex-basis: 100%; }
+  .bento-page-header h1 { line-height: 34px; }
+  .empty { padding: 32px 8px; }
+  .side-head { align-items: flex-start; }
+  .two-step-warn { max-width: min(44ch, 75vw); }
 }

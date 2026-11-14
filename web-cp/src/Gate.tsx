@@ -61,7 +61,6 @@ export function Gate({
           <span className="brand-mark" aria-hidden="true" />
           <span>Routio</span>
         </div>
-        <span className="font-mono text-meta text-muted-foreground">运维工作空间</span>
         <h1 className="cp-gate-title">Routio 运维台</h1>
         <p>连接上游，管理路由。<br />在一个工作空间查看网关、配置与计费。</p>
         <div className="cp-gate-meta">
@@ -74,8 +73,7 @@ export function Gate({
           onSubmit={submit}
         >
           <div className="mb-6">
-            <div className="mb-3 font-mono text-meta text-muted-foreground" aria-hidden="true">01 — 账户</div>
-            <h2 className="text-stat font-medium">运维登录</h2>
+            <h2 className="text-stat font-semibold">运维登录</h2>
             <p className="mt-2 text-caption text-muted-foreground">使用平台分配的运维账号继续。</p>
           </div>
           {notice && (

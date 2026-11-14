@@ -70,6 +70,7 @@ pub(crate) const SYSTEMONE: Surface = Surface::uniform("systemone");
 pub(crate) const DECISIONS: Surface = Surface::uniform("decisions");
 pub(crate) const REALTIME: Surface = Surface::uniform("realtime");
 pub(crate) const FILES: Surface = Surface::uniform("files");
+pub(crate) const UPLOADS: Surface = Surface::uniform("uploads");
 pub(crate) const BATCHES: Surface = Surface::uniform("batches");
 pub(crate) const FINE_TUNING: Surface = Surface::uniform("fine_tuning");
 pub(crate) const MCP: Surface = Surface::uniform("mcp");
@@ -77,6 +78,9 @@ pub(crate) const A2A: Surface = Surface::uniform("a2a");
 
 pub(crate) const IMAGE_GENERATION: Surface = Surface::split("images", "image_generation");
 pub(crate) const IMAGE_EDIT: Surface = Surface::split("images", "image_edit");
+pub(crate) const IMAGE_VARIATION: Surface = Surface::split("images", "image_variation");
+pub(crate) const MODERATIONS: Surface = Surface::uniform("moderations");
+pub(crate) const CONTENT_PROVENANCE_CHECKS: Surface = Surface::uniform("content_provenance_checks");
 
 pub(crate) const TRANSCRIPTION: Surface = Surface::split("audio", "transcription");
 pub(crate) const TRANSLATION: Surface = Surface::split("audio", "translation");
@@ -128,17 +132,31 @@ pub(crate) const BATCH_COMPLETION: Surface = Surface::split("batch", "batch_comp
 /// one to say anything here.
 pub(crate) fn surface_for_endpoint(endpoint: &str) -> Option<Surface> {
     Some(match endpoint {
-        "/v1/chat/completions" => CHAT,
+        "/v1/chat/completions"
+        | "/v1/chat/completions/:id"
+        | "/v1/chat/completions/:id/messages" => CHAT,
         "/v1/completions" => COMPLETIONS,
         "/v1/embeddings" => EMBEDDINGS,
         "/v1/images/generations" => IMAGE_GENERATION,
         "/v1/images/edits" => IMAGE_EDIT,
+        "/v1/images/variations" => IMAGE_VARIATION,
+        "/v1/moderations" => MODERATIONS,
+        "/v1/content_provenance_checks" => CONTENT_PROVENANCE_CHECKS,
+        "/v1/uploads"
+        | "/v1/uploads/:id/parts"
+        | "/v1/uploads/:id/complete"
+        | "/v1/uploads/:id/cancel" => UPLOADS,
         "/v1/messages" => MESSAGES,
         "/v1/messages/count_tokens" => COUNT_TOKENS,
         "/v1/rerank" => RERANK,
         "/v1/systemone" => SYSTEMONE,
         "/v1/decisions" => DECISIONS,
-        "/v1/responses" => RESPONSES,
+        "/v1/responses"
+        | "/v1/responses/compact"
+        | "/v1/responses/input_tokens"
+        | "/v1/responses/:id"
+        | "/v1/responses/:id/cancel"
+        | "/v1/responses/:id/input_items" => RESPONSES,
         "/v1/audio/transcriptions" => TRANSCRIPTION,
         "/v1/audio/translations" => TRANSLATION,
         "/v1/audio/speech" => SPEECH,
@@ -146,6 +164,10 @@ pub(crate) fn surface_for_endpoint(endpoint: &str) -> Option<Surface> {
         "/v1/realtime" => REALTIME,
         "/v1/files" | "/v1/files/:id" => FILES,
         "/v1/batches" | "/v1/batches/:id" => BATCHES,
+        "/v1/messages/batches"
+        | "/v1/messages/batches/:id"
+        | "/v1/messages/batches/:id/cancel"
+        | "/v1/messages/batches/:id/results" => BATCHES,
         "/v1/fine_tuning/jobs" | "/v1/fine_tuning/jobs/:id" => FINE_TUNING,
         "/mcp" | "/mcp/{server}" => MCP,
         "/a2a" => A2A,
@@ -208,16 +230,33 @@ mod tests {
             Emits::Nothing("account lookup; reaches no upstream and meters nothing"),
         ),
         ("/v1/chat/completions", Emits::Usage(CHAT)),
+        ("/v1/chat/completions/:id", Emits::Usage(CHAT)),
+        ("/v1/chat/completions/:id/messages", Emits::Usage(CHAT)),
         ("/v1/completions", Emits::Usage(COMPLETIONS)),
         ("/v1/embeddings", Emits::Usage(EMBEDDINGS)),
         ("/v1/images/generations", Emits::Usage(IMAGE_GENERATION)),
         ("/v1/images/edits", Emits::Usage(IMAGE_EDIT)),
+        ("/v1/images/variations", Emits::Usage(IMAGE_VARIATION)),
+        ("/v1/moderations", Emits::Usage(MODERATIONS)),
+        (
+            "/v1/content_provenance_checks",
+            Emits::Usage(CONTENT_PROVENANCE_CHECKS),
+        ),
+        ("/v1/uploads", Emits::Usage(UPLOADS)),
+        ("/v1/uploads/:id/parts", Emits::Usage(UPLOADS)),
+        ("/v1/uploads/:id/complete", Emits::Usage(UPLOADS)),
+        ("/v1/uploads/:id/cancel", Emits::Usage(UPLOADS)),
         ("/v1/messages", Emits::Usage(MESSAGES)),
         ("/v1/messages/count_tokens", Emits::Usage(COUNT_TOKENS)),
         ("/v1/rerank", Emits::Usage(RERANK)),
         ("/v1/systemone", Emits::Usage(SYSTEMONE)),
         ("/v1/decisions", Emits::Usage(DECISIONS)),
         ("/v1/responses", Emits::Usage(RESPONSES)),
+        ("/v1/responses/compact", Emits::Usage(RESPONSES)),
+        ("/v1/responses/input_tokens", Emits::Usage(RESPONSES)),
+        ("/v1/responses/:id", Emits::Usage(RESPONSES)),
+        ("/v1/responses/:id/cancel", Emits::Usage(RESPONSES)),
+        ("/v1/responses/:id/input_items", Emits::Usage(RESPONSES)),
         ("/v1/audio/transcriptions", Emits::Usage(TRANSCRIPTION)),
         ("/v1/audio/translations", Emits::Usage(TRANSLATION)),
         ("/v1/audio/speech", Emits::Usage(SPEECH)),
@@ -237,6 +276,10 @@ mod tests {
         ("/v1/batches", Emits::Usage(BATCHES)),
         ("/v1/batches/:id", Emits::Usage(BATCHES)),
         ("/v1/batches/:id/cancel", Emits::Usage(BATCHES)),
+        ("/v1/messages/batches", Emits::Usage(BATCHES)),
+        ("/v1/messages/batches/:id", Emits::Usage(BATCHES)),
+        ("/v1/messages/batches/:id/cancel", Emits::Usage(BATCHES)),
+        ("/v1/messages/batches/:id/results", Emits::Usage(BATCHES)),
         ("/v1/fine_tuning/jobs", Emits::Usage(FINE_TUNING)),
         ("/v1/fine_tuning/jobs/:id", Emits::Usage(FINE_TUNING)),
         ("/v1/fine_tuning/jobs/:id/cancel", Emits::Usage(FINE_TUNING)),
@@ -421,12 +464,16 @@ mod tests {
             (DECISIONS, "decisions"),
             (REALTIME, "realtime"),
             (FILES, "files"),
+            (UPLOADS, "uploads"),
             (BATCHES, "batches"),
             (FINE_TUNING, "fine_tuning"),
             (MCP, "mcp"),
             (A2A, "a2a"),
             (IMAGE_GENERATION, "images"),
             (IMAGE_EDIT, "images"),
+            (IMAGE_VARIATION, "images"),
+            (MODERATIONS, "moderations"),
+            (CONTENT_PROVENANCE_CHECKS, "content_provenance_checks"),
             (TRANSCRIPTION, "audio"),
             (TRANSLATION, "audio"),
             (SPEECH, "audio"),

@@ -27,9 +27,9 @@ export function ApiSuccessSummary({ totals }: { totals?: SuccessSummaryTotals })
     { label: "失败", value: formatCount(totals?.failed_requests) },
     { label: "未知", value: formatCount(totals?.unknown_outcome_requests) },
   ];
-  return <div role="group" aria-label="请求成功率摘要" className="min-w-0">
+  return <div role="group" aria-label="请求成功率摘要" className="metric-success min-w-0">
     <dl className="m-0 grid grid-cols-2 gap-x-6 gap-y-4 desktop:grid-cols-4">
-      {items.map(item => <div key={item.label} className="min-w-0"><dt className="text-micro text-muted">{item.label}</dt><dd className="m-0 mt-2"><Metric size="value">{item.value}</Metric></dd></div>)}
+      {items.map(item => <div key={item.label} className="min-w-0"><dt className="text-micro text-muted">{item.label}</dt><dd className="m-0 mt-2"><Metric size="display" className="font-medium">{item.value}</Metric></dd></div>)}
     </dl>
     <ApiOutcomeComposition totals={totals} />
     <dl className="m-0 mt-5 flex flex-wrap gap-x-6 gap-y-2 border-t border-ink/7 pt-4 text-caption">

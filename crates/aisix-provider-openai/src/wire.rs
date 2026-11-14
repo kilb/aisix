@@ -126,6 +126,7 @@ pub struct OpenAiMessage<'a> {
 pub enum OpenAiContent<'a> {
     Text(&'a str),
     Blocks(&'a [serde_json::Value]),
+    ProjectedBlocks(Vec<&'a serde_json::Value>),
 }
 
 /// Build the upstream request from the gateway's normalised format.
@@ -171,13 +172,25 @@ pub fn messages_from(
         .iter()
         .map(|m| OpenAiMessage {
             role: role_str(m.role, developer_role_mode),
-            // Vision / multimodal callers send `content` as an array
-            // of typed blocks; OpenAI accepts the array form natively
-            // (no translation needed for OpenAI / Gemini-OpenAI-compat /
-            // DeepSeek-OpenAI-compat upstreams). When present forward
-            // the raw blocks verbatim; otherwise forward the bare
-            // string. See `ChatMessage::content_blocks` doc.
+            // 原生回放载体保留在内部；Chat 只能接收可表示的块，工具走 tool_calls。
             content: match (m.content_blocks.as_deref(), m.content.as_deref()) {
+                (Some(blocks), text)
+                    if m.role == Role::Assistant && blocks.iter().any(native_replay_thinking) =>
+                {
+                    let projected: Vec<_> = blocks
+                        .iter()
+                        .filter(|block| {
+                            !native_replay_thinking(block)
+                                && block.get("type").and_then(serde_json::Value::as_str)
+                                    != Some("tool_use")
+                        })
+                        .collect();
+                    if projected.is_empty() {
+                        text.map(OpenAiContent::Text)
+                    } else {
+                        Some(OpenAiContent::ProjectedBlocks(projected))
+                    }
+                }
                 (Some(blocks), _) => Some(OpenAiContent::Blocks(blocks)),
                 // No blocks: the text is the stored string.
                 (None, Some(text)) => Some(OpenAiContent::Text(text)),
@@ -190,6 +203,21 @@ pub fn messages_from(
             extra: &m.extra,
         })
         .collect()
+}
+
+fn native_replay_thinking(block: &serde_json::Value) -> bool {
+    match block.get("type").and_then(serde_json::Value::as_str) {
+        Some("thinking") => {
+            block
+                .get("thinking")
+                .is_some_and(serde_json::Value::is_string)
+                && block
+                    .get("signature")
+                    .is_some_and(serde_json::Value::is_string)
+        }
+        Some("redacted_thinking") => block.get("data").is_some_and(serde_json::Value::is_string),
+        _ => false,
+    }
 }
 
 fn role_str(role: Role, developer_role_mode: DeveloperRoleMode) -> &'static str {
@@ -229,6 +257,8 @@ pub struct OpenAiResponse {
     /// cannot fail the whole response decode.
     #[serde(default)]
     pub service_tier: Option<serde_json::Value>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// The tier a top-level OpenAI-shape `service_tier` names, verbatim.
@@ -245,6 +275,8 @@ pub struct OpenAiChoice {
     pub finish_reason: Option<String>,
     #[serde(default)]
     pub logprobs: Option<serde_json::Value>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// A message `content`: OpenAI's string, or the array of content parts
@@ -379,17 +411,23 @@ pub fn response_into_chat_response(raw: OpenAiResponse) -> ChatResponse {
         .into_iter()
         .enumerate()
         .map(|(position, c)| choice_into_parts(position, c));
-    let (message, finish, logprobs) = match choices.next() {
-        Some((_, message, finish, logprobs)) => (message, finish, logprobs),
-        None => (ChatMessage::assistant(""), FinishReason::Stop, None),
+    let (message, finish, logprobs, choice) = match choices.next() {
+        Some((index, message, finish, logprobs, extra)) => (
+            message,
+            finish,
+            logprobs,
+            Some(aisix_gateway::chat::NativeChatChoice { index, extra }),
+        ),
+        None => (ChatMessage::assistant(""), FinishReason::Stop, None, None),
     };
     let more_choices = choices
         .map(
-            |(index, message, finish_reason, logprobs)| aisix_gateway::chat::ChatChoice {
+            |(index, message, finish_reason, logprobs, extra)| aisix_gateway::chat::ChatChoice {
                 index,
                 message,
                 finish_reason,
                 logprobs,
+                extra,
             },
         )
         .collect();
@@ -397,6 +435,7 @@ pub fn response_into_chat_response(raw: OpenAiResponse) -> ChatResponse {
     let usage = raw.usage.map(into_usage).unwrap_or_default();
 
     ChatResponse {
+        native_envelope: Some(native_envelope(raw.extra, choice)),
         id: raw.id,
         model: raw.model,
         message,
@@ -411,7 +450,13 @@ pub fn response_into_chat_response(raw: OpenAiResponse) -> ChatResponse {
 fn choice_into_parts(
     position: usize,
     c: OpenAiChoice,
-) -> (u32, ChatMessage, FinishReason, Option<serde_json::Value>) {
+) -> (
+    u32,
+    ChatMessage,
+    FinishReason,
+    Option<serde_json::Value>,
+    serde_json::Map<String, serde_json::Value>,
+) {
     let mut extra = c.message.extra;
     let has_tool_calls = c.message.tool_calls.as_ref().is_some_and(|t| !t.is_empty());
     if let Some(tool_calls) = c.message.tool_calls {
@@ -478,7 +523,22 @@ fn choice_into_parts(
         message,
         turn_finish_reason(c.finish_reason.as_deref(), has_tool_calls),
         c.logprobs.filter(|l| !l.is_null()),
+        c.extra,
     )
+}
+
+fn native_envelope(
+    mut extra: serde_json::Map<String, serde_json::Value>,
+    choice: Option<aisix_gateway::chat::NativeChatChoice>,
+) -> aisix_gateway::chat::NativeChatEnvelope {
+    let created = extra.remove("created").and_then(|v| v.as_i64());
+    // object/model 等结构字段由 renderer 写入，不能在 flatten 时重复。
+    extra.remove("object");
+    aisix_gateway::chat::NativeChatEnvelope {
+        created,
+        extra,
+        choice,
+    }
 }
 
 pub fn into_usage(u: OpenAiUsage) -> UsageStats {
@@ -512,6 +572,7 @@ pub fn into_usage(u: OpenAiUsage) -> UsageStats {
             .or(u.prompt_cache_hit_tokens)
             .unwrap_or(0),
         cache_write_tokens: prompt.and_then(|d| d.cache_write_tokens),
+        cache_usage_reported: None,
         reasoning_tokens: completion.and_then(|d| d.reasoning_tokens).unwrap_or(0),
         // OpenAI doesn't currently expose Anthropic-style cache
         // creation/read counters; leave at 0 (the control plane falls back to
@@ -532,6 +593,7 @@ pub fn into_usage(u: OpenAiUsage) -> UsageStats {
             completion_image_tokens: completion.and_then(|d| d.image_tokens),
         },
         openai_details: aisix_gateway::OpenAiUsageDetails {
+            cache_creation_tokens_reported: false,
             cached_tokens_reported: prompt.is_some_and(|d| d.cached_tokens.is_some()),
             reasoning_tokens_reported: completion.is_some_and(|d| d.reasoning_tokens.is_some()),
             prompt_text_tokens: prompt.and_then(|d| d.text_tokens),
@@ -584,6 +646,7 @@ pub struct OpenAiStreamChunk {
     pub usage: Option<OpenAiUsage>,
     /// See [`OpenAiResponse::service_tier`].
     pub service_tier: Option<serde_json::Value>,
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -599,6 +662,8 @@ struct RawStreamChunk {
     service_tier: Option<serde_json::Value>,
     #[serde(default)]
     error: Option<serde_json::Value>,
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 impl TryFrom<RawStreamChunk> for OpenAiStreamChunk {
@@ -622,6 +687,7 @@ impl TryFrom<RawStreamChunk> for OpenAiStreamChunk {
             choices: raw.choices,
             usage: raw.usage,
             service_tier: raw.service_tier,
+            extra: raw.extra,
         })
     }
 }
@@ -636,6 +702,8 @@ pub struct OpenAiStreamChoice {
     pub finish_reason: Option<String>,
     #[serde(default)]
     pub logprobs: Option<serde_json::Value>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -791,16 +859,24 @@ fn delta_runs(
 /// choice index; the frame's usage rides the last of them. A choice whose
 /// part-array content interleaves text and reasoning is one chunk per
 /// run, in order (see [`delta_runs`]). A frame with no choice is one chunk
-/// with an empty delta. Empty for a frame with no `choices` key and no
-/// usage, which carries nothing to relay.
+/// with an empty delta.
+/// 无 choices、用量、有效档位且只有标准元数据的帧不生成空增量。
 pub fn stream_chunk_into_chat_chunks(
     mut raw: OpenAiStreamChunk,
     tool_call_indexer: &mut ToolCallIndexer,
 ) -> Vec<ChatChunk> {
-    if raw.choices.is_none() && raw.usage.is_none() {
+    let envelope = native_envelope(raw.extra, None);
+    let service_tier = service_tier_of(raw.service_tier.as_ref());
+    if raw.choices.is_none()
+        && raw.usage.is_none()
+        && service_tier.is_none()
+        && envelope
+            .extra
+            .keys()
+            .all(|key| matches!(key.as_str(), "obfuscation" | "system_fingerprint"))
+    {
         return Vec::new();
     }
-    let service_tier = service_tier_of(raw.service_tier.as_ref());
     let mut chunks: Vec<ChatChunk> = raw
         .choices
         .take()
@@ -822,6 +898,13 @@ pub fn stream_chunk_into_chat_chunks(
             let mut chunks: Vec<ChatChunk> = delta_runs(reasoning_field, c.delta.content)
                 .into_iter()
                 .map(|(reasoning_content, content)| ChatChunk {
+                    native_envelope: Some(aisix_gateway::chat::NativeChatEnvelope {
+                        choice: Some(aisix_gateway::chat::NativeChatChoice {
+                            index: choice_index,
+                            extra: c.extra.clone(),
+                        }),
+                        ..envelope.clone()
+                    }),
                     id: raw.id.clone(),
                     model: raw.model.clone(),
                     choice_index,
@@ -860,6 +943,7 @@ pub fn stream_chunk_into_chat_chunks(
     // relayed as one chunk.
     if chunks.is_empty() {
         chunks.push(ChatChunk {
+            native_envelope: Some(envelope),
             id: raw.id,
             model: raw.model,
             choice_index: 0,
@@ -1723,6 +1807,85 @@ mod tests {
         assert!(
             first_chunk(raw, &mut ToolCallIndexer::default()).is_some_and(|c| c.usage.is_some())
         );
+    }
+
+    #[test]
+    fn stream_metadata_without_choices_does_not_create_a_chunk() {
+        let raw = stream_chunk(serde_json::json!({
+            "id": "c", "model": "audio-model", "object": "chat.completion.chunk",
+            "created": 1730000000, "usage": null,
+            "system_fingerprint": "fp_backend", "obfuscation": "padding"
+        }));
+        assert!(stream_chunk_into_chat_chunks(raw, &mut ToolCallIndexer::default()).is_empty());
+    }
+
+    #[test]
+    fn stream_without_choices_keeps_usage_and_served_tier() {
+        let raw = stream_chunk(serde_json::json!({
+            "id": "c", "service_tier": "priority", "obfuscation": "padding",
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        }));
+        let chunks = stream_chunk_into_chat_chunks(raw, &mut ToolCallIndexer::default());
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(
+            chunks[0].service_tier,
+            Some(aisix_gateway::ServiceTier::OpenAi("priority".into()))
+        );
+        let usage = chunks[0]
+            .usage
+            .as_ref()
+            .expect("reported zero usage was dropped");
+        assert_eq!(usage.prompt_tokens, 0);
+        assert_eq!(usage.completion_tokens, 0);
+        assert_eq!(
+            chunks[0]
+                .native_envelope
+                .as_ref()
+                .unwrap()
+                .extra
+                .get("obfuscation"),
+            Some(&serde_json::json!("padding"))
+        );
+
+        let raw = stream_chunk(serde_json::json!({
+            "id": "c", "service_tier": "priority", "obfuscation": "padding"
+        }));
+        let chunks = stream_chunk_into_chat_chunks(raw, &mut ToolCallIndexer::default());
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(
+            chunks[0].service_tier,
+            Some(aisix_gateway::ServiceTier::OpenAi("priority".into()))
+        );
+        assert!(chunks[0].usage.is_none());
+    }
+
+    #[test]
+    fn stream_without_choices_keeps_moderation_and_explicit_empty_choices() {
+        let result = serde_json::json!({
+            "type": "moderation_results", "model": "omni-moderation-latest", "results": []
+        });
+        let moderation = serde_json::json!({"input": result.clone(), "output": result});
+        let raw = stream_chunk(serde_json::json!({
+            "id": "c", "obfuscation": "padding", "moderation": moderation.clone()
+        }));
+        let chunks = stream_chunk_into_chat_chunks(raw, &mut ToolCallIndexer::default());
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(
+            chunks[0]
+                .native_envelope
+                .as_ref()
+                .unwrap()
+                .extra
+                .get("moderation"),
+            Some(&moderation)
+        );
+
+        let raw = stream_chunk(serde_json::json!({
+            "id": "c", "choices": [], "obfuscation": "padding"
+        }));
+        let chunks = stream_chunk_into_chat_chunks(raw, &mut ToolCallIndexer::default());
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].native_envelope.as_ref().unwrap().choice.is_none());
     }
 
     #[test]

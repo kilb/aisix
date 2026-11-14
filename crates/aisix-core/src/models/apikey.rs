@@ -294,6 +294,8 @@ pub enum EndpointFamily {
     Files,
     Batches,
     FineTuning,
+    Moderations,
+    ContentProvenanceChecks,
     Mcp,
     A2a,
     Passthrough,

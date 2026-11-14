@@ -1,0 +1,1330 @@
+//! 归属不可改写；读写按租户、提交、对象的顺序加锁，不拿资源全局锁。
+
+use std::collections::{BTreeSet, HashMap};
+
+use aisix_core::models::EndpointFamily;
+use aisix_core::native_objects::*;
+use aisix_core::{ApiKey, Model, ProviderKey};
+use chrono::{DateTime, Utc};
+use serde_json::{json, Value};
+use sqlx::PgConnection;
+use uuid::Uuid;
+
+use crate::billing::access::{self, Visibility};
+use crate::db::DbError;
+use crate::dp::DpIdentity;
+use crate::error::{ApiError, Detail};
+use crate::keys::{self, KeyReach, KeyRow};
+use crate::resources::{secrets, Kind};
+use crate::tenants::{self, TenantRow};
+use crate::AppState;
+
+use super::{LEASE_SECONDS, MAX_ENTRIES, MAX_PAGE};
+
+pub(crate) enum Command {
+    Begin(Box<BeginRequest>),
+    Bind(BindRequest),
+    Lookup(LookupRequest),
+    Owned(OwnedRequest),
+    Tombstone(TombstoneRequest),
+    Claim(ClaimRequest),
+    Renew(LeaseRequest),
+    Reschedule(LeaseRequest),
+    Complete(CompleteRequest),
+}
+
+pub(crate) fn unavailable<T>(_error: T) -> ApiError {
+    // 数据库错误可能携带内部值，此处不打印查询、摘要或原始文档。
+    tracing::warn!("native object authority is unavailable");
+    ApiError::unavailable()
+}
+
+fn invalid(path: &str) -> ApiError {
+    ApiError::validation(vec![Detail {
+        path: path.to_string(),
+        message: "原生对象参数不合法".to_string(),
+    }])
+}
+
+fn conflict() -> ApiError {
+    ApiError::conflict("native_object_conflict", "原生对象操作与已有状态冲突")
+}
+
+fn text_ok(value: &str, max: usize) -> bool {
+    !value.is_empty() && value.len() <= max && !value.chars().any(char::is_control)
+}
+
+struct Principal {
+    tenant: TenantRow,
+    key: KeyRow,
+    full: bool,
+}
+
+async fn principal(conn: &mut PgConnection, id: Uuid) -> Result<Principal, ApiError> {
+    let tenant: Option<Uuid> = sqlx::query_scalar(
+        "SELECT tenant_id FROM tenant_keys WHERE id = $1 AND revoked_at IS NULL",
+    )
+    .bind(id)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(unavailable)?;
+    let tenant = tenant.ok_or_else(ApiError::not_found)?;
+    // 所有密钥和成员写入先锁其租户，分享该锁就能稳定这次授权决策。
+    sqlx::query("SELECT id FROM tenants WHERE id = $1 FOR SHARE")
+        .bind(tenant)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(unavailable)?;
+    let tenant = tenants::find(&mut *conn, tenant).await?;
+    let key = keys::live_key(&mut *conn, id, Some(tenant.id), None).await?;
+    let active = match key.member_id {
+        None => true,
+        Some(member) => sqlx::query_scalar::<_, bool>(
+            "SELECT NOT disabled AND removed_at IS NULL \
+             AND role IN ('owner', 'admin', 'member') FROM members \
+             WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(member)
+        .bind(tenant.id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(unavailable)?
+        .unwrap_or(false),
+    };
+    let now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(unavailable)?;
+    if keys::effective_disabled(&tenant, &key, active) || key.expires_at.is_some_and(|at| at <= now)
+    {
+        return Err(ApiError::not_found());
+    }
+    if let Some(group) = &key.group {
+        let live: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM provider_groups WHERE id = $1 AND retired_at IS NULL)",
+        )
+        .bind(group.id)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(unavailable)?;
+        if !live {
+            return Err(ApiError::not_found());
+        }
+    }
+    let access = access::key_access(&mut *conn, id)
+        .await
+        .map_err(unavailable)?
+        .ok_or_else(ApiError::not_found)?;
+    Ok(Principal {
+        tenant,
+        key,
+        full: access.visibility == Visibility::Full,
+    })
+}
+
+fn owns(principal: &Principal, row: &ObjectRow) -> bool {
+    row.tenant_id == principal.tenant.id
+        && (principal.full
+            || match principal.key.member_id {
+                Some(member) => row.member_id == Some(member),
+                None => row.api_key_id == principal.key.id,
+            })
+}
+
+fn endpoint_permitted(
+    key: &ApiKey,
+    kind: NativeObjectKind,
+    consumer_family: Option<EndpointFamily>,
+) -> bool {
+    key.can_call(consumer_family.unwrap_or_else(|| kind.endpoint_family()))
+}
+
+async fn origin_for_consumer(
+    conn: &mut PgConnection,
+    state: &AppState,
+    principal: Option<&Principal>,
+    submission: &BeginRequest,
+    consumer_family: Option<EndpointFamily>,
+) -> Result<(), ApiError> {
+    type Resource = (String, Uuid, Value);
+    let ids = [submission.origin.model_id, submission.requested_model_id];
+    let rows: Vec<Resource> = sqlx::query_as(&format!(
+        "SELECT kind, id, doc FROM gw_resources WHERE NOT deleted AND \
+         ((kind = 'models' AND id = ANY($1)) OR (kind = 'provider_keys' AND id = $2)) \
+         ORDER BY kind, id{}",
+        if principal.is_some() {
+            " FOR SHARE"
+        } else {
+            ""
+        },
+    ))
+    .bind(&ids[..])
+    .bind(submission.origin.provider_key_id)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(unavailable)?;
+    let mut docs: HashMap<(String, Uuid), Value> = rows
+        .into_iter()
+        .map(|(kind, id, doc)| ((kind, id), doc))
+        .collect();
+    let model: Option<Model> = if principal.is_some() {
+        Some(
+            serde_json::from_value(
+                docs.get(&("models".to_string(), submission.origin.model_id))
+                    .cloned()
+                    .ok_or_else(ApiError::not_found)?,
+            )
+            .map_err(unavailable)?,
+        )
+    } else {
+        None
+    };
+    let requested: Option<Model> = if principal.is_some() {
+        Some(
+            serde_json::from_value(
+                docs.get(&("models".to_string(), submission.requested_model_id))
+                    .cloned()
+                    .ok_or_else(ApiError::not_found)?,
+            )
+            .map_err(unavailable)?,
+        )
+    } else {
+        None
+    };
+    if model.as_ref().is_some_and(|model| {
+        model.provider_key_id.as_deref()
+            != Some(submission.origin.provider_key_id.to_string().as_str())
+    }) {
+        return Err(ApiError::conflict(
+            "native_origin_changed",
+            "原生对象所属账号已变化",
+        ));
+    }
+    let mut provider = docs
+        .remove(&(
+            "provider_keys".to_string(),
+            submission.origin.provider_key_id,
+        ))
+        .ok_or_else(ApiError::not_found)?;
+    secrets::unseal(
+        &state.cfg.master_key,
+        Kind::ProviderKeys,
+        submission.origin.provider_key_id,
+        &mut provider,
+    )
+    .map_err(unavailable)?;
+    let provider: ProviderKey = serde_json::from_value(provider).map_err(unavailable)?;
+    let id_key =
+        aisix_core::native_objects::platform_id_key_from_secret(&state.pki.platform_id_key_hex());
+    let digest = configured_native_origin(
+        &id_key,
+        submission.origin.provider_key_id,
+        &provider,
+        submission.protocol,
+        submission.kind,
+    )
+    .map_err(|_| ApiError::conflict("native_origin_changed", "无法确认原生对象所属账号"))?;
+    if digest != submission.origin.boundary {
+        return Err(ApiError::conflict(
+            "native_origin_changed",
+            "原生对象所属账号已变化",
+        ));
+    }
+    if let Some(principal) = principal {
+        let allowed = match keys::reach(&principal.tenant, &principal.key) {
+            KeyReach::Ids(ids) => ids.contains(&submission.requested_model_id),
+            names => requested
+                .as_ref()
+                .is_some_and(|requested| names.names(&requested.display_name)),
+        };
+        let groups = keys::effective_groups(&principal.tenant, &principal.key);
+        let key_doc: ApiKey =
+            serde_json::from_value(keys::build_key_doc(&principal.tenant, &principal.key, true))
+                .map_err(unavailable)?;
+        if !allowed
+            || !endpoint_permitted(&key_doc, submission.kind, consumer_family)
+            || (!groups.is_empty() && !groups.iter().any(|g| provider.groups.contains(g)))
+        {
+            return Err(ApiError::not_found());
+        }
+    }
+    Ok(())
+}
+
+async fn origin(
+    conn: &mut PgConnection,
+    state: &AppState,
+    principal: Option<&Principal>,
+    submission: &BeginRequest,
+) -> Result<(), ApiError> {
+    origin_for_consumer(conn, state, principal, submission, None).await
+}
+
+#[derive(sqlx::FromRow)]
+struct OperationRow {
+    visibility_full: bool,
+    dp_id: Uuid,
+    tenant_id: Uuid,
+    api_key_id: Uuid,
+    member_id: Option<Uuid>,
+    submission: Value,
+    state: String,
+}
+
+async fn operation(
+    conn: &mut PgConnection,
+    state: &AppState,
+    id: Uuid,
+    lock: bool,
+) -> Result<OperationRow, ApiError> {
+    sqlx::query_as(&format!(
+        "SELECT visibility_full, dp_id, tenant_id, api_key_id, member_id, submission, state FROM native_operations \
+         WHERE environment_id = $1 AND operation_id = $2{}",
+        if lock { " FOR UPDATE" } else { "" },
+    ))
+    .bind(state.env.env_id)
+    .bind(id)
+    .fetch_optional(conn)
+    .await
+    .map_err(unavailable)?
+    .ok_or_else(ApiError::not_found)
+}
+
+fn submission(row: &OperationRow) -> Result<BeginRequest, ApiError> {
+    serde_json::from_value(row.submission.clone()).map_err(unavailable)
+}
+
+#[derive(sqlx::FromRow)]
+struct ObjectRow {
+    id: Uuid,
+    environment_id: Uuid,
+    operation_id: Uuid,
+    tenant_id: Uuid,
+    api_key_id: Uuid,
+    member_id: Option<Uuid>,
+    protocol: String,
+    kind: String,
+    model_id: Uuid,
+    provider_key_id: Uuid,
+    boundary: String,
+    raw_id: String,
+    parent_id: Option<Uuid>,
+    version: i64,
+    deleted_at: Option<DateTime<Utc>>,
+    lease_dp_id: Option<Uuid>,
+    lease_expires_at: Option<DateTime<Utc>>,
+    lease_generation: i64,
+    completed_at: Option<DateTime<Utc>>,
+}
+
+impl ObjectRow {
+    fn view(&self, submitted: &BeginRequest) -> Result<NativeRecord, ApiError> {
+        Ok(NativeRecord {
+            upstream_input_text: submitted.upstream_input_text,
+            input_file_id: submitted.input_file_id.clone(),
+            record_id: self.id,
+            api_key_id: Some(submitted.api_key_id),
+            entries: submitted.entries.clone(),
+            observation_headers: submitted.observation_headers.clone(),
+            completed: self.completed_at.is_some(),
+            operation_id: Some(self.operation_id),
+            requested_model_id: Some(submitted.requested_model_id),
+            requested_model: submitted.requested_model.clone(),
+            upstream_model: submitted.upstream_model.clone(),
+            upstream_provider: submitted.upstream_provider.clone(),
+            operation: submitted.operation.clone(),
+            request_id: submitted.request_id.clone(),
+            requested_service_tier: submitted.requested_service_tier.clone(),
+            origin: Some(OriginBinding {
+                model_id: self.model_id,
+                provider_key_id: self.provider_key_id,
+                boundary: serde_json::from_value(json!(self.boundary)).map_err(unavailable)?,
+            }),
+            protocol: Some(serde_json::from_value(json!(self.protocol)).map_err(unavailable)?),
+            kind: Some(serde_json::from_value(json!(self.kind)).map_err(unavailable)?),
+            raw_id: self.raw_id.clone(),
+            parent_id: self.parent_id,
+            version: self.version,
+            lease_generation: (self.lease_dp_id.is_some()).then_some(self.lease_generation),
+            lease_expires_at: self.lease_expires_at,
+            deleted: self.deleted_at.is_some(),
+        })
+    }
+}
+
+async fn object(
+    conn: &mut PgConnection,
+    state: &AppState,
+    id: Uuid,
+) -> Result<ObjectRow, ApiError> {
+    sqlx::query_as("SELECT * FROM native_objects WHERE environment_id = $1 AND id = $2 FOR UPDATE")
+        .bind(state.env.env_id)
+        .bind(id)
+        .fetch_optional(conn)
+        .await
+        .map_err(unavailable)?
+        .ok_or_else(ApiError::not_found)
+}
+
+async fn authorized_for_consumer(
+    conn: &mut PgConnection,
+    state: &AppState,
+    principal: &Principal,
+    row: &ObjectRow,
+    consumer_family: Option<EndpointFamily>,
+) -> Result<(), ApiError> {
+    if row.environment_id != state.env.env_id || !owns(principal, row) || row.deleted_at.is_some() {
+        return Err(ApiError::not_found());
+    }
+    let op = operation(&mut *conn, state, row.operation_id, false).await?;
+    let submitted = submission(&op)?;
+    origin_for_consumer(
+        &mut *conn,
+        state,
+        Some(principal),
+        &submitted,
+        consumer_family,
+    )
+    .await?;
+    // 批次返回多个模型的结果，当前权限必须覆盖每一项，不能只检查首个模型。
+    for entry in &submitted.entries {
+        let mut per_entry = submitted.clone();
+        per_entry.origin.model_id = entry.model_id;
+        per_entry.requested_model_id = entry.requested_model_id;
+        origin_for_consumer(
+            &mut *conn,
+            state,
+            Some(principal),
+            &per_entry,
+            consumer_family,
+        )
+        .await?;
+    }
+    let mut parent_id = row.parent_id;
+    for _ in 0..32 {
+        let Some(id) = parent_id else {
+            return Ok(());
+        };
+        // 父关系与归属不可改写；这里只读，不从子对象倒序加父对象写锁。
+        let parent: Option<ObjectRow> =
+            sqlx::query_as("SELECT * FROM native_objects WHERE environment_id = $1 AND id = $2")
+                .bind(state.env.env_id)
+                .bind(id)
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(unavailable)?;
+        let parent = parent.ok_or_else(ApiError::not_found)?;
+        if !owns(principal, &parent)
+            || parent.deleted_at.is_some()
+            || parent.boundary != row.boundary
+        {
+            return Err(ApiError::not_found());
+        }
+        let op = operation(&mut *conn, state, parent.operation_id, false).await?;
+        let parent_submission = submission(&op)?;
+        origin_for_consumer(
+            &mut *conn,
+            state,
+            Some(principal),
+            &parent_submission,
+            consumer_family,
+        )
+        .await?;
+        for entry in &parent_submission.entries {
+            let mut per_entry = parent_submission.clone();
+            per_entry.origin.model_id = entry.model_id;
+            per_entry.requested_model_id = entry.requested_model_id;
+            origin_for_consumer(
+                &mut *conn,
+                state,
+                Some(principal),
+                &per_entry,
+                consumer_family,
+            )
+            .await?;
+        }
+        parent_id = parent.parent_id;
+    }
+    Err(ApiError::unavailable())
+}
+
+async fn authorized(
+    conn: &mut PgConnection,
+    state: &AppState,
+    principal: &Principal,
+    row: &ObjectRow,
+) -> Result<(), ApiError> {
+    authorized_for_consumer(conn, state, principal, row, None).await
+}
+
+async fn begin(
+    conn: &mut PgConnection,
+    state: &AppState,
+    dp: DpIdentity,
+    mut body: BeginRequest,
+) -> Result<NativeReply, ApiError> {
+    if !text_ok(&body.request_id, 256)
+        || !text_ok(&body.requested_model, 256)
+        || !text_ok(&body.upstream_model, 256)
+        || !text_ok(&body.operation, 64)
+        || body
+            .requested_service_tier
+            .as_ref()
+            .is_some_and(|tier| !text_ok(tier, 64))
+        || body.entries.len() > MAX_ENTRIES
+        || body
+            .upstream_input_text
+            .as_ref()
+            .is_some_and(|text| !text.is_valid())
+    {
+        return Err(invalid("/submission"));
+    }
+    if body.kind == NativeObjectKind::MessageBatch && body.entries.is_empty() {
+        return Err(invalid("/entries"));
+    }
+    if body.kind != NativeObjectKind::MessageBatch
+        && !(body.protocol == NativeProtocol::Openai && body.kind == NativeObjectKind::File)
+        && !body.entries.is_empty()
+    {
+        return Err(invalid("/entries"));
+    }
+    if body.observation_headers.iter().any(|(name, value)| {
+        !matches!(name.as_str(), "anthropic-version" | "anthropic-beta")
+            || value.is_empty()
+            || value.len() > 8192
+            || value.chars().any(char::is_control)
+    }) {
+        return Err(invalid("/observation_headers"));
+    }
+    let batch_input = body.protocol == NativeProtocol::Openai
+        && body.kind == NativeObjectKind::File
+        && body.operation == "batch_input"
+        && body.input_file_id.is_some()
+        && body.parent_id.is_some()
+        && !body.entries.is_empty();
+    let consumer_family = batch_input.then_some(EndpointFamily::Batches);
+    let principal = principal(&mut *conn, body.api_key_id).await?;
+    origin_for_consumer(&mut *conn, state, Some(&principal), &body, consumer_family).await?;
+    let upstream: Option<String> = sqlx::query_scalar(
+        "SELECT doc ->> 'model_name' FROM gw_resources WHERE kind = 'models' AND id = $1 AND NOT deleted",
+    ).bind(body.origin.model_id).fetch_optional(&mut *conn).await.map_err(unavailable)?.flatten();
+    if upstream.as_deref() != Some(body.upstream_model.as_str()) {
+        return Err(invalid("/upstream_model"));
+    }
+    body.upstream_provider = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT doc ->> 'provider' FROM gw_resources WHERE kind = 'models' AND id = $1 AND NOT deleted",
+    ).bind(body.origin.model_id).fetch_one(&mut *conn).await.map_err(unavailable)?.unwrap_or_default();
+    let mut entries = BTreeSet::new();
+    let base_submission = body.clone();
+    for entry in &mut body.entries {
+        if !text_ok(&entry.entry_id, 256)
+            || entry
+                .upstream_input_text
+                .as_ref()
+                .is_some_and(|text| !text.is_valid())
+            || (body.protocol == NativeProtocol::Openai
+                && !matches!(
+                    entry.endpoint.as_str(),
+                    "/v1/chat/completions"
+                        | "/v1/completions"
+                        | "/v1/responses"
+                        | "/v1/embeddings"
+                        | "/v1/moderations"
+                        | "/v1/images/generations"
+                        | "/v1/images/edits"
+                ))
+            || !text_ok(&entry.upstream_model, 256)
+            || !entries.insert(&entry.entry_id)
+            || entry
+                .requested_service_tier
+                .as_ref()
+                .is_some_and(|tier| !text_ok(tier, 64))
+        {
+            return Err(invalid("/entries"));
+        }
+        let mut entry_submission = base_submission.clone();
+        entry_submission.origin.model_id = entry.model_id;
+        entry_submission.requested_model_id = entry.requested_model_id;
+        entry_submission
+            .upstream_model
+            .clone_from(&entry.upstream_model);
+        origin_for_consumer(
+            &mut *conn,
+            state,
+            Some(&principal),
+            &entry_submission,
+            consumer_family,
+        )
+        .await?;
+        let upstream: Option<String> = sqlx::query_scalar(
+            "SELECT doc ->> 'model_name' FROM gw_resources WHERE kind = 'models' AND id = $1 AND NOT deleted",
+        ).bind(entry.model_id).fetch_optional(&mut *conn).await.map_err(unavailable)?.flatten();
+        if upstream.as_deref() != Some(entry.upstream_model.as_str()) {
+            return Err(invalid("/entries/upstream_model"));
+        }
+        let current_name = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT doc ->> 'display_name' FROM gw_resources WHERE kind = 'models' AND id = $1 AND NOT deleted",
+        ).bind(entry.requested_model_id).fetch_one(&mut *conn).await.map_err(unavailable)?
+            .filter(|name| !name.is_empty()).ok_or_else(|| invalid("/entries/requested_model"))?;
+        if entry.requested_model.is_empty() {
+            entry.requested_model = current_name;
+        } else if !text_ok(&entry.requested_model, 256) {
+            return Err(invalid("/entries/requested_model"));
+        }
+        entry.upstream_provider = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT doc ->> 'provider' FROM gw_resources WHERE kind = 'models' AND id = $1 AND NOT deleted",
+        ).bind(entry.model_id).fetch_one(&mut *conn).await.map_err(unavailable)?.unwrap_or_default();
+    }
+    if let Some(raw_id) = &body.input_file_id {
+        if body.protocol != NativeProtocol::Openai
+            || (body.kind != NativeObjectKind::MessageBatch && !batch_input)
+        {
+            return Err(invalid("/input_file_id"));
+        }
+        let source = lookup(
+            &mut *conn,
+            state,
+            LookupRequest {
+                consumer_family: Some(EndpointFamily::Batches),
+                api_key_id: body.api_key_id,
+                locator: ObjectLocator {
+                    protocol: NativeProtocol::Openai,
+                    kind: NativeObjectKind::File,
+                    raw_id: raw_id.clone(),
+                    origin: Some(body.origin.clone()),
+                    parent_id: None,
+                },
+            },
+        )
+        .await?;
+        if source.record.as_ref().is_none_or(|record| {
+            record.origin.as_ref() != Some(&body.origin)
+                || (batch_input && body.parent_id != Some(record.record_id))
+        }) {
+            return Err(invalid("/input_file_id"));
+        }
+    }
+    let wire = serde_json::to_value(&body).map_err(unavailable)?;
+    sqlx::query(
+        "INSERT INTO native_operations (environment_id, operation_id, dp_id, tenant_id, \
+         api_key_id, member_id, visibility_full, submission) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) \
+         ON CONFLICT (environment_id, operation_id) DO NOTHING",
+    )
+    .bind(state.env.env_id)
+    .bind(body.operation_id)
+    .bind(dp.dp_id)
+    .bind(principal.tenant.id)
+    .bind(principal.key.id)
+    .bind(principal.key.member_id)
+    .bind(principal.full)
+    .bind(&wire)
+    .execute(&mut *conn)
+    .await
+    .map_err(unavailable)?;
+    let stored = operation(&mut *conn, state, body.operation_id, true).await?;
+    if stored.tenant_id != principal.tenant.id
+        || stored.api_key_id != principal.key.id
+        || stored.submission != wire
+    {
+        return Err(conflict());
+    }
+    if let Some(parent) = body.parent_id {
+        let parent = object(&mut *conn, state, parent).await?;
+        authorized_for_consumer(&mut *conn, state, &principal, &parent, consumer_family).await?;
+        if parent.boundary != body.origin.boundary.as_str() {
+            return Err(invalid("/parent_id"));
+        }
+    }
+    let mut reply = NativeReply::new(&stored.state);
+    reply.operation_id = Some(body.operation_id);
+    reply.origin = Some(body.origin);
+    Ok(reply)
+}
+
+async fn bind(
+    conn: &mut PgConnection,
+    state: &AppState,
+    dp: DpIdentity,
+    body: BindRequest,
+) -> Result<NativeReply, ApiError> {
+    if !text_ok(&body.raw_id, 512) {
+        return Err(invalid("/raw_id"));
+    }
+    if body.objects.len() > MAX_ENTRIES
+        || body.objects.iter().any(|object| {
+            !matches!(
+                object.kind,
+                NativeObjectKind::ResponseItem | NativeObjectKind::ResponseContainer
+            ) || !text_ok(&object.raw_id, 512)
+        })
+    {
+        return Err(invalid("/objects"));
+    }
+    let op = operation(&mut *conn, state, body.operation_id, true).await?;
+    // 上游已受理的结果必须落到原提交；撤权、换模型或换凭据不能抹掉待结算身份。
+    let submitted = submission(&op)?;
+    let mut refresh_principal = None;
+    if let Some(record_id) = body.existing_record_id {
+        let existing = object(&mut *conn, state, record_id).await?;
+        if op.state != "bound"
+            || existing.operation_id != body.operation_id
+            || existing.raw_id != body.raw_id
+            || existing.protocol != "openai"
+            || existing.kind != "response"
+            || submitted.protocol != NativeProtocol::Openai
+            || submitted.kind != NativeObjectKind::Response
+            || existing.model_id != submitted.origin.model_id
+            || existing.provider_key_id != submitted.origin.provider_key_id
+            || existing.boundary != submitted.origin.boundary.as_str()
+        {
+            return Err(ApiError::not_found());
+        }
+        let principal = principal(&mut *conn, body.api_key_id).await?;
+        authorized(&mut *conn, state, &principal, &existing).await?;
+        refresh_principal = Some(principal);
+    } else if op.dp_id != dp.dp_id || op.api_key_id != body.api_key_id {
+        return Err(ApiError::not_found());
+    }
+    if !body.objects.is_empty()
+        && (submitted.protocol != NativeProtocol::Openai
+            || submitted.kind != NativeObjectKind::Response)
+    {
+        return Err(invalid("/objects"));
+    }
+    if let Some(parent) = submitted.parent_id {
+        let parent = object(&mut *conn, state, parent).await?;
+        if parent.tenant_id != op.tenant_id || parent.boundary != submitted.origin.boundary.as_str()
+        {
+            return Err(conflict());
+        }
+    }
+    sqlx::query(
+        "INSERT INTO native_objects (id,environment_id,operation_id,tenant_id,api_key_id, \
+         member_id,protocol,kind,model_id,provider_key_id,boundary,raw_id,parent_id,pending, \
+         provider_created_at,provider_expires_at) VALUES \
+         ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) ON CONFLICT DO NOTHING",
+    )
+    .bind(Uuid::new_v4())
+    .bind(state.env.env_id)
+    .bind(body.operation_id)
+    .bind(op.tenant_id)
+    .bind(op.api_key_id)
+    .bind(op.member_id)
+    .bind(submitted.protocol.as_str())
+    .bind(submitted.kind.as_str())
+    .bind(submitted.origin.model_id)
+    .bind(submitted.origin.provider_key_id)
+    .bind(submitted.origin.boundary.as_str())
+    .bind(&body.raw_id)
+    .bind(submitted.parent_id)
+    .bind(submitted.asynchronous)
+    .bind(body.provider_created_at)
+    .bind(body.provider_expires_at)
+    .execute(&mut *conn)
+    .await
+    .map_err(unavailable)?;
+    let row: Option<ObjectRow> = sqlx::query_as(
+        "SELECT * FROM native_objects WHERE environment_id = $1 AND operation_id = $2",
+    )
+    .bind(state.env.env_id)
+    .bind(body.operation_id)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(unavailable)?;
+    let row = row.ok_or_else(conflict)?;
+    if row.raw_id != body.raw_id {
+        return Err(conflict());
+    }
+    sqlx::query("UPDATE native_operations SET state = 'bound' WHERE environment_id = $1 AND operation_id = $2")
+        .bind(state.env.env_id).bind(body.operation_id).execute(&mut *conn).await.map_err(unavailable)?;
+    // 子对象从原始提交派生，重试只确认既有归属，绝不把其他租户的裸 ID 收为己有。
+    let mut seen = BTreeSet::new();
+    let mut children = Vec::new();
+    let mut objects = body.objects;
+    objects.sort_by(|a, b| (a.kind.as_str(), &a.raw_id).cmp(&(b.kind.as_str(), &b.raw_id)));
+    for object in objects {
+        if !seen.insert((object.kind.as_str(), object.raw_id.clone())) {
+            continue;
+        }
+        // 不同 Response 可以复用同一容器；缺行时也锁住身份，避免并发 INSERT 冲突回滚已付费结果。
+        let lock_identity = serde_json::to_string(&(
+            state.env.env_id,
+            "openai",
+            object.kind.as_str(),
+            &row.boundary,
+            &object.raw_id,
+        ))
+        .map_err(unavailable)?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(lock_identity)
+            .execute(&mut *conn)
+            .await
+            .map_err(unavailable)?;
+        let existing: Option<ObjectRow> = sqlx::query_as(
+            "SELECT * FROM native_objects WHERE environment_id=$1 AND protocol='openai' AND kind=$2 AND boundary=$3 AND raw_id=$4 FOR UPDATE",
+        )
+        .bind(state.env.env_id).bind(object.kind.as_str()).bind(&row.boundary).bind(&object.raw_id)
+        .fetch_optional(&mut *conn).await.map_err(unavailable)?;
+        if let Some(existing) = existing {
+            if existing.tenant_id != row.tenant_id
+                || existing.provider_key_id != row.provider_key_id
+                || existing.boundary != row.boundary
+                || existing.deleted_at.is_some()
+            {
+                return Err(conflict());
+            }
+            if let Some(principal) = &refresh_principal {
+                // 管理刷新不能借原提交的 Full 权限越过当前成员、模型或父对象限制。
+                authorized(&mut *conn, state, principal, &existing).await?;
+            } else if !op.visibility_full
+                && existing.api_key_id != op.api_key_id
+                && !(op.member_id.is_some() && existing.member_id == op.member_id)
+            {
+                // 初次接受后的绑定只用准入时的可信身份；撤权不能抹掉已发生的推理。
+                return Err(conflict());
+            }
+            let previous =
+                submission(&operation(&mut *conn, state, existing.operation_id, false).await?)?;
+            children.push(existing.view(&previous)?);
+            continue;
+        }
+        let operation_id = Uuid::new_v4();
+        let mut derived = submitted.clone();
+        derived.operation_id = operation_id;
+        derived.kind = object.kind;
+        derived.parent_id = Some(row.id);
+        derived.asynchronous = false;
+        derived.operation = object.kind.as_str().into();
+        sqlx::query("INSERT INTO native_operations(environment_id,operation_id,dp_id,tenant_id,api_key_id,member_id,visibility_full,submission,state) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'bound')")
+            .bind(state.env.env_id).bind(operation_id).bind(op.dp_id).bind(op.tenant_id)
+            .bind(op.api_key_id).bind(op.member_id).bind(op.visibility_full).bind(serde_json::to_value(&derived).map_err(unavailable)?)
+            .execute(&mut *conn).await.map_err(unavailable)?;
+        sqlx::query("INSERT INTO native_objects(id,environment_id,operation_id,tenant_id,api_key_id,member_id,protocol,kind,model_id,provider_key_id,boundary,raw_id,parent_id,pending) VALUES ($1,$2,$3,$4,$5,$6,'openai',$7,$8,$9,$10,$11,$12,false)")
+            .bind(Uuid::new_v4()).bind(state.env.env_id).bind(operation_id).bind(op.tenant_id)
+            .bind(op.api_key_id).bind(op.member_id).bind(object.kind.as_str()).bind(row.model_id).bind(row.provider_key_id)
+            .bind(&row.boundary).bind(&object.raw_id).bind(row.id)
+            .execute(&mut *conn).await.map_err(unavailable)?;
+        let child: ObjectRow = sqlx::query_as(
+            "SELECT * FROM native_objects WHERE environment_id=$1 AND operation_id=$2",
+        )
+        .bind(state.env.env_id)
+        .bind(operation_id)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(unavailable)?;
+        children.push(child.view(&derived)?);
+    }
+    let mut reply = NativeReply::new("bound");
+    reply.record = Some(row.view(&submitted)?);
+    reply.records = children;
+    Ok(reply)
+}
+
+async fn lookup_scoped(
+    conn: &mut PgConnection,
+    state: &AppState,
+    body: LookupRequest,
+    account_wide: bool,
+) -> Result<NativeReply, ApiError> {
+    if !text_ok(&body.locator.raw_id, 512) {
+        return Err(invalid("/locator/raw_id"));
+    }
+    if body.consumer_family.is_some_and(|family| {
+        body.locator.kind != NativeObjectKind::File
+            || !native_file_consumer_allowed(body.locator.protocol, family)
+    }) {
+        return Err(invalid("/consumer_family"));
+    }
+    let principal = principal(&mut *conn, body.api_key_id).await?;
+    let boundary = body.locator.origin.as_ref().map(|o| o.boundary.as_str());
+    let model = body.locator.origin.as_ref().map(|o| o.model_id);
+    let provider = body.locator.origin.as_ref().map(|o| o.provider_key_id);
+    let rows: Vec<ObjectRow> = sqlx::query_as(
+        "SELECT * FROM native_objects WHERE environment_id = $1 AND tenant_id = $2 \
+         AND protocol = $3 AND kind = $4 AND raw_id = $5 AND deleted_at IS NULL \
+         AND ($6 OR (CASE WHEN $7::uuid IS NULL THEN api_key_id = $8 ELSE member_id = $7 END)) \
+         AND ($9::text IS NULL OR (boundary = $9 AND ($13 OR model_id = $10) AND provider_key_id = $11)) \
+         AND ($12::uuid IS NULL OR parent_id = $12) ORDER BY id LIMIT 2",
+    )
+    .bind(state.env.env_id)
+    .bind(principal.tenant.id)
+    .bind(body.locator.protocol.as_str())
+    .bind(body.locator.kind.as_str())
+    .bind(body.locator.raw_id)
+    .bind(principal.full)
+    .bind(principal.key.member_id)
+    .bind(principal.key.id)
+    .bind(boundary)
+    .bind(model)
+    .bind(provider)
+    .bind(body.locator.parent_id)
+    .bind(account_wide)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(unavailable)?;
+    if rows.len() > 1 {
+        return Err(ApiError::conflict(
+            "native_object_ambiguous",
+            "请指定原生对象所属模型",
+        ));
+    }
+    let row = rows.into_iter().next().ok_or_else(ApiError::not_found)?;
+    authorized_for_consumer(&mut *conn, state, &principal, &row, body.consumer_family).await?;
+    let submitted = submission(&operation(&mut *conn, state, row.operation_id, false).await?)?;
+    if submitted.protocol == NativeProtocol::Openai
+        && submitted.kind == NativeObjectKind::File
+        && submitted.operation == "batch_input"
+    {
+        return Err(ApiError::not_found());
+    }
+    let mut reply = NativeReply::new("found");
+    reply.record = Some(row.view(&submitted)?);
+    Ok(reply)
+}
+
+async fn lookup(
+    conn: &mut PgConnection,
+    state: &AppState,
+    body: LookupRequest,
+) -> Result<NativeReply, ApiError> {
+    lookup_scoped(conn, state, body, false).await
+}
+
+async fn owned(
+    conn: &mut PgConnection,
+    state: &AppState,
+    body: OwnedRequest,
+) -> Result<NativeReply, ApiError> {
+    if body.raw_ids.len() > MAX_PAGE || body.raw_ids.iter().any(|id| !text_ok(id, 512)) {
+        return Err(invalid("/raw_ids"));
+    }
+    let mut reply = NativeReply::new("owned");
+    for raw_id in body.raw_ids {
+        let result = lookup_scoped(
+            &mut *conn,
+            state,
+            LookupRequest {
+                consumer_family: None,
+                api_key_id: body.api_key_id,
+                locator: ObjectLocator {
+                    protocol: body.protocol,
+                    kind: body.kind,
+                    raw_id,
+                    origin: Some(body.origin.clone()),
+                    parent_id: body.parent_id,
+                },
+            },
+            true,
+        )
+        .await;
+        match result {
+            Ok(found) => {
+                if let Some(record) = found.record {
+                    reply.records.push(record);
+                }
+            }
+            Err(error) if error.status == axum::http::StatusCode::NOT_FOUND => {}
+            Err(error) => return Err(error),
+        }
+    }
+    // 空页仍检查当前密钥，不能把已撤销的身份当作合法空结果。
+    principal(conn, body.api_key_id).await?;
+    Ok(reply)
+}
+
+async fn tombstone(
+    conn: &mut PgConnection,
+    state: &AppState,
+    body: TombstoneRequest,
+) -> Result<NativeReply, ApiError> {
+    let principal = principal(&mut *conn, body.api_key_id).await?;
+    let row = object(&mut *conn, state, body.record_id).await?;
+    authorized(&mut *conn, state, &principal, &row).await?;
+    if row.version != body.version {
+        return Err(conflict());
+    }
+    if row.kind == "message_batch" && row.completed_at.is_none() {
+        // 删除不能让尚未结算的批次失去后续观察依据。
+        return Err(conflict());
+    }
+    sqlx::query("UPDATE native_objects SET deleted_at = clock_timestamp(), version = version + 1 WHERE id = $1")
+        .bind(row.id).execute(conn).await.map_err(unavailable)?;
+    Ok(NativeReply::new("deleted"))
+}
+
+async fn claim(
+    conn: &mut PgConnection,
+    state: &AppState,
+    dp: DpIdentity,
+    body: ClaimRequest,
+) -> Result<NativeReply, ApiError> {
+    if body.limit == 0 || body.limit > 50 {
+        return Err(invalid("/limit"));
+    }
+    let rows: Vec<ObjectRow> = sqlx::query_as(
+        "SELECT * FROM native_objects WHERE environment_id = $1 AND pending \
+         AND poll_after <= clock_timestamp() AND (lease_expires_at IS NULL OR lease_expires_at <= clock_timestamp()) \
+         AND ($2::uuid IS NULL OR id = $2) AND ($4::text IS NULL OR protocol = $4) \
+         AND ($5::text IS NULL OR kind = $5) ORDER BY poll_after, id LIMIT $3 FOR UPDATE SKIP LOCKED",
+    ).bind(state.env.env_id).bind(body.record_id).bind(i64::from(body.limit))
+        .bind(body.protocol.map(|protocol| protocol.as_str()))
+        .bind(body.kind.map(|kind| kind.as_str()))
+        .fetch_all(&mut *conn).await.map_err(unavailable)?;
+    let mut reply = NativeReply::new("leased");
+    // 领取页同时按字节限制，避免多个大批次超过网关的有界回复读取上限。
+    let mut reply_bytes = 0usize;
+    for row in rows {
+        let op = operation(&mut *conn, state, row.operation_id, false).await?;
+        let submitted = submission(&op)?;
+        // 不能用新凭据轮询旧账号对象；失败保留持久待处理项。
+        if let Err(error) = origin(&mut *conn, state, None, &submitted).await {
+            if error.code != "native_origin_changed" && error.code != "not_found" {
+                return Err(error);
+            }
+            sqlx::query("UPDATE native_objects SET poll_after = clock_timestamp() + interval '1 minute' WHERE id = $1")
+                .bind(row.id).execute(&mut *conn).await.map_err(unavailable)?;
+            continue;
+        }
+        let view_bytes = serde_json::to_vec(&row.view(&submitted)?)
+            .map_err(unavailable)?
+            .len();
+        if view_bytes > (7 * 1024 * 1024usize).saturating_sub(reply_bytes) {
+            break;
+        }
+        reply_bytes += view_bytes;
+        let row: ObjectRow = sqlx::query_as(
+            "UPDATE native_objects SET lease_dp_id = $2, lease_expires_at = clock_timestamp() + make_interval(secs => $3), \
+             lease_generation = lease_generation + 1 WHERE id = $1 RETURNING *",
+        ).bind(row.id).bind(dp.dp_id).bind(LEASE_SECONDS as f64)
+            .fetch_one(&mut *conn).await.map_err(unavailable)?;
+        reply.records.push(row.view(&submitted)?);
+    }
+    Ok(reply)
+}
+
+async fn lease_live(
+    conn: &mut PgConnection,
+    state: &AppState,
+    dp: DpIdentity,
+    token: &LeaseToken,
+) -> Result<ObjectRow, ApiError> {
+    let row = object(&mut *conn, state, token.record_id).await?;
+    if row.lease_dp_id != Some(dp.dp_id) || row.lease_generation != token.generation {
+        return Err(conflict());
+    }
+    let now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(unavailable)?;
+    if row.completed_at.is_none() && row.lease_expires_at.is_none_or(|at| at <= now) {
+        return Err(conflict());
+    }
+    Ok(row)
+}
+
+async fn lease(
+    conn: &mut PgConnection,
+    state: &AppState,
+    dp: DpIdentity,
+    body: LeaseRequest,
+    renew: bool,
+) -> Result<NativeReply, ApiError> {
+    let row = lease_live(&mut *conn, state, dp, &body.lease).await?;
+    if row.completed_at.is_some() {
+        return Ok(NativeReply::new("completed"));
+    }
+    if body.poll_after_ms > 3_600_000 {
+        return Err(invalid("/poll_after_ms"));
+    }
+    let row: ObjectRow = if renew {
+        sqlx::query_as("UPDATE native_objects SET lease_expires_at = clock_timestamp() + make_interval(secs => $2) WHERE id = $1 RETURNING *")
+            .bind(row.id).bind(LEASE_SECONDS as f64).fetch_one(&mut *conn).await.map_err(unavailable)?
+    } else {
+        sqlx::query_as("UPDATE native_objects SET poll_after = clock_timestamp() + make_interval(secs => $2), lease_expires_at = NULL WHERE id = $1 RETURNING *")
+            .bind(row.id).bind(f64::from(body.poll_after_ms) / 1000.0).fetch_one(&mut *conn).await.map_err(unavailable)?
+    };
+    let submitted = submission(&operation(&mut *conn, state, row.operation_id, false).await?)?;
+    let mut reply = NativeReply::new(if renew { "leased" } else { "pending" });
+    reply.record = Some(row.view(&submitted)?);
+    Ok(reply)
+}
+
+async fn complete(
+    conn: &mut PgConnection,
+    state: &AppState,
+    dp: DpIdentity,
+    body: CompleteRequest,
+) -> Result<NativeReply, ApiError> {
+    let row = lease_live(&mut *conn, state, dp, &body.lease).await?;
+    if row.completed_at.is_some() {
+        return Ok(NativeReply::new("completed"));
+    }
+    let op = operation(&mut *conn, state, row.operation_id, false).await?;
+    let submitted = submission(&op)?;
+    let statuses: &[&str] = match submitted.protocol {
+        NativeProtocol::Openai => &["completed", "failed", "cancelled", "incomplete", "expired"],
+        NativeProtocol::Anthropic => &["ended"],
+    };
+    if !statuses.contains(&body.terminal_status.as_str()) {
+        return Err(invalid("/terminal_status"));
+    }
+    let expected: BTreeSet<&str> = if submitted.entries.is_empty() {
+        BTreeSet::from([""])
+    } else {
+        submitted
+            .entries
+            .iter()
+            .map(|entry| entry.entry_id.as_str())
+            .collect()
+    };
+    let observed: BTreeSet<&str> = body
+        .usage
+        .iter()
+        .map(|entry| entry.entry_id.as_str())
+        .collect();
+    if observed != expected || observed.len() != body.usage.len() {
+        return Err(invalid("/usage"));
+    }
+    if body.output_file_ids.len() > 2
+        || (!body.output_file_ids.is_empty()
+            && (submitted.protocol != NativeProtocol::Openai
+                || submitted.kind != NativeObjectKind::MessageBatch))
+    {
+        return Err(invalid("/output_file_ids"));
+    }
+    let output_ids: BTreeSet<_> = body.output_file_ids.iter().collect();
+    if output_ids.len() != body.output_file_ids.len()
+        || output_ids.iter().any(|id| {
+            !text_ok(id, 256)
+                || matches!(id.as_str(), "." | "..")
+                || !id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+        })
+    {
+        return Err(invalid("/output_file_ids"));
+    }
+    // 文件归属由有效租约从原提交派生；撤销密钥不能抹去已发生的推理及结果。
+    for raw_id in output_ids {
+        let mut derived = submitted.clone();
+        let operation_id = Uuid::new_v4();
+        derived.operation_id = operation_id;
+        derived.kind = NativeObjectKind::File;
+        derived.input_file_id = None;
+        derived.parent_id = Some(row.id);
+        derived.asynchronous = false;
+        derived.operation = "batch_result".into();
+        let existing: Option<ObjectRow> = sqlx::query_as("SELECT * FROM native_objects WHERE environment_id=$1 AND protocol='openai' AND kind='file' AND boundary=$2 AND raw_id=$3 FOR UPDATE")
+            .bind(state.env.env_id).bind(&row.boundary).bind(raw_id)
+            .fetch_optional(&mut *conn).await.map_err(unavailable)?;
+        if let Some(existing) = existing {
+            if existing.tenant_id != row.tenant_id
+                || existing.api_key_id != row.api_key_id
+                || existing.parent_id != Some(row.id)
+                || existing.deleted_at.is_some()
+            {
+                return Err(conflict());
+            }
+            continue;
+        }
+        sqlx::query("INSERT INTO native_operations(environment_id,operation_id,dp_id,tenant_id,api_key_id,member_id,visibility_full,submission,state) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'bound')")
+            .bind(state.env.env_id).bind(operation_id).bind(op.dp_id).bind(op.tenant_id)
+            .bind(op.api_key_id).bind(op.member_id).bind(op.visibility_full).bind(serde_json::to_value(&derived).map_err(unavailable)?)
+            .execute(&mut *conn).await.map_err(unavailable)?;
+        sqlx::query("INSERT INTO native_objects(id,environment_id,operation_id,tenant_id,api_key_id,member_id,protocol,kind,model_id,provider_key_id,boundary,raw_id,parent_id,pending) VALUES ($1,$2,$3,$4,$5,$6,'openai','file',$7,$8,$9,$10,$11,false)")
+            .bind(Uuid::new_v4()).bind(state.env.env_id).bind(operation_id).bind(op.tenant_id)
+            .bind(op.api_key_id).bind(op.member_id).bind(row.model_id).bind(row.provider_key_id)
+            .bind(&row.boundary).bind(raw_id).bind(row.id)
+            .execute(&mut *conn).await.map_err(unavailable)?;
+    }
+    for usage in body.usage {
+        if usage.cached_prompt_tokens > usage.prompt_tokens
+            || usage
+                .io_audit
+                .as_ref()
+                .is_some_and(|audit| audit.version != 2 || !audit.validate())
+            || !(100..=599).contains(&usage.status_code)
+            || usage.terminal_status.as_deref().is_some_and(|status| {
+                !matches!(
+                    status,
+                    "completed" | "failed" | "cancelled" | "expired" | "incomplete"
+                )
+            })
+            || usage.error_class.len() > 64
+            || usage.error_message.len() > 4096
+        {
+            return Err(invalid("/usage"));
+        }
+        let entry = submitted
+            .entries
+            .iter()
+            .find(|entry| entry.entry_id == usage.entry_id);
+        let model_id = entry.map_or(submitted.origin.model_id, |entry| entry.model_id);
+        let requested_id = entry.map_or(submitted.requested_model_id, |entry| {
+            entry.requested_model_id
+        });
+        let event_id = Uuid::new_v4();
+        let mut event = serde_json::to_value(&usage).map_err(unavailable)?;
+        let fields = event.as_object_mut().ok_or_else(|| invalid("/usage"))?;
+        fields.remove("entry_id");
+        fields.remove("terminal_status");
+        fields.insert("event_id".to_string(), json!(event_id));
+        fields.insert("team_id".to_string(), json!(op.tenant_id));
+        fields.insert("api_key_id".to_string(), json!(op.api_key_id));
+        fields.insert(
+            "user_id".to_string(),
+            json!(op.member_id.map(|id| id.to_string()).unwrap_or_default()),
+        );
+        fields.insert("model_id".to_string(), json!(model_id));
+        fields.insert("requested_model_id".to_string(), json!(requested_id));
+        // 恢复任务只能观察实际用量，不能替换原请求已持久化的计价档位。
+        fields.insert(
+            "requested_service_tier".to_string(),
+            json!(
+                entry.map_or(submitted.requested_service_tier.as_ref(), |entry| entry
+                    .requested_service_tier
+                    .as_ref())
+            ),
+        );
+        fields.insert(
+            "is_batch".to_string(),
+            json!(submitted.kind == NativeObjectKind::MessageBatch),
+        );
+        fields.insert(
+            "provider_key_id".to_string(),
+            json!(submitted.origin.provider_key_id),
+        );
+        fields.insert(
+            "upstream_model".to_string(),
+            json!(
+                entry.map_or(submitted.upstream_model.as_str(), |entry| entry
+                    .upstream_model
+                    .as_str())
+            ),
+        );
+        fields.insert(
+            "upstream_provider".to_string(),
+            json!(
+                entry.map_or(submitted.upstream_provider.as_str(), |entry| entry
+                    .upstream_provider
+                    .as_str())
+            ),
+        );
+        fields.insert(
+            "requested_model".to_string(),
+            json!(
+                entry.map_or(submitted.requested_model.as_str(), |entry| entry
+                    .requested_model
+                    .as_str())
+            ),
+        );
+        fields.insert("request_id".to_string(), json!(submitted.request_id));
+        fields.insert("operation".to_string(), json!(submitted.operation));
+        fields.insert("is_final_attempt".to_string(), json!(true));
+        if matches!(
+            submitted.kind,
+            NativeObjectKind::Response | NativeObjectKind::MessageBatch
+        ) {
+            // 唯一终态由对象锁和永久 outbox 身份保证；不按调用方 request_id 合并。
+            fields.insert("upstream_dispatched".to_string(), json!(true));
+            fields.insert(
+                "inference_stage".to_string(),
+                json!(InferenceStage::Terminal),
+            );
+            fields.insert("native_operation_id".to_string(), json!(row.operation_id));
+            fields.insert(
+                "native_terminal_status".to_string(),
+                json!(usage
+                    .terminal_status
+                    .as_deref()
+                    .unwrap_or(body.terminal_status.as_str())),
+            );
+        }
+        sqlx::query("INSERT INTO native_terminal_outbox (event_id, object_id, entry_id, dp_id, event) VALUES ($1,$2,$3,$4,$5)")
+            .bind(event_id).bind(row.id).bind(&usage.entry_id).bind(op.dp_id).bind(event)
+            .execute(&mut *conn).await.map_err(unavailable)?;
+    }
+    sqlx::query("UPDATE native_objects SET pending = false, completed_at = clock_timestamp(), terminal_status = $2, version = version + 1 WHERE id = $1")
+        .bind(row.id).bind(body.terminal_status).execute(conn).await.map_err(unavailable)?;
+    Ok(NativeReply::new("completed"))
+}
+
+pub(crate) async fn execute(
+    conn: &mut PgConnection,
+    state: &AppState,
+    dp: DpIdentity,
+    command: Command,
+) -> Result<NativeReply, ApiError> {
+    sqlx::query("SET LOCAL statement_timeout = '2s'")
+        .execute(&mut *conn)
+        .await
+        .map_err(unavailable)?;
+    match command {
+        Command::Begin(body) => begin(conn, state, dp, *body).await,
+        Command::Bind(body) => bind(conn, state, dp, body).await,
+        Command::Lookup(body) => lookup(conn, state, body).await,
+        Command::Owned(body) => owned(conn, state, body).await,
+        Command::Tombstone(body) => tombstone(conn, state, body).await,
+        Command::Claim(body) => claim(conn, state, dp, body).await,
+        Command::Renew(body) => lease(conn, state, dp, body, true).await,
+        Command::Reschedule(body) => lease(conn, state, dp, body, false).await,
+        Command::Complete(body) => complete(conn, state, dp, body).await,
+    }
+}
+
+pub(crate) async fn deliver_one(
+    conn: &mut PgConnection,
+    state: &AppState,
+) -> Result<bool, DbError> {
+    sqlx::query("SET LOCAL statement_timeout = '5s'")
+        .execute(&mut *conn)
+        .await?;
+    let rows: Vec<(Uuid, Uuid, Value)> = sqlx::query_as(
+        "SELECT event_id, dp_id, event FROM native_terminal_outbox WHERE delivered_at IS NULL \
+         AND dp_id = (SELECT dp_id FROM native_terminal_outbox WHERE delivered_at IS NULL \
+                      ORDER BY created_at, event_id LIMIT 1) \
+         ORDER BY created_at, event_id LIMIT 100 FOR UPDATE SKIP LOCKED",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    let Some((batch_id, dp_id, _)) = rows.first() else {
+        return Ok(false);
+    };
+    let (batch_id, dp_id) = (*batch_id, *dp_id);
+    let ids: Vec<Uuid> = rows.iter().map(|(id, _, _)| *id).collect();
+    let events = rows.into_iter().map(|(_, _, event)| event).collect();
+    // 同一提交网关的一批事件一次接收，沿用原有账号锁的全局顺序。
+    let outcome =
+        crate::usage::ingest_transaction(&mut *conn, &state.prices, dp_id, batch_id, events)
+            .await?;
+    if outcome.rejected != 0 {
+        return Err(DbError::Db(sqlx::Error::Protocol(
+            "native terminal event was rejected".to_string(),
+        )));
+    }
+    sqlx::query("UPDATE native_terminal_outbox SET delivered_at = clock_timestamp() WHERE event_id = ANY($1)")
+        .bind(ids).execute(&mut *conn).await?;
+    Ok(true)
+}
+
+#[cfg(test)]
+mod consumer_endpoint_tests {
+    use super::*;
+    #[test]
+    fn file_consumer_selects_only_its_actual_endpoint_without_granting_file_management() {
+        let key: ApiKey =
+            serde_json::from_value(json!({"key_hash":"fixture","allowed_endpoints":["batches"]}))
+                .unwrap();
+        assert!(endpoint_permitted(
+            &key,
+            NativeObjectKind::File,
+            Some(EndpointFamily::Batches)
+        ));
+        assert!(!endpoint_permitted(&key, NativeObjectKind::File, None));
+        assert!(!endpoint_permitted(
+            &key,
+            NativeObjectKind::File,
+            Some(EndpointFamily::Responses)
+        ));
+    }
+}

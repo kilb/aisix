@@ -13,12 +13,11 @@
 //! Only the Responses fields that map cleanly onto chat completions are
 //! carried (`instructions`, `input` — including its image / file / audio
 //! content parts —, `tools`, `tool_choice`, `temperature`, `top_p`,
-//! `max_output_tokens`, `stream`, `reasoning.effort`, and `text.format` as
-//! `response_format`). Other OpenAI-only knobs (`store`,
-//! `previous_response_id`, `text.verbosity`, …) are dropped rather than
-//! forwarded — the downstream provider bridges flatten unknown `extra`
-//! fields onto the upstream wire, where an OpenAI-only key would 400 (e.g.
-//! Anthropic).
+//! `max_output_tokens`, `stream`, `reasoning.effort`, shared request controls,
+//! and `text.format` as `response_format`). Provider bridges project these
+//! canonical fields into the target platform's contract. Response lifecycle
+//! settings such as `store` and `previous_response_id` have no stateless chat
+//! equivalent.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -48,6 +47,61 @@ const STREAM_ASSEMBLY_MESSAGE: &str =
 /// this is the faithful transform actually dispatched upstream: it carries
 /// roles, tool calls, tool results, tools, and sampling params.
 pub fn responses_request_to_chat(model: &str, body: &Value) -> ChatFormat {
+    responses_request_to_chat_with_file_urls(model, body, ResponsesFileUrlPolicy::CanonicalUri)
+}
+
+/// Responses 文件 URL 在目标协议中的投影；上传文件 ID 始终不受此策略影响。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponsesFileUrlPolicy {
+    CanonicalUri,
+    Unsupported,
+}
+
+/// 只检查协议定义的内容数组；工具参数、metadata 等任意 JSON 不参与判断。
+pub fn responses_has_file_urls(body: &Value) -> bool {
+    let content_has_file_url = |content: &Value| {
+        content.as_array().is_some_and(|parts| {
+            parts.iter().any(|part| {
+                part.get("type").and_then(Value::as_str) == Some("input_file")
+                    && part.get("file_url").is_some_and(|value| !value.is_null())
+            })
+        })
+    };
+    body.get("input")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                let content = match item.get("type").and_then(Value::as_str) {
+                    Some("function_call_output" | "custom_tool_call_output") => item.get("output"),
+                    Some("message") | None => item.get("content"),
+                    _ => None,
+                };
+                content.is_some_and(content_has_file_url)
+            })
+        })
+}
+
+/// 用本次实际 dispatch 的平台合同决定 URL 槽；仅少见的 URL 请求需要重投影。
+pub fn responses_request_to_chat_for_bridge(
+    model: &str,
+    body: &Value,
+    bridge: &dyn aisix_gateway::Bridge,
+    ctx: &aisix_gateway::BridgeContext,
+) -> ChatFormat {
+    let chat = responses_request_to_chat(model, body);
+    if responses_has_file_urls(body) && !bridge.reads_file_uris(&chat, ctx) {
+        responses_request_to_chat_with_file_urls(model, body, ResponsesFileUrlPolicy::Unsupported)
+    } else {
+        chat
+    }
+}
+
+/// 带目标文件 URL 合同的请求转换。OpenAI Chat 没有对应的 URL 文件槽。
+pub fn responses_request_to_chat_with_file_urls(
+    model: &str,
+    body: &Value,
+    file_urls: ResponsesFileUrlPolicy,
+) -> ChatFormat {
     let mut messages: Vec<ChatMessage> = Vec::new();
     let tools = request_tools(body);
     let search_name = tool_search_chat_name(&tools);
@@ -67,7 +121,7 @@ pub fn responses_request_to_chat(model: &str, body: &Value) -> ChatFormat {
         }
         Some(Value::Array(items)) => {
             for item in items {
-                append_input_item(&mut messages, item, &search_name, &tools);
+                append_input_item(&mut messages, item, &search_name, &tools, file_urls);
             }
             messages = attach_replayed_reasoning(messages);
         }
@@ -87,6 +141,35 @@ pub fn responses_request_to_chat(model: &str, body: &Value) -> ChatFormat {
         .and_then(|v| v.as_u64())
         .and_then(|n| u32::try_from(n).ok());
     chat.stream = body.get("stream").and_then(|v| v.as_bool());
+    // 两个协议同义的字段保留调用者的值，包括显式 null；目标桥负责平台投影。
+    for key in [
+        "service_tier",
+        "prompt_cache_key",
+        "prompt_cache_retention",
+        "safety_identifier",
+        "metadata",
+        "user",
+        "top_logprobs",
+    ] {
+        if let Some(value) = body.get(key) {
+            chat.extra.insert(key.to_string(), value.clone());
+        }
+    }
+    if body
+        .get("include")
+        .and_then(Value::as_array)
+        .is_some_and(|include| {
+            include
+                .iter()
+                .any(|value| value.as_str() == Some("message.output_text.logprobs"))
+        })
+    {
+        chat.extra.insert("logprobs".to_string(), json!(true));
+    }
+    if let Some(verbosity) = body.pointer("/text/verbosity") {
+        chat.extra
+            .insert("verbosity".to_string(), verbosity.clone());
+    }
 
     // Tools/tool_choice ride `extra` in OpenAI chat shape; every provider
     // bridge translates that shape to its own (Anthropic, Gemini, …), so
@@ -144,6 +227,7 @@ fn append_input_item(
     item: &Value,
     search_name: &str,
     tools: &[Value],
+    file_urls: ResponsesFileUrlPolicy,
 ) {
     // A bare-string element is user text.
     if let Some(text) = item.as_str() {
@@ -301,7 +385,7 @@ fn append_input_item(
             let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("user");
             let content = item
                 .get("content")
-                .map(responses_content_to_chat)
+                .map(|content| responses_content_to_chat(content, file_urls))
                 .unwrap_or_else(|| ChatContent {
                     text: String::new(),
                     blocks: None,
@@ -499,7 +583,7 @@ impl ChatContent {
 ///   * `input_audio` → `{type:"input_audio", input_audio:{data, format}}`
 ///
 /// Parts that carry none of the above are skipped.
-fn responses_content_to_chat(v: &Value) -> ChatContent {
+fn responses_content_to_chat(v: &Value, file_urls: ResponsesFileUrlPolicy) -> ChatContent {
     match v {
         Value::String(s) => ChatContent {
             text: s.clone(),
@@ -524,7 +608,7 @@ fn responses_content_to_chat(v: &Value) -> ChatContent {
                         }
                     }
                     Some("input_file") => {
-                        if let Some(block) = input_file_block(part) {
+                        if let Some(block) = input_file_block(part, file_urls) {
                             blocks.push(block);
                             has_non_text = true;
                         }
@@ -580,12 +664,27 @@ fn input_image_block(part: &Value) -> Option<Value> {
 }
 
 /// `input_file` → the chat `file` part, carrying whichever of
-/// `file_data` / `filename` / `file_id` the caller sent.
-fn input_file_block(part: &Value) -> Option<Value> {
+/// `file_data` / `filename` / `file_id` the caller sent. 可表示的 URL 复用
+/// canonical File/Uri 槽，不把 PDF 改成 image，也不冒充上传文件 ID 发往 Chat。
+fn input_file_block(part: &Value, file_urls: ResponsesFileUrlPolicy) -> Option<Value> {
     let mut file = Map::new();
     for key in ["file_data", "filename", "file_id"] {
         if let Some(v) = part.get(key).filter(|v| !v.is_null()) {
             file.insert(key.to_string(), v.clone());
+        }
+    }
+    if let Some(url) = part.get("file_url").filter(|value| !value.is_null()) {
+        match file_urls {
+            ResponsesFileUrlPolicy::CanonicalUri => {
+                file.entry("file_id".to_string())
+                    .or_insert_with(|| url.clone());
+            }
+            ResponsesFileUrlPolicy::Unsupported
+                if !file.contains_key("file_data") && !file.contains_key("file_id") =>
+            {
+                return None
+            }
+            ResponsesFileUrlPolicy::Unsupported => {}
         }
     }
     (!file.is_empty()).then(|| json!({"type": "file", "file": Value::Object(file)}))
@@ -663,7 +762,7 @@ fn function_call_output_to_chat(output: &Value) -> ChatContent {
         }
         _ => {}
     }
-    let mut content = responses_content_to_chat(output);
+    let mut content = responses_content_to_chat(output, ResponsesFileUrlPolicy::CanonicalUri);
     content.blocks = None;
     content
 }
@@ -690,10 +789,8 @@ fn is_content_part(item: &Value) -> bool {
 ///     `{type:"json_schema", json_schema:{name, schema, strict, description}}`
 ///     (members the caller omitted stay omitted)
 ///   * `{type:"json_object"}` → `{type:"json_object"}`
-///   * `{type:"text"}`, anything else → `None`, so the field stays off the wire
-///
-/// `text.verbosity` has no chat-completions counterpart on this path and
-/// keeps being dropped.
+///   * `{type:"text"}` → `{type:"text"}`
+///   * anything else → `None`, so the field stays off the wire
 fn responses_text_format_to_response_format(text: &Value) -> Option<Value> {
     let format = text.get("format")?;
     match format.get("type").and_then(Value::as_str)? {
@@ -707,6 +804,7 @@ fn responses_text_format_to_response_format(text: &Value) -> Option<Value> {
             Some(json!({"type": "json_schema", "json_schema": Value::Object(schema)}))
         }
         "json_object" => Some(json!({"type": "json_object"})),
+        "text" => Some(json!({"type": "text"})),
         _ => None,
     }
 }
@@ -1279,9 +1377,8 @@ fn custom_tool_grammar_suffix(format: Option<&Value>) -> String {
 ///   * `"auto"` / `"none"` / `"required"` pass through
 ///   * `{type:"function", name}`, `{type:"custom", name}`,
 ///     `{type:"tool", name}` → `{type:"function", function:{name}}`
-///   * `{type:"allowed_tools", mode:"required"|"auto"}` → the bare mode;
-///     chat has no way to restrict the model to a subset of the tools it
-///     was given, so the subset itself is dropped
+///   * `{type:"allowed_tools", mode, tools}` → nested Chat `allowed_tools`,
+///     with each reference using its translated declaration's identity
 ///   * `{type:"any"}` → `"required"`
 ///   * a choice naming a hosted tool type, or anything else → `None`, so
 ///     the field stays off the wire
@@ -1305,11 +1402,21 @@ fn responses_tool_choice_to_chat(tc: &Value, tools: &[Value]) -> Option<Value> {
             "any" => Some(Value::String("required".to_string())),
             "allowed_tools" => match o.get("mode").and_then(|v| v.as_str())? {
                 mode @ ("auto" | "required") => {
-                    tracing::debug!(
-                        %mode,
-                        "narrowing allowed_tools to its mode: the chat bridge cannot restrict the model to a subset of the tools"
-                    );
-                    Some(Value::String(mode.to_string()))
+                    let allowed: Vec<Value> = o
+                        .get("tools")?
+                        .as_array()?
+                        .iter()
+                        .filter(|choice| {
+                            matches!(
+                                choice.get("type").and_then(Value::as_str),
+                                Some("function" | "custom" | "tool")
+                            )
+                        })
+                        .filter_map(|choice| responses_tool_choice_to_chat(choice, tools))
+                        .collect();
+                    Some(
+                        json!({"type": "allowed_tools", "allowed_tools": {"mode": mode, "tools": allowed}}),
+                    )
                 }
                 _ => None,
             },
@@ -1344,12 +1451,24 @@ pub fn chat_response_to_responses_json(
             .extra
             .get("tool_calls")
             .and_then(|v| v.as_array()),
+        resp.logprobs
+            .as_ref()
+            .and_then(|value| value.get("content"))
+            .and_then(Value::as_array)
+            .map(Vec::as_slice),
+        &responses_annotations(resp.message.extra.get("annotations")),
         reply,
     );
+    // 仅在上游没有身份时生成协议必需的 Response ID。
+    let response_id = if resp.id.is_empty() {
+        format!("resp_{}", Uuid::new_v4().simple())
+    } else {
+        resp.id.clone()
+    };
     response_resource(
         reply,
         ResponseState {
-            id: &format!("resp_{}", Uuid::new_v4().simple()),
+            id: &response_id,
             created_at,
             model: requested_model,
             status,
@@ -1601,14 +1720,52 @@ fn refusal_item_json(item_id: &str, refusal: &str) -> Value {
 }
 
 /// A completed assistant `message` item carrying `text`.
-fn message_item_json(item_id: &str, text: &str) -> Value {
+fn message_item_json(item_id: &str, text: &str, details: &OutputTextDetails) -> Value {
     json!({
         "type": "message",
         "id": item_id,
         "status": "completed",
         "role": "assistant",
-        "content": [{"type": "output_text", "text": text, "annotations": []}],
+        "content": [output_text_part(text, details)],
     })
+}
+
+// Chat 的 URL 引文多一层 url_citation，Responses 的同义字段位于注释顶层。
+fn responses_annotations(value: Option<&Value>) -> Vec<Value> {
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|annotation| {
+            if annotation.get("type").and_then(Value::as_str) != Some("url_citation") {
+                return None;
+            }
+            let citation = annotation.get("url_citation")?.as_object()?;
+            let mut projected = Map::new();
+            projected.insert("type".into(), json!("url_citation"));
+            for key in ["start_index", "end_index", "title", "url"] {
+                if let Some(value) = citation.get(key) {
+                    projected.insert(key.to_string(), value.clone());
+                }
+            }
+            Some(Value::Object(projected))
+        })
+        .collect()
+}
+
+#[derive(Debug, Default)]
+struct OutputTextDetails {
+    // None 表示上游未报告，Some([]) 表示上游报告了空列表。
+    logprobs: Option<Vec<Value>>,
+    annotations: Vec<Value>,
+}
+
+fn output_text_part(text: &str, details: &OutputTextDetails) -> Value {
+    let mut part = json!({"type": "output_text", "text": text, "annotations": details.annotations});
+    if let Some(logprobs) = &details.logprobs {
+        part["logprobs"] = json!(logprobs);
+    }
+    part
 }
 
 /// Assemble the `output` array: a `reasoning` item carrying the upstream's
@@ -1623,6 +1780,8 @@ fn build_output_items(
     text: Option<&str>,
     refusal: Option<&str>,
     tool_calls: Option<&Vec<Value>>,
+    logprobs: Option<&[Value]>,
+    annotations: &[Value],
     reply: &ResponsesReplyContext,
 ) -> Vec<Value> {
     let mut output: Vec<Value> = Vec::new();
@@ -1636,13 +1795,14 @@ fn build_output_items(
         ));
     }
     if let Some(text) = text.filter(|s| !s.is_empty()) {
-        output.push(json!({
-            "type": "message",
-            "id": format!("msg_{}", Uuid::new_v4().simple()),
-            "status": "completed",
-            "role": "assistant",
-            "content": [{"type": "output_text", "text": text, "annotations": []}],
-        }));
+        output.push(message_item_json(
+            &format!("msg_{}", Uuid::new_v4().simple()),
+            text,
+            &OutputTextDetails {
+                logprobs: logprobs.map(<[Value]>::to_vec),
+                annotations: annotations.to_vec(),
+            },
+        ));
     }
     if let Some(refusal) = refusal.filter(|s| !s.is_empty()) {
         output.push(refusal_item_json(
@@ -1955,6 +2115,8 @@ pub struct ResponsesSseEncoder {
     /// Message items already closed by reasoning that followed their text,
     /// as `(item_id, output_index, text)`.
     text_done: Vec<(String, u32, String)>,
+    // 按输出项保存概率和引文，文本被后续 reasoning 关闭后也不丢失。
+    text_details: std::collections::BTreeMap<u32, OutputTextDetails>,
     /// The refusal item currently streaming, if any.
     refusal_open: Option<RefusalState>,
     /// Refusal items already closed.
@@ -2021,6 +2183,7 @@ impl ResponsesSseEncoder {
             accumulated_bytes: 0,
             overflowed: false,
             text_done: Vec::new(),
+            text_details: std::collections::BTreeMap::new(),
             refusal_open: None,
             refusal_done: Vec::new(),
             items_closed: false,
@@ -2095,8 +2258,7 @@ impl ResponsesSseEncoder {
             map.insert("type".to_string(), json!(event_type));
             map.insert("sequence_number".to_string(), json!(seq));
         }
-        if let Some(sealer) = &self.seal {
-            crate::opaque_id::seal_responses_event(sealer, &mut data);
+        if self.seal.is_some() {
             if let Some(response) = data.get_mut("response") {
                 crate::opaque_id::drop_bridged_usage_extensions(response);
             }
@@ -2287,7 +2449,16 @@ impl ResponsesSseEncoder {
             .map(|(id, index, text)| (id, *index, text))
             .chain(open_text)
         {
-            items.push((output_index, message_item_json(id, text)));
+            items.push((
+                output_index,
+                message_item_json(
+                    id,
+                    text,
+                    self.text_details
+                        .get(&output_index)
+                        .unwrap_or(&OutputTextDetails::default()),
+                ),
+            ));
         }
         for r in self.refusal_done.iter().chain(self.refusal_open.iter()) {
             items.push((r.output_index, refusal_item_json(&r.item_id, &r.text)));
@@ -2306,6 +2477,9 @@ impl ResponsesSseEncoder {
         }
         // A Responses response is one answer.
         let chunk = &*chunk.first_choice_only();
+        if !self.sent_created && !chunk.id.is_empty() {
+            self.response_id.clone_from(&chunk.id);
+        }
         self.accumulate_usage(chunk);
         if let Some(tier) = chunk.service_tier.as_ref().and_then(|t| t.openai_value()) {
             self.service_tier = Some(tier.to_owned());
@@ -2322,11 +2496,19 @@ impl ResponsesSseEncoder {
             return Vec::new();
         }
 
+        let chunk_logprobs = chunk
+            .logprobs
+            .as_ref()
+            .and_then(|value| value.get("content"))
+            .and_then(Value::as_array);
+        let annotations = responses_annotations(chunk.delta.extra.get("annotations"));
         let has_content = chunk
             .delta
             .content
             .as_deref()
-            .is_some_and(|s| !s.is_empty());
+            .is_some_and(|s| !s.is_empty())
+            || chunk_logprobs.is_some()
+            || !annotations.is_empty();
         let has_tools = chunk
             .delta
             .tool_calls
@@ -2347,6 +2529,14 @@ impl ResponsesSseEncoder {
             .map_or(0, str::len)
             .saturating_add(chunk.delta.reasoning_content.as_deref().map_or(0, str::len))
             .saturating_add(refusal.map_or(0, str::len));
+        // 新增的概率和引文同样受整条流的组装上限约束。
+        for value in chunk_logprobs
+            .into_iter()
+            .flatten()
+            .chain(annotations.iter())
+        {
+            additional = additional.saturating_add(value.to_string().len());
+        }
         if let Some(tool_calls) = chunk.delta.tool_calls.as_ref() {
             for tc in tool_calls {
                 let index = tc.get("index").and_then(Value::as_u64).unwrap_or(0);
@@ -2471,6 +2661,21 @@ impl ResponsesSseEncoder {
             let item_id = self.text_item_id.clone().unwrap_or_default();
             let output_index = self.text_output_index;
             self.text_accum.push_str(&delta);
+            let details = self.text_details.entry(output_index).or_default();
+            if let Some(logprobs) = chunk_logprobs {
+                details
+                    .logprobs
+                    .get_or_insert_with(Vec::new)
+                    .extend(logprobs.iter().cloned());
+            }
+            let mut added_annotations = Vec::new();
+            for annotation in annotations {
+                if !details.annotations.contains(&annotation) {
+                    let index = details.annotations.len();
+                    details.annotations.push(annotation.clone());
+                    added_annotations.push((index, annotation));
+                }
+            }
             events.push(self.event(
                 "response.output_text.delta",
                 json!({
@@ -2478,8 +2683,19 @@ impl ResponsesSseEncoder {
                     "output_index": output_index,
                     "content_index": 0,
                     "delta": delta,
+                    "logprobs": chunk_logprobs.cloned().unwrap_or_default(),
                 }),
             ));
+            for (annotation_index, annotation) in added_annotations {
+                events.push(self.event(
+                    "response.output_text.annotation.added",
+                    json!({
+                        "item_id": item_id, "output_index": output_index,
+                        "content_index": 0, "annotation_index": annotation_index,
+                        "annotation": annotation,
+                    }),
+                ));
+            }
         }
 
         // ── Refusal ──
@@ -2738,6 +2954,25 @@ impl ResponsesSseEncoder {
         };
         let output_index = self.text_output_index;
         let text = std::mem::take(&mut self.text_accum);
+        let part = output_text_part(
+            &text,
+            self.text_details
+                .get(&output_index)
+                .unwrap_or(&OutputTextDetails::default()),
+        );
+        let item = message_item_json(
+            &item_id,
+            &text,
+            self.text_details
+                .get(&output_index)
+                .unwrap_or(&OutputTextDetails::default()),
+        );
+        let logprobs = self
+            .text_details
+            .get(&output_index)
+            .and_then(|details| details.logprobs.as_ref())
+            .cloned()
+            .unwrap_or_default();
         let events = vec![
             self.event(
                 "response.output_text.done",
@@ -2746,6 +2981,7 @@ impl ResponsesSseEncoder {
                     "output_index": output_index,
                     "content_index": 0,
                     "text": text,
+                    "logprobs": logprobs,
                 }),
             ),
             self.event(
@@ -2754,12 +2990,12 @@ impl ResponsesSseEncoder {
                     "item_id": item_id,
                     "output_index": output_index,
                     "content_index": 0,
-                    "part": {"type": "output_text", "text": text, "annotations": []},
+                    "part": part,
                 }),
             ),
             self.event(
                 "response.output_item.done",
-                json!({"output_index": output_index, "item": message_item_json(&item_id, &text)}),
+                json!({"output_index": output_index, "item": item}),
             ),
         ];
         self.text_done.push((item_id, output_index, text));
@@ -2924,12 +3160,15 @@ pub struct ResponsesStreamCompletion {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub reasoning_tokens: u32,
+    pub web_search_requests: u32,
     pub cached_prompt_tokens: u32,
     pub cache_write_tokens: Option<u32>,
     pub modality: aisix_gateway::ModalityTokens,
     pub cache_creation_ttl: aisix_gateway::CacheCreationTtl,
     pub cache_creation_tokens: u32,
     pub cache_read_tokens: u32,
+    /// 上游明确报告零命中时仍保留采样事实。
+    pub cache_usage_reported: Option<bool>,
     /// See `aisix_gateway::chat::merge_stream_upstream_total`.
     pub upstream_total_tokens: Option<u32>,
     /// Latest usage frame's value, as in the chat stream.
@@ -3231,12 +3470,17 @@ pub fn build_responses_bridge_stream(
                             comp.prompt_tokens = comp.prompt_tokens.max(u.prompt_tokens);
                             comp.completion_tokens = comp.completion_tokens.max(u.completion_tokens);
                             comp.reasoning_tokens = comp.reasoning_tokens.max(u.reasoning_tokens);
+                            comp.web_search_requests = comp.web_search_requests.max(u.web_search_requests);
                             comp.cached_prompt_tokens = comp.cached_prompt_tokens.max(u.cached_prompt_tokens);
                             comp.cache_write_tokens = comp.cache_write_tokens.max(u.cache_write_tokens);
                             comp.modality = comp.modality.max_fieldwise(&u.modality);
                             comp.cache_creation_ttl = comp.cache_creation_ttl.max_fieldwise(&u.cache_creation_ttl);
                             comp.cache_creation_tokens = comp.cache_creation_tokens.max(u.cache_creation_tokens);
                             comp.cache_read_tokens = comp.cache_read_tokens.max(u.cache_read_tokens);
+                            comp.cache_usage_reported = Some(
+                                comp.cache_usage_reported == Some(true)
+                                    || u.cache_usage_reported() == Some(true),
+                            );
                             aisix_gateway::chat::merge_stream_upstream_total(
                                 &mut comp.upstream_total_tokens,
                                 u.upstream_total_tokens,
@@ -3285,7 +3529,7 @@ pub fn build_responses_bridge_stream(
                             if !tool_calls.is_empty() {
                                 message.extra.insert("tool_calls".to_string(), Value::Array(tool_calls));
                             }
-                            let synth = ChatResponse { logprobs: None, more_choices: Vec::new(),
+                            let synth = ChatResponse { native_envelope: None, logprobs: None, more_choices: Vec::new(),
                                 id: String::new(),
                                 model: model_label.clone(),
                                 message,
@@ -3560,7 +3804,7 @@ pub fn build_responses_bridge_stream(
         if !tool_calls.is_empty() {
             message.extra.insert("tool_calls".to_string(), Value::Array(tool_calls));
         }
-        let synth = ChatResponse { logprobs: None, more_choices: Vec::new(),
+        let synth = ChatResponse { native_envelope: None, logprobs: None, more_choices: Vec::new(),
             id: String::new(),
             model: model_label.clone(),
             message,
@@ -4173,23 +4417,24 @@ mod tests {
     }
 
     #[test]
-    fn text_format_text_and_absent_text_emit_no_response_format() {
-        assert_eq!(response_format(json!({"format": {"type": "text"}})), None);
+    fn text_format_text_is_explicit_and_absent_text_stays_absent() {
+        assert_eq!(
+            response_format(json!({"format": {"type": "text"}})),
+            Some(json!({"type": "text"}))
+        );
         assert_eq!(response_format(json!({})), None);
         let chat = responses_request_to_chat("m", &json!({"model": "m", "input": "hi"}));
         assert!(!chat.extra.contains_key("response_format"));
     }
 
-    /// `text.verbosity` has no chat-completions counterpart on this path —
-    /// it must not leak onto the upstream wire, where the bridges flatten
-    /// `extra` and an unknown key 400s.
+    /// 当前 Chat 合同使用同义的顶层 verbosity，未设置的格式仍然省略。
     #[test]
-    fn text_verbosity_is_not_forwarded() {
+    fn text_verbosity_is_forwarded_in_the_chat_slot() {
         let chat = responses_request_to_chat(
             "m",
             &json!({"model": "m", "input": "hi", "text": {"verbosity": "low"}}),
         );
-        assert!(!chat.extra.contains_key("verbosity"));
+        assert_eq!(chat.extra.get("verbosity"), Some(&json!("low")));
         assert!(!chat.extra.contains_key("response_format"));
     }
 
@@ -4462,6 +4707,7 @@ mod tests {
             ),
         ] {
             events.extend(enc.next_events(&ChatChunk {
+                native_envelope: None,
                 choice_index: 0,
                 logprobs: None,
                 id: "c".into(),
@@ -4785,6 +5031,7 @@ mod tests {
             ),
         ] {
             events.extend(enc.next_events(&ChatChunk {
+                native_envelope: None,
                 choice_index: 0,
                 logprobs: None,
                 id: "c".into(),
@@ -4920,6 +5167,7 @@ mod tests {
         let out = chat_response_to_responses_json(&resp, "m", 1, &reply);
         let mut enc = ResponsesSseEncoder::new("r", "m", 0, reply);
         let events = enc.next_events(&ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "c".into(),
@@ -5277,19 +5525,22 @@ mod tests {
         for mode in ["auto", "none", "required"] {
             assert_eq!(with_choice(json!(mode)), Some(json!(mode)));
         }
-        // An allowed_tools choice keeps its mode; chat cannot express the
-        // subset restriction, so the subset is dropped.
+        // 当前 Chat 合同将 mode 和限制集合放在嵌套 allowed_tools 对象中。
         assert_eq!(
             with_choice(json!({
                 "type": "allowed_tools",
                 "mode": "required",
                 "tools": [{"type": "function", "name": "get_weather"}],
             })),
-            Some(json!("required"))
+            Some(
+                json!({"type": "allowed_tools", "allowed_tools": {"mode": "required", "tools": [
+                    {"type": "function", "function": {"name": "get_weather"}}
+                ]}})
+            )
         );
         assert_eq!(
             with_choice(json!({"type": "allowed_tools", "mode": "auto", "tools": []})),
-            Some(json!("auto"))
+            Some(json!({"type": "allowed_tools", "allowed_tools": {"mode": "auto", "tools": []}}))
         );
         assert_eq!(with_choice(json!({"type": "any"})), Some(json!("required")));
         // The three named forms all land on the one chat spelling — never
@@ -5473,6 +5724,7 @@ mod tests {
             extra.insert("tool_calls".into(), tc);
         }
         ChatResponse {
+            native_envelope: None,
             logprobs: None,
             more_choices: Vec::new(),
             id: "id".into(),
@@ -5597,6 +5849,7 @@ mod tests {
 
     fn content_chunk(text: &str) -> ChatChunk {
         ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "c".into(),
@@ -5624,6 +5877,7 @@ mod tests {
         all.extend(enc.next_events(&content_chunk("lo")));
         // Finish chunk carrying usage (Anthropic attaches it here).
         all.extend(enc.next_events(&ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "c".into(),
@@ -5670,6 +5924,7 @@ mod tests {
         let _ = enc.next_events(&content_chunk("hi"));
         // Finish without usage → close items but NOT completed yet.
         let at_finish = enc.next_events(&ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "c".into(),
@@ -5684,6 +5939,7 @@ mod tests {
         assert!(!enc.is_finished());
         // Trailing usage frame releases completed.
         let usage_frame = enc.next_events(&ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "c".into(),
@@ -5702,13 +5958,14 @@ mod tests {
     /// the usage counter this bridge adds beside OpenAI's does not leave.
     /// Without a sealer the same stream is exactly as before.
     #[test]
-    fn a_sealing_encoder_seals_call_ids_and_keeps_usage_to_openai_fields() {
+    fn a_platform_encoder_preserves_call_ids_and_keeps_usage_to_openai_fields() {
         let platform = crate::platform::PlatformSettings::from_secret("s");
         let sealer = std::sync::Arc::new(crate::opaque_id::Sealer::of(&platform, "team-a"));
         let run = |sealer: Option<std::sync::Arc<crate::opaque_id::Sealer>>| {
             let mut enc =
                 ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools()).sealing_ids(sealer);
             let mut events = enc.next_events(&ChatChunk {
+                native_envelope: None,
                 choice_index: 0,
                 logprobs: None,
                 id: "c".into(),
@@ -5745,14 +6002,8 @@ mod tests {
         let sealed = run(Some(sealer.clone()));
         let response = completed(&sealed);
         let call_id = response["output"][0]["call_id"].as_str().unwrap();
-        // A call id is shown behind `call_`, not the upstream's `toolu_`.
-        assert!(call_id.starts_with("call_"), "{call_id}");
-        assert_eq!(
-            sealer
-                .unseal(crate::opaque_id::IdKind::Call, call_id)
-                .as_deref(),
-            Some("toolu_bdrk_01Y")
-        );
+        assert_eq!(call_id, "toolu_bdrk_01Y");
+        assert_eq!(response["id"], "c");
         assert!(response["usage"]["input_tokens_details"]
             .get("cache_creation_tokens")
             .is_none());
@@ -5761,12 +6012,9 @@ mod tests {
             "the write is still counted"
         );
         for event in &sealed {
-            assert!(
-                !event.to_sse_string().contains("bdrk")
-                    && !event.to_sse_string().contains("toolu_"),
-                "{}",
-                event.to_sse_string()
-            );
+            if let Some(call) = event.data.pointer("/item/call_id") {
+                assert_eq!(call, "toolu_bdrk_01Y");
+            }
         }
 
         let plain = completed(&run(None));
@@ -5781,6 +6029,7 @@ mod tests {
     fn streaming_tool_call_emits_function_call_events() {
         let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools());
         let chunk = ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "c".into(),
@@ -5799,6 +6048,7 @@ mod tests {
         };
         let mut all = enc.next_events(&chunk);
         all.extend(enc.next_events(&ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "c".into(),
@@ -5815,6 +6065,7 @@ mod tests {
             accounting_usage: None,
         }));
         all.extend(enc.next_events(&ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "c".into(),
@@ -5845,6 +6096,7 @@ mod tests {
     fn streaming_custom_tool_call_emits_one_unwrapped_input_delta() {
         let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, custom_tools(&["apply_patch"]));
         let mut all = enc.next_events(&ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "c".into(),
@@ -5862,6 +6114,7 @@ mod tests {
             accounting_usage: None,
         });
         all.extend(enc.next_events(&ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "c".into(),
@@ -5878,6 +6131,7 @@ mod tests {
             accounting_usage: None,
         }));
         all.extend(enc.next_events(&ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "c".into(),
@@ -5948,6 +6202,7 @@ mod tests {
         // First fragment carries a PREFIX of the custom tool's name, so the
         // item opens as a plain function call.
         let mut all = enc.next_events(&ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "c".into(),
@@ -5965,6 +6220,7 @@ mod tests {
             accounting_usage: None,
         });
         all.extend(enc.next_events(&ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "c".into(),
@@ -6001,6 +6257,7 @@ mod tests {
     fn streaming_custom_tool_call_emits_no_function_call_argument_events() {
         let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, custom_tools(&["apply_patch"]));
         let mut all = enc.next_events(&ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "c".into(),
@@ -6028,7 +6285,7 @@ mod tests {
     #[test]
     fn streaming_mixed_tool_calls_keep_their_own_event_families() {
         let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, custom_tools(&["apply_patch"]));
-        let mut all = enc.next_events(&ChatChunk { choice_index: 0, logprobs: None,
+        let mut all = enc.next_events(&ChatChunk { native_envelope: None, choice_index: 0, logprobs: None,
             id: "c".into(),
             model: "m".into(),
             delta: ChatDelta {
@@ -6044,6 +6301,7 @@ mod tests {
             usage: None,
             service_tier: None, accounting_usage: None, });
         all.extend(enc.next_events(&ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "c".into(),
@@ -6079,6 +6337,7 @@ mod tests {
     fn only_a_renderable_chunk_counts_as_output() {
         let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools());
         let usage_only = ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "c".into(),
@@ -6101,6 +6360,7 @@ mod tests {
         // force_finish must NOT re-emit the per-item done events.
         let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools());
         let _ = enc.next_events(&ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "c".into(),
@@ -6118,6 +6378,7 @@ mod tests {
             accounting_usage: None,
         });
         let at_finish = enc.next_events(&ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "c".into(),
@@ -6158,6 +6419,7 @@ mod tests {
             let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools());
             let _ = enc.next_events(&content_chunk("hi"));
             let done = enc.next_events(&ChatChunk {
+                native_envelope: None,
                 choice_index: 0,
                 logprobs: None,
                 id: "c".into(),
@@ -6205,6 +6467,7 @@ mod tests {
         extra.insert("refusal".into(), "I can't help with that".into());
         let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools());
         let mut events = enc.next_events(&ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "c".into(),
@@ -6232,6 +6495,7 @@ mod tests {
         message.extra = extra;
         let json = chat_response_to_responses_json(
             &ChatResponse {
+                native_envelope: None,
                 logprobs: None,
                 more_choices: Vec::new(),
                 id: "c".into(),
@@ -6256,6 +6520,7 @@ mod tests {
         let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools());
         let _ = enc.next_events(&content_chunk("partial"));
         let done = enc.next_events(&ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "c".into(),
@@ -6395,7 +6660,7 @@ mod tests {
             error["sequence_number"].as_u64().unwrap() + 1
         );
         let response = &failed["response"];
-        assert_eq!(response["id"], "resp_1");
+        assert_eq!(response["id"], "c");
         assert_eq!(response["status"], "failed");
         assert_eq!(response["error"]["code"], "invalid_prompt");
         assert_eq!(response["error"]["message"], error["message"]);
@@ -6448,6 +6713,7 @@ mod tests {
 
     fn reasoning_chunk(text: &str) -> ChatChunk {
         ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "c".into(),
@@ -6465,6 +6731,7 @@ mod tests {
 
     fn finish_chunk(usage: Option<UsageStats>) -> ChatChunk {
         ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "c".into(),
@@ -6535,6 +6802,7 @@ mod tests {
         let mut all = enc.next_events(&reasoning_chunk("why"));
         all.extend(enc.next_events(&content_chunk("because")));
         all.extend(enc.next_events(&ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "c".into(),
@@ -6661,6 +6929,7 @@ mod tests {
             .extra
             .insert("refusal".into(), "I can't help".into());
         let resp = ChatResponse {
+            native_envelope: None,
             id: "c".into(),
             model: "m".into(),
             message,
@@ -6689,6 +6958,7 @@ mod tests {
                 delta.extra.insert("refusal".into(), refusal.into());
             }
             events.extend(enc.next_events(&ChatChunk {
+                native_envelope: None,
                 id: "c".into(),
                 model: "m".into(),
                 choice_index: 0,
@@ -6731,6 +7001,7 @@ mod tests {
         let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools());
         let _ = enc.next_events(&content_chunk("hello"));
         let _ = enc.next_events(&ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "c".into(),
@@ -6788,6 +7059,7 @@ mod tests {
         let mut partial = UsageStats::new(3, 0);
         partial.total_tokens = 3;
         let _ = enc.next_events(&ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "c".into(),
@@ -6812,6 +7084,7 @@ mod tests {
         let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools());
         let _ = enc.next_events(&content_chunk("hi"));
         let _ = enc.next_events(&ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "c".into(),
@@ -7169,6 +7442,7 @@ mod tests {
     fn streaming_namespace_call_announces_and_closes_the_sub_tool() {
         let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, namespace_reply());
         let mut events = enc.next_events(&ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "c".into(),
@@ -7186,6 +7460,7 @@ mod tests {
             accounting_usage: None,
         });
         events.extend(enc.next_events(&ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "c".into(),
@@ -7433,12 +7708,37 @@ mod tests {
         events.iter().map(|(e, _)| e.as_str()).collect()
     }
 
+    #[tokio::test]
+    async fn responses_bridge_completion_keeps_explicit_zero_cache_presence() {
+        for reported in [false, true] {
+            let mut usage = serde_json::json!({
+                "prompt_tokens": 100, "completion_tokens": 1, "total_tokens": 101
+            });
+            if reported {
+                usage["prompt_tokens_details"] = serde_json::json!({"cached_tokens": 0});
+            }
+            let raw = serde_json::from_value(serde_json::json!({
+                "id": "c", "model": "m", "usage": usage,
+                "choices": [{"index": 0, "delta": {"content": "hi"}, "finish_reason": "stop"}]
+            }))
+            .unwrap();
+            let chunks = aisix_provider_openai::wire::stream_chunk_into_chat_chunks(
+                raw,
+                &mut Default::default(),
+            );
+            let (_, completion) = relay(chunks.into_iter().map(Ok).collect()).await;
+            assert_eq!(completion.cached_prompt_tokens, 0);
+            assert_eq!(completion.cache_usage_reported, Some(reported));
+        }
+    }
+
     /// One partial chunk, then a timeout, with a content-capturing exporter
     /// and the given output guardrail: the completion the stream ends with.
     async fn cut_off_relay(
         output_guardrail: Option<Arc<aisix_guardrails::GuardrailChain>>,
     ) -> ResponsesStreamCompletion {
         let partial = ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "c".into(),
@@ -7525,6 +7825,7 @@ mod tests {
             }
         }
         let chunk = ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "c".into(),
@@ -7580,6 +7881,7 @@ mod tests {
 
     fn answer_chunk(content: Option<&str>, finish: bool, usage: Option<UsageStats>) -> ChatChunk {
         ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "c".into(),
@@ -7696,6 +7998,7 @@ mod tests {
     #[tokio::test]
     async fn an_empty_upstream_stream_fails_instead_of_completing() {
         let usage_only = ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "c".into(),
@@ -7708,7 +8011,7 @@ mod tests {
         };
         let (events, comp) = relay(vec![Ok(usage_only)]).await;
         assert_eq!(event_names(&events), FAILED_BEFORE_ANY_OUTPUT);
-        assert_opened_then_failed(&events);
+        assert_opened_then_failed_with_id(&events, "c");
         assert_eq!(events[2].1["code"], "upstream_error");
         let failed = &events[3].1["response"];
         assert_eq!(failed["status"], "failed");
@@ -7752,17 +8055,21 @@ mod tests {
 
     /// The opening pair carries the same in-progress Response the failure
     /// then ends, and the sequence runs 0..n without a gap.
-    fn assert_opened_then_failed(events: &[(String, Value)]) {
+    fn assert_opened_then_failed_with_id(events: &[(String, Value)], expected_id: &str) {
         for (i, (_, data)) in events.iter().enumerate() {
             assert_eq!(data["sequence_number"], i as u64);
         }
         for (_, data) in &events[..2] {
-            assert_eq!(data["response"]["id"], "resp_1");
+            assert_eq!(data["response"]["id"], expected_id);
             assert_eq!(data["response"]["status"], "in_progress");
             assert_eq!(data["response"]["output"], json!([]));
         }
-        assert_eq!(events[3].1["response"]["id"], "resp_1");
+        assert_eq!(events[3].1["response"]["id"], expected_id);
         assert_eq!(events[3].1["response"]["status"], "failed");
+    }
+
+    fn assert_opened_then_failed(events: &[(String, Value)]) {
+        assert_opened_then_failed_with_id(events, "resp_1");
     }
 
     /// An upstream failure before the first chunk is also the first thing
@@ -7830,5 +8137,505 @@ mod tests {
         assert_eq!(failed["response"]["error"]["code"], "transport_error");
         assert_eq!(failed["response"]["error"]["message"], error["message"]);
         assert_eq!(failed["response"]["output"], json!([]));
+    }
+
+    // 当前 SDK 的跨协议合同：每个哨兵断言都能识别字段被桥接丢弃。
+    #[test]
+    fn compat_responses_m1_allowed_function_subset_uses_nested_chat_shape() {
+        let chat = responses_request_to_chat(
+            "m",
+            &json!({
+                "input": "Use the permitted tool.",
+                "tools": [
+                    {"type": "function", "name": "read_state", "parameters": {"type": "object"}},
+                    {"type": "function", "name": "write_state", "parameters": {"type": "object"}}
+                ],
+                "tool_choice": {"type": "allowed_tools", "mode": "required", "tools": [
+                    {"type": "function", "name": "read_state"}
+                ]}
+            }),
+        );
+        assert_eq!(
+            chat.extra.get("tool_choice"),
+            Some(&json!({
+                "type": "allowed_tools", "allowed_tools": {"mode": "required", "tools": [
+                    {"type": "function", "function": {"name": "read_state"}}
+                ]}
+            }))
+        );
+        assert_eq!(chat.extra["tools"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn compat_responses_m1_allowed_custom_subset_matches_translated_tool_identity() {
+        let chat = responses_request_to_chat(
+            "m",
+            &json!({
+                "input": "Use the permitted tool.",
+                "tools": [{"type": "custom", "name": "apply_patch"},
+                          {"type": "function", "name": "write_state"}],
+                "tool_choice": {"type": "allowed_tools", "mode": "auto", "tools": [
+                    {"type": "custom", "name": "apply_patch"}
+                ]}
+            }),
+        );
+        assert_eq!(
+            chat.extra.get("tool_choice"),
+            Some(&json!({
+                "type": "allowed_tools", "allowed_tools": {"mode": "auto", "tools": [
+                    {"type": "function", "function": {"name": "apply_patch"}}
+                ]}
+            }))
+        );
+    }
+
+    #[test]
+    fn compat_responses_m1_allowed_namespace_subset_uses_flattened_name() {
+        let chat = responses_request_to_chat(
+            "m",
+            &json!({
+                "input": "Use the permitted tool.",
+                "tools": [{"type": "namespace", "name": "fs", "description": "Filesystem tools", "tools": [
+                    {"type": "function", "name": "read"},
+                    {"type": "function", "name": "write"}
+                ]}],
+                "tool_choice": {"type": "allowed_tools", "mode": "required", "tools": [
+                    {"type": "function", "namespace": "fs", "name": "read"}
+                ]}
+            }),
+        );
+        assert_eq!(
+            chat.extra.get("tool_choice"),
+            Some(&json!({
+                "type": "allowed_tools", "allowed_tools": {"mode": "required", "tools": [
+                    {"type": "function", "function": {"name": "fs__read"}}
+                ]}
+            }))
+        );
+    }
+
+    fn compat_responses_assert_shared_control(key: &str, value: Value) {
+        let mut body = json!({"input": "hello"});
+        body[key] = value.clone();
+        let chat = responses_request_to_chat("m", &body);
+        assert!(chat.extra.contains_key(key), "missing shared field {key}");
+        assert_eq!(chat.extra.get(key), Some(&value), "shared field {key}");
+    }
+
+    #[test]
+    fn compat_responses_m2_service_tier_is_preserved() {
+        compat_responses_assert_shared_control("service_tier", json!("priority"));
+    }
+
+    #[test]
+    fn compat_responses_m2_prompt_cache_key_is_preserved() {
+        compat_responses_assert_shared_control("prompt_cache_key", json!("cache-sentinel-17"));
+    }
+
+    #[test]
+    fn compat_responses_m2_prompt_cache_retention_is_preserved() {
+        compat_responses_assert_shared_control("prompt_cache_retention", json!("24h"));
+    }
+
+    #[test]
+    fn compat_responses_m2_safety_identifier_is_preserved() {
+        compat_responses_assert_shared_control("safety_identifier", json!("safety-sentinel-19"));
+    }
+
+    #[test]
+    fn compat_responses_m2_metadata_is_preserved() {
+        compat_responses_assert_shared_control(
+            "metadata",
+            json!({"audit_tag": "metadata-sentinel-23"}),
+        );
+    }
+
+    #[test]
+    fn compat_responses_m2_user_is_preserved() {
+        compat_responses_assert_shared_control("user", json!("legacy-user-sentinel-29"));
+    }
+
+    #[test]
+    fn compat_responses_m2_shared_null_is_distinct_from_omission() {
+        for key in [
+            "service_tier",
+            "prompt_cache_key",
+            "prompt_cache_retention",
+            "safety_identifier",
+            "metadata",
+            "user",
+        ] {
+            compat_responses_assert_shared_control(key, Value::Null);
+            let absent = responses_request_to_chat("m", &json!({"input": "hello"}));
+            assert!(!absent.extra.contains_key(key), "omitted field {key}");
+        }
+    }
+
+    #[test]
+    fn compat_responses_m2_text_controls_preserve_explicit_plain_text_and_verbosity() {
+        let chat = responses_request_to_chat(
+            "m",
+            &json!({
+                "input": "hello", "text": {"format": {"type": "text"}, "verbosity": "low"}
+            }),
+        );
+        assert_eq!(
+            chat.extra.get("response_format"),
+            Some(&json!({"type": "text"}))
+        );
+        assert_eq!(chat.extra.get("verbosity"), Some(&json!("low")));
+    }
+
+    #[test]
+    fn compat_responses_m2_served_tier_comes_from_upstream() {
+        let body = json!({"input": "hello", "service_tier": "priority"});
+        let mut response = chat_response_with(Some("hello"), None, FinishReason::Stop);
+        response.service_tier = Some(aisix_gateway::chat::ServiceTier::OpenAi("default".into()));
+        let rendered = chat_response_to_responses_json(
+            &response,
+            "m",
+            1,
+            &ResponsesReplyContext::from_request(&body),
+        );
+        assert_eq!(rendered.get("service_tier"), Some(&json!("default")));
+    }
+
+    #[test]
+    fn compat_responses_m3_include_and_top_logprobs_map_to_chat() {
+        for top_logprobs in [0, 2] {
+            let chat = responses_request_to_chat(
+                "m",
+                &json!({
+                    "input": "hello", "include": ["message.output_text.logprobs"],
+                    "top_logprobs": top_logprobs
+                }),
+            );
+            assert_eq!(chat.extra.get("logprobs"), Some(&json!(true)));
+            assert_eq!(chat.extra.get("top_logprobs"), Some(&json!(top_logprobs)));
+        }
+        let absent = responses_request_to_chat("m", &json!({"input": "hello"}));
+        assert!(!absent.extra.contains_key("logprobs"));
+        assert!(!absent.extra.contains_key("top_logprobs"));
+    }
+
+    fn compat_responses_token_probability() -> Value {
+        json!({"token": "Hello", "bytes": [72, 101, 108, 108, 111], "logprob": 0.0,
+            "top_logprobs": [{"token": "Hallo", "bytes": [72, 97, 108, 108, 111], "logprob": -0.25}]})
+    }
+
+    fn compat_responses_chat_citation() -> Value {
+        json!({"type": "url_citation", "url_citation": {
+            "start_index": 0, "end_index": 5, "title": "citation-sentinel-31",
+            "url": "https://example.com/citation-31"
+        }})
+    }
+
+    fn compat_responses_output_citation() -> Value {
+        json!({"type": "url_citation", "start_index": 0, "end_index": 5,
+            "title": "citation-sentinel-31", "url": "https://example.com/citation-31"})
+    }
+
+    #[test]
+    fn compat_responses_m3_nonstream_preserves_reported_logprobs() {
+        for probabilities in [json!([]), json!([compat_responses_token_probability()])] {
+            let mut response = chat_response_with(Some("Hello"), None, FinishReason::Stop);
+            response.logprobs = Some(json!({"content": probabilities}));
+            let rendered = chat_response_to_responses_json(&response, "m", 1, &no_custom_tools());
+            let part = &rendered["output"][0]["content"][0];
+            assert!(
+                part.get("logprobs").is_some(),
+                "reported probability field must exist"
+            );
+            assert_eq!(part.get("logprobs"), Some(&probabilities));
+        }
+        let response = chat_response_with(Some("Hello"), None, FinishReason::Stop);
+        let rendered = chat_response_to_responses_json(&response, "m", 1, &no_custom_tools());
+        assert!(rendered["output"][0]["content"][0]
+            .get("logprobs")
+            .is_none());
+    }
+
+    #[test]
+    fn compat_responses_m3_nonstream_flattens_chat_url_citations() {
+        let mut response = chat_response_with(Some("Hello"), None, FinishReason::Stop);
+        response.message.extra.insert(
+            "annotations".into(),
+            json!([compat_responses_chat_citation()]),
+        );
+        let rendered = chat_response_to_responses_json(&response, "m", 1, &no_custom_tools());
+        assert_eq!(
+            rendered["output"][0]["content"][0].get("annotations"),
+            Some(&json!([compat_responses_output_citation()]))
+        );
+    }
+
+    fn compat_responses_stream(
+        probabilities: Option<Value>,
+        citation: bool,
+    ) -> Vec<ResponsesSseEvent> {
+        let mut encoder = ResponsesSseEncoder::new("resp_compat", "m", 1, no_custom_tools());
+        let mut first = content_chunk("Hello");
+        first.logprobs = probabilities.map(|content| json!({"content": content}));
+        if citation {
+            first.delta.extra.insert(
+                "annotations".into(),
+                json!([compat_responses_chat_citation()]),
+            );
+        }
+        let mut events = encoder.next_events(&first);
+        events.extend(encoder.next_events(&answer_chunk(None, true, Some(UsageStats::new(3, 1)))));
+        events
+    }
+
+    #[test]
+    fn compat_responses_m3_stream_delta_done_and_terminal_preserve_probabilities() {
+        let probabilities = json!([compat_responses_token_probability()]);
+        let events = compat_responses_stream(Some(probabilities.clone()), false);
+        for event_type in ["response.output_text.delta", "response.output_text.done"] {
+            let event = events
+                .iter()
+                .find(|event| event.event_type == event_type)
+                .unwrap();
+            assert_eq!(
+                event.data.get("logprobs"),
+                Some(&probabilities),
+                "{event_type}"
+            );
+        }
+        for (event_type, pointer) in [
+            ("response.content_part.done", "/part/logprobs"),
+            ("response.output_item.done", "/item/content/0/logprobs"),
+            (
+                "response.completed",
+                "/response/output/0/content/0/logprobs",
+            ),
+        ] {
+            let event = events
+                .iter()
+                .find(|event| event.event_type == event_type)
+                .unwrap();
+            assert_eq!(
+                event.data.pointer(pointer),
+                Some(&probabilities),
+                "{event_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn compat_responses_m3_stream_without_probabilities_still_has_required_event_arrays() {
+        let events = compat_responses_stream(None, false);
+        for event_type in ["response.output_text.delta", "response.output_text.done"] {
+            let event = events
+                .iter()
+                .find(|event| event.event_type == event_type)
+                .unwrap();
+            assert_eq!(event.data.get("logprobs"), Some(&json!([])), "{event_type}");
+        }
+        let terminal = events
+            .iter()
+            .find(|event| event.event_type == "response.completed")
+            .unwrap();
+        assert!(terminal.data["response"]["output"][0]["content"][0]
+            .get("logprobs")
+            .is_none());
+    }
+
+    #[test]
+    fn compat_responses_m3_stream_preserves_reported_empty_probabilities() {
+        let events = compat_responses_stream(Some(json!([])), false);
+        let terminal = events
+            .iter()
+            .find(|event| event.event_type == "response.completed")
+            .unwrap();
+        assert_eq!(
+            terminal
+                .data
+                .pointer("/response/output/0/content/0/logprobs"),
+            Some(&json!([]))
+        );
+    }
+
+    #[test]
+    fn compat_responses_m3_stream_parts_items_and_terminal_preserve_citations() {
+        let events = compat_responses_stream(None, true);
+        for (event_type, pointer) in [
+            ("response.content_part.done", "/part/annotations"),
+            ("response.output_item.done", "/item/content/0/annotations"),
+            (
+                "response.completed",
+                "/response/output/0/content/0/annotations",
+            ),
+        ] {
+            let event = events
+                .iter()
+                .find(|event| event.event_type == event_type)
+                .unwrap();
+            assert_eq!(
+                event.data.pointer(pointer),
+                Some(&json!([compat_responses_output_citation()])),
+                "{event_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn compat_responses_m4_file_url_reaches_canonical_file_and_anthropic_document() {
+        use aisix_gateway::content_part::{parse_part, ContentPart, Media, MediaKind, MediaSource};
+        let url = "https://example.com/pdf-sentinel-37.pdf";
+        let chat = responses_request_to_chat(
+            "m",
+            &json!({"input": [{"role": "user", "content": [
+                {"type": "input_text", "text": "title-sentinel-37"},
+                {"type": "input_file", "file_url": url}
+            ]}]}),
+        );
+        let blocks = chat.messages[0]
+            .content_blocks
+            .as_ref()
+            .expect("file must survive beside text");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(
+            blocks[0],
+            json!({"type": "text", "text": "title-sentinel-37"})
+        );
+        assert_eq!(
+            parse_part(&blocks[1]).unwrap(),
+            ContentPart::Media(Media {
+                kind: MediaKind::File,
+                source: MediaSource::Uri {
+                    uri: url,
+                    mime_type: Some("application/pdf".into()),
+                    explicit: false
+                }
+            })
+        );
+        let (_, messages) = aisix_provider_anthropic::wire::split_system(&chat).unwrap();
+        let messages = serde_json::to_value(messages).unwrap();
+        assert_eq!(
+            messages[0]["content"][0],
+            json!({"type": "text", "text": "title-sentinel-37"})
+        );
+        assert_eq!(
+            messages[0]["content"][1],
+            json!({"type": "document", "source": {"type": "url", "url": url}})
+        );
+    }
+
+    #[test]
+    fn compat_responses_m4_openai_chat_drops_unrepresentable_file_url_only() {
+        let chat = responses_request_to_chat_with_file_urls(
+            "m",
+            &json!({"input": [{"role": "user", "content": [
+                {"type": "input_text", "text": "file-url-drop-sentinel"},
+                {"type": "input_file", "file_url": "https://example.com/url-only.pdf", "filename": "url-only.pdf"},
+                {"type": "input_file", "file_id": "file-upload-sentinel-41"},
+                {"type": "input_file", "file_id": "https://example.com/caller-supplied-id.pdf"}
+            ]}]}),
+            ResponsesFileUrlPolicy::Unsupported,
+        );
+        let blocks = chat.messages[0].content_blocks.as_ref().unwrap();
+        assert_eq!(
+            blocks,
+            &vec![
+                json!({"type": "text", "text": "file-url-drop-sentinel"}),
+                json!({"type": "file", "file": {"file_id": "file-upload-sentinel-41"}}),
+                json!({"type": "file", "file": {"file_id": "https://example.com/caller-supplied-id.pdf"}}),
+            ]
+        );
+    }
+
+    #[test]
+    fn compat_responses_m4_policy_scans_only_typed_file_content_slots() {
+        let arbitrary = json!({"metadata": {"file_url": "https://example.com/metadata.pdf"},
+            "tools": [{"type": "function", "name": "read", "parameters": {"file_url": "arbitrary"}}],
+            "input": [{"type": "function_call", "name": "read", "arguments": "{\"file_url\":\"arbitrary\"}"},
+                {"role": "user", "content": [{"type": "input_text", "text": "file_url", "file_url": "arbitrary"}]}]
+        });
+        assert!(!responses_has_file_urls(&arbitrary));
+        for output_type in ["function_call_output", "custom_tool_call_output"] {
+            assert!(responses_has_file_urls(
+                &json!({"input": [{"type": output_type,
+                    "call_id": "call_43", "output": [{"type": "input_file", "file_url": "https://example.com/output.pdf"}]
+                }]})
+            ));
+        }
+        assert!(responses_has_file_urls(
+            &json!({"input": [{"type": "message", "role": "user",
+                "content": [{"type": "input_file", "file_url": "https://example.com/input.pdf"}]
+            }]})
+        ));
+    }
+
+    // 仅测试调用点对 Bridge 能力合同的接线，不模拟任何供应商的 HTTP 行为。
+    #[test]
+    fn compat_responses_m4_dispatch_uses_actual_bridge_file_uri_contract() {
+        struct FileContract(bool);
+        #[async_trait::async_trait]
+        impl aisix_gateway::Bridge for FileContract {
+            fn name(&self) -> &'static str {
+                "file-contract-component"
+            }
+            fn reads_file_uris(
+                &self,
+                req: &ChatFormat,
+                ctx: &aisix_gateway::BridgeContext,
+            ) -> bool {
+                assert_eq!(ctx.request_id, "file-contract-sentinel-47");
+                assert_eq!(
+                    req.messages[0].content_blocks.as_ref().unwrap()[1]["file"]["file_id"],
+                    "https://example.com/dispatch-47.pdf"
+                );
+                self.0
+            }
+            async fn chat(
+                &self,
+                _req: &ChatFormat,
+                _ctx: &aisix_gateway::BridgeContext,
+            ) -> Result<ChatResponse, aisix_gateway::BridgeError> {
+                Err(aisix_gateway::BridgeError::InvalidRequest(
+                    "component never dispatches".into(),
+                ))
+            }
+            async fn chat_stream(
+                &self,
+                _req: &ChatFormat,
+                _ctx: &aisix_gateway::BridgeContext,
+            ) -> Result<ChatChunkStream, aisix_gateway::BridgeError> {
+                Err(aisix_gateway::BridgeError::InvalidRequest(
+                    "component never dispatches".into(),
+                ))
+            }
+        }
+        let model =
+            serde_json::from_value(json!({"display_name": "component", "provider": "openai",
+            "model_name": "upstream", "provider_key_id": "component-key"}))
+            .unwrap();
+        let key = serde_json::from_value(
+            json!({"display_name": "component-key", "api_key": "unused-sentinel"}),
+        )
+        .unwrap();
+        let ctx = aisix_gateway::BridgeContext::new(
+            "file-contract-sentinel-47",
+            Arc::new(model),
+            Arc::new(key),
+        );
+        let body = json!({"input": [{"role": "user", "content": [
+            {"type": "input_text", "text": "dispatch-text-sentinel-47"},
+            {"type": "input_file", "file_url": "https://example.com/dispatch-47.pdf"}
+        ]}]});
+        let represented =
+            responses_request_to_chat_for_bridge("m", &body, &FileContract(true), &ctx);
+        assert_eq!(
+            represented.messages[0].content_blocks.as_ref().unwrap()[1],
+            json!({"type": "file", "file": {"file_id": "https://example.com/dispatch-47.pdf"}})
+        );
+        let unsupported =
+            responses_request_to_chat_for_bridge("m", &body, &FileContract(false), &ctx);
+        assert_eq!(
+            unsupported.messages[0].content.as_deref(),
+            Some("dispatch-text-sentinel-47")
+        );
+        assert!(unsupported.messages[0].content_blocks.is_none());
     }
 }

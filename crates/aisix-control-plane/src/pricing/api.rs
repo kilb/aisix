@@ -30,6 +30,7 @@ use uuid::Uuid;
 use super::store::{self, CostRevision, DiscountRevision, NewDiscount};
 use crate::audit::Actor;
 use crate::auth::{OperatorAuth, OperatorRole};
+use crate::billing::calls::CallUsage;
 use crate::db::DbError;
 use crate::error::{ApiError, Detail};
 use crate::http::ApiJson;
@@ -244,6 +245,18 @@ pub struct ChargesQuery {
     model_id: Option<String>,
     /// The charge's `error_code`; `unknown` matches a charge stored with none.
     error_code: Option<String>,
+    from: Option<DateTime<Utc>>,
+    to: Option<DateTime<Utc>>,
+    member_id: Option<String>,
+    provider_key_id: Option<String>,
+    request_id: Option<String>,
+    outcome: Option<String>,
+    http_status: Option<u16>,
+    error_class: Option<String>,
+    cache_hit: Option<bool>,
+    service_tier: Option<String>,
+    operation: Option<String>,
+    final_attempt: Option<bool>,
     limit: Option<i64>,
     /// Only charges with a smaller `seq`: the `next_before` of the previous
     /// page.
@@ -295,9 +308,11 @@ struct ChargeRow {
 
 /// The fields of a charge's usage row an operator reads beside it: what
 /// the caller sent, how the attempt ended, which upstream account and model
-/// served it, and the counters the upstream reported.
+/// served it.
+/// 已记录用量、估算来源与独立长度测量也在此显式投影。
 const CHARGE_EVENT: &str = "jsonb_build_object(\
     'requested_model', ue.event->'requested_model', \
+    'operation', ue.event->'operation', \
     'status_code', ue.event->'status_code', \
     'error_class', ue.event->'error_class', \
     'attempt_kind', ue.event->'attempt_kind', \
@@ -305,6 +320,8 @@ const CHARGE_EVENT: &str = "jsonb_build_object(\
     'is_final_attempt', ue.event->'is_final_attempt', \
     'provider_key_id', ue.event->'provider_key_id', \
     'upstream_model', ue.event->'upstream_model', \
+    'io_audit', ue.event->'io_audit', \
+    'usage_estimated', ue.event->'usage_estimated', \
     'usage', jsonb_build_object(\
         'prompt_tokens', ue.event->'prompt_tokens', \
         'completion_tokens', ue.event->'completion_tokens', \
@@ -328,6 +345,8 @@ struct ChargeItem {
     model_name: Option<String>,
     /// Whether the model the charge names by id is gone.
     model_deleted: bool,
+    /// 调用的操作类型；旧记录未报告时保持未知。
+    operation: Option<String>,
     /// The call's HTTP status; `None` when the row records none.
     status_code: Option<u16>,
     /// The failed attempt's error class; `None` for a success.
@@ -347,10 +366,9 @@ struct ChargeItem {
     upstream_account_deleted: bool,
     /// The upstream model name the account was asked for.
     upstream_model: Option<String>,
-    /// The counters the upstream reported, as the usage row stores them,
-    /// only those it carries: the raw side of `lines`, for checking one
-    /// against the other. `None` when the charge has no usage row.
-    usage: Option<Map<String, Value>>,
+    /// 已记录用量和独立长度参考；估算来源与缺失状态保留在投影中。
+    #[serde(flatten)]
+    usage: CallUsage,
 }
 
 /// A text field of `ev`, `None` when it is missing or empty.
@@ -432,18 +450,6 @@ async fn account_names(
         .collect())
 }
 
-/// The counters a usage row carries, numbers only, absent ones left out.
-fn reported_usage(ev: &Value) -> Option<Map<String, Value>> {
-    let usage = ev.get("usage")?.as_object()?;
-    Some(
-        usage
-            .iter()
-            .filter(|(_, v)| v.is_number())
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect(),
-    )
-}
-
 /// The name and the deleted flag of the model `requested_model_id` names, by
 /// `names`, else by the name the call sent.
 fn shown_model(
@@ -489,9 +495,9 @@ fn model_ids<'a>(raw: impl Iterator<Item = &'a str>) -> Vec<Uuid> {
 /// `attempt_kind`, `attempt_index` and `is_final_attempt` say how its call
 /// ended. `upstream_account_id`, `upstream_account_name` (`null` once the
 /// account is gone; `upstream_account_deleted`) and `upstream_model` say
-/// which upstream served it, and `usage` holds the counters the upstream
-/// reported (only those the row carries), the raw side of `lines`. These
-/// are operators' fields: no tenant view reads them.
+/// which upstream served it. These channel fields are operators' fields.
+/// `usage` 保留事件中的已记录计数，`usage_estimated` 单独说明估算来源；
+/// 长度与文本参考不改写原始用量或计费行。
 pub async fn list_charges(
     auth: OperatorAuth,
     State(state): State<AppState>,
@@ -509,6 +515,29 @@ pub async fn list_charges(
             return Err(refused("exclude_status", "未知的计费状态"));
         }
     }
+    if let (Some(from), Some(to)) = (q.from, q.to) {
+        crate::billing::range::checked_range(from, to, None)?;
+    }
+    let member_id = q
+        .member_id
+        .as_deref()
+        .map(|id| Uuid::parse_str(id).map_err(|_| refused("/member_id", "标识不合法")))
+        .transpose()?;
+    let provider_key_id = q
+        .provider_key_id
+        .as_deref()
+        .map(|id| Uuid::parse_str(id).map_err(|_| refused("/provider_key_id", "标识不合法")))
+        .transpose()?;
+    let filters = crate::usage::CallFilters {
+        outcome: q.outcome,
+        http_status: q.http_status,
+        error_class: q.error_class,
+        cache_hit: q.cache_hit,
+        service_tier: q.service_tier,
+        operation: q.operation,
+        final_attempt: q.final_attempt,
+    };
+    filters.validate(false)?;
     let limit = page_limit(q.limit);
     let mut sql = QueryBuilder::<Postgres>::new(format!(
         "SELECT pc.seq, pc.event_id, pc.tenant_id, pc.api_key_id, pc.user_id, \
@@ -557,6 +586,26 @@ pub async fn list_charges(
                 .push_bind(code.to_string());
         }
     }
+    if let Some(from) = q.from {
+        sql.push(" AND pc.occurred_at >= ").push_bind(from);
+    }
+    if let Some(to) = q.to {
+        sql.push(" AND pc.occurred_at < ").push_bind(to);
+    }
+    if let Some(member) = member_id {
+        sql.push(" AND pc.user_id = ")
+            .push_bind(member)
+            .push("::text");
+    }
+    if let Some(account) = provider_key_id {
+        sql.push(" AND ue.event->>'provider_key_id' = ")
+            .push_bind(account)
+            .push("::text");
+    }
+    if let Some(request) = q.request_id {
+        sql.push(" AND pc.request_id = ").push_bind(request);
+    }
+    filters.push(&mut sql, "pc.service_tier", false);
     sql.push(" ORDER BY pc.seq DESC LIMIT ")
         .push_bind(limit + 1);
     let mut conn = state.db.pool().acquire().await.map_err(DbError::from)?;
@@ -597,9 +646,10 @@ pub async fn list_charges(
                     && account.is_none_or(|a| !a.live),
                 upstream_account_id,
                 upstream_model: ev_text(&ev, "upstream_model"),
-                usage: reported_usage(&ev),
+                usage: CallUsage::from_event(&ev),
                 model_name,
                 model_deleted,
+                operation: ev_text(&ev, "operation"),
                 status_code: ev
                     .get("status_code")
                     .and_then(Value::as_u64)

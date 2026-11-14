@@ -382,6 +382,7 @@ pub(crate) fn error_class(err: &ProxyError) -> &'static str {
 /// [`error_class`], which every record of a failed request goes through.
 pub(crate) fn routing_error_class(err: &BridgeError) -> &'static str {
     match err {
+        BridgeError::DependencyUnavailable => "dependency_unavailable",
         BridgeError::Timeout { .. } => "timeout",
         BridgeError::UpstreamStatus { .. } => "upstream_status",
         BridgeError::UpstreamDecode(_)
@@ -883,6 +884,7 @@ mod tests {
     fn every_bridge_error_declares_its_side_of_the_network_and_its_class() {
         for err in bridge_error_samples() {
             let (reached, class) = match &err {
+                BridgeError::DependencyUnavailable => (false, "dependency_unavailable"),
                 // A timeout or a refused connection IS upstream health: we
                 // tried to reach the provider and could not. Excluding these
                 // would hide the outage the family exists to show.

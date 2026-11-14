@@ -272,21 +272,17 @@ export function Members({
         />}
       />
       {createdNotice && <div className="note ok mb-3" role="status">{createdNotice}</div>}
-      <BentoGrid>
+      <BentoGrid className="tenant-members">
         <Card className={active ? span.d5Wide : span.d12}>
           <CardHeader number={1} title="当前成员" />
           <p className="hint">含估算用量：上游未完整返回用量，部分 token 由网关估算，费用按该用量计费。</p>
-          <RecordTableToolbar search={{ value: memberTable.query, onChange: memberTable.setQuery, label: "搜索成员", placeholder: "显示名或邮箱" }}>
-            <Field label="成员角色"><select value={roleFilter} onChange={(e) => setRoleFilter(e.target.value)}><option value="">全部角色</option>{(["owner", "admin", "member", "billing"] as const).map((role) => <option key={role} value={role}>{ROLE_LABEL[role]}</option>)}</select></Field>
-            <Field label="成员状态"><select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}><option value="">全部状态</option><option value="active">正常</option><option value="disabled">已被平台停用</option></select></Field>
-          </RecordTableToolbar>
           {people === null ? (listErr ? <CardMessage onRetry={() => void load()}>成员读取失败，请重试。</CardMessage> : <MetricSkeleton />) : <>
             <Metric size="hero">{formatCount(people.length)}</Metric>
             <CardFooter>
               <dl className="grid grid-cols-2 gap-x-7 gap-y-5">
                 {(["owner", "admin", "member", "billing"] as const).map((role) => (
                   <div key={role} className="border-t border-ink/7 pt-3">
-                    <dt className="font-mono text-meta text-ink-soft">{ROLE_LABEL[role]}</dt>
+                    <dt className="text-caption text-ink-soft">{ROLE_LABEL[role]}</dt>
                     <dd className="mt-2 text-stat tabular-nums">{formatCount(people.filter((person) => person.role === role).length)} 人</dd>
                   </div>
                 ))}
@@ -306,11 +302,15 @@ export function Members({
                     accessibleLabel={rankedUsage[0] ? `当前成员中，本月最高已计费费用为 ${fmtMicroCny(rankedUsage[0].amount)}，展示费用前 ${formatCount(rankedBars.length)} 位` : "当前没有组织成员"}
                     emptyLabel="当前没有成员费用"
                   />}
-            {usage && <p className="mt-4 break-words font-mono text-micro text-ink-soft">{fmtBeijing(usage.from)} 至 {fmtBeijing(usage.to)}，不含已离开成员及无成员归属的调用；不含未计价费用，可能含估算用量。</p>}
+            {usage && <p className="mt-4 break-words text-caption text-ink-soft">{fmtBeijing(usage.from)} 至 {fmtBeijing(usage.to)}，不含已离开成员及无成员归属的调用；不含未计价费用，可能含估算用量。</p>}
           </CardFooter>
         </Card>}
-        <Card className={span.d12}>
+        <Card className={`${span.d12} tenant-members-list`}>
           <CardHeader number={active ? 3 : 2} title="组织成员" description={active ? "本月用量按 UTC+8 月初至当前时间统计；成员额度按各自周期计算。" : undefined} />
+          <RecordTableToolbar search={{ value: memberTable.query, onChange: memberTable.setQuery, label: "搜索成员", placeholder: "显示名或邮箱" }}>
+            <Field label="成员角色"><select value={roleFilter} onChange={(e) => setRoleFilter(e.target.value)}><option value="">全部角色</option>{(["owner", "admin", "member", "billing"] as const).map((role) => <option key={role} value={role}>{ROLE_LABEL[role]}</option>)}</select></Field>
+            <Field label="成员状态"><select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}><option value="">全部状态</option><option value="active">正常</option><option value="disabled">已被平台停用</option></select></Field>
+          </RecordTableToolbar>
           {!active && <div className="note crit">组织已被停用；这里只能移除成员。</div>}
           {active && usageErr && <div className="note crit" role="alert">成员用量读取失败：{usageErr}</div>}
           {active && budgetsErr && <div className="note crit" role="alert">成员额度读取失败：{budgetsErr}</div>}
@@ -327,7 +327,7 @@ export function Members({
           {people === null ? (
             !listErr && <Loading />
           ) : (
-            <DataTable>
+            <DataTable label="组织成员">
               <thead>
                 <tr>
                   <th>显示名</th>
@@ -348,18 +348,18 @@ export function Members({
                   const memberUsageRow = usageByMember.get(m.id);
                   return (
                     <tr key={m.id}>
-                      <td>
+                      <td data-label="显示名">
                         <span className="trunc" title={m.display_name ?? undefined}>
                           {m.display_name ?? "—"}
                           {self && <span className="self">（我）</span>}
                         </span>
                       </td>
-                      <td>
+                      <td data-label="邮箱">
                         <span className="trunc" style={{ "--trunc": "240px" } as CSSProperties} title={m.email}>
                           {m.email}
                         </span>
                       </td>
-                      <td>
+                      <td data-label="角色">
                         {active && manages(m) ? (
                           <span className="acts">
                             <select
@@ -407,20 +407,20 @@ export function Members({
                           (ROLE_LABEL[m.role] ?? m.role)
                         )}
                       </td>
-                      <td>
+                      <td data-label="状态">
                         <Lamp state={m.disabled ? "disabled" : "applied"}>{m.disabled ? "已被平台停用" : "正常"}</Lamp>
                       </td>
-                      <td>
+                      <td data-label="本月用量">
                         {!active ? <span className="hint">组织未启用，无法读取用量</span> : usageErr ? <span className="hint">用量读取失败</span>
                           : usage === null ? <span className="hint">用量载入中…</span>
                             : memberUsageRow ? <UsageCell usage={memberUsageRow} /> : <span className="hint">暂无用量数据</span>}
                       </td>
-                      <td>
+                      <td data-label="成员额度">
                         {!active ? <span className="hint">组织未启用，无法读取额度</span> : budgetsErr ? <span className="hint">额度读取失败</span>
                           : budgets === null ? <span className="hint">额度载入中…</span>
                             : <BudgetCell budgets={budgetsByMember.get(m.id) ?? []} />}
                       </td>
-                      <td className="right">
+                      <td className="right [&_.btn]:h-auto [&_.btn]:min-h-11 [&_.btn]:whitespace-normal [&_.btn]:px-2 [&_.btn]:py-2" data-label="操作">
                         {manages(m) && (
                           <TwoStep
                             label="移除"
@@ -457,7 +457,7 @@ export function Members({
             ) : invites.length === 0 ? (
               <EmptyState mark="mail" text="没有待接受的邀请。" />
             ) : (
-              <DataTable>
+              <DataTable label="待接受的邀请">
                 <thead>
                   <tr>
                     <th>邮箱</th>
@@ -474,19 +474,19 @@ export function Members({
                     const by = inv.invited_by === null ? "平台" : (inv.invited_by.display_name ?? "成员");
                     return (
                       <tr key={inv.id}>
-                        <td>
+                        <td data-label="邮箱">
                           <span className="trunc" style={{ "--trunc": "240px" } as CSSProperties} title={inv.email}>
                             {inv.email}
                           </span>
                         </td>
-                        <td>{ROLE_LABEL[inv.role] ?? inv.role}</td>
-                        <td>
+                        <td data-label="角色">{ROLE_LABEL[inv.role] ?? inv.role}</td>
+                        <td data-label="邀请人">
                           <span className="trunc" title={by}>
                             {by}
                           </span>
                         </td>
-                        <td className="tabular">{when(inv.expires_at)}</td>
-                        <td className="right">
+                        <td className="tabular" data-label="有效期至">{when(inv.expires_at)}</td>
+                        <td className="right" data-label="操作">
                           {(isOwner || inv.role !== "owner") && (
                             <Button
                               size="sm"
@@ -566,7 +566,7 @@ function InviteForm({
   return (
     <Card className={span.d5Wide}>
       <CardHeader number={5} title="邀请成员" description="生成邀请链接，由新成员自行设置登录口令。" />
-      <form className="grid min-w-0 gap-5" onSubmit={submit}>
+      <form className="tenant-form grid min-w-0 gap-5" onSubmit={submit}>
         <Field label="邮箱">
           <input type="email" required value={email} onChange={(e) => setEmail(e.target.value)} />
         </Field>
@@ -584,7 +584,7 @@ function InviteForm({
             {err}
           </div>
         )}
-        <CardFooter className="col-span-full flex justify-end border-t border-ink/7 pt-5">
+        <CardFooter className="tenant-form-actions col-span-full">
           <Button kind="primary" type="submit" busy={busy}>
             邀请成员
           </Button>

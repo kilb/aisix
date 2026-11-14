@@ -72,16 +72,16 @@ function GroupMatrix({ row }: { row: ModelGroupPriceRow | null }) {
       </thead>
       <tbody>
         {row.groups.map((g) => (
-          <tr key={g.group_id} data-state={g.input_per_million_cny === undefined ? "unpriced" : "priced"}>
-            <td>{g.display_name}</td>
-            <td className="num tabular">
+          <tr data-finance-record key={g.group_id} data-state={g.input_per_million_cny === undefined ? "unpriced" : "priced"}>
+            <td data-label="分组">{g.display_name}</td>
+            <td data-label="输入（元/百万）" className="num tabular">
               {g.input_per_million_cny === undefined ? (
                 <span className="cell-note">分组未设换算率</span>
               ) : (
                 fmtCnyPerMillion(g.input_per_million_cny)
               )}
             </td>
-            <td className="num tabular">
+            <td data-label="输出（元/百万）" className="num tabular">
               {g.output_per_million_cny === undefined ? (
                 <span className="cell-note">分组未设换算率</span>
               ) : (
@@ -290,9 +290,7 @@ export function Baselines({ canEdit, onGoto }: TabProps) {
             <Button type="button" onClick={() => onGoto("pricing", "imports")}>
               去「导入审核」确认第三方数据
             </Button>
-            <Button type="button" icon="refresh" onClick={() => void load()}>
-              刷新
-            </Button>
+            <Button className="finance-icon-button" aria-label="刷新" title="刷新" type="button" icon="refresh" onClick={() => void load()}></Button>
           </>
         }
       />
@@ -373,12 +371,12 @@ export function Baselines({ canEdit, onGoto }: TabProps) {
                   {records.rows.map((r) => {
                     const rates = headline(r.current?.card ?? null);
                     return (
-                      <tr
+                      <tr data-finance-record
                         key={r.model_id}
                         data-state={r.current ? "priced" : "unpriced"}
                         className={selected === r.model_id ? "bg-well" : undefined}
                       >
-                        <td>
+                        <td data-label="模型">
                           <button
                             type="button"
                             className="link-button"
@@ -392,7 +390,7 @@ export function Baselines({ canEdit, onGoto }: TabProps) {
                             <span className="cell-note baseline-update">{catalogueUpdateWords(r.catalogue_update).row}</span>
                           )}
                         </td>
-                        <td className="num">
+                        <td data-label="输入" className="num">
                           {!r.current ? (
                             <span className="baseline-unpriced">未定价</span>
                           ) : rates ? (
@@ -401,11 +399,11 @@ export function Baselines({ canEdit, onGoto }: TabProps) {
                             "—"
                           )}
                         </td>
-                        <td className="num">
+                        <td data-label="输出" className="num">
                           {!r.current ? "—" : rates ? <span className="tabular">{usdPerMillion(rates.output)}</span> : "—"}
                         </td>
-                        <td>{r.current ? <BaselineSourceBadge revision={r.current} /> : "—"}</td>
-                        <td className="tabular">
+                        <td data-label="来源">{r.current ? <BaselineSourceBadge revision={r.current} /> : "—"}</td>
+                        <td data-label="生效时间" className="tabular">
                           {r.current ? fmtBeijing(r.current.effective_from) : "—"}
                           {r.upcoming.length > 0 && (
                             <span className="cell-note">
@@ -413,7 +411,7 @@ export function Baselines({ canEdit, onGoto }: TabProps) {
                             </span>
                           )}
                         </td>
-                        <td className="num">{r.upcoming.length}</td>
+                        <td data-label="待生效" className="num">{r.upcoming.length}</td>
                       </tr>
                     );
                   })}

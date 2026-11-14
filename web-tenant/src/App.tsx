@@ -12,7 +12,7 @@ import { EXPECTED_API_CONTRACT } from "./lib/contract";
 import { messageFor } from "./lib/errors";
 import { useTheme } from "./lib/useTheme";
 import { Button } from "./ui/Button";
-import { UserRound } from "lucide-react";
+import { Activity, ChartNoAxesCombined, KeyRound, LayoutDashboard, Layers3, ReceiptText, UsersRound, Wallet, UserRound } from "lucide-react";
 import { AccountSettings } from "./AccountSettings";
 import { PORTAL_TABS as TABS, canSeePortalTab, portalRouteOf as routeOf, type PortalTabId } from "./lib/navigation";
 import { RouteNav } from "./ui/RouteNav";
@@ -28,6 +28,8 @@ import { Prices } from "./Prices";
 import { Usage } from "./Usage";
 
 export type TabId = PortalTabId;
+
+const NAV_ICONS = { org: LayoutDashboard, usage: ChartNoAxesCombined, calls: Activity, keys: KeyRound, prices: Layers3, budgets: Wallet, billing: ReceiptText, members: UsersRound, account: UserRound } as const;
 
 interface SignedIn {
   member: SessionMember;
@@ -165,7 +167,7 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
     );
   }
 
-  if (apiContract === null) return <div className="boot">载入中…</div>;
+  if (apiContract === null) return <div className="boot" role="status">载入中…</div>;
 
   // A skew stops everything, reads included: this build's idea of the API's
   // shapes no longer holds, so whatever it shows or sends could be misread.
@@ -222,7 +224,7 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
       navigation={(close) => visible.length > 0 && (
         <RouteNav
           label="组织门户分区"
-          items={visible.filter((item) => item.id !== "account")}
+          items={visible.filter((item) => item.id !== "account").map((item) => ({ ...item, icon: NAV_ICONS[item.id] }))}
           current={current}
           onSelect={(next) => {
             openSection(next);
@@ -266,7 +268,7 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
         </div>
       )}
 
-      <main className="page shell-content">
+      <main id="workspace-main" tabIndex={-1} className="page shell-content">
         <section
           key={`${tenant.id}:${member.id}:${member.role}:${tenant.status}`}
           id={`tab-${current}`}

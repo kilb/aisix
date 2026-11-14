@@ -61,36 +61,27 @@
 //!   user-facing passthrough and hit the identical "route missing from
 //!   the list" bug.
 
+use crate::request_json::Json;
+use crate::request_json::JsonRejection;
 use aisix_obs::AccessLog;
-use axum::extract::rejection::JsonRejection;
 use axum::extract::State;
 use axum::http::{HeaderName, HeaderValue};
 use axum::response::Response;
-use axum::Json;
 use serde_json::Value;
 use std::time::{Duration, Instant};
 
-use crate::auth::AuthenticatedKey;
+use crate::auth::{AnthropicAuthenticatedKey, AuthenticatedKey};
 use crate::client_ip::ClientContext;
 use crate::error::ProxyError;
-use crate::messages::ANTHROPIC_VERSION;
 use crate::state::ProxyState;
 
 pub async fn count_tokens(
     State(state): State<ProxyState>,
-    auth: Result<AuthenticatedKey, ProxyError>,
+    AnthropicAuthenticatedKey(auth): AnthropicAuthenticatedKey,
     client: ClientContext,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Response {
-    // Auth / body-extractor rejections must render the Anthropic-shape
-    // envelope so the Claude SDK's parser recognises them (#336) — same
-    // policy as /v1/messages. The shared helper keeps the body-rejection
-    // discrimination (malformed JSON vs 413 cap vs transport error) in
-    // lockstep with the sibling route.
-    let auth = match auth {
-        Ok(a) => a,
-        Err(e) => return e.into_anthropic_response(),
-    };
+    // 认证提取器先短路失败；请求体错误与 Messages 共用 Anthropic 错误分类。
     let started = Instant::now();
     let Json(mut body) = match body {
         Ok(j) => j,
@@ -558,7 +549,15 @@ async fn dispatch(
 
     // Platform mode: nothing the request names may be an object stored
     // upstream for another tenant.
-    crate::stored_refs::refuse_in_messages(state.platform(), body)?;
+    crate::native_api::anthropic::refuse_messages_references(
+        state,
+        snapshot,
+        auth,
+        client,
+        body,
+        aisix_core::models::EndpointFamily::CountTokens,
+    )
+    .await?;
 
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
@@ -1034,7 +1033,7 @@ async fn count_tokens_to_target(
     headers.insert(HeaderName::from_static("x-api-key"), api_key_hv);
     headers.insert(
         HeaderName::from_static("anthropic-version"),
-        HeaderValue::from_static(ANTHROPIC_VERSION),
+        crate::messages::client_anthropic_version(client),
     );
     headers.insert(
         axum::http::header::CONTENT_TYPE,
@@ -1065,14 +1064,14 @@ async fn count_tokens_to_target(
         req = req.timeout(d);
     }
     let send_started = Instant::now();
-    let upstream_resp = req
-        .send()
-        .await
-        .map_err(|e| {
-            state.health.record_failure(&model.display_name);
-            crate::dispatch::reqwest_error_to_bridge(&e, send_started)
-        })
-        .map_err(ProxyError::Bridge)?;
+    let upstream_resp =
+        aisix_gateway::upstream_io::send(req, aisix_gateway::upstream_io::Protocol::Messages)
+            .await
+            .map_err(|e| {
+                state.health.record_failure(&model.display_name);
+                crate::dispatch::reqwest_error_to_bridge(&e, send_started)
+            })
+            .map_err(ProxyError::Bridge)?;
     aisix_gateway::note_upstream_response(upstream_resp.headers());
 
     let status = upstream_resp.status();
@@ -1189,7 +1188,7 @@ async fn platform_count_tokens(
         })
         .map_err(ProxyError::Bridge)?;
     state.health.record_success(&model.display_name);
-    let mut resp = axum::response::IntoResponse::into_response(axum::Json(counted));
+    let mut resp = axum::response::IntoResponse::into_response(crate::request_json::Json(counted));
     if let Ok(hv) = HeaderValue::from_str(request_id) {
         resp.headers_mut()
             .insert(HeaderName::from_static("x-aisix-request-id"), hv);
@@ -1334,9 +1333,47 @@ fn emit_access_log(
         response_body_bytes: None,
     });
 }
-
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn compat_claude_native_count_tokens_preserves_version() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages/count_tokens"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"input_tokens":17})),
+            )
+            .mount(&upstream)
+            .await;
+        for version in [None, Some("2023-06-01"), Some("2026-10-21")] {
+            let snap = new_snap(&upstream.uri());
+            snap.models.insert(anthropic_model("claude"));
+            snap.apikeys.insert(apikey_entry(&["*"]));
+            let mut req = make_req(
+                serde_json::json!({"model":"claude","messages":[{"role":"user","content":"hi"}]}),
+            );
+            req.headers_mut().remove("anthropic-version");
+            if let Some(v) = version {
+                req.headers_mut()
+                    .insert("anthropic-version", v.parse().unwrap());
+            }
+            let response = build_app(snap).oneshot(req).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let _ = to_bytes(response.into_body(), 65536).await.unwrap();
+            let requests = upstream.received_requests().await.unwrap();
+            assert_eq!(
+                requests
+                    .last()
+                    .unwrap()
+                    .headers
+                    .get("anthropic-version")
+                    .unwrap(),
+                version.unwrap_or("2023-06-01")
+            );
+        }
+    }
+
     use aisix_core::resource::ResourceEntry;
     use aisix_core::snapshot::SnapshotHandle;
     use aisix_core::{AisixSnapshot, ApiKey, Model, ProxyConfig};

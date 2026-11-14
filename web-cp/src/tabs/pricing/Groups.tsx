@@ -18,6 +18,7 @@ import { BentoGrid, Card, CardHeader, CardMessage, Metric, MetricSkeleton, PageH
 import { Sheet, SheetContent } from "../../components/ui/sheet";
 import { GroupDetail } from "./GroupDetail";
 import { Count, FormGrid } from "./kit";
+import { Pencil } from "lucide-react";
 
 /** What the operator reads for each count a refusal carries, in the order the page shows them. */
 const COUNT_WORDS: [keyof GroupUseCounts, string][] = [
@@ -126,9 +127,7 @@ export function Groups({ canEdit }: TabProps) {
         description="一个分组给同一批上游账号定一个换算率：模型的官方美元价 × 这个分组在模型上的换算率（没有时为分组默认），就是租户付的人民币价（租户折扣另算）。密钥在创建时选一个分组，此后只路由到该分组的上游账号。"
         actions={
           <>
-            <Button type="button" icon="refresh" onClick={() => void load()}>
-              刷新
-            </Button>
+            <Button type="button" icon="refresh" className="finance-icon-button" aria-label="刷新" title="刷新分组" onClick={() => void load()} />
             {canEdit && (
               <Button type="button" kind="primary" icon="plus" onClick={() => setCreating(true)}>
                 新建分组
@@ -177,21 +176,18 @@ export function Groups({ canEdit }: TabProps) {
           <RecordTableToolbar search={{ value: records.query, onChange: records.setQuery, label: "搜索分组", placeholder: "显示名、路由名或 ID" }}>
             <label className="f filter"><span>默认换算率</span><select value={rateState} onChange={(e) => setRateState(e.target.value)}><option value="">全部</option><option value="configured">已设置</option><option value="missing">未设置</option><option value="scheduled">有待生效版本</option></select></label>
           </RecordTableToolbar>
-          <DataTable label="分组">
+          <DataTable label="分组" tableClassName="finance-groups-table">
             <thead>
               <tr>
-                <th>显示名</th>
-                <th>路由名</th>
+                <th>分组</th>
                 <th>说明</th>
                 <th className="num">默认换算率</th>
-                <th className="num">租户</th>
-                <th className="num">密钥</th>
-                <th className="num">上游账号</th>
+                <th>关联资源</th>
                 <th className="right">操作</th>
               </tr>
             </thead>
             <tbody>
-              {records.rows.length === 0 && <tr><td colSpan={8}><EmptyState text="没有符合筛选条件的分组" /></td></tr>}
+              {records.rows.length === 0 && <tr><td colSpan={5}><EmptyState text="没有符合筛选条件的分组" /></td></tr>}
               {records.rows.map((g) => (
                 <GroupRowView
                   key={g.id}
@@ -279,8 +275,8 @@ function GroupRowView({
   const later = scheduled(group.default_rate);
   return (
     <>
-      <tr>
-        <td>
+      <tr data-finance-record>
+        <td data-label="分组">
           <button type="button" className="link-button" title={group.display_name} onClick={onOpen}>
             {group.display_name}
           </button>
@@ -289,27 +285,26 @@ function GroupRowView({
               默认分组
             </span>
           )}
+          <span className="cell-note mono">{group.name}</span>
         </td>
-        <td>
-          <span className="mono">{group.name}</span>
-        </td>
-        <td>
+        <td data-label="说明">
           <span className="trunc text-text-2" title={group.description}>
             {group.description || "—"}
           </span>
         </td>
-        <td className="num">
+        <td data-label="默认换算率" className="num">
           <span className="tabular">{currentRate(group.default_rate)}</span>
           {later && <span className="cell-note">待生效 {later}</span>}
         </td>
-        <td className="num">{group.tenants}</td>
-        <td className="num">{group.keys}</td>
-        <td className="num">{group.provider_keys.length}</td>
-        <td className="right">
+        <td data-label="关联资源"><span className="finance-resource-count">租户 <strong>{group.tenants}</strong></span>
+          <span className="finance-resource-count">密钥 <strong>{group.keys}</strong></span>
+          <span className="finance-resource-count">上游账号 <strong>{group.provider_keys.length}</strong></span>
+        </td>
+        <td data-label="操作" className="right">
           {canEdit && (
             <span className="row-actions">
-              <Button size="sm" onClick={() => setEditing((v) => !v)} aria-expanded={editing}>
-                编辑
+              <Button size="sm" kind="quiet" className="finance-icon-button" aria-label="编辑" title="编辑分组" onClick={() => setEditing((v) => !v)} aria-expanded={editing}>
+                <Pencil aria-hidden />
               </Button>
               {!group.is_default && (
                 <TwoStep label="设为默认分组" size="sm" busy={busy} onConfirm={() => void makeDefault()} />
@@ -327,7 +322,7 @@ function GroupRowView({
       </tr>
       {editing && canEdit && (
         <tr className="dt-detail">
-          <td colSpan={8} className="!px-6 !pb-4">
+          <td colSpan={5} className="!px-6 !pb-4">
             <EditGroup
               group={group}
               onDone={async () => {

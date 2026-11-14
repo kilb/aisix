@@ -6,7 +6,7 @@ import { charges, tenants as tenantsApi, type AdminKey, type Charge, type Charge
 import { chargeReason } from "../../lib/chargeReason";
 import { errorText } from "../../lib/fmt";
 import { fmtMicroCny } from "../../lib/money";
-import { fmtBeijing } from "../../lib/time";
+import { beijingInputValue, fmtBeijing, parseBeijingInput } from "../../lib/time";
 import { modelText, reasonLabel } from "../../lib/pricingStatus";
 import { chargeFromLines, dimensionLabel, lineUsd, rateText, reportedCounters, usageSummary } from "../../lib/chargeUsage";
 import { usdRateText } from "../../lib/rateUnits";
@@ -19,6 +19,11 @@ import { useHashQuery } from "../../lib/useHashQuery";
 import { currentQueryResult, type QueryResult } from "../../lib/queryResult";
 import { chargesQuery } from "../../lib/analysisNavigation";
 import { cn } from "../../lib/cn";
+import { ChevronDown, RotateCcw } from "lucide-react";
+import { UsageIoAuditDetails } from "../../components/UsageIoAuditDetails";
+import { UsageRecordFilters } from "../../components/UsageRecordFilters";
+import { usageRecordFilterValues } from "../../lib/usageRecordFilters";
+import "./Charges.css";
 
 const STATUSES: [string, string][] = [
   ["charged", "已计价"],
@@ -29,7 +34,6 @@ const STATUSES: [string, string][] = [
 
 const statusLabel = (s: string) => STATUSES.find(([v]) => v === s)?.[1] ?? s;
 
-// 桌面/平板：12 列完整记录表，窄屏在卡片内横向滚动。
 /**
  * 计费明细 (under 计费): every charge with its pricing reason, the upstream
  * account and model that served it and its usage, filterable and paged. A
@@ -37,9 +41,7 @@ const statusLabel = (s: string) => STATUSES.find(([v]) => v === s)?.[1] ?? s;
  * counters the upstream reported, and the charge recomputed from the lines
  * by the engine's formula beside the amount billed. A link
  * from 计价状态 opens it on that kind's calls (its status, reason and model).
- * The charges list filters by none of the rest of a 计价状态 row's scope (its
- * group or tier, the last 24 hours, corrected calls left out), so the filter
- * says it is wider and its rows need not add up to that row's count.
+ * 时间、调用结果与身份条件均由服务端在分页前筛选；重计价后的记录仍然可见。
  */
 export function Charges(_props: TabProps) {
   const [query, update] = useHashQuery();
@@ -142,12 +144,10 @@ export function Charges(_props: TabProps) {
           </>
         }
         actions={
-          <Button type="button" icon="refresh" onClick={() => void loadFirst(filter)}>
-            刷新
-          </Button>
+          <Button className="finance-icon-button" aria-label="刷新" title="刷新" type="button" icon="refresh" onClick={() => void loadFirst(filter)}></Button>
         }
       />
-      {(query.has("from") || query.has("to") || query.has("member_id")) && <p className="note warn" role="status">调用记录接口不支持按时间或成员筛选；此处保留模型、组织和密钥筛选，记录范围比分析页更宽，不应用其时间或成员条件。</p>}
+      {(filter.from || filter.to || filter.member_id || filter.provider_key_id || filter.request_id) && <p className="hint" role="status">当前已应用范围条件：{[filter.from ? "开始 " + fmtBeijing(filter.from) : null, filter.to ? "结束 " + fmtBeijing(filter.to) + "（不含）" : null, filter.member_id ? "成员 " + filter.member_id : null, filter.provider_key_id ? "上游账号 " + filter.provider_key_id : null, filter.request_id ? "请求 " + filter.request_id : null].filter(Boolean).join("；")}</p>}
       <BentoGrid>
       <Card className={span.d12}>
         <CardHeader
@@ -231,9 +231,11 @@ export function Charges(_props: TabProps) {
             </Button>
           </div>
         </form>
+        <UsageRecordFilters scope="admin" value={usageRecordFilterValues(query)} onChange={patch => update(patch)} />
+        <ChargeScopeFilters key={JSON.stringify([filter.from, filter.to, filter.member_id, filter.provider_key_id, filter.request_id, filter.model_id])} filter={filter} onChange={set} />
         {linked.length > 0 && (
           <div className="mt-3 flex flex-wrap items-center gap-3 rounded-cell border border-border bg-well/50 px-3 py-2" role="status">
-            <span className="hint">只看 {linked.join("，")}（不限分组/档位与时间，也含已通过重计价更正的调用，条数可能与计价状态的次数不同）</span>
+            <span className="hint">只看 {linked.join("，")}（按上述筛选查询，也含已通过重计价更正的调用，条数可能与计价状态的次数不同）</span>
             <Button type="button" size="sm" className="ml-auto" onClick={() => set({ error_code: undefined, model_id: undefined })}>
               清除
             </Button>
@@ -249,18 +251,13 @@ export function Charges(_props: TabProps) {
         {rows !== null && rows.length > 0 && (
           <>
             <RecordTools table={table} label="计费明细" loaded></RecordTools>
-            <DataTable label="计费明细" scroll>
+            <DataTable label="计费明细" className="charge-records" tableClassName="charge-records-table">
               <thead>
                 <tr>
-                  <th>时间</th>
-                  <th>租户</th>
-                  <th>模型</th>
-                  <th>状态</th>
-                  <th>原因</th>
-                  <th className="num">售价（元）</th>
-                  <th className="num">成本（元）</th>
-                  <th>档位</th>
-                  <th>上游</th>
+                  <th>调用 / 租户</th>
+                  <th>计价结果</th>
+                  <th className="num">费用（元）</th>
+                  <th>服务 / 档位</th>
                   <th>用量</th>
                   <th className="right">
                     <span className="vh">复核</span>
@@ -272,26 +269,29 @@ export function Charges(_props: TabProps) {
                   const shown = open.has(c.seq);
                   return (
                     <Fragment key={c.seq}>
-                      <tr>
-                        <td className="tabular text-muted-foreground">{fmtBeijing(c.occurred_at)}</td>
-                        <td>{tenantName(c.tenant_id)}</td>
-                        <td className="font-medium">{modelText(c.model_name, c.model_deleted)}</td>
-                        <td>{statusLabel(c.status)}</td>
-                        <td>{chargeReason(c)}</td>
-                        <td className="num">{c.charge_micro_cny === null ? "—" : fmtMicroCny(c.charge_micro_cny)}</td>
-                        <td className="num">{c.cost_micro_cny === null ? "—" : fmtMicroCny(c.cost_micro_cny)}</td>
-                        <td>{c.service_tier ?? "—"}</td>
-                        <td>
-                          <Upstream c={c} />
+                      <tr data-finance-record>
+                        <td data-label="调用 / 租户"><span className="font-medium">{modelText(c.model_name, c.model_deleted)}</span>
+                          <span className="cell-note">{tenantName(c.tenant_id)}</span>
+                          <span className="cell-note tabular">{fmtBeijing(c.occurred_at)}</span>
                         </td>
-                        <td className="tabular text-caption">{usageSummary(c.usage) ?? "—"}</td>
-                        <td className="right">
+                        <td data-label="计价结果">{statusLabel(c.status)}<span className="cell-note">{chargeReason(c)}</span></td>
+                        <td data-label="费用（元）" className="num"><span className="finance-amount-label">售价</span><span className="finance-amount-value">{c.charge_micro_cny === null ? "—" : fmtMicroCny(c.charge_micro_cny)}</span>
+                          <span className="cell-note">成本 {c.cost_micro_cny === null ? "—" : fmtMicroCny(c.cost_micro_cny)}</span>
+                        </td>
+                        <td data-label="服务 / 档位">
+                          <Upstream c={c} />
+                          <span className="cell-note">档位 {c.service_tier ?? "—"}</span>
+                        </td>
+                        <td data-label="用量" className="tabular text-caption">{usageSummary(c.usage) ?? "—"}</td>
+                        <td data-label="复核" className="right">
                           <Button
                             kind="quiet"
                             size="sm"
                             aria-expanded={shown}
                             aria-controls={`charge-check-${c.seq}`}
                             aria-label={`${shown ? "收起" : "展开"}用量明细 ${c.event_id}`}
+                            title={shown ? "收起用量明细" : "展开用量明细"}
+                            className="finance-icon-button"
                             onClick={() =>
                               setOpen((prev) => {
                                 const next = new Set(prev);
@@ -301,13 +301,13 @@ export function Charges(_props: TabProps) {
                               })
                             }
                           >
-                            {shown ? "收起" : "明细"}
+                            <ChevronDown aria-hidden style={{ transform: shown ? "rotate(180deg)" : undefined }} />
                           </Button>
                         </td>
                       </tr>
                       {shown && (
                         <tr className="dt-detail" id={`charge-check-${c.seq}`}>
-                          <td colSpan={11}>
+                          <td colSpan={6}>
                             <ChargeCheck c={c} />
                           </td>
                         </tr>
@@ -325,6 +325,39 @@ export function Charges(_props: TabProps) {
       </BentoGrid>
     </>
   );
+}
+
+/** 日期按北京时间录入；相关条件一次应用，避免输入半成品时改变查询范围。 */
+function ChargeScopeFilters({ filter, onChange }: { filter: ChargeFilter; onChange: (patch: ChargeFilter) => void }) {
+  const dateValue = (value: string | undefined) => value && Number.isFinite(Date.parse(value)) ? beijingInputValue(new Date(value)) : value ?? "";
+  const [draft, setDraft] = useState({ from: dateValue(filter.from), to: dateValue(filter.to), member_id: filter.member_id ?? "", provider_key_id: filter.provider_key_id ?? "", request_id: filter.request_id ?? "", model_id: filter.model_id ?? "" });
+  const [error, setError] = useState("");
+  const active = Boolean(filter.from || filter.to || filter.member_id || filter.provider_key_id || filter.request_id || filter.model_id);
+  return <details className="my-4 min-w-0 rounded-cell border border-border px-4 py-3">
+    <summary className="cursor-pointer text-caption font-medium">时间与归属筛选{active ? " · 已应用" : ""}</summary>
+    <form className="mt-4 grid min-w-0 gap-4 sm:grid-cols-2 xl:grid-cols-3" onSubmit={event => {
+      event.preventDefault();
+      // 未修改的时间保留原始精度，改变成员等条件不能截断深链接的毫秒。
+      const from = draft.from === dateValue(filter.from) ? filter.from : draft.from ? parseBeijingInput(draft.from) : undefined;
+      const to = draft.to === dateValue(filter.to) ? filter.to : draft.to ? parseBeijingInput(draft.to) : undefined;
+      if (from === null || to === null || from && !Number.isFinite(Date.parse(from)) || to && !Number.isFinite(Date.parse(to)) || from && to && Date.parse(to) <= Date.parse(from)) { setError("请输入有效时间，结束时间必须晚于开始时间。"); return; }
+      setError("");
+      onChange({ from, to, member_id: draft.member_id.trim() || undefined, provider_key_id: draft.provider_key_id.trim() || undefined, request_id: draft.request_id.trim() || undefined, model_id: draft.model_id.trim() || undefined });
+    }}>
+      <label className="f min-w-0"><span>开始时间（北京时间）</span><input type="datetime-local" step="1" className="min-w-0 w-full" value={draft.from} onChange={event => setDraft({ ...draft, from: event.target.value })} /></label>
+      <label className="f min-w-0"><span>结束时间（不含，北京时间）</span><input type="datetime-local" step="1" className="min-w-0 w-full" value={draft.to} onChange={event => setDraft({ ...draft, to: event.target.value })} /></label>
+      <label className="f min-w-0"><span>模型 ID</span><input className="min-w-0 w-full" autoComplete="off" placeholder="准确的请求模型 ID" value={draft.model_id} onChange={event => setDraft({ ...draft, model_id: event.target.value })} /></label>
+      <label className="f min-w-0"><span>成员 ID</span><input className="min-w-0 w-full" autoComplete="off" value={draft.member_id} onChange={event => setDraft({ ...draft, member_id: event.target.value })} /></label>
+      <label className="f min-w-0"><span>上游账号 ID</span><input className="min-w-0 w-full" autoComplete="off" value={draft.provider_key_id} onChange={event => setDraft({ ...draft, provider_key_id: event.target.value })} /></label>
+      <label className="f min-w-0"><span>请求 ID</span><input className="min-w-0 w-full" autoComplete="off" value={draft.request_id} onChange={event => setDraft({ ...draft, request_id: event.target.value })} /></label>
+      {error && <p role="alert" className="note crit sm:col-span-2 xl:col-span-3">{error}</p>}
+      <div className="flex flex-wrap items-center gap-3 sm:col-span-2 xl:col-span-3">
+        <Button type="submit">应用时间与归属筛选</Button>
+        {active && <Button type="button" kind="quiet" iconOnly aria-label="清除时间与归属筛选" title="清除时间与归属筛选" onClick={() => onChange({ from: undefined, to: undefined, member_id: undefined, provider_key_id: undefined, request_id: undefined, model_id: undefined })}><RotateCcw size={16} aria-hidden /></Button>}
+        <span className="hint">与调用结果、计价状态及租户条件组合查询。</span>
+      </div>
+    </form>
+  </details>;
 }
 
 /** The upstream account that served the call, and the model it was asked for. */
@@ -368,7 +401,7 @@ function ChargeCheck({ c }: { c: Charge }) {
         ) : c.lines.length === 0 ? (
           <p className="text-caption text-muted-foreground">这次调用没有计费的数量。</p>
         ) : (
-          <table className="w-full text-caption">
+          <table className="charge-quantities-table w-full text-caption">
             <thead className="text-muted-foreground">
               <tr>
                 <th className={cn(CELL, "text-left")}>维度</th>
@@ -379,11 +412,11 @@ function ChargeCheck({ c }: { c: Charge }) {
             </thead>
             <tbody>
               {c.lines.map((l) => (
-                <tr key={l.dimension}>
-                  <td className={ROW}>{dimensionLabel(l.dimension)}</td>
-                  <td className={cn(ROW, "text-right")}>{l.quantity.toLocaleString("en-US")}</td>
-                  <td className={cn(ROW, "text-right")}>{usdRateText(l.dimension, l.rate)}</td>
-                  <td className={cn(ROW, "text-right")}>{lineUsd(l) ?? "—"}</td>
+                <tr data-finance-record key={l.dimension}>
+                  <td data-label="维度" className={ROW}>{dimensionLabel(l.dimension)}</td>
+                  <td data-label="数量" className={cn(ROW, "text-right")}>{l.quantity.toLocaleString("en-US")}</td>
+                  <td data-label="基准价" className={cn(ROW, "text-right")}>{usdRateText(l.dimension, l.rate)}</td>
+                  <td data-label="小计（美元）" className={cn(ROW, "text-right")}>{lineUsd(l) ?? "—"}</td>
                 </tr>
               ))}
             </tbody>
@@ -409,15 +442,15 @@ function ChargeCheck({ c }: { c: Charge }) {
           <p className="mt-1 text-caption text-text-2">重新计价已更正 {fmtMicroCny(c.adjusted_micro_cny)}。</p>
         )}
       </section>
-      <section aria-label={`上游报告的用量 ${c.event_id}`}>
-        <h4 className="mb-2 text-caption font-medium">上游报告的用量</h4>
+      <section aria-label={`已记录用量 ${c.event_id}`}>
+        <h4 className="mb-2 text-caption font-medium">{c.usage_estimated === true ? "包含网关估算的用量" : "已记录用量"}</h4>
         {reported.length === 0 ? (
-          <p className="text-caption text-muted-foreground">这次调用没有上游用量记录。</p>
+          <p className="text-caption text-muted-foreground">这次调用没有用量记录。</p>
         ) : (
           <dl className="grid grid-cols-[minmax(0,1fr)_auto] gap-x-6 text-caption">
             {reported.map((r) => (
               <Fragment key={r.key}>
-                <dt className="border-t border-border py-1.5 text-text-2">{r.label}</dt>
+                <dt className="border-t border-border py-1.5 text-text-2">{r.key === "total_tokens" ? "记录总数" : r.label}</dt>
                 <dd className="border-t border-border py-1.5 text-right tabular-nums">{r.value.toLocaleString("en-US")}</dd>
               </Fragment>
             ))}
@@ -427,6 +460,7 @@ function ChargeCheck({ c }: { c: Charge }) {
           事件 <code>{c.event_id}</code>
         </p>
       </section>
+      <UsageIoAuditDetails data={c} />
     </div>
   );
 }

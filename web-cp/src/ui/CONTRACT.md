@@ -30,7 +30,7 @@
 
 **Lamp**：state applied/propagating/pending/rejected/disabled 不变；图形为成功实点/警告空心/危险方点，状态文字始终在场，无脉冲入场。children 是真实状态；title 可选。属性保持 data-lamp，禁止改为 data-state（后者是 rollout 合同）。
 
-**DataTable/Loading**：label 保留可访问表名，compact/scroll/children 不变；header44，普通行至少56，compact至少48，使行内44按钮不被固定小高度裁切。num/right/tabular 仍控制对齐。长表横向只在 dt-wrap 内滚，scroll 同时给纵向区域和 sticky header。Loading 三骨架行和 DOM 中“载入中…”不变，骨架 aria-hidden；reduced-motion 下关闭动画。
+**DataTable/Loading**：label 保留可访问表名，compact/scroll/children 不变；header44，普通行至少56，compact至少48，使行内44按钮不被固定小高度裁切。num/right/tabular 仍控制对齐。记录分页自然撑开页面，不在表格外框限制高度；长列仅在 dt-wrap 内按需横向滚动，scroll 继续作为兼容钩子而不强制纵向滚动。Loading 三骨架行和 DOM 中“载入中…”不变，骨架 aria-hidden；reduced-motion 下关闭动画。
 
 **EmptyState**：text/mark/action 不变；页面已有同名操作时不重复添加 action，保持 strict locator 唯一性。
 

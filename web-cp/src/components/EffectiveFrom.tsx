@@ -32,7 +32,7 @@ export function EffectiveFrom({
 
   return (
     <>
-      <label className="check min-h-11 gap-3 font-mono text-meta text-ink-soft">
+      <label className="check min-h-11 gap-3 text-body text-ink-soft">
         <input type="checkbox" checked={immediate} onChange={(e) => setImmediate(e.target.checked)} />
         <span>立即生效</span>
       </label>

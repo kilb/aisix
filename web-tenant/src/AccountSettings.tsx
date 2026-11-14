@@ -8,7 +8,7 @@ import { Card, CardHeader, DescList, PageHeader } from "./components/page";
 export function AccountSettings({ member, onSignOut }: { member: SessionMember; onSignOut: () => void }) {
   return <>
     <PageHeader title="账号设置" description="查看你的登录资料，管理口令与当前会话。" />
-    <div className="account-settings-grid">
+    <div className="account-settings-grid tenant-account">
       <Card className="account-profile">
         <CardHeader title="登录资料" description="此处为你当前使用的组织成员账号。" />
         <DescList items={[

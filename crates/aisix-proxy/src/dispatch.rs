@@ -2022,6 +2022,7 @@ mod tests {
                 _ctx: &BridgeContext,
             ) -> Result<ChatResponse, BridgeError> {
                 Ok(ChatResponse {
+                    native_envelope: None,
                     logprobs: None,
                     more_choices: Vec::new(),
                     id: "stub".into(),

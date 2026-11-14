@@ -21,6 +21,7 @@
 
 use aisix_core::{RequestOverrides, ResponseOverrides, StreamDoneMarker};
 use aisix_gateway::structured_output::close_object_schemas;
+use aisix_gateway::upstream_io::{send, Protocol};
 use aisix_gateway::url_cache::cached_endpoint_url;
 use aisix_gateway::{
     apply_request_headers, Bridge, BridgeContext, BridgeError, ChatChunk, ChatChunkStream,
@@ -84,20 +85,6 @@ fn developer_role_mode(ctx: &BridgeContext) -> DeveloperRoleMode {
 /// for any non-openai vendor (would otherwise leak the vendor's API
 /// key to api.openai.com).
 pub const OPENAI_DEFAULT_BASE: &str = "https://api.openai.com/v1";
-
-/// Path suffixes the bridge appends to `api_base` when building upstream
-/// URLs. If an operator accidentally pastes the full upstream URL into
-/// `api_base` (e.g. `https://api.openai.com/v1/chat/completions`),
-/// strip the suffix so request building still produces a valid URL.
-const OPENAI_ENDPOINT_SUFFIXES: &[&str] = &[
-    "/chat/completions",
-    "/completions",
-    "/embeddings",
-    "/images/generations",
-    "/audio/transcriptions",
-    "/audio/translations",
-    "/audio/speech",
-];
 
 pub struct OpenAiBridge {
     client: Client,
@@ -186,13 +173,12 @@ impl OpenAiBridge {
             || Ok(format!("{}/completions", self.resolve_base(ctx)?)),
         )?;
         let client = self.client_for(ctx);
-        let resp = url
-            .post_on(&client)
-            .headers(headers)
-            .body(outbound)
-            .send()
-            .await
-            .map_err(aisix_gateway::send_error)?;
+        let resp = send(
+            url.post_on(&client).headers(headers).body(outbound),
+            Protocol::Completions,
+        )
+        .await
+        .map_err(aisix_gateway::send_error)?;
 
         aisix_gateway::note_upstream_response(resp.headers());
         let status = resp.status();
@@ -299,13 +285,7 @@ fn default_client() -> Client {
 /// Strip a known endpoint suffix from `base`. Idempotent: if no known
 /// suffix matches, returns the input with only the trailing slash trimmed.
 fn strip_known_endpoint(base: &str) -> &str {
-    let trimmed = base.trim_end_matches('/');
-    for suffix in OPENAI_ENDPOINT_SUFFIXES {
-        if let Some(rest) = trimmed.strip_suffix(suffix) {
-            return rest.trim_end_matches('/');
-        }
-    }
-    trimmed
+    aisix_core::native_objects::strip_openai_chat_endpoint_suffix(base)
 }
 
 /// `api_base` normalization for the OpenAI-compatible family bridge.
@@ -320,24 +300,7 @@ fn strip_known_endpoint(base: &str) -> &str {
 ///
 /// See [`OpenAiBridge::resolve_base`] for accepted forms.
 fn normalize_api_base(base: &str) -> String {
-    let stripped = strip_known_endpoint(base);
-    normalize_canonical_openai(stripped)
-}
-
-/// Canonical OpenAI hosts. Both schemes covered for ops convenience —
-/// in production only `https://` is meaningful.
-const OPENAI_CANONICAL_HOSTS: &[&str] = &["https://api.openai.com", "http://api.openai.com"];
-
-/// Add the canonical `/v1` segment if and only if the operator pasted
-/// the bare canonical OpenAI host. Anything past the host root is left
-/// as-is so non-default paths the operator chose on purpose win.
-fn normalize_canonical_openai(base: &str) -> String {
-    for host in OPENAI_CANONICAL_HOSTS {
-        if base == *host {
-            return format!("{host}/v1");
-        }
-    }
-    base.to_string()
+    aisix_core::native_objects::normalize_openai_chat_base(base)
 }
 
 fn api_key(ctx: &BridgeContext) -> Result<&str, BridgeError> {
@@ -633,13 +596,15 @@ impl Bridge for OpenAiBridge {
         let body = {
             let messages = messages_from(&req, developer_role_mode(ctx));
             let typed = build_request(&req, upstream, &messages, false);
-            outbound_bytes(&prepare_outbound_body(
+            let mut body = prepare_outbound_body(
                 &typed,
                 req.gateway_strict_schema,
                 renames_token_cap(ctx, upstream),
                 ctx.provider_key.request.as_ref(),
                 ctx.provider_key.response.as_ref(),
-            )?)?
+            )?;
+            crate::cohere::drop_unsupported_chat_fields(&ctx.provider_key.provider, &mut body);
+            outbound_bytes(&body)?
         };
         // The owned request is not needed past its wire bytes.
         drop(req);
@@ -657,13 +622,12 @@ impl Bridge for OpenAiBridge {
         let started = Instant::now();
 
         with_deadline(ctx.deadline, started, async move {
-            let resp = url
-                .post_on(&client)
-                .headers(headers)
-                .body(body)
-                .send()
-                .await
-                .map_err(aisix_gateway::send_error)?;
+            let resp = send(
+                url.post_on(&client).headers(headers).body(body),
+                Protocol::Chat,
+            )
+            .await
+            .map_err(aisix_gateway::send_error)?;
 
             aisix_gateway::note_upstream_response(resp.headers());
             let status = resp.status();
@@ -712,13 +676,12 @@ impl Bridge for OpenAiBridge {
         let client = self.client_for(ctx);
         let started = Instant::now();
         with_deadline(ctx.deadline, started, async move {
-            let resp = url
-                .post_on(&client)
-                .headers(headers)
-                .body(body)
-                .send()
-                .await
-                .map_err(aisix_gateway::send_error)?;
+            let resp = send(
+                url.post_on(&client).headers(headers).body(body),
+                Protocol::Embeddings,
+            )
+            .await
+            .map_err(aisix_gateway::send_error)?;
 
             aisix_gateway::note_upstream_response(resp.headers());
             let status = resp.status();
@@ -804,13 +767,12 @@ impl Bridge for OpenAiBridge {
         let client = self.client_for(ctx);
         let started = Instant::now();
         with_deadline(ctx.deadline, started, async move {
-            let resp = url
-                .post_on(&client)
-                .headers(headers)
-                .body(outbound)
-                .send()
-                .await
-                .map_err(aisix_gateway::send_error)?;
+            let resp = send(
+                url.post_on(&client).headers(headers).body(outbound),
+                Protocol::Images,
+            )
+            .await
+            .map_err(aisix_gateway::send_error)?;
 
             aisix_gateway::note_upstream_response(resp.headers());
             let status = resp.status();
@@ -844,13 +806,15 @@ impl Bridge for OpenAiBridge {
         let body = {
             let messages = messages_from(&req, developer_role_mode(ctx));
             let typed = build_request(&req, upstream, &messages, true);
-            outbound_bytes(&prepare_outbound_body(
+            let mut body = prepare_outbound_body(
                 &typed,
                 req.gateway_strict_schema,
                 renames_token_cap(ctx, upstream),
                 ctx.provider_key.request.as_ref(),
                 ctx.provider_key.response.as_ref(),
-            )?)?
+            )?;
+            crate::cohere::drop_unsupported_chat_fields(&ctx.provider_key.provider, &mut body);
+            outbound_bytes(&body)?
         };
         // The owned request is not needed past its wire bytes.
         drop(req);
@@ -868,12 +832,12 @@ impl Bridge for OpenAiBridge {
         let started = Instant::now();
 
         let resp = with_deadline(ctx.deadline, started, async move {
-            url.post_on(&client)
-                .headers(headers)
-                .body(body)
-                .send()
-                .await
-                .map_err(aisix_gateway::send_error)
+            send(
+                url.post_on(&client).headers(headers).body(body),
+                Protocol::Chat,
+            )
+            .await
+            .map_err(aisix_gateway::send_error)
         })
         .await?;
 

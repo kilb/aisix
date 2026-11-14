@@ -155,7 +155,7 @@ export function Gate({
       : "创建组织与所有者账号。平台审核通过后，即可为团队创建密钥并管理调用。";
 
   return (
-    <div className="gate-page">
+    <div className="gate-page tenant-gate">
       <header className="gate-topbar">
         <span className="brand">
           <span className="brand-mark" aria-hidden="true" />
@@ -165,27 +165,25 @@ export function Gate({
       </header>
       <main id="gate" className="gate-layout">
         <section className="gate-introduction" aria-labelledby="gate-title">
-          <p className="gate-eyebrow">组织工作空间</p>
           <h1 id="gate-title">组织门户</h1>
           <p className="gate-lead">{introduction}</p>
           <dl className="gate-guide">
             <div>
-              <dt><span aria-hidden="true">01</span> 组织与成员</dt>
+              <dt>组织与成员</dt>
               <dd>按角色管理访问，邀请成员或创建团队账号。</dd>
             </div>
             <div>
-              <dt><span aria-hidden="true">02</span> 调用与费用</dt>
+              <dt>调用与费用</dt>
               <dd>查看调用记录、用量与计费明细。</dd>
             </div>
             <div>
-              <dt><span aria-hidden="true">03</span> 密钥与额度</dt>
+              <dt>密钥与额度</dt>
               <dd>设置密钥的模型范围，查看适用的预算限制。</dd>
             </div>
           </dl>
         </section>
         <section className="panel gate-panel" aria-labelledby="gate-form-title">
           <div className="gate-panel-heading">
-            <p className="gate-eyebrow">工作空间访问</p>
             <h2 id="gate-form-title">{title}</h2>
           </div>
           {notice && <div className="note warn" role="status">{notice}</div>}

@@ -98,3 +98,25 @@ test("the 原因 column follows the status", () => {
   assert.equal(chargeReason({ ...base, status: "exempt", exemption: "response_cache_hit" }), "缓存命中");
   assert.equal(chargeReason({ ...base, status: "charged", charge_micro_cny: 680 }), "—");
 });
+
+test("successful token counting explains why it has no generation charge", () => {
+  for (const status_code of [200, 201]) {
+    assert.equal(chargeReason({ ...base, operation: "count_tokens", status_code }), "Token 统计，不产生生成费用");
+  }
+  assert.equal(
+    chargeReason({ ...base, operation: "count_tokens", attempt_kind: "fallback", attempt_index: 1 }),
+    "Token 统计，不产生生成费用 · 第 2 次尝试（换用备选）",
+  );
+});
+
+test("counting failures and unknown outcomes retain their actual cause", () => {
+  assert.equal(chargeReason({ ...base, operation: "count_tokens", status_code: 502, error_class: "upstream_status" }), "调用失败 · 上游 502");
+  assert.equal(chargeReason({ ...base, operation: "count_tokens", status_code: 499, error_class: "client_disconnected" }), "调用方中断");
+  for (const status_code of [null, 0, 199, 300]) {
+    assert.equal(chargeReason({ ...base, operation: "count_tokens", status_code }), "无用量");
+  }
+  for (const operation of [undefined, null, "", "messages", "chat", "responses"]) {
+    assert.equal(chargeReason({ ...base, operation }), "无用量");
+  }
+  assert.equal(chargeReason({ ...base, operation: "count_tokens", status: "charged", charge_micro_cny: 680 }), "—");
+});

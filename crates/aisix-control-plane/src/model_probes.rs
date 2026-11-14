@@ -1052,6 +1052,7 @@ mod tests {
 
     fn chunk(delta: ChatDelta) -> ChatChunk {
         ChatChunk {
+            native_envelope: None,
             id: "probe".to_string(),
             model: "target".to_string(),
             choice_index: 0,

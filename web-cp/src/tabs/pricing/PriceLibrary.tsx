@@ -115,9 +115,7 @@ export function PriceLibrary({ canEdit, onGoto }: TabProps) {
         title="价格库"
         dataLead={meta && page ? <>当前价格库包含 {meta.entries.toLocaleString("zh-CN")} 个条目；{loadedQuery ? `「${loadedQuery}」匹配` : "全部搜索范围有"} {page.total.toLocaleString("zh-CN")} 条，显示 {page.items.length.toLocaleString("zh-CN")} 条。核对完整价格与来源后再同步基准价。</> : "使用实际存储的价格库检索模型，核对来源与完整价格后再同步。"}
         actions={
-          <Button type="button" icon="refresh" onClick={() => void refresh()}>
-            刷新
-          </Button>
+          <Button className="finance-icon-button" aria-label="刷新" title="刷新" type="button" icon="refresh" onClick={() => void refresh()}></Button>
         }
       />
       <p className="mb-6 text-body text-ink-soft">{CREDIT}</p>
@@ -177,7 +175,7 @@ export function PriceLibrary({ canEdit, onGoto }: TabProps) {
           <EmptyState text="没有匹配的模型。" />
         ) : (
           <>
-            <div className="library-browser-table" aria-busy={loading}><DataTable label="价格库条目" scroll>
+            <div className="library-browser-table" aria-busy={loading}><DataTable label="价格库条目">
               <thead>
                 <tr>
                   <th>供应商</th>
@@ -197,9 +195,9 @@ export function PriceLibrary({ canEdit, onGoto }: TabProps) {
                   const open = expanded === entryId;
                   const detailId = `library-price-${encodeURIComponent(entryId)}`;
                   return (
-                    <Fragment key={entryId}><tr>
-                      <td className="text-muted">{e.provider}</td>
-                      <td>
+                    <Fragment key={entryId}><tr data-finance-record>
+                      <td data-label="供应商" className="text-muted">{e.provider}</td>
+                      <td data-label="模型">
                         <span className="mono font-medium">{e.model}</span>
                         {e.name && e.name !== e.model && <span className="cell-note">{e.name}</span>}
                         {e.flags.length > 0 && (
@@ -221,13 +219,13 @@ export function PriceLibrary({ canEdit, onGoto }: TabProps) {
                           </span>
                         )}
                       </td>
-                      <td className="num tabular">{base?.input !== undefined ? usdPerMillion(base.input) : "—"}</td>
-                      <td className="num tabular">{base?.output !== undefined ? usdPerMillion(base.output) : "—"}</td>
-                      <td>
+                      <td data-label="输入" className="num tabular">{base?.input !== undefined ? usdPerMillion(base.input) : "—"}</td>
+                      <td data-label="输出" className="num tabular">{base?.output !== undefined ? usdPerMillion(base.output) : "—"}</td>
+                      <td data-label="价格详情">
                         {e.card ? <Button type="button" kind="quiet" size="sm" aria-expanded={open} aria-controls={open ? detailId : undefined} aria-label={`${open ? "收起" : "展开"} ${entryId} 的完整价格卡`} onClick={() => setExpanded(open ? null : entryId)}>{open ? "收起价格" : "展开价格"}</Button> : <span className="text-muted">无可同步价格卡</span>}
                         {e.prices_checked && <span className="cell-note">价格核对日期：{e.prices_checked}</span>}
                       </td>
-                      <td>
+                      <td data-label="价格页面">
                         {href ? (
                           <a href={href} target="_blank" rel="noopener noreferrer" className="inline-flex min-h-11 min-w-11 items-center">
                             价格页面

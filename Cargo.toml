@@ -63,6 +63,8 @@ http = "1.2"
 # axum/hyper; this adds an edge, not a crate.
 http-body = "1"
 http-body-util = "0.1"
+async-compression = { version = "0.4.41", default-features = false, features = ["tokio", "zstd"] }
+tokio-util = { version = "0.7.18", features = ["io"] }
 # Trusted-proxy CIDR matching for real-ip resolution (#492)
 ipnet = "2"
 

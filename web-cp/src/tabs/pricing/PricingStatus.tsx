@@ -67,9 +67,7 @@ export function PricingStatus({ onGoto }: TabProps) {
         dataLead={view ? `最近 24 小时仍有 ${fmtInt(view.unpricedTotal)} 次调用未计价；另有 ${fmtInt(view.correctedTotal)} 次已通过重计价更正。` : "读取计价引擎与最近 24 小时状态。"}
         description="计价引擎的版本、不可用的价格版本，以及最近 24 小时没能计价的调用。"
         actions={
-          <Button type="button" icon="refresh" busy={reading} busyLabel="读取中…" onClick={() => void read()}>
-            刷新
-          </Button>
+          <Button className="finance-icon-button" aria-label="刷新" title="刷新" type="button" icon="refresh" busy={reading} busyLabel="读取中…" onClick={() => void read()}></Button>
         }
       />
       {failure && (
@@ -106,7 +104,7 @@ export function PricingStatus({ onGoto }: TabProps) {
                 <Lamp state="applied">最近 24 小时没有未计价的调用。</Lamp>
               </p>
             ) : (
-              <><DataTable label="未计价的调用" scroll>
+              <><DataTable label="未计价的调用">
                 <thead>
                   <tr>
                     <th>原因</th>
@@ -121,11 +119,11 @@ export function PricingStatus({ onGoto }: TabProps) {
                 <tbody>
                   {unpricedTable.rows.length === 0 && <tr><td colSpan={7}><EmptyState text="没有符合筛选条件的未计价分组" /></td></tr>}
                   {unpricedTable.rows.map((d) => (
-                    <tr key={d.key}>
-                      <td className="font-medium">{d.label}</td>
-                      <td className="num">{fmtInt(d.count)}</td>
-                      {d.kind === "detail" ? <><td>{d.model}</td><td>{d.scope}</td><td className="tabular">{fmtBeijing(d.latestAt)}</td><td className="max-w-[28rem] whitespace-normal text-caption text-ink-soft">{d.remedy}</td></> : <td colSpan={4}>其余 {fmtInt(d.count)} 次，未逐一列出</td>}
-                      <td className="right">
+                    <tr data-finance-record key={d.key}>
+                      <td data-label="原因" className="font-medium">{d.label}</td>
+                      <td data-label="次数" className="num">{fmtInt(d.count)}</td>
+                      {d.kind === "detail" ? <><td data-label="模型">{d.model}</td><td data-label="档位 / 分组">{d.scope}</td><td data-label="最近一次" className="tabular">{fmtBeijing(d.latestAt)}</td><td data-label="处理" className="max-w-[28rem] whitespace-normal text-caption text-ink-soft">{d.remedy}</td></> : <td data-label="范围" colSpan={4}>其余 {fmtInt(d.count)} 次，未逐一列出</td>}
+                      <td data-label="操作" className="right">
                         <Button
                           type="button"
                           size="sm"
@@ -180,10 +178,10 @@ export function PricingStatus({ onGoto }: TabProps) {
                 <tbody>
                   {invalidTable.rows.length === 0 && <tr><td colSpan={3}><EmptyState text="没有符合筛选条件的价格版本" /></td></tr>}
                   {invalidTable.rows.map((r) => (
-                    <tr key={r.key}>
-                      <td>{r.table}</td>
-                      <td className="tabular">{r.revision}</td>
-                      <td className="whitespace-normal">{r.reason}</td>
+                    <tr data-finance-record key={r.key}>
+                      <td data-label="表">{r.table}</td>
+                      <td data-label="版本" className="tabular">{r.revision}</td>
+                      <td data-label="原因" className="whitespace-normal">{r.reason}</td>
                     </tr>
                   ))}
                 </tbody>

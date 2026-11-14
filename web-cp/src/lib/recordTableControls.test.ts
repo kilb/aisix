@@ -27,6 +27,18 @@ const noChange = () => undefined;
 const base: RecordTablePagerProps = { page: 1, pageSize: 25, onPageChange: noChange, onPageSizeChange: noChange };
 const textOf = (markup: string) => markup.replace(/<[^>]+>/g, "");
 
+// 可见箭头仍须带原分页名称，禁用与页边界不能因图标化改变。
+function assertPageButton(markup: string, label: string, disabled: boolean) {
+  const buttons = [...markup.matchAll(/<button[^>]*>[\s\S]*?<\/button>/g)].map(match => match[0]);
+  const matched = buttons.filter(button => button.includes(`aria-label="${label}"`));
+  assert.equal(matched.length, 1);
+  const button = matched[0]!;
+  assert.equal(/ disabled=""/.test(button), disabled);
+  assert.match(button, /type="button"/);
+  assert.match(button, /<svg[^>]*aria-hidden="true"/);
+  assert.equal(textOf(button), "");
+}
+
 // 缺少label或原生type=search会破坏键盘及读屏搜索入口；业务筛选必须仍在工具栏内。
 test("搜索带显式可访问名称并保留业务筛选插槽", () => {
   const markup = renderToStaticMarkup(createElement(RecordTableToolbar, {
@@ -45,15 +57,15 @@ test("游标页只报告已加载数量，不伪造总数或提供跳页输入",
   assert.match(textOf(markup), /已加载 25 条/);
   assert.doesNotMatch(textOf(markup), /共 25 条/);
   assert.doesNotMatch(markup, /<input/);
-  assert.match(markup, /<button[^>]*disabled=""[^>]*>上一页<\/button>/);
-  assert.match(markup, /<button(?![^>]* disabled="")[^>]*>下一页<\/button>/);
+  assertPageButton(markup, "上一页", true);
+  assertPageButton(markup, "下一页", false);
 });
 
 // 若total忽略末页边界，下一页不会禁用；页大小选项必须保持真实可选。
 test("已知总数给出精确显示范围，末页与空表阻止越界", () => {
   const last = renderToStaticMarkup(createElement(RecordTablePager, { ...base, page: 3, total: 61 }));
   assert.match(textOf(last), /51[–—-]61.*共 61 条/);
-  assert.match(last, /<button[^>]*disabled=""[^>]*>下一页<\/button>/);
+  assertPageButton(last, "下一页", true);
   for (const value of [10, 25, 50]) assert.match(last, new RegExp(`<option value="${value}"`));
   const empty = renderToStaticMarkup(createElement(RecordTablePager, { ...base, total: 0 }));
   assert.match(textOf(empty), /0[–—-]0.*共 0 条/);

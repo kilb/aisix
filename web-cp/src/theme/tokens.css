@@ -34,7 +34,7 @@
   --border: var(--bento-line);
   --input: #827F76;
   --ring: var(--brand);
-  --radius: 10px;
+  --radius: 8px;
   --sidebar: var(--card);
   --sidebar-foreground: var(--foreground);
   --sidebar-accent: var(--accent);
@@ -125,18 +125,19 @@
   --control-border: var(--input);
   --shadow-raise: none;
   --inset: none;
-  --mark-tile: var(--bento-ink);
+  --mark-tile: #121211;
   --wide: 100%;
 
   /* 运营界面采用紧凑字级；旧 size API 仍保留，但不再生成巨型数字。 */
   --type-title: 28px;
-  --type-hero: 36px;
+  --type-title-line-height: 36px;
+  --type-hero: 32px;
   --type-display: 32px;
   --type-figure: 28px;
   --type-value: 28px;
   --type-lead: 14px;
-  --card-pad: 20px;
-  --card-gap: 16px;
+  --card-pad: 24px;
+  --card-gap: 20px;
   --page-heading-gap: 24px;
   --s-1: 4px;
   --s-2: 8px;
@@ -160,20 +161,20 @@
   --lh-heading: 1.2;
   --tracking-heading: -0.02em;
   --r-input: 8px;
-  --r-card: 24px;
+  --r-card: 14px;
   --r-button: 8px;
-  --r-chip: 6px;
-  --r-panel: 24px;
-  --r-rail: 24px;
+  --r-chip: 4px;
+  --r-panel: 14px;
+  --r-rail: 20px;
   --r-round: 9999px;
   --h-control: 44px;
   --h-control-sm: 44px;
-  --h-row: 56px;
+  --h-row: 48px;
   --h-row-compact: 48px;
   --h-head: 44px;
   --icon: 16px;
   --t-fast: 120ms;
-  --t-panel: 0ms;
+  --t-panel: 160ms;
   --t-leave: 200ms;
   --t-lens: 0ms;
   --ease-out: ease-out;
@@ -210,13 +211,14 @@
   --route-3: #CAC4B4;
   --tooltip-bg: #F2F0E9;
   --tooltip-text: #1B1B18;
-  --mark-tile: #1B1B18;
+  --mark-tile: #121211;
   --shadow-float: none;
 }
 
 @media (max-width: 719px) {
   :root {
     --type-title: 26px;
+    --type-title-line-height: 34px;
     --type-hero: 32px;
     --type-display: 28px;
     --type-figure: 28px;

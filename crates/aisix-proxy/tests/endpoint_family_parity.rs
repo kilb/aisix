@@ -42,6 +42,8 @@ const MODEL_DISPATCH_HANDLERS: &[&str] = &[
     "count_tokens.rs",
     "images_edits.rs",
     "decisions.rs",
+    "native_api/anthropic.rs",
+    "native_api/openai.rs",
 ];
 
 /// Per-request mechanisms every one of those handlers must carry, with what
@@ -61,6 +63,32 @@ const REQUIRED_MECHANISMS: &[(&str, &str)] = &[
 
 fn handlers_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+}
+
+fn source_files(dir: &Path) -> Vec<PathBuf> {
+    let mut stack = vec![dir.to_path_buf()];
+    let mut files = Vec::new();
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(dir).expect("proxy src is readable") {
+            let path = entry.expect("readable entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+fn source_name(dir: &Path, path: &Path) -> String {
+    // 保留模块目录，避免同名文件互相顶替，也让嵌套处理器实际接受同一组检查。
+    path.strip_prefix(dir)
+        .expect("source file belongs to proxy src")
+        .to_str()
+        .expect("utf-8 source path")
+        .replace('\\', "/")
 }
 
 #[test]
@@ -114,6 +142,7 @@ fn a_handler_that_checks_caller_text_also_masks_it() {
         "check_input_non_segment",
         "moderate_body",
         "moderate_structured_body",
+        "jobs::scan_input_blob(",
     ];
     // Applying that same chain's mask action.
     const APPLIES_MASKS: &[&str] = &[
@@ -124,6 +153,8 @@ fn a_handler_that_checks_caller_text_also_masks_it() {
         "moderate_structured_body",
         // The multipart surfaces' shared rewrite of their `prompt` fields.
         "mask_prompt_fields",
+        // 原生处理器把同一份遮罩计数器交给共享扫描器，不能只调用其检查路径。
+        "mask.then_some(&mut self.redactions)",
     ];
 
     let mut missing: Vec<String> = Vec::new();
@@ -179,6 +210,7 @@ fn a_handler_that_masks_also_records_that_it_masked() {
         "moderate_body(",
         "moderate_structured_body(",
         "mask_prompt_fields(",
+        "mask.then_some(&mut self.redactions)",
     ];
     const REPORTS_THE_COUNTS: &[&str] = &["redacted_entity_counts", "redactions"];
 
@@ -372,29 +404,18 @@ fn the_handler_list_matches_what_is_on_disk() {
             "resolves a name only to find the rules a failure row's body answers \
              to, ahead of the chain; it dispatches nothing and answers nothing.",
         ),
+        (
+            "native_api/origin.rs",
+            "仅登记或校验持久对象归属；模型、账号和上游名称由响应处理器选定后传入，\
+             此处不预留配额、不调用推理上游，也不构造面向 SDK 的 HTTP 响应。",
+        ),
     ];
 
     let mut unlisted: Vec<String> = Vec::new();
     let mut resolvers = 0usize;
-    let mut stack = vec![dir.clone()];
-    let mut files: Vec<PathBuf> = Vec::new();
-    while let Some(d) = stack.pop() {
-        for e in std::fs::read_dir(&d).expect("proxy src is readable") {
-            let path = e.expect("readable entry").path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.extension().is_some_and(|x| x == "rs") {
-                files.push(path);
-            }
-        }
-    }
-    files.sort();
+    let files = source_files(&dir);
     for path in &files {
-        let name = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .expect("utf-8 name")
-            .to_string();
+        let name = source_name(&dir, path);
         let src = std::fs::read_to_string(path).expect("readable");
         // A call, not a mention: `semantic.rs` discusses the resolver in a
         // comment and resolves nothing.
@@ -496,19 +517,10 @@ fn a_handler_that_spends_the_rate_limit_window_also_reports_it() {
     let mut silent: Vec<String> = Vec::new();
     let mut spends_the_window: Vec<String> = Vec::new();
 
-    let entries = std::fs::read_dir(&dir).expect("proxy src is readable");
-    let mut files: Vec<PathBuf> = entries
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "rs"))
-        .collect();
-    files.sort();
+    let files = source_files(&dir);
 
     for path in &files {
-        let name = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .expect("source file has a utf-8 name")
-            .to_string();
+        let name = source_name(&dir, path);
         let src = std::fs::read_to_string(path).expect("handler is readable");
         // A mention inside a comment is not a call: `lib.rs` discusses
         // `quota::enforce` in three places and reserves nothing.

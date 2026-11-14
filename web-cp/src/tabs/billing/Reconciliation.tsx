@@ -104,7 +104,7 @@ export function Reconciliation(_props: TabProps) {
                 ))}
               </select>
             </label>
-            <Button
+            <Button className="finance-icon-button" aria-label="刷新" title="刷新"
               type="button"
               icon="refresh"
               busy={loading}
@@ -113,9 +113,7 @@ export function Reconciliation(_props: TabProps) {
                 setReset(null);
                 void load(tenantId);
               }}
-            >
-              刷新
-            </Button>
+            ></Button>
           </>
         }
       />
@@ -167,12 +165,12 @@ export function Reconciliation(_props: TabProps) {
                       </thead>
                       <tbody>
                         {mismatchTable.rows.map((m) => (
-                          <tr key={`${m.tenant_id}-${m.check}`}>
-                            <td className="font-medium">{m.tenant_name || m.tenant_id}</td>
-                            <td>{checkLabel(m.check)}</td>
-                            <td className="num money">{fmtMicroCny(m.expected_micro_cny)}</td>
-                            <td className="num money text-ink">{fmtMicroCny(m.actual_micro_cny)}</td>
-                            <td className="num">{m.seq ?? "—"}</td>
+                          <tr data-finance-record key={`${m.tenant_id}-${m.check}`}>
+                            <td data-label="租户" className="font-medium">{m.tenant_name || m.tenant_id}</td>
+                            <td data-label="项目">{checkLabel(m.check)}</td>
+                            <td data-label="应为" className="num money">{fmtMicroCny(m.expected_micro_cny)}</td>
+                            <td data-label="实为" className="num money text-ink">{fmtMicroCny(m.actual_micro_cny)}</td>
+                            <td data-label="流水号" className="num">{m.seq ?? "—"}</td>
                           </tr>
                         ))}
                       </tbody>
@@ -269,12 +267,12 @@ export function Reconciliation(_props: TabProps) {
                     {instanceTable.rows.map((i) => {
                       const reasons = Object.entries(i.drops).filter(([, n]) => n > 0);
                       return (
-                        <tr key={i.dp_id + i.instance_id}>
-                          <td className="font-medium">{i.credential_name}</td>
-                          <td className="tabular bl-wrap font-mono text-caption">{i.instance_id}</td>
-                          <td className="bl-wrap">{i.hostname}</td>
-                          <td className="tabular text-text-2">{fmtBeijing(i.last_seen_at)}</td>
-                          <td>
+                        <tr data-finance-record key={i.dp_id + i.instance_id}>
+                          <td data-label="凭据" className="font-medium">{i.credential_name}</td>
+                          <td data-label="实例" className="tabular bl-wrap font-mono text-caption">{i.instance_id}</td>
+                          <td data-label="主机" className="bl-wrap">{i.hostname}</td>
+                          <td data-label="最近心跳" className="tabular text-text-2">{fmtBeijing(i.last_seen_at)}</td>
+                          <td data-label="丢弃明细">
                             {reasons.length === 0 ? (
                               <span className="hint">无</span>
                             ) : (

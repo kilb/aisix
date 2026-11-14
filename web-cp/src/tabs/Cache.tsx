@@ -1,3 +1,4 @@
+import "./operations.css";
 import { useRecordTable } from "../lib/recordTable";
 import { RecordTools, RecordPager } from "../components/RecordTools";
 import { useEffect, useId, useState } from "react";
@@ -12,7 +13,7 @@ import { useResource } from "../lib/useResource";
 import { Failure } from "./Tenants";
 import { Button } from "../ui/Button";
 import { useRefusalFocus } from "../ui/Field";
-import { DataTable, Loading } from "../ui/DataTable";
+import { OperationalTable as DataTable, Loading } from "../components/OperationalTable";
 import { EmptyState } from "../ui/EmptyState";
 import { Lamp } from "../ui/Lamp";
 import { TwoStep } from "../ui/TwoStep";
@@ -480,7 +481,7 @@ export function Cache({ canEdit, onGoto }: TabProps) {
   );
 
   return (
-    <>
+    <div className="cp-operations cp-cache">
       <PageHeader
         eyebrow="CACHE · 应答缓存"
         title="缓存策略"
@@ -530,6 +531,6 @@ export function Cache({ canEdit, onGoto }: TabProps) {
         </div>
       )}
       <Split asideWidth="minmax(340px, 30%)" main={list} aside={editor || undefined} />
-    </>
+    </div>
   );
 }

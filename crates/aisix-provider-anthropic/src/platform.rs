@@ -67,6 +67,7 @@ const BEDROCK_FIELDS: &[&str] = &[
     "output_config",
     "safeguards",
     "context_management",
+    "compaction",
 ];
 
 /// The top-level request fields forwarded to Vertex AI `rawPredict`: the
@@ -114,6 +115,7 @@ const BEDROCK_BETAS: &[(&str, &str)] = &[
     ),
     ("claude-code-20250219", "claude-code-20250219"),
     ("compact-2026-01-12", "compact-2026-01-12"),
+    ("compact-2026-09-04", "compact-2026-09-04"),
     ("computer-use-2025-01-24", "computer-use-2025-01-24"),
     ("computer-use-2025-11-24", "computer-use-2025-11-24"),
     ("context-1m-2025-08-07", "context-1m-2025-08-07"),
@@ -166,6 +168,7 @@ const VERTEX_BETAS: &[(&str, &str)] = &[
         "tool-search-tool-2025-10-19",
     ),
     ("compact-2026-01-12", "compact-2026-01-12"),
+    ("compact-2026-09-04", "compact-2026-09-04"),
     ("computer-use-2025-01-24", "computer-use-2025-01-24"),
     ("computer-use-2025-11-24", "computer-use-2025-11-24"),
     ("context-1m-2025-08-07", "context-1m-2025-08-07"),
@@ -207,6 +210,7 @@ pub fn platform_beta(platform: Platform, beta: &str) -> Option<&'static str> {
 
 const EFFORT_BETA: &str = "effort-2025-11-24";
 const COMPACT_BETA: &str = "compact-2026-01-12";
+const ON_DEMAND_COMPACT_BETA: &str = "compact-2026-09-04";
 const CONTEXT_MANAGEMENT_BETA: &str = "context-management-2025-06-27";
 const TOOL_SEARCH_BETA: &str = "tool-search-tool-2025-10-19";
 const WEB_SEARCH_BETA: &str = "web-search-2025-03-05";
@@ -263,10 +267,15 @@ pub fn shape_request(
     if platform == Platform::Bedrock {
         obj.remove("stream");
     }
-    obj.insert(
-        "anthropic_version".to_string(),
-        Value::String(platform.anthropic_version().to_string()),
-    );
+    if platform == Platform::Bedrock {
+        obj.insert(
+            "anthropic_version".to_string(),
+            Value::String(platform.anthropic_version().to_string()),
+        );
+    } else {
+        obj.entry("anthropic_version")
+            .or_insert_with(|| Value::String(platform.anthropic_version().to_string()));
+    }
     if let Some(metadata) = obj.remove("metadata") {
         let mut kept = Map::new();
         if let Some(user_id) = metadata.get("user_id").filter(|v| v.is_string()) {
@@ -279,6 +288,28 @@ pub fn shape_request(
     fold_output_format(obj);
 
     let mut wanted: BTreeSet<String> = betas.into_iter().collect();
+    // 新压缩参数与带签名历史块都需要同一 beta；历史内容保持原样。
+    // https://docs.aws.amazon.com/bedrock/latest/userguide/claude-messages-compaction.html
+    if obj.get("compaction").is_some_and(Value::is_object)
+        || obj
+            .get("messages")
+            .and_then(Value::as_array)
+            .is_some_and(|messages| {
+                messages.iter().any(|message| {
+                    message
+                        .get("content")
+                        .and_then(Value::as_array)
+                        .is_some_and(|blocks| {
+                            blocks.iter().any(|block| {
+                                block.get("type").and_then(Value::as_str) == Some("compaction")
+                                    && block.get("signature").is_some()
+                            })
+                        })
+                })
+            })
+    {
+        wanted.insert(ON_DEMAND_COMPACT_BETA.to_string());
+    }
     match platform {
         Platform::Bedrock => {
             if effort_needs_beta(obj, upstream_id) {
@@ -373,6 +404,15 @@ pub fn shape_request(
 /// as one text block, so a body counts the same in either content form,
 /// `thinking` included.
 pub fn bedrock_count_tokens_invoke_body(body: &Value, upstream_id: &str) -> Value {
+    bedrock_count_tokens_invoke_body_with_betas(body, upstream_id, Vec::new())
+}
+
+/// 计数请求只额外携带压缩历史所需的 beta，不照搬所有推理 beta。
+pub fn bedrock_count_tokens_invoke_body_with_betas(
+    body: &Value,
+    upstream_id: &str,
+    betas: Vec<String>,
+) -> Value {
     let mut out = body.clone();
     for message in out
         .get_mut("messages")
@@ -388,7 +428,12 @@ pub fn bedrock_count_tokens_invoke_body(body: &Value, upstream_id: &str) -> Valu
             message["content"] = serde_json::json!([{"type": "text", "text": text}]);
         }
     }
-    shape_request(&mut out, Platform::Bedrock, upstream_id, Vec::new());
+    shape_request(
+        &mut out,
+        Platform::Bedrock,
+        upstream_id,
+        count_compaction_betas(betas),
+    );
     let budget = out
         .get("thinking")
         .and_then(|t| t.get("budget_tokens"))
@@ -411,14 +456,35 @@ pub fn bedrock_count_tokens_invoke_body(body: &Value, upstream_id: &str) -> Valu
 /// `cache_control` adjustments `/v1/messages` gets there, with `model` —
 /// which this route reads from the body — set to `model`.
 pub fn vertex_count_tokens_body(body: &Value, model: &str) -> Value {
+    vertex_count_tokens_body_with_betas(body, model, Vec::new()).0
+}
+
+/// 返回计数正文及压缩历史所需的请求头 beta。
+pub fn vertex_count_tokens_body_with_betas(
+    body: &Value,
+    model: &str,
+    betas: Vec<String>,
+) -> (Value, Vec<String>) {
     let mut out = body.clone();
-    shape_request(&mut out, Platform::Vertex, model, Vec::new());
+    let betas = shape_request(
+        &mut out,
+        Platform::Vertex,
+        model,
+        count_compaction_betas(betas),
+    );
     if let Some(obj) = out.as_object_mut() {
         obj.remove("anthropic_version");
         obj.remove("stream");
         obj.insert("model".to_string(), Value::String(model.to_string()));
     }
-    out
+    (out, betas)
+}
+
+fn count_compaction_betas(betas: Vec<String>) -> Vec<String> {
+    betas
+        .into_iter()
+        .filter(|beta| matches!(beta.as_str(), COMPACT_BETA | ON_DEMAND_COMPACT_BETA))
+        .collect()
 }
 
 /// Where each media URL in an Anthropic Messages body sits: `image` and
@@ -687,9 +753,73 @@ fn filter_bedrock_context_management(obj: &mut Map<String, Value>, betas: &mut B
         obj.remove("context_management");
     }
 }
-
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn compat_claude_native_platform_on_demand_compaction() {
+        for platform in [Platform::Bedrock, Platform::Vertex] {
+            let mut body = json!({"model":"alias","max_tokens":4096,"compaction":{"type":"summarize","instructions":"keep facts"},"messages":[{"role":"user","content":"hi"}]});
+            let betas = shape_request(
+                &mut body,
+                platform,
+                "claude-opus-5-5",
+                vec!["compact-2026-09-04".into()],
+            );
+            assert_eq!(
+                body["compaction"],
+                json!({"type":"summarize","instructions":"keep facts"})
+            );
+            assert!(
+                betas.iter().any(|v| v == "compact-2026-09-04"),
+                "{platform:?}: {betas:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compat_claude_native_signed_compaction_adoption_adds_beta() {
+        for platform in [Platform::Bedrock, Platform::Vertex] {
+            let block =
+                json!({"type":"compaction","content":"summary","signature":"opaque-signature"});
+            let mut body = json!({"model":"alias","max_tokens":64,"messages":[{"role":"assistant","content":[block.clone()]},{"role":"user","content":"continue"}]});
+            let betas = shape_request(&mut body, platform, "claude-opus-5-5", vec![]);
+            assert_eq!(body["messages"][0]["content"][0], block);
+            assert!(
+                betas.iter().any(|v| v == "compact-2026-09-04"),
+                "{platform:?}: {betas:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compat_claude_native_bedrock_count_keeps_signed_compaction_beta() {
+        let body = json!({"messages":[{"role":"assistant","content":[{"type":"compaction","content":"summary","signature":"opaque-signature"}]}]});
+        let out = bedrock_count_tokens_invoke_body(&body, "anthropic.claude-opus-5-5");
+        assert!(
+            out["anthropic_beta"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|v| v == "compact-2026-09-04")),
+            "{out}"
+        );
+        assert_eq!(out["messages"], body["messages"]);
+    }
+
+    #[test]
+    fn compat_claude_native_vertex_explicit_body_version() {
+        for requested in [None, Some("vertex-2023-10-16"), Some("2026-10-21")] {
+            let mut body = json!({"model":"alias","max_tokens":64,"messages":[{"role":"user","content":"hi"}]});
+            if let Some(v) = requested {
+                body["anthropic_version"] = json!(v);
+            }
+            shape_request(&mut body, Platform::Vertex, "claude-opus-5-5", vec![]);
+            assert_eq!(
+                body["anthropic_version"],
+                requested.unwrap_or("vertex-2023-10-16")
+            );
+        }
+    }
+
     use super::*;
     use serde_json::json;
 

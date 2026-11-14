@@ -1,88 +1,103 @@
-/* 价格详情自身管理宽度，嵌入主表或窄详情栏时只在价格区内滚动。 */
+/* 价格以两列价目展开；上下文区间在单元格内换行，不产生横向价格长表。 */
 .price-card-details {
   display: grid;
   min-width: 0;
   max-width: 100%;
-  gap: 16px;
+  gap: 20px;
   white-space: normal;
-  color: var(--color-ink);
+  color: var(--foreground);
 }
 .price-card-tier {
   min-width: 0;
-  border: 1px solid color-mix(in srgb, var(--color-ink) 9%, transparent);
-  border-radius: var(--radius-cell);
-  background: var(--color-surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--card);
   overflow: hidden;
 }
 .price-card-tier-heading {
   display: flex;
   flex-wrap: wrap;
-  align-items: baseline;
+  align-items: center;
   justify-content: space-between;
   gap: 8px 12px;
-  padding: 12px 16px;
-  border-bottom: 1px solid color-mix(in srgb, var(--color-ink) 7%, transparent);
-  background: color-mix(in srgb, var(--color-ink) 3%, var(--color-surface));
+  min-height: 48px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--card);
 }
 .price-card-tier-heading h4,
 .price-card-tier-heading code {
   margin: 0;
   overflow-wrap: anywhere;
-  font-size: var(--text-caption);
-  line-height: 1.45;
+  font-size: 14px;
+  line-height: 22px;
 }
-.price-card-tier-heading h4 { font-weight: 500; }
-.price-card-tier-heading code { color: var(--color-muted); font-weight: 400; }
-.price-card-band { min-width: 0; padding: 12px 16px 16px; }
-.price-card-headline { margin: 0 0 8px; color: var(--color-ink-soft); font-size: var(--text-caption); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
-.price-card-table-wrap { max-width: 100%; overflow-x: auto; overscroll-behavior-x: contain; }
+.price-card-tier-heading h4 { font-size: 15px; line-height: 24px; font-weight: 600; }
+.price-card-tier-heading code { color: var(--muted-foreground); font-weight: 400; }
+.price-card-band { min-width: 0; padding: 12px 0 0; }
+.price-card-headline { margin: 0 16px 12px; color: var(--ink-soft); font-size: var(--text-caption); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.price-card-table-wrap { min-width: 0; max-width: 100%; }
+.price-card-table-wrap:focus-visible { outline: 2px solid var(--foreground); outline-offset: -2px; }
 .price-card-details table.price-card-table {
   width: 100%;
-  min-width: 20rem;
-  table-layout: auto;
+  min-width: 0;
+  table-layout: fixed;
   border-collapse: collapse;
   font-size: var(--text-caption);
   line-height: 1.45;
 }
-.price-card-dimension-col { width: 9rem; }
-.price-card-amount-col { width: 10rem; }
-.price-card-unit-col { width: 7rem; }
+.price-card-dimension-col { width: 28%; }
+.price-card-amount-col { width: 72%; }
 /* 高于外层宽表的单元格规则，防止展开价卡继承黏性表头或行底色。 */
 .price-card-details table.price-card-table > thead > tr > th,
 .price-card-details table.price-card-table > tbody > tr > th,
 .price-card-details table.price-card-table > tbody > tr > td {
   position: static;
-  height: auto;
-  padding: 8px 6px;
+  height: 40px;
+  padding: 8px 16px;
   border: 0;
-  border-bottom: 1px solid color-mix(in srgb, var(--color-ink) 7%, transparent);
+  border-bottom: 1px solid var(--border);
   background: transparent;
   white-space: normal;
-  vertical-align: top;
+  vertical-align: middle;
   text-align: left;
   overflow-wrap: anywhere;
   font-family: var(--font-sans);
-  font-size: var(--text-caption);
+  font-size: 14px;
   font-weight: 400;
   letter-spacing: normal;
-  color: var(--color-ink-soft);
+  color: var(--ink-soft);
 }
-.price-card-details table.price-card-table > thead > tr > th { color: var(--color-muted); font-size: var(--text-micro); }
+.price-card-details table.price-card-table > thead > tr > th { height: 44px; color: var(--muted-foreground); font-size: 12px; font-weight: 500; line-height: 18px; }
 .price-card-details table.price-card-table > thead > tr > th:nth-child(n+3),
 .price-card-details table.price-card-table > tbody > tr > td.price-card-amount { text-align: right; }
 .price-card-details table.price-card-table > tbody > tr > td.price-card-amount {
-  color: var(--color-ink);
-  font-family: var(--font-mono);
+  color: var(--foreground);
+  font-family: var(--font-sans);
   font-variant-numeric: tabular-nums;
-  white-space: nowrap;
+  white-space: normal;
 }
-.price-card-details table.price-card-table > tbody > tr > th.price-card-group-heading { padding-top: 14px; color: var(--color-muted); font-size: var(--text-micro); font-weight: 500; }
+.price-card-details table.price-card-table > tbody > tr > th.price-card-group-heading { height: 32px; padding: 6px 16px; background: var(--well); color: var(--ink-soft); font-size: 12px; font-weight: 500; line-height: 18px; }
 .price-card-details table.price-card-table > tbody:last-child > tr:last-child > th,
 .price-card-details table.price-card-table > tbody:last-child > tr:last-child > td { border-bottom: 0; }
-.price-card-missing { color: var(--color-muted); font-family: var(--font-sans); }
-.price-card-empty { margin: 0; padding: 8px 0; font-size: var(--text-caption); color: var(--color-muted); }
-.price-card-invalid { min-width: 0; font-size: var(--text-caption); color: var(--color-ink-soft); }
-.price-card-invalid pre { max-width: 100%; overflow: auto; white-space: pre; }
+.price-card-missing { color: var(--muted-foreground); font-family: var(--font-sans); }
+.price-card-empty { margin: 0; padding: 8px 0; font-size: var(--text-caption); color: var(--muted-foreground); }
+.price-card-invalid { min-width: 0; font-size: var(--text-caption); color: var(--ink-soft); }
+.price-card-invalid pre { max-width: 100%; white-space: pre-wrap; overflow-wrap: anywhere; }
 .price-card-details-compact { gap: 12px; }
-.price-card-details-compact .price-card-tier-heading { padding: 10px 12px; }
-.price-card-details-compact .price-card-band { padding: 10px 12px 12px; }
+.price-card-details-compact .price-card-tier-heading { padding: 8px 12px; }
+.price-card-details-compact .price-card-band { padding: 12px 0 0; }
+
+.price-card-unit { display: block; margin-top: 5px; color: var(--muted-foreground); font-size: 12px; line-height: 18px; font-weight: 400; white-space: normal; }
+.price-card-contexts { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 12rem), 1fr)); gap: 12px 20px; margin: 0; }
+.price-card-contexts > div { min-width: 0; }
+.price-card-contexts dt { color: var(--muted-foreground); font-size: 12px; line-height: 18px; font-weight: 400; overflow-wrap: anywhere; }
+.price-card-contexts dd { margin: 5px 0 0; color: var(--foreground); font-size: 14px; line-height: 22px; font-weight: 500; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+@media (max-width: 600px) {
+  .price-card-dimension-col { width: 34%; }
+  .price-card-amount-col { width: 66%; }
+  .price-card-details table.price-card-table > thead > tr > th,
+  .price-card-details table.price-card-table > tbody > tr > th,
+  .price-card-details table.price-card-table > tbody > tr > td { padding-inline: 12px; vertical-align: top; }
+  .price-card-contexts { grid-template-columns: minmax(0, 1fr); gap: 12px; }
+}

@@ -15,10 +15,11 @@
 //! `aisix_provider_openai::overrides`.
 
 use aisix_core::{RequestOverrides, ResponseOverrides, StreamDoneMarker};
+use aisix_gateway::upstream_io::{self, Protocol};
 use aisix_gateway::{
     apply_request_headers, Bridge, BridgeContext, BridgeError, ChatChunk, ChatChunkStream,
-    ChatFormat, ChatResponse, EmbeddingRequest, EmbeddingResponse, SseDecoder, SseEvent,
-    UpstreamHeaderContext,
+    ChatFormat, ChatResponse, CompletionByteStream, EmbeddingRequest, EmbeddingResponse,
+    SseDecoder, SseEvent, UpstreamHeaderContext,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -237,6 +238,48 @@ impl AzureOpenAiBridge {
                 })
             }
         }
+    }
+
+    // 原生 completion 不经过 chat 投影；部署、凭据及覆盖与其余 Azure 请求一致。
+    async fn send_completion_raw(
+        &self,
+        body: &Value,
+        ctx: &BridgeContext,
+        stream: bool,
+    ) -> Result<reqwest::Response, BridgeError> {
+        let deployment = upstream_model(ctx)?;
+        let upstream = AzureUpstreamRef::resolve(deployment, ctx.provider_key.api_base.as_deref())?;
+        let auth = self.resolve_auth(ctx, Instant::now()).await?;
+        let mut outbound = body.clone();
+        if let Some(object) = outbound.as_object_mut() {
+            object.insert("model".into(), Value::String(deployment.to_string()));
+        }
+        let outbound = aisix_gateway::json_body(&prepare_outbound_body(
+            &outbound,
+            false,
+            false,
+            ctx.provider_key.request.as_ref(),
+            ctx.provider_key.response.as_ref(),
+        )?)
+        .map_err(|error| BridgeError::Config(format!("serialize request body: {error}")))?;
+        let headers = build_request_headers(&auth, &ctx.request_id, stream, &ctx.header_ctx())?;
+        let url = self.resolve_route_url(ctx, &upstream, "azure/completions", || {
+            upstream.deployment_url("completions")
+        });
+        let response = upstream_io::send(
+            url.post_on(&self.client_for(ctx))
+                .headers(headers)
+                .body(outbound),
+            Protocol::Completions,
+        )
+        .await
+        .map_err(aisix_gateway::send_error)?;
+        aisix_gateway::note_upstream_response(response.headers());
+        let status = response.status();
+        if !status.is_success() {
+            return Err(map_http_error(status, response).await);
+        }
+        Ok(response)
     }
 }
 
@@ -580,6 +623,73 @@ pub async fn resolve_credential(secret: &str) -> Result<AzureCredential, BridgeE
     }
 }
 
+/// 为原生媒体端点生成 Azure URL 和请求头；模型字段由调用方写入部署名。
+/// 当前 v1 同时定义 JSON、表单与流响应，旧版部署 API 不具备同一契约。
+/// <https://learn.microsoft.com/en-us/azure/foundry/reference/rest/>
+pub async fn media_request_parts(
+    ctx: &BridgeContext,
+    route: &str,
+    multipart: bool,
+) -> Result<(aisix_gateway::url_cache::EndpointUrl, HeaderMap), BridgeError> {
+    let cache_key = match route {
+        "/audio/speech" => "azure/v1/audio/speech",
+        "/audio/transcriptions" => "azure/v1/audio/transcriptions",
+        "/audio/translations" => "azure/v1/audio/translations",
+        "/images/generations" => "azure/v1/images/generations",
+        "/images/edits" => "azure/v1/images/edits",
+        _ => {
+            return Err(BridgeError::InvalidUpstreamConfig(
+                "unsupported Azure media route".into(),
+            ));
+        }
+    };
+    let deployment = upstream_model(ctx)?;
+    let upstream = AzureUpstreamRef::resolve(deployment, ctx.provider_key.api_base.as_deref())?;
+    let credential = with_deadline(
+        ctx.deadline,
+        Instant::now(),
+        resolve_credential(&ctx.provider_key.api_key),
+    )
+    .await?;
+    let auth = match credential {
+        AzureCredential::ApiKey(key) => AzureAuth {
+            api_key: Some(key),
+            bearer_token: None,
+        },
+        AzureCredential::Bearer(token) => AzureAuth {
+            api_key: None,
+            bearer_token: Some(token),
+        },
+    };
+    let mut headers = build_request_headers(&auth, &ctx.request_id, false, &ctx.header_ctx())?;
+    if multipart {
+        // 表单边界和长度属于最终编码，操作员默认值不能覆盖它们。
+        headers.remove(header::CONTENT_TYPE);
+        headers.remove(header::CONTENT_LENGTH);
+    }
+    let url = aisix_gateway::url_cache::cached_endpoint_url(
+        &ctx.provider_key_id,
+        cache_key,
+        &[ctx.provider_key.api_base.as_deref().unwrap_or("")],
+        || {
+            let base = upstream.upstream_override.as_deref().map_or_else(
+                || format!("https://{}.openai.azure.com", upstream.resource),
+                |base| base.trim_end_matches('/').to_string(),
+            );
+            let root = if base.ends_with("/openai/v1") {
+                base
+            } else if base.ends_with("/openai") {
+                format!("{base}/v1")
+            } else {
+                format!("{base}/openai/v1")
+            };
+            Ok::<_, std::convert::Infallible>(format!("{root}{route}"))
+        },
+    )
+    .unwrap_or_else(|never| match never {});
+    Ok((url, headers))
+}
+
 /// Resolved per-request auth header pair the bridge writes onto the
 /// outbound request. Exactly ONE of `api_key` / `bearer_token` is
 /// `Some`; the other is `None`.
@@ -809,6 +919,31 @@ impl Bridge for AzureOpenAiBridge {
         aisix_core::Adapter::AzureOpenai.wire_protocol()
     }
 
+    async fn complete(&self, body: &Value, ctx: &BridgeContext) -> Result<Value, BridgeError> {
+        with_deadline(ctx.deadline, Instant::now(), async {
+            let response = self.send_completion_raw(body, ctx, false).await?;
+            aisix_gateway::decode_success_body(response, aisix_gateway::UpstreamWire::AzureOpenAI)
+                .await
+        })
+        .await
+    }
+
+    async fn complete_stream(
+        &self,
+        body: &Value,
+        ctx: &BridgeContext,
+    ) -> Result<CompletionByteStream, BridgeError> {
+        let response = with_deadline(ctx.deadline, Instant::now(), async {
+            self.send_completion_raw(body, ctx, true).await
+        })
+        .await?;
+        Ok(Box::pin(
+            response
+                .bytes_stream()
+                .map(|item| item.map_err(aisix_gateway::send_error)),
+        ))
+    }
+
     async fn chat(
         &self,
         req: &ChatFormat,
@@ -859,13 +994,12 @@ impl Bridge for AzureOpenAiBridge {
         let client = self.client_for(ctx);
 
         with_deadline(ctx.deadline, started, async move {
-            let resp = url
-                .post_on(&client)
-                .headers(headers)
-                .body(body)
-                .send()
-                .await
-                .map_err(aisix_gateway::send_error)?;
+            let resp = upstream_io::send(
+                url.post_on(&client).headers(headers).body(body),
+                Protocol::Chat,
+            )
+            .await
+            .map_err(aisix_gateway::send_error)?;
 
             aisix_gateway::note_upstream_response(resp.headers());
             let status = resp.status();
@@ -928,12 +1062,12 @@ impl Bridge for AzureOpenAiBridge {
         let client = self.client_for(ctx);
 
         let resp = with_deadline(ctx.deadline, started, async move {
-            url.post_on(&client)
-                .headers(headers)
-                .body(body)
-                .send()
-                .await
-                .map_err(aisix_gateway::send_error)
+            upstream_io::send(
+                url.post_on(&client).headers(headers).body(body),
+                Protocol::Chat,
+            )
+            .await
+            .map_err(aisix_gateway::send_error)
         })
         .await?;
 
@@ -1021,13 +1155,12 @@ impl Bridge for AzureOpenAiBridge {
         let client = self.client_for(ctx);
 
         with_deadline(ctx.deadline, started, async move {
-            let resp = url
-                .post_on(&client)
-                .headers(headers)
-                .body(body)
-                .send()
-                .await
-                .map_err(aisix_gateway::send_error)?;
+            let resp = upstream_io::send(
+                url.post_on(&client).headers(headers).body(body),
+                Protocol::Embeddings,
+            )
+            .await
+            .map_err(aisix_gateway::send_error)?;
 
             aisix_gateway::note_upstream_response(resp.headers());
             let status = resp.status();
@@ -1077,13 +1210,12 @@ impl Bridge for AzureOpenAiBridge {
         let client = self.client_for(ctx);
 
         with_deadline(ctx.deadline, started, async move {
-            let resp = url
-                .post_on(&client)
-                .headers(headers)
-                .body(outbound)
-                .send()
-                .await
-                .map_err(aisix_gateway::send_error)?;
+            let resp = upstream_io::send(
+                url.post_on(&client).headers(headers).body(outbound),
+                Protocol::Images,
+            )
+            .await
+            .map_err(aisix_gateway::send_error)?;
 
             aisix_gateway::note_upstream_response(resp.headers());
             let status = resp.status();
@@ -3490,6 +3622,324 @@ mod tests {
             .expect_err("nothing listens there");
         for rendered in [err.to_string(), format!("{err:?}")] {
             assert!(!rendered.contains("sk-live-9f2b1e"), "{rendered}");
+        }
+    }
+
+    #[tokio::test]
+    async fn compat_azure_completion_preserves_native_json_and_request_fields() {
+        let server = MockServer::builder().start().await;
+        let expected = serde_json::json!({
+            "id":"cmpl-native", "object":"text_completion", "created":1700000000,
+            "model":"gpt4o-prod", "choices":[
+                {"index":0,"text":"one", "finish_reason":"stop",
+                 "logprobs":{"tokens":["one"],"token_logprobs":[-0.25],"text_offset":[0],"top_logprobs":[{"one":-0.25}]}},
+                {"index":1,"text":"two", "finish_reason":"length","logprobs":null}
+            ],
+            "usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10},
+            "prompt_filter_results":[{"prompt_index":0,"content_filter_results":{"hate":{"filtered":false,"severity":"safe"}}}]
+        });
+        Mock::given(method("POST"))
+            .and(path("/openai/deployments/gpt4o-prod/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&expected))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let ctx = BridgeContext::new("req-native", sample_model(), sample_pk(Some(&server.uri())));
+        let request = serde_json::json!({"model":"public-model","prompt":[[11,22],[33]],
+            "n":2,"logprobs":3,"echo":true,"suffix":"END","best_of":2,
+            "max_tokens":12,"stop":["STOP"],"seed":42});
+        let response = AzureOpenAiBridge::new()
+            .complete(&request, &ctx)
+            .await
+            .expect("Azure exposes native legacy completions");
+        assert_eq!(response, expected);
+        let received = server.received_requests().await.unwrap();
+        let sent = &received[0];
+        assert_eq!(sent.url.query(), Some("api-version=2024-10-21"));
+        assert_eq!(sent.headers.get("api-key").unwrap(), "az-key");
+        assert!(!sent.headers.contains_key("authorization"));
+        let mut expected_request = request;
+        expected_request["model"] = Value::String("gpt4o-prod".into());
+        assert_eq!(sent.body_json::<Value>().unwrap(), expected_request);
+    }
+
+    #[tokio::test]
+    async fn compat_azure_completion_stream_preserves_native_sse_and_usage() {
+        let server = MockServer::builder().start().await;
+        let raw = "data: {\"id\":\"cmpl-native\",\"choices\":[{\"index\":1,\"text\":\"two\",\"logprobs\":{\"tokens\":[\"two\"],\"token_logprobs\":[-0.5]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"cmpl-native\",\"choices\":[{\"index\":0,\"text\":\"one\",\"finish_reason\":\"stop\"},{\"index\":1,\"text\":\"\",\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3,\"total_tokens\":10}}\n\ndata: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/openai/deployments/gpt4o-prod/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(raw),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let ctx = BridgeContext::new(
+            "req-native-stream",
+            sample_model(),
+            sample_pk(Some(&server.uri())),
+        );
+        let request = serde_json::json!({"model":"public-model","prompt":"hello","stream":true,"n":2,"logprobs":2});
+        let mut stream = AzureOpenAiBridge::new()
+            .complete_stream(&request, &ctx)
+            .await
+            .expect("Azure exposes streaming native completions");
+        let mut bytes = Vec::new();
+        while let Some(part) = stream.next().await {
+            bytes.extend_from_slice(&part.unwrap());
+        }
+        assert_eq!(bytes, raw.as_bytes());
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(
+            received[0].headers.get("accept").unwrap(),
+            "text/event-stream"
+        );
+        assert_eq!(received[0].url.query(), Some("api-version=2024-10-21"));
+        let mut expected_request = request;
+        expected_request["model"] = Value::String("gpt4o-prod".into());
+        assert_eq!(received[0].body_json::<Value>().unwrap(), expected_request);
+    }
+
+    #[tokio::test]
+    async fn compat_azure_completion_aad_uses_cached_bearer_in_both_modes() {
+        let aad = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"access_token":"completion-token","expires_in":3600}),
+            ))
+            .expect(1)
+            .mount(&aad)
+            .await;
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .respond_with(|req: &wiremock::Request| {
+                assert_eq!(
+                    req.headers.get("authorization").unwrap(),
+                    "Bearer completion-token"
+                );
+                assert!(!req.headers.contains_key("api-key"));
+                if req.body_json::<Value>().unwrap()["stream"] == true {
+                    ResponseTemplate::new(200).set_body_string("data: [DONE]\n\n")
+                } else {
+                    ResponseTemplate::new(200).set_body_json(
+                        serde_json::json!({"id":"cmpl-aad","choices":[{"index":0,"text":"ok"}]}),
+                    )
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        let bridge = AzureOpenAiBridge::new().with_aad_token_endpoint_override(aad.uri());
+        let ctx = BridgeContext::new(
+            "req-aad",
+            sample_model(),
+            sample_pk_with_aad_secret(&server.uri()),
+        );
+        bridge
+            .complete(&serde_json::json!({"model":"alias","prompt":"hi"}), &ctx)
+            .await
+            .unwrap();
+        let mut stream = bridge
+            .complete_stream(
+                &serde_json::json!({"model":"alias","prompt":"hi","stream":true}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        while let Some(part) = stream.next().await {
+            part.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn compat_azure_completion_deadline_covers_response_body_in_both_modes() {
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(250))
+                    .set_body_json(serde_json::json!({"id":"late","choices":[]})),
+            )
+            .mount(&server)
+            .await;
+        let ctx = BridgeContext::new(
+            "req-timeout",
+            sample_model(),
+            sample_pk(Some(&server.uri())),
+        )
+        .with_deadline(Duration::from_millis(20));
+        let bridge = AzureOpenAiBridge::new();
+        let buffered = bridge
+            .complete(&serde_json::json!({"prompt":"hi"}), &ctx)
+            .await;
+        assert!(
+            matches!(buffered, Err(BridgeError::Timeout { .. })),
+            "{buffered:?}"
+        );
+        let streamed = bridge
+            .complete_stream(&serde_json::json!({"prompt":"hi","stream":true}), &ctx)
+            .await;
+        assert!(matches!(streamed, Err(BridgeError::Timeout { .. })));
+    }
+
+    #[tokio::test]
+    async fn compat_azure_completion_errors_use_shared_credential_scrubber() {
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error":{"message":"invalid prompt az-key","type":"invalid_request_error","param":"prompt","code":"BadArgument"}
+            }))).expect(1).mount(&server).await;
+        let ctx = BridgeContext::new("req-error", sample_model(), sample_pk(Some(&server.uri())));
+        let tap = Arc::new(aisix_gateway::response_tap::ResponseHeaderTap::default());
+        aisix_gateway::response_tap::scope(tap, async {
+            let err = AzureOpenAiBridge::new()
+                .complete(&serde_json::json!({"prompt":"hi"}), &ctx)
+                .await
+                .unwrap_err();
+            let rendered = format!("{err:?}");
+            assert!(!rendered.contains("az-key"), "{rendered}");
+            assert!(rendered.contains("invalid prompt"), "{rendered}");
+            assert!(rendered.contains("BadArgument"), "{rendered}");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn compat_azure_media_uses_native_v1_and_preserves_configured_prefix() {
+        for prefix in [
+            "",
+            "/private/azure",
+            "/private/openai",
+            "/private/openai/v1/",
+        ] {
+            let server = MockServer::builder().start().await;
+            let v1 = match prefix {
+                "/private/openai" | "/private/openai/v1/" => "/private/openai/v1",
+                "/private/azure" => "/private/azure/openai/v1",
+                _ => "/openai/v1",
+            };
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(5)
+                .mount(&server)
+                .await;
+            let base = format!("{}{prefix}", server.uri());
+            let ctx = BridgeContext::new("req-media", sample_model(), sample_pk(Some(&base)));
+            for route in [
+                "/audio/speech",
+                "/audio/transcriptions",
+                "/audio/translations",
+                "/images/generations",
+                "/images/edits",
+            ] {
+                let (url, headers) = media_request_parts(&ctx, route, false).await.unwrap();
+                assert_eq!(headers.get("api-key").unwrap(), "az-key");
+                assert!(!headers.contains_key("authorization"));
+                assert_eq!(headers.get("content-type").unwrap(), "application/json");
+                url.post_on(&Client::new())
+                    .headers(headers)
+                    .body("{}")
+                    .send()
+                    .await
+                    .unwrap();
+            }
+            let requests = server.received_requests().await.unwrap();
+            for (request, route) in requests.iter().zip([
+                "/audio/speech",
+                "/audio/transcriptions",
+                "/audio/translations",
+                "/images/generations",
+                "/images/edits",
+            ]) {
+                assert_eq!(request.url.path(), format!("{v1}{route}"));
+                assert_eq!(request.url.query(), None);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn compat_azure_media_multipart_owns_its_content_headers() {
+        let server = MockServer::builder().start().await;
+        let mut provider_key = (*sample_pk(Some(&server.uri()))).clone();
+        provider_key.request = Some(RequestOverrides {
+            default_headers: [
+                (
+                    "Content-Type".into(),
+                    "multipart/form-data; boundary=wrong".into(),
+                ),
+                ("Content-Length".into(), "1".into()),
+                ("x-media-sentinel".into(), "kept".into()),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        });
+        let ctx = BridgeContext::new("req-form", sample_model(), Arc::new(provider_key));
+        let (_, headers) = media_request_parts(&ctx, "/images/edits", true)
+            .await
+            .unwrap();
+        assert!(!headers.contains_key("content-type"));
+        assert!(!headers.contains_key("content-length"));
+        assert_eq!(headers.get("x-media-sentinel").unwrap(), "kept");
+        assert_eq!(headers.get("api-key").unwrap(), "az-key");
+        assert_eq!(headers.get("x-aisix-request-id").unwrap(), "req-form");
+    }
+
+    #[tokio::test]
+    async fn compat_azure_media_shared_aad_minter_caches_and_obeys_deadline() {
+        for delay in [0, 250] {
+            let aad = MockServer::builder().start().await;
+            Mock::given(method("POST"))
+                .and(path("/media-tenant/oauth2/v2.0/token"))
+                .respond_with(ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(delay))
+                    .set_body_json(serde_json::json!({"access_token":"media-cached-token","expires_in":3600})))
+                .expect(1).mount(&aad).await;
+            let secret = serde_json::json!({"tenant_id":"media-tenant","client_id":"media-client","client_secret":"media-secret","authority_host":aad.uri()}).to_string();
+            let provider_key: ProviderKey = serde_json::from_value(serde_json::json!({
+                "display_name":"media-key","api_key":secret,"api_base":"https://acme.openai.azure.com"
+            })).unwrap();
+            let ctx = BridgeContext::new("req-media-aad", sample_model(), Arc::new(provider_key))
+                .with_deadline(Duration::from_millis(if delay == 0 { 2000 } else { 25 }));
+            let result = media_request_parts(&ctx, "/audio/speech", false).await;
+            if delay > 0 {
+                assert!(matches!(result, Err(BridgeError::Timeout { .. })));
+            } else {
+                let (_, headers) = result.unwrap();
+                assert_eq!(
+                    headers.get("authorization").unwrap(),
+                    "Bearer media-cached-token"
+                );
+                assert!(!headers.contains_key("api-key"));
+                let (_, headers) = media_request_parts(&ctx, "/images/edits", true)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    headers.get("authorization").unwrap(),
+                    "Bearer media-cached-token"
+                );
+                assert!(!headers.contains_key("api-key"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn compat_azure_media_rejects_routes_outside_its_finite_family() {
+        let ctx = canonical_test_ctx();
+        for route in [
+            "/chat/completions",
+            "/images/edits/extra",
+            "/audio/../responses",
+            "/images/generations?x=1",
+        ] {
+            let error = media_request_parts(&ctx, route, false).await.unwrap_err();
+            assert!(
+                matches!(error, BridgeError::InvalidUpstreamConfig(_)),
+                "{error:?}"
+            );
         }
     }
 }

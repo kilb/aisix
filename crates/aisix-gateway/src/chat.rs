@@ -211,7 +211,7 @@ pub fn blocks_text(blocks: &[Value]) -> String {
 fn part_has_named_slots(part: &Value) -> bool {
     match part.get("type").and_then(Value::as_str) {
         Some("text") => part.get("text").is_none_or(Value::is_string),
-        Some("image_url" | "input_audio" | "file") => true,
+        Some("image_url" | "input_audio" | "file" | "redacted_thinking") => true,
         _ => is_reasoning_part(part),
     }
 }
@@ -720,6 +720,9 @@ pub struct UsageStats {
     /// Raw OpenAI cache-write count; it is not additive to prompt tokens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_write_tokens: Option<u32>,
+    /// 遥测缓存报告状态；不写入共享缓存，避免滚动升级的严格解码冲突。
+    #[serde(skip)]
+    pub cache_usage_reported: Option<bool>,
     /// OpenAI o1/o3 reasoning tokens. Subset of `completion_tokens`.
     #[serde(default)]
     pub reasoning_tokens: u32,
@@ -1049,6 +1052,7 @@ impl ModalityTokens {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OpenAiUsageDetails {
     pub cached_tokens_reported: bool,
+    pub cache_creation_tokens_reported: bool,
     pub reasoning_tokens_reported: bool,
     pub prompt_text_tokens: Option<u32>,
     pub completion_text_tokens: Option<u32>,
@@ -1067,6 +1071,8 @@ impl OpenAiUsageDetails {
         }
         Self {
             cached_tokens_reported: self.cached_tokens_reported || other.cached_tokens_reported,
+            cache_creation_tokens_reported: self.cache_creation_tokens_reported
+                || other.cache_creation_tokens_reported,
             reasoning_tokens_reported: self.reasoning_tokens_reported
                 || other.reasoning_tokens_reported,
             prompt_text_tokens: add(self.prompt_text_tokens, other.prompt_text_tokens),
@@ -1087,6 +1093,8 @@ impl OpenAiUsageDetails {
     pub fn max_fieldwise(&self, other: &Self) -> Self {
         Self {
             cached_tokens_reported: self.cached_tokens_reported || other.cached_tokens_reported,
+            cache_creation_tokens_reported: self.cache_creation_tokens_reported
+                || other.cache_creation_tokens_reported,
             reasoning_tokens_reported: self.reasoning_tokens_reported
                 || other.reasoning_tokens_reported,
             prompt_text_tokens: self.prompt_text_tokens.max(other.prompt_text_tokens),
@@ -1161,6 +1169,19 @@ pub fn merge_stream_upstream_total(acc: &mut Option<u32>, frame_total: u32) {
 }
 
 impl UsageStats {
+    /// 缓存采样只取实际报告的计数，保留显式零值和未报告的区别。
+    pub fn cache_usage_reported(&self) -> Option<bool> {
+        self.cache_usage_reported.or(Some(
+            self.openai_details.cached_tokens_reported
+                || self.openai_details.cache_creation_tokens_reported
+                || self.cache_write_tokens.is_some()
+                || self.prompt_cache_hit_tokens.is_some()
+                || self.cached_prompt_tokens > 0
+                || self.cache_read_tokens > 0
+                || self.cache_creation_tokens > 0,
+        ))
+    }
+
     pub fn new(prompt: u32, completion: u32) -> Self {
         Self {
             prompt_tokens: prompt,
@@ -1217,6 +1238,20 @@ impl UsageStats {
                 .cached_prompt_tokens
                 .saturating_add(other.cached_prompt_tokens),
             cache_write_tokens: add_opt(self.cache_write_tokens, other.cache_write_tokens),
+            cache_usage_reported: Some(
+                ((self.prompt_tokens == 0
+                    && self.completion_tokens == 0
+                    && self.cache_read_tokens == 0
+                    && self.cache_creation_tokens == 0)
+                    || self.cache_usage_reported() == Some(true))
+                    && ((other.prompt_tokens == 0
+                        && other.completion_tokens == 0
+                        && other.cache_read_tokens == 0
+                        && other.cache_creation_tokens == 0)
+                        || other.cache_usage_reported() == Some(true))
+                    && (self.cache_usage_reported() == Some(true)
+                        || other.cache_usage_reported() == Some(true)),
+            ),
             reasoning_tokens: self.reasoning_tokens.saturating_add(other.reasoning_tokens),
             cache_creation_tokens: self
                 .cache_creation_tokens
@@ -1273,6 +1308,10 @@ impl UsageStats {
             total_tokens: self.total_tokens.max(other.total_tokens),
             cached_prompt_tokens: self.cached_prompt_tokens.max(other.cached_prompt_tokens),
             cache_write_tokens: self.cache_write_tokens.max(other.cache_write_tokens),
+            cache_usage_reported: Some(
+                self.cache_usage_reported() == Some(true)
+                    || other.cache_usage_reported() == Some(true),
+            ),
             reasoning_tokens: self.reasoning_tokens.max(other.reasoning_tokens),
             cache_creation_tokens: self.cache_creation_tokens.max(other.cache_creation_tokens),
             cache_read_tokens: self.cache_read_tokens.max(other.cache_read_tokens),
@@ -1478,6 +1517,26 @@ pub fn anthropic_usage_service_tier(usage: &serde_json::Value) -> Option<String>
     anthropic_service_tier(field("speed"), field("service_tier"))
 }
 
+/// 原生 Chat envelope 的首个 choice；空 choice 列表不制造占位答案。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NativeChatChoice {
+    pub index: u32,
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extra: serde_json::Map<String, Value>,
+}
+
+/// 原生响应中不属于 message/delta 的字段，按原层级保留。
+/// 持久化到 ChatResponse 时使用独立的缓存编码域，旧副本不会读取新载荷。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NativeChatEnvelope {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<i64>,
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extra: serde_json::Map<String, Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub choice: Option<NativeChatChoice>,
+}
+
 /// Full (non-streaming) chat response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1496,6 +1555,8 @@ pub struct ChatResponse {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub more_choices: Vec<ChatChoice>,
     pub usage: UsageStats,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_envelope: Option<NativeChatEnvelope>,
     /// Not serialized: a cached response was served by no upstream, so a
     /// cache hit reports no tier — and this type denies unknown fields, so
     /// writing it would make every cache entry unreadable to a gateway
@@ -1513,6 +1574,8 @@ pub struct ChatChoice {
     pub finish_reason: FinishReason,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<Value>,
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 impl ChatResponse {
@@ -1614,6 +1677,8 @@ pub struct ChatChunk {
     pub logprobs: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<UsageStats>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_envelope: Option<NativeChatEnvelope>,
     /// The tier the upstream reported so far on this stream; see
     /// [`ChatResponse::service_tier`] for why it is not serialized.
     #[serde(skip)]
@@ -1658,6 +1723,7 @@ impl ChatChunk {
             return std::borrow::Cow::Borrowed(self);
         }
         std::borrow::Cow::Owned(ChatChunk {
+            native_envelope: None,
             id: self.id.clone(),
             model: self.model.clone(),
             choice_index: 0,
@@ -1884,11 +1950,71 @@ pub struct EmbeddingUsage {
 mod tests {
     use super::*;
 
+    #[test]
+    fn cache_reporting_preserves_zero_through_stream_and_panel_merges() {
+        let missing = UsageStats::new(100, 0);
+        let zero = UsageStats {
+            openai_details: OpenAiUsageDetails {
+                cached_tokens_reported: true,
+                ..Default::default()
+            },
+            ..UsageStats::new(100, 0)
+        };
+        assert_eq!(
+            UsageStats::default()
+                .saturating_add(&UsageStats::default())
+                .cache_usage_reported(),
+            Some(false)
+        );
+        assert_eq!(missing.cache_usage_reported(), Some(false));
+        assert_eq!(zero.cache_usage_reported(), Some(true));
+        assert_eq!(
+            zero.max_fieldwise(&missing).cache_usage_reported(),
+            Some(true)
+        );
+        assert_eq!(
+            UsageStats::default()
+                .max_fieldwise(&zero)
+                .cache_usage_reported(),
+            Some(true)
+        );
+        assert_eq!(
+            UsageStats::default()
+                .saturating_add(&zero)
+                .cache_usage_reported(),
+            Some(true)
+        );
+        assert_eq!(
+            zero.saturating_add(&zero).cache_usage_reported(),
+            Some(true)
+        );
+        assert_eq!(
+            zero.saturating_add(&missing).cache_usage_reported(),
+            Some(false)
+        );
+        let additive_zero = UsageStats {
+            openai_details: OpenAiUsageDetails {
+                cache_creation_tokens_reported: true,
+                ..Default::default()
+            },
+            ..UsageStats::new(100, 0)
+        };
+        assert_eq!(additive_zero.cache_usage_reported(), Some(true));
+        assert_eq!(
+            additive_zero.saturating_add(&zero).cache_usage_reported(),
+            Some(true)
+        );
+        // 共享缓存只读旧字段；运行时采样元数据不改变共享缓存格式。
+        let cached = serde_json::to_value(&zero).unwrap();
+        assert!(cached.get("cache_usage_reported").is_none());
+    }
+
     /// Every choice that carried something has to finish; a usage-only
     /// frame names no choice, so it neither opens one nor keeps one open.
     #[test]
     fn the_census_waits_for_every_choice_it_saw() {
         let chunk = |choice_index: u32, content: Option<&str>, finish: bool| ChatChunk {
+            native_envelope: None,
             id: String::new(),
             model: String::new(),
             choice_index,
@@ -1927,6 +2053,7 @@ mod tests {
     #[test]
     fn a_legacy_function_call_delta_is_a_payload() {
         let mut chunk = ChatChunk {
+            native_envelope: None,
             id: String::new(),
             model: String::new(),
             choice_index: 0,
@@ -2509,6 +2636,7 @@ mod tests {
             total_tokens: 15,
             cached_prompt_tokens: 2,
             cache_write_tokens: Some(3),
+            cache_usage_reported: None,
             reasoning_tokens: 3,
             cache_creation_tokens: 1,
             cache_read_tokens: 4,
@@ -2538,6 +2666,7 @@ mod tests {
             total_tokens: 27,
             cached_prompt_tokens: 1,
             cache_write_tokens: Some(5),
+            cache_usage_reported: None,
             reasoning_tokens: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 6,
@@ -2801,6 +2930,7 @@ mod tests {
     #[test]
     fn chat_chunk_omits_optional_fields_on_wire() {
         let chunk = ChatChunk {
+            native_envelope: None,
             choice_index: 0,
             logprobs: None,
             id: "cmpl-1".into(),

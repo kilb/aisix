@@ -1,0 +1,32 @@
+{
+  "batch": {
+    "base": {
+      "input": "2",
+      "output": "10",
+      "cache_read": "0.1",
+      "web_search": "10000",
+      "cache_write": "2.5",
+      "cache_write_1h": "4"
+    }
+  },
+  "default": {
+    "base": {
+      "input": "4",
+      "output": "20",
+      "cache_read": "0.2",
+      "web_search": "10000",
+      "cache_write": "5",
+      "cache_write_1h": "8"
+    }
+  },
+  "fast": {
+    "base": {
+      "input": "8",
+      "output": "40",
+      "cache_read": "0.4",
+      "cache_write": "10",
+      "cache_write_1h": "16",
+      "web_search": "10000"
+    }
+  }
+}

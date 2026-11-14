@@ -10,13 +10,13 @@
 //! 7. Call `bridge.generate_image(body, ctx)` → JSON response.
 //! 8. Providers that don't support image generation return 501.
 
+use crate::request_json::Json;
 use aisix_core::AppliedGuardrail;
 use aisix_gateway::{BridgeCapability, BridgeError};
 use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, UsageEvent};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -29,6 +29,7 @@ use crate::state::ProxyState;
 /// Per-request payload from a successful dispatch — carries the
 /// response + the bits the handler needs to emit a UsageEvent (#407).
 struct ImageDispatchSuccess {
+    usage_handled_by_stream: bool,
     response: Response,
     provider: String,
     /// UUID of the resolved Model row — required for UsageEvent
@@ -72,7 +73,26 @@ pub async fn image_generations(
     client: ClientContext,
     // Result-wrapped so an extractor-layer 413 maps to the OpenAI
     // envelope — see completions.rs.
-    body: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
+    body: Result<Json<Value>, crate::request_json::JsonRejection>,
+) -> Response {
+    image_json(
+        state,
+        auth,
+        client,
+        body,
+        "/v1/images/generations",
+        crate::operation::IMAGE_GENERATION,
+    )
+    .await
+}
+
+pub(crate) async fn image_json(
+    state: ProxyState,
+    auth: AuthenticatedKey,
+    client: ClientContext,
+    body: Result<Json<Value>, crate::request_json::JsonRejection>,
+    endpoint: &'static str,
+    surface: crate::operation::Surface,
 ) -> Response {
     let started = Instant::now();
     let Json(body) = match body {
@@ -82,14 +102,14 @@ pub async fn image_generations(
             return crate::reject::reject_before_dispatch(
                 &state,
                 "POST",
-                "/v1/images/generations",
+                endpoint,
                 &client.request_id,
                 Some(&auth.entry.id),
                 started,
                 crate::reject::Envelope::OpenAi,
                 crate::error::proxy_error_from_json_rejection(
                     rej,
-                    state.request_body_limit_for("/v1/images/generations"),
+                    state.request_body_limit_for(endpoint),
                 ),
             );
         }
@@ -120,10 +140,29 @@ pub async fn image_generations(
         &client,
         &mut audit,
         &mut routing,
+        endpoint,
+        surface,
+        started,
     )
     .await
     {
         Ok(success) => {
+            if success.usage_handled_by_stream {
+                let mut response = success.response;
+                let limits = auth.key().rate_limit.clone().unwrap_or_default();
+                crate::request_metrics::publish_rate_limit_window(
+                    &state.metrics,
+                    &state.limiter,
+                    &snapshot,
+                    &api_key_id,
+                    &limits,
+                    &model_name,
+                    &success.upstream_model,
+                    &mut response,
+                )
+                .await;
+                return response;
+            }
             let elapsed = started.elapsed();
             // The actual response status, not a hardcoded 200: the 501
             // NotImplemented branch also returns `Ok(success)`, and calling
@@ -132,7 +171,7 @@ pub async fn image_generations(
             // for completions / responses / rerank.
             let status = success.response.status().as_u16();
             emit_access_log(
-                "/v1/images/generations",
+                endpoint,
                 &model_name,
                 &success.provider,
                 &api_key_id,
@@ -147,7 +186,7 @@ pub async fn image_generations(
             let pk = crate::usage_attr::ResolvedPk::resolve(&snapshot, &success.provider_key_id);
             crate::request_metrics::record(
                 &state,
-                "/v1/images/generations",
+                endpoint,
                 crate::request_metrics::Caller::new(&auth),
                 crate::request_metrics::Upstream {
                     provider: &success.provider,
@@ -167,7 +206,7 @@ pub async fn image_generations(
             crate::usage_attr::emit_failed_attempts(
                 &state,
                 &snapshot,
-                crate::operation::IMAGE_GENERATION,
+                surface,
                 &request_id,
                 &model_name,
                 &api_key_id,
@@ -194,8 +233,8 @@ pub async fn image_generations(
                     &state,
                     &snapshot,
                     &pk,
-                    "/v1/images/generations",
-                    crate::operation::IMAGE_GENERATION,
+                    endpoint,
+                    surface,
                     &request_id,
                     &success.model_id,
                     &model_name,
@@ -214,6 +253,7 @@ pub async fn image_generations(
                     &audit,
                     success.upstream_called,
                     routing.attempts.last(),
+                    None,
                 );
             }
             // Same window /v1/chat/completions publishes, so an SDK client
@@ -240,7 +280,7 @@ pub async fn image_generations(
             let attributed = crate::attribution::current().unwrap_or_default();
             let last_target = crate::request_metrics::LastTarget::new(&snapshot, &attributed);
             emit_access_log(
-                "/v1/images/generations",
+                endpoint,
                 &model_name,
                 last_target.provider(),
                 &api_key_id,
@@ -257,7 +297,7 @@ pub async fn image_generations(
             // key's successes landed on the real one.
             crate::request_metrics::record(
                 &state,
-                "/v1/images/generations",
+                endpoint,
                 crate::request_metrics::Caller::new(&auth),
                 last_target.upstream(metric_model.as_ref(), false, routing.fallback_count() > 0),
                 status,
@@ -273,7 +313,7 @@ pub async fn image_generations(
             crate::usage_attr::emit_failed_attempts(
                 &state,
                 &snapshot,
-                crate::operation::IMAGE_GENERATION,
+                surface,
                 &request_id,
                 &model_name,
                 &api_key_id,
@@ -292,7 +332,7 @@ pub async fn image_generations(
                 crate::usage_attr::emit_error_usage_event(
                     &state,
                     &snapshot,
-                    crate::operation::IMAGE_GENERATION,
+                    surface,
                     "openai",
                     &request_id,
                     &model_name,
@@ -337,6 +377,7 @@ fn images_output_to_chat(model: &str, body: &Value) -> aisix_gateway::ChatRespon
         .collect::<Vec<_>>()
         .join("\n");
     aisix_gateway::ChatResponse {
+        native_envelope: None,
         logprobs: None,
         more_choices: Vec::new(),
         id: String::new(),
@@ -346,6 +387,11 @@ fn images_output_to_chat(model: &str, body: &Value) -> aisix_gateway::ChatRespon
         usage: aisix_gateway::UsageStats::default(),
         service_tier: None,
     }
+}
+
+enum ImageAnswer {
+    Json(Value),
+    Stream(reqwest::Response, Option<Duration>, Option<Duration>),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -358,6 +404,9 @@ async fn dispatch(
     client_ctx: &ClientContext,
     audit_out: &mut crate::usage_attr::GuardrailAudit,
     routing_out: &mut crate::attempt::RoutingTelemetry,
+    endpoint: &'static str,
+    surface: crate::operation::Surface,
+    request_started: Instant,
 ) -> Result<ImageDispatchSuccess, ProxyError> {
     crate::usage_attr::note_failure_request(snapshot, || body.to_string());
     crate::usage_attr::hold_ahead_of_chain(
@@ -385,29 +434,7 @@ async fn dispatch(
     // Client-IP allowlist gate (#557): reject before guardrails / upstream.
     crate::dispatch::check_ip_access(&model_entry.value, &client_ctx.source_ip)?;
 
-    // #1101: partial-image SSE (`stream: true`) is not relayed on this
-    // route, and the dispatch below reads the upstream answer as a single
-    // JSON document. Forwarding `stream` had the provider generate — and
-    // charge for — a stream the gateway then failed to decode; that decode
-    // failure is retryable, and this route retries it, so ONE caller
-    // request re-ran the generation for
-    // the whole retry budget and still answered 502.
-    //
-    // Refuse it here, before the provider is contacted, and in the same
-    // words `/v1/images/edits` already uses — the two are one family and a
-    // caller should not have to learn two refusals. Unlike /v1/completions
-    // there is no streaming route to point at, so the message names none.
-    //
-    // Rejected AFTER model resolution so an unknown model still answers 404
-    // (matching the other JSON endpoints' precedence), and BEFORE the
-    // guardrail chain and the rate-limit reservation so a request that
-    // cannot be served burns neither.
-    if body.get("stream").and_then(Value::as_bool) == Some(true) {
-        return Err(ProxyError::InvalidRequest(
-            "`stream` is not supported on /v1/images/generations".into(),
-        ));
-    }
-
+    let stream_requested = body.get("stream").and_then(Value::as_bool) == Some(true);
     // #545: /v1/images/generations must run input guardrails. Before this it
     // forwarded the user `prompt` with no configured content/DLP check, so a
     // block enforced on /v1/chat/completions was bypassable by switching
@@ -535,7 +562,7 @@ async fn dispatch(
     crate::dispatch::require_dispatchable_entry(&model_entry.value)?;
     *routing_out = crate::attempt::RoutingTelemetry::for_request(&model_entry.value.display_name)
         .with_trace(client_ctx.trace.clone());
-    let dispatched = crate::routing::dispatch_with_failover(
+    let dispatched = crate::routing::dispatch_stream_with_failover(
         state,
         snapshot,
         auth,
@@ -582,12 +609,10 @@ async fn dispatch(
                 if target.model.provider.as_deref() != Some("openai") && !azure {
                     return Err(ProxyError::TargetRefused(format!(
                         "{} is not an OpenAI provider; \
-                         /v1/images/generations requires OpenAI or Azure OpenAI",
+                         {endpoint} requires OpenAI or Azure OpenAI",
                         crate::routing::refused_model_label(model_name)
                     )));
                 }
-                let bridge = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value)
-                    .ok_or(ProxyError::ProviderUnavailable)?;
                 // #554: apply the configured request `timeout` as the upstream deadline.
                 let mut ctx = crate::dispatch::bridge_ctx(
                     request_id,
@@ -597,11 +622,66 @@ async fn dispatch(
                     Arc::clone(&pk_entry.value),
                     Some(client_ctx),
                 );
-                if let Some(d) = timeouts.request {
+                if let Some(d) = if stream_requested {
+                    timeouts.stream
+                } else {
+                    timeouts.request
+                } {
                     ctx = ctx.with_deadline(d);
                 }
                 // #701: per-attempt cooldown accounting — see completions.rs.
-                let answered = match bridge.generate_image(body, &ctx).await {
+                let answer = if stream_requested || endpoint == "/v1/images/edits" {
+                    let path = if endpoint == "/v1/images/edits" {
+                        "/images/edits"
+                    } else {
+                        "/images/generations"
+                    };
+                    let send_started = Instant::now();
+                    let mut request =
+                        crate::media_upstream::request(&ctx, path, Some(body)).await?;
+                    if !stream_requested {
+                        if let Some(timeout) = timeouts.request {
+                            request =
+                                request.timeout(timeout.saturating_sub(send_started.elapsed()));
+                        }
+                    }
+                    let response = crate::stream_timeout::send_with_deadline_observed(
+                        request,
+                        if stream_requested {
+                            timeouts.stream
+                        } else {
+                            timeouts.request
+                        }
+                        .map(|budget| budget.saturating_sub(send_started.elapsed())),
+                        send_started,
+                        aisix_gateway::upstream_io::Protocol::Images,
+                    )
+                    .await?;
+                    if !response.status().is_success() {
+                        Err(aisix_provider_openai::held_route_http_error(response).await)
+                    } else if crate::media_upstream::event_stream(response.headers()) {
+                        Ok(ImageAnswer::Stream(
+                            response,
+                            timeouts.stream,
+                            timeouts.request,
+                        ))
+                    } else {
+                        aisix_gateway::decode_success_body::<Value>(
+                            response,
+                            aisix_gateway::UpstreamWire::OpenAI,
+                        )
+                        .await
+                        .map(ImageAnswer::Json)
+                    }
+                } else {
+                    let bridge = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value)
+                        .ok_or(ProxyError::ProviderUnavailable)?;
+                    bridge
+                        .generate_image(body, &ctx)
+                        .await
+                        .map(ImageAnswer::Json)
+                };
+                let answered = match answer {
                     Ok(v) => Ok(v),
                     Err(
                         e @ BridgeError::UnsupportedCapability(BridgeCapability::ImageGeneration),
@@ -628,7 +708,8 @@ async fn dispatch(
         target,
         attempt_started,
         member_reservation,
-        ..
+        in_flight,
+        deferred,
     } = match dispatched {
         Ok(d) => d,
         Err(e) => {
@@ -645,7 +726,61 @@ async fn dispatch(
     let model = &target.model;
 
     match answered {
-        Ok(mut resp_json) => {
+        Ok(ImageAnswer::Stream(response, stream_budget, request_budget)) => {
+            let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
+            let response = crate::media_upstream::image_response(
+                state,
+                snapshot,
+                auth,
+                client_ctx,
+                endpoint,
+                surface,
+                request_id,
+                model_name,
+                &target.id,
+                Arc::clone(model),
+                &provider_label,
+                &pk_id,
+                &upstream_model,
+                applied_guardrails.clone(),
+                resolved_chain,
+                audit_out.clone(),
+                redactions,
+                monitor_hits,
+                response,
+                reservation,
+                in_flight,
+                deferred,
+                request_started,
+                attempt_started,
+                routing_out,
+                captured_prompt,
+                content_cap,
+                input_capture_safe,
+                stream_budget,
+                request_budget,
+            )
+            .await;
+            Ok(ImageDispatchSuccess {
+                usage_handled_by_stream: true,
+                response,
+                provider: provider_label,
+                model_id: target.id,
+                provider_key_id: pk_id,
+                upstream_model,
+                applied_guardrails,
+                usage: None,
+                upstream_called: true,
+                redactions: Default::default(),
+                monitor_hits: Vec::new(),
+                guardrail_blocked: false,
+                captured_content: None,
+            })
+        }
+        Ok(ImageAnswer::Json(mut resp_json)) => {
+            if let Some(deferred) = &deferred {
+                deferred.finish(state, 200, true);
+            }
             // #701: clear any cooldown/unhealthy mark now the upstream
             // answered — same recovery signal as rerank/audio/chat.
             state.health.record_success(&model.display_name);
@@ -704,6 +839,7 @@ async fn dispatch(
                 }
             };
             Ok(ImageDispatchSuccess {
+                usage_handled_by_stream: false,
                 response,
                 provider: provider_label,
                 // The DISPATCHED row, so pricing and per-model analytics
@@ -727,6 +863,7 @@ async fn dispatch(
             reservation.commit_tokens(0).await;
             let env = ErrorEnvelope::new(e.to_string(), "not_implemented");
             Ok(ImageDispatchSuccess {
+                usage_handled_by_stream: false,
                 response: (StatusCode::NOT_IMPLEMENTED, Json(env)).into_response(),
                 provider: provider_label,
                 model_id: target.id.clone(),
@@ -909,6 +1046,7 @@ pub(crate) fn emit_usage_event(
     dispatched: bool,
     // The attempt that answered (#655); `None` when none was dispatched.
     winner: Option<&crate::attempt::AttemptRecord>,
+    failure: Option<&crate::attempt::StreamFailure>,
 ) {
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
@@ -920,6 +1058,7 @@ pub(crate) fn emit_usage_event(
         completion_tokens: usage.completion_tokens,
         total_tokens: usage.upstream_total_tokens,
         modality_tokens: usage.modality,
+        cache_usage_reported: Some(false),
         // Priced from the dispatched row's `Model.cost` when the operator set
         // one, `0.0` otherwise — see `usage_attr::request_cost_usd`.
         cost_usd: crate::usage_attr::request_cost_usd(
@@ -948,6 +1087,10 @@ pub(crate) fn emit_usage_event(
         guardrail_bypassed_reason: crate::usage_attr::bypass_reason(audit),
         ..Default::default()
     };
+    if let Some(failure) = failure {
+        event.error_class = failure.error_class.to_string();
+        event.error_message = failure.error_message.clone();
+    }
     crate::usage_attr::apply_pk_telemetry(&mut event, pk);
     crate::usage_attr::apply_winning_attempt(&mut event, winner);
     crate::usage_attr::apply_caller_identity(&mut event, client.jwt.as_ref(), &client.caller);
@@ -1499,6 +1642,7 @@ mod tests {
                 _ctx: &BridgeContext,
             ) -> Result<ChatResponse, BridgeError> {
                 Ok(ChatResponse {
+                    native_envelope: None,
                     logprobs: None,
                     more_choices: Vec::new(),
                     id: "stub".into(),
@@ -2028,5 +2172,146 @@ mod tests {
         assert_eq!(ev.guardrail_enforced_hits[0].action, "masked");
         let wire = serde_json::to_string(&ev).unwrap();
         assert!(!wire.contains("9.9.9"), "{wire}");
+    }
+}
+#[cfg(test)]
+mod compat_media_generation_tests {
+    use crate::audio::compat_media_image_peer::{large_partial_case, stream_case, Ending, Form};
+
+    #[tokio::test]
+    async fn compat_media_generation_sse_partial_live_and_usage_eof() {
+        stream_case(Form::Generation, Ending::Eof).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_generation_sse_completed_close_success() {
+        stream_case(Form::Generation, Ending::CompletedClose).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_generation_sse_early_cancel_once() {
+        stream_case(Form::Generation, Ending::Cancel).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_generation_sse_premature_eof_failure() {
+        stream_case(Form::Generation, Ending::Truncated).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_generation_sse_inband_error_no_retry() {
+        stream_case(Form::Generation, Ending::Error).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_generation_sse_read_timeout_failure() {
+        stream_case(Form::Generation, Ending::Timeout).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_generation_sse_quota_lifetime() {
+        stream_case(Form::Generation, Ending::Concurrency).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_generation_sse_output_custom_block() {
+        stream_case(Form::Generation, Ending::OutputBlock).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_generation_sse_monitor_output_live() {
+        stream_case(Form::Generation, Ending::Monitor).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_generation_sse_large_partial_keeps_terminal_usage() {
+        large_partial_case(Form::Generation).await;
+    }
+}
+
+#[cfg(test)]
+mod compat_media_generation_control_tests {
+    use crate::audio::compat_media_test_peer::*;
+    use axum::body::{to_bytes, Bytes};
+    use axum::http::StatusCode;
+    use serde_json::{json, Value};
+    use tower::ServiceExt as _;
+
+    #[tokio::test]
+    async fn compat_media_generation_buffered_native_response_control() {
+        let native = json!({"created":1700000000,"data":[{"b64_json":"ZmluYWw=","revised_prompt":"A red square.","native_item":{"retained":true}}],
+            "usage":{"input_tokens":37,"output_tokens":53,"total_tokens":90,"input_tokens_details":{"text_tokens":10,"image_tokens":27}},"native_top":{"retained":true}});
+        let peer = Peer::start(
+            "application/json",
+            vec![Bytes::from(native.to_string())],
+            false,
+        )
+        .await;
+        peer.release(1);
+        let (app, _, _, mut rx) = app(snapshot(&peer.base, "gpt-image-2"));
+        let response = app
+            .oneshot(json_request(
+                "/v1/images/generations",
+                json!({"model":ALIAS,"prompt":"A red square.","native_request":{"retained":true}}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&to_bytes(response.into_body(), 65536).await.unwrap())
+                .unwrap(),
+            native
+        );
+        let requests = peer.requests();
+        assert_eq!(requests.len(), 1);
+        let outbound: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(outbound["model"], "gpt-image-2");
+        assert_eq!(outbound["native_request"], json!({"retained":true}));
+        assert_usage(&terminal(&mut rx).await, 37, 53, 90);
+    }
+}
+
+#[cfg(test)]
+mod compat_media_image_quantity_presence_tests {
+    use crate::audio::compat_media_image_peer::{usage_presence_case, Form};
+
+    #[tokio::test]
+    async fn compat_media_generation_reported_zero_detail_preserved() {
+        usage_presence_case(Form::Generation, true).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_generation_missing_usage_not_fabricated() {
+        usage_presence_case(Form::Generation, false).await;
+    }
+}
+
+#[cfg(test)]
+mod compat_media_output_policy_tests {
+    use crate::audio::compat_media_image_peer::{output_mask_case, output_overflow_case, Form};
+
+    #[tokio::test]
+    async fn compat_media_generation_output_overflow_fail_open() {
+        output_overflow_case(Form::Generation, true).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_generation_output_overflow_fail_closed() {
+        output_overflow_case(Form::Generation, false).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_generation_output_mask_changes_actual_sse_metadata() {
+        output_mask_case(Form::Generation).await;
+    }
+}
+
+#[cfg(test)]
+mod compat_media_large_completed_tests {
+    use crate::audio::compat_media_image_peer::{large_completed_case, Form};
+
+    #[tokio::test]
+    async fn compat_media_generation_large_completed_still_reports_usage() {
+        large_completed_case(Form::Generation).await;
     }
 }

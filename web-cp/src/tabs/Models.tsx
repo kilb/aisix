@@ -1,6 +1,7 @@
+import "./operations.css";
 import { FORM_FOOTER, RowField, ServedGroups, GENERATED_STRATEGY, type Target, type ModelDoc, type AccountDoc, type Model, type Catalog, type SchemaInfo } from "./models/catalog";
 import { RoutingModeField } from "../ui/RoutingModeField";
-import { Plus, RefreshCw, Trash2, Waypoints } from "lucide-react";
+import { Eye, Pencil, Plus, RefreshCw, Trash2, Waypoints } from "lucide-react";
 import { Fragment, useEffect, useRef, useState, type ReactNode } from "react";
 import type { TabProps } from "../App";
 import { ConflictNote } from "../components/ConflictNote";
@@ -24,7 +25,7 @@ import { useResource } from "../lib/useResource";
 import { Card, CardHeader, PageHeader } from "../components/page";
 import { cn } from "../lib/cn";
 import { Button } from "../ui/Button";
-import { DataTable, Loading } from "../ui/DataTable";
+import { OperationalTable as DataTable, Loading } from "../components/OperationalTable";
 import { EmptyState } from "../ui/EmptyState";
 import { RoutePolicy } from "../ui/RoutePolicy";
 import { CooldownEditor } from "../ui/CooldownEditor";
@@ -266,17 +267,14 @@ export function Models({ canEdit, onGoto }: TabProps) {
   const split = editor !== null;
 
   return (
-    <>
+    <div className="cp-operations cp-models">
       <PageHeader
         eyebrow="MODELS · 模型目录"
         title="模型目录"
         dataLead={models.items ? <>当前有 {counts.facing} 个对外公共模型、{counts.manual} 个手工模型和 {counts.internal} 个内部直连目标。</> : "查看模型清单，维护手工模型与路由。"}
         actions={
           <>
-            <Button type="button" onClick={refresh}>
-              <RefreshCw aria-hidden />
-              刷新
-            </Button>
+            <Button type="button" className="ops-icon-button" aria-label="刷新" title="刷新模型目录" onClick={refresh}><RefreshCw aria-hidden /></Button>
             {canEdit && !open && (
               <>
                 <Button onClick={() => openForm({ mode: "new", shape: "routing" })}>
@@ -432,8 +430,8 @@ export function Models({ canEdit, onGoto }: TabProps) {
                         <td className="right">
                           {src.kind === "public" ? (
                             <>
-                              <Button size="sm" onClick={() => onGoto("public-routes", src.id)}>公共路由</Button>
-                              {src.generated && <Button size="sm" onClick={() => openForm({ mode: "edit", id: m.id })}>查看</Button>}
+                              <Button size="sm" className="ops-table-action" aria-label="公共路由" title="打开公共路由" onClick={() => onGoto("public-routes", src.id)}><Waypoints aria-hidden /></Button>
+                              {src.generated && <Button size="sm" className="ops-table-action" aria-label="查看" title="查看模型" onClick={() => openForm({ mode: "edit", id: m.id })}><Eye aria-hidden /></Button>}
                               <span className="cell-note ml-auto">由公共模型生成，在公共模型与路由中维护</span>
                             </>
                           ) : deleting?.id === m.id ? (
@@ -455,13 +453,13 @@ export function Models({ canEdit, onGoto }: TabProps) {
                           ) : (
                             <>
                               {hasForm && (
-                                <Button size="sm" onClick={() => openForm({ mode: "edit", id: m.id })}>
-                                  {canEdit ? "编辑" : "查看"}
+                                <Button size="sm" className="ops-table-action" aria-label={canEdit ? "编辑" : "查看"} title={canEdit ? "编辑模型" : "查看模型"} onClick={() => openForm({ mode: "edit", id: m.id })}>
+                                  {canEdit ? <Pencil aria-hidden /> : <Eye aria-hidden />}
                                 </Button>
                               )}
                               {canEdit && (
-                                <Button size="sm" kind="quiet" disabled={busy} onClick={() => void startDelete(m)}>
-                                  删除
+                                <Button size="sm" kind="quiet" className="ops-table-action" aria-label="删除" title="删除模型" disabled={busy} onClick={() => void startDelete(m)}>
+                                  <Trash2 aria-hidden />
                                 </Button>
                               )}
                             </>
@@ -493,7 +491,7 @@ export function Models({ canEdit, onGoto }: TabProps) {
           <RecordTablePager {...table} total={table.filteredCount} onPageChange={table.setPage} onPageSizeChange={table.setPageSize} label="模型分页" />
         </Card>
       </div>
-    </>
+    </div>
   );
 }
 
@@ -922,9 +920,9 @@ function ModelForm({
 
 
       {shape === "routing" && (
-        <div className="@container mt-2 border-t border-line pt-5">
+        <div className="ops-form-section @container">
           <h4 className="mb-3 text-body font-semibold">路由目标（{rows.length}）</h4>
-          <div className="overflow-hidden rounded-cell border border-line">
+          <div className="ops-target-list overflow-hidden rounded-cell border border-line">
             <div aria-hidden="true" className={cn(MANUAL_ROW, "hidden border-b border-line bg-well px-3 py-2 text-caption font-medium text-ink-soft @lg:grid")}>
               <span>目标模型</span>
               <span>权重</span>
@@ -934,7 +932,7 @@ function ModelForm({
             {rows.map((r, i) => {
               const target = catalog.models.get(r.modelId);
               return (
-                <div key={r.key} className={cn(MANUAL_ROW, "border-line p-3 not-last:border-b")} role="group" aria-label={`目标 ${i + 1}`}>
+                <div key={r.key} className={cn(MANUAL_ROW, "ops-target-row border-line p-3 not-last:border-b")} role="group" aria-label={`目标 ${i + 1}`}>
                   <div className="col-span-2 min-w-0 @lg:col-span-1">
                     <RowField label="目标模型" error={targetAt(r, "model_id")}>
                       {(aria) => (

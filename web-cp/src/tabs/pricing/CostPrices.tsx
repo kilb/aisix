@@ -58,9 +58,7 @@ export function CostPrices({ canEdit }: TabProps) {
         dataLead={rows === null ? "读取账号成本换算率。" : `全部 ${fmtInt(rows.length)} 个账号中，${fmtInt(configured)} 个已设置现行默认成本换算率。`}
         description="成本价按上游账号设置换算率：模型的官方美元价 × 这个账号在模型上的成本换算率（没有时为账号默认），就是平台为一次调用付给上游的人民币成本。只用于利润报表，租户看不到。换算率只能从现在或将来开始生效；账号没有成本换算率时，它的调用成本记为未知。"
         actions={
-          <Button type="button" icon="refresh" onClick={() => void load()}>
-            刷新
-          </Button>
+          <Button className="finance-icon-button" aria-label="刷新" title="刷新" type="button" icon="refresh" onClick={() => void load()}></Button>
         }
       />
       {error && (
@@ -108,8 +106,8 @@ export function CostPrices({ canEdit }: TabProps) {
               {records.rows.map(({ account, default: plan }) => {
                 const later = scheduledWords(plan, "");
                 return (
-                  <tr key={account.id}>
-                    <td>
+                  <tr data-finance-record key={account.id}>
+                    <td data-label="上游账号">
                       <button
                         type="button"
                         className="link-button"
@@ -119,10 +117,10 @@ export function CostPrices({ canEdit }: TabProps) {
                         {account.display_name || account.id}
                       </button>
                     </td>
-                    <td>
+                    <td data-label="提供方">
                       <span className="mono cost-provider">{account.provider}</span>
                     </td>
-                    <td className="num">
+                    <td data-label="默认成本换算率" className="num">
                       <span className="tabular">{plan.current?.cny_per_usd ?? "未设置"}</span>
                       {later && <span className="cell-note">待生效 {later}</span>}
                     </td>

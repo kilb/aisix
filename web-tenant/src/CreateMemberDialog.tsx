@@ -47,8 +47,7 @@ export function CreateMemberDialog({ roles, labels, onInactive, onCreated }: {
         >
           <div className="create-member-dialog-heading">
             <div className="min-w-0">
-              <p className="mb-3 font-mono text-meta text-muted">组织成员</p>
-              <Dialog.Title className="text-title font-medium">创建账号</Dialog.Title>
+              <Dialog.Title className="create-member-title">创建账号</Dialog.Title>
             </div>
             <Button type="button" kind="quiet" className="size-11 p-0" disabled={busy} aria-label="关闭创建账号" onClick={() => changeOpen(false)}>
               <X aria-hidden />

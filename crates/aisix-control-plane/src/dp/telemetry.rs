@@ -100,6 +100,8 @@ pub const DEDUP_HEADER: HeaderName = HeaderName::from_static("x-aisix-usage-batc
 /// batch delivered before stores nothing and is answered with the events
 /// its first stored delivery refused, so a gateway whose answer was lost
 /// still learns of them.
+/// IO 补充由 2xx 与去重头整体确认，不计入常规用量的三个计数；
+/// 因此包含元数据消息时，响应计数之和不必等于传输项数。
 pub async fn telemetry(
     dp: DpIdentity,
     State(state): State<AppState>,

@@ -1,0 +1,297 @@
+/* 计量工作区以稳定读数、真实期间和明确口径组织信息。 */
+.metrics-overview,
+.metric-analysis,
+.measurement-page,
+.measurement-records {
+  min-width: 0;
+}
+.metric-range {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px 20px;
+}
+.metric-range > p {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}
+.metric-range a,
+.metric-scope-action {
+  display: inline-flex;
+  align-items: center;
+  min-height: 44px;
+  color: var(--color-ink);
+  text-decoration: underline;
+  text-underline-offset: 4px;
+}
+.overview-kpis {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0;
+  overflow: hidden;
+  border: 1px solid var(--color-line);
+  border-radius: 14px;
+  background: var(--color-surface);
+}
+.overview-kpis > section {
+  min-width: 0;
+  padding: 24px;
+}
+.overview-kpis > section + section {
+  border-left: 1px solid var(--color-line);
+}
+.overview-kpis h2 {
+  margin: 0;
+  font-size: 13px;
+  line-height: 20px;
+  font-weight: 500;
+}
+.overview-kpis .metric,
+.metric-primary .metric,
+.metric-success .metric,
+.usage-analytic .metric {
+  font-size: 32px;
+  line-height: 40px;
+  font-weight: 500;
+  letter-spacing: -0.04em;
+  overflow-wrap: anywhere;
+}
+.overview-kpis .metric {
+  font-weight: 400;
+}
+.overview-kpis [data-metric-kpi="cost"] .metric {
+  font-size: 28px;
+  letter-spacing: -0.035em;
+}
+.overview-kpis p {
+  font-size: 13px;
+  line-height: 20px;
+}
+.overview-trend .bento-card-header {
+  margin-bottom: 0;
+}
+.overview-trend h2,
+.metric-analysis h2,
+.metric-analysis h3 {
+  font-size: 17px;
+  line-height: 26px;
+  font-weight: 600;
+}
+.metric-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 8px;
+  margin-bottom: 20px;
+  padding: 0;
+  border-bottom: 1px solid var(--color-line);
+}
+.metric-tab {
+  position: relative;
+  min-height: 48px;
+  min-width: 64px;
+  padding: 10px 16px;
+  border: 0;
+  border-radius: 8px 8px 0 0;
+  background: transparent;
+  color: var(--color-muted);
+  font-size: 14px;
+  line-height: 20px;
+  font-weight: 500;
+}
+.metric-tab:hover {
+  color: var(--color-ink);
+  background: var(--hover);
+}
+.metric-tab[aria-selected="true"] {
+  color: var(--color-ink);
+}
+.metric-tab[aria-selected="true"]::after {
+  position: absolute;
+  right: 16px;
+  bottom: -1px;
+  left: 16px;
+  height: 3px;
+  border-radius: 2px 2px 0 0;
+  background: var(--color-accent);
+  content: "";
+}
+.metric-tab:focus-visible,
+.metric-range a:focus-visible,
+.metric-scope-action:focus-visible {
+  outline: 2px solid var(--color-ink);
+  outline-offset: 2px;
+}
+.metric-primary {
+  min-width: 0;
+  margin-bottom: 0;
+  padding-bottom: 20px;
+  border-bottom: 1px solid var(--color-line);
+}
+.metric-facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px 24px;
+  min-width: 0;
+  margin: 0;
+}
+.metric-facts > div {
+  min-width: 0;
+}
+.metric-facts dt {
+  font-size: 13px;
+  line-height: 20px;
+}
+.metric-facts dd {
+  margin: 4px 0 0;
+  font-size: 20px;
+  line-height: 28px;
+  font-weight: 500;
+  letter-spacing: -0.02em;
+  overflow-wrap: anywhere;
+}
+.metric-analysis-main > label {
+  max-width: 400px;
+}
+.metric-analysis-aside .metric {
+  font-size: 28px;
+  line-height: 36px;
+}
+.metric-analysis-aside .metric-facts dd {
+  font-size: 17px;
+  line-height: 26px;
+}
+.metric-chart {
+  padding-top: 8px;
+}
+.metric-chart svg > g > line {
+  stroke: var(--color-line);
+}
+.metric-chart [role="tooltip"] {
+  z-index: 1;
+  box-shadow: 0 4px 12px #0000000d;
+  font-size: 13px;
+  line-height: 20px;
+}
+.metric-toolbar {
+  display: flex;
+  min-width: 0;
+  align-items: flex-end;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 16px;
+  margin-bottom: 20px;
+}
+.metric-toolbar-controls {
+  display: flex;
+  min-width: 0;
+  max-width: 100%;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+.metric-scope {
+  min-width: 0;
+  margin-bottom: 20px;
+  padding: 20px;
+  border: 1px solid var(--color-line);
+  border-radius: 14px;
+  background: var(--color-surface);
+}
+.metric-scope-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 16px;
+}
+.metric-scope-controls .f {
+  flex: 1 1 180px;
+  flex-direction: column;
+  align-items: stretch;
+  min-width: 0;
+  width: auto;
+  margin: 0;
+}
+/* 原生日期时间值含秒与日历入口，窄屏仍不得撑破父容器。 */
+.metric-scope-controls .f:has(input[type="datetime-local"]) {
+  flex-basis: 264px;
+  min-width: min(264px, 100%);
+}
+.metric-scope-controls input,
+.metric-scope-controls select {
+  min-width: 0;
+  width: 100%;
+}
+.measurement-page .dt-wrap,
+.measurement-records .dt-wrap {
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+}
+.measurement-page .dt,
+.measurement-records .dt {
+  font-variant-numeric: tabular-nums;
+}
+.measurement-page .dt td,
+.measurement-records .dt td {
+  vertical-align: middle;
+}
+@media (max-width: 1199px) {
+  .overview-kpis > section {
+    padding: 20px;
+  }
+}
+@media (max-width: 1000px) {
+  .overview-kpis {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .overview-kpis > section:nth-child(3) {
+    border-left: 0;
+  }
+  .overview-kpis > section:nth-child(n + 3) {
+    border-top: 1px solid var(--color-line);
+  }
+}
+@media (max-width: 599px) {
+  .overview-kpis > section {
+    padding: 16px;
+  }
+  .overview-kpis .metric {
+    font-size: 28px;
+    line-height: 36px;
+  }
+  .overview-kpis [data-metric-kpi="cost"] .metric {
+    font-size: 28px;
+    overflow-wrap: anywhere;
+  }
+  .metric-range {
+    gap: 4px;
+  }
+  .metric-tabs {
+    justify-content: space-between;
+    gap: 0;
+  }
+  .metric-tab {
+    min-width: 44px;
+    padding-right: 10px;
+    padding-left: 10px;
+  }
+  .metric-tab[aria-selected="true"]::after {
+    right: 10px;
+    left: 10px;
+  }
+  .metric-scope {
+    padding: 16px;
+  }
+  .metric-scope-controls .f {
+    flex-basis: 100%;
+  }
+  .metric-facts {
+    gap: 16px;
+  }
+  .metric-facts dd {
+    font-size: 18px;
+    line-height: 26px;
+  }
+}

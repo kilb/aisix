@@ -1498,6 +1498,7 @@ mod tests {
     async fn empty_output_still_reaches_the_script() {
         let cfg = config("export function checkOutput() { return { action: 'block' }; }");
         let resp = aisix_gateway::ChatResponse {
+            native_envelope: None,
             logprobs: None,
             more_choices: Vec::new(),
             id: String::new(),
@@ -1531,6 +1532,7 @@ mod tests {
         );
         let g = guardrail(&cfg, false);
         let resp = aisix_gateway::ChatResponse {
+            native_envelope: None,
             logprobs: None,
             more_choices: Vec::new(),
             id: String::new(),

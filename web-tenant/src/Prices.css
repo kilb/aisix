@@ -1,25 +1,22 @@
-/* 目录与矩阵均在局部滚动，展开内容不放大外层表格或页面。 */
+/* 价格目录随页面自然延伸；按内容分配列宽，窄屏逐组重排。 */
 .price-catalog {
   min-width: 0;
   max-width: 100%;
   container-type: inline-size;
-  overflow-x: auto;
-  overscroll-behavior-x: contain;
 }
 .price-catalog > .dt-wrap {
-  width: max-content;
-  min-width: 100%;
-  max-width: none;
-  overflow: visible;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
 }
 .price-catalog > .dt-wrap > .dt {
-  width: 70rem;
-  min-width: 100%;
+  width: 100%;
+  min-width: 0;
   table-layout: fixed;
 }
-.price-summary-group { width: 16rem; }
-.price-summary-multiplier { width: 14rem; }
-.price-summary-amount { width: 10rem; }
+.price-summary-group { width: 22%; }
+.price-summary-multiplier { width: 22%; }
+.price-summary-amount { width: 14%; }
 .price-scroll-hint { display: none; }
 /* 固定列内保留完整精度，长金额换行而不覆盖相邻单价。 */
 .price-catalog .price-rate-amount {
@@ -28,7 +25,7 @@
   overflow-wrap: anywhere;
 }
 .price-catalog [data-model-name] {
-  min-width: 14rem;
+  min-width: 0;
   white-space: normal;
   overflow-wrap: anywhere;
   line-height: 1.5;
@@ -52,7 +49,7 @@
   color: var(--muted-foreground);
 }
 .price-catalog .price-model-heading > td {
-  background: color-mix(in srgb, var(--foreground) 3%, var(--background));
+  background: var(--muted);
   border-top: 1px solid var(--border);
   padding-block: 12px;
 }
@@ -64,7 +61,7 @@
   gap: 8px 16px;
 }
 .price-model-bar {
-  width: calc(100cqw - 32px);
+  width: 100%;
   max-width: 100%;
   justify-content: space-between;
 }
@@ -74,7 +71,9 @@
   font-weight: 500;
 }
 .price-catalog .price-group-name {
-  min-width: 14rem;
+  position: static;
+  z-index: auto;
+  min-width: 0;
   max-width: 24rem;
   padding-left: 24px;
   text-align: left;
@@ -83,13 +82,13 @@
   white-space: normal;
   overflow-wrap: anywhere;
 }
-.price-multiplier { min-width: 14rem; }
+.price-multiplier { min-width: 0; }
 .price-multiplier-value {
   color: var(--foreground);
   font-size: var(--text-stat);
   font-weight: 500;
 }
-.price-multiplier .cell-note { white-space: nowrap; }
+.price-multiplier .cell-note { white-space: normal; overflow-wrap: anywhere; }
 .price-estimate-note {
   border-top: 1px solid var(--border);
   padding-top: 16px;
@@ -97,13 +96,11 @@
 .price-detail-group {
   margin: 0;
   border-top: 1px solid var(--border);
-  padding: 20px 16px 0;
+  padding: 20px 20px 0;
+  font-size: 15px;
+  line-height: 24px;
 }
 @media (max-width: 600px) {
-  .price-scroll-hint { display: block; margin-block: 0 10px; }
-  .price-catalog > .dt-wrap > .dt { width: 59rem; }
-  .price-summary-group { width: 8rem; }
-  .price-summary-multiplier { width: 11rem; }
   .price-catalog .price-group-name {
     min-width: 0;
     max-width: none;
@@ -119,11 +116,11 @@
 .price-details {
   box-sizing: border-box;
   display: grid;
-  width: 100cqw;
+  width: 100%;
   min-width: 0;
   max-width: 100%;
-  gap: 24px;
-  padding: 24px 16px;
+  gap: 20px;
+  padding: 20px;
   contain: inline-size;
 }
 .price-details > p {
@@ -154,8 +151,6 @@
 .price-matrix-scroll {
   min-width: 0;
   max-width: 100%;
-  overflow-x: auto;
-  overscroll-behavior-x: contain;
 }
 .price-matrix {
   width: 100%;
@@ -164,14 +159,14 @@
   font-size: var(--text-body);
   line-height: 1.5;
 }
-.price-matrix .price-item-column { width: 12rem; }
-.price-matrix .price-unit-column { width: 8rem; }
-.price-matrix .price-amount-column { width: 12rem; }
+.price-matrix .price-item-column { width: 20%; }
+.price-matrix .price-unit-column { width: 16%; }
 .price-matrix :is(th, td) {
   position: static;
   height: auto;
   border-bottom: 1px solid var(--border);
-  padding: 12px 16px;
+  padding: 10px 16px;
+  line-height: 20px;
   text-align: left;
   vertical-align: top;
   white-space: normal;
@@ -179,8 +174,10 @@
 .price-matrix thead th {
   border-top: 1px solid var(--border);
   color: var(--text-2);
-  font-size: var(--text-caption);
-  font-weight: 400;
+  font-size: 12px;
+  line-height: 18px;
+  font-weight: 500;
+  padding-block: 12px;
 }
 .price-matrix .price-band-heading,
 .price-matrix .price-amount {
@@ -201,11 +198,12 @@
   font-variant-numeric: tabular-nums;
 }
 .price-matrix .price-group-heading {
-  border-bottom: 0;
-  padding-top: 20px;
-  padding-bottom: 4px;
-  color: var(--text-2);
-  font-size: var(--text-caption);
+  border-bottom: 1px solid var(--border);
+  padding-block: 8px;
+  background: color-mix(in srgb, var(--foreground) 5%, var(--background));
+  color: var(--foreground);
+  font-size: 12px;
+  line-height: 18px;
   font-weight: 500;
 }
 .price-matrix .price-unit {
@@ -221,15 +219,83 @@
 }
 .price-matrix .price-rate-amount {
   display: block;
-  font-family: var(--font-mono);
+  font-family: var(--font-sans);
+  font-weight: 500;
   font-variant-numeric: tabular-nums;
   overflow-wrap: anywhere;
 }
 .price-matrix .price-rate-rule,
 .price-matrix .price-rate-unknown {
-  font-size: var(--text-caption);
-  line-height: 1.5;
+  font-size: 13px;
+  line-height: 20px;
 }
 .price-matrix tbody:last-child tr:last-child :is(th, td) {
   border-bottom: 0;
+}
+
+/* 优惠与模型范围组成一个摘要，目录与附着详情保持同一工作表面。 */
+.tenant-prices .price-summary {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+  gap: 32px;
+}
+.price-summary-discount,
+.price-summary-models { display: grid; min-width: 0; gap: 12px; align-content: start; }
+.price-summary-models { border-left: 1px solid var(--border); padding-left: 32px; }
+.price-summary :is(.bento-card-header, .bento-card-footer) { margin: 0; }
+.price-summary .metric { font-size: 32px; line-height: 40px; font-weight: 500; }
+.price-summary .price-quote-validity { margin-top: 4px; }
+.price-model-actions .btn { min-height: 44px; }
+.price-expand-icon { width: 16px; height: 16px; transition: transform 120ms ease; }
+.price-model-actions [aria-expanded="true"] .price-expand-icon { transform: rotate(180deg); }
+.price-expanded-row { background: color-mix(in srgb, var(--foreground) 2%, var(--background)); }
+.price-tier-header h4 { font-size: 15px; line-height: 24px; font-weight: 600; }
+.price-matrix .price-unit { font-size: 13px; line-height: 20px; }
+.price-matrix .price-rate-unknown { color: var(--muted-foreground); font-weight: 400; }
+.price-catalog :is(.num, .price-multiplier-value) { font-variant-numeric: tabular-nums; }
+.price-catalog:focus-visible,
+.price-matrix-scroll:focus-visible { outline: 2px solid var(--foreground); outline-offset: 2px; }
+@media (max-width: 719px) {
+  .tenant-prices .price-summary { grid-template-columns: minmax(0, 1fr); gap: 20px; }
+  .price-summary-models { border-left: 0; border-top: 1px solid var(--border); padding: 20px 0 0; }
+  .price-summary .metric { font-size: 28px; line-height: 36px; }
+  .price-details { padding: 16px; }
+  .price-detail-group { padding-inline: 16px; }
+  .price-model-bar { gap: 12px; }
+  .price-model-actions { gap: 8px; }
+}
+@media (prefers-reduced-motion: reduce) { .price-expand-icon { transition: none; } }
+
+/* 中等视口先重排摘要，每个分组的倍率与四项单价保持同屏可读。 */
+@media (max-width: 1050px) {
+  .price-catalog > .dt-wrap > .dt { display: block; }
+  .price-catalog > .dt-wrap > .dt > colgroup { display: none; }
+  .price-catalog > .dt-wrap > .dt > thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+  .price-catalog > .dt-wrap > .dt > tbody { display: block; }
+  .price-model-heading, .price-expanded-row { display: block; }
+  .price-model-heading > td, .price-expanded-row > td { display: block; width: 100%; }
+  .price-group-row { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); padding: 16px; gap: 16px; border-bottom: 1px solid var(--border); }
+  .price-group-row > .price-group-name { grid-column: 1 / 3; padding: 0; }
+  .price-group-row > .price-multiplier { grid-column: 3 / 5; }
+  .price-catalog .price-group-row > td { display: block; min-width: 0; padding: 0; border: 0; text-align: left; }
+  .price-group-row > td::before { display: block; margin-bottom: 6px; content: attr(data-label); color: var(--muted-foreground); font-size: 12px; line-height: 18px; }
+  .price-group-row .price-rate-amount { font-size: 14px; line-height: 22px; }
+}
+
+/* 窄屏将上下文价格纵向列在同一计费项目下，数值不隐藏、不舍入。 */
+@media (max-width: 719px) {
+  .price-group-row { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+  .price-group-row > .price-group-name, .price-group-row > .price-multiplier { grid-column: 1 / -1; }
+  .price-matrix, .price-matrix > tbody { display: block; width: 100%; }
+  .price-matrix > colgroup { display: none; }
+  .price-matrix > thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+  .price-matrix tr { display: grid; grid-template-columns: minmax(0, 1fr) auto; padding-block: 12px; border-bottom: 1px solid var(--border); }
+  .price-matrix tr:has(.price-group-heading) { display: block; padding: 0; border: 0; }
+  .price-matrix .price-group-heading { display: block; }
+  .price-matrix :is(.price-item, .price-unit) { display: block; min-width: 0; padding: 0 8px 10px; border: 0; }
+  .price-matrix .price-unit { text-align: right; }
+  .price-matrix .price-amount { display: grid; grid-column: 1 / -1; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 2px 12px; padding: 8px; border: 0; }
+  .price-matrix .price-amount::before { grid-row: 1 / span 3; content: attr(data-band) "\a" attr(data-range); color: var(--muted-foreground); font-size: 12px; line-height: 18px; white-space: pre-line; text-align: left; }
+  .price-matrix .price-amount > span { grid-column: 2; min-width: 0; }
+  .price-matrix .price-amount + .price-amount { border-top: 1px solid var(--border); }
 }

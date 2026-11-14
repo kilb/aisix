@@ -76,6 +76,7 @@ mod dp_store;
 mod export;
 mod heartbeat;
 mod managed_bundle;
+mod native_objects;
 mod proxy_protocol;
 mod telemetry;
 
@@ -102,6 +103,7 @@ use clap::Parser;
 use etcd_client::{Certificate, ConnectOptions, Identity, TlsOptions};
 use std::time::Duration;
 use tokio::sync::watch;
+use tracing::Instrument;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -1508,6 +1510,18 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
             ),
         }
     }
+    // 原生对象归属使用独立 mTLS 连接池，失败时维持不可用而不降级为本地授权。
+    if let Some(h) = heartbeat_cfg.as_ref() {
+        match native_objects::NativeObjectsClient::new(dpmgr_origin(&h.url), &h.mtls) {
+            Ok(client) => {
+                proxy_state = proxy_state.with_native_objects(Arc::new(client));
+            }
+            Err(error) => tracing::error!(
+                error = %format_args!("{error:#}"),
+                "native object authority is unavailable: could not build its control-plane client",
+            ),
+        }
+    }
     // OTLP exports report the configured service name as `service.name`.
     proxy_state
         .otlp_fan_out
@@ -1686,6 +1700,26 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
     // the two trust decisions cannot drift apart.
     let proxy_protocol_trust: ProxyProtocolTrust = proxy_state.real_ip.trusted.clone().into();
     let exporter_fan_out = proxy_state.otlp_fan_out.clone();
+    // 工作器与路由共享最终状态；关机时结束读取，未完成租约由其他实例接手。
+    let native_objects_task = proxy_state.native_objects.as_ref().map(|_| {
+        tokio::spawn(
+            {
+                let state = proxy_state.clone();
+                let cancel = cancel_rx.clone();
+                async move {
+                    tokio::join!(
+                        aisix_proxy::native_api::background::run(state.clone(), cancel.clone()),
+                        aisix_proxy::native_api::openai_batch_worker::run(
+                            state.clone(),
+                            cancel.clone()
+                        ),
+                        aisix_proxy::native_api::anthropic_batch_worker::run(state, cancel),
+                    );
+                }
+            }
+            .instrument(tracing::info_span!("native_object_observer")),
+        )
+    });
     let proxy_router = aisix_proxy::build_router(proxy_state);
 
     let background_check_task = tokio::spawn(run_background_model_checks(
@@ -2004,6 +2038,9 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
     let _ = signal_task.await;
     let _ = watch_task.await;
     if let Some(task) = heartbeat_task {
+        let _ = task.await;
+    }
+    if let Some(task) = native_objects_task {
         let _ = task.await;
     }
     if let Some(task) = telemetry_task {

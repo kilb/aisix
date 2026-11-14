@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { Pencil } from "lucide-react";
 import {
   ApiError,
   billing,
@@ -249,7 +250,7 @@ export function Budgets({ member }: { member: SessionMember }) {
   return (
     <>
       <PageHeader title="预算" eyebrow="BUDGETS · 分级额度" dataLead="账户额度与组织、成员、密钥预算独立生效。多条限制同时存在时，以先用尽者为准。周期按 UTC 边界结算，时间显示采用 UTC+8。" />
-      <BentoGrid>
+      <BentoGrid className="tenant-budgets">
         {rowsErr && <div className={cn(span.d12, "note crit")} role="alert">预算读取失败：{rowsErr}</div>}
         {financial && <>
           <Section number={1} title="账户额度" className={span.d8} actions={<a className="inline-flex min-h-11 items-center text-body" href="#billing">查看账户 ↗</a>}>
@@ -259,13 +260,13 @@ export function Budgets({ member }: { member: SessionMember }) {
             </>}
             <CardFooter className="border-t border-ink/7 pt-4 text-caption text-muted">账户额度与额外预算上限分别生效；调用仍受组织、成员、密钥预算及其他限制约束。</CardFooter>
           </Section>
-          <Section number={2} title="组织预算（平台设置）" tone="inverse" className={cn(span.d4, "tablet:col-span-12")}>
-            {rows !== null && !rowsErr && <><Metric size="display">{team.length.toLocaleString("en-US")}</Metric><p className="text-caption text-on-inverse-muted">条额外组织预算</p></>}
-            <p className="text-caption text-on-inverse-muted">平台可额外设置按周期或一次性的组织预算上限，与账户余额和信用额度不同。</p>
+          <Section number={2} title="组织预算（平台设置）" className={cn(span.d4, "tablet:col-span-12")}>
+            {rows !== null && !rowsErr && <><Metric size="display">{team.length.toLocaleString("en-US")}</Metric><p className="text-caption text-muted">条额外组织预算</p></>}
+            <p className="text-caption text-muted">平台可额外设置按周期或一次性的组织预算上限，与账户余额和信用额度不同。</p>
             {!rowsErr && <QuotaTable label="组织额度" rows={rows === null ? null : team} empty="未设置额外组织预算上限" role={role} parentsOf={() => []} onChanged={reload} />}
           </Section>
         </>}
-        <Section number={financial ? 3 : 1} title="成员额度" className={creator && !rowsErr ? span.d7 : span.d12}>
+        <Section number={financial ? 3 : 1} title="成员额度" className={span.d12}>
           <p className="text-caption text-muted">{manager || role === "billing" ? "组织中每个成员的独立额度" : "分配给我的成员额度"}；进度仅比较每条预算自身的已用与限额，不合并不同周期。</p>
           {!rowsErr && <QuotaTable label="成员额度" rows={rows === null ? null : memberRows}
             empty={manager ? "还没有成员额度，可在「新建额度」中新建" : role === "billing" ? "还没有成员额度" : "还没有给你设置成员额度"}
@@ -322,15 +323,15 @@ function KeyFigures({
           const q = quotas[id];
           return (
             <tr key={id}>
-              <td>
+              <td data-label="密钥">
                 <span className="trunc" title={label}>
                   {label}
                 </span>
               </td>
-              <td className="num">
+              <td className="num" data-label="实际可用">
                 {!q ? "—" : q.effective_remaining_micro_cny === null ? "不限" : <Money micro={q.effective_remaining_micro_cny} />}
               </td>
-              <td>{q?.binding_level ? (LEVEL[q.binding_level] ?? q.binding_level) : "—"}</td>
+              <td data-label="受限于">{q?.binding_level ? (LEVEL[q.binding_level] ?? q.binding_level) : "—"}</td>
             </tr>
           );
         })}
@@ -470,16 +471,16 @@ function QuotaRow({
 
   return (
     <tr ref={form}>
-      <td>
+      <td data-label="对象">
         <span className="trunc" title={b.target.label}>
           {b.target.label}
           {!b.target_live && "（已失效）"}
         </span>
       </td>
-      <td>{SET_BY[b.set_by] ?? b.set_by}</td>
-      <td>{KIND[b.kind] ?? b.kind}</td>
-      <td className="tabular">{periodText(b)}</td>
-      <td className="num">
+      <td data-label="设置方">{SET_BY[b.set_by] ?? b.set_by}</td>
+      <td data-label="类型">{KIND[b.kind] ?? b.kind}</td>
+      <td className="tabular" data-label="结算周期"><span className="tenant-cell-label" aria-hidden="true">结算周期</span>{periodText(b)}</td>
+      <td className="num" data-label="限额">
         {editing ? (
           <Field label="新的限额（元）" error={problem}>
             {(aria) => (
@@ -492,19 +493,19 @@ function QuotaRow({
         {over && <span className="hint cell-note">{OVER_PARENT}</span>}
         {!editing && problem && <span className="field-problem">{problem}</span>}
       </td>
-      <td className="num">
+      <td className="num" data-label="已用">
         <Money micro={b.spent_micro_cny} />
-        <BudgetProgress value={exactRatio(b.spent_micro_cny, b.limit_micro_cny)} accessibleLabel={`${b.target.label}，${periodText(b)}预算已用进度`} valueLabel={progressNote} className="mt-2 min-w-24" />
+        <BudgetProgress value={exactRatio(b.spent_micro_cny, b.limit_micro_cny)} accessibleLabel={`${b.target.label}，${periodText(b)}预算已用进度`} valueLabel={progressNote} className="mt-2 min-w-0" />
       </td>
-      <td className="num">
+      <td className="num" data-label="剩余">
         <Money micro={b.remaining_micro_cny} />
       </td>
-      <td>
+      <td data-label="状态">
         <span data-state={b.exhausted ? "exhausted" : "ok"}>
           <Lamp state={b.exhausted ? "rejected" : "applied"}>{b.exhausted ? "已用尽" : "正常"}</Lamp>
         </span>
       </td>
-      <td className="right">
+      <td className="right" data-label="操作">
         {(can.edit || can.del) && (
           <span className="acts">
             {editing ? (
@@ -528,6 +529,10 @@ function QuotaRow({
                 {can.edit && (
                   <Button
                     size="sm"
+                    kind="quiet"
+                    className="tenant-icon-action"
+                    aria-label="修改限额"
+                    title="修改限额"
                     disabled={acting !== null}
                     onClick={() => {
                       setDraft(microCnyToInput(b.limit_micro_cny));
@@ -535,7 +540,7 @@ function QuotaRow({
                       setEditing(true);
                     }}
                   >
-                    修改限额
+                    <Pencil aria-hidden="true" />
                   </Button>
                 )}
                 {can.del && (
@@ -662,7 +667,7 @@ function CreateForm({
 
   return (
     <Section number={number} title="新建额度" className={span.d5Wide}>
-      <form className="grid gap-4" ref={form} onSubmit={submit} noValidate>
+      <form className="tenant-form grid gap-4" ref={form} onSubmit={submit} noValidate>
         <Field label="对象类型" error={errors.scope}>
           {(aria) => (
             <select
@@ -717,7 +722,7 @@ function CreateForm({
             {general}
           </div>
         )}
-        <div className="col-span-full mt-2 flex justify-end gap-2 border-t border-ink/7 pt-4">
+        <div className="tenant-form-actions col-span-full">
           <Button kind="primary" type="submit" busy={busy} busyLabel="创建中…">
             创建
           </Button>

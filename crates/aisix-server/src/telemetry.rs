@@ -53,9 +53,10 @@ use hyper::body::Bytes;
 use serde::Deserialize;
 use tokio::sync::watch;
 use tokio::time::Instant;
+use tracing::Instrument;
 use uuid::Uuid;
 
-use aisix_obs::{Metrics, UsageEvent, UsageEventLabels, UsageSink};
+use aisix_obs::{Metrics, UsageEvent, UsageEventLabels, UsageIoAuditUpdate, UsageSink};
 
 use crate::heartbeat::MtlsBundle;
 
@@ -297,17 +298,127 @@ pub fn spawn(
     mut cancel: watch::Receiver<bool>,
 ) -> (UsageSink, tokio::task::JoinHandle<()>) {
     let (tx, rx) = tokio::sync::mpsc::channel(QUEUE_CAPACITY);
+    let (io_tx, io_rx) = tokio::sync::mpsc::channel(MAX_BATCH);
     // Attached here as well as at the wiring point: this function holds the
     // handle, so a caller cannot end up with a sink whose queue drops are
     // invisible while the worker's are counted. (The wiring point still
     // attaches it, because the no-control-plane branch builds a
     // `UsageSink::disabled()` that never comes through here and still has
     // `sink_disabled` to report.)
-    let sink = UsageSink::new(tx).with_metrics(metrics.clone());
+    let sink = UsageSink::new(tx)
+        .with_metrics(metrics.clone())
+        .with_io_audit_sender(io_tx);
+    let mut io_cancel = cancel.clone();
     let handle = tokio::spawn(async move {
-        run(cfg, metrics, rx, &mut cancel).await;
+        tokio::join!(
+            run(cfg.clone(), metrics, rx, &mut cancel),
+            run_io_updates(cfg, io_rx, &mut io_cancel)
+                .instrument(tracing::info_span!("telemetry", kind = "io_audit_update")),
+        );
     });
     (sink, handle)
+}
+
+fn prepare_io_update(update: UsageIoAuditUpdate) -> Option<Prepared> {
+    let json = serde_json::to_vec(&update).ok()?;
+    if json.len() > MAX_EVENT_BYTES {
+        return None;
+    }
+    let age = chrono::Duration::from_std(update.queued_at.elapsed()).ok()?;
+    Some(Prepared {
+        json,
+        occurred_at: Some(chrono::Utc::now().checked_sub_signed(age)?),
+        user_id: String::new(),
+        user_name: String::new(),
+    })
+}
+
+fn fill_io_ready(buffer: &mut Buffer, rx: &mut tokio::sync::mpsc::Receiver<UsageIoAuditUpdate>) {
+    while !buffer.holds_a_full_batch() {
+        let Ok(update) = rx.try_recv() else { break };
+        if let Some(prepared) = prepare_io_update(update) {
+            buffer.bytes += prepared.json.len();
+            buffer.events.push_back(prepared);
+        }
+    }
+}
+
+// 补注独占队列和私有计数器；复用传输重试，不能占用或改变计费用量的投递状态。
+async fn run_io_updates(
+    cfg: TelemetryConfig,
+    mut rx: tokio::sync::mpsc::Receiver<UsageIoAuditUpdate>,
+    cancel: &mut watch::Receiver<bool>,
+) {
+    let client = match build_client(&cfg.mtls) {
+        Ok(client) => client,
+        Err(error) => {
+            tracing::error!(%error, "telemetry metadata client disabled");
+            return;
+        }
+    };
+    let metrics = Metrics::new(false);
+    let mut state = SenderState::default();
+    let mut buffer = Buffer::default();
+    let mut ticker = tokio::time::interval(cfg.interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut closed = false;
+    loop {
+        let ticked = if *cancel.borrow() {
+            false
+        } else {
+            tokio::select! {
+                update = rx.recv() => {
+                    if let Some(update) = update {
+                        if let Some(prepared) = prepare_io_update(update) {
+                            buffer.bytes += prepared.json.len();
+                            buffer.events.push_back(prepared);
+                        }
+                    } else {
+                        closed = true;
+                    }
+                    false
+                }
+                _ = ticker.tick() => true,
+                changed = cancel.changed() => {
+                    if changed.is_err() { closed = true; }
+                    false
+                }
+            }
+        };
+        let stopping = closed || *cancel.borrow();
+        if stopping || ticked || buffer.holds_a_full_batch() {
+            loop {
+                fill_io_ready(&mut buffer, &mut rx);
+                if stopping && Instant::now() >= state.shutdown_deadline() {
+                    return;
+                }
+                let Some(batch) = buffer.take_next() else {
+                    break;
+                };
+                deliver(
+                    &client,
+                    &cfg,
+                    &metrics,
+                    &mut state,
+                    &batch,
+                    if stopping {
+                        Retry::Disabled
+                    } else {
+                        Retry::Allowed
+                    },
+                    cancel,
+                    None,
+                )
+                .await;
+                if !stopping {
+                    break;
+                }
+            }
+        }
+        if stopping {
+            return;
+        }
+    }
 }
 
 /// Run `serving` to completion, then flip `stop`, the signal the worker
@@ -1497,6 +1608,316 @@ mod tests {
             .timeout(Duration::from_secs(10))
             .build()
             .unwrap()
+    }
+
+    fn io_audit() -> aisix_core::usage_io::UsageIoAudit {
+        serde_json::from_value(serde_json::json!({
+            "version":1,"boundary":"client_exchange","request_body_bytes":31,
+            "response_body_bytes":47,"response_complete":true,
+            "input_text":{"utf8_bytes":7,"unicode_scalars":3,"complete":true}
+        }))
+        .unwrap()
+    }
+
+    fn io_update(id: &str) -> UsageIoAuditUpdate {
+        UsageIoAuditUpdate::new(id.into(), io_audit())
+    }
+
+    fn emitted_count(metrics: &Metrics) -> u64 {
+        metrics
+            .render()
+            .lines()
+            .filter(|line| line.starts_with("aisix_usage_events_emitted_total{"))
+            .map(|line| line.rsplit(' ').next().unwrap().parse::<u64>().unwrap())
+            .sum()
+    }
+
+    #[tokio::test]
+    async fn io_updates_leave_original_wire_and_retries_unchanged() {
+        let posts = Arc::new(std::sync::Mutex::new(Vec::<(String, Vec<u8>)>::new()));
+        let recorded = Arc::clone(&posts);
+        let server = local_server(move |headers, body| {
+            let wire: serde_json::Value = serde_json::from_slice(body).unwrap();
+            let metadata = wire["events"][0]["kind"] == "io_audit_update";
+            let mut posts = recorded.lock().unwrap();
+            let first = posts.is_empty();
+            posts.push((
+                headers[USAGE_BATCH_ID_HEADER].to_str().unwrap().into(),
+                body.to_vec(),
+            ));
+            let mut reply = Reply::status(if first && !metadata { 503 } else { 200 });
+            reply.headers.push((USAGE_BATCH_DEDUP_HEADER, "1"));
+            reply
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(format!("{}/dp/telemetry", server.uri()), &dir);
+        let metrics = Metrics::new(false);
+        let (stop, cancel) = watch::channel(false);
+        let (sink, worker) = spawn(cfg, metrics.clone(), cancel);
+        assert!(sink.io_audit_updates_enabled());
+        let mut original = sample_event("original");
+        original.event_id = Uuid::new_v4().to_string();
+        sink.try_emit("chat", original.clone(), UsageEventLabels::default());
+        tokio::time::pause();
+        let mut waiting = Box::pin(std::future::pending::<()>());
+        drive_until(
+            waiting.as_mut(),
+            STEP_WHILE_SERVING,
+            || !posts.lock().unwrap().is_empty(),
+            "original was not dispatched",
+        )
+        .await;
+        sink.try_amend_io(original.event_id.clone(), io_audit());
+        drive_until(
+            waiting.as_mut(),
+            STEP_WHILE_SERVING,
+            || posts.lock().unwrap().len() >= 3,
+            "original retry or metadata missing",
+        )
+        .await;
+        stop.send(true).unwrap();
+        drop(sink);
+        drive_until(
+            waiting.as_mut(),
+            STEP_WHILE_SERVING,
+            || worker.is_finished(),
+            "joined telemetry workers did not stop",
+        )
+        .await;
+        worker.await.unwrap();
+        let posts = posts.lock().unwrap();
+        assert_eq!(posts.len(), 3, "unexpected telemetry POST");
+        let expected = format!(
+            "{{\"events\":[{}]}}",
+            serde_json::to_string(&original).unwrap()
+        )
+        .into_bytes();
+        let normals: Vec<_> = posts
+            .iter()
+            .filter(|(_, bytes)| *bytes == expected)
+            .collect();
+        assert_eq!(normals.len(), 2, "{posts:?}");
+        assert_eq!(normals[0], normals[1], "retry changes id/raw bytes");
+        let annotations: Vec<serde_json::Value> = posts
+            .iter()
+            .map(|(_, bytes)| serde_json::from_slice::<serde_json::Value>(bytes).unwrap())
+            .flat_map(|wire| wire["events"].as_array().unwrap().clone())
+            .filter(|event| event["kind"] == "io_audit_update")
+            .collect();
+        assert_eq!(
+            annotations,
+            vec![
+                serde_json::json!({"kind":"io_audit_update","event_id":original.event_id,"io_audit":io_audit()})
+            ]
+        );
+        assert_eq!(annotations[0].as_object().unwrap().len(), 3);
+        let annotation_batch: serde_json::Value = posts
+            .iter()
+            .map(|(_, bytes)| serde_json::from_slice::<serde_json::Value>(bytes).unwrap())
+            .find(|wire| wire["events"][0]["kind"] == "io_audit_update")
+            .unwrap();
+        assert_eq!(
+            annotation_batch,
+            serde_json::json!({"events":[annotations[0]]})
+        );
+        assert_eq!(emitted_count(&metrics), 1);
+        assert_eq!(drops_of_every_reason(&metrics), 0);
+    }
+
+    #[tokio::test]
+    async fn full_metadata_capacity_cannot_displace_normal_usage() {
+        let (server, posts) = scripted_server(vec![dedups(200)]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(format!("{}/dp/telemetry", server.uri()), &dir);
+        let metrics = Metrics::new(false);
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let (io_tx, mut io_rx) = tokio::sync::mpsc::channel(1);
+        let sink = UsageSink::new(tx)
+            .with_metrics(metrics.clone())
+            .with_io_audit_sender(io_tx);
+        sink.try_amend_io("annotation-A".into(), io_audit());
+        sink.try_amend_io("annotation-overflow".into(), io_audit());
+        assert_eq!(io_rx.len(), 1);
+        let original = sample_event("normal-B");
+        sink.try_emit("chat", original.clone(), UsageEventLabels::default());
+        assert_eq!(sink.queued(), 1);
+        let (_stop, mut cancel) = watch::channel(false);
+        drop(sink);
+        run(cfg, metrics.clone(), rx, &mut cancel).await;
+        let posts = posts.lock().unwrap();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].1["events"], serde_json::json!([original]));
+        assert_eq!(io_rx.try_recv().unwrap().event_id, "annotation-A");
+        assert!(io_rx.try_recv().is_err());
+        assert_eq!(emitted_count(&metrics), 1);
+        assert_eq!(drops_of_every_reason(&metrics), 0);
+    }
+
+    #[tokio::test]
+    async fn metadata_transport_never_mutates_billing_delivery_health_or_counters() {
+        for status in [200, 400, 422, 500] {
+            let (server, posts) = scripted_server(vec![Answer {
+                body: Some(r#"{"accepted":0,"rejected":1}"#),
+                ..dedups(status)
+            }])
+            .await;
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = test_config(format!("{}/dp/telemetry", server.uri()), &dir);
+            let metrics = Metrics::new(false);
+            metrics.usage_delivery().note_waiting();
+            let before = metrics.render();
+            let (stop, cancel) = watch::channel(false);
+            let (sink, worker) = spawn(cfg, metrics.clone(), cancel);
+            sink.try_amend_io("annotation".into(), io_audit());
+            stop.send(true).unwrap();
+            drop(sink);
+            tokio::time::timeout(Duration::from_secs(5), worker)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(posts.lock().unwrap().len(), 1, "{status}");
+            assert!(metrics.usage_delivery().is_waiting(), "{status}");
+            assert_eq!(emitted_count(&metrics), 0);
+            assert_eq!(drops_of_every_reason(&metrics), 0);
+            assert!(!metrics
+                .render()
+                .lines()
+                .any(|line| line.starts_with("aisix_usage_events_rejected_total ")));
+            let stable = |value: &str| {
+                value
+                    .lines()
+                    .filter(|line| {
+                        line.starts_with("aisix_usage_event")
+                            || line.starts_with("aisix_usage_events")
+                    })
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(stable(&before), stable(&metrics.render()));
+        }
+    }
+
+    #[tokio::test]
+    async fn normal_usage_delivers_while_metadata_upstream_is_stalled() {
+        let normal = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let metadata = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let observed_normal = Arc::clone(&normal);
+        let observed_metadata = Arc::clone(&metadata);
+        let server = local_server(move |_, body| {
+            let wire: serde_json::Value = serde_json::from_slice(body).unwrap();
+            let mut reply = Reply::status(200);
+            if wire["events"][0]["kind"] == "io_audit_update" {
+                observed_metadata.fetch_add(1, std::sync::atomic::Ordering::Release);
+                reply.delay = Some(BEYOND_THE_REQUEST_TIMEOUT);
+            } else {
+                observed_normal.fetch_add(1, std::sync::atomic::Ordering::Release);
+            }
+            reply
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(format!("{}/dp/telemetry", server.uri()), &dir);
+        let metrics = Metrics::new(false);
+        let (_stop, cancel) = watch::channel(false);
+        let (sink, worker) = spawn(cfg, metrics.clone(), cancel);
+        sink.try_amend_io("stalled".into(), io_audit());
+        tokio::time::pause();
+        let mut waiting = Box::pin(std::future::pending::<()>());
+        drive_until(
+            waiting.as_mut(),
+            STEP_WHILE_SERVING,
+            || metadata.load(std::sync::atomic::Ordering::Acquire) > 0,
+            "metadata never went in flight",
+        )
+        .await;
+        assert!(!metrics.usage_delivery().is_waiting());
+        sink.try_emit(
+            "chat",
+            sample_event("normal-behind-stall"),
+            UsageEventLabels::default(),
+        );
+        drive_until(
+            waiting.as_mut(),
+            STEP_WHILE_SERVING,
+            || {
+                normal.load(std::sync::atomic::Ordering::Acquire) > 0
+                    && !metrics.usage_delivery().is_waiting()
+            },
+            "metadata stall prevented normal settlement",
+        )
+        .await;
+        assert_eq!(emitted_count(&metrics), 1);
+        assert_eq!(drops_of_every_reason(&metrics), 0);
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+    }
+
+    #[test]
+    fn metadata_preparation_keeps_only_scalar_annotation_and_enqueue_age() {
+        let mut update = io_update("event-1");
+        update.queued_at = std::time::Instant::now()
+            .checked_sub(RETRY_BUDGET + Duration::from_secs(60))
+            .unwrap();
+        let prepared = prepare_io_update(update).unwrap();
+        assert_eq!(remaining_budget(&[prepared]), Duration::ZERO);
+        let prepared = prepare_io_update(io_update("event-1")).unwrap();
+        let wire: serde_json::Value = serde_json::from_slice(&prepared.json).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({"kind":"io_audit_update","event_id":"event-1","io_audit":io_audit()})
+        );
+        assert_eq!(wire.as_object().unwrap().len(), 3);
+        assert!(remaining_budget(&[prepared]) > RETRY_BUDGET - Duration::from_secs(5));
+        assert!(prepare_io_update(io_update(&"x".repeat(MAX_EVENT_BYTES))).is_none());
+    }
+
+    #[tokio::test]
+    async fn both_telemetry_workers_share_the_existing_shutdown_budget() {
+        let seen = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let recorded = Arc::clone(&seen);
+        let server = local_server(move |_, _| {
+            recorded.fetch_add(1, std::sync::atomic::Ordering::Release);
+            let mut reply = Reply::status(200);
+            reply.delay = Some(BEYOND_THE_REQUEST_TIMEOUT);
+            reply
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(format!("{}/dp/telemetry", server.uri()), &dir);
+        let metrics = Metrics::new(false);
+        let (stop, cancel) = watch::channel(false);
+        let (sink, worker) = spawn(cfg, metrics.clone(), cancel);
+        sink.try_emit(
+            "chat",
+            sample_event("normal-stop"),
+            UsageEventLabels::default(),
+        );
+        sink.try_amend_io("normal-stop".into(), io_audit());
+        tokio::time::pause();
+        let mut waiting = Box::pin(std::future::pending::<()>());
+        drive_until(
+            waiting.as_mut(),
+            STEP_WHILE_SERVING,
+            || seen.load(std::sync::atomic::Ordering::Acquire) >= 2,
+            "both workers never went in flight",
+        )
+        .await;
+        let started = Instant::now();
+        stop.send(true).unwrap();
+        drop(sink);
+        drive_until(
+            waiting.as_mut(),
+            STEP_WHILE_SERVING,
+            || worker.is_finished(),
+            "joined shutdown exceeded drain",
+        )
+        .await;
+        worker.await.unwrap();
+        assert!(Instant::now() - started <= FINAL_DRAIN_BUDGET + Duration::from_millis(100));
+        assert_eq!(emitted_count(&metrics), 1);
+        assert_eq!(drops_with_reason(&metrics, DROP_SEND_UNCONFIRMED), 1);
+        assert_eq!(drops_of_every_reason(&metrics), 1);
     }
 
     #[tokio::test]

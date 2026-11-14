@@ -25,3 +25,9 @@ test("程序导航与旧链接使用同一迁移规则", () => {
   assert.equal(adminHash("pricing", "public-models"), "#public-routes");
   assert.equal(adminHash("model-tests", "history"), "#model-tests?section=history");
 });
+
+test("上游监测有可分享入口且允许只读运维角色访问", () => {
+  assert.equal(adminRouteOf("#upstream-monitoring?model_id=direct-a").tab, "upstream-monitoring");
+  assert.equal(adminHash("upstream-monitoring"), "#upstream-monitoring");
+  for (const role of ["admin", "operator", "viewer"]) assert.equal(canSeeAdminTab("upstream-monitoring", role), true);
+});

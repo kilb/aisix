@@ -42,6 +42,7 @@ use serde_json::{json, Value};
 use sqlx::{PgConnection, Postgres, QueryBuilder};
 use uuid::Uuid;
 
+use aisix_core::usage_io::UsageIoAudit;
 use aisix_pricing::{cny_per_million, CnyPerUsd, Rate};
 
 use super::range::{checked_range, Group};
@@ -49,7 +50,7 @@ use crate::auth::{MemberAuth, MemberRole, OperatorAuth, OperatorRole};
 use crate::db::DbError;
 use crate::error::{ApiError, Detail};
 use crate::resources::Kind;
-use crate::usage::{page, page_limit, query_rejected};
+use crate::usage::{page, page_limit, query_rejected, CallFilters};
 use crate::AppState;
 
 /// What a tenant sees of a call's outcome.
@@ -59,35 +60,61 @@ pub enum TenantStatus {
     Succeeded,
     Retried,
     Failed,
+    Unknown,
 }
 
 /// The `error_class` a tenant sees for a recorded one. A model the key may
 /// not use reads as an unknown model: the gateway answers it `403` outside
 /// platform mode, and the tenant must not learn a model exists.
 pub fn tenant_error(error_class: &str, error_message: &str) -> &'static str {
-    match error_class {
-        "model_not_found" => "model_not_found",
-        "client_disconnected" => "client_disconnected",
-        "permission_denied" if error_message.starts_with("API key is not allowed to use model") => {
-            "model_not_found"
-        }
-        "invalid_request_error" => "invalid_request",
-        "rate_limit_exceeded" => "rate_limited",
-        "billing_error" => "budget_exceeded",
-        "content_filter" => "content_filtered",
-        "provider_unavailable"
-        | "all_candidates_unavailable"
-        | "timeout"
-        | "upstream_status"
-        | "upstream_decode"
-        | "upstream_in_band"
-        | "transport"
-        | "stream_aborted"
-        | "invalid_credentials"
-        | "config"
-        | "invalid_config" => "upstream_unavailable",
-        _ => "failed",
+    if error_class == "permission_denied"
+        && error_message.starts_with("API key is not allowed to use model")
+    {
+        return "model_not_found";
     }
+    TENANT_ERRORS
+        .iter()
+        .find_map(|(recorded, shown)| (*recorded == error_class).then_some(*shown))
+        .unwrap_or("failed")
+}
+
+// 显示和筛选共用同一词汇，避免用筛选探测不对租户公开的错误分类。
+const TENANT_ERRORS: &[(&str, &str)] = &[
+    ("model_not_found", "model_not_found"),
+    ("client_disconnected", "client_disconnected"),
+    ("invalid_request_error", "invalid_request"),
+    ("rate_limit_exceeded", "rate_limited"),
+    ("billing_error", "budget_exceeded"),
+    ("content_filter", "content_filtered"),
+    ("provider_unavailable", "upstream_unavailable"),
+    ("all_candidates_unavailable", "upstream_unavailable"),
+    ("timeout", "upstream_unavailable"),
+    ("upstream_status", "upstream_unavailable"),
+    ("upstream_decode", "upstream_unavailable"),
+    ("upstream_in_band", "upstream_unavailable"),
+    ("transport", "upstream_unavailable"),
+    ("stream_aborted", "upstream_unavailable"),
+    ("invalid_credentials", "upstream_unavailable"),
+    ("config", "upstream_unavailable"),
+    ("invalid_config", "upstream_unavailable"),
+];
+
+pub(crate) fn is_tenant_error(value: &str) -> bool {
+    value == "failed" || TENANT_ERRORS.iter().any(|(_, shown)| *shown == value)
+}
+
+pub(crate) fn tenant_error_sql() -> String {
+    let mut sql = String::from(
+        "CASE WHEN ue.event->>'error_class' = 'permission_denied' \
+         AND starts_with(COALESCE(ue.event->>'error_message', ''), \
+         'API key is not allowed to use model') THEN 'model_not_found' \
+         ELSE CASE ue.event->>'error_class'",
+    );
+    for (recorded, shown) in TENANT_ERRORS {
+        sql.push_str(&format!(" WHEN '{recorded}' THEN '{shown}'"));
+    }
+    sql.push_str(" ELSE 'failed' END END");
+    sql
 }
 
 /// `(status, status_code shown, error shown)` of one recorded attempt. Only
@@ -95,17 +122,28 @@ pub fn tenant_error(error_class: &str, error_message: &str) -> &'static str {
 /// vocabulary only; an attempt that was not the request's last shows
 /// neither. A final row that recorded an error class is a failure even when
 /// its status is 2xx (a stream that broke after its first byte).
+/// 缺失终态标记或有效 HTTP 状态的记录保持未知，不补造失败或重试。
 pub fn tenant_outcome(
-    status_code: u16,
+    status_code: Option<u16>,
     error_class: &str,
     error_message: &str,
-    is_final_attempt: bool,
+    is_final_attempt: Option<bool>,
 ) -> (TenantStatus, Option<u16>, Option<&'static str>) {
-    if !is_final_attempt {
+    if is_final_attempt == Some(false) {
         return (TenantStatus::Retried, None, None);
     }
-    if (200..300).contains(&status_code) && error_class.is_empty() {
-        return (TenantStatus::Succeeded, Some(status_code), None);
+    if is_final_attempt.is_none() {
+        return (TenantStatus::Unknown, None, None);
+    }
+    let status_code = status_code.filter(|code| (100..600).contains(code));
+    if error_class.is_empty() {
+        match status_code {
+            Some(code) if (200..300).contains(&code) => {
+                return (TenantStatus::Succeeded, Some(code), None);
+            }
+            None => return (TenantStatus::Unknown, None, None),
+            _ => {}
+        }
     }
     (
         TenantStatus::Failed,
@@ -192,11 +230,108 @@ pub(super) const EVENT_FIELDS: &str = "jsonb_build_object(\
     'error_class', ue.event->'error_class', \
     'error_message', ue.event->'error_message', \
     'is_final_attempt', ue.event->'is_final_attempt', \
+    'inference_stage', ue.event->'inference_stage', \
     'cache_status', ue.event->'cache_status', \
     'guardrail_blocked', ue.event->'guardrail_blocked', \
     'downstream_latency_ms', ue.event->'downstream_latency_ms', \
     'first_token_latency_ms', ue.event->'first_token_latency_ms', \
-    'upstream_latency_ms', ue.event->'upstream_latency_ms')";
+    'upstream_latency_ms', ue.event->'upstream_latency_ms', \
+    'io_audit', ue.event->'io_audit', \
+    'usage_estimated', ue.event->'usage_estimated', \
+    'usage', jsonb_build_object(\
+        'prompt_tokens', ue.event->'prompt_tokens', \
+        'completion_tokens', ue.event->'completion_tokens', \
+        'cached_prompt_tokens', ue.event->'cached_prompt_tokens', \
+        'cache_write_tokens', ue.event->'cache_write_tokens', \
+        'cache_creation_tokens', ue.event->'cache_creation_tokens', \
+        'cache_creation_1h_tokens', ue.event->'cache_creation_1h_tokens', \
+        'cache_read_tokens', ue.event->'cache_read_tokens', \
+        'reasoning_tokens', ue.event->'reasoning_tokens', \
+        'web_search_requests', ue.event->'web_search_requests', \
+        'total_tokens', ue.event->'total_tokens'))";
+
+/// 对应版本边界内已观测文本的未校准参考；不参与价格、配额或用量改写。
+#[derive(Debug, Serialize)]
+pub struct IoTokenReference {
+    method: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_tokens: Option<u64>,
+}
+
+/// 详情共用的只读投影，保留缺失、真实零和网关估算来源。
+#[derive(Debug, Serialize)]
+pub struct CallUsage {
+    usage: Option<serde_json::Map<String, Value>>,
+    usage_estimated: Option<bool>,
+    usage_input_tokens: Option<u64>,
+    io_audit: Option<UsageIoAudit>,
+    io_token_reference: Option<IoTokenReference>,
+}
+
+impl CallUsage {
+    pub(crate) fn from_event(ev: &Value) -> Self {
+        let io_audit = ev
+            .get("io_audit")
+            .and_then(|raw| serde_json::from_value::<UsageIoAudit>(raw.clone()).ok())
+            .filter(UsageIoAudit::validate);
+        let io_token_reference = io_audit
+            .as_ref()
+            // 多次真实交换的聚合长度不能与某一次调用的记录 Token 作单次对照。
+            .filter(|audit| audit.version != 2 || audit.exchange_count.is_none_or(|count| count <= 1))
+            .map(|audit| {
+                // 除法后再向上取整，避免 u64 上界的加法溢出。
+                let estimate = |bytes: u64| bytes.div_ceil(4);
+                IoTokenReference {
+                    method: "utf8_bytes_div4_v1",
+                    input_tokens: audit
+                        .input_text
+                        .as_ref()
+                        .map(|text| estimate(text.utf8_bytes)),
+                    output_tokens: audit
+                        .output_text
+                        .as_ref()
+                        .map(|text| estimate(text.utf8_bytes)),
+                }
+            });
+        Self {
+            usage: ev.get("usage").and_then(Value::as_object).map(|usage| {
+                usage
+                    .iter()
+                    .filter(|(_, value)| value.is_number())
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            }),
+            usage_estimated: ev.get("usage_estimated").and_then(Value::as_bool),
+            usage_input_tokens: stored_input_tokens(&ev["usage"]),
+            io_audit,
+            io_token_reference,
+        }
+    }
+}
+
+fn stored_input_tokens(usage: &Value) -> Option<u64> {
+    let prompt = usage.get("prompt_tokens")?.as_u64()?;
+    let optional = |key: &str| match usage.get(key) {
+        None | Some(Value::Null) => Some(0),
+        Some(value) => value.as_u64(),
+    };
+    let cached = optional("cached_prompt_tokens")?;
+    let written = optional("cache_write_tokens")?;
+    let read = optional("cache_read_tokens")?;
+    let created = optional("cache_creation_tokens")?;
+    if cached.checked_add(written)? > prompt {
+        return None;
+    }
+    cached.checked_add(read)?;
+    written.checked_add(created)?;
+    let input = aisix_core::input_tokens_for_pricing(prompt, cached, written, read, created);
+    input
+        .uncached
+        .checked_add(input.cache_read)?
+        .checked_add(input.cache_write)
+}
 
 /// A model as a tenant sees it: `id` only while the model is in the
 /// tenant's current grants.
@@ -329,6 +464,8 @@ pub struct Call {
     pub first_token_latency_ms: Option<u32>,
     /// 本次模型请求的上游起点至结束，包含网络传输，不是请求级总耗时。
     pub attempt_duration_ms: Option<u32>,
+    #[serde(flatten)]
+    pub usage: CallUsage,
     pub charge: ChargeView,
 }
 
@@ -339,6 +476,14 @@ pub struct CallsQuery {
     api_key_id: Option<String>,
     model_id: Option<String>,
     request_id: Option<String>,
+    member_id: Option<String>,
+    outcome: Option<String>,
+    http_status: Option<u16>,
+    error_class: Option<String>,
+    cache_hit: Option<bool>,
+    service_tier: Option<String>,
+    operation: Option<String>,
+    final_attempt: Option<bool>,
     limit: Option<i64>,
     /// Only calls with a smaller `seq`: the previous page's `next_before`.
     before: Option<i64>,
@@ -481,20 +626,29 @@ pub(super) struct TenantView {
 /// ([`visible_to_tenant`]). Every tenant view of a row goes through here, so
 /// they cannot disagree on what a row shows.
 pub(super) fn tenant_view(ev: &Value, charge_status: &str, repriced: bool) -> Option<TenantView> {
-    let is_final = ev.get("is_final_attempt").and_then(Value::as_bool) == Some(true);
-    if !visible_to_tenant(is_final, charge_status, repriced) {
+    let is_final = ev.get("is_final_attempt").and_then(Value::as_bool);
+    if !visible_to_tenant(is_final == Some(true), charge_status, repriced) {
         return None;
     }
     let status_code = ev
         .get("status_code")
         .and_then(Value::as_u64)
-        .and_then(|c| u16::try_from(c).ok())
-        .unwrap_or(0);
+        .and_then(|c| u16::try_from(c).ok());
+    // 后台受理尚无推理终态，不能将首次成功受理显示成已重试。
+    let outcome_final = if is_final == Some(false)
+        && matches!(
+            ev.get("inference_stage").and_then(Value::as_str),
+            Some("accepted" | "pending")
+        ) {
+        None
+    } else {
+        is_final
+    };
     let (status, status_code, error) = tenant_outcome(
         status_code,
         &text(ev, "error_class"),
         &text(ev, "error_message"),
-        is_final,
+        outcome_final,
     );
     Some(TenantView {
         status,
@@ -563,6 +717,17 @@ pub async fn list_calls(
         MemberRole::Billing,
     ])?;
     let Query(q) = query.map_err(query_rejected)?;
+    let filters = CallFilters {
+        outcome: q.outcome,
+        http_status: q.http_status,
+        error_class: q.error_class,
+        cache_hit: q.cache_hit,
+        service_tier: q.service_tier,
+        operation: q.operation,
+        final_attempt: q.final_attempt,
+    };
+    filters.validate(true)?;
+    let member_filter = uuid_filter(&q.member_id, "/member_id")?;
     let (from, to) = match (q.from, q.to) {
         (Some(from), Some(to)) => {
             let (f, t) = checked_range(from, to, None)?;
@@ -591,6 +756,12 @@ pub async fn list_calls(
     sql.push(ADJUSTED).push(" AS adjusted, ");
     sql.push(EVENT_FIELDS).push(" AS ev");
     scope.push_from(&mut sql, false);
+    if let Some(member) = member_filter {
+        sql.push(" AND pc.user_id = ")
+            .push_bind(member)
+            .push("::text");
+    }
+    filters.push(&mut sql, EFF_TIER, true);
     sql.push(" ORDER BY pc.seq DESC LIMIT ")
         .push_bind(limit + 1);
     let mut conn = state.db.pool().acquire().await.map_err(DbError::from)?;
@@ -683,6 +854,7 @@ pub async fn list_calls(
                     .and_then(Value::as_u64)
                     .and_then(|ms| u32::try_from(ms).ok())
                     .filter(|ms| *ms > 0),
+                usage: CallUsage::from_event(&r.ev),
                 charge: ChargeView {
                     calculation: ChargeCalculation {
                         original_micro_cny: r.charge_micro_cny.map(|amount| amount.to_string()),
@@ -929,6 +1101,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn aggregated_upstream_exchanges_keep_lengths_and_usage_without_a_single_call_reference() {
+        for (version, boundary, count, reference_available) in [
+            (2, "upstream_attempt", None, true),
+            (2, "upstream_attempt", Some(0), true),
+            (2, "upstream_attempt", Some(1), true),
+            (2, "upstream_attempt", Some(2), false),
+            (2, "upstream_attempt", Some(u32::MAX), false),
+            (1, "client_exchange", Some(2), true),
+        ] {
+            let mut audit = json!({"version":version,"boundary":boundary,
+                "request_body_bytes":234,"response_body_bytes":156,
+                "request_complete":true,"response_complete":true,
+                "input_text":{"utf8_bytes":16,"unicode_scalars":6,"complete":true},
+                "output_text":{"utf8_bytes":10,"unicode_scalars":4,"complete":true}});
+            if let Some(count) = count {
+                audit["exchange_count"] = json!(count);
+            }
+            let usage = json!({"prompt_tokens":1000,"cached_prompt_tokens":800,
+                "completion_tokens":200,"total_tokens":1200});
+            let view = serde_json::to_value(CallUsage::from_event(&json!({
+                "io_audit":audit,"usage":usage,"usage_estimated":false
+            })))
+            .expect("序列化只读用量投影");
+            assert_eq!(view.get("io_audit"), Some(&audit), "{view}");
+            assert_eq!(view.get("usage"), Some(&usage), "{view}");
+            assert_eq!(view.get("usage_input_tokens"), Some(&json!(1000)), "{view}");
+            assert_eq!(view.get("usage_estimated"), Some(&json!(false)), "{view}");
+            if reference_available {
+                assert_eq!(
+                    view.get("io_token_reference"),
+                    Some(
+                        &json!({"method":"utf8_bytes_div4_v1","input_tokens":4,"output_tokens":3})
+                    ),
+                    "{view}"
+                );
+            } else {
+                assert_eq!(view.get("io_token_reference"), Some(&Value::Null), "{view}");
+            }
+        }
+    }
+
+    #[test]
     fn a_forbidden_model_row_reads_like_an_unknown_model() {
         assert_eq!(
             tenant_error(
@@ -972,25 +1186,96 @@ mod tests {
     #[test]
     fn an_attempt_shows_no_internal_status() {
         assert_eq!(
-            tenant_outcome(200, "", "", true),
+            tenant_outcome(Some(200), "", "", Some(true)),
             (TenantStatus::Succeeded, Some(200), None)
         );
         assert_eq!(
-            tenant_outcome(529, "upstream_status", "x", false),
+            tenant_outcome(Some(529), "upstream_status", "x", Some(false)),
             (TenantStatus::Retried, None, None)
         );
         assert_eq!(
-            tenant_outcome(529, "upstream_status", "x", true),
+            tenant_outcome(Some(529), "upstream_status", "x", Some(true)),
             (TenantStatus::Failed, None, Some("upstream_unavailable"))
         );
         assert_eq!(
-            tenant_outcome(500, "brand_new_class", "", true),
+            tenant_outcome(Some(500), "brand_new_class", "", Some(true)),
             (TenantStatus::Failed, None, Some("failed"))
         );
         // A stream that broke after a 200 is a failure, not a success.
         assert_eq!(
-            tenant_outcome(200, "stream_aborted", "", true),
+            tenant_outcome(Some(200), "stream_aborted", "", Some(true)),
             (TenantStatus::Failed, None, Some("upstream_unavailable"))
+        );
+    }
+
+    #[test]
+    fn unknown_outcome_keeps_status_and_error_private() {
+        for status_code in [None, Some(0), Some(99), Some(600), Some(u16::MAX)] {
+            assert_eq!(
+                tenant_outcome(status_code, "", "", Some(true)),
+                (TenantStatus::Unknown, None, None),
+                "{status_code:?}"
+            );
+        }
+        for status_code in [None, Some(200), Some(503)] {
+            for error_class in ["", "upstream_status"] {
+                assert_eq!(
+                    tenant_outcome(status_code, error_class, "private upstream error", None),
+                    (TenantStatus::Unknown, None, None)
+                );
+            }
+        }
+        assert_eq!(
+            tenant_outcome(None, "stream_aborted", "private upstream error", Some(true)),
+            (TenantStatus::Failed, None, Some("upstream_unavailable"))
+        );
+        assert_eq!(
+            tenant_outcome(None, "", "", Some(false)),
+            (TenantStatus::Retried, None, None)
+        );
+        for status_code in [100, 199, 300, 599] {
+            assert_eq!(
+                tenant_outcome(Some(status_code), "", "", Some(true)),
+                (TenantStatus::Failed, None, Some("failed"))
+            );
+        }
+    }
+
+    #[test]
+    fn tenant_view_preserves_optional_recorded_outcome() {
+        for event in [
+            json!({"is_final_attempt": true}),
+            json!({"is_final_attempt": true, "status_code": null}),
+            json!({"is_final_attempt": true, "status_code": "200"}),
+            json!({"is_final_attempt": true, "status_code": 200.5}),
+            json!({"is_final_attempt": true, "status_code": 9999999999999999999_u64}),
+            json!({"status_code": 200}),
+            json!({"is_final_attempt": null, "status_code": 503}),
+            json!({"is_final_attempt": "false", "status_code": 503}),
+        ] {
+            assert_eq!(
+                tenant_view(&event, "charged", false),
+                Some(TenantView {
+                    status: TenantStatus::Unknown,
+                    status_code: None,
+                    error: None,
+                    charge_status: "charged",
+                }),
+                "{event}"
+            );
+        }
+        assert_eq!(
+            tenant_view(&json!({"status_code": 200}), "pending", false),
+            None
+        );
+        assert_eq!(
+            tenant_view(&json!({"status_code": 200}), "unpriced", true),
+            Some(TenantView {
+                status: TenantStatus::Unknown,
+                status_code: None,
+                error: None,
+                charge_status: "charged",
+            })
         );
     }
 
@@ -1015,5 +1300,16 @@ mod tests {
         assert!(!visible_to_tenant(false, "nothing_to_bill", false));
         // A run billed it.
         assert!(visible_to_tenant(false, "unpriced", true));
+    }
+
+    #[test]
+    fn visible_nonterminal_background_work_is_not_projected_as_a_retry() {
+        for stage in ["accepted", "pending"] {
+            let event = json!({"inference_stage":stage,"is_final_attempt":false,"status_code":200});
+            let view = tenant_view(&event, "charged", false).expect("已收费记录可见");
+            assert_eq!(view.status, TenantStatus::Unknown, "{stage}");
+            assert_eq!(view.status_code, None, "{stage}");
+            assert_eq!(view.error, None, "{stage}");
+        }
     }
 }

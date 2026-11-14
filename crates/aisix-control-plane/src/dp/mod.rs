@@ -10,6 +10,7 @@
 
 pub mod heartbeat;
 pub mod listener;
+pub mod native_objects;
 pub mod store;
 pub mod telemetry;
 

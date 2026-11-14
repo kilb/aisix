@@ -1,0 +1,73 @@
+/* 监测按模型逐条阅读；指标与样本在同列，不把多组数字堆进宽表。 */
+.direct-model-monitoring { display: grid; min-width: 0; gap: 24px; }
+.direct-monitor-scope { display: flex; min-width: 0; align-items: flex-end; flex-wrap: wrap; gap: 16px; }
+.direct-monitor-scope label { display: grid; min-width: 0; gap: 8px; color: var(--ink-soft); font-size: 13px; line-height: 20px; }
+.direct-monitor-scope > label:nth-child(-n+2) { flex: 1 1 264px; max-width: 320px; }
+.direct-monitor-scope :is(input, select), .direct-monitor-list-toolbar :is(input, select) { min-height: 44px; min-width: 0; max-width: 100%; width: 100%; font: inherit; color: var(--ink); }
+.direct-monitor-extra { width: 100%; border-block: 1px solid var(--line); }
+.direct-monitor-extra > summary, .direct-monitor-model-details > summary, .direct-monitor-method > summary { display: flex; align-items: center; gap: 8px; width: fit-content; min-height: 44px; padding: 8px 0; cursor: pointer; list-style: none; color: var(--ink-soft); font-size: 13px; line-height: 20px; }
+.direct-monitor-extra > summary::-webkit-details-marker, .direct-monitor-model-details > summary::-webkit-details-marker, .direct-monitor-method > summary::-webkit-details-marker { display: none; }
+.direct-model-monitoring summary:focus-visible { outline: 2px solid var(--ink); outline-offset: 3px; }
+.direct-model-monitoring details[open] > summary > svg:last-child { transform: rotate(180deg); }
+.direct-monitor-extra > form { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; padding: 0 0 16px; }
+.direct-monitor-extra > form > button { justify-self: start; grid-column: 1 / -1; }
+.direct-monitor-state, .direct-monitor-window { margin: 0; color: var(--muted-foreground); font-size: 13px; line-height: 20px; }
+.direct-monitor-window { margin-top: -8px; font-variant-numeric: tabular-nums; }
+.direct-monitor-kpis { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); min-width: 0; border-block: 1px solid var(--line); padding-block: 24px; }
+.direct-monitor-kpis > section { min-width: 0; padding-inline: 20px; }
+.direct-monitor-kpis > section:first-child { padding-left: 0; }
+.direct-monitor-kpis > section + section { border-left: 1px solid var(--line); }
+.direct-monitor-kpis h2 { margin: 0; color: var(--muted-foreground); font-size: 13px; font-weight: 500; line-height: 20px; }
+.direct-monitor-kpis strong { display: block; margin-top: 12px; overflow-wrap: anywhere; font-size: 28px; font-weight: 400; line-height: 36px; font-variant-numeric: tabular-nums; }
+.direct-monitor-kpis p { margin: 10px 0 0; color: var(--muted-foreground); font-size: 12px; line-height: 20px; }
+.direct-monitor-trends { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 24px; }
+.direct-monitor-trends > section { min-width: 0; }
+.direct-monitor-trends h2, .direct-monitor-list-toolbar h2 { margin: 0 0 16px; font-size: 16px; font-weight: 600; line-height: 24px; }
+.direct-monitor-catalogue { min-width: 0; }
+.direct-monitor-list-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 12px 16px; margin-bottom: 8px; }
+.direct-monitor-list-toolbar h2 { flex: 1 1 auto; margin: 0; }
+.direct-monitor-list-toolbar h2 > span { margin-left: 10px; color: var(--muted-foreground); font-size: 12px; font-weight: 400; font-variant-numeric: tabular-nums; }
+.direct-monitor-list-note { margin: 8px 0 16px; color: var(--muted-foreground); font-size: 12px; line-height: 20px; }
+.direct-monitor-list-toolbar > label { min-width: 0; font-size: 13px; }
+.direct-monitor-search { display: flex; align-items: center; gap: 8px; }
+.direct-monitor-search > svg { flex: none; color: var(--muted-foreground); }
+.direct-monitor-search input { width: 230px; }
+.direct-monitor-model { min-width: 0; padding-block: 20px; border-bottom: 1px solid var(--line); }
+.direct-monitor-model:first-of-type { border-top: 1px solid var(--line); }
+.direct-monitor-model-identity { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 12px; margin-bottom: 16px; }
+.direct-monitor-model-identity h3 { max-width: 100%; margin: 0; overflow-wrap: anywhere; font-size: 15px; font-weight: 600; line-height: 24px; }
+.direct-monitor-model-identity > p { margin: 0 0 0 auto; color: var(--muted-foreground); font-size: 13px; line-height: 20px; overflow-wrap: anywhere; }
+.direct-monitor-model-id { display: flex; min-width: 0; align-items: center; gap: 2px; color: var(--muted-foreground); font-size: 12px; line-height: 20px; }
+.direct-monitor-model-id > span { min-width: 0; overflow-wrap: anywhere; }
+.direct-monitor-row-values { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 16px; margin: 0; }
+.direct-monitor-row-values > div { min-width: 0; }
+.direct-monitor-row-values dt { color: var(--muted-foreground); font-size: 12px; line-height: 20px; }
+.direct-monitor-row-values dd { margin: 6px 0 0; color: var(--ink); overflow-wrap: anywhere; font-size: 16px; font-weight: 500; line-height: 24px; font-variant-numeric: tabular-nums; }
+.direct-monitor-samples { display: block; margin-top: 4px; color: var(--muted-foreground); font-size: 12px; font-weight: 400; line-height: 20px; font-variant-numeric: tabular-nums; }
+.direct-monitor-failure { color: var(--danger); }
+.direct-monitor-model-details { margin-top: 8px; }
+.direct-monitor-model-details dl { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px 24px; margin: 0; padding: 12px 16px; border-left: 2px solid var(--line); background: var(--well); }
+.direct-monitor-model-details dl > div { min-width: 0; }
+.direct-monitor-model-details dt { color: var(--ink-soft); font-size: 12px; line-height: 20px; }
+.direct-monitor-model-details dd { margin: 4px 0 0; color: var(--ink); overflow-wrap: anywhere; font-size: 13px; line-height: 22px; font-variant-numeric: tabular-nums; }
+.direct-monitor-identifier { font-family: var(--font-mono); }
+.direct-monitor-method { border-top: 1px solid var(--line); }
+.direct-monitor-method > div { display: grid; gap: 8px; padding-bottom: 12px; max-width: 85ch; }
+.direct-monitor-method p { margin: 0; color: var(--muted-foreground); font-size: 13px; line-height: 22px; }
+.direct-monitor-method p > svg { display: inline; margin-right: 6px; vertical-align: -3px; color: var(--ink-soft); }
+@media (max-width: 1199px) { .direct-monitor-kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 20px 0; } .direct-monitor-kpis > section:nth-child(4) { padding-left: 0; border-left: 0; } .direct-monitor-row-values { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@media (max-width: 719px) {
+  .direct-monitor-scope > label:nth-child(-n+2) { flex-basis: 100%; max-width: none; }
+  .direct-monitor-scope > label:nth-child(n+3) { flex: 1 1 140px; }
+  .direct-monitor-extra > form { grid-template-columns: minmax(0, 1fr); }
+  .direct-monitor-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); padding-block: 20px; }
+  .direct-monitor-kpis > section { padding-inline: 16px; }
+  .direct-monitor-kpis > section:nth-child(odd) { padding-left: 0; border-left: 0; }
+  .direct-monitor-kpis > section:nth-child(even) { padding-left: 16px; border-left: 1px solid var(--line); }
+  .direct-monitor-kpis strong { font-size: 26px; line-height: 34px; }
+  .direct-monitor-trends, .direct-monitor-model-details dl { grid-template-columns: minmax(0, 1fr); }
+  .direct-monitor-row-values { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .direct-monitor-model-identity > p { width: 100%; margin-left: 0; }
+  .direct-monitor-list-toolbar > label { flex: 1 1 100%; }
+  .direct-monitor-search input { width: 100%; }
+}

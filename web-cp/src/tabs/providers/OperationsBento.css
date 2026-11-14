@@ -1,71 +1,80 @@
-/* 仅用于连接与配置页，公共卡片的几何由设计系统负责。 */
+/* 当前配置采用连续摘要，表格始终是主要操作面。 */
 .ops-summary {
-  margin-bottom: 40px;
-}
-
-.ops-summary > section {
   min-width: 0;
+  margin-bottom: 24px;
+  padding: 20px 0 24px;
+  border-block: 1px solid var(--line);
 }
-
-.ops-metric-line {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: 14px 24px;
+.ops-summary > h2 {
+  margin: 0 0 20px;
+  color: var(--ink);
+  font-size: 17px;
+  font-weight: 600;
+  line-height: 26px;
 }
-
-.ops-facts {
+.ops-summary-grid {
   display: grid;
-  gap: 0;
+  grid-template-columns: minmax(0, .75fr) minmax(0, 1.25fr) minmax(0, 1fr);
+  align-items: start;
+  gap: 24px;
 }
-
+.ops-summary-grid > * { min-width: 0; }
+.ops-summary-grid > * + * {
+  padding-left: 24px;
+  border-left: 1px solid var(--line);
+}
+.ops-summary-label,
+.ops-summary-note {
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 20px;
+  overflow-wrap: anywhere;
+}
+.ops-summary-label { margin: 0 0 8px; }
+.ops-summary-note { max-width: 65ch; margin-top: 8px; }
+.ops-summary .metric { font-size: 32px; font-weight: 500; line-height: 40px; }
+.ops-summary .bento-card-message { min-height: 80px; }
+.ops-facts { display: grid; gap: 0; margin-top: 12px; }
 .ops-facts > div {
   display: flex;
   flex-wrap: wrap;
   align-items: baseline;
   justify-content: space-between;
-  gap: 8px 24px;
-  padding: 14px 0;
-  border-bottom: 1px solid var(--border);
+  gap: 4px 16px;
+  padding: 8px 0;
+  border-top: 1px solid var(--line);
 }
-
-.ops-facts dt {
-  color: var(--muted-foreground);
-  font-size: var(--fs-13);
-}
-
+.ops-facts dt { color: var(--text-muted); font-size: 13px; line-height: 20px; }
 .ops-facts dd {
   margin: 0;
-  font-size: var(--fs-16);
-  font-weight: 400;
+  color: var(--ink);
+  font-size: 14px;
+  font-weight: 500;
   font-variant-numeric: tabular-nums;
 }
-
 .ops-editor-grid {
   display: grid;
   grid-template-columns: repeat(12, minmax(0, 1fr));
   align-items: start;
-  gap: 12px;
+  gap: 20px;
 }
-
-.ops-editor-grid > * {
-  min-width: 0;
-  grid-column: 1 / -1;
+.ops-editor-grid > * { min-width: 0; grid-column: 1 / -1; }
+@media (min-width: 1200px) {
+  .ops-editor-grid.ops-editor-open > .ops-list { grid-column: 8 / span 5; grid-row: 1; }
+  .ops-editor-grid.ops-editor-open > .ops-editor { grid-column: 1 / span 7; grid-row: 1; }
+  .ops-editor-grid > .ops-channel-models { grid-column: 1 / -1; grid-row: 2; }
 }
-
-@media (min-width: 1100px) {
-  .ops-editor-grid.ops-editor-open > .ops-list {
-    grid-column: 8 / span 5;
-    grid-row: 1;
-  }
-
-  .ops-editor-grid.ops-editor-open > .ops-editor {
-    grid-column: 1 / span 7;
-    grid-row: 1;
-  }
-
-  .ops-editor-grid > .ops-channel-models {
-    grid-column: 1 / -1;
-    grid-row: 2;
-  }
+@media (max-width: 899px) {
+  .ops-summary-grid { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 20px; }
+  .ops-summary-breakdown { grid-column: 1 / -1; grid-row: 2; }
+  .ops-summary-grid > .ops-summary-breakdown { padding: 16px 0 0; border-left: 0; border-top: 1px solid var(--line); }
+  .ops-summary-grid > .ops-summary-secondary { padding-left: 20px; }
+}
+@media (max-width: 539px) {
+  .ops-summary { padding-block: 16px 20px; }
+  .ops-summary > h2 { margin-bottom: 16px; }
+  .ops-summary-grid { gap: 16px; }
+  .ops-summary-grid > .ops-summary-secondary { padding-left: 16px; }
+  .ops-summary .metric { font-size: 28px; line-height: 36px; }
+  .ops-facts > div { display: grid; gap: 2px; }
 }

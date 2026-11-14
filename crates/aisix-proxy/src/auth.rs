@@ -258,6 +258,25 @@ where
     }
 }
 
+// 在请求体提取前短路认证失败，同时保留 Anthropic 错误形状及单次认证日志、指标。
+pub(crate) struct AnthropicAuthenticatedKey(pub AuthenticatedKey);
+
+#[axum::async_trait]
+impl<S> FromRequestParts<S> for AnthropicAuthenticatedKey
+where
+    S: Send + Sync,
+    ProxyState: FromRef<S>,
+{
+    type Rejection = axum::response::Response;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        AuthenticatedKey::from_request_parts(parts, state)
+            .await
+            .map(Self)
+            .map_err(ProxyError::into_anthropic_response)
+    }
+}
+
 /// Count a request the extractor refused in the request families, as every
 /// other refusal is: without it a 401 / 403 on a typed route existed in the
 /// access log and nowhere in `aisix_proxy_*` / `aisix_llm_*`.

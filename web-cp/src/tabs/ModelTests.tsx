@@ -1,3 +1,4 @@
+import "./operations.css";
 import { useEffect, useState } from "react";
 import type { TabProps } from "../App";
 import { DirectModelProbe } from "../components/DirectModelProbe";
@@ -17,7 +18,7 @@ export function ModelTests({ operator, initialSection, sectionVisit, onGoto }: T
     setSection(next);
     onGoto("model-tests", next);
   }
-  return <>
+  return <div className="cp-operations cp-modeltests">
     <PageHeader eyebrow="MODELS · 模型测试" title="模型测试" dataLead="显式发起直连测试，查看进度与已保存历史。测试可能产生上游费用。" />
     <div className="mb-4 flex flex-wrap gap-2" role="tablist" aria-label="模型测试视图">
       {(["current", "history"] as const).map((value) => <Button
@@ -37,5 +38,5 @@ export function ModelTests({ operator, initialSection, sectionVisit, onGoto }: T
       >{value === "current" ? "当前测试" : "测试历史"}</Button>)}
     </div>
     <DirectModelProbe models={models.items} accounts={accounts.items} loadError={models.error !== null} canProbe={operator.role === "admin"} probe={probeDirectModel} section={section} />
-  </>;
+  </div>;
 }

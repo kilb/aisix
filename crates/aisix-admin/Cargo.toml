@@ -31,6 +31,7 @@ aisix-obs = { path = "../aisix-obs" }
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
 aisix-gateway = { path = "../aisix-gateway" }
+aisix-provider-anthropic = { path = "../aisix-provider-anthropic" }
 aisix-provider-openai = { path = "../aisix-provider-openai" }
 aisix-core = { path = "../aisix-core" }
 wiremock.workspace = true

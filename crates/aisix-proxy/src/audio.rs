@@ -17,6 +17,7 @@
 //! Auth and model authorisation follow the same rules as every other
 //! proxy endpoint.
 
+use crate::request_json::Json;
 use aisix_core::AppliedGuardrail;
 use aisix_gateway::{ChatMessage, ChatResponse, FinishReason, UsageStats};
 use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, UsageEvent};
@@ -24,7 +25,6 @@ use axum::body::Bytes;
 use axum::extract::{Multipart, State};
 use axum::http::{header, HeaderMap};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use reqwest::multipart;
 use serde_json::Value;
 use std::time::{Duration, Instant};
@@ -613,7 +613,7 @@ pub async fn speech(
     client: ClientContext,
     // Result-wrapped so an extractor-layer 413 maps to the OpenAI
     // envelope — see completions.rs.
-    body: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
+    body: Result<Json<Value>, crate::request_json::JsonRejection>,
 ) -> Response {
     let started = Instant::now();
     let Json(body) = match body {
@@ -715,13 +715,8 @@ pub async fn speech(
                 crate::redact::RedactionCounts::new(),
                 &audit,
             );
-            // Issue #406: /v1/audio/speech (TTS) returns binary audio
-            // with no usage block — emit a zero-token UsageEvent so the
-            // request is visible in /logs and attributed to the api_key.
-            // (TTS is billed per input character; that cost basis is the
-            // same cross-repo follow-up as audio duration.) Emitted when
-            // the audio ends, so it records how it ended: a caller that
-            // left is a 499, an upstream failure its own status.
+            // 二进制音频没有数量报告；SSE 从官方 done 事件读取数量。
+            // 两种格式都由同一 Drop 结算记录真实结束方式。
             let SpeechDispatchSuccess {
                 mut response,
                 body,
@@ -763,66 +758,114 @@ pub async fn speech(
                 .get(header::CONTENT_LENGTH)
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.parse::<u64>().ok());
-            let relayed = speech_relay(body, read_timeout, expected_len, move |mut outcome| {
-                // The audio's real ending settles the target: a failure counts
-                // against its health and cooldown, audio that reached its end
-                // marks it healthy, a caller that left says neither.
-                let terminal = crate::stream_timeout::finish_bridge_stream(
-                    &state_c.health,
-                    &state_c.runtime_status,
-                    &settle.model_display_name,
-                    &model_id,
-                    settle.cooldown.as_ref(),
-                    outcome.terminal_failure.take(),
-                    outcome.reached_end,
-                    200,
-                    attempt_started,
-                );
-                if let Some(deferred) = &settle.deferred {
-                    deferred.finish(
-                        &state_c,
-                        terminal.status,
-                        terminal.error_class.is_empty() && terminal.status < 400,
+            let event_stream = crate::media_upstream::event_stream(response.headers());
+            let relayed = speech_relay(
+                body,
+                read_timeout,
+                expected_len,
+                event_stream,
+                move |mut outcome| {
+                    let _holds = settle.holds;
+                    // The audio's real ending settles the target: a failure counts
+                    // against its health and cooldown, audio that reached its end
+                    // marks it healthy, a caller that left says neither.
+                    let terminal = crate::stream_timeout::finish_bridge_stream(
+                        &state_c.health,
+                        &state_c.runtime_status,
+                        &settle.model_display_name,
+                        &model_id,
+                        settle.cooldown.as_ref(),
+                        outcome.terminal_failure.take(),
+                        outcome.reached_end,
+                        200,
+                        attempt_started,
                     );
-                }
-                // A stream can outlive several config generations, so the
-                // emit reads a FRESH snapshot (#941).
-                let snap = state_c.snapshot.load();
-                let pk = crate::usage_attr::ResolvedPk::resolve(&snap, &provider_key_id);
-                let winner = winner.map(|mut w| {
-                    w.latency_ms = crate::attempt::ms_since(attempt_started);
-                    w
-                });
-                emit_usage_event(
-                    &state_c,
-                    &snap,
-                    &pk,
-                    &request_id_c,
-                    &model_id,
-                    &model_name_c,
-                    &api_key_id_c,
-                    "/v1/audio/speech",
-                    crate::operation::SPEECH,
-                    &provider,
-                    &upstream_model,
-                    &applied_guardrails,
-                    crate::attempt::stream_status(outcome.reached_end, outcome.failure.as_ref()),
-                    started.elapsed(),
-                    &UsageStats::default(),
-                    // TTS is billed per input character, not by the length
-                    // of the audio it produced — no duration cost basis here.
-                    0.0,
-                    &client_c,
-                    redactions,
-                    monitor_hits,
-                    /* guardrail_blocked */ false,
-                    captured_content.as_ref(),
-                    &audit,
-                    outcome.failure.as_ref(),
-                    winner.as_ref(),
-                );
-            });
-            *response.body_mut() = axum::body::Body::from_stream(relayed);
+                    if let Some(deferred) = &settle.deferred {
+                        deferred.finish(
+                            &state_c,
+                            terminal.status,
+                            terminal.error_class.is_empty() && terminal.status < 400,
+                        );
+                    }
+                    let usage = outcome.usage.clone().unwrap_or_default();
+                    state_c.limiter.add_tokens_post_stream_all(
+                        &settle.quota_keys,
+                        u64::from(usage.prompt_tokens) + u64::from(usage.completion_tokens),
+                    );
+                    // A stream can outlive several config generations, so the
+                    // emit reads a FRESH snapshot (#941).
+                    let snap = state_c.snapshot.load();
+                    let pk = crate::usage_attr::ResolvedPk::resolve(&snap, &provider_key_id);
+                    let winner = winner.map(|mut w| {
+                        w.latency_ms = crate::attempt::ms_since(attempt_started);
+                        w
+                    });
+                    if let Some(first) = outcome.first_frame {
+                        let caller =
+                            crate::request_metrics::Caller::from_api_key_id(&snap, &api_key_id_c);
+                        crate::request_metrics::record_stream_ttft(
+                            &state_c,
+                            "/v1/audio/speech",
+                            caller.as_caller(),
+                            crate::request_metrics::Upstream {
+                                provider: &provider,
+                                model: &model_name_c,
+                                upstream_model: &upstream_model,
+                                pk: pk.labels(),
+                                stream: true,
+                                ..Default::default()
+                            },
+                            crate::attempt::stream_status(
+                                outcome.reached_end,
+                                outcome.failure.as_ref(),
+                            ),
+                            first.saturating_duration_since(attempt_started),
+                            first.saturating_duration_since(started),
+                        );
+                    }
+                    emit_usage_event(
+                        &state_c,
+                        &snap,
+                        &pk,
+                        &request_id_c,
+                        &model_id,
+                        &model_name_c,
+                        &api_key_id_c,
+                        "/v1/audio/speech",
+                        crate::operation::SPEECH,
+                        &provider,
+                        &upstream_model,
+                        &applied_guardrails,
+                        crate::attempt::stream_status(
+                            outcome.reached_end,
+                            outcome.failure.as_ref(),
+                        ),
+                        started.elapsed(),
+                        &usage,
+                        // TTS is billed per input character, not by the length
+                        // of the audio it produced — no duration cost basis here.
+                        0.0,
+                        &client_c,
+                        redactions,
+                        monitor_hits,
+                        /* guardrail_blocked */ false,
+                        captured_content.as_ref(),
+                        &audit,
+                        outcome.failure.as_ref(),
+                        winner.as_ref(),
+                    );
+                },
+            );
+            if event_stream {
+                response.headers_mut().remove(header::CONTENT_LENGTH);
+                *response.body_mut() =
+                    axum::body::Body::from_stream(crate::sse_keepalive::with_heartbeat(
+                        Box::pin(relayed),
+                        crate::sse_keepalive::interval(),
+                    ));
+            } else {
+                *response.body_mut() = axum::body::Body::from_stream(relayed);
+            }
             response
         }
         Err(err) => {
@@ -1243,6 +1286,7 @@ fn speech_relay<S, F>(
     // polling a sized body once that many bytes are written, so the relay
     // never sees its own end: reaching the length IS the end.
     expected_len: Option<u64>,
+    event_stream: bool,
     on_complete: F,
 ) -> impl futures::Stream<Item = reqwest::Result<Bytes>> + Send
 where
@@ -1261,11 +1305,20 @@ where
         };
         futures::pin_mut!(upstream);
         let mut relayed: u64 = 0;
+        let mut observer = event_stream.then(|| crate::media_upstream::UsageObserver::new("speech.audio.done", extract_token_usage));
         while let Some(item) = upstream.next().await {
             match &item {
                 Ok(bytes) => {
                     relayed += bytes.len() as u64;
-                    if expected_len.is_some_and(|len| relayed >= len) {
+                    if let Some(observer) = &mut observer {
+                        if guard.observed().first_frame.is_none() && !bytes.is_empty() {
+                            guard.observed().first_frame=Some(std::time::Instant::now());
+                            crate::attribution::note_upstream_first_frame();
+                        }
+                        observer.feed(bytes);
+                        guard.observed().usage = observer.usage.clone();
+                        guard.observed().reached_end = observer.completed;
+                    } else if expected_len.is_some_and(|len| relayed >= len) {
                         guard.observed().reached_end = true;
                     }
                 }
@@ -1278,7 +1331,9 @@ where
         if let Some(e) = read_timeout.fired() {
             guard.observed().record_read_failure(e);
         }
-        guard.observed().reached_end = true;
+        if event_stream && !guard.observed().reached_end {
+            guard.observed().record_read_failure(aisix_gateway::BridgeError::StreamAborted);
+        } else if !event_stream { guard.observed().reached_end = true; }
         if let Some((f, observed)) = guard.slot.take() {
             f(observed);
         }
@@ -1745,33 +1800,23 @@ async fn multipart_dispatch(
                 let provider = crate::dispatch::require_provider(model)?;
                 let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
                 let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
-                let api_key = crate::dispatch::require_api_key(&pk_entry.value, model)?;
-
-                // Cache key must be `'static`; both callers pass fixed literals.
-                let url_cache_key: &'static str = if upstream_path == "/audio/translations" {
-                    "proxy/audio/translations"
-                } else {
-                    "proxy/audio/transcriptions"
-                };
-                let url = aisix_gateway::url_cache::cached_endpoint_url(
+                let cohere = upstream_path == "/audio/transcriptions"
+                    && aisix_provider_openai::cohere::is_cohere(&pk_entry.value.provider);
+                let mut ctx = crate::dispatch::bridge_ctx(
+                    request_id,
+                    &target.id,
+                    std::sync::Arc::clone(model),
                     &pk_entry.id,
-                    url_cache_key,
-                    // Every resolve_base_url input, via the shared constructor
-                    // (#1017: the resolved URL depends on the vendor too), plus the
-                    // per-call path.
-                    &{
-                        let [base, vendor, adapter] =
-                            crate::dispatch::pk_url_fingerprint(&pk_entry.value);
-                        [base, vendor, adapter, upstream_path]
-                    },
-                    || {
-                        let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
-                        Ok::<_, crate::error::ProxyError>(crate::dispatch::build_openai_url(
-                            &base,
-                            upstream_path,
-                        ))
-                    },
-                )?;
+                    std::sync::Arc::clone(&pk_entry.value),
+                    Some(client_ctx),
+                );
+                if let Some(deadline) = if stream_requested {
+                    timeouts.stream
+                } else {
+                    timeouts.request
+                } {
+                    ctx = ctx.with_deadline(deadline);
+                }
                 let provider_label = provider.to_ascii_lowercase();
 
                 // Rebuild the multipart form with `model` rewritten. A `multipart::Form`
@@ -1781,7 +1826,27 @@ async fn multipart_dispatch(
                 // streamed part could not be replayed.
                 let build_form = || {
                     let mut form = multipart::Form::new();
-                    for (name, file_name, content_type, data) in fields {
+                    let ordered = fields
+                        .iter()
+                        .filter(|(name, ..)| !cohere || name != "file")
+                        .chain(fields.iter().filter(|(name, ..)| cohere && name == "file"));
+                    for (name, file_name, content_type, data) in ordered {
+                        // 目标兼容接口只定义这些槽，其他客户端字段不可表示，静默省略。
+                        // https://docs.cohere.com/docs/compatibility-api#supported-parameters
+                        if cohere
+                            && !matches!(
+                                name.as_str(),
+                                "model" | "language" | "file" | "response_format" | "temperature"
+                            )
+                        {
+                            continue;
+                        }
+                        if cohere
+                            && name == "response_format"
+                            && std::str::from_utf8(data).map(str::trim) != Ok("json")
+                        {
+                            continue;
+                        }
                         let field_data = if name == "model" {
                             Bytes::copy_from_slice(upstream_model.as_bytes())
                         } else {
@@ -1807,42 +1872,6 @@ async fn multipart_dispatch(
                     form
                 };
 
-                // Build headers explicitly so the PK's `request.default_headers` and
-                // `request.forward_client_headers` can inject operator/client headers
-                // (#867 follow-up). The body is a multipart form, so the JSON
-                // body-field overrides don't apply here — only headers do. Content-Type
-                // is left to `.multipart()` (it sets the boundary). Reserved auth
-                // headers are protected by `apply_request_headers`.
-                let mut headers = axum::http::HeaderMap::new();
-                let auth_hv =
-                    header::HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|e| {
-                        ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
-                            "api key contains invalid header chars: {e}"
-                        )))
-                    })?;
-                headers.insert(header::AUTHORIZATION, auth_hv);
-                let rid_hv = header::HeaderValue::from_str(request_id).map_err(|e| {
-                    ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
-                        "request_id contains invalid header chars: {e}"
-                    )))
-                })?;
-                headers.insert(
-                    header::HeaderName::from_static("x-aisix-request-id"),
-                    rid_hv,
-                );
-                aisix_gateway::apply_request_headers(
-                    &mut headers,
-                    &crate::dispatch::upstream_header_ctx(
-                        &pk_entry.value,
-                        &pk_entry.id,
-                        model,
-                        &target.id,
-                        client_ctx,
-                    ),
-                );
-
-                let client =
-                    crate::http_client::client_for(pk_entry.value.upstream_connection().as_ref());
                 let tracker = &state.runtime_status;
                 let model_id: &str = &target.id;
                 let cooldown_cfg = model.cooldown.as_ref();
@@ -1854,10 +1883,9 @@ async fn multipart_dispatch(
                 let request_budget = timeouts.request;
                 let stream_budget = timeouts.stream;
                 let (upstream_headers, upstream_body) = match {
-                    let mut req = url
-                        .clone()
-                        .post_on(&client)
-                        .headers(headers.clone())
+                    let send_started = Instant::now();
+                    let mut req = crate::media_upstream::request(&ctx, upstream_path, None)
+                        .await?
                         .multipart(build_form());
                     // #554/#911: a buffered audio call takes the per-model E2E
                     // request timeout like the other direct-upstream paths
@@ -1875,7 +1903,7 @@ async fn multipart_dispatch(
                     // (`read_held_transcription`), which ends with the held phase.
                     if !stream_requested {
                         if let Some(d) = request_budget {
-                            req = req.timeout(d);
+                            req = req.timeout(d.saturating_sub(send_started.elapsed()));
                         }
                     }
                     let connect_deadline = if stream_requested {
@@ -1891,11 +1919,12 @@ async fn multipart_dispatch(
                         // is spent on it (`RetryBudget::covers`) — classifying a
                         // timeout as transport made the model's own timeout get
                         // retried, turning a 400ms budget into ~2s.
-                        let send_started = Instant::now();
-                        let resp = crate::stream_timeout::send_with_deadline(
+                        let resp = crate::stream_timeout::send_with_deadline_observed(
                             req,
-                            connect_deadline,
+                            connect_deadline
+                                .map(|budget| budget.saturating_sub(send_started.elapsed())),
                             send_started,
+                            aisix_gateway::upstream_io::Protocol::Transcription,
                         )
                         .await
                         .map_err(|be| {
@@ -2395,6 +2424,7 @@ async fn multipart_dispatch(
         }
         if refusal.is_none() {
             let synth = ChatResponse {
+                native_envelope: None,
                 logprobs: None,
                 more_choices: Vec::new(),
                 id: String::new(),
@@ -2622,6 +2652,11 @@ struct SpeechDispatchSuccess {
 
 /// The serving target of a relayed synthesis, settled when the audio ends.
 struct SpeechSettle {
+    holds: (
+        aisix_ratelimit::StreamConcurrencyGuard,
+        crate::health::InFlightGuard,
+    ),
+    quota_keys: Vec<String>,
     model_display_name: String,
     cooldown: Option<aisix_core::CooldownConfig>,
     deferred: Option<crate::attempt::DeferredAttempt>,
@@ -2809,99 +2844,20 @@ async fn speech_dispatch(
             let provider = crate::dispatch::require_provider(model)?;
             let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
             let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
-            let api_key = crate::dispatch::require_api_key(&pk_entry.value, model)?;
 
             let provider_label = provider.to_ascii_lowercase();
 
-            // This attempt's body exists only as its wire bytes past this block
-            // (see `crate::util::outbound_json`).
-            let body = if let Some(fields) =
-                crate::util::model_only_fields(base_body, &pk_entry.value, None)
-            {
-                crate::util::outbound_json(&crate::util::ModelRenamed {
-                    fields,
-                    model: &upstream_model,
-                })?
-            } else {
-                let mut attempt_body = base_body.clone();
-                let body = &mut attempt_body;
-                // Rewrite model field.
-                if let Some(m) = body.get_mut("model") {
-                    *m = Value::String(upstream_model.clone());
-                }
-
-                // Apply the PK's `request.*` overrides (body + headers) like the OpenAI
-                // bridge's chat() path — /v1/audio/speech is a JSON passthrough that builds
-                // the request directly (#867 follow-up). No-op when none set.
-                if let Some(r) = pk_entry.value.request.as_ref() {
-                    aisix_provider_openai::overrides::validate_content_safe_request_overrides(r)
-                        .map_err(|message| {
-                            ProxyError::Bridge(aisix_gateway::BridgeError::InvalidUpstreamConfig(
-                                message,
-                            ))
-                        })?;
-                    aisix_provider_openai::overrides::apply_param_renames(body, &r.param_renames);
-                    if let Some(constraints) = &r.param_constraints {
-                        aisix_provider_openai::overrides::apply_param_constraints(
-                            body,
-                            constraints,
-                        );
-                    }
-                    aisix_provider_openai::overrides::apply_default_body_fields(
-                        body,
-                        &r.default_body_fields,
-                    );
-                }
-                crate::util::outbound_json(body)?
-            };
-
-            let mut headers = axum::http::HeaderMap::new();
-            let auth_hv =
-                header::HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|e| {
-                    ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
-                        "api key contains invalid header chars: {e}"
-                    )))
-                })?;
-            headers.insert(header::AUTHORIZATION, auth_hv);
-            headers.insert(
-                header::CONTENT_TYPE,
-                header::HeaderValue::from_static("application/json"),
-            );
-            let rid_hv = header::HeaderValue::from_str(request_id).map_err(|e| {
-                ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
-                    "request_id contains invalid header chars: {e}"
-                )))
-            })?;
-            headers.insert(
-                header::HeaderName::from_static("x-aisix-request-id"),
-                rid_hv,
-            );
-            aisix_gateway::apply_request_headers(
-                &mut headers,
-                &crate::dispatch::upstream_header_ctx(
-                    &pk_entry.value,
-                    &pk_entry.id,
-                    model,
-                    &target.id,
-                    client_ctx,
-                ),
-            );
-
-            let client =
-                crate::http_client::client_for(pk_entry.value.upstream_connection().as_ref());
-            let speech_url = aisix_gateway::url_cache::cached_endpoint_url(
+            let mut ctx = crate::dispatch::bridge_ctx(
+                request_id,
+                &target.id,
+                std::sync::Arc::clone(model),
                 &pk_entry.id,
-                "proxy/audio/speech",
-                // Every resolve_base_url input (#1017) via the shared constructor.
-                &crate::dispatch::pk_url_fingerprint(&pk_entry.value),
-                || {
-                    let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
-                    Ok::<_, crate::error::ProxyError>(crate::dispatch::build_openai_url(
-                        &base,
-                        "/audio/speech",
-                    ))
-                },
-            )?;
+                std::sync::Arc::clone(&pk_entry.value),
+                Some(client_ctx),
+            );
+            if let Some(deadline) = timeouts.stream {
+                ctx = ctx.with_deadline(deadline);
+            }
             let tracker = &state.runtime_status;
             let model_id: &str = &target.id;
             let cooldown_cfg = model.cooldown.as_ref();
@@ -2917,11 +2873,9 @@ async fn speech_dispatch(
             // the same trade `/v1/videos`' content proxy makes.
             let stream_budget = timeouts.stream;
             let upstream_resp = match {
-                let req = speech_url
-                    .clone()
-                    .post_on(&client)
-                    .headers(headers.clone())
-                    .body(body.clone());
+                let send_started = Instant::now();
+                let req =
+                    crate::media_upstream::request(&ctx, "/audio/speech", Some(base_body)).await?;
                 // #554/#911: reqwest's request-level timeout would bound the
                 // body read too and cut a long synthesis off mid-file, so the
                 // stream budget bounds the connect phase and each chunk
@@ -2934,13 +2888,16 @@ async fn speech_dispatch(
                     // is spent on it (`RetryBudget::covers`) — classifying a
                     // timeout as transport made the model's own timeout get
                     // retried, turning a 400ms budget into ~2s.
-                    let send_started = Instant::now();
-                    let resp =
-                        crate::stream_timeout::send_with_deadline(req, stream_budget, send_started)
-                            .await
-                            .map_err(|be| {
-                                crate::cooldown::note_failure(tracker, model_id, cooldown_cfg, be)
-                            })?;
+                    let resp = crate::stream_timeout::send_with_deadline_observed(
+                        req,
+                        stream_budget.map(|budget| budget.saturating_sub(send_started.elapsed())),
+                        send_started,
+                        aisix_gateway::upstream_io::Protocol::Speech,
+                    )
+                    .await
+                    .map_err(|be| {
+                        crate::cooldown::note_failure(tracker, model_id, cooldown_cfg, be)
+                    })?;
 
                     let status = resp.status();
                     if !status.is_success() {
@@ -2998,21 +2955,15 @@ async fn speech_dispatch(
     // The target's health and cooldown are settled when the audio ends
     // (`SpeechSettle`): the headers alone do not say the synthesis worked.
 
-    // #911 [21]: speech synthesis (TTS) reports no token usage — it is billed
-    // per input character — so there are no tokens to add to TPM/TPD. The
-    // reservation instead becomes a hold that spans the relayed body: the
-    // handler returns once the headers are out, so releasing the concurrency
-    // slot at handler return would let a key run more simultaneous
-    // syntheses than its cap allows (#450).
+    // 并发槽跨越整个响应；SSE 报告的数量在终态同步计入已有 TPM/TPD。
+    // 二进制格式不推算 token 或新增价格单位。
+    let quota_keys = reservation.keys();
     let stream_hold = reservation.into_stream_hold();
 
     let upstream_headers = upstream_resp.headers().clone();
     let read_timeout = crate::stream_timeout::ReadTimeoutSignal::default();
     let signal = read_timeout.clone();
     let body = Box::pin(async_stream::stream! {
-        // least_busy: the target stays busy until the relay ends, with
-        // the concurrency slot.
-        let _hold = (stream_hold, in_flight);
         let inner = crate::stream_timeout::with_read_timeout_bytes_signalled(
             upstream_resp.bytes_stream(),
             stream_budget,
@@ -3047,6 +2998,8 @@ async fn speech_dispatch(
         captured_content,
         attempt_started,
         settle: SpeechSettle {
+            holds: (stream_hold, in_flight),
+            quota_keys,
             model_display_name: target.model.display_name.clone(),
             cooldown: target.model.cooldown.clone(),
             deferred,
@@ -3386,6 +3339,7 @@ fn emit_usage_event(
         completion_tokens: usage.completion_tokens,
         total_tokens: usage.upstream_total_tokens,
         modality_tokens: usage.modality,
+        cache_usage_reported: Some(false),
         audio_duration_seconds,
         // Priced from the dispatched row's `Model.cost` when the operator set
         // one, `0.0` otherwise — see `usage_attr::request_cost_usd`.
@@ -3438,8 +3392,7 @@ fn emit_usage_event(
         /* terminal */ true,
         /* dispatched */ true,
     );
-    // Speech (TTS) reports no tokens at all, so this is a no-op there; the
-    // transcription routes report them when the model supplies a usage block.
+    // 仅记录上游实际报告的数量；二进制语音仍是零。
     let owned_caller = crate::request_metrics::Caller::from_api_key_id(snap, api_key_id);
     crate::request_metrics::record_usage(
         state,
@@ -5786,5 +5739,1343 @@ data: [DONE]\n\n";
             Some(38),
             "the terminal frame's counts belong on the line that reports the relay's end",
         );
+    }
+}
+#[cfg(test)]
+pub(crate) mod compat_media_test_peer {
+    use aisix_core::resource::ResourceEntry;
+    use aisix_core::snapshot::SnapshotHandle;
+    use aisix_core::{AisixSnapshot, ApiKey, Model, ProviderKey, ProxyConfig};
+    use aisix_gateway::Hub;
+    use axum::body::{to_bytes, Body, Bytes};
+    use axum::extract::FromRequest as _;
+    use axum::http::{header, HeaderMap, Request};
+    use axum::response::IntoResponse as _;
+    use base64::Engine as _;
+    use futures::StreamExt as _;
+    use serde_json::{json, Value};
+    use std::sync::{Arc, Mutex};
+
+    pub(crate) const PK_ID: &str = "11111111-1111-1111-1111-111111111111";
+    pub(crate) const ALIAS: &str = "media-alias";
+
+    #[derive(Clone)]
+    pub(crate) struct Received {
+        pub(crate) uri: String,
+        pub(crate) headers: HeaderMap,
+        pub(crate) body: Bytes,
+    }
+
+    // 本地协议对端只验证字节与生命周期，不代表真实供应商 E2E。
+    pub(crate) struct Peer {
+        pub(crate) base: String,
+        permits: Arc<tokio::sync::Semaphore>,
+        received: Arc<Mutex<Vec<Received>>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Peer {
+        pub(crate) async fn start(content_type: &str, chunks: Vec<Bytes>, keep_open: bool) -> Self {
+            let permits = Arc::new(tokio::sync::Semaphore::new(0));
+            let received = Arc::new(Mutex::new(Vec::new()));
+            let content_type = content_type.to_string();
+            let chunks = Arc::new(chunks);
+            let app = axum::Router::new().fallback(axum::routing::any({
+                let permits = permits.clone();
+                let received = received.clone();
+                move |request: Request<Body>| {
+                    let permits = permits.clone();
+                    let received = received.clone();
+                    let content_type = content_type.clone();
+                    let chunks = chunks.clone();
+                    async move {
+                        let (head, body) = request.into_parts();
+                        let body = to_bytes(body, 32 * 1024 * 1024).await.unwrap();
+                        received.lock().unwrap().push(Received {
+                            uri: head.uri.to_string(),
+                            headers: head.headers,
+                            body,
+                        });
+                        let output = async_stream::stream! {
+                            for chunk in chunks.iter() {
+                                permits.acquire().await.unwrap().forget();
+                                yield Ok::<_, std::convert::Infallible>(chunk.clone());
+                            }
+                            if keep_open {
+                                std::future::pending::<()>().await;
+                            }
+                        };
+                        (
+                            [(header::CONTENT_TYPE, content_type)],
+                            Body::from_stream(output),
+                        )
+                            .into_response()
+                    }
+                }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let task = tokio::spawn(async move {
+                axum::serve(listener, app.into_make_service())
+                    .await
+                    .unwrap();
+            });
+            Self {
+                base,
+                permits,
+                received,
+                task,
+            }
+        }
+
+        pub(crate) fn release(&self, count: usize) {
+            self.permits.add_permits(count);
+        }
+
+        pub(crate) fn requests(&self) -> Vec<Received> {
+            self.received.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for Peer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    pub(crate) fn snapshot(base: &str, upstream_model: &str) -> AisixSnapshot {
+        let snapshot = AisixSnapshot::new();
+        let pk: ProviderKey = serde_json::from_value(json!({
+            "display_name": "component-media-peer",
+            "api_key": "component-upstream-secret",
+            "api_base": base,
+            "provider": "openai",
+            "adapter": "openai"
+        }))
+        .unwrap();
+        snapshot
+            .provider_keys
+            .insert(ResourceEntry::new(PK_ID, pk, 1));
+        let model: Model = serde_json::from_value(json!({
+            "display_name": ALIAS,
+            "provider": "openai",
+            "model_name": upstream_model,
+            "provider_key_id": PK_ID,
+            "retries": 0
+        }))
+        .unwrap();
+        snapshot
+            .models
+            .insert(ResourceEntry::new("media-model", model, 1));
+        let key: ApiKey = serde_json::from_value(json!({
+            "key_hash": "8b6712790a2089c67aa97a2d80022df18cc65c7814350e33baebe79aab508891",
+            "allowed_models": ["*"],
+            "rate_limit": {"tpm": 10000, "concurrency": 1}
+        }))
+        .unwrap();
+        snapshot
+            .apikeys
+            .insert(ResourceEntry::new("media-key", key, 1));
+        snapshot
+    }
+
+    pub(crate) fn app(
+        snapshot: AisixSnapshot,
+    ) -> (
+        axum::Router,
+        Arc<aisix_obs::Metrics>,
+        Arc<aisix_ratelimit::Limiter>,
+        tokio::sync::mpsc::Receiver<aisix_obs::UsageEvent>,
+    ) {
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized(
+            "openai",
+            Arc::new(aisix_provider_openai::OpenAiBridge::new()),
+        );
+        let config = ProxyConfig {
+            addr: "127.0.0.1:0".into(),
+            request_body_limit_bytes: 32 * 1024 * 1024,
+            real_ip: Default::default(),
+            request_id: Default::default(),
+            url_rewrites: Vec::new(),
+            expose_debug_headers: false,
+            platform: Default::default(),
+            tls: None,
+            listeners: Vec::new(),
+            thread_per_core: None,
+            workers: None,
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let state = crate::ProxyState::new(SnapshotHandle::new(snapshot), hub, &config)
+            .without_cache()
+            .with_usage_sink(aisix_obs::UsageSink::new(tx));
+        let metrics = state.metrics.clone();
+        let limiter = state.limiter.clone();
+        (crate::build_router(state), metrics, limiter, rx)
+    }
+
+    pub(crate) fn json_request(endpoint: &str, body: Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(endpoint)
+            .header("authorization", "Bearer sk-caller")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    pub(crate) fn png() -> Bytes {
+        Bytes::from(base64::engine::general_purpose::STANDARD.decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        ).unwrap())
+    }
+
+    pub(crate) type Part = (String, Option<String>, Option<String>, Bytes);
+
+    pub(crate) fn multipart_request(endpoint: &str, fields: &[Part]) -> Request<Body> {
+        let mut body = Vec::new();
+        for (name, filename, content_type, data) in fields {
+            body.extend_from_slice(
+                format!("--component-boundary\r\nContent-Disposition: form-data; name=\"{name}\"")
+                    .as_bytes(),
+            );
+            if let Some(filename) = filename {
+                body.extend_from_slice(format!("; filename=\"{filename}\"").as_bytes());
+            }
+            body.extend_from_slice(b"\r\n");
+            if let Some(content_type) = content_type {
+                body.extend_from_slice(format!("Content-Type: {content_type}\r\n").as_bytes());
+            }
+            body.extend_from_slice(b"\r\n");
+            body.extend_from_slice(data);
+            body.extend_from_slice(b"\r\n");
+        }
+        body.extend_from_slice(b"--component-boundary--\r\n");
+        Request::builder()
+            .method("POST")
+            .uri(endpoint)
+            .header("authorization", "Bearer sk-caller")
+            .header(
+                header::CONTENT_TYPE,
+                "multipart/form-data; boundary=component-boundary",
+            )
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    pub(crate) fn text_part(name: &str, value: &str) -> Part {
+        (
+            name.to_string(),
+            None,
+            None,
+            Bytes::copy_from_slice(value.as_bytes()),
+        )
+    }
+
+    pub(crate) fn image_fields(stream: bool) -> Vec<Part> {
+        let mut fields = vec![
+            text_part("model", ALIAS),
+            text_part("prompt", "Add a red border."),
+            (
+                "image[]".into(),
+                Some("one.png".into()),
+                Some("image/png".into()),
+                png(),
+            ),
+            (
+                "image[]".into(),
+                Some("two.png".into()),
+                Some("image/png".into()),
+                png(),
+            ),
+            (
+                "mask".into(),
+                Some("mask.png".into()),
+                Some("image/png".into()),
+                png(),
+            ),
+            text_part("extra_native_option", "preserved"),
+        ];
+        if stream {
+            fields.push(text_part("stream", "true"));
+            fields.push(text_part("partial_images", "1"));
+        }
+        fields
+    }
+
+    pub(crate) async fn multipart_parts(received: &Received) -> Vec<Part> {
+        assert_eq!(
+            received
+                .headers
+                .get_all(header::CONTENT_TYPE)
+                .iter()
+                .count(),
+            1
+        );
+        assert_eq!(
+            received
+                .headers
+                .get_all(header::CONTENT_LENGTH)
+                .iter()
+                .count(),
+            1
+        );
+        assert_eq!(
+            received.headers[header::CONTENT_LENGTH]
+                .to_str()
+                .unwrap()
+                .parse::<usize>()
+                .unwrap(),
+            received.body.len(),
+            "生成的 Content-Length 必须覆盖实际完整表单"
+        );
+        let mut request = Request::new(Body::from(received.body.clone()));
+        *request.headers_mut() = received.headers.clone();
+        let mut multipart = axum::extract::Multipart::from_request(request, &())
+            .await
+            .unwrap();
+        let mut fields = Vec::new();
+        while let Some(field) = multipart.next_field().await.unwrap() {
+            let name = field.name().unwrap().to_string();
+            let filename = field.file_name().map(str::to_string);
+            let content_type = field.content_type().map(str::to_string);
+            fields.push((name, filename, content_type, field.bytes().await.unwrap()));
+        }
+        fields
+    }
+
+    pub(crate) async fn next_chunk(body: &mut axum::body::BodyDataStream) -> Bytes {
+        tokio::time::timeout(std::time::Duration::from_secs(3), body.next())
+            .await
+            .expect("对端尚未放行后续事件，当前事件必须实时交付")
+            .expect("流不能在当前事件之前结束")
+            .expect("当前事件不能被传输错误替代")
+    }
+
+    pub(crate) async fn terminal(
+        rx: &mut tokio::sync::mpsc::Receiver<aisix_obs::UsageEvent>,
+    ) -> aisix_obs::UsageEvent {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+            .await
+            .expect("请求结束必须结算")
+            .expect("usage 接收端不能提前关闭");
+        assert!(event.is_final_attempt, "只有一次最终请求结算");
+        assert!(rx.try_recv().is_err(), "同一请求不能重复结算");
+        event
+    }
+
+    pub(crate) fn assert_usage(event: &aisix_obs::UsageEvent, input: u32, output: u32, total: u32) {
+        assert_eq!(event.prompt_tokens, input);
+        assert_eq!(event.completion_tokens, output);
+        assert_eq!(event.total_tokens, total);
+    }
+
+    pub(crate) fn metric_sum(metrics: &aisix_obs::Metrics, metric: &str, endpoint: &str) -> f64 {
+        metrics
+            .render()
+            .lines()
+            .filter(|line| {
+                line.starts_with(&format!("{metric}{{"))
+                    && line.contains(&format!("endpoint=\"{endpoint}\""))
+            })
+            .map(|line| line.rsplit_once(' ').unwrap().1.parse::<f64>().unwrap())
+            .sum()
+    }
+}
+
+#[cfg(test)]
+mod compat_media_audio_tests {
+    use super::compat_media_test_peer::*;
+    use aisix_core::resource::ResourceEntry;
+    use axum::body::{to_bytes, Bytes};
+    use axum::http::StatusCode;
+    use serde_json::json;
+    use tower::ServiceExt as _;
+
+    const SPEECH: &str = "/v1/audio/speech";
+    const DELTA: &str = "event: speech.audio.delta\ndata: {\"type\":\"speech.audio.delta\",\"audio\":\"UklGRg==\"}\n\n";
+    const DONE: &str = "event: speech.audio.done\ndata: {\"type\":\"speech.audio.done\",\"usage\":{\"input_tokens\":14,\"output_tokens\":101,\"total_tokens\":115}}\n\n";
+
+    fn speech_request() -> axum::http::Request<axum::body::Body> {
+        json_request(
+            SPEECH,
+            json!({"model":ALIAS,"input":"Hello.","voice":"alloy","stream_format":"sse"}),
+        )
+    }
+
+    // 删除终态观察、用默认 usage 或重复扣减，分别破坏状态、计数或限额断言。
+    async fn speech_done_case(close_at_done: bool, fragmented: bool) {
+        let mut chunks = vec![Bytes::from_static(DELTA.as_bytes())];
+        if fragmented {
+            chunks.extend([
+                Bytes::copy_from_slice(&DONE.as_bytes()[..43]),
+                Bytes::copy_from_slice(&DONE.as_bytes()[43..]),
+            ]);
+        } else {
+            chunks.push(Bytes::from_static(DONE.as_bytes()));
+        }
+        let peer = Peer::start("text/event-stream; charset=utf-8", chunks, close_at_done).await;
+        let (app, metrics, limiter, mut rx) = app(snapshot(&peer.base, "gpt-4o-mini-tts"));
+        let response = app.oneshot(speech_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+        peer.release(1);
+        assert_eq!(next_chunk(&mut body).await, DELTA.as_bytes());
+        let mut terminal_bytes = Vec::new();
+        peer.release(1);
+        terminal_bytes.extend_from_slice(&next_chunk(&mut body).await);
+        if fragmented {
+            peer.release(1);
+            terminal_bytes.extend_from_slice(&next_chunk(&mut body).await);
+        }
+        assert_eq!(terminal_bytes, DONE.as_bytes());
+        if !close_at_done {
+            assert!(futures::StreamExt::next(&mut body).await.is_none());
+        }
+        drop(body);
+        let event = terminal(&mut rx).await;
+        assert_eq!(event.status_code, 200, "SDK 读取 done 即断开仍已成功完成");
+        assert_usage(&event, 14, 101, 115);
+        assert!(event.error_class.is_empty());
+        let limits = aisix_core::RateLimit {
+            tpm: Some(10000),
+            concurrency: Some(1),
+            ..Default::default()
+        };
+        let status = limiter.peek("media-key", &limits).await.unwrap();
+        assert_eq!(status.tpm_used, 115, "已报告数量仅结算一次");
+        assert_eq!(status.in_flight, 0);
+        assert_eq!(
+            metric_sum(&metrics, "aisix_llm_input_tokens_total", SPEECH),
+            14.0
+        );
+        assert_eq!(
+            metric_sum(&metrics, "aisix_llm_output_tokens_total", SPEECH),
+            101.0
+        );
+        assert_eq!(peer.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn compat_media_speech_sse_fragmented_done_at_eof() {
+        speech_done_case(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_speech_sse_close_at_done_is_success() {
+        speech_done_case(true, true).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_speech_sse_done_settles_once() {
+        speech_done_case(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_speech_sse_early_disconnect_is_one_cancel() {
+        let peer = Peer::start(
+            "text/event-stream",
+            vec![Bytes::from_static(DELTA.as_bytes())],
+            true,
+        )
+        .await;
+        let (app, _, _, mut rx) = app(snapshot(&peer.base, "gpt-4o-mini-tts"));
+        let response = app.oneshot(speech_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+        peer.release(1);
+        assert_eq!(next_chunk(&mut body).await, DELTA.as_bytes());
+        drop(body);
+        let event = terminal(&mut rx).await;
+        assert_eq!(event.status_code, 499);
+        assert_usage(&event, 0, 0, 0);
+        assert_eq!(peer.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn compat_media_speech_binary_formats_remain_byte_exact() {
+        for content_type in ["audio/mpeg", "audio/wav", "audio/pcm"] {
+            let mut bytes = vec![0, 255, 0, 1, 128];
+            bytes.extend_from_slice(DONE.as_bytes());
+            let peer = Peer::start(content_type, vec![Bytes::from(bytes.clone())], false).await;
+            peer.release(1);
+            let (app, _, _, mut rx) = app(snapshot(&peer.base, "gpt-4o-mini-tts"));
+            let response = app.oneshot(speech_request()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(to_bytes(response.into_body(), 4096).await.unwrap(), bytes);
+            let event = terminal(&mut rx).await;
+            assert_eq!(event.status_code, 200);
+            assert_usage(&event, 0, 0, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn compat_media_speech_sse_observer_recovers_after_large_audio_frame() {
+        let large = format!(
+            "data: {{\"type\":\"speech.audio.delta\",\"audio\":\"{}\"}}\n\n",
+            "A".repeat(aisix_gateway::sse::MAX_SSE_FRAME_BYTES + 1)
+        );
+        let peer = Peer::start(
+            "text/event-stream",
+            vec![
+                Bytes::from(large.clone()),
+                Bytes::from_static(DONE.as_bytes()),
+            ],
+            false,
+        )
+        .await;
+        peer.release(2);
+        let (app, _, _, mut rx) = app(snapshot(&peer.base, "gpt-4o-mini-tts"));
+        let response = app.oneshot(speech_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 32 * 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(bytes.len(), large.len() + DONE.len());
+        assert_eq!(&bytes[..large.len()], large.as_bytes());
+        assert_eq!(&bytes[large.len()..], DONE.as_bytes());
+        let event = terminal(&mut rx).await;
+        assert_usage(&event, 14, 101, 115);
+    }
+
+    #[tokio::test]
+    async fn compat_media_speech_sse_inband_error_is_not_success_or_retried() {
+        let error = "data: {\"error\":{\"message\":\"The server had an error processing your request.\",\"type\":\"server_error\",\"code\":\"server_error\",\"param\":null}}\n\n";
+        let peer = Peer::start(
+            "text/event-stream",
+            vec![Bytes::from_static(DELTA.as_bytes()), Bytes::from(error)],
+            false,
+        )
+        .await;
+        peer.release(2);
+        let (app, _, _, mut rx) = app(snapshot(&peer.base, "gpt-4o-mini-tts"));
+        let response = app.oneshot(speech_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = to_bytes(response.into_body(), 4096).await;
+        let event = terminal(&mut rx).await;
+        assert_eq!(event.status_code, 502);
+        assert!(!event.error_class.is_empty());
+        assert_eq!(peer.requests().len(), 1);
+    }
+
+    fn wav() -> Bytes {
+        let mut wav = b"RIFF\x26\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\x40\x1f\x00\x00\x80\x3e\x00\x00\x02\x00\x10\x00data\x02\x00\x00\x00".to_vec();
+        wav.extend_from_slice(&[0, 0]);
+        Bytes::from(wav)
+    }
+
+    async fn multipart_content_headers_case(endpoint: &str) {
+        let peer = Peer::start(
+            "application/json",
+            vec![Bytes::from_static(b"{\"text\":\"hello\"}")],
+            false,
+        )
+        .await;
+        peer.release(1);
+        let snap = snapshot(&peer.base, "gpt-4o-transcribe");
+        let pk: aisix_core::ProviderKey = serde_json::from_value(json!({
+            "display_name":"component-media-peer", "api_key":"component-upstream-secret", "api_base":peer.base,
+            "provider":"openai", "adapter":"openai",
+            "request":{"default_headers":{"Content-Type":"application/json","cOnTeNt-LeNgTh":"7","x-component-sentinel":"kept"}}
+        })).unwrap();
+        snap.provider_keys.insert(ResourceEntry::new(PK_ID, pk, 2));
+        let fields = vec![
+            text_part("model", ALIAS),
+            text_part("prompt", "First prompt"),
+            text_part("prompt", "Repeated prompt"),
+            (
+                "file".into(),
+                Some("clip.wav".into()),
+                Some("audio/wav".into()),
+                wav(),
+            ),
+        ];
+        let (app, _, _, _) = app(snap);
+        let response = app
+            .oneshot(multipart_request(endpoint, &fields))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "操作员内容头不能破坏重建表单"
+        );
+        let _ = to_bytes(response.into_body(), 4096).await.unwrap();
+        let requests = peer.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].headers["x-component-sentinel"], "kept");
+        let mut expected = fields;
+        expected[0].3 = Bytes::from_static(b"gpt-4o-transcribe");
+        assert_eq!(multipart_parts(&requests[0]).await, expected);
+    }
+
+    #[tokio::test]
+    async fn compat_media_transcription_multipart_owns_content_headers() {
+        multipart_content_headers_case("/v1/audio/transcriptions").await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_translation_multipart_owns_content_headers() {
+        multipart_content_headers_case("/v1/audio/translations").await;
+    }
+
+    async fn cohere_transcription_case(compatibility_base: bool) {
+        let peer = Peer::start(
+            "application/json",
+            vec![Bytes::from_static(b"{\"text\":\"hello\"}")],
+            false,
+        )
+        .await;
+        peer.release(1);
+        let base = if compatibility_base {
+            format!("{}/compatibility/v1", peer.base)
+        } else {
+            peer.base.clone()
+        };
+        let snap = snapshot(&base, "cohere-transcribe-03-2026");
+        let pk: aisix_core::ProviderKey = serde_json::from_value(json!({
+            "display_name":"component-cohere-peer", "api_key":"component-upstream-secret", "api_base":base,
+            "provider":"cohere", "adapter":"openai"
+        })).unwrap();
+        snap.provider_keys.insert(ResourceEntry::new(PK_ID, pk, 2));
+        let model: aisix_core::Model = serde_json::from_value(json!({
+            "display_name":ALIAS,"provider":"cohere","model_name":"cohere-transcribe-03-2026","provider_key_id":PK_ID,"retries":0
+        })).unwrap();
+        snap.models
+            .insert(ResourceEntry::new("media-model", model, 2));
+        let fields = vec![
+            (
+                "file".into(),
+                Some("clip.wav".into()),
+                Some("audio/wav".into()),
+                wav(),
+            ),
+            text_part("model", ALIAS),
+            text_part("language", "en"),
+        ];
+        let (app, _, _, _) = app(snap);
+        let response = app
+            .oneshot(multipart_request("/v1/audio/transcriptions", &fields))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = to_bytes(response.into_body(), 4096).await.unwrap();
+        let requests = peer.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].uri, "/compatibility/v1/audio/transcriptions");
+        let expected = vec![
+            text_part("model", "cohere-transcribe-03-2026"),
+            text_part("language", "en"),
+            fields[0].clone(),
+        ];
+        assert_eq!(
+            multipart_parts(&requests[0]).await,
+            expected,
+            "目标平台要求 file 最后，其他字段和文件原样保留"
+        );
+    }
+
+    #[tokio::test]
+    async fn compat_media_cohere_transcription_bare_host_and_file_last() {
+        cohere_transcription_case(false).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_cohere_transcription_compatibility_root_and_file_last() {
+        cohere_transcription_case(true).await;
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod compat_media_image_peer {
+    use super::compat_media_test_peer::*;
+    use aisix_core::resource::ResourceEntry;
+    use axum::body::{to_bytes, Bytes};
+    use axum::http::StatusCode;
+    use serde_json::json;
+    use tower::ServiceExt as _;
+
+    #[derive(Clone, Copy)]
+    pub(crate) enum Form {
+        Generation,
+        EditJson,
+        EditMultipart,
+    }
+    #[derive(Clone, Copy)]
+    pub(crate) enum Ending {
+        Eof,
+        CompletedClose,
+        Cancel,
+        Truncated,
+        Error,
+        Timeout,
+        Concurrency,
+        OutputBlock,
+        Monitor,
+    }
+
+    fn endpoint(form: Form) -> &'static str {
+        match form {
+            Form::Generation => "/v1/images/generations",
+            _ => "/v1/images/edits",
+        }
+    }
+
+    fn request(form: Form) -> axum::http::Request<axum::body::Body> {
+        match form {
+            Form::Generation => json_request(
+                endpoint(form),
+                json!({"model":ALIAS,"prompt":"A red square.","stream":true,"partial_images":1}),
+            ),
+            Form::EditJson => json_request(
+                endpoint(form),
+                json!({"model":ALIAS,"images":[{"file_id":"file-component-reference"}],"prompt":"Add a red border.","stream":true,"partial_images":1}),
+            ),
+            Form::EditMultipart => multipart_request(endpoint(form), &image_fields(true)),
+        }
+    }
+
+    fn event(form: Form, completed: bool) -> String {
+        let family = match form {
+            Form::Generation => "image_generation",
+            _ => "image_edit",
+        };
+        let kind = if completed {
+            "completed"
+        } else {
+            "partial_image"
+        };
+        let mut payload = json!({
+            "type":format!("{family}.{kind}"),"b64_json":if completed {"ZmluYWw="} else {"cGFydGlhbA=="},
+            "created_at":1700000000,"background":"opaque","output_format":"png","quality":"high","size":"1024x1024",
+            "native_extension":{"retained":true}
+        });
+        if completed {
+            payload["usage"] = json!({"input_tokens":37,"output_tokens":53,"total_tokens":90,"input_tokens_details":{"text_tokens":10,"image_tokens":27}});
+        } else {
+            payload["partial_image_index"] = json!(0);
+        }
+        format!("event: {family}.{kind}\ndata: {payload}\n\n")
+    }
+
+    // 第一帧必须在终态许可仍关闭时交付；恢复 400 或整段缓冲都会失败。
+    pub(crate) async fn stream_case(form: Form, ending: Ending) {
+        let partial = event(form, false);
+        let completed = event(form, true);
+        let error = "data: {\"error\":{\"message\":\"The server had an error processing your request.\",\"type\":\"server_error\",\"code\":\"server_error\",\"param\":null}}\n\n";
+        let mut chunks = vec![Bytes::copy_from_slice(partial.as_bytes())];
+        if matches!(ending, Ending::Error) {
+            chunks.push(Bytes::from_static(error.as_bytes()));
+        } else if !matches!(ending, Ending::Cancel | Ending::Truncated | Ending::Timeout) {
+            let split = completed.len() / 2;
+            chunks.extend([
+                Bytes::copy_from_slice(&completed.as_bytes()[..split]),
+                Bytes::copy_from_slice(&completed.as_bytes()[split..]),
+            ]);
+        }
+        let keep_open = matches!(
+            ending,
+            Ending::CompletedClose | Ending::Cancel | Ending::Timeout
+        );
+        let peer = Peer::start("text/event-stream", chunks, keep_open).await;
+        let snap = snapshot(&peer.base, "gpt-image-2");
+        if matches!(ending, Ending::Timeout) {
+            let model: aisix_core::Model = serde_json::from_value(json!({"display_name":ALIAS,"provider":"openai","model_name":"gpt-image-2","provider_key_id":PK_ID,"retries":0,"stream_timeout":40})).unwrap();
+            snap.models
+                .insert(ResourceEntry::new("media-model", model, 2));
+        }
+        if matches!(ending, Ending::OutputBlock | Ending::Monitor) {
+            let guardrail: aisix_core::Guardrail = serde_json::from_value(json!({
+                "name":"component-output-rule","enabled":true,"kind":"custom","hook_point":"output","fail_open":false,
+                "enforcement_mode":if matches!(ending, Ending::Monitor) {"monitor"} else {"block"},
+                "script":"export function checkOutput() { return { action: 'block', reason_code: 'component' }; }",
+                "timeout_ms":5000,"max_buffer_bytes":1048576
+            })).unwrap();
+            crate::seed_env_scoped_guardrail(
+                &snap,
+                ResourceEntry::new("media-output-rule", guardrail, 1),
+            );
+        }
+        let (app, metrics, limiter, mut rx) = app(snap);
+        if matches!(ending, Ending::OutputBlock) {
+            peer.release(3);
+        }
+        let response = app.clone().oneshot(request(form)).await.unwrap();
+        if matches!(ending, Ending::OutputBlock) {
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "无文本输出也必须咨询 custom 输出规则"
+            );
+            let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["error"]["type"], "content_filter");
+            assert!(!String::from_utf8_lossy(&bytes).contains("cGFydGlhbA=="));
+            let event = terminal(&mut rx).await;
+            assert!(event.guardrail_blocked);
+            assert_usage(&event, 37, 53, 90);
+            assert_eq!(peer.requests().len(), 1);
+            return;
+        }
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "已存在的图像路由必须支持官方 SSE 请求"
+        );
+        assert!(response.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("text/event-stream"));
+        let mut body = response.into_body().into_data_stream();
+        peer.release(1);
+        assert_eq!(next_chunk(&mut body).await, partial.as_bytes());
+        if matches!(ending, Ending::Concurrency) {
+            let blocked = app.clone().oneshot(request(form)).await.unwrap();
+            assert_eq!(
+                blocked.status(),
+                StatusCode::TOO_MANY_REQUESTS,
+                "部分图像期间并发槽不得释放"
+            );
+            let _ = to_bytes(blocked.into_body(), 65536).await.unwrap();
+            assert_eq!(terminal(&mut rx).await.status_code, 429);
+            assert_eq!(peer.requests().len(), 1);
+        }
+        if matches!(ending, Ending::Cancel) {
+            drop(body);
+            let event = terminal(&mut rx).await;
+            assert_eq!(event.status_code, 499);
+            assert_usage(&event, 0, 0, 0);
+        } else if matches!(ending, Ending::Timeout) {
+            let next = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                futures::StreamExt::next(&mut body),
+            )
+            .await
+            .unwrap();
+            assert!(matches!(next, Some(Err(_))), "读超时不能伪装成干净 EOF");
+            drop(body);
+            let event = terminal(&mut rx).await;
+            assert_eq!(event.status_code, 504);
+            assert!(!event.error_class.is_empty());
+        } else if matches!(ending, Ending::Truncated | Ending::Error) {
+            if matches!(ending, Ending::Error) {
+                peer.release(1);
+            }
+            while futures::StreamExt::next(&mut body).await.is_some() {}
+            drop(body);
+            let event = terminal(&mut rx).await;
+            assert_eq!(
+                event.status_code, 502,
+                "缺少 completed 或上游错误均不是成功"
+            );
+            assert!(!event.error_class.is_empty());
+        } else {
+            let mut terminal_bytes = Vec::new();
+            peer.release(1);
+            terminal_bytes.extend_from_slice(&next_chunk(&mut body).await);
+            peer.release(1);
+            terminal_bytes.extend_from_slice(&next_chunk(&mut body).await);
+            assert_eq!(
+                terminal_bytes,
+                completed.as_bytes(),
+                "原生 metadata/base64/usage 必须完整保留"
+            );
+            if !matches!(ending, Ending::CompletedClose) {
+                assert!(futures::StreamExt::next(&mut body).await.is_none());
+            }
+            drop(body);
+            let event = terminal(&mut rx).await;
+            assert_eq!(event.status_code, 200);
+            assert!(event.error_class.is_empty());
+            assert_usage(&event, 37, 53, 90);
+            assert_eq!(event.modality_tokens.prompt_image_tokens, Some(27));
+            if matches!(ending, Ending::Monitor) {
+                assert!(
+                    !event.guardrail_monitor_hits.is_empty(),
+                    "monitor 必须实际运行，而不是仅允许直播"
+                );
+                assert!(!event.guardrail_blocked);
+            }
+            let limits = aisix_core::RateLimit {
+                tpm: Some(10000),
+                concurrency: Some(1),
+                ..Default::default()
+            };
+            let status = limiter.peek("media-key", &limits).await.unwrap();
+            assert_eq!(status.tpm_used, 90);
+            assert_eq!(status.in_flight, 0);
+            assert_eq!(
+                metric_sum(&metrics, "aisix_llm_input_tokens_total", endpoint(form)),
+                37.0
+            );
+            assert_eq!(
+                metric_sum(&metrics, "aisix_llm_output_tokens_total", endpoint(form)),
+                53.0
+            );
+        }
+        assert_eq!(peer.requests().len(), 1, "2xx 后的流结束不能触发再次生成");
+    }
+
+    pub(crate) async fn large_partial_case(form: Form) {
+        let family = match form {
+            Form::Generation => "image_generation",
+            _ => "image_edit",
+        };
+        let large = format!("data: {{\"type\":\"{family}.partial_image\",\"b64_json\":\"{}\",\"partial_image_index\":0}}\n\n", "A".repeat(aisix_gateway::sse::MAX_SSE_FRAME_BYTES + 1));
+        let completed = event(form, true);
+        let peer = Peer::start(
+            "text/event-stream",
+            vec![Bytes::from(large.clone()), Bytes::from(completed.clone())],
+            false,
+        )
+        .await;
+        peer.release(2);
+        let (app, _, _, mut rx) = app(snapshot(&peer.base, "gpt-image-2"));
+        let response = app.oneshot(request(form)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 32 * 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(bytes.len(), large.len() + completed.len());
+        assert_eq!(&bytes[..large.len()], large.as_bytes());
+        assert_eq!(&bytes[large.len()..], completed.as_bytes());
+        assert_usage(&terminal(&mut rx).await, 37, 53, 90);
+        assert_eq!(peer.requests().len(), 1);
+    }
+    // 无 usage 是兼容性鲁棒性输入；已报告的零和未报告的细分不能混为一谈。
+    pub(crate) async fn usage_presence_case(form: Form, zero_details: bool) {
+        let completed = event(form, true);
+        let (_, data) = completed.split_once("data: ").unwrap();
+        let mut payload: serde_json::Value = serde_json::from_str(data.trim()).unwrap();
+        if zero_details {
+            payload["usage"] = json!({"input_tokens":0,"output_tokens":0,"total_tokens":0,"input_tokens_details":{"text_tokens":0,"image_tokens":0}});
+        } else {
+            payload.as_object_mut().unwrap().remove("usage");
+        }
+        let wire = format!("data: {payload}\n\n");
+        let peer = Peer::start("text/event-stream", vec![Bytes::from(wire.clone())], false).await;
+        peer.release(1);
+        let (app, _, _, mut rx) = app(snapshot(&peer.base, "gpt-image-2"));
+        let response = app.oneshot(request(form)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(to_bytes(response.into_body(), 65536).await.unwrap(), wire);
+        let event = terminal(&mut rx).await;
+        assert_eq!(event.status_code, 200);
+        assert_usage(&event, 0, 0, 0);
+        assert_eq!(
+            event.modality_tokens.prompt_image_tokens,
+            if zero_details { Some(0) } else { None }
+        );
+        assert_eq!(event.modality_tokens.completion_image_tokens, None);
+    }
+    pub(crate) async fn output_overflow_case(form: Form, fail_open: bool) {
+        let partial = event(form, false);
+        let completed = event(form, true);
+        let peer = Peer::start(
+            "text/event-stream",
+            vec![Bytes::from(partial.clone()), Bytes::from(completed.clone())],
+            false,
+        )
+        .await;
+        peer.release(2);
+        let snap = snapshot(&peer.base, "gpt-image-2");
+        let policy:aisix_core::Guardrail=serde_json::from_value(json!({"name":"component-cap","enabled":true,"kind":"custom","hook_point":"output","fail_open":false,
+            "script":"export function checkOutput() { return {action:'block',reason_code:'component'}; }","timeout_ms":5000,
+            "stream_processing_mode":"buffer_full","max_buffer_bytes":1,"on_buffer_exceeded":if fail_open {"fail_open"} else {"fail_closed"}})).unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("media-cap-rule", policy, 1));
+        let (app, _, _, mut rx) = app(snap);
+        let response = app.oneshot(request(form)).await.unwrap();
+        assert_eq!(
+            response.status(),
+            if fail_open {
+                StatusCode::OK
+            } else {
+                StatusCode::UNPROCESSABLE_ENTITY
+            }
+        );
+        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        if fail_open {
+            assert_eq!(bytes, format!("{partial}{completed}"));
+        } else {
+            assert!(!String::from_utf8_lossy(&bytes).contains("cGFydGlhbA=="));
+        }
+        let event = terminal(&mut rx).await;
+        assert_usage(&event, 37, 53, 90);
+        assert_eq!(event.guardrail_blocked, !fail_open);
+        if fail_open {
+            assert_eq!(event.guardrail_bypassed_reason, "output_buffer_exceeded");
+        }
+        assert_eq!(peer.requests().len(), 1);
+    }
+
+    // revised_prompt 是未知原生 SSE 扩展；此例验证本地输出策略，不声称上游必发该字段。
+    pub(crate) async fn output_mask_case(form: Form) {
+        let partial = event(form, false);
+        let completed = event(form, true);
+        let (_, data) = completed.split_once("data: ").unwrap();
+        let mut payload: serde_json::Value = serde_json::from_str(data.trim()).unwrap();
+        payload["revised_prompt"] = json!("Contact alice@example.com for a red border.");
+        let completed = format!("data: {payload}\n\n");
+        let peer = Peer::start(
+            "text/event-stream",
+            vec![Bytes::from(partial.clone()), Bytes::from(completed)],
+            false,
+        )
+        .await;
+        peer.release(2);
+        let snap = snapshot(&peer.base, "gpt-image-2");
+        let policy: aisix_core::Guardrail = serde_json::from_value(
+            json!({"name":"component-output-mask","enabled":true,"kind":"pii","hook_point":"output",
+            "detectors":[{"type":"email","action":"mask"}]}),
+        )
+        .unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("media-mask-rule", policy, 1));
+        let (app, _, _, mut rx) = app(snap);
+        let response = app.oneshot(request(form)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("alice@example.com"));
+        let mut decoder = aisix_gateway::SseDecoder::new();
+        let events = decoder.feed(bytes.as_ref()).unwrap();
+        assert_eq!(events.len(), 2);
+        let aisix_gateway::SseEvent::Data(data) = &events[1] else {
+            panic!("必须保留完成事件")
+        };
+        let value: serde_json::Value = serde_json::from_str(data).unwrap();
+        assert_eq!(value["b64_json"], "ZmluYWw=");
+        assert_eq!(value["native_extension"], json!({"retained":true}));
+        let prompt = value["revised_prompt"].as_str().unwrap();
+        assert!(prompt.starts_with("Contact ") && prompt.ends_with(" for a red border."));
+        let event = terminal(&mut rx).await;
+        assert_usage(&event, 37, 53, 90);
+        assert_eq!(event.redacted_entity_counts.get("email"), Some(&1));
+        assert!(!event.guardrail_blocked);
+    }
+    // 大型二进制哨兵是观察器压力输入，不声明可被供应商解码成真实图像。
+    pub(crate) async fn large_completed_case(form: Form) {
+        let completed = event(form, true);
+        let (_, data) = completed.split_once("data: ").unwrap();
+        let mut payload: serde_json::Value = serde_json::from_str(data.trim()).unwrap();
+        payload["b64_json"] = json!("A".repeat(aisix_gateway::sse::MAX_SSE_FRAME_BYTES + 1));
+        let wire = format!("data: {payload}\n\n");
+        let peer = Peer::start("text/event-stream", vec![Bytes::from(wire.clone())], false).await;
+        peer.release(1);
+        let (app, _, limiter, mut rx) = app(snapshot(&peer.base, "gpt-image-2"));
+        let response = app.oneshot(request(form)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(response.into_body(), 32 * 1024 * 1024)
+                .await
+                .unwrap(),
+            wire
+        );
+        let event = terminal(&mut rx).await;
+        assert_eq!(event.status_code, 200);
+        assert_usage(&event, 37, 53, 90);
+        let limits = aisix_core::RateLimit {
+            tpm: Some(10000),
+            concurrency: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(
+            limiter.peek("media-key", &limits).await.unwrap().tpm_used,
+            90
+        );
+    }
+}
+
+#[cfg(test)]
+mod compat_media_duplicate_done_test {
+    use super::compat_media_test_peer::*;
+    use axum::body::{to_bytes, Bytes};
+    use serde_json::json;
+    use tower::ServiceExt as _;
+
+    #[tokio::test]
+    async fn compat_media_speech_duplicate_done_keeps_bytes_and_one_settlement() {
+        let done = "event: speech.audio.done\ndata: {\"type\":\"speech.audio.done\",\"usage\":{\"input_tokens\":14,\"output_tokens\":101,\"total_tokens\":115}}\n\n";
+        let peer = Peer::start(
+            "text/event-stream",
+            vec![
+                Bytes::copy_from_slice(done.as_bytes()),
+                Bytes::copy_from_slice(done.as_bytes()),
+            ],
+            false,
+        )
+        .await;
+        peer.release(2);
+        let (app, _, limiter, mut rx) = app(snapshot(&peer.base, "gpt-4o-mini-tts"));
+        let response = app
+            .oneshot(json_request(
+                "/v1/audio/speech",
+                json!({"model":ALIAS,"input":"Hello.","voice":"alloy","stream_format":"sse"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            to_bytes(response.into_body(), 4096).await.unwrap(),
+            format!("{done}{done}")
+        );
+        let event = terminal(&mut rx).await;
+        assert_usage(&event, 14, 101, 115);
+        let limits = aisix_core::RateLimit {
+            tpm: Some(10000),
+            concurrency: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(
+            limiter.peek("media-key", &limits).await.unwrap().tpm_used,
+            115
+        );
+        assert_eq!(peer.requests().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod compat_media_quantity_presence_tests {
+    use super::compat_media_test_peer::*;
+    use axum::body::{to_bytes, Bytes};
+    use serde_json::json;
+    use tower::ServiceExt as _;
+
+    async fn speech_usage_case(zero: bool) {
+        let mut payload = json!({"type":"speech.audio.done"});
+        if zero {
+            payload["usage"] = json!({"input_tokens":0,"output_tokens":0,"total_tokens":0});
+        }
+        let wire = format!("data: {payload}\n\n");
+        let peer = Peer::start("text/event-stream", vec![Bytes::from(wire.clone())], false).await;
+        peer.release(1);
+        let (app, _, _, mut rx) = app(snapshot(&peer.base, "gpt-4o-mini-tts"));
+        let response = app
+            .oneshot(json_request(
+                "/v1/audio/speech",
+                json!({"model":ALIAS,"input":"Hello.","voice":"alloy","stream_format":"sse"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(to_bytes(response.into_body(), 4096).await.unwrap(), wire);
+        let event = terminal(&mut rx).await;
+        assert_eq!(event.status_code, 200);
+        assert_usage(&event, 0, 0, 0);
+        assert_eq!(event.modality_tokens, aisix_gateway::ModalityTokens::NONE);
+    }
+    #[tokio::test]
+    async fn compat_media_speech_reported_zero_does_not_invent_modality() {
+        speech_usage_case(true).await;
+    }
+    // 缺失 usage 只验证保守兼容，不声明为官方完整响应。
+    #[tokio::test]
+    async fn compat_media_speech_missing_usage_is_not_fabricated() {
+        speech_usage_case(false).await;
+    }
+}
+
+#[cfg(test)]
+mod compat_media_azure_routes_tests {
+    use super::compat_media_test_peer::*;
+    use aisix_core::resource::ResourceEntry;
+    use axum::body::{to_bytes, Bytes};
+    use serde_json::{json, Value};
+    use tower::ServiceExt as _;
+
+    async fn azure_route_case(route: &str, multipart: bool, entra: bool) {
+        let image = route.starts_with("/images/");
+        let stream = route == "/audio/speech"
+            || route == "/images/generations"
+            || (route == "/images/edits" && multipart);
+        let payload = if image {
+            json!({"type":if route=="/images/edits" {"image_edit.completed"} else {"image_generation.completed"},
+                "b64_json":"ZmluYWw=","background":"opaque","created_at":1700000000,"output_format":"png","quality":"high","size":"1024x1024",
+                "usage":{"input_tokens":14,"output_tokens":101,"total_tokens":115,"input_tokens_details":{"text_tokens":4,"image_tokens":10}}})
+        } else if stream {
+            json!({"type":"speech.audio.done","usage":{"input_tokens":14,"output_tokens":101,"total_tokens":115}})
+        } else {
+            json!({"text":"hello","usage":{"type":"tokens","input_tokens":14,"output_tokens":101,"total_tokens":115}})
+        };
+        let wire = if stream {
+            format!("data: {payload}\n\n")
+        } else if image {
+            json!({"created":1700000000,"data":[{"b64_json":"ZmluYWw="}]}).to_string()
+        } else {
+            payload.to_string()
+        };
+        let peer = Peer::start(
+            if stream {
+                "text/event-stream"
+            } else {
+                "application/json"
+            },
+            vec![Bytes::from(wire.clone())],
+            false,
+        )
+        .await;
+        peer.release(1);
+        let tenant = uuid::Uuid::new_v4().to_string();
+        let token_peer = if entra {
+            let peer=Peer::start("application/json",vec![Bytes::from(json!({"access_token":"component-entra-token","token_type":"Bearer","expires_in":3600}).to_string())],false).await;
+            peer.release(1);
+            Some(peer)
+        } else {
+            None
+        };
+        let secret=token_peer.as_ref().map_or_else(||"component-azure-key".to_string(),|token_peer|
+            json!({"tenant_id":tenant,"client_id":"component-client","client_secret":"component-client-secret","authority_host":token_peer.base}).to_string());
+        let snap = snapshot(&peer.base, "media-deployment");
+        let pk:aisix_core::ProviderKey=serde_json::from_value(json!({"display_name":"component-azure-peer","provider":"azure","adapter":aisix_core::Adapter::AzureOpenai,"api_key":secret,"api_base":peer.base})).unwrap();
+        snap.provider_keys.insert(ResourceEntry::new(PK_ID, pk, 2));
+        let model:aisix_core::Model=serde_json::from_value(json!({"display_name":ALIAS,"provider":"azure","model_name":"media-deployment","provider_key_id":PK_ID,"retries":0})).unwrap();
+        snap.models
+            .insert(ResourceEntry::new("media-model", model, 2));
+        let endpoint = format!("/v1{route}");
+        let request = if multipart {
+            let fields = if image {
+                image_fields(true)
+            } else {
+                vec![
+                text_part("model",ALIAS),text_part("language","en"),
+                ("file".into(),Some("clip.wav".into()),Some("audio/wav".into()),Bytes::from_static(b"RIFF\x26\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\x40\x1f\x00\x00\x80\x3e\x00\x00\x02\x00\x10\x00data\x02\x00\x00\x00\x00\x00"))]
+            };
+            multipart_request(&endpoint, &fields)
+        } else if route == "/audio/speech" {
+            json_request(
+                &endpoint,
+                json!({"model":ALIAS,"input":"Hello.","voice":"alloy","stream_format":"sse"}),
+            )
+        } else if route == "/images/edits" {
+            json_request(
+                &endpoint,
+                json!({"model":ALIAS,"images":[{"file_id":"file-component-reference"}],"prompt":"Add a border."}),
+            )
+        } else {
+            json_request(
+                &endpoint,
+                json!({"model":ALIAS,"prompt":"A red square.","stream":true}),
+            )
+        };
+        let (app, _, _, mut rx) = app(snap);
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        if stream || !image {
+            assert_eq!(bytes, wire);
+        }
+        let requests = peer.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].uri,
+            format!("/openai/v1{route}"),
+            "当前原生媒体契约不附加旧版 deployment 路径或 api-version"
+        );
+        if entra {
+            assert_eq!(
+                requests[0].headers.get_all("authorization").iter().count(),
+                1
+            );
+            assert_eq!(
+                requests[0].headers["authorization"],
+                "Bearer component-entra-token"
+            );
+            assert!(!requests[0].headers.contains_key("api-key"));
+            let tokens = token_peer.as_ref().unwrap().requests();
+            assert_eq!(tokens.len(), 1);
+            assert_eq!(tokens[0].uri, format!("/{tenant}/oauth2/v2.0/token"));
+            let fields = std::collections::BTreeMap::<String, String>::from_iter(
+                url::form_urlencoded::parse(&tokens[0].body).into_owned(),
+            );
+            assert_eq!(
+                fields.get("grant_type").map(String::as_str),
+                Some("client_credentials")
+            );
+            assert_eq!(
+                fields.get("client_id").map(String::as_str),
+                Some("component-client")
+            );
+            assert_eq!(
+                fields.get("client_secret").map(String::as_str),
+                Some("component-client-secret")
+            );
+        } else {
+            assert_eq!(requests[0].headers.get_all("api-key").iter().count(), 1);
+            assert_eq!(requests[0].headers["api-key"], "component-azure-key");
+            assert!(!requests[0].headers.contains_key("authorization"));
+        }
+        if multipart {
+            let fields = multipart_parts(&requests[0]).await;
+            assert_eq!(
+                fields.iter().find(|field| field.0 == "model").unwrap().3,
+                Bytes::from_static(b"media-deployment")
+            );
+        } else {
+            let value: Value = serde_json::from_slice(&requests[0].body).unwrap();
+            assert_eq!(value["model"], "media-deployment");
+        }
+        let event = terminal(&mut rx).await;
+        assert_eq!(event.status_code, 200);
+        if stream || !image {
+            assert_usage(&event, 14, 101, 115);
+        }
+    }
+
+    #[tokio::test]
+    async fn compat_media_azure_speech_api_key_uses_native_v1_route() {
+        azure_route_case("/audio/speech", false, false).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_azure_speech_entra_uses_native_v1_route() {
+        azure_route_case("/audio/speech", false, true).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_azure_transcriptions_api_key_uses_native_v1_route() {
+        azure_route_case("/audio/transcriptions", true, false).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_azure_transcriptions_entra_uses_native_v1_route() {
+        azure_route_case("/audio/transcriptions", true, true).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_azure_translations_api_key_uses_native_v1_route() {
+        azure_route_case("/audio/translations", true, false).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_azure_translations_entra_uses_native_v1_route() {
+        azure_route_case("/audio/translations", true, true).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_azure_generation_sse_api_key_uses_native_v1_route() {
+        azure_route_case("/images/generations", false, false).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_azure_generation_sse_entra_uses_native_v1_route() {
+        azure_route_case("/images/generations", false, true).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_azure_edits_json_api_key_uses_native_v1_route() {
+        azure_route_case("/images/edits", false, false).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_azure_edits_json_entra_uses_native_v1_route() {
+        azure_route_case("/images/edits", false, true).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_azure_edits_multipart_sse_api_key_uses_native_v1_route() {
+        azure_route_case("/images/edits", true, false).await;
+    }
+
+    #[tokio::test]
+    async fn compat_media_azure_edits_multipart_sse_entra_uses_native_v1_route() {
+        azure_route_case("/images/edits", true, true).await;
     }
 }

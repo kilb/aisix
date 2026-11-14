@@ -435,6 +435,8 @@ pub struct ProxyStateInner {
     /// to ask: a resources file, or managed mode without a certificate
     /// bundle.
     pub(crate) account: Option<Arc<crate::account::AccountClient>>,
+    /// 原生对象归属由托管控制面裁决；文件模式不以本地缓存冒充持久归属。
+    pub native_objects: Option<Arc<dyn crate::native_api::registry::NativeObjectRegistry>>,
 }
 
 impl std::ops::Deref for ProxyState {
@@ -606,6 +608,7 @@ impl ProxyState {
             default_timeouts: crate::routing::TimeoutDefaults::default(),
             platform: None,
             account: None,
+            native_objects: None,
         })
     }
 
@@ -671,6 +674,7 @@ impl ProxyState {
             default_timeouts: crate::routing::TimeoutDefaults::default(),
             platform: None,
             account: None,
+            native_objects: None,
         })
     }
 
@@ -760,6 +764,7 @@ impl ProxyState {
             default_timeouts: crate::routing::TimeoutDefaults::default(),
             platform: None,
             account: None,
+            native_objects: None,
         })
     }
 
@@ -777,6 +782,15 @@ impl ProxyState {
     /// Install the account lookups' client, built at startup in managed mode.
     pub fn with_account(mut self, client: Arc<crate::account::AccountClient>) -> Self {
         Arc::make_mut(&mut self.inner).account = Some(client);
+        self
+    }
+
+    /// 安装使用托管连接的原生对象归属客户端。
+    pub fn with_native_objects(
+        mut self,
+        registry: Arc<dyn crate::native_api::registry::NativeObjectRegistry>,
+    ) -> Self {
+        Arc::make_mut(&mut self.inner).native_objects = Some(registry);
         self
     }
 

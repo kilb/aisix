@@ -69,11 +69,9 @@ use crate::resources::Kind;
 use crate::tenants::{self, TenantRow, TenantStatus};
 use crate::AppState;
 
-/// The endpoint families a customer's key may call in the first phase:
-/// chat and legacy completions, messages and their token count, responses,
-/// embeddings and the model list, named as `aisix_core::models::EndpointFamily`
-/// names them.
-pub const FIRST_PHASE_ENDPOINTS: [&str; 7] = [
+/// 客户密钥明确开放已实现的模型接口；工具与透传仍关闭。
+/// 每次扩展同时提升 KEY_DOC_VERSION，并经兼容门槛追平已有密钥。
+pub const FIRST_PHASE_ENDPOINTS: [&str; 18] = [
     "chat_completions",
     "completions",
     "messages",
@@ -81,6 +79,17 @@ pub const FIRST_PHASE_ENDPOINTS: [&str; 7] = [
     "responses",
     "embeddings",
     "models",
+    "images",
+    "audio",
+    "videos",
+    "rerank",
+    "decisions",
+    "realtime",
+    "files",
+    "batches",
+    "fine_tuning",
+    "moderations",
+    "content_provenance_checks",
 ];
 
 /// What every minted key starts with.
@@ -379,7 +388,7 @@ pub(crate) async fn all_live(conn: &mut PgConnection) -> Result<Vec<KeyRow>, Api
 /// routes to that group alone, and nothing else: `[<its name>]`. Without one
 /// it keeps the old rule — its own override when it sets some, the tenant's
 /// otherwise, which is none for the internal tenant, so every upstream.
-fn effective_groups(t: &TenantRow, k: &KeyRow) -> Vec<String> {
+pub(crate) fn effective_groups(t: &TenantRow, k: &KeyRow) -> Vec<String> {
     if let Some(group) = &k.group {
         return vec![group.name.clone()];
     }
@@ -426,7 +435,7 @@ fn effective_limits(t: &TenantRow, k: &KeyRow) -> KeyLimits {
 /// side or by an operator, its tenant not active, its member no longer
 /// holding keys (`member_active` false), or a customer key closed for a
 /// group reason ([`closed_for_group`]).
-fn effective_disabled(t: &TenantRow, k: &KeyRow, member_active: bool) -> bool {
+pub(crate) fn effective_disabled(t: &TenantRow, k: &KeyRow, member_active: bool) -> bool {
     k.disabled
         || k.operator_disabled
         || t.status != TenantStatus::Active
@@ -447,7 +456,8 @@ fn effective_disabled(t: &TenantRow, k: &KeyRow, member_active: bool) -> bool {
 /// live public models.
 ///
 /// 4：客户密钥增加 legacy completions，已有 live key 在启动和定期维护时追平。
-pub const KEY_DOC_VERSION: i32 = 4;
+/// 5：开放已隔离的模型数据面族；滚动升级期间保留旧列表供安全收紧。
+pub const KEY_DOC_VERSION: i32 = 5;
 
 /// The gateway `api_keys` document of key `k` of tenant `t`, whose member,
 /// if it has one, is `member_active`: neither disabled nor removed, and in
@@ -536,7 +546,7 @@ async fn select(
 
 /// The live key `id`, within the tenant and among the member's keys when
 /// they are given; `404 not_found` otherwise, whatever the reason.
-async fn live_key(
+pub(crate) async fn live_key(
     conn: &mut PgConnection,
     id: Uuid,
     tenant_id: Option<Uuid>,
@@ -598,9 +608,39 @@ async fn project(
     k: &KeyRow,
     member_active: bool,
     version: i32,
+    defer_endpoint_upgrade: bool,
 ) -> Result<(), ApiError> {
-    let doc = build_key_doc(t, k, member_active);
-    tenants::put(&mut *conn, ctx, Kind::ApiKeys, k.id, &doc, &owner(k.id)).await?;
+    let mut doc = build_key_doc(t, k, member_active);
+    if let Err(error) = tenants::put(&mut *conn, ctx, Kind::ApiKeys, k.id, &doc, &owner(k.id)).await
+    {
+        if !defer_endpoint_upgrade || t.is_internal || !compat::refused(&error) {
+            return Err(error);
+        }
+        // 普通修改不能因附带的新族而阻止收紧；保留旧列表后仍走完整校验。
+        // 显式追平不走此分支，升级后由 catch_up 补齐且推进文档版本。
+        let Some(stored) = crate::resources::store::get(&mut *conn, Kind::ApiKeys, k.id)
+            .await?
+            .filter(|row| !row.deleted)
+        else {
+            return Err(error);
+        };
+        let Some(before) = stored
+            .doc
+            .get("allowed_endpoints")
+            .and_then(Value::as_array)
+        else {
+            return Err(error);
+        };
+        let Some(after) = doc.get("allowed_endpoints").and_then(Value::as_array) else {
+            return Err(error);
+        };
+        if before == after || !before.iter().all(|family| after.contains(family)) {
+            return Err(error);
+        }
+        doc["allowed_endpoints"] = Value::Array(before.clone());
+        tenants::put(&mut *conn, ctx, Kind::ApiKeys, k.id, &doc, &owner(k.id)).await?;
+        return Ok(());
+    }
     sqlx::query("UPDATE tenant_keys SET doc_version = $2 WHERE id = $1 AND doc_version <> $2")
         .bind(k.id)
         .bind(version)
@@ -621,7 +661,7 @@ pub async fn reproject_tenants(
     tenants: &[TenantRow],
 ) -> Result<(), ApiError> {
     for tenant in tenants {
-        reproject_tenant_at(&mut *conn, ctx, tenant.id, KEY_DOC_VERSION).await?;
+        reproject_tenant_at(&mut *conn, ctx, tenant.id, KEY_DOC_VERSION, true).await?;
     }
     Ok(())
 }
@@ -634,7 +674,7 @@ pub async fn reproject_tenant(
     ctx: &WriteCtx,
     tenant_id: Uuid,
 ) -> Result<(), ApiError> {
-    reproject_tenant_at(conn, ctx, tenant_id, KEY_DOC_VERSION).await
+    reproject_tenant_at(conn, ctx, tenant_id, KEY_DOC_VERSION, true).await
 }
 
 /// [`reproject_tenant`], recording the documents as written in shape
@@ -644,12 +684,22 @@ async fn reproject_tenant_at(
     ctx: &WriteCtx,
     tenant_id: Uuid,
     version: i32,
+    defer_endpoint_upgrade: bool,
 ) -> Result<(), ApiError> {
     let tenant = tenants::lock(&mut *conn, tenant_id).await?;
     let inactive = inactive_members(&mut *conn, tenant_id).await?;
     for key in select(&mut *conn, None, Some(tenant_id), None).await? {
         let active = key.member_id.is_none_or(|m| !inactive.contains(&m));
-        project(&mut *conn, ctx, &tenant, &key, active, version).await?;
+        project(
+            &mut *conn,
+            ctx,
+            &tenant,
+            &key,
+            active,
+            version,
+            defer_endpoint_upgrade,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -671,7 +721,16 @@ pub async fn reproject_member(
     let tenant = tenants::lock(&mut *conn, tenant_id).await?;
     let active = member_active(&mut *conn, Some(member_id)).await?;
     for key in select(&mut *conn, None, Some(tenant_id), Some(member_id)).await? {
-        project(&mut *conn, ctx, &tenant, &key, active, KEY_DOC_VERSION).await?;
+        project(
+            &mut *conn,
+            ctx,
+            &tenant,
+            &key,
+            active,
+            KEY_DOC_VERSION,
+            true,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -755,7 +814,7 @@ pub async fn catch_up(db: &Db, ctx: &WriteCtx, version: i32) -> Result<CatchUp, 
             .tx(move |conn| {
                 async move {
                     tenants::lock(&mut *conn, tenant_id).await?;
-                    reproject_tenant_at(&mut *conn, &ctx, tenant_id, version).await
+                    reproject_tenant_at(&mut *conn, &ctx, tenant_id, version, false).await
                 }
                 .boxed()
             })
@@ -1182,7 +1241,7 @@ async fn create_key(
     .map_err(DbError::from)?;
     let key = raw.into_row()?;
     let active = member_active(&mut *conn, key.member_id).await?;
-    project(&mut *conn, ctx, t, &key, active, KEY_DOC_VERSION).await?;
+    project(&mut *conn, ctx, t, &key, active, KEY_DOC_VERSION, true).await?;
     audit::record(
         conn,
         audit_entry(
@@ -1246,7 +1305,7 @@ async fn update_key(
     .map_err(DbError::from)?;
     let key = raw.into_row()?;
     let active = member_active(&mut *conn, key.member_id).await?;
-    project(&mut *conn, ctx, t, &key, active, KEY_DOC_VERSION).await?;
+    project(&mut *conn, ctx, t, &key, active, KEY_DOC_VERSION, true).await?;
     audit::record(conn, audit_entry(by, "key.update", &key, detail)).await?;
     Ok(key)
 }
@@ -2189,6 +2248,17 @@ mod tests {
                 EndpointFamily::Responses,
                 EndpointFamily::Embeddings,
                 EndpointFamily::Models,
+                EndpointFamily::Images,
+                EndpointFamily::Audio,
+                EndpointFamily::Videos,
+                EndpointFamily::Rerank,
+                EndpointFamily::Decisions,
+                EndpointFamily::Realtime,
+                EndpointFamily::Files,
+                EndpointFamily::Batches,
+                EndpointFamily::FineTuning,
+                EndpointFamily::Moderations,
+                EndpointFamily::ContentProvenanceChecks,
             ]
         );
     }

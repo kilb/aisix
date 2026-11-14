@@ -294,6 +294,7 @@ mod tests {
 
     fn sample_response() -> ChatResponse {
         ChatResponse {
+            native_envelope: None,
             logprobs: None,
             more_choices: Vec::new(),
             id: "cmpl-1".into(),

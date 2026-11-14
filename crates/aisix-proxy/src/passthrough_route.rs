@@ -1123,7 +1123,20 @@ async fn dispatch(
     // — that belongs to `downstream_latency_ms`, which runs from `started`.
     let attempt_started = Instant::now();
     crate::attribution::note_upstream_wait_begin();
-    let send_fut = builder.send();
+    let send_fut = aisix_gateway::upstream_io::send(
+        builder,
+        match protocol {
+            PassthroughProtocol::Raw => aisix_gateway::upstream_io::Protocol::Unknown,
+            PassthroughProtocol::OpenaiChat => aisix_gateway::upstream_io::Protocol::Chat,
+            PassthroughProtocol::AnthropicMessages => {
+                aisix_gateway::upstream_io::Protocol::Messages
+            }
+            PassthroughProtocol::OpenaiCompletions => {
+                aisix_gateway::upstream_io::Protocol::Completions
+            }
+            PassthroughProtocol::OpenaiResponses => aisix_gateway::upstream_io::Protocol::Responses,
+        },
+    );
     let sent = match exchange_timeout {
         Some(d) => match tokio::time::timeout(d, send_fut).await {
             Ok(r) => r,
@@ -1191,6 +1204,7 @@ async fn dispatch(
         attempt_started,
         status: status.as_u16(),
         usage: None,
+        anthropic_usage: Default::default(),
         labelled_usage: None,
         service_tier: None,
         requested_model,
@@ -1369,6 +1383,7 @@ async fn dispatch(
         };
         if let Some(text) = text {
             let synth = aisix_gateway::ChatResponse {
+                native_envelope: None,
                 logprobs: None,
                 more_choices: Vec::new(),
                 id: String::new(),
@@ -3892,6 +3907,7 @@ struct PassthroughUsage {
     completion_tokens: u32,
     cached_prompt_tokens: u32,
     cache_write_tokens: Option<u32>,
+    cache_usage_reported: Option<bool>,
     modality: aisix_gateway::ModalityTokens,
     cache_creation_ttl: aisix_gateway::CacheCreationTtl,
     reasoning_tokens: u32,
@@ -3911,6 +3927,7 @@ impl PassthroughUsage {
             completion_tokens: u.completion_tokens,
             cached_prompt_tokens: u.cached_prompt_tokens,
             cache_write_tokens: u.cache_write_tokens,
+            cache_usage_reported: u.cache_usage_reported().filter(|reported| *reported),
             modality: u.modality,
             cache_creation_ttl: u.cache_creation_ttl,
             reasoning_tokens: u.reasoning_tokens,
@@ -3933,6 +3950,7 @@ impl PassthroughUsage {
         self.completion_tokens = self.completion_tokens.max(other.completion_tokens);
         self.cached_prompt_tokens = self.cached_prompt_tokens.max(other.cached_prompt_tokens);
         self.cache_write_tokens = self.cache_write_tokens.max(other.cache_write_tokens);
+        self.cache_usage_reported = self.cache_usage_reported.max(other.cache_usage_reported);
         self.modality = self.modality.max_fieldwise(&other.modality);
         self.cache_creation_ttl = self
             .cache_creation_ttl
@@ -3968,7 +3986,12 @@ fn observe_frame_usage(
     telemetry: &mut RouteTelemetry,
     frame: &[u8],
 ) {
-    let (_, usage, tier, labelled) = frame_parts_and_tier(protocol, telemetry.metering, frame);
+    let (_, usage, tier, labelled) = frame_parts_and_tier_with_usage(
+        protocol,
+        telemetry.metering,
+        frame,
+        Some(&mut telemetry.anthropic_usage),
+    );
     if let Some(u) = labelled {
         merge_usage(&mut telemetry.labelled_usage, u);
     }
@@ -4156,6 +4179,7 @@ fn dashscope_native_usage(
         prompt_tokens: prompt.unwrap_or(0),
         completion_tokens: completion.unwrap_or(0),
         cached_prompt_tokens: cached.unwrap_or(0),
+        cache_usage_reported: cached.map(|_| true),
         reasoning_tokens: reasoning.unwrap_or(0),
         upstream_total_tokens: flat("total_tokens"),
         ..PassthroughUsage::default()
@@ -4196,6 +4220,9 @@ fn agent_token_usage(usage: &serde_json::Value) -> Option<PassthroughUsage> {
         completion_tokens: completion.unwrap_or(0),
         cached_prompt_tokens: num("cache_read_input_tokens").unwrap_or(0),
         cache_write_tokens: num("cache_creation_input_tokens"),
+        cache_usage_reported: (num("cache_read_input_tokens").is_some()
+            || num("cache_creation_input_tokens").is_some())
+        .then_some(true),
         reasoning_tokens: num("reasoning_tokens").unwrap_or(0),
         upstream_total_tokens: num("total_tokens"),
         ..PassthroughUsage::default()
@@ -6082,10 +6109,25 @@ fn frame_parts(
 /// frame the server labelled a usage report: what the stream is metered
 /// with only if the typed parser read no usage on any of its frames, never
 /// added to usage it did read ([`RouteTelemetry::labelled_usage`]).
+#[cfg(test)]
 fn frame_parts_and_tier(
     protocol: PassthroughProtocol,
     metering: Metering,
     frame: &[u8],
+) -> (
+    crate::held_content::Parts,
+    Option<PassthroughUsage>,
+    Option<String>,
+    Option<PassthroughUsage>,
+) {
+    frame_parts_and_tier_with_usage(protocol, metering, frame, None)
+}
+
+fn frame_parts_and_tier_with_usage(
+    protocol: PassthroughProtocol,
+    metering: Metering,
+    frame: &[u8],
+    anthropic_usage: Option<&mut aisix_provider_anthropic::wire::AnthropicUsageAccumulator>,
 ) -> (
     crate::held_content::Parts,
     Option<PassthroughUsage>,
@@ -6188,8 +6230,17 @@ fn frame_parts_and_tier(
         }
         let report = match metering {
             Metering::Chat | Metering::Anthropic => {
-                match crate::messages::anthropic_stream_usage_stats(&v) {
-                    Some(stats) => Some(PassthroughUsage::from_stats(&stats)),
+                match crate::messages::anthropic_event_usage(&v) {
+                    Some(usage) => {
+                        if let Some(acc) = anthropic_usage {
+                            acc.update(usage);
+                            Some(PassthroughUsage::from_stats(&acc.stats()))
+                        } else {
+                            crate::messages::anthropic_stream_usage_stats(&v)
+                                .as_ref()
+                                .map(PassthroughUsage::from_stats)
+                        }
+                    }
                     None => v.get("usage").and_then(openai_chat_usage),
                 }
             }
@@ -6645,7 +6696,7 @@ fn stream_response(
                     None => frame,
                 };
                 let (parts, usage, tier, labelled) =
-                    frame_parts_and_tier(protocol, telemetry.metering, &frame);
+                    frame_parts_and_tier_with_usage(protocol, telemetry.metering, &frame, Some(&mut telemetry.anthropic_usage));
                 if let Some(u) = labelled {
                     merge_usage(&mut telemetry.labelled_usage, u);
                 }
@@ -7024,7 +7075,7 @@ fn stream_response(
                     anthropic = anthropic_stream_frame(&rest);
                 }
                 let (parts, usage, tier, labelled) =
-                    frame_parts_and_tier(protocol, telemetry.metering, &rest);
+                    frame_parts_and_tier_with_usage(protocol, telemetry.metering, &rest, Some(&mut telemetry.anthropic_usage));
                 if let Some(u) = labelled {
                     merge_usage(&mut telemetry.labelled_usage, u);
                 }
@@ -7340,6 +7391,7 @@ async fn scan_output(
 ) -> aisix_guardrails::GuardrailVerdict {
     use aisix_guardrails::Guardrail as _;
     let synth = aisix_gateway::ChatResponse {
+        native_envelope: None,
         logprobs: None,
         more_choices: Vec::new(),
         id: String::new(),
@@ -7450,6 +7502,8 @@ struct RouteTelemetry {
     /// Every token dimension the exchange reported, accumulated field-wise
     /// across the response (buffered) or its frames (streamed).
     usage: Option<PassthroughUsage>,
+    // Anthropic 的压缩迭代与顶层累计值需要独立跨帧保留。
+    anthropic_usage: aisix_provider_anthropic::wire::AnthropicUsageAccumulator,
     /// What server-labelled usage frames (`event: token_usage`) reported on
     /// a stream whose protocol was detected. The stream is metered with it
     /// only when the protocol's own parser read no usage at all.
@@ -7765,6 +7819,7 @@ impl RouteTelemetry {
             completion_tokens: usage.completion_tokens,
             cached_prompt_tokens: usage.cached_prompt_tokens,
             cache_write_tokens: usage.cache_write_tokens,
+            cache_usage_reported: usage.cache_usage_reported,
             modality_tokens: usage.modality,
             cache_creation_ttl: usage.cache_creation_ttl,
             reasoning_tokens: usage.reasoning_tokens,
@@ -7987,9 +8042,62 @@ fn emit_access_log(
         response_body_bytes: None,
     });
 }
-
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn compat_claude_native_passthrough_compaction_later_partial() {
+        use aisix_obs::UsageSink;
+        let upstream = MockServer::builder().start().await;
+        let events = [
+            serde_json::json!({"type":"message_start","message":{"id":"msg_compact","model":"claude-upstream","usage":{"input_tokens":23,"output_tokens":0}}}),
+            serde_json::json!({"type":"message_delta","usage":{"input_tokens":23,"output_tokens":5,"iterations":[{"type":"message","input_tokens":23,"output_tokens":5},{"type":"compaction","input_tokens":100,"output_tokens":7,"cache_read_input_tokens":80,"cache_creation_input_tokens":10}]}}),
+            serde_json::json!({"type":"message_delta","usage":{"input_tokens":30,"output_tokens":6}}),
+            serde_json::json!({"type":"message_stop"}),
+        ];
+        let sse = events
+            .iter()
+            .map(|v| format!("event: {}\ndata: {v}\n\n", v["type"].as_str().unwrap()))
+            .collect::<String>();
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse.clone(), "text/event-stream"))
+            .mount(&upstream)
+            .await;
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(provider_key_entry("http://unused"));
+        snap.apikeys.insert(apikey_entry("sk-caller", Some(&["*"])));
+        snap.passthrough_routes
+            .insert(inject_route(&upstream.uri()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), Arc::new(Hub::new()), &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let mut req = relay_request("/passthrough/openai/v1/messages");
+        req.headers_mut()
+            .insert("anthropic-version", "2023-06-01".parse().unwrap());
+        let response = crate::build_router(state).oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        assert_eq!(&bytes[..], sse.as_bytes());
+        let row = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                row.prompt_tokens,
+                row.completion_tokens,
+                row.cache_read_tokens,
+                row.cache_creation_tokens,
+                row.total_tokens
+            ),
+            (130, 13, 80, 10, 0)
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
     /// A frame cap the splitter tests can outgrow cheaply.
     const MAX_HELD_STREAM_BYTES: usize = 1024 * 1024;
 
@@ -9230,6 +9338,7 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
                 prompt_tokens: 100,
                 completion_tokens: 20,
                 cached_prompt_tokens: 80,
+                cache_usage_reported: Some(true),
                 reasoning_tokens: 12,
                 ..Default::default()
             })
@@ -9248,6 +9357,7 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
                 prompt_tokens: 30,
                 completion_tokens: 9,
                 cached_prompt_tokens: 25,
+                cache_usage_reported: Some(true),
                 reasoning_tokens: 4,
                 ..Default::default()
             })
@@ -9266,7 +9376,9 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
                 prompt_tokens: 11,
                 completion_tokens: 5,
                 cache_creation_tokens: 300,
+                cache_usage_reported: Some(true),
                 cache_read_tokens: 1200,
+
                 ..Default::default()
             })
         );
@@ -9305,6 +9417,7 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
                 prompt_tokens: 14603,
                 completion_tokens: 8,
                 cached_prompt_tokens: 14272,
+                cache_usage_reported: Some(true),
                 cache_write_tokens: Some(0),
                 reasoning_tokens: 8,
                 upstream_total_tokens: Some(14611),
@@ -9342,7 +9455,9 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
                 prompt_tokens: 12,
                 completion_tokens: 7,
                 cache_creation_tokens: 300,
+                cache_usage_reported: Some(true),
                 cache_read_tokens: 1200,
+
                 ..Default::default()
             }
         );
@@ -9540,6 +9655,7 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
             prompt_tokens: 10,
             completion_tokens: 4,
             cache_read_tokens: 100,
+            cache_usage_reported: Some(true),
             ..Default::default()
         };
         // A repeat of a cumulative usage object, and a partial one, are both
@@ -9557,6 +9673,7 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
                 completion_tokens: 9,
                 reasoning_tokens: 3,
                 cache_read_tokens: 100,
+                cache_usage_reported: Some(true),
                 ..Default::default()
             }
         );
@@ -11538,6 +11655,7 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
             usage_for(PassthroughProtocol::OpenaiChat, None, openai),
             Some(PassthroughUsage {
                 cached_prompt_tokens: 40,
+                cache_usage_reported: Some(true),
                 upstream_total_tokens: Some(52),
                 ..usage_dims(50, 2)
             })
@@ -11545,7 +11663,9 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
         let anthropic = br#"{"type":"message","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":9,"output_tokens":4,"cache_creation_input_tokens":100,"cache_read_input_tokens":800}}"#;
         let additive = Some(PassthroughUsage {
             cache_creation_tokens: 100,
+            cache_usage_reported: Some(true),
             cache_read_tokens: 800,
+
             ..usage_dims(9, 4)
         });
         // An Anthropic reply is Anthropic usage whichever hint reached it.
@@ -11562,6 +11682,7 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
             usage_for(PassthroughProtocol::AnthropicMessages, None, bare),
             Some(PassthroughUsage {
                 cache_read_tokens: 800,
+                cache_usage_reported: Some(true),
                 ..usage_dims(9, 4)
             })
         );
@@ -11752,6 +11873,7 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
             usage(cached),
             Some(PassthroughUsage {
                 cached_prompt_tokens: 100,
+                cache_usage_reported: Some(true),
                 reasoning_tokens: 20,
                 ..totalled(120, 30, 150)
             })

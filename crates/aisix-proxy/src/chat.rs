@@ -16,6 +16,7 @@
 //!    line. Errors surface via [`ProxyError`] which carries the right
 //!    status, error type, and (for rate-limits) Retry-After.
 
+use crate::request_json::Json;
 use aisix_cache::{semantic_prompt_text, Cache, CacheKey, SemanticCacheStore};
 use aisix_core::models::CacheBackend;
 use aisix_core::models::SemanticCacheConfig;
@@ -29,7 +30,6 @@ use axum::extract::State;
 use axum::http::HeaderValue;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use futures::{Stream, StreamExt};
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -98,7 +98,7 @@ pub async fn chat_completions(
     // vs 422 sees different semantics here than it does talking to
     // api.openai.com. Same discriminate-then-map pattern as
     // messages.rs (#336) which already handles this for /v1/messages.
-    body: Result<Json<ChatFormat>, axum::extract::rejection::JsonRejection>,
+    body: Result<Json<ChatFormat>, crate::request_json::JsonRejection>,
 ) -> Response {
     let started = Instant::now();
     let method = "POST";
@@ -302,6 +302,7 @@ pub async fn chat_completions(
                     UsageExtras {
                         cached_prompt_tokens: success.cached_prompt_tokens,
                         cache_write_tokens: success.cache_write_tokens,
+                        cache_usage_reported: success.cache_usage_reported,
                         modality: success.modality,
                         cache_creation_ttl: success.cache_creation_ttl,
                         reasoning_tokens: success.reasoning_tokens,
@@ -338,6 +339,7 @@ pub async fn chat_completions(
                         applied_guardrails: applied_guardrails.clone(),
                         redacted_entity_counts: redaction_counts.clone(),
                         guardrail_monitor_hits: monitor_hits.clone(),
+                        io_audit: None,
                     },
                     success.cost_usd,
                     /* guardrail_blocked */ false,
@@ -644,8 +646,10 @@ pub async fn chat_completions(
                         c.prompt_tokens,
                         c.completion_tokens,
                         UsageExtras {
+                            io_audit: None,
                             cached_prompt_tokens: c.cached_prompt_tokens,
                             cache_write_tokens: c.cache_write_tokens,
+                            cache_usage_reported: c.cache_usage_reported,
                             modality: c.modality,
                             cache_creation_ttl: c.cache_creation_ttl,
                             reasoning_tokens: c.reasoning_tokens,
@@ -787,6 +791,7 @@ struct Success {
     /// standard prompt / completion rate when these are 0.
     cached_prompt_tokens: u32,
     cache_write_tokens: Option<u32>,
+    cache_usage_reported: Option<bool>,
     modality: aisix_gateway::ModalityTokens,
     cache_creation_ttl: aisix_gateway::CacheCreationTtl,
     reasoning_tokens: u32,
@@ -1568,6 +1573,7 @@ struct UpstreamCharge {
     usage_estimated: bool,
     cached_prompt_tokens: u32,
     cache_write_tokens: Option<u32>,
+    cache_usage_reported: Option<bool>,
     modality: aisix_gateway::ModalityTokens,
     cache_creation_ttl: aisix_gateway::CacheCreationTtl,
     reasoning_tokens: u32,
@@ -1697,7 +1703,9 @@ async fn dispatch(
 
     // Platform mode: nothing the request names may be an object stored
     // upstream for another tenant.
-    crate::stored_refs::refuse_in_chat(state.platform(), req).map_err(with_model)?;
+    crate::native_api::openai_uploads::admit_chat_files(state, snapshot, auth, client, req)
+        .await
+        .map_err(with_model)?;
 
     // Resolve the per-request guardrail chain from the index.
     // Done once here; `resolved_chain` is reused for both the input
@@ -2036,7 +2044,10 @@ async fn dispatch(
             target_id: String,
             provider_lc: String,
             pk_id: String,
+            stored_creation:
+                Option<Result<crate::native_api::openai_chat::CreationBinding, ProxyError>>,
             upstream: aisix_gateway::ChatChunkStream,
+            accounting_hold: crate::usage_attr::ObservedStreamTokensHold,
             idx: u32,
             kind: &'static str,
             /// When this attempt began. The end-of-stream UsageEvent
@@ -2206,6 +2217,40 @@ async fn dispatch(
                     target_model: &target_model,
                     model_id: &attempt.id,
                 });
+                // 原生存储的依赖与不可变账号边界必须在本次付费派发之前成立。
+                let attempt_stored_creation =
+                    match crate::native_api::openai_chat::capture_creation(
+                        state,
+                        req,
+                        &model_id,
+                        &attempt.id,
+                        model,
+                        &pk_entry.id,
+                        &pk_entry.value,
+                    )
+                    .transpose()
+                    {
+                        Ok(binding) => binding,
+                        Err(error) => {
+                            stream_routing.record(
+                                state,
+                                AttemptRecord {
+                                    index: idx,
+                                    kind,
+                                    target_model: target_model.clone(),
+                                    target_model_id: attempt.id.clone(),
+                                    provider_key_id: pk_entry.id.clone(),
+                                    status: error.status().as_u16(),
+                                    success: false,
+                                    error_class: crate::attempt::error_class(&error).to_owned(),
+                                    error_message: crate::attempt::gateway_error_message(&error),
+                                    latency_ms: 0,
+                                    dispatched: false,
+                                },
+                            );
+                            return Err(with_model(error).with_routing(stream_routing));
+                        }
+                    };
                 // least_busy: count this target as in-flight from the moment
                 // the attempt goes out, not from when it answers: a burst
                 // arriving during connect and time to first token must see
@@ -2220,6 +2265,12 @@ async fn dispatch(
                 // timeout, so the 200 commits directly and the SSE
                 // heartbeats cover the wait for the first token. The
                 // read-timeout wrapper is a no-op when the budget is None.
+                let mut accounting_keys = reservation.keys();
+                if let Some(member) = member_reservation.as_ref() {
+                    accounting_keys.extend(member.keys());
+                }
+                let mut accounting_hold =
+                    crate::usage_attr::ObservedStreamTokensHold::new(state, idx, accounting_keys);
                 let attempt_stream: Result<aisix_gateway::ChatChunkStream, BridgeError> =
                     // Mapped per attempt and handed over by value: a rewritten
                     // request is a whole-request copy, which the bridge drops
@@ -2231,6 +2282,7 @@ async fn dispatch(
                     {
                         Err(e) => Err(e),
                         Ok(up) => {
+                            accounting_hold.bind();
                             let up = crate::stream_timeout::with_read_timeout(up, stream_budget);
                             if timeouts.stream_configured {
                                 let mut up = up;
@@ -2282,7 +2334,9 @@ async fn dispatch(
                             target_id: attempt.id.clone(),
                             provider_lc: provider.to_ascii_lowercase(),
                             pk_id: pk_entry.id.clone(),
+                            stored_creation: attempt_stored_creation.map(Ok),
                             upstream,
+                            accounting_hold,
                             idx,
                             kind,
                             attempt_started,
@@ -2379,13 +2433,28 @@ async fn dispatch(
             target_id: winner_target_id,
             provider_lc: provider,
             pk_id,
+            stored_creation,
             upstream,
+            mut accounting_hold,
             idx: winner_idx,
             kind: winner_kind,
             attempt_started: winner_attempt_started,
             in_flight: in_flight_hold,
         } = won;
         let model = &model;
+        // 原生存储 ID 先固定到真实获胜账号，绑定失败也保留流尾的上游用量。
+        let holds_stored_creation = stored_creation.is_some();
+        let upstream = if let Some(binding) = stored_creation {
+            crate::native_api::openai_chat::bind_stream(
+                state.clone(),
+                auth.clone(),
+                client.clone(),
+                binding,
+                upstream,
+            )
+        } else {
+            upstream
+        };
         // Hold concurrency for the stream's full lifetime instead of
         // releasing it at handler return. RPM was already counted by
         // pre_commit; TPM is updated retroactively on stream-end by
@@ -2537,7 +2606,22 @@ async fn dispatch(
             aisix_gateway::chat::UsageStats::default(),
             state.platform().cloned(),
             Some(estimator),
+            holds_stored_creation,
             move |mut comp: StreamCompletion| {
+                let snap = state_for_telem.snapshot.load();
+                if crate::usage_attr::resolve_observed_stream_completion!(
+                    comp,
+                    winner_idx,
+                    web_fetch_requests
+                ) {
+                    comp.total_tokens = crate::usage_attr::total_tokens_with_cache(
+                        comp.prompt_tokens,
+                        comp.completion_tokens,
+                        comp.cache_creation_tokens,
+                        comp.cache_read_tokens,
+                    );
+                }
+                accounting_hold.disarm();
                 // Rate-limit accounting (TPM cap) for all layers.
                 limiter.add_tokens_post_stream_all(&post_stream_keys, comp.total_tokens);
                 // A stream can outlive several config generations, so the
@@ -2546,7 +2630,6 @@ async fn dispatch(
                 // ProviderKey lookup for the usage event, `record_usage`
                 // and the TTFT labels below, which each used to do their
                 // own.
-                let snap = state_for_telem.snapshot.load();
                 let pk = crate::usage_attr::ResolvedPk::resolve(&snap, &provider_key_id_for_telem);
                 // A stream the consumer abandoned mid-flight is reported as
                 // 499, one an upstream error ended as that error's status —
@@ -2617,8 +2700,10 @@ async fn dispatch(
                     comp.prompt_tokens,
                     comp.completion_tokens,
                     UsageExtras {
+                        io_audit: None,
                         cached_prompt_tokens: comp.cached_prompt_tokens,
                         cache_write_tokens: comp.cache_write_tokens,
+                        cache_usage_reported: comp.cache_usage_reported,
                         modality: comp.modality,
                         cache_creation_ttl: comp.cache_creation_ttl,
                         reasoning_tokens: comp.reasoning_tokens,
@@ -2790,6 +2875,7 @@ async fn dispatch(
             cost_usd: 0.0,
             cached_prompt_tokens: 0,
             cache_write_tokens: None,
+            cache_usage_reported: None,
             modality: Default::default(),
             cache_creation_ttl: Default::default(),
             reasoning_tokens: 0,
@@ -2885,7 +2971,12 @@ async fn dispatch(
     // Per-request bypass: standard `Cache-Control` request directives.
     // `no-cache` skips the read path (both layers) but still refreshes
     // the stored entry on success; `no-store` suppresses the writes.
-    let cc = cache_control_directives(client.headers.as_ref());
+    let mut cc = cache_control_directives(client.headers.as_ref());
+    // 存储对象是本次创建的身份，不能从响应缓存复用另一笔生成的 ID。
+    if crate::native_api::openai_chat::requested(req) {
+        cc.no_cache = true;
+        cc.no_store = true;
+    }
 
     // Cache lookup keyed on the *virtual* model name so a re-request
     // hits the cache regardless of which target served the original,
@@ -3128,6 +3219,7 @@ async fn dispatch(
                 // original event accurately.
                 let cached_prompt_tokens = cached.usage.cached_prompt_tokens;
                 let cache_write_tokens = cached.usage.cache_write_tokens;
+                let cache_usage_reported = Some(false);
                 let modality = cached.usage.modality;
                 // Not kept by every cache backend (see `UsageStats`), so no
                 // hit reports it, whichever backend served it.
@@ -3278,6 +3370,7 @@ async fn dispatch(
                     usage_estimated,
                     cached_prompt_tokens,
                     cache_write_tokens,
+                    cache_usage_reported,
                     modality,
                     cache_creation_ttl,
                     reasoning_tokens,
@@ -3357,6 +3450,7 @@ async fn dispatch(
     let mut last_reserve_reject: Option<ProxyError> = None;
     let mut chosen_provider: Option<String> = None;
     let mut chosen_provider_key_id: Option<String> = None;
+    let mut stored_creation = None;
     let mut chosen_upstream_model: Option<String> = None;
     // Display name of the target whose attempt finally succeeded. Used
     // to populate the `x-aisix-served-by` response header for routing
@@ -3541,6 +3635,39 @@ async fn dispatch(
                 model_id: &attempt.id,
             });
 
+            // 在本次付费派发之前完成原生存储预检，并把同一账号边界交给获胜结果。
+            let attempt_stored_creation = match crate::native_api::openai_chat::capture_creation(
+                state,
+                req,
+                &model_id,
+                &attempt.id,
+                model,
+                &pk_entry.id,
+                &pk_entry.value,
+            )
+            .transpose()
+            {
+                Ok(binding) => binding,
+                Err(error) => {
+                    routing.record(
+                        state,
+                        AttemptRecord {
+                            index: attempt_index,
+                            kind,
+                            target_model: target_model.clone(),
+                            target_model_id: attempt.id.clone(),
+                            provider_key_id: pk_entry.id.clone(),
+                            status: error.status().as_u16(),
+                            success: false,
+                            error_class: crate::attempt::error_class(&error).to_owned(),
+                            error_message: crate::attempt::gateway_error_message(&error),
+                            latency_ms: 0,
+                            dispatched: false,
+                        },
+                    );
+                    return Err(with_model(error).with_routing(routing));
+                }
+            };
             let attempt_started = Instant::now();
             // least_busy: count this target as in-flight for the upstream
             // call. The response is fully buffered, so the target is done
@@ -3566,6 +3693,7 @@ async fn dispatch(
                         .record_latency(&attempt.id, attempt_latency_ms);
                     chosen_provider = Some(provider.to_ascii_lowercase());
                     chosen_provider_key_id = Some(pk_entry.id.clone());
+                    stored_creation = attempt_stored_creation.map(Ok);
                     chosen_upstream_model =
                         Some(model.upstream_model().unwrap_or("unknown").to_string());
                     chosen_target_display_name = Some(model.display_name.clone());
@@ -3714,6 +3842,7 @@ async fn dispatch(
     // on the Success struct for telemetry.
     let cached_prompt_tokens = upstream.usage.cached_prompt_tokens;
     let cache_write_tokens = upstream.usage.cache_write_tokens;
+    let cache_usage_reported = upstream.usage.cache_usage_reported();
     let modality = upstream.usage.modality;
     let cache_creation_ttl = upstream.usage.cache_creation_ttl;
     let reasoning_tokens = upstream.usage.reasoning_tokens;
@@ -3778,6 +3907,58 @@ async fn dispatch(
     // the chain lets the answer through.
     reservation.owe_tokens(total);
 
+    if let Some(binding) = stored_creation {
+        let registered = match binding {
+            Ok(binding) => {
+                crate::native_api::openai_chat::register_created(
+                    state,
+                    auth,
+                    client,
+                    &binding,
+                    &upstream.id,
+                    upstream
+                        .native_envelope
+                        .as_ref()
+                        .and_then(|envelope| envelope.created),
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        if let Err(error) = registered {
+            // 上游已经回答，依赖故障不得重派，也不能丢失已发生的计量。
+            let charge = UpstreamCharge {
+                provider_key_id: provider_key_id.clone(),
+                prompt_tokens: prompt_tokens_u32,
+                completion_tokens: completion_tokens_u32,
+                usage_estimated,
+                cached_prompt_tokens,
+                cache_write_tokens,
+                cache_usage_reported,
+                modality,
+                cache_creation_ttl,
+                reasoning_tokens,
+                upstream_total_tokens,
+                reasoning_folded_into_completion,
+                cache_creation_tokens,
+                cache_read_tokens,
+                web_search_requests,
+                web_fetch_requests,
+                provider_request_id: provider_request_id.clone(),
+                provider_model_version: provider_model_version.clone(),
+                service_tier: service_tier.clone(),
+                finish_reason: finish_reason.clone(),
+                bypass_reason: bypass_reason.clone().unwrap_or_default(),
+                cache_status,
+                routing: routing.clone(),
+            };
+            return Err(
+                DispatchFailure::new(Some(model_id.clone()), Some(charge), error)
+                    .with_routing(routing),
+            );
+        }
+    }
+
     let (output_verdict, hits) = resolved_chain
         .check_output_non_segment_observed(&upstream)
         .await;
@@ -3827,6 +4008,7 @@ async fn dispatch(
                 usage_estimated,
                 cached_prompt_tokens,
                 cache_write_tokens,
+                cache_usage_reported,
                 modality,
                 cache_creation_ttl,
                 reasoning_tokens,
@@ -4032,6 +4214,7 @@ async fn dispatch(
         usage_estimated,
         cached_prompt_tokens,
         cache_write_tokens,
+        cache_usage_reported,
         modality,
         cache_creation_ttl,
         reasoning_tokens,
@@ -4464,9 +4647,12 @@ async fn dispatch_ensemble(
         // what `upstream_ttft_ms` should be measured against — `started`
         // additionally covers the whole panel that ran before it.
         let judge_started = Instant::now();
-        let judge_stream = match judge_bridge
-            .chat_stream_cow(std::borrow::Cow::Owned(build_judge_req()), &judge_ctx)
-            .await
+        let judge_tap = aisix_gateway::response_tap::detached();
+        let judge_stream = match aisix_gateway::response_tap::scope(
+            Arc::clone(&judge_tap),
+            judge_bridge.chat_stream_cow(std::borrow::Cow::Owned(build_judge_req()), &judge_ctx),
+        )
+        .await
         {
             Ok(s) => s,
             // Judge connect failed AFTER the panel round-tripped: bill the
@@ -4474,16 +4660,19 @@ async fn dispatch_ensemble(
             // then surface the bridge error (5xx → 502, 4xx preserved).
             Err(be) => {
                 crate::attribution::settle_ensemble();
+                let mut judge_failed = judge_failure(&be, false, judge_started);
+                judge_failed.io_audit = judge_tap.capture().io.as_ref().map(|io| io.snapshot());
                 let failure = emit_panel_then_fail(
                     &panel,
                     &failed,
-                    Some(&judge_failure(&be, false, judge_started)),
+                    Some(&judge_failed),
                     ProxyError::Bridge(be),
                 );
                 reservation.commit_tokens(panel_total).await;
                 return Err(failure);
             }
         };
+        let judge_stream = ensemble_stream_with_tap(judge_stream, Arc::clone(&judge_tap));
 
         // The streamed judge estimator keys off `judge_model.upstream_model()`
         // directly (below), so resolve_sub's upstream_model is unused here.
@@ -4580,6 +4769,7 @@ async fn dispatch_ensemble(
             panel_usage_sum,
             state.platform().cloned(),
             Some(judge_estimator),
+            false,
             move |comp: StreamCompletion| {
                 // Fresh snapshot at stream end, shared by every emit in this
                 // closure (#941) — see the single-model streaming path.
@@ -4641,8 +4831,10 @@ async fn dispatch_ensemble(
                     comp.prompt_tokens,
                     comp.completion_tokens,
                     UsageExtras {
+                        io_audit: judge_tap.capture().io.as_ref().map(|io| io.snapshot()),
                         cached_prompt_tokens: comp.cached_prompt_tokens,
                         cache_write_tokens: comp.cache_write_tokens,
+                        cache_usage_reported: comp.cache_usage_reported,
                         modality: comp.modality,
                         cache_creation_ttl: comp.cache_creation_ttl,
                         reasoning_tokens: comp.reasoning_tokens,
@@ -4721,6 +4913,7 @@ async fn dispatch_ensemble(
             cost_usd: 0.0,
             cached_prompt_tokens: 0,
             cache_write_tokens: None,
+            cache_usage_reported: None,
             modality: Default::default(),
             cache_creation_ttl: Default::default(),
             reasoning_tokens: 0,
@@ -4797,7 +4990,7 @@ async fn dispatch_ensemble(
                 emit_panel_rows(
                     &panel,
                     &failed,
-                    judge_failed.as_ref(),
+                    judge_failed.as_deref(),
                     /* blocked */ false,
                     input_bypass,
                 );
@@ -4875,8 +5068,10 @@ async fn dispatch_ensemble(
             effective_judge.usage.prompt_tokens,
             effective_judge.usage.completion_tokens,
             UsageExtras {
+                io_audit: outcome.judge_io_audit.clone(),
                 cached_prompt_tokens: effective_judge.usage.cached_prompt_tokens,
                 cache_write_tokens: effective_judge.usage.cache_write_tokens,
+                cache_usage_reported: effective_judge.usage.cache_usage_reported(),
                 modality: effective_judge.usage.modality,
                 cache_creation_ttl: effective_judge.usage.cache_creation_ttl,
                 reasoning_tokens: effective_judge.usage.reasoning_tokens,
@@ -5049,6 +5244,7 @@ async fn dispatch_ensemble(
         usage_estimated: false,
         cached_prompt_tokens: metric_usage.cached_prompt_tokens,
         cache_write_tokens: metric_usage.cache_write_tokens,
+        cache_usage_reported: metric_usage.cache_usage_reported(),
         modality: metric_usage.modality,
         cache_creation_ttl: metric_usage.cache_creation_ttl,
         reasoning_tokens: metric_usage.reasoning_tokens,
@@ -5243,6 +5439,7 @@ fn emit_usage_event(
         total_tokens: extras.upstream_total_tokens,
         cached_prompt_tokens: extras.cached_prompt_tokens,
         cache_write_tokens: extras.cache_write_tokens,
+        cache_usage_reported: extras.cache_usage_reported,
         modality_tokens: extras.modality,
         cache_creation_ttl: extras.cache_creation_ttl,
         reasoning_tokens: extras.reasoning_tokens,
@@ -5310,11 +5507,13 @@ fn emit_usage_event(
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
         request_headers: client.request_headers.clone(),
+        io_audit: extras.io_audit,
         // MCP attribution does not apply to the chat path.
         ..Default::default()
     };
     event.reasoning_unfolded_from_completion =
         completion_tokens.saturating_sub(event.completion_tokens);
+    crate::usage_attr::resolve_observed_stream_event(&mut event, snap);
     crate::usage_attr::apply_caller_identity(&mut event, client.jwt.as_ref(), &client.caller);
     // Handler label "chat" matches the documented enumeration for
     // `aisix_usage_events_emitted_total` (#408). Keep `&'static str`
@@ -5435,8 +5634,10 @@ pub(crate) fn captured_request_json(req: &ChatFormat) -> String {
 /// streaming pre-Phase-2).
 #[derive(Default)]
 struct UsageExtras {
+    io_audit: Option<aisix_core::usage_io::UsageIoAudit>,
     cached_prompt_tokens: u32,
     cache_write_tokens: Option<u32>,
+    cache_usage_reported: Option<bool>,
     modality: aisix_gateway::ModalityTokens,
     cache_creation_ttl: aisix_gateway::CacheCreationTtl,
     reasoning_tokens: u32,
@@ -5540,10 +5741,50 @@ fn emit_failed_attempts(
     // stamped only on the event this call marks terminal.
     audit: &crate::usage_attr::GuardrailAudit,
 ) {
+    emit_failed_attempts_with_io(
+        state,
+        snap,
+        request_id,
+        requested_model,
+        api_key_id,
+        client,
+        applied_guardrails,
+        attempts,
+        terminal_last,
+        audit,
+        None,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_failed_attempts_with_io(
+    state: &ProxyState,
+    snap: &aisix_core::AisixSnapshot,
+    request_id: &str,
+    requested_model: &str,
+    api_key_id: &str,
+    client: &ClientContext,
+    applied_guardrails: &[AppliedGuardrail],
+    attempts: &[AttemptRecord],
+    terminal_last: bool,
+    audit: &crate::usage_attr::GuardrailAudit,
+    io_audit: Option<&aisix_core::usage_io::UsageIoAudit>,
+) {
     let last_failed = attempts.iter().rposition(|a| !a.success);
     for (i, rec) in attempts.iter().enumerate().filter(|(_, a)| !a.success) {
         // Each failed attempt hit its own target, hence its own key.
         let pk = crate::usage_attr::ResolvedPk::resolve(snap, &rec.provider_key_id);
+        crate::usage_attr::record_observed_stream_failure(
+            state,
+            snap,
+            "/v1/chat/completions",
+            requested_model,
+            &rec.target_model_id,
+            api_key_id,
+            rec.index,
+            client,
+            &pk,
+        );
         emit_usage_event(
             state,
             snap,
@@ -5559,6 +5800,7 @@ fn emit_failed_attempts(
             /* prompt_tokens */ 0,
             /* completion_tokens */ 0,
             UsageExtras {
+                io_audit: io_audit.cloned(),
                 attempt_index: rec.index,
                 attempt_kind: rec.kind.to_string(),
                 attempt_model: rec.target_model.clone(),
@@ -5703,6 +5945,7 @@ struct StreamCompletion {
     reasoning_folded_into_completion: u32,
     cached_prompt_tokens: u32,
     cache_write_tokens: Option<u32>,
+    cache_usage_reported: Option<bool>,
     modality: aisix_gateway::ModalityTokens,
     cache_creation_ttl: aisix_gateway::CacheCreationTtl,
     reasoning_tokens: u32,
@@ -5903,6 +6146,17 @@ fn subcall_target(snap: &AisixSnapshot, display_name: &str) -> (String, String, 
     }
 }
 
+// judge 流的延迟轮询仍绑定自己的观察与凭证上下文，不借用请求父 tap。
+fn ensemble_stream_with_tap(
+    mut upstream: aisix_gateway::ChatChunkStream,
+    tap: Arc<aisix_gateway::ResponseHeaderTap>,
+) -> aisix_gateway::ChatChunkStream {
+    futures::stream::poll_fn(move |cx| {
+        aisix_gateway::response_tap::sync_scope(&tap, || upstream.as_mut().poll_next(cx))
+    })
+    .boxed()
+}
+
 /// The request-scoped inputs every ensemble sub-call row carries, owned so
 /// they can outlive the dispatch frame (a stream's completion, a guard that
 /// fires on drop).
@@ -5928,7 +6182,7 @@ fn emit_failed_subcall(
     index: u32,
 ) {
     let (target_model_id, provider_key_id, _) = subcall_target(snap, &failure.model);
-    emit_failed_attempts(
+    emit_failed_attempts_with_io(
         state,
         snap,
         &ctx.request_id,
@@ -5951,6 +6205,7 @@ fn emit_failed_subcall(
         }],
         /* terminal_last */ false,
         &ctx.audit,
+        failure.io_audit.as_ref(),
     );
 }
 
@@ -5998,6 +6253,7 @@ struct EnsembleSubcall {
     usage: aisix_gateway::chat::UsageStats,
     usage_estimated: bool,
     service_tier: Option<String>,
+    io_audit: Option<aisix_core::usage_io::UsageIoAudit>,
 }
 
 impl EnsembleSubcall {
@@ -6011,6 +6267,7 @@ impl EnsembleSubcall {
             usage: outcome.effective_usage.clone(),
             usage_estimated: outcome.usage_estimated,
             service_tier: outcome.service_tier.clone(),
+            io_audit: outcome.io_audit.clone(),
         }
     }
 
@@ -6048,8 +6305,10 @@ impl EnsembleSubcall {
         bypass: &str,
     ) -> UsageExtras {
         UsageExtras {
+            io_audit: self.io_audit.clone(),
             cached_prompt_tokens: self.usage.cached_prompt_tokens,
             cache_write_tokens: self.usage.cache_write_tokens,
+            cache_usage_reported: self.usage.cache_usage_reported(),
             modality: self.usage.modality,
             cache_creation_ttl: self.usage.cache_creation_ttl,
             reasoning_tokens: self.usage.reasoning_tokens,
@@ -6620,6 +6879,8 @@ fn build_sse_stream<F>(
     // Token-estimation fallback context (#1074); see
     // `CompleteOnDrop::estimator`.
     estimator: Option<crate::token_estimate::Estimator>,
+    // 原生存储在归属绑定前保留真实输出；未交付不能抹掉已上报的付费用量。
+    holds_stored_creation: bool,
     on_complete: F,
 ) -> impl Stream<Item = Result<Event, Infallible>>
 where
@@ -6639,7 +6900,7 @@ where
         // why; tl;dr without this, async_stream! body code after a
         // yield only runs on consumer pulls.
         let mut guard = CompleteOnDrop {
-            slot: Some((on_complete, StreamCompletion::default())),
+            slot: Some((on_complete, StreamCompletion { held_output: holds_stored_creation, ..Default::default() })),
             delivered: delivered_for_drop,
             estimator,
         };
@@ -6754,6 +7015,8 @@ where
         let mut stream_id = crate::render::StreamId::default();
         let mut last_chunk_model = String::new();
         let mut last_chunk_tier = None;
+        let mut native_created = None;
+        let mut last_usage_envelope = None;
         // Render + serialise one held/live chunk into an SSE Event.
         // Serialisation of these plain structs can't realistically fail;
         // the Err arm mirrors the pre-hold-back defensive error frame.
@@ -6808,6 +7071,9 @@ where
                     }
                     if chunk.service_tier.is_some() {
                         last_chunk_tier.clone_from(&chunk.service_tier);
+                    }
+                    if let Some(created) = chunk.native_envelope.as_ref().and_then(|e| e.created) {
+                        native_created = Some(created);
                     }
                     let comp = guard.comp();
                     if !chunk.id.is_empty() {
@@ -6989,6 +7255,7 @@ where
                         comp.completion_tokens = acc.completion_tokens;
                         comp.total_tokens = acc.total_tokens as u64;
                         comp.cache_write_tokens = acc.cache_write_tokens;
+                        comp.cache_usage_reported = acc.cache_usage_reported();
                         comp.modality = acc.modality;
                         comp.cache_creation_ttl = acc.cache_creation_ttl;
                         comp.cached_prompt_tokens = acc.cached_prompt_tokens;
@@ -7015,9 +7282,14 @@ where
                     // usage-only chunk the gateway asked the upstream for
                     // (#790); the client sees the last report.
                     let mut chunk = chunk;
+                    let native_metadata = chunk.native_envelope.as_ref().is_some_and(|envelope| {
+                        envelope.extra.keys().any(|key| platform.is_none() || key != "system_fingerprint") || envelope.choice.as_ref()
+                            .is_some_and(|choice| !choice.extra.is_empty())
+                    });
                     let reported = chunk.accounting_usage.take().is_some();
                     let reported = match chunk.usage.take() {
                         Some(u) => {
+                            last_usage_envelope.clone_from(&chunk.native_envelope);
                             last_usage = Some(u);
                             true
                         }
@@ -7026,6 +7298,8 @@ where
                     if reported
                         && chunk.finish_reason.is_none()
                         && chunk.has_no_payload()
+                        && (!native_metadata || (client_requested_usage
+                            && chunk.native_envelope.as_ref().is_some_and(|e| e.choice.is_none())))
                     {
                         continue;
                     }
@@ -7036,6 +7310,7 @@ where
                     if platform.is_some()
                         && chunk.finish_reason.is_none()
                         && chunk.has_no_payload()
+                        && !native_metadata
                     {
                         continue;
                     }
@@ -7131,7 +7406,7 @@ where
                             if let Some(ctx) = output_guardrail.as_ref() {
                                 let synthesized = {
                                     let comp = guard.comp();
-                                    aisix_gateway::ChatResponse { logprobs: None, more_choices: Vec::new(),
+                                    aisix_gateway::ChatResponse { native_envelope: None, logprobs: None, more_choices: Vec::new(),
                                         id: comp.provider_request_id.clone(),
                                         model: comp.provider_model_version.clone(),
                                         // Fold tool-call text into the window
@@ -7317,7 +7592,13 @@ where
         }
         .filter(|_| client_requested_usage);
         if let (Some(final_usage), false) = (final_usage, errored) {
-            let chunk = aisix_gateway::ChatChunk { choice_index: 0, logprobs: None,
+            let mut native_envelope = last_usage_envelope.or_else(|| native_created.map(|created| {
+                aisix_gateway::chat::NativeChatEnvelope { created: Some(created), ..Default::default() }
+            }));
+            if let Some(envelope) = native_envelope.as_mut() {
+                envelope.choice = None;
+            }
+            let chunk = aisix_gateway::ChatChunk { native_envelope, choice_index: 0, logprobs: None,
                 id: std::mem::take(&mut last_chunk_id),
                 model: std::mem::take(&mut last_chunk_model),
                 delta: Default::default(),
@@ -7388,7 +7669,7 @@ where
                         .filter(|text| !text.is_empty());
                         let synthesized = {
                             let comp = guard.comp();
-                            aisix_gateway::ChatResponse { logprobs: None, more_choices: Vec::new(),
+                            aisix_gateway::ChatResponse { native_envelope: None, logprobs: None, more_choices: Vec::new(),
                                 id: comp.provider_request_id.clone(),
                                 model: comp.provider_model_version.clone(),
                                 message: aisix_gateway::ChatMessage::assistant(final_text),
@@ -7554,7 +7835,7 @@ where
                 } else {
                     format!("{content}\n{tc_part}")
                 };
-                let synthesized = aisix_gateway::ChatResponse { logprobs: None, more_choices: Vec::new(),
+                let synthesized = aisix_gateway::ChatResponse { native_envelope: None, logprobs: None, more_choices: Vec::new(),
                     id: guard.comp().provider_request_id.clone(),
                     model: guard.comp().provider_model_version.clone(),
                     message: aisix_gateway::ChatMessage::assistant(scan_text),
@@ -7578,7 +7859,7 @@ where
                 } else {
                     // Deltas past their bound: judge the tool-call text whole.
                     let tool_calls_whole = eos_tool_calls.is_full();
-                    let mut chunks = vec![aisix_gateway::ChatChunk { choice_index: 0, logprobs: None,
+                    let mut chunks = vec![aisix_gateway::ChatChunk { native_envelope: None, choice_index: 0, logprobs: None,
                         id: String::new(),
                         model: String::new(),
                         delta: aisix_gateway::ChatDelta {
@@ -7752,6 +8033,10 @@ pub(crate) fn error_frame_payload(error_type: &str, message: &str) -> String {
 }
 
 #[cfg(test)]
+#[path = "chat/ensemble_io_tests.rs"]
+mod ensemble_io_tests;
+
+#[cfg(test)]
 mod stream_output_scan_tests {
     use super::{build_sse_stream, StreamCompletion, StreamGuardrailContext};
     use aisix_gateway::{ChatChunk, ChatChunkStream, ChatDelta, ChatResponse};
@@ -7766,6 +8051,7 @@ mod stream_output_scan_tests {
 
     fn chunk(delta: ChatDelta) -> ChatChunk {
         ChatChunk {
+            native_envelope: None,
             id: "c".into(),
             model: "m".into(),
             delta,
@@ -7798,6 +8084,7 @@ mod stream_output_scan_tests {
             aisix_gateway::chat::UsageStats::default(),
             None,
             None,
+            false,
             move |completion| {
                 *out.lock().unwrap() = Some(completion);
             },
@@ -8043,6 +8330,7 @@ mod stream_output_scan_tests {
             aisix_gateway::chat::UsageStats::default(),
             None,
             None,
+            false,
             move |completion| {
                 *out.lock().unwrap() = Some(completion);
             },
@@ -8098,6 +8386,7 @@ mod stream_output_scan_tests {
                     vec![aisix_gateway::ChatMessage::user("a question".to_string())],
                 ))),
             )),
+            false,
             move |completion| {
                 *out.lock().unwrap() = Some(completion);
             },
@@ -8764,6 +9053,7 @@ mod complete_on_drop_tests {
         usage: UsageStats,
     ) -> aisix_gateway::chat::ChatResponse {
         aisix_gateway::chat::ChatResponse {
+            native_envelope: None,
             logprobs: None,
             more_choices: Vec::new(),
             id: "id".into(),
@@ -9059,6 +9349,7 @@ mod fail_open_capture_tests {
     #[tokio::test]
     async fn a_window_with_no_scannable_text_still_refuses_at_the_raw_bound() {
         let upstream = futures::stream::iter(vec![Ok(ChatChunk {
+            native_envelope: None,
             id: "chunk-1".into(),
             model: "upstream-model".into(),
             delta: ChatDelta {
@@ -9090,6 +9381,7 @@ mod fail_open_capture_tests {
             aisix_gateway::chat::UsageStats::default(),
             None,
             None,
+            false,
             move |completion| {
                 *captured_for_callback.lock().unwrap() = Some(completion);
             },
@@ -9164,6 +9456,7 @@ mod fail_open_capture_tests {
         for delta in deltas {
             let described = format!("{delta:?}");
             let upstream = futures::stream::iter(vec![Ok(ChatChunk {
+                native_envelope: None,
                 id: "chunk-1".into(),
                 model: "upstream-model".into(),
                 delta,
@@ -9192,6 +9485,7 @@ mod fail_open_capture_tests {
                 aisix_gateway::chat::UsageStats::default(),
                 None,
                 None,
+                false,
                 move |completion| {
                     *captured_for_callback.lock().unwrap() = Some(completion);
                 },
@@ -9208,6 +9502,7 @@ mod fail_open_capture_tests {
     async fn window_bypass_remains_capture_unsafe_after_later_allow() {
         let upstream = futures::stream::iter(vec![
             Ok(ChatChunk {
+                native_envelope: None,
                 id: "chunk-1".into(),
                 model: "upstream-model".into(),
                 delta: ChatDelta {
@@ -9222,6 +9517,7 @@ mod fail_open_capture_tests {
                 accounting_usage: None,
             }),
             Ok(ChatChunk {
+                native_envelope: None,
                 id: "chunk-2".into(),
                 model: "upstream-model".into(),
                 delta: ChatDelta {
@@ -9254,6 +9550,7 @@ mod fail_open_capture_tests {
             aisix_gateway::chat::UsageStats::default(),
             None,
             None,
+            false,
             move |completion| {
                 *captured_for_callback.lock().unwrap() = Some(completion);
             },
@@ -9270,6 +9567,7 @@ mod fail_open_capture_tests {
     #[tokio::test]
     async fn buffer_overflow_fail_open_releases_wire_but_suppresses_capture() {
         let upstream = futures::stream::iter(vec![Ok(ChatChunk {
+            native_envelope: None,
             id: "chunk-1".into(),
             model: "upstream-model".into(),
             delta: ChatDelta {
@@ -9301,6 +9599,7 @@ mod fail_open_capture_tests {
             aisix_gateway::chat::UsageStats::default(),
             None,
             None,
+            false,
             move |completion| {
                 *captured_for_callback.lock().unwrap() = Some(completion);
             },
@@ -9320,6 +9619,7 @@ mod fail_open_capture_tests {
     async fn upstream_error_survives_the_error_frame_yield() {
         let upstream = futures::stream::iter(vec![
             Ok(ChatChunk {
+                native_envelope: None,
                 id: "chunk-1".into(),
                 model: "upstream-model".into(),
                 delta: ChatDelta {
@@ -9353,6 +9653,7 @@ mod fail_open_capture_tests {
             aisix_gateway::chat::UsageStats::default(),
             None,
             None,
+            false,
             move |completion| {
                 *captured_for_callback.lock().unwrap() = Some(completion);
             },
@@ -9376,6 +9677,7 @@ mod fail_open_capture_tests {
     async fn cut_off_stream(guardrail: Option<StreamGuardrailContext>) -> StreamCompletion {
         let upstream = futures::stream::iter(vec![
             Ok(ChatChunk {
+                native_envelope: None,
                 id: "chunk-1".into(),
                 model: "upstream-model".into(),
                 delta: ChatDelta {
@@ -9409,6 +9711,7 @@ mod fail_open_capture_tests {
             aisix_gateway::chat::UsageStats::default(),
             None,
             None,
+            false,
             move |completion| {
                 *captured_for_callback.lock().unwrap() = Some(completion);
             },
@@ -9578,6 +9881,49 @@ mod platform_stream_tests {
         aisix_provider_openai::wire::stream_chunk_into_chat_chunks(raw, &mut Default::default())
     }
 
+    #[tokio::test]
+    async fn stream_completion_keeps_reported_zero_cache_presence() {
+        use futures::StreamExt;
+        for reported in [false, true] {
+            let mut usage =
+                serde_json::json!({"prompt_tokens":100,"completion_tokens":1,"total_tokens":101});
+            if reported {
+                usage["prompt_tokens_details"] = serde_json::json!({"cached_tokens":0});
+            }
+            let mut chunks = wire_chunks(serde_json::json!({"id":"x","model":"m","choices":[{
+                "index":0,"delta":{"content":"hi"},"finish_reason":"stop"
+            }]}));
+            chunks.extend(wire_chunks(
+                serde_json::json!({"id":"x","model":"m","choices":[],"usage":usage}),
+            ));
+            let captured = Arc::new(Mutex::new(None::<StreamCompletion>));
+            let out = Arc::clone(&captured);
+            let stream = build_sse_stream(
+                futures::stream::iter(chunks.into_iter().map(Ok)).boxed(),
+                1,
+                None,
+                Instant::now(),
+                Instant::now(),
+                "gw".into(),
+                None,
+                false,
+                aisix_gateway::UsageStats::default(),
+                None,
+                None,
+                false,
+                move |completion| {
+                    *out.lock().unwrap() = Some(completion);
+                },
+            );
+            axum::body::to_bytes(Sse::new(stream).into_response().into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let completion = captured.lock().unwrap().take().expect("流完成回调");
+            assert_eq!(completion.cached_prompt_tokens, 0);
+            assert_eq!(completion.cache_usage_reported, Some(reported));
+        }
+    }
+
     /// What the caller receives from `chunks`, as `data:` payloads.
     async fn payloads(
         chunks: Vec<ChatChunk>,
@@ -9598,6 +9944,7 @@ mod platform_stream_tests {
             aisix_gateway::chat::UsageStats::default(),
             platform,
             None,
+            false,
             move |completion| {
                 *out.lock().unwrap() = Some(completion);
             },
@@ -9611,14 +9958,9 @@ mod platform_stream_tests {
             .collect()
     }
 
-    /// One channel's stream opens on a frame with no choice (`choices: []`
-    /// beside its prompt filter results), which the OpenAI wire relays as a
-    /// chunk with an empty delta. Other channels never send it, so in
-    /// platform mode, where it would name the channel on every stream, a
-    /// chunk with nothing for the caller is dropped. Off platform mode it
-    /// is relayed as before.
+    // 过滤结果属于调用者可读的原生响应，两个模式都保留其原始层级。
     #[tokio::test]
-    async fn a_chunk_with_nothing_for_the_caller_is_dropped_only_in_platform_mode() {
+    async fn native_prompt_filter_metadata_is_preserved_in_both_modes() {
         let frames = || {
             let mut chunks = wire_chunks(serde_json::json!({
                 "id": "",
@@ -9641,16 +9983,153 @@ mod platform_stream_tests {
 
         let off = payloads(frames(), None).await;
         assert_eq!(off.len(), 4, "prelude, answer, finish, [DONE]: {off:?}");
-        assert!(off[0].contains(r#""delta":{}"#), "{off:?}");
+        let prelude: serde_json::Value = serde_json::from_str(&off[0]).unwrap();
+        assert_eq!(prelude["choices"], serde_json::json!([]));
+        assert_eq!(
+            prelude["prompt_filter_results"],
+            serde_json::json!([
+                {"prompt_index": 0, "content_filter_results": {}}
+            ])
+        );
 
         let on = payloads(
             frames(),
             Some(crate::platform::PlatformSettings::from_secret("s")),
         )
         .await;
-        assert_eq!(on.len(), 3, "answer, finish, [DONE]: {on:?}");
-        assert!(on[0].contains(r#""role":"assistant""#), "{on:?}");
-        assert!(on[1].contains(r#""finish_reason":"stop""#), "{on:?}");
-        assert_eq!(on[2], "[DONE]");
+        assert_eq!(on.len(), 4, "prelude, answer, finish, [DONE]: {on:?}");
+        let platform_prelude: serde_json::Value = serde_json::from_str(&on[0]).unwrap();
+        assert_eq!(platform_prelude["choices"], serde_json::json!([]));
+        assert_eq!(
+            platform_prelude["prompt_filter_results"],
+            prelude["prompt_filter_results"]
+        );
+        assert!(on[1].contains(r#""role":"assistant""#), "{on:?}");
+        assert!(on[2].contains(r#""finish_reason":"stop""#), "{on:?}");
+        assert_eq!(on[3], "[DONE]");
+    }
+
+    #[tokio::test]
+    async fn compat_chat_true_empty_native_prelude_is_still_suppressed_in_platform_mode() {
+        let frames = || {
+            let mut chunks = wire_chunks(serde_json::json!({
+                "id": "", "model": "", "created": 1_700_000_000, "choices": []
+            }));
+            chunks.extend(wire_chunks(serde_json::json!({
+                "id": "x", "model": "m", "choices": [{"index": 0, "delta": {"content": "hi"}, "finish_reason": "stop"}]
+            })));
+            chunks
+        };
+        assert_eq!(payloads(frames(), None).await.len(), 3);
+        let on = payloads(
+            frames(),
+            Some(crate::platform::PlatformSettings::from_secret("s")),
+        )
+        .await;
+        assert_eq!(on.len(), 2, "answer and DONE only: {on:?}");
+        assert!(on[0].contains(r#""content":"hi""#));
+        assert_eq!(on[1], "[DONE]");
+    }
+
+    #[tokio::test]
+    async fn compat_chat_forced_internal_usage_without_metadata_stays_hidden() {
+        let frames = || {
+            let mut chunks = wire_chunks(serde_json::json!({
+                "id": "x", "model": "m", "created": 1_700_000_000,
+                "choices": [{"index": 0, "delta": {"content": "hi"}, "finish_reason": "stop"}]
+            }));
+            chunks.extend(wire_chunks(serde_json::json!({
+                "id": "x", "model": "m", "created": 1_700_000_000, "choices": [],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+            })));
+            chunks
+        };
+        for platform in [
+            None,
+            Some(crate::platform::PlatformSettings::from_secret("s")),
+        ] {
+            let output = payloads(frames(), platform).await;
+            assert_eq!(output.len(), 2, "answer and DONE only: {output:?}");
+            assert!(!output[0].contains("\"usage\""));
+            assert!(output[0].contains(r#""content":"hi""#));
+            assert_eq!(output[1], "[DONE]");
+        }
+    }
+
+    #[tokio::test]
+    async fn compat_chat_native_stream_handler_preserves_metadata_around_usage_projection() {
+        use futures::StreamExt;
+        use serde_json::{json, Value};
+
+        for enabled in [false, true] {
+            for include_usage in [false, true] {
+                let filters = json!([{"prompt_index": 0, "content_filter_results": {"hate": {"filtered": false, "severity": "safe"}}}]);
+                let moderation = json!({"input": {"type": "moderation_results", "model": "omni-moderation-latest", "results": []},
+                    "output": {"type": "moderation_results", "model": "omni-moderation-latest", "results": []}});
+                let frames = vec![
+                    json!({"id": "x", "created": 1_700_000_000, "model": "m", "choices": [], "prompt_filter_results": filters, "system_fingerprint": "fp_backend"}),
+                    json!({"id": "x", "created": 1_700_000_000, "model": "m", "choices": [{"index": 0, "delta": {"content": "hi"}, "finish_reason": "stop"}]}),
+                    json!({"id": "x", "created": 1_700_000_000, "model": "m", "choices": [], "moderation": moderation, "obfuscation": "moderation-padding"}),
+                    json!({"id": "x", "created": 1_700_000_000, "model": "m", "choices": [], "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}, "obfuscation": "terminal-padding"}),
+                ];
+                let chunks: Vec<_> = frames.into_iter().flat_map(wire_chunks).collect();
+                let stream = build_sse_stream(
+                    futures::stream::iter(chunks.into_iter().map(Ok)).boxed(),
+                    42,
+                    None,
+                    Instant::now(),
+                    Instant::now(),
+                    "public".into(),
+                    None,
+                    include_usage,
+                    aisix_gateway::UsageStats::default(),
+                    enabled.then(|| crate::platform::PlatformSettings::from_secret("s")),
+                    None,
+                    false,
+                    |_| {},
+                );
+                let bytes =
+                    axum::body::to_bytes(Sse::new(stream).into_response().into_body(), usize::MAX)
+                        .await
+                        .unwrap();
+                let output: Vec<Value> = String::from_utf8_lossy(&bytes)
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter(|body| *body != "[DONE]")
+                    .map(|body| serde_json::from_str(body).unwrap())
+                    .collect();
+                let prelude = output
+                    .iter()
+                    .find(|body| body.get("prompt_filter_results").is_some())
+                    .expect("prompt filters survive handler");
+                assert_eq!(prelude["prompt_filter_results"], filters);
+                assert_eq!(prelude["choices"], json!([]));
+                assert_eq!(prelude.get("system_fingerprint").is_some(), !enabled);
+                let moderated = output
+                    .iter()
+                    .find(|body| body.get("moderation").is_some())
+                    .expect("moderation survives handler");
+                assert_eq!(moderated["moderation"], moderation);
+                assert_eq!(moderated["obfuscation"], "moderation-padding");
+                let terminal = output
+                    .iter()
+                    .find(|body| body.get("obfuscation") == Some(&json!("terminal-padding")))
+                    .expect("terminal native metadata survives");
+                assert_eq!(terminal["created"], 1_700_000_000);
+                assert_eq!(terminal["choices"], json!([]));
+                let usage_frames: Vec<_> = output
+                    .iter()
+                    .filter(|body| body.get("usage").is_some())
+                    .collect();
+                assert_eq!(usage_frames.len(), usize::from(include_usage));
+                if include_usage {
+                    assert_eq!(terminal["usage"]["total_tokens"], 5);
+                }
+                for body in &output {
+                    assert_eq!(body["model"], "public");
+                    assert_eq!(body["created"], 1_700_000_000);
+                }
+            }
+        }
     }
 }

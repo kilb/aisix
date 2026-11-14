@@ -17,14 +17,9 @@
 //!    credential injected — OpenAI Sora), constant-memory, never buffering
 //!    the whole file.
 //!
-//! **Stateless task addressing**: the gateway persists nothing. The
-//! caller-visible id is `base64url_nopad("<model_entry_id>:<upstream_task_id>")`
-//! (for a Model Group, the id of the target that accepted the task)
-//! — the GET routes decode it, re-resolve the Model row (and thus the
-//! ProviderKey credential) from the live snapshot, and call the
-//! provider's task endpoint. Same encode-routing-into-the-id approach as
-//! the jobs surface (`jobs::encode_routed_id`), minus the `aisix-` prefix
-//! since video ids never round-trip into other request bodies.
+//! 平台模式下，任务地址使用已有平台密钥认证加密，绑定租户与实际账号边界；
+//! 查询时仍核对当前模型、分组和账号。旧的未认证地址在平台模式下视为不存在。
+//! 独立模式保留既有 base64 地址格式，平台密钥相同的副本可继续访问自己的任务。
 //!
 //! **Phase 1 provider coverage** (dispatch by the Model's open
 //! `provider` string, case-insensitive; any other provider returns 501
@@ -70,12 +65,12 @@
 //! control-plane follow-up; the GET routes emit no usage events by
 //! design (poll traffic would flood /logs with no billing signal).
 
+use crate::request_json::Json;
 use aisix_core::AppliedGuardrail;
 use aisix_obs::{AccessLog, UsageEvent};
 use axum::extract::State;
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -165,6 +160,118 @@ fn decode_video_id(id: &str) -> Option<(String, String, String)> {
         return None;
     }
     Some((entry_id.to_string(), alias, task_id.to_string()))
+}
+
+const OWNED_VIDEO_PREFIX: &str = "video_aisix_v1_";
+
+fn video_sealer(
+    platform: &crate::platform::PlatformSettings,
+    auth: &AuthenticatedKey,
+) -> crate::opaque_id::Sealer {
+    crate::opaque_id::Sealer::of(
+        platform,
+        &format!("video:v1:{}", crate::platform::tenant_owner(auth)),
+    )
+}
+
+/// 只存摘要，不能把凭据、账号头或目标地址带入调用方可见的任务地址。
+fn video_origin(platform: &crate::platform::PlatformSettings, target: &VideoTarget) -> String {
+    use ring::hmac;
+    let key = hmac::Key::new(
+        hmac::HMAC_SHA256,
+        &crate::opaque_id::derive_key(&platform.id_key, b"video-origin-v1"),
+    );
+    let mut digest = hmac::Context::with_key(&key);
+    let mut field = |value: &[u8]| {
+        digest.update(&(value.len() as u64).to_be_bytes());
+        digest.update(value);
+    };
+    for value in [
+        target.pk_id.as_str(),
+        target.provider_label.as_str(),
+        target.base_url.trim_end_matches('/'),
+        target.secret.as_str(),
+        target.model_entry.value.model_name.as_deref().unwrap_or(""),
+    ] {
+        field(value.as_bytes());
+    }
+    let mut headers = axum::http::HeaderMap::new();
+    if let Ok(value) = header::HeaderValue::from_str(&format!("Bearer {}", target.secret)) {
+        headers.insert(header::AUTHORIZATION, value);
+    }
+    if let Some((name, value)) = target.provider.all_request_header() {
+        if let (Ok(name), Ok(value)) = (
+            name.parse::<header::HeaderName>(),
+            header::HeaderValue::from_str(value),
+        ) {
+            headers.insert(name, value);
+        }
+    }
+    for (name, value) in &target.extra_headers {
+        if !headers.contains_key(name) {
+            headers.insert(name.clone(), value.clone());
+        }
+    }
+    target.forwarded_client.apply(&mut headers);
+    let mut names: Vec<_> = headers.keys().collect();
+    names.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    for name in names {
+        // 该槽由网关写入，不选择上游账号，每次查询的请求 ID 可以不同。
+        if name.as_str() == "x-aisix-request-id" {
+            continue;
+        }
+        field(name.as_str().as_bytes());
+        for value in headers.get_all(name) {
+            field(value.as_bytes());
+        }
+    }
+    URL_SAFE_NO_PAD.encode(digest.sign().as_ref())
+}
+
+fn issued_video_id(
+    platform: Option<&crate::platform::PlatformSettings>,
+    auth: &AuthenticatedKey,
+    target: &VideoTarget,
+    alias: &str,
+    task_id: &str,
+) -> Result<String, ProxyError> {
+    let Some(platform) = platform else {
+        return Ok(encode_video_id(&target.model_entry.id, alias, task_id));
+    };
+    let payload = serde_json::to_string(&(
+        target.model_entry.id.as_str(),
+        alias,
+        task_id,
+        video_origin(platform, target),
+    ))
+    .map_err(|_| ProxyError::AccountUnavailable)?;
+    Ok(format!(
+        "{OWNED_VIDEO_PREFIX}{}",
+        video_sealer(platform, auth).seal(crate::opaque_id::IdKind::Item, &payload)
+    ))
+}
+
+fn open_video_id(
+    platform: Option<&crate::platform::PlatformSettings>,
+    auth: &AuthenticatedKey,
+    id: &str,
+) -> Option<(String, String, String, Option<String>)> {
+    let Some(platform) = platform else {
+        return decode_video_id(id).map(|(entry, alias, task)| (entry, alias, task, None));
+    };
+    if id.len() > 4096 {
+        return None;
+    }
+    let payload = video_sealer(platform, auth).unseal(
+        crate::opaque_id::IdKind::Item,
+        id.strip_prefix(OWNED_VIDEO_PREFIX)?,
+    )?;
+    let (entry, alias, task, origin): (String, String, String, String) =
+        serde_json::from_str(&payload).ok()?;
+    if entry.is_empty() || alias.is_empty() || task.is_empty() {
+        return None;
+    }
+    Some((entry, alias, task, Some(origin)))
 }
 
 // ─────────────────────── status normalisation ───────────────────────
@@ -1281,10 +1388,14 @@ fn provider_call_once<'a>(
     if let Some(d) = timeout {
         builder = builder.timeout(d);
     }
+    let protocol = if body.is_some() {
+        aisix_gateway::upstream_io::Protocol::Videos
+    } else {
+        aisix_gateway::upstream_io::Protocol::Unknown
+    };
     async move {
         let started = Instant::now();
-        let resp = builder
-            .send()
+        let resp = aisix_gateway::upstream_io::send(builder, protocol)
             .await
             .map_err(|e| note(crate::dispatch::reqwest_error_to_bridge(&e, started)))?;
         aisix_gateway::note_upstream_response(resp.headers());
@@ -1538,17 +1649,11 @@ async fn proxy_content(
                     yield Ok(bytes);
                 }
                 Some(Err(error)) => {
-                    guard.failure = Some(match &error {
-                        crate::stream_timeout::RawStreamError::Timeout { elapsed_ms } => {
-                            aisix_gateway::BridgeError::Timeout {
-                                elapsed_ms: *elapsed_ms,
-                                cause: "stream body".to_string(),
-                            }
-                        }
-                        crate::stream_timeout::RawStreamError::Upstream(e) => {
-                            crate::dispatch::reqwest_error_to_bridge(e, started)
-                        }
-                    });
+                    let mut bridge = error.as_bridge(started);
+                    if let aisix_gateway::BridgeError::Timeout { cause, .. } = &mut bridge {
+                        *cause = "stream body".to_string();
+                    }
+                    guard.failure = Some(bridge);
                     // 保留结算失败后继续交给响应体，避免截断下载被当作正常 EOF。
                     yield Err(error);
                     done = true;
@@ -1780,7 +1885,7 @@ pub async fn create_video(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     client: ClientContext,
-    body: Result<Json<VideoCreateBody>, axum::extract::rejection::JsonRejection>,
+    body: Result<Json<VideoCreateBody>, crate::request_json::JsonRejection>,
 ) -> Response {
     let started = Instant::now();
     let telemetry = Telemetry {
@@ -2236,7 +2341,13 @@ async fn dispatch_create(
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     let video = VideoObject {
-        id: encode_video_id(&target.model_entry.id, &body.model, &submit.task_id),
+        id: issued_video_id(
+            state.platform(),
+            auth,
+            &target,
+            &body.model,
+            &submit.task_id,
+        )?,
         object: "video",
         // Echo the caller's requested model name, like every other
         // typed endpoint (wildcard aliases included).
@@ -2304,6 +2415,7 @@ async fn dispatch_create(
 /// client-facing `model` echoes the one the caller used. Telemetry labels
 /// keep using `display_name` — see `usage_attr`.
 fn resolve_get_target(
+    platform: Option<&crate::platform::PlatformSettings>,
     snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
     video_id: &str,
@@ -2313,7 +2425,8 @@ fn resolve_get_target(
         err: ProxyError::VideoNotFound(video_id.to_string()),
         model: None,
     };
-    let (entry_id, alias, task_id) = decode_video_id(video_id).ok_or_else(not_found)?;
+    let (entry_id, alias, task_id, origin) =
+        open_video_id(platform, auth, video_id).ok_or_else(not_found)?;
     let resolved =
         crate::model_resolve::resolve_model(snapshot, &alias).filter(|r| r.id == entry_id);
     let (model_entry, acl_name, group) = match resolved {
@@ -2324,6 +2437,9 @@ fn resolve_get_target(
                 .models
                 .get_by_name(&alias)
                 .filter(|_| group_routes_to(snapshot, &alias, &row.value.display_name));
+            if platform.is_some() && group.is_none() {
+                return Err(not_found());
+            }
             let acl_name = if group.is_some() {
                 alias.clone()
             } else {
@@ -2342,6 +2458,11 @@ fn resolve_get_target(
     let display_name = model_entry.value.display_name.clone();
     match resolve_video_target(snapshot, auth, model_entry, &acl_name, client_ctx) {
         Ok(Ok(target)) => {
+            if let Some(platform) = platform {
+                if origin.as_deref() != Some(video_origin(platform, &target).as_str()) {
+                    return Err(not_found());
+                }
+            }
             // After the ACL, so a key that may not use the group learns
             // nothing about its allowlist.
             if let Some(group) = group {
@@ -2406,7 +2527,7 @@ pub async fn get_video(
     let snapshot = state.snapshot.load();
 
     let (target, task_id, requested_alias) =
-        match resolve_get_target(&snapshot, &auth, &video_id, &client) {
+        match resolve_get_target(state.platform(), &snapshot, &auth, &video_id, &client) {
             Ok(resolved) => resolved,
             Err(failure) => {
                 return telemetry.finish_without_target(failure.err, failure.model.as_deref())
@@ -2484,12 +2605,13 @@ pub async fn video_content(
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
 
-    let (target, task_id, _) = match resolve_get_target(&snapshot, &auth, &video_id, &client) {
-        Ok(resolved) => resolved,
-        Err(failure) => {
-            return telemetry.finish_without_target(failure.err, failure.model.as_deref())
-        }
-    };
+    let (target, task_id, _) =
+        match resolve_get_target(state.platform(), &snapshot, &auth, &video_id, &client) {
+            Ok(resolved) => resolved,
+            Err(failure) => {
+                return telemetry.finish_without_target(failure.err, failure.model.as_deref())
+            }
+        };
 
     let result: Result<(Response, bool), ProxyError> = async {
         // Same model-layer exemption as the poll route (see get_video). The
@@ -2684,6 +2806,287 @@ mod tests {
     use std::sync::Arc;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn platform_app(snapshot: AisixSnapshot) -> axum::Router {
+        crate::build_router(
+            crate::ProxyState::new(SnapshotHandle::new(snapshot), Arc::new(Hub::new()), &cfg())
+                .without_cache()
+                .with_platform(crate::platform::PlatformSettings::from_secret(
+                    "video-test-seal-key",
+                )),
+        )
+    }
+
+    fn video_owner_snapshot(base: &str) -> AisixSnapshot {
+        use sha2::{Digest, Sha256};
+        let snapshot = new_snap(base, "openai", "");
+        for (id, token) in [
+            ("video-owner-a", "video-key-a"),
+            ("video-owner-b", "video-key-b"),
+        ] {
+            let key: ApiKey = serde_json::from_value(serde_json::json!({
+                "key_hash": format!("{:x}", Sha256::digest(token.as_bytes())),
+                "allowed_models": ["*"]
+            }))
+            .unwrap();
+            snapshot.apikeys.insert(ResourceEntry::new(id, key, 1));
+        }
+        snapshot
+    }
+
+    fn video_owner_request(method: &str, uri: &str, token: &str) -> Request<axum::body::Body> {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", format!("Bearer {token}"));
+        let body = if method == "POST" {
+            request = request.header("content-type", "application/json");
+            axum::body::Body::from(
+                serde_json::json!({"model":"my-video","prompt":"a tree"}).to_string(),
+            )
+        } else {
+            axum::body::Body::empty()
+        };
+        request.body(body).unwrap()
+    }
+
+    async fn mount_owned_video(upstream: &MockServer) {
+        Mock::given(method("POST"))
+            .and(path("/v1/videos"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id":"video_owned", "status":"queued", "created_at":1770000000
+            })))
+            .mount(upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/videos/video_owned"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id":"video_owned", "status":"completed", "progress":100
+            })))
+            .mount(upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/videos/video_owned/content"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "video/mp4")
+                    .set_body_bytes(b"OWNED-VIDEO".to_vec()),
+            )
+            .mount(upstream)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn platform_video_owner_survives_restart_and_blocks_foreign_and_forged_ids() {
+        let upstream = MockServer::builder().start().await;
+        mount_owned_video(&upstream).await;
+        let created = tower::ServiceExt::oneshot(
+            platform_app(video_owner_snapshot(&upstream.uri())),
+            video_owner_request("POST", "/v1/videos", "video-key-a"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let id = body_json(created).await["id"].as_str().unwrap().to_owned();
+        let rebuilt = platform_app(video_owner_snapshot(&upstream.uri()));
+        let before = upstream.received_requests().await.unwrap().len();
+        let forged = encode_video_id(MODEL_ID, "my-video", "video_owned");
+        for (token, candidate) in [
+            ("video-key-b", id.clone()),
+            ("video-key-a", forged),
+            ("video-key-a", format!("{id}tampered")),
+        ] {
+            for suffix in ["", "/content"] {
+                let response = tower::ServiceExt::oneshot(
+                    rebuilt.clone(),
+                    video_owner_request("GET", &format!("/v1/videos/{candidate}{suffix}"), token),
+                )
+                .await
+                .unwrap();
+                assert_eq!(response.status(), StatusCode::NOT_FOUND, "{token} {suffix}");
+                let body = body_json(response).await;
+                let text = body.to_string();
+                assert!(
+                    !text.contains("sk-up") && !text.contains("my-video") && !text.contains(PK_ID)
+                );
+            }
+        }
+        assert_eq!(
+            upstream.received_requests().await.unwrap().len(),
+            before,
+            "无权 ID 不能探测上游"
+        );
+        let polled = tower::ServiceExt::oneshot(
+            rebuilt.clone(),
+            video_owner_request("GET", &format!("/v1/videos/{id}"), "video-key-a"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(polled.status(), StatusCode::OK);
+        assert_eq!(body_json(polled).await["id"], id);
+        let content = tower::ServiceExt::oneshot(
+            rebuilt,
+            video_owner_request("GET", &format!("/v1/videos/{id}/content"), "video-key-a"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(content.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(content.into_body(), 1024).await.unwrap().as_ref(),
+            b"OWNED-VIDEO"
+        );
+    }
+
+    #[tokio::test]
+    async fn platform_video_account_changes_invalidate_ids_before_any_poll() {
+        let upstream = MockServer::builder().start().await;
+        mount_owned_video(&upstream).await;
+        let created = tower::ServiceExt::oneshot(
+            platform_app(video_owner_snapshot(&upstream.uri())),
+            video_owner_request("POST", "/v1/videos", "video-key-a"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let id = body_json(created).await["id"].as_str().unwrap().to_owned();
+        let before = upstream.received_requests().await.unwrap().len();
+        for changed in [
+            serde_json::json!({"secret":"rotated-video-secret"}),
+            serde_json::json!({"api_base":format!("{}/other-account", upstream.uri())}),
+            serde_json::json!({"request":{"default_headers":{"openai-organization":"other-org"}}}),
+        ] {
+            let snapshot = video_owner_snapshot(&upstream.uri());
+            let mut key = serde_json::json!({"display_name":"up", "provider":"openai",
+                "secret":"sk-up", "api_base":upstream.uri()});
+            for (name, value) in changed.as_object().unwrap() {
+                key[name] = value.clone();
+            }
+            snapshot.provider_keys.insert(ResourceEntry::new(
+                PK_ID,
+                serde_json::from_value::<aisix_core::ProviderKey>(key).unwrap(),
+                2,
+            ));
+            let rebuilt = platform_app(snapshot);
+            for suffix in ["", "/content"] {
+                let response = tower::ServiceExt::oneshot(
+                    rebuilt.clone(),
+                    video_owner_request("GET", &format!("/v1/videos/{id}{suffix}"), "video-key-a"),
+                )
+                .await
+                .unwrap();
+                assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            }
+        }
+        assert_eq!(
+            upstream.received_requests().await.unwrap().len(),
+            before,
+            "账号轮换不能用新凭据查询旧任务"
+        );
+    }
+
+    #[tokio::test]
+    async fn platform_video_current_model_and_group_permissions_still_apply() {
+        use sha2::{Digest, Sha256};
+        let upstream = MockServer::builder().start().await;
+        mount_owned_video(&upstream).await;
+        let created = tower::ServiceExt::oneshot(
+            platform_app(video_owner_snapshot(&upstream.uri())),
+            video_owner_request("POST", "/v1/videos", "video-key-a"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let id = body_json(created).await["id"].as_str().unwrap().to_owned();
+        let before = upstream.received_requests().await.unwrap().len();
+        for permissions in [
+            serde_json::json!({"allowed_models":["other"]}),
+            serde_json::json!({"allowed_provider_groups":["other-group"]}),
+        ] {
+            let snapshot = video_owner_snapshot(&upstream.uri());
+            let mut key = serde_json::json!({
+                "key_hash":format!("{:x}", Sha256::digest(b"video-key-a")), "allowed_models":["*"]});
+            for (name, value) in permissions.as_object().unwrap() {
+                key[name] = value.clone();
+            }
+            snapshot.apikeys.insert(ResourceEntry::new(
+                "video-owner-a",
+                serde_json::from_value::<ApiKey>(key).unwrap(),
+                2,
+            ));
+            for suffix in ["", "/content"] {
+                let response = tower::ServiceExt::oneshot(
+                    platform_app(snapshot.clone()),
+                    video_owner_request("GET", &format!("/v1/videos/{id}{suffix}"), "video-key-a"),
+                )
+                .await
+                .unwrap();
+                assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            }
+        }
+        assert_eq!(upstream.received_requests().await.unwrap().len(), before);
+    }
+
+    #[tokio::test]
+    async fn platform_video_forwarded_account_cannot_be_switched_for_followups() {
+        let upstream = MockServer::builder().start().await;
+        mount_owned_video(&upstream).await;
+        let snapshot = || {
+            let snapshot = video_owner_snapshot(&upstream.uri());
+            let key = serde_json::from_value::<aisix_core::ProviderKey>(serde_json::json!({
+                "display_name":"up", "provider":"openai", "secret":"sk-up",
+                "api_base":upstream.uri(),
+                "request":{"forward_client_headers":["openai-organization"]}
+            }))
+            .unwrap();
+            snapshot
+                .provider_keys
+                .insert(ResourceEntry::new(PK_ID, key, 2));
+            snapshot
+        };
+        let account = |mut request: Request<axum::body::Body>, value: &'static str| {
+            request.headers_mut().insert(
+                "openai-organization",
+                header::HeaderValue::from_static(value),
+            );
+            request
+        };
+        let created = tower::ServiceExt::oneshot(
+            platform_app(snapshot()),
+            account(
+                video_owner_request("POST", "/v1/videos", "video-key-a"),
+                "org-a",
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let id = body_json(created).await["id"].as_str().unwrap().to_owned();
+        let before = upstream.received_requests().await.unwrap().len();
+        let app = platform_app(snapshot());
+        for suffix in ["", "/content"] {
+            let rejected = tower::ServiceExt::oneshot(
+                app.clone(),
+                account(
+                    video_owner_request("GET", &format!("/v1/videos/{id}{suffix}"), "video-key-a"),
+                    "org-b",
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(rejected.status(), StatusCode::NOT_FOUND);
+        }
+        assert_eq!(upstream.received_requests().await.unwrap().len(), before);
+        let allowed = tower::ServiceExt::oneshot(
+            app,
+            account(
+                video_owner_request("GET", &format!("/v1/videos/{id}"), "video-key-a"),
+                "org-a",
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
+    }
 
     // ───────────────────────── pure-function tests ─────────────────────────
 

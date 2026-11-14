@@ -11,12 +11,12 @@
 //! be configured with a `base_url` pointing to their rerank endpoint root.
 //! The gateway appends `/v1/rerank`.
 
+use crate::request_json::Json;
 use aisix_core::AppliedGuardrail;
 use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, UsageEvent};
 use axum::extract::State;
 use axum::http::HeaderValue;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde_json::Value;
 use std::time::{Duration, Instant};
 
@@ -84,7 +84,7 @@ pub async fn rerank(
     client: ClientContext,
     // Result-wrapped so an extractor-layer 413 maps to the OpenAI
     // envelope — see completions.rs.
-    body: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
+    body: Result<Json<Value>, crate::request_json::JsonRejection>,
 ) -> Response {
     let started = Instant::now();
     let Json(mut body) = match body {
@@ -703,7 +703,12 @@ async fn dispatch(
                     }
                     async move {
                         let send_started = Instant::now();
-                        let upstream_resp = req.send().await.map_err(|e| {
+                        let upstream_resp = aisix_gateway::upstream_io::send(
+                            req,
+                            aisix_gateway::upstream_io::Protocol::Rerank,
+                        )
+                        .await
+                        .map_err(|e| {
                             crate::cooldown::note_failure(
                                 tracker,
                                 model_id,

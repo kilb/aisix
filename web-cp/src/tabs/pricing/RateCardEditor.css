@@ -1,0 +1,108 @@
+/* 档位使用连续分区；长上下文以边线附着，不叠加独立卡片。 */
+.rate-card {
+  container-type: inline-size;
+  min-width: 0;
+  max-width: 100%;
+  margin: 0 0 20px;
+  padding: 0;
+  border: 0;
+}
+.rate-card > legend {
+  padding: 0;
+  margin-bottom: 8px;
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 24px;
+}
+.rate-card > .hint {
+  max-width: 76ch;
+  font-size: 13px;
+  line-height: 20px;
+}
+.rate-card .rate-tier {
+  margin: 0 0 20px;
+  padding: 16px 0 0;
+  border: 0;
+  border-top: 1px solid var(--border);
+  border-radius: 0;
+  background: transparent;
+}
+.rate-tier-heading {
+  display: flex;
+  min-height: 44px;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 12px;
+  margin-bottom: 12px;
+}
+.rate-tier-title {
+  margin: 0;
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 24px;
+  overflow-wrap: anywhere;
+}
+.rate-groups {
+  display: grid;
+  gap: 20px;
+  min-width: 0;
+}
+.rate-dimension-group {
+  min-width: 0;
+}
+.rate-dimension-group > h5 {
+  margin: 0 0 8px;
+  color: var(--ink-soft);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 20px;
+}
+.rate-field-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: start;
+  gap: 20px 16px;
+  min-width: 0;
+}
+.rate-card .field {
+  min-width: 0;
+  margin-bottom: 0;
+}
+.rate-card :is(input, select) {
+  min-height: 44px;
+  max-width: 100%;
+  font-variant-numeric: tabular-nums;
+}
+.rate-card .rate-band {
+  min-width: 0;
+  margin: 20px 0 0;
+  padding: 16px 0 0 16px;
+  border: 0;
+  border-top: 1px solid var(--border);
+  border-left: 2px solid var(--border);
+  border-radius: 0;
+  background: transparent;
+  color: var(--foreground);
+}
+.rate-band-threshold {
+  max-width: 24rem;
+  margin-bottom: 20px;
+}
+.rate-add-tier {
+  padding-top: 20px;
+  border-top: 1px solid var(--border);
+}
+@container (min-width: 30rem) {
+  .rate-field-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+@container (min-width: 48rem) {
+  .rate-field-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}

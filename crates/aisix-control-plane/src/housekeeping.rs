@@ -55,6 +55,12 @@ pub async fn run_once(db: &Db) -> Result<Pruned, DbError> {
             .await?
             .rows_affected();
     let tombstones = prune_tombstones(db, TOMBSTONE_RETENTION).await?;
+    // 遥测发送端最多重试半小时；孤立 IO 补充保留一天，避免无限积累未知父行。
+    sqlx::query(
+        "DELETE FROM usage_io_audit_pending WHERE received_at < now() - interval '24 hours'",
+    )
+    .execute(db.pool())
+    .await?;
     Ok(Pruned {
         sessions,
         instances,

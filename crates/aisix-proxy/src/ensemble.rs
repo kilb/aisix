@@ -27,6 +27,7 @@ use async_trait::async_trait;
 use futures::future::join_all;
 
 use aisix_core::models::{EnsembleConfig, Judge, PanelMember};
+use aisix_core::usage_io::UsageIoAudit;
 use aisix_core::AisixSnapshot;
 use aisix_gateway::bridge::BridgeError;
 use aisix_gateway::chat::{ChatFormat, ChatMessage, ChatResponse, Role, UsageStats};
@@ -77,6 +78,8 @@ pub struct ModelCallOutcome {
     pub response: ChatResponse,
     pub effective_usage: UsageStats,
     pub usage_estimated: bool,
+    /// 成员调用的独立快照；内部重试的累计范围由 exchange_count 标明。
+    pub io_audit: Option<UsageIoAudit>,
 }
 
 /// A failed sub-call: the bridge error the caller is answered with, and
@@ -86,6 +89,7 @@ pub struct ModelCallOutcome {
 pub struct CallError {
     pub source: BridgeError,
     pub rate_limited: bool,
+    pub io_audit: Option<UsageIoAudit>,
 }
 
 impl From<BridgeError> for CallError {
@@ -93,6 +97,7 @@ impl From<BridgeError> for CallError {
         Self {
             source,
             rate_limited: false,
+            io_audit: None,
         }
     }
 }
@@ -232,6 +237,7 @@ impl ModelCaller for ProxyModelCaller<'_> {
                     "rate limit exceeded for an ensemble sub-call",
                 ),
                 rate_limited: true,
+                io_audit: None,
             }
         })?;
 
@@ -268,6 +274,7 @@ impl ModelCaller for ProxyModelCaller<'_> {
             response,
             effective_usage: effective.usage,
             usage_estimated: effective.estimated,
+            io_audit: None,
         })
     }
 }
@@ -287,6 +294,7 @@ pub struct PanelOutcome {
     pub usage_estimated: bool,
     /// The tier the member's upstream reported it served on.
     pub service_tier: Option<String>,
+    pub io_audit: Option<UsageIoAudit>,
 }
 
 impl PanelOutcome {
@@ -298,6 +306,7 @@ impl PanelOutcome {
             effective_usage: outcome.effective_usage.clone(),
             usage_estimated: outcome.usage_estimated,
             service_tier: tier_value(&outcome.response),
+            io_audit: outcome.io_audit.clone(),
         }
     }
 }
@@ -317,6 +326,7 @@ pub struct SubcallFailure {
     pub latency_ms: u32,
     /// Whether the call reached the upstream.
     pub dispatched: bool,
+    pub io_audit: Option<UsageIoAudit>,
 }
 
 impl SubcallFailure {
@@ -344,6 +354,7 @@ impl SubcallFailure {
             error_message: crate::attempt::attempt_error_message(err),
             latency_ms: crate::attempt::ms_since(started),
             dispatched: !rate_limited && err.reached_upstream(),
+            io_audit: None,
         }
     }
 }
@@ -365,6 +376,7 @@ pub struct EnsembleOutcome {
     pub judge_model: String,
     pub judge_effective_usage: UsageStats,
     pub judge_usage_estimated: bool,
+    pub judge_io_audit: Option<UsageIoAudit>,
 }
 
 /// The sub-calls of one ensemble run that have already returned, recorded as
@@ -453,7 +465,7 @@ pub enum EnsembleError {
         panel: Vec<PanelOutcome>,
         failed: Vec<SubcallFailure>,
         /// The judge call's own failure row.
-        judge: SubcallFailure,
+        judge: Box<SubcallFailure>,
     },
 }
 
@@ -514,14 +526,16 @@ pub(crate) async fn run_ensemble_panel(
                 call_with_optional_timeout(caller, &model, &member_req, per_call_timeout).await;
             let result = result.map_err(|err| {
                 tracing::warn!(panel_model = %model, error = %err.source, "ensemble panel member failed");
-                SubcallFailure::new(
+                let mut failure = SubcallFailure::new(
                     slot,
                     "panel",
                     &model,
                     &err.source,
                     err.rate_limited,
                     started,
-                )
+                );
+                failure.io_audit = err.io_audit;
+                failure
             });
             progress.record_panel(match &result {
                 Ok(outcome) => Ok(PanelOutcome::of(slot, &model, outcome)),
@@ -547,6 +561,7 @@ pub(crate) async fn run_ensemble_panel(
                     effective_usage: outcome.effective_usage,
                     usage_estimated: outcome.usage_estimated,
                     service_tier: tier_value(&resp),
+                    io_audit: outcome.io_audit,
                 });
                 candidates.push(resp);
             }
@@ -607,7 +622,7 @@ pub async fn run_ensemble(
         // Carry the (already-billed) panel survivors out on the judge
         // failure so the dispatch layer commits + emits them too.
         Err(err) => {
-            let judge = SubcallFailure::new(
+            let mut judge = SubcallFailure::new(
                 judge_index,
                 "judge",
                 &config.judge.model,
@@ -615,11 +630,12 @@ pub async fn run_ensemble(
                 err.rate_limited,
                 judge_started,
             );
+            judge.io_audit = err.io_audit;
             return Err(EnsembleError::Judge {
                 source: err.source,
                 panel,
                 failed,
-                judge,
+                judge: Box::new(judge),
             });
         }
     };
@@ -632,6 +648,7 @@ pub async fn run_ensemble(
         judge_model: config.judge.model.clone(),
         judge_effective_usage: judge.effective_usage,
         judge_usage_estimated: judge.usage_estimated,
+        judge_io_audit: judge.io_audit,
     })
 }
 
@@ -741,8 +758,11 @@ async fn call_with_optional_timeout(
     req: &RequestBuilder<'_>,
     timeout: Option<Duration>,
 ) -> Result<ModelCallOutcome, CallError> {
-    match timeout {
-        Some(d) => match tokio::time::timeout(d, caller.call(target, req)).await {
+    // 并行成员各持一份 tap；同一成员的重试仍在其中累计 exchange_count。
+    let tap = aisix_gateway::response_tap::detached();
+    let call = aisix_gateway::response_tap::scope(Arc::clone(&tap), caller.call(target, req));
+    let mut result = match timeout {
+        Some(d) => match tokio::time::timeout(d, call).await {
             Ok(result) => result,
             Err(_) => Err(BridgeError::Timeout {
                 elapsed_ms: d.as_millis() as u64,
@@ -750,9 +770,19 @@ async fn call_with_optional_timeout(
             }
             .into()),
         },
-        None => caller.call(target, req).await,
+        None => call.await,
+    };
+    let io_audit = tap.capture().io.as_ref().map(|io| io.snapshot());
+    match &mut result {
+        Ok(outcome) => outcome.io_audit = io_audit,
+        Err(error) => error.io_audit = io_audit,
     }
+    result
 }
+
+#[cfg(test)]
+#[path = "ensemble/upstream_io_tests.rs"]
+mod upstream_io_tests;
 
 #[cfg(test)]
 mod tests {
@@ -819,12 +849,14 @@ mod tests {
                 effective_usage: response.usage.clone(),
                 response,
                 usage_estimated: false,
+                io_audit: None,
             })
         }
     }
 
     fn ok(model: &str, content: &str) -> Result<ChatResponse, BridgeError> {
         Ok(ChatResponse {
+            native_envelope: None,
             logprobs: None,
             more_choices: Vec::new(),
             id: format!("id-{model}"),

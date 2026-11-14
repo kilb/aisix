@@ -2294,6 +2294,7 @@ mod tests {
 
     fn resp(text: &str) -> ChatResponse {
         ChatResponse {
+            native_envelope: None,
             logprobs: None,
             more_choices: Vec::new(),
             id: "r".into(),
@@ -2354,6 +2355,7 @@ mod tests {
         assert_eq!(v, GuardrailVerdict::Allow);
         // Output hook is monitored the same way.
         let resp = ChatResponse {
+            native_envelope: None,
             logprobs: None,
             more_choices: Vec::new(),
             id: "r".into(),
@@ -5365,6 +5367,7 @@ mod tests {
         // ...but output check is a noop on this rule.
         use aisix_gateway::{ChatResponse, FinishReason, UsageStats};
         let resp = ChatResponse {
+            native_envelope: None,
             logprobs: None,
             more_choices: Vec::new(),
             id: "r".into(),

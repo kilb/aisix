@@ -1,3 +1,5 @@
+import type { UsageAuditData } from "./usageIoAudit";
+import type { UsageRecordApiFilters } from "./usageRecordFilters";
 /**
  * A thin client for the control plane's tenant API (`/api/*`).
  *
@@ -610,7 +612,7 @@ export interface UsageModel {
   name: string;
 }
 
-export type CallStatus = "succeeded" | "retried" | "failed";
+export type CallStatus = "succeeded" | "retried" | "failed" | "unknown";
 
 /** What a call's charge is: `pending` waits for a price. */
 export type CallChargeStatus = "charged" | "exempt" | "nothing_to_bill" | "pending";
@@ -650,7 +652,7 @@ export interface CallCharge {
 }
 
 /** `Call`: one call of the organisation, with nothing of the platform's channel. */
-export interface Call {
+export interface Call extends UsageAuditData {
   event_id: string;
   occurred_at: string;
   request_id: string | null;
@@ -664,7 +666,8 @@ export interface Call {
   charge: CallCharge;
 }
 
-export interface CallsQuery {
+export interface CallsQuery extends UsageRecordApiFilters {
+  member_id?: string;
   from?: string;
   to?: string;
   api_key_id?: string;

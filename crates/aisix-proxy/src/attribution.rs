@@ -535,6 +535,8 @@ struct Cell {
     noted_error_source: Option<aisix_obs::ErrorSource>,
     /// See [`note_relayed_error_body`].
     relayed_error_body: Option<bytes::Bytes>,
+    /// 原生错误变成类型后仍需保留 SDK 重试头；这里只保存固定白名单。
+    native_reply_headers: Option<(axum::http::StatusCode, axum::http::HeaderMap)>,
     /// See [`note_terminal_event`]: `(status, error_class, error_message)`
     /// of the terminal event, `None` when it named no failure.
     terminal_error: Option<(u16, String, String)>,
@@ -832,6 +834,10 @@ pub(crate) struct RequestAttribution {
     /// of its response body, which is where every error a caller receives is
     /// rendered, streamed frames included.
     platform: bool,
+    /// 共享路径按请求协议头确定的入站协议，在响应体和取消收尾时保持一致。
+    inbound_protocol: Option<&'static str>,
+    /// 共享路径按请求方法确定是否为推理，避免管理操作和升级握手计作推理。
+    counts_as_llm: Option<bool>,
     /// How the request's latest attempt reached its upstream, when its
     /// handler records it ([`note_translated_dispatch`]): one of
     /// `DISPATCH_UNRECORDED`, `DISPATCH_NATIVE` and `DISPATCH_TRANSLATED`.
@@ -853,6 +859,8 @@ impl RequestAttribution {
             gateway_embedding_ledger: Arc::clone(&self.gateway_embedding_ledger),
             response_tap: Arc::default(),
             platform: self.platform,
+            inbound_protocol: self.inbound_protocol,
+            counts_as_llm: self.counts_as_llm,
             dispatch: std::sync::atomic::AtomicU8::new(DISPATCH_UNRECORDED),
         }
     }
@@ -860,6 +868,18 @@ impl RequestAttribution {
     /// This cell, for a request the gateway serves in platform mode when `on`.
     pub(crate) fn in_platform_mode(mut self, on: bool) -> Self {
         self.platform = on;
+        self
+    }
+
+    /// 在安装请求上下文前固定协议，后续轮询与收尾复用同一事实。
+    pub(crate) fn with_inbound_protocol(mut self, protocol: &'static str) -> Self {
+        self.inbound_protocol = Some(protocol);
+        self
+    }
+
+    /// 在请求开始时固定推理分类，响应与取消收尾不再依赖可变状态。
+    pub(crate) fn with_llm_inference(mut self, inference: bool) -> Self {
+        self.counts_as_llm = Some(inference);
         self
     }
 
@@ -1049,6 +1069,9 @@ impl RequestAttribution {
     /// middleware's guard.
     pub(crate) fn finish(&self) {
         let mut cell = self.lock();
+        if cell.finished {
+            return;
+        }
         cell.finished = true;
         let mut line = cell.ready_line.take();
         if let Some(line) = line.as_mut() {
@@ -1074,6 +1097,36 @@ impl RequestAttribution {
         self.lock().resolved.clone()
     }
 
+    /// 句柄跨取消存活，但只能读取创建它的 attempt。
+    pub(crate) fn stream_usage_observer(
+        &self,
+        attempt_index: u32,
+    ) -> Option<aisix_gateway::response_tap::StreamUsageObserver> {
+        let cell = self.lock();
+        if let Some(response) = cell.attempt_responses.get(&attempt_index) {
+            return response.stream_usage.clone();
+        }
+        let current = cell
+            .cancel
+            .in_flight
+            .as_ref()
+            .is_some_and(|a| a.index == attempt_index);
+        drop(cell);
+        if current {
+            self.response_tap.stream_usage_observer()
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn observed_stream_usage(
+        &self,
+        attempt_index: u32,
+    ) -> Option<aisix_gateway::response_tap::ObservedStreamUsage> {
+        self.stream_usage_observer(attempt_index)
+            .and_then(|usage| usage.get())
+    }
+
     /// Move the cancel context out of the cell. Only the cancel guard calls
     /// this, once, from `Drop` — taking rather than cloning keeps the
     /// `Vec<AttemptRecord>` off every other read of this cell.
@@ -1082,9 +1135,40 @@ impl RequestAttribution {
     /// were served so far: the bridge that makes them publishes it to the
     /// request's response tap, the one place it can reach.
     pub(crate) fn take_cancel_context(&self) -> CancelContext {
-        let mut ctx = std::mem::take(&mut self.lock().cancel);
+        let mut cell = self.lock();
+        let mut ctx = std::mem::take(&mut cell.cancel);
+        // 当前重试的 capture 尚未结算；取消先按其 index 保存，不能借用前次 settled 标志。
+        if let Some(attempt) = ctx.in_flight.as_ref() {
+            let response = self.response_tap.take();
+            if !response.is_empty() {
+                cell.attempt_responses.insert(attempt.index, response);
+            }
+        }
+        let observed = ctx
+            .in_flight
+            .as_ref()
+            .map(|attempt| attempt.index)
+            .or_else(|| ctx.won.as_ref().map(|won| won.index))
+            .and_then(|index| cell.attempt_responses.get(&index))
+            .and_then(|response| response.stream_usage.as_ref())
+            .and_then(|usage| usage.get());
+        drop(cell);
         if let Some(attempt) = ctx.in_flight.as_mut() {
             attempt.served_input_tokens = self.response_tap.served_input_tokens();
+            if attempt.answered.is_none() {
+                if let Some(observed) = observed.as_ref() {
+                    attempt.answered = Some(AnsweredAttempt {
+                        usage: crate::usage_attr::AnsweredUsage::from_observed_stream(observed),
+                        latency_ms: crate::attempt::measured_ms(attempt.started.elapsed()),
+                    });
+                }
+            }
+        } else if let (Some(won), Some(observed)) = (ctx.won.as_mut(), observed.as_ref()) {
+            if won.usage.is_none() {
+                won.usage = Some(crate::usage_attr::AnsweredUsage::from_observed_stream(
+                    observed,
+                ));
+            }
         }
         ctx
     }
@@ -1287,6 +1371,16 @@ pub(crate) fn current() -> Option<Resolved> {
 /// outside a request scope.
 pub(crate) fn platform_mode() -> bool {
     CURRENT.try_with(|a| a.platform).unwrap_or(false)
+}
+
+/// 读取本次请求确定的协议；无请求上下文时由调用方沿用路径分类。
+pub(crate) fn inbound_protocol() -> Option<&'static str> {
+    CURRENT.try_with(|a| a.inbound_protocol).ok().flatten()
+}
+
+/// 读取本次请求固定的推理分类；上下文外沿用端点的默认分类。
+pub(crate) fn counts_as_llm() -> Option<bool> {
+    CURRENT.try_with(|a| a.counts_as_llm).ok().flatten()
 }
 
 /// Record whether the attempt about to be dispatched reaches an upstream of
@@ -1848,6 +1942,31 @@ pub(crate) fn relayed_error_body() -> Option<bytes::Bytes> {
         .flatten()
 }
 
+pub(crate) fn note_native_reply_headers(
+    status: axum::http::StatusCode,
+    headers: &axum::http::HeaderMap,
+) {
+    let mut kept = axum::http::HeaderMap::new();
+    for name in [
+        "retry-after",
+        "retry-after-ms",
+        "x-request-id",
+        "content-disposition",
+    ] {
+        if let Some(value) = headers.get(name) {
+            kept.insert(name, value.clone());
+        }
+    }
+    let _ = CURRENT.try_with(|a| a.lock().native_reply_headers = Some((status, kept)));
+}
+
+pub(crate) fn native_reply_headers() -> Option<(axum::http::StatusCode, axum::http::HeaderMap)> {
+    CURRENT
+        .try_with(|a| a.lock().native_reply_headers.clone())
+        .ok()
+        .flatten()
+}
+
 /// The `provider_request_id` of the request's terminal usage event, for a
 /// line written after it on a success that has no response object of its own
 /// to read one from (`/v1/messages/count_tokens`).
@@ -1967,6 +2086,20 @@ pub(crate) fn upstream_wait() -> Option<Duration> {
 /// See [`Cell::upstream_unmeasured`].
 pub(crate) fn note_upstream_wait_unmeasured() {
     let _ = CURRENT.try_with(|a| a.lock().upstream_unmeasured = true);
+}
+
+/// 读取指定 attempt 的已报告流用量；不消费快照，也不借用后续 attempt 的 tap。
+pub(crate) fn observed_stream_usage(
+    attempt_index: u32,
+) -> Option<aisix_gateway::response_tap::ObservedStreamUsage> {
+    CURRENT
+        .try_with(|a| a.observed_stream_usage(attempt_index))
+        .ok()
+        .flatten()
+}
+
+pub(crate) fn stream_usage_attribution() -> Option<Arc<RequestAttribution>> {
+    CURRENT.try_with(Arc::clone).ok()
 }
 
 /// What the upstream response of the attempt `attempt_index` names left —
@@ -2121,6 +2254,11 @@ pub(crate) fn note_table_need(need: crate::token_estimate::TableNeed) {
             cell.table_needs.push(need);
         }
     });
+}
+
+/// 已有权威输入和输出计数时，终态结算不再等待惰性分词表。
+pub(crate) fn clear_table_needs() {
+    let _ = CURRENT.try_with(|a| a.lock().table_needs.clear());
 }
 
 pub(crate) fn note_responses_finish(finish: Option<&'static str>) {

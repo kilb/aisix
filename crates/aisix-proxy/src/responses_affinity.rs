@@ -29,7 +29,7 @@
 //! tenant ([`ContextAffinity::admit_continuation`]).
 
 use std::borrow::Cow;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use base64::Engine as _;
 use ring::aead;
@@ -88,6 +88,7 @@ pub(crate) fn seal_response_id(
     seal_response_id_with(&cipher(key), nonces.next(), owner, target_id, upstream_id)
 }
 
+#[cfg(test)]
 fn seal_response_id_with(
     cipher: &aead::LessSafeKey,
     nonce: [u8; aead::NONCE_LEN],
@@ -336,43 +337,11 @@ impl TenantSeal {
     }
 }
 
-/// Platform mode: the one sealed id a response carries, made on first use.
-/// Its nonce is random, so every frame of the response must reuse it.
-#[derive(Debug)]
-struct SealedResponseId {
-    tenant: TenantSeal,
-    /// The target that served the response.
-    target_id: String,
-    /// `(upstream id, sealed id)`.
-    sealed: OnceLock<(String, String)>,
-}
-
-impl SealedResponseId {
-    fn seal(&self, upstream_id: &str) -> String {
-        let fresh = || {
-            seal_response_id_with(
-                &self.tenant.cipher,
-                self.tenant.nonces.next(),
-                &self.tenant.owner,
-                &self.target_id,
-                upstream_id,
-            )
-        };
-        let (first, sealed) = self
-            .sealed
-            .get_or_init(|| (upstream_id.to_string(), fresh()));
-        if first == upstream_id {
-            sealed.clone()
-        } else {
-            fresh()
-        }
-    }
-}
-
 pub(crate) fn mark_encrypted_content(target_id: &str, original: &str) -> String {
     format!("{ENC_PREFIX}{};{original}", b64().encode(target_id))
 }
 
+#[cfg(test)]
 pub(crate) fn mark_response_id(target_id: &str, original: &str) -> String {
     format!(
         "{RESP_ID_PREFIX}{}",
@@ -447,12 +416,27 @@ impl Boundary {
     }
 }
 
+/// 旧封装只恢复既有归属；不会把任意上游 ID 注册成调用方的对象。
+pub(crate) fn legacy_response_reference(
+    platform: Option<&crate::platform::PlatformSettings>,
+    auth: &crate::auth::AuthenticatedKey,
+    id: &str,
+) -> Option<(String, String)> {
+    match platform {
+        Some(platform) => open_response_id_with(
+            platform.response_cipher(),
+            &crate::platform::tenant_owner(auth),
+            id,
+        ),
+        None => decode_response_id(id),
+    }
+}
+
 /// What a request's tags said, recorded while removing them.
 #[derive(Debug, Default)]
 pub(crate) struct ContextAffinity {
     previous_origin: Option<String>,
-    /// `(original, as the client sent it)` for a tagged `previous_response_id`,
-    /// so the Response object can echo back the value the client sent.
+    /// `(上游原值, 调用方旧别名)`；别名只用于输入兼容，响应使用原值。
     previous_echo: Option<(String, String)>,
     /// Index into `input[]` of each item whose ciphertext was tagged, with
     /// its origin. Items whose tag did not decode were already stripped.
@@ -462,10 +446,13 @@ pub(crate) struct ContextAffinity {
     /// Platform mode: the `previous_response_id` names no response this
     /// tenant was handed.
     previous_unknown: bool,
+    /// 持久归属查询确认的账号边界，不允许续接跨账号降级。
+    registered_origin: Option<aisix_core::native_objects::OriginBinding>,
     /// Platform mode: the index into `input[]` of the first item reference
     /// whose id is not this tenant's seal
     /// ([`crate::opaque_id::unseal_responses_input`]).
     unopened_item_reference: Option<usize>,
+    owned_container_paths: Vec<String>,
     /// The positions, in `input[]` as the caller sent it and ascending, of
     /// the items [`Self::unwrap_input`] dropped, so a refusal can name an
     /// item by the position the caller knows it at.
@@ -510,6 +497,61 @@ impl ContextAffinity {
         affinity.unwrap_input(body, |value| tenant.decode_encrypted_content(value));
         affinity.tenant = Some(tenant);
         affinity
+    }
+
+    /// 控制面已逐次授权的原生引用保持原始 ID，同时固定分派来源。
+    pub(crate) fn admit_registered_origin(&mut self, origin: &str) {
+        self.previous_unknown = false;
+        self.previous_origin = Some(origin.to_owned());
+    }
+
+    /// 原始引用经过持久归属查询后才能解除未知标记。
+    pub(crate) fn needs_registered_previous(&self) -> bool {
+        self.previous_unknown
+    }
+
+    pub(crate) fn admit_registered_response(
+        &mut self,
+        origin: aisix_core::native_objects::OriginBinding,
+    ) {
+        self.admit_registered_origin(&origin.model_id.to_string());
+        self.registered_origin = Some(origin);
+    }
+
+    pub(crate) fn admit_object_origin(
+        &mut self,
+        origin: aisix_core::native_objects::OriginBinding,
+    ) -> Result<(), crate::error::ProxyError> {
+        if self.registered_origin.as_ref().is_some_and(|current| {
+            current.provider_key_id != origin.provider_key_id || current.boundary != origin.boundary
+        }) {
+            return Err(crate::error::ProxyError::ResponseNotFound);
+        }
+        self.previous_origin
+            .get_or_insert_with(|| origin.model_id.to_string());
+        self.registered_origin = Some(origin);
+        Ok(())
+    }
+
+    pub(crate) fn note_owned_container(&mut self, pointer: String) {
+        self.owned_container_paths.push(pointer);
+    }
+
+    pub(crate) fn stored_object_check_body<'a>(&self, body: &'a Value) -> Cow<'a, Value> {
+        if self.owned_container_paths.is_empty() {
+            return Cow::Borrowed(body);
+        }
+        let mut checked = body.clone();
+        for pointer in &self.owned_container_paths {
+            if let Some(value) = checked.pointer_mut(pointer) {
+                *value = Value::Null;
+            }
+        }
+        Cow::Owned(checked)
+    }
+
+    pub(crate) fn registered_origin(&self) -> Option<&aisix_core::native_objects::OriginBinding> {
+        self.registered_origin.as_ref()
     }
 
     fn restore_previous(&mut self, slot: &mut Value, origin: String, original: String) {
@@ -725,13 +767,7 @@ impl ContextAffinity {
             target_id: in_group.then(|| target_id.to_string()),
             previous_echo: self.previous_echo.clone(),
             seal: None,
-            tenant: self.tenant.clone().map(|tenant| {
-                Arc::new(SealedResponseId {
-                    tenant,
-                    target_id: target_id.to_string(),
-                    sealed: OnceLock::new(),
-                })
-            }),
+            tenant: self.tenant.clone(),
         }
     }
 }
@@ -767,7 +803,7 @@ pub(crate) struct ResponseMark {
     seal: Option<std::sync::Arc<crate::opaque_id::Sealer>>,
     /// Platform mode: the response id leaves sealed to the tenant, and so
     /// does a group target's ciphertext tag.
-    tenant: Option<Arc<SealedResponseId>>,
+    tenant: Option<TenantSeal>,
 }
 
 #[derive(Clone, Copy)]
@@ -777,8 +813,6 @@ enum Slot {
     ResponseId,
     PreviousResponseId,
     EncryptedContent,
-    /// An id platform mode seals, with the kind it holds.
-    Id(crate::opaque_id::IdKind),
 }
 
 impl ResponseMark {
@@ -806,58 +840,45 @@ impl ResponseMark {
         self.seal.clone()
     }
 
-    /// The `previous_response_id` as the client sent it, when it was tagged:
-    /// what a Response object the gateway builds itself echoes.
+    /// 桥接响应回显已解码的上游 ID，不重新输出调用方的旧别名。
     pub(crate) fn previous_response_id_sent(&self) -> Option<&str> {
-        self.previous_echo.as_ref().map(|(_, sent)| sent.as_str())
+        self.previous_echo
+            .as_ref()
+            .map(|(original, _)| original.as_str())
     }
 
     /// A response id the gateway minted itself (the bridged path).
     pub(crate) fn response_id(&self, id: String) -> String {
-        if let Some(tenant) = &self.tenant {
-            return tenant.seal(&id);
-        }
-        match &self.target_id {
-            Some(target) => mark_response_id(target, &id),
-            None => id,
-        }
+        id
     }
 
     fn rewrite(&self, slot: Slot, value: &str, model: Option<&str>) -> Option<String> {
         match slot {
             Slot::Model => model.map(str::to_string),
-            Slot::ResponseId => match &self.tenant {
-                Some(tenant) => (!value.is_empty()).then(|| tenant.seal(value)),
-                None => self
-                    .target_id
-                    .as_deref()
-                    .filter(|_| !value.is_empty())
-                    .map(|t| mark_response_id(t, value)),
-            },
+            Slot::ResponseId => None,
             Slot::EncryptedContent => {
                 self.target_id
                     .as_deref()
                     .filter(|_| !value.is_empty())
                     .map(|t| match &self.tenant {
-                        Some(sealed) => sealed.tenant.mark_encrypted_content(t, value),
+                        Some(sealed) => sealed.mark_encrypted_content(t, value),
                         None => mark_encrypted_content(t, value),
                     })
             }
-            Slot::PreviousResponseId => self
-                .previous_echo
-                .as_ref()
-                .filter(|(original, _)| original == value)
-                .map(|(_, sent)| sent.clone()),
-            Slot::Id(kind) => self
-                .seal
-                .as_ref()
-                .filter(|_| !value.is_empty())
-                .map(|sealer| sealer.seal(kind, value)),
+            Slot::PreviousResponseId => None,
         }
     }
 
     /// Tag a parsed (non-streaming) Response object.
     pub(crate) fn apply_to_body(&self, body: &mut Value) {
+        self.apply_to_body_inner(body, true);
+    }
+
+    pub(crate) fn apply_to_input_items_body(&self, body: &mut Value) {
+        self.apply_to_body_inner(body, false);
+    }
+
+    fn apply_to_body_inner(&self, body: &mut Value, response_resource: bool) {
         if self.is_noop() {
             return;
         }
@@ -883,8 +904,10 @@ impl ResponseMark {
                 }
             }
         }
-        if let Some(sealer) = &self.seal {
-            crate::opaque_id::seal_responses_body(sealer, body);
+        if self.seal.is_some()
+            && response_resource
+            && body.get("object").and_then(Value::as_str) == Some("response")
+        {
             crate::opaque_id::retain_value(body, crate::opaque_id::RESPONSE_BODY);
         }
     }
@@ -916,9 +939,6 @@ impl ResponseMark {
                 }
                 [PathSeg::Key(i), PathSeg::Key(e)] if i == "item" && e == "encrypted_content" => {
                     Some(Slot::EncryptedContent)
-                }
-                _ if self.seal.is_some() => {
-                    crate::opaque_id::responses_event_id_kind(path).map(Slot::Id)
                 }
                 _ => None,
             };
@@ -1179,11 +1199,8 @@ mod tests {
                 .as_bytes(),
         )
         .unwrap();
-        assert_eq!(
-            payload["response"]["id"],
-            mark_response_id("m-1", "resp_up")
-        );
-        assert_eq!(payload["response"]["previous_response_id"], "resp_SENT");
+        assert_eq!(payload["response"]["id"], "resp_up");
+        assert_eq!(payload["response"]["previous_response_id"], "resp_prev");
         assert_eq!(
             payload["response"]["output"][0]["encrypted_content"],
             mark_encrypted_content("m-1", "CT")
@@ -1205,11 +1222,10 @@ mod tests {
     }
 
     #[test]
-    fn a_sealing_mark_seals_item_ids_beside_the_context_tags() {
-        use crate::opaque_id::{seal_call, seal_id};
-        let (mark, key) = sealing_mark(Some("m-1"));
+    fn a_platform_mark_preserves_item_ids_beside_the_context_tags() {
+        let (mark, _) = sealing_mark(Some("m-1"));
         let mut body = json!({
-            "id": "resp_up",
+            "id": "resp_up", "object": "response",
             "output": [{"type": "function_call", "id": "fc_bdrk_1", "call_id": "call_bdrk_1",
                         "name": "f", "arguments": "{}"},
                        {"type": "reasoning", "id": "rs_1", "encrypted_content": "CT", "summary": []}],
@@ -1217,48 +1233,25 @@ mod tests {
             "usage": {"input_tokens": 9, "input_tokens_details": {"cached_tokens": 1, "cache_creation_tokens": 3}},
         });
         mark.apply_to_body(&mut body);
-        // A relayed answer keeps the usage counters the API documents.
         assert_eq!(
             body["usage"],
-            json!({"input_tokens": 9, "input_tokens_details": {"cached_tokens": 1}})
+            json!({"input_tokens":9,"input_tokens_details":{"cached_tokens":1}})
         );
-        assert_eq!(body["id"], mark_response_id("m-1", "resp_up"));
-        assert_eq!(
-            body["output"][0]["id"],
-            seal_id(&key, "team-a", "fc_bdrk_1")
-        );
-        assert_eq!(
-            body["output"][0]["call_id"],
-            seal_call(&key, "team-a", "call_bdrk_1")
-        );
-        assert_eq!(body["output"][1]["id"], seal_id(&key, "team-a", "rs_1"));
+        assert_eq!(body["id"], "resp_up");
+        assert_eq!(body["output"][0]["id"], "fc_bdrk_1");
+        assert_eq!(body["output"][0]["call_id"], "call_bdrk_1");
+        assert_eq!(body["output"][1]["id"], "rs_1");
         assert_eq!(
             body["output"][1]["encrypted_content"],
             mark_encrypted_content("m-1", "CT")
         );
         assert!(body.get("amazon-bedrock-invocationMetrics").is_none());
-
         let frame = b"data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_bdrk_1\",\"delta\":\"{\"}\n\n";
-        let out = String::from_utf8(mark.apply_to_sse_frame(frame).unwrap()).unwrap();
-        assert_eq!(
-            out,
-            format!(
-                "data: {{\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"{}\",\"delta\":\"{{\"}}\n\n",
-                seal_id(&key, "team-a", "fc_bdrk_1")
-            )
-        );
+        assert!(mark.apply_to_sse_frame(frame).is_none());
         let done = b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_up\",\"output\":[{\"id\":\"fc_bdrk_1\",\"call_id\":\"call_bdrk_1\"}]},\"amazon-bedrock-invocationMetrics\":{\"n\":1}}\n\n";
-        let out = String::from_utf8(mark.apply_to_sse_frame(done).unwrap()).unwrap();
-        assert!(!out.contains("bdrk"), "{out}");
-        assert!(out.contains(&mark_response_id("m-1", "resp_up")), "{out}");
-        // A cloud platform's invocation metrics go out as the upstream wrote
-        // them, in platform mode as without it.
-        assert!(
-            out.ends_with("]},\"amazon-bedrock-invocationMetrics\":{\"n\":1}}\n\n"),
-            "{out}"
-        );
-        let buffered = mark.apply_to_sse_buffer([&frame[..], &done[..]].concat());
-        assert!(!String::from_utf8(buffered).unwrap().contains("bdrk"));
+        assert!(mark.apply_to_sse_frame(done).is_none());
+        let buffered = [&frame[..], &done[..]].concat();
+        assert_eq!(mark.apply_to_sse_buffer(buffered.clone()), buffered);
     }
 
     /// In platform mode a buffered Response object keeps the members and the
@@ -1339,9 +1332,9 @@ mod tests {
         assert!(mark.apply_to_sse_frame(frame).is_none());
         assert!(mark.sealer().is_none());
 
-        // Platform mode alone, outside a routing group, still seals.
+        // 平台模式只登记归属，项目 ID 仍为上游原值。
         let (mark, _) = sealing_mark(None);
-        assert!(mark.apply_to_sse_frame(frame).is_some());
+        assert!(mark.apply_to_sse_frame(frame).is_none());
     }
 
     #[test]
@@ -1529,9 +1522,9 @@ mod tests {
         assert_eq!(body["previous_response_id"], "resp_up");
         assert_eq!(a.origin(), Some("m-1"));
         assert!(!a.previous_unknown);
-        // The Response object echoes what the client sent.
+        // 旧别名只用于输入解码；响应仍使用上游的原始 ID。
         let mark = a.response_mark("m-1", false);
-        assert_eq!(mark.previous_response_id_sent(), Some(sent.as_str()));
+        assert_eq!(mark.previous_response_id_sent(), Some("resp_up"));
     }
 
     #[test]
@@ -1610,41 +1603,32 @@ mod tests {
     }
 
     #[test]
-    fn a_tenant_mark_seals_the_response_id_once_for_every_frame() {
+    fn a_tenant_mark_preserves_response_ids_and_raw_previous_echo() {
         let sent = sealed_for("team-a", "m-0", "resp_prev");
         let mut req = json!({"previous_response_id": sent});
         let affinity = ContextAffinity::unwrap_sealed_request(&mut req, tenant("team-a"));
         let mark = affinity.response_mark("m-1", false);
-        let key = response_id_key(&crate::platform::PlatformSettings::from_secret("s").id_key);
-
-        let mut body = json!({"id": "resp_bdrk_up", "previous_response_id": "resp_prev",
-                              "output": [{"type": "reasoning", "encrypted_content": "CT"}]});
+        let mut body = json!({"id":"resp_bdrk_up","previous_response_id":"resp_prev",
+            "output":[{"type":"reasoning","encrypted_content":"CT"}]});
         mark.apply_to_body(&mut body);
-        let id = body["id"].as_str().unwrap().to_string();
-        assert_eq!(
-            open_response_id(&key, "team-a", &id),
-            Some(("m-1".into(), "resp_bdrk_up".into()))
-        );
-        assert_eq!(body["previous_response_id"], sent.as_str());
-        // Outside a routing group no ciphertext is tagged, as before.
+        assert_eq!(body["id"], "resp_bdrk_up");
+        assert_eq!(body["previous_response_id"], "resp_prev");
         assert_eq!(body["output"][0]["encrypted_content"], "CT");
-
         let created = b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_bdrk_up\",\"previous_response_id\":\"resp_prev\"}}\n\n";
         let completed = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_bdrk_up\"}}\n\n";
-        for frame in [&created[..], &completed[..]] {
-            let out = String::from_utf8(mark.apply_to_sse_frame(frame).unwrap()).unwrap();
-            assert!(out.contains(&id), "{out}");
-            assert!(!out.contains("resp_bdrk_up"), "{out}");
-        }
+        let created_out = mark.apply_to_sse_frame(created);
+        assert_eq!(created_out.as_deref().unwrap_or(created), created);
+        assert!(mark.apply_to_sse_frame(completed).is_none());
         let buffered = mark.apply_to_sse_buffer([&created[..], &completed[..]].concat());
-        assert_eq!(String::from_utf8(buffered).unwrap().matches(&id).count(), 2);
-        // A response the gateway minted itself gets the same one id.
-        assert_eq!(mark.response_id("resp_bdrk_up".into()), id);
-        let minted = mark.response_id("resp_gw".into());
         assert_eq!(
-            open_response_id(&key, "team-a", &minted),
-            Some(("m-1".into(), "resp_gw".into()))
+            String::from_utf8(buffered)
+                .unwrap()
+                .matches("resp_bdrk_up")
+                .count(),
+            2
         );
+        assert_eq!(mark.response_id("resp_bdrk_up".into()), "resp_bdrk_up");
+        assert_eq!(mark.response_id("resp_gw".into()), "resp_gw");
     }
 
     #[test]
@@ -1757,10 +1741,187 @@ mod tests {
         let (mark, _) = sealing_mark(None);
         let frame = b"data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"delta\":\"x\"}\n\n";
         for _ in 0..50 {
-            assert!(mark.apply_to_sse_frame(frame).is_some());
+            assert!(mark.apply_to_sse_frame(frame).is_none());
         }
         let mut body = json!({"output": [{"id": "fc_1", "call_id": "call_1"}]});
         mark.apply_to_body(&mut body);
         assert_eq!(built() - before, 1);
+    }
+    #[test]
+    fn registered_response_keeps_all_upstream_ids() {
+        let platform = crate::platform::PlatformSettings::from_secret("s");
+        let affinity = ContextAffinity::unwrap_sealed_request(&mut json!({}), tenant("team-a"));
+        let mark = affinity
+            .response_mark("m-1", true)
+            .sealing_ids(Some(&platform), "team-a");
+        let mut body = json!({"id":"resp_native","output":[{
+            "id":"msg_native","type":"message","role":"assistant","content":[]
+        }]});
+        mark.apply_to_body(&mut body);
+        assert_eq!(body["id"], "resp_native");
+        assert_eq!(body["output"][0]["id"], "msg_native");
+    }
+
+    #[test]
+    fn raw_responses_ids_stay_exact_in_json_and_sse_in_every_mode() {
+        let platform = crate::platform::PlatformSettings::from_secret("raw-id-contract");
+        for grouped in [false, true] {
+            for managed in [false, true] {
+                let affinity = if managed {
+                    ContextAffinity::unwrap_sealed_request(
+                        &mut json!({}),
+                        TenantSeal::new(&platform, "team-a").unwrap(),
+                    )
+                } else {
+                    ContextAffinity::default()
+                };
+                let mark = affinity
+                    .response_mark("private-model-id", grouped)
+                    .sealing_ids(managed.then_some(&platform), "team-a");
+                let mut body = json!({"id":"resp_upstream-exact", "previous_response_id":"resp_previous-exact",
+                    "output":[{"type":"function_call","id":"fc_upstream-exact", "call_id":"toolu_upstream-exact",
+                    "name":"weather","arguments":"{}"}]});
+                let expected = body.clone();
+                mark.apply_to_body(&mut body);
+                assert_eq!(body, expected, "grouped={grouped}, managed={managed}");
+                assert_eq!(mark.response_id("upstream-exact".into()), "upstream-exact");
+                for event in [
+                    json!({"type":"response.created","response":expected}),
+                    json!({"type":"response.function_call_arguments.delta","response_id":"resp_upstream-exact",
+                        "item_id":"fc_upstream-exact","call_id":"toolu_upstream-exact","delta":"{}"}),
+                ] {
+                    let frame = format!("data: {event}\n\n");
+                    let rewritten = mark.apply_to_sse_frame(frame.as_bytes());
+                    assert_eq!(
+                        rewritten.as_deref().unwrap_or(frame.as_bytes()),
+                        frame.as_bytes()
+                    );
+                }
+            }
+        }
+    }
+    fn legacy_previous_mark(managed: bool, grouped: bool) -> (Value, ResponseMark) {
+        let sent = if managed {
+            sealed_for("team-a", "m-1", "resp_previous-exact")
+        } else {
+            mark_response_id("m-1", "resp_previous-exact")
+        };
+        let mut request = json!({"previous_response_id": sent, "input": "hi"});
+        let affinity = if managed {
+            ContextAffinity::unwrap_sealed_request(&mut request, tenant("team-a"))
+        } else {
+            ContextAffinity::unwrap_request(&mut request)
+        };
+        assert_eq!(request["previous_response_id"], "resp_previous-exact");
+        assert_eq!(affinity.origin(), Some("m-1"));
+        assert!(!affinity.needs_registered_previous());
+        let platform = crate::platform::PlatformSettings::from_secret("s");
+        let mark = affinity
+            .response_mark("m-1", grouped)
+            .sealing_ids(managed.then_some(&platform), "team-a");
+        (request, mark)
+    }
+
+    #[test]
+    fn legacy_previous_response_id_stays_raw_in_json() {
+        for managed in [false, true] {
+            for grouped in [false, true] {
+                let (_, mark) = legacy_previous_mark(managed, grouped);
+                let mut body = json!({"id":"resp_current-exact", "previous_response_id":"resp_previous-exact",
+                    "output":[{"type":"function_call", "id":"fc_exact", "call_id":"toolu_exact",
+                        "name":"weather", "arguments":"{}"}]});
+                let expected = body.clone();
+                mark.apply_to_body(&mut body);
+                assert_eq!(body, expected, "managed={managed}, grouped={grouped}");
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_previous_response_id_stays_raw_in_sse_and_websocket_payloads() {
+        for managed in [false, true] {
+            for grouped in [false, true] {
+                let (_, mark) = legacy_previous_mark(managed, grouped);
+                let event = br#"{ "type":"response.completed", "response":{"id":"resp_current-exact","previous_response_id":"resp_previous-exact","model":"upstream-model","output":[]}, "sequence_number":7 }"#;
+                let json = mark.apply_to_event_json(event, None);
+                assert_eq!(json.as_deref().unwrap_or(event), event);
+                let frame = format!(
+                    "event: response.completed\r\ndata: {}\r\n\r\n",
+                    std::str::from_utf8(event).unwrap()
+                );
+                let live = mark.apply_to_sse_frame(frame.as_bytes());
+                assert_eq!(
+                    live.as_deref().unwrap_or(frame.as_bytes()),
+                    frame.as_bytes()
+                );
+                assert_eq!(
+                    mark.apply_to_sse_buffer(frame.as_bytes().to_vec()),
+                    frame.as_bytes()
+                );
+                let restamped = mark
+                    .restamp_and_tag_sse_frame(frame.as_bytes(), "alias")
+                    .unwrap();
+                assert_eq!(
+                    restamped,
+                    frame.replace("upstream-model", "alias").as_bytes()
+                );
+                // WebSocket 适配层消费同一 SSE 数据，再编码为 JSON 消息。
+                let ws_payload = crate::redact::frame_payload(&restamped).unwrap();
+                let ws_event: Value = serde_json::from_str(ws_payload.trim()).unwrap();
+                assert_eq!(
+                    ws_event["response"]["previous_response_id"],
+                    "resp_previous-exact"
+                );
+                assert_eq!(ws_event["response"]["id"], "resp_current-exact");
+                assert_eq!(ws_event["response"]["model"], "alias");
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_previous_response_id_stays_raw_in_bridge_reply() {
+        for managed in [false, true] {
+            for grouped in [false, true] {
+                let (request, mark) = legacy_previous_mark(managed, grouped);
+                let mut reply =
+                    crate::responses_bridge::ResponsesReplyContext::from_request(&request);
+                if let Some(previous) = mark.previous_response_id_sent() {
+                    reply.echo_previous_response_id(previous);
+                }
+                let upstream = aisix_gateway::ChatResponse {
+                    id: "resp_current-exact".into(),
+                    model: "upstream-model".into(),
+                    message: aisix_gateway::ChatMessage::assistant("hello"),
+                    finish_reason: aisix_gateway::FinishReason::Stop,
+                    logprobs: None,
+                    more_choices: Vec::new(),
+                    usage: aisix_gateway::UsageStats::new(11, 7),
+                    native_envelope: None,
+                    service_tier: None,
+                };
+                let body = crate::responses_bridge::chat_response_to_responses_json(
+                    &upstream, "alias", 1, &reply,
+                );
+                assert_eq!(body["previous_response_id"], "resp_previous-exact");
+                assert_eq!(body["id"], "resp_current-exact");
+                assert_eq!(body["model"], "alias");
+                assert_eq!(body["output"][0]["content"][0]["text"], "hello");
+            }
+        }
+    }
+
+    #[test]
+    fn management_objects_preserve_their_documented_fields_and_raw_ids() {
+        let (mark, _) = sealing_mark(Some("private-model"));
+        for mut body in [
+            json!({"id":"resp_raw","object":"response.deleted","deleted":true}),
+            json!({"object":"response.input_tokens","input_tokens":17}),
+            json!({"id":"resp_compact_raw","object":"response.compaction","output":[],"usage":{"input_tokens":4,"output_tokens":1}}),
+            json!({"object":"list","data":[{"id":"msg_raw"}],"first_id":"msg_raw","last_id":"msg_raw","has_more":true}),
+        ] {
+            let expected = body.clone();
+            mark.apply_to_body(&mut body);
+            assert_eq!(body, expected);
+        }
     }
 }

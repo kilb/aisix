@@ -79,6 +79,12 @@ export function SidebarShell({
   return (
     <Dialog.Root open={!desktop && open} onOpenChange={setOpen}>
       <div ref={shell} className="sidebar-shell">
+        <a className="shell-skip-link" href="#workspace-main" onClick={(event) => {
+          event.preventDefault();
+          const main = shell.current?.querySelector<HTMLElement>("#workspace-main");
+          main?.focus({ preventScroll: true });
+          main?.scrollIntoView({ block: "start" });
+        }}>跳到主要内容</a>
         {desktop || !open ? (
           <aside ref={sidebar} className="shell-sidebar" aria-label={label} hidden={!desktop}>{panel}</aside>
         ) : (

@@ -1,3 +1,4 @@
+import "./operations.css";
 import { useRecordTable } from "../lib/recordTable";
 import { RecordTools, RecordPager } from "../components/RecordTools";
 import { useCallback, useEffect, useState } from "react";
@@ -16,7 +17,7 @@ import { problemAt } from "../lib/errors";
 import { errorText, fmtInt, fmtTime } from "../lib/fmt";
 import { Button } from "../ui/Button";
 import { CopyButton } from "../ui/CopyButton";
-import { DataTable, Loading } from "../ui/DataTable";
+import { OperationalTable as DataTable, Loading } from "../components/OperationalTable";
 import { EmptyState } from "../ui/EmptyState";
 import { Lamp } from "../ui/Lamp";
 import { TwoStep } from "../ui/TwoStep";
@@ -113,7 +114,7 @@ export function Gateways({ operator }: TabProps) {
   const revoked = (credentials?.length ?? 0) - valid;
 
   return (
-    <>
+    <div className="cp-operations cp-gateways">
       <PageHeader
         eyebrow="GATEWAYS · 实例与凭据"
         title="网关"
@@ -285,7 +286,7 @@ export function Gateways({ operator }: TabProps) {
           </Card>
         }
       />
-    </>
+    </div>
   );
 }
 

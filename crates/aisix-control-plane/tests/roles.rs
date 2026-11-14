@@ -162,6 +162,7 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
         // Stored usage.
         ("GET", "/admin/usage/events")
         | ("GET", "/admin/usage/metrics")
+        | ("GET", "/admin/usage/direct-models")
         | ("GET", "/admin/usage/batches")
         | ("GET", "/admin/usage/rejects") => (path.to_string(), None),
         // Prices and charges. Each write is refused after the role check

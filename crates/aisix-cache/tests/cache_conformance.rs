@@ -211,6 +211,7 @@ impl Drop for Redis {
 
 fn response(text: &str) -> ChatResponse {
     ChatResponse {
+        native_envelope: None,
         logprobs: None,
         more_choices: Vec::new(),
         service_tier: None,

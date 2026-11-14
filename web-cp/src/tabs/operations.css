@@ -1,0 +1,89 @@
+/* 接入与平台管理局部布局；颜色和控件使用共享令牌。 */
+.cp-operations { min-width: 0; }
+.cp-operations .ops-icon-button { width: 44px; min-width: 44px; padding-inline: 0; border-color: transparent; background: transparent; }
+.cp-operations .ops-icon-button:hover { background: var(--well); }
+.cp-operations .ops-icon-button svg { width: 17px; height: 17px; }
+.cp-operations > *,
+.cp-operations :is(.ops-editor, .ops-list, .side-main, .side-panel, fieldset) { min-width: 0; }
+.cp-operations .bento-lead { max-width: 76ch; }
+.cp-operations .ops-snapshot {
+  border: 0;
+  border-top: 1px solid var(--line);
+  border-radius: 0;
+  padding: 20px 0;
+  background: transparent;
+}
+.cp-operations .ops-snapshot .bento-card-header { margin-bottom: 12px; }
+.cp-operations .ops-snapshot .bento-card-footer { padding-top: 16px; }
+.cp-operations .ops-snapshot .metric { font-size: 32px; font-weight: 500; line-height: 40px; }
+.cp-operations .ops-snapshot dd .metric { font-size: 24px; line-height: 32px; }
+.cp-operations .ops-snapshot :is(dt, .text-micro, .text-meta) { font-size: 13px; line-height: 20px; }
+.cp-operations .ops-snapshot .bento-card-header :is(h2, h3) { font-size: 15px; line-height: 24px; }
+.cp-operations .ops-form-section {
+  margin-top: 24px;
+  padding-top: 20px;
+  border-top: 1px solid var(--line);
+}
+.cp-operations .ops-target-list { border-radius: 8px; }
+.cp-operations .ops-target-row { padding: 16px; row-gap: 12px; }
+.cp-operations .ops-form-footer {
+  min-height: 76px;
+  margin-top: 24px;
+  padding-block: 16px;
+  background: var(--surface);
+}
+.cp-operations .ops-form-footer .hint { margin-right: auto; }
+.cp-operations :is(.ops-target-row, .ops-editor) .field-problem { margin-top: 6px; }
+.cp-operations .ops-row-field > label { gap: 8px; }
+.cp-operations .ops-group-badge { font-family: inherit; border-radius: 4px; }
+.cp-operations .ops-group-badge > span:last-child { overflow-wrap: anywhere; }
+.cp-operations :is(.tn-part, .tn-foot, .tn-bleed) { --ops-pad: var(--pad, 24px); }
+.cp-operations .tn-part { margin-inline: calc(-1 * var(--ops-pad)); padding-inline: var(--ops-pad); }
+.cp-operations .tn-foot { margin-inline: calc(-1 * var(--ops-pad)); padding-inline: var(--ops-pad); }
+.cp-operations .panel > .tn-foot:last-child,
+.cp-operations .panel > .tn-sub:last-child > .tn-foot:last-child { margin-bottom: calc(-1 * var(--ops-pad)); }
+.cp-operations .tn-bleed { margin-inline: calc(-1 * var(--ops-pad)); }
+.cp-operations .tn-bleed > .dt-wrap { --dt-edge: var(--ops-pad); }
+.cp-operations .side-panel > :last-child.tn-part { margin-bottom: calc(-1 * var(--ops-pad)); }
+.cp-operations .tn-scope label { min-height: 44px; }
+.cp-operations .tn-strip { border-radius: 8px; }
+.cp-operations .tn-strip > div { padding: 12px 16px; }
+.cp-operations .tn-strip dd { overflow-wrap: anywhere; }
+.cp-operations .tn-checks.tn-box { border-radius: 8px; }
+.cp-operations .tn-checks.tn-groups { border-radius: 8px; }
+.cp-operations .tn-section > :is(legend, h3) { font-size: 15px; line-height: 24px; }
+.cp-operations .audit-detail { display: grid; gap: 6px; white-space: normal; }
+.cp-operations .audit-field { display: block; overflow-wrap: anywhere; }
+.cp-operations .audit-field .lab { margin-right: 4px; }
+.cp-modeltests [role="tablist"] {
+  width: fit-content;
+  max-width: 100%;
+  padding: 4px;
+  gap: 4px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--well);
+}
+@media (max-width: 719px) {
+  .cp-operations .ops-snapshot { padding-block: 16px; }
+  .cp-operations .ops-snapshot .metric { font-size: 28px; line-height: 36px; }
+  .cp-operations .ops-target-row { padding: 12px; }
+  .cp-operations .ops-form-footer { gap: 8px; }
+  .cp-operations .ops-form-footer > .btn { flex: 1 1 auto; }
+  .cp-operations .tn-strip > div { padding: 12px; }
+  .cp-operations .tn-checks { grid-template-columns: minmax(0, 1fr); }
+  .cp-operations .tn-checks.tn-box { grid-template-columns: minmax(0, 1fr); }
+}
+.cp-operations .ch-section { gap: 20px; }
+.cp-operations .ch-tools > .panel {
+  border: 0;
+  border-top: 1px solid var(--line);
+  border-radius: 0;
+  background: transparent;
+  padding-inline: 0;
+}
+.cp-operations .ch-tools > .panel .ch-save { margin-inline: 0; padding-inline: 0; }
+.cp-operations .ch-tools .bento-card-header { margin-bottom: 16px; }
+.cp-operations .ch-section details > summary { min-height: 44px; padding-block: 12px; cursor: pointer; }
+.cp-operations .ch-section details > summary:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; border-radius: 4px; }
+.cp-operations .ops-editor .tn-checks.tn-groups { grid-template-columns: minmax(0, 1fr); }

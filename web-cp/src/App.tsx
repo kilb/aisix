@@ -24,6 +24,7 @@ import { Lamp, type LampState } from "./ui/Lamp";
 import { RouteNav } from "./ui/RouteNav";
 import { SidebarMenuButton, SidebarShell } from "./ui/Sidebar";
 import {
+  Activity,
   Braces,
   Building2,
   DatabaseZap,
@@ -43,6 +44,7 @@ import {
 import { takeChargesFilter } from "./lib/pricingStatus";
 import { adminRouteOf, adminHash, canSeeAdminTab } from "./lib/navigation";
 import { Analytics } from "./tabs/Analytics";
+import { DirectModelMonitoring } from "./components/DirectModelMonitoring";
 import { Calls } from "./tabs/Calls";
 import { ModelTests } from "./tabs/ModelTests";
 import { PublicRoutes } from "./tabs/PublicRoutes";
@@ -64,6 +66,7 @@ const TABS = [
   { id: "overview", label: "概览", icon: LayoutDashboard, group: "运行" },
   { id: "analytics", label: "用量分析", icon: LayoutDashboard, group: "运行" },
   { id: "calls", label: "调用记录", icon: ScrollText, group: "运行" },
+  { id: "upstream-monitoring", label: "上游监测", icon: Activity, group: "运行" },
   { id: "providers", label: "上游账号", icon: Plug, group: "接入" },
   { id: "models", label: "模型目录", icon: Waypoints, group: "接入" },
   { id: "public-routes", label: "公共模型与路由", icon: Waypoints, group: "接入" },
@@ -214,6 +217,8 @@ function Page({ tab, ...props }: TabProps & { tab: TabId }) {
       return <Analytics {...props} />;
     case "calls":
       return <Calls {...props} />;
+    case "upstream-monitoring":
+      return <DirectModelMonitoring />;
     case "public-routes":
       return <PublicRoutes {...props} />;
     case "model-tests":
@@ -374,7 +379,7 @@ export function App() {
     );
   }
 
-  if (apiContract === null) return <div className="boot" />;
+  if (apiContract === null) return <div className="boot" role="status">载入中…</div>;
 
   // A skew stops everything, reads included, rather than showing a banner
   // over pages that keep editing: this build's idea of the API's shapes no
@@ -497,7 +502,7 @@ export function App() {
       </header>
       <div className="workspace shell-content">
         {signOutError && <div className="note crit" role="alert">{signOutError}</div>}
-        <main>
+        <main id="workspace-main" tabIndex={-1}>
           <section id={`tab-${current}`} role="region" aria-labelledby={`stop-${current}`}>
             {current === "account" ? <AccountSettings operator={operator} roleLabel={ROLE_LABEL[operator.role]} onSignOut={() => void signOut()} /> : <Page
               tab={current}

@@ -60,6 +60,7 @@ async fn connect_ns(url: &str, ns: &str) -> RedisSemanticCache {
 
 fn resp(content: &str) -> ChatResponse {
     ChatResponse {
+        native_envelope: None,
         logprobs: None,
         more_choices: Vec::new(),
         id: "cmpl-sem-1".into(),

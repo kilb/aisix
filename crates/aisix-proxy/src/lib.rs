@@ -69,10 +69,12 @@ mod mcp;
 mod mcp_auth;
 mod mcp_oauth;
 mod mcp_oauth_login;
+mod media_upstream;
 mod messages;
 mod model_echo;
 mod model_resolve;
 mod models;
+pub mod native_api;
 mod opaque_id;
 mod operation;
 mod passthrough_route;
@@ -87,13 +89,18 @@ mod redact;
 mod reject;
 mod render;
 mod request_body_account;
+mod request_decode;
+#[cfg(test)]
+mod request_decode_tests;
 mod request_id;
+mod request_json;
 mod request_metrics;
 mod rerank;
 mod response_cache;
 mod responses;
 mod responses_affinity;
 mod responses_bridge;
+mod responses_ws;
 mod rewrite;
 mod routing;
 mod semantic;
@@ -108,6 +115,8 @@ mod token_estimate;
 mod unread_body;
 mod unsized_audio;
 mod usage_attr;
+#[cfg(test)]
+mod usage_io;
 /// The `model` metric label for a request that resolved no model. Exported
 /// because the retirement sweep's liveness predicate lives in the server
 /// crate and must recognise it as a placeholder — spelling it there as a
@@ -161,11 +170,31 @@ pub fn build_router(state: ProxyState) -> Router {
         // What one request id cost the caller, from the control plane
         // (account/generation.rs). Reaches no upstream.
         .route("/v1/generation", get(account::generation::generation))
-        .route("/v1/chat/completions", post(chat::chat_completions))
+        .route(
+            "/v1/chat/completions",
+            post(chat::chat_completions).get(native_api::openai_chat::list),
+        )
+        .route(
+            "/v1/chat/completions/:id",
+            get(native_api::openai_chat::retrieve)
+                .post(native_api::openai_chat::update)
+                .delete(native_api::openai_chat::delete),
+        )
+        .route(
+            "/v1/chat/completions/:id/messages",
+            get(native_api::openai_chat::messages),
+        )
         .route("/v1/completions", post(completions::completions))
         .route("/v1/embeddings", post(embeddings::embeddings))
         .route("/v1/images/generations", post(images::image_generations))
         .route("/v1/images/edits", post(images_edits::image_edits))
+        .route("/v1/images/variations", post(native_api::openai::variations))
+        .route("/v1/moderations", post(native_api::openai::moderations))
+        .route("/v1/content_provenance_checks", post(native_api::openai::provenance))
+        .route("/v1/uploads", post(native_api::openai_uploads::create_upload))
+        .route("/v1/uploads/:id/parts", post(native_api::openai_uploads::create_part))
+        .route("/v1/uploads/:id/complete", post(native_api::openai_uploads::complete_upload))
+        .route("/v1/uploads/:id/cancel", post(native_api::openai_uploads::cancel_upload))
         .route("/v1/messages", post(messages::messages))
         .route(
             "/v1/messages/count_tokens",
@@ -175,7 +204,15 @@ pub fn build_router(state: ProxyState) -> Router {
         .route("/v1/rerank", post(rerank::rerank))
         .route("/v1/systemone", post(decisions::systemone))
         .route("/v1/decisions", post(decisions::decisions))
-        .route("/v1/responses", post(responses::responses))
+        .route("/v1/responses", post(responses::responses).get(responses_ws::responses_websocket))
+        .route("/v1/responses/compact", post(native_api::responses::compact))
+        .route("/v1/responses/input_tokens", post(native_api::responses::input_tokens))
+        .route(
+            "/v1/responses/:id",
+            get(native_api::responses::retrieve).delete(native_api::responses::delete),
+        )
+        .route("/v1/responses/:id/cancel", post(native_api::responses::cancel))
+        .route("/v1/responses/:id/input_items", get(native_api::responses::input_items))
         .route("/v1/audio/transcriptions", post(audio::transcriptions))
         .route("/v1/audio/translations", post(audio::translations))
         .route("/v1/audio/speech", post(audio::speech))
@@ -206,6 +243,23 @@ pub fn build_router(state: ProxyState) -> Router {
         )
         .route("/v1/batches/:id", get(jobs::get_batch))
         .route("/v1/batches/:id/cancel", post(jobs::cancel_batch))
+        // 原生消息批次保留逐项模型归属与持久终态计量。
+        .route(
+            "/v1/messages/batches",
+            post(native_api::anthropic_batches::create).get(native_api::anthropic_batches::list),
+        )
+        .route(
+            "/v1/messages/batches/:id",
+            get(native_api::anthropic_batches::retrieve).delete(native_api::anthropic_batches::delete),
+        )
+        .route(
+            "/v1/messages/batches/:id/cancel",
+            post(native_api::anthropic_batches::cancel),
+        )
+        .route(
+            "/v1/messages/batches/:id/results",
+            get(native_api::anthropic_batches::results),
+        )
         .route(
             "/v1/fine_tuning/jobs",
             post(jobs::create_ft_job).get(jobs::list_ft_jobs),
@@ -289,6 +343,11 @@ pub fn build_router(state: ProxyState) -> Router {
             "/a2a/:agent/.well-known/agent-card.json",
             get(a2a::a2a_agent_card),
         )
+        // 仅解码已注册接口；原始透传保留编码及原始字节。
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            request_decode::decode_request_body,
+        ))
         // Path-prefix passthrough routes match here, AFTER every typed
         // route has had its chance — a route can never shadow the
         // gateway's own API. No-match requests keep the plain 404 inside
@@ -419,16 +478,23 @@ fn normalize_endpoint_label(path: &str) -> &'static str {
         "/.well-known/oauth-protected-resource" => "/.well-known/oauth-protected-resource",
         "/.well-known/oauth-protected-resource/mcp" => "/.well-known/oauth-protected-resource/mcp",
         "/v1/chat/completions" => "/v1/chat/completions",
+        "/v1/images/variations" => "/v1/images/variations",
+        "/v1/moderations" => "/v1/moderations",
+        "/v1/content_provenance_checks" => "/v1/content_provenance_checks",
+        "/v1/uploads" => "/v1/uploads",
         "/v1/completions" => "/v1/completions",
         "/v1/embeddings" => "/v1/embeddings",
         "/v1/images/generations" => "/v1/images/generations",
         "/v1/images/edits" => "/v1/images/edits",
         "/v1/messages" => "/v1/messages",
         "/v1/messages/count_tokens" => "/v1/messages/count_tokens",
+        "/v1/messages/batches" => "/v1/messages/batches",
         "/v1/rerank" => "/v1/rerank",
         "/v1/systemone" => "/v1/systemone",
         "/v1/decisions" => "/v1/decisions",
         "/v1/responses" => "/v1/responses",
+        "/v1/responses/compact" => "/v1/responses/compact",
+        "/v1/responses/input_tokens" => "/v1/responses/input_tokens",
         "/v1/audio/transcriptions" => "/v1/audio/transcriptions",
         "/v1/audio/translations" => "/v1/audio/translations",
         "/v1/audio/speech" => "/v1/audio/speech",
@@ -439,6 +505,50 @@ fn normalize_endpoint_label(path: &str) -> &'static str {
         "/v1/batches" => "/v1/batches",
         "/v1/fine_tuning/jobs" => "/v1/fine_tuning/jobs",
         _ if path.starts_with("/v1/models/") => "/v1/models/:id",
+        _ if path.starts_with("/v1/chat/completions/") => {
+            let mut parts = path["/v1/chat/completions/".len()..].split('/');
+            match (parts.next(), parts.next(), parts.next()) {
+                (Some(id), None, None) if !id.is_empty() => "/v1/chat/completions/:id",
+                (Some(id), Some("messages"), None) if !id.is_empty() => {
+                    "/v1/chat/completions/:id/messages"
+                }
+                _ => "other",
+            }
+        }
+        _ if path.starts_with("/v1/uploads/") => {
+            let mut parts = path["/v1/uploads/".len()..].split('/');
+            match (parts.next(), parts.next(), parts.next()) {
+                (Some(id), Some("parts"), None) if !id.is_empty() => "/v1/uploads/:id/parts",
+                (Some(id), Some("complete"), None) if !id.is_empty() => "/v1/uploads/:id/complete",
+                (Some(id), Some("cancel"), None) if !id.is_empty() => "/v1/uploads/:id/cancel",
+                _ => "other",
+            }
+        }
+        _ if path.starts_with("/v1/messages/batches/") => {
+            let mut parts = path["/v1/messages/batches/".len()..].split('/');
+            match (parts.next(), parts.next(), parts.next()) {
+                (Some(id), None, None) if !id.is_empty() => "/v1/messages/batches/:id",
+                (Some(id), Some("cancel"), None) if !id.is_empty() => {
+                    "/v1/messages/batches/:id/cancel"
+                }
+                (Some(id), Some("results"), None) if !id.is_empty() => {
+                    "/v1/messages/batches/:id/results"
+                }
+                _ => "other",
+            }
+        }
+        // 对象 ID 只落在固定模板，未挂载的额外路径仍归 other。
+        _ if path.starts_with("/v1/responses/") => {
+            let mut parts = path["/v1/responses/".len()..].split('/');
+            match (parts.next(), parts.next(), parts.next()) {
+                (Some(id), None, None) if !id.is_empty() => "/v1/responses/:id",
+                (Some(id), Some("cancel"), None) if !id.is_empty() => "/v1/responses/:id/cancel",
+                (Some(id), Some("input_items"), None) if !id.is_empty() => {
+                    "/v1/responses/:id/input_items"
+                }
+                _ => "other",
+            }
+        }
         // `/v1/videos/:id` and `/v1/videos/:id/content` collapse together:
         // the id is the only thing that varies and neither is worth its own
         // series.
@@ -491,7 +601,7 @@ fn normalize_endpoint_label(path: &str) -> &'static str {
 /// Shared by the in-flight gauge and the detailed request families
 /// (`request_metrics`) so the two can't disagree.
 fn inbound_protocol_for_endpoint(endpoint: &str) -> &'static str {
-    if endpoint == "/v1/messages" || endpoint == "/v1/messages/count_tokens" {
+    if endpoint == "/v1/messages" || endpoint.starts_with("/v1/messages/") {
         "anthropic"
     } else if endpoint == "/mcp"
         || endpoint.starts_with("/mcp/")
@@ -658,6 +768,14 @@ async fn record_request_telemetry(
     // suffix (or any 404 path) would otherwise let an unauthenticated
     // caller mint unbounded Prometheus time series (#451).
     let endpoint = normalize_endpoint_label(request.uri().path());
+    let inbound_protocol = if matches!(endpoint, "/v1/files" | "/v1/files/:id")
+        && native_api::anthropic::is_anthropic(request.headers())
+    {
+        "anthropic"
+    } else {
+        inbound_protocol_for_endpoint(endpoint)
+    };
+    let counts_as_llm = request_metrics::is_llm_request(endpoint, request.method());
     let version = request.version();
     // The cell the handler fills in as it resolves the model and picks a
     // target, so this layer can attribute a cancelled request to them
@@ -674,7 +792,9 @@ async fn record_request_telemetry(
                 .map(|r| r.0.clone())
                 .unwrap_or_default(),
         )
-        .in_platform_mode(state.platform().is_some()),
+        .in_platform_mode(state.platform().is_some())
+        .with_inbound_protocol(inbound_protocol)
+        .with_llm_inference(counts_as_llm),
     );
     // The access-log line is held on the cell until the guard below finishes
     // the request, which is when both body sizes are known. Written in the
@@ -682,6 +802,9 @@ async fn record_request_telemetry(
     // `Drop`.
     attribution.track(tracing::Span::current());
     let request = request.map(|body| {
+        if http_body::Body::is_end_stream(&body) {
+            attribution.note_request_complete();
+        }
         axum::body::Body::new(RequestBodyCounter {
             inner: body,
             cell: attribution.clone(),
@@ -708,11 +831,7 @@ async fn record_request_telemetry(
             .cloned(),
         started: std::time::Instant::now(),
     };
-    let _in_flight = InFlightGuard::new(
-        state.metrics.clone(),
-        endpoint,
-        inbound_protocol_for_endpoint(endpoint),
-    );
+    let _in_flight = InFlightGuard::new(state.metrics.clone(), endpoint, inbound_protocol);
     let drain = DrainGuard::new(state.livez.clone());
     // Arrival is only logged while draining, where it is the one window in
     // which a request can leave no trace at all: everything else this
@@ -1286,8 +1405,10 @@ async fn enforce_request_body_limit(
     // hit it. Accept both forms.
     let path = request.uri().path();
     let body_limit = state.request_body_limit_for(path);
-    let is_anthropic_path =
-        path == "/v1/messages" || path == "/v1/messages/" || path == "/v1/messages/count_tokens";
+    let is_anthropic_path = path == "/v1/messages"
+        || path.starts_with("/v1/messages/")
+        || ((path == "/v1/files" || path.starts_with("/v1/files/"))
+            && native_api::anthropic::is_anthropic(request.headers()));
     let envelope = if is_anthropic_path {
         reject::Envelope::Anthropic
     } else {
@@ -1507,7 +1628,7 @@ fn record_body_limit_rejection(state: &ProxyState, record: BodyLimitRejectionRec
         drain,
         started,
     } = record;
-    let inbound_protocol = inbound_protocol_for_endpoint(endpoint);
+    let inbound_protocol = request_metrics::inbound_protocol(endpoint);
     state
         .metrics
         .record_body_limit_rejection(endpoint, inbound_protocol, drain.outcome.as_str());
@@ -1709,6 +1830,164 @@ pub(crate) async fn exported_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const IO_AUDIT_UPSTREAM_REQUEST: &str = r#"{"messages":[{"role":"user","content":"A汉😀"}]}"#;
+    const IO_AUDIT_UPSTREAM_RESPONSE: &str =
+        r#"{"choices":[{"index":0,"message":{"content":"A汉😀"}}]}"#;
+
+    fn io_audit_lifecycle_router(state: ProxyState, response: &'static str) -> Router {
+        let telemetry_state = state.clone();
+        Router::new()
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(move || {
+                    let state = state.clone();
+                    async move {
+                        crate::usage_io::observe_test_exchange(
+                            aisix_gateway::upstream_io::Protocol::Chat,
+                            IO_AUDIT_UPSTREAM_REQUEST.as_bytes(),
+                            IO_AUDIT_UPSTREAM_RESPONSE.as_bytes(),
+                        )
+                        .await;
+                        let snap = state.snapshot.load();
+                        crate::usage_attr::emit_usage(
+                            &state,
+                            &snap,
+                            crate::operation::CHAT,
+                            aisix_obs::UsageEvent::default(),
+                            aisix_obs::UsageEventLabels::default(),
+                            None,
+                            None,
+                            true,
+                            true,
+                        );
+                        (
+                            [(axum::http::header::CONTENT_TYPE, "application/json")],
+                            response,
+                        )
+                    }
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                telemetry_state,
+                record_request_telemetry,
+            ))
+    }
+
+    #[tokio::test]
+    async fn io_audit_buffered_upstream_emits_before_client_body_and_keeps_original_unicode() {
+        use tower::ServiceExt;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let (audit_tx, mut updates) = tokio::sync::mpsc::channel(8);
+        let state = build_state(AisixSnapshot::new(), Arc::new(Hub::new()))
+            .with_usage_sink(aisix_obs::UsageSink::new(tx).with_io_audit_sender(audit_tx));
+        let wire = r#"{"choices":[{"index":0,"message":{"content":"client replacement"}}]}"#;
+        let app = io_audit_lifecycle_router(state, wire);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let row = rx
+            .try_recv()
+            .expect("upstream audit is on the original event before client polling");
+        assert!(!row.event_id.is_empty());
+        let audit = row.io_audit.expect("upstream audit is present");
+        assert_eq!(audit.version, 2);
+        assert_eq!(audit.boundary, "upstream_attempt");
+        assert_eq!(audit.transport.as_deref(), Some("http_entity"));
+        assert_eq!(audit.exchange_count, Some(1));
+        assert_eq!(
+            audit.request_body_bytes,
+            Some(IO_AUDIT_UPSTREAM_REQUEST.len() as u64)
+        );
+        assert_eq!(
+            audit.response_body_bytes,
+            Some(IO_AUDIT_UPSTREAM_RESPONSE.len() as u64)
+        );
+        assert_eq!(audit.request_complete, Some(true));
+        assert!(audit.response_complete);
+        let expected = Some(aisix_core::usage_io::TextMeasurement {
+            utf8_bytes: 8,
+            unicode_scalars: 3,
+            complete: true,
+        });
+        assert_eq!(audit.input_text, expected);
+        assert_eq!(audit.output_text, expected);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ref(), wire.as_bytes());
+        assert_ne!(bytes.len() as u64, audit.response_body_bytes.unwrap());
+        assert!(
+            rx.try_recv().is_err(),
+            "client body completion cannot emit a second event"
+        );
+        assert!(
+            updates.try_recv().is_err(),
+            "v2 requires no client completion amendment"
+        );
+    }
+
+    #[tokio::test]
+    async fn io_audit_unpolled_client_body_retains_complete_upstream_counts_and_one_event() {
+        use tower::ServiceExt;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let (audit_tx, mut updates) = tokio::sync::mpsc::channel(8);
+        let state = build_state(AisixSnapshot::new(), Arc::new(Hub::new()))
+            .with_usage_sink(aisix_obs::UsageSink::new(tx).with_io_audit_sender(audit_tx));
+        let app = io_audit_lifecycle_router(
+            state,
+            r#"{"choices":[{"message":{"content":"never delivered"}}]}"#,
+        );
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let row = rx
+            .try_recv()
+            .expect("one original event before the client body is dropped");
+        assert!(!row.event_id.is_empty());
+        let audit = row.io_audit.expect("audit follows upstream receipt");
+        assert_eq!(audit.version, 2);
+        assert_eq!(audit.boundary, "upstream_attempt");
+        assert_eq!(audit.transport.as_deref(), Some("http_entity"));
+        assert_eq!(audit.exchange_count, Some(1));
+        assert_eq!(
+            audit.request_body_bytes,
+            Some(IO_AUDIT_UPSTREAM_REQUEST.len() as u64)
+        );
+        assert_eq!(
+            audit.response_body_bytes,
+            Some(IO_AUDIT_UPSTREAM_RESPONSE.len() as u64)
+        );
+        assert_eq!(audit.request_complete, Some(true));
+        assert!(
+            audit.response_complete,
+            "upstream EOF is independent of client delivery"
+        );
+        let expected = Some(aisix_core::usage_io::TextMeasurement {
+            utf8_bytes: 8,
+            unicode_scalars: 3,
+            complete: true,
+        });
+        assert_eq!(audit.input_text, expected);
+        assert_eq!(audit.output_text, expected);
+        drop(response);
+        assert!(rx.try_recv().is_err(), "no cancel duplicate");
+        assert!(updates.try_recv().is_err(), "no client drop amendment");
+    }
 
     #[test]
     fn endpoint_label_is_bounded_for_arbitrary_paths() {

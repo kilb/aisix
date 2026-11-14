@@ -247,11 +247,11 @@ export function OrgQuota({ account, canEdit, onQuotasChanged }: RegionProps) {
           </thead>
           <tbody>
             {rows.map((b) => (
-              <tr key={b.id}>
-                <td>{b.kind === "cumulative" ? "一次性额度" : "按周期"}</td>
-                <td>{budgetPeriod(b)}</td>
-                <td className="num">{fmtMicroCny(b.limit_micro_cny)}</td>
-                <td className="num">
+              <tr data-finance-record key={b.id}>
+                <td data-label="类型">{b.kind === "cumulative" ? "一次性额度" : "按周期"}</td>
+                <td data-label="周期">{budgetPeriod(b)}</td>
+                <td data-label="限额" className="num">{fmtMicroCny(b.limit_micro_cny)}</td>
+                <td data-label="已用" className="num">
                   {fmtMicroCny(b.spent_micro_cny)}
                   <BudgetProgress
                     value={exactRatio(b.spent_micro_cny, b.limit_micro_cny)}
@@ -259,14 +259,14 @@ export function OrgQuota({ account, canEdit, onQuotasChanged }: RegionProps) {
                     className="mt-2 min-w-24"
                   />
                 </td>
-                <td className="num">{fmtMicroCny(b.remaining_micro_cny)}</td>
-                <td>
+                <td data-label="剩余" className="num">{fmtMicroCny(b.remaining_micro_cny)}</td>
+                <td data-label="状态">
                   <span data-state={b.exhausted ? "exhausted" : "ok"}>
                     <Lamp state={b.exhausted ? "rejected" : "applied"}>{b.exhausted ? "已用尽" : "正常"}</Lamp>
                   </span>
                 </td>
                 {canEdit && (
-                  <td className="right">{b.set_by === "operator" ? <RowActions tenantId={account.tenant_id} budget={b} onChanged={reload} /> : null}</td>
+                  <td data-label="操作" className="right">{b.set_by === "operator" ? <RowActions tenantId={account.tenant_id} budget={b} onChanged={reload} /> : null}</td>
                 )}
               </tr>
             ))}

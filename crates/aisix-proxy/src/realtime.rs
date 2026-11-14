@@ -61,7 +61,7 @@
 //! the rate-limit reservation like the other non-chat surfaces (#911
 //! [21]).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use aisix_core::models::model::Adapter;
@@ -86,6 +86,7 @@ const REALTIME_MAX_FRAME_BYTES: usize = 16 << 20;
 use crate::client_ip::ClientContext;
 use crate::error::ProxyError;
 use crate::state::ProxyState;
+use aisix_gateway::upstream_io::{Protocol, UpstreamIoObserver};
 use aisix_gateway::BridgeError;
 
 /// Azure Realtime GA api-version (see the jobs surface twin constant).
@@ -1057,6 +1058,7 @@ fn splice_or_keep(text: String, splice: impl FnOnce(&[u8]) -> Option<Vec<u8>>) -
 /// Accumulated session usage harvested from upstream frames.
 #[derive(Default)]
 struct SessionUsage {
+    cache_missing: bool,
     input_tokens: u64,
     output_tokens: u64,
     cached_tokens: u64,
@@ -1084,6 +1086,9 @@ impl SessionUsage {
                 let usage = &v["response"]["usage"];
                 let input = usage["input_tokens"].as_u64().unwrap_or(0);
                 let output = usage["output_tokens"].as_u64().unwrap_or(0);
+                self.cache_missing |= usage["input_token_details"]["cached_tokens"]
+                    .as_u64()
+                    .is_none();
                 self.input_tokens += input;
                 self.output_tokens += output;
                 self.upstream_total.add(usage, input + output > 0);
@@ -1104,6 +1109,9 @@ impl SessionUsage {
                 if usage.get("type").and_then(Value::as_str) == Some("tokens") {
                     let input = usage["input_tokens"].as_u64().unwrap_or(0);
                     let output = usage["output_tokens"].as_u64().unwrap_or(0);
+                    self.cache_missing |= usage["input_token_details"]["cached_tokens"]
+                        .as_u64()
+                        .is_none();
                     self.input_tokens += input;
                     self.output_tokens += output;
                     self.upstream_total.add(usage, input + output > 0);
@@ -1118,6 +1126,128 @@ impl SessionUsage {
             }
             _ => {}
         }
+    }
+}
+
+/// 只观察实际经过上游套接字的负载；会话上下文由上游持有，文本参考始终为部分。
+struct SessionIo {
+    observer: UpstreamIoObserver,
+    pending_creates: usize,
+    active_responses: HashSet<String>,
+    tracking_complete: bool,
+    request_failed: bool,
+    response_failed: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct SessionIoEvent {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    response_id: Option<String>,
+    response: Option<SessionIoResponse>,
+}
+
+#[derive(serde::Deserialize)]
+struct SessionIoResponse {
+    id: Option<String>,
+    status: Option<String>,
+}
+
+impl SessionIo {
+    fn new() -> Self {
+        let observer = UpstreamIoObserver::websocket(Protocol::Realtime);
+        observer.begin_response(Some("application/json"));
+        observer.mark_input_text_partial();
+        Self {
+            observer,
+            pending_creates: 0,
+            active_responses: HashSet::new(),
+            tracking_complete: true,
+            request_failed: false,
+            response_failed: false,
+        }
+    }
+
+    fn track_request(&mut self, bytes: &[u8]) {
+        if let Ok(event) = serde_json::from_slice::<SessionIoEvent>(bytes) {
+            if event.kind.as_deref() == Some("response.create") {
+                self.pending_creates = self.pending_creates.saturating_add(1);
+            }
+        }
+    }
+
+    fn response(&mut self, bytes: &[u8]) {
+        self.observer.observe_response_message(bytes);
+        let Ok(event) = serde_json::from_slice::<SessionIoEvent>(bytes) else {
+            self.tracking_complete = false;
+            return;
+        };
+        let kind = event.kind.as_deref().unwrap_or("");
+        let response_id = event
+            .response
+            .as_ref()
+            .and_then(|response| response.id.as_deref())
+            .or(event.response_id.as_deref());
+        if kind == "response.done" {
+            if !response_id.is_some_and(|id| self.active_responses.remove(id)) {
+                self.pending_creates = self.pending_creates.saturating_sub(1);
+            }
+            if event
+                .response
+                .as_ref()
+                .and_then(|response| response.status.as_deref())
+                .is_some_and(|status| status != "completed")
+            {
+                self.response_failed = true;
+            }
+        } else if kind.starts_with("response.") {
+            if let Some(id) = response_id {
+                // 不保存已完成轮的 id，也不允许异常上游无限扩张活跃轮集合。
+                if id.len() > 256 {
+                    self.tracking_complete = false;
+                    return;
+                }
+                if !self.active_responses.contains(id) {
+                    if self.active_responses.len() < 128 {
+                        self.active_responses.insert(id.to_owned());
+                        self.pending_creates = self.pending_creates.saturating_sub(1);
+                    } else {
+                        self.tracking_complete = false;
+                    }
+                }
+            } else if kind != "response.created" {
+                self.tracking_complete = false;
+            }
+        }
+    }
+
+    fn drained(&mut self, message: &TgMessage) {
+        match message {
+            TgMessage::Text(text) => self.response(text.as_bytes()),
+            TgMessage::Binary(bytes) => {
+                self.tracking_complete = false;
+                self.response(bytes);
+            }
+            _ => {}
+        }
+    }
+
+    fn finish(self) -> aisix_core::usage_io::UsageIoAudit {
+        if self.request_failed {
+            self.observer.fail_request();
+        } else {
+            self.observer.finish_request();
+        }
+        if self.response_failed
+            || !self.tracking_complete
+            || self.pending_creates != 0
+            || !self.active_responses.is_empty()
+        {
+            self.observer.fail_response();
+        } else {
+            self.observer.finish_response();
+        }
+        self.observer.snapshot()
     }
 }
 
@@ -1462,7 +1592,10 @@ async fn run_session(
             return;
         }
     };
-    let (mut up_tx, mut up_rx) = upstream.split();
+    let mut io = SessionIo::new();
+    // SplitSink 自己的 start_send 只写入暂存槽；观测必须包在 split 之前的真实套接字。
+    let (mut up_tx, mut up_rx) =
+        crate::responses_ws::ObservedUpstreamSocket::new(upstream, io.observer.clone()).split();
 
     let client_type = state.client_classifier.classify(&client.user_agent);
     let mut meter = SessionMeter {
@@ -1513,6 +1646,7 @@ async fn run_session(
             Some(cap) => match tokio::time::timeout(cap, next).await {
                 Ok(r) => r,
                 Err(_) => {
+                    io.response_failed = true;
                     let _ = client_tx
                         .send(AxMessage::Close(Some(CloseFrame {
                             code: 1001,
@@ -1557,7 +1691,9 @@ async fn run_session(
                         }
                     }
                     let text = restamp_session_model_in(text, &requested_model, &upstream_model);
+                    io.track_request(text.as_bytes());
                     if up_tx.send(TgMessage::Text(text)).await.is_err() {
+                        io.request_failed = true;
                         break;
                     }
                 }
@@ -1574,7 +1710,9 @@ async fn run_session(
                         session_error = Some(refusal);
                         break;
                     }
+                    io.track_request(&b);
                     if up_tx.send(TgMessage::Binary(b)).await.is_err() {
+                        io.request_failed = true;
                         break;
                     }
                 }
@@ -1600,18 +1738,24 @@ async fn run_session(
                             }
                         }
                     });
-                    close_upstream(&mut up_tx, &mut up_rx, frame, |text| {
-                        usage.absorb(text);
-                        opening.observe(&state, &model_entry.id, Some(text));
+                    close_upstream(&mut up_tx, &mut up_rx, frame, |message| {
+                        io.drained(message);
+                        if let TgMessage::Text(text) = message {
+                            usage.absorb(text);
+                            opening.observe(&state, &model_entry.id, Some(text));
+                        }
                     })
                     .await;
                     break;
                 }
                 Some(Ok(_)) => {} // ping/pong handled by the transports
                 Some(Err(_)) | None => {
-                    close_upstream(&mut up_tx, &mut up_rx, None, |text| {
-                        usage.absorb(text);
-                        opening.observe(&state, &model_entry.id, Some(text));
+                    close_upstream(&mut up_tx, &mut up_rx, None, |message| {
+                        io.drained(message);
+                        if let TgMessage::Text(text) = message {
+                            usage.absorb(text);
+                            opening.observe(&state, &model_entry.id, Some(text));
+                        }
                     })
                     .await;
                     break;
@@ -1619,6 +1763,7 @@ async fn run_session(
             },
             Dir::FromUpstream(m) => match m {
                 Some(Ok(TgMessage::Text(text))) => {
+                    io.response(text.as_bytes());
                     usage.absorb(&text);
                     let usage_arrived = meter.behind(&usage);
                     meter.settle(&usage);
@@ -1711,6 +1856,8 @@ async fn run_session(
                     }
                 }
                 Some(Ok(TgMessage::Binary(b))) => {
+                    io.tracking_complete = false;
+                    io.response(&b);
                     opening.observe(&state, &model_entry.id, None);
                     if let Some((resp, refusal)) = binary_frame_refusal(&chain, false) {
                         let _ = client_tx.send(AxMessage::Text(resp)).await;
@@ -1738,6 +1885,7 @@ async fn run_session(
                 }
                 Some(Ok(_)) => {} // ping/pong/raw frames
                 Some(Err(e)) => {
+                    io.response_failed = true;
                     tracing::debug!(error = %e, "realtime upstream stream error");
                     let error = aisix_gateway::error_with_causes(&e);
                     close_client_after_upstream(
@@ -1753,6 +1901,7 @@ async fn run_session(
                     break;
                 }
                 None => {
+                    io.response_failed = true;
                     close_client_after_upstream(
                         &mut client_tx,
                         UpstreamEnd::Dropped,
@@ -1770,7 +1919,13 @@ async fn run_session(
     // `response.done` already on its way is still billed. Where the upstream
     // already closed, the send fails and this returns at once; the flush below
     // then sends the reply to the Close it sent.
-    close_upstream(&mut up_tx, &mut up_rx, None, |text| usage.absorb(text)).await;
+    close_upstream(&mut up_tx, &mut up_rx, None, |message| {
+        io.drained(message);
+        if let TgMessage::Text(text) = message {
+            usage.absorb(text);
+        }
+    })
+    .await;
     let _ = tokio::time::timeout(UPSTREAM_CLOSE_ACK, up_tx.close()).await;
 
     // Whoever hung up first, a session that only ever reported an error failed.
@@ -1856,6 +2011,7 @@ async fn run_session(
         elapsed,
     );
     let mut event = UsageEvent {
+        io_audit: Some(io.finish()),
         request_id: request_id.clone(),
         occurred_at: aisix_obs::UsageEvent::occurred_at_now(),
         model_id: model_entry.id.clone(),
@@ -1870,6 +2026,7 @@ async fn run_session(
         completion_tokens: usage.output_tokens.min(u32::MAX as u64) as u32,
         total_tokens: usage.upstream_total.recorded(),
         cached_prompt_tokens: usage.cached_tokens.min(u32::MAX as u64) as u32,
+        cache_usage_reported: Some(usage.responses > 0 && !usage.cache_missing),
         modality_tokens: usage.modality,
         status_code: close_status,
         // Single-attempt endpoint: the attempt spans the whole request, so
@@ -2037,12 +2194,12 @@ const UPSTREAM_CLOSE_ACK: Duration = Duration::from_secs(2);
 
 /// Close the upstream socket and wait, briefly, for its acknowledgement,
 /// so the upstream sees a completed handshake rather than a reset. A text frame
-/// that arrives meanwhile (a response finishing) still goes to `on_text`.
+/// that arrives meanwhile (a response finishing) still goes to `on_message`.
 async fn close_upstream<T, R>(
     up_tx: &mut T,
     up_rx: &mut R,
     frame: Option<TgCloseFrame<'static>>,
-    mut on_text: impl FnMut(&str),
+    mut on_message: impl FnMut(&TgMessage),
 ) where
     T: futures::Sink<TgMessage> + Unpin,
     R: futures::Stream<Item = Result<TgMessage, tokio_tungstenite::tungstenite::Error>> + Unpin,
@@ -2052,8 +2209,8 @@ async fn close_upstream<T, R>(
     }
     let _ = tokio::time::timeout(UPSTREAM_CLOSE_ACK, async {
         while let Some(Ok(m)) = up_rx.next().await {
-            match m {
-                TgMessage::Text(text) => on_text(&text),
+            match &m {
+                TgMessage::Text(_) | TgMessage::Binary(_) => on_message(&m),
                 TgMessage::Close(_) => break,
                 _ => {}
             }
@@ -2234,6 +2391,7 @@ async fn guardrail_block_event(
         aisix_guardrails::Guardrail::check_input_unmaskable_observed(chain, &chat).await
     } else {
         let synth = aisix_gateway::ChatResponse {
+            native_envelope: None,
             logprobs: None,
             more_choices: Vec::new(),
             id: String::new(),
@@ -2567,6 +2725,35 @@ fn emit_access_log(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn session_cache_sampling_requires_every_report_to_include_cache_counts() {
+        let mut usage = super::SessionUsage::default();
+        usage.absorb(
+            &serde_json::json!({"type":"response.done","response":{"usage":{
+                "input_tokens":100,"output_tokens":1,"input_token_details":{"cached_tokens":80}
+            }}})
+            .to_string(),
+        );
+        usage.absorb(
+            &serde_json::json!({"type":"response.done","response":{"usage":{
+                "input_tokens":100,"output_tokens":1,"input_token_details":{"cached_tokens":0}
+            }}})
+            .to_string(),
+        );
+        assert_eq!(usage.responses, 2);
+        assert_eq!(usage.input_tokens, 200);
+        assert_eq!(usage.cached_tokens, 80);
+        assert!(!usage.cache_missing);
+        usage.absorb(
+            &serde_json::json!({"type":"response.done","response":{"usage":{
+                "input_tokens":100,"output_tokens":1
+            }}})
+            .to_string(),
+        );
+        assert_eq!(usage.responses, 3);
+        assert!(usage.cache_missing);
+    }
+
     /// tungstenite gives a refused upgrade only the bytes that came with its
     /// head, undecoded. Only a body they demonstrably complete is quoted.
     #[tokio::test]
@@ -4833,5 +5020,165 @@ mod tests {
         assert_eq!(ev.guardrail_enforced_hits[0].action, "blocked");
         let wire = serde_json::to_string(&ev).unwrap();
         assert!(!wire.contains("BLOCKME"), "{wire}");
+    }
+
+    #[cfg(test)]
+    mod upstream_io_v10_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn upstream_io_session_records_raw_frames_with_one_billed_event() {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let up_addr = listener.local_addr().unwrap();
+            let sent = Arc::new(Mutex::new(Vec::<String>::new()));
+            let actual_requests = sent.clone();
+            let frames = vec![
+                serde_json::json!({"type":"session.created", "session":{"model":"gpt-realtime"}}),
+                serde_json::json!({"type":"response.created", "response":{"id":"resp_one"}}),
+                serde_json::json!({"type":"response.output_text.delta", "response_id":"resp_one",
+                    "item_id":"message", "output_index":0, "content_index":0, "delta":"A汉😀"}),
+                serde_json::json!({"type":"response.function_call_arguments.delta", "response_id":"resp_one",
+                    "item_id":"tool", "output_index":1, "delta":"{\"ok\":true}"}),
+                serde_json::json!({"type":"response.done", "response":{"id":"resp_one", "status":"completed",
+                    "output":[{"type":"message", "id":"message", "content":[{"type":"output_text", "text":"A汉😀"}]},
+                        {"type":"function_call", "id":"tool", "arguments":"{\"ok\":true}"}],
+                    "usage":{"input_tokens":7, "output_tokens":3, "total_tokens":10,
+                        "input_token_details":{"cached_tokens":1}}}}),
+            ].into_iter().map(|frame| frame.to_string()).collect::<Vec<_>>();
+            let raw_response_bytes = frames.iter().map(String::len).sum::<usize>() as u64;
+            tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                for _ in 0..2 {
+                    let Some(Ok(TgMessage::Text(text))) = ws.next().await else {
+                        panic!("expected both session settings and response.create");
+                    };
+                    actual_requests.lock().unwrap().push(text);
+                }
+                for frame in frames {
+                    ws.send(TgMessage::Text(frame)).await.unwrap();
+                }
+                ws.send(TgMessage::Close(None)).await.unwrap();
+                while ws.next().await.is_some() {}
+            });
+            let snap = snapshot_with_cost(
+                &format!("http://{up_addr}/v1"),
+                "openai",
+                "openai",
+                r#","cost":{"input_per_1k":10.0,"output_per_1k":20.0,"cached_input_per_1k":1.0}"#,
+            );
+            let (addr, _state, mut events) = serve(snap).await;
+            let mut request = format!("ws://{addr}/v1/realtime?model=rt-model")
+                .into_client_request()
+                .unwrap();
+            request
+                .headers_mut()
+                .insert("authorization", "Bearer sk-caller".parse().unwrap());
+            let (mut ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+            ws.send(TgMessage::Text(
+                serde_json::json!({"type":"session.update",
+                "session":{"model":"rt-model", "instructions":"A汉😀"}})
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+            ws.send(TgMessage::Text(
+                serde_json::json!({"type":"response.create"}).to_string(),
+            ))
+            .await
+            .unwrap();
+            let mut client_response_bytes = 0_u64;
+            while let Some(Ok(message)) = ws.next().await {
+                match message {
+                    TgMessage::Text(text) => client_response_bytes += text.len() as u64,
+                    TgMessage::Close(_) => break,
+                    _ => {}
+                }
+            }
+            let event = tokio::time::timeout(Duration::from_secs(3), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let actual_requests = sent.lock().unwrap();
+            let first: Value = serde_json::from_str(&actual_requests[0]).unwrap();
+            assert_eq!(first["session"]["model"], "gpt-realtime");
+            let request_bytes = actual_requests.iter().map(String::len).sum::<usize>() as u64;
+            let audit = event
+                .io_audit
+                .as_ref()
+                .expect("original usage event must carry upstream observation");
+            assert_eq!(audit.transport.as_deref(), Some("websocket_payload"));
+            assert_eq!(audit.request_body_bytes, Some(request_bytes));
+            assert_eq!(audit.response_body_bytes, Some(raw_response_bytes));
+            assert_ne!(raw_response_bytes, client_response_bytes);
+            assert_eq!(audit.request_complete, Some(true));
+            assert!(audit.response_complete);
+            let input = audit.input_text.unwrap();
+            assert_eq!(input.utf8_bytes, 8);
+            assert_eq!(input.unicode_scalars, 3);
+            assert!(!input.complete);
+            let output = audit.output_text.unwrap();
+            assert_eq!(output.utf8_bytes, 19);
+            assert_eq!(output.unicode_scalars, 14);
+            assert!(output.complete);
+            assert_eq!(event.prompt_tokens, 7);
+            assert_eq!(event.completion_tokens, 3);
+            assert_eq!(event.cached_prompt_tokens, 1);
+            assert!((event.cost_usd - 0.121).abs() < 1e-9);
+            assert!(
+                events.try_recv().is_err(),
+                "one session must retain exactly one usage event"
+            );
+        }
+
+        #[test]
+        fn upstream_io_session_cancel_preserves_only_observed_prefix() {
+            let mut io = SessionIo::new();
+            let request = br#"{"type":"response.create"}"#;
+            io.observer.observe_request_message(request);
+            io.track_request(request);
+            let prefix =
+                serde_json::json!({"type":"response.output_text.delta", "response_id":"unfinished",
+                "item_id":"message", "output_index":0, "content_index":0, "delta":"A汉😀"})
+                .to_string();
+            io.response(prefix.as_bytes());
+            let audit = io.finish();
+            assert_eq!(audit.request_body_bytes, Some(request.len() as u64));
+            assert_eq!(audit.response_body_bytes, Some(prefix.len() as u64));
+            assert!(!audit.response_complete);
+            let output = audit.output_text.unwrap();
+            assert_eq!(output.utf8_bytes, 8);
+            assert_eq!(output.unicode_scalars, 3);
+            assert!(!output.complete);
+        }
+
+        #[test]
+        fn upstream_io_session_counts_distinct_responses_without_mixing_terminal_snapshots() {
+            let mut io = SessionIo::new();
+            for (id, answer) in [("one", "A汉😀"), ("two", "B")] {
+                io.observer
+                    .observe_request_message(br#"{"type":"response.create"}"#);
+                io.track_request(br#"{"type":"response.create"}"#);
+                io.response(
+                    serde_json::json!({"type":"response.text.delta", "response_id":id,
+                    "item_id":"message", "output_index":0, "content_index":0, "delta":answer})
+                    .to_string()
+                    .as_bytes(),
+                );
+                io.response(
+                    serde_json::json!({"type":"response.done", "response":{"id":id,
+                    "status":"completed", "output":[{"type":"message", "id":"message",
+                        "content":[{"type":"text", "text":answer}]}]}})
+                    .to_string()
+                    .as_bytes(),
+                );
+            }
+            let audit = io.finish();
+            assert!(audit.response_complete);
+            let output = audit.output_text.unwrap();
+            assert_eq!(output.utf8_bytes, 9);
+            assert_eq!(output.unicode_scalars, 4);
+            assert!(output.complete);
+        }
     }
 }

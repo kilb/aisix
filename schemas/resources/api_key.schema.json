@@ -40,6 +40,8 @@
         "files",
         "batches",
         "fine_tuning",
+        "moderations",
+        "content_provenance_checks",
         "mcp",
         "a2a",
         "passthrough"

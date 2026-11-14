@@ -42,7 +42,7 @@ function DataState({ rows, error, onRetry, chart = false }: Pick<Props, "rows" |
 export function UsageRequestCard({ rows, error, rangeLabel, group = "day", number, className, onRetry }: Props) {
   const summary = rows === null ? null : summarizeUsage(rows);
   return (
-    <Card className={className}>
+    <Card className={`usage-analytic ${className}`}>
       <CardHeader number={number} title="调用尝试次数" description={rangeLabel} />
       {error || rows === null || rows.length === 0 ? <DataState rows={rows} error={error} onRetry={onRetry} chart /> : summary && <>
         <Metric size="hero" className="break-all">{summary.requests === null ? "未知" : summary.requests.toLocaleString("en-US")}</Metric>
@@ -61,7 +61,7 @@ export function UsageCostCard({ rows, error, rangeLabel, number, className, onRe
   const summary = rows === null ? null : summarizeUsage(rows);
   const cost = summary?.chargedMicroCny == null ? "未知" : fmtMicroCny(summary.chargedMicroCny);
   return (
-    <Card tone="inverse" className={className}>
+    <Card className={`usage-analytic ${className}`}>
       <CardHeader number={number} title="费用" description={rangeLabel} />
       {error || rows === null || rows.length === 0 ? <DataState rows={rows} error={error} onRetry={onRetry} /> : summary && <>
         <Metric size={cost.length > 14 ? "value" : "figure"} className="break-all">{cost}</Metric>
@@ -86,7 +86,7 @@ export function UsageModelsCard({ rows, error, rangeLabel, number, className, on
   const total = summary?.chargedMicroCny ?? null;
   const canShowShare = total !== null && total > 0n && summary?.models.every((model) => model.chargedMicroCny !== null && model.chargedMicroCny >= 0n);
   return (
-    <Card className={className}>
+    <Card className={`usage-analytic ${className}`}>
       <CardHeader number={number} title="模型费用分布" description={rangeLabel} />
       {error || rows === null || rows.length === 0 ? <DataState rows={rows} error={error} onRetry={onRetry} chart /> : summary && <>
         <div className="flex flex-wrap items-baseline gap-2">
@@ -111,7 +111,7 @@ export function UsageModelsCard({ rows, error, rangeLabel, number, className, on
 export function UsageCostTrendCard({ rows, error, rangeLabel, group = "day", number, className, onRetry }: Props) {
   const summary = rows === null ? null : summarizeUsage(rows);
   return (
-    <Card className={className}>
+    <Card className={`usage-analytic ${className}`}>
       <CardHeader number={number} title="费用趋势" description={rangeLabel} />
       {error || rows === null || rows.length === 0 ? <DataState rows={rows} error={error} onRetry={onRetry} chart /> : summary && <>
         {summary.hasMergedPeriods ? <CardMessage>部分期间明细已合并，无法完整绘制趋势。合并费用仍计入总额，请查看用量汇总。</CardMessage> :

@@ -54,8 +54,8 @@ function failure(error: unknown): string {
 
 function Reading({ label, value, title }: { label: string; value: ReactNode; title?: string }) {
   return (
-    <div className="min-w-0 border-b border-ink/7 py-3 last:border-b-0">
-      <dt className="text-micro text-muted">{label}</dt>
+    <div className="org-reading">
+      <dt className="text-caption text-muted">{label}</dt>
       <dd className="mt-1 break-words text-body" title={title}>{value}</dd>
     </div>
   );
@@ -117,11 +117,11 @@ export function Org({ member, status }: { member: SessionMember; status: TenantS
     : shown === "active" ? "查看组织身份、真实用量与各项独立额度。" : "查看组织状态与资料；个人口令在账号设置中管理。";
   return (
     <>
-      <PageHeader title="概览" eyebrow="OVERVIEW · 组织概览" dataLead={lead} actions={<Button kind="secondary" onClick={retry}>刷新</Button>} />
+      <PageHeader title="概览" dataLead={lead} actions={<Button kind="secondary" onClick={retry}>刷新</Button>} />
       {shown === "pending" && <div className="note warn mb-3">组织正在等待平台审核，审核通过后即可创建密钥和邀请成员</div>}
       {shown === "suspended" && <div className="note crit mb-3">组织已被停用，请联系平台</div>}
       {err && <div className="note crit mb-3" role="alert">{err}</div>}
-      <BentoGrid>
+      <BentoGrid className="tenant-overview">
         <ApiMetricsPanel compact refreshKey={refresh} scope="tenant" enabled={access.usage} from={range.from} to={range.to} numberStart={1} className={span.d12} />
         {access.usage && <>
           <UsageRequestCard rows={rows} error={usageErr} rangeLabel={`${rangeLabel} · ${scopeLabel}`} number={3} className={span.d8} onRetry={retry} />
@@ -158,9 +158,9 @@ export function OverviewBudgets({ budgets, error, balance, balanceError, showBal
   const credit = balance === null ? null : exactOverviewAmount(balance, "credit_limit_micro_cny");
   const shown = [...(budgets ?? [])].filter((budget) => budget.target_live).sort((a, b) => Number(b.exhausted) - Number(a.exhausted)).slice(0, 2);
   return <Card className={span.d5}>
-    <CardHeader number={number} title={showBalance ? "账户与预算" : "我的预算"} actions={<a className="inline-flex min-h-11 items-center text-caption underline underline-offset-4" href="#budgets">全部预算 ↗</a>} />
+    <CardHeader number={number} title={showBalance ? "账户与预算" : "我的预算"} actions={<a className="inline-flex min-h-11 items-center text-caption underline underline-offset-4" href="#budgets">全部预算</a>} />
     {showBalance && <div className="mb-6">
-      <p className="text-micro text-muted">账户可用额度</p>
+      <p className="text-caption text-muted">账户可用额度</p>
       {balanceError ? <CardMessage onRetry={onRetry}>{balanceError}</CardMessage> : balance === null ? <MetricSkeleton /> : <>
         <Metric size="value" className="mt-2 break-all">{available === null ? "未知" : fmtMicroCny(available)}</Metric>
         <dl className="mt-3 flex flex-wrap gap-x-5 gap-y-2 text-caption">
