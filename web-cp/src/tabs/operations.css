@@ -89,3 +89,6 @@
 .cp-operations .ch-section details > summary { min-height: 44px; padding-block: 12px; cursor: pointer; }
 .cp-operations .ch-section details > summary:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; border-radius: 4px; }
 .cp-operations .ops-editor .tn-checks.tn-groups { grid-template-columns: minmax(0, 1fr); }
+
+/* 账号名保持可读换行，不让模型区标题标签撑破编辑器。 */
+.cp-providers .ch-section .bento-card-header .tag { min-width: 0; max-width: 100%; white-space: normal; overflow-wrap: anywhere; }

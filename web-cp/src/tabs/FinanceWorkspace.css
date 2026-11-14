@@ -4,6 +4,8 @@
   max-width: 100%;
   container-type: inline-size;
 }
+/* 表头筛选允许收缩，长租户选项不能撑破卡片。 */
+.finance-workspace .bento-card-header > * { min-width: 0; max-width: 100%; }
 /* 工具栏由自身间距排布，搜索标签不再额外留下表单字段的底部间距。 */
 .finance-workspace .record-table-toolbar > .f {
   margin-bottom: 0;

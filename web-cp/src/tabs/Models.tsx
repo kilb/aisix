@@ -558,7 +558,7 @@ function Source({
   // The row a caller names is 对外; the per-account documents behind it are
   // 内部直连 — reachable only as that row's targets, never granted or priced.
   const shared = (
-    <div className="sub mt-1 max-w-[16rem] min-w-28 font-mono text-meta [overflow-wrap:anywhere]">
+    <div className="sub mt-1 max-w-[16rem] min-w-0 font-mono text-meta [overflow-wrap:anywhere]">
       {publicRead ? (name ?? `${source.id}（公共模型已不在列表）`) : "…"}
     </div>
   );
