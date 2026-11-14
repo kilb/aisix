@@ -1052,3 +1052,149 @@ async fn customer_endpoint_expansion_counts_old_protected_rows_when_recent_rows_
     }), false).await.expect_err("old protected rows still require the conservative capacity gate");
     assert_eq!(error.code, "gateway_too_old");
 }
+
+// 源码集成回归：已发布支持构建不应因控制面独立热修复而永久失去扩权资格。
+// 模拟控制面新提交；生产构建必须继续报告各自真实的提交标识。
+#[tokio::test]
+async fn customer_endpoint_hotfix_accepts_the_published_gateway_without_a_gateway_restart() {
+    for (cp_version, gateway) in [
+        ("dev+sha-a11ce11", "dev+sha-08ff931"),
+        (
+            "dev+sha-a11ce11",
+            "dev+sha-08ff931722b737d40a8942a9e55de94afc9b51d5",
+        ),
+        (
+            "dev+sha-a11ce11000000000000000000000000000000000",
+            "dev+sha-a11ce11000000000000000000000000000000000",
+        ),
+    ] {
+        let Some(cp) = TestCp::start_stamped(cp_version).await else {
+            return;
+        };
+        let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+        let gw = Gateway::issue(&cp, &admin).await;
+        gw.beat("customer-hotfix-proven-v11", gateway).await;
+        let id = Uuid::new_v4();
+        let doc = json!({
+            "key_hash": format!("customer-hotfix-proven-{id}"), "allowed_model_ids": [],
+            "allowed_endpoints": [
+                "chat_completions", "completions", "messages", "count_tokens", "responses",
+                "embeddings", "models", "images", "audio", "videos", "rerank", "decisions",
+                "realtime", "files", "batches", "fine_tuning", "moderations",
+                "content_provenance_checks",
+            ],
+        });
+        write_key(&cp, id, doc.clone(), false)
+            .await
+            .expect("the published supporting gateway remains eligible after a CP-only hotfix");
+        let stored: Value = sqlx::query_scalar("SELECT doc FROM gw_resources WHERE id = $1")
+            .bind(id)
+            .fetch_one(cp.db().pool())
+            .await
+            .expect("read the complete persisted grant");
+        assert_eq!(stored, doc, "every granted family must be stored");
+    }
+}
+
+// 不能把已知短标识当作任意前缀，也不能借已知构建放行未知、裸开发或旧构建。
+#[tokio::test]
+async fn customer_endpoint_hotfix_rejects_unknown_builds_and_published_hash_lookalikes() {
+    for (cp_version, gateway) in [
+        ("dev+sha-a11ce11", "dev+sha-f0f2360"),
+        ("dev+sha-a11ce11", "dev+sha-abcd123"),
+        ("dev+sha-a11ce11", "dev"),
+        ("dev+sha-a11ce11", "dev+sha-"),
+        ("dev+sha-a11ce11", "dev+sha-08ff9317"),
+        (
+            "dev+sha-a11ce11",
+            "dev+sha-08ff931000000000000000000000000000000000",
+        ),
+        (
+            "dev+sha-a11ce11",
+            "dev+sha-08ff931722b737d40a8942a9e55de94afc9b51d4",
+        ),
+        (
+            "dev+sha-a11ce11",
+            "dev+sha-08ff931722b737d40a8942a9e55de94afc9b51d5-extra",
+        ),
+        ("dev", "dev+sha-08ff931"),
+        ("dev+sha-", "dev+sha-08ff931"),
+        ("dev+sha-not-a-commit", "dev+sha-08ff931"),
+        ("1.9.0+sha-a11ce11", "dev+sha-08ff931"),
+    ] {
+        let Some(cp) = TestCp::start_stamped(cp_version).await else {
+            return;
+        };
+        let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+        let gw = Gateway::issue(&cp, &admin).await;
+        gw.beat("customer-hotfix-unproven-v11", gateway).await;
+        let id = Uuid::new_v4();
+        let error = write_key(
+            &cp,
+            id,
+            json!({
+                "key_hash": format!("customer-hotfix-unproven-{id}"), "allowed_model_ids": [],
+                "allowed_endpoints": ["files"],
+            }),
+            false,
+        )
+        .await
+        .expect_err(&format!("{cp_version} must not trust {gateway}"));
+        assert_eq!((error.status.as_u16(), error.code), (422, "gateway_too_old"));
+        assert_eq!(error.details[0].path, "/allowed_endpoints");
+        let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM gw_resources WHERE id = $1")
+            .bind(id)
+            .fetch_one(cp.db().pool())
+            .await
+            .expect("count refused hotfix grant");
+        assert_eq!(stored, 0, "an unproven grant must not be stored");
+    }
+}
+
+// 源码集成回归通过数据库时间模拟自然经过24小时；不得修改生产心跳历史。
+// 只接受已知构建不能绕过离线、已撤销但仍在窗口内的旧实例。
+#[tokio::test]
+async fn customer_endpoint_hotfix_waits_for_the_complete_recent_fleet_to_support_expansion() {
+    let Some(cp) = TestCp::start_stamped("dev+sha-a11ce11").await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let old = Gateway::issue(&cp, &admin).await;
+    old.beat("customer-hotfix-old-v11", "dev+sha-f0f2360").await;
+    age_instance(&cp, "customer-hotfix-old-v11", "23 hours 59 minutes").await;
+    let changed =
+        sqlx::query("UPDATE dp_credentials SET revoked_at = now() WHERE dp_id = $1::uuid")
+            .bind(&old.dp_id)
+            .execute(cp.db().pool())
+            .await
+            .expect("revoke only the source-integration test credential");
+    assert_eq!(changed.rows_affected(), 1);
+    let new = Gateway::issue(&cp, &admin).await;
+    new.beat("customer-hotfix-published-v11", "dev+sha-08ff931")
+        .await;
+    let id = Uuid::new_v4();
+    let doc = json!({
+        "key_hash": "customer-hotfix-window-v11", "allowed_model_ids": [],
+        "allowed_endpoints": ["files", "batches", "videos"],
+    });
+    let error = write_key(&cp, id, doc.clone(), false)
+        .await
+        .expect_err("the old revoked and offline instance still belongs to the recent fleet");
+    assert_eq!((error.status.as_u16(), error.code), (422, "gateway_too_old"));
+    let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM gw_resources WHERE id = $1")
+        .bind(id)
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("count deferred hotfix grant");
+    assert_eq!(stored, 0, "the mixed fleet must not receive an expanded grant");
+    age_instance(&cp, "customer-hotfix-old-v11", "24 hours 1 minute").await;
+    write_key(&cp, id, doc.clone(), false)
+        .await
+        .expect("the published gateway supports expansion once the old report naturally expires");
+    let stored: Value = sqlx::query_scalar("SELECT doc FROM gw_resources WHERE id = $1")
+        .bind(id)
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("read the accepted hotfix grant");
+    assert_eq!(stored, doc);
+}

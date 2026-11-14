@@ -92,6 +92,17 @@ pub const FIRST_PHASE_ENDPOINTS: [&str; 18] = [
     "content_provenance_checks",
 ];
 
+// 新族尚未通过兼容门槛时，新客户密钥沿用已发布的 v4 权限。
+const LEGACY_ENDPOINTS: [&str; 7] = [
+    "chat_completions",
+    "completions",
+    "messages",
+    "count_tokens",
+    "responses",
+    "embeddings",
+    "models",
+];
+
 /// What every minted key starts with.
 const KEY_PREFIX: &str = "sk-rt-";
 
@@ -607,7 +618,7 @@ async fn project(
     t: &TenantRow,
     k: &KeyRow,
     member_active: bool,
-    version: i32,
+    mut version: i32,
     defer_endpoint_upgrade: bool,
 ) -> Result<(), ApiError> {
     let mut doc = build_key_doc(t, k, member_active);
@@ -618,28 +629,32 @@ async fn project(
         }
         // 普通修改不能因附带的新族而阻止收紧；保留旧列表后仍走完整校验。
         // 显式追平不走此分支，升级后由 catch_up 补齐且推进文档版本。
-        let Some(stored) = crate::resources::store::get(&mut *conn, Kind::ApiKeys, k.id)
-            .await?
-            .filter(|row| !row.deleted)
-        else {
-            return Err(error);
-        };
-        let Some(before) = stored
-            .doc
-            .get("allowed_endpoints")
-            .and_then(Value::as_array)
-        else {
-            return Err(error);
-        };
-        let Some(after) = doc.get("allowed_endpoints").and_then(Value::as_array) else {
-            return Err(error);
-        };
-        if before == after || !before.iter().all(|family| after.contains(family)) {
-            return Err(error);
+        let stored = crate::resources::store::get(&mut *conn, Kind::ApiKeys, k.id).await?;
+        if let Some(stored) = stored {
+            if stored.deleted {
+                return Err(error);
+            }
+            let Some(before) = stored
+                .doc
+                .get("allowed_endpoints")
+                .and_then(Value::as_array)
+            else {
+                return Err(error);
+            };
+            let Some(after) = doc.get("allowed_endpoints").and_then(Value::as_array) else {
+                return Err(error);
+            };
+            if before == after || !before.iter().all(|family| after.contains(family)) {
+                return Err(error);
+            }
+            doc["allowed_endpoints"] = Value::Array(before.clone());
+            tenants::put(&mut *conn, ctx, Kind::ApiKeys, k.id, &doc, &owner(k.id)).await?;
+            return Ok(());
         }
-        doc["allowed_endpoints"] = Value::Array(before.clone());
+        // 首次创建也保留旧7族，完整重验后记为 v4，后续追平再开放新族。
+        doc["allowed_endpoints"] = json!(LEGACY_ENDPOINTS);
         tenants::put(&mut *conn, ctx, Kind::ApiKeys, k.id, &doc, &owner(k.id)).await?;
-        return Ok(());
+        version = 4;
     }
     sqlx::query("UPDATE tenant_keys SET doc_version = $2 WHERE id = $1 AND doc_version <> $2")
         .bind(k.id)

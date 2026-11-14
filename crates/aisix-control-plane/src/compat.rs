@@ -88,6 +88,9 @@ impl FieldFloor {
 // allowed_endpoints 的通用门槛与客户新增族共用发行版本，正式发布只固定这一处。
 const API_KEY_ENDPOINTS_SINCE: Since = Since::ThisRelease;
 
+// 首个已发布并验证支持客户接口隔离的网关源码；控制面独立热修复仍识别其真实标记。
+const CUSTOMER_ENDPOINT_EXPANSION_DEV_SHA: &str = "08ff931722b737d40a8942a9e55de94afc9b51d5";
+
 /// Every field older gateways would misread in a way that opens what it
 /// closes, or that quietly withholds what it grants. A new field whose
 /// absence is fail-open on an older gateway gets a row here, and so does a
@@ -186,7 +189,14 @@ fn supports_customer_endpoint_expansion(version: &str, cp_version: &str) -> bool
             (7..=40).contains(&sha.len()) && sha.bytes().all(|byte| byte.is_ascii_hexdigit())
         })
     }
-    dev_sha(cp_version).is_some_and(|sha| dev_sha(version) == Some(sha))
+    let Some(cp_sha) = dev_sha(cp_version) else {
+        return false;
+    };
+    dev_sha(version).is_some_and(|sha| {
+        sha == cp_sha
+            || sha == CUSTOMER_ENDPOINT_EXPANSION_DEV_SHA
+            || sha == &CUSTOMER_ENDPOINT_EXPANSION_DEV_SHA[..7]
+    })
 }
 
 fn customer_endpoint_expansion(kind: Kind, doc: &Value, stored: &Value) -> bool {
@@ -520,7 +530,7 @@ pub async fn gate(
             return Err(too_old(
                 "/allowed_endpoints",
                 format!(
-                    "客户接口扩展需要全部网关满足接口隔离版本，或与控制面使用相同的已标记开发构建；\
+                    "客户接口扩展需要全部网关满足接口隔离版本，或使用已确认支持的已标记开发构建；\
                      当前有 {unsupported} 个实例无法确认支持"
                 ),
             ));

@@ -4379,30 +4379,29 @@ async fn customer_endpoint_expansion_defers_boot_catch_up_and_keeps_edits_on_v4_
     assert_eq!(doc_version(&upgraded, &key).await, 4);
     let before_mint = (
         upgraded.count("tenant_keys").await,
+        upgraded.count("gw_resources").await,
         audit_rows(&upgraded).await,
     );
-    let refused = mint(&upgraded, &owner, json!({"label": "customer-waits-v9"})).await;
-    assert_eq!(refused.status, 503, "{refused:?}");
-    assert_eq!(refused.body["code"], "unavailable");
-    let fields: BTreeSet<&str> = refused
-        .body
-        .as_object()
-        .expect("an error")
-        .keys()
-        .map(String::as_str)
-        .collect();
+    let (fresh, _) = mint_ok(
+        &upgraded,
+        &owner,
+        json!({"label": "customer-keeps-minting-v11"}),
+    )
+    .await;
+    assert_eq!(doc_version(&upgraded, &fresh).await, 4);
     assert_eq!(
-        fields,
-        BTreeSet::from(["code", "error"]),
-        "neutral tenant error only"
+        key_doc(&upgraded, &fresh).await.get("allowed_endpoints"),
+        before.get("allowed_endpoints"),
+        "minting during deferred expansion keeps exactly the legacy grant"
     );
     assert_eq!(
         (
             upgraded.count("tenant_keys").await,
+            upgraded.count("gw_resources").await,
             audit_rows(&upgraded).await
         ),
-        before_mint,
-        "the failed mint rolls back"
+        (before_mint.0 + 1, before_mint.1 + 1, before_mint.2 + 1),
+        "one mint writes exactly one key, document and audit row"
     );
     let revealed = reveal(&upgraded, &owner, &key).await;
     assert_eq!(revealed.status, 200, "{revealed:?}");
@@ -4412,6 +4411,11 @@ async fn customer_endpoint_expansion_defers_boot_catch_up_and_keeps_edits_on_v4_
         .await
         .expect("publish after the fleet proves support");
     assert_eq!((pass.rewritten, pass.deferred), (1, 0));
+    assert_eq!(doc_version(&upgraded, &fresh).await, 5);
+    assert_eq!(
+        key_doc(&upgraded, &fresh).await.get("allowed_endpoints"),
+        Some(&customer_model_endpoints())
+    );
     assert_eq!(doc_version(&upgraded, &key).await, 5);
     let after = key_doc(&upgraded, &key).await;
     expected["allowed_endpoints"] = json!([
@@ -4438,4 +4442,262 @@ async fn customer_endpoint_expansion_defers_boot_catch_up_and_keeps_edits_on_v4_
         after, expected,
         "only the endpoint grant changes after proof"
     );
+}
+
+// 去掉兼容回退会使真实门户和管理端返回503/422；重复创建或丢掉限制也必须失败。
+async fn mint_customer_keys_on_both_apis(
+    cp: &TestCp,
+    admin: &OperatorSession,
+    tenant: Uuid,
+    owner: &MemberSession,
+    model: &str,
+    endpoints: &Value,
+    doc_shape: i32,
+) -> Vec<(String, String)> {
+    let mut minted = Vec::new();
+    for as_admin in [false, true] {
+        let label = if as_admin {
+            "admin-mint-v11"
+        } else {
+            "portal-mint-v11"
+        };
+        let mut body = json!({
+            "label": label, "model_ids": [model],
+            "rate_limit": {"rpm": 23, "concurrency": 3},
+            "expires_at": "2035-01-01T00:00:00Z"
+        });
+        if as_admin {
+            body["member_id"] = json!(owner.id);
+        }
+        let before = (
+            cp.count("tenant_keys").await,
+            cp.count("gw_resources").await,
+            audit_rows(cp).await,
+        );
+        let response = if as_admin {
+            admin_mint(cp, admin, tenant, body).await
+        } else {
+            mint(cp, owner, body).await
+        };
+        assert_eq!(response.status, 201, "{label}: {response:?}");
+        let key = text(&response.body, "/key/id");
+        let plaintext = text(&response.body, "/plaintext");
+        assert_eq!(
+            (
+                cp.count("tenant_keys").await,
+                cp.count("gw_resources").await,
+                audit_rows(cp).await
+            ),
+            (before.0 + 1, before.1 + 1, before.2 + 1),
+            "one mint creates one key, one resource and one audit row"
+        );
+        assert_eq!(response.body["key"].get("version"), Some(&json!(1)));
+        assert_eq!(
+            response.body["key"].get("plaintext_available"),
+            Some(&json!(true))
+        );
+        let creator = if as_admin {
+            json!({"kind":"operator", "id":admin.id})
+        } else {
+            json!({"kind":"member", "id":owner.id})
+        };
+        if as_admin {
+            assert_eq!(response.body["key"].get("created_by"), Some(&creator));
+        } else {
+            assert!(response.body["key"].get("created_by").is_none());
+        }
+        let recorded_creator: Value = sqlx::query_scalar(
+            "SELECT jsonb_build_object('kind', created_by_kind, 'id', created_by) \
+             FROM tenant_keys WHERE id = $1::uuid",
+        )
+        .bind(&key)
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("read the recorded creator");
+        assert_eq!(recorded_creator, creator);
+        let resource = stored(cp, "api_keys", &key).await;
+        assert!(!resource.deleted);
+        assert_eq!(resource.managed_by, Some(format!("key:{key}")));
+        assert_eq!(doc_version(cp, &key).await, doc_shape);
+        assert_eq!(
+            resource.doc,
+            json!({
+                "key_hash": ApiKey::hash_bearer(&plaintext), "display_name":label,
+                "team_id":tenant, "user_id":owner.id,
+                "allowed_model_ids":[model], "allowed_provider_groups":["shared"],
+                "allowed_endpoints": endpoints, "disabled":false,
+                "rate_limit":{"rpm":23,"concurrency":3},
+                "expires_at":"2035-01-01T00:00:00Z"
+            }),
+            "every identity, scope, group and limit is preserved"
+        );
+        let audits: Vec<(String, Option<Uuid>, Option<Uuid>, Value)> = sqlx::query_as(
+            "SELECT actor_kind, actor_id, tenant_id, detail FROM audit_log \
+             WHERE action = 'key.create' AND target_kind = 'api_key' AND target_id = $1",
+        )
+        .bind(&key)
+        .fetch_all(cp.db().pool())
+        .await
+        .expect("read creation audit");
+        assert_eq!(audits.len(), 1, "creation is audited exactly once");
+        assert_eq!(audits[0].0, if as_admin { "operator" } else { "member" });
+        assert_eq!(
+            audits[0].1,
+            Some(if as_admin { admin.id } else { owner.id })
+        );
+        assert_eq!(audits[0].2, Some(tenant));
+        assert!(!audits[0].3.to_string().contains(&plaintext));
+        let revealed = reveal(cp, owner, &key).await;
+        assert_eq!(revealed.status, 200, "{revealed:?}");
+        assert_eq!(revealed.body.get("plaintext"), Some(&json!(plaintext)));
+        minted.push((key, plaintext));
+    }
+    minted
+}
+
+// 只报告新构建的完整清单必须直接发18族，不能把回退变成永久降级。
+#[tokio::test]
+async fn customer_key_mint_new_only_fleet_grants_all_public_families_on_both_apis() {
+    const BUILD: &str = "dev+sha-12ab345";
+    let Some(cp) = TestCp::start_stamped(BUILD).await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let ids = models(&cp, &admin, &["mint-new-v11"]).await;
+    let tenant = cp.seed_tenant(TenantStatus::Active).await;
+    patch_tenant_ok(&cp, &admin, tenant, json!({"allowed_model_ids":ids})).await;
+    let owner = cp.member_login_seeded(tenant, MemberRole::Owner).await;
+    let gw = register_gateway(&cp, &admin).await;
+    beat(&gw, "mint-current-v11", BUILD).await;
+    mint_customer_keys_on_both_apis(
+        &cp,
+        &admin,
+        tenant,
+        &owner,
+        &ids[0],
+        &customer_model_endpoints(),
+        5,
+    )
+    .await;
+}
+
+// 混合版本仍可新建旧7族；后续收紧、撤销和追平都不得改变身份、限额或密文。
+#[tokio::test]
+async fn customer_key_mint_mixed_fleet_uses_legacy_grants_and_later_catches_up_without_reopening() {
+    const BUILD: &str = "dev+sha-12ab345";
+    let Some(cp) = TestCp::start_stamped(BUILD).await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let ids = models(&cp, &admin, &["mint-kept-v11", "mint-unused-v11"]).await;
+    let tenant = cp.seed_tenant(TenantStatus::Active).await;
+    patch_tenant_ok(&cp, &admin, tenant, json!({"allowed_model_ids":ids})).await;
+    let owner = cp.member_login_seeded(tenant, MemberRole::Owner).await;
+    let gw = register_gateway(&cp, &admin).await;
+    beat(&gw, "mint-current-v11", BUILD).await;
+    beat(&gw, "mint-old-v11", "dev+sha-f0f2360").await;
+    let legacy = json!([
+        "chat_completions",
+        "completions",
+        "messages",
+        "count_tokens",
+        "responses",
+        "embeddings",
+        "models"
+    ]);
+    let keys =
+        mint_customer_keys_on_both_apis(&cp, &admin, tenant, &owner, &ids[0], &legacy, 4).await;
+    let ctx = WriteCtx::of(cp.state());
+    let pending = keys::catch_up(cp.db(), &ctx, KEY_DOC_VERSION)
+        .await
+        .expect("defer expansion");
+    assert_eq!((pending.rewritten, pending.deferred), (0, 1));
+    assert!(pending.failed.is_empty());
+    let disabled = on_key(
+        &cp,
+        &owner,
+        "PATCH",
+        &keys[0].0,
+        Some(json!({"disabled":true})),
+    )
+    .await;
+    assert_eq!(disabled.status, 200, "{disabled:?}");
+    let removed = on_key(&cp, &owner, "DELETE", &keys[1].0, None).await;
+    assert_eq!(removed.status, 204, "{removed:?}");
+    let gone = stored(&cp, "api_keys", &keys[1].0).await;
+    assert!(gone.deleted);
+    let before = key_doc(&cp, &keys[0].0).await;
+    assert_eq!(before.get("allowed_endpoints"), Some(&legacy));
+    assert_eq!(before.get("disabled"), Some(&json!(true)));
+    assert_eq!(doc_version(&cp, &keys[0].0).await, 4);
+    let sealed_before: String =
+        sqlx::query_scalar("SELECT sealed_plaintext FROM tenant_keys WHERE id = $1::uuid")
+            .bind(&keys[0].0)
+            .fetch_one(cp.db().pool())
+            .await
+            .expect("read sealed key");
+    beat(&gw, "mint-old-v11", BUILD).await;
+    let pass = keys::catch_up(cp.db(), &ctx, KEY_DOC_VERSION)
+        .await
+        .expect("promote after proof");
+    assert_eq!((pass.rewritten, pass.deferred), (1, 0));
+    assert!(pass.failed.is_empty());
+    let mut expected = before;
+    expected["allowed_endpoints"] = customer_model_endpoints();
+    assert_eq!(key_doc(&cp, &keys[0].0).await, expected);
+    assert_eq!(doc_version(&cp, &keys[0].0).await, 5);
+    assert_eq!(doc_version(&cp, &keys[1].0).await, 4);
+    let still_gone = stored(&cp, "api_keys", &keys[1].0).await;
+    assert!(still_gone.deleted);
+    assert_eq!(still_gone.seq, gone.seq);
+    let sealed_after: String =
+        sqlx::query_scalar("SELECT sealed_plaintext FROM tenant_keys WHERE id = $1::uuid")
+            .bind(&keys[0].0)
+            .fetch_one(cp.db().pool())
+            .await
+            .expect("read unchanged sealed key");
+    assert_eq!(sealed_after, sealed_before);
+    let again = keys::catch_up(cp.db(), &ctx, KEY_DOC_VERSION)
+        .await
+        .expect("repeat catch-up");
+    assert_eq!((again.rewritten, again.deferred), (0, 0));
+    assert!(again.failed.is_empty());
+}
+
+// 开发构建不明或实例上限只挡新增族；通用门槛仍认可的旧7族可以创建。
+#[tokio::test]
+async fn customer_key_mint_uncertain_or_capped_fleet_keeps_legacy_grants_on_both_apis() {
+    const BUILD: &str = "dev+sha-12ab345";
+    for (version, capped) in [("dev", false), (BUILD, true)] {
+        let Some(cp) = TestCp::start_stamped(BUILD).await else {
+            return;
+        };
+        let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+        let ids = models(&cp, &admin, &["mint-uncertain-v11"]).await;
+        let tenant = cp.seed_tenant(TenantStatus::Active).await;
+        patch_tenant_ok(&cp, &admin, tenant, json!({"allowed_model_ids":ids})).await;
+        let owner = cp.member_login_seeded(tenant, MemberRole::Owner).await;
+        let gw = register_gateway(&cp, &admin).await;
+        beat(&gw, "mint-uncertain-v11", version).await;
+        if capped {
+            let updated = sqlx::query(
+                "UPDATE dp_credentials SET instance_cap_hit_at = now() WHERE dp_id = $1::uuid",
+            )
+            .bind(&gw.0)
+            .execute(cp.db().pool())
+            .await
+            .expect("record a real incomplete fleet");
+            assert_eq!(updated.rows_affected(), 1);
+        }
+        let legacy = json!([
+            "chat_completions",
+            "completions",
+            "messages",
+            "count_tokens",
+            "responses",
+            "embeddings",
+            "models"
+        ]);
+        mint_customer_keys_on_both_apis(&cp, &admin, tenant, &owner, &ids[0], &legacy, 4).await;
+    }
 }
