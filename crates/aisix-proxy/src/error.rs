@@ -339,6 +339,9 @@ pub enum ProxyError {
     /// refusal of the request itself (`crate::platform_errors`).
     #[error("request payload is invalid: {0}")]
     TargetRefused(String),
+    /// 原生对象的持久生命周期事务尚未完成。
+    #[error("native object has pending lifecycle operations")]
+    NativeOperationConflict,
     /// A non-WebSocket request reached the WebSocket-only realtime
     /// endpoint. Carries the upgrade layer's own classification — 400 for
     /// malformed upgrade headers, 426 for a connection that cannot
@@ -621,6 +624,7 @@ impl ProxyError {
                 StatusCode::BAD_REQUEST
             }
             ProxyError::JobListRefused => StatusCode::FORBIDDEN,
+            ProxyError::NativeOperationConflict => StatusCode::CONFLICT,
             ProxyError::InvalidRequest(_)
             | ProxyError::UnusableTarget(_)
             | ProxyError::TargetRefused(_) => StatusCode::BAD_REQUEST,
@@ -684,6 +688,7 @@ impl ProxyError {
                 "invalid_request_error"
             }
             ProxyError::JobListRefused => "permission_denied",
+            ProxyError::NativeOperationConflict => "invalid_request_error",
             ProxyError::InvalidRequest(_)
             | ProxyError::UnusableTarget(_)
             | ProxyError::TargetRefused(_) => "invalid_request_error",
@@ -847,6 +852,7 @@ impl ProxyError {
             }
             ProxyError::BudgetExceeded(r) => env.with_code("budget_exceeded").with_budget(r),
             ProxyError::BudgetUnverified => env.with_code("budget_unverified"),
+            ProxyError::NativeOperationConflict => env.with_code("native_operation_conflict"),
             ProxyError::AccountUnavailable => env.with_code("control_plane_unavailable"),
             ProxyError::Bridge(aisix_gateway::BridgeError::DependencyUnavailable) => {
                 env.with_code("control_plane_unavailable")

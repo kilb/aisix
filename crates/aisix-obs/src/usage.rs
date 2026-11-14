@@ -1268,7 +1268,11 @@ pub struct UsageSink {
     metrics: Option<crate::metrics::Metrics>,
     drop_warnings: std::sync::Arc<DropWarnings>,
     io_audit_tx: Option<tokio::sync::mpsc::Sender<UsageIoAuditUpdate>>,
+    durable_tx: Option<tokio::sync::mpsc::Sender<DurableUsageRequest>>,
 }
+
+mod durable;
+pub use durable::{DurableUsageError, DurableUsageEvent, DurableUsageRequest};
 
 /// 只携带标量长度，不能作为一条计费用量事件。
 #[derive(Debug, Clone, Serialize)]
@@ -1413,6 +1417,31 @@ pub fn bounded_inbound_protocol(raw: &str) -> &'static str {
 }
 
 impl UsageSink {
+    /// 只在控制面明确接收后成功；任何失败或取消都由原持久 outbox 重试。
+    pub async fn emit_durable(&self, event: DurableUsageEvent) -> Result<(), DurableUsageError> {
+        let tx = self
+            .durable_tx
+            .as_ref()
+            .ok_or(DurableUsageError::Unavailable)?;
+        let (request, receipt) = DurableUsageRequest::new(event);
+        tx.try_send(request).map_err(|error| match error {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => DurableUsageError::QueueFull,
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => DurableUsageError::QueueClosed,
+        })?;
+        tokio::time::timeout(std::time::Duration::from_secs(15), receipt)
+            .await
+            .map_err(|_| DurableUsageError::TimedOut)?
+            .map_err(|_| DurableUsageError::ReceiptLost)?
+    }
+
+    pub fn with_durable_sender(
+        mut self,
+        tx: tokio::sync::mpsc::Sender<DurableUsageRequest>,
+    ) -> Self {
+        self.durable_tx = Some(tx);
+        self
+    }
+
     /// Events waiting in the queue to the control plane, not counting a
     /// batch the reporter has already taken off it.
     pub fn queued(&self) -> u64 {
@@ -1430,6 +1459,7 @@ impl UsageSink {
             metrics: None,
             drop_warnings: Default::default(),
             io_audit_tx: None,
+            durable_tx: None,
         }
     }
 
@@ -1442,6 +1472,7 @@ impl UsageSink {
             metrics: None,
             drop_warnings: Default::default(),
             io_audit_tx: None,
+            durable_tx: None,
         }
     }
 

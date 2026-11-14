@@ -195,6 +195,42 @@ pub fn build_router(state: ProxyState) -> Router {
         .route("/v1/uploads/:id/parts", post(native_api::openai_uploads::create_part))
         .route("/v1/uploads/:id/complete", post(native_api::openai_uploads::complete_upload))
         .route("/v1/uploads/:id/cancel", post(native_api::openai_uploads::cancel_upload))
+        .route("/v1/conversations", post(native_api::openai_conversations::create))
+        .route("/v1/conversations/:id", get(native_api::openai_conversations::retrieve).post(native_api::openai_conversations::update).delete(native_api::openai_conversations::delete))
+        .route("/v1/conversations/:id/items", get(native_api::openai_conversations::list_items).post(native_api::openai_conversations::create_items))
+        .route("/v1/conversations/:id/items/:item_id", get(native_api::openai_conversations::retrieve_item).delete(native_api::openai_conversations::delete_item))
+        .route("/v1/containers", post(native_api::openai_containers::create_container).get(native_api::openai_containers::list_containers))
+        .route("/v1/containers/:id", get(native_api::openai_containers::retrieve_container).delete(native_api::openai_containers::delete_container))
+        .route("/v1/containers/:id/files", post(native_api::openai_containers::create_file).get(native_api::openai_containers::list_files))
+        .route("/v1/containers/:id/files/:file_id", get(native_api::openai_containers::retrieve_file).delete(native_api::openai_containers::delete_file))
+        .route("/v1/containers/:id/files/:file_id/content", get(native_api::openai_containers::file_content))
+        .route("/v1/vector_stores", post(native_api::openai_vector_stores::create).get(native_api::openai_vector_stores::list))
+        .route("/v1/vector_stores/:id", get(native_api::openai_vector_stores::get).post(native_api::openai_vector_stores::update).delete(native_api::openai_vector_stores::delete))
+        .route("/v1/vector_stores/:id/search", post(native_api::openai_vector_stores::search))
+        .route("/v1/vector_stores/:id/files", post(native_api::openai_vector_stores::attach_file).get(native_api::openai_vector_stores::list_files))
+        .route("/v1/vector_stores/:id/files/:file_id", get(native_api::openai_vector_stores::get_file).post(native_api::openai_vector_stores::update_file).delete(native_api::openai_vector_stores::detach_file))
+        .route("/v1/vector_stores/:id/files/:file_id/content", get(native_api::openai_vector_stores::file_content))
+        .route("/v1/vector_stores/:id/file_batches", post(native_api::openai_vector_stores::create_batch))
+        .route("/v1/vector_stores/:id/file_batches/:batch_id", get(native_api::openai_vector_stores::get_batch))
+        .route("/v1/vector_stores/:id/file_batches/:batch_id/cancel", post(native_api::openai_vector_stores::cancel_batch))
+        .route("/v1/vector_stores/:id/file_batches/:batch_id/files", get(native_api::openai_vector_stores::batch_files))
+        .route("/v1/skills", get(native_api::skills::collection).post(native_api::skills::collection))
+        .route("/v1/skills/:id", get(native_api::skills::addressed).post(native_api::skills::addressed).delete(native_api::skills::addressed))
+        .route("/v1/skills/:id/content", get(native_api::skills::content))
+        .route("/v1/skills/:id/versions", get(native_api::skills::versions).post(native_api::skills::versions))
+        .route("/v1/skills/:id/versions/:version", get(native_api::skills::version).delete(native_api::skills::version))
+        .route("/v1/skills/:id/versions/:version/content", get(native_api::skills::version_content))
+        .route("/v1/audio/voice_consents", get(native_api::voices::consents).post(native_api::voices::consents))
+        .route("/v1/audio/voice_consents/:id", get(native_api::voices::consent).post(native_api::voices::consent).delete(native_api::voices::consent))
+        .route("/v1/audio/voices", post(native_api::voices::create))
+        .route("/v1/audio/voices/:id", axum::routing::delete(native_api::voices::delete))
+        .route("/v1/evals", post(native_api::openai_evals::handle).get(native_api::openai_evals::handle))
+        .route("/v1/evals/:eval_id", get(native_api::openai_evals::handle).post(native_api::openai_evals::handle).delete(native_api::openai_evals::handle))
+        .route("/v1/evals/:eval_id/runs", post(native_api::openai_evals::handle).get(native_api::openai_evals::handle))
+        .route("/v1/evals/:eval_id/runs/:run_id", get(native_api::openai_evals::handle).delete(native_api::openai_evals::handle))
+        .route("/v1/evals/:eval_id/runs/:run_id/cancel", post(native_api::openai_evals::handle))
+        .route("/v1/evals/:eval_id/runs/:run_id/output_items", get(native_api::openai_evals::handle))
+        .route("/v1/evals/:eval_id/runs/:run_id/output_items/:output_item_id", get(native_api::openai_evals::handle))
         .route("/v1/messages", post(messages::messages))
         .route(
             "/v1/messages/count_tokens",
@@ -482,6 +518,15 @@ fn normalize_endpoint_label(path: &str) -> &'static str {
         "/v1/moderations" => "/v1/moderations",
         "/v1/content_provenance_checks" => "/v1/content_provenance_checks",
         "/v1/uploads" => "/v1/uploads",
+        "/v1/skills" => "/v1/skills",
+        "/v1/audio/voice_consents" => "/v1/audio/voice_consents",
+        "/v1/audio/voices" => "/v1/audio/voices",
+        "/v1/evals" => "/v1/evals",
+
+        "/v1/conversations" => "/v1/conversations",
+        "/v1/containers" => "/v1/containers",
+        "/v1/vector_stores" => "/v1/vector_stores",
+
         "/v1/completions" => "/v1/completions",
         "/v1/embeddings" => "/v1/embeddings",
         "/v1/images/generations" => "/v1/images/generations",
@@ -511,6 +556,117 @@ fn normalize_endpoint_label(path: &str) -> &'static str {
                 (Some(id), None, None) if !id.is_empty() => "/v1/chat/completions/:id",
                 (Some(id), Some("messages"), None) if !id.is_empty() => {
                     "/v1/chat/completions/:id/messages"
+                }
+                _ => "other",
+            }
+        }
+        _ if path.starts_with("/v1/conversations/") => {
+            let parts: Vec<_> = path["/v1/conversations/".len()..].split('/').collect();
+            match parts.as_slice() {
+                [id] if !id.is_empty() => "/v1/conversations/:id",
+                [id, "items"] if !id.is_empty() => "/v1/conversations/:id/items",
+                [id, "items", item_id] if !id.is_empty() && !item_id.is_empty() => {
+                    "/v1/conversations/:id/items/:item_id"
+                }
+                _ => "other",
+            }
+        }
+        _ if path.starts_with("/v1/containers/") => {
+            let parts: Vec<_> = path["/v1/containers/".len()..].split('/').collect();
+            match parts.as_slice() {
+                [id] if !id.is_empty() => "/v1/containers/:id",
+                [id, "files"] if !id.is_empty() => "/v1/containers/:id/files",
+                [id, "files", file_id] if !id.is_empty() && !file_id.is_empty() => {
+                    "/v1/containers/:id/files/:file_id"
+                }
+                [id, "files", file_id, "content"] if !id.is_empty() && !file_id.is_empty() => {
+                    "/v1/containers/:id/files/:file_id/content"
+                }
+                _ => "other",
+            }
+        }
+        _ if path.starts_with("/v1/vector_stores/") => {
+            let parts: Vec<_> = path["/v1/vector_stores/".len()..].split('/').collect();
+            match parts.as_slice() {
+                [id] if !id.is_empty() => "/v1/vector_stores/:id",
+                [id, "search"] if !id.is_empty() => "/v1/vector_stores/:id/search",
+                [id, "files"] if !id.is_empty() => "/v1/vector_stores/:id/files",
+                [id, "files", file_id] if !id.is_empty() && !file_id.is_empty() => {
+                    "/v1/vector_stores/:id/files/:file_id"
+                }
+                [id, "files", file_id, "content"] if !id.is_empty() && !file_id.is_empty() => {
+                    "/v1/vector_stores/:id/files/:file_id/content"
+                }
+                [id, "file_batches"] if !id.is_empty() => "/v1/vector_stores/:id/file_batches",
+                [id, "file_batches", batch_id] if !id.is_empty() && !batch_id.is_empty() => {
+                    "/v1/vector_stores/:id/file_batches/:batch_id"
+                }
+                [id, "file_batches", batch_id, "cancel"]
+                    if !id.is_empty() && !batch_id.is_empty() =>
+                {
+                    "/v1/vector_stores/:id/file_batches/:batch_id/cancel"
+                }
+                [id, "file_batches", batch_id, "files"]
+                    if !id.is_empty() && !batch_id.is_empty() =>
+                {
+                    "/v1/vector_stores/:id/file_batches/:batch_id/files"
+                }
+                _ => "other",
+            }
+        }
+        _ if path.starts_with("/v1/skills/") => {
+            let parts: Vec<_> = path["/v1/skills/".len()..].split('/').collect();
+            match parts.as_slice() {
+                [id] if !id.is_empty() => "/v1/skills/:id",
+                [id, "content"] if !id.is_empty() => "/v1/skills/:id/content",
+                [id, "versions"] if !id.is_empty() => "/v1/skills/:id/versions",
+                [id, "versions", version] if !id.is_empty() && !version.is_empty() => {
+                    "/v1/skills/:id/versions/:version"
+                }
+                [id, "versions", version, "content"] if !id.is_empty() && !version.is_empty() => {
+                    "/v1/skills/:id/versions/:version/content"
+                }
+                _ => "other",
+            }
+        }
+        _ if path.starts_with("/v1/audio/voice_consents/") => {
+            let parts: Vec<_> = path["/v1/audio/voice_consents/".len()..]
+                .split('/')
+                .collect();
+            match parts.as_slice() {
+                [id] if !id.is_empty() => "/v1/audio/voice_consents/:id",
+                _ => "other",
+            }
+        }
+        _ if path.starts_with("/v1/audio/voices/") => {
+            let parts: Vec<_> = path["/v1/audio/voices/".len()..].split('/').collect();
+            match parts.as_slice() {
+                [id] if !id.is_empty() => "/v1/audio/voices/:id",
+                _ => "other",
+            }
+        }
+        _ if path.starts_with("/v1/evals/") => {
+            let parts: Vec<_> = path["/v1/evals/".len()..].split('/').collect();
+            match parts.as_slice() {
+                [eval_id] if !eval_id.is_empty() => "/v1/evals/:eval_id",
+                [eval_id, "runs"] if !eval_id.is_empty() => "/v1/evals/:eval_id/runs",
+                [eval_id, "runs", run_id] if !eval_id.is_empty() && !run_id.is_empty() => {
+                    "/v1/evals/:eval_id/runs/:run_id"
+                }
+                [eval_id, "runs", run_id, "cancel"]
+                    if !eval_id.is_empty() && !run_id.is_empty() =>
+                {
+                    "/v1/evals/:eval_id/runs/:run_id/cancel"
+                }
+                [eval_id, "runs", run_id, "output_items"]
+                    if !eval_id.is_empty() && !run_id.is_empty() =>
+                {
+                    "/v1/evals/:eval_id/runs/:run_id/output_items"
+                }
+                [eval_id, "runs", run_id, "output_items", output_item_id]
+                    if !eval_id.is_empty() && !run_id.is_empty() && !output_item_id.is_empty() =>
+                {
+                    "/v1/evals/:eval_id/runs/:run_id/output_items/:output_item_id"
                 }
                 _ => "other",
             }
@@ -768,7 +924,8 @@ async fn record_request_telemetry(
     // suffix (or any 404 path) would otherwise let an unauthenticated
     // caller mint unbounded Prometheus time series (#451).
     let endpoint = normalize_endpoint_label(request.uri().path());
-    let inbound_protocol = if matches!(endpoint, "/v1/files" | "/v1/files/:id")
+    let inbound_protocol = if (matches!(endpoint, "/v1/files" | "/v1/files/:id")
+        || endpoint.starts_with("/v1/skills"))
         && native_api::anthropic::is_anthropic(request.headers())
     {
         "anthropic"
@@ -1407,7 +1564,10 @@ async fn enforce_request_body_limit(
     let body_limit = state.request_body_limit_for(path);
     let is_anthropic_path = path == "/v1/messages"
         || path.starts_with("/v1/messages/")
-        || ((path == "/v1/files" || path.starts_with("/v1/files/"))
+        || ((path == "/v1/files"
+            || path.starts_with("/v1/files/")
+            || path == "/v1/skills"
+            || path.starts_with("/v1/skills/"))
             && native_api::anthropic::is_anthropic(request.headers()));
     let envelope = if is_anthropic_path {
         reject::Envelope::Anthropic

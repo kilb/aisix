@@ -6,9 +6,11 @@ use std::time::Instant;
 
 use aisix_core::models::EndpointFamily;
 use aisix_core::native_objects::{
-    configured_native_origin, native_file_consumer_allowed, BeginRequest, BindRequest,
-    InferenceStage, LookupRequest, NativeEntry, NativeObjectKind, NativeProtocol, NativeRecord,
-    ObjectLocator, OriginBinding, OwnedRequest, TombstoneRequest,
+    configured_native_endpoint_at, configured_native_origin_at, native_object_consumer_allowed,
+    native_origin_surface, AcceptedReference, BeginRelatedRequest, BeginRequest,
+    BindRelatedRequest, BindRequest, BoundRelation, InferenceStage, LookupRequest, NativeEntry,
+    NativeObjectKind, NativeOriginSurface, NativeProtocol, NativeRecord, ObjectLocator,
+    OriginBinding, OwnedRequest, TombstoneRequest,
 };
 use aisix_core::{Adapter, AisixSnapshot};
 use aisix_obs::UsageEvent;
@@ -60,7 +62,6 @@ where
 }
 
 pub(crate) fn registry(state: &ProxyState) -> Result<Arc<dyn NativeObjectRegistry>, ProxyError> {
-    state.platform().ok_or(ProxyError::AccountUnavailable)?;
     state
         .native_objects
         .clone()
@@ -68,11 +69,11 @@ pub(crate) fn registry(state: &ProxyState) -> Result<Arc<dyn NativeObjectRegistr
 }
 
 pub(crate) fn api_key_id(auth: &AuthenticatedKey) -> Result<Uuid, ProxyError> {
-    Uuid::parse_str(&auth.entry.id).map_err(|_| ProxyError::AccountUnavailable)
+    super::openai::api_key_id(auth)
 }
 
 fn not_found() -> ProxyError {
-    ProxyError::JobResourceNotFound("file".into())
+    ProxyError::JobResourceNotFound("native object".into())
 }
 fn registry_error(error: NativeRegistryError) -> ProxyError {
     match error {
@@ -98,7 +99,101 @@ pub(crate) fn resolve_target(
     client: &ClientContext,
     kind: NativeObjectKind,
 ) -> Result<(JobTarget, OriginBinding), ProxyError> {
-    resolve_target_for_request(state, snapshot, auth, wanted, wanted, client, kind)
+    resolve(state, snapshot, auth, client, wanted, kind)
+}
+
+pub(crate) fn resolve(
+    state: &ProxyState,
+    snapshot: &AisixSnapshot,
+    auth: &AuthenticatedKey,
+    client: &ClientContext,
+    wanted: &str,
+    kind: NativeObjectKind,
+) -> Result<(JobTarget, OriginBinding), ProxyError> {
+    resolve_for_requested_family(
+        state, snapshot, auth, client, wanted, wanted, kind, None, true, None,
+    )
+}
+
+pub(crate) fn resolve_management(
+    state: &ProxyState,
+    snapshot: &AisixSnapshot,
+    auth: &AuthenticatedKey,
+    client: &ClientContext,
+    wanted: &str,
+    kind: NativeObjectKind,
+) -> Result<(JobTarget, OriginBinding), ProxyError> {
+    resolve_for_requested_family(
+        state, snapshot, auth, client, wanted, wanted, kind, None, false, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_reference_for_requested(
+    state: &ProxyState,
+    snapshot: &AisixSnapshot,
+    auth: &AuthenticatedKey,
+    client: &ClientContext,
+    direct: &str,
+    requested: &str,
+    kind: NativeObjectKind,
+    consumer_family: EndpointFamily,
+) -> Result<(JobTarget, OriginBinding), ProxyError> {
+    resolve_for_requested_family(
+        state,
+        snapshot,
+        auth,
+        client,
+        direct,
+        requested,
+        kind,
+        Some(consumer_family),
+        false,
+        None,
+    )
+}
+
+fn reference_family(
+    kind: NativeObjectKind,
+    consumer: Option<EndpointFamily>,
+) -> Result<EndpointFamily, ProxyError> {
+    match consumer {
+        None => Ok(kind.endpoint_family()),
+        Some(family) if native_object_consumer_allowed(NativeProtocol::Anthropic, kind, family) => {
+            Ok(family)
+        }
+        Some(_) => Err(not_found()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_for_requested_family(
+    state: &ProxyState,
+    snapshot: &AisixSnapshot,
+    auth: &AuthenticatedKey,
+    client: &ClientContext,
+    direct: &str,
+    requested: &str,
+    kind: NativeObjectKind,
+    consumer: Option<EndpointFamily>,
+    check_provider_budget: bool,
+    surface: Option<NativeOriginSurface>,
+) -> Result<(JobTarget, OriginBinding), ProxyError> {
+    let current = super::openai::current_auth(snapshot, auth)?;
+    if !current.key().can_call(reference_family(kind, consumer)?) {
+        return Err(not_found());
+    }
+    resolve_target_authorized(
+        state,
+        snapshot,
+        &current,
+        direct,
+        requested,
+        client,
+        kind,
+        check_provider_budget,
+        surface,
+    )
 }
 
 fn resolve_target_for_request(
@@ -110,7 +205,28 @@ fn resolve_target_for_request(
     client: &ClientContext,
     kind: NativeObjectKind,
 ) -> Result<(JobTarget, OriginBinding), ProxyError> {
-    let platform = state.platform().ok_or(ProxyError::AccountUnavailable)?;
+    resolve_target_authorized(
+        state, snapshot, auth, wanted, requested, client, kind, false, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_target_authorized(
+    state: &ProxyState,
+    snapshot: &AisixSnapshot,
+    auth: &AuthenticatedKey,
+    wanted: &str,
+    requested: &str,
+    client: &ClientContext,
+    kind: NativeObjectKind,
+    check_provider_budget: bool,
+    surface: Option<NativeOriginSurface>,
+) -> Result<(JobTarget, OriginBinding), ProxyError> {
+    let current = super::openai::current_auth(snapshot, auth)?;
+    let auth = &current;
+    let origin_key = state
+        .native_origin_key()
+        .ok_or(ProxyError::AccountUnavailable)?;
     let model_entry = crate::model_resolve::resolve_model(snapshot, wanted)
         .ok_or_else(|| ProxyError::ModelNotFound(wanted.into()))?;
     if !auth.key().can_access(snapshot, requested) {
@@ -132,19 +248,41 @@ fn resolve_target_for_request(
     }
     crate::dispatch::check_ip_access(model, &client.source_ip)?;
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
-    crate::budget::gate(state, snapshot).check_provider_key(&pk_entry.id)?;
-    let provider_key_id =
-        Uuid::parse_str(&pk_entry.id).map_err(|_| ProxyError::AccountUnavailable)?;
+    let surface = surface.or(Some(native_origin_surface(NativeProtocol::Anthropic, kind)));
+    let declared = surface == Some(NativeOriginSurface::Messages)
+        && pk_entry
+            .value
+            .apis
+            .as_ref()
+            .is_some_and(|apis| apis.messages.is_some())
+        && !matches!(
+            pk_entry.value.adapter,
+            Some(Adapter::Bedrock | Adapter::Vertex | Adapter::AzureOpenai)
+        );
+    let native = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value).map_or_else(
+        || aisix_gateway::hub::upstream_protocol(&pk_entry.value) == "anthropic",
+        |bridge| bridge.wire_protocol() == "anthropic",
+    );
+    if !declared && !native {
+        return Err(ProxyError::TargetRefused(
+            "the selected account does not declare the native Anthropic protocol".into(),
+        ));
+    }
+    if check_provider_budget {
+        crate::budget::gate(state, snapshot).check_provider_key(&pk_entry.id)?;
+    }
+    let provider_key_id = super::openai::resource_id(state, "provider_keys", &pk_entry.id)?;
     let origin = OriginBinding {
-        surface: None,
-        model_id: Uuid::parse_str(&model_entry.id).map_err(|_| ProxyError::AccountUnavailable)?,
+        surface,
+        model_id: super::openai::resource_id(state, "models", &model_entry.id)?,
         provider_key_id,
-        boundary: configured_native_origin(
-            &platform.id_key,
+        boundary: configured_native_origin_at(
+            &origin_key,
             provider_key_id,
             &pk_entry.value,
             NativeProtocol::Anthropic,
             kind,
+            surface,
         )
         .map_err(|_| ProxyError::AccountUnavailable)?,
     };
@@ -158,7 +296,7 @@ fn resolve_target_for_request(
     );
     let extra_headers = aisix_gateway::resolve_default_headers(&context);
     let forwarded_client = aisix_gateway::ForwardedClientHeaders::resolve(&context);
-    // workspace 会改变存储账号。调用方只能重复已经纳入边界的静态配置值。
+    // workspace 会改变存储账号，调用方只能重复已纳入边界的静态配置值。
     if let Some(workspace) = client.headers.get("anthropic-workspace-id") {
         if !extra_headers
             .iter()
@@ -169,11 +307,10 @@ fn resolve_target_for_request(
             ));
         }
     }
-    let requested_id = crate::model_resolve::resolve_model(snapshot, requested)
-        .ok_or_else(|| ProxyError::ModelNotFound(requested.into()))?
-        .id
-        .clone();
-    crate::attribution::note_requested_model(requested, &requested_id);
+    let requested_entry = crate::model_resolve::resolve_model(snapshot, requested)
+        .ok_or_else(|| ProxyError::ModelNotFound(requested.into()))?;
+    crate::dispatch::check_ip_access(&requested_entry.value, &client.source_ip)?;
+    crate::attribution::note_requested_model(requested, &requested_entry.id);
     crate::attribution::note_resolved_entry(&model_entry.id);
     crate::attribution::note_target(model, &pk_entry.id);
     Ok((
@@ -189,7 +326,7 @@ fn resolve_target_for_request(
     ))
 }
 
-/// 文件消费沿用真实调用面的权限，账号与模型证明仍使用文件自身的原生边界。
+/// Messages/CountTokens 借用文件消费权限，指纹仍取实际 Messages 派发面。
 #[allow(clippy::too_many_arguments)]
 fn resolve_target_for_consumer(
     state: &ProxyState,
@@ -201,26 +338,15 @@ fn resolve_target_for_consumer(
     kind: NativeObjectKind,
     consumer: EndpointFamily,
 ) -> Result<(JobTarget, OriginBinding), ProxyError> {
-    if !native_file_consumer_allowed(NativeProtocol::Anthropic, consumer) {
-        return Err(not_found());
-    }
     let current = super::openai::current_auth(snapshot, auth)?;
-    if !current.key().can_call(consumer) {
+    if !native_object_consumer_allowed(NativeProtocol::Anthropic, NativeObjectKind::File, consumer)
+        || !current.key().can_call(consumer)
+    {
         return Err(not_found());
     }
-    let requested_entry =
-        crate::model_resolve::resolve_model(snapshot, requested).ok_or_else(not_found)?;
-    crate::dispatch::check_ip_access(&requested_entry.value, &client.source_ip)?;
-    let (target, origin) =
-        resolve_target_for_request(state, snapshot, &current, wanted, requested, client, kind)?;
-    let native = crate::dispatch::resolve_bridge(&state.hub, &target.pk_entry.value).map_or_else(
-        || aisix_gateway::hub::upstream_protocol(&target.pk_entry.value) == "anthropic",
-        |bridge| bridge.wire_protocol() == "anthropic",
-    );
-    if !native {
-        return Err(not_found());
-    }
-    Ok((target, origin))
+    resolve_target_authorized(
+        state, snapshot, &current, wanted, requested, client, kind, false, None,
+    )
 }
 
 pub(crate) enum Body {
@@ -321,25 +447,76 @@ pub(crate) async fn send(
     query: &str,
     body: Body,
 ) -> Result<(StatusCode, HeaderMap, Bytes), ProxyError> {
-    let key = &target.pk_entry.value;
-    let base = if path.starts_with("/messages/batches") {
-        crate::dispatch::resolve_base_url_for(key, aisix_core::ApiSurface::Messages)?
+    let kind = if path == "/messages/batches" || path.starts_with("/messages/batches/") {
+        NativeObjectKind::MessageBatch
+    } else if path == "/skills" || path.starts_with("/skills/") {
+        NativeObjectKind::Skill
+    } else if path == "/messages/containers" || path.starts_with("/messages/containers/") {
+        NativeObjectKind::MessageContainer
     } else {
-        key.api_base
-            .as_deref()
-            .map(str::trim)
-            .filter(|base| !base.is_empty())
-            .unwrap_or("https://api.anthropic.com")
-            .trim_end_matches('/')
-            .to_owned()
+        NativeObjectKind::File
     };
+    send_for_kind(state, target, client, kind, method, path, query, body).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn send_for_kind(
+    state: &ProxyState,
+    target: &JobTarget,
+    client: &ClientContext,
+    kind: NativeObjectKind,
+    method: Method,
+    path: &str,
+    query: &str,
+    body: Body,
+) -> Result<(StatusCode, HeaderMap, Bytes), ProxyError> {
+    send_for_surface(state, target, client, kind, None, method, path, query, body).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn send_at_origin(
+    state: &ProxyState,
+    target: &JobTarget,
+    client: &ClientContext,
+    origin: &OriginBinding,
+    kind: NativeObjectKind,
+    method: Method,
+    path: &str,
+    query: &str,
+    body: Body,
+) -> Result<(StatusCode, HeaderMap, Bytes), ProxyError> {
+    send_for_surface(
+        state,
+        target,
+        client,
+        kind,
+        origin.surface,
+        method,
+        path,
+        query,
+        body,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_for_surface(
+    state: &ProxyState,
+    target: &JobTarget,
+    client: &ClientContext,
+    kind: NativeObjectKind,
+    surface: Option<NativeOriginSurface>,
+    method: Method,
+    path: &str,
+    query: &str,
+    body: Body,
+) -> Result<(StatusCode, HeaderMap, Bytes), ProxyError> {
+    let key = &target.pk_entry.value;
+    let base = configured_native_endpoint_at(key, NativeProtocol::Anthropic, kind, surface)
+        .map_err(|_| ProxyError::AccountUnavailable)?;
     // 路径只剥离已知协议端点；配置中的 userinfo、query 保留给 HTTP 客户端。
     let mut url = url::Url::parse(&base).map_err(|_| ProxyError::AccountUnavailable)?;
     let root = url.path().trim_end_matches('/');
-    let root = root
-        .strip_suffix("/v1/messages")
-        .or_else(|| root.strip_suffix("/v1"))
-        .unwrap_or(root);
     url.set_path(&format!("{root}/v1{path}"));
     if !query.is_empty() {
         let configured = url
@@ -430,9 +607,12 @@ pub(crate) async fn send(
 
 pub(crate) struct Registration {
     pub(crate) operation_id: Uuid,
+    pub(crate) inference_stage: InferenceStage,
     api_key_id: Uuid,
     origin: OriginBinding,
     kind: NativeObjectKind,
+    parent_id: Option<Uuid>,
+    accepted_reference_ids: Vec<Uuid>,
     registry: Arc<dyn NativeObjectRegistry>,
 }
 
@@ -445,7 +625,134 @@ pub(crate) async fn begin(
     entries: Vec<NativeEntry>,
     client: &ClientContext,
 ) -> Result<Registration, ProxyError> {
-    begin_for_requested(state, auth, target, origin, kind, entries, client, None).await
+    let (operation, stage) = match kind {
+        NativeObjectKind::File => ("files", InferenceStage::Management),
+        NativeObjectKind::MessageBatch => ("batch_completion", InferenceStage::Accepted),
+        _ => {
+            return Err(ProxyError::InvalidRequest(
+                "native registration requires an explicit operation".into(),
+            ))
+        }
+    };
+    begin_for_requested(
+        state,
+        auth,
+        target,
+        origin,
+        kind,
+        None,
+        entries,
+        client,
+        None,
+        operation,
+        stage,
+        Vec::new(),
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn begin_operation(
+    state: &ProxyState,
+    auth: &AuthenticatedKey,
+    target: &JobTarget,
+    origin: OriginBinding,
+    kind: NativeObjectKind,
+    parent_id: Option<Uuid>,
+    client: &ClientContext,
+    operation: &str,
+    stage: InferenceStage,
+) -> Result<Registration, ProxyError> {
+    begin_related_operation(
+        state,
+        auth,
+        target,
+        origin,
+        kind,
+        parent_id,
+        client,
+        operation,
+        stage,
+        Vec::new(),
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn begin_related_operation(
+    state: &ProxyState,
+    auth: &AuthenticatedKey,
+    target: &JobTarget,
+    origin: OriginBinding,
+    kind: NativeObjectKind,
+    parent_id: Option<Uuid>,
+    client: &ClientContext,
+    operation: &str,
+    stage: InferenceStage,
+    references: Vec<AcceptedReference>,
+    owner_parent_record_id: Option<Uuid>,
+) -> Result<Registration, ProxyError> {
+    let requested = crate::attribution::current()
+        .filter(|resolved| !resolved.requested_model_id.is_empty())
+        .map(|resolved| {
+            Ok::<_, ProxyError>((
+                super::openai::resource_id(state, "models", &resolved.requested_model_id)?,
+                resolved.requested_model,
+            ))
+        })
+        .transpose()?;
+    begin_for_requested(
+        state,
+        auth,
+        target,
+        origin,
+        kind,
+        parent_id,
+        Vec::new(),
+        client,
+        requested,
+        operation,
+        stage,
+        references,
+        owner_parent_record_id,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn begin_from_record_operation(
+    state: &ProxyState,
+    auth: &AuthenticatedKey,
+    target: &JobTarget,
+    origin: OriginBinding,
+    kind: NativeObjectKind,
+    parent_id: Option<Uuid>,
+    client: &ClientContext,
+    operation: &str,
+    stage: InferenceStage,
+    source: &NativeRecord,
+) -> Result<Registration, ProxyError> {
+    begin_for_requested(
+        state,
+        auth,
+        target,
+        origin,
+        kind,
+        parent_id,
+        Vec::new(),
+        client,
+        Some((
+            source.requested_model_id.ok_or_else(dependency)?,
+            source.requested_model.clone(),
+        )),
+        operation,
+        stage,
+        Vec::new(),
+        None,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -455,49 +762,65 @@ async fn begin_for_requested(
     target: &JobTarget,
     origin: OriginBinding,
     kind: NativeObjectKind,
+    parent_id: Option<Uuid>,
     entries: Vec<NativeEntry>,
     client: &ClientContext,
     requested: Option<(Uuid, String)>,
+    operation: &str,
+    stage: InferenceStage,
+    references: Vec<AcceptedReference>,
+    owner_parent_record_id: Option<Uuid>,
 ) -> Result<Registration, ProxyError> {
     let registry = registry(state)?;
     let api_key_id = api_key_id(auth)?;
     let operation_id = Uuid::new_v4();
-    let reply = registry
-        .begin(BeginRequest {
-            upstream_input_text: None,
-            input_file_id: None,
-            operation_id,
-            api_key_id,
-            protocol: NativeProtocol::Anthropic,
-            kind,
-            origin: origin.clone(),
-            parent_id: None,
-            requested_model_id: requested.as_ref().map_or(origin.model_id, |(id, _)| *id),
-            requested_model: requested.as_ref().map_or_else(
-                || target.model_entry.value.display_name.clone(),
-                |(_, name)| name.clone(),
-            ),
-            upstream_model: target
-                .model_entry
-                .value
-                .upstream_model()
-                .unwrap_or_default()
-                .to_owned(),
-            upstream_provider: target.pk_entry.value.provider.clone(),
-            operation: if kind == NativeObjectKind::File {
-                "files"
-            } else {
-                "batch_completion"
-            }
-            .into(),
-            request_id: client.request_id.clone(),
-            asynchronous: kind == NativeObjectKind::MessageBatch,
-            requested_service_tier: None,
-            entries,
-            observation_headers: observation_headers(target, client)?,
-        })
-        .await
-        .map_err(registry_error)?;
+    let accepted_reference_ids = references
+        .iter()
+        .map(|reference| reference.record_id)
+        .chain(owner_parent_record_id)
+        .collect();
+    let submission = BeginRequest {
+        upstream_input_text: None,
+        input_file_id: None,
+        operation_id,
+        api_key_id,
+        protocol: NativeProtocol::Anthropic,
+        kind,
+        origin: origin.clone(),
+        parent_id,
+        requested_model_id: requested.as_ref().map_or(origin.model_id, |(id, _)| *id),
+        requested_model: requested.as_ref().map_or_else(
+            || target.model_entry.value.display_name.clone(),
+            |(_, name)| name.clone(),
+        ),
+        upstream_model: target
+            .model_entry
+            .value
+            .upstream_model()
+            .unwrap_or_default()
+            .to_owned(),
+        upstream_provider: target.pk_entry.value.provider.clone(),
+        operation: operation.into(),
+        request_id: client.request_id.clone(),
+        asynchronous: stage == InferenceStage::Accepted,
+        requested_service_tier: None,
+        entries,
+        observation_headers: observation_headers(target, client)?,
+    };
+    let reply = if references.is_empty() && owner_parent_record_id.is_none() {
+        registry.begin(submission).await
+    } else {
+        registry
+            .begin_related(BeginRelatedRequest {
+                entry_references: Default::default(),
+                lifecycle_context: None,
+                submission,
+                references,
+                owner_parent_record_id,
+            })
+            .await
+    }
+    .map_err(registry_error)?;
     if reply.state != "pending_submission"
         || reply.operation_id != Some(operation_id)
         || reply.origin.as_ref() != Some(&origin)
@@ -506,15 +829,35 @@ async fn begin_for_requested(
     }
     Ok(Registration {
         operation_id,
+        inference_stage: stage,
         api_key_id,
         origin,
         kind,
+        parent_id,
+        accepted_reference_ids,
         registry,
     })
 }
 
 impl Registration {
     pub(crate) async fn bind(&self, value: &Value) -> Result<NativeRecord, ProxyError> {
+        self.bind_with_relations(value, None).await
+    }
+
+    pub(crate) async fn bind_related(
+        &self,
+        value: &Value,
+        relations: Vec<BoundRelation>,
+    ) -> Result<NativeRecord, ProxyError> {
+        self.bind_with_relations(value, Some(relations)).await
+    }
+
+    async fn bind_with_relations(
+        &self,
+        value: &Value,
+        relations: Option<Vec<BoundRelation>>,
+    ) -> Result<NativeRecord, ProxyError> {
+        let may_reuse_root = relations.is_some() && self.kind == NativeObjectKind::MessageContainer;
         let raw_id = value
             .get("id")
             .and_then(Value::as_str)
@@ -527,28 +870,44 @@ impl Registration {
                 .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
                 .map(|time| time.with_timezone(&chrono::Utc))
         };
-        let reply = self
-            .registry
-            .bind(BindRequest {
-                existing_record_id: None,
-                objects: Vec::new(),
-                operation_id: self.operation_id,
-                api_key_id: self.api_key_id,
-                raw_id: raw_id.into(),
-                provider_created_at: timestamp("created_at"),
-                provider_expires_at: timestamp("expires_at"),
-            })
-            .await
-            .map_err(|_| dependency())?;
+        let binding = BindRequest {
+            existing_record_id: None,
+            objects: Vec::new(),
+            operation_id: self.operation_id,
+            api_key_id: self.api_key_id,
+            raw_id: raw_id.into(),
+            provider_created_at: timestamp("created_at"),
+            provider_expires_at: timestamp("expires_at"),
+        };
+        let reply = match relations {
+            None => self.registry.bind(binding).await,
+            Some(relations) => {
+                self.registry
+                    .bind_related(BindRelatedRequest { binding, relations })
+                    .await
+            }
+        }
+        .map_err(|_| dependency())?;
         reply
             .record
             .filter(|record| {
+                let accepted_root =
+                    may_reuse_root && self.accepted_reference_ids.contains(&record.record_id);
+                let same_origin = record.origin.as_ref().is_some_and(|origin| {
+                    if accepted_root {
+                        origin.provider_key_id == self.origin.provider_key_id
+                            && origin.boundary == self.origin.boundary
+                    } else {
+                        origin == &self.origin
+                    }
+                });
                 reply.state == "bound"
-                    && record.operation_id == Some(self.operation_id)
+                    && (record.operation_id == Some(self.operation_id) || accepted_root)
                     && record.raw_id == raw_id
-                    && record.origin.as_ref() == Some(&self.origin)
+                    && same_origin
                     && record.protocol == Some(NativeProtocol::Anthropic)
                     && record.kind == Some(self.kind)
+                    && (record.parent_id == self.parent_id || accepted_root)
                     && !record.deleted
             })
             .ok_or_else(dependency)
@@ -562,7 +921,42 @@ pub(crate) async fn lookup(
     id: &str,
     kind: NativeObjectKind,
 ) -> Result<(JobTarget, OriginBinding, NativeRecord), ProxyError> {
-    lookup_at_origin(state, auth, client, id, kind, None, None).await
+    lookup_for_consumer(state, auth, client, id, kind, None, None, None, true).await
+}
+
+pub(crate) async fn lookup_management(
+    state: &ProxyState,
+    auth: &AuthenticatedKey,
+    client: &ClientContext,
+    id: &str,
+    kind: NativeObjectKind,
+    parent_id: Option<Uuid>,
+) -> Result<(JobTarget, OriginBinding, NativeRecord), ProxyError> {
+    lookup_for_consumer(state, auth, client, id, kind, parent_id, None, None, false).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn lookup_reference(
+    state: &ProxyState,
+    auth: &AuthenticatedKey,
+    client: &ClientContext,
+    id: &str,
+    kind: NativeObjectKind,
+    parent_id: Option<Uuid>,
+    consumer_family: EndpointFamily,
+) -> Result<(JobTarget, OriginBinding, NativeRecord), ProxyError> {
+    lookup_for_consumer(
+        state,
+        auth,
+        client,
+        id,
+        kind,
+        parent_id,
+        None,
+        Some(consumer_family),
+        false,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -575,6 +969,33 @@ async fn lookup_at_origin(
     hint: Option<OriginBinding>,
     consumer_family: Option<EndpointFamily>,
 ) -> Result<(JobTarget, OriginBinding, NativeRecord), ProxyError> {
+    lookup_for_consumer(
+        state,
+        auth,
+        client,
+        id,
+        kind,
+        None,
+        hint,
+        consumer_family,
+        consumer_family.is_none(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn lookup_for_consumer(
+    state: &ProxyState,
+    auth: &AuthenticatedKey,
+    client: &ClientContext,
+    id: &str,
+    kind: NativeObjectKind,
+    parent_id: Option<Uuid>,
+    hint: Option<OriginBinding>,
+    consumer_family: Option<EndpointFamily>,
+    check_provider_budget: bool,
+) -> Result<(JobTarget, OriginBinding, NativeRecord), ProxyError> {
+    reference_family(kind, consumer_family)?;
     crate::jobs::require_safe_upstream_id(id).map_err(|_| not_found())?;
     let reply = registry(state)?
         .lookup(LookupRequest {
@@ -585,7 +1006,7 @@ async fn lookup_at_origin(
                 kind,
                 raw_id: id.into(),
                 origin: hint,
-                parent_id: None,
+                parent_id,
             },
         })
         .await
@@ -598,53 +1019,32 @@ async fn lookup_at_origin(
                 && record.raw_id == id
                 && record.protocol == Some(NativeProtocol::Anthropic)
                 && record.kind == Some(kind)
+                && parent_id.is_none_or(|parent| record.parent_id == Some(parent))
         })
         .ok_or_else(not_found)?;
-    let origin = record
-        .origin
-        .clone()
-        .ok_or(ProxyError::AccountUnavailable)?;
+    let origin = record.origin.clone().ok_or_else(dependency)?;
     let snapshot = state.snapshot.load();
-    let requested = snapshot
-        .models
-        .get_by_id(
-            &record
-                .requested_model_id
-                .ok_or(ProxyError::AccountUnavailable)?
-                .to_string(),
-        )
-        .ok_or_else(not_found)?;
-    let direct = snapshot
-        .models
-        .get_by_id(&origin.model_id.to_string())
-        .ok_or_else(not_found)?;
-    let (target, actual) = if let Some(consumer) = consumer_family {
-        if kind != NativeObjectKind::File {
-            return Err(not_found());
-        }
-        resolve_target_for_consumer(
-            state,
-            &snapshot,
-            auth,
-            &direct.value.display_name,
-            &requested.value.display_name,
-            client,
-            kind,
-            consumer,
-        )?
-    } else {
-        resolve_target_for_request(
-            state,
-            &snapshot,
-            auth,
-            &direct.value.display_name,
-            &requested.value.display_name,
-            client,
-            kind,
-        )?
-    };
+    let requested = super::openai::model_entry_by_id(
+        state,
+        &snapshot,
+        record.requested_model_id.ok_or_else(dependency)?,
+    )?;
+    let direct = super::openai::model_entry_by_id(state, &snapshot, origin.model_id)?;
+    let (target, actual) = resolve_for_requested_family(
+        state,
+        &snapshot,
+        auth,
+        client,
+        &direct.value.display_name,
+        &requested.value.display_name,
+        kind,
+        consumer_family,
+        check_provider_budget,
+        origin.surface,
+    )
+    .map_err(|_| not_found())?;
     if actual != origin {
-        return Err(ProxyError::AccountUnavailable);
+        return Err(not_found());
     }
     Ok((target, origin, record))
 }
@@ -658,7 +1058,7 @@ pub(crate) async fn refuse_messages_references(
     body: &Value,
     consumer: EndpointFamily,
 ) -> Result<(), ProxyError> {
-    if state.platform().is_none() {
+    if state.native_objects.is_none() {
         return crate::stored_refs::refuse_in_messages(None, body);
     }
     fn scrub(node: &mut Value, ids: &mut Vec<String>) -> Result<(), ProxyError> {
@@ -718,6 +1118,15 @@ pub(crate) async fn refuse_messages_references(
     if let Some(messages) = sanitized.get_mut("messages") {
         scrub(messages, &mut ids)?;
     }
+    super::skills::admit_anthropic_owned_references(
+        state,
+        auth,
+        client,
+        body,
+        &mut sanitized,
+        consumer,
+    )
+    .await?;
     crate::stored_refs::refuse_in_messages(state.platform(), &sanitized)?;
     if ids.is_empty() {
         return Ok(());
@@ -877,16 +1286,21 @@ pub(crate) async fn register_output_files_at_origin(
         }
         let requested = crate::model_resolve::resolve_model(&snapshot, requested_model)
             .ok_or_else(not_found)?;
-        let requested_id = Uuid::parse_str(&requested.id).map_err(|_| dependency())?;
+        let requested_id = super::openai::resource_id(state, "models", &requested.id)?;
         let registration = begin_for_requested(
             state,
             auth,
             &target,
             origin.clone(),
             NativeObjectKind::File,
+            None,
             Vec::new(),
             client,
             Some((requested_id, requested.value.display_name.clone())),
+            "files",
+            InferenceStage::Management,
+            Vec::new(),
+            None,
         )
         .await?;
         registration.bind(&serde_json::json!({"id": id})).await?;
@@ -938,6 +1352,8 @@ pub(crate) fn json_body(status: StatusCode, headers: &HeaderMap, bytes: Bytes) -
 #[derive(Default)]
 pub(crate) struct Audit {
     target: Option<JobTarget>,
+    operation_id: Option<Uuid>,
+    stage: Option<InferenceStage>,
     monitor: Vec<aisix_core::GuardrailMonitorHit>,
     redactions: crate::redact::RedactionCounts,
     enforced: Vec<aisix_core::GuardrailEnforcedHit>,
@@ -946,6 +1362,13 @@ pub(crate) struct Audit {
     applied: Vec<aisix_core::AppliedGuardrail>,
 }
 impl Audit {
+    pub(crate) fn registered(&mut self, registration: &Registration) {
+        self.registered_operation(registration.operation_id, registration.inference_stage);
+    }
+    pub(crate) fn registered_operation(&mut self, operation_id: Uuid, stage: InferenceStage) {
+        self.operation_id = Some(operation_id);
+        self.stage = Some(stage);
+    }
     pub(crate) fn resolved(&mut self, target: &JobTarget) {
         self.target = Some(target.clone());
     }
@@ -1013,6 +1436,8 @@ pub(crate) async fn finish(
     stage: InferenceStage,
     operation_id: Option<Uuid>,
 ) -> Response {
+    let stage = audit.stage.unwrap_or(stage);
+    let operation_id = audit.operation_id.or(operation_id);
     let elapsed = started.elapsed();
     if let Err(error) = &result {
         crate::usage_attr::note_client_error_body(snapshot, || error.anthropic_body());
@@ -1236,12 +1661,12 @@ pub(crate) async fn create_file(
                 "multipart body must include a file field".into(),
             ));
         }
-        let (target, origin) = resolve_target(
+        let (target, origin) = resolve_management(
             &state,
             &snapshot,
             &auth,
-            &wanted,
             &client,
+            &wanted,
             NativeObjectKind::File,
         )?;
         audit.resolved(&target);
@@ -1324,13 +1749,17 @@ fn page_sealer(
     auth: &AuthenticatedKey,
     origin: &OriginBinding,
 ) -> Result<crate::opaque_id::Sealer, ProxyError> {
-    let platform = state.platform().ok_or(ProxyError::AccountUnavailable)?;
+    let key = state
+        .native_origin_key()
+        .ok_or(ProxyError::AccountUnavailable)?;
+    let mut legacy_origin = origin.clone();
+    legacy_origin.surface = None;
     let owner = format!(
         "native:anthropic:file:page:{}:{}",
         crate::platform::tenant_owner(auth),
-        serde_json::to_string(origin).map_err(|_| ProxyError::AccountUnavailable)?
+        serde_json::to_string(&legacy_origin).map_err(|_| ProxyError::AccountUnavailable)?
     );
-    Ok(crate::opaque_id::Sealer::of(platform, &owner))
+    Ok(crate::opaque_id::Sealer::from_native_key(&key, &owner))
 }
 
 pub(crate) async fn list_files(
@@ -1349,12 +1778,12 @@ pub(crate) async fn list_files(
                 "pass model or x-aisix-model to select a direct model".into(),
             )
         })?;
-        let (target, origin) = resolve_target(
+        let (target, origin) = resolve_management(
             &state,
             &snapshot,
             &auth,
-            &wanted,
             &client,
+            &wanted,
             NativeObjectKind::File,
         )?;
         audit.resolved(&target);
@@ -1455,7 +1884,7 @@ pub(crate) async fn list_files(
                 }
                 let requested = record
                     .requested_model_id
-                    .and_then(|id| snapshot.models.get_by_id(&id.to_string()));
+                    .and_then(|id| super::openai::model_entry_by_id(&state, &snapshot, id).ok());
                 if requested.is_some_and(|model| {
                     auth.key().can_access(&snapshot, &model.value.display_name)
                 }) {
@@ -1532,7 +1961,7 @@ pub(crate) async fn addressed_file(
     };
     let result = async {
         let (target, _, record) =
-            lookup(&state, &auth, &client, &id, NativeObjectKind::File).await?;
+            lookup_management(&state, &auth, &client, &id, NativeObjectKind::File, None).await?;
         audit.resolved(&target);
         let _reservation = crate::jobs::reserve_target(&state, &snapshot, &auth, &target).await?;
         audit

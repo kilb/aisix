@@ -78,6 +78,7 @@ mod heartbeat;
 mod managed_bundle;
 mod native_objects;
 mod proxy_protocol;
+mod standalone_native;
 mod telemetry;
 
 use aisix_admin::{AdminState, ConfigStore, EtcdConfigStore, FileManagedStore};
@@ -1522,6 +1523,16 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
             ),
         }
     }
+    let standalone_native_store = if let Some(native) = cfg.native_objects.as_ref() {
+        if heartbeat_cfg.is_some() {
+            anyhow::bail!("native_objects cannot replace a managed native object authority");
+        }
+        let store = standalone_native::open(native, snapshot_handle.clone()).await?;
+        proxy_state = proxy_state.with_native_objects(store.clone());
+        Some(store)
+    } else {
+        None
+    };
     // OTLP exports report the configured service name as `service.name`.
     proxy_state
         .otlp_fan_out
@@ -1709,11 +1720,23 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
                 async move {
                     tokio::join!(
                         aisix_proxy::native_api::background::run(state.clone(), cancel.clone()),
+                        aisix_proxy::native_api::openai_eval_worker::run(
+                            state.clone(),
+                            cancel.clone()
+                        ),
                         aisix_proxy::native_api::openai_batch_worker::run(
                             state.clone(),
                             cancel.clone()
                         ),
-                        aisix_proxy::native_api::anthropic_batch_worker::run(state, cancel),
+                        aisix_proxy::native_api::anthropic_batch_worker::run(
+                            state.clone(),
+                            cancel.clone()
+                        ),
+                        aisix_proxy::native_api::standalone_store::run_outbox(
+                            standalone_native_store,
+                            state,
+                            cancel
+                        ),
                     );
                 }
             }

@@ -56,6 +56,7 @@ use tokio::time::Instant;
 use tracing::Instrument;
 use uuid::Uuid;
 
+use aisix_obs::usage::DurableUsageRequest;
 use aisix_obs::{Metrics, UsageEvent, UsageEventLabels, UsageIoAuditUpdate, UsageSink};
 
 use crate::heartbeat::MtlsBundle;
@@ -299,6 +300,7 @@ pub fn spawn(
 ) -> (UsageSink, tokio::task::JoinHandle<()>) {
     let (tx, rx) = tokio::sync::mpsc::channel(QUEUE_CAPACITY);
     let (io_tx, io_rx) = tokio::sync::mpsc::channel(MAX_BATCH);
+    let (durable_tx, durable_rx) = tokio::sync::mpsc::channel(16);
     // Attached here as well as at the wiring point: this function holds the
     // handle, so a caller cannot end up with a sink whose queue drops are
     // invisible while the worker's are counted. (The wiring point still
@@ -307,16 +309,50 @@ pub fn spawn(
     // `sink_disabled` to report.)
     let sink = UsageSink::new(tx)
         .with_metrics(metrics.clone())
-        .with_io_audit_sender(io_tx);
+        .with_io_audit_sender(io_tx)
+        .with_durable_sender(durable_tx);
     let mut io_cancel = cancel.clone();
+    let mut durable_cancel = cancel.clone();
     let handle = tokio::spawn(async move {
         tokio::join!(
             run(cfg.clone(), metrics, rx, &mut cancel),
-            run_io_updates(cfg, io_rx, &mut io_cancel)
+            run_io_updates(cfg.clone(), io_rx, &mut io_cancel)
                 .instrument(tracing::info_span!("telemetry", kind = "io_audit_update")),
+            run_durable(cfg, durable_rx, &mut durable_cancel)
+                .instrument(tracing::info_span!("telemetry", kind = "durable_usage")),
         );
     });
     (sink, handle)
+}
+
+async fn run_durable(
+    cfg: TelemetryConfig,
+    mut rx: tokio::sync::mpsc::Receiver<DurableUsageRequest>,
+    cancel: &mut watch::Receiver<bool>,
+) {
+    let Ok(client) = build_client(&cfg.mtls) else {
+        return;
+    };
+    loop {
+        if *cancel.borrow() {
+            return;
+        }
+        let request = tokio::select! {
+            changed = cancel.changed() => {
+                if changed.is_err() || *cancel.borrow() { return; }
+                continue;
+            },
+            request = rx.recv() => match request {
+                Some(request) => request,
+                None => return,
+            },
+        };
+        // 退出或任务崩溃会丢弃回执而非确认；持久 outbox 留给下一次 claim。
+        tokio::select! {
+            _ = request.deliver(&client, &cfg.url) => {},
+            _ = cancel.changed() => return,
+        }
+    }
 }
 
 fn prepare_io_update(update: UsageIoAuditUpdate) -> Option<Prepared> {
@@ -1520,6 +1556,8 @@ mod tests {
     use std::path::Path;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    include!("telemetry_durable_tests.rs");
 
     fn write_test_bundle(dir: &Path) -> MtlsBundle {
         let ca_kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();

@@ -1930,6 +1930,22 @@ async fn dispatch(
             (attempts, None)
         };
 
+    // 缓存命中前拒绝覆盖规则注入的私有引用；实际派发仍用选定账号复验。
+    if !virtual_entry.value.is_ensemble() {
+        for attempt in &attempt_models {
+            let Ok(key) = crate::dispatch::resolve_provider_key(snapshot, &attempt.model) else {
+                continue;
+            };
+            let Some(bridge) = crate::dispatch::resolve_bridge(&state.hub, &key.value) else {
+                continue;
+            };
+            if bridge.wire_protocol() == "openai" {
+                crate::native_api::voices::chat_voice_after_overrides(req, &key.value)
+                    .map_err(&with_model)?;
+            }
+        }
+    }
+
     // For non-routing requests, surface a misconfigured bridge as a
     // proper 503 rather than burying it inside a generic Bridge error.
     // Routing requests rely on the loop's `is_retryable` path so a
@@ -2086,6 +2102,27 @@ async fn dispatch(
                 ));
                 continue 'targets;
             };
+
+            if bridge.wire_protocol() == "openai" {
+                if let Some(voice) =
+                    crate::native_api::voices::chat_voice_after_overrides(req, &pk_entry.value)
+                        .map_err(&with_model)?
+                {
+                    crate::native_api::voices::validate_voice_for_target(
+                        state,
+                        auth,
+                        client,
+                        &voice,
+                        &attempt.id,
+                        &pk_entry.id,
+                        &pk_entry.value,
+                        aisix_core::native_objects::NativeOriginSurface::ChatCompletions,
+                        aisix_core::models::EndpointFamily::ChatCompletions,
+                    )
+                    .await
+                    .map_err(&with_model)?;
+                }
+            }
 
             // Streaming deadline (#554): bound the connect by the effective
             // stream timeout; the read-timeout wrapper below enforces the
@@ -3518,6 +3555,27 @@ async fn dispatch(
             continue;
         };
 
+        if bridge.wire_protocol() == "openai" {
+            if let Some(voice) =
+                crate::native_api::voices::chat_voice_after_overrides(req, &pk_entry.value)
+                    .map_err(&with_model)?
+            {
+                crate::native_api::voices::validate_voice_for_target(
+                    state,
+                    auth,
+                    client,
+                    &voice,
+                    &attempt.id,
+                    &pk_entry.id,
+                    &pk_entry.value,
+                    aisix_core::native_objects::NativeOriginSurface::ChatCompletions,
+                    aisix_core::models::EndpointFamily::ChatCompletions,
+                )
+                .await
+                .map_err(&with_model)?;
+            }
+        }
+
         // Per-attempt non-streaming deadline (#554): an elapsed `timeout`
         // surfaces as a retryable `BridgeError::Timeout`, so a slow target
         // fails over to the next one via the loop below.
@@ -4648,9 +4706,46 @@ async fn dispatch_ensemble(
         // additionally covers the whole panel that ran before it.
         let judge_started = Instant::now();
         let judge_tap = aisix_gateway::response_tap::detached();
+        let judge_req = build_judge_req();
+        let judge_voice_admission: Result<(), ProxyError> = async {
+            if judge_bridge.wire_protocol() == "openai" {
+                if let Some(voice) = crate::native_api::voices::chat_voice_after_overrides(
+                    &judge_req,
+                    &judge_pk.value,
+                )? {
+                    crate::native_api::voices::validate_voice_for_target(
+                        state,
+                        auth,
+                        client,
+                        &voice,
+                        &judge_entry.id,
+                        &judge_pk.id,
+                        &judge_pk.value,
+                        aisix_core::native_objects::NativeOriginSurface::ChatCompletions,
+                        aisix_core::models::EndpointFamily::ChatCompletions,
+                    )
+                    .await?;
+                }
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(refused) = judge_voice_admission {
+            crate::attribution::settle_ensemble();
+            let error =
+                BridgeError::upstream_status(refused.status().as_u16(), refused.to_string());
+            let failure = emit_panel_then_fail(
+                &panel,
+                &failed,
+                Some(&judge_failure(&error, false, Instant::now())),
+                refused,
+            );
+            reservation.commit_tokens(panel_total).await;
+            return Err(failure);
+        }
         let judge_stream = match aisix_gateway::response_tap::scope(
             Arc::clone(&judge_tap),
-            judge_bridge.chat_stream_cow(std::borrow::Cow::Owned(build_judge_req()), &judge_ctx),
+            judge_bridge.chat_stream_cow(std::borrow::Cow::Owned(judge_req), &judge_ctx),
         )
         .await
         {

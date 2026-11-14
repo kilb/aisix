@@ -95,6 +95,9 @@ ipnet.workspace = true
 # default-features-off drops the id3v2 zlib path we never need.
 lofty.workspace = true
 
+# 本机原生对象归属使用受保护文件和跨进程事务。
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
+
 [dev-dependencies]
 # `test-util` drives the SSE-heartbeat tests on a paused clock.
 tokio = { workspace = true, features = ["macros", "rt", "test-util"] }

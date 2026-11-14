@@ -68,6 +68,13 @@ etcd:
 # file without booting via `aisix validate --resources <file>`.
 # resources_file: "/etc/aisix/resources.yaml"
 
+# 单机原生对象的持久归属；与 managed / platform 模式互斥。
+# 目录预建为 0700，数据库为 0600；密钥文件为 0600/0400，
+# 内容为至少 32 随机字节的 hex/base64。密钥与本地数据库一起备份。
+# native_objects:
+#   sqlite_path: "/var/lib/aisix/native/objects.sqlite3"
+#   origin_secret_file: "/run/secrets/aisix-native-origin"
+
 proxy:
   addr: "0.0.0.0:3000"
   # Cap on inbound request bodies (JSON, multipart, passthrough, MCP,
