@@ -345,6 +345,48 @@ fn reveal_secrets_emits_the_real_value_inline() {
     assert!(doc.secret_placeholders.is_empty());
 }
 
+// 删除真实凭据 visitor 的 SIP 分支时，完整导出必须因泄漏原值和缺少占位记录而失败。
+#[test]
+fn default_export_replaces_sip_webhook_secret_with_a_recorded_placeholder() {
+    let snap = AisixSnapshot::new();
+    let pk = serde_json::from_value(json!({
+        "display_name":"sip-account", "api_key":"export-upstream-secret-sentinel",
+        "realtime_sip":{
+            "route_id":"sip-route", "api_key_id":"caller-resource", "model_id":"model-resource",
+            "webhook_secret":"export-webhook-secret-sentinel"
+        }
+    }))
+    .unwrap();
+    snap.provider_keys
+        .insert(ResourceEntry::new("sip-pk", pk, 1));
+
+    let doc = build_export_document(&snap, false);
+    let keys = find(&doc, "provider_keys");
+    assert_eq!(keys.len(), 1);
+    assert_eq!(
+        keys[0]["realtime_sip"],
+        json!({
+            "route_id":"sip-route", "api_key_id":"caller-resource", "model_id":"model-resource",
+            "webhook_secret":"${AISIXSECRET_PROVIDER_KEY_SIP_ACCOUNT_REALTIME_SIP_WEBHOOK_SECRET}"
+        })
+    );
+    assert_eq!(doc.secret_placeholders.len(), 2);
+    let slot = doc
+        .secret_placeholders
+        .iter()
+        .find(|slot| slot.field == "realtime_sip.webhook_secret")
+        .expect("the actual visitor records the SIP credential");
+    assert_eq!(slot.kind, "provider_keys");
+    assert_eq!(slot.identity, "sip-account");
+    assert_eq!(
+        slot.env_var,
+        "AISIXSECRET_PROVIDER_KEY_SIP_ACCOUNT_REALTIME_SIP_WEBHOOK_SECRET"
+    );
+    let rendered = serde_json::to_string(&doc.collections).unwrap();
+    assert!(!rendered.contains("export-webhook-secret-sentinel"));
+    assert!(!rendered.contains("export-upstream-secret-sentinel"));
+}
+
 fn keyword_guardrail(name: &str) -> aisix_core::models::Guardrail {
     serde_json::from_value(json!({
         "name": name, "kind": "keyword",

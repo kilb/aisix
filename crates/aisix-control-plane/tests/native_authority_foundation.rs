@@ -1862,6 +1862,33 @@ async fn eval_run_settles_only_observed_accepted_models_including_canceled_runs(
         let target = json!({"target":"object","lease":{"record_id":run["record_id"],"generation":generation}});
         let payload = |usage| json!({"target":target,"terminal_status":status,"usage":usage});
         let actual = token_usage("model-a");
+        assert!(actual[0]["meter"]["usage"]
+            .get("cache_write_tokens")
+            .is_none());
+        assert_eq!(
+            actual[0]["meter"]["usage"]["cached_prompt_tokens"].as_u64(),
+            Some(0)
+        );
+        // 持久层存 typed DTO 的规范值；缺失的可选量是 null，真实报告的缓存零量仍为 0。
+        // 期望手写公开契约的完整形状，不调用产品 serializer 推导断言。
+        let canonical_observed = json!([{
+            "entry_id":"model-a", "upstream_model":"gpt-4o-mini", "occurred_at":"2026-11-14T01:02:03Z",
+            "meter":{"kind":"tokens", "usage":{
+                "entry_id":"model-a", "occurred_at":"2026-11-14T01:02:03Z", "status_code":200,
+                "prompt_tokens":40, "completion_tokens":10, "total_tokens":50,
+                "cached_prompt_tokens":0, "cache_usage_reported":true,
+                "cache_write_tokens":null, "cache_creation_tokens":0, "cache_read_tokens":0,
+                "cache_creation_5m_tokens":null, "cache_creation_1h_tokens":null, "reasoning_tokens":0,
+                "prompt_audio_tokens":null, "prompt_image_tokens":null,
+                "completion_audio_tokens":null, "completion_image_tokens":null,
+                "web_search_requests":0, "usage_estimated":false,
+                "service_tier":null, "requested_service_tier":null,
+                "error_class":"operator_retained_detail", "error_message":"private-metering-error-sentinel-v12",
+                "io_audit":{"version":2,"boundary":"upstream_attempt","response_complete":true,
+                    "exchange_count":1,"input_text":{"utf8_bytes":5,"unicode_scalars":5,"complete":true},
+                    "output_text":{"utf8_bytes":2,"unicode_scalars":2,"complete":true}}
+            }}
+        }]);
         let unknown =
             f.dp.send(
                 "POST",
@@ -1943,7 +1970,7 @@ async fn eval_run_settles_only_observed_accepted_models_including_canceled_runs(
         );
         let stored: Value = sqlx::query_scalar("SELECT observed_usage FROM native_metering_records WHERE environment_id=$1 AND operation_id=$2")
             .bind(f.cp.env().env_id).bind(uuid_at(&submission,"/operation_id")).fetch_one(f.cp.db().pool()).await.expect("the exact observed subset without fabricated entries");
-        assert_eq!(stored, actual);
+        assert_eq!(stored, canonical_observed);
         let replay =
             f.dp.send(
                 "POST",

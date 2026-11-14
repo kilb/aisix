@@ -461,6 +461,7 @@ mod tests {
             "secrets",
             "hmac_secret",
             "client_secret",
+            "webhook_secret",
         ];
         const NOT_SECRET: &[&str] = &[
             "api_key_header",   // the name of a header, not its value
@@ -596,10 +597,23 @@ mod tests {
             "route_id":"route", "api_key_id":"caller", "model_id":"model", "webhook_secret":"private-signing-key"
         }});
         let found = slots(CredentialKind::ProviderKey, doc.clone());
-        assert!(found.contains(&(
-            "REALTIME_SIP_WEBHOOK_SECRET".into(),
-            "private-signing-key".into()
-        )));
+        assert_eq!(
+            found,
+            vec![
+                (
+                    "REALTIME_SIP_WEBHOOK_SECRET".into(),
+                    "private-signing-key".into()
+                ),
+                ("api_key".into(), "upstream".into()),
+            ]
+        );
+        let mut sip_slot = None;
+        visit_credentials(CredentialKind::ProviderKey, &mut doc, &mut |slot, _| {
+            if slot.field_key == "REALTIME_SIP_WEBHOOK_SECRET" {
+                sip_slot = Some(slot.label.clone());
+            }
+        });
+        assert_eq!(sip_slot.as_deref(), Some("realtime_sip.webhook_secret"));
         redact_credentials(CredentialKind::ProviderKey, &mut doc);
         assert_eq!(doc["realtime_sip"]["webhook_secret"], REDACTED);
         assert_eq!(doc["realtime_sip"]["api_key_id"], "caller");

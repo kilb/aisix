@@ -1,14 +1,17 @@
-//! 原生对象权限必须经过真实控制面写入与当前网关构建门槛。
+//! 公开接口保持派生资源保护；内部派生写入在真实 PG 与 heartbeat 上验证构建门槛。
 
 mod support;
 
 use aisix_control_plane::auth::{MemberRole, OperatorRole};
+use aisix_control_plane::error::ApiError;
 use aisix_control_plane::keys;
-use aisix_control_plane::resources::write::WriteCtx;
+use aisix_control_plane::resources::write::{write_resource, ResourceWrite, WriteCtx, WriteOp};
+use aisix_control_plane::resources::Kind;
 use aisix_control_plane::tenants::TenantStatus;
 use aisix_core::models::{ApiKey, EndpointFamily};
+use futures::FutureExt;
 use serde_json::{json, Value};
-use support::{DpClient, TestCp};
+use support::{DpClient, OperatorSession, TestCp};
 use uuid::Uuid;
 
 const BUILD: &str = "dev+sha-12ab345";
@@ -88,6 +91,76 @@ async fn projected(cp: &TestCp, key: &str) -> (Value, i32) {
     (doc, version)
 }
 
+// 与 tests/compat.rs 的派生写入相同：真实事务依次经过 schema、引用和 compat::gate。
+// 这是内部组件回归；公开 HTTP 不能直接维护派生 api_keys。
+async fn write_native_grant(cp: &TestCp, doc: Value) -> Result<i64, ApiError> {
+    let ctx = WriteCtx::of(cp.state());
+    cp.db()
+        .tx(move |conn| {
+            async move {
+                Ok(write_resource(
+                    conn,
+                    &ctx,
+                    ResourceWrite {
+                        kind: Kind::ApiKeys,
+                        id: Uuid::new_v4(),
+                        op: WriteOp::Create(&doc),
+                        expected_version: None,
+                        managed_by: Some("tenant:native-key-floors-v14"),
+                    },
+                )
+                .await?
+                .version)
+            }
+            .boxed()
+        })
+        .await
+}
+
+async fn native_grant_rows(cp: &TestCp, doc: &Value) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM gw_resources WHERE doc->>'key_hash'=$1")
+        .bind(doc["key_hash"].as_str().expect("the grant's distinct hash"))
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("count the attempted derived grant")
+}
+
+async fn assert_public_grant_is_managed(cp: &TestCp, admin: &OperatorSession, doc: &Value) {
+    let response = cp
+        .send(
+            "POST",
+            "/admin/resources/api_keys",
+            Some(admin.cookie()),
+            Some(json!({"doc":doc})),
+        )
+        .await;
+    assert_eq!(
+        response.status, 409,
+        "the public resource API cannot edit derived grants: {response:?}"
+    );
+    assert_eq!(response.body.get("code"), Some(&json!("managed_resource")));
+    assert_eq!(native_grant_rows(cp, doc).await, 0);
+}
+
+async fn assert_native_grant_is_too_old(cp: &TestCp, doc: Value) {
+    let error = write_native_grant(cp, doc.clone())
+        .await
+        .expect_err("the actual derived write must reach the version gate");
+    assert_eq!(
+        (error.status.as_u16(), error.code),
+        (422, "gateway_too_old"),
+        "{error:?}"
+    );
+    assert_eq!(error.details.len(), 1, "{error:?}");
+    assert_eq!(error.details[0].path, "/allowed_endpoints");
+    assert!(!error.details[0].message.is_empty());
+    assert_eq!(
+        native_grant_rows(cp, &doc).await,
+        0,
+        "a rejected grant is never persisted"
+    );
+}
+
 #[test]
 fn native_families_are_independent_grants_and_unknown_names_grant_nothing() {
     for name in NATIVE_FAMILIES {
@@ -133,49 +206,31 @@ async fn native_families_require_the_new_build_without_borrowing_the_legacy_buil
         ] {
             beat(&client, &bundle.dp_id, gateway).await;
             for family in NATIVE_FAMILIES {
-                let hash = format!("native-refused-{}", Uuid::new_v4());
-                let response = cp
-                    .send(
-                        "POST",
-                        "/admin/resources/api_keys",
-                        Some(admin.cookie()),
-                        Some(json!({"doc":{"key_hash":hash,"allowed_endpoints":[family]}})),
-                    )
-                    .await;
-                assert_eq!(
-                    response.status, 422,
-                    "{cp_version} / {gateway} / {family}: {response:?}"
-                );
-                assert_eq!(response.body.get("code"), Some(&json!("gateway_too_old")));
-                assert_eq!(
-                    response.body.pointer("/details/0/path"),
-                    Some(&json!("/allowed_endpoints"))
-                );
-                let count: i64 = sqlx::query_scalar(
-                    "SELECT count(*) FROM gw_resources WHERE doc->>'key_hash'=$1",
-                )
-                .bind(&hash)
-                .fetch_one(cp.db().pool())
-                .await
-                .expect("count refused rows");
-                assert_eq!(count, 0, "a rejected grant is never persisted");
+                let doc = json!({"key_hash":format!("native-refused-{}", Uuid::new_v4()),
+                    "allowed_endpoints":[family]});
+                assert_public_grant_is_managed(&cp, &admin, &doc).await;
+                assert_native_grant_is_too_old(&cp, doc).await;
             }
         }
         if cp_version == BUILD {
             beat(&client, &bundle.dp_id, BUILD).await;
             for family in NATIVE_FAMILIES {
-                let response = cp
-                    .send(
-                        "POST",
-                        "/admin/resources/api_keys",
-                        Some(admin.cookie()),
-                        Some(
-                            json!({"doc":{"key_hash":format!("native-allowed-{}",Uuid::new_v4()),
-                        "allowed_endpoints":[family]}}),
-                        ),
-                    )
-                    .await;
-                assert_eq!(response.status, 201, "{family}: {response:?}");
+                let doc = json!({"key_hash":format!("native-allowed-{}",Uuid::new_v4()),
+                    "allowed_endpoints":[family]});
+                assert_public_grant_is_managed(&cp, &admin, &doc).await;
+                let version = write_native_grant(&cp, doc.clone())
+                    .await
+                    .expect("the proven build accepts the internal derived grant");
+                assert_eq!(version, 1, "{family}");
+                assert_eq!(native_grant_rows(&cp, &doc).await, 1);
+                let stored: Value = sqlx::query_scalar(
+                    "SELECT doc FROM gw_resources WHERE doc->>'key_hash'=$1 AND NOT deleted",
+                )
+                .bind(doc["key_hash"].as_str().expect("the allowed grant hash"))
+                .fetch_one(cp.db().pool())
+                .await
+                .expect("the exact allowed grant");
+                assert_eq!(stored["allowed_endpoints"], json!([family]));
             }
         }
     }
@@ -267,18 +322,9 @@ async fn native_only_grants_refuse_an_incomplete_fleet_even_with_a_proven_build(
             .expect("record an incomplete fleet");
     assert_eq!(updated.rows_affected(), 1);
     for family in NATIVE_FAMILIES {
-        let response = cp
-            .send(
-                "POST",
-                "/admin/resources/api_keys",
-                Some(admin.cookie()),
-                Some(
-                    json!({"doc":{"key_hash":format!("native-capped-{}",Uuid::new_v4()),
-                "allowed_endpoints":[family]}}),
-                ),
-            )
-            .await;
-        assert_eq!(response.status, 422, "{family}: {response:?}");
-        assert_eq!(response.body.get("code"), Some(&json!("gateway_too_old")));
+        let doc = json!({"key_hash":format!("native-capped-{}",Uuid::new_v4()),
+            "allowed_endpoints":[family]});
+        assert_public_grant_is_managed(&cp, &admin, &doc).await;
+        assert_native_grant_is_too_old(&cp, doc).await;
     }
 }

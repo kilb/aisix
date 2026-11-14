@@ -1550,6 +1550,47 @@ mod tests {
         assert_eq!(v["value"]["groups"], json!(["grp-alpha"]));
     }
 
+    // 两个真实 Admin 读取 handler 都必须走同一 visitor；删除 SIP 分支会暴露哨兵值。
+    #[tokio::test]
+    async fn provider_key_reads_redact_the_sip_webhook_secret() {
+        let (state, store) = build_seedable_state();
+        let pk: aisix_core::ProviderKey = serde_json::from_value(json!({
+            "display_name":"sip-account", "api_key":"admin-upstream-secret-sentinel",
+            "realtime_sip":{
+                "route_id":"sip-route", "api_key_id":"caller-resource", "model_id":"model-resource",
+                "webhook_secret":"admin-webhook-secret-sentinel"
+            }
+        }))
+        .unwrap();
+        store
+            .put_provider_key(aisix_core::ResourceEntry::new("sip-pk", pk, 1))
+            .await
+            .unwrap();
+        let app = build_router(state);
+        for path in ["/admin/v1/provider_keys", "/admin/v1/provider_keys/sip-pk"] {
+            let response = run(app.clone(), auth_req("GET", path, None)).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = body_json(response).await;
+            let entry = if path.ends_with("/sip-pk") {
+                &body
+            } else {
+                assert_eq!(body.as_array().unwrap().len(), 1);
+                &body[0]
+            };
+            assert_eq!(
+                entry["value"]["realtime_sip"],
+                json!({
+                    "route_id":"sip-route", "api_key_id":"caller-resource", "model_id":"model-resource",
+                    "webhook_secret":"[REDACTED]"
+                })
+            );
+            assert_eq!(entry["value"]["api_key"], "[REDACTED]");
+            let rendered = body.to_string();
+            assert!(!rendered.contains("admin-webhook-secret-sentinel"));
+            assert!(!rendered.contains("admin-upstream-secret-sentinel"));
+        }
+    }
+
     /// The hand-written read projection documents the field, and the
     /// provider key schema it is matched against documents `groups`.
     #[tokio::test]
