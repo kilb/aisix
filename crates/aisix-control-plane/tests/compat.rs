@@ -1140,7 +1140,10 @@ async fn customer_endpoint_hotfix_rejects_unknown_builds_and_published_hash_look
         )
         .await
         .expect_err(&format!("{cp_version} must not trust {gateway}"));
-        assert_eq!((error.status.as_u16(), error.code), (422, "gateway_too_old"));
+        assert_eq!(
+            (error.status.as_u16(), error.code),
+            (422, "gateway_too_old")
+        );
         assert_eq!(error.details[0].path, "/allowed_endpoints");
         let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM gw_resources WHERE id = $1")
             .bind(id)
@@ -1180,13 +1183,19 @@ async fn customer_endpoint_hotfix_waits_for_the_complete_recent_fleet_to_support
     let error = write_key(&cp, id, doc.clone(), false)
         .await
         .expect_err("the old revoked and offline instance still belongs to the recent fleet");
-    assert_eq!((error.status.as_u16(), error.code), (422, "gateway_too_old"));
+    assert_eq!(
+        (error.status.as_u16(), error.code),
+        (422, "gateway_too_old")
+    );
     let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM gw_resources WHERE id = $1")
         .bind(id)
         .fetch_one(cp.db().pool())
         .await
         .expect("count deferred hotfix grant");
-    assert_eq!(stored, 0, "the mixed fleet must not receive an expanded grant");
+    assert_eq!(
+        stored, 0,
+        "the mixed fleet must not receive an expanded grant"
+    );
     age_instance(&cp, "customer-hotfix-old-v11", "24 hours 1 minute").await;
     write_key(&cp, id, doc.clone(), false)
         .await

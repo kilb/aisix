@@ -64,6 +64,7 @@ enums!(SampleResult {
 enums!(ErrorKind {
     Auth,
     RateLimit,
+    UpstreamHttp,
     Timeout,
     Transport,
     Decode,

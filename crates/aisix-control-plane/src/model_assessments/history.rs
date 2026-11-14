@@ -6,6 +6,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{PgConnection, Row};
+use std::collections::HashSet;
 use uuid::Uuid;
 
 use super::{
@@ -725,13 +726,18 @@ pub async fn reserve_next(
         return Ok(ReserveOutcome::Stopped(CompletionReason::Budget));
     }
     let deadline = claim.deadline_at.min(now + Duration::seconds(30));
+    let mut attempted_accounts = HashSet::new();
     for item in unsent {
-        let mut sample = item.sample.clone();
-        let target = if sample.role == Role::Reference {
+        let target = if item.sample.role == Role::Reference {
             run.summary.reference.clone()
         } else {
             run.summary.candidate.clone()
         };
+        // 同账号本轮最多尝试一次；保留其最早ordinal，下一轮仍会重新检查。
+        if !attempted_accounts.insert(target.account_id) {
+            continue;
+        }
+        let mut sample = item.sample.clone();
         if !admission::reserve(
             &mut tx,
             run.summary.id,

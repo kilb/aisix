@@ -52,16 +52,36 @@ async fn execute(state: AppState, run_id: Uuid) -> Result<(), ApiError> {
             let Ok(permit) = Arc::clone(&state.model_probes).try_acquire_owned() else {
                 break;
             };
-            let reservation = tokio::select! {
-                biased;
-                _ = control.changed() => break 'work (*control.borrow()).unwrap_or(CompletionReason::OwnerLost),
-                result = tokio::time::timeout(CONTROL_TIMEOUT, history::reserve_next(&state, &claimed)) => result,
+            let reservation_started = Instant::now();
+            let pending_reservation =
+                tokio::time::timeout(CONTROL_TIMEOUT, history::reserve_next(&state, &claimed));
+            tokio::pin!(pending_reservation);
+            // 在途派发可能持有数据库锁；等待新预留时也必须继续驱动它们提交。
+            // 固定同一预留future，不能因另一次派发完成而丢弃、重开可能已提交的预留。
+            let reservation = loop {
+                tokio::select! {
+                    biased;
+                    _ = control.changed() => break 'work (*control.borrow()).unwrap_or(CompletionReason::OwnerLost),
+                    result = &mut pending_reservation => break result,
+                    result = active.next(), if !active.is_empty() => {
+                        if result.is_some_and(|result| result.is_err()) {
+                            break 'work CompletionReason::OwnerLost;
+                        }
+                    }
+                }
             };
             match reservation {
                 Ok(Ok(ReserveOutcome::Reserved(reservation))) => {
                     let state = state.clone();
                     let claimed = Arc::clone(&claimed);
-                    active.push(Box::pin(dispatch(state, claimed, reservation, permit)));
+                    active.push(Box::pin(async move {
+                        let started = Instant::now();
+                        let result = dispatch(state, claimed, reservation, permit).await;
+                        if result.is_err() {
+                            tracing::warn!(%run_id, cause="dispatch_persistence_failed", elapsed_ms=started.elapsed().as_millis() as u64, "能力对照持久化操作失败");
+                        }
+                        result
+                    }));
                 }
                 Ok(Ok(ReserveOutcome::Wait)) => break,
                 Ok(Ok(ReserveOutcome::Done)) if active.is_empty() => {
@@ -71,7 +91,14 @@ async fn execute(state: AppState, run_id: Uuid) -> Result<(), ApiError> {
                 Ok(Ok(ReserveOutcome::Done)) => break,
                 Ok(Ok(ReserveOutcome::Stopped(reason))) => break 'work reason,
                 // 超时不证明事务未提交；既不续领，也不重放可能已保留的sample。
-                Ok(Err(_)) | Err(_) => break 'work CompletionReason::OwnerLost,
+                Ok(Err(_)) => {
+                    tracing::warn!(%run_id, cause="reserve_failed", elapsed_ms=reservation_started.elapsed().as_millis() as u64, "能力对照预留停止");
+                    break 'work CompletionReason::OwnerLost;
+                }
+                Err(_) => {
+                    tracing::warn!(%run_id, cause="reserve_timeout", elapsed_ms=reservation_started.elapsed().as_millis() as u64, "能力对照预留停止");
+                    break 'work CompletionReason::OwnerLost;
+                }
             }
         }
         tokio::select! {
@@ -101,6 +128,7 @@ fn watch_control(
                 _ = sender.closed() => return,
                 _ = tick.tick() => {},
             }
+            let check_started = Instant::now();
             let check = async {
                 tokio::try_join!(
                     history::control(&state, &claimed),
@@ -110,7 +138,17 @@ fn watch_control(
             let reason = match tokio::time::timeout(CONTROL_TIMEOUT, check).await {
                 Ok(Ok((Some(reason), _))) => Some(reason),
                 Ok(Ok((None, true))) => None,
-                Ok(Ok((None, false))) | Ok(Err(_)) | Err(_) => Some(CompletionReason::OwnerLost),
+                Ok(Ok((None, false))) => Some(CompletionReason::OwnerLost),
+                Ok(Err(_)) => {
+                    let run_id = claimed.run.summary.id;
+                    tracing::warn!(%run_id, cause="control_failed", elapsed_ms=check_started.elapsed().as_millis() as u64, "能力对照控制检查停止");
+                    Some(CompletionReason::OwnerLost)
+                }
+                Err(_) => {
+                    let run_id = claimed.run.summary.id;
+                    tracing::warn!(%run_id, cause="control_or_heartbeat_timeout", elapsed_ms=check_started.elapsed().as_millis() as u64, "能力对照控制检查停止");
+                    Some(CompletionReason::OwnerLost)
+                }
             };
             if let Some(reason) = reason {
                 let _ = sender.send(Some(reason));
@@ -467,21 +505,25 @@ fn failed(sample: &mut AssessmentSample, kind: ErrorKind, detail: &str, uncertai
 }
 
 fn bridge_failure(sample: &mut AssessmentSample, error: &BridgeError) {
-    let status = match error {
-        BridgeError::UpstreamStatus { status, .. }
-        | BridgeError::UpstreamBodyUnread { status, .. } => Some(*status),
-        _ => None,
+    let (status, unread) = match error {
+        BridgeError::UpstreamStatus {
+            status, diagnostic, ..
+        } => (Some(*status), diagnostic.is_some()),
+        BridgeError::UpstreamBodyUnread { status, .. } => (Some(*status), true),
+        _ => (None, false),
     };
     let kind = match status {
         Some(401 | 403) => ErrorKind::Auth,
         Some(429) => ErrorKind::RateLimit,
+        Some(_) => ErrorKind::UpstreamHttp,
         _ => match error {
             BridgeError::Timeout { .. } => ErrorKind::Timeout,
             BridgeError::UpstreamDecode(_) | BridgeError::StreamAborted => ErrorKind::Decode,
             _ => ErrorKind::Transport,
         },
     };
-    failed(sample, kind, &error.to_string(), status.is_none());
+    // 已读完的HTTP错误是确定终态；只有状态头不能证明错误体已读完。
+    failed(sample, kind, &error.to_string(), status.is_none() || unread);
     sample.http_status = status;
     if matches!(error, BridgeError::UnsupportedCapability(_)) {
         sample.result = SampleResult::Unsupported;
@@ -503,6 +545,141 @@ fn has_http_status(error: &BridgeError) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn sent_sample() -> AssessmentSample {
+        AssessmentSample {
+            id: Uuid::new_v4(),
+            ordinal: 0,
+            pair_id: Uuid::new_v4().to_string(),
+            cluster_id: "component.http_error".into(),
+            dimension: Dimension::Protocol,
+            role: Role::Candidate,
+            request_semantic_hash: "semantic".into(),
+            task_hash: "task".into(),
+            input_bytes: 1,
+            dispatch_state: DispatchState::Sent,
+            result: SampleResult::NotRun,
+            error_kind: None,
+            owner_generation: Some(Uuid::new_v4()),
+            dispatch_deadline_at: Some(Utc::now() + chrono::Duration::seconds(30)),
+            sent_at: Some(Utc::now()),
+            finished_at: None,
+            http_status: None,
+            finish_reason: None,
+            score: None,
+            usage: Usage::default(),
+            duration_ms: None,
+            output_bytes: None,
+            evidence: Evidence {
+                checks: vec![],
+                expected_hash: "expected".into(),
+                answer_preview: None,
+                answer_scrubbed: false,
+            },
+            effective_request: EffectiveRequest {
+                native_protocol: "openai.chat_completions".into(),
+                adapter_build: "component".into(),
+                stream: true,
+                output_cap: 1024,
+                sampling_policy: "upstream_defaults".into(),
+                semantic_configuration_hash: "configuration".into(),
+            },
+            error: None,
+        }
+    }
+
+    #[test]
+    fn complete_http_400_and_500_are_known_errors_not_transport_or_unsupported() {
+        for status in [400, 500] {
+            let mut sample = sent_sample();
+            bridge_failure(
+                &mut sample,
+                &BridgeError::upstream_status(status, "complete error"),
+            );
+            assert_eq!(sample.dispatch_state, DispatchState::Finished);
+            assert_eq!(sample.result, SampleResult::Error);
+            assert_eq!(sample.score, None);
+            assert_eq!(sample.http_status, Some(status));
+            // 使用序列化合同使旧产品可编译，并在错误分类的实际值上变红。
+            assert_eq!(
+                serde_json::to_value(sample.error_kind).unwrap(),
+                json!("upstream_http")
+            );
+            assert_eq!(
+                serde_json::to_value(sample.usage).unwrap(),
+                json!({
+                    "input_tokens":null, "output_tokens":null, "upstream_total_tokens":null,
+                    "cached_prompt_tokens":null, "cache_read_tokens":null,
+                    "cache_creation_tokens":null, "reasoning_tokens":null
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn complete_auth_and_rate_limit_http_errors_keep_their_existing_categories() {
+        for (status, expected) in [
+            (401, ErrorKind::Auth),
+            (403, ErrorKind::Auth),
+            (429, ErrorKind::RateLimit),
+        ] {
+            let mut sample = sent_sample();
+            bridge_failure(
+                &mut sample,
+                &BridgeError::upstream_status(status, "complete error"),
+            );
+            assert_eq!(sample.dispatch_state, DispatchState::Finished);
+            assert_eq!(sample.result, SampleResult::Error);
+            assert_eq!(sample.error_kind, Some(expected));
+            assert_eq!(sample.http_status, Some(status));
+        }
+    }
+
+    #[test]
+    fn unread_http_error_bodies_are_uncertain_even_when_the_status_is_known() {
+        for status in [400, 401, 403, 429, 500] {
+            for error in [
+                BridgeError::UpstreamBodyUnread {
+                    status,
+                    decode_error: "incomplete body".into(),
+                    reason: "connection closed".into(),
+                },
+                BridgeError::upstream_status(status, "incomplete body")
+                    .with_body_read_error(Some("connection closed".into())),
+            ] {
+                let mut sample = sent_sample();
+                bridge_failure(&mut sample, &error);
+                assert_eq!(sample.http_status, Some(status));
+                assert_eq!(
+                    sample.dispatch_state,
+                    DispatchState::AbortedAfterSend,
+                    "未读完的HTTP错误体不能释放未知执行槽"
+                );
+                assert_eq!(sample.result, SampleResult::Error);
+                assert_eq!(sample.score, None);
+            }
+        }
+    }
+
+    #[test]
+    fn real_transport_timeout_and_interrupted_streams_remain_uncertain() {
+        for error in [
+            BridgeError::Transport("connection closed".into()),
+            BridgeError::Timeout {
+                elapsed_ms: 30_000,
+                cause: String::new(),
+            },
+            BridgeError::StreamAborted,
+            BridgeError::UpstreamDecode("incomplete stream".into()),
+        ] {
+            let mut sample = sent_sample();
+            bridge_failure(&mut sample, &error);
+            assert_eq!(sample.dispatch_state, DispatchState::AbortedAfterSend);
+            assert_eq!(sample.result, SampleResult::Error);
+            assert_eq!(sample.score, None);
+            assert_eq!(sample.http_status, None);
+        }
+    }
 
     fn task(value: serde_json::Value) -> TaskSnapshot {
         let input_bytes = serde_json::to_vec(&value).unwrap().len() as u32;

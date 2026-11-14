@@ -9,6 +9,9 @@ use aisix_control_plane::model_assessments::history::{
 };
 use aisix_control_plane::model_assessments::suite::SuitePlan;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 use support::{OperatorSession, TestCp};
 use uuid::Uuid;
 
@@ -491,4 +494,271 @@ async fn a_live_admin_can_start_a_plan_after_its_planner_was_disabled() {
     .await
     .expect("当前有效的实际发起人可以开始计划");
     assert_eq!(run.actor_id, starter.id, "工作器必须检查实际发起人");
+}
+
+async fn complete_http_errors_release_admission(status: u16) {
+    complete_http_errors_release_admission_for_accounts(status, false).await;
+}
+
+fn runner_warning_diagnostics() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(
+                "off,aisix_control_plane::model_assessments::runner=warn",
+            ))
+            .with_ansi(false)
+            .without_time()
+            .with_test_writer()
+            .try_init()
+            .expect("组件测试必须安装限定runner的诊断订阅器");
+    });
+}
+
+async fn complete_http_errors_release_admission_for_accounts(status: u16, shared_account: bool) {
+    runner_warning_diagnostics();
+    let Some(cp) = TestCp::start_reaching_loopback().await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let requests = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&requests);
+    let app = axum::Router::new().route("/v1/chat/completions", axum::routing::post(move || {
+        let observed = Arc::clone(&observed);
+        async move {
+            observed.fetch_add(1, Ordering::SeqCst);
+            (axum::http::StatusCode::from_u16(status).expect("合法HTTP状态"), axum::Json(json!({
+                "error":{"message":"complete component HTTP error", "type":match status {400=>"invalid_request_error",403=>"permission_error",_=>"server_error"}}
+            })))
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("独立HTTP组件监听");
+    let endpoint = format!("http://{}/v1", listener.local_addr().expect("组件端口"));
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("HTTP组件服务");
+    });
+    let mut targets = vec![];
+    let mut first_account = Value::Null;
+    for name in ["reference", "candidate"] {
+        let account = if shared_account && name == "candidate" {
+            first_account.clone()
+        } else {
+            let account = cp.send("POST", "/admin/resources/provider_keys", Some(admin.cookie()), Some(json!({"doc": {
+            "display_name":format!("known-http-{name}"), "provider":"openai", "api_key":"component-not-a-real-credential",
+            "api_base":endpoint, "groups":["shared"]
+        }}))).await;
+            assert_eq!(account.status, 201, "{account:?}");
+            account.body
+        };
+        first_account = account.clone();
+        let model = cp.send("POST", "/admin/resources/models", Some(admin.cookie()), Some(json!({"doc": {
+            "display_name":format!("known-http-{name}"), "provider":"openai", "model_name":"component-exact-model", "provider_key_id":account["id"]
+        }}))).await;
+        assert_eq!(model.status, 201, "{model:?}");
+        let revision = |value: &Value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| value.as_i64().expect("资源版本").to_string())
+        };
+        targets.push(json!({"model_id":model.body["id"], "model_version":revision(&model.body["version"]), "provider_key_version":revision(&account["version"])}));
+    }
+    let planned = cp.send("POST", "/admin/model-assessments/plan", Some(admin.cookie()), Some(json!({
+        "reference":targets[0], "candidate":targets[1], "mode":"quick", "suite_id":"capability-v1", "suite_version":"1",
+        "reference_source":{"kind":"verified_channel", "note":"HTTP error admission component regression only", "verified_at":"2026-01-01T00:00:00Z", "independence_confirmed":true}
+    }))).await;
+    if shared_account {
+        server.abort();
+        // 冻结接口要求不同账号；这个新增错误样本不能用于放宽生产合同。
+        assert_eq!(planned.status, 422, "{planned:?}");
+        assert_eq!(planned.body["code"], "validation_failed");
+        assert_eq!(requests.load(Ordering::SeqCst), 0, "非法计划不能调用模型");
+        return;
+    }
+    assert_eq!(planned.status, 201, "{planned:?}");
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        0,
+        "计划不能发出模型HTTP请求"
+    );
+    let id: Uuid = serde_json::from_value(planned.body["id"].clone()).expect("运行UUID");
+    let started = cp
+        .send(
+            "POST",
+            &format!("/admin/model-assessments/{id}/start"),
+            Some(admin.cookie()),
+            Some(json!({
+                "client_request_id":Uuid::new_v4(), "accept_unknown_price":true
+            })),
+        )
+        .await;
+    assert_eq!(started.status, 202, "{started:?}");
+    let finished = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let run = cp
+                .send(
+                    "GET",
+                    &format!("/admin/model-assessments/{id}"),
+                    Some(admin.cookie()),
+                    None,
+                )
+                .await;
+            assert_eq!(run.status, 200, "{run:?}");
+            if matches!(
+                run.body["state"].as_str(),
+                Some("completed" | "interrupted" | "cancelled")
+            ) {
+                break run.body;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    server.abort();
+    let run = finished.expect("完整HTTP错误不得使两个已终态请求占槽90秒");
+    assert_eq!(run["state"], "completed", "{run}");
+    assert_eq!(run["completion_reason"], "all_scheduled");
+    assert_eq!(run["reserved_requests"], 20, "完成错误不退还预留预算");
+    assert_eq!(run["sent_requests"], 20);
+    assert_eq!(run["finished_requests"], 20);
+    assert_eq!(run["unknown_requests"], 0);
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        20,
+        "每个样本恰好一次HTTP请求"
+    );
+    let occupied: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM model_assessment_admission WHERE sample_id IS NOT NULL",
+    )
+    .fetch_one(cp.state().db.pool())
+    .await
+    .expect("真实数据库准入槽");
+    assert_eq!(occupied, 0, "完整终态错误应立即释放准入槽");
+    let samples = cp
+        .send(
+            "GET",
+            &format!("/admin/model-assessments/{id}/samples?limit=100"),
+            Some(admin.cookie()),
+            None,
+        )
+        .await;
+    assert_eq!(samples.status, 200, "{samples:?}");
+    let samples = samples.body["items"].as_array().expect("样本数组");
+    assert_eq!(samples.len(), 20);
+    for sample in samples {
+        assert_eq!(sample["dispatch_state"], "finished");
+        assert_eq!(
+            sample["result"], "error",
+            "HTTP错误不能冒充Pass或Unsupported"
+        );
+        assert_eq!(sample["http_status"], status);
+        assert_eq!(
+            sample["error_kind"],
+            if status == 403 {
+                "auth"
+            } else {
+                "upstream_http"
+            }
+        );
+        assert_eq!(sample.get("score"), Some(&Value::Null));
+        let usage = sample["usage"].as_object().expect("缺量保留显式null对象");
+        assert_eq!(usage.len(), 7);
+        for field in [
+            "input_tokens",
+            "output_tokens",
+            "upstream_total_tokens",
+            "cached_prompt_tokens",
+            "cache_read_tokens",
+            "cache_creation_tokens",
+            "reasoning_tokens",
+        ] {
+            assert_eq!(
+                usage.get(field),
+                Some(&Value::Null),
+                "缺失上游用量不能变成0或省略字段"
+            );
+        }
+    }
+    assert!(history::claim_run(cp.state(), id)
+        .await
+        .expect("终态不得重放")
+        .is_none());
+}
+
+#[tokio::test]
+async fn twenty_complete_http_400_errors_finish_without_quarantining_known_terminal_calls() {
+    complete_http_errors_release_admission(400).await;
+}
+
+#[tokio::test]
+async fn twenty_complete_http_500_errors_finish_without_quarantining_known_terminal_calls() {
+    complete_http_errors_release_admission(500).await;
+}
+
+#[tokio::test]
+async fn two_models_on_one_account_are_rejected_before_any_http_call() {
+    complete_http_errors_release_admission_for_accounts(400, true).await;
+}
+
+#[tokio::test]
+async fn twenty_complete_http_403_errors_keep_auth_category_and_release_terminal_calls() {
+    complete_http_errors_release_admission(403).await;
+}
+
+#[tokio::test]
+async fn uncertain_transport_timeout_and_incomplete_bodies_keep_the_original_quarantine() {
+    for (kind, sent) in [
+        (ErrorKind::Transport, false),
+        (ErrorKind::Timeout, false),
+        (ErrorKind::Decode, true),
+        (ErrorKind::Truncated, true),
+    ] {
+        let Some(cp) = TestCp::start().await else {
+            return;
+        };
+        let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+        let claim = claim_without_dispatch(&cp, &admin).await;
+        let reservation = reserve(&cp, &claim).await;
+        if sent {
+            assert!(history::record_sent(cp.state(), &reservation)
+                .await
+                .expect("上游已应答后断流"));
+        }
+        let mut sample = reservation.sample.clone();
+        sample.dispatch_state = if sent {
+            DispatchState::AbortedAfterSend
+        } else {
+            DispatchState::InterruptedUnknown
+        };
+        sample.error_kind = Some(kind);
+        sample.result = SampleResult::Error;
+        sample.score = None;
+        assert!(
+            history::finish_sample(cp.state(), &reservation, sample, None)
+                .await
+                .expect("不完整执行持久化")
+        );
+        let slot:(Uuid,chrono::DateTime<chrono::Utc>,chrono::DateTime<chrono::Utc>)=sqlx::query_as("SELECT sample_id,dispatch_deadline_at,isolated_until FROM model_assessment_admission WHERE sample_id=$1")
+            .bind(reservation.sample.id).fetch_one(cp.state().db.pool()).await.expect("未知执行必须保留隔离槽");
+        assert_eq!(slot.0, reservation.sample.id);
+        assert_eq!(slot.1, reservation.dispatch_deadline_at);
+        assert_eq!(
+            slot.2,
+            reservation.dispatch_deadline_at + chrono::Duration::seconds(60)
+        );
+        let run = history::read(cp.state(), claim.run.summary.id)
+            .await
+            .expect("原预算快照");
+        assert_eq!(run.summary.reserved_requests, 1);
+        assert_eq!(run.summary.sent_requests, u32::from(sent));
+        assert!(!history::mark_sent(cp.state(), &reservation)
+            .await
+            .expect("终态sample不能重发"));
+        assert!(history::claim_run(cp.state(), claim.run.summary.id)
+            .await
+            .expect("已预留作业不能重放")
+            .is_none());
+    }
 }

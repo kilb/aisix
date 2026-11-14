@@ -102,7 +102,7 @@ export interface AssessmentSample {
   input_bytes: number;
   dispatch_state: "not_sent" | "reserved" | "sent" | "finished" | "cancelled_before_send" | "aborted_after_send" | "interrupted_unknown";
   result: "pass" | "fail" | "error" | "unsupported" | "not_run";
-  error_kind: "auth" | "rate_limit" | "timeout" | "transport" | "decode" | "truncated" | "configuration_changed" | "cancelled" | null;
+  error_kind: "auth" | "rate_limit" | "upstream_http" | "timeout" | "transport" | "decode" | "truncated" | "configuration_changed" | "cancelled" | null;
   owner_generation: string | null;
   dispatch_deadline_at: string | null;
   sent_at: string | null;
