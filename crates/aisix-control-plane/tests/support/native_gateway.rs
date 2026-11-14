@@ -65,6 +65,16 @@ impl HttpRegistry {
             )
             .await
             .map_err(|_| NativeRegistryError::Unavailable)?;
+        if std::env::var_os("AISIX_NATIVE_AUTHORITY_DIAGNOSTICS").is_some() {
+            // 只输出固定协议槽和计数，避免把对象标识、请求正文或凭据写进诊断。
+            eprintln!(
+                "native authority diagnostic: operation={operation} status={} code={} state={} origin_surface={}",
+                response.status,
+                response.body["code"].as_str().unwrap_or("absent"),
+                response.body["state"].as_str().unwrap_or("absent"),
+                response.body.pointer("/origin/surface").and_then(Value::as_str).unwrap_or("absent"),
+            );
+        }
         match response.status {
             200 => {
                 serde_json::from_value(response.body).map_err(|_| NativeRegistryError::Unavailable)
