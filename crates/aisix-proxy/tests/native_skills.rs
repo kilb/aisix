@@ -810,7 +810,12 @@ async fn anthropic_skill_container_survives_gateway_restart_reuse_and_replacemen
     assert_eq!(response.status(), StatusCode::OK);
     let mut payload = json!({"model":"native-model","max_tokens":32,"container":{"skills":[{"type":"custom","skill_id":"skill_owned","version":"latest"}]},"tools":[{"type":"code_execution_20250825","name":"code_execution"}],"messages":[{"role":"user","content":"Use marker"}]});
     let result = json!({"id":"msg_container","type":"message","role":"assistant","model":"provider-model","content":[{"type":"text","text":"CONTAINER_MARKER"}],"stop_reason":"end_turn","stop_sequence":null,"container":{"id":"container_owned","expires_at":"2026-12-01T00:00:00Z"},"usage":{"input_tokens":5,"output_tokens":1}});
-    mount_json(&upstream, "POST", "/v1/messages", result.clone()).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(result.clone()))
+        .up_to_n_times(2)
+        .mount(&upstream)
+        .await;
     let response = request(
         router,
         "anthropic",
