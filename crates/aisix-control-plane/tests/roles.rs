@@ -166,6 +166,7 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
         ),
         // Stored usage.
         ("GET", "/admin/usage/events")
+        | ("GET", "/admin/native-metering")
         | ("GET", "/admin/usage/metrics")
         | ("GET", "/admin/usage/direct-models")
         | ("GET", "/admin/usage/batches")
