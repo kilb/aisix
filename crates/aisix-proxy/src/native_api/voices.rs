@@ -120,7 +120,8 @@ async fn handle(
     let snapshot = state.snapshot.load();
     let mut audit = skills::Audit::new(NativeProtocol::Openai);
     let mut operation_id = None;
-    let result = async {
+    let mut deletion = None;
+    let mut result = async {
         let mut payload = skills::Payload::parse(&state, request, &endpoint).await?;
         let (target, origin, record) = if let Some(id) = action.id() {
             let (target, origin, record) =
@@ -200,6 +201,17 @@ async fn handle(
         } else {
             None
         };
+        if method == Method::DELETE {
+            let reserved = skills::Deletion::reserve(
+                &state,
+                &auth,
+                record.as_ref().ok_or_else(openai::dependency)?,
+            )
+            .await?;
+            operation_id = Some(reserved.operation_id());
+            audit.deleting(reserved.operation_id());
+            deletion = Some(reserved);
+        }
         let query = openai::strip_model_query(query.as_deref());
         let reply = if method == Method::GET && matches!(action, Action::Consents) {
             skills::list_owned(
@@ -251,13 +263,9 @@ async fn handle(
                         return Err(openai::invalid_identity());
                     }
                 }
-                if method == Method::DELETE {
-                    skills::tombstone(
-                        &state,
-                        &auth,
-                        record.as_ref().ok_or_else(openai::dependency)?,
-                    )
-                    .await?;
+                if let Some(reserved) = &deletion {
+                    reserved.commit().await?;
+                    deletion = None;
                 }
             }
             audit.output(&state, &auth, &target, &reply.bytes).await?;
@@ -265,6 +273,11 @@ async fn handle(
         Ok((skills::response(NativeProtocol::Openai, reply), target))
     }
     .await;
+    if let (Err(error), Some(reserved)) = (&result, deletion) {
+        if let Err(error) = reserved.resolve(error).await {
+            result = Err(error);
+        }
+    }
     audit
         .finish(
             &state,

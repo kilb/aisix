@@ -6,8 +6,8 @@ use std::time::Instant;
 use aisix_core::models::EndpointFamily;
 use aisix_core::native_objects::{
     configured_native_origin_at, AcceptedReference, InferenceStage, NativeObjectKind,
-    NativeOriginSurface, NativeProtocol, NativeRecord, OriginBinding, OwnedRequest,
-    TombstoneRequest,
+    NativeOriginSurface, NativeProtocol, NativeRecord, ObjectDeletionRequest, OriginBinding,
+    OwnedRequest, ResolveReservationRequest,
 };
 use aisix_core::AisixSnapshot;
 use axum::extract::{FromRequest, Multipart, RawQuery, Request, State};
@@ -17,6 +17,7 @@ use bytes::Bytes;
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
+use super::registry::{NativeObjectRegistry, NativeRegistryError};
 use super::{anthropic, openai};
 use crate::auth::AuthenticatedKey;
 use crate::client_ip::ClientContext;
@@ -75,6 +76,17 @@ impl Audit {
                 audit.registered(registration)
             }
             _ => {}
+        }
+    }
+
+    pub(crate) fn deleting(&mut self, operation_id: Uuid) {
+        match self {
+            Self::Openai(audit) => {
+                audit.registered_operation(operation_id, InferenceStage::Management)
+            }
+            Self::Anthropic(audit) => {
+                audit.registered_operation(operation_id, InferenceStage::Management)
+            }
         }
     }
 
@@ -524,23 +536,94 @@ pub(crate) fn response(protocol: NativeProtocol, reply: openai::Reply) -> Respon
     }
 }
 
-pub(crate) async fn tombstone(
-    state: &ProxyState,
-    auth: &AuthenticatedKey,
-    record: &NativeRecord,
-) -> Result<(), ProxyError> {
-    let reply = openai::registry(state)?
-        .tombstone(TombstoneRequest {
+/// 派发前持久占住对象；明确拒绝可释放，未知结果必须保留到受控对账。
+pub(crate) struct Deletion {
+    registry: Arc<dyn NativeObjectRegistry>,
+    request: ObjectDeletionRequest,
+}
+
+fn deletion_error(error: NativeRegistryError) -> ProxyError {
+    if error == NativeRegistryError::Conflict {
+        ProxyError::NativeOperationConflict
+    } else {
+        openai::registry_error(error)
+    }
+}
+
+impl Deletion {
+    pub(crate) async fn reserve(
+        state: &ProxyState,
+        auth: &AuthenticatedKey,
+        record: &NativeRecord,
+    ) -> Result<Self, ProxyError> {
+        let registry = openai::registry(state)?;
+        let request = ObjectDeletionRequest {
             api_key_id: openai::api_key_id(auth)?,
+            operation_id: Uuid::new_v4(),
             record_id: record.record_id,
             version: record.version,
-        })
-        .await
-        .map_err(openai::registry_error)?;
-    if reply.state != "deleted" {
-        return Err(openai::dependency());
+        };
+        let reply = registry
+            .reserve_delete(request.clone())
+            .await
+            .map_err(deletion_error)?;
+        if reply.state != "reserved"
+            || reply.operation_id != Some(request.operation_id)
+            || !reply.record.as_ref().is_some_and(|reserved| {
+                reserved.record_id == request.record_id
+                    && reserved.version == request.version
+                    && !reserved.deleted
+            })
+        {
+            return Err(openai::dependency());
+        }
+        Ok(Self { registry, request })
     }
-    Ok(())
+
+    pub(crate) fn operation_id(&self) -> Uuid {
+        self.request.operation_id
+    }
+
+    pub(crate) async fn commit(&self) -> Result<(), ProxyError> {
+        let reply = self
+            .registry
+            .commit_delete(self.request.clone())
+            .await
+            .map_err(deletion_error)?;
+        if reply.state != "deleted" {
+            return Err(openai::dependency());
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn resolve(&self, error: &ProxyError) -> Result<(), ProxyError> {
+        let upstream_rejected = matches!(
+            error,
+            ProxyError::Bridge(
+                aisix_gateway::BridgeError::UpstreamStatus { status, .. }
+                | aisix_gateway::BridgeError::UpstreamBodyUnread { status, .. }
+            ) if (400..500).contains(status) && *status != 408
+        );
+        let reply = self
+            .registry
+            .resolve_reservation(ResolveReservationRequest {
+                api_key_id: self.request.api_key_id,
+                operation_id: self.request.operation_id,
+                upstream_rejected,
+            })
+            .await
+            .map_err(deletion_error)?;
+        if reply.state
+            != if upstream_rejected {
+                "rejected"
+            } else {
+                "uncertain"
+            }
+        {
+            return Err(openai::dependency());
+        }
+        Ok(())
+    }
 }
 
 pub(crate) async fn filter_owned(
@@ -922,7 +1005,8 @@ async fn handle(
     let snapshot = state.snapshot.load();
     let mut audit = Audit::new(protocol);
     let mut operation_id = None;
-    let result = async {
+    let mut deletion = None;
+    let mut result = async {
         if protocol == NativeProtocol::Anthropic
             && (matches!(action, Action::Content(_))
                 || matches!(action, Action::Skill(_)) && method == Method::POST)
@@ -1042,6 +1126,17 @@ async fn handle(
         } else {
             None
         };
+        if matches!(action, Action::Skill(_)) && method == Method::DELETE {
+            let reserved = Deletion::reserve(
+                &state,
+                &auth,
+                record.as_ref().ok_or_else(openai::dependency)?,
+            )
+            .await?;
+            operation_id = Some(reserved.operation_id());
+            audit.deleting(reserved.operation_id());
+            deletion = Some(reserved);
+        }
         let reply = if method == Method::GET
             && matches!(action, Action::Collection | Action::Versions(_))
         {
@@ -1104,13 +1199,9 @@ async fn handle(
                         }
                     }
                 }
-                if matches!(action, Action::Skill(_)) && method == Method::DELETE {
-                    tombstone(
-                        &state,
-                        &auth,
-                        record.as_ref().ok_or_else(openai::dependency)?,
-                    )
-                    .await?;
+                if let Some(reserved) = &deletion {
+                    reserved.commit().await?;
+                    deletion = None;
                 }
             }
             audit.output(&state, &auth, &target, &reply.bytes).await?;
@@ -1118,6 +1209,11 @@ async fn handle(
         Ok((response(protocol, reply), target))
     }
     .await;
+    if let (Err(error), Some(reserved)) = (&result, deletion) {
+        if let Err(error) = reserved.resolve(error).await {
+            result = Err(error);
+        }
+    }
     audit
         .finish(
             &state,
