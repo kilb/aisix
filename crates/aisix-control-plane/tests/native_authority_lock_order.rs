@@ -130,7 +130,7 @@ async fn fixture() -> Fixture {
         .send("POST", RELATED_BEGIN, Some(admission.clone()))
         .await;
     assert_eq!(begun.status, 200, "{begun:?}");
-    assert_eq!(begun.body["state"].as_str(), Some("submitted"));
+    assert_eq!(begun.body["state"].as_str(), Some("pending_submission"));
     let binding = json!({
         "binding":{"operation_id":submission["operation_id"], "api_key_id":key, "raw_id":"vsfb_lock_order"},
         "relations":[{"parent":{"source":"record","record_id":parent},
