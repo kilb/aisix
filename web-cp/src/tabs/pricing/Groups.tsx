@@ -14,7 +14,7 @@ import { RecordTablePager, RecordTableToolbar } from "../../ui/RecordTable";
 import { Field, useRefusalFocus } from "../../ui/Field";
 import { TwoStep } from "../../ui/TwoStep";
 import { useToast } from "../../ui/Toast";
-import { BentoGrid, Card, CardHeader, CardMessage, Metric, MetricSkeleton, PageHeader, span } from "../../components/page";
+import { Card, CardHeader, PageHeader } from "../../components/page";
 import { Sheet, SheetContent } from "../../components/ui/sheet";
 import { GroupDetail } from "./GroupDetail";
 import { Count, FormGrid } from "./kit";
@@ -91,6 +91,7 @@ export function Groups({ canEdit }: TabProps) {
   const [refusal, setRefusal] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
+  const createTrigger = useRef<HTMLButtonElement | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -129,7 +130,7 @@ export function Groups({ canEdit }: TabProps) {
           <>
             <Button type="button" icon="refresh" className="finance-icon-button" aria-label="刷新" title="刷新分组" onClick={() => void load()} />
             {canEdit && (
-              <Button type="button" kind="primary" icon="plus" onClick={() => setCreating(true)}>
+              <Button type="button" kind="primary" icon="plus" onClick={(event) => { createTrigger.current = event.currentTarget; setCreating(true); }}>
                 新建分组
               </Button>
             )}
@@ -149,22 +150,15 @@ export function Groups({ canEdit }: TabProps) {
           {refusal}
         </div>
       )}
-      <BentoGrid className="mb-3">
-        <Card className={span.d7}>
-          <CardHeader number={1} title="分组 · 全部" />
-          {rows === null ? error ? <CardMessage onRetry={() => void load()}>数据读取失败</CardMessage> : <MetricSkeleton /> : <Metric size="hero">{fmtInt(rows.length)}</Metric>}
-          <dl className="mt-6 grid grid-cols-2 gap-4 border-t border-ink/7 pt-4">
-            <div><dt className="font-mono text-micro text-muted">租户引用</dt><dd className="mt-1 break-all text-stat tabular-nums">{referenceCount(rows, "tenants")}</dd></div>
-            <div><dt className="font-mono text-micro text-muted">密钥引用</dt><dd className="mt-1 break-all text-stat tabular-nums">{referenceCount(rows, "keys")}</dd></div>
-          </dl>
-        </Card>
-        <Card tone="inverse" className={span.d5Wide}>
-          <CardHeader number={2} title="默认换算率 · 待生效修订" />
-          {rows === null ? error ? <CardMessage onRetry={() => void load()}>数据读取失败</CardMessage> : <MetricSkeleton /> : <Metric size="display">{fmtInt(scheduledCount)}</Metric>}
-          <p className="mt-4 text-caption text-on-inverse-muted">只统计全部分组默认换算率的预约版本；单模型覆盖在分组明细查看。</p>
-          <p className="mt-6 border-t border-surface/12 pt-4 text-body">默认分组：{rows === null ? "—" : rows.find((g) => g.is_default)?.display_name ?? "未设置"}</p>
-        </Card>
-      </BentoGrid>
+      <Card className="mb-3">
+        <dl className="compact-overview-facts">
+          <div><dt>分组 · 全部</dt><dd>{rows === null ? "—" : fmtInt(rows.length)}</dd></div>
+          <div><dt>租户引用</dt><dd>{referenceCount(rows, "tenants")}</dd></div>
+          <div><dt>密钥引用</dt><dd>{referenceCount(rows, "keys")}</dd></div>
+          <div><dt>默认换算率 · 待生效修订</dt><dd>{rows === null ? "—" : fmtInt(scheduledCount)}</dd></div>
+        </dl>
+        <p className="text-caption text-muted">默认分组：{rows === null ? "—" : rows.find((group) => group.is_default)?.display_name ?? "未设置"}。预约修订只统计默认换算率，单模型覆盖在分组明细中查看。</p>
+      </Card>
       <Card className="mb-0">
         <CardHeader number={3} className="mb-0" title={<>全部分组{rows && <Count n={rows.length} />}</>} />
         {rows === null ? (
@@ -208,6 +202,7 @@ export function Groups({ canEdit }: TabProps) {
         <Sheet open={creating} onOpenChange={setCreating}>
           <SheetContent
             title="新建分组"
+            onCloseAutoFocus={(event) => { event.preventDefault(); createTrigger.current?.focus(); }}
             onEscapeKeyDown={(e) => {
               // Escape inside an open confirmation takes back the confirmation, not the whole form.
               if (document.activeElement?.closest(".two-step.is-asking")) e.preventDefault();

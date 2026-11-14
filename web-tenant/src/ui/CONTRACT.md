@@ -6,7 +6,7 @@
 
 双端使用 Refined 暖石灰视觉：画布 #ECEAE4、暖白面板 #FBFAF7、嵌套区 #E1DED6、墨色 #121211、次级文字 #64635D。主按钮、链接和焦点使用墨色；#FF5A1F 仅用于当前导航小点、实时点与重点图形，不用于浅底小字。成功、警告、失败仍附状态文字与图形。颜色原值集中在 tokens.css，不在业务页面另建主题。
 
-页面标题28px、手机26px；hero36px、display32px、figure/value28px，手机hero32px、其余28px，指标400字重。正文与导航14px，描述13px，meta/micro最少12px。CardHeader为16px/600，页标题500。中文普通标签使用sans，等宽用于机器标识与代码。面板padding20px、手机16px；内容gap16px、区域24px、面板圆角24px，按钮与输入框圆角8px。控件命中区保持44px。面板用细边线分层，不使用投影、装饰渐变或入场位移。
+页面标题28px、手机26px；hero36px、display32px、figure/value28px，手机hero32px、其余28px，指标400字重。正文与导航14px，描述13px，meta/micro最少12px。CardHeader为16px/600，页标题500。中文普通标签使用sans，等宽用于机器标识与代码。面板padding18px、手机16px；内容gap14px、区域16px、面板圆角24px，按钮与输入框圆角8px。控件命中区保持44px。面板用细边线分层，不使用投影、装饰渐变或入场位移。
 
 桌面侧栏224px，距离视口左、上、下24px，与主内容间距24px；圆角24px，暖白面板，菜单独立滚动，账号固定在底部。当前项采用淡墨底、墨字与橙点。页头融入画布；宽表只在自身容器滚动。窄屏使用保留焦点合同的抽屉，距离视口16px，内容按原断点重排。
 
@@ -30,7 +30,7 @@
 
 **Lamp**：state applied/propagating/pending/rejected/disabled 不变；图形为成功实点/警告空心/危险方点，状态文字始终在场，无脉冲入场。children 是真实状态；title 可选。属性保持 data-lamp，禁止改为 data-state（后者是 rollout 合同）。
 
-**DataTable/Loading**：label 保留可访问表名，compact/scroll/children 不变；header44，普通行至少56，compact至少48，使行内44按钮不被固定小高度裁切。num/right/tabular 仍控制对齐。记录分页自然撑开页面，不在表格外框限制高度；长列仅在 dt-wrap 内按需横向滚动，scroll 继续作为兼容钩子而不强制纵向滚动。Loading 三骨架行和 DOM 中“载入中…”不变，骨架 aria-hidden；reduced-motion 下关闭动画。
+**DataTable/Loading**：label 保留可访问表名，compact/scroll/children 不变；header40，普通行基准40，含操作的行由44px命中区自然撑开，使按钮不被固定小高度裁切。num/right/tabular 仍控制对齐。记录分页自然撑开页面，不在表格外框限制高度；长列仅在 dt-wrap 内按需横向滚动，scroll 继续作为兼容钩子而不强制纵向滚动。Loading 三骨架行和 DOM 中“载入中…”不变，骨架 aria-hidden；reduced-motion 下关闭动画。
 
 **EmptyState**：text/mark/action 不变；页面已有同名操作时不重复添加 action，保持 strict locator 唯一性。
 

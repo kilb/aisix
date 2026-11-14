@@ -158,7 +158,7 @@
 .finance-workspace .dt > :is(thead, tbody, tfoot) > tr > :is(th, td) { min-width: 0; max-width: none; overflow-wrap: anywhere; white-space: normal; vertical-align: top; }
 .finance-workspace .dt:not(:has(> colgroup)) > :is(thead, tbody, tfoot) > tr > :is(th, td):first-child:not([colspan], .import-pick) { width: 25%; }
 .finance-workspace .dt .num { text-align: right; font-variant-numeric: tabular-nums; }
-.finance-workspace .dt > :is(thead, tbody, tfoot) > tr > :is(th, td).right { width: 12%; min-width: 0; }
+.finance-workspace .dt:not(:has(> colgroup)) > :is(thead, tbody, tfoot) > tr > :is(th, td).right { width: 12%; min-width: 0; }
 /* 分组的长操作与二次确认在列内换行，不向表格外挤出。 */
 .finance-workspace .finance-groups-table > :is(thead, tbody) > tr > :is(th, td).right { width: 20%; }
 .finance-workspace .finance-groups-table .row-actions { min-width: 0; max-width: 100%; }
@@ -188,15 +188,15 @@
 .finance-resource-count strong { color: var(--foreground); font-size: 13px; font-variant-numeric: tabular-nums; font-weight: 500; }
 /* 多字段记录在中等容器中改为有名称的网格，金额和审查状态仍全部可见。 */
 @container (max-width: 72rem) {
-  .finance-workspace table:has(> tbody > tr[data-finance-record] > td:nth-child(7)) { display: block; }
-  .finance-workspace table:has(> tbody > tr[data-finance-record] > td:nth-child(7)) > colgroup { display: none; }
-  .finance-workspace table:has(> tbody > tr[data-finance-record] > td:nth-child(7)) > thead { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
-  .finance-workspace table:has(> tbody > tr[data-finance-record] > td:nth-child(7)) > tbody { display: block; }
-  .finance-workspace table:has(> tbody > tr[data-finance-record] > td:nth-child(7)) > tbody > tr[data-finance-record] { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px 20px; padding: 20px 16px; border-bottom: 1px solid var(--border); }
-  .finance-workspace table:has(> tbody > tr[data-finance-record] > td:nth-child(7)) > tbody > tr[data-finance-record] > td { display: block; width: auto; min-width: 0; max-width: none; height: auto; padding: 0; border: 0; text-align: left; }
-  .finance-workspace table:has(> tbody > tr[data-finance-record] > td:nth-child(7)) > tbody > tr[data-finance-record] > td::before { content: attr(data-label); display: block; margin-bottom: 5px; color: var(--muted-foreground); font-size: 12px; line-height: 18px; font-weight: 400; }
-  .finance-workspace table:has(> tbody > tr[data-finance-record] > td:nth-child(7)) > tbody > tr:not([data-finance-record]):has(> td[colspan]) { display: block; }
-  .finance-workspace table:has(> tbody > tr[data-finance-record] > td:nth-child(7)) > tbody > tr:not([data-finance-record]) > td[colspan] { display: block; width: 100%; box-sizing: border-box; }
+  .finance-workspace table:not(.charge-records-table):has(> tbody > tr[data-finance-record] > td:nth-child(7)) { display: block; }
+  .finance-workspace table:not(.charge-records-table):has(> tbody > tr[data-finance-record] > td:nth-child(7)) > colgroup { display: none; }
+  .finance-workspace table:not(.charge-records-table):has(> tbody > tr[data-finance-record] > td:nth-child(7)) > thead { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  .finance-workspace table:not(.charge-records-table):has(> tbody > tr[data-finance-record] > td:nth-child(7)) > tbody { display: block; }
+  .finance-workspace table:not(.charge-records-table):has(> tbody > tr[data-finance-record] > td:nth-child(7)) > tbody > tr[data-finance-record] { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px 14px; padding: 12px 14px; border-bottom: 1px solid var(--border); }
+  .finance-workspace table:not(.charge-records-table):has(> tbody > tr[data-finance-record] > td:nth-child(7)) > tbody > tr[data-finance-record] > td { display: block; width: auto; min-width: 0; max-width: none; height: auto; padding: 0; border: 0; text-align: left; }
+  .finance-workspace table:not(.charge-records-table):has(> tbody > tr[data-finance-record] > td:nth-child(7)) > tbody > tr[data-finance-record] > td::before { content: attr(data-label); display: block; margin-bottom: 5px; color: var(--muted-foreground); font-size: 12px; line-height: 18px; font-weight: 400; }
+  .finance-workspace table:not(.charge-records-table):has(> tbody > tr[data-finance-record] > td:nth-child(7)) > tbody > tr:not([data-finance-record]):has(> td[colspan]) { display: block; }
+  .finance-workspace table:not(.charge-records-table):has(> tbody > tr[data-finance-record] > td:nth-child(7)) > tbody > tr:not([data-finance-record]) > td[colspan] { display: block; width: 100%; box-sizing: border-box; }
 }
 @media (max-width: 719px) {
   .finance-workspace .sections-switch { flex-wrap: wrap; overflow-x: visible; row-gap: 0; }
@@ -217,3 +217,7 @@
   .finance-workspace .dt-detail { max-width: 100%; }
   .finance-workspace .dt-detail > td { padding-inline: 12px; }
 }
+
+.finance-workspace .finance-amount-label { margin-bottom: 2px; }
+.finance-workspace .sections-switch { margin-bottom: 16px; }
+.finance-workspace .finance-form-grid { row-gap: 16px; }

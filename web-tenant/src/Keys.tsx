@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useId, useState, type CSSProperties } from "react";
-import { Pause, Play } from "lucide-react";
+import { useCallback, useEffect, useId, useRef, useState, type CSSProperties } from "react";
+import { Pause, Play, Plus } from "lucide-react";
 import {
   ApiError,
   groups as groupApi,
@@ -18,6 +18,7 @@ import {
 } from "./lib/api";
 import { formMessageFor, messageFor } from "./lib/errors";
 import { ShownOnce } from "./controls";
+import { FormDialog } from "./ui/FormDialog";
 import { Button } from "./ui/Button";
 import { DataTable, Loading } from "./ui/DataTable";
 import { EmptyState } from "./ui/EmptyState";
@@ -25,8 +26,7 @@ import { Field, useRefusalFocus } from "./ui/Field";
 import { KeySecret } from "./ui/KeySecret";
 import { Lamp, type LampState } from "./ui/Lamp";
 import { TwoStep } from "./ui/TwoStep";
-import { BentoGrid, Card, CardFooter, CardHeader, CardMessage, Metric, MetricSkeleton, PageHeader, span } from "./components/page";
-import { RankBars } from "./components/charts";
+import { BentoGrid, Card, CardHeader, PageHeader, span } from "./components/page";
 import { formatCount } from "./lib/chartFormat";
 import { cn } from "./lib/cn";
 import { fmtBeijing, parseBeijingInput } from "./lib/time";
@@ -74,9 +74,13 @@ export function Keys({
   const [caps, setCaps] = useState<Caps | null>(null);
   const [people, setPeople] = useState<Member[] | null>(null);
   const [readErr, setReadErr] = useState<string | null>(null);
+  const [createOpen, setCreateOpen] = useState(false);
+  const [createBusy, setCreateBusy] = useState(false);
   // The plaintext, in this page's state alone: it goes with a reload or a
   // change of page. The list's own 复制 reveals it again.
   const [minted, setMinted] = useState<string | null>(null);
+  const createdResult = useRef<HTMLDivElement>(null);
+  useEffect(() => { if (minted && createOpen) createdResult.current?.focus(); }, [minted, createOpen]);
   const [actionErr, setActionErr] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   // Which action on that key is in flight.
@@ -187,6 +191,7 @@ export function Keys({
   return (
     <>
       <PageHeader
+        actions={active && <Button kind="primary" onClick={() => { setMinted(null); setCreateOpen(true); }}><Plus aria-hidden />新建密钥</Button>}
         title="API 密钥"
         eyebrow={visibleScope}
         dataLead={items === null ? "管理调用凭据、模型范围与使用限制。" : <>
@@ -196,30 +201,12 @@ export function Keys({
         </>}
       />
       <BentoGrid className="tenant-keys">
-        <Card className={span.d5Wide}>
-          <CardHeader number={1} title="当前可见密钥" />
-          {items === null ? (listErr ? <CardMessage onRetry={() => void load()}>密钥读取失败，请重试。</CardMessage> : <MetricSkeleton />) : (
-            <>
-              <Metric size="hero">{formatCount(items.length)}</Metric>
-              <CardFooter>
-                <p className="text-body text-ink-soft">{manager ? "组织成员及组织持有的全部密钥" : "仅包含归属你的密钥"}</p>
-                <p className="mt-2 text-caption text-ink-soft">完整可见列表 · 不包含已吊销密钥</p>
-              </CardFooter>
-            </>
-          )}
-        </Card>
-        <Card className={span.d7}>
-          <CardHeader number={2} title="密钥配置状态" description="每把密钥只计入一个状态；不代表实时调用结果。" />
-          <CardFooter>
-            {items === null ? (listErr ? <CardMessage onRetry={() => void load()}>状态读取失败，请重试。</CardMessage> : <Loading />) : (
-              <RankBars
-                items={stateCounts.map((item) => ({ ...item, displayValue: `${formatCount(item.value)} 把` }))}
-                accessibleLabel={`当前可见密钥中，${formatCount(readyKeys ?? 0)} 把配置可用，共 ${formatCount(items.length)} 把`}
-                emptyLabel="还没有密钥"
-              />
-            )}
-            <p className="mt-4 text-caption text-ink-soft">平台停用、主动停用、过期、分组不可用按此顺序归类。组织状态、预算及实时额度另行生效。</p>
-          </CardFooter>
+        <Card className={`${span.d12} keys-overview`} aria-label="密钥配置状态概览">
+          <dl className="compact-overview-facts">
+            <div><dt>当前可见密钥</dt><dd>{items === null ? "—" : formatCount(items.length)}</dd></div>
+            {stateCounts.map((state) => <div key={state.label}><dt>{state.label}</dt><dd>{formatCount(state.value)}</dd></div>)}
+          </dl>
+          <p className="text-caption text-muted">{manager ? "全组织密钥" : "我的密钥"} · 配置状态不代表实时调用结果，实际调用受组织授权和额度约束。</p>
         </Card>
         <Card className={cn(span.d12, "keys-list")}>
           <CardHeader number={3} title="密钥列表" description="复制或查看明文会重新获取密钥；吊销后立即失效，无法恢复。" />
@@ -228,11 +215,6 @@ export function Keys({
             <Field label="密钥分组"><select value={groupFilter} onChange={(e) => setGroupFilter(e.target.value)}><option value="">全部分组</option>{(groups ?? []).map((group) => <option key={group.id} value={group.id}>{group.display_name}</option>)}</select></Field>
           </RecordTableToolbar>
           {!active && <div className="note crit">组织已被停用，所有密钥暂时无法调用；这里只能吊销密钥。</div>}
-          {minted && (
-            <ShownOnce title="密钥明文（可再次复制）" value={minted} onDone={() => setMinted(null)}>
-              <span className="hint">密钥创建成功。之后可在下面的密钥列表里随时点「复制」再次获取明文。</span>
-            </ShownOnce>
-          )}
           {listErr && (
             <div className="note crit" role="alert">
               {listErr}
@@ -359,8 +341,8 @@ export function Keys({
           )}
           {items !== null && <RecordTablePager page={table.page} pageSize={table.pageSize} onPageChange={table.setPage} onPageSizeChange={table.setPageSize} total={table.filteredCount} label="密钥" />}
         </Card>
-        {active && (
-          <NewKeyForm
+        {active && <FormDialog open={createOpen} onOpenChange={(next) => { setCreateOpen(next); if (!next) setMinted(null); }} busy={createBusy} title={minted ? "密钥已创建" : "新建密钥"} description="先选择计价分组，再设置模型范围与限制。留空的限制沿用组织上限。">
+          {minted ? <div ref={createdResult} tabIndex={-1} aria-label="密钥已创建" className="key-created-result"><ShownOnce title="密钥明文（可再次复制）" value={minted} onDone={() => { setCreateOpen(false); setMinted(null); }}><span className="hint">密钥已创建。复制后即可使用；之后也可以在密钥列表里重新获取明文。</span></ShownOnce></div> : <NewKeyForm
             me={member}
             manager={manager}
             catalog={catalog}
@@ -369,12 +351,14 @@ export function Keys({
             people={people}
             readErr={readErr}
             onInactive={onSelfChanged}
+            onBusyChange={setCreateBusy}
+            onCancel={() => setCreateOpen(false)}
             onCreated={(plaintext) => {
               setMinted(plaintext);
               void load();
             }}
-          />
-        )}
+          />}
+        </FormDialog>}
       </BentoGrid>
     </>
   );
@@ -509,6 +493,8 @@ function NewKeyForm({
   readErr,
   onInactive,
   onCreated,
+  onBusyChange,
+  onCancel,
 }: {
   me: SessionMember;
   manager: boolean;
@@ -520,6 +506,8 @@ function NewKeyForm({
   /** Called when the control plane says the organisation is no longer active. */
   onInactive: () => void;
   onCreated: (plaintext: string) => void;
+  onBusyChange: (busy: boolean) => void;
+  onCancel: () => void;
 }) {
   const id = useId();
   const [label, setLabel] = useState("");
@@ -586,6 +574,7 @@ function NewKeyForm({
     if (expiresAt) body.expires_at = expiresAt;
     if (manager && owner) body.member_id = owner;
     setBusy(true);
+    onBusyChange(true);
     try {
       const { plaintext } = await keyApi.create(body);
       setLabel("");
@@ -626,6 +615,7 @@ function NewKeyForm({
       }
     } finally {
       setBusy(false);
+      onBusyChange(false);
     }
   }
 
@@ -864,6 +854,7 @@ function NewKeyForm({
           </div>
         )}
         <div className="tenant-form-actions col-span-full">
+          <Button onClick={onCancel} disabled={busy}>取消</Button>
           <Button
             kind="primary"
             type="submit"

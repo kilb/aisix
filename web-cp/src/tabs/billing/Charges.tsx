@@ -20,6 +20,8 @@ import { currentQueryResult, type QueryResult } from "../../lib/queryResult";
 import { chargesQuery } from "../../lib/analysisNavigation";
 import { cn } from "../../lib/cn";
 import { ChevronDown, RotateCcw } from "lucide-react";
+import { UsagePerformance } from "../../components/UsagePerformance";
+import { isSupportedUsageIoAudit } from "../../lib/usageIoAudit";
 import { UsageIoAuditDetails } from "../../components/UsageIoAuditDetails";
 import { UsageRecordFilters } from "../../components/UsageRecordFilters";
 import { usageRecordFilterValues } from "../../lib/usageRecordFilters";
@@ -137,30 +139,21 @@ export function Charges(_props: TabProps) {
         title="调用记录"
         eyebrow="CALLS · 计费尝试"
         dataLead="按计费尝试逐条展示，同一请求可能有多条记录。失败但已产生用量的调用仍按实际用量计费。"
-        description={
-          <>
-            每一次调用的计价结果，最新的在前。售价和成本都以人民币计：成本是这次调用按上游账号的成本换算率算出的平台成本，未知时显示 —。
-            未计价的行写明原因；无需计费的行写明调用怎样结束（上游失败、没有可用的上游、调用方中断、网关出错、请求被拒绝或没有用量），这些行不收费。
-          </>
-        }
+        description="售价与成本以人民币计；成本未知显示 —。无需计费的调用不收费，原因保留在每行。"
         actions={
           <Button className="finance-icon-button" aria-label="刷新" title="刷新" type="button" icon="refresh" onClick={() => void loadFirst(filter)}></Button>
         }
       />
       {(filter.from || filter.to || filter.member_id || filter.provider_key_id || filter.request_id) && <p className="hint" role="status">当前已应用范围条件：{[filter.from ? "开始 " + fmtBeijing(filter.from) : null, filter.to ? "结束 " + fmtBeijing(filter.to) + "（不含）" : null, filter.member_id ? "成员 " + filter.member_id : null, filter.provider_key_id ? "上游账号 " + filter.provider_key_id : null, filter.request_id ? "请求 " + filter.request_id : null].filter(Boolean).join("；")}</p>}
       <BentoGrid>
-      <Card className={span.d12}>
+      <Card className={`${span.d12} charge-workspace`}>
         <CardHeader
           number={1}
           title="调用计费记录"
-          description={<>
-            {rows === null ? (error ? "当前筛选结果读取失败，请重试。" : "正在读取当前筛选结果。") : `当前筛选已加载 ${formatCount(rows.length)} 条${next === null ? "，已到记录末尾。" : "，可继续加载。"}`}
-            每一次调用的计价结果，最新的在前。售价和成本都以人民币计：成本是这次调用按上游账号的成本换算率算出的平台成本，未知时显示 —。
-            未计价的行写明原因；无需计费的行写明调用怎样结束（上游失败、没有可用的上游、调用方中断、网关出错、请求被拒绝或没有用量），这些行不收费。
-          </>}
+          description={rows === null ? (error ? "当前筛选结果读取失败，请重试。" : "正在读取当前筛选结果。") : `当前筛选已加载 ${formatCount(rows.length)} 条${next === null ? "，已到记录末尾。" : "，可继续加载。"}`}
         />
         <form
-          className="flex flex-wrap items-center gap-x-4 gap-y-3"
+          className="charge-primary-filters"
           onSubmit={(e) => {
             e.preventDefault();
             set({ event_id: eventDraft.trim() || undefined });
@@ -252,13 +245,15 @@ export function Charges(_props: TabProps) {
           <>
             <RecordTools table={table} label="计费明细" loaded></RecordTools>
             <DataTable label="计费明细" className="charge-records" tableClassName="charge-records-table">
+              <colgroup><col className="charge-col-identity" /><col className="charge-col-status" /><col className="charge-col-money" /><col className="charge-col-service" /><col className="charge-col-performance" /><col /><col className="charge-col-action" /></colgroup>
               <thead>
                 <tr>
                   <th>调用 / 租户</th>
                   <th>计价结果</th>
                   <th className="num">费用（元）</th>
                   <th>服务 / 档位</th>
-                  <th>用量</th>
+                  <th>响应性能</th>
+                  <th>用量 / 字节估算</th>
                   <th className="right">
                     <span className="vh">复核</span>
                   </th>
@@ -282,7 +277,8 @@ export function Charges(_props: TabProps) {
                           <Upstream c={c} />
                           <span className="cell-note">档位 {c.service_tier ?? "—"}</span>
                         </td>
-                        <td data-label="用量" className="tabular text-caption">{usageSummary(c.usage) ?? "—"}</td>
+                        <td data-label="响应性能"><UsagePerformance data={c} /></td>
+                        <td data-label="用量" className="tabular text-caption"><span title={usageSummary(c.usage) ?? undefined}>输入 {c.usage_input_tokens == null ? "—" : formatCount(c.usage_input_tokens)} / 输出 {c.usage?.completion_tokens == null ? "—" : formatCount(c.usage.completion_tokens)}</span><IoReferenceSummary c={c} /></td>
                         <td data-label="复核" className="right">
                           <Button
                             kind="quiet"
@@ -307,7 +303,7 @@ export function Charges(_props: TabProps) {
                       </tr>
                       {shown && (
                         <tr className="dt-detail" id={`charge-check-${c.seq}`}>
-                          <td colSpan={6}>
+                          <td colSpan={7}>
                             <ChargeCheck c={c} />
                           </td>
                         </tr>
@@ -358,6 +354,17 @@ function ChargeScopeFilters({ filter, onChange }: { filter: ChargeFilter; onChan
       </div>
     </form>
   </details>;
+}
+
+/** 字节估算与实测用量显示在同一条记录，完整口径保留在明细。 */
+function IoReferenceSummary({ c }: { c: Charge }) {
+  const audit = isSupportedUsageIoAudit(c.io_audit) ? c.io_audit : undefined;
+  const reference = audit && c.io_token_reference?.method === "utf8_bytes_div4_v1" ? c.io_token_reference : undefined;
+  const format = (value: number | null | undefined) => value == null ? "—" : new Intl.NumberFormat("en-US").format(value);
+  const partial = audit?.input_text?.complete === false || audit?.output_text?.complete === false;
+  return <span className="cell-note io-token-reference" title="按已观测文本 UTF-8 字节数 ÷ 4 向上取整；未校准，仅供核对，不参与计费。">
+    字节估算 ≈ {format(reference?.input_tokens)} / {format(reference?.output_tokens)}{partial ? "（部分）" : ""}
+  </span>;
 }
 
 /** The upstream account that served the call, and the model it was asked for. */

@@ -5,6 +5,7 @@ import { Eye, Pencil, Plus, RefreshCw, Trash2, Waypoints } from "lucide-react";
 import { Fragment, useEffect, useRef, useState, type ReactNode } from "react";
 import type { TabProps } from "../App";
 import { ConflictNote } from "../components/ConflictNote";
+import { FormDialog } from "../ui/FormDialog";
 import { Field, useRefusalFocus } from "../ui/Field";
 import { Msg, type Note } from "../components/Msg";
 import { RolloutBadge } from "../components/RolloutBadge";
@@ -264,7 +265,7 @@ export function Models({ canEdit, onGoto }: TabProps) {
     );
   }
   // 编辑区打开时仍保留全部列，表格在卡片内部滚动。
-  const split = editor !== null;
+  const split = editor !== null && open?.mode !== "new";
 
   return (
     <div className="cp-operations cp-models">
@@ -275,7 +276,7 @@ export function Models({ canEdit, onGoto }: TabProps) {
         actions={
           <>
             <Button type="button" className="ops-icon-button" aria-label="刷新" title="刷新模型目录" onClick={refresh}><RefreshCw aria-hidden /></Button>
-            {canEdit && !open && (
+            {canEdit && (!open || open.mode === "new") && (
               <>
                 <Button onClick={() => openForm({ mode: "new", shape: "routing" })}>
                   <Waypoints aria-hidden />
@@ -361,7 +362,7 @@ export function Models({ canEdit, onGoto }: TabProps) {
           split && "ops-editor-open",
         )}
       >
-        {editor && <div className="ops-editor">{editor}</div>}
+        {editor && (open?.mode === "new" ? <FormDialog open onOpenChange={(next) => { if (!next) setOpen(null); }} title={open.shape === "routing" ? "新建路由模型" : "新建直连模型"}>{editor}</FormDialog> : <div className="ops-editor">{editor}</div>)}
         <Card className="ops-list mb-0">
           <CardHeader
             number={editor ? 4 : 3}

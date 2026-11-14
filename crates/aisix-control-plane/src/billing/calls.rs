@@ -236,6 +236,8 @@ pub(super) const EVENT_FIELDS: &str = "jsonb_build_object(\
     'downstream_latency_ms', ue.event->'downstream_latency_ms', \
     'first_token_latency_ms', ue.event->'first_token_latency_ms', \
     'upstream_latency_ms', ue.event->'upstream_latency_ms', \
+    'upstream_tpot_ms', ue.event->'upstream_tpot_ms', \
+    'upstream_dispatched', ue.event->'upstream_dispatched', \
     'io_audit', ue.event->'io_audit', \
     'usage_estimated', ue.event->'usage_estimated', \
     'usage', jsonb_build_object(\
@@ -263,6 +265,10 @@ pub struct IoTokenReference {
 /// 详情共用的只读投影，保留缺失、真实零和网关估算来源。
 #[derive(Debug, Serialize)]
 pub struct CallUsage {
+    first_token_latency_ms: Option<u32>,
+    /// 本次上游尝试的完整耗时，不以客户端首帧耗时代替。
+    attempt_duration_ms: Option<u32>,
+    throughput_tps: Option<f64>,
     usage: Option<serde_json::Map<String, Value>>,
     usage_estimated: Option<bool>,
     usage_input_tokens: Option<u64>,
@@ -296,6 +302,9 @@ impl CallUsage {
                 }
             });
         Self {
+            first_token_latency_ms: event_milliseconds(ev, "first_token_latency_ms"),
+            attempt_duration_ms: event_milliseconds(ev, "upstream_latency_ms").filter(|ms| *ms > 0),
+            throughput_tps: measured_throughput(ev),
             usage: ev.get("usage").and_then(Value::as_object).map(|usage| {
                 usage
                     .iter()
@@ -309,6 +318,30 @@ impl CallUsage {
             io_token_reference,
         }
     }
+}
+
+fn event_milliseconds(event: &Value, field: &str) -> Option<u32> {
+    event
+        .get(field)?
+        .as_u64()
+        .and_then(|ms| u32::try_from(ms).ok())
+}
+
+/// 复用监测中的 TPOT 口径；不从完整耗时、字节参考或缺失字段推算吞吐。
+fn measured_throughput(event: &Value) -> Option<f64> {
+    let status = event.get("status_code")?.as_u64()?;
+    if !(200..300).contains(&status)
+        || event
+            .get("error_class")
+            .and_then(Value::as_str)
+            .is_some_and(|v| !v.is_empty())
+        || event.get("cache_status").and_then(Value::as_str) == Some("hit")
+        || event.get("upstream_dispatched").and_then(Value::as_bool) == Some(false)
+    {
+        return None;
+    }
+    let tpot = event.get("upstream_tpot_ms")?.as_f64()?;
+    (1e-100..=1e100).contains(&tpot).then(|| 1000.0 / tpot)
 }
 
 fn stored_input_tokens(usage: &Value) -> Option<u64> {
@@ -461,9 +494,6 @@ pub struct Call {
     pub cache_hit: bool,
     pub guardrail_blocked: bool,
     pub latency_ms: Option<u32>,
-    pub first_token_latency_ms: Option<u32>,
-    /// 本次模型请求的上游起点至结束，包含网络传输，不是请求级总耗时。
-    pub attempt_duration_ms: Option<u32>,
     #[serde(flatten)]
     pub usage: CallUsage,
     pub charge: ChargeView,
@@ -840,17 +870,6 @@ pub async fn list_calls(
                 latency_ms: r
                     .ev
                     .get("downstream_latency_ms")
-                    .and_then(Value::as_u64)
-                    .and_then(|ms| u32::try_from(ms).ok())
-                    .filter(|ms| *ms > 0),
-                first_token_latency_ms: r
-                    .ev
-                    .get("first_token_latency_ms")
-                    .and_then(Value::as_u64)
-                    .and_then(|ms| u32::try_from(ms).ok()),
-                attempt_duration_ms: r
-                    .ev
-                    .get("upstream_latency_ms")
                     .and_then(Value::as_u64)
                     .and_then(|ms| u32::try_from(ms).ok())
                     .filter(|ms| *ms > 0),

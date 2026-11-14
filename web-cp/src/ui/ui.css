@@ -377,7 +377,7 @@ select.select-sm {
 }
 .dt td {
   height: var(--h-row);
-  padding: 2px 12px;
+  padding: 4px 10px;
   border-bottom: 1px solid var(--border);
   vertical-align: middle;
   white-space: normal;
@@ -390,8 +390,8 @@ select.select-sm {
   max-width: 320px;
 }
 .dt tr:has(.cell-note, .tn-note, .rollout-errors, .sub) > td {
-  padding-top: 10px;
-  padding-bottom: 10px;
+  padding-top: 5px;
+  padding-bottom: 5px;
 }
 .dt td > .lamp,
 .dt td > .rollout {
@@ -514,7 +514,7 @@ select.select-sm {
   align-items: center;
   gap: 12px;
   margin: 16px 0 0;
-  padding: 48px 24px;
+  padding: 28px 16px;
   border: 0;
   border-radius: 0;
   color: var(--muted-foreground);
@@ -715,7 +715,25 @@ main { counter-reset: bento-card; }
   .bento-page-header { gap: 12px; margin-bottom: 20px; }
   .bento-page-header > :first-child { flex-basis: 100%; }
   .bento-page-header h1 { line-height: 34px; }
-  .empty { padding: 32px 8px; }
+  .empty { padding: 24px 8px; }
   .side-head { align-items: flex-start; }
   .two-step-warn { max-width: min(44ch, 75vw); }
 }
+
+.dt tr:has(.btn) > td { padding-top: 2px; padding-bottom: 2px; }
+
+/* 三项实测值并列排布，单元格保持两行，保留真实零与未知。 */
+.usage-performance { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px 10px; margin: 0; min-width: 0; text-align: right; font-variant-numeric: tabular-nums; }
+.usage-performance > div { min-width: 0; }
+.usage-performance dt { color: var(--muted-foreground); font-size: 12px; line-height: 16px; white-space: nowrap; }
+.usage-performance dd { margin: 2px 0 0; color: var(--foreground); font-size: 13px; line-height: 18px; overflow-wrap: anywhere; }
+
+/* 紧凑统计条用于列表概况，不以大块数字卡挤压实际记录。 */
+.compact-overview-facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); align-items: start; gap: 12px 20px; margin: 0; }
+.compact-overview-facts > div { min-width: 0; }
+.compact-overview-facts dt { color: var(--muted-foreground); font-size: 12px; line-height: 18px; }
+.compact-overview-facts dd { margin: 4px 0 0; color: var(--foreground); font-size: 24px; font-weight: 400; line-height: 32px; font-variant-numeric: tabular-nums; }
+.pricing-tier-coverage { display: flex; flex-wrap: wrap; gap: 6px 12px; color: var(--muted-foreground); font-size: 12px; }
+.pricing-tier-coverage > span { padding: 3px 8px; border-radius: 5px; background: var(--muted); }
+.pricing-tier-coverage strong { margin-left: 6px; color: var(--foreground); font-weight: 500; }
+.public-model-overview { margin-bottom: 14px; }

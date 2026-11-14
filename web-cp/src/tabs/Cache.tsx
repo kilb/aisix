@@ -12,6 +12,7 @@ import { defaultAt, enumAt, loadSchema, SchemaShapeError, valueDescriptionsAt } 
 import { useResource } from "../lib/useResource";
 import { Failure } from "./Tenants";
 import { Button } from "../ui/Button";
+import { FormDialog } from "../ui/FormDialog";
 import { useRefusalFocus } from "../ui/Field";
 import { OperationalTable as DataTable, Loading } from "../components/OperationalTable";
 import { EmptyState } from "../ui/EmptyState";
@@ -530,7 +531,8 @@ export function Cache({ canEdit, onGoto }: TabProps) {
           {optionsError}
         </div>
       )}
-      <Split asideWidth="minmax(340px, 30%)" main={list} aside={editor || undefined} />
+      <Split asideWidth="minmax(340px, 30%)" main={list} aside={form?.id === null ? undefined : editor || undefined} />
+      {form?.id === null && <FormDialog open onOpenChange={(next) => { if (!next) setForm(null); }} busy={busy} title="新建缓存策略" description="按作用范围与模型设置缓存；校验失败保留输入。">{editor}</FormDialog>}
     </div>
   );
 }

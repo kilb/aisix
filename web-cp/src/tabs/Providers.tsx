@@ -14,6 +14,7 @@ import { enumAt, loadSchema } from "../lib/schema";
 import { useResource } from "../lib/useResource";
 import { Card, CardHeader, PageHeader } from "../components/page";
 import { cn } from "../lib/cn";
+import { FormDialog } from "../ui/FormDialog";
 import { Button } from "../ui/Button";
 import { OperationalTable as DataTable, Loading } from "../components/OperationalTable";
 import { useRecordTable } from "../lib/recordTable";
@@ -94,6 +95,7 @@ export function Providers({ canEdit }: TabProps) {
   const [schema, setSchema] = useState<SchemaInfo | null>(null);
   const [open, setOpen] = useState<Open | null>(null);
   const [opening, setOpening] = useState(false);
+  const createTrigger = useRef<HTMLButtonElement>(null);
   const [note, setNote] = useState<Note | null>(null);
   // The row whose `删除` was clicked once, awaiting `确认删除`.
   const [deleting, setDeleting] = useState<string | null>(null);
@@ -173,7 +175,7 @@ export function Providers({ canEdit }: TabProps) {
   const editChoices = groupChoices(groups.data, editing?.doc.groups ?? []);
 
   // 编辑表单旁保留完整账号列，表格在自己的卡片中滚动。
-  const split = open?.mode === "new" || editing !== undefined;
+  const split = editing !== undefined;
 
   const assignedGroups = new Set(pk.items?.flatMap((a) => a.doc.groups ?? []) ?? []);
   const ungrouped = pk.items?.filter((a) => (a.doc.groups?.length ?? 0) === 0).length ?? 0;
@@ -187,8 +189,8 @@ export function Providers({ canEdit }: TabProps) {
         actions={
           <>
             <Button type="button" className="ops-icon-button" aria-label="刷新" title="刷新上游账号" onClick={() => void pk.reload()}><RefreshCw aria-hidden /></Button>
-            {canEdit && !open && (
-              <Button kind="primary" disabled={opening} onClick={() => void openNew()}>
+            {canEdit && (!open || open.mode === "new") && (
+              <Button ref={createTrigger} kind="primary" disabled={opening} onClick={() => void openNew()}>
                 <Plus aria-hidden />
                 新增上游账号
               </Button>
@@ -256,7 +258,7 @@ export function Providers({ canEdit }: TabProps) {
       {/* 编辑表单先于列表朗读，账号模型映射在两者下方铺满一行。 */}
       <div className={cn("ops-editor-grid", split && "ops-editor-open")}>
         {open?.mode === "new" && (
-          <div className="ops-editor">
+          <FormDialog open onOpenChange={(next) => { if (!next) setOpen(null); }} title="新建上游账号" returnFocusRef={createTrigger} description="选择协议族与凭据，保存后凭据不会再次显示。">
             <AccountForm
               key="new"
               account={null}
@@ -272,7 +274,7 @@ export function Providers({ canEdit }: TabProps) {
               onClose={() => setOpen(null)}
               onReload={() => undefined}
             />
-          </div>
+          </FormDialog>
         )}
         {editing && (
           <div className="ops-editor">

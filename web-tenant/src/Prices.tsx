@@ -13,7 +13,7 @@ import { EmptyState } from "./ui/EmptyState";
 import { RecordTablePager, RecordTableToolbar } from "./ui/RecordTable";
 import { Button } from "./ui/Button";
 import { CopyButton } from "./ui/CopyButton";
-import { BentoGrid, Card, CardFooter, CardHeader, CardMessage, Metric, MetricSkeleton, PageHeader, span } from "./components/page";
+import { BentoGrid, Card, CardHeader, CardMessage, MetricSkeleton, PageHeader, span } from "./components/page";
 
 function failure(e: unknown): string {
   return e instanceof ApiError ? messageFor(e) : String(e);
@@ -67,27 +67,17 @@ export function Prices({ initialGroup }: { initialGroup: string | null }) {
   return <>
     {header}
     <BentoGrid className="tenant-prices">
-      <Card className={`${span.d12} price-summary`}>
-        <div className="price-summary-discount">
-          <CardHeader title="当前组织优惠" />
-          <Metric size="display">{quote.discount_bps === null ? "未知" : discountPercent(quote.discount_bps)}</Metric>
-          <p className="text-body text-ink-soft">优惠为减免比例，以下单价已计入优惠。</p>
-          <p className="text-caption text-muted">倍率 = 换算率 ×（1 − 组织优惠）。换算率由平台配置，人民币单价按模型的美元基准价乘以倍率计算。</p>
-          <CardFooter className="price-quote-validity text-caption text-muted">
-            <p>报价时刻 {fmtBeijing(quote.as_of)}</p>
-            <p>{quote.valid_until === null ? "当前报价未设置失效时刻" : `有效至 ${fmtBeijing(quote.valid_until)}`}</p>
-          </CardFooter>
-        </div>
-        <div className="price-summary-models">
-          <CardHeader title="可计价模型" />
-          <Metric size="display">{catalog.length.toLocaleString("en-US")}</Metric>
-          <p className="text-body text-ink-soft">覆盖 {quote.groups.length.toLocaleString("en-US")} 个分组</p>
-          <CardFooter className="text-caption text-muted">当前报价不改变历史账单；历史费用使用调用时的费率。</CardFooter>
-        </div>
+      <Card className={`${span.d12} price-summary price-summary-compact`}>
+        <dl className="price-summary-facts">
+          <div><dt>当前组织优惠</dt><dd>{quote.discount_bps === null ? "未知" : discountPercent(quote.discount_bps)}</dd><span>下方价格已计入优惠</span></div>
+          <div><dt>可计价模型</dt><dd>{catalog.length.toLocaleString("en-US")}</dd><span>{quote.groups.length.toLocaleString("en-US")} 个可用分组</span></div>
+          <div className="price-summary-time"><dt>报价时刻</dt><dd>{fmtBeijing(quote.as_of)}</dd><span>{quote.valid_until === null ? "当前报价未设置失效时刻" : `有效至 ${fmtBeijing(quote.valid_until)}`}</span></div>
+        </dl>
+        <details className="price-quote-explainer"><summary>价格如何计算</summary><p>倍率 = 换算率 ×（1 − 组织优惠）。人民币单价按美元基准价乘以倍率计算。当前报价不改变历史账单；历史费用使用调用时的费率。</p></details>
       </Card>
       <Card className={span.d12}>
         <CardHeader title="模型价格目录" />
-        <p className="text-caption text-muted">价格以人民币计，按实际用量计费。摘要为标准档基础价，单位为元/百万 token；展开查看完整档位与上下文条件。</p>
+        <p className="text-caption text-muted">价格以人民币计，按实际用量计费。摘要跟随所选服务档位，单位为元/百万 Token；展开可对比全部档位、长上下文与其他计量项目。</p>
         <PriceCatalog quote={quote} groupId={selectedGroup} onGroupChange={(value) => setGroupFilter({ linkedGroup: initialGroup, value })} />
         <p className="price-estimate-note text-caption text-muted">已列出的单价按价卡确定；“未提供价格”的项目不按零计费。“含估算”表示调用的部分 token 用量由网关估算，与单价无关，具体调用会在用量页单独标注。</p>
       </Card>
@@ -95,11 +85,15 @@ export function Prices({ initialGroup }: { initialGroup: string | null }) {
   </>;
 }
 
+const tierName = (tier: string) => ({ default: "标准", standard: "Standard", fast: "Fast", priority: "Priority", batch: "Batch", flex: "Flex" } as Record<string, string>)[tier] ?? tier;
+
 const searchModel = (model: CatalogModel) => [model.name, ...model.groups.flatMap((group) => [group.display_name, group.description])];
 
 function PriceCatalog({ quote, groupId, onGroupChange }: { quote: PriceQuoteList; groupId: string; onGroupChange: (group: string) => void }) {
   const models = useMemo(() => modelPriceCatalog(quote.groups, groupId), [quote.groups, groupId]);
   const table = useRecordTable({ items: models, searchText: searchModel, resetKey: groupId });
+  const [tier, setTier] = useState("default");
+  const tiers = [...new Set(models.flatMap((model) => model.groups.flatMap((group) => Object.keys(group.quote.prices_by_tier))))].sort((a, b) => (a === "default" ? -1 : b === "default" ? 1 : a.localeCompare(b)));
   return <>
     <RecordTableToolbar search={{ value: table.query, onChange: table.setQuery, label: "搜索模型价格", placeholder: "模型名、分组或说明" }}>
       <label className="price-group-filter">分组筛选
@@ -108,6 +102,7 @@ function PriceCatalog({ quote, groupId, onGroupChange }: { quote: PriceQuoteList
           {quote.groups.map((group) => <option key={group.id} value={group.id}>{group.display_name}</option>)}
         </select>
       </label>
+      <label className="price-group-filter">服务档位<select aria-label="服务档位" value={tier} onChange={(event) => setTier(event.target.value)}><option value="default">标准</option>{tiers.filter((value) => value !== "default").map((value) => <option key={value} value={value}>{tierName(value)}</option>)}</select></label>
     </RecordTableToolbar>
     {table.rows.length === 0 ? <EmptyState text={table.query || groupId ? "没有符合筛选条件的模型价格。" : "当前分组暂时没有可计价的模型。"} mark="route" /> : <>
       <div className="price-catalog" role="region" aria-label="模型价格"><DataTable label="模型单价">
@@ -115,15 +110,15 @@ function PriceCatalog({ quote, groupId, onGroupChange }: { quote: PriceQuoteList
           {Array.from({ length: 4 }, (_, index) => <col key={index} className="price-summary-amount" />)}
         </colgroup>
         <thead><tr><th>模型 / 分组</th><th className="num">倍率</th><th className="num">输入</th><th className="num">输出</th><th className="num">缓存读</th><th className="num">缓存写</th></tr></thead>
-        {table.rows.map((model) => <ModelRows key={model.model_id} model={model} discountBps={quote.discount_bps} />)}
+        {table.rows.map((model) => <ModelRows key={model.model_id} model={model} tier={tier} discountBps={quote.discount_bps} />)}
       </DataTable></div>
     </>}
     <RecordTablePager page={table.page} pageSize={table.pageSize} onPageChange={table.setPage} onPageSizeChange={table.setPageSize} total={table.filteredCount} label="模型价格分页" />
   </>;
 }
 
-function GroupPriceRow({ group, discountBps }: { group: ModelGroupQuote; discountBps: number | null }) {
-  const base = group.quote.prices_by_tier.default?.base ?? [];
+function GroupPriceRow({ group, discountBps, tier }: { group: ModelGroupQuote; discountBps: number | null; tier: string }) {
+  const base = group.quote.prices_by_tier[tier]?.base ?? [];
   const rate = (dimension: Dimension) => base.find((item) => item.dimension === dimension);
   const oneHour = rate("cache_write_1h");
   return <tr data-price-group={group.id} className="price-group-row">
@@ -131,7 +126,7 @@ function GroupPriceRow({ group, discountBps }: { group: ModelGroupQuote; discoun
       {group.description !== "" && <span className="cell-note hint">{group.description}</span>}
     </th>
     <td className="num price-multiplier" data-label="倍率"><span className="price-multiplier-value">{group.quote.effective_multiplier}×</span>
-      <span className="cell-note hint">{group.quote.cny_per_usd} ×（1 − {discountBps === null ? "未知" : discountPercent(discountBps)}）</span>
+      <span className="cell-note hint" title={`${group.quote.cny_per_usd} ×（1 − ${discountBps === null ? "未知" : discountPercent(discountBps)}）`}>已含组织优惠</span>
     </td>
     <td className="num" data-label="输入"><PriceRateValue rate={rate("input")} /></td>
     <td className="num" data-label="输出"><PriceRateValue rate={rate("output")} /></td>
@@ -143,13 +138,13 @@ function GroupPriceRow({ group, discountBps }: { group: ModelGroupQuote; discoun
   </tr>;
 }
 
-function ModelRows({ model, discountBps }: { model: CatalogModel; discountBps: number | null }) {
+function ModelRows({ model, discountBps, tier }: { model: CatalogModel; discountBps: number | null; tier: string }) {
   const [expanded, setExpanded] = useState(false);
   const [copyError, setCopyError] = useState<string | null>(null);
   const detailsId = useId();
   return <tbody data-price-model={model.model_id}>
     <tr className="price-model-heading"><td colSpan={6}>
-      <div className="price-model-bar"><span className="break-all select-text" data-model-name>{model.name}</span>
+      <div className="price-model-bar"><span className="break-all select-text" data-model-name>{model.name}<span className="price-model-tier">{tierName(tier)}{model.groups.some((group) => (group.quote.prices_by_tier[tier]?.long_context.length ?? 0) > 0) ? " · 含长上下文价格" : ""}</span></span>
         <div className="price-model-actions">
           <CopyButton text={async () => { setCopyError(null); return model.name; }} label="复制模型名" size="sm"
             onFailed={(error) => setCopyError(`复制失败：${failure(error)}。请手动选择上方模型名。`)} />
@@ -160,7 +155,7 @@ function ModelRows({ model, discountBps }: { model: CatalogModel; discountBps: n
       </div>
       {copyError !== null && <p className="field-problem" role="alert">{copyError}</p>}
     </td></tr>
-    {model.groups.map((group) => <GroupPriceRow key={group.id} group={group} discountBps={discountBps} />)}
+    {model.groups.map((group) => <GroupPriceRow key={group.id} group={group} tier={tier} discountBps={discountBps} />)}
     {expanded && <tr className="price-expanded-row"><td colSpan={6} id={detailsId} className="price-detail-cell">
       {model.groups.map((group) => <Fragment key={group.id}>
         <h3 className="price-detail-group text-body font-medium">{group.display_name} · 完整价格</h3>

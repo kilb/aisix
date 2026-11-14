@@ -318,6 +318,11 @@ const CHARGE_EVENT: &str = "jsonb_build_object(\
     'attempt_kind', ue.event->'attempt_kind', \
     'attempt_index', ue.event->'attempt_index', \
     'is_final_attempt', ue.event->'is_final_attempt', \
+    'first_token_latency_ms', ue.event->'first_token_latency_ms', \
+    'upstream_latency_ms', ue.event->'upstream_latency_ms', \
+    'upstream_tpot_ms', ue.event->'upstream_tpot_ms', \
+    'upstream_dispatched', ue.event->'upstream_dispatched', \
+    'cache_status', ue.event->'cache_status', \
     'provider_key_id', ue.event->'provider_key_id', \
     'upstream_model', ue.event->'upstream_model', \
     'io_audit', ue.event->'io_audit', \

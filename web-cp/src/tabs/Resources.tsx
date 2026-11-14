@@ -11,6 +11,7 @@ import { RolloutBadge } from "../components/RolloutBadge";
 import { ApiError, resources, type Detail, type ResourceView } from "../lib/api";
 import { messageFor } from "../lib/errors";
 import { useResource } from "../lib/useResource";
+import { FormDialog } from "../ui/FormDialog";
 import { Button } from "../ui/Button";
 import { useRefusalFocus } from "../ui/Field";
 import { OperationalTable as DataTable, Loading } from "../components/OperationalTable";
@@ -385,7 +386,8 @@ function KindPage({ info, canEdit }: { info: KindInfo; canEdit: boolean }) {
           <div><dt>当前类型操作</dt><dd>{writable ? "可编辑手工资源" : "只读"}</dd></div>
         </dl>
       </InventorySummary>
-      <Split asideWidth="minmax(460px, 44%)" main={list} aside={editor || undefined} />
+      <Split asideWidth="minmax(460px, 44%)" main={list} aside={editing?.mode === "new" ? undefined : editor || undefined} />
+      {editing?.mode === "new" && <FormDialog open onOpenChange={(next) => { if (!next) setEditing(null); }} busy={busy} title={`新建${info.label}`} description="文档经服务端校验后保存。验证失败会保留输入。">{editor}</FormDialog>}
     </>
   );
 }

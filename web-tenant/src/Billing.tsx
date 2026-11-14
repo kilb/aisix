@@ -22,6 +22,7 @@ import { beijingRange, defaultCalendarRange, fmtBeijing, periodLabel } from "./l
 import { useRecordTable, type RecordPageSize } from "./lib/recordTable";
 import { RecordTablePager, RecordTableToolbar } from "./ui/RecordTable";
 import { BalanceReadout, Money, type ReadoutStop } from "./ui/BalanceReadout";
+import { FormDialog } from "./ui/FormDialog";
 import { Button } from "./ui/Button";
 import { DataTable, Loading } from "./ui/DataTable";
 import { EmptyState } from "./ui/EmptyState";
@@ -77,6 +78,8 @@ export function Billing({ member }: { member: SessionMember }) {
   const [balanceErr, setBalanceErr] = useState<string | null>(null);
   const [topups, setTopups] = useState<Topup[] | null>(null);
   const [topupsVersion, setTopupsVersion] = useState(0);
+  const [topupOpen, setTopupOpen] = useState(false);
+  const [topupBusy, setTopupBusy] = useState(false);
   const rememberTopups = useCallback((items: Topup[]) => {
     setTopups((current) => [...new Map([...(current ?? []), ...items].map((item) => [item.id, item])).values()]);
   }, []);
@@ -120,12 +123,12 @@ export function Billing({ member }: { member: SessionMember }) {
 
   return (
     <>
-      <PageHeader title="账务账户" dataLead="余额来自全量已入账快照；可用额度同时受账户、组织、成员和密钥限制。待审批充值到账后才可使用。" />
+      <PageHeader actions={<Button kind="primary" icon="plus" onClick={() => setTopupOpen(true)}>申请充值</Button>} title="账务账户" dataLead="余额来自全量已入账快照；可用额度同时受账户、组织、成员和密钥限制。待审批充值到账后才可使用。" />
       <BentoGrid className="billing tenant-billing">
         <BalancePanel balance={balance} team={team} teamErr={teamErr} onRetryTeam={() => void loadTeam()} err={balanceErr} />
         <Readout member={member} balance={balance} team={team} teamErr={teamErr} onRetryTeam={() => void loadTeam()} />
         <TopupList reloadKey={topupsVersion} onLoaded={rememberTopups} />
-        <TopupForm onRequested={() => { setTopupsVersion((version) => version + 1); void loadBalance(); }} />
+        <FormDialog open={topupOpen} onOpenChange={setTopupOpen} busy={topupBusy} title="申请充值" description="提交金额与付款凭据后，等待平台审批；申请不会立即改变余额。"><TopupForm onBusyChange={setTopupBusy} onRequested={() => { setTopupOpen(false); setTopupsVersion((version) => version + 1); void loadBalance(); }} /></FormDialog>
         <Ledger topups={topups} />
       </BentoGrid>
     </>
@@ -392,7 +395,7 @@ type TopupField = "amount" | "note" | "reference";
 
 const TOPUP_PATH: Record<string, TopupField> = { "/amount_cny": "amount", "/note": "note", "/reference": "reference" };
 
-function TopupForm({ onRequested }: { onRequested: () => void }) {
+function TopupForm({ onRequested, onBusyChange }: { onRequested: () => void; onBusyChange: (busy: boolean) => void }) {
   const [amount, setAmount] = useState("");
   const [note, setNote] = useState("");
   const [reference, setReference] = useState("");
@@ -413,6 +416,7 @@ function TopupForm({ onRequested }: { onRequested: () => void }) {
     }
     setErrors({});
     setBusy(true);
+    onBusyChange(true);
     try {
       await billing.requestTopup({
         amount_cny: amountText,
@@ -441,6 +445,7 @@ function TopupForm({ onRequested }: { onRequested: () => void }) {
       }
     } finally {
       setBusy(false);
+      onBusyChange(false);
     }
   }
 

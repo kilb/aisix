@@ -7,7 +7,7 @@ import { Mark, type MarkName } from "./Icon";
 /**
  * An empty list: a 32px muted mark, one sentence on what to do next, and,
  * when the page has none in view already, the one action that starts it,
- * centred with 48px of space above and below.
+ * centred with 28px of space above and below.
  */
 export function EmptyState({ text, action, mark = "route" }: { text: string; action?: ReactNode; mark?: MarkName }) {
   return (

@@ -37,6 +37,7 @@ export function TwoStep({
   size,
   ask = () => true,
   warning,
+  icon,
 }: {
   label: string;
   onConfirm: () => void;
@@ -45,10 +46,12 @@ export function TwoStep({
   busy?: boolean;
   /** The busy button's name; its own label when absent. */
   busyLabel?: string;
-  kind?: "primary" | "secondary" | "danger";
+  kind?: "primary" | "secondary" | "danger" | "quiet";
   size?: "sm";
   ask?: () => boolean;
   warning?: ReactNode;
+  /** 安静图标动作仍以 label 命名，确认文字保持完整。 */
+  icon?: ReactNode;
 }) {
   const [asking, setAsking] = useState(false);
   // Confirmed, and open until the request it started has ended.
@@ -105,13 +108,16 @@ export function TwoStep({
           key="first"
           ref={first}
           kind={kind}
+          iconOnly={icon != null}
+          aria-label={icon != null ? label : undefined}
+          title={icon != null ? label : undefined}
           size={size}
           disabled={disabled}
           busy={busy}
           busyLabel={busyLabel ?? label}
           onClick={() => (ask() ? swap(true) : onConfirm())}
         >
-          {label}
+          {icon ?? label}
         </Button>
       ) : (
         <>

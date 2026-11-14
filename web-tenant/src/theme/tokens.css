@@ -6,7 +6,7 @@
   --bento-surface: #FBFAF7;
   --bento-well: #E1DED6;
   --bento-stone: #D9D5CB;
-  --bento-line: #C9C5BB;
+  --bento-line: #D7D4CC;
   --bento-graphite: #7A7871;
   --bento-ink: #121211;
   --bento-ink-soft: #4A4944;
@@ -32,7 +32,7 @@
   --destructive: var(--danger);
   --destructive-foreground: var(--bento-surface);
   --border: var(--bento-line);
-  --input: #827F76;
+  --input: #86847E;
   --ring: var(--brand);
   --radius: 8px;
   --sidebar: var(--card);
@@ -72,7 +72,7 @@
   --text-muted: var(--muted-foreground);
   --divider: var(--border);
   --input-border: var(--input);
-  --input-border-hover: var(--foreground);
+  --input-border-hover: var(--bento-graphite);
   --box-border: var(--input);
   --focus: var(--ring);
   --focus-halo: transparent;
@@ -80,7 +80,7 @@
   --error: var(--danger);
   --hover: color-mix(in srgb, var(--foreground) 5%, transparent);
   --press: color-mix(in srgb, var(--foreground) 8%, transparent);
-  --row-hover: var(--bento-canvas);
+  --row-hover: #F4F3F0;
   --chip: var(--muted);
   --skeleton: var(--bento-well);
   --scrollbar: var(--bento-graphite);
@@ -136,9 +136,9 @@
   --type-figure: 28px;
   --type-value: 28px;
   --type-lead: 14px;
-  --card-pad: 24px;
-  --card-gap: 20px;
-  --page-heading-gap: 24px;
+  --card-pad: 18px;
+  --card-gap: 14px;
+  --page-heading-gap: 16px;
   --s-1: 4px;
   --s-2: 8px;
   --s-3: 12px;
@@ -169,9 +169,9 @@
   --r-round: 9999px;
   --h-control: 44px;
   --h-control-sm: 44px;
-  --h-row: 48px;
-  --h-row-compact: 48px;
-  --h-head: 44px;
+  --h-row: 40px;
+  --h-row-compact: 40px;
+  --h-head: 40px;
   --icon: 16px;
   --t-fast: 120ms;
   --t-panel: 160ms;
@@ -185,6 +185,7 @@
 
 /* 深色按用途重新分层，保持相同语义和手动主题选择。 */
 :root[data-theme="dark"] {
+  --row-hover: #2B2B26;
   color-scheme: dark;
   --bento-canvas: #1B1B18;
   --bento-surface: #242420;

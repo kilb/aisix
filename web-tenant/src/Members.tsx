@@ -18,6 +18,7 @@ import { useRecordTable } from "./lib/recordTable";
 import { RecordTablePager, RecordTableToolbar } from "./ui/RecordTable";
 import { formMessageFor, messageFor } from "./lib/errors";
 import { ShownOnce } from "./controls";
+import { FormDialog } from "./ui/FormDialog";
 import { Button } from "./ui/Button";
 import { DataTable, Loading } from "./ui/DataTable";
 import { EmptyState } from "./ui/EmptyState";
@@ -145,6 +146,10 @@ export function Members({
   const [budgetsErr, setBudgetsErr] = useState<string | null>(null);
   const loadId = useRef(0);
   const [issued, setIssued] = useState<{ email: string; link: string; expiresAt: string } | null>(null);
+  const [inviteOpen, setInviteOpen] = useState(false);
+  const [inviteBusy, setInviteBusy] = useState(false);
+  const issuedResult = useRef<HTMLDivElement>(null);
+  useEffect(() => { if (issued && inviteOpen) issuedResult.current?.focus(); }, [issued, inviteOpen]);
   const [actionErr, setActionErr] = useState<string | null>(null);
   const [createdNotice, setCreatedNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -261,7 +266,7 @@ export function Members({
           组织现有 <span className="font-medium text-ink">{formatCount(people.length)}</span> 位成员。
           {active ? "本月费用按当前成员归属展示，成员额度各自独立生效。" : "组织已停用，目前仅支持移除成员。"}
         </>}
-        actions={canCreate && <CreateMemberDialog
+        actions={<>{active && <Button onClick={() => { setIssued(null); setInviteOpen(true); }} icon="plus">邀请成员</Button>}{canCreate && <CreateMemberDialog
           roles={roles}
           labels={ROLE_LABEL}
           onInactive={onSelfChanged}
@@ -269,7 +274,7 @@ export function Members({
             setCreatedNotice(`账号已创建：${created.email}，可使用邮箱和初始密码登录。`);
             void load();
           }}
-        />}
+        />}</>}
       />
       {createdNotice && <div className="note ok mb-3" role="status">{createdNotice}</div>}
       <BentoGrid className="tenant-members">
@@ -508,25 +513,18 @@ export function Members({
             {invites !== null && <RecordTablePager page={inviteTable.page} pageSize={inviteTable.pageSize} onPageChange={inviteTable.setPage} onPageSizeChange={inviteTable.setPageSize} total={inviteTable.filteredCount} label="邀请" />}
           </Card>
         )}
-        {active && (
+        {active && <FormDialog open={inviteOpen} onOpenChange={(next) => { setInviteOpen(next); if (!next) setIssued(null); }} busy={inviteBusy} title={issued ? "邀请已创建" : "邀请成员"} description="创建邀请链接，由新成员自行设置登录口令。">
+          {issued ? <div ref={issuedResult} tabIndex={-1} className="key-created-result" aria-label="邀请已创建"><ShownOnce title="邀请链接只显示这一次" value={issued.link} onDone={() => { setInviteOpen(false); setIssued(null); }}><span className="hint">发给 {issued.email}，{when(issued.expiresAt)} 前有效。</span></ShownOnce></div> :
           <InviteForm
             roles={roles}
+            onBusyChange={setInviteBusy}
             onInactive={onSelfChanged}
             onIssued={(email, invite) => {
               setIssued({ email, link: inviteLink(invite), expiresAt: invite.expires_at });
               void load();
             }}
-          />
-        )}
-        {issued && (
-          <div className={span.d12}>
-            <ShownOnce title="邀请链接只显示这一次" value={issued.link} onDone={() => setIssued(null)}>
-              <span className="hint">
-                发给 {issued.email}，{when(issued.expiresAt)} 前有效。对方打开链接、设置口令即可加入。
-              </span>
-            </ShownOnce>
-          </div>
-        )}
+          />}
+        </FormDialog>}
       </BentoGrid>
     </>
   );
@@ -536,11 +534,13 @@ function InviteForm({
   roles,
   onInactive,
   onIssued,
+  onBusyChange,
 }: {
   roles: MemberRole[];
   /** Called when the control plane says the organisation is no longer active. */
   onInactive: () => void;
   onIssued: (email: string, invite: IssuedInvite) => void;
+  onBusyChange: (busy: boolean) => void;
 }) {
   const [email, setEmail] = useState("");
   const [role, setRole] = useState<MemberRole>("member");
@@ -551,6 +551,7 @@ function InviteForm({
     e.preventDefault();
     setErr(null);
     setBusy(true);
+    onBusyChange(true);
     try {
       const invite = await memberApi.invite(email, role);
       onIssued(email, invite);
@@ -560,6 +561,7 @@ function InviteForm({
       setErr(e instanceof ApiError ? formMessageFor(e) : String(e));
     } finally {
       setBusy(false);
+      onBusyChange(false);
     }
   }
 

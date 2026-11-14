@@ -653,6 +653,9 @@ export interface CallCharge {
 
 /** `Call`: one call of the organisation, with nothing of the platform's channel. */
 export interface Call extends UsageAuditData {
+  first_token_latency_ms?: number | null;
+  attempt_duration_ms?: number | null;
+  throughput_tps?: number | null;
   event_id: string;
   occurred_at: string;
   request_id: string | null;

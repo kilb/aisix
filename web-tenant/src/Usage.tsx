@@ -26,6 +26,7 @@ import { currentQueryResult, type QueryResult } from "./lib/queryResult";
 import { useHashQuery } from "./lib/useHashQuery";
 import { usageRange, usageDateValue, usageRequestKey, metricViewOf } from "./lib/usageNavigation";
 import { ApiMetricsPanel } from "./components/ApiMetricsPanel";
+import { UsagePerformance } from "./components/UsagePerformance";
 import { UsageIoAuditDetails } from "./components/UsageIoAuditDetails";
 import { UsageRecordFilters } from "./components/UsageRecordFilters";
 import { usageRecordFilterParams, usageRecordFilterValues } from "./lib/usageRecordFilters";
@@ -613,7 +614,7 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
                       <CallStatusLamp call={c} />
                       <span className="cell-note">分组 {c.charge.group ? c.charge.group.display_name : "—"}</span>
                     </td>
-                    <td className="num" data-label="响应性能"><span className="usage-timing-value"><span>首 token</span>{c.first_token_latency_ms === null ? "—" : `${c.first_token_latency_ms} ms`}</span><span className="usage-timing-value cell-note"><span>处理耗时</span>{c.attempt_duration_ms === null ? "—" : `${c.attempt_duration_ms} ms`}</span></td>
+                    <td className="num" data-label="响应性能"><UsagePerformance data={c} /></td>
                     <td className="num" data-label="费用">{chargeText(c)}</td>
                   </tr>
                   {expanded && (

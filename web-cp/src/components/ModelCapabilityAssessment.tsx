@@ -11,6 +11,7 @@ import { cancelAssessment, exportAssessment, getAssessment, listAssessments, lis
 import { beijingInputValue, fmtBeijing, parseBeijingInput } from "../lib/time";
 import { useHashQuery } from "../lib/useHashQuery";
 import type { AccountDoc, ModelDoc } from "../tabs/models/catalog";
+import { FormDialog } from "../ui/FormDialog";
 import { Button } from "../ui/Button";
 import { Field } from "../ui/Field";
 import { RecordTablePager, type RecordPageSize } from "../ui/RecordTable";
@@ -74,6 +75,8 @@ export function ModelCapabilityAssessment({ models, accounts, loadError }: {
   const targets = useMemo(() => assessmentTargets(models ?? [], accounts ?? []), [models, accounts]);
   const [query, updateQuery] = useHashQuery();
   const selectedId = query.get("assessment_run") ?? "";
+  const [planOpen, setPlanOpen] = useState(false);
+  useEffect(() => { if (selectedId) setPlanOpen(false); }, [selectedId]);
   const [referenceId, setReferenceId] = useState("");
   const [candidateId, setCandidateId] = useState("");
   const [kind, setKind] = useState<AssessmentSource["kind"]>("direct_provider");
@@ -193,6 +196,8 @@ export function ModelCapabilityAssessment({ models, accounts, loadError }: {
   }
 
   return <section className="model-assessment" id="model-tests-assessment" role="tabpanel" aria-labelledby="model-tests-assessment-tab">
+    <div className="assessment-create-toolbar"><p className="assessment-help">Quick：20 次生成调用；Full：160 次生成调用。生成计划（不调用模型）后，审核预算再显式开始。</p><Button kind="primary" icon="plus" onClick={() => setPlanOpen(true)}>新建能力对照</Button></div>
+    <FormDialog open={planOpen} onOpenChange={setPlanOpen} title="新建能力对照" description="在固定合成题集内比较两个渠道的能力。结果不认证模型身份。" busy={busy}>
     <Card>
       <CardHeader title="新建能力对照" description="在固定合成题集内对照两个渠道的能力。来源独立性由操作员审定，结果不认证模型身份。" />
       <form onSubmit={plan}>
@@ -214,7 +219,9 @@ export function ModelCapabilityAssessment({ models, accounts, loadError }: {
         <Button type="submit" kind="primary" busy={busy} busyLabel="请求处理中…" disabled={Boolean(selectionError) || !note.trim() || !verifiedAt || loadError || models === null || accounts === null}><FileSearch aria-hidden="true" />生成计划（不调用模型）</Button>
       </form>
     </Card>
-    {error && <p className="note crit" role="alert">{error}{startAttempt.current && <> 开始响应未确认时，请刷新进度或重试相同开始请求；不要据此认定没有产生费用。</>}</p>}
+      {error && <p className="note crit" role="alert">{error}</p>}
+    </FormDialog>
+    {!planOpen && error && <p className="note crit" role="alert">{error}{startAttempt.current && <> 开始响应未确认时，请刷新进度或重试相同开始请求；不要据此认定没有产生费用。</>}</p>}
     {readError && <p className="note crit" role="alert">{readError}<Button kind="quiet" onClick={() => setRevision((value) => value + 1)}><RefreshCw aria-hidden="true" />重新读取</Button></p>}
     {selectedId && !currentRun && !readError && <Loading />}
     {currentRun && <>

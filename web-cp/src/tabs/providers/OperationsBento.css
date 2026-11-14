@@ -1,12 +1,12 @@
 /* 当前配置采用连续摘要，表格始终是主要操作面。 */
 .ops-summary {
   min-width: 0;
-  margin-bottom: 24px;
-  padding: 20px 0 24px;
+  margin-bottom: 16px;
+  padding: 14px 0 16px;
   border-block: 1px solid var(--line);
 }
 .ops-summary > h2 {
-  margin: 0 0 20px;
+  margin: 0 0 12px;
   color: var(--ink);
   font-size: 17px;
   font-weight: 600;
@@ -16,11 +16,11 @@
   display: grid;
   grid-template-columns: minmax(0, .75fr) minmax(0, 1.25fr) minmax(0, 1fr);
   align-items: start;
-  gap: 24px;
+  gap: 18px;
 }
 .ops-summary-grid > * { min-width: 0; }
 .ops-summary-grid > * + * {
-  padding-left: 24px;
+  padding-left: 18px;
   border-left: 1px solid var(--line);
 }
 .ops-summary-label,
@@ -32,16 +32,16 @@
 }
 .ops-summary-label { margin: 0 0 8px; }
 .ops-summary-note { max-width: 65ch; margin-top: 8px; }
-.ops-summary .metric { font-size: 32px; font-weight: 500; line-height: 40px; }
+.ops-summary .metric { font-size: 26px; font-weight: 500; line-height: 34px; }
 .ops-summary .bento-card-message { min-height: 80px; }
-.ops-facts { display: grid; gap: 0; margin-top: 12px; }
+.ops-facts { display: grid; gap: 0; margin-top: 8px; }
 .ops-facts > div {
   display: flex;
   flex-wrap: wrap;
   align-items: baseline;
   justify-content: space-between;
   gap: 4px 16px;
-  padding: 8px 0;
+  padding: 5px 0;
   border-top: 1px solid var(--line);
 }
 .ops-facts dt { color: var(--text-muted); font-size: 13px; line-height: 20px; }
