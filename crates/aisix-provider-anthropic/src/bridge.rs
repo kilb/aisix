@@ -622,6 +622,7 @@ where
                 let SseEvent::Data(payload) = event else { continue };
                 let parsed: AnthropicStreamEvent = serde_json::from_str(&payload)
                     .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
+                state.note_parsed_frame();
                 if let AnthropicStreamEvent::Error { error } = &parsed {
                     Err(crate::wire::stream_error_into_bridge_error(error))?;
                 }

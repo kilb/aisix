@@ -2908,6 +2908,7 @@ pub struct AnthropicStreamUsage {
 pub struct StreamState {
     usage_stats: AnthropicUsageAccumulator,
     usage_observer: Option<aisix_gateway::response_tap::StreamUsageObserver>,
+    first_frame_seen: bool,
     native_thinking_seen: bool,
     native_blocks: std::collections::BTreeMap<Option<u64>, serde_json::Value>,
     native_arguments: std::collections::BTreeMap<Option<u64>, String>,
@@ -2964,14 +2965,22 @@ impl StreamState {
         }
     }
 
+    /// 首个成功解析的事件只记一次；后续事件不读共享原子或时钟。
+    pub fn note_parsed_frame(&mut self) {
+        if self.first_frame_seen {
+            return;
+        }
+        self.first_frame_seen = true;
+        if let Some(observer) = &self.usage_observer {
+            observer.note_first_frame();
+        }
+    }
+
     pub fn update(&mut self, event: &AnthropicStreamEvent) {
         self.event_tool = None;
         self.completed_blocks.clear();
         match event {
             AnthropicStreamEvent::MessageStart { message } => {
-                if let Some(observer) = &self.usage_observer {
-                    observer.note_first_frame();
-                }
                 self.native_thinking_seen = false;
                 self.native_blocks.clear();
                 self.native_arguments.clear();

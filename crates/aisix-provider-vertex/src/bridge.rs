@@ -1479,6 +1479,7 @@ impl VertexBridge {
                                 "vertex anthropic stream chunk parse: {e}"
                             ))
                         })?;
+                    state.note_parsed_frame();
                     if let AnthropicStreamEvent::Error { error } = &parsed {
                         Err(aisix_provider_anthropic::wire::stream_error_into_bridge_error(error))?;
                     }

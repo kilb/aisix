@@ -1930,6 +1930,10 @@ async fn anthropic_passthrough_dispatch(
             if let Some(err) = crate::dispatch::first_sse_frame_json(&first_bytes)
                 .and_then(|frame| aisix_provider_anthropic::wire::body_in_band_error(&frame))
             {
+                // 预读已解析到真实错误帧，消费者尚未创建也要保留该 attempt 的样本。
+                if let Some(observer) = aisix_gateway::response_tap::stream_usage_observer() {
+                    observer.note_first_frame();
+                }
                 if err.http_status() >= 500 {
                     state.health.record_failure(&model.display_name);
                 }

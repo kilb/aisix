@@ -2214,7 +2214,7 @@ pub(crate) fn upstream_stream_timing() -> aisix_gateway::response_tap::StreamTim
         .unwrap_or_default()
 }
 
-/// 已解析但被桥过滤的首协议帧仍是同一次上游等待的结束，不借正文到达时刻。
+/// 只恢复首协议帧样本，不改变失败或取消时仍需结算的上游等待窗口。
 pub(crate) fn observed_stream_ttft(
     timing: &aisix_gateway::response_tap::StreamTiming,
     started: Instant,
@@ -2223,7 +2223,6 @@ pub(crate) fn observed_stream_ttft(
         return None;
     }
     let at = timing.observer.as_ref()?.first_frame_at()?;
-    note_upstream_first_frame_at(at);
     Some(at.saturating_duration_since(started))
 }
 
@@ -2235,11 +2234,13 @@ pub(crate) fn first_stream_chunk_ttft(
     if timing.buffered {
         return None;
     }
-    observed_stream_ttft(timing, started).or_else(|| {
-        let at = Instant::now();
-        note_upstream_first_frame_at(at);
-        Some(at.saturating_duration_since(started))
-    })
+    let at = timing
+        .observer
+        .as_ref()
+        .and_then(|observer| observer.first_frame_at())
+        .unwrap_or_else(Instant::now);
+    note_upstream_first_frame_at(at);
+    Some(at.saturating_duration_since(started))
 }
 
 /// The time this request has spent waiting on upstreams so far, or `None`
