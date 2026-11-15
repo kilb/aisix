@@ -163,24 +163,9 @@ async fn lock_objects(
     let mut ids = BTreeSet::from([parent_id]);
     ids.extend(child_ids.iter().copied());
     let ids: Vec<Uuid> = ids.into_iter().collect();
-    let mut rows: Vec<ObjectRow> = sqlx::query_as(
-        "SELECT * FROM native_objects WHERE environment_id=$1 AND id=ANY($2) \
-         ORDER BY id FOR UPDATE",
-    )
-    .bind(state.env.env_id)
-    .bind(&ids)
-    .fetch_all(conn)
-    .await
-    .map_err(unavailable)?;
-    if rows.len() != ids.len() {
-        return Err(ApiError::not_found());
-    }
-    let index = rows
-        .iter()
-        .position(|row| row.id == parent_id)
-        .ok_or_else(ApiError::not_found)?;
-    let parent = rows.remove(index);
-    Ok((parent, rows))
+    let mut rows = super::foundation::lock_command_objects(conn, state, &ids, None).await?;
+    let parent = rows.remove(&parent_id).ok_or_else(ApiError::not_found)?;
+    Ok((parent, rows.into_values().collect()))
 }
 
 async fn record_view(
@@ -470,7 +455,16 @@ pub(super) async fn commit(
                 .iter()
                 .map(|record| record.record_id)
                 .collect();
-            let parent = object(&mut *conn, state, reservation.parent_id).await?;
+            let mut locked = super::foundation::lock_command_objects(
+                &mut *conn,
+                state,
+                &[reservation.parent_id],
+                None,
+            )
+            .await?;
+            let parent = locked
+                .remove(&reservation.parent_id)
+                .ok_or_else(ApiError::not_found)?;
             authorized(&mut *conn, state, caller, &parent).await?;
             // 归属不变的子对象沿用关系读取的无锁查询，不从子对象倒序锁父对象。
             let children: Vec<ObjectRow> = sqlx::query_as(

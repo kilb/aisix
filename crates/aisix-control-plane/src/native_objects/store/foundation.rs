@@ -1,6 +1,41 @@
 //! 已接受身份与对象关系一起持久化；产物的所有者不由发现它的调用人决定。
 use super::*;
 
+pub(super) async fn lock_command_objects(
+    conn: &mut PgConnection,
+    state: &AppState,
+    ids: &[Uuid],
+    root_operation_id: Option<Uuid>,
+) -> Result<std::collections::BTreeMap<Uuid, ObjectRow>, ApiError> {
+    let ids: Vec<_> = ids
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if ids.is_empty() && root_operation_id.is_none() {
+        return Ok(std::collections::BTreeMap::new());
+    }
+    // 一个命令先按 UUID 锁定全部正式会话，再锁定其余已明确引用的对象。
+    let rows: Vec<ObjectRow> = sqlx::query_as(
+        "SELECT * FROM native_objects WHERE environment_id=$1 \
+         AND (id=ANY($2) OR operation_id=$3) \
+         ORDER BY CASE WHEN protocol='openai' AND kind='conversation' THEN 0 ELSE 1 END,id FOR UPDATE",
+    )
+    .bind(state.env.env_id)
+    .bind(&ids)
+    .bind(root_operation_id)
+    .fetch_all(conn)
+    .await
+    .map_err(unavailable)?;
+    let rows: std::collections::BTreeMap<_, _> =
+        rows.into_iter().map(|row| (row.id, row)).collect();
+    if ids.iter().any(|id| !rows.contains_key(id)) {
+        return Err(ApiError::not_found());
+    }
+    Ok(rows)
+}
+
 pub(super) async fn assert_unfenced(
     conn: &mut PgConnection,
     state: &AppState,
@@ -195,9 +230,20 @@ pub(super) async fn begin_related(
         return Err(invalid("/references"));
     }
     let principal = principal(&mut *conn, body.submission.api_key_id).await?;
+    let mut ids: Vec<_> = body
+        .references
+        .iter()
+        .map(|reference| reference.record_id)
+        .collect();
+    ids.extend(body.submission.parent_id);
+    ids.extend(body.owner_parent_record_id);
+    let root_operation_id = (!ids.is_empty()).then_some(body.submission.operation_id);
+    let locked = lock_command_objects(&mut *conn, state, &ids, root_operation_id).await?;
     let mut rows = Vec::new();
     for reference in &body.references {
-        let row = object(&mut *conn, state, reference.record_id).await?;
+        let row = locked
+            .get(&reference.record_id)
+            .ok_or_else(ApiError::not_found)?;
         let protocol: NativeProtocol =
             serde_json::from_value(json!(row.protocol)).map_err(unavailable)?;
         let kind: NativeObjectKind =
@@ -243,7 +289,15 @@ pub(super) async fn begin_related(
     {
         return Err(invalid("/owner_parent_record_id"));
     }
-    let reply = begin(&mut *conn, state, dp, body.submission.clone()).await?;
+    let locked_parent = body.submission.parent_id.and_then(|id| locked.get(&id));
+    let reply = begin_with_locked_parent(
+        &mut *conn,
+        state,
+        dp,
+        body.submission.clone(),
+        locked_parent,
+    )
+    .await?;
     let wire = serde_json::to_value(&body).map_err(unavailable)?;
     sqlx::query("INSERT INTO native_related_operations(environment_id,operation_id,manifest,owner_record_id) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING")
         .bind(state.env.env_id).bind(body.submission.operation_id).bind(&wire).bind(body.owner_parent_record_id).execute(&mut *conn).await.map_err(unavailable)?;
@@ -277,23 +331,14 @@ async fn root_object(
     op: &OperationRow,
     submitted: &BeginRequest,
     raw_id: &str,
-    owner: Option<&ObjectRow>,
+    owner: Option<(Uuid, Uuid, Option<Uuid>)>,
     references: &BTreeSet<Uuid>,
+    existing: Option<ObjectRow>,
 ) -> Result<ObjectRow, ApiError> {
     if !text_ok(raw_id, 512) {
         return Err(invalid("/raw_id"));
     }
-    let (tenant, key, member) = owner.map_or((op.tenant_id, op.api_key_id, op.member_id), |r| {
-        (r.tenant_id, r.api_key_id, r.member_id)
-    });
-    let existing: Option<ObjectRow> = sqlx::query_as(
-        "SELECT * FROM native_objects WHERE environment_id=$1 AND operation_id=$2 FOR UPDATE",
-    )
-    .bind(state.env.env_id)
-    .bind(submitted.operation_id)
-    .fetch_optional(&mut *conn)
-    .await
-    .map_err(unavailable)?;
+    let (tenant, key, member) = owner.unwrap_or((op.tenant_id, op.api_key_id, op.member_id));
     if let Some(row) = existing {
         if row.raw_id != raw_id
             || row.tenant_id != tenant
@@ -453,9 +498,14 @@ pub(super) async fn bind_related(
         return serde_json::from_value(receipt["reply"].clone()).map_err(unavailable);
     }
     let references:Vec<(Uuid,i64,i64)>=sqlx::query_as("SELECT record_id,record_version,parent_epoch FROM native_operation_references WHERE environment_id=$1 AND operation_id=$2 ORDER BY record_id").bind(state.env.env_id).bind(body.binding.operation_id).fetch_all(&mut *conn).await.map_err(unavailable)?;
+    let mut ids: Vec<_> = references.iter().map(|reference| reference.0).collect();
+    ids.extend(owner_id);
+    ids.extend(accepted.parent_id);
+    let mut locked =
+        lock_command_objects(&mut *conn, state, &ids, Some(accepted.operation_id)).await?;
     let mut reference_ids = BTreeSet::new();
     for (id, version, epoch) in references {
-        let reference = object(&mut *conn, state, id).await?;
+        let reference = locked.get(&id).ok_or_else(ApiError::not_found)?;
         if reference.deleted_at.is_some()
             || reference.version != version
             || reference.membership_epoch != epoch
@@ -465,17 +515,26 @@ pub(super) async fn bind_related(
         reference_ids.insert(id);
     }
     let owner = match owner_id {
-        Some(id) => Some(object(&mut *conn, state, id).await?),
+        Some(id) => {
+            let owner = locked.get(&id).ok_or_else(ApiError::not_found)?;
+            Some((owner.tenant_id, owner.api_key_id, owner.member_id))
+        }
         None => None,
     };
+    let existing_root_id = locked
+        .values()
+        .find(|row| row.operation_id == accepted.operation_id)
+        .map(|row| row.id);
+    let existing_root = existing_root_id.and_then(|id| locked.remove(&id));
     let root = root_object(
         &mut *conn,
         state,
         &op,
         &accepted,
         &body.binding.raw_id,
-        owner.as_ref(),
+        owner,
         &reference_ids,
+        existing_root,
     )
     .await?;
     let root_accepted = if root.operation_id == accepted.operation_id {
