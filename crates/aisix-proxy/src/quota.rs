@@ -468,9 +468,24 @@ async fn reserve_layers(
     model_rl: Option<&ModelRateLimit>,
     mcp_server: Option<&str>,
 ) -> Result<MultiReservation, ProxyError> {
+    let (mut request, model) =
+        reserve_layers_split(state, snapshot, auth, model_rl, mcp_server).await?;
+    request.merge(model);
+    Ok(request)
+}
+
+/// 同一次准入分别持有请求层和模型层，不能把次级模型用量扣到主模型桶。
+async fn reserve_layers_split(
+    state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
+    auth: &AuthenticatedKey,
+    model_rl: Option<&ModelRateLimit>,
+    mcp_server: Option<&str>,
+) -> Result<(MultiReservation, MultiReservation), ProxyError> {
     // Starts empty so the common no-limits request never allocates;
     // the first reservation (if any) grows it on demand.
     let mut reservations = Vec::new();
+    let mut model_reservations = Vec::new();
 
     // Layer 1: API key inline rate limit.
     let key_limits = auth.key().rate_limit.clone().unwrap_or_default();
@@ -492,7 +507,7 @@ async fn reserve_layers(
                 .pre_commit(&key, limits)
                 .await
                 .map_err(|e| reject(state, e, "model", None, false))?;
-            reservations.push(r);
+            model_reservations.push(r);
         }
     }
 
@@ -526,17 +541,22 @@ async fn reserve_layers(
     let phase = PolicyPhase::Request {
         defer_model_properties: model_rl.is_some_and(|m| m.routing_parent),
     };
-    reserve_policy_layers(
+    reserve_policy_layers_into(
         state,
         snapshot,
         &input,
         phase,
         &mut reservations,
+        Some(&mut model_reservations),
+        None,
         ParentCounted::Off,
     )
     .await?;
 
-    Ok(MultiReservation::new(reservations))
+    Ok((
+        MultiReservation::new(reservations),
+        MultiReservation::new(model_reservations),
+    ))
 }
 
 /// Select policy candidates for the given phase and reserve every
@@ -553,6 +573,30 @@ async fn reserve_policy_layers(
     input: &ConditionInput<'_>,
     phase: PolicyPhase,
     reservations: &mut Vec<aisix_ratelimit::Reservation>,
+    parent_counted: ParentCounted<'_>,
+) -> Result<(), ProxyError> {
+    reserve_policy_layers_into(
+        state,
+        snap,
+        input,
+        phase,
+        reservations,
+        None,
+        None,
+        parent_counted,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reserve_policy_layers_into(
+    state: &ProxyState,
+    snap: &aisix_core::AisixSnapshot,
+    input: &ConditionInput<'_>,
+    phase: PolicyPhase,
+    reservations: &mut Vec<aisix_ratelimit::Reservation>,
+    mut model_reservations: Option<&mut Vec<aisix_ratelimit::Reservation>>,
+    mut held: Option<(&[String], &mut Vec<String>)>,
     mut parent_counted: ParentCounted<'_>,
 ) -> Result<(), ProxyError> {
     // O(1) empty check before anything else: deployments with no
@@ -585,6 +629,12 @@ async fn reserve_policy_layers(
         // A bucket left with nothing to check (one that only counts requests,
         // already counted for this request) takes no reservation.
         if !limits.is_unrestricted() {
+            if let Some((held, keys)) = held.as_mut() {
+                keys.push(layer.bucket_key.clone());
+                if held.contains(&layer.bucket_key) {
+                    continue;
+                }
+            }
             let r = state
                 .limiter
                 .pre_commit(&layer.bucket_key, &limits)
@@ -598,7 +648,13 @@ async fn reserve_policy_layers(
                         policy_bucket_is_callers(policy),
                     )
                 })?;
-            reservations.push(r);
+            if let Some(targets) = model_reservations.as_deref_mut().filter(|_| {
+                match_policy_layer(policy, &entry.id, input, PolicyPhase::ModelTarget).is_some()
+            }) {
+                targets.push(r);
+            } else {
+                reservations.push(r);
+            }
             if let ParentCounted::Record(keys) = &mut parent_counted {
                 if matched_only_through_parent(policy, &entry.id, input, phase) {
                     keys.push(layer.bucket_key.clone());
@@ -668,6 +724,96 @@ pub(crate) async fn enforce(
     let reserved = reserve_layers(state, snapshot, auth, model_rl, None).await;
     refresh_remaining(state, snapshot, auth, model_rl);
     reserved
+}
+
+pub(crate) async fn enforce_split(
+    state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
+    auth: &AuthenticatedKey,
+    model_rl: &ModelRateLimit,
+) -> Result<(MultiReservation, MultiReservation), ProxyError> {
+    crate::budget::enforce_key(state, snapshot, auth)?;
+    let reserved = reserve_layers_split(state, snapshot, auth, Some(model_rl), None).await;
+    refresh_remaining(state, snapshot, auth, Some(model_rl));
+    reserved
+}
+
+/// 已建立会话只重查 token 窗口；不重复计 RPM，也不重复取得自己已持有的并发槽。
+pub(crate) async fn check_realtime_tokens(
+    state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
+    auth: &AuthenticatedKey,
+    model_rl: &ModelRateLimit,
+    include_request: bool,
+) -> Result<(), ProxyError> {
+    async fn check(
+        state: &ProxyState,
+        key: &str,
+        limits: &RateLimit,
+        layer: &'static str,
+        policy: Option<(&str, &str)>,
+        callers_bucket: bool,
+    ) -> Result<(), ProxyError> {
+        let tokens = RateLimit {
+            tpm: limits.tpm,
+            tph: limits.tph,
+            tpd: limits.tpd,
+            ..Default::default()
+        };
+        if !tokens.is_unrestricted() {
+            let reservation = state
+                .limiter
+                .pre_commit(key, &tokens)
+                .await
+                .map_err(|error| reject(state, error, layer, policy, callers_bucket))?;
+            drop(reservation);
+        }
+        Ok(())
+    }
+    if include_request {
+        if let Some(limits) = auth.key().rate_limit.as_ref() {
+            check(state, &auth.entry.id, limits, "api_key", None, true).await?;
+        }
+    }
+    if let Some(limits) = model_rl.limits.as_ref() {
+        check(
+            state,
+            &format!("model:{}", model_rl.bucket_name),
+            limits,
+            "model",
+            None,
+            false,
+        )
+        .await?;
+    }
+    let input = condition_input(auth, Some(model_rl), None);
+    let phase = if include_request {
+        PolicyPhase::Request {
+            defer_model_properties: false,
+        }
+    } else {
+        PolicyPhase::ModelTarget
+    };
+    let index = state.policy_index.for_table(&snapshot.rate_limit_policies);
+    let now = chrono::Utc::now();
+    for entry in index.candidates(&input) {
+        let policy = &entry.value;
+        if policy.suspended_at(now) {
+            continue;
+        }
+        if let Some(layer) = match_policy_layer(policy, &entry.id, &input, phase) {
+            check(
+                state,
+                &layer.bucket_key,
+                &layer.limits,
+                "policy",
+                Some((&entry.id, &policy.name)),
+                policy_bucket_is_callers(policy),
+            )
+            .await?;
+        }
+    }
+    Ok(())
 }
 
 /// Refresh `aisix_ratelimit_remaining_{requests,tokens}` for the caller's
@@ -832,6 +978,7 @@ pub(crate) async fn reserve_model_only(
         model_entry_id,
         model,
         routing_parent,
+        None,
         ParentCounted::Off,
     )
     .await
@@ -859,6 +1006,7 @@ pub(crate) async fn reserve_semantic_classifier(
         model_entry_id,
         model,
         Some(router),
+        None,
         ParentCounted::Record(parent_counted),
     )
     .await
@@ -873,6 +1021,7 @@ async fn reserve_model_layers(
     model_entry_id: &str,
     model: &aisix_core::Model,
     routing_parent: Option<RoutingParent<'_>>,
+    mut held: Option<(&[String], &mut Vec<String>)>,
     parent_counted: ParentCounted<'_>,
 ) -> Result<MultiReservation, ProxyError> {
     let mut reservations = Vec::new();
@@ -881,12 +1030,20 @@ async fn reserve_model_layers(
     let mrl = ModelRateLimit::from_model(model_name, model_entry_id, model);
     if let Some(ref limits) = mrl.limits {
         let key = format!("model:{}", mrl.bucket_name);
-        let r = state
-            .limiter
-            .pre_commit(&key, limits)
-            .await
-            .map_err(|e| reject(state, e, "model", None, false))?;
-        reservations.push(r);
+        let reused = if let Some((held, keys)) = held.as_mut() {
+            keys.push(key.clone());
+            held.contains(&key)
+        } else {
+            false
+        };
+        if !reused {
+            let r = state
+                .limiter
+                .pre_commit(&key, limits)
+                .await
+                .map_err(|e| reject(state, e, "model", None, false))?;
+            reservations.push(r);
+        }
     }
 
     // Policies that follow the model to this target. The condition
@@ -894,17 +1051,48 @@ async fn reserve_model_layers(
     // policy pinning the parent's id or alias matches here too
     // (#1267).
     let input = condition_input(auth, Some(&mrl), routing_parent);
-    reserve_policy_layers(
+    reserve_policy_layers_into(
         state,
         snapshot,
         &input,
         PolicyPhase::ModelTarget,
         &mut reservations,
+        None,
+        held,
         parent_counted,
     )
     .await?;
 
     Ok(MultiReservation::new(reservations))
+}
+
+/// 同一实时会话的模型桶只持有一个并发槽；每个收费模型仍保留完整 token 桶集合。
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn reserve_realtime_model(
+    state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
+    auth: &AuthenticatedKey,
+    model_name: &str,
+    model_entry_id: &str,
+    model: &aisix_core::Model,
+    held: &[String],
+) -> Result<(MultiReservation, Vec<String>), ProxyError> {
+    let mut keys = Vec::new();
+    let reservation = reserve_model_layers(
+        state,
+        snapshot,
+        auth,
+        model_name,
+        model_entry_id,
+        model,
+        None,
+        Some((held, &mut keys)),
+        ParentCounted::Off,
+    )
+    .await?;
+    keys.sort_unstable();
+    keys.dedup();
+    Ok((reservation, keys))
 }
 
 /// Reserve the model-scoped layers for one routing-dispatch target (Model
@@ -965,6 +1153,7 @@ pub(crate) async fn reserve_routing_target_counted(
         target_entry_id,
         target,
         Some(parent),
+        None,
         ParentCounted::Skip(parent_counted),
     )
     .await

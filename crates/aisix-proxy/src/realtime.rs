@@ -48,8 +48,8 @@
 //! handshake, and a named credential slot displaces the ProviderKey's own
 //! rather than joining it. The handshake slots this surface owns are the
 //! one addition to the shared refusals — see [`REALTIME_HANDSHAKE_SLOTS`].
-//! `request.default_headers` is a separate feature that this face has
-//! never applied.
+//! Static `request.default_headers` apply before forwarded headers, with
+//! the adapter's own handshake and credential slots taking precedence.
 //!
 //! ## Usage
 //!
@@ -62,12 +62,16 @@
 //! [21]).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 
 use aisix_core::models::model::Adapter;
 use aisix_obs::{AccessLog, UsageEvent};
 use axum::extract::ws::{CloseFrame, Message as AxMessage, WebSocket, WebSocketUpgrade};
-use axum::extract::{Query, State};
+use axum::extract::{OriginalUri, Query, State};
 use axum::http::{HeaderMap, Method};
 use axum::response::{IntoResponse, Response};
 use futures::{SinkExt, StreamExt};
@@ -159,13 +163,16 @@ fn client_requested_beta_realtime(headers: &HeaderMap) -> bool {
         || header_list_has(headers, "sec-websocket-protocol", SUBPROTOCOL_BETA_ITEM)
 }
 
-type UpstreamDial = Result<
-    (
-        tokio_tungstenite::WebSocketStream<HandedBack>,
-        tokio_tungstenite::tungstenite::handshake::client::Response,
-    ),
-    DialFailure,
->;
+type UpstreamConnection = (
+    tokio_tungstenite::WebSocketStream<HandedBack>,
+    tokio_tungstenite::tungstenite::handshake::client::Response,
+);
+type UpstreamDial = Result<UpstreamConnection, DialFailure>;
+
+enum SessionDialFailure {
+    Upstream(DialFailure),
+    Authority(ProxyError),
+}
 
 /// A dial that opened no session, with the stream when the handshake got far
 /// enough to have one to give back.
@@ -178,6 +185,7 @@ struct DialFailure {
 /// only the bytes that came with a refused upgrade's response head and drops the
 /// stream, so the rest of the body can only be read from here.
 struct HandedBack {
+    written: Arc<AtomicBool>,
     stream: Option<aisix_gateway::upstream_dial::UpstreamStream>,
     back: Option<tokio::sync::oneshot::Sender<aisix_gateway::upstream_dial::UpstreamStream>>,
 }
@@ -216,11 +224,15 @@ impl tokio::io::AsyncRead for HandedBack {
 
 impl tokio::io::AsyncWrite for HandedBack {
     fn poll_write(
-        self: std::pin::Pin<&mut Self>,
+        mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        self.io().poll_write(cx, buf)
+        let result = self.as_mut().io().poll_write(cx, buf);
+        if matches!(result, std::task::Poll::Ready(Ok(count)) if count > 0) {
+            self.get_mut().written.store(true, Ordering::Relaxed);
+        }
+        result
     }
 
     fn poll_flush(
@@ -461,10 +473,12 @@ fn decode_chunked(mut raw: &[u8]) -> Option<(Vec<u8>, bool)> {
 /// provider's `/v1/chat/completions` worked.
 async fn connect_upstream(
     request: tokio_tungstenite::tungstenite::handshake::client::Request,
+    written: Arc<AtomicBool>,
 ) -> UpstreamDial {
     connect_upstream_within(
         aisix_gateway::upstream_http::config().connect_timeout,
         request,
+        written,
     )
     .await
 }
@@ -483,6 +497,7 @@ async fn connect_upstream(
 async fn connect_upstream_within(
     budget: Option<Duration>,
     request: tokio_tungstenite::tungstenite::handshake::client::Request,
+    written: Arc<AtomicBool>,
 ) -> UpstreamDial {
     let (back, mut handed_back) = tokio::sync::oneshot::channel();
     let dial = async {
@@ -507,6 +522,7 @@ async fn connect_upstream_within(
             stream = aisix_gateway::upstream_dial::connect_tls(stream, host).await?;
         }
         let stream = HandedBack {
+            written,
             stream: Some(stream),
             back: Some(back),
         };
@@ -531,14 +547,41 @@ async fn connect_upstream_within(
     })
 }
 
+/// 同一拨号 future 等待期间持续续租；权威失败不能变成供应商故障或触发重拨。
+async fn connect_with_authority(
+    request: tokio_tungstenite::tungstenite::handshake::client::Request,
+    journal: Option<&crate::native_api::realtime_journal::Journal>,
+    written: Arc<AtomicBool>,
+) -> Result<UpstreamConnection, SessionDialFailure> {
+    let dial = connect_upstream(request, written);
+    tokio::pin!(dial);
+    let Some(journal) = journal else {
+        return dial.await.map_err(SessionDialFailure::Upstream);
+    };
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    heartbeat.tick().await;
+    loop {
+        tokio::select! {
+            result = &mut dial => return result.map_err(SessionDialFailure::Upstream),
+            _ = heartbeat.tick() => {
+                journal.heartbeat().await.map_err(SessionDialFailure::Authority)?;
+            }
+        }
+    }
+}
+
 pub(crate) async fn realtime(
     State(state): State<ProxyState>,
+    OriginalUri(uri): OriginalUri,
     method: Method,
-    Query(params): Query<HashMap<String, String>>,
+    Query(mut params): Query<HashMap<String, String>>,
     headers: HeaderMap,
     mut client: ClientContext,
     ws: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
 ) -> Response {
+    let translation = uri.path() == "/v1/realtime/translations";
+    let endpoint = realtime_endpoint(translation);
     let request_id = client.request_id.clone();
     let started = Instant::now();
 
@@ -562,16 +605,76 @@ pub(crate) async fn realtime(
     // a fresh one — it can run for minutes.
     let snapshot = state.snapshot.load();
     let outcome = match ws {
-        Ok(ws) => match authenticate(&state, &headers, &client).await {
-            Ok(auth) => {
+        Ok(ws) => match authenticate(&state, &headers, &client, translation).await {
+            Ok((auth, credential)) => {
                 // Every other family gets `client.jwt` published by the
                 // auth extractor; do the same here so the session clone
                 // and the error emits below attribute the JWT identity.
                 client.jwt = auth.jwt.clone();
-                prepare(&state, &snapshot, &params, &headers, &client, auth.clone())
-                    .await
-                    .map(|prep| (ws, prep))
-                    .map_err(|err| (Some(auth), err))
+                client.caller = auth.caller();
+                if let Some(credential) = &credential {
+                    params
+                        .entry("model".into())
+                        .or_insert_with(|| credential.requested_model.clone());
+                    if credential.purpose
+                        == aisix_core::native_realtime::RealtimePurpose::Transcription
+                    {
+                        params.insert("intent".into(), "transcription".into());
+                    }
+                }
+                let mut connection_headers = headers.clone();
+                if credential.as_ref().is_some_and(|credential| {
+                    credential.defaults.get("legacy").and_then(Value::as_bool) == Some(true)
+                }) {
+                    connection_headers.insert(
+                        "openai-beta",
+                        axum::http::HeaderValue::from_static("realtime=v1"),
+                    );
+                }
+                async {
+                    let mut prep = prepare_for(
+                        &state,
+                        &snapshot,
+                        &params,
+                        &connection_headers,
+                        &client,
+                        auth.clone(),
+                        translation,
+                    )
+                    .await?;
+                    prep.initial_configuration = credential
+                        .as_ref()
+                        .map(crate::native_api::realtime_credentials::initial_event)
+                        .transpose()?;
+                    prep.journal = crate::native_api::realtime_journal::Journal::admit(
+                        &state,
+                        &auth,
+                        prep.voice_origin.as_ref(),
+                        &prep.model_entry.id,
+                        &prep.requested_model,
+                        &prep.upstream_model,
+                        &prep.upstream_provider,
+                        &request_id,
+                        &client,
+                        credential.as_ref(),
+                        if translation {
+                            aisix_core::native_realtime::RealtimePurpose::Translation
+                        } else if params.get("intent").map(String::as_str) == Some("transcription")
+                        {
+                            aisix_core::native_realtime::RealtimePurpose::Transcription
+                        } else {
+                            aisix_core::native_realtime::RealtimePurpose::Realtime
+                        },
+                        prep.model_reservation.keys(),
+                        endpoint,
+                    )
+                    .await?;
+                    prep.credential = credential;
+                    Ok(prep)
+                }
+                .await
+                .map(|prep| (ws, prep))
+                .map_err(|err| (Some(auth), err))
             }
             Err(err) => Err((None, err)),
         },
@@ -658,7 +761,7 @@ pub(crate) async fn realtime(
             // only when a key was resolved (#932).
             crate::request_metrics::record(
                 &state,
-                "/v1/realtime",
+                endpoint,
                 match auth.as_ref() {
                     Some(a) => crate::request_metrics::Caller::new(a),
                     None => crate::request_metrics::Caller::unattributed(None),
@@ -676,10 +779,7 @@ pub(crate) async fn realtime(
                 started.elapsed(),
             );
             crate::usage_attr::note_client_error(&snapshot, &err);
-            crate::usage_attr::emit_error_usage_event(
-                &state,
-                &snapshot,
-                crate::operation::REALTIME,
+            let event = crate::usage_attr::build_error_usage_event(
                 "realtime",
                 &request_id,
                 params.get("model").map_or("", |model| model.trim()),
@@ -696,6 +796,28 @@ pub(crate) async fn realtime(
                 Vec::new(),
                 String::new(),
             );
+            let pk = crate::usage_attr::ResolvedPk::resolve(&snapshot, &attributed.provider_key_id);
+            let model = crate::usage_attr::usage_event_model_label(
+                &snapshot,
+                params.get("model").map_or("", |model| model.trim()),
+            );
+            // 明确的权威 journal 出口不接准入拒绝；真实错误仍完整进入观察链。
+            let emit = if state.native_objects.as_ref().is_some_and(|registry| {
+                registry.live_usage_authority()
+                    == crate::native_api::registry::LiveUsageAuthority::CanonicalJournal
+            }) {
+                crate::usage_attr::emit_prepared_usage_observation
+            } else {
+                crate::usage_attr::emit_prepared_usage_event
+            };
+            emit(
+                &state,
+                &snapshot,
+                crate::operation::REALTIME,
+                event,
+                crate::usage_attr::usage_event_labels(&model, &pk),
+                client.trace.as_ref(),
+            );
             err.into_response()
         }
     }
@@ -703,18 +825,34 @@ pub(crate) async fn realtime(
 
 /// Everything resolved before the upgrade is accepted.
 struct Prepared {
+    endpoint: &'static str,
     auth: AuthenticatedKey,
     model_entry: std::sync::Arc<aisix_core::ResourceEntry<aisix_core::Model>>,
     pk_id: String,
+    voice_origin: Option<aisix_core::native_objects::OriginBinding>,
+    credential: Option<aisix_core::native_realtime::NativeCredential>,
+    journal: Option<crate::native_api::realtime_journal::Journal>,
+    initial_configuration: Option<Value>,
     upstream_request: tokio_tungstenite::tungstenite::handshake::client::Request,
     reservation: aisix_ratelimit::MultiReservation,
+    model_reservation: aisix_ratelimit::MultiReservation,
     requested_model: String,
     /// Provider-side model id the upstream session was opened with. Only
     /// [`restamp_session_model_in`] reads it — see there for why.
     upstream_model: String,
+    upstream_provider: String,
     provider_label: String,
 }
 
+fn realtime_endpoint(translation: bool) -> &'static str {
+    if translation {
+        "/v1/realtime/translations"
+    } else {
+        "/v1/realtime"
+    }
+}
+
+#[cfg(test)]
 async fn prepare(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
@@ -722,6 +860,18 @@ async fn prepare(
     headers: &HeaderMap,
     client: &ClientContext,
     auth: AuthenticatedKey,
+) -> Result<Prepared, ProxyError> {
+    prepare_for(state, snapshot, params, headers, client, auth, false).await
+}
+
+async fn prepare_for(
+    state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
+    params: &HashMap<String, String>,
+    headers: &HeaderMap,
+    client: &ClientContext,
+    auth: AuthenticatedKey,
+    translation: bool,
 ) -> Result<Prepared, ProxyError> {
     // The key's endpoint allow-list. Here rather than in `authenticate` so
     // the refusal is attributed to the key, like every check after it, and
@@ -733,7 +883,7 @@ async fn prepare(
             family,
             crate::auth::DenialContext {
                 method: "GET",
-                path: "/v1/realtime",
+                path: realtime_endpoint(translation),
                 request_id: &client.request_id,
                 source_ip: crate::auth::LazySourceIp::Ready(&client.source_ip),
             },
@@ -741,6 +891,11 @@ async fn prepare(
         return Err(err);
     }
     let beta_realtime = client_requested_beta_realtime(headers);
+    let upstream_path = if translation {
+        "/realtime/translations"
+    } else {
+        "/realtime"
+    };
     let requested_model = params
         .get("model")
         .map(String::as_str)
@@ -789,11 +944,16 @@ async fn prepare(
     // where a per-request mechanism goes silently missing — an operator
     // who declared that this upstream reads a credential the caller sends
     // got it on every other `/v1/*` endpoint and not here.
-    let mut forwarded = aisix_gateway::ForwardedClientHeaders::resolve(
-        &aisix_gateway::UpstreamHeaderContext::from_overrides(pk_entry.value.request.as_ref())
-            .with_client_headers(headers)
-            .with_surface_blocked(REALTIME_HANDSHAKE_SLOTS),
-    );
+    let header_context = crate::dispatch::upstream_header_ctx(
+        &pk_entry.value,
+        &pk_entry.id,
+        model,
+        &model_entry.id,
+        client,
+    )
+    .with_surface_blocked(REALTIME_HANDSHAKE_SLOTS);
+    let default_headers = aisix_gateway::resolve_default_headers(&header_context);
+    let mut forwarded = aisix_gateway::ForwardedClientHeaders::resolve(&header_context);
     // The WebSocket client renders the handshake as text and refuses a
     // header value it cannot read as a string, failing the whole upstream
     // connection. Dropping the entry keeps a caller who sent one obs-text
@@ -810,12 +970,15 @@ async fn prepare(
     let mut upstream_request = match pk_entry.value.adapter {
         Some(Adapter::Openai) => {
             let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
-            let url = crate::dispatch::build_openai_url(&base, "/realtime");
-            let url = format!(
-                "{}?model={}",
-                to_ws_scheme(&url)?,
-                urlencode(&upstream_model)
-            );
+            let url = crate::dispatch::build_openai_url(&base, upstream_path);
+            let query = if !translation
+                && params.get("intent").map(String::as_str) == Some("transcription")
+            {
+                "intent=transcription".to_owned()
+            } else {
+                format!("model={}", urlencode(&upstream_model))
+            };
+            let url = format!("{}?{query}", to_ws_scheme(&url)?);
             let mut req = url.into_client_request().map_err(|e| {
                 ProxyError::InvalidRequest(format!("invalid upstream realtime URL: {e}"))
             })?;
@@ -838,6 +1001,11 @@ async fn prepare(
             req
         }
         Some(Adapter::AzureOpenai) => {
+            if translation {
+                return Err(ProxyError::TargetRefused(
+                    "the configured adapter does not expose the Translation WebSocket API".into(),
+                ));
+            }
             let base = pk_entry
                 .value
                 .api_base
@@ -877,6 +1045,26 @@ async fn prepare(
             )));
         }
     };
+    // 静态头先送出；适配器自有凭据和握手槽保持优先，客户端转发仍最后应用。
+    let mut dropped_defaults = 0usize;
+    for (name, value) in default_headers {
+        if REALTIME_HANDSHAKE_SLOTS.contains(&name.as_str()) {
+            continue;
+        }
+        if value.to_str().is_err() {
+            dropped_defaults += 1;
+            continue;
+        }
+        if !upstream_request.headers().contains_key(&name) {
+            upstream_request.headers_mut().insert(name, value);
+        }
+    }
+    if dropped_defaults > 0 {
+        tracing::debug!(
+            dropped_defaults,
+            "non-ASCII default headers are not sent on a realtime handshake"
+        );
+    }
     // AFTER the per-adapter build, which is what lets a credential slot
     // the operator named displace the ProviderKey's own — the ordering
     // `apply` documents and every other face follows. It leaves any other
@@ -884,28 +1072,93 @@ async fn prepare(
     // works, not who it is from.
     forwarded.apply(upstream_request.headers_mut());
 
-    let reservation = crate::quota::enforce(
+    // 只为实际发往同一静态账号的 WS 记录归属；动态凭据或不等价基址不冒充配置账号。
+    let voice_origin = if dropped_defaults == 0 && pk_entry.value.adapter == Some(Adapter::Openai) {
+        (|| {
+            use aisix_core::native_objects::{
+                NativeObjectKind, NativeOriginSurface, NativeProtocol, OriginBinding,
+            };
+            let protocol = NativeProtocol::Openai;
+            let kind = NativeObjectKind::Voice;
+            let surface = Some(NativeOriginSurface::Objects);
+            let key = state.native_origin_key()?;
+            let provider_key_id =
+                crate::native_api::openai::resource_id(state, "provider_keys", &pk_entry.id)
+                    .ok()?;
+            let model_id =
+                crate::native_api::openai::resource_id(state, "models", &model_entry.id).ok()?;
+            let base = aisix_core::native_objects::configured_native_endpoint_at(
+                &pk_entry.value,
+                protocol,
+                kind,
+                surface,
+            )
+            .ok()?;
+            let query = if !translation
+                && params.get("intent").map(String::as_str) == Some("transcription")
+            {
+                "intent=transcription".to_owned()
+            } else {
+                format!("model={}", urlencode(&upstream_model))
+            };
+            let expected = format!(
+                "{}?{query}",
+                to_ws_scheme(&crate::dispatch::build_openai_url(&base, upstream_path)).ok()?,
+            );
+            if url::Url::parse(&expected).ok()?
+                != url::Url::parse(&upstream_request.uri().to_string()).ok()?
+            {
+                return None;
+            }
+            let boundary = aisix_core::native_objects::configured_native_origin_at(
+                &key,
+                provider_key_id,
+                &pk_entry.value,
+                protocol,
+                kind,
+                surface,
+            )
+            .ok()?;
+            Some(OriginBinding {
+                surface,
+                model_id,
+                provider_key_id,
+                boundary,
+            })
+        })()
+    } else {
+        None
+    };
+
+    let (reservation, model_reservation) = crate::quota::enforce_split(
         state,
         snapshot,
         &auth,
-        Some(&crate::quota::ModelRateLimit::from_model(
+        &crate::quota::ModelRateLimit::from_model(
             &model_entry.value.display_name,
             &model_entry.id,
             &model_entry.value,
-        )),
+        ),
     )
     .await?;
     crate::budget::gate(state, snapshot).check_provider_key(&pk_entry.id)?;
 
     let provider_label = model.provider.clone().unwrap_or_default();
     Ok(Prepared {
+        endpoint: realtime_endpoint(translation),
         auth,
         pk_id: pk_entry.id.to_string(),
+        voice_origin,
+        credential: None,
+        journal: None,
+        initial_configuration: None,
         model_entry,
         upstream_request,
         reservation,
+        model_reservation,
         requested_model,
         upstream_model,
+        upstream_provider: pk_entry.value.provider.clone(),
         provider_label,
     })
 }
@@ -917,18 +1170,26 @@ async fn authenticate(
     state: &ProxyState,
     headers: &HeaderMap,
     client: &ClientContext,
-) -> Result<AuthenticatedKey, ProxyError> {
+    translation: bool,
+) -> Result<
+    (
+        AuthenticatedKey,
+        Option<aisix_core::native_realtime::NativeCredential>,
+    ),
+    ProxyError,
+> {
     // `/v1/realtime` is a WebSocket upgrade, so there are no request parts
     // to read here — the resolved client context carries the same two
     // identifying fields the HTTP extractor puts on a denial.
     let ctx = crate::auth::DenialContext {
         method: "GET",
-        path: "/v1/realtime",
+        path: realtime_endpoint(translation),
         request_id: &client.request_id,
         source_ip: crate::auth::LazySourceIp::Ready(&client.source_ip),
     };
     if let Some(token) = crate::auth::header_credential(headers) {
-        return crate::auth::authenticate_token(state, &token?, ctx).await;
+        let token = token?;
+        return authenticate_realtime_token(state, &token, client, ctx, translation).await;
     }
     // List-valued and splittable across repeated fields, like the beta
     // opt-in above: reading only the first field 401s a caller whose
@@ -938,12 +1199,67 @@ async fn authenticate(
         for item in s.split(',') {
             if let Some(token) = item.trim().strip_prefix(SUBPROTOCOL_KEY_PREFIX) {
                 if !token.is_empty() {
-                    return crate::auth::authenticate_token(state, token, ctx).await;
+                    return authenticate_realtime_token(state, token, client, ctx, translation)
+                        .await;
                 }
             }
         }
     }
     Err(ProxyError::MissingAuth(crate::auth::AUTHORIZATION_LABEL))
+}
+
+async fn authenticate_realtime_token(
+    state: &ProxyState,
+    token: &str,
+    client: &ClientContext,
+    ctx: crate::auth::DenialContext<'_>,
+    translation: bool,
+) -> Result<
+    (
+        AuthenticatedKey,
+        Option<aisix_core::native_realtime::NativeCredential>,
+    ),
+    ProxyError,
+> {
+    use crate::native_api::realtime_credentials;
+    use aisix_core::native_realtime::RealtimePurpose;
+    if !realtime_credentials::is_credential(token) {
+        return crate::auth::authenticate_token(state, token, ctx)
+            .await
+            .map(|auth| (auth, None));
+    }
+    if translation {
+        let admitted = realtime_credentials::redeem(
+            state,
+            token,
+            RealtimePurpose::Translation,
+            &client.source_ip,
+        )
+        .await?;
+        return Ok((admitted.0, Some(admitted.1)));
+    }
+    // 两种用途共用官方实时 WS；Translation 的 capability 只在专用入口认领。
+    let admitted = match realtime_credentials::redeem(
+        state,
+        token,
+        RealtimePurpose::Realtime,
+        &client.source_ip,
+    )
+    .await
+    {
+        Ok(admitted) => admitted,
+        Err(ProxyError::InvalidApiKey) => {
+            realtime_credentials::redeem(
+                state,
+                token,
+                RealtimePurpose::Transcription,
+                &client.source_ip,
+            )
+            .await?
+        }
+        Err(error) => return Err(error),
+    };
+    Ok((admitted.0, Some(admitted.1)))
 }
 
 fn to_ws_scheme(url: &str) -> Result<String, ProxyError> {
@@ -1058,11 +1374,16 @@ fn splice_or_keep(text: String, splice: impl FnOnce(&[u8]) -> Option<Vec<u8>>) -
 /// Accumulated session usage harvested from upstream frames.
 #[derive(Default)]
 struct SessionUsage {
+    seen_facts: HashSet<String>,
     cache_missing: bool,
     input_tokens: u64,
     output_tokens: u64,
     cached_tokens: u64,
     responses: u32,
+    /// 已固定次级模型的量仍保留在会话汇总，但不能再记入主模型的桶和指标。
+    secondary_input_tokens: u64,
+    secondary_output_tokens: u64,
+    secondary_cached_tokens: u64,
     /// Summed across the session's usage frames, `None` where none
     /// reported the modality.
     modality: aisix_gateway::ModalityTokens,
@@ -1071,7 +1392,12 @@ struct SessionUsage {
 }
 
 impl SessionUsage {
+    #[cfg(test)]
     fn absorb(&mut self, text: &str) {
+        self.absorb_model(text, false);
+    }
+
+    fn absorb_model(&mut self, text: &str, secondary: bool) {
         // Fast path: only parse frames that can carry usage.
         if !text.contains("\"response.done\"")
             && !text.contains("\"conversation.item.input_audio_transcription.completed\"")
@@ -1081,6 +1407,19 @@ impl SessionUsage {
         let Ok(v) = serde_json::from_str::<Value>(text) else {
             return;
         };
+        let fact = match v.get("type").and_then(Value::as_str) {
+            Some("response.done") => v["response"]["id"]
+                .as_str()
+                .map(|id| format!("response:{id}")),
+            Some("conversation.item.input_audio_transcription.completed") => v["item_id"]
+                .as_str()
+                .zip(v["content_index"].as_u64())
+                .map(|(id, index)| format!("transcription:{id}:{index}")),
+            _ => None,
+        };
+        if fact.is_some_and(|fact| !self.seen_facts.insert(fact)) {
+            return;
+        }
         match v.get("type").and_then(Value::as_str) {
             Some("response.done") => {
                 let usage = &v["response"]["usage"];
@@ -1114,6 +1453,15 @@ impl SessionUsage {
                         .is_none();
                     self.input_tokens += input;
                     self.output_tokens += output;
+                    let cached = usage["input_token_details"]["cached_tokens"]
+                        .as_u64()
+                        .unwrap_or(0);
+                    self.cached_tokens += cached;
+                    if secondary {
+                        self.secondary_input_tokens += input;
+                        self.secondary_output_tokens += output;
+                        self.secondary_cached_tokens += cached;
+                    }
                     self.upstream_total.add(usage, input + output > 0);
                     self.modality = self.modality.saturating_add(
                         &aisix_gateway::ModalityTokens::from_openai_details(
@@ -1257,6 +1605,7 @@ impl SessionIo {
 /// for the close: a limit could not act on it. It settles each usage frame as it
 /// arrives.
 struct SessionMeter<'a> {
+    endpoint: &'static str,
     state: &'a ProxyState,
     auth: &'a crate::auth::AuthenticatedKey,
     model_entry: &'a aisix_core::ResourceEntry<aisix_core::Model>,
@@ -1265,15 +1614,55 @@ struct SessionMeter<'a> {
     requested_model: &'a str,
     client_type: &'a str,
     token_keys: Vec<String>,
+    model_token_keys: Vec<String>,
     input_tokens: u64,
     output_tokens: u64,
     cached_tokens: u64,
+    secondary_input_tokens: u64,
+    secondary_output_tokens: u64,
+    secondary_cached_tokens: u64,
     /// What the session has cost so far: each response priced when it arrived.
     cost_usd: f64,
     responses: u32,
 }
 
 impl SessionMeter<'_> {
+    /// 新推理输入先检查当前 token 窗口；取消、关闭和配置撤除不被用量门槛阻断。
+    async fn check_tokens(&self, bytes: &[u8]) -> Result<(), ProxyError> {
+        let work = serde_json::from_slice::<Value>(bytes).is_ok_and(|event| {
+            matches!(
+                event["type"].as_str(),
+                Some(
+                    "input_audio_buffer.append"
+                        | "input_audio_buffer.commit"
+                        | "response.create"
+                        | "conversation.item.create"
+                )
+            )
+        });
+        if !work {
+            return Ok(());
+        }
+        let snapshot = self.state.snapshot.load();
+        let current = crate::native_api::openai::current_auth(&snapshot, self.auth)?;
+        let model = snapshot
+            .models
+            .get_by_id(&self.model_entry.id)
+            .ok_or(ProxyError::AccountUnavailable)?;
+        crate::quota::check_realtime_tokens(
+            self.state,
+            &snapshot,
+            &current,
+            &crate::quota::ModelRateLimit::from_model(
+                &model.value.display_name,
+                &model.id,
+                &model.value,
+            ),
+            true,
+        )
+        .await
+    }
+
     /// Whether frames arrived that are not charged yet.
     fn behind(&self, usage: &SessionUsage) -> bool {
         self.responses != usage.responses
@@ -1318,19 +1707,43 @@ impl SessionMeter<'_> {
         let input = usage.input_tokens.saturating_sub(self.input_tokens);
         let output = usage.output_tokens.saturating_sub(self.output_tokens);
         let cached = usage.cached_tokens.saturating_sub(self.cached_tokens);
+        let secondary_input = usage
+            .secondary_input_tokens
+            .saturating_sub(self.secondary_input_tokens);
+        let secondary_output = usage
+            .secondary_output_tokens
+            .saturating_sub(self.secondary_output_tokens);
+        let secondary_cached = usage
+            .secondary_cached_tokens
+            .saturating_sub(self.secondary_cached_tokens);
+        (
+            self.secondary_input_tokens,
+            self.secondary_output_tokens,
+            self.secondary_cached_tokens,
+        ) = (
+            usage.secondary_input_tokens,
+            usage.secondary_output_tokens,
+            usage.secondary_cached_tokens,
+        );
         (self.input_tokens, self.output_tokens, self.cached_tokens) =
             (usage.input_tokens, usage.output_tokens, usage.cached_tokens);
-        self.cost_usd += self.price_usd(&snap, input, cached, output);
+        let primary_input = input.saturating_sub(secondary_input);
+        let primary_output = output.saturating_sub(secondary_output);
+        let primary_cached = cached.saturating_sub(secondary_cached);
+        self.cost_usd += self.price_usd(&snap, primary_input, primary_cached, primary_output);
         self.responses = usage.responses;
 
         self.state
             .limiter
             .add_tokens_post_stream_all(&self.token_keys, input + output);
+        self.state
+            .limiter
+            .add_tokens_post_stream_all(&self.model_token_keys, primary_input + primary_output);
         // A realtime session bills real tokens against a real model, and
         // reports them as each frame arrives.
         crate::request_metrics::record_usage(
             self.state,
-            "/v1/realtime",
+            self.endpoint,
             crate::request_metrics::Caller::new(self.auth),
             crate::request_metrics::Upstream {
                 provider: self.provider_label,
@@ -1343,12 +1756,12 @@ impl SessionMeter<'_> {
                 ..Default::default()
             },
             crate::request_metrics::Tokens {
-                input: input.min(u32::MAX as u64) as u32,
-                output: output.min(u32::MAX as u64) as u32,
-                total: (input + output).min(u32::MAX as u64) as u32,
+                input: primary_input.min(u32::MAX as u64) as u32,
+                output: primary_output.min(u32::MAX as u64) as u32,
+                total: (primary_input + primary_output).min(u32::MAX as u64) as u32,
                 // The Realtime session reports its cache hits in the
                 // OpenAI shape — inside `input_tokens`, never beside it.
-                cached: cached.min(u32::MAX as u64) as u32,
+                cached: primary_cached.min(u32::MAX as u64) as u32,
                 cache_read: 0,
                 cache_creation: 0,
                 client_type: self.client_type,
@@ -1393,15 +1806,28 @@ async fn run_session(
     started: Instant,
 ) {
     let Prepared {
+        endpoint,
         auth,
         model_entry,
         pk_id,
+        voice_origin,
+        credential: _,
+        mut journal,
+        initial_configuration,
         upstream_request,
         reservation,
+        model_reservation,
         requested_model,
         upstream_model,
+        upstream_provider: _,
         provider_label,
     } = prep;
+    let canonical = journal.as_ref().is_some_and(|journal| journal.canonical());
+    let emit_usage = if canonical {
+        crate::usage_attr::emit_usage_observation
+    } else {
+        crate::usage_attr::emit_usage
+    };
 
     let guardrail_ctx = aisix_guardrails::RequestContext {
         passthrough_route_id: "",
@@ -1432,7 +1858,14 @@ async fn run_session(
     let idle_cap =
         crate::routing::effective_timeouts(&model_entry.value, None, state.default_timeouts).stream;
     let mut client_tx = ClientSink::new(client_tx, idle_cap);
-    let (upstream, upgrade_request_id) = match connect_upstream(upstream_request).await {
+    let handshake_written = Arc::new(AtomicBool::new(false));
+    let (upstream, upgrade_request_id) = match connect_with_authority(
+        upstream_request,
+        journal.as_ref(),
+        Arc::clone(&handshake_written),
+    )
+    .await
+    {
         Ok((ws, resp)) => {
             let upgrade_request_id = crate::usage_attr::sanitize_provider_response_id(
                 &aisix_gateway::provider_request_id(resp.headers()),
@@ -1445,22 +1878,43 @@ async fn run_session(
             (ws, upgrade_request_id)
         }
         Err(failure) => {
-            tracing::warn!(error = %failure.error, model = %requested_model, "realtime upstream connect failed");
-            let client_gone = async {
-                while let Some(Ok(message)) = client_rx.next().await {
-                    if matches!(message, AxMessage::Close(_)) {
-                        break;
-                    }
+            if let Some(journal) = journal.as_mut() {
+                let _ = journal.finish().await;
+            }
+            let authority_failed = matches!(&failure, SessionDialFailure::Authority(_));
+            let (connect_err, refused) = match failure {
+                SessionDialFailure::Upstream(failure) => {
+                    tracing::warn!(error = %failure.error, model = %requested_model, "realtime upstream connect failed");
+                    let client_gone = async {
+                        while let Some(Ok(message)) = client_rx.next().await {
+                            if matches!(message, AxMessage::Close(_)) {
+                                break;
+                            }
+                        }
+                    };
+                    let (error, refused) = connect_failure(
+                        failure,
+                        dial_started.elapsed(),
+                        idle_cap,
+                        &request_id,
+                        client_gone,
+                    )
+                    .await;
+                    crate::attempt::RoutingTelemetry::record_deployment(
+                        &state,
+                        &model_entry.id,
+                        error.http_status(),
+                    );
+                    let error = ProxyError::Bridge(crate::cooldown::note_failure(
+                        &state.runtime_status,
+                        &model_entry.id,
+                        model_entry.value.cooldown.as_ref(),
+                        error,
+                    ));
+                    (error, refused)
                 }
+                SessionDialFailure::Authority(error) => (error, None),
             };
-            let (connect_err, refused) = connect_failure(
-                failure,
-                dial_started.elapsed(),
-                idle_cap,
-                &request_id,
-                client_gone,
-            )
-            .await;
             let provider_request_id = refused
                 .as_ref()
                 .map(|r| {
@@ -1469,24 +1923,28 @@ async fn run_session(
                     )
                 })
                 .unwrap_or_default();
-            let status = connect_err.http_status();
-            crate::attempt::RoutingTelemetry::record_deployment(&state, &model_entry.id, status);
-            // `note_failure` hands the error back, so the same value that
-            // drove the cooldown decision also names the failure to the
-            // caller and in the access log instead of being rebuilt.
-            let connect_err = ProxyError::Bridge(crate::cooldown::note_failure(
-                &state.runtime_status,
-                &model_entry.id,
-                model_entry.value.cooldown.as_ref(),
-                connect_err,
-            ));
+            let status = connect_err.status().as_u16();
+            let error_source = if authority_failed {
+                crate::attempt::error_source(&connect_err)
+            } else {
+                aisix_obs::ErrorSource::Upstream
+            };
             let _ = client_tx
                 .send(AxMessage::Text(connect_failure_frame(&connect_err)))
                 .await;
             let _ = client_tx
                 .send(AxMessage::Close(Some(CloseFrame {
-                    code: 1011,
-                    reason: "upstream connect failed".into(),
+                    code: if authority_failed && status < 500 {
+                        1008
+                    } else {
+                        1011
+                    },
+                    reason: if authority_failed {
+                        "session authorization"
+                    } else {
+                        "upstream connect failed"
+                    }
+                    .into(),
                 })))
                 .await;
             emit_access_log(
@@ -1518,7 +1976,7 @@ async fn run_session(
             let pk = crate::usage_attr::ResolvedPk::resolve(&snap, &pk_id);
             crate::request_metrics::record(
                 &state,
-                "/v1/realtime",
+                endpoint,
                 crate::request_metrics::Caller::new(&auth),
                 crate::request_metrics::Upstream {
                     provider: &provider_label,
@@ -1532,7 +1990,7 @@ async fn run_session(
                     ..Default::default()
                 },
                 status,
-                aisix_obs::ErrorSource::Upstream,
+                error_source,
                 started.elapsed(),
             );
             let mut event = crate::usage_attr::build_error_usage_event(
@@ -1568,7 +2026,7 @@ async fn run_session(
                 }
                 event.upstream_latency_ms = crate::attempt::measured_ms(dial_started.elapsed());
                 let content = upstream_failure_content(&snap, &refused.body);
-                crate::usage_attr::emit_usage(
+                emit_usage(
                     &state,
                     &snap,
                     crate::operation::REALTIME,
@@ -1581,13 +2039,16 @@ async fn run_session(
                 );
                 return;
             }
-            crate::usage_attr::emit_prepared_usage_event(
+            emit_usage(
                 &state,
                 &snap,
                 crate::operation::REALTIME,
                 event,
                 labels,
+                None,
                 client.trace.as_ref(),
+                true,
+                handshake_written.load(Ordering::Relaxed),
             );
             return;
         }
@@ -1599,6 +2060,7 @@ async fn run_session(
 
     let client_type = state.client_classifier.classify(&client.user_agent);
     let mut meter = SessionMeter {
+        endpoint,
         state: &state,
         auth: &auth,
         model_entry: &model_entry,
@@ -1607,9 +2069,13 @@ async fn run_session(
         requested_model: &requested_model,
         client_type,
         token_keys: reservation.keys(),
+        model_token_keys: model_reservation.keys(),
         input_tokens: 0,
         output_tokens: 0,
         cached_tokens: 0,
+        secondary_input_tokens: 0,
+        secondary_output_tokens: 0,
+        secondary_cached_tokens: 0,
         cost_usd: 0.0,
         responses: 0,
     };
@@ -1635,34 +2101,205 @@ async fn run_session(
         .flatten()
         .map(|(max_buffer_bytes, fail_open)| HeldOutput::new(max_buffer_bytes, fail_open));
 
+    let mut configuration_pending = initial_configuration.is_some();
+    let mut configuration_ack = initial_configuration
+        .as_ref()
+        .map(|event| {
+            if event.get("type").and_then(Value::as_str) == Some("transcription_session.update") {
+                "transcription_session.updated"
+            } else {
+                "session.updated"
+            }
+        })
+        .unwrap_or("session.updated");
+    let mut configuration_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut initial_configuration = initial_configuration.map(|event| event.to_string());
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    heartbeat.tick().await;
+    let mut last_activity = Instant::now();
+
     loop {
-        let next = async {
-            tokio::select! {
-                m = client_rx.next() => Dir::FromClient(m),
-                m = up_rx.next() => Dir::FromUpstream(m),
+        let idle_remaining = idle_cap.map(|cap| cap.saturating_sub(last_activity.elapsed()));
+        let read_cap = if configuration_pending {
+            let remaining =
+                configuration_deadline.saturating_duration_since(tokio::time::Instant::now());
+            Some(idle_remaining.map_or(remaining, |idle| idle.min(remaining)))
+        } else {
+            idle_remaining
+        };
+        let mut event = if let Some(configuration) = initial_configuration.take() {
+            Dir::FromClient(Some(Ok(AxMessage::Text(configuration))))
+        } else {
+            let next = async {
+                tokio::select! {
+                    m = client_rx.next(), if !configuration_pending => Dir::FromClient(m),
+                    m = up_rx.next() => Dir::FromUpstream(m),
+                    _ = heartbeat.tick(), if journal.is_some() => Dir::Heartbeat,
+                }
+            };
+            match read_cap {
+                Some(cap) => match tokio::time::timeout(cap, next).await {
+                    Ok(r) => r,
+                    Err(_) => {
+                        io.response_failed = true;
+                        let _ = client_tx
+                            .send(AxMessage::Close(Some(CloseFrame {
+                                code: 1001,
+                                reason: if configuration_pending {
+                                    "configuration timeout"
+                                } else {
+                                    "idle timeout"
+                                }
+                                .into(),
+                            })))
+                            .await;
+                        close_status = 504;
+                        session_error = Some(ProxyError::Bridge(BridgeError::Timeout {
+                            elapsed_ms: cap.as_millis() as u64,
+                            cause: if configuration_pending {
+                                "initial realtime configuration was not acknowledged".into()
+                            } else {
+                                "no realtime frame within the stream idle budget".into()
+                            },
+                        }));
+                        break;
+                    }
+                },
+                None => next.await,
             }
         };
-        let event = match idle_cap {
-            Some(cap) => match tokio::time::timeout(cap, next).await {
-                Ok(r) => r,
-                Err(_) => {
-                    io.response_failed = true;
+        if !matches!(event, Dir::Heartbeat) {
+            last_activity = Instant::now();
+        }
+
+        if let Dir::FromUpstream(Some(Ok(TgMessage::Text(text)))) = &event {
+            if configuration_pending
+                && serde_json::from_str::<Value>(text)
+                    .ok()
+                    .is_some_and(|event| {
+                        event.get("type").and_then(Value::as_str) == Some(configuration_ack)
+                    })
+            {
+                configuration_pending = false;
+            }
+        }
+
+        let voice_bytes = match &event {
+            Dir::FromClient(Some(Ok(AxMessage::Text(text)))) => Some(text.as_bytes()),
+            Dir::FromClient(Some(Ok(AxMessage::Binary(bytes)))) => Some(bytes.as_slice()),
+            _ => None,
+        };
+        if voice_bytes.is_some() || matches!(event, Dir::Heartbeat) {
+            let failure = match journal.as_ref() {
+                Some(journal) => journal.heartbeat().await.err(),
+                None => None,
+            }
+            .or_else(|| meter.refusal());
+            if let Some(error) = failure {
+                let frame = serde_json::json!({ "type": "error", "error": error.envelope().error });
+                let _ = client_tx.send(AxMessage::Text(frame.to_string())).await;
+                let _ = client_tx
+                    .send(AxMessage::Close(Some(CloseFrame {
+                        code: 1008,
+                        reason: "session authorization".into(),
+                    })))
+                    .await;
+                close_status = error.status().as_u16();
+                session_error = Some(error);
+                break;
+            }
+        }
+        if let Some(bytes) = voice_bytes {
+            if let Err(error) = crate::native_api::voices::validate_realtime_frame(
+                &state,
+                &auth,
+                &client,
+                bytes,
+                voice_origin.as_ref(),
+                &requested_model,
+            )
+            .await
+            {
+                let event = serde_json::json!({ "type": "error", "error": error.envelope().error });
+                let _ = client_tx.send(AxMessage::Text(event.to_string())).await;
+                let _ = client_tx
+                    .send(AxMessage::Close(Some(CloseFrame {
+                        code: 1008,
+                        reason: "voice authorization".into(),
+                    })))
+                    .await;
+                close_status = error.status().as_u16();
+                session_error = Some(error);
+                // 新帧未派发；此前接受的尾量仍由同一计量器吸收和结算。
+                if let Err(error) = close_upstream(
+                    &mut up_tx,
+                    &mut up_rx,
+                    Some(TgCloseFrame {
+                        code: 1008.into(),
+                        reason: "voice authorization".into(),
+                    }),
+                    &mut journal,
+                    &mut usage,
+                    &mut io,
+                    Some((&state, &model_entry.id, &mut opening)),
+                )
+                .await
+                {
+                    session_error.get_or_insert(error);
+                }
+                break;
+            }
+        }
+
+        let prepared_frame = match &event {
+            Dir::FromClient(Some(Ok(AxMessage::Text(text)))) => Some(text.as_bytes()),
+            Dir::FromClient(Some(Ok(AxMessage::Binary(bytes)))) => Some(bytes.as_slice()),
+            _ => None,
+        };
+        if let Some(bytes) = prepared_frame {
+            let result = match meter.check_tokens(bytes).await {
+                Err(error) => Err(error),
+                Ok(()) => match journal.as_mut() {
+                    Some(journal) => journal.prepare_frame(bytes).await,
+                    None => Ok(None),
+                },
+            };
+            if let Some(ack) = journal
+                .as_ref()
+                .and_then(|journal| journal.configuration_ack())
+            {
+                configuration_pending = true;
+                configuration_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                configuration_ack = ack;
+            }
+            match result {
+                Ok(Some(bytes)) => match &mut event {
+                    Dir::FromClient(Some(Ok(AxMessage::Text(text)))) => {
+                        if let Ok(rewritten) = String::from_utf8(bytes) {
+                            *text = rewritten;
+                        }
+                    }
+                    Dir::FromClient(Some(Ok(AxMessage::Binary(frame)))) => *frame = bytes,
+                    _ => {}
+                },
+                Ok(None) => {}
+                Err(error) => {
+                    let frame =
+                        serde_json::json!({ "type":"error", "error":error.envelope().error });
+                    let _ = client_tx.send(AxMessage::Text(frame.to_string())).await;
                     let _ = client_tx
                         .send(AxMessage::Close(Some(CloseFrame {
-                            code: 1001,
-                            reason: "idle timeout".into(),
+                            code: 1008,
+                            reason: "transcription authorization".into(),
                         })))
                         .await;
-                    close_status = 504;
-                    session_error = Some(ProxyError::Bridge(BridgeError::Timeout {
-                        elapsed_ms: cap.as_millis() as u64,
-                        cause: "no realtime frame within the stream idle budget".into(),
-                    }));
+                    close_status = error.status().as_u16();
+                    session_error = Some(error);
                     break;
                 }
-            },
-            None => next.await,
-        };
+            }
+        }
 
         match event {
             Dir::FromClient(m) => match m {
@@ -1738,33 +2375,47 @@ async fn run_session(
                             }
                         }
                     });
-                    close_upstream(&mut up_tx, &mut up_rx, frame, |message| {
-                        io.drained(message);
-                        if let TgMessage::Text(text) = message {
-                            usage.absorb(text);
-                            opening.observe(&state, &model_entry.id, Some(text));
-                        }
-                    })
-                    .await;
+                    if let Err(error) = close_upstream(
+                        &mut up_tx,
+                        &mut up_rx,
+                        frame,
+                        &mut journal,
+                        &mut usage,
+                        &mut io,
+                        Some((&state, &model_entry.id, &mut opening)),
+                    )
+                    .await
+                    {
+                        session_error.get_or_insert(error);
+                    }
                     break;
                 }
                 Some(Ok(_)) => {} // ping/pong handled by the transports
                 Some(Err(_)) | None => {
-                    close_upstream(&mut up_tx, &mut up_rx, None, |message| {
-                        io.drained(message);
-                        if let TgMessage::Text(text) = message {
-                            usage.absorb(text);
-                            opening.observe(&state, &model_entry.id, Some(text));
-                        }
-                    })
-                    .await;
+                    if let Err(error) = close_upstream(
+                        &mut up_tx,
+                        &mut up_rx,
+                        None,
+                        &mut journal,
+                        &mut usage,
+                        &mut io,
+                        Some((&state, &model_entry.id, &mut opening)),
+                    )
+                    .await
+                    {
+                        session_error.get_or_insert(error);
+                    }
                     break;
                 }
             },
             Dir::FromUpstream(m) => match m {
                 Some(Ok(TgMessage::Text(text))) => {
                     io.response(text.as_bytes());
-                    usage.absorb(&text);
+                    if let Err(error) = observe_usage(&mut journal, &mut usage, &text).await {
+                        close_status = error.status().as_u16();
+                        session_error = Some(error);
+                        break;
+                    }
                     let usage_arrived = meter.behind(&usage);
                     meter.settle(&usage);
                     opening.observe(&state, &model_entry.id, Some(&text));
@@ -1911,6 +2562,7 @@ async fn run_session(
                     break;
                 }
             },
+            Dir::Heartbeat => {}
         }
     }
 
@@ -1919,13 +2571,24 @@ async fn run_session(
     // `response.done` already on its way is still billed. Where the upstream
     // already closed, the send fails and this returns at once; the flush below
     // then sends the reply to the Close it sent.
-    close_upstream(&mut up_tx, &mut up_rx, None, |message| {
-        io.drained(message);
-        if let TgMessage::Text(text) = message {
-            usage.absorb(text);
+    if let Err(error) = close_upstream(
+        &mut up_tx,
+        &mut up_rx,
+        None,
+        &mut journal,
+        &mut usage,
+        &mut io,
+        None,
+    )
+    .await
+    {
+        session_error.get_or_insert(error);
+    }
+    if let Some(journal) = journal.as_mut() {
+        if let Err(error) = journal.finish().await {
+            session_error.get_or_insert(error);
         }
-    })
-    .await;
+    }
     let _ = tokio::time::timeout(UPSTREAM_CLOSE_ACK, up_tx.close()).await;
 
     // Whoever hung up first, a session that only ever reported an error failed.
@@ -1974,8 +2637,12 @@ async fn run_session(
     // What the last frames brought, then the session's whole cost: one figure,
     // the same one the event reports and the charges along the way add up to.
     meter.settle(&usage);
-    let cost_usd = meter.cost_usd;
+    let cost_usd = meter.cost_usd
+        + journal
+            .as_ref()
+            .map_or(0.0, |journal| journal.secondary_cost_usd());
     reservation.commit_tokens(0).await;
+    model_reservation.commit_tokens(0).await;
 
     emit_access_log(
         &Method::GET,
@@ -1990,7 +2657,7 @@ async fn run_session(
     );
     crate::request_metrics::record(
         &state,
-        "/v1/realtime",
+        endpoint,
         crate::request_metrics::Caller::new(&auth),
         crate::request_metrics::Upstream {
             provider: &provider_label,
@@ -2077,7 +2744,7 @@ async fn run_session(
     let content = refusal_frame
         .as_deref()
         .and_then(|frame| upstream_failure_content(&snap, frame.as_bytes()));
-    crate::usage_attr::emit_usage(
+    emit_usage(
         &state,
         &snap,
         crate::operation::REALTIME,
@@ -2195,28 +2862,70 @@ const UPSTREAM_CLOSE_ACK: Duration = Duration::from_secs(2);
 /// Close the upstream socket and wait, briefly, for its acknowledgement,
 /// so the upstream sees a completed handshake rather than a reset. A text frame
 /// that arrives meanwhile (a response finishing) still goes to `on_message`.
+async fn observe_usage(
+    journal: &mut Option<crate::native_api::realtime_journal::Journal>,
+    usage: &mut SessionUsage,
+    text: &str,
+) -> Result<(), ProxyError> {
+    let secondary = journal
+        .as_ref()
+        .is_some_and(|journal| journal.is_secondary_fact(text));
+    let appended = match journal.as_mut() {
+        Some(journal) => journal.observe(text).await,
+        None => Ok(true),
+    };
+    match appended {
+        Ok(false) => Ok(()),
+        Ok(true) => {
+            usage.absorb_model(text, secondary);
+            Ok(())
+        }
+        Err(error) => {
+            // 真实已观察量仍进入指标和导出；未知追加结果绝不改走另一付费出口。
+            usage.absorb_model(text, secondary);
+            Err(error)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn close_upstream<T, R>(
     up_tx: &mut T,
     up_rx: &mut R,
     frame: Option<TgCloseFrame<'static>>,
-    mut on_message: impl FnMut(&TgMessage),
-) where
+    journal: &mut Option<crate::native_api::realtime_journal::Journal>,
+    usage: &mut SessionUsage,
+    io: &mut SessionIo,
+    mut opening: Option<(&ProxyState, &str, &mut SessionOpening)>,
+) -> Result<(), ProxyError>
+where
     T: futures::Sink<TgMessage> + Unpin,
     R: futures::Stream<Item = Result<TgMessage, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
     if up_tx.send(TgMessage::Close(frame)).await.is_err() {
-        return;
+        return Ok(());
     }
+    let mut failure = None;
     let _ = tokio::time::timeout(UPSTREAM_CLOSE_ACK, async {
-        while let Some(Ok(m)) = up_rx.next().await {
-            match &m {
-                TgMessage::Text(_) | TgMessage::Binary(_) => on_message(&m),
+        while let Some(Ok(message)) = up_rx.next().await {
+            match &message {
+                TgMessage::Text(text) => {
+                    io.drained(&message);
+                    if let Err(error) = observe_usage(journal, usage, text).await {
+                        failure.get_or_insert(error);
+                    }
+                    if let Some((state, model, opening)) = opening.as_mut() {
+                        opening.observe(state, model, Some(text));
+                    }
+                }
+                TgMessage::Binary(_) => io.drained(&message),
                 TgMessage::Close(_) => break,
                 _ => {}
             }
         }
     })
     .await;
+    failure.map_or(Ok(()), Err)
 }
 
 /// Close codes an endpoint may put in a Close frame (RFC 6455 §7.4.1 and
@@ -2368,6 +3077,7 @@ async fn close_client_after_upstream<S>(
 }
 
 enum Dir {
+    Heartbeat,
     FromClient(Option<Result<AxMessage, axum::Error>>),
     FromUpstream(Option<Result<TgMessage, tokio_tungstenite::tungstenite::Error>>),
 }
@@ -3012,7 +3722,7 @@ mod tests {
         // rather than fail it.
         let err = tokio::time::timeout(
             Duration::from_secs(5),
-            connect_upstream_within(Some(budget), request),
+            connect_upstream_within(Some(budget), request, Arc::new(AtomicBool::new(false))),
         )
         .await
         .expect("the dial must end on its own budget")

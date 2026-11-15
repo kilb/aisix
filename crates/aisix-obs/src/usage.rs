@@ -792,8 +792,10 @@ pub struct UsageEvent {
     ///
     /// - `"openai"` — `/v1/chat/completions` / `/v1/responses` /
     ///   `/v1/embeddings` / `/v1/audio/*` / `/v1/images/*` / `/v1/rerank`
-    ///   (every OpenAI-shape endpoint family)
+    ///   (the ordinary OpenAI HTTP endpoint families)
     /// - `"anthropic"` — `/v1/messages` (Anthropic SDK)
+    /// - `"realtime"` — `/v1/realtime`, its GA credential endpoint and
+    ///   the Realtime Translation WebSocket and credential endpoints
     ///
     /// Disambiguates the `provider` label which today reflects the
     /// **upstream** provider only — an Anthropic-SDK call routed at a
@@ -823,7 +825,7 @@ pub struct UsageEvent {
     /// batch's real tokens and spend.
     ///
     /// The dimension nothing else on this event carries. `inbound_protocol`
-    /// collapses every OpenAI-shaped route onto one value, so a text chat, an
+    /// groups ordinary OpenAI HTTP routes under one value, so a text chat, an
     /// image generation and a video submission are indistinguishable without
     /// this field — an exporter consumer could only tell them apart by
     /// regex-ing a captured prompt, which `content_mode = metadata_only`
@@ -1417,6 +1419,14 @@ pub fn bounded_inbound_protocol(raw: &str) -> &'static str {
 }
 
 impl UsageSink {
+    /// 保留完整观察与供应商日志，不产生控制面队列意图、投递或丢弃计数。
+    /// 仅供已有权威 journal 负责计费的调用使用；没有改动事件中的真实数量。
+    pub fn observe_only(&self, handler: &'static str, mut event: UsageEvent) -> UsageEvent {
+        event.cache_creation_ttl = event.settled_cache_creation_ttl();
+        log_provider_call(handler, &event);
+        event
+    }
+
     /// 只在控制面明确接收后成功；任何失败或取消都由原持久 outbox 重试。
     pub async fn emit_durable(&self, event: DurableUsageEvent) -> Result<(), DurableUsageError> {
         let tx = self
@@ -1536,14 +1546,8 @@ impl UsageSink {
     /// reason `PkLabels` keeps a key's id and name together — a name that
     /// can be sourced separately from its id is a name that will
     /// eventually be wrong.
-    pub fn try_emit(
-        &self,
-        handler: &'static str,
-        mut event: UsageEvent,
-        labels: UsageEventLabels<'_>,
-    ) {
-        event.cache_creation_ttl = event.settled_cache_creation_ttl();
-        log_provider_call(handler, &event);
+    pub fn try_emit(&self, handler: &'static str, event: UsageEvent, labels: UsageEventLabels<'_>) {
+        let event = self.observe_only(handler, event);
         // Owned because `event` is moved into the channel below while the
         // drop counter still needs the labels.
         let user_id = event.user_id.clone();
@@ -1974,6 +1978,52 @@ mod tests {
         assert!(
             out.contains("attempt_kind=\"fallback\"") || out.contains("attempt_kind=fallback"),
             "{out}"
+        );
+    }
+
+    #[test]
+    fn observation_only_keeps_quantities_and_log_without_control_plane_intent() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let metrics = crate::metrics::Metrics::new(false);
+        let sink = UsageSink::new(tx).with_metrics(metrics.clone());
+        let mut event = sample_event("req-observation");
+        event.provider_request_id = "resp-observation".into();
+        event.prompt_tokens = 10;
+        event.cached_prompt_tokens = 2;
+        event.completion_tokens = 3;
+        event.total_tokens = 13;
+        event.modality_tokens.prompt_audio_tokens = Some(0);
+        event.modality_tokens.completion_image_tokens = None;
+        let expected = serde_json::to_value(&event).unwrap();
+        let mut observed = None;
+        let out = capture_logs(|| {
+            observed = Some(sink.observe_only("realtime", event));
+        });
+        let observed = serde_json::to_value(observed.unwrap()).unwrap();
+        assert_eq!(observed, expected);
+        assert_eq!(
+            observed.get("prompt_audio_tokens"),
+            Some(&serde_json::json!(0))
+        );
+        assert!(observed.get("completion_image_tokens").is_none());
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            out.lines()
+                .filter(|line| line.contains("provider call completed"))
+                .count(),
+            1
+        );
+        assert!(out.contains("req-observation") && out.contains("resp-observation"));
+        let scrape = metrics.render();
+        assert!(
+            !scrape.lines().any(|line| {
+                line.starts_with("aisix_usage_events_emitted_total{")
+                    || line.starts_with("aisix_usage_event_drops_total{")
+            }),
+            "no control-plane queue intent or invented drop: {scrape}"
         );
     }
 

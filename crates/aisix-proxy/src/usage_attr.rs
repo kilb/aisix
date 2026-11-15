@@ -1440,9 +1440,50 @@ pub(crate) fn emit_prepared_usage_event(
     state: &ProxyState,
     snap: &AisixSnapshot,
     surface: Surface,
+    event: UsageEvent,
+    labels: UsageEventLabels<'_>,
+    trace: Option<&std::sync::Arc<aisix_obs::RequestTraceBundle>>,
+) {
+    emit_prepared_usage_to(
+        state,
+        snap,
+        surface,
+        event,
+        labels,
+        trace,
+        UsageDelivery::ControlPlaneAndExporters,
+    );
+}
+
+/// 权威实时计量出口只接收费事实；准入拒绝仍保留完整观察与 exporter。
+pub(crate) fn emit_prepared_usage_observation(
+    state: &ProxyState,
+    snap: &AisixSnapshot,
+    surface: Surface,
+    event: UsageEvent,
+    labels: UsageEventLabels<'_>,
+    trace: Option<&std::sync::Arc<aisix_obs::RequestTraceBundle>>,
+) {
+    emit_prepared_usage_to(
+        state,
+        snap,
+        surface,
+        event,
+        labels,
+        trace,
+        UsageDelivery::ExportersOnly,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_prepared_usage_to(
+    state: &ProxyState,
+    snap: &AisixSnapshot,
+    surface: Surface,
     mut event: UsageEvent,
     labels: UsageEventLabels<'_>,
     trace: Option<&std::sync::Arc<aisix_obs::RequestTraceBundle>>,
+    delivery: UsageDelivery,
 ) {
     // It speaks for no attempt of its own: after the failed attempts of a
     // single-shot failover whose winner then failed, it follows them.
@@ -1453,8 +1494,8 @@ pub(crate) fn emit_prepared_usage_event(
     // builder leaves `upstream_latency_ms` at 0, so no upstream span is
     // derivable either way — `dispatched: false` states the common case
     // (most error events never reached a provider).
-    emit_usage(
-        state, snap, surface, event, labels, None, trace, true, false,
+    emit_usage_to(
+        state, snap, surface, event, labels, None, trace, true, true, false, delivery,
     );
 }
 
@@ -1623,6 +1664,58 @@ pub(crate) fn emit_usage(
     emit_usage_with_finality(
         state, snap, surface, event, labels, content, trace, terminal, terminal, dispatched,
     );
+}
+
+/// 权威 journal 已承担付费事件；同一真实观察继续进入日志、追踪与 exporter。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_usage_observation(
+    state: &ProxyState,
+    snap: &AisixSnapshot,
+    surface: Surface,
+    event: UsageEvent,
+    labels: UsageEventLabels<'_>,
+    content: Option<&aisix_obs::CapturedContent>,
+    trace: Option<&std::sync::Arc<aisix_obs::RequestTraceBundle>>,
+    terminal: bool,
+    dispatched: bool,
+) {
+    emit_usage_to(
+        state,
+        snap,
+        surface,
+        event,
+        labels,
+        content,
+        trace,
+        terminal,
+        terminal,
+        dispatched,
+        UsageDelivery::ExportersOnly,
+    );
+}
+
+#[derive(Clone, Copy)]
+enum UsageDelivery {
+    ControlPlaneAndExporters,
+    ExportersOnly,
+}
+
+impl UsageDelivery {
+    fn publish(
+        self,
+        sink: &aisix_obs::UsageSink,
+        handler: &'static str,
+        event: UsageEvent,
+        labels: UsageEventLabels<'_>,
+    ) -> UsageEvent {
+        match self {
+            Self::ControlPlaneAndExporters => {
+                sink.try_emit(handler, event.clone(), labels);
+                event
+            }
+            Self::ExportersOnly => sink.observe_only(handler, event),
+        }
+    }
 }
 
 /// 源端已报告的累计值优先于估算；未结算输出仍保留流消费者的部分输出估算。
@@ -1956,6 +2049,34 @@ pub(crate) fn emit_usage_with_finality(
     state: &ProxyState,
     snap: &AisixSnapshot,
     surface: Surface,
+    event: UsageEvent,
+    labels: UsageEventLabels<'_>,
+    content: Option<&aisix_obs::CapturedContent>,
+    trace: Option<&std::sync::Arc<aisix_obs::RequestTraceBundle>>,
+    terminal: bool,
+    logical_final: bool,
+    dispatched: bool,
+) {
+    emit_usage_to(
+        state,
+        snap,
+        surface,
+        event,
+        labels,
+        content,
+        trace,
+        terminal,
+        logical_final,
+        dispatched,
+        UsageDelivery::ControlPlaneAndExporters,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_usage_to(
+    state: &ProxyState,
+    snap: &AisixSnapshot,
+    surface: Surface,
     mut event: UsageEvent,
     labels: UsageEventLabels<'_>,
     content: Option<&aisix_obs::CapturedContent>,
@@ -1963,6 +2084,7 @@ pub(crate) fn emit_usage_with_finality(
     terminal: bool,
     logical_final: bool,
     dispatched: bool,
+    delivery: UsageDelivery,
 ) {
     stamp_requested_model_id(&mut event);
     stamp_billing_fields(snap, &mut event, labels.provider_key_id);
@@ -2078,6 +2200,7 @@ pub(crate) fn emit_usage_with_finality(
             None,
             &exporters,
             terminal,
+            delivery,
         );
         return;
     }
@@ -2140,6 +2263,7 @@ pub(crate) fn emit_usage_with_finality(
         facts.as_ref(),
         &exporters,
         terminal,
+        delivery,
     );
 }
 
@@ -2157,6 +2281,7 @@ pub(crate) struct PendingUsage {
     snapshot: aisix_core::SnapshotHandle<AisixSnapshot>,
     span: tracing::Span,
     token_terminal: bool,
+    delivery: UsageDelivery,
 }
 
 impl PendingUsage {
@@ -2185,11 +2310,12 @@ impl PendingUsage {
             user_name: &self.labels[4],
             upstream_protocol: &self.labels[5],
         };
-        self.sink
-            .try_emit(self.surface.handler, self.event.clone(), labels);
+        let event = self
+            .delivery
+            .publish(&self.sink, self.surface.handler, self.event, labels);
         if !exporters.is_empty() {
             self.fan_out.fan_out(
-                &self.event,
+                &event,
                 self.content.as_ref(),
                 self.emission.as_ref(),
                 self.facts.as_ref(),
@@ -2211,6 +2337,7 @@ fn deliver_usage(
     facts: Option<&Arc<aisix_obs::SpanFacts>>,
     exporters: &LiveExporters,
     _terminal: bool,
+    delivery: UsageDelivery,
 ) {
     let token_terminal = event.is_final_attempt && crate::first_token::token_surface(surface);
     event.first_token_latency_ms = if token_terminal {
@@ -2239,13 +2366,12 @@ fn deliver_usage(
             snapshot: state.snapshot.clone(),
             span: tracing::Span::current(),
             token_terminal,
+            delivery,
         };
         crate::attribution::defer_body_usage(pending);
         return;
     }
-    state
-        .usage_sink
-        .try_emit(surface.handler, event.clone(), labels);
+    let event = delivery.publish(&state.usage_sink, surface.handler, event, labels);
     if !exporters.is_empty() {
         state.otlp_fan_out.fan_out(
             &event,

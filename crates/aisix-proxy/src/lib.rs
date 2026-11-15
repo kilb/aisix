@@ -262,6 +262,9 @@ pub fn build_router(state: ProxyState) -> Router {
         // OpenAI Realtime WebSocket relay (#721). Auth/ACL/quota are
         // enforced pre-upgrade inside the handler.
         .route("/v1/realtime", get(realtime::realtime))
+        .route("/v1/realtime/translations", get(realtime::realtime))
+        .route("/v1/realtime/client_secrets", post(native_api::realtime_credentials::client_secrets))
+        .route("/v1/realtime/translations/client_secrets", post(native_api::realtime_credentials::translation_client_secrets))
         // Files / Batches / Fine-tuning jobs surface (#720). Provider
         // routing rides the gateway-encoded resource ids; see jobs.rs.
         .route(
@@ -546,6 +549,9 @@ fn normalize_endpoint_label(path: &str) -> &'static str {
         "/v1/videos" => "/v1/videos",
         "/mcp" | "/mcp/" => "/mcp",
         "/v1/realtime" => "/v1/realtime",
+        "/v1/realtime/translations" => "/v1/realtime/translations",
+        "/v1/realtime/client_secrets" => "/v1/realtime/client_secrets",
+        "/v1/realtime/translations/client_secrets" => "/v1/realtime/translations/client_secrets",
         "/v1/files" => "/v1/files",
         "/v1/batches" => "/v1/batches",
         "/v1/fine_tuning/jobs" => "/v1/fine_tuning/jobs",
@@ -766,7 +772,7 @@ fn inbound_protocol_for_endpoint(endpoint: &str) -> &'static str {
         "mcp"
     } else if endpoint == "/a2a" || endpoint == "/a2a/{agent}/.well-known/agent-card.json" {
         "a2a"
-    } else if endpoint == "/v1/realtime" {
+    } else if endpoint == "/v1/realtime" || endpoint.starts_with("/v1/realtime/") {
         "realtime"
     } else if endpoint == "/passthrough_route" {
         // Whatever API a route relays, it is not the gateway's own OpenAI

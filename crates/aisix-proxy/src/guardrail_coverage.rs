@@ -283,6 +283,18 @@ pub(crate) const POSTURE: &[(&str, Posture)] = &[
              live socket. Covered by the realtime e2e suite.",
         ),
     ),
+    (
+        "/v1/realtime/translations",
+        Posture::EnforcedNotDrivableInCrate("专用实时翻译 WS 沿逐帧 guardrail；真实套接字组件覆盖配置和音频。"),
+    ),
+    (
+        "/v1/realtime/client_secrets",
+        Posture::EnforcedNotDrivableInCrate("GA 凭据沿基本密钥、模型准入与内容审核；组件合同覆盖真实配置成功和拒绝。"),
+    ),
+    (
+        "/v1/realtime/translations/client_secrets",
+        Posture::EnforcedNotDrivableInCrate("翻译凭据沿基本密钥、模型准入与内容审核；组件合同覆盖真实配置成功和拒绝。"),
+    ),
     ("/v1/files", Posture::Enforced),
     ("/v1/batches", Posture::Enforced),
     (

@@ -1331,7 +1331,12 @@ pub(crate) async fn finish(
             .unwrap_or_default(),
         status_code: status,
         downstream_latency_ms: crate::attempt::measured_ms(elapsed),
-        inbound_protocol: "openai".into(),
+        inbound_protocol: if surface == crate::operation::REALTIME {
+            "realtime"
+        } else {
+            "openai"
+        }
+        .into(),
         inference_stage: Some(stage),
         native_operation_id: audit.operation_id,
         client_source_ip: client.source_ip.clone(),

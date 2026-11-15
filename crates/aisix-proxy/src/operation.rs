@@ -3,12 +3,13 @@
 //!
 //! A usage event already says which protocol addressed the gateway
 //! (`inbound_protocol`) and which model answered — but not what was asked
-//! for. Every OpenAI-shaped route collapses onto `inbound_protocol="openai"`,
+//! for. Ordinary OpenAI HTTP routes share `inbound_protocol="openai"`,
 //! so a text chat, an image generation and a video submission are one
 //! undifferentiated stream to an exporter consumer. The only way to tell them
 //! apart was to regex a captured prompt, which `content_mode = metadata_only`
 //! deployments do not have and which a video submission (zero tokens, no
 //! captured content) does not answer at all (AISIX-Cloud#1461).
+//! Realtime WS、GA 凭据和实时翻译接口共用既有 `realtime` 协议标签。
 //!
 //! [`Surface`] pairs the two labels a terminal emitter needs and hands them
 //! out as constants, because they must not be able to disagree: `handler` is
@@ -204,7 +205,10 @@ pub(crate) fn surface_for_endpoint(endpoint: &str) -> Option<Surface> {
         "/v1/audio/translations" => TRANSLATION,
         "/v1/audio/speech" => SPEECH,
         "/v1/videos" => VIDEO_GENERATION,
-        "/v1/realtime" => REALTIME,
+        "/v1/realtime"
+        | "/v1/realtime/translations"
+        | "/v1/realtime/client_secrets"
+        | "/v1/realtime/translations/client_secrets" => REALTIME,
         "/v1/files" | "/v1/files/:id" => FILES,
         "/v1/batches" | "/v1/batches/:id" => BATCHES,
         "/v1/messages/batches"
@@ -415,6 +419,12 @@ mod tests {
             Emits::Nothing("downloads a job the submission already metered"),
         ),
         ("/v1/realtime", Emits::Usage(REALTIME)),
+        ("/v1/realtime/translations", Emits::Usage(REALTIME)),
+        ("/v1/realtime/client_secrets", Emits::Usage(REALTIME)),
+        (
+            "/v1/realtime/translations/client_secrets",
+            Emits::Usage(REALTIME),
+        ),
         ("/v1/files", Emits::Usage(FILES)),
         ("/v1/files/:id", Emits::Usage(FILES)),
         ("/v1/files/:id/content", Emits::Usage(FILES)),

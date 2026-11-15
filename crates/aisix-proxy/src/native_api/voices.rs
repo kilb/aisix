@@ -475,3 +475,74 @@ pub(crate) async fn validate_voice_slot(
     }
     Ok(())
 }
+
+/// WS 只在官方事件槽解释自定义引用；JSON binary 与 text 使用同一当前授权。
+pub(crate) async fn validate_realtime_frame(
+    state: &ProxyState,
+    auth: &AuthenticatedKey,
+    client: &ClientContext,
+    bytes: &[u8],
+    origin: Option<&OriginBinding>,
+    requested_model: &str,
+) -> Result<(), ProxyError> {
+    // 音频 append 等高频帧只借用原始值；仅配置事件解析容器，避免复制整段音频。
+    let Ok(event) = serde_json::from_slice::<
+        std::collections::HashMap<String, &serde_json::value::RawValue>,
+    >(bytes) else {
+        return Ok(());
+    };
+    let kind = event
+        .get("type")
+        .and_then(|value| serde_json::from_str::<String>(value.get()).ok());
+    let field = match kind.as_deref() {
+        Some("session.update") => "session",
+        Some("response.create") => "response",
+        _ => return Ok(()),
+    };
+    let Some(config) = event
+        .get(field)
+        .and_then(|value| serde_json::from_str::<Value>(value.get()).ok())
+    else {
+        return Ok(());
+    };
+    let voices = ["/audio/output/voice", "/voice"]
+        .iter()
+        .filter_map(|slot| config.pointer(slot))
+        .filter(|voice| voice.is_object())
+        .collect::<Vec<_>>();
+    if voices.is_empty() {
+        return Ok(());
+    }
+    let expected = origin.ok_or_else(openai::dependency)?;
+    let snapshot = state.snapshot.load();
+    let current = openai::current_auth(&snapshot, auth)?;
+    let direct = openai::model_entry_by_id(state, &snapshot, expected.model_id)?;
+    let (_, actual) = crate::attribution::detached(async {
+        openai::resolve_reference_for_requested(
+            state,
+            &snapshot,
+            &current,
+            client,
+            &direct.value.display_name,
+            requested_model,
+            NativeObjectKind::Voice,
+            EndpointFamily::Realtime,
+        )
+    })
+    .await?;
+    if !skills::same_account(expected, &actual) {
+        return Err(skills::not_found());
+    }
+    for voice in voices {
+        validate_voice_reference(
+            state,
+            &current,
+            client,
+            voice,
+            &actual,
+            EndpointFamily::Realtime,
+        )
+        .await?;
+    }
+    Ok(())
+}
