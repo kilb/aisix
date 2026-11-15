@@ -1313,3 +1313,303 @@ async fn actual_two_entry_batch_keeps_each_executed_input_audit_with_its_own_ter
         "batch observation and replay cannot rewrite any original submission value"
     );
 }
+
+// 本组件只替代供应商协议；实际路由、CP/PG、worker 和账本保持真实，不冒充外部端到端验收。
+// 跳过 group 输出链会使 A 保持原文；广播链会改坏 B；同一回答双跑会多一个后缀。
+#[tokio::test]
+async fn batch_group_output_mask_changes_only_its_own_entry_once_without_changing_settlement() {
+    let Some(f) = fixture().await else { return };
+    assert_ne!(f.alias, f.target, "the caller addresses a real group alias");
+    assert_ne!(
+        f.target, f.second,
+        "the sibling retains its own actual target identity"
+    );
+    let guardrail = resource(
+        &f.cp,
+        &f.admin,
+        "guardrails",
+        json!({
+            "name":"metadata-group-output","kind":"pii","hook_point":"output","detectors":[],
+            "custom_patterns":[{"name":"group_result_word","regex":"classified",
+                "action":"mask","replacement":"classified:screened"}]
+        }),
+    )
+    .await;
+    resource(
+        &f.cp,
+        &f.admin,
+        "guardrail_attachments",
+        json!({
+            "guardrail_id":guardrail,"scope_type":"model","scope_id":f.alias,"priority":50
+        }),
+    )
+    .await;
+    let (state, mut usage) = gateway(&f).await;
+    verified_auth_preflight(&state).await;
+    let lines: String = [("A", ALIAS, A_TEXT), ("B", SECOND, B_TEXT)]
+        .into_iter()
+        .map(|(id, model, text)| {
+            format!(
+                "{}\n",
+                json!({"custom_id":id,"method":"POST","url":"/v1/chat/completions",
+            "body":{"model":model,"messages":[{"role":"user","content":text}]}})
+            )
+        })
+        .collect();
+    let boundary = "metadata-group-output-input";
+    let upload = format!("--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nmetadata-actual-target\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"purpose\"\r\n\r\nbatch\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"metadata.jsonl\"\r\nContent-Type: application/jsonl\r\n\r\n{lines}\r\n--{boundary}--\r\n");
+    let (status, body) = send(
+        &state,
+        "POST",
+        "/v1/files",
+        "admission",
+        &format!("multipart/form-data; boundary={boundary}"),
+        upload.into_bytes(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "positive control: actual direct-model file upload: {body}"
+    );
+    assert_eq!(body["id"], INPUT_FILE);
+    let uploaded_bytes = f
+        .provider
+        .state
+        .files
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|file| file.0 == INPUT_FILE)
+        .expect("the provider actually received the input file")
+        .1
+        .clone();
+    assert_eq!(
+        uploaded_bytes.as_slice(),
+        lines.as_bytes(),
+        "the provider received both original public entries byte for byte"
+    );
+    f.provider.state.scans.lock().unwrap().clear();
+    drain(&mut usage);
+    let (status, body) = json_request(&state, "POST", "/v1/batches", "admission",
+        json!({"input_file_id":INPUT_FILE,"endpoint":"/v1/chat/completions","completion_window":"24h"})).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "positive control: real batch acceptance: {body}"
+    );
+    assert_eq!(body["id"], BATCH_ID);
+    let (object, operation) = record(&f, BATCH_ID).await;
+    let admitted = admission_submission(&f, operation).await;
+    let scans = f.provider.scans();
+    assert_eq!(
+        scans.len(),
+        2,
+        "both real input scans precede output policy"
+    );
+    for (own, sibling) in [
+        ("metadata-entry-a", "metadata-entry-b"),
+        ("metadata-entry-b", "metadata-entry-a"),
+    ] {
+        assert_eq!(
+            scans
+                .iter()
+                .filter(|text| text.contains(own) && !text.contains(sibling))
+                .count(),
+            1
+        );
+    }
+    let staged = f.provider.file(STAGED_FILE);
+    assert_eq!(staged.len(), 2);
+    for (index, custom_id, content) in [(0, "A", A_MASKED), (1, "B", B_TEXT)] {
+        assert_eq!(staged[index]["custom_id"], custom_id);
+        assert_eq!(
+            staged[index]["body"]["model"], "gpt-4o-mini",
+            "one upstream model per actual provider batch"
+        );
+        assert_eq!(staged[index]["body"]["messages"][0]["content"], content);
+    }
+    let submitted = f.provider.posts("/v1/batches");
+    assert_eq!(submitted.len(), 1);
+    assert_eq!(submitted[0]["input_file_id"], STAGED_FILE);
+    assert_eq!(submitted[0]["endpoint"], "/v1/chat/completions");
+    f.provider.complete();
+    assert_eq!(
+        aisix_proxy::native_api::openai_batch_worker::run_once(&state)
+            .await
+            .unwrap(),
+        1
+    );
+    let rows = terminals(&f, object, 2).await;
+    for (entry, event, charge) in &rows {
+        let (requested, actual, input, output, amount) = match entry.as_str() {
+            "A" => (f.alias, f.target, 100, 10, 240),
+            "B" => (f.second, f.second, 200, 30, 520),
+            _ => panic!("only the two actual custom ids can settle"),
+        };
+        assert_eq!(event["requested_model_id"], json!(requested));
+        assert_eq!(event["model_id"], json!(actual));
+        assert_eq!(event["native_operation_id"], json!(operation));
+        assert_eq!(event["upstream_model"], "gpt-4o-mini");
+        assert_eq!(event["prompt_tokens"], input);
+        assert_eq!(event["completion_tokens"], output);
+        assert_eq!(
+            *charge, amount,
+            "output policy never changes actual billed quantities"
+        );
+        original_metadata(event);
+    }
+    let (status, batch) = json_request(
+        &state,
+        "GET",
+        &format!("/v1/batches/{BATCH_ID}"),
+        "admission",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "real completed batch management: {batch}"
+    );
+    assert_eq!(batch["status"], "completed");
+    assert_eq!(batch["output_file_id"], OUTPUT_FILE);
+    drain(&mut usage);
+    let request = Request::builder()
+        .method("GET")
+        .uri(format!("/v1/files/{OUTPUT_FILE}/content"))
+        .header("authorization", format!("Bearer {}", token("admission")))
+        .header("cookie", format!("session={COOKIE_CANARY}"))
+        .header("x-metadata-project", "admission")
+        .header("x-metadata-private", UNSELECTED_CANARY)
+        .body(Body::empty())
+        .unwrap();
+    let response = build_router(state.clone()).oneshot(request).await.unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the actual owned batch result can be read"
+    );
+    let media_type = response
+        .headers()
+        .get("content-type")
+        .expect("the real JSONL result media type")
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .trim();
+    assert_eq!(media_type, "application/jsonl");
+    let bytes = Limited::new(response.into_body(), 1 << 20)
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    let text = std::str::from_utf8(&bytes).expect("the actual batch result remains UTF-8 JSONL");
+    let results: Vec<Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("each actual result line remains valid JSON"))
+        .collect();
+    assert_eq!(
+        results.len(),
+        2,
+        "output policy retains both complete result lines"
+    );
+    for (id, model, content, input, output) in [
+        ("A", ALIAS, "classified:screened", 100, 10),
+        ("B", SECOND, "classified", 200, 30),
+    ] {
+        let matching: Vec<_> = results
+            .iter()
+            .filter(|row| row["custom_id"] == id)
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "each original custom id survives exactly once"
+        );
+        let result = matching[0];
+        assert_eq!(result["id"], format!("batch_req_metadata_{id}"));
+        assert_eq!(
+            result.get("error"),
+            Some(&Value::Null),
+            "the original explicit error field survives"
+        );
+        assert_eq!(result["response"]["status_code"], 200);
+        assert_eq!(result["response"]["request_id"], format!("provider-{id}"));
+        let body = &result["response"]["body"];
+        assert_eq!(body["id"], format!("chatcmpl_metadata_{id}"));
+        assert_eq!(body["object"], "chat.completion");
+        assert_eq!(body["created"], COMPLETED_AT);
+        assert_eq!(body["model"], model);
+        assert_eq!(
+            body["choices"]
+                .as_array()
+                .expect("the original complete choices")
+                .len(),
+            1
+        );
+        let choice = &body["choices"][0];
+        assert_eq!(choice["index"], 0);
+        assert_eq!(choice["finish_reason"], "stop");
+        assert_eq!(choice["message"]["role"], "assistant");
+        assert_eq!(
+            choice["message"]["content"], content,
+            "group A is screened once and direct sibling B is untouched"
+        );
+        assert_eq!(body["usage"]["prompt_tokens"], input);
+        assert_eq!(body["usage"]["completion_tokens"], output);
+        assert_eq!(body["usage"]["total_tokens"], input + output);
+    }
+    let management = drain_typed(&mut usage);
+    assert!(
+        management.iter().any(
+            |event| event.inference_stage == Some(InferenceStage::Management)
+                && event
+                    .guardrail_enforced_hits
+                    .iter()
+                    .any(|hit| hit.guardrail_name == "metadata-group-output"
+                        && hit.hook == "output"
+                        && hit.action == "masked"
+                        && hit.counts.get("group_result_word").copied() == Some(1))
+        ),
+        "independent positive control: the actual management event records the applied output mask"
+    );
+    let calls = f.provider.state.calls.lock().unwrap().clone();
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.0 == "GET" && call.1 == format!("/v1/files/{OUTPUT_FILE}/content")),
+        "the real provider result was fetched, not fabricated by the authority or fixture setup"
+    );
+    assert_eq!(calls.iter().filter(|call| call.0 == "POST").count(), 3,
+        "one original upload, one staged upload and one accepted batch; no extra inference dispatch");
+    assert!(f.provider.posts("/v1/responses").is_empty());
+    assert_eq!(f.provider.posts("/v1/batches").len(), 1);
+    assert_eq!(
+        aisix_proxy::native_api::openai_batch_worker::run_once(&state)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        terminals(&f, object, 2).await,
+        rows,
+        "reading screened results cannot reattribute or rebill the accepted entries"
+    );
+    replay_once(
+        &f,
+        object,
+        rows.into_iter().map(|(_, event, _)| event).collect(),
+        2,
+        760,
+    )
+    .await;
+    assert_eq!(
+        admission_submission(&f, operation).await,
+        admitted,
+        "output policy and management never rewrite the original caller or input audit snapshots"
+    );
+    shutdown_exporters(&state).await;
+}
