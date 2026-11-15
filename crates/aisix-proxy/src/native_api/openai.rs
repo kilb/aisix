@@ -383,7 +383,10 @@ fn resolve_for_requested_family(
             .as_ref()
             .is_some_and(|routing| {
                 routing.targets.iter().any(|target| {
-                    target.model_ref(snapshot).as_ref() == entry.value.display_name.as_str()
+                    snapshot
+                        .models
+                        .get_by_name(&target.model_ref(snapshot))
+                        .is_some_and(|member| member.id == entry.id)
                 })
             })
     {
