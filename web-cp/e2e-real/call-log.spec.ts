@@ -12,7 +12,7 @@ const output = resolve(process.env.REFINED_QA_OUTPUT!);
 if (state.ready !== true || state.mockUpstream !== false) throw new Error("Call-log E2E requires a ready real isolated stack");
 const base = state.adminUrl as string;
 if (!["127.0.0.1", "localhost"].includes(new URL(base).hostname)) throw new Error("Only isolated loopback URLs are allowed");
-interface ChargeRecord { event_id: string; status_code: number | null; error_class: string | null; error_message: string | null; attempt_index: number; is_final_attempt: boolean | null }
+interface ChargeRecord { status: string; charge_micro_cny: number | null; lines: { dimension: string; quantity: number; rate: string }[] | null; event_id: string; status_code: number | null; error_class: string | null; error_message: string | null; attempt_index: number; is_final_attempt: boolean | null }
 interface StoredRecord { event_id: string; request_id: string | null; event: Record<string, unknown> }
 const requests = new WeakMap<Page, { method: string; path: string; search: string }[]>();
 const errors = new WeakMap<Page, string[]>();
@@ -123,11 +123,15 @@ test("failed call opens its complete saved log, copies content and survives dire
   await expect(direct.getByRole("heading", { name: "调用日志详情", exact: true })).toBeVisible();
   await expect(direct.getByRole("region", { name: "错误信息", exact: true }).locator("pre")).toHaveText(expectedMessage);
   await isolated.close();
+  await json.locator("summary").click();
+  await expect(message.locator("pre")).toBeVisible();
+  await expect(json.locator("pre")).toBeVisible();
   mkdirSync(join(output, "screenshots"), { recursive: true });
   for (const width of [390, 900, 1440]) {
     await page.setViewportSize({ width, height: 1000 });
     await expect(page.getByRole("link", { name: "返回调用记录", exact: true })).toBeVisible();
     const bounds = await page.evaluate(() => ({ viewport: document.documentElement.clientWidth, page: document.documentElement.scrollWidth, content: [...document.querySelectorAll(".call-log-text pre")].filter(element => element.getBoundingClientRect().width > 0).map(element => ({ client: element.clientWidth, scroll: element.scrollWidth })) }));
+    expect(bounds.content).toHaveLength(2);
     expect(bounds.page, `page width at ${width}`).toBeLessThanOrEqual(bounds.viewport + 1);
     for (const block of bounds.content) expect(block.scroll, `long log wraps at ${width}`).toBeLessThanOrEqual(block.client + 1);
     await page.screenshot({ path: join(output, "screenshots", `call-log-${width}.png`) });
@@ -181,4 +185,84 @@ test("a missing event shows an explicit missing state and can return to the same
   await page.getByRole("link", { name: "返回调用记录", exact: true }).click();
   expect(new URL(page.url()).hash).toBe("#calls?outcome=failed");
   await expect(page.getByRole("heading", { name: "调用记录", exact: true })).toBeVisible();
+});
+
+
+// 长错误与已计费明细可以属于不同真实调用；两种分支都必须先有证据再量布局。
+test("long saved logs and billed quantity rows fit narrow detail pages without losing content", async ({ page }) => {
+  const longErrorId = process.env.CALL_LOG_QA_LONG_EVENT_ID ?? state.callLogEvidence?.longErrorEventId;
+  const billedId = process.env.CALL_LOG_QA_BILLED_EVENT_ID ?? state.callLogEvidence?.billedEventId;
+  expect(typeof longErrorId === "string" && longErrorId.length > 0, "Prepare an actual saved failure with a long unbroken error field, then name its event ID").toBe(true);
+  expect(typeof billedId === "string" && billedId.length > 0, "Prepare an actual billed call with nonempty quantity lines and a long numeric rate, then name its event ID").toBe(true);
+  await login(page);
+  for (const [kind, eventId] of [["long-error", longErrorId], ["billed", billedId]] as const) {
+    const detailPath = `/admin/usage/events/${encodeURIComponent(eventId)}`;
+    const eventRead = page.waitForResponse(response => new URL(response.url()).pathname === detailPath);
+    const chargeRead = page.waitForResponse(response => listResponse(response, eventId));
+    await page.goto(`${base}/#calls?detail=${encodeURIComponent(eventId)}`);
+    const eventAnswer = await eventRead;
+    const chargeAnswer = await chargeRead;
+    expect(eventAnswer.status()).toBe(200);
+    expect(chargeAnswer.status()).toBe(200);
+    const stored = await eventAnswer.json() as StoredRecord;
+    const priced = await chargeAnswer.json() as { items: ChargeRecord[] };
+    expect(stored.event_id).toBe(eventId);
+    await expect(page.getByRole("heading", { name: "调用日志详情", exact: true })).toBeVisible();
+    const json = page.getByRole("region", { name: "事件 JSON", exact: true });
+    await json.locator("summary").click();
+    await expect(json.locator("pre")).toBeVisible();
+    await expect(json.locator("pre")).toHaveText(JSON.stringify(stored, null, 2));
+    if (kind === "long-error") {
+      expect(typeof stored.event.error_message).toBe("string");
+      expect(String(stored.event.error_message), "The real stored error must stress unbroken-line wrapping").toMatch(/[^\s]{160,}/u);
+      await expect(page.getByRole("region", { name: "错误信息", exact: true }).locator("pre")).toHaveText(String(stored.event.error_message));
+    } else {
+      expect(priced.items).toHaveLength(1);
+      const billed = priced.items[0]!;
+      expect(billed.status).toBe("charged");
+      expect(billed.charge_micro_cny).not.toBeNull();
+      expect(billed.charge_micro_cny!).toBeGreaterThan(0);
+      expect(Array.isArray(billed.lines)).toBe(true);
+      expect(billed.lines!.length, "The real billed quantities branch must actually render").toBeGreaterThan(0);
+      expect(billed.lines!.some(line => line.quantity > 0 && /^\d+(?:\.\d+)?$/.test(line.rate) && line.rate.replace(/\D/g, "").length >= 12), "At least one actual billed rate must contain 12 digits to stress narrow quantity cells").toBe(true);
+      const quantities = page.getByRole("region", { name: `计费数量 ${eventId}`, exact: true });
+      await expect(quantities.locator("table tbody tr")).toHaveCount(billed.lines!.length);
+      for (const row of await quantities.locator("table tbody tr").all()) {
+        await expect(row.locator("td")).toHaveCount(4);
+        for (const label of ["维度", "数量", "基准价", "小计（美元）"]) await expect(row.locator(`td[data-label="${label}"]`)).not.toBeEmpty();
+      }
+    }
+    for (const width of [390, 900, 1440]) {
+      await page.setViewportSize({ width, height: 1000 });
+      const errorBlock = page.getByRole("region", { name: "错误信息", exact: true }).locator("pre");
+      if (kind === "long-error") await expect(errorBlock).toBeVisible();
+      await expect(json.locator("pre")).toBeVisible();
+      const table = page.getByRole("region", { name: `计费数量 ${eventId}`, exact: true }).locator("table");
+      if (kind === "billed") await expect(table).toBeVisible();
+      const bounds = await page.evaluate(() => {
+        const visible = (element: Element) => element.getBoundingClientRect().width > 0;
+        const rect = (element: Element) => { const r = element.getBoundingClientRect(); return { left: r.left, right: r.right, client: element.clientWidth, scroll: element.scrollWidth }; };
+        return {
+          viewport: document.documentElement.clientWidth, page: document.documentElement.scrollWidth,
+          blocks: [...document.querySelectorAll(".call-log-text pre")].filter(visible).map(rect),
+          tables: [...document.querySelectorAll(".call-log-page .charge-quantities-table")].filter(visible).map(rect),
+          cells: [...document.querySelectorAll(".call-log-page .charge-quantities-table tbody td")].filter(visible).map(element => ({ ...rect(element), text: element.textContent })),
+        };
+      });
+      const expectedBlocks = typeof stored.event.error_message === "string" && stored.event.error_message.length > 0 ? 2 : 1;
+      expect(bounds.blocks).toHaveLength(expectedBlocks);
+      expect(bounds.page, `${kind} page width at ${width}`).toBeLessThanOrEqual(bounds.viewport + 1);
+      if (kind === "billed") {
+        expect(bounds.tables).toHaveLength(1);
+        expect(bounds.cells.length).toBeGreaterThanOrEqual(4);
+      }
+      for (const box of [...bounds.blocks, ...bounds.tables, ...bounds.cells]) {
+        expect(box.left).toBeGreaterThanOrEqual(-1);
+        expect(box.right).toBeLessThanOrEqual(bounds.viewport + 1);
+        expect(box.scroll, `${kind} visible content fits at ${width}`).toBeLessThanOrEqual(box.client + 1);
+      }
+      mkdirSync(join(output, "screenshots"), { recursive: true });
+      await page.screenshot({ path: join(output, "screenshots", `call-log-${kind}-${width}.png`), fullPage: true });
+    }
+  }
 });

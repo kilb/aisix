@@ -404,8 +404,8 @@ export function ChargeCheck({ c }: { c: Charge }) {
   const reported = reportedCounters(c.usage);
   const recomputed = chargeFromLines(c.lines, c.cny_per_usd_e4, c.discount_bps);
   return (
-    <div className="grid gap-4 rounded-cell border border-border bg-well/50 p-4 text-ink-soft lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
-      <section aria-label={`计费数量 ${c.event_id}`}>
+    <div className="charge-check grid min-w-0 gap-4 rounded-cell border border-border bg-well/50 p-4 text-ink-soft lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
+      <section className="min-w-0" aria-label={`计费数量 ${c.event_id}`}>
         <h4 className="mb-2 text-caption font-medium">计费数量</h4>
         {c.lines === null ? (
           <p className="text-caption text-muted-foreground">
@@ -455,7 +455,7 @@ export function ChargeCheck({ c }: { c: Charge }) {
           <p className="mt-1 text-caption text-text-2">重新计价已更正 {fmtMicroCny(c.adjusted_micro_cny)}。</p>
         )}
       </section>
-      <section aria-label={`已记录用量 ${c.event_id}`}>
+      <section className="min-w-0" aria-label={`已记录用量 ${c.event_id}`}>
         <h4 className="mb-2 text-caption font-medium">{c.usage_estimated === true ? "包含网关估算的用量" : "已记录用量"}</h4>
         {reported.length === 0 ? (
           <p className="text-caption text-muted-foreground">这次调用没有用量记录。</p>

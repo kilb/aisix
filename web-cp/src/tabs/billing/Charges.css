@@ -14,13 +14,13 @@
   .charge-records .charge-records-table .finance-icon-button { width: 44px; min-width: 44px; min-height: 44px; padding-inline: 0; }
   .charge-records .dt.charge-records-table > tbody > tr.dt-detail { display: block; }
   .charge-records .dt.charge-records-table > tbody > tr.dt-detail > td { display: block; width: 100%; height: auto; min-height: 0; padding: 0 16px 20px; box-sizing: border-box; }
-  .charge-records .charge-quantities-table { display: block; width: 100%; }
-  .charge-records .charge-quantities-table > thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
-  .charge-records .charge-quantities-table > tbody { display: block; }
-  .charge-records .charge-quantities-table > tbody > tr { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 16px; padding: 14px 0; border-bottom: 1px solid var(--border); }
-  .charge-records .charge-quantities-table > tbody > tr > td { display: block; width: auto; height: auto; padding: 0; border: 0; text-align: left; }
-  .charge-records .charge-quantities-table > tbody > tr > td:nth-child(n+3) { grid-column: 1 / -1; }
-  .charge-records .charge-quantities-table > tbody > tr > td::before { content: attr(data-label); display: block; margin-bottom: 5px; color: var(--muted-foreground); font-size: 12px; line-height: 18px; }
+  .charge-check .charge-quantities-table { display: block; width: 100%; }
+  .charge-check .charge-quantities-table > thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+  .charge-check .charge-quantities-table > tbody { display: block; }
+  .charge-check .charge-quantities-table > tbody > tr { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 16px; padding: 14px 0; border-bottom: 1px solid var(--border); }
+  .charge-check .charge-quantities-table > tbody > tr > td { display: block; width: auto; min-width: 0; height: auto; padding: 0; border: 0; text-align: left; }
+  .charge-check .charge-quantities-table > tbody > tr > td:nth-child(n+3) { grid-column: 1 / -1; }
+  .charge-check .charge-quantities-table > tbody > tr > td::before { content: attr(data-label); display: block; margin-bottom: 5px; color: var(--muted-foreground); font-size: 12px; line-height: 18px; }
 }
 
 @media (min-width: 900px) {
@@ -63,3 +63,7 @@
 /* 错误只作列表摘要，完整内容进入独立日志页阅读。 */
 .call-error-summary { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; overflow-wrap: anywhere; margin-top: 5px; color: var(--destructive); font-size: 12px; line-height: 18px; }
 .call-log-link { display: inline-flex; align-items: center; justify-content: center; min-height: 44px; font-size: 12px; color: var(--primary); text-decoration: underline; text-underline-offset: 3px; }
+
+/* 列表展开行与独立日志页共享计费明细的换行边界，不裁掉长数值。 */
+.charge-check { overflow-wrap: anywhere; }
+.charge-check .charge-quantities-table :is(th, td) { white-space: normal; overflow-wrap: anywhere; }
