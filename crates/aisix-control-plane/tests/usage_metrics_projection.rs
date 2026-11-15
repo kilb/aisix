@@ -502,15 +502,34 @@ async fn all_metrics_scopes_keep_complete_responses_for_missing_and_poisoned_unk
     let member = w.cp.member_login_seeded(w.tenant, MemberRole::Member).await;
     let member_key = seed_key(&w.cp, &w.admin, w.tenant, Some(member.id)).await;
     let outside = seed_tenant(&w.cp, &w.admin).await;
-    let outside_key = seed_key(&w.cp, &w.admin, outside, None).await;
+    let outside_member = w.cp.seed_member(outside, MemberRole::Member).await.id;
+    let outside_key = seed_key(&w.cp, &w.admin, outside, Some(outside_member)).await;
     let from = Utc::now() - TimeDelta::minutes(1);
     let to = Utc::now() + TimeDelta::minutes(1);
     let mut events = Vec::new();
-    for (index, (id, key, final_attempt)) in [
-        ("input-api-success", w.key.as_str(), true),
-        ("input-api-retry", w.key.as_str(), false),
-        ("input-api-member", member_key.as_str(), true),
-        ("input-api-foreign", outside_key.as_str(), true),
+    for (index, (id, key, final_attempt, tenant, user)) in [
+        (
+            "input-api-success",
+            w.key.as_str(),
+            true,
+            w.tenant,
+            w.member,
+        ),
+        ("input-api-retry", w.key.as_str(), false, w.tenant, w.member),
+        (
+            "input-api-member",
+            member_key.as_str(),
+            true,
+            w.tenant,
+            member.id,
+        ),
+        (
+            "input-api-foreign",
+            outside_key.as_str(),
+            true,
+            outside,
+            outside_member,
+        ),
     ]
     .into_iter()
     .enumerate()
@@ -518,6 +537,8 @@ async fn all_metrics_scopes_keep_complete_responses_for_missing_and_poisoned_unk
         let mut event = usage(&w, id, model, tokens_680());
         for (key, value) in [
             ("api_key_id", json!(key)),
+            ("team_id", json!(tenant)),
+            ("user_id", json!(user)),
             ("model_id", json!(model)),
             ("provider_key_id", json!(provider)),
             ("is_final_attempt", json!(final_attempt)),
@@ -544,6 +565,14 @@ async fn all_metrics_scopes_keep_complete_responses_for_missing_and_poisoned_unk
         delivered.body,
         json!({"accepted":4,"rejected":0,"duplicates":0})
     );
+    for id in [
+        "input-api-success",
+        "input-api-retry",
+        "input-api-member",
+        "input-api-foreign",
+    ] {
+        assert_bill(&w.cp, id, 680).await;
+    }
     adjustment(&w, "input-api-success", 7).await;
     adjustment(&w, "input-api-success", 11).await;
     let range = format!(

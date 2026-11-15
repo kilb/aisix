@@ -149,13 +149,57 @@ fn assert_missing_model(status: StatusCode, envelope: &Value, path: &str) {
     );
 }
 
+fn is_ga_credential_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/v1/realtime/client_secrets" | "/v1/realtime/translations/client_secrets"
+    )
+}
+
+// 原生凭据的未知目标返回通用资源 404；真实归属及 provider 正控由局部 fixture 持有。
+async fn assert_ga_missing_native_resource(
+    fixture: &NativeDecodeFixture,
+    status: StatusCode,
+    envelope: &Value,
+    path: &str,
+) -> TestResult {
+    assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {envelope}");
+    assert_eq!(
+        envelope["error"]["type"].as_str(),
+        Some("resource_not_found"),
+        "{path}: {envelope}"
+    );
+    assert_eq!(
+        envelope["error"]["message"].as_str(),
+        Some("resource \"native object\" not found"),
+        "{path}: {envelope}"
+    );
+    assert_eq!(
+        fixture
+            .provider
+            .received_requests()
+            .await
+            .ok_or("provider request recording is disabled")?
+            .len(),
+        1,
+        "{path}: unknown native target reached the provider"
+    );
+    Ok(())
+}
+
 // 任一接口遗漏共享解码层都会在压缩分支返回解析错误，而不是明确的 404。
 #[tokio::test]
 async fn request_decode_json_and_bytes_families_reach_model_resolution() -> TestResult {
     let app = admitted_router()?;
+    let native = NativeDecodeFixture::new(1_048_576).await?;
     for case in JSON_CASES {
+        let case_app = if is_ga_credential_path(case.path) {
+            native.app.clone()
+        } else {
+            app.clone()
+        };
         for (label, body, zstd) in [("plain", case.plain, false), ("zstd", case.encoded, true)] {
-            let response = app
+            let response = case_app
                 .clone()
                 .oneshot(body_request(
                     case.path,
@@ -165,7 +209,17 @@ async fn request_decode_json_and_bytes_families_reach_model_resolution() -> Test
                 ))
                 .await?;
             let (status, envelope) = response_json(response).await?;
-            assert_missing_model(status, &envelope, &format!("{} ({label})", case.path));
+            if is_ga_credential_path(case.path) {
+                assert_ga_missing_native_resource(
+                    &native,
+                    status,
+                    &envelope,
+                    &format!("{} ({label})", case.path),
+                )
+                .await?;
+            } else {
+                assert_missing_model(status, &envelope, &format!("{} ({label})", case.path));
+            }
         }
     }
     Ok(())
@@ -271,9 +325,15 @@ async fn request_decode_json_families_allow_trailing_whitespace() -> TestResult 
     let state = admitted_state(1_048_576)?;
     let metrics = state.metrics.clone();
     let app = crate::build_router(state);
+    let native = NativeDecodeFixture::new(1_048_576).await?;
     for case in JSON_CASES {
+        let case_app = if is_ga_credential_path(case.path) {
+            native.app.clone()
+        } else {
+            app.clone()
+        };
         let entity = [case.plain, b" \t\r\n ".as_slice()].concat();
-        let response = app
+        let response = case_app
             .clone()
             .oneshot(body_request(
                 case.path,
@@ -283,7 +343,11 @@ async fn request_decode_json_families_allow_trailing_whitespace() -> TestResult 
             ))
             .await?;
         let (status, envelope) = response_json(response).await?;
-        assert_missing_model(status, &envelope, case.path);
+        if is_ga_credential_path(case.path) {
+            assert_ga_missing_native_resource(&native, status, &envelope, case.path).await?;
+        } else {
+            assert_missing_model(status, &envelope, case.path);
+        }
         assert_no_json_upstream_dispatch(&metrics, case.path)?;
     }
     Ok(())

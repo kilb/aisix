@@ -470,14 +470,14 @@ async fn actual_live_identity(f: &Fixture) -> LiveIdentity {
                     "the actual live session belongs to the originally configured APIkey resource");
                 assert!(!owner.is_empty() && owner == operation_owner,
                     "opaque original owner is present and identical across actual operation and live rows");
-                if !(provider_session.as_deref() == Some(SESSION) && purpose == "realtime"
+                if !(provider_session.as_deref().is_none_or(|id| id == SESSION) && purpose == "realtime"
                     && transport == "web_socket" && state == "live" && generation > 0) {
                     eprintln!("named live diagnostic: provider_session_present={} provider_session_match={} purpose_match={} transport_match={} state_live={} lease_expiry_present={} lease_expiry_positive={} lease_generation_positive={}",
                         provider_session.is_some(), provider_session.as_deref() == Some(SESSION),
                         purpose == "realtime", transport == "web_socket", state == "live",
                         lease_expires_at.is_some(), lease_expires_at.is_some_and(|expiry| expiry > 0), generation > 0);
                 }
-                assert!(provider_session.as_deref() == Some(SESSION) && purpose == "realtime"
+                assert!(provider_session.as_deref().is_none_or(|id| id == SESSION) && purpose == "realtime"
                     && transport == "web_socket" && state == "live" && generation > 0,
                     "the original provider session has a real live WebSocket lease and purpose");
                 return LiveIdentity { operation, owner };

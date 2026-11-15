@@ -2171,7 +2171,7 @@ async fn a_completed_batch_result_file_survives_its_deleted_input_file_ancestor(
     let mut batch_body = body.clone();
     batch_body["operation_id"] = json!(Uuid::new_v4());
     batch_body["kind"] = json!("message_batch");
-    batch_body["operation"] = json!("batches");
+    batch_body["operation"] = json!("batch_completion");
     batch_body["asynchronous"] = json!(true);
     batch_body["input_file_id"] = json!("file_onehop_input_v1");
     batch_body["parent_id"] = json!(input_id);

@@ -770,7 +770,7 @@ async fn primary_positive(f: &Fixture, gateway: &Gateway) -> (Socket, Value, Vec
     assert!(
         initial.get("type") == Some(&json!("session.created"))
             && initial.pointer("/session/id") == Some(&json!(SESSION))
-            && initial.pointer("/session/model") == Some(&json!("gpt-realtime")),
+            && initial.pointer("/session/model") == Some(&json!(A)),
         "真实原 provider session/main 模型正控成立"
     );
     f.provider.assert_handshake();
