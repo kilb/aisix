@@ -214,6 +214,11 @@ pub(crate) struct CancelContext {
     /// forward-proxied upstream normalizes to the CHAT surface. The row
     /// would then be filed as an abandoned chat call with no model.
     pub surface: Option<crate::operation::Surface>,
+    /// 原生请求的阶段和已登记操作由共享生命周期入口发布，取消时仍保持不计费管理语义。
+    pub inference_stage: Option<aisix_core::native_objects::InferenceStage>,
+    pub native_operation_id: Option<uuid::Uuid>,
+    /// 当前交换已交给真实 HTTP 发送入口；每次 attempt 的 tap 独立保存。
+    pub http_dispatched: bool,
     /// Set by a route that files no usage row at ANY outcome but shares a
     /// normalized endpoint label with a metering sibling — the A2A agent
     /// card, which normalizes to `/a2a` like the calls do. The guard has
@@ -1137,6 +1142,7 @@ impl RequestAttribution {
     pub(crate) fn take_cancel_context(&self) -> CancelContext {
         let mut cell = self.lock();
         let mut ctx = std::mem::take(&mut cell.cancel);
+        ctx.http_dispatched = self.response_tap.http_dispatched();
         // 当前重试的 capture 尚未结算；取消先按其 index 保存，不能借用前次 settled 标志。
         if let Some(attempt) = ctx.in_flight.as_ref() {
             let response = self.response_tap.take();
@@ -1575,6 +1581,17 @@ pub(crate) fn note_authenticated(auth: &crate::auth::AuthenticatedKey) {
 /// the routes that need it are named.
 pub(crate) fn note_unmetered_route() {
     with_cancel(|c| c.unmetered = true);
+}
+
+/// 发布或清除原生生命周期上下文；普通旧适配器不继承先前尝试的受理身份。
+pub(crate) fn note_native_context(
+    stage: Option<aisix_core::native_objects::InferenceStage>,
+    operation_id: Option<uuid::Uuid>,
+) {
+    with_cancel(|c| {
+        c.inference_stage = stage;
+        c.native_operation_id = operation_id;
+    });
 }
 
 /// Note the passthrough route this request matched, for the row a cancelled

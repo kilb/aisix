@@ -248,18 +248,11 @@ pub(crate) fn emit(
             kind: a.kind,
             target_model: a.target_model.as_str(),
             model_id: a.model_id.as_str(),
-            // `begin_attempt` publishes an attempt BEFORE the target's own
-            // rate-limit reservation and before the bridge assembles the
-            // request, so an attempt in flight has not necessarily reached
-            // a provider — `AttemptRecord::dispatched` records exactly that
-            // case as false. Claiming it would make `emit_usage` fabricate
-            // an upstream span for a call nobody made, and there is no
-            // latency to report that would mean what an attempt's normally
-            // means. One that has ANSWERED, and was being processed inside
-            // the attempt when the caller left, did reach it, and took the
-            // time it took to answer. So did one some of whose upstream
-            // calls answered, for as long as it ran.
-            dispatched: a.answered.is_some() || a.served_input_tokens.is_some(),
+            // 解析和限流预留不代表发送；真实 HTTP 入口记录的事实在尚无响应时也成立。
+            // 已回答或部分已服务的非 HTTP 调用保留原来的派发判断。
+            dispatched: ctx.http_dispatched
+                || a.answered.is_some()
+                || a.served_input_tokens.is_some(),
             latency_ms: match (&a.answered, a.served_input_tokens) {
                 (Some(answered), _) => answered.latency_ms,
                 (None, Some(_)) => crate::attempt::measured_ms(a.started.elapsed()),
@@ -348,7 +341,7 @@ pub(crate) fn emit(
             0,
         );
     }
-    let dispatched = attempt.as_ref().is_some_and(|a| a.dispatched);
+    let dispatched = ctx.http_dispatched || attempt.as_ref().is_some_and(|a| a.dispatched);
     emit_one(
         state,
         &snap,
@@ -413,6 +406,8 @@ fn base_event(
         requested_model: resolved.requested_model.clone(),
         requested_model_id: resolved.requested_model_id.clone(),
         inbound_protocol: inbound_protocol.to_string(),
+        inference_stage: ctx.inference_stage,
+        native_operation_id: ctx.native_operation_id,
         provider_kind: crate::chat::sanitize_tag(
             tags.kind.map(|k| k.as_str().to_owned()).unwrap_or_default(),
         ),
@@ -555,6 +550,156 @@ fn emit_token_metrics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 真实 HTTP 组件验证：覆盖共享发送入口，不代替各协议的路由或权威端到端验收。
+    #[tokio::test]
+    async fn cancelled_active_management_http_send_is_dispatched_before_any_response() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for (surface, endpoint, protocol) in [
+            (
+                crate::operation::FILES,
+                "/v1/files/:id",
+                aisix_gateway::upstream_io::Protocol::Unknown,
+            ),
+            (
+                crate::operation::BATCHES,
+                "/v1/batches/:id",
+                aisix_gateway::upstream_io::Protocol::Messages,
+            ),
+            (
+                crate::operation::CONVERSATIONS,
+                "/v1/conversations/:id",
+                aisix_gateway::upstream_io::Protocol::Responses,
+            ),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let seen = std::sync::Arc::new(tokio::sync::Notify::new());
+            let release = std::sync::Arc::new(tokio::sync::Notify::new());
+            let (server_seen, server_release) = (seen.clone(), release.clone());
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut head = Vec::new();
+                let mut byte = [0];
+                while !head.ends_with(b"\r\n\r\n") {
+                    assert!(head.len() < 8192);
+                    socket.read_exact(&mut byte).await.unwrap();
+                    head.push(byte[0]);
+                }
+                assert!(head.starts_with(b"DELETE /owned-object HTTP/1.1\r\n"));
+                server_seen.notify_one();
+                server_release.notified().await;
+                let _ = socket.shutdown().await;
+            });
+            let config = serde_json::from_value(serde_json::json!({"addr":"127.0.0.1:0"})).unwrap();
+            let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+            let state = ProxyState::new(
+                aisix_core::snapshot::SnapshotHandle::new(aisix_core::AisixSnapshot::new()),
+                std::sync::Arc::new(aisix_gateway::Hub::new()),
+                &config,
+            )
+            .with_usage_sink(aisix_obs::UsageSink::new(tx));
+            let cell = std::sync::Arc::new(crate::attribution::RequestAttribution::default());
+            crate::attribution::scope(cell.clone(), async {
+                crate::attribution::with_cancel_for_test(|ctx| {
+                    ctx.api_key_id = "key".into();
+                    ctx.client = Some(ClientContext::default());
+                    ctx.surface = Some(surface);
+                    ctx.inference_stage = Some(aisix_core::native_objects::InferenceStage::Management);
+                });
+                let request = aisix_gateway::upstream_io::send(
+                    reqwest::Client::new().delete(format!("http://{address}/owned-object")),
+                    protocol,
+                );
+                tokio::pin!(request);
+                tokio::select! {
+                    result = &mut request => panic!("provider must hold its response: {result:?}"),
+                    result = tokio::time::timeout(std::time::Duration::from_secs(5), seen.notified()) => result.expect("provider must receive the HTTP request before cancellation")
+                }
+            }).await;
+            emit(
+                &state,
+                endpoint,
+                "cancelled-http",
+                &Resolved::default(),
+                cell.take_cancel_context(),
+                Phase::BeforeHead,
+                None,
+            );
+            let event = rx.try_recv().unwrap();
+            assert_eq!(event.status_code, 499);
+            assert_eq!(
+                event.inference_stage,
+                Some(aisix_core::native_objects::InferenceStage::Management)
+            );
+            assert_eq!(event.upstream_dispatched, Some(true), "{endpoint}");
+            assert_eq!((event.prompt_tokens, event.completion_tokens), (0, 0));
+            assert!(rx.try_recv().is_err());
+            release.notify_one();
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn active_management_without_http_send_is_not_dispatched() {
+        let config = serde_json::from_value(serde_json::json!({"addr":"127.0.0.1:0"})).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let state = ProxyState::new(
+            aisix_core::snapshot::SnapshotHandle::new(aisix_core::AisixSnapshot::new()),
+            std::sync::Arc::new(aisix_gateway::Hub::new()),
+            &config,
+        )
+        .with_usage_sink(aisix_obs::UsageSink::new(tx));
+        for no_http_kind in 0..4 {
+            let cell = std::sync::Arc::new(crate::attribution::RequestAttribution::default());
+            crate::attribution::scope(cell.clone(), async {
+                crate::attribution::with_cancel_for_test(|ctx| {
+                    ctx.api_key_id = "key".into();
+                    ctx.client = Some(ClientContext::default());
+                    ctx.entry_model_id = "resolved-model".into();
+                    ctx.surface = Some(crate::operation::FILES);
+                    ctx.inference_stage =
+                        Some(aisix_core::native_objects::InferenceStage::Accepted);
+                    ctx.native_operation_id = Some(uuid::Uuid::new_v4());
+                });
+                if no_http_kind == 1 {
+                    let result = aisix_gateway::upstream_io::send(
+                        reqwest::Client::new().post("not a valid URL"),
+                        aisix_gateway::upstream_io::Protocol::Unknown,
+                    )
+                    .await;
+                    assert!(result.is_err());
+                } else if no_http_kind == 2 {
+                    let _observer = aisix_gateway::upstream_io::UpstreamIoObserver::observed(
+                        aisix_gateway::upstream_io::Protocol::Unknown,
+                    );
+                } else if no_http_kind == 3 {
+                    let _observer = aisix_gateway::upstream_io::UpstreamIoObserver::websocket(
+                        aisix_gateway::upstream_io::Protocol::Realtime,
+                    );
+                }
+            })
+            .await;
+            emit(
+                &state,
+                "/v1/files",
+                "without-http",
+                &Resolved::default(),
+                cell.take_cancel_context(),
+                Phase::BeforeHead,
+                None,
+            );
+            let event = rx.try_recv().unwrap();
+            assert_eq!(event.upstream_dispatched, Some(false));
+            assert_eq!(
+                event.inference_stage,
+                Some(aisix_core::native_objects::InferenceStage::Accepted)
+            );
+            assert!(event.native_operation_id.is_some());
+            assert!(rx.try_recv().is_err());
+        }
+    }
 
     #[tokio::test]
     async fn cancelled_active_retry_preserves_its_priced_capture_after_a_failed_attempt() {

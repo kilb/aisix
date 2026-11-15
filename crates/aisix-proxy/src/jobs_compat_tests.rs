@@ -671,3 +671,132 @@ mod compat_tests {
         assert!(events.try_recv().is_err());
     }
 }
+
+async fn legacy_bodyless_request_obeys_custom_input_guard(
+    verb: &'static str,
+    route: &'static str,
+    upstream_path: &'static str,
+    answer: Value,
+) {
+    let upstream = MockServer::start().await;
+    Mock::given(wm_method(verb))
+        .and(path(upstream_path))
+        .respond_with(ResponseTemplate::new(200).set_body_json(answer))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let app = |blocked: bool| {
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
+        snap.models.insert(model("m-a", "jobs-a", PK_A));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        if blocked {
+            let guardrail: aisix_core::Guardrail = serde_json::from_value(serde_json::json!({
+                "name":"legacy-bodyless-input-block","enabled":true,"kind":"custom",
+                "hook_point":"input","fail_open":false,"timeout_ms":5000,
+                "script":"export function checkInput() { return { action: 'block', reason_code: 'blocked' }; }"
+            })).unwrap();
+            crate::seed_env_scoped_guardrail(
+                &snap,
+                ResourceEntry::new("legacy-bodyless-input-block", guardrail, 1),
+            );
+        }
+        build_app(snap)
+    };
+    let request = || {
+        Request::builder()
+            .method(verb)
+            .uri(route)
+            .header("authorization", "Bearer sk-caller")
+            .body(axum::body::Body::empty())
+            .unwrap()
+    };
+    let positive = app(false).oneshot(request()).await.unwrap();
+    assert_eq!(
+        positive.status(),
+        StatusCode::OK,
+        "healthy legacy request: {verb} {route}"
+    );
+    let _ = to_bytes(positive.into_body(), 65536).await.unwrap();
+    let before = upstream.received_requests().await.unwrap().len();
+    assert_eq!(
+        before, 1,
+        "positive must reach the real HTTP component provider"
+    );
+    let blocked = app(true).oneshot(request()).await.unwrap();
+    assert_eq!(
+        blocked.status(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "bodyless custom input block: {verb} {route}"
+    );
+    let value: Value =
+        serde_json::from_slice(&to_bytes(blocked.into_body(), 65536).await.unwrap()).unwrap();
+    assert_eq!(
+        value["error"].get("type"),
+        Some(&serde_json::json!("content_filter"))
+    );
+    assert_eq!(
+        upstream.received_requests().await.unwrap().len(),
+        before,
+        "a block must prevent dispatch: {verb} {route}"
+    );
+}
+
+macro_rules! legacy_bodyless_input_case {
+    ($name:ident, $verb:expr, $route:expr, $upstream:expr, $answer:expr) => {
+        #[tokio::test]
+        async fn $name() {
+            legacy_bodyless_request_obeys_custom_input_guard($verb, $route, $upstream, $answer)
+                .await;
+        }
+    };
+}
+legacy_bodyless_input_case!(
+    legacy_bodyless_files_list_consults_input,
+    "GET",
+    "/v1/files?model=jobs-a",
+    "/v1/files",
+    serde_json::json!({"object":"list","data":[],"has_more":false})
+);
+legacy_bodyless_input_case!(
+    legacy_bodyless_file_get_consults_input,
+    "GET",
+    "/v1/files/file-1?model=jobs-a",
+    "/v1/files/file-1",
+    serde_json::json!({"id":"file-1","object":"file"})
+);
+legacy_bodyless_input_case!(
+    legacy_bodyless_file_content_consults_input,
+    "GET",
+    "/v1/files/file-1/content?model=jobs-a",
+    "/v1/files/file-1/content",
+    serde_json::json!({"text":"stored content"})
+);
+legacy_bodyless_input_case!(
+    legacy_bodyless_file_delete_consults_input,
+    "DELETE",
+    "/v1/files/file-1?model=jobs-a",
+    "/v1/files/file-1",
+    serde_json::json!({"id":"file-1","deleted":true})
+);
+legacy_bodyless_input_case!(
+    legacy_bodyless_batches_list_consults_input,
+    "GET",
+    "/v1/batches?model=jobs-a",
+    "/v1/batches",
+    serde_json::json!({"object":"list","data":[],"has_more":false})
+);
+legacy_bodyless_input_case!(
+    legacy_bodyless_batch_get_consults_input,
+    "GET",
+    "/v1/batches/batch-1?model=jobs-a",
+    "/v1/batches/batch-1",
+    serde_json::json!({"id":"batch-1","object":"batch","status":"in_progress"})
+);
+legacy_bodyless_input_case!(
+    legacy_bodyless_batch_cancel_consults_input,
+    "POST",
+    "/v1/batches/batch-1/cancel?model=jobs-a",
+    "/v1/batches/batch-1/cancel",
+    serde_json::json!({"id":"batch-1","object":"batch","status":"cancelling"})
+);

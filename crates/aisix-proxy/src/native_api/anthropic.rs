@@ -1383,9 +1383,14 @@ impl Audit {
     pub(crate) fn registered_operation(&mut self, operation_id: Uuid, stage: InferenceStage) {
         self.operation_id = Some(operation_id);
         self.stage = Some(stage);
+        crate::attribution::note_native_context(Some(stage), Some(operation_id));
     }
     pub(crate) fn resolved(&mut self, target: &JobTarget) {
         self.target = Some(target.clone());
+        crate::attribution::note_native_context(
+            Some(self.stage.unwrap_or(InferenceStage::Management)),
+            self.operation_id,
+        );
     }
 
     pub(crate) async fn input(
@@ -1397,7 +1402,7 @@ impl Audit {
         blob: &[u8],
         mask: bool,
     ) -> Result<Option<Vec<u8>>, ProxyError> {
-        self.target = Some(target.clone());
+        self.resolved(target);
         crate::jobs::scan_input_blob(
             state,
             snapshot,
@@ -1420,7 +1425,7 @@ impl Audit {
         target: &JobTarget,
         blob: &[u8],
     ) -> Result<(), ProxyError> {
-        self.target = Some(target.clone());
+        self.resolved(target);
         crate::jobs::scan_output_blob(
             state,
             auth,

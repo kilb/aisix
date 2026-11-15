@@ -97,6 +97,8 @@ pub struct UpstreamResponseCapture {
     pub stream_usage: Option<StreamUsageObserver>,
     /// 真实上游交换的长度观察；与正文导出开关无关。
     pub io: Option<crate::upstream_io::UpstreamIoObserver>,
+    /// 仅实际 HTTP 发送入口置位；观察者、目标解析和操作登记均不代表发送。
+    pub http_dispatched: bool,
 }
 
 impl UpstreamResponseCapture {
@@ -106,6 +108,7 @@ impl UpstreamResponseCapture {
             && self.error_body.is_none()
             && self.stream_usage.is_none()
             && self.io.is_none()
+            && !self.http_dispatched
     }
 }
 
@@ -222,6 +225,10 @@ impl ResponseHeaderTap {
         self.lock().io.clone()
     }
 
+    pub fn http_dispatched(&self) -> bool {
+        self.lock().http_dispatched
+    }
+
     pub fn stream_usage_observer(&self) -> Option<StreamUsageObserver> {
         self.lock().stream_usage.clone()
     }
@@ -269,6 +276,11 @@ pub(crate) fn note_upstream_io(observer: &crate::upstream_io::UpstreamIoObserver
             current.io = Some(crate::upstream_io::UpstreamIoObserver::aggregate(observer));
         }
     });
+}
+
+/// 仅在已构建请求交给 HTTP client 或 SDK 进入传输时调用；内部控制面和鉴权请求不调用。
+pub fn note_http_dispatch() {
+    let _ = TAP.try_with(|tap| tap.lock().http_dispatched = true);
 }
 
 /// Install `tap` for everything `fut` does.
@@ -444,6 +456,30 @@ pub fn wants_upstream_error_body() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn http_dispatch_survives_headers_and_is_reset_with_each_capture() {
+        let tap = Arc::new(ResponseHeaderTap::default());
+        scope(tap.clone(), async {
+            assert!(!tap.http_dispatched());
+            note_http_dispatch();
+            assert!(!tap.capture().is_empty(), "只有发送事实也必须保存 capture");
+            note_upstream_response(&http::HeaderMap::new());
+            assert!(tap.http_dispatched(), "响应头不能清掉已经发生的发送");
+            let first = tap.take();
+            assert!(first.http_dispatched);
+            assert!(!tap.http_dispatched(), "新 attempt 不能继承旧发送");
+            assert!(tap.take().is_empty());
+            let _observer = crate::upstream_io::UpstreamIoObserver::observed(
+                crate::upstream_io::Protocol::Unknown,
+            );
+            assert!(!tap.http_dispatched(), "创建观察器不代表发送 HTTP");
+            let child = detached();
+            assert!(!child.http_dispatched());
+            assert!(first.http_dispatched, "旧 capture 保持不可变事实");
+        })
+        .await;
+    }
 
     #[tokio::test]
     async fn stream_usage_stays_with_its_capture_across_take_and_detached_attempts() {

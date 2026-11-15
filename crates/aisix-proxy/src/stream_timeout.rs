@@ -789,3 +789,99 @@ mod upstream_io_tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod physical_dispatch_boundary_tests {
+    use super::*;
+    use aisix_gateway::response_tap::{scope, ResponseHeaderTap};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // 发送事实与模型 IO 审计正交；下载未收到响应头即取消，也不能抹掉真实 GET。
+    #[tokio::test]
+    async fn unobserved_download_records_physical_http_without_model_io_before_response() {
+        for deadline in [None, Some(Duration::from_secs(10))] {
+            let rejected = Arc::new(ResponseHeaderTap::default());
+            assert!(!rejected.http_dispatched());
+            assert!(rejected.upstream_io_observer().is_none());
+            let invalid = scope(
+                rejected.clone(),
+                send_with_deadline(
+                    reqwest::Client::new().get("not a valid HTTP URL"),
+                    deadline,
+                    Instant::now(),
+                ),
+            )
+            .await;
+            assert!(
+                invalid.is_err(),
+                "invalid builder fails before transmission"
+            );
+            assert!(
+                !rejected.http_dispatched(),
+                "failed construction is not HTTP dispatch"
+            );
+            assert!(rejected.upstream_io_observer().is_none());
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let seen = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let (server_seen, server_release) = (seen.clone(), release.clone());
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut head = Vec::new();
+                let mut byte = [0];
+                while !head.ends_with(b"\r\n\r\n") {
+                    assert!(head.len() < 8192);
+                    socket.read_exact(&mut byte).await.unwrap();
+                    head.push(byte[0]);
+                }
+                assert!(head.starts_with(b"GET /owned-content HTTP/1.1\r\n"));
+                server_seen.notify_one();
+                server_release.notified().await;
+                let _ = socket.shutdown().await;
+            });
+            struct ProviderTask(tokio::task::JoinHandle<()>);
+            impl Drop for ProviderTask {
+                fn drop(&mut self) {
+                    self.0.abort();
+                }
+            }
+            let mut server = ProviderTask(server);
+            let tap = Arc::new(ResponseHeaderTap::default());
+            {
+                let sending = scope(
+                    tap.clone(),
+                    send_with_deadline(
+                        reqwest::Client::new().get(format!("http://{address}/owned-content")),
+                        deadline,
+                        Instant::now(),
+                    ),
+                );
+                tokio::pin!(sending);
+                tokio::select! {
+                    result = &mut sending => panic!("provider withholds every response byte: {result:?}"),
+                    result = tokio::time::timeout(Duration::from_secs(5), seen.notified()) => {
+                        result.expect("local provider receives GET before the client future is dropped");
+                    }
+                }
+                // 离开作用域会丢弃仍等待响应的正式发送 future。
+            }
+            assert!(
+                tap.http_dispatched(),
+                "received GET remains dispatched before any response header"
+            );
+            assert!(tap.capture().http_dispatched);
+            assert!(
+                tap.upstream_io_observer().is_none(),
+                "download cannot manufacture a model IO exchange"
+            );
+            assert!(tap.capture().io.is_none());
+            release.notify_one();
+            tokio::time::timeout(Duration::from_secs(5), &mut server.0)
+                .await
+                .expect("held local provider finishes after release")
+                .expect("local provider task completes without panic");
+        }
+    }
+}

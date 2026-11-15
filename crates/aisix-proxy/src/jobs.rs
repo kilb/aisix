@@ -2354,6 +2354,20 @@ pub(crate) async fn get_batch(
             )),
         )
         .await?;
+        scan_input_blob(
+            &state,
+            &snapshot,
+            &auth,
+            &target,
+            &[],
+            &mut monitor_hits,
+            &mut enforced_hits,
+            &mut scores,
+            &mut bypass,
+            &mut applied,
+            None,
+        )
+        .await?;
         crate::budget::gate(&state, &snapshot).check_provider_key(&target.pk_entry.id)?;
 
         let url = upstream_url(&target, &format!("/batches/{raw}"), "")?;
@@ -2854,22 +2868,21 @@ async fn forward_simple(
 
         let early_reservation =
             reserve_before_costly_scan(&state, &snapshot, &auth, &target).await?;
-        if let Some(body) = &spec.body {
-            scan_input_blob(
-                &state,
-                &snapshot,
-                &auth,
-                &target,
-                body,
-                &mut monitor_hits,
-                &mut enforced_hits,
-                &mut scores,
-                &mut bypass,
-                &mut applied,
-                None,
-            )
-            .await?;
-        }
+        // 没有正文也要咨询输入链；自定义规则的决定可以独立于文本。
+        scan_input_blob(
+            &state,
+            &snapshot,
+            &auth,
+            &target,
+            spec.body.as_deref().unwrap_or_default(),
+            &mut monitor_hits,
+            &mut enforced_hits,
+            &mut scores,
+            &mut bypass,
+            &mut applied,
+            None,
+        )
+        .await?;
         let _reservation = match early_reservation {
             Some(reservation) => reservation,
             None => reserve_target(&state, &snapshot, &auth, &target).await?,

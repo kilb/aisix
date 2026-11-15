@@ -1062,6 +1062,7 @@ pub async fn send(
         observer.begin_request_body();
         observer.finish_request();
     }
+    crate::response_tap::note_http_dispatch();
     let response = client.execute(request).await?;
     Ok(wrap_response(response, observer))
 }

@@ -153,19 +153,27 @@ pub(crate) const POSTURE: &[(&str, Posture)] = &[
     ),
     (
         "/v1/files/:id",
-        Posture::NoUpstreamContent("GET/DELETE by id; carries no caller text"),
+        Posture::EnforcedNotDrivableInCrate(
+            "jobs::tests::legacy_bodyless_* 先验证合法旧路线真实 HTTP，再逐方法验证无文本输入阻断且不派发；原生归属由各 family 合同覆盖。",
+        ),
     ),
     (
         "/v1/files/:id/content",
-        Posture::NoUpstreamContent("downloads by id; carries no caller text"),
+        Posture::EnforcedNotDrivableInCrate(
+            "jobs::tests::legacy_bodyless_* 先验证合法旧路线真实 HTTP，再逐方法验证无文本输入阻断且不派发；原生归属由各 family 合同覆盖。",
+        ),
     ),
     (
         "/v1/batches/:id",
-        Posture::NoUpstreamContent("GET by id; carries no caller text"),
+        Posture::EnforcedNotDrivableInCrate(
+            "jobs::tests::legacy_bodyless_* 先验证合法旧路线真实 HTTP，再逐方法验证无文本输入阻断且不派发；原生归属由各 family 合同覆盖。",
+        ),
     ),
     (
         "/v1/batches/:id/cancel",
-        Posture::NoUpstreamContent("cancels by id; carries no caller text"),
+        Posture::EnforcedNotDrivableInCrate(
+            "jobs::tests::legacy_bodyless_* 先验证合法旧路线真实 HTTP，再逐方法验证无文本输入阻断且不派发；原生归属由各 family 合同覆盖。",
+        ),
     ),
     (
         "/v1/fine_tuning/jobs/:id",
