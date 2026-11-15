@@ -3,6 +3,8 @@
 use super::*;
 use crate::auth::{MemberRole, OperatorRole};
 use std::cell::Cell;
+use tracing::instrument::WithSubscriber as _;
+use tracing_subscriber::layer::SubscriberExt as _;
 
 #[path = "../../../tests/support/mod.rs"]
 mod support;
@@ -12,6 +14,7 @@ use support::{OperatorSession, TestCp};
 #[derive(Clone, Copy, Debug, Default)]
 struct Cost {
     resource_loads: usize,
+    resource_queries: usize,
     scalar_reads: usize,
     working_copies: usize,
     copied_entry_cells: usize,
@@ -30,12 +33,45 @@ pub(super) fn resource_load() {
     });
 }
 
-pub(super) fn scalar_read() {
-    let _ = COST.try_with(|slot| {
-        let mut cost = slot.get();
-        cost.scalar_reads += 1;
-        slot.set(cost);
-    });
+// 观察 SQLx 查询结束时的真实事件；恢复字段 SELECT 而不恢复手工 hook 也会变红。
+struct QueryCount;
+struct QueryFields {
+    resource: bool,
+    scalar: bool,
+}
+
+impl tracing::field::Visit for QueryFields {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "db.statement" {
+            self.resource = value.contains("FROM gw_resources");
+            self.scalar = self.resource && value.contains("SELECT doc ->>");
+        }
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "db.statement" {
+            self.record_str(field, &format!("{value:?}"));
+        }
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for QueryCount {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        if event.metadata().target() != "sqlx::query" {
+            return;
+        }
+        let mut fields = QueryFields {
+            resource: false,
+            scalar: false,
+        };
+        event.record(&mut fields);
+        let _ = COST.try_with(|slot| {
+            let mut cost = slot.get();
+            cost.resource_queries += usize::from(fields.resource);
+            cost.scalar_reads += usize::from(fields.scalar);
+            slot.set(cost);
+        });
+    }
 }
 
 pub(super) fn working_copy(body: &BeginRequest) {
@@ -186,7 +222,9 @@ impl Fixture {
         let (result, cost) = COST
             .scope(Cell::new(Cost::default()), async {
                 let result =
-                    begin_with_locked_parent(&mut tx, self.cp.state(), self.dp, body, None).await;
+                    begin_with_locked_parent(&mut tx, self.cp.state(), self.dp, body, None)
+                        .with_subscriber(tracing_subscriber::registry().with(QueryCount))
+                        .await;
                 (result, COST.with(Cell::get))
             })
             .await;
@@ -235,7 +273,12 @@ async fn bounded_cost(count: usize) {
     // 当前81a已把深复制清单压到一次；不能把已修复的N²当成本轮RED。
     assert!(cost.copied_entry_cells <= count);
     assert!(cost.copied_root_contexts <= 1);
+    assert!(cost.resource_queries > 0, "SQLx真实查询事件采集必须先生效");
     assert_eq!(cost.resource_loads, 1, "同一事务只预载一次完整授权资源");
+    assert_eq!(
+        cost.resource_queries, 1,
+        "真实SQL执行事件只允许一次资源查询"
+    );
     assert_eq!(cost.scalar_reads, 0, "已加载模型的三个字段不能再逐项SELECT");
     assert!(
         cost.working_copies <= 1,
