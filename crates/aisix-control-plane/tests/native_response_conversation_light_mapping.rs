@@ -561,7 +561,7 @@ async fn full_member_response_uses_requested_model_and_preserves_conversation_it
             "[ownership:accepted-model-b] {pointer}"
         );
     }
-    let children: Vec<(Uuid, Uuid, Uuid, Uuid)> = sqlx::query_as("SELECT id,parent_id,tenant_id,api_key_id FROM native_objects WHERE environment_id=$1 AND kind='conversation_item' AND raw_id=$2")
+    let children: Vec<(Uuid, Uuid, Uuid, Uuid)> = sqlx::query_as("SELECT n.id,m.parent_id,n.tenant_id,n.api_key_id FROM native_objects n JOIN native_object_memberships m ON m.environment_id=n.environment_id AND m.child_id=n.id WHERE n.environment_id=$1 AND n.kind='response_item' AND n.raw_id=$2 AND m.relation='conversation_item' AND m.deleted_at IS NULL")
         .bind(cp.env().env_id).bind(ITEM).fetch_all(cp.db().pool()).await.expect("[ownership:conversation-item] durable rows before first list");
     assert_eq!(children.len(), 1, "[ownership:conversation-item] formal conversation intent must bind I before a later list discovers it");
     assert_eq!(
@@ -617,7 +617,7 @@ async fn full_member_response_uses_requested_model_and_preserves_conversation_it
         );
     }
     assert_paid_once(&cp, tenant_id).await;
-    let child_replay: Vec<(Uuid, Uuid, Uuid, Uuid)> = sqlx::query_as("SELECT id,parent_id,tenant_id,api_key_id FROM native_objects WHERE environment_id=$1 AND kind='conversation_item' AND raw_id=$2")
+    let child_replay: Vec<(Uuid, Uuid, Uuid, Uuid)> = sqlx::query_as("SELECT n.id,m.parent_id,n.tenant_id,n.api_key_id FROM native_objects n JOIN native_object_memberships m ON m.environment_id=n.environment_id AND m.child_id=n.id WHERE n.environment_id=$1 AND n.kind='response_item' AND n.raw_id=$2 AND m.relation='conversation_item' AND m.deleted_at IS NULL")
         .bind(cp.env().env_id).bind(ITEM).fetch_all(cp.db().pool()).await.expect("[replay:durable-item] actual durable rows");
     assert_eq!(
         child_replay, children,
