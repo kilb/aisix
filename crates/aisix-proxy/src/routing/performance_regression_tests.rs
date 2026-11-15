@@ -152,6 +152,7 @@ fn alternating_filtered_hash_subsets_do_not_rebuild_warm_rings() {
 #[test]
 fn filtered_hash_stable_and_alternating_resolution_probe() {
     // 记录真实 resolver 的时间和分配；比较固定子集与交错子集，不能只报告后者的收益。
+    let by_id = std::env::var("AISIX_FILTERED_HASH_BENCH_BY_ID").as_deref() == Ok("1");
     let repetitions = std::env::var("AISIX_FILTERED_HASH_BENCH_REPS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -169,6 +170,10 @@ fn filtered_hash_stable_and_alternating_resolution_probe() {
                             fixture(count, RoutingStrategy::ConsistentHash, limit);
                         let routing = Arc::make_mut(&mut model).routing.as_mut().unwrap();
                         for (index, target) in routing.targets.iter_mut().enumerate() {
+                            if by_id {
+                                target.model.clear();
+                                target.model_id = Some(format!("id-{index}"));
+                            }
                             target.tags = Some(vec![
                                 if sparse && index >= 4 {
                                     "other"
@@ -228,6 +233,7 @@ fn filtered_hash_stable_and_alternating_resolution_probe() {
                             "{}",
                             json!({
                                 "case":"filtered_hash_resolution", "configured":count,
+                            "model_id_references":by_id,
                                 "survivors":survivors, "alternating":alternating,
                                 "weighted":weighted, "max_fallbacks":limit,
                                 "repetitions_per_sample":repetitions, "samples_ns_per_call":samples,
