@@ -53,6 +53,13 @@ async fn index_names(store: &StandaloneNativeStore) -> Vec<String> {
 }
 
 async fn plans(store: &StandaloneNativeStore) -> (Vec<String>, Vec<String>) {
+    let mut conn = store.pool.acquire().await.unwrap();
+    // 同连接先执行普通 schema 读取，校验外部 DDL 的 schema cookie，再重新编译观察计划。
+    let _: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_schema")
+        .persistent(false)
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
     let query = format!("EXPLAIN QUERY PLAN {CLAIM_SQL}");
     let claim = sqlx::query(&query)
         .persistent(false)
@@ -65,7 +72,7 @@ async fn plans(store: &StandaloneNativeStore) -> (Vec<String>, Vec<String>) {
         .bind("response")
         .bind("response")
         .bind(8)
-        .fetch_all(&store.pool)
+        .fetch_all(&mut *conn)
         .await
         .unwrap();
     let query = format!("EXPLAIN QUERY PLAN {DELIVERY_SQL}");
@@ -73,7 +80,7 @@ async fn plans(store: &StandaloneNativeStore) -> (Vec<String>, Vec<String>) {
         .persistent(false)
         .bind(now())
         .bind(16)
-        .fetch_all(&store.pool)
+        .fetch_all(&mut *conn)
         .await
         .unwrap();
     let details = |rows: Vec<sqlx::sqlite::SqliteRow>| {
