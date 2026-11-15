@@ -395,6 +395,11 @@ fn the_handler_list_matches_what_is_on_disk() {
              does not have).",
         ),
         (
+            "native_api/realtime_journal.rs",
+            "由 realtime.rs 驱动的 WS 会话准入、ASR 配额与用量助手；\
+             不发送供应商推理请求，也不构造 SDK 的 HTTP 响应或响应头。",
+        ),
+        (
             "request_metrics.rs",
             "resolves a name only to choose a metric label for a request that \
              already ended; it dispatches nothing and answers nothing.",
