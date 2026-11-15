@@ -1977,6 +1977,10 @@ pub(crate) async fn exported_for(
 
 #[cfg(test)]
 mod tests {
+    mod request_timing_tests {
+        use super::*;
+        include!("request_timing_tests.rs");
+    }
     mod ttft_capture_tests {
         use super::*;
         include!("ttft_capture_tests.rs");
