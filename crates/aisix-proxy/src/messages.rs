@@ -11689,3 +11689,7 @@ data: [DONE]\n\n";
         }
     }
 }
+
+#[cfg(test)]
+#[path = "messages_stream_observation_tests.rs"]
+mod stream_observation_tests;

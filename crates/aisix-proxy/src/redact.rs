@@ -4578,12 +4578,50 @@ fn read_sse_event(frame: &[u8]) -> SseEventRead {
     let data = if payload.is_empty() || sentinel {
         None
     } else {
+        #[cfg(test)]
+        sse_json_parse_counter::note_attempt();
         serde_json::from_slice::<Value>(payload).ok()
     };
     SseEventRead {
         malformed: !payload.is_empty() && !sentinel && data.is_none(),
         data,
         sentinel,
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod sse_json_parse_counter {
+    use std::cell::Cell;
+
+    thread_local! {
+        static ATTEMPTS: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    pub(crate) struct Scope;
+
+    impl Scope {
+        pub(crate) fn start() -> Self {
+            ATTEMPTS.with(|count| assert!(count.replace(Some(0)).is_none()));
+            Self
+        }
+
+        pub(crate) fn attempts(&self) -> usize {
+            ATTEMPTS.with(|count| count.get().unwrap())
+        }
+    }
+
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            ATTEMPTS.with(|count| count.set(None));
+        }
+    }
+
+    pub(super) fn note_attempt() {
+        ATTEMPTS.with(|count| {
+            if let Some(value) = count.get() {
+                count.set(Some(value + 1));
+            }
+        });
     }
 }
 
