@@ -458,11 +458,11 @@ struct LiveIdentity {
 async fn actual_live_identity(f: &Fixture) -> LiveIdentity {
     tokio::time::timeout(LIMIT, async {
         loop {
-            let rows: Vec<(String,String,String,Option<String>,String,String,String,String,i64)> = sqlx::query_as(
-                "SELECT s.operation_id,s.api_key_id,s.owner,s.provider_session_id,s.purpose,s.transport,s.state,o.owner,s.lease_generation FROM native_live_sessions s JOIN native_operations o ON o.operation_id=s.operation_id")
+            let rows: Vec<(String,String,String,Option<String>,String,String,String,String,i64,Option<i64>)> = sqlx::query_as(
+                "SELECT s.operation_id,s.api_key_id,s.owner,s.provider_session_id,s.purpose,s.transport,s.state,o.owner,s.lease_generation,s.lease_expires_at FROM native_live_sessions s JOIN native_operations o ON o.operation_id=s.operation_id")
                 .fetch_all(&f.reader).await.expect("observe the actual SQLite operation and live identity");
             assert!(rows.len() <= 1, "one actual raw-key WS creates one original local live operation");
-            if let Some((operation, key, owner, provider_session, purpose, transport, state, operation_owner, generation)) = rows.into_iter().next() {
+            if let Some((operation, key, owner, provider_session, purpose, transport, state, operation_owner, generation, lease_expires_at)) = rows.into_iter().next() {
                 let operation = Uuid::parse_str(&operation).expect("a real nonempty operation UUID");
                 assert!(!operation.is_nil(), "the admitted operation identity is nonnil");
                 let expected_key = stable_resource_id("apikeys", f.ids.key);
@@ -470,6 +470,13 @@ async fn actual_live_identity(f: &Fixture) -> LiveIdentity {
                     "the actual live session belongs to the originally configured APIkey resource");
                 assert!(!owner.is_empty() && owner == operation_owner,
                     "opaque original owner is present and identical across actual operation and live rows");
+                if !(provider_session.as_deref() == Some(SESSION) && purpose == "realtime"
+                    && transport == "web_socket" && state == "live" && generation > 0) {
+                    eprintln!("named live diagnostic: provider_session_present={} provider_session_match={} purpose_match={} transport_match={} state_live={} lease_expiry_present={} lease_expiry_positive={} lease_generation_positive={}",
+                        provider_session.is_some(), provider_session.as_deref() == Some(SESSION),
+                        purpose == "realtime", transport == "web_socket", state == "live",
+                        lease_expires_at.is_some(), lease_expires_at.is_some_and(|expiry| expiry > 0), generation > 0);
+                }
                 assert!(provider_session.as_deref() == Some(SESSION) && purpose == "realtime"
                     && transport == "web_socket" && state == "live" && generation > 0,
                     "the original provider session has a real live WebSocket lease and purpose");
