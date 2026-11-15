@@ -27,6 +27,7 @@ struct Registry {
     operations: Mutex<HashMap<Uuid, BeginRequest>>,
     records: Mutex<HashMap<(String, String, String), (Uuid, NativeRecord)>>,
     accepted: Mutex<Vec<BeginRelatedRequest>>,
+    deletions: Mutex<HashMap<Uuid, ObjectDeletionRequest>>,
     fail_bind: bool,
 }
 
@@ -43,6 +44,105 @@ impl NativeObjectRegistry for Registry {
     unavailable!(renew, LeaseRequest);
     unavailable!(reschedule, LeaseRequest);
     unavailable!(complete, CompleteRequest);
+
+    fn reserve_delete(
+        &self,
+        request: ObjectDeletionRequest,
+    ) -> BoxFuture<'_, Result<NativeReply, NativeRegistryError>> {
+        let result = (|| {
+            let records = self.records.lock().unwrap();
+            let (_, record) = records
+                .values()
+                .find(|(owner, record)| {
+                    *owner == request.api_key_id
+                        && record.record_id == request.record_id
+                        && !record.deleted
+                })
+                .ok_or(NativeRegistryError::NotFound)?;
+            if record.version != request.version {
+                return Err(NativeRegistryError::Conflict);
+            }
+            let mut deletions = self.deletions.lock().unwrap();
+            if deletions.get(&request.operation_id).is_some_and(|pending| {
+                pending.record_id != request.record_id
+                    || pending.api_key_id != request.api_key_id
+                    || pending.version != request.version
+            }) || deletions.values().any(|pending| {
+                pending.record_id == request.record_id
+                    && pending.operation_id != request.operation_id
+            }) {
+                return Err(NativeRegistryError::Conflict);
+            }
+            let mut reply = NativeReply::new("reserved");
+            reply.operation_id = Some(request.operation_id);
+            reply.record = Some(record.clone());
+            deletions.insert(request.operation_id, request);
+            Ok(reply)
+        })();
+        Box::pin(async move { result })
+    }
+
+    fn commit_delete(
+        &self,
+        request: ObjectDeletionRequest,
+    ) -> BoxFuture<'_, Result<NativeReply, NativeRegistryError>> {
+        let result = (|| {
+            let mut records = self.records.lock().unwrap();
+            let mut deletions = self.deletions.lock().unwrap();
+            let pending = deletions
+                .get(&request.operation_id)
+                .filter(|pending| {
+                    pending.api_key_id == request.api_key_id
+                        && pending.record_id == request.record_id
+                        && pending.version == request.version
+                })
+                .ok_or(NativeRegistryError::NotFound)?;
+            let (_, record) = records
+                .values_mut()
+                .find(|(owner, record)| {
+                    *owner == pending.api_key_id
+                        && record.record_id == pending.record_id
+                        && !record.deleted
+                })
+                .ok_or(NativeRegistryError::NotFound)?;
+            if record.version != pending.version {
+                return Err(NativeRegistryError::Conflict);
+            }
+            record.deleted = true;
+            record.version += 1;
+            let mut reply = NativeReply::new("deleted");
+            reply.operation_id = Some(request.operation_id);
+            reply.record = Some(record.clone());
+            deletions.remove(&request.operation_id);
+            Ok(reply)
+        })();
+        Box::pin(async move { result })
+    }
+
+    fn resolve_reservation(
+        &self,
+        request: ResolveReservationRequest,
+    ) -> BoxFuture<'_, Result<NativeReply, NativeRegistryError>> {
+        let mut deletions = self.deletions.lock().unwrap();
+        let found = deletions
+            .get(&request.operation_id)
+            .is_some_and(|pending| pending.api_key_id == request.api_key_id);
+        if found && request.upstream_rejected {
+            deletions.remove(&request.operation_id);
+        }
+        let reply = NativeReply::new(if request.upstream_rejected {
+            "rejected"
+        } else {
+            "uncertain"
+        });
+        Box::pin(async move {
+            if found {
+                Ok(reply)
+            } else {
+                Err(NativeRegistryError::NotFound)
+            }
+        })
+    }
 
     fn begin_related(
         &self,
