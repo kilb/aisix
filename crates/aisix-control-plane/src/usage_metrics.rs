@@ -221,22 +221,17 @@ fn checked_window(q: &MetricsQuery) -> Result<(DateTime<Utc>, DateTime<Utc>, Buc
 /// 新增遥测字段是可选的；错误类型或超出 u32 的值同缺失处理，不让历史 JSON 使汇总失败。
 fn counter(field: &str) -> String {
     format!(
-        "CASE WHEN jsonb_typeof(counter_fields.{field}) = 'number' \
-        AND (counter_fields.{field} #>> '{{}}') ~ '^[0-9]{{1,10}}$' \
-        THEN CASE WHEN (counter_fields.{field} #>> '{{}}')::numeric <= 4294967295 \
-          THEN (counter_fields.{field} #>> '{{}}')::bigint END END"
+        "CASE WHEN jsonb_typeof(COALESCE(event_fields.event, 'null'::jsonb)->'{field}') = 'number' \
+        AND (COALESCE(event_fields.event, 'null'::jsonb)->>'{field}') ~ '^[0-9]{{1,10}}$' \
+        THEN CASE WHEN (COALESCE(event_fields.event, 'null'::jsonb)->>'{field}')::numeric <= 4294967295 \
+          THEN (COALESCE(event_fields.event, 'null'::jsonb)->>'{field}')::bigint END END"
     )
 }
 
-// 一次解包大事件，数值校验只读取各字段的小 JSON；保留 jsonb 类型，避免把字符串强转成数值。
-// 原始对象的字段存在性仍由调用处判断，显式 null 不冒充省略。旧的非对象记录按缺失字段读取。
-const COUNTER_FIELDS: &str = " CROSS JOIN LATERAL jsonb_to_record(\
-    CASE WHEN jsonb_typeof(ue.event) = 'object' THEN ue.event ELSE '{}'::jsonb END\
-    ) AS counter_fields(prompt_tokens jsonb, completion_tokens jsonb, reasoning_tokens jsonb, \
-    total_tokens jsonb, cached_prompt_tokens jsonb, cache_read_tokens jsonb, \
-    cache_creation_tokens jsonb, cache_write_tokens jsonb, status_code jsonb, \
-    first_token_latency_ms jsonb, downstream_latency_ms jsonb, upstream_ttft_ms jsonb, \
-    upstream_latency_ms jsonb)";
+// 函数扫描为每条事件只解包一次大 JSON，原有字段读取和校验继续使用未压缩的副本。
+// record 的整值 null 会折成 SQL NULL，读取处用 COALESCE 还原，保留旧坏行和显式 null 的语义。
+const METRIC_EVENT: &str = " CROSS JOIN LATERAL jsonb_to_record(\
+    jsonb_build_object('event', ue.event)) AS event_fields(event jsonb)";
 
 fn count(condition: &str) -> String {
     format!("count(*) FILTER (WHERE {condition})")
@@ -358,17 +353,18 @@ async fn summarize(
     let ids: Vec<String> = names.keys().cloned().collect();
 
     let mut sql = QueryBuilder::<Postgres>::new("WITH raw AS MATERIALIZED (SELECT ");
+    let visible = VISIBLE.replace("ue.event", "COALESCE(event_fields.event, 'null'::jsonb)");
     sql.push("date_trunc(")
         .push_bind(bucket.unit())
         .push(", pc.occurred_at, 'Asia/Shanghai') AS period_start, ");
     sql.push("CASE WHEN pc.requested_model_id = ANY(")
         .push_bind(ids)
         .push(") THEN pc.requested_model_id ELSE '' END AS model_id, ");
-    sql.push(format!("ue.event->'is_final_attempt' = 'true'::jsonb AS final, \
-        (ue.event->'is_final_attempt' IS NULL OR jsonb_typeof(ue.event->'is_final_attempt') <> 'boolean') AS unknown_final, \
-        {VISIBLE} AS visible, pc.status AS charge_status, pc.charge_micro_cny, \
+    sql.push(format!("COALESCE(event_fields.event, 'null'::jsonb)->'is_final_attempt' = 'true'::jsonb AS final, \
+        (COALESCE(event_fields.event, 'null'::jsonb)->'is_final_attempt' IS NULL OR jsonb_typeof(COALESCE(event_fields.event, 'null'::jsonb)->'is_final_attempt') <> 'boolean') AS unknown_final, \
+        {visible} AS visible, pc.status AS charge_status, pc.charge_micro_cny, \
         (SELECT sum(pa.delta_micro_cny)::numeric FROM pricing_adjustments_cny pa WHERE pa.event_id = pc.event_id) AS adjusted, \
-        COALESCE(ue.event->>'error_class', '') <> '' AS has_error, ue.event->>'cache_status' AS cache_status, "));
+        COALESCE(COALESCE(event_fields.event, 'null'::jsonb)->>'error_class', '') <> '' AS has_error, COALESCE(event_fields.event, 'null'::jsonb)->>'cache_status' AS cache_status, "));
     let mut columns: Vec<String> = [
         "prompt_tokens",
         "completion_tokens",
@@ -403,12 +399,12 @@ async fn summarize(
     .iter()
     .map(|field| {
         let nullable = if *field == "cache_write_tokens" {
-            "ue.event->'cache_write_tokens' = 'null'::jsonb OR "
+            "COALESCE(event_fields.event, 'null'::jsonb)->'cache_write_tokens' = 'null'::jsonb OR "
         } else {
             ""
         };
         format!(
-            "(NOT (ue.event ? '{field}') OR {nullable}({}) IS NOT NULL)",
+            "(NOT (COALESCE(event_fields.event, 'null'::jsonb) ? '{field}') OR {nullable}({}) IS NOT NULL)",
             counter(field)
         )
     })
@@ -417,7 +413,7 @@ async fn summarize(
     columns.push(format!("({valid_optional}) AS valid_optional_usage"));
     sql.push(columns.join(", "))
         .push(" FROM pricing_charges_cny pc JOIN usage_events ue ON ue.event_id = pc.event_id")
-        .push(COUNTER_FIELDS)
+        .push(METRIC_EVENT)
         .push(" WHERE pc.occurred_at >= ")
         .push_bind(from)
         .push(" AND pc.occurred_at < ")
@@ -635,9 +631,9 @@ pub struct DirectMetricsResponse {
 
 /// TPOT 仅接受有效的正数；先按 numeric 验界，避免历史 JSON 转换溢出。
 fn direct_tpot() -> &'static str {
-    "CASE WHEN jsonb_typeof(ue.event->'upstream_tpot_ms') = 'number' \
-     THEN CASE WHEN (ue.event->>'upstream_tpot_ms')::numeric BETWEEN 1e-100 AND 1e100 \
-       THEN (ue.event->>'upstream_tpot_ms')::double precision END END"
+    "CASE WHEN jsonb_typeof(COALESCE(event_fields.event, 'null'::jsonb)->'upstream_tpot_ms') = 'number' \
+     THEN CASE WHEN (COALESCE(event_fields.event, 'null'::jsonb)->>'upstream_tpot_ms')::numeric BETWEEN 1e-100 AND 1e100 \
+       THEN (COALESCE(event_fields.event, 'null'::jsonb)->>'upstream_tpot_ms')::double precision END END"
 }
 
 fn direct_token_sum(field: &str) -> String {
@@ -789,14 +785,14 @@ async fn summarize_direct_models(
     let mut sql = QueryBuilder::<Postgres>::new("WITH raw AS MATERIALIZED (SELECT date_trunc(");
     sql.push_bind(bucket.unit()).push(
         ", ue.occurred_at, 'Asia/Shanghai') AS period_start, \
-          ue.event->>'model_id' AS model_id, \
-          COALESCE(ue.event->>'provider_key_id', '') AS provider_key_id, \
-          COALESCE(ue.event->>'error_class', '') AS error_class, \
-          ue.event->>'cache_status' AS cache_status, \
-          ue.event->>'inference_stage' AS inference_stage, \
-          ue.event->>'native_terminal_status' AS native_terminal_status, \
-          CASE WHEN jsonb_typeof(ue.event->'upstream_dispatched') = 'boolean' \
-            THEN (ue.event->>'upstream_dispatched')::boolean END AS explicit_dispatch, ",
+          COALESCE(event_fields.event, 'null'::jsonb)->>'model_id' AS model_id, \
+          COALESCE(COALESCE(event_fields.event, 'null'::jsonb)->>'provider_key_id', '') AS provider_key_id, \
+          COALESCE(COALESCE(event_fields.event, 'null'::jsonb)->>'error_class', '') AS error_class, \
+          COALESCE(event_fields.event, 'null'::jsonb)->>'cache_status' AS cache_status, \
+          COALESCE(event_fields.event, 'null'::jsonb)->>'inference_stage' AS inference_stage, \
+          COALESCE(event_fields.event, 'null'::jsonb)->>'native_terminal_status' AS native_terminal_status, \
+          CASE WHEN jsonb_typeof(COALESCE(event_fields.event, 'null'::jsonb)->'upstream_dispatched') = 'boolean' \
+            THEN (COALESCE(event_fields.event, 'null'::jsonb)->>'upstream_dispatched')::boolean END AS explicit_dispatch, ",
     );
     let mut columns: Vec<String> = [
         "prompt_tokens",
@@ -834,38 +830,44 @@ async fn summarize_direct_models(
     .iter()
     .map(|field| {
         let nullable = if *field == "cache_write_tokens" {
-            "ue.event->'cache_write_tokens' = 'null'::jsonb OR "
+            "COALESCE(event_fields.event, 'null'::jsonb)->'cache_write_tokens' = 'null'::jsonb OR "
         } else {
             ""
         };
         format!(
-            "(NOT (ue.event ? '{field}') OR {nullable}({}) IS NOT NULL)",
+            "(NOT (COALESCE(event_fields.event, 'null'::jsonb) ? '{field}') OR {nullable}({}) IS NOT NULL)",
             counter(field)
         )
     })
     .collect::<Vec<_>>()
     .join(" AND ");
     columns.push(format!("({optional_usage}) AS valid_optional_usage"));
-    columns.push("CASE WHEN jsonb_typeof(ue.event->'cache_usage_reported') = 'boolean' THEN (ue.event->>'cache_usage_reported')::boolean WHEN ue.event ? 'cache_usage_reported' THEN FALSE END AS explicit_cache_reported".to_string());
+    columns.push("CASE WHEN jsonb_typeof(COALESCE(event_fields.event, 'null'::jsonb)->'cache_usage_reported') = 'boolean' THEN (COALESCE(event_fields.event, 'null'::jsonb)->>'cache_usage_reported')::boolean WHEN COALESCE(event_fields.event, 'null'::jsonb) ? 'cache_usage_reported' THEN FALSE END AS explicit_cache_reported".to_string());
     sql.push(columns.join(", "))
         .push(" FROM usage_events ue")
-        .push(COUNTER_FIELDS)
+        .push(METRIC_EVENT)
         .push(" WHERE ue.occurred_at >= ")
         .push_bind(from)
         .push(" AND ue.occurred_at < ")
         .push_bind(to)
         .push(
-            " AND ue.event->>'model_id' ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' \
-              AND (ue.event->>'model_id' = ANY(",
+            " AND COALESCE(event_fields.event, 'null'::jsonb)->>'model_id' ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' \
+              AND (COALESCE(event_fields.event, 'null'::jsonb)->>'model_id' = ANY(",
         )
         .push_bind(direct_ids)
-        .push(") OR (NOT (ue.event->>'model_id' = ANY(")
+        .push(") OR (NOT (COALESCE(event_fields.event, 'null'::jsonb)->>'model_id' = ANY(")
         .push_bind(known_ids)
-        .push(")) AND ue.event->>'provider_key_id' ~* \
+        .push(")) AND COALESCE(event_fields.event, 'null'::jsonb)->>'provider_key_id' ~* \
             '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'))");
     for (column, value) in [
-        ("ue.event->>'model_id'", q.model_id),
-        ("ue.event->>'provider_key_id'", q.provider_key_id),
+        (
+            "COALESCE(event_fields.event, 'null'::jsonb)->>'model_id'",
+            q.model_id,
+        ),
+        (
+            "COALESCE(event_fields.event, 'null'::jsonb)->>'provider_key_id'",
+            q.provider_key_id,
+        ),
         ("ue.api_key_id", q.api_key_id),
     ] {
         if let Some(value) = value {
@@ -883,7 +885,7 @@ async fn summarize_direct_models(
         .push(")");
     }
     if let Some(tier) = q.service_tier {
-        sql.push(" AND ue.event->>'service_tier' = ")
+        sql.push(" AND COALESCE(event_fields.event, 'null'::jsonb)->>'service_tier' = ")
             .push_bind(tier);
     }
     sql.push(
