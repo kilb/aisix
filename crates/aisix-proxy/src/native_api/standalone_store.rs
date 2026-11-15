@@ -457,57 +457,83 @@ impl StandaloneNativeStore {
         submission: &BeginRequest,
         caller: &Owner,
     ) -> Result<BTreeMap<String, serde_json::Value>> {
-        let mut sources = vec![(String::new(), submission.clone())];
-        for entry in &submission.entries {
-            let mut source = submission.clone();
-            source.origin.model_id = entry.model_id;
-            source.requested_model_id = entry.requested_model_id;
-            source.requested_model = entry.requested_model.clone();
-            source.upstream_model = entry.upstream_model.clone();
-            source.upstream_provider = entry.upstream_provider.clone();
-            source.requested_service_tier = entry.requested_service_tier.clone();
-            sources.push((entry.entry_id.clone(), source));
-        }
         let mut templates = BTreeMap::new();
-        for (id, source) in sources {
-            let model =
-                unique_resource(snapshot.models.entries(), "models", source.origin.model_id).ok();
-            let requested = unique_resource(
-                snapshot.models.entries(),
-                "models",
-                source.requested_model_id,
-            )
-            .ok();
+        let context = submission.usage_context.as_deref();
+        // 只借用根与条目投影，不能为每项复制整份批次及其观测上下文。
+        for entry in std::iter::once(None).chain(submission.entries.iter().map(Some)) {
+            let id = entry.map_or("", |entry| entry.entry_id.as_str());
+            let model_id = entry.map_or(submission.origin.model_id, |entry| entry.model_id);
+            let requested_id = entry.map_or(submission.requested_model_id, |entry| {
+                entry.requested_model_id
+            });
+            let requested_name = entry.map_or(submission.requested_model.as_str(), |entry| {
+                entry.requested_model.as_str()
+            });
+            let upstream_model = entry.map_or(submission.upstream_model.as_str(), |entry| {
+                entry.upstream_model.as_str()
+            });
+            let upstream_provider = entry.map_or(submission.upstream_provider.as_str(), |entry| {
+                entry.upstream_provider.as_str()
+            });
+            let tier = entry.map_or(submission.requested_service_tier.as_ref(), |entry| {
+                entry.requested_service_tier.as_ref()
+            });
+            let input_audit = match entry {
+                Some(entry) => entry.usage_context.as_deref(),
+                None => context.map(|context| &context.input_audit),
+            };
+            let model = unique_resource(snapshot.models.entries(), "models", model_id).ok();
+            let requested = unique_resource(snapshot.models.entries(), "models", requested_id).ok();
             let provider = unique_resource(
                 snapshot.provider_keys.entries(),
                 "provider_keys",
-                source.origin.provider_key_id,
+                submission.origin.provider_key_id,
             )
             .ok();
-            // NO-GUARDRAIL-CHAIN: 只保存准入时身份，不生成用量或发出计费事件。
             let mut event = aisix_obs::UsageEvent {
                 api_key_id: caller.key_id.clone(),
                 team_id: caller.team_id.clone().unwrap_or_default(),
                 user_id: caller.user_id.clone().unwrap_or_default(),
                 model_id: model
                     .as_ref()
-                    .map_or_else(|| source.origin.model_id.to_string(), |v| v.id.clone()),
+                    .map_or_else(|| model_id.to_string(), |value| value.id.clone()),
                 requested_model_id: requested
                     .as_ref()
-                    .map_or_else(|| source.requested_model_id.to_string(), |v| v.id.clone()),
-                requested_model: source.requested_model,
-                upstream_model: Some(source.upstream_model),
-                upstream_provider: Some(source.upstream_provider),
+                    .map_or_else(|| requested_id.to_string(), |value| value.id.clone()),
+                requested_model: requested_name.to_owned(),
+                upstream_model: Some(upstream_model.to_owned()),
+                upstream_provider: Some(upstream_provider.to_owned()),
                 provider_key_id: Some(provider.as_ref().map_or_else(
-                    || source.origin.provider_key_id.to_string(),
-                    |v| v.id.clone(),
+                    || submission.origin.provider_key_id.to_string(),
+                    |value| value.id.clone(),
                 )),
-                requested_service_tier: source.requested_service_tier,
+                requested_service_tier: tier.cloned(),
+                applied_guardrails: input_audit
+                    .map(|audit| audit.applied_guardrails.clone())
+                    .unwrap_or_default(),
+                guardrail_bypassed_reason: input_audit
+                    .map(|audit| audit.guardrail_bypassed_reason.clone())
+                    .unwrap_or_default(),
+                guardrail_monitor_hits: input_audit
+                    .map(|audit| audit.guardrail_monitor_hits.clone())
+                    .unwrap_or_default(),
+                guardrail_enforced_hits: input_audit
+                    .map(|audit| audit.guardrail_enforced_hits.clone())
+                    .unwrap_or_default(),
+                guardrail_scores: input_audit
+                    .map(|audit| audit.guardrail_scores.clone())
+                    .unwrap_or_default(),
                 ..Default::default()
             };
-            if let Some(key) = snapshot.apikeys.get_by_id(&caller.key_id) {
-                let auth = crate::auth::AuthenticatedKey::new(snapshot, key, None, false);
-                crate::usage_attr::apply_caller_identity(&mut event, None, &auth.caller());
+            if let Some(context) = context {
+                crate::usage_attr::apply_native_caller_observations(
+                    &mut event,
+                    context.api_key_name.clone(),
+                    context.tags.clone(),
+                    context.jwt_subject.clone(),
+                    context.jwt_provider.clone(),
+                    context.jwt_claim_mapping.clone(),
+                );
             }
             if let Some(provider) = provider {
                 crate::usage_attr::apply_pk_telemetry(
@@ -519,7 +545,7 @@ impl StandaloneNativeStore {
             event.requested_service_tier = event
                 .requested_service_tier
                 .map(crate::chat::sanitize_tag)
-                .filter(|v| !v.is_empty());
+                .filter(|value| !value.is_empty());
             let wire = serde_json::to_value(event).map_err(unavailable)?;
             let fields = wire.as_object().ok_or(Error::Unavailable)?;
             let mut saved = serde_json::Map::new();
@@ -529,6 +555,14 @@ impl StandaloneNativeStore {
                 "team_id",
                 "user_id",
                 "tags",
+                "jwt_subject",
+                "jwt_provider",
+                "jwt_claim_mapping",
+                "applied_guardrails",
+                "guardrail_bypassed_reason",
+                "guardrail_monitor_hits",
+                "guardrail_enforced_hits",
+                "guardrail_scores",
                 "model_id",
                 "requested_model_id",
                 "requested_model",
@@ -555,7 +589,7 @@ impl StandaloneNativeStore {
                     );
                 }
             }
-            templates.insert(id, serde_json::Value::Object(saved));
+            templates.insert(id.to_owned(), serde_json::Value::Object(saved));
         }
         Ok(templates)
     }
@@ -2819,14 +2853,19 @@ fn canonical_terminal_event(
     template: &serde_json::Value,
 ) -> Result<String> {
     let entry = source.entries.iter().find(|e| e.entry_id == usage.entry_id);
-    // NO-GUARDRAIL-CHAIN: 后台终态仅结算原准入；不重新扫描或重新派发模型。
-    let event = aisix_obs::UsageEvent {
+    let context = NativeUsageContext::deserialize(template).map_err(unavailable)?;
+    let mut event = aisix_obs::UsageEvent {
         event_id: event_id.to_string(),
         request_id: source.request_id.clone(),
         occurred_at: usage
             .occurred_at
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         io_audit: usage.io_audit.clone(),
+        applied_guardrails: context.input_audit.applied_guardrails,
+        guardrail_bypassed_reason: context.input_audit.guardrail_bypassed_reason,
+        guardrail_monitor_hits: context.input_audit.guardrail_monitor_hits,
+        guardrail_enforced_hits: context.input_audit.guardrail_enforced_hits,
+        guardrail_scores: context.input_audit.guardrail_scores,
         inference_stage: Some(InferenceStage::Terminal),
         native_operation_id: Some(source.operation_id),
         inbound_protocol: source.protocol.as_str().into(),
@@ -2861,6 +2900,14 @@ fn canonical_terminal_event(
         is_batch: source.kind == NativeObjectKind::MessageBatch,
         ..Default::default()
     };
+    crate::usage_attr::apply_native_caller_observations(
+        &mut event,
+        context.api_key_name,
+        context.tags,
+        context.jwt_subject,
+        context.jwt_provider,
+        context.jwt_claim_mapping,
+    );
     let surface = match source.kind {
         NativeObjectKind::MessageBatch => crate::operation::BATCH_COMPLETION,
         NativeObjectKind::EvalRun => crate::operation::Surface {
