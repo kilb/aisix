@@ -1208,6 +1208,10 @@ pub(crate) fn retry_after_of(err: &ProxyError) -> Option<u64> {
 }
 
 #[cfg(test)]
+#[path = "quota_peek_work_tests.rs"]
+mod peek_work_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
