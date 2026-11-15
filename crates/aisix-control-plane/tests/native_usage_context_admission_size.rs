@@ -22,9 +22,10 @@ use aisix_core::{AisixSnapshot, ApiKey, Model, ProviderKey, ProxyConfig, Resourc
 use aisix_gateway::Hub;
 use aisix_obs::{UsageEvent, UsageSink};
 use aisix_proxy::{build_router, ProxyState};
-use axum::body::{to_bytes, Body};
+use axum::body::Body;
 use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode};
+use http_body_util::BodyExt;
 use axum::{routing::post, Json, Router};
 use chrono::Utc;
 use serde_json::{json, Value};
@@ -139,7 +140,8 @@ async fn producer_event(tags: &BTreeMap<String, String>) -> UsageEvent {
         StatusCode::OK,
         "producer probe must execute normally"
     );
-    let _ = to_bytes(response.into_body(), 1 << 20)
+    let _ = http_body_util::Limited::new(response.into_body(), 1 << 20)
+        .collect()
         .await
         .expect("drain actual chat response");
     let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
