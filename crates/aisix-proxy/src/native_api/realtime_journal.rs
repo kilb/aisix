@@ -366,6 +366,25 @@ impl Journal {
                     .models
                     .get_by_id(&entry.model.id)
                     .ok_or(ProxyError::AccountUnavailable)?;
+                // 配置同步后仍须允许该次级模型；主模型 A 可用不能代替 B 的准入。
+                if !current
+                    .key()
+                    .can_access(&snapshot, &entry.accepted.requested_model)
+                {
+                    return Err(ProxyError::ModelForbidden(
+                        entry.accepted.requested_model.clone(),
+                    ));
+                }
+                if !crate::routing::target_in_groups(
+                    &snapshot,
+                    &model.value,
+                    &current.key().allowed_provider_groups,
+                ) {
+                    return Err(crate::routing::no_target_in_groups(
+                        &entry.accepted.requested_model,
+                    ));
+                }
+                crate::dispatch::check_ip_access(&model.value, &self.client.source_ip)?;
                 crate::quota::check_realtime_tokens(
                     &self.state,
                     &snapshot,
