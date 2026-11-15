@@ -295,15 +295,31 @@ impl StandaloneNativeStore {
             stored.record.kind.ok_or(Error::Unavailable)?,
             consumer,
         )?;
+        // 同一账号和实际/请求模型范围只校验一次；不同请求别名仍各自保留权限边界。
+        let mut checked = BTreeSet::from([(
+            stored.submission.origin.provider_key_id,
+            stored.submission.origin.model_id,
+            stored.submission.requested_model_id,
+            stored.submission.requested_model.as_str(),
+        )]);
+        let mut submitted = None;
         for entry in &stored.submission.entries {
-            let mut submitted = stored.submission.clone();
+            if !checked.insert((
+                stored.submission.origin.provider_key_id,
+                entry.model_id,
+                entry.requested_model_id,
+                entry.requested_model.as_str(),
+            )) {
+                continue;
+            }
+            let submitted = submitted.get_or_insert_with(|| stored.submission.clone());
             submitted.origin.model_id = entry.model_id;
             submitted.requested_model_id = entry.requested_model_id;
-            submitted.requested_model = entry.requested_model.clone();
+            submitted.requested_model.clone_from(&entry.requested_model);
             self.authorize_origin(
                 snapshot,
                 Some(caller),
-                &submitted,
+                submitted,
                 stored.submission.kind,
                 consumer,
             )?;
@@ -553,14 +569,18 @@ impl StandaloneNativeStore {
         let mut owner = principal.owner.clone();
         if let Some(parent_id) = body.parent_id {
             let parent = Self::stored(conn, parent_id).await?;
-            self.authorize_chain(
-                conn,
-                &snapshot,
-                &principal,
-                &parent,
-                Some(body.kind.endpoint_family()),
-            )
-            .await?;
+            // File 自身仍按 Files 准入；合法 Batch 父上下文保留其 Batches 范围。
+            let parent_consumer = if body.protocol == NativeProtocol::Openai
+                && body.kind == NativeObjectKind::File
+                && parent.submission.protocol == NativeProtocol::Openai
+                && parent.submission.kind == NativeObjectKind::MessageBatch
+            {
+                EndpointFamily::Batches
+            } else {
+                body.kind.endpoint_family()
+            };
+            self.authorize_chain(conn, &snapshot, &principal, &parent, Some(parent_consumer))
+                .await?;
             if !account(
                 parent.record.origin.as_ref().ok_or(Error::Unavailable)?,
                 &body.origin,
@@ -2914,14 +2934,29 @@ fn unique_resource<T: aisix_core::resource::Resource>(
 impl StandaloneNativeStore {
     async fn authorize_chain(
         &self,
-        _conn: &mut SqliteConnection,
+        conn: &mut SqliteConnection,
         snapshot: &AisixSnapshot,
         caller: &Principal,
         stored: &Stored,
         consumer: Option<EndpointFamily>,
     ) -> Result<()> {
-        // 保留内部调用接缝；只校验目标对象，不递归遍历来源祖先。
-        self.authorize(snapshot, caller, stored, consumer)
+        self.authorize(snapshot, caller, stored, consumer)?;
+        // 正式 Batch 结果文件保留整批模型限制和父对象存续；只查必要的一跳。
+        if stored.submission.kind == NativeObjectKind::File {
+            if let Some(parent_id) = stored.record.parent_id {
+                let parent = Self::stored(conn, parent_id).await?;
+                if parent.submission.kind == NativeObjectKind::MessageBatch {
+                    if !account(
+                        stored.record.origin.as_ref().ok_or(Error::Unavailable)?,
+                        parent.record.origin.as_ref().ok_or(Error::Unavailable)?,
+                    ) {
+                        return Err(Error::NotFound);
+                    }
+                    self.authorize(snapshot, caller, &parent, consumer)?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
