@@ -39,7 +39,7 @@ const TOKEN_NOTE = "趋势只包含有可用用量记录的尝试，也包含已
 const LATENCY_LABELS: Record<LatencyKind, string> = { first_token_latency_ms: "首 token 延迟", response_latency_ms: "响应延迟", attempt_duration_ms: "上游尝试完整耗时" };
 const LATENCY_NOTES: Record<LatencyKind, string> = {
   first_token_latency_ms: "首个生成内容交付的实测延迟。无首 token 样本包含非流式与历史记录，不以首帧或完整耗时补齐。",
-  response_latency_ms: "请求至首个可用数据的实测延迟。流式请求的首个可用数据不代表完整响应结束。",
+  response_latency_ms: "请求至响应可用的实测延迟：流式请求统计首个可用数据，非流式请求统计完整响应。",
   attempt_duration_ms: "每次上游尝试的完整耗时，包含可见的已计费重试；不能拼成客户端完整请求耗时。",
 };
 const BUCKET_LABELS: Record<MetricsBucket, string> = { minute: "分钟", hour: "小时", day: "天" };
@@ -232,7 +232,7 @@ export function ApiMetricsPanel({ scope, enabled, from, to, bucket, modelId, mem
       </Card>
       <Card className={cn(span.d5Wide, "metric-analysis-aside")}>
         <CardHeader number={numberStart + 1} title={sideTitle} description="与左侧使用相同时间、身份和筛选范围" />
-        {view === "requests" || view === "cost" ? <ModelRanks data={data} field={view === "requests" ? "requests" : "charged_micro_cny"} /> : view === "tokens" ? <TokenFacts values={totals} /> : view === "cache" ? <CacheFacts values={totals} /> : <div className="grid gap-7"><LatencyFacts title="首 token 延迟" value={totals?.first_token_latency_ms} note="最终请求的首个生成内容；无样本包含非流式与历史记录。" /><div className="border-t border-ink/7 pt-6"><LatencyFacts title="响应延迟" value={totals?.response_latency_ms} note="最终请求至首个可用数据，不是完整响应时长。" /></div><div className="border-t border-ink/7 pt-6"><LatencyFacts title="上游尝试完整耗时" value={totals?.attempt_duration_ms} note="所有可见计费尝试各自的完整耗时，不能相加为客户端请求时长。" /></div></div>}
+        {view === "requests" || view === "cost" ? <ModelRanks data={data} field={view === "requests" ? "requests" : "charged_micro_cny"} /> : view === "tokens" ? <TokenFacts values={totals} /> : view === "cache" ? <CacheFacts values={totals} /> : <div className="grid gap-7"><LatencyFacts title="首 token 延迟" value={totals?.first_token_latency_ms} note="最终请求的首个生成内容；无样本包含非流式与历史记录。" /><div className="border-t border-ink/7 pt-6"><LatencyFacts title="响应延迟" value={totals?.response_latency_ms} note="最终请求的响应延迟：流式请求统计首个可用数据，非流式请求统计完整响应。" /></div><div className="border-t border-ink/7 pt-6"><LatencyFacts title="上游尝试完整耗时" value={totals?.attempt_duration_ms} note="所有可见计费尝试各自的完整耗时，不能相加为客户端请求时长。" /></div></div>}
       </Card>
       </BentoGrid>
     </section>
