@@ -339,7 +339,7 @@ async fn send_with_deadline_inner(
     let send = async move {
         match protocol {
             Some(protocol) => aisix_gateway::upstream_io::send(req, protocol).await,
-            None => req.send().await,
+            None => aisix_gateway::upstream_io::send_unobserved(req).await,
         }
     };
     let sent = match deadline {
