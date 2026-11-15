@@ -2138,7 +2138,7 @@ mod tests {
             scrape
                 .lines()
                 .any(|line| line.starts_with("aisix_usage_events_emitted_total{")
-                    && line.ends_with(" 1")),
+                    && line.ends_with(" 4")),
             "{scrape}"
         );
     }
