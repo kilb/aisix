@@ -1319,7 +1319,7 @@ impl StandaloneNativeStore {
                         // 反序父节点只按本次声明的精确账号身份查证一次；实际保存后以原owner覆盖。
                         let saved: Option<String> = sqlx::query_scalar("SELECT owner FROM native_objects WHERE protocol=? AND kind=? AND boundary=? AND raw_id=?")
                             .bind(graph.root.submission.protocol.as_str()).bind(kind.as_str())
-                            .bind(&graph.root.submission.origin.boundary).bind(raw_id)
+                            .bind(graph.root.submission.origin.boundary.as_str()).bind(raw_id)
                             .fetch_optional(&mut *conn).await.map_err(unavailable)?;
                         let candidate = match saved {
                             Some(saved) => decode(&saved)?,
