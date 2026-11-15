@@ -99,6 +99,8 @@ lofty.workspace = true
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 
 [dev-dependencies]
+# 独立测试依赖承载系统分配器代理，产品库保留 unsafe 禁止规则。
+aisix-response-reference-test-alloc = { path = "tests/allocation-support" }
 # `test-util` drives the SSE-heartbeat tests on a paused clock.
 tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
 # aisix-provider-anthropic + aisix-provider-openai moved to
