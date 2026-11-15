@@ -188,7 +188,6 @@ pub fn build_router(state: ProxyState) -> Router {
         .route("/v1/embeddings", post(embeddings::embeddings))
         .route("/v1/images/generations", post(images::image_generations))
         .route("/v1/images/edits", post(images_edits::image_edits))
-        .route("/v1/images/variations", post(native_api::openai::variations))
         .route("/v1/moderations", post(native_api::openai::moderations))
         .route("/v1/content_provenance_checks", post(native_api::openai::provenance))
         .route("/v1/uploads", post(native_api::openai_uploads::create_upload))
@@ -224,13 +223,6 @@ pub fn build_router(state: ProxyState) -> Router {
         .route("/v1/audio/voice_consents/:id", get(native_api::voices::consent).post(native_api::voices::consent).delete(native_api::voices::consent))
         .route("/v1/audio/voices", post(native_api::voices::create))
         .route("/v1/audio/voices/:id", axum::routing::delete(native_api::voices::delete))
-        .route("/v1/evals", post(native_api::openai_evals::handle).get(native_api::openai_evals::handle))
-        .route("/v1/evals/:eval_id", get(native_api::openai_evals::handle).post(native_api::openai_evals::handle).delete(native_api::openai_evals::handle))
-        .route("/v1/evals/:eval_id/runs", post(native_api::openai_evals::handle).get(native_api::openai_evals::handle))
-        .route("/v1/evals/:eval_id/runs/:run_id", get(native_api::openai_evals::handle).delete(native_api::openai_evals::handle))
-        .route("/v1/evals/:eval_id/runs/:run_id/cancel", post(native_api::openai_evals::handle))
-        .route("/v1/evals/:eval_id/runs/:run_id/output_items", get(native_api::openai_evals::handle))
-        .route("/v1/evals/:eval_id/runs/:run_id/output_items/:output_item_id", get(native_api::openai_evals::handle))
         .route("/v1/messages", post(messages::messages))
         .route(
             "/v1/messages/count_tokens",
@@ -250,7 +242,6 @@ pub fn build_router(state: ProxyState) -> Router {
         .route("/v1/responses/:id/cancel", post(native_api::responses::cancel))
         .route("/v1/responses/:id/input_items", get(native_api::responses::input_items))
         .route("/v1/audio/transcriptions", post(audio::transcriptions))
-        .route("/v1/audio/translations", post(audio::translations))
         .route("/v1/audio/speech", post(audio::speech))
         // Unified video-generation surface (#1118 Phase 1):
         // submit → poll → fetch. Auth/ACL/quota enforced inside the
@@ -265,7 +256,7 @@ pub fn build_router(state: ProxyState) -> Router {
         .route("/v1/realtime/translations", get(realtime::realtime))
         .route("/v1/realtime/client_secrets", post(native_api::realtime_credentials::client_secrets))
         .route("/v1/realtime/translations/client_secrets", post(native_api::realtime_credentials::translation_client_secrets))
-        // Files / Batches / Fine-tuning jobs surface (#720). Provider
+        // Files / Batches jobs surface (#720). Provider
         // routing rides the gateway-encoded resource ids; see jobs.rs.
         .route(
             "/v1/files",
@@ -298,15 +289,6 @@ pub fn build_router(state: ProxyState) -> Router {
         .route(
             "/v1/messages/batches/:id/results",
             get(native_api::anthropic_batches::results),
-        )
-        .route(
-            "/v1/fine_tuning/jobs",
-            post(jobs::create_ft_job).get(jobs::list_ft_jobs),
-        )
-        .route("/v1/fine_tuning/jobs/:id", get(jobs::get_ft_job))
-        .route(
-            "/v1/fine_tuning/jobs/:id/cancel",
-            post(jobs::cancel_ft_job),
         )
         // RFC 9728 Protected Resource Metadata for the /mcp OAuth surface
         // (AISIX-Cloud#1143). Unauthenticated by design — discovery must

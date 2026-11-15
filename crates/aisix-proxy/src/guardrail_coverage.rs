@@ -23,6 +23,9 @@
 //! only one that can tell "the chain ran and decided" apart from "the
 //! chain found nothing to match". That distinction is the whole bug class.
 
+#[path = "supported_scope_curation_tests.rs"]
+mod supported_scope_curation_tests;
+
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -176,14 +179,6 @@ pub(crate) const POSTURE: &[(&str, Posture)] = &[
         ),
     ),
     (
-        "/v1/fine_tuning/jobs/:id",
-        Posture::NoUpstreamContent("GET by id; carries no caller text"),
-    ),
-    (
-        "/v1/fine_tuning/jobs/:id/cancel",
-        Posture::NoUpstreamContent("cancels by id; carries no caller text"),
-    ),
-    (
         "/v1/responses/:id",
         Posture::NoUpstreamContent("GET/DELETE by owned id; input was screened at creation"),
     ),
@@ -203,7 +198,6 @@ pub(crate) const POSTURE: &[(&str, Posture)] = &[
     ("/v1/embeddings", Posture::Enforced),
     ("/v1/images/generations", Posture::Enforced),
     ("/v1/images/edits", Posture::Enforced),
-    ("/v1/images/variations", Posture::Enforced),
     ("/v1/moderations", Posture::Enforced),
     ("/v1/content_provenance_checks", Posture::Enforced),
     ("/v1/conversations", Posture::EnforcedNotDrivableInCrate("原生对象需持久归属；native_openai_conversations 的无文本阻断合同覆盖每个方法。")),
@@ -235,13 +229,6 @@ pub(crate) const POSTURE: &[(&str, Posture)] = &[
     ("/v1/audio/voice_consents/:id", Posture::EnforcedNotDrivableInCrate("原生对象需持久归属；native_voices 覆盖官方协议及空正文审查。")),
     ("/v1/audio/voices", Posture::EnforcedNotDrivableInCrate("原生对象需持久归属；native_voices 覆盖官方协议及空正文审查。")),
     ("/v1/audio/voices/:id", Posture::EnforcedNotDrivableInCrate("原生对象需持久归属；native_voices 覆盖官方协议及空正文审查。")),
-    ("/v1/evals", Posture::EnforcedNotDrivableInCrate("原生对象需持久归属；native_openai_evals 覆盖官方协议及空正文审查。")),
-    ("/v1/evals/:eval_id", Posture::EnforcedNotDrivableInCrate("原生对象需持久归属；native_openai_evals 覆盖官方协议及空正文审查。")),
-    ("/v1/evals/:eval_id/runs", Posture::EnforcedNotDrivableInCrate("原生对象需持久归属；native_openai_evals 覆盖官方协议及空正文审查。")),
-    ("/v1/evals/:eval_id/runs/:run_id", Posture::EnforcedNotDrivableInCrate("原生对象需持久归属；native_openai_evals 覆盖官方协议及空正文审查。")),
-    ("/v1/evals/:eval_id/runs/:run_id/cancel", Posture::EnforcedNotDrivableInCrate("原生对象需持久归属；native_openai_evals 覆盖官方协议及空正文审查。")),
-    ("/v1/evals/:eval_id/runs/:run_id/output_items", Posture::EnforcedNotDrivableInCrate("原生对象需持久归属；native_openai_evals 覆盖官方协议及空正文审查。")),
-    ("/v1/evals/:eval_id/runs/:run_id/output_items/:output_item_id", Posture::EnforcedNotDrivableInCrate("原生对象需持久归属；native_openai_evals 覆盖官方协议及空正文审查。")),
     ("/v1/uploads", Posture::EnforcedNotDrivableInCrate("原生上传需托管注册表；native_openai_uploads 验证各写入步骤的审查拒绝。")),
     ("/v1/uploads/:id/parts", Posture::EnforcedNotDrivableInCrate("原生上传需托管注册表；native_openai_uploads 验证分片的审查拒绝。")),
     ("/v1/uploads/:id/complete", Posture::EnforcedNotDrivableInCrate("原生上传需托管注册表；native_openai_uploads 验证完成字段的审查拒绝。")),
@@ -269,7 +256,6 @@ pub(crate) const POSTURE: &[(&str, Posture)] = &[
     ("/v1/responses/compact", Posture::Enforced),
     ("/v1/responses/input_tokens", Posture::Enforced),
     ("/v1/audio/transcriptions", Posture::Enforced),
-    ("/v1/audio/translations", Posture::Enforced),
     ("/v1/audio/speech", Posture::Enforced),
     ("/v1/videos", Posture::Enforced),
     ("/mcp", Posture::Enforced),
@@ -315,7 +301,6 @@ pub(crate) const POSTURE: &[(&str, Posture)] = &[
         "/v1/messages/batches/:id/results",
         Posture::NoUpstreamContent("读取已审查批次结果，输出仍经过审查"),
     ),
-    ("/v1/fine_tuning/jobs", Posture::Enforced),
     (
         FALLBACK_SURFACE,
         Posture::EnforcedNotDrivableInCrate(

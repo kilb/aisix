@@ -806,12 +806,16 @@ pub struct UsageEvent {
     pub inbound_protocol: String,
 
     /// What the caller asked the gateway to DO, from a fixed set:
-    /// `chat`, `messages`, `count_tokens`, `responses`, `completions`,
-    /// `embeddings`, `rerank`, `systemone`, `decisions`, `image_generation`,
-    /// `image_edit`, `image_variation`, `moderations`, `content_provenance_checks`,
-    /// `uploads`, `transcription`, `translation`, `speech`, `video_generation`,
-    /// `realtime`, `files`, `batches`, `fine_tuning`, `batch_completion`,
-    /// `mcp`, `a2a`, `passthrough`.
+    /// `batch_completion`, `batches`, `chat`, `completions`, `containers`,
+    /// `content_provenance_checks`, `conversations`, `count_tokens`, `decisions`, `embeddings`,
+    /// `eval_completion`, `evals`, `files`, `fine_tuning`, `image_edit`,
+    /// `image_generation`, `image_variation`, `mcp`, `messages`, `moderations`,
+    /// `passthrough`, `realtime`, `rerank`, `responses`, `skills`,
+    /// `speech`, `systemone`, `transcription`, `translation`, `uploads`,
+    /// `vector_stores`, `video_generation`, `voice_consents`, `voices`.
+    ///
+    /// 该词汇表保留历史标签的读取含义；当前支持范围由活动路由分区决定，
+    /// 不能仅凭历史标签仍可读取就认为对应的 HTTP 入口仍受支持。
     ///
     /// That list is the whole of it, and a consumer building a filter or a
     /// facet should take it verbatim. `aisix_proxy::operation` is where the

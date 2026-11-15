@@ -283,7 +283,6 @@ mod tests {
         ("/v1/embeddings", Emits::Usage(EMBEDDINGS)),
         ("/v1/images/generations", Emits::Usage(IMAGE_GENERATION)),
         ("/v1/images/edits", Emits::Usage(IMAGE_EDIT)),
-        ("/v1/images/variations", Emits::Usage(IMAGE_VARIATION)),
         ("/v1/moderations", Emits::Usage(MODERATIONS)),
         (
             "/v1/content_provenance_checks",
@@ -379,22 +378,6 @@ mod tests {
             "/v1/audio/voices/:id",
             Emits::Usage(crate::native_api::voices::VOICES_SURFACE),
         ),
-        ("/v1/evals", Emits::Usage(EVALS)),
-        ("/v1/evals/:eval_id", Emits::Usage(EVALS)),
-        ("/v1/evals/:eval_id/runs", Emits::Usage(EVALS)),
-        ("/v1/evals/:eval_id/runs/:run_id", Emits::Usage(EVALS)),
-        (
-            "/v1/evals/:eval_id/runs/:run_id/cancel",
-            Emits::Usage(EVALS),
-        ),
-        (
-            "/v1/evals/:eval_id/runs/:run_id/output_items",
-            Emits::Usage(EVALS),
-        ),
-        (
-            "/v1/evals/:eval_id/runs/:run_id/output_items/:output_item_id",
-            Emits::Usage(EVALS),
-        ),
         ("/v1/messages", Emits::Usage(MESSAGES)),
         ("/v1/messages/count_tokens", Emits::Usage(COUNT_TOKENS)),
         ("/v1/rerank", Emits::Usage(RERANK)),
@@ -407,7 +390,6 @@ mod tests {
         ("/v1/responses/:id/cancel", Emits::Usage(RESPONSES)),
         ("/v1/responses/:id/input_items", Emits::Usage(RESPONSES)),
         ("/v1/audio/transcriptions", Emits::Usage(TRANSCRIPTION)),
-        ("/v1/audio/translations", Emits::Usage(TRANSLATION)),
         ("/v1/audio/speech", Emits::Usage(SPEECH)),
         ("/v1/videos", Emits::Usage(VIDEO_GENERATION)),
         (
@@ -435,9 +417,6 @@ mod tests {
         ("/v1/messages/batches/:id", Emits::Usage(BATCHES)),
         ("/v1/messages/batches/:id/cancel", Emits::Usage(BATCHES)),
         ("/v1/messages/batches/:id/results", Emits::Usage(BATCHES)),
-        ("/v1/fine_tuning/jobs", Emits::Usage(FINE_TUNING)),
-        ("/v1/fine_tuning/jobs/:id", Emits::Usage(FINE_TUNING)),
-        ("/v1/fine_tuning/jobs/:id/cancel", Emits::Usage(FINE_TUNING)),
         (
             "/.well-known/oauth-protected-resource",
             Emits::Nothing("RFC 9728 discovery; unauthenticated, meters nothing"),
@@ -774,6 +753,25 @@ mod tests {
     /// requires each to appear here or in the route table.
     const NON_ROUTE: &[Surface] = &[BATCH_COMPLETION];
 
+    /// 已退出本轮 HTTP 支持的历史标签；不计入 active emitted_operations。
+    const RETIRED_SURFACES: &[Surface] = &[
+        EVALS,
+        EVAL_COMPLETION,
+        FINE_TUNING,
+        IMAGE_VARIATION,
+        TRANSLATION,
+    ];
+
+    #[test]
+    fn retired_surfaces_are_not_active_emissions() {
+        for retired in RETIRED_SURFACES {
+            assert!(!NON_ROUTE.contains(retired));
+            assert!(ROUTE_OPERATIONS
+                .iter()
+                .all(|(_, emits)| { !matches!(emits, Emits::Usage(active) if active == retired) }));
+        }
+    }
+
     /// Every operation this crate can emit, from the two places they come
     /// from: the route table (itself pinned to `build_router`) and the
     /// routeless surfaces above.
@@ -848,6 +846,7 @@ mod tests {
 
         let routed = block_after("const ROUTE_OPERATIONS: &[(&str, Emits)] = &[", "\n    ];");
         let routeless = block_after("const NON_ROUTE: &[Surface] = &[", "];");
+        let retired = block_after("const RETIRED_SURFACES: &[Surface] = &[", "];");
         let handlers = block_after("for (surface, handler) in [", "\n        ] {");
 
         let mut unemitted = Vec::new();
@@ -856,7 +855,12 @@ mod tests {
             // `Emits::Usage(CHAT)` / `&[BATCH_COMPLETION]`.
             let emitted = routed.contains(&format!("({name})"))
                 || routeless.split([',', ' ', ']']).any(|t| t == *name);
-            if !emitted {
+            let inactive = retired.split([',', ' ', '\n', ']']).any(|t| t == *name);
+            assert!(
+                !(emitted && inactive),
+                "{name} cannot be both active and retired",
+            );
+            if !emitted && !inactive {
                 unemitted.push(*name);
             }
             // `(CHAT, "chat"),`
@@ -871,8 +875,8 @@ mod tests {
              `emitted_operations` does not know they exist and the doc census \
              will happily agree with a `usage.rs` that also omits them: \
              {unemitted:?}\n\
-             Put each on a route in ROUTE_OPERATIONS, or in NON_ROUTE if it \
-             has no route of its own.",
+             Put each active surface on a route or in NON_ROUTE; retired surfaces \
+             belong only in the explicit RETIRED_SURFACES partition.",
         );
         assert!(
             unpinned.is_empty(),
@@ -892,7 +896,7 @@ mod tests {
     /// Parsed rather than re-copied, the same move `ROUTE_OPERATIONS` makes
     /// against `build_router`.
     #[test]
-    fn the_wire_field_documents_exactly_what_this_crate_emits() {
+    fn the_wire_field_documents_exactly_the_known_operation_vocabulary() {
         const USAGE_SRC: &str = include_str!("../../aisix-obs/src/usage.rs");
         const OPENER: &str = "What the caller asked the gateway to DO, from a fixed set:";
 
@@ -916,13 +920,13 @@ mod tests {
             chars.next();
         }
 
-        let emitted = emitted_operations();
+        let known: BTreeSet<_> = emitted_operations()
+            .into_iter()
+            .chain(RETIRED_SURFACES.iter().map(|surface| surface.operation))
+            .collect();
         assert_eq!(
-            documented,
-            emitted,
-            "UsageEvent::operation's doc comment and this module disagree.\n               documented but never emitted: {:?}\n               emitted but undocumented: {:?}",
-            documented.difference(&emitted).collect::<Vec<_>>(),
-            emitted.difference(&documented).collect::<Vec<_>>(),
+            documented, known,
+            "UsageEvent::operation must document exactly the active and retained legacy vocabulary",
         );
     }
 

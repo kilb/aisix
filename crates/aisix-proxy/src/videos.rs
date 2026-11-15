@@ -1,3 +1,4 @@
+//! 当前支持源不再选择 OpenAI 视频 provider；旧 enum/codecs 保留供历史数据兼容。
 //! `/v1/videos` — unified video-generation surface (#1118 Phase 1).
 //!
 //! Three typed routes following the submit → poll → fetch contract
@@ -708,8 +709,6 @@ impl VideoProvider {
             || provider.eq_ignore_ascii_case("runway")
         {
             Some(Self::Runway)
-        } else if provider.eq_ignore_ascii_case("openai") {
-            Some(Self::Openai)
         } else {
             None
         }
@@ -2795,6 +2794,22 @@ fn emit_submit_usage_event(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn public_video_provider_selection_keeps_the_active_provider_partition() {
+        assert!(VideoProvider::from_provider("openai").is_none());
+        assert!(VideoProvider::from_provider("OpenAI").is_none());
+        for (name, provider) in [
+            ("alibaba", VideoProvider::Alibaba),
+            ("zhipuai", VideoProvider::Zhipu),
+            ("zhipu", VideoProvider::Zhipu),
+            ("volcengine", VideoProvider::Volcengine),
+            ("runwayml", VideoProvider::Runway),
+            ("runway", VideoProvider::Runway),
+        ] {
+            assert_eq!(VideoProvider::from_provider(name), Some(provider));
+        }
+    }
     use super::*;
 
     use aisix_core::resource::ResourceEntry;

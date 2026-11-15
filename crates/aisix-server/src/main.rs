@@ -1720,10 +1720,6 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
                 async move {
                     tokio::join!(
                         aisix_proxy::native_api::background::run(state.clone(), cancel.clone()),
-                        aisix_proxy::native_api::openai_eval_worker::run(
-                            state.clone(),
-                            cancel.clone()
-                        ),
                         aisix_proxy::native_api::openai_batch_worker::run(
                             state.clone(),
                             cancel.clone()

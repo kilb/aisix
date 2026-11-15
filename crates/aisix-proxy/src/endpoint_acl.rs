@@ -109,7 +109,10 @@ pub(crate) fn endpoint_family(path: &str) -> Option<EndpointFamily> {
         "/v1/videos" | "/v1/videos/:id" => F::Videos,
         "/v1/rerank" => F::Rerank,
         "/v1/decisions" | "/v1/systemone" => F::Decisions,
-        "/v1/realtime" => F::Realtime,
+        "/v1/realtime"
+        | "/v1/realtime/translations"
+        | "/v1/realtime/client_secrets"
+        | "/v1/realtime/translations/client_secrets" => F::Realtime,
         "/v1/files" | "/v1/files/:id" => F::Files,
         "/v1/batches" | "/v1/batches/:id" => F::Batches,
         "/v1/messages/batches"
@@ -231,7 +234,6 @@ mod tests {
         ("/v1/embeddings", Family(F::Embeddings)),
         ("/v1/images/generations", Family(F::Images)),
         ("/v1/images/edits", Family(F::Images)),
-        ("/v1/images/variations", Family(F::Images)),
         ("/v1/moderations", Family(F::Moderations)),
         (
             "/v1/content_provenance_checks",
@@ -297,19 +299,6 @@ mod tests {
         ("/v1/audio/voice_consents/:id", Family(F::Audio)),
         ("/v1/audio/voices", Family(F::Audio)),
         ("/v1/audio/voices/:id", Family(F::Audio)),
-        ("/v1/evals", Family(F::Evals)),
-        ("/v1/evals/:eval_id", Family(F::Evals)),
-        ("/v1/evals/:eval_id/runs", Family(F::Evals)),
-        ("/v1/evals/:eval_id/runs/:run_id", Family(F::Evals)),
-        ("/v1/evals/:eval_id/runs/:run_id/cancel", Family(F::Evals)),
-        (
-            "/v1/evals/:eval_id/runs/:run_id/output_items",
-            Family(F::Evals),
-        ),
-        (
-            "/v1/evals/:eval_id/runs/:run_id/output_items/:output_item_id",
-            Family(F::Evals),
-        ),
         ("/v1/messages", Family(F::Messages)),
         ("/v1/messages/count_tokens", Family(F::CountTokens)),
         ("/v1/rerank", Family(F::Rerank)),
@@ -322,12 +311,17 @@ mod tests {
         ("/v1/responses/:id/cancel", Family(F::Responses)),
         ("/v1/responses/:id/input_items", Family(F::Responses)),
         ("/v1/audio/transcriptions", Family(F::Audio)),
-        ("/v1/audio/translations", Family(F::Audio)),
         ("/v1/audio/speech", Family(F::Audio)),
         ("/v1/videos", Family(F::Videos)),
         ("/v1/videos/:id", Family(F::Videos)),
         ("/v1/videos/:id/content", Family(F::Videos)),
         ("/v1/realtime", Family(F::Realtime)),
+        ("/v1/realtime/translations", Family(F::Realtime)),
+        ("/v1/realtime/client_secrets", Family(F::Realtime)),
+        (
+            "/v1/realtime/translations/client_secrets",
+            Family(F::Realtime),
+        ),
         ("/v1/files", Family(F::Files)),
         ("/v1/files/:id", Family(F::Files)),
         ("/v1/files/:id/content", Family(F::Files)),
@@ -338,9 +332,6 @@ mod tests {
         ("/v1/messages/batches/:id", Family(F::Batches)),
         ("/v1/messages/batches/:id/cancel", Family(F::Batches)),
         ("/v1/messages/batches/:id/results", Family(F::Batches)),
-        ("/v1/fine_tuning/jobs", Family(F::FineTuning)),
-        ("/v1/fine_tuning/jobs/:id", Family(F::FineTuning)),
-        ("/v1/fine_tuning/jobs/:id/cancel", Family(F::FineTuning)),
         ("/.well-known/oauth-protected-resource", Exempt(NO_KEY)),
         ("/.well-known/oauth-protected-resource/mcp", Exempt(NO_KEY)),
         (
