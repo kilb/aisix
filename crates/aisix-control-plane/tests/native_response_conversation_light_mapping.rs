@@ -27,6 +27,7 @@ use axum::extract::State;
 use axum::http::{Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
+use http_body_util::{BodyExt, Limited};
 use native_gateway::{projected_snapshot, HttpRegistry};
 use serde_json::{json, Value};
 use support::{Bundle, OperatorSession, TestCp, TEST_PASSWORD};
@@ -164,9 +165,11 @@ async fn send(
         .await
         .expect("production router response");
     let status = response.status();
-    let bytes = to_bytes(response.into_body(), 1 << 20)
+    let bytes = Limited::new(response.into_body(), 1 << 20)
+        .collect()
         .await
-        .expect("complete gateway response");
+        .expect("complete gateway response")
+        .to_bytes();
     (
         status,
         serde_json::from_slice(&bytes).expect("gateway response JSON"),
