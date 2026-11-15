@@ -3653,6 +3653,106 @@ pub fn redact_chat_response_structured(
     redact_chat_response_impl(chain, resp, true)
 }
 
+// 正式 Chat 响应沿官方消息槽原位改写，保留未知成员和每个 choice 的其余字段。
+// 字段依据：https://github.com/openai/openai-python/blob/main/src/openai/types/chat/chat_completion_message.py
+pub(crate) fn redact_chat_wire_response_structured(
+    chain: &dyn Guardrail,
+    body: &mut Value,
+) -> AnthropicRequestRedaction {
+    let mut counts = RedactionCounts::new();
+    let mut unrewritable_tool_key = false;
+    if !chain.redacts_output() {
+        return counts.into();
+    }
+    if let Some(choices) = body.get_mut("choices").and_then(Value::as_array_mut) {
+        for choice in choices {
+            let before = masked_spans(&counts);
+            let mut rewritten_replay = false;
+            let Some(message) = choice.get_mut("message") else {
+                continue;
+            };
+            let echo_text = message
+                .get("content")
+                .is_some_and(|content| content.is_string() || content.is_array());
+            let echo_tools = message.get("tool_calls").is_some();
+            if let Some(content) = message.get_mut("content") {
+                if let Some(parts) = content.as_array_mut() {
+                    let (unrewritable, rewritten) = redact_chat_replay_blocks(
+                        chain,
+                        Direction::Output,
+                        parts,
+                        &mut counts,
+                        true,
+                        false,
+                        echo_tools,
+                    );
+                    unrewritable_tool_key |= unrewritable;
+                    rewritten_replay |= rewritten;
+                } else {
+                    apply_to_value_string(chain, Direction::Output, content, &mut counts);
+                }
+            }
+            if let Some(parts) = message
+                .get_mut("content_blocks")
+                .and_then(Value::as_array_mut)
+            {
+                let (unrewritable, rewritten) = redact_chat_replay_blocks(
+                    chain,
+                    Direction::Output,
+                    parts,
+                    &mut counts,
+                    true,
+                    echo_text,
+                    echo_tools,
+                );
+                unrewritable_tool_key |= unrewritable;
+                rewritten_replay |= rewritten;
+            }
+            if let Some(refusal) = message.get_mut("refusal") {
+                apply_to_value_string(chain, Direction::Output, refusal, &mut counts);
+            }
+            if let Some(transcript) = message
+                .get("audio")
+                .and_then(|audio| audio.get("transcript"))
+            {
+                unrewritable_tool_key |= detect_unrewritable_value_strings(
+                    chain,
+                    Direction::Output,
+                    transcript,
+                    &mut counts,
+                );
+            }
+            if let Some(tool_calls) = message.get_mut("tool_calls") {
+                unrewritable_tool_key |= redact_tool_call_arguments(
+                    chain,
+                    Direction::Output,
+                    tool_calls,
+                    &mut counts,
+                    true,
+                );
+            }
+            if let Some(function_call) = message.get_mut("function_call") {
+                unrewritable_tool_key |= redact_legacy_function_call(
+                    chain,
+                    Direction::Output,
+                    function_call,
+                    &mut counts,
+                    true,
+                );
+            }
+            if rewritten_replay || masked_spans(&counts) != before {
+                if let Some(choice) = choice.as_object_mut() {
+                    choice.remove("logprobs");
+                }
+            }
+        }
+    }
+    AnthropicRequestRedaction {
+        counts,
+        unrewritable_tool_key,
+    }
+}
+
 pub async fn moderate_chat_response_structured(
     chain: &dyn Guardrail,
     non_segment_verdict: aisix_guardrails::GuardrailVerdict,
@@ -5482,6 +5582,63 @@ mod tests {
 
     fn both() -> Arc<dyn Guardrail> {
         mask_chain(aisix_core::models::GuardrailHookPoint::Both)
+    }
+
+    #[test]
+    fn chat_wire_response_masks_every_choice_without_rebuilding_other_fields() {
+        let mut body = json!({
+            "id":"chatcmpl_original", "model":"alias", "object":"chat.completion",
+            "created":17, "usage":{"prompt_tokens":100,"completion_tokens":10,"total_tokens":110},
+            "metadata":{"owner":"alice@example.com"}, "future":{"opaque":[null,7,"alice@example.com"]},
+            "choices":[
+                {"index":0,"finish_reason":"tool_calls","logprobs":{"content":["alice@example.com"]},
+                 "message":{"role":"assistant","content":"mail alice@example.com",
+                    "refusal":"alice@example.com", "reasoning_content":"alice@example.com",
+                    "annotations":[{"unknown":"alice@example.com"}], "future":"alice@example.com",
+                    "tool_calls":[
+                        {"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{\"address\":\"alice@example.com\"}"}},
+                        {"id":"call_2","type":"custom","custom":{"name":"lookup","input":"alice@example.com"}}
+                    ],
+                    "function_call":{"name":"lookup","arguments":"{\"address\":\"alice@example.com\"}"}}},
+                {"index":1,"finish_reason":"stop","logprobs":{"refusal":["alice@example.com"]},
+                 "message":{"role":"assistant","content":"alice@example.com"}},
+                {"index":2,"finish_reason":"stop","logprobs":{"content":["plain"]},
+                 "message":{"role":"assistant","content":null}}
+            ]
+        });
+        let mut expected = body.clone();
+        expected["choices"][0]["message"]["content"] = json!("mail [EMAIL_REDACTED]");
+        expected["choices"][0]["message"]["refusal"] = json!("[EMAIL_REDACTED]");
+        expected["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] =
+            json!("{\"address\":\"[EMAIL_REDACTED]\"}");
+        expected["choices"][0]["message"]["tool_calls"][1]["custom"]["input"] =
+            json!("[EMAIL_REDACTED]");
+        expected["choices"][0]["message"]["function_call"]["arguments"] =
+            json!("{\"address\":\"[EMAIL_REDACTED]\"}");
+        expected["choices"][1]["message"]["content"] = json!("[EMAIL_REDACTED]");
+        for index in [0, 1] {
+            expected["choices"][index]
+                .as_object_mut()
+                .unwrap()
+                .remove("logprobs");
+        }
+        let redaction = redact_chat_wire_response_structured(both().as_ref(), &mut body);
+        assert!(!redaction.unrewritable_tool_key);
+        assert_eq!(redaction.counts.get("email"), Some(&6));
+        assert_eq!(body, expected);
+    }
+
+    #[test]
+    fn chat_wire_response_refuses_an_unrewritable_audio_transcript() {
+        let mut body = json!({"choices":[{"index":0,"message":{
+            "role":"assistant","content":null,
+            "audio":{"id":"audio_original","data":"opaque","transcript":"alice@example.com"}
+        }}]});
+        let original = body.clone();
+        let redaction = redact_chat_wire_response_structured(both().as_ref(), &mut body);
+        assert!(redaction.unrewritable_tool_key);
+        assert_eq!(redaction.counts.get("email"), Some(&1));
+        assert_eq!(body, original);
     }
 
     fn compat_chat_replay_blocks() -> Vec<Value> {

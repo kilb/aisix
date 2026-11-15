@@ -1348,28 +1348,116 @@ impl Audit {
         .await
     }
 
-    pub(crate) async fn output_for_entry(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn output_response_for_entry(
         &mut self,
         state: &ProxyState,
         auth: &AuthenticatedKey,
         target: &JobTarget,
-        blob: &[u8],
-        requested: &aisix_core::ResourceEntry<aisix_core::Model>,
+        endpoint: &str,
+        body: &mut Value,
+        requested: Option<&aisix_core::ResourceEntry<aisix_core::Model>>,
     ) -> Result<(), ProxyError> {
+        use aisix_guardrails::{Guardrail, SegmentRole};
         self.resolved(target);
-        crate::jobs::scan_output_blob_for_entry(
-            state,
-            auth,
-            target,
-            blob,
+        let (scope_id, model_name) = requested.map_or(
+            (target.model_entry.id.as_str(), target.display_name()),
+            |entry| (entry.id.as_str(), entry.value.display_name.as_str()),
+        );
+        let chain = state
+            .guardrail_index
+            .resolve(&aisix_guardrails::RequestContext {
+                passthrough_route_id: "",
+                model_id: scope_id,
+                mcp_server_id: "",
+                api_key_id: &auth.entry.id,
+                team_id: auth.key().team_id.as_deref(),
+            });
+        if self.applied.is_empty() {
+            self.applied = chain.applied().to_vec();
+        }
+        if !Guardrail::runs_on_output(&chain) {
+            return Ok(());
+        }
+        // 批次持有正式响应，沿对应端点的内容槽写回，未知字段和计费字段不重建。
+        let mut walk = |guardrail: &dyn Guardrail| -> crate::redact::AnthropicRequestRedaction {
+            match endpoint {
+                "/v1/chat/completions" => {
+                    crate::redact::redact_chat_wire_response_structured(guardrail, body)
+                }
+                "/v1/completions" => {
+                    crate::redact::redact_completions_response(guardrail, body).into()
+                }
+                "/v1/responses" => {
+                    crate::redact::redact_responses_response_structured(guardrail, body)
+                }
+                "/v1/images/generations" | "/v1/images/edits" => {
+                    crate::redact::redact_images_response_structured(guardrail, body)
+                }
+                // 向量和分类结果没有生成文本；空内容仍进入完整链，执行独立于文本的规则。
+                _ => crate::redact::RedactionCounts::new().into(),
+            }
+        };
+        let text = crate::redact::collect_segments(|guardrail| {
+            let _ = walk(guardrail);
+        })
+        .into_iter()
+        .filter(|segment| matches!(segment.role, SegmentRole::Rewritable | SegmentRole::Echo))
+        .map(|segment| segment.text)
+        .collect::<Vec<_>>()
+        .join("\n");
+        let synth = aisix_gateway::ChatResponse {
+            native_envelope: None,
+            logprobs: None,
+            more_choices: Vec::new(),
+            id: String::new(),
+            model: model_name.to_owned(),
+            message: aisix_gateway::ChatMessage::assistant(text),
+            finish_reason: aisix_gateway::FinishReason::Stop,
+            usage: UsageStats::default(),
+            service_tier: None,
+        };
+        let (verdict, hits) = Guardrail::check_output_non_segment_observed(&chain, &synth).await;
+        self.monitor.extend(hits);
+        let moderation = crate::redact::moderate_body(
+            &chain,
+            crate::redact::Direction::Output,
+            None,
+            verdict,
+            &mut self.redactions,
             &mut self.monitor,
-            &mut self.enforced,
-            &mut self.scores,
-            &mut self.bypass,
-            &mut self.applied,
-            Some(requested),
+            &mut walk,
         )
-        .await
+        .await;
+        let mut verdict = moderation.verdict;
+        if !verdict.is_block() {
+            let redaction = walk(&chain);
+            crate::redact::merge_counts(&mut self.redactions, redaction.counts);
+            if redaction.unrewritable_tool_key {
+                verdict = crate::redact::unrewritable_tool_key_verdict();
+            }
+        }
+        // 最后才读取审计，确保本地写回的 masked 结果也归入这次管理请求。
+        self.enforced.extend(chain.enforced_hits());
+        self.scores.extend(chain.scores());
+        if self.bypass.is_empty() {
+            if let Some(reason) = chain.bypass_reason() {
+                self.bypass = reason;
+            }
+        }
+        if let aisix_guardrails::GuardrailVerdict::Block {
+            guardrail_name,
+            unavailable,
+            ..
+        } = verdict
+        {
+            return Err(crate::error::guardrail_block_error(
+                "response",
+                guardrail_name.as_deref(),
+                unavailable.as_deref(),
+            ));
+        }
+        Ok(())
     }
 }
 

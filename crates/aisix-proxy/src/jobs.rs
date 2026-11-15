@@ -4006,14 +4006,18 @@ async fn managed_result_line(
             let requested = (entry.requested_model_id != entry.model_id)
                 .then(|| openai::model_entry_by_id(state, &snapshot, entry.requested_model_id))
                 .transpose()?;
-            let body = serde_json::to_vec(body).map_err(|_| openai::invalid_identity())?;
-            if let Some(requested) = requested.as_ref().filter(|entry| entry.value.is_routing()) {
-                audit
-                    .output_for_entry(state, auth, &target, &body, requested)
-                    .await?;
-            } else {
-                audit.output(state, auth, &target, &body).await?;
-            }
+            audit
+                .output_response_for_entry(
+                    state,
+                    auth,
+                    &target,
+                    &entry.endpoint,
+                    body,
+                    requested
+                        .as_deref()
+                        .filter(|entry| entry.value.is_routing()),
+                )
+                .await?;
         } else {
             let raw =
                 Bytes::from(serde_json::to_vec(body).map_err(|_| openai::invalid_identity())?);
