@@ -1042,6 +1042,16 @@ pub fn limit_untracked_response(response: reqwest::Response) -> reqwest::Respons
     }
 }
 
+/// 仅记录已构建请求交给 HTTP client，不注册模型 IO 或改写请求、响应正文。
+pub async fn send_unobserved(
+    req: reqwest::RequestBuilder,
+) -> Result<reqwest::Response, reqwest::Error> {
+    let (client, request) = req.build_split();
+    let request = request?;
+    crate::response_tap::note_http_dispatch();
+    client.execute(request).await
+}
+
 /// 在最终请求已构建、真正交给 client 前建立观察；不改变等待或正文读取时机。
 pub async fn send(
     req: reqwest::RequestBuilder,

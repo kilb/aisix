@@ -574,15 +574,14 @@ impl A2aBridge for HttpBridge {
     }
 
     async fn send(&self, request: &serde_json::Value) -> Result<serde_json::Value, A2aError> {
-        let resp = self
-            .prepare(
-                self.endpoint
-                    .clone()
-                    .post_on(&self.client)
-                    .timeout(self.upstream.timeout)
-                    .json(request),
-            )
-            .send()
+        let request = self.prepare(
+            self.endpoint
+                .clone()
+                .post_on(&self.client)
+                .timeout(self.upstream.timeout)
+                .json(request),
+        );
+        let resp = aisix_gateway::upstream_io::send_unobserved(request)
             .await
             .map_err(connect_error)?;
         aisix_gateway::note_upstream_response(resp.headers());
@@ -619,14 +618,15 @@ impl A2aBridge for HttpBridge {
         let deadline = tokio::time::Instant::now() + self.upstream.timeout;
         let resp = tokio::time::timeout_at(
             deadline,
-            self.prepare(
-                self.endpoint
-                    .clone()
-                    .post_on(&self.client)
-                    .header(reqwest::header::ACCEPT, SSE_CONTENT_TYPE)
-                    .json(request),
-            )
-            .send(),
+            aisix_gateway::upstream_io::send_unobserved(
+                self.prepare(
+                    self.endpoint
+                        .clone()
+                        .post_on(&self.client)
+                        .header(reqwest::header::ACCEPT, SSE_CONTENT_TYPE)
+                        .json(request),
+                ),
+            ),
         )
         .await
         .map_err(|_| A2aError::Connect("timed out opening the upstream stream".to_string()))?

@@ -555,14 +555,16 @@ async fn dispatch(
                     req = req.timeout(d);
                 }
                 let send_started = Instant::now();
-                let upstream_resp = req.send().await.map_err(|e| {
-                    ProxyError::Bridge(crate::cooldown::note_failure(
-                        tracker,
-                        model_id,
-                        cooldown_cfg,
-                        crate::dispatch::reqwest_error_to_bridge(&e, send_started),
-                    ))
-                })?;
+                let upstream_resp = aisix_gateway::upstream_io::send_unobserved(req)
+                    .await
+                    .map_err(|e| {
+                        ProxyError::Bridge(crate::cooldown::note_failure(
+                            tracker,
+                            model_id,
+                            cooldown_cfg,
+                            crate::dispatch::reqwest_error_to_bridge(&e, send_started),
+                        ))
+                    })?;
                 aisix_gateway::note_upstream_response(upstream_resp.headers());
                 let status = upstream_resp.status();
                 if !status.is_success() {

@@ -139,6 +139,8 @@ impl Intercept for UpstreamIoInterceptor {
         _runtime_components: &RuntimeComponents,
         _cfg: &mut ConfigBag,
     ) -> Result<(), BoxError> {
+        // SDK 已完成构建、认证与签名；观察者注册本身不代表 HTTP 发送。
+        aisix_gateway::response_tap::note_http_dispatch();
         // 只有真正进入传输的 operation 才注册；认证或序列化失败没有虚构交换。
         let io = self
             .io
