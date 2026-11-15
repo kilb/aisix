@@ -666,16 +666,16 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
           </tbody>
         </DataTable>
       )}
-      {rows !== null && <RecordTablePager
+      <RecordTablePager
         page={table.page} pageSize={table.pageSize}
         onPageChange={(page) => {
           if (page <= table.pageCount) table.setPage(page);
           else void loadMore();
         }}
         onPageSizeChange={value => { setPageSize(value); table.setPageSize(value); }}
-        loadedCount={rows.length} hasNext={table.page < table.pageCount || next !== null}
+        loadedCount={rows?.length} hasNext={rows !== null && (table.page < table.pageCount || next !== null)}
         busy={more} label="调用记录"
-      />}
+      />
 
     </Section>
   );
