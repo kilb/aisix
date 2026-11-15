@@ -1,5 +1,6 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
+import "./index.css";
 import { App } from "./App";
 import { ToastProvider } from "./ui/Toast";
 // 中文字体随构建自托管，保留现有 Geist Latin 字形与中点度量。
@@ -7,7 +8,6 @@ import "@fontsource/noto-sans-sc/300.css";
 import "@fontsource/noto-sans-sc/400.css";
 import "@fontsource/noto-sans-sc/500.css";
 import "@fontsource/noto-sans-sc/700.css";
-import "./index.css";
 
 /**
  * The invitation token, if the page was opened from an invitation link

@@ -464,6 +464,11 @@ test("dropdown-controls-retain-keyboard-and-viewport-boundaries", async ({ page 
     await expect(list).toBeVisible();
     await expect(page.getByRole("option")).toHaveText(["10", "25", "50"]);
     await expect(list).toHaveAttribute("data-side", /^(top|bottom)$/);
+    const popupFrame = await list.evaluate(element => {
+      const style = getComputedStyle(element);
+      return { border: Number.parseFloat(style.borderTopWidth), shadow: style.boxShadow };
+    });
+    expect(popupFrame.border > 0 || popupFrame.shadow !== "none", "弹层必须与下方表格有可见分隔").toBe(true);
     const bounds = await list.boundingBox();
     expect(bounds).not.toBeNull();
     expect(bounds!.x).toBeGreaterThanOrEqual(0); expect(bounds!.y).toBeGreaterThanOrEqual(0);
