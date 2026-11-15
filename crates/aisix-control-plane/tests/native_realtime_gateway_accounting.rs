@@ -1541,3 +1541,225 @@ async fn granted_asr_alias_uses_upstream_name_and_separate_paid_metrics_and_mode
     gateway.assert_billing_sink_empty().await;
     paid_asr(&f, secondary, 1).await;
 }
+
+// 已同步的本地模型 ACL 撤 B 留 A：旧 accepted B 尾量保留，新 audio 必须在供应商前停止。
+#[tokio::test]
+async fn projected_secondary_grant_revocation_keeps_main_enabled_and_accepted_asr_tail_but_blocks_new_audio(
+) {
+    let Some(f) = fixture().await else { return };
+    let secondary = secondary_alias(&f, true, None).await;
+    let mut gateway = Gateway::start(&f).await;
+    let initial_snapshot = gateway.state.snapshot.load();
+    let initial_key = initial_snapshot
+        .apikeys
+        .get_by_id(&f.key.to_string())
+        .expect("the actual initially granted key is in the serving snapshot");
+    assert!(
+        !initial_key.value.disabled
+            && initial_key.value.can_access(&initial_snapshot, MODEL)
+            && initial_key.value.can_access(&initial_snapshot, ASR_ALIAS),
+        "the same enabled key initially has both real A and B grants"
+    );
+    let mut socket = gateway.connect(&f.bearer).await;
+    let initial = next_event(&mut socket).await;
+    assert!(initial.get("type") == Some(&json!("session.created")));
+    assert!(
+        f.provider
+            .state
+            .handshakes
+            .lock()
+            .expect("actual initial provider handshake log")
+            .as_slice()
+            == [true],
+        "the original authenticated account/project/main-model provider actually upgraded"
+    );
+    let mut expected = Vec::new();
+    committed_audio(&f, &mut socket, "item_main_before_b", None, &mut expected).await;
+    main_response(&f, &mut socket, &mut expected).await;
+    paid_asr(&f, secondary, 0).await;
+    socket
+        .send(Message::Text(
+            json!({"type":"session.update","event_id":"configure_b_before_projected_revocation",
+                "session":{"type":"realtime","audio":{"input":{"transcription":{"model":ASR_ALIAS}}}}})
+            .to_string(),
+        ))
+        .await
+        .expect("request the genuinely granted B alias on the positive A connection");
+    expected.push("session.update");
+    f.provider.received(&expected).await;
+    assert!(
+        f.provider
+            .state
+            .secondary_models
+            .lock()
+            .expect("actual B upstream model log")
+            .as_slice()
+            == [true],
+        "the original provider actually receives ASR's upstream name rather than its local alias"
+    );
+    let mut configured = initial
+        .get("session")
+        .expect("actual original provider session")
+        .clone();
+    configured["audio"] = json!({"input":{"transcription":{"model":ASR}}});
+    f.provider.send(json!({"type":"session.updated","event_id":"b_applied_before_revocation","session":configured}));
+    let ack = next_event(&mut socket).await;
+    assert!(
+        ack.get("type") == Some(&json!("session.updated"))
+            && ack.pointer("/session/audio/input/transcription/model") == Some(&json!(ASR)),
+        "the real provider applies B before the input whose tail will survive revocation"
+    );
+    committed_audio(
+        &f,
+        &mut socket,
+        "item_b_accepted_before_projection",
+        Some("item_main_before_b"),
+        &mut expected,
+    )
+    .await;
+    let path = format!("/admin/tenants/{}", f.tenant);
+    let current = f.cp.send("GET", &path, Some(f.admin.cookie()), None).await;
+    assert_eq!(current.status, 200);
+    let revoked =
+        f.cp.send_conditional(
+            "PATCH",
+            &path,
+            f.admin.cookie(),
+            current.body["version"]
+                .as_i64()
+                .expect("actual tenant version"),
+            json!({"allowed_model_ids":[f.model]}),
+        )
+        .await;
+    assert_eq!(
+        revoked.status, 200,
+        "the actual public grant API revokes B while retaining A"
+    );
+    let actual_grants: Vec<Uuid> =
+        sqlx::query_scalar("SELECT allowed_model_ids FROM tenants WHERE id=$1")
+            .bind(f.tenant)
+            .fetch_one(f.cp.db().pool())
+            .await
+            .expect("read actual persisted grants without mutating authority");
+    assert!(
+        actual_grants.contains(&f.model) && !actual_grants.contains(&secondary),
+        "the real CP retained A and withdrew only B"
+    );
+    let projected = projected_snapshot(&f.cp).await;
+    let projected_key = projected
+        .apikeys
+        .get_by_id(&f.key.to_string())
+        .expect("actual CP to kine projection retains the same creator key");
+    assert!(
+        !projected_key.value.disabled
+            && projected_key.value.can_access(&projected, MODEL)
+            && !projected_key.value.can_access(&projected, ASR_ALIAS),
+        "the actual projected key remains enabled and allows A while denying B"
+    );
+    gateway.state.snapshot.store(projected);
+    let applied = gateway.state.snapshot.load();
+    let applied_key = applied
+        .apikeys
+        .get_by_id(&f.key.to_string())
+        .expect("read the original key from the actual serving snapshot");
+    assert!(
+        !applied_key.value.disabled
+            && applied_key.value.can_access(&applied, MODEL)
+            && !applied_key.value.can_access(&applied, ASR_ALIAS),
+        "before either tail or new work, the same serving gateway has applied B-only revocation and kept A callable"
+    );
+    // 新权限只约束新工作；已接受 item/content 的真实 B 数量不能被当前 grant 抹掉。
+    f.provider.send(asr_done(
+        "item_b_accepted_before_projection",
+        "b_tail_after_actual_projection",
+    ));
+    let completed = next_event(&mut socket).await;
+    assert!(
+        completed.get("type")
+            == Some(&json!(
+                "conversation.item.input_audio_transcription.completed"
+            ))
+            && completed.get("item_id") == Some(&json!("item_b_accepted_before_projection"))
+            && completed.get("content_index") == Some(&json!(0)),
+        "the accepted B item/content-zero tail is actually relayed after local B revocation"
+    );
+    assert_eq!(
+        completed.pointer("/usage/input_token_details/audio_tokens"),
+        Some(&json!(5))
+    );
+    assert_eq!(
+        completed.pointer("/usage/input_token_details/text_tokens"),
+        Some(&json!(0))
+    );
+    assert_eq!(completed.pointer("/usage/total_tokens"), Some(&json!(6)));
+    f.provider.send(asr_done(
+        "item_b_accepted_before_projection",
+        "same_accepted_b_changed_delivery_after_projection",
+    ));
+    f.provider.send(json!({"type":"rate_limits.updated","event_id":"b_duplicate_processed_before_new_audio","rate_limits":[]}));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let event = next_event(&mut socket).await;
+            if event.get("type") == Some(&json!("rate_limits.updated"))
+                && event.get("event_id") == Some(&json!("b_duplicate_processed_before_new_audio"))
+            {
+                break;
+            }
+            assert!(
+                event.get("type")
+                    == Some(&json!(
+                        "conversation.item.input_audio_transcription.completed"
+                    ))
+                    && event.get("item_id") == Some(&json!("item_b_accepted_before_projection")),
+                "only the known duplicate can precede the actual same-WS processing marker"
+            );
+        }
+    })
+    .await
+    .expect("the actual provider duplicate precedes the received marker; no queued fake receipt");
+    paid_asr(&f, secondary, 1).await;
+    let before = f
+        .provider
+        .state
+        .received
+        .lock()
+        .expect("complete positive provider input history")
+        .clone();
+    assert!(
+        before.iter().map(String::as_str).eq(expected.iter().copied()),
+        "the provider positively read main PCM/response and the granted B configuration/input before the refusal"
+    );
+    let attempt = socket
+        .send(Message::Text(
+            json!({"type":"input_audio_buffer.append",
+        "event_id":"new_b_audio_after_applied_grant_revocation",
+        "audio":base64::engine::general_purpose::STANDARD.encode([0_u8;4800])})
+            .to_string(),
+        ))
+        .await;
+    if attempt.is_ok() {
+        await_denial(&mut socket).await;
+    }
+    drain_provider(&f, socket).await;
+    assert!(
+        f.provider
+            .state
+            .received
+            .lock()
+            .expect("fully drained provider input history")
+            .as_slice()
+            == before.as_slice(),
+        "new audio or commit cannot reach active B after actual local revocation, while A's key remains enabled"
+    );
+    paid_asr(&f, secondary, 1).await;
+    assert_asr_detail_presence(&f, secondary).await;
+    assert_per_model_metrics(&gateway).await;
+    gateway.assert_billing_sink_empty().await;
+    let facts: (i64, i64, i64) = sqlx::query_as("SELECT (SELECT count(*) FROM native_live_journal),(SELECT count(*) FROM native_live_outbox),(SELECT count(*) FROM usage_events)")
+        .fetch_one(f.cp.db().pool()).await.expect("read all actual facts after the processed duplicate and refused new work");
+    assert_eq!(
+        facts,
+        (2, 2, 2),
+        "one A144 and one accepted B700 survive revocation and changed delivery ID exactly once"
+    );
+}
