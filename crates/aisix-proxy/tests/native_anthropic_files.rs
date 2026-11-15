@@ -1068,3 +1068,113 @@ async fn native_file_model_quota_rejections_keep_resolved_attribution_on_every_r
         assert!(events.try_recv().is_err());
     }
 }
+
+async fn generated_stream_file_is_bound_before_release(fail_bind: bool) {
+    let upstream = MockServer::start().await;
+    let registry = Arc::new(Registry {
+        fail_bind,
+        ..Registry::default()
+    });
+    let (router, _) = app(&upstream.uri(), registry.clone());
+    let file_id = "file_generated_stream_observation";
+    // 官方执行结果块中的文件槽；普通文本与任意 metadata 不作为产物。
+    let events = [
+        json!({"type":"message_start","message":{
+            "id":"msg_generated_stream","type":"message","role":"assistant",
+            "model":"provider-model","content":[],"usage":{"input_tokens":5,"output_tokens":0}
+        }}),
+        json!({"type":"content_block_start","index":0,"content_block":{
+            "type":"bash_code_execution_tool_result","tool_use_id":"srvtoolu_generated_stream",
+            "content":{"type":"bash_code_execution_result","stdout":"","stderr":"","return_code":0,
+                "content":[{"type":"bash_code_execution_output","file_id":file_id}]}
+        }}),
+        json!({"type":"content_block_stop","index":0}),
+        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}),
+        json!({"type":"message_stop"}),
+    ];
+    let sse = events
+        .iter()
+        .map(|event| {
+            format!(
+                "event: {}\ndata: {event}\n\n",
+                event["type"].as_str().unwrap()
+            )
+        })
+        .collect::<String>();
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("x-api-key", "caller")
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"model":"native-model","stream":true,"max_tokens":32,
+                        "messages":[{"role":"user","content":"Execute the supplied task"}]})
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut chunks = response.into_body().into_data_stream();
+    let mut received = Vec::new();
+    let mut saw_file_frame = false;
+    while let Some(chunk) = futures::StreamExt::next(&mut chunks).await {
+        received.extend_from_slice(&chunk.unwrap());
+        if String::from_utf8_lossy(&received).contains(file_id) {
+            // 在继续 poll 到下一帧前核持久边界，事后登记不能通过此断言。
+            let records = registry.records.lock().unwrap();
+            let record = records
+                .get(file_id)
+                .expect("file frame released before bind");
+            assert_eq!(record.api_key_id, Some(Uuid::parse_str(KEY).unwrap()));
+            assert_eq!(record.kind, Some(NativeObjectKind::File));
+            saw_file_frame = true;
+        }
+    }
+    let operations = registry.operations.lock().unwrap();
+    assert_eq!(
+        operations.len(),
+        1,
+        "output registration must actually begin"
+    );
+    assert_eq!(
+        operations.values().next().unwrap().kind,
+        NativeObjectKind::File
+    );
+    if fail_bind {
+        assert!(!saw_file_frame);
+        assert!(!String::from_utf8_lossy(&received).contains(file_id));
+        assert!(registry.records.lock().unwrap().is_empty());
+    } else {
+        assert!(
+            saw_file_frame,
+            "successful bind must preserve the original file id"
+        );
+        assert_eq!(registry.records.lock().unwrap().len(), 1);
+    }
+}
+
+// 删除流中的产物观察会同时丢失登记，不能靠省掉整个分支优化解析次数。
+#[tokio::test]
+async fn streamed_generated_file_is_bound_before_its_id_is_released() {
+    generated_stream_file_is_bound_before_release(false).await;
+}
+
+#[tokio::test]
+async fn streamed_generated_file_is_withheld_when_binding_fails() {
+    generated_stream_file_is_bound_before_release(true).await;
+}
