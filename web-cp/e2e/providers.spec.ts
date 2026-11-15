@@ -1,5 +1,6 @@
 import { expect, test, type Locator, type Page } from "@playwright/test";
 import { STACK_START_TIMEOUT_MS, startStack, type Json, type Stack } from "./stack";
+import { selectOptions } from "./select";
 
 /**
  * The upstream accounts tab: the account form and its schema-driven
@@ -135,8 +136,8 @@ async function accountNamed(name: string): Promise<Json> {
 async function fieldValues(page: Page, selector: string): Promise<string> {
   return page.evaluate(
     (sel) =>
-      Array.from(document.querySelectorAll(`${sel} input, ${sel} textarea, ${sel} select`))
-        .map((el) => (el as HTMLInputElement).value)
+      Array.from(document.querySelectorAll(`${sel} input, ${sel} textarea, ${sel} select, ${sel} [role="combobox"]`))
+        .map((el) => el.getAttribute("data-value") ?? (el as HTMLInputElement).value)
         .join("\n"),
     selector,
   );
@@ -169,7 +170,8 @@ test("协议族的选项就是网关 schema 里的 Adapter 枚举", async ({ pag
   await loginAsOperator(page);
   await openTab(page, "上游账号");
   await page.getByRole("button", { name: "新增上游账号" }).click();
-  await expect(page.getByLabel("协议族").locator("option")).toHaveText(schema.definitions.Adapter.enum);
+  await expect(await selectOptions(page.getByLabel("协议族"))).toHaveText(schema.definitions.Adapter.enum);
+  await page.keyboard.press("Escape");
 });
 
 /** Three or more English words in a row: prose, as opposed to an identifier such as `openai`. */

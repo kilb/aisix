@@ -1,5 +1,6 @@
 import { expect, test, type Page } from "@playwright/test";
 import { STACK_START_TIMEOUT_MS, fundTenant, startStack, type ApiClient, type Json, type Stack } from "./stack";
+import { chooseSelect, selectOptions } from "./select";
 
 /**
  * The Keys tab, the operator's side of API keys: minting (the plaintext shown
@@ -115,7 +116,7 @@ async function login(page: Page, email: string, password: string): Promise<void>
 async function openKeys(page: Page, org?: string): Promise<void> {
   await login(page, stack.operator.email, stack.operator.password);
   await page.locator('[data-tab="keys"]').click();
-  if (org) await page.getByLabel("租户").selectOption({ label: org });
+  if (org) await chooseSelect(page.getByLabel("租户"), { label: org });
 }
 
 const keyTable = (page: Page) => page.getByRole("table", { name: "密钥列表" });
@@ -134,9 +135,13 @@ test("新建内部密钥：明文可随时再次复制，用它能调网关", as
   await openKeys(page);
   // The platform's own tenant comes first and is the one shown.
   const picker = page.getByLabel("租户");
-  await expect(picker.locator("option")).not.toHaveCount(1);
-  await expect(picker.locator("option").first()).toContainText("平台内部");
-  expect(await picker.inputValue()).toBe(await picker.locator("option").first().getAttribute("value"));
+  const tenantOptions = await selectOptions(picker);
+  await expect(tenantOptions).not.toHaveCount(1);
+  await expect(tenantOptions.first()).toContainText("平台内部");
+  const firstTenant = await tenantOptions.first().evaluate(option => option.getAttribute("data-value") ?? option.getAttribute("value"));
+  await page.keyboard.press("Escape");
+  expect(firstTenant).not.toBeNull();
+  await expect(picker).toHaveAttribute("data-value", firstTenant!);
 
   await page.getByRole("button", { name: "新建密钥" }).click();
   const form = page.getByRole("group", { name: "新建密钥" });
@@ -144,7 +149,7 @@ test("新建内部密钥：明文可随时再次复制，用它能调网关", as
   // The platform's own tenant chooses among every live group, so the
   // operator answers the select. The account serving `chat-t6-*` is in `shared`,
   // offered by its display name with the routing name beside it.
-  await form.getByLabel("分组（必选）").selectOption({ label: "通用分组（shared）" });
+  await chooseSelect(form.getByLabel("分组（必选）"), { label: "通用分组（shared）" });
   await form.getByLabel("模型（可写通配）").fill("chat-t6-*");
   await form.getByRole("button", { name: "创建" }).click();
 
@@ -237,7 +242,7 @@ test("内部密钥的明文可以再次复制；客户租户的密钥没有复�
   // sign-up above added.
   await page.reload();
   await page.locator('[data-tab="keys"]').click();
-  await page.getByLabel("租户").selectOption({ label: t.org });
+  await chooseSelect(page.getByLabel("租户"), { label: t.org });
   const theirs = keyRow(page, "customer-reveal-t6");
   await expect(theirs).toBeVisible();
   await expect(theirs.getByRole("button", { name: "复制密钥", exact: true })).toHaveCount(0);
@@ -283,7 +288,7 @@ test("停用后网关返回 401，启用后恢复", async ({ page }) => {
   // After a reload the page shows what the control plane holds: still off.
   await page.reload();
   await page.locator('[data-tab="keys"]').click();
-  await page.getByLabel("租户").selectOption({ label: t.org });
+  await chooseSelect(page.getByLabel("租户"), { label: t.org });
   await expect(row).toContainText("已停用");
   await row.getByRole("button", { name: "启用" }).click();
   await expect(row).toContainText("正常");
@@ -412,7 +417,7 @@ test("给客户租户新建密钥：只能调用所选模型，限额与过期�
   await expect(choices.getByRole("checkbox", { name: "alpha-t6-e2e" })).toHaveCount(0);
   await form.getByLabel("名称").fill("scoped-key-t6");
   // The tenant has one group, chosen in the form already.
-  await expect(form.getByLabel("分组（必选）")).toHaveValue("shared");
+  await expect(form.getByLabel("分组（必选）")).toHaveAttribute("data-value", "shared");
   await choices.getByRole("checkbox", { name: "chat-t6-e2e" }).check();
   await form.getByLabel("并发").fill("2");
   await form.getByLabel("每分钟请求").fill("30");
@@ -563,9 +568,11 @@ test("分组只选一个：分组没有上游账号时先警告并要求确认�
   await form.getByLabel("名称").fill("unreach-key-t6");
   const select = form.getByLabel("分组（必选）");
   // The placeholder and the tenant's own two groups, and no others.
-  await expect(select.locator("option")).toHaveCount(3);
-  await expect(select.locator("option", { hasText: "grp-alpha-7c1" })).toHaveCount(0);
-  await select.selectOption({ label: "grp-none-6b2" });
+  const groupOptions = await selectOptions(select);
+  await expect(groupOptions).toHaveCount(3);
+  await expect(groupOptions.filter({ hasText: "grp-alpha-7c1" })).toHaveCount(0);
+  await page.keyboard.press("Escape");
+  await chooseSelect(select, { label: "grp-none-6b2" });
   await form.getByRole("button", { name: "创建" }).click();
   await expect(form.getByRole("alert")).toContainText("grp-none-6b2");
   expect((await stack.admin.get(`/admin/tenants/${t.id}/keys`)).items).toEqual([]);
@@ -598,8 +605,9 @@ test("为客户租户新建密钥：从租户的分组里选一个，创建后�
   // A choice is required: the create button stays disabled until one is made.
   await expect(form.getByRole("button", { name: "创建" })).toBeDisabled();
   // Each option is the group's display name; a routing name that differs is shown with it.
-  await expect(select.locator("option", { hasText: "Alpha 分组 7c1" })).toContainText("grp-alpha-7c1");
-  await select.selectOption({ label: "Alpha 分组 7c1（grp-alpha-7c1）" });
+  await expect((await selectOptions(select)).filter({ hasText: "Alpha 分组 7c1" })).toContainText("grp-alpha-7c1");
+  await page.keyboard.press("Escape");
+  await chooseSelect(select, { label: "Alpha 分组 7c1（grp-alpha-7c1）" });
   await form.getByRole("button", { name: "创建" }).click();
   await expect
     .poll(() => page.getByRole("region", { name: "密钥已创建" }).getByLabel("密钥明文").textContent())
@@ -823,8 +831,9 @@ test("待审核的租户在密钥页没有新建密钥", async ({ page }) => {
   await openKeys(page, active.org);
   await expect(page.getByRole("button", { name: "新建密钥" })).toBeVisible();
   const picker = page.getByLabel("租户");
-  const option = await picker.locator("option", { hasText: pending }).getAttribute("value");
-  await picker.selectOption(option!);
+  const option = await (await selectOptions(picker)).filter({ hasText: pending }).evaluate(option => option.getAttribute("data-value") ?? option.getAttribute("value"));
+  await page.keyboard.press("Escape");
+  await chooseSelect(picker, option!);
   await expect(page.getByRole("region", { name: new RegExp(pending) })).toBeVisible();
   await expect(page.getByRole("button", { name: "新建密钥" })).toHaveCount(0);
 });
@@ -857,7 +866,7 @@ test("只读账号在密钥页看不到任何操作", async ({ page }) => {
 
   await login(page, viewer.email, viewer.password);
   await page.locator('[data-tab="keys"]').click();
-  await page.getByLabel("租户").selectOption({ label: t.org });
+  await chooseSelect(page.getByLabel("租户"), { label: t.org });
   await expect(keyRow(page, "viewer-key-t6")).toContainText("正常");
   await expect(page.getByRole("button", { name: /新建|创建|停用|启用|吊销|覆盖/ })).toHaveCount(0);
 });

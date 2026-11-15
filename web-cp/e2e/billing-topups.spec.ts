@@ -1,6 +1,7 @@
 import { expect, test, type Browser, type Page } from "@playwright/test";
 import { STACK_START_TIMEOUT_MS, startStack, type Json, type Stack } from "./stack";
 import { rejectTopup, seedTenant, tenantClient, type BillingWorld } from "./world";
+import { chooseSelect } from "./select";
 
 /**
  * 「计费 · 充值审批」 against the real control plane through the built
@@ -75,7 +76,7 @@ test("批准充值需二次确认，批准后租户余额与流水更新", async
   expect(entries[0].balance_after_micro_cny).toBe(50_000);
 
   // 已批准 lists it with its outcome and no controls.
-  await page.getByLabel("状态").selectOption("approved");
+  await chooseSelect(page.getByLabel("状态"), "approved");
   await expect(row).toContainText("已批准");
   await expect(row.getByRole("button")).toHaveCount(0);
 });

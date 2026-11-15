@@ -47,7 +47,7 @@ test("预算失败模式的说明写明对整个环境生效", async ({ page }) 
 
   // 去修改 opens 全部资源 on budget_policy, which shows the same note.
   await note.getByRole("button", { name: "去修改" }).click();
-  await expect(page.getByLabel("资源类型")).toHaveValue("budget_policy");
+  await expect(page.getByLabel("资源类型")).toHaveAttribute("data-value", "budget_policy");
   const generic = page.getByRole("note", { name: "预算失败模式" });
   await expect(generic).toContainText("预算失败模式：sticky: 保持最后状态");
   await expect(generic).toContainText(SCOPE);

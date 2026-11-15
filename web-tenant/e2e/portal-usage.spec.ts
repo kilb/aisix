@@ -2,6 +2,7 @@ import { createServer } from "node:net";
 import { expect, test, type Locator, type Page } from "@playwright/test";
 import { STACK_START_TIMEOUT_MS, startStack, type ApiClient, type Json, type Stack } from "./stack";
 import { SHARED_DISPLAY_NAME, chat, memberKey, seedBillingWorld, waitClearOfUtcMidnight, type BillingWorld, type Login } from "./world";
+import { chooseSelect } from "./select";
 
 /**
  * The tenant portal's 用量 page: the summary and the call log, against the
@@ -478,10 +479,10 @@ test("先未计价、后经重新计价的调用，费用显示重新计价的�
 test("汇总的时间范围超过上限时，在日期旁说明，不发出请求", async ({ page }) => {
   const world = await seedBillingWorld(stack);
   const { summary } = await openUsage(page, world.owner);
-  await expect(summary.getByRole("combobox", { name: "汇总方式" })).toHaveValue("day");
+  await expect(summary.getByRole("combobox", { name: "汇总方式" })).toHaveAttribute("data-value", "day");
   await summary.getByLabel("开始日期（UTC）").fill("2020-01-01");
   await summary.getByLabel("结束日期（UTC）").fill("2020-06-30");
   await expect(summary).toContainText("按天最多 92 天，按月最多 731 天");
-  await summary.getByRole("combobox", { name: "汇总方式" }).selectOption("month");
+  await chooseSelect(summary.getByRole("combobox", { name: "汇总方式" }), "month");
   await expect(summary).not.toContainText("时间范围过大");
 });

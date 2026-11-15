@@ -1,6 +1,7 @@
 import { expect, test, type Locator, type Page } from "@playwright/test";
 import { STACK_START_TIMEOUT_MS, startStack, type Stack } from "./stack";
 import { chat, seedTenant, waitClearOfUtcMidnight, type BillingWorld } from "./world";
+import { chooseSelect } from "./select";
 
 /**
  * 计费 · 账户: every tenant's mode, balance, credit limit and state, and one
@@ -300,7 +301,7 @@ test("余额流水加载更多途中换了类型：旧类型的下一页不混�
   const ledger = region(page, "余额流水");
   const rows = ledger.locator("tbody tr");
   const kinds = () => rows.locator("td:nth-child(2)").allTextContents();
-  await ledger.getByLabel("类型").selectOption({ label: "充值" });
+  await chooseSelect(ledger.getByLabel("类型"), { label: "充值" });
   await expect(rows).toHaveCount(50);
 
   const NEXT_PAGE = /\/billing\/ledger\?.*before=/;
@@ -317,7 +318,7 @@ test("余额流水加载更多途中换了类型：旧类型的下一页不混�
   await arrived;
 
   // 全部: 51 top-ups and 2 扣费, a first page of 50 and a next one of 3.
-  await ledger.getByLabel("类型").selectOption({ label: "全部" });
+  await chooseSelect(ledger.getByLabel("类型"), { label: "全部" });
   await expect(rows).toHaveCount(50);
   const answered = page.waitForResponse(NEXT_PAGE);
   release();

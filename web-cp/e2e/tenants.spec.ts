@@ -1,5 +1,6 @@
 import { expect, test, type Page } from "@playwright/test";
 import { STACK_START_TIMEOUT_MS, fundTenant, startStack, type ApiClient, type Json, type Stack } from "./stack";
+import { chooseSelect } from "./select";
 
 /**
  * The Tenants tab: approval, model grants, provider groups, limits, members,
@@ -132,7 +133,7 @@ test("经 /api 自助注册的租户出现在待审核列表，批准后其会�
   expect((await t.client.get("/api/session")).tenant.status).toBe("pending");
 
   await openTenants(page);
-  await page.getByLabel("按状态筛选").selectOption({ label: "待审核" });
+  await chooseSelect(page.getByLabel("按状态筛选"), { label: "待审核" });
   const row = tenantRow(page, t.org);
   await expect(row).toContainText("待审核");
   // The filter leaves out the platform's own tenant, which is active.
@@ -140,7 +141,7 @@ test("经 /api 自助注册的租户出现在待审核列表，批准后其会�
 
   await row.getByRole("button", { name: "批准" }).click();
   await expect(row).toHaveCount(0);
-  await page.getByLabel("按状态筛选").selectOption({ label: "全部" });
+  await chooseSelect(page.getByLabel("按状态筛选"), { label: "全部" });
   await expect(tenantRow(page, t.org)).toContainText("正常");
   expect((await t.client.get("/api/session")).tenant.status).toBe("active");
 });
@@ -416,7 +417,7 @@ test("运维邀请成员：邀请 token 只显示一次", async ({ page }) => {
   await openTenant(page, t.org);
   const form = page.getByRole("group", { name: "邀请成员" });
   await form.getByLabel("邮箱").fill(email);
-  await form.getByLabel("角色").selectOption({ label: "成员" });
+  await chooseSelect(form.getByLabel("角色"), { label: "成员" });
   await form.getByRole("button", { name: "生成邀请" }).click();
   const shown = form.getByLabel("邀请 token");
   await expect(shown).toBeVisible();

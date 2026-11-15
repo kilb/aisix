@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { expect, test, type Page } from "@playwright/test";
 import { STACK_START_TIMEOUT_MS, startStack, type Json, type Stack } from "./stack";
 import { CALL_MICRO_CNY, chat, seedTenant } from "./world";
+import { chooseSelect } from "./select";
 
 /**
  * 计费 · 计费明细: every charge with its pricing reason, its upstream and its
@@ -67,7 +68,7 @@ test("计费明细按租户与状态筛选", async ({ page }) => {
   ]);
 
   // Tenant filter: only this organisation's two rows.
-  await page.getByLabel("租户").selectOption({ label: world.tenantName });
+  await chooseSelect(page.getByLabel("租户"), { label: world.tenantName });
   await expect(table.getByRole("row")).toHaveCount(3);
   await expect(table.getByRole("row", { name: new RegExp(other.tenantName) })).toHaveCount(0);
   const priced = table.getByRole("row", { name: new RegExp(`${world.model.name}(?!-)`) });
@@ -76,7 +77,7 @@ test("计费明细按租户与状态筛选", async ({ page }) => {
   await expect(priced).toContainText("已计价");
 
   // Status filter: only the unpriced one, with its reason.
-  await page.getByLabel("状态").selectOption({ label: "未计价" });
+  await chooseSelect(page.getByLabel("状态"), { label: "未计价" });
   await expect(table.getByRole("row")).toHaveCount(2);
   const row = table.getByRole("row").nth(1);
   await expect(row).toContainText(world.laterModel!.name);
@@ -84,7 +85,7 @@ test("计费明细按租户与状态筛选", async ({ page }) => {
   await expect(row.getByRole("cell").nth(5)).toHaveText("—");
 
   // Event filter: one known call, with the status filter cleared.
-  await page.getByLabel("状态").selectOption({ label: "全部" });
+  await chooseSelect(page.getByLabel("状态"), { label: "全部" });
   await page.getByLabel("事件").fill(pricedId);
   await page.getByRole("button", { name: "查找" }).click();
   await expect(table.getByRole("row")).toHaveCount(2);
@@ -93,7 +94,7 @@ test("计费明细按租户与状态筛选", async ({ page }) => {
   // A key filter within the tenant.
   await page.getByLabel("事件").fill("");
   await page.getByRole("button", { name: "查找" }).click();
-  await page.getByLabel("密钥").selectOption({ index: 1 });
+  await chooseSelect(page.getByLabel("密钥"), { index: 1 });
   await expect(table.getByRole("row")).toHaveCount(3);
 });
 
@@ -117,7 +118,7 @@ test("加载更多按 next_before 续页", async ({ page }) => {
     .toBe(total);
 
   await openCharges(page);
-  await page.getByLabel("租户").selectOption({ label: world.tenantName });
+  await chooseSelect(page.getByLabel("租户"), { label: world.tenantName });
   const table = page.getByRole("table", { name: "计费明细" });
   await expect(table.getByRole("row")).toHaveCount(51);
   await page.getByRole("button", { name: "加载更多" }).click();
@@ -150,7 +151,7 @@ test("换筛选时不能用上一个筛选的 cursor 续页：新筛选的首页
 
   await openCharges(page);
   const table = page.getByRole("table", { name: "计费明细" });
-  await page.getByLabel("租户").selectOption({ label: a.tenantName });
+  await chooseSelect(page.getByLabel("租户"), { label: a.tenantName });
   await expect(table.getByRole("row")).toHaveCount(51);
   await expect(page.getByRole("button", { name: "加载更多" })).toBeVisible();
 
@@ -171,7 +172,7 @@ test("换筛选时不能用上一个筛选的 cursor 续页：新筛选的首页
       await route.continue();
     },
   );
-  await page.getByLabel("租户").selectOption({ label: b.tenantName });
+  await chooseSelect(page.getByLabel("租户"), { label: b.tenantName });
   // While B's first page is unresolved there is nothing to continue, so no
   // continuation is offered — and the one on screen is A's, not B's.
   await expect(table).toHaveCount(0);
@@ -227,7 +228,7 @@ test("无需计费的行写明原因；模型删除后仍显示名称；可以�
   await stack.admin.del(`/admin/resources/models/${made.id}`, doc.version ?? doc.body.version);
 
   await openCharges(page);
-  await page.getByLabel("租户").selectOption({ label: world.tenantName });
+  await chooseSelect(page.getByLabel("租户"), { label: world.tenantName });
   const table = page.getByRole("table", { name: "计费明细" });
   await expect(table.getByRole("row")).toHaveCount(3);
   const failed = table.getByRole("row").filter({ hasText: "无需计费" });
@@ -248,7 +249,7 @@ test("计费明细写明实际调用的上游与用量，展开后能按公式�
   await chargesFor(world.tenantId, 1);
 
   await openCharges(page);
-  await page.getByLabel("租户").selectOption({ label: world.tenantName });
+  await chooseSelect(page.getByLabel("租户"), { label: world.tenantName });
   const table = page.getByRole("table", { name: "计费明细" });
   await expect(table.getByRole("columnheader")).toContainText(["售价（元）", "成本（元）", "档位", "上游", "用量"]);
   const row = table.getByRole("row").filter({ hasText: world.model.name });

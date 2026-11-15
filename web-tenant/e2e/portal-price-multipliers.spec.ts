@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { expect, test, type Locator, type Page } from "@playwright/test";
 import { STACK_START_TIMEOUT_MS, startStack, type ApiClient, type Stack } from "./stack";
+import { chooseSelect } from "./select";
 
 let stack: Stack;
 const PASSWORD = "pricing-model-groups-pass-1112";
@@ -191,7 +192,7 @@ test("美元基准与分组精确报价切换、详情、搜索和分页保留�
   expect(await page.evaluate(() => performance.timeOrigin)).toBe(pageOrigin);
   await page.getByRole("searchbox", { name: "搜索模型价格", exact: true }).fill("");
   await scope("").click();
-  await page.getByLabel("模型价格分页每页条数", { exact: true }).selectOption("10");
+  await chooseSelect(page.getByLabel("模型价格分页每页条数", { exact: true }), "10");
   await expect(catalog.locator("tbody[data-price-model]")).toHaveCount(10);
   await page.getByRole("button", { name: "下一页", exact: true }).click();
   await expect(catalog.locator("tbody[data-price-model]")).toHaveCount(2);

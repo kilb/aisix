@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { expect, test, type Locator, type Page } from "@playwright/test";
 import { STACK_START_TIMEOUT_MS, startStack, type Stack } from "./stack";
+import { chooseSelect, selectOptions } from "./select";
 
 /**
  * 价格 · 导入审核 against the real control plane through the built `dist/`.
@@ -124,7 +125,7 @@ test("未勾选核对声明时确认按钮不可用", async ({ page }) => {
   const panel = await openProposal(page, "anthropic/claude-v1");
   const confirm = panel.getByRole("button", { name: "确认", exact: true });
   // Preselected to the model the upload matched, and ready but for the attestation.
-  await expect(panel.getByLabel("模型")).toHaveValue(model.id);
+  await expect(panel.getByLabel("模型")).toHaveAttribute("data-value", model.id);
   await expect(confirm).toBeDisabled();
 
   await panel.getByRole("checkbox", { name: "已对照官方价格页核对" }).check();
@@ -177,10 +178,11 @@ test("上游账号经公共模型提供的条目，确认表单预选公共模�
 
   const panel = await openProposal(page, "openai/gpt-3.5-turbo-16k");
   const select = panel.getByLabel("模型");
-  await expect(select).toHaveValue(pub.id);
-  await expect(select.locator("option:checked")).toHaveText(publicName);
+  await expect(select).toHaveAttribute("data-value", pub.id);
+  await expect(select).toHaveText(publicName);
   // No choice the form offers names an upstream account.
-  await expect(select.locator("option", { hasText: "#acct-" })).toHaveCount(0);
+  await expect((await selectOptions(select)).filter({ hasText: "#acct-" })).toHaveCount(0);
+  await page.keyboard.press("Escape");
 
   await panel.getByRole("checkbox", { name: "已对照官方价格页核对" }).check();
   await panel.getByRole("button", { name: "确认", exact: true }).click();
@@ -331,12 +333,12 @@ test("切换上传批次会丢掉上一个批次的核对声明和勾选", async
 
   // Switching to A drops the tick with its picks: A's rows were not reviewed,
   // so nothing about them may confirm on B's attestation.
-  await page.getByLabel("上传批次").selectOption(idOf("batch-a"));
+  await chooseSelect(page.getByLabel("上传批次"), idOf("batch-a"));
   await expect(row(page, "mistral/mistral-saba")).toBeVisible();
 
   // Back on B, the tick and the picks are gone rather than restored, and the
   // control is disabled: a tick never survives its batch leaving the selector.
-  await page.getByLabel("上传批次").selectOption(idOf("batch-b"));
+  await chooseSelect(page.getByLabel("上传批次"), idOf("batch-b"));
   await expect(row(page, "mistral/ministral-8b")).toBeVisible();
   await expect(bulk.getByRole("checkbox", { name: "已对照官方价格页核对" })).not.toBeChecked();
   await expect(bulk.getByRole("button", { name: /^确认所选/ })).toBeDisabled();
@@ -359,7 +361,7 @@ test("在生效时间输入框里按回车也绕不过核对声明", async ({ pa
   await upload(page);
 
   const panel = await openProposal(page, "mistral/mistral-nemo");
-  await expect(panel.getByLabel("模型")).toHaveValue(model.id);
+  await expect(panel.getByLabel("模型")).toHaveAttribute("data-value", model.id);
   // A typable 生效时间, which is where a keyboard submit starts.
   await panel.getByRole("checkbox", { name: "立即生效" }).uncheck();
   const when = panel.getByLabel("生效时间");
@@ -446,8 +448,8 @@ test("核对前没选模型时，确认被页面拦下，不发请求", async ({
   await upload(page);
 
   const panel = await openProposal(page, "openai/gpt-oss-20b");
-  await expect(panel.getByLabel("模型")).toHaveValue(model.id);
-  await panel.getByLabel("模型").selectOption("");
+  await expect(panel.getByLabel("模型")).toHaveAttribute("data-value", model.id);
+  await chooseSelect(panel.getByLabel("模型"), "");
   await panel.getByRole("checkbox", { name: "已对照官方价格页核对" }).check();
   await panel.getByRole("button", { name: "确认", exact: true }).click();
 

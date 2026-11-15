@@ -50,8 +50,13 @@ export function Select({ value, onValueChange, options, children, size, placehol
   const nativeInvalid = required && String(value) === "" && validationMessage !== "";
   return <span className={cn("ui-select-field", size === "compact" && "ui-select-field-compact")} onInvalid={event => {
     event.preventDefault();
-    setValidationMessage((event.target as HTMLSelectElement).validationMessage);
-    event.currentTarget.querySelector<HTMLButtonElement>('[role="combobox"]')?.focus();
+    const target = event.target as HTMLSelectElement;
+    setValidationMessage(target.validationMessage);
+    const firstInvalid = [...(target.form?.elements ?? [])].find(element => element.matches("input:invalid, select:invalid, textarea:invalid"));
+    if (!firstInvalid || firstInvalid === target) {
+      const trigger = event.currentTarget.querySelector<HTMLButtonElement>('[role="combobox"]');
+      queueMicrotask(() => trigger?.focus());
+    }
   }}><SelectPrimitive.Root value={String(value)} onValueChange={onValueChange} name={name} required={required} form={form} disabled={disabled}>
     <SelectPrimitive.Trigger {...triggerProps} aria-invalid={triggerProps["aria-invalid"] || nativeInvalid || undefined} aria-describedby={[triggerProps["aria-describedby"], nativeInvalid ? validationId : undefined].filter(Boolean).join(" ") || undefined} className={cn("ui-select-trigger", size === "compact" && "ui-select-compact", className)} data-value={String(value)}>
       <span className="ui-select-value"><SelectPrimitive.Value placeholder={selected?.label ?? placeholder}>{selected?.label ?? String(value)}</SelectPrimitive.Value></span>

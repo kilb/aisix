@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { expect, test, type Page } from "@playwright/test";
 import { STACK_START_TIMEOUT_MS, startStack, type Stack } from "./stack";
 import { chat, seedTenant } from "./world";
+import { chooseSelect } from "./select";
 
 /**
  * 价格 · 租户方案 against the real control plane through the built `dist/`.
@@ -34,7 +35,7 @@ async function openPlan(page: Page, tenantName: string, who = stack.operator): P
   await login(page, who.email, who.password);
   await page.locator('[data-tab="pricing"]').click();
   await page.getByRole("button", { name: "租户方案" }).click();
-  await page.getByRole("combobox", { name: "租户" }).selectOption({ label: tenantName });
+  await chooseSelect(page.getByRole("combobox", { name: "租户" }), { label: tenantName });
   await expect(page.getByRole("region", { name: "折扣" })).toBeVisible();
 }
 

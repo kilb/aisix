@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { expect, test, type Locator, type Page } from "@playwright/test";
 import { STACK_START_TIMEOUT_MS, startStack, type Json, type Stack } from "./stack";
+import { chooseSelect } from "./select";
 
 /**
  * 价格 · 基准价 against the real control plane through the built `dist/`.
@@ -111,7 +112,7 @@ test("未定价的模型排在最前，并标为未定价", async ({ page }) => 
 
   // Price the one the alphabet puts first, through the page: it moves after.
   const panel = await openModel(page, later.name);
-  await panel.getByLabel("方式").selectOption("catalogue");
+  await chooseSelect(panel.getByLabel("方式"), "catalogue");
   await panel.getByRole("button", { name: "保存" }).click();
   await expect(page.getByText("已保存")).toBeVisible();
 
@@ -135,9 +136,9 @@ test("从官方目录设置基准价，显示官方目录来源、来源页链�
   await openBaselines(page);
   const started = Date.now();
   const panel = await openModel(page, model.name);
-  await panel.getByLabel("方式").selectOption("catalogue");
+  await chooseSelect(panel.getByLabel("方式"), "catalogue");
   // The model's own entry, preselected from its provider and model name.
-  await expect(panel.getByLabel("目录条目")).toHaveValue("openai/gpt-5.4");
+  await expect(panel.getByLabel("目录条目")).toHaveAttribute("data-value", "openai/gpt-5.4");
   await panel.getByRole("button", { name: "保存" }).click();
   await expect(page.getByText("已保存")).toBeVisible();
 
@@ -168,7 +169,7 @@ test("手动录入必须填写说明；保存后显示手动录入与填写人",
   await openBaselines(page);
   const panel = await openModel(page, model.name);
 
-  await panel.getByLabel("方式").selectOption("manual");
+  await chooseSelect(panel.getByLabel("方式"), "manual");
   await panel.getByLabel("输入", { exact: true }).fill("3");
   await panel.getByLabel("输出", { exact: true }).fill("6");
   await panel.getByRole("button", { name: "保存" }).click();
@@ -197,7 +198,7 @@ test("预约的基准价显示在待生效中", async ({ page }) => {
   await openBaselines(page);
   const panel = await openModel(page, model.name);
 
-  await panel.getByLabel("方式").selectOption("manual");
+  await chooseSelect(panel.getByLabel("方式"), "manual");
   await panel.getByLabel("输入", { exact: true }).fill("5");
   await panel.getByLabel("输出", { exact: true }).fill("10");
   await panel.getByLabel("说明", { exact: true }).fill(note);
@@ -236,7 +237,7 @@ test("只读运维看不到编辑入口", async ({ page }) => {
   await expect(row(page, model.name)).toBeVisible();
   const panel = await openModel(page, model.name);
   await expect(panel.getByRole("heading", { name: "现行与待生效" })).toBeVisible();
-  await expect(panel.getByLabel(/^方式/).and(page.locator("select"))).toHaveCount(0);
+  await expect(panel.getByLabel(/^方式/).and(page.getByRole("combobox"))).toHaveCount(0);
   await expect(panel.getByRole("button", { name: "保存" })).toHaveCount(0);
   await expect(panel.getByRole("form", { name: "新基准价" })).toHaveCount(0);
 });
@@ -254,7 +255,7 @@ test("面板列出每个分组的人民币售价：基准价乘以该分组现�
 
   await openBaselines(page);
   const panel = await openModel(page, model.name);
-  await panel.getByLabel("方式").selectOption("manual");
+  await chooseSelect(panel.getByLabel("方式"), "manual");
   await panel.getByLabel("输入", { exact: true }).fill("3");
   await panel.getByLabel("输出", { exact: true }).fill("6");
   await panel.getByLabel("说明", { exact: true }).fill("矩阵价");
@@ -283,7 +284,7 @@ test("手动录入可以填写多个档位与长上下文档，联网搜索按�
   const model = await newModel("tier-base", "gpt-5.4-nano");
   await openBaselines(page);
   const panel = await openModel(page, model.name);
-  await panel.getByLabel("方式").selectOption("manual");
+  await chooseSelect(panel.getByLabel("方式"), "manual");
 
   // The standard tier: its base, and a band above 200,000 input tokens. A
   // web search is typed as the provider publishes it, $10 per 1,000.
@@ -303,7 +304,7 @@ test("手动录入可以填写多个档位与长上下文档，联网搜索按�
   ]);
 
   // A second tier, batch, with its band at the standard tier's threshold.
-  await panel.getByLabel("要添加的档位").selectOption("batch");
+  await chooseSelect(panel.getByLabel("要添加的档位"), "batch");
   await panel.getByRole("button", { name: "添加档位" }).click();
   const batchBand = panel.getByRole("group", { name: "批量档 长上下文档 1", exact: true });
   await expect(batchBand.getByLabel("输入超过（tokens）")).toHaveValue("200000");
@@ -349,7 +350,7 @@ test("手动录入可以填写多个档位与长上下文档，联网搜索按�
   await page.locator('[data-tab="pricing"]').click();
   await page.getByRole("button", { name: "基准价", exact: true }).click();
   const again = await openModel(page, model.name);
-  await again.getByLabel("方式").selectOption("manual");
+  await chooseSelect(again.getByLabel("方式"), "manual");
   await expect(again.getByRole("group", { name: "批量档 长上下文档 1", exact: true }).getByLabel("输出", { exact: true })).toHaveValue("11.25");
   await expect(again.getByRole("group", { name: "标准档 基础价", exact: true }).getByLabel("联网搜索（每千次）")).toHaveValue("10");
 });
@@ -358,7 +359,7 @@ test("档位的长上下文门槛与标准档不同：在该档位旁报错，�
   const model = await newModel("tier-bad", "gpt-5.4-nano");
   await openBaselines(page);
   const panel = await openModel(page, model.name);
-  await panel.getByLabel("方式").selectOption("manual");
+  await chooseSelect(panel.getByLabel("方式"), "manual");
 
   await fill(panel.getByRole("group", { name: "标准档 基础价", exact: true }), [
     ["输入", "1"],
@@ -370,7 +371,7 @@ test("档位的长上下文门槛与标准档不同：在该档位旁报错，�
     ["输入", "2"],
     ["输出", "4"],
   ]);
-  await panel.getByLabel("要添加的档位").selectOption("batch");
+  await chooseSelect(panel.getByLabel("要添加的档位"), "batch");
   await panel.getByRole("button", { name: "添加档位" }).click();
   await fill(panel.getByRole("group", { name: "批量档 基础价", exact: true }), [
     ["输入", "0.5"],
@@ -415,7 +416,7 @@ test("联网搜索的价格不是每千次的金额时，在字段旁提示，�
   const model = await newModel("search-bad", "gpt-5.4-nano");
   await openBaselines(page);
   const panel = await openModel(page, model.name);
-  await panel.getByLabel("方式").selectOption("manual");
+  await chooseSelect(panel.getByLabel("方式"), "manual");
   await fill(panel.getByRole("group", { name: "标准档 基础价", exact: true }), [
     ["输入", "1"],
     ["输出", "2"],
@@ -433,7 +434,7 @@ test("JSON 视图里每个价格都按每百万单位：提示不说按每千次
   const model = await newModel("search-json", "gpt-5.4-nano");
   await openBaselines(page);
   const panel = await openModel(page, model.name);
-  await panel.getByLabel("方式").selectOption("manual");
+  await chooseSelect(panel.getByLabel("方式"), "manual");
   const card = panel.getByRole("group", { name: "价格卡（美元）" });
   // The fields take a search per thousand.
   await expect(card.getByText("联网搜索按每千次填写", { exact: false })).toBeVisible();
@@ -460,7 +461,7 @@ test("JSON 里写了字段视图读不了的价格卡：切回字段时留在 JS
   const model = await newModel("shape-base", "gpt-5.4-nano");
   await openBaselines(page);
   const panel = await openModel(page, model.name);
-  await panel.getByLabel("方式").selectOption("manual");
+  await chooseSelect(panel.getByLabel("方式"), "manual");
   const card = panel.getByRole("group", { name: "价格卡（美元）" });
   const toggle = card.getByRole("button", { name: "编辑完整价格卡（JSON）" });
 
@@ -534,7 +535,7 @@ for (const { label, broken, path } of [
     const model = await newModel("rate-shape-base", "gpt-5.4-nano");
     await openBaselines(page);
     const panel = await openModel(page, model.name);
-    await panel.getByLabel("方式").selectOption("manual");
+    await chooseSelect(panel.getByLabel("方式"), "manual");
     const card = panel.getByRole("group", { name: "价格卡（美元）" });
     const toggle = card.getByRole("button", { name: "编辑完整价格卡（JSON）" });
 
@@ -598,7 +599,7 @@ test("生效时间是日历上不存在的日子时报错且不写入；闰年�
   const model = await newModel("cal-base", "gpt-5.4-nano");
   await openBaselines(page);
   const panel = await openModel(page, model.name);
-  await panel.getByLabel("方式").selectOption("manual");
+  await chooseSelect(panel.getByLabel("方式"), "manual");
   await panel.getByLabel("输入", { exact: true }).fill("5");
   await panel.getByLabel("输出", { exact: true }).fill("10");
   await panel.getByLabel("说明", { exact: true }).fill("日历");

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { expect, test, type Locator, type Page } from "@playwright/test";
 import { STACK_START_TIMEOUT_MS, fundTenant, startStack, type Json, type Stack } from "./stack";
+import { chooseSelect, selectOptions } from "./select";
 
 /**
  * The model catalog and routing tab: direct models on an upstream account,
@@ -185,7 +186,7 @@ test("直连模型：保存后网关能用它的对外名称调用", async ({ pa
   await page.getByRole("button", { name: "新增直连模型" }).click();
   const form = page.getByRole("form", { name: "新增直连模型" });
   await form.getByLabel("对外名称").fill("chat-e2e");
-  await form.getByLabel("上游账号").selectOption({ label: "acct-chat-e2e" });
+  await chooseSelect(form.getByLabel("上游账号"), { label: "acct-chat-e2e" });
   // The provider comes from the account.
   await expect(form.getByLabel("供应商标识")).toHaveValue("openai");
   await form.getByLabel("上游模型").fill("gpt-4o-mini");
@@ -225,19 +226,20 @@ test("路由模型：选路策略的选项来自 schema，目标行显示各自�
   await openModels(page);
   await page.getByRole("button", { name: "新增路由模型" }).click();
   const form = page.getByRole("form", { name: "新增路由模型" });
-  await expect(form.getByLabel("选路策略").locator("option")).toHaveText(strategies);
-  await expect(form.getByLabel("选路策略")).toHaveValue(preset);
+  await expect(await selectOptions(form.getByLabel("选路策略"))).toHaveText(strategies);
+  await page.keyboard.press("Escape");
+  await expect(form.getByLabel("选路策略")).toHaveAttribute("data-value", preset);
 
   await form.getByLabel("对外名称").fill("route-e2e");
-  await form.getByLabel("选路策略").selectOption(chosen!);
+  await chooseSelect(form.getByLabel("选路策略"), chosen!);
   const first = targetRows(form).nth(0);
-  await first.getByLabel("目标模型").selectOption({ label: "chat-alpha-e2e" });
+  await chooseSelect(first.getByLabel("目标模型"), { label: "chat-alpha-e2e" });
   await first.getByLabel("权重").fill("3");
   await expect(first).toContainText("grp-alpha-7c1");
   await expect(first).not.toContainText("grp-beta-3e9");
   await form.getByRole("button", { name: "添加目标" }).click();
   const second = targetRows(form).nth(1);
-  await second.getByLabel("目标模型").selectOption({ label: "chat-beta-e2e" });
+  await chooseSelect(second.getByLabel("目标模型"), { label: "chat-beta-e2e" });
   await second.getByLabel("优先级").fill("1");
   await expect(second).toContainText("grp-beta-3e9");
   await expect(second).not.toContainText("grp-alpha-7c1");
@@ -370,7 +372,7 @@ test("移除路由目标要两步确认：取消保留，确认后移除，保�
   const form = page.getByRole("form", { name: /route-trim-e2e/ });
   await expect(targetRows(form)).toHaveCount(2);
   const first = targetRows(form).nth(0);
-  await expect(first.getByLabel("目标模型").locator("option:checked")).toHaveText("chat-drop-t-e2e");
+  await expect(first.getByLabel("目标模型")).toHaveText("chat-drop-t-e2e");
   await first.getByRole("button", { name: "移除" }).click();
   await first.getByRole("button", { name: "取消" }).click();
   await expect(targetRows(form)).toHaveCount(2);
@@ -379,7 +381,7 @@ test("移除路由目标要两步确认：取消保留，确认后移除，保�
   await first.getByRole("button", { name: "移除" }).click();
   await first.getByRole("button", { name: "确认移除" }).click();
   await expect(targetRows(form)).toHaveCount(1);
-  await expect(targetRows(form).nth(0).getByLabel("目标模型").locator("option:checked")).toHaveText("chat-keep-t-e2e");
+  await expect(targetRows(form).nth(0).getByLabel("目标模型")).toHaveText("chat-keep-t-e2e");
   // Nothing is written before the save.
   expect((await stack.admin.get(`/admin/resources/models/${route.id}`)).doc.routing.targets).toHaveLength(2);
   await form.getByRole("button", { name: "保存" }).click();
@@ -442,7 +444,7 @@ test("所选上游账号在保存前被删掉：被拒的原因标在上游账�
   await page.getByRole("button", { name: "新增直连模型" }).click();
   const form = page.getByRole("form", { name: "新增直连模型" });
   await form.getByLabel("对外名称").fill("gone-e2e");
-  await form.getByLabel("上游账号").selectOption({ label: "acct-gone-e2e" });
+  await chooseSelect(form.getByLabel("上游账号"), { label: "acct-gone-e2e" });
   await form.getByLabel("上游模型").fill("gpt-4o-mini");
   // Another operator deletes the account before the save.
   await stack.admin.del(`/admin/resources/provider_keys/${account.id}`, account.version);
@@ -522,10 +524,10 @@ test("公共模型的路由设置在这里改：保存后网关照它选路，�
 
   // A generated model starts on the generator's strategy, which is not the
   // schema's own default, and on no setting of its own.
-  await expect(form.getByLabel("选路策略")).toHaveValue("round_robin");
+  await expect(form.getByLabel("选路策略")).toHaveAttribute("data-value", "round_robin");
   await expect(form.getByLabel("重试次数")).toHaveValue("");
 
-  await form.getByLabel("选路策略").selectOption("consistent_hash");
+  await chooseSelect(form.getByLabel("选路策略"), "consistent_hash");
   await form.getByLabel("重试次数").fill("2");
   await form.getByLabel("额外重试的状态码").fill("408, 429");
   await form.getByLabel("429 也参与重试和切换").check();
@@ -575,7 +577,7 @@ test("公共模型的路由设置在这里改：保存后网关照它选路，�
   const again = modelRow(page, publicName);
   await again.getByRole("button", { name: "编辑", exact: true }).click();
   const reopened = page.getByRole("form", { name: `编辑模型「${publicName}」` });
-  await expect(reopened.getByLabel("选路策略")).toHaveValue("consistent_hash");
+  await expect(reopened.getByLabel("选路策略")).toHaveAttribute("data-value", "consistent_hash");
   await expect(reopened.getByLabel("重试次数")).toHaveValue("2");
   await expect(reopened.getByLabel("额外重试的状态码")).toHaveValue("408, 429");
   await expect(reopened.getByLabel("429 也参与重试和切换")).toBeChecked();
@@ -1019,9 +1021,10 @@ test("公共模型的选路策略不提供 least_cost：目标不带价格，控
   await openModels(page);
   await modelRow(page, publicName).getByRole("button", { name: "编辑", exact: true }).click();
   const form = page.getByRole("form", { name: `编辑模型「${publicName}」` });
-  const options = form.getByLabel("选路策略").locator("option");
+  const options = await selectOptions(form.getByLabel("选路策略"));
   await expect(options.filter({ hasText: /^least_latency$/ })).toHaveCount(1);
   await expect(options.filter({ hasText: /^least_cost$/ })).toHaveCount(0);
+  await page.keyboard.press("Escape");
 });
 
 test("保存路由设置后接着改：模型列表先读回来也从刚保存的设置继续，再改一项不丢前面的设置", async ({ page }) => {
@@ -1035,7 +1038,7 @@ test("保存路由设置后接着改：模型列表先读回来也从刚保存�
   await openModels(page);
   await modelRow(page, publicName).getByRole("button", { name: "编辑", exact: true }).click();
   const form = page.getByRole("form", { name: `编辑模型「${publicName}」` });
-  await form.getByLabel("选路策略").selectOption("failover");
+  await chooseSelect(form.getByLabel("选路策略"), "failover");
   await form.getByLabel("重试次数").fill("2");
 
   // After the save, the public models' list is held back for a moment, so
@@ -1057,7 +1060,7 @@ test("保存路由设置后接着改：模型列表先读回来也从刚保存�
   await modelsRead;
   // The form shows what was just saved, not the defaults.
   const again = page.getByRole("form", { name: `编辑模型「${publicName}」` });
-  await expect(again.getByLabel("选路策略")).toHaveValue("failover");
+  await expect(again.getByLabel("选路策略")).toHaveAttribute("data-value", "failover");
   await expect(again.getByLabel("重试次数")).toHaveValue("2");
 
   // Changing one more field and saving keeps the others.
@@ -1096,7 +1099,7 @@ test("内部直连行的查看打开只读表单：名称、账号、上游模�
     await expect(form, who.email).toBeVisible();
     await expect(form.getByLabel("对外名称")).toHaveValue(directName);
     await expect(form.getByLabel("对外名称")).toBeDisabled();
-    await expect(form.getByLabel("上游账号")).toHaveValue(account.id);
+    await expect(form.getByLabel("上游账号")).toHaveAttribute("data-value", account.id);
     await expect(form.getByLabel("上游账号")).toBeDisabled();
     await expect(form.getByLabel("上游模型")).toHaveValue(upstream);
     await expect(form.getByLabel("上游模型")).toBeDisabled();
@@ -1259,8 +1262,9 @@ test("在公共模型的路由表单里添加目标：选另一个上游账号�
   const row = form.getByRole("listitem", { name: /^新目标/ });
   await expect(row).toHaveCount(1);
   // An account that already serves the model is not offered again.
-  await expect(row.getByLabel("上游账号").locator(`option[value="${serving.id}"]`)).toHaveCount(0);
-  await row.getByLabel("上游账号").selectOption(added.id);
+  await expect((await selectOptions(row.getByLabel("上游账号"))).and(page.locator(`[data-value="${serving.id}"], option[value="${serving.id}"]`))).toHaveCount(0);
+  await page.keyboard.press("Escape");
+  await chooseSelect(row.getByLabel("上游账号"), added.id);
   // The operator sees which groups the chosen account serves.
   await expect(row).toContainText("grp-beta-3e9");
   await (await readyUpstream(row)).fill(`gpt-tgt-add-up-${suffix}`);
@@ -1340,7 +1344,7 @@ test("新目标换一个上游账号：新账号会被查询，前一个账号�
   await form.getByRole("button", { name: "添加目标" }).click();
   const row = form.getByRole("listitem", { name: /^新目标/ });
   const account = row.getByLabel("上游账号");
-  await account.selectOption(a.id);
+  await chooseSelect(account, a.id);
   const field = row.getByRole("combobox", { name: "上游模型名称" });
   await field.focus();
   // The first account's answer: its list cannot be fetched from here.
@@ -1350,7 +1354,7 @@ test("新目标换一个上游账号：新账号会被查询，前一个账号�
 
   // The same row switches to the bedrock account: it is asked now, and what
   // the first one answered is not what the second one shows.
-  await account.selectOption(b.id);
+  await chooseSelect(account, b.id);
   await row.getByRole("combobox", { name: "上游模型名称" }).focus();
   await expect.poll(() => looked.filter((id) => id === b.id).length).toBeGreaterThan(0);
   await expect(row.locator(".upicker-reason")).toContainText("该类型的上游不提供模型列表，请直接填写模型名称");
@@ -1365,11 +1369,11 @@ test("新目标换一个上游账号：新账号会被查询，前一个账号�
     await new Promise((r) => setTimeout(r, 2_500));
     await route.continue();
   });
-  await account.selectOption(c.id);
+  await chooseSelect(account, c.id);
   const pending = row.getByRole("combobox", { name: "上游模型名称" });
   await pending.focus();
   await expect(row.locator(".upicker-loading")).toBeVisible();
-  await account.selectOption(b.id);
+  await chooseSelect(account, b.id);
   await row.getByRole("combobox", { name: "上游模型名称" }).focus();
   await expect(row.locator(".upicker-reason")).toContainText("该类型的上游不提供模型列表，请直接填写模型名称");
   // Past the point the first account's answer has arrived.
@@ -1501,7 +1505,7 @@ test("手工路由模型的编辑表单：改目标的权重和优先级、添�
   await first.getByLabel("优先级").fill("2");
   await form.getByRole("button", { name: "添加目标" }).click();
   const second = targetRows(form).nth(1);
-  await second.getByLabel("目标模型").selectOption({ label: `chat-hand-two-${suffix}` });
+  await chooseSelect(second.getByLabel("目标模型"), { label: `chat-hand-two-${suffix}` });
   await second.getByLabel("优先级").fill("1");
   await form.getByRole("button", { name: "保存" }).click();
   await expect(form).toHaveCount(0);

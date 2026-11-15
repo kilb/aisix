@@ -21,11 +21,12 @@ const compiled = await build({
       return <><form onSubmit={event=>event.preventDefault()}>
         <label>角色<Select name="role" value={value} onValueChange={setValue} options={options} size="compact" /></label>
         <label>必填角色<Select value={value} onValueChange={setValue} options={options} required /></label>
+        <label>第二必填角色<Select value={value} onValueChange={setValue} options={options} required /></label>
         <Select aria-label="禁用选择" value="admin" onValueChange={setValue} options={options} disabled />
         <Select aria-label="拒绝选择" aria-invalid="true" aria-describedby="refusal" value={value} onValueChange={setValue} options={options} /><p id="refusal">角色已被拒绝</p>
         <label>可用模型<MultiSelect value={multi} onValueChange={setMulti} options={options.slice(1)} placeholder="选择模型" /></label>
         <button type="submit">保存</button><output aria-label="已选值">{value}</output><output aria-label="多选值">{multi.join(",")}</output>
-      </form><div style={{height:180}} /><div className="table-overflow" style={{position:"fixed",bottom:0,left:0,overflow:"auto",width:"100%",height:60}}><div style={{width:800,display:"flex",justifyContent:"flex-end"}}><Select aria-label="表格角色" size="compact" value={value} onValueChange={setValue} options={options} /><Menu label="更多操作" items={[{label:"不可用操作",disabled:true,onSelect:()=>setAction("错误")},{label:"修改成员",onSelect:()=>setAction("修改")},{label:"停用成员",danger:true,onSelect:()=>setAction("停用")}]} /></div></div><output aria-label="操作结果">{action}</output><button>外部按钮</button></>;
+      </form><div className="table-overflow" style={{position:"fixed",bottom:0,left:0,overflow:"auto",width:"100%",height:60}}><div style={{width:800,display:"flex",justifyContent:"flex-end"}}><Select aria-label="表格角色" size="compact" value={value} onValueChange={setValue} options={options} /><Menu label="更多操作" items={[{label:"不可用操作",disabled:true,onSelect:()=>setAction("错误")},{label:"修改成员",onSelect:()=>setAction("修改")},{label:"停用成员",danger:true,onSelect:()=>setAction("停用")}]} /></div></div><output aria-label="操作结果">{action}</output><button>外部按钮</button></>;
     }
     createRoot(document.getElementById("root")).render(<Journey />);` },
   bundle: true, platform: "browser", format: "iife", jsx: "automatic", write: false,
@@ -58,6 +59,8 @@ test("选择与操作菜单保留键盘、空值、多选、表单、拒绝状�
     await page.keyboard.press("End"); await expect(page.getByRole("option", { name: "这是一个很长的成员角色名称用于验证窄屏弹层不会越过视口边缘", exact: true })).toBeFocused(); await page.keyboard.press("Enter");
     await expect(page.getByRole("status", { name: "已选值", exact: true })).toHaveText("member");
     await expect(role).toBeFocused();
+    assert.ok((await role.boundingBox())!.width <= 240);
+    assert.equal(await role.locator(".ui-select-value").evaluate(element => getComputedStyle(element).textOverflow), "ellipsis");
     assert.deepEqual(await page.locator("form").evaluate(form => [...new FormData(form as HTMLFormElement).entries()]), [["role", "member"]]);
     await role.click(); await expect(page.getByRole("option", { name: "这是一个很长的成员角色名称用于验证窄屏弹层不会越过视口边缘", exact: true })).toBeFocused(); await page.keyboard.press("Home"); await expect(page.getByRole("option", { name: "全部角色", exact: true })).toBeFocused(); await page.keyboard.press("Enter");
     await expect(role).toHaveText("全部角色");
@@ -80,6 +83,7 @@ test("选择与操作菜单保留键盘、空值、多选、表单、拒绝状�
     const list = page.getByRole("listbox");
     await expect(list).toBeVisible();
     await expect(list).toHaveAttribute("data-side", "top");
+    assert.equal(await page.getByRole("option", { name: "这是一个很长的成员角色名称用于验证窄屏弹层不会越过视口边缘", exact: true }).evaluate(element => element.scrollWidth <= element.clientWidth), true);
     assert.equal(await list.evaluate(element => element.closest(".table-overflow") === null), true);
     if (process.env.DROPDOWN_QA_OUTPUT) await page.screenshot({ path: join(process.env.DROPDOWN_QA_OUTPUT, "dropdown-component-375.png") });
     const bounds = await list.boundingBox();

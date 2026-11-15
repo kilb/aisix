@@ -1,6 +1,7 @@
 import { expect, test, type Locator, type Page, type Response } from "@playwright/test";
 import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { chooseSelect } from "../e2e/select";
 
 // 只读真实隔离服务；不拦截响应、不造模型流量、不访问生产地址。
 const session = resolve(process.env.REFINED_QA_SESSION!);
@@ -90,7 +91,7 @@ for (const scope of ["tenant", "admin"] as const) {
     await expect(filters).toBeVisible();
     for (const outcome of ["failed", "succeeded"]) {
       const waiting = page.waitForResponse(response => matching(response, path, { outcome }));
-      await filters.getByLabel("调用结果", { exact: true }).selectOption(outcome);
+      await chooseSelect(filters.getByLabel("调用结果", { exact: true }), outcome);
       const response = await waiting;
       expect(response.status()).toBe(200);
       expect(new URL(response.url()).searchParams.has("before")).toBe(false);
@@ -111,19 +112,19 @@ for (const scope of ["tenant", "admin"] as const) {
       expect(new URLSearchParams(page.url().split("?")[1]).get("outcome")).toBe(outcome);
     }
     await page.goBack();
-    await expect(filters.getByLabel("调用结果", { exact: true })).toHaveValue("failed");
+    await expect(filters.getByLabel("调用结果", { exact: true })).toHaveAttribute("data-value", "failed");
     await filters.getByRole("button", { name: /更多筛选/ }).click();
     await expect(filters.getByLabel("响应缓存", { exact: true })).toBeVisible();
     await expect(filters.getByLabel("实际服务档位", { exact: true })).toBeVisible();
     await expect(filters.getByLabel("API 操作", { exact: true })).toBeVisible();
     if (scope === "tenant") await expect(filters.getByLabel("HTTP 状态码", { exact: true })).toHaveCount(0);
     const waiting = page.waitForResponse(response => matching(response, path, { outcome: "failed", cache_hit: "false" }));
-    await filters.getByLabel("响应缓存", { exact: true }).selectOption("false");
+    await chooseSelect(filters.getByLabel("响应缓存", { exact: true }), "false");
     expect((await waiting).status()).toBe(200);
-    await expect(filters.getByLabel("调用结果", { exact: true })).toHaveValue("failed");
+    await expect(filters.getByLabel("调用结果", { exact: true })).toHaveAttribute("data-value", "failed");
     await filters.getByRole("button", { name: "清除调用结果筛选", exact: true }).click();
-    await expect(filters.getByLabel("调用结果", { exact: true })).toHaveValue("");
-    await expect(filters.getByLabel("响应缓存", { exact: true })).toHaveValue("");
+    await expect(filters.getByLabel("调用结果", { exact: true })).toHaveAttribute("data-value", "");
+    await expect(filters.getByLabel("响应缓存", { exact: true })).toHaveAttribute("data-value", "");
   });
 }
 
@@ -133,19 +134,19 @@ test("legacy failed-call links retain outcome when combining and clearing filter
   await page.goto(`${base}/#calls?status=failed`);
   expect((await initial).status()).toBe(200);
   const filters = page.getByRole("region", { name: "调用结果筛选", exact: true });
-  await expect(filters.getByLabel("调用结果", { exact: true })).toHaveValue("failed");
+  await expect(filters.getByLabel("调用结果", { exact: true })).toHaveAttribute("data-value", "failed");
   await filters.getByRole("button", { name: /更多筛选/ }).click();
   const combined = page.waitForResponse(response => matching(response, "/api/usage/calls", { outcome: "failed", cache_hit: "false" }));
-  await filters.getByLabel("响应缓存", { exact: true }).selectOption("false");
+  await chooseSelect(filters.getByLabel("响应缓存", { exact: true }), "false");
   expect((await combined).status()).toBe(200);
-  await expect(filters.getByLabel("调用结果", { exact: true })).toHaveValue("failed");
+  await expect(filters.getByLabel("调用结果", { exact: true })).toHaveAttribute("data-value", "failed");
   const query = new URLSearchParams(page.url().split("?")[1]);
   expect(query.get("outcome")).toBe("failed");
   expect(query.has("status")).toBe(false);
   const cleared = page.waitForResponse(response => { const url = new URL(response.url()); return url.pathname === "/api/usage/calls" && !url.searchParams.has("outcome") && !url.searchParams.has("cache_hit"); });
   await filters.getByRole("button", { name: "清除调用结果筛选", exact: true }).click();
   expect((await cleared).status()).toBe(200);
-  await expect(filters.getByLabel("调用结果", { exact: true })).toHaveValue("");
+  await expect(filters.getByLabel("调用结果", { exact: true })).toHaveAttribute("data-value", "");
   expect(new URLSearchParams(page.url().split("?")[1]).has("status")).toBe(false);
 });
 

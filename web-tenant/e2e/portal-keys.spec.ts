@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { expect, test, type ElementHandle, type Locator, type Page } from "@playwright/test";
 import { STACK_START_TIMEOUT_MS, fundTenant, startStack, type ApiClient, type Json, type Stack } from "./stack";
+import { chooseSelect, selectOptions } from "./select";
 
 /**
  * The tenant portal's keys and members pages: who sees which keys, a new
@@ -339,7 +340,7 @@ test("未选分组的旧密钥可以选择一次分组", async ({ page }) => {
   // canned 提交的内容未通过校验 — is what the tenant must read.
   await assignGroups(id, ["grp-a-7c3"]);
   await listed.getByRole("button", { name: "选择分组" }).click();
-  await listed.getByRole("combobox", { name: "分组" }).selectOption({ label: "B 通道 7c3" });
+  await chooseSelect(listed.getByRole("combobox", { name: "分组" }), { label: "B 通道 7c3" });
   await listed.getByRole("button", { name: "确认选择" }).click();
   const refusal = page.getByRole("alert").filter({ hasText: "分组" });
   await expect(refusal).toContainText("分组不存在或不可用");
@@ -357,7 +358,7 @@ test("未选分组的旧密钥可以选择一次分组", async ({ page }) => {
   // Before anything is chosen, the tenant is told the choice is for good and
   // what it decides.
   await expect(listed).toContainText("分组只能选择一次，选定后不能更改，并决定这个密钥的价格");
-  await listed.getByRole("combobox", { name: "分组" }).selectOption({ label: "A 通道 7c3" });
+  await chooseSelect(listed.getByRole("combobox", { name: "分组" }), { label: "A 通道 7c3" });
   await listed.getByRole("button", { name: "确认选择" }).click();
   await expect(listed).toContainText("A 通道 7c3");
   await expect(listed).not.toContainText("未选分组");
@@ -593,7 +594,8 @@ test("普通成员只看到自己的密钥", async ({ page, browser }) => {
   await openTab(page, "密钥");
   await expect(row(page, "owner-key-3c9")).toBeVisible();
   await expect(row(page, "member-key-3c9")).toContainText("Mo 3c9");
-  await expect(page.getByLabel("归属成员").getByRole("option", { name: "Mo 3c9" })).toHaveCount(1);
+  await expect((await selectOptions(page.getByLabel("归属成员"))).and(page.getByRole("option", { name: "Mo 3c9" }))).toHaveCount(1);
+  await page.keyboard.press("Escape");
 });
 
 test("账单角色看不到密钥页，直接请求也被拒", async ({ page }) => {
@@ -655,7 +657,7 @@ test("最后一个所有者不能被降级", async ({ page }) => {
   await login(page, "owner@last-6f3.test");
   await openTab(page, "成员");
   const self = row(page, "owner@last-6f3.test");
-  await self.getByRole("combobox").selectOption({ label: "管理员" });
+  await chooseSelect(self.getByRole("combobox"), { label: "管理员" });
   await self.getByRole("button", { name: "确认更改角色" }).click();
   await expect(page.getByRole("alert")).toContainText("组织至少要有一个所有者");
   // Removing the last owner is refused the same way, on a fresh page whose
@@ -796,13 +798,15 @@ test("邀请成员：链接只显示一次，打开即可加入；管理员不�
   await openTab(page, "成员");
   const role = page.getByRole("combobox", { name: "角色", exact: true });
   // Waits for the form, then reads every option it offers.
-  await expect(role.getByRole("option", { name: "成员", exact: true })).toHaveCount(1);
-  expect(await role.getByRole("option").allTextContents()).not.toContain("所有者");
+  const roleOptions = await selectOptions(role);
+  await expect(roleOptions.and(page.getByRole("option", { name: "成员", exact: true }))).toHaveCount(1);
+  expect(await roleOptions.allTextContents()).not.toContain("所有者");
+  await page.keyboard.press("Escape");
 
   /** Invites `email` as a 成员 through the form; the link shown. */
   const invite = async (email: string): Promise<string> => {
     await page.getByLabel("邮箱", { exact: true }).fill(email);
-    await role.selectOption({ label: "成员" });
+    await chooseSelect(role, { label: "成员" });
     await page.getByRole("button", { name: "邀请成员" }).click();
     // Listed as open once issued; the notice may still show an earlier link until then.
     await expect(row(page, email)).toBeVisible();

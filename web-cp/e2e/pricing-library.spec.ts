@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { expect, test, type Locator, type Page } from "@playwright/test";
 import { STACK_START_TIMEOUT_MS, startStack, type Json, type Stack } from "./stack";
+import { chooseSelect, selectOptions } from "./select";
 
 /**
  * 价格 · 价格库 against the real control plane through the built `dist/`.
@@ -178,7 +179,7 @@ test("价格库真正续页，10、25、50条均无重复，搜索从第一页�
 
   await expectRows(entries.slice(0, 25));
   for (const size of [10, 25, 50]) {
-    await readPage(() => sizeControl.selectOption(String(size)), size, 0);
+    await readPage(() => chooseSelect(sizeControl, String(size)), size, 0);
     await expectRows(entries.slice(0, size));
     await readPage(() => pager.getByRole("button", { name: "下一页" }).click(), size, size);
     await expectRows(entries.slice(size, size * 2));
@@ -221,10 +222,11 @@ test("预览同步后一次确认：基准价写入，分组售价按换算率�
   // chosen for the operator.
   const ambiguous = previewRow(page, "gpt-4o");
   await expect(ambiguous).toContainText("多个匹配");
-  const sources = ambiguous.getByLabel("选择价格来源 gpt-4o").locator("option");
+  const sources = await selectOptions(ambiguous.getByLabel("选择价格来源 gpt-4o"));
   await expect(sources.filter({ hasText: "openai · gpt-4o" })).toHaveCount(1);
   await expect(sources.filter({ hasText: "github-copilot · gpt-4o" })).toHaveCount(1);
   await expect(sources.filter({ hasText: "openai · gpt-4o" })).toContainText("$2.5/10 每百万");
+  await page.keyboard.press("Escape");
   await expect(previewRow(page, nothing)).toContainText("无匹配");
 
   // The one confirmation names how many models it writes: every row the
@@ -333,25 +335,27 @@ test("多个匹配的模型选好价格来源后同步：写入基准价、记�
   await expect(row).toContainText("多个匹配");
   const pick = row.getByLabel("选择价格来源 claude-2");
   // Nothing is chosen for the operator.
-  await expect(pick).toHaveValue("");
+  await expect(pick).toHaveAttribute("data-value", "");
   // Every candidate is offered with its own prices.
   const anthropic = snapshot("anthropic", "claude-2");
   const openrouter = snapshot("openrouter", "claude-2");
-  await expect(pick.locator("option", { hasText: "anthropic · claude-2" })).toContainText(
+  const candidates = await selectOptions(pick);
+  await expect(candidates.filter({ hasText: "anthropic · claude-2" })).toContainText(
     `$${anthropic.input}/${anthropic.output} 每百万`,
   );
-  await expect(pick.locator("option", { hasText: "openrouter · claude-2" })).toContainText(
+  await expect(candidates.filter({ hasText: "openrouter · claude-2" })).toContainText(
     `$${openrouter.input}/${openrouter.output} 每百万`,
   );
   // The placeholder, and one line per candidate.
-  await expect(pick.locator("option")).toHaveCount(3);
+  await expect(candidates).toHaveCount(3);
+  await page.keyboard.press("Escape");
   // Nothing is written for it until one is chosen.
   const before = await page
     .getByRole("table", { name: "同步预览" })
     .locator('tr[data-shown="create"], tr[data-shown="update"]')
     .count();
 
-  await pick.selectOption({ value: "anthropic/claude-2" });
+  await chooseSelect(pick, { value: "anthropic/claude-2" });
   // The row now shows what syncing from the chosen entry would do.
   await expect(row).toHaveAttribute("data-shown", "create");
   await expect(row).toContainText("将新增");
@@ -401,7 +405,7 @@ test("多个匹配的模型选好价格来源后同步：写入基准价、记�
   // 重新选择 forgets it, and the model needs a choice again.
   await again.getByRole("button", { name: "重新选择" }).click();
   await expect(again).toContainText("多个匹配");
-  await expect(again.getByLabel("选择价格来源 claude-2")).toHaveValue("");
+  await expect(again.getByLabel("选择价格来源 claude-2")).toHaveAttribute("data-value", "");
   await expect(again).not.toContainText("已选");
 });
 
@@ -419,7 +423,7 @@ test("勾选核对后改选价格来源：核对声明随之取消，同步不�
   const row = previewRow(page, "phi-4-reasoning-plus");
   await expect(row).toContainText("多个匹配");
   const pick = row.getByLabel("选择价格来源 phi-4-reasoning-plus");
-  await pick.selectOption({ value: "azure/phi-4-reasoning-plus" });
+  await chooseSelect(pick, { value: "azure/phi-4-reasoning-plus" });
   const azure = snapshot("azure", "phi-4-reasoning-plus");
   await expect(row).toContainText(`输入 $${azure.input} · 输出 $${azure.output}`);
   const attest = sync.getByRole("checkbox", { name: "已对照官方价格页核对" });
@@ -428,7 +432,7 @@ test("勾选核对后改选价格来源：核对声明随之取消，同步不�
   await expect(all).toBeEnabled();
 
   // The tick was given for the source then shown; another one is not checked.
-  await pick.selectOption({ value: "openrouter/phi-4-reasoning-plus" });
+  await chooseSelect(pick, { value: "openrouter/phi-4-reasoning-plus" });
   const openrouter = snapshot("openrouter", "phi-4-reasoning-plus");
   await expect(row).toContainText(`输入 $${openrouter.input} · 输出 $${openrouter.output}`);
   await expect(attest).not.toBeChecked();
@@ -444,12 +448,12 @@ test("勾选核对后改选价格来源：核对声明随之取消，同步不�
     .click();
   const one = page.getByRole("dialog", { name: "phi-4-multimodal-instruct 的基准价" }).getByRole("region", { name: "从价格库同步" });
   const pickOne = one.getByLabel("选择价格来源 phi-4-multimodal-instruct");
-  await pickOne.selectOption({ value: "azure/phi-4-multimodal-instruct" });
+  await chooseSelect(pickOne, { value: "azure/phi-4-multimodal-instruct" });
   const attestOne = one.getByRole("checkbox", { name: "已对照官方价格页核对" });
   const button = one.getByRole("button", { name: "从价格库同步", exact: true });
   await attestOne.check();
   await expect(button).toBeEnabled();
-  await pickOne.selectOption({ value: "openrouter/phi-4-multimodal-instruct" });
+  await chooseSelect(pickOne, { value: "openrouter/phi-4-multimodal-instruct" });
   const other = snapshot("openrouter", "phi-4-multimodal-instruct");
   await expect(one).toContainText(`输入 $${other.input} · 输出 $${other.output}`);
   await expect(attestOne).not.toBeChecked();
@@ -516,7 +520,7 @@ test("多个匹配的模型选好来源后价格库被替换：预览按新价�
   const sync = page.getByRole("region", { name: "同步基准价" });
   const row = previewRow(page, "command-r-plus");
   await expect(row).toContainText("多个匹配");
-  await row.getByLabel("选择价格来源 command-r-plus").selectOption({ value: "cohere/command-r-plus" });
+  await chooseSelect(row.getByLabel("选择价格来源 command-r-plus"), { value: "cohere/command-r-plus" });
   await expect(row).toContainText(`输入 $${cohere.input} · 输出 $${cohere.output}`);
 
   // Meanwhile, from another tab, the library is replaced. In the new file the

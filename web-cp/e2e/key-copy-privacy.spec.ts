@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { expect, test, type Page } from "@playwright/test";
 import { STACK_START_TIMEOUT_MS, startStack, type Stack } from "./stack";
+import { chooseSelect } from "./select";
 
 let stack: Stack;
 test.use({ trace: "off" });
@@ -42,7 +43,7 @@ test("内部密钥一次性关闭清理与图标复制，剪贴板拒绝可手�
   const form = page.getByRole("group", { name: "新建密钥", exact: true });
   const label = `内部真实复制 ${suffix}`;
   await form.getByLabel("名称", { exact: true }).fill(label);
-  await form.getByLabel("分组（必选）").selectOption({ label: "通用分组（shared）" });
+  await chooseSelect(form.getByLabel("分组（必选）"), { label: "通用分组（shared）" });
   await form.getByLabel("模型（可写通配）").fill(modelName);
   const creation = page.waitForResponse((response) => /\/admin\/tenants\/[^/]+\/keys$/.test(new URL(response.url()).pathname) && response.request().method() === "POST");
   await form.getByRole("button", { name: "创建", exact: true }).click();
@@ -113,7 +114,7 @@ test("内部密钥一次性关闭清理与图标复制，剪贴板拒绝可手�
   const table = page.getByRole("table", { name: "密钥列表", exact: true });
   const stale = table.getByRole("row").filter({ hasText: `旧密钥 ${suffix}` });
   await expect(stale.getByRole("button", { name: "复制密钥", exact: true })).toHaveAttribute("aria-disabled", "true");
-  await page.getByRole("combobox", { name: /^租户/ }).selectOption({ label: `客户复制边界 ${suffix}` });
+  await chooseSelect(page.getByRole("combobox", { name: /^租户/ }), { label: `客户复制边界 ${suffix}` });
   const theirs = table.getByRole("row").filter({ hasText: `客户密钥 ${suffix}` });
   await expect(theirs).toBeVisible();
   await expect(theirs.getByRole("button", { name: /复制密钥|显示|隐藏/ })).toHaveCount(0);

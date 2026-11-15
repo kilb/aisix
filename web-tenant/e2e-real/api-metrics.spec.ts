@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { expect, test, type Locator } from "@playwright/test";
 import { STACK_START_TIMEOUT_MS, startStack, type Json, type Stack } from "../e2e/stack";
 import { invitedMember, login, mintedKey, realCall, realProtocolStream, recorded, seedRealWorld, signedIn } from "./organization-real-world";
+import { chooseSelect } from "../e2e/select";
 
 let stack: Stack;
 test.beforeAll(async () => {
@@ -244,7 +245,7 @@ test("真实请求、响应缓存与中断用量完整聚合，统计分母和�
   await expect(card.getByText(pointText(points.length - 1), { exact: true })).toHaveCount(0);
   await panel.getByRole("button", { name: "延迟", exact: true }).click();
   card = currentCard("延迟");
-  await card.getByRole("combobox", { name: "耗时口径", exact: true }).selectOption({ label: "首 token 延迟" });
+  await chooseSelect(card.getByRole("combobox", { name: "耗时口径", exact: true }), { label: "首 token 延迟" });
   await definition(card, "P50", duration((latencies[0] + latencies[1]) / 2));
   await definition(card, "P95", duration(latencies[0] + (latencies[1] - latencies[0]) * 0.95));
   await definition(card, "P99", duration(latencies[0] + (latencies[1] - latencies[0]) * 0.99));
@@ -252,12 +253,12 @@ test("真实请求、响应缓存与中断用量完整聚合，统计分母和�
   await definition(card, "无实测值", "2");
   await capture("latency");
   for (const label of ["响应延迟", "上游尝试完整耗时"]) {
-    await card.getByRole("combobox", { name: "耗时口径", exact: true }).selectOption({ label });
+    await chooseSelect(card.getByRole("combobox", { name: "耗时口径", exact: true }), { label });
     await expect(card.getByText(`${label} · 平均`, { exact: true })).toBeVisible();
   }
   await panel.getByRole("button", { name: "token", exact: true }).click();
   card = currentCard("token");
-  await card.getByRole("combobox", { name: "token 口径", exact: true }).selectOption({ label: "已记录输入 token" });
+  await chooseSelect(card.getByRole("combobox", { name: "token 口径", exact: true }), { label: "已记录输入 token" });
   await expect(card.getByText("已记录输入 token", { exact: true }).locator("..").getByText(new Intl.NumberFormat("en-US").format(input), { exact: true })).toBeVisible();
   const recordedUsage = displayedMetrics.totals.tokens.known_usage_attempts;
   const missingUsage = displayedMetrics.totals.tokens.unknown_usage_attempts;
@@ -265,14 +266,14 @@ test("真实请求、响应缓存与中断用量完整聚合，统计分母和�
   await definition(card, "用量记录覆盖率", percent(recordedUsage / (recordedUsage + missingUsage)));
   await definition(card, "有可用用量记录的尝试", new Intl.NumberFormat("en-US").format(recordedUsage));
   await definition(card, "无可用用量记录的尝试", new Intl.NumberFormat("en-US").format(missingUsage));
-  await card.getByRole("combobox", { name: "token 口径", exact: true }).selectOption({ label: "已记录输出 token" });
+  await chooseSelect(card.getByRole("combobox", { name: "token 口径", exact: true }), { label: "已记录输出 token" });
   await expect(card.getByText("已记录输出 token", { exact: true }).locator("..").getByText(new Intl.NumberFormat("en-US").format(expectedTokens.completion_tokens), { exact: true })).toBeVisible();
   await capture("tokens");
   await panel.getByRole("button", { name: "缓存", exact: true }).click();
   card = currentCard("缓存");
   await definition(card, "已记录缓存读取", new Intl.NumberFormat("en-US").format(hitTokens));
   await definition(card, "输入 token", new Intl.NumberFormat("en-US").format(input));
-  await card.getByRole("combobox", { name: "缓存口径", exact: true }).selectOption({ label: "响应缓存命中率" });
+  await chooseSelect(card.getByRole("combobox", { name: "缓存口径", exact: true }), { label: "响应缓存命中率" });
   await expect(card.getByText("响应缓存命中率", { exact: true }).filter({ visible: true }).locator("..").getByText(percent(cache.hit_rate), { exact: true })).toBeVisible();
   const cacheDetail = panel.getByRole("heading", { name: "响应缓存与 token 明细", exact: true }).locator("xpath=ancestor::section[1]");
   await definition(cacheDetail, "命中请求", "1");

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { expect, test, type Page } from "@playwright/test";
 import { STACK_START_TIMEOUT_MS, startStack, type Json, type Stack } from "./stack";
 import { CALL_MICRO_CNY, chat, seedTenant, waitClearOfUtcMidnight, type BillingWorld } from "./world";
+import { chooseSelect } from "./select";
 
 /**
  * 「计费 · 重新计价」 against the real control plane and gateway: a model with
@@ -100,9 +101,9 @@ async function preview(page: Page, world: BillingWorld, model: { name: string },
   // A `datetime-local` input drops `:00` seconds from its value, which `fill`
   // reads back as a malformed value: write a whole minute without them.
   await form.getByLabel("结束（UTC）").fill(new Date().toISOString().slice(0, 19).replace(/:00$/, ""));
-  await form.getByLabel("模型").selectOption({ label: model.name });
-  await form.getByLabel("租户").selectOption({ label: world.tenantName });
-  await form.getByLabel("状态").selectOption({ value: status });
+  await chooseSelect(form.getByLabel("模型"), { label: model.name });
+  await chooseSelect(form.getByLabel("租户"), { label: world.tenantName });
+  await chooseSelect(form.getByLabel("状态"), { value: status });
   await form.getByLabel("原因").fill(reason);
   await form.getByRole("button", { name: "预览", exact: true }).click();
   await expect(page.getByRole("region", { name: "预览结果" })).toBeVisible();

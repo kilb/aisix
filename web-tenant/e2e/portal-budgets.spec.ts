@@ -1,6 +1,7 @@
 import { expect, test, type Locator, type Page } from "@playwright/test";
 import { STACK_START_TIMEOUT_MS, startStack, type ApiClient, type Stack } from "./stack";
 import { chat, seedBillingWorld, waitClearOfUtcMidnight, type BillingWorld, type Login } from "./world";
+import { chooseSelect, selectOptions } from "./select";
 
 /**
  * 预算: the organisation's, members' and keys' quotas, against the real
@@ -108,10 +109,10 @@ async function createViaPage(
   q: { scope: "成员" | "密钥"; target: string; kind?: "periodic" | "cumulative"; period?: string; limit: string },
 ): Promise<void> {
   const form = region(page, "新建额度");
-  await form.getByLabel(/^对象类型/).selectOption({ label: q.scope });
-  await form.getByLabel(/^对象(?!类型)/).selectOption(q.target);
-  if (q.kind) await form.getByLabel(/^类型/).selectOption(q.kind);
-  if (q.period) await form.getByLabel(/^周期/).selectOption(q.period);
+  await chooseSelect(form.getByLabel(/^对象类型/), { label: q.scope });
+  await chooseSelect(form.getByLabel(/^对象(?!类型)/), q.target);
+  if (q.kind) await chooseSelect(form.getByLabel(/^类型/), q.kind);
+  if (q.period) await chooseSelect(form.getByLabel(/^周期/), q.period);
   await form.getByLabel("限额（元）").fill(q.limit);
   await form.getByRole("button", { name: "创建" }).click();
 }
@@ -223,10 +224,12 @@ test("成员只能给自己的密钥设额度，看不到组织额度", async ({
   for (const token of ['"scope":"team"', "5430000"]) expect(seen).not.toContain(token);
 
   const form = region(page, "新建额度");
-  await expect(form.getByLabel(/^对象类型/).locator("option")).toHaveText(["密钥"]);
-  const targets = form.getByLabel(/^对象(?!类型)/).locator("option");
+  await expect(await selectOptions(form.getByLabel(/^对象类型/))).toHaveText(["密钥"]);
+  await page.keyboard.press("Escape");
+  const targets = await selectOptions(form.getByLabel(/^对象(?!类型)/));
   await expect(targets).toHaveCount(1);
   await expect(targets.first()).toHaveText("m-key-one");
+  await page.keyboard.press("Escape");
 
   await createViaPage(page, { scope: "密钥", target: s.km.id, period: "month", limit: "0.01" });
   const keys = table(page, "密钥额度");
@@ -245,17 +248,17 @@ test("超过上级额度时给出提示，但仍能保存", async ({ page }) => 
   await expect(rowOf(table(page, "成员额度"), "每月")).toHaveCount(1);
 
   const form = region(page, "新建额度");
-  await form.getByLabel(/^对象类型/).selectOption({ label: "密钥" });
-  await form.getByLabel(/^对象(?!类型)/).selectOption(s.km.id);
+  await chooseSelect(form.getByLabel(/^对象类型/), { label: "密钥" });
+  await chooseSelect(form.getByLabel(/^对象(?!类型)/), s.km.id);
   const warning = form.getByText("超过上级额度时以先用尽者为准");
   // Equal to the member's monthly 0.01 is not above it.
   await form.getByLabel("限额（元）").fill("0.01");
   await expect(warning).toHaveCount(0);
   // A daily cap is not compared with a monthly one.
-  await form.getByLabel(/^周期/).selectOption("day");
+  await chooseSelect(form.getByLabel(/^周期/), "day");
   await form.getByLabel("限额（元）").fill("5.00");
   await expect(warning).toHaveCount(0);
-  await form.getByLabel(/^周期/).selectOption("month");
+  await chooseSelect(form.getByLabel(/^周期/), "month");
   await expect(warning).toBeVisible();
   await form.getByRole("button", { name: "创建" }).click();
 
@@ -343,7 +346,8 @@ test("管理员可以给任何密钥设额度，并修改、删除自己设的�
   await (await apiAs(s.world.owner)).patch(`/api/members/${s.m.id}`, { role: "admin" });
   await openBudgets(page, s.m);
   const form = region(page, "新建额度");
-  await expect(form.getByLabel(/^对象类型/).locator("option")).toHaveText(["成员", "密钥"]);
+  await expect(await selectOptions(form.getByLabel(/^对象类型/))).toHaveText(["成员", "密钥"]);
+  await page.keyboard.press("Escape");
   await createViaPage(page, { scope: "密钥", target: s.k1.id, period: "month", limit: "0.50" });
   const row = rowOf(table(page, "密钥额度"), "world-owner-key");
   await expect(row).toContainText("组织管理员");

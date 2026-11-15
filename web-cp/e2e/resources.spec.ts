@@ -1,5 +1,6 @@
 import { expect, test, type Locator, type Page } from "@playwright/test";
 import { STACK_START_TIMEOUT_MS, fundTenant, startStack, type Json, type Stack } from "./stack";
+import { chooseSelect, selectOptions } from "./select";
 
 /**
  * The cache policies page and the generic resource page ("全部资源"), against
@@ -130,7 +131,7 @@ function row(page: Page, name: string): Locator {
 
 /** Picks `kind` on the generic page. */
 async function pickKind(page: Page, kind: string): Promise<void> {
-  await page.getByLabel("资源类型").selectOption(kind);
+  await chooseSelect(page.getByLabel("资源类型"), kind);
 }
 
 test("缓存策略的范围选项里没有 env，默认选中 team，作用于写入模型 id", async ({ page }) => {
@@ -148,13 +149,14 @@ test("缓存策略的范围选项里没有 env，默认选中 team，作用于�
   await page.getByRole("button", { name: "新建缓存策略" }).click();
 
   const scope = page.getByLabel("范围");
-  const options = await scope.locator("option").evaluateAll((os) => os.map((o) => (o as HTMLOptionElement).value));
+  const options = await (await selectOptions(scope)).evaluateAll((os) => os.map((o) => o.getAttribute("data-value") ?? (o as HTMLOptionElement).value));
   expect(options).toEqual(scopes.filter((s) => s !== "env"));
-  await expect(scope).toHaveValue("team");
+  await page.keyboard.press("Escape");
+  await expect(scope).toHaveAttribute("data-value", "team");
   await expect(page.getByText(teamDescription!)).toBeVisible();
 
   await page.getByLabel("名称").fill("cache-scope-e2e");
-  await page.getByLabel("作用于").selectOption({ label: "chat-e2e" });
+  await chooseSelect(page.getByLabel("作用于"), { label: "chat-e2e" });
   await page.getByRole("button", { name: "保存" }).click();
   await expect(row(page, "cache-scope-e2e").locator("[data-state]")).toHaveAttribute("data-state", "applied", {
     timeout: ROLLOUT_MS,
@@ -175,7 +177,7 @@ test("同租户两把 key 命中同一缓存条目", async ({ page }) => {
   await openTab(page, "cache");
   await page.getByRole("button", { name: "新建缓存策略" }).click();
   await page.getByLabel("名称").fill("cache-team-e2e");
-  await page.getByLabel("作用于").selectOption({ label: "cached-e2e" });
+  await chooseSelect(page.getByLabel("作用于"), { label: "cached-e2e" });
   // 范围 is left as the page offers it.
   await page.getByRole("button", { name: "保存" }).click();
   await expect(row(page, "cache-team-e2e").locator("[data-state]")).toHaveAttribute("data-state", "applied", {
@@ -408,13 +410,15 @@ test("缓存策略表单：作用于列出后建的模型，缓存时长必填�
   await openTab(page, "cache");
   const target = page.getByLabel("作用于");
   await page.getByRole("button", { name: "新建缓存策略" }).click();
-  await expect(target.locator("option", { hasText: "early-e2e" })).toHaveCount(1);
+  await expect((await selectOptions(target)).filter({ hasText: "early-e2e" })).toHaveCount(1);
+  await page.keyboard.press("Escape");
   await page.getByRole("button", { name: "取消" }).click();
 
   // A model created elsewhere while this page is open.
   await seedModel("late-e2e", "upstream-late-e2e");
   await page.getByRole("button", { name: "新建缓存策略" }).click();
-  await expect(target.locator("option", { hasText: "late-e2e" })).toHaveCount(1);
+  await expect((await selectOptions(target)).filter({ hasText: "late-e2e" })).toHaveCount(1);
+  await page.keyboard.press("Escape");
 
   await page.getByLabel("名称").fill("cache-field-e2e");
   const ttl = page.getByLabel("缓存时长（秒）");

@@ -10,6 +10,7 @@ import {
   type BillingWorld,
   type Login,
 } from "./world";
+import { chooseSelect } from "./select";
 
 /**
  * 账户: the balance, the readout of what can still be spent, top-up requests
@@ -174,7 +175,7 @@ test.describe.serial("充值与扣费", () => {
       const summary = region(page, "按期汇总");
       await ledger.getByLabel("开始日期（UTC）").fill(today);
       await ledger.getByLabel("结束日期（UTC）").fill(today);
-      await expect(summary.getByRole("combobox", { name: "汇总方式" })).toHaveValue("day");
+      await expect(summary.getByRole("combobox", { name: "汇总方式" })).toHaveAttribute("data-value", "day");
       await expect(bodyRows(summary)).toHaveCount(1);
       const row = bodyRows(summary).first().locator("td");
       await expect(row.nth(0)).toHaveText(today);
@@ -184,20 +185,20 @@ test.describe.serial("充值与扣费", () => {
       await expect(bodyRows(ledger)).toHaveCount(3);
 
       // By month the same day is one period, labelled by its UTC month.
-      await summary.getByLabel("汇总方式").selectOption("month");
+      await chooseSelect(summary.getByLabel("汇总方式"), "month");
       await expect(bodyRows(summary)).toHaveCount(1);
       await expect(bodyRows(summary).first().locator("td").nth(0)).toHaveText(today.slice(0, 7));
       await expect(bodyRows(summary).first().locator("td").nth(1)).toHaveText("-¥0.022");
-      await summary.getByLabel("汇总方式").selectOption("day");
+      await chooseSelect(summary.getByLabel("汇总方式"), "day");
 
       // The 类型 filter narrows the ledger to one kind.
-      await ledger.getByLabel("类型").selectOption("usage");
+      await chooseSelect(ledger.getByLabel("类型"), "usage");
       await expect(bodyRows(ledger)).toHaveCount(2);
       await expect(bodyRows(ledger).locator("td:nth-child(2)")).toHaveText(["扣费", "扣费"]);
-      await ledger.getByLabel("类型").selectOption("topup");
+      await chooseSelect(ledger.getByLabel("类型"), "topup");
       await expect(bodyRows(ledger)).toHaveCount(1);
       await expect(bodyRows(ledger).first().locator("td").nth(1)).toHaveText("充值");
-      await ledger.getByLabel("类型").selectOption("");
+      await chooseSelect(ledger.getByLabel("类型"), "");
       await expect(bodyRows(ledger)).toHaveCount(3);
 
       // An end before the start names nothing, and the field says so.
@@ -374,14 +375,14 @@ test("密钥选择切换可用额度，成员额度单独成一站", async ({ pa
   await openAccount(page, world.owner);
   const readout = region(page, "可用额度");
   // The newest key of the viewer is read first: organisation, member and key all limit it.
-  await expect(readout.getByLabel("密钥")).toHaveValue(second.key.id);
+  await expect(readout.getByLabel("密钥")).toHaveAttribute("data-value", second.key.id);
   await expect(readout.getByRole("listitem")).toHaveCount(3);
   await expect(readout.getByTestId("readout-amount")).toHaveText("¥0.30");
   await expect(readout.getByRole("listitem").filter({ hasText: "密钥" })).toContainText("以此为准");
   await expect(readout.getByRole("listitem").filter({ hasText: "成员" })).toContainText("¥0.50");
 
   // The first key has no quota of its own: the member's 0.50 binds.
-  await readout.getByLabel("密钥").selectOption(world.key.id);
+  await chooseSelect(readout.getByLabel("密钥"), world.key.id);
   await expect(readout.getByRole("listitem")).toHaveCount(2);
   await expect(readout.getByTestId("readout-amount")).toHaveText("¥0.50");
   await expect(readout.getByRole("listitem").filter({ hasText: "成员" })).toContainText("以此为准");
@@ -446,7 +447,7 @@ test("换筛选后首页未到时不能加载更多；到了之后逐页翻完�
   const ledger = region(page, "余额流水");
   const rows = bodyRows(ledger);
   await expect(rows).toHaveCount(50);
-  await ledger.getByLabel("类型").selectOption({ label: "充值" });
+  await chooseSelect(ledger.getByLabel("类型"), { label: "充值" });
   await expect(rows.locator("td:nth-child(2)")).toHaveText(Array(50).fill("充值"));
   await expect(ledger.getByRole("button", { name: "加载更多" })).toBeVisible();
 
@@ -462,7 +463,7 @@ test("换筛选后首页未到时不能加载更多；到了之后逐页翻完�
     await held;
     await route.continue();
   });
-  await ledger.getByLabel("类型").selectOption({ label: "全部" });
+  await chooseSelect(ledger.getByLabel("类型"), { label: "全部" });
   await arrived;
   // Nothing of 充值's to continue from while 全部's first page is out.
   await expect(ledger.getByRole("button", { name: "加载更多" })).toHaveCount(0);

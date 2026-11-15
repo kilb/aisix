@@ -1,6 +1,7 @@
 import { expect, test } from "@playwright/test";
 import { STACK_START_TIMEOUT_MS, startStack, type Stack } from "../e2e/stack";
 import { COMPLETE_RATES, DISCOUNT_BPS, expectedMicroCny, fullPriceModel, grantLaterModel, invitedMember, login, mintedKey, PASSWORD, realCall, recorded, seedRealWorld, signedIn } from "./organization-real-world";
+import { chooseSelect, selectOptions } from "../e2e/select";
 
 let stack: Stack;
 test.beforeAll(async () => {
@@ -82,7 +83,7 @@ test("组织直接创建新账号并真实登录，重复邮箱不改变原密�
   await form.getByLabel("显示名", { exact: true }).fill("真实创建成员");
   await form.getByLabel("邮箱", { exact: true }).fill(email);
   await form.getByLabel("初始密码", { exact: true }).fill(PASSWORD);
-  await form.getByLabel("角色", { exact: true }).selectOption("member");
+  await chooseSelect(form.getByLabel("角色", { exact: true }), "member");
   await form.getByRole("button", { name: "创建账号", exact: true }).click();
   await expect(page.getByRole("status").filter({ hasText: "账号已创建" })).toBeVisible();
   const createdApi = await signedIn(stack, { email, password: PASSWORD });
@@ -109,7 +110,8 @@ test("组织直接创建新账号并真实登录，重复邮箱不改变原密�
       await login(adminPage, stack, admin);
       await adminPage.getByRole("tab", { name: "成员", exact: true }).click();
       await adminPage.getByRole("button", { name: "创建账号", exact: true }).click();
-      await expect(adminPage.getByLabel("角色", { exact: true }).getByRole("option", { name: "所有者", exact: true })).toHaveCount(0);
+      await expect((await selectOptions(adminPage.getByLabel("角色", { exact: true }))).and(adminPage.getByRole("option", { name: "所有者", exact: true }))).toHaveCount(0);
+      await adminPage.keyboard.press("Escape");
     } finally {
       await adminContext.close();
     }

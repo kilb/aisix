@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { expect, test, type Page } from "@playwright/test";
 import { STACK_START_TIMEOUT_MS, startStack, type Stack } from "./stack";
 import { approveTopup, chat, internalKey, seedTenant, tenantClient } from "./world";
+import { chooseSelect, selectOptions } from "./select";
 
 /**
  * 「计费 · 对账」 against the real control plane and gateway. The gateway's
@@ -73,14 +74,15 @@ test("对账：账实相符时显示无差异", async ({ page }) => {
   await expect(region(page, "账实核对").getByText("账实相符")).toBeVisible();
   await expect(region(page, "账实核对").getByRole("table")).toHaveCount(0);
   await expect(region(page, "已计费但未入账").locator("strong")).toHaveText("0");
-  await expect(page.getByLabel("租户").locator("option", { hasText: oddName })).toHaveCount(1);
+  await expect((await selectOptions(page.getByLabel("租户"))).filter({ hasText: oddName })).toHaveCount(1);
+  await page.keyboard.press("Escape");
 });
 
 test("对账：选了租户后只统计该租户，并说明另外两项不随之变化", async ({ page }) => {
   const world = await seedTenant(stack);
   await open(page);
   const asked = page.waitForRequest((r) => r.url().includes(`/admin/billing/reconciliation?tenant_id=${world.tenantId}`));
-  await page.getByLabel("租户").selectOption({ label: world.tenantName });
+  await chooseSelect(page.getByLabel("租户"), { label: world.tenantName });
   await asked;
   await expect(region(page, "已计费但未入账")).toContainText("仅统计所选租户");
   await expect(region(page, "近 24 小时未计价")).toContainText("始终统计全部租户");

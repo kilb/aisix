@@ -1,5 +1,6 @@
 import { expect, test, type Page } from "@playwright/test";
 import { STACK_START_TIMEOUT_MS, startStack, type Json, type Stack } from "./stack";
+import { chooseSelect } from "./select";
 
 /**
  * 价格 · 价格目录: the built-in public list prices with their sources.
@@ -35,7 +36,7 @@ test("价格目录可浏览，带来源链接与日期", async ({ page }) => {
   const table = page.getByRole("table", { name: "价格目录" });
   await expect(table.getByRole("columnheader")).toContainText(["条目", "别名", "来源", "日期", "说明"]);
   const pager = page.getByRole("navigation", { name: "价格目录分页" });
-  await pager.getByLabel("价格目录分页每页条数").selectOption("10");
+  await chooseSelect(pager.getByLabel("价格目录分页每页条数"), "10");
   // 逐页核对完整目录，不能把第一页当成全部，也不能漏掉同一标识的后续版本。
   for (let offset = 0; offset < items.length; offset += 10) {
     const segment = items.slice(offset, offset + 10);

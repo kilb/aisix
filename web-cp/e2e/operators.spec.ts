@@ -1,5 +1,6 @@
 import { expect, test, type Locator, type Page } from "@playwright/test";
 import { STACK_START_TIMEOUT_MS, startStack, type ApiClient, type Json, type Stack } from "./stack";
+import { chooseSelect, selectOptions } from "./select";
 
 /**
  * Operator accounts, roles and the audit log, against the real control
@@ -106,7 +107,7 @@ function rowWith(page: Page, text: string): Locator {
 
 /** The role a row's role picker shows. */
 function shownRole(row: Locator): Locator {
-  return row.getByLabel("角色").locator("option:checked");
+  return row.getByLabel("角色");
 }
 
 /** The cells of the column headed `header` in the page's table, top to bottom. */
@@ -177,7 +178,7 @@ test("只读运维看不到任何编辑入口，从页面直接发写请求被�
   const form = page.getByRole("form", { name: "新建运维账号" });
   await form.getByLabel("邮箱").fill(viewer.email);
   await form.getByLabel("显示名").fill("只读 E2E");
-  await form.getByLabel("角色").selectOption({ label: "只读" });
+  await chooseSelect(form.getByLabel("角色"), { label: "只读" });
   await form.getByLabel("初始口令").fill(viewer.password);
   await form.getByRole("button", { name: "创建" }).click();
   const row = rowWith(page, viewer.email);
@@ -198,14 +199,15 @@ test("只读运维看不到任何编辑入口，从页面直接发写请求被�
   // Every kind of the generic page, and a row opened on it.
   await openTab(vpage, "resources");
   const picker = vpage.getByLabel("资源类型");
-  const kinds = await picker.locator("option").evaluateAll((os) => os.map((o) => (o as HTMLOptionElement).value));
+  const kinds = await (await selectOptions(picker)).evaluateAll((os) => os.map((o) => o.getAttribute("data-value") ?? (o as HTMLOptionElement).value));
+  await vpage.keyboard.press("Escape");
   expect(kinds.length).toBeGreaterThan(1);
   for (const kind of kinds) {
-    await picker.selectOption(kind);
+    await chooseSelect(picker, kind);
     await settled(vpage);
     expect((await pageButtons(vpage)).filter((n) => EDIT_CONTROL.test(n)), `edit controls for ${kind}`).toEqual([]);
   }
-  await picker.selectOption("models");
+  await chooseSelect(picker, "models");
   await rowWith(vpage, "view-model-e2e").getByRole("button").click();
   await expect(vpage.getByLabel("资源文档")).toHaveValue(/view-model-e2e/);
   await expect(vpage.getByLabel("资源文档")).not.toBeEditable();
@@ -277,7 +279,7 @@ test("不能停用最后一个管理员", async ({ page }) => {
   expect((await operatorByEmail(stack.operator.email)).disabled).toBe(false);
 
   // Nor lower its role.
-  await row.getByLabel("角色").selectOption({ label: "运维" });
+  await chooseSelect(row.getByLabel("角色"), { label: "运维" });
   await row.getByRole("button", { name: "确认改为运维" }).click();
   await expect(page.getByRole("alert")).toContainText("至少要保留一个可用的管理员");
   await expect(shownRole(row)).toHaveText("管理员");
@@ -315,12 +317,12 @@ test("停用、启用与降级都在页面上确认，停用即结束该账号�
   expect((await operatorByEmail(target.email)).disabled).toBe(false);
 
   // A lower role waits for its confirmation too.
-  await row.getByLabel("角色").selectOption({ label: "只读" });
+  await chooseSelect(row.getByLabel("角色"), { label: "只读" });
   await row.getByRole("button", { name: "取消" }).click();
   await expect(shownRole(row)).toHaveText("运维");
   expect((await operatorByEmail(target.email)).role).toBe("operator");
 
-  await row.getByLabel("角色").selectOption({ label: "只读" });
+  await chooseSelect(row.getByLabel("角色"), { label: "只读" });
   await row.getByRole("button", { name: "确认改为只读" }).click();
   await expect(row.getByRole("button", { name: "确认改为只读" })).toHaveCount(0);
   await expect(shownRole(row)).toHaveText("只读");
@@ -369,7 +371,7 @@ test("审计日志记录了谁做了什么，且不含口令", async ({ page }) 
   const form = page.getByRole("form", { name: "新建运维账号" });
   await form.getByLabel("邮箱").fill(email);
   await form.getByLabel("显示名").fill(displayName);
-  await form.getByLabel("角色").selectOption({ label: "运维" });
+  await chooseSelect(form.getByLabel("角色"), { label: "运维" });
   await form.getByLabel("初始口令").fill(initial);
   await form.getByRole("button", { name: "创建" }).click();
   await expect(shownRole(rowWith(page, email))).toHaveText("运维");
@@ -431,7 +433,7 @@ test("审计日志按对象类型与租户筛选，加载更多沿用服务端�
   await openTab(page, "audit");
 
   // By target kind, page after page, exactly as the API pages it.
-  await page.getByLabel("对象类型").selectOption("operator");
+  await chooseSelect(page.getByLabel("对象类型"), "operator");
   const expected: string[] = [];
   let before: number | null = null;
   let pages = 0;
@@ -450,9 +452,9 @@ test("审计日志按对象类型与租户筛选，加载更多沿用服务端�
   await expect(page.getByRole("button", { name: "加载更多" })).toHaveCount(0);
 
   // By tenant: only that tenant's rows.
-  await page.getByLabel("对象类型").selectOption({ label: "全部" });
+  await chooseSelect(page.getByLabel("对象类型"), { label: "全部" });
   // By role and name: the target-kind picker's own options mention 租户 too.
-  await page.getByRole("combobox", { name: /^租户/ }).selectOption({ label: "audit-tenant-a-e2e" });
+  await chooseSelect(page.getByRole("combobox", { name: /^租户/ }), { label: "audit-tenant-a-e2e" });
   const forA = await stack.admin.get(`/admin/audit?tenant_id=${tenantA.id}`);
   const forB = await stack.admin.get(`/admin/audit?tenant_id=${tenantB.id}`);
   expect(forA.items.length).toBeGreaterThan(0);

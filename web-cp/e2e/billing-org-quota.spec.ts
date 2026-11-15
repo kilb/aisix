@@ -64,7 +64,7 @@ test("运维为组织分配月度额度，用尽后该组织所有密钥被拒",
   expect(await budgets(world)).toHaveLength(0);
 
   // 周期 defaults to 每月.
-  await expect(org.locator("select").nth(1)).toHaveValue("month");
+  await expect(org.getByRole("combobox").nth(1)).toHaveAttribute("data-value", "month");
   await org.getByLabel("限额（元）").fill("0.02");
   await org.getByRole("button", { name: "新建", exact: true }).click();
   const row = orgRows(panel);
