@@ -957,39 +957,6 @@ pub(crate) async fn scan_input_blob(
     // 控制字段。
     redactions: Option<&mut crate::redact::RedactionCounts>,
 ) -> Result<Option<Vec<u8>>, ProxyError> {
-    scan_input_blob_for_models(
-        state,
-        snapshot,
-        auth,
-        target,
-        blob,
-        monitor_hits,
-        enforced_hits,
-        scores,
-        bypass,
-        applied,
-        redactions,
-        &[],
-    )
-    .await
-}
-
-/// 多模型工作只合并显式请求的模型作用域，扫描、遮蔽与审计仍共用一次处理。
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn scan_input_blob_for_models(
-    state: &ProxyState,
-    snapshot: &aisix_core::AisixSnapshot,
-    auth: &AuthenticatedKey,
-    target: &JobTarget,
-    blob: &[u8],
-    monitor_hits: &mut Vec<aisix_core::GuardrailMonitorHit>,
-    enforced_hits: &mut Vec<aisix_core::GuardrailEnforcedHit>,
-    scores: &mut Vec<aisix_core::GuardrailScore>,
-    bypass: &mut String,
-    applied: &mut Vec<aisix_core::AppliedGuardrail>,
-    redactions: Option<&mut crate::redact::RedactionCounts>,
-    model_ids: &[&str],
-) -> Result<Option<Vec<u8>>, ProxyError> {
     let ctx = aisix_guardrails::RequestContext {
         passthrough_route_id: "",
         model_id: &target.model_entry.id,
@@ -997,7 +964,7 @@ pub(crate) async fn scan_input_blob_for_models(
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref(),
     };
-    let chain = state.guardrail_index.resolve_for_models(&ctx, model_ids);
+    let chain = state.guardrail_index.resolve(&ctx);
     if chain.is_empty() {
         return Ok(None);
     }
