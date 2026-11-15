@@ -141,3 +141,65 @@ async fn request_timing_cancelled_upload_reports_partial_read_without_decode() {
     assert!(timing.get("pre_handler_ms").is_none(), "{timing}");
     assert!(rx.try_recv().is_err());
 }
+
+#[tokio::test]
+async fn request_timing_read_error_never_claims_complete_or_decoded_json() {
+    use std::time::Duration;
+    use tower::ServiceExt;
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let snapshot = seed_snapshot("phase-model", &["phase-model"], "http://unused");
+    let app = build_router(
+        build_state(snapshot, Arc::new(Hub::new())).with_usage_sink(aisix_obs::UsageSink::new(tx)),
+    );
+    const PREFIX: &[u8] = br#"{"model":"#;
+    let body = async_stream::stream! {
+        yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(PREFIX));
+        tokio::time::sleep(Duration::from_millis(160)).await;
+        yield Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "client read failed"));
+    };
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(Body::from_stream(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 400);
+    let _ = to_bytes(response.into_body(), 65_536).await.unwrap();
+    let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let wire = serde_json::to_value(event).unwrap();
+    let timing = wire.get("request_timing").expect("读失败仍须保留已读窗口");
+    assert!(
+        timing
+            .get("body_read_ms")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap()
+            >= 140
+    );
+    assert_eq!(
+        timing.get("request_body_complete"),
+        Some(&serde_json::json!(false))
+    );
+    assert_eq!(
+        timing.get("request_body_bytes"),
+        Some(&serde_json::json!(PREFIX.len()))
+    );
+    assert!(timing.get("json_decode_ms").is_none(), "{timing}");
+    assert!(
+        timing
+            .get("pre_handler_ms")
+            .and_then(serde_json::Value::as_u64)
+            .is_some(),
+        "{timing}"
+    );
+    assert!(rx.try_recv().is_err());
+}
