@@ -619,7 +619,17 @@ async fn begin(
     conn: &mut PgConnection,
     state: &AppState,
     dp: DpIdentity,
+    body: BeginRequest,
+) -> Result<NativeReply, ApiError> {
+    begin_with_locked_parent(conn, state, dp, body, None).await
+}
+
+async fn begin_with_locked_parent(
+    conn: &mut PgConnection,
+    state: &AppState,
+    dp: DpIdentity,
     mut body: BeginRequest,
+    locked_parent: Option<&ObjectRow>,
 ) -> Result<NativeReply, ApiError> {
     // 新对象明确保存所选面；已发布种类缺省值保持旧线协议，供滚动升级重放。
     if body.origin.surface.is_none()
@@ -821,7 +831,14 @@ async fn begin(
         return Err(conflict());
     }
     if let Some(parent) = body.parent_id {
-        let parent = object(&mut *conn, state, parent).await?;
+        let loaded_parent;
+        let parent = match locked_parent.filter(|row| row.id == parent) {
+            Some(parent) => parent,
+            None => {
+                loaded_parent = object(&mut *conn, state, parent).await?;
+                &loaded_parent
+            }
+        };
         foundation::assert_unfenced(&mut *conn, state, parent.id, Some(body.operation_id)).await?;
         let parent_consumer = if body.protocol == NativeProtocol::Openai
             && body.kind == NativeObjectKind::Response
@@ -832,7 +849,7 @@ async fn begin(
         } else {
             consumer_family
         };
-        authorized_for_consumer(&mut *conn, state, &principal, &parent, parent_consumer).await?;
+        authorized_for_consumer(&mut *conn, state, &principal, parent, parent_consumer).await?;
         if parent.boundary != body.origin.boundary.as_str() {
             return Err(invalid("/parent_id"));
         }
@@ -865,9 +882,24 @@ async fn bind(
     let op = operation(&mut *conn, state, body.operation_id, true).await?;
     // 上游已受理的结果必须落到原提交；撤权、换模型或换凭据不能抹掉待结算身份。
     let submitted = submission(&op)?;
+    // 正式 C 与本次已有 R 必须在任何子对象或 identity 锁前按共同顺序取得。
+    let ordered_parent = submitted.protocol == NativeProtocol::Openai
+        && submitted.kind == NativeObjectKind::Response
+        && submitted.parent_id.is_some();
+    let mut locked_objects = if ordered_parent {
+        let mut ids = Vec::from_iter(submitted.parent_id);
+        ids.extend(body.existing_record_id);
+        foundation::lock_command_objects(&mut *conn, state, &ids, Some(body.operation_id)).await?
+    } else {
+        std::collections::BTreeMap::new()
+    };
     let mut refresh_principal = None;
+    let mut locked_root = None;
     if let Some(record_id) = body.existing_record_id {
-        let existing = object(&mut *conn, state, record_id).await?;
+        let existing = match locked_objects.remove(&record_id) {
+            Some(existing) => existing,
+            None => object(&mut *conn, state, record_id).await?,
+        };
         if op.state != "bound"
             || existing.operation_id != body.operation_id
             || existing.raw_id != body.raw_id
@@ -884,6 +916,9 @@ async fn bind(
         let principal = principal(&mut *conn, body.api_key_id).await?;
         authorized(&mut *conn, state, &principal, &existing).await?;
         refresh_principal = Some(principal);
+        if ordered_parent {
+            locked_root = Some(existing);
+        }
     } else if op.dp_id != dp.dp_id || op.api_key_id != body.api_key_id {
         return Err(ApiError::not_found());
     }
@@ -893,18 +928,32 @@ async fn bind(
     {
         return Err(invalid("/objects"));
     }
+    let mut conversation_writable = false;
     let conversation = if let Some(parent) = submitted.parent_id {
-        let parent = object(&mut *conn, state, parent).await?;
-        foundation::assert_unfenced(&mut *conn, state, parent.id, Some(body.operation_id)).await?;
+        let parent = match locked_objects.remove(&parent) {
+            Some(parent) => parent,
+            None => object(&mut *conn, state, parent).await?,
+        };
+        let is_conversation = submitted.protocol == NativeProtocol::Openai
+            && submitted.kind == NativeObjectKind::Response
+            && parent.protocol == "openai"
+            && parent.kind == "conversation";
+        let fenced = if is_conversation {
+            sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM native_parent_fences WHERE environment_id=$1 AND parent_id=$2 AND state IN ('held','uncertain') AND operation_id<>$3)")
+                .bind(state.env.env_id).bind(parent.id).bind(body.operation_id)
+                .fetch_one(&mut *conn).await.map_err(unavailable)?
+        } else {
+            foundation::assert_unfenced(&mut *conn, state, parent.id, Some(body.operation_id))
+                .await?;
+            false
+        };
         if parent.tenant_id != op.tenant_id || parent.boundary != submitted.origin.boundary.as_str()
         {
             return Err(conflict());
         }
-        (submitted.protocol == NativeProtocol::Openai
-            && submitted.kind == NativeObjectKind::Response
-            && parent.protocol == "openai"
-            && parent.kind == "conversation")
-            .then_some(parent)
+        // 墓碑只提供已接受产物的不可变 owner；管理栅栏不撤销已经发生的 R/I。
+        conversation_writable = is_conversation && parent.deleted_at.is_none() && !fenced;
+        is_conversation.then_some(parent)
     } else {
         None
     };
@@ -933,14 +982,21 @@ async fn bind(
     .execute(&mut *conn)
     .await
     .map_err(unavailable)?;
-    let row: Option<ObjectRow> = sqlx::query_as(
-        "SELECT * FROM native_objects WHERE environment_id = $1 AND operation_id = $2",
-    )
-    .bind(state.env.env_id)
-    .bind(body.operation_id)
-    .fetch_optional(&mut *conn)
-    .await
-    .map_err(unavailable)?;
+    let row = match locked_root.or_else(|| {
+        locked_objects
+            .into_values()
+            .find(|row| row.operation_id == body.operation_id)
+    }) {
+        Some(row) => Some(row),
+        None => sqlx::query_as(
+            "SELECT * FROM native_objects WHERE environment_id = $1 AND operation_id = $2",
+        )
+        .bind(state.env.env_id)
+        .bind(body.operation_id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(unavailable)?,
+    };
     let row = row.ok_or_else(conflict)?;
     if row.raw_id != body.raw_id {
         return Err(conflict());
@@ -1061,7 +1117,7 @@ async fn bind(
                 body.operation_id,
             )
             .await?;
-            if object.kind == NativeObjectKind::ResponseItem {
+            if object.kind == NativeObjectKind::ResponseItem && conversation_writable {
                 if let Some(parent) = &conversation {
                     bind_response_conversation_item(
                         &mut *conn,
@@ -1136,7 +1192,7 @@ async fn bind(
             body.operation_id,
         )
         .await?;
-        if let Some(parent) = item_owner {
+        if let Some(parent) = item_owner.filter(|_| conversation_writable) {
             bind_response_conversation_item(
                 &mut *conn,
                 state,
