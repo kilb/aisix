@@ -180,6 +180,49 @@ fn requested_authority_name<'a>(model: &'a Model, submitted: &'a BeginRequest) -
     }
 }
 
+struct OriginResources {
+    models: HashMap<Uuid, Model>,
+    providers: HashMap<Uuid, ProviderKey>,
+}
+
+async fn load_origin_resources(
+    conn: &mut PgConnection,
+    state: &AppState,
+    model_ids: &[Uuid],
+    provider_ids: &[Uuid],
+    check_models: bool,
+) -> Result<OriginResources, ApiError> {
+    let rows: Vec<(String, Uuid, Value)> = sqlx::query_as(&format!(
+        "SELECT kind, id, doc FROM gw_resources WHERE NOT deleted AND \
+         ((kind = 'models' AND id = ANY($1)) OR (kind = 'provider_keys' AND id = ANY($2))) \
+         ORDER BY kind, id{}",
+        if check_models { " FOR SHARE" } else { "" },
+    ))
+    .bind(model_ids)
+    .bind(provider_ids)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(unavailable)?;
+    let mut resources = OriginResources {
+        models: HashMap::new(),
+        providers: HashMap::new(),
+    };
+    for (kind, id, mut doc) in rows {
+        if kind == "models" && check_models {
+            resources
+                .models
+                .insert(id, serde_json::from_value(doc).map_err(unavailable)?);
+        } else if kind == "provider_keys" {
+            secrets::unseal(&state.cfg.master_key, Kind::ProviderKeys, id, &mut doc)
+                .map_err(unavailable)?;
+            resources
+                .providers
+                .insert(id, serde_json::from_value(doc).map_err(unavailable)?);
+        }
+    }
+    Ok(resources)
+}
+
 async fn origin_for_consumer(
     conn: &mut PgConnection,
     state: &AppState,
@@ -187,51 +230,51 @@ async fn origin_for_consumer(
     submission: &BeginRequest,
     consumer_family: Option<EndpointFamily>,
 ) -> Result<(), ApiError> {
-    type Resource = (String, Uuid, Value);
-    let ids = [submission.origin.model_id, submission.requested_model_id];
-    let rows: Vec<Resource> = sqlx::query_as(&format!(
-        "SELECT kind, id, doc FROM gw_resources WHERE NOT deleted AND \
-         ((kind = 'models' AND id = ANY($1)) OR (kind = 'provider_keys' AND id = $2)) \
-         ORDER BY kind, id{}",
-        if principal.is_some() {
-            " FOR SHARE"
-        } else {
-            ""
-        },
-    ))
-    .bind(&ids[..])
-    .bind(submission.origin.provider_key_id)
-    .fetch_all(&mut *conn)
+    let resources = load_origin_resources(
+        &mut *conn,
+        state,
+        &[submission.origin.model_id, submission.requested_model_id],
+        &[submission.origin.provider_key_id],
+        principal.is_some(),
+    )
+    .await?;
+    origin_for_consumer_loaded(
+        conn,
+        state,
+        principal,
+        submission,
+        consumer_family,
+        &resources,
+        false,
+    )
     .await
-    .map_err(unavailable)?;
-    let mut docs: HashMap<(String, Uuid), Value> = rows
-        .into_iter()
-        .map(|(kind, id, doc)| ((kind, id), doc))
-        .collect();
-    let model: Option<Model> = if principal.is_some() {
-        Some(
-            serde_json::from_value(
-                docs.get(&("models".to_string(), submission.origin.model_id))
-                    .cloned()
-                    .ok_or_else(ApiError::not_found)?,
-            )
-            .map_err(unavailable)?,
-        )
-    } else {
-        None
-    };
-    let requested: Option<Model> = if principal.is_some() {
-        Some(
-            serde_json::from_value(
-                docs.get(&("models".to_string(), submission.requested_model_id))
-                    .cloned()
-                    .ok_or_else(ApiError::not_found)?,
-            )
-            .map_err(unavailable)?,
-        )
-    } else {
-        None
-    };
+}
+
+async fn origin_for_consumer_loaded(
+    conn: &mut PgConnection,
+    state: &AppState,
+    principal: Option<&Principal>,
+    submission: &BeginRequest,
+    consumer_family: Option<EndpointFamily>,
+    resources: &OriginResources,
+    source_checked: bool,
+) -> Result<(), ApiError> {
+    let model = principal
+        .map(|_| {
+            resources
+                .models
+                .get(&submission.origin.model_id)
+                .ok_or_else(ApiError::not_found)
+        })
+        .transpose()?;
+    let requested = principal
+        .map(|_| {
+            resources
+                .models
+                .get(&submission.requested_model_id)
+                .ok_or_else(ApiError::not_found)
+        })
+        .transpose()?;
     if model.as_ref().is_some_and(|model| {
         model.provider_key_id.as_deref()
             != Some(submission.origin.provider_key_id.to_string().as_str())
@@ -241,25 +284,17 @@ async fn origin_for_consumer(
             "原生对象所属账号已变化",
         ));
     }
-    let mut provider = docs
-        .remove(&(
-            "provider_keys".to_string(),
-            submission.origin.provider_key_id,
-        ))
+    let provider = resources
+        .providers
+        .get(&submission.origin.provider_key_id)
         .ok_or_else(ApiError::not_found)?;
-    secrets::unseal(
-        &state.cfg.master_key,
-        Kind::ProviderKeys,
-        submission.origin.provider_key_id,
-        &mut provider,
-    )
-    .map_err(unavailable)?;
-    let provider: ProviderKey = serde_json::from_value(provider).map_err(unavailable)?;
     let id_key =
         aisix_core::native_objects::platform_id_key_from_secret(&state.pki.platform_id_key_hex());
-    if submission.origin.surface.is_some_and(|surface| {
-        surface != native_origin_surface(submission.protocol, submission.kind)
-    }) {
+    if !source_checked
+        && submission.origin.surface.is_some_and(|surface| {
+            surface != native_origin_surface(submission.protocol, submission.kind)
+        })
+    {
         let source: Option<Uuid> = sqlx::query_scalar("SELECT source_record_id FROM native_operation_origin_sources WHERE environment_id=$1 AND operation_id=$2")
             .bind(state.env.env_id).bind(submission.operation_id).fetch_optional(&mut *conn).await.map_err(unavailable)?;
         let source_id = source
@@ -292,7 +327,7 @@ async fn origin_for_consumer(
     let digest = configured_native_origin_at(
         &id_key,
         submission.origin.provider_key_id,
-        &provider,
+        provider,
         submission.protocol,
         submission.kind,
         submission.origin.surface,
@@ -464,89 +499,111 @@ async fn authorized_for_consumer(
     }
     let op = operation(&mut *conn, state, row.operation_id, false).await?;
     let submitted = submission(&op)?;
-    origin_for_consumer(
-        &mut *conn,
-        state,
-        Some(principal),
-        &submitted,
-        consumer_family,
-    )
-    .await?;
-    // 批次返回多个模型的结果，当前权限必须覆盖每一项，不能只检查首个模型。
-    for entry in &submitted.entries {
-        let mut per_entry = submitted.clone();
-        per_entry.origin.model_id = entry.model_id;
-        per_entry.requested_model_id = entry.requested_model_id;
-        origin_for_consumer(
-            &mut *conn,
-            state,
-            Some(principal),
-            &per_entry,
-            consumer_family,
-        )
-        .await?;
+    #[derive(sqlx::FromRow)]
+    struct BatchParent {
+        #[sqlx(flatten)]
+        row: ObjectRow,
+        batch_submission: Value,
     }
-    let mut parent_id = row.parent_id;
-    if matches!(row.kind.as_str(), "response_item" | "response_container") {
-        if let Some(id) = parent_id {
-            let provenance: Option<String> = sqlx::query_scalar(
-                "SELECT kind FROM native_objects WHERE environment_id=$1 AND id=$2",
-            )
-            .bind(state.env.env_id)
-            .bind(id)
-            .fetch_optional(&mut *conn)
-            .await
-            .map_err(unavailable)?;
-            if provenance.as_deref() == Some("response") {
-                parent_id = None;
-            }
+    // File 只保留直接 Batch 的既有依赖；其他来源不递归形成当前权限闭包。
+    let batch_parent: Option<BatchParent> = if row.kind == "file" {
+        if let Some(parent_id) = row.parent_id {
+            sqlx::query_as(
+                "SELECT parent.*, operation.submission AS batch_submission \
+                 FROM native_objects parent JOIN native_operations operation \
+                 ON operation.environment_id=parent.environment_id AND operation.operation_id=parent.operation_id \
+                 WHERE parent.id=$1 AND parent.kind='message_batch'",
+            ).bind(parent_id).fetch_optional(&mut *conn).await.map_err(unavailable)?
+        } else {
+            None
         }
-    }
-    for _ in 0..32 {
-        let Some(id) = parent_id else {
-            return Ok(());
-        };
-        // 父关系与归属不可改写；这里只读，不从子对象倒序加父对象写锁。
-        let parent: Option<ObjectRow> =
-            sqlx::query_as("SELECT * FROM native_objects WHERE environment_id = $1 AND id = $2")
-                .bind(state.env.env_id)
-                .bind(id)
-                .fetch_optional(&mut *conn)
-                .await
-                .map_err(unavailable)?;
-        let parent = parent.ok_or_else(ApiError::not_found)?;
-        if !owns(principal, &parent)
-            || parent.deleted_at.is_some()
-            || parent.boundary != row.boundary
+    } else {
+        None
+    };
+    let parent_submission = if let Some(parent) = &batch_parent {
+        if parent.row.environment_id != state.env.env_id
+            || !owns(principal, &parent.row)
+            || parent.row.deleted_at.is_some()
+            || parent.row.protocol != row.protocol
+            || parent.row.provider_key_id != row.provider_key_id
+            || parent.row.boundary != row.boundary
         {
             return Err(ApiError::not_found());
         }
-        let op = operation(&mut *conn, state, parent.operation_id, false).await?;
-        let parent_submission = submission(&op)?;
-        origin_for_consumer(
+        Some(
+            serde_json::from_value::<BeginRequest>(parent.batch_submission.clone())
+                .map_err(unavailable)?,
+        )
+    } else {
+        None
+    };
+    let submissions = [Some(&submitted), parent_submission.as_ref()];
+    let mut model_ids = BTreeSet::new();
+    let mut provider_ids = BTreeSet::new();
+    for accepted in submissions.iter().flatten() {
+        model_ids.insert(accepted.origin.model_id);
+        model_ids.insert(accepted.requested_model_id);
+        provider_ids.insert(accepted.origin.provider_key_id);
+        for entry in &accepted.entries {
+            model_ids.insert(entry.model_id);
+            model_ids.insert(entry.requested_model_id);
+        }
+    }
+    let model_ids: Vec<_> = model_ids.into_iter().collect();
+    let provider_ids: Vec<_> = provider_ids.into_iter().collect();
+    let resources =
+        load_origin_resources(&mut *conn, state, &model_ids, &provider_ids, true).await?;
+    for accepted in submissions.into_iter().flatten() {
+        origin_for_consumer_loaded(
             &mut *conn,
             state,
             Some(principal),
-            &parent_submission,
+            accepted,
             consumer_family,
+            &resources,
+            false,
         )
         .await?;
-        for entry in &parent_submission.entries {
-            let mut per_entry = parent_submission.clone();
-            per_entry.origin.model_id = entry.model_id;
-            per_entry.requested_model_id = entry.requested_model_id;
-            origin_for_consumer(
+        // 同一提交内按实际与请求身份去重；不同名称保留各自检查，不共享跨请求缓存。
+        let mut seen = BTreeSet::from([(
+            accepted.origin.model_id,
+            accepted.requested_model_id,
+            accepted.requested_model.as_str(),
+        )]);
+        let mut per_entry: Option<BeginRequest> = None;
+        for entry in &accepted.entries {
+            // 新条目用自己的请求名；旧空值沿用既有提交名，不补造历史 alias。
+            let requested_name = if entry.requested_model.is_empty() {
+                accepted.requested_model.as_str()
+            } else {
+                entry.requested_model.as_str()
+            };
+            if !seen.insert((entry.model_id, entry.requested_model_id, requested_name)) {
+                continue;
+            }
+            let checked = per_entry.get_or_insert_with(|| {
+                let mut copy = (*accepted).clone();
+                copy.entries.clear();
+                copy
+            });
+            checked.origin.model_id = entry.model_id;
+            checked.requested_model_id = entry.requested_model_id;
+            checked.requested_model.clear();
+            checked.requested_model.push_str(requested_name);
+            // 每项只改模型身份和请求名；surface 来源已在同一提交的检查中验证。
+            origin_for_consumer_loaded(
                 &mut *conn,
                 state,
                 Some(principal),
-                &per_entry,
+                checked,
                 consumer_family,
+                &resources,
+                true,
             )
             .await?;
         }
-        parent_id = parent.parent_id;
     }
-    Err(ApiError::unavailable())
+    Ok(())
 }
 
 async fn authorized(
