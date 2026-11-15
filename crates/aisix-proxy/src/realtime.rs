@@ -1483,6 +1483,7 @@ impl SessionUsage {
 /// 只观察实际经过上游套接字的负载；会话上下文由上游持有，文本参考始终为部分。
 struct SessionIo {
     observer: UpstreamIoObserver,
+    closing: bool,
     pending_creates: usize,
     active_responses: HashSet<String>,
     tracking_complete: bool,
@@ -1511,6 +1512,7 @@ impl SessionIo {
         observer.mark_input_text_partial();
         Self {
             observer,
+            closing: false,
             pending_creates: 0,
             active_responses: HashSet::new(),
             tracking_complete: true,
@@ -2591,11 +2593,7 @@ async fn run_session(
         }
     }
 
-    // Every other way out of the loop leaves the upstream half open: send its
-    // Close and read what it sends back, as the client's own close does, so a
-    // `response.done` already on its way is still billed. Where the upstream
-    // already closed, the send fails and this returns at once; the flush below
-    // then sends the reply to the Close it sent.
+    // 统一收束尚未排空的上游；已经开始关闭的分支不重复读取或重置排空预算。
     if let Err(error) = close_upstream(
         &mut up_tx,
         &mut up_rx,
@@ -2890,7 +2888,7 @@ const UPSTREAM_CLOSE_ACK: Duration = Duration::from_secs(2);
 /// Close the upstream socket and wait, briefly, for its acknowledgement,
 /// so the upstream sees a completed handshake rather than a reset. A text frame
 /// that arrives meanwhile (a response finishing) still goes to `on_message`.
-async fn observe_usage(
+fn collect_usage(
     journal: &mut Option<crate::native_api::realtime_journal::Journal>,
     usage: &mut SessionUsage,
     text: &str,
@@ -2898,22 +2896,25 @@ async fn observe_usage(
     let secondary = journal
         .as_ref()
         .is_some_and(|journal| journal.is_secondary_fact(text));
-    let appended = match journal.as_mut() {
-        Some(journal) => journal.observe(text).await,
+    let collected = match journal.as_mut() {
+        Some(journal) => journal.collect(text),
         None => Ok(true),
     };
-    match appended {
-        Ok(false) => Ok(()),
-        Ok(true) => {
-            usage.absorb_model(text, secondary);
-            Ok(())
-        }
-        Err(error) => {
-            // 真实已观察量仍进入指标和导出；未知追加结果绝不改走另一付费出口。
-            usage.absorb_model(text, secondary);
-            Err(error)
-        }
+    // 会话观察自带事实去重；持久追加尚未确认时也不丢真实数量或改走另一计费出口。
+    usage.absorb_model(text, secondary);
+    collected.map(|_| ())
+}
+
+async fn observe_usage(
+    journal: &mut Option<crate::native_api::realtime_journal::Journal>,
+    usage: &mut SessionUsage,
+    text: &str,
+) -> Result<(), ProxyError> {
+    collect_usage(journal, usage, text)?;
+    if let Some(journal) = journal.as_mut() {
+        journal.flush().await?;
     }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2930,29 +2931,59 @@ where
     T: futures::Sink<TgMessage> + Unpin,
     R: futures::Stream<Item = Result<TgMessage, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
-    if up_tx.send(TgMessage::Close(frame)).await.is_err() {
+    if io.closing {
         return Ok(());
     }
+    io.closing = true;
+    let deadline = tokio::time::Instant::now() + UPSTREAM_CLOSE_ACK;
+    let _ = tokio::time::timeout_at(deadline, up_tx.send(TgMessage::Close(frame))).await;
     let mut failure = None;
-    let _ = tokio::time::timeout(UPSTREAM_CLOSE_ACK, async {
-        while let Some(Ok(message)) = up_rx.next().await {
-            match &message {
-                TgMessage::Text(text) => {
-                    io.drained(&message);
-                    if let Err(error) = observe_usage(journal, usage, text).await {
-                        failure.get_or_insert(error);
-                    }
-                    if let Some((state, model, opening)) = opening.as_mut() {
-                        opening.observe(state, model, Some(text));
-                    }
+    let mut messages = 0usize;
+    let mut bytes = 0usize;
+    // 只限套接字排空：已读事实先进入紧凑队列，CP 慢回包不能取消并遮住下一条事实。
+    while messages < 128
+        && bytes < REALTIME_MAX_MESSAGE_BYTES
+        && !journal
+            .as_ref()
+            .is_some_and(|journal| journal.pending_full())
+    {
+        let message = match tokio::time::timeout_at(deadline, up_rx.next()).await {
+            Ok(Some(Ok(message))) => message,
+            _ => break,
+        };
+        messages += 1;
+        match &message {
+            TgMessage::Text(text) => {
+                bytes = bytes.saturating_add(text.len());
+                io.drained(&message);
+                if let Err(error) = collect_usage(journal, usage, text) {
+                    failure.get_or_insert(error);
                 }
-                TgMessage::Binary(_) => io.drained(&message),
-                TgMessage::Close(_) => break,
-                _ => {}
+                if let Some((state, model, opening)) = opening.as_mut() {
+                    opening.observe(state, model, Some(text));
+                }
             }
+            TgMessage::Binary(body) => {
+                bytes = bytes.saturating_add(body.len());
+                io.drained(&message);
+            }
+            TgMessage::Close(_) => break,
+            _ => {}
         }
-    })
-    .await;
+    }
+    if messages >= 128
+        || bytes >= REALTIME_MAX_MESSAGE_BYTES
+        || journal
+            .as_ref()
+            .is_some_and(|journal| journal.pending_full())
+    {
+        // 当前已读帧仍保留；未继续读取的部分无法证实完备，终态只能是 Unknown。
+        tracing::warn!(
+            reason = "closing_drain_limit",
+            "realtime closing observation is incomplete"
+        );
+    }
+
     failure.map_or(Ok(()), Err)
 }
 

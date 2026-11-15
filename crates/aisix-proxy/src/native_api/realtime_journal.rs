@@ -36,7 +36,7 @@ pub(crate) struct Journal {
     deadline_at: DateTime<Utc>,
     upstream_model: String,
     transcription: bool,
-    pending: Option<AppendLiveUsageRequest>,
+    pending: VecDeque<AppendLiveUsageRequest>,
     state: ProxyState,
     auth: AuthenticatedKey,
     client: ClientContext,
@@ -273,7 +273,7 @@ impl Journal {
             deadline_at,
             upstream_model: upstream_model.to_owned(),
             transcription: purpose == RealtimePurpose::Transcription,
-            pending: None,
+            pending: VecDeque::new(),
             state: state.clone(),
             auth: auth.clone(),
             client: client.clone(),
@@ -676,20 +676,19 @@ impl Journal {
     }
 
     /// 相同供应商事实换 event_id 重投只观察一次；不以传输投递 ID 定义收费事实。
-    pub(crate) async fn observe(&mut self, text: &str) -> Result<bool, ProxyError> {
+    pub(crate) fn collect(&mut self, text: &str) -> Result<bool, ProxyError> {
         let Ok(event) = serde_json::from_str::<Value>(text) else {
             return Ok(true);
         };
         self.observe_configuration(&event)?;
         self.observe_asr_meter(&event)?;
-        self.flush().await?;
         if event["type"].as_str() == Some("conversation.item.input_audio_transcription.completed") {
             let identity = event["item_id"]
                 .as_str()
                 .zip(event["content_index"].as_u64());
             let entry = self.asr_entry(&event);
             let Some(entry) = entry else {
-                return self.unknown_usage(&event["usage"]).await;
+                return self.unknown_usage(&event["usage"]);
             };
             // 供应商转录可按输入秒数报告，包括显式 0；不将缺价秒量改成 token 或零账。
             let meter = if event["usage"]["type"].as_str() == Some("duration") {
@@ -712,7 +711,7 @@ impl Journal {
                 })
             };
             let Some(meter) = meter else {
-                return self.unknown_usage(&event["usage"]).await;
+                return self.unknown_usage(&event["usage"]);
             };
             let Some((id, index)) = identity else {
                 return Ok(true);
@@ -724,7 +723,7 @@ impl Journal {
                 ObservedMeter::Tokens { usage } => usage.occurred_at,
                 _ => Utc::now(),
             };
-            self.pending = Some(AppendLiveUsageRequest {
+            self.pending.push_back(AppendLiveUsageRequest {
                 operation_id: self.lease.operation_id,
                 api_key_id: self.api_key_id,
                 event_id: fact.clone(),
@@ -740,7 +739,7 @@ impl Journal {
                 raw_usage: Some(event["usage"].clone()),
                 lease: Some(self.lease.clone()),
             });
-            return self.flush().await;
+            return Ok(true);
         }
         if event.get("type").and_then(Value::as_str) != Some("response.done") {
             return Ok(true);
@@ -758,7 +757,7 @@ impl Journal {
         let measured = terminal_usage(usage, response["status"].as_str());
         if id.is_none() || measured.is_none() {
             // SDK 的 response.id 可缺失；只保存待对账观察，不虚构收费事实或拒掉旧 WS。
-            self.pending = Some(AppendLiveUsageRequest {
+            self.pending.push_back(AppendLiveUsageRequest {
                 operation_id: self.lease.operation_id,
                 api_key_id: self.api_key_id,
                 event_id: format!("gateway-observation:{}", Uuid::new_v4()),
@@ -769,13 +768,13 @@ impl Journal {
                 raw_usage: Some(usage.clone()),
                 lease: Some(self.lease.clone()),
             });
-            return self.flush().await;
+            return Ok(true);
         }
         let (Some(id), Some(measured)) = (id, measured) else {
             return Ok(true);
         };
         let at = measured.occurred_at;
-        self.pending = Some(AppendLiveUsageRequest {
+        self.pending.push_back(AppendLiveUsageRequest {
             operation_id: self.lease.operation_id,
             api_key_id: self.api_key_id,
             event_id: format!("response:{id}"),
@@ -791,14 +790,14 @@ impl Journal {
             raw_usage: Some(usage.clone()),
             lease: Some(self.lease.clone()),
         });
-        self.flush().await
+        Ok(true)
     }
 
-    async fn unknown_usage(&mut self, usage: &Value) -> Result<bool, ProxyError> {
+    fn unknown_usage(&mut self, usage: &Value) -> Result<bool, ProxyError> {
         if !usage.is_object() {
             return Ok(true);
         }
-        self.pending = Some(AppendLiveUsageRequest {
+        self.pending.push_back(AppendLiveUsageRequest {
             operation_id: self.lease.operation_id,
             api_key_id: self.api_key_id,
             event_id: format!("gateway-observation:{}", Uuid::new_v4()),
@@ -809,40 +808,66 @@ impl Journal {
             raw_usage: Some(usage.clone()),
             lease: Some(self.lease.clone()),
         });
-        self.flush().await
+        Ok(true)
     }
 
-    /// 未知结果只用原稳定事实重试，不能退回会话汇总收费。
-    async fn flush(&mut self) -> Result<bool, ProxyError> {
-        let Some(request) = self.pending.as_ref() else {
-            return Ok(true);
-        };
-        let reply = self
-            .registry
-            .append_live_usage(request.clone())
-            .await
-            .map_err(proxy_error)?;
-        if reply.operation_id != Some(self.lease.operation_id) {
-            return Err(ProxyError::AccountUnavailable);
+    pub(crate) fn pending_full(&self) -> bool {
+        self.pending.len() >= 128
+    }
+
+    /// 已读到的事实先入队；未知追加结果只重试原稳定身份，不能退回会话汇总收费。
+    pub(crate) async fn flush(&mut self) -> Result<(), ProxyError> {
+        while let Some(request) = self.pending.front().cloned() {
+            let registry = Arc::clone(&self.registry);
+            let reply = registry
+                .append_live_usage(request)
+                .await
+                .map_err(proxy_error)?;
+            if reply.operation_id != Some(self.lease.operation_id) || reply.appended.is_none() {
+                return Err(ProxyError::AccountUnavailable);
+            }
+            self.pending.pop_front();
         }
-        let appended = reply.appended.ok_or(ProxyError::AccountUnavailable)?;
-        self.pending = None;
-        Ok(appended)
+        Ok(())
     }
 
     pub(crate) async fn finish(&mut self) -> Result<(), ProxyError> {
-        self.flush().await?;
-        // 普通 WS 无供应商会话累计终账；连接结束不能证明缺失尾量为零。
-        self.registry
-            .checkpoint_live_session(CheckpointLiveSessionRequest {
-                lease: self.lease.clone(),
-                terminal: true,
-                coverage: UsageCoverage::Unknown,
-                entries: Vec::new(),
-            })
-            .await
-            .map_err(proxy_error)?;
-        Ok(())
+        // 套接字已停止后才有限重试，不把持久化等待纳入两秒读排空预算。
+        let persisted = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            for attempt in 0..3 {
+                match self.flush().await {
+                    Ok(()) => return Ok(()),
+                    Err(error) if attempt == 2 => return Err(error),
+                    Err(_) => tokio::time::sleep(std::time::Duration::from_millis(250)).await,
+                }
+            }
+            Err(ProxyError::AccountUnavailable)
+        })
+        .await
+        .unwrap_or(Err(ProxyError::AccountUnavailable));
+        if persisted.is_err() {
+            tracing::warn!(
+                operation_id = %self.lease.operation_id,
+                pending_facts = self.pending.len(),
+                reason = "usage_persistence_unavailable",
+                "realtime closing usage remains unconfirmed"
+            );
+        }
+        // 即使追加失败也尝试收束 Unknown；不得把未确认的 RAM 数量称为已持久或零费用。
+        let closed = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            self.registry
+                .checkpoint_live_session(CheckpointLiveSessionRequest {
+                    lease: self.lease.clone(),
+                    terminal: true,
+                    coverage: UsageCoverage::Unknown,
+                    entries: Vec::new(),
+                }),
+        )
+        .await
+        .map_err(|_| ProxyError::AccountUnavailable)?
+        .map_err(proxy_error);
+        persisted.and(closed.map(|_| ()))
     }
 }
 
