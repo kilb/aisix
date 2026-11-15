@@ -13,6 +13,7 @@ use std::sync::{
 use std::time::Duration;
 
 use aisix_control_plane::auth::{MemberRole, OperatorRole};
+use aisix_core::native_objects::InferenceStage;
 use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::ProxyConfig;
 use aisix_gateway::Hub;
@@ -41,6 +42,7 @@ const LABEL: &str = "metadata-original-key";
 const UPSTREAM_KEY: &str = "sk-local-metadata-provider-contract";
 const SIGNING_KEY: &str = "metadata-hmac-fixture-at-least-thirty-two-bytes";
 const COOKIE_CANARY: &str = "metadata_cookie_secret_31e8";
+const UNSELECTED_CANARY: &str = "metadata_unselected_header_secret_77ab";
 const RESPONSE_ID: &str = "resp_metadata_background";
 const BATCH_ID: &str = "batch_metadata_entries";
 const INPUT_FILE: &str = "file_metadata_original";
@@ -55,6 +57,7 @@ const COMPLETED_AT: i64 = 1_794_614_500;
 struct ProviderState {
     terminal: AtomicBool,
     scans: Mutex<Vec<String>>,
+    otlp_payloads: Mutex<Vec<Value>>,
     calls: Mutex<Vec<(String, String, Vec<u8>)>>,
     files: Mutex<Vec<(String, Vec<u8>)>>,
     batch_input: Mutex<Option<String>>,
@@ -98,6 +101,80 @@ impl Provider {
             .collect()
     }
 
+    // 只观察真实 handler 触发的正式 exporter HTTP，不直接构造或发送 span。
+    async fn exported_request_headers(&self, request_id: &str, phase: &str) {
+        assert!(
+            !request_id.is_empty(),
+            "a real accepted/management request has a correlation id"
+        );
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let spans: Vec<Value> = self
+                    .state
+                    .otlp_payloads
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|payload| {
+                        payload
+                            .get("resourceSpans")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                    })
+                    .flat_map(|resource| {
+                        resource
+                            .get("scopeSpans")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                    })
+                    .flat_map(|scope| {
+                        scope
+                            .get("spans")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                    })
+                    .filter(|span| otlp_text(span, "aisix.request_id") == Some(request_id))
+                    .cloned()
+                    .collect();
+                if spans.iter().any(|span| {
+                    otlp_text(span, "http.request.header.x-metadata-project") == Some(phase)
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the real DP exporter sends the selected nonempty request header to OTLP HTTP");
+        // 调用者先关闭两个正式 fanout；检查全部已完成的真实 HTTP payload，覆盖资源属性和无关联 span 的泄漏。
+        for payload in self.state.otlp_payloads.lock().unwrap().iter() {
+            let wire = payload.to_string();
+            for forbidden in [
+                "http.request.header.authorization",
+                "http.request.header.cookie",
+                "http.request.header.x-metadata-private",
+            ] {
+                assert!(
+                    !wire.contains(forbidden),
+                    "credentials and unselected headers never appear in actual exporter output"
+                );
+            }
+            for secret in [COOKIE_CANARY, UNSELECTED_CANARY, SIGNING_KEY, UPSTREAM_KEY] {
+                assert!(
+                    !wire.contains(secret),
+                    "sensitive header values never reach actual OTLP output"
+                );
+            }
+            assert!(
+                !wire.contains(&URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","typ":"JWT"}"#)),
+                "the raw signed credential never reaches actual OTLP output"
+            );
+        }
+    }
+
     fn posts(&self, path: &str) -> Vec<Value> {
         self.state
             .calls
@@ -108,6 +185,15 @@ impl Provider {
             .map(|call| serde_json::from_slice(&call.2).unwrap())
             .collect()
     }
+}
+
+fn otlp_text<'a>(span: &'a Value, key: &str) -> Option<&'a str> {
+    span.get("attributes")?
+        .as_array()?
+        .iter()
+        .find(|field| field.get("key").and_then(Value::as_str) == Some(key))?
+        .pointer("/value/stringValue")?
+        .as_str()
 }
 
 impl Drop for Provider {
@@ -182,6 +268,15 @@ async fn provider(State(state): State<Arc<ProviderState>>, request: Request<Body
         .and_then(|v| v.to_str().ok())
         == Some(format!("Bearer {UPSTREAM_KEY}").as_str());
     let bytes = to_bytes(request.into_body(), 1 << 20).await.unwrap();
+    if path == "/v1/traces" {
+        assert_eq!(method, "POST", "the actual exporter uses OTLP HTTP POST");
+        state
+            .otlp_payloads
+            .lock()
+            .unwrap()
+            .push(serde_json::from_slice(&bytes).expect("actual OTLP HTTP JSON"));
+        return Json(json!({})).into_response();
+    }
     if path == "/scan" {
         let body: Value = serde_json::from_slice(&bytes).unwrap();
         state
@@ -405,7 +500,8 @@ async fn fixture() -> Option<Fixture> {
         &admin,
         "observability_exporters",
         json!({"name":"metadata-selected-headers",
-        "kind":"otlp_http","endpoint":format!("{}/unused-traces", provider.base),
+        "kind":"otlp_http","endpoint":format!("{}/v1/traces", provider.base),
+        "content_mode":"metadata_only","sample_rate":1,
         "request_headers":["x-metadata-project"]}),
     )
     .await;
@@ -535,6 +631,7 @@ async fn send(
         .header("authorization", format!("Bearer {}", token(phase)))
         .header("cookie", format!("session={COOKIE_CANARY}"))
         .header("x-metadata-project", phase)
+        .header("x-metadata-private", UNSELECTED_CANARY)
         .header("content-type", content_type)
         .body(Body::from(bytes))
         .unwrap();
@@ -568,12 +665,29 @@ async fn json_request(
     .await
 }
 
-fn drain(rx: &mut mpsc::Receiver<UsageEvent>) -> Vec<Value> {
+fn drain_typed(rx: &mut mpsc::Receiver<UsageEvent>) -> Vec<UsageEvent> {
     let mut events = Vec::new();
     while let Ok(event) = rx.try_recv() {
-        events.push(serde_json::to_value(event).unwrap());
+        events.push(event);
     }
     events
+}
+
+fn drain(rx: &mut mpsc::Receiver<UsageEvent>) -> Vec<Value> {
+    drain_typed(rx)
+        .into_iter()
+        .map(|event| serde_json::to_value(event).unwrap())
+        .collect()
+}
+
+// 先观察 DP 私有出口；UsageEvent 的公共序列化有意不携带请求头。
+fn private_request_header(event: &UsageEvent, phase: &str) {
+    let headers = serde_json::to_value(&event.request_headers).unwrap();
+    assert_eq!(
+        headers.get("x-metadata-project").and_then(Value::as_str),
+        Some(phase),
+        "the actual DP event retains the selected request header before public serialization"
+    );
 }
 
 fn original_metadata(event: &Value) {
@@ -585,12 +699,12 @@ fn original_metadata(event: &Value) {
     assert_eq!(event["jwt_subject"], "metadata-admission-subject");
     assert_eq!(event["jwt_provider"], "metadata-admission-idp");
     assert_eq!(event["jwt_claim_mapping"], "metadata-admission-mapping");
-    assert_eq!(
-        event["request_headers"],
-        json!({"x-metadata-project":"admission"})
+    assert!(
+        !event.as_object().unwrap().contains_key("request_headers"),
+        "request headers belong only to private DP observation, never the public billing payload"
     );
     let wire = event.to_string();
-    for secret in [COOKIE_CANARY, SIGNING_KEY, UPSTREAM_KEY] {
+    for secret in [COOKIE_CANARY, UNSELECTED_CANARY, SIGNING_KEY, UPSTREAM_KEY] {
         assert!(
             !wire.contains(secret),
             "credential values must not become metadata"
@@ -600,9 +714,6 @@ fn original_metadata(event: &Value) {
         !wire.contains(&URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","typ":"JWT"}"#)),
         "the raw signed credential must not become metadata"
     );
-    let headers = event["request_headers"].as_object().unwrap();
-    assert!(!headers.contains_key("authorization"));
-    assert!(!headers.contains_key("cookie"));
 }
 
 fn input_audit(event: &Value, is_a: bool) {
@@ -752,6 +863,12 @@ async fn replay_once(
     assert_eq!(counts, (expected_count, expected_count, expected_total));
 }
 
+async fn shutdown_exporters(state: &ProxyState) {
+    tokio::time::timeout(Duration::from_secs(10), state.otlp_fan_out.shutdown())
+        .await
+        .expect("the real DP exporter flushes and shuts down within the fixture budget");
+}
+
 async fn stop(stop: watch::Sender<bool>, worker: tokio::task::JoinHandle<()>) {
     stop.send(true).unwrap();
     tokio::time::timeout(Duration::from_secs(10), worker)
@@ -799,16 +916,15 @@ async fn background_response_keeps_original_verified_metadata_through_real_autho
         "the custom input rule actually ran"
     );
     assert!(f.provider.scans()[0].contains("metadata-entry-a"));
-    let accepted: Vec<_> = drain(&mut usage)
+    let accepted: Vec<_> = drain_typed(&mut usage)
         .into_iter()
-        .filter(|event| event["inference_stage"] == "accepted")
+        .filter(|event| event.inference_stage == Some(InferenceStage::Accepted))
         .collect();
     assert_eq!(
         accepted.len(),
         1,
         "one real accepted event, no fabricated terminal"
     );
-    assert_eq!(accepted[0]["native_operation_id"], json!(operation));
     rename_key(&f).await;
     let (recovery, mut observation) = gateway(&f).await;
     f.provider.complete();
@@ -833,8 +949,11 @@ async fn background_response_keeps_original_verified_metadata_through_real_autho
         ),
         (Some(7), Some(3))
     );
-    original_metadata(&accepted[0]);
-    input_audit(&accepted[0], true);
+    private_request_header(&accepted[0], "admission");
+    let accepted_wire = serde_json::to_value(&accepted[0]).unwrap();
+    assert_eq!(accepted_wire["native_operation_id"], json!(operation));
+    original_metadata(&accepted_wire);
+    input_audit(&accepted_wire, true);
     original_metadata(&rows[0].1);
     input_audit(&rows[0].1, true);
     let (status, body) = json_request(
@@ -864,6 +983,26 @@ async fn background_response_keeps_original_verified_metadata_through_real_autho
         "current observer metadata cannot rewrite historical metadata"
     );
     assert_eq!(f.provider.posts("/v1/responses").len(), 1);
+    shutdown_exporters(&state).await;
+    shutdown_exporters(&recovery).await;
+    let accepted_request_id = accepted_wire["request_id"]
+        .as_str()
+        .expect("actual accepted request id");
+    f.provider
+        .exported_request_headers(accepted_request_id, "admission")
+        .await;
+    let observer = observed
+        .iter()
+        .find(|event| event["jwt_subject"] == "metadata-observer-subject")
+        .unwrap();
+    f.provider
+        .exported_request_headers(
+            observer["request_id"]
+                .as_str()
+                .expect("actual management request id"),
+            "observer",
+        )
+        .await;
     replay_once(&f, object, vec![rows[0].1.clone()], 1, 26).await;
 }
 
@@ -941,6 +1080,10 @@ async fn actual_two_entry_batch_keeps_each_executed_input_audit_with_its_own_ter
     assert_eq!(staged[1]["body"]["model"], "gpt-4.1-mini");
     assert_eq!(staged[1]["body"]["messages"][0]["content"], B_TEXT);
     assert_eq!(f.provider.posts("/v1/batches").len(), 1);
+    let accepted: Vec<_> = drain_typed(&mut usage)
+        .into_iter()
+        .filter(|event| event.inference_stage == Some(InferenceStage::Accepted))
+        .collect();
     rename_key(&f).await;
     let (recovery, _) = gateway(&f).await;
     f.provider.complete();
@@ -969,6 +1112,19 @@ async fn actual_two_entry_batch_keeps_each_executed_input_audit_with_its_own_ter
         assert_eq!(*charge, expected_charge);
         assert_eq!(event["is_batch"], true);
     }
+    assert_eq!(accepted.len(), 1, "one actual accepted batch event");
+    private_request_header(&accepted[0], "admission");
+    let accepted_wire = serde_json::to_value(&accepted[0]).unwrap();
+    shutdown_exporters(&state).await;
+    shutdown_exporters(&recovery).await;
+    f.provider
+        .exported_request_headers(
+            accepted_wire["request_id"]
+                .as_str()
+                .expect("actual accepted batch request id"),
+            "admission",
+        )
+        .await;
     for (entry, event, _) in &rows {
         original_metadata(event);
         input_audit(event, entry == "A");
