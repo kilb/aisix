@@ -27,7 +27,7 @@ use crate::error::ProxyError;
 use crate::operation::Surface;
 use crate::state::ProxyState;
 
-/// 只有真正原生准入才调用；空观测分支不复制身份、请求头或分配 Box。
+/// 只有真正原生准入才调用；空公共观测分支不复制身份或分配 Box。
 pub(crate) fn native_usage_context(
     client: &ClientContext,
     input_audit: aisix_core::native_objects::NativeInputAudit,
@@ -45,14 +45,12 @@ pub(crate) fn native_usage_context(
     if caller.api_key_name.as_ref().is_none_or(String::is_empty)
         && caller.tags.is_empty()
         && !has_jwt
-        && client.request_headers.is_empty()
         && input_audit.is_empty()
     {
         return None;
     }
     let mut event = UsageEvent::default();
     apply_caller_identity(&mut event, client.jwt.as_ref(), caller);
-    event.request_headers = client.request_headers.clone();
     native_usage_context_from_event(event, input_audit)
 }
 
@@ -66,7 +64,6 @@ fn native_usage_context_from_event(
         jwt_subject: event.jwt_subject,
         jwt_provider: event.jwt_provider,
         jwt_claim_mapping: event.jwt_claim_mapping,
-        request_headers: event.request_headers,
         input_audit,
     };
     (!context.is_empty()).then(|| Box::new(context))
@@ -4558,7 +4555,7 @@ mod tests {
         assert!(at("let c = '\"'; UsageEvent {}", "UsageEvent"));
         assert!(at("let var = 1; UsageEvent {}", "UsageEvent"));
     }    #[test]
-    fn a_native_context_moves_only_the_original_observation_projection() {
+    fn a_native_context_moves_only_the_original_public_observation_projection() {
         let mut event = UsageEvent::default();
         event.api_key_id = "authoritative-key".into();
         event.team_id = "authoritative-tenant".into();
@@ -4579,7 +4576,7 @@ mod tests {
             serde_json::json!({
                 "api_key_name":"original-name", "tags":{"project":"original-tag"},
                 "jwt_subject":"original-subject", "jwt_provider":"original-provider",
-                "jwt_claim_mapping":"original-mapping", "request_headers":{"x-project":"original-header"}
+                "jwt_claim_mapping":"original-mapping"
             })
         );
     }
@@ -4624,5 +4621,12 @@ mod tests {
     #[test]
     fn an_empty_native_observation_has_no_carrier() {
         assert!(native_usage_context(&ClientContext::default(), Default::default()).is_none());
+    }
+
+    #[test]
+    fn private_exporter_headers_alone_do_not_create_a_public_context() {
+        let mut client = ClientContext::default();
+        client.request_headers.insert("x-project".into(), "private-observation".into());
+        assert!(native_usage_context(&client, Default::default()).is_none());
     }
 }

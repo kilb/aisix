@@ -583,8 +583,6 @@ pub struct NativeUsageContext {
     pub jwt_provider: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub jwt_claim_mapping: String,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub request_headers: BTreeMap<String, String>,
     #[serde(flatten)]
     pub input_audit: NativeInputAudit,
 }
@@ -596,7 +594,6 @@ impl NativeUsageContext {
             && self.jwt_subject.is_empty()
             && self.jwt_provider.is_empty()
             && self.jwt_claim_mapping.is_empty()
-            && self.request_headers.is_empty()
             && self.input_audit.is_empty()
     }
 }
@@ -1412,7 +1409,8 @@ mod usage_context_tests {
         wire["usage_context"] = json!({
             "api_key_name":"original-name", "future_observation":{"value":7},
             "api_key_id":Uuid::from_u128(999), "team_id":"other-tenant", "user_id":"other-member",
-            "cost_usd":999, "prompt_tokens":999, "occurred_at":"2099-01-01T00:00:00Z"
+            "cost_usd":999, "prompt_tokens":999, "occurred_at":"2099-01-01T00:00:00Z",
+            "request_headers":{"x-private":"must-stay-exporter-only"}
         });
         let submission: BeginRequest = serde_json::from_value(wire).unwrap();
         assert_eq!(submission.api_key_id, Uuid::from_u128(2));
