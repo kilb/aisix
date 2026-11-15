@@ -4,20 +4,33 @@
 mod support;
 
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use aisix_control_plane::auth::{MemberRole, OperatorRole};
 use aisix_core::models::tags::{MAX_TAGS, MAX_TAG_VALUE_CHARS};
-use aisix_core::models::{tag_value_from_claim, validate_apikey};
-use aisix_core::native_objects::{
-    configured_native_origin, native_origin_surface, platform_id_key_from_secret, NativeObjectKind,
-    NativeProtocol, NativeUsageContext,
+use aisix_core::models::{
+    tag_value_from_claim, validate_apikey, validate_model, validate_provider_key,
 };
-use aisix_core::ProviderKey;
+use aisix_core::native_objects::{
+    configured_native_origin, native_origin_surface, platform_id_key_from_secret, InferenceStage,
+    NativeObjectKind, NativeProtocol, NativeUsageContext, TerminalUsage,
+};
+use aisix_core::snapshot::SnapshotHandle;
+use aisix_core::{AisixSnapshot, ApiKey, Model, ProviderKey, ProxyConfig, ResourceEntry};
+use aisix_gateway::Hub;
+use aisix_obs::{UsageEvent, UsageSink};
+use aisix_proxy::{build_router, ProxyState};
+use axum::body::{to_bytes, Body};
+use axum::extract::ConnectInfo;
+use axum::http::{Request, StatusCode};
+use axum::{routing::post, Json, Router};
 use chrono::Utc;
 use serde_json::{json, Value};
 use support::world::{db_now, group_id, seed_key, seed_tenant, SHARED_GROUP};
 use support::{DpClient, OperatorSession, TestCp};
+use tower::ServiceExt;
 use uuid::Uuid;
 
 const SNAPSHOT_FIELDS: [&str; 10] = [
@@ -49,7 +62,105 @@ async fn create(cp: &TestCp, admin: &OperatorSession, path: &str, body: Value) -
     response.body
 }
 
-fn snapshot(large: bool) -> Value {
+// 真实公开路由产出遥测，HTTP 替身只提供官方 chat 成功形状；此 sink 不接 CP reporter。
+async fn producer_event(tags: &BTreeMap<String, String>) -> UsageEvent {
+    struct Upstream(Option<tokio::task::JoinHandle<()>>);
+    impl Drop for Upstream {
+        fn drop(&mut self) {
+            if let Some(task) = &self.0 {
+                task.abort();
+            }
+        }
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("local component listener");
+    let address = listener.local_addr().expect("local component address");
+    let upstream = Router::new().route("/v1/chat/completions", post(|| async {
+        Json(json!({"id":"chatcmpl_context_probe","object":"chat.completion","created":1,
+            "model":"context-probe-upstream","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}))
+    }));
+    let mut server = Upstream(Some(tokio::spawn(async move {
+        axum::serve(listener, upstream)
+            .await
+            .expect("local component HTTP");
+    })));
+    let provider_id = "11111111-1111-4111-8111-111111111111";
+    let model_id = "22222222-2222-4222-8222-222222222222";
+    let key_id = "33333333-3333-4333-8333-333333333333";
+    let provider_doc = json!({"display_name":"context-probe-account","provider":"openai","adapter":"openai",
+        "secret":"component-probe-upstream","api_base":format!("http://{address}/v1")});
+    let model_doc = json!({"display_name":"context-probe","provider":"openai",
+        "model_name":"context-probe-upstream","provider_key_id":provider_id});
+    let key_doc = json!({"key_hash":ApiKey::hash_bearer("context-probe-caller"),
+        "display_name":"native-metadata-key","allowed_model_ids":[model_id],"tags":tags});
+    validate_provider_key(&provider_doc).expect("public provider resource admission");
+    validate_model(&model_doc).expect("public model resource admission");
+    validate_apikey(&key_doc).expect("public caller resource admission with legal tags");
+    let snapshot = AisixSnapshot::new();
+    snapshot.provider_keys.insert(ResourceEntry::new(
+        provider_id,
+        serde_json::from_value::<ProviderKey>(provider_doc).expect("typed provider"),
+        1,
+    ));
+    snapshot.models.insert(ResourceEntry::new(
+        model_id,
+        serde_json::from_value::<Model>(model_doc).expect("typed model"),
+        1,
+    ));
+    snapshot.apikeys.insert(ResourceEntry::new(
+        key_id,
+        serde_json::from_value::<ApiKey>(key_doc).expect("typed caller"),
+        1,
+    ));
+    let hub = Arc::new(Hub::new());
+    hub.register_specialized(
+        "openai",
+        Arc::new(aisix_provider_openai::OpenAiBridge::new()),
+    );
+    let config: ProxyConfig = serde_json::from_value(json!({"addr":"127.0.0.1:0"}))
+        .expect("proxy component configuration");
+    let (sender, mut events) = tokio::sync::mpsc::channel(4);
+    let state = ProxyState::new(SnapshotHandle::new(snapshot), hub, &config)
+        .without_cache()
+        .with_usage_sink(UsageSink::new(sender));
+    let request = Request::builder().method("POST").uri("/v1/chat/completions")
+        .header("authorization","Bearer context-probe-caller").header("content-type","application/json")
+        .extension(ConnectInfo("127.0.0.1:41000".parse::<SocketAddr>().expect("component peer")))
+        .body(Body::from(json!({"model":"context-probe","messages":[{"role":"user","content":"tag producer probe"}]}).to_string()))
+        .expect("public chat request");
+    let response = build_router(state)
+        .oneshot(request)
+        .await
+        .expect("actual production router");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "producer probe must execute normally"
+    );
+    let _ = to_bytes(response.into_body(), 1 << 20)
+        .await
+        .expect("drain actual chat response");
+    let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+        .await
+        .expect("actual UsageSink delivery")
+        .expect("one real producer event");
+    assert_eq!(event.status_code, 200);
+    assert_eq!((event.prompt_tokens, event.completion_tokens), (1, 1));
+    assert_eq!(
+        &event.tags, tags,
+        "actual producer sanitize preserves all legal 128-character values"
+    );
+    assert_eq!(event.api_key_name, "native-metadata-key");
+    if let Some(task) = server.0.take() {
+        task.abort();
+        let _ = task.await;
+    }
+    event
+}
+
+async fn snapshot(cp: &TestCp, large: bool) -> Value {
     let count = if large { MAX_TAGS } else { 1 };
     let value = if large {
         "🙂".repeat(MAX_TAG_VALUE_CHARS)
@@ -79,8 +190,21 @@ fn snapshot(large: bool) -> Value {
                 > 16_384
         );
     }
+    let before: i64 = sqlx::query_scalar("SELECT count(*) FROM usage_events")
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("usage count before isolated producer probe");
+    let produced = producer_event(&tags).await;
+    let after: i64 = sqlx::query_scalar("SELECT count(*) FROM usage_events")
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("usage count after isolated producer probe");
+    assert_eq!(
+        after, before,
+        "producer probe is captured locally and never delivered into CP"
+    );
     let context: NativeUsageContext = serde_json::from_value(json!({
-        "api_key_name":"native-metadata-key","tags":tags,
+        "api_key_name":produced.api_key_name,"tags":produced.tags,
         "jwt_subject":"component-subject","jwt_provider":"component-provider",
         "jwt_claim_mapping":"component-claim-mapping",
         "applied_guardrails":[{"kind":"pii","hook":"input"}],
@@ -114,6 +238,55 @@ struct Fixture {
 }
 
 impl Fixture {
+    fn expected_event(
+        &self,
+        usage: &Value,
+        context: &Value,
+        operation: Uuid,
+        request_id: &str,
+    ) -> Value {
+        let usage: TerminalUsage =
+            serde_json::from_value(usage.clone()).expect("public terminal usage");
+        let mut event = serde_json::to_value(usage).expect("complete terminal usage serialization");
+        let fields = event.as_object_mut().expect("terminal usage object");
+        fields.remove("entry_id");
+        fields.remove("terminal_status");
+        // CP 之后才分配事件 ID；测量使用同宽合法 UUID，不把占位值作为实际身份断言。
+        for (name, value) in [
+            ("event_id", json!(operation)),
+            ("team_id", json!(self.tenant)),
+            ("api_key_id", json!(self.key)),
+            ("user_id", json!(self.member)),
+            ("model_id", json!(self.model)),
+            ("requested_model_id", json!(self.model)),
+            ("requested_service_tier", Value::Null),
+            ("is_batch", json!(false)),
+            ("provider_key_id", json!(self.provider)),
+            ("upstream_model", json!("native-context-upstream")),
+            ("upstream_provider", json!("openai")),
+            ("requested_model", json!("native-context-model")),
+            ("request_id", json!(request_id)),
+            ("operation", json!("responses")),
+            ("is_final_attempt", json!(true)),
+            ("upstream_dispatched", json!(true)),
+            ("inference_stage", json!(InferenceStage::Terminal)),
+            ("native_operation_id", json!(operation)),
+            ("native_terminal_status", json!("completed")),
+        ] {
+            fields.insert(name.into(), value);
+        }
+        for name in SNAPSHOT_FIELDS {
+            fields.insert(
+                name.into(),
+                context
+                    .get(name)
+                    .expect("all ten full event fields are explicit")
+                    .clone(),
+            );
+        }
+        event
+    }
+
     async fn new() -> Self {
         assert!(
             std::env::var("CP_TEST_DATABASE_URL").is_ok(),
@@ -283,7 +456,19 @@ impl Fixture {
             "terminal_status":"completed","usage":[{"entry_id":"","occurred_at":occurred_at,
                 "status_code":200,"prompt_tokens":37,"completion_tokens":19,
                 "cached_prompt_tokens":7,"cache_usage_reported":true,"total_tokens":56}]});
-        eprintln!("[native-context-size] stage={label}_before_complete public_tags_valid=true accepted_context_bytes={context_bytes} claimed_count=1");
+        let expected_event =
+            self.expected_event(&complete["usage"][0], &context, operation, &request_id);
+        let full_event_bytes: i32 = sqlx::query_scalar("SELECT octet_length($1::jsonb::text)")
+            .bind(expected_event)
+            .fetch_one(self.cp.db().pool())
+            .await
+            .expect("measure the full authoritative expected event in PG");
+        assert_eq!(
+            full_event_bytes > 16_384,
+            large,
+            "{label}: complete expected event JSONB size precondition"
+        );
+        eprintln!("[native-context-size] stage={label}_before_complete public_tags_valid=true producer_tags_captured=true accepted_context_bytes={context_bytes} full_event_bytes={full_event_bytes} claimed_count=1");
         let completed = self
             .dp
             .send(
@@ -315,17 +500,24 @@ impl Fixture {
             "{label}: one nonempty delivered terminal event"
         );
         let (event_id, outbox, ingested) = rows.first().expect("one event");
-        for event in [outbox, ingested] {
-            for name in SNAPSHOT_FIELDS {
-                let expected = context
-                    .get(name)
-                    .expect("all ten input snapshot fields are explicit");
+        for name in SNAPSHOT_FIELDS {
+            let expected = context
+                .get(name)
+                .expect("all ten input snapshot fields are explicit");
+            assert_eq!(
+                ingested.get(name),
+                Some(expected),
+                "{label}: complete final public snapshot field {name}"
+            );
+            // outbox 是内部交付表示；允许从持久提交恢复观测，但已经携带的值不得改写。
+            if let Some(persisted) = outbox.get(name) {
                 assert_eq!(
-                    event.get(name),
-                    Some(expected),
-                    "{label}: complete public snapshot field {name}"
+                    persisted, expected,
+                    "{label}: any outbox snapshot copy remains exact for {name}"
                 );
             }
+        }
+        for event in [outbox, ingested] {
             for (name, expected) in [
                 ("team_id", json!(self.tenant)),
                 ("api_key_id", json!(self.key)),
@@ -382,6 +574,13 @@ impl Fixture {
             (1, 1, 1, 1, -124),
             "{label}: metadata size must not alter price or once-only posting"
         );
+        let saved: Value = sqlx::query_scalar("SELECT submission->'usage_context' FROM native_operations WHERE environment_id=$1 AND operation_id=$2")
+            .bind(self.cp.env().env_id).bind(operation).fetch_one(self.cp.db().pool()).await
+            .expect("original admission snapshot remains durable after completion and replay");
+        assert_eq!(
+            saved, context,
+            "{label}: completion cannot discard the immutable full snapshot"
+        );
         eprintln!("[native-context-size] stage={label}_passed snapshot_fields=10 outbox_count=1 usage_count=1 charge_count=1 ledger_count=1 charge_micro_cny=124");
         charge.1.expect("the asserted nonzero charge")
     }
@@ -390,8 +589,12 @@ impl Fixture {
 #[tokio::test]
 async fn legal_public_tag_context_completes_without_truncation_or_duplicate_charge() {
     let fixture = Fixture::new().await;
-    let small = fixture.run("small", snapshot(false), false).await;
-    let large = fixture.run("large", snapshot(true), true).await;
+    let small = fixture
+        .run("small", snapshot(&fixture.cp, false).await, false)
+        .await;
+    let large = fixture
+        .run("large", snapshot(&fixture.cp, true).await, true)
+        .await;
     assert_eq!(small, large, "only the legal public metadata size differs");
     let balance: i64 =
         sqlx::query_scalar("SELECT balance_micro_cny FROM billing_accounts WHERE tenant_id=$1")
