@@ -3,6 +3,12 @@ mod asr_billing_contract {
     use super::*;
 
     async fn local_session() -> crate::native_api::realtime_journal::Journal {
+        local_session_with_route_refresh(false).await
+    }
+
+    async fn local_session_with_route_refresh(
+        refresh: bool,
+    ) -> crate::native_api::realtime_journal::Journal {
         let snap = snapshot("http://127.0.0.1:1/v1", "openai", "openai");
         let b: Model = serde_json::from_value(serde_json::json!({
             "display_name":"asr-alias", "provider":"openai", "model_name":"asr-upstream",
@@ -15,6 +21,40 @@ mod asr_billing_contract {
         let auth =
             AuthenticatedKey::new(&live, live.apikeys.get_by_id("k-1").unwrap(), None, false);
         let state = ProxyState::new(handle, Arc::new(Hub::new()), &cfg()).without_cache();
+        let prepared = prepare(
+            &state,
+            &live,
+            &HashMap::from([("model".to_owned(), "rt-model".to_owned())]),
+            &HeaderMap::new(),
+            &ClientContext::default(),
+            auth.clone(),
+        )
+        .await
+        .expect("real upstream request preparation");
+        assert_eq!(
+            prepared.upstream_request.uri().query(),
+            Some("model=gpt-realtime")
+        );
+        if refresh {
+            let next = (*live).clone();
+            let entry = next.models.get_by_id("m-rt").unwrap();
+            let mut model = (*entry.value).clone();
+            model.model_name = Some("new-route-after-preparation".into());
+            next.models
+                .insert(ResourceEntry::new("m-rt", model, entry.revision + 1));
+            state.snapshot.store(next);
+            assert_eq!(
+                state
+                    .snapshot
+                    .load()
+                    .models
+                    .get_by_id("m-rt")
+                    .unwrap()
+                    .value
+                    .upstream_model(),
+                Some("new-route-after-preparation")
+            );
+        }
         let mut journal = crate::native_api::realtime_journal::Journal::admit(
             &state,
             &auth,
@@ -176,5 +216,38 @@ mod asr_billing_contract {
             "same-session model rows retain independent delivery identities"
         );
         assert!(!primary.1.event_id.is_empty() && !secondary.1.event_id.is_empty());
+    }
+    #[tokio::test]
+    async fn primary_split_billing_keeps_the_model_snapshot_that_prepared_the_actual_socket() {
+        let mut journal = local_session_with_route_refresh(true).await;
+        collect(
+            &mut journal,
+            serde_json::json!({"type":"response.done","response":{
+                "id":"real-prepared-main", "status":"completed", "usage":{
+                    "input_tokens":10,"output_tokens":3,"total_tokens":13,
+                    "input_token_details":{"cached_tokens":2}
+                }
+            }}),
+        );
+        b_done(&mut journal);
+        let rows = journal.billing_rows(&summary());
+        let (snapshot, row) = rows
+            .iter()
+            .find(|(_, row)| row.model_id == "m-rt")
+            .expect("real primary quantity still gets one billing row");
+        assert_eq!(
+            (row.prompt_tokens, row.completion_tokens, row.total_tokens),
+            (10, 3, 13)
+        );
+        assert_eq!(
+            snapshot
+                .models
+                .get_by_id("m-rt")
+                .unwrap()
+                .value
+                .upstream_model(),
+            Some("gpt-realtime"),
+            "new metadata cannot retarget the already prepared socket's billing identity"
+        );
     }
 }
