@@ -1636,6 +1636,77 @@ async fn complete(
             "user_id".to_string(),
             json!(op.member_id.map(|id| id.to_string()).unwrap_or_default()),
         );
+        // 观测上下文只补同名遥测字段；tenant、key、成员和金额仍由上面的权威行决定。
+        if let Some(context) = submitted.usage_context.as_deref() {
+            for (name, value) in [
+                (
+                    "api_key_name",
+                    (!context.api_key_name.is_empty()).then(|| json!(&context.api_key_name)),
+                ),
+                (
+                    "tags",
+                    (!context.tags.is_empty()).then(|| json!(&context.tags)),
+                ),
+                (
+                    "jwt_subject",
+                    (!context.jwt_subject.is_empty()).then(|| json!(&context.jwt_subject)),
+                ),
+                (
+                    "jwt_provider",
+                    (!context.jwt_provider.is_empty()).then(|| json!(&context.jwt_provider)),
+                ),
+                (
+                    "jwt_claim_mapping",
+                    (!context.jwt_claim_mapping.is_empty())
+                        .then(|| json!(&context.jwt_claim_mapping)),
+                ),
+            ] {
+                if let Some(value) = value {
+                    fields.insert(name.into(), value);
+                }
+            }
+        }
+        // 条目缺少审计时保持缺省，不能改用批次根的累计规则或 first-bypass。
+        let input_audit = match entry {
+            Some(entry) => entry.usage_context.as_deref(),
+            None if usage.entry_id.is_empty() => submitted
+                .usage_context
+                .as_deref()
+                .map(|context| &context.input_audit),
+            None => None,
+        };
+        if let Some(audit) = input_audit {
+            for (name, value) in [
+                (
+                    "applied_guardrails",
+                    (!audit.applied_guardrails.is_empty())
+                        .then(|| json!(&audit.applied_guardrails)),
+                ),
+                (
+                    "guardrail_bypassed_reason",
+                    (!audit.guardrail_bypassed_reason.is_empty())
+                        .then(|| json!(&audit.guardrail_bypassed_reason)),
+                ),
+                (
+                    "guardrail_monitor_hits",
+                    (!audit.guardrail_monitor_hits.is_empty())
+                        .then(|| json!(&audit.guardrail_monitor_hits)),
+                ),
+                (
+                    "guardrail_enforced_hits",
+                    (!audit.guardrail_enforced_hits.is_empty())
+                        .then(|| json!(&audit.guardrail_enforced_hits)),
+                ),
+                (
+                    "guardrail_scores",
+                    (!audit.guardrail_scores.is_empty()).then(|| json!(&audit.guardrail_scores)),
+                ),
+            ] {
+                if let Some(value) = value {
+                    fields.insert(name.into(), value);
+                }
+            }
+        }
         fields.insert("model_id".to_string(), json!(model_id));
         fields.insert("requested_model_id".to_string(), json!(requested_id));
         // 恢复任务只能观察实际用量，不能替换原请求已持久化的计价档位。
