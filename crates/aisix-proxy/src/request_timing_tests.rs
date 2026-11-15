@@ -205,3 +205,69 @@ async fn request_timing_read_error_never_claims_complete_or_decoded_json() {
     );
     assert!(rx.try_recv().is_err());
 }
+
+#[tokio::test]
+async fn request_timing_raw_and_bodyless_errors_record_the_handler_boundary() {
+    use std::time::Duration;
+    use tower::ServiceExt;
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    let snapshot = seed_snapshot("phase-model", &["phase-model"], "http://unused");
+    let app = build_router(
+        build_state(snapshot, Arc::new(Hub::new())).with_usage_sink(aisix_obs::UsageSink::new(tx)),
+    );
+    for (method, path) in [
+        ("POST", "/v1/audio/transcriptions"),
+        ("POST", "/v1/audio/translations"),
+        ("POST", "/v1/images/edits"),
+        ("POST", "/v1/images/variations"),
+        ("POST", "/v1/content_provenance_checks"),
+        ("POST", "/v1/files"),
+        ("GET", "/v1/files"),
+        ("GET", "/v1/batches/missing-phase-boundary"),
+        ("POST", "/v1/uploads/missing-phase-boundary/parts"),
+        ("POST", "/v1/uploads/missing-phase-boundary/cancel"),
+        ("GET", "/v1/conversations/missing-phase-boundary"),
+        ("GET", "/v1/containers"),
+        ("POST", "/v1/containers/missing-phase-boundary/files"),
+        ("GET", "/v1/vector_stores"),
+        ("GET", "/v1/responses/missing-phase-boundary"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("authorization", "Bearer sk-caller")
+                    .header("content-type", "text/plain")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !response.status().is_success(),
+            "请求没有可用资源或合法上传：{method} {path}"
+        );
+        let _ = to_bytes(response.into_body(), 65_536).await.unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap_or_else(|error| panic!("{method} {path}: 错误终态未到达：{error}"))
+            .unwrap_or_else(|| panic!("{method} {path}: UsageEvent 通道关闭"));
+        let wire = serde_json::to_value(event).unwrap();
+        let timing = wire.get("request_timing").expect("HTTP 终态记录入口阶段");
+        assert!(
+            timing
+                .get("pre_handler_ms")
+                .and_then(serde_json::Value::as_u64)
+                .is_some(),
+            "{method} {path}: 已执行 handler 的窗口不能未知：{timing}"
+        );
+        assert!(
+            timing.get("json_decode_ms").is_none(),
+            "{method} {path}: 未解码 JSON 的请求不能捏造阶段：{timing}"
+        );
+        assert!(rx.try_recv().is_err(), "{method} {path}: 不重复发射");
+    }
+}
