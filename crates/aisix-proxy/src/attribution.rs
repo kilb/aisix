@@ -1568,6 +1568,36 @@ pub(crate) fn settle_ensemble() {
     with_cancel(|c| c.ensemble = None);
 }
 
+/// 拒绝尾点只读取认证时的身份；不取正文，也不重新查询当前 key 的归属。
+pub(crate) fn rejected_caller(
+    api_key_id: &str,
+    endpoint: &str,
+) -> Option<(
+    crate::operation::Surface,
+    crate::auth::AuthenticatedKey,
+    Option<ClientContext>,
+)> {
+    CURRENT
+        .try_with(|a| {
+            let cell = a.lock();
+            let ctx = &cell.cancel;
+            if ctx.unmetered || ctx.emitted_terminal || ctx.in_flight.is_some() || ctx.won.is_some()
+            {
+                return None;
+            }
+            let auth = ctx
+                .auth
+                .as_ref()
+                .filter(|auth| auth.entry.id == api_key_id)?;
+            let surface = ctx
+                .surface
+                .or_else(|| crate::operation::surface_for_endpoint(endpoint))?;
+            Some((surface, auth.clone(), ctx.client.clone()))
+        })
+        .ok()
+        .flatten()
+}
+
 /// Note the caller behind this request. Called once, from the
 /// [`ClientContext`] extractor — the one place every client-facing handler
 /// resolves its caller, and which by construction runs after the `auth`

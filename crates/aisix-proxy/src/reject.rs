@@ -111,6 +111,41 @@ pub(crate) fn reject_before_dispatch(
         crate::attempt::error_source(&err),
         elapsed,
     );
+    // 认证前的正文上限拒绝没有调用方；认证后的解析失败复用现有终态事件。
+    if let Some((surface, auth, client)) = api_key_id.and_then(|id| {
+        crate::attribution::rejected_caller(id, crate::normalize_endpoint_label(path))
+    }) {
+        let client = client.unwrap_or_default();
+        let snapshot = state.snapshot.load();
+        let protocol = crate::attribution::inbound_protocol().unwrap_or_else(|| {
+            crate::request_metrics::inbound_protocol(crate::normalize_endpoint_label(path))
+        });
+        let mut event = crate::usage_attr::build_error_usage_event(
+            protocol,
+            request_id,
+            "",
+            &auth.entry.id,
+            status,
+            crate::usage_attr::EventError::of(&err),
+            err.is_guardrail_block(),
+            &client,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            String::new(),
+        );
+        crate::usage_attr::apply_caller_identity(&mut event, auth.jwt.as_ref(), &auth.caller());
+        crate::usage_attr::apply_auth_type(&mut event, &auth);
+        let pk = crate::usage_attr::ResolvedPk::unresolved();
+        crate::usage_attr::emit_prepared_usage_event(
+            state,
+            &snapshot,
+            surface,
+            event,
+            crate::usage_attr::usage_event_labels(UNRESOLVED_MODEL_LABEL, &pk),
+            client.trace.as_ref(),
+        );
+    }
     match envelope {
         Envelope::OpenAi => err.into_response(),
         Envelope::Anthropic => err.into_anthropic_response(),
