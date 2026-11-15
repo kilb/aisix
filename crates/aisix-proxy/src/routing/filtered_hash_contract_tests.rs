@@ -409,6 +409,11 @@ fn configured_hash_ring_storage_stays_bounded_by_declarations() {
         .unwrap();
     assert!(ring.points.len() <= 160 * (64 + 128));
     assert_eq!(ring.point_positions.len(), ring.points.len());
+    assert_eq!(
+        std::mem::size_of_val(ring.point_positions.as_slice()),
+        4 * ring.points.len()
+    );
+    assert!(ring.point_positions.capacity() <= ring.points.len());
     assert_eq!(ring.declaration_offsets.len(), 129);
 }
 
