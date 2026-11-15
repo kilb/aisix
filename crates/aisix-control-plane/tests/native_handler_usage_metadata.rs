@@ -833,6 +833,83 @@ async fn record(f: &Fixture, raw: &str) -> (Uuid, Uuid) {
     (row.0, row.1)
 }
 
+const CALLER_SNAPSHOT_FIELDS: [&str; 5] = [
+    "api_key_name",
+    "tags",
+    "jwt_subject",
+    "jwt_provider",
+    "jwt_claim_mapping",
+];
+const AUDIT_SNAPSHOT_FIELDS: [&str; 5] = [
+    "applied_guardrails",
+    "guardrail_bypassed_reason",
+    "guardrail_monitor_hits",
+    "guardrail_enforced_hits",
+    "guardrail_scores",
+];
+
+// outbox 的内部表示可以从不可变提交恢复十个观测字段，其余权威值一字不改。
+fn assert_authoritative_terminal_preserved(raw: &Value, delivered: &Value) {
+    let mut raw_authority = raw.as_object().expect("actual raw outbox object").clone();
+    let mut delivered_authority = delivered
+        .as_object()
+        .expect("actual delivered usage object")
+        .clone();
+    for name in CALLER_SNAPSHOT_FIELDS
+        .into_iter()
+        .chain(AUDIT_SNAPSHOT_FIELDS)
+    {
+        if let Some(saved) = raw_authority.remove(name) {
+            assert_eq!(
+                delivered.get(name),
+                Some(&saved),
+                "a snapshot field already carried by the raw outbox remains exact: {name}"
+            );
+        }
+        delivered_authority.remove(name);
+    }
+    assert_eq!(raw_authority, delivered_authority,
+        "every authority, token/cache, clock, identity, price and other non-snapshot field remains exact");
+}
+
+async fn admission_submission(f: &Fixture, operation: Uuid) -> Value {
+    sqlx::query_scalar(
+        "SELECT submission FROM native_operations WHERE environment_id=$1 AND operation_id=$2",
+    )
+    .bind(f.cp.env().env_id)
+    .bind(operation)
+    .fetch_one(f.cp.db().pool())
+    .await
+    .expect("read the real immutable admission submission")
+}
+
+fn assert_admitted_observations_delivered(caller: &Value, audit: &Value, delivered: &Value) {
+    // 调用方五字段另有非空业务正控，不能用缺失值互相比较来买绿。
+    for name in CALLER_SNAPSHOT_FIELDS {
+        let accepted = caller
+            .get(name)
+            .expect("the original caller snapshot carries all five fields");
+        assert_eq!(
+            delivered.get(name),
+            Some(accepted),
+            "the accepted caller field reaches the final sink: {name}"
+        );
+    }
+    // 公共 usage 可省略空审计字段；所有实际扫描产生的非空值必须完整相等。
+    for name in AUDIT_SNAPSHOT_FIELDS {
+        let empty = if name == "guardrail_bypassed_reason" {
+            json!("")
+        } else {
+            json!([])
+        };
+        assert_eq!(
+            delivered.get(name).unwrap_or(&empty),
+            audit.get(name).unwrap_or(&empty),
+            "the entry's own accepted input audit reaches the final sink: {name}"
+        );
+    }
+}
+
 async fn terminals(f: &Fixture, record: Uuid, count: i64) -> Vec<(String, Value, i64)> {
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
@@ -854,10 +931,9 @@ async fn terminals(f: &Fixture, record: Uuid, count: i64) -> Vec<(String, Value,
         .map(|(entry, event, charge, delivered, debit, occurred)| {
             assert!(charge > 0, "the terminal must actually be billed");
             assert_eq!(charge, debit);
-            assert_eq!(
-                event, delivered,
-                "the sink must retain the complete canonical terminal"
-            );
+            assert_authoritative_terminal_preserved(&event, &delivered);
+            // 后续业务断言观察真实最终 usage_events，不能把允许精简的 outbox 当最终结果。
+            let event = delivered;
             assert_eq!(
                 occurred.timestamp(),
                 COMPLETED_AT,
@@ -948,6 +1024,7 @@ async fn background_response_keeps_original_verified_metadata_through_real_autho
     assert_eq!(body["id"], RESPONSE_ID);
     assert_eq!(body["status"], "queued");
     let (object, operation) = record(&f, RESPONSE_ID).await;
+    let admitted = admission_submission(&f, operation).await;
     let sent = f.provider.posts("/v1/responses");
     assert_eq!(
         sent.len(),
@@ -1005,6 +1082,17 @@ async fn background_response_keeps_original_verified_metadata_through_real_autho
     input_audit(&accepted_wire, true);
     original_metadata(&rows[0].1);
     input_audit(&rows[0].1, true);
+    let original_context = admitted
+        .get("usage_context")
+        .expect("the actual admission retained its observation snapshot");
+    original_metadata(original_context);
+    input_audit(original_context, true);
+    assert_admitted_observations_delivered(original_context, original_context, &rows[0].1);
+    assert_eq!(
+        admission_submission(&f, operation).await,
+        admitted,
+        "completion leaves the complete original submission unchanged"
+    );
     let (status, body) = json_request(
         &recovery,
         "GET",
@@ -1053,6 +1141,11 @@ async fn background_response_keeps_original_verified_metadata_through_real_autho
         )
         .await;
     replay_once(&f, object, vec![rows[0].1.clone()], 1, 26).await;
+    assert_eq!(
+        admission_submission(&f, operation).await,
+        admitted,
+        "the current observer and replay cannot rewrite any original submission value"
+    );
 }
 
 // 让批次根审计广播给每个 entry，B 会错误得到 A 的旁路、monitor 和 mask。
@@ -1100,6 +1193,7 @@ async fn actual_two_entry_batch_keeps_each_executed_input_audit_with_its_own_ter
     );
     assert_eq!(body["id"], BATCH_ID);
     let (object, operation) = record(&f, BATCH_ID).await;
+    let admitted = admission_submission(&f, operation).await;
     let scans = f.provider.scans();
     assert_eq!(
         scans.len(),
@@ -1174,10 +1268,30 @@ async fn actual_two_entry_batch_keeps_each_executed_input_audit_with_its_own_ter
             "admission",
         )
         .await;
+    let original_caller = admitted
+        .get("usage_context")
+        .expect("the batch admission retained its caller snapshot");
+    original_metadata(original_caller);
     for (entry, event, _) in &rows {
         original_metadata(event);
         input_audit(event, entry == "A");
+        let original_entry = admitted["entries"]
+            .as_array()
+            .expect("the actual admitted batch entries")
+            .iter()
+            .find(|candidate| candidate["entry_id"].as_str() == Some(entry.as_str()))
+            .expect("each final custom_id belongs to its original admitted entry");
+        let original_audit = original_entry
+            .get("usage_context")
+            .expect("each actually scanned entry retained its own input audit");
+        input_audit(original_audit, entry == "A");
+        assert_admitted_observations_delivered(original_caller, original_audit, event);
     }
+    assert_eq!(
+        admission_submission(&f, operation).await,
+        admitted,
+        "batch completion leaves all original caller and per-entry audit values unchanged"
+    );
     assert_eq!(
         aisix_proxy::native_api::openai_batch_worker::run_once(&recovery)
             .await
@@ -1193,4 +1307,9 @@ async fn actual_two_entry_batch_keeps_each_executed_input_audit_with_its_own_ter
     )
     .await;
     assert_eq!(f.provider.posts("/v1/batches").len(), 1);
+    assert_eq!(
+        admission_submission(&f, operation).await,
+        admitted,
+        "batch observation and replay cannot rewrite any original submission value"
+    );
 }
