@@ -1737,7 +1737,7 @@ pub(crate) fn note_resolved_entry(entry_model_id: &str) {
 /// cannot see.
 pub(crate) fn note_attempt_started(attempt: InFlightAttempt) {
     let _ = CURRENT.try_with(|a| {
-        a.response_tap.take();
+        a.response_tap.begin_attempt(attempt.started);
         let mut cell = a.lock();
         cell.cancel.in_flight = Some(attempt);
         cell.upstream_clock.begin(Instant::now());

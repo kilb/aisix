@@ -96,6 +96,8 @@ pub struct UpstreamResponseCapture {
     pub error_body: Option<bytes::Bytes>,
     /// 流在首个可转译内容前已报告的用量；句柄随本次 attempt 保存，不随 take 换绑。
     pub stream_usage: Option<StreamUsageObserver>,
+    /// 本次路由 attempt 的单调起点，仅供首 canonical chunk 前终止时恢复已测首帧。
+    pub attempt_started: Option<Instant>,
     /// 调用方虽请求流式，上游实际完整返回后才被转为模拟流，首流帧时刻未知。
     pub buffered_stream: bool,
     /// 真实上游交换的长度观察；与正文导出开关无关。
@@ -105,6 +107,16 @@ pub struct UpstreamResponseCapture {
 }
 
 impl UpstreamResponseCapture {
+    /// 纯读取，不改变失败或取消时仍需完整结算的上游等待窗口。
+    pub fn observed_ttft(&self) -> Option<std::time::Duration> {
+        if self.buffered_stream {
+            return None;
+        }
+        let started = self.attempt_started?;
+        let at = self.stream_usage.as_ref()?.first_frame_at()?;
+        Some(at.saturating_duration_since(started))
+    }
+
     pub fn is_empty(&self) -> bool {
         self.headers.is_empty()
             && self.request_id.is_empty()
@@ -286,6 +298,15 @@ impl ResponseHeaderTap {
     /// Move the latest capture out, leaving nothing behind.
     pub fn take(&self) -> UpstreamResponseCapture {
         std::mem::take(&mut *self.lock())
+    }
+
+    /// 与原先 take 共用一次锁；未产生响应时单独的起点不算非空 capture。
+    pub fn begin_attempt(&self, started: Instant) {
+        let mut current = self.lock();
+        *current = UpstreamResponseCapture {
+            attempt_started: Some(started),
+            ..Default::default()
+        };
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, UpstreamResponseCapture> {

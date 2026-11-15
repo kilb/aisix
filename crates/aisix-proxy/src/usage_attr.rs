@@ -2199,6 +2199,14 @@ fn emit_usage_to(
     let mut upstream_error_body = None;
     if dispatched {
         let response = crate::attribution::take_attempt_upstream_response(event.attempt_index);
+        // 资源级首帧预读可在流消费者创建前失败或取消；已测首帧随 attempt 恢复。
+        // 此处只读样本，失败的 upstream_clock 仍保留到失败或取消的完整等待。
+        if event.upstream_ttft_ms == 0 {
+            if let Some(ttft) = response.observed_ttft() {
+                event.upstream_ttft_ms = crate::attempt::measured_ms(ttft);
+                record_recovered_first_frame(state, snap, surface, &event, &labels, ttft);
+            }
+        }
         // 长度只取本次实际上游交换；客户端渲染及交付进度不能覆盖它。
         if event.io_audit.is_none() {
             event.io_audit = response.io.as_ref().map(|io| io.snapshot());
@@ -2372,6 +2380,63 @@ fn emit_usage_to(
         &exporters,
         terminal,
         delivery,
+    );
+}
+
+/// 只有尚无消费者记录的源端首帧才走这里；capture 只领取一次，指标不与流尾重复。
+fn record_recovered_first_frame(
+    state: &ProxyState,
+    snap: &AisixSnapshot,
+    surface: Surface,
+    event: &UsageEvent,
+    labels: &UsageEventLabels<'_>,
+    ttft: std::time::Duration,
+) {
+    let endpoint = match surface {
+        crate::operation::CHAT => "/v1/chat/completions",
+        crate::operation::MESSAGES => "/v1/messages",
+        crate::operation::RESPONSES => "/v1/responses",
+        _ => return,
+    };
+    let target = snap.models.get_by_id(&event.model_id);
+    let provider = target
+        .as_ref()
+        .and_then(|entry| entry.value.provider.as_deref())
+        .unwrap_or("unknown");
+    let upstream_model = target
+        .as_ref()
+        .and_then(|entry| entry.value.upstream_model())
+        .unwrap_or("unknown");
+    let (model, upstream_model) =
+        metric_model_label_pair(snap, &event.requested_model, upstream_model);
+    let caller = crate::request_metrics::Caller::from_api_key_id(snap, &event.api_key_id);
+    let caller = caller.as_caller();
+    state.metrics.record_ttft(
+        aisix_obs::LatencyLabels {
+            endpoint,
+            model: model.as_ref(),
+            provider,
+            status: event.status_code,
+            streaming: true,
+            details: aisix_obs::UsageLabels {
+                endpoint,
+                inbound_protocol: &event.inbound_protocol,
+                upstream_protocol: labels.upstream_protocol,
+                provider,
+                model: model.as_ref(),
+                upstream_model: upstream_model.as_ref(),
+                provider_key_id: labels.provider_key_id,
+                provider_key_name: labels.provider_key_name,
+                api_key_id: caller.api_key_id,
+                api_key_name: caller.api_key_name,
+                team_id: caller.team_id,
+                team_name: caller.team_name,
+                user_id: caller.user_id,
+                user_name: caller.user_name,
+            },
+        },
+        Some(ttft),
+        None,
     );
 }
 
