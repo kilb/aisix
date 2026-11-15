@@ -109,6 +109,8 @@ rustix = { version = "1", features = ["process"] }
 tonic-build = "=0.12.3"
 
 [dev-dependencies]
+# 元数据旅程通过真实防护链检查 handler 的输入扫描。
+aisix-guardrails = { path = "../aisix-guardrails" }
 aisix-ratelimit = { path = "../aisix-ratelimit" }
 # 联合实时组件使用工作区同版本的真实 WebSocket 客户端。
 tokio-tungstenite.workspace = true
