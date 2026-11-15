@@ -8,7 +8,7 @@ pub struct RequestTiming {
     /// 首次读取正文到 EOF、读错误或取消的窗口，未必已读完整。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body_read_ms: Option<u32>,
-    /// 入口既有首次 JSON 解码的耗时；不包含后续转换或再次读取。
+    /// 入口既有 JSON 解码块的耗时，包含错误分类回退，不包含后续转换。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub json_decode_ms: Option<u32>,
     /// middleware 起点到最终 extractor 完成；原始 Request 路由复用其处理起点。

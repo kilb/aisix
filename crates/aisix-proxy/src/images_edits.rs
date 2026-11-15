@@ -104,6 +104,7 @@ pub async fn image_edits(
         )
         .await;
     }
+    crate::attribution::note_handler_started(Instant::now());
     let multipart = Multipart::from_request(request, &state).await;
     let started = Instant::now();
     let request_id = client.request_id.clone();

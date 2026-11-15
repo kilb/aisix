@@ -588,6 +588,7 @@ pub(crate) async fn realtime(
     let endpoint = realtime_endpoint(translation);
     let request_id = client.request_id.clone();
     let started = Instant::now();
+    crate::attribution::note_handler_started(started);
 
     // A non-WebSocket request (plain GET, malformed upgrade headers, a
     // connection that cannot upgrade, or a HEAD — `get()` serves HEAD

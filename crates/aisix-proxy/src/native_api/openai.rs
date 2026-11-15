@@ -1887,6 +1887,7 @@ async fn multipart_call(
     body_model: bool,
 ) -> Response {
     let started = Instant::now();
+    crate::attribution::note_handler_started(started);
     let snapshot = state.snapshot.load();
     let mut audit = Audit::default();
     let mut usage = None;

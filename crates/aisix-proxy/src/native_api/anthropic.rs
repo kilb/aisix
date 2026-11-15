@@ -1647,6 +1647,7 @@ pub(crate) async fn create_file(
     multipart: Result<Multipart, axum::extract::multipart::MultipartRejection>,
 ) -> Response {
     let started = Instant::now();
+    crate::attribution::note_handler_started(started);
     let snapshot = state.snapshot.load();
     let mut audit = Audit::default();
     let mut operation_id = None;
@@ -1818,6 +1819,7 @@ pub(crate) async fn list_files(
     query: Option<String>,
 ) -> Response {
     let started = Instant::now();
+    crate::attribution::note_handler_started(started);
     let snapshot = state.snapshot.load();
     let mut audit = Audit::default();
     let result = async {
@@ -2000,6 +2002,7 @@ pub(crate) async fn addressed_file(
     content: bool,
 ) -> Response {
     let started = Instant::now();
+    crate::attribution::note_handler_started(started);
     let snapshot = state.snapshot.load();
     let mut audit = Audit::default();
     let path = if content {

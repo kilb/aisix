@@ -2100,7 +2100,7 @@ pub(crate) fn note_handler_started(started: Instant) {
     });
 }
 
-/// 包围既有一次入站解码；不增加 JSON 遍历，也不改变错误类型。
+/// 包围既有入站解码块（含原有错误分类回退）；不增加遍历或改变错误类型。
 pub(crate) fn measure_json_decode<T>(extractor: bool, parse: impl FnOnce() -> T) -> T {
     let started = Instant::now();
     let result = parse();

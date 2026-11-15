@@ -582,6 +582,7 @@ async fn list(
     query: Option<String>,
 ) -> Response {
     let started = Instant::now();
+    crate::attribution::note_handler_started(started);
     let route = parent_id.as_ref().map_or_else(
         || "/v1/containers".into(),
         |id| format!("/v1/containers/{id}/files"),
@@ -892,6 +893,7 @@ async fn container_call(
     delete: bool,
 ) -> Response {
     let started = Instant::now();
+    crate::attribution::note_handler_started(started);
     let route = format!("/v1/containers/{id}");
     let method = if delete { Method::DELETE } else { Method::GET };
     let snapshot = state.snapshot.load();
@@ -1050,6 +1052,7 @@ pub(crate) async fn create_file(
     request: Request,
 ) -> Response {
     let started = Instant::now();
+    crate::attribution::note_handler_started(started);
     let route = format!("/v1/containers/{id}/files");
     let snapshot = state.snapshot.load();
     let mut audit = Audit::default();
@@ -1335,6 +1338,7 @@ async fn file_call(
     content: bool,
 ) -> Response {
     let started = Instant::now();
+    crate::attribution::note_handler_started(started);
     let route = format!(
         "/v1/containers/{id}/files/{file}{}",
         if content { "/content" } else { "" }

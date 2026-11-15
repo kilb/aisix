@@ -214,6 +214,7 @@ async fn resolve_caller(
 }
 
 async fn serve(state: ProxyState, request: Request, scope: Option<String>) -> Response {
+    crate::attribution::note_handler_started(Instant::now());
     // Authentication runs here rather than as an extractor because the
     // decision depends on which entry was addressed: a no-credential
     // request may be served anonymously on an entry configured for it
@@ -252,7 +253,6 @@ async fn serve(state: ProxyState, request: Request, scope: Option<String>) -> Re
     // around `dispatch` covers every early-return path (quota, guardrail
     // blocks, gateway errors) with the actual response status.
     let started = Instant::now();
-    crate::attribution::note_handler_started(started);
     let request_id = request
         .extensions()
         .get::<crate::request_id::RequestId>()

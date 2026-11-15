@@ -292,6 +292,7 @@ async fn addressed(
     kind: ResponseOperationKind,
 ) -> Response {
     let started = Instant::now();
+    crate::attribution::note_handler_started(started);
     let mut operation = NativeResponseOperation::new(kind);
     let resolved = match super::origin::resolve_reference(&state, &auth, &id).await {
         Ok(resolved) => resolved,

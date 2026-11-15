@@ -336,6 +336,7 @@ async fn addressed(
     operation: Operation,
 ) -> Response {
     let started = Instant::now();
+    crate::attribution::note_handler_started(started);
     let snapshot = state.snapshot.load();
     let mut audit = Audit::default();
     let path = format!("/v1/messages/batches/{id}{}", operation.suffix());
@@ -554,6 +555,7 @@ pub(crate) async fn list(
     RawQuery(query): RawQuery,
 ) -> Response {
     let started = Instant::now();
+    crate::attribution::note_handler_started(started);
     let snapshot = state.snapshot.load();
     let mut audit = Audit::default();
     let result = async {

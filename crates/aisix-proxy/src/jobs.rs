@@ -1695,6 +1695,7 @@ pub(crate) async fn create_file(
         .await;
     }
     let started = Instant::now();
+    crate::attribution::note_handler_started(started);
     let request_id = client.request_id.clone();
 
     // Same silent class as the body-extractor rejections #863 collected: a
@@ -2362,6 +2363,7 @@ pub(crate) async fn get_batch(
         .await;
     }
     let started = Instant::now();
+    crate::attribution::note_handler_started(started);
     let request_id = client.request_id.clone();
     let (raw, embedded, routed) = routed_model_hint(&id, &params, &headers);
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
@@ -4133,6 +4135,7 @@ async fn managed_forward(
         NativeObjectKind, NativeProtocol, OwnedRequest, TombstoneRequest,
     };
     let started = Instant::now();
+    crate::attribution::note_handler_started(started);
     let snapshot = state.snapshot.load();
     let mut audit = openai::Audit::default();
     let kind = if spec.surface == crate::operation::FILES {

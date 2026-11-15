@@ -556,6 +556,9 @@ async fn run(
     body: Option<Value>,
 ) -> Response {
     let started = Instant::now();
+    if body.is_none() {
+        crate::attribution::note_handler_started(started);
+    }
     let snapshot = state.snapshot.load();
     let path = action.path(&store, &child);
     let public_path = format!("/v1{path}");

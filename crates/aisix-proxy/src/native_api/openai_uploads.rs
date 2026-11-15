@@ -391,6 +391,7 @@ pub(crate) async fn create_part(
     multipart: Result<Multipart, MultipartRejection>,
 ) -> Response {
     let started = Instant::now();
+    crate::attribution::note_handler_started(started);
     let route = format!("/v1/uploads/{id}/parts");
     let snapshot = state.snapshot.load();
     let mut audit = Audit::default();
@@ -699,6 +700,7 @@ pub(crate) async fn cancel_upload(
     request: Request,
 ) -> Response {
     let started = Instant::now();
+    crate::attribution::note_handler_started(started);
     let route = format!("/v1/uploads/{id}/cancel");
     let snapshot = state.snapshot.load();
     let mut audit = Audit::default();

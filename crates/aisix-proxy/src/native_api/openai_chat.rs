@@ -380,6 +380,9 @@ async fn addressed(
     body: Option<Value>,
 ) -> Response {
     let started = Instant::now();
+    if body.is_none() {
+        crate::attribution::note_handler_started(started);
+    }
     let snapshot = state.snapshot.load();
     if let Some(body) = &body {
         crate::usage_attr::note_failure_request(&snapshot, || body.to_string());
@@ -509,6 +512,7 @@ pub(crate) async fn list(
     RawQuery(query): RawQuery,
 ) -> Response {
     let started = Instant::now();
+    crate::attribution::note_handler_started(started);
     let snapshot = state.snapshot.load();
     let mut audit = Audit::default();
     let path = "/v1/chat/completions";

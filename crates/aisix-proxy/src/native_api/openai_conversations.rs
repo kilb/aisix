@@ -512,6 +512,9 @@ async fn root_call(
     body: Option<Value>,
     started: Instant,
 ) -> Response {
+    if body.is_none() {
+        crate::attribution::note_handler_started(started);
+    }
     let route = format!("/v1/conversations/{id}");
     let snapshot = state.snapshot.load();
     let mut audit = Audit::default();
@@ -634,6 +637,9 @@ async fn items_call(
     body: Option<Value>,
     started: Instant,
 ) -> Response {
+    if body.is_none() {
+        crate::attribution::note_handler_started(started);
+    }
     let path = item_id.as_ref().map_or_else(
         || format!("/conversations/{id}/items"),
         |item| format!("/conversations/{id}/items/{item}"),
