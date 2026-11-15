@@ -137,6 +137,75 @@ mod frame_allocation {
     }
 
     #[tokio::test]
+    async fn actual_client_inline_audio_without_asr_does_not_copy_the_audio_payload() {
+        let (_directory, state, mut prepared, client) = admitted().await;
+        let payload = format!(
+            "{{\"type\":\"conversation.item.create\",\"item\":{{\"id\":\"inline-no-asr\",\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_audio\",\"audio\":\"{}\"}}]}}}}",
+            "A".repeat(32 * 1024)
+        );
+        let meter = SessionMeter {
+            endpoint: "/v1/realtime",
+            state: &state,
+            auth: &prepared.auth,
+            model_entry: &prepared.model_entry,
+            pk_id: &prepared.pk_id,
+            provider_label: &prepared.provider_label,
+            requested_model: &prepared.requested_model,
+            client_type: "sdk",
+            token_keys: prepared.reservation.keys(),
+            model_token_keys: prepared.model_reservation.keys(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_tokens: 0,
+            secondary_input_tokens: 0,
+            secondary_output_tokens: 0,
+            secondary_cached_tokens: 0,
+            cost_usd: 0.0,
+            responses: 0,
+        };
+        // admission/文件事务/输入构造均在计数前完成；只量真正的三段生产策略调用。
+        let scope = calibrated_scope();
+        let mut frame = Frame::new(payload.as_bytes());
+        crate::native_api::voices::validate_realtime_config(
+            &state,
+            &prepared.auth,
+            &client,
+            &frame,
+            prepared.voice_origin.as_ref(),
+            &prepared.requested_model,
+        )
+        .await
+        .expect("inline audio has no private voice reference");
+        meter
+            .check_tokens(&frame)
+            .await
+            .expect("actual request/model quota check");
+        let rewritten = prepared
+            .journal
+            .as_mut()
+            .expect("actual admitted journal")
+            .prepare_frame(&mut frame)
+            .await
+            .expect("actual journal frame preparation");
+        let allocated = scope.finish();
+        assert!(
+            rewritten.is_none(),
+            "inline audio without ASR must remain verbatim"
+        );
+        eprintln!(
+            "actual_inline_no_asr_policy_allocations calls={} bytes={} full_value_decodes={}",
+            allocated.calls,
+            allocated.bytes,
+            frame.decode_count()
+        );
+        assert!(
+            allocated.bytes < payload.len() / 4,
+            "the actual no-ASR inline policy chain copied an audio-sized payload: {} bytes",
+            allocated.bytes
+        );
+    }
+
+    #[tokio::test]
     async fn actual_supplier_usage_chain_does_not_allocate_an_audio_delta_sized_value() {
         let (_directory, _state, mut prepared, _client) = admitted().await;
         let payload = format!(
