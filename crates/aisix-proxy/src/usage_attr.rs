@@ -27,6 +27,84 @@ use crate::error::ProxyError;
 use crate::operation::Surface;
 use crate::state::ProxyState;
 
+/// 只有真正原生准入才调用；空观测分支不复制身份、请求头或分配 Box。
+pub(crate) fn native_usage_context(
+    client: &ClientContext,
+    input_audit: aisix_core::native_objects::NativeInputAudit,
+) -> Option<Box<aisix_core::native_objects::NativeUsageContext>> {
+    let caller = &client.caller;
+    let jwt = client.jwt.as_deref();
+    let has_jwt = jwt.is_some_and(|jwt| {
+        !jwt.subject.is_empty()
+            || !jwt.provider.is_empty()
+            || jwt
+                .claim_mapping
+                .as_ref()
+                .is_some_and(|value| !value.is_empty())
+    });
+    if caller.api_key_name.as_ref().is_none_or(String::is_empty)
+        && caller.tags.is_empty()
+        && !has_jwt
+        && client.request_headers.is_empty()
+        && input_audit.is_empty()
+    {
+        return None;
+    }
+    let mut event = UsageEvent::default();
+    apply_caller_identity(&mut event, client.jwt.as_ref(), caller);
+    event.request_headers = client.request_headers.clone();
+    native_usage_context_from_event(event, input_audit)
+}
+
+fn native_usage_context_from_event(
+    event: UsageEvent,
+    input_audit: aisix_core::native_objects::NativeInputAudit,
+) -> Option<Box<aisix_core::native_objects::NativeUsageContext>> {
+    let context = aisix_core::native_objects::NativeUsageContext {
+        api_key_name: event.api_key_name,
+        tags: event.tags,
+        jwt_subject: event.jwt_subject,
+        jwt_provider: event.jwt_provider,
+        jwt_claim_mapping: event.jwt_claim_mapping,
+        request_headers: event.request_headers,
+        input_audit,
+    };
+    (!context.is_empty()).then(|| Box::new(context))
+}
+
+/// 每项用自己的局部扫描值；不得传整批累计的 first-bypass 或 applied 集合。
+pub(crate) fn native_input_audit(
+    monitor: &[aisix_core::GuardrailMonitorHit],
+    enforced: &[aisix_core::GuardrailEnforcedHit],
+    scores: &[aisix_core::GuardrailScore],
+    bypass: &str,
+    applied: &[aisix_core::AppliedGuardrail],
+) -> aisix_core::native_objects::NativeInputAudit {
+    aisix_core::native_objects::NativeInputAudit {
+        guardrail_monitor_hits: monitor.to_vec(),
+        guardrail_enforced_hits: enforced.to_vec(),
+        guardrail_scores: scores.to_vec(),
+        guardrail_bypassed_reason: bypass.to_owned(),
+        applied_guardrails: applied.to_vec(),
+    }
+}
+
+/// 只移动已保存的观测身份投影；租户、key、成员和账务字段不在参数内。
+pub(crate) fn apply_native_caller_observations(
+    event: &mut UsageEvent,
+    api_key_name: String,
+    tags: std::collections::BTreeMap<String, String>,
+    jwt_subject: String,
+    jwt_provider: String,
+    jwt_claim_mapping: String,
+) {
+    event.api_key_name = api_key_name;
+    event.tags = tags;
+    event.jwt_subject = jwt_subject;
+    event.jwt_provider = jwt_provider;
+    event.jwt_claim_mapping = jwt_claim_mapping;
+}
+
 /// The request's ENFORCE-mode guardrail audit handle (AISIX-Cloud#1330),
 /// cloned off the resolved chain with
 /// [`GuardrailChain::audit_log`](aisix_guardrails::GuardrailChain::audit_log)
@@ -4479,5 +4557,72 @@ mod tests {
         // in `r` must not open a raw string.
         assert!(at("let c = '\"'; UsageEvent {}", "UsageEvent"));
         assert!(at("let var = 1; UsageEvent {}", "UsageEvent"));
+    }    #[test]
+    fn a_native_context_moves_only_the_original_observation_projection() {
+        let mut event = UsageEvent::default();
+        event.api_key_id = "authoritative-key".into();
+        event.team_id = "authoritative-tenant".into();
+        event.user_id = "authoritative-member".into();
+        event.prompt_tokens = 17;
+        event.occurred_at = "2024-01-02T03:04:05.678Z".into();
+        event.api_key_name = "original-name".into();
+        event.tags = std::collections::BTreeMap::from([("project".into(), "original-tag".into())]);
+        event.jwt_subject = "original-subject".into();
+        event.jwt_provider = "original-provider".into();
+        event.jwt_claim_mapping = "original-mapping".into();
+        event.request_headers =
+            std::collections::BTreeMap::from([("x-project".into(), "original-header".into())]);
+        let context = native_usage_context_from_event(event, Default::default()).unwrap();
+        let wire = serde_json::to_value(context).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "api_key_name":"original-name", "tags":{"project":"original-tag"},
+                "jwt_subject":"original-subject", "jwt_provider":"original-provider",
+                "jwt_claim_mapping":"original-mapping", "request_headers":{"x-project":"original-header"}
+            })
+        );
+    }
+
+    #[test]
+    fn saved_observation_identity_does_not_replace_authority_or_usage() {
+        let mut event = UsageEvent::default();
+        event.api_key_id = "authoritative-key".into();
+        event.team_id = "authoritative-tenant".into();
+        event.user_id = "authoritative-member".into();
+        event.model_id = "actual-model".into();
+        event.prompt_tokens = 17;
+        event.completion_tokens = 5;
+        event.cost_usd = 0.25;
+        event.occurred_at = "2024-01-02T03:04:05.678Z".into();
+        apply_native_caller_observations(
+            &mut event,
+            "original-name".into(),
+            std::collections::BTreeMap::from([("project".into(), "original-tag".into())]),
+            "original-subject".into(),
+            "original-provider".into(),
+            "original-mapping".into(),
+        );
+        assert_eq!(event.api_key_id, "authoritative-key");
+        assert_eq!(event.team_id, "authoritative-tenant");
+        assert_eq!(event.user_id, "authoritative-member");
+        assert_eq!(event.model_id, "actual-model");
+        assert_eq!(event.prompt_tokens, 17);
+        assert_eq!(event.completion_tokens, 5);
+        assert_eq!(event.cost_usd, 0.25);
+        assert_eq!(event.occurred_at, "2024-01-02T03:04:05.678Z");
+        assert_eq!(event.api_key_name, "original-name");
+        assert_eq!(
+            event.tags.get("project").map(String::as_str),
+            Some("original-tag")
+        );
+        assert_eq!(event.jwt_subject, "original-subject");
+        assert_eq!(event.jwt_provider, "original-provider");
+        assert_eq!(event.jwt_claim_mapping, "original-mapping");
+    }
+
+    #[test]
+    fn an_empty_native_observation_has_no_carrier() {
+        assert!(native_usage_context(&ClientContext::default(), Default::default()).is_none());
     }
 }
