@@ -1529,6 +1529,52 @@ fn latency_key(runtime_status: &crate::ModelRuntimeStatusTracker, id: &str) -> f
         .unwrap_or(f64::NEG_INFINITY)
 }
 
+struct MetricKey(f64);
+
+impl PartialEq for MetricKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.total_cmp(&other.0).is_eq()
+    }
+}
+
+impl Eq for MetricKey {}
+
+impl PartialOrd for MetricKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for MetricKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
+fn sort_by_metric_key(attempts: &mut [AttemptModel], mut key: impl FnMut(&AttemptModel) -> f64) {
+    if attempts.len() == 2 {
+        if key(&attempts[0]).total_cmp(&key(&attempts[1])).is_gt() {
+            attempts.swap(0, 1);
+        }
+    } else if attempts.len() <= 8 {
+        // 每个候选只读一次信号；小组在栈上稳定插入排序，不新增堆分配。
+        let mut keys = [0.0f64; 8];
+        for (slot, attempt) in keys.iter_mut().zip(attempts.iter()) {
+            *slot = key(attempt);
+        }
+        for index in 1..attempts.len() {
+            let mut position = index;
+            while position > 0 && keys[position].total_cmp(&keys[position - 1]).is_lt() {
+                keys.swap(position, position - 1);
+                attempts.swap(position, position - 1);
+                position -= 1;
+            }
+        }
+    } else {
+        attempts.sort_by_cached_key(|attempt| MetricKey(key(attempt)));
+    }
+}
+
 /// Rank the resolved attempt list by the strategy's runtime metric,
 /// best-first (ascending). Stable, so equal-metric targets keep their
 /// declaration order. Only metric-based strategies reach here; positional
@@ -1540,20 +1586,16 @@ fn order_attempts_by_metric(
     snapshot: &AisixSnapshot,
     pricing: &LivePricingIndex,
 ) {
+    if attempts.len() < 2 {
+        return;
+    }
     match strategy {
         RoutingStrategy::LeastCost => {
-            // Built here rather than per comparison: the sort calls the
-            // key function O(n log n) times, and the index is shared with
-            // whatever else prices this snapshot.
             let pricing = pricing.for_snapshot(snapshot);
-            attempts.sort_by(|a, b| {
-                cost_key(&pricing, &a.model).total_cmp(&cost_key(&pricing, &b.model))
-            });
+            sort_by_metric_key(attempts, |attempt| cost_key(&pricing, &attempt.model));
         }
         RoutingStrategy::LeastLatency => {
-            attempts.sort_by(|a, b| {
-                latency_key(runtime_status, &a.id).total_cmp(&latency_key(runtime_status, &b.id))
-            });
+            sort_by_metric_key(attempts, |attempt| latency_key(runtime_status, &attempt.id));
         }
         RoutingStrategy::LeastBusy => {
             // The APISIX least_conn score: in-flight scaled by 1/weight, so a
@@ -1562,7 +1604,7 @@ fn order_attempts_by_metric(
             let score = |a: &AttemptModel| {
                 (runtime_status.in_flight(&a.id) as f64 + 1.0) / f64::from(a.weight.max(1))
             };
-            attempts.sort_by(|a, b| score(a).total_cmp(&score(b)));
+            sort_by_metric_key(attempts, score);
         }
         RoutingStrategy::Failover
         | RoutingStrategy::RoundRobin
