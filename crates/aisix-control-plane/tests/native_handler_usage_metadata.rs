@@ -592,10 +592,10 @@ fn with_explicit_local_jwt_component_config(snapshot: AisixSnapshot, key: Uuid) 
     assert_eq!(local.oidc_providers.len(), 2);
     assert_eq!(local.claim_mappings.len(), 2);
     for entry in local.oidc_providers.entries() {
-        snapshot.oidc_providers.insert(entry);
+        snapshot.oidc_providers.insert(entry.as_ref().clone());
     }
     for entry in local.claim_mappings.entries() {
-        snapshot.claim_mappings.insert(entry);
+        snapshot.claim_mappings.insert(entry.as_ref().clone());
     }
     snapshot
 }
