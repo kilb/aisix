@@ -952,6 +952,14 @@ async fn bind(
     let mut children = Vec::new();
     let mut objects = body.objects;
     objects.sort_by(|a, b| (a.kind.as_str(), &a.raw_id).cmp(&(b.kind.as_str(), &b.raw_id)));
+    #[derive(sqlx::FromRow)]
+    struct ExistingConversationItem {
+        #[sqlx(flatten)]
+        row: ObjectRow,
+        previous: Value,
+        accepted_output: bool,
+        source_r: bool,
+    }
     for object in objects {
         if !seen.insert((object.kind.as_str(), object.raw_id.clone())) {
             continue;
@@ -970,11 +978,36 @@ async fn bind(
             .execute(&mut *conn)
             .await
             .map_err(unavailable)?;
-        let existing: Option<ObjectRow> = sqlx::query_as(
-            "SELECT * FROM native_objects WHERE environment_id=$1 AND protocol='openai' AND kind=$2 AND boundary=$3 AND raw_id=$4 FOR UPDATE",
-        )
-        .bind(state.env.env_id).bind(object.kind.as_str()).bind(&row.boundary).bind(&object.raw_id)
-        .fetch_optional(&mut *conn).await.map_err(unavailable)?;
+        let (existing, previous, accepted_output, source_r) = if conversation.is_some()
+            && object.kind == NativeObjectKind::ResponseItem
+        {
+            let found: Option<ExistingConversationItem> = sqlx::query_as(
+                "SELECT item.*, operation.submission AS previous, \
+                 EXISTS(SELECT 1 FROM native_object_memberships membership WHERE membership.environment_id=item.environment_id AND membership.parent_id=$5 AND membership.child_id=item.id AND membership.relation='response_output' AND membership.created_operation_id=$6) AS accepted_output, \
+                 EXISTS(SELECT 1 FROM native_operation_origin_sources source WHERE source.environment_id=item.environment_id AND source.operation_id=item.operation_id AND source.source_record_id=$5) AS source_r \
+                 FROM native_objects item JOIN native_operations operation ON operation.environment_id=item.environment_id AND operation.operation_id=item.operation_id \
+                 WHERE item.environment_id=$1 AND item.protocol='openai' AND item.kind=$2 AND item.boundary=$3 AND item.raw_id=$4 FOR UPDATE OF item",
+            )
+            .bind(state.env.env_id).bind(object.kind.as_str()).bind(&row.boundary).bind(&object.raw_id)
+            .bind(row.id).bind(body.operation_id)
+            .fetch_optional(&mut *conn).await.map_err(unavailable)?;
+            match found {
+                Some(found) => (
+                    Some(found.row),
+                    Some(found.previous),
+                    found.accepted_output,
+                    found.source_r,
+                ),
+                None => (None, None, false, false),
+            }
+        } else {
+            let found: Option<ObjectRow> = sqlx::query_as(
+                "SELECT * FROM native_objects WHERE environment_id=$1 AND protocol='openai' AND kind=$2 AND boundary=$3 AND raw_id=$4 FOR UPDATE",
+            )
+            .bind(state.env.env_id).bind(object.kind.as_str()).bind(&row.boundary).bind(&object.raw_id)
+            .fetch_optional(&mut *conn).await.map_err(unavailable)?;
+            (found, None, false, false)
+        };
         if let Some(existing) = existing {
             if existing.tenant_id != row.tenant_id
                 || existing.provider_key_id != row.provider_key_id
@@ -983,33 +1016,42 @@ async fn bind(
             {
                 return Err(conflict());
             }
-            let accepted_output = object.kind == NativeObjectKind::ResponseItem
-                && conversation.is_some()
-                && sqlx::query_scalar::<_, bool>(
-                    "SELECT EXISTS(SELECT 1 FROM native_object_memberships WHERE environment_id=$1 AND parent_id=$2 AND child_id=$3 AND relation='response_output' AND created_operation_id=$4)",
-                )
-                .bind(state.env.env_id)
-                .bind(row.id)
-                .bind(existing.id)
-                .bind(body.operation_id)
-                .fetch_one(&mut *conn)
-                .await
-                .map_err(unavailable)?;
+            let previous: Option<BeginRequest> = previous
+                .map(|value| serde_json::from_value(value).map_err(unavailable))
+                .transpose()?;
+            let accepted_item = existing.parent_id == Some(row.id) && accepted_output;
             if let Some(principal) = &refresh_principal {
-                // 管理刷新不能借原提交的 Full 权限越过当前成员、模型或父对象限制。
-                authorized(&mut *conn, state, principal, &existing).await?;
+                // 仅本 R 已保存的完整派生模板可复用刚通过的当前 R 权限；外来对象仍逐项授权。
+                let own_output = accepted_item
+                    && source_r
+                    && existing.model_id == row.model_id
+                    && previous.as_ref().is_some_and(|previous| {
+                        let mut expected = submitted.clone();
+                        expected.operation_id = existing.operation_id;
+                        expected.kind = NativeObjectKind::ResponseItem;
+                        expected.parent_id = Some(row.id);
+                        expected.asynchronous = false;
+                        expected.operation = NativeObjectKind::ResponseItem.as_str().into();
+                        previous == &expected && previous.origin.surface == expected.origin.surface
+                    });
+                if !own_output {
+                    authorized(&mut *conn, state, principal, &existing).await?;
+                }
             } else if !op.visibility_full
                 && existing.api_key_id != op.api_key_id
                 && !(op.member_id.is_some() && existing.member_id == op.member_id)
             {
                 // 初次接受后的绑定只用准入时的可信身份；撤权不能抹掉已发生的推理。
-                let accepted_item = existing.parent_id == Some(row.id) && accepted_output;
                 if !accepted_item {
                     return Err(conflict());
                 }
             }
-            let previous =
-                submission(&operation(&mut *conn, state, existing.operation_id, false).await?)?;
+            let previous = match previous {
+                Some(previous) => previous,
+                None => {
+                    submission(&operation(&mut *conn, state, existing.operation_id, false).await?)?
+                }
+            };
             insert_membership(
                 &mut *conn,
                 state,
@@ -1050,28 +1092,41 @@ async fn bind(
             .map_or((op.tenant_id, op.api_key_id, op.member_id), |parent| {
                 (parent.tenant_id, parent.api_key_id, parent.member_id)
             });
-        sqlx::query("INSERT INTO native_operations(environment_id,operation_id,dp_id,tenant_id,api_key_id,member_id,visibility_full,submission,state) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'bound')")
+        let child: ObjectRow = if item_owner.is_some() {
+            sqlx::query_as(
+                "WITH made_operation AS (\
+                 INSERT INTO native_operations(environment_id,operation_id,dp_id,tenant_id,api_key_id,member_id,visibility_full,submission,state) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'bound') RETURNING operation_id\
+                 ), made_source AS (\
+                 INSERT INTO native_operation_origin_sources(environment_id,operation_id,source_record_id) SELECT $1,operation_id,$9 FROM made_operation RETURNING operation_id\
+                 ) INSERT INTO native_objects(id,environment_id,operation_id,tenant_id,api_key_id,member_id,protocol,kind,model_id,provider_key_id,boundary,raw_id,parent_id,pending) \
+                 SELECT $10,$1,operation_id,$11,$12,$13,'openai',$14,$15,$16,$17,$18,$9,false FROM made_source RETURNING *",
+            )
             .bind(state.env.env_id).bind(operation_id).bind(op.dp_id).bind(op.tenant_id)
-            .bind(op.api_key_id).bind(op.member_id).bind(op.visibility_full).bind(serde_json::to_value(&derived).map_err(unavailable)?)
-            .execute(&mut *conn).await.map_err(unavailable)?;
-        if item_owner.is_some() {
-            sqlx::query("INSERT INTO native_operation_origin_sources(environment_id,operation_id,source_record_id) VALUES($1,$2,$3)")
-                .bind(state.env.env_id).bind(operation_id).bind(row.id)
+            .bind(op.api_key_id).bind(op.member_id).bind(op.visibility_full)
+            .bind(serde_json::to_value(&derived).map_err(unavailable)?).bind(row.id)
+            .bind(Uuid::new_v4()).bind(owner_tenant).bind(owner_key).bind(owner_member)
+            .bind(object.kind.as_str()).bind(row.model_id).bind(row.provider_key_id)
+            .bind(&row.boundary).bind(&object.raw_id)
+            .fetch_one(&mut *conn).await.map_err(unavailable)?
+        } else {
+            sqlx::query("INSERT INTO native_operations(environment_id,operation_id,dp_id,tenant_id,api_key_id,member_id,visibility_full,submission,state) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'bound')")
+                .bind(state.env.env_id).bind(operation_id).bind(op.dp_id).bind(op.tenant_id)
+                .bind(op.api_key_id).bind(op.member_id).bind(op.visibility_full).bind(serde_json::to_value(&derived).map_err(unavailable)?)
                 .execute(&mut *conn).await.map_err(unavailable)?;
-        }
-        sqlx::query("INSERT INTO native_objects(id,environment_id,operation_id,tenant_id,api_key_id,member_id,protocol,kind,model_id,provider_key_id,boundary,raw_id,parent_id,pending) VALUES ($1,$2,$3,$4,$5,$6,'openai',$7,$8,$9,$10,$11,$12,false)")
-            .bind(Uuid::new_v4()).bind(state.env.env_id).bind(operation_id).bind(owner_tenant)
-            .bind(owner_key).bind(owner_member).bind(object.kind.as_str()).bind(row.model_id).bind(row.provider_key_id)
-            .bind(&row.boundary).bind(&object.raw_id).bind(row.id)
-            .execute(&mut *conn).await.map_err(unavailable)?;
-        let child: ObjectRow = sqlx::query_as(
-            "SELECT * FROM native_objects WHERE environment_id=$1 AND operation_id=$2",
-        )
-        .bind(state.env.env_id)
-        .bind(operation_id)
-        .fetch_one(&mut *conn)
-        .await
-        .map_err(unavailable)?;
+            sqlx::query("INSERT INTO native_objects(id,environment_id,operation_id,tenant_id,api_key_id,member_id,protocol,kind,model_id,provider_key_id,boundary,raw_id,parent_id,pending) VALUES ($1,$2,$3,$4,$5,$6,'openai',$7,$8,$9,$10,$11,$12,false)")
+                .bind(Uuid::new_v4()).bind(state.env.env_id).bind(operation_id).bind(owner_tenant)
+                .bind(owner_key).bind(owner_member).bind(object.kind.as_str()).bind(row.model_id).bind(row.provider_key_id)
+                .bind(&row.boundary).bind(&object.raw_id).bind(row.id)
+                .execute(&mut *conn).await.map_err(unavailable)?;
+            sqlx::query_as(
+                "SELECT * FROM native_objects WHERE environment_id=$1 AND operation_id=$2",
+            )
+            .bind(state.env.env_id)
+            .bind(operation_id)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(unavailable)?
+        };
         insert_membership(
             &mut *conn,
             state,
@@ -1109,21 +1164,36 @@ async fn bind_response_conversation_item(
     replayed_output: bool,
 ) -> Result<(), ApiError> {
     // 同一已接受操作的重放不能推进 epoch，也不能重新附加后来已移除的成员。
-    let known: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM native_object_memberships WHERE environment_id=$1 AND parent_id=$2 AND child_id=$3 AND relation='conversation_item' AND (deleted_at IS NULL OR created_operation_id=$4 OR $5))")
-        .bind(state.env.env_id).bind(parent.id).bind(child.id).bind(operation_id).bind(replayed_output)
-        .fetch_one(&mut *conn).await.map_err(unavailable)?;
-    if !known {
-        insert_membership(
-            &mut *conn,
-            state,
-            parent,
-            child,
-            NativeRelation::ConversationItem,
-            operation_id,
-        )
-        .await?;
-        sqlx::query("UPDATE native_objects SET membership_epoch=membership_epoch+1,version=version+1 WHERE id=$1")
-            .bind(parent.id).execute(&mut *conn).await.map_err(unavailable)?;
+    let protocol: NativeProtocol =
+        serde_json::from_value(json!(parent.protocol)).map_err(unavailable)?;
+    let parent_kind: NativeObjectKind =
+        serde_json::from_value(json!(parent.kind)).map_err(unavailable)?;
+    let child_kind: NativeObjectKind =
+        serde_json::from_value(json!(child.kind)).map_err(unavailable)?;
+    let permitted = NativeRelation::ConversationItem.permits(protocol, parent_kind, child_kind)
+        && parent.tenant_id == child.tenant_id
+        && parent.provider_key_id == child.provider_key_id
+        && parent.boundary == child.boundary
+        && parent.deleted_at.is_none()
+        && child.deleted_at.is_none();
+    let accepted: bool = sqlx::query_scalar(
+        "WITH prior AS MATERIALIZED (\
+         SELECT COALESCE(MAX(generation),0)+1 AS next_generation, COALESCE(bool_or(deleted_at IS NULL OR created_operation_id=$4 OR $5),false) AS known \
+         FROM native_object_memberships WHERE environment_id=$1 AND parent_id=$2 AND child_id=$3 AND relation='conversation_item'\
+         ), made_membership AS (\
+         INSERT INTO native_object_memberships(id,environment_id,parent_id,child_id,relation,created_operation_id,generation) \
+         SELECT $6,$1,$2,$3,'conversation_item',$4,next_generation FROM prior WHERE NOT known AND $7 \
+         ON CONFLICT(environment_id,parent_id,child_id,relation) WHERE deleted_at IS NULL DO NOTHING RETURNING 1\
+         ), bumped AS (\
+         UPDATE native_objects SET membership_epoch=membership_epoch+1,version=version+1 \
+         WHERE environment_id=$1 AND id=$2 AND EXISTS(SELECT 1 FROM made_membership) RETURNING 1\
+         ) SELECT known OR EXISTS(SELECT 1 FROM bumped) FROM prior",
+    )
+    .bind(state.env.env_id).bind(parent.id).bind(child.id).bind(operation_id).bind(replayed_output)
+    .bind(Uuid::new_v4()).bind(permitted)
+    .fetch_one(&mut *conn).await.map_err(unavailable)?;
+    if !accepted {
+        return Err(conflict());
     }
     Ok(())
 }
