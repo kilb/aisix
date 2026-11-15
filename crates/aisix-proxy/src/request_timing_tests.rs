@@ -246,29 +246,43 @@ async fn request_timing_raw_and_bodyless_errors_record_the_handler_boundary() {
             )
             .await
             .unwrap();
+        let status = response.status();
         assert!(
             !response.status().is_success(),
             "请求没有可用资源或合法上传：{method} {path}"
         );
         let _ = to_bytes(response.into_body(), 65_536).await.unwrap();
-        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-            .await
-            .unwrap_or_else(|error| panic!("{method} {path}: 错误终态未到达：{error}"))
-            .unwrap_or_else(|| panic!("{method} {path}: UsageEvent 通道关闭"));
-        let wire = serde_json::to_value(event).unwrap();
-        let timing = wire.get("request_timing").expect("HTTP 终态记录入口阶段");
-        assert!(
-            timing
-                .get("pre_handler_ms")
-                .and_then(serde_json::Value::as_u64)
-                .is_some(),
-            "{method} {path}: 已执行 handler 的窗口不能未知：{timing}"
-        );
-        assert!(
-            timing.get("json_decode_ms").is_none(),
-            "{method} {path}: 未解码 JSON 的请求不能捏造阶段：{timing}"
-        );
-        assert!(rx.try_recv().is_err(), "{method} {path}: 不重复发射");
+        // 轻支持合同已退休的两个接口仍要发请求验证 404，不伪造不存在的 handler 阶段。
+        if matches!(path, "/v1/audio/translations" | "/v1/images/variations") {
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "退休接口不能重新挂载：{method} {path}"
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "退休路径没有认证 handler，不能伪造 UsageEvent 或阶段：{method} {path}"
+            );
+        } else {
+            let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap_or_else(|error| panic!("{method} {path}: 错误终态未到达：{error}"))
+                .unwrap_or_else(|| panic!("{method} {path}: UsageEvent 通道关闭"));
+            let wire = serde_json::to_value(event).unwrap();
+            let timing = wire.get("request_timing").expect("HTTP 终态记录入口阶段");
+            assert!(
+                timing
+                    .get("pre_handler_ms")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some(),
+                "{method} {path}: 已执行 handler 的窗口不能未知：{timing}"
+            );
+            assert!(
+                timing.get("json_decode_ms").is_none(),
+                "{method} {path}: 未解码 JSON 的请求不能捏造阶段：{timing}"
+            );
+            assert!(rx.try_recv().is_err(), "{method} {path}: 不重复发射");
+        }
     }
 }
 
