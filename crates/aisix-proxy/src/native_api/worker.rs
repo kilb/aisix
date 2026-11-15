@@ -26,7 +26,7 @@ pub(super) async fn run<F, P>(
         return;
     }
     let capacity = request.limit as usize;
-    let mut active = FuturesUnordered::new();
+    let mut active: FuturesUnordered<P> = FuturesUnordered::new();
     let mut claiming: Option<BoxFuture<'_, Result<NativeReply, NativeRegistryError>>> = None;
     let mut claimed_limit = 0;
     let mut ticks = tokio::time::interval(POLL_INTERVAL);
