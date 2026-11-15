@@ -522,6 +522,7 @@ dependencies = [
  "aisix-provider-openai",
  "aisix-provider-vertex",
  "aisix-ratelimit",
+ "aisix-response-reference-test-alloc",
  "arc-swap",
  "async-compression",
  "async-stream",
@@ -591,6 +592,10 @@ dependencies = [
  "tokio",
  "tracing",
 ]
+
+[[package]]
+name = "aisix-response-reference-test-alloc"
+version = "0.0.0"
 
 [[package]]
 name = "aisix-server"
