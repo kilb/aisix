@@ -1638,77 +1638,6 @@ async fn complete(
             "user_id".to_string(),
             json!(op.member_id.map(|id| id.to_string()).unwrap_or_default()),
         );
-        // 观测上下文只补同名遥测字段；tenant、key、成员和金额仍由上面的权威行决定。
-        if let Some(context) = submitted.usage_context.as_deref() {
-            for (name, value) in [
-                (
-                    "api_key_name",
-                    (!context.api_key_name.is_empty()).then(|| json!(&context.api_key_name)),
-                ),
-                (
-                    "tags",
-                    (!context.tags.is_empty()).then(|| json!(&context.tags)),
-                ),
-                (
-                    "jwt_subject",
-                    (!context.jwt_subject.is_empty()).then(|| json!(&context.jwt_subject)),
-                ),
-                (
-                    "jwt_provider",
-                    (!context.jwt_provider.is_empty()).then(|| json!(&context.jwt_provider)),
-                ),
-                (
-                    "jwt_claim_mapping",
-                    (!context.jwt_claim_mapping.is_empty())
-                        .then(|| json!(&context.jwt_claim_mapping)),
-                ),
-            ] {
-                if let Some(value) = value {
-                    fields.insert(name.into(), value);
-                }
-            }
-        }
-        // 条目缺少审计时保持缺省，不能改用批次根的累计规则或 first-bypass。
-        let input_audit = match entry {
-            Some(entry) => entry.usage_context.as_deref(),
-            None if usage.entry_id.is_empty() => submitted
-                .usage_context
-                .as_deref()
-                .map(|context| &context.input_audit),
-            None => None,
-        };
-        if let Some(audit) = input_audit {
-            for (name, value) in [
-                (
-                    "applied_guardrails",
-                    (!audit.applied_guardrails.is_empty())
-                        .then(|| json!(&audit.applied_guardrails)),
-                ),
-                (
-                    "guardrail_bypassed_reason",
-                    (!audit.guardrail_bypassed_reason.is_empty())
-                        .then(|| json!(&audit.guardrail_bypassed_reason)),
-                ),
-                (
-                    "guardrail_monitor_hits",
-                    (!audit.guardrail_monitor_hits.is_empty())
-                        .then(|| json!(&audit.guardrail_monitor_hits)),
-                ),
-                (
-                    "guardrail_enforced_hits",
-                    (!audit.guardrail_enforced_hits.is_empty())
-                        .then(|| json!(&audit.guardrail_enforced_hits)),
-                ),
-                (
-                    "guardrail_scores",
-                    (!audit.guardrail_scores.is_empty()).then(|| json!(&audit.guardrail_scores)),
-                ),
-            ] {
-                if let Some(value) = value {
-                    fields.insert(name.into(), value);
-                }
-            }
-        }
         fields.insert("model_id".to_string(), json!(model_id));
         fields.insert("requested_model_id".to_string(), json!(requested_id));
         // 恢复任务只能观察实际用量，不能替换原请求已持久化的计价档位。
@@ -1872,21 +1801,85 @@ pub(crate) async fn deliver_one(
     sqlx::query("SET LOCAL statement_timeout = '5s'")
         .execute(&mut *conn)
         .await?;
-    let rows: Vec<(Uuid, Uuid, Value)> = sqlx::query_as(
-        "SELECT event_id, dp_id, event FROM native_terminal_outbox WHERE delivered_at IS NULL \
+    let rows: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        "SELECT event_id, dp_id FROM native_terminal_outbox WHERE delivered_at IS NULL \
          AND dp_id = (SELECT dp_id FROM native_terminal_outbox WHERE delivered_at IS NULL \
                       ORDER BY created_at, event_id LIMIT 1) \
          ORDER BY created_at, event_id LIMIT 100 FOR UPDATE SKIP LOCKED",
     )
     .fetch_all(&mut *conn)
     .await?;
-    let Some((batch_id, dp_id, _)) = rows.first() else {
+    let Some((batch_id, dp_id)) = rows.first() else {
         return Ok(false);
     };
     let (batch_id, dp_id) = (*batch_id, *dp_id);
+    let ids: Vec<Uuid> = rows.iter().map(|(id, _)| *id).collect();
+    // 发件箱只存有界账务事实；同一查询从不可变提交恢复公共 caller 和精确条目审计。
+    // 递推只计算字节前缀及首个超额事件，首事件始终可单独交付，避免大事件饿死。
+    let rows: Vec<(Uuid, Uuid, Value)> = sqlx::query_as(
+        r#"WITH RECURSIVE pending AS MATERIALIZED (
+             SELECT outbox.event_id, outbox.entry_id, outbox.event, outbox.object_id,
+                    row_number() OVER (ORDER BY outbox.created_at, outbox.event_id) AS ordinal
+             FROM native_terminal_outbox outbox WHERE outbox.event_id = ANY($1)
+           ), projected AS NOT MATERIALIZED (
+             SELECT pending.ordinal, pending.event_id, objects.operation_id,
+                    pending.event || COALESCE(observations.fields, '{}'::jsonb) AS event
+             FROM pending
+             JOIN native_objects objects ON objects.id = pending.object_id
+             JOIN native_operations operations ON operations.environment_id = objects.environment_id
+                                              AND operations.operation_id = objects.operation_id
+             CROSS JOIN LATERAL (
+               SELECT jsonb_path_query_first(operations.submission,
+                        '$.entries[*] ? (@.entry_id == $entry_id)',
+                        jsonb_build_object('entry_id', pending.entry_id)) AS entry
+             ) matched
+             CROSS JOIN LATERAL (
+               SELECT operations.submission->'usage_context' AS caller,
+                      CASE WHEN matched.entry IS NOT NULL THEN matched.entry->'usage_context'
+                           WHEN pending.entry_id = '' THEN operations.submission->'usage_context'
+                           ELSE NULL END AS audit
+             ) context
+             CROSS JOIN LATERAL (
+               SELECT jsonb_object_agg(key, value) AS fields
+               FROM jsonb_each(jsonb_build_object(
+                 'api_key_name', context.caller->'api_key_name',
+                 'tags', context.caller->'tags',
+                 'jwt_subject', context.caller->'jwt_subject',
+                 'jwt_provider', context.caller->'jwt_provider',
+                 'jwt_claim_mapping', context.caller->'jwt_claim_mapping',
+                 'applied_guardrails', context.audit->'applied_guardrails',
+                 'guardrail_bypassed_reason', context.audit->'guardrail_bypassed_reason',
+                 'guardrail_monitor_hits', context.audit->'guardrail_monitor_hits',
+                 'guardrail_enforced_hits', context.audit->'guardrail_enforced_hits',
+                 'guardrail_scores', context.audit->'guardrail_scores'))
+               WHERE value NOT IN ('null'::jsonb, '""'::jsonb, '{}'::jsonb, '[]'::jsonb)
+             ) observations
+           ), bounded AS (
+             SELECT projected.*, octet_length(projected.event::text)::bigint AS total_bytes
+             FROM projected WHERE ordinal = 1
+             UNION ALL
+             SELECT next.*, bounded.total_bytes + octet_length(next.event::text)::bigint
+             FROM bounded
+             CROSS JOIN LATERAL (
+               SELECT projected.* FROM projected
+               WHERE projected.ordinal = bounded.ordinal + 1 AND bounded.total_bytes <= $2
+               OFFSET 0
+             ) next
+           )
+           SELECT event_id, operation_id, event FROM bounded
+           WHERE total_bytes <= $2 OR ordinal = 1 ORDER BY ordinal"#,
+    )
+    .bind(&ids)
+    .bind(8 * 1024 * 1024i64)
+    .fetch_all(&mut *conn)
+    .await?;
     let ids: Vec<Uuid> = rows.iter().map(|(id, _, _)| *id).collect();
-    let operation_ids:Vec<Uuid>=sqlx::query_scalar("SELECT DISTINCT objects.operation_id FROM native_terminal_outbox outbox JOIN native_objects objects ON objects.id=outbox.object_id WHERE outbox.event_id=ANY($1)")
-        .bind(&ids).fetch_all(&mut *conn).await?;
+    let operation_ids: Vec<Uuid> = rows
+        .iter()
+        .map(|(_, operation_id, _)| *operation_id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
     let events = rows.into_iter().map(|(_, _, event)| event).collect();
     // 同一提交网关的一批事件一次接收，沿用原有账号锁的全局顺序。
     let outcome =
