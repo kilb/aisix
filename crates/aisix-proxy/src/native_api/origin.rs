@@ -54,6 +54,7 @@ pub(crate) async fn begin_response(
     conversation_record_id: Option<Uuid>,
     request_id: &str,
     upstream_input_text: Option<aisix_core::usage_io::TextMeasurement>,
+    usage_context: Option<Box<aisix_core::native_objects::NativeUsageContext>>,
 ) -> Result<Option<OriginRegistration>, ProxyError> {
     let Some(registry) = state.native_objects.as_ref() else {
         return Ok(None);
@@ -81,7 +82,7 @@ pub(crate) async fn begin_response(
     let operation_id = Uuid::new_v4();
     let reply = registry
         .begin(BeginRequest {
-            usage_context: None,
+            usage_context,
             upstream_input_text,
             input_file_id: None,
             operation_id,

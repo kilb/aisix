@@ -2241,6 +2241,20 @@ async fn responses_to_target(
             } else {
                 None
             },
+            if asynchronous {
+                crate::usage_attr::native_usage_context(
+                    client_ctx,
+                    aisix_core::native_objects::NativeInputAudit {
+                        applied_guardrails: chain.applied().to_vec(),
+                        guardrail_bypassed_reason: chain.bypass_reason().unwrap_or_default(),
+                        guardrail_monitor_hits: input_monitor_hits.clone(),
+                        guardrail_enforced_hits: chain.enforced_hits(),
+                        guardrail_scores: chain.scores(),
+                    },
+                )
+            } else {
+                None
+            },
         )
         .await?
     } else if matches!(

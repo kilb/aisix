@@ -152,7 +152,8 @@ pub(crate) async fn create(
                 .await?
             };
             reservations.push(reservation);
-            audit
+            let mut entry_audit = Audit::default();
+            let scanned = entry_audit
                 .input(
                     &state,
                     &snapshot,
@@ -161,7 +162,16 @@ pub(crate) async fn create(
                     params.to_string().as_bytes(),
                     false,
                 )
-                .await?;
+                .await;
+            let usage_context = if scanned.is_ok() {
+                let audit = entry_audit.input_observation();
+                (!audit.is_empty()).then(|| Box::new(audit))
+            } else {
+                None
+            };
+            // block 路径也先把本项审计归回原请求，再返回同一个错误。
+            audit.merge_input(entry_audit);
+            scanned?;
             anthropic::refuse_messages_references(
                 &state,
                 &snapshot,
@@ -187,7 +197,7 @@ pub(crate) async fn create(
             );
             io.observe_request_json(params);
             entries.push(NativeEntry {
-                usage_context: None,
+                usage_context,
                 upstream_input_text: io.snapshot().input_text,
                 endpoint: String::new(),
                 entry_id: id,

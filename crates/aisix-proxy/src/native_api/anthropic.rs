@@ -793,7 +793,11 @@ async fn begin_for_requested(
         .chain(owner_parent_record_id)
         .collect();
     let submission = BeginRequest {
-        usage_context: None,
+        usage_context: if stage == InferenceStage::Accepted {
+            crate::usage_attr::native_usage_context(client, Default::default())
+        } else {
+            None
+        },
         upstream_input_text: None,
         input_file_id: None,
         operation_id,
@@ -1378,6 +1382,29 @@ pub(crate) struct Audit {
     applied: Vec<aisix_core::AppliedGuardrail>,
 }
 impl Audit {
+    pub(crate) fn input_observation(&self) -> aisix_core::native_objects::NativeInputAudit {
+        crate::usage_attr::native_input_audit(
+            &self.monitor,
+            &self.enforced,
+            &self.scores,
+            &self.bypass,
+            &self.applied,
+        )
+    }
+
+    pub(crate) fn merge_input(&mut self, input: Self) {
+        self.monitor.extend(input.monitor);
+        self.enforced.extend(input.enforced);
+        self.scores.extend(input.scores);
+        if self.bypass.is_empty() {
+            self.bypass = input.bypass;
+        }
+        if self.applied.is_empty() {
+            self.applied = input.applied;
+        }
+        crate::redact::merge_counts(&mut self.redactions, input.redactions);
+    }
+
     pub(crate) fn registered(&mut self, registration: &Registration) {
         self.registered_operation(registration.operation_id, registration.inference_stage);
     }

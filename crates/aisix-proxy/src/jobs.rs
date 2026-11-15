@@ -2962,7 +2962,14 @@ async fn managed_begin(
         && !entries.is_empty();
     let reply = openai::registry(state)?
         .begin(BeginRequest {
-            usage_context: None,
+            usage_context: if asynchronous
+                || (kind == aisix_core::native_objects::NativeObjectKind::File
+                    && !entries.is_empty())
+            {
+                crate::usage_attr::native_usage_context(client, Default::default())
+            } else {
+                None
+            },
             upstream_input_text: None,
             input_file_id,
             operation_id,
@@ -3346,21 +3353,48 @@ async fn managed_batch_input(
                 ProxyError::InvalidRequest("batch input body is required".into())
             })?)
             .map_err(|_| openai::dependency())?;
-        if let Some(masked) = scan_input_blob(
+        let mut entry_monitor = Vec::new();
+        let mut entry_enforced = Vec::new();
+        let mut entry_scores = Vec::new();
+        let mut entry_bypass = String::new();
+        let mut entry_applied = Vec::new();
+        let scanned = scan_input_blob(
             state,
             snapshot,
             auth,
             &target,
             &body,
-            monitor_hits,
-            enforced_hits,
-            scores,
-            bypass,
-            applied,
+            &mut entry_monitor,
+            &mut entry_enforced,
+            &mut entry_scores,
+            &mut entry_bypass,
+            &mut entry_applied,
             Some(redactions),
         )
-        .await?
-        {
+        .await;
+        let usage_context = if scanned.is_ok() {
+            let audit = crate::usage_attr::native_input_audit(
+                &entry_monitor,
+                &entry_enforced,
+                &entry_scores,
+                &entry_bypass,
+                &entry_applied,
+            );
+            (!audit.is_empty()).then(|| Box::new(audit))
+        } else {
+            None
+        };
+        // 先保留本项真实错误审计，再传播 block 或其他扫描错误。
+        monitor_hits.extend(entry_monitor);
+        enforced_hits.extend(entry_enforced);
+        scores.extend(entry_scores);
+        if bypass.is_empty() {
+            *bypass = entry_bypass;
+        }
+        if applied.is_empty() {
+            *applied = entry_applied;
+        }
+        if let Some(masked) = scanned? {
             changed = true;
             line["body"] = serde_json::from_slice(&masked).map_err(|_| {
                 ProxyError::InvalidRequest("masked batch input body is not JSON".into())
@@ -3398,7 +3432,7 @@ async fn managed_batch_input(
         let io = aisix_gateway::upstream_io::UpstreamIoObserver::new(protocol);
         io.observe_request_json(line.get("body").ok_or_else(openai::dependency)?);
         entries.push(NativeEntry {
-            usage_context: None,
+            usage_context,
             upstream_input_text: io.snapshot().input_text,
             endpoint,
             entry_id: id,
