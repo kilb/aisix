@@ -1227,3 +1227,7 @@ mod lua_invariants {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "redis_release_work_tests.rs"]
+mod release_work_tests;

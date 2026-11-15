@@ -493,6 +493,10 @@ impl Drop for StreamConcurrencyGuard {
 }
 
 #[cfg(test)]
+#[path = "limiter_lease_work_tests.rs"]
+mod lease_work_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::clock::TestClock;

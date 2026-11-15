@@ -2123,3 +2123,127 @@ async fn a_refused_credential_corrected_on_the_server_is_adopted_without_a_resta
         .query_async::<()>(&mut handle)
         .await;
 }
+
+// 健康 Redis 上只限窗口的 reservation 没有共享并发成员，Drop 不应派发 ZREM。
+#[tokio::test(flavor = "current_thread")]
+async fn window_only_reservation_drop_does_not_spawn_a_redis_release() {
+    let Some(url) = redis_url() else { return };
+    let store = Arc::new(store(&url).await);
+    let limiter = Limiter::with_store(store);
+    let key = unique_key("window-release-work");
+    let limits = RateLimit {
+        rpm: Some(10),
+        tpm: Some(100),
+        ..rl()
+    };
+    let reservation = limiter.pre_commit(&key, &limits).await.unwrap();
+    let runtime = tokio::runtime::Handle::current().metrics();
+    let tasks = runtime.num_alive_tasks();
+    drop(reservation);
+    assert_eq!(
+        runtime.num_alive_tasks(),
+        tasks,
+        "无并发租约不应增加远程清理任务"
+    );
+    assert_eq!(limiter.peek(&key, &limits).await.unwrap().rpm_used, 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn window_only_stream_drop_does_not_spawn_a_redis_release() {
+    let Some(url) = redis_url() else { return };
+    let store = Arc::new(store(&url).await);
+    let limiter = Limiter::with_store(store);
+    let key = unique_key("window-stream-release-work");
+    let limits = RateLimit {
+        tpm: Some(100),
+        ..rl()
+    };
+    let hold = MultiReservation::new(vec![limiter.pre_commit(&key, &limits).await.unwrap()])
+        .into_stream_hold();
+    let runtime = tokio::runtime::Handle::current().metrics();
+    let tasks = runtime.num_alive_tasks();
+    drop(hold);
+    assert_eq!(
+        runtime.num_alive_tasks(),
+        tasks,
+        "流结束也不能清理不存在的 Redis 租约"
+    );
+}
+
+// 先在空 slot 本地取得并发槽，再连上真实 Redis；恢复不能凭空变成远程所有权。
+#[tokio::test(flavor = "current_thread")]
+async fn a_local_only_lease_released_after_recovery_stays_local() {
+    let Some(url) = redis_url() else { return };
+    let relay = RedisCutoff::start(&url).await;
+    let cfg = RedisConnConfig {
+        timeout_secs: 1,
+        ..single(&relay.url())
+    };
+    relay.blackhole();
+    let (store, degraded) = RedisStore::connect_or_attach_later(&cfg).await.unwrap();
+    assert!(degraded.is_some(), "必须先证明取得的是本地槽");
+    let key = unique_key("local-only-release-after-recovery");
+    let limits = RateLimit {
+        concurrency: Some(1),
+        ..rl()
+    };
+    store.acquire(&key, &limits, "local").await.unwrap();
+    relay.heal();
+    let peer = RedisStore::connect(&cfg).await.unwrap();
+    wait_for_attach(&store, &peer).await;
+
+    let runtime = tokio::runtime::Handle::current().metrics();
+    let tasks = runtime.num_alive_tasks();
+    store.release(&key, "local");
+    assert_eq!(
+        runtime.num_alive_tasks(),
+        tasks,
+        "恢复不使 LocalOnly 需要 ZREM"
+    );
+}
+
+// 丢的是已执行 acquire 的回包；Unknown 仍必须清理真实远程槽和本地备份。
+#[tokio::test]
+async fn an_ambiguous_acquire_releases_its_remote_and_local_members() {
+    let Some(url) = redis_url() else { return };
+    let relay = RedisCutoff::start(&url).await;
+    let store = RedisStore::connect(&single(&relay.url())).await.unwrap();
+    let limits = RateLimit {
+        concurrency: Some(1),
+        ..rl()
+    };
+    let warmup = unique_key("ambiguous-release-warmup");
+    store.acquire(&warmup, &limits, "warmup").await.unwrap();
+    store.commit(&warmup, 0, "warmup").await;
+    let key = unique_key("ambiguous-release");
+    relay.fail_next_reply_after_apply();
+    store.acquire(&key, &limits, "ambiguous").await.unwrap();
+    let peer = RedisStore::connect(&single(&url)).await.unwrap();
+    assert!(matches!(
+        peer.acquire(&key, &limits, "blocked").await,
+        Err(RateLimitError::Concurrency { .. })
+    ));
+
+    store.release(&key, "ambiguous");
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match peer.acquire(&key, &limits, "after-release").await {
+                Ok(()) => return,
+                Err(RateLimitError::Concurrency { .. }) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("不应触发其它限流维度: {error:?}"),
+            }
+        }
+    })
+    .await
+    .expect("Unknown 可能已经写入 Redis，不能省略其 ZREM");
+    peer.release(&key, "after-release");
+
+    relay.cut();
+    store
+        .acquire(&key, &limits, "fallback-after-release")
+        .await
+        .expect("Unknown 的本地备份槽也必须释放");
+    store.release(&key, "fallback-after-release");
+}
