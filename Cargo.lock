@@ -117,6 +117,7 @@ dependencies = [
  "aisix-core",
  "aisix-etcd",
  "aisix-gateway",
+ "aisix-guardrails",
  "aisix-obs",
  "aisix-pricing",
  "aisix-provider-anthropic",

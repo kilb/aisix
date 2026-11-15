@@ -29,7 +29,10 @@ fn alternating_capture_work(fragments: usize) -> usize {
         } else {
             json!({"content":"t"})
         };
-        feed(&mut collector, json!({"choices":[{"index":0,"delta":delta}]}));
+        feed(
+            &mut collector,
+            json!({"choices":[{"index":0,"delta":delta}]}),
+        );
     }
     let visits = PART_LEN_VISITS.with(Cell::get);
     let capture = collector.finish();
@@ -93,7 +96,10 @@ fn late_chat_tool_metadata_keeps_its_existing_over_cap_semantics() {
             feed(&mut collector, event.clone());
         }
         if append_text {
-            feed(&mut collector, json!({"choices":[{"delta":{"content":"x"}}]}));
+            feed(
+                &mut collector,
+                json!({"choices":[{"delta":{"content":"x"}}]}),
+            );
         }
         let capture = collector.finish();
         assert_eq!(capture.truncated, append_text);
@@ -108,8 +114,14 @@ fn late_chat_tool_metadata_keeps_its_existing_over_cap_semantics() {
 fn anthropic_argument_delta_reclaims_the_empty_object_placeholder() {
     for (cap, expected_args, truncated) in [(5, json!({}), false), (4, json!(""), true)] {
         let mut collector = OutputCollector::new(OutputWire::AnthropicMessages, cap);
-        feed(&mut collector, json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t","name":"f","input":{}}}));
-        feed(&mut collector, json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{ }"}}));
+        feed(
+            &mut collector,
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t","name":"f","input":{}}}),
+        );
+        feed(
+            &mut collector,
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{ }"}}),
+        );
         let capture = collector.finish();
         assert_eq!(capture.truncated, truncated, "cap={cap}");
         assert_eq!(
@@ -147,8 +159,14 @@ fn responses_final_item_reclaims_only_its_own_slots() {
 #[test]
 fn replacing_a_part_releases_its_previous_byte_budget() {
     let mut collector = OutputCollector::new(OutputWire::OpenAiResponses, 8);
-    let first = SlotKey { position: 0, sub: 0 };
-    let second = SlotKey { position: 1, sub: 0 };
+    let first = SlotKey {
+        position: 0,
+        sub: 0,
+    };
+    let second = SlotKey {
+        position: 1,
+        sub: 0,
+    };
     collector.put(first, Part::Text("abcd".into()));
     collector.put(second, Part::Text("xy".into()));
     collector.put(first, Part::Text("a".into()));
