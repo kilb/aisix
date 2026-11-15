@@ -192,6 +192,30 @@ fn assert_status(status: u16, expected: u16, body: &Value, phase: &str) {
         Some("not_found") => "not_found",
         _ => "other_or_absent",
     };
+    if status != expected {
+        let mut reported = false;
+        for detail in body.get("details").and_then(Value::as_array).into_iter().flatten() {
+            let path = match detail.get("path").and_then(Value::as_str) {
+                Some("api_key") => "api_key",
+                Some("api_base") => "api_base",
+                Some("provider") => "provider",
+                Some("adapter") => "adapter",
+                Some("groups") => "groups",
+                Some("default header OpenAI-Project") => "default header OpenAI-Project",
+                Some("default header openai-project") => "default header openai-project",
+                Some("/api_key") => "/api_key",
+                Some("/api_base") => "/api_base",
+                Some("/request/default_headers/OpenAI-Project") => "/request/default_headers/OpenAI-Project",
+                Some("/doc/request/default_headers/OpenAI-Project") => "/doc/request/default_headers/OpenAI-Project",
+                _ => "other_or_absent",
+            };
+            eprintln!("duration setup diagnostic: phase={phase} status={status} code={code} path={path}");
+            reported = true;
+        }
+        if !reported {
+            eprintln!("duration setup diagnostic: phase={phase} status={status} code={code} path=absent");
+        }
+    }
     assert_eq!(status, expected, "duration phase={phase} code={code}");
 }
 
@@ -215,6 +239,8 @@ async fn setup_duration_model(f: &Fixture, peer: &DurationPeer) -> Uuid {
     doc["api_base"] = json!(peer.base);
     // 同一真实 account 在任何 WS admission 前改地址；显式重供原密钥满足目的地变更合同。
     doc["api_key"] = json!(f.provider.state.secret);
+    // 真实原始 fixture 只有这个 header；目的地变更须显式重供 GET 已脱敏的原值。
+    doc["request"]["default_headers"] = json!({"OpenAI-Project":PROJECT});
     let changed =
         f.cp.send_conditional(
             "PUT",
