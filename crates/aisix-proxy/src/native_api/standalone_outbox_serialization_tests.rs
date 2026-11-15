@@ -122,6 +122,26 @@ async fn batch_completion_serialization(entry_count: usize) {
             .collect(),
         output_file_ids: vec![],
     };
+    // 在任何 terminal receipt 存在前验证代次；否则 payload 差异也会产生 Conflict。
+    let mut stale_fresh = request.clone();
+    stale_fresh.lease.generation += 1;
+    let rejected_scope = SerializationScope::start();
+    assert_eq!(
+        f.store.complete(stale_fresh).await.unwrap_err(),
+        Error::Conflict
+    );
+    assert_eq!(rejected_scope.finish(), 0);
+    assert!(saved_rows(&f.store, record.record_id).await.is_empty());
+    let untouched = f
+        .store
+        .lookup(lookup("key-a", NativeObjectKind::MessageBatch, &raw_id))
+        .await
+        .unwrap()
+        .record
+        .unwrap();
+    assert_eq!(untouched.version, leased.version);
+    assert!(!untouched.completed);
+
     let fresh = request.clone();
     let scope = SerializationScope::start();
     let started = Instant::now();
