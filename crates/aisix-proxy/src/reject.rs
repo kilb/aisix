@@ -367,8 +367,6 @@ mod tests {
             ("POST", "/v1/uploads/%ff/cancel"),
             ("GET", "/v1/batches/%ff"),
             ("POST", "/v1/batches/%ff/cancel"),
-            ("GET", "/v1/fine_tuning/jobs/%ff"),
-            ("POST", "/v1/fine_tuning/jobs/%ff/cancel"),
             ("GET", "/v1/videos/%ff"),
             ("GET", "/v1/videos/%ff/content"),
         ] {
@@ -417,11 +415,7 @@ mod tests {
         // the same silent bare-400 class, one extractor over (#880 review
         // follow-up). Every multipart route must answer the envelope.
         let router = router();
-        for path in [
-            "/v1/audio/transcriptions",
-            "/v1/audio/translations",
-            "/v1/files",
-        ] {
+        for path in ["/v1/audio/transcriptions", "/v1/files"] {
             let request = HttpRequest::post(path)
                 .header("authorization", format!("Bearer {TOKEN}"))
                 .header("content-type", "application/json")

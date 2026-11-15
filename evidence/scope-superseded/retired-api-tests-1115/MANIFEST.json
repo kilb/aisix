@@ -1,0 +1,326 @@
+{
+  "schema": "retired-api-tests-1115/manifest/v1",
+  "base_commit": "4b6cb5142d5e8eaa6cfeee1ee8d04706f29763f0",
+  "worktree": "/home/ubuntu/aisix-work/p3-active-test-curation-1115",
+  "branch": "codex/p3-active-test-curation-1115",
+  "status": "actual curations applied in isolated tree; runtime unverified; no full-suite GREEN claim",
+  "authority": "P3/root authorized actual retired-only archive curation plus three active GA route census/classification parity.",
+  "changed_source": [
+    {
+      "path": "crates/aisix-control-plane/tests/native_evals_gateway_journey.rs",
+      "base_sha256": "dab726b9cd10d4990431170250a851e2c71a9693879afe0e8d4d3f3f7e158640",
+      "current_exists": false,
+      "archive": "evidence/scope-superseded/retired-api-tests-1115/retired-source/crates/aisix-control-plane/tests/native_evals_gateway_journey.rs"
+    },
+    {
+      "path": "crates/aisix-proxy/src/audio.rs",
+      "base_sha256": "2a313a34ade463f4bc5d3765f0695de7cb5290d1510f35c8cdeafeb705f650be",
+      "current_exists": true,
+      "current_sha256": "cbfb5d8b10e2a7bb835cb3e69882d53bbd9020f3be310983b0da13935ac22db2"
+    },
+    {
+      "path": "crates/aisix-proxy/src/jobs.rs",
+      "base_sha256": "872906af56d763a482bd022091f56468ee106b86c76b7925de1f3d5954efae7a",
+      "current_exists": true,
+      "current_sha256": "8188def700bd9cc81ddf5117ddfa5c241699318ed720be6eb3aa88d5f8a4edb6"
+    },
+    {
+      "path": "crates/aisix-proxy/src/jobs_compat_tests.rs",
+      "base_sha256": "302450e8129de0786abd42733c1db17623675e82171b32531835aee46eff15e2",
+      "current_exists": true,
+      "current_sha256": "4d69185cce23eb39edf2dcb000defda6a9aa4212a13e5b271ebe161add922492"
+    },
+    {
+      "path": "crates/aisix-proxy/src/native_api/mod.rs",
+      "base_sha256": "cf32ac27644ad99c4da170399c356cb08fb749a60db8fed1276eb2270050b165",
+      "current_exists": true,
+      "current_sha256": "5414af28938c0e0ebf1411fa94ab5d2a54b11b843a5674fc8a00e92927810a7a"
+    },
+    {
+      "path": "crates/aisix-proxy/src/native_api/openai_eval_worker.rs",
+      "base_sha256": "3b6326f9b069c5afcba88e5d3352c25147e581790ecc79ce507f65e3529d54af",
+      "current_exists": false,
+      "archive": "evidence/scope-superseded/retired-api-tests-1115/retired-source/crates/aisix-proxy/src/native_api/openai_eval_worker.rs"
+    },
+    {
+      "path": "crates/aisix-proxy/src/native_api/openai_evals.rs",
+      "base_sha256": "2a78ec76bcdbc3d9eed252fdae3dea87f10b9b0764bf276f54df1e9856bad6ed",
+      "current_exists": false,
+      "archive": "evidence/scope-superseded/retired-api-tests-1115/retired-source/crates/aisix-proxy/src/native_api/openai_evals.rs"
+    },
+    {
+      "path": "crates/aisix-proxy/src/reject.rs",
+      "base_sha256": "0aac054ea22092d854e7289e43d6edad54c92dab64012c62cbc2b6a158646bc6",
+      "current_exists": true,
+      "current_sha256": "15ece605789ed79a9cffbbdfedebe667d3bbbf3c920af185f75f07ec8119fd6e"
+    },
+    {
+      "path": "crates/aisix-proxy/src/request_decode_tests.rs",
+      "base_sha256": "52a289b37f664ac289eaac3e3f64a6d431986b2197d8462bb5237a119b882cb0",
+      "current_exists": true,
+      "current_sha256": "198c8e90854fc9b50de479b65b8fea76e2d8945375124d57011ebe0b05ddc90f"
+    },
+    {
+      "path": "crates/aisix-proxy/src/request_metrics.rs",
+      "base_sha256": "d0a4ac5d21ff29fd9ebfd8cedf884ea382850f392d224f5d9af5d43e3415ea05",
+      "current_exists": true,
+      "current_sha256": "277e9521af5cd06a7ca8861278ceea33bc9b47e374e417a006033e17b19b6c2e"
+    },
+    {
+      "path": "crates/aisix-proxy/src/videos.rs",
+      "base_sha256": "e8c0842a4a0ceb45e958a608c06a03d5beb68a09235c816bc0eb2300196cfca9",
+      "current_exists": true,
+      "current_sha256": "9815d3901f54ed7fbd8eee3579339e4ccccc7012cbc6783457c072a9166ae850"
+    },
+    {
+      "path": "crates/aisix-proxy/tests/metric_label_cardinality.rs",
+      "base_sha256": "d7b0da08f2136c7e615d4d793c55b8710c4f40bca6b2783ba681b8c6db0065e8",
+      "current_exists": true,
+      "current_sha256": "2c5fbbcbe98ee9cfd0643ff78d7ead5c8ed4ad69060582b3fbbc6db6a5e0980d"
+    },
+    {
+      "path": "crates/aisix-proxy/tests/native_openai_evals.rs",
+      "base_sha256": "e0b3eb677b20dd83758e2013d955c8f34dc1a35a2f4afd68bcb707605a20ddbb",
+      "current_exists": false,
+      "archive": "evidence/scope-superseded/retired-api-tests-1115/retired-source/crates/aisix-proxy/tests/native_openai_evals.rs"
+    },
+    {
+      "path": "crates/aisix-proxy/tests/native_openai_stateless.rs",
+      "base_sha256": "f92e5082970745f43ce29897d64fe72cfc89a8cae318fe8a5eadc2827dd21f8a",
+      "current_exists": true,
+      "current_sha256": "5d939c0fa809061a8d8fcf78bb2a9370c29148f8ee6edac8b6621b7bc982483f"
+    }
+  ],
+  "archive_files": [
+    {
+      "path": "evidence/scope-superseded/retired-api-tests-1115/README.md",
+      "bytes": 2166,
+      "sha256": "0701c4e5aeff556372b395727dafa796b13708639ed72b5603b07bc383d2251f"
+    },
+    {
+      "path": "evidence/scope-superseded/retired-api-tests-1115/inventory32.json",
+      "bytes": 12014,
+      "sha256": "46103834151d32fd2677634871a7746659ee08f70e839adf7d687459f598e839"
+    },
+    {
+      "path": "evidence/scope-superseded/retired-api-tests-1115/originals/crates/aisix-proxy/src/audio.rs",
+      "bytes": 312587,
+      "sha256": "2a313a34ade463f4bc5d3765f0695de7cb5290d1510f35c8cdeafeb705f650be"
+    },
+    {
+      "path": "evidence/scope-superseded/retired-api-tests-1115/originals/crates/aisix-proxy/src/guardrail_blocked_telemetry.rs",
+      "bytes": 23548,
+      "sha256": "24ac5c69ed27847dc9ee8be41f17d5b8dacf9136ccb3f01cc26378ad32e58b2d"
+    },
+    {
+      "path": "evidence/scope-superseded/retired-api-tests-1115/originals/crates/aisix-proxy/src/jobs.rs",
+      "bytes": 330559,
+      "sha256": "872906af56d763a482bd022091f56468ee106b86c76b7925de1f3d5954efae7a"
+    },
+    {
+      "path": "evidence/scope-superseded/retired-api-tests-1115/originals/crates/aisix-proxy/src/jobs_compat_tests.rs",
+      "bytes": 33540,
+      "sha256": "302450e8129de0786abd42733c1db17623675e82171b32531835aee46eff15e2"
+    },
+    {
+      "path": "evidence/scope-superseded/retired-api-tests-1115/originals/crates/aisix-proxy/src/model_echo.rs",
+      "bytes": 26091,
+      "sha256": "97ce16035344b7df568bbfe69e79a61977a40a642af351d131763372f0f98572"
+    },
+    {
+      "path": "evidence/scope-superseded/retired-api-tests-1115/originals/crates/aisix-proxy/src/native_api/mod.rs",
+      "bytes": 758,
+      "sha256": "cf32ac27644ad99c4da170399c356cb08fb749a60db8fed1276eb2270050b165"
+    },
+    {
+      "path": "evidence/scope-superseded/retired-api-tests-1115/originals/crates/aisix-proxy/src/reject.rs",
+      "bytes": 17424,
+      "sha256": "0aac054ea22092d854e7289e43d6edad54c92dab64012c62cbc2b6a158646bc6"
+    },
+    {
+      "path": "evidence/scope-superseded/retired-api-tests-1115/originals/crates/aisix-proxy/src/request_decode_tests.rs",
+      "bytes": 73737,
+      "sha256": "52a289b37f664ac289eaac3e3f64a6d431986b2197d8462bb5237a119b882cb0"
+    },
+    {
+      "path": "evidence/scope-superseded/retired-api-tests-1115/originals/crates/aisix-proxy/src/request_metrics.rs",
+      "bytes": 68046,
+      "sha256": "d0a4ac5d21ff29fd9ebfd8cedf884ea382850f392d224f5d9af5d43e3415ea05"
+    },
+    {
+      "path": "evidence/scope-superseded/retired-api-tests-1115/originals/crates/aisix-proxy/src/videos.rs",
+      "bytes": 233206,
+      "sha256": "e8c0842a4a0ceb45e958a608c06a03d5beb68a09235c816bc0eb2300196cfca9"
+    },
+    {
+      "path": "evidence/scope-superseded/retired-api-tests-1115/originals/crates/aisix-proxy/tests/metric_label_cardinality.rs",
+      "bytes": 10484,
+      "sha256": "d7b0da08f2136c7e615d4d793c55b8710c4f40bca6b2783ba681b8c6db0065e8"
+    },
+    {
+      "path": "evidence/scope-superseded/retired-api-tests-1115/originals/crates/aisix-proxy/tests/native_openai_stateless.rs",
+      "bytes": 55091,
+      "sha256": "f92e5082970745f43ce29897d64fe72cfc89a8cae318fe8a5eadc2827dd21f8a"
+    },
+    {
+      "path": "evidence/scope-superseded/retired-api-tests-1115/parts/cp-evals-curation.json",
+      "bytes": 957,
+      "sha256": "c4f03ea8d81fe116b56fbb6066cafd0cf7d2cb54c91d64aa2e3ddd9b7eec2a78"
+    },
+    {
+      "path": "evidence/scope-superseded/retired-api-tests-1115/parts/formatting.json",
+      "bytes": 1179,
+      "sha256": "1c913bf1da136e0b1eb223f364908edf2179a1b80f16374369c52e53254a907b"
+    },
+    {
+      "path": "evidence/scope-superseded/retired-api-tests-1115/parts/ga-request-decode-curation.json",
+      "bytes": 6949,
+      "sha256": "455cd194d71c012151a6adc0b637e063ee8c988fa2474177f6e0007c75810100"
+    },
+    {
+      "path": "evidence/scope-superseded/retired-api-tests-1115/parts/h1-curation.json",
+      "bytes": 4905,
+      "sha256": "0a515f8d69d7a38ac979e491b01e0f22610900f5b108422390fa8621b2deadc4"
+    },
+    {
+      "path": "evidence/scope-superseded/retired-api-tests-1115/parts/metrics-curation.json",
+      "bytes": 4004,
+      "sha256": "671db2a3524e0afbd619e16916fc049b7b372b762901e840a1eeef9225096893"
+    },
+    {
+      "path": "evidence/scope-superseded/retired-api-tests-1115/parts/misc-curation.json",
+      "bytes": 13708,
+      "sha256": "2732025e0b9153b605278c93ef840ea11c3a8000c4640c086a02e90728d1808f"
+    },
+    {
+      "path": "evidence/scope-superseded/retired-api-tests-1115/parts/route-curation.json",
+      "bytes": 11160,
+      "sha256": "fc00ff76955c0d04a4622375e100647a71beb6c91fc1092a5fcf2c41c77964ed"
+    },
+    {
+      "path": "evidence/scope-superseded/retired-api-tests-1115/retired-source/crates/aisix-control-plane/tests/native_evals_gateway_journey.rs",
+      "bytes": 20748,
+      "sha256": "dab726b9cd10d4990431170250a851e2c71a9693879afe0e8d4d3f3f7e158640"
+    },
+    {
+      "path": "evidence/scope-superseded/retired-api-tests-1115/retired-source/crates/aisix-proxy/src/native_api/openai_eval_worker.rs",
+      "bytes": 12370,
+      "sha256": "3b6326f9b069c5afcba88e5d3352c25147e581790ecc79ce507f65e3529d54af"
+    },
+    {
+      "path": "evidence/scope-superseded/retired-api-tests-1115/retired-source/crates/aisix-proxy/src/native_api/openai_evals.rs",
+      "bytes": 35842,
+      "sha256": "2a78ec76bcdbc3d9eed252fdae3dea87f10b9b0764bf276f54df1e9856bad6ed"
+    },
+    {
+      "path": "evidence/scope-superseded/retired-api-tests-1115/retired-source/crates/aisix-proxy/tests/native_openai_evals.rs",
+      "bytes": 38845,
+      "sha256": "e0b3eb677b20dd83758e2013d955c8f34dc1a35a2f4afd68bcb707605a20ddbb"
+    }
+  ],
+  "scope_superseded_tests": {
+    "whole_targets": {
+      "crates/aisix-proxy/tests/native_openai_evals.rs": 9,
+      "crates/aisix-control-plane/tests/native_evals_gateway_journey.rs": 1
+    },
+    "mixed_file_retired_only_functions": 9,
+    "note": "Counts are retained test attributes, not runtime results; mixed table rows are recorded separately in parts."
+  },
+  "unchanged_blockers": [
+    {
+      "file": "crates/aisix-proxy/src/videos.rs",
+      "function": "platform_video_owner_survives_restart_and_blocks_foreign_and_forged_ids",
+      "attribute_start": 2894,
+      "function_start": 2895,
+      "function_end": 2953,
+      "sha256": "afc6ee71a2287f3e80483855b404b842bb4db42d94bc67392109e82f914ba704",
+      "classification": "BLOCKING_ACTIVE_CONTRACT_WITH_RETIRED_OPENAI_FIXTURE",
+      "reason": "共有归属/账户/模型分组合同或共享stream concurrency不能以退役供应商名义删除；原业务assert与case不改。video_owner_snapshot :2837固定openai，或该case new_snap(...,\"openai\",...)。未运行确认失败，需ROOT统一决定独立active fixture coverage，不在此改场景。"
+    },
+    {
+      "file": "crates/aisix-proxy/src/videos.rs",
+      "function": "platform_video_account_changes_invalidate_ids_before_any_poll",
+      "attribute_start": 2955,
+      "function_start": 2956,
+      "function_end": 3000,
+      "sha256": "d2c60b9d39028ddc26ff71715c974ecb00976bd00b8219f25a37bae1de9169eb",
+      "classification": "BLOCKING_ACTIVE_CONTRACT_WITH_RETIRED_OPENAI_FIXTURE",
+      "reason": "共有归属/账户/模型分组合同或共享stream concurrency不能以退役供应商名义删除；原业务assert与case不改。video_owner_snapshot :2837固定openai，或该case new_snap(...,\"openai\",...)。未运行确认失败，需ROOT统一决定独立active fixture coverage，不在此改场景。"
+    },
+    {
+      "file": "crates/aisix-proxy/src/videos.rs",
+      "function": "platform_video_current_model_and_group_permissions_still_apply",
+      "attribute_start": 3002,
+      "function_start": 3003,
+      "function_end": 3042,
+      "sha256": "dbfcb932f228969707105728909d1b364735fc80a44c5cc1b5e5762be4297bca",
+      "classification": "BLOCKING_ACTIVE_CONTRACT_WITH_RETIRED_OPENAI_FIXTURE",
+      "reason": "共有归属/账户/模型分组合同或共享stream concurrency不能以退役供应商名义删除；原业务assert与case不改。video_owner_snapshot :2837固定openai，或该case new_snap(...,\"openai\",...)。未运行确认失败，需ROOT统一决定独立active fixture coverage，不在此改场景。"
+    },
+    {
+      "file": "crates/aisix-proxy/src/videos.rs",
+      "function": "platform_video_forwarded_account_cannot_be_switched_for_followups",
+      "attribute_start": 3044,
+      "function_start": 3045,
+      "function_end": 3104,
+      "sha256": "f9036986fdd80407d88f557895f2ce7f57cfeaef0b4669473207add2f45017fe",
+      "classification": "BLOCKING_ACTIVE_CONTRACT_WITH_RETIRED_OPENAI_FIXTURE",
+      "reason": "共有归属/账户/模型分组合同或共享stream concurrency不能以退役供应商名义删除；原业务assert与case不改。video_owner_snapshot :2837固定openai，或该case new_snap(...,\"openai\",...)。未运行确认失败，需ROOT统一决定独立active fixture coverage，不在此改场景。"
+    },
+    {
+      "file": "crates/aisix-proxy/src/videos.rs",
+      "function": "a_proxied_download_holds_the_key_concurrency_until_its_body_ends",
+      "attribute_start": 5304,
+      "function_start": 5305,
+      "function_end": 5366,
+      "sha256": "bd2c948e492c76c7b095f3c6a008c52af4996f423a62460eea5d62a0cd31524e",
+      "classification": "BLOCKING_ACTIVE_CONTRACT_WITH_RETIRED_OPENAI_FIXTURE",
+      "reason": "共有归属/账户/模型分组合同或共享stream concurrency不能以退役供应商名义删除；原业务assert与case不改。video_owner_snapshot :2837固定openai，或该case new_snap(...,\"openai\",...)。未运行确认失败，需ROOT统一决定独立active fixture coverage，不在此改场景。"
+    }
+  ],
+  "typescript": {
+    "files": 14,
+    "source_changed": false,
+    "cargo_auto_discovered": false,
+    "separate_runner": "tests/e2e package Vitest / dedicated CI E2E job",
+    "external_receipt": "/home/ubuntu/aisix-work/api-compat-1112-evidence/resume-1115/light-supported-source-curation/h1-ts-mixed-e2e-readonly.json",
+    "receipt_sha256": "56bb623a4a19d2df1df0e96ed810e90bb85922505f348e7389a33d689789d410"
+  },
+  "retained_invariants": [
+    "All persisted enums/codecs unchanged.",
+    "No new ignore/skip/only or altered business expected values.",
+    "Active normal auth/model/group/IP/quota behavior not changed.",
+    "Three GA mounted routes remain in exact source census; no NOT_METERED exemption.",
+    "Five active video blocker functions still byte-identical.",
+    "Original and moved source bytes equal the exact base blobs.",
+    "No Cargo or service operation by this agent."
+  ],
+  "required_root_validation": [
+    "cargo test --workspace --all-features -- --list",
+    "cargo test --workspace --all-features (with real CP service environment installed by root; no retired target falsely counted PASS)",
+    "Real active GA WebSocket translations traffic followed by GET /metrics; secret mint requests remain proxy-only."
+  ],
+  "verification_limits": [
+    "No Rust compilation or runtime test executed here.",
+    "Existing historical metadata source census limitations were not weakened or repaired by this scope curation.",
+    "Five known active-video fixture blockers and mixed TS follow-up remain explicit.",
+    "Exact request decode source census still has 51 active-family method/path omissions in base-derived coverage. This gate is explicitly unresolved, not scope-superseded."
+  ],
+  "known_unresolved_source_gate": {
+    "severity": "MEDIUM",
+    "test": "request_decode_tests::request_decode_census_covers_every_registered_method_and_path",
+    "static_mounted_method_path_count": 128,
+    "static_declared_coverage_count": 77,
+    "missing_active_method_path_count": 51,
+    "families": [
+      "Conversations",
+      "Containers",
+      "VectorStores",
+      "Skills",
+      "Voices"
+    ],
+    "three_GA_routes": "now covered",
+    "action": "Original exact equality oracle retained. No blanket bodyless exemption for JSON consumers; dedicated truthful per-surface transport postures remain necessary.",
+    "runtime_status": "not executed here"
+  }
+}

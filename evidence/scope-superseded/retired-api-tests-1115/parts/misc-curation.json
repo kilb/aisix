@@ -1,0 +1,308 @@
+{
+  "schema": "retired-api-tests-1115/misc-curation/v1",
+  "worktree": "/home/ubuntu/aisix-work/p3-active-test-curation-1115",
+  "base_commit": "4b6cb5142d5e8eaa6cfeee1ee8d04706f29763f0",
+  "archive_root": "evidence/scope-superseded/retired-api-tests-1115",
+  "authorized_scope": "Only named misc test files; archive/remove exact retired-only test rows, preserve active assertions and pure codecs/normalizers/shared HTTP units.",
+  "retired_families": [
+    "Evals",
+    "FineTuning",
+    "OpenAI Videos only",
+    "image variations",
+    "old audio translations",
+    "deprecated realtime sessions/transcription_sessions",
+    "Calls/SIP"
+  ],
+  "files": [
+    {
+      "path": "crates/aisix-proxy/src/guardrail_blocked_telemetry.rs",
+      "exists": true,
+      "original_sha256": "24ac5c69ed27847dc9ee8be41f17d5b8dacf9136ccb3f01cc26378ad32e58b2d",
+      "curated_sha256": "24ac5c69ed27847dc9ee8be41f17d5b8dacf9136ccb3f01cc26378ad32e58b2d",
+      "original_bytes": 23548,
+      "curated_bytes": 23548,
+      "original_copy": "evidence/scope-superseded/retired-api-tests-1115/originals/crates/aisix-proxy/src/guardrail_blocked_telemetry.rs",
+      "action": "unchanged_no_retired_only_scenario",
+      "removed_functions": [],
+      "removed_rows": [],
+      "all_function_names_preserved": true,
+      "all_assertion_and_test_attribute_lines_byte_identical": true,
+      "kept_active": [
+        "Entire guardrail cross-handler tests and /v1/videos shared route fixtures; FT appears only in absent-surface explanatory comment."
+      ]
+    },
+    {
+      "path": "crates/aisix-proxy/src/request_decode_tests.rs",
+      "exists": true,
+      "original_sha256": "52a289b37f664ac289eaac3e3f64a6d431986b2197d8462bb5237a119b882cb0",
+      "curated_sha256": "3db1bfe9408f9ff0fc7af336d75eedba09c41e44914764436892ef498b5d03cf",
+      "original_bytes": 73737,
+      "curated_bytes": 72679,
+      "original_copy": "evidence/scope-superseded/retired-api-tests-1115/originals/crates/aisix-proxy/src/request_decode_tests.rs",
+      "action": "remove_retired_only_rows",
+      "removed_functions": [],
+      "removed_rows": [
+        {
+          "kind": "mixed_table_row",
+          "container": "request_decode_multipart_families_reach_model_resolution",
+          "family": "old_audio_translations",
+          "original_lines": {
+            "start": 509,
+            "end": 509
+          },
+          "original_byte_range": {
+            "start": 18276,
+            "end_exclusive": 18345
+          },
+          "verbatim_utf8": "        (\"/v1/audio/translations\", MULTIPART_PLAIN, MULTIPART_ZSTD),\n",
+          "sha256": "c2cc6d675e7607de48106ad6836d723d919b900b3b4b4946e2b752a6e6d37843"
+        },
+        {
+          "kind": "mixed_table_row",
+          "container": "BODY_AND_IGNORED_SURFACES",
+          "family": "image_variations",
+          "original_lines": {
+            "start": 1304,
+            "end": 1304
+          },
+          "original_byte_range": {
+            "start": 48272,
+            "end_exclusive": 48311
+          },
+          "verbatim_utf8": "    (\"/v1/images/variations\", \"POST\"),\n",
+          "sha256": "e0c4839a8c8b09c74010b3549a005ea38ad82bbfd9c8937c7f10418d0698cd09"
+        },
+        {
+          "kind": "mixed_table_row",
+          "container": "BODY_AND_IGNORED_SURFACES",
+          "family": "old_audio_translations",
+          "original_lines": {
+            "start": 1319,
+            "end": 1319
+          },
+          "original_byte_range": {
+            "start": 48814,
+            "end_exclusive": 48854
+          },
+          "verbatim_utf8": "    (\"/v1/audio/translations\", \"POST\"),\n",
+          "sha256": "4756e472c8cbbae464ac6bb7374ad2f7a478efe7c451ad665a87415137dd289b"
+        },
+        {
+          "kind": "mixed_table_row",
+          "container": "BODY_AND_IGNORED_SURFACES",
+          "family": "fine_tuning",
+          "original_lines": {
+            "start": 1335,
+            "end": 1335
+          },
+          "original_byte_range": {
+            "start": 49462,
+            "end_exclusive": 49499
+          },
+          "verbatim_utf8": "    (\"/v1/fine_tuning/jobs\", \"GET\"),\n",
+          "sha256": "6eebaa8046bb7a6b892674fee7a00c89ab3da48bc67499846756afe09237175e"
+        },
+        {
+          "kind": "mixed_table_row",
+          "container": "BODY_AND_IGNORED_SURFACES",
+          "family": "fine_tuning",
+          "original_lines": {
+            "start": 1336,
+            "end": 1336
+          },
+          "original_byte_range": {
+            "start": 49499,
+            "end_exclusive": 49540
+          },
+          "verbatim_utf8": "    (\"/v1/fine_tuning/jobs/:id\", \"GET\"),\n",
+          "sha256": "3b202f2c8cf858a5038fc9310d1b59752afad2d00cebd18ac6ed5fd7e8fe234e"
+        },
+        {
+          "kind": "mixed_table_row",
+          "container": "BODY_AND_IGNORED_SURFACES",
+          "family": "fine_tuning",
+          "original_lines": {
+            "start": 1337,
+            "end": 1337
+          },
+          "original_byte_range": {
+            "start": 49540,
+            "end_exclusive": 49589
+          },
+          "verbatim_utf8": "    (\"/v1/fine_tuning/jobs/:id/cancel\", \"POST\"),\n",
+          "sha256": "0be8e69f4d8f94737c04d153e2ded2d43fc101ecf92537a5e6c0b233081710b5"
+        },
+        {
+          "kind": "mixed_table_row",
+          "container": "JSON_CASES",
+          "family": "fine_tuning",
+          "original_lines": {
+            "start": 1390,
+            "end": 1390
+          },
+          "original_byte_range": {
+            "start": 60550,
+            "end_exclusive": 61333
+          },
+          "verbatim_utf8": "    JsonCase { path: \"/v1/fine_tuning/jobs\", plain: b\"{\\\"model\\\":\\\"request-decode-absent\\\",\\\"training_file\\\":\\\"aisix-ZmlsZS1zZW50aW5lbDttb2RlbCxyZXF1ZXN0LWRlY29kZS1hYnNlbnQ\\\"}\", encoded: &[0x28,0xb5,0x2f,0xfd,0x20,0x71,0x6d,0x03,0x00,0x12,0x47,0x1a,0x1e,0x50,0x8d,0x1b,0x9c,0x04,0xe5,0x70,0x3f,0x7b,0x48,0x06,0x43,0x13,0x6a,0x63,0xff,0xcf,0xde,0x87,0x80,0x99,0xda,0xfe,0xf4,0x61,0xa3,0xaa,0x2a,0xac,0x01,0x93,0x34,0xfc,0xba,0xf3,0xd2,0x82,0x41,0xca,0x08,0x2c,0x92,0x3f,0xad,0xa0,0x38,0x91,0x32,0x42,0xa4,0x90,0x87,0x60,0xfd,0x59,0x36,0xc6,0xc1,0x3a,0xd3,0x9c,0xc2,0x34,0x8d,0x30,0x48,0xa1,0x4f,0xba,0x1e,0x0d,0xdb,0x65,0x93,0xec,0x9d,0x38,0x28,0xbe,0xbf,0x5d,0x15,0x13,0x90,0xf1,0x19,0xae,0x5b,0xfc,0x28,0x04,0xbf,0x15,0x21,0x3b,0x1a,0x5c,0x65,0x93,0xce,0x8f,0x9a,0x52,0x12,0x00] },\n",
+          "sha256": "5b78e415f89b40e9cd9d102837c8633a6bbbaba8cc7fcaf97bde407da5d97de9"
+        }
+      ],
+      "all_function_names_preserved": true,
+      "all_assertion_and_test_attribute_lines_byte_identical": true,
+      "kept_active": [
+        "All JSON/zstd/multipart transport assertions and test functions unchanged.",
+        "Shared /v1/videos create/poll/content cases retained: they validate transport/error/route census, not OpenAI video provider lifecycle.",
+        "Chat/Messages/Responses/Files/Batches/Uploads/embeddings/rerank/audio transcriptions/speech/images generations/edits/MCP/A2A/OAuth/health/model active sibling fixture rows retained."
+      ]
+    },
+    {
+      "path": "crates/aisix-proxy/src/model_echo.rs",
+      "exists": true,
+      "original_sha256": "97ce16035344b7df568bbfe69e79a61977a40a642af351d131763372f0f98572",
+      "curated_sha256": "97ce16035344b7df568bbfe69e79a61977a40a642af351d131763372f0f98572",
+      "original_bytes": 26091,
+      "curated_bytes": 26091,
+      "original_copy": "evidence/scope-superseded/retired-api-tests-1115/originals/crates/aisix-proxy/src/model_echo.rs",
+      "action": "unchanged_no_retired_only_scenario",
+      "removed_functions": [],
+      "removed_rows": [],
+      "all_function_names_preserved": true,
+      "all_assertion_and_test_attribute_lines_byte_identical": true,
+      "kept_active": [
+        "Entire byte-preserving JSON/SSE/WS model normalizer tests; session.created/session.updated here are live WS frame shapes, not deprecated HTTP realtime/sessions API. FT appears only in module contract comment."
+      ]
+    },
+    {
+      "path": "crates/aisix-proxy/src/reject.rs",
+      "exists": true,
+      "original_sha256": "0aac054ea22092d854e7289e43d6edad54c92dab64012c62cbc2b6a158646bc6",
+      "curated_sha256": "5cd04905d3688488f7dde8c8f9ddb10d5ec949097ab3c138723b169a9b53c83a",
+      "original_bytes": 17424,
+      "curated_bytes": 17280,
+      "original_copy": "evidence/scope-superseded/retired-api-tests-1115/originals/crates/aisix-proxy/src/reject.rs",
+      "action": "remove_retired_only_rows",
+      "removed_functions": [],
+      "removed_rows": [
+        {
+          "kind": "mixed_table_row",
+          "container": "malformed_path_params_answer_the_openai_envelope_across_the_family",
+          "family": "fine_tuning",
+          "original_lines": {
+            "start": 370,
+            "end": 370
+          },
+          "original_byte_range": {
+            "start": 13732,
+            "end_exclusive": 13781
+          },
+          "verbatim_utf8": "            (\"GET\", \"/v1/fine_tuning/jobs/%ff\"),\n",
+          "sha256": "5bca05a3be13d1422a7d711177586c704043ed1ea2674722ebd5e007d42c6a7f"
+        },
+        {
+          "kind": "mixed_table_row",
+          "container": "malformed_path_params_answer_the_openai_envelope_across_the_family",
+          "family": "fine_tuning",
+          "original_lines": {
+            "start": 371,
+            "end": 371
+          },
+          "original_byte_range": {
+            "start": 13781,
+            "end_exclusive": 13838
+          },
+          "verbatim_utf8": "            (\"POST\", \"/v1/fine_tuning/jobs/%ff/cancel\"),\n",
+          "sha256": "39103c987de5a627af082e88cd310662f05ed740a320db86af69c8bd81e48f72"
+        },
+        {
+          "kind": "mixed_table_row",
+          "container": "multipart_content_type_mismatch_answers_the_envelope",
+          "family": "old_audio_translations",
+          "original_lines": {
+            "start": 422,
+            "end": 422
+          },
+          "original_byte_range": {
+            "start": 16069,
+            "end_exclusive": 16107
+          },
+          "verbatim_utf8": "            \"/v1/audio/translations\",\n",
+          "sha256": "bbede03f0cfb380fd8d95449fc7f0d9d68b189c104c994ad7fb84ffd6067df1e"
+        }
+      ],
+      "all_function_names_preserved": true,
+      "all_assertion_and_test_attribute_lines_byte_identical": true,
+      "kept_active": [
+        "All envelope/status/auth-order assertions unchanged.",
+        "Shared video malformed path cases retained; all active sibling malformed-path and multipart checks retained."
+      ]
+    },
+    {
+      "path": "crates/aisix-proxy/tests/metric_label_cardinality.rs",
+      "exists": true,
+      "original_sha256": "d7b0da08f2136c7e615d4d793c55b8710c4f40bca6b2783ba681b8c6db0065e8",
+      "curated_sha256": "2c5fbbcbe98ee9cfd0643ff78d7ead5c8ed4ad69060582b3fbbc6db6a5e0980d",
+      "original_bytes": 10484,
+      "curated_bytes": 10331,
+      "original_copy": "evidence/scope-superseded/retired-api-tests-1115/originals/crates/aisix-proxy/tests/metric_label_cardinality.rs",
+      "action": "remove_retired_only_rows",
+      "removed_functions": [],
+      "removed_rows": [
+        {
+          "kind": "mixed_table_row",
+          "container": "requests_for",
+          "family": "fine_tuning",
+          "original_lines": {
+            "start": 172,
+            "end": 176
+          },
+          "original_byte_range": {
+            "start": 6915,
+            "end_exclusive": 7068
+          },
+          "verbatim_utf8": "        (\n            \"/v1/fine_tuning/jobs\",\n            \"POST\",\n            serde_json::json!({\"model\": model, \"training_file\": \"file-x\"}),\n        ),\n",
+          "sha256": "e168503e0bc62b17a6d05cc5da9c2d580da54f653c2fa89c1130b426d44a65fe"
+        }
+      ],
+      "all_function_names_preserved": true,
+      "all_assertion_and_test_attribute_lines_byte_identical": true,
+      "kept_active": [
+        "All canary/cardinality assertions unchanged for active sibling route fixtures.",
+        "Shared /v1/videos row retained: it drives generic attacker-shaped model failure and bounded label invariants, no successful OpenAI video provider scenario.",
+        "endpoint_label FT arm retained as pure local template normalizer helper; no retired route is driven through it after FT fixture removal."
+      ]
+    }
+  ],
+  "summary": {
+    "inspected_files": 5,
+    "modified_files": 3,
+    "retired_rows_removed": 11,
+    "source_lines_removed": 15,
+    "whole_test_functions_removed": 0,
+    "assertions_changed": 0,
+    "test_attributes_changed": 0,
+    "ignore_or_runtime_filter_added": false
+  },
+  "blockers": [],
+  "not_scope_deleted": [
+    "Shared /v1/videos route tests do not assert OpenAI provider video lifecycle.",
+    "Fine-tuning documentation mentions in model_echo and guardrail_blocked_telemetry.",
+    "Pure model JSON/SSE/WS normalizers, zstd codec/transport units, persisted enum/codecs and shared HTTP units."
+  ],
+  "checks": {
+    "originals_copied_before_edit": true,
+    "all_backups_equal_original_bytes": true,
+    "changes_are_only_exact_recorded_row_deletions": true,
+    "all_function_names_preserved": true,
+    "all_assertion_and_test_attribute_lines_byte_identical": true,
+    "Cargo_or_tests_run": false,
+    "services_run": false,
+    "git_index_touched": false,
+    "committed": false
+  },
+  "limits": [
+    "No build/test/Cargo run by explicit root ownership instruction.",
+    "Active route census completeness beyond removal of retired table entries is unchanged and not asserted as passing.",
+    "No product code or expected assertion values modified; actual runtime failures remain for ROOT execution."
+  ]
+}

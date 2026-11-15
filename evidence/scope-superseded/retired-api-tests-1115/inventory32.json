@@ -1,0 +1,232 @@
+{
+  "schema": "retired-api-tests-1115/inventory32/v1",
+  "base_commit": "4b6cb5142d5e8eaa6cfeee1ee8d04706f29763f0",
+  "file_count": 32,
+  "note": "32 is affected file count, not the number of tests. Fourteen mixed TypeScript files are preserved; no claim that their separate Vitest suite was curated or passed.",
+  "partition": [
+    {
+      "file": "crates/aisix-proxy/src/audio.rs",
+      "action": "curated_retired_only_functions_or_matrix_rows_active_assertions_retained",
+      "current_exists": true,
+      "current_sha256": "cbfb5d8b10e2a7bb835cb3e69882d53bbd9020f3be310983b0da13935ac22db2",
+      "base_sha256": "2a313a34ade463f4bc5d3765f0695de7cb5290d1510f35c8cdeafeb705f650be"
+    },
+    {
+      "file": "crates/aisix-proxy/src/dispatch.rs",
+      "action": "retained_active_or_shared_unit_codec_or_already_curated_by_base",
+      "current_exists": true,
+      "current_sha256": "580004c0b8ab998a356b123f5ce489ea1b20d03237e81c5a21de4ae9a4b5a9e8",
+      "base_sha256": "580004c0b8ab998a356b123f5ce489ea1b20d03237e81c5a21de4ae9a4b5a9e8"
+    },
+    {
+      "file": "crates/aisix-proxy/src/endpoint_acl.rs",
+      "action": "retained_active_or_shared_unit_codec_or_already_curated_by_base",
+      "current_exists": true,
+      "current_sha256": "f208387faa2639a7457ad4ac5f0fb0c5313ce9bf2ce26434b30bb476c8711435",
+      "base_sha256": "f208387faa2639a7457ad4ac5f0fb0c5313ce9bf2ce26434b30bb476c8711435"
+    },
+    {
+      "file": "crates/aisix-proxy/src/guardrail_blocked_telemetry.rs",
+      "action": "retained_active_or_shared_unit_codec_or_already_curated_by_base",
+      "current_exists": true,
+      "current_sha256": "24ac5c69ed27847dc9ee8be41f17d5b8dacf9136ccb3f01cc26378ad32e58b2d",
+      "base_sha256": "24ac5c69ed27847dc9ee8be41f17d5b8dacf9136ccb3f01cc26378ad32e58b2d"
+    },
+    {
+      "file": "crates/aisix-proxy/src/guardrail_coverage.rs",
+      "action": "retained_active_or_shared_unit_codec_or_already_curated_by_base",
+      "current_exists": true,
+      "current_sha256": "7f11663e0ddcddd81a6c35bda1d83359b87819b572f45010b7c1f0e79e7eed4d",
+      "base_sha256": "7f11663e0ddcddd81a6c35bda1d83359b87819b572f45010b7c1f0e79e7eed4d"
+    },
+    {
+      "file": "crates/aisix-proxy/src/jobs.rs",
+      "action": "curated_retired_only_functions_or_matrix_rows_active_assertions_retained",
+      "current_exists": true,
+      "current_sha256": "8188def700bd9cc81ddf5117ddfa5c241699318ed720be6eb3aa88d5f8a4edb6",
+      "base_sha256": "872906af56d763a482bd022091f56468ee106b86c76b7925de1f3d5954efae7a"
+    },
+    {
+      "file": "crates/aisix-proxy/src/jobs_compat_tests.rs",
+      "action": "curated_retired_only_functions_or_matrix_rows_active_assertions_retained",
+      "current_exists": true,
+      "current_sha256": "4d69185cce23eb39edf2dcb000defda6a9aa4212a13e5b271ebe161add922492",
+      "base_sha256": "302450e8129de0786abd42733c1db17623675e82171b32531835aee46eff15e2"
+    },
+    {
+      "file": "crates/aisix-proxy/src/lib.rs",
+      "action": "retained_active_or_shared_unit_codec_or_already_curated_by_base",
+      "current_exists": true,
+      "current_sha256": "448b15526246bbb88f0bd64e1fad3070ad8bd2a79e4e70348da90862ea8fc4f6",
+      "base_sha256": "448b15526246bbb88f0bd64e1fad3070ad8bd2a79e4e70348da90862ea8fc4f6"
+    },
+    {
+      "file": "crates/aisix-proxy/src/model_echo.rs",
+      "action": "retained_active_or_shared_unit_codec_or_already_curated_by_base",
+      "current_exists": true,
+      "current_sha256": "97ce16035344b7df568bbfe69e79a61977a40a642af351d131763372f0f98572",
+      "base_sha256": "97ce16035344b7df568bbfe69e79a61977a40a642af351d131763372f0f98572"
+    },
+    {
+      "file": "crates/aisix-proxy/src/native_api/openai.rs",
+      "action": "retained_active_or_shared_unit_codec_or_already_curated_by_base",
+      "current_exists": true,
+      "current_sha256": "69dcd99d47f7df1d1f91abd60554693dc12b0f5fcb7cf4534e84a8c882b88b50",
+      "base_sha256": "69dcd99d47f7df1d1f91abd60554693dc12b0f5fcb7cf4534e84a8c882b88b50"
+    },
+    {
+      "file": "crates/aisix-proxy/src/native_api/openai_evals.rs",
+      "action": "moved_retired_only_source_out_of_cargo_auto_discovery",
+      "current_exists": false,
+      "current_sha256": null,
+      "base_sha256": "2a78ec76bcdbc3d9eed252fdae3dea87f10b9b0764bf276f54df1e9856bad6ed"
+    },
+    {
+      "file": "crates/aisix-proxy/src/operation.rs",
+      "action": "retained_active_or_shared_unit_codec_or_already_curated_by_base",
+      "current_exists": true,
+      "current_sha256": "d28a51cda1896245f3a1c02efb1dfb41a6bce3eee5018829867d8398b28ecb41",
+      "base_sha256": "d28a51cda1896245f3a1c02efb1dfb41a6bce3eee5018829867d8398b28ecb41"
+    },
+    {
+      "file": "crates/aisix-proxy/src/reject.rs",
+      "action": "curated_retired_only_functions_or_matrix_rows_active_assertions_retained",
+      "current_exists": true,
+      "current_sha256": "15ece605789ed79a9cffbbdfedebe667d3bbbf3c920af185f75f07ec8119fd6e",
+      "base_sha256": "0aac054ea22092d854e7289e43d6edad54c92dab64012c62cbc2b6a158646bc6"
+    },
+    {
+      "file": "crates/aisix-proxy/src/request_decode_tests.rs",
+      "action": "curated_retired_only_functions_or_matrix_rows_active_assertions_retained",
+      "current_exists": true,
+      "current_sha256": "198c8e90854fc9b50de479b65b8fea76e2d8945375124d57011ebe0b05ddc90f",
+      "base_sha256": "52a289b37f664ac289eaac3e3f64a6d431986b2197d8462bb5237a119b882cb0"
+    },
+    {
+      "file": "crates/aisix-proxy/src/request_metrics.rs",
+      "action": "curated_retired_only_functions_or_matrix_rows_active_assertions_retained",
+      "current_exists": true,
+      "current_sha256": "277e9521af5cd06a7ca8861278ceea33bc9b47e374e417a006033e17b19b6c2e",
+      "base_sha256": "d0a4ac5d21ff29fd9ebfd8cedf884ea382850f392d224f5d9af5d43e3415ea05"
+    },
+    {
+      "file": "crates/aisix-proxy/tests/metric_label_cardinality.rs",
+      "action": "curated_retired_only_functions_or_matrix_rows_active_assertions_retained",
+      "current_exists": true,
+      "current_sha256": "2c5fbbcbe98ee9cfd0643ff78d7ead5c8ed4ad69060582b3fbbc6db6a5e0980d",
+      "base_sha256": "d7b0da08f2136c7e615d4d793c55b8710c4f40bca6b2783ba681b8c6db0065e8"
+    },
+    {
+      "file": "crates/aisix-proxy/tests/native_openai_evals.rs",
+      "action": "moved_retired_only_source_out_of_cargo_auto_discovery",
+      "current_exists": false,
+      "current_sha256": null,
+      "base_sha256": "e0b3eb677b20dd83758e2013d955c8f34dc1a35a2f4afd68bcb707605a20ddbb"
+    },
+    {
+      "file": "crates/aisix-proxy/tests/native_openai_stateless.rs",
+      "action": "curated_retired_only_functions_or_matrix_rows_active_assertions_retained",
+      "current_exists": true,
+      "current_sha256": "5d939c0fa809061a8d8fcf78bb2a9370c29148f8ee6edac8b6621b7bc982483f",
+      "base_sha256": "f92e5082970745f43ce29897d64fe72cfc89a8cae318fe8a5eadc2827dd21f8a"
+    },
+    {
+      "file": "tests/e2e/src/cases/batch-files-finetuning-e2e.test.ts",
+      "action": "deferred_mixed_TS_vitest_scope_split_no_file_archived",
+      "current_exists": true,
+      "current_sha256": "de7b1e9ac12dbda97e0a64b23e01a30584d157f3e330e845d188be21dec20841",
+      "base_sha256": "de7b1e9ac12dbda97e0a64b23e01a30584d157f3e330e845d188be21dec20841"
+    },
+    {
+      "file": "tests/e2e/src/cases/failure-row-refused-body-e2e.test.ts",
+      "action": "deferred_mixed_TS_vitest_scope_split_no_file_archived",
+      "current_exists": true,
+      "current_sha256": "04bdc874d3b6d18772cbc4f2248c46d1c76a9d2ba48db8bc433d55e6fc4424a4",
+      "base_sha256": "04bdc874d3b6d18772cbc4f2248c46d1c76a9d2ba48db8bc433d55e6fc4424a4"
+    },
+    {
+      "file": "tests/e2e/src/cases/guardrail-remote-refusal-ratelimit-e2e.test.ts",
+      "action": "deferred_mixed_TS_vitest_scope_split_no_file_archived",
+      "current_exists": true,
+      "current_sha256": "8e45942fd200cd61bda3701fe605320bb5f8ad437460f81b40d97a0ace938253",
+      "base_sha256": "8e45942fd200cd61bda3701fe605320bb5f8ad437460f81b40d97a0ace938253"
+    },
+    {
+      "file": "tests/e2e/src/cases/jobs-owner-scope-e2e.test.ts",
+      "action": "deferred_mixed_TS_vitest_scope_split_no_file_archived",
+      "current_exists": true,
+      "current_sha256": "9dd3a4dff79b2ae2aad3ddc292fdd120a1ffec7df329f7d3e617747f74d2ad75",
+      "base_sha256": "9dd3a4dff79b2ae2aad3ddc292fdd120a1ffec7df329f7d3e617747f74d2ad75"
+    },
+    {
+      "file": "tests/e2e/src/cases/metric-endpoint-parity-e2e.test.ts",
+      "action": "deferred_mixed_TS_vitest_scope_split_no_file_archived",
+      "current_exists": true,
+      "current_sha256": "dee40bd78188cff3f2914c8b49c511a79a2828ef50e2ae63ec72425c706f2993",
+      "base_sha256": "dee40bd78188cff3f2914c8b49c511a79a2828ef50e2ae63ec72425c706f2993"
+    },
+    {
+      "file": "tests/e2e/src/cases/model-group-single-shot-endpoints-e2e.test.ts",
+      "action": "deferred_mixed_TS_vitest_scope_split_no_file_archived",
+      "current_exists": true,
+      "current_sha256": "8313e0dab66b58e77baddd7854451d6a4a7135006bdc9f9bebd02a628e8a6720",
+      "base_sha256": "8313e0dab66b58e77baddd7854451d6a4a7135006bdc9f9bebd02a628e8a6720"
+    },
+    {
+      "file": "tests/e2e/src/cases/non-utf8-prompt-reject-e2e.test.ts",
+      "action": "deferred_mixed_TS_vitest_scope_split_no_file_archived",
+      "current_exists": true,
+      "current_sha256": "5178ba62b8a0bcc61a475af803bbfdd8c6653e4720ffc1a8e287dd153282738a",
+      "base_sha256": "5178ba62b8a0bcc61a475af803bbfdd8c6653e4720ffc1a8e287dd153282738a"
+    },
+    {
+      "file": "tests/e2e/src/cases/path-param-reject-e2e.test.ts",
+      "action": "deferred_mixed_TS_vitest_scope_split_no_file_archived",
+      "current_exists": true,
+      "current_sha256": "9728875845dd57b8284fee06bbfd406fe80e1041cf84e9a9a173beb334b7a731",
+      "base_sha256": "9728875845dd57b8284fee06bbfd406fe80e1041cf84e9a9a173beb334b7a731"
+    },
+    {
+      "file": "tests/e2e/src/cases/retried-attempt-usage-1136-e2e.test.ts",
+      "action": "deferred_mixed_TS_vitest_scope_split_no_file_archived",
+      "current_exists": true,
+      "current_sha256": "83a4dfdf35a21f55bd5af83e9885d0d21a2f9707283fc0c8f15a343309e6cd74",
+      "base_sha256": "83a4dfdf35a21f55bd5af83e9885d0d21a2f9707283fc0c8f15a343309e6cd74"
+    },
+    {
+      "file": "tests/e2e/src/cases/upstream-error-body-stall-e2e.test.ts",
+      "action": "deferred_mixed_TS_vitest_scope_split_no_file_archived",
+      "current_exists": true,
+      "current_sha256": "84159f1ffc7578568d7a15c48aa26c5b5e3e0e94d3d59515f8d8cece62128fff",
+      "base_sha256": "84159f1ffc7578568d7a15c48aa26c5b5e3e0e94d3d59515f8d8cece62128fff"
+    },
+    {
+      "file": "tests/e2e/src/cases/upstream-error-text-family-e2e.test.ts",
+      "action": "deferred_mixed_TS_vitest_scope_split_no_file_archived",
+      "current_exists": true,
+      "current_sha256": "f8cf8ae6db0d950b9dd6c7c977a68a022709de251702a88e1f003a905b50ab1b",
+      "base_sha256": "f8cf8ae6db0d950b9dd6c7c977a68a022709de251702a88e1f003a905b50ab1b"
+    },
+    {
+      "file": "tests/e2e/src/cases/upstream-request-id-on-errors-e2e.test.ts",
+      "action": "deferred_mixed_TS_vitest_scope_split_no_file_archived",
+      "current_exists": true,
+      "current_sha256": "d6a22043d059f2cebe48644ca2d71d4205f653285ce0c108c94c5d4bf757b44a",
+      "base_sha256": "d6a22043d059f2cebe48644ca2d71d4205f653285ce0c108c94c5d4bf757b44a"
+    },
+    {
+      "file": "tests/e2e/src/cases/usage-operation-e2e.test.ts",
+      "action": "deferred_mixed_TS_vitest_scope_split_no_file_archived",
+      "current_exists": true,
+      "current_sha256": "31d77cd1fde1956185653e4dcd2a506837e21888ead288b365b5d993615cb87b",
+      "base_sha256": "31d77cd1fde1956185653e4dcd2a506837e21888ead288b365b5d993615cb87b"
+    },
+    {
+      "file": "tests/e2e/src/cases/wildcard-metric-label-family-e2e.test.ts",
+      "action": "deferred_mixed_TS_vitest_scope_split_no_file_archived",
+      "current_exists": true,
+      "current_sha256": "b16cc378bffbfa0cc58caf9506beee049422a7ffe458794b915b87a0a7089093",
+      "base_sha256": "b16cc378bffbfa0cc58caf9506beee049422a7ffe458794b915b87a0a7089093"
+    }
+  ]
+}

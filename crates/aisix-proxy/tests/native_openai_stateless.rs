@@ -25,10 +25,9 @@ const MODEL: &str = "11111111-1111-4111-8111-111111111111";
 const PROVIDER: &str = "22222222-2222-4222-8222-222222222222";
 const KEY: &str = "33333333-3333-4333-8333-333333333333";
 const BODY_MODEL: &str = "44444444-4444-4444-8444-444444444444";
-const ENDPOINTS: [(&str, &str); 3] = [
+const ENDPOINTS: [(&str, &str); 2] = [
     ("/v1/moderations", "moderations"),
     ("/v1/content_provenance_checks", "content_provenance_checks"),
-    ("/v1/images/variations", "images"),
 ];
 
 fn configured_app(
@@ -195,24 +194,6 @@ async fn provenance_preserves_multipart_bytes_filename_query_and_native_result()
         .windows(b"PNG\x00\xffsecret-looking-sk-test".len())
         .any(|w| w == b"PNG\x00\xffsecret-looking-sk-test"));
     assert!(String::from_utf8_lossy(&requests[0].body).contains("filename=\"image.png\""));
-}
-#[tokio::test]
-async fn variations_is_a_native_legacy_relay_and_preserves_upstream_rejection() {
-    let upstream = MockServer::builder().start().await;
-    Mock::given(method("POST")).and(path("/v1/images/variations")).respond_with(ResponseTemplate::new(400).set_body_json(json!({"error":{"message":"legacy image variations is unavailable","type":"invalid_request_error","code":"model_not_found"}}))).expect(1).mount(&upstream).await;
-    let body="--n\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nnative-model\r\n--n\r\nContent-Disposition: form-data; name=\"image\"; filename=\"image.png\"\r\nContent-Type: image/png\r\n\r\nPNG\r\n--n--\r\n";
-    let req = Request::builder()
-        .method("POST")
-        .uri("/v1/images/variations")
-        .header("authorization", "Bearer caller")
-        .header("content-type", "multipart/form-data; boundary=n")
-        .body(Body::from(body))
-        .unwrap();
-    let response = app(&upstream.uri()).oneshot(req).await.unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let value = response_json(response).await;
-    assert_eq!(value["error"]["code"], "model_not_found");
-    assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
 }
 
 fn edit_key(snapshot: &AisixSnapshot, edit: impl FnOnce(&mut ApiKey)) {
@@ -1212,7 +1193,7 @@ fn conflicting_model_request(endpoint: &str, query_hint: bool) -> Request<Body> 
 
 #[tokio::test]
 async fn explicit_stateless_body_model_controls_access_mapping_quota_and_billing_audit() {
-    for endpoint in ["/v1/moderations", "/v1/images/variations"] {
+    for endpoint in ["/v1/moderations"] {
         for query_hint in [false, true] {
             let upstream = MockServer::builder().start().await;
             let mut answer = native_answer(endpoint);
@@ -1311,7 +1292,7 @@ async fn explicit_stateless_body_model_controls_access_mapping_quota_and_billing
 
 #[tokio::test]
 async fn explicit_stateless_body_model_selects_its_own_guardrail_over_conflicting_hints() {
-    for endpoint in ["/v1/moderations", "/v1/images/variations"] {
+    for endpoint in ["/v1/moderations"] {
         for query_hint in [false, true] {
             let upstream = MockServer::builder().start().await;
             mount_native_answer(&upstream, endpoint, native_answer(endpoint)).await;

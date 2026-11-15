@@ -1,0 +1,118 @@
+{
+  "schema": "retired-api-tests-1115/h1-curation/v1",
+  "base_commit": "4b6cb5142d5e8eaa6cfeee1ee8d04706f29763f0",
+  "files": [
+    {
+      "path": "crates/aisix-proxy/src/jobs.rs",
+      "original_sha256": "872906af56d763a482bd022091f56468ee106b86c76b7925de1f3d5954efae7a",
+      "curated_sha256": "8188def700bd9cc81ddf5117ddfa5c241699318ed720be6eb3aa88d5f8a4edb6",
+      "original_copy": "evidence/scope-superseded/retired-api-tests-1115/originals/crates/aisix-proxy/src/jobs.rs",
+      "removed_ranges": [
+        {
+          "start": 5385,
+          "end": 5385,
+          "reason": "orphan FT-only b_file fixture",
+          "sha256": "e5950144d139dec6b6d14ce9a7a98d91978854b82b2532802a4077e443143f63"
+        },
+        {
+          "start": 5391,
+          "end": 5398,
+          "reason": "FT tuple rows, first two",
+          "sha256": "e9d018181e6cc4446a0dde812528dd862a6cbd01739d56d045b48a610a8fd04d"
+        },
+        {
+          "start": 5404,
+          "end": 5411,
+          "reason": "FT tuple rows, last two",
+          "sha256": "9606f2825eacc601496e9ffeba9a7fd5acd619629ab8c56ef060ca7f664e4d61"
+        },
+        {
+          "start": 6990,
+          "end": 7048,
+          "reason": "FT-only test and its section comment",
+          "sha256": "8acb9f2aacb94c5f0ecd6fb07cb15f42cf0184608c6477444b52b3b1224ad648"
+        },
+        {
+          "start": 8052,
+          "end": 8087,
+          "reason": "FT-only test and attached documentation",
+          "sha256": "1666a60ec46bc018969f7105a79958f31091eb8da8762de73b8ea2e28ccaf3ea"
+        }
+      ],
+      "literal_replacements": [
+        {
+          "old": "for uri in [\"/v1/files\", \"/v1/batches\", \"/v1/fine_tuning/jobs\"] {",
+          "new": "for uri in [\"/v1/files\", \"/v1/batches\"] {",
+          "occurrences": 1
+        }
+      ],
+      "assertion_expected_values_changed": false
+    },
+    {
+      "path": "crates/aisix-proxy/tests/native_openai_stateless.rs",
+      "original_sha256": "f92e5082970745f43ce29897d64fe72cfc89a8cae318fe8a5eadc2827dd21f8a",
+      "curated_sha256": "5d939c0fa809061a8d8fcf78bb2a9370c29148f8ee6edac8b6621b7bc982483f",
+      "original_copy": "evidence/scope-superseded/retired-api-tests-1115/originals/crates/aisix-proxy/tests/native_openai_stateless.rs",
+      "removed_ranges": [
+        {
+          "start": 31,
+          "end": 31,
+          "reason": "retired image variations ENDPOINTS tuple",
+          "sha256": "a66fc15466a79bea5b8d3c451b906928c6c63209c16e68f241f340c6800d7a6c"
+        },
+        {
+          "start": 199,
+          "end": 216,
+          "reason": "retired variation-only test",
+          "sha256": "dbcb3474041f483ee4429604d3b69620758f23dc16330369fdf1460d135a7eb1"
+        }
+      ],
+      "literal_replacements": [
+        {
+          "old": "const ENDPOINTS: [(&str, &str); 3]",
+          "new": "const ENDPOINTS: [(&str, &str); 2]",
+          "occurrences": 1
+        },
+        {
+          "old": "for endpoint in [\"/v1/moderations\", \"/v1/images/variations\"] {",
+          "new": "for endpoint in [\"/v1/moderations\"] {",
+          "occurrences": 2
+        }
+      ],
+      "assertion_expected_values_changed": false
+    },
+    {
+      "path": "crates/aisix-proxy/tests/native_openai_evals.rs",
+      "action": "reversible_move_retired_only_source",
+      "archive": "evidence/scope-superseded/retired-api-tests-1115/retired-source/crates/aisix-proxy/tests/native_openai_evals.rs",
+      "sha256": "e0b3eb677b20dd83758e2013d955c8f34dc1a35a2f4afd68bcb707605a20ddbb",
+      "bytes": 38845
+    },
+    {
+      "path": "crates/aisix-proxy/src/native_api/openai_eval_worker.rs",
+      "action": "reversible_move_retired_only_source",
+      "archive": "evidence/scope-superseded/retired-api-tests-1115/retired-source/crates/aisix-proxy/src/native_api/openai_eval_worker.rs",
+      "sha256": "3b6326f9b069c5afcba88e5d3352c25147e581790ecc79ce507f65e3529d54af",
+      "bytes": 12370
+    },
+    {
+      "path": "crates/aisix-proxy/src/native_api/openai_evals.rs",
+      "action": "reversible_move_retired_only_source",
+      "archive": "evidence/scope-superseded/retired-api-tests-1115/retired-source/crates/aisix-proxy/src/native_api/openai_evals.rs",
+      "sha256": "2a78ec76bcdbc3d9eed252fdae3dea87f10b9b0764bf276f54df1e9856bad6ed",
+      "bytes": 35842
+    },
+    {
+      "path": "crates/aisix-proxy/src/native_api/mod.rs",
+      "original_copy": "evidence/scope-superseded/retired-api-tests-1115/originals/crates/aisix-proxy/src/native_api/mod.rs",
+      "original_sha256": "cf32ac27644ad99c4da170399c356cb08fb749a60db8fed1276eb2270050b165",
+      "curated_sha256": "5414af28938c0e0ebf1411fa94ab5d2a54b11b843a5674fc8a00e92927810a7a",
+      "removed_declarations": [
+        "pub mod openai_eval_worker;",
+        "pub(crate) mod openai_evals;"
+      ],
+      "shared_modules_retained": true
+    }
+  ],
+  "test_execution": "Not run; root is sole Cargo runner."
+}
