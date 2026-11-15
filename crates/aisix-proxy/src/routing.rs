@@ -1273,15 +1273,18 @@ impl RoutingRegistry {
             .map(|t| i64::from(t.weight_or_default().max(1)))
             .collect();
         let total: i64 = weights.iter().sum();
-        let entry = self
-            .wrr
-            .entry((virtual_name.to_string(), priority))
-            .or_insert_with(|| {
-                Mutex::new(WrrState {
-                    fingerprint: config_fingerprint,
-                    rotations: std::collections::HashMap::new(),
+        let key = (virtual_name.to_string(), priority);
+        let entry = self.wrr.get(&key).unwrap_or_else(|| {
+            self.wrr
+                .entry(key)
+                .or_insert_with(|| {
+                    Mutex::new(WrrState {
+                        fingerprint: config_fingerprint,
+                        rotations: std::collections::HashMap::new(),
+                    })
                 })
-            });
+                .downgrade()
+        });
         #[cfg(test)]
         performance_regression_tests::pause_wrr_after_lookup();
         let mut state = entry
