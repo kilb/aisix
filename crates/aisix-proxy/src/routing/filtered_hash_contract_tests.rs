@@ -414,7 +414,7 @@ fn configured_hash_ring_storage_stays_bounded_by_declarations() {
 
 #[test]
 fn small_filtered_hash_successor_queries_allocate_only_the_returned_order() {
-    // 把每次请求的声明映射或 successor scratch 改成 Vec，会超过实际分配计数上限。
+    // 把 successor scratch 改成 Vec，会超过实际分配计数上限。
     let declarations: Vec<_> = (0..16)
         .map(|index| RoutingTarget::new(format!("alloc-{index}")))
         .collect();
@@ -426,5 +426,69 @@ fn small_filtered_hash_successor_queries_allocate_only_the_returned_order() {
         let allocations = scope.finish();
         assert_eq!(order.len(), count);
         assert_eq!(allocations.calls, 1, "count={count}: {allocations:?}");
+    }
+}
+
+#[test]
+fn small_warm_hash_pickers_add_no_id_name_or_mapping_scratch_allocations() {
+    // ID 名称 clone、声明映射 Vec 或 successor Vec 都会超过名称引用的实际分配预算。
+    // 规范化 survivors 在计数范围外构造，范围只覆盖环查找、配置声明匹配和查询。
+    for count in [1usize, 2, 8] {
+        let snapshot = AisixSnapshot::new();
+        let names: Vec<_> = (0..count * 2)
+            .map(|index| {
+                let name = format!("picker-{index}");
+                put(&snapshot, &format!("picker-id-{index}"), &name);
+                RoutingTarget::new(name)
+            })
+            .collect();
+        let ids: Vec<_> = (0..count * 2)
+            .map(|index| RoutingTarget::by_id(format!("picker-id-{index}")))
+            .collect();
+        let available: Vec<_> = names.iter().step_by(2).cloned().collect();
+        let named_model = group(names, None);
+        let id_model = group(ids, None);
+        let registry = RoutingRegistry::new();
+        let mut expected = Vec::new();
+        let mut reference_calls = None;
+        for (label, model) in [("names", named_model), ("ids", id_model)] {
+            let routing = model.routing.as_ref().unwrap();
+            let warm = registry.pick_configured_hash_indices(
+                &snapshot,
+                label,
+                routing,
+                &available,
+                "allocator-key",
+            );
+            if label == "names" {
+                expected = warm;
+            } else {
+                assert_eq!(warm, expected);
+            }
+            let scope = AllocationScope::start();
+            let actual = registry.pick_configured_hash_indices(
+                &snapshot,
+                label,
+                routing,
+                &available,
+                "allocator-key",
+            );
+            let allocated = scope.finish();
+            assert_eq!(actual, expected);
+            assert_eq!(actual.len(), count);
+            let budget = if count == 1 { 1 } else { 5 };
+            assert!(
+                allocated.calls <= budget,
+                "count={count} label={label} budget={budget}: {allocated:?}"
+            );
+            if let Some(calls) = reference_calls {
+                assert_eq!(
+                    allocated.calls, calls,
+                    "count={count}: ID added allocations"
+                );
+            } else {
+                reference_calls = Some(allocated.calls);
+            }
+        }
     }
 }
