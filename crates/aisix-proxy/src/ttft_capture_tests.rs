@@ -1032,3 +1032,184 @@ async fn parsed_ping_native_messages_precedes_delayed_message_start() {
         parsed_event_before_message_start("/v1/messages", true, prefetch).await;
     }
 }
+
+// 删除 Vertex 解析成功后的 note_parsed_frame，error-only 和早 ping 两组都必须变红。
+async fn parsed_vertex_event_before_message_start(
+    endpoint: &str,
+    ping_first: bool,
+    prefetch: bool,
+) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_upstream = calls.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let upstream = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().fallback(
+                move |uri: axum::http::Uri,
+                      headers: axum::http::HeaderMap,
+                      axum::Json(body): axum::Json<serde_json::Value>| {
+                    let calls = calls_upstream.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::Relaxed);
+                        assert!(uri.path().ends_with(":streamRawPredict"), "{uri}");
+                        assert!(uri.path().contains("/publishers/anthropic/models/"));
+                        assert_eq!(headers["authorization"], "Bearer local-test-token");
+                        assert_eq!(body["stream"], true, "{body}");
+                        let bytes = async_stream::stream! {
+                            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+                            if ping_first {
+                                yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+                                    b"event: ping\ndata: {\"type\":\"ping\"}\n\n",
+                                ));
+                                tokio::time::sleep(BODY_DELAY).await;
+                                yield Ok(bytes::Bytes::from_static(
+                                    b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_vertex_after_ping\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-5-haiku@20241022\",\"stop_reason\":null,\"usage\":{\"input_tokens\":13,\"output_tokens\":0}}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"vertex-answer-after-ping\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":5}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+                                ));
+                            } else {
+                                yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+                                    b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"the upstream is temporarily overloaded\"}}\n\n",
+                                ));
+                            }
+                        };
+                        axum::http::Response::builder()
+                            .header("content-type", "text/event-stream")
+                            .body(Body::from_stream(bytes))
+                            .unwrap()
+                    }
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    });
+    let snapshot = AisixSnapshot::new();
+    snapshot.provider_keys.insert(ResourceEntry::new(
+        "pk-vertex-parsed",
+        serde_json::from_value::<aisix_core::ProviderKey>(serde_json::json!({
+            "display_name":"vertex-parsed", "provider":"google", "adapter":"vertex",
+            "api_base":format!("http://{address}"),
+            "secret":serde_json::json!({"access_token":"local-test-token",
+                "project":"local-test-project","region":"us-east5"}).to_string()
+        }))
+        .unwrap(),
+        1,
+    ));
+    snapshot.models.insert(ResourceEntry::new(
+        "model-vertex-parsed",
+        serde_json::from_value::<Model>(serde_json::json!({
+            "display_name":"vertex-parsed", "provider":"google",
+            "model_name":"claude-3-5-haiku@20241022", "provider_key_id":"pk-vertex-parsed",
+            "stream_timeout":prefetch.then_some(5_000), "retries":0
+        }))
+        .unwrap(),
+        1,
+    ));
+    snapshot
+        .apikeys
+        .insert(apikey_entry("sk-caller", &["vertex-parsed"]));
+    let hub = Arc::new(Hub::new());
+    hub.register_family(
+        aisix_core::Adapter::Vertex,
+        Arc::new(aisix_provider_vertex::VertexBridge::with_client(
+            aisix_gateway::client_builder().no_proxy().build().unwrap(),
+        )),
+    );
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let state = build_state(snapshot, hub).with_usage_sink(aisix_obs::UsageSink::new(tx));
+    let metrics = state.metrics.clone();
+    let gateway_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gateway_address = gateway_listener.local_addr().unwrap();
+    let gateway = tokio::spawn(async move {
+        axum::serve(gateway_listener, build_router(state))
+            .await
+            .unwrap();
+    });
+    let body = if endpoint == "/v1/responses" {
+        serde_json::json!({
+            "model":"vertex-parsed", "input":"hi", "stream":true, "max_output_tokens":16
+        })
+    } else {
+        serde_json::json!({
+            "model":"vertex-parsed", "messages":[{"role":"user","content":"hi"}],
+            "max_tokens":16, "stream":true
+        })
+    };
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .post(format!("http://{gateway_address}{endpoint}"))
+        .bearer_auth("sk-caller")
+        .timeout(std::time::Duration::from_secs(10))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    if ping_first {
+        assert_eq!(response.status(), StatusCode::OK);
+    } else if prefetch {
+        assert!(response.status().is_server_error());
+    }
+    let delivered = response.text().await.unwrap();
+    let event = next_event(&mut rx).await;
+    gateway.abort();
+    upstream.abort();
+    assert_eq!(calls.load(Ordering::Relaxed), 1, "不能重派已经回答的流");
+    assert!(event.is_final_attempt);
+    assert!(rx.try_recv().is_err(), "一次请求只能结算一次");
+    if ping_first {
+        assert_eq!(event.status_code, 200);
+        assert!(
+            delivered.contains("vertex-answer-after-ping"),
+            "{delivered}"
+        );
+        assert_eq!((event.prompt_tokens, event.completion_tokens), (13, 5));
+        assert!(event
+            .first_token_latency_ms
+            .is_some_and(|value| value >= 1_200));
+        assert!(event.upstream_latency_ms >= 1_200);
+    } else {
+        assert!(event.status_code >= 500, "{event:?}");
+        assert!(delivered.contains("overloaded"), "{delivered}");
+        assert_eq!((event.prompt_tokens, event.completion_tokens), (0, 0));
+        assert!(event.first_token_latency_ms.is_none());
+    }
+    assert!(
+        event.upstream_ttft_ms > 0 && event.upstream_ttft_ms < 600,
+        "{endpoint}, ping={ping_first}, prefetch={prefetch}: Vertex 首个已解析事件应当立即停表：{}ms",
+        event.upstream_ttft_ms
+    );
+    let rendered = metrics.render();
+    let counts: Vec<_> = rendered
+        .lines()
+        .filter(|line| {
+            line.starts_with("aisix_request_ttft_seconds_count{")
+                && line.contains(&format!("endpoint=\"{endpoint}\""))
+                && line.contains("side=\"upstream\"")
+        })
+        .collect();
+    assert_eq!(counts.len(), 1, "{rendered}");
+    assert_eq!(counts[0].rsplit_once(' ').unwrap().1, "1", "{rendered}");
+}
+
+#[tokio::test]
+async fn parsed_vertex_error_only_retains_the_first_frame() {
+    for endpoint in ["/v1/chat/completions", "/v1/responses"] {
+        for prefetch in [false, true] {
+            parsed_vertex_event_before_message_start(endpoint, false, prefetch).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn parsed_vertex_ping_precedes_delayed_message_start() {
+    for endpoint in ["/v1/chat/completions", "/v1/responses"] {
+        for prefetch in [false, true] {
+            parsed_vertex_event_before_message_start(endpoint, true, prefetch).await;
+        }
+    }
+}
