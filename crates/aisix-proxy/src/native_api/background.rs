@@ -305,13 +305,22 @@ fn terminal_status(response: &Value) -> Option<&str> {
     }
 }
 
+fn response_completed_at(response: &Value) -> Option<DateTime<Utc>> {
+    // 完成时间是 Unix 秒数，可含小数；复用终态 JSON，不以创建时间代替。
+    // https://developers.openai.com/api/reference/resources/responses/methods/retrieve.md
+    let seconds = response.get("completed_at")?.as_f64()?;
+    let whole_seconds = seconds.floor();
+    DateTime::from_timestamp(
+        whole_seconds as i64,
+        ((seconds - whole_seconds) * 1_000_000_000.0) as u32,
+    )
+}
+
 fn terminal_observation(
     record: &NativeRecord,
     response: &Value,
     observed_at: DateTime<Utc>,
 ) -> Option<CompleteRequest> {
-    // 终态观察接收有类型的时间；UsageEvent 的字符串时间由控制面统一格式化。
-    let occurred_at = observed_at;
     if record.protocol != Some(NativeProtocol::Openai)
         || record.kind != Some(NativeObjectKind::Response)
         || response.get("id").and_then(Value::as_str) != Some(record.raw_id.as_str())
@@ -319,6 +328,12 @@ fn terminal_observation(
         return None;
     }
     let status = terminal_status(response)?;
+    // 供应商报告的完成时间优先；未报告时保留观察时刻的既有回退。
+    let occurred_at = if status == "completed" {
+        response_completed_at(response).unwrap_or(observed_at)
+    } else {
+        observed_at
+    };
     let usage = response.get("usage");
     let count = |path: &str| {
         usage
