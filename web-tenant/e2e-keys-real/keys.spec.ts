@@ -123,6 +123,7 @@ test("list-costs-use-one-authorized-batch-and-detail-keeps-the-same-window", asy
   await page.getByRole("tab", { name: "费用", exact: true }).click();
   await expect(page.getByRole("tabpanel").getByText(money(priced.charged_micro_cny), { exact: true }).first()).toBeVisible();
   await expect(page.getByRole("region", { name: "密钥计量明细", exact: true })).toBeVisible();
+  await expect(page.getByRole("combobox", { name: /每页/ })).toHaveCount(1);
   await page.getByRole("button", { name: "返回密钥列表", exact: true }).click();
   await expect(page.getByRole("heading", { name: "API 密钥", exact: true })).toBeVisible();
   expect(new URLSearchParams(page.url().split("?", 2)[1]).has("key")).toBe(false);

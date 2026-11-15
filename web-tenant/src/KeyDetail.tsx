@@ -9,12 +9,14 @@ import { beijingRange, defaultCalendarRange, fmtBeijing, periodLabel } from "./l
 import { metricsRangeError } from "./lib/apiMetrics";
 import { usageDateValue, usageRange } from "./lib/usageNavigation";
 import { useHashQuery } from "./lib/useHashQuery";
+import { useRecordTable } from "./lib/recordTable";
 import { ApiMetricsPanel } from "./components/ApiMetricsPanel";
 import { BentoGrid, Card, CardHeader, CardMessage, PageHeader, span } from "./components/page";
 import { Button } from "./ui/Button";
 import { DataTable, Loading } from "./ui/DataTable";
 import { Field } from "./ui/Field";
 import { Lamp } from "./ui/Lamp";
+import { RecordTablePager } from "./ui/RecordTable";
 
 const DIMENSIONS: Record<string, string> = {
   input: "输入", output: "输出", cache_read: "缓存读", cache_write: "缓存写", cache_write_1h: "1 小时缓存写",
@@ -57,6 +59,7 @@ function KeyUsage({ keyId }: { keyId: string }) {
     return () => { live = false; };
   }, [requestKey, keyId, from, to, rangeError]);
   const current = answer.key === requestKey ? answer : null;
+  const table = useRecordTable({ items: current?.rows ?? [], resetKey: requestKey });
   return <BentoGrid>
     <Card className={span.d12} aria-label="密钥用量范围">
       <CardHeader title="用量明细" description="仅统计当前密钥。默认最近 30 个北京自然日，最多查询 92 天。" />
@@ -74,7 +77,7 @@ function KeyUsage({ keyId }: { keyId: string }) {
       <CardHeader title="按日与模型的计量明细" description="按用量发生时间汇总，包含已计费重试及历史费用调整。缺失记录显示未知，不视为免费或零用量。" />
       {current?.error ? <CardMessage onRetry={() => setRefresh(value => value + 1)}>{current.error}</CardMessage> : current?.rows === null || !current ? <Loading /> : current.rows.length === 0 ? <CardMessage>所选范围内没有用量</CardMessage> : <DataTable label="密钥计量明细">
         <thead><tr><th>日期</th><th>模型</th><th>调用尝试</th><th>已计价费用</th><th>计量维度</th></tr></thead>
-        <tbody>{current.rows.map((row, index) => {
+        <tbody>{table.rows.map((row, index) => {
           const amount = exactInteger(row.charged_micro_cny);
           const merged = row.model.id === null && row.model.name === "other";
           return <tr key={`${row.period_start}/${row.model.id ?? row.model.name}/${index}`}>
@@ -84,6 +87,7 @@ function KeyUsage({ keyId }: { keyId: string }) {
           </tr>;
         })}</tbody>
       </DataTable>}
+      {current?.rows && !current.error && <RecordTablePager page={table.page} pageSize={table.pageSize} onPageChange={table.setPage} onPageSizeChange={table.setPageSize} total={table.filteredCount} label="密钥计量记录" />}
     </Card>}
   </BentoGrid>;
 }
