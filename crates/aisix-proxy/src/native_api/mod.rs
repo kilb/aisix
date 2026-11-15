@@ -19,6 +19,7 @@ pub(crate) mod skills;
 mod standalone_realtime_store;
 pub mod standalone_store;
 pub(crate) mod voices;
+mod worker;
 
 pub(crate) mod anthropic;
 pub mod anthropic_batch_worker;

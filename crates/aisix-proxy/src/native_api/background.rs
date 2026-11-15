@@ -8,6 +8,7 @@ use aisix_core::native_objects::{
 };
 use axum::http::{HeaderMap, HeaderValue};
 use chrono::{DateTime, Utc};
+#[cfg(test)]
 use futures::StreamExt;
 use serde_json::Value;
 use tokio::sync::watch;
@@ -18,44 +19,23 @@ use crate::error::ProxyError;
 use crate::state::ProxyState;
 
 const CLAIM_SIZE: u32 = 8;
-const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_POLL_TIME: Duration = Duration::from_secs(10);
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const PENDING_DELAY_MS: u32 = 2_000;
 const ERROR_DELAY_MS: u32 = 30_000;
 
 /// 服务启动一次；退出时丢弃未完成的读取，控制面租约到期后由别的进程接手。
-pub async fn run(state: ProxyState, mut cancel: watch::Receiver<bool>) {
-    if state.native_objects.is_none() || *cancel.borrow() {
+pub async fn run(state: ProxyState, cancel: watch::Receiver<bool>) {
+    let Some(registry) = state.native_objects.as_deref() else {
         return;
-    }
-    let mut ticks = tokio::time::interval(POLL_INTERVAL);
-    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        tokio::select! {
-            biased;
-            changed = cancel.changed() => {
-                if changed.is_err() || *cancel.borrow() {
-                    return;
-                }
-            }
-            _ = ticks.tick() => {
-                tokio::select! {
-                    biased;
-                    changed = cancel.changed() => {
-                        if changed.is_err() || *cancel.borrow() {
-                            return;
-                        }
-                    }
-                    result = run_once(&state) => {
-                        if result.is_err() {
-                            tracing::warn!("native response observation authority unavailable");
-                        }
-                    }
-                }
-            }
-        }
-    }
+    };
+    super::worker::run(
+        registry,
+        claim_request(None),
+        |record| observe_record(&state, registry, record),
+        cancel,
+    )
+    .await;
 }
 
 fn claim_request(record_id: Option<uuid::Uuid>) -> ClaimRequest {
@@ -68,6 +48,7 @@ fn claim_request(record_id: Option<uuid::Uuid>) -> ClaimRequest {
 }
 
 /// 每批数量等于并发上限，不让刚领取的对象在队列里耗尽租期。
+#[cfg(test)]
 pub(crate) async fn run_once(state: &ProxyState) -> Result<usize, NativeRegistryError> {
     let registry = state
         .native_objects
@@ -77,10 +58,12 @@ pub(crate) async fn run_once(state: &ProxyState) -> Result<usize, NativeRegistry
     if reply.state != "leased" || reply.records.len() > CLAIM_SIZE as usize {
         return Err(NativeRegistryError::Unavailable);
     }
-    let mut polls = futures::stream::iter(reply.records.into_iter().map(|record| {
-        let span = tracing::info_span!("native_response_observe", record_id = %record.record_id);
-        poll_record(state, registry.as_ref(), record).instrument(span)
-    }))
+    let mut polls = futures::stream::iter(
+        reply
+            .records
+            .into_iter()
+            .map(|record| observe_record(state, registry.as_ref(), record)),
+    )
     .buffer_unordered(CLAIM_SIZE as usize);
     let mut completed = 0;
     while let Some(result) = polls.next().await {
@@ -91,6 +74,15 @@ pub(crate) async fn run_once(state: &ProxyState) -> Result<usize, NativeRegistry
         }
     }
     Ok(completed)
+}
+
+async fn observe_record(
+    state: &ProxyState,
+    registry: &dyn NativeObjectRegistry,
+    record: NativeRecord,
+) -> Result<bool, NativeRegistryError> {
+    let span = tracing::info_span!("native_response_observe", record_id = %record.record_id);
+    poll_record(state, registry, record).instrument(span).await
 }
 
 fn lease_of(record: &NativeRecord) -> Option<LeaseToken> {

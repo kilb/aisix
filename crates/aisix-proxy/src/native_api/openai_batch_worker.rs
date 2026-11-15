@@ -19,7 +19,6 @@ use super::registry::{NativeObjectRegistry, NativeRegistryError};
 use crate::state::ProxyState;
 
 const CLAIM_SIZE: u32 = 8;
-const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
 const OBSERVATION_TIMEOUT: Duration = Duration::from_secs(300);
 const RENEW_INTERVAL: Duration = Duration::from_secs(5);
@@ -33,33 +32,17 @@ fn unavailable() -> NativeRegistryError {
     NativeRegistryError::Unavailable
 }
 
-pub async fn run(state: ProxyState, mut cancel: watch::Receiver<bool>) {
-    if state.native_objects.is_none() || *cancel.borrow() {
+pub async fn run(state: ProxyState, cancel: watch::Receiver<bool>) {
+    let Some(registry) = state.native_objects.as_deref() else {
         return;
-    }
-    let mut ticks = tokio::time::interval(POLL_INTERVAL);
-    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        tokio::select! {
-            biased;
-            changed = cancel.changed() => {
-                if changed.is_err() || *cancel.borrow() { return; }
-            }
-            _ = ticks.tick() => {
-                tokio::select! {
-                    biased;
-                    changed = cancel.changed() => {
-                        if changed.is_err() || *cancel.borrow() { return; }
-                    }
-                    result = run_once(&state) => {
-                        if result.is_err() {
-                            tracing::warn!("native batch observation authority unavailable");
-                        }
-                    }
-                }
-            }
-        }
-    }
+    };
+    super::worker::run(
+        registry,
+        claim_request(None),
+        |record| observe_record(&state, registry, record),
+        cancel,
+    )
+    .await;
 }
 
 fn claim_request(record_id: Option<uuid::Uuid>) -> ClaimRequest {
@@ -78,12 +61,12 @@ pub async fn run_once(state: &ProxyState) -> Result<usize, NativeRegistryError> 
     if reply.state != "leased" || reply.records.len() > CLAIM_SIZE as usize {
         return Err(unavailable());
     }
-    let mut jobs = futures::stream::iter(reply.records.into_iter().map(|record| {
-        let span = tracing::info_span!("native_batch_observe", record_id = %record.record_id);
-        let tap = Arc::new(aisix_gateway::ResponseHeaderTap::default());
-        aisix_gateway::response_tap::scope(tap, poll_record(state, registry.as_ref(), record))
-            .instrument(span)
-    }))
+    let mut jobs = futures::stream::iter(
+        reply
+            .records
+            .into_iter()
+            .map(|record| observe_record(state, registry.as_ref(), record)),
+    )
     .buffer_unordered(CLAIM_SIZE as usize);
     let mut completed = 0;
     while let Some(result) = jobs.next().await {
@@ -94,6 +77,18 @@ pub async fn run_once(state: &ProxyState) -> Result<usize, NativeRegistryError> 
         }
     }
     Ok(completed)
+}
+
+async fn observe_record(
+    state: &ProxyState,
+    registry: &dyn NativeObjectRegistry,
+    record: NativeRecord,
+) -> Result<bool, NativeRegistryError> {
+    let span = tracing::info_span!("native_batch_observe", record_id = %record.record_id);
+    let tap = Arc::new(aisix_gateway::ResponseHeaderTap::default());
+    aisix_gateway::response_tap::scope(tap, poll_record(state, registry, record))
+        .instrument(span)
+        .await
 }
 
 fn lease_of(record: &NativeRecord) -> Option<LeaseToken> {
