@@ -748,10 +748,11 @@ async fn a_removed_member_can_be_invited_again() {
 /// call: to see the tenant's state, keep their own account, and close what
 /// should not outlive the suspension (a leaked key, a member who left).
 /// Every other one answers `403 tenant_not_active`.
-const OPEN_WHILE_NOT_ACTIVE: [(&str, &str); 6] = [
+const OPEN_WHILE_NOT_ACTIVE: [(&str, &str); 7] = [
     ("GET", "/api/org"),
     ("POST", "/api/password"),
     ("GET", "/api/keys"),
+    ("GET", "/api/usage/keys"),
     ("DELETE", "/api/keys/{id}"),
     ("GET", "/api/members"),
     ("DELETE", "/api/members/{id}"),
