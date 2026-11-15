@@ -833,7 +833,7 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
     // Managed-mode bootstrap. First boot materialises the dashboard-
     // issued cert bundle. Subsequent boots re-use the persisted files
     // and synthesise heartbeat config from config + dp_id_file.
-    let heartbeat_cfg: Option<heartbeat::HeartbeatConfig> = if cfg.managed.is_managed() {
+    let mut heartbeat_cfg: Option<heartbeat::HeartbeatConfig> = if cfg.managed.is_managed() {
         let bundle_on_disk = managed_bundle::bundle_exists(&cfg.managed.mtls_dir);
         let bundle_provided = cfg.managed.cert_bundle_provided();
         // Log the branch inputs so operators don't have to guess why
@@ -1512,9 +1512,10 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
         }
     }
     // 原生对象归属使用独立 mTLS 连接池，失败时维持不可用而不降级为本地授权。
-    if let Some(h) = heartbeat_cfg.as_ref() {
+    if let Some(h) = heartbeat_cfg.as_mut() {
         match native_objects::NativeObjectsClient::new(dpmgr_origin(&h.url), &h.mtls) {
             Ok(client) => {
+                h.native_capability_observer = Some(client.capability_observer());
                 proxy_state = proxy_state.with_native_objects(Arc::new(client));
             }
             Err(error) => tracing::error!(

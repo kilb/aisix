@@ -34,7 +34,7 @@ use aisix_core::{redact_url_for_log, ConfigRejectionSnapshot};
 use aisix_etcd::loader::PartialCompatEntry;
 use aisix_obs::SinkStatsSnapshot;
 use anyhow::{anyhow, Context};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
 /// Cheap clonable callback the heartbeat invokes once per tick to pull
@@ -95,6 +95,36 @@ pub type PartialCompatFetcher = Arc<dyn Fn() -> Vec<PartialCompatEntry> + Send +
 /// instead of only on this gateway's scrape. The counts only grow while the
 /// process runs; a restart is a new instance, whose counts start at zero.
 pub type UsageDropsFetcher = Arc<dyn Fn() -> BTreeMap<String, u64> + Send + Sync>;
+
+/// 只采用同一 mTLS 心跳的正式 200 回复；旧控制面空对象不声明 journal。
+pub type NativeCapabilityObserver = Arc<dyn Fn(&HeartbeatReply) + Send + Sync>;
+
+#[derive(Default, Deserialize)]
+pub struct HeartbeatReply {
+    #[serde(default)]
+    pub native_realtime: Option<RealtimeCapability>,
+}
+
+#[derive(Default, Deserialize)]
+pub struct RealtimeCapability {
+    #[serde(default)]
+    pub journal_version: u32,
+}
+
+pub(crate) fn observe_native_reply(
+    observer: &NativeCapabilityObserver,
+    bytes: &[u8],
+) -> anyhow::Result<()> {
+    let value: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|_| anyhow!("heartbeat capability reply is invalid"))?;
+    if !value.is_object() {
+        return Err(anyhow!("heartbeat capability reply is invalid"));
+    }
+    let reply: HeartbeatReply = serde_json::from_value(value)
+        .map_err(|_| anyhow!("heartbeat capability reply is invalid"))?;
+    observer(&reply);
+    Ok(())
+}
 
 /// File paths to the on-disk mTLS bundle the heartbeat client presents
 /// to the control plane. Same three files written by cert-bundle provisioning and
@@ -178,6 +208,7 @@ pub struct HeartbeatConfig {
     /// reason. `None` (tests / no telemetry) omits the field, same
     /// tolerance contract as the other optional fields.
     pub usage_drops_fetcher: Option<UsageDropsFetcher>,
+    pub native_capability_observer: Option<NativeCapabilityObserver>,
 }
 
 impl std::fmt::Debug for HeartbeatConfig {
@@ -217,6 +248,10 @@ impl std::fmt::Debug for HeartbeatConfig {
                 "usage_drops_fetcher",
                 &self.usage_drops_fetcher.as_ref().map(|_| "<fn>"),
             )
+            .field(
+                "native_capability_observer",
+                &self.native_capability_observer.as_ref().map(|_| "<fn>"),
+            )
             .finish()
     }
 }
@@ -247,6 +282,7 @@ impl HeartbeatConfig {
             config_hash_fetcher: None,
             partial_compat_fetcher: None,
             usage_drops_fetcher: None,
+            native_capability_observer: None,
         }
     }
 
@@ -568,7 +604,7 @@ async fn send(client: &reqwest::Client, cfg: &HeartbeatConfig, uptime: i64) -> a
         .map(|fetcher| fetcher())
         .unwrap_or_default();
 
-    let resp = client
+    let mut resp = client
         .post(&cfg.url)
         // No bearer header — the control plane authenticates via the peer
         // certificate SAN URI (§9A.7.2).
@@ -600,6 +636,27 @@ async fn send(client: &reqwest::Client, cfg: &HeartbeatConfig, uptime: i64) -> a
             status,
             body.trim().chars().take(200).collect::<String>()
         ));
+    }
+    // 只有正式的 200 回复能确认原生能力，其它成功状态不改变已确认状态。
+    if status != reqwest::StatusCode::OK {
+        return Ok(());
+    }
+    if let Some(observer) = cfg.native_capability_observer.as_ref() {
+        const MAX_REPLY: usize = 64 * 1024;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(reqwest::Error::without_url)
+            .context("read heartbeat capability reply")?
+        {
+            if chunk.len() > MAX_REPLY.saturating_sub(bytes.len()) {
+                return Err(anyhow!("heartbeat capability reply exceeds the size limit"));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        // 错误不显示响应正文；失败或畸形响应不能将已确认能力切回汇总计费。
+        observe_native_reply(observer, &bytes)?;
     }
     Ok(())
 }
@@ -1515,5 +1572,291 @@ managed:
         let text = format!("{err:#}");
         assert!(text.contains("503"), "{text}");
         assert!(!text.contains("hunter2"), "{text}");
+    }
+    // 轻隔离计费能力合同独立于此前强 principal 配对测试，旧测试保留历史。
+    mod light_journal_contract {
+        use super::*;
+        use aisix_core::native_realtime::{
+            CreateLiveSessionRequest, MintCredentialRequest, RealtimePurpose, RealtimeTransport,
+        };
+        use aisix_proxy::native_api::registry::{
+            LiveUsageAuthority, NativeObjectRegistry, NativeRegistryError,
+        };
+
+        const JOURNAL: &str = r#"{"native_realtime":{"journal_version":1},"future":{"version":7}}"#;
+        const PAIRED: &str =
+            r#"{"native_principal":{"version":1},"native_realtime":{"journal_version":1}}"#;
+
+        // 只替换 HTTP 对端；实际 send、解码、observer 和客户端缓存都执行。
+        fn fixture(
+            server: &MockServer,
+        ) -> (
+            tempfile::TempDir,
+            HeartbeatConfig,
+            crate::native_objects::NativeObjectsClient,
+        ) {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let dir = tempfile::tempdir().unwrap();
+            let mut cfg = cfg_with_bundle(
+                format!("{}/dp/heartbeat", server.uri()),
+                write_test_bundle(dir.path()),
+            );
+            let authority =
+                crate::native_objects::NativeObjectsClient::new(&server.uri(), &cfg.mtls).unwrap();
+            cfg.native_capability_observer = Some(authority.capability_observer());
+            (dir, cfg, authority)
+        }
+
+        async fn heartbeat_reply(
+            server: &MockServer,
+            cfg: &HeartbeatConfig,
+            status: u16,
+            body: &str,
+        ) -> anyhow::Result<()> {
+            server.reset().await;
+            Mock::given(method("POST"))
+                .and(path("/dp/heartbeat"))
+                .respond_with(ResponseTemplate::new(status).set_body_string(body))
+                .expect(1)
+                .mount(server)
+                .await;
+            send(&plain_client(), cfg, 7).await
+        }
+
+        fn mint_request() -> MintCredentialRequest {
+            MintCredentialRequest {
+                operation_id: uuid::Uuid::from_u128(11),
+                api_key_id: uuid::Uuid::from_u128(12),
+                token_hash: "a".repeat(64),
+                purpose: RealtimePurpose::Realtime,
+                expires_at: chrono::Utc::now() + chrono::Duration::minutes(1),
+                defaults: serde_json::json!({"session":{"type":"realtime"}}),
+            }
+        }
+
+        fn create_request() -> CreateLiveSessionRequest {
+            CreateLiveSessionRequest {
+                operation_id: uuid::Uuid::from_u128(21),
+                api_key_id: uuid::Uuid::from_u128(12),
+                purpose: RealtimePurpose::Realtime,
+                transport: RealtimeTransport::WebSocket,
+                credential_id: None,
+                provider_session_id: Some("provider_session_light".into()),
+                deadline_at: chrono::Utc::now() + chrono::Duration::minutes(2),
+            }
+        }
+
+        #[tokio::test]
+        async fn actual_200_journal_v1_selects_canonical_without_principal_capability() {
+            let server = MockServer::start().await;
+            let (_dir, cfg, authority) = fixture(&server);
+            assert_eq!(
+                authority.live_usage_authority(),
+                LiveUsageAuthority::Unsupported
+            );
+            heartbeat_reply(&server, &cfg, 200, JOURNAL).await.unwrap();
+            assert_eq!(
+                authority.live_usage_authority(),
+                LiveUsageAuthority::CanonicalJournal
+            );
+        }
+
+        #[tokio::test]
+        async fn old_missing_and_unknown_journal_contracts_do_not_claim_canonical() {
+            let server = MockServer::start().await;
+            for body in [
+                "{}",
+                r#"{"native_principal":{"version":1}}"#,
+                r#"{"native_realtime":{}}"#,
+                r#"{"native_realtime":{"journal_version":0}}"#,
+                r#"{"native_realtime":{"journal_version":2}}"#,
+            ] {
+                let (_dir, cfg, authority) = fixture(&server);
+                heartbeat_reply(&server, &cfg, 200, body).await.unwrap();
+                assert_eq!(
+                    authority.live_usage_authority(),
+                    LiveUsageAuthority::Unsupported,
+                    "{body}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn non_200_cannot_establish_journal_authority() {
+            let server = MockServer::start().await;
+            for status in [201, 202, 203, 204, 401, 503] {
+                let (_dir, cfg, authority) = fixture(&server);
+                let _ = heartbeat_reply(&server, &cfg, status, JOURNAL).await;
+                assert_eq!(
+                    authority.live_usage_authority(),
+                    LiveUsageAuthority::Unsupported,
+                    "status {status}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn failed_or_malformed_heartbeat_cannot_downgrade_confirmed_journal() {
+            let server = MockServer::start().await;
+            let (_dir, cfg, authority) = fixture(&server);
+            // 配对正控使此案例在旧实现上也确实走到错误响应，另案覆盖仅 journal。
+            heartbeat_reply(&server, &cfg, 200, PAIRED).await.unwrap();
+            let admitted_mode = authority.live_usage_authority();
+            assert_eq!(admitted_mode, LiveUsageAuthority::CanonicalJournal);
+            for (status, body) in [
+                (401, "{}"),
+                (503, "{}"),
+                (202, "{}"),
+                (200, "not-json"),
+                (200, "null"),
+                (200, r#"{"native_realtime":{"journal_version":"bad"}}"#),
+            ] {
+                let _ = heartbeat_reply(&server, &cfg, status, body).await;
+                assert_eq!(
+                    authority.live_usage_authority(),
+                    LiveUsageAuthority::CanonicalJournal,
+                    "status {status}"
+                );
+                assert_eq!(admitted_mode, LiveUsageAuthority::CanonicalJournal);
+            }
+        }
+
+        #[tokio::test]
+        async fn known_journal_backend_can_mint_without_a_principal_protocol() {
+            let server = MockServer::start().await;
+            let (_dir, cfg, authority) = fixture(&server);
+            heartbeat_reply(&server, &cfg, 200, JOURNAL).await.unwrap();
+            let request = mint_request();
+            let expires_at = request.expires_at;
+            Mock::given(method("POST"))
+                .and(path("/dp/v1/native-objects/credentials/mint"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "state":"credential", "credential":{
+                        "credential_id":uuid::Uuid::from_u128(31), "api_key_id":request.api_key_id,
+                        "purpose":"realtime", "expires_at":expires_at, "future":true
+                    }, "future":true
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let credential = authority
+                .mint_credential(request)
+                .await
+                .unwrap()
+                .credential
+                .unwrap();
+            assert!(credential.usable_at(RealtimePurpose::Realtime, chrono::Utc::now()));
+            assert_eq!(credential.api_key_id, uuid::Uuid::from_u128(12));
+        }
+
+        #[tokio::test]
+        async fn known_journal_backend_can_create_without_a_principal_protocol() {
+            let server = MockServer::start().await;
+            let (_dir, cfg, authority) = fixture(&server);
+            heartbeat_reply(&server, &cfg, 200, JOURNAL).await.unwrap();
+            let request = create_request();
+            let expected_operation = request.operation_id;
+            Mock::given(method("POST"))
+                .and(path("/dp/v1/native-objects/live/create"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "state":"live", "live_session":{
+                        "operation_id":expected_operation, "api_key_id":request.api_key_id,
+                        "purpose":"realtime", "transport":"web_socket", "state":"open",
+                        "lease":{"operation_id":expected_operation,"generation":1},
+                        "deadline_at":request.deadline_at, "future":true
+                    }, "future":true
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let live = authority
+                .create_live_session(request)
+                .await
+                .unwrap()
+                .live_session
+                .unwrap();
+            assert_eq!(live.operation_id, expected_operation);
+            assert_eq!(live.api_key_id, uuid::Uuid::from_u128(12));
+            assert_eq!(live.lease.unwrap().generation, 1);
+        }
+
+        #[tokio::test]
+        async fn unknown_backend_cannot_accept_new_gateway_credentials_or_sessions() {
+            let server = MockServer::start().await;
+            let (_dir, cfg, authority) = fixture(&server);
+            heartbeat_reply(&server, &cfg, 200, "{}").await.unwrap();
+            Mock::given(method("POST"))
+                .and(path("/dp/v1/native-objects/credentials/mint"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"state":"credential"})),
+                )
+                .expect(0)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/dp/v1/native-objects/live/create"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({"state":"live"})),
+                )
+                .expect(0)
+                .mount(&server)
+                .await;
+            assert!(matches!(
+                authority.mint_credential(mint_request()).await,
+                Err(NativeRegistryError::Unavailable)
+            ));
+            assert!(matches!(
+                authority.create_live_session(create_request()).await,
+                Err(NativeRegistryError::Unavailable)
+            ));
+        }
+
+        #[tokio::test]
+        async fn known_journal_backend_accepts_a_new_asr_entry_without_principal_protocol() {
+            use aisix_core::native_objects::NativeEntry;
+            use aisix_core::native_realtime::{
+                CheckpointLiveSessionRequest, LiveSessionLease, UsageCoverage,
+            };
+            let server = MockServer::start().await;
+            let (_dir, cfg, authority) = fixture(&server);
+            heartbeat_reply(&server, &cfg, 200, JOURNAL).await.unwrap();
+            let operation_id = uuid::Uuid::from_u128(21);
+            let entry: NativeEntry = serde_json::from_value(serde_json::json!({
+                "entry_id":"asr-item-1", "requested_model":"public-asr",
+                "requested_model_id":uuid::Uuid::from_u128(41),
+                "model_id":uuid::Uuid::from_u128(42), "upstream_model":"upstream-asr",
+                "endpoint":"/v1/realtime"
+            }))
+            .unwrap();
+            Mock::given(method("POST"))
+                .and(path("/dp/v1/native-objects/live/checkpoint"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "state":"live", "live_session":{
+                        "operation_id":operation_id, "api_key_id":uuid::Uuid::from_u128(12),
+                        "state":"open", "lease":{"operation_id":operation_id,"generation":1},
+                        "requires_stop":false
+                    }
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let reply = authority
+                .checkpoint_live_session(CheckpointLiveSessionRequest {
+                    lease: LiveSessionLease {
+                        operation_id,
+                        generation: 1,
+                    },
+                    terminal: false,
+                    coverage: UsageCoverage::Partial,
+                    entries: vec![entry],
+                })
+                .await
+                .unwrap();
+            let live = reply.live_session.unwrap();
+            assert_eq!(live.operation_id, operation_id);
+            assert!(!live.requires_stop);
+            assert_eq!(live.lease.unwrap().generation, 1);
+        }
     }
 }

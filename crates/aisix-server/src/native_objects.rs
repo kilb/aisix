@@ -3,6 +3,8 @@
 use aisix_core::native_realtime::SignedSipIntakeRequest;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use aisix_core::native_metering::{ReconciliationRequest, TypedCompleteRequest};
@@ -32,6 +34,7 @@ type ReplyFuture<'a> =
 pub struct NativeObjectsClient {
     http: reqwest::Client,
     base: String,
+    journal: Arc<AtomicBool>,
 }
 
 impl NativeObjectsClient {
@@ -47,7 +50,20 @@ impl NativeObjectsClient {
         Self {
             http,
             base: format!("{}/dp/v1/native-objects", origin.trim_end_matches('/')),
+            journal: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// 只由构建本客户端的同一 CP/mTLS 心跳更新，不使用跨来源的全局缓存。
+    pub fn capability_observer(&self) -> crate::heartbeat::NativeCapabilityObserver {
+        let cache = Arc::clone(&self.journal);
+        Arc::new(move |reply| {
+            let journal = reply
+                .native_realtime
+                .as_ref()
+                .is_some_and(|cap| cap.journal_version == 1);
+            cache.store(journal, Ordering::Release);
+        })
     }
 
     async fn post<T: Serialize + Sync>(
@@ -55,6 +71,11 @@ impl NativeObjectsClient {
         operation: &'static str,
         body: &T,
     ) -> Result<NativeReply, NativeRegistryError> {
+        if matches!(operation, "credentials/mint" | "live/create")
+            && !self.journal.load(Ordering::Acquire)
+        {
+            return Err(NativeRegistryError::Unavailable);
+        }
         // 失败不自动重发：上一次提交可能已持久化，调用方持有其操作身份。
         let mut response = self
             .http
@@ -120,6 +141,14 @@ struct AuthorityFailure {
 }
 
 impl NativeObjectRegistry for NativeObjectsClient {
+    fn live_usage_authority(&self) -> aisix_proxy::native_api::registry::LiveUsageAuthority {
+        if self.journal.load(Ordering::Acquire) {
+            aisix_proxy::native_api::registry::LiveUsageAuthority::CanonicalJournal
+        } else {
+            aisix_proxy::native_api::registry::LiveUsageAuthority::Unsupported
+        }
+    }
+
     fn begin(&self, request: BeginRequest) -> ReplyFuture<'_> {
         Box::pin(async move { self.post("begin", &request).await })
     }
@@ -171,6 +200,9 @@ impl NativeObjectRegistry for NativeObjectsClient {
         Box::pin(async move { self.post("live/append", &request).await })
     }
     fn checkpoint_live_session(&self, request: CheckpointLiveSessionRequest) -> ReplyFuture<'_> {
+        if !request.entries.is_empty() && !self.journal.load(Ordering::Acquire) {
+            return Box::pin(async { Err(NativeRegistryError::Unavailable) });
+        }
         Box::pin(async move { self.post("live/checkpoint", &request).await })
     }
     fn claim_live_sessions(&self, request: ClaimLiveSessionsRequest) -> ReplyFuture<'_> {

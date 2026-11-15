@@ -273,7 +273,8 @@ pub async fn heartbeat(
             ..ApiError::busy()
         });
     }
-    Ok(Json(json!({})))
+    // 成功登记后声明已经持久化实现的实时 journal；旧客户端可忽略此字段。
+    Ok(Json(json!({"native_realtime":{"journal_version":1}})))
 }
 
 /// Whether `dp_id` already has a row for `instance_id`.
