@@ -13,6 +13,7 @@ async fn completed_batch_files(f: &Fixture, with_context: bool) -> BatchFiles {
     source.entries = [("first", "model-a"), ("second", "model-b")]
         .into_iter()
         .map(|(entry, model)| NativeEntry {
+            usage_context: None,
             entry_id: entry.into(),
             endpoint: "/v1/chat/completions".into(),
             requested_model_id: stable_resource_id("models", model),

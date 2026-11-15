@@ -277,6 +277,7 @@ pub(crate) async fn create_container(
                 lifecycle_context: None,
                 entry_references: Default::default(),
                 submission: BeginRequest {
+                    usage_context: None,
                     upstream_input_text: None,
                     input_file_id: None,
                     operation_id,

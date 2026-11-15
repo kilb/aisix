@@ -793,6 +793,7 @@ async fn begin_for_requested(
         .chain(owner_parent_record_id)
         .collect();
     let submission = BeginRequest {
+        usage_context: None,
         upstream_input_text: None,
         input_file_id: None,
         operation_id,

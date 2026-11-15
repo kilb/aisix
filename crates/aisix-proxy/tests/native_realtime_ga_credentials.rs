@@ -1216,6 +1216,7 @@ async fn object_only_legacy_backend_rejects_ga_mint_before_any_supplier_request(
         .expect("the actual original account resource");
     let kind = NativeObjectKind::Response;
     let request = BeginRequest {
+        usage_context: None,
         upstream_input_text: None,
         input_file_id: None,
         operation_id: Uuid::new_v4(),

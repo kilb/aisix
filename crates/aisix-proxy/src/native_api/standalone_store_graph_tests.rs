@@ -241,6 +241,7 @@ async fn two_paid_entries_can_append_to_the_same_accepted_parent_across_observat
     begin.entries = ["one", "two"]
         .into_iter()
         .map(|id| NativeEntry {
+            usage_context: None,
             upstream_input_text: None,
             endpoint: "/v1/responses".into(),
             entry_id: id.into(),

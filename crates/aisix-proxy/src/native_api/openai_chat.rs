@@ -145,6 +145,7 @@ pub(crate) async fn register_created(
     let api_key_id = openai::api_key_id(&auth)?;
     let reply = registry
         .begin(BeginRequest {
+            usage_context: None,
             upstream_input_text: None,
             input_file_id: None,
             operation_id,

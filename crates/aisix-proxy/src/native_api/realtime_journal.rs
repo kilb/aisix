@@ -286,6 +286,7 @@ impl Journal {
             .map_err(proxy_error)?;
         let operation_id = Uuid::new_v4();
         let accepted = BeginRequest {
+            usage_context: None,
             upstream_input_text: None,
             input_file_id: None,
             operation_id,
@@ -641,6 +642,7 @@ impl Journal {
         };
         let native = if let Some(actual) = actual {
             Some(NativeEntry {
+                usage_context: None,
                 upstream_input_text: None,
                 endpoint: "/v1/audio/transcriptions".to_owned(),
                 entry_id: entry_id.clone(),

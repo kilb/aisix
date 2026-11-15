@@ -466,6 +466,7 @@ async fn asr_revocation(reuse_entry: bool) {
     f.snapshot.store(snapshot);
     let (submitted, live) = created(&f, &f.store, None).await;
     let entry = NativeEntry {
+        usage_context: None,
         entry_id: "asr".into(),
         endpoint: "/v1/audio/transcriptions".into(),
         requested_model_id: stable_resource_id("models", "model-b"),

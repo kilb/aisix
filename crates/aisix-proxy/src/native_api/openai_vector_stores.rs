@@ -350,6 +350,7 @@ async fn begin_creation(
             entry_references: Default::default(),
             lifecycle_context: None,
             submission: BeginRequest {
+                usage_context: None,
                 upstream_input_text: None,
                 input_file_id: None,
                 operation_id,

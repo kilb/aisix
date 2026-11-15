@@ -543,8 +543,68 @@ impl PartialEq for OriginBinding {
 }
 impl Eq for OriginBinding {}
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// 准入时的纯观测值；不参与授权、来源证明或账务事实。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NativeInputAudit {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub applied_guardrails: Vec<crate::AppliedGuardrail>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub guardrail_bypassed_reason: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub guardrail_monitor_hits: Vec<crate::GuardrailMonitorHit>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub guardrail_enforced_hits: Vec<crate::GuardrailEnforcedHit>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub guardrail_scores: Vec<crate::GuardrailScore>,
+}
+
+impl NativeInputAudit {
+    pub fn is_empty(&self) -> bool {
+        self.applied_guardrails.is_empty()
+            && self.guardrail_bypassed_reason.is_empty()
+            && self.guardrail_monitor_hits.is_empty()
+            && self.guardrail_enforced_hits.is_empty()
+            && self.guardrail_scores.is_empty()
+    }
+}
+
+/// 请求身份的遥测投影不含租户、key 或成员标识；那些仍来自权威归属记录。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NativeUsageContext {
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub api_key_name: String,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub tags: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub jwt_subject: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub jwt_provider: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub jwt_claim_mapping: String,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub request_headers: BTreeMap<String, String>,
+    #[serde(flatten)]
+    pub input_audit: NativeInputAudit,
+}
+
+impl NativeUsageContext {
+    pub fn is_empty(&self) -> bool {
+        self.api_key_name.is_empty()
+            && self.tags.is_empty()
+            && self.jwt_subject.is_empty()
+            && self.jwt_provider.is_empty()
+            && self.jwt_claim_mapping.is_empty()
+            && self.request_headers.is_empty()
+            && self.input_audit.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NativeEntry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_context: Option<Box<NativeInputAudit>>,
     /// 最终模型请求的文本标量；不持久化正文或推断未观察的传输字节。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_input_text: Option<TextMeasurement>,
@@ -562,8 +622,10 @@ pub struct NativeEntry {
     pub upstream_provider: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BeginRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_context: Option<Box<NativeUsageContext>>,
     /// 最终模型请求的文本标量；不持久化正文或推断未观察的传输字节。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_input_text: Option<TextMeasurement>,
@@ -1305,5 +1367,89 @@ mod authority_contract_tests {
             NativeObjectKind::FineTunedModel,
             EndpointFamily::Models
         ));
+    }
+}
+
+#[cfg(test)]
+mod usage_context_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn old_entry() -> serde_json::Value {
+        json!({
+            "entry_id":"one", "requested_model_id":Uuid::from_u128(3),
+            "model_id":Uuid::from_u128(4), "upstream_model":"original-upstream"
+        })
+    }
+
+    fn old_submission() -> serde_json::Value {
+        json!({
+            "operation_id":Uuid::from_u128(1), "api_key_id":Uuid::from_u128(2),
+            "protocol":"openai", "kind":"response",
+            "origin":{"model_id":Uuid::from_u128(4),"provider_key_id":Uuid::from_u128(5),
+                "boundary":"v1:0000000000000000000000000000000000000000000000000000000000000000"},
+            "requested_model_id":Uuid::from_u128(3), "requested_model":"original-alias",
+            "upstream_model":"original-upstream", "operation":"responses",
+            "request_id":"original-request", "asynchronous":true
+        })
+    }
+
+    #[test]
+    fn old_submissions_and_entries_do_not_gain_empty_observation_fields() {
+        let submission: BeginRequest = serde_json::from_value(old_submission()).unwrap();
+        assert!(submission.usage_context.is_none());
+        let wire = serde_json::to_value(submission).unwrap();
+        assert!(wire.get("usage_context").is_none());
+        let entry: NativeEntry = serde_json::from_value(old_entry()).unwrap();
+        assert!(entry.usage_context.is_none());
+        let wire = serde_json::to_value(entry).unwrap();
+        assert!(wire.get("usage_context").is_none());
+    }
+
+    #[test]
+    fn a_future_observation_field_cannot_become_authority_or_financial_data() {
+        let mut wire = old_submission();
+        wire["usage_context"] = json!({
+            "api_key_name":"original-name", "future_observation":{"value":7},
+            "api_key_id":Uuid::from_u128(999), "team_id":"other-tenant", "user_id":"other-member",
+            "cost_usd":999, "prompt_tokens":999, "occurred_at":"2099-01-01T00:00:00Z"
+        });
+        let submission: BeginRequest = serde_json::from_value(wire).unwrap();
+        assert_eq!(submission.api_key_id, Uuid::from_u128(2));
+        let context = serde_json::to_value(submission.usage_context.unwrap()).unwrap();
+        assert_eq!(context, json!({"api_key_name":"original-name"}));
+
+        let mut wire = old_entry();
+        wire["usage_context"] = json!({
+            "applied_guardrails":[{"kind":"keyword","hook":"input"}],
+            "api_key_name":"must-not-be-repeated-per-entry", "future_audit":true
+        });
+        let entry: NativeEntry = serde_json::from_value(wire).unwrap();
+        let context = serde_json::to_value(entry.usage_context.unwrap()).unwrap();
+        assert_eq!(
+            context,
+            json!({"applied_guardrails":[{"kind":"keyword","hook":"input"}]})
+        );
+    }
+
+    #[test]
+    fn native_record_reads_future_entry_observations_without_requiring_them() {
+        let mut entry = old_entry();
+        entry["usage_context"] = json!({
+            "guardrail_bypassed_reason":"original-observed-tag", "future_audit":true
+        });
+        let record: NativeRecord = serde_json::from_value(json!({
+            "record_id":Uuid::from_u128(9), "entries":[entry], "future_record_field":true
+        }))
+        .unwrap();
+        assert_eq!(record.entries.len(), 1);
+        assert_eq!(
+            record.entries[0]
+                .usage_context
+                .as_deref()
+                .unwrap()
+                .guardrail_bypassed_reason,
+            "original-observed-tag"
+        );
     }
 }

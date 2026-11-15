@@ -1484,6 +1484,7 @@ impl NativeDecodeFixture {
         let api_key_id = stable_resource_id("apikeys", "request-decode-key");
         let accepted = store
             .begin(BeginRequest {
+                usage_context: None,
                 upstream_input_text: None,
                 input_file_id: None,
                 operation_id,

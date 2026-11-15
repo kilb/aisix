@@ -858,6 +858,7 @@ async fn begin_requested(
     let operation_id = Uuid::new_v4();
     let (requested_model, requested_model_id) = requested;
     let submission = BeginRequest {
+        usage_context: None,
         upstream_input_text: None,
         input_file_id: None,
         operation_id,

@@ -81,6 +81,7 @@ pub(crate) async fn begin_response(
     let operation_id = Uuid::new_v4();
     let reply = registry
         .begin(BeginRequest {
+            usage_context: None,
             upstream_input_text,
             input_file_id: None,
             operation_id,

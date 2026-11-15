@@ -70,6 +70,7 @@ impl Fixture {
         let s = self.snapshot.load();
         let provider = s.provider_keys.get_by_id("provider-a").unwrap();
         BeginRequest {
+            usage_context: None,
             upstream_input_text: None,
             input_file_id: None,
             operation_id: Uuid::new_v4(),
@@ -731,6 +732,7 @@ async fn batch_entries_have_independent_response_roots_and_conflicting_replay_is
     begin.entries = ["one", "two"]
         .into_iter()
         .map(|id| NativeEntry {
+            usage_context: None,
             upstream_input_text: None,
             endpoint: "/v1/responses".into(),
             entry_id: id.into(),
@@ -1363,6 +1365,7 @@ async fn batch_entry_graph_cannot_borrow_another_entry_or_the_aggregate_referenc
     begin.entries = ["one", "two"]
         .into_iter()
         .map(|id| NativeEntry {
+            usage_context: None,
             upstream_input_text: None,
             endpoint: "/v1/responses".into(),
             entry_id: id.into(),

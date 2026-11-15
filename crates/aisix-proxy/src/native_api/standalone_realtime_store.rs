@@ -986,6 +986,7 @@ fn sip_submission(
     )
     .map_err(|_| Error::NotFound)?;
     Ok(BeginRequest {
+        usage_context: None,
         operation_id: body.operation_id,
         api_key_id: binding.key_id,
         protocol: NativeProtocol::Openai,

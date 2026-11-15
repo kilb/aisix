@@ -187,6 +187,7 @@ pub(crate) async fn create(
             );
             io.observe_request_json(params);
             entries.push(NativeEntry {
+                usage_context: None,
                 upstream_input_text: io.snapshot().input_text,
                 endpoint: String::new(),
                 entry_id: id,

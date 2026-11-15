@@ -2962,6 +2962,7 @@ async fn managed_begin(
         && !entries.is_empty();
     let reply = openai::registry(state)?
         .begin(BeginRequest {
+            usage_context: None,
             upstream_input_text: None,
             input_file_id,
             operation_id,
@@ -3397,6 +3398,7 @@ async fn managed_batch_input(
         let io = aisix_gateway::upstream_io::UpstreamIoObserver::new(protocol);
         io.observe_request_json(line.get("body").ok_or_else(openai::dependency)?);
         entries.push(NativeEntry {
+            usage_context: None,
             upstream_input_text: io.snapshot().input_text,
             endpoint,
             entry_id: id,
