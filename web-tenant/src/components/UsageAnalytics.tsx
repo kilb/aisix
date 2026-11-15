@@ -15,6 +15,7 @@ type Props = {
   className: string;
   onRetry?: () => void;
 };
+type SummaryProps = Props & { summary: Summary | null };
 
 /** 图形只接收归一化位置，所有金额继续使用原始精确整数展示。 */
 function trendPoints(summary: Summary, field: "requests" | "chargedMicroCny", group: "day" | "month") {
@@ -39,8 +40,7 @@ function DataState({ rows, error, onRetry, chart = false }: Pick<Props, "rows" |
   return <CardMessage>所选范围内没有用量。产生调用后，这里会显示实际数据。</CardMessage>;
 }
 
-export function UsageRequestCard({ rows, error, rangeLabel, group = "day", number, className, onRetry }: Props) {
-  const summary = rows === null ? null : summarizeUsage(rows);
+export function UsageRequestCard({ rows, summary, error, rangeLabel, group = "day", number, className, onRetry }: SummaryProps) {
   return (
     <Card className={`usage-analytic ${className}`}>
       <CardHeader number={number} title="调用尝试次数" description={rangeLabel} />
@@ -57,8 +57,7 @@ export function UsageRequestCard({ rows, error, rangeLabel, group = "day", numbe
   );
 }
 
-export function UsageCostCard({ rows, error, rangeLabel, number, className, onRetry }: Props) {
-  const summary = rows === null ? null : summarizeUsage(rows);
+export function UsageCostCard({ rows, summary, error, rangeLabel, number, className, onRetry }: SummaryProps) {
   const cost = summary?.chargedMicroCny == null ? "未知" : fmtMicroCny(summary.chargedMicroCny);
   return (
     <Card className={`usage-analytic ${className}`}>
@@ -74,8 +73,7 @@ export function UsageCostCard({ rows, error, rangeLabel, number, className, onRe
   );
 }
 
-export function UsageModelsCard({ rows, error, rangeLabel, number, className, onRetry }: Props) {
-  const summary = rows === null ? null : summarizeUsage(rows);
+export function UsageModelsCard({ rows, summary, error, rangeLabel, number, className, onRetry }: SummaryProps) {
   const ranked = summary?.models.filter((model) => model.chargedMicroCny !== null).sort((a, b) => {
     const left = a.chargedMicroCny ?? 0n;
     const right = b.chargedMicroCny ?? 0n;

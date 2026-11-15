@@ -9,6 +9,7 @@ import { build } from "esbuild";
 import { createElement, type ComponentType } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { UsageSummaryRow } from "./api";
+import { summarizeUsage, type UsageChartSummary } from "./chartFormat.ts";
 
 // 直接渲染产品卡片，校验合并期间与金额展示，不替换网络或聚合实现。
 const require = createRequire(import.meta.url);
@@ -34,11 +35,11 @@ const temporary = await mkdtemp(join(tmpdir(), "aisix-usage-analytics-"));
 after(() => rm(temporary, { recursive: true, force: true }));
 const entry = join(temporary, "component.cjs");
 await writeFile(entry, compiled.outputFiles[0]!.text);
-type CardProps = { rows: UsageSummaryRow[] | null; error: string | null; rangeLabel: string; number: number; className: string };
+type CardProps = { rows: UsageSummaryRow[] | null; summary: UsageChartSummary | null; error: string | null; rangeLabel: string; number: number; className: string };
 const cards = createRequire(import.meta.url)(entry) as Record<string, ComponentType<CardProps>>;
 
-function render(name: string, rows: UsageSummaryRow[] | null, error: string | null = null): string {
-  return renderToStaticMarkup(createElement(cards[name]!, { rows, error, rangeLabel: "所选 UTC 区间", number: 1, className: "" }));
+function render(name: string, rows: UsageSummaryRow[] | null, error: string | null = null, summary = rows === null ? null : summarizeUsage(rows)): string {
+  return renderToStaticMarkup(createElement(cards[name]!, { rows, summary, error, rangeLabel: "所选 UTC 区间", number: 1, className: "" }));
 }
 
 function text(markup: string): string {
@@ -112,4 +113,51 @@ test("加载、空态和错误仍保留对应卡标题与原因", () => {
   const failed = text(render("UsageRequestCard", [], "统计暂不可用"));
   assert.match(failed, /调用尝试次数.*统计暂不可用/);
   assert.doesNotMatch(failed, /¥0\.00/);
+});
+
+// 恢复任一卡内的全量聚合会再次读取每条requests，使本检查失败。
+test("概览三卡消费同一份精确摘要，不重复遍历原始用量", () => {
+  let reads = 0;
+  const rows = [row("Beta", 4000000, 4), row("Alpha", 2000000, 2), row("Beta", -1000000, 1)]
+    .map((source) => ({ ...source, get requests() { reads += 1; return source.requests; } }));
+  const summary = summarizeUsage(rows);
+  const requests = render("UsageRequestCard", rows, null, summary);
+  const cost = text(render("UsageCostCard", rows, null, summary));
+  const models = text(render("UsageModelsCard", rows, null, summary));
+  assert.match(requests, /合计7次/);
+  assert.match(cost, /¥5\.00/);
+  assert.match(models, /Beta.*¥3\.00 · 60\.0%.*Alpha.*¥2\.00 · 40\.0%/);
+  assert.equal(reads, rows.length, "单次聚合后，三卡不得重新读取原始requests");
+});
+
+test("摘要卡在替换输入后显示新数量和费用，空与加载不显示旧摘要", () => {
+  const previous = [row("Old", 9000000, 9)];
+  const next = [row("New", 2000000, 2)];
+  const summary = summarizeUsage(next);
+  assert.match(render("UsageRequestCard", next, null, summary), /合计2次/);
+  assert.match(text(render("UsageCostCard", next, null, summary)), /¥2\.00/);
+  assert.doesNotMatch(text(render("UsageModelsCard", next, null, summary)), /Old|¥9\.00/);
+  for (const name of ["UsageRequestCard", "UsageCostCard", "UsageModelsCard"]) {
+    // 即使旧摘要仍由上层持有，rows的未完成/空结果也必须优先。
+    const stale = summarizeUsage(previous);
+    const loading = render(name, null, null, stale);
+    const empty = text(render(name, [], null, stale));
+    assert.doesNotMatch(loading, /<svg/);
+    assert.match(empty, /所选范围内没有用量/);
+    assert.doesNotMatch(text(loading) + empty, /Old|¥9\.00|合计9次/);
+  }
+});
+
+test("请求趋势按期间先后显示，模型费用按数额排序而不是输入顺序", () => {
+  const rows = [
+    { ...row("Alpha", 1000000, 1), period_start: "2026-10-03T00:00:00Z" },
+    { ...row("Beta", 3000000, 3), period_start: "2026-10-01T00:00:00Z" },
+    { ...row("Alpha", 1000000, 1), period_start: "2026-10-02T00:00:00Z" },
+  ];
+  const requests = text(render("UsageRequestCard", rows));
+  const models = text(render("UsageModelsCard", rows));
+  const dates = ["2026-10-01", "2026-10-02", "2026-10-03"].map((date) => requests.indexOf(date));
+  assert.ok(dates.every((index) => index >= 0));
+  assert.ok(dates[0]! < dates[1]! && dates[1]! < dates[2]!);
+  assert.match(models, /Beta.*¥3\.00 · 60\.0%.*Alpha.*¥2\.00 · 40\.0%/);
 });

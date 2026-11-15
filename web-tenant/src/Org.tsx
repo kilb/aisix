@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import {
   ApiError,
   budgets as budgetApi,
@@ -108,7 +108,7 @@ export function Org({ member, status }: { member: SessionMember; status: TenantS
     return () => { live = false; };
   }, [access.usage, access.budgets, access.billing, member.id, member.role, range.from, range.to, refresh]);
 
-  const summary = rows === null ? null : summarizeUsage(rows);
+  const summary = useMemo(() => rows === null ? null : summarizeUsage(rows), [rows]);
   const rangeLabel = "最近 30 天";
   const scopeLabel = member.role === "member" ? "你的密钥" : "全组织";
   const retry = () => setRefresh((value) => value + 1);
@@ -124,10 +124,10 @@ export function Org({ member, status }: { member: SessionMember; status: TenantS
       <BentoGrid className="tenant-overview">
         <ApiMetricsPanel compact refreshKey={refresh} scope="tenant" enabled={access.usage} from={range.from} to={range.to} numberStart={1} className={span.d12} />
         {access.usage && <>
-          <UsageRequestCard rows={rows} error={usageErr} rangeLabel={`${rangeLabel} · ${scopeLabel}`} number={3} className={span.d8} onRetry={retry} />
-          <UsageCostCard rows={rows} error={usageErr} rangeLabel={`${rangeLabel} · ${scopeLabel}`} number={4} className={span.d4} onRetry={retry} />
+          <UsageRequestCard rows={rows} summary={summary} error={usageErr} rangeLabel={`${rangeLabel} · ${scopeLabel}`} number={3} className={span.d8} onRetry={retry} />
+          <UsageCostCard rows={rows} summary={summary} error={usageErr} rangeLabel={`${rangeLabel} · ${scopeLabel}`} number={4} className={span.d4} onRetry={retry} />
           <OverviewBudgets number={5} budgets={budgets} error={budgetErr} balance={balance} balanceError={balanceErr} showBalance={access.billing} onRetry={retry} />
-          <UsageModelsCard rows={rows} error={usageErr} rangeLabel={`${rangeLabel} · ${scopeLabel}`} number={6} className={span.d3} onRetry={retry} />
+          <UsageModelsCard rows={rows} summary={summary} error={usageErr} rangeLabel={`${rangeLabel} · ${scopeLabel}`} number={6} className={span.d3} onRetry={retry} />
         </>}
         <Card className={access.usage ? span.d4 : span.d6}>
           <CardHeader number={access.usage ? 7 : 1} title="组织资料" />
