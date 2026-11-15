@@ -130,6 +130,12 @@ impl Registry {
 
     fn assert_claim(&self, index: usize, family: Family, limit: u32) {
         let claims = self.claims.lock().unwrap();
+        assert!(
+            claims.len() > index,
+            "{family:?}: claim #{} was not started by the required tick; expected limit {limit}, observed {} claims",
+            index + 1,
+            claims.len()
+        );
         let request = &claims[index];
         assert_eq!(request.limit, limit, "{family:?}");
         assert_eq!(request.protocol, Some(family.protocol()), "{family:?}");
