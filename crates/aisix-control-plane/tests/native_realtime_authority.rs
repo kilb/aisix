@@ -1124,3 +1124,195 @@ async fn a_terminal_partial_report_does_not_become_complete_coverage() {
         "reported quantities remain billable even when the interval is incomplete"
     );
 }
+
+// 空终态只收束已接受的观察，不新增用量，也不续租。
+async fn terminal_empty_snapshot(f: &Fixture, operation: Uuid) -> Value {
+    sqlx::query_scalar(
+        r#"SELECT jsonb_build_object(
+          'identity',(SELECT to_jsonb(live)-ARRAY['state','coverage','accounting_state','closed_at','updated_at']::text[]
+            FROM native_live_sessions live WHERE environment_id=$1 AND operation_id=$2),
+          'entries',(SELECT COALESCE(jsonb_agg(to_jsonb(entry) ORDER BY entry_id),'[]'::jsonb)
+            FROM native_live_entries entry WHERE environment_id=$1 AND operation_id=$2),
+          'journal',(SELECT COALESCE(jsonb_agg(to_jsonb(journal) ORDER BY event_id),'[]'::jsonb)
+            FROM native_live_journal journal WHERE environment_id=$1 AND operation_id=$2),
+          'outbox',(SELECT COALESCE(jsonb_agg(to_jsonb(outbox)-ARRAY['delivered_at','pricing_state']::text[] ORDER BY outbox.event_id),'[]'::jsonb)
+            FROM native_live_outbox outbox JOIN native_live_journal journal ON journal.id=outbox.journal_id
+            WHERE journal.environment_id=$1 AND journal.operation_id=$2),
+          'ledger',(SELECT COALESCE(jsonb_agg(to_jsonb(ledger) ORDER BY ledger.event_id),'[]'::jsonb)
+            FROM native_live_outbox outbox JOIN native_live_journal journal ON journal.id=outbox.journal_id
+            JOIN billing_ledger_cny ledger ON ledger.event_id=outbox.event_id::text
+            WHERE journal.environment_id=$1 AND journal.operation_id=$2))"#,
+    )
+    .bind(f.cp.state().env.env_id)
+    .bind(operation)
+    .fetch_one(f.cp.db().pool())
+    .await
+    .expect("read actual identities and immutable accepted usage facts")
+}
+
+async fn assert_terminal_empty_close(f: &Fixture, accepted: &Value, session: &Value) {
+    let operation = id(accepted, "/operation_id");
+    let original_expiry: chrono::DateTime<Utc> =
+        serde_json::from_value(session["lease_expires_at"].clone())
+            .expect("create explicitly returned the original lease expiry");
+    let before = terminal_empty_snapshot(f, operation).await;
+    let request =
+        json!({"lease":session["lease"],"terminal":true,"coverage":"unknown","entries":[]});
+    let closed = post(&f.dp, "live/checkpoint", request.clone()).await;
+    assert_eq!(
+        closed.status, 200,
+        "accepted empty terminal cleanup: {closed:?}"
+    );
+    let record = &closed.body["live_session"];
+    assert_eq!(record["operation_id"], accepted["operation_id"]);
+    assert_eq!(record["api_key_id"], accepted["api_key_id"]);
+    assert_eq!(record["lease"], session["lease"]);
+    assert_eq!(record["state"], "closed");
+    assert_eq!(record["coverage"], "unknown");
+    assert_eq!(record["accounting_state"], "awaiting_reconciliation");
+    let actual_expiry: chrono::DateTime<Utc> =
+        serde_json::from_value(record["lease_expires_at"].clone())
+            .expect("close explicitly returns its lease expiry");
+    assert_eq!(
+        actual_expiry, original_expiry,
+        "terminal cleanup cannot extend the last accepted lease"
+    );
+    let persisted: (String, String, String, bool) = sqlx::query_as(
+        "SELECT state,coverage,accounting_state,closed_at IS NOT NULL FROM native_live_sessions WHERE environment_id=$1 AND operation_id=$2",
+    )
+    .bind(f.cp.state().env.env_id)
+    .bind(operation)
+    .fetch_one(f.cp.db().pool())
+    .await
+    .expect("read the durably closed lifecycle");
+    assert_eq!(
+        persisted,
+        (
+            "closed".into(),
+            "unknown".into(),
+            "awaiting_reconciliation".into(),
+            true
+        )
+    );
+    assert_eq!(terminal_empty_snapshot(f, operation).await, before,
+        "empty close preserves holder, generation, deadline, expiry, entries, nonzero quantities, outbox and existing debits");
+    let closed_at: Value = sqlx::query_scalar(
+        "SELECT to_jsonb(closed_at) FROM native_live_sessions WHERE environment_id=$1 AND operation_id=$2",
+    )
+    .bind(f.cp.state().env.env_id)
+    .bind(operation)
+    .fetch_one(f.cp.db().pool())
+    .await
+    .expect("read explicit durable closed_at");
+    assert!(!closed_at.is_null());
+    let replay = post(&f.dp, "live/checkpoint", request).await;
+    assert_eq!(
+        replay.status, 200,
+        "same-holder terminal replay: {replay:?}"
+    );
+    assert_eq!(replay.body["live_session"], closed.body["live_session"]);
+    let replay_closed_at: Value = sqlx::query_scalar(
+        "SELECT to_jsonb(closed_at) FROM native_live_sessions WHERE environment_id=$1 AND operation_id=$2",
+    )
+    .bind(f.cp.state().env.env_id)
+    .bind(operation)
+    .fetch_one(f.cp.db().pool())
+    .await
+    .expect("read replayed closed_at");
+    assert_eq!(replay_closed_at, closed_at);
+    assert_eq!(terminal_empty_snapshot(f, operation).await, before);
+}
+
+#[tokio::test]
+async fn terminal_empty_checkpoint_after_natural_expiry_closes_unknown_without_new_usage() {
+    let Some(f) = fixture().await else { return };
+    support::world::price(&f.cp, f.model).await;
+    let accepted = begin(&f.dp, &f.template).await;
+    let created = post(
+        &f.dp,
+        "live/create",
+        json!({
+            "operation_id":accepted["operation_id"],"api_key_id":accepted["api_key_id"],
+            "purpose":"realtime","transport":"web_socket",
+            "provider_session_id":format!("sess_terminal_expiry.{}",Uuid::new_v4()),
+            "deadline_at":Utc::now()+Duration::seconds(4)
+        }),
+    )
+    .await;
+    assert_eq!(
+        created.status, 200,
+        "public short-deadline admission: {created:?}"
+    );
+    let session = created.body["live_session"].clone();
+    assert_eq!(session["state"], "live");
+    assert!(session
+        .pointer("/lease/generation")
+        .and_then(Value::as_i64)
+        .is_some_and(|generation| generation > 0));
+    let report = usage(
+        &accepted,
+        &session,
+        "terminal.expiry.nonzero",
+        "terminal.expiry.response",
+    );
+    let appended = post(&f.dp, "live/append", report).await;
+    assert_eq!(
+        appended.status, 200,
+        "nonzero accepted fact before close: {appended:?}"
+    );
+    assert_eq!(appended.body.get("appended"), Some(&json!(true)));
+    assert_eq!(appended.body["live_session"]["state"], "live");
+    assert_eq!(appended.body["live_session"]["coverage"], "complete");
+    let operation = id(&accepted, "/operation_id");
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let count:i64=sqlx::query_scalar("SELECT count(*) FROM native_live_outbox outbox JOIN native_live_journal journal ON journal.id=outbox.journal_id JOIN billing_ledger_cny ledger ON ledger.event_id=outbox.event_id::text WHERE journal.operation_id=$1")
+                .bind(operation).fetch_one(f.cp.db().pool()).await.expect("read actual paid positive control");
+            if count == 1 { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }).await.expect("the real nonzero outbox reaches the existing billing ledger before cleanup");
+    let facts = terminal_empty_snapshot(&f, operation).await;
+    assert_eq!(facts["journal"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        facts.pointer("/journal/0/usage/0/meter/usage/prompt_tokens"),
+        Some(&json!(10))
+    );
+    assert_eq!(facts["outbox"].as_array().map(Vec::len), Some(1));
+    assert_eq!(facts["ledger"].as_array().map(Vec::len), Some(1));
+    let (expires, db_now): (chrono::DateTime<Utc>, chrono::DateTime<Utc>) = sqlx::query_as(
+        "SELECT lease_expires_at,clock_timestamp() FROM native_live_sessions WHERE environment_id=$1 AND operation_id=$2",
+    ).bind(f.cp.state().env.env_id).bind(operation).fetch_one(f.cp.db().pool()).await.expect("read the real unchanged lease and database clock");
+    let returned_expiry: chrono::DateTime<Utc> =
+        serde_json::from_value(session["lease_expires_at"].clone())
+            .expect("explicit admitted expiry");
+    assert_eq!(expires, returned_expiry);
+    let wait = expires
+        .signed_duration_since(db_now)
+        .to_std()
+        .unwrap_or_default();
+    tokio::time::sleep(wait + std::time::Duration::from_millis(25)).await;
+    let expired: bool = sqlx::query_scalar(
+        "SELECT lease_expires_at<=clock_timestamp() AND deadline_at<=clock_timestamp() FROM native_live_sessions WHERE environment_id=$1 AND operation_id=$2",
+    ).bind(f.cp.state().env.env_id).bind(operation).fetch_one(f.cp.db().pool()).await.expect("observe natural deadline/lease expiry without clock mutation");
+    assert!(
+        expired,
+        "the public admission naturally reaches its own persisted deadline and lease expiry"
+    );
+    assert_terminal_empty_close(&f, &accepted, &session).await;
+}
+
+#[tokio::test]
+async fn terminal_empty_checkpoint_before_expiry_preserves_original_expiry() {
+    let Some(f) = fixture().await else { return };
+    let (accepted, session) = create(&f.dp, &f.template, None).await;
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    let live: bool = sqlx::query_scalar(
+        "SELECT lease_expires_at>clock_timestamp() AND state='live' FROM native_live_sessions WHERE environment_id=$1 AND operation_id=$2",
+    ).bind(f.cp.state().env.env_id).bind(id(&accepted,"/operation_id")).fetch_one(f.cp.db().pool()).await.expect("the delayed terminal request still has a genuinely live lease");
+    assert!(live);
+    let facts = terminal_empty_snapshot(&f, id(&accepted, "/operation_id")).await;
+    assert_eq!(facts["journal"].as_array().map(Vec::len), Some(0));
+    assert_eq!(facts["outbox"].as_array().map(Vec::len), Some(0));
+    assert_terminal_empty_close(&f, &accepted, &session).await;
+}
