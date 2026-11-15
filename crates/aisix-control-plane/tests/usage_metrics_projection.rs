@@ -759,6 +759,144 @@ async fn backfill_does_not_jump_a_locked_first_row_and_completed_runs_never_scan
     assert_eq!((done.examined, done.written, done.deferred), (0, 0, 0));
 }
 
+async fn worker_checkpoint(cp: &TestCp) -> Result<(i64, i64, Option<i64>, bool), sqlx::Error> {
+    sqlx::query_as(
+        "SELECT (SELECT count(*) FROM usage_metric_inputs), after_seq, high_seq, complete \
+         FROM usage_metric_input_backfill WHERE version = 1",
+    )
+    .fetch_one(cp.db().pool())
+    .await
+}
+
+// 删除 housekeeping 的回填分支必须超时失败；此场景从不手动调用 backfill_once。
+#[tokio::test]
+async fn real_background_worker_recovers_a_locked_historical_hole_across_control_plane_restarts() {
+    let Some(mut cp) = TestCp::start().await else {
+        return;
+    };
+    pin_fixture_backfill_complete(&cp).await;
+    sqlx::query("ALTER TABLE usage_events DISABLE TRIGGER usage_metric_inputs_insert")
+        .execute(cp.db().pool())
+        .await
+        .expect("仅关闭本测试库的统计 INSERT 触发器");
+    let seeded = sqlx::query(
+        "INSERT INTO usage_events(event_id,dp_id,batch_id,occurred_at,event) \
+         SELECT 'input-worker-' || n, $1, $1, now(), jsonb_build_object('prompt_tokens',n) \
+         FROM generate_series(1,3) n ORDER BY n",
+    )
+    .bind(Uuid::new_v4())
+    .execute(cp.db().pool())
+    .await;
+    // 先恢复已提交的触发器状态，再处理造数错误。
+    sqlx::query("ALTER TABLE usage_events ENABLE TRIGGER usage_metric_inputs_insert")
+        .execute(cp.db().pool())
+        .await
+        .expect("恢复统计 INSERT 触发器");
+    assert_eq!(
+        seeded.expect("准备三条真实旧 writer 历史").rows_affected(),
+        3
+    );
+    let missing: i64 = sqlx::query_scalar("SELECT count(*) FROM usage_metric_inputs")
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("后台尚未恢复，必须确实没有投影");
+    assert_eq!(missing, 0);
+    let high: i64 = sqlx::query_scalar("SELECT max(seq) FROM usage_events")
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("已存历史的固定上界");
+    let money = finances(&cp).await;
+    let mut held = cp.db().pool().begin().await.expect("持有跨重启的首行锁");
+    let first: String =
+        sqlx::query_scalar("SELECT event_id FROM usage_events ORDER BY seq LIMIT 1 FOR UPDATE")
+            .fetch_one(&mut *held)
+            .await
+            .expect("首行 FOR UPDATE 已真实获得");
+    assert_eq!(first, "input-worker-1");
+    let reset = sqlx::query(
+        "UPDATE usage_metric_input_backfill SET after_seq = 0, high_seq = NULL, complete = false \
+         WHERE version = 1",
+    )
+    .execute(cp.db().pool())
+    .await;
+    if let Err(error) = reset {
+        held.rollback().await.expect("先释放首行锁");
+        panic!("恢复后台回填状态失败: {error}");
+    }
+    let restarted = tokio::time::timeout(Duration::from_secs(10), cp.restart()).await;
+    let next = match restarted {
+        Ok(next) => next,
+        Err(error) => {
+            held.rollback().await.expect("重启超时前先释放首行锁");
+            panic!("首洞锁不能阻止控制面重启: {error}");
+        }
+    };
+    drop(std::mem::replace(&mut cp, next));
+    let first_progress = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let state = worker_checkpoint(&cp).await?;
+            if state.0 >= 2 || state.1 != 0 || state.3 {
+                return Ok::<_, sqlx::Error>(state);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    let expected = (2, 0, Some(high), false);
+    let checkpoint = match first_progress {
+        Ok(Ok(state)) if state == expected => state,
+        other => {
+            held.rollback().await.expect("后台失败或超时后先释放首行锁");
+            panic!("没有新 UE 流量时，后台应补后两行但保留首洞；expected={expected:?}, actual={other:?}");
+        }
+    };
+    let restarted = tokio::time::timeout(Duration::from_secs(10), cp.restart()).await;
+    let next = match restarted {
+        Ok(next) => next,
+        Err(error) => {
+            held.rollback().await.expect("再次重启超时前先释放首行锁");
+            panic!("保留 checkpoint 的重启失败: {error}");
+        }
+    };
+    drop(std::mem::replace(&mut cp, next));
+    let persisted = tokio::time::timeout(Duration::from_secs(10), worker_checkpoint(&cp)).await;
+    let persisted = match persisted {
+        Ok(Ok(state)) => state,
+        other => {
+            held.rollback()
+                .await
+                .expect("检查 checkpoint 失败先释放首行锁");
+            panic!("重启后无法读取 checkpoint: {other:?}");
+        }
+    };
+    held.rollback().await.expect("第二次重启后释放历史首洞");
+    assert_eq!(persisted, checkpoint, "控制面重启不能重置持久 checkpoint");
+    let complete = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let state = worker_checkpoint(&cp).await?;
+            if state.0 >= 3 && state.3 {
+                return Ok::<_, sqlx::Error>(state);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("释放首洞后，新控制面的真实 worker 必须恢复回填")
+    .expect("读取后台完成状态");
+    assert_eq!(complete, (3, high, Some(high), true));
+    for n in 1..=3 {
+        let projected = input(&cp, &format!("input-worker-{n}")).await;
+        assert_eq!(field(&projected, "projection_version"), 1);
+        assert_eq!(field(&projected, "u32_prompt_tokens"), &json!(n));
+    }
+    let events: i64 = sqlx::query_scalar("SELECT count(*) FROM usage_events")
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("恢复过程未借助新的遥测流量");
+    assert_eq!(events, 3);
+    assert_eq!(finances(&cp).await, money, "历史后台只补投影，不改账务");
+}
+
 async fn stats_triggers(cp: &TestCp, enabled: bool) -> Result<(), sqlx::Error> {
     let mut tx = cp.db().pool().begin().await?;
     for name in ["usage_metric_inputs_insert", "usage_metric_inputs_update"] {
