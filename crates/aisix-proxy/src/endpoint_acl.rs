@@ -171,8 +171,8 @@ mod tests {
 
     use EndpointFamily as F;
 
-    /// Every family a route can be refused under: all but the catch-all.
-    const ROUTABLE_FAMILIES: [EndpointFamily; 26] = [
+    /// 已知的可写 family；退休族仍保留枚举与 API key 权限检查覆盖。
+    const KNOWN_FAMILIES: [EndpointFamily; 26] = [
         F::ChatCompletions,
         F::Completions,
         F::Embeddings,
@@ -199,6 +199,16 @@ mod tests {
         F::Mcp,
         F::A2a,
         F::Passthrough,
+    ];
+
+    /// 当前轻支持合同明确退休的整族；保留可写枚举不代表挂载路由。
+    const RETIRED_FAMILIES: &[(EndpointFamily, &str, &str)] = &[
+        (
+            F::FineTuning,
+            "/v1/fine_tuning",
+            "当前轻支持合同明确排除微调整族。",
+        ),
+        (F::Evals, "/v1/evals", "当前轻支持合同明确排除 Evals。"),
     ];
 
     /// What the endpoint check owes each route `build_router` mounts.
@@ -393,8 +403,8 @@ mod tests {
     #[test]
     fn a_key_without_an_endpoint_list_may_call_every_family() {
         let k = key_with(None);
-        assert!(ROUTABLE_FAMILIES.iter().all(|f| k.can_call(*f)));
-        assert!(ROUTABLE_FAMILIES
+        assert!(KNOWN_FAMILIES.iter().all(|f| k.can_call(*f)));
+        assert!(KNOWN_FAMILIES
             .iter()
             .all(|f| check_endpoint(&k, *f).is_ok()));
     }
@@ -408,7 +418,7 @@ mod tests {
             check_endpoint(&k, F::Images),
             Err(ProxyError::EndpointForbidden(_))
         ));
-        for family in ROUTABLE_FAMILIES {
+        for family in KNOWN_FAMILIES {
             let listed = matches!(family, F::ChatCompletions | F::Models);
             assert_eq!(check_endpoint(&k, family).is_ok(), listed, "{family:?}");
         }
@@ -418,7 +428,7 @@ mod tests {
     fn an_empty_list_refuses_every_family() {
         assert!(!key_with(Some(vec![])).can_call(F::Models));
         let k = key_with(Some(vec![]));
-        assert!(ROUTABLE_FAMILIES
+        assert!(KNOWN_FAMILIES
             .iter()
             .all(|f| check_endpoint(&k, *f).is_err()));
     }
@@ -433,7 +443,7 @@ mod tests {
             "allowed_endpoints": ["video_editing_v9", "speech_to_speech"],
         }))
         .unwrap();
-        for family in ROUTABLE_FAMILIES {
+        for family in KNOWN_FAMILIES {
             assert!(
                 matches!(
                     check_endpoint(&k, family),
@@ -549,9 +559,7 @@ mod tests {
         }
     }
 
-    /// The hand-written family list is the enum, as the write schema names
-    /// it; and every family is reached somewhere: by a mounted route, or by
-    /// the passthrough routes that check their own.
+    /// 可写枚举始终完整；活跃族必须可达，明确退休的整族必须无挂载。
     #[test]
     fn every_family_is_routable_and_the_list_is_the_enum() {
         let strict = aisix_core::models::schema::resource_root_schema("api_key", true);
@@ -562,7 +570,7 @@ mod tests {
             .iter()
             .map(|v| v.as_str().unwrap().to_owned())
             .collect();
-        let listed: std::collections::BTreeSet<String> = ROUTABLE_FAMILIES
+        let listed: std::collections::BTreeSet<String> = KNOWN_FAMILIES
             .iter()
             .map(|f| {
                 serde_json::to_value(f)
@@ -574,6 +582,14 @@ mod tests {
             .collect();
         assert_eq!(listed, written);
 
+        let known: std::collections::BTreeSet<_> = KNOWN_FAMILIES.into_iter().collect();
+        let retired: std::collections::BTreeSet<_> = RETIRED_FAMILIES
+            .iter()
+            .map(|(family, _, _)| *family)
+            .collect();
+        assert_eq!(retired.len(), RETIRED_FAMILIES.len());
+        assert!(retired.is_subset(&known), "退休族必须属于已知可写枚举");
+        let active: std::collections::BTreeSet<_> = known.difference(&retired).copied().collect();
         let reached: std::collections::BTreeSet<EndpointFamily> = ROUTES
             .iter()
             .filter_map(|(_, expect)| match expect {
@@ -582,10 +598,17 @@ mod tests {
             })
             .chain([F::Passthrough])
             .collect();
-        for family in ROUTABLE_FAMILIES {
+        assert_eq!(active, reached, "活跃族与实际路由分类必须完整对应");
+
+        let mounted = mounted_surfaces();
+        for (family, prefix, reason) in RETIRED_FAMILIES {
+            assert!(!reason.trim().is_empty(), "{family:?} 退休缺少理由");
+            let descendants = format!("{prefix}/");
             assert!(
-                reached.contains(&family),
-                "{family:?} is reached by no route"
+                !mounted.iter().any(|route| {
+                    route.as_str() == *prefix || route.starts_with(descendants.as_str())
+                }),
+                "{family:?} 已退休但仍挂载路由"
             );
         }
     }
@@ -799,7 +822,7 @@ mod tests {
             assert_eq!(body["error"]["message"], REFUSAL, "{body}");
             assert_eq!(body["error"]["type"], "permission_denied", "{body}");
             let text = body.to_string();
-            for name in ROUTABLE_FAMILIES {
+            for name in KNOWN_FAMILIES {
                 let name = serde_json::to_value(name).unwrap();
                 let name = name.as_str().unwrap();
                 assert!(!text.contains(name), "{name} in {text}");
