@@ -1622,3 +1622,6 @@ async fn canonical_terminal_preserves_reported_modality_zero_and_never_invents_a
 
 #[path = "standalone_batch_file_context_tests.rs"]
 mod batch_file_context;
+
+#[path = "standalone_realtime_store_tests.rs"]
+mod realtime;
