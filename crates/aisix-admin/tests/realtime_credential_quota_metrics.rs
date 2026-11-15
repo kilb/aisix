@@ -147,9 +147,18 @@ fn assert_gauge(scrape: &str, family: &str, purpose: Purpose, expected: u64) {
         "one actual caller/model window series must exist"
     );
     let line = lines[0];
+    // 本 fixture 的 ID/alias 不含逗号或转义；只比较完整标签项，防止错误前缀误中。
+    let labels = line
+        .strip_prefix(&prefix)
+        .and_then(|remainder| remainder.split_once('}'))
+        .map(|(labels, _)| labels);
+    let key_label = format!("api_key_id=\"{}\"", purpose.key_id());
+    let model_label = format!("model=\"{}\"", purpose.alias());
     assert!(
-        line.contains(&format!("api_key_id=\"{}\"", purpose.key_id()))
-            && line.contains(&format!("model=\"{}\"", purpose.alias())),
+        labels.is_some_and(|labels| {
+            labels.split(',').any(|label| label == key_label)
+                && labels.split(',').any(|label| label == model_label)
+        }),
         "window labels must identify the actual creator key and resolved public alias"
     );
     let actual = line
