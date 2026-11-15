@@ -703,7 +703,9 @@ async fn begin_with_locked_parent(
         "SELECT doc ->> 'provider' FROM gw_resources WHERE kind = 'models' AND id = $1 AND NOT deleted",
     ).bind(body.origin.model_id).fetch_one(&mut *conn).await.map_err(unavailable)?.unwrap_or_default();
     let mut entries = BTreeSet::new();
-    let base_submission = body.clone();
+    let mut base_submission = body.clone();
+    base_submission.entries.clear();
+    base_submission.usage_context = None;
     for entry in &mut body.entries {
         if matches!(
             body.kind,
