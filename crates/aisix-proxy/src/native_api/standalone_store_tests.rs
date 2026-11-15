@@ -1631,3 +1631,6 @@ mod realtime;
 
 #[path = "standalone_polling_index_tests.rs"]
 mod polling_indexes;
+
+#[path = "standalone_outbox_serialization_tests.rs"]
+pub(super) mod outbox_serialization;

@@ -146,6 +146,8 @@ fn unavailable<T>(_: T) -> Error {
     Error::Unavailable
 }
 fn json<T: Serialize>(value: &T) -> Result<String> {
+    #[cfg(test)]
+    tests::outbox_serialization::record_json::<T>();
     serde_json::to_string(value).map_err(unavailable)
 }
 fn decode<T: DeserializeOwned>(value: &str) -> Result<T> {
