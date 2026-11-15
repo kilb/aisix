@@ -3,7 +3,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use aisix_core::native_metering::{ObservedMeter, ObservedUsage};
+use aisix_core::native_metering::{
+    AudioMeasurementBasis, MeasurementSource, ObservedMeter, ObservedUsage,
+};
 use aisix_core::native_objects::{
     BeginRequest, NativeEntry, NativeObjectKind, NativeProtocol, NativeReply, OriginBinding,
     TerminalUsage,
@@ -670,26 +672,49 @@ impl Journal {
             let Some(entry) = entry else {
                 return self.unknown_usage(&event["usage"]).await;
             };
-            let Some(mut measured) = terminal_usage(&event["usage"], Some("completed")) else {
+            // 供应商转录可按输入秒数报告，包括显式 0；不将缺价秒量改成 token 或零账。
+            let meter = if event["usage"]["type"].as_str() == Some("duration") {
+                event["usage"]["seconds"].as_number().and_then(|number| {
+                    let mut seconds = number.to_string();
+                    if seconds.contains(['e', 'E']) {
+                        seconds = number.as_f64()?.to_string();
+                    }
+                    aisix_core::native_metering::validate_reported_seconds(&seconds).ok()?;
+                    Some(ObservedMeter::AudioSeconds {
+                        seconds,
+                        basis: AudioMeasurementBasis::InputAudioSeconds,
+                        source: MeasurementSource::SupplierReported,
+                    })
+                })
+            } else {
+                terminal_usage(&event["usage"], Some("completed")).map(|mut measured| {
+                    measured.entry_id = entry.accepted.entry_id.clone();
+                    ObservedMeter::Tokens { usage: measured }
+                })
+            };
+            let Some(meter) = meter else {
                 return self.unknown_usage(&event["usage"]).await;
             };
             let Some((id, index)) = identity else {
                 return Ok(true);
             };
             let fact = format!("transcription:{:x}:{index}", Sha256::digest(id.as_bytes()));
-            measured.entry_id = entry.accepted.entry_id.clone();
+            let entry_id = entry.accepted.entry_id.clone();
             let upstream_model = entry.accepted.upstream_model.clone();
-            let at = measured.occurred_at;
+            let at = match &meter {
+                ObservedMeter::Tokens { usage } => usage.occurred_at,
+                _ => Utc::now(),
+            };
             self.pending = Some(AppendLiveUsageRequest {
                 operation_id: self.lease.operation_id,
                 api_key_id: self.api_key_id,
                 event_id: fact.clone(),
                 response_id: Some(fact),
                 usage: vec![ObservedUsage {
-                    entry_id: measured.entry_id.clone(),
+                    entry_id,
                     upstream_model,
                     occurred_at: at,
-                    meter: ObservedMeter::Tokens { usage: measured },
+                    meter,
                 }],
                 coverage: UsageCoverage::Complete,
                 terminal: false,
