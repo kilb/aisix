@@ -863,3 +863,172 @@ fn repeated_first_frame_observation_keeps_the_original_sample() {
     observer.clone().note_first_frame();
     assert_eq!(observer.first_frame_at(), Some(first));
 }
+
+// 删除首个已解析 error/ping 的源观测，必须使对应的首帧断言失败。
+// error 与 ping 都是已定义事件：https://platform.claude.com/docs/en/build-with-claude/streaming
+async fn parsed_event_before_message_start(endpoint: &str, ping_first: bool, prefetch: bool) {
+    use aisix_provider_anthropic::AnthropicBridge;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_upstream = calls.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let upstream = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().route(
+                "/v1/messages",
+                axum::routing::post(move || {
+                    let calls = calls_upstream.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::Relaxed);
+                        let bytes = async_stream::stream! {
+                            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+                            if ping_first {
+                                yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+                                    b"event: ping\ndata: {\"type\":\"ping\"}\n\n",
+                                ));
+                                tokio::time::sleep(BODY_DELAY).await;
+                                yield Ok(bytes::Bytes::from_static(
+                                    b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_after_ping\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-5-haiku-20241022\",\"stop_reason\":null,\"usage\":{\"input_tokens\":13,\"output_tokens\":0}}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"answer-after-ping\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":5}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+                                ));
+                            } else {
+                                yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+                                    b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"the upstream is temporarily overloaded\"}}\n\n",
+                                ));
+                            }
+                        };
+                        axum::http::Response::builder()
+                            .header("content-type", "text/event-stream")
+                            .body(Body::from_stream(bytes))
+                            .unwrap()
+                    }
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+    });
+    let snapshot = AisixSnapshot::new();
+    snapshot
+        .provider_keys
+        .insert(matrix_anthropic_pk(&format!("http://{address}")));
+    let mut model = (*anthropic_model_entry("parsed-clock").value).clone();
+    model.stream_timeout = prefetch.then_some(5_000);
+    model.retries = Some(0);
+    snapshot
+        .models
+        .insert(ResourceEntry::new("model-anthropic-1", model, 1));
+    snapshot
+        .apikeys
+        .insert(apikey_entry("sk-caller", &["parsed-clock"]));
+    let hub = Arc::new(Hub::new());
+    hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let state = build_state(snapshot, hub).with_usage_sink(aisix_obs::UsageSink::new(tx));
+    let metrics = state.metrics.clone();
+    let body = if endpoint == "/v1/responses" {
+        serde_json::json!({
+            "model":"parsed-clock", "input":"hi", "stream":true, "max_output_tokens":16
+        })
+    } else {
+        serde_json::json!({
+            "model":"parsed-clock", "messages":[{"role":"user","content":"hi"}],
+            "max_tokens":16, "stream":true
+        })
+    };
+    let response = build_router(state)
+        .oneshot(cancellable_request(endpoint, body))
+        .await
+        .unwrap();
+    if ping_first {
+        assert_eq!(response.status(), StatusCode::OK);
+    } else if prefetch {
+        assert!(response.status().is_server_error());
+    }
+    let delivered = String::from_utf8(
+        to_bytes(response.into_body(), 65_536)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    let event = next_event(&mut rx).await;
+    upstream.abort();
+    assert_eq!(calls.load(Ordering::Relaxed), 1, "不能重派已经回答的流");
+    assert!(event.is_final_attempt);
+    assert!(rx.try_recv().is_err(), "一次请求只能结算一次");
+    if ping_first {
+        assert_eq!(event.status_code, 200);
+        assert!(delivered.contains("answer-after-ping"), "{delivered}");
+        assert_eq!((event.prompt_tokens, event.completion_tokens), (13, 5));
+        assert!(event
+            .first_token_latency_ms
+            .is_some_and(|value| value >= 1_200));
+        assert!(event.upstream_latency_ms >= 1_200);
+    } else {
+        assert!(event.status_code >= 500, "{event:?}");
+        assert!(delivered.contains("overloaded"), "{delivered}");
+        assert_eq!((event.prompt_tokens, event.completion_tokens), (0, 0));
+        assert!(event.first_token_latency_ms.is_none());
+    }
+    assert!(
+        event.upstream_ttft_ms > 0 && event.upstream_ttft_ms < 600,
+        "{endpoint}, ping={ping_first}, prefetch={prefetch}: 首个已解析事件应当立即停表：{}ms",
+        event.upstream_ttft_ms
+    );
+    let rendered = metrics.render();
+    let counts: Vec<_> = rendered
+        .lines()
+        .filter(|line| {
+            line.starts_with("aisix_request_ttft_seconds_count{")
+                && line.contains(&format!("endpoint=\"{endpoint}\""))
+                && line.contains("side=\"upstream\"")
+        })
+        .collect();
+    assert_eq!(counts.len(), 1, "{rendered}");
+    assert_eq!(counts[0].rsplit_once(' ').unwrap().1, "1", "{rendered}");
+}
+
+#[tokio::test]
+async fn parsed_error_only_chat_retains_the_first_frame() {
+    for prefetch in [false, true] {
+        parsed_event_before_message_start("/v1/chat/completions", false, prefetch).await;
+    }
+}
+
+#[tokio::test]
+async fn parsed_error_only_responses_retains_the_first_frame() {
+    for prefetch in [false, true] {
+        parsed_event_before_message_start("/v1/responses", false, prefetch).await;
+    }
+}
+
+#[tokio::test]
+async fn parsed_error_only_native_messages_retains_the_first_frame() {
+    for prefetch in [false, true] {
+        parsed_event_before_message_start("/v1/messages", false, prefetch).await;
+    }
+}
+
+#[tokio::test]
+async fn parsed_ping_chat_precedes_delayed_message_start() {
+    for prefetch in [false, true] {
+        parsed_event_before_message_start("/v1/chat/completions", true, prefetch).await;
+    }
+}
+
+#[tokio::test]
+async fn parsed_ping_responses_precedes_delayed_message_start() {
+    for prefetch in [false, true] {
+        parsed_event_before_message_start("/v1/responses", true, prefetch).await;
+    }
+}
+
+#[tokio::test]
+async fn parsed_ping_native_messages_precedes_delayed_message_start() {
+    for prefetch in [false, true] {
+        parsed_event_before_message_start("/v1/messages", true, prefetch).await;
+    }
+}
