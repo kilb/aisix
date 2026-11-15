@@ -266,6 +266,70 @@ struct RelayTransportState {
     release: Notify,
     delivered: AtomicBool,
     delivered_notify: Notify,
+    completed_connections: AtomicUsize,
+    failed: AtomicBool,
+    teardown: AtomicBool,
+}
+
+// 只有四份尾量都已交付后的关闭阶段，或明确 Drop，才允许 TCP 正常终结。
+fn transport_ending_allowed(state: &RelayTransportState) -> bool {
+    state.teardown.load(Ordering::Acquire)
+        || (state.close_seen.load(Ordering::Acquire)
+            && state.delivered.load(Ordering::Acquire)
+            && state.buffered_text_frames.load(Ordering::Acquire) == 4)
+}
+
+fn transport_end_diagnostic(state: &RelayTransportState, stage: &str, ending: &str) {
+    eprintln!(
+        "two-tail transport diagnostic: stage={stage} ending={ending} close_seen={} delivered={} buffered_text_frames={} teardown={}",
+        state.close_seen.load(Ordering::Acquire),
+        state.delivered.load(Ordering::Acquire),
+        state.buffered_text_frames.load(Ordering::Acquire),
+        state.teardown.load(Ordering::Acquire),
+    );
+}
+
+fn transport_read(
+    result: std::io::Result<usize>,
+    state: &RelayTransportState,
+    stage: &str,
+) -> usize {
+    match result {
+        Ok(0) if transport_ending_allowed(state) => {
+            transport_end_diagnostic(state, stage, "eof");
+            0
+        }
+        Ok(0) => panic!("premature two-tail transport EOF: stage={stage}"),
+        Ok(length) => length,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::ConnectionReset
+                && transport_ending_allowed(state) =>
+        {
+            transport_end_diagnostic(state, stage, "connection_reset");
+            0
+        }
+        Err(error) => panic!(
+            "unexpected two-tail transport read error: stage={stage} kind={:?}",
+            error.kind()
+        ),
+    }
+}
+
+fn transport_write(result: std::io::Result<()>, state: &RelayTransportState, stage: &str) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::ConnectionReset
+                && transport_ending_allowed(state) =>
+        {
+            transport_end_diagnostic(state, stage, "connection_reset");
+            false
+        }
+        Err(error) => panic!(
+            "unexpected two-tail transport write error: stage={stage} kind={:?}",
+            error.kind()
+        ),
+    }
 }
 
 struct DelayedTransport {
@@ -291,6 +355,9 @@ impl DelayedTransport {
             release: Notify::new(),
             delivered: AtomicBool::new(false),
             delivered_notify: Notify::new(),
+            completed_connections: AtomicUsize::new(0),
+            failed: AtomicBool::new(false),
+            teardown: AtomicBool::new(false),
         });
         let shared = state.clone();
         let task = tokio::spawn(async move {
@@ -309,7 +376,7 @@ impl DelayedTransport {
                                 let mut observer=FrameObserver::default();
                                 let mut bytes=[0_u8;16384];
                                 loop {
-                                    let length=client_read.read(&mut bytes).await.expect("read actual gateway transport bytes");
+                                    let length=transport_read(client_read.read(&mut bytes).await,&state,"gateway_to_supplier_read");
                                     if length==0 { break; }
                                     let opcodes=observer.observe(&bytes[..length]);
                                     if state.holding.load(Ordering::Acquire) && opcodes.contains(&8) {
@@ -321,9 +388,9 @@ impl DelayedTransport {
                                             delivered.await;
                                         }
                                     }
-                                    if server_write.write_all(&bytes[..length]).await.is_err() { break; }
+                                    if !transport_write(server_write.write_all(&bytes[..length]).await,&state,"gateway_to_supplier_write") { break; }
                                 }
-                                let _=server_write.shutdown().await;
+                                transport_write(server_write.shutdown().await,&state,"supplier_write_shutdown");
                             };
                             let toward_gateway=async {
                                 let mut observer=FrameObserver::default();
@@ -333,31 +400,39 @@ impl DelayedTransport {
                                 loop {
                                     tokio::select! {
                                         _=state.release.notified(),if !released=>{
-                                            client_write.write_all(&buffered).await.expect("deliver already-in-flight supplier tails after actual gateway Close");
-                                            client_write.flush().await.expect("flush original supplier bytes unchanged");
+                                            assert!(transport_write(client_write.write_all(&buffered).await,&state,"buffered_tail_write"),"all original tail bytes must be delivered before any transport ending is accepted");
+                                            assert!(transport_write(client_write.flush().await,&state,"buffered_tail_flush"),"all original tail bytes must be flushed before any transport ending is accepted");
                                             buffered.clear();
                                             released=true;
                                             state.delivered.store(true,Ordering::Release);
                                             state.delivered_notify.notify_waiters();
                                         }
                                         length=server_read.read(&mut bytes)=>{
-                                            let length=length.expect("read actual supplier transport bytes");
+                                            let length=transport_read(length,&state,"supplier_to_gateway_read");
                                             if length==0 { break; }
                                             let opcodes=observer.observe(&bytes[..length]);
                                             if state.holding.load(Ordering::Acquire) && !released {
                                                 buffered.extend_from_slice(&bytes[..length]);
                                                 state.buffered_text_frames.fetch_add(opcodes.iter().filter(|opcode|**opcode==1).count(),Ordering::AcqRel);
-                                            } else if client_write.write_all(&bytes[..length]).await.is_err() { break; }
+                                            } else if !transport_write(client_write.write_all(&bytes[..length]).await,&state,"supplier_to_gateway_write") { break; }
                                         }
                                     }
                                 }
-                                let _=client_write.shutdown().await;
+                                transport_write(client_write.shutdown().await,&state,"gateway_write_shutdown");
                             };
                             tokio::join!(toward_supplier,toward_gateway);
                         });
                     }
                     done=connections.join_next(),if !connections.is_empty()=>{
-                        if let Some(done)=done { done.expect("the transparent transport component must not panic"); }
+                        if let Some(done)=done {
+                            match done {
+                                Ok(())=>{shared.completed_connections.fetch_add(1,Ordering::AcqRel);}
+                                Err(error)=>{
+                                    shared.failed.store(true,Ordering::Release);
+                                    panic!("the transparent transport component task failed: panic={} canceled={}",error.is_panic(),error.is_cancelled());
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -380,10 +455,28 @@ impl DelayedTransport {
             "no supplier tail was emitted after this peer received Close"
         );
     }
+
+    async fn drained(&self) {
+        tokio::time::timeout(IO_LIMIT, async {
+            loop {
+                assert!(!self.state.failed.load(Ordering::Acquire), "an unexpected transparent transport task failure must fail the component check");
+                if self.state.completed_connections.load(Ordering::Acquire)
+                    == self.state.connections.load(Ordering::Acquire) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("the transparent transport completes within its finite component drain budget");
+        assert!(
+            !self.state.failed.load(Ordering::Acquire),
+            "the transparent transport reports every unexpected task failure"
+        );
+    }
 }
 
 impl Drop for DelayedTransport {
     fn drop(&mut self) {
+        self.state.teardown.store(true, Ordering::Release);
         self.task.abort();
     }
 }
@@ -524,6 +617,7 @@ impl Provider {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }).await.expect("the actual supplier drains and completes its legal Close handshake within a finite budget");
+        self.transport.drained().await;
     }
 }
 
