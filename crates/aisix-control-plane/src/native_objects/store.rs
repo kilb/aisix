@@ -34,6 +34,10 @@ use aisix_core::native_realtime::{
 };
 use foundation::{derive_object, insert_membership};
 
+#[cfg(test)]
+#[path = "store/begin_perf_tests.rs"]
+mod begin_perf_tests;
+
 pub(crate) enum Command {
     Begin(Box<BeginRequest>),
     Bind(BindRequest),
@@ -192,6 +196,8 @@ async fn load_origin_resources(
     provider_ids: &[Uuid],
     check_models: bool,
 ) -> Result<OriginResources, ApiError> {
+    #[cfg(test)]
+    begin_perf_tests::resource_load();
     let rows: Vec<(String, Uuid, Value)> = sqlx::query_as(&format!(
         "SELECT kind, id, doc FROM gw_resources WHERE NOT deleted AND \
          ((kind = 'models' AND id = ANY($1)) OR (kind = 'provider_keys' AND id = ANY($2))) \
@@ -693,16 +699,22 @@ async fn begin_with_locked_parent(
     let consumer_family = batch_input.then_some(EndpointFamily::Batches);
     let principal = principal(&mut *conn, body.api_key_id).await?;
     origin_for_consumer(&mut *conn, state, Some(&principal), &body, consumer_family).await?;
+    #[cfg(test)]
+    begin_perf_tests::scalar_read();
     let upstream: Option<String> = sqlx::query_scalar(
         "SELECT doc ->> 'model_name' FROM gw_resources WHERE kind = 'models' AND id = $1 AND NOT deleted",
     ).bind(body.origin.model_id).fetch_optional(&mut *conn).await.map_err(unavailable)?.flatten();
     if upstream.as_deref() != Some(body.upstream_model.as_str()) {
         return Err(invalid("/upstream_model"));
     }
+    #[cfg(test)]
+    begin_perf_tests::scalar_read();
     body.upstream_provider = sqlx::query_scalar::<_, Option<String>>(
         "SELECT doc ->> 'provider' FROM gw_resources WHERE kind = 'models' AND id = $1 AND NOT deleted",
     ).bind(body.origin.model_id).fetch_one(&mut *conn).await.map_err(unavailable)?.unwrap_or_default();
     let mut entries = BTreeSet::new();
+    #[cfg(test)]
+    begin_perf_tests::working_copy(&body);
     let mut base_submission = body.clone();
     base_submission.entries.clear();
     base_submission.usage_context = None;
@@ -746,6 +758,8 @@ async fn begin_with_locked_parent(
         {
             return Err(invalid("/entries"));
         }
+        #[cfg(test)]
+        begin_perf_tests::working_copy(&base_submission);
         let mut entry_submission = base_submission.clone();
         entry_submission.origin.model_id = entry.model_id;
         entry_submission.requested_model_id = entry.requested_model_id;
@@ -760,12 +774,16 @@ async fn begin_with_locked_parent(
             consumer_family,
         )
         .await?;
+        #[cfg(test)]
+        begin_perf_tests::scalar_read();
         let upstream: Option<String> = sqlx::query_scalar(
             "SELECT doc ->> 'model_name' FROM gw_resources WHERE kind = 'models' AND id = $1 AND NOT deleted",
         ).bind(entry.model_id).fetch_optional(&mut *conn).await.map_err(unavailable)?.flatten();
         if upstream.as_deref() != Some(entry.upstream_model.as_str()) {
             return Err(invalid("/entries/upstream_model"));
         }
+        #[cfg(test)]
+        begin_perf_tests::scalar_read();
         let current_name = sqlx::query_scalar::<_, Option<String>>(
             "SELECT doc ->> 'display_name' FROM gw_resources WHERE kind = 'models' AND id = $1 AND NOT deleted",
         ).bind(entry.requested_model_id).fetch_one(&mut *conn).await.map_err(unavailable)?
@@ -775,6 +793,8 @@ async fn begin_with_locked_parent(
         } else if !text_ok(&entry.requested_model, 256) {
             return Err(invalid("/entries/requested_model"));
         }
+        #[cfg(test)]
+        begin_perf_tests::scalar_read();
         entry.upstream_provider = sqlx::query_scalar::<_, Option<String>>(
             "SELECT doc ->> 'provider' FROM gw_resources WHERE kind = 'models' AND id = $1 AND NOT deleted",
         ).bind(entry.model_id).fetch_one(&mut *conn).await.map_err(unavailable)?.unwrap_or_default();
