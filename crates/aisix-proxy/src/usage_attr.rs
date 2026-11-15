@@ -2409,8 +2409,16 @@ fn record_recovered_first_frame(
         .unwrap_or("unknown");
     let (model, upstream_model) =
         metric_model_label_pair(snap, &event.requested_model, upstream_model);
-    let caller = crate::request_metrics::Caller::from_api_key_id(snap, &event.api_key_id);
-    let caller = caller.as_caller();
+    // 使用事件已经固定的 caller 身份，不在取消时按可能已改归属的 key 重建。
+    let team = snap.teams.get_by_id(&event.team_id);
+    let team_name = team.as_ref().map(|entry| entry.value.name.as_str());
+    fn known(value: &str) -> &str {
+        if value.is_empty() {
+            crate::request_metrics::UNKNOWN
+        } else {
+            value
+        }
+    }
     state.metrics.record_ttft(
         aisix_obs::LatencyLabels {
             endpoint,
@@ -2427,12 +2435,12 @@ fn record_recovered_first_frame(
                 upstream_model: upstream_model.as_ref(),
                 provider_key_id: labels.provider_key_id,
                 provider_key_name: labels.provider_key_name,
-                api_key_id: caller.api_key_id,
-                api_key_name: caller.api_key_name,
-                team_id: caller.team_id,
-                team_name: caller.team_name,
-                user_id: caller.user_id,
-                user_name: caller.user_name,
+                api_key_id: known(&event.api_key_id),
+                api_key_name: known(&event.api_key_name),
+                team_id: known(&event.team_id),
+                team_name: known(team_name.unwrap_or_default()),
+                user_id: known(&event.user_id),
+                user_name: known(&event.user_name),
             },
         },
         Some(ttft),
