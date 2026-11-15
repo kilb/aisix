@@ -1837,6 +1837,7 @@ async fn anthropic_passthrough_dispatch(
                 aisix_gateway::NativeMessages::Json(mut message) if synthetic_json => {
                     aisix_provider_anthropic::json_tool::unwrap(&mut message);
                     if is_stream {
+                        aisix_gateway::response_tap::note_buffered_stream();
                         let frames = aisix_provider_anthropic::json_tool::into_sse_frames(&message);
                         Upstream::Native(aisix_gateway::NativeMessages::Stream(Box::pin(
                             futures::stream::iter(frames.into_iter().map(Ok)),
@@ -5645,6 +5646,8 @@ where
     S: Stream<Item = Result<Bytes, crate::stream_timeout::RawStreamError>> + Send + 'static,
     F: FnOnce(AnthropicStreamUsage) + Send + 'static,
 {
+    let buffered_stream =
+        aisix_gateway::response_tap::stream_timing().is_some_and(|timing| timing.buffered);
     let delivered = Arc::new(AtomicU32::new(0));
     let delivered_for_drop = Arc::clone(&delivered);
     // #932 / #466-class: under a hold-back policy the passthrough buffers
@@ -5676,7 +5679,8 @@ where
         futures::pin_mut!(upstream);
         let mut buf: Vec<u8> = Vec::new();
         let mut scanned = 0usize;
-        let mut first_token_seen = false;
+        // 模拟流没有可测的上游首帧；只跳过计时，仍解析并结算每个事件。
+        let mut first_token_seen = buffered_stream;
         // Whole-response hold-back buffer (BufferFull and Window policies).
         let mut held: Vec<u8> = Vec::new();
         let mut held_len = crate::held_content::HeldBytes::default();
