@@ -37,6 +37,8 @@
 #[cfg(test)]
 mod indexed_contract_tests;
 #[cfg(test)]
+mod metric_key_tests;
+#[cfg(test)]
 mod performance_contract_tests;
 #[cfg(test)]
 pub(crate) mod performance_regression_tests;
@@ -2369,7 +2371,14 @@ pub(crate) fn resolve_attempt_models(
         resolved.sort_by_key(|a| std::cmp::Reverse(a.priority));
     }
     if let Some(origin) = req.context_origin {
-        resolved = pin_context_origin(snapshot, runtime_status, &attempts, &indices, resolved, origin);
+        resolved = pin_context_origin(
+            snapshot,
+            runtime_status,
+            &attempts,
+            &indices,
+            resolved,
+            origin,
+        );
         tracing::debug!(
             virtual_model = %virtual_name,
             origin,
