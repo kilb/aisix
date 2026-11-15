@@ -119,10 +119,11 @@ impl RoutingRegistry {
             for (declaration, &index) in configured.iter().enumerate() {
                 let target = &routing.targets[index];
                 // 持有当前快照条目并借用名称；热环查询不为每个 ID 声明复制字符串。
-                let resolved = target
-                    .model_id
-                    .as_deref()
-                    .and_then(|id| snapshot.models.get_by_id(id));
+                let resolved = target.model_id.as_deref().and_then(|id| {
+                    #[cfg(test)]
+                    performance_regression_tests::note_configured_id_lookup();
+                    snapshot.models.get_by_id(id)
+                });
                 let name = resolved
                     .as_ref()
                     .map(|entry| entry.value.display_name.as_str())

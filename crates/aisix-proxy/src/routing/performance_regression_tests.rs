@@ -24,6 +24,15 @@ thread_local! {
     static AFFINITY_PROBES: Cell<Option<usize>> = const { Cell::new(None) };
     static WRR_PAUSE: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
     static RING_BUILDS: Cell<Option<usize>> = const { Cell::new(None) };
+    static CONFIGURED_ID_LOOKUPS: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+pub(crate) fn note_configured_id_lookup() {
+    CONFIGURED_ID_LOOKUPS.with(|slot| {
+        if let Some(lookups) = slot.get() {
+            slot.set(Some(lookups + 1));
+        }
+    });
 }
 
 pub(crate) fn note_ring_build() {
@@ -146,6 +155,83 @@ fn alternating_filtered_hash_subsets_do_not_rebuild_warm_rings() {
             0,
             "count={count}: warm filtered subsets rebuilt their rings"
         );
+    }
+}
+
+#[test]
+fn warm_hash_subsets_do_not_resolve_configured_model_ids_again() {
+    // 恢复每次完整配置 ID 解析会产生 D×requests 次真实 lookup；热身计数也必须为正。
+    for count in [4usize, 8, 128] {
+        let (snapshot, mut model) = fixture(count, RoutingStrategy::ConsistentHash, None);
+        for (index, target) in Arc::make_mut(&mut model)
+            .routing
+            .as_mut()
+            .unwrap()
+            .targets
+            .iter_mut()
+            .enumerate()
+        {
+            target.model.clear();
+            target.model_id = Some(format!("id-{index}"));
+            target.tags = Some(vec![
+                if index >= 4 {
+                    "other"
+                } else if index % 2 == 0 {
+                    "eu"
+                } else {
+                    "us"
+                }
+                .into(),
+            ]);
+        }
+        let registry = RoutingRegistry::new();
+        let status = crate::ModelRuntimeStatusTracker::new();
+        let pricing = LivePricingIndex::new();
+        let tags = [vec!["eu".to_string()], vec!["us".to_string()]];
+        let invoke = |side: usize| {
+            resolve_attempt_models(
+                &registry,
+                &status,
+                &pricing,
+                &snapshot,
+                "lookup-group",
+                "lookup-id",
+                &model,
+                RoutingRequest {
+                    tags: &tags[side],
+                    api_key_id: "same-key",
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        };
+        CONFIGURED_ID_LOOKUPS.with(|slot| slot.set(Some(0)));
+        assert_eq!(invoke(0).len(), 2);
+        assert_eq!(invoke(1).len(), 2);
+        assert!(CONFIGURED_ID_LOOKUPS.with(|slot| slot.get().unwrap()) > 0);
+        for alternating in [false, true] {
+            CONFIGURED_ID_LOOKUPS.with(|slot| slot.set(Some(0)));
+            for request in 0..32 {
+                let side = usize::from(alternating && request % 2 == 1);
+                let actual = invoke(side);
+                assert_eq!(actual.len(), 2);
+                assert!(actual.iter().all(|attempt| {
+                    attempt
+                        .id
+                        .strip_prefix("id-")
+                        .unwrap()
+                        .parse::<usize>()
+                        .unwrap()
+                        % 2
+                        == side
+                }));
+            }
+            assert_eq!(
+                CONFIGURED_ID_LOOKUPS.with(|slot| slot.take().unwrap()),
+                0,
+                "count={count} alternating={alternating}: warm routing re-resolved configured IDs"
+            );
+        }
     }
 }
 
