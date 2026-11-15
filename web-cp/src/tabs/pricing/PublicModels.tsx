@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { TabProps } from "../../App";
 import { Trash2, Undo2 } from "lucide-react";
 import {
@@ -14,7 +14,7 @@ import { runPublicModelWrite, type PublicModelWriteGate } from "../../lib/public
 import { isUnknownOutcome } from "../../lib/creditOutcome";
 import { messageFor, problemAt } from "../../lib/errors";
 import { errorText } from "../../lib/fmt";
-import { pricedState, unpricedReason } from "../../lib/publicPricing";
+import { pricingStates, unpricedReason } from "../../lib/publicPricing";
 import { deleteRefusalText, deleteWarning } from "../../lib/retireWarning";
 import { Button } from "../../ui/Button";
 import { DataTable } from "../../ui/DataTable";
@@ -133,6 +133,15 @@ export function PublicModels({ canEdit, onGoto, initialSection, sectionVisit, re
     searchText: (model) => [model.name, model.id],
     resetKey: modelState,
   });
+  const pricing = useMemo(() => {
+    if (rows === null || prices === null) return null;
+    const states = pricingStates(rows, prices, liveGroups);
+    const counts = { priced: 0, no_baseline: 0, missing_rates: 0 };
+    for (const model of rows) {
+      if (model.retired_at === null) counts[states.get(model.id)!.kind] += 1;
+    }
+    return { states, counts };
+  }, [rows, prices, liveGroups]);
   function select(model: string | null): void {
     setCreateOpen(false);
     setSelected(model);
@@ -161,10 +170,7 @@ export function PublicModels({ canEdit, onGoto, initialSection, sectionVisit, re
   // 统计来自完整公共模型列表；定价只在用模型，沿用逐行的服务分组判断。
   const live = rows?.filter((model) => model.retired_at === null) ?? null;
   const unavailable = live?.filter((model) => !model.served_by.some((account) => account.enabled)) ?? null;
-  const pricingCounts = live && prices ? { priced: 0, no_baseline: 0, missing_rates: 0 } : null;
-  if (pricingCounts && live && prices) {
-    for (const model of live) pricingCounts[pricedState(model, prices.get(model.id), liveGroups).kind] += 1;
-  }
+  const pricingCounts = pricing?.counts ?? null;
 
   async function create(e: React.FormEvent) {
     e.preventDefault();
@@ -323,7 +329,7 @@ export function PublicModels({ canEdit, onGoto, initialSection, sectionVisit, re
               <tbody>
                 {records.rows.length === 0 && <tr><td colSpan={7}><EmptyState text="没有符合筛选条件的公共模型" /></td></tr>}
                 {records.rows.map((m) => {
-                  const priced = prices === null ? null : pricedState(m, prices.get(m.id), liveGroups);
+                  const priced = pricing?.states.get(m.id) ?? null;
                   const retired = m.retired_at !== null;
                   return (
                     <tr data-finance-record key={m.id} data-model={m.id}>
