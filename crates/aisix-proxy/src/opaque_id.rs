@@ -713,7 +713,8 @@ pub(crate) fn is_item_reference(item: &Value) -> bool {
 // Telemetry has read the upstream's answer before any of this runs.
 
 /// A Responses `Response` object's top-level members, as openai-python
-/// 3.41.0 documents them (`types/responses/response.py`).
+/// 3.41.0 (`types/responses/response.py`) and the official API examples document.
+/// `store` 也见官方响应示例：<https://developers.openai.com/api/reference/resources/responses/methods/create>。
 fn response_member(key: &str) -> bool {
     matches!(
         key,
@@ -747,6 +748,7 @@ fn response_member(key: &str) -> bool {
             | "safety_identifier"
             | "service_tier"
             | "status"
+            | "store"
             | "text"
             | "tool_usage"
             | "top_logprobs"
