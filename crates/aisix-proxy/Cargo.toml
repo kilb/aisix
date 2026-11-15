@@ -114,3 +114,7 @@ aisix-provider-vertex = { path = "../aisix-provider-vertex" }
 # The budget-gate boundary test loads a real `aisix_core::Config` from
 # a file so it exercises `managed.cp_base_url` normalisation.
 tempfile.workspace = true
+
+# 源审计按 Rust 模块语法划定生产与测试边界；只参与测试构建。
+syn = { version = "2", features = ["full", "visit"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }

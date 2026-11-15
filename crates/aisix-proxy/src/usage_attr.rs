@@ -4130,32 +4130,347 @@ mod tests {
         );
     }
 
-    /// Every `UsageEvent` this crate builds carries the request's
-    /// `request_headers`, so the operator-selected headers reach every
-    /// event of every family — success, failure, per-attempt, cancel, and
-    /// the after-the-fact batch rows alike. An emitter that forgot it would
-    /// export rows silently missing the attribution, which no test of
-    /// another family can see.
+    /// 导出器事件必须保留所选请求头。公共 JSON 投影会按 serde(skip) 移除它们；
+    /// 只有 AST 证明事件未逃逸且最终按所有权序列化时，才没有导出器头字段义务。
     #[test]
     fn every_usage_event_this_crate_builds_carries_the_request_headers() {
-        let literals = usage_event_literals();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs");
+        let literals = usage_event_literals_in_sources(&root);
         assert!(
             literals.len() >= 18,
             "the UsageEvent literal scan found only {}",
             literals.len()
         );
-        // The cancel emitter's literals spread a base event that sets it.
-        let missing: Vec<&str> = literals
-            .iter()
-            .filter(|(_, block)| {
-                !sets_field(block, "request_headers") && !block.contains("..base_event(")
-            })
-            .map(|(site, _)| site.as_str())
-            .collect();
+        let projections = public_projection_usage_sites(&root);
+        let missing = missing_request_header_sites(&literals, &projections);
         assert!(
             missing.is_empty(),
-            "these UsageEvent literals do not set request_headers: {missing:?}"
+            "these exporter-capable UsageEvent literals do not set request_headers: {missing:?}"
         );
+    }
+
+    fn missing_request_header_sites<'a>(
+        literals: &'a [(String, String, String)],
+        projections: &std::collections::BTreeSet<String>,
+    ) -> Vec<&'a str> {
+        literals
+            .iter()
+            .filter(|(site, block, _)| {
+                !sets_field(block, "request_headers")
+                    && !block.contains("..base_event(")
+                    && !projections.contains(site)
+            })
+            .map(|(site, _, _)| site.as_str())
+            .collect()
+    }
+
+    #[derive(Default)]
+    struct UsageConsumerProofs {
+        public_projections: std::collections::BTreeSet<String>,
+        saved_callers: std::collections::BTreeSet<String>,
+    }
+
+    fn public_projection_usage_sites(root: &std::path::Path) -> std::collections::BTreeSet<String> {
+        usage_event_consumer_proofs(root).public_projections
+    }
+
+    /// 所有字面量仍参加 caller/guardrail/time 审计；这里只证明私有头字段的消费者。
+    /// 无法证明的宏、闭包、别名或未知调用全部保留原有 header 义务。
+    fn usage_event_consumer_proofs(root: &std::path::Path) -> UsageConsumerProofs {
+        use syn::spanned::Spanned;
+        use syn::visit::Visit;
+
+        fn is_binding(expr: &syn::Expr, binding: &syn::Ident) -> bool {
+            matches!(expr, syn::Expr::Path(path) if path.qself.is_none() && path.path.is_ident(binding))
+        }
+
+        fn named_call(call: &syn::ExprCall, name: &str) -> bool {
+            let syn::Expr::Path(path) = &*call.func else {
+                return false;
+            };
+            path.qself.is_none()
+                && path.path.leading_colon.is_none()
+                && path.path.segments.len() == 3
+                && path.path.segments[0].ident == "crate"
+                && path.path.segments[1].ident == "usage_attr"
+                && path.path.segments[2].ident == name
+        }
+
+        struct Mentions<'a> {
+            binding: &'a syn::Ident,
+            found: bool,
+        }
+
+        impl<'ast> Visit<'ast> for Mentions<'_> {
+            fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+                self.found |= path.qself.is_none() && path.path.is_ident(self.binding);
+                syn::visit::visit_expr_path(self, path);
+            }
+
+            fn visit_macro(&mut self, _mac: &'ast syn::Macro) {
+                self.found = true;
+            }
+        }
+
+        struct Uses<'a> {
+            binding: &'a syn::Ident,
+            public_fields: &'a std::collections::BTreeSet<String>,
+            valid: bool,
+            serializations: usize,
+            saved_caller: bool,
+            conditional: bool,
+        }
+
+        impl<'ast> Visit<'ast> for Uses<'_> {
+            fn visit_attribute(&mut self, attribute: &'ast syn::Attribute) {
+                self.conditional |=
+                    attribute.path().is_ident("cfg") || attribute.path().is_ident("cfg_attr");
+            }
+
+            fn visit_pat_ident(&mut self, pattern: &'ast syn::PatIdent) {
+                if pattern.ident == *self.binding {
+                    self.valid = false;
+                }
+                syn::visit::visit_pat_ident(self, pattern);
+            }
+
+            fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+                if path.qself.is_none() && path.path.is_ident(self.binding) {
+                    self.valid = false;
+                }
+                syn::visit::visit_expr_path(self, path);
+            }
+
+            fn visit_expr_field(&mut self, field: &'ast syn::ExprField) {
+                for attribute in &field.attrs {
+                    self.visit_attribute(attribute);
+                }
+                if is_binding(&field.base, self.binding) {
+                    self.valid &= self.serializations == 0;
+                    // serde(skip) 字段不能冒充公共字段准备；新增未知写法默认不豁免。
+                    if !matches!(&field.member, syn::Member::Named(name) if self.public_fields.contains(&name.to_string()))
+                    {
+                        self.valid = false;
+                    }
+                    return;
+                }
+                syn::visit::visit_expr_field(self, field);
+            }
+
+            fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+                for attribute in &call.attrs {
+                    self.visit_attribute(attribute);
+                }
+                let serializer = matches!(&*call.func, syn::Expr::Path(path) if path.qself.is_none() && path.path.leading_colon.is_some() && path.path.segments.len() == 2 && path.path.segments[0].ident == "serde_json" && path.path.segments[1].ident == "to_value");
+                if serializer && call.args.len() == 1 && is_binding(&call.args[0], self.binding) {
+                    self.valid &= self.serializations == 0;
+                    self.serializations += 1;
+                    return;
+                }
+                let pure_mutation = [
+                    "apply_caller_identity",
+                    "apply_native_caller_observations",
+                    "apply_pk_telemetry",
+                    "bound_outside_text",
+                ]
+                .iter()
+                .any(|name| named_call(call, name));
+                if pure_mutation
+                    && matches!(call.args.first(), Some(syn::Expr::Reference(reference)) if reference.mutability.is_some() && is_binding(&reference.expr, self.binding))
+                {
+                    self.valid &= self.serializations == 0;
+                    self.saved_caller |= named_call(call, "apply_native_caller_observations");
+                    for argument in call.args.iter().skip(1) {
+                        self.visit_expr(argument);
+                    }
+                    return;
+                }
+                syn::visit::visit_expr_call(self, call);
+            }
+
+            fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+                for attribute in &call.attrs {
+                    self.visit_attribute(attribute);
+                }
+                if is_binding(&call.receiver, self.binding)
+                    && call.method == "settled_cache_creation_ttl"
+                    && call.args.is_empty()
+                {
+                    self.valid &= self.serializations == 0;
+                    return;
+                }
+                syn::visit::visit_expr_method_call(self, call);
+            }
+
+            fn visit_local(&mut self, local: &'ast syn::Local) {
+                for attribute in &local.attrs {
+                    self.visit_attribute(attribute);
+                }
+                if matches!(&local.pat, syn::Pat::Ident(pattern) if pattern.ident == *self.binding)
+                {
+                    let syn::Pat::Ident(pattern) = &local.pat else {
+                        unreachable!()
+                    };
+                    if pattern.by_ref.is_some() || pattern.subpat.is_some() {
+                        self.valid = false;
+                        return;
+                    }
+                    if let Some(init) = &local.init {
+                        if let syn::Expr::Call(call) = &*init.expr {
+                            if init.diverge.is_none()
+                                && named_call(call, "prepare_usage_event_fields")
+                                && call.args.len() == 4
+                                && is_binding(&call.args[1], self.binding)
+                            {
+                                self.valid &= self.serializations == 0;
+                                for (index, argument) in call.args.iter().enumerate() {
+                                    if index != 1 {
+                                        self.visit_expr(argument);
+                                    }
+                                }
+                                return;
+                            }
+                        }
+                    }
+                    self.valid = false;
+                }
+                syn::visit::visit_local(self, local);
+            }
+
+            fn visit_macro(&mut self, _mac: &'ast syn::Macro) {
+                // 宏还可能用格式串隐式捕获局部变量；未知展开无法证明无逃逸。
+                self.valid = false;
+            }
+
+            fn visit_expr_closure(&mut self, closure: &'ast syn::ExprClosure) {
+                let mut capture = Mentions {
+                    binding: self.binding,
+                    found: false,
+                };
+                capture.visit_expr(&closure.body);
+                if capture.found {
+                    self.valid = false;
+                }
+            }
+
+            fn visit_expr_async(&mut self, expression: &'ast syn::ExprAsync) {
+                let mut capture = Mentions {
+                    binding: self.binding,
+                    found: false,
+                };
+                capture.visit_block(&expression.block);
+                if capture.found {
+                    self.valid = false;
+                }
+            }
+        }
+
+        struct Sites<'a> {
+            name: &'a str,
+            source: &'a str,
+            code: &'a [bool],
+            public_fields: &'a std::collections::BTreeSet<String>,
+            proofs: &'a mut UsageConsumerProofs,
+        }
+
+        impl<'ast> Visit<'ast> for Sites<'_> {
+            fn visit_block(&mut self, block: &'ast syn::Block) {
+                for (index, statement) in block.stmts.iter().enumerate() {
+                    let syn::Stmt::Local(local) = statement else {
+                        continue;
+                    };
+                    let syn::Pat::Ident(pattern) = &local.pat else {
+                        continue;
+                    };
+                    let Some(init) = &local.init else { continue };
+                    let syn::Expr::Struct(literal) = &*init.expr else {
+                        continue;
+                    };
+                    let Some(name) = literal.path.segments.last() else {
+                        continue;
+                    };
+                    let start = name.ident.span().byte_range().start;
+                    if name.ident != "UsageEvent"
+                        || !self.code[start]
+                        || init.diverge.is_some()
+                        || pattern.by_ref.is_some()
+                        || pattern.subpat.is_some()
+                        || local.attrs.iter().any(|attribute| {
+                            attribute.path().is_ident("cfg")
+                                || attribute.path().is_ident("cfg_attr")
+                        })
+                    {
+                        continue;
+                    }
+                    let canonical_type = literal.path.leading_colon.is_some()
+                        && literal.path.segments.len() == 2
+                        && literal.path.segments[0].ident == "aisix_obs";
+                    let mut uses = Uses {
+                        binding: &pattern.ident,
+                        public_fields: self.public_fields,
+                        valid: true,
+                        serializations: 0,
+                        saved_caller: false,
+                        conditional: false,
+                    };
+                    for next in &block.stmts[index + 1..] {
+                        uses.visit_stmt(next);
+                    }
+                    let site = usage_literal_site(self.name, self.source, start);
+                    if !uses.conditional {
+                        if canonical_type && uses.valid && uses.serializations == 1 {
+                            self.proofs.public_projections.insert(site.clone());
+                            if uses.saved_caller {
+                                self.proofs.saved_callers.insert(site);
+                            }
+                        }
+                    }
+                }
+                syn::visit::visit_block(self, block);
+            }
+        }
+
+        let src_dir = root.parent().expect("crate root has a parent");
+        let mut proofs = UsageConsumerProofs::default();
+        let public_fields = public_usage_event_fields();
+        for (path, source, code) in production_usage_sources(root) {
+            let name = path
+                .strip_prefix(src_dir)
+                .unwrap_or(&path)
+                .to_string_lossy();
+            let file = syn::parse_file(&source).expect("production source must parse");
+            Sites {
+                name: &name,
+                source: &source,
+                code: &code,
+                public_fields: &public_fields,
+                proofs: &mut proofs,
+            }
+            .visit_file(&file);
+        }
+        proofs
+    }
+
+    /// 直接读取真实 serde 定义，新增私有字段不会自动获得公共投影豁免。
+    fn public_usage_event_fields() -> std::collections::BTreeSet<String> {
+        let file = syn::parse_file(include_str!("../../aisix-obs/src/usage.rs"))
+            .expect("UsageEvent source must parse");
+        let event = file
+            .items
+            .iter()
+            .find_map(|item| match item {
+                syn::Item::Struct(item) if item.ident == "UsageEvent" => Some(item),
+                _ => None,
+            })
+            .expect("UsageEvent must be defined");
+        event.fields.iter().filter_map(|field| {
+            let private = field.attrs.iter().filter(|attr| attr.path().is_ident("serde")).any(|attr| {
+                let fields = attr.parse_args_with(syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated)
+                    .expect("serde attributes must parse");
+                fields.iter().any(|meta| matches!(meta, syn::Meta::Path(path) if path.is_ident("skip") || path.is_ident("skip_serializing")))
+            });
+            (!private).then(|| field.ident.as_ref().expect("named UsageEvent field").to_string())
+        }).collect()
     }
 
     /// Every `UsageEvent` this crate builds carries the caller identity —
@@ -4166,49 +4481,280 @@ mod tests {
     /// than as a missing stamp, so no behavioural test of another family
     /// can see an emitter that forgot it.
     ///
-    /// The stamp is `apply_caller_identity`, called on the built event in
+    /// The stamp is `apply_caller_identity` or its saved-observation projection,
+    /// `apply_native_caller_observations`, called on the built event in
     /// the rest of the block the literal sits in; the cancel emitter's
     /// literals spread a base event that calls it. An emitter with no
     /// authenticated caller behind it says so with a `NO-CALLER-IDENTITY:`
     /// comment.
     #[test]
     fn every_usage_event_this_crate_builds_carries_the_caller_identity() {
-        const EXEMPT: &str = "NO-CALLER-IDENTITY:";
         let literals = usage_event_literals_in_context();
         assert!(
             literals.len() >= 18,
             "the UsageEvent literal scan found only {}",
             literals.len()
         );
-        let missing: Vec<&str> = literals
-            .iter()
-            .filter(|(_, block, rest)| {
-                !block.contains("..base_event(")
-                    && !block.contains(EXEMPT)
-                    && !rest.contains("apply_caller_identity(")
-            })
-            .map(|(site, _, _)| site.as_str())
-            .collect();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs");
+        let missing = missing_caller_identity_sites(
+            &literals,
+            &usage_event_consumer_proofs(&root).saved_callers,
+        );
         assert!(
             missing.is_empty(),
-            "these UsageEvent literals are never handed to apply_caller_identity: {missing:?}"
+            "these UsageEvent literals are never handed to a caller identity stamper: {missing:?}"
         );
     }
 
-    /// [`usage_event_literals`] with, for each, the rest of the innermost
-    /// block the literal sits in — where the event it builds is stamped.
+    fn missing_caller_identity_sites<'a>(
+        literals: &'a [(String, String, String)],
+        saved_callers: &std::collections::BTreeSet<String>,
+    ) -> Vec<&'a str> {
+        const EXEMPT: &str = "NO-CALLER-IDENTITY:";
+        literals
+            .iter()
+            .filter(|(site, block, rest)| {
+                !block.contains("..base_event(")
+                    && !block.contains(EXEMPT)
+                    && !rest.contains("apply_caller_identity(")
+                    && !saved_callers.contains(site)
+            })
+            .map(|(site, _, _)| site.as_str())
+            .collect()
+    }
+
+    /// [`usage_event_literals`] 及其所在代码块的后续代码。
     fn usage_event_literals_in_context() -> Vec<(String, String, String)> {
-        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs");
+        usage_event_literals_in_sources(&root)
+    }
+
+    /// 所有生产 UsageEvent 字面量；模块和 include! 的测试边界由 Rust 语法判定。
+    fn usage_event_literals() -> Vec<(String, String)> {
+        usage_event_literals_in_context()
+            .into_iter()
+            .map(|(site, block, _)| (site, block))
+            .collect()
+    }
+
+    /// 从 crate 根沿模块与 include! 读取生产源码；测试边界由 cfg 语法决定。
+    fn production_usage_sources(
+        root: &std::path::Path,
+    ) -> Vec<(std::path::PathBuf, String, Vec<bool>)> {
+        use syn::spanned::Spanned;
+        use syn::visit::Visit;
+
+        fn cfg_value(meta: &syn::Meta) -> Option<bool> {
+            match meta {
+                syn::Meta::Path(path) if path.is_ident("test") => Some(false),
+                syn::Meta::List(list) => {
+                    let args = list
+                        .parse_args_with(
+                            syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+                        )
+                        .expect("cfg arguments must parse");
+                    let values: Vec<_> = args.iter().map(cfg_value).collect();
+                    if list.path.is_ident("all") {
+                        if values.contains(&Some(false)) {
+                            Some(false)
+                        } else if values.iter().all(|value| *value == Some(true)) {
+                            Some(true)
+                        } else {
+                            None
+                        }
+                    } else if list.path.is_ident("any") {
+                        if values.contains(&Some(true)) {
+                            Some(true)
+                        } else if values.iter().all(|value| *value == Some(false)) {
+                            Some(false)
+                        } else {
+                            None
+                        }
+                    } else if list.path.is_ident("not") && values.len() == 1 {
+                        values[0].map(|value| !value)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        }
+
+        fn production(attrs: &[syn::Attribute]) -> bool {
+            attrs.iter().all(|attr| {
+                !attr.path().is_ident("cfg")
+                    || cfg_value(&attr.parse_args().expect("cfg expression must parse"))
+                        != Some(false)
+            })
+        }
+
+        fn explicit_path(attrs: &[syn::Attribute]) -> Option<std::path::PathBuf> {
+            attrs.iter().find_map(|attr| {
+                if !attr.path().is_ident("path") {
+                    return None;
+                }
+                let syn::Meta::NameValue(meta) = &attr.meta else {
+                    panic!("path attribute must have a value");
+                };
+                let syn::Expr::Lit(value) = &meta.value else {
+                    panic!("path attribute must be a string");
+                };
+                let syn::Lit::Str(value) = &value.lit else {
+                    panic!("path attribute must be a string");
+                };
+                Some(value.value().into())
+            })
+        }
+
+        struct Source<'a> {
+            path: &'a std::path::Path,
+            module_dir: std::path::PathBuf,
+            excluded: Vec<std::ops::Range<usize>>,
+            children: Vec<(std::path::PathBuf, std::path::PathBuf)>,
+        }
+
+        impl<'ast> Visit<'ast> for Source<'_> {
+            fn visit_item(&mut self, item: &'ast syn::Item) {
+                let attrs: &[syn::Attribute] = match item {
+                    syn::Item::Const(item) => &item.attrs,
+                    syn::Item::Enum(item) => &item.attrs,
+                    syn::Item::ExternCrate(item) => &item.attrs,
+                    syn::Item::Fn(item) => &item.attrs,
+                    syn::Item::ForeignMod(item) => &item.attrs,
+                    syn::Item::Impl(item) => &item.attrs,
+                    syn::Item::Macro(item) => &item.attrs,
+                    syn::Item::Mod(item) => &item.attrs,
+                    syn::Item::Static(item) => &item.attrs,
+                    syn::Item::Struct(item) => &item.attrs,
+                    syn::Item::Trait(item) => &item.attrs,
+                    syn::Item::TraitAlias(item) => &item.attrs,
+                    syn::Item::Type(item) => &item.attrs,
+                    syn::Item::Union(item) => &item.attrs,
+                    syn::Item::Use(item) => &item.attrs,
+                    _ => &[],
+                };
+                if production(attrs) {
+                    syn::visit::visit_item(self, item);
+                } else {
+                    self.excluded.push(item.span().byte_range());
+                }
+            }
+
+            fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
+                let attrs: &[syn::Attribute] = match item {
+                    syn::ImplItem::Const(item) => &item.attrs,
+                    syn::ImplItem::Fn(item) => &item.attrs,
+                    syn::ImplItem::Type(item) => &item.attrs,
+                    syn::ImplItem::Macro(item) => &item.attrs,
+                    _ => &[],
+                };
+                if production(attrs) {
+                    syn::visit::visit_impl_item(self, item);
+                } else {
+                    self.excluded.push(item.span().byte_range());
+                }
+            }
+
+            fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+                let name = item.ident.to_string();
+                if item.content.is_some() {
+                    let next = self
+                        .module_dir
+                        .join(explicit_path(&item.attrs).unwrap_or(name.into()));
+                    let previous = std::mem::replace(&mut self.module_dir, next);
+                    syn::visit::visit_item_mod(self, item);
+                    self.module_dir = previous;
+                    return;
+                }
+                let path = if let Some(path) = explicit_path(&item.attrs) {
+                    self.path.parent().expect("source has a parent").join(path)
+                } else {
+                    let flat = self.module_dir.join(format!("{name}.rs"));
+                    let nested = self.module_dir.join(&name).join("mod.rs");
+                    assert_ne!(
+                        flat.is_file(),
+                        nested.is_file(),
+                        "module {name} must resolve once"
+                    );
+                    if flat.is_file() {
+                        flat
+                    } else {
+                        nested
+                    }
+                };
+                let module_dir = if path.file_name().is_some_and(|name| name == "mod.rs") {
+                    path.parent().expect("module has a parent").to_path_buf()
+                } else {
+                    path.with_extension("")
+                };
+                self.children.push((path, module_dir));
+            }
+
+            fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+                if mac.path.is_ident("include") {
+                    let path: syn::LitStr = syn::parse2(mac.tokens.clone())
+                        .expect("include! source must name a literal path");
+                    self.children.push((
+                        self.path
+                            .parent()
+                            .expect("source has a parent")
+                            .join(path.value()),
+                        self.module_dir.clone(),
+                    ));
+                }
+                syn::visit::visit_macro(self, mac);
+            }
+        }
+
+        let mut pending = vec![(
+            root.to_path_buf(),
+            root.parent()
+                .expect("crate root has a parent")
+                .to_path_buf(),
+        )];
+        let mut seen = std::collections::BTreeSet::new();
+        let mut sources = Vec::new();
+        while let Some((path, module_dir)) = pending.pop() {
+            assert!(
+                seen.insert(path.clone()),
+                "source included twice: {}",
+                path.display()
+            );
+            let src = std::fs::read_to_string(&path).expect("production source must read");
+            let file = syn::parse_file(&src).expect("production source must parse");
+            if !production(&file.attrs) {
+                continue;
+            }
+            let mut visitor = Source {
+                path: &path,
+                module_dir,
+                excluded: Vec::new(),
+                children: Vec::new(),
+            };
+            visitor.visit_file(&file);
+            let mut code = code_mask(&src);
+            for range in visitor.excluded {
+                code[range].fill(false);
+            }
+            pending.extend(visitor.children);
+            sources.push((path, src, code));
+        }
+        sources.sort_by(|left, right| left.0.cmp(&right.0));
+        sources
+    }
+
+    fn usage_event_literals_in_sources(root: &std::path::Path) -> Vec<(String, String, String)> {
+        let src_dir = root.parent().expect("crate root has a parent");
         let mut out = Vec::new();
-        for path in crate_rs_files(&src_dir) {
-            let src = std::fs::read_to_string(&path).expect("source must read");
+        let literal_start = regex::Regex::new(r"\bUsageEvent\s*\{").expect("constant regex");
+        for (path, src, code) in production_usage_sources(root) {
             let name = path
-                .strip_prefix(&src_dir)
+                .strip_prefix(src_dir)
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .into_owned();
-            let code = code_mask(&src);
-            for (idx, _) in src.match_indices("UsageEvent {") {
+            for matched in literal_start.find_iter(&src) {
+                let idx = matched.start();
                 if !code[idx] {
                     continue;
                 }
@@ -4219,8 +4765,10 @@ mod tests {
                 if before.ends_with("->") {
                     continue;
                 }
-                let open = idx + "UsageEvent ".len();
+                let open = matched.end() - 1;
                 let block = braced_block(&src, &code, open).expect("balanced literal");
+                syn::parse_str::<syn::ExprStruct>(&format!("UsageEvent {block}"))
+                    .expect("UsageEvent expression must parse");
                 let after = open + block.len();
                 let b = src.as_bytes();
                 let mut depth = 0i64;
@@ -4239,9 +4787,8 @@ mod tests {
                         _ => {}
                     }
                 }
-                let line = src[..idx].lines().count();
                 out.push((
-                    format!("{name}:{line}"),
+                    usage_literal_site(&name, &src, idx),
                     block.to_string(),
                     src[after..end].to_string(),
                 ));
@@ -4250,104 +4797,70 @@ mod tests {
         out
     }
 
-    /// Every `UsageEvent { .. }` literal in this crate's source, as
-    /// `("<file>:<line>", block)`. A parse of the source rather than a list
-    /// of emitters — see the guardrail census above for why.
-    fn usage_event_literals() -> Vec<(String, String)> {
-        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut out = Vec::new();
-        for path in crate_rs_files(&src_dir) {
-            let src = std::fs::read_to_string(&path).expect("source must read");
-            let name = path
-                .strip_prefix(&src_dir)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .into_owned();
-            let code = code_mask(&src);
-            for (idx, _) in src.match_indices("UsageEvent {") {
-                // Skip anything that is not Rust code: this file writes the
-                // token it searches for in a string literal and in a
-                // comment, and both would otherwise be counted as emitters
-                // — a check inflating its own coverage.
-                if !code[idx] {
-                    continue;
-                }
-                // `-> UsageEvent {` (optionally path-qualified) is a
-                // return type followed by a function body, not a literal.
-                let before = src[..idx]
-                    .trim_end()
-                    .trim_end_matches(|c: char| c.is_alphanumeric() || c == '_' || c == ':')
-                    .trim_end();
-                if before.ends_with("->") {
-                    continue;
-                }
-                let open = idx + "UsageEvent ".len();
-                let Some(block) = braced_block(&src, &code, open) else {
-                    panic!("{name}: unbalanced UsageEvent literal at byte {idx}");
-                };
-                let line = src[..idx].lines().count();
-                out.push((format!("{name}:{line}"), block.to_string()));
-            }
-        }
-        out
+    /// 同行两个字面量必须具有独立身份，不能由公共投影替另一个事件买豁免。
+    fn usage_literal_site(name: &str, source: &str, start: usize) -> String {
+        let prefix = &source[..start];
+        let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+        let column = prefix.rfind('\n').map_or(start + 1, |last| start - last);
+        format!("{name}:{line}:{column}")
     }
 
-    /// Every `.rs` file under `dir`, sorted. Recursive: `src/` is flat
-    /// today, and a refactor that moved a handler into a subdirectory would
-    /// otherwise take its emitter out of scope while a scan stayed green.
-    fn crate_rs_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
-        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-            let entries = std::fs::read_dir(dir).expect("the crate's own src/ must be readable");
-            for path in entries.filter_map(|e| e.ok().map(|e| e.path())) {
-                if path.is_dir() {
-                    walk(&path, out);
-                } else if path.extension().is_some_and(|e| e == "rs") {
-                    out.push(path);
-                }
-            }
-        }
-        let mut files = Vec::new();
-        walk(dir, &mut files);
-        files.sort();
-        files
+    /// 仅检查 UsageEvent 自身的时间字段；其他 DTO 的事实时间不属于该格式审计。
+    fn shared_occurred_at_stamp(block: &str) -> Option<bool> {
+        let literal: syn::ExprStruct = syn::parse_str(&format!("UsageEvent {block}"))
+            .expect("UsageEvent expression must parse");
+        let field = literal.fields.iter().find(
+            |field| matches!(&field.member, syn::Member::Named(name) if name == "occurred_at"),
+        )?;
+        let syn::Expr::Call(call) = &field.expr else {
+            return Some(false);
+        };
+        let syn::Expr::Path(function) = &*call.func else {
+            return Some(false);
+        };
+        let path: Vec<_> = function
+            .path
+            .segments
+            .iter()
+            .map(|segment| segment.ident.to_string())
+            .collect();
+        Some(
+            matches!(
+                path.iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                ["UsageEvent", "occurred_at_now"] | ["aisix_obs", "UsageEvent", "occurred_at_now"]
+            ) && call.args.is_empty()
+                || matches!(
+                    path.iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                        .as_slice(),
+                    ["UsageEvent", "occurred_at"] | ["aisix_obs", "UsageEvent", "occurred_at"]
+                ) && call.args.len() == 1,
+        )
     }
 
-    /// Every `occurred_at` this crate stamps goes through
-    /// `UsageEvent::occurred_at_now`, so the whole emitter family writes one
-    /// format (millisecond RFC 3339, AISIX-Cloud#1368). A hand-rolled
-    /// `to_rfc3339_opts` at one site would put a second-precision stamp back
-    /// on that surface, and nothing downstream rejects it: it still parses,
-    /// it just ties with every other row of the same second.
+    /// 所有 UsageEvent 的 occurred_at 都使用共享格式器；已观测事实不能改成重放时刻。
     #[test]
     fn every_occurred_at_is_stamped_by_the_shared_helper() {
-        const HELPER: &str = "occurred_at: aisix_obs::UsageEvent::occurred_at_now()";
-        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut stamped = 0usize;
         let mut hand_rolled = Vec::new();
-        for path in crate_rs_files(&src_dir) {
-            let src = std::fs::read_to_string(&path).expect("source must read");
-            let code = code_mask(&src);
-            for (idx, _) in src.match_indices("occurred_at:") {
-                if !code[idx] {
-                    continue;
-                }
-                if src[idx..].starts_with(HELPER) {
-                    stamped += 1;
-                } else {
-                    let line = src[..idx].lines().count();
-                    hand_rolled.push(format!("{}:{line}", path.display()));
-                }
+        for (site, block) in usage_event_literals() {
+            match shared_occurred_at_stamp(&block) {
+                Some(true) => stamped += 1,
+                Some(false) => hand_rolled.push(site),
+                None => {}
             }
         }
-        // The crate's real count is twenty; a floor keeps the scan from
-        // passing vacuously if it stops matching.
         assert!(
             stamped >= 20,
             "the occurred_at scan found only {stamped} stamps"
         );
         assert!(
             hand_rolled.is_empty(),
-            "these sites set occurred_at without UsageEvent::occurred_at_now: {hand_rolled:?}",
+            "these UsageEvent sites set occurred_at without the shared formatter: {hand_rolled:?}",
         );
     }
 
@@ -4554,6 +5067,348 @@ mod tests {
         // in `r` must not open a raw string.
         assert!(at("let c = '\"'; UsageEvent {}", "UsageEvent"));
         assert!(at("let var = 1; UsageEvent {}", "UsageEvent"));
+    }
+
+    /// 若把测试边界去掉，夹具必须重新被审计；文件名从不决定是否排除。
+    #[test]
+    fn production_usage_scan_follows_compilation_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("lib.rs");
+        let source = r#"
+            #[cfg(test)]
+            mod fixture;
+            #[cfg(not(test))]
+            #[path = "production_tests.rs"]
+            mod production;
+            #[cfg(test)]
+            mod inline_fixture { fn fixture() { let _ = UsageEvent { ..Default::default() }; } }
+            fn tail() { let _ = UsageEvent { request_headers: headers, ..Default::default() }; }
+            include!("included.rs");
+        "#;
+        std::fs::write(&root, source).unwrap();
+        std::fs::write(
+            dir.path().join("fixture.rs"),
+            "fn fixture() { let _ = UsageEvent { ..Default::default() }; }",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("production_tests.rs"), "fn production() { let _ = UsageEvent { request_headers: headers, ..Default::default() }; }").unwrap();
+        std::fs::write(dir.path().join("included.rs"), "fn included() { async_stream::stream! { let _ = UsageEvent { request_headers: headers, ..Default::default() }; } }").unwrap();
+        let literals = usage_event_literals_in_sources(&root);
+        assert_eq!(literals.len(), 3);
+        assert!(literals
+            .iter()
+            .any(|(site, _, _)| site.starts_with("production_tests.rs:")));
+        assert!(literals
+            .iter()
+            .any(|(site, _, _)| site.starts_with("included.rs:")));
+        assert_eq!(
+            literals
+                .iter()
+                .filter(|(site, _, _)| site.starts_with("lib.rs:"))
+                .count(),
+            1
+        );
+        std::fs::write(
+            &root,
+            source.replacen("#[cfg(test)]", "#[cfg(not(test))]", 1),
+        )
+        .unwrap();
+        let mutated = usage_event_literals_in_sources(&root);
+        assert_eq!(mutated.len(), literals.len() + 1);
+        assert!(mutated
+            .iter()
+            .any(|(site, _, _)| site.starts_with("fixture.rs:")));
+    }
+
+    /// 删掉生产字段仍必须报缺失，不能靠过滤测试夹具获得假覆盖。
+    #[test]
+    fn production_usage_metadata_mutations_stay_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("lib.rs");
+        let source = r#"
+            fn emit() {
+                let mut event = UsageEvent
+                {
+                    request_headers: client.request_headers.clone(),
+                    guardrail_bypassed_reason: bypass,
+                    applied_guardrails: applied,
+                    ..Default::default()
+                };
+                apply_caller_identity(&mut event, jwt, caller);
+            }
+        "#;
+        std::fs::write(&root, source).unwrap();
+        let literals = usage_event_literals_in_sources(&root);
+        assert_eq!(literals.len(), 1);
+        let (_, block, rest) = &literals[0];
+        for field in [
+            "request_headers",
+            "guardrail_bypassed_reason",
+            "applied_guardrails",
+        ] {
+            assert!(sets_field(block, field), "baseline must carry {field}");
+            let line = source
+                .lines()
+                .find(|line| line.trim_start().starts_with(&format!("{field}:")))
+                .unwrap();
+            std::fs::write(&root, source.replace(line, "")).unwrap();
+            let mutated = usage_event_literals_in_sources(&root);
+            assert_eq!(
+                mutated.len(),
+                1,
+                "missing {field} cannot remove the production event"
+            );
+            assert!(
+                !sets_field(&mutated[0].1, field),
+                "missing {field} must be rejected"
+            );
+        }
+        assert!(rest.contains("apply_caller_identity("));
+        std::fs::write(
+            &root,
+            source.replace("apply_caller_identity(&mut event, jwt, caller);", ""),
+        )
+        .unwrap();
+        let mutated = usage_event_literals_in_sources(&root);
+        assert_eq!(mutated.len(), 1);
+        assert!(!mutated[0].2.contains("apply_caller_identity("));
+    }
+
+    /// 公共投影必须有正向消费者证明；加任意逃逸即重新要求真实导出头。
+    #[test]
+    fn header_audience_requires_a_non_escaping_owned_public_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("lib.rs");
+        let source = r#"
+            fn projection() {
+                let mut event = ::aisix_obs::UsageEvent {
+                    occurred_at: UsageEvent::occurred_at(observed),
+                    applied_guardrails: applied,
+                    guardrail_bypassed_reason: bypass,
+                    ..Default::default()
+                };
+                crate::usage_attr::apply_native_caller_observations(&mut event, name, tags, subject, provider, mapping);
+                if let Some(pk) = pk {
+                    crate::usage_attr::apply_pk_telemetry(&mut event, &pk);
+                }
+                crate::usage_attr::bound_outside_text(&mut event);
+                event.requested_service_tier = event.requested_service_tier.map(sanitize);
+                let mut event = crate::usage_attr::prepare_usage_event_fields(surface, event, true, true);
+                event.cache_creation_ttl = event.settled_cache_creation_ttl();
+                if let Some(cost) = cost {
+                    event.cost_usd = cost.calculate(event.cache_creation_ttl);
+                }
+                let wire = ::serde_json::to_value(event).map_err(error)?;
+                wire
+            }
+        "#;
+        let rejected = |text: &str| {
+            std::fs::write(&root, text).unwrap();
+            let literals = usage_event_literals_in_sources(&root);
+            assert_eq!(
+                literals.len(),
+                1,
+                "audience must not remove a literal from other audits"
+            );
+            assert!(sets_field(&literals[0].1, "applied_guardrails"));
+            assert!(sets_field(&literals[0].1, "guardrail_bypassed_reason"));
+            assert_eq!(shared_occurred_at_stamp(&literals[0].1), Some(true));
+            !missing_request_header_sites(&literals, &public_projection_usage_sites(&root))
+                .is_empty()
+        };
+        assert!(
+            !rejected(source),
+            "owned public projection has no exporter header consumer"
+        );
+        for escape in [
+            "publish(&event);",
+            "publish(event.clone());",
+            "let alias = &event;",
+            "publish!(event);",
+            "let capture = format!(\"{event:?}\");",
+            "let capture = || event.api_key_name.clone();",
+            "let capture = async { event.api_key_name.clone() };",
+            "unknown::apply_caller_identity(&mut event, jwt, caller);",
+            "event.request_headers.clear();",
+            "let event = replacement;",
+            "let (event,) = (replacement,);",
+            "let Some(event) = replacement else { return };",
+            "let ref event @ ref alias = crate::usage_attr::prepare_usage_event_fields(surface, event, true, true); publish(alias);",
+        ] {
+            let mutated = source.replace(
+                "let wire = ::serde_json::to_value(event)",
+                &format!("{escape}\nlet wire = ::serde_json::to_value(event)"),
+            );
+            assert!(
+                rejected(&mutated),
+                "escape must restore header obligation: {escape}"
+            );
+        }
+        assert!(
+            rejected(
+                &source
+                    .replace(
+                        "let mut event = ::aisix_obs::UsageEvent",
+                        "let ref event @ ref alias = ::aisix_obs::UsageEvent"
+                    )
+                    .replace("let wire =", "publish(alias); let wire =")
+            ),
+            "ref/@ aliases cannot prove ownership"
+        );
+        for serializer in [
+            "::serde_json::to_value(&event)",
+            "::serde_json::to_value(event.clone())",
+            "publish(event)",
+        ] {
+            assert!(
+                rejected(&source.replace("::serde_json::to_value(event)", serializer)),
+                "{serializer} cannot prove an owned public projection"
+            );
+        }
+        assert!(
+            rejected(&source.replace(
+                "let wire = ::serde_json::to_value(event).map_err(error)?;",
+                "let wire = empty;"
+            )),
+            "removing serialization must remove the exemption"
+        );
+
+        for mutated in [
+            source.replace("crate::usage_attr::apply_native_caller_observations", "apply_native_caller_observations")
+                .replace("fn projection() {", "fn projection() { let apply_native_caller_observations = |event, name, tags, subject, provider, mapping| publish(event);"),
+            source.replace("::serde_json::to_value", "serde_json::to_value")
+                .replace("fn projection() {", "fn projection() { use crate::publisher as serde_json;"),
+            source.replace("::aisix_obs::UsageEvent", "UsageEvent")
+                .replace("fn projection() {", "fn projection() { use crate::PublisherEvent as UsageEvent;"),
+        ] {
+            assert!(rejected(&mutated), "shadowable paths cannot prove public serialization");
+        }
+
+        let exporter = source
+            .replace(
+                "..Default::default()",
+                "request_headers: client.request_headers.clone(), ..Default::default()",
+            )
+            .replace("::serde_json::to_value(event)", "publish(event)");
+        assert!(
+            !rejected(&exporter),
+            "real exporter carries captured headers"
+        );
+        assert!(
+            rejected(&exporter.replace("request_headers: client.request_headers.clone(),", "")),
+            "deleting real exporter headers must be RED"
+        );
+    }
+
+    /// 已保存调用方的窄投影与实时身份使用同一 caller 义务，删掉任一 stamp 都必须失败。
+    #[test]
+    fn saved_caller_projection_cannot_disappear_behind_a_public_header_audience() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("lib.rs");
+        for stamp in [
+            "crate::usage_attr::apply_caller_identity(&mut event, jwt, caller);",
+            "crate::usage_attr::apply_native_caller_observations(&mut event, name, tags, subject, provider, mapping);",
+        ] {
+            let source = format!("fn project() {{ let mut event = ::aisix_obs::UsageEvent {{ applied_guardrails: applied, guardrail_bypassed_reason: bypass, ..Default::default() }}; {stamp} let wire = ::serde_json::to_value(event); }}");
+            std::fs::write(&root, &source).unwrap();
+            let literals = usage_event_literals_in_sources(&root);
+            assert_eq!(literals.len(), 1);
+            assert_eq!(public_projection_usage_sites(&root).len(), 1);
+            assert!(missing_caller_identity_sites(&literals, &usage_event_consumer_proofs(&root).saved_callers).is_empty());
+            for changed in [
+                source.replace(stamp, ""),
+                source.replace(stamp, &stamp.replace("&mut event", "&mut another_event")),
+                source.replace(stamp, &format!("/* {stamp} */")),
+                source.replace(stamp, &format!("#[cfg(test)] {{ {stamp} }}")),
+                source.replace(stamp, &format!("{stamp} event = replacement;")),
+                source.replace(stamp, &format!("{stamp} let event = replacement;")),
+                source.replace(stamp, &format!("{stamp} let (event,) = (replacement,);")),
+                source.replace(stamp, &format!("{stamp} let Some(event) = replacement else {{ return }};")),
+                source.replace(stamp, &format!("{stamp} std::mem::take(&mut event);")),
+            ] {
+                std::fs::write(&root, changed).unwrap();
+                let mutated = usage_event_literals_in_sources(&root);
+                assert_eq!(mutated.len(), 1);
+                // 原实时 caller stamp 的词法机制未扩写；新增保存投影必须绑定当前事件。
+                if stamp.contains("apply_native_caller_observations") {
+                    assert_eq!(missing_caller_identity_sites(&mutated, &usage_event_consumer_proofs(&root).saved_callers).len(), 1);
+                }
+            }
+            std::fs::write(&root, source.replace(stamp, "")).unwrap();
+            let mutated = usage_event_literals_in_sources(&root);
+            assert_eq!(mutated.len(), 1);
+            assert_eq!(public_projection_usage_sites(&root).len(), 1);
+            assert_eq!(
+                missing_caller_identity_sites(&mutated, &usage_event_consumer_proofs(&root).saved_callers).len(),
+                1,
+                "public JSON projection must still require a real caller stamp"
+            );
+        }
+    }
+
+    /// 同行生产事件各自承担导出义务，不能共享一个投影集合键。
+    #[test]
+    fn a_public_projection_cannot_exempt_another_literal_on_the_same_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("lib.rs");
+        std::fs::write(&root, "fn project() { let event = ::aisix_obs::UsageEvent { ..Default::default() }; ::serde_json::to_value(event); } fn export() { let event = ::aisix_obs::UsageEvent { ..Default::default() }; publish(event); }").unwrap();
+        let literals = usage_event_literals_in_sources(&root);
+        assert_eq!(literals.len(), 2);
+        assert_ne!(literals[0].0, literals[1].0);
+        let projections = public_projection_usage_sites(&root);
+        assert_eq!(projections.len(), 1);
+        let missing = missing_request_header_sites(&literals, &projections);
+        assert_eq!(missing, vec![literals[1].0.as_str()]);
+    }
+
+    #[test]
+    fn header_projection_uses_the_actual_public_serde_fields() {
+        let public = public_usage_event_fields();
+        assert!(public.contains("api_key_name"));
+        assert!(public.contains("applied_guardrails"));
+        for private in [
+            "request_headers",
+            "upstream_response_headers",
+            "user_name",
+            "reasoning_unfolded_from_completion",
+        ] {
+            assert!(
+                !public.contains(private),
+                "private field {private} cannot prove a public-only use"
+            );
+        }
+    }
+
+    #[test]
+    fn occurred_at_scan_checks_the_event_field_and_shared_formatters() {
+        assert_eq!(
+            shared_occurred_at_stamp(
+                "{ occurred_at: aisix_obs::UsageEvent::occurred_at_now(), ..Default::default() }"
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            shared_occurred_at_stamp(
+                "{ occurred_at: UsageEvent::occurred_at(observed), ..Default::default() }"
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            shared_occurred_at_stamp(
+                "{ occurred_at: observed.to_rfc3339(), ..Default::default() }"
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            shared_occurred_at_stamp("{ occurred_at: Utc::now(), ..Default::default() }"),
+            Some(false)
+        );
+        assert_eq!(
+            shared_occurred_at_stamp(
+                "{ io_audit: ObservedUsage { occurred_at: observed }, ..Default::default() }"
+            ),
+            None
+        );
     }
 
     #[test]
