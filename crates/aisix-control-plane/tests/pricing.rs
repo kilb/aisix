@@ -3100,8 +3100,12 @@ async fn a_charge_says_how_its_call_ended_and_names_a_deleted_model() {
         (json!(name), json!(false)),
         "{retried}"
     );
-    // The upstream's own words stay in the usage row.
-    assert!(retried.get("error_message").is_none(), "{retried}");
+    // 管理员可读已存错误的脱敏展示副本。
+    assert_eq!(
+        retried.get("error_message"),
+        Some(&json!("upstream answered 502")),
+        "{retried}"
+    );
     let r = one(all.clone(), "e-refused");
     assert_eq!(
         (
@@ -3119,6 +3123,7 @@ async fn a_charge_says_how_its_call_ended_and_names_a_deleted_model() {
         "{r}"
     );
     let ok = one(all, "e-ok");
+    assert_eq!(ok.get("error_message"), Some(&Value::Null), "{ok}");
     assert_eq!(
         (
             ok["attempt_kind"].clone(),

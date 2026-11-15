@@ -22,7 +22,7 @@ const UPSTREAM_MODEL: &str = "upstream-mdl-9f3";
 const UPSTREAM_ERROR: &str = "upstream secret 4b7";
 
 /// The keys of a `Call`, from the API section.
-const CALL_KEYS: [&str; 22] = [
+const CALL_KEYS: [&str; 23] = [
     "event_id",
     "occurred_at",
     "request_id",
@@ -37,6 +37,7 @@ const CALL_KEYS: [&str; 22] = [
     "guardrail_blocked",
     "latency_ms",
     "first_token_latency_ms",
+    "request_timing",
     "attempt_duration_ms",
     "throughput_tps",
     "usage",
@@ -183,10 +184,19 @@ fn around_now() -> String {
 async fn a_tenants_call_log_names_no_channel_and_no_cost() {
     let Some(w) = world().await else { return };
     let m = model(&w, "chat-bill", Some(w.tenant)).await;
+    let timing = json!({
+        "body_read_ms": 17,
+        "json_decode_ms": 0,
+        "pre_handler_ms": 21,
+        "request_body_bytes": 123,
+        "request_body_complete": true,
+    });
+    let mut measured = tokens_680();
+    measured["request_timing"] = timing.clone();
     send_all(
         &w,
         vec![
-            row(&w, "ok1", m, "chat-bill", tokens_680()),
+            row(&w, "ok1", m, "chat-bill", measured),
             row(
                 &w,
                 "bad1",
@@ -238,6 +248,13 @@ async fn a_tenants_call_log_names_no_channel_and_no_cost() {
     let mut lines_seen = 0;
     for item in items(&r) {
         assert_eq!(keys(item), want, "{item}");
+        // 新记录完整保留入口测量；旧事件的未知窗口不得补成零。
+        let expected_timing = if item["event_id"] == "ok1" {
+            &timing
+        } else {
+            &Value::Null
+        };
+        assert_eq!(item.get("request_timing"), Some(expected_timing), "{item}");
         assert_eq!(keys(&item["charge"]), charge_keys, "{item}");
         for line in item["charge"]["lines"].as_array().expect("lines") {
             assert_eq!(keys(line), line_keys, "{line}");
