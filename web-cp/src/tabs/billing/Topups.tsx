@@ -14,6 +14,7 @@ import { BentoGrid, Card, CardHeader, PageHeader, span } from "../../components/
 import { formatCount } from "../../lib/chartFormat";
 import { Lamp } from "../../ui/Lamp";
 import { TwoStep } from "../../ui/TwoStep";
+import { Select } from "../../ui/Select";
 
 type StatusFilter = Topup["status"] | "";
 
@@ -164,31 +165,31 @@ export function Topups({ canEdit, refreshShell }: TabProps) {
           <>
             <label className="f filter">
               <span>状态</span>
-              <select value={status} onChange={(e) => setStatus(e.target.value as StatusFilter)}>
+              <Select size="compact" value={status} onValueChange={(value) => setStatus(value as StatusFilter)}>
                 <option value="pending">待审批</option>
                 <option value="approved">已批准</option>
                 <option value="rejected">已驳回</option>
                 <option value="">全部</option>
-              </select>
+              </Select>
             </label>
             <label className="f filter">
               <span>来源</span>
-              <select value={origin} onChange={(e) => setOrigin(e.target.value as Topup["origin"] | "")}>
+              <Select size="compact" value={origin} onValueChange={(value) => setOrigin(value as Topup["origin"] | "")}>
                 <option value="">全部</option>
                 <option value="tenant">{ORIGIN_LABEL.tenant}</option>
                 <option value="operator">{ORIGIN_LABEL.operator}</option>
-              </select>
+              </Select>
             </label>
             <label className="f filter">
               <span>租户</span>
-              <select value={tenantId} onChange={(e) => setTenantId(e.target.value)}>
+              <Select size="compact" value={tenantId} onValueChange={(value) => setTenantId(value)}>
                 <option value="">全部</option>
                 {tenantList.map((t) => (
                   <option key={t.id} value={t.id}>
                     {t.name}
                   </option>
                 ))}
-              </select>
+              </Select>
             </label>
           </>
         }

@@ -1,3 +1,4 @@
+import { Select } from "./ui/Select";
 import { useState, type ReactNode } from "react";
 import { useTheme } from "./lib/useTheme";
 import { Button, type ButtonKind } from "./ui/Button";
@@ -68,6 +69,7 @@ export default function Styleguide() {
   const [theme, toggleTheme] = useTheme();
   const [tab, setTab] = useState<"a" | "b" | "c" | "d">("b");
   const [panel, setPanel] = useState(true);
+  const [sampleStatus, setSampleStatus] = useState("全部");
   const toast = useToast();
 
   return (
@@ -175,9 +177,9 @@ export default function Styleguide() {
                   {s === "载入中" ? (
                     <span className="sg-na">—</span>
                   ) : (
-                    <select className={FORCED[i] || undefined} disabled={s === "不可用"} aria-label="示例下拉" tabIndex={-1}>
+                    <Select value="全部" onValueChange={() => undefined} className={FORCED[i] || undefined} disabled={s === "不可用"} aria-label="示例下拉" tabIndex={-1}>
                       <option>全部</option>
-                    </select>
+                    </Select>
                   )}
                 </td>
               ))}
@@ -225,10 +227,10 @@ export default function Styleguide() {
             {(aria) => <input defaultValue="2.5" {...aria} />}
           </Field>
           <Field label="按状态筛选">
-            <select>
+            <Select value={sampleStatus} onValueChange={setSampleStatus}>
               <option>全部</option>
               <option>待审核</option>
-            </select>
+            </Select>
           </Field>
         </div>
         <div className="sg-inline">

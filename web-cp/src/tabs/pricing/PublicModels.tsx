@@ -29,6 +29,7 @@ import { Card, CardHeader, CardMessage, ChartSkeleton, PageHeader } from "../../
 import { Lamp } from "../../ui/Lamp";
 import { PublicModelDetail } from "./PublicModelDetail";
 import { CardFooter, Count, FormGrid } from "./kit";
+import { Select } from "../../ui/Select";
 
 /** How many accounts serve a model, and at which priorities: `2 个（优先级 5、0）`. */
 function tiersOf(model: PublicModel): string {
@@ -305,7 +306,7 @@ export function PublicModels({ canEdit, onGoto, initialSection, sectionVisit, re
           ) : (
             <>
             <RecordTableToolbar search={{ value: records.query, onChange: records.setQuery, label: "搜索公共模型", placeholder: "模型名称或 ID" }}>
-              <label className="f filter"><span>模型状态</span><select value={modelState} onChange={(e) => setModelState(e.target.value)}><option value="">全部</option><option value="live">在用</option><option value="retired">已停用</option><option value="unavailable">在用但无可用账号</option></select></label>
+              <label className="f filter"><span>模型状态</span><Select size="compact" value={modelState} onValueChange={(value) => setModelState(value)}><option value="">全部</option><option value="live">在用</option><option value="retired">已停用</option><option value="unavailable">在用但无可用账号</option></Select></label>
             </RecordTableToolbar>
             <DataTable label="公共模型" tableClassName="pm-models-table">
               <thead>

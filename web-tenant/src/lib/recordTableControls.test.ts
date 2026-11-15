@@ -5,6 +5,7 @@ import { test } from "node:test";
 import { build } from "esbuild";
 import { createElement, useState, type ComponentType } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
+import { chromium, expect } from "@playwright/test";
 import type { RecordTablePagerProps, RecordTableToolbarProps } from "../ui/RecordTable";
 import { useRecordTable } from "./recordTable.ts";
 
@@ -66,7 +67,7 @@ test("已知总数给出精确显示范围，末页与空表阻止越界", () =>
   const last = renderToStaticMarkup(createElement(RecordTablePager, { ...base, page: 3, total: 61 }));
   assert.match(textOf(last), /51[–—-]61.*共 61 条/);
   assertPageButton(last, "下一页", true);
-  for (const value of [10, 25, 50]) assert.match(last, new RegExp(`<option value="${value}"`));
+  assert.match(last, /role="combobox"[^>]*data-value="25"/);
   const empty = renderToStaticMarkup(createElement(RecordTablePager, { ...base, total: 0 }));
   assert.match(textOf(empty), /0[–—-]0.*共 0 条/);
   assert.equal(empty.match(/<button[^>]*disabled=""/g)?.length, 2);
@@ -75,8 +76,9 @@ test("已知总数给出精确显示范围，末页与空表阻止越界", () =>
 // 若busy仍可翻页或改页大小，会并发沿用过时cursor。
 test("请求中锁定页导航与页大小，状态区可被辅助技术播报", () => {
   const markup = renderToStaticMarkup(createElement(RecordTablePager, { ...base, page: 2, hasNext: true, loadedCount: 50, busy: true }));
-  assert.equal(markup.match(/<button[^>]*disabled=""/g)?.length, 2);
-  assert.match(markup, /<select[^>]*disabled=""/);
+  assertPageButton(markup, "上一页", true);
+  assertPageButton(markup, "下一页", true);
+  assert.match(markup.match(/<button[^>]*role="combobox"[^>]*>/)?.[0] ?? "", /disabled=""/);
   assert.match(markup, /role="status"/);
 });
 
@@ -110,4 +112,27 @@ test("表格保留语义和名称，局部滚动区域可被键盘聚焦", () =>
   assert.match(markup, /role="region" aria-label="模型列表表格滚动区域" tabindex="0"/);
   assert.match(markup, /<table[^>]*aria-label="模型列表"/);
   assert.match(markup, /<tbody><tr><td>Alpha<\/td><\/tr><\/tbody>/);
+});
+
+// 删除任何页大小选项、丢失实际值或忙时漏锁触发器都会使连续交互失败。
+test("页大小菜单实际提供10/25/50并把原值传给回调，忙时不能更改", { timeout: 30_000 }, async () => {
+  const script = await build({
+    stdin: { loader: "tsx", contents: `import { createRoot } from "react-dom/client"; import { useState } from "react"; import { RecordTablePager } from "./ui/RecordTable"; function Journey() { const [size,setSize]=useState(25); const [busy,setBusy]=useState(false); return <><RecordTablePager page={1} pageSize={size} total={61} onPageChange={()=>{}} onPageSizeChange={setSize} busy={busy}/><output aria-label="实际页大小">{size}</output><button onClick={()=>setBusy(true)}>锁定请求</button></>; } createRoot(document.getElementById("root")).render(<Journey/>);`, resolveDir: fileURLToPath(new URL("../", import.meta.url)), sourcefile: "record-table-size.tsx" },
+    bundle: true, platform: "browser", format: "iife", jsx: "automatic", write: false, loader: { ".css": "empty" }, define: { "process.env.NODE_ENV": '"test"' },
+  });
+  const browser = await chromium.launch();
+  try {
+    const page = await browser.newPage();
+    await page.setContent('<div id="root"></div>'); await page.addScriptTag({ content: script.outputFiles[0]!.text });
+    const control = page.getByRole("combobox", { name: "记录分页每页条数", exact: true });
+    for (const value of ["10", "25", "50"]) {
+      await control.click();
+      await expect(page.getByRole("option")).toHaveCount(3);
+      await page.getByRole("option", { name: value, exact: true }).click();
+      await expect(control).toHaveAttribute("data-value", value);
+      await expect(page.getByRole("status", { name: "实际页大小", exact: true })).toHaveText(value);
+    }
+    await page.getByRole("button", { name: "锁定请求", exact: true }).click();
+    await expect(control).toBeDisabled();
+  } finally { await browser.close(); }
 });

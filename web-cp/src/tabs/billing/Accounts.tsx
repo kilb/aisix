@@ -13,6 +13,7 @@ import { RankBars } from "../../components/charts";
 import { exactInteger, formatCount } from "../../lib/chartFormat";
 import { SIDE_OPEN } from "../Tenants";
 import { AccountPanel, AccountState, MODE_LABEL } from "./AccountPanel";
+import { Select } from "../../ui/Select";
 
 // 桌面/平板：6 + 6；账户列表与详情：12。
 /** 账户: every tenant's balance and credit limit, and one tenant's billing in a side panel. */
@@ -136,7 +137,7 @@ export function Accounts({ canEdit, operator, onGoto }: TabProps) {
               <EmptyState text="还没有已开通的租户。" />
             ) : (
               <>
-                <RecordTools table={table} label="账户列表"><label className="f filter"><span>计费模式</span><select aria-label="计费模式" value={modeFilter} onChange={(e) => setModeFilter(e.target.value)}><option value="">全部</option><option value="prepaid">预付</option><option value="postpaid">后付</option></select></label><label className="f filter"><span>余额状态</span><select aria-label="余额状态" value={balanceFilter} onChange={(e) => setBalanceFilter(e.target.value)}><option value="">全部</option><option value="exhausted">额度已用尽</option><option value="available">额度未用尽</option></select></label></RecordTools>
+                <RecordTools table={table} label="账户列表"><label className="f filter"><span>计费模式</span><Select size="compact" aria-label="计费模式" value={modeFilter} onValueChange={(value) => setModeFilter(value)}><option value="">全部</option><option value="prepaid">预付</option><option value="postpaid">后付</option></Select></label><label className="f filter"><span>余额状态</span><Select size="compact" aria-label="余额状态" value={balanceFilter} onValueChange={(value) => setBalanceFilter(value)}><option value="">全部</option><option value="exhausted">额度已用尽</option><option value="available">额度未用尽</option></Select></label></RecordTools>
                 <DataTable label="账户列表">
                   <thead>
                     <tr>

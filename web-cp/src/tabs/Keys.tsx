@@ -53,6 +53,7 @@ import { OperationalTable as DataTable, Loading } from "../components/Operationa
 import { EmptyState } from "../ui/EmptyState";
 import { Lamp } from "../ui/Lamp";
 import { TwoStep } from "../ui/TwoStep";
+import { Select } from "../ui/Select";
 
 /** The roles that manage every key of their tenant, and so may mint one for someone else. */
 const MANAGERS: Member["role"][] = ["owner", "admin"];
@@ -115,13 +116,13 @@ export function Keys({ canEdit }: TabProps) {
             <div className="flex flex-wrap items-end gap-3">
               <label className="f filter filter-wide">
                 <span>租户</span>
-                <select value={tenantId ?? ""} onChange={(e) => setChosen(e.target.value)}>
+                <Select size="compact" value={tenantId ?? ""} onValueChange={(value) => setChosen(value)}>
                   {ordered.map((t) => (
                     <option key={t.id} value={t.id}>
                       {tenantLabel(t)}
                     </option>
                   ))}
-                </select>
+                </Select>
               </label>
             </div>
           )}
@@ -357,7 +358,7 @@ function TenantKeys({ tenantId, canEdit, tick }: { tenantId: string; canEdit: bo
             <EmptyState mark="key" text="该租户还没有密钥。" />
           ) : (
             <>
-              <RecordTools table={table} label="密钥列表"><label className="f filter"><span>密钥状态</span><select aria-label="密钥状态" value={keyStatus} onChange={(e) => setKeyStatus(e.target.value)}><option value="">全部</option><option value="enabled">可用</option><option value="disabled">停用</option></select></label><label className="f filter"><span>密钥分组</span><select aria-label="密钥分组" value={keyGroup} onChange={(e) => setKeyGroup(e.target.value)}><option value="">全部</option>{choices.map((g) => <option key={g.name} value={g.name}>{g.display_name}</option>)}</select></label></RecordTools>
+              <RecordTools table={table} label="密钥列表"><label className="f filter"><span>密钥状态</span><Select size="compact" aria-label="密钥状态" value={keyStatus} onValueChange={(value) => setKeyStatus(value)}><option value="">全部</option><option value="enabled">可用</option><option value="disabled">停用</option></Select></label><label className="f filter"><span>密钥分组</span><Select size="compact" aria-label="密钥分组" value={keyGroup} onValueChange={(value) => setKeyGroup(value)}><option value="">全部</option>{choices.map((g) => <option key={g.name} value={g.name}>{g.display_name}</option>)}</Select></label></RecordTools>
               <DataTable label="密钥列表">
                 <thead>
                   <tr>
@@ -779,7 +780,7 @@ function CreateForm({
         ) : (
           <label className="f">
             <span>分组（必选）</span>
-            <select value={group} disabled={busy} onChange={(e) => setGroup(e.target.value)}>
+            <Select value={group} disabled={busy} onValueChange={(value) => setGroup(value)}>
               <option value="">请选择分组</option>
               {choices.map((g) => (
                 <option key={g.id} value={g.name}>
@@ -787,7 +788,7 @@ function CreateForm({
                   {g.display_name === g.name ? "" : `（${g.name}）`}
                 </option>
               ))}
-            </select>
+            </Select>
           </label>
         )}
         {at("/group_id") && (

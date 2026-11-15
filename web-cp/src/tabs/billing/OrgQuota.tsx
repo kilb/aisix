@@ -12,6 +12,7 @@ import { refusal, useLoad } from "../Tenants";
 import { MONEY_HINT, PERIOD_LABEL, Region, budgetPeriod, type RegionProps } from "./AccountPanel";
 import { BudgetProgress } from "../../components/charts";
 import { exactRatio } from "../../lib/chartFormat";
+import { Select } from "../../ui/Select";
 
 type Refusal = ReturnType<typeof refusal>;
 
@@ -63,22 +64,22 @@ function NewQuota({ account, onCreated }: { account: RegionProps["account"]; onC
       <div className="bl-controls bl-inline">
         <Field label="类型" error={refused?.at.get("/kind") ?? null}>
           {(aria) => (
-            <select value={kind} disabled={busy} onChange={(e) => setKind(e.target.value as "periodic" | "cumulative")} {...aria}>
+            <Select value={kind} disabled={busy} onValueChange={(value) => setKind(value as "periodic" | "cumulative")} {...aria}>
               <option value="periodic">按周期</option>
               <option value="cumulative">一次性额度</option>
-            </select>
+            </Select>
           )}
         </Field>
         {kind === "periodic" && (
           <Field label="周期" error={refused?.at.get("/period") ?? null}>
             {(aria) => (
-              <select value={period} disabled={busy} onChange={(e) => setPeriod(e.target.value as "day" | "week" | "month")} {...aria}>
+              <Select value={period} disabled={busy} onValueChange={(value) => setPeriod(value as "day" | "week" | "month")} {...aria}>
                 {(["day", "week", "month"] as const).map((p) => (
                   <option key={p} value={p}>
                     {PERIOD_LABEL[p]}
                   </option>
                 ))}
-              </select>
+              </Select>
             )}
           </Field>
         )}

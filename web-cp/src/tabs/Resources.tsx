@@ -19,6 +19,7 @@ import { EmptyState } from "../ui/EmptyState";
 import { CardHeader, PageHeader, Split } from "../components/page";
 import { Eye, Pencil, Plus, RefreshCw } from "lucide-react";
 import { InventorySummary, countGroups } from "./providers/OperationsBento";
+import { Select } from "../ui/Select";
 
 /**
  * Every gateway resource kind the control plane stores, by the segment
@@ -80,13 +81,13 @@ export function Resources({ canEdit, initialSection }: TabProps) {
         actions={
           <label className="f filter filter-wide max-md:w-full">
             <span>资源类型</span>
-            <select className="max-md:w-full" value={kind} onChange={(e) => setKind(e.target.value)}>
+            <Select size="compact" className="max-md:w-full" value={kind} onValueChange={(value) => setKind(value)}>
               {KINDS.map((k) => (
                 <option key={k.kind} value={k.kind}>
                   {k.label} · {k.kind}
                 </option>
               ))}
-            </select>
+            </Select>
           </label>
         }
       />
@@ -256,7 +257,7 @@ function KindPage({ info, canEdit }: { info: KindInfo; canEdit: boolean }) {
       {items !== null && items.length === 0 && <EmptyState text="暂无此类资源。" />}
       {items !== null && items.length > 0 && (
         <>
-          <RecordTools table={table} label="资源文档"><label className="f filter"><span>管理来源</span><select aria-label="管理来源" value={managedFilter} onChange={(e) => setManagedFilter(e.target.value)}><option value="">全部</option><option value="manual">手工管理</option><option value="managed">系统管理</option></select></label><label className="f filter"><span>下发状态</span><select aria-label="下发状态" value={rolloutFilter} onChange={(e) => setRolloutFilter(e.target.value)}><option value="">全部</option><option value="applied">applied</option><option value="pending">pending</option><option value="propagating">propagating</option><option value="rejected">rejected</option><option value="no_gateways">no_gateways</option></select></label></RecordTools>
+          <RecordTools table={table} label="资源文档"><label className="f filter"><span>管理来源</span><Select size="compact" aria-label="管理来源" value={managedFilter} onValueChange={(value) => setManagedFilter(value)}><option value="">全部</option><option value="manual">手工管理</option><option value="managed">系统管理</option></Select></label><label className="f filter"><span>下发状态</span><Select size="compact" aria-label="下发状态" value={rolloutFilter} onValueChange={(value) => setRolloutFilter(value)}><option value="">全部</option><option value="applied">applied</option><option value="pending">pending</option><option value="propagating">propagating</option><option value="rejected">rejected</option><option value="no_gateways">no_gateways</option></Select></label></RecordTools>
           <DataTable label="资源文档">
             <thead>
               <tr>

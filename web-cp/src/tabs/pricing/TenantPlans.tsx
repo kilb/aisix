@@ -21,6 +21,7 @@ import { discountBps, fmtPercent } from "../../lib/percent";
 import { Card, CardHeader, CardMessage, MetricSkeleton, PageHeader } from "../../components/page";
 import { EmptyState } from "../../ui/EmptyState";
 import { CardFooter, FormGrid } from "./kit";
+import { Select } from "../../ui/Select";
 
 export function TenantPlans({ canEdit }: TabProps) {
   const [list, setList] = useState<Tenant[] | null>(null);
@@ -42,14 +43,14 @@ export function TenantPlans({ canEdit }: TabProps) {
           list !== null && (
             <label className="f filter filter-wide">
               <span>租户</span>
-              <select value={tenantId} onChange={(e) => setTenantId(e.target.value)}>
+              <Select size="compact" value={tenantId} onValueChange={(value) => setTenantId(value)}>
                 <option value="">请选择租户</option>
                 {list.map((t) => (
                   <option key={t.id} value={t.id}>
                     {t.name}
                   </option>
                 ))}
-              </select>
+              </Select>
             </label>
           )
         }

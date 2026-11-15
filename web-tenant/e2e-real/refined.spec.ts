@@ -1,6 +1,16 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Page, type Locator } from "@playwright/test";
 import { readFileSync, mkdirSync } from "node:fs";
 import { join, resolve } from "node:path";
+
+
+// 自定义菜单通过真实键盘/指针交互选择；data-value保留原业务值。
+async function chooseSelect(control: Locator, choice: string | { label: string }): Promise<void> {
+  await control.click();
+  const options = control.page().getByRole("option");
+  const option = typeof choice === "string" ? options.and(control.page().locator(`[data-value=${JSON.stringify(choice)}]`)) : control.page().getByRole("option", { name: choice.label, exact: true });
+  await option.click();
+  if (typeof choice === "string") await expect(control).toHaveAttribute("data-value", choice);
+}
 
 // 只使用保留的真实隔离世界；没有seed、响应替换、模型调用或上游探测。
 const session = resolve(process.env.REFINED_QA_SESSION!);
@@ -234,7 +244,7 @@ test("call-record-pagination-preserves-real-four-call-total", async ({ page }) =
   const size = page.getByRole("combobox", { name: /每页/ });
   await expect(size).toHaveCount(1);
   for (const value of ["10", "25", "50"]) {
-    await size.selectOption(value); await settle(page);
+    await chooseSelect(size, value); await settle(page);
     await expect(page.getByRole("button", { name: "下一页", exact: true })).toBeDisabled();
     expect((await metricOracle(page)).totals).toEqual(before.totals);
   }
@@ -254,19 +264,19 @@ test("analysis-preserves-exact-fee-latency-tokens-and-cache-denominators", async
     await expect(term).toHaveCount(1);
     await expect(term.locator("xpath=following-sibling::dd[1]")).toHaveText(value);
   };
-  await panel.getByRole("combobox", { name: "耗时口径", exact: true }).selectOption({ label: "首 token 延迟" });
+  await chooseSelect(panel.getByRole("combobox", { name: "耗时口径", exact: true }), { label: "首 token 延迟" });
   await definition("P50", "5.59 s"); await definition("P99", "8.36 s");
   await definition("实测样本", "2"); await definition("无实测值", "2");
   await tabs.getByRole("tab", { name: /^token$/i }).click(); await settle(page); card = cardFor("token");
-  await panel.getByRole("combobox", { name: "token 口径", exact: true }).selectOption({ label: "已记录输入 token" });
+  await chooseSelect(panel.getByRole("combobox", { name: "token 口径", exact: true }), { label: "已记录输入 token" });
   await expect(panel.getByText("13,208", { exact: true }).first()).toBeVisible();
   await definition("用量记录覆盖率", "100%");
   await definition("有可用用量记录的尝试", "4"); await definition("无可用用量记录的尝试", "0");
-  await panel.getByRole("combobox", { name: "token 口径", exact: true }).selectOption({ label: "已记录输出 token" });
+  await chooseSelect(panel.getByRole("combobox", { name: "token 口径", exact: true }), { label: "已记录输出 token" });
   await expect(panel.getByText("16", { exact: true }).first()).toBeVisible();
   await tabs.getByRole("tab", { name: "缓存", exact: true }).click(); await settle(page); card = cardFor("缓存");
   await definition("已记录缓存读取", "12,672"); await definition("输入 token", "13,208");
-  await panel.getByRole("combobox", { name: "缓存口径", exact: true }).selectOption({ label: "响应缓存命中率" });
+  await chooseSelect(panel.getByRole("combobox", { name: "缓存口径", exact: true }), { label: "响应缓存命中率" });
   await expect(panel.getByText("50%", { exact: true }).first()).toBeVisible();
   await expect(panel).toContainText(/命中.*未命中/s);
   await tabs.getByRole("tab", { name: "费用", exact: true }).click(); await settle(page); card = cardFor("费用");
@@ -326,7 +336,7 @@ test("key-change-never-commits-old-rows-and-local-query-hides-immediately", asyn
     const frame = (): void => { sample(); w.refinedRaf = requestAnimationFrame(frame); }; frame();
     location.hash = "#calls?api_key_id=" + empty;
   }, { empty: fixture.emptyKeyId, old: oldRows });
-  await expect(page.getByRole("combobox", { name: "密钥", exact: true })).toHaveValue(fixture.emptyKeyId);
+  await expect(page.getByRole("combobox", { name: "密钥", exact: true })).toHaveAttribute("data-value", fixture.emptyKeyId);
   await settle(page);
   const samples = await page.evaluate(() => { const w = window as any; w.refinedObserver.disconnect(); cancelAnimationFrame(w.refinedRaf); return w.refinedSamples; });
   expect(samples.length).toBeGreaterThan(0);
@@ -376,12 +386,12 @@ test("unknown-url-key-and-model-stay-visible-and-never-become-all", async ({ pag
     await goto(page, `#${route}?api_key_id=${key}&model_id=${model}`);
     const keySelect = page.getByRole("combobox", { name: "密钥", exact: true });
     const modelSelect = page.getByRole("combobox", { name: "模型", exact: true });
-    await expect(keySelect).toHaveValue(key); await expect(modelSelect).toHaveValue(model);
-    await expect(keySelect.locator("option:checked")).toContainText(key);
-    await expect(modelSelect.locator("option:checked")).toContainText(model);
+    await expect(keySelect).toHaveAttribute("data-value", key); await expect(modelSelect).toHaveAttribute("data-value", model);
+    await expect(keySelect).toContainText(key);
+    await expect(modelSelect).toContainText(model);
     for (const [param, value] of [["api_key_id", key], ["model_id", model]]) expect(new URLSearchParams(page.url().split("?")[1]).get(param!)).toBe(value);
     await page.reload(); await settle(page);
-    await expect(keySelect).toHaveValue(key); await expect(modelSelect).toHaveValue(model);
+    await expect(keySelect).toHaveAttribute("data-value", key); await expect(modelSelect).toHaveAttribute("data-value", model);
   }
   const constrained = (requests.get(page) ?? []).slice(phaseStart).filter(r => r.method === "GET" && ["/api/usage/metrics", "/api/usage/calls", "/api/usage/summary"].includes(r.path));
   await test.info().attach("all-requests-before-explicit-filter-clear", { body: JSON.stringify(constrained), contentType: "application/json" });
@@ -394,12 +404,12 @@ test("unknown-url-key-and-model-stay-visible-and-never-become-all", async ({ pag
   const keySelect = page.getByRole("combobox", { name: "密钥", exact: true });
   const modelSelect = page.getByRole("combobox", { name: "模型", exact: true });
   const keyClearStart = (requests.get(page) ?? []).length;
-  await keySelect.selectOption(""); await settle(page);
+  await chooseSelect(keySelect, ""); await settle(page);
   const keyCleared = (requests.get(page) ?? []).slice(keyClearStart).filter(r => r.method === "GET" && r.path === "/api/usage/calls");
   expect(keyCleared.length).toBeGreaterThanOrEqual(1);
   for (const read of keyCleared) { expect(new URLSearchParams(read.query).has("api_key_id")).toBe(false); expect(new URLSearchParams(read.query).get("model_id")).toBe(model); }
   const modelClearStart = (requests.get(page) ?? []).length;
-  await modelSelect.selectOption(""); await settle(page);
+  await chooseSelect(modelSelect, ""); await settle(page);
   const allCleared = (requests.get(page) ?? []).slice(modelClearStart).filter(r => r.method === "GET" && r.path === "/api/usage/calls");
   expect(allCleared.length).toBeGreaterThanOrEqual(1);
   for (const read of allCleared) { expect(new URLSearchParams(read.query).has("api_key_id")).toBe(false); expect(new URLSearchParams(read.query).has("model_id")).toBe(false); }
@@ -438,4 +448,34 @@ test("time-label-copy-keeps-utc-plus-eight-values-and-budget-boundaries", async 
     const row = page.getByRole("row").filter({ hasText: budget.target.label }).filter({ hasText: range }); await expect(row).toHaveCount(1); await expect(row.getByRole("cell", { name: range, exact: true })).toHaveCount(1);
   }
   await expect(page.locator("main")).not.toContainText("北京时间");
+});
+
+// 真实调用记录的分页菜单须在桌面与手机内完整显示，不改变查询口径。
+test("dropdown-controls-retain-keyboard-and-viewport-boundaries", async ({ page }) => {
+  await login(page); await goto(page, "#calls");
+  for (const viewport of [{ width: 1440, height: 1000 }, { width: 375, height: 667 }]) {
+    await page.setViewportSize(viewport); await settle(page);
+    const control = page.getByRole("combobox", { name: /每页条数/ });
+    await expect(control).toHaveCount(1);
+    await control.evaluate(element => element.scrollIntoView({ block: "end" }));
+    await control.focus(); await page.keyboard.press("ArrowDown");
+    const list = page.getByRole("listbox");
+    await expect(list).toBeVisible();
+    await expect(page.getByRole("option")).toHaveText(["10", "25", "50"]);
+    await expect(list).toHaveAttribute("data-side", /^(top|bottom)$/);
+    const bounds = await list.boundingBox();
+    expect(bounds).not.toBeNull();
+    expect(bounds!.x).toBeGreaterThanOrEqual(0); expect(bounds!.y).toBeGreaterThanOrEqual(0);
+    expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(viewport.width);
+    expect(bounds!.y + bounds!.height).toBeLessThanOrEqual(viewport.height);
+    mkdirSync(join(output, "screenshots"), { recursive: true });
+    await page.screenshot({ path: join(output, "screenshots", `${app}-dropdown-${viewport.width}.png`), fullPage: false });
+    await page.keyboard.press("Home"); await expect(page.getByRole("option", { name: "10", exact: true })).toBeFocused();
+    await page.keyboard.press("Enter"); await expect(control).toHaveAttribute("data-value", "10");
+    await settle(page); await expect(control).toBeFocused();
+    await control.click(); await expect(list).toBeVisible(); await page.keyboard.press("Escape");
+    await expect(list).toHaveCount(0); await expect(control).toBeFocused();
+    await control.click(); await expect(list).toBeVisible(); await page.mouse.click(4, 4);
+    await expect(list).toHaveCount(0);
+  }
 });

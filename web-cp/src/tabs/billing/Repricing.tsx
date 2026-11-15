@@ -18,6 +18,7 @@ import { exactRatio, formatCount } from "../../lib/chartFormat";
 import { cn } from "../../lib/cn";
 import { Lamp } from "../../ui/Lamp";
 import { TwoStep } from "../../ui/TwoStep";
+import { Select } from "../../ui/Select";
 
 const STATUS_OPTIONS: [string, string][] = [
   ["unpriced", "待计价"],
@@ -322,34 +323,34 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
         </div>
         <div className="grid gap-x-4 tablet:grid-cols-3 desktop:grid-cols-1">
           <Field label="模型">
-            <select value={form.model_id} disabled={busy} onChange={(e) => set("model_id", e.target.value)}>
+            <Select value={form.model_id} disabled={busy} onValueChange={(value) => set("model_id", value)}>
               <option value="">全部</option>
               {models.map((m) => (
                 <option key={m.id} value={m.id}>
                   {m.name}
                 </option>
               ))}
-            </select>
+            </Select>
           </Field>
           <Field label="租户">
-            <select value={form.tenant_id} disabled={busy} onChange={(e) => set("tenant_id", e.target.value)}>
+            <Select value={form.tenant_id} disabled={busy} onValueChange={(value) => set("tenant_id", value)}>
               <option value="">全部</option>
               {tenantList.map((t) => (
                 <option key={t.id} value={t.id}>
                   {t.name}
                 </option>
               ))}
-            </select>
+            </Select>
           </Field>
           <Field label="状态" error={problems.status}>
             {(aria) => (
-              <select {...aria} value={form.status} disabled={busy} onChange={(e) => set("status", e.target.value)}>
+              <Select {...aria} value={form.status} disabled={busy} onValueChange={(value) => set("status", value)}>
                 {STATUS_OPTIONS.map(([v, label]) => (
                   <option key={v} value={v}>
                     {label}
                   </option>
                 ))}
-              </select>
+              </Select>
             )}
           </Field>
         </div>
@@ -533,7 +534,7 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
       {runs === null && !loadError && <Loading />}
       {runs !== null && (
         <>
-          <RecordTools table={table} label="重新计价运行" loaded><label className="f filter"><span>运行状态</span><select aria-label="运行状态" value={runState} onChange={(e) => setRunState(e.target.value)}><option value="">全部</option><option value="previewed">已预览</option><option value="applied">已执行</option></select></label></RecordTools>
+          <RecordTools table={table} label="重新计价运行" loaded><label className="f filter"><span>运行状态</span><Select size="compact" aria-label="运行状态" value={runState} onValueChange={(value) => setRunState(value)}><option value="">全部</option><option value="previewed">已预览</option><option value="applied">已执行</option></Select></label></RecordTools>
           <DataTable label="重新计价运行">
             <thead>
               <tr>

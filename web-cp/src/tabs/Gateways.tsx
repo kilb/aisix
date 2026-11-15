@@ -25,6 +25,7 @@ import { TwoStep } from "../ui/TwoStep";
 import { Card, CardHeader, PageHeader, Split } from "../components/page";
 import { Plus } from "lucide-react";
 import { InventorySummary } from "./providers/OperationsBento";
+import { Select } from "../ui/Select";
 
 /** How often the instances are read again: about one gateway heartbeat. */
 const REFRESH_MS = 5_000;
@@ -174,7 +175,7 @@ export function Gateways({ operator }: TabProps) {
               <EmptyState mark="gateway" text="还没有网关发来心跳。" />
             ) : (
               <>
-                <RecordTools table={table} label="网关实例"><label className="f filter"><span>在线状态</span><select aria-label="在线状态" value={onlineFilter} onChange={(e) => setOnlineFilter(e.target.value)}><option value="">全部</option><option value="online">在线</option><option value="offline">离线</option></select></label><label className="f filter"><span>版本状态</span><select aria-label="版本状态" value={versionFilter} onChange={(e) => setVersionFilter(e.target.value)}><option value="">全部</option><option value="match">一致</option><option value="mismatch">不一致</option><option value="unknown">无法比较</option></select></label></RecordTools>
+                <RecordTools table={table} label="网关实例"><label className="f filter"><span>在线状态</span><Select size="compact" aria-label="在线状态" value={onlineFilter} onValueChange={(value) => setOnlineFilter(value)}><option value="">全部</option><option value="online">在线</option><option value="offline">离线</option></Select></label><label className="f filter"><span>版本状态</span><Select size="compact" aria-label="版本状态" value={versionFilter} onValueChange={(value) => setVersionFilter(value)}><option value="">全部</option><option value="match">一致</option><option value="mismatch">不一致</option><option value="unknown">无法比较</option></Select></label></RecordTools>
                 <DataTable label="网关实例">
                   <thead>
                     <tr>

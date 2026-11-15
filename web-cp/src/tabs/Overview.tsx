@@ -11,6 +11,7 @@ import { ApiMetricsPanel } from "../components/ApiMetricsPanel";
 import "./providers/OperationsBento.css";
 import { Lamp } from "../ui/Lamp";
 import { TwoStep } from "../ui/TwoStep";
+import { Select } from "../ui/Select";
 
 /** How often the summary is read again: about one gateway heartbeat. */
 const REFRESH_MS = 5_000;
@@ -160,9 +161,9 @@ export function Overview({ operator, onGoto }: TabProps) {
             <div className="metric-toolbar-controls">
               <label className="f filter m-0">
                 <span>统计范围</span>
-                <select value={metrics.range} onChange={(e) => setMetrics(metricsWindow(e.target.value as MetricsRange))}>
+                <Select size="compact" value={metrics.range} onValueChange={(value) => setMetrics(metricsWindow(value as MetricsRange))}>
                   {METRICS_RANGES.map((r) => <option key={r.value} value={r.value}>{r.label}</option>)}
-                </select>
+                </Select>
               </label>
               <Button onClick={() => setMetrics(metricsWindow(metrics.range))}>刷新统计</Button>
             </div>

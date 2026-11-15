@@ -14,6 +14,7 @@ import { BentoGrid, Card, CardFooter, CardHeader, Metric, PageHeader, span } fro
 import { RankBars } from "../../components/charts";
 import { exactInteger, formatCount } from "../../lib/chartFormat";
 import { Lamp } from "../../ui/Lamp";
+import { Select } from "../../ui/Select";
 
 // 桌面/平板：12；6 + 6；12。
 /**
@@ -88,12 +89,12 @@ export function Reconciliation(_props: TabProps) {
           <>
             <label className="f filter">
               <span>租户</span>
-              <select
+              <Select size="compact"
                 value={tenantId}
                 disabled={loading}
-                onChange={(e) => {
+                onValueChange={(value) => {
                   setReset(null);
-                  setTenantId(e.target.value);
+                  setTenantId(value);
                 }}
               >
                 <option value="">全部</option>
@@ -102,7 +103,7 @@ export function Reconciliation(_props: TabProps) {
                     {t.name}
                   </option>
                 ))}
-              </select>
+              </Select>
             </label>
             <Button className="finance-icon-button" aria-label="刷新" title="刷新"
               type="button"
@@ -152,7 +153,7 @@ export function Reconciliation(_props: TabProps) {
                 <>
                   <p className="hint text-caption">「扣费与计费」不符时，已计费但未入账的调用也在其中，同时计入下方「已计费但未入账」。</p>
                   <>
-                    <RecordTools table={mismatchTable} label="账实不符"><label className="f filter"><span>核对项目</span><select aria-label="核对项目" value={checkFilter} onChange={(e) => setCheckFilter(e.target.value)}><option value="">全部</option>{[...new Set((answer?.mismatches ?? []).map((m) => m.check))].map((c) => <option key={c} value={c}>{checkLabel(c)}</option>)}</select></label></RecordTools>
+                    <RecordTools table={mismatchTable} label="账实不符"><label className="f filter"><span>核对项目</span><Select size="compact" aria-label="核对项目" value={checkFilter} onValueChange={(value) => setCheckFilter(value)}><option value="">全部</option>{[...new Set((answer?.mismatches ?? []).map((m) => m.check))].map((c) => <option key={c} value={c}>{checkLabel(c)}</option>)}</Select></label></RecordTools>
                     <DataTable label="账实不符">
                       <thead>
                         <tr>

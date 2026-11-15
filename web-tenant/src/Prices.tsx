@@ -1,3 +1,4 @@
+import { Select } from "./ui/Select";
 import { ArrowUpRight, X } from "lucide-react";
 import { Dialog } from "radix-ui";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -129,7 +130,7 @@ function PriceCatalog({ quote, groupId, onGroupChange }: { quote: PriceQuoteList
   return <>
     <PriceScopes items={quote.groups} value={groupId} onChange={onGroupChange} label="价格分组" />
     <RecordTableToolbar search={{ value: table.query, onChange: table.setQuery, label: "搜索模型价格", placeholder: "模型名、分组或说明" }}>
-      <label className="price-group-filter">服务档位<select aria-label="服务档位" value={effectiveTier} onChange={(event) => setTier(event.target.value)}><option value="default">标准</option>{tiers.filter((value) => value !== "default").map((value) => <option key={value} value={value}>{tierName(value)}</option>)}</select></label>
+      <label className="price-group-filter">服务档位<Select aria-label="服务档位" value={effectiveTier} onValueChange={(selectedValue) => setTier(selectedValue)}><option value="default">标准</option>{tiers.filter((value) => value !== "default").map((value) => <option key={value} value={value}>{tierName(value)}</option>)}</Select></label>
     </RecordTableToolbar>
     <div className="price-scope-note"><p>{group?.description || (currency === "USD" ? "美元基准价，不含分组换算与组织优惠。" : "分组人民币单价，已含组织优惠。")}</p><p>{currency === "USD" ? "美元" : "元"}/百万 token · 点击模型查看完整价格</p></div>
     {unavailable ? <CardMessage>暂无法读取美元基准价，请稍后刷新或选择分组查看人民币报价。</CardMessage>

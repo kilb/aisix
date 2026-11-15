@@ -21,6 +21,7 @@ import { TwoStep } from "../ui/TwoStep";
 import { CardHeader, PageHeader, Split } from "../components/page";
 import { Plus, RefreshCw } from "lucide-react";
 import { InventorySummary, countGroups } from "./providers/OperationsBento";
+import { Select } from "../ui/Select";
 
 /** A cache policy document; fields the form does not show are kept as stored. */
 interface CachePolicyDoc {
@@ -273,7 +274,7 @@ export function Cache({ canEdit, onGoto }: TabProps) {
       {policies.items !== null && policies.items.length === 0 && <EmptyState text="还没有缓存策略。" />}
       {policies.items !== null && policies.items.length > 0 && (
         <>
-          <RecordTools table={table} label="缓存策略"><label className="f filter"><span>启用状态</span><select aria-label="启用状态" value={enabledFilter} onChange={(e) => setEnabledFilter(e.target.value)}><option value="">全部</option><option value="enabled">启用</option><option value="disabled">停用</option></select></label><label className="f filter"><span>作用范围</span><select aria-label="作用范围" value={scopeFilter} onChange={(e) => setScopeFilter(e.target.value)}><option value="">全部</option><option value="team">租户</option><option value="env">环境</option></select></label></RecordTools>
+          <RecordTools table={table} label="缓存策略"><label className="f filter"><span>启用状态</span><Select size="compact" aria-label="启用状态" value={enabledFilter} onValueChange={(value) => setEnabledFilter(value)}><option value="">全部</option><option value="enabled">启用</option><option value="disabled">停用</option></Select></label><label className="f filter"><span>作用范围</span><Select size="compact" aria-label="作用范围" value={scopeFilter} onValueChange={(value) => setScopeFilter(value)}><option value="">全部</option><option value="team">租户</option><option value="env">环境</option></Select></label></RecordTools>
           <DataTable label="缓存策略">
             <thead>
               <tr>
@@ -368,19 +369,19 @@ export function Cache({ canEdit, onGoto }: TabProps) {
             {form.envScoped ? (
               <input value={ENV_SCOPE} disabled />
             ) : (
-              <select
+              <Select
                 value={form.scope}
                 disabled={readOnly}
                 aria-invalid={scopeProblem ? true : undefined}
                 aria-describedby={scopeProblem ? scopeProblemId : undefined}
-                onChange={(e) => set({ scope: e.target.value })}
+                onValueChange={(value) => set({ scope: value })}
               >
                 {(options?.scopes ?? []).map((s) => (
                   <option key={s} value={s}>
                     {s}
                   </option>
                 ))}
-              </select>
+              </Select>
             )}
           </label>
           {scopeProblem && (
@@ -419,7 +420,7 @@ export function Cache({ canEdit, onGoto }: TabProps) {
             {form.otherTarget !== null ? (
               <input value={form.otherTarget} disabled />
             ) : (
-              <select value={form.target} disabled={readOnly} onChange={(e) => set({ target: e.target.value })}>
+              <Select value={form.target} disabled={readOnly} onValueChange={(value) => set({ target: value })}>
                 <option value="">全部请求</option>
                 {form.target && !models.items?.some((m) => m.id === form.target) && (
                   <option value={form.target}>{form.target}</option>
@@ -429,7 +430,7 @@ export function Cache({ canEdit, onGoto }: TabProps) {
                     {m.doc.display_name ?? m.id}
                   </option>
                 ))}
-              </select>
+              </Select>
             )}
           </label>
           {form.otherTarget !== null && (

@@ -34,6 +34,7 @@ import { cn } from "../../lib/cn";
 import { Card, CardHeader, Metric } from "../../components/page";
 import { PriceCardDetails } from "./PriceCardDetails";
 import { cardDetails } from "./cardDetails";
+import { Select } from "../../ui/Select";
 
 /** The attestation's own words: the checkbox's text, as the import's confirmation gives it. */
 const ATTESTATION = "已对照官方价格页核对";
@@ -151,10 +152,10 @@ function EntryCell({
   if (item.state === "ambiguous") {
     return (
       <span className="library-entry">
-        <select
+        <Select
           aria-label={`选择价格来源 ${item.name}`}
           value={chosen ? keyOf(chosen) : ""}
-          onChange={(e) => onChoose(item.candidates.find((c) => keyOf(c) === e.target.value))}
+          onValueChange={(value) => onChoose(item.candidates.find((c) => keyOf(c) === value))}
         >
           <option value="">选择价格来源</option>
           {item.candidates.map((c) => (
@@ -162,7 +163,7 @@ function EntryCell({
               {candidateLabel(c)}
             </option>
           ))}
-        </select>
+        </Select>
         {chosen && <EntryMeta entry={chosen} how="已选价格来源" />}
       </span>
     );
@@ -413,7 +414,7 @@ export function LibrarySync({ canEdit, generation, cardNumber = 4 }: { canEdit: 
             </div>
           )}
           <RecordTableToolbar search={{ value: table.query, onChange: table.setQuery, label: "搜索同步预览", placeholder: "按模型名称、ID 或供应商搜索" }}>
-            <label className="field mb-0"><span className="field-label">同步状态</span><select value={stateFilter} onChange={(e) => setStateFilter(e.target.value)}><option value="">全部状态</option>{counts.map(([label, state]) => <option key={state} value={state}>{label}</option>)}</select></label>
+            <label className="field mb-0"><span className="field-label">同步状态</span><Select size="compact" value={stateFilter} onValueChange={(value) => setStateFilter(value)}><option value="">全部状态</option>{counts.map(([label, state]) => <option key={state} value={state}>{label}</option>)}</Select></label>
             <p className="hint mb-0">已读取完整预览；筛选和翻页不改变同步范围。</p>
           </RecordTableToolbar>
           <div className="library-sync-table"><DataTable label="同步预览">

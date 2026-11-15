@@ -1,3 +1,4 @@
+import { Select } from "./ui/Select";
 import { Fragment, useEffect, useRef, useState, type ReactNode } from "react";
 import { ChevronRight } from "lucide-react";
 import {
@@ -193,7 +194,7 @@ function Filters({ children }: { children: ReactNode }) {
 function KeySelect({ keys, value, onChange }: { keys: TenantKey[]; value: string; onChange: (v: string) => void }) {
   return (
     <Field label="密钥">
-      <select value={value} onChange={(e) => onChange(e.target.value)}>
+      <Select value={value} onValueChange={(selectedValue) => onChange(selectedValue)}>
         <option value="">全部</option>
         {value && !keys.some((key) => key.id === value) && <option value={value}>已选密钥（{value}，当前列表未提供）</option>}
         {keys.map((k) => (
@@ -201,7 +202,7 @@ function KeySelect({ keys, value, onChange }: { keys: TenantKey[]; value: string
             {k.label}
           </option>
         ))}
-      </select>
+      </Select>
     </Field>
   );
 }
@@ -347,7 +348,7 @@ function Summary({ keys, showKeys, ownScope, models }: { keys: TenantKey[]; show
           <Field label="开始日期"><input type="date" value={fromDate} onChange={e => setFromDate(e.target.value)} /></Field>
           <Field label="结束日期"><input type="date" value={toDate} onChange={e => setToDate(e.target.value)} /></Field>
           {showKeys && <KeySelect keys={keys} value={keyId} onChange={setKeyId} />}
-          <Field label="模型"><select value={query.get("model_id") ?? ""} onChange={event => update({ model_id: event.target.value, from: metricsFrom, to: metricsTo })}><option value="">全部</option>{query.get("model_id") && !models.some(model => model.id === query.get("model_id")) && <option value={query.get("model_id")!}>已选模型（{query.get("model_id")}，当前列表未提供）</option>}{models.map(model => <option key={model.id} value={model.id}>{model.name}</option>)}</select></Field>
+          <Field label="模型"><Select value={query.get("model_id") ?? ""} onValueChange={selectedValue => update({ model_id: selectedValue, from: metricsFrom, to: metricsTo })}><option value="">全部</option>{query.get("model_id") && !models.some(model => model.id === query.get("model_id")) && <option value={query.get("model_id")!}>已选模型（{query.get("model_id")}，当前列表未提供）</option>}{models.map(model => <option key={model.id} value={model.id}>{model.name}</option>)}</Select></Field>
           <Button onClick={() => setRefresh(value => value + 1)}>刷新分析</Button>
           <a className="metric-scope-action" href={`#calls?${new URLSearchParams({ ...Object.fromEntries(query), from: metricsFrom, to: metricsTo })}`}>查看调用记录</a>
         </Filters>
@@ -361,10 +362,10 @@ function Summary({ keys, showKeys, ownScope, models }: { keys: TenantKey[]; show
         {(query.has("model_id") || query.has("member_id")) && <p className="note warn">下方计费汇总仅按时间和密钥筛选，不应用分析区的模型或成员筛选。</p>}
         <Filters>
           <Field label="汇总方式">
-            <select value={group} onChange={(e) => setGroup(e.target.value as "day" | "month")}>
+            <Select value={group} onValueChange={(selectedValue) => setGroup(selectedValue as "day" | "month")}>
               <option value="day">按天</option>
               <option value="month">按月</option>
-            </select>
+            </Select>
           </Field>
         </Filters>
         <RecordTableToolbar search={{ value: searchQuery, onChange: value => update({ q: value }), label: "搜索汇总模型", placeholder: "模型名称" }} />
@@ -544,7 +545,7 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
         </Field>
         {showKeys && <KeySelect keys={keys} value={keyId} onChange={setKeyId} />}
         <Field label="模型">
-          <select value={modelId} onChange={(e) => setModelId(e.target.value)}>
+          <Select value={modelId} onValueChange={(selectedValue) => setModelId(selectedValue)}>
             <option value="">全部</option>
             {modelId && !models.some((model) => model.id === modelId) && <option value={modelId}>已选模型（{modelId}，当前列表未提供）</option>}
             {models.map((m) => (
@@ -552,7 +553,7 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
                 {m.name}
               </option>
             ))}
-          </select>
+          </Select>
         </Field>
         <Field label="请求 ID">
           <input autoComplete="off" value={typed} onChange={(e) => { setTyped(e.target.value); setRequestEditing(true); }} />

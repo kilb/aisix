@@ -1,3 +1,4 @@
+import { Select } from "../ui/Select";
 import { useEffect, useId, useRef, useState } from "react";
 import { fetchApiMetrics, maximumMetricIndex, metricsRangeError, rankMetricModels, requestRateSummary, sampleCoverage, tokenTrendValue, type ApiMetricValues, type ApiMetricsResponse, type MetricsBucket, type MetricsLatency, type MetricsScope } from "../lib/apiMetrics";
 import { formatCount, formatDuration, formatRatio, normalizeExactValues } from "../lib/chartFormat";
@@ -194,9 +195,9 @@ export function ApiMetricsPanel({ scope, enabled, from, to, bucket, modelId, mem
       <BentoGrid id={panelId} role="tabpanel" aria-labelledby={`${choiceId}-${view}`} tabIndex={0}>
       <Card className={cn(span.d7, "metric-analysis-main")}>
         <CardHeader number={numberStart} title={`API 指标 · ${VIEWS.find(item => item.value === view)?.label}`} description={`${fmtBeijing(data?.from ?? from)} — ${fmtBeijing(data?.to ?? to)}（UTC+8，结束时间不含）`} />
-        {view === "latency" && <label htmlFor={choiceId} className="mb-5 grid gap-2 text-caption text-muted">耗时口径<select id={choiceId} value={latencyKind} onChange={event => setLatencyKind(event.target.value as LatencyKind)}>{Object.entries(LATENCY_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>}
-        {view === "tokens" && <label htmlFor={choiceId} className="mb-5 grid gap-2 text-caption text-muted">token 口径<select id={choiceId} value={tokenKind} onChange={event => setTokenKind(event.target.value as TokenKind)}>{Object.entries(TOKEN_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>}
-        {view === "cache" && <label htmlFor={choiceId} className="mb-5 grid gap-2 text-caption text-muted">缓存口径<select id={choiceId} value={cacheKind} onChange={event => setCacheKind(event.target.value as CacheKind)}><option value="tokens">已记录缓存 token 占输入比例</option><option value="response">响应缓存命中率</option></select></label>}
+        {view === "latency" && <label htmlFor={choiceId} className="mb-5 grid gap-2 text-caption text-muted">耗时口径<Select id={choiceId} value={latencyKind} onValueChange={selectedValue => setLatencyKind(selectedValue as LatencyKind)}>{Object.entries(LATENCY_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</Select></label>}
+        {view === "tokens" && <label htmlFor={choiceId} className="mb-5 grid gap-2 text-caption text-muted">token 口径<Select id={choiceId} value={tokenKind} onValueChange={selectedValue => setTokenKind(selectedValue as TokenKind)}>{Object.entries(TOKEN_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</Select></label>}
+        {view === "cache" && <label htmlFor={choiceId} className="mb-5 grid gap-2 text-caption text-muted">缓存口径<Select id={choiceId} value={cacheKind} onValueChange={selectedValue => setCacheKind(selectedValue as CacheKind)}><option value="tokens">已记录缓存 token 占输入比例</option><option value="response">响应缓存命中率</option></Select></label>}
         {<>
           <div className="metric-primary"><div className="mb-3 text-micro text-muted">{metricTitle}{view === "latency" ? " · 平均" : ""}</div><Metric size={primary.length > 18 ? "value" : "display"} className="break-all font-medium">{primary}</Metric></div>
           {view === "requests" && <Facts items={[

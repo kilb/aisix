@@ -26,6 +26,7 @@ import { UsageIoAuditDetails } from "../../components/UsageIoAuditDetails";
 import { UsageRecordFilters } from "../../components/UsageRecordFilters";
 import { usageRecordFilterValues } from "../../lib/usageRecordFilters";
 import "./Charges.css";
+import { Select } from "../../ui/Select";
 
 const STATUSES: [string, string][] = [
   ["charged", "已计价"],
@@ -161,20 +162,20 @@ export function Charges(_props: TabProps) {
         >
           <label className="f filter">
             <span>状态</span>
-            <select value={filter.status ?? ""} onChange={(e) => set({ status: e.target.value || undefined })}>
+            <Select size="compact" value={filter.status ?? ""} onValueChange={(value) => set({ status: value || undefined })}>
               <option value="">全部</option>
               {STATUSES.map(([v, l]) => (
                 <option key={v} value={v}>
                   {l}
                 </option>
               ))}
-            </select>
+            </Select>
           </label>
           <label className="f filter">
             <span>租户</span>
-            <select
+            <Select size="compact"
               value={filter.tenant_id ?? ""}
-              onChange={(e) => set({ tenant_id: e.target.value || undefined, api_key_id: undefined })}
+              onValueChange={(value) => set({ tenant_id: value || undefined, api_key_id: undefined })}
             >
               <option value="">全部</option>
               {filter.tenant_id && !tenants.some((tenant) => tenant.id === filter.tenant_id) && <option value={filter.tenant_id}>已选租户（{filter.tenant_id}，当前列表未提供）</option>}
@@ -183,14 +184,14 @@ export function Charges(_props: TabProps) {
                   {t.name}
                 </option>
               ))}
-            </select>
+            </Select>
           </label>
           <label className="f filter">
             <span>密钥</span>
-            <select
+            <Select size="compact"
               value={filter.api_key_id ?? ""}
               disabled={!filter.tenant_id && !filter.api_key_id}
-              onChange={(e) => set({ api_key_id: e.target.value || undefined })}
+              onValueChange={(value) => set({ api_key_id: value || undefined })}
             >
               <option value="">全部</option>
               {filter.api_key_id && !keys.some((key) => key.id === filter.api_key_id) && <option value={filter.api_key_id}>已选密钥（{filter.api_key_id}，当前列表未提供）</option>}
@@ -199,7 +200,7 @@ export function Charges(_props: TabProps) {
                   {k.label} · {k.prefix}
                 </option>
               ))}
-            </select>
+            </Select>
           </label>
           <label className="f filter">
             <input

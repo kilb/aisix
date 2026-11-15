@@ -13,6 +13,7 @@ import { handChargesFilter, statusView } from "../../lib/pricingStatus";
 import { BentoGrid, Card, CardHeader, CardMessage, Metric, MetricSkeleton, PageHeader, span } from "../../components/page";
 import { RankBars } from "../../components/charts";
 import { normalizeExactValues } from "../../lib/chartFormat";
+import { Select } from "../../ui/Select";
 
 /**
  * 计价状态: the pricing version, price revisions that cannot be used, and the
@@ -96,7 +97,7 @@ export function PricingStatus({ onGoto }: TabProps) {
           <Card className="mb-3">
             <CardHeader number={3} className={view.unpricedTotal === 0 ? undefined : "mb-0"} title="最近 24 小时未计价" />
             {view.unpricedTotal > 0 && <RecordTableToolbar search={{ value: unpricedTable.query, onChange: unpricedTable.setQuery, label: "搜索未计价分组", placeholder: "按模型、原因或分组搜索" }}>
-              <label className="field mb-0"><span className="field-label">未计价原因</span><select value={reasonFilter} onChange={(e) => setReasonFilter(e.target.value)}><option value="">全部原因</option>{view.unpriced.map((row) => <option key={row.code} value={row.code}>{row.label}</option>)}</select></label>
+              <label className="field mb-0"><span className="field-label">未计价原因</span><Select size="compact" value={reasonFilter} onValueChange={(value) => setReasonFilter(value)}><option value="">全部原因</option>{view.unpriced.map((row) => <option key={row.code} value={row.code}>{row.label}</option>)}</Select></label>
               <p className="hint mb-0">未逐一列出的调用按原因汇总；合计包含全部未计价调用。</p>
             </RecordTableToolbar>}
             {view.unpricedTotal === 0 ? (
@@ -160,7 +161,7 @@ export function PricingStatus({ onGoto }: TabProps) {
           <Card className="mb-0">
             <CardHeader number={4} className={view.invalid.length === 0 ? undefined : "mb-0"} title="不可用的价格版本" />
             {view.invalid.length > 0 && <RecordTableToolbar search={{ value: invalidTable.query, onChange: invalidTable.setQuery, label: "搜索价格版本", placeholder: "按版本、表或原因搜索" }}>
-              <label className="field mb-0"><span className="field-label">价格表</span><select value={tableFilter} onChange={(e) => setTableFilter(e.target.value)}><option value="">全部价格表</option>{[...new Set(view.invalid.map((row) => row.table))].map((table) => <option key={table} value={table}>{table}</option>)}</select></label>
+              <label className="field mb-0"><span className="field-label">价格表</span><Select size="compact" value={tableFilter} onValueChange={(value) => setTableFilter(value)}><option value="">全部价格表</option>{[...new Set(view.invalid.map((row) => row.table))].map((table) => <option key={table} value={table}>{table}</option>)}</Select></label>
             </RecordTableToolbar>}
             {view.invalid.length === 0 ? (
               <p className="status-line">

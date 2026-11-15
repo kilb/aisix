@@ -1,4 +1,4 @@
-import { Children, Fragment, isValidElement, type ComponentProps, type ReactNode } from "react";
+import { Children, Fragment, isValidElement, useId, useState, type ComponentProps, type ReactNode } from "react";
 import { Select as SelectPrimitive, DropdownMenu } from "radix-ui";
 import { Check, ChevronDown, ChevronUp } from "lucide-react";
 import { cn } from "../lib/cn";
@@ -45,9 +45,16 @@ function optionsFromChildren(children: ReactNode, group?: string): SelectOption[
 export function Select({ value, onValueChange, options, children, size, placeholder = "请选择", name, required, form, disabled, className, ...triggerProps }: SelectProps) {
   const choices = options ?? optionsFromChildren(children);
   const selected = choices.find(option => option.value === String(value));
-  return <SelectPrimitive.Root value={String(value)} onValueChange={onValueChange} name={name} required={required} form={form} disabled={disabled}>
-    <SelectPrimitive.Trigger {...triggerProps} className={cn("ui-select-trigger", size === "compact" && "ui-select-compact", className)} data-value={String(value)}>
-      <SelectPrimitive.Value className="ui-select-value" placeholder={selected?.label ?? placeholder}>{selected?.label ?? String(value)}</SelectPrimitive.Value>
+  const validationId = useId();
+  const [validationMessage, setValidationMessage] = useState("");
+  const nativeInvalid = required && String(value) === "" && validationMessage !== "";
+  return <span className={cn("ui-select-field", size === "compact" && "ui-select-field-compact")} onInvalid={event => {
+    event.preventDefault();
+    setValidationMessage((event.target as HTMLSelectElement).validationMessage);
+    event.currentTarget.querySelector<HTMLButtonElement>('[role="combobox"]')?.focus();
+  }}><SelectPrimitive.Root value={String(value)} onValueChange={onValueChange} name={name} required={required} form={form} disabled={disabled}>
+    <SelectPrimitive.Trigger {...triggerProps} aria-invalid={triggerProps["aria-invalid"] || nativeInvalid || undefined} aria-describedby={[triggerProps["aria-describedby"], nativeInvalid ? validationId : undefined].filter(Boolean).join(" ") || undefined} className={cn("ui-select-trigger", size === "compact" && "ui-select-compact", className)} data-value={String(value)}>
+      <span className="ui-select-value"><SelectPrimitive.Value placeholder={selected?.label ?? placeholder}>{selected?.label ?? String(value)}</SelectPrimitive.Value></span>
       <SelectPrimitive.Icon className="ui-select-chevron"><ChevronDown aria-hidden="true" /></SelectPrimitive.Icon>
     </SelectPrimitive.Trigger>
     <SelectPrimitive.Portal>
@@ -56,7 +63,7 @@ export function Select({ value, onValueChange, options, children, size, placehol
         <SelectPrimitive.Viewport className="ui-dropdown-viewport">
           {choices.map((option, index) => <Fragment key={option.value}>
             {option.group && option.group !== choices[index - 1]?.group && <div className="ui-dropdown-label">{option.group}</div>}
-            <SelectPrimitive.Item className="ui-dropdown-item ui-select-option" value={option.value} disabled={option.disabled} textValue={option.label}>
+            <SelectPrimitive.Item className="ui-dropdown-item ui-select-option" value={option.value} data-value={option.value} disabled={option.disabled} textValue={option.label}>
               <SelectPrimitive.ItemText>{option.label}</SelectPrimitive.ItemText>
               <SelectPrimitive.ItemIndicator className="ui-dropdown-check"><Check aria-hidden="true" /></SelectPrimitive.ItemIndicator>
             </SelectPrimitive.Item>
@@ -65,7 +72,7 @@ export function Select({ value, onValueChange, options, children, size, placehol
         <SelectPrimitive.ScrollDownButton className="ui-select-scroll"><ChevronDown aria-hidden="true" /></SelectPrimitive.ScrollDownButton>
       </SelectPrimitive.Content>
     </SelectPrimitive.Portal>
-  </SelectPrimitive.Root>;
+  </SelectPrimitive.Root>{nativeInvalid && <span className="ui-select-validation" id={validationId} aria-hidden="true">{validationMessage}</span>}</span>;
 }
 
 export interface MultiSelectProps extends TriggerProps {

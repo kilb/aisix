@@ -36,6 +36,7 @@ import { cooldownProblem as validateCooldown } from "../lib/cooldown";
 import { GroupBadges } from "./providers/GroupBadges";
 
 import { InventorySummary, countGroups } from "./providers/OperationsBento";
+import { Select } from "../ui/Select";
 
 /** The model's dispatch shape. Only direct and routing models have a form here. */
 type Shape = "direct" | "routing" | "ensemble" | "semantic";
@@ -383,7 +384,7 @@ export function Models({ canEdit, onGoto }: TabProps) {
               </label>
             }
           />
-          <RecordTableToolbar search={{ value: table.query, onChange: table.setQuery, label: "搜索模型", placeholder: "模型名称、标识、上游模型或策略" }}><label className="text-caption">模型类型<select value={shapeFilter} onChange={(e) => setShapeFilter(e.target.value)}><option value="">全部类型</option>{Object.entries(SHAPE_LABEL).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label></RecordTableToolbar>
+          <RecordTableToolbar search={{ value: table.query, onChange: table.setQuery, label: "搜索模型", placeholder: "模型名称、标识、上游模型或策略" }}><label className="text-caption">模型类型<Select size="compact" value={shapeFilter} onValueChange={(value) => setShapeFilter(value)}><option value="">全部类型</option>{Object.entries(SHAPE_LABEL).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</Select></label></RecordTableToolbar>
           {models.items === null ? (
             !models.error && <Loading />
           ) : models.items.length === 0 ? (
@@ -861,14 +862,14 @@ function ModelForm({
           <>
             <Field label="上游账号" error={at("/provider_key_id")}>
               {(aria) => (
-                <select required disabled={locked} value={accountId} onChange={(e) => chooseAccount(e.target.value)} {...aria}>
+                <Select required disabled={locked} value={accountId} onValueChange={(value) => chooseAccount(value)} {...aria}>
                   <option value="">（选择上游账号）</option>
                   {accountOptions.map((o) => (
                     <option key={o.id} value={o.id}>
                       {o.label}
                     </option>
                   ))}
-                </select>
+                </Select>
               )}
             </Field>
             <Field label="供应商标识" error={at("/provider")}>
@@ -937,14 +938,14 @@ function ModelForm({
                   <div className="col-span-2 min-w-0 @lg:col-span-1">
                     <RowField label="目标模型" error={targetAt(r, "model_id")}>
                       {(aria) => (
-                        <select required disabled={locked} value={r.modelId} onChange={(e) => setRow(r.key, { modelId: e.target.value })} {...aria}>
+                        <Select required disabled={locked} value={r.modelId} onValueChange={(value) => setRow(r.key, { modelId: value })} {...aria}>
                           <option value="">（选择直连模型）</option>
                           {targetOptions(r).map((o) => (
                             <option key={o.id} value={o.id}>
                               {o.label}
                             </option>
                           ))}
-                        </select>
+                        </Select>
                       )}
                     </RowField>
                     {r.modelId && <ServedGroups className="mt-1.5">{groupsOf(target, catalog)}</ServedGroups>}

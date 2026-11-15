@@ -14,6 +14,7 @@ import { Card, CardHeader, PageHeader } from "../../components/page";
 import { CardLines } from "./LibrarySync";
 import { Count } from "./kit";
 import { ChevronDown } from "lucide-react";
+import { Select } from "../../ui/Select";
 
 /** A row's identity: a key can appear again with a later `effective_from`. */
 const rowId = (e: CatalogueEntry) => `${e.key}@${e.effective_from ?? ""}`;
@@ -70,7 +71,7 @@ export function Catalogue(_props: TabProps) {
         {items !== null && items.length > 0 && (
           <>
           <RecordTableToolbar search={{ value: records.query, onChange: records.setQuery, label: "搜索目录", placeholder: "目录标识或别名" }}>
-            <label className="f filter"><span>来源</span><select value={source} onChange={(e) => setSource(e.target.value)}><option value="">全部</option><option value="sourced">附来源链接</option><option value="missing">无来源链接</option></select></label>
+            <label className="f filter"><span>来源</span><Select size="compact" value={source} onValueChange={(value) => setSource(value)}><option value="">全部</option><option value="sourced">附来源链接</option><option value="missing">无来源链接</option></Select></label>
           </RecordTableToolbar>
           <DataTable label="价格目录">
             <colgroup>

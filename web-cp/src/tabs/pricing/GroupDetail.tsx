@@ -28,6 +28,7 @@ import { TwoStep } from "../../ui/TwoStep";
 import { useToast } from "../../ui/Toast";
 import { BentoGrid, Card, CardHeader, CardMessage, Metric, MetricSkeleton, PageHeader, span } from "../../components/page";
 import { CardFooter, Count, FormGrid, WithForms } from "./kit";
+import { Select } from "../../ui/Select";
 
 /** How far back the margin is measured. */
 const MARGIN_DAYS = 30;
@@ -237,7 +238,7 @@ export function GroupDetail({
           ) : (
             <>
             <RecordTableToolbar search={{ value: records.query, onChange: records.setQuery, label: "搜索分组模型", placeholder: "模型名称或 ID" }}>
-              <label className="f filter"><span>价格状态</span><select value={priceState} onChange={(e) => setPriceState(e.target.value)}><option value="">全部</option><option value="baseline">已有基准价</option><option value="missing">缺少基准价</option><option value="override">已设单模型覆盖</option></select></label>
+              <label className="f filter"><span>价格状态</span><Select size="compact" value={priceState} onValueChange={(value) => setPriceState(value)}><option value="">全部</option><option value="baseline">已有基准价</option><option value="missing">缺少基准价</option><option value="override">已设单模型覆盖</option></Select></label>
             </RecordTableToolbar>
             <DataTable label="分组换算率">
               <thead>

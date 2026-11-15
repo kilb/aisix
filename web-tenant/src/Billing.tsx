@@ -1,3 +1,4 @@
+import { Select } from "./ui/Select";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import {
   ApiError,
@@ -351,13 +352,13 @@ function Readout({
     manager && items.length > 0 ? (
       <div className="w-full">
         <Field label="密钥">
-          <select value={keyId ?? ""} onChange={(e) => setKeyId(e.target.value)}>
+          <Select value={keyId ?? ""} onValueChange={(selectedValue) => setKeyId(selectedValue)}>
             {items.map((k) => (
               <option key={k.id} value={k.id}>
                 {k.label}
               </option>
             ))}
-          </select>
+          </Select>
         </Field>
       </div>
     ) : null;
@@ -606,12 +607,12 @@ function TopupList({ reloadKey, onLoaded }: { reloadKey: number; onLoaded: (item
       <p className="text-caption text-muted">按时间读取申请与平台入账记录，搜索仅作用于已加载记录；待审批总数见账户余额。</p>
       <RecordTableToolbar search={{ value: records.query, onChange: records.setQuery, label: "搜索已加载充值记录", placeholder: "付款凭证号、提交人" }}>
         <Field label="充值状态">
-          <select value={status} onChange={(event) => setStatus(event.target.value as "" | Topup["status"])}>
+          <Select value={status} onValueChange={(selectedValue) => setStatus(selectedValue as "" | Topup["status"])}>
             <option value="">全部</option>
             <option value="pending">待审批</option>
             <option value="approved">已到账</option>
             <option value="rejected">已驳回</option>
-          </select>
+          </Select>
         </Field>
       </RecordTableToolbar>
       {err && (
@@ -747,12 +748,12 @@ function Ledger({ topups }: { topups: Topup[] | null }) {
             <input type="date" value={toDate} min={fromDate || undefined} onChange={(e) => setToDate(e.target.value)} />
           </Field>
           <Field label="类型">
-            <select value={kind} onChange={(e) => setKind(e.target.value as "" | LedgerKind)}>
+            <Select value={kind} onValueChange={(selectedValue) => setKind(selectedValue as "" | LedgerKind)}>
               <option value="">全部</option>
               <option value="usage">扣费</option>
               <option value="topup">充值</option>
               <option value="adjustment">调整</option>
-            </select>
+            </Select>
           </Field>
         </RecordTableToolbar>
         <p className="hint">搜索仅作用于已加载记录；日期和类型筛选由服务端执行，金额与余额快照不随分页重算。</p>
@@ -859,10 +860,10 @@ function Summary({ range, fromDate, toDate }: { range: { from?: string; to?: str
       actions={
         <label className="flex items-center gap-2">
           <span className="f-label">汇总方式</span>
-          <select className="min-h-11 w-auto pr-8 text-body" value={group} onChange={(e) => setGroup(e.target.value as "day" | "month")}>
+          <Select className="min-h-11 w-auto pr-8 text-body" value={group} onValueChange={(selectedValue) => setGroup(selectedValue as "day" | "month")}>
             <option value="day">按天</option>
             <option value="month">按月</option>
-          </select>
+          </Select>
         </label>
       }
     >

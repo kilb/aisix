@@ -25,8 +25,8 @@ function handler(file: string, name: string, bindings: Record<string, unknown>) 
   return execute(find(file, node => ts.isFunctionDeclaration(node) && node.name?.text === name), bindings);
 }
 function select(file: string, value: string, bindings: Record<string, unknown>) {
-  const node = find(file, node => ts.isJsxElement(node) && node.openingElement.tagName.getText() === "select" && node.openingElement.attributes.properties.some(prop => ts.isJsxAttribute(prop) && prop.name.getText() === "value" && prop.initializer?.getText() === `{${value}}`));
-  return execute(node, { React, ...bindings }) as React.ReactElement<{ value: string; disabled?: boolean; children: React.ReactNode; onChange: (event: { target: { value: string } }) => void }>;
+  const node = find(file, node => ts.isJsxElement(node) && node.openingElement.tagName.getText() === "Select" && node.openingElement.attributes.properties.some(prop => ts.isJsxAttribute(prop) && prop.name.getText() === "value" && prop.initializer?.getText() === `{${value}}`));
+  return execute(node, { React, Select: "select", ...bindings }) as React.ReactElement<{ value: string; disabled?: boolean; children: React.ReactNode; onValueChange: (value: string) => void }>;
 }
 function optionValues(node: React.ReactNode): string[] {
   return React.Children.toArray(node).flatMap(child => React.isValidElement<{ value: string; children: React.ReactNode }>(child) ? child.type === "option" ? [child.props.value] : optionValues(child.props.children) : []);
@@ -97,7 +97,7 @@ for (const field of ["tenant_id", "api_key_id"]) test(`CP ${field} 未加载/不
   assert.ok(optionValues(node.props.children).includes("historic-id"), "缺少匹配 option 时 React 会显示全部");
   assert.notEqual(node.props.disabled, true, "URL key-only 必须能清除");
   assert.equal(chargesQuery(query)[field], "historic-id");
-  node.props.onChange({ target: { value: "" } });
+  node.props.onValueChange("");
   assert.equal(Object.hasOwn(chargesQuery(query), field), false);
 });
 

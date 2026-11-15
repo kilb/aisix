@@ -25,6 +25,7 @@ import {
 } from "../components/page";
 import { RankBars } from "../components/charts";
 import { RefreshCw } from "lucide-react";
+import { Select } from "../ui/Select";
 
 /**
  * The `target_kind` values the control plane records, by the names this
@@ -209,18 +210,18 @@ export function Audit(_: TabProps) {
           <Toolbar>
             <label className="f filter filter-wide">
               <span>对象类型</span>
-              <select value={filter.kind} onChange={(e) => setFilter((f) => ({ ...f, kind: e.target.value }))}>
+              <Select size="compact" value={filter.kind} onValueChange={(value) => setFilter((f) => ({ ...f, kind: value }))}>
                 <option value="">全部</option>
                 {TARGET_KINDS.map((k) => (
                   <option key={k.kind} value={k.kind}>
                     {k.label} · {k.kind}
                   </option>
                 ))}
-              </select>
+              </Select>
             </label>
             <label className="f filter filter-wide">
               <span>租户</span>
-              <select value={filter.tenant} onChange={(e) => setFilter((f) => ({ ...f, tenant: e.target.value }))}>
+              <Select size="compact" value={filter.tenant} onValueChange={(value) => setFilter((f) => ({ ...f, tenant: value }))}>
                 <option value="">全部</option>
                 {tenants.map((t) => (
                   <option key={t.id} value={t.id}>
@@ -228,7 +229,7 @@ export function Audit(_: TabProps) {
                     {t.is_internal ? "（平台内部）" : ""}
                   </option>
                 ))}
-              </select>
+              </Select>
             </label>
           </Toolbar>
           {tenantsError && <div className="note crit">无法读取租户列表：{tenantsError}</div>}

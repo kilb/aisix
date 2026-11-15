@@ -37,6 +37,7 @@ import { Card, CardHeader, PageHeader } from "../../components/page";
 import { LibrarySyncOne } from "./LibrarySync";
 import { PriceCardDetails } from "./PriceCardDetails";
 import { CardFooter, Count, FormGrid } from "./kit";
+import { Select } from "../../ui/Select";
 
 /** The rates of a baseline's `default` tier, when the card has both. */
 function headline(card: RateCard | null): { input: string; output: string } | null {
@@ -324,7 +325,7 @@ export function Baselines({ canEdit, onGoto }: TabProps) {
             ) : (
               <>
               <RecordTableToolbar search={{ value: records.query, onChange: records.setQuery, label: "搜索基准价模型", placeholder: "模型名称或 ID" }}>
-                <label className="f filter"><span>定价状态</span><select value={status} onChange={(e) => setStatus(e.target.value)}><option value="">全部</option><option value="priced">已定价</option><option value="unpriced">未定价</option><option value="changed">目录有更新</option></select></label>
+                <label className="f filter"><span>定价状态</span><Select size="compact" value={status} onValueChange={(value) => setStatus(value)}><option value="">全部</option><option value="priced">已定价</option><option value="unpriced">未定价</option><option value="changed">目录有更新</option></Select></label>
               </RecordTableToolbar>
               <DataTable label="基准价">
                 <thead>
@@ -519,31 +520,31 @@ function BaselinePanel({
           <FormGrid>
             <Field label="方式">
               {(aria) => (
-                <select
+                <Select
                   {...aria}
                   value={mode}
-                  onChange={(e) => {
-                    const next = e.target.value as "catalogue" | "manual";
+                  onValueChange={(value) => {
+                    const next = value as "catalogue" | "manual";
                     if (next === "manual") setManualVisited(true);
                     setMode(next);
                   }}
                 >
                   <option value="catalogue">从官方目录</option>
                   <option value="manual">手动录入</option>
-                </select>
+                </Select>
               )}
             </Field>
             {mode === "catalogue" && (
               <Field label="目录条目" error={problemAt(details, (p) => p === "/catalogue_key")}>
                 {(aria) => (
-                  <select {...aria} value={chosen} onChange={(e) => setEntry(e.target.value)}>
+                  <Select {...aria} value={chosen} onValueChange={(value) => setEntry(value)}>
                     <option value="">请选择</option>
                     {keys.map((k) => (
                       <option key={k} value={k}>
                         {k}
                       </option>
                     ))}
-                  </select>
+                  </Select>
                 )}
               </Field>
             )}

@@ -1,3 +1,4 @@
+import { Select } from "./ui/Select";
 import { useRef, useState } from "react";
 import { ApiError, MIN_PASSWORD_CHARS, type Member, type MemberRole } from "./lib/api";
 import { formMessageFor } from "./lib/errors";
@@ -108,9 +109,9 @@ export function CreateMember({ roles, labels, onInactive, onCreated, onBusyChang
           </Field>
           <Field label="角色" error={errors.role} hint={ROLE_HELP[role]}>
             {(aria) => (
-              <select aria-label="角色" value={role} onChange={(e) => setRole(e.target.value as MemberRole)} disabled={busy} {...aria}>
+              <Select aria-label="角色" value={role} onValueChange={(selectedValue) => setRole(selectedValue as MemberRole)} disabled={busy} {...aria}>
                 {roles.map((value) => <option key={value} value={value}>{labels[value]}</option>)}
-              </select>
+              </Select>
             )}
           </Field>
         </div>

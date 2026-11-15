@@ -43,6 +43,7 @@ import { GroupName } from "../ui/GroupName";
 import { Lamp, type LampState } from "../ui/Lamp";
 import { SidePanel } from "../ui/SidePanel";
 import { TwoStep } from "../ui/TwoStep";
+import { Select } from "../ui/Select";
 
 export const STATUS_LABEL: Record<Tenant["status"], string> = {
   pending: "待审核",
@@ -499,12 +500,12 @@ export function Tenants({ operator, canEdit }: TabProps) {
               actions={
                 <label className="f filter">
                   <span>按状态筛选</span>
-                  <select value={filter} onChange={(e) => setFilter(e.target.value as Tenant["status"] | "")}>
+                  <Select size="compact" value={filter} onValueChange={(value) => setFilter(value as Tenant["status"] | "")}>
                     <option value="">全部</option>
                     <option value="pending">待审核</option>
                     <option value="active">正常</option>
                     <option value="suspended">已停用</option>
-                  </select>
+                  </Select>
                 </label>
               }
             />
@@ -1460,7 +1461,7 @@ function MembersPart({
       ) : (
         <div className="tn-bleed">
         <>
-          <RecordTools table={memberTable} label="成员"><label className="f filter"><span>成员角色</span><select aria-label="成员角色" value={memberRole} onChange={(e) => setMemberRole(e.target.value)}><option value="">全部</option><option value="owner">所有者</option><option value="admin">管理员</option><option value="member">成员</option><option value="billing">计费</option></select></label><label className="f filter"><span>成员状态</span><select aria-label="成员状态" value={memberStatus} onChange={(e) => setMemberStatus(e.target.value)}><option value="">全部</option><option value="enabled">正常</option><option value="disabled">停用</option></select></label></RecordTools>
+          <RecordTools table={memberTable} label="成员"><label className="f filter"><span>成员角色</span><Select size="compact" aria-label="成员角色" value={memberRole} onValueChange={(value) => setMemberRole(value)}><option value="">全部</option><option value="owner">所有者</option><option value="admin">管理员</option><option value="member">成员</option><option value="billing">计费</option></Select></label><label className="f filter"><span>成员状态</span><Select size="compact" aria-label="成员状态" value={memberStatus} onValueChange={(value) => setMemberStatus(value)}><option value="">全部</option><option value="enabled">正常</option><option value="disabled">停用</option></Select></label></RecordTools>
           <DataTable label="成员">
             <thead>
               <tr>
@@ -1578,13 +1579,13 @@ function InvitePart({ tenant }: { tenant: Tenant }) {
           </div>
           <label className="f">
             <span>角色</span>
-            <select value={role} onChange={(e) => setRole(e.target.value as Member["role"])}>
+            <Select value={role} onValueChange={(value) => setRole(value as Member["role"])}>
               {ROLES.map((r) => (
                 <option key={r} value={r}>
                   {ROLE_LABEL[r]}
                 </option>
               ))}
-            </select>
+            </Select>
           </label>
         </div>
         {refused?.general && (
@@ -1684,7 +1685,7 @@ function KeysPart({
       ) : (
         <div className="tn-bleed">
         <>
-          <RecordTools table={keyTable} label="密钥"><label className="f filter"><span>密钥状态</span><select aria-label="密钥状态" value={keyStatus} onChange={(e) => setKeyStatus(e.target.value)}><option value="">全部</option><option value="enabled">可用</option><option value="disabled">停用</option></select></label><label className="f filter"><span>密钥分组</span><select aria-label="密钥分组" value={keyGroup} onChange={(e) => setKeyGroup(e.target.value)}><option value="">全部</option>{choices.map((g) => <option key={g.name} value={g.name}>{g.display_name}</option>)}</select></label></RecordTools>
+          <RecordTools table={keyTable} label="密钥"><label className="f filter"><span>密钥状态</span><Select size="compact" aria-label="密钥状态" value={keyStatus} onValueChange={(value) => setKeyStatus(value)}><option value="">全部</option><option value="enabled">可用</option><option value="disabled">停用</option></Select></label><label className="f filter"><span>密钥分组</span><Select size="compact" aria-label="密钥分组" value={keyGroup} onValueChange={(value) => setKeyGroup(value)}><option value="">全部</option>{choices.map((g) => <option key={g.name} value={g.name}>{g.display_name}</option>)}</Select></label></RecordTools>
           <DataTable label="密钥">
             <thead>
               <tr>

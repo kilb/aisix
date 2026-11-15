@@ -21,6 +21,7 @@ const compiled = await build({
   platform: "node",
   format: "cjs",
   jsx: "automatic",
+  loader: { ".css": "empty" },
   define: { "import.meta.env.BASE_URL": '"/"' },
   write: false,
   plugins: [{

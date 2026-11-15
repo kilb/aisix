@@ -11,6 +11,7 @@ import { Card, CardHeader, PageHeader } from "../../components/page";
 import { CostAccountDetail } from "./CostAccountDetail";
 import { Count } from "./kit";
 import { scheduledWords } from "./GroupDetail";
+import { Select } from "../../ui/Select";
 
 /**
  * 价格 · 成本价: every upstream account and its default cost rate, in CNY per
@@ -86,7 +87,7 @@ export function CostPrices({ canEdit }: TabProps) {
         ) : (
           <>
           <RecordTableToolbar search={{ value: records.query, onChange: records.setQuery, label: "搜索成本价账号", placeholder: "账号名称、ID 或供应商" }}>
-            <label className="f filter"><span>默认成本换算率</span><select value={rateState} onChange={(e) => setRateState(e.target.value)}><option value="">全部</option><option value="configured">已设置</option><option value="missing">未设置</option><option value="scheduled">有待生效版本</option></select></label>
+            <label className="f filter"><span>默认成本换算率</span><Select size="compact" value={rateState} onValueChange={(value) => setRateState(value)}><option value="">全部</option><option value="configured">已设置</option><option value="missing">未设置</option><option value="scheduled">有待生效版本</option></Select></label>
           </RecordTableToolbar>
           <DataTable label="上游账号成本价">
             <thead>

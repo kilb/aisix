@@ -74,7 +74,7 @@ test("提取后的公共表单保留现有路由策略，支持首个目标与�
   };
   const editable = renderToStaticMarkup(createElement(PublicRoutingForm, formProps));
   assert.match(editable, /同级分配方式/);
-  assert.match(editable, /value="failover" selected=""/);
+  assert.match(editable, /<button\b[^>]*\brole="combobox"[^>]*\bdata-value="failover"/);
   assert.match(editable, /添加目标/);
   const viewer = renderToStaticMarkup(createElement(PublicRoutingForm, { ...formProps, readOnly: true }));
   assert.match(viewer, /同级分配方式/);

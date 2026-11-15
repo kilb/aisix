@@ -25,6 +25,7 @@ import { GroupBadges } from "./providers/GroupBadges";
 import { InventorySummary, countGroups } from "./providers/OperationsBento";
 import { RealtimeSipBindingForm } from "./providers/RealtimeSipBindingForm";
 import { isRealtimeSipProjectPath, realtimeSipBody, realtimeSipDraft, realtimeSipErrors, realtimeSipProjectBody, realtimeSipProjectDraft, realtimeSipProjectError, type RealtimeSipBinding, type RealtimeSipErrors, type RealtimeSipField, type RealtimeSipRequest } from "../lib/realtimeSipBinding";
+import { Select } from "../ui/Select";
 
 /** The fields of a `provider_key` this page edits; every other field is kept as stored. */
 interface ProviderKeyDoc {
@@ -314,7 +315,7 @@ export function Providers({ canEdit }: TabProps) {
             className="mb-0"
             actions={pk.items && <span className="text-caption text-muted tabular-nums">{pk.items.length} 个</span>}
           />
-          <RecordTableToolbar search={{ value: accountTable.query, onChange: accountTable.setQuery, label: "搜索上游账号", placeholder: "名称、标识、协议族、供应商或分组" }}><label className="text-caption">协议族<select value={adapterFilter} onChange={(e) => setAdapterFilter(e.target.value)}><option value="">全部协议族</option>{[...new Set((pk.items ?? []).map((a) => a.doc.adapter).filter((a): a is string => Boolean(a)))].sort().map((adapter) => <option key={adapter} value={adapter}>{adapter}</option>)}</select></label></RecordTableToolbar>
+          <RecordTableToolbar search={{ value: accountTable.query, onChange: accountTable.setQuery, label: "搜索上游账号", placeholder: "名称、标识、协议族、供应商或分组" }}><label className="text-caption">协议族<Select size="compact" value={adapterFilter} onValueChange={(value) => setAdapterFilter(value)}><option value="">全部协议族</option>{[...new Set((pk.items ?? []).map((a) => a.doc.adapter).filter((a): a is string => Boolean(a)))].sort().map((adapter) => <option key={adapter} value={adapter}>{adapter}</option>)}</Select></label></RecordTableToolbar>
           {pk.items === null ? (
             !pk.error && <Loading />
           ) : pk.items.length === 0 ? (
@@ -694,10 +695,10 @@ function AccountForm({
         ) : (
           <Field label="协议族" error={at("adapter")}>
             {(aria) => (
-              <select
+              <Select
                 disabled={locked || adapters === null}
                 value={adapter}
-                onChange={(e) => setAdapter(e.target.value)}
+                onValueChange={(value) => setAdapter(value)}
                 {...aria}
               >
                 {adapterOptions.map((v) => (
@@ -705,7 +706,7 @@ function AccountForm({
                     {v === "" ? "（未设置）" : v}
                   </option>
                 ))}
-              </select>
+              </Select>
             )}
           </Field>
         )}

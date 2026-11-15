@@ -1,3 +1,4 @@
+import { Select } from "../ui/Select";
 import { Download, FileSearch, Play, RefreshCw, Square } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { ApiError, type ResourceView } from "../lib/api";
@@ -204,12 +205,12 @@ export function ModelCapabilityAssessment({ models, accounts, loadError }: {
         <fieldset disabled={busy || loadError || models === null || accounts === null}>
           <legend className="vh">参考与被测</legend>
           <div className="assessment-form-grid">
-            <Field label="可信参考模型" hint="只可选择已保存的具体模型及其账号。">{(aria) => <select {...aria} required value={referenceId} onChange={(event) => setReferenceId(event.target.value)}><option value="">选择参考模型</option>{targets.map((target) => <option key={target.model_id} value={target.model_id}>{target.model_name} · {target.account_name}</option>)}</select>}</Field>
-            <Field label="被测模型" hint="须与参考使用不同模型、不同账号；账号不同不证明渠道独立。">{(aria) => <select {...aria} required value={candidateId} onChange={(event) => setCandidateId(event.target.value)}><option value="">选择被测模型</option>{targets.map((target) => <option key={target.model_id} value={target.model_id}>{target.model_name} · {target.account_name}</option>)}</select>}</Field>
-            <Field label="参考来源"><select value={kind} onChange={(event) => setKind(event.target.value as AssessmentSource["kind"])}><option value="direct_provider">官方直连</option><option value="verified_channel">已核实的独立渠道</option></select></Field>
+            <Field label="可信参考模型" hint="只可选择已保存的具体模型及其账号。">{(aria) => <Select {...aria} required value={referenceId} onValueChange={(selectedValue) => setReferenceId(selectedValue)}><option value="">选择参考模型</option>{targets.map((target) => <option key={target.model_id} value={target.model_id}>{target.model_name} · {target.account_name}</option>)}</Select>}</Field>
+            <Field label="被测模型" hint="须与参考使用不同模型、不同账号；账号不同不证明渠道独立。">{(aria) => <Select {...aria} required value={candidateId} onValueChange={(selectedValue) => setCandidateId(selectedValue)}><option value="">选择被测模型</option>{targets.map((target) => <option key={target.model_id} value={target.model_id}>{target.model_name} · {target.account_name}</option>)}</Select>}</Field>
+            <Field label="参考来源"><Select value={kind} onValueChange={(selectedValue) => setKind(selectedValue as AssessmentSource["kind"])}><option value="direct_provider">官方直连</option><option value="verified_channel">已核实的独立渠道</option></Select></Field>
             <Field label="来源核实时间（北京时间）"><input required type="datetime-local" value={verifiedAt} max={beijingInputValue(new Date()).slice(0, 16)} onChange={(event) => setVerifiedAt(event.target.value)} /></Field>
             <Field label="来源核实说明" hint="说明参考渠道和核实依据，最多256字；请勿填入密钥或含凭据的地址。">{(aria) => <textarea {...aria} required maxLength={256} rows={2} value={note} onChange={(event) => setNote(event.target.value)} />}</Field>
-            <Field label="固定题集模式"><select value={mode} onChange={(event) => setMode(event.target.value as AssessmentMode)}><option value="quick">Quick · 10 对 / 20 次生成调用 · 仅描述</option><option value="full">Full · 80 对 / 160 次生成调用</option></select></Field>
+            <Field label="固定题集模式"><Select value={mode} onValueChange={(selectedValue) => setMode(selectedValue as AssessmentMode)}><option value="quick">Quick · 10 对 / 20 次生成调用 · 仅描述</option><option value="full">Full · 80 对 / 160 次生成调用</option></Select></Field>
           </div>
           <label className="assessment-checkbox"><input type="checkbox" checked={independent} onChange={(event) => setIndependent(event.target.checked)} /><span>我已核实参考来源，并审定参考与被测的供应渠道独立性。</span></label>
         </fieldset>

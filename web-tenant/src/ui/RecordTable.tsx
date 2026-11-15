@@ -1,3 +1,4 @@
+import { Select } from "./Select";
 import type { ReactNode } from "react";
 import { ChevronLeft, ChevronRight } from "lucide-react";
 import { RECORD_PAGE_SIZES, type RecordPageSize } from "../lib/recordTable";
@@ -53,9 +54,9 @@ export function RecordTablePager({ page, pageSize, onPageChange, onPageSizeChang
       <div className="record-table-navigation">
         <label className="record-table-page-size">
           <span>每页条数</span>
-          <select aria-label={`${label}每页条数`} value={pageSize} disabled={busy} onChange={(event) => onPageSizeChange(Number(event.target.value) as RecordPageSize)}>
+          <Select size="compact" aria-label={`${label}每页条数`} value={pageSize} disabled={busy} onValueChange={(selectedValue) => onPageSizeChange(Number(selectedValue) as RecordPageSize)}>
             {RECORD_PAGE_SIZES.map((size) => <option key={size} value={size}>{size}</option>)}
-          </select>
+          </Select>
         </label>
         <div className="record-table-page-controls">
           <Button size="sm" kind="quiet" iconOnly className="record-table-page-button" aria-label="上一页" title="上一页" disabled={busy || current <= 1} onClick={() => onPageChange(current - 1)}><ChevronLeft aria-hidden="true" /></Button>

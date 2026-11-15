@@ -1,5 +1,8 @@
 @layer components {
   /* 紧凑表格沿用表单令牌，触发器与弹层各自约束宽度。 */
+  .ui-select-field { display: inline-flex; width: 100%; min-width: 0; max-width: 100%; flex-direction: column; gap: 4px; vertical-align: middle; }
+  .ui-select-field-compact { width: auto; max-width: min(240px, 100%); }
+  .ui-select-validation { color: var(--danger); font-size: 12px; line-height: 18px; white-space: normal; }
   .ui-select-trigger,
   .ui-menu-trigger {
     display: inline-flex;
@@ -21,7 +24,7 @@
     cursor: pointer;
   }
   .ui-select-trigger { width: 100%; }
-  .ui-select-compact { width: auto; min-height: 36px; padding-inline: 10px; font-size: 13px; }
+  .ui-select-compact { width: auto; max-width: min(240px, 100%); min-height: 36px; padding-inline: 10px; font-size: 13px; }
   .ui-select-value { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .ui-select-chevron { display: inline-flex; flex: none; width: 16px; height: 16px; color: var(--muted-foreground); }
   .ui-select-chevron > svg { width: 16px; height: 16px; }
@@ -49,6 +52,11 @@
   }
   .ui-select-content { min-width: min(var(--radix-select-trigger-width), calc(100vw - 24px)); max-height: min(320px, var(--radix-select-content-available-height)); }
   .ui-dropdown-viewport { padding: 0; }
+  .record-table-toolbar .ui-select-trigger { min-height: 44px; }
+  .record-table-page-size .ui-select-trigger { width: auto; min-width: 64px; min-height: 44px; padding-inline: 8px; border-color: transparent; background: transparent; font-size: 12px; font-variant-numeric: tabular-nums; }
+  .record-table-page-size .ui-select-trigger:enabled:hover { background: var(--well); }
+  .f.filter > .ui-select-field { width: auto; flex: 1 1 auto; }
+  td .ui-select-trigger { max-width: min(240px, 100%); }
   .ui-multiselect-content,
   .ui-menu-content { min-width: min(160px, calc(100vw - 24px)); max-height: min(320px, var(--radix-dropdown-menu-content-available-height)); overflow-y: auto; }
   .ui-multiselect-content { min-width: min(var(--radix-dropdown-menu-trigger-width), calc(100vw - 24px)); }

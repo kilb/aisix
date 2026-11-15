@@ -1,3 +1,4 @@
+import { Select } from "../ui/Select";
 import "../tabs/pricing/RateCardEditor.css";
 import { useEffect, useId, useState } from "react";
 import type { Detail, RateCard, RateMap, TierRates } from "../lib/api";
@@ -395,14 +396,14 @@ export function RateCardEditor({
           })}
           <div className="rate-add-tier flex min-w-0 flex-wrap items-end gap-3 [&_.field]:mb-0 [&_.field]:min-w-0 [&_.field]:basis-48 [&_.field]:flex-1">
             <Field label="要添加的档位">
-              <select value={picked} onChange={(e) => setAdding(e.target.value)}>
+              <Select value={picked} onValueChange={(selectedValue) => setAdding(selectedValue)}>
                 {offered.map((t) => (
                   <option key={t.tier} value={t.tier}>
                     {t.label}
                   </option>
                 ))}
                 <option value={OTHER}>其他（填写名称）</option>
-              </select>
+              </Select>
             </Field>
             {picked === OTHER && (
               <Field label="档位名称" hint="上游报告的服务档位名称：小写字母、数字、_ 和 -">

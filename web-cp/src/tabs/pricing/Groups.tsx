@@ -19,6 +19,7 @@ import { Sheet, SheetContent } from "../../components/ui/sheet";
 import { GroupDetail } from "./GroupDetail";
 import { Count, FormGrid } from "./kit";
 import { Pencil } from "lucide-react";
+import { Select } from "../../ui/Select";
 
 /** What the operator reads for each count a refusal carries, in the order the page shows them. */
 const COUNT_WORDS: [keyof GroupUseCounts, string][] = [
@@ -168,7 +169,7 @@ export function Groups({ canEdit }: TabProps) {
         ) : (
           <>
           <RecordTableToolbar search={{ value: records.query, onChange: records.setQuery, label: "搜索分组", placeholder: "显示名、路由名或 ID" }}>
-            <label className="f filter"><span>默认换算率</span><select value={rateState} onChange={(e) => setRateState(e.target.value)}><option value="">全部</option><option value="configured">已设置</option><option value="missing">未设置</option><option value="scheduled">有待生效版本</option></select></label>
+            <label className="f filter"><span>默认换算率</span><Select size="compact" value={rateState} onValueChange={(value) => setRateState(value)}><option value="">全部</option><option value="configured">已设置</option><option value="missing">未设置</option><option value="scheduled">有待生效版本</option></Select></label>
           </RecordTableToolbar>
           <DataTable label="分组" tableClassName="finance-groups-table">
             <thead>

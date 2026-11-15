@@ -1,3 +1,4 @@
+import { Select } from "../ui/Select";
 import { useEffect, useId, useMemo, useState } from "react";
 import { ArrowDownRight, ArrowUpRight, Check, ChevronDown, RefreshCw, Search } from "lucide-react";
 import { fetchDirectModelMetrics, type DirectModelMetricRow, type DirectModelMetricsQuery, type DirectModelMetricsResponse } from "../lib/directModelMetrics";
@@ -139,8 +140,8 @@ export function DirectModelMonitoring() {
     <div className="direct-monitor-scope" aria-label="上游监测范围">
       <label><span>开始时间</span><input type="datetime-local" step="1" value={dateValue(from)} onChange={event => changeDate("from", event.target.value)} /></label>
       <label><span>结束时间</span><input type="datetime-local" step="1" value={dateValue(to)} onChange={event => changeDate("to", event.target.value)} /></label>
-      <label><span>时间粒度</span><select value={rawBucket} onChange={event => change({ bucket: event.target.value })}><option value="minute">每分钟</option><option value="hour">每小时</option><option value="day">每天</option></select></label>
-      <label><span>尝试结果</span><select value={rawOutcome} onChange={event => change({ outcome: event.target.value })}><option value="">全部结果</option><option value="succeeded">成功</option><option value="failed">失败</option><option value="unknown">结果未知</option></select></label>
+      <label><span>时间粒度</span><Select value={rawBucket} onValueChange={selectedValue => change({ bucket: selectedValue })}><option value="minute">每分钟</option><option value="hour">每小时</option><option value="day">每天</option></Select></label>
+      <label><span>尝试结果</span><Select value={rawOutcome} onValueChange={selectedValue => change({ outcome: selectedValue })}><option value="">全部结果</option><option value="succeeded">成功</option><option value="failed">失败</option><option value="unknown">结果未知</option></Select></label>
       <ModelScopeFilters key={requestKey} request={request} onApply={change} />
     </div>
     {error ? <div className="note crit" role="alert">{error}{!rangeError && <Button kind="quiet" onClick={() => setRevision(value => value + 1)}>重试</Button>}</div> : busy ? <p role="status" className="direct-monitor-state">正在读取上游监测</p> : null}
@@ -156,7 +157,7 @@ export function DirectModelMonitoring() {
     <section className="direct-monitor-catalogue" aria-labelledby={`${id}-models`}>
       <div className="direct-monitor-list-toolbar"><h2 id={`${id}-models`}>直连模型<span>{formatCount(data ? models.length : null)} / {formatCount(data?.models.length)}</span></h2>
         <label className="direct-monitor-search"><Search size={16} aria-hidden /><span className="vh">搜索监测模型</span><input type="search" placeholder="搜索已加载模型或账号" value={search} onChange={event => setSearch(event.target.value)} /></label>
-        <label><span className="vh">监测模型排序</span><select aria-label="监测模型排序" value={order} onChange={event => setOrder(event.target.value)}><option value="name">按模型名称</option><option value="failure">失败率从高到低</option><option value="latency">首帧 P95 从高到低</option><option value="tps">TPS 从高到低</option></select></label>
+        <label><span className="vh">监测模型排序</span><Select aria-label="监测模型排序" value={order} onValueChange={selectedValue => setOrder(selectedValue)}><option value="name">按模型名称</option><option value="failure">失败率从高到低</option><option value="latency">首帧 P95 从高到低</option><option value="tps">TPS 从高到低</option></Select></label>
       </div>
       <p className="direct-monitor-list-note">搜索与排序只调整模型列表；概览和趋势仍使用完整筛选范围。</p>
       {data && models.length === 0 ? <EmptyState text={search ? "没有匹配的模型，请调整搜索。" : "当前范围没有直连模型，请调整筛选。"} /> : table.rows.map(model => <ModelRow key={`${model.model.id}/${model.provider_key.id ?? ""}`} model={model} />)}

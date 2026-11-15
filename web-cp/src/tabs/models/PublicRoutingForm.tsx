@@ -16,6 +16,7 @@ import { CooldownEditor } from "../../ui/CooldownEditor";
 import { UpstreamModelPicker } from "../../ui/UpstreamModelPicker";
 import { GroupBadges } from "../providers/GroupBadges";
 import { FORM_FOOTER, RowField, ServedGroups, GENERATED_STRATEGY, type Catalog, type SchemaInfo } from "./catalog";
+import { Select } from "../../ui/Select";
 
 const UNPRICED_STRATEGY = "least_cost";
 
@@ -395,11 +396,11 @@ export function PublicRoutingForm({
           />
           <Field label="全部不可用时的处理" hint="只针对后台健康检查报告全部目标不健康。全部目标都在故障冷却时仍会尝试。" error={at("/routing/when_all_unavailable")}>
             {(aria) => (
-              <select disabled={locked} value={draft.whenAllUnavailable} onChange={(e) => set("whenAllUnavailable", e.target.value)} {...aria}>
+              <Select disabled={locked} value={draft.whenAllUnavailable} onValueChange={(value) => set("whenAllUnavailable", value)} {...aria}>
                 <option value="">（网关默认）</option>
                 <option value="fail">fail（返回 503）</option>
                 <option value="try_anyway">try_anyway（仍然尝试）</option>
-              </select>
+              </Select>
             )}
           </Field>
           <Field label="重试次数" hint="留空时目标设值优先；目标未设置且仍有后备目标时为 0 次，最后一个目标继承网关配置。" error={at("/routing/retries")}>
@@ -555,14 +556,14 @@ export function PublicRoutingForm({
                       <>
                         <RowField label="上游账号" at="3xl" error={refusal?.fields.account}>
                           {(aria) => (
-                            <select disabled={locked} value={a.accountId} onChange={(e) => chooseAccount(a, e.target.value)} {...aria}>
+                            <Select disabled={locked} value={a.accountId} onValueChange={(value) => chooseAccount(a, value)} {...aria}>
                               <option value="">（选择上游账号）</option>
                               {accountOptions(a).map((o) => (
                                 <option key={o.id} value={o.id}>
                                   {o.label}
                                 </option>
                               ))}
-                            </select>
+                            </Select>
                           )}
                         </RowField>
                         {account && <ServedGroups className="mt-1.5">{groupBadges(account.doc.groups)}</ServedGroups>}

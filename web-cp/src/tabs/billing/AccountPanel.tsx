@@ -31,6 +31,7 @@ import { OrgQuota } from "./OrgQuota";
 import { CardHeader } from "../../components/page";
 import { BudgetProgress } from "../../components/charts";
 import { exactRatio, formatCount } from "../../lib/chartFormat";
+import { Select } from "../../ui/Select";
 
 /** What every region of the panel is given. */
 export interface RegionProps {
@@ -377,12 +378,12 @@ function Ledger({ account }: RegionProps) {
       <div className="bl-controls bl-filters">
         {days.fields}
         <Field label="类型">
-          <select value={kind} onChange={(e) => setKind(e.target.value as LedgerItem["kind"] | "")}>
+          <Select size="compact" value={kind} onValueChange={(value) => setKind(value as LedgerItem["kind"] | "")}>
             <option value="">全部</option>
             <option value="usage">扣费</option>
             <option value="topup">充值</option>
             <option value="adjustment">调整</option>
-          </select>
+          </Select>
         </Field>
       </div>
       {first.error ? (
@@ -459,10 +460,10 @@ function Summary<T>({
     <Region label={label}>
       <div className="bl-controls bl-filters">
         <Field label="汇总方式">
-          <select value={group} onChange={(e) => setGroup(e.target.value as "day" | "month")}>
+          <Select size="compact" value={group} onValueChange={(value) => setGroup(value as "day" | "month")}>
             <option value="day">按天</option>
             <option value="month">按月</option>
-          </select>
+          </Select>
         </Field>
         {days.fields}
       </div>
@@ -614,7 +615,7 @@ function Quotas({ account, quotaRev }: RegionProps) {
         <EmptyState text="这个租户没有设置额度。" />
       ) : (
         <>
-          <RecordTools table={table} label="额度"><label className="f filter"><span>额度层级</span><select aria-label="额度层级" value={scopeFilter} onChange={(e) => setScopeFilter(e.target.value)}><option value="">全部</option><option value="team">组织</option><option value="member">成员</option><option value="api_key">密钥</option></select></label><label className="f filter"><span>额度类型</span><select aria-label="额度类型" value={kindFilter} onChange={(e) => setKindFilter(e.target.value)}><option value="">全部</option><option value="periodic">周期</option><option value="cumulative">一次性</option></select></label><label className="f filter"><span>额度状态</span><select aria-label="额度状态" value={quotaStatus} onChange={(e) => setQuotaStatus(e.target.value)}><option value="">全部</option><option value="exhausted">用尽</option><option value="available">正常</option></select></label></RecordTools>
+          <RecordTools table={table} label="额度"><label className="f filter"><span>额度层级</span><Select size="compact" aria-label="额度层级" value={scopeFilter} onValueChange={(value) => setScopeFilter(value)}><option value="">全部</option><option value="team">组织</option><option value="member">成员</option><option value="api_key">密钥</option></Select></label><label className="f filter"><span>额度类型</span><Select size="compact" aria-label="额度类型" value={kindFilter} onValueChange={(value) => setKindFilter(value)}><option value="">全部</option><option value="periodic">周期</option><option value="cumulative">一次性</option></Select></label><label className="f filter"><span>额度状态</span><Select size="compact" aria-label="额度状态" value={quotaStatus} onValueChange={(value) => setQuotaStatus(value)}><option value="">全部</option><option value="exhausted">用尽</option><option value="available">正常</option></Select></label></RecordTools>
           <DataTable label="额度" compact>
             <thead>
               <tr>

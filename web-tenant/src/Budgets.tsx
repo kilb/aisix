@@ -1,3 +1,4 @@
+import { Select } from "./ui/Select";
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { Pencil } from "lucide-react";
 import {
@@ -378,8 +379,8 @@ function QuotaTable({
   return (
     <>
     <RecordTableToolbar search={{ value: table.query, onChange: table.setQuery, label: `搜索${label}`, placeholder: "对象或设置方" }}>
-      <Field label={`${label}周期`}><select value={kindFilter} onChange={(e) => setKindFilter(e.target.value)}><option value="">全部周期</option><option value="day">每天</option><option value="week">每周</option><option value="month">每月</option><option value="cumulative">一次性额度</option></select></Field>
-      <Field label={`${label}状态`}><select value={stateFilter} onChange={(e) => setStateFilter(e.target.value)}><option value="">全部状态</option><option value="ok">正常</option><option value="exhausted">已用尽</option></select></Field>
+      <Field label={`${label}周期`}><Select value={kindFilter} onValueChange={(selectedValue) => setKindFilter(selectedValue)}><option value="">全部周期</option><option value="day">每天</option><option value="week">每周</option><option value="month">每月</option><option value="cumulative">一次性额度</option></Select></Field>
+      <Field label={`${label}状态`}><Select value={stateFilter} onValueChange={(selectedValue) => setStateFilter(selectedValue)}><option value="">全部状态</option><option value="ok">正常</option><option value="exhausted">已用尽</option></Select></Field>
     </RecordTableToolbar>
     <DataTable label={label}>
       <thead>
@@ -677,47 +678,47 @@ function CreateForm({
       <form className="tenant-form grid gap-4" ref={form} onSubmit={submit} noValidate>
         <Field label="对象类型" error={errors.scope}>
           {(aria) => (
-            <select
+            <Select
               value={scope}
-              onChange={(e) => {
-                setScope(e.target.value as NewBudget["scope"]);
+              onValueChange={(selectedValue) => {
+                setScope(selectedValue as NewBudget["scope"]);
                 setTarget("");
               }}
               {...aria}
             >
               {manager && <option value="member">成员</option>}
               <option value="api_key">密钥</option>
-            </select>
+            </Select>
           )}
         </Field>
         <Field label="对象" error={errors.target}>
           {(aria) => (
-            <select value={chosen} onChange={(e) => setTarget(e.target.value)} {...aria}>
+            <Select value={chosen} onValueChange={(selectedValue) => setTarget(selectedValue)} {...aria}>
               {options.length === 0 && <option value="">（没有可选的对象）</option>}
               {options.map((o) => (
                 <option key={o.id} value={o.id}>
                   {o.label}
                 </option>
               ))}
-            </select>
+            </Select>
           )}
         </Field>
         <Field label="类型" error={errors.kind}>
           {(aria) => (
-            <select value={kind} onChange={(e) => setKind(e.target.value as Budget["kind"])} {...aria}>
+            <Select value={kind} onValueChange={(selectedValue) => setKind(selectedValue as Budget["kind"])} {...aria}>
               <option value="periodic">{KIND.periodic}</option>
               <option value="cumulative">{KIND.cumulative}</option>
-            </select>
+            </Select>
           )}
         </Field>
         {kind === "periodic" && (
           <Field label="周期" error={errors.period}>
             {(aria) => (
-              <select value={period} onChange={(e) => setPeriod(e.target.value as NonNullable<Budget["period"]>)} {...aria}>
+              <Select value={period} onValueChange={(selectedValue) => setPeriod(selectedValue as NonNullable<Budget["period"]>)} {...aria}>
                 <option value="day">{PERIOD.day}</option>
                 <option value="week">{PERIOD.week}</option>
                 <option value="month">{PERIOD.month}</option>
-              </select>
+              </Select>
             )}
           </Field>
         )}

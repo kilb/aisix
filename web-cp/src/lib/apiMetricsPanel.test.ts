@@ -16,6 +16,7 @@ const require = createRequire(import.meta.url);
 const compiled = await build({
   stdin: { contents: 'export { ApiMetricsPanel } from "./components/ApiMetricsPanel.tsx"; export { ApiSuccessSummary } from "./components/ApiSuccessSummary.tsx"; export { ApiMetricsOverview } from "./components/ApiMetricsOverview.tsx";', resolveDir: fileURLToPath(new URL("../", import.meta.url)), sourcefile: "api-metrics-panel.tsx" },
   bundle: true, platform: "node", format: "cjs", jsx: "automatic", write: false,
+  loader: { ".css": "empty" },
   define: { "import.meta.env.BASE_URL": '"/"' },
   plugins: [{ name: "single-react-runtime", setup(builder) { builder.onResolve({ filter: /^react(?:\/.*)?$/ }, args => ({ path: require.resolve(args.path), external: true })); } }],
 });
@@ -60,7 +61,7 @@ test("完整分析使用唯一 tablist 与稳定 tabpanel，受控视图改变�
     const activeTab = markup.match(/id="([^"]+)" role="tab"[^>]*aria-selected="true"[^>]*aria-controls="([^"]+)"/);
     assert.ok(activeTab);
     assert.ok(markup.includes(`id="${activeTab[2]}" role="tabpanel" aria-labelledby="${activeTab[1]}"`));
-    assert.doesNotMatch(markup, /aria-expanded|aria-pressed/);
+    assert.doesNotMatch(markup.replace(/<button[^>]*role="combobox"[^>]*>[\s\S]*?<\/button>/g, ""), /aria-expanded|aria-pressed/);
   }
 });
 

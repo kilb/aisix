@@ -26,6 +26,7 @@ import {
 import { RankBars } from "../components/charts";
 import { Plus, RefreshCw, X } from "lucide-react";
 import "./Operators.css";
+import { Select } from "../ui/Select";
 
 /** The control plane's operator roles, highest first, by the names this page shows. */
 const ROLES: { role: OperatorRole; label: string }[] = [
@@ -133,7 +134,7 @@ export function Operators({ operator }: TabProps) {
       {items === null && !loadError && <Loading />}
       {items !== null && (
         <>
-          <RecordTools table={table} label="全部运维账号"><label className="f filter"><span>筛选角色</span><select aria-label="筛选角色" value={roleFilter} onChange={(e) => setRoleFilter(e.target.value)}><option value="">全部</option><option value="admin">管理员</option><option value="operator">运维</option><option value="viewer">只读</option></select></label><label className="f filter"><span>筛选状态</span><select aria-label="筛选状态" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}><option value="">全部</option><option value="enabled">正常</option><option value="disabled">已停用</option></select></label></RecordTools>
+          <RecordTools table={table} label="全部运维账号"><label className="f filter"><span>筛选角色</span><Select size="compact" aria-label="筛选角色" value={roleFilter} onValueChange={(value) => setRoleFilter(value)}><option value="">全部</option><option value="admin">管理员</option><option value="operator">运维</option><option value="viewer">只读</option></Select></label><label className="f filter"><span>筛选状态</span><Select size="compact" aria-label="筛选状态" value={statusFilter} onValueChange={(value) => setStatusFilter(value)}><option value="">全部</option><option value="enabled">正常</option><option value="disabled">已停用</option></Select></label></RecordTools>
           <DataTable label="全部运维账号">
             <thead>
               <tr>
@@ -166,13 +167,13 @@ export function Operators({ operator }: TabProps) {
                       </span>
                     </td>
                     <td>
-                      <select
+                      <Select size="compact"
                         aria-label="角色"
                         className="select-sm"
                         value={shownRole}
                         disabled={busy || mine?.kind === "disable"}
-                        onChange={(e) => {
-                          const role = e.target.value as OperatorRole;
+                        onValueChange={(value) => {
+                          const role = value as OperatorRole;
                           setOutcome(null);
                           setPending(role === a.role ? null : { id: a.id, kind: "role", role });
                         }}
@@ -182,7 +183,7 @@ export function Operators({ operator }: TabProps) {
                             {r.label}
                           </option>
                         ))}
-                      </select>
+                      </Select>
                     </td>
                     <td>
                       <Lamp state={a.disabled ? "disabled" : "applied"}>{a.disabled ? "已停用" : "正常"}</Lamp>
@@ -467,13 +468,13 @@ function CreateForm({
               <div className="operators-create-field">
                 <label className="f">
                   <span>角色</span>
-                  <select value={role} aria-describedby={ids.role} onChange={(e) => setRole(e.target.value as OperatorRole)}>
+                  <Select value={role} aria-describedby={ids.role} onValueChange={(value) => setRole(value as OperatorRole)}>
                     {ROLES.map((r) => (
                       <option key={r.role} value={r.role}>
                         {r.label}
                       </option>
                     ))}
-                  </select>
+                  </Select>
                 </label>
                 <p id={ids.role} className="operators-role-hint">
                   只读：只能查看；运维：可修改网关资源、租户与密钥；管理员：另可管理运维账号、网关凭据与下发。

@@ -40,6 +40,7 @@ import { useToast } from "../../ui/Toast";
 import { usdPerMillion } from "./Baselines";
 import { BentoGrid, Card, CardHeader, CardMessage, Metric, MetricSkeleton, PageHeader, span } from "../../components/page";
 import { CardFooter, FormGrid } from "./kit";
+import { Select } from "../../ui/Select";
 
 /**
  * The credit the dataset's authors ask for (its MIT licence, `LICENSE` beside
@@ -353,14 +354,14 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
                 <FormGrid className="import-controls">
                   <Field label="上传批次">
                     {(aria) => (
-                      <select {...aria} value={batchId ?? ""} onChange={(e) => switchBatch(e.target.value)}>
+                      <Select {...aria} value={batchId ?? ""} onValueChange={(value) => switchBatch(value)}>
                         {batches.map((b) => (
                           <option key={b.id} value={b.id}>
                             {b.dataset_ref} · {fmtBeijing(b.created_at)} · {b.status === "open" ? "待审" : "已被取代"} ·{" "}
                             {b.proposals} 条提议（{b.flagged} 条带标记）
                           </option>
                         ))}
-                      </select>
+                      </Select>
                     )}
                   </Field>
                   <label className="check col-span-full mb-0 min-h-11">
@@ -380,7 +381,7 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
                   </label>
                 </FormGrid>
                 <RecordTableToolbar search={{ value: table.query, onChange: table.setQuery, label: "筛选模型", placeholder: "按提供方或模型名筛选" }}>
-                  <Field label="提议状态">{(aria) => <select {...aria} value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}><option value="">全部状态</option><option value="pending">待审</option><option value="confirmed">已确认</option><option value="rejected">已驳回</option><option value="superseded">已被取代</option></select>}</Field>
+                  <Field label="提议状态">{(aria) => <Select size="compact" {...aria} value={statusFilter} onValueChange={(value) => setStatusFilter(value)}><option value="">全部状态</option><option value="pending">待审</option><option value="confirmed">已确认</option><option value="rejected">已驳回</option><option value="superseded">已被取代</option></Select>}</Field>
                   <label className="check mb-0 min-h-11"><input type="checkbox" checked={flaggedOnly} onChange={(e) => setFlaggedOnly(e.target.checked)} /><span>只看带标记</span></label>
                   <p className="hint mb-0">已读取当前批次完整列表；翻页不改变已选项。</p>
                 </RecordTableToolbar>
@@ -937,7 +938,7 @@ function ConfirmForm({
       <h3 className="mb-3 font-mono text-meta text-muted">确认</h3>
       <Field label="模型" hint="确认后，这项价格成为该模型的基准价" error={problemAt(details, (p) => p === "/model_id")}>
         {(aria) => (
-          <select {...aria} value={model} onChange={(e) => setModel(e.target.value)}>
+          <Select {...aria} value={model} onValueChange={(value) => setModel(value)}>
             <option value="">请选择</option>
             {/* A channel's generated direct document is priced through its public model. */}
             {models
@@ -947,7 +948,7 @@ function ConfirmForm({
                   {m.doc.display_name || m.id}
                 </option>
               ))}
-          </select>
+          </Select>
         )}
       </Field>
       {tierWarning && <p className="note warn whitespace-normal [overflow-wrap:anywhere]" role="status">{tierWarning}</p>}

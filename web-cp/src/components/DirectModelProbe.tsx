@@ -1,3 +1,4 @@
+import { Select } from "../ui/Select";
 import { Check, CircleHelp, LoaderCircle, Play, RefreshCw, Square } from "lucide-react";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import {
@@ -324,9 +325,9 @@ function ProbeHistory({ targets, revision }: { targets: readonly DirectProbeTarg
     <h3>测试历史</h3>
     <p className="direct-probe-method">从历史保存启用后保留每一轮结果。基础与能力各自保留状态和用量，不计入正式调用统计。</p>
     <RecordTableToolbar>
-      <label>测试目标<select aria-label="历史测试目标" value={model} onChange={(event) => { setModel(event.target.value); reset(); }}><option value="">全部目标</option>{targets.map((target) => <option value={target.id} key={target.id}>{target.name}</option>)}</select></label>
-      <label>测试模式<select value={mode} onChange={(event) => { setMode(event.target.value as typeof mode); reset(); }}><option value="">全部模式</option><option value="baseline">仅基础</option><option value="capability">基础 + 能力</option></select></label>
-      <label>基础状态<select value={status} onChange={(event) => { setStatus(event.target.value as typeof status); reset(); }}><option value="">全部状态</option>{(["available", "failed", "timeout", "unsupported"] as const).map((value) => <option value={value} key={value}>{STATUS_LABEL[value]}</option>)}</select></label>
+      <label>测试目标<Select aria-label="历史测试目标" value={model} onValueChange={(selectedValue) => { setModel(selectedValue); reset(); }}><option value="">全部目标</option>{targets.map((target) => <option value={target.id} key={target.id}>{target.name}</option>)}</Select></label>
+      <label>测试模式<Select value={mode} onValueChange={(selectedValue) => { setMode(selectedValue as typeof mode); reset(); }}><option value="">全部模式</option><option value="baseline">仅基础</option><option value="capability">基础 + 能力</option></Select></label>
+      <label>基础状态<Select value={status} onValueChange={(selectedValue) => { setStatus(selectedValue as typeof status); reset(); }}><option value="">全部状态</option>{(["available", "failed", "timeout", "unsupported"] as const).map((value) => <option value={value} key={value}>{STATUS_LABEL[value]}</option>)}</Select></label>
       <label>开始日期（北京）<input type="date" value={from} onChange={(event) => { setFrom(event.target.value); reset(); }} /></label>
       <label>结束日期（北京）<input type="date" value={to} onChange={(event) => { setTo(event.target.value); reset(); }} /></label>
     </RecordTableToolbar>

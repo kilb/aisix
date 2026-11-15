@@ -28,6 +28,7 @@ import { inForce, isZeroRate, scheduledWords } from "./GroupDetail";
 import { BaselineSourceBadge } from "./Baselines";
 import { PriceCardDetails } from "./PriceCardDetails";
 import { CardFooter, Count, FormGrid, WithForms } from "./kit";
+import { Select } from "../../ui/Select";
 
 /**
  * One upstream account's cost rates, as a group's detail shows its rates:
@@ -153,7 +154,7 @@ export function CostAccountDetail({
           ) : (
             <>
             <RecordTableToolbar search={{ value: records.query, onChange: records.setQuery, label: "搜索成本价模型", placeholder: "模型名称或 ID" }}>
-              <label className="f filter"><span>价格状态</span><select value={priceState} onChange={(e) => setPriceState(e.target.value)}><option value="">全部</option><option value="baseline">已有基准价</option><option value="missing">缺少基准价</option><option value="override">已设单模型覆盖</option></select></label>
+              <label className="f filter"><span>价格状态</span><Select size="compact" value={priceState} onValueChange={(value) => setPriceState(value)}><option value="">全部</option><option value="baseline">已有基准价</option><option value="missing">缺少基准价</option><option value="override">已设单模型覆盖</option></Select></label>
             </RecordTableToolbar>
             <DataTable label="账号成本换算率">
               <colgroup>
