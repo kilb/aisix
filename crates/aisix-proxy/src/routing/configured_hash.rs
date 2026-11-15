@@ -253,8 +253,34 @@ impl RoutingRegistry {
                 larger = vec![0usize; tier.len()];
                 &mut larger[..]
             };
-            for (declaration, &index) in declarations.iter_mut().zip(tier) {
-                *declaration = configured.find(routing, &targets[index]);
+            let configured_len = configured.declarations.len();
+            let binary_work = tier
+                .len()
+                .saturating_mul(configured_len.ilog2() as usize + 1);
+            if binary_work >= configured_len {
+                // 密集候选仍是配置的稳定子序列；归并避免为每个候选重复二分字符串。
+                let mut next = 0;
+                for (declaration, &index) in configured.declarations.iter().enumerate() {
+                    if target_identity_cmp(
+                        &configured.names[declaration],
+                        &routing.targets[index],
+                        &targets[tier[next]].model,
+                        &targets[tier[next]],
+                    )
+                    .is_eq()
+                    {
+                        declarations[next] = declaration;
+                        next += 1;
+                        if next == tier.len() {
+                            break;
+                        }
+                    }
+                }
+                debug_assert_eq!(next, tier.len());
+            } else {
+                for (declaration, &index) in declarations.iter_mut().zip(tier) {
+                    *declaration = configured.find(routing, &targets[index]);
+                }
             }
             order.extend(
                 ring.subset_preference_order(key_hash, declarations)
