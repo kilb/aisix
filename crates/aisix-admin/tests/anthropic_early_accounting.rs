@@ -212,9 +212,31 @@ async fn exercise(client: Client, overloaded: bool, configured_timeout: bool) {
     .await
     .expect("usage sink did not close");
     assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].upstream_dispatched, Some(true));
+    assert!(rows[0].is_final_attempt);
+    assert_eq!(rows[0].status_code, 502);
+    assert_eq!(
+        (
+            rows[0].prompt_tokens,
+            rows[0].completion_tokens,
+            rows[0].total_tokens
+        ),
+        (37, 0, 0)
+    );
     let event = serde_json::to_value(&rows[0]).unwrap();
     // 没有既存搜索次数 Prometheus 系列；搜索计数仍在真实终态事件上验证。
     assert_eq!(event.get("web_search_requests"), Some(&json!(7)), "{event}");
+    assert_eq!(event.get("cache_creation_tokens"), Some(&json!(11)));
+    assert_eq!(event.get("cache_read_tokens"), Some(&json!(23)));
+    assert_eq!(event.get("cache_usage_reported"), Some(&json!(true)));
+    assert_eq!(event.get("cost_usd"), Some(&json!(0.0)));
+    assert!(
+        event
+            .get("upstream_ttft_ms")
+            .and_then(Value::as_u64)
+            .is_some_and(|ms| ms > 0),
+        "已解析 message_start，必须保留上游首帧测量：{event}"
+    );
     assert!(event.get("first_token_latency_ms").is_none(), "{event}");
     let after = scrape(metrics).await;
     for (family, expected) in [
@@ -226,16 +248,27 @@ async fn exercise(client: Client, overloaded: bool, configured_timeout: bool) {
     ] {
         exact_counter(&after, family, client.path(), expected);
     }
-    // 零值 token 系列按既有合同稀疏导出；没有输出也不能制造 TTFT 观察。
+    // 零值 token 系列按既有合同稀疏导出。
     for family in [
         "aisix_llm_output_tokens_total",
         "aisix_llm_cached_input_tokens_total",
-        "aisix_request_ttft_seconds_count",
-        "aisix_llm_time_to_first_token_seconds_count",
     ] {
         assert!(
             samples(&after, family, client.path()).is_empty(),
             "unexpected {family}: {after}"
+        );
+    }
+    // message_start 是已解析首帧，独立于未产生的首内容；两套 TTFT 仅各记一次上游。
+    for family in [
+        "aisix_request_ttft_seconds_count",
+        "aisix_llm_time_to_first_token_seconds_count",
+    ] {
+        exact_counter(&after, family, client.path(), 1);
+        let row = samples(&after, family, client.path())[0];
+        let labels = row.split_once('{').unwrap().1.split_once('}').unwrap().0;
+        assert!(
+            labels.split(',').any(|label| label == "side=\"upstream\""),
+            "不能把未交付的内容计为 downstream TTFT：{row}"
         );
     }
     assert_eq!(upstream.received_requests().await.unwrap().len(), 1);

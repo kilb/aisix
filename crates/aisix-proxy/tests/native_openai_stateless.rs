@@ -848,14 +848,83 @@ async fn malformed_moderation_json_returns_native_error_without_upstream_dispatc
         assert!(!value["error"]["message"].as_str().unwrap().is_empty());
         assert!(upstream.received_requests().await.unwrap().is_empty());
         assert_request_metrics(&metrics, "/v1/moderations", &[400]);
+        let event = next_event(&mut events).await;
+        assert_eq!(event.api_key_id, KEY);
+        assert_eq!(event.status_code, 400);
+        assert!(event.is_final_attempt);
+        assert_eq!(event.upstream_dispatched, Some(false));
+        assert_eq!(
+            (
+                event.prompt_tokens,
+                event.completion_tokens,
+                event.total_tokens,
+                event.cached_prompt_tokens,
+                event.cache_creation_tokens,
+                event.cache_read_tokens,
+                event.reasoning_tokens
+            ),
+            (0, 0, 0, 0, 0, 0, 0)
+        );
+        assert_eq!(event.upstream_latency_ms, 0);
+        assert_eq!(event.upstream_ttft_ms, 0);
+        assert!(event.first_token_latency_ms.is_none());
+        assert!(event.io_audit.is_none());
+        let wire = serde_json::to_value(&event).unwrap();
+        for (field, expected) in [
+            ("prompt_tokens", json!(0)),
+            ("completion_tokens", json!(0)),
+            ("cost_usd", json!(0.0)),
+            ("upstream_dispatched", json!(false)),
+        ] {
+            assert_eq!(wire.get(field), Some(&expected), "{payload}: {wire}");
+        }
+        let timing = wire
+            .get("request_timing")
+            .expect("解析拒绝仍须记录入口阶段");
+        for phase in ["body_read_ms", "json_decode_ms", "pre_handler_ms"] {
+            assert!(
+                timing.get(phase).and_then(Value::as_u64).is_some(),
+                "测量即使为零也须有键：{payload}/{phase}: {wire}"
+            );
+        }
+        assert_eq!(
+            timing.get("request_body_bytes"),
+            Some(&json!(payload.len())),
+            "{wire}"
+        );
+        assert_eq!(timing.get("request_body_complete"), Some(&json!(true)));
         assert!(
             matches!(
                 events.try_recv(),
                 Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
             ),
-            "malformed JSON must not emit a usage event"
+            "已认证的解析拒绝只能发布一次零用量终态：{payload}"
         );
     }
+}
+
+#[tokio::test]
+async fn malformed_moderation_json_without_auth_does_not_emit_usage() {
+    let upstream = MockServer::builder().start().await;
+    let (router, _, mut events, metrics) = configured_app_with_metrics(&upstream.uri(), |_| {});
+    let mut request = native_request("/v1/moderations", &[("x-aisix-model", "native-model")]);
+    request.headers_mut().remove("authorization");
+    *request.body_mut() = Body::from("{");
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(!response_json(response).await["error"]["message"]
+        .as_str()
+        .unwrap()
+        .is_empty());
+    assert!(upstream.received_requests().await.unwrap().is_empty());
+    assert_request_metrics(&metrics, "/v1/moderations", &[401]);
+    assert!(
+        matches!(
+            events.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ),
+        "未认证请求不能产生用量事件"
+    );
 }
 
 #[tokio::test]
