@@ -5349,6 +5349,7 @@ pub(crate) fn anthropic_event_usage(event: &Value) -> Option<&Value> {
 /// unit — every conforming parser buffers to the blank-line terminator
 /// anyway — so holding a partial one back is not observable to a client,
 /// and `buf` retains only that partial tail.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn drain_anthropic_sse_frames(
     buf: &mut Vec<u8>,
@@ -5360,6 +5361,32 @@ fn drain_anthropic_sse_frames(
     response_text_cap: usize,
     client_facing_model: &str,
     out: &mut Vec<u8>,
+) -> Option<usize> {
+    drain_anthropic_sse_frames_with_outputs(
+        buf,
+        scanned,
+        acc,
+        attempt_started,
+        first_token_seen,
+        response_text_cap,
+        client_facing_model,
+        out,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drain_anthropic_sse_frames_with_outputs(
+    buf: &mut Vec<u8>,
+    // How much of `buf` an earlier call scanned without finding a frame end.
+    scanned: &mut usize,
+    acc: &mut AnthropicStreamUsage,
+    attempt_started: Instant,
+    first_token_seen: &mut bool,
+    response_text_cap: usize,
+    client_facing_model: &str,
+    out: &mut Vec<u8>,
+    mut native_outputs: Option<&mut Vec<Value>>,
 ) -> Option<usize> {
     if acc.reached_end || acc.stream_failure.is_some() {
         return Some(0);
@@ -5403,6 +5430,12 @@ fn drain_anthropic_sse_frames(
             }
         } else {
             out.extend_from_slice(forwarded);
+        }
+        if let (Some(outputs), Some(value)) = (native_outputs.as_deref_mut(), json) {
+            if NativeOutputFiles::observes_event(&value) {
+                // 只保留正式产物事件的既有解析结果，普通文本帧立即释放。
+                outputs.push(value);
+            }
         }
         if acc.reached_end || acc.stream_failure.is_some() {
             return Some(0);
@@ -5543,28 +5576,36 @@ struct NativeOutputFiles {
 }
 
 impl NativeOutputFiles {
-    async fn register(&self, frames: &[u8]) -> Result<(), ProxyError> {
-        let mut remaining = frames;
-        while !remaining.is_empty() {
-            let end =
-                aisix_gateway::sse::find_frame_end_from(remaining, 0).unwrap_or(remaining.len());
-            let (value, _) = crate::redact::parse_sse_json_event(&remaining[..end]);
-            if let Some(value) = value {
-                if let Some(admission) = &self.container_admission {
-                    admission.observe(&value).await?;
-                }
-                crate::native_api::anthropic::register_output_files_at_origin(
-                    &self.state,
-                    &self.auth,
-                    &self.client,
-                    &self.requested_model,
-                    &self.direct_model,
-                    self.origin.as_ref(),
-                    &value,
-                )
-                .await?;
+    fn observes_event(value: &Value) -> bool {
+        match value.get("type").and_then(Value::as_str) {
+            Some("content_block_start") => value.get("content_block").is_some(),
+            Some("message_start" | "message_delta") => value
+                .get("container")
+                .or_else(|| value.pointer("/message/container"))
+                .or_else(|| value.pointer("/delta/container"))
+                .is_some_and(|container| !container.is_null()),
+            _ => false,
+        }
+    }
+
+    async fn register(&self, events: &[Value]) -> Result<(), ProxyError> {
+        for value in events {
+            if !Self::observes_event(value) {
+                continue;
             }
-            remaining = &remaining[end..];
+            if let Some(admission) = &self.container_admission {
+                admission.observe(value).await?;
+            }
+            crate::native_api::anthropic::register_output_files_at_origin(
+                &self.state,
+                &self.auth,
+                &self.client,
+                &self.requested_model,
+                &self.direct_model,
+                self.origin.as_ref(),
+                value,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -5683,7 +5724,8 @@ where
             // trailing remainder until its terminator arrives.
             buf.extend_from_slice(&bytes);
             let mut forward: Vec<u8> = Vec::new();
-            let terminal_seen = drain_anthropic_sse_frames(
+            let mut native_outputs = Vec::new();
+            let terminal_seen = drain_anthropic_sse_frames_with_outputs(
                 &mut buf,
                 &mut scanned,
                 guard.usage(),
@@ -5692,6 +5734,7 @@ where
                 response_text_cap,
                 &model_label,
                 &mut forward,
+                file_registration.as_ref().map(|_| &mut native_outputs),
             )
             .is_some();
             if terminal_seen {
@@ -5746,11 +5789,19 @@ where
                      restamp skipped for the oversized frame)"
                 );
                 guard.usage().released_unparsed_frame = true;
+                if file_registration.is_some() {
+                    // 此超限尾帧尚未解析；保留原 live-forward 观察语义且只解析一次。
+                    if let (Some(value), _) = crate::redact::parse_sse_json_event(&buf) {
+                        if NativeOutputFiles::observes_event(&value) {
+                            native_outputs.push(value);
+                        }
+                    }
+                }
                 forward.append(&mut buf);
                 scanned = 0;
             }
-            if let Some(registration) = file_registration.as_ref() {
-                if registration.register(&forward).await.is_err() {
+            if let Some(registration) = file_registration.as_ref().filter(|_| !native_outputs.is_empty()) {
+                if registration.register(&native_outputs).await.is_err() {
                     let bridge = aisix_gateway::BridgeError::DependencyUnavailable;
                     let usage = guard.usage();
                     crate::attempt::StreamFailure::record(&mut usage.failure, &bridge);
@@ -5850,8 +5901,8 @@ where
                     response_text_cap,
                 );
             }
-            if let Some(registration) = file_registration.as_ref() {
-                if registration.register(&tail).await.is_err() {
+            if let (Some(registration), Some(value)) = (file_registration.as_ref(), json.as_ref()) {
+                if registration.register(std::slice::from_ref(value)).await.is_err() {
                     let bridge = aisix_gateway::BridgeError::DependencyUnavailable;
                     let usage = guard.usage();
                     crate::attempt::StreamFailure::record(&mut usage.failure, &bridge);
