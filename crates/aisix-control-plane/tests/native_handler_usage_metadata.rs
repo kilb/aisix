@@ -104,6 +104,91 @@ impl Provider {
             .collect()
     }
 
+    // 超时仅输出计数、协议属性名和比较结果；不输出 span 内容、id 或任何 header 值。
+    fn otlp_timeout_diagnostics(&self, request_id: &str, phase: &str) -> Value {
+        let payloads = self.state.otlp_payloads.lock().unwrap();
+        let spans: Vec<&Value> = payloads
+            .iter()
+            .flat_map(|payload| {
+                payload
+                    .get("resourceSpans")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+            })
+            .flat_map(|resource| {
+                resource
+                    .get("scopeSpans")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+            })
+            .flat_map(|scope| {
+                scope
+                    .get("spans")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+            })
+            .collect();
+        let has_key = |span: &Value, key: &str| {
+            span.get("attributes")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .any(|field| field.get("key").and_then(Value::as_str) == Some(key))
+        };
+        let payload_keys: std::collections::BTreeSet<_> = payloads
+            .iter()
+            .filter_map(Value::as_object)
+            .flat_map(|object| object.keys())
+            .cloned()
+            .collect();
+        let attribute_keys: std::collections::BTreeSet<_> = spans
+            .iter()
+            .flat_map(|span| {
+                span.get("attributes")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+            })
+            .filter_map(|field| field.get("key").and_then(Value::as_str))
+            .collect();
+        let value_encoding_keys: std::collections::BTreeSet<_> = spans
+            .iter()
+            .flat_map(|span| {
+                span.get("attributes")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+            })
+            .filter_map(|field| field.get("value").and_then(Value::as_object))
+            .flat_map(|object| object.keys())
+            .collect();
+        let distinct_request_ids = spans
+            .iter()
+            .filter_map(|span| otlp_text(span, "aisix.request_id"))
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        let selected_key = "http.request.header.x-metadata-project";
+        json!({
+            "received_payload_count":payloads.len(),
+            "received_span_count":spans.len(),
+            "payload_top_level_keys":payload_keys,
+            "span_attribute_keys":attribute_keys,
+            "attribute_value_encoding_keys":value_encoding_keys,
+            "request_id_key_span_count":spans.iter().filter(|span| has_key(span,"aisix.request_id")).count(),
+            "distinct_request_id_count":distinct_request_ids,
+            "correlated_span_count":spans.iter().filter(|span| otlp_text(span,"aisix.request_id")==Some(request_id)).count(),
+            "selected_header_key_span_count":spans.iter().filter(|span| has_key(span,selected_key)).count(),
+            "selected_header_expected_value_span_count":spans.iter().filter(|span| otlp_header_values(span,selected_key)==Some(vec![phase])).count(),
+            "correlated_selected_header_key_span_count":spans.iter().filter(|span| otlp_text(span,"aisix.request_id")==Some(request_id) && has_key(span,selected_key)).count(),
+            "correlated_selected_header_expected_value_span_count":spans.iter().filter(|span| otlp_text(span,"aisix.request_id")==Some(request_id) && otlp_header_values(span,selected_key)==Some(vec![phase])).count(),
+            "selected_header_expected_value_on_other_request_count":spans.iter().filter(|span| otlp_text(span,"aisix.request_id").is_some_and(|id| id!=request_id) && otlp_header_values(span,selected_key)==Some(vec![phase])).count(),
+            "selected_header_expected_value_without_request_id_count":spans.iter().filter(|span| otlp_text(span,"aisix.request_id").is_none() && otlp_header_values(span,selected_key)==Some(vec![phase])).count()
+        })
+    }
+
     // 只观察真实 handler 触发的正式 exporter HTTP，不直接构造或发送 span。
     async fn exported_request_headers(&self, request_id: &str, phase: &str) {
         assert!(
@@ -143,7 +228,7 @@ impl Provider {
                     .cloned()
                     .collect();
                 if spans.iter().any(|span| {
-                    otlp_text(span, "http.request.header.x-metadata-project") == Some(phase)
+                    otlp_header_values(span, "http.request.header.x-metadata-project") == Some(vec![phase])
                 }) {
                     break;
                 }
@@ -151,7 +236,10 @@ impl Provider {
             }
         })
         .await
-        .expect("the real DP exporter sends the selected nonempty request header to OTLP HTTP");
+        .unwrap_or_else(|_| {
+            panic!("the real DP exporter sends the selected nonempty request header to OTLP HTTP; collector_diagnostics={}",
+                self.otlp_timeout_diagnostics(request_id, phase));
+        });
         // 调用者先关闭两个正式 fanout；检查全部已完成的真实 HTTP payload，覆盖资源属性和无关联 span 的泄漏。
         for payload in self.state.otlp_payloads.lock().unwrap().iter() {
             let wire = payload.to_string();
@@ -197,6 +285,20 @@ fn otlp_text<'a>(span: &'a Value, key: &str) -> Option<&'a str> {
         .find(|field| field.get("key").and_then(Value::as_str) == Some(key))?
         .pointer("/value/stringValue")?
         .as_str()
+}
+
+// HTTP header 的 OTLP 属性是 string[]，单值也必须精确解码为单元素数组。
+// https://opentelemetry.io/docs/specs/semconv/registry/attributes/http/
+fn otlp_header_values<'a>(span: &'a Value, key: &str) -> Option<Vec<&'a str>> {
+    span.get("attributes")?
+        .as_array()?
+        .iter()
+        .find(|field| field.get("key").and_then(Value::as_str) == Some(key))?
+        .pointer("/value/arrayValue/values")?
+        .as_array()?
+        .iter()
+        .map(|value| value.get("stringValue")?.as_str())
+        .collect()
 }
 
 impl Drop for Provider {
@@ -988,10 +1090,43 @@ async fn replay_once(
     assert_eq!(counts, (expected_count, expected_count, expected_total));
 }
 
+// 公开 exporter 诊断只汇总计数，不打印 exporter 名称、地址、配置或 last_error。
+fn otlp_fanout_counter_diagnostics(state: &ProxyState) -> Value {
+    let stats = state.otlp_fan_out.exporter_stats();
+    let queues = state.otlp_fan_out.exporter_queue_depths();
+    let mut totals = [0_u64; 6];
+    for snapshot in stats.values() {
+        for (total, value) in totals.iter_mut().zip([
+            snapshot.sent,
+            snapshot.dropped,
+            snapshot.rejected,
+            snapshot.retries,
+            snapshot.delivered_batches,
+            snapshot.failed_batches,
+        ]) {
+            *total = total.saturating_add(value);
+        }
+    }
+    json!({
+        "exporter_count":stats.len(),"queue_count":queues.len(),
+        "queued_record_count":queues.iter().fold(0_u64,|total,(_,depth)|total.saturating_add(*depth)),
+        "sent":totals[0],"dropped":totals[1],"rejected":totals[2],"retries":totals[3],
+        "delivered_batches":totals[4],"failed_batches":totals[5]
+    })
+}
+
 async fn shutdown_exporters(state: &ProxyState) {
+    eprintln!(
+        "[native-otlp-diagnostics] before_shutdown={}",
+        otlp_fanout_counter_diagnostics(state)
+    );
     tokio::time::timeout(Duration::from_secs(10), state.otlp_fan_out.shutdown())
         .await
         .expect("the real DP exporter flushes and shuts down within the fixture budget");
+    eprintln!(
+        "[native-otlp-diagnostics] after_shutdown={}",
+        otlp_fanout_counter_diagnostics(state)
+    );
 }
 
 async fn stop(stop: watch::Sender<bool>, worker: tokio::task::JoinHandle<()>) {
