@@ -150,6 +150,98 @@ fn alternating_filtered_hash_subsets_do_not_rebuild_warm_rings() {
 }
 
 #[test]
+fn filtered_hash_stable_and_alternating_resolution_probe() {
+    // 记录真实 resolver 的时间和分配；比较固定子集与交错子集，不能只报告后者的收益。
+    let repetitions = std::env::var("AISIX_FILTERED_HASH_BENCH_REPS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(16);
+    for count in [4usize, 8, 128] {
+        for sparse in [false, true] {
+            if sparse && count == 4 {
+                continue;
+            }
+            for alternating in [false, true] {
+                for weighted in [false, true] {
+                    for limit in [Some(0), None] {
+                        let (snapshot, mut model) =
+                            fixture(count, RoutingStrategy::ConsistentHash, limit);
+                        let routing = Arc::make_mut(&mut model).routing.as_mut().unwrap();
+                        for (index, target) in routing.targets.iter_mut().enumerate() {
+                            target.tags = Some(vec![
+                                if sparse && index >= 4 {
+                                    "other"
+                                } else if index % 2 == 0 {
+                                    "eu"
+                                } else {
+                                    "us"
+                                }
+                                .into(),
+                            ]);
+                            if weighted {
+                                target.weight = Some((index % 7 + 1) as u32);
+                            }
+                        }
+                        let registry = RoutingRegistry::new();
+                        let status = crate::ModelRuntimeStatusTracker::new();
+                        let pricing = LivePricingIndex::new();
+                        let tags = [vec!["eu".to_string()], vec!["us".to_string()]];
+                        let invoke = |side: usize| {
+                            resolve_attempt_models(
+                                &registry,
+                                &status,
+                                &pricing,
+                                &snapshot,
+                                "probe-group",
+                                "probe-id",
+                                &model,
+                                RoutingRequest {
+                                    tags: &tags[side],
+                                    api_key_id: "probe-key",
+                                    ..Default::default()
+                                },
+                            )
+                            .unwrap()
+                        };
+                        let survivors = if sparse { 2 } else { count / 2 };
+                        let expected = if limit == Some(0) { 1 } else { survivors };
+                        assert_eq!(invoke(1).len(), expected);
+                        assert_eq!(invoke(0).len(), expected);
+                        let scope = AllocationScope::start();
+                        let measured = invoke(usize::from(alternating));
+                        let allocated = scope.finish();
+                        assert_eq!(measured.len(), expected);
+                        let mut samples = Vec::new();
+                        for _ in 0..7 {
+                            let started = std::time::Instant::now();
+                            let mut resolved = 0;
+                            for request in 0..repetitions {
+                                let side = usize::from(alternating && request % 2 == 1);
+                                resolved += std::hint::black_box(invoke(side)).len();
+                            }
+                            samples
+                                .push(started.elapsed().as_secs_f64() * 1e9 / repetitions as f64);
+                            assert_eq!(resolved, repetitions * expected);
+                        }
+                        eprintln!(
+                            "{}",
+                            json!({
+                                "case":"filtered_hash_resolution", "configured":count,
+                                "survivors":survivors, "alternating":alternating,
+                                "weighted":weighted, "max_fallbacks":limit,
+                                "repetitions_per_sample":repetitions, "samples_ns_per_call":samples,
+                                "allocation_calls":allocated.calls, "allocated_bytes":allocated.bytes,
+                            })
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn affinity_restoration_has_linear_membership_work() {
     // 恢复逐项线性查重会把计数变成约 N²/2；错误地删掉回补则选不到最后的来源。
     for count in [8usize, 64, 128, 256] {
