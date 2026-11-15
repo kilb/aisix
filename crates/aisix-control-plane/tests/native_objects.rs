@@ -2147,3 +2147,238 @@ async fn native_submission_rejects_invalid_input_measurements_before_persistence
         );
     }
 }
+
+// 输入 File 已被消费后，其删除不能越过有效的直接 Batch 父对象隐藏已完成结果。
+#[tokio::test]
+async fn a_completed_batch_result_file_survives_its_deleted_input_file_ancestor() {
+    let cp = TestCp::start()
+        .await
+        .expect("CP_TEST_DATABASE_URL must name the isolated test Postgres server");
+    let (mut body, tenant, member, key) = submission(&cp).await;
+    let model = id_at(&body, "/origin/model_id");
+    support::world::insert_baseline_backdated(
+        cp.db(),
+        model,
+        json!({"default":{"base":{"input":"4","output":"8"}},"batch":{"base":{"input":"2","output":"4"}}}),
+        "2000-01-01T00:00:00Z".parse().expect("an explicit baseline start"),
+    ).await;
+    let dp = cp.issue_dp_client("gw-batch-file-onehop-v1").await;
+    body["kind"] = json!("file");
+    body["operation"] = json!("files");
+    body["asynchronous"] = json!(false);
+    let input = bind_submission(&dp, &body, "file_onehop_input_v1").await;
+    let input_id = id_at(&input, "/record_id");
+    let mut batch_body = body.clone();
+    batch_body["operation_id"] = json!(Uuid::new_v4());
+    batch_body["kind"] = json!("message_batch");
+    batch_body["operation"] = json!("batches");
+    batch_body["asynchronous"] = json!(true);
+    batch_body["input_file_id"] = json!("file_onehop_input_v1");
+    batch_body["parent_id"] = json!(input_id);
+    batch_body["entries"] = json!([{
+        "entry_id":"onehop-entry-v1", "endpoint":"/v1/chat/completions",
+        "requested_model_id":model, "model_id":model,
+        "requested_model":body["requested_model"], "upstream_model":body["upstream_model"]
+    }]);
+    let batch = bind_submission(&dp, &batch_body, "batch_onehop_complete_v1").await;
+    let batch_id = id_at(&batch, "/record_id");
+    let claimed = dp
+        .send(
+            "POST",
+            "/dp/v1/native-objects/claim",
+            Some(json!({
+                "limit":1,"record_id":batch_id,"protocol":"openai","kind":"message_batch"
+            })),
+        )
+        .await;
+    assert_eq!(claimed.status, 200, "claim setup: {claimed:?}");
+    let leases = claimed.body["records"]
+        .as_array()
+        .expect("explicit claimed records");
+    assert_eq!(leases.len(), 1);
+    assert_eq!(leases[0]["record_id"], json!(batch_id));
+    let generation = leases[0]["lease_generation"]
+        .as_i64()
+        .expect("an explicit Batch lease");
+    let completion = json!({
+        "lease":{"record_id":batch_id,"generation":generation},
+        "terminal_status":"completed", "output_file_ids":["file_onehop_result_v1"],
+        "usage":[{"entry_id":"onehop-entry-v1","occurred_at":chrono::Utc::now().to_rfc3339(),
+            "status_code":200,"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}]
+    });
+    for _ in 0..2 {
+        let done = dp
+            .send(
+                "POST",
+                "/dp/v1/native-objects/complete",
+                Some(completion.clone()),
+            )
+            .await;
+        assert_eq!(
+            done.status, 200,
+            "completion and identical replay setup: {done:?}"
+        );
+    }
+    let batch_lookup = json!({"api_key_id":key,"locator":{
+        "protocol":"openai","kind":"message_batch","raw_id":"batch_onehop_complete_v1"
+    }});
+    let file_lookup = json!({"api_key_id":key,"locator":{
+        "protocol":"openai","kind":"file","raw_id":"file_onehop_result_v1"
+    }});
+    let initial_batch = dp
+        .send(
+            "POST",
+            "/dp/v1/native-objects/lookup",
+            Some(batch_lookup.clone()),
+        )
+        .await;
+    assert_eq!(
+        initial_batch.status, 200,
+        "the completed direct Batch is initially readable: {initial_batch:?}"
+    );
+    assert_eq!(initial_batch.body["record"]["record_id"], json!(batch_id));
+    assert_eq!(
+        initial_batch.body["record"]["completed"].as_bool(),
+        Some(true)
+    );
+    let initial_file = dp
+        .send(
+            "POST",
+            "/dp/v1/native-objects/lookup",
+            Some(file_lookup.clone()),
+        )
+        .await;
+    assert_eq!(
+        initial_file.status, 200,
+        "the result File is initially readable: {initial_file:?}"
+    );
+    let file_id = id_at(&initial_file.body, "/record/record_id");
+    assert_eq!(initial_file.body["record"]["parent_id"], json!(batch_id));
+    assert_eq!(initial_file.body["record"]["api_key_id"], json!(key));
+    assert_eq!(initial_file.body["record"]["origin"], body["origin"]);
+    let persisted: (Uuid, Uuid, Option<Uuid>, Option<Uuid>) = sqlx::query_as(
+        "SELECT tenant_id,api_key_id,member_id,parent_id FROM native_objects WHERE id=$1",
+    )
+    .bind(file_id)
+    .fetch_one(cp.db().pool())
+    .await
+    .expect("the real result File owner");
+    assert_eq!(persisted, (tenant, key, Some(member), Some(batch_id)));
+    let admin = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let foreign_member = cp
+        .seed_member(tenant, aisix_control_plane::auth::MemberRole::Member)
+        .await;
+    let foreign_key =
+        Uuid::parse_str(&seed_key(&cp, &admin, tenant, Some(foreign_member.id)).await)
+            .expect("the other member's valid key");
+    let mut foreign_lookup = file_lookup.clone();
+    foreign_lookup["api_key_id"] = json!(foreign_key);
+    let refused = dp
+        .send(
+            "POST",
+            "/dp/v1/native-objects/lookup",
+            Some(foreign_lookup.clone()),
+        )
+        .await;
+    let mut missing = foreign_lookup.clone();
+    missing["locator"]["raw_id"] = json!("file_onehop_unknown_v1");
+    let unknown = dp
+        .send("POST", "/dp/v1/native-objects/lookup", Some(missing))
+        .await;
+    assert_eq!(
+        refused.status, 404,
+        "another ordinary member never owns the result: {refused:?}"
+    );
+    assert_eq!(
+        unknown.status, 404,
+        "the unknown result is also hidden: {unknown:?}"
+    );
+    assert_eq!(refused.body, unknown.body);
+    // 等待真实投递和账本；重复完成不得多记一次用量或扣费。
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let counts: (i64, i64) = sqlx::query_as(
+                "SELECT count(*),count(ledger.event_id) FROM native_terminal_outbox outbox \
+                 LEFT JOIN billing_ledger_cny ledger ON ledger.event_id=outbox.event_id::text \
+                 WHERE outbox.object_id=$1",
+            )
+            .bind(batch_id)
+            .fetch_one(cp.db().pool())
+            .await
+            .expect("the actual outbox and ledger");
+            if counts == (1, 1) {
+                break;
+            }
+            assert!(
+                counts.0 <= 1 && counts.1 <= 1,
+                "completion replay duplicated billing: {counts:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the one real Batch terminal reaches the billing ledger");
+    let removed = dp
+        .send(
+            "POST",
+            "/dp/v1/native-objects/tombstone",
+            Some(json!({
+                "api_key_id":key,"record_id":input_id,"version":input["version"]
+            })),
+        )
+        .await;
+    assert_eq!(removed.status, 200, "input tombstone setup: {removed:?}");
+    let gone = dp.send("POST", "/dp/v1/native-objects/lookup", Some(json!({
+        "api_key_id":key,"locator":{"protocol":"openai","kind":"file","raw_id":"file_onehop_input_v1"}
+    }))).await;
+    assert_eq!(
+        gone.status, 404,
+        "the consumed input was actually deleted: {gone:?}"
+    );
+    let after_batch = dp
+        .send("POST", "/dp/v1/native-objects/lookup", Some(batch_lookup))
+        .await;
+    let after_file = dp
+        .send(
+            "POST",
+            "/dp/v1/native-objects/lookup",
+            Some(file_lookup.clone()),
+        )
+        .await;
+    assert_eq!(after_batch.status, 200,
+        "a completed Batch is its own valid target after its consumed input is deleted: {after_batch:?}; result File: {after_file:?}");
+    assert_eq!(
+        after_file.status, 200,
+        "the result File depends on the direct Batch, not the input File above it: {after_file:?}"
+    );
+    assert_eq!(after_file.body["record"], initial_file.body["record"]);
+    let restarted = cp.restart().await;
+    let reader = restarted
+        .issue_dp_client("gw-batch-file-onehop-restarted-v1")
+        .await;
+    let restored = reader
+        .send("POST", "/dp/v1/native-objects/lookup", Some(file_lookup))
+        .await;
+    assert_eq!(
+        restored.status, 200,
+        "the same one-hop result survives restart: {restored:?}"
+    );
+    assert_eq!(restored.body["record"], initial_file.body["record"]);
+    let foreign = reader
+        .send("POST", "/dp/v1/native-objects/lookup", Some(foreign_lookup))
+        .await;
+    assert_eq!(
+        foreign.status, 404,
+        "restart cannot widen ownership: {foreign:?}"
+    );
+    let final_counts: (i64, i64) = sqlx::query_as(
+        "SELECT count(*),count(ledger.event_id) FROM native_terminal_outbox outbox \
+         LEFT JOIN billing_ledger_cny ledger ON ledger.event_id=outbox.event_id::text \
+         WHERE outbox.object_id=$1",
+    )
+    .bind(batch_id)
+    .fetch_one(restarted.db().pool())
+    .await
+    .expect("the persistent once-only billing count");
+    assert_eq!(final_counts, (1, 1));
+}
