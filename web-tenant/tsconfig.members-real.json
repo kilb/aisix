@@ -1,0 +1,7 @@
+{
+  "extends": "./tsconfig.json",
+  "include": [
+    "e2e-real/member-management.spec.ts",
+    "playwright.members-real.config.ts"
+  ]
+}

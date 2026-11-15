@@ -11,9 +11,10 @@ import {
   type SessionMember,
   type TenantStatus,
 } from "./lib/api";
-import { memberUsage, type MemberUsage, type MemberUsageSummary } from "./lib/memberUsage";
+import { memberUsage, type MemberUsageSummary } from "./lib/memberUsage";
+import { memberChargeLabel } from "./lib/memberUsagePresentation";
 import { fmtMicroCny } from "./lib/money";
-import { fmtBeijing, budgetPeriodRange } from "./lib/time";
+import { fmtBeijing } from "./lib/time";
 import { useRecordTable } from "./lib/recordTable";
 import { RecordTablePager, RecordTableToolbar } from "./ui/RecordTable";
 import { formMessageFor, messageFor } from "./lib/errors";
@@ -24,12 +25,12 @@ import { DataTable, Loading } from "./ui/DataTable";
 import { EmptyState } from "./ui/EmptyState";
 import { Field } from "./ui/Field";
 import { Lamp } from "./ui/Lamp";
-import { TwoStep } from "./ui/TwoStep";
+import { Select } from "./ui/Select";
 import { when } from "./Keys";
 import { ROLE_LABEL } from "./Org";
 import { BentoGrid, Card, CardFooter, CardHeader, CardMessage, ChartSkeleton, Metric, MetricSkeleton, PageHeader, span } from "./components/page";
-import { BudgetProgress, RankBars } from "./components/charts";
-import { exactRatio, formatCount, normalizeExactValues } from "./lib/chartFormat";
+import { RankBars } from "./components/charts";
+import { formatCount, normalizeExactValues } from "./lib/chartFormat";
 import { rankCurrentMemberCosts } from "./lib/memberBento";
 import { CreateMemberDialog } from "./CreateMemberDialog";
 
@@ -39,63 +40,12 @@ function failure(e: unknown): string {
   return e instanceof ApiError ? messageFor(e) : String(e);
 }
 
-const QUANTITY_LABEL: Record<string, string> = {
-  input: "输入", output: "输出", cache_read: "缓存读", cache_write: "缓存写",
-  cache_write_1h: "1 小时缓存写", reasoning: "推理", audio_input: "音频输入",
-  audio_output: "音频输出", image_input: "图片输入", image_output: "图片输出", web_search: "联网搜索",
-};
-
-function UsageCell({ usage }: { usage: MemberUsage }) {
-  const incomplete = usage.unknown_quantity_requests > 0;
-  const quantities = Object.entries(usage.quantities);
-  const tokens = quantities
-    .filter(([dimension]) => dimension in QUANTITY_LABEL && dimension !== "web_search")
-    .reduce((total, [, quantity]) => total + BigInt(quantity), 0n);
-  return (
-    <>
-      <span className="tabular">{formatCount(usage.requests)} 次调用</span>
-      <span className="cell-note tabular">
-        {incomplete && quantities.length === 0 ? "计费用量未知" : `${incomplete ? "已知" : ""}计费用量 ${formatCount(tokens)} token`}
-      </span>
-      <span className="cell-note tabular">已计费 {fmtMicroCny(usage.charged_micro_cny)}</span>
-      {quantities.map(([dimension, quantity]) => (
-        <span className="cell-note tabular" key={dimension}>
-          {QUANTITY_LABEL[dimension] ?? dimension} {formatCount(quantity)} {dimension === "web_search" ? "次" : dimension in QUANTITY_LABEL ? "token" : ""}
-        </span>
-      ))}
-      {incomplete && <span className="cell-note hint">{formatCount(usage.unknown_quantity_requests)} 次用量明细未记录</span>}
-      {usage.unpriced_requests > 0 && <span className="cell-note hint">{formatCount(usage.unpriced_requests)} 次未计价，费用尚未包含</span>}
-      {usage.pending_requests > usage.unpriced_requests && (
-        <span className="cell-note hint">另有 {formatCount(usage.pending_requests - usage.unpriced_requests)} 次待计价</span>
-      )}
-      {usage.estimated_requests > 0 && <span className="cell-note hint">{formatCount(usage.estimated_requests)} 次含估算用量</span>}
-    </>
-  );
-}
-
 function BudgetCell({ budgets }: { budgets: Budget[] }) {
-  if (budgets.length === 0) return <span className="hint">未设置成员额度；仍受组织及密钥限制</span>;
+  if (budgets.length === 0) return <span className="hint">不限制</span>;
   const period = { day: "每日", week: "每周", month: "每月" };
-  return (
-    <div className="grid gap-3">
-      {budgets.map((budget) => (
-        <div key={budget.id}>
-          <span>{budget.kind === "cumulative" ? "累计" : period[budget.period ?? "month"]}额度</span>
-          <span className="cell-note tabular">限额 {fmtMicroCny(budget.limit_micro_cny)}</span>
-          <span className="cell-note tabular">本期已用 {fmtMicroCny(budget.spent_micro_cny)}</span>
-          <span className="cell-note tabular">剩余 {fmtMicroCny(budget.remaining_micro_cny)}{budget.exhausted && "（已用尽）"}</span>
-          <BudgetProgress
-            className="mt-2"
-            value={exactRatio(budget.spent_micro_cny, budget.limit_micro_cny)}
-            accessibleLabel={`该成员额度本期已用 ${fmtMicroCny(budget.spent_micro_cny)}，限额 ${fmtMicroCny(budget.limit_micro_cny)}`}
-          />
-          <span className="cell-note hint">
-            {budget.kind === "cumulative" ? `累计自 ${fmtBeijing(budget.counted_from ?? budget.created_at)}` : budget.period && budget.period_start ? budgetPeriodRange(budget.period_start, budget.period) : "本期起止未知"}
-          </span>
-        </div>
-      ))}
-    </div>
-  );
+  return <div className="grid gap-1">{budgets.map((budget) => (
+    <span className="tabular" key={budget.id}>{budget.kind === "cumulative" ? "累计" : period[budget.period ?? "month"]} {fmtMicroCny(budget.limit_micro_cny)}</span>
+  ))}</div>;
 }
 
 /**
@@ -110,27 +60,18 @@ function inviteLink(issued: IssuedInvite): string {
   );
 }
 
-/**
- * The organisation's members and open invitations, for an owner or an
- * admin. Only an owner makes, changes or removes an owner, so an admin is
- * offered neither the role nor an owner's row. While the organisation is
- * suspended the page offers removal only.
- *
- * `onSelfChanged` re-reads the session: after a change to the caller's own
- * role, and after a refusal that says the organisation is no longer active,
- * since what the portal shows them is the control plane's to say.
- * `onLeft` follows the caller removing themself.
- */
+/** 成员列表只列摘要；权限、用量和额度管理在独立成员详情页。 */
 export function Members({
   member,
   status,
   onSelfChanged,
-  onLeft,
+  onOpenMember,
 }: {
   member: SessionMember;
   status: TenantStatus;
   onSelfChanged: () => void;
   onLeft: () => void;
+  onOpenMember?: (id: string) => void;
 }) {
   const active = status === "active";
   const isOwner = member.role === "owner";
@@ -153,10 +94,8 @@ export function Members({
   const [actionErr, setActionErr] = useState<string | null>(null);
   const [createdNotice, setCreatedNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
-  // Which action on that member or invitation is in flight.
-  const [acting, setActing] = useState<"role" | "remove" | "revoke" | null>(null);
-  /** A role picked for a member and not yet confirmed. */
-  const [drafts, setDrafts] = useState<Record<string, MemberRole>>({});
+  // 邀请撤销请求进行中时，保留按钮反馈。
+  const [acting, setActing] = useState<"revoke" | null>(null);
   const [roleFilter, setRoleFilter] = useState("");
   const [statusFilter, setStatusFilter] = useState("");
   const [inviteRole, setInviteRole] = useState("");
@@ -224,22 +163,12 @@ export function Members({
     return () => { loadId.current += 1; };
   }, [load, member.role]);
 
-  /**
-   * One change, keyed `key` while it runs. On success `done`, when given,
-   * takes over from reading the lists again: a change to the caller's own
-   * row can leave them unable to read them. Otherwise, and on any refusal,
-   * the lists are read again.
-   */
-  async function act(key: string, what: "role" | "remove" | "revoke", change: () => Promise<unknown>, done?: () => void) {
+  async function act(key: string, what: "revoke", change: () => Promise<unknown>) {
     setBusy(key);
     setActing(what);
     setActionErr(null);
     try {
       await change();
-      if (done) {
-        done();
-        return;
-      }
     } catch (e) {
       if (e instanceof ApiError && e.code === "tenant_not_active") onSelfChanged();
       setActionErr(failure(e));
@@ -249,13 +178,6 @@ export function Members({
     }
     await load();
   }
-
-  function dropDraft(id: string) {
-    setDrafts(({ [id]: _, ...rest }) => rest);
-  }
-
-  /** Whether the caller may change or remove `m`. */
-  const manages = (m: Member) => isOwner || m.role !== "owner";
 
   return (
     <>
@@ -311,10 +233,10 @@ export function Members({
           </CardFooter>
         </Card>}
         <Card className={`${span.d12} tenant-members-list`}>
-          <CardHeader number={active ? 3 : 2} title="组织成员" description={active ? "本月用量按 UTC+8 月初至当前时间统计；成员额度按各自周期计算。" : undefined} />
+          <CardHeader number={active ? 3 : 2} title="组织成员" description={active ? "本月费用按 UTC+8 月初至当前时间统计；点击成员查看用量明细并管理权限和额度。" : undefined} />
           <RecordTableToolbar search={{ value: memberTable.query, onChange: memberTable.setQuery, label: "搜索成员", placeholder: "显示名或邮箱" }}>
-            <Field label="成员角色"><select value={roleFilter} onChange={(e) => setRoleFilter(e.target.value)}><option value="">全部角色</option>{(["owner", "admin", "member", "billing"] as const).map((role) => <option key={role} value={role}>{ROLE_LABEL[role]}</option>)}</select></Field>
-            <Field label="成员状态"><select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}><option value="">全部状态</option><option value="active">正常</option><option value="disabled">已被平台停用</option></select></Field>
+            <Field label="成员角色"><Select size="compact" value={roleFilter} onValueChange={setRoleFilter} options={[{ value: "", label: "全部角色" }, ...(["owner", "admin", "member", "billing"] as const).map((role) => ({ value: role, label: ROLE_LABEL[role] }))]} /></Field>
+            <Field label="成员状态"><Select size="compact" value={statusFilter} onValueChange={setStatusFilter} options={[{ value: "", label: "全部状态" }, { value: "active", label: "正常" }, { value: "disabled", label: "已被平台停用" }]} /></Field>
           </RecordTableToolbar>
           {!active && <div className="note crit">组织已被停用；这里只能移除成员。</div>}
           {active && usageErr && <div className="note crit" role="alert">成员用量读取失败：{usageErr}</div>}
@@ -339,7 +261,7 @@ export function Members({
                   <th>邮箱</th>
                   <th>角色</th>
                   <th>状态</th>
-                  <th>本月用量</th>
+                  <th>本月费用</th>
                   <th>成员额度</th>
                   <th>
                     <span className="vh">操作</span>
@@ -349,15 +271,16 @@ export function Members({
               <tbody>
                 {memberTable.rows.map((m) => {
                   const self = m.id === member.id;
-                  const draft = drafts[m.id];
                   const memberUsageRow = usageByMember.get(m.id);
                   return (
                     <tr key={m.id}>
                       <td data-label="显示名">
-                        <span className="trunc" title={m.display_name ?? undefined}>
-                          {m.display_name ?? "—"}
+                        <a className="trunc font-medium underline-offset-4 hover:underline" href={`#members?member=${encodeURIComponent(m.id)}`} aria-label={`${m.email} 的成员详情`} onClick={(event) => {
+                          if (onOpenMember) { event.preventDefault(); onOpenMember(m.id); }
+                        }} title={m.display_name ?? m.email}>
+                          {m.display_name ?? m.email}
                           {self && <span className="self">（我）</span>}
-                        </span>
+                        </a>
                       </td>
                       <td data-label="邮箱">
                         <span className="trunc" style={{ "--trunc": "240px" } as CSSProperties} title={m.email}>
@@ -365,77 +288,25 @@ export function Members({
                         </span>
                       </td>
                       <td data-label="角色">
-                        {active && manages(m) ? (
-                          <span className="acts">
-                            <select
-                              aria-label={`${m.email} 的角色`}
-                              value={draft ?? m.role}
-                              onChange={(e) => setDrafts({ ...drafts, [m.id]: e.target.value as MemberRole })}
-                            >
-                              {roles.map((r) => (
-                                <option key={r} value={r}>
-                                  {ROLE_LABEL[r]}
-                                </option>
-                              ))}
-                            </select>
-                            {/* A role change takes a second step: one that takes access away is destructive. */}
-                            {draft && draft !== m.role && (
-                              <span className="role-confirm is-in">
-                                {draft === "billing" && (
-                                  <span className="hint warn-inline">账单角色不持有密钥，该成员的密钥将停止工作</span>
-                                )}
-                                <Button
-                                  kind="danger"
-                                  size="sm"
-                                  disabled={busy === m.id}
-                                  busy={busy === m.id && acting === "role"}
-                                  busyLabel="确认更改角色"
-                                  onClick={() =>
-                                    // The step stays, busy, until the change is answered.
-                                    void act(
-                                      m.id,
-                                      "role",
-                                      () => memberApi.setRole(m.id, draft),
-                                      self ? onSelfChanged : undefined,
-                                    ).finally(() => dropDraft(m.id))
-                                  }
-                                >
-                                  确认更改角色
-                                </Button>
-                                <Button size="sm" disabled={busy === m.id} onClick={() => dropDraft(m.id)}>
-                                  取消
-                                </Button>
-                              </span>
-                            )}
-                          </span>
-                        ) : (
-                          (ROLE_LABEL[m.role] ?? m.role)
-                        )}
+                        {ROLE_LABEL[m.role] ?? m.role}
                       </td>
                       <td data-label="状态">
                         <Lamp state={m.disabled ? "disabled" : "applied"}>{m.disabled ? "已被平台停用" : "正常"}</Lamp>
                       </td>
-                      <td data-label="本月用量">
+                      <td data-label="本月费用">
                         {!active ? <span className="hint">组织未启用，无法读取用量</span> : usageErr ? <span className="hint">用量读取失败</span>
                           : usage === null ? <span className="hint">用量载入中…</span>
-                            : memberUsageRow ? <UsageCell usage={memberUsageRow} /> : <span className="hint">暂无用量数据</span>}
+                            : <span className="tabular">{memberChargeLabel(memberUsageRow)}</span>}
                       </td>
                       <td data-label="成员额度">
                         {!active ? <span className="hint">组织未启用，无法读取额度</span> : budgetsErr ? <span className="hint">额度读取失败</span>
                           : budgets === null ? <span className="hint">额度载入中…</span>
                             : <BudgetCell budgets={budgetsByMember.get(m.id) ?? []} />}
                       </td>
-                      <td className="right [&_.btn]:h-auto [&_.btn]:min-h-11 [&_.btn]:whitespace-normal [&_.btn]:px-2 [&_.btn]:py-2" data-label="操作">
-                        {manages(m) && (
-                          <TwoStep
-                            label="移除"
-                            size="sm"
-                            warning="该成员的所有密钥会被吊销"
-                            disabled={busy === m.id}
-                            busy={busy === m.id && acting === "remove"}
-                            onConfirm={() => void act(m.id, "remove", () => memberApi.remove(m.id), self ? onLeft : undefined)}
-                          />
-                        )}
+                      <td className="right" data-label="操作">
+                        <a className="inline-flex min-h-11 items-center whitespace-nowrap text-primary underline-offset-4 hover:underline" href={`#members?member=${encodeURIComponent(m.id)}`} onClick={(event) => {
+                          if (onOpenMember) { event.preventDefault(); onOpenMember(m.id); }
+                        }}>查看详情</a>
                       </td>
                     </tr>
                   );
@@ -455,7 +326,7 @@ export function Members({
               </div>
             )}
             <RecordTableToolbar search={{ value: inviteTable.query, onChange: inviteTable.setQuery, label: "搜索邀请", placeholder: "邮箱或邀请人" }}>
-              <Field label="邀请角色"><select value={inviteRole} onChange={(e) => setInviteRole(e.target.value)}><option value="">全部角色</option>{roles.map((role) => <option key={role} value={role}>{ROLE_LABEL[role]}</option>)}</select></Field>
+              <Field label="邀请角色"><Select size="compact" value={inviteRole} onValueChange={setInviteRole} options={[{ value: "", label: "全部角色" }, ...roles.map((role) => ({ value: role, label: ROLE_LABEL[role] }))]} /></Field>
             </RecordTableToolbar>
             {invites === null ? (
               !invitesErr && <Loading />
@@ -573,13 +444,7 @@ function InviteForm({
           <input type="email" required value={email} onChange={(e) => setEmail(e.target.value)} />
         </Field>
         <Field label="角色">
-          <select value={role} onChange={(e) => setRole(e.target.value as MemberRole)}>
-            {roles.map((r) => (
-              <option key={r} value={r}>
-                {ROLE_LABEL[r]}
-              </option>
-            ))}
-          </select>
+          <Select value={role} onValueChange={(value) => setRole(value as MemberRole)} disabled={busy} options={roles.map((value) => ({ value, label: ROLE_LABEL[value] }))} />
         </Field>
         {err && (
           <div className="note crit col-span-full" role="alert">

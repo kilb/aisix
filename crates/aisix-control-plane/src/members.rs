@@ -926,6 +926,68 @@ pub async fn change_password(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResetPassword {
+    new_password: String,
+}
+
+/// 管理员重置同组织其他成员的密码；本人仍通过旧密码验证的改密接口。
+/// 更新成员行后再撤销全部会话，沿用登录的行锁校验，避免旧密码登录竞态。
+pub async fn reset_password(
+    auth: MemberAuth,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    ApiJson(req): ApiJson<ResetPassword>,
+) -> Result<Response, ApiError> {
+    auth.require_active()?;
+    auth.require(&[MemberRole::Owner, MemberRole::Admin])?;
+    let id = parse_id(&id)?;
+    if id == auth.id {
+        return Err(ApiError::forbidden());
+    }
+    if !password::long_enough(&req.new_password) {
+        return Err(ApiError::validation(vec![password_too_short(
+            "/new_password",
+        )]));
+    }
+    let hash = state.passwords.hash(&req.new_password).await?;
+    state
+        .db
+        .tx(move |conn| {
+            async move {
+                let auth =
+                    current(&mut *conn, &auth, &[MemberRole::Owner, MemberRole::Admin]).await?;
+                let target = live_member(&mut *conn, auth.tenant_id, id).await?;
+                if target.role == MemberRole::Owner && auth.role != MemberRole::Owner {
+                    return Err(ApiError::forbidden());
+                }
+                sqlx::query("UPDATE members SET password_hash = $2 WHERE id = $1")
+                    .bind(id)
+                    .bind(&hash)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(DbError::from)?;
+                session::revoke_all(&mut *conn, Principal::Member(id), None).await?;
+                audit::record(
+                    conn,
+                    member_entry(
+                        member_actor(&auth),
+                        "member.password_reset",
+                        auth.tenant_id,
+                        id,
+                        json!({}),
+                    ),
+                )
+                .await?;
+                Ok::<_, ApiError>(())
+            }
+            .boxed()
+        })
+        .await?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
 /// Who issued an invitation.
 #[derive(Clone, Copy)]
 enum Inviter<'a> {

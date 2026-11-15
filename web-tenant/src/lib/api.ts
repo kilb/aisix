@@ -377,6 +377,10 @@ export const members = {
   async setRole(id: string, role: MemberRole): Promise<Member> {
     return (await call<Member>("PATCH", `/members/${at(id)}`, { role })).data;
   },
+  /** 管理员重置其他成员的密码，同时结束该成员的登录会话。 */
+  async resetPassword(id: string, newPassword: string): Promise<void> {
+    await call<null>("POST", `/members/${at(id)}/password`, { new_password: newPassword });
+  },
   /** Removes the member and revokes every key of theirs. */
   async remove(id: string): Promise<void> {
     await call<null>("DELETE", `/members/${at(id)}`);
