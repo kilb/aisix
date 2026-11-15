@@ -110,6 +110,8 @@ struct SlotKey {
 pub struct OutputCollector {
     wire: OutputWire,
     cap: usize,
+    // 与 slots 中所有内容的字节数保持一致，避免每次准入遍历已有片段。
+    captured_bytes: usize,
     slots: BTreeMap<SlotKey, Part>,
     /// Chat assigns slots in arrival order: a tool call keeps its own by
     /// index, and text or reasoning opens a new one whenever the kind
@@ -129,6 +131,7 @@ impl OutputCollector {
         Self {
             wire,
             cap,
+            captured_bytes: 0,
             slots: BTreeMap::new(),
             next_sub: 0,
             chat_tools: BTreeMap::new(),
@@ -175,17 +178,13 @@ impl OutputCollector {
         }
     }
 
-    fn captured_bytes(&self) -> usize {
-        self.slots.values().map(Part::len).sum()
-    }
-
     /// Room left under the cap for `len` more bytes; past it the capture
     /// is marked cut and stops growing.
     fn admit(&mut self, len: usize) -> bool {
         if self.truncated {
             return false;
         }
-        if self.captured_bytes() + len > self.cap {
+        if self.captured_bytes + len > self.cap {
             self.truncated = true;
             return false;
         }
@@ -200,15 +199,21 @@ impl OutputCollector {
             Part::Text(s) | Part::Reasoning(s) => s.push_str(text),
             Part::ToolCall { arguments, .. } => arguments.push_str(text),
         }
+        self.captured_bytes += text.len();
     }
 
     fn put(&mut self, key: SlotKey, part: Part) {
+        if self.truncated {
+            return;
+        }
         let previous = self.slots.get(&key).map_or(0, Part::len);
-        if self.truncated || self.captured_bytes() - previous + part.len() > self.cap {
+        let next = self.captured_bytes - previous + part.len();
+        if next > self.cap {
             self.truncated = true;
             return;
         }
         self.slots.insert(key, part);
+        self.captured_bytes = next;
     }
 
     fn observe_body(&mut self, body: &Value) {
@@ -329,10 +334,14 @@ impl OutputCollector {
             }) = self.slots.get_mut(&key)
             {
                 if let Some(id) = id.filter(|id| !id.is_empty()) {
+                    if slot_id.is_none() {
+                        self.captured_bytes += id.len();
+                    }
                     slot_id.get_or_insert_with(|| id.to_string());
                 }
                 if let Some(name) = name.filter(|n| !n.is_empty()) {
                     if slot_name.is_empty() {
+                        self.captured_bytes += name.len();
                         slot_name.push_str(name);
                     }
                 }
@@ -422,6 +431,7 @@ impl OutputCollector {
                 if let Some(text) = fragment.and_then(Value::as_str) {
                     if self.placeholder_args.remove(&key) {
                         if let Some(Part::ToolCall { arguments, .. }) = self.slots.get_mut(&key) {
+                            self.captured_bytes -= arguments.len();
                             arguments.clear();
                         }
                     }
@@ -513,7 +523,15 @@ impl OutputCollector {
             // deltas assembled for it.
             Some("response.output_item.done") => {
                 if let Some(item) = event.get("item") {
-                    self.slots.retain(|k, _| k.position != output_index);
+                    let captured_bytes = &mut self.captured_bytes;
+                    self.slots.retain(|k, part| {
+                        if k.position == output_index {
+                            *captured_bytes -= part.len();
+                            false
+                        } else {
+                            true
+                        }
+                    });
                     self.observe_responses_item(output_index, item);
                 }
             }
