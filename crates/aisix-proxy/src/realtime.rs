@@ -2204,14 +2204,7 @@ async fn run_session(
                 .or_else(|| renewal.as_ref().and_then(|renewal| renewal.refusal()))
                 .or_else(|| meter.refusal());
             if let Some(error) = failure {
-                let frame = serde_json::json!({ "type": "error", "error": error.envelope().error });
-                let _ = client_tx.send(AxMessage::Text(frame.to_string())).await;
-                let _ = client_tx
-                    .send(AxMessage::Close(Some(CloseFrame {
-                        code: 1008,
-                        reason: "session authorization".into(),
-                    })))
-                    .await;
+                reject_session_work(&mut client_tx, &error).await;
                 close_status = error.status().as_u16();
                 session_error = Some(error);
                 break;
@@ -2337,6 +2330,17 @@ async fn run_session(
                             break;
                         }
                     }
+                    // 前置配置或内容审核可能等待到租约结束；真正派发前再作本地复查。
+                    if let Some(error) = renewal
+                        .as_ref()
+                        .and_then(|renewal| renewal.refusal())
+                        .or_else(|| meter.refusal())
+                    {
+                        reject_session_work(&mut client_tx, &error).await;
+                        close_status = error.status().as_u16();
+                        session_error = Some(error);
+                        break;
+                    }
                     let text = restamp_session_model_in(text, &requested_model, &upstream_model);
                     io.track_request(text.as_bytes());
                     if up_tx.send(TgMessage::Text(text)).await.is_err() {
@@ -2355,6 +2359,17 @@ async fn run_session(
                             .await;
                         close_status = 400;
                         session_error = Some(refusal);
+                        break;
+                    }
+                    // 前置配置或内容审核可能等待到租约结束；真正派发前再作本地复查。
+                    if let Some(error) = renewal
+                        .as_ref()
+                        .and_then(|renewal| renewal.refusal())
+                        .or_else(|| meter.refusal())
+                    {
+                        reject_session_work(&mut client_tx, &error).await;
+                        close_status = error.status().as_u16();
+                        session_error = Some(error);
                         break;
                     }
                     io.track_request(&b);
@@ -3010,6 +3025,20 @@ where
             let _ = tokio::time::timeout(self.bound, self.tx.close()).await;
         }
     }
+}
+
+async fn reject_session_work<S>(client: &mut ClientSink<S>, error: &ProxyError)
+where
+    S: futures::Sink<AxMessage> + Unpin,
+{
+    let frame = serde_json::json!({ "type": "error", "error": error.envelope().error });
+    let _ = client.send(AxMessage::Text(frame.to_string())).await;
+    let _ = client
+        .send(AxMessage::Close(Some(CloseFrame {
+            code: 1008,
+            reason: "session authorization".into(),
+        })))
+        .await;
 }
 
 /// tungstenite (under both the upstream client and axum's server side)
