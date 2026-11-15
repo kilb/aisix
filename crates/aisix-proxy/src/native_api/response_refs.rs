@@ -93,3 +93,7 @@ pub(crate) async fn admit_affinity(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "response_refs_perf_tests.rs"]
+mod perf_tests;
