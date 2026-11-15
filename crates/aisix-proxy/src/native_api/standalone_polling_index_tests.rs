@@ -55,6 +55,7 @@ async fn index_names(store: &StandaloneNativeStore) -> Vec<String> {
 async fn plans(store: &StandaloneNativeStore) -> (Vec<String>, Vec<String>) {
     let query = format!("EXPLAIN QUERY PLAN {CLAIM_SQL}");
     let claim = sqlx::query(&query)
+        .persistent(false)
         .bind(now())
         .bind(now())
         .bind(None::<String>)
@@ -69,6 +70,7 @@ async fn plans(store: &StandaloneNativeStore) -> (Vec<String>, Vec<String>) {
         .unwrap();
     let query = format!("EXPLAIN QUERY PLAN {DELIVERY_SQL}");
     let delivery = sqlx::query(&query)
+        .persistent(false)
         .bind(now())
         .bind(16)
         .fetch_all(&store.pool)
