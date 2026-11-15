@@ -2308,8 +2308,8 @@ pub(crate) fn resolve_attempt_models(
         ));
     }
     let mut resolved: Vec<AttemptModel> = indices
-        .into_iter()
-        .map(|index| attempts[index].clone())
+        .iter()
+        .map(|index| attempts[*index].clone())
         .collect();
     // 指标策略先取完整候选下标，再按解析后的模型信号排序并限制尝试预算。
     // 排名后稳定按优先级分层，保留同层指标顺序。
@@ -2324,7 +2324,7 @@ pub(crate) fn resolve_attempt_models(
         resolved.sort_by_key(|a| std::cmp::Reverse(a.priority));
     }
     if let Some(origin) = req.context_origin {
-        resolved = pin_context_origin(snapshot, runtime_status, &available, resolved, origin);
+        resolved = pin_context_origin(snapshot, runtime_status, &attempts, &indices, resolved, origin);
         tracing::debug!(
             virtual_model = %virtual_name,
             origin,
@@ -2342,36 +2342,47 @@ pub(crate) fn resolve_attempt_models(
 /// strategy's order. Targets the strategy left out of `resolved` (its
 /// `max_fallbacks` cut) are brought back behind the ones it ordered, since
 /// the pinned order can push those out and the cut is applied again after
-/// this. Only targets that survived the filters are considered — `targets`
+/// this. Only targets that survived the filters are considered — `attempts`
 /// is already that set. When every target left is cooling, a boundary member
 /// goes behind the others, so it cannot spend the `max_fallbacks` budget
 /// ahead of one that can serve whatever it is sent.
 fn pin_context_origin(
     snapshot: &AisixSnapshot,
     runtime_status: &crate::ModelRuntimeStatusTracker,
-    targets: &[RoutingTarget],
+    attempts: &[AttemptModel],
+    selected: &[usize],
     resolved: Vec<AttemptModel>,
     origin: &str,
 ) -> Vec<AttemptModel> {
     let boundary = crate::responses_affinity::Boundary::of(snapshot, origin);
     let mut candidates = resolved;
-    for t in targets {
-        let Some(entry) = snapshot.models.get_by_name(&t.model) else {
-            continue;
+    if selected.len() < attempts.len() {
+        // 复用策略下标；小组用整数位图，大组才分配，且不再按名字二次解析。
+        let mut bits = 0u64;
+        let mut larger = if attempts.len() > u64::BITS as usize {
+            vec![false; attempts.len()]
+        } else {
+            Vec::new()
         };
-        if candidates.iter().any(|a| {
+        for &index in selected {
+            if larger.is_empty() {
+                bits |= 1u64 << index;
+            } else {
+                larger[index] = true;
+            }
+        }
+        for (index, attempt) in attempts.iter().enumerate() {
             #[cfg(test)]
             performance_regression_tests::note_affinity_probe();
-            a.id == entry.id
-        }) {
-            continue;
+            let present = if larger.is_empty() {
+                bits & (1u64 << index) != 0
+            } else {
+                larger[index]
+            };
+            if !present {
+                candidates.push(attempt.clone());
+            }
         }
-        candidates.push(AttemptModel {
-            id: entry.id.clone(),
-            model: entry.value.clone(),
-            priority: t.priority_or_default(),
-            weight: t.weight_or_default(),
-        });
     }
     let (mut inside, outside): (Vec<_>, Vec<_>) = candidates
         .into_iter()
