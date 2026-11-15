@@ -48,8 +48,10 @@ async fn request_timing_records_slow_json_rejections_across_typed_families() {
         let _ = response.bytes().await.unwrap();
         let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
-            .unwrap()
-            .unwrap();
+            .unwrap_or_else(|error| {
+                panic!("{endpoint}: HTTP 400 已返回但终态 UsageEvent 未到达：{error}")
+            })
+            .unwrap_or_else(|| panic!("{endpoint}: UsageEvent 接收通道已关闭"));
         let wire = serde_json::to_value(event).unwrap();
         let timing = wire
             .get("request_timing")
