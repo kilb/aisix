@@ -118,7 +118,15 @@ impl RoutingRegistry {
             let mut fingerprint = FNV_OFFSET_BASIS;
             for (declaration, &index) in configured.iter().enumerate() {
                 let target = &routing.targets[index];
-                let name = target.model_ref(snapshot);
+                // 持有当前快照条目并借用名称；热环查询不为每个 ID 声明复制字符串。
+                let resolved = target
+                    .model_id
+                    .as_deref()
+                    .and_then(|id| snapshot.models.get_by_id(id));
+                let name = resolved
+                    .as_ref()
+                    .map(|entry| entry.value.display_name.as_str())
+                    .unwrap_or_else(|| target.model_id.as_deref().unwrap_or(target.model.as_str()));
                 fingerprint = fnv1a_extend(fingerprint, name.as_bytes());
                 fingerprint = fnv1a_extend(fingerprint, &[0, 0]);
                 fingerprint = fnv1a_extend(fingerprint, &target.weight_or_default().to_le_bytes());
