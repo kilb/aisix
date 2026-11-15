@@ -546,12 +546,6 @@ async fn inference_metrics_follow_the_operation_on_shared_and_management_paths(
             "/v1/responses/:id/input_items",
             false,
         ),
-        (
-            "POST",
-            "/v1/images/variations",
-            "/v1/images/variations",
-            true,
-        ),
         ("POST", "/v1/moderations", "/v1/moderations", true),
         (
             "POST",

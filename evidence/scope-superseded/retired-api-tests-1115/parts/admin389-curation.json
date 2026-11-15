@@ -1,0 +1,123 @@
+{
+  "schema": "retired-api-tests-1115/admin389-curation/v1",
+  "base_commit": "5d28eed97fdab928661b28053b46e944a8d38365",
+  "path": "crates/aisix-admin/tests/native_anthropic_route_metrics.rs",
+  "original_copy": "evidence/scope-superseded/retired-api-tests-1115/originals/crates/aisix-admin/tests/native_anthropic_route_metrics.rs",
+  "original_git_blob": "3cafc0f865cdb790006f51702aa21e415ea12bc4",
+  "original_bytes": 26887,
+  "original_sha256": "7fd17013b622fd455eebe7b295da920c936e10c99692a224a5a440716de16c19",
+  "curated_bytes": 26754,
+  "curated_sha256": "303ed5d578e2987617292f8e4e4eb42a0cb95cd1730f4ca1c83f10e6c896b579",
+  "authorization": "ROOT explicitly approved this single retired image-variations row under the user-approved light scope; no assertion or route restoration authorized.",
+  "operation": {
+    "action": "archive_original_then_remove_one_retired_matrix_tuple",
+    "method": "POST",
+    "endpoint": "/v1/images/variations",
+    "inference": true,
+    "original_lines": [
+      549,
+      554
+    ],
+    "removed_lines": 6,
+    "removed_bytes": 133,
+    "removed_sha256": "d54b86dd8f3760d73f73ead2eb9aed7a62dd6498c17b55f091a1156f4eb0ee8d",
+    "reviewed_patch_payload_sha256": "f889c4062f9d8600d4996c61fb4298debb3f23cb620c3549399d2915cac0ee3c",
+    "reviewed_patch_payload_source": "External ROOT-reviewed resume-1115/light-supported-source-curation/admin-389-proposal/remove-retired-variations-row.patch; difflib unified payload, not git diff index headers",
+    "applied_source_git_diff_sha256": "aa7ddfb2011a71e737861877a35dee930b4583828a88f6855d067960cf616406",
+    "applied_source_git_diff_command": "git diff --no-ext-diff HEAD -- crates/aisix-admin/tests/native_anthropic_route_metrics.rs"
+  },
+  "mixed_test": {
+    "function": "inference_metrics_follow_the_operation_on_shared_and_management_paths",
+    "original_lines": [
+      493,
+      614
+    ],
+    "original_bytes": 3736,
+    "original_sha256": "50110af8f3d2c3a2ae834f2c0d957f545fdc250e1eb005feac34097aa72cf0d4",
+    "curated_bytes": 3603,
+    "curated_sha256": "8c376b255531ffd49f419255ebe591d5cdf512b72a088d85d1f1d0161f0f4c03",
+    "original_matrix_rows": 19,
+    "retired_rows_removed": 1,
+    "active_rows_retained": 18,
+    "active_method_paths": [
+      "POST /v1/chat/completions",
+      "GET /v1/chat/completions",
+      "GET /v1/chat/completions/chatcmpl_sample",
+      "POST /v1/chat/completions/chatcmpl_sample",
+      "DELETE /v1/chat/completions/chatcmpl_sample",
+      "GET /v1/chat/completions/chatcmpl_sample/messages",
+      "POST /v1/responses",
+      "GET /v1/responses",
+      "GET /v1/responses/resp_sample",
+      "DELETE /v1/responses/resp_sample",
+      "POST /v1/responses/resp_sample/cancel",
+      "GET /v1/responses/resp_sample/input_items",
+      "POST /v1/moderations",
+      "POST /v1/content_provenance_checks",
+      "POST /v1/uploads",
+      "POST /v1/uploads/upload_sample/parts",
+      "POST /v1/uploads/upload_sample/complete",
+      "POST /v1/uploads/upload_sample/cancel"
+    ]
+  },
+  "shared_assertions": {
+    "original_lines": [
+      592,
+      611
+    ],
+    "bytes": 866,
+    "sha256": "5a8950d46eb0341975aa0c46f9f94a188d4a7281d731a089ed29ca88bfe451e1",
+    "bytes_unchanged": true,
+    "status_expectation_unchanged": "StatusCode::UNAUTHORIZED; no 401/404 expectation change"
+  },
+  "active_sibling_tests": [
+    {
+      "name": "native_files_and_batches_report_each_proxy_operation_without_llm_inflation",
+      "original_lines": [
+        269,
+        442
+      ],
+      "bytes": 6370,
+      "sha256": "3acbf5aed000be433d90563524cd922007228b687fc40fa9cd43d2e5266a509d",
+      "bytes_unchanged": true
+    },
+    {
+      "name": "shared_files_protocol_is_recorded_before_authentication",
+      "original_lines": [
+        444,
+        491
+      ],
+      "bytes": 2137,
+      "sha256": "622f06f718c3f977221b9094f645fe2aa9b314dce8bb2bad8d315246d96df0bf",
+      "bytes_unchanged": true
+    },
+    {
+      "name": "responses_websocket_handshake_does_not_count_as_an_inference",
+      "original_lines": [
+        616,
+        663
+      ],
+      "bytes": 2108,
+      "sha256": "fcd8b90260a48a9d50ed815efcef1738ab9b1b0bd275b0670a18e70ed3e1d1aa",
+      "bytes_unchanged": true
+    },
+    {
+      "name": "cancelled_shared_files_keep_the_initial_protocol_in_usage_and_metrics",
+      "original_lines": [
+        665,
+        724
+      ],
+      "bytes": 2691,
+      "sha256": "3694baa90752844c67de1072753d589598080b89bfd8d385d39a754d0c11df8b",
+      "bytes_unchanged": true
+    }
+  ],
+  "mechanical_proof": "Curated file equals the exact original with only original lines549-554 removed. All original bytes before/after this 133-byte span are unchanged; archive equals the fixed parent blob byte-for-byte.",
+  "runtime_gate": {
+    "original_389_target_result": "4 passed, 1 failed, 0 ignored; retired POST /v1/images/variations returned404 vs historical401",
+    "unreached_active_suffix_rows": 6,
+    "required_next_run": "ROOT runs the full aisix-admin native_anthropic_route_metrics target (all5 tests) after narrow integration. No Cargo run by this curator.",
+    "green_claim": false
+  },
+  "preserved": "Target remains auto-discovered with all5 tests. No ignore/filter/assert edits; no product/routes/manifests/other archives changed."
+}
