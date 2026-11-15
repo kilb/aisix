@@ -1519,10 +1519,23 @@ async fn batch_group_output_mask_changes_only_its_own_entry_once_without_changin
         .expect("the provider actually received the input file")
         .1
         .clone();
+    // 上传已执行输入规则；只允许 A 的消息按已配置的替换值变化。
+    let expected_upload: String = lines
+        .lines()
+        .map(|line| {
+            let mut entry: Value =
+                serde_json::from_str(line).expect("valid original fixture JSONL");
+            if entry["custom_id"] == "A" {
+                assert_eq!(entry["body"]["messages"][0]["content"], A_TEXT);
+                entry["body"]["messages"][0]["content"] = json!(A_MASKED);
+            }
+            format!("{entry}\n")
+        })
+        .collect();
     assert_eq!(
         uploaded_bytes.as_slice(),
-        lines.as_bytes(),
-        "the provider received both original public entries byte for byte"
+        expected_upload.as_bytes(),
+        "the provider receives exactly A's configured input mask and every other original byte"
     );
     f.provider.state.scans.lock().unwrap().clear();
     drain(&mut usage);
