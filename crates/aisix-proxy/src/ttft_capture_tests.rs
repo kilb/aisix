@@ -917,6 +917,14 @@ async fn parsed_event_before_message_start(endpoint: &str, ping_first: bool, pre
     let mut model = (*anthropic_model_entry("parsed-clock").value).clone();
     model.stream_timeout = prefetch.then_some(5_000);
     model.retries = Some(0);
+    if !ping_first {
+        model.cost = Some(
+            serde_json::from_value(serde_json::json!({
+                "input_per_1k":10.0, "output_per_1k":20.0
+            }))
+            .unwrap(),
+        );
+    }
     snapshot
         .models
         .insert(ResourceEntry::new("model-anthropic-1", model, 1));
@@ -946,6 +954,8 @@ async fn parsed_event_before_message_start(endpoint: &str, ping_first: bool, pre
         assert_eq!(response.status(), StatusCode::OK);
     } else if prefetch {
         assert!(response.status().is_server_error());
+    } else {
+        assert_eq!(response.status(), StatusCode::OK);
     }
     let delivered = String::from_utf8(
         to_bytes(response.into_body(), 65_536)
@@ -970,7 +980,7 @@ async fn parsed_event_before_message_start(endpoint: &str, ping_first: bool, pre
     } else {
         assert!(event.status_code >= 500, "{event:?}");
         assert!(delivered.contains("overloaded"), "{delivered}");
-        assert_eq!((event.prompt_tokens, event.completion_tokens), (0, 0));
+        assert_parsed_error_only_usage(&event, prefetch);
         assert!(event.first_token_latency_ms.is_none());
     }
     assert!(
@@ -1103,7 +1113,10 @@ async fn parsed_vertex_event_before_message_start(
         serde_json::from_value::<Model>(serde_json::json!({
             "display_name":"vertex-parsed", "provider":"google",
             "model_name":"claude-3-5-haiku@20241022", "provider_key_id":"pk-vertex-parsed",
-            "stream_timeout":prefetch.then_some(5_000), "retries":0
+            "stream_timeout":prefetch.then_some(5_000), "retries":0,
+            "cost":(!ping_first).then_some(serde_json::json!({
+                "input_per_1k":10.0, "output_per_1k":20.0
+            }))
         }))
         .unwrap(),
         1,
@@ -1153,6 +1166,8 @@ async fn parsed_vertex_event_before_message_start(
         assert_eq!(response.status(), StatusCode::OK);
     } else if prefetch {
         assert!(response.status().is_server_error());
+    } else {
+        assert_eq!(response.status(), StatusCode::OK);
     }
     let delivered = response.text().await.unwrap();
     let event = next_event(&mut rx).await;
@@ -1175,7 +1190,7 @@ async fn parsed_vertex_event_before_message_start(
     } else {
         assert!(event.status_code >= 500, "{event:?}");
         assert!(delivered.contains("overloaded"), "{delivered}");
-        assert_eq!((event.prompt_tokens, event.completion_tokens), (0, 0));
+        assert_parsed_error_only_usage(&event, prefetch);
         assert!(event.first_token_latency_ms.is_none());
     }
     assert!(
@@ -1211,5 +1226,43 @@ async fn parsed_vertex_ping_precedes_delayed_message_start() {
         for prefetch in [false, true] {
             parsed_vertex_event_before_message_start(endpoint, true, prefetch).await;
         }
+    }
+}
+
+fn assert_parsed_error_only_usage(event: &aisix_obs::UsageEvent, prefetch: bool) {
+    // 已提交的 SSE 缺 usage 时本地估算；既有 #1074 E2E 的 user "hi" = 3+1+1+3 = 8。
+    // UsageEvent::usage_estimated 的公开字段说明明确覆盖上游流式错误。
+    // 预读在响应头前失败则尚未创建流消费者，不产生这份估算。
+    let expected_prompt = if prefetch { 0 } else { 8 };
+    assert_eq!(event.prompt_tokens, expected_prompt);
+    assert_eq!(event.completion_tokens, 0, "错误正文不能当模型输出估算");
+    assert_eq!(event.usage_estimated, !prefetch);
+    // 仅 error fixture 配置每千输入 10 美元；估算费用不冒充提供方的实际账单。
+    let expected_cost = if prefetch { 0.0 } else { 0.08 };
+    assert!(
+        (event.cost_usd - expected_cost).abs() < 1e-9,
+        "本地记录须按已配置费率计算：{}，预期 {expected_cost}",
+        event.cost_usd
+    );
+    assert_eq!(event.total_tokens, 0, "上游没有报告 total，不能填入估算和");
+    assert_eq!(event.cached_prompt_tokens, 0);
+    assert_eq!(event.cache_read_tokens, 0);
+    assert_eq!(event.cache_creation_tokens, 0);
+    assert_eq!(event.cache_usage_reported, None);
+    assert_eq!(event.cache_write_tokens, None);
+    assert_eq!(event.reasoning_tokens, 0);
+    let wire = serde_json::to_value(event).unwrap();
+    for field in [
+        "total_tokens",
+        "cached_prompt_tokens",
+        "cache_read_tokens",
+        "cache_creation_tokens",
+        "cache_creation_5m_tokens",
+        "cache_creation_1h_tokens",
+        "cache_usage_reported",
+        "cache_write_tokens",
+        "reasoning_tokens",
+    ] {
+        assert!(wire.get(field).is_none(), "不能伪造上游 usage：{field}");
     }
 }
