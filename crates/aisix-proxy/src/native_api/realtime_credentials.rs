@@ -15,7 +15,7 @@ use rand::RngCore as _;
 use serde_json::Value;
 
 use super::openai::{self, Audit, Body};
-use super::registry::NativeRegistryError;
+use super::registry::{LiveUsageAuthority, NativeRegistryError};
 use crate::auth::AuthenticatedKey;
 use crate::client_ip::ClientContext;
 use crate::error::ProxyError;
@@ -154,6 +154,13 @@ async fn mint(
         {
             body = serde_json::from_slice(&masked).map_err(|_| openai::dependency())?;
         }
+        // 临时凭据必须由支持实时生命周期的后端托管，不能先消费供应商 mint 再发现缺实现。
+        let registry = openai::registry(&state)?;
+        if registry.live_usage_authority() == LiveUsageAuthority::Unsupported {
+            return Err(openai::dependency());
+        }
+        // 本地默认保留调用方模型别名，重连时仍走相同本地准入；只改供应商请求的实际模型槽。
+        let mut configuration = body.get("session").cloned().unwrap_or(Value::Null);
         // model 在创建时的合法位置改为已授权的上游模型，其他原生字段保留。
         let slot = body
             .pointer_mut(pointer)
@@ -207,7 +214,6 @@ async fn mint(
         if let Some(session) = returned.get_mut("session") {
             strip_credential_slots(session);
         }
-        let mut configuration = body.get("session").cloned().unwrap_or(Value::Null);
         strip_credential_slots(&mut configuration);
         // 仅把 SDK 定义为会话配置的响应成员补作默认；未知响应元数据保留在响应中。
         // realtime_session_create_request_param.py / beta session_create_params.py。
@@ -266,7 +272,7 @@ async fn mint(
             )
             .await?;
         let api_key_id = openai::api_key_id(&auth)?;
-        let stored = openai::registry(&state)?
+        let stored = registry
             .mint_credential(MintCredentialRequest {
                 operation_id: registration.operation_id,
                 api_key_id,
