@@ -86,7 +86,7 @@ async function login(page: Page, who: Credentials = owner): Promise<void> {
   await page.getByRole("button", { name: "登录", exact: true }).click();
   expect((await response).status(), "real login").toBe(200);
   await settle(page);
-  expect((await api(page, "GET", "/api/me")).status).toBe(200);
+  expect((await api(page, "GET", "/api/session")).status).toBe(200);
 }
 
 function waitForApi(page: Page, method: string, path: string) {

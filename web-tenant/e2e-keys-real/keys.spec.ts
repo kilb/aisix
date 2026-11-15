@@ -151,8 +151,8 @@ test("edit-complete-settings-and-clear-overrides", async ({ page }) => {
   const sent = response.request().postDataJSON();
   expect(sent).toEqual({ label: "完整修改参数验收", model_ids: [model.id], rate_limit: { concurrency: 1, rpm: 1 }, disabled: true, expires_at: "2030-12-01T04:34:00.000Z" });
   expect(response.request().headers()["if-match"]).toBe(`"${key.version}"`);
-  await expect(page.getByRole("status")).toHaveText("密钥修改已保存");
-  await expect(page.getByRole("status")).toBeInViewport();
+  await expect(page.getByRole("status").filter({ hasText: /^密钥修改已保存$/ })).toHaveText("密钥修改已保存");
+  await expect(page.getByRole("status").filter({ hasText: /^密钥修改已保存$/ })).toBeInViewport();
   const changed = await api(page, `/api/keys/${key.id}`);
   for (const field of ["label", "model_ids", "rate_limit", "disabled"]) expect(changed.body[field]).toEqual(sent[field]);
   expect(Date.parse(changed.body.expires_at)).toBe(Date.parse(sent.expires_at));
