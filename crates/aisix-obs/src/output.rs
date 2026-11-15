@@ -45,6 +45,8 @@ enum Part {
 
 impl Part {
     fn len(&self) -> usize {
+        #[cfg(test)]
+        capture_perf_tests::record_part_len_visit();
         match self {
             Part::Text(s) | Part::Reasoning(s) => s.len(),
             Part::ToolCall {
@@ -641,6 +643,10 @@ fn first_choice(v: &Value) -> Option<&Value> {
 fn array(v: Option<&Value>) -> &[Value] {
     v.and_then(Value::as_array).map_or(&[], Vec::as_slice)
 }
+
+#[cfg(test)]
+#[path = "output_capture_perf_tests.rs"]
+mod capture_perf_tests;
 
 #[cfg(test)]
 mod tests {
