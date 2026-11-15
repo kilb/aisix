@@ -490,7 +490,7 @@ impl StandaloneNativeStore {
                 submission.origin.provider_key_id,
             )
             .ok();
-            let mut event = aisix_obs::UsageEvent {
+            let mut event = ::aisix_obs::UsageEvent {
                 api_key_id: caller.key_id.clone(),
                 team_id: caller.team_id.clone().unwrap_or_default(),
                 user_id: caller.user_id.clone().unwrap_or_default(),
@@ -546,7 +546,7 @@ impl StandaloneNativeStore {
                 .requested_service_tier
                 .map(crate::chat::sanitize_tag)
                 .filter(|value| !value.is_empty());
-            let wire = serde_json::to_value(event).map_err(unavailable)?;
+            let wire = ::serde_json::to_value(event).map_err(unavailable)?;
             let fields = wire.as_object().ok_or(Error::Unavailable)?;
             let mut saved = serde_json::Map::new();
             for name in [
@@ -2854,12 +2854,10 @@ fn canonical_terminal_event(
 ) -> Result<String> {
     let entry = source.entries.iter().find(|e| e.entry_id == usage.entry_id);
     let context = NativeUsageContext::deserialize(template).map_err(unavailable)?;
-    let mut event = aisix_obs::UsageEvent {
+    let mut event = ::aisix_obs::UsageEvent {
         event_id: event_id.to_string(),
         request_id: source.request_id.clone(),
-        occurred_at: usage
-            .occurred_at
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        occurred_at: ::aisix_obs::UsageEvent::occurred_at(usage.occurred_at),
         io_audit: usage.io_audit.clone(),
         applied_guardrails: context.input_audit.applied_guardrails,
         guardrail_bypassed_reason: context.input_audit.guardrail_bypassed_reason,
@@ -2933,7 +2931,7 @@ fn canonical_terminal_event(
             u64::from(usage.completion_tokens),
         );
     }
-    let mut wire = serde_json::to_value(&event).map_err(unavailable)?;
+    let mut wire = ::serde_json::to_value(event).map_err(unavailable)?;
     wire.as_object_mut().ok_or(Error::Unavailable)?.extend(
         template
             .as_object()
