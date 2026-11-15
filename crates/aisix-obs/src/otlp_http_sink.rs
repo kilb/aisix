@@ -2681,8 +2681,9 @@ mod tests {
     #[test]
     fn the_fan_out_builds_a_content_record_per_exporter() {
         let src = include_str!("otlp_http_sink.rs");
+        // 字段或测试探针类型的 cfg(test) 后仍有生产代码，只有测试模块才是边界。
         let production = src
-            .split_once("\n#[cfg(test)]")
+            .split_once("\n#[cfg(test)]\nmod tests {")
             .map(|(before, _)| before)
             .unwrap_or(src);
 
