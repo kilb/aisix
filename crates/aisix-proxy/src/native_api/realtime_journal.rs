@@ -846,7 +846,13 @@ impl Journal {
         self.observe_configuration(event)?;
         let secondary = self.is_secondary_fact(frame);
         self.observe_asr_meter(frame, event)?;
-        if !secondary {
+        let primary_usage = if frame.kind() == Kind::ResponseDone {
+            &event["response"]["usage"]
+        } else {
+            &event["usage"]
+        };
+        // 未报告的主量只留在会话观察；不能因 B 有量而新增 A 的假零账。
+        if !secondary && reported_token_quantities(primary_usage).is_some() {
             self.primary_usage.absorb_frame(frame, false);
         }
         let Some(p) = self.persistence.as_ref() else {
@@ -1059,9 +1065,15 @@ fn transcription_pointer(event: &Value) -> Option<&'static str> {
     .find(|pointer| event.pointer(pointer).is_some())
 }
 
+fn reported_token_quantities(usage: &Value) -> Option<(u32, u32)> {
+    Some((
+        u32::try_from(usage.get("input_tokens")?.as_u64()?).ok()?,
+        u32::try_from(usage.get("output_tokens")?.as_u64()?).ok()?,
+    ))
+}
+
 fn terminal_usage(usage: &Value, status: Option<&str>) -> Option<TerminalUsage> {
-    let prompt_tokens = u32::try_from(usage.get("input_tokens")?.as_u64()?).ok()?;
-    let completion_tokens = u32::try_from(usage.get("output_tokens")?.as_u64()?).ok()?;
+    let (prompt_tokens, completion_tokens) = reported_token_quantities(usage)?;
     let count = |value: Option<&Value>| {
         value
             .and_then(Value::as_u64)
