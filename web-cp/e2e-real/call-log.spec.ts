@@ -271,3 +271,57 @@ test("long saved logs and billed quantity rows fit narrow detail pages without l
     }
   }
 });
+
+// 场景编号只能指向真实网关400/404请求已写入的事件，以及未采集阶段的历史事件。
+test("real rejected calls show their recorded request phases while legacy events remain unknown", async ({ page }) => {
+  const phase400 = process.env.CALL_LOG_QA_PHASE_400_EVENT_ID ?? state.callLogEvidence?.phase400EventId;
+  const phase404 = process.env.CALL_LOG_QA_PHASE_404_EVENT_ID ?? state.callLogEvidence?.phase404EventId;
+  const legacy = process.env.CALL_LOG_QA_LEGACY_EVENT_ID ?? state.callLogEvidence?.legacyEventId;
+  for (const [name, eventId] of [["actual fully read invalid JSON 400", phase400], ["actual fully read unknown-model 404", phase404], ["legacy event without request timing", legacy]]) {
+    expect(typeof eventId === "string" && eventId.length > 0, `Prepare the real ${name} event and supply its ID`).toBe(true);
+  }
+  await login(page);
+  const phaseKeys = ["body_read_ms", "json_decode_ms", "pre_handler_ms", "request_body_bytes", "request_body_complete"] as const;
+  const duration = (value: number) => `${new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 }).format(value < 1000 ? value : value / 1000)} ${value < 1000 ? "ms" : "s"}`;
+  for (const [status, eventId] of [[400, phase400], [404, phase404], [null, legacy]] as const) {
+    const eventRead = page.waitForResponse(response => new URL(response.url()).pathname === `/admin/usage/events/${encodeURIComponent(eventId)}`);
+    const chargeRead = page.waitForResponse(response => listResponse(response, eventId));
+    await page.goto(`${base}/#calls?detail=${encodeURIComponent(eventId)}`);
+    const eventAnswer = await eventRead;
+    const chargeAnswer = await chargeRead;
+    expect(eventAnswer.status()).toBe(200);
+    expect(chargeAnswer.status()).toBe(200);
+    const stored = await eventAnswer.json() as StoredRecord;
+    const priced = await chargeAnswer.json() as { items: (ChargeRecord & { request_timing?: unknown })[] };
+    expect(stored.event_id).toBe(eventId);
+    expect(priced.items).toHaveLength(1);
+    const stage = page.getByRole("region", { name: "请求入口阶段", exact: true });
+    await expect(stage).toBeVisible();
+    const shown = (key: string) => stage.locator(`[data-request-timing-field="${key}"] dd`);
+    if (status === null) {
+      expect(stored.event.request_timing == null, "the actual historical event must lack phase measurements").toBe(true);
+      expect(priced.items[0]!.request_timing == null).toBe(true);
+      for (const key of phaseKeys) await expect(shown(key)).toHaveText("未记录");
+      await expect(stage.getByText("此记录未采集请求入口阶段，历史缺失不按零显示。", { exact: true })).toBeVisible();
+      continue;
+    }
+    expect(stored.event.status_code).toBe(status);
+    expect(typeof stored.event.request_timing).toBe("object");
+    expect(stored.event.request_timing).not.toBeNull();
+    const timing = stored.event.request_timing as Record<string, unknown>;
+    for (const key of phaseKeys) expect(Object.hasOwn(timing, key), `the actual ${status} event must explicitly record ${key}`).toBe(true);
+    for (const key of ["body_read_ms", "json_decode_ms", "pre_handler_ms", "request_body_bytes"]) {
+      expect(Number.isFinite(timing[key])).toBe(true);
+      expect(timing[key] as number).toBeGreaterThanOrEqual(0);
+    }
+    expect(timing.request_body_bytes as number).toBeGreaterThan(0);
+    expect(timing.request_body_complete, "these two real requests fully sent their body before the rejection").toBe(true);
+    expect(priced.items[0]!.request_timing, "the existing charge projection must preserve the same phase object").toEqual(timing);
+    for (const key of ["body_read_ms", "json_decode_ms", "pre_handler_ms"]) await expect(shown(key)).toHaveText(duration(timing[key] as number));
+    await expect(shown("request_body_bytes")).toHaveText(`已读取 ${new Intl.NumberFormat("en-US").format(timing.request_body_bytes as number)} 字节`);
+    await expect(shown("request_body_complete")).toHaveText("已读至结束");
+    await expect(stage).toContainText("阶段可能重叠，不能直接相加");
+    await expect(stage).toContainText("首 Token 延迟从请求到达起计，包含上传和处理时间");
+    await expect(stage).toContainText("上游首帧延迟只对应本次上游尝试");
+  }
+});

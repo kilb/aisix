@@ -10,6 +10,7 @@ import { Button } from "../ui/Button";
 import { CopyButton } from "../ui/CopyButton";
 import { Loading } from "../ui/DataTable";
 import { ChargeCheck } from "../tabs/billing/Charges";
+import { RequestTimingDetails } from "./RequestTimingDetails";
 import { UsageIoAuditDetails } from "./UsageIoAuditDetails";
 import { Card, CardHeader, PageHeader } from "./page";
 import "./CallLogDetails.css";
@@ -123,6 +124,7 @@ export function CallLogDetails({ eventId, backHref }: { eventId: string; backHre
             ["上游首帧延迟", formatDuration(numberValue(event?.upstream_ttft_ms))],
             ["生成吞吐（Token/s）", charge?.throughput_tps],
           ]} />
+          <RequestTimingDetails data={event ? event.request_timing : charge?.request_timing} />
         </Card>
         <Card aria-label="用量与计费">
           <CardHeader title="用量与计费" />

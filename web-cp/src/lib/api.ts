@@ -998,7 +998,17 @@ export async function deleteOrgQuota(tenantId: string, id: string): Promise<void
 export type { ChargeLine, ReportedUsage } from "./chargeUsage";
 import type { ChargeLine, ReportedUsage } from "./chargeUsage";
 
+/** 客户端请求入口的独立观测窗口；缺失阶段不表示零。 */
+export interface RequestTiming {
+  body_read_ms?: number | null;
+  json_decode_ms?: number | null;
+  pre_handler_ms?: number | null;
+  request_body_bytes?: number | null;
+  request_body_complete: boolean;
+}
+
 export interface Charge extends UsageAuditData {
+  request_timing?: RequestTiming | null;
   first_token_latency_ms?: number | null;
   attempt_duration_ms?: number | null;
   throughput_tps?: number | null;
@@ -1103,7 +1113,7 @@ export interface StoredUsageEvent {
   team_id: string | null;
   api_key_id: string | null;
   request_id: string | null;
-  event: Record<string, unknown> & UsageAuditData;
+  event: Record<string, unknown> & UsageAuditData & { request_timing?: RequestTiming | null };
 }
 
 export const usageEvents = {
