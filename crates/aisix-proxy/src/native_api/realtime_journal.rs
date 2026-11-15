@@ -296,6 +296,10 @@ impl Journal {
         self.authority == LiveUsageAuthority::CanonicalJournal
     }
 
+    pub(crate) fn operation_id(&self) -> Uuid {
+        self.lease.operation_id
+    }
+
     pub(crate) fn lease_expires_at(&self) -> DateTime<Utc> {
         self.lease_expires_at
     }

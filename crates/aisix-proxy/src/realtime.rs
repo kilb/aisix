@@ -2707,6 +2707,7 @@ async fn run_session(
     let mut event = UsageEvent {
         io_audit: Some(io.finish()),
         request_id: request_id.clone(),
+        native_operation_id: journal.as_ref().map(|journal| journal.operation_id()),
         occurred_at: aisix_obs::UsageEvent::occurred_at_now(),
         model_id: model_entry.id.clone(),
         api_key_id: auth.entry.id.clone(),
