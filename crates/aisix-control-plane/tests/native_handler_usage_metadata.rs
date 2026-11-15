@@ -508,7 +508,48 @@ async fn resource(cp: &TestCp, admin: &OperatorSession, kind: &str, doc: Value) 
     uuid_at(&reply.body, "/id")
 }
 
+async fn install_input_guardrails(
+    cp: &TestCp,
+    admin: &OperatorSession,
+    provider_base: &str,
+    alias: Uuid,
+    second: Uuid,
+) {
+    let script = format!(
+        r#"export async function checkInput(ctx) {{
+        const reply = await fetch("{}/scan", {{method:"POST", headers:{{"content-type":"application/json"}}, body:JSON.stringify({{text:ctx.text}})}});
+        if (!reply.ok) throw new Error("scan failed");
+        if (ctx.text.includes("metadata-entry-a")) throw new Error("entry-a scanner unavailable");
+        return {{action:"allow"}};
+    }}"#,
+        provider_base
+    );
+    let rules = [
+        json!({"name":"metadata-fail-open","kind":"custom","hook_point":"input","fail_open":true,"script":script,"timeout_ms":5000}),
+        json!({"name":"metadata-monitor","kind":"keyword","hook_point":"input","enforcement_mode":"monitor", "patterns":[{"kind":"literal","value":"metadata-entry-a"}]}),
+        json!({"name":"metadata-mask","kind":"pii","hook_point":"input","detectors":[],
+            "custom_patterns":[{"name":"private_email","regex":"alice@example\\.com","action":"mask","replacement":"MASKED"}]}),
+    ];
+    for (priority, rule) in rules.into_iter().enumerate() {
+        let id = resource(cp, admin, "guardrails", rule).await;
+        for model in [alias, second] {
+            resource(
+                cp,
+                admin,
+                "guardrail_attachments",
+                json!({"guardrail_id":id,
+                "scope_type":"model","scope_id":model,"priority":100 + priority}),
+            )
+            .await;
+        }
+    }
+}
+
 async fn fixture() -> Option<Fixture> {
+    fixture_with_input_guardrails(true).await
+}
+
+async fn fixture_with_input_guardrails(install_rules: bool) -> Option<Fixture> {
     let cp = TestCp::start_with_kine().await?;
     let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
     let provider = Provider::start().await;
@@ -597,33 +638,8 @@ async fn fixture() -> Option<Fixture> {
         "request_headers":["x-metadata-project"]}),
     )
     .await;
-    let script = format!(
-        r#"export async function checkInput(ctx) {{
-        const reply = await fetch("{}/scan", {{method:"POST", headers:{{"content-type":"application/json"}}, body:JSON.stringify({{text:ctx.text}})}});
-        if (!reply.ok) throw new Error("scan failed");
-        if (ctx.text.includes("metadata-entry-a")) throw new Error("entry-a scanner unavailable");
-        return {{action:"allow"}};
-    }}"#,
-        provider.base
-    );
-    let rules = [
-        json!({"name":"metadata-fail-open","kind":"custom","hook_point":"input","fail_open":true,"script":script,"timeout_ms":5000}),
-        json!({"name":"metadata-monitor","kind":"keyword","hook_point":"input","enforcement_mode":"monitor", "patterns":[{"kind":"literal","value":"metadata-entry-a"}]}),
-        json!({"name":"metadata-mask","kind":"pii","hook_point":"input","detectors":[],
-            "custom_patterns":[{"name":"private_email","regex":"alice@example\\.com","action":"mask","replacement":"MASKED"}]}),
-    ];
-    for (priority, rule) in rules.into_iter().enumerate() {
-        let id = resource(&cp, &admin, "guardrails", rule).await;
-        for model in [alias, second] {
-            resource(
-                &cp,
-                &admin,
-                "guardrail_attachments",
-                json!({"guardrail_id":id,
-                "scope_type":"model","scope_id":model,"priority":100 + priority}),
-            )
-            .await;
-        }
+    if install_rules {
+        install_input_guardrails(&cp, &admin, &provider.base, alias, second).await;
     }
     for model in [alias, target, second] {
         support::world::insert_baseline_backdated(cp.db(), model,
@@ -1286,7 +1302,9 @@ async fn background_response_keeps_original_verified_metadata_through_real_autho
 // 让批次根审计广播给每个 entry，B 会错误得到 A 的旁路、monitor 和 mask。
 #[tokio::test]
 async fn actual_two_entry_batch_keeps_each_executed_input_audit_with_its_own_terminal() {
-    let Some(f) = fixture().await else { return };
+    let Some(f) = fixture_with_input_guardrails(false).await else {
+        return;
+    };
     let (state, mut usage) = gateway(&f).await;
     verified_auth_preflight(&state).await;
     let lines: String = [("A", ALIAS, A_TEXT), ("B", SECOND, B_TEXT)]
@@ -1300,7 +1318,7 @@ async fn actual_two_entry_batch_keeps_each_executed_input_audit_with_its_own_ter
         })
         .collect();
     let boundary = "metadata-batch-input";
-    // 文件传输使用同账号、不挂扫描规则的 direct 模型；输入规则在批次准入逐 entry 执行。
+    // 先完成真实文件上传，再安装输入规则，确保本次批次准入扫描的是未脱敏内容。
     let upload = format!("--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nmetadata-actual-target\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"purpose\"\r\n\r\nbatch\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"metadata.jsonl\"\r\nContent-Type: application/jsonl\r\n\r\n{lines}\r\n--{boundary}--\r\n");
     let (status, body) = send(
         &state,
@@ -1317,6 +1335,26 @@ async fn actual_two_entry_batch_keeps_each_executed_input_audit_with_its_own_ter
         "positive control: real uploaded input file: {body}"
     );
     assert_eq!(body["id"], INPUT_FILE);
+    let original_entries: Vec<Value> = lines
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("valid original fixture JSONL"))
+        .collect();
+    assert_eq!(
+        f.provider.file(INPUT_FILE),
+        original_entries,
+        "positive control: the pre-policy upload retains both complete unmasked entries"
+    );
+    assert!(
+        f.provider.scans().is_empty(),
+        "the input scanner is not installed during this file upload"
+    );
+    install_input_guardrails(&f.cp, &f.admin, &f.provider.base, f.alias, f.second).await;
+    state
+        .snapshot
+        .store(with_explicit_local_jwt_component_config(
+            projected_snapshot(&f.cp).await,
+            f.key,
+        ));
     f.provider.state.scans.lock().unwrap().clear();
     drain(&mut usage);
     let (status, body) = json_request(&state, "POST", "/v1/batches", "admission",
@@ -1348,6 +1386,14 @@ async fn actual_two_entry_batch_keeps_each_executed_input_audit_with_its_own_ter
             .filter(|text| text.contains("metadata-entry-b") && !text.contains("metadata-entry-a"))
             .count(),
         1
+    );
+    assert_eq!(
+        scans
+            .iter()
+            .filter(|text| text.contains(A_TEXT) && !text.contains("metadata-entry-b"))
+            .count(),
+        1,
+        "the actual batch admission scans A's original unmasked input"
     );
     let staged = f.provider.file(STAGED_FILE);
     assert_eq!(staged.len(), 2);
