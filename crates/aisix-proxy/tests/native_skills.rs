@@ -51,12 +51,20 @@ impl NativeObjectRegistry for Registry {
     ) -> BoxFuture<'_, Result<NativeReply, NativeRegistryError>> {
         let result = (|| {
             let records = self.records.lock().unwrap();
-            let (_, record) = records
-                .values()
-                .find(|(owner, record)| {
-                    *owner == request.api_key_id
+            let record = records
+                .iter()
+                .find_map(|((protocol, kind, raw), (owner, record))| {
+                    (*owner == request.api_key_id
                         && record.record_id == request.record_id
                         && !record.deleted
+                        && record
+                            .protocol
+                            .is_some_and(|value| value.as_str() == protocol.as_str())
+                        && record
+                            .kind
+                            .is_some_and(|value| value.as_str() == kind.as_str())
+                        && record.raw_id.as_str() == raw.as_str())
+                    .then_some(record)
                 })
                 .ok_or(NativeRegistryError::NotFound)?;
             if record.version != request.version {
