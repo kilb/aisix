@@ -205,6 +205,17 @@ impl Payload {
         request: Request,
         path: &str,
     ) -> Result<Self, ProxyError> {
+        // 无体方法不解析也不转发调用方正文；后续 screen 仍以空输入咨询 guardrail 链。
+        if matches!(
+            request.method(),
+            &Method::GET | &Method::HEAD | &Method::DELETE
+        ) {
+            return Ok(Self {
+                value: Value::Null,
+                json: None,
+                parts: None,
+            });
+        }
         let multipart = request
             .headers()
             .get(header::CONTENT_TYPE)
