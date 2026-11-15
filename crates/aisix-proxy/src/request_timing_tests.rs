@@ -351,4 +351,90 @@ mod request_timing_tests {
             assert!(rx.try_recv().is_err());
         }
     }
+
+    #[tokio::test]
+    async fn request_timing_authenticated_responses_get_records_the_handler_boundary() {
+        use std::time::Duration;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let snapshot = AisixSnapshot::new();
+        let caller = apikey_entry("sk-phase-responses-get", &["*"]);
+        let caller_id = caller.id.clone();
+        snapshot.apikeys.insert(caller);
+        let app = build_router(
+            build_state(snapshot, Arc::new(Hub::new()))
+                .with_usage_sink(aisix_obs::UsageSink::new(tx)),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/v1/responses"))
+            .bearer_auth("sk-phase-responses-get")
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        assert!(status.is_client_error(), "普通 GET 不能成为 WebSocket 升级");
+        let request_id = response
+            .headers()
+            .get("x-aisix-request-id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let _ = response.bytes().await.unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.request_id, request_id);
+        assert_eq!(event.api_key_id, caller_id);
+        assert_eq!(event.status_code, status.as_u16());
+        assert!(event.is_final_attempt);
+        assert_eq!(event.upstream_dispatched, Some(false));
+        assert_eq!(
+            (
+                event.prompt_tokens,
+                event.completion_tokens,
+                event.total_tokens
+            ),
+            (0, 0, 0)
+        );
+        assert_eq!(event.cost_usd, 0.0);
+        assert!(event.io_audit.is_none(), "拒绝升级没有上游交换");
+        assert!(event.first_token_latency_ms.is_none(), "没有交付生成内容");
+        let wire = serde_json::to_value(event).unwrap();
+        assert_eq!(wire.get("prompt_tokens"), Some(&serde_json::json!(0)));
+        assert_eq!(wire.get("completion_tokens"), Some(&serde_json::json!(0)));
+        assert_eq!(wire.get("cost_usd"), Some(&serde_json::json!(0.0)));
+        let timing = wire
+            .get("request_timing")
+            .expect("已进入认证后的 HTTP handler");
+        assert!(
+            timing
+                .get("pre_handler_ms")
+                .and_then(serde_json::Value::as_u64)
+                .is_some(),
+            "GET /v1/responses 不能遗漏处理入口：{timing}"
+        );
+        assert!(
+            timing.get("json_decode_ms").is_none(),
+            "普通 GET 未解码 JSON：{timing}"
+        );
+        assert_eq!(timing.get("body_read_ms"), Some(&serde_json::json!(0)));
+        assert_eq!(
+            timing.get("request_body_bytes"),
+            Some(&serde_json::json!(0))
+        );
+        assert_eq!(
+            timing.get("request_body_complete"),
+            Some(&serde_json::json!(true))
+        );
+        assert!(rx.try_recv().is_err(), "拒绝升级只记录一次终态");
+        server.abort();
+    }
 }

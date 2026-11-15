@@ -512,6 +512,7 @@ pub(crate) async fn responses_websocket(
     ws: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
 ) -> Response {
     let started = Instant::now();
+    crate::attribution::note_handler_started(started);
     let ws = match ws {
         Ok(ws) => ws,
         Err(rejection) => {
