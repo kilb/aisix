@@ -15,6 +15,7 @@ use support::{OperatorSession, TestCp};
 struct Cost {
     resource_loads: usize,
     resource_queries: usize,
+    ordered_shared_queries: usize,
     scalar_reads: usize,
     working_copies: usize,
     copied_entry_cells: usize,
@@ -38,6 +39,7 @@ struct QueryCount;
 struct QueryFields {
     resource: bool,
     scalar: bool,
+    ordered_shared: bool,
 }
 
 impl tracing::field::Visit for QueryFields {
@@ -45,6 +47,7 @@ impl tracing::field::Visit for QueryFields {
         if field.name() == "db.statement" {
             self.resource = value.contains("FROM gw_resources");
             self.scalar = self.resource && value.contains("SELECT doc ->>");
+            self.ordered_shared = self.resource && value.contains("ORDER BY kind, id FOR SHARE");
         }
     }
 
@@ -63,11 +66,13 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for QueryCount {
         let mut fields = QueryFields {
             resource: false,
             scalar: false,
+            ordered_shared: false,
         };
         event.record(&mut fields);
         let _ = COST.try_with(|slot| {
             let mut cost = slot.get();
             cost.resource_queries += usize::from(fields.resource);
+            cost.ordered_shared_queries += usize::from(fields.ordered_shared);
             cost.scalar_reads += usize::from(fields.scalar);
             slot.set(cost);
         });
@@ -349,4 +354,41 @@ async fn native_begin_refuses_an_ungranted_entry_model_even_after_valid_entries(
         axum::http::StatusCode::NOT_FOUND
     );
     fixture.assert_not_accepted(operation).await;
+}
+
+#[tokio::test]
+async fn native_begin_preserves_the_legacy_empty_entry_name_fallback() {
+    let fixture = Fixture::new().await;
+    let mut body = fixture.body(2);
+    body.entries[1].requested_model.clear();
+    let operation = body.operation_id;
+    let mut expected = serde_json::to_value(&body).unwrap();
+    // 既有写入规范将旧空字段补为当前资源名；准入仍沿用根的具体请求名。
+    expected["entries"][1]["requested_model"] = json!("batch-a/*");
+    let (result, _) = fixture.invoke(body).await;
+    assert_eq!(
+        result.expect("旧空名兼容仍必须可用").state,
+        "pending_submission"
+    );
+    assert_eq!(fixture.saved(operation).await, expected);
+}
+
+#[tokio::test]
+async fn native_begin_without_entries_keeps_a_single_ordered_resource_query() {
+    let fixture = Fixture::new().await;
+    let mut body = fixture.body(0);
+    body.kind = NativeObjectKind::Response;
+    body.operation = "responses".into();
+    let operation = body.operation_id;
+    let expected = serde_json::to_value(&body).unwrap();
+    let (result, cost) = fixture.invoke(body).await;
+    assert_eq!(
+        result.expect("普通无entries请求仍可准入").state,
+        "pending_submission"
+    );
+    assert_eq!(fixture.saved(operation).await, expected);
+    eprintln!("native_begin_component count=0 cost={cost:?}");
+    assert_eq!(cost.resource_loads, 1);
+    assert_eq!(cost.resource_queries, 1);
+    assert_eq!(cost.ordered_shared_queries, 1);
 }
