@@ -30,6 +30,7 @@ pub mod gateways;
 pub mod groups;
 pub mod housekeeping;
 pub mod http;
+pub mod key_usage;
 pub mod keys;
 pub mod kine;
 pub mod member_usage;
