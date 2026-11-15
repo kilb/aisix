@@ -1875,6 +1875,7 @@ impl StandaloneNativeStore {
             .await
             .map_err(unavailable)?,
         )?;
+        let mut submission_wire = None;
         for usage in &body.usage {
             if usage.cached_prompt_tokens > usage.prompt_tokens
                 || !(100..=599).contains(&usage.status_code)
@@ -1892,7 +1893,7 @@ impl StandaloneNativeStore {
             let canonical_event =
                 canonical_terminal_event(event_id, &stored.submission, usage, template)?;
             sqlx::query("INSERT INTO native_terminal_outbox(event_id,record_id,entry_id,submission,owner,usage,event) VALUES(?,?,?,?,?,?,?)")
-                .bind(event_id.to_string()).bind(stored.record.record_id.to_string()).bind(&usage.entry_id).bind(json(&stored.submission)?).bind(&caller).bind(json(usage)?).bind(canonical_event).execute(&mut *conn).await.map_err(unavailable)?;
+                .bind(event_id.to_string()).bind(stored.record.record_id.to_string()).bind(&usage.entry_id).bind(submission_wire.get_or_insert_with(|| json(&stored.submission)).as_ref().map_err(|error| *error)?).bind(&caller).bind(json(usage)?).bind(canonical_event).execute(&mut *conn).await.map_err(unavailable)?;
         }
         let mut stored = stored;
         stored.record.completed = true;
