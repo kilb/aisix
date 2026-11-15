@@ -867,7 +867,8 @@ fn refresh_remaining(
         return;
     };
     let key_limits = auth.key().rate_limit.clone().unwrap_or_default();
-    if key_limits.is_unrestricted() {
+    // 这里只发布分钟请求/token gauge；其它窗口和并发上限没有观测消费者。
+    if key_limits.rpm.is_none() && key_limits.tpm.is_none() {
         return;
     }
     // Off the request's path: on a shared store the peek is a round trip,

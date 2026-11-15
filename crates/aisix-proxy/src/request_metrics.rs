@@ -1052,8 +1052,8 @@ pub(crate) fn record_usage(
 /// the recorder sets no idle timeout — so a raw request string is
 /// attacker-controlled cardinality that is never reclaimed (#451).
 ///
-/// No-op when the key has no limit configured: `peek` returns `None` and the
-/// caller should not read an absent header as "unlimited".
+/// 只读取会发布响应头的 RPM、TPM 或并发窗口；其它窗口没有头或剩余额度 gauge。
+/// 缺少响应头不代表无限制，其它周期的准入仍按配置执行。
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn publish_rate_limit_window(
     metrics: &aisix_obs::Metrics,
@@ -1065,6 +1065,9 @@ pub(crate) async fn publish_rate_limit_window(
     upstream_model: &str,
     response: &mut axum::response::Response,
 ) {
+    if limits.rpm.is_none() && limits.tpm.is_none() && limits.concurrency.is_none() {
+        return;
+    }
     let Some(status) = limiter.peek(api_key_id, limits).await else {
         return;
     };
