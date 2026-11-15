@@ -2852,41 +2852,14 @@ fn unique_resource<T: aisix_core::resource::Resource>(
 impl StandaloneNativeStore {
     async fn authorize_chain(
         &self,
-        conn: &mut SqliteConnection,
+        _conn: &mut SqliteConnection,
         snapshot: &AisixSnapshot,
         caller: &Principal,
         stored: &Stored,
         consumer: Option<EndpointFamily>,
     ) -> Result<()> {
-        self.authorize(snapshot, caller, stored, consumer)?;
-        let mut current = stored.clone();
-        let mut seen = BTreeSet::from([stored.record.record_id]);
-        for _ in 0..32 {
-            let Some(id) = current.record.parent_id else {
-                return Ok(());
-            };
-            if !seen.insert(id) {
-                return Err(Error::Unavailable);
-            }
-            let parent = Self::stored(conn, id).await?;
-            // Response 的自动产物保留来源，但不依赖原 Response 继续存在。
-            if matches!(
-                current.submission.kind,
-                NativeObjectKind::ResponseItem | NativeObjectKind::ResponseContainer
-            ) && parent.submission.kind == NativeObjectKind::Response
-            {
-                return Ok(());
-            }
-            if !account(
-                stored.record.origin.as_ref().ok_or(Error::Unavailable)?,
-                parent.record.origin.as_ref().ok_or(Error::Unavailable)?,
-            ) {
-                return Err(Error::NotFound);
-            }
-            self.authorize(snapshot, caller, &parent, consumer)?;
-            current = parent;
-        }
-        Err(Error::Unavailable)
+        // 保留内部调用接缝；只校验目标对象，不递归遍历来源祖先。
+        self.authorize(snapshot, caller, stored, consumer)
     }
 }
 
