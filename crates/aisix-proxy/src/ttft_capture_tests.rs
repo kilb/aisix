@@ -115,3 +115,107 @@ async fn bridged_chat_first_frame_precedes_the_first_content() {
 async fn bridged_responses_first_frame_precedes_the_first_content() {
     early_start_late_text("/v1/responses").await;
 }
+
+async fn buffered_structured_output_has_no_upstream_ttft(endpoint: &str) {
+    use aisix_provider_anthropic::AnthropicBridge;
+
+    let upstream = MockServer::builder().start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({"stream":false}),
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(BODY_DELAY)
+                .set_body_json(serde_json::json!({
+                    "id":"msg_buffered", "type":"message", "role":"assistant",
+                    "model":"claude-3-5-haiku-20241022",
+                    "content":[{"type":"tool_use","id":"toolu_json", "name":"json_tool_call",
+                        "input":{"answer":"ok"}}],
+                    "stop_reason":"tool_use", "usage":{"input_tokens":13,"output_tokens":5}
+                })),
+        )
+        .mount(&upstream)
+        .await;
+    let snapshot = AisixSnapshot::new();
+    snapshot
+        .provider_keys
+        .insert(matrix_anthropic_pk(&upstream.uri()));
+    snapshot
+        .models
+        .insert(anthropic_model_entry("buffered-clock"));
+    snapshot
+        .apikeys
+        .insert(apikey_entry("sk-caller", &["buffered-clock"]));
+    let hub = Arc::new(Hub::new());
+    hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let state = build_state(snapshot, hub).with_usage_sink(aisix_obs::UsageSink::new(tx));
+    let metrics = state.metrics.clone();
+    let schema = serde_json::json!({"type":"object","properties":{"answer":{"type":"string"}}});
+    let body = if endpoint == "/v1/responses" {
+        serde_json::json!({
+            "model":"buffered-clock", "input":"hi", "stream":true,
+            "text":{"format":{"type":"json_schema","name":"answer","schema":schema}}
+        })
+    } else {
+        serde_json::json!({
+            "model":"buffered-clock", "messages":[{"role":"user","content":"hi"}],
+            "stream":true,
+            "response_format":{"type":"json_schema","json_schema":{"name":"answer","schema":schema}}
+        })
+    };
+    let response = build_router(state)
+        .oneshot(cancellable_request(endpoint, body))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let delivered = String::from_utf8(
+        to_bytes(response.into_body(), 65_536)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    let event = next_event(&mut rx).await;
+    assert!(
+        delivered.contains("ok"),
+        "完整结构化输出不能丢失：{delivered}"
+    );
+    assert_eq!(event.status_code, 200);
+    assert_eq!((event.prompt_tokens, event.completion_tokens), (13, 5));
+    assert!(event
+        .first_token_latency_ms
+        .is_some_and(|value| value >= 1_200));
+    assert!(event.upstream_latency_ms >= 1_200);
+    assert_eq!(
+        event.upstream_ttft_ms, 0,
+        "非流式上游没有可测首流帧，不能拿完整耗时冒充"
+    );
+    assert!(!serde_json::to_value(&event)
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .contains_key("upstream_ttft_ms"));
+    assert!(rx.try_recv().is_err(), "一次请求只能结算一次");
+    let rendered = metrics.render();
+    assert!(
+        !rendered.lines().any(|line| {
+            line.starts_with("aisix_request_ttft_seconds_count{")
+                && line.contains(&format!("endpoint=\"{endpoint}\""))
+                && line.contains("side=\"upstream\"")
+        }),
+        "非流式上游不得产生首流帧指标：{rendered}"
+    );
+}
+
+#[tokio::test]
+async fn buffered_chat_output_does_not_report_complete_latency_as_upstream_ttft() {
+    buffered_structured_output_has_no_upstream_ttft("/v1/chat/completions").await;
+}
+
+#[tokio::test]
+async fn buffered_responses_output_does_not_report_complete_latency_as_upstream_ttft() {
+    buffered_structured_output_has_no_upstream_ttft("/v1/responses").await;
+}
