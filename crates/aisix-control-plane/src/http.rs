@@ -30,9 +30,9 @@ use serde_json::{json, Value};
 use crate::auth::{MemberRole, OperatorRole, KEY_HOLDERS};
 use crate::error::{ApiError, Detail};
 use crate::{
-    audit, billing, channels, dp, gateways, groups, keys, member_usage, members, model_assessments,
-    model_probe_history, model_probes, native_objects, operators, pricing, projector, resources,
-    rollout, tenants, upstream_models, usage, usage_metrics, AppState,
+    audit, billing, channels, dp, gateways, groups, key_usage, keys, member_usage, members,
+    model_assessments, model_probe_history, model_probes, native_objects, operators, pricing,
+    projector, resources, rollout, tenants, upstream_models, usage, usage_metrics, AppState,
 };
 
 /// The largest request body either listener reads.
@@ -344,6 +344,11 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
     ("GET", "/api/prices", MinRole::Member(EVERY_MEMBER)),
     ("GET", "/api/members", MinRole::Member(MANAGERS)),
     ("POST", "/api/members", MinRole::Member(MANAGERS)),
+    (
+        "POST",
+        "/api/members/{id}/password",
+        MinRole::Member(MANAGERS),
+    ),
     ("GET", "/api/members/usage", MinRole::Member(MANAGERS)),
     ("GET", "/api/members/invites", MinRole::Member(MANAGERS)),
     ("POST", "/api/members/invites", MinRole::Member(MANAGERS)),
@@ -355,6 +360,7 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
     ("PATCH", "/api/members/{id}", MinRole::Member(MANAGERS)),
     ("DELETE", "/api/members/{id}", MinRole::Member(MANAGERS)),
     ("GET", "/api/keys", MinRole::Member(KEY_HOLDERS)),
+    ("GET", "/api/usage/keys", MinRole::Member(KEY_HOLDERS)),
     ("POST", "/api/keys", MinRole::Member(KEY_HOLDERS)),
     ("GET", "/api/keys/{id}", MinRole::Member(KEY_HOLDERS)),
     ("PATCH", "/api/keys/{id}", MinRole::Member(KEY_HOLDERS)),
@@ -851,6 +857,7 @@ pub const INACTIVE_TENANT_ROUTES: &[(&str, &str)] = &[
     ("POST", "/api/password"),
     ("GET", "/api/org"),
     ("GET", "/api/keys"),
+    ("GET", "/api/usage/keys"),
     ("DELETE", "/api/keys/{id}"),
     ("GET", "/api/members"),
     ("DELETE", "/api/members/{id}"),
@@ -963,6 +970,7 @@ pub fn browser_router(state: AppState) -> Router {
         .route("/api/prices", get(billing::tenant_prices::prices))
         .route("/api/members", get(members::list).post(members::create_account))
         .route("/api/members/usage", get(member_usage::get))
+        .route("/api/members/{id}/password", post(members::reset_password))
         .route(
             "/api/members/invites",
             get(members::list_invites).post(members::invite),
@@ -973,6 +981,7 @@ pub fn browser_router(state: AppState) -> Router {
             patch(members::update).delete(members::remove),
         )
         .route("/api/keys", get(keys::list).post(keys::create))
+        .route("/api/usage/keys", get(key_usage::get))
         .route(
             "/api/keys/{id}",
             get(keys::get).patch(keys::update).delete(keys::revoke),

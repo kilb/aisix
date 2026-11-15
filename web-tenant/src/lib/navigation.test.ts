@@ -37,3 +37,27 @@ test("调用记录沿用用量权限，待审和停用组织不可扩大访问",
   }
   assert.equal(canSeePortalTab("calls", "future_role", "active"), false);
 });
+
+test("成员与密钥详情保留主导航并解码自己的标识", () => {
+  assert.deepEqual(portalRouteOf("#members?member=member%2Fa"), { tab: "members", group: null, memberId: "member/a" });
+  assert.deepEqual(portalRouteOf("#keys?key=key%2Fa&edit=1"), { tab: "keys", group: null, keyId: "key/a" });
+  assert.deepEqual(portalRouteOf("#keys?key=key-a&from=2026-11-01T00%3A00%3A00Z"), { tab: "keys", group: null, keyId: "key-a" });
+});
+
+test("详情标识不污染其它页、空值或非法主导航", () => {
+  assert.deepEqual(portalRouteOf("#keys?member=member-a"), { tab: "keys", group: null });
+  assert.deepEqual(portalRouteOf("#members?key=key-a"), { tab: "members", group: null });
+  assert.deepEqual(portalRouteOf("#keys?key="), { tab: "keys", group: null });
+  assert.deepEqual(portalRouteOf("#members?member="), { tab: "members", group: null });
+  assert.deepEqual(portalRouteOf("#invalid?key=key-a&member=member-a"), { tab: "org", group: null });
+});
+
+test("成员详情不扩大普通成员或账单角色的管理入口", () => {
+  for (const role of ["member", "billing", "future_role"]) {
+    for (const status of ["active", "suspended", "pending"]) {
+      assert.equal(canSeePortalTab("members", role, status), false);
+    }
+  }
+  assert.equal(canSeePortalTab("members", "owner", "active"), true);
+  assert.equal(canSeePortalTab("members", "admin", "active"), true);
+});

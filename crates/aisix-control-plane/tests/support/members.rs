@@ -83,6 +83,10 @@ pub fn tenant_fixture(method: &str, path: &str) -> (String, Option<Value>) {
         ("DELETE", "/api/members/invites/{id}") => {
             (format!("/api/members/invites/{}", Uuid::new_v4()), None)
         }
+        ("POST", "/api/members/{id}/password") => (
+            format!("/api/members/{}/password", Uuid::new_v4()),
+            Some(json!({"new_password": "short"})),
+        ),
         ("PATCH", "/api/members/{id}") => (
             format!("/api/members/{}", Uuid::new_v4()),
             Some(json!({"role": "member"})),
@@ -102,6 +106,10 @@ pub fn tenant_fixture(method: &str, path: &str) -> (String, Option<Value>) {
         // A range of one hour, so the summary answers 200.
         ("GET", "/api/billing/summary") => (
             format!("{path}?group=day&from=2026-01-01T00:00:00Z&to=2026-01-01T01:00:00Z"),
+            None,
+        ),
+        ("GET", "/api/usage/keys") => (
+            format!("{path}?from=2026-01-01T00:00:00Z&to=2026-01-02T00:00:00Z"),
             None,
         ),
         ("GET", "/api/usage/calls" | "/api/usage/metrics") => (path.to_string(), None),

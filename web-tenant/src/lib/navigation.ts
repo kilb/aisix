@@ -13,12 +13,20 @@ export const PORTAL_TABS = [
 export type PortalTabId = (typeof PORTAL_TABS)[number]["id"];
 
 /** 深链仍使用既有 hash；账号不复用组织的 billing 页面。 */
-export function portalRouteOf(hash: string): { tab: PortalTabId; group: string | null } {
+export function portalRouteOf(hash: string): { tab: PortalTabId; group: string | null; memberId?: string; keyId?: string } {
   const [name, query = ""] = hash.replace(/^#/, "").split("?", 2);
   const parsed = PORTAL_TABS.find((item) => item.id === name)?.id ?? "org";
-  const tab = parsed === "usage" && new URLSearchParams(query).get("page") === "calls" ? "calls" : parsed;
-  const group = new URLSearchParams(query).get("group");
-  return { tab, group: group === "" ? null : group };
+  const params = new URLSearchParams(query);
+  const tab = parsed === "usage" && params.get("page") === "calls" ? "calls" : parsed;
+  const group = params.get("group");
+  const memberId = params.get("member");
+  const keyId = params.get("key");
+  return {
+    tab,
+    group: group === "" ? null : group,
+    ...(tab === "members" && memberId ? { memberId } : {}),
+    ...(tab === "keys" && keyId ? { keyId } : {}),
+  };
 }
 
 /** 个人安全独立于组织状态；组织业务权限保持原规则。 */

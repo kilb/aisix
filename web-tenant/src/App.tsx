@@ -20,7 +20,9 @@ import { SidebarMenuButton, SidebarShell } from "./ui/Sidebar";
 import { ThemeToggle } from "./ui/ThemeToggle";
 import { Gate } from "./Gate";
 import { Keys } from "./Keys";
+import { KeyDetail } from "./KeyDetail";
 import { Members } from "./Members";
+import { MemberDetail } from "./MemberDetail";
 import { Org, ROLE_LABEL } from "./Org";
 import { Billing } from "./Billing";
 import { Budgets } from "./Budgets";
@@ -53,6 +55,8 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
   const [tab, setTab] = useState<TabId>("org");
   /** The group a `#prices?group=<id>` link named, read when that page opens. */
   const [priceGroup, setPriceGroup] = useState<string | null>(null);
+  const [memberId, setMemberId] = useState<string | null>(null);
+  const [keyId, setKeyId] = useState<string | null>(null);
   const [theme, toggleTheme] = useTheme();
   /** Whether the page has scrolled under the sticky header, which then shows its rule. */
   const [scrolled, setScrolled] = useState(false);
@@ -83,6 +87,8 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
       const route = routeOf(window.location.hash);
       setTab(route.tab);
       setPriceGroup(route.group);
+      setMemberId(route.memberId ?? null);
+      setKeyId(route.keyId ?? null);
     };
     apply();
     window.addEventListener("hashchange", apply);
@@ -96,6 +102,8 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
   const openSection = useCallback((t: TabId) => {
     setTab(t);
     setPriceGroup(null);
+    setMemberId(null);
+    setKeyId(null);
     window.location.hash = `#${t}`;
   }, []);
 
@@ -152,7 +160,7 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
   // 长列表进入新页时回到标题，避免把账号页等短页停在旧页的滚动位置。
   useLayoutEffect(() => {
     window.scrollTo({ top: 0, left: 0, behavior: "instant" });
-  }, [current, me?.tenant.id, me?.member.id]);
+  }, [current, memberId, keyId, me?.tenant.id, me?.member.id]);
 
   if (bootError) {
     return (
@@ -206,7 +214,7 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
   return (
     <SidebarShell
       label="组织门户导航"
-      routeKey={`${tenant.id}:${current}:${priceGroup ?? ""}`}
+      routeKey={`${tenant.id}:${current}:${priceGroup ?? ""}:${memberId ?? ""}:${keyId ?? ""}`}
       brand={
         <span className="brand">
           <span className="brand-mark" aria-hidden="true" />
@@ -278,11 +286,12 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
           {current === "account" ? (
             <AccountSettings member={member} onSignOut={() => void signOut()} />
           ) : current === "keys" ? (
-            <Keys member={member} status={tenant.status} onSelfChanged={() => void boot()} />
+            keyId ? <KeyDetail key={keyId} keyId={keyId} member={member} status={tenant.status} onSelfChanged={() => void boot()} onBack={() => openSection("keys")} /> : <Keys member={member} status={tenant.status} onSelfChanged={() => void boot()} />
           ) : current === "prices" ? (
             <Prices initialGroup={priceGroup} />
           ) : current === "members" ? (
-            <Members member={member} status={tenant.status} onSelfChanged={() => void boot()} onLeft={leave} />
+            memberId ? <MemberDetail key={memberId} memberId={memberId} member={member} status={tenant.status} onBack={() => openSection("members")} onSelfChanged={() => void boot()} onLeft={leave} /> :
+              <Members member={member} status={tenant.status} onSelfChanged={() => void boot()} onLeft={leave} onOpenMember={(id) => { setMemberId(id); window.location.hash = `#members?member=${encodeURIComponent(id)}`; }} />
           ) : current === "usage" || current === "calls" ? (
             <Usage member={member} page={current === "calls" ? "calls" : "analysis"} />
           ) : current === "budgets" ? (
