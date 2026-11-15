@@ -224,9 +224,14 @@ test("long saved logs and billed quantity rows fit narrow detail pages without l
       expect(billed.charge_micro_cny!).toBeGreaterThan(0);
       expect(Array.isArray(billed.lines)).toBe(true);
       expect(billed.lines!.length, "The real billed quantities branch must actually render").toBeGreaterThan(0);
-      expect(billed.lines!.some(line => line.quantity > 0 && /^\d+(?:\.\d+)?$/.test(line.rate) && line.rate.replace(/\D/g, "").length >= 12), "At least one actual billed rate must contain 12 digits to stress narrow quantity cells").toBe(true);
+      const longRateIndex = billed.lines!.findIndex(line => line.dimension !== "web_search" && line.quantity > 0 && /^\d+(?:\.\d+)?$/.test(line.rate) && line.rate.replace(/\D/g, "").length >= 12);
+      expect(longRateIndex, "At least one actual billed Token rate must contain 12 digits to stress narrow quantity cells").toBeGreaterThanOrEqual(0);
       const quantities = page.getByRole("region", { name: `计费数量 ${eventId}`, exact: true });
       await expect(quantities.locator("table tbody tr")).toHaveCount(billed.lines!.length);
+      const longLine = billed.lines![longRateIndex]!;
+      const longRow = quantities.locator("table tbody tr").nth(longRateIndex);
+      await expect(longRow.locator('td[data-label="基准价"]')).toHaveText(`$${longLine.rate} / 百万 tokens`);
+      await expect(longRow.locator('td[data-label="数量"]')).toHaveText(new Intl.NumberFormat("en-US").format(longLine.quantity));
       for (const row of await quantities.locator("table tbody tr").all()) {
         await expect(row.locator("td")).toHaveCount(4);
         for (const label of ["维度", "数量", "基准价", "小计（美元）"]) await expect(row.locator(`td[data-label="${label}"]`)).not.toBeEmpty();
