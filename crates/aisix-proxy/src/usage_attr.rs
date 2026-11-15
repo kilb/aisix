@@ -4554,7 +4554,9 @@ mod tests {
         // in `r` must not open a raw string.
         assert!(at("let c = '\"'; UsageEvent {}", "UsageEvent"));
         assert!(at("let var = 1; UsageEvent {}", "UsageEvent"));
-    }    #[test]
+    }
+
+    #[test]
     fn a_native_context_moves_only_the_original_public_observation_projection() {
         let mut event = UsageEvent::default();
         event.api_key_id = "authoritative-key".into();
@@ -4626,7 +4628,9 @@ mod tests {
     #[test]
     fn private_exporter_headers_alone_do_not_create_a_public_context() {
         let mut client = ClientContext::default();
-        client.request_headers.insert("x-project".into(), "private-observation".into());
+        client
+            .request_headers
+            .insert("x-project".into(), "private-observation".into());
         assert!(native_usage_context(&client, Default::default()).is_none());
     }
 }
