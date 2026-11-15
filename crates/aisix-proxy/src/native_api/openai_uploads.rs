@@ -208,7 +208,48 @@ pub(crate) async fn admit_responses_files(
     }
     let references = super::response_refs::ReferenceScan::collect(body);
     references.resolve(state, auth, client, expected).await?;
-    if state.platform().is_none() || !references.needs_review_copy {
+    review_responses_files(
+        state,
+        auth,
+        body,
+        allow_background,
+        references.needs_review_copy,
+    )
+}
+
+pub(crate) async fn admit_responses_files_with_affinity(
+    state: &ProxyState,
+    auth: &AuthenticatedKey,
+    client: &ClientContext,
+    body: &Value,
+    allow_background: bool,
+    expected: Option<&aisix_core::native_objects::OriginBinding>,
+    affinity: &mut crate::responses_affinity::ContextAffinity,
+) -> Result<(), ProxyError> {
+    if state.native_objects.is_none() && state.platform().is_none() {
+        return Ok(());
+    }
+    let references = super::response_refs::ReferenceScan::collect(body);
+    references
+        .resolve_admitted(state, auth, client, expected, affinity)
+        .await?;
+    review_responses_files(
+        state,
+        auth,
+        body,
+        allow_background,
+        references.needs_review_copy,
+    )
+}
+
+fn review_responses_files(
+    state: &ProxyState,
+    auth: &AuthenticatedKey,
+    body: &Value,
+    allow_background: bool,
+    needs_review_copy: bool,
+) -> Result<(), ProxyError> {
+    if state.platform().is_none() || !needs_review_copy {
         return crate::stored_refs::refuse_in_responses_with_background(
             state.platform(),
             body,

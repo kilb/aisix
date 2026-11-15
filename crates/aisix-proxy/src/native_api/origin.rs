@@ -409,22 +409,27 @@ pub(crate) async fn admit_input_references(
                 .as_ref()
                 .and_then(|sealer| sealer.unseal(crate::opaque_id::IdKind::Item, raw));
             let raw = original.as_deref().unwrap_or(raw);
-            let reference =
-                match resolve_object_reference(state, auth, raw, NativeObjectKind::ResponseItem)
-                    .await
+            let origin = match resolve_admitted_origin(
+                state,
+                auth,
+                raw,
+                NativeObjectKind::ResponseItem,
+                affinity,
+            )
+            .await
+            {
+                Ok(origin) => origin,
+                // 已知原生历史仍固定原账号；可内联的文本没有登记时由实际目标决定。
+                Err(ProxyError::ResponseNotFound | ProxyError::AccountUnavailable)
+                    if inline_reasoning_reference(item) =>
                 {
-                    Ok(reference) => reference,
-                    // 已知原生历史仍固定原账号；可内联的文本没有登记时由实际目标决定。
-                    Err(ProxyError::ResponseNotFound | ProxyError::AccountUnavailable)
-                        if inline_reasoning_reference(item) =>
-                    {
-                        affinity.defer_reasoning_authority();
-                        continue;
-                    }
-                    Err(ProxyError::ResponseNotFound) => return Err(refused()),
-                    Err(error) => return Err(error),
-                };
-            affinity.admit_object_origin(reference.origin.ok_or(ProxyError::ResponseNotFound)?)?;
+                    affinity.defer_reasoning_authority();
+                    continue;
+                }
+                Err(ProxyError::ResponseNotFound) => return Err(refused()),
+                Err(error) => return Err(error),
+            };
+            affinity.admit_object_origin(origin)?;
         }
     }
     let mut paths = Vec::new();
@@ -443,10 +448,15 @@ pub(crate) async fn admit_input_references(
             .as_ref()
             .and_then(|sealer| sealer.unseal(crate::opaque_id::IdKind::Container, &raw))
             .unwrap_or(raw);
-        let reference =
-            resolve_object_reference(state, auth, &original, NativeObjectKind::ResponseContainer)
-                .await?;
-        affinity.admit_object_origin(reference.origin.ok_or(ProxyError::ResponseNotFound)?)?;
+        let origin = resolve_admitted_origin(
+            state,
+            auth,
+            &original,
+            NativeObjectKind::ResponseContainer,
+            affinity,
+        )
+        .await?;
+        affinity.admit_object_origin(origin)?;
         if let Some(value) = body.pointer_mut(&pointer) {
             *value = Value::String(original);
         }
@@ -478,12 +488,36 @@ fn inline_reasoning_reference(item: &Value) -> bool {
 }
 
 /// 翻译目标只消费可见文本；每个原生尝试必须先证明同一存储对象及账号边界。
+#[cfg(test)]
 pub(crate) async fn admit_native_reasoning_references(
     state: &ProxyState,
     snapshot: &AisixSnapshot,
     auth: &AuthenticatedKey,
     model: &aisix_core::Model,
     body: &Value,
+) -> Result<(), ProxyError> {
+    admit_native_reasoning_references_inner(state, snapshot, auth, model, body, None).await
+}
+
+pub(crate) async fn admit_native_reasoning_references_with_affinity(
+    state: &ProxyState,
+    snapshot: &AisixSnapshot,
+    auth: &AuthenticatedKey,
+    model: &aisix_core::Model,
+    body: &Value,
+    affinity: &mut crate::responses_affinity::ContextAffinity,
+) -> Result<(), ProxyError> {
+    admit_native_reasoning_references_inner(state, snapshot, auth, model, body, Some(affinity))
+        .await
+}
+
+async fn admit_native_reasoning_references_inner(
+    state: &ProxyState,
+    snapshot: &AisixSnapshot,
+    auth: &AuthenticatedKey,
+    model: &aisix_core::Model,
+    body: &Value,
+    mut affinity: Option<&mut crate::responses_affinity::ContextAffinity>,
 ) -> Result<(), ProxyError> {
     let Some(platform) = state.platform() else {
         return Ok(());
@@ -499,16 +533,22 @@ pub(crate) async fn admit_native_reasoning_references(
         }
         let refused = || ProxyError::StoredObjectReference(format!("input[{index}].id"));
         let raw = item.get("id").and_then(Value::as_str).ok_or_else(refused)?;
-        let reference = resolve_object_reference(state, auth, raw, NativeObjectKind::ResponseItem)
-            .await
-            .map_err(|error| {
-                if matches!(error, ProxyError::ResponseNotFound) {
-                    refused()
-                } else {
-                    error
-                }
-            })?;
-        let origin = reference.origin.ok_or(ProxyError::AccountUnavailable)?;
+        let origin = match affinity.as_deref_mut() {
+            Some(affinity) => {
+                resolve_admitted_origin(state, auth, raw, NativeObjectKind::ResponseItem, affinity)
+                    .await
+            }
+            None => resolve_object_reference(state, auth, raw, NativeObjectKind::ResponseItem)
+                .await
+                .and_then(|reference| reference.origin.ok_or(ProxyError::AccountUnavailable)),
+        }
+        .map_err(|error| {
+            if matches!(error, ProxyError::ResponseNotFound) {
+                refused()
+            } else {
+                error
+            }
+        })?;
         let provider = model
             .provider_key_id
             .as_deref()
@@ -706,50 +746,91 @@ pub(crate) async fn resolve_object_reference(
         .map_err(proxy_error)?;
     let record = reply
         .record
-        .filter(|r| {
-            reply.state == "found"
-                && !r.deleted
-                && r.raw_id == raw_id
-                && r.protocol == Some(NativeProtocol::Openai)
-                && r.kind == Some(kind)
-        })
+        .filter(|_| reply.state == "found")
         .ok_or(ProxyError::ResponseNotFound)?;
+    let (requested_model, origin) = validate_object_record(
+        state,
+        &snapshot,
+        auth,
+        raw_id,
+        kind,
+        legacy.as_ref().map(|(model, _)| model.as_str()),
+        &record,
+    )?;
+    Ok(ResolvedReference {
+        requested_model,
+        origin: Some(origin),
+        record: Some(record),
+        raw_id: raw_id.to_owned(),
+    })
+}
+
+/// 请求内复用仍运行相同的本地检查；不再查询同一记录，也不复制其已存正文。
+async fn resolve_admitted_origin(
+    state: &ProxyState,
+    auth: &AuthenticatedKey,
+    raw: &str,
+    kind: NativeObjectKind,
+    affinity: &mut crate::responses_affinity::ContextAffinity,
+) -> Result<OriginBinding, ProxyError> {
+    if let Some(record) = affinity.admitted_reference(kind, raw) {
+        let snapshot = state.snapshot.load();
+        return validate_object_record(state, &snapshot, auth, raw, kind, None, record)
+            .map(|(_, origin)| origin);
+    }
+    let reference = resolve_object_reference(state, auth, raw, kind).await?;
+    let origin = reference.origin.ok_or(ProxyError::ResponseNotFound)?;
+    let record = reference.record.ok_or(ProxyError::ResponseNotFound)?;
+    affinity.note_admitted_reference(kind, record);
+    Ok(origin)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_object_record(
+    state: &ProxyState,
+    snapshot: &AisixSnapshot,
+    auth: &AuthenticatedKey,
+    raw_id: &str,
+    kind: NativeObjectKind,
+    legacy_model: Option<&str>,
+    record: &NativeRecord,
+) -> Result<(String, OriginBinding), ProxyError> {
+    if !safe_id(raw_id)
+        || record.deleted
+        || record.raw_id != raw_id
+        || record.protocol != Some(NativeProtocol::Openai)
+        || record.kind != Some(kind)
+    {
+        return Err(ProxyError::ResponseNotFound);
+    }
     let origin = record
         .origin
         .clone()
         .ok_or(ProxyError::AccountUnavailable)?;
-    if legacy
-        .as_ref()
-        .is_some_and(|(model_id, _)| model_id != &origin.model_id.to_string())
-    {
+    if legacy_model.is_some_and(|model_id| model_id != origin.model_id.to_string()) {
         return Err(ProxyError::ResponseNotFound);
     }
-    verify_origin(state, &snapshot, &origin)?;
+    verify_origin(state, snapshot, &origin)?;
     let requested_id = record
         .requested_model_id
         .ok_or(ProxyError::AccountUnavailable)?;
-    let requested_model = super::openai::model_entry_by_id(state, &snapshot, requested_id)
+    let requested_model = super::openai::model_entry_by_id(state, snapshot, requested_id)
         .map_err(|_| ProxyError::ResponseNotFound)?;
-    let target = super::openai::model_entry_by_id(state, &snapshot, origin.model_id)
+    let target = super::openai::model_entry_by_id(state, snapshot, origin.model_id)
         .map_err(|_| ProxyError::ResponseNotFound)?;
     if !auth
         .key()
-        .can_access(&snapshot, &requested_model.value.display_name)
+        .can_access(snapshot, &requested_model.value.display_name)
         || (!auth.key().allowed_provider_groups.is_empty()
             && !crate::routing::target_in_groups(
-                &snapshot,
+                snapshot,
                 &target.value,
                 &auth.key().allowed_provider_groups,
             ))
     {
         return Err(ProxyError::ResponseNotFound);
     }
-    Ok(ResolvedReference {
-        requested_model: requested_model.value.display_name.clone(),
-        origin: Some(origin),
-        record: Some(record),
-        raw_id: raw_id.to_owned(),
-    })
+    Ok((requested_model.value.display_name.clone(), origin))
 }
 
 #[cfg(test)]

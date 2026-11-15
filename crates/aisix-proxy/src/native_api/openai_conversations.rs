@@ -243,25 +243,6 @@ pub(crate) fn take_response_conversation(body: &mut Value) -> Option<String> {
     Some(raw)
 }
 
-pub(crate) async fn admit_response_conversation(
-    state: &ProxyState,
-    auth: &AuthenticatedKey,
-    client: &ClientContext,
-    raw: &str,
-) -> Result<(OriginBinding, NativeRecord), ProxyError> {
-    let (_, origin, record) = crate::attribution::detached(openai::lookup_reference(
-        state,
-        auth,
-        client,
-        raw,
-        KIND,
-        None,
-        EndpointFamily::Responses,
-    ))
-    .await?;
-    Ok((origin, record))
-}
-
 async fn check_selector(
     state: &ProxyState,
     auth: &AuthenticatedKey,

@@ -29,8 +29,10 @@
 //! tenant ([`ContextAffinity::admit_continuation`]).
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use aisix_core::native_objects::{NativeObjectKind, NativeRecord};
 use base64::Engine as _;
 use ring::aead;
 use serde_json::Value;
@@ -432,6 +434,8 @@ pub(crate) fn legacy_response_reference(
     }
 }
 
+type AdmittedReferences = BTreeMap<&'static str, BTreeMap<String, Arc<NativeRecord>>>;
+
 /// What a request's tags said, recorded while removing them.
 #[derive(Debug, Default)]
 pub(crate) struct ContextAffinity {
@@ -455,6 +459,8 @@ pub(crate) struct ContextAffinity {
     /// ([`crate::opaque_id::unseal_responses_input`]).
     unopened_item_reference: Option<usize>,
     owned_container_paths: Vec<String>,
+    /// 仅本请求已查询的正式引用；空请求不分配，重试共享记录而不深复制其条目和上下文。
+    admitted_references: Option<Arc<AdmittedReferences>>,
     /// The positions, in `input[]` as the caller sent it and ascending, of
     /// the items [`Self::unwrap_input`] dropped, so a refusal can name an
     /// item by the position the caller knows it at.
@@ -545,6 +551,28 @@ impl ContextAffinity {
 
     pub(crate) fn note_owned_container(&mut self, pointer: String) {
         self.owned_container_paths.push(pointer);
+    }
+
+    pub(crate) fn admitted_reference(
+        &self,
+        kind: NativeObjectKind,
+        raw: &str,
+    ) -> Option<&NativeRecord> {
+        self.admitted_references
+            .as_deref()?
+            .get(kind.as_str())?
+            .get(raw)
+            .map(Arc::as_ref)
+    }
+
+    pub(crate) fn note_admitted_reference(&mut self, kind: NativeObjectKind, record: NativeRecord) {
+        let records = self
+            .admitted_references
+            .get_or_insert_with(|| Arc::new(BTreeMap::new()));
+        Arc::make_mut(records)
+            .entry(kind.as_str())
+            .or_default()
+            .insert(record.raw_id.clone(), Arc::new(record));
     }
 
     pub(crate) fn stored_object_check_body<'a>(&self, body: &'a Value) -> Cow<'a, Value> {

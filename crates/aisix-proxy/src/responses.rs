@@ -638,7 +638,7 @@ pub(crate) async fn responses_operation(
         &auth,
         &operation,
         &mut body,
-        &affinity,
+        &mut affinity,
         conversation_record_id.as_ref(),
         &request_id,
         started,
@@ -993,7 +993,7 @@ async fn dispatch(
     // text in place before it reaches the upstream.
     body: &mut Value,
     // The context tags `responses` removed from `body`.
-    affinity: &crate::responses_affinity::ContextAffinity,
+    affinity: &mut crate::responses_affinity::ContextAffinity,
     conversation_record_id: Option<&(String, Uuid)>,
     request_id: &str,
     // Request-scoped clock + downstream client attribution, threaded so the
@@ -1053,17 +1053,19 @@ async fn dispatch(
         && state.platform().is_some()
         && state.native_objects.is_some()
         && body.get("background").and_then(Value::as_bool) == Some(true);
-    crate::native_api::openai_uploads::admit_responses_files(
+    let checked_body = affinity.stored_object_check_body(body);
+    crate::native_api::openai_uploads::admit_responses_files_with_affinity(
         state,
-        snapshot,
         auth,
         client,
-        &affinity.stored_object_check_body(body),
+        &checked_body,
         durable_background,
         None,
+        affinity,
     )
     .await
     .map_err(|err| affinity.at_caller_position(err))?;
+    drop(checked_body);
     affinity.refuse_unopened_item_reference()?;
 
     // Platform mode: a continuation names a response this tenant was handed,
@@ -1578,12 +1580,13 @@ async fn dispatch(
             );
             crate::attribution::note_translated_dispatch(!native);
             let result = if native {
-                match crate::native_api::origin::admit_native_reasoning_references(
+                match crate::native_api::origin::admit_native_reasoning_references_with_affinity(
                     state,
                     snapshot,
                     auth,
                     &target.model,
                     body,
+                    affinity,
                 )
                 .await
                 {
@@ -1595,6 +1598,7 @@ async fn dispatch(
                             operation,
                             attempt_body,
                             conversation_record_id,
+                            affinity,
                             mark,
                             &target.model,
                             &target.id,
@@ -2048,6 +2052,7 @@ async fn responses_to_target(
     operation: &NativeResponseOperation,
     body: &Value,
     admitted_conversation: Option<&(String, Uuid)>,
+    affinity: &mut crate::responses_affinity::ContextAffinity,
     // The context tags this attempt's response carries back.
     mark: crate::responses_affinity::ResponseMark,
     model: &Arc<aisix_core::Model>,
@@ -2206,7 +2211,7 @@ async fn responses_to_target(
         if let Some(raw) = conversation_to_resolve {
             conversation_record_id = Some(
                 crate::native_api::response_refs::admit_final_conversation(
-                    state, auth, client_ctx, &raw, &pk_entry,
+                    state, auth, client_ctx, &raw, &pk_entry, affinity,
                 )
                 .await?,
             );

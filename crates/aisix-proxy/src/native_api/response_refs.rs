@@ -41,9 +41,17 @@ pub(crate) async fn admit_final_conversation(
     client: &ClientContext,
     raw: &str,
     provider: &ResourceEntry<ProviderKey>,
+    affinity: &mut crate::responses_affinity::ContextAffinity,
 ) -> Result<uuid::Uuid, ProxyError> {
-    let (origin, record) =
-        super::openai_conversations::admit_response_conversation(state, auth, client, raw).await?;
+    let (origin, record_id) = crate::attribution::detached(resolve_admitted_reference(
+        state,
+        auth,
+        client,
+        raw,
+        NativeObjectKind::Conversation,
+        affinity,
+    ))
+    .await?;
     let provider_key_id = super::openai::resource_id(state, "provider_keys", &provider.id)?;
     let boundary = configured_native_origin(
         &state
@@ -58,7 +66,43 @@ pub(crate) async fn admit_final_conversation(
     if origin.provider_key_id != provider_key_id || origin.boundary != boundary {
         return Err(ProxyError::ResponseNotFound);
     }
-    Ok(record.record_id)
+    Ok(record_id)
+}
+
+async fn resolve_admitted_reference(
+    state: &ProxyState,
+    auth: &AuthenticatedKey,
+    client: &ClientContext,
+    raw: &str,
+    kind: NativeObjectKind,
+    affinity: &mut crate::responses_affinity::ContextAffinity,
+) -> Result<(OriginBinding, uuid::Uuid), ProxyError> {
+    if let Some(record) = affinity.admitted_reference(kind, raw) {
+        let (_, origin) = super::openai::validate_reference_record(
+            state,
+            auth,
+            client,
+            raw,
+            kind,
+            None,
+            EndpointFamily::Responses,
+            record,
+        )?;
+        return Ok((origin, record.record_id));
+    }
+    let (_, origin, record) = super::openai::lookup_reference(
+        state,
+        auth,
+        client,
+        raw,
+        kind,
+        None,
+        EndpointFamily::Responses,
+    )
+    .await?;
+    let record_id = record.record_id;
+    affinity.note_admitted_reference(kind, record);
+    Ok((origin, record_id))
 }
 
 pub(crate) fn take_references(body: &mut Value) -> Vec<(NativeObjectKind, String)> {
@@ -246,8 +290,39 @@ impl<'a> ReferenceScan<'a> {
         }
         Ok(records)
     }
+
+    pub(crate) async fn resolve_admitted(
+        &self,
+        state: &ProxyState,
+        auth: &AuthenticatedKey,
+        client: &ClientContext,
+        expected: Option<&OriginBinding>,
+        affinity: &mut crate::responses_affinity::ContextAffinity,
+    ) -> Result<Vec<OriginBinding>, ProxyError> {
+        let mut origins = Vec::with_capacity(self.references.len());
+        let mut account = expected.cloned();
+        for &(kind, raw) in &self.references {
+            if kind == NativeObjectKind::Skill && super::skills::curated_openai_skill(raw) {
+                continue;
+            }
+            let (origin, _) = crate::attribution::detached(resolve_admitted_reference(
+                state, auth, client, raw, kind, affinity,
+            ))
+            .await?;
+            if account.as_ref().is_some_and(|expected| {
+                expected.provider_key_id != origin.provider_key_id
+                    || expected.boundary != origin.boundary
+            }) {
+                return Err(ProxyError::ResponseNotFound);
+            }
+            account.get_or_insert_with(|| origin.clone());
+            origins.push(origin);
+        }
+        Ok(origins)
+    }
 }
 
+#[cfg(test)]
 pub(crate) async fn resolve(
     state: &ProxyState,
     auth: &AuthenticatedKey,
@@ -282,18 +357,18 @@ pub(crate) async fn admit_affinity_with_conversation(
     if state.native_objects.is_none() && state.platform().is_none() {
         return Ok(None);
     }
-    let conversation = conversation_id(body);
-    let mut conversation_record_id = None;
-    for record in resolve(state, auth, client, body, None).await? {
-        // 只保存本次正式槽匹配的已授权记录，不从引用数量推断 conversation。
-        if record.kind == Some(NativeObjectKind::Conversation)
-            && Some(record.raw_id.as_str()) == conversation
-        {
-            conversation_record_id = Some((record.raw_id.clone(), record.record_id));
-        }
-        affinity.admit_object_origin(record.origin.ok_or(ProxyError::AccountUnavailable)?)?;
+    for origin in ReferenceScan::collect(body)
+        .resolve_admitted(state, auth, client, None, affinity)
+        .await?
+    {
+        affinity.admit_object_origin(origin)?;
     }
-    Ok(conversation_record_id)
+    // 只取本次正式 conversation 槽匹配的已授权记录，不能沿用已删除的旧槽。
+    Ok(conversation_id(body).and_then(|raw| {
+        affinity
+            .admitted_reference(NativeObjectKind::Conversation, raw)
+            .map(|record| (raw.to_owned(), record.record_id))
+    }))
 }
 
 #[cfg(test)]
