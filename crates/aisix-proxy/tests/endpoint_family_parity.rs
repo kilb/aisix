@@ -746,6 +746,8 @@ fn a_handler_that_spends_the_rate_limit_window_also_reports_it() {
     /// Calls that reserve the request-level layers (api_key / team / member).
     const SPENDS_THE_WINDOW: &[&str] = &[
         "quota::enforce(",
+        // 请求层与模型层拆开持有，仍经同一预留路径消费调用方窗口。
+        "quota::enforce_split(",
         "quota::enforce_rate_limit(",
         "quota::enforce_mcp(",
     ];
