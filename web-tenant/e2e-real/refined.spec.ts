@@ -328,9 +328,9 @@ test("key-change-never-commits-old-rows-and-local-query-hides-immediately", asyn
     const w = window as unknown as { refinedSamples: { key: string; staleRows: string[]; query: string }[]; refinedObserver: MutationObserver; refinedRaf: number };
     w.refinedSamples = [];
     const sample = (): void => {
-      const select = [...document.querySelectorAll("select")].find(n => n.value === empty);
+      const control = [...document.querySelectorAll<HTMLElement>('[role="combobox"][data-value]')].find(n => n.getAttribute("data-value") === empty);
       const rows = [...document.querySelectorAll("main tbody tr")].map(n => n.textContent ?? "");
-      w.refinedSamples.push({ key: select?.value ?? "", staleRows: rows.filter(text => old.some(o => o.replace(/\s+/g, "").trim() === text.replace(/\s+/g, "").trim())), query: location.hash });
+      w.refinedSamples.push({ key: control?.getAttribute("data-value") ?? "", staleRows: rows.filter(text => old.some(o => o.replace(/\s+/g, "").trim() === text.replace(/\s+/g, "").trim())), query: location.hash });
     };
     w.refinedObserver = new MutationObserver(sample); w.refinedObserver.observe(document.querySelector("main")!, { subtree: true, childList: true, characterData: true, attributes: true });
     const frame = (): void => { sample(); w.refinedRaf = requestAnimationFrame(frame); }; frame();
@@ -340,6 +340,7 @@ test("key-change-never-commits-old-rows-and-local-query-hides-immediately", asyn
   await settle(page);
   const samples = await page.evaluate(() => { const w = window as any; w.refinedObserver.disconnect(); cancelAnimationFrame(w.refinedRaf); return w.refinedSamples; });
   expect(samples.length).toBeGreaterThan(0);
+  expect(samples.some((sample: any) => sample.key === fixture.emptyKeyId), "observer recorded the selected empty key").toBe(true);
   expect(samples.filter((x: any) => x.key === fixture.emptyKeyId && x.staleRows.length > 0)).toEqual([]);
   await test.info().attach("real-key-scope-dom-commits", { body: JSON.stringify(samples), contentType: "application/json" });
   await goto(page, "#calls");
