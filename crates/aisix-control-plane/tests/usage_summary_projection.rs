@@ -413,6 +413,64 @@ async fn summaries_keep_billed_retries_net_zero_corrections_and_the_original_eve
     .await;
     assert_corrected_summary(&tenant, s.paid, s.unpaid);
     assert_eq!(admin, tenant);
+    // 原付费行的明细非空；最新 NULL 不得退回原 charge 或更早的已知修正。
+    let original_lines: Value = sqlx::query_scalar(
+        "SELECT lines FROM pricing_charges_cny WHERE event_id='summary-paid-retry'",
+    )
+    .fetch_one(s.w.cp.db().pool())
+    .await
+    .expect("先验证付费行确有非空原明细");
+    assert_eq!(original_lines.as_array().expect("原付费明细数组").len(), 3);
+    correction(
+        &s.w,
+        "summary-paid-retry",
+        Uuid::from_u128(0x30),
+        5,
+        at("2026-01-03T10:00:00Z"),
+        Some(original_lines),
+    )
+    .await;
+    correction(
+        &s.w,
+        "summary-paid-retry",
+        Uuid::from_u128(0x31),
+        -5,
+        at("2026-01-03T11:00:00Z"),
+        None,
+    )
+    .await;
+    let net: (i64, i64, i64) = sqlx::query_as(
+        "SELECT count(*),COALESCE(sum(delta_micro_cny)::bigint,0), \
+         (count(*) FILTER (WHERE lines IS NULL))::bigint FROM pricing_adjustments_cny \
+         WHERE event_id='summary-paid-retry'",
+    )
+    .fetch_one(s.w.cp.db().pool())
+    .await
+    .expect("两个非零修正净额为零且最新缺明细");
+    assert_eq!(net, (2, 0, 1));
+    let without_detail = get(
+        &s.w.cp,
+        &format!("/api/usage/summary?{range}"),
+        owner.cookie(),
+    )
+    .await;
+    let admin_without_detail = get(
+        &s.w.cp,
+        &format!("/admin/tenants/{}/usage/summary?{range}", s.w.tenant),
+        viewer.cookie(),
+    )
+    .await;
+    assert_eq!(items(&without_detail).len(), 2);
+    assert_row(
+        model_row(&without_detail, s.paid),
+        2,
+        1377,
+        1,
+        quantities(1),
+    );
+    assert_row(model_row(&without_detail, s.unpaid), 2, 0, 0, json!({}));
+    assert_ne!(without_detail, tenant, "未知明细不能伪装成原来两份已知量");
+    assert_eq!(admin_without_detail, without_detail);
     let late = query("day", "2026-01-03T00:00:00Z", "2026-01-04T00:00:00Z");
     for (path, cookie) in [
         (format!("/api/usage/summary?{late}"), owner.cookie()),
