@@ -221,12 +221,22 @@ fn checked_window(q: &MetricsQuery) -> Result<(DateTime<Utc>, DateTime<Utc>, Buc
 /// 新增遥测字段是可选的；错误类型或超出 u32 的值同缺失处理，不让历史 JSON 使汇总失败。
 fn counter(field: &str) -> String {
     format!(
-        "CASE WHEN jsonb_typeof(ue.event->'{field}') = 'number' \
-        AND (ue.event->>'{field}') ~ '^[0-9]{{1,10}}$' \
-        THEN CASE WHEN (ue.event->>'{field}')::numeric <= 4294967295 \
-          THEN (ue.event->>'{field}')::bigint END END"
+        "CASE WHEN jsonb_typeof(counter_fields.{field}) = 'number' \
+        AND (counter_fields.{field} #>> '{{}}') ~ '^[0-9]{{1,10}}$' \
+        THEN CASE WHEN (counter_fields.{field} #>> '{{}}')::numeric <= 4294967295 \
+          THEN (counter_fields.{field} #>> '{{}}')::bigint END END"
     )
 }
+
+// 一次解包大事件，数值校验只读取各字段的小 JSON；保留 jsonb 类型，避免把字符串强转成数值。
+// 原始对象的字段存在性仍由调用处判断，显式 null 不冒充省略。旧的非对象记录按缺失字段读取。
+const COUNTER_FIELDS: &str = " CROSS JOIN LATERAL jsonb_to_record(\
+    CASE WHEN jsonb_typeof(ue.event) = 'object' THEN ue.event ELSE '{}'::jsonb END\
+    ) AS counter_fields(prompt_tokens jsonb, completion_tokens jsonb, reasoning_tokens jsonb, \
+    total_tokens jsonb, cached_prompt_tokens jsonb, cache_read_tokens jsonb, \
+    cache_creation_tokens jsonb, cache_write_tokens jsonb, status_code jsonb, \
+    first_token_latency_ms jsonb, downstream_latency_ms jsonb, upstream_ttft_ms jsonb, \
+    upstream_latency_ms jsonb)";
 
 fn count(condition: &str) -> String {
     format!("count(*) FILTER (WHERE {condition})")
@@ -406,10 +416,9 @@ async fn summarize(
     .join(" AND ");
     columns.push(format!("({valid_optional}) AS valid_optional_usage"));
     sql.push(columns.join(", "))
-        .push(
-            " FROM pricing_charges_cny pc JOIN usage_events ue ON ue.event_id = pc.event_id \
-        WHERE pc.occurred_at >= ",
-        )
+        .push(" FROM pricing_charges_cny pc JOIN usage_events ue ON ue.event_id = pc.event_id")
+        .push(COUNTER_FIELDS)
+        .push(" WHERE pc.occurred_at >= ")
         .push_bind(from)
         .push(" AND pc.occurred_at < ")
         .push_bind(to);
@@ -839,7 +848,9 @@ async fn summarize_direct_models(
     columns.push(format!("({optional_usage}) AS valid_optional_usage"));
     columns.push("CASE WHEN jsonb_typeof(ue.event->'cache_usage_reported') = 'boolean' THEN (ue.event->>'cache_usage_reported')::boolean WHEN ue.event ? 'cache_usage_reported' THEN FALSE END AS explicit_cache_reported".to_string());
     sql.push(columns.join(", "))
-        .push(" FROM usage_events ue WHERE ue.occurred_at >= ")
+        .push(" FROM usage_events ue")
+        .push(COUNTER_FIELDS)
+        .push(" WHERE ue.occurred_at >= ")
         .push_bind(from)
         .push(" AND ue.occurred_at < ")
         .push_bind(to)

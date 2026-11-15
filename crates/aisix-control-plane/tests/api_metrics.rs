@@ -655,3 +655,89 @@ async fn malformed_or_inconsistent_cache_usage_is_unknown_instead_of_zero_or_ove
     assert_eq!(t["tokens"]["unknown_usage_attempts"], 2);
     assert_eq!(t["tokens"]["input_tokens"], 100);
 }
+
+#[tokio::test]
+async fn numeric_projection_keeps_json_types_nulls_and_u32_boundaries() {
+    let Some(w) = world().await else { return };
+    let model = seed_model(&w.cp, &w.admin).await;
+    let owner = w.cp.member_login_seeded(w.tenant, MemberRole::Owner).await;
+    let mut events = vec![event(
+        &w,
+        "projection-valid",
+        model,
+        json!({"prompt_tokens": 4294967295_u64, "completion_tokens": 0,
+            "first_token_latency_ms": 0, "cache_write_tokens": null}),
+    )];
+    for (index, invalid) in [
+        json!("1"),
+        json!(-1),
+        json!(1.5),
+        json!(4294967296_u64),
+        Value::Null,
+        json!([]),
+        json!({}),
+        json!(true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        events.push(event(
+            &w,
+            &format!("projection-invalid-{index}"),
+            model,
+            json!({"prompt_tokens": invalid, "completion_tokens": 0,
+                "first_token_latency_ms": invalid}),
+        ));
+    }
+    events.push(event(
+        &w,
+        "projection-optional-null",
+        model,
+        json!({"prompt_tokens": 10, "completion_tokens": 0, "reasoning_tokens": null}),
+    ));
+    let legacy = [
+        Value::Null,
+        json!([]),
+        json!(true),
+        json!(123),
+        json!("legacy"),
+    ];
+    for index in 0..legacy.len() {
+        events.push(event(
+            &w,
+            &format!("projection-legacy-{index}"),
+            model,
+            json!({}),
+        ));
+    }
+    intake(&w, events).await;
+    // 存量表没有对象约束；旧坏行不能让一次全量统计失败。
+    for (index, raw) in legacy.into_iter().enumerate() {
+        sqlx::query("UPDATE usage_events SET event = $1 WHERE event_id = $2")
+            .bind(raw)
+            .bind(format!("projection-legacy-{index}"))
+            .execute(w.cp.db().pool())
+            .await
+            .expect("准备旧的非对象记录");
+    }
+    for (path, cookie) in [
+        ("/api/usage/metrics".to_string(), owner.cookie()),
+        ("/admin/usage/metrics".to_string(), w.admin.cookie()),
+        (
+            format!("/admin/tenants/{}/usage/metrics", w.tenant),
+            w.admin.cookie(),
+        ),
+    ] {
+        let response = w.cp.send("GET", &path, Some(cookie), None).await;
+        let t = totals(&response);
+        assert_eq!(t["requests"], 10, "{path}");
+        assert_eq!(t["unknown_final_attempts"], 5, "{path}");
+        assert_eq!(t["tokens"]["known_usage_attempts"], 1, "{path}");
+        assert_eq!(t["tokens"]["unknown_usage_attempts"], 9, "{path}");
+        assert_eq!(t["tokens"]["prompt_tokens"], 4294967295_u64, "{path}");
+        assert_eq!(t["tokens"]["completion_tokens"], 0, "{path}");
+        assert_eq!(t["first_token_latency_ms"]["sample_count"], 1, "{path}");
+        assert_eq!(t["first_token_latency_ms"]["missing_count"], 9, "{path}");
+        near(&t["first_token_latency_ms"]["p99"], 0.0);
+    }
+}
