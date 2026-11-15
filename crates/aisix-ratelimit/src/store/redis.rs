@@ -844,14 +844,16 @@ impl RateStore for RedisStore {
     }
 
     async fn commit(&self, key: &str, tokens: u64, member: &str) {
-        self.lease_members
-            .remove(&(key.to_string(), member.to_string()));
+        // 等待期间仍保留所有权：commit 被取消时，Reservation::Drop 还要清理远程槽。
         let prefix = self.bucket_prefix(key);
         let mut conn = match self.conn.acquire().await {
             Ok(c) => c,
             Err(e) => {
                 self.note_failure("commit", &e);
-                return self.local.commit(key, tokens, member).await;
+                self.local.commit(key, tokens, member).await;
+                self.lease_members
+                    .remove(&(key.to_string(), member.to_string()));
+                return;
             }
         };
         let res: Result<i64, redis::RedisError> = Script::new(COMMIT_LUA)
@@ -880,14 +882,22 @@ impl RateStore for RedisStore {
                 self.local.commit(key, tokens, member).await;
             }
         }
+        self.lease_members
+            .remove(&(key.to_string(), member.to_string()));
     }
 
     fn release(&self, key: &str, member: &str) {
-        self.lease_members
-            .remove(&(key.to_string(), member.to_string()));
+        let ownership = self
+            .lease_members
+            .remove(&(key.to_string(), member.to_string()))
+            .map(|(_, ownership)| ownership);
         // Drop the local slot first (a cheap no-op when the bucket was
         // never acquired locally); covers the degraded-acquire case.
         self.local.release(key, member);
+        // 无共享租约或只在本地取得的槽都已清完；Unknown 仍可能在 Redis 中。
+        if matches!(ownership, None | Some(LeaseOwnership::LocalOnly)) {
+            return;
+        }
         let conc_key = format!("{}:conc", self.bucket_prefix(key));
         let conn = self.conn.clone();
         let member = member.to_string();

@@ -392,7 +392,7 @@ impl MultiReservation {
                 // observed a missing lease while upstream response headers
                 // were pending. A per-layer watcher forwards that durable
                 // state into the one response-body receiver below.
-                if let Some(task) = r.refresh_task.take().or_else(|| {
+                let refresh_task = r.refresh_task.take().or_else(|| {
                     spawn_lease_refresh(
                         Arc::clone(&store),
                         r.key.clone(),
@@ -400,14 +400,19 @@ impl MultiReservation {
                         r.has_concurrency_slot,
                         Some(r.lease_loss.clone()),
                     )
-                }) {
+                });
+                let has_refresh_task = refresh_task.is_some();
+                if let Some(task) = refresh_task {
                     refresh_tasks.push(task);
                 }
-                let mut source = r.lease_loss.subscribe();
-                if *source.borrow_and_update() {
+                if *r.lease_loss.borrow() {
                     lease_loss.send_replace(true);
-                } else if let Some(task) = spawn_lease_loss_forwarder(source, lease_loss.clone()) {
-                    lease_loss_tasks.push(task);
+                } else if has_refresh_task {
+                    if let Some(task) =
+                        spawn_lease_loss_forwarder(r.lease_loss.subscribe(), lease_loss.clone())
+                    {
+                        lease_loss_tasks.push(task);
+                    }
                 }
                 (store, r.key.clone(), r.member.clone())
             })
