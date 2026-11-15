@@ -339,7 +339,9 @@ export function App() {
     setOperator(op);
     setSignOutError(null);
     setSessionEnded(false);
-    setTab("overview");
+    // 日志分享链接登录后仍打开原事件，避免跳回概览丢失定位。
+    const destination = adminRouteOf(window.location.hash);
+    if (destination.tab !== "calls" || !destination.query.get("detail")) setTab("overview");
   }, []);
 
   // Signed out only once the control plane has revoked the session (or says

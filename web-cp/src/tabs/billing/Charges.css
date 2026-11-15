@@ -33,7 +33,7 @@
 .charge-records-table th:nth-child(3) { width: 13%; }
 .charge-records-table th:nth-child(4) { width: 16%; }
 .charge-records-table th:nth-child(5) { width: 19%; }
-.charge-records-table th:last-child { width: 64px; }
+.charge-records-table th:last-child { width: 88px; }
 .charge-records .cell-note { margin-top: 2px; }
 .charge-records .io-token-reference { color: var(--muted-foreground); font-size: 12px; line-height: 18px; }
 @media (max-width: 899px) { .charge-records .usage-performance { text-align: left; max-width: 24rem; } }
@@ -43,7 +43,7 @@
 .charge-col-money { width: 12%; }
 .charge-col-service { width: 15%; }
 .charge-col-performance { width: 22%; }
-.charge-col-action { width: 64px; }
+.charge-col-action { width: 88px; }
 
 @media (min-width: 900px) { .charge-records .charge-records-table td.right { padding-inline: 10px; } }
 
@@ -59,3 +59,7 @@
 .charge-workspace > details { margin-block: 10px; padding-block: 10px; }
 .charge-workspace .usage-record-filter-note { margin-top: 6px; }
 @media (max-width: 599px) { .charge-primary-filters > .f.filter { flex: 1 1 130px; } }
+
+/* 错误只作列表摘要，完整内容进入独立日志页阅读。 */
+.call-error-summary { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; overflow-wrap: anywhere; margin-top: 5px; color: var(--destructive); font-size: 12px; line-height: 18px; }
+.call-log-link { display: inline-flex; align-items: center; justify-content: center; min-height: 44px; font-size: 12px; color: var(--primary); text-decoration: underline; text-underline-offset: 3px; }

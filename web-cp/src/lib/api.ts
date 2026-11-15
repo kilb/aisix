@@ -1037,6 +1037,8 @@ export interface Charge extends UsageAuditData {
   status_code: number | null;
   /** The failed attempt's error class; `null` for a success. */
   error_class: string | null;
+  /** 已记录的错误摘要；旧控制面或未记录错误时缺失。 */
+  error_message?: string | null;
   /** `initial`, `retry` or `fallback`. */
   attempt_kind: string;
   /** The attempt's 0-based index within its request. */
@@ -1087,6 +1089,26 @@ export const charges = {
     for (const [k, v] of Object.entries(f)) if (v !== undefined && v !== "") q.set(k, String(v));
     const qs = q.toString();
     return (await call<{ items: Charge[]; next_before: number | null }>("GET", `/admin/pricing/charges${qs ? `?${qs}` : ""}`)).data;
+  },
+};
+
+/** 一条已保存的调用事件；未知字段保留供管理员查看，响应已由服务端脱敏。 */
+export interface StoredUsageEvent {
+  seq: number;
+  event_id: string;
+  occurred_at: string;
+  received_at: string;
+  dp_id: string;
+  batch_id: string;
+  team_id: string | null;
+  api_key_id: string | null;
+  request_id: string | null;
+  event: Record<string, unknown> & UsageAuditData;
+}
+
+export const usageEvents = {
+  async get(eventId: string): Promise<StoredUsageEvent> {
+    return (await call<StoredUsageEvent>("GET", `/admin/usage/events/${seg(eventId)}`)).data;
   },
 };
 

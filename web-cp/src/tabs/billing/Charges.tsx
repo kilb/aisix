@@ -3,6 +3,7 @@ import { RecordTools, RecordPager } from "../../components/RecordTools";
 import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import type { TabProps } from "../../App";
 import { charges, tenants as tenantsApi, type AdminKey, type Charge, type ChargeFilter, type Tenant } from "../../lib/api";
+import { callDetailHash } from "../../lib/callLog";
 import { chargeReason } from "../../lib/chargeReason";
 import { errorText } from "../../lib/fmt";
 import { fmtMicroCny } from "../../lib/money";
@@ -256,7 +257,7 @@ export function Charges(_props: TabProps) {
                   <th>响应性能</th>
                   <th>用量 / 字节估算</th>
                   <th className="right">
-                    <span className="vh">复核</span>
+                    <span className="vh">日志 / 复核</span>
                   </th>
                 </tr>
               </thead>
@@ -270,7 +271,10 @@ export function Charges(_props: TabProps) {
                           <span className="cell-note">{tenantName(c.tenant_id)}</span>
                           <span className="cell-note tabular">{fmtBeijing(c.occurred_at)}</span>
                         </td>
-                        <td data-label="计价结果">{statusLabel(c.status)}<span className="cell-note">{chargeReason(c)}</span></td>
+                        <td data-label="计价结果">{statusLabel(c.status)}<span className="cell-note">{chargeReason(c)}</span>
+                          <span className="cell-note">HTTP {c.status_code ?? "—"}{c.error_class ? ` · ${c.error_class}` : ""}</span>
+                          {c.error_message && <span className="call-error-summary">{c.error_message}</span>}
+                        </td>
                         <td data-label="费用（元）" className="num"><span className="finance-amount-label">售价</span><span className="finance-amount-value">{c.charge_micro_cny === null ? "—" : fmtMicroCny(c.charge_micro_cny)}</span>
                           <span className="cell-note">成本 {c.cost_micro_cny === null ? "—" : fmtMicroCny(c.cost_micro_cny)}</span>
                         </td>
@@ -280,7 +284,8 @@ export function Charges(_props: TabProps) {
                         </td>
                         <td data-label="响应性能"><UsagePerformance data={c} /></td>
                         <td data-label="用量" className="tabular text-caption"><span title={usageSummary(c.usage) ?? undefined}>输入 {c.usage_input_tokens == null ? "—" : formatCount(c.usage_input_tokens)} / 输出 {c.usage?.completion_tokens == null ? "—" : formatCount(c.usage.completion_tokens)}</span><IoReferenceSummary c={c} /></td>
-                        <td data-label="复核" className="right">
+                        <td data-label="日志 / 复核" className="right">
+                          <a className="call-log-link" href={callDetailHash(query, c.event_id)} aria-label={`查看调用日志 ${c.event_id}`}>查看日志</a>
                           <Button
                             kind="quiet"
                             size="sm"
@@ -395,7 +400,7 @@ const ROW = "h-auto border-b border-border px-2 py-1.5 text-caption tabular-nums
  * counters the upstream reported, and the formula with its group rate and
  * discount, recomputed beside the amount billed.
  */
-function ChargeCheck({ c }: { c: Charge }) {
+export function ChargeCheck({ c }: { c: Charge }) {
   const reported = reportedCounters(c.usage);
   const recomputed = chargeFromLines(c.lines, c.cny_per_usd_e4, c.discount_bps);
   return (
