@@ -103,3 +103,9 @@ BEGIN SELECT RAISE(ABORT,'immutable native metering receipt'); END;
 CREATE TRIGGER IF NOT EXISTS native_terminal_payload_immutable BEFORE UPDATE OF
  event_id,record_id,entry_id,submission,owner,usage,event ON native_terminal_outbox
 BEGIN SELECT RAISE(ABORT,'immutable native terminal payload'); END;
+
+-- 已完成历史不进入后台租约和终态投递的轮询范围。
+CREATE INDEX IF NOT EXISTS native_objects_poll_pending
+ ON native_objects(poll_after,record_id) WHERE pending=1;
+CREATE INDEX IF NOT EXISTS native_terminal_delivery_pending
+ ON native_terminal_outbox(event_id) WHERE delivered=0;
