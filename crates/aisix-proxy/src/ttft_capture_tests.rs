@@ -24,7 +24,7 @@ async fn early_start_late_text(endpoint: &str) -> aisix_obs::UsageEvent {
                             b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"answer\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":5}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
                         ));
                     };
-                    Response::builder()
+                    axum::http::Response::builder()
                         .header("content-type", "text/event-stream")
                         .body(Body::from_stream(bytes))
                         .unwrap()
