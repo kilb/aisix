@@ -163,6 +163,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-stream",
+ "tokio-tungstenite",
  "tonic",
  "tonic-build",
  "tower 0.5.3",

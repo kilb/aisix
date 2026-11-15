@@ -109,6 +109,8 @@ rustix = { version = "1", features = ["process"] }
 tonic-build = "=0.12.3"
 
 [dev-dependencies]
+# 联合实时组件使用工作区同版本的真实 WebSocket 客户端。
+tokio-tungstenite.workspace = true
 # 持久交付回归使用真实文件 SQLite，临时目录随测试释放。
 tempfile.workspace = true
 # 联合回归使用真实控制面权威和两个独立网关状态。

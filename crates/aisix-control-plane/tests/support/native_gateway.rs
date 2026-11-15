@@ -7,6 +7,10 @@ use std::sync::{
 
 use aisix_core::native_metering::{ReconciliationRequest, TypedCompleteRequest};
 use aisix_core::native_objects::*;
+use aisix_core::native_realtime::{
+    AppendLiveUsageRequest, CheckpointLiveSessionRequest, ClaimLiveSessionsRequest,
+    CreateLiveSessionRequest, MintCredentialRequest, RedeemCredentialRequest,
+};
 use aisix_core::AisixSnapshot;
 use aisix_etcd::{build_snapshot, PrefixSet, RawEntry};
 use aisix_proxy::native_api::registry::{NativeObjectRegistry, NativeRegistryError};
@@ -196,6 +200,11 @@ macro_rules! authority_operation {
 }
 
 impl NativeObjectRegistry for HttpRegistry {
+    // 组件适配器显式使用同源真实 CP journal；这不是生产客户端握手能力证明。
+    fn live_usage_authority(&self) -> aisix_proxy::native_api::registry::LiveUsageAuthority {
+        aisix_proxy::native_api::registry::LiveUsageAuthority::CanonicalJournal
+    }
+
     authority_operation!(begin, BeginRequest);
     authority_operation!(bind, BindRequest);
     authority_operation!(lookup, LookupRequest);
@@ -228,6 +237,20 @@ impl NativeObjectRegistry for HttpRegistry {
     authority_operation!(commit_delete, ObjectDeletionRequest, "delete/commit");
     authority_operation!(complete_typed, TypedCompleteRequest, "complete-typed");
     authority_operation!(mark_reconciliation, ReconciliationRequest, "reconciliation");
+    authority_operation!(mint_credential, MintCredentialRequest, "credentials/mint");
+    authority_operation!(
+        redeem_credential,
+        RedeemCredentialRequest,
+        "credentials/redeem"
+    );
+    authority_operation!(create_live_session, CreateLiveSessionRequest, "live/create");
+    authority_operation!(append_live_usage, AppendLiveUsageRequest, "live/append");
+    authority_operation!(
+        checkpoint_live_session,
+        CheckpointLiveSessionRequest,
+        "live/checkpoint"
+    );
+    authority_operation!(claim_live_sessions, ClaimLiveSessionsRequest, "live/claim");
 }
 
 // 真正投影到 kine 的文档经网关的生产加载器进入快照，避免手造权限模型。
