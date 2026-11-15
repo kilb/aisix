@@ -1,5 +1,6 @@
 use super::*;
 use aisix_core::ResourceEntry;
+use aisix_response_reference_test_alloc::AllocationScope;
 use dashmap::try_result::TryResult;
 use serde_json::json;
 use std::cell::{Cell, RefCell};
@@ -170,6 +171,84 @@ fn metric_ranking_reads_each_runtime_key_at_most_once() {
             }
             drop(holds);
         }
+    }
+}
+
+#[test]
+fn small_metric_ranking_adds_no_heap_allocations() {
+    // 把小组也改成缓存键 Vec 会触发真实 allocator 计数，不能由大组收益掩盖。
+    for strategy in [RoutingStrategy::LeastLatency, RoutingStrategy::LeastBusy] {
+        for count in [1usize, 2, 8] {
+            let (snapshot, _) = fixture(count, strategy, None);
+            let status = crate::ModelRuntimeStatusTracker::new();
+            let mut attempts: Vec<_> = (0..count)
+                .map(|index| AttemptModel {
+                    id: format!("id-{index}"),
+                    model: snapshot
+                        .models
+                        .get_by_id(&format!("id-{index}"))
+                        .unwrap()
+                        .value
+                        .clone(),
+                    priority: 0,
+                    weight: 1,
+                })
+                .collect();
+            let pricing = LivePricingIndex::new();
+            let scope = AllocationScope::start();
+            order_attempts_by_metric(strategy, &mut attempts, &status, &snapshot, &pricing);
+            let allocated = scope.finish();
+            assert_eq!(
+                allocated.calls, 0,
+                "strategy={strategy:?} count={count} allocations={allocated:?}"
+            );
+            let expected: Vec<_> = (0..count).map(|index| format!("id-{index}")).collect();
+            let ids: Vec<_> = attempts.iter().map(|a| a.id.as_str()).collect();
+            assert_eq!(ids, expected);
+        }
+    }
+}
+
+#[test]
+fn latency_ranking_preserves_unknown_and_penalized_ties() {
+    // 两条分支都必须保留未采样探测优先、惩罚末位和两类 tie 的声明顺序。
+    for (count, expected) in [
+        (
+            8usize,
+            vec![
+                "id-0", "id-1", "id-4", "id-6", "id-7", "id-5", "id-3", "id-2",
+            ],
+        ),
+        (
+            16usize,
+            vec![
+                "id-0", "id-1", "id-4", "id-6", "id-7", "id-8", "id-11", "id-12", "id-13", "id-14",
+                "id-15", "id-9", "id-5", "id-3", "id-2", "id-10",
+            ],
+        ),
+    ] {
+        let (snapshot, model) = fixture(count, RoutingStrategy::LeastLatency, None);
+        let status = crate::ModelRuntimeStatusTracker::new();
+        status.record_latency("id-3", 90);
+        status.record_latency("id-5", 60);
+        status.penalize_latency("id-2");
+        if count == 16 {
+            status.record_latency("id-9", 30);
+            status.penalize_latency("id-10");
+        }
+        let attempts = resolve_attempt_models(
+            &RoutingRegistry::new(),
+            &status,
+            &LivePricingIndex::new(),
+            &snapshot,
+            "group",
+            "group-id",
+            &model,
+            RoutingRequest::default(),
+        )
+        .unwrap();
+        let ids: Vec<_> = attempts.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, expected);
     }
 }
 
