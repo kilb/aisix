@@ -610,7 +610,8 @@ async fn all_metrics_scopes_keep_complete_responses_for_missing_and_poisoned_unk
     let forbidden =
         w.cp.send("GET", &requests[7].0, Some(owner.cookie()), None)
             .await;
-    assert_eq!(forbidden.status, 403, "{forbidden:?}");
+    assert_eq!(forbidden.status, 401, "{forbidden:?}");
+    assert_eq!(forbidden.body["code"], "unauthenticated", "{forbidden:?}");
     let money = finances(&w.cp).await;
     sqlx::query("DELETE FROM usage_metric_inputs WHERE event_id = 'input-api-success'")
         .execute(w.cp.db().pool())
