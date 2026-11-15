@@ -852,9 +852,10 @@ async fn committed_audio(
     );
 }
 
-// 当前 Member 撤为 Billing 后停止新输入，先前两段输入的倒序 ASR 尾量仍按模型 B 各记一份账。
+// 原 strict 即时 CP 撤权合同及 368 RED 已逐字归档；本轻替代先保留已接受尾量，再验证本地配置同步后的拒绝。
 #[tokio::test]
-async fn accepted_asr_items_keep_separate_model_prices_after_current_member_role_revocation() {
+async fn accepted_asr_items_keep_separate_model_prices_and_deny_new_audio_after_role_projection_sync(
+) {
     let Some(f) = fixture().await else { return };
     let account: Uuid = sqlx::query_scalar(
         "SELECT (doc->>'provider_key_id')::uuid FROM gw_resources WHERE kind='models' AND id=$1",
@@ -986,6 +987,20 @@ async fn accepted_asr_items_keep_separate_model_prices_after_current_member_role
         key.value.disabled,
         "the role change projects a closed key while the active gateway retains its older snapshot"
     );
+    // 角色撤销后的倒序 B 尾量已真实入账 144+700+700；仅现在安装真实 CP→kine 投影。
+    gateway.state.snapshot.store(current);
+    assert!(
+        gateway
+            .state
+            .snapshot
+            .load()
+            .apikeys
+            .get_by_id(&f.key.to_string())
+            .expect("the serving gateway retains the original projected key")
+            .value
+            .disabled,
+        "the actual serving gateway has applied the revoked-role key before testing new input"
+    );
     let before = f
         .provider
         .state
@@ -1021,7 +1036,7 @@ async fn accepted_asr_items_keep_separate_model_prices_after_current_member_role
     tokio::time::timeout(Duration::from_secs(10), async {
         while !f.provider.task.is_finished() { tokio::time::sleep(Duration::from_millis(20)).await; }
     }).await.expect("the actual upstream reader drains to transport close before trusting the no-new-input assertion");
-    assert!(f.provider.state.received.lock().expect("provider negative input log").as_slice() == before.as_slice(),"new input after current role withdrawal never reaches the provider despite an older gateway snapshot");
+    assert!(f.provider.state.received.lock().expect("provider negative input log").as_slice() == before.as_slice(),"new input never reaches the provider after the serving gateway applies the actual revoked-role projection");
     gateway.assert_billing_sink_empty().await;
     paid_asr(&f, asr_model, 2).await;
     let facts: (i64,i64,i64) = sqlx::query_as("SELECT (SELECT count(*) FROM native_live_journal),(SELECT count(*) FROM native_live_outbox),(SELECT count(*) FROM usage_events)")

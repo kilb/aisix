@@ -1267,9 +1267,9 @@ async fn translation_minted_secondary_defaults_need_current_grant_before_they_ar
     no_supplier_charge(&f).await;
 }
 
-// 当前主模型与动态 ASR grant 分别验证；两个有效连接先给真实正向 PCM，避免阴性假绿。
+// 原 strict stale-snapshot 即时撤权合同及 368 RED 已逐字归档；本轻替代保留动态 B gate，并在真实配置同步后验证主模型撤销。
 #[tokio::test]
-async fn translation_dynamic_asr_and_current_primary_model_gates_precede_new_audio() {
+async fn translation_dynamic_asr_gate_and_projected_primary_grant_revocation_precede_new_audio() {
     let Some(f) = fixture().await else { return };
     grant(&f, &[f.translation, f.realtime]).await;
     let mut gateway = Gateway::start(&f).await;
@@ -1323,12 +1323,44 @@ async fn translation_dynamic_asr_and_current_primary_model_gates_precede_new_aud
         !current.contains(&f.translation),
         "the primary Translation grant really was withdrawn"
     );
+    // 公开资源的 id grant 为权威；CP→kine 的真实投影先保留普通模型，再撤掉 Translation。
+    let projected = projected_snapshot(&f.cp).await;
+    let projected_key = projected
+        .apikeys
+        .get_by_id(&f.key.to_string())
+        .expect("the actual projected creator key remains represented");
+    let projected_grants = projected_key
+        .value
+        .allowed_model_ids
+        .as_ref()
+        .expect("the actual CP projection carries authoritative model resource ids");
+    assert!(
+        projected_grants.contains(&f.realtime.to_string())
+            && !projected_grants.contains(&f.translation.to_string()),
+        "the real projected key keeps ordinary Realtime while withdrawing Translation"
+    );
+    gateway.state.snapshot.store(projected);
+    let applied = gateway.state.snapshot.load();
+    let applied_key = applied
+        .apikeys
+        .get_by_id(&f.key.to_string())
+        .expect("the serving gateway reads the actual original creator key");
+    let applied_grants = applied_key
+        .value
+        .allowed_model_ids
+        .as_ref()
+        .expect("the serving snapshot keeps authoritative model resource ids");
+    assert!(
+        applied_grants.contains(&f.realtime.to_string())
+            && !applied_grants.contains(&f.translation.to_string()),
+        "the actual serving snapshot has applied the primary-model revocation before new PCM"
+    );
     let attempt=primary_socket.send(Message::Text(json!({"type":"input_audio_buffer.append","event_id":"new_pcm_after_primary_revocation","audio":STANDARD.encode([21,0,22,0])}).to_string())).await;
     if attempt.is_ok() {
         denied_frame(&mut primary_socket).await;
     }
     disconnect(primary_socket, &primary_session).await;
-    assert!(primary_session.input.lock().expect("drained primary PCM log").as_slice()==before.as_slice(),"current main-model withdrawal stops new audio despite an unchanged gateway snapshot and unexpired secret");
+    assert!(primary_session.input.lock().expect("drained primary PCM log").as_slice()==before.as_slice(),"primary-model withdrawal stops new audio after the actual serving snapshot applies the revoked grant, even with an unexpired secret");
     denied_connection(&f, &gateway, &cap, true, TRANSLATION).await;
     unknown_sessions(&f, &cap, 2).await;
     gateway.no_ordinary_billing().await;
