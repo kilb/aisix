@@ -3,7 +3,9 @@ use aisix_gateway::sse::{SseDecoder, SseEvent, SseFrameSplitter};
 #[test]
 fn frame_delivery_preserves_coalesced_bytes_partial_tail_and_every_chunk_cut() {
     // 不同换行、UTF-8 跨片、多 data 行和尾帧来自同一条可读协议会话。
-    let wire = "data: first\n\nevent: update\r\ndata: 你好\r\ndata: world\r\n\r\ndata: last\r\rdata: tail".as_bytes();
+    let wire =
+        "data: first\n\nevent: update\r\ndata: 你好\r\ndata: world\r\n\r\ndata: last\r\rdata: tail"
+            .as_bytes();
     for chunk_bytes in 1..=wire.len() {
         let mut splitter = SseFrameSplitter::new(128);
         let mut decoded = SseDecoder::with_max_frame_bytes(128);

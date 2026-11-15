@@ -3,7 +3,11 @@ use aisix_core::ResourceEntry;
 use serde_json::json;
 use std::sync::Arc;
 
-fn group(strategy: RoutingStrategy, targets: Vec<RoutingTarget>, fallback: Option<u32>) -> Arc<Model> {
+fn group(
+    strategy: RoutingStrategy,
+    targets: Vec<RoutingTarget>,
+    fallback: Option<u32>,
+) -> Arc<Model> {
     Arc::new(
         serde_json::from_value(json!({
             "display_name": "group",
@@ -128,12 +132,18 @@ fn consistent_hash_keeps_configured_weights_and_priority_when_candidates_are_fil
         RoutingTarget::new("low-a").with_priority(-5).with_weight(3),
         RoutingTarget::new("heavy").with_priority(5).with_weight(90),
         RoutingTarget::new("light").with_priority(5).with_weight(10),
-        RoutingTarget::new("medium").with_priority(5).with_weight(30),
+        RoutingTarget::new("medium")
+            .with_priority(5)
+            .with_weight(30),
         RoutingTarget::new("low-b").with_priority(-5).with_weight(7),
     ];
     let model = group(RoutingStrategy::ConsistentHash, targets.clone(), None);
     let routing = model.routing.as_ref().unwrap();
-    let filtered: Vec<_> = targets.iter().filter(|t| t.model != "light").cloned().collect();
+    let filtered: Vec<_> = targets
+        .iter()
+        .filter(|t| t.model != "light")
+        .cloned()
+        .collect();
     let reversed: Vec<_> = targets.iter().rev().cloned().collect();
     let registry = RoutingRegistry::new();
     let mut counts = [0usize; 3];
@@ -160,8 +170,14 @@ fn consistent_hash_keeps_configured_weights_and_priority_when_candidates_are_fil
         };
         counts[slot] += 1;
     }
-    assert!(counts[0] > counts[1] * 4, "90:10 share was lost: {counts:?}");
-    assert!(counts[0] > counts[2] * 2, "90:30 share was lost: {counts:?}");
+    assert!(
+        counts[0] > counts[1] * 4,
+        "90:10 share was lost: {counts:?}"
+    );
+    assert!(
+        counts[0] > counts[2] * 2,
+        "90:30 share was lost: {counts:?}"
+    );
 }
 
 #[test]
@@ -188,12 +204,21 @@ fn routing_resolution_scaling_probe() {
             let started = std::time::Instant::now();
             for _ in 0..repetitions {
                 let result = resolve_attempt_models(
-                    &registry, &status, &pricing, &snapshot, "group", "group-id", &model,
+                    &registry,
+                    &status,
+                    &pricing,
+                    &snapshot,
+                    "group",
+                    "group-id",
+                    &model,
                     RoutingRequest::default(),
                 )
                 .unwrap();
                 assert_eq!(result.len(), 1);
-                assert_eq!(result[0].id, if filtered { "id-000001" } else { "id-000000" });
+                assert_eq!(
+                    result[0].id,
+                    if filtered { "id-000001" } else { "id-000000" }
+                );
                 std::hint::black_box(result);
             }
             eprintln!(

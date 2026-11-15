@@ -4,7 +4,7 @@ use aisix_response_reference_test_alloc::AllocationScope;
 use dashmap::try_result::TryResult;
 use serde_json::json;
 use std::cell::{Cell, RefCell};
-use std::sync::{Arc, mpsc};
+use std::sync::{mpsc, Arc};
 
 #[derive(Clone, Copy, Default, Debug)]
 struct MetricReads {
@@ -174,16 +174,14 @@ fn filtered_hash_stable_and_alternating_resolution_probe() {
                                 target.model.clear();
                                 target.model_id = Some(format!("id-{index}"));
                             }
-                            target.tags = Some(vec![
-                                if sparse && index >= 4 {
-                                    "other"
-                                } else if index % 2 == 0 {
-                                    "eu"
-                                } else {
-                                    "us"
-                                }
-                                .into(),
-                            ]);
+                            target.tags = Some(vec![if sparse && index >= 4 {
+                                "other"
+                            } else if index % 2 == 0 {
+                                "eu"
+                            } else {
+                                "us"
+                            }
+                            .into()]);
                             if weighted {
                                 target.weight = Some((index % 7 + 1) as u32);
                             }

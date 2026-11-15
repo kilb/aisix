@@ -1039,7 +1039,11 @@ async fn unconditional_input_guardrail_blocks_all_eight_conversation_operations(
         let response = request(router.clone(), verb, route, body, "caller", hint).await;
         let status = response.status();
         let answer = value(response).await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{verb} {route}: {answer}");
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{verb} {route}: {answer}"
+        );
         assert_eq!(
             upstream.received_requests().await.unwrap().len(),
             accepted_calls,

@@ -230,10 +230,7 @@ async fn a_heartbeat_records_the_instance_and_its_applied_revision() {
 
     let r = gw.heartbeat(full_beat(&bundle.dp_id, &instance)).await;
     assert_eq!(r.status, 200, "{r:?}");
-    assert_eq!(
-        r.body,
-        json!({"native_realtime": {"journal_version": 1}})
-    );
+    assert_eq!(r.body, json!({"native_realtime": {"journal_version": 1}}));
 
     let items = instances(&cp, &viewer).await;
     assert_eq!(items.len(), 1, "{items:?}");

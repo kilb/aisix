@@ -1,13 +1,13 @@
 //! Batch JSONL 的真实准入组件测试；使用独立本地归属库，不启动网络或提供方替身。
 use super::*;
 use crate::native_api::standalone_store::StandaloneNativeStore;
-use std::os::unix::fs::PermissionsExt;
 use aisix_core::native_objects::{NativeObjectKind, OriginBinding};
 use aisix_core::{
     snapshot::SnapshotHandle, AisixSnapshot, ApiKey, Model, ProviderKey, ProxyConfig,
 };
 use aisix_response_reference_test_alloc::{AllocationScope, Allocations};
 use serde_json::json;
+use std::os::unix::fs::PermissionsExt;
 use uuid::Uuid;
 
 const MODEL: &str = "11111111-1111-4111-8111-111111111111";
@@ -58,8 +58,7 @@ async fn fixture(guardrail: Option<Value>) -> Fixture {
     let snapshot = SnapshotHandle::new(snapshot);
     let platform = crate::platform::PlatformSettings::from_secret("batch-copy-test");
     let directory = tempfile::tempdir().unwrap();
-    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
-        .unwrap();
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let store = StandaloneNativeStore::open(
         &directory.path().join("authority.sqlite3"),
         platform.id_key,
@@ -199,7 +198,8 @@ async fn unchanged_lines_still_run_the_input_guardrail_and_report_the_verdict() 
     let fixture = fixture(Some(json!({
         "name":"block-last-line", "enabled":true, "hook_point":"input", "kind":"keyword",
         "patterns":[{"kind":"literal","value":"forbidden-last-line"}]
-    }))).await;
+    })))
+    .await;
     let input = b"{\"custom_id\":\"first\",\"url\":\"/v1/chat/completions\",\"body\":{\"model\":\"batch-upstream\",\"messages\":[]}}\n{\"custom_id\":\"last\",\"url\":\"/v1/chat/completions\",\"body\":{\"model\":\"batch-upstream\",\"messages\":[{\"role\":\"user\",\"content\":\"forbidden-last-line\"}]}}\n";
     let mut enforced = Vec::new();
     let mut applied = Vec::new();
