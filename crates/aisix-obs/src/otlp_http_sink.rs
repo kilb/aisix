@@ -317,7 +317,7 @@ impl OtlpHttpFanOut {
         // every publish (the reconcile runs just ahead of the swap), so a
         // live exporter must not lose the events inside it.
         let stale = snapshot_generation < *reconciled_generation;
-        if !stale {
+        if snapshot_generation > *reconciled_generation {
             *reconciled_generation = snapshot_generation;
             let desired: std::collections::HashMap<_, _> = exporters
                 .iter()
@@ -358,18 +358,18 @@ impl OtlpHttpFanOut {
         let fingerprint = fingerprint_exporter(exp);
         match &exp.kind {
             ExporterKind::OtlpHttp(cfg) => {
-                let name = clone_delivery_config!(self, &exp.name);
-                let endpoint = clone_delivery_config!(self, &cfg.endpoint);
-                let headers = clone_delivery_config!(self, &cfg.headers);
-                let service_name = self
-                    .inner
-                    .service_name
-                    .get()
-                    .cloned()
-                    .unwrap_or_else(|| DEFAULT_SERVICE_NAME.to_string());
                 self.inner
                     .exporters
                     .get_or_create(&exp.name, fingerprint, move || {
+                        let name = clone_delivery_config!(self, &exp.name);
+                        let endpoint = clone_delivery_config!(self, &cfg.endpoint);
+                        let headers = clone_delivery_config!(self, &cfg.headers);
+                        let service_name = self
+                            .inner
+                            .service_name
+                            .get()
+                            .cloned()
+                            .unwrap_or_else(|| DEFAULT_SERVICE_NAME.to_string());
                         Arc::new(
                             OtlpSink::new(name, endpoint, headers, client)
                                 .with_service_name(service_name),
@@ -377,11 +377,11 @@ impl OtlpHttpFanOut {
                     })
             }
             ExporterKind::AliyunSls(cfg) => {
-                let name = clone_delivery_config!(self, &exp.name);
-                let cfg = clone_delivery_config!(self, cfg);
                 self.inner
                     .exporters
                     .get_or_create(&exp.name, fingerprint, move || {
+                        let name = clone_delivery_config!(self, &exp.name);
+                        let cfg = clone_delivery_config!(self, cfg);
                         // Resolve the AccessKey from the DP's local env at
                         // build time (the key never rode the kine path).
                         // Missing creds → empty key → SLS 401 surfaces as a
@@ -400,11 +400,11 @@ impl OtlpHttpFanOut {
                     })
             }
             ExporterKind::ObjectStore(cfg) => {
-                let name = clone_delivery_config!(self, &exp.name);
-                let cfg = clone_delivery_config!(self, cfg);
                 self.inner
                     .exporters
                     .get_or_create(&exp.name, fingerprint, move || {
+                        let name = clone_delivery_config!(self, &exp.name);
+                        let cfg = clone_delivery_config!(self, cfg);
                         // Resolve cloud creds from the DP's local env and
                         // build the backend at build time. Missing creds or
                         // an un-buildable backend yield a sink that reports
@@ -414,11 +414,11 @@ impl OtlpHttpFanOut {
                     })
             }
             ExporterKind::Datadog(cfg) => {
-                let name = clone_delivery_config!(self, &exp.name);
-                let cfg = clone_delivery_config!(self, cfg);
                 self.inner
                     .exporters
                     .get_or_create(&exp.name, fingerprint, move || {
+                        let name = clone_delivery_config!(self, &exp.name);
+                        let cfg = clone_delivery_config!(self, cfg);
                         // Resolve the Datadog API key from the DP's local
                         // env at build time (the key never rode the kine
                         // path). Missing key → empty → Datadog 403 surfaces
