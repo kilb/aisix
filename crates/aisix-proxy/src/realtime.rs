@@ -550,24 +550,27 @@ async fn connect_upstream_within(
 /// 同一拨号 future 等待期间持续续租；权威失败不能变成供应商故障或触发重拨。
 async fn connect_with_authority(
     request: tokio_tungstenite::tungstenite::handshake::client::Request,
-    journal: Option<&crate::native_api::realtime_journal::Journal>,
+    renewal: &mut Option<crate::native_api::realtime_journal::LeaseRenewal>,
     written: Arc<AtomicBool>,
 ) -> Result<UpstreamConnection, SessionDialFailure> {
     let dial = connect_upstream(request, written);
     tokio::pin!(dial);
-    let Some(journal) = journal else {
-        return dial.await.map_err(SessionDialFailure::Upstream);
-    };
-    let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
-    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    heartbeat.tick().await;
     loop {
         tokio::select! {
             result = &mut dial => return result.map_err(SessionDialFailure::Upstream),
-            _ = heartbeat.tick() => {
-                journal.heartbeat().await.map_err(SessionDialFailure::Authority)?;
+            result = next_lease_event(renewal) => {
+                result.map_err(SessionDialFailure::Authority)?;
             }
         }
+    }
+}
+
+async fn next_lease_event(
+    renewal: &mut Option<crate::native_api::realtime_journal::LeaseRenewal>,
+) -> Result<(), ProxyError> {
+    match renewal {
+        Some(renewal) => renewal.next().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -1822,6 +1825,7 @@ async fn run_session(
         upstream_provider: _,
         provider_label,
     } = prep;
+    let mut renewal = journal.as_ref().map(|journal| journal.lease_renewal());
     let canonical = journal.as_ref().is_some_and(|journal| journal.canonical());
     let emit_usage = if canonical {
         crate::usage_attr::emit_usage_observation
@@ -1861,7 +1865,7 @@ async fn run_session(
     let handshake_written = Arc::new(AtomicBool::new(false));
     let (upstream, upgrade_request_id) = match connect_with_authority(
         upstream_request,
-        journal.as_ref(),
+        &mut renewal,
         Arc::clone(&handshake_written),
     )
     .await
@@ -1878,6 +1882,9 @@ async fn run_session(
             (ws, upgrade_request_id)
         }
         Err(failure) => {
+            if let Some(renewal) = renewal.as_mut() {
+                renewal.cancel();
+            }
             if let Some(journal) = journal.as_mut() {
                 let _ = journal.finish().await;
             }
@@ -2114,9 +2121,6 @@ async fn run_session(
         .unwrap_or("session.updated");
     let mut configuration_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let mut initial_configuration = initial_configuration.map(|event| event.to_string());
-    let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
-    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    heartbeat.tick().await;
     let mut last_activity = Instant::now();
 
     loop {
@@ -2135,7 +2139,7 @@ async fn run_session(
                 tokio::select! {
                     m = client_rx.next(), if !configuration_pending => Dir::FromClient(m),
                     m = up_rx.next() => Dir::FromUpstream(m),
-                    _ = heartbeat.tick(), if journal.is_some() => Dir::Heartbeat,
+                    result = next_lease_event(&mut renewal) => Dir::Heartbeat(result.err()),
                 }
             };
             match read_cap {
@@ -2169,7 +2173,7 @@ async fn run_session(
                 None => next.await,
             }
         };
-        if !matches!(event, Dir::Heartbeat) {
+        if !matches!(event, Dir::Heartbeat(_)) {
             last_activity = Instant::now();
         }
 
@@ -2185,26 +2189,22 @@ async fn run_session(
             }
         }
 
+        let renewal_failure = match &mut event {
+            Dir::Heartbeat(error) => error.take(),
+            _ => None,
+        };
         let voice_bytes = match &event {
             Dir::FromClient(Some(Ok(AxMessage::Text(text)))) => Some(text.as_bytes()),
             Dir::FromClient(Some(Ok(AxMessage::Binary(bytes)))) => Some(bytes.as_slice()),
             _ => None,
         };
-        if voice_bytes.is_some() || matches!(event, Dir::Heartbeat) {
-            let failure = match journal.as_ref() {
-                Some(journal) => journal.heartbeat().await.err(),
-                None => None,
-            }
-            .or_else(|| meter.refusal());
+        if voice_bytes.is_some() || matches!(event, Dir::Heartbeat(_)) {
+            // 配置同步后的本地鉴权与已知租约期限不等待任何远程 RPC。
+            let failure = renewal_failure
+                .or_else(|| renewal.as_ref().and_then(|renewal| renewal.refusal()))
+                .or_else(|| meter.refusal());
             if let Some(error) = failure {
-                let frame = serde_json::json!({ "type": "error", "error": error.envelope().error });
-                let _ = client_tx.send(AxMessage::Text(frame.to_string())).await;
-                let _ = client_tx
-                    .send(AxMessage::Close(Some(CloseFrame {
-                        code: 1008,
-                        reason: "session authorization".into(),
-                    })))
-                    .await;
+                reject_session_work(&mut client_tx, &error).await;
                 close_status = error.status().as_u16();
                 session_error = Some(error);
                 break;
@@ -2265,6 +2265,9 @@ async fn run_session(
                     None => Ok(None),
                 },
             };
+            if let (Some(journal), Some(renewal)) = (journal.as_ref(), renewal.as_mut()) {
+                renewal.confirmed_expiry(journal.lease_expires_at());
+            }
             if let Some(ack) = journal
                 .as_ref()
                 .and_then(|journal| journal.configuration_ack())
@@ -2327,6 +2330,17 @@ async fn run_session(
                             break;
                         }
                     }
+                    // 前置配置或内容审核可能等待到租约结束；真正派发前再作本地复查。
+                    if let Some(error) = renewal
+                        .as_ref()
+                        .and_then(|renewal| renewal.refusal())
+                        .or_else(|| meter.refusal())
+                    {
+                        reject_session_work(&mut client_tx, &error).await;
+                        close_status = error.status().as_u16();
+                        session_error = Some(error);
+                        break;
+                    }
                     let text = restamp_session_model_in(text, &requested_model, &upstream_model);
                     io.track_request(text.as_bytes());
                     if up_tx.send(TgMessage::Text(text)).await.is_err() {
@@ -2345,6 +2359,17 @@ async fn run_session(
                             .await;
                         close_status = 400;
                         session_error = Some(refusal);
+                        break;
+                    }
+                    // 前置配置或内容审核可能等待到租约结束；真正派发前再作本地复查。
+                    if let Some(error) = renewal
+                        .as_ref()
+                        .and_then(|renewal| renewal.refusal())
+                        .or_else(|| meter.refusal())
+                    {
+                        reject_session_work(&mut client_tx, &error).await;
+                        close_status = error.status().as_u16();
+                        session_error = Some(error);
                         break;
                     }
                     io.track_request(&b);
@@ -2562,7 +2587,7 @@ async fn run_session(
                     break;
                 }
             },
-            Dir::Heartbeat => {}
+            Dir::Heartbeat(_) => {}
         }
     }
 
@@ -2583,6 +2608,9 @@ async fn run_session(
     .await
     {
         session_error.get_or_insert(error);
+    }
+    if let Some(renewal) = renewal.as_mut() {
+        renewal.cancel();
     }
     if let Some(journal) = journal.as_mut() {
         if let Err(error) = journal.finish().await {
@@ -2999,6 +3027,20 @@ where
     }
 }
 
+async fn reject_session_work<S>(client: &mut ClientSink<S>, error: &ProxyError)
+where
+    S: futures::Sink<AxMessage> + Unpin,
+{
+    let frame = serde_json::json!({ "type": "error", "error": error.envelope().error });
+    let _ = client.send(AxMessage::Text(frame.to_string())).await;
+    let _ = client
+        .send(AxMessage::Close(Some(CloseFrame {
+            code: 1008,
+            reason: "session authorization".into(),
+        })))
+        .await;
+}
+
 /// tungstenite (under both the upstream client and axum's server side)
 /// replaces a received Close whose code may not be sent (1004, 1016–2999,
 /// …) with exactly this frame and drops the original code, so it is
@@ -3077,7 +3119,7 @@ async fn close_client_after_upstream<S>(
 }
 
 enum Dir {
-    Heartbeat,
+    Heartbeat(Option<ProxyError>),
     FromClient(Option<Result<AxMessage, axum::Error>>),
     FromUpstream(Option<Result<TgMessage, tokio_tungstenite::tungstenite::Error>>),
 }
