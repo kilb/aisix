@@ -57,6 +57,7 @@ mod asr_billing_contract {
         }
         let mut journal = crate::native_api::realtime_journal::Journal::admit(
             &state,
+            &live,
             &auth,
             None,
             "m-rt",

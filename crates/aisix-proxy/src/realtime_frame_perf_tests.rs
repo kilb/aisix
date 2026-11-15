@@ -49,6 +49,7 @@ mod frame_allocation {
             .expect("actual Realtime preparation without opening a provider socket");
         prepared.journal = crate::native_api::realtime_journal::Journal::admit(
             &state,
+            &live,
             &prepared.auth,
             prepared.voice_origin.as_ref(),
             &prepared.model_entry.id,

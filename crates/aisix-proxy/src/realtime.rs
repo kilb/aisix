@@ -652,6 +652,7 @@ pub(crate) async fn realtime(
                         .transpose()?;
                     prep.journal = crate::native_api::realtime_journal::Journal::admit(
                         &state,
+                        &snapshot,
                         &auth,
                         prep.voice_origin.as_ref(),
                         &prep.model_entry.id,

@@ -182,6 +182,7 @@ impl Journal {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn admit(
         state: &ProxyState,
+        admission_snapshot: &Arc<aisix_core::AisixSnapshot>,
         auth: &AuthenticatedKey,
         origin: Option<&OriginBinding>,
         model_id: &str,
@@ -226,7 +227,7 @@ impl Journal {
             model_reservations: Vec::new(),
             seen_asr: HashSet::new(),
             secondary_cost_usd: 0.0,
-            primary_snapshot: state.snapshot.load(),
+            primary_snapshot: Arc::clone(admission_snapshot),
             primary_usage: crate::realtime::SessionUsage::default(),
             primary_event_id: Uuid::new_v4().to_string(),
             active_asr: None,
