@@ -271,6 +271,65 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn pre_dispatch_error_emits_once_with_the_authenticated_identity_snapshot() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let state = state().with_usage_sink(aisix_obs::UsageSink::new(tx));
+        let auth = {
+            let snap = state.snapshot.load();
+            crate::auth::AuthenticatedKey::new(
+                &snap,
+                snap.apikeys.get_by_id("ak-1").unwrap(),
+                None,
+                false,
+            )
+        };
+        let cell = Arc::new(crate::attribution::RequestAttribution::default());
+        crate::attribution::scope(cell, async {
+            crate::attribution::note_authenticated(&auth);
+            let old_name = auth.api_key_name().map(str::to_owned);
+            // 发射时的当前文档已经改变；事件仍必须使用认证时的不可变身份。
+            let changed: ApiKey = serde_json::from_value(serde_json::json!({
+                "key_hash": ApiKey::hash_bearer(TOKEN), "allowed_models": ["*"],
+                "user_id": "later-owner", "tags": {"source": "later"},
+            }))
+            .unwrap();
+            state
+                .snapshot
+                .load()
+                .apikeys
+                .insert(ResourceEntry::new("ak-1", changed, 2));
+            for _ in 0..2 {
+                let response = super::reject_before_dispatch(
+                    &state,
+                    "POST",
+                    "/v1/chat/completions",
+                    "rejected-once",
+                    Some("ak-1"),
+                    std::time::Instant::now(),
+                    super::Envelope::OpenAi,
+                    crate::error::ProxyError::InvalidRequest("invalid JSON request body".into()),
+                );
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            }
+            let row = rx.try_recv().expect("已认证非法 JSON 必须留下零费失败事实");
+            assert_eq!(row.api_key_id, "ak-1");
+            assert_eq!(row.request_id, "rejected-once");
+            assert_eq!(row.status_code, 400);
+            assert_eq!(row.upstream_dispatched, Some(false));
+            assert_eq!(
+                (row.prompt_tokens, row.completion_tokens, row.total_tokens),
+                (0, 0, 0)
+            );
+            assert_eq!(row.user_id, auth.key().user_id.clone().unwrap_or_default());
+            assert_eq!(row.api_key_name, old_name.unwrap_or_default());
+            assert!(row.tags.get("source").is_none());
+            assert!(row.model_id.is_empty());
+            assert!(rx.try_recv().is_err(), "重复尾点不能再次结算");
+        })
+        .await;
+    }
+
     use aisix_core::snapshot::SnapshotHandle;
     use aisix_core::{AisixSnapshot, ApiKey, ProxyConfig, ResourceEntry};
     use axum::body::Body;
