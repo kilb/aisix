@@ -25,6 +25,7 @@ impl HashRing {
             points,
             point_positions,
             declaration_offsets,
+            configured: None,
         }
     }
 
@@ -62,30 +63,114 @@ impl HashRing {
     }
 }
 
+pub(super) struct ConfiguredTier {
+    owner: std::sync::Arc<Model>,
+    model_generation: std::sync::atomic::AtomicU64,
+    declarations: Vec<usize>,
+    names: Vec<String>,
+    lookup: Vec<u32>,
+}
+
+fn with_configured_name<T>(
+    snapshot: &AisixSnapshot,
+    target: &RoutingTarget,
+    read: impl FnOnce(&str) -> T,
+) -> T {
+    let resolved = target.model_id.as_deref().and_then(|id| {
+        #[cfg(test)]
+        performance_regression_tests::note_configured_id_lookup();
+        snapshot.models.get_by_id(id)
+    });
+    let name = resolved
+        .as_ref()
+        .map(|entry| entry.value.display_name.as_str())
+        .unwrap_or_else(|| target.model_id.as_deref().unwrap_or(target.model.as_str()));
+    read(name)
+}
+
+fn target_identity_cmp(
+    left_name: &str,
+    left: &RoutingTarget,
+    right_name: &str,
+    right: &RoutingTarget,
+) -> std::cmp::Ordering {
+    left_name
+        .cmp(right_name)
+        .then_with(|| left.weight.cmp(&right.weight))
+        .then_with(|| left.priority.cmp(&right.priority))
+        .then_with(|| left.tags.cmp(&right.tags))
+}
+
+impl ConfiguredTier {
+    fn matches(
+        &self,
+        snapshot: &AisixSnapshot,
+        owner: &std::sync::Arc<Model>,
+        routing: &Routing,
+        generation: u64,
+    ) -> bool {
+        use std::sync::atomic::Ordering;
+        if !std::sync::Arc::ptr_eq(&self.owner, owner) {
+            return false;
+        }
+        if self.model_generation.load(Ordering::Acquire) == generation {
+            return true;
+        }
+        // 只在相关模型表变更时核对引用；改动未改变名字则复用原点，不因 API key 写入失效。
+        let unchanged = self
+            .declarations
+            .iter()
+            .zip(&self.names)
+            .all(|(&index, name)| {
+                with_configured_name(snapshot, &routing.targets[index], |current| current == name)
+            });
+        if unchanged {
+            self.model_generation.store(generation, Ordering::Release);
+        }
+        unchanged
+    }
+
+    fn find(&self, routing: &Routing, target: &RoutingTarget) -> usize {
+        let compare = |declaration: u32| {
+            let declaration = declaration as usize;
+            target_identity_cmp(
+                &self.names[declaration],
+                &routing.targets[self.declarations[declaration]],
+                &target.model,
+                target,
+            )
+        };
+        // 相同归一化元数据的声明在去重前有相同 group/tag 资格，因此保留第一次声明。
+        let position = self
+            .lookup
+            .partition_point(|&declaration| compare(declaration).is_lt());
+        let declaration = self.lookup[position];
+        debug_assert!(compare(declaration).is_eq());
+        declaration as usize
+    }
+}
+
 impl RoutingRegistry {
-    /// 缓存以请求地址所在的配置组和层为身份，不以派发模型或请求子集为身份。
-    /// direct、wildcard、ensemble、semantic 与 embedding 不经过此组内排序。
-    /// model_id 的名字取自本次快照；模型更名改变完整层 fingerprint，旧快照不借用新名字。
+    /// 缓存以请求地址所在的配置组和层为身份；direct、wildcard、ensemble、semantic 与
+    /// embedding 不经过此排序。owner 由 Arc 保活，避免地址复用；只读取 models generation，
+    /// 不读取全 snapshot version。模型更名重新建环，并发旧快照请求仍持有自己的环。
     pub(super) fn pick_configured_hash_indices(
         &self,
         snapshot: &AisixSnapshot,
         virtual_name: &str,
-        routing: &Routing,
+        owner: &std::sync::Arc<Model>,
         targets: &[RoutingTarget],
         hash_key: &str,
     ) -> Vec<usize> {
         if targets.len() < 2 {
             return (0..targets.len()).collect();
         }
+        let Some(routing) = owner.routing.as_ref() else {
+            unreachable!("configured hash selection requires a routing model");
+        };
         let mut order = Vec::with_capacity(targets.len());
         let priorities = priority_order(targets);
-        let configured = priority_order(&routing.targets);
-        let mut configured_tiers = configured
-            .chunk_by(|left, right| {
-                routing.targets[*left].priority_or_default()
-                    == routing.targets[*right].priority_or_default()
-            })
-            .peekable();
+        let generation = snapshot.models.generation();
         let key_hash = stable_hash(hash_key);
         for tier in priorities.chunk_by(|left, right| {
             targets[*left].priority_or_default() == targets[*right].priority_or_default()
@@ -95,17 +180,71 @@ impl RoutingRegistry {
                 continue;
             }
             let priority = targets[tier[0]].priority_or_default();
-            while configured_tiers.peek().is_some_and(|configured| {
-                routing.targets[configured[0]].priority_or_default() > priority
-            }) {
-                configured_tiers.next();
-            }
-            let Some(configured) = configured_tiers.next_if(|configured| {
-                routing.targets[configured[0]].priority_or_default() == priority
-            }) else {
-                unreachable!("surviving routing targets retain their configured priority");
+            let key = (virtual_name.to_string(), priority);
+            let cached = self
+                .rings
+                .get(&key)
+                .filter(|ring| {
+                    ring.configured.as_ref().is_some_and(|configured| {
+                        configured.matches(snapshot, owner, routing, generation)
+                    })
+                })
+                .map(|ring| ring.clone());
+            let ring = cached.unwrap_or_else(|| {
+                let declarations: Vec<_> = routing
+                    .targets
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, target)| target.priority_or_default() == priority)
+                    .map(|(index, _)| index)
+                    .collect();
+                let names: Vec<_> = declarations
+                    .iter()
+                    .map(|&index| {
+                        with_configured_name(snapshot, &routing.targets[index], str::to_owned)
+                    })
+                    .collect();
+                let mut lookup: Vec<_> = (0..declarations.len() as u32).collect();
+                lookup.sort_unstable_by(|&left, &right| {
+                    let left_index = left as usize;
+                    let right_index = right as usize;
+                    target_identity_cmp(
+                        &names[left_index],
+                        &routing.targets[declarations[left_index]],
+                        &names[right_index],
+                        &routing.targets[declarations[right_index]],
+                    )
+                    .then_with(|| left.cmp(&right))
+                });
+                let scale =
+                    RingScale::of(declarations.iter().map(|&index| &routing.targets[index]));
+                let fingerprint =
+                    tier_fingerprint(declarations.iter().map(|&index| &routing.targets[index]));
+                let mut next = 0;
+                let mut ring = HashRing::build_named(
+                    fingerprint,
+                    declarations.iter().map(|&index| &routing.targets[index]),
+                    scale,
+                    |_| {
+                        let name = names[next].as_str();
+                        next += 1;
+                        std::borrow::Cow::Borrowed(name)
+                    },
+                );
+                ring.configured = Some(ConfiguredTier {
+                    owner: owner.clone(),
+                    model_generation: std::sync::atomic::AtomicU64::new(generation),
+                    declarations,
+                    names,
+                    lookup,
+                });
+                let ring = std::sync::Arc::new(ring);
+                self.rings.insert(key, ring.clone());
+                ring
+            });
+            let Some(configured) = ring.configured.as_ref() else {
+                unreachable!("configured hash rings retain declaration identity");
             };
-            let scale = RingScale::of(configured.iter().map(|index| &routing.targets[*index]));
             let mut small = [0usize; 8];
             let mut larger;
             let declarations = if tier.len() <= small.len() {
@@ -114,57 +253,9 @@ impl RoutingRegistry {
                 larger = vec![0usize; tier.len()];
                 &mut larger[..]
             };
-            let mut next = 0;
-            let mut fingerprint = FNV_OFFSET_BASIS;
-            for (declaration, &index) in configured.iter().enumerate() {
-                let target = &routing.targets[index];
-                // 持有当前快照条目并借用名称；热环查询不为每个 ID 声明复制字符串。
-                let resolved = target.model_id.as_deref().and_then(|id| {
-                    #[cfg(test)]
-                    performance_regression_tests::note_configured_id_lookup();
-                    snapshot.models.get_by_id(id)
-                });
-                let name = resolved
-                    .as_ref()
-                    .map(|entry| entry.value.display_name.as_str())
-                    .unwrap_or_else(|| target.model_id.as_deref().unwrap_or(target.model.as_str()));
-                fingerprint = fnv1a_extend(fingerprint, name.as_bytes());
-                fingerprint = fnv1a_extend(fingerprint, &[0, 0]);
-                fingerprint = fnv1a_extend(fingerprint, &target.weight_or_default().to_le_bytes());
-                fingerprint = fnv1a_extend(fingerprint, &[1]);
-                // available 保持配置子序列，且只改过 model/model_id；一次单调归并恢复声明位置。
-                // 若两声明归一化后连 tags 都相同，它们在去重前的 group/tag 筛选也相同，
-                // 所以被保留的一定是前者，无需逐候选从配置头部反查。
-                if tier.get(next).is_some_and(|&index| {
-                    let candidate = &targets[index];
-                    name == candidate.model
-                        && target.weight == candidate.weight
-                        && target.priority == candidate.priority
-                        && target.tags == candidate.tags
-                }) {
-                    declarations[next] = declaration;
-                    next += 1;
-                }
+            for (declaration, &index) in declarations.iter_mut().zip(tier) {
+                *declaration = configured.find(routing, &targets[index]);
             }
-            debug_assert_eq!(next, tier.len());
-            fingerprint = fnv1a_extend(fingerprint, &scale.gcd.to_le_bytes());
-            fingerprint = fnv1a_extend(fingerprint, &scale.sum.to_le_bytes());
-            let key = (virtual_name.to_string(), priority);
-            let cached = self
-                .rings
-                .get(&key)
-                .filter(|ring| ring.fingerprint == fingerprint)
-                .map(|ring| ring.clone());
-            let ring = cached.unwrap_or_else(|| {
-                let ring = std::sync::Arc::new(HashRing::build_named(
-                    fingerprint,
-                    configured.iter().map(|index| &routing.targets[*index]),
-                    scale,
-                    |target| target.model_ref(snapshot),
-                ));
-                self.rings.insert(key, ring.clone());
-                ring
-            });
             order.extend(
                 ring.subset_preference_order(key_hash, declarations)
                     .into_iter()

@@ -457,11 +457,10 @@ fn small_warm_hash_pickers_add_no_id_name_or_mapping_scratch_allocations() {
         let mut expected = Vec::new();
         let mut reference_calls = None;
         for (label, model) in [("names", named_model), ("ids", id_model)] {
-            let routing = model.routing.as_ref().unwrap();
             let warm = registry.pick_configured_hash_indices(
                 &snapshot,
                 label,
-                routing,
+                &model,
                 &available,
                 "allocator-key",
             );
@@ -474,7 +473,7 @@ fn small_warm_hash_pickers_add_no_id_name_or_mapping_scratch_allocations() {
             let actual = registry.pick_configured_hash_indices(
                 &snapshot,
                 label,
-                routing,
+                &model,
                 &available,
                 "allocator-key",
             );
@@ -496,4 +495,77 @@ fn small_warm_hash_pickers_add_no_id_name_or_mapping_scratch_allocations() {
             }
         }
     }
+}
+
+#[test]
+fn hash_rings_keep_both_snapshot_names_when_renamed_requests_interleave() {
+    // 忽略模型 generation、跨快照借用规范名，或用可变环原地更新，都会与旧环 oracle 不符。
+    let before = AisixSnapshot::new();
+    for name in ["a", "b", "c", "d"] {
+        put(&before, &format!("id-{name}"), name);
+    }
+    let after = before.clone();
+    put(&after, "id-a", "a-renamed");
+    let declarations: Vec<_> = ["a", "b", "c", "d"]
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            RoutingTarget::by_id(format!("id-{name}")).with_weight(index as u32 * 2 + 1)
+        })
+        .collect();
+    let model = group(declarations.clone(), None);
+    let keys: Vec<_> = (0..8)
+        .map(|index| format!("snapshot-key-{index}"))
+        .collect();
+    let expected: Vec<Vec<Vec<String>>> = [false, true]
+        .iter()
+        .map(|renamed| {
+            let targets: Vec<_> = [if *renamed { "a-renamed" } else { "a" }, "b", "c", "d"]
+                .iter()
+                .enumerate()
+                .map(|(index, name)| RoutingTarget::new(*name).with_weight(index as u32 * 2 + 1))
+                .collect();
+            keys.iter()
+                .map(|key| legacy_order(&declarations, &targets, key))
+                .collect()
+        })
+        .collect();
+    let registry = RoutingRegistry::new();
+    let status = crate::ModelRuntimeStatusTracker::new();
+    let pricing = LivePricingIndex::new();
+    std::thread::scope(|scope| {
+        for worker in 0..8 {
+            let (before, after, model, keys, expected, registry, status, pricing) = (
+                &before, &after, &model, &keys, &expected, &registry, &status, &pricing,
+            );
+            scope.spawn(move || {
+                for request in 0..32 {
+                    let side = (worker + request) % 2;
+                    let index = request % keys.len();
+                    let actual = resolve_attempt_models(
+                        registry,
+                        status,
+                        pricing,
+                        if side == 0 { before } else { after },
+                        "snapshot-group",
+                        "snapshot-group-id",
+                        model,
+                        RoutingRequest {
+                            api_key_id: &keys[index],
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        actual
+                            .iter()
+                            .map(|attempt| attempt.model.display_name.as_str())
+                            .collect::<Vec<_>>(),
+                        expected[side][index],
+                        "worker={worker} request={request} snapshot={side}"
+                    );
+                }
+            });
+        }
+    });
 }

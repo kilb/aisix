@@ -232,6 +232,16 @@ fn warm_hash_subsets_do_not_resolve_configured_model_ids_again() {
                 "count={count} alternating={alternating}: warm routing re-resolved configured IDs"
             );
         }
+        // 模型表更新但引用名字不变时，只核对一次，随后仍为零 lookup，也不重建点。
+        put(&snapshot, count + 1000);
+        CONFIGURED_ID_LOOKUPS.with(|slot| slot.set(Some(0)));
+        RING_BUILDS.with(|slot| slot.set(Some(0)));
+        assert_eq!(invoke(0).len(), 2);
+        assert!(CONFIGURED_ID_LOOKUPS.with(|slot| slot.take().unwrap()) > 0);
+        assert_eq!(RING_BUILDS.with(|slot| slot.take().unwrap()), 0);
+        CONFIGURED_ID_LOOKUPS.with(|slot| slot.set(Some(0)));
+        assert_eq!(invoke(1).len(), 2);
+        assert_eq!(CONFIGURED_ID_LOOKUPS.with(|slot| slot.take().unwrap()), 0);
     }
 }
 

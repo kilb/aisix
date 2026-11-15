@@ -1072,6 +1072,7 @@ struct HashRing {
     /// 每个声明的点在完整排序环中的位置；按声明连续存储，每个位置只占四字节。
     point_positions: Vec<u32>,
     declaration_offsets: Vec<usize>,
+    configured: Option<configured_hash::ConfiguredTier>,
 }
 
 impl HashRing {
@@ -1089,7 +1090,7 @@ impl HashRing {
         fingerprint: u64,
         targets: I,
         scale: RingScale,
-        model_name: impl Fn(&'a RoutingTarget) -> std::borrow::Cow<'a, str>,
+        mut model_name: impl FnMut(&'a RoutingTarget) -> std::borrow::Cow<'a, str>,
     ) -> Self
     where
         I: IntoIterator<Item = &'a RoutingTarget>,
@@ -2370,8 +2371,13 @@ pub(crate) fn resolve_attempt_models(
         None => std::borrow::Cow::Borrowed(virtual_name),
     };
     let indices = if routing.strategy == RoutingStrategy::ConsistentHash {
-        routing_registry
-            .pick_configured_hash_indices(snapshot, &rotation, routing, &available, &hash_key)
+        routing_registry.pick_configured_hash_indices(
+            snapshot,
+            &rotation,
+            virtual_model,
+            &available,
+            &hash_key,
+        )
     } else {
         routing_registry.pick_target_indices(&rotation, routing, &available, &hash_key)
     };
