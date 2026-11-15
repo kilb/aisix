@@ -1179,3 +1179,234 @@ async fn server_vad_commit_without_client_commit_rechecks_the_next_turn_and_know
     )
     .await;
 }
+
+// 只供补充场景使用；旧两例仍逐字使用默认 A/request100000、B6 的原 fixture。
+async fn install_wide_b_and_request_day19(f: &Fixture, gateway: &Gateway) {
+    let admin = f.cp.admin_login_seeded(OperatorRole::Admin).await;
+    let path = format!("/admin/resources/models/{}", f.b);
+    let current = f.cp.send("GET", &path, Some(admin.cookie()), None).await;
+    assert_eq!(current.status, 200);
+    let mut doc = current.body["doc"].clone();
+    doc["rate_limit"] = json!({"tpm":100000,"tph":100000,"tpd":100000});
+    let widened =
+        f.cp.send_conditional(
+            "PUT",
+            &path,
+            admin.cookie(),
+            current.body["version"]
+                .as_i64()
+                .expect("actual B model version"),
+            json!({"doc":doc}),
+        )
+        .await;
+    assert_eq!(
+        widened.status, 200,
+        "real public API widens B without changing its model/account/grant"
+    );
+    let path = format!("/admin/resources/rate_limit_policies/{}", f.policies[1]);
+    let current = f.cp.send("GET", &path, Some(admin.cookie()), None).await;
+    assert_eq!(current.status, 200);
+    assert!(
+        current.body.pointer("/doc/window") == Some(&json!("day"))
+            && current.body.pointer("/doc/scope_ref") == Some(&json!(f.key))
+    );
+    let mut doc = current.body["doc"].clone();
+    doc["max_tokens"] = json!(19);
+    let limited =
+        f.cp.send_conditional(
+            "PUT",
+            &path,
+            admin.cookie(),
+            current.body["version"]
+                .as_i64()
+                .expect("actual request-day policy version"),
+            json!({"doc":doc}),
+        )
+        .await;
+    assert_eq!(
+        limited.status, 200,
+        "real request-day cap19 is configured before WS admission"
+    );
+    let current = f.cp.send("GET", &path, Some(admin.cookie()), None).await;
+    assert_eq!(current.status, 200);
+    assert_eq!(current.body.pointer("/doc/max_tokens"), Some(&json!(19)));
+    let projected = projected_snapshot(&f.cp).await;
+    gateway.state.snapshot.store(projected);
+    supplementary_caps(f, gateway);
+}
+
+fn supplementary_caps(f: &Fixture, gateway: &Gateway) {
+    let snapshot = gateway.state.snapshot.load();
+    for model in [f.a, f.b] {
+        let entry = snapshot
+            .models
+            .get_by_id(&model.to_string())
+            .expect("actual synchronized quota model");
+        let limits = entry
+            .value
+            .rate_limit
+            .as_ref()
+            .expect("actual synchronized token caps");
+        assert!(
+            limits.tpm == Some(100000) && limits.tph == Some(100000) && limits.tpd == Some(100000),
+            "A and B remain wide; neither model can be the known19 request rejection"
+        );
+    }
+    for (policy, cap) in [(f.policies[0], 100000), (f.policies[1], 19)] {
+        let entry = snapshot
+            .rate_limit_policies
+            .get_by_id(&policy.to_string())
+            .expect("actual synchronized request policy");
+        let doc = serde_json::to_value(entry.value.as_ref()).expect("public request policy DTO");
+        assert!(
+            doc.get("max_tokens") == Some(&json!(cap)),
+            "the serving snapshot has the exact intended request cap"
+        );
+    }
+    let key = snapshot
+        .apikeys
+        .get_by_id(&f.key.to_string())
+        .expect("actual unchanged creator key");
+    assert!(!key.value.disabled && key.value.can_access(&snapshot,A) && key.value.can_access(&snapshot,B),
+        "both grants and the same enabled creator remain valid after real configuration synchronization");
+}
+
+fn request_day_denials(f: &Fixture) -> u64 {
+    f.redis
+        .measured
+        .denied
+        .lock()
+        .expect("actual request backend token-denial history")
+        .get(&f.buckets()[2])
+        .copied()
+        .unwrap_or(0)
+}
+
+#[tokio::test]
+async fn late_accepted_asr_usage_invalidates_request_permit_for_an_already_admitted_buffer() {
+    let mut f = fixture(false).await;
+    let mut gateway = Gateway::start(&f).await;
+    // 原 start 的默认 cap 正控先原样执行；本例的 public 配置和真实投影都在 connect 前完成。
+    install_wide_b_and_request_day19(&f, &gateway).await;
+    let (mut socket, mut expected) = applied_b(&f, &gateway).await;
+    gated_append(
+        &f,
+        &mut socket,
+        &mut expected,
+        "old_b_work_before_request_exhaustion",
+    )
+    .await;
+    commit(
+        &f,
+        &mut socket,
+        &mut expected,
+        "item_b_accepted_for_late_request_fact",
+        None,
+    )
+    .await;
+    gated_append(
+        &f,
+        &mut socket,
+        &mut expected,
+        "another_buffer_admitted_while_request_is13",
+    )
+    .await;
+    let admitted = f.peer.history();
+    assert!(
+        admitted.last().is_some_and(|event| event.get("type")
+            == Some(&json!("input_audio_buffer.append"))
+            && event.get("event_id") == Some(&json!("another_buffer_admitted_while_request_is13"))),
+        "the other buffer is already physically forwarded after real A/request/B admission"
+    );
+    let policy_generation = gateway
+        .state
+        .snapshot
+        .load()
+        .rate_limit_policies
+        .generation();
+    // 从此没有 commit/clear/config/新 committed/marker/duplicate，只有旧已接受 B item 的真实非零尾量。
+    f.peer.send(asr_done(
+        "item_b_accepted_for_late_request_fact",
+        "only_late_b6_advances_request19",
+    ));
+    let completed = next_event(&mut socket).await;
+    assert!(
+        completed.get("type")
+            == Some(&json!(
+                "conversation.item.input_audio_transcription.completed"
+            ))
+            && completed.get("item_id") == Some(&json!("item_b_accepted_for_late_request_fact"))
+            && completed.get("content_index") == Some(&json!(0)),
+        "the accepted old B fact is actually relayed while the other buffer stays open"
+    );
+    assert_eq!(completed.pointer("/usage/total_tokens"), Some(&json!(6)));
+    assert_eq!(
+        completed.pointer("/usage/input_token_details/audio_tokens"),
+        Some(&json!(5))
+    );
+    assert_eq!(
+        completed.pointer("/usage/input_token_details/text_tokens"),
+        Some(&json!(0))
+    );
+    paid(&f, true).await;
+    f.known_tokens(true).await;
+    supplementary_caps(&f, &gateway);
+    assert_eq!(
+        gateway
+            .state
+            .snapshot
+            .load()
+            .rate_limit_policies
+            .generation(),
+        policy_generation,
+        "no local policy publication can mask late-fact permit invalidation"
+    );
+    assert!(
+        f.peer.history() == admitted,
+        "no extra client boundary/input is introduced while waiting for actual request19"
+    );
+    let member = Uuid::new_v4().to_string();
+    let wide = RateLimit {
+        tpm: Some(100000),
+        tph: Some(100000),
+        tpd: Some(100000),
+        ..Default::default()
+    };
+    assert!(f.redis.peer.acquire(&f.buckets()[3], &wide, &member).await.is_ok(),
+        "the actual shared B6 is below B's real wide cap; B cannot hide a missing primary/request recheck");
+    f.redis.peer.release(&f.buckets()[3], &member);
+    let before_counts = f.counts();
+    let request_denied_before = request_day_denials(&f);
+    let b_denied_before = f.b_denials();
+    socket.send(Message::Text(audio("same_open_buffer_after_late_request19").to_string())).await
+        .expect("request another frame on the actual already-admitted open buffer before any test close");
+    tokio::time::timeout(LIMIT, async {
+        loop {
+            match socket.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let event: Value = serde_json::from_str(&text).expect("actual gateway event JSON");
+                    if event.get("type") == Some(&json!("error")) { break; }
+                }
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                Some(Ok(Message::Ping(bytes))) => { let _ = socket.send(Message::Pong(bytes)).await; }
+                _ => {}
+            }
+        }
+    }).await.expect("late B usage advances shared request19; the next frame must recheck and refuse the old request permit");
+    assert!(f.counts()[2] > before_counts[2] && request_day_denials(&f) > request_denied_before,
+        "the actual request-day token-only RedisStore.acquire returned quota refusal; a B-only recheck is insufficient");
+    assert_eq!(
+        f.b_denials(),
+        b_denied_before,
+        "wide B must not be the denying layer"
+    );
+    let _ = socket.close(None).await;
+    drop(socket);
+    f.peer.drained().await;
+    f.peer.assert_handshake();
+    assert!(f.peer.history() == admitted,
+        "fully drained actual provider history has no new PCM/config/commit after known request19; no counter reset");
+    paid(&f, true).await;
+    f.known_tokens(true).await;
+    gateway.no_ordinary_rebill().await;
+}
