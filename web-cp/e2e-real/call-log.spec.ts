@@ -277,7 +277,7 @@ test("real rejected calls show their recorded request phases while legacy events
   const phase400 = process.env.CALL_LOG_QA_PHASE_400_EVENT_ID ?? state.callLogEvidence?.phase400EventId;
   const phase404 = process.env.CALL_LOG_QA_PHASE_404_EVENT_ID ?? state.callLogEvidence?.phase404EventId;
   const legacy = process.env.CALL_LOG_QA_LEGACY_EVENT_ID ?? state.callLogEvidence?.legacyEventId;
-  for (const [name, eventId] of [["actual fully read invalid JSON 400", phase400], ["actual fully read unknown-model 404", phase404], ["legacy event without request timing", legacy]]) {
+  for (const [name, eventId] of [["actual fully read JSON request rejected with 400", phase400], ["actual fully read unknown-model 404", phase404], ["legacy event without request timing", legacy]]) {
     expect(typeof eventId === "string" && eventId.length > 0, `Prepare the real ${name} event and supply its ID`).toBe(true);
   }
   await login(page);
