@@ -5964,4 +5964,5 @@ mod tests {
             assert!(output.complete);
         }
     }
+    include!("realtime_frame_perf_tests.rs");
 }
