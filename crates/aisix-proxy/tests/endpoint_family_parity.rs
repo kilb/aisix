@@ -91,6 +91,271 @@ fn source_name(dir: &Path, path: &Path) -> String {
         .replace('\\', "/")
 }
 
+// 复用仓内测试的有限词法状态机；注释、字符串和字符不能冒充调用或闭括号。
+fn window_code_mask(src: &str) -> Vec<bool> {
+    #[derive(Clone, Copy)]
+    enum St {
+        Code,
+        Str,
+        Raw(usize),
+        Char,
+        Line,
+        Block(usize),
+    }
+    let b = src.as_bytes();
+    let mut mask = vec![false; b.len()];
+    let mut st = St::Code;
+    let mut i = 0;
+    while i < b.len() {
+        match st {
+            St::Code => {
+                mask[i] = true;
+                match b[i] {
+                    b'/' if b.get(i + 1) == Some(&b'/') => {
+                        st = St::Line;
+                        mask[i] = false;
+                    }
+                    b'/' if b.get(i + 1) == Some(&b'*') => {
+                        st = St::Block(1);
+                        mask[i] = false;
+                        i += 2;
+                        continue;
+                    }
+                    b'"' => st = St::Str,
+                    b'\'' if b.get(i + 1) == Some(&b'\\') || b.get(i + 2) == Some(&b'\'') => {
+                        st = St::Char
+                    }
+                    b'r' => {
+                        let prev_ident =
+                            i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+                        let mut j = i + 1;
+                        while b.get(j) == Some(&b'#') {
+                            j += 1;
+                        }
+                        let raw_prefix = i > 0
+                            && matches!(b[i - 1], b'b' | b'c')
+                            && (i < 2 || !(b[i - 2].is_ascii_alphanumeric() || b[i - 2] == b'_'));
+                        if (!prev_ident || raw_prefix) && b.get(j) == Some(&b'"') {
+                            st = St::Raw(j - i - 1);
+                            i = j + 1;
+                            continue;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            St::Str => {
+                if b[i] == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if b[i] == b'"' {
+                    st = St::Code;
+                }
+            }
+            St::Raw(hashes) => {
+                if b[i] == b'"'
+                    && b.get(i + 1..i + 1 + hashes)
+                        .is_some_and(|end| end.iter().all(|c| *c == b'#'))
+                {
+                    st = St::Code;
+                    i += hashes + 1;
+                    continue;
+                }
+            }
+            St::Char => {
+                if b[i] == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if b[i] == b'\'' {
+                    st = St::Code;
+                }
+            }
+            St::Line => {
+                if b[i] == b'\n' {
+                    st = St::Code;
+                }
+            }
+            St::Block(depth) => {
+                if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                    st = St::Block(depth + 1);
+                    i += 2;
+                    continue;
+                }
+                if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                    st = if depth == 1 {
+                        St::Code
+                    } else {
+                        St::Block(depth - 1)
+                    };
+                    i += 2;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    mask
+}
+
+fn window_block_end(source: &str, code: &[bool], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (at, byte) in source.bytes().enumerate().skip(open) {
+        if !code[at] {
+            continue;
+        }
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(at + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn window_production_mask(source: &str) -> Vec<bool> {
+    let mut code = window_code_mask(source);
+    for (at, _) in source.match_indices("#[cfg(test)]") {
+        if !code[at] {
+            continue;
+        }
+        // 跳过该测试 item，而非截断其后的生产函数；测试 import 也不会遮掉后文。
+        let end = source
+            .bytes()
+            .enumerate()
+            .skip(at + "#[cfg(test)]".len())
+            .find_map(|(next, byte)| {
+                if !code[next] {
+                    None
+                } else if byte == b'{' {
+                    Some(window_block_end(source, &code, next).unwrap_or(source.len()))
+                } else if byte == b';' {
+                    Some(next + 1)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(source.len());
+        code[at..end].fill(false);
+    }
+    code
+}
+
+fn window_has_call(source: &str, code: &[bool], call: &str) -> bool {
+    source.match_indices(call).any(|(at, _)| {
+        code[at..at + call.len()].iter().all(|byte| *byte)
+            && (at == 0
+                || !matches!(source.as_bytes()[at - 1],
+                b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b':' | 128..=255))
+    })
+}
+
+fn reports_rate_limit_window(source: &str, openai: &str) -> bool {
+    const PUBLISH: [&str; 2] = [
+        "request_metrics::publish_rate_limit_window(",
+        "crate::request_metrics::publish_rate_limit_window(",
+    ];
+    let code = window_production_mask(source);
+    if PUBLISH
+        .iter()
+        .any(|call| window_has_call(source, &code, call))
+    {
+        return true;
+    }
+    if !window_has_call(source, &code, "openai::finish(") {
+        return false;
+    }
+    let code = window_production_mask(openai);
+    let signature = "pub(crate) async fn finish(";
+    let Some(at) = openai
+        .match_indices(signature)
+        .find_map(|(at, _)| code[at].then_some(at))
+    else {
+        return false;
+    };
+    let Some(open) = openai
+        .bytes()
+        .enumerate()
+        .skip(at + signature.len())
+        .find_map(|(at, byte)| (code[at] && byte == b'{').then_some(at))
+    else {
+        return false;
+    };
+    let Some(end) = window_block_end(openai, &code, open) else {
+        return false;
+    };
+    // 精确截在真实 finish 的闭括号；后续 private helper 或测试的调用不作证明。
+    PUBLISH
+        .iter()
+        .any(|call| window_has_call(&openai[open..end], &code[open..end], call))
+}
+
+#[test]
+fn delegated_window_reporting_requires_the_finisher_and_its_actual_publisher() {
+    let dir = handlers_dir();
+    let source = std::fs::read_to_string(dir.join("native_api/realtime_credentials.rs"))
+        .expect("credential handler is readable");
+    let openai = std::fs::read_to_string(dir.join("native_api/openai.rs"))
+        .expect("shared native finisher is readable");
+    const FINISH: &str = "openai::finish(";
+    const PUBLISH: &str = "request_metrics::publish_rate_limit_window(";
+    assert_eq!(
+        source.matches(FINISH).count(),
+        1,
+        "one real delegation edge"
+    );
+    assert!(reports_rate_limit_window(&source, &openai));
+    let no_finish = source.replace(FINISH, "missing_finish(");
+    assert!(!reports_rate_limit_window(&no_finish, &openai));
+    let wrong_finish = source.replace(FINISH, "not_openai::finish(");
+    assert!(!reports_rate_limit_window(&wrong_finish, &openai));
+    let no_publish = openai.replace(PUBLISH, "request_metrics::missing_window_publisher(");
+    assert_ne!(
+        no_publish, openai,
+        "mutation must remove the actual publisher"
+    );
+    assert!(!reports_rate_limit_window(&source, &no_publish));
+    let wrong_publish = openai.replace(PUBLISH, "not_request_metrics::publish_rate_limit_window(");
+    assert!(!reports_rate_limit_window(&source, &wrong_publish));
+
+    // 裸行 marker、嵌套 block comment、普通/raw/byte raw 字符串均不能补回真实边。
+    for marker in [FINISH, PUBLISH] {
+        for pollution in [
+            format!("// {marker}\n"),
+            format!("/* outer /* inner */\n{marker}\n*/\n"),
+            format!("const MARKER: &str = \"\n{marker}\n\";\n"),
+            format!("const MARKER: &str = r###\"\n{marker}\n\"###;\n"),
+            format!("const MARKER: &[u8] = br###\"\n{marker}\n\"###;\n"),
+            format!("#[cfg(test)]\nfn test_only() {{ {marker} }}\n"),
+        ] {
+            assert!(!reports_rate_limit_window(
+                &format!("{no_finish}\n{pollution}"),
+                &openai
+            ));
+            assert!(!reports_rate_limit_window(
+                &source,
+                &format!("{no_publish}\n{pollution}")
+            ));
+        }
+    }
+    let private_helper = no_publish.replacen(
+        "pub(crate) fn model_hint(",
+        &format!("fn unrelated_private_helper() {{ crate::{PUBLISH} }}\npub(crate) fn model_hint("),
+        1,
+    );
+    assert_ne!(
+        private_helper, no_publish,
+        "outside-helper pollution must be installed"
+    );
+    assert!(!reports_rate_limit_window(&source, &private_helper));
+}
+
 #[test]
 fn every_model_dispatch_handler_carries_the_shared_mechanisms() {
     let dir = handlers_dir();
@@ -519,6 +784,8 @@ fn a_handler_that_spends_the_rate_limit_window_also_reports_it() {
     ];
 
     let dir = handlers_dir();
+    let openai = std::fs::read_to_string(dir.join("native_api/openai.rs"))
+        .expect("shared native finisher is readable");
     let mut silent: Vec<String> = Vec::new();
     let mut spends_the_window: Vec<String> = Vec::new();
 
@@ -537,7 +804,7 @@ fn a_handler_that_spends_the_rate_limit_window_also_reports_it() {
             continue;
         }
         spends_the_window.push(name.clone());
-        if src.contains("publish_rate_limit_window") {
+        if reports_rate_limit_window(&src, &openai) {
             continue;
         }
         if EXEMPT.iter().any(|(f, _)| *f == name) {
