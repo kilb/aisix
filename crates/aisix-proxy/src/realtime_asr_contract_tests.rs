@@ -80,7 +80,10 @@ mod asr_billing_contract {
         }}}})
         .to_string();
         let rewritten = journal
-            .prepare_frame(&mut Frame::new(config.as_bytes()))
+            .prepare_frame(
+                &mut Frame::new(config.as_bytes()),
+                &mut crate::quota::RealtimeTokenChecks::new(),
+            )
             .await
             .expect("actual locally granted configuration")
             .expect("the caller alias is rewritten in the actual ASR slot");
@@ -100,7 +103,10 @@ mod asr_billing_contract {
             "id":"accepted-b-item", "type":"message", "role":"user", "content":[{"type":"input_audio","audio":"AAAA"}]
         }}).to_string();
         journal
-            .prepare_frame(&mut Frame::new(item.as_bytes()))
+            .prepare_frame(
+                &mut Frame::new(item.as_bytes()),
+                &mut crate::quota::RealtimeTokenChecks::new(),
+            )
             .await
             .expect("freeze the real accepted input item under B");
         journal

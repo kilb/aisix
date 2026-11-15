@@ -738,6 +738,9 @@ pub(crate) async fn enforce_split(
     reserved
 }
 
+/// 同一工作帧已通过的物理桶与阈值；不同阈值仍保持原 AND 校验。
+pub(crate) type RealtimeTokenChecks = std::collections::HashMap<String, [Option<u64>; 3]>;
+
 /// 已建立会话只重查 token 窗口；不重复计 RPM，也不重复取得自己已持有的并发槽。
 pub(crate) async fn check_realtime_tokens(
     state: &ProxyState,
@@ -746,6 +749,26 @@ pub(crate) async fn check_realtime_tokens(
     model_rl: &ModelRateLimit,
     include_request: bool,
 ) -> Result<(), ProxyError> {
+    check_realtime_tokens_once(
+        state,
+        snapshot,
+        auth,
+        model_rl,
+        include_request,
+        &mut RealtimeTokenChecks::new(),
+    )
+    .await
+}
+
+/// 同一工作边界内物理 token 桶只读一次；不改变真实 token 入账或其他请求族。
+pub(crate) async fn check_realtime_tokens_once(
+    state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
+    auth: &AuthenticatedKey,
+    model_rl: &ModelRateLimit,
+    include_request: bool,
+    checked: &mut RealtimeTokenChecks,
+) -> Result<(), ProxyError> {
     async fn check(
         state: &ProxyState,
         key: &str,
@@ -753,6 +776,7 @@ pub(crate) async fn check_realtime_tokens(
         layer: &'static str,
         policy: Option<(&str, &str)>,
         callers_bucket: bool,
+        checked: &mut RealtimeTokenChecks,
     ) -> Result<(), ProxyError> {
         let tokens = RateLimit {
             tpm: limits.tpm,
@@ -760,19 +784,30 @@ pub(crate) async fn check_realtime_tokens(
             tpd: limits.tpd,
             ..Default::default()
         };
-        if !tokens.is_unrestricted() {
+        let windows = [tokens.tpm, tokens.tph, tokens.tpd];
+        if !tokens.is_unrestricted() && checked.get(key) != Some(&windows) {
             let reservation = state
                 .limiter
                 .pre_commit(key, &tokens)
                 .await
                 .map_err(|error| reject(state, error, layer, policy, callers_bucket))?;
             drop(reservation);
+            checked.insert(key.to_owned(), windows);
         }
         Ok(())
     }
     if include_request {
         if let Some(limits) = auth.key().rate_limit.as_ref() {
-            check(state, &auth.entry.id, limits, "api_key", None, true).await?;
+            check(
+                state,
+                &auth.entry.id,
+                limits,
+                "api_key",
+                None,
+                true,
+                checked,
+            )
+            .await?;
         }
     }
     if let Some(limits) = model_rl.limits.as_ref() {
@@ -783,6 +818,7 @@ pub(crate) async fn check_realtime_tokens(
             "model",
             None,
             false,
+            checked,
         )
         .await?;
     }
@@ -809,6 +845,7 @@ pub(crate) async fn check_realtime_tokens(
                 "policy",
                 Some((&entry.id, &policy.name)),
                 policy_bucket_is_callers(policy),
+                checked,
             )
             .await?;
         }

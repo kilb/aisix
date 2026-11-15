@@ -48,6 +48,8 @@ pub(crate) struct Journal {
     primary_event_id: String,
     active_asr: Option<String>,
     configured_asr: Option<Option<String>>,
+    audio_admission: Option<crate::realtime::TokenStamp>,
+    prepared_audio_admission: Option<crate::realtime::TokenStamp>,
     configuration_ack: &'static str,
     committed: VecDeque<Option<String>>,
     items: HashMap<(String, u64), String>,
@@ -232,6 +234,8 @@ impl Journal {
             primary_event_id: Uuid::new_v4().to_string(),
             active_asr: None,
             configured_asr: None,
+            audio_admission: None,
+            prepared_audio_admission: None,
             configuration_ack: "session.updated",
             committed: VecDeque::new(),
             items: HashMap::new(),
@@ -444,7 +448,9 @@ impl Journal {
     pub(crate) async fn prepare_frame(
         &mut self,
         frame: &mut Frame<'_>,
+        checked: &mut crate::quota::RealtimeTokenChecks,
     ) -> Result<Option<Vec<u8>>, ProxyError> {
+        self.prepared_audio_admission = None;
         let kind = frame.kind();
         // 未启用 ASR 时 item 无次级绑定；主 A/request 闸仍由共享入口执行。
         if kind == Kind::ItemCreate && self.active_asr.is_none() {
@@ -486,18 +492,30 @@ impl Journal {
                     ));
                 }
                 crate::dispatch::check_ip_access(&model.value, &self.client.source_ip)?;
-                crate::quota::check_realtime_tokens(
-                    &self.state,
-                    &snapshot,
-                    &current,
-                    &crate::quota::ModelRateLimit::from_model(
-                        &entry.accepted.requested_model,
-                        &model.id,
-                        &model.value,
-                    ),
-                    false,
-                )
-                .await?;
+                let buffer = matches!(kind, Kind::AudioAppend | Kind::AudioCommit);
+                if !buffer
+                    || !self
+                        .audio_admission
+                        .as_ref()
+                        .is_some_and(|stamp| stamp.matches(&snapshot, &current, &model))
+                {
+                    let stamp = buffer
+                        .then(|| crate::realtime::TokenStamp::capture(&snapshot, &current, &model));
+                    crate::quota::check_realtime_tokens_once(
+                        &self.state,
+                        &snapshot,
+                        &current,
+                        &crate::quota::ModelRateLimit::from_model(
+                            &entry.accepted.requested_model,
+                            &model.id,
+                            &model.value,
+                        ),
+                        false,
+                        checked,
+                    )
+                    .await?;
+                    self.prepared_audio_admission = stamp;
+                }
             }
         }
         if kind == Kind::AudioCommit {
@@ -693,6 +711,20 @@ impl Journal {
             .map_err(|_| ProxyError::AccountUnavailable)
     }
 
+    /// 额度许可只在真实发送成功后生效；commit/clear 不替下一 buffer 授权。
+    pub(crate) fn confirmed_input(&mut self, kind: Kind) {
+        match kind {
+            Kind::AudioAppend => {
+                if let Some(stamp) = self.prepared_audio_admission.take() {
+                    self.audio_admission = Some(stamp);
+                }
+            }
+            Kind::AudioCommit | Kind::AudioClear => self.audio_admission = None,
+            _ => {}
+        }
+        self.prepared_audio_admission = None;
+    }
+
     fn bind_item(&mut self, item: &Value) -> Result<(), ProxyError> {
         let (Some(id), Some(content), Some(entry)) = (
             item["id"].as_str(),
@@ -734,9 +766,12 @@ impl Journal {
                         return Err(ProxyError::AccountUnavailable);
                     }
                     self.active_asr = expected;
+                    self.audio_admission = None;
                 }
             }
+            Some("input_audio_buffer.cleared") => self.audio_admission = None,
             Some("input_audio_buffer.committed") => {
+                self.audio_admission = None;
                 let entry = self
                     .committed
                     .pop_front()
@@ -776,6 +811,9 @@ impl Journal {
         let output = u64::from(measured.completion_tokens);
         let cached = u64::from(measured.cached_prompt_tokens);
         if self.seen_asr.insert(fact) {
+            if input.saturating_add(output) > 0 {
+                self.audio_admission = None;
+            }
             let entry = self
                 .asr_entry(event)
                 .ok_or(ProxyError::AccountUnavailable)?;
@@ -839,6 +877,7 @@ impl Journal {
             Kind::SessionUpdated
                 | Kind::TranscriptionUpdated
                 | Kind::AudioCommitted
+                | Kind::AudioCleared
                 | Kind::ItemCreated
                 | Kind::TranscriptionCompleted
                 | Kind::ResponseDone
@@ -857,8 +896,14 @@ impl Journal {
             &event["usage"]
         };
         // 未报告的主量只留在会话观察；不能因 B 有量而新增 A 的假零账。
-        if !secondary && reported_token_quantities(primary_usage).is_some() {
-            self.primary_usage.absorb_frame(frame, false);
+        if !secondary {
+            if let Some((input, output)) = reported_token_quantities(primary_usage) {
+                let before = self.primary_usage.report_count();
+                self.primary_usage.absorb_frame(frame, false);
+                if self.primary_usage.report_count() != before && input.saturating_add(output) > 0 {
+                    self.audio_admission = None;
+                }
+            }
         }
         let Some(p) = self.persistence.as_ref() else {
             return Ok(true);

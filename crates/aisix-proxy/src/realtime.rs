@@ -1410,6 +1410,10 @@ impl SessionUsage {
         self.responses > 0
     }
 
+    pub(crate) fn report_count(&self) -> u32 {
+        self.responses
+    }
+
     pub(crate) fn apply_to(&self, event: &mut UsageEvent) {
         event.prompt_tokens = self.input_tokens.min(u64::from(u32::MAX)) as u32;
         event.completion_tokens = self.output_tokens.min(u64::from(u32::MAX)) as u32;
@@ -1631,6 +1635,41 @@ impl SessionIo {
     }
 }
 
+/// 已检查的真实配置版本；只缓存当前 buffer 的额度准入，不缓存权限或未来用量。
+pub(crate) struct TokenStamp {
+    model_id: String,
+    key_revision: i64,
+    model_revision: i64,
+    policies: u64,
+}
+
+impl TokenStamp {
+    pub(crate) fn matches(
+        &self,
+        snapshot: &aisix_core::AisixSnapshot,
+        auth: &AuthenticatedKey,
+        model: &aisix_core::ResourceEntry<aisix_core::Model>,
+    ) -> bool {
+        self.model_id == model.id
+            && self.key_revision == auth.entry.revision
+            && self.model_revision == model.revision
+            && self.policies == snapshot.rate_limit_policies.generation()
+    }
+
+    pub(crate) fn capture(
+        snapshot: &aisix_core::AisixSnapshot,
+        auth: &AuthenticatedKey,
+        model: &aisix_core::ResourceEntry<aisix_core::Model>,
+    ) -> Self {
+        Self {
+            model_id: model.id.clone(),
+            key_revision: auth.entry.revision,
+            model_revision: model.revision,
+            policies: snapshot.rate_limit_policies.generation(),
+        }
+    }
+}
+
 /// What a session has charged so far, and everything it needs to charge more.
 ///
 /// A session runs for as long as its traffic does, so nothing it spends can wait
@@ -1656,11 +1695,18 @@ struct SessionMeter<'a> {
     /// What the session has cost so far: each response priced when it arrived.
     cost_usd: f64,
     responses: u32,
+    audio_admission: Option<TokenStamp>,
+    prepared_audio_admission: Option<TokenStamp>,
 }
 
 impl SessionMeter<'_> {
     /// 新推理输入先检查当前 token 窗口；取消、关闭和配置撤除不被用量门槛阻断。
-    async fn check_tokens(&self, frame: &Frame<'_>) -> Result<(), ProxyError> {
+    async fn check_tokens(
+        &mut self,
+        frame: &Frame<'_>,
+        checked: &mut crate::quota::RealtimeTokenChecks,
+    ) -> Result<(), ProxyError> {
+        self.prepared_audio_admission = None;
         let work = matches!(
             frame.kind(),
             Kind::AudioAppend | Kind::AudioCommit | Kind::ResponseCreate | Kind::ItemCreate
@@ -1674,7 +1720,18 @@ impl SessionMeter<'_> {
             .models
             .get_by_id(&self.model_entry.id)
             .ok_or(ProxyError::AccountUnavailable)?;
-        crate::quota::check_realtime_tokens(
+        let buffer = matches!(frame.kind(), Kind::AudioAppend | Kind::AudioCommit);
+        if buffer
+            && self
+                .audio_admission
+                .as_ref()
+                .is_some_and(|stamp| stamp.matches(&snapshot, &current, &model))
+        {
+            return Ok(());
+        }
+        // 只保存实际检查过的 S；等待期间的新 S' 留给下一帧重查，不能在 send 后重新盖章。
+        let stamp = buffer.then(|| TokenStamp::capture(&snapshot, &current, &model));
+        crate::quota::check_realtime_tokens_once(
             self.state,
             &snapshot,
             &current,
@@ -1684,8 +1741,30 @@ impl SessionMeter<'_> {
                 &model.value,
             ),
             true,
+            checked,
         )
-        .await
+        .await?;
+        self.prepared_audio_admission = stamp;
+        Ok(())
+    }
+
+    fn confirmed_input(&mut self, kind: Kind) {
+        match kind {
+            Kind::AudioAppend => {
+                if let Some(stamp) = self.prepared_audio_admission.take() {
+                    self.audio_admission = Some(stamp);
+                }
+            }
+            Kind::AudioCommit | Kind::AudioClear => self.audio_admission = None,
+            _ => {}
+        }
+        self.prepared_audio_admission = None;
+    }
+
+    fn observed_boundary(&mut self, kind: Kind) {
+        if matches!(kind, Kind::AudioCommitted | Kind::AudioCleared) {
+            self.audio_admission = None;
+        }
     }
 
     /// Whether frames arrived that are not charged yet.
@@ -1732,6 +1811,10 @@ impl SessionMeter<'_> {
         let input = usage.input_tokens.saturating_sub(self.input_tokens);
         let output = usage.output_tokens.saturating_sub(self.output_tokens);
         let cached = usage.cached_tokens.saturating_sub(self.cached_tokens);
+        // B 的已接受尾量也推进 request/APIkey 桶；下一新输入不能沿用旧额度读数。
+        if input.saturating_add(output) > 0 {
+            self.audio_admission = None;
+        }
         let secondary_input = usage
             .secondary_input_tokens
             .saturating_sub(self.secondary_input_tokens);
@@ -2107,6 +2190,8 @@ async fn run_session(
         secondary_cached_tokens: 0,
         cost_usd: 0.0,
         responses: 0,
+        audio_admission: None,
+        prepared_audio_admission: None,
     };
     let mut usage = SessionUsage::default();
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
@@ -2264,11 +2349,12 @@ async fn run_session(
             }
         }
 
+        let mut checked_tokens = crate::quota::RealtimeTokenChecks::new();
         let prepared = if let Some(frame) = inspected_frame.as_mut() {
-            Some(match meter.check_tokens(frame).await {
+            Some(match meter.check_tokens(frame, &mut checked_tokens).await {
                 Err(error) => Err(error),
                 Ok(()) => match journal.as_mut() {
-                    Some(journal) => journal.prepare_frame(frame).await,
+                    Some(journal) => journal.prepare_frame(frame, &mut checked_tokens).await,
                     None => Ok(None),
                 },
             })
@@ -2362,6 +2448,10 @@ async fn run_session(
                         io.request_failed = true;
                         break;
                     }
+                    meter.confirmed_input(client_kind);
+                    if let Some(journal) = journal.as_mut() {
+                        journal.confirmed_input(client_kind);
+                    }
                 }
                 Some(Ok(AxMessage::Binary(b))) => {
                     if let Some((resp, refusal)) = binary_frame_refusal(&chain, true) {
@@ -2391,6 +2481,10 @@ async fn run_session(
                     if up_tx.send(TgMessage::Binary(b)).await.is_err() {
                         io.request_failed = true;
                         break;
+                    }
+                    meter.confirmed_input(client_kind);
+                    if let Some(journal) = journal.as_mut() {
+                        journal.confirmed_input(client_kind);
                     }
                 }
                 Some(Ok(AxMessage::Close(frame))) => {
@@ -2462,6 +2556,7 @@ async fn run_session(
                     {
                         configuration_pending = false;
                     }
+                    meter.observed_boundary(frame.kind());
                     let observed = observe_usage(&mut journal, &mut usage, &frame).await;
                     drop(frame);
                     if let Err(error) = observed {

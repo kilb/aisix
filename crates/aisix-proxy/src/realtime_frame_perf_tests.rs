@@ -77,7 +77,7 @@ mod frame_allocation {
             "{{\"type\":\"input_audio_buffer.append\",\"audio\":\"{}\"}}",
             "A".repeat(32 * 1024)
         );
-        let meter = SessionMeter {
+        let mut meter = SessionMeter {
             endpoint: "/v1/realtime",
             state: &state,
             auth: &prepared.auth,
@@ -96,10 +96,13 @@ mod frame_allocation {
             secondary_cached_tokens: 0,
             cost_usd: 0.0,
             responses: 0,
+            audio_admission: None,
+            prepared_audio_admission: None,
         };
         // admission/文件事务/输入构造均在计数前完成；只量真正的三段生产策略调用。
         let scope = calibrated_scope();
         let mut frame = Frame::new(payload.as_bytes());
+        let mut checked_tokens = crate::quota::RealtimeTokenChecks::new();
         crate::native_api::voices::validate_realtime_config(
             &state,
             &prepared.auth,
@@ -111,14 +114,14 @@ mod frame_allocation {
         .await
         .expect("plain PCM has no private voice reference");
         meter
-            .check_tokens(&frame)
+            .check_tokens(&frame, &mut checked_tokens)
             .await
             .expect("actual request/model quota check");
         let rewritten = prepared
             .journal
             .as_mut()
             .expect("actual admitted journal")
-            .prepare_frame(&mut frame)
+            .prepare_frame(&mut frame, &mut checked_tokens)
             .await
             .expect("actual journal frame preparation");
         let allocated = scope.finish();
@@ -143,7 +146,7 @@ mod frame_allocation {
             "{{\"type\":\"conversation.item.create\",\"item\":{{\"id\":\"inline-no-asr\",\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_audio\",\"audio\":\"{}\"}}]}}}}",
             "A".repeat(32 * 1024)
         );
-        let meter = SessionMeter {
+        let mut meter = SessionMeter {
             endpoint: "/v1/realtime",
             state: &state,
             auth: &prepared.auth,
@@ -162,10 +165,13 @@ mod frame_allocation {
             secondary_cached_tokens: 0,
             cost_usd: 0.0,
             responses: 0,
+            audio_admission: None,
+            prepared_audio_admission: None,
         };
         // admission/文件事务/输入构造均在计数前完成；只量真正的三段生产策略调用。
         let scope = calibrated_scope();
         let mut frame = Frame::new(payload.as_bytes());
+        let mut checked_tokens = crate::quota::RealtimeTokenChecks::new();
         crate::native_api::voices::validate_realtime_config(
             &state,
             &prepared.auth,
@@ -177,14 +183,14 @@ mod frame_allocation {
         .await
         .expect("inline audio has no private voice reference");
         meter
-            .check_tokens(&frame)
+            .check_tokens(&frame, &mut checked_tokens)
             .await
             .expect("actual request/model quota check");
         let rewritten = prepared
             .journal
             .as_mut()
             .expect("actual admitted journal")
-            .prepare_frame(&mut frame)
+            .prepare_frame(&mut frame, &mut checked_tokens)
             .await
             .expect("actual journal frame preparation");
         let allocated = scope.finish();
