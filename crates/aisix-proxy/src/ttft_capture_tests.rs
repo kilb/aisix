@@ -918,12 +918,15 @@ async fn parsed_event_before_message_start(endpoint: &str, ping_first: bool, pre
     model.stream_timeout = prefetch.then_some(5_000);
     model.retries = Some(0);
     if !ping_first {
-        model.cost = Some(
-            serde_json::from_value(serde_json::json!({
-                "input_per_1k":10.0, "output_per_1k":20.0
-            }))
-            .unwrap(),
-        );
+        model = Model {
+            cost: Some(
+                serde_json::from_value(serde_json::json!({
+                    "input_per_1k":10.0, "output_per_1k":20.0
+                }))
+                .unwrap(),
+            ),
+            ..model
+        };
     }
     snapshot
         .models
