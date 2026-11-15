@@ -569,14 +569,18 @@ impl StandaloneNativeStore {
         let mut owner = principal.owner.clone();
         if let Some(parent_id) = body.parent_id {
             let parent = Self::stored(conn, parent_id).await?;
-            self.authorize_chain(
-                conn,
-                &snapshot,
-                &principal,
-                &parent,
-                Some(body.kind.endpoint_family()),
-            )
-            .await?;
+            // File 自身仍按 Files 准入；合法 Batch 父上下文保留其 Batches 范围。
+            let parent_consumer = if body.protocol == NativeProtocol::Openai
+                && body.kind == NativeObjectKind::File
+                && parent.submission.protocol == NativeProtocol::Openai
+                && parent.submission.kind == NativeObjectKind::MessageBatch
+            {
+                EndpointFamily::Batches
+            } else {
+                body.kind.endpoint_family()
+            };
+            self.authorize_chain(conn, &snapshot, &principal, &parent, Some(parent_consumer))
+                .await?;
             if !account(
                 parent.record.origin.as_ref().ok_or(Error::Unavailable)?,
                 &body.origin,
