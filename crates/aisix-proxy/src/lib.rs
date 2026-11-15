@@ -2013,14 +2013,8 @@ pub(crate) async fn exported_for(
 
 #[cfg(test)]
 mod tests {
-    mod request_timing_tests {
-        use super::*;
-        include!("request_timing_tests.rs");
-    }
-    mod ttft_capture_tests {
-        use super::*;
-        include!("ttft_capture_tests.rs");
-    }
+    include!("request_timing_tests.rs");
+    include!("ttft_capture_tests.rs");
     use super::*;
 
     const IO_AUDIT_UPSTREAM_REQUEST: &str = r#"{"messages":[{"role":"user","content":"A汉😀"}]}"#;
