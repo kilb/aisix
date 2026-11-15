@@ -407,3 +407,32 @@ async fn ga_translation_mint_reports_real_request_and_token_windows_in_headers_a
 ) -> TestResult {
     successful_mints_report_their_actual_window(Purpose::Translation).await
 }
+
+#[test]
+fn gauge_helper_accepts_exact_labels_and_rejects_poisoned_label_names() {
+    let purpose = Purpose::Realtime;
+    let family = "aisix_ratelimit_remaining_requests";
+    let valid = format!(
+        "{family}{{api_key_id=\"{}\",model=\"{}\"}} 6",
+        purpose.key_id(),
+        purpose.alias()
+    );
+    assert_gauge(&valid, family, purpose, 6);
+
+    // 数量和标签值均正确，只毒化名字；旧 substring helper 会错误地接受这三行。
+    for (key_name, model_name) in [
+        ("not_api_key_id", "model"),
+        ("api_key_id", "upstream_model"),
+        ("not_api_key_id", "upstream_model"),
+    ] {
+        let poisoned = format!(
+            "{family}{{{key_name}=\"{}\",{model_name}=\"{}\"}} 6",
+            purpose.key_id(),
+            purpose.alias()
+        );
+        assert!(
+            std::panic::catch_unwind(|| assert_gauge(&poisoned, family, purpose, 6)).is_err(),
+            "the actual helper must reject a poisoned complete label name"
+        );
+    }
+}
