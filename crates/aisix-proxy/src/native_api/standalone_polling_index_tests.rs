@@ -82,6 +82,110 @@ async fn plans(store: &StandaloneNativeStore) -> (Vec<String>, Vec<String>) {
     (details(claim), details(delivery))
 }
 
+// 诊断只读取常量 SQL、参数类型和 schema；保留原缓存计划及断言，不强制选索引。
+async fn diagnose_plans(
+    store: &StandaloneNativeStore,
+    stage: &str,
+    observed: &(Vec<String>, Vec<String>),
+) {
+    let mut conn = store.pool.acquire().await.unwrap();
+    let sqlite: String = sqlx::query_scalar("SELECT sqlite_version()")
+        .persistent(false)
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    let source: String = sqlx::query_scalar("SELECT sqlite_source_id()")
+        .persistent(false)
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    let schema_version: i64 = sqlx::query_scalar("PRAGMA schema_version")
+        .persistent(false)
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    // 普通 schema SELECT 和后续重新 prepare 的 EXPLAIN 固定在同一个连接。
+    let indexes = sqlx::query("SELECT name,sql FROM sqlite_schema WHERE type='index' AND tbl_name IN ('native_objects','native_terminal_outbox') ORDER BY name")
+        .persistent(false).fetch_all(&mut *conn).await.unwrap()
+        .into_iter().map(|row| json!({"name":row.get::<String,_>("name"),"sql":row.get::<Option<String>,_>("sql")})).collect::<Vec<_>>();
+    let request = response_claim();
+    let at = now();
+    let claim_query = format!("EXPLAIN QUERY PLAN {CLAIM_SQL}");
+    let old_types = sqlx::query("SELECT typeof(?1),typeof(?2),typeof(?3),typeof(?4),typeof(?5),typeof(?6),typeof(?7),typeof(?8),typeof(?9)")
+        .persistent(false).bind(at).bind(at).bind(None::<String>).bind(None::<String>)
+        .bind("openai").bind("openai").bind("response").bind("response").bind(8_i32)
+        .fetch_one(&mut *conn).await.unwrap();
+    let old_types = (0..9_usize)
+        .map(|index| old_types.get::<String, _>(index))
+        .collect::<Vec<_>>();
+    let same_bindings = sqlx::query(&claim_query)
+        .persistent(false)
+        .bind(at)
+        .bind(at)
+        .bind(None::<String>)
+        .bind(None::<String>)
+        .bind("openai")
+        .bind("openai")
+        .bind("response")
+        .bind("response")
+        .bind(8_i32)
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect::<Vec<_>>();
+    let production_types = sqlx::query("SELECT typeof(?1),typeof(?2),typeof(?3),typeof(?4),typeof(?5),typeof(?6),typeof(?7),typeof(?8),typeof(?9)")
+        .persistent(false).bind(at).bind(at)
+        .bind(request.record_id.map(|id|id.to_string())).bind(request.record_id.map(|id|id.to_string()))
+        .bind(request.protocol.map(|protocol|protocol.as_str())).bind(request.protocol.map(|protocol|protocol.as_str()))
+        .bind(request.kind.map(|kind|kind.as_str())).bind(request.kind.map(|kind|kind.as_str())).bind(request.limit)
+        .fetch_one(&mut *conn).await.unwrap();
+    let production_types = (0..9_usize)
+        .map(|index| production_types.get::<String, _>(index))
+        .collect::<Vec<_>>();
+    let production = sqlx::query(&claim_query)
+        .persistent(false)
+        .bind(at)
+        .bind(at)
+        .bind(request.record_id.map(|id| id.to_string()))
+        .bind(request.record_id.map(|id| id.to_string()))
+        .bind(request.protocol.map(|protocol| protocol.as_str()))
+        .bind(request.protocol.map(|protocol| protocol.as_str()))
+        .bind(request.kind.map(|kind| kind.as_str()))
+        .bind(request.kind.map(|kind| kind.as_str()))
+        .bind(request.limit)
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect::<Vec<_>>();
+    let delivery_query = format!("EXPLAIN QUERY PLAN {DELIVERY_SQL}");
+    let delivery = sqlx::query(&delivery_query)
+        .persistent(false)
+        .bind(at)
+        .bind(16_u32)
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect::<Vec<_>>();
+    eprintln!(
+        "SQLITE_POLL_PLAN_DIAG {}",
+        json!({
+            "stage":stage,"sqlite":sqlite,"sqlite_source_id":source,"schema_version":schema_version,
+            "indexes":indexes,"observed_cached_plan":observed,"claim_sql":CLAIM_SQL,"delivery_sql":DELIVERY_SQL,
+            "original_bind_sqlite_types":old_types,"production_bind_sqlite_types":production_types,
+            "original_rust_bind_shapes":["i64","i64","Option<String>::None","Option<String>::None","str","str","str","str","i32=8"],
+            "production_rust_bind_shapes":["i64","i64","Option<String>::None","Option<String>::None","Option<str>::Some","Option<str>::Some","Option<str>::Some","Option<str>::Some","u32=8"],
+            "same_connection_fresh_original_bind_plan":same_bindings,"same_connection_fresh_production_bind_plan":production,
+            "same_connection_fresh_delivery_plan_u32":delivery
+        })
+    );
+}
+
 fn uses_index(plan: &[String], name: &str) -> bool {
     plan.iter().any(|detail| detail.contains(name))
 }
@@ -213,6 +317,7 @@ async fn reopening_current_file_restores_polling_indexes_and_preserves_lease_and
         format_version
     );
     let restored = plans(&reopened).await;
+    diagnose_plans(&reopened, "functional_after_reopen", &restored).await;
     eprintln!(
         "SQLITE_POLL_REOPEN {}",
         json!({"reopen_ms":reopen_ms,"missing_plans":missing,"reopened_plans":restored,"indexes":index_names(&reopened).await})
@@ -459,6 +564,7 @@ async fn rust_sqlx_polling_baseline_reports_history_scaling_build_reopen_and_wri
         let before = empty_polls(&f.store).await;
         let index_build_ms = build_indexes(&f.store).await;
         let after_plans = plans(&f.store).await;
+        diagnose_plans(&f.store, "micro_after_explicit_build", &after_plans).await;
         let after = empty_polls(&f.store).await;
         assert!(uses_index(&after_plans.0, "native_objects_poll_pending"));
         assert!(uses_index(
