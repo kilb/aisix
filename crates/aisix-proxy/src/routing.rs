@@ -36,6 +36,8 @@
 
 #[cfg(test)]
 mod performance_contract_tests;
+#[cfg(test)]
+mod indexed_contract_tests;
 
 use aisix_core::models::{LivePricingIndex, PricingIndex};
 use aisix_core::{
