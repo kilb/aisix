@@ -6008,4 +6008,5 @@ mod tests {
         }
     }
     include!("realtime_frame_perf_tests.rs");
+    include!("realtime_asr_contract_tests.rs");
 }
