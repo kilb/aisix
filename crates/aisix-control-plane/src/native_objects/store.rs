@@ -698,16 +698,43 @@ async fn begin_with_locked_parent(
         && !body.entries.is_empty();
     let consumer_family = batch_input.then_some(EndpointFamily::Batches);
     let principal = principal(&mut *conn, body.api_key_id).await?;
-    origin_for_consumer(&mut *conn, state, Some(&principal), &body, consumer_family).await?;
-    let upstream: Option<String> = sqlx::query_scalar(
-        "SELECT doc ->> 'model_name' FROM gw_resources WHERE kind = 'models' AND id = $1 AND NOT deleted",
-    ).bind(body.origin.model_id).fetch_optional(&mut *conn).await.map_err(unavailable)?.flatten();
-    if upstream.as_deref() != Some(body.upstream_model.as_str()) {
+    // 同一事务按既有顺序锁住根和每项的两种模型身份，不按 entry 重读账号。
+    let model_ids: Vec<_> = std::iter::once(body.origin.model_id)
+        .chain(std::iter::once(body.requested_model_id))
+        .chain(
+            body.entries
+                .iter()
+                .flat_map(|entry| [entry.model_id, entry.requested_model_id]),
+        )
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let resources = load_origin_resources(
+        &mut *conn,
+        state,
+        &model_ids,
+        &[body.origin.provider_key_id],
+        true,
+    )
+    .await?;
+    origin_for_consumer_loaded(
+        &mut *conn,
+        state,
+        Some(&principal),
+        &body,
+        consumer_family,
+        &resources,
+        false,
+    )
+    .await?;
+    let model = resources
+        .models
+        .get(&body.origin.model_id)
+        .ok_or_else(ApiError::not_found)?;
+    if model.model_name.as_deref() != Some(body.upstream_model.as_str()) {
         return Err(invalid("/upstream_model"));
     }
-    body.upstream_provider = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT doc ->> 'provider' FROM gw_resources WHERE kind = 'models' AND id = $1 AND NOT deleted",
-    ).bind(body.origin.model_id).fetch_one(&mut *conn).await.map_err(unavailable)?.unwrap_or_default();
+    body.upstream_provider = model.provider.clone().unwrap_or_default();
     let mut entries = BTreeSet::new();
     #[cfg(test)]
     begin_perf_tests::working_copy(&body);
@@ -754,40 +781,52 @@ async fn begin_with_locked_parent(
         {
             return Err(invalid("/entries"));
         }
-        #[cfg(test)]
-        begin_perf_tests::working_copy(&base_submission);
-        let mut entry_submission = base_submission.clone();
-        entry_submission.origin.model_id = entry.model_id;
-        entry_submission.requested_model_id = entry.requested_model_id;
-        entry_submission
+        if !entry.requested_model.is_empty() && !text_ok(&entry.requested_model, 256) {
+            return Err(invalid("/entries/requested_model"));
+        }
+        base_submission.origin.model_id = entry.model_id;
+        base_submission.requested_model_id = entry.requested_model_id;
+        base_submission
             .upstream_model
             .clone_from(&entry.upstream_model);
-        origin_for_consumer(
+        // 旧空值仍沿用根请求名；非空名必须按本项的 wildcard 匹配，不能借根名授权。
+        base_submission
+            .requested_model
+            .clone_from(if entry.requested_model.is_empty() {
+                &body.requested_model
+            } else {
+                &entry.requested_model
+            });
+        // 来源的 surface/parent/账号边界沿用已检查的根；模型、别名和组仍逐项检查。
+        origin_for_consumer_loaded(
             &mut *conn,
             state,
             Some(&principal),
-            &entry_submission,
+            &base_submission,
             consumer_family,
+            &resources,
+            true,
         )
         .await?;
-        let upstream: Option<String> = sqlx::query_scalar(
-            "SELECT doc ->> 'model_name' FROM gw_resources WHERE kind = 'models' AND id = $1 AND NOT deleted",
-        ).bind(entry.model_id).fetch_optional(&mut *conn).await.map_err(unavailable)?.flatten();
-        if upstream.as_deref() != Some(entry.upstream_model.as_str()) {
+        let model = resources
+            .models
+            .get(&entry.model_id)
+            .ok_or_else(ApiError::not_found)?;
+        if model.model_name.as_deref() != Some(entry.upstream_model.as_str()) {
             return Err(invalid("/entries/upstream_model"));
         }
-        let current_name = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT doc ->> 'display_name' FROM gw_resources WHERE kind = 'models' AND id = $1 AND NOT deleted",
-        ).bind(entry.requested_model_id).fetch_one(&mut *conn).await.map_err(unavailable)?
-            .filter(|name| !name.is_empty()).ok_or_else(|| invalid("/entries/requested_model"))?;
-        if entry.requested_model.is_empty() {
-            entry.requested_model = current_name;
-        } else if !text_ok(&entry.requested_model, 256) {
+        let current_name = &resources
+            .models
+            .get(&entry.requested_model_id)
+            .ok_or_else(ApiError::not_found)?
+            .display_name;
+        if current_name.is_empty() {
             return Err(invalid("/entries/requested_model"));
         }
-        entry.upstream_provider = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT doc ->> 'provider' FROM gw_resources WHERE kind = 'models' AND id = $1 AND NOT deleted",
-        ).bind(entry.model_id).fetch_one(&mut *conn).await.map_err(unavailable)?.unwrap_or_default();
+        if entry.requested_model.is_empty() {
+            entry.requested_model.clone_from(current_name);
+        }
+        entry.upstream_provider = model.provider.clone().unwrap_or_default();
     }
     if let Some(raw_id) = &body.input_file_id {
         if body.protocol != NativeProtocol::Openai
