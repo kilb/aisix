@@ -23,3 +23,6 @@ pub(crate) mod voices;
 pub(crate) mod anthropic;
 pub mod anthropic_batch_worker;
 pub(crate) mod anthropic_batches;
+
+#[cfg(test)]
+mod worker_tests;
