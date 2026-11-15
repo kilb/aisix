@@ -64,8 +64,8 @@ async function api(page: Page, method: string, path: string, body?: JsonObject):
   try {
     return await page.evaluate(async ({ method, path, body }) => {
       const response = await fetch(path, {
-        method, credentials: "include",
-        ...(body === undefined ? {} : { headers: { "content-type": "application/json" }, body: JSON.stringify(body) }),
+        method, credentials: "include", headers: { "content-type": "application/json" },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       });
       const raw = await response.text();
       return { status: response.status, body: raw ? JSON.parse(raw) as unknown : null };
@@ -284,7 +284,7 @@ test("详情重置隔离成员密码撤销旧 session，旧密码失效而新密
     await fillSecret(dialog.getByLabel("再次输入新密码", { exact: true }), newPassword);
     await dialog.getByRole("button", { name: "重置密码", exact: true }).click();
     await expect(dialog.getByRole("button", { name: "确认重置密码", exact: true })).toBeVisible();
-    expect((await api(memberPage, "GET", "/api/me")).status, "confirmation has not revoked the session").toBe(200);
+    expect((await api(memberPage, "GET", "/api/org")).status, "confirmation has not revoked the session").toBe(200);
     const reset = waitForApi(page, "POST", `/api/members/${member.id}/password`);
     await dialog.getByRole("button", { name: "确认重置密码", exact: true }).click();
     const response = await reset;
@@ -293,10 +293,10 @@ test("详情重置隔离成员密码撤销旧 session，旧密码失效而新密
     expect(Object.keys(sent)).toEqual(["new_password"]);
     expect(sent.new_password === newPassword, "the submitted new password is exact").toBe(true);
     await expect(page.getByText("密码已重置。该成员需要使用新密码重新登录。", { exact: true })).toBeVisible();
-    expect((await api(memberPage, "GET", "/api/me")).status, "the old real session was revoked").toBe(401);
+    expect((await api(memberPage, "GET", "/api/org")).status, "the old real session was revoked").toBe(401);
     expect((await api(memberPage, "POST", "/api/login", { email: member.email, password: member.password })).status, "old password is refused").toBe(401);
     expect((await api(memberPage, "POST", "/api/login", { email: member.email, password: newPassword })).status, "new password signs in").toBe(200);
-    expect((await api(memberPage, "GET", "/api/me")).status).toBe(200);
+    expect((await api(memberPage, "GET", "/api/org")).status).toBe(200);
   });
   const own = (await listMembers(page)).find(member => member.email === owner.email);
   expect(own !== undefined).toBe(true);

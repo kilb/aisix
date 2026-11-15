@@ -134,7 +134,7 @@ test("upstream-edit-has-no-account-list-and-still-saves", async ({ page }) => {
   await form.getByRole("button", { name: "保存", exact: true }).click();
   expect((await saved).status()).toBe(200);
   await expect(form).toHaveCount(0);
-  await expect(page.getByRole("table", { name: "上游账号", exact: true }).getByRole("row").filter({ hasText: originalName })).toBeVisible();
+  await expect(page.getByRole("table", { name: "上游账号", exact: true }).getByRole("row").filter({ has: page.getByRole("cell", { name: originalName, exact: true }) })).toBeVisible();
   await expect(page.getByText(`已保存「${originalName}」。`, { exact: true })).toBeVisible();
 });
 
