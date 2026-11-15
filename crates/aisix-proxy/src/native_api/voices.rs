@@ -108,6 +108,7 @@ async fn handle(
     action: Action,
 ) -> Response {
     let started = Instant::now();
+    crate::attribution::note_handler_started(started);
     let method = request.method().clone();
     let path = action.path();
     let endpoint = format!("/v1{path}");

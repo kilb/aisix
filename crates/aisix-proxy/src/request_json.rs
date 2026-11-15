@@ -57,15 +57,21 @@ where
     async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
         if !json_content_type(request.headers()) {
             // 让框架构造原有的媒体类型拒绝；此分支不会读取请求正文。
-            return axum::Json::<T>::from_request(request, state)
+            let result = axum::Json::<T>::from_request(request, state)
                 .await
                 .map(|value| Self(value.0))
                 .map_err(Into::into);
+            crate::attribution::note_handler_started(std::time::Instant::now());
+            return result;
         }
-        let bytes = Bytes::from_request(request, state)
-            .await
-            .map_err(|error| JsonRejection::Axum(error.into()))?;
-        Self::from_bytes(&bytes)
+        let bytes = match Bytes::from_request(request, state).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                crate::attribution::note_handler_started(std::time::Instant::now());
+                return Err(JsonRejection::Axum(error.into()));
+            }
+        };
+        crate::attribution::measure_json_decode(true, || Self::from_bytes(&bytes))
     }
 }
 

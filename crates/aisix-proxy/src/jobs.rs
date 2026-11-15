@@ -2146,6 +2146,7 @@ pub(crate) async fn create_batch(
     body: Result<Bytes, axum::extract::rejection::BytesRejection>,
 ) -> Response {
     let started = Instant::now();
+    crate::attribution::note_handler_started(started);
     let body = match body {
         Ok(bytes) => bytes,
         // Answer through `reject` — see completions.rs.
@@ -2192,8 +2193,9 @@ pub(crate) async fn create_batch(
 
     let mut resolved = None;
     let result = async {
-        let mut req_json: Value = serde_json::from_slice(&body)
-            .map_err(|e| ProxyError::InvalidRequest(format!("invalid JSON body: {e}")))?;
+        let mut req_json: Value =
+            crate::attribution::measure_json_decode(false, || serde_json::from_slice(&body))
+                .map_err(|e| ProxyError::InvalidRequest(format!("invalid JSON body: {e}")))?;
 
         let input_file_id = req_json
             .get("input_file_id")
@@ -2549,6 +2551,7 @@ pub(crate) async fn create_ft_job(
     body: Result<Bytes, axum::extract::rejection::BytesRejection>,
 ) -> Response {
     let started = Instant::now();
+    crate::attribution::note_handler_started(started);
     let body = match body {
         Ok(bytes) => bytes,
         // Answer through `reject` — see completions.rs.
@@ -2592,8 +2595,9 @@ pub(crate) async fn create_ft_job(
 
     let mut resolved = None;
     let result = async {
-        let mut req_json: Value = serde_json::from_slice(&body)
-            .map_err(|e| ProxyError::InvalidRequest(format!("invalid JSON body: {e}")))?;
+        let mut req_json: Value =
+            crate::attribution::measure_json_decode(false, || serde_json::from_slice(&body))
+                .map_err(|e| ProxyError::InvalidRequest(format!("invalid JSON body: {e}")))?;
 
         // `training_file` routes the job (it was uploaded through the
         // gateway); the body's `model` is the provider's BASE model to
@@ -2844,6 +2848,7 @@ async fn forward_simple(
         return managed_forward(state, auth, client, params, headers, spec).await;
     }
     let started = Instant::now();
+    crate::attribution::note_handler_started(started);
     let request_id = client.request_id.clone();
     let method = spec.method.clone();
     let log_path = spec.log_path.clone();
@@ -3702,8 +3707,9 @@ async fn managed_create_batch(
     let mut audit = openai::Audit::default();
     let mut stage = aisix_core::native_objects::InferenceStage::Management;
     let result = async {
-        let mut value: Value = serde_json::from_slice(&body)
-            .map_err(|_| ProxyError::InvalidRequest("invalid JSON body".into()))?;
+        let mut value: Value =
+            crate::attribution::measure_json_decode(false, || serde_json::from_slice(&body))
+                .map_err(|_| ProxyError::InvalidRequest("invalid JSON body".into()))?;
         let raw = value
             .get("input_file_id")
             .and_then(Value::as_str)

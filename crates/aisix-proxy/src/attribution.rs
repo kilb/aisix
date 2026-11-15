@@ -498,6 +498,8 @@ impl LineTokens {
 
 #[derive(Default)]
 struct Cell {
+    /// 固定边界采样，不随正文帧数增长；字节数在终态复用外层计数器。
+    request_timing: aisix_core::usage_io::RequestTiming,
     resolved: Resolved,
     cancel: CancelContext,
     /// See [`PendingAccessLog`]. `Some` only between a streaming handler
@@ -827,6 +829,8 @@ impl Drop for GatewayEmbeddingCallGuard {
 /// cell from a different point in the stack than the writer.
 #[derive(Default)]
 pub(crate) struct RequestAttribution {
+    /// 复用 middleware 的原始起点；独立后台 scope 保持未知。
+    request_started: Option<Instant>,
     cell: Mutex<Cell>,
     bodies: BodyCounters,
     gateway_embedding_ledger: Arc<GatewayEmbeddingLedger>,
@@ -854,11 +858,38 @@ const DISPATCH_NATIVE: u8 = 1;
 const DISPATCH_TRANSLATED: u8 = 2;
 
 impl RequestAttribution {
+    pub(crate) fn with_request_start(mut self, started: Instant) -> Self {
+        self.request_started = Some(started);
+        self
+    }
+
+    pub(crate) fn note_body_read(&self, elapsed: Duration) {
+        if self.request_started.is_some() {
+            self.lock()
+                .request_timing
+                .body_read_ms
+                .get_or_insert_with(|| crate::attempt::measured_ms(elapsed));
+        }
+    }
+
+    fn request_timing(&self) -> Option<aisix_core::usage_io::RequestTiming> {
+        self.request_started?;
+        let mut timing = self.lock().request_timing;
+        let read = self.bodies.request_bytes.load(Ordering::Relaxed);
+        timing.request_body_complete = self.bodies.request_complete.load(Ordering::Relaxed)
+            && !self.bodies.request_discarded.load(Ordering::Relaxed);
+        timing.request_body_bytes =
+            (timing.body_read_ms.is_some() || timing.request_body_complete || read > 0)
+                .then_some(read);
+        Some(timing)
+    }
+
     /// A sub-call scope that cannot change the parent request's target
     /// attribution but can still account for gateway-initiated embeddings on
     /// the parent's eventual terminal usage event.
     fn detached_child(&self) -> Self {
         Self {
+            request_started: None,
             cell: Mutex::new(Cell::default()),
             bodies: BodyCounters::default(),
             gateway_embedding_ledger: Arc::clone(&self.gateway_embedding_ledger),
@@ -2023,6 +2054,45 @@ fn record_e2e_upstream(note: impl FnOnce(&mut Cell)) {
 /// one. Called from the terminal-usage-event chokepoint.
 pub(crate) fn emit_deferred_access_log(event: &aisix_obs::UsageEvent) {
     let _ = CURRENT.try_with(|a| a.emit_deferred_access_log(event));
+}
+
+/// 原始 Request / Bytes handler 复用其已有起点；同一入口只保留第一次。
+pub(crate) fn note_handler_started(started: Instant) {
+    let _ = CURRENT.try_with(|a| {
+        if let Some(arrived) = a.request_started {
+            a.lock()
+                .request_timing
+                .pre_handler_ms
+                .get_or_insert_with(|| {
+                    crate::attempt::measured_ms(started.saturating_duration_since(arrived))
+                });
+        }
+    });
+}
+
+/// 包围既有一次入站解码；不增加 JSON 遍历，也不改变错误类型。
+pub(crate) fn measure_json_decode<T>(extractor: bool, parse: impl FnOnce() -> T) -> T {
+    let started = Instant::now();
+    let result = parse();
+    let finished = Instant::now();
+    let _ = CURRENT.try_with(|a| {
+        if let Some(arrived) = a.request_started {
+            let mut cell = a.lock();
+            cell.request_timing.json_decode_ms.get_or_insert_with(|| {
+                crate::attempt::measured_ms(finished.saturating_duration_since(started))
+            });
+            if extractor {
+                cell.request_timing.pre_handler_ms.get_or_insert_with(|| {
+                    crate::attempt::measured_ms(finished.saturating_duration_since(arrived))
+                });
+            }
+        }
+    });
+    result
+}
+
+pub(crate) fn request_timing() -> Option<aisix_core::usage_io::RequestTiming> {
+    CURRENT.try_with(|a| a.request_timing()).ok().flatten()
 }
 
 pub(crate) fn first_token_latency_ms() -> Option<u32> {

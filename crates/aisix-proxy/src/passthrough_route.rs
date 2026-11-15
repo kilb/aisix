@@ -346,6 +346,7 @@ pub async fn entry(
     req: Request,
 ) -> Response {
     let started = Instant::now();
+    crate::attribution::note_handler_started(started);
     let snapshot = request_snapshot(&state, &req);
     let host = inbound_host(&req);
     let path = req.uri().path().to_string();
@@ -2072,7 +2073,9 @@ fn body_model_name(
     if matches!(protocol, PassthroughProtocol::Raw) && raw_shape.is_none() {
         return String::new();
     }
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
+    let Ok(v) = crate::attribution::measure_json_decode(false, || {
+        serde_json::from_slice::<serde_json::Value>(body)
+    }) else {
         return String::new();
     };
     v.get("model")

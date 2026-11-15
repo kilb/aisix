@@ -177,6 +177,7 @@ pub async fn a2a_endpoint(
     request: Request,
 ) -> Response {
     let started = Instant::now();
+    crate::attribution::note_handler_started(started);
     let request_id = request
         .extensions()
         .get::<crate::request_id::RequestId>()
@@ -354,10 +355,11 @@ async fn dispatch(
         }
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid request body").into_response(),
     };
-    let mut value: serde_json::Value = match serde_json::from_slice(&bytes) {
-        Ok(value) => value,
-        Err(_) => return (StatusCode::BAD_REQUEST, "invalid JSON-RPC body").into_response(),
-    };
+    let mut value: serde_json::Value =
+        match crate::attribution::measure_json_decode(false, || serde_json::from_slice(&bytes)) {
+            Ok(value) => value,
+            Err(_) => return (StatusCode::BAD_REQUEST, "invalid JSON-RPC body").into_response(),
+        };
     let method = value
         .get("method")
         .and_then(serde_json::Value::as_str)

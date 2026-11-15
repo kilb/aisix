@@ -236,7 +236,7 @@ impl Payload {
             let value = if bytes.is_empty() {
                 Value::Null
             } else {
-                serde_json::from_slice(&bytes)
+                crate::attribution::measure_json_decode(false, || serde_json::from_slice(&bytes))
                     .map_err(|_| ProxyError::InvalidRequest("invalid JSON body".into()))?
             };
             return Ok(Self {
@@ -1012,6 +1012,7 @@ async fn handle(
     action: Action,
 ) -> Response {
     let started = Instant::now();
+    crate::attribution::note_handler_started(started);
     let protocol = protocol(request.headers());
     let method = request.method().clone();
     let path = action.path();

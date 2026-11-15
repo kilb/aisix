@@ -939,22 +939,16 @@ async fn record_request_telemetry(
         )
         .in_platform_mode(state.platform().is_some())
         .with_inbound_protocol(inbound_protocol)
-        .with_llm_inference(counts_as_llm),
+        .with_llm_inference(counts_as_llm)
+        .with_request_start(started),
     );
     // The access-log line is held on the cell until the guard below finishes
     // the request, which is when both body sizes are known. Written in the
     // request span this middleware runs in, since the guard writes it from
     // `Drop`.
     attribution.track(tracing::Span::current());
-    let request = request.map(|body| {
-        if http_body::Body::is_end_stream(&body) {
-            attribution.note_request_complete();
-        }
-        axum::body::Body::new(RequestBodyCounter {
-            inner: body,
-            cell: attribution.clone(),
-        })
-    });
+    let request = request
+        .map(|body| axum::body::Body::new(RequestBodyCounter::new(body, attribution.clone())));
     let mut guard = ClientCancelGuard {
         phase: GuardPhase::Head,
         state: state.clone(),
@@ -1208,6 +1202,40 @@ impl axum::body::HttpBody for TelemetryBody {
 struct RequestBodyCounter {
     inner: axum::body::Body,
     cell: std::sync::Arc<attribution::RequestAttribution>,
+    started: Option<std::time::Instant>,
+    finished: bool,
+}
+
+impl RequestBodyCounter {
+    fn new(inner: axum::body::Body, cell: std::sync::Arc<attribution::RequestAttribution>) -> Self {
+        let finished = http_body::Body::is_end_stream(&inner);
+        if finished {
+            cell.note_request_complete();
+            cell.note_body_read(std::time::Duration::ZERO);
+        }
+        Self {
+            inner,
+            cell,
+            started: None,
+            finished,
+        }
+    }
+
+    fn finish_read(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        if let Some(started) = self.started.take() {
+            self.cell.note_body_read(started.elapsed());
+        }
+    }
+}
+
+impl Drop for RequestBodyCounter {
+    fn drop(&mut self) {
+        self.finish_read();
+    }
 }
 
 impl axum::body::HttpBody for RequestBodyCounter {
@@ -1219,17 +1247,25 @@ impl axum::body::HttpBody for RequestBodyCounter {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
         let this = &mut *self;
+        if !this.finished {
+            this.started.get_or_insert_with(std::time::Instant::now);
+        }
         let polled = std::pin::Pin::new(&mut this.inner).poll_frame(cx);
         match &polled {
             std::task::Poll::Ready(Some(Ok(frame))) => {
                 if let Some(data) = frame.data_ref() {
                     this.cell.add_request_bytes(data.len() as u64);
                 }
-                if this.inner.is_end_stream() {
+                if this.inner.is_end_stream() && !this.finished {
                     this.cell.note_request_complete();
+                    this.finish_read();
                 }
             }
-            std::task::Poll::Ready(None) => this.cell.note_request_complete(),
+            std::task::Poll::Ready(None) if !this.finished => {
+                this.cell.note_request_complete();
+                this.finish_read();
+            }
+            std::task::Poll::Ready(Some(Err(_))) => this.finish_read(),
             _ => {}
         }
         polled

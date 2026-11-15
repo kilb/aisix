@@ -2,6 +2,26 @@
 
 use serde::{Deserialize, Serialize};
 
+/// 请求入口的实际阶段测量；缺失表示未观测，零表示窗口短于一毫秒。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestTiming {
+    /// 首次读取正文到 EOF、读错误或取消的窗口，未必已读完整。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_read_ms: Option<u32>,
+    /// 入口既有首次 JSON 解码的耗时；不包含后续转换或再次读取。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json_decode_ms: Option<u32>,
+    /// middleware 起点到最终 extractor 完成；原始 Request 路由复用其处理起点。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_handler_ms: Option<u32>,
+    /// 已实际读取的入口字节；只有完整标志为真时才代表全部正文。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_body_bytes: Option<u64>,
+    /// 来自入口正文计数器的完成状态，不由 Content-Length 推断。
+    #[serde(default)]
+    pub request_body_complete: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TextMeasurement {
     pub utf8_bytes: u64,

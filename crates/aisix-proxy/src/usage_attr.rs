@@ -2234,6 +2234,7 @@ fn emit_usage_to(
     // endings this is. A request that wrote its line inline — everything
     // non-streamed — parked nothing, and this is a no-op for it.
     if terminal {
+        event.request_timing = crate::attribution::request_timing();
         crate::attribution::note_terminal_event(
             &event,
             // Only an upstream's own id: a cache hit's stored one is not this

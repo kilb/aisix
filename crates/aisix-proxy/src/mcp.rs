@@ -252,6 +252,7 @@ async fn serve(state: ProxyState, request: Request, scope: Option<String>) -> Re
     // around `dispatch` covers every early-return path (quota, guardrail
     // blocks, gateway errors) with the actual response status.
     let started = Instant::now();
+    crate::attribution::note_handler_started(started);
     let request_id = request
         .extensions()
         .get::<crate::request_id::RequestId>()
@@ -431,7 +432,10 @@ async fn dispatch(
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid request body").into_response(),
     };
 
-    let peek = serde_json::from_slice::<JsonRpcPeek>(&bytes).ok();
+    let peek = crate::attribution::measure_json_decode(false, || {
+        serde_json::from_slice::<JsonRpcPeek>(&bytes)
+    })
+    .ok();
 
     let is_tool_call = peek.as_ref().and_then(|p| p.method.as_deref()) == Some("tools/call");
     // Recorded from the SAME parse the gates below use, and BEFORE the first

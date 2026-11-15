@@ -115,6 +115,9 @@ pub struct GatewayEmbeddingCall {
 /// the control plane parser expects.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct UsageEvent {
+    /// 仅 HTTP 请求终态携带入口阶段；后台重放与历史记录不补造。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_timing: Option<aisix_core::usage_io::RequestTiming>,
     /// 仅一次客户端交换的终态带长度观察；旧事件缺失保持未知。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub io_audit: Option<aisix_core::usage_io::UsageIoAudit>,

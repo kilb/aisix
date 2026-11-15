@@ -132,6 +132,7 @@ async fn handle(
     body: Result<Bytes, axum::extract::rejection::BytesRejection>,
 ) -> Response {
     let started = Instant::now();
+    crate::attribution::note_handler_started(started);
     let reject = |err: ProxyError| {
         crate::reject::reject_before_dispatch(
             &state,
@@ -153,7 +154,9 @@ async fn handle(
             ))
         }
     };
-    let doc = match serde_json::from_slice::<Json>(&raw) {
+    let doc = match crate::attribution::measure_json_decode(false, || {
+        serde_json::from_slice::<Json>(&raw)
+    }) {
         Ok(doc) => doc,
         Err(_) => {
             return reject(ProxyError::InvalidRequest(
