@@ -1041,6 +1041,33 @@ pub(crate) async fn lookup_file_reference(
     .await
 }
 
+/// 只复用本请求已经查过持久归属的记录；本地校验本身不能建立对象归属权限。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn validate_reference_record(
+    state: &ProxyState,
+    auth: &AuthenticatedKey,
+    client: &ClientContext,
+    raw: &str,
+    kind: NativeObjectKind,
+    parent_id: Option<Uuid>,
+    consumer_family: aisix_core::models::EndpointFamily,
+    record: &NativeRecord,
+) -> Result<(JobTarget, OriginBinding), ProxyError> {
+    reference_family(kind, Some(consumer_family))?;
+    crate::jobs::require_safe_upstream_id(raw).map_err(|_| not_found())?;
+    validate_lookup_record(
+        state,
+        auth,
+        client,
+        raw,
+        kind,
+        parent_id,
+        Some(consumer_family),
+        false,
+        record,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn lookup_for_consumer(
     state: &ProxyState,
@@ -1070,16 +1097,44 @@ async fn lookup_for_consumer(
         .map_err(registry_error)?;
     let record = reply
         .record
-        .filter(|record| {
-            reply.state == "found"
-                && !record.deleted
-                && record.raw_id == raw
-                && record.protocol == Some(NativeProtocol::Openai)
-                && record.kind == Some(kind)
-                && !(kind == NativeObjectKind::File && record.operation == "batch_input")
-                && parent_id.is_none_or(|parent| record.parent_id == Some(parent))
-        })
+        .filter(|_| reply.state == "found")
         .ok_or_else(not_found)?;
+    let (target, origin) = validate_lookup_record(
+        state,
+        auth,
+        client,
+        raw,
+        kind,
+        parent_id,
+        consumer_family,
+        check_provider_budget,
+        &record,
+    )?;
+    Ok((target, origin, record))
+}
+
+/// 远程查询和请求内复用共用原有的模型、分组、IP、消费端与账号检查，不复制记录。
+#[allow(clippy::too_many_arguments)]
+fn validate_lookup_record(
+    state: &ProxyState,
+    auth: &AuthenticatedKey,
+    client: &ClientContext,
+    raw: &str,
+    kind: NativeObjectKind,
+    parent_id: Option<Uuid>,
+    consumer_family: Option<aisix_core::models::EndpointFamily>,
+    check_provider_budget: bool,
+    record: &NativeRecord,
+) -> Result<(JobTarget, OriginBinding), ProxyError> {
+    if record.deleted
+        || record.raw_id != raw
+        || record.protocol != Some(NativeProtocol::Openai)
+        || record.kind != Some(kind)
+        || (kind == NativeObjectKind::File && record.operation == "batch_input")
+        || parent_id.is_some_and(|parent| record.parent_id != Some(parent))
+    {
+        return Err(not_found());
+    }
     let origin = record.origin.clone().ok_or_else(dependency)?;
     let snapshot = state.snapshot.load();
     let requested = model_entry_by_id(
@@ -1128,7 +1183,7 @@ async fn lookup_for_consumer(
             }
         }
     }
-    Ok((target, origin, record))
+    Ok((target, origin))
 }
 pub(crate) fn raw_body(status: StatusCode, headers: &HeaderMap, bytes: Bytes) -> Response {
     let mut response = (status, bytes).into_response();
