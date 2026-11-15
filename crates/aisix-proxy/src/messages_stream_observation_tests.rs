@@ -293,3 +293,54 @@ async fn stream_observation_plain_delta_benchmark() {
     }
     assert_eq!(registry.0.load(Ordering::Relaxed), 0);
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn stream_observation_full_text_blocks_preserve_bytes_and_report_small_shape_cost() {
+    let (observer, registry) = native_observer(false);
+    let mut all_reused = true;
+    for deltas in [1, 2, 8] {
+        let envelope = text_frames(0, "", "\n");
+        let mut frames = vec![
+            envelope[0].clone(),
+            Bytes::from_static(b"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"),
+        ];
+        for _ in 0..deltas {
+            frames.push(Bytes::from_static(b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ordinary text\"}}\n\n"));
+        }
+        frames.push(Bytes::from_static(
+            b"data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        ));
+        frames.extend_from_slice(&envelope[1..]);
+        let joined = vec![Bytes::from(frames.concat())];
+        for (shape, input) in [("one-frame-per-chunk", frames), ("coalesced", joined)] {
+            let (expected, expected_usage, expected_parses) = relay(input.clone(), None).await;
+            assert_eq!(expected_parses, deltas + 5);
+            for enabled in [false, true] {
+                let started = Instant::now();
+                let iterations = 128;
+                let mut total_parses = 0;
+                let mut total_bytes = 0;
+                for _ in 0..iterations {
+                    let (output, usage, parses) =
+                        relay(input.clone(), enabled.then(|| observer.clone())).await;
+                    assert_eq!(output, expected);
+                    same_usage(&usage, &expected_usage);
+                    assert!(usage.reached_end);
+                    assert_eq!((usage.prompt_tokens, usage.completion_tokens), (17, 5));
+                    total_parses += parses;
+                    total_bytes += output.len();
+                    std::hint::black_box(output);
+                }
+                if enabled {
+                    all_reused &= total_parses == iterations * expected_parses;
+                }
+                println!("STREAM_OBSERVATION_FULL_BLOCK_BENCH {{\"deltas\":{deltas},\"shape\":\"{shape}\",\"observer\":{enabled},\"iterations\":{iterations},\"parse_attempts\":{total_parses},\"output_bytes\":{total_bytes},\"elapsed_ns\":{}}}", started.elapsed().as_nanos());
+            }
+        }
+    }
+    assert_eq!(registry.0.load(Ordering::Relaxed), 0);
+    assert!(
+        all_reused,
+        "a full text block must not cause duplicate JSON parsing"
+    );
+}
