@@ -194,7 +194,12 @@ fn assert_status(status: u16, expected: u16, body: &Value, phase: &str) {
     };
     if status != expected {
         let mut reported = false;
-        for detail in body.get("details").and_then(Value::as_array).into_iter().flatten() {
+        for detail in body
+            .get("details")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
             let path = match detail.get("path").and_then(Value::as_str) {
                 Some("api_key") => "api_key",
                 Some("api_base") => "api_base",
@@ -205,15 +210,23 @@ fn assert_status(status: u16, expected: u16, body: &Value, phase: &str) {
                 Some("default header openai-project") => "default header openai-project",
                 Some("/api_key") => "/api_key",
                 Some("/api_base") => "/api_base",
-                Some("/request/default_headers/OpenAI-Project") => "/request/default_headers/OpenAI-Project",
-                Some("/doc/request/default_headers/OpenAI-Project") => "/doc/request/default_headers/OpenAI-Project",
+                Some("/request/default_headers/OpenAI-Project") => {
+                    "/request/default_headers/OpenAI-Project"
+                }
+                Some("/doc/request/default_headers/OpenAI-Project") => {
+                    "/doc/request/default_headers/OpenAI-Project"
+                }
                 _ => "other_or_absent",
             };
-            eprintln!("duration setup diagnostic: phase={phase} status={status} code={code} path={path}");
+            eprintln!(
+                "duration setup diagnostic: phase={phase} status={status} code={code} path={path}"
+            );
             reported = true;
         }
         if !reported {
-            eprintln!("duration setup diagnostic: phase={phase} status={status} code={code} path=absent");
+            eprintln!(
+                "duration setup diagnostic: phase={phase} status={status} code={code} path=absent"
+            );
         }
     }
     assert_eq!(status, expected, "duration phase={phase} code={code}");
