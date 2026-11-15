@@ -848,4 +848,5 @@ async fn a_partial_terminal_report_never_becomes_complete_accounting() {
 mod expiry_tail {
     use super::*;
     include!("standalone_realtime_expiry_tests.rs");
+    include!("standalone_realtime_terminal_close_tests.rs");
 }
