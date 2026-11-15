@@ -2,6 +2,7 @@
 //!
 //! 多进程只能共享同一台机器上的同一个本地数据库文件；不支持网络文件系统或多机副本。
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     path::Path,
     sync::Arc,
@@ -101,16 +102,22 @@ struct GraphReferences<'a> {
 }
 
 #[derive(Default)]
+struct OwningChild<'a> {
+    relations: Vec<&'a BoundRelation>,
+    owner: Option<Owner>,
+}
+type OwningEdges<'a> = BTreeMap<(&'static str, &'a str), OwningChild<'a>>;
+type ObjectKeys<'a> = BTreeSet<(&'static str, &'a str)>;
+
+#[derive(Default)]
 struct ChildOwners {
     records: BTreeMap<Uuid, Stored>,
-    observed: BTreeMap<(&'static str, String), Owner>,
+    observed: BTreeMap<&'static str, BTreeMap<String, Owner>>,
 }
 struct DerivedGraph<'a> {
     root: &'a Stored,
     references: GraphReferences<'a>,
-    objects: &'a [NativeChildObject],
-    relations: &'a [BoundRelation],
-    observed: &'a [Stored],
+    objects: &'a ObjectKeys<'a>,
 }
 
 #[derive(Clone)]
@@ -1059,6 +1066,20 @@ impl StandaloneNativeStore {
             parent_id: related.submission.parent_id,
             references: &related.references,
         };
+        let (mut owning_edges, observed_parents) = if body.binding.objects.is_empty() {
+            (BTreeMap::new(), false)
+        } else {
+            Self::owning_edges(&body.relations)
+        };
+        let objects: ObjectKeys<'_> = if observed_parents {
+            body.binding
+                .objects
+                .iter()
+                .map(|object| (object.kind.as_str(), object.raw_id.as_str()))
+                .collect()
+        } else {
+            BTreeSet::new()
+        };
         let mut observed = Vec::new();
         for child in &body.binding.objects {
             let legacy_output = related.submission.kind == NativeObjectKind::Response
@@ -1080,20 +1101,24 @@ impl StandaloneNativeStore {
                 ))
             .then_some(root.record.record_id);
             derived.asynchronous = false;
-            let child_owner = self
-                .child_owner(
-                    conn,
-                    &DerivedGraph {
-                        root: &root,
-                        references,
-                        objects: &body.binding.objects,
-                        relations: &body.relations,
-                        observed: &observed,
-                    },
-                    child,
-                    &mut owners,
-                )
-                .await?
+            let child_owner =
+                match owning_edges.get_mut(&(child.kind.as_str(), child.raw_id.as_str())) {
+                    Some(edges) => {
+                        self.child_owner(
+                            conn,
+                            &DerivedGraph {
+                                root: &root,
+                                references,
+                                objects: &objects,
+                            },
+                            child,
+                            &mut owners,
+                            edges,
+                        )
+                        .await?
+                    }
+                    None => None,
+                }
                 .unwrap_or_else(|| owner.clone());
             let stored = self
                 .insert_object(
@@ -1105,6 +1130,18 @@ impl StandaloneNativeStore {
                     capture.as_ref(),
                 )
                 .await?;
+            if observed_parents
+                && matches!(
+                    stored.submission.kind,
+                    NativeObjectKind::Conversation | NativeObjectKind::ResponseContainer
+                )
+            {
+                owners
+                    .observed
+                    .entry(stored.submission.kind.as_str())
+                    .or_default()
+                    .insert(stored.record.raw_id.clone(), stored.owner.clone());
+            }
             if legacy_output {
                 self.attach(
                     conn,
@@ -1121,6 +1158,7 @@ impl StandaloneNativeStore {
         reply.operation_id = Some(body.binding.operation_id);
         reply.record = Some(root.record.clone());
         reply.records = observed.iter().map(|s| s.record.clone()).collect();
+        drop(owning_edges);
         for relation in body.relations {
             let parent = self
                 .selector(conn, &root, &observed, references, relation.parent, &owners)
@@ -1167,21 +1205,43 @@ impl StandaloneNativeStore {
         Ok(reply)
     }
 
-    async fn selector(
+    fn owning_edges(relations: &[BoundRelation]) -> (OwningEdges<'_>, bool) {
+        let mut indexed: OwningEdges<'_> = BTreeMap::new();
+        let mut observed_parents = false;
+        for relation in relations {
+            if !matches!(
+                relation.relation,
+                NativeRelation::ConversationItem | NativeRelation::ContainerFile
+            ) {
+                continue;
+            }
+            if let ArtifactSelector::Observed { kind, raw_id } = &relation.child {
+                observed_parents |= matches!(&relation.parent, ArtifactSelector::Observed { .. });
+                indexed
+                    .entry((kind.as_str(), raw_id.as_str()))
+                    .or_default()
+                    .relations
+                    .push(relation);
+            }
+        }
+        (indexed, observed_parents)
+    }
+
+    async fn selector<'a>(
         &self,
         conn: &mut SqliteConnection,
-        root: &Stored,
-        observed: &[Stored],
+        root: &'a Stored,
+        observed: &'a [Stored],
         references: GraphReferences<'_>,
         selector: ArtifactSelector,
-        owners: &ChildOwners,
-    ) -> Result<Stored> {
+        owners: &'a ChildOwners,
+    ) -> Result<Cow<'a, Stored>> {
         match selector {
-            ArtifactSelector::Root => Ok(root.clone()),
+            ArtifactSelector::Root => Ok(Cow::Borrowed(root)),
             ArtifactSelector::Observed { kind, raw_id } => observed
                 .iter()
                 .find(|s| s.record.kind == Some(kind) && s.record.raw_id == raw_id)
-                .cloned()
+                .map(Cow::Borrowed)
                 .ok_or(Error::InvalidRequest),
             ArtifactSelector::Record { record_id } => {
                 if references.parent_id != Some(record_id)
@@ -1193,9 +1253,9 @@ impl StandaloneNativeStore {
                     return Err(Error::InvalidRequest);
                 }
                 if let Some(parent) = owners.records.get(&record_id) {
-                    return Ok(parent.clone());
+                    return Ok(Cow::Borrowed(parent));
                 }
-                Self::stored(conn, record_id).await
+                Self::stored(conn, record_id).await.map(Cow::Owned)
             }
         }
     }
@@ -1206,7 +1266,11 @@ impl StandaloneNativeStore {
         graph: &DerivedGraph<'_>,
         child: &NativeChildObject,
         owners: &mut ChildOwners,
+        edges: &mut OwningChild<'_>,
     ) -> Result<Option<Owner>> {
+        if let Some(owner) = &edges.owner {
+            return Ok(Some(owner.clone()));
+        }
         if !matches!(
             child.kind,
             NativeObjectKind::ResponseItem | NativeObjectKind::ContainerFile
@@ -1214,11 +1278,7 @@ impl StandaloneNativeStore {
             return Ok(None);
         }
         let mut owner: Option<Owner> = None;
-        for relation in graph.relations {
-            if !matches!(&relation.child, ArtifactSelector::Observed {kind,raw_id} if *kind==child.kind && raw_id==&child.raw_id)
-            {
-                continue;
-            }
+        for relation in &edges.relations {
             let parent_kind = match relation.relation {
                 NativeRelation::ConversationItem => NativeObjectKind::Conversation,
                 NativeRelation::ContainerFile => NativeObjectKind::ResponseContainer,
@@ -1227,39 +1287,36 @@ impl StandaloneNativeStore {
             let (kind, candidate) = match &relation.parent {
                 ArtifactSelector::Root => (graph.root.submission.kind, graph.root.owner.clone()),
                 ArtifactSelector::Record { record_id } => {
-                    let parent = self
-                        .selector(
-                            conn,
-                            graph.root,
-                            &[],
-                            graph.references,
-                            relation.parent.clone(),
-                            owners,
-                        )
-                        .await?;
-                    let candidate = (parent.submission.kind, parent.owner.clone());
-                    owners.records.entry(*record_id).or_insert(parent);
-                    candidate
+                    if graph.references.parent_id != Some(*record_id)
+                        && !graph
+                            .references
+                            .references
+                            .iter()
+                            .any(|r| r.record_id == *record_id)
+                    {
+                        return Err(Error::InvalidRequest);
+                    }
+                    if let Some(parent) = owners.records.get(record_id) {
+                        (parent.submission.kind, parent.owner.clone())
+                    } else {
+                        let parent = Self::stored(conn, *record_id).await?;
+                        let candidate = (parent.submission.kind, parent.owner.clone());
+                        owners.records.insert(*record_id, parent);
+                        candidate
+                    }
                 }
                 ArtifactSelector::Observed { kind, raw_id } => {
-                    let key = (kind.as_str(), raw_id.clone());
-                    let candidate = if let Some(parent) = graph
+                    let candidate = if let Some(owner) = owners
                         .observed
-                        .iter()
-                        .find(|p| p.submission.kind == *kind && p.record.raw_id == *raw_id)
+                        .get(kind.as_str())
+                        .and_then(|parents| parents.get(raw_id.as_str()))
                     {
-                        parent.owner.clone()
-                    } else if let Some(owner) = owners.observed.get(&key) {
                         owner.clone()
                     } else {
-                        if !graph
-                            .objects
-                            .iter()
-                            .any(|p| p.kind == *kind && p.raw_id == *raw_id)
-                        {
+                        if !graph.objects.contains(&(kind.as_str(), raw_id.as_str())) {
                             return Err(Error::InvalidRequest);
                         }
-                        // 父节点可能排在child之后；只查本次显式节点的精确账号身份，避免改变输入顺序契约。
+                        // 反序父节点只按本次声明的精确账号身份查证一次；实际保存后以原owner覆盖。
                         let saved: Option<String> = sqlx::query_scalar("SELECT owner FROM native_objects WHERE protocol=? AND kind=? AND boundary=? AND raw_id=?")
                             .bind(graph.root.submission.protocol.as_str()).bind(kind.as_str())
                             .bind(&graph.root.submission.origin.boundary).bind(raw_id)
@@ -1268,7 +1325,11 @@ impl StandaloneNativeStore {
                             Some(saved) => decode(&saved)?,
                             None => graph.root.owner.clone(),
                         };
-                        owners.observed.insert(key, candidate.clone());
+                        owners
+                            .observed
+                            .entry(kind.as_str())
+                            .or_default()
+                            .insert(raw_id.clone(), candidate.clone());
                         candidate
                     };
                     (*kind, candidate)
@@ -1286,6 +1347,7 @@ impl StandaloneNativeStore {
             }
             owner = Some(candidate);
         }
+        edges.owner = owner.clone();
         Ok(owner)
     }
 
@@ -1949,6 +2011,20 @@ impl StandaloneNativeStore {
                 return Err(Error::Conflict);
             }
             reply.records.push(root.record.clone());
+            let (mut owning_edges, observed_parents) = if entry.objects.is_empty() {
+                (BTreeMap::new(), false)
+            } else {
+                Self::owning_edges(&entry.relations)
+            };
+            let objects: ObjectKeys<'_> = if observed_parents {
+                entry
+                    .objects
+                    .iter()
+                    .map(|object| (object.kind.as_str(), object.raw_id.as_str()))
+                    .collect()
+            } else {
+                BTreeSet::new()
+            };
             let mut children = Vec::new();
             for object in &entry.objects {
                 let legacy_output = root.submission.kind == NativeObjectKind::Response
@@ -1970,24 +2046,40 @@ impl StandaloneNativeStore {
                     ))
                 .then_some(root.record.record_id);
                 child.asynchronous = false;
-                let child_owner = self
-                    .child_owner(
-                        conn,
-                        &DerivedGraph {
-                            root: &root,
-                            references,
-                            objects: &entry.objects,
-                            relations: &entry.relations,
-                            observed: &children,
-                        },
-                        object,
-                        &mut owners,
-                    )
-                    .await?
+                let child_owner =
+                    match owning_edges.get_mut(&(object.kind.as_str(), object.raw_id.as_str())) {
+                        Some(edges) => {
+                            self.child_owner(
+                                conn,
+                                &DerivedGraph {
+                                    root: &root,
+                                    references,
+                                    objects: &objects,
+                                },
+                                object,
+                                &mut owners,
+                                edges,
+                            )
+                            .await?
+                        }
+                        None => None,
+                    }
                     .unwrap_or_else(|| source.owner.clone());
                 let stored = self
                     .insert_object(conn, child, child_owner, &object.raw_id, true, capture)
                     .await?;
+                if observed_parents
+                    && matches!(
+                        stored.submission.kind,
+                        NativeObjectKind::Conversation | NativeObjectKind::ResponseContainer
+                    )
+                {
+                    owners
+                        .observed
+                        .entry(stored.submission.kind.as_str())
+                        .or_default()
+                        .insert(stored.record.raw_id.clone(), stored.owner.clone());
+                }
                 if legacy_output {
                     reply.memberships.push(
                         self.attach(
@@ -2003,6 +2095,7 @@ impl StandaloneNativeStore {
                 reply.records.push(stored.record.clone());
                 children.push(stored);
             }
+            drop(owning_edges);
             for relation in entry.relations {
                 let parent = self
                     .selector(conn, &root, &children, references, relation.parent, &owners)
