@@ -4,8 +4,10 @@ use std::collections::BTreeSet;
 
 use aisix_core::models::EndpointFamily;
 use aisix_core::native_objects::{
-    AcceptedReference, NativeObjectKind, NativeRecord, OriginBinding,
+    configured_native_origin, AcceptedReference, NativeObjectKind, NativeProtocol, NativeRecord,
+    OriginBinding,
 };
+use aisix_core::{ProviderKey, ResourceEntry};
 use serde_json::Value;
 
 use crate::auth::AuthenticatedKey;
@@ -18,6 +20,45 @@ fn conversation_id(body: &Value) -> Option<&str> {
     conversation
         .as_str()
         .or_else(|| conversation.get("id").and_then(Value::as_str))
+}
+
+pub(crate) fn final_conversation(
+    body: &Value,
+    admitted: Option<&(String, uuid::Uuid)>,
+) -> (Option<uuid::Uuid>, Option<String>) {
+    match conversation_id(body) {
+        Some(raw) if admitted.is_some_and(|(previous, _)| previous == raw) => {
+            (admitted.map(|(_, id)| *id), None)
+        }
+        Some(raw) => (None, Some(raw.to_owned())),
+        None => (None, None),
+    }
+}
+
+pub(crate) async fn admit_final_conversation(
+    state: &ProxyState,
+    auth: &AuthenticatedKey,
+    client: &ClientContext,
+    raw: &str,
+    provider: &ResourceEntry<ProviderKey>,
+) -> Result<uuid::Uuid, ProxyError> {
+    let (origin, record) =
+        super::openai_conversations::admit_response_conversation(state, auth, client, raw).await?;
+    let provider_key_id = super::openai::resource_id(state, "provider_keys", &provider.id)?;
+    let boundary = configured_native_origin(
+        &state
+            .native_origin_key()
+            .ok_or(ProxyError::AccountUnavailable)?,
+        provider_key_id,
+        &provider.value,
+        NativeProtocol::Openai,
+        NativeObjectKind::Response,
+    )
+    .map_err(|_| ProxyError::AccountUnavailable)?;
+    if origin.provider_key_id != provider_key_id || origin.boundary != boundary {
+        return Err(ProxyError::ResponseNotFound);
+    }
+    Ok(record.record_id)
 }
 
 pub(crate) fn take_references(body: &mut Value) -> Vec<(NativeObjectKind, String)> {
@@ -237,7 +278,7 @@ pub(crate) async fn admit_affinity_with_conversation(
     client: &ClientContext,
     body: &Value,
     affinity: &mut crate::responses_affinity::ContextAffinity,
-) -> Result<Option<uuid::Uuid>, ProxyError> {
+) -> Result<Option<(String, uuid::Uuid)>, ProxyError> {
     if state.native_objects.is_none() && state.platform().is_none() {
         return Ok(None);
     }
@@ -248,7 +289,7 @@ pub(crate) async fn admit_affinity_with_conversation(
         if record.kind == Some(NativeObjectKind::Conversation)
             && Some(record.raw_id.as_str()) == conversation
         {
-            conversation_record_id = Some(record.record_id);
+            conversation_record_id = Some((record.raw_id.clone(), record.record_id));
         }
         affinity.admit_object_origin(record.origin.ok_or(ProxyError::AccountUnavailable)?)?;
     }

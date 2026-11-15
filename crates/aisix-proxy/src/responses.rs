@@ -639,7 +639,7 @@ pub(crate) async fn responses_operation(
         &operation,
         &mut body,
         &affinity,
-        conversation_record_id,
+        conversation_record_id.as_ref(),
         &request_id,
         started,
         &client,
@@ -994,7 +994,7 @@ async fn dispatch(
     body: &mut Value,
     // The context tags `responses` removed from `body`.
     affinity: &crate::responses_affinity::ContextAffinity,
-    conversation_record_id: Option<Uuid>,
+    conversation_record_id: Option<&(String, Uuid)>,
     request_id: &str,
     // Request-scoped clock + downstream client attribution, threaded so the
     // streaming path's Drop guard can stamp latency + client IP/UA on the
@@ -2047,7 +2047,7 @@ async fn responses_to_target(
     snapshot: &aisix_core::AisixSnapshot,
     operation: &NativeResponseOperation,
     body: &Value,
-    conversation_record_id: Option<Uuid>,
+    admitted_conversation: Option<&(String, Uuid)>,
     // The context tags this attempt's response carries back.
     mark: crate::responses_affinity::ResponseMark,
     model: &Arc<aisix_core::Model>,
@@ -2124,11 +2124,10 @@ async fn responses_to_target(
         && body.get("background").and_then(Value::as_bool) == Some(true);
     let bill_tokens = operation.bills_tokens() && !asynchronous;
     let estimate_usage = operation.is_create() && bill_tokens;
-    // Only the outbound wire bytes outlive this block: the caller keeps its
-    // body for fail-over, and reqwest holds these until the response head,
-    // so a `Value` copy alive across the await would be a third copy of the
-    // request (see `crate::util::outbound_json`).
-    let (body_bytes, is_stream) = {
+    // 本块只保留出站字节和正式 ID；正文留给故障转移，reqwest 持有字节直到响应头。
+    // 等待查找或响应头前先释放 Value 副本，避免同时持有第三份正文。
+    // 参见 crate::util::outbound_json。
+    let (body_bytes, is_stream, (mut conversation_record_id, conversation_to_resolve)) = {
         let mapped = crate::effort_mapping::responses_request(body, model);
         // The common case only renames `model`: serialize the caller's body
         // with that one field swapped instead of deep-cloning it first, which
@@ -2148,7 +2147,11 @@ async fn responses_to_target(
                 .get("stream")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            (crate::util::outbound_json(&wire)?, is_stream)
+            (
+                crate::util::outbound_json(&wire)?,
+                is_stream,
+                crate::native_api::response_refs::final_conversation(body, admitted_conversation),
+            )
         } else {
             let mut body = mapped.into_owned();
 
@@ -2190,9 +2193,25 @@ async fn responses_to_target(
                 .get("stream")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            (crate::util::outbound_json(&body)?, is_stream)
+            // 归属只跟随最终正式槽；同一原始 ID 复用本次已授权记录。
+            (
+                crate::util::outbound_json(&body)?,
+                is_stream,
+                crate::native_api::response_refs::final_conversation(&body, admitted_conversation),
+            )
         }
     };
+
+    if operation.is_create() && state.native_objects.is_some() {
+        if let Some(raw) = conversation_to_resolve {
+            conversation_record_id = Some(
+                crate::native_api::response_refs::admit_final_conversation(
+                    state, auth, client_ctx, &raw, &pk_entry,
+                )
+                .await?,
+            );
+        }
+    }
 
     // 最终模型正文定型后保存文本标量；真正发送前仍先固定持久归属。
     let mut registration = if operation.is_create() {
