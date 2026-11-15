@@ -142,13 +142,15 @@ async fn build_indexes(store: &StandaloneNativeStore) -> f64 {
 async fn reopening_current_file_restores_polling_indexes_and_preserves_lease_and_terminal_semantics(
 ) {
     let f = Fixture::new().await;
-    let historical = completed(&f, "resp-index-history").await;
-    let delivered = f.store.pending_terminals(1).await.unwrap().remove(0);
-    f.store
-        .acknowledge_terminal_claim(&delivered)
-        .await
-        .unwrap();
-    seed_history(&f.store, &historical, 1, 128).await;
+    for i in 0..8 {
+        let historical = completed(&f, &format!("resp-index-history-{i}")).await;
+        let delivered = f.store.pending_terminals(1).await.unwrap().remove(0);
+        assert_eq!(delivered.record_id, historical.record_id);
+        f.store
+            .acknowledge_terminal_claim(&delivered)
+            .await
+            .unwrap();
+    }
     let ready = f
         .create(
             "key-a",
