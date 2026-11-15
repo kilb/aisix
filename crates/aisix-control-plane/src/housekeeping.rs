@@ -27,7 +27,7 @@ use crate::db::{Db, DbError};
 use crate::resources::write::{WriteCtx, RESOURCES_LOCK_KEY};
 use crate::resources::Kind;
 use crate::stopped;
-use crate::{channels, keys, tenants};
+use crate::{channels, keys, tenants, usage_metrics_projection};
 
 const PERIOD: Duration = Duration::from_secs(600);
 
@@ -186,12 +186,34 @@ pub fn spawn(db: Db, ctx: WriteCtx, mut shutdown: watch::Receiver<bool>) -> Join
     tokio::spawn(async move {
         let mut every = tokio::time::interval(PERIOD);
         every.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        // 迁移只安装触发器；历史投影用独立单连接短批次补齐，完成后关闭这条分支。
+        let mut metric_db = Some(db.dedicated_within(1, Duration::from_millis(50)));
+        let mut metrics = tokio::time::interval(Duration::from_millis(100));
+        metrics.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 () = stopped(&mut shutdown) => return,
-                _ = every.tick() => {}
+                _ = every.tick() => tick(&db, &ctx).await,
+                _ = metrics.tick(), if metric_db.is_some() => {
+                    if let Some(backfill) = &metric_db {
+                        match usage_metrics_projection::backfill_once(backfill).await {
+                            Ok(progress) if progress.complete => {
+                                tracing::debug!(?progress, "usage metric inputs caught up");
+                                metric_db = None;
+                            }
+                            Ok(progress) => {
+                                if progress.deferred > 0 {
+                                    metrics.reset_after(Duration::from_secs(1));
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "catching up usage metric inputs failed");
+                                metrics.reset_after(Duration::from_secs(10));
+                            }
+                        }
+                    }
+                }
             }
-            tick(&db, &ctx).await;
         }
     })
 }
