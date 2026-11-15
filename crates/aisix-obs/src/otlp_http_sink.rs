@@ -110,6 +110,28 @@ struct FanOutInner {
     /// The resource `service.name` every OTLP export carries, once
     /// [`OtlpHttpFanOut::set_service_name`] hands it over.
     service_name: std::sync::OnceLock<String>,
+    #[cfg(test)]
+    work: FanOutWork,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct FanOutWork {
+    reconciles: std::sync::atomic::AtomicUsize,
+    config_clones: std::sync::atomic::AtomicUsize,
+}
+
+// 测试只计实际执行的配置 clone；发布构建仍展开为原来的 Clone::clone。
+macro_rules! clone_delivery_config {
+    ($fan_out:expr, $value:expr) => {{
+        #[cfg(test)]
+        $fan_out
+            .inner
+            .work
+            .config_clones
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::clone::Clone::clone($value)
+    }};
 }
 
 /// Delivery tuning for otlp exporter pipelines. A short flush keeps a
@@ -160,6 +182,8 @@ impl OtlpHttpFanOut {
                 client,
                 reconciled_generation: parking_lot::Mutex::new(0),
                 service_name: std::sync::OnceLock::new(),
+                #[cfg(test)]
+                work: FanOutWork::default(),
             }),
         }
     }
@@ -334,9 +358,9 @@ impl OtlpHttpFanOut {
         let fingerprint = fingerprint_exporter(exp);
         match &exp.kind {
             ExporterKind::OtlpHttp(cfg) => {
-                let name = exp.name.clone();
-                let endpoint = cfg.endpoint.clone();
-                let headers = cfg.headers.clone();
+                let name = clone_delivery_config!(self, &exp.name);
+                let endpoint = clone_delivery_config!(self, &cfg.endpoint);
+                let headers = clone_delivery_config!(self, &cfg.headers);
                 let service_name = self
                     .inner
                     .service_name
@@ -353,8 +377,8 @@ impl OtlpHttpFanOut {
                     })
             }
             ExporterKind::AliyunSls(cfg) => {
-                let name = exp.name.clone();
-                let cfg = cfg.clone();
+                let name = clone_delivery_config!(self, &exp.name);
+                let cfg = clone_delivery_config!(self, cfg);
                 self.inner
                     .exporters
                     .get_or_create(&exp.name, fingerprint, move || {
@@ -376,8 +400,8 @@ impl OtlpHttpFanOut {
                     })
             }
             ExporterKind::ObjectStore(cfg) => {
-                let name = exp.name.clone();
-                let cfg = cfg.clone();
+                let name = clone_delivery_config!(self, &exp.name);
+                let cfg = clone_delivery_config!(self, cfg);
                 self.inner
                     .exporters
                     .get_or_create(&exp.name, fingerprint, move || {
@@ -390,8 +414,8 @@ impl OtlpHttpFanOut {
                     })
             }
             ExporterKind::Datadog(cfg) => {
-                let name = exp.name.clone();
-                let cfg = cfg.clone();
+                let name = clone_delivery_config!(self, &exp.name);
+                let cfg = clone_delivery_config!(self, cfg);
                 self.inner
                     .exporters
                     .get_or_create(&exp.name, fingerprint, move || {
@@ -442,6 +466,11 @@ impl OtlpHttpFanOut {
     /// whose delivery fingerprint changed. Called by [`Self::fan_out`] and by
     /// the snapshot publication listener.
     fn reconcile_pipelines(&self, desired: &std::collections::HashMap<String, u64>) {
+        #[cfg(test)]
+        self.inner
+            .work
+            .reconciles
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.inner.exporters.reconcile(desired);
     }
 
@@ -470,6 +499,10 @@ impl OtlpHttpFanOut {
         self.inner.exporters.shutdown_within(deadline).await
     }
 }
+
+#[cfg(test)]
+#[path = "otlp_fan_out_work_tests.rs"]
+mod fan_out_work_tests;
 
 impl Default for OtlpHttpFanOut {
     fn default() -> Self {
