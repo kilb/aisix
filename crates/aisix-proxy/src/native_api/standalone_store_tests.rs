@@ -1625,3 +1625,6 @@ mod batch_file_context;
 
 #[path = "standalone_realtime_store_tests.rs"]
 mod realtime;
+
+#[path = "standalone_polling_index_tests.rs"]
+mod polling_indexes;
