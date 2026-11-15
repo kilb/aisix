@@ -701,7 +701,7 @@ pub(super) async fn checkpoint(
     if row.state == "closed" {
         return Ok(live_reply(&row, None));
     }
-    if row.lease_expires_at <= at {
+    if row.lease_expires_at <= at && (!body.terminal || !body.entries.is_empty()) {
         return Err(ApiError::not_found());
     }
     let op = operation(&mut *conn, state, row.operation_id, false).await?;
@@ -769,7 +769,7 @@ pub(super) async fn checkpoint(
     } else {
         row.state.as_str()
     };
-    sqlx::query("UPDATE native_live_sessions SET state=$3,coverage=$4,accounting_state=CASE WHEN $4='unknown' THEN 'awaiting_reconciliation' ELSE accounting_state END,lease_expires_at=CASE WHEN $3='requires_stop' THEN clock_timestamp()+interval '30 seconds' ELSE LEAST(clock_timestamp()+interval '30 seconds',deadline_at) END,closed_at=CASE WHEN $3='closed' THEN clock_timestamp() ELSE NULL END,updated_at=clock_timestamp() WHERE environment_id=$1 AND operation_id=$2")
+    sqlx::query("UPDATE native_live_sessions SET state=$3,coverage=$4,accounting_state=CASE WHEN $4='unknown' THEN 'awaiting_reconciliation' ELSE accounting_state END,lease_expires_at=CASE WHEN $3='closed' THEN lease_expires_at WHEN $3='requires_stop' THEN clock_timestamp()+interval '30 seconds' ELSE LEAST(clock_timestamp()+interval '30 seconds',deadline_at) END,closed_at=CASE WHEN $3='closed' THEN clock_timestamp() ELSE NULL END,updated_at=clock_timestamp() WHERE environment_id=$1 AND operation_id=$2")
         .bind(state.env.env_id).bind(row.operation_id).bind(next_state).bind(next)
         .execute(&mut *conn).await.map_err(unavailable)?;
     refresh_accounting(&mut *conn, state, row.operation_id)
