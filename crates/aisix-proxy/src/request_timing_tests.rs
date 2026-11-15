@@ -271,3 +271,60 @@ async fn request_timing_raw_and_bodyless_errors_record_the_handler_boundary() {
         assert!(rx.try_recv().is_err(), "{method} {path}: 不重复发射");
     }
 }
+
+#[tokio::test]
+async fn request_timing_keeps_passthrough_json_work_before_a_guardrail_rejects() {
+    use std::time::Duration;
+    use tower::ServiceExt;
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let snapshot = seed_snapshot("phase-model", &["phase-model"], "http://unused");
+    snapshot
+        .passthrough_routes
+        .insert(passthrough_route_entry("http://unused"));
+    let rule: aisix_core::Guardrail = serde_json::from_value(serde_json::json!({
+        "name": "phase-stop", "kind": "custom", "hook_point": "input",
+        "script": "export function checkInput() { return { action: 'block', reason_code: 'phase-stop' }; }",
+        "timeout_ms": 5000,
+    })).unwrap();
+    seed_env_scoped_guardrail(&snapshot, ResourceEntry::new("phase-stop", rule, 1));
+    let app = build_router(
+        build_state(snapshot, Arc::new(Hub::new())).with_usage_sink(aisix_obs::UsageSink::new(tx)),
+    );
+    for body in [
+        r#"{"unrecognized_api_field":"hello"}"#,
+        r#"{"model":"phase-model","input":{"prompt":"hello"}}"#,
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/passthrough/openai/custom")
+                    .header("authorization", "Bearer sk-caller")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 422);
+        let _ = to_bytes(response.into_body(), 65_536).await.unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(event.guardrail_blocked);
+        assert_eq!(event.upstream_dispatched, Some(false));
+        let wire = serde_json::to_value(event).unwrap();
+        let timing = wire.get("request_timing").expect("HTTP 阶段必须存在");
+        assert!(
+            timing
+                .get("json_decode_ms")
+                .and_then(serde_json::Value::as_u64)
+                .is_some(),
+            "原有解码发生后才被护栏拒绝，不能丢掉已做的工作：{timing}"
+        );
+        assert!(rx.try_recv().is_err());
+    }
+}
