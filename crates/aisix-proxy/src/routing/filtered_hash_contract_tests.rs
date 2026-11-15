@@ -1,5 +1,6 @@
 use super::*;
 use aisix_core::ResourceEntry;
+use aisix_response_reference_test_alloc::AllocationScope;
 use serde_json::json;
 use std::sync::Arc;
 
@@ -247,5 +248,183 @@ fn filtered_hash_all_zero_candidates_keep_old_order_with_configured_positive_sib
                 .collect::<Vec<_>>(),
             legacy_order(&declarations, &declarations[..2], &key)
         );
+    }
+}
+
+#[test]
+fn filtered_hash_successors_preserve_equal_point_ties_and_wraparound() {
+    // 相同点必须按原声明位置解 tie；跳过不可用声明后也不能按请求局部下标重新打散。
+    let ring = HashRing::from_sorted_points(
+        0,
+        vec![
+            (10, 0),
+            (10, 1),
+            (10, 2),
+            (20, 2),
+            (30, 0),
+            (30, 1),
+            (40, 2),
+        ],
+        3,
+    );
+    for (key, expected) in [
+        (0, [0, 1]),
+        (10, [0, 1]),
+        (11, [1, 0]),
+        (20, [1, 0]),
+        (21, [0, 1]),
+        (30, [0, 1]),
+        (31, [1, 0]),
+        (40, [1, 0]),
+        (41, [0, 1]),
+        (u64::MAX, [0, 1]),
+    ] {
+        assert_eq!(
+            ring.subset_preference_order(key, &[0, 2]),
+            expected,
+            "key={key}"
+        );
+        assert_eq!(
+            ring.subset_preference_order(key, &[1, 2]),
+            expected,
+            "key={key}"
+        );
+    }
+    assert_eq!(ring.subset_preference_order(10, &[0, 1, 2]), [0, 1, 2]);
+    assert_eq!(ring.subset_preference_order(11, &[0, 1, 2]), [2, 0, 1]);
+}
+
+#[test]
+fn filtered_hash_matches_legacy_with_weighted_priority_tiers_and_cooldown() {
+    // 子集权重域、健康过滤、try_anyway 或跨层 fallback 任一改变都必须逐项偏离旧环。
+    for count in [8usize, 32] {
+        let snapshot = AisixSnapshot::new();
+        let declarations: Vec<_> = (0..count)
+            .map(|index| {
+                let name = format!("weighted-{index}");
+                put(&snapshot, &format!("weighted-id-{index}"), &name);
+                RoutingTarget::new(name)
+                    .with_weight((index % 7 + 1) as u32)
+                    .with_priority((index % 3) as i32 - 1)
+                    .with_tags(vec![if index % 2 == 0 { "eu" } else { "us" }.into()])
+            })
+            .collect();
+        let mut model = group(declarations.clone(), None);
+        Arc::make_mut(&mut model)
+            .routing
+            .as_mut()
+            .unwrap()
+            .when_all_unavailable = Some(WhenAllUnavailablePolicy::TryAnyway);
+        let registry = RoutingRegistry::new();
+        let pricing = LivePricingIndex::new();
+        for cooldown in [0usize, 1, count] {
+            let status = crate::ModelRuntimeStatusTracker::new();
+            for index in 0..cooldown {
+                status.mark_cooldown(
+                    &format!("weighted-id-{index}"),
+                    Duration::from_secs(600),
+                    "oracle-cooldown",
+                );
+            }
+            for side in [0usize, 1] {
+                let tags = vec![if side == 0 { "eu" } else { "us" }.to_string()];
+                let kept: Vec<_> = declarations
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| {
+                        index % 2 == side && (cooldown == count || *index >= cooldown)
+                    })
+                    .map(|(_, target)| target.clone())
+                    .collect();
+                for index in 0..64 {
+                    let key = format!("weighted-key-{index}");
+                    let actual = resolve_attempt_models(
+                        &registry,
+                        &status,
+                        &pricing,
+                        &snapshot,
+                        "weighted-group",
+                        "weighted-id",
+                        &model,
+                        RoutingRequest {
+                            tags: &tags,
+                            api_key_id: &key,
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        actual
+                            .iter()
+                            .map(|attempt| attempt.model.display_name.as_str())
+                            .collect::<Vec<_>>(),
+                        legacy_order(&declarations, &kept, &key),
+                        "count={count} cooldown={cooldown} side={side} key={key}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn configured_hash_ring_storage_stays_bounded_by_declarations() {
+    // 缓存改回按请求子集累积，或为每个点重复索引，都会突破配置域的点数/条目上界。
+    let snapshot = AisixSnapshot::new();
+    let declarations = (0..128)
+        .map(|index| {
+            let name = format!("bounded-{index}");
+            put(&snapshot, &format!("bounded-id-{index}"), &name);
+            RoutingTarget::new(name)
+                .with_weight(index as u32 + 1)
+                .with_tags(vec![format!("subset-{}", index % 16)])
+        })
+        .collect();
+    let model = group(declarations, None);
+    let registry = RoutingRegistry::new();
+    let status = crate::ModelRuntimeStatusTracker::new();
+    let pricing = LivePricingIndex::new();
+    for subset in 0..16 {
+        let tags = vec![format!("subset-{subset}")];
+        let actual = resolve_attempt_models(
+            &registry,
+            &status,
+            &pricing,
+            &snapshot,
+            "bounded-group",
+            "bounded-id",
+            &model,
+            RoutingRequest {
+                tags: &tags,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(actual.len(), 8);
+    }
+    assert_eq!(registry.rings.len(), 1);
+    let ring = registry
+        .rings
+        .get(&("bounded-group".to_string(), 0))
+        .unwrap();
+    assert!(ring.points.len() <= 160 * (64 + 128));
+    assert_eq!(ring.point_positions.len(), ring.points.len());
+    assert_eq!(ring.declaration_offsets.len(), 129);
+}
+
+#[test]
+fn small_filtered_hash_successor_queries_allocate_only_the_returned_order() {
+    // 把每次请求的声明映射或 successor scratch 改成 Vec，会超过实际分配计数上限。
+    let declarations: Vec<_> = (0..16)
+        .map(|index| RoutingTarget::new(format!("alloc-{index}")))
+        .collect();
+    let ring = HashRing::build(0, &declarations, RingScale::of(declarations.iter()));
+    for count in [1usize, 2, 8] {
+        let subset: Vec<_> = (0..count).map(|index| index * 2).collect();
+        let scope = AllocationScope::start();
+        let order = ring.subset_preference_order(12345, &subset);
+        let allocations = scope.finish();
+        assert_eq!(order.len(), count);
+        assert_eq!(allocations.calls, 1, "count={count}: {allocations:?}");
     }
 }
