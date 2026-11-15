@@ -37,6 +37,8 @@
 #[cfg(test)]
 mod indexed_contract_tests;
 #[cfg(test)]
+mod filtered_hash_contract_tests;
+#[cfg(test)]
 mod metric_key_tests;
 #[cfg(test)]
 mod performance_contract_tests;
