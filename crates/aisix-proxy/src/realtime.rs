@@ -1229,7 +1229,15 @@ async fn authenticate_realtime_token(
 > {
     use crate::native_api::realtime_credentials;
     use aisix_core::native_realtime::RealtimePurpose;
-    if !realtime_credentials::is_credential(token) {
+    if !realtime_credentials::is_credential(token)
+        || state
+            .snapshot
+            .load()
+            .apikeys
+            .get_by_name(&aisix_core::ApiKey::hash_bearer(token))
+            .is_some()
+    {
+        // 临时凭据前缀不保留普通 key 的明文空间；真实 hash 命中仍走原生命周期鉴权。
         return crate::auth::authenticate_token(state, token, ctx)
             .await
             .map(|auth| (auth, None));
