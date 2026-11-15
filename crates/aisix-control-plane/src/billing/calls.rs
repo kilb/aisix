@@ -560,20 +560,13 @@ struct Scope {
 }
 
 impl Scope {
-    /// ` FROM ... WHERE ...` over the charge `pc` and its usage row `ue`,
-    /// with the correction `eff` ([`EFFECTIVE`]), and one row per charge
-    /// line `l` (the corrected lines) when `lines` is set.
-    fn push_from(&self, sql: &mut QueryBuilder<'_, Postgres>, lines: bool) {
+    /// 调用明细按费用与事件关联，并附带最新修正。
+    fn push_from(&self, sql: &mut QueryBuilder<'_, Postgres>) {
         sql.push(" FROM pricing_charges_cny pc JOIN usage_events ue ON ue.event_id = pc.event_id");
         // The display name only: a charge's group is shown by what tenants may
         // see, never by the routing name its provider keys carry.
         sql.push(" LEFT JOIN provider_groups g ON g.id = pc.group_id");
         sql.push(EFFECTIVE);
-        if lines {
-            sql.push(format!(
-                " CROSS JOIN LATERAL jsonb_array_elements({EFF_LINES}) l"
-            ));
-        }
         sql.push(" WHERE pc.tenant_id = ");
         sql.push_bind(self.tenant).push("::text");
         sql.push(" AND ").push(VISIBLE);
@@ -790,7 +783,7 @@ pub async fn list_calls(
     ));
     sql.push(ADJUSTED).push(" AS adjusted, ");
     sql.push(EVENT_FIELDS).push(" AS ev");
-    scope.push_from(&mut sql, false);
+    scope.push_from(&mut sql);
     if let Some(member) = member_filter {
         sql.push(" AND pc.user_id = ")
             .push_bind(member)
