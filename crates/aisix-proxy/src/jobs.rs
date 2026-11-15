@@ -4746,6 +4746,10 @@ async fn attribute_batch_usage(job: &BatchAttribution) -> Result<(), String> {
 }
 
 #[cfg(test)]
+#[path = "jobs_batch_input_perf_tests.rs"]
+mod batch_input_perf_tests;
+
+#[cfg(test)]
 mod tests {
     /// 这个面判断一把密钥说哪种协议，必须和请求路径实际怎么分派一致：
     /// chat 能用的密钥这里也能用，chat 分派不出去的这里也不收。
