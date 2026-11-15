@@ -776,7 +776,7 @@ async fn dispatch(
             .then(crate::json_splice::SpliceError::unevaluable)
     });
     let protocol = refine_request_protocol(protocol, &path, &incoming_headers);
-    let raw_shape = detect_raw_usage_shape(protocol, &body_bytes);
+    let (raw_shape, raw_model) = detect_raw_usage_shape(protocol, &body_bytes);
     let metering = metering_protocol(protocol, raw_shape, &path);
 
     // INPUT guardrails on the (envelope-extracted) request text.
@@ -889,7 +889,8 @@ async fn dispatch(
         .map(|_| String::from_utf8_lossy(&body_bytes).into_owned());
 
     // The alias the caller addressed, for the usage event's attribution.
-    let requested_model = body_model_name(protocol, raw_shape, &body_bytes);
+    let requested_model =
+        raw_model.unwrap_or_else(|| body_model_name(protocol, raw_shape, &body_bytes));
 
     // Otherwise rate limits AFTER the input guardrail so a content block by
     // local rules doesn't burn an RPM slot (matching the typed endpoints).
@@ -1971,12 +1972,21 @@ enum RawUsageShape {
 
 /// Classify a body [`detect_protocol`] left `Raw`; `None` for any other
 /// protocol, so the three LLM envelopes are never re-read.
-fn detect_raw_usage_shape(protocol: PassthroughProtocol, body: &[u8]) -> Option<RawUsageShape> {
+fn detect_raw_usage_shape(
+    protocol: PassthroughProtocol,
+    body: &[u8],
+) -> (Option<RawUsageShape>, Option<String>) {
     if !matches!(protocol, PassthroughProtocol::Raw) {
-        return None;
+        return (None, None);
     }
-    let v = serde_json::from_slice::<serde_json::Value>(body).ok()?;
-    if v.get("documents").is_some_and(serde_json::Value::is_array) && v.get("query").is_some() {
+    let Ok(v) = crate::attribution::measure_json_decode(false, || {
+        serde_json::from_slice::<serde_json::Value>(body)
+    }) else {
+        return (None, None);
+    };
+    let shape = if v.get("documents").is_some_and(serde_json::Value::is_array)
+        && v.get("query").is_some()
+    {
         Some(RawUsageShape::Rerank)
     } else if v.get("model").is_some_and(serde_json::Value::is_string)
         && v.get("input").is_some_and(serde_json::Value::is_object)
@@ -1984,7 +1994,9 @@ fn detect_raw_usage_shape(protocol: PassthroughProtocol, body: &[u8]) -> Option<
         Some(RawUsageShape::DashscopeNative)
     } else {
         None
-    }
+    };
+    // 复用这次原有解码的模型名；护栏提前拒绝也已留下解析成本，不再解析第二遍。
+    (shape, shape.map(|_| decoded_body_model_name(&v)))
 }
 
 /// The protocol an exchange is METERED as: which typed endpoint's parser
@@ -2078,6 +2090,10 @@ fn body_model_name(
     }) else {
         return String::new();
     };
+    decoded_body_model_name(&v)
+}
+
+fn decoded_body_model_name(v: &serde_json::Value) -> String {
     v.get("model")
         .and_then(|m| m.as_str())
         .map(|m| {
@@ -11819,7 +11835,7 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
 
     #[test]
     fn raw_usage_shapes_are_claimed_only_from_raw_bodies() {
-        let shape = |b: &[u8]| detect_raw_usage_shape(detect_protocol(b), b);
+        let shape = |b: &[u8]| detect_raw_usage_shape(detect_protocol(b), b).0;
         // The LLM envelopes keep their classification.
         let responses = br#"{"model":"m","input":"hi","documents":[],"query":"q"}"#;
         assert_eq!(
