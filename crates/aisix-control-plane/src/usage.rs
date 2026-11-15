@@ -701,6 +701,16 @@ pub(crate) fn admin_event_view(value: &mut Value) {
         Value::Object(fields) => {
             for (key, value) in fields {
                 let key = key.to_ascii_lowercase().replace('-', "_");
+                // 已存的 header 对象沿用核心凭据分类；普通 JSON 的标识字段不受影响。
+                if key == "headers" || key.ends_with("_headers") {
+                    if let Some(headers) = value.as_object_mut() {
+                        for (name, value) in headers {
+                            if aisix_core::is_credential_header_name(name) {
+                                *value = json!(aisix_gateway::upstream_error_scrub::REDACTED);
+                            }
+                        }
+                    }
+                }
                 if matches!(
                     key.as_str(),
                     "authorization"
@@ -725,11 +735,11 @@ pub(crate) fn admin_event_view(value: &mut Value) {
         }
         Value::Array(values) => values.iter_mut().for_each(admin_event_view),
         Value::String(text) => {
-            *text = aisix_gateway::upstream_error_scrub::scrub_upstream_error_text(text);
-            // 非 HTTP 的配置地址同样可能携带 userinfo 或查询凭据。
+            // 先移除完整 URL 的查询凭据；共享脱敏会把内部 host 改为不可解析的占位符。
             if text.contains("://") && reqwest::Url::parse(text).is_ok() {
                 *text = aisix_core::redact_url_for_log(text);
             }
+            *text = aisix_gateway::upstream_error_scrub::scrub_upstream_error_text(text);
         }
         _ => {}
     }

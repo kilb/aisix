@@ -304,3 +304,184 @@ async fn unknown_records_are_404_and_tenant_sessions_cannot_read_admin_details()
         assert_eq!(refused.body.get("code"), Some(&json!("unauthenticated")));
     }
 }
+
+#[tokio::test]
+async fn internal_https_and_wss_urls_expose_no_query_credentials_on_admin_reads() {
+    let Some(w) = world().await else { return };
+    let model = seed_model(&w.cp, &w.admin).await;
+    let cases = [
+        (
+            "detail-internal-https",
+            "https://api.private.internal/path?api_key=opaque-secret-411",
+            "opaque-secret-411",
+            "api.private.internal",
+        ),
+        (
+            "detail-internal-wss",
+            "wss://socket.private.svc/path?access_token=opaque-wss-secret-411",
+            "opaque-wss-secret-411",
+            "socket.private.svc",
+        ),
+    ];
+    let events = cases
+        .iter()
+        .map(|(id, url, _, _)| {
+            usage(
+                &w,
+                id,
+                model,
+                json!({
+                    "status_code":502,"error_class":"upstream_status","error_message":url,
+                    "future_field":{"diagnostic_url":url}
+                }),
+            )
+        })
+        .collect();
+    let accepted = deliver(&w.dp, Uuid::new_v4(), events).await;
+    assert_eq!(accepted.status, 200, "{accepted:?}");
+    assert_eq!(
+        accepted.body,
+        json!({"accepted":2,"rejected":0,"duplicates":0})
+    );
+    let viewer = w.cp.admin_login_seeded(OperatorRole::Viewer).await;
+
+    for (event_id, original_url, credential, internal_host) in cases {
+        for path in [
+            detail_path(event_id),
+            format!("/admin/usage/events?request_id=req-{event_id}"),
+            format!("/admin/pricing/charges?event_id={event_id}&limit=1"),
+        ] {
+            let response = w.cp.get_with_cookie(&path, viewer.cookie()).await;
+            assert_eq!(response.status, 200, "{path}: {response:?}");
+            let raw = response.body.to_string();
+            assert!(
+                !raw.contains(credential),
+                "内部 URL 的查询凭据不能显示：{raw}"
+            );
+            assert!(!raw.contains(internal_host), "内部地址不能显示：{raw}");
+            let row = if let Some(items) = response.body.get("items") {
+                let items = items.as_array().expect("管理记录列表");
+                assert_eq!(items.len(), 1, "精确查询的记录必须存在");
+                &items[0]
+            } else {
+                &response.body
+            };
+            let message = row
+                .get("error_message")
+                .or_else(|| row.pointer("/event/error_message"))
+                .and_then(Value::as_str)
+                .expect("具体错误字段仍须返回");
+            assert!(!message.is_empty(), "不能靠丢掉整条错误避开凭据检查");
+            assert!(
+                !message.contains('?'),
+                "完整 URL 的查询字符串必须移除：{message}"
+            );
+            if let Some(event) = row.get("event") {
+                let diagnostic_url = event
+                    .pointer("/future_field/diagnostic_url")
+                    .and_then(Value::as_str)
+                    .expect("未知字段保留脱敏后的显示副本");
+                assert!(!diagnostic_url.is_empty());
+                assert!(
+                    !diagnostic_url.contains('?'),
+                    "嵌套 URL 的查询字符串必须移除"
+                );
+            }
+        }
+        let stored: String = sqlx::query_scalar(
+            "SELECT event->>'error_message' FROM usage_events WHERE event_id=$1",
+        )
+        .bind(event_id)
+        .fetch_one(w.cp.db().pool())
+        .await
+        .expect("已存错误原文");
+        assert_eq!(stored, original_url, "读取时脱敏不得修改已存事实");
+    }
+}
+
+#[tokio::test]
+async fn stored_header_maps_redact_opaque_credentials_and_keep_correlation_headers() {
+    let Some(w) = world().await else { return };
+    let model = seed_model(&w.cp, &w.admin).await;
+    let credentials = [
+        ("Cookie", "session=opaque-cookie-411"),
+        ("X-Goog-Api-Key", "opaque-google-key-411"),
+        ("x-amz-security-token", "opaque-aws-session-411"),
+        ("ocp-apim-subscription-key", "opaque-apim-key-411"),
+    ];
+    let mut headers = json!({"x-request-id":"visible-request-header-411"});
+    for (name, value) in credentials {
+        headers[name] = json!(value);
+    }
+    let header_maps = [
+        "request_headers",
+        "upstream_response_headers",
+        "headers",
+        "response_headers",
+        "upstream_headers",
+        "default_headers",
+    ];
+    let mut fields = json!({"future_field":{"api_key_id":"safe-key-id"}});
+    for map in header_maps {
+        fields[map] = headers.clone();
+    }
+    let event = usage(&w, "detail-header-credentials", model, fields);
+    let accepted = deliver(&w.dp, Uuid::new_v4(), vec![event.clone()]).await;
+    assert_eq!(accepted.status, 200, "{accepted:?}");
+    assert_eq!(
+        accepted.body,
+        json!({"accepted":1,"rejected":0,"duplicates":0})
+    );
+    let viewer = w.cp.admin_login_seeded(OperatorRole::Viewer).await;
+
+    for path in [
+        detail_path("detail-header-credentials"),
+        "/admin/usage/events?request_id=req-detail-header-credentials".to_owned(),
+    ] {
+        let response = w.cp.get_with_cookie(&path, viewer.cookie()).await;
+        assert_eq!(response.status, 200, "{path}: {response:?}");
+        let raw = response.body.to_string();
+        for (_, credential) in credentials {
+            assert!(
+                !raw.contains(credential),
+                "已存 header 的不透明凭据不能显示：{raw}"
+            );
+        }
+        let row = if let Some(items) = response.body.get("items") {
+            let items = items.as_array().expect("事件列表");
+            assert_eq!(items.len(), 1, "目标事件必须存在");
+            &items[0]
+        } else {
+            &response.body
+        };
+        for map in header_maps {
+            let headers = row["event"]
+                .get(map)
+                .and_then(Value::as_object)
+                .expect("已存 header 对象仍须可读");
+            for (name, _) in credentials {
+                let shown = headers
+                    .get(name)
+                    .and_then(Value::as_str)
+                    .expect("敏感 header 保留脱敏占位符");
+                assert!(!shown.is_empty());
+            }
+            assert_eq!(
+                headers.get("x-request-id"),
+                Some(&json!("visible-request-header-411")),
+                "非凭据 header 保留可诊断的原值"
+            );
+        }
+        assert_eq!(
+            row.pointer("/event/future_field/api_key_id"),
+            Some(&json!("safe-key-id")),
+            "普通 JSON 中的标识不能当成 header 凭据"
+        );
+    }
+    let stored: Value = sqlx::query_scalar("SELECT event FROM usage_events WHERE event_id=$1")
+        .bind("detail-header-credentials")
+        .fetch_one(w.cp.db().pool())
+        .await
+        .expect("已存原记录");
+    assert_eq!(stored, event, "展示脱敏不得修改已存 header 或用量事实");
+}
