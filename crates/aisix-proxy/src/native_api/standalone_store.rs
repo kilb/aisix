@@ -1391,9 +1391,19 @@ impl StandaloneNativeStore {
         child: &Stored,
         relation: NativeRelation,
     ) -> Result<()> {
-        if parent.record.deleted
-            || child.record.deleted
-            || !parent.owner.permits(&child.owner)
+        if parent.record.deleted || child.record.deleted {
+            return Err(Error::Conflict);
+        }
+        self.validate_relation_identity(parent, child, relation)
+    }
+
+    fn validate_relation_identity(
+        &self,
+        parent: &Stored,
+        child: &Stored,
+        relation: NativeRelation,
+    ) -> Result<()> {
+        if !parent.owner.permits(&child.owner)
             || !account(
                 parent.record.origin.as_ref().ok_or(Error::Unavailable)?,
                 child.record.origin.as_ref().ok_or(Error::Unavailable)?,
@@ -1699,34 +1709,44 @@ impl StandaloneNativeStore {
         conn: &mut SqliteConnection,
         body: LookupRelationsRequest,
     ) -> Result<NativeReply> {
-        if body.raw_ids.len() > MAX_ITEMS {
+        if body.raw_ids.len() > MAX_ITEMS || body.raw_ids.iter().any(|id| !valid_id(id)) {
             return Err(Error::InvalidRequest);
         }
+        let raw_ids: BTreeSet<&str> = body.raw_ids.iter().map(String::as_str).collect();
         let snapshot = self.snapshot.load();
         let principal = Self::principal(&snapshot, body.api_key_id)?;
         let parent = Self::stored(conn, body.parent_record_id).await?;
         self.authorize_chain(conn, &snapshot, &principal, &parent, body.consumer_family)
             .await?;
-        let rows = sqlx::query("SELECT membership_id,child_id,generation,version FROM native_memberships WHERE parent_id=? AND relation=? AND deleted=0 ORDER BY membership_id")
-            .bind(body.parent_record_id.to_string()).bind(body.relation.as_str()).fetch_all(&mut *conn).await.map_err(unavailable)?;
+        let rows = if raw_ids.is_empty() {
+            sqlx::query("SELECT membership_id,child_id,generation,version FROM native_memberships WHERE parent_id=? AND relation=? AND deleted=0 ORDER BY membership_id")
+                .bind(body.parent_record_id.to_string()).bind(body.relation.as_str()).fetch_all(&mut *conn).await.map_err(unavailable)?
+        } else {
+            // 单个已校验集合参数避免逐 ID 查询和 SQLite 占位符数量上限。
+            sqlx::query("SELECT m.membership_id,m.child_id,m.generation,m.version FROM native_memberships m JOIN native_objects child ON child.record_id=m.child_id WHERE m.parent_id=? AND m.relation=? AND m.deleted=0 AND child.raw_id IN (SELECT value FROM json_each(?)) ORDER BY m.membership_id")
+                .bind(body.parent_record_id.to_string()).bind(body.relation.as_str()).bind(json(&raw_ids)?).fetch_all(&mut *conn).await.map_err(unavailable)?
+        };
         let mut reply = NativeReply::new("related");
         for row in rows {
             let child_id = Uuid::parse_str(row.try_get("child_id").map_err(unavailable)?)
                 .map_err(unavailable)?;
             let child = Self::stored(conn, child_id).await?;
-            if !body.raw_ids.is_empty() && !body.raw_ids.contains(&child.record.raw_id) {
-                continue;
+            self.validate_relation_identity(&parent, &child, body.relation)?;
+            match self
+                .authorize_chain(
+                    conn,
+                    &snapshot,
+                    &principal,
+                    &child,
+                    body.consumer_family
+                        .or(Some(parent.submission.kind.endpoint_family())),
+                )
+                .await
+            {
+                Ok(()) => {}
+                Err(Error::NotFound) => continue,
+                Err(error) => return Err(error),
             }
-            self.validate_relation(&parent, &child, body.relation)?;
-            self.authorize_chain(
-                conn,
-                &snapshot,
-                &principal,
-                &child,
-                body.consumer_family
-                    .or(Some(parent.submission.kind.endpoint_family())),
-            )
-            .await?;
             reply.memberships.push(NativeMembership {
                 membership_id: Uuid::parse_str(row.try_get("membership_id").map_err(unavailable)?)
                     .map_err(unavailable)?,
@@ -1737,15 +1757,6 @@ impl StandaloneNativeStore {
                 version: row.try_get("version").map_err(unavailable)?,
             });
             reply.records.push(child.record);
-        }
-        // 指定 ID 的关系查询逐个成立，不能靠同一父对象下另一个成员成功来授权。
-        if !body.raw_ids.is_empty()
-            && body
-                .raw_ids
-                .iter()
-                .any(|id| !reply.records.iter().any(|r| &r.raw_id == id))
-        {
-            return Err(Error::NotFound);
         }
         Ok(reply)
     }
@@ -2060,6 +2071,7 @@ impl StandaloneNativeStore {
                 BTreeSet::new()
             };
             let mut children = Vec::new();
+            let mut membership_keys = BTreeSet::new();
             for object in &entry.objects {
                 let legacy_output = root.submission.kind == NativeObjectKind::Response
                     && matches!(
@@ -2114,7 +2126,13 @@ impl StandaloneNativeStore {
                         .or_default()
                         .insert(stored.record.raw_id.clone(), stored.owner.clone());
                 }
-                if legacy_output {
+                if legacy_output
+                    && membership_keys.insert((
+                        root.record.record_id,
+                        stored.record.record_id,
+                        NativeRelation::ResponseOutput.as_str(),
+                    ))
+                {
                     reply.memberships.push(
                         self.attach(
                             conn,
@@ -2137,8 +2155,22 @@ impl StandaloneNativeStore {
                 let child = self
                     .selector(conn, &root, &children, references, relation.child, &owners)
                     .await?;
-                self.validate_relation(&parent, &child, relation.relation)?;
+                self.validate_relation_identity(&parent, &child, relation.relation)?;
+                if child.record.deleted {
+                    return Err(Error::Conflict);
+                }
+                // 已接受工作保留真实产物；被删集合只省略关系，不能复活或改动它。
+                if parent.record.deleted {
+                    continue;
+                }
                 self.fence_free(conn, parent.record.record_id, None).await?;
+                if !membership_keys.insert((
+                    parent.record.record_id,
+                    child.record.record_id,
+                    relation.relation.as_str(),
+                )) {
+                    continue;
+                }
                 reply.memberships.push(
                     self.attach(
                         conn,
