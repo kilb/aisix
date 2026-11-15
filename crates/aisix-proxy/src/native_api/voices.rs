@@ -477,6 +477,7 @@ pub(crate) async fn validate_voice_slot(
 }
 
 /// WS 只在官方事件槽解释自定义引用；JSON binary 与 text 使用同一当前授权。
+#[cfg(test)]
 pub(crate) async fn validate_realtime_frame(
     state: &ProxyState,
     auth: &AuthenticatedKey,
@@ -485,24 +486,25 @@ pub(crate) async fn validate_realtime_frame(
     origin: Option<&OriginBinding>,
     requested_model: &str,
 ) -> Result<(), ProxyError> {
-    // 音频 append 等高频帧只借用原始值；仅配置事件解析容器，避免复制整段音频。
-    let Ok(event) = serde_json::from_slice::<
-        std::collections::HashMap<String, &serde_json::value::RawValue>,
-    >(bytes) else {
-        return Ok(());
-    };
-    let kind = event
-        .get("type")
-        .and_then(|value| serde_json::from_str::<String>(value.get()).ok());
-    let field = match kind.as_deref() {
-        Some("session.update") => "session",
-        Some("response.create") => "response",
+    let frame = super::realtime_frame::Frame::new(bytes);
+    validate_realtime_config(state, auth, client, &frame, origin, requested_model).await
+}
+
+pub(crate) async fn validate_realtime_config(
+    state: &ProxyState,
+    auth: &AuthenticatedKey,
+    client: &ClientContext,
+    frame: &super::realtime_frame::Frame<'_>,
+    origin: Option<&OriginBinding>,
+    requested_model: &str,
+) -> Result<(), ProxyError> {
+    use super::realtime_frame::Kind;
+    let field = match frame.kind() {
+        Kind::SessionUpdate => "session",
+        Kind::ResponseCreate => "response",
         _ => return Ok(()),
     };
-    let Some(config) = event
-        .get(field)
-        .and_then(|value| serde_json::from_str::<Value>(value.get()).ok())
-    else {
+    let Some(config) = frame.json().and_then(|event| event.get(field)) else {
         return Ok(());
     };
     let voices = ["/audio/output/voice", "/voice"]

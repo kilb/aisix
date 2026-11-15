@@ -89,6 +89,7 @@ const REALTIME_MAX_MESSAGE_BYTES: usize = 64 << 20;
 const REALTIME_MAX_FRAME_BYTES: usize = 16 << 20;
 use crate::client_ip::ClientContext;
 use crate::error::ProxyError;
+use crate::native_api::realtime_frame::{Frame, Kind};
 use crate::state::ProxyState;
 use aisix_gateway::upstream_io::{Protocol, UpstreamIoObserver};
 use aisix_gateway::BridgeError;
@@ -1397,17 +1398,17 @@ struct SessionUsage {
 impl SessionUsage {
     #[cfg(test)]
     fn absorb(&mut self, text: &str) {
-        self.absorb_model(text, false);
+        self.absorb_frame(&Frame::new(text.as_bytes()), false);
     }
 
-    fn absorb_model(&mut self, text: &str, secondary: bool) {
-        // Fast path: only parse frames that can carry usage.
-        if !text.contains("\"response.done\"")
-            && !text.contains("\"conversation.item.input_audio_transcription.completed\"")
-        {
+    fn absorb_frame(&mut self, frame: &Frame<'_>, secondary: bool) {
+        if !matches!(
+            frame.kind(),
+            Kind::ResponseDone | Kind::TranscriptionCompleted
+        ) {
             return;
         }
-        let Ok(v) = serde_json::from_str::<Value>(text) else {
+        let Some(v) = frame.json() else {
             return;
         };
         let fact = match v.get("type").and_then(Value::as_str) {
@@ -1521,11 +1522,14 @@ impl SessionIo {
         }
     }
 
+    #[cfg(test)]
     fn track_request(&mut self, bytes: &[u8]) {
-        if let Ok(event) = serde_json::from_slice::<SessionIoEvent>(bytes) {
-            if event.kind.as_deref() == Some("response.create") {
-                self.pending_creates = self.pending_creates.saturating_add(1);
-            }
+        self.track_kind(Frame::new(bytes).kind());
+    }
+
+    fn track_kind(&mut self, kind: Kind) {
+        if kind == Kind::ResponseCreate {
+            self.pending_creates = self.pending_creates.saturating_add(1);
         }
     }
 
@@ -1633,18 +1637,11 @@ struct SessionMeter<'a> {
 
 impl SessionMeter<'_> {
     /// 新推理输入先检查当前 token 窗口；取消、关闭和配置撤除不被用量门槛阻断。
-    async fn check_tokens(&self, bytes: &[u8]) -> Result<(), ProxyError> {
-        let work = serde_json::from_slice::<Value>(bytes).is_ok_and(|event| {
-            matches!(
-                event["type"].as_str(),
-                Some(
-                    "input_audio_buffer.append"
-                        | "input_audio_buffer.commit"
-                        | "response.create"
-                        | "conversation.item.create"
-                )
-            )
-        });
+    async fn check_tokens(&self, frame: &Frame<'_>) -> Result<(), ProxyError> {
+        let work = matches!(
+            frame.kind(),
+            Kind::AudioAppend | Kind::AudioCommit | Kind::ResponseCreate | Kind::ItemCreate
+        );
         if !work {
             return Ok(());
         }
@@ -2179,18 +2176,6 @@ async fn run_session(
             last_activity = Instant::now();
         }
 
-        if let Dir::FromUpstream(Some(Ok(TgMessage::Text(text)))) = &event {
-            if configuration_pending
-                && serde_json::from_str::<Value>(text)
-                    .ok()
-                    .is_some_and(|event| {
-                        event.get("type").and_then(Value::as_str) == Some(configuration_ack)
-                    })
-            {
-                configuration_pending = false;
-            }
-        }
-
         let renewal_failure = match &mut event {
             Dir::Heartbeat(error) => error.take(),
             _ => None,
@@ -2212,12 +2197,14 @@ async fn run_session(
                 break;
             }
         }
-        if let Some(bytes) = voice_bytes {
-            if let Err(error) = crate::native_api::voices::validate_realtime_frame(
+        let mut inspected_frame = voice_bytes.map(Frame::new);
+        let client_kind = inspected_frame.as_ref().map_or(Kind::Other, Frame::kind);
+        if let Some(frame) = inspected_frame.as_ref() {
+            if let Err(error) = crate::native_api::voices::validate_realtime_config(
                 &state,
                 &auth,
                 &client,
-                bytes,
+                frame,
                 voice_origin.as_ref(),
                 &requested_model,
             )
@@ -2254,19 +2241,20 @@ async fn run_session(
             }
         }
 
-        let prepared_frame = match &event {
-            Dir::FromClient(Some(Ok(AxMessage::Text(text)))) => Some(text.as_bytes()),
-            Dir::FromClient(Some(Ok(AxMessage::Binary(bytes)))) => Some(bytes.as_slice()),
-            _ => None,
-        };
-        if let Some(bytes) = prepared_frame {
-            let result = match meter.check_tokens(bytes).await {
+        let prepared = if let Some(frame) = inspected_frame.as_mut() {
+            Some(match meter.check_tokens(frame).await {
                 Err(error) => Err(error),
                 Ok(()) => match journal.as_mut() {
-                    Some(journal) => journal.prepare_frame(bytes).await,
+                    Some(journal) => journal.prepare_frame(frame).await,
                     None => Ok(None),
                 },
-            };
+            })
+        } else {
+            None
+        };
+        // 改写原 Text/Binary 前结束借用；策略已共用同一个懒解析缓存。
+        drop(inspected_frame);
+        if let Some(result) = prepared {
             if let (Some(journal), Some(renewal)) = (journal.as_ref(), renewal.as_mut()) {
                 renewal.confirmed_expiry(journal.lease_expires_at());
             }
@@ -2344,7 +2332,7 @@ async fn run_session(
                         break;
                     }
                     let text = restamp_session_model_in(text, &requested_model, &upstream_model);
-                    io.track_request(text.as_bytes());
+                    io.track_kind(client_kind);
                     if up_tx.send(TgMessage::Text(text)).await.is_err() {
                         io.request_failed = true;
                         break;
@@ -2374,7 +2362,7 @@ async fn run_session(
                         session_error = Some(error);
                         break;
                     }
-                    io.track_request(&b);
+                    io.track_kind(client_kind);
                     if up_tx.send(TgMessage::Binary(b)).await.is_err() {
                         io.request_failed = true;
                         break;
@@ -2438,7 +2426,20 @@ async fn run_session(
             Dir::FromUpstream(m) => match m {
                 Some(Ok(TgMessage::Text(text))) => {
                     io.response(text.as_bytes());
-                    if let Err(error) = observe_usage(&mut journal, &mut usage, &text).await {
+                    let frame = Frame::new(text.as_bytes());
+                    if configuration_pending
+                        && frame.kind()
+                            == if configuration_ack == "transcription_session.updated" {
+                                Kind::TranscriptionUpdated
+                            } else {
+                                Kind::SessionUpdated
+                            }
+                    {
+                        configuration_pending = false;
+                    }
+                    let observed = observe_usage(&mut journal, &mut usage, &frame).await;
+                    drop(frame);
+                    if let Err(error) = observed {
                         close_status = error.status().as_u16();
                         session_error = Some(error);
                         break;
@@ -2891,26 +2892,26 @@ const UPSTREAM_CLOSE_ACK: Duration = Duration::from_secs(2);
 fn collect_usage(
     journal: &mut Option<crate::native_api::realtime_journal::Journal>,
     usage: &mut SessionUsage,
-    text: &str,
+    frame: &Frame<'_>,
 ) -> Result<(), ProxyError> {
     let secondary = journal
         .as_ref()
-        .is_some_and(|journal| journal.is_secondary_fact(text));
+        .is_some_and(|journal| journal.is_secondary_fact(frame));
     let collected = match journal.as_mut() {
-        Some(journal) => journal.collect(text),
+        Some(journal) => journal.collect(frame),
         None => Ok(true),
     };
     // 会话观察自带事实去重；持久追加尚未确认时也不丢真实数量或改走另一计费出口。
-    usage.absorb_model(text, secondary);
+    usage.absorb_frame(frame, secondary);
     collected.map(|_| ())
 }
 
 async fn observe_usage(
     journal: &mut Option<crate::native_api::realtime_journal::Journal>,
     usage: &mut SessionUsage,
-    text: &str,
+    frame: &Frame<'_>,
 ) -> Result<(), ProxyError> {
-    collect_usage(journal, usage, text)?;
+    collect_usage(journal, usage, frame)?;
     if let Some(journal) = journal.as_mut() {
         journal.flush().await?;
     }
@@ -2956,7 +2957,8 @@ where
             TgMessage::Text(text) => {
                 bytes = bytes.saturating_add(text.len());
                 io.drained(&message);
-                if let Err(error) = collect_usage(journal, usage, text) {
+                let frame = Frame::new(text.as_bytes());
+                if let Err(error) = collect_usage(journal, usage, &frame) {
                     failure.get_or_insert(error);
                 }
                 if let Some((state, model, opening)) = opening.as_mut() {

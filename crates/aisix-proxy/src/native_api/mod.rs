@@ -10,6 +10,7 @@ pub(crate) mod openai_uploads;
 pub(crate) mod openai_vector_stores;
 pub(crate) mod origin;
 pub(crate) mod realtime_credentials;
+pub(crate) mod realtime_frame;
 pub(crate) mod realtime_journal;
 pub mod registry;
 pub(crate) mod response_refs;

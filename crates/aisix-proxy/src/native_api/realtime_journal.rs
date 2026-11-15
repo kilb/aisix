@@ -20,6 +20,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use super::realtime_frame::{Frame, Kind};
 use super::registry::{proxy_error, LiveUsageAuthority, NativeObjectRegistry, NativeRegistryError};
 use crate::auth::AuthenticatedKey;
 use crate::client_ip::ClientContext;
@@ -327,11 +328,12 @@ impl Journal {
             .and_then(|entry| self.entries.get(entry))
     }
 
-    pub(crate) fn is_secondary_fact(&self, text: &str) -> bool {
-        serde_json::from_str::<Value>(text).is_ok_and(|event| {
-            event["type"].as_str() == Some("conversation.item.input_audio_transcription.completed")
-                && (!self.transcription || self.asr_entry(&event).is_some())
-        })
+    pub(crate) fn is_secondary_fact(&self, frame: &Frame<'_>) -> bool {
+        frame.kind() == Kind::TranscriptionCompleted
+            && (!self.transcription
+                || frame
+                    .json()
+                    .is_some_and(|event| self.asr_entry(event).is_some()))
     }
 
     pub(crate) fn configuration_ack(&self) -> Option<&'static str> {
@@ -343,21 +345,18 @@ impl Journal {
     /// ASR 是独立收费模型；转发配置前先固定当前授权身份，不能借主模型的准入。
     pub(crate) async fn prepare_frame(
         &mut self,
-        bytes: &[u8],
+        frame: &mut Frame<'_>,
     ) -> Result<Option<Vec<u8>>, ProxyError> {
-        let Ok(mut event) = serde_json::from_slice::<Value>(bytes) else {
-            return Ok(None);
-        };
-        let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
-        let audio_input = matches!(
-            kind,
-            "input_audio_buffer.append" | "input_audio_buffer.commit"
-        ) || (kind == "conversation.item.create"
-            && event["item"]["content"].as_array().is_some_and(|parts| {
-                parts
-                    .iter()
-                    .any(|part| part["type"].as_str() == Some("input_audio"))
-            }));
+        let kind = frame.kind();
+        let audio_input = matches!(kind, Kind::AudioAppend | Kind::AudioCommit)
+            || (kind == Kind::ItemCreate
+                && frame.json().is_some_and(|event| {
+                    event["item"]["content"].as_array().is_some_and(|parts| {
+                        parts
+                            .iter()
+                            .any(|part| part["type"].as_str() == Some("input_audio"))
+                    })
+                }));
         if audio_input {
             if let Some(entry) = self.active_asr.as_ref().and_then(|id| self.entries.get(id)) {
                 let snapshot = self.state.snapshot.load();
@@ -399,26 +398,31 @@ impl Journal {
                 .await?;
             }
         }
-        if kind == "input_audio_buffer.commit" {
+        if kind == Kind::AudioCommit {
             if self.committed.len() >= 128 {
                 return Err(ProxyError::AccountUnavailable);
             }
             self.committed.push_back(self.active_asr.clone());
             return Ok(None);
         }
-        if kind == "conversation.item.create" {
-            self.bind_item(&event["item"])?;
+        if kind == Kind::ItemCreate {
+            if let Some(event) = frame.json() {
+                self.bind_item(&event["item"])?;
+            }
             return Ok(None);
         }
-        if !matches!(kind, "session.update" | "transcription_session.update") {
+        if !matches!(kind, Kind::SessionUpdate | Kind::TranscriptionUpdate) {
             return Ok(None);
         }
-        let pointer = transcription_pointer(&event);
+        let Some(event) = frame.json_mut() else {
+            return Ok(None);
+        };
+        let pointer = transcription_pointer(event);
         let Some(pointer) = pointer else {
             return Ok(None);
         };
         let transcription = event.pointer(pointer).cloned().unwrap_or(Value::Null);
-        self.configuration_ack = if kind == "transcription_session.update" {
+        self.configuration_ack = if kind == Kind::TranscriptionUpdate {
             "transcription_session.updated"
         } else {
             "session.updated"
@@ -536,7 +540,7 @@ impl Journal {
         if let Some(slot) = event.pointer_mut(&format!("{pointer}/model")) {
             *slot = Value::String(upstream_model);
         }
-        serde_json::to_vec(&event)
+        serde_json::to_vec(&*event)
             .map(Some)
             .map_err(|_| ProxyError::AccountUnavailable)
     }
@@ -676,17 +680,28 @@ impl Journal {
     }
 
     /// 相同供应商事实换 event_id 重投只观察一次；不以传输投递 ID 定义收费事实。
-    pub(crate) fn collect(&mut self, text: &str) -> Result<bool, ProxyError> {
-        let Ok(event) = serde_json::from_str::<Value>(text) else {
+    pub(crate) fn collect(&mut self, frame: &Frame<'_>) -> Result<bool, ProxyError> {
+        if !matches!(
+            frame.kind(),
+            Kind::SessionUpdated
+                | Kind::TranscriptionUpdated
+                | Kind::AudioCommitted
+                | Kind::ItemCreated
+                | Kind::TranscriptionCompleted
+                | Kind::ResponseDone
+        ) {
+            return Ok(true);
+        }
+        let Some(event) = frame.json() else {
             return Ok(true);
         };
-        self.observe_configuration(&event)?;
-        self.observe_asr_meter(&event)?;
+        self.observe_configuration(event)?;
+        self.observe_asr_meter(event)?;
         if event["type"].as_str() == Some("conversation.item.input_audio_transcription.completed") {
             let identity = event["item_id"]
                 .as_str()
                 .zip(event["content_index"].as_u64());
-            let entry = self.asr_entry(&event);
+            let entry = self.asr_entry(event);
             let Some(entry) = entry else {
                 return self.unknown_usage(&event["usage"]);
             };

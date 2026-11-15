@@ -97,32 +97,35 @@ mod frame_allocation {
         };
         // admission/文件事务/输入构造均在计数前完成；只量真正的三段生产策略调用。
         let scope = calibrated_scope();
-        crate::native_api::voices::validate_realtime_frame(
+        let mut frame = Frame::new(payload.as_bytes());
+        crate::native_api::voices::validate_realtime_config(
             &state,
             &prepared.auth,
             &client,
-            payload.as_bytes(),
+            &frame,
             prepared.voice_origin.as_ref(),
             &prepared.requested_model,
         )
         .await
         .expect("plain PCM has no private voice reference");
         meter
-            .check_tokens(payload.as_bytes())
+            .check_tokens(&frame)
             .await
             .expect("actual request/model quota check");
         let rewritten = prepared
             .journal
             .as_mut()
             .expect("actual admitted journal")
-            .prepare_frame(payload.as_bytes())
+            .prepare_frame(&mut frame)
             .await
             .expect("actual journal frame preparation");
         let allocated = scope.finish();
         assert!(rewritten.is_none(), "PCM content must remain verbatim");
         eprintln!(
-            "actual_client_policy_allocations calls={} bytes={}",
-            allocated.calls, allocated.bytes
+            "actual_client_policy_allocations calls={} bytes={} full_value_decodes={}",
+            allocated.calls,
+            allocated.bytes,
+            frame.decode_count()
         );
         assert!(
             allocated.bytes < payload.len() / 4,
@@ -140,19 +143,36 @@ mod frame_allocation {
         );
         let mut usage = SessionUsage::default();
         let scope = calibrated_scope();
-        observe_usage(&mut prepared.journal, &mut usage, &payload)
+        let frame = Frame::new(payload.as_bytes());
+        observe_usage(&mut prepared.journal, &mut usage, &frame)
             .await
             .expect("actual supplier observation path");
         let allocated = scope.finish();
         assert_eq!(usage.responses, 0, "audio delta is not a paid usage fact");
         eprintln!(
-            "actual_supplier_policy_allocations calls={} bytes={}",
-            allocated.calls, allocated.bytes
+            "actual_supplier_policy_allocations calls={} bytes={} full_value_decodes={}",
+            allocated.calls,
+            allocated.bytes,
+            frame.decode_count()
         );
         assert!(
             allocated.bytes < payload.len() / 4,
             "the actual supplier policy chain copied the audio payload: {} bytes",
             allocated.bytes
         );
+    }
+    #[tokio::test]
+    async fn legacy_voice_byte_wrapper_keeps_plain_audio_opaque() {
+        let (_directory, state, prepared, client) = admitted().await;
+        crate::native_api::voices::validate_realtime_frame(
+            &state,
+            &prepared.auth,
+            &client,
+            br#"{"type":"input_audio_buffer.append","audio":"AAAAAA=="}"#,
+            prepared.voice_origin.as_ref(),
+            &prepared.requested_model,
+        )
+        .await
+        .expect("legacy byte-wrapper compatibility");
     }
 }
