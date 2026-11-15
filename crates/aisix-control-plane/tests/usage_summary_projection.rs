@@ -90,6 +90,14 @@ fn event(
     row["usage_estimated"] = json!(estimated);
     if let Some(flag) = final_flag {
         row["is_final_attempt"] = flag;
+    } else {
+        row.as_object_mut()
+            .expect("合法遥测对象")
+            .remove("is_final_attempt");
+        assert!(
+            row.get("is_final_attempt").is_none(),
+            "missing 场景必须真的缺字段"
+        );
     }
     row
 }
