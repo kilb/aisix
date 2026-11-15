@@ -1138,9 +1138,41 @@ pub(crate) async fn scan_output_blob(
     // non-empty chain's set is the request's.
     applied: &mut Vec<aisix_core::AppliedGuardrail>,
 ) -> Result<(), ProxyError> {
+    scan_output_blob_for_entry(
+        state,
+        auth,
+        target,
+        blob,
+        monitor_hits,
+        enforced_hits,
+        scores,
+        bypass,
+        applied,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn scan_output_blob_for_entry(
+    state: &ProxyState,
+    auth: &AuthenticatedKey,
+    target: &JobTarget,
+    blob: &[u8],
+    monitor_hits: &mut Vec<aisix_core::GuardrailMonitorHit>,
+    enforced_hits: &mut Vec<aisix_core::GuardrailEnforcedHit>,
+    scores: &mut Vec<aisix_core::GuardrailScore>,
+    bypass: &mut String,
+    applied: &mut Vec<aisix_core::AppliedGuardrail>,
+    requested: Option<&ResourceEntry<Model>>,
+) -> Result<(), ProxyError> {
+    let (scope_id, model_name) = requested.map_or(
+        (target.model_entry.id.as_str(), target.display_name()),
+        |entry| (entry.id.as_str(), entry.value.display_name.as_str()),
+    );
     let ctx = aisix_guardrails::RequestContext {
         passthrough_route_id: "",
-        model_id: &target.model_entry.id,
+        model_id: scope_id,
         mcp_server_id: "",
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref(),
@@ -1157,7 +1189,7 @@ pub(crate) async fn scan_output_blob(
         logprobs: None,
         more_choices: Vec::new(),
         id: String::new(),
-        model: target.display_name().to_string(),
+        model: model_name.to_string(),
         message: aisix_gateway::ChatMessage::assistant(String::from_utf8_lossy(blob).into_owned()),
         finish_reason: aisix_gateway::FinishReason::Stop,
         usage: aisix_gateway::UsageStats::default(),
@@ -3963,14 +3995,17 @@ async fn managed_result_line(
                 entry.requested_model_id,
                 NativeObjectKind::File,
             )?;
-            audit
-                .output(
-                    state,
-                    auth,
-                    &target,
-                    &serde_json::to_vec(body).map_err(|_| openai::invalid_identity())?,
-                )
-                .await?;
+            let requested = (entry.requested_model_id != entry.model_id)
+                .then(|| openai::model_entry_by_id(state, &snapshot, entry.requested_model_id))
+                .transpose()?;
+            let body = serde_json::to_vec(body).map_err(|_| openai::invalid_identity())?;
+            if let Some(requested) = requested.as_ref().filter(|entry| entry.value.is_routing()) {
+                audit
+                    .output_for_entry(state, auth, &target, &body, requested)
+                    .await?;
+            } else {
+                audit.output(state, auth, &target, &body).await?;
+            }
         } else {
             let raw =
                 Bytes::from(serde_json::to_vec(body).map_err(|_| openai::invalid_identity())?);

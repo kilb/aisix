@@ -1347,6 +1347,30 @@ impl Audit {
         )
         .await
     }
+
+    pub(crate) async fn output_for_entry(
+        &mut self,
+        state: &ProxyState,
+        auth: &AuthenticatedKey,
+        target: &JobTarget,
+        blob: &[u8],
+        requested: &aisix_core::ResourceEntry<aisix_core::Model>,
+    ) -> Result<(), ProxyError> {
+        self.resolved(target);
+        crate::jobs::scan_output_blob_for_entry(
+            state,
+            auth,
+            target,
+            blob,
+            &mut self.monitor,
+            &mut self.enforced,
+            &mut self.scores,
+            &mut self.bypass,
+            &mut self.applied,
+            Some(requested),
+        )
+        .await
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
