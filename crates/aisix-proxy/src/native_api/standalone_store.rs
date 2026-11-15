@@ -69,6 +69,50 @@ struct Stored {
     submission: BeginRequest,
 }
 
+type StoredOperation = (Owner, BeginRelatedRequest, String, Option<String>);
+
+// 新产物的调用者和遥测沿用已受理执行，不能随 owner 改成所属集合的创建者。
+struct DerivedCapture {
+    caller: String,
+    telemetry: String,
+}
+impl DerivedCapture {
+    fn for_entry(
+        &self,
+        templates: &BTreeMap<String, serde_json::Value>,
+        entry_id: &str,
+    ) -> Result<Self> {
+        let template = templates.get(entry_id).ok_or(Error::Unavailable)?;
+        Ok(Self {
+            caller: self.caller.clone(),
+            telemetry: json(&BTreeMap::from([("", template)]))?,
+        })
+    }
+}
+struct ObservedSource {
+    related: BeginRelatedRequest,
+    capture: Option<DerivedCapture>,
+    templates: Option<BTreeMap<String, serde_json::Value>>,
+}
+#[derive(Clone, Copy)]
+struct GraphReferences<'a> {
+    parent_id: Option<Uuid>,
+    references: &'a [AcceptedReference],
+}
+
+#[derive(Default)]
+struct ChildOwners {
+    records: BTreeMap<Uuid, Stored>,
+    observed: BTreeMap<(&'static str, String), Owner>,
+}
+struct DerivedGraph<'a> {
+    root: &'a Stored,
+    references: GraphReferences<'a>,
+    objects: &'a [NativeChildObject],
+    relations: &'a [BoundRelation],
+    observed: &'a [Stored],
+}
+
 #[derive(Clone)]
 pub struct StandaloneNativeStore {
     pub(super) pool: SqlitePool,
@@ -372,6 +416,31 @@ impl StandaloneNativeStore {
             decode(row.try_get("related").map_err(unavailable)?)?,
             row.try_get("state").map_err(unavailable)?,
             row.try_get("root_id").map_err(unavailable)?,
+        ))
+    }
+
+    // 在生产者原有 operation 查询中同时取 immutable caller/telemetry，不按 child 另查。
+    async fn operation_with_capture(
+        conn: &mut SqliteConnection,
+        id: Uuid,
+        capture: bool,
+    ) -> Result<(StoredOperation, Option<DerivedCapture>)> {
+        if !capture {
+            return Ok((Self::operation(conn, id).await?, None));
+        }
+        let row = sqlx::query("SELECT owner,related,state,root_id,caller,telemetry FROM native_operations WHERE operation_id=?")
+            .bind(id.to_string()).fetch_optional(&mut *conn).await.map_err(unavailable)?.ok_or(Error::NotFound)?;
+        Ok((
+            (
+                decode(row.try_get("owner").map_err(unavailable)?)?,
+                decode(row.try_get("related").map_err(unavailable)?)?,
+                row.try_get("state").map_err(unavailable)?,
+                row.try_get("root_id").map_err(unavailable)?,
+            ),
+            Some(DerivedCapture {
+                caller: row.try_get("caller").map_err(unavailable)?,
+                telemetry: row.try_get("telemetry").map_err(unavailable)?,
+            }),
         ))
     }
 
@@ -707,6 +776,7 @@ impl StandaloneNativeStore {
         owner: Owner,
         raw_id: &str,
         derived: bool,
+        capture: Option<&DerivedCapture>,
     ) -> Result<Stored> {
         if !valid_id(raw_id) {
             return Err(Error::InvalidRequest);
@@ -737,14 +807,28 @@ impl StandaloneNativeStore {
                 references: vec![],
                 owner_parent_record_id: None,
             };
-            let caller: String = if let Some(parent) = submitted.parent_id {
-                sqlx::query_scalar("SELECT p.caller FROM native_objects o JOIN native_operations p USING(operation_id) WHERE o.record_id=?")
-                    .bind(parent.to_string()).fetch_one(&mut *conn).await.map_err(unavailable)?
+            let fallback;
+            let capture = if let Some(capture) = capture {
+                capture
             } else {
-                json(&owner)?
+                let caller: String = if let Some(parent) = submitted.parent_id {
+                    sqlx::query_scalar("SELECT p.caller FROM native_objects o JOIN native_operations p USING(operation_id) WHERE o.record_id=?")
+                        .bind(parent.to_string()).fetch_one(&mut *conn).await.map_err(unavailable)?
+                } else {
+                    json(&owner)?
+                };
+                fallback = DerivedCapture {
+                    caller,
+                    telemetry: json(&self.accepted_telemetry(
+                        &self.snapshot.load(),
+                        &submitted,
+                        &owner,
+                    )?)?,
+                };
+                &fallback
             };
             sqlx::query("INSERT INTO native_operations(operation_id,owner,caller,submission,state,related,worker_id,telemetry) VALUES(?,?,?,?,'bound',?,?,?)")
-                .bind(submitted.operation_id.to_string()).bind(json(&owner)?).bind(caller).bind(json(&submitted)?).bind(json(&related)?).bind(self.worker_id.to_string()).bind(json(&self.accepted_telemetry(&self.snapshot.load(), &submitted, &owner)?)?).execute(&mut *conn).await.map_err(unavailable)?;
+                .bind(submitted.operation_id.to_string()).bind(json(&owner)?).bind(&capture.caller).bind(json(&submitted)?).bind(json(&related)?).bind(self.worker_id.to_string()).bind(&capture.telemetry).execute(&mut *conn).await.map_err(unavailable)?;
         }
         let record = NativeRecord {
             upstream_input_text: submitted.upstream_input_text,
@@ -875,11 +959,16 @@ impl StandaloneNativeStore {
         if body.binding.objects.len() > MAX_ITEMS || body.relations.len() > MAX_ITEMS {
             return Err(Error::InvalidRequest);
         }
-        let (owner, related, operation_state, root_id) =
-            Self::operation(conn, body.binding.operation_id).await?;
+        let ((owner, related, operation_state, root_id), capture) = Self::operation_with_capture(
+            conn,
+            body.binding.operation_id,
+            !body.binding.objects.is_empty(),
+        )
+        .await?;
         if !matches!(operation_state.as_str(), "accepted" | "bound" | "uncertain") {
             return Err(Error::Conflict);
         }
+        let mut owners = ChildOwners::default();
         let parent_rows = sqlx::query("SELECT parent_id,version FROM native_operation_parents WHERE operation_id=? AND active=1")
             .bind(body.binding.operation_id.to_string()).fetch_all(&mut *conn).await.map_err(unavailable)?;
         for row in parent_rows {
@@ -893,6 +982,14 @@ impl StandaloneNativeStore {
                 || parent.record.version != row.try_get::<i64, _>("version").map_err(unavailable)?
             {
                 return Err(Error::Conflict);
+            }
+            if capture.is_some()
+                && matches!(
+                    parent.submission.kind,
+                    NativeObjectKind::Conversation | NativeObjectKind::ResponseContainer
+                )
+            {
+                owners.records.insert(parent.record.record_id, parent);
             }
         }
         if related.submission.api_key_id != body.binding.api_key_id {
@@ -951,14 +1048,19 @@ impl StandaloneNativeStore {
                     owner.clone(),
                     &body.binding.raw_id,
                     false,
+                    None,
                 )
                 .await?;
             stored.record.lifecycle_context = related.lifecycle_context.clone();
             Self::save_record(conn, &stored).await?;
             stored
         };
+        let references = GraphReferences {
+            parent_id: related.submission.parent_id,
+            references: &related.references,
+        };
         let mut observed = Vec::new();
-        for child in body.binding.objects {
+        for child in &body.binding.objects {
             let legacy_output = related.submission.kind == NativeObjectKind::Response
                 && matches!(
                     child.kind,
@@ -978,8 +1080,30 @@ impl StandaloneNativeStore {
                 ))
             .then_some(root.record.record_id);
             derived.asynchronous = false;
+            let child_owner = self
+                .child_owner(
+                    conn,
+                    &DerivedGraph {
+                        root: &root,
+                        references,
+                        objects: &body.binding.objects,
+                        relations: &body.relations,
+                        observed: &observed,
+                    },
+                    child,
+                    &mut owners,
+                )
+                .await?
+                .unwrap_or_else(|| owner.clone());
             let stored = self
-                .insert_object(conn, derived, owner.clone(), &child.raw_id, true)
+                .insert_object(
+                    conn,
+                    derived,
+                    child_owner,
+                    &child.raw_id,
+                    true,
+                    capture.as_ref(),
+                )
                 .await?;
             if legacy_output {
                 self.attach(
@@ -999,10 +1123,10 @@ impl StandaloneNativeStore {
         reply.records = observed.iter().map(|s| s.record.clone()).collect();
         for relation in body.relations {
             let parent = self
-                .selector(conn, &root, &observed, &related, relation.parent)
+                .selector(conn, &root, &observed, references, relation.parent, &owners)
                 .await?;
             let child = self
-                .selector(conn, &root, &observed, &related, relation.child)
+                .selector(conn, &root, &observed, references, relation.child, &owners)
                 .await?;
             self.validate_relation(&parent, &child, relation.relation)?;
             self.fence_free(
@@ -1048,8 +1172,9 @@ impl StandaloneNativeStore {
         conn: &mut SqliteConnection,
         root: &Stored,
         observed: &[Stored],
-        related: &BeginRelatedRequest,
+        references: GraphReferences<'_>,
         selector: ArtifactSelector,
+        owners: &ChildOwners,
     ) -> Result<Stored> {
         match selector {
             ArtifactSelector::Root => Ok(root.clone()),
@@ -1059,14 +1184,109 @@ impl StandaloneNativeStore {
                 .cloned()
                 .ok_or(Error::InvalidRequest),
             ArtifactSelector::Record { record_id } => {
-                if related.submission.parent_id != Some(record_id)
-                    && !related.references.iter().any(|r| r.record_id == record_id)
+                if references.parent_id != Some(record_id)
+                    && !references
+                        .references
+                        .iter()
+                        .any(|r| r.record_id == record_id)
                 {
                     return Err(Error::InvalidRequest);
+                }
+                if let Some(parent) = owners.records.get(&record_id) {
+                    return Ok(parent.clone());
                 }
                 Self::stored(conn, record_id).await
             }
         }
+    }
+
+    async fn child_owner(
+        &self,
+        conn: &mut SqliteConnection,
+        graph: &DerivedGraph<'_>,
+        child: &NativeChildObject,
+        owners: &mut ChildOwners,
+    ) -> Result<Option<Owner>> {
+        if !matches!(
+            child.kind,
+            NativeObjectKind::ResponseItem | NativeObjectKind::ContainerFile
+        ) {
+            return Ok(None);
+        }
+        let mut owner: Option<Owner> = None;
+        for relation in graph.relations {
+            if !matches!(&relation.child, ArtifactSelector::Observed {kind,raw_id} if *kind==child.kind && raw_id==&child.raw_id)
+            {
+                continue;
+            }
+            let parent_kind = match relation.relation {
+                NativeRelation::ConversationItem => NativeObjectKind::Conversation,
+                NativeRelation::ContainerFile => NativeObjectKind::ResponseContainer,
+                _ => continue,
+            };
+            let (kind, candidate) = match &relation.parent {
+                ArtifactSelector::Root => (graph.root.submission.kind, graph.root.owner.clone()),
+                ArtifactSelector::Record { record_id } => {
+                    let parent = self
+                        .selector(
+                            conn,
+                            graph.root,
+                            &[],
+                            graph.references,
+                            relation.parent.clone(),
+                            owners,
+                        )
+                        .await?;
+                    let candidate = (parent.submission.kind, parent.owner.clone());
+                    owners.records.entry(*record_id).or_insert(parent);
+                    candidate
+                }
+                ArtifactSelector::Observed { kind, raw_id } => {
+                    let key = (kind.as_str(), raw_id.clone());
+                    let candidate = if let Some(parent) = graph
+                        .observed
+                        .iter()
+                        .find(|p| p.submission.kind == *kind && p.record.raw_id == *raw_id)
+                    {
+                        parent.owner.clone()
+                    } else if let Some(owner) = owners.observed.get(&key) {
+                        owner.clone()
+                    } else {
+                        if !graph
+                            .objects
+                            .iter()
+                            .any(|p| p.kind == *kind && p.raw_id == *raw_id)
+                        {
+                            return Err(Error::InvalidRequest);
+                        }
+                        // 父节点可能排在child之后；只查本次显式节点的精确账号身份，避免改变输入顺序契约。
+                        let saved: Option<String> = sqlx::query_scalar("SELECT owner FROM native_objects WHERE protocol=? AND kind=? AND boundary=? AND raw_id=?")
+                            .bind(graph.root.submission.protocol.as_str()).bind(kind.as_str())
+                            .bind(&graph.root.submission.origin.boundary).bind(raw_id)
+                            .fetch_optional(&mut *conn).await.map_err(unavailable)?;
+                        let candidate = match saved {
+                            Some(saved) => decode(&saved)?,
+                            None => graph.root.owner.clone(),
+                        };
+                        owners.observed.insert(key, candidate.clone());
+                        candidate
+                    };
+                    (*kind, candidate)
+                }
+            };
+            if kind != parent_kind
+                || !relation
+                    .relation
+                    .permits(graph.root.submission.protocol, kind, child.kind)
+            {
+                return Err(Error::Conflict);
+            }
+            if owner.as_ref().is_some_and(|owner| owner != &candidate) {
+                return Err(Error::Conflict);
+            }
+            owner = Some(candidate);
+        }
+        Ok(owner)
     }
 
     fn validate_relation(
@@ -1314,7 +1534,7 @@ impl StandaloneNativeStore {
                 derived.kind = object.kind;
                 derived.parent_id = None;
                 derived.asynchronous = false;
-                self.insert_object(conn, derived, owner.clone(), &object.raw_id, true)
+                self.insert_object(conn, derived, owner.clone(), &object.raw_id, true, None)
                     .await?
             };
             if !children
@@ -1527,7 +1747,7 @@ impl StandaloneNativeStore {
             derived.parent_id = Some(stored.record.record_id);
             derived.input_file_id = None;
             derived.asynchronous = false;
-            self.insert_object(conn, derived, stored.owner.clone(), raw, true)
+            self.insert_object(conn, derived, stored.owner.clone(), raw, true, None)
                 .await?;
         }
         let caller: String =
@@ -1590,6 +1810,7 @@ impl StandaloneNativeStore {
             return Err(Error::InvalidRequest);
         }
         let source = self.lease_record(conn, &body.lease).await?;
+        let mut accepted_source: Option<ObservedSource> = None;
         let mut seen = BTreeSet::new();
         let mut reply = NativeReply::new("observed");
         for entry in body.entries {
@@ -1641,6 +1862,56 @@ impl StandaloneNativeStore {
                 submitted.entries.clear();
                 submitted.input_file_id = None;
             }
+            if accepted_source.is_none() {
+                let ((_, related, _, _), capture) = Self::operation_with_capture(
+                    conn,
+                    source.submission.operation_id,
+                    !source.submission.entries.is_empty() || !entry.objects.is_empty(),
+                )
+                .await?;
+                let templates = if source.submission.entries.is_empty() {
+                    None
+                } else {
+                    Some(decode(
+                        &capture.as_ref().ok_or(Error::Unavailable)?.telemetry,
+                    )?)
+                };
+                accepted_source = Some(ObservedSource {
+                    related,
+                    capture,
+                    templates,
+                });
+            }
+            let accepted = accepted_source.as_ref().ok_or(Error::Unavailable)?;
+            let entry_capture;
+            let (references, capture) = if let Some(templates) = &accepted.templates {
+                entry_capture = accepted
+                    .capture
+                    .as_ref()
+                    .ok_or(Error::Unavailable)?
+                    .for_entry(templates, &entry_id)?;
+                (
+                    GraphReferences {
+                        parent_id: None,
+                        references: accepted
+                            .related
+                            .entry_references
+                            .get(&entry_id)
+                            .map(Vec::as_slice)
+                            .unwrap_or(&[]),
+                    },
+                    Some(&entry_capture),
+                )
+            } else {
+                (
+                    GraphReferences {
+                        parent_id: accepted.related.submission.parent_id,
+                        references: &accepted.related.references,
+                    },
+                    accepted.capture.as_ref(),
+                )
+            };
+            let mut owners = ChildOwners::default();
             let root = if source.submission.entries.is_empty() {
                 source.clone()
             } else {
@@ -1667,6 +1938,7 @@ impl StandaloneNativeStore {
                         source.owner.clone(),
                         &entry.root.raw_id,
                         true,
+                        capture,
                     )
                     .await?
                 }
@@ -1678,7 +1950,7 @@ impl StandaloneNativeStore {
             }
             reply.records.push(root.record.clone());
             let mut children = Vec::new();
-            for object in entry.objects {
+            for object in &entry.objects {
                 let legacy_output = root.submission.kind == NativeObjectKind::Response
                     && matches!(
                         object.kind,
@@ -1698,8 +1970,23 @@ impl StandaloneNativeStore {
                     ))
                 .then_some(root.record.record_id);
                 child.asynchronous = false;
+                let child_owner = self
+                    .child_owner(
+                        conn,
+                        &DerivedGraph {
+                            root: &root,
+                            references,
+                            objects: &entry.objects,
+                            relations: &entry.relations,
+                            observed: &children,
+                        },
+                        object,
+                        &mut owners,
+                    )
+                    .await?
+                    .unwrap_or_else(|| source.owner.clone());
                 let stored = self
-                    .insert_object(conn, child, source.owner.clone(), &object.raw_id, true)
+                    .insert_object(conn, child, child_owner, &object.raw_id, true, capture)
                     .await?;
                 if legacy_output {
                     reply.memberships.push(
@@ -1716,22 +2003,12 @@ impl StandaloneNativeStore {
                 reply.records.push(stored.record.clone());
                 children.push(stored);
             }
-            let (_, mut related, _, _) =
-                Self::operation(conn, source.submission.operation_id).await?;
-            if !source.submission.entries.is_empty() {
-                related.references = related
-                    .entry_references
-                    .remove(&entry_id)
-                    .unwrap_or_default();
-                related.submission.parent_id = None;
-                related.owner_parent_record_id = None;
-            }
             for relation in entry.relations {
                 let parent = self
-                    .selector(conn, &root, &children, &related, relation.parent)
+                    .selector(conn, &root, &children, references, relation.parent, &owners)
                     .await?;
                 let child = self
-                    .selector(conn, &root, &children, &related, relation.child)
+                    .selector(conn, &root, &children, references, relation.child, &owners)
                     .await?;
                 self.validate_relation(&parent, &child, relation.relation)?;
                 self.fence_free(conn, parent.record.record_id, None).await?;
