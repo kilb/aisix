@@ -457,7 +457,11 @@ pub(crate) async fn admit_input_references(
             NativeObjectKind::ResponseContainer,
             affinity,
         )
-        .await?;
+        .await
+        .map_err(|error| match error {
+            ProxyError::ResponseNotFound => ProxyError::JobResourceNotFound("container".into()),
+            error => error,
+        })?;
         affinity.admit_object_origin(origin)?;
         if let Some(value) = body.pointer_mut(&pointer) {
             *value = Value::String(original);
