@@ -823,7 +823,16 @@ async fn begin(
     if let Some(parent) = body.parent_id {
         let parent = object(&mut *conn, state, parent).await?;
         foundation::assert_unfenced(&mut *conn, state, parent.id, Some(body.operation_id)).await?;
-        authorized_for_consumer(&mut *conn, state, &principal, &parent, consumer_family).await?;
+        let parent_consumer = if body.protocol == NativeProtocol::Openai
+            && body.kind == NativeObjectKind::Response
+            && parent.protocol == "openai"
+            && parent.kind == "conversation"
+        {
+            Some(EndpointFamily::Responses)
+        } else {
+            consumer_family
+        };
+        authorized_for_consumer(&mut *conn, state, &principal, &parent, parent_consumer).await?;
         if parent.boundary != body.origin.boundary.as_str() {
             return Err(invalid("/parent_id"));
         }
@@ -884,14 +893,21 @@ async fn bind(
     {
         return Err(invalid("/objects"));
     }
-    if let Some(parent) = submitted.parent_id {
+    let conversation = if let Some(parent) = submitted.parent_id {
         let parent = object(&mut *conn, state, parent).await?;
         foundation::assert_unfenced(&mut *conn, state, parent.id, Some(body.operation_id)).await?;
         if parent.tenant_id != op.tenant_id || parent.boundary != submitted.origin.boundary.as_str()
         {
             return Err(conflict());
         }
-    }
+        (submitted.protocol == NativeProtocol::Openai
+            && submitted.kind == NativeObjectKind::Response
+            && parent.protocol == "openai"
+            && parent.kind == "conversation")
+            .then_some(parent)
+    } else {
+        None
+    };
     sqlx::query(
         "INSERT INTO native_objects (id,environment_id,operation_id,tenant_id,api_key_id, \
          member_id,protocol,kind,model_id,provider_key_id,boundary,raw_id,parent_id,pending, \
@@ -967,6 +983,18 @@ async fn bind(
             {
                 return Err(conflict());
             }
+            let accepted_output = object.kind == NativeObjectKind::ResponseItem
+                && conversation.is_some()
+                && sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM native_object_memberships WHERE environment_id=$1 AND parent_id=$2 AND child_id=$3 AND relation='response_output' AND created_operation_id=$4)",
+                )
+                .bind(state.env.env_id)
+                .bind(row.id)
+                .bind(existing.id)
+                .bind(body.operation_id)
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(unavailable)?;
             if let Some(principal) = &refresh_principal {
                 // 管理刷新不能借原提交的 Full 权限越过当前成员、模型或父对象限制。
                 authorized(&mut *conn, state, principal, &existing).await?;
@@ -975,7 +1003,10 @@ async fn bind(
                 && !(op.member_id.is_some() && existing.member_id == op.member_id)
             {
                 // 初次接受后的绑定只用准入时的可信身份；撤权不能抹掉已发生的推理。
-                return Err(conflict());
+                let accepted_item = existing.parent_id == Some(row.id) && accepted_output;
+                if !accepted_item {
+                    return Err(conflict());
+                }
             }
             let previous =
                 submission(&operation(&mut *conn, state, existing.operation_id, false).await?)?;
@@ -988,6 +1019,19 @@ async fn bind(
                 body.operation_id,
             )
             .await?;
+            if object.kind == NativeObjectKind::ResponseItem {
+                if let Some(parent) = &conversation {
+                    bind_response_conversation_item(
+                        &mut *conn,
+                        state,
+                        parent,
+                        &existing,
+                        body.operation_id,
+                        accepted_output,
+                    )
+                    .await?;
+                }
+            }
             children.push(existing.view(&previous)?);
             continue;
         }
@@ -998,13 +1042,26 @@ async fn bind(
         derived.parent_id = Some(row.id);
         derived.asynchronous = false;
         derived.operation = object.kind.as_str().into();
+        // 会话只提供新项目的 owner；执行、可见性快照和物理来源仍属于本次 Response。
+        let item_owner = conversation
+            .as_ref()
+            .filter(|_| object.kind == NativeObjectKind::ResponseItem);
+        let (owner_tenant, owner_key, owner_member) = item_owner
+            .map_or((op.tenant_id, op.api_key_id, op.member_id), |parent| {
+                (parent.tenant_id, parent.api_key_id, parent.member_id)
+            });
         sqlx::query("INSERT INTO native_operations(environment_id,operation_id,dp_id,tenant_id,api_key_id,member_id,visibility_full,submission,state) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'bound')")
             .bind(state.env.env_id).bind(operation_id).bind(op.dp_id).bind(op.tenant_id)
             .bind(op.api_key_id).bind(op.member_id).bind(op.visibility_full).bind(serde_json::to_value(&derived).map_err(unavailable)?)
             .execute(&mut *conn).await.map_err(unavailable)?;
+        if item_owner.is_some() {
+            sqlx::query("INSERT INTO native_operation_origin_sources(environment_id,operation_id,source_record_id) VALUES($1,$2,$3)")
+                .bind(state.env.env_id).bind(operation_id).bind(row.id)
+                .execute(&mut *conn).await.map_err(unavailable)?;
+        }
         sqlx::query("INSERT INTO native_objects(id,environment_id,operation_id,tenant_id,api_key_id,member_id,protocol,kind,model_id,provider_key_id,boundary,raw_id,parent_id,pending) VALUES ($1,$2,$3,$4,$5,$6,'openai',$7,$8,$9,$10,$11,$12,false)")
-            .bind(Uuid::new_v4()).bind(state.env.env_id).bind(operation_id).bind(op.tenant_id)
-            .bind(op.api_key_id).bind(op.member_id).bind(object.kind.as_str()).bind(row.model_id).bind(row.provider_key_id)
+            .bind(Uuid::new_v4()).bind(state.env.env_id).bind(operation_id).bind(owner_tenant)
+            .bind(owner_key).bind(owner_member).bind(object.kind.as_str()).bind(row.model_id).bind(row.provider_key_id)
             .bind(&row.boundary).bind(&object.raw_id).bind(row.id)
             .execute(&mut *conn).await.map_err(unavailable)?;
         let child: ObjectRow = sqlx::query_as(
@@ -1024,12 +1081,51 @@ async fn bind(
             body.operation_id,
         )
         .await?;
+        if let Some(parent) = item_owner {
+            bind_response_conversation_item(
+                &mut *conn,
+                state,
+                parent,
+                &child,
+                body.operation_id,
+                false,
+            )
+            .await?;
+        }
         children.push(child.view(&derived)?);
     }
     let mut reply = NativeReply::new("bound");
     reply.record = Some(row.view(&submitted)?);
     reply.records = children;
     Ok(reply)
+}
+
+async fn bind_response_conversation_item(
+    conn: &mut PgConnection,
+    state: &AppState,
+    parent: &ObjectRow,
+    child: &ObjectRow,
+    operation_id: Uuid,
+    replayed_output: bool,
+) -> Result<(), ApiError> {
+    // 同一已接受操作的重放不能推进 epoch，也不能重新附加后来已移除的成员。
+    let known: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM native_object_memberships WHERE environment_id=$1 AND parent_id=$2 AND child_id=$3 AND relation='conversation_item' AND (deleted_at IS NULL OR created_operation_id=$4 OR $5))")
+        .bind(state.env.env_id).bind(parent.id).bind(child.id).bind(operation_id).bind(replayed_output)
+        .fetch_one(&mut *conn).await.map_err(unavailable)?;
+    if !known {
+        insert_membership(
+            &mut *conn,
+            state,
+            parent,
+            child,
+            NativeRelation::ConversationItem,
+            operation_id,
+        )
+        .await?;
+        sqlx::query("UPDATE native_objects SET membership_epoch=membership_epoch+1,version=version+1 WHERE id=$1")
+            .bind(parent.id).execute(&mut *conn).await.map_err(unavailable)?;
+    }
+    Ok(())
 }
 
 async fn lookup_scoped(

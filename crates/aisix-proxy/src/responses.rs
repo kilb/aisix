@@ -566,10 +566,10 @@ pub(crate) async fn responses_operation(
             }
         }
     }
-    if let Err(error) = async {
+    let conversation_record_id = match async {
         crate::native_api::origin::admit_input_references(&state, &auth, &mut body, &mut affinity)
             .await?;
-        crate::native_api::response_refs::admit_affinity(
+        crate::native_api::response_refs::admit_affinity_with_conversation(
             &state,
             &auth,
             &client,
@@ -580,18 +580,21 @@ pub(crate) async fn responses_operation(
     }
     .await
     {
-        let error = affinity.at_caller_position(error);
-        return crate::reject::reject_before_dispatch(
-            &state,
-            operation.method().as_str(),
-            operation.path(),
-            &client.request_id,
-            Some(&auth.entry.id),
-            started,
-            crate::reject::Envelope::OpenAi,
-            error,
-        );
-    }
+        Ok(conversation_record_id) => conversation_record_id,
+        Err(error) => {
+            let error = affinity.at_caller_position(error);
+            return crate::reject::reject_before_dispatch(
+                &state,
+                operation.method().as_str(),
+                operation.path(),
+                &client.request_id,
+                Some(&auth.entry.id),
+                started,
+                crate::reject::Envelope::OpenAi,
+                error,
+            );
+        }
+    };
     let request_id = client.request_id.clone();
     crate::span_facts::note_request(
         &client,
@@ -636,6 +639,7 @@ pub(crate) async fn responses_operation(
         &operation,
         &mut body,
         &affinity,
+        conversation_record_id,
         &request_id,
         started,
         &client,
@@ -990,6 +994,7 @@ async fn dispatch(
     body: &mut Value,
     // The context tags `responses` removed from `body`.
     affinity: &crate::responses_affinity::ContextAffinity,
+    conversation_record_id: Option<Uuid>,
     request_id: &str,
     // Request-scoped clock + downstream client attribution, threaded so the
     // streaming path's Drop guard can stamp latency + client IP/UA on the
@@ -1589,6 +1594,7 @@ async fn dispatch(
                             snapshot,
                             operation,
                             attempt_body,
+                            conversation_record_id,
                             mark,
                             &target.model,
                             &target.id,
@@ -2041,6 +2047,7 @@ async fn responses_to_target(
     snapshot: &aisix_core::AisixSnapshot,
     operation: &NativeResponseOperation,
     body: &Value,
+    conversation_record_id: Option<Uuid>,
     // The context tags this attempt's response carries back.
     mark: crate::responses_affinity::ResponseMark,
     model: &Arc<aisix_core::Model>,
@@ -2198,6 +2205,7 @@ async fn responses_to_target(
             &pk_entry,
             &upstream_model,
             body,
+            conversation_record_id,
             request_id,
             if asynchronous {
                 let io = aisix_gateway::upstream_io::UpstreamIoObserver::new(

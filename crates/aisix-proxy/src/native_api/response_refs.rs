@@ -13,6 +13,13 @@ use crate::client_ip::ClientContext;
 use crate::error::ProxyError;
 use crate::state::ProxyState;
 
+fn conversation_id(body: &Value) -> Option<&str> {
+    let conversation = body.get("conversation")?;
+    conversation
+        .as_str()
+        .or_else(|| conversation.get("id").and_then(Value::as_str))
+}
+
 pub(crate) fn take_references(body: &mut Value) -> Vec<(NativeObjectKind, String)> {
     let mut references = Vec::new();
     if let Some(raw) = super::openai_conversations::take_response_conversation(body) {
@@ -42,13 +49,8 @@ impl<'a> ReferenceScan<'a> {
             references: Vec::new(),
             needs_review_copy: false,
         };
-        if let Some(conversation) = body.get("conversation") {
-            if let Some(raw) = conversation
-                .as_str()
-                .or_else(|| conversation.get("id").and_then(Value::as_str))
-            {
-                scan.push(NativeObjectKind::Conversation, raw);
-            }
+        if let Some(raw) = conversation_id(body) {
+            scan.push(NativeObjectKind::Conversation, raw);
         }
         for field in ["input", "tools", "tool_choice"] {
             if let Some(value) = body.get(field) {
@@ -229,6 +231,31 @@ pub(crate) fn accepted(records: &[NativeRecord]) -> Vec<AcceptedReference> {
         .collect()
 }
 
+pub(crate) async fn admit_affinity_with_conversation(
+    state: &ProxyState,
+    auth: &AuthenticatedKey,
+    client: &ClientContext,
+    body: &Value,
+    affinity: &mut crate::responses_affinity::ContextAffinity,
+) -> Result<Option<uuid::Uuid>, ProxyError> {
+    if state.native_objects.is_none() && state.platform().is_none() {
+        return Ok(None);
+    }
+    let conversation = conversation_id(body);
+    let mut conversation_record_id = None;
+    for record in resolve(state, auth, client, body, None).await? {
+        // 只保存本次正式槽匹配的已授权记录，不从引用数量推断 conversation。
+        if record.kind == Some(NativeObjectKind::Conversation)
+            && Some(record.raw_id.as_str()) == conversation
+        {
+            conversation_record_id = Some(record.record_id);
+        }
+        affinity.admit_object_origin(record.origin.ok_or(ProxyError::AccountUnavailable)?)?;
+    }
+    Ok(conversation_record_id)
+}
+
+#[cfg(test)]
 pub(crate) async fn admit_affinity(
     state: &ProxyState,
     auth: &AuthenticatedKey,
@@ -236,13 +263,9 @@ pub(crate) async fn admit_affinity(
     body: &Value,
     affinity: &mut crate::responses_affinity::ContextAffinity,
 ) -> Result<(), ProxyError> {
-    if state.native_objects.is_none() && state.platform().is_none() {
-        return Ok(());
-    }
-    for record in resolve(state, auth, client, body, None).await? {
-        affinity.admit_object_origin(record.origin.ok_or(ProxyError::AccountUnavailable)?)?;
-    }
-    Ok(())
+    admit_affinity_with_conversation(state, auth, client, body, affinity)
+        .await
+        .map(|_| ())
 }
 
 #[cfg(test)]

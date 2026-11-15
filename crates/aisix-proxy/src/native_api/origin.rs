@@ -51,6 +51,7 @@ pub(crate) async fn begin_response(
     provider: &ResourceEntry<ProviderKey>,
     upstream_model: &str,
     body: &Value,
+    conversation_record_id: Option<Uuid>,
     request_id: &str,
     upstream_input_text: Option<aisix_core::usage_io::TextMeasurement>,
 ) -> Result<Option<OriginRegistration>, ProxyError> {
@@ -87,7 +88,7 @@ pub(crate) async fn begin_response(
             protocol: NativeProtocol::Openai,
             kind: NativeObjectKind::Response,
             origin: origin.clone(),
-            parent_id: None,
+            parent_id: conversation_record_id,
             requested_model_id,
             requested_model: requested_model.to_owned(),
             upstream_model: upstream_model.to_owned(),
