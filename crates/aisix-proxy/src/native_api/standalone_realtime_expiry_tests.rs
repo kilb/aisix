@@ -1,4 +1,4 @@
-//! 通过合法短 deadline 自然到期；已接受尾量不变成新工作或新租约。
+// 通过合法短 deadline 自然到期；已接受尾量不变成新工作或新租约。
 
 type Fence = (String, i64, i64, String, Option<i64>, String, String);
 type JournalRow = (String, Option<String>, String, Option<String>, String, i64);
