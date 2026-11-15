@@ -2161,7 +2161,13 @@ impl StandaloneNativeStore {
                 }
                 // 已接受工作保留真实产物；被删集合只省略关系，不能复活或改动它。
                 if parent.record.deleted {
-                    continue;
+                    if matches!(
+                        parent.submission.kind,
+                        NativeObjectKind::Conversation | NativeObjectKind::ResponseContainer
+                    ) {
+                        continue;
+                    }
+                    return Err(Error::Conflict);
                 }
                 self.fence_free(conn, parent.record.record_id, None).await?;
                 if !membership_keys.insert((
