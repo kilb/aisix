@@ -237,7 +237,7 @@ fn batch_body(state: &ProviderState) -> Value {
 }
 
 fn output_lines() -> String {
-    [("A", "gpt-4o-mini", 100, 10), ("B", "gpt-4.1-mini", 200, 30)]
+    [("A", "gpt-4o-mini", 100, 10), ("B", "gpt-4o-mini", 200, 30)]
         .into_iter()
         .map(|(id, model, input, output)| {
             format!("{}\n", json!({"id":format!("batch_req_metadata_{id}"),"custom_id":id,
@@ -427,12 +427,14 @@ async fn fixture() -> Option<Fixture> {
         "provider":"openai","model_name":"gpt-4o-mini","provider_key_id":account}),
     )
     .await;
+    // 同一批次文件只使用一个上游模型；两个内部 direct 资源仍保留不同身份。
+    // https://developers.openai.com/api/docs/guides/batch#1-prepare-your-batch-file
     let second = resource(
         &cp,
         &admin,
         "models",
         json!({"display_name":SECOND,
-        "provider":"openai","model_name":"gpt-4.1-mini","provider_key_id":account}),
+        "provider":"openai","model_name":"gpt-4o-mini","provider_key_id":account}),
     )
     .await;
     let alias = resource(
@@ -1124,7 +1126,7 @@ async fn actual_two_entry_batch_keeps_each_executed_input_audit_with_its_own_ter
     assert_eq!(staged[0]["body"]["model"], "gpt-4o-mini");
     assert_eq!(staged[0]["body"]["messages"][0]["content"], A_MASKED);
     assert_eq!(staged[1]["custom_id"], "B");
-    assert_eq!(staged[1]["body"]["model"], "gpt-4.1-mini");
+    assert_eq!(staged[1]["body"]["model"], "gpt-4o-mini");
     assert_eq!(staged[1]["body"]["messages"][0]["content"], B_TEXT);
     assert_eq!(f.provider.posts("/v1/batches").len(), 1);
     let accepted: Vec<_> = drain_typed(&mut usage)
@@ -1147,7 +1149,7 @@ async fn actual_two_entry_batch_keeps_each_executed_input_audit_with_its_own_ter
             if index == 0 {
                 ("A", f.alias, f.target, "gpt-4o-mini", 100, 10, 240)
             } else {
-                ("B", f.second, f.second, "gpt-4.1-mini", 200, 30, 520)
+                ("B", f.second, f.second, "gpt-4o-mini", 200, 30, 520)
             };
         assert_eq!(entry, expected_entry);
         assert_eq!(event["requested_model_id"], json!(requested));
