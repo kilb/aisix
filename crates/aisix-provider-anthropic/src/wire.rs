@@ -2969,6 +2969,9 @@ impl StreamState {
         self.completed_blocks.clear();
         match event {
             AnthropicStreamEvent::MessageStart { message } => {
+                if let Some(observer) = &self.usage_observer {
+                    observer.note_first_frame();
+                }
                 self.native_thinking_seen = false;
                 self.native_blocks.clear();
                 self.native_arguments.clear();

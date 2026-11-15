@@ -14,7 +14,8 @@
 //! for about a failed call, and an error response carries no body id.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 /// The longest value recorded per header, in characters.
 const MAX_VALUE_CHARS: usize = 256;
@@ -95,6 +96,8 @@ pub struct UpstreamResponseCapture {
     pub error_body: Option<bytes::Bytes>,
     /// 流在首个可转译内容前已报告的用量；句柄随本次 attempt 保存，不随 take 换绑。
     pub stream_usage: Option<StreamUsageObserver>,
+    /// 调用方虽请求流式，上游实际完整返回后才被转为模拟流，首流帧时刻未知。
+    pub buffered_stream: bool,
     /// 真实上游交换的长度观察；与正文导出开关无关。
     pub io: Option<crate::upstream_io::UpstreamIoObserver>,
     /// 仅实际 HTTP 发送入口置位；观察者、目标解析和操作登记均不代表发送。
@@ -107,8 +110,25 @@ impl UpstreamResponseCapture {
             && self.request_id.is_empty()
             && self.error_body.is_none()
             && self.stream_usage.is_none()
+            && !self.buffered_stream
             && self.io.is_none()
             && !self.http_dispatched
+    }
+}
+
+/// 只复制本次流的计时句柄与形态，不复制响应头、正文或用量计数。
+#[derive(Debug, Default, Clone)]
+pub struct StreamTiming {
+    pub observer: Option<StreamUsageObserver>,
+    pub buffered: bool,
+}
+
+impl UpstreamResponseCapture {
+    pub fn stream_timing(&self) -> StreamTiming {
+        StreamTiming {
+            observer: self.stream_usage.clone(),
+            buffered: self.buffered_stream,
+        }
     }
 }
 
@@ -124,7 +144,13 @@ pub struct ObservedStreamUsage {
 
 /// 绑定一次上游响应的共享观测；捕获被移入已结算 attempt 后仍写入原句柄。
 #[derive(Debug, Default, Clone)]
-pub struct StreamUsageObserver(Arc<Mutex<Option<ObservedStreamUsage>>>);
+pub struct StreamUsageObserver(Arc<StreamObservation>);
+
+#[derive(Debug, Default)]
+struct StreamObservation {
+    usage: Mutex<Option<ObservedStreamUsage>>,
+    first_frame: OnceLock<Instant>,
+}
 
 impl PartialEq for StreamUsageObserver {
     fn eq(&self, other: &Self) -> bool {
@@ -135,8 +161,17 @@ impl PartialEq for StreamUsageObserver {
 impl Eq for StreamUsageObserver {}
 
 impl StreamUsageObserver {
+    /// 在已经解析出的协议首帧处调用；重读不能覆盖首样本，也不重复读时钟。
+    pub fn note_first_frame(&self) {
+        self.0.first_frame.get_or_init(Instant::now);
+    }
+
+    pub fn first_frame_at(&self) -> Option<Instant> {
+        self.0.first_frame.get().copied()
+    }
+
     pub fn record(&self, mut observed: ObservedStreamUsage) {
-        let mut current = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.0.usage.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(previous) = current.as_ref() {
             observed.stats = previous.stats.max_fieldwise(&observed.stats);
             observed.prompt_reported |= previous.prompt_reported;
@@ -149,12 +184,20 @@ impl StreamUsageObserver {
     }
 
     pub fn get(&self) -> Option<ObservedStreamUsage> {
-        self.0.lock().unwrap_or_else(|p| p.into_inner()).clone()
+        self.0
+            .usage
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// 同一次事件发布只领取一次；非消费读取用于 handler 被取消时的归属判断。
     pub fn take(&self) -> Option<ObservedStreamUsage> {
-        self.0.lock().unwrap_or_else(|p| p.into_inner()).take()
+        self.0
+            .usage
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
     }
 }
 
@@ -265,6 +308,21 @@ pub fn stream_usage_observer() -> Option<StreamUsageObserver> {
             .clone()
     })
     .ok()
+}
+
+/// 创建流消费者时捕获当前调用；取走响应的路由层可从已保存的 capture 读取同一值。
+pub fn stream_timing() -> Option<StreamTiming> {
+    TAP.try_with(|tap| {
+        let capture = tap.lock();
+        (capture.buffered_stream || capture.stream_usage.is_some()).then(|| capture.stream_timing())
+    })
+    .ok()
+    .flatten()
+}
+
+/// 模拟流的上游没有真实流帧，不能用完整响应耗时冒充上游首帧。
+pub fn note_buffered_stream() {
+    let _ = TAP.try_with(|tap| tap.lock().buffered_stream = true);
 }
 
 pub(crate) fn note_upstream_io(observer: &crate::upstream_io::UpstreamIoObserver) {

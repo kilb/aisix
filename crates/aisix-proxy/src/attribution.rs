@@ -2085,7 +2085,61 @@ pub(crate) fn note_upstream_wait_end(success: bool) {
 /// The winning attempt's first streamed frame arrived. Every stream that
 /// stamps `upstream_ttft_ms` calls this at the same point.
 pub(crate) fn note_upstream_first_frame() {
-    let _ = CURRENT.try_with(|a| a.lock().upstream_clock.first_frame(Instant::now()));
+    note_upstream_first_frame_at(Instant::now());
+}
+
+fn note_upstream_first_frame_at(at: Instant) {
+    let _ = CURRENT.try_with(|a| a.lock().upstream_clock.first_frame(at));
+}
+
+/// 消费者创建时固定本次响应；路由已取走 tap 时只读取该 winner 保存的句柄。
+pub(crate) fn upstream_stream_timing() -> aisix_gateway::response_tap::StreamTiming {
+    if let Some(timing) = aisix_gateway::response_tap::stream_timing() {
+        return timing;
+    }
+    CURRENT
+        .try_with(|a| {
+            let cell = a.lock();
+            let index = cell
+                .cancel
+                .in_flight
+                .as_ref()
+                .map(|attempt| attempt.index)
+                .or_else(|| cell.cancel.won.as_ref().map(|winner| winner.index));
+            index
+                .and_then(|index| cell.attempt_responses.get(&index))
+                .map(aisix_gateway::UpstreamResponseCapture::stream_timing)
+                .unwrap_or_default()
+        })
+        .unwrap_or_default()
+}
+
+/// 已解析但被桥过滤的首协议帧仍是同一次上游等待的结束，不借正文到达时刻。
+pub(crate) fn observed_stream_ttft(
+    timing: &aisix_gateway::response_tap::StreamTiming,
+    started: Instant,
+) -> Option<Duration> {
+    if timing.buffered {
+        return None;
+    }
+    let at = timing.observer.as_ref()?.first_frame_at()?;
+    note_upstream_first_frame_at(at);
+    Some(at.saturating_duration_since(started))
+}
+
+/// 原有首 canonical chunk 的兜底保持不变；模拟流则不制造上游流帧样本。
+pub(crate) fn first_stream_chunk_ttft(
+    timing: &aisix_gateway::response_tap::StreamTiming,
+    started: Instant,
+) -> Option<Duration> {
+    if timing.buffered {
+        return None;
+    }
+    observed_stream_ttft(timing, started).or_else(|| {
+        let at = Instant::now();
+        note_upstream_first_frame_at(at);
+        Some(at.saturating_duration_since(started))
+    })
 }
 
 /// The time this request has spent waiting on upstreams so far, or `None`

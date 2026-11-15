@@ -3347,8 +3347,18 @@ pub fn build_responses_bridge_stream(
 ) -> axum::body::Body {
     use futures::StreamExt;
 
+    let upstream_timing = crate::attribution::upstream_stream_timing();
     let mut encoder = encoder;
     let stream = async_stream::stream! {
+        let on_complete = |mut comp: ResponsesStreamCompletion| {
+            if comp.upstream_ttft.is_none() {
+                if let Some(ttft) = crate::attribution::observed_stream_ttft(&upstream_timing, attempt_started) {
+                    comp.upstream_ttft_ms = crate::attempt::measured_ms(ttft);
+                    comp.upstream_ttft = Some(ttft);
+                }
+            }
+            on_complete(comp);
+        };
         let mut guard = CompleteOnDrop {
             slot: Some((on_complete, ResponsesStreamCompletion::default())),
             estimator,
@@ -3399,11 +3409,10 @@ pub fn build_responses_bridge_stream(
                     // (#1225).
                     if !first_chunk_seen {
                         first_chunk_seen = true;
-                        let ttft = attempt_started.elapsed();
-                        guard.comp().upstream_ttft_ms =
-                            crate::attempt::measured_ms(ttft);
-                        guard.comp().upstream_ttft = Some(ttft);
-                        crate::attribution::note_upstream_first_frame();
+                        if let Some(ttft) = crate::attribution::first_stream_chunk_ttft(&upstream_timing, attempt_started) {
+                            guard.comp().upstream_ttft_ms = crate::attempt::measured_ms(ttft);
+                            guard.comp().upstream_ttft = Some(ttft);
+                        }
                     }
                     {
                         let comp = guard.comp();

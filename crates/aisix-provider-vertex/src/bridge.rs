@@ -909,6 +909,7 @@ impl Bridge for VertexBridge {
                 StructuredOutput::Tool(_)
             )
         {
+            aisix_gateway::response_tap::note_buffered_stream();
             // The leg is not streaming, so it runs under the budget a
             // non-streaming call would have got — the streaming budget
             // this context carries bounds a chunk gap, not a completion.

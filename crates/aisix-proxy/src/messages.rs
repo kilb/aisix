@@ -3655,6 +3655,7 @@ fn build_anthropic_sse_stream(
 ) -> axum::body::Body {
     use futures::StreamExt;
 
+    let upstream_timing = crate::attribution::upstream_stream_timing();
     let mut encoder = encoder;
     // Stamp the caller-facing figure on the first SSE bytes that actually
     // leave for the client. Wrapping the encoder output here covers both
@@ -3676,6 +3677,15 @@ fn build_anthropic_sse_stream(
     // for which chains hold.
     let hold_policy = anthropic_stream_hold_policy(output_guardrail.as_deref());
     let stream = async_stream::stream! {
+        let on_complete = |mut comp: AnthropicStreamCompletion| {
+            if comp.upstream_ttft.is_none() {
+                if let Some(ttft) = crate::attribution::observed_stream_ttft(&upstream_timing, attempt_started) {
+                    comp.upstream_ttft_ms = crate::attempt::measured_ms(ttft);
+                    comp.upstream_ttft = Some(ttft);
+                }
+            }
+            on_complete(comp);
+        };
         // Live-forward output has already reached the caller. Held output is
         // unsafe for exporters until the complete moderation pass succeeds.
         let completion = AnthropicStreamCompletion {
@@ -3735,10 +3745,10 @@ fn build_anthropic_sse_stream(
                     // (#1225).
                     if !first_chunk_seen {
                         first_chunk_seen = true;
-                        let ttft = attempt_started.elapsed();
-                        guard.comp().upstream_ttft_ms = crate::attempt::measured_ms(ttft);
-                        guard.comp().upstream_ttft = Some(ttft);
-                        crate::attribution::note_upstream_first_frame();
+                        if let Some(ttft) = crate::attribution::first_stream_chunk_ttft(&upstream_timing, attempt_started) {
+                            guard.comp().upstream_ttft_ms = crate::attempt::measured_ms(ttft);
+                            guard.comp().upstream_ttft = Some(ttft);
+                        }
                     }
                     {
                         let comp = guard.comp();

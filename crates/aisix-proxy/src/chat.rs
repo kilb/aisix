@@ -4850,145 +4850,151 @@ async fn dispatch_ensemble(
             judge_model.upstream_model().unwrap_or("unknown"),
             crate::token_estimate::PromptInput::Chat(Box::new(build_judge_req())),
         );
-        let sse_stream = build_sse_stream(
-            judge_stream,
-            created_ts,
-            stream_guardrail,
-            started,
-            judge_started,
-            // Re-stamp the client-facing ensemble model name (e.g. "council")
-            // onto every chunk — never the judge's upstream model id.
-            req.model.clone(),
-            content_cap,
-            client_requested_usage,
-            panel_usage_sum,
-            state.platform().cloned(),
-            Some(judge_estimator),
-            false,
-            move |comp: StreamCompletion| {
-                // Fresh snapshot at stream end, shared by every emit in this
-                // closure (#941) — see the single-model streaming path.
-                let snap = state_for_telem.snapshot.load();
-                let terminal_status = stream_terminal_status(&comp);
-                // Telemetry: one event per panel member (attempt_kind "panel",
-                // index = its slot) carrying that member's own buffered usage
-                // or, for a member that failed, its error, then one judge
-                // event (attempt_kind "judge", index = panel size) from the
-                // streamed `StreamCompletion`. All share `request_id`. This
-                // mirrors the non-streaming ensemble's per-sub-call emission,
-                // moved into on_complete because the judge counts only land on
-                // the terminal SSE chunk.
-                // The stream owns the panel from here, whichever way it ended.
-                crate::attribution::settle_ensemble();
-                emit_ensemble_rows(
-                    &state_for_telem,
-                    &snap,
-                    &row_ctx_for_telem,
-                    &panel_rows,
-                    &failed,
-                    None,
-                    comp.guardrail_blocked,
-                    &bypass_for_telem,
-                );
-                // The judge's row is priced off the judge's own target.
-                let judge_cost_usd = crate::usage_attr::request_cost_usd(
-                    &snap,
-                    &judge_model_id,
-                    crate::usage_attr::input_tokens_from_counts(
+        let judge_timing_scope = Arc::clone(&judge_tap);
+        let sse_stream = aisix_gateway::response_tap::sync_scope(&judge_timing_scope, || {
+            build_sse_stream(
+                judge_stream,
+                created_ts,
+                stream_guardrail,
+                started,
+                judge_started,
+                // Re-stamp the client-facing ensemble model name (e.g. "council")
+                // onto every chunk — never the judge's upstream model id.
+                req.model.clone(),
+                content_cap,
+                client_requested_usage,
+                panel_usage_sum,
+                state.platform().cloned(),
+                Some(judge_estimator),
+                false,
+                move |comp: StreamCompletion| {
+                    // Fresh snapshot at stream end, shared by every emit in this
+                    // closure (#941) — see the single-model streaming path.
+                    let snap = state_for_telem.snapshot.load();
+                    let terminal_status = stream_terminal_status(&comp);
+                    // Telemetry: one event per panel member (attempt_kind "panel",
+                    // index = its slot) carrying that member's own buffered usage
+                    // or, for a member that failed, its error, then one judge
+                    // event (attempt_kind "judge", index = panel size) from the
+                    // streamed `StreamCompletion`. All share `request_id`. This
+                    // mirrors the non-streaming ensemble's per-sub-call emission,
+                    // moved into on_complete because the judge counts only land on
+                    // the terminal SSE chunk.
+                    // The stream owns the panel from here, whichever way it ended.
+                    crate::attribution::settle_ensemble();
+                    emit_ensemble_rows(
+                        &state_for_telem,
+                        &snap,
+                        &row_ctx_for_telem,
+                        &panel_rows,
+                        &failed,
+                        None,
+                        comp.guardrail_blocked,
+                        &bypass_for_telem,
+                    );
+                    // The judge's row is priced off the judge's own target.
+                    let judge_cost_usd = crate::usage_attr::request_cost_usd(
+                        &snap,
+                        &judge_model_id,
+                        crate::usage_attr::input_tokens_from_counts(
+                            comp.prompt_tokens,
+                            comp.cached_prompt_tokens,
+                            comp.cache_write_tokens,
+                            comp.cache_read_tokens,
+                            comp.cache_creation_tokens,
+                            comp.cache_creation_ttl,
+                        ),
+                        u64::from(comp.completion_tokens),
+                    );
+                    panel_charge.settle_stream(&judge_post_stream_keys, &comp);
+                    let judge_pk =
+                        crate::usage_attr::ResolvedPk::resolve(&snap, &judge_provider_key_id);
+                    let stream_error = crate::attempt::stream_error_fields(
+                        comp.refusal.as_ref(),
+                        comp.failure.as_ref(),
+                    );
+                    emit_usage_event(
+                        &state_for_telem,
+                        &snap,
+                        &judge_pk,
+                        &request_id_for_telem,
+                        &judge_model_id,
+                        &client_model_for_telem,
+                        &api_key_id_for_telem,
+                        // The judge's stream is the one the caller reads: its
+                        // abandonment or upstream failure is the request's.
+                        terminal_status,
+                        started.elapsed(),
                         comp.prompt_tokens,
-                        comp.cached_prompt_tokens,
-                        comp.cache_write_tokens,
-                        comp.cache_read_tokens,
-                        comp.cache_creation_tokens,
-                        comp.cache_creation_ttl,
-                    ),
-                    u64::from(comp.completion_tokens),
-                );
-                panel_charge.settle_stream(&judge_post_stream_keys, &comp);
-                let judge_pk =
-                    crate::usage_attr::ResolvedPk::resolve(&snap, &judge_provider_key_id);
-                let stream_error = crate::attempt::stream_error_fields(
-                    comp.refusal.as_ref(),
-                    comp.failure.as_ref(),
-                );
-                emit_usage_event(
-                    &state_for_telem,
-                    &snap,
-                    &judge_pk,
-                    &request_id_for_telem,
-                    &judge_model_id,
-                    &client_model_for_telem,
-                    &api_key_id_for_telem,
-                    // The judge's stream is the one the caller reads: its
-                    // abandonment or upstream failure is the request's.
-                    terminal_status,
-                    started.elapsed(),
-                    comp.prompt_tokens,
-                    comp.completion_tokens,
-                    UsageExtras {
-                        io_audit: judge_tap.capture().io.as_ref().map(|io| io.snapshot()),
-                        cached_prompt_tokens: comp.cached_prompt_tokens,
-                        cache_write_tokens: comp.cache_write_tokens,
-                        cache_usage_reported: comp.cache_usage_reported,
-                        modality: comp.modality,
-                        cache_creation_ttl: comp.cache_creation_ttl,
-                        reasoning_tokens: comp.reasoning_tokens,
-                        upstream_total_tokens: comp.upstream_total_tokens.unwrap_or(0),
-                        reasoning_folded_into_completion: comp.reasoning_folded_into_completion,
-                        cache_creation_tokens: comp.cache_creation_tokens,
-                        cache_read_tokens: comp.cache_read_tokens,
-                        usage_estimated: comp.usage_estimated,
-                        provider_request_id: comp.provider_request_id,
-                        provider_model_version: comp.provider_model_version,
-                        service_tier: comp.service_tier,
-                        finish_reason: comp.finish_reason,
-                        bypass_reason: if !bypass_for_telem.is_empty() {
-                            bypass_for_telem.clone()
-                        } else {
-                            comp.bypass_reason
+                        comp.completion_tokens,
+                        UsageExtras {
+                            io_audit: judge_tap.capture().io.as_ref().map(|io| io.snapshot()),
+                            cached_prompt_tokens: comp.cached_prompt_tokens,
+                            cache_write_tokens: comp.cache_write_tokens,
+                            cache_usage_reported: comp.cache_usage_reported,
+                            modality: comp.modality,
+                            cache_creation_ttl: comp.cache_creation_ttl,
+                            reasoning_tokens: comp.reasoning_tokens,
+                            upstream_total_tokens: comp.upstream_total_tokens.unwrap_or(0),
+                            reasoning_folded_into_completion: comp.reasoning_folded_into_completion,
+                            cache_creation_tokens: comp.cache_creation_tokens,
+                            cache_read_tokens: comp.cache_read_tokens,
+                            usage_estimated: comp.usage_estimated,
+                            provider_request_id: comp.provider_request_id,
+                            provider_model_version: comp.provider_model_version,
+                            service_tier: comp.service_tier,
+                            finish_reason: comp.finish_reason,
+                            bypass_reason: if !bypass_for_telem.is_empty() {
+                                bypass_for_telem.clone()
+                            } else {
+                                comp.bypass_reason
+                            },
+                            cache_status: CacheStatus::Disabled.as_str().to_string(),
+                            upstream_ttft_ms: comp.upstream_ttft_ms,
+                            // The judge's stream is what the caller sees, so its
+                            // event carries the request-scoped figure; the panel
+                            // members' sub-call events leave it 0.
+                            downstream_latency_ms: comp.downstream_latency_ms,
+                            attempt_index: judge_attempt_index,
+                            attempt_kind: "judge".to_string(),
+                            attempt_model: judge_attempt_model.clone(),
+                            error_class: stream_error.0.clone(),
+                            error_message: stream_error.1.clone(),
+                            applied_guardrails: applied_guardrails_for_telem.clone(),
+                            redacted_entity_counts: {
+                                let mut merged = input_redactions_for_telem.clone();
+                                crate::redact::merge_counts(
+                                    &mut merged,
+                                    comp.redacted_entity_counts,
+                                );
+                                merged
+                            },
+                            guardrail_monitor_hits: {
+                                let mut merged = input_monitor_hits_for_telem.clone();
+                                merged.extend(comp.monitor_hits);
+                                merged
+                            },
+                            ..UsageExtras::default()
                         },
-                        cache_status: CacheStatus::Disabled.as_str().to_string(),
-                        upstream_ttft_ms: comp.upstream_ttft_ms,
-                        // The judge's stream is what the caller sees, so its
-                        // event carries the request-scoped figure; the panel
-                        // members' sub-call events leave it 0.
-                        downstream_latency_ms: comp.downstream_latency_ms,
-                        attempt_index: judge_attempt_index,
-                        attempt_kind: "judge".to_string(),
-                        attempt_model: judge_attempt_model.clone(),
-                        error_class: stream_error.0.clone(),
-                        error_message: stream_error.1.clone(),
-                        applied_guardrails: applied_guardrails_for_telem.clone(),
-                        redacted_entity_counts: {
-                            let mut merged = input_redactions_for_telem.clone();
-                            crate::redact::merge_counts(&mut merged, comp.redacted_entity_counts);
-                            merged
-                        },
-                        guardrail_monitor_hits: {
-                            let mut merged = input_monitor_hits_for_telem.clone();
-                            merged.extend(comp.monitor_hits);
-                            merged
-                        },
-                        ..UsageExtras::default()
-                    },
-                    judge_cost_usd,
-                    comp.guardrail_blocked,
-                    &client_for_telem,
-                    /* content */ None,
-                    // The streaming ensemble emits nothing after the judge
-                    // — this IS the request's terminal emission, same as
-                    // the single-model stream guard (#1279).
-                    /* terminal */
-                    true,
-                    /* dispatched */ true,
-                    &audit_for_telem,
-                );
-                // Release the concurrency permit(s) now the stream is done
-                // (or was cancelled) — on_complete fires on both paths (#450).
-                drop(stream_concurrency_hold);
-                drop(judge_concurrency_hold);
-            },
-        );
+                        judge_cost_usd,
+                        comp.guardrail_blocked,
+                        &client_for_telem,
+                        /* content */ None,
+                        // The streaming ensemble emits nothing after the judge
+                        // — this IS the request's terminal emission, same as
+                        // the single-model stream guard (#1279).
+                        /* terminal */
+                        true,
+                        /* dispatched */ true,
+                        &audit_for_telem,
+                    );
+                    // Release the concurrency permit(s) now the stream is done
+                    // (or was cancelled) — on_complete fires on both paths (#450).
+                    drop(stream_concurrency_hold);
+                    drop(judge_concurrency_hold);
+                },
+            )
+        });
         let mut response = Sse::new(sse_stream);
         if let Some(d) = crate::sse_keepalive::interval() {
             response = response.keep_alive(KeepAlive::new().interval(d));
@@ -6988,7 +6994,18 @@ where
     // any chunk reached the wire (#419).
     let delivered = Arc::new(AtomicU32::new(0));
     let delivered_for_drop = Arc::clone(&delivered);
+    let upstream_timing = crate::attribution::upstream_stream_timing();
     let inner = async_stream::stream! {
+        let on_complete = |mut comp: StreamCompletion| {
+            // 元数据后错误或取消也要保留已经测到的首帧；没有首帧则保持未知。
+            if comp.upstream_ttft.is_none() {
+                if let Some(ttft) = crate::attribution::observed_stream_ttft(&upstream_timing, attempt_started) {
+                    comp.upstream_ttft_ms = crate::attempt::measured_ms(ttft);
+                    comp.upstream_ttft = Some(ttft);
+                }
+            }
+            on_complete(comp);
+        };
         // Hold on_complete + the running StreamCompletion accumulator
         // inside a Drop guard so on_complete fires even on client-
         // disconnect cancellation. See `CompleteOnDrop` above for the
@@ -7152,11 +7169,10 @@ where
                     // what external observers report (#1225).
                     if !first_chunk_seen {
                         first_chunk_seen = true;
-                        let ttft = attempt_started.elapsed();
-                        guard.comp().upstream_ttft_ms =
-                            crate::attempt::measured_ms(ttft);
-                        guard.comp().upstream_ttft = Some(ttft);
-                        crate::attribution::note_upstream_first_frame();
+                        if let Some(ttft) = crate::attribution::first_stream_chunk_ttft(&upstream_timing, attempt_started) {
+                            guard.comp().upstream_ttft_ms = crate::attempt::measured_ms(ttft);
+                            guard.comp().upstream_ttft = Some(ttft);
+                        }
                     }
                     if !chunk.id.is_empty() {
                         last_chunk_id.clone_from(&chunk.id);
