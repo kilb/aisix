@@ -1,0 +1,17 @@
+/* 费用与状态各自保留可读宽度；长名称和完整金额可换行。 */
+@media (min-width: 1051px) {
+  .tenant-keys .keys-list .dt :is(th, td):nth-child(1) { width: 12%; }
+  .tenant-keys .keys-list .dt :is(th, td):nth-child(2) { width: 15%; }
+  .tenant-keys .keys-list .dt :is(th, td):nth-child(3) { width: 8%; }
+  .tenant-keys .keys-list .dt :is(th, td):nth-child(4) { width: 11%; }
+  .tenant-keys .keys-list .dt :is(th, td):nth-child(5) { width: 9%; }
+  .tenant-keys .keys-list .dt :is(th, td):nth-child(6) { width: 8%; }
+  .tenant-keys .keys-list .dt :is(th, td):nth-child(7) { width: 14%; }
+  .tenant-keys .keys-list .dt :is(th, td):nth-child(8) { width: 9%; }
+  .tenant-keys .keys-list .dt :is(th, td):last-child { width: 14%; }
+}
+.keys-list .dt td[data-label="已用费用"] { overflow-wrap: anywhere; white-space: normal; }
+.keys-list .key-detail-link { display: inline-flex; min-height: 44px; align-items: center; color: var(--foreground); text-decoration: underline; text-underline-offset: 3px; }
+.keys-list .key-detail-link:hover { color: var(--primary); }
+.keys-list .key-detail-link:focus-visible { outline: 2px solid var(--ring); outline-offset: 3px; }
+.keys-list .dt td[data-label="操作"] .acts { flex-wrap: wrap; justify-content: flex-end; }

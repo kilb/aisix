@@ -289,6 +289,16 @@ export interface NewKey {
   expires_at?: string;
 }
 
+/** PATCH 只提交变化项；null 清除该密钥的覆盖值，归属成员不可更改。 */
+export interface UpdateKey {
+  label?: string;
+  model_ids?: string[] | null;
+  group_id?: string;
+  rate_limit?: KeyLimits | null;
+  disabled?: boolean;
+  expires_at?: string | null;
+}
+
 /** `Member`. */
 export interface Member {
   id: string;
@@ -336,6 +346,12 @@ export const keys = {
   /** Every key of the organisation for an owner or an admin; a member's own for a member. */
   async list(): Promise<TenantKey[]> {
     return (await call<{ items: TenantKey[] }>("GET", "/keys")).data.items;
+  },
+  async get(id: string): Promise<TenantKey> {
+    return (await call<TenantKey>("GET", `/keys/${at(id)}`)).data;
+  },
+  async update(id: string, body: UpdateKey, version: number): Promise<TenantKey> {
+    return (await call<TenantKey>("PATCH", `/keys/${at(id)}`, body, version)).data;
   },
   /** The new key, and its plaintext, which no later answer carries. */
   async create(body: NewKey): Promise<{ key: TenantKey; plaintext: string }> {

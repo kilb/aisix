@@ -29,9 +29,15 @@ import { TwoStep } from "./ui/TwoStep";
 import { BentoGrid, Card, CardHeader, PageHeader, span } from "./components/page";
 import { formatCount } from "./lib/chartFormat";
 import { cn } from "./lib/cn";
-import { fmtBeijing, parseBeijingInput } from "./lib/time";
+import { beijingInputValue, fmtBeijing, parseBeijingInput } from "./lib/time";
+import { keySettingsPatch } from "./lib/keySettings";
+import { fetchKeyCosts, keyCostNotes, keyMonthRange, type KeyCosts } from "./lib/keyUsage";
+import { fmtMicroCny } from "./lib/money";
 import { useRecordTable } from "./lib/recordTable";
 import { RecordTablePager, RecordTableToolbar } from "./ui/RecordTable";
+import { Select } from "./ui/Select";
+import { Menu } from "./ui/Menu";
+import "./Keys.css";
 
 // 桌面：5 + 7 / 12 / 12；平板与手机按卡片顺序各占整行。
 
@@ -69,6 +75,9 @@ export function Keys({
   const manager = member.role === "owner" || member.role === "admin";
   const [items, setItems] = useState<TenantKey[] | null>(null);
   const [listErr, setListErr] = useState<string | null>(null);
+  const [costs, setCosts] = useState<KeyCosts | null>(null);
+  const [costRange, setCostRange] = useState(keyMonthRange);
+  const [costErr, setCostErr] = useState<string | null>(null);
   const [catalog, setCatalog] = useState<PortalModel[] | null>(null);
   const [groups, setGroups] = useState<PortalGroup[] | null>(null);
   const [caps, setCaps] = useState<Caps | null>(null);
@@ -85,18 +94,24 @@ export function Keys({
   const [busy, setBusy] = useState<string | null>(null);
   // Which action on that key is in flight.
   const [acting, setActing] = useState<"switch" | "revoke" | "group" | null>(null);
+  const loadTicket = useRef(0);
 
   const load = useCallback(async () => {
-    try {
-      setItems(await keyApi.list());
-      setListErr(null);
-    } catch (e) {
-      setListErr(failure(e));
-    }
+    const ticket = ++loadTicket.current;
+    const range = keyMonthRange();
+    setCostRange(range);
+    setCosts(null);
+    setCostErr(null);
+    // 列表与已授权的批量费用并行；每次载入只有一个费用请求。
+    await Promise.all([
+      keyApi.list().then(items => { if (ticket === loadTicket.current) { setItems(items); setListErr(null); } }, error => { if (ticket === loadTicket.current) setListErr(failure(error)); }),
+      fetchKeyCosts(range).then(costs => { if (ticket === loadTicket.current) setCosts(costs); }, error => { if (ticket === loadTicket.current) setCostErr(failure(error)); }),
+    ]);
   }, []);
 
   useEffect(() => {
     void load();
+    return () => { loadTicket.current += 1; };
   }, [load]);
 
   // The caps hold in any state; the models, the groups and the members feed
@@ -209,10 +224,12 @@ export function Keys({
           <p className="text-caption text-muted">{manager ? "全组织密钥" : "我的密钥"} · 配置状态不代表实时调用结果，实际调用受组织授权和额度约束。</p>
         </Card>
         <Card className={cn(span.d12, "keys-list")}>
-          <CardHeader number={3} title="密钥列表" description="复制或查看明文会重新获取密钥；吊销后立即失效，无法恢复。" />
+          <CardHeader number={3} title="密钥列表" description="复制或查看明文会重新获取密钥；吊销后立即失效，无法恢复。" actions={<Button onClick={() => void load()}>刷新列表</Button>} />
+          <p className="hint">本月费用：{when(costs?.from ?? costRange.from)} 至 {when(costs?.to ?? costRange.to)}（UTC+8，不含结束时间）。只含已计价金额；待计价与处理中记录另列。</p>
+          {costErr && <div className="note crit" role="alert">费用读取失败：{costErr}<Button onClick={() => void load()}>重新读取费用</Button></div>}
           <RecordTableToolbar search={{ value: table.query, onChange: table.setQuery, label: "搜索密钥", placeholder: "名称、公开前缀、归属或分组" }}>
-            <Field label="密钥状态"><select value={stateFilter} onChange={(e) => setStateFilter(e.target.value)}><option value="">全部状态</option>{["可用", "已被平台停用", "已停用", "已过期"].map((value) => <option key={value}>{value}</option>)}</select></Field>
-            <Field label="密钥分组"><select value={groupFilter} onChange={(e) => setGroupFilter(e.target.value)}><option value="">全部分组</option>{(groups ?? []).map((group) => <option key={group.id} value={group.id}>{group.display_name}</option>)}</select></Field>
+            <Field label="密钥状态"><Select value={stateFilter} onValueChange={setStateFilter} size="compact"><option value="">全部状态</option>{["可用", "已被平台停用", "已停用", "已过期"].map((value) => <option key={value}>{value}</option>)}</Select></Field>
+            <Field label="密钥分组"><Select value={groupFilter} onValueChange={setGroupFilter} size="compact"><option value="">全部分组</option>{(groups ?? []).map((group) => <option key={group.id} value={group.id}>{group.display_name}</option>)}</Select></Field>
           </RecordTableToolbar>
           {!active && <div className="note crit">组织已被停用，所有密钥暂时无法调用；这里只能吊销密钥。</div>}
           {listErr && (
@@ -239,6 +256,7 @@ export function Keys({
                   <th>模型</th>
                   <th>分组</th>
                   <th>限制</th>
+                  <th>本月费用</th>
                   <th>状态</th>
                   <th>
                     <span className="vh">操作</span>
@@ -250,11 +268,13 @@ export function Keys({
                   const state = stateOf(k);
                   const owner = ownerOf(k);
                   const models = modelsOf(k);
+                  const cost = costs?.items.get(k.id);
+                  const detailHref = `#keys?${new URLSearchParams({ key: k.id, from: costs?.from ?? costRange.from, to: costs?.to ?? costRange.to })}`;
                   return (
                     <tr key={k.id}>
                       <td data-label="名称">
                         <span className="trunc [--trunc:144px] min-[1800px]:[--trunc:160px]" title={k.label}>
-                          {k.label}
+                          <a className="key-detail-link" href={detailHref}>{k.label}</a>
                         </span>
                       </td>
                       <td data-label="前缀">
@@ -299,6 +319,10 @@ export function Keys({
                       <td className="tabular" data-label="限制">
                         <span className="block">{limitsOf(k)}</span>
                       </td>
+                      <td className="tabular" data-label="已用费用">
+                        <span className="block">{costErr ? "读取失败" : costs === null ? "读取中…" : cost === undefined ? "未读取" : cost.chargedMicroCny === null ? "未知" : fmtMicroCny(cost.chargedMicroCny)}</span>
+                        {cost && keyCostNotes(cost).map(note => <span className="hint cell-note" key={note}>{note}</span>)}
+                      </td>
                       <td data-label="状态">
                         <Lamp state={state.lamp}>{state.text}</Lamp>
                         {state.note && (
@@ -307,6 +331,10 @@ export function Keys({
                       </td>
                       <td className="right" data-label="操作">
                         <span className="acts">
+                          <Menu label={`更多操作：${k.label}`} disabled={busy === k.id} items={[
+                            { label: "查看用量", onSelect: () => { window.location.hash = detailHref; } },
+                            ...(active ? [{ label: "修改密钥", onSelect: () => { window.location.hash = `${detailHref}&edit=1`; } }] : []),
+                          ]} />
                           {/* The organisation's own switch, which the platform's overrides. */}
                           {active && !k.disabled_by_platform && (
                             <Button
@@ -342,7 +370,7 @@ export function Keys({
           {items !== null && <RecordTablePager page={table.page} pageSize={table.pageSize} onPageChange={table.setPage} onPageSizeChange={table.setPageSize} total={table.filteredCount} label="密钥" />}
         </Card>
         {active && <FormDialog open={createOpen} onOpenChange={(next) => { setCreateOpen(next); if (!next) setMinted(null); }} busy={createBusy} title={minted ? "密钥已创建" : "新建密钥"} description="先选择计价分组，再设置模型范围与限制。留空的限制沿用组织上限。">
-          {minted ? <div ref={createdResult} tabIndex={-1} aria-label="密钥已创建" className="key-created-result"><ShownOnce title="密钥明文（可再次复制）" value={minted} onDone={() => { setCreateOpen(false); setMinted(null); }}><span className="hint">密钥已创建。复制后即可使用；之后也可以在密钥列表里重新获取明文。</span></ShownOnce></div> : <NewKeyForm
+          {minted ? <div ref={createdResult} tabIndex={-1} aria-label="密钥已创建" className="key-created-result"><ShownOnce title="密钥明文（可再次复制）" value={minted} onDone={() => { setCreateOpen(false); setMinted(null); }}><span className="hint">密钥已创建。复制后即可使用；之后也可以在密钥列表里重新获取明文。</span></ShownOnce></div> : <KeyForm
             me={member}
             manager={manager}
             catalog={catalog}
@@ -411,14 +439,14 @@ function GroupCell({
     return (
       <span className="acts">
         <span className="hint">分组只能选择一次，选定后不能更改，并决定这个密钥的价格。</span>
-        <select aria-label="分组" value={choice} onChange={(e) => setChoice(e.target.value)}>
+        <Select aria-label="分组" value={choice} onValueChange={setChoice} size="compact">
           <option value="">请选择</option>
           {(groups ?? []).map((g) => (
             <option key={g.id} value={g.id}>
               {g.display_name}
             </option>
           ))}
-        </select>
+        </Select>
         <Button
           size="sm"
           disabled={busy || choice === ""}
@@ -445,7 +473,7 @@ function GroupCell({
   );
 }
 
-function stateOf(k: TenantKey): { text: string; lamp: LampState; note?: string } {
+export function stateOf(k: TenantKey): { text: string; lamp: LampState; note?: string } {
   if (k.disabled_by_platform) return { text: "已被平台停用", lamp: "disabled", note: "只有平台可以重新启用" };
   if (k.disabled) return { text: "已停用", lamp: "disabled" };
   if (k.expires_at && Date.parse(k.expires_at) <= Date.now()) return { text: "已过期", lamp: "disabled" };
@@ -475,7 +503,8 @@ function limit(raw: string): { value?: number; problem?: string } {
   const text = raw.trim();
   if (text === "") return {};
   if (!/^\d+$/.test(text)) return { problem: "请填整数；留空表示不单独限制" };
-  return { value: Number(text) };
+  const value = Number(text);
+  return Number.isSafeInteger(value) && value <= 4_294_967_295 ? { value } : { problem: "请填 0 到 4,294,967,295 之间的整数；留空表示不单独限制" };
 }
 
 function capHint(cap: number | undefined, caps: Caps | null): string {
@@ -483,7 +512,7 @@ function capHint(cap: number | undefined, caps: Caps | null): string {
   return cap === undefined ? "组织未设上限；留空表示不限" : `组织上限 ${count(cap)}；留空则按此上限`;
 }
 
-function NewKeyForm({
+export function KeyForm({
   me,
   manager,
   catalog,
@@ -495,6 +524,9 @@ function NewKeyForm({
   onCreated,
   onBusyChange,
   onCancel,
+  initial,
+  onSaved,
+  onConflict,
 }: {
   me: SessionMember;
   manager: boolean;
@@ -505,36 +537,40 @@ function NewKeyForm({
   readErr: string | null;
   /** Called when the control plane says the organisation is no longer active. */
   onInactive: () => void;
-  onCreated: (plaintext: string) => void;
+  onCreated?: (plaintext: string) => void;
+  initial?: TenantKey;
+  onSaved?: (key: TenantKey) => void;
+  onConflict?: () => void;
   onBusyChange: (busy: boolean) => void;
   onCancel: () => void;
 }) {
   const id = useId();
-  const [label, setLabel] = useState("");
+  const [label, setLabel] = useState(initial?.label ?? "");
   // The group the key is bought in: what it is priced at, so it is chosen
   // with the key and never changed afterwards.
-  const [group, setGroup] = useState("");
-  const [modelScope, setModelScope] = useState<"inherited" | "selected">("inherited");
+  const [group, setGroup] = useState(initial?.group?.id ?? "");
+  const [modelScope, setModelScope] = useState<"inherited" | "selected">(initial && initial.model_ids !== null ? "selected" : "inherited");
   const [modelsOpen, setModelsOpen] = useState(false);
   const [modelSearch, setModelSearch] = useState("");
-  const [picked, setPicked] = useState<string[]>([]);
-  const [concurrency, setConcurrency] = useState("");
-  const [rpm, setRpm] = useState("");
-  const [expires, setExpires] = useState("");
+  const [picked, setPicked] = useState<string[]>(initial?.model_ids ?? []);
+  const [concurrency, setConcurrency] = useState(initial?.rate_limit.concurrency?.toString() ?? "");
+  const [rpm, setRpm] = useState(initial?.rate_limit.rpm?.toString() ?? "");
+  const [expires, setExpires] = useState(initial?.expires_at ? beijingInputValue(new Date(initial.expires_at)) : "");
+  const [disabled, setDisabled] = useState(initial?.disabled ?? false);
   // Empty: the caller.
   const [owner, setOwner] = useState("");
   const [errs, setErrs] = useState<FieldErrors>({});
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [form, focusRefusal] = useRefusalFocus<HTMLFormElement>();
-  const noModels = modelScope === "selected" && picked.length === 0;
+  const noModels = !initial && modelScope === "selected" && picked.length === 0;
   const modelsEmptyMessage = "请至少选择一个模型，或改为不限制模型";
 
   // One group is the organisation's only choice, so it is preselected; it is
   // still shown, since it is what the key is priced at.
   useEffect(() => {
-    if (groups !== null && groups.length === 1) setGroup(groups[0]?.id ?? "");
-  }, [groups]);
+    if (!initial?.group && groups !== null && groups.length === 1) setGroup(groups[0]?.id ?? "");
+  }, [groups, initial?.group]);
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -576,6 +612,15 @@ function NewKeyForm({
     setBusy(true);
     onBusyChange(true);
     try {
+      if (initial) {
+        const patch = keySettingsPatch(initial, {
+          label, modelIds: modelScope === "inherited" ? null : picked, groupId: group,
+          rateLimit: { concurrency: c.value, rpm: r.value }, disabled, expiresAt: expiresAt ?? null,
+        });
+        const updated = Object.keys(patch).length === 0 ? initial : await keyApi.update(initial.id, patch, initial.version);
+        onSaved?.(updated);
+        return;
+      }
       const { plaintext } = await keyApi.create(body);
       setLabel("");
       setGroup(groups !== null && groups.length === 1 ? (groups[0]?.id ?? "") : "");
@@ -587,7 +632,7 @@ function NewKeyForm({
       setRpm("");
       setExpires("");
       setOwner("");
-      onCreated(plaintext);
+      onCreated?.(plaintext);
     } catch (e) {
       if (e instanceof ApiError && e.code === "validation_failed" && e.details.length > 0) {
         // Each refusal beside its field; one the form has no field for above the button.
@@ -606,7 +651,9 @@ function NewKeyForm({
         if (rest.length > 0) setErr(rest.join("；"));
         focusRefusal();
       } else if (e instanceof ApiError && e.code === "unavailable") {
-        setErr("平台暂时无法创建密钥，请稍后再试");
+        setErr(initial ? "平台暂时无法修改密钥，请稍后再试" : "平台暂时无法创建密钥，请稍后再试");
+      } else if (e instanceof ApiError && e.code === "version_mismatch") {
+        setErr("该密钥已被他人修改。请重新载入最新配置后再修改，未保存的内容将被替换。");
       } else if (e instanceof ApiError && e.code === "tenant_not_active") {
         setErr(messageFor(e));
         onInactive();
@@ -627,6 +674,7 @@ function NewKeyForm({
   const modelsDescribedBy = [modelsHint, errs.models ? modelsErr : noModels ? modelsEmpty : null].filter(Boolean).join(" ");
   const search = modelSearch.trim().toLocaleLowerCase();
   const visibleModels = (catalog ?? []).filter((m) => m.name.toLocaleLowerCase().includes(search));
+  const unavailableModels = catalog === null ? [] : picked.filter(modelId => !catalog.some(model => model.id === modelId));
   function clearModelsError() {
     setErrs((was) => {
       const { models: _, ...rest } = was;
@@ -638,16 +686,16 @@ function NewKeyForm({
   const choices = (people ?? []).filter((p) => p.id !== me.id && p.role !== "billing");
   // The hint is rendered only when there is a group to choose, so it is
   // described by only then.
-  const groupDescribedBy = [groups !== null && groups.length > 0 ? groupHint : null, errs.group ? groupErr : null]
+  const groupDescribedBy = [initial?.group || (groups !== null && groups.length > 0) ? groupHint : null, errs.group ? groupErr : null]
     .filter(Boolean)
     .join(" ");
   // With no group assigned the form cannot create anything: the button says
   // why and the submit never reaches the server to earn its refusal.
-  const noGroup = groups !== null && groups.length === 0;
+  const noGroup = !initial?.group && groups !== null && groups.length === 0;
 
   return (
     <Card className={cn(span.d12, "tenant-key-create")}>
-      <CardHeader number={4} title="新建密钥" description="先选择计价分组，再设置模型范围与限制。未填写的限制沿用组织上限。" />
+      <CardHeader number={4} title={initial ? "密钥配置" : "新建密钥"} description={initial ? "修改调用范围与限制。未填写的限制沿用组织上限。" : "先选择计价分组，再设置模型范围与限制。未填写的限制沿用组织上限。"} />
       {readErr && (
         <div className="note crit" role="alert">
           {readErr}
@@ -669,7 +717,9 @@ function NewKeyForm({
             aria-invalid={errs.group ? true : undefined}
           >
             <legend>分组</legend>
-            {groups === null ? (
+            {initial?.group ? (
+              <p>{initial.group.display_name}（只读）</p>
+            ) : groups === null ? (
               <span className="hint">载入中…</span>
             ) : groups.length === 0 ? (
               <span className="hint">运营尚未为本组织分配分组。请联系平台运营分配分组后，再新建密钥。</span>
@@ -701,7 +751,7 @@ function NewKeyForm({
               </div>
             )}
           </fieldset>
-          {groups !== null && groups.length > 0 && (
+          {(initial?.group || (groups !== null && groups.length > 0)) && (
             <p className="hint" id={groupHint}>
               分组建好密钥后不能更换；如需更换分组，请新建密钥
               {/* The prices of the group just picked, which is what the
@@ -758,7 +808,7 @@ function NewKeyForm({
             {modelScope === "selected" && (
               <div className="grid min-w-0 gap-3">
                 <p className="hint" aria-live="polite">
-                  已选 {formatCount(picked.length)} 个模型
+                  已选 {formatCount(picked.length)} 个模型{initial && picked.length === 0 ? "，该密钥无法调用任何模型" : ""}
                 </p>
                 {noModels && !errs.models && <p className="hint" id={modelsEmpty}>{modelsEmptyMessage}</p>}
                 <div>
@@ -776,6 +826,12 @@ function NewKeyForm({
                     <Field label="搜索模型">
                       <input type="search" value={modelSearch} onChange={(e) => setModelSearch(e.target.value)} />
                     </Field>
+                    {unavailableModels.length > 0 && <div className="picks [overflow-wrap:anywhere]">
+                      {unavailableModels.map(modelId => <label key={modelId} className="pick min-w-0">
+                        <input type="checkbox" checked onChange={() => setPicked(was => was.filter(value => value !== modelId))} />
+                        已不在组织授权内（{modelId}）
+                      </label>)}
+                    </div>}
                     {catalog === null ? (
                       <span className="hint">载入中…</span>
                     ) : catalog.length === 0 ? (
@@ -832,10 +888,15 @@ function NewKeyForm({
           )}
         </Field>
 
-        {manager && (
+        {initial && <Field label="密钥状态" wide hint={initial.disabled_by_platform ? "平台已停用此密钥，只有平台可以重新启用。" : "停用后无法调用，重新启用仍受组织授权和额度约束。"}>
+          <Select value={disabled ? "disabled" : "enabled"} disabled={initial.disabled_by_platform} onValueChange={value => setDisabled(value === "disabled")}>
+            <option value="enabled">启用</option><option value="disabled">停用</option>
+          </Select>
+        </Field>}
+        {initial ? <div className="field wide"><span className="f-label">归属成员</span><p>{initial.owner === null ? "组织" : initial.owner.id === me.id ? "我" : initial.owner.display_name ?? "成员"}（只读）</p><p className="hint">密钥创建后不能更换归属成员；如需更换，请新建密钥。</p></div> : manager && (
           <Field label="归属成员" wide error={errs.owner}>
             {(aria) => (
-              <select value={owner} onChange={(e) => setOwner(e.target.value)} {...aria}>
+              <Select value={owner} onValueChange={setOwner} {...aria}>
                 <option value="">我</option>
                 {choices.map((p) => (
                   <option key={p.id} value={p.id}>
@@ -843,7 +904,7 @@ function NewKeyForm({
                     {p.disabled ? "（已停用）" : ""}
                   </option>
                 ))}
-              </select>
+              </Select>
             )}
           </Field>
         )}
@@ -851,6 +912,7 @@ function NewKeyForm({
         {err && (
           <div className="note crit col-span-full" role="alert">
             {err}
+            {err.startsWith("该密钥已被他人修改") && onConflict && <Button onClick={onConflict}>重新载入最新配置</Button>}
           </div>
         )}
         <div className="tenant-form-actions col-span-full">
@@ -862,7 +924,7 @@ function NewKeyForm({
             disabled={noGroup || noModels}
             disabledReason={noModels ? modelsEmptyMessage : undefined}
           >
-            新建密钥
+            {initial ? "保存修改" : "新建密钥"}
           </Button>
         </div>
       </form>

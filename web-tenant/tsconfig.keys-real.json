@@ -1,0 +1,7 @@
+{
+  "extends": "./tsconfig.json",
+  "include": [
+    "e2e-keys-real/keys.spec.ts",
+    "playwright.keys-real.config.ts"
+  ]
+}
