@@ -2565,6 +2565,44 @@ mod tests {
         assert_eq!(open.total(ms(40)), Duration::from_millis(40));
     }
 
+    // 终态只恢复首帧样本；把该读取改回停表，开放等待和已提交 winner 都必须失败。
+    #[tokio::test]
+    async fn recovering_a_parsed_frame_does_not_settle_the_upstream_wait() {
+        use aisix_gateway::response_tap::{StreamTiming, StreamUsageObserver};
+
+        let observer = StreamUsageObserver::default();
+        observer.note_first_frame();
+        let frame = observer.first_frame_at().unwrap();
+        let started = frame - Duration::from_millis(10);
+        let ended = frame + Duration::from_millis(90);
+        let timing = StreamTiming {
+            observer: Some(observer),
+            buffered: false,
+        };
+        for committed in [false, true] {
+            let cell = Arc::new(RequestAttribution::default());
+            {
+                let mut inner = cell.lock();
+                inner.upstream_clock.begin(started);
+                if committed {
+                    inner.upstream_clock.settle(ended, true);
+                }
+            }
+            scope(cell.clone(), async {
+                assert_eq!(
+                    observed_stream_ttft(&timing, started),
+                    Some(Duration::from_millis(10))
+                );
+            })
+            .await;
+            assert_eq!(
+                cell.lock().upstream_clock.total(ended),
+                Duration::from_millis(100),
+                "恢复样本不得缩短等待窗口，committed={committed}"
+            );
+        }
+    }
+
     /// A write with no request scope must not panic — `resolve_provider_key`
     /// also runs from the background health checker.
     #[test]
