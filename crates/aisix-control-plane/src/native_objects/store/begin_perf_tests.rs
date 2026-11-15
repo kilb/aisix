@@ -8,7 +8,7 @@ use tracing_subscriber::layer::SubscriberExt as _;
 
 #[path = "../../../tests/support/mod.rs"]
 mod support;
-use support::world::{seed_key, seed_tenant};
+use support::world::{group_id, seed_key, seed_tenant, SHARED_GROUP};
 use support::{OperatorSession, TestCp};
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -122,6 +122,14 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
+        Self::with_class(false).await
+    }
+
+    async fn wildcard() -> Self {
+        Self::with_class(true).await
+    }
+
+    async fn with_class(internal_wildcard: bool) -> Self {
         let cp = TestCp::start()
             .await
             .expect("CP_TEST_DATABASE_URL is required for real PG");
@@ -139,11 +147,20 @@ impl Fixture {
             "/id",
         );
         let mut models = Vec::new();
-        for (name, upstream) in [
-            ("batch-a/*", "upstream-a"),
-            ("batch-b/*", "upstream-b"),
-            ("batch-denied/*", "upstream-denied"),
+        for (direct_name, wildcard_name, upstream) in [
+            ("batch-a/root", "batch-a/*", "upstream-a"),
+            ("batch-b/allowed", "batch-b/*", "upstream-b"),
+            (
+                "batch-denied/forbidden",
+                "batch-denied/*",
+                "upstream-denied",
+            ),
         ] {
+            let name = if internal_wildcard {
+                wildcard_name
+            } else {
+                direct_name
+            };
             let model = create(
                 &cp,
                 &admin,
@@ -156,25 +173,46 @@ impl Fixture {
             .await;
             models.push(uuid_at(&model, "/id"));
         }
-        let tenant = seed_tenant(&cp, &admin).await;
-        let path = format!("/admin/tenants/{tenant}");
-        let current = cp.send("GET", &path, Some(admin.cookie()), None).await;
-        assert_eq!(current.status, 200, "real tenant setup");
-        let granted = cp
-            .send_conditional(
-                "PATCH",
-                &path,
-                admin.cookie(),
-                current.body["version"].as_i64().unwrap(),
-                json!({"allowed_model_ids":[models[0],models[1]]}),
+        let (tenant, key) = if internal_wildcard {
+            // 公开合同只给平台内部 key 开放模型模式；不向客户租户授权通配模型。
+            let tenant: Uuid = sqlx::query_scalar("SELECT id FROM tenants WHERE is_internal")
+                .fetch_one(cp.db().pool())
+                .await
+                .expect("the boot-created internal tenant");
+            let key = create(
+                &cp,
+                &admin,
+                &format!("/admin/tenants/{tenant}/keys"),
+                json!({
+                    "label":"native-batch-preload-internal",
+                    "allowed_models":["batch-a/*","batch-b/*"],
+                    "group_id":group_id(&cp, SHARED_GROUP).await
+                }),
             )
             .await;
-        assert_eq!(
-            granted.status, 200,
-            "grant both allowed wildcard rows: {granted:?}"
-        );
-        let member = cp.seed_member(tenant, MemberRole::Member).await.id;
-        let key = Uuid::parse_str(&seed_key(&cp, &admin, tenant, Some(member)).await).unwrap();
+            (tenant, uuid_at(&key, "/key/id"))
+        } else {
+            let tenant = seed_tenant(&cp, &admin).await;
+            let path = format!("/admin/tenants/{tenant}");
+            let current = cp.send("GET", &path, Some(admin.cookie()), None).await;
+            assert_eq!(current.status, 200, "real tenant setup");
+            let granted = cp
+                .send_conditional(
+                    "PATCH",
+                    &path,
+                    admin.cookie(),
+                    current.body["version"].as_i64().unwrap(),
+                    json!({"allowed_model_ids":[models[0],models[1]]}),
+                )
+                .await;
+            assert_eq!(
+                granted.status, 200,
+                "grant both ordinary direct models: {granted:?}"
+            );
+            let member = cp.seed_member(tenant, MemberRole::Member).await.id;
+            let key = Uuid::parse_str(&seed_key(&cp, &admin, tenant, Some(member)).await).unwrap();
+            (tenant, key)
+        };
         let gateway_admin = cp.admin_login_seeded(OperatorRole::Admin).await;
         let bundle = cp
             .issue_bundle(&gateway_admin, "native-batch-preload-gateway")
@@ -303,7 +341,7 @@ async fn native_begin_preloads_resources_once_for_1000_entries() {
 
 #[tokio::test]
 async fn native_begin_checks_the_actual_b_entry_alias_after_a_root() {
-    let fixture = Fixture::new().await;
+    let fixture = Fixture::wildcard().await;
     let mut body = fixture.body(2);
     let entry = &mut body.entries[1];
     entry.model_id = fixture.model_b;
@@ -324,7 +362,7 @@ async fn native_begin_checks_the_actual_b_entry_alias_after_a_root() {
 
 #[tokio::test]
 async fn native_begin_refuses_an_entry_alias_outside_its_wildcard_despite_valid_root() {
-    let fixture = Fixture::new().await;
+    let fixture = Fixture::wildcard().await;
     let mut body = fixture.body(2);
     body.entries[1].requested_model = "outside-the-granted-wildcard/forbidden".into();
     let operation = body.operation_id;
@@ -358,7 +396,7 @@ async fn native_begin_refuses_an_ungranted_entry_model_even_after_valid_entries(
 
 #[tokio::test]
 async fn native_begin_preserves_the_legacy_empty_entry_name_fallback() {
-    let fixture = Fixture::new().await;
+    let fixture = Fixture::wildcard().await;
     let mut body = fixture.body(2);
     body.entries[1].requested_model.clear();
     let operation = body.operation_id;
