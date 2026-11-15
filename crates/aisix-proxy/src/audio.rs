@@ -364,7 +364,6 @@ pub async fn translations(
     multipart: Result<Multipart, axum::extract::multipart::MultipartRejection>,
 ) -> Response {
     let started = Instant::now();
-    crate::attribution::note_handler_started(started);
     let request_id = client.request_id.clone();
     let api_key_id = auth.entry.id.clone();
 
