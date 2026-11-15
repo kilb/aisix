@@ -34,10 +34,11 @@
 //! - **least_busy**: least-loaded target first, by in-flight requests
 //!   divided by target `weight` (the APISIX least_conn score).
 
-#[cfg(test)]
-mod indexed_contract_tests;
+mod configured_hash;
 #[cfg(test)]
 mod filtered_hash_contract_tests;
+#[cfg(test)]
+mod indexed_contract_tests;
 #[cfg(test)]
 mod metric_key_tests;
 #[cfg(test)]
@@ -1068,10 +1069,28 @@ struct HashRing {
     fingerprint: u64,
     /// (hash point, index into the tier's target list), sorted by point.
     points: Vec<(u64, u32)>,
+    /// 每个声明的点在完整排序环中的位置；按声明连续存储，每个位置只占四字节。
+    point_positions: Vec<u32>,
+    declaration_offsets: Vec<usize>,
 }
 
 impl HashRing {
     fn build<'a, I>(fingerprint: u64, targets: I, scale: RingScale) -> Self
+    where
+        I: IntoIterator<Item = &'a RoutingTarget>,
+        I::IntoIter: Clone,
+    {
+        Self::build_named(fingerprint, targets, scale, |target| {
+            std::borrow::Cow::Borrowed(target.model.as_str())
+        })
+    }
+
+    fn build_named<'a, I>(
+        fingerprint: u64,
+        targets: I,
+        scale: RingScale,
+        model_name: impl Fn(&'a RoutingTarget) -> std::borrow::Cow<'a, str>,
+    ) -> Self
     where
         I: IntoIterator<Item = &'a RoutingTarget>,
         I::IntoIter: Clone,
@@ -1089,18 +1108,16 @@ impl HashRing {
         let total_points = units.iter().sum::<u64>() as usize * RING_POINTS_PER_UNIT;
         let mut points = Vec::with_capacity(total_points);
         for (idx, (target, units)) in targets.zip(&units).enumerate() {
+            let model_name = model_name(target);
             for i in 0..(*units as usize) * RING_POINTS_PER_UNIT {
-                let mut h = fnv1a_extend(FNV_OFFSET_BASIS, target.model.as_bytes());
+                let mut h = fnv1a_extend(FNV_OFFSET_BASIS, model_name.as_bytes());
                 h = fnv1a_extend(h, &[0]);
                 h = fnv1a_extend(h, &(i as u32).to_le_bytes());
                 points.push((mix64(h), idx as u32));
             }
         }
         points.sort_unstable();
-        Self {
-            fingerprint,
-            points,
-        }
+        Self::from_sorted_points(fingerprint, points, units.len())
     }
 
     /// The tier's targets in this key's deterministic preference order:
@@ -2352,7 +2369,12 @@ pub(crate) fn resolve_attempt_models(
         Some(_) => std::borrow::Cow::Owned(format!("{virtual_name}{PARTIAL_ROUTE_ROTATION}")),
         None => std::borrow::Cow::Borrowed(virtual_name),
     };
-    let indices = routing_registry.pick_target_indices(&rotation, routing, &available, &hash_key);
+    let indices = if routing.strategy == RoutingStrategy::ConsistentHash {
+        routing_registry
+            .pick_configured_hash_indices(snapshot, &rotation, routing, &available, &hash_key)
+    } else {
+        routing_registry.pick_target_indices(&rotation, routing, &available, &hash_key)
+    };
     if indices.is_empty() {
         return Err(ProxyError::InvalidRequest(
             "routing model has no targets".into(),
