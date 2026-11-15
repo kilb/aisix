@@ -680,3 +680,105 @@ async fn named_resources_reach_actual_ws_and_keep_original_local_owner_usage_and
     }
     ordinary_journey(NAMED_IDS).await;
 }
+
+// 普通永久 key 的 secret 没有保留前缀；本地供应商只是协议组件，不是 vendor E2E。
+#[tokio::test]
+async fn permanent_key_with_realtime_secret_prefix_keeps_ordinary_auth_and_nonzero_ws_work() {
+    let mut f = Fixture::new(NAMED_IDS).await;
+    f.bearer = format!("aisix_rt_{}", Uuid::new_v4().simple());
+    let key: ApiKey = serde_json::from_value(json!({"display_name":"ordinary-local-owner",
+        "key_hash":ApiKey::hash_bearer(&f.bearer),"allowed_model_ids":[NAMED_IDS.model],
+        "allowed_endpoints":["models","realtime"]}))
+    .expect("a configured permanent key may use an arbitrary legal bearer secret");
+    f.state
+        .snapshot
+        .load()
+        .apikeys
+        .insert(ResourceEntry::new(NAMED_IDS.key, key, 2));
+
+    let models = reqwest::Client::new()
+        .get(format!("http://{}/v1/models", f.address))
+        .bearer_auth(&f.bearer)
+        .timeout(LIMIT)
+        .send()
+        .await
+        .expect("the actual prefixed permanent bearer reaches the ordinary HTTP router");
+    assert_eq!(
+        models.status().as_u16(),
+        200,
+        "the same configured bearer is a valid permanent key on ordinary HTTP"
+    );
+
+    let mut socket = tokio::time::timeout(LIMIT, f.connect())
+        .await
+        .expect("a permanent key with this prefix still receives an actual WS Upgrade");
+    let session = next_event(&mut socket).await;
+    assert!(
+        session.get("type") == Some(&json!("session.created"))
+            && session.pointer("/session/id") == Some(&json!(SESSION)),
+        "the permanent bearer reaches the actual configured provider session"
+    );
+    let original = actual_live_identity(&f).await;
+    let credential: Option<String> =
+        sqlx::query_scalar("SELECT credential_id FROM native_live_sessions WHERE operation_id=?")
+            .bind(original.operation.to_string())
+            .fetch_one(&f.reader)
+            .await
+            .expect("the actual admitted permanent-key session has a durable identity");
+    assert!(
+        credential.is_none(),
+        "a configured permanent bearer is not redeemed as a temporary credential"
+    );
+
+    let create = json!({"type":"response.create","event_id":"prefixed_permanent_work",
+        "response":{"output_modalities":["text"]}});
+    socket
+        .send(Message::Text(create.to_string()))
+        .await
+        .expect("send actual work through the prefixed permanent-key WS");
+    let accepted = next_event(&mut socket).await;
+    assert!(
+        accepted.get("type") == Some(&json!("response.created"))
+            && accepted.pointer("/response/id") == Some(&json!(RESPONSE)),
+        "the actual provider accepts the permanent-key request"
+    );
+    for delivery in ["named_response_done", "named_response_done_redelivery"] {
+        let completed = next_event(&mut socket).await;
+        assert!(
+            completed.get("type") == Some(&json!("response.done"))
+                && completed.get("event_id") == Some(&json!(delivery))
+                && completed.pointer("/response/id") == Some(&json!(RESPONSE))
+                && completed.pointer("/response/usage/input_tokens") == Some(&json!(10))
+                && completed.pointer("/response/usage/output_tokens") == Some(&json!(3))
+                && completed.pointer("/response/usage/total_tokens") == Some(&json!(13)),
+            "the permanent bearer receives explicitly present nonzero provider usage"
+        );
+    }
+    socket
+        .close(None)
+        .await
+        .expect("close the actual prefixed permanent-key WS");
+    drop(socket);
+    f.peer.drained().await;
+    assert!(
+        f.peer
+            .state
+            .handshakes
+            .lock()
+            .expect("complete actual provider handshake history")
+            .as_slice()
+            == [true],
+        "the configured upstream accepts exactly one authenticated provider connection"
+    );
+    assert!(
+        f.peer
+            .state
+            .inputs
+            .lock()
+            .expect("complete drained actual provider inputs")
+            .as_slice()
+            == [create],
+        "the actual provider receives the permanent caller's request exactly once"
+    );
+    one_actual_aggregate(&mut f, &original).await;
+}
