@@ -577,6 +577,10 @@ impl Scope {
         sql.push(" WHERE pc.tenant_id = ");
         sql.push_bind(self.tenant).push("::text");
         sql.push(" AND ").push(VISIBLE);
+        self.push_filters(sql);
+    }
+
+    fn push_filters(&self, sql: &mut QueryBuilder<'_, Postgres>) {
         if let Some(member) = self.member {
             sql.push(" AND pc.user_id = ")
                 .push_bind(member)
@@ -929,6 +933,18 @@ pub const MAX_SUMMARY_ROWS: usize = 1000;
 /// The name of the row that holds everything past [`MAX_SUMMARY_ROWS`].
 const OTHER: &str = "other";
 
+#[derive(sqlx::FromRow)]
+struct SummaryAggregate {
+    kind: i32,
+    period_start: DateTime<Utc>,
+    model_id: String,
+    requests: i64,
+    amount: i64,
+    estimated: i64,
+    dimension: String,
+    quantity: i64,
+}
+
 /// Runs `summarize` in one read-only repeatable-read transaction, so its
 /// queries see the same rows.
 async fn summarize_snapshot(
@@ -963,49 +979,42 @@ async fn summarize(
         Group::Month => "month",
     };
 
-    let mut sql = QueryBuilder::<Postgres>::new("SELECT date_trunc(");
-    sql.push_bind(unit).push(format!(
-        ", pc.occurred_at, 'Asia/Shanghai'), pc.requested_model_id, count(*)::bigint, \
-         COALESCE(sum(pc.charge_micro_cny) FILTER (WHERE pc.status = 'charged'), 0)::bigint \
-           + sum(COALESCE({ADJUSTED}, 0))::bigint, \
-         (count(*) FILTER (WHERE pc.estimated))::bigint"
-    ));
-    scope.push_from(&mut sql, false);
-    sql.push(" GROUP BY 1, 2 ORDER BY 1, 2");
-    let rows: Vec<(DateTime<Utc>, String, i64, i64, i64)> = sql
-        .build_query_as()
-        .fetch_all(&mut *conn)
-        .await
-        .map_err(DbError::from)?;
-
-    let mut sql = QueryBuilder::<Postgres>::new("SELECT date_trunc(");
-    sql.push_bind(unit).push(
-        ", pc.occurred_at, 'Asia/Shanghai'), pc.requested_model_id, l->>'dimension', \
-         COALESCE(sum((l->>'quantity')::bigint), 0)::bigint",
+    // 修正先按本次范围聚合；可见行只投影一次，金额与数量共用同一结果。
+    let mut sql = QueryBuilder::<Postgres>::new(
+        "WITH scoped AS NOT MATERIALIZED (\
+         SELECT pc.event_id, pc.occurred_at, pc.requested_model_id, pc.status, \
+                pc.charge_micro_cny, pc.estimated, pc.lines \
+         FROM pricing_charges_cny pc WHERE pc.tenant_id = ",
     );
-    scope.push_from(&mut sql, true);
-    sql.push(" GROUP BY 1, 2, 3");
-    let quantity_rows: Vec<(DateTime<Utc>, String, String, i64)> = sql
+    sql.push_bind(scope.tenant).push("::text");
+    scope.push_filters(&mut sql);
+    sql.push(")").push(format!(
+        include_str!("summary.sql"),
+        unit = unit,
+        effective_lines = EFF_LINES,
+    ));
+    let aggregates: Vec<SummaryAggregate> = sql
         .build_query_as()
         .fetch_all(&mut *conn)
         .await
         .map_err(DbError::from)?;
 
-    let model_ids: Vec<Uuid> = rows
+    let model_ids: Vec<Uuid> = aggregates
         .iter()
-        .filter_map(|r| Uuid::parse_str(&r.1).ok())
+        .filter(|r| r.kind == 0)
+        .filter_map(|r| Uuid::parse_str(&r.model_id).ok())
         .collect();
     let models = Models::load(conn, scope.tenant, &model_ids).await?;
 
     // The shown model of a stored id: granted ids by name, all others as one.
     let shown = |raw: &str| call_model(&models, raw, "");
     let mut merged: BTreeMap<(DateTime<Utc>, Option<Uuid>), UsageSummaryRow> = BTreeMap::new();
-    for (period, raw, requests, charged, estimated) in rows {
-        let model = shown(&raw);
+    for aggregate in aggregates.iter().filter(|r| r.kind == 0) {
+        let model = shown(&aggregate.model_id);
         let row = merged
-            .entry((period, model.id))
+            .entry((aggregate.period_start, model.id))
             .or_insert_with(|| UsageSummaryRow {
-                period_start: period,
+                period_start: aggregate.period_start,
                 model: ModelRef {
                     id: model.id,
                     name: model.name.clone(),
@@ -1015,14 +1024,14 @@ async fn summarize(
                 estimated_requests: 0,
                 quantities: BTreeMap::new(),
             });
-        row.requests += requests;
-        row.charged_micro_cny += charged;
-        row.estimated_requests += estimated;
+        row.requests += aggregate.requests;
+        row.charged_micro_cny += aggregate.amount;
+        row.estimated_requests += aggregate.estimated;
     }
-    for (period, raw, dimension, quantity) in quantity_rows {
-        let model = shown(&raw);
-        if let Some(row) = merged.get_mut(&(period, model.id)) {
-            *row.quantities.entry(dimension).or_insert(0) += quantity;
+    for aggregate in aggregates.into_iter().filter(|r| r.kind == 1) {
+        let model = shown(&aggregate.model_id);
+        if let Some(row) = merged.get_mut(&(aggregate.period_start, model.id)) {
+            *row.quantities.entry(aggregate.dimension).or_insert(0) += aggregate.quantity;
         }
     }
 
