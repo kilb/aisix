@@ -145,8 +145,8 @@ pub struct UsageEvent {
     pub trace_id: String,
 
     /// Wall-clock time the upstream call completed: RFC 3339, UTC, with
-    /// exactly three fractional digits. Stamp it with
-    /// [`UsageEvent::occurred_at_now`], never by hand.
+    /// exactly three fractional digits. Use [`UsageEvent::occurred_at_now`] for
+    /// completion now, or [`UsageEvent::occurred_at`] for an already observed instant.
     pub occurred_at: String,
 
     /// UUID of the Model row this event is attributed to. A direct model
@@ -1154,7 +1154,12 @@ impl UsageEvent {
     /// request's attempts and its usage rows by this value, and whole
     /// seconds tie for everything a request emits.
     pub fn occurred_at_now() -> String {
-        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        Self::occurred_at(chrono::Utc::now())
+    }
+
+    /// 将已观测的完成时刻写成统一格式；后台重放不得改写事实时间。
+    pub fn occurred_at(at: chrono::DateTime<chrono::Utc>) -> String {
+        at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
     }
 
     /// The completion count every in-gateway consumer reports — the
@@ -1838,6 +1843,17 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn occurred_at_formatter_preserves_the_observed_instant() {
+        let observed = chrono::DateTime::parse_from_rfc3339("2024-01-02T03:04:05.678912+08:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(
+            UsageEvent::occurred_at(observed),
+            "2024-01-01T19:04:05.678Z"
+        );
+    }
 
     #[test]
     fn occurred_at_is_utc_rfc3339_with_exactly_three_fractional_digits() {
