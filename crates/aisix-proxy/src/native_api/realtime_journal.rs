@@ -5,18 +5,20 @@ use std::sync::Arc;
 
 use aisix_core::native_metering::{ObservedMeter, ObservedUsage};
 use aisix_core::native_objects::{
-    BeginRequest, NativeEntry, NativeObjectKind, NativeProtocol, OriginBinding, TerminalUsage,
+    BeginRequest, NativeEntry, NativeObjectKind, NativeProtocol, NativeReply, OriginBinding,
+    TerminalUsage,
 };
 use aisix_core::native_realtime::{
     AppendLiveUsageRequest, CheckpointLiveSessionRequest, CreateLiveSessionRequest,
     LiveSessionLease, NativeCredential, RealtimePurpose, RealtimeTransport, UsageCoverage,
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
+use futures::future::BoxFuture;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use super::registry::{proxy_error, LiveUsageAuthority, NativeObjectRegistry};
+use super::registry::{proxy_error, LiveUsageAuthority, NativeObjectRegistry, NativeRegistryError};
 use crate::auth::AuthenticatedKey;
 use crate::client_ip::ClientContext;
 use crate::error::ProxyError;
@@ -28,6 +30,8 @@ pub(crate) struct Journal {
     authority: LiveUsageAuthority,
     api_key_id: Uuid,
     lease: LiveSessionLease,
+    lease_expires_at: DateTime<Utc>,
+    deadline_at: DateTime<Utc>,
     upstream_model: String,
     transcription: bool,
     pending: Option<AppendLiveUsageRequest>,
@@ -52,6 +56,105 @@ struct AsrEntry {
     model: Arc<aisix_core::ResourceEntry<aisix_core::Model>>,
     pk_id: String,
     token_keys: Vec<String>,
+}
+
+/// 同一会话只持有一个续租 future；轮询被音频抢占时请求仍保留，不阻塞转发。
+pub(crate) struct LeaseRenewal {
+    registry: Arc<dyn NativeObjectRegistry>,
+    lease: LiveSessionLease,
+    api_key_id: Uuid,
+    expires_at: tokio::time::Instant,
+    deadline_at: tokio::time::Instant,
+    interval: tokio::time::Interval,
+    pending: Option<BoxFuture<'static, Result<NativeReply, NativeRegistryError>>>,
+}
+
+impl LeaseRenewal {
+    fn instant(at: DateTime<Utc>) -> tokio::time::Instant {
+        let now = tokio::time::Instant::now();
+        now.checked_add((at - Utc::now()).to_std().unwrap_or_default())
+            .unwrap_or(now)
+    }
+
+    /// 每帧仅检查最后确认的真实租约期限，不作远程鉴权或写事务。
+    pub(crate) fn refusal(&self) -> Option<ProxyError> {
+        (tokio::time::Instant::now() >= self.expires_at).then_some(ProxyError::AccountUnavailable)
+    }
+
+    pub(crate) async fn next(&mut self) -> Result<(), ProxyError> {
+        loop {
+            if let Some(error) = self.refusal() {
+                return Err(error);
+            }
+            if let Some(pending) = self.pending.as_mut() {
+                let result = tokio::select! {
+                    _ = tokio::time::sleep_until(self.expires_at) => {
+                        return Err(ProxyError::AccountUnavailable);
+                    }
+                    result = pending => result,
+                };
+                self.pending = None;
+                // 迟到回包不能让本地已到期的会话重新开始派发。
+                if let Some(error) = self.refusal() {
+                    return Err(error);
+                }
+                let reply = match result {
+                    Ok(reply) => reply,
+                    Err(NativeRegistryError::Unavailable) => continue,
+                    Err(_) => return Err(ProxyError::InvalidApiKey),
+                };
+                let live = reply.live_session.ok_or(ProxyError::AccountUnavailable)?;
+                if live.operation_id != self.lease.operation_id
+                    || live.api_key_id != self.api_key_id
+                    || live.lease.as_ref() != Some(&self.lease)
+                {
+                    return Err(ProxyError::AccountUnavailable);
+                }
+                if live.requires_stop || live.state != "live" {
+                    return Err(ProxyError::InvalidApiKey);
+                }
+                let expiry = live
+                    .lease_expires_at
+                    .ok_or(ProxyError::AccountUnavailable)?;
+                self.confirmed_expiry(expiry);
+                if let Some(error) = self.refusal() {
+                    return Err(error);
+                }
+                return Ok(());
+            }
+            tokio::select! {
+                _ = tokio::time::sleep_until(self.expires_at) => {
+                    return Err(ProxyError::AccountUnavailable);
+                }
+                _ = self.interval.tick() => {}
+            }
+            let registry = Arc::clone(&self.registry);
+            let request = CheckpointLiveSessionRequest {
+                lease: self.lease.clone(),
+                terminal: false,
+                coverage: UsageCoverage::Partial,
+                entries: Vec::new(),
+            };
+            self.pending = Some(Box::pin(async move {
+                registry.checkpoint_live_session(request).await
+            }));
+        }
+    }
+
+    /// 同代次较旧回包不能缩短另一次配置写入已确认的租期，也不能复活到期会话。
+    pub(crate) fn confirmed_expiry(&mut self, expiry: DateTime<Utc>) {
+        if self.refusal().is_none() {
+            self.expires_at = self
+                .expires_at
+                .max(Self::instant(expiry))
+                .min(self.deadline_at);
+        }
+    }
+
+    /// Drop 取消仍在等待的续租，不留下独立 task 或跨会话引用环。
+    pub(crate) fn cancel(&mut self) {
+        self.pending = None;
+    }
 }
 
 impl Journal {
@@ -143,12 +246,18 @@ impl Journal {
             .map_err(proxy_error)?;
         let record = reply.live_session.ok_or(ProxyError::AccountUnavailable)?;
         let lease = record.lease.ok_or(ProxyError::AccountUnavailable)?;
+        let lease_expires_at = record
+            .lease_expires_at
+            .ok_or(ProxyError::AccountUnavailable)?;
+        let deadline_at = record.deadline_at.ok_or(ProxyError::AccountUnavailable)?;
         if record.operation_id != operation_id
             || record.api_key_id != api_key_id
             || record.transport != RealtimeTransport::WebSocket
             || record.purpose != purpose
             || record.requires_stop
             || lease.operation_id != operation_id
+            || lease_expires_at <= Utc::now()
+            || deadline_at <= Utc::now()
         {
             return Err(ProxyError::AccountUnavailable);
         }
@@ -158,6 +267,8 @@ impl Journal {
             authority,
             api_key_id,
             lease,
+            lease_expires_at,
+            deadline_at,
             upstream_model: upstream_model.to_owned(),
             transcription: purpose == RealtimePurpose::Transcription,
             pending: None,
@@ -180,6 +291,26 @@ impl Journal {
 
     pub(crate) fn canonical(&self) -> bool {
         self.authority == LiveUsageAuthority::CanonicalJournal
+    }
+
+    pub(crate) fn lease_expires_at(&self) -> DateTime<Utc> {
+        self.lease_expires_at
+    }
+
+    pub(crate) fn lease_renewal(&self) -> LeaseRenewal {
+        let deadline_at = LeaseRenewal::instant(self.deadline_at);
+        let first = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut interval = tokio::time::interval_at(first, std::time::Duration::from_secs(10));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        LeaseRenewal {
+            registry: Arc::clone(&self.registry),
+            lease: self.lease.clone(),
+            api_key_id: self.api_key_id,
+            expires_at: LeaseRenewal::instant(self.lease_expires_at).min(deadline_at),
+            deadline_at,
+            interval,
+            pending: None,
+        }
     }
 
     pub(crate) fn secondary_cost_usd(&self) -> f64 {
@@ -351,12 +482,19 @@ impl Journal {
             })
             .await
             .map_err(proxy_error)?;
-        if reply
+        let live = reply
             .live_session
             .as_ref()
-            .is_none_or(|live| live.operation_id != self.lease.operation_id || live.requires_stop)
+            .ok_or(ProxyError::AccountUnavailable)?;
+        if live.operation_id != self.lease.operation_id
+            || live.api_key_id != self.api_key_id
+            || live.lease.as_ref() != Some(&self.lease)
+            || live.requires_stop
         {
             return Err(ProxyError::InvalidApiKey);
+        }
+        if let Some(expiry) = live.lease_expires_at {
+            self.lease_expires_at = self.lease_expires_at.max(expiry);
         }
         if let Some(reservation) = reservation {
             self.held_model_keys.extend(reservation.keys());
@@ -646,24 +784,6 @@ impl Journal {
         let appended = reply.appended.ok_or(ProxyError::AccountUnavailable)?;
         self.pending = None;
         Ok(appended)
-    }
-
-    pub(crate) async fn heartbeat(&self) -> Result<(), ProxyError> {
-        let reply = self
-            .registry
-            .checkpoint_live_session(CheckpointLiveSessionRequest {
-                lease: self.lease.clone(),
-                terminal: false,
-                coverage: UsageCoverage::Partial,
-                entries: Vec::new(),
-            })
-            .await
-            .map_err(proxy_error)?;
-        let live = reply.live_session.ok_or(ProxyError::AccountUnavailable)?;
-        if live.operation_id != self.lease.operation_id || live.requires_stop {
-            return Err(ProxyError::InvalidApiKey);
-        }
-        Ok(())
     }
 
     pub(crate) async fn finish(&mut self) -> Result<(), ProxyError> {
