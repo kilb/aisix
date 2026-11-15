@@ -208,6 +208,7 @@ impl Journal {
             upstream_model,
             provider,
             request_id,
+            client,
             credential,
             purpose,
         )
@@ -252,6 +253,7 @@ impl Journal {
         upstream_model: &str,
         provider: &str,
         request_id: &str,
+        client: &ClientContext,
         credential: Option<&NativeCredential>,
         purpose: RealtimePurpose,
     ) -> Result<Option<Persistence>, ProxyError> {
@@ -286,7 +288,7 @@ impl Journal {
             .map_err(proxy_error)?;
         let operation_id = Uuid::new_v4();
         let accepted = BeginRequest {
-            usage_context: None,
+            usage_context: crate::usage_attr::native_usage_context(client, Default::default()),
             upstream_input_text: None,
             input_file_id: None,
             operation_id,
