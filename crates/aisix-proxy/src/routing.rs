@@ -1074,6 +1074,8 @@ impl HashRing {
         I: IntoIterator<Item = &'a RoutingTarget>,
         I::IntoIter: Clone,
     {
+        #[cfg(test)]
+        performance_regression_tests::note_ring_build();
         let targets = targets.into_iter();
         // A 0 only gets here when every candidate is at 0 (see the weight
         // filter in `resolve_attempt_models`): they have no share to compare,

@@ -23,6 +23,15 @@ thread_local! {
     static METRIC_READS: Cell<Option<MetricReads>> = const { Cell::new(None) };
     static AFFINITY_PROBES: Cell<Option<usize>> = const { Cell::new(None) };
     static WRR_PAUSE: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    static RING_BUILDS: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+pub(crate) fn note_ring_build() {
+    RING_BUILDS.with(|slot| {
+        if let Some(builds) = slot.get() {
+            slot.set(Some(builds + 1));
+        }
+    });
 }
 
 pub(crate) fn note_metric_read(kind: MetricRead) {
@@ -82,6 +91,62 @@ fn fixture(
     }))
     .unwrap();
     (snapshot, Arc::new(model))
+}
+
+#[test]
+fn alternating_filtered_hash_subsets_do_not_rebuild_warm_rings() {
+    // 恢复按请求子集覆盖缓存会在热身后重建 1000 次；删掉实际建环也会让热身计数失败。
+    for count in [4usize, 16, 128] {
+        let (snapshot, mut model) = fixture(count, RoutingStrategy::ConsistentHash, None);
+        let routing = Arc::make_mut(&mut model).routing.as_mut().unwrap();
+        for (index, target) in routing.targets.iter_mut().enumerate() {
+            target.tags = Some(vec![if index % 2 == 0 { "eu" } else { "us" }.into()]);
+        }
+        let registry = RoutingRegistry::new();
+        let status = crate::ModelRuntimeStatusTracker::new();
+        let pricing = LivePricingIndex::new();
+        let tags = [vec!["eu".to_string()], vec!["us".to_string()]];
+        let invoke = |side: usize| {
+            resolve_attempt_models(
+                &registry,
+                &status,
+                &pricing,
+                &snapshot,
+                "group",
+                "group-id",
+                &model,
+                RoutingRequest {
+                    tags: &tags[side],
+                    api_key_id: "stable-caller",
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        };
+        RING_BUILDS.with(|slot| slot.set(Some(0)));
+        let warm = [invoke(0), invoke(1)];
+        assert!(RING_BUILDS.with(|slot| slot.get().unwrap()) > 0);
+        RING_BUILDS.with(|slot| slot.set(Some(0)));
+        for request in 0..1000 {
+            let side = request % 2;
+            let actual = invoke(side);
+            assert_eq!(actual.len(), count / 2);
+            let ids: Vec<_> = actual.iter().map(|attempt| attempt.id.as_str()).collect();
+            let expected: Vec<_> = warm[side]
+                .iter()
+                .map(|attempt| attempt.id.as_str())
+                .collect();
+            assert_eq!(ids, expected);
+            assert!(ids.iter().all(|id| {
+                id.strip_prefix("id-").unwrap().parse::<usize>().unwrap() % 2 == side
+            }));
+        }
+        assert_eq!(
+            RING_BUILDS.with(|slot| slot.take().unwrap()),
+            0,
+            "count={count}: warm filtered subsets rebuilt their rings"
+        );
+    }
 }
 
 #[test]
