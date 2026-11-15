@@ -20,10 +20,10 @@ export interface MenuProps {
   children?: ReactNode;
 }
 
-/** 行操作使用独立弹层，菜单关闭后归还触发器焦点。 */
+/** 行操作使用独立弹层，菜单关闭后归还焦点；fieldset 禁用同样阻止打开。 */
 export function Menu({ label, items, disabled, align = "end", className, children }: MenuProps) {
   return <DropdownMenu.Root modal={false}>
-    <DropdownMenu.Trigger className={cn("ui-menu-trigger", className)} disabled={disabled} aria-label={label} title={label}>
+    <DropdownMenu.Trigger onPointerDown={event => { if (event.currentTarget.matches(":disabled")) event.preventDefault(); }} className={cn("ui-menu-trigger", className)} disabled={disabled} aria-label={label} title={label}>
       {children ?? <Ellipsis aria-hidden="true" />}
     </DropdownMenu.Trigger>
     <DropdownMenu.Portal>

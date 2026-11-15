@@ -58,7 +58,11 @@ export function Select({ value, onValueChange, options, children, size, placehol
       queueMicrotask(() => trigger?.focus());
     }
   }}><SelectPrimitive.Root value={String(value)} onValueChange={onValueChange} name={name} required={required} form={form} disabled={disabled}>
-    <SelectPrimitive.Trigger {...triggerProps} aria-invalid={triggerProps["aria-invalid"] || nativeInvalid || undefined} aria-describedby={[triggerProps["aria-describedby"], nativeInvalid ? validationId : undefined].filter(Boolean).join(" ") || undefined} className={cn("ui-select-trigger", size === "compact" && "ui-select-compact", className)} data-value={String(value)}>
+    <SelectPrimitive.Trigger {...triggerProps} onPointerDown={event => {
+      // fieldset 禁用不会进入 Radix prop，但原生按钮仍会收到 pointerdown。
+      if (event.currentTarget.matches(":disabled")) event.preventDefault();
+      else triggerProps.onPointerDown?.(event);
+    }} aria-invalid={triggerProps["aria-invalid"] || nativeInvalid || undefined} aria-describedby={[triggerProps["aria-describedby"], nativeInvalid ? validationId : undefined].filter(Boolean).join(" ") || undefined} className={cn("ui-select-trigger", size === "compact" && "ui-select-compact", className)} data-value={String(value)}>
       <span className="ui-select-value"><SelectPrimitive.Value placeholder={selected?.label ?? placeholder}>{selected?.label ?? String(value)}</SelectPrimitive.Value></span>
       <SelectPrimitive.Icon className="ui-select-chevron"><ChevronDown aria-hidden="true" /></SelectPrimitive.Icon>
     </SelectPrimitive.Trigger>
@@ -92,7 +96,11 @@ export interface MultiSelectProps extends TriggerProps {
 export function MultiSelect({ value, onValueChange, options, placeholder = "请选择", size, disabled, className, ...triggerProps }: MultiSelectProps) {
   const labels = value.map(item => options.find(option => option.value === item)?.label ?? item);
   return <DropdownMenu.Root modal={false}>
-    <DropdownMenu.Trigger {...triggerProps} disabled={disabled} className={cn("ui-select-trigger", size === "compact" && "ui-select-compact", className)}>
+    <DropdownMenu.Trigger {...triggerProps} onPointerDown={event => {
+      // fieldset 禁用不会进入 Radix prop，但原生按钮仍会收到 pointerdown。
+      if (event.currentTarget.matches(":disabled")) event.preventDefault();
+      else triggerProps.onPointerDown?.(event);
+    }} disabled={disabled} className={cn("ui-select-trigger", size === "compact" && "ui-select-compact", className)}>
       <span className="ui-select-value" title={labels.join("、")}>{labels.length ? labels.join("、") : placeholder}</span>
       <ChevronDown className="ui-select-chevron" aria-hidden="true" />
     </DropdownMenu.Trigger>
