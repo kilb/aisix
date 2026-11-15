@@ -775,7 +775,8 @@ pub(super) async fn checkpoint_live_session(
         return live_reply(&row, None);
     }
     let at = now();
-    if row.lease_expires_at <= at {
+    // 只允许空终态收束已接受观察；到期的新工作和续租仍拒绝。
+    if row.lease_expires_at <= at && (!body.terminal || !body.entries.is_empty()) {
         return Err(Error::NotFound);
     }
     let submitted = operation(&mut tx, row.operation_id).await?.0;
@@ -848,7 +849,9 @@ pub(super) async fn checkpoint_live_session(
     } else {
         row.state.as_str()
     };
-    let expiry = if state == "requires_stop" {
+    let expiry = if body.terminal {
+        row.lease_expires_at
+    } else if state == "requires_stop" {
         at + LIVE_LEASE_MS
     } else {
         (at + LIVE_LEASE_MS).min(row.deadline.timestamp_millis())
