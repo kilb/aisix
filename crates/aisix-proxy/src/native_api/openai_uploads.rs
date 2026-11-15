@@ -203,11 +203,20 @@ pub(crate) async fn admit_responses_files(
     allow_background: bool,
     expected: Option<&aisix_core::native_objects::OriginBinding>,
 ) -> Result<(), ProxyError> {
-    let mut checked = body.clone();
-    if state.native_objects.is_some() || state.platform().is_some() {
-        super::response_refs::resolve(state, auth, client, body, expected).await?;
-        super::response_refs::take_references(&mut checked);
+    if state.native_objects.is_none() && state.platform().is_none() {
+        return Ok(());
     }
+    let references = super::response_refs::ReferenceScan::collect(body);
+    references.resolve(state, auth, client, expected).await?;
+    if state.platform().is_none() || !references.needs_review_copy {
+        return crate::stored_refs::refuse_in_responses_with_background(
+            state.platform(),
+            body,
+            allow_background,
+        );
+    }
+    let mut checked = body.clone();
+    super::response_refs::take_references(&mut checked);
     crate::opaque_id::with_own_containers(state.platform(), auth, &mut checked, |checked| {
         crate::stored_refs::refuse_in_responses_with_background(
             state.platform(),
