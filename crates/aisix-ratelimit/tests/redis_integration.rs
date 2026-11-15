@@ -2247,3 +2247,47 @@ async fn an_ambiguous_acquire_releases_its_remote_and_local_members() {
         .expect("Unknown 的本地备份槽也必须释放");
     store.release(&key, "fallback-after-release");
 }
+
+// commit 的 Redis 等待被取消后，Reservation::Drop 仍须清理已经取得的远程槽。
+#[tokio::test(flavor = "current_thread")]
+async fn cancelling_a_pending_commit_still_releases_its_redis_lease() {
+    let Some(url) = redis_url() else { return };
+    let relay = RedisCutoff::start(&url).await;
+    let store = Arc::new(RedisStore::connect(&single(&relay.url())).await.unwrap());
+    let limiter = Limiter::with_store(store);
+    let key = unique_key("cancelled-commit-release");
+    let limits = RateLimit {
+        concurrency: Some(1),
+        ..rl()
+    };
+    let reservation = limiter.pre_commit(&key, &limits).await.unwrap();
+    let peer = RedisStore::connect(&single(&url)).await.unwrap();
+    assert!(matches!(
+        peer.acquire(&key, &limits, "blocked").await,
+        Err(RateLimitError::Concurrency { .. })
+    ));
+
+    relay.blackhole();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), reservation.commit_tokens(0))
+            .await
+            .is_err(),
+        "必须先证明取消发生在尚未完成的 Redis commit 内"
+    );
+    // timeout 已同步 Drop reservation；current_thread 中 release 任务尚未被 poll。
+    relay.heal();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match peer.acquire(&key, &limits, "after-cancel").await {
+                Ok(()) => return,
+                Err(RateLimitError::Concurrency { .. }) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("不应触发其它限流维度: {error:?}"),
+            }
+        }
+    })
+    .await
+    .expect("取消 commit 后，真实 Redis 并发槽仍必须由 Drop 释放");
+    peer.release(&key, "after-cancel");
+}
