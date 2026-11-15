@@ -655,6 +655,7 @@ pub(crate) async fn realtime(
                         &auth,
                         prep.voice_origin.as_ref(),
                         &prep.model_entry.id,
+                        &prep.pk_id,
                         &prep.requested_model,
                         &prep.upstream_model,
                         &prep.upstream_provider,
@@ -1377,7 +1378,7 @@ fn splice_or_keep(text: String, splice: impl FnOnce(&[u8]) -> Option<Vec<u8>>) -
 
 /// Accumulated session usage harvested from upstream frames.
 #[derive(Default)]
-struct SessionUsage {
+pub(crate) struct SessionUsage {
     seen_facts: HashSet<String>,
     cache_missing: bool,
     input_tokens: u64,
@@ -1396,12 +1397,25 @@ struct SessionUsage {
 }
 
 impl SessionUsage {
+    pub(crate) fn has_reports(&self) -> bool {
+        self.responses > 0
+    }
+
+    pub(crate) fn apply_to(&self, event: &mut UsageEvent) {
+        event.prompt_tokens = self.input_tokens.min(u64::from(u32::MAX)) as u32;
+        event.completion_tokens = self.output_tokens.min(u64::from(u32::MAX)) as u32;
+        event.cached_prompt_tokens = self.cached_tokens.min(u64::from(u32::MAX)) as u32;
+        event.total_tokens = self.upstream_total.recorded();
+        event.cache_usage_reported = Some(self.responses > 0 && !self.cache_missing);
+        event.modality_tokens = self.modality;
+    }
+
     #[cfg(test)]
     fn absorb(&mut self, text: &str) {
         self.absorb_frame(&Frame::new(text.as_bytes()), false);
     }
 
-    fn absorb_frame(&mut self, frame: &Frame<'_>, secondary: bool) {
+    pub(crate) fn absorb_frame(&mut self, frame: &Frame<'_>, secondary: bool) {
         if !matches!(
             frame.kind(),
             Kind::ResponseDone | Kind::TranscriptionCompleted
@@ -1824,7 +1838,7 @@ async fn run_session(
         upstream_provider: _,
         provider_label,
     } = prep;
-    let mut renewal = journal.as_ref().map(|journal| journal.lease_renewal());
+    let mut renewal = journal.as_ref().and_then(|journal| journal.lease_renewal());
     let canonical = journal.as_ref().is_some_and(|journal| journal.canonical());
     let emit_usage = if canonical {
         crate::usage_attr::emit_usage_observation
@@ -2256,7 +2270,9 @@ async fn run_session(
         drop(inspected_frame);
         if let Some(result) = prepared {
             if let (Some(journal), Some(renewal)) = (journal.as_ref(), renewal.as_mut()) {
-                renewal.confirmed_expiry(journal.lease_expires_at());
+                if let Some(expiry) = journal.lease_expires_at() {
+                    renewal.confirmed_expiry(expiry);
+                }
             }
             if let Some(ack) = journal
                 .as_ref()
@@ -2707,7 +2723,7 @@ async fn run_session(
     let mut event = UsageEvent {
         io_audit: Some(io.finish()),
         request_id: request_id.clone(),
-        native_operation_id: journal.as_ref().map(|journal| journal.operation_id()),
+        native_operation_id: journal.as_ref().and_then(|journal| journal.operation_id()),
         occurred_at: aisix_obs::UsageEvent::occurred_at_now(),
         model_id: model_entry.id.clone(),
         api_key_id: auth.entry.id.clone(),
@@ -2772,6 +2788,18 @@ async fn run_session(
     let content = refusal_frame
         .as_deref()
         .and_then(|frame| upstream_failure_content(&snap, frame.as_bytes()));
+    let billing_rows = if canonical {
+        Vec::new()
+    } else {
+        journal
+            .as_ref()
+            .map_or_else(Vec::new, |journal| journal.billing_rows(&event))
+    };
+    let emit_usage = if billing_rows.is_empty() {
+        emit_usage
+    } else {
+        crate::usage_attr::emit_usage_observation
+    };
     emit_usage(
         &state,
         &snap,
@@ -2783,6 +2811,18 @@ async fn run_session(
         /* terminal */ true,
         /* dispatched */ true,
     );
+    for (snapshot, row) in billing_rows {
+        let row_pk = crate::usage_attr::ResolvedPk::resolve(&snapshot, &pk_id);
+        let label = crate::usage_attr::usage_event_model_label(&snapshot, &row.requested_model)
+            .into_owned();
+        crate::usage_attr::emit_usage_billing(
+            &state,
+            &snapshot,
+            crate::operation::REALTIME,
+            row,
+            crate::usage_attr::usage_event_labels(&label, &row_pk),
+        );
+    }
 }
 
 /// The response column of a failure row, under a full-content export only.

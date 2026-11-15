@@ -29,24 +29,23 @@ use crate::state::ProxyState;
 
 pub(crate) struct Journal {
     endpoint: &'static str,
-    registry: Arc<dyn NativeObjectRegistry>,
-    authority: LiveUsageAuthority,
-    api_key_id: Uuid,
-    lease: LiveSessionLease,
-    lease_expires_at: DateTime<Utc>,
-    deadline_at: DateTime<Utc>,
+    persistence: Option<Persistence>,
     upstream_model: String,
     transcription: bool,
     pending: VecDeque<AppendLiveUsageRequest>,
     state: ProxyState,
     auth: AuthenticatedKey,
     client: ClientContext,
-    origin: OriginBinding,
+    origin: Option<OriginBinding>,
+    provider_key_id: String,
     entries: HashMap<String, AsrEntry>,
     held_model_keys: Vec<String>,
     model_reservations: Vec<aisix_ratelimit::MultiReservation>,
     seen_asr: HashSet<String>,
     secondary_cost_usd: f64,
+    primary_snapshot: Arc<aisix_core::AisixSnapshot>,
+    primary_usage: crate::realtime::SessionUsage,
+    primary_event_id: String,
     active_asr: Option<String>,
     configured_asr: Option<Option<String>>,
     configuration_ack: &'static str,
@@ -54,11 +53,30 @@ pub(crate) struct Journal {
     items: HashMap<(String, u64), String>,
 }
 
+struct Persistence {
+    registry: Arc<dyn NativeObjectRegistry>,
+    authority: LiveUsageAuthority,
+    api_key_id: Uuid,
+    lease: LiveSessionLease,
+    lease_expires_at: DateTime<Utc>,
+    deadline_at: DateTime<Utc>,
+}
+
+struct AcceptedAsr {
+    entry_id: String,
+    requested_model: String,
+    upstream_model: String,
+}
+
 struct AsrEntry {
-    accepted: NativeEntry,
+    accepted: AcceptedAsr,
     model: Arc<aisix_core::ResourceEntry<aisix_core::Model>>,
     pk_id: String,
     token_keys: Vec<String>,
+    snapshot: Arc<aisix_core::AisixSnapshot>,
+    usage: crate::realtime::SessionUsage,
+    event_id: String,
+    cost_usd: f64,
 }
 
 /// 同一会话只持有一个续租 future；轮询被音频抢占时请求仍保留，不阻塞转发。
@@ -167,6 +185,7 @@ impl Journal {
         auth: &AuthenticatedKey,
         origin: Option<&OriginBinding>,
         model_id: &str,
+        provider_key_id: &str,
         requested_model: &str,
         upstream_model: &str,
         provider: &str,
@@ -177,6 +196,60 @@ impl Journal {
         held_model_keys: Vec<String>,
         endpoint: &'static str,
     ) -> Result<Option<Self>, ProxyError> {
+        let persistence = Self::admit_persistence(
+            state,
+            auth,
+            origin,
+            model_id,
+            requested_model,
+            upstream_model,
+            provider,
+            request_id,
+            credential,
+            purpose,
+        )
+        .await?;
+        let origin = persistence.as_ref().and_then(|_| origin.cloned());
+        Ok(Some(Self {
+            endpoint,
+            persistence,
+            upstream_model: upstream_model.to_owned(),
+            transcription: purpose == RealtimePurpose::Transcription,
+            pending: VecDeque::new(),
+            state: state.clone(),
+            auth: auth.clone(),
+            client: client.clone(),
+            origin,
+            provider_key_id: provider_key_id.to_owned(),
+            entries: HashMap::new(),
+            held_model_keys,
+            model_reservations: Vec::new(),
+            seen_asr: HashSet::new(),
+            secondary_cost_usd: 0.0,
+            primary_snapshot: state.snapshot.load(),
+            primary_usage: crate::realtime::SessionUsage::default(),
+            primary_event_id: Uuid::new_v4().to_string(),
+            active_asr: None,
+            configured_asr: None,
+            configuration_ack: "session.updated",
+            committed: VecDeque::new(),
+            items: HashMap::new(),
+        }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn admit_persistence(
+        state: &ProxyState,
+        auth: &AuthenticatedKey,
+        origin: Option<&OriginBinding>,
+        model_id: &str,
+        requested_model: &str,
+        upstream_model: &str,
+        provider: &str,
+        request_id: &str,
+        credential: Option<&NativeCredential>,
+        purpose: RealtimePurpose,
+    ) -> Result<Option<Persistence>, ProxyError> {
         let Some(registry) = state.native_objects.as_ref() else {
             return if credential.is_some() {
                 Err(ProxyError::AccountUnavailable)
@@ -192,7 +265,7 @@ impl Journal {
                 Ok(None)
             };
         }
-        // 动态来源将走独立的只观察证明；不能冒充已配置静态账号来源。
+        // 动态来源保留旧 aggregate；不能冒充已配置的静态账号。
         let Some(origin) = origin else {
             return if credential.is_some() {
                 Err(ProxyError::AccountUnavailable)
@@ -264,64 +337,84 @@ impl Journal {
         {
             return Err(ProxyError::AccountUnavailable);
         }
-        Ok(Some(Self {
-            endpoint,
+        Ok(Some(Persistence {
             registry: Arc::clone(registry),
             authority,
             api_key_id,
             lease,
             lease_expires_at,
             deadline_at,
-            upstream_model: upstream_model.to_owned(),
-            transcription: purpose == RealtimePurpose::Transcription,
-            pending: VecDeque::new(),
-            state: state.clone(),
-            auth: auth.clone(),
-            client: client.clone(),
-            origin: origin.clone(),
-            entries: HashMap::new(),
-            held_model_keys,
-            model_reservations: Vec::new(),
-            seen_asr: HashSet::new(),
-            secondary_cost_usd: 0.0,
-            active_asr: None,
-            configured_asr: None,
-            configuration_ack: "session.updated",
-            committed: VecDeque::new(),
-            items: HashMap::new(),
         }))
     }
 
     pub(crate) fn canonical(&self) -> bool {
-        self.authority == LiveUsageAuthority::CanonicalJournal
+        self.persistence
+            .as_ref()
+            .is_some_and(|p| p.authority == LiveUsageAuthority::CanonicalJournal)
     }
 
-    pub(crate) fn operation_id(&self) -> Uuid {
-        self.lease.operation_id
+    pub(crate) fn operation_id(&self) -> Option<Uuid> {
+        self.persistence.as_ref().map(|p| p.lease.operation_id)
     }
 
-    pub(crate) fn lease_expires_at(&self) -> DateTime<Utc> {
-        self.lease_expires_at
+    pub(crate) fn lease_expires_at(&self) -> Option<DateTime<Utc>> {
+        self.persistence.as_ref().map(|p| p.lease_expires_at)
     }
 
-    pub(crate) fn lease_renewal(&self) -> LeaseRenewal {
-        let deadline_at = LeaseRenewal::instant(self.deadline_at);
+    pub(crate) fn lease_renewal(&self) -> Option<LeaseRenewal> {
+        let p = self.persistence.as_ref()?;
+        let deadline_at = LeaseRenewal::instant(p.deadline_at);
         let first = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut interval = tokio::time::interval_at(first, std::time::Duration::from_secs(10));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        LeaseRenewal {
-            registry: Arc::clone(&self.registry),
-            lease: self.lease.clone(),
-            api_key_id: self.api_key_id,
-            expires_at: LeaseRenewal::instant(self.lease_expires_at).min(deadline_at),
+        Some(LeaseRenewal {
+            registry: Arc::clone(&p.registry),
+            lease: p.lease.clone(),
+            api_key_id: p.api_key_id,
+            expires_at: LeaseRenewal::instant(p.lease_expires_at).min(deadline_at),
             deadline_at,
             interval,
             pending: None,
-        }
+        })
     }
 
     pub(crate) fn secondary_cost_usd(&self) -> f64 {
         self.secondary_cost_usd
+    }
+
+    /// 无持久来源仍沿原 aggregate 队列；不同真实模型不能再合并按主模型计价。
+    pub(crate) fn billing_rows(
+        &self,
+        summary: &aisix_obs::UsageEvent,
+    ) -> Vec<(Arc<aisix_core::AisixSnapshot>, aisix_obs::UsageEvent)> {
+        if !self.entries.values().any(|entry| entry.usage.has_reports()) {
+            return Vec::new();
+        }
+        let mut rows = Vec::new();
+        if self.primary_usage.has_reports() {
+            let mut row = summary.clone();
+            self.primary_usage.apply_to(&mut row);
+            row.event_id = self.primary_event_id.clone();
+            row.io_audit = None;
+            row.cost_usd = (summary.cost_usd - self.secondary_cost_usd).max(0.0);
+            rows.push((Arc::clone(&self.primary_snapshot), row));
+        }
+        for entry in self
+            .entries
+            .values()
+            .filter(|entry| entry.usage.has_reports())
+        {
+            let mut row = summary.clone();
+            entry.usage.apply_to(&mut row);
+            row.event_id = entry.event_id.clone();
+            row.io_audit = None;
+            row.model_id = entry.model.id.clone();
+            row.requested_model_id = entry.model.id.clone();
+            row.requested_model = entry.accepted.requested_model.clone();
+            row.cost_usd = entry.cost_usd;
+            rows.push((Arc::clone(&entry.snapshot), row));
+        }
+        rows
     }
 
     fn asr_entry(&self, event: &Value) -> Option<&AsrEntry> {
@@ -440,34 +533,71 @@ impl Journal {
         };
         let snapshot = self.state.snapshot.load();
         let current = super::openai::current_auth(&snapshot, &self.auth)?;
-        let (target, actual) = crate::attribution::detached(async {
-            super::openai::resolve_for_requested(
-                &self.state,
+        let (model, pk, actual) = if let Some(origin) = self.origin.as_ref() {
+            let (target, actual) = crate::attribution::detached(async {
+                super::openai::resolve_for_requested(
+                    &self.state,
+                    &snapshot,
+                    &current,
+                    &self.client,
+                    wanted,
+                    wanted,
+                    NativeObjectKind::RealtimeCall,
+                )
+            })
+            .await?;
+            if !super::skills::same_account(origin, &actual) {
+                return Err(super::skills::not_found());
+            }
+            (target.model_entry, target.pk_entry, Some(actual))
+        } else {
+            // 本地 ASR 准入独立于持久来源；仍只使用已打开套接字的账号。
+            crate::endpoint_acl::check_endpoint(
+                current.key(),
+                aisix_core::models::EndpointFamily::Realtime,
+            )?;
+            if !current.key().can_access(&snapshot, wanted) {
+                return Err(ProxyError::ModelForbidden(wanted.to_owned()));
+            }
+            let model = crate::model_resolve::resolve_model(&snapshot, wanted)
+                .ok_or_else(|| ProxyError::ModelNotFound(wanted.to_owned()))?;
+            if model.value.is_routing() || model.value.is_ensemble() || model.value.is_semantic() {
+                return Err(ProxyError::InvalidRequest(
+                    "Realtime ASR requires a direct model".into(),
+                ));
+            }
+            if !crate::routing::target_in_groups(
                 &snapshot,
-                &current,
-                &self.client,
-                wanted,
-                wanted,
-                NativeObjectKind::RealtimeCall,
-            )
-        })
-        .await?;
-        if !super::skills::same_account(&self.origin, &actual) {
-            return Err(super::skills::not_found());
-        }
+                &model.value,
+                &current.key().allowed_provider_groups,
+            ) {
+                return Err(crate::routing::no_target_in_groups(wanted));
+            }
+            crate::dispatch::check_ip_access(&model.value, &self.client.source_ip)?;
+            let pk = crate::dispatch::resolve_provider_key(&snapshot, &model.value)?;
+            if pk.id != self.provider_key_id {
+                return Err(ProxyError::AccountUnavailable);
+            }
+            crate::budget::gate(&self.state, &snapshot).check_provider_key(&pk.id)?;
+            (model, pk, None)
+        };
         crate::budget::enforce_key(&self.state, &snapshot, &current)?;
-        let upstream_model =
-            crate::dispatch::require_upstream_model(&target.model_entry.value)?.to_owned();
-        let entry_id = format!("asr:{:x}", Sha256::digest(wanted.as_bytes()));
+        let upstream_model = crate::dispatch::require_upstream_model(&model.value)?.to_owned();
+        let mut identity = Sha256::new();
+        for field in [wanted, model.id.as_str(), upstream_model.as_str()] {
+            identity.update((field.len() as u64).to_be_bytes());
+            identity.update(field.as_bytes());
+        }
+        identity.update(model.revision.to_be_bytes());
+        let entry_id = format!("asr:{:x}", identity.finalize());
+        if self.entries.len() >= 128 && !self.entries.contains_key(&entry_id) {
+            return Err(ProxyError::AccountUnavailable);
+        }
         crate::quota::check_realtime_tokens(
             &self.state,
             &snapshot,
             &current,
-            &crate::quota::ModelRateLimit::from_model(
-                wanted,
-                &target.model_entry.id,
-                &target.model_entry.value,
-            ),
+            &crate::quota::ModelRateLimit::from_model(wanted, &model.id, &model.value),
             false,
         )
         .await?;
@@ -479,51 +609,53 @@ impl Journal {
                 &snapshot,
                 &current,
                 wanted,
-                &target.model_entry.id,
-                &target.model_entry.value,
+                &model.id,
+                &model.value,
                 &self.held_model_keys,
             )
             .await?;
             (Some(reservation), keys)
         };
-        let entry = NativeEntry {
-            upstream_input_text: None,
-            endpoint: "/v1/audio/transcriptions".to_owned(),
-            entry_id: entry_id.clone(),
-            requested_model: wanted.to_owned(),
-            requested_service_tier: None,
-            requested_model_id: super::openai::resource_id(
-                &self.state,
-                "models",
-                &target.model_entry.id,
-            )?,
-            model_id: actual.model_id,
-            upstream_model: upstream_model.clone(),
-            upstream_provider: target.pk_entry.value.provider.clone(),
-        };
-        let reply = self
-            .registry
-            .checkpoint_live_session(CheckpointLiveSessionRequest {
-                lease: self.lease.clone(),
-                terminal: false,
-                coverage: UsageCoverage::Partial,
-                entries: vec![entry.clone()],
+        let native = if let Some(actual) = actual {
+            Some(NativeEntry {
+                upstream_input_text: None,
+                endpoint: "/v1/audio/transcriptions".to_owned(),
+                entry_id: entry_id.clone(),
+                requested_model: wanted.to_owned(),
+                requested_service_tier: None,
+                requested_model_id: super::openai::resource_id(&self.state, "models", &model.id)?,
+                model_id: actual.model_id,
+                upstream_model: upstream_model.clone(),
+                upstream_provider: pk.value.provider.clone(),
             })
-            .await
-            .map_err(proxy_error)?;
-        let live = reply
-            .live_session
-            .as_ref()
-            .ok_or(ProxyError::AccountUnavailable)?;
-        if live.operation_id != self.lease.operation_id
-            || live.api_key_id != self.api_key_id
-            || live.lease.as_ref() != Some(&self.lease)
-            || live.requires_stop
-        {
-            return Err(ProxyError::InvalidApiKey);
-        }
-        if let Some(expiry) = live.lease_expires_at {
-            self.lease_expires_at = self.lease_expires_at.max(expiry);
+        } else {
+            None
+        };
+        if let (Some(p), Some(entry)) = (self.persistence.as_mut(), native.as_ref()) {
+            let reply = p
+                .registry
+                .checkpoint_live_session(CheckpointLiveSessionRequest {
+                    lease: p.lease.clone(),
+                    terminal: false,
+                    coverage: UsageCoverage::Partial,
+                    entries: vec![entry.clone()],
+                })
+                .await
+                .map_err(proxy_error)?;
+            let live = reply
+                .live_session
+                .as_ref()
+                .ok_or(ProxyError::AccountUnavailable)?;
+            if live.operation_id != p.lease.operation_id
+                || live.api_key_id != p.api_key_id
+                || live.lease.as_ref() != Some(&p.lease)
+                || live.requires_stop
+            {
+                return Err(ProxyError::InvalidApiKey);
+            }
+            if let Some(expiry) = live.lease_expires_at {
+                p.lease_expires_at = p.lease_expires_at.max(expiry);
+            }
         }
         if let Some(reservation) = reservation {
             self.held_model_keys.extend(reservation.keys());
@@ -531,15 +663,22 @@ impl Journal {
             self.held_model_keys.dedup();
             self.model_reservations.push(reservation);
         }
-        self.entries.insert(
-            entry_id.clone(),
-            AsrEntry {
-                accepted: entry,
-                model: Arc::clone(&target.model_entry),
-                pk_id: target.pk_entry.id.clone(),
+        self.entries
+            .entry(entry_id.clone())
+            .or_insert_with(|| AsrEntry {
+                accepted: AcceptedAsr {
+                    entry_id: entry_id.clone(),
+                    requested_model: wanted.to_owned(),
+                    upstream_model: upstream_model.clone(),
+                },
+                model: Arc::clone(&model),
+                pk_id: pk.id.clone(),
                 token_keys,
-            },
-        );
+                snapshot: Arc::clone(&snapshot),
+                usage: crate::realtime::SessionUsage::default(),
+                event_id: Uuid::new_v4().to_string(),
+                cost_usd: 0.0,
+            });
         self.configured_asr = Some(Some(entry_id));
         if let Some(slot) = event.pointer_mut(&format!("{pointer}/model")) {
             *slot = Value::String(upstream_model);
@@ -612,7 +751,7 @@ impl Journal {
         Ok(())
     }
 
-    fn observe_asr_meter(&mut self, event: &Value) -> Result<(), ProxyError> {
+    fn observe_asr_meter(&mut self, frame: &Frame<'_>, event: &Value) -> Result<(), ProxyError> {
         if event["type"].as_str() != Some("conversation.item.input_audio_transcription.completed")
             || self.asr_entry(event).is_none()
         {
@@ -638,7 +777,7 @@ impl Journal {
             self.state
                 .limiter
                 .add_tokens_post_stream_all(&entry.token_keys, input + output);
-            let snapshot = self.state.snapshot.load();
+            let snapshot = Arc::clone(&entry.snapshot);
             let pk = crate::usage_attr::ResolvedPk::resolve(&snapshot, &entry.pk_id);
             crate::request_metrics::record_usage(
                 &self.state,
@@ -678,7 +817,12 @@ impl Journal {
                     )
                 })
                 .unwrap_or(0.0);
+            let entry_id = entry.accepted.entry_id.clone();
             self.secondary_cost_usd += cost;
+            if let Some(entry) = self.entries.get_mut(&entry_id) {
+                entry.cost_usd += cost;
+                entry.usage.absorb_frame(frame, false);
+            }
         }
         Ok(())
     }
@@ -700,7 +844,14 @@ impl Journal {
             return Ok(true);
         };
         self.observe_configuration(event)?;
-        self.observe_asr_meter(event)?;
+        let secondary = self.is_secondary_fact(frame);
+        self.observe_asr_meter(frame, event)?;
+        if !secondary {
+            self.primary_usage.absorb_frame(frame, false);
+        }
+        let Some(p) = self.persistence.as_ref() else {
+            return Ok(true);
+        };
         if event["type"].as_str() == Some("conversation.item.input_audio_transcription.completed") {
             let identity = event["item_id"]
                 .as_str()
@@ -743,8 +894,8 @@ impl Journal {
                 _ => Utc::now(),
             };
             self.pending.push_back(AppendLiveUsageRequest {
-                operation_id: self.lease.operation_id,
-                api_key_id: self.api_key_id,
+                operation_id: p.lease.operation_id,
+                api_key_id: p.api_key_id,
                 event_id: fact.clone(),
                 response_id: Some(fact),
                 usage: vec![ObservedUsage {
@@ -756,7 +907,7 @@ impl Journal {
                 coverage: UsageCoverage::Complete,
                 terminal: false,
                 raw_usage: Some(event["usage"].clone()),
-                lease: Some(self.lease.clone()),
+                lease: Some(p.lease.clone()),
             });
             return Ok(true);
         }
@@ -777,15 +928,15 @@ impl Journal {
         if id.is_none() || measured.is_none() {
             // SDK 的 response.id 可缺失；只保存待对账观察，不虚构收费事实或拒掉旧 WS。
             self.pending.push_back(AppendLiveUsageRequest {
-                operation_id: self.lease.operation_id,
-                api_key_id: self.api_key_id,
+                operation_id: p.lease.operation_id,
+                api_key_id: p.api_key_id,
                 event_id: format!("gateway-observation:{}", Uuid::new_v4()),
                 response_id: None,
                 usage: Vec::new(),
                 coverage: UsageCoverage::Unknown,
                 terminal: false,
                 raw_usage: Some(usage.clone()),
-                lease: Some(self.lease.clone()),
+                lease: Some(p.lease.clone()),
             });
             return Ok(true);
         }
@@ -794,8 +945,8 @@ impl Journal {
         };
         let at = measured.occurred_at;
         self.pending.push_back(AppendLiveUsageRequest {
-            operation_id: self.lease.operation_id,
-            api_key_id: self.api_key_id,
+            operation_id: p.lease.operation_id,
+            api_key_id: p.api_key_id,
             event_id: format!("response:{id}"),
             response_id: Some(id.to_owned()),
             usage: vec![ObservedUsage {
@@ -807,25 +958,28 @@ impl Journal {
             coverage: UsageCoverage::Complete,
             terminal: false,
             raw_usage: Some(usage.clone()),
-            lease: Some(self.lease.clone()),
+            lease: Some(p.lease.clone()),
         });
         Ok(true)
     }
 
     fn unknown_usage(&mut self, usage: &Value) -> Result<bool, ProxyError> {
+        let Some(p) = self.persistence.as_ref() else {
+            return Ok(true);
+        };
         if !usage.is_object() {
             return Ok(true);
         }
         self.pending.push_back(AppendLiveUsageRequest {
-            operation_id: self.lease.operation_id,
-            api_key_id: self.api_key_id,
+            operation_id: p.lease.operation_id,
+            api_key_id: p.api_key_id,
             event_id: format!("gateway-observation:{}", Uuid::new_v4()),
             response_id: None,
             usage: Vec::new(),
             coverage: UsageCoverage::Unknown,
             terminal: false,
             raw_usage: Some(usage.clone()),
-            lease: Some(self.lease.clone()),
+            lease: Some(p.lease.clone()),
         });
         Ok(true)
     }
@@ -836,13 +990,16 @@ impl Journal {
 
     /// 已读到的事实先入队；未知追加结果只重试原稳定身份，不能退回会话汇总收费。
     pub(crate) async fn flush(&mut self) -> Result<(), ProxyError> {
+        let Some(p) = self.persistence.as_ref() else {
+            return Ok(());
+        };
         while let Some(request) = self.pending.front().cloned() {
-            let registry = Arc::clone(&self.registry);
+            let registry = Arc::clone(&p.registry);
             let reply = registry
                 .append_live_usage(request)
                 .await
                 .map_err(proxy_error)?;
-            if reply.operation_id != Some(self.lease.operation_id) || reply.appended.is_none() {
+            if reply.operation_id != Some(p.lease.operation_id) || reply.appended.is_none() {
                 return Err(ProxyError::AccountUnavailable);
             }
             self.pending.pop_front();
@@ -864,9 +1021,12 @@ impl Journal {
         })
         .await
         .unwrap_or(Err(ProxyError::AccountUnavailable));
+        let Some(p) = self.persistence.as_ref() else {
+            return persisted;
+        };
         if persisted.is_err() {
             tracing::warn!(
-                operation_id = %self.lease.operation_id,
+                operation_id = %p.lease.operation_id,
                 pending_facts = self.pending.len(),
                 reason = "usage_persistence_unavailable",
                 "realtime closing usage remains unconfirmed"
@@ -875,9 +1035,9 @@ impl Journal {
         // 即使追加失败也尝试收束 Unknown；不得把未确认的 RAM 数量称为已持久或零费用。
         let closed = tokio::time::timeout(
             std::time::Duration::from_secs(8),
-            self.registry
+            p.registry
                 .checkpoint_live_session(CheckpointLiveSessionRequest {
-                    lease: self.lease.clone(),
+                    lease: p.lease.clone(),
                     terminal: true,
                     coverage: UsageCoverage::Unknown,
                     entries: Vec::new(),

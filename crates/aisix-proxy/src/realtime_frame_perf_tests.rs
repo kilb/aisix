@@ -52,6 +52,7 @@ mod frame_allocation {
             &prepared.auth,
             prepared.voice_origin.as_ref(),
             &prepared.model_entry.id,
+            &prepared.pk_id,
             &prepared.requested_model,
             &prepared.upstream_model,
             &prepared.upstream_provider,
