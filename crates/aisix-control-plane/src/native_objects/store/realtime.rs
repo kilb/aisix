@@ -641,11 +641,7 @@ pub(super) async fn append(
         }
         return Ok(live_reply(&row, Some(false)));
     }
-    let at = now(&mut *conn).await?;
-    // 收到的尾量仍可在 close 后补记；失效租约必须先由恢复者重新领取。
-    if row.lease_expires_at <= at && row.state != "closed" {
-        return Err(ApiError::not_found());
-    }
+    // 已接受的尾量保留原 holder/generation；新工作和续租仍由 checkpoint/claim 裁决。
     let op = operation(&mut *conn, state, body.operation_id, false).await?;
     let mut submitted = submission(&op)?;
     require_live_submission(&submitted)?;
