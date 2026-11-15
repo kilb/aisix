@@ -1552,6 +1552,21 @@ impl UsageSink {
     /// eventually be wrong.
     pub fn try_emit(&self, handler: &'static str, event: UsageEvent, labels: UsageEventLabels<'_>) {
         let event = self.observe_only(handler, event);
+        self.enqueue(handler, event, labels);
+    }
+
+    /// 仅提交已单独观察过的计费分项，不重复供应商日志或 exporter。
+    pub fn try_enqueue_only(
+        &self,
+        handler: &'static str,
+        mut event: UsageEvent,
+        labels: UsageEventLabels<'_>,
+    ) {
+        event.cache_creation_ttl = event.settled_cache_creation_ttl();
+        self.enqueue(handler, event, labels);
+    }
+
+    fn enqueue(&self, handler: &'static str, event: UsageEvent, labels: UsageEventLabels<'_>) {
         // Owned because `event` is moved into the channel below while the
         // drop counter still needs the labels.
         let user_id = event.user_id.clone();
@@ -2028,6 +2043,103 @@ mod tests {
                     || line.starts_with("aisix_usage_event_drops_total{")
             }),
             "no control-plane queue intent or invented drop: {scrape}"
+        );
+    }
+
+    #[test]
+    fn billing_only_keeps_distinct_real_rows_without_repeating_provider_log() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let metrics = crate::metrics::Metrics::new(false);
+        let sink = UsageSink::new(tx).with_metrics(metrics.clone());
+        let mut a = sample_event("same-session");
+        a.event_id = "session-model-a".into();
+        a.provider_request_id = "provider-session".into();
+        a.prompt_tokens = 10;
+        a.completion_tokens = 3;
+        a.cached_prompt_tokens = 2;
+        a.total_tokens = 13;
+        let mut b = a.clone();
+        b.event_id = "session-model-b".into();
+        b.model_id = "model-b".into();
+        b.prompt_tokens = 5;
+        b.completion_tokens = 1;
+        b.total_tokens = 6;
+        b.modality_tokens.prompt_audio_tokens = Some(5);
+        b.modality_tokens.prompt_image_tokens = Some(0);
+        b.modality_tokens.completion_image_tokens = None;
+        let expected_b = serde_json::to_value(&b).unwrap();
+        let output = capture_logs(|| {
+            let _ = sink.observe_only("realtime", a.clone());
+            sink.try_enqueue_only("realtime", a, UsageEventLabels::default());
+            sink.try_enqueue_only("realtime", b, UsageEventLabels::default());
+        });
+        assert_eq!(
+            output
+                .lines()
+                .filter(|line| line.contains("provider call completed"))
+                .count(),
+            1
+        );
+        let a = rx.try_recv().expect("primary actual queue row");
+        let b = rx.try_recv().expect("secondary actual queue row");
+        assert_eq!(a.event_id, "session-model-a");
+        assert_eq!(serde_json::to_value(b).unwrap(), expected_b);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(metrics
+            .render()
+            .lines()
+            .any(|line| line.starts_with("aisix_usage_events_emitted_total{")
+                && line.ends_with(" 2")));
+    }
+
+    #[test]
+    fn billing_only_reports_actual_full_closed_and_disabled_queue_outcomes() {
+        let metrics = crate::metrics::Metrics::new(false);
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let sink = UsageSink::new(tx).with_metrics(metrics.clone());
+        sink.try_enqueue_only(
+            "realtime",
+            sample_event("first"),
+            UsageEventLabels::default(),
+        );
+        sink.try_enqueue_only(
+            "realtime",
+            sample_event("full"),
+            UsageEventLabels::default(),
+        );
+        drop(rx);
+        sink.try_enqueue_only(
+            "realtime",
+            sample_event("closed"),
+            UsageEventLabels::default(),
+        );
+        UsageSink::disabled()
+            .with_metrics(metrics.clone())
+            .try_enqueue_only(
+                "realtime",
+                sample_event("disabled"),
+                UsageEventLabels::default(),
+            );
+        let scrape = metrics.render();
+        for reason in ["sink_full", "sink_closed", "sink_disabled"] {
+            assert!(
+                scrape
+                    .lines()
+                    .any(|line| line.starts_with("aisix_usage_event_drops_total{")
+                        && line.contains(reason)
+                        && line.ends_with(" 1")),
+                "{reason}: {scrape}"
+            );
+        }
+        assert!(
+            scrape
+                .lines()
+                .any(|line| line.starts_with("aisix_usage_events_emitted_total{")
+                    && line.ends_with(" 1")),
+            "{scrape}"
         );
     }
 

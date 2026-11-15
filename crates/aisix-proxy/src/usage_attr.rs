@@ -1694,10 +1694,38 @@ pub(crate) fn emit_usage_observation(
     );
 }
 
+/// 会话汇总已观察一次；按真实接受模型拆分的量只进入原计费队列。
+/// 复用字段准备和延迟发布，不重复请求终态、供应商日志或 exporter。
+pub(crate) fn emit_usage_billing(
+    state: &ProxyState,
+    snap: &AisixSnapshot,
+    surface: Surface,
+    mut event: UsageEvent,
+    labels: UsageEventLabels<'_>,
+) {
+    stamp_requested_model_id(&mut event);
+    stamp_billing_fields(snap, &mut event, labels.provider_key_id);
+    let event = prepare_usage_event_fields(surface, event, true, true);
+    let exporters = live_exporters(state, snap);
+    deliver_usage(
+        state,
+        surface,
+        event,
+        labels,
+        None,
+        None,
+        None,
+        &exporters,
+        true,
+        UsageDelivery::ControlPlaneOnly,
+    );
+}
+
 #[derive(Clone, Copy)]
 enum UsageDelivery {
     ControlPlaneAndExporters,
     ExportersOnly,
+    ControlPlaneOnly,
 }
 
 impl UsageDelivery {
@@ -1714,6 +1742,10 @@ impl UsageDelivery {
                 event
             }
             Self::ExportersOnly => sink.observe_only(handler, event),
+            Self::ControlPlaneOnly => {
+                sink.try_enqueue_only(handler, event.clone(), labels);
+                event
+            }
         }
     }
 }
@@ -2313,7 +2345,7 @@ impl PendingUsage {
         let event = self
             .delivery
             .publish(&self.sink, self.surface.handler, self.event, labels);
-        if !exporters.is_empty() {
+        if !matches!(self.delivery, UsageDelivery::ControlPlaneOnly) && !exporters.is_empty() {
             self.fan_out.fan_out(
                 &event,
                 self.content.as_ref(),
@@ -2372,7 +2404,7 @@ fn deliver_usage(
         return;
     }
     let event = delivery.publish(&state.usage_sink, surface.handler, event, labels);
-    if !exporters.is_empty() {
+    if !matches!(delivery, UsageDelivery::ControlPlaneOnly) && !exporters.is_empty() {
         state.otlp_fan_out.fan_out(
             &event,
             content,
