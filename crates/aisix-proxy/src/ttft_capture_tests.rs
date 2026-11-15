@@ -328,7 +328,8 @@ async fn native_messages_synthetic_json_has_no_upstream_ttft() {
     let mut payloads = Vec::<serde_json::Value>::new();
     let mut first_content = None;
     while let Some(chunk) = body.next().await {
-        for frame in decoder.feed(&chunk.unwrap()).unwrap() {
+        let chunk = chunk.unwrap();
+        for frame in decoder.feed(chunk.as_ref()).unwrap() {
             let SseEvent::Data(data) = frame else {
                 continue;
             };
