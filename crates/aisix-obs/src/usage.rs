@@ -806,7 +806,7 @@ pub struct UsageEvent {
     pub inbound_protocol: String,
 
     /// What the caller asked the gateway to DO, from a fixed set:
-    /// `batch_completion`, `batches`, `chat`, `completions`, `containers`,
+    /// `a2a`, `batch_completion`, `batches`, `chat`, `completions`, `containers`,
     /// `content_provenance_checks`, `conversations`, `count_tokens`, `decisions`, `embeddings`,
     /// `eval_completion`, `evals`, `files`, `fine_tuning`, `image_edit`,
     /// `image_generation`, `image_variation`, `mcp`, `messages`, `moderations`,
