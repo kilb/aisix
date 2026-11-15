@@ -198,7 +198,7 @@ impl Journal {
             };
         };
         let api_key_id = registry
-            .resource_id("api_keys", &auth.entry.id)
+            .resource_id("apikeys", &auth.entry.id)
             .map_err(proxy_error)?;
         let requested_model_id = registry
             .resource_id("models", model_id)
