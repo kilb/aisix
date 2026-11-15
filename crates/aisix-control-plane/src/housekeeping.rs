@@ -68,6 +68,8 @@ pub async fn run_once(db: &Db) -> Result<Pruned, DbError> {
     })
 }
 
+/// 先将租约和生命周期均已到期的 WS 观察收束为 Unknown；保留租约身份和已接受的计量事实。
+///
 /// One tick: the key documents an older release wrote are caught up
 /// ([`keys::catch_up`]), then every tenant without a billing account gets one
 /// ([`ledger::backfill_accounts`]: an older release, during a rolling
@@ -89,6 +91,11 @@ pub async fn run_once(db: &Db) -> Result<Pruned, DbError> {
 /// logged on its own so that one failing leaves the others to run. A tenant
 /// the gateway-version gate refuses is caught up by a later tick.
 pub async fn tick(db: &Db, ctx: &WriteCtx) {
+    match close_expired_realtime_sessions(db, ctx).await {
+        Ok(0) => {}
+        Ok(closed) => tracing::debug!(closed, "expired realtime observations closed"),
+        Err(_) => tracing::warn!("closing expired realtime observations failed"),
+    }
     match keys::catch_up(db, ctx, keys::KEY_DOC_VERSION).await {
         Ok(caught_up) => tracing::debug!(?caught_up, "key documents caught up"),
         Err(e) => tracing::warn!(code = e.code, "catching up key documents failed"),
@@ -108,6 +115,36 @@ pub async fn tick(db: &Db, ctx: &WriteCtx) {
     match run_once(db).await {
         Ok(pruned) => tracing::debug!(?pruned, "housekeeping pass"),
         Err(e) => tracing::warn!(error = %e, "a housekeeping pass failed"),
+    }
+}
+
+// WS 的原租约和生命周期均已结束时，只收束观察；不接管租约，也不推断完整用量。
+// 尚在生命周期内的过期租约仍由 claim 恢复；已接受的尾量仍可按原 holder/generation 追加。
+async fn close_expired_realtime_sessions(db: &Db, ctx: &WriteCtx) -> Result<u64, DbError> {
+    let mut total = 0;
+    loop {
+        // 每批只锁到期行，跳过正在 append/checkpoint/claim 的行，不拿账务或资源锁。
+        let closed = sqlx::query(
+            "WITH expired AS (\
+               SELECT environment_id,operation_id FROM native_live_sessions \
+               WHERE environment_id=$1 AND state<>'closed' AND transport='web_socket' \
+                 AND lease_expires_at<=statement_timestamp() AND deadline_at<=statement_timestamp() \
+               ORDER BY lease_expires_at,operation_id LIMIT 100 FOR UPDATE SKIP LOCKED\
+             ) \
+             UPDATE native_live_sessions live SET state='closed',coverage='unknown',\
+               accounting_state='awaiting_reconciliation',closed_at=statement_timestamp(),\
+               updated_at=statement_timestamp() \
+             FROM expired WHERE live.environment_id=expired.environment_id \
+               AND live.operation_id=expired.operation_id",
+        )
+        .bind(ctx.env.env_id)
+        .execute(db.pool())
+        .await?
+        .rows_affected();
+        total += closed;
+        if closed < 100 {
+            return Ok(total);
+        }
     }
 }
 
