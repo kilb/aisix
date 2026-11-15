@@ -958,9 +958,45 @@ pub(crate) async fn scan_input_blob(
     // 控制字段。
     redactions: Option<&mut crate::redact::RedactionCounts>,
 ) -> Result<Option<Vec<u8>>, ProxyError> {
+    scan_input_blob_for_entry(
+        state,
+        snapshot,
+        auth,
+        target,
+        blob,
+        monitor_hits,
+        enforced_hits,
+        scores,
+        bypass,
+        applied,
+        redactions,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn scan_input_blob_for_entry(
+    state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
+    auth: &AuthenticatedKey,
+    target: &JobTarget,
+    blob: &[u8],
+    monitor_hits: &mut Vec<aisix_core::GuardrailMonitorHit>,
+    enforced_hits: &mut Vec<aisix_core::GuardrailEnforcedHit>,
+    scores: &mut Vec<aisix_core::GuardrailScore>,
+    bypass: &mut String,
+    applied: &mut Vec<aisix_core::AppliedGuardrail>,
+    redactions: Option<&mut crate::redact::RedactionCounts>,
+    requested: Option<&ResourceEntry<Model>>,
+) -> Result<Option<Vec<u8>>, ProxyError> {
+    let (scope_id, model_name) = requested.map_or(
+        (target.model_entry.id.as_str(), target.display_name()),
+        |entry| (entry.id.as_str(), entry.value.display_name.as_str()),
+    );
     let ctx = aisix_guardrails::RequestContext {
         passthrough_route_id: "",
-        model_id: &target.model_entry.id,
+        model_id: scope_id,
         mcp_server_id: "",
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref(),
@@ -973,7 +1009,7 @@ pub(crate) async fn scan_input_blob(
         *applied = chain.applied().to_vec();
     }
     let chat = aisix_gateway::ChatFormat::new(
-        target.display_name(),
+        model_name,
         vec![aisix_gateway::ChatMessage::user(inspection_text(blob))],
     );
     let (verdict, hits) = if redactions.is_some() {
@@ -3181,31 +3217,123 @@ fn managed_current_target_for_consumer(
         openai::model_entry_by_id(state, snapshot, requested_id).map_err(|_| not_found())?;
     let direct =
         openai::model_entry_by_id(state, snapshot, origin.model_id).map_err(|_| not_found())?;
-    let (target, current) = match consumer_family {
-        Some(family) => openai::resolve_file_reference_for_requested(
+    let (target, current) = if requested.value.is_routing() {
+        openai::prepare_entry_origin(
             state,
             snapshot,
             auth,
             client,
-            &direct.value.display_name,
-            &requested.value.display_name,
-            family,
-        ),
-        None => openai::resolve_for_requested(
-            state,
-            snapshot,
-            auth,
-            client,
-            &direct.value.display_name,
+            &direct,
             &requested.value.display_name,
             kind,
-        ),
+            consumer_family,
+            consumer_family.is_none(),
+        )
+    } else {
+        match consumer_family {
+            Some(family) => openai::resolve_file_reference_for_requested(
+                state,
+                snapshot,
+                auth,
+                client,
+                &direct.value.display_name,
+                &requested.value.display_name,
+                family,
+            ),
+            None => openai::resolve_for_requested(
+                state,
+                snapshot,
+                auth,
+                client,
+                &direct.value.display_name,
+                &requested.value.display_name,
+                kind,
+            ),
+        }
     }
     .map_err(|_| not_found())?;
     if current != *origin {
         return Err(not_found());
     }
     Ok(target)
+}
+
+/// 只在文件已选定的账号内执行公开组的现有目标选择；后续提交复用已存绑定。
+fn managed_group_entry_target(
+    state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
+    auth: &AuthenticatedKey,
+    client: &ClientContext,
+    origin: &aisix_core::native_objects::OriginBinding,
+    requested: &Arc<ResourceEntry<Model>>,
+    consumer_family: Option<aisix_core::models::EndpointFamily>,
+) -> Result<(JobTarget, aisix_core::native_objects::OriginBinding), ProxyError> {
+    use crate::native_api::openai;
+    use aisix_core::native_objects::NativeObjectKind;
+    let current = openai::current_auth(snapshot, auth)?;
+    if !current
+        .key()
+        .can_call(consumer_family.unwrap_or(NativeObjectKind::File.endpoint_family()))
+    {
+        return Err(ProxyError::JobResourceNotFound("native object".into()));
+    }
+    state
+        .native_origin_key()
+        .ok_or(ProxyError::AccountUnavailable)?;
+    if !current
+        .key()
+        .can_access(snapshot, &requested.value.display_name)
+    {
+        return Err(ProxyError::ModelForbidden(
+            requested.value.display_name.clone(),
+        ));
+    }
+    crate::dispatch::check_ip_access(&requested.value, &client.source_ip)?;
+    let provider = openai::provider_entry_by_id(state, snapshot, origin.provider_key_id)?;
+    let same_account = |model: &Model| {
+        crate::dispatch::resolve_provider_key(snapshot, model)
+            .is_ok_and(|candidate| candidate.id == provider.id)
+    };
+    let budget = crate::budget::gate(state, snapshot);
+    let selected = crate::routing::resolve_attempt_models(
+        &state.routing,
+        &state.runtime_status,
+        &state.pricing,
+        snapshot,
+        &requested.value.display_name,
+        &requested.id,
+        &requested.value,
+        crate::routing::RoutingRequest {
+            tags: &client.routing_tags,
+            headers: Some(&client.headers),
+            api_key_id: &current.entry.id,
+            source_ip: &client.source_ip,
+            context_origin: None,
+            budget: Some(&budget),
+            serves: Some(&same_account),
+            allowed_groups: &current.key().allowed_provider_groups,
+        },
+    )?
+    .into_iter()
+    .next()
+    .ok_or_else(|| {
+        ProxyError::InvalidRequest("batch input models must share the selected account".into())
+    })?;
+    let selected = snapshot
+        .models
+        .get_by_id(&selected.id)
+        .ok_or_else(openai::dependency)?;
+    openai::prepare_entry_origin(
+        state,
+        snapshot,
+        &current,
+        client,
+        &selected,
+        &requested.value.display_name,
+        NativeObjectKind::File,
+        consumer_family,
+        consumer_family.is_none(),
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -3285,7 +3413,7 @@ async fn managed_batch_input<'a>(
                     .ok_or_else(openai::invalid_identity)
             })
             .transpose()?;
-        let (requested, target, entry_origin) = if let Some(saved) = saved {
+        let (requested, requested_entry, target, entry_origin) = if let Some(saved) = saved {
             if raw_model != saved.requested_model && raw_model != saved.upstream_model {
                 return Err(openai::invalid_identity());
             }
@@ -3293,18 +3421,39 @@ async fn managed_batch_input<'a>(
                 .map_err(|_| openai::dependency())?;
             let requested = openai::model_entry_by_id(state, snapshot, saved.requested_model_id)
                 .map_err(|_| openai::dependency())?;
-            let (target, origin) = openai::resolve_file_reference_for_requested(
-                state,
-                snapshot,
-                auth,
-                client,
-                &direct.value.display_name,
-                &requested.value.display_name,
-                aisix_core::models::EndpointFamily::Batches,
-            )?;
-            (saved.requested_model.clone(), target, origin)
+            let requested_entry = requested.value.is_routing().then(|| Arc::clone(&requested));
+            let (target, origin) = if let Some(requested) = requested_entry.as_ref() {
+                openai::prepare_entry_origin(
+                    state,
+                    snapshot,
+                    auth,
+                    client,
+                    &direct,
+                    &requested.value.display_name,
+                    NativeObjectKind::File,
+                    Some(aisix_core::models::EndpointFamily::Batches),
+                    false,
+                )
+            } else {
+                openai::resolve_file_reference_for_requested(
+                    state,
+                    snapshot,
+                    auth,
+                    client,
+                    &direct.value.display_name,
+                    &requested.value.display_name,
+                    aisix_core::models::EndpointFamily::Batches,
+                )
+            }?;
+            (
+                saved.requested_model.clone(),
+                requested_entry,
+                target,
+                origin,
+            )
         } else {
-            let requested = if crate::model_resolve::resolve_model(snapshot, &raw_model).is_none() {
+            let declared = crate::model_resolve::resolve_model(snapshot, &raw_model);
+            let requested = if declared.is_none() {
                 openai::model_entry_by_id(state, snapshot, origin.model_id)
                     .ok()
                     .filter(|entry| entry.value.upstream_model() == Some(raw_model.as_str()))
@@ -3313,20 +3462,33 @@ async fn managed_batch_input<'a>(
             } else {
                 raw_model.clone()
             };
-            let (target, origin) = match consumer_family {
-                Some(family) => openai::resolve_file_reference_for_requested(
-                    state, snapshot, auth, client, &requested, &requested, family,
-                ),
-                None => openai::resolve(
+            let requested_entry = declared.filter(|entry| entry.value.is_routing());
+            let (target, entry_origin) = if let Some(requested) = requested_entry.as_ref() {
+                managed_group_entry_target(
                     state,
                     snapshot,
                     auth,
                     client,
-                    &requested,
-                    NativeObjectKind::File,
-                ),
+                    origin,
+                    requested,
+                    consumer_family,
+                )
+            } else {
+                match consumer_family {
+                    Some(family) => openai::resolve_file_reference_for_requested(
+                        state, snapshot, auth, client, &requested, &requested, family,
+                    ),
+                    None => openai::resolve(
+                        state,
+                        snapshot,
+                        auth,
+                        client,
+                        &requested,
+                        NativeObjectKind::File,
+                    ),
+                }
             }?;
-            (requested, target, origin)
+            (requested, requested_entry, target, entry_origin)
         };
         if entry_origin.provider_key_id != origin.provider_key_id
             || entry_origin.boundary != origin.boundary
@@ -3366,7 +3528,7 @@ async fn managed_batch_input<'a>(
         let mut entry_scores = Vec::new();
         let mut entry_bypass = String::new();
         let mut entry_applied = Vec::new();
-        let scanned = scan_input_blob(
+        let scanned = scan_input_blob_for_entry(
             state,
             snapshot,
             auth,
@@ -3378,6 +3540,7 @@ async fn managed_batch_input<'a>(
             &mut entry_bypass,
             &mut entry_applied,
             Some(redactions),
+            requested_entry.as_deref(),
         )
         .await;
         let usage_context = if scanned.is_ok() {
@@ -3447,8 +3610,11 @@ async fn managed_batch_input<'a>(
             endpoint,
             entry_id: id,
             requested_model: requested,
-            requested_model_id: saved
-                .map_or(entry_origin.model_id, |entry| entry.requested_model_id),
+            requested_model_id: match (saved, requested_entry.as_ref()) {
+                (Some(saved), _) => saved.requested_model_id,
+                (None, Some(requested)) => openai::resource_id(state, "models", &requested.id)?,
+                (None, None) => entry_origin.model_id,
+            },
             model_id: entry_origin.model_id,
             upstream_model: upstream.clone(),
             requested_service_tier,

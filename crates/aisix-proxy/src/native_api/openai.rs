@@ -171,7 +171,7 @@ pub(crate) fn resolve_for_requested(
     kind: NativeObjectKind,
 ) -> Result<(JobTarget, OriginBinding), ProxyError> {
     resolve_for_requested_family(
-        state, snapshot, auth, client, direct, requested, kind, None, true, None,
+        state, snapshot, auth, client, direct, requested, kind, None, true, None, None,
     )
 }
 
@@ -185,7 +185,7 @@ pub(crate) fn resolve_management(
     kind: NativeObjectKind,
 ) -> Result<(JobTarget, OriginBinding), ProxyError> {
     resolve_for_requested_family(
-        state, snapshot, auth, client, wanted, wanted, kind, None, false, None,
+        state, snapshot, auth, client, wanted, wanted, kind, None, false, None, None,
     )
 }
 
@@ -210,6 +210,7 @@ pub(crate) fn resolve_reference_for_requested(
         kind,
         Some(consumer_family),
         false,
+        None,
         None,
     )
 }
@@ -249,6 +250,34 @@ fn reference_family(
     }
 }
 
+/// 批次条目复用已经按公开组策略选中的目标；公开入口仍不能直接寻址内部模型。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_entry_origin(
+    state: &ProxyState,
+    snapshot: &AisixSnapshot,
+    auth: &AuthenticatedKey,
+    client: &ClientContext,
+    selected: &Arc<aisix_core::ResourceEntry<aisix_core::Model>>,
+    requested: &str,
+    kind: NativeObjectKind,
+    consumer_family: Option<aisix_core::models::EndpointFamily>,
+    check_provider_budget: bool,
+) -> Result<(JobTarget, OriginBinding), ProxyError> {
+    resolve_for_requested_family(
+        state,
+        snapshot,
+        auth,
+        client,
+        &selected.value.display_name,
+        requested,
+        kind,
+        consumer_family,
+        check_provider_budget,
+        None,
+        Some(selected),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn resolve_for_requested_family(
     state: &ProxyState,
@@ -261,6 +290,7 @@ fn resolve_for_requested_family(
     consumer_family: Option<aisix_core::models::EndpointFamily>,
     check_provider_budget: bool,
     surface: Option<NativeOriginSurface>,
+    selected: Option<&Arc<aisix_core::ResourceEntry<aisix_core::Model>>>,
 ) -> Result<(JobTarget, OriginBinding), ProxyError> {
     let current = current_auth(snapshot, auth)?;
     let auth = &current;
@@ -276,7 +306,10 @@ fn resolve_for_requested_family(
     if !auth.key().can_access(snapshot, requested) {
         return Err(ProxyError::ModelForbidden(requested.into()));
     }
-    let entry = crate::model_resolve::resolve_model(snapshot, direct).ok_or_else(not_found)?;
+    let entry = selected
+        .cloned()
+        .or_else(|| crate::model_resolve::resolve_model(snapshot, direct))
+        .ok_or_else(not_found)?;
     let model = &entry.value;
     crate::model_resolve::refuse_ensemble_to_grouped_key(
         direct,
@@ -343,6 +376,19 @@ fn resolve_for_requested_family(
     let secret = crate::dispatch::require_api_key(&pk.value, model)?.to_owned();
     let requested_entry =
         crate::model_resolve::resolve_model(snapshot, requested).ok_or_else(not_found)?;
+    if selected.is_some()
+        && !requested_entry
+            .value
+            .routing
+            .as_ref()
+            .is_some_and(|routing| {
+                routing.targets.iter().any(|target| {
+                    target.model_ref(snapshot).as_ref() == entry.value.display_name.as_str()
+                })
+            })
+    {
+        return Err(not_found());
+    }
     crate::dispatch::check_ip_access(&requested_entry.value, &client.source_ip)?;
     crate::attribution::note_requested_model(requested, &requested_entry.id);
     crate::attribution::note_resolved_entry(&entry.id);
@@ -1159,6 +1205,7 @@ fn validate_lookup_record(
         consumer_family,
         check_provider_budget,
         origin.surface,
+        None,
     )
     .map_err(|_| not_found())?;
     if actual != origin {
@@ -1179,6 +1226,7 @@ fn validate_lookup_record(
                 consumer_family,
                 check_provider_budget,
                 origin.surface,
+                requested.value.is_routing().then_some(&direct),
             )
             .map_err(|_| not_found())?;
             let mut expected = origin.clone();
