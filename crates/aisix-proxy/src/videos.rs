@@ -1908,7 +1908,16 @@ pub async fn create_video(
                 rej,
                 state.request_body_limit_for("/v1/videos"),
             );
-            return telemetry.finish_without_target(err, None);
+            return crate::reject::reject_before_dispatch(
+                &state,
+                "POST",
+                "/v1/videos",
+                &client.request_id,
+                Some(&auth.entry.id),
+                started,
+                crate::reject::Envelope::OpenAi,
+                err,
+            );
         }
     };
     let model_name = body.model.clone();
