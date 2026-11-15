@@ -446,6 +446,10 @@ impl Journal {
         frame: &mut Frame<'_>,
     ) -> Result<Option<Vec<u8>>, ProxyError> {
         let kind = frame.kind();
+        // 未启用 ASR 时 item 无次级绑定；主 A/request 闸仍由共享入口执行。
+        if kind == Kind::ItemCreate && self.active_asr.is_none() {
+            return Ok(None);
+        }
         let audio_input = matches!(kind, Kind::AudioAppend | Kind::AudioCommit)
             || (kind == Kind::ItemCreate
                 && frame.json().is_some_and(|event| {
