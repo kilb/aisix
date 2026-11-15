@@ -233,11 +233,7 @@ mod compat_tests {
         })
         .await;
         let app = build_app(snapshot(&upstream.base));
-        for (route, raw) in [
-            ("files", "file-cursor"),
-            ("batches", "batch-cursor"),
-            ("fine_tuning/jobs", "ftjob-cursor"),
-        ] {
+        for (route, raw) in [("files", "file-cursor"), ("batches", "batch-cursor")] {
             let id = encode_routed_id(raw, "jobs-a", None);
             let response = app
                 .clone()
@@ -460,11 +456,7 @@ mod compat_tests {
                         }));
             }
             let app = crate::build_router(state);
-            for route in [
-                "files/file-test",
-                "batches/batch-test",
-                "fine_tuning/jobs/ftjob-test",
-            ] {
+            for route in ["files/file-test", "batches/batch-test"] {
                 let response = app
                     .clone()
                     .oneshot(get_as(format!("/v1/{route}?model=jobs-a"), "sk-caller"))
@@ -506,13 +498,7 @@ mod compat_tests {
 
     #[tokio::test]
     async fn legacy_job_quota_rejections_keep_each_resolved_target_without_dispatch() {
-        for family in [
-            "upload",
-            "batch_create",
-            "batch_retrieve",
-            "fine_tuning_create",
-            "forward",
-        ] {
+        for family in ["upload", "batch_create", "batch_retrieve"] {
             let upstream = MockServer::builder().start().await;
             Mock::given(wm_method("GET"))
                 .and(path("/v1/files/file_prime"))

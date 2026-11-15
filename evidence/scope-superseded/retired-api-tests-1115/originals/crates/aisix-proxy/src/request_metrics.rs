@@ -1,0 +1,1713 @@
+//! The one chokepoint for the per-request outcome metrics every handler
+//! emits once dispatch has produced a response.
+//!
+//! # When a request is recorded, and what `elapsed` measures
+//!
+//! A request is recorded once, at its end, with the status it ended on and
+//! the time from arrival to that end. For a non-streamed response that is
+//! the handler's return. For a STREAMED response it is the end of the
+//! stream: the handler parks a [`PendingRequestMetrics`] beside its
+//! access-log line, and it is recorded with the request's terminal usage
+//! event — `200` for a stream delivered to its end, `499` for one the caller
+//! abandoned (including a body dropped before it was ever read), the
+//! failure's status (`502`, `504`, an in-stream `4xx`) for one an upstream
+//! error ended. So for streams the duration families measure the whole
+//! stream, not time to response start, and a stream that fails after its
+//! head counts as a failure.
+//!
+//! One open-ended body is still recorded at its head: the
+//! `/v1/videos/:id/content` relay files no usage event (the submission
+//! was metered), so there is no terminal emit to park on.
+//!
+//! A caller that leaves before the response head is written is NOT
+//! recorded here — it never had a response. It is counted by
+//! `aisix_proxy_client_cancelled_requests_total` alone.
+//!
+//! Time to first token is `aisix_request_ttft_seconds`; the SLO view of the same
+//! whole-request duration is `aisix_request_e2e_latency_seconds`, whose
+//! `downstream` side is recorded by the same emit as the request families
+//! (every route but `/v1/realtime`), so a route that counts its requests
+//! cannot leave it out.
+//!
+//! Three families ride on a single call:
+//!
+//! - `aisix_requests_total` / `aisix_request_duration_seconds` — the legacy
+//!   compatibility series, four labels, every endpoint.
+//! - `aisix_proxy_requests_total` / `aisix_proxy_failed_requests_total` /
+//!   `aisix_proxy_request_duration_seconds` — the detailed series over ALL
+//!   proxied traffic.
+//! - `aisix_llm_requests_total` / `aisix_llm_request_duration_seconds` — the
+//!   subset of the above that is a model-inference call, per
+//!   [`LLM_ENDPOINTS`].
+//!
+//! Splitting the two tiers is the point: an MCP tool call, a batch-file
+//! upload and a 413 are all proxy requests, but counting them as LLM
+//! requests would corrupt every per-request token/cost average and the LLM
+//! success rate. What is NOT a judgement call is that both tiers must cover
+//! every endpoint — before #1234 only chat + messages emitted the
+//! detailed families at all, so ten endpoints were absent from the
+//! success-rate and request-count queries built on them while still showing
+//! up in the legacy series.
+//!
+//! [`record_usage`] is the companion emit for what the request consumed —
+//! the token families, which had the same coverage problem, in
+//! three different shapes (see its own docs).
+//!
+//! The counters of the two detailed tiers also carry `error_source`, which each
+//! emit is handed: see [`aisix_obs::ErrorSource`] and `crates/aisix-proxy/AGENTS.md`.
+//!
+//! Handlers call [`record`] and [`record_usage`] instead of touching
+//! `Metrics` directly, and the tier is decided from the endpoint rather than
+//! by the caller, so a new endpoint cannot land with a half-wired label set —
+//! the same anti-drift move `usage_attr` makes for the UsageEvent side.
+//!
+//! Two endpoints are model inference but report no tokens by nature —
+//! `/v1/audio/speech` (billed per input character) and `/v1/videos` (per
+//! video). They count as requests and contribute nothing to the token
+//! families, so aggregate tokens-per-request is only meaningful per
+//! `endpoint`, never summed across all of them.
+
+use std::borrow::Cow;
+use std::time::Duration;
+
+use aisix_core::{AisixSnapshot, ApiKey};
+use aisix_obs::{ErrorSource, LatencySide, LlmUsage, RequestLabels, RequestOutcome, UsageLabels};
+
+use crate::auth::AuthenticatedKey;
+use crate::state::ProxyState;
+use crate::usage_attr::PkLabels;
+
+/// Label value every `RequestLabels` field falls back to when the path
+/// never resolved it. Matches `RequestLabels::default()`.
+pub(crate) const UNKNOWN: &str = "unknown";
+
+/// Caller identity for the detailed label set.
+#[derive(Clone, Copy)]
+pub(crate) struct Caller<'a> {
+    pub api_key_id: &'a str,
+    pub api_key_name: &'a str,
+    pub team_id: &'a str,
+    pub team_name: &'a str,
+    pub user_id: &'a str,
+    pub user_name: &'a str,
+}
+
+impl<'a> Caller<'a> {
+    pub(crate) fn new(auth: &'a AuthenticatedKey) -> Self {
+        let key = auth.key();
+        Self {
+            api_key_id: &auth.entry.id,
+            api_key_name: auth.api_key_name().unwrap_or(UNKNOWN),
+            team_id: key.team_id.as_deref().unwrap_or(UNKNOWN),
+            team_name: auth.team_name().unwrap_or(UNKNOWN),
+            user_id: key.user_id.as_deref().unwrap_or(UNKNOWN),
+            user_name: auth.user_name().unwrap_or(UNKNOWN),
+        }
+    }
+
+    /// Recover an owned caller from the request's dispatch snapshot.
+    /// Capture this before starting a stream so key deletion or reassignment
+    /// cannot change the caller attributed to the completed request.
+    pub(crate) fn from_api_key_id(snap: &aisix_core::AisixSnapshot, api_key_id: &str) -> Owned {
+        let entry = snap.apikeys.get_by_id(api_key_id);
+        let key = entry.as_ref().map(|e| &*e.value);
+        let owner = key.map(|k| aisix_core::KeyOwnerNames::resolve(snap, k));
+        let owned = |v: Option<&str>| v.map(str::to_owned);
+        Owned {
+            api_key_id: api_key_id.to_owned(),
+            api_key_name: owned(key.and_then(ApiKey::telemetry_name)),
+            team_id: key.and_then(|k| k.team_id.clone()),
+            team_name: owned(owner.as_ref().and_then(|o| o.team_name())),
+            user_id: key.and_then(|k| k.user_id.clone()),
+            user_name: owned(key.zip(owner.as_ref()).and_then(|(k, o)| o.user_name(k))),
+        }
+    }
+
+    /// A path that gave up before it could attribute the request to a team
+    /// or user — the pre-dispatch rejections. `api_key_id` is `Some` once
+    /// the auth extractor has run and `None` for the middleware
+    /// short-circuits that precede it (see `reject`).
+    pub(crate) fn unattributed(api_key_id: Option<&'a str>) -> Self {
+        Self {
+            api_key_id: api_key_id.unwrap_or(UNKNOWN),
+            api_key_name: UNKNOWN,
+            team_id: UNKNOWN,
+            team_name: UNKNOWN,
+            user_id: UNKNOWN,
+            user_name: UNKNOWN,
+        }
+    }
+}
+
+/// Owning form of [`Caller`], for the snapshot lookup whose strings cannot
+/// outlive the guard. Call [`Owned::as_caller`] at the emit.
+#[derive(Clone)]
+pub(crate) struct Owned {
+    api_key_id: String,
+    api_key_name: Option<String>,
+    team_id: Option<String>,
+    team_name: Option<String>,
+    user_id: Option<String>,
+    user_name: Option<String>,
+}
+
+impl Owned {
+    /// The owning form of [`Caller::new`].
+    pub(crate) fn from_auth(auth: &AuthenticatedKey) -> Self {
+        Self::from_caller(Caller::new(auth))
+    }
+
+    pub(crate) fn from_caller(c: Caller<'_>) -> Self {
+        let known = |v: &str| (v != UNKNOWN).then(|| v.to_owned());
+        Self {
+            api_key_id: c.api_key_id.to_owned(),
+            api_key_name: known(c.api_key_name),
+            team_id: known(c.team_id),
+            team_name: known(c.team_name),
+            user_id: known(c.user_id),
+            user_name: known(c.user_name),
+        }
+    }
+
+    pub(crate) fn as_caller(&self) -> Caller<'_> {
+        Caller {
+            api_key_id: &self.api_key_id,
+            api_key_name: self.api_key_name.as_deref().unwrap_or(UNKNOWN),
+            team_id: self.team_id.as_deref().unwrap_or(UNKNOWN),
+            team_name: self.team_name.as_deref().unwrap_or(UNKNOWN),
+            user_id: self.user_id.as_deref().unwrap_or(UNKNOWN),
+            user_name: self.user_name.as_deref().unwrap_or(UNKNOWN),
+        }
+    }
+}
+
+/// What the handler resolved about the upstream it reached, or tried to.
+/// [`Upstream::default()`] is the shape of a request that failed before
+/// resolution; a handler fills in only the fields its endpoint has.
+#[derive(Clone, Copy)]
+pub(crate) struct Upstream<'a> {
+    pub provider: &'a str,
+    /// MUST be bounded: a name that already resolved against the snapshot,
+    /// or `usage_attr::metric_model_label()` output on any path that can
+    /// fire before resolution. The raw client-supplied `model` is
+    /// attacker-controlled cardinality (#451).
+    pub model: &'a str,
+    pub upstream_model: &'a str,
+    /// The attempt's ProviderKey id AND its readable name, resolved
+    /// together by `usage_attr::ResolvedPk` (#941). Taking the pair rather
+    /// than a bare id is deliberate: the name used to be looked up inside
+    /// each emit, so a request paid one snapshot read per emit and a new
+    /// call site could not tell it was doing so.
+    pub pk: PkLabels<'a>,
+    pub stream: bool,
+    pub is_fallback: bool,
+}
+
+impl Default for Upstream<'_> {
+    fn default() -> Self {
+        Self {
+            provider: UNKNOWN,
+            model: UNKNOWN,
+            upstream_model: UNKNOWN,
+            pk: PkLabels::default(),
+            stream: false,
+            is_fallback: false,
+        }
+    }
+}
+
+/// Whether the caller addressed an ensemble model. See [`LastTarget::new`].
+fn is_ensemble(snap: &AisixSnapshot, requested_model: &str) -> bool {
+    !requested_model.is_empty()
+        && crate::model_resolve::resolve_model(snap, requested_model)
+            .is_some_and(|entry| entry.value.is_ensemble())
+}
+
+/// The upstream a request had committed to when it FAILED, recovered from
+/// the request's attribution cell.
+///
+/// A handler's failure branch holds a `ProxyError`, which carries no
+/// upstream identity, so every failed request used to emit
+/// [`Upstream::default()`] — `provider="unknown"`, no ProviderKey — even
+/// when it had reached a real provider and been answered 5xx. That split
+/// one ProviderKey's successes and failures across two label sets, so a
+/// failure rate grouped by `provider` reported 0% for every real provider
+/// and 100% for `unknown` (AISIX-Cloud#1325).
+///
+/// Names the LAST target the request selected. Under retry / fallback that
+/// is the attempt whose error the caller was actually served, which is the
+/// same attempt the access log's routing telemetry ends on.
+///
+/// Still `unknown` for a request that failed BEFORE selecting a target —
+/// model-not-found, an input guardrail block, a budget refusal. Those
+/// never reached a provider, so there is nothing to attribute and the
+/// placeholder is the honest answer.
+pub(crate) struct LastTarget<'a> {
+    provider: String,
+    upstream_model: Cow<'a, str>,
+    pk: Option<crate::usage_attr::ResolvedPk<'a>>,
+}
+
+impl<'a> LastTarget<'a> {
+    /// `resolved` has to outlive the emit — read it into a local first
+    /// (`let resolved = attribution::current().unwrap_or_default();`).
+    pub(crate) fn new(snap: &AisixSnapshot, resolved: &'a crate::attribution::Resolved) -> Self {
+        // An ensemble has no single terminal target: its panel members run
+        // concurrently and all of them are attempted, so the cell just holds
+        // whichever resolved last. Naming that one would read as "this key
+        // is what failed" — a plausible-looking wrong answer, which is worse
+        // than the placeholder. Suppressed rather than deferred to the
+        // ensemble design pass, because it is this change that would
+        // otherwise introduce it.
+        if is_ensemble(snap, &resolved.requested_model) {
+            return Self {
+                provider: UNKNOWN.to_string(),
+                upstream_model: Cow::Borrowed(UNKNOWN),
+                pk: None,
+            };
+        }
+        Self {
+            // Lowercased here because the success path lowercases at its
+            // own emit; a failure that spelled the vendor differently
+            // would land on a second series for the same provider.
+            provider: if resolved.provider.is_empty() {
+                UNKNOWN.to_string()
+            } else {
+                resolved.provider.to_ascii_lowercase()
+            },
+            // A wildcard row resolves to a SUBSTITUTED upstream id — the
+            // caller's own suffix — so it goes through the same collapse the
+            // success path's emit applies, or a failed request could mint one
+            // series per made-up suffix (#451).
+            upstream_model: if resolved.upstream_model.is_empty() {
+                Cow::Borrowed(UNKNOWN)
+            } else {
+                crate::usage_attr::metric_model_label_pair(
+                    snap,
+                    &resolved.requested_model,
+                    &resolved.upstream_model,
+                )
+                .1
+            },
+            // An empty id must fall back to `PkLabels::default()`, NOT to
+            // `ResolvedPk::resolve(snap, "")` — that one reports the id
+            // verbatim, and an empty `provider_key_id` label would be a
+            // third value alongside `unknown` and the real ids.
+            pk: (!resolved.provider_key_id.is_empty())
+                .then(|| crate::usage_attr::ResolvedPk::resolve(snap, &resolved.provider_key_id)),
+        }
+    }
+
+    /// For the SLO latency histogram, which carries `provider` but no
+    /// ProviderKey (per-key dimensions multiply every bucket).
+    pub(crate) fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    /// The failure's labels, keeping the handler's own `model` / `stream`
+    /// / `is_fallback` decisions — those are request-level facts the cell
+    /// has no better answer for.
+    pub(crate) fn upstream<'b>(
+        &'b self,
+        model: &'b str,
+        stream: bool,
+        is_fallback: bool,
+    ) -> Upstream<'b> {
+        Upstream {
+            provider: &self.provider,
+            model,
+            upstream_model: &self.upstream_model,
+            pk: self.pk.as_ref().map(|p| p.labels()).unwrap_or_default(),
+            stream,
+            is_fallback,
+        }
+    }
+
+    /// The model the caller addressed, bounded to the configured set —
+    /// for the failure paths that could not recover it locally (the
+    /// multipart audio routes parse it inside the dispatch that failed).
+    pub(crate) fn requested_model<'b>(
+        snap: &AisixSnapshot,
+        resolved: &'b crate::attribution::Resolved,
+    ) -> Cow<'b, str> {
+        if resolved.requested_model.is_empty() {
+            Cow::Borrowed(UNKNOWN)
+        } else {
+            crate::usage_attr::metric_model_label(snap, &resolved.requested_model)
+        }
+    }
+}
+
+/// Endpoints whose requests belong in the `aisix_llm_*` families on top of
+/// the `aisix_proxy_*` ones — the model-inference routes.
+///
+/// Values are `normalize_endpoint_label` outputs; `llm_endpoints_are_reachable`
+/// pins that, because a typo here fails silently (the entry simply never
+/// matches, and the endpoint quietly drops out of every LLM query).
+///
+/// Deliberately absent, and why:
+/// - `/mcp`, `/mcp/{server}`, `/a2a` — tool and agent calls, no model.
+/// - `/passthrough_route` — one endpoint for opaque relays and identified
+///   LLM exchanges alike, so its tier is decided per request
+///   ([`record_in_tier`]): an exchange identified as a protocol a typed
+///   endpoint serves (chat, Anthropic messages, responses, completions,
+///   embeddings, images, rerank) counts in the LLM tier and the token
+///   families, exactly once, like that endpoint; an opaque relay, or a shape
+///   no typed endpoint serves, stays proxy-only.
+/// - `/v1/files`, `/v1/batches`, `/v1/fine_tuning/jobs` — management calls.
+/// - `/v1/responses/:id`, `/v1/responses/:id/cancel` and
+///   `/v1/responses/:id/input_items` — 查询或管理已提交的推理，不再次计作推理请求。
+///
+/// `/v1/realtime` was in that list until the token families reached it too.
+/// It was held out because it fed none of them, so counting it here would
+/// have inflated the denominator of every tokens-per-request query; now that
+/// a session reports its tokens and cost, that reason is gone and it belongs
+/// with the rest.
+const LLM_ENDPOINTS: &[&str] = &[
+    "/v1/chat/completions",
+    "/v1/completions",
+    "/v1/embeddings",
+    "/v1/images/generations",
+    "/v1/images/edits",
+    "/v1/images/variations",
+    "/v1/moderations",
+    "/v1/content_provenance_checks",
+    "/v1/messages",
+    "/v1/messages/count_tokens",
+    "/v1/rerank",
+    "/v1/systemone",
+    "/v1/decisions",
+    "/v1/responses",
+    "/v1/responses/compact",
+    "/v1/responses/input_tokens",
+    "/v1/audio/transcriptions",
+    "/v1/audio/translations",
+    "/v1/audio/speech",
+    "/v1/videos",
+    "/v1/videos/:id",
+    "/v1/realtime",
+];
+
+/// Whether this endpoint's requests are model inference.
+///
+/// Keyed off the route, not the call site, so a request lands in the same
+/// families however it ended — a 413 refused before dispatch has to sit in
+/// the same denominator as the model-not-found 404 the handler itself
+/// records, or a success rate over the endpoint silently omits one of them.
+///
+/// Anything unlisted is proxy-only, the safe default: a wrong `false` loses
+/// a row from an LLM query, a wrong `true` corrupts every per-request token
+/// and cost average built on these counters.
+fn is_llm_endpoint(endpoint: &str) -> bool {
+    LLM_ENDPOINTS.contains(&endpoint)
+}
+
+/// 共享路径的 GET 分别是已保存聊天列表和 WebSocket 握手；后者每轮另经 POST 计量。
+/// 其余方法保留端点分类，包括既有 405 的分母和 Realtime 的会话语义。
+pub(crate) fn is_llm_request(endpoint: &str, method: &axum::http::Method) -> bool {
+    is_llm_endpoint(endpoint)
+        && !(method == axum::http::Method::GET
+            && matches!(endpoint, "/v1/chat/completions" | "/v1/responses"))
+}
+
+/// 请求开始时确定的分类；直接调用发射器的上下文外路径沿用端点默认值。
+fn current_is_llm_request(endpoint: &str) -> bool {
+    crate::attribution::counts_as_llm().unwrap_or_else(|| is_llm_endpoint(endpoint))
+}
+
+/// 共享路径复用请求开始时固定的协议，不将原始路径或协议头值写入标签。
+pub(crate) fn inbound_protocol(endpoint: &str) -> &'static str {
+    crate::attribution::inbound_protocol()
+        .unwrap_or_else(|| crate::inbound_protocol_for_endpoint(endpoint))
+}
+
+/// The one request-metric emit, shared by every handler.
+///
+/// Called on the handler's way out, which is the request's end for every
+/// response except a stream — a streamed response defers to
+/// [`PendingRequestMetrics`] instead (see the module docs).
+///
+/// `endpoint` must be a bounded route template — a literal for the fixed
+/// routes, or [`crate::normalize_endpoint_label`] output for the `:param` /
+/// wildcard ones. Never a raw request path (#451).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record(
+    state: &ProxyState,
+    endpoint: &'static str,
+    caller: Caller<'_>,
+    upstream: Upstream<'_>,
+    status: u16,
+    error_source: ErrorSource,
+    elapsed: Duration,
+) {
+    record_in_tier(
+        state,
+        endpoint,
+        current_is_llm_request(endpoint),
+        caller,
+        upstream,
+        status,
+        error_source,
+        elapsed,
+    );
+}
+
+/// [`record`] for the one endpoint whose tier is decided per request:
+/// `/passthrough_route`, which carries opaque relays and identified LLM
+/// exchanges alike. `llm` is whether THIS request is model inference of a
+/// kind a typed endpoint serves — see `LLM_ENDPOINTS`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_in_tier(
+    state: &ProxyState,
+    endpoint: &'static str,
+    llm: bool,
+    caller: Caller<'_>,
+    upstream: Upstream<'_>,
+    status: u16,
+    error_source: ErrorSource,
+    elapsed: Duration,
+) {
+    let e2e = E2eSides::for_request(&state.snapshot.load());
+    record_bounded(
+        state,
+        endpoint,
+        llm,
+        caller,
+        upstream,
+        status,
+        error_source,
+        elapsed,
+        e2e,
+    );
+}
+
+/// [`record`] for a request answered before anything was dispatched — a
+/// refusal, a discovery document — whose end-to-end latency can only have
+/// a `downstream` side.
+pub(crate) fn record_undispatched(
+    state: &ProxyState,
+    endpoint: &'static str,
+    caller: Caller<'_>,
+    upstream: Upstream<'_>,
+    status: u16,
+    error_source: ErrorSource,
+    elapsed: Duration,
+) {
+    record_bounded(
+        state,
+        endpoint,
+        current_is_llm_request(endpoint),
+        caller,
+        upstream,
+        status,
+        error_source,
+        elapsed,
+        E2eSides::DownstreamOnly,
+    );
+}
+
+/// [`record`] for a response whose body is relayed after this call
+/// returns (`/v1/videos/:id/content`): the request families are recorded
+/// now, at the head, and the `downstream` end-to-end observation when the
+/// body relay ends, under the head's status.
+pub(crate) fn record_spanning_body(
+    state: &ProxyState,
+    endpoint: &'static str,
+    caller: Caller<'_>,
+    upstream: Upstream<'_>,
+    status: u16,
+    error_source: ErrorSource,
+    started: std::time::Instant,
+) {
+    record_bounded(
+        state,
+        endpoint,
+        current_is_llm_request(endpoint),
+        caller,
+        upstream,
+        status,
+        error_source,
+        started.elapsed(),
+        E2eSides::AtBodyEnd(started),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_bounded(
+    state: &ProxyState,
+    endpoint: &'static str,
+    llm: bool,
+    caller: Caller<'_>,
+    upstream: Upstream<'_>,
+    status: u16,
+    error_source: ErrorSource,
+    elapsed: Duration,
+    e2e: E2eSides,
+) {
+    // Emit-chokepoint label bounding (#451 class): success paths hand in
+    // the caller's requested string, which for a wildcard-served alias
+    // is caller-minted — collapse it to the configured row's name here
+    // so no handler-family member can mint unbounded series.
+    let snap = state.snapshot.load();
+    let (model, upstream_model) =
+        crate::usage_attr::metric_model_label_pair(&snap, upstream.model, upstream.upstream_model);
+    let upstream = Upstream {
+        model: model.as_ref(),
+        upstream_model: upstream_model.as_ref(),
+        ..upstream
+    };
+    emit(
+        &state.metrics,
+        endpoint,
+        inbound_protocol(endpoint),
+        llm,
+        caller,
+        upstream,
+        status,
+        error_source,
+        elapsed,
+        e2e,
+    );
+}
+
+/// Which sides of `aisix_request_e2e_latency_seconds` a recorded request
+/// observes.
+#[derive(Clone, Copy)]
+enum E2eSides {
+    /// `downstream` now, and `upstream` once the request's terminal attempt
+    /// is known to have been dispatched (see [`record_e2e_downstream`]).
+    Both,
+    /// An ensemble's response comes from no single attempt — its terminal
+    /// event is the judge's own call, only the last step — so it has no
+    /// upstream side to observe, on any path.
+    DownstreamOnly,
+    /// `downstream` when the response body relay ends, timed from this
+    /// instant; nothing upstream (the route files no usage event).
+    AtBodyEnd(std::time::Instant),
+}
+
+impl E2eSides {
+    fn for_request(snap: &AisixSnapshot) -> Self {
+        if crate::attribution::current().is_some_and(|r| is_ensemble(snap, &r.requested_model)) {
+            Self::DownstreamOnly
+        } else {
+            Self::Both
+        }
+    }
+}
+
+/// Endpoints that record the request families but not the end-to-end
+/// latency histogram: a `/v1/realtime` request is a WebSocket session, which
+/// has no request/response round trip to time.
+const NO_E2E_ENDPOINTS: &[&str] = &["/v1/realtime"];
+
+/// Write one request's samples. `upstream` must already be bounded.
+///
+/// Every request family AND the end-to-end latency histogram are written
+/// here, so a route that records its requests cannot skip the latency
+/// one.
+#[allow(clippy::too_many_arguments)]
+fn emit(
+    metrics: &std::sync::Arc<aisix_obs::Metrics>,
+    endpoint: &'static str,
+    inbound_protocol: &'static str,
+    llm: bool,
+    caller: Caller<'_>,
+    upstream: Upstream<'_>,
+    status: u16,
+    error_source: ErrorSource,
+    elapsed: Duration,
+    e2e: E2eSides,
+) {
+    let outcome = RequestOutcome::from_status(status);
+    metrics.record_request(upstream.provider, upstream.model, status, outcome, elapsed);
+    let labels = RequestLabels {
+        endpoint,
+        // 与 in-flight 复用同一请求事实，共享 Files 路径不能仅按端点分类。
+        inbound_protocol,
+        // Read off the SAME ProviderKey row that produced the id and name
+        // beside it (`usage_attr::ResolvedPk`), so a request can never be
+        // labelled with one key's identity and another's protocol.
+        upstream_protocol: upstream.pk.protocol(),
+        provider: upstream.provider,
+        model: upstream.model,
+        upstream_model: upstream.upstream_model,
+        provider_key_id: upstream.pk.id(),
+        provider_key_name: upstream.pk.name(),
+        api_key_id: caller.api_key_id,
+        api_key_name: caller.api_key_name,
+        team_id: caller.team_id,
+        team_name: caller.team_name,
+        user_id: caller.user_id,
+        user_name: caller.user_name,
+        stream: upstream.stream,
+        is_fallback: upstream.is_fallback,
+        status,
+        outcome,
+        error_source,
+    };
+    if llm {
+        metrics.record_proxy_and_llm_request(labels, elapsed);
+    } else {
+        metrics.record_proxy_request(labels, elapsed);
+    }
+    if NO_E2E_ENDPOINTS.contains(&endpoint) {
+        return;
+    }
+    let latency = latency_labels(endpoint, inbound_protocol, caller, upstream, status);
+    match e2e {
+        E2eSides::Both => record_e2e_downstream(metrics, latency, elapsed),
+        E2eSides::DownstreamOnly => {
+            metrics.record_request_e2e_latency(latency, LatencySide::Downstream, elapsed)
+        }
+        E2eSides::AtBodyEnd(started) => crate::attribution::note_e2e_at_body_end(
+            metrics.clone(),
+            OwnedLatencyLabels::from(latency),
+            started,
+        ),
+    }
+}
+
+/// The request families of a STREAMED response, held until the stream ends.
+///
+/// A streaming handler returns when the response head goes out, so the
+/// status it holds then is the `200` of a stream that has not delivered
+/// anything yet, and its clock stops at time-to-response-start. Recording
+/// there counted a stream the caller abandoned, or the upstream broke
+/// mid-way, as a success, and kept it out of
+/// `aisix_proxy_failed_requests_total`.
+///
+/// So the handler parks this beside its access-log line
+/// (`attribution::defer_access_log` takes both), and it is recorded with
+/// the status of the request's TERMINAL usage event, when that event goes
+/// out — the same status the line and the usage row carry, whichever of the
+/// stream's endings produced it. Taking it out of the cell is what makes it
+/// exactly once.
+///
+/// Labels are bounded when it is built, against the snapshot the request
+/// dispatched on: the model row may be gone by the time the stream ends.
+pub(crate) struct PendingRequestMetrics {
+    metrics: std::sync::Arc<aisix_obs::Metrics>,
+    endpoint: &'static str,
+    inbound_protocol: &'static str,
+    llm: bool,
+    upstream_protocol: &'static str,
+    provider: String,
+    model: String,
+    upstream_model: String,
+    provider_key_id: String,
+    provider_key_name: String,
+    caller: Owned,
+    stream: bool,
+    is_fallback: bool,
+    /// The request clock: a stream's duration is the whole stream.
+    started: std::time::Instant,
+    /// Decided against the request's own attribution cell when the stream
+    /// starts; see [`E2eSides`].
+    e2e: E2eSides,
+}
+
+impl PendingRequestMetrics {
+    /// A streamed request's samples, to be recorded when its terminal usage
+    /// event goes out. `started` is the REQUEST clock.
+    pub(crate) fn at_stream_end(
+        state: &ProxyState,
+        endpoint: &'static str,
+        caller: Caller<'_>,
+        upstream: Upstream<'_>,
+        started: std::time::Instant,
+    ) -> Self {
+        let snap = state.snapshot.load();
+        let (model, upstream_model) = crate::usage_attr::metric_model_label_pair(
+            &snap,
+            upstream.model,
+            upstream.upstream_model,
+        );
+        Self {
+            metrics: state.metrics.clone(),
+            endpoint,
+            inbound_protocol: inbound_protocol(endpoint),
+            llm: current_is_llm_request(endpoint),
+            upstream_protocol: upstream.pk.protocol(),
+            provider: upstream.provider.to_owned(),
+            model: model.into_owned(),
+            upstream_model: upstream_model.into_owned(),
+            provider_key_id: upstream.pk.id().to_owned(),
+            provider_key_name: upstream.pk.name().to_owned(),
+            caller: Owned::from_caller(caller),
+            stream: upstream.stream,
+            is_fallback: upstream.is_fallback,
+            started,
+            e2e: E2eSides::for_request(&snap),
+        }
+    }
+
+    /// Record the parked samples under the request's terminal status and
+    /// what ended it.
+    pub(crate) fn record_terminal(self, status: u16, error_source: ErrorSource) {
+        let upstream = Upstream {
+            provider: &self.provider,
+            model: &self.model,
+            upstream_model: &self.upstream_model,
+            pk: PkLabels::from_parts(
+                &self.provider_key_id,
+                &self.provider_key_name,
+                self.upstream_protocol,
+            ),
+            stream: self.stream,
+            is_fallback: self.is_fallback,
+        };
+        emit(
+            &self.metrics,
+            self.endpoint,
+            self.inbound_protocol,
+            self.llm,
+            self.caller.as_caller(),
+            upstream,
+            status,
+            error_source,
+            self.started.elapsed(),
+            self.e2e,
+        );
+    }
+}
+
+/// Record a streamed response's time to first token — both sides, on
+/// `aisix_request_ttft_seconds` and `aisix_llm_time_to_first_token_seconds`
+/// — under the same bounded labels the end-to-end latency histogram uses.
+pub(crate) fn record_stream_ttft(
+    state: &ProxyState,
+    endpoint: &'static str,
+    caller: Caller<'_>,
+    upstream: Upstream<'_>,
+    status: u16,
+    upstream_ttft: impl Into<Option<Duration>>,
+    downstream_ttft: impl Into<Option<Duration>>,
+) {
+    let snap = state.snapshot.load();
+    with_latency_labels(&snap, endpoint, caller, upstream, status, |labels| {
+        state
+            .metrics
+            .record_ttft(labels, upstream_ttft.into(), downstream_ttft.into());
+    });
+}
+
+/// The latency families' labels for one request, with the model pair bounded
+/// at this chokepoint like every other emit here.
+fn with_latency_labels(
+    snap: &AisixSnapshot,
+    endpoint: &'static str,
+    caller: Caller<'_>,
+    upstream: Upstream<'_>,
+    status: u16,
+    f: impl FnOnce(aisix_obs::LatencyLabels<'_>),
+) {
+    let (model, upstream_model) =
+        crate::usage_attr::metric_model_label_pair(snap, upstream.model, upstream.upstream_model);
+    f(latency_labels(
+        endpoint,
+        inbound_protocol(endpoint),
+        caller,
+        Upstream {
+            model: model.as_ref(),
+            upstream_model: upstream_model.as_ref(),
+            ..upstream
+        },
+        status,
+    ));
+}
+
+/// The latency families' labels for an already-bounded `upstream`.
+fn latency_labels<'a>(
+    endpoint: &'static str,
+    inbound_protocol: &'static str,
+    caller: Caller<'a>,
+    upstream: Upstream<'a>,
+    status: u16,
+) -> aisix_obs::LatencyLabels<'a> {
+    aisix_obs::LatencyLabels {
+        endpoint,
+        model: upstream.model,
+        provider: upstream.provider,
+        status,
+        streaming: upstream.stream,
+        details: UsageLabels {
+            endpoint,
+            inbound_protocol,
+            upstream_protocol: upstream.pk.protocol(),
+            provider: upstream.provider,
+            model: upstream.model,
+            upstream_model: upstream.upstream_model,
+            provider_key_id: upstream.pk.id(),
+            provider_key_name: upstream.pk.name(),
+            api_key_id: caller.api_key_id,
+            api_key_name: caller.api_key_name,
+            team_id: caller.team_id,
+            team_name: caller.team_name,
+            user_id: caller.user_id,
+            user_name: caller.user_name,
+        },
+    }
+}
+
+/// Observe a request's `downstream` end-to-end latency, and note its labels
+/// on the request's cell so that its `upstream` sibling — the terminal
+/// attempt's own duration, which the terminal usage event carries — is
+/// recorded under the same labels. Recorded only when the request's
+/// terminal attempt was dispatched to an upstream; see
+/// `attribution::note_e2e_downstream`.
+pub(crate) fn record_e2e_downstream(
+    metrics: &std::sync::Arc<aisix_obs::Metrics>,
+    labels: aisix_obs::LatencyLabels<'_>,
+    elapsed: Duration,
+) {
+    metrics.record_request_e2e_latency(labels, LatencySide::Downstream, elapsed);
+    crate::attribution::note_e2e_downstream(
+        metrics.clone(),
+        OwnedLatencyLabels::from(labels),
+        elapsed,
+    );
+}
+
+/// An owned [`aisix_obs::LatencyLabels`], held on the request's cell
+/// between the two sides of its end-to-end observation.
+pub(crate) struct OwnedLatencyLabels {
+    endpoint: String,
+    model: String,
+    provider: String,
+    status: u16,
+    streaming: bool,
+    details: [String; 14],
+}
+
+impl From<aisix_obs::LatencyLabels<'_>> for OwnedLatencyLabels {
+    fn from(l: aisix_obs::LatencyLabels<'_>) -> Self {
+        let d = l.details;
+        Self {
+            endpoint: l.endpoint.to_owned(),
+            model: l.model.to_owned(),
+            provider: l.provider.to_owned(),
+            status: l.status,
+            streaming: l.streaming,
+            details: [
+                d.endpoint,
+                d.inbound_protocol,
+                d.upstream_protocol,
+                d.provider,
+                d.model,
+                d.upstream_model,
+                d.provider_key_id,
+                d.provider_key_name,
+                d.api_key_id,
+                d.api_key_name,
+                d.team_id,
+                d.team_name,
+                d.user_id,
+                d.user_name,
+            ]
+            .map(str::to_owned),
+        }
+    }
+}
+
+impl OwnedLatencyLabels {
+    pub(crate) fn as_labels(&self) -> aisix_obs::LatencyLabels<'_> {
+        let d = &self.details;
+        aisix_obs::LatencyLabels {
+            endpoint: &self.endpoint,
+            model: &self.model,
+            provider: &self.provider,
+            status: self.status,
+            streaming: self.streaming,
+            details: UsageLabels {
+                endpoint: &d[0],
+                inbound_protocol: &d[1],
+                upstream_protocol: &d[2],
+                provider: &d[3],
+                model: &d[4],
+                upstream_model: &d[5],
+                provider_key_id: &d[6],
+                provider_key_name: &d[7],
+                api_key_id: &d[8],
+                api_key_name: &d[9],
+                team_id: &d[10],
+                team_name: &d[11],
+                user_id: &d[12],
+                user_name: &d[13],
+            },
+        }
+    }
+}
+
+/// What one request consumed. Every counter below no-ops on an all-zero
+/// value, so the zero-token paths — a failed attempt, a 501, `/v1/files` —
+/// cost nothing and create no series.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Tokens<'a> {
+    pub input: u32,
+    pub output: u32,
+    /// The canonical, CACHE-INCLUSIVE total. Use
+    /// `usage_attr::total_tokens_with_cache` wherever cache counters exist
+    /// (#740/#1002) — a bare input+output silently undercounts cached
+    /// traffic, and this value is what the by-client series reports as
+    /// `token_type="total"`.
+    pub total: u32,
+    /// Upstream prompt-cache detail (AISIX-Cloud#1404), each field
+    /// forwarded exactly as the upstream reported it and never folded
+    /// into `input` / `total` — the two accounting shapes are
+    /// incompatible, so the split is what makes a cross-protocol cache
+    /// ratio computable at all. `cached` is `UsageStats::
+    /// cached_prompt_tokens` (already inside `input`); `cache_read` and
+    /// `cache_creation` are the Anthropic-shape counters that sit
+    /// outside `input` and inside `total`. All three are 0 on the
+    /// endpoints and providers that report no cache detail, which emits
+    /// no series.
+    pub cached: u32,
+    pub cache_read: u32,
+    pub cache_creation: u32,
+    /// Normalised inbound client for the by-client series
+    /// (`state.client_classifier.classify(&client.user_agent)`).
+    pub client_type: &'a str,
+}
+
+/// Terminal token emit, shared by every handler — the companion to
+/// [`record`].
+///
+/// Three families ride along, and each had a DIFFERENT endpoint coverage
+/// before #1234's follow-up: the `aisix_llm_*_tokens_total`
+/// families were chat and messages only,
+/// `aisix_llm_tokens_by_client_total` was chat, messages and responses, and
+/// the legacy `aisix_tokens_consumed_total` was chat ALONE. A gateway that
+/// billed a customer for `/v1/embeddings` reported none of those tokens.
+///
+/// Labels come from the same [`Caller`] / [`Upstream`] pair [`record`] uses,
+/// so a query joining requests to tokens lines up by construction, and this
+/// adds no series dimension the request families don't already carry.
+pub(crate) fn record_usage(
+    state: &ProxyState,
+    endpoint: &'static str,
+    caller: Caller<'_>,
+    upstream: Upstream<'_>,
+    tokens: Tokens<'_>,
+) {
+    // Same emit-chokepoint bounding as `record` — see the note there.
+    let snap = state.snapshot.load();
+    let (model_label, upstream_label) =
+        crate::usage_attr::metric_model_label_pair(&snap, upstream.model, upstream.upstream_model);
+    let upstream = Upstream {
+        model: model_label.as_ref(),
+        upstream_model: upstream_label.as_ref(),
+        ..upstream
+    };
+    // Legacy compatibility series (provider × model).
+    state
+        .metrics
+        .record_tokens(upstream.provider, upstream.model, u64::from(tokens.total));
+    state.metrics.record_llm_usage(
+        UsageLabels {
+            endpoint,
+            inbound_protocol: inbound_protocol(endpoint),
+            upstream_protocol: upstream.pk.protocol(),
+            provider: upstream.provider,
+            model: upstream.model,
+            upstream_model: upstream.upstream_model,
+            provider_key_id: upstream.pk.id(),
+            provider_key_name: upstream.pk.name(),
+            api_key_id: caller.api_key_id,
+            api_key_name: caller.api_key_name,
+            team_id: caller.team_id,
+            team_name: caller.team_name,
+            user_id: caller.user_id,
+            user_name: caller.user_name,
+        },
+        LlmUsage {
+            input_tokens: tokens.input,
+            output_tokens: tokens.output,
+            total_tokens: tokens.total,
+            cached_input_tokens: tokens.cached,
+            cache_read_input_tokens: tokens.cache_read,
+            cache_creation_input_tokens: tokens.cache_creation,
+        },
+    );
+    // Deliberately NOT keyed on the labels above: this family is
+    // client_type × model × token_type only, so the per-key dimensions
+    // never multiply it (#890 req-4).
+    state.metrics.record_llm_tokens_by_client(
+        tokens.client_type,
+        upstream.model,
+        u64::from(tokens.input),
+        u64::from(tokens.output),
+        u64::from(tokens.total),
+    );
+}
+
+/// Publish the caller's current rate-limit window: inject the
+/// `x-ratelimit-*` response headers the OpenAI and Anthropic SDKs read to
+/// schedule back-off, and record the remaining-quota gauges.
+///
+/// One function for both so an endpoint cannot ship the header without the
+/// metric, or the metric with an unbounded label. `model` is collapsed
+/// through [`crate::usage_attr::metric_model_label_pair`] here rather than at
+/// the call site: a wildcard row serves arbitrary caller-minted names, every
+/// distinct `(api_key_id, model)` pair registers a new Prometheus series, and
+/// the recorder sets no idle timeout — so a raw request string is
+/// attacker-controlled cardinality that is never reclaimed (#451).
+///
+/// No-op when the key has no limit configured: `peek` returns `None` and the
+/// caller should not read an absent header as "unlimited".
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn publish_rate_limit_window(
+    metrics: &aisix_obs::Metrics,
+    limiter: &aisix_ratelimit::Limiter,
+    snapshot: &aisix_core::AisixSnapshot,
+    api_key_id: &str,
+    limits: &aisix_core::RateLimit,
+    requested_model: &str,
+    upstream_model: &str,
+    response: &mut axum::response::Response,
+) {
+    let Some(status) = limiter.peek(api_key_id, limits).await else {
+        return;
+    };
+    crate::render::inject_ratelimit_headers(response, &status);
+    let (model, _) =
+        crate::usage_attr::metric_model_label_pair(snapshot, requested_model, upstream_model);
+    let api_key_name = snapshot
+        .apikeys
+        .get_by_id(api_key_id)
+        .and_then(|e| e.value.telemetry_name().map(str::to_owned));
+    metrics.set_rate_limit_remaining(
+        api_key_id,
+        api_key_name.as_deref().unwrap_or(UNKNOWN),
+        model.as_ref(),
+        status.rpm_remaining(),
+        status.tpm_remaining(),
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    /// H-01 / L-11: the `x-ratelimit-*` headers and the remaining-quota
+    /// gauges ship from one call so an endpoint cannot emit one without the
+    /// other — and the gauge's `model` label is collapsed to the resolved
+    /// row. A wildcard row serves arbitrary caller-minted names, and nothing
+    /// evicts a Prometheus series, so labelling with the raw request string
+    /// is unbounded cardinality (#451).
+    #[tokio::test]
+    async fn publish_rate_limit_window_bounds_the_model_label_and_sets_headers() {
+        use aisix_core::resource::ResourceEntry;
+        use aisix_core::snapshot::ResourceTable;
+
+        let table = ResourceTable::default();
+        let wildcard: aisix_core::Model = serde_json::from_value(serde_json::json!({
+            "display_name": "openai/*",
+            "provider": "openai",
+            "model_name": "*",
+            "provider_key_id": "pk-1",
+        }))
+        .unwrap();
+        table.insert(ResourceEntry::new("m-star", wildcard, 1));
+        let snapshot = aisix_core::AisixSnapshot {
+            models: table,
+            ..Default::default()
+        };
+
+        let metrics = aisix_obs::Metrics::new(false);
+        let limiter = aisix_ratelimit::Limiter::new();
+        let limits = aisix_core::RateLimit {
+            rpm: Some(100),
+            tpm: Some(10_000),
+            ..Default::default()
+        };
+
+        // Two different caller-minted names the same wildcard row serves.
+        for requested in ["openai/gpt-4o", "openai/anything-else"] {
+            // Production peeks after the commit, so the bucket exists.
+            let _reservation = limiter.pre_commit("key-1", &limits).await.unwrap();
+            let mut response = axum::response::Response::new(axum::body::Body::empty());
+            publish_rate_limit_window(
+                &metrics,
+                &limiter,
+                &snapshot,
+                "key-1",
+                &limits,
+                requested,
+                "gpt-4o",
+                &mut response,
+            )
+            .await;
+            assert!(
+                response
+                    .headers()
+                    .contains_key("x-ratelimit-limit-requests"),
+                "the window must reach the client as headers too"
+            );
+        }
+
+        let scrape = metrics.render();
+        let series: Vec<&str> = scrape
+            .lines()
+            .filter(|line| line.starts_with("aisix_ratelimit_remaining_requests{"))
+            .collect();
+        assert_eq!(
+            series.len(),
+            1,
+            "two caller-minted names served by one wildcard row must collapse \
+             to a single series, got: {series:?}"
+        );
+        assert!(
+            series[0].contains("model=\"openai/*\""),
+            "label must be the resolved row, got: {}",
+            series[0]
+        );
+        assert!(
+            !scrape.contains("openai/gpt-4o"),
+            "the raw caller-supplied model must never reach a metric label"
+        );
+    }
+
+    use super::*;
+
+    use aisix_core::{Model, ResourceEntry};
+
+    #[tokio::test]
+    async fn parked_metrics_keep_request_facts_after_the_scope_ends(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for (endpoint, protocol) in [
+            ("/v1/files", "anthropic"),
+            ("/v1/chat/completions", "openai"),
+        ] {
+            let config = serde_json::from_value(serde_json::json!({"addr":"127.0.0.1:0"}))?;
+            let state = ProxyState::new(
+                aisix_core::snapshot::SnapshotHandle::new(AisixSnapshot::new()),
+                std::sync::Arc::new(aisix_gateway::Hub::new()),
+                &config,
+            );
+            let cell = std::sync::Arc::new(
+                crate::attribution::RequestAttribution::default()
+                    .with_inbound_protocol(protocol)
+                    .with_llm_inference(false),
+            );
+            let pending = crate::attribution::scope(cell, async {
+                PendingRequestMetrics::at_stream_end(
+                    &state,
+                    endpoint,
+                    Caller::unattributed(None),
+                    Upstream::default(),
+                    std::time::Instant::now(),
+                )
+            })
+            .await;
+            assert_eq!(crate::attribution::inbound_protocol(), None);
+            assert_eq!(crate::attribution::counts_as_llm(), None);
+            pending.record_terminal(200, ErrorSource::None);
+            let scrape = state.metrics.render();
+            let requests: Vec<_> = scrape
+                .lines()
+                .filter(|line| line.starts_with("aisix_proxy_requests_total{"))
+                .collect();
+            assert_eq!(requests.len(), 1, "{scrape}");
+            assert!(
+                requests[0].contains(&format!("inbound_protocol=\"{protocol}\"")),
+                "{}",
+                requests[0]
+            );
+            assert_eq!(
+                requests[0].rsplit_once(' ').map(|(_, count)| count),
+                Some("1")
+            );
+            assert!(
+                !scrape
+                    .lines()
+                    .any(|line| line.starts_with("aisix_llm_requests_total{")),
+                "a parked management request became inference: {scrape}"
+            );
+        }
+        Ok(())
+    }
+
+    fn snapshot_with(display_name: &str, body: serde_json::Value) -> AisixSnapshot {
+        let model: Model = serde_json::from_value(body).unwrap();
+        let snap = AisixSnapshot::new();
+        snap.models
+            .insert(ResourceEntry::new(display_name, model, 1));
+        snap
+    }
+
+    fn resolved(requested: &str) -> crate::attribution::Resolved {
+        crate::attribution::Resolved {
+            requested_model: requested.to_string(),
+            provider: "OpenAI".to_string(),
+            upstream_model: "gpt-4o-mini".to_string(),
+            provider_key_id: "pk-1".to_string(),
+            cache_hit_layer: None,
+            ..Default::default()
+        }
+    }
+
+    /// The vendor id reaches the label lowercased, because the success path
+    /// lowercases at its own emit — a failure spelling it differently would
+    /// put one provider on two series, which is the bug this recovers from.
+    #[test]
+    fn a_recovered_target_matches_the_success_paths_spelling() {
+        let snap = snapshot_with(
+            "direct",
+            serde_json::json!({
+                "display_name": "direct",
+                "provider": "openai",
+                "model_name": "gpt-4o-mini",
+                "provider_key_id": "pk-1",
+            }),
+        );
+        let r = resolved("direct");
+        let target = LastTarget::new(&snap, &r);
+        let upstream = target.upstream("direct", false, false);
+        assert_eq!(target.provider(), "openai");
+        assert_eq!(upstream.provider, "openai");
+        assert_eq!(upstream.upstream_model, "gpt-4o-mini");
+        assert_eq!(upstream.pk.id(), "pk-1");
+    }
+
+    /// An ensemble's panel members all run, so the cell holds whichever
+    /// resolved last. Naming it would read as "this key is what failed" —
+    /// a plausible-looking wrong answer. The placeholder is the honest one.
+    #[test]
+    fn an_ensemble_failure_is_not_attributed_to_one_of_its_members() {
+        let snap = snapshot_with(
+            "panel",
+            serde_json::json!({
+                "display_name": "panel",
+                "ensemble": {
+                    "panel": [{"model": "gpt4"}],
+                    "judge": {"model": "gpt4"},
+                },
+            }),
+        );
+        let r = resolved("panel");
+        let target = LastTarget::new(&snap, &r);
+        let upstream = target.upstream("panel", false, false);
+        assert_eq!(upstream.provider, UNKNOWN);
+        assert_eq!(upstream.upstream_model, UNKNOWN);
+        assert_eq!(upstream.pk.id(), UNKNOWN);
+        assert_eq!(upstream.pk.name(), UNKNOWN);
+    }
+
+    /// A request that never selected a target keeps the placeholder, and the
+    /// ProviderKey id must be `unknown` rather than the empty string an
+    /// unresolved `ResolvedPk` reports verbatim — an empty label value would
+    /// be a second "nothing resolved" series alongside it.
+    #[test]
+    fn nothing_resolved_collapses_to_one_placeholder() {
+        let snap = AisixSnapshot::new();
+        let nothing = crate::attribution::Resolved::default();
+        let target = LastTarget::new(&snap, &nothing);
+        let upstream = target.upstream(crate::usage_attr::UNRESOLVED_MODEL_LABEL, false, false);
+        assert_eq!(upstream.provider, UNKNOWN);
+        assert_eq!(upstream.upstream_model, UNKNOWN);
+        assert_eq!(upstream.pk.id(), UNKNOWN);
+        assert_eq!(upstream.pk.name(), UNKNOWN);
+    }
+
+    /// Every registered proxy route, as its raw request path. Adding a route
+    /// to `build_router` without adding it here leaves the tests below
+    /// unable to see it — which is the point: the two assertions that follow
+    /// are what force a new endpoint's `endpoint` label and LLM-vs-proxy
+    /// tier to be decided rather than defaulted.
+    const ROUTES: &[&str] = &[
+        "/v1/models",
+        "/v1/models/gpt-4o",
+        "/v1/key",
+        "/v1/generation",
+        "/.well-known/oauth-protected-resource",
+        "/.well-known/oauth-protected-resource/mcp",
+        "/.well-known/oauth-protected-resource/mcp/some-server",
+        "/.well-known/oauth-authorization-server/mcp/some-server",
+        "/mcp/some-server/.well-known/openid-configuration",
+        "/mcp/some-server/.well-known/jwks.json",
+        "/mcp/some-server/oauth/register",
+        "/mcp/some-server/oauth/authorize",
+        "/mcp/some-server/oauth/token",
+        "/mcp/some-server/oauth/credential",
+        "/mcp-oauth/callback",
+        "/mcp-oauth/login/callback",
+        "/mcp-oauth/consent",
+        "/a2a/some-agent/.well-known/agent-card.json",
+        "/v1/chat/completions",
+        "/v1/chat/completions/chatcmpl_sample",
+        "/v1/chat/completions/chatcmpl_sample/messages",
+        "/v1/completions",
+        "/v1/embeddings",
+        "/v1/images/generations",
+        "/v1/images/edits",
+        "/v1/images/variations",
+        "/v1/moderations",
+        "/v1/content_provenance_checks",
+        "/v1/messages",
+        "/v1/messages/count_tokens",
+        "/v1/rerank",
+        "/v1/systemone",
+        "/v1/decisions",
+        "/v1/responses",
+        "/v1/responses/compact",
+        "/v1/responses/input_tokens",
+        "/v1/responses/resp_sample",
+        "/v1/responses/resp_sample/cancel",
+        "/v1/responses/resp_sample/input_items",
+        "/v1/audio/transcriptions",
+        "/v1/audio/translations",
+        "/v1/audio/speech",
+        "/v1/videos",
+        "/v1/videos/vid_abc123",
+        "/v1/videos/vid_abc123/content",
+        "/v1/realtime",
+        "/v1/files",
+        "/v1/files/file_abc123",
+        "/v1/files/file_abc123/content",
+        "/v1/conversations",
+        "/v1/conversations/owned_sample",
+        "/v1/conversations/owned_sample/items",
+        "/v1/conversations/owned_sample/items/item_sample",
+        "/v1/containers",
+        "/v1/containers/owned_sample",
+        "/v1/containers/owned_sample/files",
+        "/v1/containers/owned_sample/files/file_sample",
+        "/v1/containers/owned_sample/files/file_sample/content",
+        "/v1/vector_stores",
+        "/v1/vector_stores/owned_sample",
+        "/v1/vector_stores/owned_sample/search",
+        "/v1/vector_stores/owned_sample/files",
+        "/v1/vector_stores/owned_sample/files/file_sample",
+        "/v1/vector_stores/owned_sample/files/file_sample/content",
+        "/v1/vector_stores/owned_sample/file_batches",
+        "/v1/vector_stores/owned_sample/file_batches/batch_sample",
+        "/v1/vector_stores/owned_sample/file_batches/batch_sample/cancel",
+        "/v1/vector_stores/owned_sample/file_batches/batch_sample/files",
+        "/v1/skills",
+        "/v1/skills/id_sample",
+        "/v1/skills/id_sample/content",
+        "/v1/skills/id_sample/versions",
+        "/v1/skills/id_sample/versions/version_sample",
+        "/v1/skills/id_sample/versions/version_sample/content",
+        "/v1/audio/voice_consents",
+        "/v1/audio/voice_consents/id_sample",
+        "/v1/audio/voices",
+        "/v1/audio/voices/id_sample",
+        "/v1/evals",
+        "/v1/evals/eval_id_sample",
+        "/v1/evals/eval_id_sample/runs",
+        "/v1/evals/eval_id_sample/runs/run_id_sample",
+        "/v1/evals/eval_id_sample/runs/run_id_sample/cancel",
+        "/v1/evals/eval_id_sample/runs/run_id_sample/output_items",
+        "/v1/evals/eval_id_sample/runs/run_id_sample/output_items/output_item_id_sample",
+        "/v1/uploads",
+        "/v1/uploads/upload_sample/parts",
+        "/v1/uploads/upload_sample/complete",
+        "/v1/uploads/upload_sample/cancel",
+        "/v1/batches",
+        "/v1/batches/batch_abc123",
+        "/v1/batches/batch_abc123/cancel",
+        "/v1/messages/batches",
+        "/v1/messages/batches/msgbatch_sample",
+        "/v1/messages/batches/msgbatch_sample/cancel",
+        "/v1/messages/batches/msgbatch_sample/results",
+        "/v1/fine_tuning/jobs",
+        "/v1/fine_tuning/jobs/ft_abc123",
+        "/v1/fine_tuning/jobs/ft_abc123/cancel",
+        "/mcp",
+        // 带尾斜杠的那条是单独注册的，归一化里也有专门的臂 —— 两者都要有样本，
+        // 否则那个臂没有任何断言看着。
+        "/mcp/",
+        "/mcp/some-server",
+        "/a2a/some-agent",
+        "/a2a/some-agent/.well-known/agent-card.json",
+        "/passthrough/openai/v1/anything",
+    ];
+
+    /// Routes deliberately outside the per-endpoint request families, with
+    /// the reason. Everything else must have a sample in [`ROUTES`].
+    ///
+    /// The liveness and readiness probes are scraped continuously by the
+    /// orchestrator, carry no caller identity, and answer from process state
+    /// without reaching an upstream — a per-endpoint series for them would
+    /// be pure scrape noise sharing labels with real traffic.
+    const NOT_METERED: &[&str] = &["/livez", "/readyz"];
+
+    /// Every protocol `inbound_protocol_for_endpoint` can return must survive
+    /// the usage sink's label bounding unchanged.
+    ///
+    /// Two closed sets, in two crates, describing the same thing: the request
+    /// and LLM families label a request with the first, and the usage-event
+    /// families with the second. When they disagree the same request carries
+    /// two different protocols and an operator cannot join the families on
+    /// it — which is what happened to `a2a`, `realtime`, `passthrough` and
+    /// `batch`, folded into `other` on one side while the other named them.
+    #[test]
+    fn inbound_protocol_label_set_covers_every_endpoint() {
+        for route in ROUTES {
+            let endpoint = crate::normalize_endpoint_label(route);
+            let protocol = crate::inbound_protocol_for_endpoint(endpoint);
+            assert_eq!(
+                aisix_obs::bounded_inbound_protocol(protocol),
+                protocol,
+                "{endpoint} 的协议标签 {protocol:?} 会被用量事件那侧折成 \
+                 {:?} —— 同一次请求在两个指标族里协议不同，join 不起来",
+                aisix_obs::bounded_inbound_protocol(protocol),
+            );
+        }
+    }
+
+    /// Every `inbound_protocol` literal a handler writes onto a `UsageEvent`
+    /// must survive the sink's label bounding unchanged.
+    ///
+    /// The sibling test above covers the values derived from the endpoint
+    /// label. These are the ones handlers set directly on the event —
+    /// `"batch"`, `"passthrough"`, `"realtime"` — and they are what the
+    /// usage-event families label with. A handler adding a new one lands in
+    /// `other` silently: the events still flow, they just stop being
+    /// distinguishable, which looks exactly like that protocol having no
+    /// traffic.
+    ///
+    /// Read off the tree rather than listed here, so a new handler is
+    /// covered by existing.
+    #[test]
+    fn every_written_inbound_protocol_is_a_bounded_label() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for e in entries.flatten() {
+                let path = e.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|x| x == "rs") {
+                    let Ok(src) = std::fs::read_to_string(&path) else {
+                        continue;
+                    };
+                    // 只看生产段：测试里会故意写越界的值来钉住收口本身。
+                    let production = src.split_once("#[cfg(test)]").map_or(&src[..], |(a, _)| a);
+                    for chunk in production.split("inbound_protocol: \"").skip(1) {
+                        if let Some(end) = chunk.find('"') {
+                            out.push((
+                                path.file_name()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                                    .into(),
+                                chunk[..end].to_string(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut found = Vec::new();
+        walk(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut found,
+        );
+        assert!(
+            found.len() >= 5,
+            "只扫到 {} 个 inbound_protocol 字面量，抽取多半坏了",
+            found.len()
+        );
+        for (file, protocol) in found {
+            assert_eq!(
+                aisix_obs::bounded_inbound_protocol(&protocol),
+                protocol,
+                "{file} 写的协议 {protocol:?} 会被用量事件那侧折成 {:?} —— \
+                 它的用量事件从此和「没有流量」看起来一样",
+                aisix_obs::bounded_inbound_protocol(&protocol),
+            );
+        }
+    }
+
+    /// Every route `build_router` registers must have a sample in [`ROUTES`]
+    /// or an entry in [`NOT_METERED`].
+    ///
+    /// [`ROUTES`] is what makes the two assertions below able to see a route
+    /// at all, and it was kept in step by eye: a route added to
+    /// `build_router` and not here produced no failure, it just stopped
+    /// being checked. That is the same invisibility that shipped `/v1/videos`
+    /// reporting `endpoint="other"` (#1234) — the label was never decided,
+    /// and nothing said so.
+    ///
+    /// The route table is read out of this crate's own source rather than
+    /// duplicated: a third list would be a third thing to align by hand. The
+    /// scan stops at the test module so routes declared by tests below do not
+    /// count as shipped ones.
+    #[test]
+    fn every_registered_route_is_covered_by_a_sample() {
+        const LIB_SRC: &str = include_str!("lib.rs");
+        // 分界是测试模块本身：lib.rs 顶部还有别的 `#[cfg(test)]` 声明，在第一处
+        // 切开会把 `build_router` 也切掉。
+        let production = LIB_SRC
+            .split_once("#[cfg(test)]\nmod tests {")
+            .map(|(before, _)| before)
+            .unwrap_or(LIB_SRC);
+
+        // `.route("<pattern>"` — the literal may sit on the next line.
+        let mut patterns: Vec<&str> = Vec::new();
+        for chunk in production.split(".route(").skip(1) {
+            let Some(open) = chunk.find('"') else {
+                continue;
+            };
+            // 只接受紧跟其后的字面量：`.route(` 与它之间只能有空白，否则那是
+            // 别的东西（比如注释里提到的 `.route(`）。
+            if !chunk[..open].chars().all(char::is_whitespace) {
+                continue;
+            }
+            let rest = &chunk[open + 1..];
+            let Some(close) = rest.find('"') else {
+                continue;
+            };
+            patterns.push(&rest[..close]);
+        }
+        patterns.sort_unstable();
+        patterns.dedup();
+        assert!(
+            patterns.len() > 20,
+            "只从源码里认出 {} 条路由，抽取多半坏了（真实数量是三十几条）",
+            patterns.len()
+        );
+
+        /// 一个样本路径是否匹配一条路由模式。`:param` 段匹配任意一段。
+        fn matches(pattern: &str, sample: &str) -> bool {
+            let p: Vec<&str> = pattern.split('/').collect();
+            let s: Vec<&str> = sample.split('/').collect();
+            p.len() == s.len()
+                && p.iter()
+                    .zip(&s)
+                    .all(|(pseg, sseg)| pseg.starts_with(':') || pseg == sseg)
+        }
+
+        for pattern in &patterns {
+            if NOT_METERED.contains(pattern) {
+                continue;
+            }
+            assert!(
+                ROUTES.iter().any(|sample| matches(pattern, sample)),
+                "路由 {pattern} 在 ROUTES 里没有样本，于是下面两条断言看不见它 —— \
+                 它的 endpoint 标签和 LLM/proxy 分层都还没被决定过。加一个样本，\
+                 或者连同理由加进 NOT_METERED。"
+            );
+        }
+    }
+
+    /// No proxy route may fall through to the `"other"` bucket. A route that
+    /// does is invisible per-endpoint in every request series — which is how
+    /// `/v1/videos` shipped (#1234): it was registered in
+    /// `build_router` but missing from the normalizer's allowlist, so all
+    /// video traffic reported `endpoint="other"`.
+    #[test]
+    fn every_route_has_its_own_endpoint_label() {
+        for route in ROUTES {
+            assert_ne!(
+                crate::normalize_endpoint_label(route),
+                "other",
+                "route {route} is missing from normalize_endpoint_label"
+            );
+        }
+    }
+
+    /// Guards against a typo in [`LLM_ENDPOINTS`]. An entry that no route
+    /// normalizes to can never match, and the failure is silent: the
+    /// endpoint just stops appearing in `aisix_llm_requests_total`, which is
+    /// indistinguishable from having no traffic.
+    #[test]
+    fn llm_endpoints_are_reachable() {
+        let reachable: Vec<&str> = ROUTES
+            .iter()
+            .map(|r| crate::normalize_endpoint_label(r))
+            .collect();
+        for endpoint in LLM_ENDPOINTS {
+            assert!(
+                reachable.contains(endpoint),
+                "no route normalizes to {endpoint} — dead entry in LLM_ENDPOINTS"
+            );
+        }
+    }
+
+    /// The tier split itself: the inference routes carry the LLM series, the
+    /// tool / management / tunnel surfaces carry only the proxy series.
+    #[test]
+    fn tiers_split_inference_from_the_rest() {
+        for route in [
+            "/v1/chat/completions",
+            "/v1/responses",
+            "/v1/responses/compact",
+            "/v1/responses/input_tokens",
+            "/v1/messages/count_tokens",
+            "/v1/embeddings",
+            "/v1/images/edits",
+            "/v1/images/variations",
+            "/v1/moderations",
+            "/v1/content_provenance_checks",
+            "/v1/audio/speech",
+            "/v1/videos/vid_abc123/content",
+            // Moved in once realtime started reporting its tokens + cost.
+            "/v1/realtime",
+        ] {
+            assert!(
+                is_llm_endpoint(crate::normalize_endpoint_label(route)),
+                "{route} should count as an LLM request"
+            );
+        }
+        for route in [
+            "/mcp/some-server",
+            "/a2a/some-agent",
+            "/v1/batches/batch_abc123",
+            "/v1/chat/completions/chatcmpl_sample",
+            "/v1/chat/completions/chatcmpl_sample/messages",
+            "/v1/conversations",
+            "/v1/conversations/owned_sample",
+            "/v1/conversations/owned_sample/items",
+            "/v1/conversations/owned_sample/items/item_sample",
+            "/v1/containers",
+            "/v1/containers/owned_sample",
+            "/v1/containers/owned_sample/files",
+            "/v1/containers/owned_sample/files/file_sample",
+            "/v1/containers/owned_sample/files/file_sample/content",
+            "/v1/vector_stores",
+            "/v1/vector_stores/owned_sample",
+            "/v1/vector_stores/owned_sample/search",
+            "/v1/vector_stores/owned_sample/files",
+            "/v1/vector_stores/owned_sample/files/file_sample",
+            "/v1/vector_stores/owned_sample/files/file_sample/content",
+            "/v1/vector_stores/owned_sample/file_batches",
+            "/v1/vector_stores/owned_sample/file_batches/batch_sample",
+            "/v1/vector_stores/owned_sample/file_batches/batch_sample/cancel",
+            "/v1/vector_stores/owned_sample/file_batches/batch_sample/files",
+            "/v1/skills",
+            "/v1/skills/id_sample",
+            "/v1/skills/id_sample/content",
+            "/v1/skills/id_sample/versions",
+            "/v1/skills/id_sample/versions/version_sample",
+            "/v1/skills/id_sample/versions/version_sample/content",
+            "/v1/audio/voice_consents",
+            "/v1/audio/voice_consents/id_sample",
+            "/v1/audio/voices",
+            "/v1/audio/voices/id_sample",
+            "/v1/evals",
+            "/v1/evals/eval_id_sample",
+            "/v1/evals/eval_id_sample/runs",
+            "/v1/evals/eval_id_sample/runs/run_id_sample",
+            "/v1/evals/eval_id_sample/runs/run_id_sample/cancel",
+            "/v1/evals/eval_id_sample/runs/run_id_sample/output_items",
+            "/v1/evals/eval_id_sample/runs/run_id_sample/output_items/output_item_id_sample",
+            "/v1/uploads",
+            "/v1/uploads/upload_sample/parts",
+            "/v1/uploads/upload_sample/complete",
+            "/v1/uploads/upload_sample/cancel",
+            "/v1/responses/resp_sample",
+            "/v1/responses/resp_sample/cancel",
+            "/v1/responses/resp_sample/input_items",
+            "/passthrough/openai/v1/anything",
+            "/livez",
+        ] {
+            assert!(
+                !is_llm_endpoint(crate::normalize_endpoint_label(route)),
+                "{route} must not count as an LLM request"
+            );
+        }
+    }
+}

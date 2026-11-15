@@ -5186,7 +5186,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         // Lists span the account: scoped keys are told so, by name of the reason.
-        for uri in ["/v1/files", "/v1/batches", "/v1/fine_tuning/jobs"] {
+        for uri in ["/v1/files", "/v1/batches"] {
             let (status, body) = call("sk-a", "GET", format!("{uri}?model=jobs-a")).await;
             assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {body}");
             assert!(body.contains("listing is not available"), "{uri}: {body}");
@@ -5382,32 +5382,15 @@ mod tests {
         ));
         let app = build_app(snap);
         let a_file = encode_routed_id("file-a", "jobs-a", Some(("team:t-a", SECRET_A)));
-        let b_file = encode_routed_id("file-b", "jobs-a", Some(("team:t-b", SECRET_A)));
         for (uri, body) in [
             (
                 "/v1/batches",
                 serde_json::json!({"input_file_id": a_file, "endpoint": "/v1/chat/completions"}),
             ),
-            (
-                "/v1/fine_tuning/jobs",
-                serde_json::json!({"training_file": a_file, "model": "gpt-4o-mini"}),
-            ),
-            (
-                "/v1/fine_tuning/jobs",
-                serde_json::json!({"training_file": b_file, "validation_file": a_file, "model": "gpt-4o-mini"}),
-            ),
             // A provider's own id names no owner, so it is not this key's.
             (
                 "/v1/batches?model=jobs-a",
                 serde_json::json!({"input_file_id": "file-a", "endpoint": "/v1/chat/completions"}),
-            ),
-            (
-                "/v1/fine_tuning/jobs?model=jobs-a",
-                serde_json::json!({"training_file": "file-a", "model": "gpt-4o-mini"}),
-            ),
-            (
-                "/v1/fine_tuning/jobs",
-                serde_json::json!({"training_file": b_file, "validation_file": "file-a", "model": "gpt-4o-mini"}),
             ),
         ] {
             let req = Request::builder()
@@ -6987,65 +6970,6 @@ mod tests {
         assert_ne!(first_call.event_id, first.event_id);
     }
 
-    // ---- fine-tuning ----
-
-    #[tokio::test]
-    async fn ft_create_routes_by_training_file_and_reencodes_ids() {
-        let upstream = MockServer::builder().start().await;
-        Mock::given(wm_method("POST"))
-            .and(path("/v1/fine_tuning/jobs"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "ftjob-9",
-                "object": "fine_tuning.job",
-                "model": "gpt-4o-mini-2024-07-18",
-                "training_file": "file-train",
-                "result_files": ["file-res"]
-            })))
-            .mount(&upstream)
-            .await;
-
-        let snap = AisixSnapshot::new();
-        snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
-        snap.models.insert(model("m-a", "jobs-a", PK_A));
-        snap.apikeys.insert(apikey_entry(&["*"]));
-        let app = build_app(snap);
-
-        let body = serde_json::json!({
-            // The provider BASE model forwards verbatim; routing rides the
-            // encoded training_file id.
-            "model": "gpt-4o-mini-2024-07-18",
-            "training_file": encode_routed_id("file-train", "jobs-a", None),
-        });
-        let req = Request::builder()
-            .method("POST")
-            .uri("/v1/fine_tuning/jobs")
-            .header("authorization", "Bearer sk-caller")
-            .header("content-type", "application/json")
-            .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let received = upstream.received_requests().await.unwrap();
-        let sent: Value = serde_json::from_slice(&received[0].body).unwrap();
-        assert_eq!(sent["training_file"], "file-train");
-        assert_eq!(
-            sent["model"], "gpt-4o-mini-2024-07-18",
-            "FT base model must forward verbatim"
-        );
-
-        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
-        let v: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(
-            decode_routed_id(v["id"].as_str().unwrap()),
-            Some(routed("ftjob-9", "jobs-a"))
-        );
-        assert_eq!(
-            decode_routed_id(v["result_files"][0].as_str().unwrap()),
-            Some(routed("file-res", "jobs-a"))
-        );
-    }
-
     // ---- azure ----
 
     #[tokio::test]
@@ -8049,41 +7973,5 @@ mod tests {
         assert_eq!(v["error"]["type"], "content_filter", "{v}");
     }
 
-    /// The scope boundary, response side. Fine-tuning reads share
-    /// `forward_simple` with the files reads, so this is what fails if the
-    /// files surface is exempted by deleting that scan rather than by
-    /// naming the surface it belongs to.
-    #[tokio::test]
-    async fn a_fine_tuning_job_read_is_still_screened() {
-        let upstream = MockServer::builder().start().await;
-        Mock::given(wm_method("GET"))
-            .and(path("/v1/fine_tuning/jobs/ftjob-9"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "ftjob-9",
-                "object": "fine_tuning.job",
-                "status": "forbidden-term"
-            })))
-            .mount(&upstream)
-            .await;
-
-        let snap = AisixSnapshot::new();
-        snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
-        snap.models.insert(model("m-a", "jobs-a", PK_A));
-        snap.apikeys.insert(apikey_entry(&["*"]));
-        seed_blocking_output_guardrail(&snap);
-        let app = build_app(snap);
-
-        let req = Request::builder()
-            .method("GET")
-            .uri("/v1/fine_tuning/jobs/ftjob-9?model=jobs-a")
-            .header("authorization", "Bearer sk-caller")
-            .body(axum::body::Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
-        let v: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v["error"]["type"], "content_filter", "{v}");
-    }
     include!("jobs_compat_tests.rs");
 }

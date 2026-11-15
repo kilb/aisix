@@ -1,0 +1,26 @@
+{
+  "schema": "retired-api-tests-1115/formatting/v1",
+  "files": [
+    {
+      "path": "crates/aisix-proxy/src/audio.rs",
+      "before_sha256": "8e8fbff8d6b3c4514fe6ffe3bf1677baec6c3ce92b227d6a13db39d7b5a05113",
+      "after_sha256": "cbfb5d8b10e2a7bb835cb3e69882d53bbd9020f3be310983b0da13935ac22db2"
+    },
+    {
+      "path": "crates/aisix-proxy/src/jobs_compat_tests.rs",
+      "before_sha256": "c55e21b7a256f27caa5f1c90346b43cd40208cd60e21392b1d925b2a7cacd489",
+      "after_sha256": "4d69185cce23eb39edf2dcb000defda6a9aa4212a13e5b271ebe161add922492"
+    },
+    {
+      "path": "crates/aisix-proxy/src/reject.rs",
+      "before_sha256": "5cd04905d3688488f7dde8c8f9ddb10d5ec949097ab3c138723b169a9b53c83a",
+      "after_sha256": "15ece605789ed79a9cffbbdfedebe667d3bbbf3c920af185f75f07ec8119fd6e"
+    },
+    {
+      "path": "crates/aisix-proxy/src/videos.rs",
+      "before_sha256": "8d32e367dcec8976290fcc197f377a25208bd79bc47c40ede7e854455771bd6e",
+      "after_sha256": "9815d3901f54ed7fbd8eee3579339e4ccccc7012cbc6783457c072a9166ae850"
+    }
+  ],
+  "scope": "Only rustfmt cleanup adjacent to removed functions/shortened arrays; no assertions or business values changed."
+}

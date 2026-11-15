@@ -1,0 +1,206 @@
+{
+  "schema_version": 1,
+  "source_base": "4b6cb5142d5e8eaa6cfeee1ee8d04706f29763f0",
+  "worktree": "/home/ubuntu/aisix-work/p3-active-test-curation-1115",
+  "status": "applied_test_scope_curation_only_uncompiled",
+  "policy": "Full original files archived byte-for-byte; remove only declared retired-only test blocks and retired matrix members. Keep active scenarios/assertions, codec/URL/shared HTTP units and listed blockers unchanged. No ignore/filter/expected-value edits.",
+  "files": [
+    {
+      "file": "crates/aisix-proxy/src/audio.rs",
+      "original_blob": "b856874b62159eaae6c6e549ead3e2eed600997c",
+      "original_sha256": "2a313a34ade463f4bc5d3765f0695de7cb5290d1510f35c8cdeafeb705f650be",
+      "archive": "/home/ubuntu/aisix-work/api-compat-1112-evidence/resume-1115/scope-superseded/retired-api-tests-1115/originals/crates/aisix-proxy/src/audio.rs",
+      "current_sha256": "8e8fbff8d6b3c4514fe6ffe3bf1677baec6c3ce92b227d6a13db39d7b5a05113",
+      "original_test_count": 82,
+      "remaining_test_count": 78,
+      "removed_test_blocks": [
+        {
+          "function": "translations_non_utf8_prompt_rejected_without_guardrail",
+          "attribute_start": 3904,
+          "function_start": 3905,
+          "function_end": 3933,
+          "removed_start": 3900,
+          "removed_end": 3933,
+          "test_block_sha256": "2a54f6f329c4ad7b15cdac528b2f45f9576cce708dd6bfced2de888191c225ec",
+          "removed_bytes_sha256": "20ec78360e0a1377ead9bdd3ca71b696c66813ef974cfc04197f2f2f02295aa7",
+          "classification": "scope-superseded-retired-only"
+        },
+        {
+          "function": "compat_media_translation_multipart_owns_content_headers",
+          "attribute_start": 6333,
+          "function_start": 6334,
+          "function_end": 6336,
+          "removed_start": 6333,
+          "removed_end": 6336,
+          "test_block_sha256": "8987eb32cf911f8334bbdbe5f161ce0eb6b4fe273009dade23980fc7486fd866",
+          "removed_bytes_sha256": "8e9e97914bfec7e8b9e02b5419fca29dc3585b77d047da200178be081bb849a0",
+          "classification": "scope-superseded-retired-only"
+        },
+        {
+          "function": "compat_media_azure_translations_api_key_uses_native_v1_route",
+          "attribute_start": 7058,
+          "function_start": 7059,
+          "function_end": 7061,
+          "removed_start": 7058,
+          "removed_end": 7061,
+          "test_block_sha256": "16a409fa150cd70be8332a7af559e8a13ccd4160b3b410aa269e821173f78a4c",
+          "removed_bytes_sha256": "f808ddaac73ef8bbe5c2e7154ecedace4648c54a977bdc40c28da04669985e35",
+          "classification": "scope-superseded-retired-only"
+        },
+        {
+          "function": "compat_media_azure_translations_entra_uses_native_v1_route",
+          "attribute_start": 7063,
+          "function_start": 7064,
+          "function_end": 7066,
+          "removed_start": 7063,
+          "removed_end": 7066,
+          "test_block_sha256": "2658609dd2afe2de70de6e17bd138eab3111f52e5df60da8727a63b0915fccd2",
+          "removed_bytes_sha256": "2b116fa0e5858bd3108859464f3815bcde0b33b5185f26c9699aae65171b0158",
+          "classification": "scope-superseded-retired-only"
+        }
+      ],
+      "removed_matrix_rows": [],
+      "unchanged_or_kept_test_blocks_verified": 78
+    },
+    {
+      "file": "crates/aisix-proxy/src/jobs_compat_tests.rs",
+      "original_blob": "c97899568fd2b04826808305c34d1c72c6a3ba27",
+      "original_sha256": "302450e8129de0786abd42733c1db17623675e82171b32531835aee46eff15e2",
+      "archive": "/home/ubuntu/aisix-work/api-compat-1112-evidence/resume-1115/scope-superseded/retired-api-tests-1115/originals/crates/aisix-proxy/src/jobs_compat_tests.rs",
+      "current_sha256": "c55e21b7a256f27caa5f1c90346b43cd40208cd60e21392b1d925b2a7cacd489",
+      "original_test_count": 10,
+      "remaining_test_count": 10,
+      "removed_test_blocks": [],
+      "removed_matrix_rows": [
+        {
+          "function": "routed_list_cursors_are_decoded_without_losing_query_pairs",
+          "line": 239,
+          "key": "(\"fine_tuning/jobs\", \"ftjob-cursor\"),",
+          "removed_line_sha256": "b04a9f775eb039e058b81dbed7392557b621bae8df35953409f4df30bb03f922"
+        },
+        {
+          "function": "jobs_error_headers_keep_retry_and_sdk_request_identity",
+          "line": 466,
+          "key": "\"fine_tuning/jobs/ftjob-test\",",
+          "removed_line_sha256": "724b916c21467ec8e6a547fa15b27d9ac747bb2fd3457d5155d515a4bf0a2c7e"
+        },
+        {
+          "function": "legacy_job_quota_rejections_keep_each_resolved_target_without_dispatch",
+          "line": 513,
+          "key": "\"fine_tuning_create\",",
+          "removed_line_sha256": "e61497cb24ef97dda4bcff04c4ac96d86486148865d77c3057b17ed30219b044"
+        },
+        {
+          "function": "legacy_job_quota_rejections_keep_each_resolved_target_without_dispatch",
+          "line": 514,
+          "key": "\"forward\",",
+          "resolved_surface": "GET /v1/fine_tuning/jobs/ft_quota (branch :566-570)",
+          "removed_line_sha256": "4595be1b91b8fa42879e980e7ee4b4a09a048e73b13029257f17e959639af56d"
+        }
+      ],
+      "unchanged_or_kept_test_blocks_verified": 7
+    },
+    {
+      "file": "crates/aisix-proxy/src/videos.rs",
+      "original_blob": "fd9374fe1c5f1823b6fff68654de8823c6575d3d",
+      "original_sha256": "e8c0842a4a0ceb45e958a608c06a03d5beb68a09235c816bc0eb2300196cfca9",
+      "archive": "/home/ubuntu/aisix-work/api-compat-1112-evidence/resume-1115/scope-superseded/retired-api-tests-1115/originals/crates/aisix-proxy/src/videos.rs",
+      "current_sha256": "8d32e367dcec8976290fcc197f377a25208bd79bc47c40ede7e854455771bd6e",
+      "original_test_count": 65,
+      "remaining_test_count": 63,
+      "removed_test_blocks": [
+        {
+          "function": "openai_submit_poll_content_proxy_journey",
+          "attribute_start": 5187,
+          "function_start": 5188,
+          "function_end": 5299,
+          "removed_start": 5181,
+          "removed_end": 5299,
+          "test_block_sha256": "72d6ec599a55bbc3a90e16258868d0939e9ca908e5bb70acdf5cf18e18fc627b",
+          "removed_bytes_sha256": "bda590dac82c8dec72727f844832a0a5663ff19220bf2a615adda4d193a0f998",
+          "classification": "scope-superseded-retired-only"
+        },
+        {
+          "function": "openai_content_proxy_upstream_403_maps_to_error_envelope",
+          "attribute_start": 5371,
+          "function_start": 5372,
+          "function_end": 5420,
+          "removed_start": 5368,
+          "removed_end": 5420,
+          "test_block_sha256": "5b6841b16c9176de0a6cf0b98cefcf4b40944b403f5bb45e60e257f6293487ce",
+          "removed_bytes_sha256": "2eb11a6c8e5df59f40b6b6185228b77a297a16e31badb081962eaef51c24cb61",
+          "classification": "scope-superseded-retired-only"
+        }
+      ],
+      "removed_matrix_rows": [],
+      "unchanged_or_kept_test_blocks_verified": 63
+    }
+  ],
+  "blockers": [
+    {
+      "file": "crates/aisix-proxy/src/videos.rs",
+      "function": "platform_video_owner_survives_restart_and_blocks_foreign_and_forged_ids",
+      "attribute_start": 2894,
+      "function_start": 2895,
+      "function_end": 2953,
+      "sha256": "afc6ee71a2287f3e80483855b404b842bb4db42d94bc67392109e82f914ba704",
+      "classification": "BLOCKING_ACTIVE_CONTRACT_WITH_RETIRED_OPENAI_FIXTURE",
+      "reason": "共有归属/账户/模型分组合同或共享stream concurrency不能以退役供应商名义删除；原业务assert与case不改。video_owner_snapshot :2837固定openai，或该case new_snap(...,\"openai\",...)。未运行确认失败，需ROOT统一决定独立active fixture coverage，不在此改场景。"
+    },
+    {
+      "file": "crates/aisix-proxy/src/videos.rs",
+      "function": "platform_video_account_changes_invalidate_ids_before_any_poll",
+      "attribute_start": 2955,
+      "function_start": 2956,
+      "function_end": 3000,
+      "sha256": "d2c60b9d39028ddc26ff71715c974ecb00976bd00b8219f25a37bae1de9169eb",
+      "classification": "BLOCKING_ACTIVE_CONTRACT_WITH_RETIRED_OPENAI_FIXTURE",
+      "reason": "共有归属/账户/模型分组合同或共享stream concurrency不能以退役供应商名义删除；原业务assert与case不改。video_owner_snapshot :2837固定openai，或该case new_snap(...,\"openai\",...)。未运行确认失败，需ROOT统一决定独立active fixture coverage，不在此改场景。"
+    },
+    {
+      "file": "crates/aisix-proxy/src/videos.rs",
+      "function": "platform_video_current_model_and_group_permissions_still_apply",
+      "attribute_start": 3002,
+      "function_start": 3003,
+      "function_end": 3042,
+      "sha256": "dbfcb932f228969707105728909d1b364735fc80a44c5cc1b5e5762be4297bca",
+      "classification": "BLOCKING_ACTIVE_CONTRACT_WITH_RETIRED_OPENAI_FIXTURE",
+      "reason": "共有归属/账户/模型分组合同或共享stream concurrency不能以退役供应商名义删除；原业务assert与case不改。video_owner_snapshot :2837固定openai，或该case new_snap(...,\"openai\",...)。未运行确认失败，需ROOT统一决定独立active fixture coverage，不在此改场景。"
+    },
+    {
+      "file": "crates/aisix-proxy/src/videos.rs",
+      "function": "platform_video_forwarded_account_cannot_be_switched_for_followups",
+      "attribute_start": 3044,
+      "function_start": 3045,
+      "function_end": 3104,
+      "sha256": "f9036986fdd80407d88f557895f2ce7f57cfeaef0b4669473207add2f45017fe",
+      "classification": "BLOCKING_ACTIVE_CONTRACT_WITH_RETIRED_OPENAI_FIXTURE",
+      "reason": "共有归属/账户/模型分组合同或共享stream concurrency不能以退役供应商名义删除；原业务assert与case不改。video_owner_snapshot :2837固定openai，或该case new_snap(...,\"openai\",...)。未运行确认失败，需ROOT统一决定独立active fixture coverage，不在此改场景。"
+    },
+    {
+      "file": "crates/aisix-proxy/src/videos.rs",
+      "function": "a_proxied_download_holds_the_key_concurrency_until_its_body_ends",
+      "attribute_start": 5304,
+      "function_start": 5305,
+      "function_end": 5366,
+      "sha256": "bd2c948e492c76c7b095f3c6a008c52af4996f423a62460eea5d62a0cd31524e",
+      "classification": "BLOCKING_ACTIVE_CONTRACT_WITH_RETIRED_OPENAI_FIXTURE",
+      "reason": "共有归属/账户/模型分组合同或共享stream concurrency不能以退役供应商名义删除；原业务assert与case不改。video_owner_snapshot :2837固定openai，或该case new_snap(...,\"openai\",...)。未运行确认失败，需ROOT统一决定独立active fixture coverage，不在此改场景。"
+    }
+  ],
+  "verification": {
+    "cargo": false,
+    "tests": false,
+    "git_index": false,
+    "commit": false,
+    "services": false,
+    "push": false,
+    "source_byte_checks": [
+      "All 3 archives match frozen commit bytes.",
+      "Removed exactly 6 retired-only tests and 4 retired matrix lines.",
+      "All other test functions preserved exactly; the 3 edited matrix functions differ only by listed retired row bytes.",
+      "All 5 active/shared video blocker functions preserved byte-for-byte."
+    ]
+  },
+  "generated_utc": "2026-11-15T06:35:42.441434+00:00"
+}

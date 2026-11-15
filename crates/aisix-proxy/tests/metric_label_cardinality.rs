@@ -169,11 +169,6 @@ fn requests_for(model: &'static str) -> Vec<(&'static str, &'static str, serde_j
                 "completion_window": "24h"
             }),
         ),
-        (
-            "/v1/fine_tuning/jobs",
-            "POST",
-            serde_json::json!({"model": model, "training_file": "file-x"}),
-        ),
     ]
 }
 

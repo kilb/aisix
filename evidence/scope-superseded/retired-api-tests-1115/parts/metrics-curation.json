@@ -1,0 +1,98 @@
+{
+  "schema": "retired-api-tests-1115/metrics-curation/v1",
+  "base_commit": "4b6cb5142d5e8eaa6cfeee1ee8d04706f29763f0",
+  "path": "crates/aisix-proxy/src/request_metrics.rs",
+  "original_copy": "evidence/scope-superseded/retired-api-tests-1115/originals/crates/aisix-proxy/src/request_metrics.rs",
+  "original_sha256": "d0a4ac5d21ff29fd9ebfd8cedf884ea382850f392d224f5d9af5d43e3415ea05",
+  "curated_sha256": "277e9521af5cd06a7ca8861278ceea33bc9b47e374e417a006033e17b19b6c2e",
+  "operations": [
+    {
+      "action": "remove_retired_sample_or_dead_classifier_member",
+      "endpoint": "/v1/images/variations",
+      "occurrences": 3
+    },
+    {
+      "action": "remove_retired_sample_or_dead_classifier_member",
+      "endpoint": "/v1/audio/translations",
+      "occurrences": 2
+    },
+    {
+      "action": "remove_retired_sample_or_dead_classifier_member",
+      "endpoint": "/v1/fine_tuning/jobs",
+      "occurrences": 1
+    },
+    {
+      "action": "remove_retired_sample_or_dead_classifier_member",
+      "endpoint": "/v1/fine_tuning/jobs/ft_abc123",
+      "occurrences": 1
+    },
+    {
+      "action": "remove_retired_sample_or_dead_classifier_member",
+      "endpoint": "/v1/fine_tuning/jobs/ft_abc123/cancel",
+      "occurrences": 1
+    },
+    {
+      "action": "remove_retired_sample_or_dead_classifier_member",
+      "endpoint": "/v1/evals",
+      "occurrences": 2
+    },
+    {
+      "action": "remove_retired_sample_or_dead_classifier_member",
+      "endpoint": "/v1/evals/eval_id_sample",
+      "occurrences": 2
+    },
+    {
+      "action": "remove_retired_sample_or_dead_classifier_member",
+      "endpoint": "/v1/evals/eval_id_sample/runs",
+      "occurrences": 2
+    },
+    {
+      "action": "remove_retired_sample_or_dead_classifier_member",
+      "endpoint": "/v1/evals/eval_id_sample/runs/run_id_sample",
+      "occurrences": 2
+    },
+    {
+      "action": "remove_retired_sample_or_dead_classifier_member",
+      "endpoint": "/v1/evals/eval_id_sample/runs/run_id_sample/cancel",
+      "occurrences": 2
+    },
+    {
+      "action": "remove_retired_sample_or_dead_classifier_member",
+      "endpoint": "/v1/evals/eval_id_sample/runs/run_id_sample/output_items",
+      "occurrences": 2
+    },
+    {
+      "action": "remove_retired_sample_or_dead_classifier_member",
+      "endpoint": "/v1/evals/eval_id_sample/runs/run_id_sample/output_items/output_item_id_sample",
+      "occurrences": 2
+    },
+    {
+      "action": "add_active_GA_census_and_tier",
+      "old": "    \"/v1/realtime\",\n",
+      "new": "    \"/v1/realtime\",\n    \"/v1/realtime/translations\",\n",
+      "occurrences": 1
+    },
+    {
+      "action": "add_active_GA_census_and_tier",
+      "old": "        \"/v1/realtime\",\n",
+      "new": "        \"/v1/realtime\",\n        \"/v1/realtime/client_secrets\",\n        \"/v1/realtime/translations\",\n        \"/v1/realtime/translations/client_secrets\",\n",
+      "occurrences": 1
+    },
+    {
+      "action": "add_active_GA_census_and_tier",
+      "old": "            \"/v1/realtime\",\n",
+      "new": "            \"/v1/realtime\",\n            \"/v1/realtime/translations\",\n",
+      "occurrences": 1
+    },
+    {
+      "action": "add_active_GA_census_and_tier",
+      "old": "        for route in [\n            \"/mcp/some-server\",",
+      "new": "        for route in [\n            \"/v1/realtime/client_secrets\",\n            \"/v1/realtime/translations/client_secrets\",\n            \"/mcp/some-server\",",
+      "occurrences": 1
+    }
+  ],
+  "production_change": "GET /v1/realtime/translations joins the LLM tier because it uses the real session meter. Two client-secrets POSTs remain proxy-only. The two unmounted variation/audio-translation classifier entries are removed.",
+  "assertion_bodies_or_expected_values_changed": false,
+  "active_census_assertions": "unchanged; all three GA routes explicitly covered, with independent inference/management tier assertions",
+  "verification": "Static only; real WS/metrics test pending sole root runner."
+}

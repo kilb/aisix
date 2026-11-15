@@ -1,0 +1,14 @@
+{
+  "schema": "retired-api-tests-1115/cp-evals-curation/v1",
+  "base_commit": "4b6cb5142d5e8eaa6cfeee1ee8d04706f29763f0",
+  "path": "crates/aisix-control-plane/tests/native_evals_gateway_journey.rs",
+  "archive": "evidence/scope-superseded/retired-api-tests-1115/retired-source/crates/aisix-control-plane/tests/native_evals_gateway_journey.rs",
+  "sha256": "dab726b9cd10d4990431170250a851e2c71a9693879afe0e8d4d3f3f7e158640",
+  "bytes": 20748,
+  "scope": "Single retired Evals gateway HTTP/mTLS+PG joint-component journey; no active sibling case in target. The shared native_gateway/support modules remain in place.",
+  "reason": "Cargo auto-discovers this target and it references the retired-only openai_eval_worker; preserve whole target bytes outside auto-discovery rather than selectively delete assertions.",
+  "test_functions": [
+    "accepted_eval_survives_real_authority_restart_and_settles_once_after_withdrawal"
+  ],
+  "verified_runtime": false
+}
