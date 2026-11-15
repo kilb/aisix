@@ -1120,6 +1120,31 @@ pub async fn admin_summary(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn request_timing_projection_preserves_zero_partial_and_unknown() {
+        let unknown =
+            serde_json::to_value(super::CallUsage::from_event(&serde_json::json!({}))).unwrap();
+        assert!(unknown
+            .get("request_timing")
+            .is_none_or(serde_json::Value::is_null));
+        let timing = serde_json::json!({
+            "body_read_ms": 0, "json_decode_ms": 0, "pre_handler_ms": 0,
+            "request_body_bytes": 0, "request_body_complete": false,
+        });
+        let view = serde_json::to_value(super::CallUsage::from_event(&serde_json::json!({
+            "request_timing": timing,
+        })))
+        .unwrap();
+        assert_eq!(view.get("request_timing"), Some(&timing));
+        let partial = serde_json::json!({"body_read_ms": 170,"request_body_bytes": 11,
+            "request_body_complete": false});
+        let view = serde_json::to_value(super::CallUsage::from_event(&serde_json::json!({
+            "request_timing": partial,
+        })))
+        .unwrap();
+        assert_eq!(view.get("request_timing"), Some(&partial));
+    }
+
     use super::*;
 
     #[test]

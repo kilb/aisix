@@ -85,3 +85,59 @@ async fn request_timing_records_slow_json_rejections_across_typed_families() {
     }
     server.abort();
 }
+
+#[tokio::test]
+async fn request_timing_cancelled_upload_reports_partial_read_without_decode() {
+    use std::time::Duration;
+    use tower::ServiceExt;
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let snapshot = seed_snapshot("phase-model", &["phase-model"], "http://unused");
+    let app = build_router(
+        build_state(snapshot, Arc::new(Hub::new())).with_usage_sink(aisix_obs::UsageSink::new(tx)),
+    );
+    let (read_tx, read_rx) = tokio::sync::oneshot::channel();
+    const PREFIX: &[u8] = br#"{"model":"#;
+    let body = async_stream::stream! {
+        yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(PREFIX));
+        let _ = read_tx.send(());
+        std::future::pending::<()>().await;
+    };
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/responses")
+        .header("authorization", "Bearer sk-caller")
+        .header("content-type", "application/json")
+        .body(Body::from_stream(body))
+        .unwrap();
+    let task = tokio::spawn(app.oneshot(request));
+    read_rx.await.unwrap();
+    tokio::time::sleep(Duration::from_millis(160)).await;
+    task.abort();
+    let _ = task.await;
+    let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(event.status_code, 499);
+    let wire = serde_json::to_value(event).unwrap();
+    let timing = wire
+        .get("request_timing")
+        .expect("取消不能丢失已观测入口窗口");
+    let read_ms = timing
+        .get("body_read_ms")
+        .and_then(serde_json::Value::as_u64)
+        .expect("取消发生在真实正文读取窗口内");
+    assert!(read_ms >= 140, "{timing}");
+    assert_eq!(
+        timing.get("request_body_bytes"),
+        Some(&serde_json::json!(PREFIX.len()))
+    );
+    assert_eq!(
+        timing.get("request_body_complete"),
+        Some(&serde_json::json!(false))
+    );
+    assert!(timing.get("json_decode_ms").is_none(), "{timing}");
+    assert!(timing.get("pre_handler_ms").is_none(), "{timing}");
+    assert!(rx.try_recv().is_err());
+}
