@@ -724,10 +724,7 @@ pub(super) async fn append_live_usage(
         }
         return live_reply(&row, Some(false));
     }
-    // 关闭后的已收到尾量仍可补记；活跃会话过期后先由恢复者领取新代次。
-    if row.lease_expires_at <= now() && row.state != "closed" {
-        return Err(Error::NotFound);
-    }
+    // 已校验持久身份和代次；尾量不因 TTL 丢失，也不刷新租约或授予新工作。
     let mut submitted = operation(&mut tx, body.operation_id).await?.0;
     let entries: Vec<String> = sqlx::query_scalar(
         "SELECT entry FROM native_live_entries WHERE operation_id=? ORDER BY entry_id",
