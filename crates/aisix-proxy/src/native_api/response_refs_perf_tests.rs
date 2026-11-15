@@ -112,7 +112,7 @@ async fn probe(
     let scope = AllocationScope::start();
     let result = if dispatch {
         crate::native_api::openai_uploads::admit_responses_files(
-            state, &snapshot, auth, &client, body, false, None,
+            state, &snapshot, auth, &client, body, false,
         )
         .await
     } else {
@@ -304,7 +304,6 @@ async fn no_resolved_references_never_skips_the_existing_stored_field_refusal() 
         &ClientContext::default(),
         &body,
         false,
-        None,
     )
     .await;
     assert!(
