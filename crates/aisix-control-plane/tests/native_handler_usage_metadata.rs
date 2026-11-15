@@ -1,6 +1,8 @@
 //! 真实路由、JWT 验签、CP/mTLS、Postgres 和终态 outbox 的元数据回归。
 //! 供应商 HTTP 和自定义扫描服务为本地协议替身，不冒充外部供应商端到端验收。
 //! 业务断言来自调用者合同；不调用元数据快照、填充或合并 helper。
+//! JWT 信任和映射为显式网关本地组件配置，经正式资源加载器读取，不能声称由 CP 投影。
+//! 租户、key、模型、防护规则和持久权威仍来自真实 CP；本测试不验证两源混合启动部署。
 
 #[path = "support/native_gateway.rs"]
 mod native_gateway;
@@ -15,7 +17,8 @@ use std::time::Duration;
 use aisix_control_plane::auth::{MemberRole, OperatorRole};
 use aisix_core::native_objects::InferenceStage;
 use aisix_core::snapshot::SnapshotHandle;
-use aisix_core::ProxyConfig;
+use aisix_core::{AisixSnapshot, ProxyConfig};
+use aisix_etcd::{build_snapshot, PrefixSet, RawEntry};
 use aisix_gateway::Hub;
 use aisix_obs::{UsageEvent, UsageSink};
 use aisix_proxy::{build_router, ProxyState};
@@ -479,22 +482,7 @@ async fn fixture() -> Option<Fixture> {
         .await;
     assert_eq!(minted.status, 201, "{minted:?}");
     let key = uuid_at(&minted.body, "/key/id");
-    // 两个合法 JWT 映射到同一个真实 key；观察者不能替换接受时的历史文本或标签。
-    for phase in ["admission", "observer"] {
-        resource(&cp, &admin, "oidc_providers", json!({
-            "name":format!("metadata-{phase}-idp"),"hmac_secret":SIGNING_KEY,
-            "issuer":format!("https://metadata-{phase}.example"),"tag_claims":{"department":"department"}})).await;
-        resource(
-            &cp,
-            &admin,
-            "claim_mappings",
-            json!({"name":format!("metadata-{phase}-mapping"),
-            "jwt_provider":format!("metadata-{phase}-idp"),
-            "match":[{"claim":"sub","op":"exact","values":[format!("metadata-{phase}-subject")]}],
-            "resolve":{"api_key_id":key}}),
-        )
-        .await;
-    }
+    // CP 尚无 oidc_providers/claim_mappings 写入口；两类 JWT 配置在 gateway() 明确按本地组件资源加载。
     resource(
         &cp,
         &admin,
@@ -554,8 +542,67 @@ async fn fixture() -> Option<Fixture> {
     })
 }
 
+// 只修正测试接线：与既有 JWT 旅程同用规范资源文档和正式 loader，不伪造已认证身份。
+// 这里显式组合组件来源，不宣称 CP API 或二进制启动支持混合两种配置源。
+fn with_explicit_local_jwt_component_config(snapshot: AisixSnapshot, key: Uuid) -> AisixSnapshot {
+    assert!(
+        snapshot.apikeys.get_by_id(&key.to_string()).is_some(),
+        "setup: the JWT mapping targets the real CP-minted, projected key"
+    );
+    assert_eq!(
+        snapshot.oidc_providers.len(),
+        0,
+        "setup: JWT providers are not claimed to come from the current CP projection"
+    );
+    assert_eq!(
+        snapshot.claim_mappings.len(),
+        0,
+        "setup: JWT mappings are not claimed to come from the current CP projection"
+    );
+    let prefix = "/explicit-gateway-local-jwt-component-config";
+    let mut entries = Vec::new();
+    for phase in ["admission", "observer"] {
+        let provider = json!({
+            "name":format!("metadata-{phase}-idp"),"hmac_secret":SIGNING_KEY,
+            "issuer":format!("https://metadata-{phase}.example"),
+            "tag_claims":{"department":"department"}});
+        let mapping = json!({"name":format!("metadata-{phase}-mapping"),
+            "jwt_provider":format!("metadata-{phase}-idp"),
+            "match":[{"claim":"sub","op":"exact","values":[format!("metadata-{phase}-subject")]}],
+            "resolve":{"api_key_id":key}});
+        for (kind, document) in [("oidc_providers", provider), ("claim_mappings", mapping)] {
+            entries.push(RawEntry {
+                key: format!("{prefix}/{kind}/{}", Uuid::new_v4()),
+                value: serde_json::to_vec(&document)
+                    .expect("canonical local JWT resource document"),
+                revision: 1,
+            });
+        }
+    }
+    let (local, stats) = build_snapshot(&PrefixSet::single(prefix.to_owned()), &entries);
+    assert_eq!(
+        stats.accepted,
+        entries.len(),
+        "setup: the real JWT resource loader accepts all four canonical documents: {stats:?}"
+    );
+    assert!(
+        stats.rejections.is_empty(),
+        "setup: local JWT configuration has no rejected rows: {stats:?}"
+    );
+    assert_eq!(local.oidc_providers.len(), 2);
+    assert_eq!(local.claim_mappings.len(), 2);
+    for entry in local.oidc_providers.entries() {
+        snapshot.oidc_providers.insert(entry);
+    }
+    for entry in local.claim_mappings.entries() {
+        snapshot.claim_mappings.insert(entry);
+    }
+    snapshot
+}
+
 async fn gateway(f: &Fixture) -> (ProxyState, mpsc::Receiver<UsageEvent>) {
-    let snapshot = SnapshotHandle::new(projected_snapshot(&f.cp).await);
+    let projected = projected_snapshot(&f.cp).await;
+    let snapshot = SnapshotHandle::new(with_explicit_local_jwt_component_config(projected, f.key));
     let hub = Arc::new(Hub::new());
     hub.register_specialized(
         "openai",

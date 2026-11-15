@@ -415,6 +415,13 @@ impl NativeObjectRegistry for Registry {
                     return Err(NativeRegistryError::NotFound);
                 }
                 existing
+            } else if let Some((owner, record)) = records.get(&request.raw_id) {
+                if *owner != request.api_key_id
+                    || record.operation_id != Some(request.operation_id)
+                {
+                    return Err(NativeRegistryError::Conflict);
+                }
+                record.record_id
             } else {
                 Uuid::new_v4()
             };
@@ -749,7 +756,7 @@ async fn unconditional_input_guardrail_blocks_all_sixteen_vector_store_operation
         let response = request(router.clone(), verb, route, body, "caller", hint).await;
         let status = response.status();
         let answer = value(response).await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "{verb} {route}: {answer}");
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{verb} {route}: {answer}");
         assert_eq!(
             upstream.received_requests().await.unwrap().len(),
             accepted_calls,

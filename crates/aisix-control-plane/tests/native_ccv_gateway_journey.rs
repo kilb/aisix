@@ -1041,7 +1041,7 @@ async fn all_thirty_three_ccv_operations_cross_real_authority_with_raw_wire_and_
         "/v1/containers/cntr_ccv_1/files",
         &f.owner.bearer,
         "input.txt",
-        b"tenant support policy\n",
+        BINARY,
     )
     .await;
     assert_eq!(

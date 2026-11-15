@@ -6366,7 +6366,7 @@ admin:
     #[test]
     fn standalone_native_authority_requires_explicit_absolute_separate_files() {
         let load = |extra: &str| {
-            let file = write_yaml(&format!("etcd:\n  endpoints: [\"http://127.0.0.1:2379\"]\nproxy:\n  addr: \"127.0.0.1:3000\"\n{extra}\n"));
+            let file = write_yaml(&format!("etcd:\n  endpoints: [\"http://127.0.0.1:2379\"]\nproxy:\n  addr: \"127.0.0.1:3000\"\nadmin:\n  addr: \"127.0.0.1:3001\"\n  admin_keys: [\"k1\"]\n{extra}\n"));
             Config::load_from_path(Some(file.path()))
         };
         let cfg = load("native_objects: {sqlite_path: /var/lib/aisix/native/objects.sqlite3, origin_secret_file: /run/secrets/native-origin}").unwrap();

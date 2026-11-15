@@ -1,5 +1,7 @@
-//! Batch JSONL 的真实准入组件测试；不启动网络、数据库或提供方替身。
+//! Batch JSONL 的真实准入组件测试；使用独立本地归属库，不启动网络或提供方替身。
 use super::*;
+use crate::native_api::standalone_store::StandaloneNativeStore;
+use std::os::unix::fs::PermissionsExt;
 use aisix_core::native_objects::{NativeObjectKind, OriginBinding};
 use aisix_core::{
     snapshot::SnapshotHandle, AisixSnapshot, ApiKey, Model, ProviderKey, ProxyConfig,
@@ -16,9 +18,10 @@ struct Fixture {
     state: ProxyState,
     auth: AuthenticatedKey,
     origin: OriginBinding,
+    _directory: tempfile::TempDir,
 }
 
-fn fixture(guardrail: Option<Value>) -> Fixture {
+async fn fixture(guardrail: Option<Value>) -> Fixture {
     let snapshot = AisixSnapshot::new();
     let provider: ProviderKey = serde_json::from_value(json!({
         "display_name":"batch-copy-account", "provider":"openai", "adapter":"openai",
@@ -52,14 +55,21 @@ fn fixture(guardrail: Option<Value>) -> Fixture {
         );
     }
     let config: ProxyConfig = serde_json::from_value(json!({"addr":"127.0.0.1:0"})).unwrap();
-    let state = ProxyState::new(
-        SnapshotHandle::new(snapshot),
-        Arc::new(aisix_gateway::Hub::new()),
-        &config,
+    let snapshot = SnapshotHandle::new(snapshot);
+    let platform = crate::platform::PlatformSettings::from_secret("batch-copy-test");
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+        .unwrap();
+    let store = StandaloneNativeStore::open(
+        &directory.path().join("authority.sqlite3"),
+        platform.id_key,
+        snapshot.clone(),
     )
-    .with_platform(crate::platform::PlatformSettings::from_secret(
-        "batch-copy-test",
-    ));
+    .await
+    .unwrap();
+    let state = ProxyState::new(snapshot, Arc::new(aisix_gateway::Hub::new()), &config)
+        .with_native_objects(Arc::new(store))
+        .with_platform(platform);
     let (_, origin) = crate::native_api::openai::resolve(
         &state,
         &state.snapshot.load(),
@@ -73,6 +83,7 @@ fn fixture(guardrail: Option<Value>) -> Fixture {
         state,
         auth,
         origin,
+        _directory: directory,
     }
 }
 
@@ -100,7 +111,7 @@ macro_rules! admit {
 
 #[tokio::test(flavor = "current_thread")]
 async fn unchanged_batch_input_shares_the_original_buffer_for_upload_and_submit() {
-    let fixture = fixture(None);
+    let fixture = fixture(None).await;
     for admission in [
         BatchInputAdmission::Upload,
         BatchInputAdmission::Submit(&[]),
@@ -141,7 +152,7 @@ async fn allocation_probe(fixture: &Fixture, input: &[u8]) -> Allocations {
 
 #[tokio::test(flavor = "current_thread")]
 async fn unchanged_batch_input_does_not_allocate_an_output_file_buffer() {
-    let fixture = fixture(None);
+    let fixture = fixture(None).await;
     let line = br#"{"custom_id":"one","url":"/v1/chat/completions","body":{"model":"batch-upstream","messages":[{"role":"user","content":"hello"}]}}"#;
     let small = [b" ".as_slice(), line, b"\n"].concat();
     let large = [vec![b' '; 1024 * 1024].as_slice(), line, b"\n"].concat();
@@ -159,7 +170,7 @@ async fn unchanged_batch_input_does_not_allocate_an_output_file_buffer() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn submit_rewrites_only_the_changed_line_and_preserves_surrounding_bytes() {
-    let fixture = fixture(None);
+    let fixture = fixture(None).await;
     let before = b" \r\n{\"url\":\"/v1/chat/completions\",\"custom_id\":\"before\",\"body\":{\"messages\":[],\"model\":\"batch-upstream\"}}\r\n";
     let middle = b"{\"custom_id\":\"middle\",\"url\":\"/v1/chat/completions\",\"body\":{\"model\":\"batch-public\",\"messages\":[]}}\r\n";
     let after = b"\n {\"url\":\"/v1/chat/completions\",\"custom_id\":\"after\",\"body\":{\"messages\":[],\"model\":\"batch-upstream\"}}";
@@ -188,7 +199,7 @@ async fn unchanged_lines_still_run_the_input_guardrail_and_report_the_verdict() 
     let fixture = fixture(Some(json!({
         "name":"block-last-line", "enabled":true, "hook_point":"input", "kind":"keyword",
         "patterns":[{"kind":"literal","value":"forbidden-last-line"}]
-    })));
+    }))).await;
     let input = b"{\"custom_id\":\"first\",\"url\":\"/v1/chat/completions\",\"body\":{\"model\":\"batch-upstream\",\"messages\":[]}}\n{\"custom_id\":\"last\",\"url\":\"/v1/chat/completions\",\"body\":{\"model\":\"batch-upstream\",\"messages\":[{\"role\":\"user\",\"content\":\"forbidden-last-line\"}]}}\n";
     let mut enforced = Vec::new();
     let mut applied = Vec::new();
@@ -215,7 +226,7 @@ async fn unchanged_lines_still_run_the_input_guardrail_and_report_the_verdict() 
 
 #[tokio::test(flavor = "current_thread")]
 async fn malformed_later_line_is_rejected_after_an_earlier_model_rewrite() {
-    let fixture = fixture(None);
+    let fixture = fixture(None).await;
     let input = b"{\"custom_id\":\"first\",\"url\":\"/v1/chat/completions\",\"body\":{\"model\":\"batch-public\",\"messages\":[]}}\n{\"custom_id\":\"last\",\"url\":\"/v1/chat/completions\",\"body\":{\"messages\":[]}}\n";
     assert!(matches!(
         admit!(fixture, input, BatchInputAdmission::Submit(&[])),

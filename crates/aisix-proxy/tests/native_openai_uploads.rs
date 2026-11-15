@@ -1123,7 +1123,14 @@ async fn admitting_a_file_does_not_admit_other_stored_objects_or_nested_extensio
                 "/v1/chat/completions"
             };
             let answer = json_request(router, route, Some(body), "caller", false).await;
-            assert_eq!(answer.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                answer.status(),
+                if responses && extra == "stored_object" {
+                    StatusCode::NOT_FOUND
+                } else {
+                    StatusCode::BAD_REQUEST
+                }
+            );
             assert_eq!(upstream.received_requests().await.unwrap().len(), 2);
         }
     }
@@ -1574,7 +1581,14 @@ async fn authorized_response_tool_files_do_not_authorize_a_container_or_skill() 
             }
         }
         let answer = json_request(router, "/v1/responses", Some(body), "caller", false).await;
-        assert_eq!(answer.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            answer.status(),
+            if stored == "extension" {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::NOT_FOUND
+            }
+        );
         assert_eq!(upstream.received_requests().await.unwrap().len(), 2);
     }
 }

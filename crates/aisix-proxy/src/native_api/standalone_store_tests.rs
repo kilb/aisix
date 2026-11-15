@@ -388,13 +388,10 @@ async fn two_stores_share_one_file_detach_preserves_other_relation_and_root_file
     let detach = reserve(&a, &file, RelationAction::Detach);
     f.store.reserve_relations(detach.clone()).await.unwrap();
     f.store.commit_relations(commit(&detach)).await.unwrap();
-    assert_eq!(
-        f.store
-            .lookup_relations(relation(&a, &file))
-            .await
-            .unwrap_err(),
-        Error::NotFound
-    );
+    let detached = f.store.lookup_relations(relation(&a, &file)).await.unwrap();
+    assert_eq!(detached.state, "related");
+    assert!(detached.records.is_empty());
+    assert!(detached.memberships.is_empty());
     assert_eq!(
         f.store
             .lookup_relations(relation(&b, &file))
@@ -468,13 +465,14 @@ async fn uncertain_mutation_blocks_new_process_and_stale_discovery_cannot_revive
             .unwrap_err(),
         Error::Conflict
     );
-    assert_eq!(
-        f.store
-            .lookup_relations(relation(&parent, &file))
-            .await
-            .unwrap_err(),
-        Error::NotFound
-    );
+    let detached = f
+        .store
+        .lookup_relations(relation(&parent, &file))
+        .await
+        .unwrap();
+    assert_eq!(detached.state, "related");
+    assert!(detached.records.is_empty());
+    assert!(detached.memberships.is_empty());
     let parent = second
         .lookup(lookup("key-a", NativeObjectKind::VectorStore, "vs-cas"))
         .await
@@ -1460,17 +1458,20 @@ async fn batch_entry_graph_cannot_borrow_another_entry_or_the_aggregate_referenc
             .count(),
         1
     );
-    assert!(f
+    let unrelated = f
         .store
         .lookup_relations(LookupRelationsRequest {
             api_key_id: begin.api_key_id,
             parent_record_id: two.record_id,
             relation: NativeRelation::ConversationItem,
             raw_ids: vec!["item-entry-scope".into()],
-            consumer_family: None
+            consumer_family: None,
         })
         .await
-        .is_err());
+        .unwrap();
+    assert_eq!(unrelated.state, "related");
+    assert!(unrelated.records.is_empty());
+    assert!(unrelated.memberships.is_empty());
 }
 
 #[path = "standalone_store_graph_tests.rs"]

@@ -2071,7 +2071,10 @@ mod shared_dispatch_tests {
             provider("openai", &format!("{}/v1", upstream.uri())),
         )
         .await;
-        let client = ClientContext::default();
+        let client = ClientContext {
+            request_id: crate::request_id::new_request_id(),
+            ..Default::default()
+        };
         let snapshot = state.snapshot.load();
         assert!(state.platform().is_none());
         assert!(resolve(
@@ -2220,7 +2223,10 @@ mod shared_dispatch_tests {
     async fn object_consumption_does_not_grant_management_and_rechecks_current_key() {
         let (state, auth, _directory) =
             fixture("openai", provider("openai", "https://api.openai.com/v1")).await;
-        let client = ClientContext::default();
+        let client = ClientContext {
+            request_id: crate::request_id::new_request_id(),
+            ..Default::default()
+        };
         let (target, origin) = resolve_management(
             &state,
             &state.snapshot.load(),
@@ -2525,7 +2531,10 @@ mod shared_dispatch_tests {
             provider("anthropic", "https://api.anthropic.com"),
         )
         .await;
-        let client = ClientContext::default();
+        let client = ClientContext {
+            request_id: crate::request_id::new_request_id(),
+            ..Default::default()
+        };
         let (target, origin) = super::super::anthropic::resolve_management(
             &state,
             &state.snapshot.load(),
@@ -2622,7 +2631,10 @@ mod shared_dispatch_tests {
         key["apis"] =
             json!({"messages":{"base":format!("{}/messages-origin/v1/messages", upstream.uri())}});
         let (state, auth, _directory) = fixture("anthropic", key).await;
-        let client = ClientContext::default();
+        let client = ClientContext {
+            request_id: crate::request_id::new_request_id(),
+            ..Default::default()
+        };
         let (target, origin) = super::super::anthropic::resolve_management(
             &state,
             &state.snapshot.load(),

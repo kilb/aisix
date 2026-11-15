@@ -4476,7 +4476,46 @@ mod tests {
     /// session's one event reports is what the charges add up to.
     #[tokio::test]
     async fn an_open_session_is_charged_as_it_goes_and_ends_when_its_key_is_disabled() {
-        let up_addr = spawn_open_upstream().await;
+        // 第三笔先被真实 WS reader 接受，再挂起它的 done；不把禁用后的新请求冒充在途。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = listener.local_addr().unwrap();
+        let handshakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (third_ready_tx, third_ready_rx) = tokio::sync::oneshot::channel();
+        let (third_release_tx, third_release_rx) = tokio::sync::oneshot::channel();
+        let upstream_handshakes = Arc::clone(&handshakes);
+        let upstream_accepted = Arc::clone(&accepted);
+        let provider = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            upstream_handshakes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (mut tx, mut rx) = ws.split();
+            let mut ready = Some(third_ready_tx);
+            let mut release = Some(third_release_rx);
+            while let Some(Ok(message)) = rx.next().await {
+                match message {
+                    TgMessage::Text(_) => {
+                        let count =
+                            upstream_accepted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        if count == 3 {
+                            ready.take().unwrap().send(()).unwrap();
+                            release.take().unwrap().await.unwrap();
+                        }
+                        let done = serde_json::json!({"type":"response.done","response":{
+                            "usage":{"input_tokens":1000,"output_tokens":1000}
+                        }});
+                        if tx.send(TgMessage::Text(done.to_string())).await.is_err() {
+                            break;
+                        }
+                    }
+                    TgMessage::Close(frame) => {
+                        let _ = tx.send(TgMessage::Close(frame)).await;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        });
         let snap = snapshot_with_cost(
             &format!("http://{up_addr}/v1"),
             "openai",
@@ -4502,19 +4541,51 @@ mod tests {
         tx.send(ask()).await.unwrap();
         assert_eq!(tokens_reach(&state, 4_000).await, 4_000);
 
+        tx.send(ask()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), third_ready_rx)
+            .await
+            .expect("provider actually accepted the third request before revocation")
+            .expect("the real third-request readiness channel stays connected");
+        assert_eq!(handshakes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 3);
+        // 第三笔确已在供应商；仅更新现有本地配置，然后放行其合法在途尾量。
         let live = state.snapshot.load();
         let key = live.apikeys.get_by_id("k-1").unwrap();
+        assert!(!key.value.disabled);
         let mut disabled = (*key.value).clone();
         disabled.disabled = true;
         live.apikeys.insert(ResourceEntry::new("k-1", disabled, 2));
-
-        // The response in flight is still delivered, and billed; then it ends.
-        tx.send(ask()).await.unwrap();
+        assert!(
+            state
+                .snapshot
+                .load()
+                .apikeys
+                .get_by_id("k-1")
+                .unwrap()
+                .value
+                .disabled
+        );
+        third_release_tx
+            .send(())
+            .expect("release the already accepted third paid response");
         let mut close_code = None;
         let mut responses = 0;
+        let mut completed = 0;
+        let mut fourth_attempted = false;
         while let Some(Ok(msg)) = client_rx.next().await {
             match msg {
-                TgMessage::Text(_) => responses += 1,
+                TgMessage::Text(text) => {
+                    responses += 1;
+                    let event: Value = serde_json::from_str(&text).expect("actual response JSON");
+                    if event.get("type").and_then(Value::as_str) == Some("response.done") {
+                        completed += 1;
+                        if completed == 3 {
+                            // 尚未读取 Close 时才尝试第四笔；服务器可能已经关闭写侧，均不得新增派发。
+                            fourth_attempted = true;
+                            let _ = tx.send(ask()).await;
+                        }
+                    }
+                }
                 TgMessage::Close(frame) => {
                     close_code = frame.map(|f| u16::from(f.code));
                     break;
@@ -4524,6 +4595,14 @@ mod tests {
         }
         assert_eq!(close_code, Some(1008));
         assert_eq!(responses, 3);
+        assert_eq!(
+            completed, 3,
+            "three actual paid done events, not an error counted as a response"
+        );
+        assert!(
+            fourth_attempted,
+            "the new-work negative is actually attempted before reading Close"
+        );
 
         let ev = tokio::time::timeout(Duration::from_secs(3), rx.recv())
             .await
@@ -4537,6 +4616,20 @@ mod tests {
             tokens_reach(&state, 6_000).await,
             6_000,
             "the charges add up to what the event reports, and no further"
+        );
+        tokio::time::timeout(Duration::from_secs(5), provider)
+            .await
+            .expect("the actual provider finishes its close handshake")
+            .expect("the provider task completes without a fixture panic");
+        assert_eq!(
+            accepted.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "the fourth new request after local revocation is never dispatched"
+        );
+        assert_eq!(
+            handshakes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "closing or rejecting new work must not redial the provider"
         );
     }
 

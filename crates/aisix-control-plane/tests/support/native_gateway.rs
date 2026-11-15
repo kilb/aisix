@@ -1,7 +1,7 @@
 //! 联合组件测试的真实 mTLS 控制面适配器和本地供应商协议替身。
 
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicI64, Ordering},
     Arc, Mutex,
 };
 
@@ -309,7 +309,7 @@ pub struct ProviderRequest {
 
 #[derive(Default)]
 struct ProviderState {
-    terminal: AtomicBool,
+    completed_at: AtomicI64,
     requests: Mutex<Vec<ProviderRequest>>,
     files: Mutex<std::collections::HashMap<String, StoredFile>>,
     batch_input: Mutex<Option<String>>,
@@ -355,7 +355,13 @@ impl ProviderSubstitute {
     }
 
     pub fn complete(&self) {
-        self.state.terminal.store(true, Ordering::SeqCst);
+        // 终态时间只在首次完成时固定，重复完成与轮询不改变已发生的时间。
+        let _ = self.state.completed_at.compare_exchange(
+            0,
+            chrono::Utc::now().timestamp(),
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
     }
 
     pub fn file_bytes(&self, id: &str) -> Vec<u8> {
@@ -488,9 +494,10 @@ fn batch_json(state: &ProviderState) -> Value {
     let mut batch = json!({"id":BATCH,"object":"batch","status":"in_progress",
         "input_file_id":state.batch_input.lock().expect("the accepted batch input").clone(),
         "endpoint":"/v1/chat/completions","created_at":1794614400});
-    if state.terminal.load(Ordering::SeqCst) {
+    let completed_at = state.completed_at.load(Ordering::SeqCst);
+    if completed_at != 0 {
         batch["status"] = json!("completed");
-        batch["completed_at"] = json!(1794614500);
+        batch["completed_at"] = json!(completed_at);
         batch["output_file_id"] = json!(OUTPUT_FILE);
     }
     batch

@@ -64,8 +64,9 @@ async fn durable_delivery_waits_for_control_plane_receipt() {
         Metrics::new(false),
         cancel,
     );
+    let delivery_sink = sink.clone();
     let delivery = tokio::spawn(async move {
-        sink.emit_durable(durable_test_envelope(&durable_test_event()))
+        delivery_sink.emit_durable(durable_test_envelope(&durable_test_event()))
             .await
     });
     tokio::time::timeout(Duration::from_secs(3), arrived.notified())
@@ -78,6 +79,7 @@ async fn durable_delivery_waits_for_control_plane_receipt() {
     release.notify_one();
     assert!(delivery.await.unwrap().is_ok());
     durable_stop_worker(stop, worker).await;
+    drop(sink);
     receiver.abort();
 }
 

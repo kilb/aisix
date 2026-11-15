@@ -168,7 +168,7 @@ async fn paid_observation_retains_parent_owned_artifacts_but_never_revives_a_del
         "resp-late-parent",
         &conversation,
         &container,
-        true,
+        false,
     ))
     .unwrap();
     let request = BindObservedArtifactsRequest {
@@ -285,7 +285,7 @@ async fn two_paid_entries_can_append_to_the_same_accepted_parent_across_observat
     let observed = |entry: &str| {
         serde_json::from_value(json!({"entry_id":entry,"root":{"kind":"response","raw_id":format!("resp-paid-{entry}")},
         "objects":[{"kind":"response_item","raw_id":format!("item-paid-{entry}")}],"relations":[
-            {"parent":{"source":"accepted","kind":"conversation","raw_id":conversation.raw_id},"child":{"source":"observed","kind":"response_item","raw_id":format!("item-paid-{entry}")},"relation":"conversation_item"},
+            {"parent":{"source":"record","record_id":conversation.record_id},"child":{"source":"observed","kind":"response_item","raw_id":format!("item-paid-{entry}")},"relation":"conversation_item"},
             {"parent":{"source":"root"},"child":{"source":"observed","kind":"response_item","raw_id":format!("item-paid-{entry}")},"relation":"response_output"}]})).unwrap()
     };
     let first = f
@@ -334,7 +334,7 @@ async fn two_paid_entries_can_append_to_the_same_accepted_parent_across_observat
 }
 
 #[tokio::test]
-async fn parent_owned_artifact_keeps_its_parents_model_grant_across_a_different_response_model() {
+async fn parent_owned_artifact_keeps_executed_model_and_requires_its_current_grant() {
     let f = Fixture::new().await;
     let (conversation, container) = parents(&f).await;
     let snapshot = (*f.snapshot.load()).clone();
@@ -364,24 +364,30 @@ async fn parent_owned_artifact_keeps_its_parents_model_grant_across_a_different_
         reply.record.as_ref().unwrap().requested_model_id,
         Some(stable_resource_id("models", "model-b"))
     );
+    assert_eq!(
+        reply.record.as_ref().unwrap().api_key_id,
+        Some(stable_resource_id("apikeys", "key-a2"))
+    );
     for child in &reply.records {
         assert_eq!(
             child.requested_model_id,
-            Some(stable_resource_id("models", "model-a"))
+            Some(stable_resource_id("models", "model-b"))
         );
         assert_eq!(
             child.origin.as_ref().unwrap().model_id,
-            stable_resource_id("models", "model-a")
+            stable_resource_id("models", "model-b")
         );
         assert_eq!(
             child.api_key_id,
             Some(stable_resource_id("apikeys", "key-a"))
         );
-        assert!(f
-            .store
-            .lookup(lookup("key-a", child.kind.unwrap(), &child.raw_id))
-            .await
-            .is_ok());
+        assert_eq!(
+            f.store
+                .lookup(lookup("key-a", child.kind.unwrap(), &child.raw_id))
+                .await
+                .unwrap_err(),
+            Error::NotFound
+        );
     }
     assert_eq!(
         f.store
@@ -393,5 +399,59 @@ async fn parent_owned_artifact_keeps_its_parents_model_grant_across_a_different_
             .await
             .unwrap_err(),
         Error::NotFound
+    );
+
+    let snapshot = (*f.snapshot.load()).clone();
+    let mut owner = (*snapshot.apikeys.get_by_id("key-a").unwrap().value).clone();
+    owner.allowed_models = vec!["model-a".into(), "model-b".into()];
+    snapshot
+        .apikeys
+        .insert(ResourceEntry::new("key-a", owner, 3));
+    f.snapshot.store(snapshot);
+    for child in &reply.records {
+        let found = f
+            .store
+            .lookup(lookup("key-a", child.kind.unwrap(), &child.raw_id))
+            .await
+            .unwrap()
+            .record
+            .unwrap();
+        assert_eq!(found.record_id, child.record_id);
+        assert_eq!(
+            found.api_key_id,
+            Some(stable_resource_id("apikeys", "key-a"))
+        );
+        assert_eq!(
+            found.requested_model_id,
+            Some(stable_resource_id("models", "model-b"))
+        );
+        assert_eq!(
+            found.origin.as_ref().unwrap().model_id,
+            stable_resource_id("models", "model-b")
+        );
+    }
+    let response = f
+        .store
+        .lookup(lookup(
+            "key-a2",
+            NativeObjectKind::Response,
+            "resp-cross-model",
+        ))
+        .await
+        .unwrap()
+        .record
+        .unwrap();
+    assert_eq!(response.record_id, reply.record.as_ref().unwrap().record_id);
+    assert_eq!(
+        response.api_key_id,
+        Some(stable_resource_id("apikeys", "key-a2"))
+    );
+    assert_eq!(
+        response.requested_model_id,
+        Some(stable_resource_id("models", "model-b"))
+    );
+    assert_eq!(
+        response.origin.as_ref().unwrap().model_id,
+        stable_resource_id("models", "model-b")
     );
 }

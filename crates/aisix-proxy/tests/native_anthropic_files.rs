@@ -445,7 +445,7 @@ async fn rotated_credentials_cannot_reach_the_original_file() {
         .provider_keys
         .insert(ResourceEntry::new(PROVIDER, provider, 2));
     let response = request(router, "GET", "/v1/files/file_owned", false).await;
-    assert!(response.status().is_server_error());
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
     assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
 }
 
