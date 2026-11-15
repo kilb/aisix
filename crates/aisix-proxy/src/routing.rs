@@ -35,9 +35,9 @@
 //!   divided by target `weight` (the APISIX least_conn score).
 
 #[cfg(test)]
-mod performance_contract_tests;
-#[cfg(test)]
 mod indexed_contract_tests;
+#[cfg(test)]
+mod performance_contract_tests;
 
 use aisix_core::models::{LivePricingIndex, PricingIndex};
 use aisix_core::{
@@ -1021,20 +1021,23 @@ struct RingScale {
 }
 
 impl RingScale {
-    fn of<'a>(configured_tier: impl Iterator<Item = &'a RoutingTarget>) -> Self {
+    fn of<'a>(configured_tier: impl Iterator<Item = &'a RoutingTarget> + Clone) -> Self {
         fn gcd(mut a: u64, mut b: u64) -> u64 {
             while b != 0 {
                 (a, b) = (b, a % b);
             }
             a
         }
-        let weights: Vec<u64> = configured_tier
+        let gcd = configured_tier
+            .clone()
             .map(|t| u64::from(t.weight_or_default().max(1)))
-            .collect();
-        let gcd = weights.iter().fold(0, |acc, w| gcd(acc, *w)).max(1);
+            .fold(0, gcd)
+            .max(1);
         Self {
             gcd,
-            sum: weights.iter().map(|w| w / gcd).sum(),
+            sum: configured_tier
+                .map(|t| u64::from(t.weight_or_default().max(1)) / gcd)
+                .sum(),
         }
     }
 
@@ -1062,17 +1065,22 @@ struct HashRing {
 }
 
 impl HashRing {
-    fn build(fingerprint: u64, targets: &[RoutingTarget], scale: RingScale) -> Self {
+    fn build<'a, I>(fingerprint: u64, targets: I, scale: RingScale) -> Self
+    where
+        I: IntoIterator<Item = &'a RoutingTarget>,
+        I::IntoIter: Clone,
+    {
+        let targets = targets.into_iter();
         // A 0 only gets here when every candidate is at 0 (see the weight
         // filter in `resolve_attempt_models`): they have no share to compare,
         // so each gets one unit rather than the ring going empty.
         let units: Vec<u64> = targets
-            .iter()
+            .clone()
             .map(|t| scale.units(t.weight_or_default()))
             .collect();
         let total_points = units.iter().sum::<u64>() as usize * RING_POINTS_PER_UNIT;
         let mut points = Vec::with_capacity(total_points);
-        for (idx, (target, units)) in targets.iter().zip(&units).enumerate() {
+        for (idx, (target, units)) in targets.zip(&units).enumerate() {
             for i in 0..(*units as usize) * RING_POINTS_PER_UNIT {
                 let mut h = fnv1a_extend(FNV_OFFSET_BASIS, target.model.as_bytes());
                 h = fnv1a_extend(h, &[0]);
@@ -1155,6 +1163,20 @@ impl RoutingRegistry {
         targets: &[RoutingTarget],
         hash_key: &str,
     ) -> Vec<String> {
+        self.pick_target_indices(virtual_name, routing, targets, hash_key)
+            .into_iter()
+            .map(|index| targets[index].model.clone())
+            .collect()
+    }
+
+    /// 策略只重排候选下标，解析后的模型不再经名字复制和二次匹配。
+    fn pick_target_indices(
+        &self,
+        virtual_name: &str,
+        routing: &Routing,
+        targets: &[RoutingTarget],
+        hash_key: &str,
+    ) -> Vec<usize> {
         if targets.is_empty() {
             return Vec::new();
         }
@@ -1164,30 +1186,62 @@ impl RoutingRegistry {
         // back the full declaration-order list; tier-aware ranking and
         // `max_fallbacks` truncation happen there instead.
         if routing.strategy.is_metric_based() {
-            return targets.iter().map(|t| t.model.clone()).collect();
+            return (0..targets.len()).collect();
         }
         let mut order = Vec::with_capacity(targets.len());
         let config_fingerprint = tier_fingerprint(&routing.targets);
-        for tier in partition_by_priority(targets) {
-            let priority = tier[0].priority_or_default();
+        let priorities = priority_order(targets);
+        // 全配置按优先级排一次，续用同层完整权重；请求过滤不能重算环的权重域。
+        let configured = if routing.strategy == RoutingStrategy::ConsistentHash {
+            priority_order(&routing.targets)
+        } else {
+            Vec::new()
+        };
+        let mut configured_tiers = configured
+            .chunk_by(|left, right| {
+                routing.targets[*left].priority_or_default()
+                    == routing.targets[*right].priority_or_default()
+            })
+            .peekable();
+        for tier in priorities.chunk_by(|left, right| {
+            targets[*left].priority_or_default() == targets[*right].priority_or_default()
+        }) {
+            let priority = targets[tier[0]].priority_or_default();
             match routing.strategy {
                 RoutingStrategy::Failover => {
-                    order.extend(tier.iter().map(|t| t.model.clone()));
+                    order.extend_from_slice(tier);
                 }
                 RoutingStrategy::RoundRobin => {
-                    let start = self.wrr_pick(virtual_name, priority, config_fingerprint, &tier);
-                    order.extend(attempt_order(&tier, start, tier.len()));
+                    let start = self.wrr_pick(
+                        virtual_name,
+                        priority,
+                        config_fingerprint,
+                        tier.iter().map(|index| &targets[*index]),
+                    );
+                    order.extend((0..tier.len()).map(|offset| tier[(start + offset) % tier.len()]));
                 }
                 RoutingStrategy::ConsistentHash => {
-                    let scale = RingScale::of(
-                        routing
-                            .targets
-                            .iter()
-                            .filter(|t| t.priority_or_default() == priority),
+                    while configured_tiers.peek().is_some_and(|configured| {
+                        routing.targets[configured[0]].priority_or_default() > priority
+                    }) {
+                        configured_tiers.next();
+                    }
+                    let scale = configured_tiers
+                        .next_if(|configured| {
+                            routing.targets[configured[0]].priority_or_default() == priority
+                        })
+                        .map(|configured| {
+                            RingScale::of(configured.iter().map(|index| &routing.targets[*index]))
+                        })
+                        .unwrap_or(RingScale { gcd: 1, sum: 0 });
+                    let ring = self.ring_for(
+                        virtual_name,
+                        priority,
+                        tier.iter().map(|index| &targets[*index]),
+                        scale,
                     );
-                    let ring = self.ring_for(virtual_name, priority, &tier, scale);
                     for idx in ring.preference_order(stable_hash(hash_key), tier.len()) {
-                        order.push(tier[idx as usize].model.clone());
+                        order.push(tier[idx as usize]);
                     }
                 }
                 RoutingStrategy::LeastCost
@@ -1205,15 +1259,15 @@ impl RoutingRegistry {
     /// each target's weight to its running counter, takes the max, and
     /// subtracts the weight total from the winner. Proportional AND
     /// interleaved; equal weights degrade to a declaration-order cycle.
-    fn wrr_pick(
+    fn wrr_pick<'a>(
         &self,
         virtual_name: &str,
         priority: i32,
         config_fingerprint: u64,
-        tier: &[RoutingTarget],
+        tier: impl Iterator<Item = &'a RoutingTarget> + Clone,
     ) -> usize {
         let weights: Vec<i64> = tier
-            .iter()
+            .clone()
             .map(|t| i64::from(t.weight_or_default().max(1)))
             .collect();
         let total: i64 = weights.iter().sum();
@@ -1253,15 +1307,15 @@ impl RoutingRegistry {
     /// different tag/IP-filtered subset. One entry per key: alternating
     /// subsets rebuild rather than accumulate, keeping the map bounded by
     /// the number of configured (group, tier) pairs.
-    fn ring_for(
+    fn ring_for<'a>(
         &self,
         virtual_name: &str,
         priority: i32,
-        tier: &[RoutingTarget],
+        tier: impl Iterator<Item = &'a RoutingTarget> + Clone,
         scale: RingScale,
     ) -> std::sync::Arc<HashRing> {
         let fingerprint = fnv1a_extend(
-            fnv1a_extend(tier_fingerprint(tier), &scale.gcd.to_le_bytes()),
+            fnv1a_extend(tier_fingerprint(tier.clone()), &scale.gcd.to_le_bytes()),
             &scale.sum.to_le_bytes(),
         );
         let key = (virtual_name.to_string(), priority);
@@ -1285,23 +1339,11 @@ impl std::fmt::Debug for RoutingRegistry {
     }
 }
 
-/// Split targets into priority tiers, highest priority first, declaration
-/// order preserved within each tier. Every target defaults to priority 0,
-/// so an unconfigured group is a single tier and this is a no-op shape.
-fn partition_by_priority(targets: &[RoutingTarget]) -> Vec<Vec<RoutingTarget>> {
-    let mut priorities: Vec<i32> = targets.iter().map(|t| t.priority_or_default()).collect();
-    priorities.sort_unstable_by(|a, b| b.cmp(a));
-    priorities.dedup();
-    priorities
-        .into_iter()
-        .map(|p| {
-            targets
-                .iter()
-                .filter(|t| t.priority_or_default() == p)
-                .cloned()
-                .collect()
-        })
-        .collect()
+/// 优先级从高到低排列候选下标；稳定排序保留同层声明顺序，不复制目标字符串。
+fn priority_order(targets: &[RoutingTarget]) -> Vec<usize> {
+    let mut order: Vec<_> = (0..targets.len()).collect();
+    order.sort_by_key(|index| std::cmp::Reverse(targets[*index].priority_or_default()));
+    order
 }
 
 /// Fingerprint of a target list's identity for balancing-state reuse: the
@@ -1309,7 +1351,7 @@ fn partition_by_priority(targets: &[RoutingTarget]) -> Vec<Vec<RoutingTarget>> {
 /// key and tags do not affect selection within a surviving subset. A target
 /// named by id carries that id, since its `model` is empty until it is
 /// normalized.
-fn tier_fingerprint(tier: &[RoutingTarget]) -> u64 {
+fn tier_fingerprint<'a>(tier: impl IntoIterator<Item = &'a RoutingTarget>) -> u64 {
     let mut h = FNV_OFFSET_BASIS;
     for t in tier {
         h = fnv1a_extend(h, t.model.as_bytes());
@@ -1366,18 +1408,6 @@ fn eligible_targets<'a>(
     } else {
         matched
     })
-}
-
-/// Build the target-order vector starting at `start_idx`, walking forward
-/// (wrap-around) for `limit` distinct entries.
-fn attempt_order(targets: &[RoutingTarget], start_idx: usize, limit: usize) -> Vec<String> {
-    let n = targets.len();
-    let mut order = Vec::with_capacity(limit);
-    for i in 0..limit {
-        let t = &targets[(start_idx + i) % n];
-        order.push(t.model.clone());
-    }
-    order
 }
 
 const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
@@ -2087,14 +2117,9 @@ pub(crate) fn resolve_attempt_models(
     // keeps the id as its name and is reported below as the missing target
     // it is — the same outcome a dangling `model` gets.
     //
-    // Collapsing to one entry per resolved model is part of the same step,
-    // and not an optimisation: the loop below finds a picked name's target
-    // with `find`, so two entries resolving to the same model would give
-    // the second attempt the FIRST one's weight and priority and spend two
-    // `max_fallbacks` slots on one upstream. The write path rejects
-    // duplicate targets, but it can only compare the spelling each entry
-    // used — `{"model": "beta"}` beside `{"model_id": "<beta>"}` is one
-    // model written two ways and reaches this side intact.
+    // 每个实际模型只保留首次声明的权重和优先级，且只占一个 fallback 名额。
+    // 写入校验只能比较引用拼写；model 名称与 model_id 仍可能指向同一模型，
+    // 因此先归一化去重，再建立后续稳定下标。
     //
     // Stays borrowed when every target already names its model once — the
     // common case — so the default path through routing copies no target.
@@ -2246,13 +2271,21 @@ pub(crate) fn resolve_attempt_models(
     let available = if attempts.len() == eligible.len() {
         eligible
     } else {
-        std::borrow::Cow::Owned(
-            eligible
-                .iter()
-                .filter(|t| attempts.iter().any(|a| a.model.display_name == t.model))
-                .cloned()
-                .collect::<Vec<_>>(),
-        )
+        // 健康筛选保留输入子序列；一次归并后 available[i] 与 attempts[i] 严格对齐。
+        let mut next_attempt = 0;
+        let available = eligible
+            .iter()
+            .filter(|target| {
+                let selected = attempts
+                    .get(next_attempt)
+                    .is_some_and(|attempt| attempt.model.display_name == target.model);
+                next_attempt += usize::from(selected);
+                selected
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        debug_assert_eq!(next_attempt, attempts.len());
+        std::borrow::Cow::Owned(available)
     };
 
     let hash_key = if routing.strategy == RoutingStrategy::ConsistentHash {
@@ -2264,26 +2297,18 @@ pub(crate) fn resolve_attempt_models(
         Some(_) => std::borrow::Cow::Owned(format!("{virtual_name}{PARTIAL_ROUTE_ROTATION}")),
         None => std::borrow::Cow::Borrowed(virtual_name),
     };
-    let names = routing_registry.pick_targets(&rotation, routing, &available, &hash_key);
-    if names.is_empty() {
+    let indices = routing_registry.pick_target_indices(&rotation, routing, &available, &hash_key);
+    if indices.is_empty() {
         return Err(ProxyError::InvalidRequest(
             "routing model has no targets".into(),
         ));
     }
-    let mut resolved: Vec<AttemptModel> = names
-        .iter()
-        .filter_map(|name| {
-            attempts
-                .iter()
-                .find(|a| a.model.display_name == *name)
-                .cloned()
-        })
+    let mut resolved: Vec<AttemptModel> = indices
+        .into_iter()
+        .map(|index| attempts[index].clone())
         .collect();
-    // Metric-ordered strategies get the full target set from `pick_targets`;
-    // rank it best-first here (target Models are now resolved) and cap it to
-    // the same attempt budget the positional strategies apply upstream. The
-    // metric sort runs first, then a stable sort on priority — so tiers
-    // concatenate highest-first with the metric order preserved inside each.
+    // 指标策略先取完整候选下标，再按解析后的模型信号排序并限制尝试预算。
+    // 排名后稳定按优先级分层，保留同层指标顺序。
     if routing.strategy.is_metric_based() {
         order_attempts_by_metric(
             routing.strategy,
