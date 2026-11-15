@@ -15,6 +15,7 @@ pub mod registry;
 pub(crate) mod response_refs;
 pub(crate) mod responses;
 pub(crate) mod skills;
+mod standalone_realtime_store;
 pub mod standalone_store;
 pub(crate) mod voices;
 

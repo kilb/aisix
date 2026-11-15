@@ -26,7 +26,20 @@ pub enum NativeRegistryError {
     InvalidRequest,
 }
 
+/// 成功持久追加后的唯一计费出口；不能从部署模式或本地密钥猜测。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveUsageAuthority {
+    Unsupported,
+    AggregateSink,
+    CanonicalJournal,
+}
+
 pub trait NativeObjectRegistry: Send + Sync {
+    /// 未声明的后端不承担实时计费；新会话不能据此同时使用两条付费出口。
+    fn live_usage_authority(&self) -> LiveUsageAuthority {
+        LiveUsageAuthority::Unsupported
+    }
+
     /// 本地归属密钥独立于平台错误隐藏模式；托管实现继续使用平台配置。
     fn id_key(&self) -> Option<[u8; 32]> {
         None
