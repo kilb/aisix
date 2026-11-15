@@ -272,7 +272,7 @@ async fn legacy_sql_statements_project_all_rows_refresh_same_version_and_roll_ba
     .execute(cp.db().pool())
     .await
     .expect("旧 SQL 批量写入");
-    let actual: Vec<(i16, Option<i64>)> = sqlx::query_as(
+    let actual: Vec<(i32, Option<i64>)> = sqlx::query_as(
         "SELECT projection_version, u32_prompt_tokens FROM usage_metric_inputs ORDER BY event_id",
     )
     .fetch_all(cp.db().pool())
@@ -295,7 +295,7 @@ async fn legacy_sql_statements_project_all_rows_refresh_same_version_and_roll_ba
     .execute(cp.db().pool())
     .await
     .expect("同版本批量替换原事件");
-    let refreshed: Vec<(i16, Option<i64>, bool)> = sqlx::query_as(
+    let refreshed: Vec<(i32, Option<i64>, bool)> = sqlx::query_as(
         "SELECT projection_version, u32_prompt_tokens, has_reasoning_tokens FROM usage_metric_inputs ORDER BY event_id",
     ).fetch_all(cp.db().pool()).await.expect("同版本应刷新全部投影");
     assert_eq!(refreshed, vec![(1, Some(21), false); 6]);
