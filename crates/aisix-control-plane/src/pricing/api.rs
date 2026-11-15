@@ -315,6 +315,7 @@ const CHARGE_EVENT: &str = "jsonb_build_object(\
     'operation', ue.event->'operation', \
     'status_code', ue.event->'status_code', \
     'error_class', ue.event->'error_class', \
+    'error_message', ue.event->'error_message', \
     'attempt_kind', ue.event->'attempt_kind', \
     'attempt_index', ue.event->'attempt_index', \
     'is_final_attempt', ue.event->'is_final_attempt', \
@@ -356,6 +357,8 @@ struct ChargeItem {
     status_code: Option<u16>,
     /// The failed attempt's error class; `None` for a success.
     error_class: Option<String>,
+    /// 已记录的具体错误，仅脱敏展示副本；旧记录未采集时为空。
+    error_message: Option<String>,
     /// `initial`, `retry` or `fallback`.
     attempt_kind: String,
     /// The attempt's 0-based index within its request.
@@ -503,6 +506,7 @@ fn model_ids<'a>(raw: impl Iterator<Item = &'a str>) -> Vec<Uuid> {
 /// which upstream served it. These channel fields are operators' fields.
 /// `usage` 保留事件中的已记录计数，`usage_estimated` 单独说明估算来源；
 /// 长度与文本参考不改写原始用量或计费行。
+/// `error_message` 为已存错误的脱敏展示副本，未采集时为空。
 pub async fn list_charges(
     auth: OperatorAuth,
     State(state): State<AppState>,
@@ -634,7 +638,10 @@ pub async fn list_charges(
     let items: Vec<ChargeItem> = rows
         .into_iter()
         .map(|row| {
-            let ev = row.ev.clone().unwrap_or(Value::Null);
+            let mut ev = row.ev.clone().unwrap_or(Value::Null);
+            if let Some(message) = ev.get_mut("error_message") {
+                crate::usage::admin_event_view(message);
+            }
             let (model_name, model_deleted) = shown_model(
                 &names,
                 &row.requested_model_id,
@@ -661,6 +668,7 @@ pub async fn list_charges(
                     .and_then(|c| u16::try_from(c).ok())
                     .filter(|c| *c > 0),
                 error_class: ev_text(&ev, "error_class"),
+                error_message: ev_text(&ev, "error_message"),
                 attempt_kind: ev_text(&ev, "attempt_kind").unwrap_or_else(|| "initial".into()),
                 attempt_index: ev.get("attempt_index").and_then(Value::as_u64).unwrap_or(0),
                 is_final_attempt: ev.get("is_final_attempt").and_then(Value::as_bool),

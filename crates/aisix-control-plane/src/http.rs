@@ -396,6 +396,11 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
     ),
     (
         "GET",
+        "/admin/usage/events/{event_id}",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
+    (
+        "GET",
         "/admin/usage/batches",
         MinRole::Op(OperatorRole::Viewer),
     ),
@@ -988,6 +993,7 @@ pub fn browser_router(state: AppState) -> Router {
         )
         .route("/api/keys/{id}/reveal", post(keys::reveal))
         .route("/admin/usage/events", get(usage::list_events))
+        .route("/admin/usage/events/{event_id}", get(usage::get_event))
         .route("/admin/native-metering", get(native_objects::metering_api::list))
         .route("/admin/usage/batches", get(usage::list_batches))
         .route("/admin/usage/rejects", get(usage::list_rejects))

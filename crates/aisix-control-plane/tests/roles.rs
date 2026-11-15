@@ -171,6 +171,8 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
         | ("GET", "/admin/usage/direct-models")
         | ("GET", "/admin/usage/batches")
         | ("GET", "/admin/usage/rejects") => (path.to_string(), None),
+        ("GET", "/admin/usage/events/{event_id}") =>
+            (path.replace("{event_id}", "roles-absent-event"), None),
         // Prices and charges. Each write is refused after the role check
         // (no such model or tenant, a card without a default tier), so
         // nothing is written.

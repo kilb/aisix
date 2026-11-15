@@ -50,7 +50,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use axum::extract::rejection::QueryRejection;
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::Json;
 use chrono::{DateTime, Utc};
 use futures::FutureExt;
@@ -695,6 +695,100 @@ type EventRow = (
     Value,
 );
 
+// 接收端保留新网关的未知字段；展示副本仍须隐藏其中的凭据槽。
+pub(crate) fn admin_event_view(value: &mut Value) {
+    match value {
+        Value::Object(fields) => {
+            for (key, value) in fields {
+                let key = key.to_ascii_lowercase().replace('-', "_");
+                if matches!(
+                    key.as_str(),
+                    "authorization"
+                        | "proxy_authorization"
+                        | "x_api_key"
+                        | "api_key"
+                        | "apikey"
+                        | "access_token"
+                        | "refresh_token"
+                        | "client_secret"
+                        | "password"
+                        | "secret"
+                        | "token"
+                        | "access_key_secret"
+                        | "secret_access_key"
+                ) {
+                    *value = json!(aisix_gateway::upstream_error_scrub::REDACTED);
+                } else {
+                    admin_event_view(value);
+                }
+            }
+        }
+        Value::Array(values) => values.iter_mut().for_each(admin_event_view),
+        Value::String(text) => {
+            *text = aisix_gateway::upstream_error_scrub::scrub_upstream_error_text(text);
+            // 非 HTTP 的配置地址同样可能携带 userinfo 或查询凭据。
+            if text.contains("://") && reqwest::Url::parse(text).is_ok() {
+                *text = aisix_core::redact_url_for_log(text);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn event_view(row: EventRow) -> Value {
+    let (
+        seq,
+        event_id,
+        occurred_at,
+        received_at,
+        dp_id,
+        batch_id,
+        team_id,
+        api_key_id,
+        request_id,
+        mut event,
+    ) = row;
+    admin_event_view(&mut event);
+    json!({
+        "seq": seq,
+        "event_id": event_id,
+        "occurred_at": occurred_at,
+        "received_at": received_at,
+        "dp_id": dp_id,
+        "batch_id": batch_id,
+        "team_id": team_id,
+        "api_key_id": api_key_id,
+        "request_id": request_id,
+        "event": event,
+    })
+}
+
+/// `GET /admin/usage/events/{event_id}`：按全局唯一的事件标识读取一条记录。
+/// 权限与管理员列表一致。
+/// 返回列表单行契约，缺失时为 `404 not_found`。只脱敏展示副本，
+/// 不补造未采集正文或计数，也不触发请求重放、计价或统计更新。
+pub async fn get_event(
+    auth: OperatorAuth,
+    State(state): State<AppState>,
+    Path(event_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    auth.require(OperatorRole::Viewer)?;
+    // 存储的事件标识已替换 NUL，原字符不可能命中，也不能传给 Postgres text。
+    if event_id.contains('\0') {
+        return Err(ApiError::not_found());
+    }
+    let row: EventRow = sqlx::query_as(
+        "SELECT seq, event_id, occurred_at, received_at, dp_id, batch_id, team_id, api_key_id, \
+                request_id, event FROM usage_events WHERE event_id = $1",
+    )
+    .bind(event_id)
+    .fetch_optional(state.db.pool())
+    .await
+    .map_err(DbError::from)?
+    .ok_or_else(ApiError::not_found)?;
+    Ok(Json(event_view(row)))
+}
+
 /// `GET /admin/usage/events`: stored events, newest first by `seq`,
 /// `limit` (default 50, at most 500) at a time, optionally only those of a
 /// `team_id`, an `api_key_id` or a `request_id`. `next_before` is the
@@ -736,36 +830,7 @@ pub async fn list_events(
         .await
         .map_err(DbError::from)?;
     let (rows, next_before) = page(rows, limit, |r| r.0);
-    let items: Vec<Value> = rows
-        .into_iter()
-        .map(
-            |(
-                seq,
-                event_id,
-                occurred_at,
-                received_at,
-                dp_id,
-                batch_id,
-                team_id,
-                api_key_id,
-                request_id,
-                event,
-            )| {
-                json!({
-                    "seq": seq,
-                    "event_id": event_id,
-                    "occurred_at": occurred_at,
-                    "received_at": received_at,
-                    "dp_id": dp_id,
-                    "batch_id": batch_id,
-                    "team_id": team_id,
-                    "api_key_id": api_key_id,
-                    "request_id": request_id,
-                    "event": event,
-                })
-            },
-        )
-        .collect();
+    let items: Vec<Value> = rows.into_iter().map(event_view).collect();
     Ok(Json(json!({ "items": items, "next_before": next_before })))
 }
 
