@@ -176,9 +176,10 @@ pub fn visible_to_tenant(is_final_attempt: bool, charge_status: &str, repriced: 
 }
 
 /// [`visible_to_tenant`] over the joined `pc` (charge) and `ue` (usage row).
-pub(crate) const VISIBLE: &str =
-    "(ue.event->'is_final_attempt' = 'true'::jsonb OR pc.status = 'charged' \
-     OR EXISTS (SELECT 1 FROM pricing_adjustments_cny pa WHERE pa.event_id = pc.event_id))";
+// 计费或已修正的尝试必可见；仅其余行需要为最终标志解包事件。
+pub(crate) const VISIBLE: &str = "(CASE WHEN pc.status = 'charged' \
+     OR EXISTS (SELECT 1 FROM pricing_adjustments_cny pa WHERE pa.event_id = pc.event_id) \
+     THEN TRUE ELSE ue.event->'is_final_attempt' = 'true'::jsonb END)";
 
 /// The sum of the adjustments of the charge `pc`, `NULL` when it has none.
 pub(crate) const ADJUSTED: &str =
