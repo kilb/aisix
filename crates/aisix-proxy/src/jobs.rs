@@ -66,6 +66,7 @@
 //! the equivalent of a mainstream gateway's completed-batch handling. The key
 //! that submitted the batch pays, not the one that happened to observe it ([`BATCH_SUBMITTER_KEY`]).
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1799,7 +1800,8 @@ pub(crate) async fn create_file(
                 if let UploadField::File {bytes,..}=field {
                     let bytes=masked.get(&index).map_or(bytes.as_ref(),Vec::as_slice);
                     let (rewritten,entries)=managed_batch_input(&state,snapshot,&auth,&client,origin,bytes,&mut monitor_hits,&mut enforced_hits,&mut scores,&mut bypass,&mut applied,&mut redactions,BatchInputAdmission::Upload).await?;
-                    masked.insert(index,rewritten.to_vec());native_entries=entries;
+                    if let Cow::Owned(rewritten)=rewritten {masked.insert(index,rewritten);}
+                    native_entries=entries;
                 }
             }
         }
@@ -3213,13 +3215,13 @@ enum BatchInputAdmission<'a> {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn managed_batch_input(
+async fn managed_batch_input<'a>(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
     client: &ClientContext,
     origin: &aisix_core::native_objects::OriginBinding,
-    bytes: &[u8],
+    bytes: &'a [u8],
     monitor_hits: &mut Vec<aisix_core::GuardrailMonitorHit>,
     enforced_hits: &mut Vec<aisix_core::GuardrailEnforcedHit>,
     scores: &mut Vec<aisix_core::GuardrailScore>,
@@ -3227,13 +3229,13 @@ async fn managed_batch_input(
     applied: &mut Vec<aisix_core::AppliedGuardrail>,
     redactions: &mut crate::redact::RedactionCounts,
     admission: BatchInputAdmission<'_>,
-) -> Result<(Bytes, Vec<aisix_core::native_objects::NativeEntry>), ProxyError> {
+) -> Result<(Cow<'a, [u8]>, Vec<aisix_core::native_objects::NativeEntry>), ProxyError> {
     use crate::native_api::openai;
     use aisix_core::native_objects::{NativeEntry, NativeObjectKind};
-    let mut out = Vec::with_capacity(bytes.len());
+    let mut out: Option<Vec<u8>> = None;
     let mut entries = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    let mut changed = false;
+    let mut offset = 0;
     let (saved_entries, consumer_family) = match admission {
         BatchInputAdmission::Upload => (None, None),
         BatchInputAdmission::Submit(entries) => (
@@ -3241,12 +3243,18 @@ async fn managed_batch_input(
             Some(aisix_core::models::EndpointFamily::Batches),
         ),
     };
-    for line in bytes
-        .split(|byte| *byte == b'\n')
-        .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
-    {
-        let mut line: Value = serde_json::from_slice(line)
+    for raw_line in bytes.split_inclusive(|byte| *byte == b'\n') {
+        let start = offset;
+        offset += raw_line.len();
+        if raw_line.iter().all(u8::is_ascii_whitespace) {
+            if let Some(out) = out.as_mut() {
+                out.extend_from_slice(raw_line);
+            }
+            continue;
+        }
+        let mut line: Value = serde_json::from_slice(raw_line)
             .map_err(|_| ProxyError::InvalidRequest("invalid batch input JSONL".into()))?;
+        let mut changed = false;
         let id = line
             .get("custom_id")
             .and_then(Value::as_str)
@@ -3395,10 +3403,12 @@ async fn managed_batch_input(
             *applied = entry_applied;
         }
         if let Some(masked) = scanned? {
-            changed = true;
-            line["body"] = serde_json::from_slice(&masked).map_err(|_| {
-                ProxyError::InvalidRequest("masked batch input body is not JSON".into())
-            })?;
+            if masked != body {
+                changed = true;
+                line["body"] = serde_json::from_slice(&masked).map_err(|_| {
+                    ProxyError::InvalidRequest("masked batch input body is not JSON".into())
+                })?;
+            }
         }
         if endpoint == "/v1/responses" {
             // 上传与提交均检查最终 JSONL；所有引用必须属于本批次实际使用的账号。
@@ -3448,8 +3458,22 @@ async fn managed_batch_input(
             line["body"]["model"] = Value::String(upstream);
             changed = true;
         }
-        serde_json::to_writer(&mut out, &line).map_err(|_| openai::dependency())?;
-        out.push(b'\n');
+        if changed {
+            // 首次实际改写才分配输出；之前及之后未改写的行保留原始字节。
+            let out = out.get_or_insert_with(|| {
+                let mut out = Vec::with_capacity(bytes.len());
+                out.extend_from_slice(&bytes[..start]);
+                out
+            });
+            serde_json::to_writer(&mut *out, &line).map_err(|_| openai::dependency())?;
+            if raw_line.ends_with(b"\r\n") {
+                out.extend_from_slice(b"\r\n");
+            } else if raw_line.ends_with(b"\n") {
+                out.push(b'\n');
+            }
+        } else if let Some(out) = out.as_mut() {
+            out.extend_from_slice(raw_line);
+        }
         if entries.len() > 1000 {
             return Err(ProxyError::InvalidRequest(
                 "batch input exceeds the durable entry limit".into(),
@@ -3464,14 +3488,7 @@ async fn managed_batch_input(
     if saved_entries.is_some_and(|saved| !saved.is_empty() && saved.len() != entries.len()) {
         return Err(openai::invalid_identity());
     }
-    Ok((
-        if changed {
-            Bytes::from(out)
-        } else {
-            Bytes::copy_from_slice(bytes)
-        },
-        entries,
-    ))
+    Ok((out.map_or(Cow::Borrowed(bytes), Cow::Owned), entries))
 }
 
 async fn managed_create_batch(
@@ -3592,7 +3609,7 @@ async fn managed_create_batch(
                     "endpoint must match every request in the batch input file".into(),
                 ));
             }
-            if rewritten != content.bytes {
+            if rewritten.as_ref() != content.bytes.as_ref() {
                 // 只新建派生输入；原文件、客户端可继续使用的 ID 与已受理批次均不重派。
                 let operation = managed_begin(
                     &state,
@@ -3607,7 +3624,9 @@ async fn managed_create_batch(
                     Some(raw.clone()),
                 )
                 .await?;
-                let part = reqwest::multipart::Part::bytes(rewritten.to_vec())
+                let rewritten = Bytes::from(rewritten.into_owned());
+                let len = rewritten.len() as u64;
+                let part = reqwest::multipart::Part::stream_with_length(rewritten, len)
                     .file_name("batch-input.jsonl")
                     .mime_str("application/jsonl")
                     .map_err(|_| openai::dependency())?;
