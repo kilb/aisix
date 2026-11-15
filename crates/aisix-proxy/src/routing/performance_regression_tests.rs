@@ -19,25 +19,29 @@ pub(crate) enum MetricRead {
 }
 
 thread_local! {
-    static METRIC_READS: Cell<MetricReads> = Cell::new(MetricReads::default());
-    static AFFINITY_PROBES: Cell<usize> = const { Cell::new(0) };
+    static METRIC_READS: Cell<Option<MetricReads>> = const { Cell::new(None) };
+    static AFFINITY_PROBES: Cell<Option<usize>> = const { Cell::new(None) };
     static WRR_PAUSE: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
 }
 
 pub(crate) fn note_metric_read(kind: MetricRead) {
     METRIC_READS.with(|slot| {
-        let mut reads = slot.get();
+        let Some(mut reads) = slot.get() else { return };
         match kind {
             MetricRead::Busy => reads.busy += 1,
             MetricRead::Latency => reads.latency += 1,
             MetricRead::Penalty => reads.penalty += 1,
         }
-        slot.set(reads);
+        slot.set(Some(reads));
     });
 }
 
 pub(crate) fn note_affinity_probe() {
-    AFFINITY_PROBES.with(|slot| slot.set(slot.get() + 1));
+    AFFINITY_PROBES.with(|slot| {
+        if let Some(probes) = slot.get() {
+            slot.set(Some(probes + 1));
+        }
+    });
 }
 
 pub(crate) fn pause_wrr_after_lookup() {
@@ -84,7 +88,7 @@ fn affinity_restoration_has_linear_membership_work() {
     // 恢复逐项线性查重会把计数变成约 N²/2；错误地删掉回补则选不到最后的来源。
     for count in [8usize, 64, 128, 256] {
         let (snapshot, model) = fixture(count, RoutingStrategy::Failover, Some(0));
-        AFFINITY_PROBES.with(|slot| slot.set(0));
+        AFFINITY_PROBES.with(|slot| slot.set(Some(0)));
         let origin = format!("id-{}", count - 1);
         let attempts = resolve_attempt_models(
             &RoutingRegistry::new(),
@@ -102,7 +106,7 @@ fn affinity_restoration_has_linear_membership_work() {
         .unwrap();
         assert_eq!(attempts.len(), 1);
         assert_eq!(attempts[0].id, origin);
-        let probes = AFFINITY_PROBES.with(Cell::get);
+        let probes = AFFINITY_PROBES.with(|slot| slot.take().unwrap());
         assert!(probes > 0, "亲和性恢复计数没有覆盖实际工作");
         assert!(
             probes <= 2 * count,
@@ -127,7 +131,7 @@ fn metric_ranking_reads_each_runtime_key_at_most_once() {
                     holds.push(status.count_in_flight(&id));
                 }
             }
-            METRIC_READS.with(|slot| slot.set(MetricReads::default()));
+            METRIC_READS.with(|slot| slot.set(Some(MetricReads::default())));
             let attempts = resolve_attempt_models(
                 &RoutingRegistry::new(),
                 &status,
@@ -151,7 +155,7 @@ fn metric_ranking_reads_each_runtime_key_at_most_once() {
                 .collect();
             let ids: Vec<_> = attempts.iter().map(|a| a.id.as_str()).collect();
             assert_eq!(ids, expected);
-            let reads = METRIC_READS.with(Cell::get);
+            let reads = METRIC_READS.with(|slot| slot.take().unwrap());
             match strategy {
                 RoutingStrategy::LeastLatency => {
                     assert_eq!(reads.penalty, count, "count={count}, reads={reads:?}");
