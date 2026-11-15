@@ -963,7 +963,8 @@ async fn request_decode_all_ignored_method_paths_keep_their_decision_without_pol
         let path = template
             .replace(":id", "missing-transport-id")
             .replace(":server", "missing-transport-server")
-            .replace(":agent", "missing-transport-agent");
+            .replace(":agent", "missing-transport-agent")
+            .replace(":version", "1");
         let mut plain_status = None;
         for zstd in [false, true] {
             let polls = Arc::new(AtomicUsize::new(0));
@@ -1229,6 +1230,465 @@ async fn request_decode_raw_path_and_foreign_host_relay_keep_encoded_entity() ->
     Ok(())
 }
 
+// 固定官方 SDK 3dae6090cc31cc64a437fe0bcee740b6d81ed2cc 的 active 原生正文合同。
+// CCV 的引用入口：resources/conversations、containers、vector_stores；
+// Skills/Voices：resources/skills、audio/voice_consents、audio/voices。
+// 仅完整 HTTP 组件与真实本地 SQLite；本地协议替身不代表提供商 E2E。
+#[derive(Clone, Copy)]
+enum NativeBodyForm {
+    Json,
+    Multipart,
+    JsonAndMultipart,
+}
+
+struct NativeBodyCase {
+    route: &'static str,
+    form: NativeBodyForm,
+}
+
+const NATIVE_BODY_CASES: &[NativeBodyCase] = &[
+    NativeBodyCase {
+        route: "/v1/conversations",
+        form: NativeBodyForm::Json,
+    },
+    NativeBodyCase {
+        route: "/v1/conversations/:id",
+        form: NativeBodyForm::Json,
+    },
+    NativeBodyCase {
+        route: "/v1/conversations/:id/items",
+        form: NativeBodyForm::Json,
+    },
+    NativeBodyCase {
+        route: "/v1/containers",
+        form: NativeBodyForm::Json,
+    },
+    NativeBodyCase {
+        route: "/v1/containers/:id/files",
+        form: NativeBodyForm::JsonAndMultipart,
+    },
+    NativeBodyCase {
+        route: "/v1/vector_stores",
+        form: NativeBodyForm::Json,
+    },
+    NativeBodyCase {
+        route: "/v1/vector_stores/:id",
+        form: NativeBodyForm::Json,
+    },
+    NativeBodyCase {
+        route: "/v1/vector_stores/:id/search",
+        form: NativeBodyForm::Json,
+    },
+    NativeBodyCase {
+        route: "/v1/vector_stores/:id/files",
+        form: NativeBodyForm::Json,
+    },
+    NativeBodyCase {
+        route: "/v1/vector_stores/:id/files/:file_id",
+        form: NativeBodyForm::Json,
+    },
+    NativeBodyCase {
+        route: "/v1/vector_stores/:id/file_batches",
+        form: NativeBodyForm::Json,
+    },
+    NativeBodyCase {
+        route: "/v1/skills",
+        form: NativeBodyForm::Multipart,
+    },
+    NativeBodyCase {
+        route: "/v1/skills/:id",
+        form: NativeBodyForm::Json,
+    },
+    NativeBodyCase {
+        route: "/v1/skills/:id/versions",
+        form: NativeBodyForm::Multipart,
+    },
+    NativeBodyCase {
+        route: "/v1/audio/voice_consents",
+        form: NativeBodyForm::Multipart,
+    },
+    NativeBodyCase {
+        route: "/v1/audio/voice_consents/:id",
+        form: NativeBodyForm::Json,
+    },
+    NativeBodyCase {
+        route: "/v1/audio/voices",
+        form: NativeBodyForm::JsonAndMultipart,
+    },
+];
+
+const NATIVE_BAD_JSON_ZSTD: &[u8] = &[0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x01, 0x09, 0x00, 0x00, 0x7b];
+const NATIVE_BAD_MULTIPART: &[u8] = b"--transport-native\r\nnot-a-valid-multipart-header\r\n\r\nsentinel\r\n--transport-native--\r\n";
+const NATIVE_BAD_MULTIPART_ZSTD: &[u8] = &[
+    0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x54, 0xa1, 0x02, 0x00, 0x2d, 0x2d, 0x74, 0x72, 0x61, 0x6e, 0x73,
+    0x70, 0x6f, 0x72, 0x74, 0x2d, 0x6e, 0x61, 0x74, 0x69, 0x76, 0x65, 0x0d, 0x0a, 0x6e, 0x6f, 0x74,
+    0x2d, 0x61, 0x2d, 0x76, 0x61, 0x6c, 0x69, 0x64, 0x2d, 0x6d, 0x75, 0x6c, 0x74, 0x69, 0x70, 0x61,
+    0x72, 0x74, 0x2d, 0x68, 0x65, 0x61, 0x64, 0x65, 0x72, 0x0d, 0x0a, 0x0d, 0x0a, 0x73, 0x65, 0x6e,
+    0x74, 0x69, 0x6e, 0x65, 0x6c, 0x0d, 0x0a, 0x2d, 0x2d, 0x74, 0x72, 0x61, 0x6e, 0x73, 0x70, 0x6f,
+    0x72, 0x74, 0x2d, 0x6e, 0x61, 0x74, 0x69, 0x76, 0x65, 0x2d, 0x2d, 0x0d, 0x0a,
+];
+
+const NATIVE_LIMIT_MULTIPART_ZSTD: &[u8] = &[
+    0x28, 0xb5, 0x2f, 0xfd, 0x60, 0x9d, 0x0f, 0x85, 0x03, 0x00, 0xb2, 0xc6, 0x15, 0x18, 0x90, 0x29,
+    0x6d, 0xf8, 0x2b, 0x11, 0xc8, 0x5e, 0x58, 0x58, 0xe5, 0xb7, 0xa6, 0x46, 0xe6, 0xbe, 0x02, 0xfb,
+    0x37, 0x40, 0x72, 0xbd, 0xc4, 0xcc, 0x65, 0x77, 0x65, 0x8a, 0xb2, 0xb2, 0x83, 0x89, 0x9e, 0xee,
+    0x79, 0x84, 0x03, 0x88, 0x28, 0xa2, 0x1b, 0x8b, 0x91, 0xbd, 0x28, 0x98, 0x55, 0x03, 0xa0, 0x1c,
+    0x26, 0x11, 0x9a, 0x18, 0x41, 0x1e, 0xdc, 0x72, 0xe0, 0xf1, 0x70, 0x07, 0x71, 0x52, 0x8c, 0x65,
+    0xbd, 0x26, 0xee, 0xa4, 0x84, 0xfb, 0xe6, 0x97, 0x07, 0x65, 0x99, 0xd0, 0xe3, 0xde, 0x11, 0x77,
+    0x5a, 0x44, 0xbf, 0x0b, 0x07, 0x00, 0x8a, 0x70, 0x3c, 0x8c, 0xff, 0xb8, 0x87, 0x50, 0xb0, 0xaf,
+    0x04, 0x54, 0x26, 0xe8, 0xa0, 0x39, 0x10, 0x28, 0x28, 0x66,
+];
+
+fn native_transport_path(route: &str) -> String {
+    route
+        .replace(":id", "container-transport")
+        .replace(":file_id", "file-transport")
+        .replace(":item_id", "item-transport")
+        .replace(":batch_id", "batch-transport")
+        .replace(":version", "1")
+}
+
+struct NativeDecodeFixture {
+    app: axum::Router,
+    provider: wiremock::MockServer,
+    _directory: tempfile::TempDir,
+}
+
+impl NativeDecodeFixture {
+    async fn new(limit: usize) -> Result<Self, Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        use crate::native_api::registry::NativeObjectRegistry;
+        use crate::native_api::standalone_store::{stable_resource_id, StandaloneNativeStore};
+        use aisix_core::native_objects::{
+            configured_native_origin, native_origin_surface, BeginRequest, BindRequest,
+            NativeObjectKind, NativeProtocol, OriginBinding,
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const MODEL: &str = "81111111-1111-4111-8111-111111111111";
+        const PROVIDER: &str = "82222222-2222-4222-8222-222222222222";
+        const SECRET: [u8; 32] = [47; 32];
+        let provider = MockServer::builder().start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/containers/container-transport"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id":"container-transport", "object":"container", "name":"transport",
+                "created_at":1730000000, "status":"running"
+            })))
+            .mount(&provider)
+            .await;
+        let state = admitted_state(limit)?;
+        let provider_doc: aisix_core::ProviderKey = serde_json::from_value(json!({
+            "display_name":"transport-provider", "provider":"openai", "adapter":"openai",
+            "api_key":"transport-provider-test-only", "api_base":format!("{}/v1", provider.uri())
+        }))?;
+        let model: aisix_core::Model = serde_json::from_value(json!({
+            "display_name":"request-decode-native", "provider_key_id":PROVIDER,
+            "model_name":"transport-upstream"
+        }))?;
+        {
+            let snapshot = state.snapshot.load();
+            snapshot
+                .provider_keys
+                .insert(ResourceEntry::new(PROVIDER, provider_doc.clone(), 1));
+            snapshot.models.insert(ResourceEntry::new(MODEL, model, 1));
+        }
+        let directory = tempfile::tempdir()?;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+        let store = StandaloneNativeStore::open(
+            &directory.path().join("authority.sqlite3"),
+            SECRET,
+            state.snapshot.clone(),
+        )
+        .await?;
+        let kind = NativeObjectKind::ResponseContainer;
+        let origin = OriginBinding {
+            surface: Some(native_origin_surface(NativeProtocol::Openai, kind)),
+            model_id: MODEL.parse()?,
+            provider_key_id: PROVIDER.parse()?,
+            boundary: configured_native_origin(
+                &SECRET,
+                PROVIDER.parse()?,
+                &provider_doc,
+                NativeProtocol::Openai,
+                kind,
+            )?,
+        };
+        let operation_id = uuid::Uuid::new_v4();
+        let api_key_id = stable_resource_id("apikeys", "request-decode-key");
+        let accepted = store
+            .begin(BeginRequest {
+                upstream_input_text: None,
+                input_file_id: None,
+                operation_id,
+                api_key_id,
+                protocol: NativeProtocol::Openai,
+                kind,
+                origin,
+                parent_id: None,
+                requested_model_id: MODEL.parse()?,
+                requested_model: "request-decode-native".into(),
+                upstream_model: "transport-upstream".into(),
+                upstream_provider: "openai".into(),
+                operation: "containers".into(),
+                request_id: uuid::Uuid::new_v4().to_string(),
+                asynchronous: false,
+                requested_service_tier: None,
+                entries: Vec::new(),
+                observation_headers: Default::default(),
+            })
+            .await?;
+        assert_eq!(accepted.operation_id, Some(operation_id));
+        let bound = store
+            .bind(BindRequest {
+                existing_record_id: None,
+                objects: Vec::new(),
+                operation_id,
+                api_key_id,
+                raw_id: "container-transport".into(),
+                provider_created_at: None,
+                provider_expires_at: None,
+            })
+            .await?;
+        assert_eq!(
+            bound.record.as_ref().map(|record| record.raw_id.as_str()),
+            Some("container-transport")
+        );
+        let app = crate::build_router(state.with_native_objects(Arc::new(store)));
+        // 先证明同一 key、真实归属、模型与账号确实能走到 provider，后续零增量才非空验证。
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/containers/container-transport")
+                    .header(header::AUTHORIZATION, "Bearer sk-request-decode-test")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        let (status, body) = response_json(response).await?;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "native fixture positive control: {body}"
+        );
+        assert_eq!(body["id"].as_str(), Some("container-transport"));
+        assert_eq!(
+            provider
+                .received_requests()
+                .await
+                .ok_or("provider request recording is disabled")?
+                .len(),
+            1
+        );
+        Ok(Self {
+            app,
+            provider,
+            _directory: directory,
+        })
+    }
+}
+
+async fn assert_native_body_rejected(
+    fixture: &NativeDecodeFixture,
+    case: &NativeBodyCase,
+    content_type: &str,
+    plain: &'static [u8],
+    encoded: &'static [u8],
+) -> TestResult {
+    let before = fixture
+        .provider
+        .received_requests()
+        .await
+        .ok_or("provider request recording is disabled")?
+        .len();
+    assert_eq!(
+        before, 1,
+        "the real provider control must have run exactly once"
+    );
+    for (label, bytes, zstd) in [("plain", plain, false), ("zstd", encoded, true)] {
+        let path = native_transport_path(case.route);
+        let mut request = body_request(&path, Body::from(bytes), content_type, zstd);
+        request
+            .headers_mut()
+            .insert("x-aisix-model", "request-decode-native".parse()?);
+        let response = fixture.app.clone().oneshot(request).await?;
+        let (status, body) = response_json(response).await?;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{} {label}: {body}",
+            case.route
+        );
+        assert_eq!(
+            body["error"]["type"].as_str(),
+            Some("invalid_request_error"),
+            "{} {label}: {body}",
+            case.route
+        );
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| !message.is_empty()),
+            "{} {label}: {body}",
+            case.route
+        );
+        assert_eq!(
+            fixture
+                .provider
+                .received_requests()
+                .await
+                .ok_or("provider request recording is disabled")?
+                .len(),
+            before,
+            "{} {label}: invalid body reached the provider",
+            case.route
+        );
+    }
+    Ok(())
+}
+
+// 有效认证与真实父对象不能让畸形 JSON 穿过任何 active 原生写入口。
+#[tokio::test]
+async fn request_decode_active_native_json_rejects_malformed_body_without_dispatch() -> TestResult {
+    let fixture = NativeDecodeFixture::new(1_048_576).await?;
+    for case in NATIVE_BODY_CASES.iter().filter(|case| {
+        matches!(
+            case.form,
+            NativeBodyForm::Json | NativeBodyForm::JsonAndMultipart
+        )
+    }) {
+        assert_native_body_rejected(
+            &fixture,
+            case,
+            "application/json",
+            b"{",
+            NATIVE_BAD_JSON_ZSTD,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+// 与 JSON 并列覆盖实际 multipart 消费者，容器文件使用已持久化的 owned parent。
+#[tokio::test]
+async fn request_decode_active_native_multipart_rejects_malformed_body_without_dispatch(
+) -> TestResult {
+    let fixture = NativeDecodeFixture::new(1_048_576).await?;
+    for case in NATIVE_BODY_CASES.iter().filter(|case| {
+        matches!(
+            case.form,
+            NativeBodyForm::Multipart | NativeBodyForm::JsonAndMultipart
+        )
+    }) {
+        assert_native_body_rejected(
+            &fixture,
+            case,
+            "multipart/form-data; boundary=transport-native",
+            NATIVE_BAD_MULTIPART,
+            NATIVE_BAD_MULTIPART_ZSTD,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+// wire 小于上限而完整实体大于上限；漏掉解压只能读到乱码 400，不能满足这里的 413。
+// 每个真实正文入口都执行两种 framing 控制，不以畸形 plain/zstd 同报 400 假称已解码。
+#[tokio::test]
+async fn request_decode_active_native_decoded_limits_reject_without_dispatch() -> TestResult {
+    const LIMIT: usize = 512;
+    let fixture = NativeDecodeFixture::new(LIMIT).await?;
+    let padding = vec![b'x'; 4096];
+    let json = [
+        br#"{"model":"request-decode-absent","input":""#.as_slice(),
+        padding.as_slice(),
+        br#""}"#.as_slice(),
+    ]
+    .concat();
+    let multipart = [
+        b"--transport-native\r\nContent-Disposition: form-data; name=\"file\"; filename=\"transport.bin\"\r\nContent-Type: application/octet-stream\r\n\r\n".as_slice(),
+        padding.as_slice(),
+        b"\r\n--transport-native--\r\n".as_slice(),
+    ].concat();
+    assert_eq!(json.len(), PADDED_RESPONSES_LEN);
+    let json_control: Value = serde_json::from_slice(&json)?;
+    assert!(json_control.is_object());
+    for case in NATIVE_BODY_CASES {
+        for (is_json, content_type, plain, encoded) in [
+            (
+                true,
+                "application/json",
+                json.as_slice(),
+                PADDED_RESPONSES_ZSTD,
+            ),
+            (
+                false,
+                "multipart/form-data; boundary=transport-native",
+                multipart.as_slice(),
+                NATIVE_LIMIT_MULTIPART_ZSTD,
+            ),
+        ] {
+            if matches!(
+                (case.form, is_json),
+                (NativeBodyForm::Json, false) | (NativeBodyForm::Multipart, true)
+            ) {
+                continue;
+            }
+            assert!(
+                encoded.len() < LIMIT,
+                "{}: encoded control exceeds wire cap",
+                case.route
+            );
+            assert!(
+                plain.len() >= 4 * 1024,
+                "{}: decoded control must contain at least 4KiB",
+                case.route
+            );
+            assert!(
+                plain.len() > LIMIT,
+                "{}: decoded control is within cap",
+                case.route
+            );
+            for (label, bytes, zstd) in [("plain", plain, false), ("zstd", encoded, true)] {
+                let path = native_transport_path(case.route);
+                let mut request =
+                    body_request(&path, Body::from(bytes.to_vec()), content_type, zstd);
+                request
+                    .headers_mut()
+                    .insert("x-aisix-model", "request-decode-native".parse()?);
+                let response = fixture.app.clone().oneshot(request).await?;
+                let (status, body) = response_json(response).await?;
+                assert_eq!(
+                    status,
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "{} {content_type} {label}: {body}",
+                    case.route
+                );
+                assert!(
+                    body.get("error").is_some_and(Value::is_object),
+                    "{} {label}: {body}",
+                    case.route
+                );
+                assert_eq!(
+                    fixture
+                        .provider
+                        .received_requests()
+                        .await
+                        .ok_or("provider request recording is disabled")?
+                        .len(),
+                    1,
+                    "{} {label}: oversized decoded body reached provider",
+                    case.route
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 // 路径和 method 都来自实际注册表；新增任何接口必须补齐可解码 fixture 或无体说明。
 #[test]
 fn request_decode_census_covers_every_registered_method_and_path() {
@@ -1279,6 +1739,9 @@ fn request_decode_census_covers_every_registered_method_and_path() {
     for case in JSON_CASES {
         covered.insert((case.path.to_owned(), "POST".to_owned()));
     }
+    for case in NATIVE_BODY_CASES {
+        covered.insert((case.route.to_owned(), "POST".to_owned()));
+    }
     for (path, method) in BODY_AND_IGNORED_SURFACES {
         covered.insert(((*path).into(), (*method).into()));
     }
@@ -1292,6 +1755,44 @@ fn request_decode_census_covers_every_registered_method_and_path() {
 // ANY 记录注册器本身；MCP 的 POST 语义由 RPC 用例覆盖，其余 method 保持既有处理。
 // GET/DELETE/取消/发现/健康接口不消费请求体，完整 typed route_layer 仍覆盖这些注册。
 const BODY_AND_IGNORED_SURFACES: &[(&str, &str)] = &[
+    // 官方 GET/DELETE/取消方法不带正文，继续复用严格 no-poll 合同。
+    ("/v1/conversations/:id", "GET"),
+    ("/v1/conversations/:id", "DELETE"),
+    ("/v1/conversations/:id/items", "GET"),
+    ("/v1/conversations/:id/items/:item_id", "GET"),
+    ("/v1/conversations/:id/items/:item_id", "DELETE"),
+    ("/v1/containers", "GET"),
+    ("/v1/containers/:id", "GET"),
+    ("/v1/containers/:id", "DELETE"),
+    ("/v1/containers/:id/files", "GET"),
+    ("/v1/containers/:id/files/:file_id", "GET"),
+    ("/v1/containers/:id/files/:file_id", "DELETE"),
+    ("/v1/containers/:id/files/:file_id/content", "GET"),
+    ("/v1/vector_stores", "GET"),
+    ("/v1/vector_stores/:id", "GET"),
+    ("/v1/vector_stores/:id", "DELETE"),
+    ("/v1/vector_stores/:id/files", "GET"),
+    ("/v1/vector_stores/:id/files/:file_id", "GET"),
+    ("/v1/vector_stores/:id/files/:file_id", "DELETE"),
+    ("/v1/vector_stores/:id/files/:file_id/content", "GET"),
+    ("/v1/vector_stores/:id/file_batches/:batch_id", "GET"),
+    (
+        "/v1/vector_stores/:id/file_batches/:batch_id/cancel",
+        "POST",
+    ),
+    ("/v1/vector_stores/:id/file_batches/:batch_id/files", "GET"),
+    ("/v1/skills", "GET"),
+    ("/v1/skills/:id", "GET"),
+    ("/v1/skills/:id", "DELETE"),
+    ("/v1/skills/:id/content", "GET"),
+    ("/v1/skills/:id/versions", "GET"),
+    ("/v1/skills/:id/versions/:version", "GET"),
+    ("/v1/skills/:id/versions/:version", "DELETE"),
+    ("/v1/skills/:id/versions/:version/content", "GET"),
+    ("/v1/audio/voice_consents", "GET"),
+    ("/v1/audio/voice_consents/:id", "GET"),
+    ("/v1/audio/voice_consents/:id", "DELETE"),
+    ("/v1/audio/voices/:id", "DELETE"),
     // 原生 OpenAI 字段由组件用例验证；全部 typed route_layer 共享已验证的解码层。
     ("/v1/chat/completions", "GET"),
     ("/v1/chat/completions/:id", "GET"),
