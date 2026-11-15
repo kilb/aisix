@@ -592,6 +592,30 @@ impl ContextAffinity {
         self.registered_origin.as_ref()
     }
 
+    /// 文件账户不可达使用资源404；真正的Response上下文保留既有400协议。
+    pub(crate) fn reference_account_not_found(&self, body: &Value) -> crate::error::ProxyError {
+        let files_only = self.previous_echo.is_none()
+            && self.encrypted.is_empty()
+            && !self.pending_reasoning_authority
+            && !body
+                .get("previous_response_id")
+                .is_some_and(Value::is_string)
+            && self
+                .admitted_references
+                .as_deref()
+                .is_some_and(|references| {
+                    references.len() == 1
+                        && references
+                            .get(NativeObjectKind::File.as_str())
+                            .is_some_and(|files| !files.is_empty())
+                });
+        if files_only {
+            crate::error::ProxyError::JobResourceNotFound("file".into())
+        } else {
+            crate::error::ProxyError::ResponseNotFound
+        }
+    }
+
     fn restore_previous(&mut self, slot: &mut Value, origin: String, original: String) {
         let sent = std::mem::replace(slot, Value::String(original.clone()));
         if let Value::String(sent) = sent {

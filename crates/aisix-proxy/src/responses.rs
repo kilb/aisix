@@ -1407,7 +1407,7 @@ async fn dispatch(
             target.model.provider_key_id.as_deref() == Some(provider_key_id.as_str())
         });
         if attempt_models.is_empty() {
-            return Err(ProxyError::ResponseNotFound.into());
+            return Err(affinity.reference_account_not_found(body).into());
         }
     }
     if let Some(origin) = &operation.origin {
