@@ -38,6 +38,8 @@
 mod indexed_contract_tests;
 #[cfg(test)]
 mod performance_contract_tests;
+#[cfg(test)]
+pub(crate) mod performance_regression_tests;
 
 use aisix_core::models::{LivePricingIndex, PricingIndex};
 use aisix_core::{
@@ -1280,6 +1282,8 @@ impl RoutingRegistry {
                     rotations: std::collections::HashMap::new(),
                 })
             });
+        #[cfg(test)]
+        performance_regression_tests::pause_wrr_after_lookup();
         let mut state = entry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2355,7 +2359,11 @@ fn pin_context_origin(
         let Some(entry) = snapshot.models.get_by_name(&t.model) else {
             continue;
         };
-        if candidates.iter().any(|a| a.id == entry.id) {
+        if candidates.iter().any(|a| {
+            #[cfg(test)]
+            performance_regression_tests::note_affinity_probe();
+            a.id == entry.id
+        }) {
             continue;
         }
         candidates.push(AttemptModel {

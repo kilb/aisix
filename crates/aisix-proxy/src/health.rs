@@ -1085,6 +1085,10 @@ impl ModelRuntimeStatusTracker {
 
     /// Whether `model_id` is ranking behind the others for a recent failure.
     pub fn latency_penalized(&self, model_id: &str) -> bool {
+        #[cfg(test)]
+        crate::routing::performance_regression_tests::note_metric_read(
+            crate::routing::performance_regression_tests::MetricRead::Penalty,
+        );
         self.latency_penalty_until
             .get(model_id)
             .is_some_and(|until| *until > Instant::now())
@@ -1092,6 +1096,10 @@ impl ModelRuntimeStatusTracker {
 
     /// Current latency EWMA (ms) for `model_id`, or `None` if never sampled.
     pub fn latency_ewma_ms(&self, model_id: &str) -> Option<f64> {
+        #[cfg(test)]
+        crate::routing::performance_regression_tests::note_metric_read(
+            crate::routing::performance_regression_tests::MetricRead::Latency,
+        );
         self.latency_ewma_ms.get(model_id).map(|v| *v)
     }
 
@@ -1137,6 +1145,10 @@ impl ModelRuntimeStatusTracker {
 
     /// Current in-flight request count for `model_id`.
     pub fn in_flight(&self, model_id: &str) -> usize {
+        #[cfg(test)]
+        crate::routing::performance_regression_tests::note_metric_read(
+            crate::routing::performance_regression_tests::MetricRead::Busy,
+        );
         self.in_flight
             .get(model_id)
             .map(|c| c.load(Ordering::Relaxed))
