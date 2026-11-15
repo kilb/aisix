@@ -50,6 +50,9 @@ const SHARED_UI = [
   "Icon.tsx",
   "CopyButton.tsx",
   "KeySecret.tsx",
+  "Select.tsx",
+  "Menu.tsx",
+  "dropdown.css",
 ];
 
 for (const file of SHARED_UI) {

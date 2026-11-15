@@ -1,0 +1,72 @@
+@layer components {
+  /* 紧凑表格沿用表单令牌，触发器与弹层各自约束宽度。 */
+  .ui-select-trigger,
+  .ui-menu-trigger {
+    display: inline-flex;
+    min-width: 0;
+    max-width: 100%;
+    min-height: 44px;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 0 12px;
+    border: 1px solid var(--input);
+    border-radius: var(--r-input);
+    background: var(--card);
+    color: var(--foreground);
+    font: inherit;
+    font-size: 14px;
+    line-height: 20px;
+    text-align: left;
+    cursor: pointer;
+  }
+  .ui-select-trigger { width: 100%; }
+  .ui-select-compact { width: auto; min-height: 36px; padding-inline: 10px; font-size: 13px; }
+  .ui-select-value { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ui-select-chevron { display: inline-flex; flex: none; width: 16px; height: 16px; color: var(--muted-foreground); }
+  .ui-select-chevron > svg { width: 16px; height: 16px; }
+  .ui-menu-trigger { width: 36px; min-height: 36px; flex: none; justify-content: center; padding: 0; border-color: transparent; background: transparent; }
+  .ui-menu-trigger > svg { width: 18px; height: 18px; }
+  .ui-select-trigger:enabled:hover { border-color: var(--input-border-hover); }
+  .ui-menu-trigger:enabled:hover { background: var(--well); }
+  :is(.ui-select-trigger, .ui-menu-trigger)[data-state="open"] { border-color: var(--foreground); background: var(--row-hover); }
+  :is(.ui-select-trigger, .ui-menu-trigger):focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+  :is(.ui-select-trigger, .ui-menu-trigger)[aria-invalid="true"] { border-color: var(--danger); border-style: dashed; }
+  :is(.ui-select-trigger, .ui-menu-trigger):disabled { opacity: .5; cursor: not-allowed; background: var(--muted); }
+  .ui-dropdown {
+    z-index: 80;
+    max-width: min(420px, calc(100vw - 24px));
+    padding: 4px;
+    overflow-x: hidden;
+    border: 1px solid var(--border);
+    border-radius: var(--r-input);
+    background: var(--popover);
+    color: var(--popover-foreground);
+    font-family: var(--font-sans);
+    font-size: 13px;
+    line-height: 20px;
+    text-align: left;
+  }
+  .ui-select-content { min-width: min(var(--radix-select-trigger-width), calc(100vw - 24px)); max-height: min(320px, var(--radix-select-content-available-height)); }
+  .ui-dropdown-viewport { padding: 0; }
+  .ui-multiselect-content,
+  .ui-menu-content { min-width: min(160px, calc(100vw - 24px)); max-height: min(320px, var(--radix-dropdown-menu-content-available-height)); overflow-y: auto; }
+  .ui-multiselect-content { min-width: min(var(--radix-dropdown-menu-trigger-width), calc(100vw - 24px)); }
+  .ui-dropdown-item { position: relative; display: flex; min-height: 36px; align-items: center; gap: 8px; padding: 7px 10px; border-radius: 5px; outline: 0; overflow-wrap: anywhere; white-space: normal; user-select: none; cursor: pointer; }
+  .ui-select-option { padding-right: 34px; }
+  .ui-dropdown-item[data-highlighted] { background: var(--well); color: var(--foreground); }
+  .ui-dropdown-item[data-state="checked"] { font-weight: 500; }
+  .ui-dropdown-item[data-danger="true"] { color: var(--danger); }
+  .ui-dropdown-item[data-disabled] { color: var(--muted-foreground); opacity: .55; cursor: not-allowed; }
+  .ui-dropdown-check { position: absolute; right: 10px; top: 0; bottom: 0; display: flex; align-items: center; }
+  .ui-dropdown-check > svg { width: 16px; height: 16px; }
+  .ui-dropdown-label { padding: 6px 10px; color: var(--muted-foreground); font-size: 12px; }
+  .ui-select-scroll { display: flex; height: 24px; align-items: center; justify-content: center; background: var(--popover); }
+  .ui-select-scroll > svg { width: 14px; height: 14px; }
+  @media (max-width: 719px), (pointer: coarse) {
+    .ui-select-compact,
+    .ui-menu-trigger,
+    .ui-dropdown-item { min-height: 44px; }
+    .ui-menu-trigger { width: 44px; }
+  }
+}

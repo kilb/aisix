@@ -6,7 +6,7 @@
 
 双端使用 Refined 暖石灰视觉：画布 #ECEAE4、暖白面板 #FBFAF7、嵌套区 #E1DED6、墨色 #121211、次级文字 #64635D。主按钮、链接和焦点使用墨色；#FF5A1F 仅用于当前导航小点、实时点与重点图形，不用于浅底小字。成功、警告、失败仍附状态文字与图形。颜色原值集中在 tokens.css，不在业务页面另建主题。
 
-页面标题28px、手机26px；hero36px、display32px、figure/value28px，手机hero32px、其余28px，指标400字重。正文与导航14px，描述13px，meta/micro最少12px。CardHeader为16px/600，页标题500。中文普通标签使用sans，等宽用于机器标识与代码。面板padding18px、手机16px；内容gap14px、区域16px、面板圆角24px，按钮与输入框圆角8px。控件命中区保持44px。面板用细边线分层，不使用投影、装饰渐变或入场位移。
+页面标题28px、手机26px；hero36px、display32px、figure/value28px，手机hero32px、其余28px，指标400字重。正文与导航14px，描述13px，meta/micro最少12px。CardHeader为16px/600，页标题500。中文普通标签使用sans，等宽用于机器标识与代码。面板padding18px、手机16px；内容gap14px、区域16px、面板圆角24px，按钮与输入框圆角8px。默认控件命中区44px；表格compact选择器与菜单在桌面为36px，手机或粗指针恢复44px。面板用细边线分层，不使用投影、装饰渐变或入场位移。
 
 桌面侧栏224px，距离视口左、上、下24px，与主内容间距24px；圆角24px，暖白面板，菜单独立滚动，账号固定在底部。当前项采用淡墨底、墨字与橙点。页头融入画布；宽表只在自身容器滚动。窄屏使用保留焦点合同的抽屉，距离视口16px，内容按原断点重排。
 
@@ -19,6 +19,8 @@
 **Button**：kind 为 primary（墨色实底主操作）、secondary（默认轮廓）、danger（危险色破坏性第二步实底）或 quiet。两种 size（默认/sm）均至少44×44；sm 只减少横向 padding。block 填满容器；icon 装饰，无文字时须有 aria-label；type 默认为 button。busy 禁用重复提交、保持标签占位，读屏名称 busyLabel 默认“处理中…”。与 busy 共用锁的其它操作使用 disabled。disabledReason 用于屏幕没有解释的禁用原因：按钮保留焦点，以 aria-disabled 阻止点击，tooltip 同时支持 hover/键盘并接入 aria-describedby。焦点为2px+offset2，不用颜色或移动来制造按压效果。
 
 **Field**：label、hint、error、wide、children API 不变。children 可为 control 或接收 aria 的函数；有 hint/refusal 必须用函数并 spread。label 包裹控件；hint/error 由 useId 连接 aria-describedby；拒绝控件 aria-invalid 与虚线边框，原因文字在下方，危险色不替代原因说明。field-problem 没有 alert role，随字段读出。提交拒绝时 useRefusalFocus 将焦点移到第一处被拒字段，fieldset 选第一个可聚焦控件；没有字段拒绝则保留焦点，由表单 note.crit role=alert 说明。checkbox/radio 可保持18px视觉，但可点击 label 至少44px。
+
+**Select / MultiSelect / Menu**：双端共享同一Radix原语与dropdown.css。单选使用value/onValueChange/options，兼容option/optgroup/Fragment描述符；空字符串保留原值，name/required/form保持原生表单合同。默认表单44px，size=compact桌面36px、手机或粗指针44px；紧凑触发器与表格行对齐，长文字在触发器省略、弹层折行。弹层通过Portal脱离表格overflow，与触发器对齐并在视口边缘翻转/约束；不扩大表格单元格。键盘方向键/Home/End/类型检索与Enter选取由Radix管理；Escape和外点收起并保留焦点合同。MultiSelect保留数组原值，勾选后保持展开。Menu使用label/items，disabled项不能选择，danger项始终附具体操作文字。拒绝态保持aria-invalid/aria-describedby和虚线边框。
 
 **Toast**：ToastProvider/useToast API 不变，动词对应操作（保存→已保存），底部显示，无入场动作，停留3秒、离开200ms，最多3条。栈是 polite live region，无额外 role，避免与 status/alert 争读。announce 默认 true；只有页面自己的活区已读相同消息才 false。toast 不能是消息的唯一载体。
 
