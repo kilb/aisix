@@ -34,6 +34,9 @@
 //! - **least_busy**: least-loaded target first, by in-flight requests
 //!   divided by target `weight` (the APISIX least_conn score).
 
+#[cfg(test)]
+mod performance_contract_tests;
+
 use aisix_core::models::{LivePricingIndex, PricingIndex};
 use aisix_core::{
     AisixSnapshot, HashOnType, Model, Routing, RoutingStrategy, RoutingTarget,
