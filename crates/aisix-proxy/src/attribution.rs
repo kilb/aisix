@@ -2137,6 +2137,18 @@ pub(crate) fn first_token_latency_ms() -> Option<u32> {
         .flatten()
 }
 
+pub(crate) fn first_content_at() -> Option<Instant> {
+    CURRENT
+        .try_with(|a| {
+            a.lock()
+                .first_token
+                .as_ref()
+                .and_then(crate::first_token::Observer::first_content_at)
+        })
+        .ok()
+        .flatten()
+}
+
 pub(crate) fn body_poll_in_progress() -> bool {
     CURRENT.try_with(|a| a.lock().body_poll).unwrap_or(false)
 }
@@ -2171,8 +2183,9 @@ pub(crate) fn note_usage_emitted(terminal: bool, attempt_index: u32) {
 /// [`UpstreamClock`].
 pub(crate) fn note_upstream_wait_begin() {
     let _ = CURRENT.try_with(|a| {
-        a.response_tap.take();
-        a.lock().upstream_clock.begin(Instant::now());
+        let started = Instant::now();
+        a.response_tap.begin_attempt(started);
+        a.lock().upstream_clock.begin(started);
     });
 }
 
@@ -2185,6 +2198,14 @@ pub(crate) fn note_upstream_wait_end(success: bool) {
 /// The winning attempt's first streamed frame arrived. Every stream that
 /// stamps `upstream_ttft_ms` calls this at the same point.
 pub(crate) fn note_upstream_first_frame() {
+    let token_surface = CURRENT
+        .try_with(|a| a.lock().first_token.is_some())
+        .unwrap_or(false);
+    if token_surface {
+        if let Some(timing) = upstream_stream_timing().http {
+            timing.note_canonical_chunk();
+        }
+    }
     note_upstream_first_frame_at(Instant::now());
 }
 
@@ -2231,6 +2252,9 @@ pub(crate) fn first_stream_chunk_ttft(
     timing: &aisix_gateway::response_tap::StreamTiming,
     started: Instant,
 ) -> Option<Duration> {
+    if let Some(timing) = &timing.http {
+        timing.note_canonical_chunk();
+    }
     if timing.buffered {
         return None;
     }
@@ -2579,6 +2603,7 @@ mod tests {
         let timing = StreamTiming {
             observer: Some(observer),
             buffered: false,
+            http: None,
         };
         for committed in [false, true] {
             let cell = Arc::new(RequestAttribution::default());

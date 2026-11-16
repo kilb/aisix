@@ -104,6 +104,37 @@ pub struct UpstreamResponseCapture {
     pub io: Option<crate::upstream_io::UpstreamIoObserver>,
     /// 仅实际 HTTP 发送入口置位；观察者、目标解析和操作登记均不代表发送。
     pub http_dispatched: bool,
+    /// 复用已有 IO 观察者的持久句柄；take 后仍属于本次交换。
+    pub timing: Option<HttpTimingObserver>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpTimingObserver(crate::upstream_io::UpstreamIoObserver);
+
+impl HttpTimingObserver {
+    pub fn snapshot(&self) -> Option<aisix_core::usage_io::UpstreamTiming> {
+        self.0
+            .with_http_timing(|timing| timing.snapshot())
+            .flatten()
+    }
+
+    pub fn note_canonical_chunk(&self) {
+        self.0.with_http_timing(|timing| {
+            timing.canonical.get_or_insert_with(Instant::now);
+        });
+    }
+
+    pub fn note_first_content(&self) {
+        self.0.with_http_timing(|timing| {
+            timing.content.get_or_insert_with(Instant::now);
+        });
+    }
+
+    pub fn note_first_content_at(&self, at: Instant) {
+        self.0.with_http_timing(|timing| {
+            timing.content.get_or_insert(at);
+        });
+    }
 }
 
 impl UpstreamResponseCapture {
@@ -133,6 +164,7 @@ impl UpstreamResponseCapture {
 pub struct StreamTiming {
     pub observer: Option<StreamUsageObserver>,
     pub buffered: bool,
+    pub http: Option<HttpTimingObserver>,
 }
 
 impl UpstreamResponseCapture {
@@ -140,6 +172,7 @@ impl UpstreamResponseCapture {
         StreamTiming {
             observer: self.stream_usage.clone(),
             buffered: self.buffered_stream,
+            http: self.timing.clone(),
         }
     }
 }
@@ -335,7 +368,8 @@ pub fn stream_usage_observer() -> Option<StreamUsageObserver> {
 pub fn stream_timing() -> Option<StreamTiming> {
     TAP.try_with(|tap| {
         let capture = tap.lock();
-        (capture.buffered_stream || capture.stream_usage.is_some()).then(|| capture.stream_timing())
+        (capture.buffered_stream || capture.stream_usage.is_some() || capture.timing.is_some())
+            .then(|| capture.stream_timing())
     })
     .ok()
     .flatten()
@@ -349,6 +383,18 @@ pub fn note_buffered_stream() {
 pub(crate) fn note_upstream_io(observer: &crate::upstream_io::UpstreamIoObserver) {
     let _ = TAP.try_with(|tap| {
         let mut current = tap.lock();
+        observer.with_http_timing(|timing| timing.started = current.attempt_started);
+        if current.io.is_none() {
+            current.timing = Some(HttpTimingObserver(observer.clone()));
+        } else {
+            // 多个交换不能拼成单一时间线，已经取走的句柄也必须失效。
+            if let Some(previous) = current.timing.take() {
+                previous
+                    .0
+                    .with_http_timing(|timing| timing.ambiguous = true);
+            }
+            observer.with_http_timing(|timing| timing.ambiguous = true);
+        }
         if let Some(aggregate) = &current.io {
             aggregate.append(observer);
         } else {

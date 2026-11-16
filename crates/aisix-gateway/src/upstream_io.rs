@@ -10,6 +10,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
+use std::time::Instant;
 
 mod parser;
 
@@ -93,7 +94,45 @@ struct ResponseBodyLimitExceeded;
 
 type BodyError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
+#[derive(Default)]
+pub(crate) struct HttpTiming {
+    pub(crate) started: Option<Instant>,
+    send: Option<Instant>,
+    headers: Option<Instant>,
+    byte: Option<Instant>,
+    frame: Option<Instant>,
+    pub(crate) canonical: Option<Instant>,
+    pub(crate) content: Option<Instant>,
+    pub(crate) ambiguous: bool,
+}
+
+impl HttpTiming {
+    pub(crate) fn snapshot(&self) -> Option<aisix_core::usage_io::UpstreamTiming> {
+        let started = self.started?;
+        self.send?;
+        if self.ambiguous {
+            return None;
+        }
+        let offset = |at: Option<Instant>| {
+            at.map(|at| {
+                at.saturating_duration_since(started)
+                    .as_millis()
+                    .min(u128::from(u32::MAX)) as u32
+            })
+        };
+        Some(aisix_core::usage_io::UpstreamTiming {
+            http_send_started_ms: offset(self.send),
+            response_headers_ms: offset(self.headers),
+            first_response_byte_ms: offset(self.byte),
+            first_protocol_frame_ms: offset(self.frame),
+            first_canonical_chunk_ms: offset(self.canonical),
+            first_content_ms: offset(self.content),
+        })
+    }
+}
+
 struct Exchange {
+    timing: HttpTiming,
     id: u64,
     parents: Vec<Weak<Mutex<Collection>>>,
     closed: bool,
@@ -122,6 +161,7 @@ struct Exchange {
 impl Exchange {
     fn new(protocol: Protocol) -> Self {
         Self {
+            timing: HttpTiming::default(),
             id: NEXT_EXCHANGE_ID.fetch_add(1, Ordering::Relaxed),
             parents: Vec::new(),
             closed: false,
@@ -296,6 +336,21 @@ impl PartialEq for UpstreamIoObserver {
 impl Eq for UpstreamIoObserver {}
 
 impl UpstreamIoObserver {
+    /// 时序使用已有 local 的持久句柄；不增加 heap 分配，也不受长度折叠/关闭影响。
+    pub(crate) fn with_http_timing<T>(
+        &self,
+        observe: impl FnOnce(&mut HttpTiming) -> T,
+    ) -> Option<T> {
+        let local = self
+            .0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .local
+            .clone()?;
+        let mut exchange = local.lock().unwrap_or_else(|p| p.into_inner());
+        Some(observe(&mut exchange.timing))
+    }
+
     pub fn new(protocol: Protocol) -> Self {
         Self(Arc::new(Mutex::new(Collection {
             local: Some(Arc::new(Mutex::new(Exchange::new(protocol)))),
@@ -513,6 +568,9 @@ impl UpstreamIoObserver {
 
     pub fn begin_response(&self, content_type: Option<&str>) {
         self.update(|exchange| {
+            if exchange.timing.send.is_some() && exchange.timing.headers.is_none() {
+                exchange.timing.headers = Some(Instant::now());
+            }
             let mime = content_type
                 .unwrap_or("")
                 .split(';')
@@ -535,18 +593,31 @@ impl UpstreamIoObserver {
 
     pub fn observe_response_body(&self, bytes: &[u8]) {
         self.update(|exchange| {
+            if !bytes.is_empty() && exchange.timing.send.is_some() && exchange.timing.byte.is_none()
+            {
+                exchange.timing.byte = Some(Instant::now());
+            }
             *exchange.response_bytes.get_or_insert(0) = exchange
                 .response_bytes
                 .unwrap_or(0)
                 .saturating_add(bytes.len() as u64);
             if let Some(output) = &mut exchange.output {
                 output.feed(bytes);
+                if exchange.timing.send.is_some()
+                    && exchange.timing.frame.is_none()
+                    && output.has_sse_frame()
+                {
+                    exchange.timing.frame = Some(Instant::now());
+                }
             }
         });
     }
 
     fn observe_rejected_response_bytes(&self, bytes: usize) {
         self.update(|exchange| {
+            if bytes > 0 && exchange.timing.send.is_some() && exchange.timing.byte.is_none() {
+                exchange.timing.byte = Some(Instant::now());
+            }
             *exchange.response_bytes.get_or_insert(0) = exchange
                 .response_bytes
                 .unwrap_or(0)
@@ -1073,6 +1144,7 @@ pub async fn send(
         observer.finish_request();
     }
     crate::response_tap::note_http_dispatch();
+    observer.with_http_timing(|timing| timing.send = Some(Instant::now()));
     let response = client.execute(request).await?;
     Ok(wrap_response(response, observer))
 }

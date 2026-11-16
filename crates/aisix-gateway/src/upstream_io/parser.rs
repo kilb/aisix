@@ -1226,6 +1226,7 @@ struct RealtimeSlot {
 
 #[derive(Clone)]
 pub(super) struct ResponseObserver {
+    first_sse_frame: bool,
     protocol: Protocol,
     sse: bool,
     json: JsonObserver,
@@ -1256,6 +1257,7 @@ pub(super) struct ResponseObserver {
 impl ResponseObserver {
     pub(super) fn new(protocol: Protocol, sse: bool) -> Self {
         Self {
+            first_sse_frame: false,
             protocol,
             sse,
             json: JsonObserver::new(protocol, sse),
@@ -1399,6 +1401,7 @@ impl ResponseObserver {
         if !self.event_data {
             return;
         }
+        self.first_sse_frame = true;
         if let Some(index) = self.sentinel {
             self.terminal |= index == b"[DONE]".len();
             self.invalid |= index != b"[DONE]".len();
@@ -1650,6 +1653,10 @@ impl RequestObserver {
 }
 
 impl ResponseObserver {
+    pub(super) fn has_sse_frame(&self) -> bool {
+        self.first_sse_frame
+    }
+
     pub(super) fn terminal(&self) -> bool {
         self.terminal
     }

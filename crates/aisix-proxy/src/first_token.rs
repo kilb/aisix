@@ -52,6 +52,7 @@ pub(crate) struct Observer {
     started: Instant,
     frames: Option<SseFrameSplitter>,
     latency_ms: Option<u32>,
+    first_content_at: Option<Instant>,
 }
 
 impl Observer {
@@ -61,11 +62,16 @@ impl Observer {
             started,
             frames: Some(SseFrameSplitter::new(MAX_FRAME_BYTES)),
             latency_ms: None,
+            first_content_at: None,
         }
     }
 
     pub(crate) fn latency_ms(&self) -> Option<u32> {
         self.latency_ms
+    }
+
+    pub(crate) fn first_content_at(&self) -> Option<Instant> {
+        self.first_content_at
     }
 
     pub(crate) fn observing(&self) -> bool {
@@ -76,7 +82,8 @@ impl Observer {
         let Some(frames) = self.frames.as_mut() else {
             return;
         };
-        let delivered = self.started.elapsed();
+        let delivered_at = Instant::now();
+        let delivered = delivered_at.saturating_duration_since(self.started);
         // splitter.push 本身不限输入块大小，所以分片后再检查帧上限。
         for part in bytes.chunks(FEED_BYTES) {
             frames.push(part);
@@ -85,6 +92,7 @@ impl Observer {
                     Ok(Some(frame)) if frame.len() <= MAX_FRAME_BYTES => {
                         if has_content(self.wire, &frame) {
                             self.latency_ms = Some(crate::attempt::measured_ms(delivered));
+                            self.first_content_at = Some(delivered_at);
                             self.frames = None;
                             return;
                         }

@@ -126,6 +126,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn upstream_timing_rejects_reversed_known_samples_without_inventing_missing_ones() {
+        let mut timing = UpstreamTiming {
+            http_send_started_ms: Some(0),
+            first_response_byte_ms: Some(5),
+            first_content_ms: Some(12),
+            ..Default::default()
+        };
+        assert!(timing.validate());
+        timing.response_headers_ms = Some(6);
+        assert!(!timing.validate());
+        timing.response_headers_ms = Some(5);
+        assert!(timing.validate());
+    }
+
+    #[test]
     fn known_zero_survives_while_unknown_is_omitted() {
         let audit = UsageIoAudit {
             version: 1,

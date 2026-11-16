@@ -1793,6 +1793,7 @@ pub(crate) fn emit_usage_billing(
         &exporters,
         true,
         UsageDelivery::ControlPlaneOnly,
+        None,
     );
 }
 
@@ -2197,8 +2198,10 @@ fn emit_usage_to(
     stamp_billing_fields(snap, &mut event, labels.provider_key_id);
     let mut event = prepare_usage_event_fields(surface, event, logical_final, dispatched);
     let mut upstream_error_body = None;
+    let mut upstream_timing = None;
     if dispatched {
         let response = crate::attribution::take_attempt_upstream_response(event.attempt_index);
+        upstream_timing = response.timing.clone();
         // 资源级首帧预读可在流消费者创建前失败或取消；已测首帧随 attempt 恢复。
         // 此处只读样本，失败的 upstream_clock 仍保留到失败或取消的完整等待。
         if event.upstream_ttft_ms == 0 {
@@ -2317,6 +2320,7 @@ fn emit_usage_to(
             &exporters,
             terminal,
             delivery,
+            upstream_timing,
         );
         return;
     }
@@ -2380,6 +2384,7 @@ fn emit_usage_to(
         &exporters,
         terminal,
         delivery,
+        upstream_timing,
     );
 }
 
@@ -2451,6 +2456,7 @@ fn record_recovered_first_frame(
 /// 一个 outer body poll 内暂存的最终发布；不复制请求的资源快照。
 /// 取消去重和终态副作用已经发生，锁外发布时只补交付边界测得的新字段。
 pub(crate) struct PendingUsage {
+    upstream_timing: Option<aisix_gateway::response_tap::HttpTimingObserver>,
     sink: aisix_obs::UsageSink,
     fan_out: aisix_obs::OtlpHttpFanOut,
     surface: Surface,
@@ -2472,6 +2478,11 @@ impl PendingUsage {
             .token_terminal
             .then(crate::attribution::first_token_latency_ms)
             .flatten();
+        stamp_http_timing(
+            &mut self.event,
+            self.upstream_timing.as_ref(),
+            self.token_terminal,
+        );
         self.publish();
     }
 
@@ -2519,6 +2530,7 @@ fn deliver_usage(
     exporters: &LiveExporters,
     _terminal: bool,
     delivery: UsageDelivery,
+    upstream_timing: Option<aisix_gateway::response_tap::HttpTimingObserver>,
 ) {
     let token_terminal = event.is_final_attempt && crate::first_token::token_surface(surface);
     event.first_token_latency_ms = if token_terminal {
@@ -2528,6 +2540,7 @@ fn deliver_usage(
     };
     if token_terminal && crate::attribution::body_poll_in_progress() {
         let pending = PendingUsage {
+            upstream_timing,
             sink: state.usage_sink.clone(),
             fan_out: state.otlp_fan_out.clone(),
             surface,
@@ -2552,6 +2565,7 @@ fn deliver_usage(
         crate::attribution::defer_body_usage(pending);
         return;
     }
+    stamp_http_timing(&mut event, upstream_timing.as_ref(), token_terminal);
     let event = delivery.publish(&state.usage_sink, surface.handler, event, labels);
     if !matches!(delivery, UsageDelivery::ControlPlaneOnly) && !exporters.is_empty() {
         state.otlp_fan_out.fan_out(
@@ -2562,6 +2576,22 @@ fn deliver_usage(
             exporters.generation(),
             exporters.iter().map(|e| &*e.value),
         );
+    }
+}
+
+fn stamp_http_timing(
+    event: &mut UsageEvent,
+    timing: Option<&aisix_gateway::response_tap::HttpTimingObserver>,
+    token_terminal: bool,
+) {
+    if let Some(timing) = timing {
+        // 仅最终交换拥有交付内容；保存实际 Instant 后减各自 attempt 起点。
+        if token_terminal {
+            if let Some(at) = crate::attribution::first_content_at() {
+                timing.note_first_content_at(at);
+            }
+        }
+        event.upstream_timing = timing.snapshot();
     }
 }
 
