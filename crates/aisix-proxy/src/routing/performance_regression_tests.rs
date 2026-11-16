@@ -173,16 +173,14 @@ fn warm_hash_subsets_do_not_resolve_configured_model_ids_again() {
         {
             target.model.clear();
             target.model_id = Some(format!("id-{index}"));
-            target.tags = Some(vec![
-                if index >= 4 {
-                    "other"
-                } else if index % 2 == 0 {
-                    "eu"
-                } else {
-                    "us"
-                }
-                .into(),
-            ]);
+            target.tags = Some(vec![if index >= 4 {
+                "other"
+            } else if index % 2 == 0 {
+                "eu"
+            } else {
+                "us"
+            }
+            .into()]);
         }
         let registry = RoutingRegistry::new();
         let status = crate::ModelRuntimeStatusTracker::new();
