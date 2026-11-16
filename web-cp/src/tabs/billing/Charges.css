@@ -45,7 +45,7 @@
 .charge-col-performance { width: 22%; }
 .charge-col-action { width: 88px; }
 
-@media (min-width: 900px) { .charge-records .charge-records-table td.right { padding-inline: 10px; } }
+@media (min-width: 900px) { .charge-records .charge-records-table td.right { padding-inline: 10px; white-space: normal; } }
 
 /* 主筛选共享一条标签基线，附加筛选与列表之间不重复堆叠大段说明。 */
 .charge-primary-filters { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 10px 12px; }
