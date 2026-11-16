@@ -52,7 +52,7 @@ use crate::billing::budgets::{self, ChargedRow, CountMode};
 use crate::billing::ledger::{self, Account, Posting, Source};
 use crate::billing::marks;
 use crate::db::DbError;
-use store::{record_charge, ChargeError, ChargeIdentity, PriceBookCache, Recorded};
+use store::{record_charges, ChargeError, ChargeIdentity, PriceBookCache, Recorded};
 
 /// A usage row the intake transaction has just stored, as stored.
 pub struct StoredEvent {
@@ -111,8 +111,7 @@ pub async fn price_stored(
     // A fixed order, by event_id compared as bytes, for the charge inserts
     // and the ledger entries.
     stored.sort_by(|a, b| a.event_id.cmp(&b.event_id));
-    let mut debits = Vec::new();
-    let mut charged = Vec::new();
+    let mut charges = Vec::with_capacity(stored.len());
     for row in &stored {
         let claim = Claim::of(&row.event);
         let key_uuid = key_id(claim.api_key_id);
@@ -178,19 +177,37 @@ pub async fn price_stored(
             Ok(_) => {}
             Err(_) => priced.unpriced += 1,
         }
-        let ident = ChargeIdentity {
-            event_id: &row.event_id,
-            occurred_at: row.occurred_at,
-            team_id: &tenant_id,
-            api_key_id: claim.api_key_id,
-            user_id: &member_id,
-            requested_model_id: claim.requested_model_id,
-            group_id: key.and_then(|k| k.group_id),
-            request_id: row.request_id.as_deref(),
-        };
-        let recorded = record_charge(&mut *conn, &ident, &charge).await?;
+        charges.push((tenant_id, member_id, key_uuid, claim, charge));
+    }
+    let records: Vec<_> = stored
+        .iter()
+        .zip(&charges)
+        .map(|(row, (tenant_id, member_id, key_uuid, claim, charge))| {
+            let key = key_uuid.and_then(|id| keys.get(&id));
+            (
+                ChargeIdentity {
+                    event_id: &row.event_id,
+                    occurred_at: row.occurred_at,
+                    team_id: tenant_id,
+                    api_key_id: claim.api_key_id,
+                    user_id: member_id,
+                    requested_model_id: claim.requested_model_id,
+                    group_id: key.and_then(|k| k.group_id),
+                    request_id: row.request_id.as_deref(),
+                },
+                charge,
+            )
+        })
+        .collect();
+    let recorded = record_charges(&mut *conn, &records).await?;
+    let mut debits = Vec::new();
+    let mut charged = Vec::new();
+    for ((row, (_, _, key_uuid, _, charge)), recorded) in stored.iter().zip(&charges).zip(recorded)
+    {
+        let key_uuid = *key_uuid;
+        let key = key_uuid.and_then(|id| keys.get(&id));
         if let (Recorded::Inserted, Ok(p), Some(k), Some(api_key_id)) =
-            (recorded, &charge, key, key_uuid)
+            (recorded, charge, key, key_uuid)
         {
             if p.outcome == Outcome::Charged && p.charge.0 > 0 {
                 debits.push(Posting {

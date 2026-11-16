@@ -475,7 +475,7 @@ impl ChargeError {
     }
 }
 
-/// What [`record_charge`] did.
+/// What [`record_charges`] did for one row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Recorded {
     Inserted,
@@ -582,67 +582,86 @@ impl<'a> Columns<'a> {
     }
 }
 
-/// Records the charge of the stored row `ident`, once: `AlreadyRecorded`
-/// when the row has one. An `Err` is stored as an `unpriced` charge with its
-/// code and no amount.
-///
-/// The cost goes to `cost_micro_cny`, NULL when it is unknown, and the rate
-/// that decided it to `cost_source`. `cost_micro_usd` is not written: it
-/// holds the costs of rows priced before cost became a rate.
-pub async fn record_charge(
+/// 一次写入整批 charge，按输入顺序返回是否新增；相同 event_id 仍只保留第一行。
+/// 成本未知时写 NULL；旧的 cost_micro_usd 列保持不写。
+pub async fn record_charges(
     conn: &mut PgConnection,
-    ident: &ChargeIdentity<'_>,
-    charge: &Result<PricedEvent, ChargeError>,
-) -> Result<Recorded, DbError> {
-    let c = Columns::of(charge);
-    let inserted: Option<String> = sqlx::query_scalar(
-        "INSERT INTO pricing_charges_cny \
-         (event_id, tenant_id, api_key_id, user_id, requested_model_id, occurred_at, \
-          price_instant, status, charge_micro_cny, cost_micro_cny, cost_source, group_id, \
-          baseline_revision_id, rate_revision_id, cny_per_usd_e4, rate_is_model_override, \
-          discount_revision_id, discount_bps, service_tier, \
-          requested_service_tier, long_context_above, estimated, exemption, error_code, lines, \
-          warnings, engine_version, request_id) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, \
-                 $19, $20, $21, $22, $23, $24, $25, $26, $27, $28) \
-         ON CONFLICT (event_id) DO NOTHING RETURNING event_id",
+    charges: &[(ChargeIdentity<'_>, &Result<PricedEvent, ChargeError>)],
+) -> Result<Vec<Recorded>, DbError> {
+    if charges.is_empty() {
+        return Ok(Vec::new());
+    }
+    let columns: Vec<_> = charges
+        .iter()
+        .map(|(_, charge)| Columns::of(charge))
+        .collect();
+    // 输入已按 event_id 的字节序排列；保留 ordinality，避免数据库排序规则改变锁序。
+    let inserted: Vec<String> = sqlx::query_scalar(
+        "INSERT INTO pricing_charges_cny (event_id, tenant_id, api_key_id, user_id, \
+         requested_model_id, occurred_at, price_instant, status, charge_micro_cny, cost_micro_cny, \
+         cost_source, group_id, baseline_revision_id, rate_revision_id, cny_per_usd_e4, \
+         rate_is_model_override, discount_revision_id, discount_bps, service_tier, \
+         requested_service_tier, long_context_above, estimated, exemption, error_code, lines, \
+         warnings, engine_version, request_id) \
+         SELECT c.event_id, c.tenant_id, c.api_key_id, c.user_id, c.requested_model_id, \
+         c.occurred_at, c.price_instant, c.status, c.charge_micro_cny, c.cost_micro_cny, \
+         c.cost_source, c.group_id, c.baseline_revision_id, c.rate_revision_id, c.cny_per_usd_e4, \
+         c.rate_is_model_override, c.discount_revision_id, c.discount_bps, c.service_tier, \
+         c.requested_service_tier, c.long_context_above, c.estimated, c.exemption, c.error_code, \
+         c.lines, c.warnings, c.engine_version, c.request_id \
+         FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::timestamptz[], \
+         $7::timestamptz[], $8::text[], $9::bigint[], $10::bigint[], $11::jsonb[], $12::uuid[], \
+         $13::bigint[], $14::bigint[], $15::bigint[], $16::boolean[], $17::bigint[], $18::bigint[], \
+         $19::text[], $20::text[], $21::bigint[], $22::boolean[], $23::text[], $24::text[], \
+         $25::jsonb[], $26::jsonb[], $27::bigint[], $28::text[]) WITH ORDINALITY AS c(event_id, \
+         tenant_id, api_key_id, user_id, requested_model_id, occurred_at, price_instant, status, \
+         charge_micro_cny, cost_micro_cny, cost_source, group_id, baseline_revision_id, \
+         rate_revision_id, cny_per_usd_e4, rate_is_model_override, discount_revision_id, \
+         discount_bps, service_tier, requested_service_tier, long_context_above, estimated, \
+         exemption, error_code, lines, warnings, engine_version, request_id, n) \
+         ORDER BY c.n ON CONFLICT (event_id) DO NOTHING RETURNING event_id",
     )
-    .bind(ident.event_id)
-    .bind(id_column(ident.team_id))
-    .bind(id_column(ident.api_key_id))
-    .bind(id_column(ident.user_id))
-    .bind(id_column(ident.requested_model_id))
-    .bind(ident.occurred_at)
-    .bind(c.price_instant)
-    .bind(c.status)
-    .bind(c.charge)
-    .bind(c.cost)
-    .bind(c.cost_source)
-    // The key's group, whatever the outcome: the engine prices a row at
-    // exactly this group, and a row it refused is still filed under it.
-    .bind(ident.group_id)
-    .bind(c.baseline_revision_id)
-    .bind(c.rate_revision_id)
-    .bind(c.cny_per_usd_e4)
-    .bind(c.rate_is_model_override)
-    .bind(c.discount_revision_id)
-    .bind(c.discount_bps)
-    .bind(c.service_tier)
-    .bind(c.requested_service_tier)
-    .bind(c.long_context_above)
-    .bind(c.estimated)
-    .bind(c.exemption)
-    .bind(c.error_code)
-    .bind(c.lines)
-    .bind(c.warnings)
-    .bind(c.engine_version)
-    .bind(ident.request_id)
-    .fetch_optional(conn)
+    .bind(charges.iter().map(|(ident, _)| ident.event_id).collect::<Vec<_>>())
+    .bind(charges.iter().map(|(ident, _)| id_column(ident.team_id)).collect::<Vec<_>>())
+    .bind(charges.iter().map(|(ident, _)| id_column(ident.api_key_id)).collect::<Vec<_>>())
+    .bind(charges.iter().map(|(ident, _)| id_column(ident.user_id)).collect::<Vec<_>>())
+    .bind(charges.iter().map(|(ident, _)| id_column(ident.requested_model_id)).collect::<Vec<_>>())
+    .bind(charges.iter().map(|(ident, _)| ident.occurred_at).collect::<Vec<_>>())
+    .bind(columns.iter().map(|c| c.price_instant).collect::<Vec<_>>())
+    .bind(columns.iter().map(|c| c.status).collect::<Vec<_>>())
+    .bind(columns.iter().map(|c| c.charge).collect::<Vec<_>>())
+    .bind(columns.iter().map(|c| c.cost).collect::<Vec<_>>())
+    .bind(columns.iter().map(|c| c.cost_source.as_ref().map(Json)).collect::<Vec<_>>())
+    .bind(charges.iter().map(|(ident, _)| ident.group_id).collect::<Vec<_>>())
+    .bind(columns.iter().map(|c| c.baseline_revision_id).collect::<Vec<_>>())
+    .bind(columns.iter().map(|c| c.rate_revision_id).collect::<Vec<_>>())
+    .bind(columns.iter().map(|c| c.cny_per_usd_e4).collect::<Vec<_>>())
+    .bind(columns.iter().map(|c| c.rate_is_model_override).collect::<Vec<_>>())
+    .bind(columns.iter().map(|c| c.discount_revision_id).collect::<Vec<_>>())
+    .bind(columns.iter().map(|c| c.discount_bps).collect::<Vec<_>>())
+    .bind(columns.iter().map(|c| c.service_tier).collect::<Vec<_>>())
+    .bind(columns.iter().map(|c| c.requested_service_tier).collect::<Vec<_>>())
+    .bind(columns.iter().map(|c| c.long_context_above).collect::<Vec<_>>())
+    .bind(columns.iter().map(|c| c.estimated).collect::<Vec<_>>())
+    .bind(columns.iter().map(|c| c.exemption).collect::<Vec<_>>())
+    .bind(columns.iter().map(|c| c.error_code).collect::<Vec<_>>())
+    .bind(columns.iter().map(|c| c.lines.clone()).collect::<Vec<_>>())
+    .bind(columns.iter().map(|c| c.warnings.clone()).collect::<Vec<_>>())
+    .bind(columns.iter().map(|c| c.engine_version).collect::<Vec<_>>())
+    .bind(charges.iter().map(|(ident, _)| ident.request_id).collect::<Vec<_>>())
+    .fetch_all(conn)
     .await?;
-    Ok(match inserted {
-        Some(_) => Recorded::Inserted,
-        None => Recorded::AlreadyRecorded,
-    })
+    let mut inserted: std::collections::HashSet<_> = inserted.into_iter().collect();
+    Ok(charges
+        .iter()
+        .map(|(ident, _)| {
+            if inserted.remove(ident.event_id) {
+                Recorded::Inserted
+            } else {
+                Recorded::AlreadyRecorded
+            }
+        })
+        .collect())
 }
 
 /// A tenant discount to write, in basis points (0 to 10000).
