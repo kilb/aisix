@@ -8,7 +8,7 @@
 }
 .record-table-toolbar > * { min-width: 0; }
 .record-table-search { flex: 1 1 240px; max-width: 420px; }
-.record-table-toolbar :is(input, select) { min-height: 44px; max-width: 100%; }
+.record-table-toolbar :is(input, select) { min-height: var(--h-control); max-width: 100%; }
 .record-table-pager {
   display: flex;
   min-width: 0;
@@ -33,7 +33,7 @@
 .record-table-page-controls { gap: 0; }
 .record-table-page-size {
   display: flex;
-  min-height: 44px;
+  min-height: var(--h-control-sm);
   align-items: center;
   gap: 4px;
   color: var(--muted-foreground);
@@ -41,7 +41,7 @@
 .record-table-page-size select {
   width: auto;
   min-width: 64px;
-  min-height: 44px;
+  min-height: var(--h-control-sm);
   padding: 6px 24px 6px 8px;
   border: 1px solid transparent;
   border-radius: var(--r-input);
@@ -59,12 +59,12 @@
   font-variant-numeric: tabular-nums;
 }
 .record-table-page-position > span { color: var(--muted-foreground); }
-/* 外层保留44px命中区，箭头按钮的可见表面收为32px。 */
+/* 分页按钮沿用紧凑控件尺寸，手机与粗指针由同一令牌恢复触控高度。 */
 .record-table-page-button.btn {
   position: relative;
-  width: 44px;
-  min-width: 44px;
-  height: 44px;
+  width: var(--h-control-sm);
+  min-width: var(--h-control-sm);
+  height: var(--h-control-sm);
   padding: 0;
   border: 0;
   background: transparent;
@@ -73,7 +73,7 @@
 .record-table-page-button::before {
   content: "";
   position: absolute;
-  inset: 6px;
+  inset: 0;
   border: 1px solid var(--border);
   border-radius: 7px;
   background: var(--card);

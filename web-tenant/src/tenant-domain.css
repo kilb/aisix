@@ -63,18 +63,11 @@
   line-height: 1.6;
 }
 
-/* 名称和联系信息优先，金额列按需换行，分页记录不再撑出横向画布。 */
-:is(.tenant-members-list, .keys-list, .tenant-budgets, .tenant-billing) .dt { table-layout: fixed; }
+/* 列宽跟随内容，短字段收紧，名称、模型和说明使用剩余空间。 */
+:is(.tenant-members-list, .keys-list, .tenant-budgets, .tenant-billing) .dt { table-layout: auto; }
 :is(.tenant-members-list, .keys-list, .tenant-budgets, .tenant-billing) .dt :is(th, td) { min-width: 0; overflow-wrap: anywhere; white-space: normal; }
 :is(.tenant-members-list, .keys-list, .tenant-budgets, .tenant-billing) .dt .trunc { display: block; max-width: 100%; overflow: visible; white-space: normal; text-overflow: clip; overflow-wrap: anywhere; }
 :is(.tenant-members-list, .keys-list, .tenant-budgets, .tenant-billing) .dt .acts { max-width: 100%; flex-wrap: wrap; }
-.tenant-members-list .dt :is(th, td):nth-child(1) { width: 13%; }
-.tenant-members-list .dt :is(th, td):nth-child(2) { width: 18%; }
-.tenant-members-list .dt :is(th, td):nth-child(3) { width: 12%; }
-.tenant-members-list .dt :is(th, td):nth-child(4) { width: 9%; }
-.tenant-members-list .dt :is(th, td):nth-child(5),
-.tenant-members-list .dt :is(th, td):nth-child(6) { width: 19%; }
-.tenant-members-list .dt :is(th, td):last-child { width: 10%; }
 .tenant-members-list .dt select { width: 100%; min-width: 0; }
 /* 角色文字保留完整宽度，箭头靠边但仍留出独立空间。 */
 .tenant-members-list .dt td[data-label="角色"] select { padding-inline: 6px 22px; background-position: right 4px center; }
@@ -84,29 +77,26 @@
 .tenant-members-list .dt td[data-label="操作"] .two-step.is-asking { grid-template-columns: minmax(0, 1fr); }
 .tenant-members-list .dt td[data-label="操作"] .two-step-warn { width: auto; overflow-wrap: anywhere; }
 .tenant-members-list .dt td[data-label="操作"] .two-step-confirm { flex-wrap: wrap; justify-content: flex-end; }
-.tenant-members-list .dt td[data-label="操作"] .btn { min-width: min(44px, 100%); max-width: 100%; height: auto; min-height: 44px; padding-block: 8px; padding-inline: 8px; white-space: normal; overflow-wrap: anywhere; }
-/* 展开确认时为完整操作文字留宽，总列宽保持 100%，不挤出横向画布。 */
+.tenant-members-list .dt td[data-label="操作"] .btn { min-width: min(var(--h-control-sm), 100%); max-width: 100%; height: auto; min-height: var(--h-control-sm); padding-block: 6px; padding-inline: 8px; white-space: normal; overflow-wrap: anywhere; }
+/* 最小宽度来自字段本身；宽度不足只在表格内滚动，不拆散金额和操作。 */
 @media (min-width: 1051px) {
-  .tenant-members-list .dt:has(.two-step.is-asking) :is(th, td):nth-child(1) { width: 11%; }
-  .tenant-members-list .dt:has(.two-step.is-asking) :is(th, td):nth-child(2),
-  .tenant-members-list .dt:has(.two-step.is-asking) :is(th, td):nth-child(5),
-  .tenant-members-list .dt:has(.two-step.is-asking) :is(th, td):nth-child(6) { width: 16%; }
-  .tenant-members-list .dt:has(.two-step.is-asking) :is(th, td):last-child { width: 20%; }
+  :is(.tenant-members-list, .keys-list, .tenant-budgets, .tenant-billing) .dt td:is([data-label="状态"], [data-label="角色"], [data-label="类型"], [data-label="设置方"], [data-label="来源"], [data-label="受限于"]) { width: 1%; min-width: 6rem; }
+  :is(.tenant-members-list, .keys-list, .tenant-budgets, .tenant-billing) .dt td:is(.num, [data-label="本月费用"], [data-label="已用费用"]) { width: 1%; min-width: 7rem; font-variant-numeric: tabular-nums; }
+  :is(.tenant-members-list, .keys-list, .tenant-budgets, .tenant-billing) .dt td:is([data-label="操作"], [data-label="限制"]) { width: 1%; min-width: 6rem; }
+  :is(.tenant-members-list, .keys-list, .tenant-budgets, .tenant-billing) .dt td:is([data-label="名称"], [data-label="显示名"], [data-label="对象"], [data-label="密钥"], [data-label="模型"], [data-label="说明"]) { min-width: 10rem; }
+  :is(.tenant-members-list, .keys-list) .dt td:is([data-label="邮箱"], [data-label="成员额度"]) { min-width: 12rem; }
+  .keys-list .dt td:is([data-label="前缀"], [data-label="归属"], [data-label="分组"]) { min-width: 8rem; }
+  .keys-list .dt td[data-label="操作"] { min-width: 9rem; }
+  .tenant-billing .dt td:is([data-label="时间"], [data-label="提交时间"], [data-label="处理时间"], [data-label="期间"]) { width: 8rem; min-width: 8rem; }
+  .tenant-billing .dt td[data-label="本笔余额计算"] { min-width: 14rem; }
+  .tenant-budgets .dt td[data-label="结算周期"] { min-width: 11rem; }
 }
-.keys-list .dt :is(th, td):nth-child(1) { width: 14%; }
-.keys-list .dt :is(th, td):nth-child(2) { width: 18%; }
-.keys-list .dt :is(th, td):nth-child(3) { width: 11%; }
-.keys-list .dt :is(th, td):nth-child(4) { width: 17%; }
-.keys-list .dt :is(th, td):nth-child(5) { width: 13%; }
-.keys-list .dt :is(th, td):nth-child(6) { width: 9%; }
-.keys-list .dt :is(th, td):nth-child(7) { width: 9%; }
-.keys-list .dt :is(th, td):last-child { width: 9%; }
 .keys-list .dt :is(code, select, .acts) { max-width: 100%; min-width: 0; overflow-wrap: anywhere; }
 .keys-list .dt td[data-label="限制"] > span { min-width: 0; max-width: none; }
 .tenant-billing .dt .num { white-space: normal; }
-.tenant-budgets .dt td[data-label="结算周期"] { width: 20%; font-size: 13px; line-height: 20px; }
+.tenant-budgets .dt td[data-label="结算周期"] { font-size: 13px; line-height: 20px; }
 .tenant-cell-label { display: none; }
-.tenant-icon-action { width: 44px; padding-inline: 0; }
+.tenant-icon-action { width: var(--h-control-sm); padding-inline: 0; }
 
 /* 记录保留原表格语义与列标题，窄屏在一行记录内分成有标签的字段。 */
 @media (max-width: 1050px) {
