@@ -247,3 +247,62 @@ async fn invalid_timing_never_refuses_charges_and_unknown_keys_do_not_reach_tena
         }
     }
 }
+
+#[tokio::test]
+async fn the_public_dp_usage_event_wire_reaches_both_call_views_with_optional_offsets() {
+    let Some(w) = world().await else { return };
+    let model = seed_model(&w.cp, &w.admin).await;
+    price(&w.cp, model).await;
+    let owner = w.cp.member_login_seeded(w.tenant, MemberRole::Owner).await;
+    // 固定偏移仅验证正式 DP 事件的线协议，不把合约夹具称为实际时钟观测。
+    let event = aisix_obs::UsageEvent {
+        request_id: "timing-wire-request".to_owned(),
+        event_id: "timing-wire-event".to_owned(),
+        occurred_at: aisix_obs::UsageEvent::occurred_at_now(),
+        requested_model_id: model.to_string(),
+        model_id: model.to_string(),
+        api_key_id: w.key.clone(),
+        team_id: w.tenant.to_string(),
+        user_id: w.member.to_string(),
+        operation: "chat".to_owned(),
+        status_code: 200,
+        is_final_attempt: true,
+        prompt_tokens: 1000,
+        cached_prompt_tokens: 800,
+        completion_tokens: 200,
+        upstream_timing: Some(aisix_core::usage_io::UpstreamTiming {
+            http_send_started_ms: Some(0),
+            response_headers_ms: Some(3),
+            first_response_byte_ms: Some(5),
+            first_protocol_frame_ms: None,
+            first_canonical_chunk_ms: Some(8),
+            first_content_ms: Some(11),
+        }),
+        ..Default::default()
+    };
+    let expected = json!({
+        "http_send_started_ms":0,"response_headers_ms":3,"first_response_byte_ms":5,
+        "first_canonical_chunk_ms":8,"first_content_ms":11
+    });
+    let wire = serde_json::to_value(event).expect("正式 UsageEvent 序列化");
+    assert_eq!(wire.get("upstream_timing"), Some(&expected));
+    let accepted = deliver(&w.dp, Uuid::new_v4(), vec![wire]).await;
+    assert_eq!(accepted.status, 200, "{accepted:?}");
+    assert_eq!(
+        accepted.body,
+        json!({"accepted":1,"rejected":0,"duplicates":0})
+    );
+    for (path, cookie) in [
+        ("/admin/pricing/charges", w.admin.cookie()),
+        ("/api/usage/calls", owner.cookie()),
+    ] {
+        let response = w.cp.get_with_cookie(path, cookie).await;
+        assert_eq!(response.status, 200, "{response:?}");
+        let row = item(&response.body, "timing-wire-event");
+        assert_eq!(row.get("upstream_timing"), Some(&expected));
+        let amount = row
+            .get("charge_micro_cny")
+            .or_else(|| row["charge"].get("amount_micro_cny"));
+        assert_eq!(amount, Some(&json!(680)));
+    }
+}

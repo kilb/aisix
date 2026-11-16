@@ -42,7 +42,7 @@ use serde_json::{json, Value};
 use sqlx::{PgConnection, Postgres, QueryBuilder};
 use uuid::Uuid;
 
-use aisix_core::usage_io::{RequestTiming, UsageIoAudit};
+use aisix_core::usage_io::{RequestTiming, UpstreamTiming, UsageIoAudit};
 use aisix_pricing::{cny_per_million, CnyPerUsd, Rate};
 
 use super::range::{checked_range, Group};
@@ -237,6 +237,7 @@ pub(super) const EVENT_FIELDS: &str = "jsonb_build_object(\
     'downstream_latency_ms', ue.event->'downstream_latency_ms', \
     'first_token_latency_ms', ue.event->'first_token_latency_ms', \
     'request_timing', ue.event->'request_timing', \
+    'upstream_timing', ue.event->'upstream_timing', \
     'upstream_latency_ms', ue.event->'upstream_latency_ms', \
     'upstream_tpot_ms', ue.event->'upstream_tpot_ms', \
     'upstream_dispatched', ue.event->'upstream_dispatched', \
@@ -268,6 +269,8 @@ pub struct IoTokenReference {
 #[derive(Debug, Serialize)]
 pub struct CallUsage {
     request_timing: Option<RequestTiming>,
+    /// 同一次上游尝试的已观测偏移；缺失或非法时不从其他延迟字段补值。
+    upstream_timing: Option<UpstreamTiming>,
     first_token_latency_ms: Option<u32>,
     /// 本次上游尝试的完整耗时，不以客户端首帧耗时代替。
     attempt_duration_ms: Option<u32>,
@@ -308,6 +311,10 @@ impl CallUsage {
             request_timing: ev
                 .get("request_timing")
                 .and_then(|raw| serde_json::from_value(raw.clone()).ok()),
+            upstream_timing: ev
+                .get("upstream_timing")
+                .and_then(|raw| serde_json::from_value::<UpstreamTiming>(raw.clone()).ok())
+                .filter(UpstreamTiming::validate),
             first_token_latency_ms: event_milliseconds(ev, "first_token_latency_ms"),
             attempt_duration_ms: event_milliseconds(ev, "upstream_latency_ms").filter(|ms| *ms > 0),
             throughput_tps: measured_throughput(ev),

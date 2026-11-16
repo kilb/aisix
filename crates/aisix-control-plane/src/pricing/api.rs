@@ -321,6 +321,7 @@ const CHARGE_EVENT: &str = "jsonb_build_object(\
     'is_final_attempt', ue.event->'is_final_attempt', \
     'first_token_latency_ms', ue.event->'first_token_latency_ms', \
     'request_timing', ue.event->'request_timing', \
+    'upstream_timing', ue.event->'upstream_timing', \
     'upstream_latency_ms', ue.event->'upstream_latency_ms', \
     'upstream_tpot_ms', ue.event->'upstream_tpot_ms', \
     'upstream_dispatched', ue.event->'upstream_dispatched', \
