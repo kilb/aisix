@@ -488,6 +488,98 @@ async fn write_key(cp: &TestCp, id: Uuid, doc: Value, replace: bool) -> Result<i
         .await
 }
 
+// 已有密钥新增限制不应阻止关闭、撤回权限或普通重投影；版本门槛只阻止扩权。
+#[tokio::test]
+async fn an_existing_key_can_gain_restricting_fields_with_an_older_gateway_registered() {
+    let Some((cp, _admin, gw)) = setup().await else {
+        return;
+    };
+    let mut keys = Vec::new();
+    for case in ["restrict", "disable", "expire", "withdraw"] {
+        let id = Uuid::new_v4();
+        let before = json!({
+            "key_hash": format!("restriction-{case}-{id}"),
+            "allowed_models": ["*"],
+            "disabled": false,
+            "expires_at": "2035-01-01T00:00:00Z",
+        });
+        write_key(&cp, id, before.clone(), false)
+            .await
+            .expect("the existing key predates the floored restricting fields");
+        keys.push((case, id, before));
+    }
+    gw.beat("old-gateway-new-restrictions-454", OLD).await;
+    for (case, id, before) in keys {
+        let mut restricted = before;
+        restricted["allowed_endpoints"] = json!(["chat_completions"]);
+        restricted["allowed_provider_groups"] = json!(["shared"]);
+        match case {
+            "disable" => restricted["disabled"] = json!(true),
+            "expire" => restricted["expires_at"] = json!("2034-01-01T00:00:00Z"),
+            "withdraw" => restricted["allowed_models"] = json!([]),
+            _ => {}
+        }
+        write_key(&cp, id, restricted.clone(), true)
+            .await
+            .unwrap_or_else(|error| panic!("{case} must save on a stamped release: {error:?}"));
+        let stored: Value = sqlx::query_scalar("SELECT doc FROM gw_resources WHERE id = $1")
+            .bind(id)
+            .fetch_one(cp.db().pool())
+            .await
+            .expect("read the actual replacement document");
+        assert_eq!(stored, restricted, "all restrictions must persist: {case}");
+    }
+}
+
+// 新建以及重新启用仍会增加旧网关能服务的范围，新增限制字段不能绕过门槛。
+#[tokio::test]
+async fn new_restricting_fields_still_gate_creates_and_re_enabling_on_a_stamped_release() {
+    let Some((cp, _admin, gw)) = setup().await else {
+        return;
+    };
+    let id = Uuid::new_v4();
+    let before = json!({"key_hash": format!("restriction-reenable-{id}"), "disabled": true});
+    write_key(&cp, id, before.clone(), false)
+        .await
+        .expect("the disabled key predates the restricting fields");
+    gw.beat("old-gateway-reenable-restrictions-454", OLD).await;
+    let wider = json!({
+        "key_hash": format!("restriction-reenable-{id}"),
+        "disabled": false,
+        "allowed_endpoints": ["chat_completions"],
+        "allowed_provider_groups": ["shared"],
+    });
+    let error = write_key(&cp, id, wider.clone(), true)
+        .await
+        .expect_err("re-enabling a previously closed key still widens it");
+    assert_eq!(
+        (error.status.as_u16(), error.code),
+        (422, "gateway_too_old")
+    );
+    let stored: Value = sqlx::query_scalar("SELECT doc FROM gw_resources WHERE id = $1")
+        .bind(id)
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("read the refused replacement");
+    assert_eq!(stored, before, "refusal must leave the key closed");
+    let created_id = Uuid::new_v4();
+    let mut created = wider;
+    created["key_hash"] = json!(format!("restriction-create-{created_id}"));
+    let error = write_key(&cp, created_id, created, false)
+        .await
+        .expect_err("new keys carrying restricting fields still require a current gateway");
+    assert_eq!(
+        (error.status.as_u16(), error.code),
+        (422, "gateway_too_old")
+    );
+    let stored: Option<Value> = sqlx::query_scalar("SELECT doc FROM gw_resources WHERE id = $1")
+        .bind(created_id)
+        .fetch_optional(cp.db().pool())
+        .await
+        .expect("read the refused create");
+    assert_eq!(stored, None, "a refused create must not persist");
+}
+
 #[tokio::test]
 async fn re_enabling_a_key_an_older_gateway_would_serve_unrestricted_is_refused() {
     let Some((cp, _admin, gw)) = setup().await else {

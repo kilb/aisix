@@ -529,6 +529,7 @@ fn adds(before: &[Value], after: &[Value]) -> bool {
 /// already loads, so keeping it exposes nothing new unless the row widens;
 /// refusing would otherwise stop an operator from changing, or switching
 /// off, a row the older gateway already serves.
+/// 已有密钥只按扩权判断：新增限制字段不会扩大忽略它的旧网关原本能服务的范围。
 fn newly_triggered<'f>(
     floors: &'f [FieldFloor],
     kind: Kind,
@@ -538,7 +539,13 @@ fn newly_triggered<'f>(
     floors
         .iter()
         .filter(|f| f.kind == kind && triggered(f, doc))
-        .filter(|f| !triggered(f, stored) || (f.widens)(stored, doc))
+        .filter(|f| {
+            if kind == Kind::ApiKeys && !stored.is_null() {
+                (f.widens)(stored, doc)
+            } else {
+                !triggered(f, stored) || (f.widens)(stored, doc)
+            }
+        })
         .collect()
 }
 
@@ -895,7 +902,7 @@ mod tests {
         let key = |groups: Value| json!({"key_hash": "h", "allowed_provider_groups": groups});
         let keys = |doc: &Value, stored: &Value| count(Kind::ApiKeys, doc, stored);
         assert_eq!(keys(&key(json!(["a", "b"])), &key(json!(["a"]))), 0);
-        assert_eq!(keys(&key(json!(["a"])), &json!({"key_hash": "h"})), 1);
+        assert_eq!(keys(&key(json!(["a"])), &json!({"key_hash": "h"})), 0);
     }
 
     #[test]
@@ -908,7 +915,7 @@ mod tests {
             pointer: "/allowed_endpoints",
             trigger: Trigger::Contains("videos_7f1"),
             since: Since::Version("1.10.0"),
-            widens: never,
+            widens: key_widens,
             why: "test row",
         }];
         let with = json!({"key_hash": "h", "allowed_endpoints": ["chat", "videos_7f1"]});
