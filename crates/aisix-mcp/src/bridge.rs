@@ -11,7 +11,7 @@
 //! the rest of the data plane never depends on the SDK directly. That keeps
 //! rmcp's still-moving API contained to this file.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::Duration;
@@ -1090,6 +1090,7 @@ impl McpBridge for RmcpBridge {
             };
             let mut bytes = serialized_bytes(&empty, MAX_TOOL_LIST_BYTES).map_err(too_large)?;
             let mut params = None;
+            let mut seen_cursors = HashSet::new();
             for _ in 0..MAX_TOOL_LIST_PAGES {
                 let page = self
                     .running
@@ -1112,6 +1113,11 @@ impl McpBridge for RmcpBridge {
                 let Some(cursor) = page.next_cursor else {
                     return Ok(tools);
                 };
+                if !seen_cursors.insert(cursor.clone()) {
+                    return Err(McpError::Request(
+                        "upstream tools/list repeated a pagination cursor".to_string(),
+                    ));
+                }
                 params =
                     Some(rmcp::model::PaginatedRequestParams::default().with_cursor(Some(cursor)));
             }

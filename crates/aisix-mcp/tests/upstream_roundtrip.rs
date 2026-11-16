@@ -792,6 +792,10 @@ enum Paging {
     ThreePages,
     /// A cursor on every page, forever.
     Endless,
+    /// 下一页继续返回同一个游标。
+    SelfLoop,
+    /// 两个游标交替出现。
+    CursorCycle,
     /// The first page answers; the second never does.
     StallsOnPageTwo,
     /// This many pages, one tool each, every tool carrying a
@@ -806,7 +810,7 @@ const LARGE_DESCRIPTION_BYTES: usize = 6 * 1024 * 1024;
 /// A real MCP server that hands its tool list out a page at a time — the
 /// `nextCursor` contract of `tools/list`.
 #[derive(Clone)]
-struct PagedServer(Paging);
+struct PagedServer(Paging, Arc<AtomicUsize>);
 
 impl ServerHandler for PagedServer {
     async fn list_tools(
@@ -814,6 +818,7 @@ impl ServerHandler for PagedServer {
         request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
+        self.1.fetch_add(1, Ordering::SeqCst);
         let cursor = request.and_then(|r| r.cursor);
         let page: usize = cursor.as_deref().map_or(1, |c| {
             c.strip_prefix("page-")
@@ -839,10 +844,17 @@ impl ServerHandler for PagedServer {
         let last = match self.0 {
             Paging::ThreePages => page == 3,
             Paging::LargePages(pages) => page == pages,
-            Paging::Endless | Paging::StallsOnPageTwo => false,
+            Paging::Endless | Paging::SelfLoop | Paging::CursorCycle | Paging::StallsOnPageTwo => {
+                false
+            }
         };
         if !last {
-            result.next_cursor = Some(format!("page-{}", page + 1));
+            let next = match self.0 {
+                Paging::SelfLoop => 2,
+                Paging::CursorCycle if page == 3 => 2,
+                _ => page + 1,
+            };
+            result.next_cursor = Some(format!("page-{next}"));
         }
         Ok(result)
     }
@@ -855,8 +867,14 @@ impl ServerHandler for PagedServer {
 }
 
 async fn spawn_paged_server(paging: Paging) -> SocketAddr {
+    spawn_counted_paged_server(paging).await.0
+}
+
+async fn spawn_counted_paged_server(paging: Paging) -> (SocketAddr, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let server_calls = calls.clone();
     let service = StreamableHttpService::new(
-        move || Ok(PagedServer(paging)),
+        move || Ok(PagedServer(paging, server_calls.clone())),
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default(),
     );
@@ -868,7 +886,7 @@ async fn spawn_paged_server(paging: Paging) -> SocketAddr {
     tokio::spawn(async move {
         axum::serve(listener, app).await.expect("serve");
     });
-    addr
+    (addr, calls)
 }
 
 /// A tool on a later page of the upstream's list is listed: the bridge
@@ -912,6 +930,33 @@ async fn an_endless_cursor_fails_the_list_at_the_page_cap() {
         .await
         .expect_err("an endless list fails");
     assert!(err.to_string().contains("pages"), "{err}");
+}
+
+async fn assert_cursor_cycle_stops(paging: Paging, expected_pages: usize) {
+    let (addr, calls) = spawn_counted_paged_server(paging).await;
+    let upstream = McpUpstream::new(format!("http://{addr}/mcp"));
+    let held = RmcpBridge::connect(&upstream).await.expect("connect");
+    let ephemeral = EphemeralBridge::new(upstream);
+    for bridge in [&held as &dyn McpBridge, &ephemeral] {
+        let before = calls.load(Ordering::SeqCst);
+        let err = bridge.list_tools().await.expect_err("a cursor cycle fails");
+        assert!(matches!(err, aisix_mcp::McpError::Request(_)), "{err}");
+        assert_eq!(
+            calls.load(Ordering::SeqCst) - before,
+            expected_pages,
+            "a seen cursor must not be requested again: {err}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn tools_list_stops_before_requesting_a_self_loop_cursor_again() {
+    assert_cursor_cycle_stops(Paging::SelfLoop, 2).await;
+}
+
+#[tokio::test]
+async fn tools_list_stops_before_requesting_an_a_b_a_cursor_cycle_again() {
+    assert_cursor_cycle_stops(Paging::CursorCycle, 3).await;
 }
 
 /// Pages that each fit their own transport cap but together outgrow what a

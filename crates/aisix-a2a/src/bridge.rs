@@ -638,8 +638,7 @@ impl A2aBridge for HttpBridge {
             // `send`. Bounded here: `send`'s request timeout has no twin on a
             // stream, and a stalled error body must not hold the caller's answer.
             let status = resp.status().as_u16();
-            let _ =
-                tokio::time::timeout(self.upstream.timeout, read_error_body_for_export(resp)).await;
+            let _ = tokio::time::timeout_at(deadline, read_error_body_for_export(resp)).await;
             return Err(A2aError::UpstreamStatus(status));
         }
 
@@ -663,7 +662,7 @@ impl A2aBridge for HttpBridge {
             let bytes = tokio::time::timeout_at(deadline, read_capped(resp))
                 .await
                 .map_err(|_| {
-                    A2aError::Request("timed out reading the upstream response".to_string())
+                    A2aError::Connect("timed out reading the upstream response".to_string())
                 })??;
             let mut value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
                 A2aError::Request(format!(

@@ -4146,4 +4146,113 @@ mod tests {
             "the line must keep naming the family it belongs to",
         );
     }
+
+    // 正文在 handler 返回后才轮询；此时仍须用请求的 sent-key 集合清理错误。
+    #[tokio::test]
+    async fn a_streamed_error_scrubs_the_sent_key_after_the_handler_returns() {
+        use aisix_obs::UsageSink;
+        use axum::response::IntoResponse as _;
+
+        const CANARY: &str = "a2a-held-canary-7c19fe32";
+        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let agent_received = received.clone();
+        let agent = axum::Router::new().route(
+            "/a2a",
+            axum::routing::post(move |headers: HeaderMap| {
+                let received = agent_received.clone();
+                async move {
+                    let key = headers
+                        .get("x-api-key")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    received.lock().unwrap().push(key.clone());
+                    let envelope = serde_json::json!({
+                        "jsonrpc": "2.0", "id": "s",
+                        "error": {"code": -32001, "message": format!("token rejected; saw {key}"),
+                            "data": {"detail": format!("credential {key} was refused")}}
+                    });
+                    let body = futures::stream::once(async move {
+                        Ok::<_, std::convert::Infallible>(format!("data: {envelope}\n\n"))
+                    });
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                        Body::from_stream(body),
+                    )
+                        .into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, agent).await.unwrap() });
+        let snap = snapshot_with(
+            &format!("http://{addr}/a2a"),
+            true,
+            serde_json::json!(["*"]),
+        );
+        let agent: A2aAgent = serde_json::from_value(serde_json::json!({
+            "name": "invoice", "url": format!("http://{addr}/a2a"), "enabled": true,
+            "auth_type": "api_key", "secret": CANARY,
+        }))
+        .unwrap();
+        snap.a2a_agents.insert(ResourceEntry::new("ag-1", agent, 2));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let state = ProxyState::new(
+            SnapshotHandle::new(snap),
+            Arc::new(aisix_gateway::Hub::new()),
+            &proxy_cfg(),
+        )
+        .without_cache()
+        .with_usage_sink(UsageSink::new(tx));
+        let capture = crate::test_log::Capture::install();
+        let response = build_router(state)
+            .oneshot(
+                HttpRequest::post("/a2a/invoice")
+                    .header("host", "gw.example.com")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":"s","method":"message/stream"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 65_536)
+            .await
+            .unwrap();
+        server.abort();
+        assert_eq!(*received.lock().unwrap(), [CANARY]);
+        let caller = String::from_utf8(bytes.to_vec()).unwrap();
+        let envelope: serde_json::Value = serde_json::from_str(
+            caller
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .expect("one SSE event"),
+        )
+        .unwrap();
+        assert_eq!(envelope["error"]["code"], -32001);
+        assert!(envelope["error"]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("token rejected; saw "));
+        assert!(!caller.contains(CANARY), "the caller received the held key");
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the SSE error must settle usage")
+            .expect("one terminal usage event");
+        assert_eq!(event.a2a_operation, "message/stream");
+        assert_eq!(event.operation, "a2a");
+        assert!(!serde_json::to_string(&event).unwrap().contains(CANARY));
+        assert!(rx.try_recv().is_err(), "one call, one usage event");
+        let line = capture.only("an A2A SSE error");
+        assert_eq!(line.status(), 200);
+        assert_eq!(line.field("provider").as_deref(), Some("a2a"));
+        assert!(
+            !capture.text().contains(CANARY),
+            "the held key reached a log"
+        );
+    }
 }

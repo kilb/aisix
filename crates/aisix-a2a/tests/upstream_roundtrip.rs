@@ -1047,7 +1047,7 @@ async fn a_stalled_json_answer_to_a_streaming_call_fails_at_the_deadline() {
     .await
     .expect("the call must not outlive its deadline");
     assert!(
-        matches!(&opened, Err(A2aError::Request(message)) if message.contains("timed out")),
+        matches!(&opened, Err(A2aError::Connect(message)) if message.contains("timed out")),
         "{:?}",
         opened.as_ref().map(|_| "a stream")
     );
@@ -1055,6 +1055,73 @@ async fn a_stalled_json_answer_to_a_streaming_call_fails_at_the_deadline() {
         started.elapsed() < Duration::from_secs(5),
         "{:?}",
         started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn a_stream_error_body_uses_only_the_remaining_opening_budget() {
+    use futures::StreamExt as _;
+
+    async fn stalled_error() -> impl IntoResponse {
+        // 响应头先耗掉大半预算；正文不再得到一个完整的新预算。
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let body = futures::stream::once(async {
+            Ok::<_, std::convert::Infallible>(b"upstream refused".to_vec())
+        })
+        .chain(futures::stream::pending());
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::body::Body::from_stream(body),
+        )
+    }
+    let addr = serve(Router::new().route("/a2a", post(stalled_error))).await;
+    let mut up = upstream(format!("http://{addr}/a2a"), A2aAuth::None);
+    up.timeout = Duration::from_millis(1_000);
+    let bridge = HttpBridge::new(up);
+    let tap = Arc::new(aisix_gateway::response_tap::ResponseHeaderTap::new(
+        Vec::new(),
+        true,
+        "stream-error-budget".into(),
+    ));
+
+    let started = Instant::now();
+    let opened = aisix_gateway::response_tap::scope(
+        tap,
+        bridge.send_stream(&json!({"jsonrpc":"2.0","id":"s","method":"message/stream"})),
+    )
+    .await;
+    assert!(
+        matches!(opened, Err(A2aError::UpstreamStatus(503))),
+        "{:?}",
+        opened.as_ref().map(|_| "a stream")
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(1_400),
+        "opening took {:?}; the error body must share the opening deadline",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn a_complete_malformed_json_answer_to_a_streaming_call_is_a_decode_error() {
+    let app = Router::new().route(
+        "/a2a",
+        post(|| async {
+            (
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                "{broken json",
+            )
+        }),
+    );
+    let addr = serve(app).await;
+    let bridge = HttpBridge::new(upstream(format!("http://{addr}/a2a"), A2aAuth::None));
+    let opened = bridge
+        .send_stream(&json!({"jsonrpc":"2.0","id":"s","method":"message/stream"}))
+        .await;
+    assert!(
+        matches!(&opened, Err(A2aError::Request(message)) if message.contains("neither SSE nor JSON")),
+        "{:?}",
+        opened.as_ref().map(|_| "a stream")
     );
 }
 
