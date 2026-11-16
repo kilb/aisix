@@ -441,7 +441,9 @@ async fn dispatch(
     }
 
     crate::attribution::note_requested_stream(crate::stream_metadata::multipart_intent(
-        fields.iter().map(|(name, _, _, data)| (name.as_str(), data.as_ref())),
+        fields
+            .iter()
+            .map(|(name, _, _, data)| (name.as_str(), data.as_ref())),
     ));
 
     let model_name = fields

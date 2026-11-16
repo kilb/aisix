@@ -2123,7 +2123,9 @@ pub(crate) fn prepare_usage_event_fields(
     // present on a family's success path and missing from its error or
     // streaming one (AISIX-Cloud#1461).
     event.operation = surface.operation.to_string();
-    event.stream = event.stream.or_else(|| crate::stream_metadata::fixed_intent(surface));
+    event.stream = event
+        .stream
+        .or_else(|| crate::stream_metadata::fixed_intent(surface));
     event.is_final_attempt = logical_final;
     // 与上游 span 使用同一派发事实；零耗时仍可能是一次实际调用。
     event.upstream_dispatched = Some(dispatched);

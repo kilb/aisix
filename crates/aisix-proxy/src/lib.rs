@@ -38,9 +38,6 @@ mod client_ip;
 mod completions;
 pub(crate) mod cooldown;
 mod count_tokens;
-mod stream_metadata;
-#[cfg(test)]
-mod stream_metadata_tests;
 mod decisions;
 mod decisions_convert;
 mod dispatch;
@@ -111,6 +108,9 @@ mod span_facts;
 pub mod sse_keepalive;
 mod state;
 mod stored_refs;
+mod stream_metadata;
+#[cfg(test)]
+mod stream_metadata_tests;
 mod stream_timeout;
 #[cfg(test)]
 mod test_log;

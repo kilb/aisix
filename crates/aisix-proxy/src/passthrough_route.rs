@@ -2106,8 +2106,11 @@ fn body_model_name(
         return String::new();
     };
     match metering {
-        Metering::Chat | Metering::Anthropic | Metering::Responses
-        | Metering::Completions | Metering::Images => crate::stream_metadata::note_json(&v),
+        Metering::Chat
+        | Metering::Anthropic
+        | Metering::Responses
+        | Metering::Completions
+        | Metering::Images => crate::stream_metadata::note_json(&v),
         Metering::Embeddings | Metering::Rerank => {
             crate::attribution::note_requested_stream(Some(false));
         }
@@ -9971,7 +9974,10 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
         );
         // An opaque body's `model`-shaped key belongs to some other API.
         let opaque = br#"{"model":"whatever","config_name":"x"}"#;
-        assert_eq!(body_model_name(PassthroughProtocol::Raw, None, opaque, Metering::Opaque), "");
+        assert_eq!(
+            body_model_name(PassthroughProtocol::Raw, None, opaque, Metering::Opaque),
+            ""
+        );
         // Caller-supplied, so bounded and control-char free before it
         // reaches telemetry.
         let hostile = format!(
