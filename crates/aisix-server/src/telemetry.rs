@@ -28,10 +28,10 @@
 //!   carrying the de-duplication header, which is the control plane
 //!   reporting a transient store failure that the same batch, re-sent
 //!   unchanged, gets past. Past [`REPORTED_OUTAGE_BUDGET`] of those, the
-//!   next batch is posted once to tell a store outage from a batch the
-//!   store keeps failing on: if it is stored, the held batch is re-sent once
-//!   more and, failing again, given up on; if it is not, the store is down,
-//!   and both are held within the budget. A batch given up on after an attempt that may have
+//!   next batch is posted once so later events can still be stored. Its
+//!   success cannot classify another batch's `503` as permanent: the held
+//!   batch keeps its backoff and budget. An unsuccessful probe is held
+//!   under its own id within the same bounds. A batch given up on after an attempt that may have
 //!   reached the control plane unanswered is counted as unconfirmed rather
 //!   than as lost. Every wait between re-sends is spread by
 //!   [`RETRY_JITTER`], so gateways that failed together do not re-send
@@ -149,13 +149,12 @@ const RETRY_JITTER: f64 = 0.2;
 /// [`MAX_ANSWERED_FAILURES`]. But one batch that keeps meeting them would
 /// otherwise hold the single in-flight sender for the whole
 /// [`RETRY_BUDGET`] while everything queued behind it overflows. Five
-/// minutes outlasts a database failover. Past it the sender asks whether
-/// the failure is the store's or the batch's: it posts the next batch once
-/// ([`probe_with_the_next_batch`]). Stored, the held batch gets one more
-/// attempt and, failing again with a reported outage, is given up on alone.
-/// Not stored, the store is down: the held batch is kept, within
-/// [`RETRY_BUDGET`], and the probe waits under its own id to go next, so an
-/// outage longer than five minutes loses nothing the budget would keep.
+/// minutes outlasts a database failover. Past it the sender posts the next
+/// batch once ([`probe_with_the_next_batch`]) so later events can be stored
+/// while the held batch is still meeting transient failures. Both remain
+/// bounded by [`RETRY_BUDGET`]; a probe that was not stored waits under its
+/// own id to go next. A successful probe does not make a later `503` on the
+/// held batch permanent.
 const REPORTED_OUTAGE_BUDGET: Duration = Duration::from_secs(5 * 60);
 
 /// How long a batch may be re-sent, measured from its OLDEST event's
@@ -201,7 +200,8 @@ const RETRY_BUDGET: Duration = Duration::from_secs(30 * 60);
 /// a store outage longer than the backoff to the eighth answer (about a
 /// minute and a half) would drop the batch at the head of every gateway's
 /// queue although none of them was ever stored; it is bounded by
-/// [`REPORTED_OUTAGE_BUDGET`] instead, on the same backoff. Every other answered failure counts,
+/// [`RETRY_BUDGET`] instead, on the same backoff, with a probe after
+/// [`REPORTED_OUTAGE_BUDGET`]. Every other answered failure counts,
 /// including a `503` WITHOUT the header, which a proxy in front of the
 /// control plane can send and which says nothing about the store. See
 /// [`SendFailure::counts_toward_the_cap`].
@@ -241,8 +241,7 @@ const DROP_OVERSIZED: &str = "oversized";
 /// `aisix_usage_event_drops_total{reason}` for a batch that ran out of room
 /// to keep trying: its events aged past [`RETRY_BUDGET`] (with or without
 /// an attempt ever being made), the answers refusing it reached
-/// [`MAX_ANSWERED_FAILURES`], or the control plane kept reporting a store
-/// outage on it past [`REPORTED_OUTAGE_BUDGET`]. Distinct from
+/// [`MAX_ANSWERED_FAILURES`]. Distinct from
 /// [`DROP_SEND_FAILED`], which says the very first failure could not be
 /// re-sent at all.
 const DROP_RETRY_BUDGET_EXHAUSTED: &str = "retry_budget_exhausted";
@@ -973,8 +972,8 @@ struct Behind<'a> {
     rx: &'a mut tokio::sync::mpsc::Receiver<UsageEvent>,
 }
 
-/// Tell a store outage from a batch the store keeps failing on: post the
-/// next batch once. `true` when the control plane stored it. A probe that
+/// Post the next batch once while the held batch keeps meeting a reported
+/// outage. `true` when the control plane stored it. A probe that
 /// was not stored and may be re-sent goes next, under the id it went out
 /// with; one that may not be is given up on as [`deliver`] gives one up.
 /// `false` too when nothing is queued to ask with.
@@ -1092,16 +1091,11 @@ async fn deliver(
     let mut attempts = 0usize;
     let mut answered_failures = 0usize;
     let mut resending = false;
-    // When the control plane's report of a store outage on this batch stops
-    // being believed: set at the first such report.
+    // 下一次用后续批次探测的时间，从本轮首次 503 开始计算。
     let mut reported_outage_ends: Option<Instant> = None;
     // Whether an attempt may have reached the control plane unanswered, so a
     // drop cannot say the events are not stored.
     let mut maybe_stored = batch.maybe_stored;
-    // Set once the batch behind this one was stored while this one kept
-    // meeting a reported outage: the store works, so another such report on
-    // this batch is about the batch.
-    let mut the_store_answers = false;
     // Flipped when shutdown interrupts a backoff: the batch in hand gets one
     // final attempt, and then this worker stops holding the drain open.
     let mut last_attempt = retry == Retry::Disabled;
@@ -1180,17 +1174,6 @@ async fn deliver(
             return;
         }
 
-        if failure.is_reported_outage() && the_store_answers {
-            drop_batch(
-                metrics,
-                unconfirmed_or(DROP_RETRY_BUDGET_EXHAUSTED),
-                events,
-                batch_id,
-                attempts,
-                Some(&failure),
-            );
-            return;
-        }
         let now = Instant::now();
         let outage_over = failure.is_reported_outage()
             && now
@@ -1203,7 +1186,6 @@ async fn deliver(
             if let Some(behind) = behind.as_mut() {
                 if probe_with_the_next_batch(client, cfg, metrics, state, behind, cancel).await {
                     // Re-sent at once: the store took the batch behind it.
-                    the_store_answers = true;
                     continue;
                 }
             }
@@ -1429,7 +1411,7 @@ impl SendFailure {
 
     /// Whether this is the control plane reporting a store outage on the
     /// batch: a `503` that carries [`USAGE_BATCH_DEDUP_HEADER`]. Bounded by
-    /// [`REPORTED_OUTAGE_BUDGET`] rather than by the cap.
+    /// [`RETRY_BUDGET`] rather than by the cap.
     fn is_reported_outage(&self) -> bool {
         matches!(self, SendFailure::Response { .. }) && !self.counts_toward_the_cap()
     }
@@ -3951,13 +3933,118 @@ mod tests {
         .sum()
     }
 
-    /// A batch the store keeps failing on alone, while it stores the one
-    /// behind it, holds the single in-flight sender for minutes, not for
-    /// the whole budget. Past [`REPORTED_OUTAGE_BUDGET`], spread per batch,
-    /// the batch behind it goes out once; it is stored, so the held batch
-    /// gets one more attempt and, failing again, is given up on.
+    /// 探测批次成功不代表原批次的下一次 503 是永久失败；恢复后原事件
+    /// 应按原顺序、原批次 ID 送达，已成功的探测批次不再发送。
     #[tokio::test]
-    async fn a_batch_the_store_keeps_failing_alone_is_given_up_on_once_the_next_is_stored() {
+    async fn a_reported_outage_after_a_stored_probe_keeps_the_held_batch() {
+        let posts = Arc::new(std::sync::Mutex::new(Vec::<(String, Vec<u8>, u16)>::new()));
+        let recorded = Arc::clone(&posts);
+        let server = local_server(move |headers, body| {
+            let id = headers[USAGE_BATCH_ID_HEADER].to_str().unwrap().to_string();
+            let mut posts = recorded.lock().unwrap();
+            let held = posts.first().is_none_or(|(first, ..)| *first == id);
+            let after_probe = posts
+                .iter()
+                .rev()
+                .take_while(|(batch, ..)| *batch == id)
+                .count();
+            let probe_stored = posts
+                .iter()
+                .any(|(batch, _, status)| *batch != id && *status == 200);
+            let status = if held && (!probe_stored || after_probe < 3) {
+                503
+            } else {
+                200
+            };
+            posts.push((id, body.to_vec(), status));
+            let mut reply = Reply::status(status);
+            reply
+                .headers
+                .push((USAGE_BATCH_DEDUP_HEADER, USAGE_BATCH_DEDUP_ENABLED));
+            reply
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(format!("{}/dp/telemetry", server.uri()), &dir);
+        let metrics = Metrics::new(false);
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let mut expected = ordered_events(5);
+        for event in &mut expected {
+            event.event_id = Uuid::new_v4().to_string();
+        }
+        let (tx, rx) = tokio::sync::mpsc::channel(BACKLOG_QUEUE);
+        tokio::time::pause();
+        let mut sender = Box::pin(run(cfg, metrics.clone(), rx, &mut cancel_rx));
+        assert!(poll_sender(sender.as_mut()).await.is_pending());
+        for event in &expected[..2] {
+            tx.try_send(event.clone()).unwrap();
+        }
+        drive_until(
+            sender.as_mut(),
+            STEP_WHILE_SERVING,
+            || !posts.lock().unwrap().is_empty(),
+            "the held batch never went out",
+        )
+        .await;
+        for event in &expected[2..] {
+            tx.try_send(event.clone()).unwrap();
+        }
+        drive_until(
+            sender.as_mut(),
+            STEP_WHILE_SERVING,
+            || {
+                posts
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(.., status)| *status == 200)
+                    .count()
+                    == 2
+                    || drops_of_every_reason(&metrics) > 0
+            },
+            "the held batch neither recovered nor was dropped",
+        )
+        .await;
+        assert_eq!(
+            drops_of_every_reason(&metrics),
+            0,
+            "a recoverable 503 dropped usage"
+        );
+        drop(tx);
+        finish_sender(sender.as_mut()).await;
+
+        let posts = posts.lock().unwrap();
+        let held_id = &posts[0].0;
+        let probe = posts.iter().position(|(id, ..)| id != held_id).unwrap();
+        assert_eq!(posts[probe].2, 200);
+        assert_eq!(posts.len(), probe + 5, "three more 503s then recovery");
+        for (index, (id, body, _)) in posts.iter().enumerate() {
+            if index == probe {
+                continue;
+            }
+            assert_eq!(id, held_id);
+            assert_eq!(body, &posts[0].1, "re-sends preserve bytes and event order");
+        }
+        let stored: Vec<serde_json::Value> = posts
+            .iter()
+            .filter(|(.., status)| *status == 200)
+            .map(|(_, body, _)| serde_json::from_slice(body).unwrap())
+            .collect();
+        assert_eq!(stored.len(), 2, "accepted batches are never re-sent");
+        assert_eq!(
+            stored[0]["events"],
+            serde_json::to_value(&expected[2..]).unwrap()
+        );
+        assert_eq!(
+            stored[1]["events"],
+            serde_json::to_value(&expected[..2]).unwrap()
+        );
+    }
+
+    /// 原批次始终遇到 503 时，探测仍可交付后续批次；原批次只在已有
+    /// 事件年龄预算耗尽后丢弃，不会无限持有发送器或重发已成功的探测。
+    #[tokio::test]
+    async fn a_batch_that_keeps_meeting_503_after_a_stored_probe_exhausts_its_age_budget() {
         let down = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (server, posts) = server_with_an_outage(down, true).await;
         let dir = tempfile::tempdir().unwrap();
@@ -3987,8 +4074,9 @@ mod tests {
         )
         .await;
         let held = first.elapsed();
-        let low = REPORTED_OUTAGE_BUDGET.mul_f64(1.0 - RETRY_JITTER);
-        let high = REPORTED_OUTAGE_BUDGET.mul_f64(1.0 + RETRY_JITTER) + RETRY_MAX_BACKOFF;
+        // 时间戳只有秒精度，首次请求也在预算内，因此为起点留两秒余量。
+        let low = RETRY_BUDGET - Duration::from_secs(2);
+        let high = RETRY_BUDGET + RETRY_MAX_BACKOFF;
         assert!(
             (low..=high).contains(&held),
             "given up on {held:?} after its first answer"
@@ -4004,11 +4092,25 @@ mod tests {
         assert_eq!(posts[probe].1, 3, "{posts:?}");
         assert_eq!(posts[probe].2, 200, "the batch behind it was stored");
         assert_eq!(
+            posts.iter().filter(|(id, ..)| *id != held_id).count(),
+            1,
+            "a stored probe is never re-sent"
+        );
+        assert_eq!(
             posts[probe + 1].0,
             held_id,
-            "the held batch was re-sent once more"
+            "the held batch was re-sent after the probe"
         );
-        assert_eq!(posts.len(), probe + 2, "{posts:?}");
+        assert!(
+            posts.len() > probe + MAX_ANSWERED_FAILURES,
+            "503s after a stored probe remain transient: {posts:?}"
+        );
+        assert!(
+            posts[probe + 1..]
+                .iter()
+                .all(|(id, _, status)| *id == held_id && *status == 503),
+            "only the held batch kept failing: {posts:?}"
+        );
     }
 
     /// A store outage longer than [`REPORTED_OUTAGE_BUDGET`] loses nothing
