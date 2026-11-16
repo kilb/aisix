@@ -230,6 +230,10 @@ aws-smithy-http-client = { version = "1", default-features = false, features = [
 wiremock = "0.6"
 tempfile = "3.13"
 
+# 已发布驱动只回补 SQLite 依赖版本，来源与补丁见 vendor/README.md。
+[patch.crates-io]
+sqlx-sqlite = { path = "vendor/sqlx-sqlite-0.8.6" }
+
 # Full DWARF is the largest single thing in `target/` here: it is 83% of
 # every test binary, and `cargo test --workspace` links 44 of them. Line
 # tables keep what a failing test needs while costing much less to emit.

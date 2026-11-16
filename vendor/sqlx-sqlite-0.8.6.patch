@@ -1,0 +1,5 @@
+--- sqlx-sqlite-0.8.6/Cargo.toml
++++ sqlx-sqlite-0.8.6/Cargo.toml
+@@ -82 +82 @@
+-version = "0.30.1"
++version = "=0.39.1"
