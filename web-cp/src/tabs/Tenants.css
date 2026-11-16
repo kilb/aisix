@@ -320,7 +320,7 @@ td .tn-note {
 .tn-error {
   display: block;
   margin-top: var(--s-1);
-  color: var(--color-danger-fg);
+  color: var(--color-danger);
   font-size: var(--text-small);
   font-weight: 500;
   line-height: var(--lh-table);
@@ -329,7 +329,7 @@ td .tn-note {
 /* 密钥需要处理的状态说明仍使用明确文字。 */
 .tn-flag {
   display: block;
-  color: var(--color-danger-fg);
+  color: var(--color-danger);
 }
 td .tn-flag {
   margin: 2px 0 0;

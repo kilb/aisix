@@ -34,7 +34,7 @@
 .direct-probe-status svg { width: 16px; height: 16px; flex: none; }
 .direct-probe-status[data-status="not_tested"], .direct-probe-status[data-status="unsupported"] { color: var(--color-fg-3); }
 .direct-probe-status[data-status="available"] { color: var(--color-success-fg); }
-.direct-probe-status[data-status="failed"], .direct-probe-status[data-status="timeout"] { color: var(--color-danger-fg); }
+.direct-probe-status[data-status="failed"], .direct-probe-status[data-status="timeout"] { color: var(--color-danger); }
 .direct-probe-method, .direct-probe-empty { max-width: 88ch; margin-top: 16px; color: var(--color-fg-3); font-size: var(--text-caption); line-height: 1.5; }
 .direct-probe-history { min-width: 0; margin: 0; padding: 0; border: 0; }
 .direct-probe-history h3 { font-size: var(--text-title); font-weight: 700; }

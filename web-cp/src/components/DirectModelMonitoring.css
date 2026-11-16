@@ -42,7 +42,7 @@
 .direct-monitor-model-id { display: flex; min-width: 0; align-items: center; gap: 4px; color: var(--color-fg-3); font-size: var(--text-caption); line-height: 1.45; }
 .direct-monitor-model-id > span { min-width: 0; overflow-wrap: anywhere; }
 .direct-monitor-samples { display: block; margin-top: 4px; color: var(--color-fg-3); font-size: var(--text-caption); font-weight: 400; line-height: 1.45; font-variant-numeric: tabular-nums; }
-.direct-monitor-failure { color: var(--color-danger-fg); }
+.direct-monitor-failure { color: var(--color-danger); }
 .direct-monitor-model-details dl { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; margin: 0; padding: 16px; border-radius: var(--radius-tile); background: var(--color-sunken); }
 .direct-monitor-model-details dl > div { min-width: 0; }
 .direct-monitor-model-details dt { color: var(--color-fg-3); font-size: var(--text-caption); line-height: 1.45; }
