@@ -78,7 +78,7 @@ async function showCall(page: Page, scenario: Scenario): Promise<{ row: Locator;
   await page.evaluate(() => document.fonts.ready);
   await page.waitForLoadState("networkidle");
   expect(new URL(page.url()).hash).toContain("#calls?");
-  await expect(page).toHaveTitle(/AISIX/i);
+  await expect(page).toHaveTitle("Routio 组织门户");
   await expect(page.getByRole("heading", { name: "调用记录", exact: true }).first()).toBeVisible();
   const answer = await page.evaluate(async path => {
     const response = await fetch(path, { credentials: "include" });
@@ -178,6 +178,23 @@ test("real-call-drawer-mobile-fits-scrolls-and-restores-focus", async ({ page })
   await trigger.click();
   const dialog = page.getByRole("dialog", { name: "调用详情", exact: true });
   await expect(dialog).toBeVisible();
+  // 只等已启动的入场动画结束，不以几何断言轮询到通过来掩盖越界。
+  await dialog.evaluate(async element => {
+    const animations = element.getAnimations().filter(animation => animation instanceof CSSAnimation && animation.animationName === "tenant-call-enter");
+    for (const animation of animations) {
+      if (!Number.isFinite(animation.effect?.getComputedTiming().endTime)) throw new Error("Drawer entry animation must finish in finite time");
+    }
+    let timeout: number | undefined;
+    try {
+      await Promise.race([
+        Promise.all(animations.map(animation => animation.finished)),
+        new Promise<never>((_, reject) => { timeout = window.setTimeout(() => reject(new Error("Drawer entry animation exceeded 1200 ms")), 1200); }),
+      ]);
+    } finally {
+      if (timeout !== undefined) window.clearTimeout(timeout);
+    }
+    await new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+  });
   const bounds = await dialog.boundingBox();
   expect(bounds).not.toBeNull(); expect(bounds!.width).toBeGreaterThanOrEqual(360); expect(bounds!.x).toBeGreaterThanOrEqual(0); expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(391);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
