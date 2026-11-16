@@ -35,13 +35,15 @@ export function Totals(_props: TabProps) {
     if (rangeError) return;
     let current = true;
     setAnswer({ key, usage: { data: null, error: null }, cost: { data: null, error: null } });
-    void Promise.allSettled([fetchApiMetrics("admin", { from, to }), fetchCostTotals(from, to)]).then(([usage, cost]) => {
-      if (!current) return;
-      setAnswer({
-        key,
-        usage: usage.status === "fulfilled" ? { data: usage.value, error: null } : { data: null, error: errorText(usage.reason) },
-        cost: cost.status === "fulfilled" ? { data: cost.value, error: null } : { data: null, error: errorText(cost.reason) },
-      });
+    void fetchApiMetrics("admin", { from, to }).then(data => {
+      if (current) setAnswer(previous => previous.key === key ? { ...previous, usage: { data, error: null } } : previous);
+    }, (error: unknown) => {
+      if (current) setAnswer(previous => previous.key === key ? { ...previous, usage: { data: null, error: errorText(error) } } : previous);
+    });
+    void fetchCostTotals(from, to).then(data => {
+      if (current) setAnswer(previous => previous.key === key ? { ...previous, cost: { data, error: null } } : previous);
+    }, (error: unknown) => {
+      if (current) setAnswer(previous => previous.key === key ? { ...previous, cost: { data: null, error: errorText(error) } } : previous);
     });
     return () => { current = false; };
   }, [key, from, to, rangeError]);
@@ -106,8 +108,8 @@ export function Totals(_props: TabProps) {
     </div>
     <section className="totals-method" aria-label="统计口径">
       <h2>统计口径</h2>
-      <p>输入覆盖可见的最终记录及已计费重试；成本覆盖已收费或已重定价记录，两项统计的人口不同。成本来自当笔记录，不使用当前费率重新估算。</p>
-      <p>两项统计使用相同时间窗口，分别独立查询；记录持续写入或重定价时，结果可能存在短暂差异。成本仅在运维控制台提供，不向租户展示。</p>
+      <p>输入覆盖可见的最终记录及已计费重试；成本覆盖已收费或已重定价记录，两项统计范围不同。成本来自当笔记录，不使用当前费率重新估算。</p>
+      <p>两项统计使用相同时间窗口，分别独立查询；记录持续写入或重定价时，结果可能存在短暂差异。</p>
     </section>
   </div>;
 }
