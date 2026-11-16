@@ -145,7 +145,7 @@ function Discounts({ tenantId, plan, canEdit, onSaved }: { tenantId: string; pla
 
   const stray = details.filter((d) => d.path !== "/discount_bps" && d.path !== "/effective_from");
   const shown = (
-    <Card className="mb-3" role="region" aria-label="折扣">
+    <Card className="finance-facts-card" role="region" aria-label="折扣">
       <dl className="compact-overview-facts">
         <div><dt>现行折扣</dt><dd data-testid="current-discount">{current ? fmtPercent(current.discount_bps) : "无折扣"}</dd></div>
         <div><dt>生效时间</dt><dd className="text-body">{current ? fmtBeijing(current.effective_from) : "未设置"}</dd></div>
@@ -161,7 +161,7 @@ function Discounts({ tenantId, plan, canEdit, onSaved }: { tenantId: string; pla
       {shown}
       <div className="flex justify-end"><Button kind="primary" icon="plus" onClick={() => setCreateOpen(true)}>新折扣</Button></div>
       <FormDialog open={createOpen} onOpenChange={setCreateOpen} busy={saving} title="新折扣" description="只影响现在或将来开始生效的计费。历史账单保持原有价格。">
-      <Card className="mb-0">
+      <div className="finance-dialog-body">
           <form ref={form} aria-label="新折扣" onSubmit={(e) => void save(e)} noValidate>
             <FormGrid>
               <Field label="折扣（%）" error={problemAt(details, (p) => p === "/discount_bps")}>
@@ -194,7 +194,7 @@ function Discounts({ tenantId, plan, canEdit, onSaved }: { tenantId: string; pla
               </Button>
             </CardFooter>
           </form>
-      </Card>
+      </div>
       </FormDialog>
     </>
   );

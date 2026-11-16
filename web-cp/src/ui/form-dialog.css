@@ -1,8 +1,8 @@
-.form-dialog-overlay { position: fixed; inset: 0; z-index: 70; background: rgb(18 18 17 / 28%); }
-.form-dialog { position: fixed; z-index: 71; left: 50%; top: 50%; transform: translate(-50%, -50%); display: flex; flex-direction: column; width: min(760px, calc(100vw - 32px)); max-height: calc(100dvh - 48px); min-width: 0; overflow: hidden; border: 1px solid var(--border); border-radius: 16px; background: var(--card); color: var(--foreground); }
+.form-dialog-overlay { position: fixed; inset: 0; z-index: 70; background: var(--overlay); }
+.form-dialog { position: fixed; z-index: 71; left: 50%; top: 50%; transform: translate(-50%, -50%); display: flex; flex-direction: column; width: min(760px, calc(100vw - 32px)); max-height: calc(100dvh - 48px); min-width: 0; overflow: hidden; border: 1px solid var(--border); border-radius: var(--r-tile); background: var(--card); color: var(--foreground); }
 .form-dialog-heading { display: flex; flex: none; align-items: flex-start; justify-content: space-between; gap: 16px; padding: 18px 20px 14px; border-bottom: 1px solid var(--border); }
-.form-dialog-title { margin: 0; font-size: 18px; font-weight: 600; line-height: 28px; letter-spacing: -.02em; }
-.form-dialog-description { margin: 4px 0 0; max-width: 64ch; color: var(--muted-foreground); font-size: 13px; line-height: 1.55; }
+.form-dialog-title { margin: 0; font-size: var(--text-title); font-weight: 600; line-height: 28px; letter-spacing: -.02em; }
+.form-dialog-description { margin: 4px 0 0; max-width: 64ch; color: var(--muted-foreground); font-size: var(--text-small); line-height: 1.55; }
 .form-dialog-close { flex: none; width: 44px; padding: 0; margin: -8px -8px -8px 0; }
 .form-dialog-body { min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 20px; }
 .form-dialog-body > .panel { padding: 0; border: 0; border-radius: 0; }
@@ -10,7 +10,7 @@
 .form-dialog-body :is(.finance-form-grid, .tenant-key-form) { row-gap: 16px; }
 .form-dialog-body form > :last-child { margin-bottom: 0; }
 @media (max-width: 599px) {
-  .form-dialog { width: calc(100vw - 24px); max-height: calc(100dvh - 24px); border-radius: 12px; }
+  .form-dialog { width: calc(100vw - 24px); max-height: calc(100dvh - 24px); border-radius: var(--r-field); }
   .form-dialog-heading, .form-dialog-body { padding: 16px; }
 }
 

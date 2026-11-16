@@ -127,7 +127,6 @@ export function Org({ member, status }: { member: SessionMember; status: TenantS
           <UsageRequestCard rows={rows} summary={summary} error={usageErr} rangeLabel={`${rangeLabel} · ${scopeLabel}`} number={3} className={span.d8} onRetry={retry} />
           <UsageCostCard rows={rows} summary={summary} error={usageErr} rangeLabel={`${rangeLabel} · ${scopeLabel}`} number={4} className={span.d4} onRetry={retry} />
           <OverviewBudgets number={5} budgets={budgets} error={budgetErr} balance={balance} balanceError={balanceErr} showBalance={access.billing} onRetry={retry} />
-          <UsageModelsCard rows={rows} summary={summary} error={usageErr} rangeLabel={`${rangeLabel} · ${scopeLabel}`} number={6} className={span.d3} onRetry={retry} />
         </>}
         <Card className={access.usage ? span.d4 : span.d6}>
           <CardHeader number={access.usage ? 7 : 1} title="组织资料" />
@@ -139,6 +138,7 @@ export function Org({ member, status }: { member: SessionMember; status: TenantS
             <Reading label="单个密钥的每分钟请求上限" value={cap(org.limits.key_rpm_max)} />
           </dl>}
         </Card>
+        {access.usage && <UsageModelsCard rows={rows} summary={summary} error={usageErr} rangeLabel={`${rangeLabel} · ${scopeLabel}`} number={6} className={span.d12} onRetry={retry} />}
       </BentoGrid>
     </>
   );
@@ -157,9 +157,9 @@ export function OverviewBudgets({ budgets, error, balance, balanceError, showBal
   const cash = balance === null ? null : exactOverviewAmount(balance, "balance_micro_cny");
   const credit = balance === null ? null : exactOverviewAmount(balance, "credit_limit_micro_cny");
   const shown = [...(budgets ?? [])].filter((budget) => budget.target_live).sort((a, b) => Number(b.exhausted) - Number(a.exhausted)).slice(0, 2);
-  return <Card className={span.d5}>
+  return <Card className={span.d8}>
     <CardHeader number={number} title={showBalance ? "账户与预算" : "我的预算"} actions={<a className="inline-flex min-h-11 items-center text-caption underline underline-offset-4" href="#budgets">全部预算</a>} />
-    {showBalance && <div className="mb-6">
+    {showBalance && <div className="overview-account-reading">
       <p className="text-caption text-muted">账户可用额度</p>
       {balanceError ? <CardMessage onRetry={onRetry}>{balanceError}</CardMessage> : balance === null ? <MetricSkeleton /> : <>
         <Metric size="value" className="mt-2 break-all">{available === null ? "未知" : fmtMicroCny(available)}</Metric>

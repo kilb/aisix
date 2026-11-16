@@ -12,7 +12,8 @@ import { Button } from "../ui/Button";
 import { CopyButton } from "../ui/CopyButton";
 import { EmptyState } from "../ui/EmptyState";
 import { RecordTablePager } from "../ui/RecordTable";
-import { PageHeader } from "./page";
+import { Card, CardHeader, PageHeader } from "./page";
+import { DataTable } from "../ui/DataTable";
 import { TrendChart } from "./charts";
 import "./DirectModelMonitoring.css";
 
@@ -34,22 +35,25 @@ function Outcome({ model }: { model: DirectModelMetricRow }) {
 
 function ModelRow({ model }: { model: DirectModelMetricRow }) {
   const [copyError, setCopyError] = useState<string | null>(null);
-  return <article className="direct-monitor-model" aria-label={model.model.name}>
-    <div className="direct-monitor-model-identity">
-      <h3>{model.model.name || "未命名直连模型"}</h3>
-      <div className="direct-monitor-model-id"><span title={model.model.id}>{model.model.id}</span><CopyButton text={model.model.id} label="复制 ID" size="sm" onFailed={cause => setCopyError(errorText(cause))} /></div>
-      <p>{model.provider_key.name || "上游账号名称未知"}</p>
-    </div>
-    {copyError && <p className="note crit" role="alert">复制失败：{copyError}；可选中模型 ID 复制。</p>}
-    <dl className="direct-monitor-row-values">
-      <div><dt>上游尝试</dt><dd>{formatCount(model.attempts)}</dd><span className="direct-monitor-samples">结果未知 {formatCount(model.unknown_outcome_attempts)}</span></div>
-      <div><dt>失败率</dt><dd><Outcome model={model} /></dd></div>
-      <div><dt>首 token 延迟 · P50</dt><dd>{formatDuration(model.first_token_latency_ms.p50)}</dd><span className="direct-monitor-samples">上游首帧 {formatDuration(model.upstream_ttft_ms.p50)}</span></div>
-      <div><dt>缓存 token 命中率</dt><dd>{formatRatio(model.tokens.cache_hit_rate)}</dd><span className="direct-monitor-samples">命中 {formatCount(model.tokens.cache_measured_hit_tokens)} / 已采样输入 {formatCount(model.tokens.cache_measured_input_tokens)}</span></div>
-      <div><dt>生成吞吐 · TPS</dt><dd>{formatTps(model.throughput_tps.avg)}</dd><Sample value={model.throughput_tps} /></div>
-    </dl>
-    <details className="direct-monitor-model-details">
-      <summary>样本与延迟明细<ChevronDown size={16} aria-hidden /></summary>
+  const [expanded, setExpanded] = useState(false);
+  const detailId = useId();
+  return <>
+    <tr className="direct-monitor-model" aria-label={model.model.name}>
+      <td><div className="direct-monitor-model-identity">
+        <h3>{model.model.name || "未命名直连模型"}</h3>
+        <div className="direct-monitor-model-id"><span title={model.model.id}>{model.model.id}</span><CopyButton text={model.model.id} label="复制 ID" size="sm" onFailed={cause => setCopyError(errorText(cause))} /></div>
+        <p>{model.provider_key.name || "上游账号名称未知"}</p>
+      </div></td>
+      <td className="num"><strong>{formatCount(model.attempts)}</strong><span className="direct-monitor-samples">结果未知 {formatCount(model.unknown_outcome_attempts)}</span></td>
+      <td className="num"><Outcome model={model} /></td>
+      <td className="num"><strong>{formatDuration(model.first_token_latency_ms.p50)}</strong><span className="direct-monitor-samples">上游首帧 {formatDuration(model.upstream_ttft_ms.p50)}</span></td>
+      <td className="num"><strong>{formatRatio(model.tokens.cache_hit_rate)}</strong><span className="direct-monitor-samples">命中 {formatCount(model.tokens.cache_measured_hit_tokens)} / 已采样输入 {formatCount(model.tokens.cache_measured_input_tokens)}</span></td>
+      <td className="num"><strong>{formatTps(model.throughput_tps.avg)}</strong><Sample value={model.throughput_tps} /></td>
+      <td className="right"><Button type="button" kind="quiet" size="sm" aria-expanded={expanded} aria-controls={detailId} onClick={() => setExpanded(value => !value)}>样本与延迟明细<ChevronDown size={16} aria-hidden /></Button></td>
+    </tr>
+    <tr className="dt-detail" hidden={!expanded && !copyError}><td colSpan={7}>
+      {copyError && <p className="note crit" role="alert">复制失败：{copyError}；可选中模型 ID 复制。</p>}
+      <div id={detailId} className="direct-monitor-model-details" role="region" aria-label={`${model.model.name}样本与延迟明细`} hidden={!expanded}>
       <dl>
         <div><dt>上游首帧延迟</dt><dd>P50 {formatDuration(model.upstream_ttft_ms.p50)} · P95 {formatDuration(model.upstream_ttft_ms.p95)} · P99 {formatDuration(model.upstream_ttft_ms.p99)}<Sample value={model.upstream_ttft_ms} /></dd></div>
         <div><dt>客户端首 token 延迟</dt><dd>P50 {formatDuration(model.first_token_latency_ms.p50)} · P95 {formatDuration(model.first_token_latency_ms.p95)}<Sample value={model.first_token_latency_ms} /></dd></div>
@@ -61,8 +65,9 @@ function ModelRow({ model }: { model: DirectModelMetricRow }) {
         <div><dt>缓存计数样本</dt><dd>已报告 {formatCount(model.tokens.cache_measured_attempts)} · 未报告 {formatCount(model.tokens.cache_missing_attempts)} · 全部输入 {formatCount(model.tokens.input_tokens)}</dd></div>
         <div><dt>上游账号 ID</dt><dd className="direct-monitor-identifier">{model.provider_key.id ?? "—"}</dd></div>
       </dl>
-    </details>
-  </article>;
+      </div>
+    </td></tr>
+  </>;
 }
 
 type RequestState = { key: string; data: DirectModelMetricsResponse | null; error: string | null };
@@ -137,13 +142,13 @@ export function DirectModelMonitoring() {
   ];
   return <div className="direct-model-monitoring">
     <PageHeader title="上游监测" description="按实际直连模型统计上游尝试；包含失败重试，区分上游首帧与客户端首 token 延迟。" actions={<Button kind="quiet" iconOnly aria-label="刷新上游监测" title="刷新上游监测" disabled={busy} onClick={() => setRevision(value => value + 1)}><RefreshCw size={16} aria-hidden /></Button>} />
-    <div className="direct-monitor-scope" aria-label="上游监测范围">
+    <Card className="direct-monitor-scope" aria-label="上游监测范围">
       <label><span>开始时间</span><input type="datetime-local" step="1" value={dateValue(from)} onChange={event => changeDate("from", event.target.value)} /></label>
       <label><span>结束时间</span><input type="datetime-local" step="1" value={dateValue(to)} onChange={event => changeDate("to", event.target.value)} /></label>
       <label><span>时间粒度</span><Select value={rawBucket} onValueChange={selectedValue => change({ bucket: selectedValue })}><option value="minute">每分钟</option><option value="hour">每小时</option><option value="day">每天</option></Select></label>
       <label><span>尝试结果</span><Select value={rawOutcome} onValueChange={selectedValue => change({ outcome: selectedValue })}><option value="">全部结果</option><option value="succeeded">成功</option><option value="failed">失败</option><option value="unknown">结果未知</option></Select></label>
       <ModelScopeFilters key={requestKey} request={request} onApply={change} />
-    </div>
+    </Card>
     {error ? <div className="note crit" role="alert">{error}{!rangeError && <Button kind="quiet" onClick={() => setRevision(value => value + 1)}>重试</Button>}</div> : busy ? <p role="status" className="direct-monitor-state">正在读取上游监测</p> : null}
     <div className="direct-monitor-kpis" aria-label="上游监测概览" aria-busy={busy || undefined}>
       <section><h2>上游尝试</h2><strong>{formatCount(totals?.attempts)}</strong><p>已排除 {formatCount(totals?.excluded_attempts)} · 派发未知 {formatCount(totals?.unmeasured_attempts)}</p></section>
@@ -153,16 +158,16 @@ export function DirectModelMonitoring() {
       <section><h2>生成吞吐 · TPS</h2><strong>{formatTps(totals?.throughput_tps.avg)}</strong><p>实测 {formatCount(totals?.throughput_tps.sample_count)} · 缺失 {formatCount(totals?.throughput_tps.missing_count)}</p></section>
     </div>
     {data && <p className="direct-monitor-window">{fmtBeijing(data.from)} — {fmtBeijing(data.to)}（UTC+8，结束时间不含）</p>}
-    <div className="direct-monitor-trends">{trends.map(trend => <section key={trend.title}><h2>{trend.title}</h2><TrendChart accessibleLabel={trend.title} points={trend.points} formatValue={trend.format} emptyLabel="当前范围没有实测数据" /></section>)}</div>
-    <section className="direct-monitor-catalogue" aria-labelledby={`${id}-models`}>
+    <div className="direct-monitor-trends">{trends.map(trend => <Card key={trend.title}><CardHeader title={trend.title} /><TrendChart accessibleLabel={trend.title} points={trend.points} formatValue={trend.format} emptyLabel="当前范围没有实测数据" /></Card>)}</div>
+    <Card className="direct-monitor-catalogue" aria-labelledby={`${id}-models`}>
       <div className="direct-monitor-list-toolbar"><h2 id={`${id}-models`}>直连模型<span>{formatCount(data ? models.length : null)} / {formatCount(data?.models.length)}</span></h2>
         <label className="direct-monitor-search"><Search size={16} aria-hidden /><span className="vh">搜索监测模型</span><input type="search" placeholder="搜索已加载模型或账号" value={search} onChange={event => setSearch(event.target.value)} /></label>
         <label><span className="vh">监测模型排序</span><Select aria-label="监测模型排序" value={order} onValueChange={selectedValue => setOrder(selectedValue)}><option value="name">按模型名称</option><option value="failure">失败率从高到低</option><option value="latency">首帧 P95 从高到低</option><option value="tps">TPS 从高到低</option></Select></label>
       </div>
       <p className="direct-monitor-list-note">搜索与排序只调整模型列表；概览和趋势仍使用完整筛选范围。</p>
-      {data && models.length === 0 ? <EmptyState text={search ? "没有匹配的模型，请调整搜索。" : "当前范围没有直连模型，请调整筛选。"} /> : table.rows.map(model => <ModelRow key={`${model.model.id}/${model.provider_key.id ?? ""}`} model={model} />)}
+      {data && models.length === 0 ? <EmptyState text={search ? "没有匹配的模型，请调整搜索。" : "当前范围没有直连模型，请调整筛选。"} /> : <DataTable label="直连模型监测" className="direct-monitor-table"><thead><tr><th>模型 / 上游账号</th><th className="num">上游尝试</th><th className="num">失败率</th><th className="num">首 token 延迟 · P50</th><th className="num">缓存 token 命中率</th><th className="num">生成吞吐 · TPS</th><th className="right">操作</th></tr></thead><tbody>{table.rows.map(model => <ModelRow key={`${model.model.id}/${model.provider_key.id ?? ""}`} model={model} />)}</tbody></DataTable>}
       {data && <RecordTablePager label="监测模型分页" page={table.page} pageSize={table.pageSize} total={table.filteredCount} onPageChange={table.setPage} onPageSizeChange={table.setPageSize} />}
-    </section>
+    </Card>
     <details className="direct-monitor-method"><summary>统计口径<ChevronDown size={16} aria-hidden /></summary><div>
       <p><ArrowUpRight size={16} aria-hidden />按实际直连目标和上游账号归属上游尝试，包含失败重试；与按最终请求统计的门户成功率不同。</p>
       <p>排除记录包括响应缓存命中、本地拒绝、后台任务的受理，以及查询、取消等对象管理请求；后台任务在最终结果确定后计入上游尝试，避免重复统计。</p>

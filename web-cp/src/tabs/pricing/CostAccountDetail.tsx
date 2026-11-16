@@ -129,7 +129,7 @@ export function CostAccountDetail({
           </Button>
         </div>
       )}
-      <BentoGrid className="mb-3">
+      <BentoGrid className="finance-overview">
         <Card className={span.d7}>
           <CardHeader number={1} title="账号服务模型 · 全部" />
           {rates ? <Metric size="hero">{fmtInt(rates.models.length)}</Metric> : error ? <CardMessage onRetry={() => void load()}>数据读取失败</CardMessage> : <MetricSkeleton />}

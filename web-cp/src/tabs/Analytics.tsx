@@ -22,7 +22,7 @@ export function Analytics(_props: TabProps) {
     const value = key === "from" ? from : key === "to" ? to : query.get(key);
     if (value) calls.set(key, value);
   }
-  return <div className="measurement-page">
+  return <div className="measurement-page analytics-page">
     <PageHeader title="用量分析" description="按完整时间范围统计，切换指标保留筛选。最多查询 92 天或 1500 个时间桶，超出范围请调整，不裁剪历史。" />
     <div className="metric-scope"><div className="metric-scope-controls">
       <label className="f filter"><span>开始时间</span><input type="datetime-local" step="1" value={dateValue(from)} onChange={e => changeDate("from", e.target.value)} /></label>

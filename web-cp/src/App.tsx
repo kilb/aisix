@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useState } from "react";
 import {
   ApiError,
   environment,
@@ -18,7 +18,7 @@ import {
 import { EXPECTED_API_CONTRACT } from "./lib/contract";
 import { errorText, fmtInt } from "./lib/fmt";
 import { useTheme } from "./lib/useTheme";
-import { AccountSettings } from "./components/AccountSettings";
+const AccountSettings = lazy(() => import("./components/AccountSettings").then(module => ({ default: module.AccountSettings })));
 import { Button } from "./ui/Button";
 import { Lamp, type LampState } from "./ui/Lamp";
 import { RouteNav } from "./ui/RouteNav";
@@ -43,24 +43,24 @@ import {
 } from "lucide-react";
 import { takeChargesFilter } from "./lib/pricingStatus";
 import { adminRouteOf, adminHash, canSeeAdminTab } from "./lib/navigation";
-import { Analytics } from "./tabs/Analytics";
-import { DirectModelMonitoring } from "./components/DirectModelMonitoring";
-import { Calls } from "./tabs/Calls";
-import { ModelTests } from "./tabs/ModelTests";
-import { PublicRoutes } from "./tabs/PublicRoutes";
+const Analytics = lazy(() => import("./tabs/Analytics").then(module => ({ default: module.Analytics })));
+const DirectModelMonitoring = lazy(() => import("./components/DirectModelMonitoring").then(module => ({ default: module.DirectModelMonitoring })));
+const Calls = lazy(() => import("./tabs/Calls").then(module => ({ default: module.Calls })));
+const ModelTests = lazy(() => import("./tabs/ModelTests").then(module => ({ default: module.ModelTests })));
+const PublicRoutes = lazy(() => import("./tabs/PublicRoutes").then(module => ({ default: module.PublicRoutes })));
 import { Gate } from "./Gate";
-import { Audit } from "./tabs/Audit";
-import { Cache } from "./tabs/Cache";
-import { Gateways } from "./tabs/Gateways";
-import { Keys } from "./tabs/Keys";
-import { Models } from "./tabs/Models";
-import { Billing } from "./tabs/Billing";
-import { Operators } from "./tabs/Operators";
-import { Overview } from "./tabs/Overview";
-import { Pricing } from "./tabs/Pricing";
-import { Providers } from "./tabs/Providers";
-import { Resources } from "./tabs/Resources";
-import { Tenants } from "./tabs/Tenants";
+const Audit = lazy(() => import("./tabs/Audit").then(module => ({ default: module.Audit })));
+const Cache = lazy(() => import("./tabs/Cache").then(module => ({ default: module.Cache })));
+const Gateways = lazy(() => import("./tabs/Gateways").then(module => ({ default: module.Gateways })));
+const Keys = lazy(() => import("./tabs/Keys").then(module => ({ default: module.Keys })));
+const Models = lazy(() => import("./tabs/Models").then(module => ({ default: module.Models })));
+const Billing = lazy(() => import("./tabs/Billing").then(module => ({ default: module.Billing })));
+const Operators = lazy(() => import("./tabs/Operators").then(module => ({ default: module.Operators })));
+const Overview = lazy(() => import("./tabs/Overview").then(module => ({ default: module.Overview })));
+const Pricing = lazy(() => import("./tabs/Pricing").then(module => ({ default: module.Pricing })));
+const Providers = lazy(() => import("./tabs/Providers").then(module => ({ default: module.Providers })));
+const Resources = lazy(() => import("./tabs/Resources").then(module => ({ default: module.Resources })));
+const Tenants = lazy(() => import("./tabs/Tenants").then(module => ({ default: module.Tenants })));
 
 const TABS = [
   { id: "overview", label: "概览", icon: LayoutDashboard, group: "运行" },
@@ -468,7 +468,7 @@ export function App() {
         </button>
       )}
       navigation={(close) => (
-        <RouteNav
+        <RouteNav docked
           items={visible.filter((item) => item.id !== "account")}
           current={current}
           attention={attention}
@@ -506,6 +506,7 @@ export function App() {
         {signOutError && <div className="note crit" role="alert">{signOutError}</div>}
         <main id="workspace-main" tabIndex={-1}>
           <section id={`tab-${current}`} role="region" aria-labelledby={`stop-${current}`}>
+            <Suspense fallback={<div className="boot" role="status">载入中…</div>}>
             {current === "account" ? <AccountSettings operator={operator} roleLabel={ROLE_LABEL[operator.role]} onSignOut={() => void signOut()} /> : <Page
               tab={current}
               operator={operator}
@@ -515,6 +516,7 @@ export function App() {
               initialSection={section}
               sectionVisit={sectionVisit}
             />}
+            </Suspense>
           </section>
         </main>
       </div>

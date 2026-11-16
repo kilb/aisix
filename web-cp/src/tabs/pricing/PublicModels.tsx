@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { TabProps } from "../../App";
 import { Trash2, Undo2 } from "lucide-react";
 import {
@@ -88,6 +88,12 @@ export function PublicModels({ canEdit, onGoto, initialSection, sectionVisit, re
   /** The refusal belongs on the name field: a live model already holds the name. */
   const [atName, setAtName] = useState(false);
   const [selected, setSelected] = useState<string | null>(initialSection ?? null);
+  // 同页切换详情也从标题开始；刷新数据不打断当前编辑位置。
+  useLayoutEffect(() => {
+    if (!selected) return;
+    window.scrollTo({ top: 0, left: 0, behavior: "instant" });
+    document.getElementById("workspace-main")?.focus({ preventScroll: true });
+  }, [selected]);
   useEffect(() => { setSelected(initialSection ?? null); }, [initialSection, sectionVisit]);
   const [name, setName] = useState("");
   const [creating, setCreating] = useState(false);
@@ -248,7 +254,7 @@ export function PublicModels({ canEdit, onGoto, initialSection, sectionVisit, re
 
 
   return (
-    <div className="public-models panel contents">
+    <div className="public-models contents">
       <PageHeader
         eyebrow="模型管理 / 公共模型与路由"
         title="公共模型与路由"
@@ -257,7 +263,7 @@ export function PublicModels({ canEdit, onGoto, initialSection, sectionVisit, re
           <><Button className="finance-icon-button" aria-label="刷新" title="刷新" type="button" icon="refresh" onClick={() => void load()}></Button>{canEdit && <Button kind="primary" icon="plus" aria-label="新建公共模型" disabled={writeGate.busy} onClick={() => setCreateOpen(true)}>新建公共模型</Button>}</>
         }
       />
-      <p className="mb-4 max-w-3xl text-caption text-muted">租户请求的模型名。标识只生成一次，授权、基准价和分组换算率都跟着它，所以名称不改、也不接管已有模型；显示名重复时请直接使用已有模型。</p>
+      <p className="mb-4 max-w-3xl text-caption text-fg-3">租户请求的模型名。标识只生成一次，授权、基准价和分组换算率都跟着它，所以名称不改、也不接管已有模型；显示名重复时请直接使用已有模型。</p>
       {error && (
         <div className="note crit mt-0" role="alert">
           读取失败：{error}
@@ -276,7 +282,7 @@ export function PublicModels({ canEdit, onGoto, initialSection, sectionVisit, re
           <div data-tone="warning"><dt>缺少分组换算率</dt><dd>{pricingCounts?.missing_rates ?? "—"}</dd></div>
           <div data-tone="warning"><dt>没有可用账号</dt><dd>{unavailable ? unavailable.length.toLocaleString("zh-CN") : "—"}</dd></div>
         </dl>
-        <p className="text-caption text-muted">{rows && live ? `全部 ${rows.length.toLocaleString("zh-CN")} 个 · 已停用 ${(rows.length - live.length).toLocaleString("zh-CN")} 个。` : "统计来自完整公共模型列表。"}无可用账号时请求会以 503 失败，进入模型详情可核对路由与账号映射。</p>
+        <p className="text-caption text-fg-3">{rows && live ? `全部 ${rows.length.toLocaleString("zh-CN")} 个 · 已停用 ${(rows.length - live.length).toLocaleString("zh-CN")} 个。` : "统计来自完整公共模型列表。"}无可用账号时请求会以 503 失败，进入模型详情可核对路由与账号映射。</p>
       </section>
       <FormDialog open={createOpen} onOpenChange={setCreateOpen} title="新建公共模型" description="设置租户调用的模型名称。创建后，在路由中添加服务账号。" busy={creating || writeGate.busy}>
               <form ref={form} aria-label="新建公共模型" onSubmit={(e) => void create(e)}>
@@ -338,7 +344,7 @@ export function PublicModels({ canEdit, onGoto, initialSection, sectionVisit, re
                           <span>{m.name}</span><span className="pm-model-id mono">{m.id}</span>
                         </button>
                       </td>
-                      <td data-label="服务账号" className={m.served_by.some((s) => s.enabled) ? undefined : "text-muted"}>{tiersOf(m)}</td>
+                      <td data-label="服务账号" className={m.served_by.some((s) => s.enabled) ? undefined : "text-fg-3"}>{tiersOf(m)}</td>
                       <td data-label="定价">
                         {retired ? (
                           "—"

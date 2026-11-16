@@ -6,7 +6,7 @@ export function GroupBadges({ groups, empty = "—" }: { groups: string[]; empty
   return (
     <span className="inline-flex max-w-full flex-wrap items-center gap-1 align-middle">
       {groups.map((g, i) => (
-        <span key={g} className="ops-group-badge tag gap-1.5 font-normal text-ink">
+        <span key={g} className="ops-group-badge tag gap-1.5 font-normal text-fg">
           {i > 0 && <span className="vh">、</span>}
           <span aria-hidden="true" className="size-1.5 shrink-0 rounded-full bg-graphite" />
           <span>{g}</span>

@@ -459,14 +459,14 @@ export function PublicRoutingForm({
       </section>
 
       <section className="ops-form-section pm-route-section @container" aria-label="路由目标">
-        <div className="pm-section-heading"><h3>路由目标 <span className="pm-section-count">{targets.length}</span></h3><span className="text-caption text-muted">按优先级从高到低使用</span></div>
+        <div className="pm-section-heading"><h3>路由目标 <span className="pm-section-count">{targets.length}</span></h3><span className="text-caption text-fg-3">按优先级从高到低使用</span></div>
         {targets.length === 0 && additions.length === 0 ? (
-          <p className="hint rounded-cell border border-dashed border-line px-4 py-6 text-center text-caption">
+          <p className="hint rounded-field border border-dashed border-hairline px-4 py-6 text-center text-caption">
             还没有账号服务这个模型：请求会以「上游不可用」失败。{!readOnly && "用下面的「添加目标」加一个账号。"}
           </p>
         ) : (
           <div className="ops-target-list pm-target-list">
-            <div aria-hidden="true" className={cn(TARGET_ROW, "hidden border-b border-line bg-well px-3 py-2 text-caption font-medium text-ink-soft @3xl:grid")}>
+            <div aria-hidden="true" className={cn(TARGET_ROW, "hidden border-b border-hairline bg-sunken px-3 py-2 text-caption font-medium text-fg-2 @3xl:grid")}>
               <span>账号</span>
               <span>上游模型名称</span>
               <span>优先级</span>
@@ -492,7 +492,7 @@ export function PublicRoutingForm({
                     heading={
                       <>
                         <div className="pm-target-account pt-2 font-medium @3xl:pt-1.5" title={accountName}>
-                          <span className="font-normal text-muted">账号：</span>
+                          <span className="font-normal text-fg-3">账号：</span>
                           {accountName}
                         </div>
                         <ServedGroups>{groupBadges(t.groups)}</ServedGroups>
@@ -513,7 +513,7 @@ export function PublicRoutingForm({
                       // reloads the targets behind this form, and the step has to
                       // survive the re-render that causes.
                       removing === accountId && (
-                        <div className="flex flex-wrap items-center justify-between gap-3 rounded-cell border border-line bg-well px-3 py-2.5">
+                        <div className="flex flex-wrap items-center justify-between gap-3 rounded-field border border-hairline bg-sunken px-3 py-2.5">
                           <p role="alert" className="min-w-0 flex-1 basis-64 text-caption">
                             移除后，账号「{accountName}」不再为「{publicModel.name}」提供服务，它对该模型的映射也会删除。
                           </p>
@@ -568,7 +568,7 @@ export function PublicRoutingForm({
                         </RowField>
                         {account && <ServedGroups className="mt-1.5">{groupBadges(account.doc.groups)}</ServedGroups>}
                         {disabledRows.has(a.accountId) && (
-                          <div className="sub mt-1 text-meta">该账号对这个模型的映射已停用，保存后重新启用。</div>
+                          <div className="sub mt-1 text-caption">该账号对这个模型的映射已停用，保存后重新启用。</div>
                         )}
                       </>
                     }
@@ -693,14 +693,14 @@ function TargetRow({
     .filter((m): m is string => typeof m === "string" && m !== "")
     .join("；");
   return (
-    <li className={cn(TARGET_ROW, "ops-target-row border-line p-3 not-last:border-b")} aria-label={label}>
+    <li className={cn(TARGET_ROW, "ops-target-row border-hairline p-3 not-last:border-b")} aria-label={label}>
       <div className="col-span-2 min-w-0 @md:col-start-1 @md:row-start-1 @3xl:col-span-1">
         {heading}
-        {written && <span className="tag mt-1.5 border-line bg-well text-ink">已保存</span>}
+        {written && <span className="tag mt-1.5 border-hairline bg-sunken text-fg">已保存</span>}
       </div>
       <div className="col-span-2 min-w-0 @md:col-span-1 @md:col-start-1 @md:row-start-2 @3xl:col-start-2 @3xl:row-start-1">
         <div className="flex flex-col gap-1.5">
-          <span className="text-caption font-medium text-muted @3xl:hidden">上游模型名称</span>
+          <span className="text-caption font-medium text-fg-3 @3xl:hidden">上游模型名称</span>
           <UpstreamModelPicker
             // Keyed by the account: a row that switches accounts is a
             // different model list, so nothing the first account answered

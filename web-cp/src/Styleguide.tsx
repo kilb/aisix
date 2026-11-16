@@ -413,7 +413,7 @@ export default function Styleguide() {
 
       <Row title="详情面板与分区导航">
         <div className="sg-nav">
-          <RouteNav
+          <RouteNav docked
             items={[
               { id: "a", label: "概览" },
               { id: "b", label: "租户" },
@@ -492,7 +492,7 @@ export default function Styleguide() {
         <ul className="sg-swatches">
           {SWATCHES.map(([token, name, role]) => (
             <li key={token}>
-              <span className="sg-chip" style={{ background: `var(${token})` }} />
+              <span className="sg-chip" style={{ "--swatch-color": `var(${token})` } as React.CSSProperties} />
               <b>{name}</b>
               <code>{token}</code>
               <span>{role}</span>

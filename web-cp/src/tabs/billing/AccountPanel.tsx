@@ -728,7 +728,7 @@ export function AccountPanel({
   }, [tenantId]);
   return (
     <SidePanel
-      title={<><span aria-hidden="true" className="mr-3 font-mono text-meta font-normal text-muted">04</span><span title={account.tenant_name}>{account.tenant_name}</span></>}
+      title={<span title={account.tenant_name}>{account.tenant_name}</span>}
       label={`租户计费：${account.tenant_name}`}
       extra={account.is_internal ? <span className="tag">平台内部</span> : undefined}
       onClose={onClose}

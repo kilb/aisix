@@ -1,8 +1,9 @@
 import "./operations.css";
+import "./Tenants.css";
 import { keySearchText } from "../lib/operationalRecords";
 import { useRecordTable } from "../lib/recordTable";
 import { RecordTools, RecordPager } from "../components/RecordTools";
-/** 布局：[01 全部 6][02 正常 6]；[默认配置 12]；[列表 12 / 打开详情时 6 + 6]。 */
+/** 租户列表通栏显示，详情与默认配置独立占据工作区。 */
 import { Fragment, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import type { TabProps } from "../App";
 import { ConflictNote } from "../components/ConflictNote";
@@ -32,8 +33,7 @@ import {
 import { messageFor } from "../lib/errors";
 import { generatedDirect } from "../lib/generatedDirect";
 import { errorText, fmtInt, fmtTime } from "../lib/fmt";
-import { BentoGrid, Card, CardFooter, CardHeader, CardMessage, ChartSkeleton, Metric, MetricSkeleton, PageHeader, span } from "../components/page";
-import { RankBars } from "../components/charts";
+import { Card, CardHeader, Metric, MetricSkeleton, PageHeader } from "../components/page";
 import { Button } from "../ui/Button";
 import { useRefusalFocus } from "../ui/Field";
 import { CopyButton } from "../ui/CopyButton";
@@ -346,6 +346,7 @@ export function Tenants({ operator, canEdit }: TabProps) {
   const [tick, setTick] = useState(0);
   const lifetime = useLifetime();
   const selectedRef = useRef(selected);
+  const tenantOpeners = useRef(new Map<string, HTMLButtonElement>());
   selectedRef.current = selected;
   const listSeq = useRef(0);
 
@@ -369,11 +370,6 @@ export function Tenants({ operator, canEdit }: TabProps) {
   const items = useMemo(() => (all === null ? null : filter ? all.filter((t) => t.status === filter) : all), [all, filter]);
   const count = (status: Tenant["status"]) => (all === null ? "—" : fmtInt(all.filter((t) => t.status === status).length));
   const table = useRecordTable({ items: items ?? [], searchText: (t) => [t.name, t.id], resetKey: filter });
-  const statusItems = all === null ? null : (["active", "pending", "suspended"] as const).map((status) => ({
-    label: STATUS_LABEL[status],
-    value: all.filter((tenant) => tenant.status === status).length,
-    displayValue: count(status),
-  })).sort((a, b) => b.value - a.value);
 
   // A view replaces the one shown unless it is older: a read that raced a write.
   const applyView = useCallback((view: Tenant) => {
@@ -425,6 +421,13 @@ export function Tenants({ operator, canEdit }: TabProps) {
     setTick((n) => n + 1);
   }
 
+  function closeDetail() {
+    const id = selectedRef.current;
+    setSelected(null);
+    // 列表重新挂载后将焦点交还给打开详情的租户。
+    requestAnimationFrame(() => { if (id) tenantOpeners.current.get(id)?.focus(); });
+  }
+
   async function act(t: Tenant, run: (id: string) => Promise<Tenant>) {
     setActing(t.id);
     setRowError(null);
@@ -441,60 +444,55 @@ export function Tenants({ operator, canEdit }: TabProps) {
 
   return (
     <div className="cp-operations cp-tenants">
-      {/* 桌面与平板：6 + 6；列表和默认配置占 12，详情打开后 6 + 6。 */}
+      {/* 编辑状态独立显示，避免概览和列表分散当前操作。 */}
       <PageHeader
-        title="租户"
+        title={selected ? detail?.name ?? "租户详情" : showDefaults ? "新租户默认值" : "租户"}
         eyebrow="客户管理"
-        dataLead={listError ? "租户列表读取失败；已有统计保留最近成功读取的值。" : all === null ? "读取租户的当前状态与授权范围。" : `当前共有 ${fmtInt(all.length)} 个租户，${count("pending")} 个待审核；下方筛选不改变总览统计。`}
+        dataLead={selected ? "管理模型授权、可用分组、限额与成员。" : showDefaults ? "设置之后创建的租户使用的初始限额与分组。" : listError ? "租户列表读取失败；已有统计保留最近成功读取的值。" : all === null ? "读取租户的当前状态与授权范围。" : `当前共有 ${fmtInt(all.length)} 个租户，${count("pending")} 个待审核。`}
         description="客户经租户门户自助注册后在这里审核；批准前它不能自行创建密钥，名下的密钥也都不可用。停用租户会让它的全部密钥立即失效，恢复后重新可用。"
         actions={
           <>
             <Button type="button" icon="refresh" onClick={refreshAll}>
               刷新
             </Button>
-            {operator.role === "admin" && (
+            {selected && <Button type="button" onClick={closeDetail}>返回租户列表</Button>}
+            {!selected && operator.role === "admin" && (
               <Button type="button" aria-expanded={showDefaults} onClick={() => setShowDefaults((open) => !open)}>
-                新租户默认值
+                {showDefaults ? "返回租户列表" : "新租户默认值"}
               </Button>
             )}
           </>
         }
       />
 
-      <BentoGrid className="mb-3" aria-label="租户当前概况">
-        <Card className={`${span.d6} ops-snapshot`}>
-          <CardHeader number={1} title="全部租户" description={listError ? "刷新失败，保留最近成功读取的完整列表" : "完整列表的当前快照"} />
-          {all === null && !listError ? <MetricSkeleton /> : <Metric size="hero">{all === null ? "—" : fmtInt(all.length)}</Metric>}
-          <CardFooter>
-            {statusItems === null ? (listError ? <CardMessage onRetry={() => void loadList()}>租户统计读取失败。</CardMessage> : <ChartSkeleton />) : (
-              <RankBars items={statusItems} accessibleLabel={`全部 ${fmtInt(all?.length ?? 0)} 个租户中，正常 ${count("active")} 个，待审核 ${count("pending")} 个，已停用 ${count("suspended")} 个。`} emptyLabel="当前没有租户。" />
-            )}
-          </CardFooter>
-        </Card>
-        <Card className={`${span.d6} ops-snapshot`}>
-          <CardHeader number={2} title="正常租户" description={listError ? "读取失败；已有值来自最近成功读取" : "正常状态仍受模型授权、分组与账务限制"} />
-          {all === null && !listError ? <MetricSkeleton /> : <Metric size="display">{count("active")}</Metric>}
-          <CardFooter>
-            <dl className="grid grid-cols-2 gap-6 border-t border-line pt-5">
-              <div><dt className="text-caption text-muted">待审核</dt><dd className="mt-2"><Metric size="value">{count("pending")}</Metric></dd></div>
-              <div><dt className="text-caption text-muted">已停用</dt><dd className="mt-2"><Metric size="value">{count("suspended")}</Metric></dd></div>
-            </dl>
-          </CardFooter>
-        </Card>
-      </BentoGrid>
+      {!selected && !showDefaults && (
+        <section className="tenant-stats" aria-label="租户当前概况">
+          {([
+            ["全部租户", all === null ? "—" : fmtInt(all.length)],
+            ["正常租户", count("active")],
+            ["待审核", count("pending")],
+            ["已停用", count("suspended")],
+          ] as const).map(([label, value]) => (
+            <Card key={label} className="tenant-stat">
+              <CardHeader title={label} />
+              {all === null && !listError ? <MetricSkeleton /> : <Metric size="value">{value}</Metric>}
+            </Card>
+          ))}
+        </section>
+      )}
 
       {showDefaults && operator.role === "admin" && <DefaultsPanel number={3} />}
 
-      <div className={detail ? SIDE_OPEN : "with-side"}>
-        <div className="side-main min-w-0">
+      <div className="tenant-workspace">
+        {!selected && !showDefaults && <div className="side-main min-w-0">
           <Card className="mb-0">
             <CardHeader
               number={showDefaults && operator.role === "admin" ? 4 : 3}
-              description="客户经租户门户自助注册后在这里审核；批准前不能自行创建密钥，名下的密钥也不可用。停用会使该租户的全部密钥立即失效，恢复后重新可用。"
+              description="选择租户查看授权、分组、限额与成员。"
               title={
                 <>
                   租户列表
-                  {items !== null && <span className="tag ml-2 align-[2px]">{fmtInt(items.length)}</span>}
+                  {items !== null && <span className="tag ml-2">{fmtInt(items.length)}</span>}
                 </>
               }
               actions={
@@ -542,6 +540,7 @@ export function Tenants({ operator, canEdit }: TabProps) {
                           <span className="flex min-w-0 items-center gap-2">
                             <button
                               type="button"
+                              ref={(node) => { if (node) tenantOpeners.current.set(t.id, node); else tenantOpeners.current.delete(t.id); }}
                               className="link-button tn-name"
                               title={t.name}
                               aria-expanded={selected === t.id}
@@ -555,7 +554,7 @@ export function Tenants({ operator, canEdit }: TabProps) {
                         <td>
                           <TenantStatus status={t.status} />
                         </td>
-                        <td className="side-opt text-text-2">{BILLING_LABEL[t.billing_mode] ?? t.billing_mode}</td>
+                        <td className="side-opt text-fg-2">{BILLING_LABEL[t.billing_mode] ?? t.billing_mode}</td>
                         <td className="side-opt"><dl className="ops-cell-facts"><div><dt>成员</dt><dd>{fmtInt(t.member_count)}</dd></div><div><dt>密钥</dt><dd>{fmtInt(t.key_count)}</dd></div></dl></td>
                         <td>
                           <RolloutBadge rollout={t.rollout} />
@@ -609,17 +608,15 @@ export function Tenants({ operator, canEdit }: TabProps) {
               </>
             )}
           </Card>
-
-          {selected && detailError && (
-            <div className="note crit" role="alert">
-              {detailError}{" "}
-              <Button type="button" size="sm" onClick={() => void loadDetail(selected)}>
-                重试
-              </Button>
-            </div>
-          )}
-        </div>
-        {detail && (
+        </div>}
+        {selected && detailError && (
+          <div className="note crit" role="alert">
+            {detailError}{" "}
+            <Button type="button" size="sm" onClick={() => void loadDetail(selected)}>重试</Button>
+          </div>
+        )}
+        {selected && !detail && !detailError && <Card aria-label="租户详情"><Loading /></Card>}
+        {selected && detail && (
           <TenantDetail
             key={detail.id}
             tenant={detail}
@@ -629,7 +626,7 @@ export function Tenants({ operator, canEdit }: TabProps) {
             onView={settle}
             onRefresh={() => void refresh(detail.id)}
             onReload={() => void loadDetail(detail.id)}
-            onClose={() => setSelected(null)}
+            onClose={closeDetail}
           />
         )}
       </div>
@@ -1476,7 +1473,7 @@ function MembersPart({
               {memberTable.rows.map((m) => (
                 <tr key={m.id}>
                   <td className="font-medium">{m.display_name || "—"}</td>
-                  <td className="text-text-2">{m.email}</td>
+                  <td className="text-fg-2">{m.email}</td>
                   <td>
                     <span className="tag">{ROLE_LABEL[m.role] ?? m.role}</span>
                   </td>
@@ -1705,7 +1702,7 @@ function KeysPart({
                     <td>
                       <code>{k.prefix}…</code>
                     </td>
-                    <td className="text-text-2">{ownerOf(k)}</td>
+                    <td className="text-fg-2">{ownerOf(k)}</td>
                     <td>
                       <KeyGroupCell k={k} />
                       <StrayNote k={k} tenant={tenant} />
@@ -1771,7 +1768,7 @@ export function KeyGroupCell({ k }: { k: AdminKey }) {
   if (k.group === null) return <span className="tn-note">未选分组</span>;
   const same = k.group.display_name === k.group.name;
   return (
-    <span className="grps grps-one">
+    <span className="key-group-cell">
       <GroupName name={same ? k.group.name : k.group.display_name} />
       {!same && <span className="tn-note">{k.group.name}</span>}
     </span>
@@ -1930,11 +1927,11 @@ function DefaultsForm({
 
   const whole = refused?.at.get("/default_provider_groups");
   return (
-    <section ref={panel} className="panel bento-card mb-3" aria-label="新租户默认值">
+    <section ref={panel} className="panel bento-card tenant-defaults" aria-label="新租户默认值">
       <CardHeader number={number} title="新租户默认值" description="新租户创建时复制这里的限额与默认分组；修改不影响已有租户。留空的限额表示不限。" />
-      <div className="grid items-start gap-x-8 gap-y-2 lg:grid-cols-2">
+      <div className="tenant-default-fields">
         <div className="min-w-0">
-          <h4 className="mb-3 text-caption font-medium text-muted">限额</h4>
+          <h4 className="mb-3 text-caption font-medium text-fg-3">限额</h4>
           <LimitInputs draft={draft} onChange={setDraft} disabled={false} errorFor={(field) => refused?.at.get(`/${field}`)} />
         </div>
         <fieldset className="tn-sub">

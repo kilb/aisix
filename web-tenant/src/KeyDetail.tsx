@@ -73,16 +73,16 @@ function KeyUsage({ keyId }: { keyId: string }) {
       {rangeError && <p className="note crit" role="alert">{rangeError}</p>}
     </Card>
     <ApiMetricsPanel scope="tenant" enabled={!rangeError} from={from} to={to} bucket="day" apiKeyId={keyId} refreshKey={refresh} className={span.d12} />
-    {!rangeError && <Card className={span.d12} aria-label="密钥计量明细">
+    {!rangeError && <Card padding="table" className={span.d12} aria-label="密钥计量明细">
       <CardHeader title="按日与模型的计量明细" description="按用量发生时间汇总，包含已计费重试及历史费用调整。缺失记录显示未知，不视为免费或零用量。" />
       {current?.error ? <CardMessage onRetry={() => setRefresh(value => value + 1)}>{current.error}</CardMessage> : current?.rows === null || !current ? <Loading /> : current.rows.length === 0 ? <CardMessage>所选范围内没有用量</CardMessage> : <DataTable label="密钥计量明细">
-        <thead><tr><th>日期</th><th>模型</th><th>调用尝试</th><th>已计价费用</th><th>计量维度</th></tr></thead>
+        <thead><tr><th>日期</th><th>模型</th><th className="num">调用尝试</th><th className="num">已计价费用</th><th>计量维度</th></tr></thead>
         <tbody>{table.rows.map((row, index) => {
           const amount = exactInteger(row.charged_micro_cny);
           const merged = row.model.id === null && row.model.name === "other";
           return <tr key={`${row.period_start}/${row.model.id ?? row.model.name}/${index}`}>
             <td data-label="日期">{merged ? "跨期合并" : periodLabel(row.period_start, "day")}</td><td data-label="模型">{merged ? "其他（合并记录）" : row.model.name || "未授权或未知模型"}</td>
-            <td data-label="调用尝试">{formatCount(row.requests)}</td><td data-label="已计价费用" className="tabular-nums">{amount === null ? "未知" : fmtMicroCny(amount)}{row.estimated_requests > 0 ? "（含估算）" : ""}</td>
+            <td className="num tabular" data-label="调用尝试">{formatCount(row.requests)}</td><td data-label="已计价费用" className="num tabular">{amount === null ? "未知" : fmtMicroCny(amount)}{row.estimated_requests > 0 ? "（含估算）" : ""}</td>
             <td data-label="计量维度"><KeyQuantities quantities={row.quantities} /></td>
           </tr>;
         })}</tbody>
@@ -166,7 +166,7 @@ export function KeyDetail({ keyId, onBack, member, status, onSelfChanged }: {
   return <>
     {header}
     {saved && <p className="note" role="status">密钥修改已保存</p>}
-    <Card className="mb-6" aria-label="密钥配置摘要">
+    <Card className="mb-4" aria-label="密钥配置摘要">
       <CardHeader title="密钥配置" />
       <dl className="compact-overview-facts">
         <div><dt>公开前缀</dt><dd><code>{key.prefix}</code></dd></div>

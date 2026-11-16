@@ -1,0 +1,1 @@
+{"extends":"./tsconfig.json","include":["e2e-real/key-mask-privacy.spec.ts","playwright.key-mask-real.config.ts"]}

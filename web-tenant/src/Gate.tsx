@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Activity, KeyRound, UsersRound } from "lucide-react";
 import { ApiError, MIN_PASSWORD_CHARS, acceptInvite, login, signup, type Session } from "./lib/api";
 import { formMessageFor, messageFor } from "./lib/errors";
 import type { Theme } from "./lib/useTheme";
@@ -6,6 +7,7 @@ import { Button } from "./ui/Button";
 import { Field } from "./ui/Field";
 import { RouteNav } from "./ui/RouteNav";
 import { ThemeToggle } from "./ui/ThemeToggle";
+import { Card } from "./components/page";
 
 type Mode = "login" | "signup";
 
@@ -164,25 +166,28 @@ export function Gate({
         <ThemeToggle theme={theme} onToggle={onToggleTheme} />
       </header>
       <main id="gate" className="gate-layout">
-        <section className="gate-introduction" aria-labelledby="gate-title">
+        <Card tone="lilac" className="gate-introduction" aria-labelledby="gate-title">
           <h1 id="gate-title">组织门户</h1>
           <p className="gate-lead">{introduction}</p>
           <dl className="gate-guide">
             <div>
+              <UsersRound aria-hidden="true" />
               <dt>组织与成员</dt>
               <dd>按角色管理访问，邀请成员或创建团队账号。</dd>
             </div>
             <div>
+              <Activity aria-hidden="true" />
               <dt>调用与费用</dt>
               <dd>查看调用记录、用量与计费明细。</dd>
             </div>
             <div>
+              <KeyRound aria-hidden="true" />
               <dt>密钥与额度</dt>
               <dd>设置密钥的模型范围，查看适用的预算限制。</dd>
             </div>
           </dl>
-        </section>
-        <section className="panel gate-panel" aria-labelledby="gate-form-title">
+        </Card>
+        <Card className="gate-panel" aria-labelledby="gate-form-title">
           <div className="gate-panel-heading">
             <h2 id="gate-form-title">{title}</h2>
           </div>
@@ -247,7 +252,7 @@ export function Gate({
               )}
             </>
           )}
-        </section>
+        </Card>
       </main>
     </div>
   );

@@ -436,7 +436,7 @@ export function ChannelModels({
         <div className="flex flex-wrap items-center gap-x-6 gap-y-3">
           <label className="relative block w-full sm:w-80">
             <span className="sr-only">搜索模型</span>
-            <Search aria-hidden className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted" />
+            <Search aria-hidden className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-fg-3" />
             <input className="pl-9" value={query} onChange={(e) => setQuery(e.target.value)} placeholder="按公共模型名称或上游名称筛选" />
           </label>
           <label className="ch-tick gap-2 text-caption">
@@ -473,7 +473,7 @@ export function ChannelModels({
                 const draft = drafts[row.public_model_id] ?? draftOf(row);
                 const model = modelOf.get(row.public_model_id);
                 return (
-                  <tr key={row.public_model_id} data-model={row.public_model_id} className={draft.served ? undefined : "text-muted"}>
+                  <tr key={row.public_model_id} data-model={row.public_model_id} className={draft.served ? undefined : "text-fg-3"}>
                     <td>
                       <label className="ch-tick">
                         <input
@@ -609,7 +609,7 @@ export function ChannelModels({
         )}
         {(rows !== null || !canEdit) && (
           // The save closes the card: what it will write on the left, the write on the right.
-          <div className="ch-save ops-form-footer -mx-[var(--pad)] -mb-[var(--pad)] mt-6 flex flex-wrap items-start justify-end gap-x-4 gap-y-2 rounded-b-card border-t border-line bg-well px-[var(--pad)] py-3 [&_.hint]:text-ink-soft">
+          <div className="ch-save ops-form-footer -mx-[var(--pad)] -mb-[var(--pad)] mt-6 flex flex-wrap items-start justify-end gap-x-4 gap-y-2 rounded-b-card border-t border-hairline bg-sunken px-[var(--pad)] py-3 [&_.hint]:text-fg-2">
             {canEdit ? (
               <>
                 {changed.length > 0 && <span className="hint mr-auto self-center text-caption">将保存 {changed.length} 个模型的改动。</span>}
@@ -661,7 +661,7 @@ export function ChannelModels({
           <div className="panel ch-create mb-0">
             <CardHeader number={7} title="新建公共模型" />
             <div className="flex items-start gap-3">
-              <span aria-hidden="true" className="grid size-11 shrink-0 place-items-center rounded-cell border border-line bg-well text-ink-soft">
+              <span aria-hidden="true" className="grid size-11 shrink-0 place-items-center rounded-field border border-hairline bg-sunken text-fg-2">
                 <Plus className="size-4" />
               </span>
               <p className="hint text-caption" data-dialog-focus tabIndex={-1}>上游有、公共模型还没有的名称可以在这里一并新建；价格仍然建在该公共模型上。</p>

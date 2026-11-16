@@ -27,7 +27,7 @@ export function RealtimeSipBindingForm({
   const path = realtimeSipWebhookPath(draft.routeId);
   const locked = disabled || !draft.enabled;
   return (
-    <fieldset className="tn-section mt-2 border-t border-line pt-5">
+    <fieldset className="tn-section mt-2 border-t border-hairline pt-5">
       <legend className="text-body font-semibold">Realtime SIP 来电</legend>
       <label className="flex items-center gap-2 text-caption">
         <input type="checkbox" checked={draft.enabled} disabled={disabled} onChange={(event) => onChange({ ...draft, enabled: event.target.checked })} />

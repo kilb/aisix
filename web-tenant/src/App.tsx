@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useState } from "react";
 import {
   ApiError,
   logout,
@@ -13,21 +13,23 @@ import { messageFor } from "./lib/errors";
 import { useTheme } from "./lib/useTheme";
 import { Button } from "./ui/Button";
 import { Activity, ChartNoAxesCombined, KeyRound, LayoutDashboard, Layers3, ReceiptText, UsersRound, Wallet, UserRound } from "lucide-react";
-import { AccountSettings } from "./AccountSettings";
 import { PORTAL_TABS as TABS, canSeePortalTab, portalRouteOf as routeOf, type PortalTabId } from "./lib/navigation";
 import { RouteNav } from "./ui/RouteNav";
 import { SidebarMenuButton, SidebarShell } from "./ui/Sidebar";
 import { ThemeToggle } from "./ui/ThemeToggle";
 import { Gate } from "./Gate";
-import { Keys } from "./Keys";
-import { KeyDetail } from "./KeyDetail";
-import { Members } from "./Members";
-import { MemberDetail } from "./MemberDetail";
 import { Org, ROLE_LABEL } from "./Org";
-import { Billing } from "./Billing";
-import { Budgets } from "./Budgets";
-import { Prices } from "./Prices";
-import { Usage } from "./Usage";
+
+// 业务页按实际导航加载，登录与概览不再下载全部管理表单。
+const AccountSettings = lazy(() => import("./AccountSettings").then((module) => ({ default: module.AccountSettings })));
+const Keys = lazy(() => import("./Keys").then((module) => ({ default: module.Keys })));
+const KeyDetail = lazy(() => import("./KeyDetail").then((module) => ({ default: module.KeyDetail })));
+const Members = lazy(() => import("./Members").then((module) => ({ default: module.Members })));
+const MemberDetail = lazy(() => import("./MemberDetail").then((module) => ({ default: module.MemberDetail })));
+const Billing = lazy(() => import("./Billing").then((module) => ({ default: module.Billing })));
+const Budgets = lazy(() => import("./Budgets").then((module) => ({ default: module.Budgets })));
+const Prices = lazy(() => import("./Prices").then((module) => ({ default: module.Prices })));
+const Usage = lazy(() => import("./Usage").then((module) => ({ default: module.Usage })));
 
 export type TabId = PortalTabId;
 
@@ -213,6 +215,7 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
 
   return (
     <SidebarShell
+      storageKey="aisix.tenant.sidebar.collapsed"
       label="组织门户导航"
       routeKey={`${tenant.id}:${current}:${priceGroup ?? ""}:${memberId ?? ""}:${keyId ?? ""}`}
       brand={
@@ -225,8 +228,11 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
       }
       context={
         <span className="tenant-context">
+          <span className="tenant-context-avatar" aria-hidden="true">{[...tenant.name][0] ?? "组"}</span>
+          <span className="tenant-context-copy">
           <span className="tenant-context-label">当前组织</span>
           <span className="org-name" title={tenant.name}>{tenant.name}</span>
+          </span>
         </span>
       }
       navigation={(close) => visible.length > 0 && (
@@ -255,8 +261,9 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
         <div className="shell-view-location">
           <SidebarMenuButton />
           <span className="shell-location-text">
-            <span className="shell-current-label">{TABS.find((item) => item.id === current)?.label}</span>
             <span className="shell-current-context" title={tenant.name}>{tenant.name}</span>
+            <span className="shell-location-divider" aria-hidden="true">/</span>
+            <span className="shell-current-label">{TABS.find((item) => item.id === current)?.label}</span>
           </span>
         </div>
         <div className="shell-user-tools">
@@ -283,6 +290,7 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
           role="region"
           aria-labelledby={visible.length > 0 ? `stop-${current}` : undefined}
         >
+          <Suspense fallback={<div className="min-h-16 text-caption text-muted" role="status">载入中…</div>}>
           {current === "account" ? (
             <AccountSettings member={member} onSignOut={() => void signOut()} />
           ) : current === "keys" ? (
@@ -301,6 +309,7 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
           ) : (
             <Org member={member} status={tenant.status} />
           )}
+          </Suspense>
         </section>
       </main>
     </SidebarShell>

@@ -304,7 +304,7 @@ export function Baselines({ canEdit, onGoto }: TabProps) {
           </Button>
         </div>
       )}
-      <Card className="mb-3" aria-label="基准价概况">
+      <Card className="finance-facts-card" aria-label="基准价概况">
         <dl className="compact-overview-facts">
           <div><dt>现行基准价覆盖</dt><dd>{rows === null ? "—" : `${priced.toLocaleString("zh-CN")} / ${rows.length.toLocaleString("zh-CN")}`}</dd></div>
           <div><dt>待处理 · 定价缺口</dt><dd>{rows === null ? "—" : unpriced.length.toLocaleString("zh-CN")}</dd></div>
@@ -314,9 +314,9 @@ export function Baselines({ canEdit, onGoto }: TabProps) {
         {rows !== null && <div className="pricing-tier-coverage" aria-label="现行基准价来源">{sources.map(({ kind, label }) => <span key={kind}>{label} <strong>{rows.filter((row) => row.current?.source_kind === kind).length.toLocaleString("zh-CN")}</strong></span>)}{unknownSources > 0 && <span>来源未知 <strong>{unknownSources.toLocaleString("zh-CN")}</strong></span>}</div>}
         {unpriced[0] && <div><Button type="button" onClick={() => setSelected(unpriced[0]!.model_id)}>查看首个未定价模型</Button></div>}
       </Card>
-      <div className={detail ? "with-side baseline-workspace is-open" : "with-side baseline-workspace"}>
+      <div className="finance-record-layout baseline-workspace">
         <div className="side-main min-w-0">
-          <Card className="mb-0">
+          <Card className="finance-table-card">
             <CardHeader number={3} title={<>模型{rows && <Count n={rows.length} />}</>} description="未定价模型优先。表格展示标准档输入与输出；选择模型查看所有价格维度、档位、来源与待生效版本。" />
             {rows === null ? (
               !error && <Loading />

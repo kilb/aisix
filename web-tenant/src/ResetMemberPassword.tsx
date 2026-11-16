@@ -44,7 +44,7 @@ export function ResetMemberPassword({ memberId, onClose, onSaved, onInactive }: 
   }
 
   return <FormDialog open onOpenChange={(open) => { if (!open) onClose(); }} busy={busy} title="重置密码" description="该成员的现有登录会话将结束。请通过安全渠道交付新密码。">
-    <form ref={form} className="grid gap-5" aria-label="重置密码" onSubmit={(event) => event.preventDefault()}>
+    <form ref={form} className="grid gap-4" aria-label="重置密码" onSubmit={(event) => event.preventDefault()}>
       <Field label="新密码" error={passwordError} hint={`至少 ${MIN_PASSWORD_CHARS} 个字符`}>{(aria) => <input type="password" autoComplete="new-password" required value={password} onChange={(event) => setPassword(event.target.value)} disabled={busy} {...aria} />}</Field>
       <Field label="再次输入新密码" error={confirmationError}>{(aria) => <input type="password" autoComplete="new-password" required value={confirmation} onChange={(event) => setConfirmation(event.target.value)} disabled={busy} {...aria} />}</Field>
       {error && <div className="note crit" role="alert">{error}</div>}

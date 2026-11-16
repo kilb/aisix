@@ -16,7 +16,7 @@ export function PageHeader({
   return (
     <header className={cn("page-header bento-page-header", className)}>
       <div className="min-w-0">
-        <h1 className="text-title font-semibold">{title}</h1>
+        <h1 className="text-display font-extrabold">{title}</h1>
         {(dataLead ?? description) != null && (
           <div className="bento-lead mt-1.5 text-lead font-normal text-ink-soft">{dataLead ?? description}</div>
         )}
@@ -43,24 +43,27 @@ export function BentoGrid({ className, ...props }: ComponentProps<"div">) {
   return <div {...props} className={cn("bento-grid grid grid-cols-12 gap-(--card-gap)", className)} />;
 }
 
-export function Card({ className, tone = "surface", ...props }: ComponentProps<"section"> & { tone?: "surface" | "inverse" }) {
-  return <section {...props} data-tone={tone} className={cn("panel bento-card", className)} />;
+export type CardTone = "surface" | "default" | "inverse" | "ink" | "lilac" | "lime";
+
+export function Card({ className, tone = "surface", padding = "md", ...props }: ComponentProps<"section"> & { tone?: CardTone; padding?: "md" | "sm" | "table" | "none" }) {
+  return <section {...props} data-tone={tone} data-padding={padding} className={cn("panel bento-card", className)} />;
 }
 
 export function CardHeader({
-  title, description, actions, className, as: Heading = "h2",
+  title, description, actions, className, id, as: Heading = "h2",
 }: {
   title: ReactNode;
   description?: ReactNode;
   actions?: ReactNode;
   className?: string;
+  id?: string;
   number?: number;
   as?: "h2" | "h3";
 }) {
   return (
     <div className={cn("bento-card-header flex flex-wrap items-center justify-between gap-x-4 gap-y-2", className)}>
       <div className="min-w-0">
-        <Heading className={cn("flex items-baseline gap-2 font-semibold text-foreground", Heading === "h3" ? "text-[15px] leading-6" : "text-stat")}>
+        <Heading id={id} className="flex items-baseline gap-2 text-title font-bold text-foreground">
           <span>{title}</span>
         </Heading>
         {description && <p className="mt-1.5 text-caption text-muted">{description}</p>}
@@ -79,7 +82,7 @@ const metricSize = { hero: "text-hero", display: "text-display", figure: "text-f
 
 /** 不解析或缩写金额；调用方传入精确 formatter 的结果。 */
 export function Metric({ children, size = "value", className }: { children: ReactNode; size?: MetricSize; className?: string }) {
-  return <div className={cn("metric font-normal tabular-nums", metricSize[size], className)}>{children}</div>;
+  return <div className={cn("metric font-extrabold tabular-nums", metricSize[size], className)}>{children}</div>;
 }
 
 export function MetricSkeleton({ className, ...props }: ComponentProps<"div">) {
@@ -102,15 +105,15 @@ export function CardMessage({ children, onRetry }: { children: ReactNode; onRetr
 export function Split({ main, aside, className }: {
   main: ReactNode;
   aside?: ReactNode;
-  /** 兼容旧调用；详情宽度统一由 7+5 列网格决定，不再固定像素宽度。 */
+  /** 兼容旧调用；详情与列表均占满整行，不再固定像素宽度。 */
   asideWidth?: string;
   className?: string;
 }) {
   if (!aside) return <div className={className}>{main}</div>;
   return (
     <BentoGrid className={cn("bento-split items-start", className)}>
-      <div className={cn("min-w-0", span.d7)}>{main}</div>
-      <aside className={cn("min-w-0 desktop:sticky desktop:top-6", span.d5Wide)}>{aside}</aside>
+      <div className={cn("min-w-0", span.d12)}>{main}</div>
+      <aside className={cn("min-w-0", span.d12)}>{aside}</aside>
     </BentoGrid>
   );
 }

@@ -28,7 +28,7 @@ import { Field, useRefusalFocus } from "./ui/Field";
 import { Lamp } from "./ui/Lamp";
 import { useToast } from "./ui/Toast";
 import { TwoStep } from "./ui/TwoStep";
-import { BentoGrid, Card, CardFooter, CardHeader, CardMessage, Metric, PageHeader, span } from "./components/page";
+import { BentoGrid, Card, CardFooter, CardHeader, CardMessage, PageHeader, span } from "./components/page";
 import { BudgetProgress } from "./components/charts";
 import { exactInteger, exactRatio } from "./lib/chartFormat";
 import { cn } from "./lib/cn";
@@ -134,10 +134,10 @@ function powers(b: Budget, role: SessionMember["role"]): { edit: boolean; del: b
 // ── the page ────────────────────────────────────────────────────────────────
 
 /** A card that is a region named by its heading, its actions beside the heading. */
-function Section({ title, number, actions, children, className, tone }: { title: string; number: number; actions?: ReactNode; children: ReactNode; className?: string; tone?: "surface" | "inverse" }) {
+function Section({ title, number, actions, children, className = span.d12, tone, table = false }: { title: string; number: number; actions?: ReactNode; children: ReactNode; className?: string; tone?: "surface" | "inverse" | "ink"; table?: boolean }) {
   return (
-    <Card role="region" aria-label={title} className={className} tone={tone}>
-      <CardHeader number={number} title={title} actions={actions} />
+    <Card role="region" aria-label={title} className={className} tone={tone} padding={table ? "table" : "md"}>
+      <CardHeader number={number} title={title} actions={actions} className={table ? "px-3" : undefined} />
       {children}
     </Card>
   );
@@ -253,35 +253,37 @@ export function Budgets({ member }: { member: SessionMember }) {
 
   return (
     <>
-      <PageHeader actions={creator && !rowsErr && <Button kind="primary" icon="plus" onClick={() => setCreateOpen(true)}>新建额度</Button>} title="预算" eyebrow="BUDGETS · 分级额度" dataLead="账户额度与组织、成员、密钥预算独立生效。多条限制同时存在时，以先用尽者为准。周期按 UTC 边界结算，时间显示采用 UTC+8。" />
+      <PageHeader actions={creator && !rowsErr && <Button kind="primary" icon="plus" onClick={() => setCreateOpen(true)}>新建额度</Button>} title="预算" dataLead="账户、组织、成员和密钥预算独立生效，以先用尽者为准。" description="周期按 UTC 边界结算，时间显示采用 UTC+8。" />
       <BentoGrid className="tenant-budgets">
         {rowsErr && <div className={cn(span.d12, "note crit")} role="alert">预算读取失败：{rowsErr}</div>}
         {financial && <>
-          <Section number={1} title="账户额度" className={span.d8} actions={<a className="inline-flex min-h-11 items-center text-body" href="#billing">查看账户 ↗</a>}>
+          <Section number={1} title="账户额度" tone="ink" actions={<a className="inline-flex min-h-11 items-center rounded-full bg-tint px-4 text-small text-fg" href="#billing">查看账户</a>}>
             {balanceErr ? <div role="alert"><CardMessage>账户额度读取失败：{balanceErr}</CardMessage></div> : balance === null ? <Loading /> : <>
               <BudgetAccountAmounts balance={balance} />
               {balance.exhausted && <div className="note warn">{balance.billing_mode === "postpaid" ? "账户已达信用额度" : "账户余额不足"}</div>}
             </>}
-            <CardFooter className="border-t border-ink/7 pt-4 text-caption text-muted">账户额度与额外预算上限分别生效；调用仍受组织、成员、密钥预算及其他限制约束。</CardFooter>
+            <CardFooter className="border-t border-hairline pt-4 text-caption text-fg-3">账户额度与额外预算上限分别生效；调用仍受组织、成员、密钥预算及其他限制约束。</CardFooter>
           </Section>
-          <Section number={2} title="组织预算（平台设置）" className={cn(span.d4, "tablet:col-span-12")}>
-            {rows !== null && !rowsErr && <><Metric size="display">{team.length.toLocaleString("en-US")}</Metric><p className="text-caption text-muted">条额外组织预算</p></>}
-            <p className="text-caption text-muted">平台可额外设置按周期或一次性的组织预算上限，与账户余额和信用额度不同。</p>
+          <Section number={2} title="组织预算（平台设置）" table>
+            <p className="px-3 text-caption text-fg-3">{rows !== null && !rowsErr ? `${team.length.toLocaleString("en-US")} 条额外组织预算。` : ""}平台设置的周期或一次性预算，与账户余额和信用额度分别约束调用。</p>
             {!rowsErr && <QuotaTable label="组织额度" rows={rows === null ? null : team} empty="未设置额外组织预算上限" role={role} parentsOf={() => []} onChanged={reload} />}
           </Section>
         </>}
-        <Section number={financial ? 3 : 1} title="成员额度" className={span.d12}>
-          <p className="text-caption text-muted">{manager || role === "billing" ? "组织中每个成员的独立额度" : "分配给我的成员额度"}；进度仅比较每条预算自身的已用与限额，不合并不同周期。</p>
+        <Section number={financial ? 3 : 1} title="成员额度" table>
+          <p className="px-3 text-caption text-fg-3">{manager || role === "billing" ? "组织中每个成员的独立额度" : "分配给我的成员额度"}；进度仅比较每条预算自身的已用与限额，不合并不同周期。</p>
           {!rowsErr && <QuotaTable label="成员额度" rows={rows === null ? null : memberRows}
             empty={manager ? "还没有成员额度，可在「新建额度」中新建" : role === "billing" ? "还没有成员额度" : "还没有给你设置成员额度"}
             role={role} parentsOf={() => team.map(termsOf)} onChanged={reload} />}
         </Section>
         {creator && !rowsErr && <FormDialog open={createOpen} onOpenChange={setCreateOpen} busy={createBusy} title="新建额度" description="为成员或密钥设置预算上限；组织、账户和已有额度仍然独立生效。"><CreateForm number={financial ? 4 : 2} role={role} keys={keys} people={people} team={team} quotas={quotas} onTargetKey={setFormKey} onBusyChange={setCreateBusy} onCreated={() => { setCreateOpen(false); reload(); }} /></FormDialog>}
-        <Section number={financial ? creator && !rowsErr ? 5 : 4 : creator && !rowsErr ? 3 : 2} title="密钥额度" className={span.d12}
+        <Section number={financial ? 4 : 2} title="密钥实际可用" table
           actions={<Button size="sm" icon="refresh" busy={reloading} busyLabel="刷新中…" onClick={reload}>刷新</Button>}>
-          <p className="text-caption text-muted">实际可用额度取账户与各级预算的最小剩余值；未设置限额时显示“不限”。仅为当前页密钥读取实际可用额度，未读取的值保持未知。</p>
+          <p className="px-3 text-caption text-fg-3">账户与各级预算的最小剩余值决定实际可用额度；无限额显示“不限”，未读取的值保持未知。</p>
           {quotaErr && <div className="note crit" role="alert">{quotaErr}</div>}
           <KeyFigures keys={keys} rows={keyRows} quotas={quotas} onVisibleKeys={setVisibleKeys} />
+        </Section>
+        <Section number={financial ? 5 : 3} title="密钥额度" table>
+          <p className="px-3 text-caption text-fg-3">每条密钥预算分别生效，剩余额度不会相加。</p>
           {!rowsErr && <QuotaTable label="密钥额度" rows={rows === null ? null : keyRows}
             empty={creator ? "还没有密钥额度，可在「新建额度」中新建" : "还没有密钥额度"}
             role={role} parentsOf={(b) => keyParents(quotas[b.target.id])} onVisibleKeys={setVisibleBudgetKeys} onChanged={reload} />}
@@ -314,7 +316,8 @@ function KeyFigures({
   return (
     <>
     <RecordTableToolbar search={{ value: table.query, onChange: table.setQuery, label: "搜索实际可用密钥", placeholder: "密钥名称" }} />
-    <DataTable label="密钥实际可用">
+    <DataTable label="密钥实际可用" tableClassName="table-fixed min-w-[34rem]">
+      <colgroup><col /><col className="w-48" /><col className="w-36" /></colgroup>
       <thead>
         <tr>
           <th>密钥</th>
@@ -382,7 +385,8 @@ function QuotaTable({
       <Field label={`${label}周期`}><Select value={kindFilter} onValueChange={(selectedValue) => setKindFilter(selectedValue)}><option value="">全部周期</option><option value="day">每天</option><option value="week">每周</option><option value="month">每月</option><option value="cumulative">一次性额度</option></Select></Field>
       <Field label={`${label}状态`}><Select value={stateFilter} onValueChange={(selectedValue) => setStateFilter(selectedValue)}><option value="">全部状态</option><option value="ok">正常</option><option value="exhausted">已用尽</option></Select></Field>
     </RecordTableToolbar>
-    <DataTable label={label}>
+    <DataTable label={label} tableClassName="table-fixed min-w-[70rem]">
+      <colgroup><col /><col className="w-24" /><col className="w-24" /><col className="w-40" /><col className="w-28" /><col className="w-28" /><col className="w-28" /><col className="w-24" /><col className="w-36" /></colgroup>
       <thead>
         <tr>
           <th>对象</th>
@@ -514,7 +518,7 @@ function QuotaRow({
           <span className="acts">
             {editing ? (
               <>
-                <Button size="sm" kind="primary" busy={acting === "save"} busyLabel="保存中…" onClick={() => void save()}>
+                <Button size="sm" kind="secondary" busy={acting === "save"} busyLabel="保存中…" onClick={() => void save()}>
                   保存
                 </Button>
                 <Button

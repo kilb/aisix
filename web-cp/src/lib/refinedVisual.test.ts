@@ -5,44 +5,55 @@ import { readTokens } from "./contrast.ts";
 
 const source = (file: string): string => readFileSync(new URL(`../${file}`, import.meta.url), "utf8");
 
-// 约束令牌与布局声明；真实渲染、焦点和横滚由真实后端 E2E 验收。
-test("refined 使用冷灰画布、白色面板、蓝色交互与青色强调", () => {
-  const tokens = readTokens(source("theme/tokens.css"), "light");
+// 用户指定模板后，旧蓝色方案的断言改为精确约束模板颜色与组件层级。
+function templatePalette(css: string): void {
+  const tokens = readTokens(css, "light");
   for (const [name, value] of Object.entries({
-    "--background": "#F4F7FB", "--card": "#FFFFFF", "--well": "#EDF3F9",
-    "--foreground": "#17243A", "--muted-foreground": "#5D6D83", "--bento-accent": "#0891B2",
-    "--primary": "#2563EB", "--link": "#2563EB", "--ring": "#2563EB",
-  })) assert.equal(tokens[name], value, name);
+    "--background": "#f3f2ee", "--card": "#ffffff", "--foreground": "#111110",
+    "--lilac": "#e3d0ff", "--lime": "#d5f95f", "--primary": "#111110",
+  })) assert.equal(tokens[name]?.toLowerCase(), value, name);
+  assert.equal(tokens["--card-gap"], "16px");
+  assert.equal(tokens["--r-card"], "28px");
   assert.equal(tokens["--h-control"], "40px");
-  assert.equal(tokens["--shadow-float"], "none");
+  assert.ok(tokens["--shadow-float"], "浮层阴影必须显式存在");
+  assert.notEqual(tokens["--shadow-float"], "none");
+  assert.match(tokens["--font-sans"] ?? "", /Manrope/);
+}
+
+test("template 使用暖白画布、墨黑交互与丁香紫青柠强调", () => {
+  const css = source("theme/tokens.css");
+  templatePalette(css);
+  const mutated = css.replace(/#f3f2ee/i, "#000000");
+  assert.notEqual(mutated, css, "画布 token 必须存在才能执行反例");
+  assert.throws(() => templatePalette(mutated), /--background/);
 });
 
-test("refined 桌面侧栏留出四周空间，抽屉保留独立宽度和高度", () => {
+test("template 悬浮侧栏保留16px间距，可收起为100px外侧轨道", () => {
   const css = source("ui/Sidebar.css");
   const shell = /\.sidebar-shell\s*\{([^}]+)\}/.exec(css)?.[1] ?? "";
   const sidebar = /\.shell-sidebar\s*\{([^}]+)\}/.exec(css)?.[1] ?? "";
   const drawer = /\.shell-drawer\s*\{([^}]+)\}/.exec(css)?.[1] ?? "";
-  assert.match(shell, /grid-template-columns:\s*224px minmax\(0, 1fr\)/);
-  assert.match(shell, /padding:\s*24px/);
-  assert.match(shell, /gap:\s*24px/);
-  assert.match(sidebar, /top:\s*24px/);
-  assert.match(sidebar, /height:\s*calc\(100dvh - 48px\)/);
-  assert.match(sidebar, /border-radius:\s*var\(--r-rail\)/);
+  assert.match(shell, /grid-template-columns:\s*236px minmax\(0, 1fr\)/);
+  assert.match(shell, /padding:\s*16px/);
+  assert.match(shell, /gap:\s*16px/);
+  assert.match(sidebar, /top:\s*16px/);
+  assert.match(sidebar, /height:\s*calc\(100dvh - 32px\)/);
+  assert.match(sidebar, /border-radius:\s*var\(--r-card\)/);
+  assert.match(css, /\[data-collapsed="true"\]\s*\{\s*grid-template-columns:\s*68px minmax\(0, 1fr\)/);
   assert.match(drawer, /height:\s*calc\(100dvh - 32px\)/);
   assert.match(drawer, /width:\s*min\(288px, calc\(100vw - 32px\)\)/);
 });
 
-test("refined 数字使用400字重且旧样式不得将其改回500", () => {
-  assert.match(source("components/page.tsx"), /metric font-normal tabular-nums/);
-  for (const file of ["styles.css", "ui/ui.css"])
-    assert.doesNotMatch(source(file), /\.metric\s*\{[^}]*font-weight:\s*(?:500|600|700)/);
-  const tokens = readTokens(source("theme/tokens.css"), "light");
-  for (const name of ["--type-hero", "--type-display", "--type-figure", "--type-value"])
-    assert.ok(parseInt(tokens[name] ?? "0") >= 28 && parseInt(tokens[name] ?? "0") <= 36, name);
+test("template 页面与指标使用粗体层级，卡片语义覆盖三种强调色", () => {
+  const page = source("components/page.tsx");
+  assert.match(page, /metric[^"\n]*font-extrabold[^"\n]*tabular/);
+  for (const tone of ["lilac", "ink", "lime"]) assert.ok(page.includes(`"${tone}"`), tone);
+  assert.ok(page.includes('"table"'), "表格拥有独立内边距模式");
+  assert.doesNotMatch(page, /text-\[\d+(?:\.\d+)?(?:px|rem|em)\]/);
 });
 
-// 文件各自独立读取，任意一端单改都必须失败。
-test("refined 侧栏与页面原语在两端保持逐字节一致", () => {
+// 独立读取两份文件，任意一端单独修改都会使断言失败。
+test("template 侧栏与页面原语在两端保持逐字节一致", () => {
   for (const file of ["theme/tokens.css", "ui/Sidebar.css", "components/page.tsx", "ui/CONTRACT.md"])
     assert.equal(source(file), readFileSync(new URL(`../../../web-tenant/src/${file}`, import.meta.url), "utf8"), file);
 });

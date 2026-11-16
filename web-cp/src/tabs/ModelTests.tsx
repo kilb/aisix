@@ -1,4 +1,5 @@
 import "./operations.css";
+import "./ModelTests.css";
 import { useEffect, useState } from "react";
 import type { TabProps } from "../App";
 import { DirectModelProbe } from "../components/DirectModelProbe";
@@ -25,10 +26,10 @@ export function ModelTests({ operator, initialSection, sectionVisit, onGoto }: T
   }
   return <div className="cp-operations cp-modeltests">
     <PageHeader eyebrow="MODELS · 模型测试" title="模型测试" dataLead="显式发起直连测试，查看进度与已保存历史。测试可能产生上游费用。" />
-    <div className="mb-4 flex flex-wrap gap-2" role="tablist" aria-label="模型测试视图">
+    <div className="model-tests-tabs flex flex-wrap" role="tablist" aria-label="模型测试视图">
       {(["current", "history", "assessment"] as const).map((value) => <Button
         key={value} type="button" role="tab" id={`model-tests-${value}-tab`}
-        kind={section === value ? "primary" : "secondary"}
+        kind="quiet"
         aria-selected={section === value} aria-controls={`model-tests-${value}`}
         tabIndex={section === value ? 0 : -1}
         disabled={value === "assessment" && !canAssess}
@@ -45,7 +46,7 @@ export function ModelTests({ operator, initialSection, sectionVisit, onGoto }: T
         }}
       >{value === "current" ? "当前测试" : value === "history" ? "测试历史" : "能力对照"}</Button>)}
     </div>
-    {!canAssess && <p className="hint mb-4">能力对照的计划、运行、历史与导出仅管理员可用。</p>}
+    {!canAssess && <p className="hint">能力对照的计划、运行、历史与导出仅管理员可用。</p>}
     <div hidden={section === "assessment"}>
       <DirectModelProbe models={models.items} accounts={accounts.items} loadError={models.error !== null} canProbe={operator.role === "admin"} probe={probeDirectModel} section={section === "history" ? "history" : "current"} />
     </div>

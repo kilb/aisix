@@ -7,26 +7,26 @@ form.model-editor-form.panel > *,
 
 .model-editor-form,
 .cp-publicroutes .ops-routing-form {
-  --pad: 20px;
+  --pad: 24px;
 }
 
 .model-editor-form > .bento-card-header,
 .cp-publicroutes .ops-routing-form > .bento-card-header {
-  margin-bottom: 18px;
+  margin-bottom: 16px;
 }
 
 .model-editor-form .model-form-section,
 .cp-publicroutes .pm-route-section {
   margin: 0;
-  padding: 18px 0;
-  border-top: 1px solid var(--border);
+  padding: 16px 0;
+  border-top: 1px solid var(--color-hairline);
 }
 
 .model-editor-form .model-form-section > h3,
 .cp-publicroutes .pm-section-heading h3 {
   margin: 0 0 12px;
-  color: var(--foreground);
-  font-size: 14px;
+  color: var(--color-fg);
+  font-size: var(--text-body);
   font-weight: 600;
   line-height: 22px;
 }
@@ -35,7 +35,7 @@ form.model-editor-form.panel > *,
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   align-items: start;
-  gap: 12px 20px;
+  gap: 16px;
 }
 
 .model-upstream-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
@@ -47,13 +47,13 @@ form.model-editor-form.panel > *,
 .cp-publicroutes .pm-routing-settings .field,
 .cp-publicroutes .pm-routing-settings .f { margin-bottom: 0; }
 .model-account-groups { grid-column: 1 / -1; margin: 0; }
-.model-form-grid .hint { margin-top: 6px; font-size: 12px; line-height: 19px; }
+.model-form-grid .hint { margin-top: 6px; font-size: var(--text-caption); line-height: 19px; }
 .model-identity-grid > div > .hint { margin-bottom: 0; }
 
 .model-document-meta { display: grid; gap: 8px; margin: 0; padding-top: 2px; }
 .model-document-meta > div { display: flex; flex-wrap: wrap; gap: 4px 12px; }
-.model-document-meta dt { color: var(--muted-foreground); font-size: 12px; line-height: 20px; }
-.model-document-meta dd { min-width: 0; margin: 0; font-size: 12px; line-height: 20px; overflow-wrap: anywhere; }
+.model-document-meta dt { color: var(--color-fg-3); font-size: var(--text-caption); line-height: 20px; }
+.model-document-meta dd { min-width: 0; margin: 0; font-size: var(--text-caption); line-height: 20px; overflow-wrap: anywhere; }
 
 /* 冷却控件沿用原有输入与校验，作为目标的一行配置呈现。 */
 .model-cooldown > div,
@@ -61,7 +61,7 @@ form.model-editor-form.panel > *,
   display: grid;
   grid-template-columns: minmax(120px, .5fr) minmax(0, 1.5fr);
   align-items: start;
-  gap: 8px 20px;
+  gap: 12px 16px;
   padding: 0;
   border: 0;
   border-radius: 0;
@@ -83,67 +83,68 @@ form.model-editor-form.panel > *,
   width: fit-content;
   max-width: 100%;
   padding-block: 4px;
-  color: var(--muted-foreground);
-  font-size: 12px;
+  color: var(--color-fg-3);
+  font-size: var(--text-caption);
   line-height: 20px;
   cursor: pointer;
 }
 .model-cooldown summary:focus-visible,
-.cp-publicroutes summary:focus-visible { outline: 2px solid var(--ring); outline-offset: 3px; border-radius: 3px; }
+.cp-publicroutes summary:focus-visible { outline: 2px solid var(--ring); outline-offset: 3px; border-radius: var(--radius-field); }
 
 .model-editor-form .model-target-list,
 .cp-publicroutes .pm-target-list { border: 0; border-radius: 0; }
 .model-editor-form .model-target-list > [aria-hidden],
-.cp-publicroutes .pm-target-list > [aria-hidden] { padding-inline: 0; background: transparent; color: var(--muted-foreground); }
+.cp-publicroutes .pm-target-list > [aria-hidden] { padding-inline: 0; background: transparent; color: var(--color-fg-3); }
 .model-editor-form .model-target-list .ops-target-row,
-.cp-publicroutes .pm-target-list .ops-target-row { padding: 14px 0; border-color: var(--border); row-gap: 12px; }
+.cp-publicroutes .pm-target-list .ops-target-row { padding: 14px 0; border-color: var(--color-hairline); row-gap: 12px; }
 .cp-publicroutes .pm-target-account { overflow-wrap: anywhere; }
-.cp-publicroutes .pm-target-cooldown { padding-top: 10px; border-top: 1px dashed var(--border); }
+.cp-publicroutes .pm-target-cooldown { padding-top: 10px; border-top: 1px dashed var(--color-hairline); }
 .cp-publicroutes .pm-target-cooldown > div { grid-template-columns: minmax(120px, .4fr) minmax(0, 1.6fr); }
-.cp-publicroutes .pm-target-cooldown .hint { font-size: 12px; line-height: 19px; }
+.cp-publicroutes .pm-target-cooldown .hint { font-size: var(--text-caption); line-height: 19px; }
 
 form.model-editor-form > .model-form-footer,
 .cp-publicroutes form.ops-routing-form > .model-form-footer {
   min-height: 0;
   margin: 0;
   padding: 14px 0 0;
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--color-hairline);
   border-radius: 0;
   background: transparent;
 }
 
 /* 状态摘要占用一条信息带，主区留给模型和路由。 */
 .cp-publicroutes .public-model-overview {
-  margin: 0 0 18px;
-  padding: 14px 0;
-  border-block: 1px solid var(--border);
+  margin: 0;
+  padding: 0;
+  border: 0;
 }
 .cp-publicroutes .compact-overview-facts {
   display: grid;
   grid-template-columns: repeat(5, minmax(0, 1fr));
-  gap: 12px 20px;
-  margin: 0 0 10px;
+  gap: 16px;
+  margin: 0 0 12px;
 }
-.cp-publicroutes .compact-overview-facts > div { min-width: 0; }
-.cp-publicroutes .compact-overview-facts dt { color: var(--muted-foreground); font-size: 12px; line-height: 20px; }
-.cp-publicroutes .compact-overview-facts dd { margin: 2px 0 0; font-size: 22px; font-weight: 500; line-height: 30px; font-variant-numeric: tabular-nums; }
-.cp-publicroutes .compact-overview-facts [data-tone="success"] dd { color: var(--success); }
-.cp-publicroutes .compact-overview-facts [data-tone="warning"] dd { color: var(--warning); }
-.cp-publicroutes .public-model-overview > p { margin: 0; font-size: 12px; line-height: 20px; }
+.cp-publicroutes .compact-overview-facts > div { min-width: 0; padding: 18px; border-radius: var(--radius-card); background: var(--color-surface); box-shadow: var(--shadow-card); }
+.cp-publicroutes .compact-overview-facts dt { color: var(--color-fg-3); font-size: var(--text-caption); line-height: 20px; }
+.cp-publicroutes .compact-overview-facts dd { margin: 8px 0 0; font-size: var(--text-metric); font-weight: 800; line-height: 1.1; font-variant-numeric: tabular-nums; }
+.cp-publicroutes .compact-overview-facts [data-tone="success"] dd { color: var(--color-fg); }
+.cp-publicroutes .compact-overview-facts [data-tone="warning"] dd { color: var(--color-fg); }
+.cp-publicroutes .public-model-overview > p { margin: 0; font-size: var(--text-caption); line-height: 20px; }
 .cp-publicroutes .pm-list-section { gap: 14px; }
-.cp-publicroutes .pm-list-section > .bento-card-header h2 { font-size: 16px; line-height: 24px; }
+.cp-publicroutes .pm-list-section > .bento-card-header h2 { font-size: var(--text-title); line-height: 24px; }
 
 .cp-publicroutes .pm-pricing-state {
   display: inline-flex;
   align-items: center;
+  gap: 6px;
   padding: 2px 7px;
-  border-radius: 4px;
-  font-size: 12px;
+  border-radius: var(--r-round);
+  font-size: var(--text-caption);
   font-weight: 500;
   line-height: 20px;
 }
-.cp-publicroutes .pm-pricing-state[data-state="priced"] { color: var(--success); background: var(--success-soft); }
-.cp-publicroutes .pm-pricing-state[data-state="unpriced"] { color: var(--warning); background: var(--warning-soft); }
+.cp-publicroutes .pm-pricing-state[data-state="priced"] { color: var(--color-success-fg); background: var(--color-success-soft); }
+.cp-publicroutes .pm-pricing-state[data-state="unpriced"] { color: var(--color-warning-fg); background: var(--color-warning-soft); }
 .cp-publicroutes .pm-models-table th:first-child { width: 28%; }
 .cp-publicroutes .pm-models-table th:nth-child(2) { width: auto; }
 .cp-publicroutes .pm-models-table th:nth-child(3) { width: 8.5rem; }
@@ -152,24 +153,24 @@ form.model-editor-form > .model-form-footer,
 .cp-publicroutes .pm-models-table th:nth-child(6) { width: 5.5rem; }
 .cp-publicroutes .pm-models-table td { white-space: normal; overflow-wrap: anywhere; }
 
-.cp-publicroutes .pm-detail-overview { padding: 0 0 18px; margin-bottom: 18px; border-bottom: 1px solid var(--border); }
-.cp-publicroutes .pm-detail-identity { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 18px; margin-bottom: 16px; color: var(--muted-foreground); font-size: 12px; line-height: 20px; }
+.cp-publicroutes .pm-detail-overview { margin: 0; padding: 0; border: 0; }
+.cp-publicroutes .pm-detail-identity { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; margin: 0; color: var(--color-fg-3); font-size: var(--text-caption); line-height: 20px; }
 .cp-publicroutes .pm-detail-identity > span { min-width: 0; overflow-wrap: anywhere; }
-.cp-publicroutes .pm-detail-facts { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 12px 20px; margin: 0 0 10px; }
-.cp-publicroutes .pm-detail-facts dt { color: var(--muted-foreground); font-size: 12px; line-height: 20px; }
-.cp-publicroutes .pm-detail-facts dd { margin: 2px 0 0; color: var(--foreground); font-size: 22px; font-weight: 500; line-height: 30px; font-variant-numeric: tabular-nums; }
-.cp-publicroutes .pm-detail-overview > .hint { margin: 0; font-size: 12px; line-height: 20px; }
+.cp-publicroutes .pm-detail-facts { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 16px; margin: 0 0 12px; }
+.cp-publicroutes .pm-detail-facts dt { color: var(--color-fg-3); font-size: var(--text-caption); line-height: 20px; }
+.cp-publicroutes .pm-detail-facts dd { margin: 2px 0 0; color: var(--color-fg); font-size: var(--text-metric); font-weight: 800; line-height: 1.1; font-variant-numeric: tabular-nums; }
+.cp-publicroutes .pm-detail-overview > .hint { margin: 0; font-size: var(--text-caption); line-height: 20px; }
 .cp-publicroutes .pm-detail-overview > .note { margin: 12px 0 0; }
-.cp-publicroutes .pm-detail-workspace { display: grid; gap: 20px; min-width: 0; }
+.cp-publicroutes .pm-detail-workspace { display: grid; gap: 16px; min-width: 0; }
 .cp-publicroutes .pm-section-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 16px; margin-bottom: 10px; }
 .cp-publicroutes .pm-section-heading h3 { margin: 0; }
-.cp-publicroutes .pm-section-count { margin-left: 4px; color: var(--muted-foreground); font-size: 12px; font-weight: 400; font-variant-numeric: tabular-nums; }
+.cp-publicroutes .pm-section-count { margin-left: 4px; color: var(--color-fg-3); font-size: var(--text-caption); font-weight: 400; font-variant-numeric: tabular-nums; }
 .cp-publicroutes .pm-routing-explanation { margin: 0 0 12px; }
 .cp-publicroutes .pm-routing-explanation > div { padding: 8px 0; }
-.cp-publicroutes .pm-routing-settings { gap: 14px 20px; margin-bottom: 14px; }
-.cp-publicroutes .pm-routing-settings .hint { margin-top: 6px; font-size: 12px; line-height: 19px; }
-.cp-publicroutes .pm-maintenance-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 2fr); align-items: start; gap: 24px; }
-.cp-publicroutes .pm-maintenance-section { min-width: 0; padding-top: 16px; border-top: 1px solid var(--border); }
+.cp-publicroutes .pm-routing-settings { gap: 16px; margin-bottom: 14px; }
+.cp-publicroutes .pm-routing-settings .hint { margin-top: 6px; font-size: var(--text-caption); line-height: 19px; }
+.cp-publicroutes .pm-maintenance-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 2fr); align-items: start; gap: 16px; }
+.cp-publicroutes .pm-maintenance-section { min-width: 0; padding: 24px; border: 0; border-radius: var(--radius-card); background: var(--color-surface); box-shadow: var(--shadow-card); }
 .cp-publicroutes .pm-maintenance-section > .bento-card-header { margin-bottom: 12px; }
 .cp-publicroutes .pm-maintenance-section .library-one > h3 { display: none; }
 .cp-publicroutes .pm-maintenance-section .library-card-block { padding: 0; border-radius: 0; background: transparent; }
@@ -205,3 +206,17 @@ form.model-editor-form > .model-form-footer,
   .cp-publicroutes .pm-detail-identity { gap: 6px 12px; }
   .cp-publicroutes .pm-detail-identity > span:last-child { flex-basis: 100%; }
 }
+
+/* 列表和编辑保持同一套纵向节奏，编辑时只展开当前对象。 */
+.cp-models, .cp-publicroutes, .cp-publicroutes .public-model-detail { display: grid; min-width: 0; gap: 16px; }
+.cp-models > .page-header, .cp-publicroutes .page-header { margin: 0; }
+.cp-publicroutes .public-models > p { margin: 0; }
+.cp-publicroutes .pm-detail-meta { margin-top: 12px; font-size: var(--text-small); }
+.cp-publicroutes .pm-detail-meta > summary { width: fit-content; min-height: 40px; padding: 8px 12px; border-radius: var(--r-round); background: var(--color-sunken-strong); color: var(--color-fg-2); cursor: pointer; }
+.cp-publicroutes .pm-detail-meta .pm-detail-facts { margin-top: 16px; }
+.cp-publicroutes .pm-detail-meta > .hint { color: var(--color-fg-3); font-size: var(--text-caption); }
+.cp-publicroutes .pm-maintenance-section .library-one { margin: 0; }
+.cp-publicroutes .pm-pricing-state::before { content: ''; width: 6px; height: 6px; flex: none; border-radius: var(--r-round); background: currentColor; }
+.form-dialog .model-editor-form { --pad: 0px; padding: 0; border: 0; border-radius: 0; background: transparent; box-shadow: none; }
+.form-dialog .model-editor-form > .bento-card-header h2 { display: none; }
+@media (max-width: 719px) { .cp-publicroutes .pm-maintenance-section { padding: 16px; } }

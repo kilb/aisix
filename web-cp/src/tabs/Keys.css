@@ -1,0 +1,130 @@
+/* 密钥页以租户范围、紧凑指标和通栏列表组织工作区。 */
+.cp-keys {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+}
+.cp-keys > .page-header {
+  margin-bottom: 0;
+}
+.cp-keys .keys-scope-card {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 0;
+  padding-block: 18px;
+}
+.cp-keys .keys-scope-heading {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+.cp-keys .keys-scope-card .f {
+  margin: 0;
+}
+.cp-keys .keys-scope-card .note {
+  flex-basis: 100%;
+}
+.cp-keys .key-stats {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+.cp-keys .key-stat {
+  gap: 12px;
+  margin: 0;
+  padding: 18px;
+  border-radius: var(--radius-card);
+}
+.cp-keys .key-stat .bento-card-header {
+  margin-bottom: 0;
+}
+.cp-keys .key-stat .bento-card-header h2 {
+  color: var(--color-fg-3);
+  font-size: var(--text-small);
+  font-weight: 500;
+}
+.cp-keys .key-stat .metric {
+  font-size: var(--text-metric);
+  font-weight: 800;
+  line-height: 1.1;
+}
+.cp-keys .keys-workspace,
+.cp-keys .keys-list {
+  min-width: 0;
+  margin: 0;
+}
+.cp-keys .tn-override {
+  border: 0;
+  border-top: 1px solid var(--color-hairline);
+  border-radius: 0;
+  background: transparent;
+}
+/* 弹窗置于 Portal 内，以表单自身作用域保持字段与操作区的布局。 */
+.form-dialog:has(.key-create-form) {
+  width: min(880px, calc(100vw - 32px));
+}
+.key-create-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  min-width: 0;
+}
+.key-create-form > :is(.tn-field, .tn-limits, .note, .tn-foot, .gateway-too-old) {
+  grid-column: 1 / -1;
+}
+.key-create-form .f,
+.key-create-form .tn-field {
+  margin-bottom: 0;
+}
+.key-create-form .tn-field {
+  padding-top: 16px;
+  border-top: 1px solid var(--color-hairline);
+}
+.key-create-form .tn-field > legend {
+  margin-bottom: 8px;
+  font-size: var(--text-title);
+  font-weight: 700;
+}
+.key-create-form .tn-field > .hint {
+  margin-bottom: 12px;
+  color: var(--color-fg-3);
+  font-size: var(--text-small);
+}
+.key-create-form .tn-checks.tn-box {
+  grid-template-columns: repeat(auto-fit, minmax(min(180px, 100%), 1fr));
+  gap: 8px 16px;
+  border: 0;
+  border-radius: var(--radius-tile);
+  padding: 12px 16px;
+  background: var(--color-sunken);
+}
+.key-create-form .tn-foot {
+  gap: 8px;
+  margin: 0;
+  padding: 16px 0 0;
+  border-top: 1px solid var(--color-hairline);
+  background: transparent;
+}
+@media (min-width: 1024px) {
+  .cp-keys .key-stats {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+@media (max-width: 639px) {
+  .cp-keys .keys-scope-card {
+    align-items: stretch;
+  }
+  .cp-keys .keys-scope-card > div,
+  .cp-keys .keys-scope-card .f {
+    width: 100%;
+    min-width: 0;
+  }
+  .key-create-form {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

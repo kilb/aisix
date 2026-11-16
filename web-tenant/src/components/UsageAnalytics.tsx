@@ -49,8 +49,8 @@ export function UsageRequestCard({ rows, summary, error, rangeLabel, group = "da
         <CardFooter>
           {summary.hasMergedPeriods ? <CardMessage>部分期间明细已合并，无法完整绘制趋势。合并的用量仍计入总数，请查看用量汇总。</CardMessage> :
             <TrendChart points={trendPoints(summary, "requests", group)} currentIndex={currentPeriod(summary, group)} accessibleLabel={`${rangeLabel}可见调用尝试次数趋势，合计${summary.requests === null ? "未知" : summary.requests.toLocaleString("en-US")}次，按实际有记录的期间汇总`} />}
-          {!summary.hasMergedPeriods && <p className="mt-3 text-caption text-muted">显示实际有记录的期间，缺失期间未填零。图形使用相对刻度。</p>}
-          <p className="mt-3 text-caption text-muted">包含最终尝试，以及已计费或重新计价的重试；不是去重后的最终请求数。</p>
+          {!summary.hasMergedPeriods && <p className="mt-3 text-caption text-fg-3">显示实际有记录的期间，缺失期间未填零。图形使用相对刻度。</p>}
+          <p className="mt-3 text-caption text-fg-3">包含最终尝试，以及已计费或重新计价的重试；不是去重后的最终请求数。</p>
         </CardFooter>
       </>}
     </Card>
@@ -60,13 +60,13 @@ export function UsageRequestCard({ rows, summary, error, rangeLabel, group = "da
 export function UsageCostCard({ rows, summary, error, rangeLabel, number, className, onRetry }: SummaryProps) {
   const cost = summary?.chargedMicroCny == null ? "未知" : fmtMicroCny(summary.chargedMicroCny);
   return (
-    <Card className={`usage-analytic ${className}`}>
+    <Card tone="ink" className={`usage-analytic usage-cost-card ${className}`}>
       <CardHeader number={number} title="费用" description={rangeLabel} />
       {error || rows === null || rows.length === 0 ? <DataState rows={rows} error={error} onRetry={onRetry} /> : summary && <>
         <Metric size={cost.length > 14 ? "value" : "figure"} className="break-all">{cost}</Metric>
         <CardFooter>
-          <p className="text-caption">{summary.estimatedRequests === null ? "估算调用数未知" : summary.estimatedRequests > 0n ? `含 ${summary.estimatedRequests.toLocaleString("en-US")} 次估算调用` : "所选范围内不含估算调用"}</p>
-          <p className="mt-3 text-caption">按用量发生期间归属。历史费率、折扣与调整可在调用明细中核查。</p>
+          <p className="text-caption text-fg-2">{summary.estimatedRequests === null ? "估算调用数未知" : summary.estimatedRequests > 0n ? `含 ${summary.estimatedRequests.toLocaleString("en-US")} 次估算调用` : "所选范围内不含估算调用"}</p>
+          <p className="mt-3 text-caption text-fg-3">按用量发生期间归属。历史费率、折扣与调整可在调用明细中核查。</p>
         </CardFooter>
       </>}
     </Card>
@@ -89,7 +89,7 @@ export function UsageModelsCard({ rows, summary, error, rangeLabel, number, clas
       {error || rows === null || rows.length === 0 ? <DataState rows={rows} error={error} onRetry={onRetry} chart /> : summary && <>
         <div className="flex flex-wrap items-baseline gap-2">
           <Metric size="value">{summary.models.filter((model) => model.label !== "" && !(model.id === null && model.label === "其他")).length.toLocaleString("en-US")}</Metric>
-          <span className="text-caption text-muted">可识别模型</span>
+          <span className="text-caption text-fg-3">可识别模型</span>
         </div>
         {ranked.length !== summary.models.length || total === null ? <CardMessage>部分模型费用未知，无法完整计算占比。请查看用量汇总。</CardMessage> : <RankBars
           items={shown.map((model, index) => {
@@ -99,7 +99,7 @@ export function UsageModelsCard({ rows, summary, error, rangeLabel, number, clas
           accessibleLabel={`${rangeLabel}费用最高的 ${shown.length} 个模型分组及其费用占比`}
         />}
         <CardFooter>
-          <p className="text-caption text-muted">{ranked.length > shown.length ? `展示费用前 ${shown.length} 个分组，共 ${ranked.length} 个。` : "按各模型已计费用量汇总。"}{!canShowShare && total !== null ? "费用含负数调整或合计为零时，不计算占比。" : ""}{summary.hasMergedPeriods ? "“其他”为跨期合并分组，不计入可识别模型数。" : ""}</p>
+          <p className="text-caption text-fg-3">{ranked.length > shown.length ? `展示费用前 ${shown.length} 个分组，共 ${ranked.length} 个。` : "按各模型已计费用量汇总。"}{!canShowShare && total !== null ? "费用含负数调整或合计为零时，不计算占比。" : ""}{summary.hasMergedPeriods ? "“其他”为跨期合并分组，不计入可识别模型数。" : ""}</p>
         </CardFooter>
       </>}
     </Card>
@@ -114,7 +114,7 @@ export function UsageCostTrendCard({ rows, error, rangeLabel, group = "day", num
       {error || rows === null || rows.length === 0 ? <DataState rows={rows} error={error} onRetry={onRetry} chart /> : summary && <>
         {summary.hasMergedPeriods ? <CardMessage>部分期间明细已合并，无法完整绘制趋势。合并费用仍计入总额，请查看用量汇总。</CardMessage> :
           <TrendChart points={trendPoints(summary, "chargedMicroCny", group)} currentIndex={currentPeriod(summary, group)} accessibleLabel={`${rangeLabel}费用趋势，合计${summary.chargedMicroCny === null ? "未知" : fmtMicroCny(summary.chargedMicroCny)}，按实际有记录的期间汇总`} />}
-        <CardFooter><p className="text-caption text-muted">按用量发生时间归属，重新计价后的调整归入原期间。只显示有记录的期间；图形使用相对刻度，金额保留原始精度。</p></CardFooter>
+        <CardFooter><p className="text-caption text-fg-3">按用量发生时间归属，重新计价后的调整归入原期间。只显示有记录的期间；图形使用相对刻度，金额保留原始精度。</p></CardFooter>
       </>}
     </Card>
   );

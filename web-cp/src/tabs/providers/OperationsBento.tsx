@@ -1,6 +1,5 @@
 import type { ReactNode } from "react";
-import { RankBars } from "../../components/charts";
-import { CardMessage, Metric, MetricSkeleton } from "../../components/page";
+import { Card, CardMessage, Metric, MetricSkeleton } from "../../components/page";
 import { fmtInt } from "../../lib/fmt";
 import "./OperationsBento.css";
 
@@ -35,27 +34,27 @@ export function InventorySummary({
 }) {
   return (
     <section className="ops-summary" aria-label={title}>
-      <h2>{title}</h2>
+      <h2 className="sr-only">{title}</h2>
       <div className="ops-summary-grid">
-        <div className="ops-summary-total">
+        <Card tone="lilac" className="ops-summary-total">
           <p className="ops-summary-label">{totalLabel}</p>
           {total === null ? (
             error ? <CardMessage onRetry={onRetry}>数据加载失败，请重试。</CardMessage> : <MetricSkeleton />
           ) : <Metric size="figure">{fmtInt(total)}</Metric>}
           {error && total !== null && <p className="ops-summary-note" role="status">刷新失败，保留最近成功读取的结果。</p>}
-        </div>
-        <div className="ops-summary-breakdown">
-          <p className="ops-summary-label">{breakdownLabel}</p>
-          {total !== null && <RankBars items={breakdown} accessibleLabel={breakdownLabel} emptyLabel="当前集合为空。" />}
-        </div>
-        <div className="ops-summary-secondary">
+        </Card>
+        <Card className="ops-summary-secondary">
           <p className="ops-summary-label">{secondaryTitle}</p>
           {secondaryValue === null
             ? secondaryError ? <CardMessage>数据暂不可用，请查看下方错误提示。</CardMessage> : <MetricSkeleton />
             : <Metric size="figure">{fmtInt(secondaryValue)}</Metric>}
           <p className="ops-summary-note">{secondaryFoot}</p>
-          {children}
-        </div>
+        </Card>
+        <Card className="ops-summary-breakdown">
+          <p className="ops-summary-label">{breakdownLabel}</p>
+          {total !== null ? <dl className="ops-summary-distribution">{breakdown.map((item) => <div key={item.label}><dt>{item.label}</dt><dd>{item.displayValue}</dd></div>)}{breakdown.length === 0 && <div><dt>当前集合为空</dt><dd>—</dd></div>}</dl> : <MetricSkeleton />}
+        </Card>
+        {children && <Card className="ops-summary-facts">{children}</Card>}
       </div>
     </section>
   );

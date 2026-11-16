@@ -51,16 +51,16 @@ function sumCounts(left: number | null | undefined, right: number | null | undef
 function modelName(name: string): string { return name || "未授权或未知模型"; }
 
 function Facts({ items }: { items: { label: string; value: string }[] }) {
-  return <dl className="metric-facts">{items.map(item => <div key={item.label} className="min-w-0"><dt className="text-muted">{item.label}</dt><dd className="min-w-0 break-all tabular-nums text-ink">{item.value}</dd></div>)}</dl>;
+  return <dl className="metric-facts">{items.map(item => <div key={item.label} className="min-w-0"><dt className="text-fg-3">{item.label}</dt><dd className="min-w-0 break-all tabular-nums text-fg">{item.value}</dd></div>)}</dl>;
 }
 
 function LatencyFacts({ title, value, note }: { title: string; value: MetricsLatency | undefined; note: string }) {
-  return <section className="min-w-0"><h3 className="mb-4 text-meta font-normal text-ink">{title}</h3><Facts items={[
+  return <section className="min-w-0"><h3 className="mb-4 text-caption font-normal text-fg">{title}</h3><Facts items={[
     { label: "平均", value: formatDuration(value?.avg) }, { label: "P50", value: formatDuration(value?.p50) },
     { label: "P95", value: formatDuration(value?.p95) }, { label: "P99", value: formatDuration(value?.p99) },
     { label: "实测样本", value: formatCount(value?.sample_count) },
     { label: "无实测值", value: formatCount(value?.missing_count) },
-  ]} /><p className="mt-3 text-caption text-muted">{note}</p></section>;
+  ]} /><p className="mt-3 text-caption text-fg-3">{note}</p></section>;
 }
 
 /** 横轴来自服务器实际时间桶；位置归一化与精确金额显示互不回流。 */
@@ -85,19 +85,19 @@ function trendPoints(data: ApiMetricsResponse, view: ApiMetricView, latencyKind:
 function TokenFacts({ values }: { values?: ApiMetricValues }) {
   const tokens = values?.tokens;
   const available = tokenTrendValue(tokens, "input_tokens") !== null;
-  return <div className="grid gap-6">
-    <section aria-label="用量记录覆盖诊断"><div className="text-caption text-muted">用量记录覆盖率</div><Metric size="value" className="mt-3">{formatRatio(sampleCoverage(tokens?.known_usage_attempts, tokens?.unknown_usage_attempts))}</Metric><div className="mt-5"><Facts items={[
+  return <div className="metric-detail-sections">
+    <section aria-label="用量记录覆盖诊断"><div className="text-caption text-fg-3">用量记录覆盖率</div><Metric size="value" className="mt-3">{formatRatio(sampleCoverage(tokens?.known_usage_attempts, tokens?.unknown_usage_attempts))}</Metric><div className="mt-5"><Facts items={[
       { label: "有可用用量记录的尝试", value: formatCount(tokens?.known_usage_attempts) },
       { label: "无可用用量记录的尝试", value: formatCount(tokens?.unknown_usage_attempts) },
-    ]} /></div><p className="mt-3 text-caption text-muted">有可用记录 ÷（有可用 + 无可用记录），按可见尝试统计。可用记录可能含估算，不等于上游精确报告。</p></section>
-    <section className="border-t border-ink/7 pt-5"><h3 className="mb-4 text-caption font-normal text-ink">已记录 token 构成</h3><Facts items={[
+    ]} /></div><p className="mt-3 text-caption text-fg-3">有可用记录 ÷（有可用 + 无可用记录），按可见尝试统计。可用记录可能含估算，不等于上游精确报告。</p></section>
+    <section className="border-t border-hairline pt-5"><h3 className="mb-4 text-caption font-normal text-fg">已记录 token 构成</h3><Facts items={[
       { label: "输入合计", value: formatCount(tokenTrendValue(tokens, "input_tokens")) },
       { label: "输出", value: formatCount(tokenTrendValue(tokens, "completion_tokens")) },
       { label: "原始输入", value: formatCount(available ? tokens?.prompt_tokens : null) },
       { label: "推理 token", value: formatCount(available ? tokens?.reasoning_tokens : null) },
       { label: "额外缓存读取", value: formatCount(available ? tokens?.cache_read_tokens : null) },
       { label: "额外缓存创建", value: formatCount(available ? tokens?.cache_creation_tokens : null) },
-    ]} /><p className="mt-3 text-caption text-muted">推理 token 保留上游记录的口径，不再次累加到输出。输入内缓存子集已包含在原始输入中。</p></section>
+    ]} /><p className="mt-3 text-caption text-fg-3">推理 token 保留上游记录的口径，不再次累加到输出。输入内缓存子集已包含在原始输入中。</p></section>
   </div>;
 }
 
@@ -108,32 +108,32 @@ function currentPeriod(data: ApiMetricsResponse): number | undefined {
 }
 
 function ModelRanks({ data, field }: { data: ApiMetricsResponse | null; field: "requests" | "charged_micro_cny" }) {
-  if (data === null) return <><div aria-hidden="true" className="grid gap-4">{Array.from({ length: 5 }, (_, index) => <div key={index}><div className="mb-2 flex justify-between gap-4"><span className="h-5 w-1/3 rounded-chip bg-ink/7" /><span className="h-5 w-1/4 rounded-chip bg-ink/7" /></div><div className="h-2.5 rounded-full bg-ink/7" /></div>)}</div><p className="mt-5 text-caption text-muted">展示所选范围的全部模型分组。未授权或已无法识别的模型合并显示，未暴露其内部名称。</p></>;
+  if (data === null) return <><div aria-hidden="true" className="grid gap-4">{Array.from({ length: 5 }, (_, index) => <div key={index}><div className="mb-2 flex justify-between gap-4"><span className="h-5 w-1/3 rounded-chip bg-tint" /><span className="h-5 w-1/4 rounded-chip bg-tint" /></div><div className="h-2.5 rounded-full bg-tint" /></div>)}</div><p className="mt-5 text-caption text-fg-3">展示所选范围的全部模型分组。未授权或已无法识别的模型合并显示，未暴露其内部名称。</p></>;
   const ranked = rankMetricModels(data.models, field);
   if (ranked === null) return <CardMessage>部分模型的{field === "requests" ? "请求数" : "费用"}未知，无法完整比较模型分布。</CardMessage>;
   const shown = ranked.slice(0, 5);
   const normalized = normalizeExactValues(shown.map(row => row[field]));
   const leader = shown[0];
   const leaderValue = leader === undefined ? "" : field === "requests" ? `${formatCount(leader.requests)} 次` : money(leader.charged_micro_cny);
-  return <><RankBars items={shown.map((row, index) => ({ label: modelName(row.model.name), value: normalized[index] ?? 0, displayValue: field === "requests" ? `${formatCount(row.requests)} 次` : money(row.charged_micro_cny) }))} accessibleLabel={leader ? `当前范围${field === "requests" ? "请求数" : "费用"}最多的模型分组为${modelName(leader.model.name)}，${leaderValue}；展示前 ${formatCount(shown.length)} 个，共 ${formatCount(ranked.length)} 个分组` : "当前范围没有模型用量"} emptyLabel="所选范围内没有模型用量" /><p className="mt-5 text-caption text-muted">{ranked.length > shown.length ? `按全部 ${formatCount(ranked.length)} 个模型分组比较，展示前 ${formatCount(shown.length)} 个。` : "展示所选范围的全部模型分组。"}未授权或已无法识别的模型合并显示，未暴露其内部名称。</p></>;
+  return <><RankBars items={shown.map((row, index) => ({ label: modelName(row.model.name), value: normalized[index] ?? 0, displayValue: field === "requests" ? `${formatCount(row.requests)} 次` : money(row.charged_micro_cny) }))} accessibleLabel={leader ? `当前范围${field === "requests" ? "请求数" : "费用"}最多的模型分组为${modelName(leader.model.name)}，${leaderValue}；展示前 ${formatCount(shown.length)} 个，共 ${formatCount(ranked.length)} 个分组` : "当前范围没有模型用量"} emptyLabel="所选范围内没有模型用量" /><p className="mt-5 text-caption text-fg-3">{ranked.length > shown.length ? `按全部 ${formatCount(ranked.length)} 个模型分组比较，展示前 ${formatCount(shown.length)} 个。` : "展示所选范围的全部模型分组。"}未授权或已无法识别的模型合并显示，未暴露其内部名称。</p></>;
 }
 
 function CacheFacts({ values }: { values: ApiMetricValues | undefined }) {
   const cache = values?.response_cache;
   return <>
-    <div><div className="text-micro text-muted">响应缓存命中率</div><Metric size="value" className="mt-3">{formatRatio(cache?.hit_rate)}</Metric><p className="mt-3 text-caption text-muted">命中 ÷（命中 + 未命中）；绕过、未启用与未知不进入分母。</p></div>
+    <div><div className="text-micro text-fg-3">响应缓存命中率</div><Metric size="value" className="mt-3">{formatRatio(cache?.hit_rate)}</Metric><p className="mt-3 text-caption text-fg-3">命中 ÷（命中 + 未命中）；绕过、未启用与未知不进入分母。</p></div>
     <Facts items={[
       { label: "命中请求", value: formatCount(cache?.hit_requests) }, { label: "未命中请求", value: formatCount(cache?.miss_requests) },
       { label: "绕过缓存", value: formatCount(cache?.bypass_requests) }, { label: "未启用缓存", value: formatCount(cache?.disabled_requests) },
       { label: "缓存状态未知", value: formatCount(cache?.unknown_requests) },
     ]} />
-    <div className="border-t border-ink/7 pt-5"><h3 className="mb-4 text-meta font-normal text-ink">已记录 token</h3><Facts items={[
+    <div className="border-t border-hairline pt-5"><h3 className="mb-4 text-caption font-normal text-fg">已记录 token</h3><Facts items={[
       { label: "输入合计", value: formatCount(values?.tokens.input_tokens) }, { label: "输出", value: formatCount(values?.tokens.completion_tokens) },
       { label: "推理 token", value: formatCount(values?.tokens.reasoning_tokens) }, { label: "原始输入", value: formatCount(values?.tokens.prompt_tokens) },
       { label: "输入内缓存子集", value: formatCount(values?.tokens.cached_prompt_tokens) }, { label: "额外缓存读取", value: formatCount(values?.tokens.cache_read_tokens) },
       { label: "额外缓存创建", value: formatCount(values?.tokens.cache_creation_tokens) }, { label: "已记录缓存读取合计", value: formatCount(values?.tokens.cache_hit_tokens) },
     ]} /></div>
-    <p className="text-caption text-muted">输入合计 = 原始输入 + 额外缓存读取 + 额外缓存创建。输入内缓存子集已在原始输入内，不能再相加。缓存计数未区分明确报告零与未报告。</p>
+    <p className="text-caption text-fg-3">输入合计 = 原始输入 + 额外缓存读取 + 额外缓存创建。输入内缓存子集已在原始输入内，不能再相加。缓存计数未区分明确报告零与未报告。</p>
   </>;
 }
 
@@ -193,13 +193,24 @@ export function ApiMetricsPanel({ scope, enabled, from, to, bucket, modelId, mem
         }} className="metric-tab">{item.label}</button>)}
       </div>
       <BentoGrid id={panelId} role="tabpanel" aria-labelledby={`${choiceId}-${view}`} tabIndex={0}>
-      <Card className={cn(span.d7, "metric-analysis-main")}>
+      <Card className={cn(view === "requests" || view === "cost" ? span.d8 : span.d12, "metric-analysis-main")}>
         <CardHeader number={numberStart} title={`API 指标 · ${VIEWS.find(item => item.value === view)?.label}`} description={`${fmtBeijing(data?.from ?? from)} — ${fmtBeijing(data?.to ?? to)}（UTC+8，结束时间不含）`} />
-        {view === "latency" && <label htmlFor={choiceId} className="mb-5 grid gap-2 text-caption text-muted">耗时口径<Select id={choiceId} value={latencyKind} onValueChange={selectedValue => setLatencyKind(selectedValue as LatencyKind)}>{Object.entries(LATENCY_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</Select></label>}
-        {view === "tokens" && <label htmlFor={choiceId} className="mb-5 grid gap-2 text-caption text-muted">token 口径<Select id={choiceId} value={tokenKind} onValueChange={selectedValue => setTokenKind(selectedValue as TokenKind)}>{Object.entries(TOKEN_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</Select></label>}
-        {view === "cache" && <label htmlFor={choiceId} className="mb-5 grid gap-2 text-caption text-muted">缓存口径<Select id={choiceId} value={cacheKind} onValueChange={selectedValue => setCacheKind(selectedValue as CacheKind)}><option value="tokens">已记录缓存 token 占输入比例</option><option value="response">响应缓存命中率</option></Select></label>}
+        {view === "latency" && <label htmlFor={choiceId} className="mb-5 grid gap-2 text-caption text-fg-3">耗时口径<Select id={choiceId} value={latencyKind} onValueChange={selectedValue => setLatencyKind(selectedValue as LatencyKind)}>{Object.entries(LATENCY_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</Select></label>}
+        {view === "tokens" && <label htmlFor={choiceId} className="mb-5 grid gap-2 text-caption text-fg-3">token 口径<Select id={choiceId} value={tokenKind} onValueChange={selectedValue => setTokenKind(selectedValue as TokenKind)}>{Object.entries(TOKEN_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</Select></label>}
+        {view === "cache" && <label htmlFor={choiceId} className="mb-5 grid gap-2 text-caption text-fg-3">缓存口径<Select id={choiceId} value={cacheKind} onValueChange={selectedValue => setCacheKind(selectedValue as CacheKind)}><option value="tokens">已记录缓存 token 占输入比例</option><option value="response">响应缓存命中率</option></Select></label>}
         {<>
-          <div className="metric-primary"><div className="mb-3 text-micro text-muted">{metricTitle}{view === "latency" ? " · 平均" : ""}</div><Metric size={primary.length > 18 ? "value" : "display"} className="break-all font-medium">{primary}</Metric></div>
+          <div className="metric-primary"><div className="mb-3 text-micro text-fg-3">{metricTitle}{view === "latency" ? " · 平均" : ""}</div><Metric size="value" className="break-all">{primary}</Metric></div>
+          <CardFooter className="pt-4"><div className="min-h-64">{data ? <TrendChart points={points} currentIndex={currentPeriod(data)} accessibleLabel={trendLabel} emptyLabel="所选范围没有可用期间数据" /> : <div><div className="relative h-56">{error ? <div className="absolute inset-0 flex items-center"><CardMessage onRetry={rangeError ? undefined : () => setRevision(value => value + 1)}>{error}</CardMessage></div> : <><div aria-hidden="true" className="h-full w-full rounded-field bg-tint" /><span role="status" className="sr-only">正在加载完整 API 指标</span></>}</div><div aria-hidden="true" className="mt-2 flex justify-between text-micro text-fg-3"><span>—</span><span>—</span><span>—</span></div></div>}</div><p className="mt-4 text-caption text-fg-3">按{BUCKET_LABELS[displayBucket]}汇总，图形使用相对刻度，精确值可用键盘逐期查看。</p></CardFooter>
+          <p className="mt-4 text-caption text-fg-3">{view === "latency" ? LATENCY_NOTES[latencyKind] + " P99 由所选范围原始实测样本计算，小样本需结合样本数判断。" : view === "tokens" ? TOKEN_NOTE : view === "cache" ? cacheKind === "tokens" ? "（输入内缓存子集 + 额外缓存读取）÷（原始输入 + 额外缓存读取 + 额外缓存创建）。这是已记录 token 的比例，不代表上游报告覆盖率。" : "响应缓存命中 ÷（命中 + 未命中）；绕过、未启用与未知不进入分母。" : view === "requests" ? "成功率 = 成功请求 ÷（成功 + 失败请求），失败率使用同一已知结果分母。结果未知的请求单列；最终状态未知的尝试不作为最终请求。请求速率是整个查询周期的平均值，不是瞬时 RPS。" : "已计价费用汇总最终记录及可见的已计费重试，保留当笔历史费率与费用调整。待计价尝试不等于免费，完成计价后费用可能变化。"}</p>
+          <p className="mt-3 text-caption text-fg-3">请求数按最终记录统计，费用与 token 还包含已计费重试。计费尝试包含免费与未定价的最终记录，不等于请求数。</p>
+        </>}
+      </Card>
+      <Card className={cn(view === "requests" || view === "cost" ? span.d4 : span.d12, "metric-analysis-aside")}>
+        <CardHeader number={numberStart + 1} title={sideTitle} description="与趋势使用相同时间、身份和筛选范围" />
+        {view === "requests" || view === "cost" ? <ModelRanks data={data} field={view === "requests" ? "requests" : "charged_micro_cny"} /> : view === "tokens" ? <TokenFacts values={totals} /> : view === "cache" ? <CacheFacts values={totals} /> : <div className="metric-detail-sections"><LatencyFacts title="首 token 延迟" value={totals?.first_token_latency_ms} note="最终请求的首个生成内容；无样本包含非流式与历史记录。" /><div className="border-t border-hairline pt-6"><LatencyFacts title="响应延迟" value={totals?.response_latency_ms} note="最终请求的响应延迟：流式请求统计首个可用数据，非流式请求统计完整响应。" /></div><div className="border-t border-hairline pt-6"><LatencyFacts title="上游尝试完整耗时" value={totals?.attempt_duration_ms} note="所有可见计费尝试各自的完整耗时，不能相加为客户端请求时长。" /></div></div>}
+      </Card>
+      <Card className={cn(span.d12, "metric-analysis-details")}>
+        <CardHeader title={view === "requests" ? "请求计数与结果" : view === "latency" ? "延迟分位与样本" : view === "tokens" ? "Token 记录覆盖" : view === "cache" ? "缓存采样" : "费用计价明细"} />
           {view === "requests" && <Facts items={[
             { label: "成功率", value: formatRatio(totals?.success_rate) },
             { label: "失败率（已知结果）", value: formatRatio(requestRates?.failureRate) },
@@ -225,14 +236,6 @@ export function ApiMetricsPanel({ scope, enabled, from, to, bucket, modelId, mem
             { label: "命中请求", value: formatCount(totals?.response_cache?.hit_requests) }, { label: "查询缓存的请求", value: formatCount(sumCounts(totals?.response_cache?.hit_requests, totals?.response_cache?.miss_requests)) },
           ]} />}
           {view === "cost" && <Facts items={[{ label: "最终请求", value: formatCount(totals?.requests) }, { label: "计费尝试", value: formatCount(totals?.billing_attempts) }, { label: "待计价尝试", value: formatCount(totals?.unpriced_attempts) }, { label: "费用调整", value: money(totals?.adjusted_micro_cny ?? null) }]} />}
-          <CardFooter className="pt-7"><div className="min-h-64">{data ? <TrendChart points={points} currentIndex={currentPeriod(data)} accessibleLabel={trendLabel} emptyLabel="所选范围没有可用期间数据" /> : <div><div className="relative h-56">{error ? <div className="absolute inset-0 flex items-center"><CardMessage onRetry={rangeError ? undefined : () => setRevision(value => value + 1)}>{error}</CardMessage></div> : <><div aria-hidden="true" className="h-full w-full rounded-cell bg-ink/7" /><span role="status" className="sr-only">正在加载完整 API 指标</span></>}</div><div aria-hidden="true" className="mt-2 flex justify-between text-micro text-muted"><span>—</span><span>—</span><span>—</span></div></div>}</div><p className="mt-4 text-caption text-muted">按{BUCKET_LABELS[displayBucket]}汇总，图形使用相对刻度，精确值可用键盘逐期查看。</p></CardFooter>
-          <p className="mt-4 text-caption text-muted">{view === "latency" ? LATENCY_NOTES[latencyKind] + " P99 由所选范围原始实测样本计算，小样本需结合样本数判断。" : view === "tokens" ? TOKEN_NOTE : view === "cache" ? cacheKind === "tokens" ? "（输入内缓存子集 + 额外缓存读取）÷（原始输入 + 额外缓存读取 + 额外缓存创建）。这是已记录 token 的比例，不代表上游报告覆盖率。" : "响应缓存命中 ÷（命中 + 未命中）；绕过、未启用与未知不进入分母。" : view === "requests" ? "成功率 = 成功请求 ÷（成功 + 失败请求），失败率使用同一已知结果分母。结果未知的请求单列；最终状态未知的尝试不作为最终请求。请求速率是整个查询周期的平均值，不是瞬时 RPS。" : "已计价费用汇总最终记录及可见的已计费重试，保留当笔历史费率与费用调整。待计价尝试不等于免费，完成计价后费用可能变化。"}</p>
-          <p className="mt-3 text-caption text-muted">请求数按最终记录统计，费用与 token 还包含已计费重试。计费尝试包含免费与未定价的最终记录，不等于请求数。</p>
-        </>}
-      </Card>
-      <Card className={cn(span.d5Wide, "metric-analysis-aside")}>
-        <CardHeader number={numberStart + 1} title={sideTitle} description="与左侧使用相同时间、身份和筛选范围" />
-        {view === "requests" || view === "cost" ? <ModelRanks data={data} field={view === "requests" ? "requests" : "charged_micro_cny"} /> : view === "tokens" ? <TokenFacts values={totals} /> : view === "cache" ? <CacheFacts values={totals} /> : <div className="grid gap-7"><LatencyFacts title="首 token 延迟" value={totals?.first_token_latency_ms} note="最终请求的首个生成内容；无样本包含非流式与历史记录。" /><div className="border-t border-ink/7 pt-6"><LatencyFacts title="响应延迟" value={totals?.response_latency_ms} note="最终请求的响应延迟：流式请求统计首个可用数据，非流式请求统计完整响应。" /></div><div className="border-t border-ink/7 pt-6"><LatencyFacts title="上游尝试完整耗时" value={totals?.attempt_duration_ms} note="所有可见计费尝试各自的完整耗时，不能相加为客户端请求时长。" /></div></div>}
       </Card>
       </BentoGrid>
     </section>

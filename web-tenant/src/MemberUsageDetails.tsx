@@ -2,6 +2,7 @@ import type { MemberUsage } from "./lib/memberUsage";
 import { memberChargeLabel } from "./lib/memberUsagePresentation";
 import { formatCount } from "./lib/chartFormat";
 import { DataTable } from "./ui/DataTable";
+import { Metric } from "./components/page";
 
 const QUANTITY_LABEL: Record<string, string> = {
   input: "输入", output: "输出", cache_read: "缓存读", cache_write: "缓存写",
@@ -13,11 +14,11 @@ const QUANTITY_LABEL: Record<string, string> = {
 export function MemberUsageDetails({ usage }: { usage: MemberUsage }) {
   const quantities = Object.entries(usage.quantities);
   return <>
-    <dl className="grid gap-5 tablet:grid-cols-2">
-      <div><dt className="text-caption text-muted">已计费费用</dt><dd className="mt-1 text-stat tabular">{memberChargeLabel(usage)}</dd></div>
-      <div><dt className="text-caption text-muted">调用次数</dt><dd className="mt-1 text-stat tabular">{formatCount(usage.requests)}</dd></div>
+    <dl className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+      <div className="rounded-tile bg-sunken p-4"><dt className="text-small font-semibold text-fg-2">已计费费用</dt><dd className="mt-2"><Metric>{memberChargeLabel(usage)}</Metric></dd></div>
+      <div className="rounded-tile bg-sunken p-4"><dt className="text-small font-semibold text-fg-2">调用次数</dt><dd className="mt-2"><Metric>{formatCount(usage.requests)}</Metric></dd></div>
     </dl>
-    <h3 className="mt-6 mb-3 text-body font-medium">计费用量</h3>
+    <h3 className="text-title font-bold">计费用量</h3>
     {quantities.length === 0 ? <p className="hint">{usage.unknown_quantity_requests > 0 ? "计费用量未知" : "暂无已记录的计费用量"}</p> : <DataTable label="计费用量">
       <thead><tr><th>用量类型</th><th className="right">用量</th></tr></thead>
       <tbody>{quantities.map(([dimension, quantity]) => <tr key={dimension}>
@@ -25,7 +26,7 @@ export function MemberUsageDetails({ usage }: { usage: MemberUsage }) {
         <td className="right tabular" data-label="用量">{formatCount(quantity)}{dimension === "web_search" ? " 次" : dimension in QUANTITY_LABEL ? " token" : ""}</td>
       </tr>)}</tbody>
     </DataTable>}
-    <div className="mt-4 grid gap-2 text-caption text-muted" role="note" aria-label="费用与用量说明">
+    <div className="grid gap-2 text-caption text-fg-3" role="note" aria-label="费用与用量说明">
       {usage.unknown_quantity_requests > 0 && <p>{formatCount(usage.unknown_quantity_requests)} 次用量明细未记录；上方仅显示已知部分。</p>}
       {usage.unpriced_requests > 0 && <p>{formatCount(usage.unpriced_requests)} 次未计价，费用尚未包含。</p>}
       {usage.pending_requests > usage.unpriced_requests && <p>另有 {formatCount(usage.pending_requests - usage.unpriced_requests)} 次待计价。</p>}

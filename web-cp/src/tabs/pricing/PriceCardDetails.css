@@ -3,15 +3,16 @@
   display: grid;
   min-width: 0;
   max-width: 100%;
-  gap: 20px;
+  gap: 16px;
   white-space: normal;
   color: var(--foreground);
 }
 .price-card-tier {
   min-width: 0;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--card);
+  border: 0;
+  border-top: 1px solid var(--border);
+  border-radius: 0;
+  background: transparent;
   overflow: hidden;
 }
 .price-card-tier-heading {
@@ -23,21 +24,21 @@
   min-height: 48px;
   padding: 8px 16px;
   border-bottom: 1px solid var(--border);
-  background: var(--card);
+  background: var(--well);
 }
 .price-card-tier-heading h4,
 .price-card-tier-heading code {
   margin: 0;
   overflow-wrap: anywhere;
-  font-size: 14px;
+  font-size: var(--text-body);
   line-height: 22px;
 }
-.price-card-tier-heading h4 { font-size: 15px; line-height: 24px; font-weight: 600; }
+.price-card-tier-heading h4 { font-size: var(--text-body); line-height: 24px; font-weight: 600; }
 .price-card-tier-heading code { color: var(--muted-foreground); font-weight: 400; }
 .price-card-band { min-width: 0; padding: 12px 0 0; }
 .price-card-headline { margin: 0 16px 12px; color: var(--ink-soft); font-size: var(--text-caption); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 .price-card-table-wrap { min-width: 0; max-width: 100%; }
-.price-card-table-wrap:focus-visible { outline: 2px solid var(--foreground); outline-offset: -2px; }
+.price-card-table-wrap:focus-visible { outline: 2px solid var(--ring); outline-offset: -2px; }
 .price-card-details table.price-card-table {
   width: 100%;
   min-width: 0;
@@ -63,12 +64,12 @@
   text-align: left;
   overflow-wrap: anywhere;
   font-family: var(--font-sans);
-  font-size: 14px;
+  font-size: var(--text-body);
   font-weight: 400;
   letter-spacing: normal;
   color: var(--ink-soft);
 }
-.price-card-details table.price-card-table > thead > tr > th { height: 44px; color: var(--muted-foreground); font-size: 12px; font-weight: 500; line-height: 18px; }
+.price-card-details table.price-card-table > thead > tr > th { height: 44px; color: var(--muted-foreground); font-size: var(--text-caption); font-weight: 500; line-height: 18px; }
 .price-card-details table.price-card-table > thead > tr > th:nth-child(n+3),
 .price-card-details table.price-card-table > tbody > tr > td.price-card-amount { text-align: right; }
 .price-card-details table.price-card-table > tbody > tr > td.price-card-amount {
@@ -77,7 +78,7 @@
   font-variant-numeric: tabular-nums;
   white-space: normal;
 }
-.price-card-details table.price-card-table > tbody > tr > th.price-card-group-heading { height: 32px; padding: 6px 16px; background: var(--well); color: var(--ink-soft); font-size: 12px; font-weight: 500; line-height: 18px; }
+.price-card-details table.price-card-table > tbody > tr > th.price-card-group-heading { height: 32px; padding: 6px 16px; background: var(--well); color: var(--ink-soft); font-size: var(--text-caption); font-weight: 500; line-height: 18px; }
 .price-card-details table.price-card-table > tbody:last-child > tr:last-child > th,
 .price-card-details table.price-card-table > tbody:last-child > tr:last-child > td { border-bottom: 0; }
 .price-card-missing { color: var(--muted-foreground); font-family: var(--font-sans); }
@@ -88,11 +89,11 @@
 .price-card-details-compact .price-card-tier-heading { padding: 8px 12px; }
 .price-card-details-compact .price-card-band { padding: 12px 0 0; }
 
-.price-card-unit { display: block; margin-top: 5px; color: var(--muted-foreground); font-size: 12px; line-height: 18px; font-weight: 400; white-space: normal; }
+.price-card-unit { display: block; margin-top: 5px; color: var(--muted-foreground); font-size: var(--text-caption); line-height: 18px; font-weight: 400; white-space: normal; }
 .price-card-contexts { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 12rem), 1fr)); gap: 12px 20px; margin: 0; }
 .price-card-contexts > div { min-width: 0; }
-.price-card-contexts dt { color: var(--muted-foreground); font-size: 12px; line-height: 18px; font-weight: 400; overflow-wrap: anywhere; }
-.price-card-contexts dd { margin: 5px 0 0; color: var(--foreground); font-size: 14px; line-height: 22px; font-weight: 500; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.price-card-contexts dt { color: var(--muted-foreground); font-size: var(--text-caption); line-height: 18px; font-weight: 400; overflow-wrap: anywhere; }
+.price-card-contexts dd { margin: 5px 0 0; color: var(--foreground); font-size: var(--text-body); line-height: 22px; font-weight: 500; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 @media (max-width: 600px) {
   .price-card-dimension-col { width: 34%; }
   .price-card-amount-col { width: 66%; }

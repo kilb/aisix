@@ -8,7 +8,7 @@ import { extendTailwindMerge } from "tailwind-merge";
 const mergeBento = extendTailwindMerge({
   extend: {
     classGroups: {
-      "font-size": [{ text: ["hero", "display", "figure", "value", "title", "lead", "stat", "brand", "body", "caption", "meta", "micro"] }],
+      "font-size": [{ text: ["heading", "small", "metric", "metric-lg", "metric-xl", "hero", "display", "figure", "value", "title", "lead", "stat", "brand", "body", "caption", "meta", "micro"] }],
     },
   },
 });

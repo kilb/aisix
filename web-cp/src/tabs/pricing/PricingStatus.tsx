@@ -76,7 +76,7 @@ export function PricingStatus({ onGoto }: TabProps) {
           {failure}
         </div>
       )}
-      <BentoGrid className="mb-3">
+      <BentoGrid className="finance-overview">
         <Card className={span.d7}>
           <CardHeader number={1} title="未计价调用 · 最近 24 小时" />
           {view ? <Metric size="hero">{fmtInt(view.unpricedTotal)}</Metric> : failure ? <CardMessage onRetry={() => void read()}>计价状态读取失败</CardMessage> : <MetricSkeleton />}

@@ -51,6 +51,7 @@ export function OperationalTable({ label, compact = false, children }: { label?:
   const headings = headingsOf(children);
   return <div className="dt-wrap ops-record-table" tabIndex={0} role="region" aria-label={label ? `${label}表格` : "记录表格"}>
     <table role="table" className={compact ? "dt dt-compact" : "dt"} aria-label={label}>
+      <caption className="vh">{label ?? "数据列表"}</caption>
       {describeRows(children, headings)}
     </table>
   </div>;

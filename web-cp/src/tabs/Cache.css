@@ -1,0 +1,51 @@
+/* 缓存策略采用通栏表格和独立设置区，字段沿统一栅格排列。 */
+.cp-cache {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.cp-cache > .page-header,
+.cp-cache > .cache-summary,
+.cp-cache > .cache-list,
+.cp-cache > .cache-editor {
+  margin: 0;
+}
+.cache-list,
+.cache-editor {
+  min-width: 0;
+}
+.cache-settings {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--hairline);
+}
+.cache-settings > h3 {
+  margin: 0 0 16px;
+}
+.cache-fields {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0 16px;
+}
+.cache-fields > * {
+  min-width: 0;
+}
+.cache-editor-footer {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--hairline);
+}
+@media (min-width: 720px) {
+  .cache-fields {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+@media (min-width: 1280px) {
+  .cache-fields {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}

@@ -56,7 +56,7 @@ export function Catalogue(_props: TabProps) {
           {failure}
         </div>
       )}
-      <Card className="pricing-catalogue-summary mb-3">
+      <Card className="pricing-catalogue-summary finance-facts-card">
         <dl className="compact-overview-facts">
           <div><dt>公开价格版本</dt><dd>{items === null ? "—" : fmtInt(items.length)}</dd></div>
           <div><dt>目录标识</dt><dd>{items === null ? "—" : fmtInt(new Set(items.map((entry) => entry.key)).size)}</dd></div>
@@ -64,7 +64,7 @@ export function Catalogue(_props: TabProps) {
         </dl>
         <div className="pricing-tier-coverage" aria-label="服务档位覆盖">{tiers.map(([tier, count]) => <span key={tier}>{tier} <strong>{fmtInt(count)}</strong></span>)}</div>
       </Card>
-      <Card className="catalogue-records mb-0">
+      <Card className="catalogue-records finance-table-card">
         <CardHeader number={3} className="mb-0" title={<>目录条目{items && <Count n={items.length} />}</>} />
         {!failure && items === null && <Loading />}
         {items !== null && items.length === 0 && <EmptyState text="目录里还没有条目" />}

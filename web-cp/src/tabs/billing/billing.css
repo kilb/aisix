@@ -75,14 +75,14 @@
 .bl-tiles dd {
   margin: 8px 0 0;
   overflow-wrap: anywhere;
-  font-size: 20px;
+  font-size: var(--text-heading);
   font-weight: 400;
   letter-spacing: var(--text-value--letter-spacing);
   line-height: 28px;
   font-variant-numeric: tabular-nums;
 }
 .bl-tiles dd.money {
-  font-size: 28px;
+  font-size: var(--text-metric);
   line-height: 36px;
 }
 .bl-tiles dd .lamp {

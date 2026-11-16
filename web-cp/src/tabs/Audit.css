@@ -1,0 +1,92 @@
+/* 审计日志以范围摘要、筛选和通栏记录呈现真实加载范围。 */
+.cp-audit {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+}
+.cp-audit > .page-header {
+  margin-bottom: 0;
+}
+.cp-audit .audit-overview {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+.cp-audit .audit-stat {
+  gap: 12px;
+  padding: 18px;
+}
+.cp-audit .audit-stat .bento-card-header {
+  margin-bottom: 0;
+}
+.cp-audit .audit-stat .bento-card-header h2 {
+  color: var(--color-fg-3);
+  font-size: var(--text-small);
+  font-weight: 500;
+}
+.cp-audit .audit-stat .metric {
+  font-size: var(--text-metric);
+  font-weight: 800;
+  line-height: 1.1;
+}
+.cp-audit .audit-range > p {
+  margin: 0;
+  color: var(--color-fg);
+  font-size: var(--text-title);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.cp-audit .audit-list {
+  min-width: 0;
+  margin: 0;
+}
+.cp-audit .audit-kinds {
+  display: grid;
+  gap: 12px;
+  padding-block: 16px;
+  border-top: 1px solid var(--color-hairline);
+  border-bottom: 1px solid var(--color-hairline);
+}
+.cp-audit .audit-kinds dl {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.cp-audit .audit-kinds dl > div {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 6px 12px;
+  border-radius: var(--r-button);
+  background: var(--color-sunken);
+  font-size: var(--text-small);
+}
+.cp-audit .audit-kinds dt {
+  color: var(--color-fg-2);
+}
+.cp-audit .audit-kinds dd {
+  margin: 0;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.cp-audit .audit-detail {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  white-space: normal;
+}
+.cp-audit .audit-detail .lab {
+  color: var(--color-fg-3);
+  font-size: var(--text-caption);
+}
+@media (min-width: 1024px) {
+  .cp-audit .audit-overview {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+
+@container (min-width: 761px) {
+  .cp-audit .ops-record-table td[data-label="对象"] { min-width: 10rem; }
+}

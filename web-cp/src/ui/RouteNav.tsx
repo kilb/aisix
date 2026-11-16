@@ -1,81 +1,111 @@
-import { useEffect, useRef, type ComponentType, type KeyboardEvent } from "react";
+import { useLayoutEffect, useRef, type ComponentType, type KeyboardEvent } from "react";
+import { cn } from "../lib/cn";
+import "./RouteNav.css";
+
+// 应用侧栏与卡内横向分组共用既有导航接口。
 
 export interface RouteItem<Id extends string> {
   id: Id;
   label: string;
   group?: string;
-  /** A lucide icon drawn before the label. */
   icon?: ComponentType<{ className?: string; "aria-hidden"?: boolean }>;
 }
 
-/** 侧栏分区导航，保留键盘漫游与需要关注事项的文字说明。 */
+/**
+ * 文字导航保留手动激活的 tab 键盘模型：方向键、Home/End 移焦，Enter/Space 打开。
+ * docked 表示侧栏或抽屉内的应用导航；其余保留分段或下划线外观。
+ * tab 的 id、controls 和可访问名称沿用既有页面合同。
+ */
 export function RouteNav<Id extends string>({
+  label,
   items,
   current,
-  attention,
-  label,
   onSelect,
+  attention = {},
+  docked,
+  look = "segment",
+  className,
 }: {
+  label: string;
   items: readonly RouteItem<Id>[];
   current: Id;
-  /** Per section, what needs attention there, in words; absent when nothing does. */
-  attention: Partial<Record<Id, string>>;
-  label: string;
   onSelect: (id: Id) => void;
+  attention?: Partial<Record<Id, string>>;
+  docked?: boolean;
+  look?: "segment" | "underline";
+  className?: string;
 }) {
-  const list = useRef<HTMLOListElement>(null);
-  const tabs = () => [...(list.current?.querySelectorAll<HTMLAnchorElement>("a[href]") ?? [])];
+  const bar = useRef<HTMLElement>(null);
+  const lens = useRef<HTMLSpanElement>(null);
 
-  // 当前入口始终在侧栏自己的滚动区域中可见。
-  useEffect(() => {
-    list.current
-      ?.querySelector<HTMLElement>('[aria-current="page"]')
-      ?.scrollIntoView({ block: "nearest", inline: "nearest" });
-  }, [current]);
+  // The lens covers the current tab. It is placed before the first paint
+  // with no transition, and glides only from then on; it is placed again
+  // whenever the bar changes size (a font arriving, the phone layout).
+  useLayoutEffect(() => {
+    const nav = bar.current;
+    if (!nav) return;
+    if (docked) {
+      nav.querySelector<HTMLElement>('[aria-current="page"]')?.scrollIntoView({ block: "nearest", inline: "nearest" });
+      return;
+    }
+    const mark = lens.current;
+    if (!mark) return;
+    const place = () => {
+      const tab = nav.querySelector<HTMLElement>('[aria-selected="true"]');
+      if (!tab) {
+        mark.style.opacity = "0";
+        return;
+      }
+      mark.style.opacity = "";
+      mark.style.width = `${tab.offsetWidth}px`;
+      mark.style.height = `${tab.offsetHeight}px`;
+      mark.style.transform = `translate(${tab.offsetLeft}px, ${tab.offsetTop}px)`;
+    };
+    place();
+    const frame = requestAnimationFrame(() => mark.setAttribute("data-ready", ""));
+    const resized = new ResizeObserver(place);
+    resized.observe(nav);
+    void document.fonts?.ready.then(place);
+    return () => {
+      cancelAnimationFrame(frame);
+      resized.disconnect();
+    };
+  }, [current, items, docked]);
 
-  function onKeyDown(e: KeyboardEvent<HTMLOListElement>) {
-    const all = tabs();
-    const at = all.indexOf(document.activeElement as HTMLAnchorElement);
+  function onKeyDown(e: KeyboardEvent<HTMLElement>) {
+    const tabs = [...e.currentTarget.querySelectorAll<HTMLElement>(docked ? 'a[href]' : '[role="tab"]')];
+    const at = tabs.findIndex((t) => t === document.activeElement);
     if (at < 0) return;
-    const to =
-      e.key === "ArrowDown" || e.key === "ArrowRight"
-        ? (at + 1) % all.length
-        : e.key === "ArrowUp" || e.key === "ArrowLeft"
-          ? (at - 1 + all.length) % all.length
-          : e.key === "Home"
-            ? 0
-            : e.key === "End"
-              ? all.length - 1
-              : null;
-    if (to === null) return;
+    const last = tabs.length - 1;
+    const next =
+      e.key === "ArrowRight" || (docked && e.key === "ArrowDown") ? (at === last ? 0 : at + 1)
+      : e.key === "ArrowLeft" || (docked && e.key === "ArrowUp") ? (at === 0 ? last : at - 1)
+      : e.key === "Home" ? 0
+      : e.key === "End" ? last
+      : null;
+    if (next === null) return;
     e.preventDefault();
-    all[to]?.focus();
+    tabs[next]?.focus();
   }
 
-  return (
-    <nav className="shell-route-nav" aria-label={label}>
-      <ol
-        ref={list}
-        aria-label={label}
-        onKeyDown={onKeyDown}
-        className="shell-route-list"
-      >
-        {items.map((t, index) => {
-          const note = attention[t.id];
-          const selected = current === t.id;
-          const Icon = t.icon;
-          return (
-            <li key={t.id} role="presentation" className="shell-route-item">
+  if (docked) {
+    return (
+      <nav ref={bar} className={cn("shell-route-nav", className)} aria-label={label} onKeyDown={onKeyDown}>
+        <ol className="shell-route-list" role="presentation">
+          {items.map((t, index) => {
+            const Icon = t.icon;
+            return <li key={t.id} className="shell-route-item" role="presentation">
               {t.group && items[index - 1]?.group !== t.group && <div className="shell-route-group">{t.group}</div>}
               <a
                 href={`#${t.id}`}
                 className="shell-route-stop"
                 id={`stop-${t.id}`}
                 data-tab={t.id}
-                data-attention={note ? "" : undefined}
+                title={t.label}
                 aria-label={t.label}
-                aria-current={selected ? "page" : undefined}
-                aria-describedby={note ? `attention-${t.id}` : undefined}
+                data-attention={attention[t.id] ? "" : undefined}
+                aria-describedby={attention[t.id] ? `attention-${t.id}` : undefined}
+                aria-current={t.id === current ? "page" : undefined}
                 onClick={(event) => {
                   if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
                   event.preventDefault();
@@ -84,15 +114,42 @@ export function RouteNav<Id extends string>({
               >
                 {Icon && <Icon className="shell-route-icon" aria-hidden />}
                 <span className="stop-name">{t.label}</span>
-                {note && <span aria-hidden="true" className="cp-attention">!</span>}
+                {attention[t.id] && <span aria-hidden="true" className="cp-attention">!</span>}
               </a>
-            </li>
-          );
-        })}
-      </ol>
-      {items.map((t) => attention[t.id] ? (
-        <span key={t.id} id={`attention-${t.id}`} className="vh">{attention[t.id]}</span>
-      ) : null)}
+            </li>;
+          })}
+        </ol>
+        {items.map((t) => attention[t.id] ? <span key={t.id} id={`attention-${t.id}`} className="vh">{attention[t.id]}</span> : null)}
+      </nav>
+    );
+  }
+
+  const kind = look === "underline" ? "route route-line" : "route route-seg";
+  return (
+    <nav
+      ref={bar}
+      className={cn(kind, className)}
+      role="tablist"
+      aria-label={label}
+      onKeyDown={onKeyDown}
+    >
+      <span ref={lens} className="lens" aria-hidden="true" />
+      {items.map((t) => (
+        <button
+          key={t.id}
+          type="button"
+          role="tab"
+          id={`stop-${t.id}`}
+          data-tab={t.id}
+          aria-selected={t.id === current}
+          aria-controls={`tab-${t.id}`}
+          tabIndex={t.id === current ? 0 : -1}
+          onClick={() => onSelect(t.id)}
+        >
+          <span className="stop" aria-hidden="true" />
+          <span className="name">{t.label}</span>
+        </button>
+      ))}
     </nav>
   );
 }

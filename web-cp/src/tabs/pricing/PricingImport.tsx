@@ -284,7 +284,7 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
           <Button className="finance-icon-button" aria-label="刷新" title="刷新" type="button" icon="refresh" onClick={() => void loadBatches()}></Button>
         }
       />
-      <BentoGrid className="mb-3" aria-label="导入审核概况">
+      <BentoGrid className="finance-overview" aria-label="导入审核概况">
         <Card className={span.d7}>
           <CardHeader number={1} title="当前读取范围 · 待处理提议" description={all ? "包含与当前基准价相同的提议；以下统计来自当前批次已读取的清单。" : "隐藏与当前基准价相同的提议；以下统计来自当前批次已读取的清单。"} />
           {batches === null || (proposals === null && batchId) ? (error ? <CardMessage>提议读取失败</CardMessage> : <MetricSkeleton />) : (
@@ -310,7 +310,7 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
           </div>
         </Card>
       </BentoGrid>
-      <div className={detail ? "with-side import-workspace is-open" : "with-side import-workspace"}>
+      <div className="finance-record-layout import-workspace">
         <div className="side-main min-w-0">
           <ImportUpload
             canEdit={canEdit}
@@ -328,7 +328,7 @@ export function PricingImport({ canEdit, onGoto }: TabProps) {
             }}
           />
 
-          <Card className="mb-0">
+          <Card className="finance-table-card">
             <CardHeader number={canEdit ? 4 : 3} title="审核清单" description="打开模型查看完整对照、来源与标记；逐项决定，或选择可批量确认的提议。" />
             <div className="sections-switch import-view-switch" role="group" aria-label="审核内容">
               <button type="button" aria-pressed={view === "proposals"} onClick={() => setView("proposals")}>
@@ -677,7 +677,7 @@ function ImportUpload({
         )}
         <CardFooter>
           <span className="mr-auto text-caption text-muted">JSON 文件 · 最大 8 MiB</span>
-          <Button type="submit" kind="primary" busy={uploading} busyLabel="上传中…">上传</Button>
+          <Button type="submit" busy={uploading} busyLabel="上传中…">上传</Button>
         </CardFooter>
       </form>
     </Card>

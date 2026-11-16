@@ -11,19 +11,7 @@ import { Button } from "../ui/Button";
 import { useRefusalFocus } from "../ui/Field";
 import { OperationalTable as DataTable, Loading } from "../components/OperationalTable";
 import { Lamp } from "../ui/Lamp";
-import {
-  BentoGrid,
-  Card,
-  CardFooter,
-  CardHeader,
-  CardMessage,
-  ChartSkeleton,
-  Metric,
-  MetricSkeleton,
-  PageHeader,
-  span,
-} from "../components/page";
-import { RankBars } from "../components/charts";
+import { Card, CardHeader, Metric, MetricSkeleton, PageHeader } from "../components/page";
 import { Plus, RefreshCw, X } from "lucide-react";
 import "./Operators.css";
 import { Select } from "../ui/Select";
@@ -106,14 +94,13 @@ export function Operators({ operator }: TabProps) {
   const roles = ROLES.map(({ role, label }) => {
     const value = items?.filter((account) => account.role === role).length ?? 0;
     return { label, value, displayValue: fmtInt(value) };
-  }).sort((a, b) => b.value - a.value || a.label.localeCompare(b.label));
+  });
 
   const list = (
-    <Card className={span.d12}>
+    <Card className="operators-list">
       <CardHeader
-        number={3}
         as="h2"
-        description="管理员可以新建账号、调整角色、停用或启用。停用会立即结束该账号的全部会话；账号不会被删除，停用即收回访问。至少要保留一个可用的管理员。"
+        description="按角色与状态筛选账号；角色修改和停用操作在当前行确认。"
         title={
           <span className="inline-flex items-center gap-2">
             全部账号
@@ -135,6 +122,8 @@ export function Operators({ operator }: TabProps) {
       {items !== null && (
         <>
           <RecordTools table={table} label="全部运维账号"><label className="f filter"><span>筛选角色</span><Select size="compact" aria-label="筛选角色" value={roleFilter} onValueChange={(value) => setRoleFilter(value)}><option value="">全部</option><option value="admin">管理员</option><option value="operator">运维</option><option value="viewer">只读</option></Select></label><label className="f filter"><span>筛选状态</span><Select size="compact" aria-label="筛选状态" value={statusFilter} onValueChange={(value) => setStatusFilter(value)}><option value="">全部</option><option value="enabled">正常</option><option value="disabled">已停用</option></Select></label></RecordTools>
+          <dl className="operators-role-summary" aria-label="角色分布 · 全部账号">{roles.map((role) => <div key={role.label}><dt>{role.label}</dt><dd>{role.displayValue}</dd></div>)}</dl>
+          <p className="text-caption text-fg-3">角色分布包含可用与已停用账号。</p>
           <DataTable label="全部运维账号">
             <thead>
               <tr>
@@ -142,7 +131,7 @@ export function Operators({ operator }: TabProps) {
                 <th>角色</th>
                 <th>状态</th>
                 <th>创建时间</th>
-                <th />
+                <th className="right"><span className="sr-only">操作</span></th>
               </tr>
             </thead>
             <tbody>
@@ -155,14 +144,14 @@ export function Operators({ operator }: TabProps) {
                       <span className="inline-flex items-center gap-2.5 align-middle">
                         <span
                           aria-hidden="true"
-                          className="grid size-11 shrink-0 place-items-center rounded-full bg-well text-meta font-medium text-ink-soft uppercase"
+                          className="grid size-11 shrink-0 place-items-center rounded-full bg-sunken text-caption font-medium text-fg-2 uppercase"
                         >
                           {(a.display_name || a.email).slice(0, 1)}
                         </span>
                         <span className="flex flex-col leading-tight">
                           <span className="font-medium">{a.email}</span>
                           <span className="ops-cell-secondary">{a.display_name ?? "—"}</span>
-                          {a.id === operator.id && <span className="hint mt-0.5 text-meta">（当前账号）</span>}
+                          {a.id === operator.id && <span className="hint mt-0.5 text-caption">（当前账号）</span>}
                         </span>
                       </span>
                     </td>
@@ -188,7 +177,7 @@ export function Operators({ operator }: TabProps) {
                     <td>
                       <Lamp state={a.disabled ? "disabled" : "applied"}>{a.disabled ? "已停用" : "正常"}</Lamp>
                     </td>
-                    <td className="text-muted-foreground">{fmtTime(a.created_at)}</td>
+                    <td className="text-fg-3">{fmtTime(a.created_at)}</td>
                     <td className="right">
                       <span className="inline-flex items-center justify-end gap-1.5">
                         {mine?.kind === "role" && (
@@ -293,38 +282,18 @@ export function Operators({ operator }: TabProps) {
           </>
         }
       />
-      <BentoGrid>
-        <Card className={`${span.d6} ops-snapshot`}>
-          <CardHeader number={1} title="可用账号 · 全部运维账号" />
-          {enabled === null
-            ? (loadError ? <CardMessage onRetry={() => void reload()}>账号状态读取失败。</CardMessage> : <MetricSkeleton />)
-            : <Metric size="hero">{fmtInt(enabled.length)}</Metric>}
-          <CardFooter>
-            <dl className="grid grid-cols-2 gap-4 border-t border-line pt-4">
-              <div>
-                <dt className="text-caption text-muted">可用管理员</dt>
-                <dd className="mt-2"><Metric size="value">{enabled === null ? "—" : fmtInt(enabled.filter((account) => account.role === "admin").length)}</Metric></dd>
-              </div>
-              <div>
-                <dt className="text-caption text-muted">已停用账号</dt>
-                <dd className="mt-2"><Metric size="value">{items === null || enabled === null ? "—" : fmtInt(items.length - enabled.length)}</Metric></dd>
-              </div>
-            </dl>
-            <p className="mt-4 text-caption text-muted">停用会立即结束全部会话。至少保留一位可用管理员。</p>
-            {loadError && items !== null && <p className="mt-3 text-caption text-muted">刷新失败，显示最近成功读取的状态。</p>}
-          </CardFooter>
-        </Card>
-        <Card className={`${span.d6} ops-snapshot`}>
-          <CardHeader number={2} title="角色分布 · 全部账号" description="包含可用与已停用账号；角色决定平台操作范围。" />
-          <CardFooter>
-            {items === null ? (loadError
-              ? <CardMessage onRetry={() => void reload()}>账号读取失败，重试后查看角色分布。</CardMessage>
-              : <ChartSkeleton />)
-              : <RankBars items={roles} accessibleLabel={`全部 ${fmtInt(items.length)} 个运维账号的角色分布：${roles.map((role) => `${role.label} ${role.displayValue} 个`).join("，")}`} emptyLabel="暂无运维账号" />}
-          </CardFooter>
-        </Card>
-        {list}
-      </BentoGrid>
+      <section className="operators-overview" aria-label="运维账号概况">
+        {([
+          ["全部账号", items === null ? "—" : fmtInt(items.length)],
+          ["可用账号", enabled === null ? "—" : fmtInt(enabled.length)],
+          ["可用管理员", enabled === null ? "—" : fmtInt(enabled.filter((account) => account.role === "admin").length)],
+          ["已停用账号", items === null || enabled === null ? "—" : fmtInt(items.length - enabled.length)],
+        ] as const).map(([label, value]) => (
+          <Card key={label} className="operators-stat"><CardHeader title={label} />{items === null && !loadError ? <MetricSkeleton /> : <Metric>{value}</Metric>}</Card>
+        ))}
+      </section>
+      {loadError && items !== null && <p className="text-caption text-fg-3">刷新失败，显示最近成功读取的状态。</p>}
+      {list}
       </div>
       {creating && <CreateForm onCreated={created} onCancel={() => setCreating(false)} />}
     </Dialog.Root>
@@ -427,6 +396,7 @@ function CreateForm({
           <div className="operators-create-body">
             <fieldset className="operators-create-fields" disabled={busy}>
               <legend className="vh">账号信息与权限</legend>
+              <h3 className="operators-create-heading">登录资料</h3>
               <div className="operators-create-grid">
                 <div className="operators-create-field">
                   <label className="f">
@@ -465,40 +435,43 @@ function CreateForm({
                   )}
                 </div>
               </div>
-              <div className="operators-create-field">
-                <label className="f">
-                  <span>角色</span>
-                  <Select value={role} aria-describedby={ids.role} onValueChange={(value) => setRole(value as OperatorRole)}>
-                    {ROLES.map((r) => (
-                      <option key={r.role} value={r.role}>
-                        {r.label}
-                      </option>
-                    ))}
-                  </Select>
-                </label>
-                <p id={ids.role} className="operators-role-hint">
-                  只读：只能查看；运维：可修改网关资源、租户与密钥；管理员：另可管理运维账号、网关凭据与下发。
-                </p>
-              </div>
-              <div className="operators-create-field">
-                <label className="f">
-                  <span>初始口令</span>
-                  <input
-                    type="password"
-                    required
-                    autoComplete="new-password"
-                    value={password}
-                    aria-invalid={fields.password ? true : undefined}
-                    aria-describedby={[ids.passwordHint, fields.password ? ids.password : null].filter(Boolean).join(" ")}
-                    onChange={(e) => setPassword(e.target.value)}
-                  />
-                </label>
-                <p id={ids.passwordHint} className="operators-field-hint">创建后不再显示口令，请通过安全渠道交付。</p>
-                {fields.password && (
-                  <p id={ids.password} className="field-problem">
-                    {fields.password}
+              <h3 className="operators-create-heading">访问与安全</h3>
+              <div className="operators-create-grid">
+                <div className="operators-create-field">
+                  <label className="f">
+                    <span>角色</span>
+                    <Select value={role} aria-describedby={ids.role} onValueChange={(value) => setRole(value as OperatorRole)}>
+                      {ROLES.map((r) => (
+                        <option key={r.role} value={r.role}>
+                          {r.label}
+                        </option>
+                      ))}
+                    </Select>
+                  </label>
+                  <p id={ids.role} className="operators-role-hint">
+                    只读：只能查看；运维：可修改网关资源、租户与密钥；管理员：另可管理运维账号、网关凭据与下发。
                   </p>
-                )}
+                </div>
+                <div className="operators-create-field">
+                  <label className="f">
+                    <span>初始口令</span>
+                    <input
+                      type="password"
+                      required
+                      autoComplete="new-password"
+                      value={password}
+                      aria-invalid={fields.password ? true : undefined}
+                      aria-describedby={[ids.passwordHint, fields.password ? ids.password : null].filter(Boolean).join(" ")}
+                      onChange={(e) => setPassword(e.target.value)}
+                    />
+                  </label>
+                  <p id={ids.passwordHint} className="operators-field-hint">创建后不再显示口令，请通过安全渠道交付。</p>
+                  {fields.password && (
+                    <p id={ids.password} className="field-problem">
+                      {fields.password}
+                    </p>
+                  )}
+                </div>
               </div>
             </fieldset>
             {failure && (

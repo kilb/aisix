@@ -1,4 +1,5 @@
 import "./operations.css";
+import "./Audit.css";
 import { auditSearchText } from "../lib/operationalRecords";
 import { useRecordTable } from "../lib/recordTable";
 import { RecordTools, RecordPager } from "../components/RecordTools";
@@ -10,20 +11,7 @@ import { errorText, fmtInt, fmtTime } from "../lib/fmt";
 import { Button } from "../ui/Button";
 import { OperationalTable as DataTable, Loading } from "../components/OperationalTable";
 import { EmptyState } from "../ui/EmptyState";
-import {
-  BentoGrid,
-  Card,
-  CardFooter,
-  CardHeader,
-  CardMessage,
-  ChartSkeleton,
-  Metric,
-  MetricSkeleton,
-  PageHeader,
-  span,
-  Toolbar,
-} from "../components/page";
-import { RankBars } from "../components/charts";
+import { Card, CardHeader, Metric, MetricSkeleton, PageHeader, Toolbar } from "../components/page";
 import { RefreshCw } from "lucide-react";
 import { Select } from "../ui/Select";
 
@@ -151,6 +139,7 @@ export function Audit(_: TabProps) {
     kindCounts.set(kind, (kindCounts.get(kind) ?? 0) + 1);
   }
   const kindItems = [...kindCounts].map(([kind, value]) => ({
+    kind,
     label: TARGET_KINDS.find((target) => target.kind === kind)?.label ?? (kind || "未标注对象"),
     value,
     displayValue: fmtInt(value),
@@ -158,9 +147,8 @@ export function Audit(_: TabProps) {
 
   const newest = rows?.[0] ?? null;
   const oldest = rows?.at(-1) ?? null;
-  const leadingKind = kindItems[0] ?? null;
 
-  // 桌面和平板：范围 6 + 对象分布 6；筛选与完整记录 12。
+  // 统计只描述已加载范围；完整记录始终通栏显示。
   return (
     <div className="cp-operations cp-audit">
       <PageHeader
@@ -174,39 +162,28 @@ export function Audit(_: TabProps) {
           <Button type="button" className="ops-icon-button" aria-label="刷新" title="刷新审计日志" onClick={() => void loadFirst(filter)}><RefreshCw aria-hidden /></Button>
         }
       />
-      <BentoGrid>
-        <Card className={`${span.d6} ops-snapshot`}>
-          <CardHeader number={1} title="已加载记录 · 当前筛选" />
-          {rows === null
-            ? (error ? <CardMessage onRetry={() => void loadFirst(filter)}>审计记录读取失败。</CardMessage> : <MetricSkeleton />)
-            : <Metric size="hero">{fmtInt(rows.length)}</Metric>}
-          <CardFooter>
-            <p className="text-caption text-muted">{rows === null ? "读取记录后显示当前范围。" : next === null ? "已加载当前筛选下的全部记录。" : "当前为部分记录，不能代表全部审计量。"}</p>
-            {newest !== null && oldest !== null && (
-              <dl className="mt-4 grid gap-4 border-t border-line pt-4 tablet:grid-cols-2">
-                <div>
-                  <dt className="text-caption text-muted">本次加载 · 最新</dt>
-                  <dd className="mt-2 text-caption"><time dateTime={newest.at}>{fmtTime(newest.at)}</time></dd>
-                </div>
-                <div>
-                  <dt className="text-caption text-muted">本次加载 · 最早</dt>
-                  <dd className="mt-2 text-caption"><time dateTime={oldest.at}>{fmtTime(oldest.at)}</time></dd>
-                </div>
-              </dl>
-            )}
-          </CardFooter>
+      <section className="audit-overview" aria-label="已加载审计记录概况">
+        <Card className="audit-stat">
+          <CardHeader title="已加载记录" />
+          {rows === null && !error ? <MetricSkeleton /> : <Metric>{rows === null ? "—" : fmtInt(rows.length)}</Metric>}
+          <p className="text-caption text-fg-3">{rows === null ? "读取记录后显示当前范围。" : next === null ? "已加载当前筛选下的全部记录。" : "当前为部分记录，可继续加载更早记录。"}</p>
         </Card>
-        <Card className={`${span.d6} ops-snapshot`}>
-          <CardHeader number={2} title="对象类型 · 已加载记录前五" description="仅汇总当前已加载记录；不包含尚未读取的更早记录。" />
-          <CardFooter>
-            {rows === null ? (error
-              ? <CardMessage onRetry={() => void loadFirst(filter)}>审计记录读取失败，重试后查看分布。</CardMessage>
-              : <ChartSkeleton />)
-              : <RankBars items={kindItems} accessibleLabel={leadingKind !== null ? `已加载 ${fmtInt(rows.length)} 条记录中，最多的对象类型是${leadingKind.label}，共 ${leadingKind.displayValue} 条；图中列出前五类` : "当前筛选没有已加载的审计记录"} emptyLabel="没有符合条件的记录" />}
-          </CardFooter>
+        <Card className="audit-stat">
+          <CardHeader title="对象类型" />
+          {rows === null && !error ? <MetricSkeleton /> : <Metric>{rows === null ? "—" : fmtInt(kindCounts.size)}</Metric>}
+          <p className="text-caption text-fg-3">仅汇总当前已加载的记录</p>
         </Card>
-        <Card className={span.d12}>
-          <CardHeader number={3} title="变更记录" description="每项变更与审计记录在同一事务里写入，最新的在前。详情只列字段名和非机密的值。" />
+        <Card className="audit-stat audit-range">
+          <CardHeader title="本次加载 · 最新" />
+          <p>{newest ? <time dateTime={newest.at}>{fmtTime(newest.at)}</time> : "—"}</p>
+        </Card>
+        <Card className="audit-stat audit-range">
+          <CardHeader title="本次加载 · 最早" />
+          <p>{oldest ? <time dateTime={oldest.at}>{fmtTime(oldest.at)}</time> : "—"}</p>
+        </Card>
+      </section>
+      <Card className="audit-list">
+          <CardHeader title="变更记录" description="最新记录在前；详情仅显示字段名与非机密值。" />
           <Toolbar>
             <label className="f filter filter-wide">
               <span>对象类型</span>
@@ -232,6 +209,12 @@ export function Audit(_: TabProps) {
               </Select>
             </label>
           </Toolbar>
+          {rows !== null && kindItems.length > 0 && (
+            <section className="audit-kinds" aria-label="对象类型 · 已加载记录前五">
+              <h3 className="text-small text-fg-3">对象类型 · 已加载记录前五</h3>
+              <dl>{kindItems.map((kind) => <div key={kind.kind}><dt>{kind.label}</dt><dd>{kind.displayValue}</dd></div>)}</dl>
+            </section>
+          )}
           {tenantsError && <div className="note crit">无法读取租户列表：{tenantsError}</div>}
           {error && (
             <div className="note crit" role="alert">
@@ -258,7 +241,7 @@ export function Audit(_: TabProps) {
                 <tbody>
                   {table.rows.map((r) => (
                     <tr key={r.id}>
-                      <td className="whitespace-normal text-muted-foreground" title={fmtTime(r.at)}>
+                      <td className="whitespace-normal text-fg-3" title={fmtTime(r.at)}>
                         {fmtTime(r.at)}
                         <span className="ops-cell-secondary">#{r.id}</span>
                       </td>
@@ -271,13 +254,13 @@ export function Audit(_: TabProps) {
                         )}
                       </td>
                       <td>
-                        <code className="rounded-chip bg-well px-2 py-1 font-mono text-meta text-ink-soft">{r.action}</code>
+                        <code className="rounded-full bg-sunken px-2 py-1 font-mono text-caption text-fg-2">{r.action}</code>
                       </td>
                       <td>
                         <span className="inline-flex flex-col gap-0.5 align-middle">
                           {r.target_kind ? <code className="text-caption">{r.target_kind}</code> : "—"}{" "}
                           {r.target_id && (
-                            <code className="block max-w-[19ch] text-meta break-all whitespace-normal text-muted-foreground">
+                            <code className="block max-w-[19ch] text-caption break-all whitespace-normal text-fg-3">
                               {r.target_id}
                             </code>
                           )}
@@ -295,8 +278,7 @@ export function Audit(_: TabProps) {
             </>
           )}
 
-        </Card>
-      </BentoGrid>
+      </Card>
     </div>
   );
 }

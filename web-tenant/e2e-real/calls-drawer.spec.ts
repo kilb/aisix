@@ -21,7 +21,9 @@ for (const field of ["tenantUrl", "adminUrl", "httpUrl"]) {
   const url = new URL(state[field]);
   if (!["http:", "https:"].includes(url.protocol) || !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname) || url.username || url.password) throw new Error("Only isolated loopback acceptance URLs are allowed");
 }
-const baseUrl: string = state.tenantUrl;
+// 候选前端通过独立预览端口连接同一个真实后端，原世界文件保持只读。
+const baseUrl: string = process.env.CONSOLE_TEMPLATE_TENANT_URL ?? state.tenantUrl;
+if (!["localhost", "127.0.0.1", "[::1]"].includes(new URL(baseUrl).hostname)) throw new Error("Only isolated preview URLs are allowed");
 const scenarios = state.byteTokenEvidence?.cases as Scenario[] | undefined;
 if (!Array.isArray(scenarios) || !scenarios.some(item => item.kind === "positive") || !scenarios.some(item => item.kind === "missing") || scenarios.some(item => item.tenant_auth !== "metricsOwner" || !item.event_id || !item.request_id)) throw new Error("Real positive and missing call evidence is required");
 if (!state.tokenUiFixture?.apiKeyId || !state.tokenUiFixture?.tenantId) throw new Error("Real tenant and API key scope is required");

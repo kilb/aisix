@@ -1,0 +1,91 @@
+/* 个人设置按资料、安全、会话分区；口令处理仍由原安全组件负责。 */
+.cp-account-settings {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+}
+.cp-account-settings > .page-header {
+  margin-bottom: 0;
+}
+.cp-account-settings .account-settings-sheet {
+  gap: 0;
+  min-width: 0;
+}
+.cp-account-settings .account-settings-sheet > section {
+  min-width: 0;
+  margin: 0;
+  padding: 16px 0;
+  border: 0;
+  border-top: 1px solid var(--color-hairline);
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+.cp-account-settings .account-settings-sheet > section:first-child {
+  padding-top: 0;
+  border-top: 0;
+}
+.cp-account-settings .account-settings-sheet > section:last-child {
+  padding-bottom: 0;
+}
+.cp-account-settings .account-profile-list {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+  margin-top: 16px;
+}
+.cp-account-settings .account-profile-list > div {
+  display: grid;
+  align-content: start;
+  gap: 6px;
+  padding: 0;
+  border: 0;
+  min-width: 0;
+}
+.cp-account-settings .account-profile-list dt {
+  color: var(--color-fg-3);
+  font-size: var(--text-caption);
+}
+.cp-account-settings .account-profile-list dd {
+  margin: 0;
+  color: var(--color-fg);
+  font-size: var(--text-small);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.cp-account-settings .account-security .bento-card-header {
+  margin-bottom: 0;
+}
+.cp-account-settings .account-security {
+  gap: 16px;
+}
+.cp-account-settings .account-password-form {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  max-width: none;
+}
+.cp-account-settings .account-password-form > .field:first-child,
+.cp-account-settings .account-password-form > :is(.note, .account-form-actions) {
+  grid-column: 1 / -1;
+}
+.cp-account-settings .account-password-form > .field:first-child {
+  max-width: 560px;
+}
+.cp-account-settings .account-form-actions {
+  justify-content: flex-end;
+  padding-top: 16px;
+  border-top: 1px solid var(--color-hairline);
+}
+.cp-account-settings .account-session .bento-card-header {
+  margin-bottom: 0;
+}
+@media (max-width: 719px) {
+  .cp-account-settings .account-profile-list,
+  .cp-account-settings .account-password-form {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .cp-account-settings .account-password-form > .field:first-child {
+    max-width: none;
+  }
+}

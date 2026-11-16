@@ -1,0 +1,31 @@
+/* JSON 资源编辑保留完整宽度，列表和编辑状态各占一个工作区。 */
+.cp-resources {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.cp-resources > .page-header,
+.cp-resources > .resources-summary,
+.cp-resources > .resources-list,
+.cp-resources > .resources-editor {
+  margin: 0;
+}
+.resources-list,
+.resources-editor {
+  min-width: 0;
+}
+.resources-editor .json-editor {
+  margin-top: 16px;
+}
+.resources-editor-footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--hairline);
+}
+.resources-editor-footer > span {
+  flex-wrap: wrap;
+}

@@ -1,6 +1,7 @@
 import "./operations.css";
+import "./providers/ProviderManagement.css";
 import { Eye, Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { TabProps } from "../App";
 import { ConflictNote } from "../components/ConflictNote";
 import { Field, useRefusalFocus } from "../ui/Field";
@@ -61,7 +62,7 @@ const GROUPS_HINT = "分组名只有运维可见；普通租户只能用到其�
 
 /** A form card's closing bar: its buttons at the bottom right, on a muted strip the card's width. */
 const FORM_FOOTER =
-  "ops-form-footer -mx-[var(--pad)] -mb-[var(--pad)] mt-6 flex max-w-none flex-wrap items-center justify-end gap-2 rounded-b-card border-t border-line bg-well px-[var(--pad)] py-3 [&_.hint]:text-ink-soft";
+  "ops-form-footer -mx-[var(--pad)] -mb-[var(--pad)] mt-6 flex max-w-none flex-wrap items-center justify-end gap-2 rounded-b-card border-t border-hairline bg-sunken px-[var(--pad)] py-3 [&_.hint]:text-fg-2";
 
 /** How a referrer's kind is named on this page. */
 const KIND_LABEL: Record<string, string> = { models: "模型" };
@@ -99,6 +100,12 @@ export function Providers({ canEdit }: TabProps) {
   const groups = useLoad(() => groupsApi.list(), []);
   const [schema, setSchema] = useState<SchemaInfo | null>(null);
   const [open, setOpen] = useState<Open | null>(null);
+  // 隐去长列表后从当前对象标题进入，避免沿用列表中段的滚动位置。
+  useLayoutEffect(() => {
+    if (open?.mode !== "edit") return;
+    window.scrollTo({ top: 0, left: 0, behavior: "instant" });
+    document.getElementById("workspace-main")?.focus({ preventScroll: true });
+  }, [open]);
   const [opening, setOpening] = useState(false);
   const createTrigger = useRef<HTMLButtonElement>(null);
   const accountList = useRef<HTMLElement>(null);
@@ -195,8 +202,8 @@ export function Providers({ canEdit }: TabProps) {
     <div className="cp-operations cp-providers">
       <PageHeader
         eyebrow="PROVIDERS · 上游连接"
-        title="上游账号"
-        dataLead={pk.items ? <>已配置 {pk.items.length} 个上游账号，覆盖 {assignedGroups.size} 个分组。账号的协议、模型映射和密钥在此维护。</> : "维护上游连接、协议族、分组与模型映射。"}
+        title={editing ? nameOf(editing) : "上游账号"}
+        dataLead={editing ? "维护当前账号的连接、分组和模型映射。" : pk.items ? <>已配置 {pk.items.length} 个上游账号，覆盖 {assignedGroups.size} 个分组。账号的协议、模型映射和密钥在此维护。</> : "维护上游连接、协议族、分组与模型映射。"}
         actions={
           <>
             <Button type="button" className="ops-icon-button" aria-label="刷新" title="刷新上游账号" onClick={() => void pk.reload()}><RefreshCw aria-hidden /></Button>
@@ -209,7 +216,7 @@ export function Providers({ canEdit }: TabProps) {
           </>
         }
       />
-      <InventorySummary
+      {!editing && <InventorySummary
         title="上游账号 · 当前配置"
         total={pk.items?.length ?? null}
         totalLabel="已配置账号"
@@ -226,8 +233,8 @@ export function Providers({ canEdit }: TabProps) {
           <div><dt>已分配分组的账号</dt><dd>{pk.items ? pk.items.length - ungrouped : "—"}</dd></div>
           <div><dt>未分配分组的账号</dt><dd>{pk.items ? ungrouped : "—"}</dd></div>
         </dl>
-      </InventorySummary>
-      <div className="mb-6 grid gap-3 empty:hidden [&>.note]:m-0">
+      </InventorySummary>}
+      <div className="grid gap-3 empty:hidden [&>.note]:m-0">
         <Msg note={note} />
         {deleteFailure &&
           (deleteFailure.error.code === "version_mismatch" ? (
@@ -313,7 +320,7 @@ export function Providers({ canEdit }: TabProps) {
             title="全部账号"
             description={<>网关调用上游供应商所用的账号。密钥保存后不再显示。{GROUPS_HINT}。</>}
             className="mb-0"
-            actions={pk.items && <span className="text-caption text-muted tabular-nums">{pk.items.length} 个</span>}
+            actions={pk.items && <span className="text-caption text-fg-3 tabular-nums">{pk.items.length} 个</span>}
           />
           <RecordTableToolbar search={{ value: accountTable.query, onChange: accountTable.setQuery, label: "搜索上游账号", placeholder: "名称、标识、协议族、供应商或分组" }}><label className="text-caption">协议族<Select size="compact" value={adapterFilter} onValueChange={(value) => setAdapterFilter(value)}><option value="">全部协议族</option>{[...new Set((pk.items ?? []).map((a) => a.doc.adapter).filter((a): a is string => Boolean(a)))].sort().map((adapter) => <option key={adapter} value={adapter}>{adapter}</option>)}</Select></label></RecordTableToolbar>
           {pk.items === null ? (
@@ -343,7 +350,7 @@ export function Providers({ canEdit }: TabProps) {
                     <td><span className="ops-cell-main">{a.doc.adapter ?? "—"}</span><span className="ops-cell-secondary">{a.doc.provider || "—"}</span></td>
                     <td>
                       {a.doc.api_base ? (
-                        <code className="block max-w-[18rem] truncate text-caption text-ink-soft" title={maskUrl(a.doc.api_base)}>
+                        <code className="block max-w-[18rem] truncate text-caption text-fg-2" title={maskUrl(a.doc.api_base)}>
                           {maskUrl(a.doc.api_base)}
                         </code>
                       ) : (
@@ -678,10 +685,11 @@ function AccountForm({
   }
 
   return (
-    <form ref={form} className="panel @container mb-0" aria-label={title} onSubmit={submit}>
-      <CardHeader number={3} title={title} className="mb-5" />
-      {/* 字段按可用宽度排为两列或四列。 */}
-      <div className="grid gap-x-4 @sm:grid-cols-2 @3xl:grid-cols-4">
+    <form ref={form} className="panel provider-editor-form @container mb-0" aria-label={title} onSubmit={submit}>
+      <CardHeader title={title} description="密钥保存后不再显示；未替换时保留已保存值。" />
+      <section className="provider-form-section" aria-label="上游连接">
+      <h3>上游连接</h3>
+      <div className="provider-form-grid">
         <Field label="名称" error={at("name")}>
           {(aria) => <input required disabled={locked} value={name} onChange={(e) => setName(e.target.value)} {...aria} />}
         </Field>
@@ -710,12 +718,12 @@ function AccountForm({
             )}
           </Field>
         )}
-        <div className="min-w-0 @sm:col-span-2">
+        <div className="min-w-0">
           <Field label="供应商标识" hint={PROVIDER_HINT} error={at("provider")}>
             {(aria) => <input disabled={locked} value={provider} onChange={(e) => setProvider(e.target.value)} {...aria} />}
           </Field>
         </div>
-        <div className="min-w-0 @sm:col-span-2">
+        <div className="min-w-0">
           <Field label="接口地址" error={at("apiBase")}>
             {(aria) => (
               <input
@@ -729,7 +737,7 @@ function AccountForm({
             )}
           </Field>
         </div>
-        <div className="min-w-0 @sm:col-span-2">
+        <div className="min-w-0">
           <SecretInput
             label="密钥"
             stored={stored}
@@ -741,6 +749,7 @@ function AccountForm({
           />
         </div>
       </div>
+      </section>
       <RealtimeSipBindingForm
         draft={sip}
         storedSecret={typeof doc.realtime_sip?.webhook_secret === "string" && doc.realtime_sip.webhook_secret !== ""}
@@ -752,7 +761,7 @@ function AccountForm({
         projectError={sipProjectError ?? problemAt(details, isRealtimeSipProjectPath)}
         onProjectChange={(value) => { setSipProject(value); setSipProjectError(null); }}
       />
-      <fieldset className="tn-section mt-2 border-t border-line pt-5 [&_.tn-groups]:grid-cols-[repeat(auto-fill,minmax(13rem,1fr))] [&_.tn-groups]:gap-x-6">
+      <fieldset className="tn-section mt-2 border-t border-hairline pt-5 [&_.tn-groups]:grid-cols-[repeat(auto-fill,minmax(13rem,1fr))] [&_.tn-groups]:gap-x-6">
         <legend className="text-body font-semibold">分组</legend>
         <p className="hint text-caption">{GROUPS_HINT}；只能从已有的分组里选。</p>
         {groupsError && (

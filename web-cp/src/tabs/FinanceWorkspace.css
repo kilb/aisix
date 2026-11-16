@@ -1,239 +1,158 @@
-/* 账务与价格工作区共用紧凑排版；金额格式和业务状态由原组件提供。 */
+/* 财务页面沿用模板的通栏清单、紧凑指标和单层表单。金额仍由业务 formatter 完整提供。 */
 .finance-workspace {
   min-width: 0;
   max-width: 100%;
   container-type: inline-size;
 }
-/* 表头筛选允许收缩，长租户选项不能撑破卡片。 */
 .finance-workspace .bento-card-header > * { min-width: 0; max-width: 100%; }
-/* 工具栏由自身间距排布，搜索标签不再额外留下表单字段的底部间距。 */
-.finance-workspace .record-table-toolbar > .f {
-  margin-bottom: 0;
-}
-/* 分区保留全部入口，窄屏在导航本身滚动。 */
+.finance-workspace .record-table-toolbar > .f { margin-bottom: 0; }
+
+/* 分区导航与模板的分段控件一致；选中状态由文字和实心胶囊共同表达。 */
 .finance-workspace .sections-switch {
+  display: flex;
+  width: fit-content;
   max-width: 100%;
   gap: 4px;
-  margin-bottom: 24px;
-  padding: 0;
+  margin-bottom: 16px;
+  padding: 4px;
   overflow-x: auto;
   overscroll-behavior-x: contain;
   border: 0;
-  border-bottom: 1px solid var(--border);
-  border-radius: 0;
-  background: transparent;
+  border-radius: var(--r-round);
+  background: var(--color-sunken);
 }
 .finance-workspace .sections-switch > button {
-  min-width: 44px;
-  min-height: 44px;
+  flex: 0 0 auto;
+  min-height: 36px;
   height: auto;
-  padding: 10px 12px;
+  padding: 8px 14px;
   border: 0;
-  border-bottom: 2px solid transparent;
-  border-radius: 0;
+  border-radius: var(--r-round);
   background: transparent;
-  color: var(--ink-soft);
+  color: var(--color-fg-3);
   font-family: var(--font-sans);
-  font-size: 14px;
-  font-weight: 500;
-  line-height: 22px;
+  font-size: var(--text-small);
+  font-weight: 600;
+  line-height: var(--text-small--line-height);
+  white-space: nowrap;
 }
-.finance-workspace .sections-switch > button:hover {
-  background: var(--card);
-  color: var(--foreground);
+.finance-workspace .sections-switch > button:hover { background: var(--color-tint); color: var(--color-fg); }
+.finance-workspace .sections-switch > button[aria-pressed="true"] { background: var(--color-ink); color: var(--color-surface); }
+.finance-workspace .sections-switch > button::after { content: none; }
+.finance-workspace .sections-switch > button:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+.finance-workspace .finance-count { border-radius: var(--r-round); background: var(--color-tint); font-family: var(--font-sans); }
+
+/* 指标独立成行；余额完整显示，不因长金额挤压其它数字。 */
+.finance-workspace .finance-stats {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 16px;
+  margin-bottom: 16px;
 }
-.finance-workspace .sections-switch > button[aria-pressed="true"] {
-  border-bottom-color: var(--bento-accent);
-  background: transparent;
-  color: var(--foreground);
+.finance-workspace .finance-stats > .finance-stat { grid-column: auto; min-width: 0; padding: 18px; border-radius: var(--radius-tile); }
+.finance-workspace .finance-stat > .bento-card-header { margin-bottom: 0; }
+.finance-workspace .finance-stat .metric { overflow-wrap: anywhere; font-size: var(--text-metric); line-height: var(--text-metric--line-height); }
+.finance-workspace .finance-balance-stat .metric { font-size: var(--text-heading); line-height: var(--text-heading--line-height); letter-spacing: normal; }
+.finance-workspace .finance-overview { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; margin-bottom: 16px; }
+.finance-workspace .finance-overview > .panel:first-child { grid-column: span 2; }
+.finance-workspace .finance-overview > .panel:nth-child(2) { grid-column: span 1; }
+.finance-workspace .finance-overview .metric { font-size: var(--text-metric-lg); line-height: var(--text-metric-lg--line-height); }
+.finance-workspace .finance-facts-card { margin-bottom: 16px; }
+.finance-workspace .finance-facts-card .compact-overview-facts { gap: 16px; }
+.finance-workspace .finance-facts-card .compact-overview-facts > div { min-width: 0; }
+.finance-workspace .finance-facts-card .compact-overview-facts dd { overflow-wrap: anywhere; }
+
+/* 清单和打开的详情各占一行，宽表不再与表单争夺横向空间。 */
+.finance-workspace .finance-record-layout { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; align-items: start; }
+.finance-workspace .finance-record-layout > * { min-width: 0; }
+.finance-workspace .finance-record-layout > .side-panel { width: auto; margin: 0; position: static; }
+.finance-workspace .finance-record-layout > .side-main { display: grid; gap: 16px; }
+.finance-workspace .finance-table-card { margin-bottom: 0; }
+.finance-workspace .finance-form-grid { gap: 16px; }
+.finance-workspace .finance-dialog-body { min-width: 0; }
+.finance-workspace .finance-repricing-result { display: grid; min-width: 0; gap: 16px; }
+.finance-workspace .finance-repricing-totals .dt > tbody { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr)); }
+.finance-workspace .finance-repricing-totals .dt > tbody > tr { display: flex; min-width: 0; flex-direction: column; padding: 12px 16px; }
+.finance-workspace .finance-repricing-totals .dt > tbody > tr > :is(th, td) { height: auto; border: 0; padding: 4px 0; text-align: left; }
+.finance-workspace .finance-repricing-totals .dt .money { overflow-wrap: anywhere; }
+.finance-workspace .finance-repricing-totals .dt td { font-weight: 700; }
+
+/* 表格保留实际列宽，滚动只发生在 DataTable 容器中。 */
+.finance-workspace .dt-wrap { max-width: 100%; max-height: none; overflow-x: auto; overflow-y: visible; container-type: inline-size; }
+.finance-workspace .dt { width: 100%; min-width: 40rem; }
+.finance-workspace .dt:has(> thead > tr > th:nth-child(5)) { min-width: 52rem; }
+.finance-workspace .dt:has(> thead > tr > th:nth-child(7)) { min-width: 68rem; }
+.finance-workspace .bl-box:not(:has(thead)) .dt { min-width: 0; }
+.finance-workspace .dt > :is(thead, tbody, tfoot) > tr > :is(th, td) { vertical-align: top; }
+.finance-workspace .dt .num { text-align: right; font-variant-numeric: tabular-nums; }
+.finance-workspace .dt .cell-note { overflow-wrap: anywhere; }
+.finance-workspace .finance-groups-table .row-actions { min-width: 0; max-width: 100%; flex-wrap: wrap; }
+.finance-workspace .finance-groups-table .two-step-warn { white-space: normal; overflow-wrap: anywhere; }
+.finance-workspace .finance-groups-table .row-actions .btn { white-space: nowrap; }
+/* 目录、价格库、同步对照、分组编辑、成本明细和充值驳回共用同一展开边界。
+   宽度取自身表格滚动窗，横滚到右端时仍留在可见区域；调用记录由专用样式处理。 */
+.finance-workspace .dt > tbody > :is(.dt-detail, .library-sync-detail-row) > td[colspan] > :is(div, form, section):not(.charge-check) {
+  --finance-detail-gutter: var(--s-5);
+  position: sticky;
+  left: var(--finance-detail-gutter);
+  box-sizing: border-box;
+  width: calc(100cqw - var(--finance-detail-gutter) * 2);
+  inline-size: calc(100cqw - var(--finance-detail-gutter) * 2);
+  max-width: calc(100cqw - var(--finance-detail-gutter) * 2);
+  max-inline-size: calc(100cqw - var(--finance-detail-gutter) * 2);
+  min-width: 0;
+  contain: inline-size;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
-.finance-workspace .sections-switch > button:focus-visible {
-  outline: 2px solid var(--foreground);
-  outline-offset: -3px;
+.finance-workspace :is(.dt-detail, .library-sync-detail-row) .price-card-table-wrap {
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: auto;
 }
-.finance-workspace .finance-count {
-  border-radius: 4px;
-  background: var(--well);
-  font-family: var(--font-sans);
-  line-height: 20px;
-}
+.finance-workspace .dt-detail > td > :is(div, form) { border-radius: 0; box-shadow: none; }
+.finance-workspace .dt-detail > td > div:has(.price-card-details) { background: transparent; }
+.finance-workspace .dt-detail section { min-width: 0; }
+.finance-workspace .dt-detail pre { max-width: 100%; white-space: pre-wrap; overflow-wrap: anywhere; }
+.finance-workspace .finance-icon-button { width: 36px; min-width: 36px; min-height: 36px; padding-inline: 0; }
+.finance-workspace .finance-icon-button > svg { width: 16px; height: 16px; }
+.finance-amount-label { display: block; margin-bottom: 2px; color: var(--color-fg-3); font-size: var(--text-caption); font-weight: 400; }
+.finance-resource-count { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; color: var(--color-fg-3); font-size: var(--text-caption); }
+.finance-resource-count strong { color: var(--color-fg); font-size: var(--text-small); font-variant-numeric: tabular-nums; font-weight: 600; }
+
+/* 价格明细附着原记录，以分隔线表达版本和服务档位。 */
 .finance-workspace :is(.baseline-form, .import-compare, .import-detail, .library-single) h3,
 .finance-workspace h3.font-mono,
 .finance-workspace dt.font-mono,
-.finance-workspace :is(.baseline-source-counts, .baseline-next-counts) dt {
-  font-family: var(--font-sans);
-}
-.finance-workspace h3.font-mono {
-  color: var(--foreground);
-  font-size: 15px;
-  line-height: 24px;
-  font-weight: 600;
-}
-.finance-workspace .finance-form-grid {
-  row-gap: 20px;
-}
-/* 完整费率优先占满详情宽度，原始文档接在价目下方。 */
-.finance-workspace .catalogue-records {
-  container-type: inline-size;
-}
-.finance-workspace .catalogue-entry-detail {
-  box-sizing: border-box;
-  width: 100cqw;
-  max-width: 100%;
-  contain: inline-size;
-}
-.finance-workspace .catalogue-entry-detail .price-card-unit {
-  white-space: normal;
-}
-.finance-workspace .baseline-version {
-  padding: 16px 0;
-  border: 0;
-  border-top: 1px solid var(--border);
-  border-radius: 0;
-}
-.finance-workspace .baseline-version-list {
-  gap: 0;
-}
-.finance-workspace .baseline-version-meta {
-  gap: 12px;
-  margin-bottom: 16px;
-}
-.finance-workspace .baseline-version-id {
-  margin-bottom: 12px;
-}
-.finance-workspace .baseline-version-summary {
-  margin-bottom: 12px;
-  padding-top: 12px;
-}
-.finance-workspace .library-price-comparison-grid {
-  gap: 20px;
-  margin-top: 12px;
-  padding-top: 16px;
-  border-top: 1px solid var(--border);
-}
-.finance-workspace .library-expanded-price {
-  padding: 20px 16px;
-}
-.finance-workspace :is(.library-expanded-price, .library-price-comparison-grid) h3 {
-  font-size: 15px;
-  line-height: 24px;
-  font-weight: 600;
-}
-.finance-workspace .library-provenance > div {
-  padding: 12px 0;
-  border-color: var(--border);
-}
-.finance-workspace .library-confirm,
-.finance-workspace .import-bulk {
-  border-radius: 8px;
-  border: 1px solid var(--border);
-}
-/* 明细嵌入清单时避免第二层圆角容器，展开内容仍附着原记录。 */
-.finance-workspace .dt-detail > td > :is(div, form) {
-  border-radius: 0;
-  box-shadow: none;
-}
-.finance-workspace .dt-detail > td > div:has(.price-card-details) {
-  background: transparent;
-}
-.finance-workspace .dt-detail section {
-  min-width: 0;
-}
-.finance-workspace .dt-detail pre {
-  max-width: 100%;
-  overflow: auto;
-}
-@media (max-width: 600px) {
-  .finance-workspace .library-expanded-price {
-    padding: 16px;
-  }
-  .finance-workspace .baseline-version-meta > div {
-    grid-template-columns: minmax(0, 1fr);
-    gap: 4px;
-  }
-}
-
-/* 分页价目与账目自然铺满页面；明细按内容换行，而不是用宽表或内层滚动框承载。 */
-.finance-workspace .dt-wrap { max-height: none; overflow-y: visible; }
-.finance-workspace :is(.panel, .bl-region) { container-type: inline-size; }
-.finance-workspace .dt { width: 100%; min-width: 0; table-layout: fixed; }
-.finance-workspace .dt > :is(thead, tbody, tfoot) > tr > :is(th, td) { min-width: 0; max-width: none; overflow-wrap: anywhere; white-space: normal; vertical-align: top; }
-.finance-workspace .dt:not(:has(> colgroup)) > :is(thead, tbody, tfoot) > tr > :is(th, td):first-child:not([colspan], .import-pick) { width: 25%; }
-.finance-workspace .dt .num { text-align: right; font-variant-numeric: tabular-nums; }
-.finance-workspace .dt:not(:has(> colgroup)) > :is(thead, tbody, tfoot) > tr > :is(th, td).right { width: 12%; min-width: 0; }
-/* 分组的长操作与二次确认在列内换行，不向表格外挤出。 */
-.finance-workspace .finance-groups-table > :is(thead, tbody) > tr > :is(th, td).right { width: 20%; }
-.finance-workspace .finance-groups-table .row-actions { min-width: 0; max-width: 100%; }
-.finance-workspace .finance-groups-table :is(.two-step, .two-step-confirm, .two-step-warn) { min-width: 0; max-width: 100%; }
-/* 固定网格轨道，警告按列宽排版，不用 max-content 撑开确认区。 */
-.finance-workspace .finance-groups-table .two-step.is-asking { grid-template-columns: minmax(0, 1fr); }
-.finance-workspace .finance-groups-table .two-step-warn { width: auto; overflow-wrap: anywhere; }
-.finance-workspace .finance-groups-table .two-step-confirm { flex-wrap: wrap; justify-content: flex-end; }
-.finance-workspace .finance-groups-table .row-actions .btn { max-width: 100%; height: auto; min-height: 44px; padding-block: 8px; white-space: normal; overflow-wrap: anywhere; }
-.finance-workspace .dt:not(:has(> colgroup)):has(> tbody > tr[data-finance-record] > td:nth-child(7)) > :is(thead, tbody) > tr > :is(th, td):first-child:not([colspan], .import-pick) { width: 20%; }
-.finance-workspace .dt .trunc,
-.finance-workspace .dt .truncate { display: block; max-width: 100%; white-space: normal; overflow: visible; text-overflow: clip; overflow-wrap: anywhere; }
-.finance-workspace .dt .max-w-0 { max-width: none; }
-.finance-workspace .dt > :is(thead, tbody) > tr > :is(th, td).w-full { width: auto; }
-.finance-workspace .dt code { white-space: normal; overflow-wrap: anywhere; }
-.finance-workspace :is(.library-browser-table, .library-sync-table, .cost-model-card, .pm-mapping-card) > .dt-wrap > .dt { min-width: 0; min-inline-size: 0; }
-.finance-workspace .baseline-workspace > .side-main > .panel > .dt-wrap > .dt { min-width: 0; }
-.finance-workspace .baseline-workspace > .side-main > .panel > .dt-wrap > .dt > thead > tr > th { width: auto; }
-.finance-workspace .library-browser-table > .dt-wrap > .dt > thead > tr > th { width: auto; }
-.finance-workspace .library-browser-table > .dt-wrap > .dt > thead > tr > th:nth-child(2) { width: 27%; }
-.finance-workspace .library-price-summary { min-width: 0; max-width: 100%; }
-.finance-workspace .dt-detail pre { white-space: pre-wrap; overflow-wrap: anywhere; }
-.finance-workspace .finance-icon-button { min-width: 44px; width: 44px; min-height: 44px; padding-inline: 0; }
-.finance-workspace .finance-icon-button > svg { width: 16px; height: 16px; }
-.finance-amount-label { display: block; margin-bottom: 4px; color: var(--muted-foreground); font-size: 12px; font-weight: 400; }
-.finance-resource-count { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; color: var(--muted-foreground); font-size: 12px; line-height: 20px; }
-.finance-resource-count strong { color: var(--foreground); font-size: 13px; font-variant-numeric: tabular-nums; font-weight: 500; }
-/* 多字段记录在中等容器中改为有名称的网格，金额和审查状态仍全部可见。 */
-@container (max-width: 72rem) {
-  .finance-workspace table:not(.charge-records-table):has(> tbody > tr[data-finance-record] > td:nth-child(7)) { display: block; }
-  .finance-workspace table:not(.charge-records-table):has(> tbody > tr[data-finance-record] > td:nth-child(7)) > colgroup { display: none; }
-  .finance-workspace table:not(.charge-records-table):has(> tbody > tr[data-finance-record] > td:nth-child(7)) > thead { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
-  .finance-workspace table:not(.charge-records-table):has(> tbody > tr[data-finance-record] > td:nth-child(7)) > tbody { display: block; }
-  .finance-workspace table:not(.charge-records-table):has(> tbody > tr[data-finance-record] > td:nth-child(7)) > tbody > tr[data-finance-record] { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px 14px; padding: 12px 14px; border-bottom: 1px solid var(--border); }
-  .finance-workspace table:not(.charge-records-table):has(> tbody > tr[data-finance-record] > td:nth-child(7)) > tbody > tr[data-finance-record] > td { display: block; width: auto; min-width: 0; max-width: none; height: auto; padding: 0; border: 0; text-align: left; }
-  .finance-workspace table:not(.charge-records-table):has(> tbody > tr[data-finance-record] > td:nth-child(7)) > tbody > tr[data-finance-record] > td::before { content: attr(data-label); display: block; margin-bottom: 5px; color: var(--muted-foreground); font-size: 12px; line-height: 18px; font-weight: 400; }
-  .finance-workspace table:not(.charge-records-table):has(> tbody > tr[data-finance-record] > td:nth-child(7)) > tbody > tr:not([data-finance-record]):has(> td[colspan]) { display: block; }
-  .finance-workspace table:not(.charge-records-table):has(> tbody > tr[data-finance-record] > td:nth-child(7)) > tbody > tr:not([data-finance-record]) > td[colspan] { display: block; width: 100%; box-sizing: border-box; }
-}
-@media (max-width: 719px) {
-  .finance-workspace .sections-switch { flex-wrap: wrap; overflow-x: visible; row-gap: 0; }
-  .finance-workspace .sections-switch > button { padding-inline: 10px; }
-  .finance-workspace table:has(> tbody > tr[data-finance-record]) { display: block; min-width: 0; }
-  .finance-workspace table:has(> tbody > tr[data-finance-record]) > colgroup { display: none; }
-  .finance-workspace table:has(> tbody > tr[data-finance-record]) > thead { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
-  .finance-workspace table:has(> tbody > tr[data-finance-record]) > tbody { display: block; }
-  .finance-workspace table:has(> tbody > tr[data-finance-record]) > tbody > tr[data-finance-record] { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 16px; padding: 16px; border-bottom: 1px solid var(--border); }
-  .finance-workspace table:has(> tbody > tr[data-finance-record]) > tbody > tr[data-finance-record] > td { display: block; width: auto; min-width: 0; max-width: none; height: auto; padding: 0; border: 0; text-align: left; }
-  .finance-workspace table:has(> tbody > tr[data-finance-record]) > tbody > tr[data-finance-record] > td:first-child,
-  .finance-workspace table:has(> tbody > tr[data-finance-record]) > tbody > tr[data-finance-record] > td[colspan],
-  .finance-workspace table:has(> tbody > tr[data-finance-record]) > tbody > tr[data-finance-record] > td.right { grid-column: 1 / -1; }
-  .finance-workspace table:has(> tbody > tr[data-finance-record]) > tbody > tr[data-finance-record] > td::before { content: attr(data-label); display: block; margin-bottom: 5px; color: var(--muted-foreground); font-size: 12px; line-height: 18px; font-weight: 400; }
-  .finance-workspace table:has(> tbody > tr[data-finance-record]) > tbody > tr:not([data-finance-record]):has(> td[colspan]) { display: block; }
-  .finance-workspace table:has(> tbody > tr[data-finance-record]) > tbody > tr:not([data-finance-record]) > td[colspan] { display: block; width: 100%; box-sizing: border-box; }
-  .finance-workspace .dt tbody tr > td > :is(.row-actions, .bl-row-actions) { justify-content: flex-start; }
-  .finance-workspace .dt-detail { max-width: 100%; }
-  .finance-workspace .dt-detail > td { padding-inline: 12px; }
-}
-
-.finance-workspace .finance-amount-label { margin-bottom: 2px; }
-.finance-workspace .sections-switch { margin-bottom: 16px; }
-.finance-workspace .finance-form-grid { row-gap: 16px; }
-
-/* 宽表保留列的阅读宽度，滚动限制在原有表格工作区。 */
-@media (min-width: 900px) {
-  .finance-workspace .dt:has(> thead > tr > th:nth-child(5)) { min-width: 960px; }
-  .finance-workspace .dt:has(> thead > tr > th:nth-child(7)) { min-width: 1120px; }
-  .finance-workspace .dt:has(> tbody > tr[data-finance-record] > td:nth-child(7)):not(.charge-records-table) { min-width: 0; }
-}
-/* 来源和说明拥有明确的列宽，不用其它列余下的空间承载整段文字。 */
+.finance-workspace :is(.baseline-source-counts, .baseline-next-counts) dt { font-family: var(--font-sans); }
+.finance-workspace h3.font-mono { color: var(--color-fg); font-size: var(--text-body); font-weight: 700; }
+.finance-workspace .catalogue-records { container-type: inline-size; }
+.finance-workspace .catalogue-entry-detail { box-sizing: border-box; width: 100cqw; max-width: 100%; contain: inline-size; }
+.finance-workspace .baseline-version { padding: 16px 0; border: 0; border-top: 1px solid var(--color-hairline); border-radius: 0; }
+.finance-workspace .baseline-version-list { gap: 0; }
+.finance-workspace .baseline-version-meta { gap: 12px; margin-bottom: 16px; }
+.finance-workspace .baseline-version-id { margin-bottom: 12px; }
+.finance-workspace .baseline-version-summary { margin-bottom: 12px; padding-top: 12px; }
+.finance-workspace .library-price-comparison-grid { gap: 16px; margin-top: 12px; padding-top: 16px; border-top: 1px solid var(--color-hairline); }
+.finance-workspace .library-expanded-price { padding: 20px 16px; }
+.finance-workspace :is(.library-expanded-price, .library-price-comparison-grid) h3 { font-size: var(--text-body); font-weight: 700; }
+.finance-workspace .library-provenance > div { padding: 12px 0; border-color: var(--color-hairline); }
+.finance-workspace :is(.library-confirm, .import-bulk) { border-radius: var(--radius-tile); border: 1px solid var(--color-hairline); }
 .catalogue-col-name { width: 22%; }
 .catalogue-col-alias { width: 10%; }
 .catalogue-col-source { width: 22%; }
 .catalogue-col-date { width: 12%; }
 .catalogue-col-notes { width: 28%; }
 .catalogue-col-actions { width: 6%; }
+
+@media (max-width: 1279px) {
+  .finance-workspace .finance-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .finance-workspace .finance-overview { grid-template-columns: minmax(0, 1fr); }
+  .finance-workspace .finance-overview > .panel:nth-child(n) { grid-column: auto; }
+}
+@media (max-width: 599px) {
+  .finance-workspace .finance-stats { grid-template-columns: minmax(0, 1fr); }
+  .finance-workspace .sections-switch { width: 100%; border-radius: var(--radius-tile); }
+  .finance-workspace .finance-icon-button { width: 44px; min-width: 44px; min-height: 44px; }
+  .finance-workspace .library-expanded-price { padding: 16px; }
+  .finance-workspace .baseline-version-meta > div { grid-template-columns: minmax(0, 1fr); gap: 4px; }
+}

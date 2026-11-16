@@ -3,24 +3,24 @@
   container-type: inline-size;
   min-width: 0;
   max-width: 100%;
-  margin: 0 0 20px;
+  margin: 0 0 16px;
   padding: 0;
   border: 0;
 }
 .rate-card > legend {
   padding: 0;
   margin-bottom: 8px;
-  font-size: 15px;
+  font-size: var(--text-body);
   font-weight: 600;
   line-height: 24px;
 }
 .rate-card > .hint {
   max-width: 76ch;
-  font-size: 13px;
+  font-size: var(--text-small);
   line-height: 20px;
 }
 .rate-card .rate-tier {
-  margin: 0 0 20px;
+  margin: 0 0 16px;
   padding: 16px 0 0;
   border: 0;
   border-top: 1px solid var(--border);
@@ -40,14 +40,14 @@
   margin: 0;
   color: var(--foreground);
   font-family: var(--font-sans);
-  font-size: 15px;
+  font-size: var(--text-body);
   font-weight: 600;
   line-height: 24px;
   overflow-wrap: anywhere;
 }
 .rate-groups {
   display: grid;
-  gap: 20px;
+  gap: 16px;
   min-width: 0;
 }
 .rate-dimension-group {
@@ -57,7 +57,7 @@
   margin: 0 0 8px;
   color: var(--ink-soft);
   font-family: var(--font-sans);
-  font-size: 13px;
+  font-size: var(--text-small);
   font-weight: 500;
   line-height: 20px;
 }
@@ -65,7 +65,7 @@
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   align-items: start;
-  gap: 20px 16px;
+  gap: 16px;
   min-width: 0;
 }
 .rate-card .field {
@@ -79,7 +79,7 @@
 }
 .rate-card .rate-band {
   min-width: 0;
-  margin: 20px 0 0;
+  margin: 16px 0 0;
   padding: 16px 0 0 16px;
   border: 0;
   border-top: 1px solid var(--border);

@@ -1,0 +1,9 @@
+/* 分段导航只切换面板，测试队列与历史游标仍由现有组件维护。 */
+.cp-modeltests { display: grid; gap: 16px; min-width: 0; }
+.cp-modeltests > .page-header { margin: 0; }
+.cp-modeltests .model-tests-tabs { width: fit-content; max-width: 100%; gap: 4px; padding: 4px; border: 0; border-radius: var(--r-round); background: var(--color-sunken-strong); }
+.cp-modeltests .model-tests-tabs .btn { border: 0; border-radius: var(--r-round); background: transparent; color: var(--color-fg-2); }
+.cp-modeltests .model-tests-tabs [aria-selected="true"] { background: var(--color-ink); color: var(--color-fg-inverse); }
+.cp-modeltests [role="tabpanel"], .cp-modeltests [role="tabpanel"] > .panel { margin: 0; min-width: 0; }
+.cp-modeltests > .hint { margin: 0; }
+@media (max-width: 539px) { .cp-modeltests .model-tests-tabs { width: 100%; border-radius: var(--radius-tile); } .cp-modeltests .model-tests-tabs .btn { flex: 1 1 auto; } }

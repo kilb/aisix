@@ -1,16 +1,16 @@
 /* 主筛选保持紧凑；附加条件在页面内展开，不遮挡当前记录。 */
 .usage-record-filters { min-width: 0; margin-block: 16px; }
 .usage-record-filter-primary { display: flex; align-items: flex-end; flex-wrap: wrap; gap: 12px 16px; }
-.usage-record-filter-primary label, .usage-record-filter-grid label { display: grid; min-width: 0; gap: 8px; color: var(--ink-soft); font-size: 13px; line-height: 20px; }
+.usage-record-filter-primary label, .usage-record-filter-grid label { display: grid; min-width: 0; gap: 8px; color: var(--ink-soft); font-size: var(--text-small); line-height: 20px; }
 .usage-record-filter-outcome { flex: 0 1 168px; }
 .usage-record-filter-primary :is(input, select) { min-height: 44px; width: 100%; min-width: 0; max-width: 100%; font: inherit; color: var(--ink); }
-.usage-record-filter-more { display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 44px; padding: 8px 12px; border: 1px solid var(--line); border-radius: 8px; cursor: pointer; color: var(--ink-soft); font-size: 13px; line-height: 20px; }
+.usage-record-filter-more { display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 44px; padding: 8px 12px; border: 1px solid var(--line); border-radius: var(--r-field); cursor: pointer; color: var(--ink-soft); font-size: var(--text-small); line-height: 20px; }
 .usage-record-filter-more:hover { background: var(--well); color: var(--ink); }
-.usage-record-filter-more:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+.usage-record-filter-more:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
 .usage-record-filter-more[aria-expanded="true"] { border-color: var(--ink); color: var(--ink); }
 .usage-record-filter-more[aria-expanded="true"] > svg:last-child { transform: rotate(180deg); }
 .usage-record-filter-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); flex: 1 0 100%; order: 1; min-width: 0; gap: 16px 20px; margin: 0; padding: 16px 0 0; border: 0; border-top: 1px solid var(--line); }
 .usage-record-filter-grid[hidden] { display: none; }
-.usage-record-filter-note { margin: 10px 0 0; max-width: 80ch; color: var(--muted-foreground); font-size: 12px; line-height: 20px; }
+.usage-record-filter-note { margin: 10px 0 0; max-width: 80ch; color: var(--muted-foreground); font-size: var(--text-caption); line-height: 20px; }
 @media (max-width: 719px) { .usage-record-filter-outcome { flex: 1 1 150px; } .usage-record-filter-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-width: 479px) { .usage-record-filter-grid { grid-template-columns: minmax(0, 1fr); } }

@@ -258,7 +258,7 @@ describe("fixed session hashing component protocol", () => {
     peers[chosen].failing = true;
     try {
       const first = await send(config, "/v1/chat/completions", false, { "session-id": session });
-      expect(first.status, first.text).toBe(503);
+      expect(first.status, first.text).toBe(502);
       expect(counts().map((value, index) => value - before[index])).toEqual(chosen === 0 ? [1, 0] : [0, 1]);
       const cooling = counts();
       for (const [path, stream] of SURFACES) {

@@ -8,7 +8,7 @@
   background: var(--row-hover);
 }
 .dt tr:has(.tn-name[aria-expanded="true"]) > td:first-child {
-  border-left: 2px solid var(--foreground);
+  border-left: 2px solid var(--color-fg);
 }
 .tn-mark {
   margin-left: var(--s-2);
@@ -34,9 +34,9 @@ td > .tn-actions {
 .tn-facts {
   margin: var(--s-4) 0 0;
   padding: var(--s-3) 0;
-  border-top: 1px solid var(--divider);
-  border-bottom: 1px solid var(--divider);
-  color: var(--text-2);
+  border-top: 1px solid var(--color-hairline);
+  border-bottom: 1px solid var(--color-hairline);
+  color: var(--color-fg-2);
 }
 
 /* 租户详情的四项基本资料。 */
@@ -46,9 +46,9 @@ td > .tn-actions {
   gap: 1px;
   margin: 16px 0 0;
   overflow: hidden;
-  border: 1px solid var(--border);
+  border: 1px solid var(--color-hairline);
   border-radius: var(--radius);
-  background: var(--border);
+  background: var(--color-hairline);
 }
 @media (min-width: 640px) {
   .tn-strip {
@@ -58,16 +58,16 @@ td > .tn-actions {
 .tn-strip > div {
   min-width: 0;
   padding: 10px 14px;
-  background: var(--card);
+  background: var(--color-surface);
 }
 .tn-strip dt {
-  color: var(--muted-foreground);
-  font-size: var(--fs-12);
+  color: var(--color-fg-3);
+  font-size: var(--text-caption);
   font-weight: 500;
 }
 .tn-strip dd {
   margin: 4px 0 0;
-  font-size: var(--fs-14);
+  font-size: var(--text-body);
   font-weight: 400;
 }
 
@@ -77,7 +77,7 @@ td > .tn-actions {
   margin: 28px -28px 0;
   padding: 20px 28px;
   border: 0;
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--color-hairline);
 }
 .tn-part > legend,
 .tn-part > h3,
@@ -86,8 +86,8 @@ td > .tn-actions {
   width: 100%;
   margin: 0 0 4px;
   padding: 0;
-  color: var(--foreground);
-  font-size: var(--fs-14);
+  color: var(--color-fg);
+  font-size: var(--text-body);
   font-weight: 500;
   line-height: 1.4;
   letter-spacing: -0.01em;
@@ -100,7 +100,7 @@ td > .tn-actions {
 .tn-part > .hint,
 .tn-sub > .hint {
   margin: 0 0 14px;
-  font-size: var(--fs-13);
+  font-size: var(--text-small);
   line-height: 1.55;
 }
 .tn-part + .tn-part,
@@ -122,20 +122,20 @@ form + .tn-part,
 /* 密钥创建表单的字段分组。 */
 .tn-create > legend {
   margin-bottom: 16px;
-  font-size: var(--fs-16);
+  font-size: var(--text-title);
 }
 .tn-field {
   margin: 0 0 16px;
 }
 .tn-field > legend {
   margin: 0 0 2px;
-  font-size: var(--fs-13);
+  font-size: var(--text-small);
   font-weight: 500;
   letter-spacing: 0;
 }
 .tn-field > .hint {
   margin: 0 0 8px;
-  font-size: var(--fs-12);
+  font-size: var(--text-caption);
 }
 .tn-field .f {
   margin-bottom: 0;
@@ -143,7 +143,7 @@ form + .tn-part,
 .tn-checks.tn-box {
   grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
   padding: 10px 12px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--color-hairline);
   border-radius: var(--radius);
 }
 
@@ -156,9 +156,9 @@ form + .tn-part,
   gap: 8px;
   margin: 16px -28px -20px;
   padding: 12px 28px;
-  border-top: 1px solid var(--border);
-  background: var(--well);
-  color: var(--ink-soft);
+  border-top: 1px solid var(--color-hairline);
+  background: var(--color-sunken);
+  color: var(--color-fg-2);
 }
 .panel > .tn-foot:last-child,
 .panel > .tn-sub:last-child > .tn-foot:last-child {
@@ -176,7 +176,7 @@ form + .tn-part,
 .tn-bleed > .dt-wrap {
   --dt-edge: 28px;
   margin: 0;
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--color-hairline);
 }
 .tn-part > .tn-bleed:last-child {
   margin-bottom: -20px;
@@ -198,8 +198,8 @@ form + .tn-part,
   width: 100%;
   margin: 0 0 var(--s-2);
   padding: 0;
-  color: var(--text);
-  font-size: var(--fs-14);
+  color: var(--color-fg);
+  font-size: var(--text-body);
   font-weight: 500;
   line-height: var(--lh-heading);
 }
@@ -211,7 +211,7 @@ form + .tn-part,
   margin-bottom: var(--s-3);
 }
 .tn-section .tn-section > legend {
-  font-size: var(--fs-14);
+  font-size: var(--text-body);
 }
 .tn-section > .btn,
 .tn-section > .two-step,
@@ -227,9 +227,9 @@ form + .tn-part,
   margin: 4px 0 12px;
   padding: 3px;
   min-height: 44px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--color-hairline);
   border-radius: var(--r-button);
-  background: var(--well);
+  background: var(--color-sunken);
 }
 .tn-scope label {
   display: inline-flex;
@@ -238,14 +238,14 @@ form + .tn-part,
   min-height: 38px;
   padding: 0 12px;
   border-radius: var(--r-button);
-  color: var(--text-2);
-  font-size: var(--fs-13);
+  color: var(--color-fg-2);
+  font-size: var(--text-small);
   font-weight: 500;
   cursor: pointer;
 }
 .tn-scope label:has(:checked) {
-  background: var(--card);
-  color: var(--foreground);
+  background: var(--color-surface);
+  color: var(--color-fg);
 }
 .tn-scope label:has(:disabled) {
   cursor: default;
@@ -283,19 +283,19 @@ form + .tn-part,
   grid-template-columns: minmax(0, 1fr);
   gap: 0;
   overflow: hidden;
-  border: 1px solid var(--border);
+  border: 1px solid var(--color-hairline);
   border-radius: var(--radius);
 }
 .tn-checks.tn-groups > li {
   padding: 10px 14px;
-  background: var(--card);
+  background: var(--color-surface);
 }
 .tn-checks.tn-groups > li + li {
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--color-hairline);
 }
 .tn-checks.tn-groups > li:has(:checked) {
-  background: var(--well);
-  color: var(--ink-soft);
+  background: var(--color-sunken);
+  color: var(--color-fg-2);
 }
 .tn-checks.tn-groups label {
   font-weight: 500;
@@ -303,14 +303,14 @@ form + .tn-part,
 /* 分组显示名旁保留实际路由名。 */
 .grp-route {
   margin-left: var(--s-2);
-  color: var(--ink-soft);
+  color: var(--color-fg-2);
   font-family: var(--font-mono);
-  font-size: var(--fs-12);
+  font-size: var(--text-caption);
 }
 .tn-note {
   margin-left: var(--s-2);
-  color: var(--ink-soft);
-  font-size: var(--fs-13);
+  color: var(--color-fg-2);
+  font-size: var(--text-small);
   line-height: var(--lh-table);
 }
 td .tn-note {
@@ -320,8 +320,8 @@ td .tn-note {
 .tn-error {
   display: block;
   margin-top: var(--s-1);
-  color: var(--error);
-  font-size: var(--fs-13);
+  color: var(--color-danger-fg);
+  font-size: var(--text-small);
   font-weight: 500;
   line-height: var(--lh-table);
   white-space: normal;
@@ -329,7 +329,7 @@ td .tn-note {
 /* 密钥需要处理的状态说明仍使用明确文字。 */
 .tn-flag {
   display: block;
-  color: var(--error);
+  color: var(--color-danger-fg);
 }
 td .tn-flag {
   margin: 2px 0 0;
@@ -349,12 +349,12 @@ td .tn-flag {
   min-width: 0;
   margin: 0;
   padding: 7px 12px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--color-hairline);
   border-radius: var(--r-input);
-  background: var(--card);
-  color: var(--text);
+  background: var(--color-surface);
+  color: var(--color-fg);
   font-family: var(--font-mono);
-  font-size: var(--fs-13);
+  font-size: var(--text-small);
   line-height: 1.5;
   word-break: break-all;
   user-select: all;
@@ -365,10 +365,10 @@ td .tn-flag {
   min-width: 0;
   margin: 4px 0 0;
   padding: var(--s-4);
-  border: 1px solid var(--border);
+  border: 1px solid var(--color-hairline);
   border-radius: var(--radius);
-  background: var(--well);
-  color: var(--ink-soft);
+  background: var(--color-sunken);
+  color: var(--color-fg-2);
   white-space: normal;
 }
 .tn-override > legend {
@@ -400,3 +400,195 @@ td .tn-flag {
     grid-column: 1 / -1;
   }
 }
+
+/* 租户工作区按列表、详情或默认配置展示一个当前任务。 */
+.cp-tenants {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.cp-tenants > .page-header {
+  margin-bottom: 0;
+}
+.cp-tenants .tenant-stats {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+.cp-tenants .tenant-stat {
+  gap: 12px;
+  padding: 18px;
+  margin: 0;
+  border-radius: var(--radius-card);
+}
+.cp-tenants .tenant-stat .bento-card-header {
+  margin-bottom: 0;
+}
+.cp-tenants .tenant-stat .bento-card-header h2 {
+  color: var(--color-fg-3);
+  font-size: var(--text-small);
+  font-weight: 500;
+}
+.cp-tenants .tenant-stat .metric {
+  font-size: var(--text-metric);
+  font-weight: 800;
+  line-height: 1.1;
+}
+.cp-tenants .tenant-workspace {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 16px;
+  min-width: 0;
+}
+.cp-tenants .tenant-workspace:empty {
+  display: none;
+}
+.cp-tenants .tenant-workspace > .side-panel {
+  position: static;
+  width: auto;
+  max-width: none;
+  min-width: 0;
+  margin: 0;
+}
+.cp-tenants .tenant-workspace .side-head {
+  margin-bottom: 16px;
+}
+.cp-tenants .tn-strip {
+  gap: 16px;
+  margin: 0;
+  padding: 16px;
+  border: 0;
+  border-radius: var(--radius-tile);
+  background: var(--color-sunken);
+}
+.cp-tenants .tn-strip > div {
+  padding: 0;
+  background: transparent;
+}
+.cp-tenants .tn-strip dd {
+  color: var(--color-fg);
+  font-weight: 600;
+}
+.cp-tenants .tn-part {
+  margin: 20px 0 0;
+  padding: 20px 0 0;
+  border-color: var(--color-hairline);
+}
+.cp-tenants .tn-part + .tn-part,
+.cp-tenants form + .tn-part,
+.cp-tenants .tn-part + form > .tn-part {
+  margin-top: 20px;
+}
+.cp-tenants .tn-part > legend,
+.cp-tenants .tn-part > h3,
+.cp-tenants .tn-sub > legend {
+  margin-bottom: 8px;
+  font-size: var(--text-title);
+  font-weight: 700;
+}
+.cp-tenants .tn-part > .hint,
+.cp-tenants .tn-sub > .hint {
+  margin-bottom: 16px;
+  color: var(--color-fg-3);
+  font-size: var(--text-small);
+}
+.cp-tenants .tn-foot {
+  gap: 8px;
+  margin: 16px 0 0;
+  padding: 16px 0 0;
+  border-top-color: var(--color-hairline);
+  background: transparent;
+}
+.cp-tenants .panel > .tn-foot:last-child,
+.cp-tenants .panel > .tn-sub:last-child > .tn-foot:last-child,
+.cp-tenants .side-panel > :last-child.tn-part {
+  margin-bottom: 0;
+}
+.cp-tenants .tn-bleed {
+  margin: 16px 0 0;
+}
+.cp-tenants .tn-bleed > .dt-wrap {
+  --dt-edge: 14px;
+}
+.cp-tenants .tn-part > .tn-bleed:last-child {
+  margin-bottom: 0;
+}
+.cp-tenants .tn-limits {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+.cp-tenants .tn-limits > div > .f {
+  margin-bottom: 0;
+}
+.cp-tenants .tn-limits .tn-error {
+  margin: 4px 0 0;
+}
+.cp-tenants .tn-checks {
+  grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr));
+  gap: 8px 16px;
+}
+.cp-tenants .tn-checks.tn-groups {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0;
+  border-radius: var(--radius-tile);
+  background: var(--color-sunken);
+}
+.cp-tenants .tn-checks.tn-groups > li {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--color-hairline);
+  background: transparent;
+}
+.cp-tenants .tn-checks.tn-groups > li + li {
+  border-top: 0;
+}
+.cp-tenants .tn-checks.tn-groups > li:has(:checked) {
+  background: var(--color-tint);
+}
+.cp-tenants .tn-scope {
+  border: 0;
+  border-radius: var(--r-button);
+  background: var(--color-sunken);
+}
+.cp-tenants .tn-scope label {
+  border-radius: var(--r-button);
+}
+.cp-tenants .tn-scope label:has(:checked) {
+  color: var(--color-fg-inverse);
+  background: var(--color-fg);
+}
+.cp-tenants .tenant-defaults {
+  margin: 0;
+}
+.cp-tenants .tenant-default-fields {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 20px;
+}
+.cp-tenants .tenant-default-fields > .tn-sub {
+  border-top: 1px solid var(--color-hairline);
+  padding-top: 20px;
+}
+@media (min-width: 1024px) {
+  .cp-tenants .tenant-stats {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+  .cp-tenants .tn-limits {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+@media (max-width: 639px) {
+  .cp-tenants .tn-limits,
+  .cp-tenants .tn-checks.tn-groups {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .cp-tenants .tn-strip {
+    gap: 16px 12px;
+  }
+  .cp-tenants .tn-foot > .btn {
+    flex: 1 1 auto;
+  }
+}
+
+/* 密钥分组的显示名和路由名各占一行，避免长显示名挤窄路由标识。 */
+.key-group-cell { display: grid; min-width: 0; max-width: 100%; gap: 4px; }
+.key-group-cell > :is(.grp, .tn-note) { display: block; min-width: 0; max-width: 100%; margin: 0; white-space: normal; overflow-wrap: anywhere; }

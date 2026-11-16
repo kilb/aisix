@@ -58,7 +58,7 @@ export function ServedGroups({ children, className }: { children: ReactNode; cla
 
 /** A form card's closing bar: its buttons at the bottom right, on a muted strip the card's width. */
 export const FORM_FOOTER =
-  "ops-form-footer -mx-[var(--pad)] -mb-[var(--pad)] mt-6 flex max-w-none flex-wrap items-center justify-end gap-2 rounded-b-card border-t border-line bg-well px-[var(--pad)] py-3 [&_.hint]:text-ink-soft";
+  "ops-form-footer -mx-[var(--pad)] -mb-[var(--pad)] mt-6 flex max-w-none flex-wrap items-center justify-end gap-2 rounded-b-card border-t border-hairline bg-sunken px-[var(--pad)] py-3 [&_.hint]:text-fg-2";
 
 /**
  * A field in a row of fields: its label above it while the row is stacked,
@@ -85,7 +85,7 @@ export function RowField({
   return (
     <div className={cn("ops-row-field min-w-0", className)}>
       <label className="flex flex-col gap-1.5">
-        <span className={cn("text-caption font-medium text-muted", at === "lg" ? "@lg:sr-only" : "@3xl:sr-only")}>{label}</span>
+        <span className={cn("text-caption font-medium text-fg-3", at === "lg" ? "@lg:sr-only" : "@3xl:sr-only")}>{label}</span>
         {children(aria)}
       </label>
       {error && (

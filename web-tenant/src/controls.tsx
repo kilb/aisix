@@ -19,12 +19,14 @@ const COPIED_MS = 1500;
 export function ShownOnce({
   title,
   value,
+  masked,
   children,
   onDone,
 }: {
   /** The notice's heading, which also names the region. */
   title: string;
   value: string;
+  masked: boolean;
   children?: ReactNode;
   onDone: () => void;
 }) {
@@ -46,8 +48,7 @@ export function ShownOnce({
       // The status beside the buttons says it to assistive technology already.
       toast("已复制", { announce: false });
     } catch {
-      // No clipboard (an insecure context, a denied permission): the value
-      // is still there to select by hand.
+      // 复制失败不解除密钥遮罩；邀请链接保留手动复制入口。
       setCopied(false);
     }
   }
@@ -55,7 +56,7 @@ export function ShownOnce({
   return (
     <div className="secret tenant-shown-once" role="region" aria-label={title}>
       <strong>{title}</strong>
-      <input readOnly value={value} aria-label={title} onFocus={(e) => e.currentTarget.select()} />
+      {masked ? <code className="secret-mask" aria-label="密钥已隐藏，请使用复制按钮获取">••••••••••••••••</code> : <input readOnly value={value} aria-label={title} onFocus={(e) => e.currentTarget.select()} />}
       {children}
       <span className="secret-acts">
         <Button size="sm" icon={flash ? "check" : "copy"} aria-label={flash ? "已复制" : "复制"} title={flash ? "已复制" : "复制"} onClick={() => void copy()} />
@@ -64,7 +65,7 @@ export function ShownOnce({
         </Button>
         {copied !== null && (
           <span className={copied ? "vh" : "field-problem"} role="status">
-            {copied ? "已复制" : "无法写入剪贴板，请手动选中复制"}
+            {copied ? "已复制" : masked ? "无法写入剪贴板，请允许剪贴板权限后重试" : "无法写入剪贴板，请手动选中复制"}
           </span>
         )}
       </span>

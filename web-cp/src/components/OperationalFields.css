@@ -5,27 +5,30 @@
 .operational-secret > label { gap: 8px; }
 .operational-secret .secret {
   min-height: var(--h-control);
-  border-radius: 8px;
-  background: var(--well);
+  border-radius: var(--r-round);
+  background: var(--color-sunken);
 }
 .operational-secret .secret-undo { margin-top: 4px; margin-bottom: 0; }
 .operational-tags .tags { gap: 8px; }
 .operational-tags .tags li {
   max-width: 100%;
   min-height: var(--h-control);
-  border-radius: 8px;
+  border-radius: var(--r-round);
   font-family: inherit;
-  font-size: 13px;
+  font-size: var(--text-small);
   line-height: 20px;
   overflow-wrap: anywhere;
 }
 .operational-tags .tag-add { width: 100%; gap: 8px; margin-top: 8px; }
 .operational-tags .tag-add > input { min-width: 0; }
 .json-editor { min-width: 0; }
-.json-editor > textarea { border-radius: 8px; tab-size: 2; }
-.json-editor .json-problems { border-radius: 8px; overflow-wrap: anywhere; }
+.json-editor > textarea { border-radius: var(--radius-field); tab-size: 2; }
+.json-editor .json-problems { border-radius: var(--radius-field); overflow-wrap: anywhere; }
 .json-editor .json-problems li + li { margin-top: 8px; }
 .json-editor .json-path { box-decoration-break: clone; }
 @media (max-width: 539px) {
   .json-editor > textarea { min-height: 280px; }
 }
+
+.operational-tags .tags li { border-radius: var(--r-round); background: var(--color-sunken); border-color: var(--color-hairline); color: var(--color-fg-2); }
+.operational-tags .tag-add > input { border-radius: var(--r-round); }

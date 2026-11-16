@@ -1,4 +1,5 @@
 import "./operations.css";
+import "./Gateways.css";
 import { useRecordTable } from "../lib/recordTable";
 import { RecordTools, RecordPager } from "../components/RecordTools";
 import { useCallback, useEffect, useState } from "react";
@@ -22,9 +23,8 @@ import { OperationalTable as DataTable, Loading } from "../components/Operationa
 import { EmptyState } from "../ui/EmptyState";
 import { Lamp } from "../ui/Lamp";
 import { TwoStep } from "../ui/TwoStep";
-import { Card, CardHeader, PageHeader, Split } from "../components/page";
+import { Card, CardHeader, PageHeader, Stat, StatGrid } from "../components/page";
 import { Plus } from "lucide-react";
-import { InventorySummary } from "./providers/OperationsBento";
 import { Select } from "../ui/Select";
 
 /** How often the instances are read again: about one gateway heartbeat. */
@@ -110,6 +110,7 @@ export function Gateways({ operator }: TabProps) {
   const [onlineFilter, setOnlineFilter] = useState("");
   const [versionFilter, setVersionFilter] = useState("");
   const table = useRecordTable({ items: (instances ?? []).filter((i) => (!onlineFilter || (i.online ? "online" : "offline") === onlineFilter) && (!versionFilter || (i.version_matches_cp === null ? "unknown" : i.version_matches_cp ? "match" : "mismatch") === versionFilter)), searchText: (i) => [i.instance_id, i.hostname, i.credential_name, i.version], resetKey: `${onlineFilter}:${versionFilter}` });
+  const credentialTable = useRecordTable({ items: credentials ?? [], searchText: (c) => [c.dp_id, c.name, c.revoked_at ? "已吊销" : "未吊销"] });
   const online = instances?.filter((i) => i.online).length ?? 0;
   const skewed = instances?.filter((i) => i.version_matches_cp === false).length ?? 0;
   const valid = credentials?.filter((c) => !c.revoked_at).length ?? 0;
@@ -118,7 +119,6 @@ export function Gateways({ operator }: TabProps) {
   return (
     <div className="cp-operations cp-gateways">
       <PageHeader
-        eyebrow="GATEWAYS · 实例与凭据"
         title="网关"
         dataLead={instances ? <>已记录 {fmtInt(instances.length)} 个网关实例，其中 {fmtInt(online)} 个在线、{fmtInt(instances.length - online)} 个离线。</> : "查看网关的当前心跳、版本与连接凭据。"}
         actions={
@@ -131,162 +131,149 @@ export function Gateways({ operator }: TabProps) {
         }
       />
 
-      <InventorySummary
-        title="网关实例 · 当前心跳"
-        total={instances?.length ?? null}
-        totalLabel="已记录实例"
-        breakdown={instances ? [
-          { label: "在线", value: online, displayValue: fmtInt(online) },
-          { label: "离线", value: instances.length - online, displayValue: fmtInt(instances.length - online) },
-        ] : []}
-        breakdownLabel="已记录实例的在线状态"
-        secondaryTitle="未吊销的网关凭据"
-        secondaryValue={credentials ? valid : null}
-        secondaryFoot={credentials ? `共签发 ${fmtInt(credentials.length)} 份，已吊销 ${fmtInt(revoked)} 份。` : "凭据签发记录由控制面提供。"}
-        error={instancesError !== null}
-        secondaryError={credentialsError !== null}
-      >
-        <dl className="ops-facts">
-          <div><dt>版本与控制面不一致</dt><dd>{instances ? fmtInt(skewed) : "—"}</dd></div>
-          <div><dt>版本无法比较</dt><dd>{instances ? fmtInt(instances.filter((i) => i.version_matches_cp === null).length) : "—"}</dd></div>
-        </dl>
-      </InventorySummary>
+      <StatGrid className="gateways-summary" aria-label="网关概况">
+        <Stat label="已记录实例" value={instances ? fmtInt(instances.length) : "—"} foot="每个发过心跳的网关进程一行" />
+        <Stat label="在线实例" value={instances ? fmtInt(online) : "—"} foot={instances ? `${fmtInt(instances.length - online)} 个离线实例` : "等待网关心跳"} />
+        <Stat label="有效网关凭据" value={credentials ? fmtInt(valid) : "—"} foot={credentials ? `共签发 ${fmtInt(credentials.length)} 份，已吊销 ${fmtInt(revoked)} 份` : "凭据签发记录由控制面提供"} />
+        <Stat label="版本与控制面不一致" value={instances ? fmtInt(skewed) : "—"} foot={instances ? `${fmtInt(instances.filter((i) => i.version_matches_cp === null).length)} 个实例版本无法比较` : "等待实例版本信息"} />
+      </StatGrid>
 
       {bundle && <Bundle bundle={bundle} onClose={() => setBundle(null)} />}
 
-      <Split
-        asideWidth="minmax(380px, 34%)"
-        main={
-          <Card className="mb-0">
-            <CardHeader
-              number={bundle ? 4 : 3}
-              as="h2"
-              title="网关实例"
-              description="每个发过心跳的网关进程一行。超过控制面设定的时间没有心跳即为离线。"
-            />
-            {instancesError && (
-              <div className="note crit" role="alert">
-                读取失败：{instancesError}
-              </div>
-            )}
-            {instances === null ? (
-              !instancesError && <Loading />
-            ) : instances.length === 0 ? (
-              <EmptyState mark="gateway" text="还没有网关发来心跳。" />
-            ) : (
-              <>
-                <RecordTools table={table} label="网关实例"><label className="f filter"><span>在线状态</span><Select size="compact" aria-label="在线状态" value={onlineFilter} onValueChange={(value) => setOnlineFilter(value)}><option value="">全部</option><option value="online">在线</option><option value="offline">离线</option></Select></label><label className="f filter"><span>版本状态</span><Select size="compact" aria-label="版本状态" value={versionFilter} onValueChange={(value) => setVersionFilter(value)}><option value="">全部</option><option value="match">一致</option><option value="mismatch">不一致</option><option value="unknown">无法比较</option></Select></label></RecordTools>
-                <DataTable label="网关实例">
-                  <thead>
-                    <tr>
-                      <th>凭据</th>
-                      <th>主机</th>
-                      <th>版本</th>
-                      <th className="right">已应用修订</th>
-                      <th>最近心跳</th>
-                      <th>状态</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {table.rows.map((i) => (
-                      <tr key={`${i.dp_id}/${i.instance_id}`}>
-                        <td className="font-medium">{i.credential_name}</td>
-                        <td>
-                          <code>{i.hostname}</code>
-                        </td>
-                        <td>
-                          <code>{i.version}</code>
-                          {i.version_matches_cp === false && (
-                            <span className="cell-note">
-                              <Lamp state="rejected">版本与控制面不一致</Lamp>
-                            </span>
-                          )}
-                        </td>
-                        <td className="right num">{i.applied_revision}</td>
-                        <td className="text-muted">{fmtTime(i.last_seen_at)}</td>
-                        <td>
-                          <Lamp state={i.online ? "applied" : "disabled"}>{i.online ? "在线" : "离线"}</Lamp>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </DataTable>
-                <RecordPager table={table} label="网关实例" />
-              </>
-            )}
-          </Card>
-        }
-        aside={
-          <Card className="mb-0">
-            <CardHeader
-              number={bundle ? 5 : 4}
-              as="h2"
-              title={
-                <span className="inline-flex items-center gap-2">
-                  网关凭据
-                  {credentials && credentials.length > 0 && <span className="tag">{fmtInt(credentials.length)}</span>}
-                </span>
-              }
-              description="网关凭据是控制面签发的客户端证书，网关凭它连接控制面。"
-            />
-            {isAdmin && <FormDialog open={issuing} onOpenChange={setIssuing} title="签发网关凭据" description="签发用于连接控制面的客户端证书，不会改变现有网关。">
-              <IssueForm
-                onCancel={() => setIssuing(false)}
-                onIssued={(b) => {
-                  setIssuing(false);
-                  setNote(null);
-                  setBundle(b);
-                  void readCredentials();
-                }}
-              />
-            </FormDialog>}
-            <Msg note={note} />
-            {credentialsError && (
-              <div className="note crit" role="alert">
-                读取失败：{credentialsError}
-              </div>
-            )}
-            {credentials === null ? (
-              !credentialsError && <Loading />
-            ) : credentials.length === 0 ? (
-              <EmptyState mark="gateway" text="还没有签发过网关凭据。" />
-            ) : (
-              <ul className="-mx-[var(--pad)] -mb-[var(--pad)] mt-4 divide-y divide-border border-t border-line">
-                {credentials.map((c) => (
-                  <li key={c.dp_id} className="flex flex-col gap-1.5 px-[var(--pad)] py-3.5">
-                    <div className="flex min-w-0 flex-wrap items-center justify-between gap-x-3 gap-y-1">
-                      <strong className="min-w-0 font-medium break-all">{c.name}</strong>
-                      {c.revoked_at ? (
-                        <Lamp state="disabled">已吊销 · {fmtTime(c.revoked_at)}</Lamp>
-                      ) : (
-                        <Lamp state="applied">未吊销</Lamp>
-                      )}
-                    </div>
-                    <code className="truncate text-caption text-muted" title={c.dp_id}>
-                      {c.dp_id}
-                    </code>
-                    <div className="flex flex-wrap items-start justify-between gap-x-3 gap-y-2">
-                      <span className="hint pt-1.5 text-caption">有效期至 {fmtTime(c.not_after)}</span>
-                      {isAdmin && !c.revoked_at && (
-                        <span className="right ml-auto min-w-0 max-w-full has-[.is-asking]:basis-full [&_.two-step]:max-w-full [&_.two-step-warn]:w-auto [&_.two-step-warn]:max-w-full">
-                          <TwoStep
-                            label="吊销"
-                            size="sm"
-                            disabled={busy}
-                            busy={revoking === c.dp_id}
-                            warning={`吊销网关凭据「${c.name}」后，使用这份凭据的网关将被控制面拒绝连接，且无法恢复。`}
-                            onConfirm={() => void revoke(c)}
-                          />
+      <Card className="gateways-list" aria-label="网关实例">
+        <CardHeader
+          as="h2"
+          title="网关实例"
+          description="每个发过心跳的网关进程一行。超过控制面设定的时间没有心跳即为离线。"
+        />
+        {instancesError && (
+          <div className="note crit" role="alert">
+            读取失败：{instancesError}
+          </div>
+        )}
+        {instances === null ? (
+          !instancesError && <Loading />
+        ) : instances.length === 0 ? (
+          <EmptyState mark="gateway" text="还没有网关发来心跳。" />
+        ) : (
+          <>
+            <RecordTools table={table} label="网关实例"><label className="f filter"><span>在线状态</span><Select size="compact" aria-label="在线状态" value={onlineFilter} onValueChange={(value) => setOnlineFilter(value)}><option value="">全部</option><option value="online">在线</option><option value="offline">离线</option></Select></label><label className="f filter"><span>版本状态</span><Select size="compact" aria-label="版本状态" value={versionFilter} onValueChange={(value) => setVersionFilter(value)}><option value="">全部</option><option value="match">一致</option><option value="mismatch">不一致</option><option value="unknown">无法比较</option></Select></label></RecordTools>
+            <DataTable label="网关实例">
+              <thead>
+                <tr>
+                  <th>凭据</th>
+                  <th>主机</th>
+                  <th>版本</th>
+                  <th className="right">已应用修订</th>
+                  <th>最近心跳</th>
+                  <th>状态</th>
+                </tr>
+              </thead>
+              <tbody>
+                {table.rows.map((i) => (
+                  <tr key={`${i.dp_id}/${i.instance_id}`}>
+                    <td className="font-medium">{i.credential_name}</td>
+                    <td>
+                      <code>{i.hostname}</code>
+                    </td>
+                    <td>
+                      <code>{i.version}</code>
+                      {i.version_matches_cp === false && (
+                        <span className="cell-note">
+                          <Lamp state="rejected">版本与控制面不一致</Lamp>
                         </span>
                       )}
-                    </div>
-                  </li>
+                    </td>
+                    <td className="right num">{i.applied_revision}</td>
+                    <td className="text-fg-3">{fmtTime(i.last_seen_at)}</td>
+                    <td>
+                      <Lamp state={i.online ? "applied" : "disabled"}>{i.online ? "在线" : "离线"}</Lamp>
+                    </td>
+                  </tr>
                 ))}
-              </ul>
-            )}
-          </Card>
-        }
-      />
+              </tbody>
+            </DataTable>
+            <RecordPager table={table} label="网关实例" />
+          </>
+        )}
+      </Card>
+      <Card className="gateways-list" aria-label="网关凭据">
+        <CardHeader
+          as="h2"
+          title={
+            <span className="inline-flex items-center gap-2">
+              网关凭据
+              {credentials && credentials.length > 0 && <span className="tag">{fmtInt(credentials.length)}</span>}
+            </span>
+          }
+          description="网关凭据是控制面签发的客户端证书，网关凭它连接控制面。"
+        />
+        {isAdmin && <FormDialog open={issuing} onOpenChange={setIssuing} title="签发网关凭据" description="签发用于连接控制面的客户端证书，不会改变现有网关。">
+          <IssueForm
+            onCancel={() => setIssuing(false)}
+            onIssued={(b) => {
+              setIssuing(false);
+              setNote(null);
+              setBundle(b);
+              void readCredentials();
+            }}
+          />
+        </FormDialog>}
+        <Msg note={note} />
+        {credentialsError && (
+          <div className="note crit" role="alert">
+            读取失败：{credentialsError}
+          </div>
+        )}
+        {credentials === null ? (
+          !credentialsError && <Loading />
+        ) : credentials.length === 0 ? (
+          <EmptyState mark="gateway" text="还没有签发过网关凭据。" />
+        ) : (
+          <>
+            <RecordTools table={credentialTable} label="网关凭据" />
+            <DataTable label="网关凭据">
+              <thead>
+                <tr>
+                  <th>名称 / ID</th>
+                  <th>状态</th>
+                  <th>有效期至</th>
+                  <th><span className="sr-only">操作</span></th>
+                </tr>
+              </thead>
+              <tbody>
+                {credentialTable.rows.map((c) => (
+                  <tr key={c.dp_id}>
+                    <td>
+                      <strong className="ops-cell-main">{c.name}</strong>
+                      <code className="ops-cell-secondary" title={c.dp_id}>{c.dp_id}</code>
+                    </td>
+                    <td>
+                      {c.revoked_at ? (
+                        <><Lamp state="disabled">已吊销</Lamp><span className="ops-cell-secondary">{fmtTime(c.revoked_at)}</span></>
+                      ) : <Lamp state="applied">未吊销</Lamp>}
+                    </td>
+                    <td className="text-fg-3">{fmtTime(c.not_after)}</td>
+                    <td className="right">
+                      {isAdmin && !c.revoked_at && (
+                        <TwoStep
+                          label="吊销"
+                          size="sm"
+                          disabled={busy}
+                          busy={revoking === c.dp_id}
+                          warning={`吊销网关凭据「${c.name}」后，使用这份凭据的网关将被控制面拒绝连接，且无法恢复。`}
+                          onConfirm={() => void revoke(c)}
+                        />
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </DataTable>
+            <RecordPager table={credentialTable} label="网关凭据" />
+          </>
+        )}
+      </Card>
     </div>
   );
 }
@@ -326,9 +313,8 @@ function IssueForm({ onIssued, onCancel }: { onIssued: (b: IssuedCredential) => 
   const listed = details.filter((d) => !ISSUE_FIELDS.includes(d.path));
 
   return (
-    <form ref={form} onSubmit={submit} className="mt-2 rounded-cell border border-line bg-well p-4">
-      <h3 className="mb-3 text-body font-semibold">签发网关凭据</h3>
-      <div className="grid gap-x-4 tablet:grid-cols-2 desktop:grid-cols-1">
+    <form ref={form} onSubmit={submit} className="gateway-issue-form">
+      <div className="gateway-issue-fields">
         <Field label="名称" error={at("/name")}>
           {(aria) => <input required value={name} onChange={(e) => setName(e.target.value)} {...aria} />}
         </Field>
@@ -383,8 +369,8 @@ function Bundle({ bundle, onClose }: { bundle: IssuedCredential; onClose: () => 
   const copyFailed = () => setCopied({ kind: "crit", text: "浏览器不允许复制，请手动选中上面的内容复制。" });
 
   return (
-    <Card className="bundle mb-10" aria-label="部署包">
-      <CardHeader number={3} title="一次性部署包" />
+    <Card className="bundle gateway-bundle" aria-label="部署包">
+      <CardHeader title="一次性部署包" />
       <div className="note warn mt-0">
         <p>
           <strong>部署包「{bundle.name}」：私钥只显示这一次</strong>
@@ -397,16 +383,16 @@ function Bundle({ bundle, onClose }: { bundle: IssuedCredential; onClose: () => 
           （Redis 地址）。部署包不含这两项，单副本可以不加。
         </p>
       </div>
-      <div className="grid items-start gap-3 desktop:grid-cols-2">
+      <div className="gateway-bundle-fields">
         <div className="min-w-0">
           <div className="mb-2 flex flex-wrap items-end justify-between gap-3">
             <div className="min-w-0">
               <h3 className="m-0 text-body font-semibold">环境变量</h3>
               <p className="hint mt-1 text-caption">官方镜像以这些变量启动为托管模式的网关。多行的值用单引号括起。</p>
             </div>
-            <CopyButton text={lines} label="复制全部" kind="primary" size="sm" onFailed={copyFailed} />
+            <CopyButton text={lines} label="复制全部" size="sm" onFailed={copyFailed} />
           </div>
-          <pre className={`${PRE} max-h-[640px]`}>{lines}</pre>
+          <pre className={`${PRE} gateway-bundle-env`}>{lines}</pre>
           <Msg note={copied} />
         </div>
         <div className="grid min-w-0 gap-4">
@@ -424,7 +410,7 @@ function Bundle({ bundle, onClose }: { bundle: IssuedCredential; onClose: () => 
           </div>
         </div>
       </div>
-      <div className="-mx-[var(--pad)] -mb-[var(--pad)] mt-6 flex flex-wrap justify-end gap-2 rounded-b-card border-t border-line bg-well px-[var(--pad)] py-3 [&_.hint]:text-ink-soft">
+      <div className="gateway-bundle-footer">
         <Button type="button" onClick={onClose}>
           我已保存，关闭
         </Button>

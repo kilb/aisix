@@ -1,10 +1,10 @@
 /* 应用壳独立于业务页，桌面侧栏与窄屏抽屉沿用同一套导航层级。 */
 .sidebar-shell {
   display: grid;
-  grid-template-columns: 224px minmax(0, 1fr);
+  grid-template-columns: 236px minmax(0, 1fr);
   align-items: start;
-  gap: 24px;
-  padding: 24px;
+  gap: 16px;
+  padding: 16px;
   min-height: 100dvh;
   background: var(--background);
   color: var(--foreground);
@@ -12,16 +12,17 @@
 
 .shell-sidebar {
   position: sticky;
-  top: 24px;
+  top: 16px;
   display: flex;
-  width: 224px;
-  height: calc(100dvh - 48px);
+  width: 100%;
+  height: calc(100dvh - 32px);
   min-height: 0;
   flex-direction: column;
   gap: 16px;
-  padding: 20px 12px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-rail);
+  padding: 14px 12px 12px;
+  border: 0;
+  border-radius: var(--r-card);
+  box-shadow: var(--shadow-float);
   background: var(--card);
   color: var(--foreground);
 }
@@ -48,8 +49,8 @@
   flex: none;
   padding: 12px;
   border: 0;
-  border-radius: var(--r-input);
-  background: var(--background);
+  border-radius: var(--r-field);
+  background: var(--well);
   color: var(--ink-soft);
   font-size: var(--text-meta);
   line-height: 1.5;
@@ -64,7 +65,7 @@
 }
 .shell-sidebar-context .fleet { gap: 6px; }
 .shell-sidebar-context .org-name { font-size: var(--text-body); }
-.shell-route-group { padding: 12px 12px 6px; color: var(--muted-foreground); font-size: 12px; font-weight: 500; line-height: 1.4; }
+.shell-route-group { padding: 12px 12px 6px; color: var(--muted-foreground); font-size: var(--text-caption); font-weight: 500; line-height: 1.4; }
 .shell-route-item:first-child .shell-route-group { padding-top: 4px; }
 
 .shell-sidebar-navigation {
@@ -90,13 +91,13 @@
   display: flex;
   width: 100%;
   min-width: 44px;
-  min-height: 44px;
+  min-height: 42px;
   align-items: center;
   gap: 10px;
-  padding: 10px 22px 10px 12px;
+  padding: 10px 12px;
   transition: background-color var(--t-fast) ease, color var(--t-fast) ease;
   border: 1px solid transparent;
-  border-radius: var(--r-input);
+  border-radius: var(--r-field);
   background: transparent;
   color: var(--ink-soft);
   font-size: var(--text-body);
@@ -108,11 +109,11 @@
 .shell-route-stop:hover { background: var(--well); color: var(--foreground); }
 .shell-route-stop:is([aria-selected="true"], [aria-current="page"]) {
   border-color: transparent;
-  background: var(--well);
-  color: var(--foreground);
-  font-weight: 500;
+  background: var(--primary);
+  color: var(--primary-foreground);
+  font-weight: 600;
 }
-.shell-route-stop:is([aria-selected="true"], [aria-current="page"])::before { content: ""; position: absolute; right: 10px; top: calc(50% - 3px); width: 6px; height: 6px; border-radius: 50%; background: var(--brand-dot); }
+.shell-route-stop:is([aria-selected="true"], [aria-current="page"]) .shell-route-icon { color: var(--lime); }
 .shell-route-stop:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
 .shell-route-icon { width: 18px; height: 18px; flex: none; }
 .shell-route-stop .stop-name { min-width: 0; overflow-wrap: anywhere; }
@@ -121,7 +122,7 @@
 .shell-sidebar-footer {
   min-width: 0;
   flex: none;
-  padding: 16px 8px 0;
+  padding: 12px 0 0;
   border-top: 1px solid var(--line);
 }
 .shell-sidebar-footer :is(.cp-identity, .shell-member) {
@@ -149,17 +150,17 @@
   top: 0;
   z-index: 30;
   display: flex;
-  min-height: 64px;
+  min-height: 52px;
   flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 12px 24px;
   padding: 10px 0;
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid transparent;
   background: var(--background);
 }
 .shell-view-location { display: flex; min-width: 0; align-items: center; gap: 12px; }
-.shell-location-text { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
+.shell-location-text { display: flex; min-width: 0; align-items: center; gap: 10px; }
 .shell-current-label { color: var(--foreground); font-size: var(--text-body); font-weight: 500; }
 .shell-current-context {
   min-width: 0;
@@ -184,15 +185,15 @@
   max-width: 1440px;
   min-width: 0;
   margin-inline: auto;
-  padding: 24px 0 24px;
+  padding: 16px 0;
 }
 .sidebar-shell .shell-note { width: auto; max-width: none; margin-inline: 0; padding-top: 20px; }
 .shell-menu-trigger { display: none; }
 
-@media (max-width: 1099px) {
+@media (max-width: 1023px) {
   .sidebar-shell { display: block; padding: 0 24px; }
   .shell-menu-trigger { display: inline-flex; }
-  .shell-drawer-backdrop { position: fixed; inset: 0; z-index: 60; background: rgb(0 0 0 / 35%); animation: shell-backdrop-in var(--t-panel) ease-out; }
+  .shell-drawer-backdrop { position: fixed; inset: 0; z-index: 60; background: var(--overlay); animation: shell-backdrop-in var(--t-panel) ease-out; }
   .shell-drawer {
     position: fixed;
     inset: 16px auto 16px 16px;
@@ -200,7 +201,7 @@
     z-index: 61;
     width: min(288px, calc(100vw - 32px));
     outline: none;
-    box-shadow: 0 12px 32px rgb(0 0 0 / 14%);
+    box-shadow: var(--shadow-drawer);
     animation: shell-drawer-in var(--t-panel) ease-out;
   }
   .shell-drawer-close { width: 44px; min-width: 44px; padding-inline: 0; }
@@ -209,7 +210,7 @@
 @media (max-width: 719px) {
   .sidebar-shell { padding-inline: 16px; }
   .sidebar-shell .shell-view-header { padding: 12px 0; gap: 12px; }
-  .sidebar-shell .shell-content { padding: 20px 0 40px; }
+  .sidebar-shell .shell-content { padding: 16px 0; }
   .sidebar-shell .shell-note { margin-inline: 0; }
   .shell-current-context { max-width: 21ch; }
 }
@@ -217,12 +218,12 @@
 /* 个人身份同时提供账号设置入口，抽屉里沿用同一交互。 */
 .shell-sidebar-footer .shell-account-link {
   width: 100%; min-width: 0; padding: 8px; border: 1px solid transparent;
-  border-radius: var(--r-input); background: transparent; color: var(--foreground); text-align: left; cursor: pointer;
+  border-radius: var(--r-field); background: transparent; color: var(--foreground); text-align: left; cursor: pointer;
 }
 .shell-account-link:hover { background: var(--well); }
 .shell-account-link[aria-current="page"] { background: var(--well); border-color: var(--line); }
 .shell-account-link:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
-.shell-account-caption { grid-column: 2; color: var(--muted-foreground); font-size: 12px; line-height: 1.5; }
+.shell-account-caption { grid-column: 2; color: var(--muted-foreground); font-size: var(--text-caption); line-height: 1.5; }
 @media (max-width: 719px) {
   .cp-account-label, .cp-theme-label { display: none; }
   .sidebar-shell .shell-view-header { flex-wrap: nowrap; }
@@ -230,12 +231,12 @@
 }
 
 /* 键盘直达主内容，焦点框在浅深主题均使用墨色语义令牌。 */
-.shell-skip-link { position: fixed; left: 24px; top: 8px; z-index: 80; padding: 12px 16px; border: 1px solid var(--foreground); border-radius: var(--r-input); background: var(--card); color: var(--foreground); transform: translateY(-160%); }
+.shell-skip-link { position: fixed; left: 24px; top: 8px; z-index: 80; padding: 12px 16px; border: 1px solid var(--foreground); border-radius: var(--r-field); background: var(--card); color: var(--foreground); transform: translateY(-160%); }
 .shell-skip-link:focus { transform: translateY(0); }
 #workspace-main { scroll-margin-top: 88px; }
 #workspace-main:focus:not(:focus-visible) { outline: none; }
 .shell-view-location { flex: 1 1 auto; }
-.shell-sidebar-footer :is(.cp-avatar, .avatar) { width: 36px; height: 36px; font-family: var(--font-sans); font-size: 14px; }
+.shell-sidebar-footer :is(.cp-avatar, .avatar) { width: 36px; height: 36px; font-family: var(--font-sans); font-size: var(--text-body); }
 @keyframes shell-drawer-in { from { opacity: 0; transform: translateX(-12px); } to { opacity: 1; transform: translateX(0); } }
 @keyframes shell-backdrop-in { from { opacity: 0; } to { opacity: 1; } }
 @media (max-width: 719px) {
@@ -243,6 +244,37 @@
   .shell-location-text { min-width: 0; }
   .shell-view-location { gap: 8px; }
   .shell-menu-trigger { width: 44px; padding-inline: 0; font-size: 0; gap: 0; }
-  .sidebar-shell .shell-view-header { min-height: 68px; }
+  .sidebar-shell .shell-view-header { min-height: 64px; }
   .shell-skip-link { left: 16px; }
 }
+
+/* 模板的悬浮导航可收成图标栏，业务导航及焦点顺序保持不变。 */
+.sidebar-shell { transition: grid-template-columns var(--t-panel) ease; }
+.sidebar-shell[data-collapsed="true"] { grid-template-columns: 68px minmax(0, 1fr); }
+.shell-collapse-toggle { flex: none; width: 32px; min-width: 32px; padding-inline: 0; }
+.shell-sidebar-brand { overflow: hidden; }
+.shell-sidebar-brand .brand { min-width: 0; }
+.sidebar-shell[data-collapsed="true"] .shell-sidebar-head { flex-direction: column; gap: 8px; }
+.sidebar-shell[data-collapsed="true"] .shell-sidebar-brand :is(.brand-name, .cp-brand-label, .cp-brand-name, .cp-brand-title) { display: none; }
+.sidebar-shell[data-collapsed="true"] .shell-sidebar-brand .cp-brand { display: flex; }
+.sidebar-shell[data-collapsed="true"] :is(.shell-sidebar-context, .shell-route-group) { display: none; }
+.sidebar-shell[data-collapsed="true"] .shell-route-stop { justify-content: center; padding-inline: 0; }
+.sidebar-shell[data-collapsed="true"] .shell-route-stop :is(.stop-name, .cp-attention),
+.sidebar-shell[data-collapsed="true"] .shell-sidebar-footer :is(.me-name, .shell-account-caption, .cp-identity-name, .tag, .cp-role) {
+  position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap;
+}
+.sidebar-shell[data-collapsed="true"] .shell-sidebar-footer :is(.shell-member, .cp-identity) { display: flex; justify-content: center; padding-inline: 0; }
+.sidebar-shell[data-collapsed="true"] .shell-route-list { padding-inline: 0; }
+.shell-view-header.is-scrolled { border-bottom-color: var(--border); }
+.shell-location-divider { color: var(--muted-foreground); font-size: var(--text-caption); }
+.shell-current-label { font-weight: 700; }
+.shell-sidebar-footer :is(.cp-avatar, .avatar) { background: var(--lime); color: var(--ink-solid); font-weight: 700; }
+@media (max-width: 1023px) {
+  .sidebar-shell[data-collapsed="true"] { display: block; }
+}
+@media (max-width: 719px) {
+  .shell-location-text { flex-wrap: wrap; gap: 4px 8px; }
+  .shell-current-context { max-width: 14ch; }
+}
+
+:root[data-theme="dark"] .shell-route-stop[aria-current="page"] .shell-route-icon { color: var(--primary-foreground); }

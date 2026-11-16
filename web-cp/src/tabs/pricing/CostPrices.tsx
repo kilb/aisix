@@ -70,7 +70,7 @@ export function CostPrices({ canEdit }: TabProps) {
           </Button>
         </div>
       )}
-      <Card className="mb-3">
+      <Card className="finance-facts-card">
         <dl className="compact-overview-facts">
           <div><dt>上游账号 · 全部</dt><dd>{rows === null ? "—" : fmtInt(rows.length)}</dd></div>
           <div><dt>未设现行默认成本换算率</dt><dd>{rows === null ? "—" : fmtInt(rows.length - configured)}</dd></div>
@@ -78,7 +78,7 @@ export function CostPrices({ canEdit }: TabProps) {
         </dl>
         <p className="text-caption text-muted">成本只用于平台利润，对租户不可见。默认与单模型覆盖均未设置时，成本保持未知。</p>
       </Card>
-      <Card className="mb-0">
+      <Card className="finance-table-card">
         <CardHeader number={3} className="mb-0" title={<>上游账号{rows && <Count n={rows.length} />}</>} />
         {rows === null ? (
           !error && <Loading />

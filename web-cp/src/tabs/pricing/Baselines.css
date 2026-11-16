@@ -141,7 +141,7 @@
   height: 8px;
   margin: 28px 0 24px;
   overflow: hidden;
-  border-radius: 999px;
+  border-radius: var(--r-round);
   background: color-mix(in srgb, var(--color-ink) 7%, transparent);
 }
 

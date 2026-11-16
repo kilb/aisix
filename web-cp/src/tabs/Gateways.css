@@ -1,0 +1,57 @@
+/* 实例与凭据分别以通栏表格展示，部署材料保留独立滚动边界。 */
+.cp-gateways {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.cp-gateways > .page-header,
+.cp-gateways > .gateways-summary,
+.cp-gateways > .gateways-list,
+.cp-gateways > .gateway-bundle {
+  margin: 0;
+}
+.gateways-list,
+.gateway-bundle {
+  min-width: 0;
+}
+.gateway-issue-form {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.gateway-issue-fields,
+.gateway-bundle-fields {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 16px;
+}
+.gateway-issue-fields > *,
+.gateway-bundle-fields > * {
+  min-width: 0;
+}
+.gateway-issue-fields .f {
+  margin: 0;
+}
+.gateway-bundle-env {
+  max-height: 40rem;
+}
+.gateway-bundle-footer {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--hairline);
+}
+@media (min-width: 720px) {
+  .gateway-issue-fields {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+@media (min-width: 1280px) {
+  .gateway-bundle-fields {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    align-items: start;
+  }
+}

@@ -1,5 +1,6 @@
 import { useLayoutEffect, useRef, type ComponentType, type KeyboardEvent } from "react";
 import { cn } from "../lib/cn";
+import "./RouteNav.css";
 
 // 应用侧栏与卡内横向分组共用既有导航接口。
 
@@ -20,6 +21,7 @@ export function RouteNav<Id extends string>({
   items,
   current,
   onSelect,
+  attention = {},
   docked,
   look = "segment",
   className,
@@ -28,6 +30,7 @@ export function RouteNav<Id extends string>({
   items: readonly RouteItem<Id>[];
   current: Id;
   onSelect: (id: Id) => void;
+  attention?: Partial<Record<Id, string>>;
   docked?: boolean;
   look?: "segment" | "underline";
   className?: string;
@@ -98,6 +101,10 @@ export function RouteNav<Id extends string>({
                 className="shell-route-stop"
                 id={`stop-${t.id}`}
                 data-tab={t.id}
+                title={t.label}
+                aria-label={t.label}
+                data-attention={attention[t.id] ? "" : undefined}
+                aria-describedby={attention[t.id] ? `attention-${t.id}` : undefined}
                 aria-current={t.id === current ? "page" : undefined}
                 onClick={(event) => {
                   if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
@@ -107,10 +114,12 @@ export function RouteNav<Id extends string>({
               >
                 {Icon && <Icon className="shell-route-icon" aria-hidden />}
                 <span className="stop-name">{t.label}</span>
+                {attention[t.id] && <span aria-hidden="true" className="cp-attention">!</span>}
               </a>
             </li>;
           })}
         </ol>
+        {items.map((t) => attention[t.id] ? <span key={t.id} id={`attention-${t.id}`} className="vh">{attention[t.id]}</span> : null)}
       </nav>
     );
   }

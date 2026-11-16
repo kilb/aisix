@@ -1,6 +1,6 @@
 /* 导入审核：先展示当前读取范围，再逐批确认真实价格。 */
 .import-upload {
-  margin-bottom: 12px;
+  margin-bottom: 16px;
 }
 .import-results {
   margin: 0;
@@ -33,9 +33,9 @@
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 16px;
-  margin-top: 28px;
+  margin-top: 16px;
   border-top: 1px solid color-mix(in srgb, var(--color-ink) 7%, transparent);
-  padding-top: 20px;
+  padding-top: 16px;
 }
 
 .import-review-counts > div + div {
@@ -59,9 +59,9 @@
 }
 
 .import-selection-note {
-  margin-top: 24px;
+  margin-top: 16px;
   border-top: 1px solid color-mix(in srgb, var(--color-surface) 12%, transparent);
-  padding-top: 20px;
+  padding-top: 16px;
 }
 
 .import-workspace {
@@ -73,7 +73,7 @@
   padding: 4px;
   background: var(--color-well);
   border: 0;
-  border-radius: 999px;
+  border-radius: var(--r-round);
 }
 
 .import-view-switch > button {
@@ -85,7 +85,7 @@
 .import-view-switch > button[aria-pressed="true"] {
   background: var(--color-surface);
   color: var(--color-ink);
-  border-radius: 999px;
+  border-radius: var(--r-round);
 }
 
 .import-view-switch > button[aria-pressed="true"]::after {

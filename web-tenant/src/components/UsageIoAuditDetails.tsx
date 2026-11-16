@@ -57,19 +57,19 @@ export function UsageIoAuditDetails({ data }: { data: UsageAuditData }) {
     { key: "recorded-output", label: "记录输出 Token", value: recorded(data.usage?.completion_tokens) },
     { key: "usage-source", label: "用量来源", value: data.usage_estimated === true ? "包含网关估算" : data.usage_estimated === false ? "已记录用量" : "来源未记录" },
   ];
-  return <details className="io-audit-details mt-4 min-w-0 border-t border-border pt-3 lg:col-span-2" aria-label="输入输出与 Token 参考">
+  return <details className="io-audit-details mt-4 min-w-0 border-t border-hairline pt-3 lg:col-span-2" aria-label="输入输出与 Token 参考">
     <summary className="cursor-pointer text-caption font-medium">输入输出与 Token 参考</summary>
-    {upstream ? <p className="mt-3 text-meta text-muted-foreground">本次上游尝试{audit.exchange_count != null && audit.exchange_count > 1 ? ` · ${count.format(audit.exchange_count)} 次上游交换合计` : ""}；请求转换后、客户端响应处理前采集。“完整”表示该项观测已结束，字符按 Unicode 码点计。{audit.exchange_count != null && audit.exchange_count > 1 ? "包含多次上游交换，暂不提供单次 Token 对照。" : ""}</p>
-      : legacy ? <p className="mt-3 text-meta text-muted-foreground">历史客户端交换统计，仅统计客户端可见文本；“完整”表示这部分观测已结束，不代表完整计费输入。字符按 Unicode 码点计。</p>
-      : data.io_audit != null ? <p className="mt-3 text-meta text-muted-foreground">此记录的统计版本或边界暂不支持，长度与参考未展示。</p>
-      : <p className="mt-3 text-meta text-muted-foreground">此记录未采集输入输出长度。</p>}
+    {upstream ? <p className="mt-3 text-meta text-fg-3">本次上游尝试{audit.exchange_count != null && audit.exchange_count > 1 ? ` · ${count.format(audit.exchange_count)} 次上游交换合计` : ""}；请求转换后、客户端响应处理前采集。“完整”表示该项观测已结束，字符按 Unicode 码点计。{audit.exchange_count != null && audit.exchange_count > 1 ? "包含多次上游交换，暂不提供单次 Token 对照。" : ""}</p>
+      : legacy ? <p className="mt-3 text-meta text-fg-3">历史客户端交换统计，仅统计客户端可见文本；“完整”表示这部分观测已结束，不代表完整计费输入。字符按 Unicode 码点计。</p>
+      : data.io_audit != null ? <p className="mt-3 text-meta text-fg-3">此记录的统计版本或边界暂不支持，长度与参考未展示。</p>
+      : <p className="mt-3 text-meta text-fg-3">此记录未采集输入输出长度。</p>}
     <dl className="mt-3 grid min-w-0 gap-x-6 gap-y-2 text-caption sm:grid-cols-2">
       {rows.map(row => <div key={row.key} data-io-field={row.key} className="min-w-0">
-        <dt className="text-muted-foreground">{row.label}</dt>
+        <dt className="text-fg-3">{row.label}</dt>
         <dd className="mt-1 break-words tabular-nums">{row.value}</dd>
       </div>)}
     </dl>
-    {audit ? <><p className="mt-3 text-meta text-muted-foreground">Token 参考未校准：UTF-8 字节数 ÷ 4 向上取整，不用于计费。{legacy ? "未包含工具定义、结构描述、多模态、隐藏推理与存储上下文。" : "文本参考仅覆盖本次已观测的可解码内容；工具/结构描述、媒体、隐藏推理或托管上下文是否可见取决于上游协议，部分或未知不代表完整计费用量。"}</p>
-    <p className="mt-2 text-meta text-muted-foreground">{legacy ? "大小仅含正文，不含协议头和加密开销；压缩请求按压缩后大小记录，流式响应含事件包装。“响应完整”仅表示已交给 HTTP 服务，不保证客户端收到。" : `正文大小与文本长度分开统计。${transportScope}`}</p></> : null}
+    {audit ? <><p className="mt-3 text-meta text-fg-3">Token 参考未校准：UTF-8 字节数 ÷ 4 向上取整，不用于计费。{legacy ? "未包含工具定义、结构描述、多模态、隐藏推理与存储上下文。" : "文本参考仅覆盖本次已观测的可解码内容；工具/结构描述、媒体、隐藏推理或托管上下文是否可见取决于上游协议，部分或未知不代表完整计费用量。"}</p>
+    <p className="mt-2 text-meta text-fg-3">{legacy ? "大小仅含正文，不含协议头和加密开销；压缩请求按压缩后大小记录，流式响应含事件包装。“响应完整”仅表示已交给 HTTP 服务，不保证客户端收到。" : `正文大小与文本长度分开统计。${transportScope}`}</p></> : null}
   </details>;
 }

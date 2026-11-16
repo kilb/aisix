@@ -54,7 +54,7 @@ export function MemberBudgetDialog({ memberId, budget, onClose, onSaved, onInact
   }
 
   return <FormDialog open onOpenChange={(open) => { if (!open) onClose(); }} busy={busy} title={budget ? "调整成员额度" : "设置成员额度"} description="成员额度与组织、密钥额度独立生效，以先用尽者为准。">
-    <form ref={form} className="grid gap-5" aria-label={budget ? "调整成员额度" : "设置成员额度"} onSubmit={submit}>
+    <form ref={form} className="grid gap-4" aria-label={budget ? "调整成员额度" : "设置成员额度"} onSubmit={submit}>
       {!budget && <>
         <Field label="额度类型"><Select value={kind} onValueChange={(value) => setKind(value as Budget["kind"])} disabled={busy} options={[{ value: "periodic", label: "按周期" }, { value: "cumulative", label: "累计" }]} /></Field>
         {kind === "periodic" && <Field label="额度周期"><Select value={period} onValueChange={(value) => setPeriod(value as NonNullable<Budget["period"]>)} disabled={busy} options={[{ value: "day", label: "每天" }, { value: "week", label: "每周" }, { value: "month", label: "每月" }]} /></Field>}

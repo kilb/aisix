@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { Dialog } from "radix-ui";
-import { Menu, X } from "lucide-react";
+import { Menu, PanelLeftClose, PanelLeftOpen, X } from "lucide-react";
 import { Button } from "./Button";
 import "./Sidebar.css";
 
-const DESKTOP_QUERY = "(min-width: 1100px)";
+const DESKTOP_QUERY = "(min-width: 1024px)";
 
 /** 桌面与抽屉共用同一份导航，避免重复的导航 id 与可访问入口。 */
 export function SidebarShell({
@@ -14,6 +14,7 @@ export function SidebarShell({
   footer,
   navigation,
   routeKey,
+  storageKey = `aisix.sidebar.collapsed:${window.location.pathname}`,
   children,
 }: {
   brand: ReactNode | ((close: () => void) => ReactNode);
@@ -22,14 +23,30 @@ export function SidebarShell({
   footer?: ReactNode | ((close: () => void) => ReactNode);
   navigation: (close: () => void) => ReactNode;
   routeKey?: string;
+  storageKey?: string;
   children: ReactNode;
 }) {
   const [desktop, setDesktop] = useState(() => window.matchMedia(DESKTOP_QUERY).matches);
   const [open, setOpen] = useState(false);
+  const [collapsed, setCollapsed] = useState(() => {
+    try {
+      return window.localStorage.getItem(storageKey) === "1";
+    } catch {
+      return false;
+    }
+  });
   const sidebar = useRef<HTMLElement>(null);
   const shell = useRef<HTMLDivElement>(null);
   const returnToMenu = useRef(false);
   const close = useCallback(() => setOpen(false), []);
+  const toggleCollapsed = () => setCollapsed((current) => {
+    try {
+      window.localStorage.setItem(storageKey, current ? "0" : "1");
+    } catch {
+      // 存储不可用时仍可在当前页面收起导航。
+    }
+    return !current;
+  });
 
   useEffect(() => {
     const query = window.matchMedia(DESKTOP_QUERY);
@@ -62,6 +79,11 @@ export function SidebarShell({
     <>
       <div className="shell-sidebar-head">
         <div className="shell-sidebar-brand">{typeof brand === "function" ? brand(close) : brand}</div>
+        {desktop && <Button kind="quiet" size="sm" className="shell-collapse-toggle"
+          aria-label={collapsed ? "展开侧边栏" : "收起侧边栏"} aria-expanded={!collapsed}
+          onClick={toggleCollapsed}>
+          {collapsed ? <PanelLeftOpen aria-hidden="true" /> : <PanelLeftClose aria-hidden="true" />}
+        </Button>}
         {!desktop && (
           <Dialog.Close asChild>
             <Button kind="quiet" className="shell-drawer-close" aria-label="关闭菜单">
@@ -78,7 +100,7 @@ export function SidebarShell({
 
   return (
     <Dialog.Root open={!desktop && open} onOpenChange={setOpen}>
-      <div ref={shell} className="sidebar-shell">
+      <div ref={shell} className="sidebar-shell" data-collapsed={desktop && collapsed ? "true" : undefined}>
         <a className="shell-skip-link" href="#workspace-main" onClick={(event) => {
           event.preventDefault();
           const main = shell.current?.querySelector<HTMLElement>("#workspace-main");

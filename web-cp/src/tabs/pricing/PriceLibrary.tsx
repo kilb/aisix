@@ -119,7 +119,7 @@ export function PriceLibrary({ canEdit, onGoto }: TabProps) {
         }
       />
       <p className="mb-6 text-body text-ink-soft">{CREDIT}</p>
-      <BentoGrid className="mb-3" aria-label="价格库概览">
+      <BentoGrid className="finance-overview" aria-label="价格库概览">
         <Card className={span.d7}>
           <CardHeader number={1} title="当前价格库" description="实际存储版本 · 全部条目" />
           {meta ? <Metric size="hero">{meta.entries.toLocaleString("zh-CN")}</Metric> : page ? <CardMessage>还没有价格库</CardMessage> : error ? <CardMessage onRetry={() => void refresh()}>未能读取价格库</CardMessage> : <MetricSkeleton />}
@@ -139,7 +139,7 @@ export function PriceLibrary({ canEdit, onGoto }: TabProps) {
               <p className="mt-4 text-caption text-muted">从数据集的发布地址获取最新数据。无法访问外网时，可在「导入审核」上传数据集文件，同样会更新价格库。</p>
               <CardFooter>
                 <Button type="button" onClick={() => onGoto("pricing", "imports")}>去「导入审核」上传</Button>
-                <Button type="button" kind="primary" busy={fetching} busyLabel="更新中…" onClick={() => void update()}>更新价格库</Button>
+                <Button type="button" busy={fetching} busyLabel="更新中…" onClick={() => void update()}>更新价格库</Button>
               </CardFooter>
             </>
           )}
@@ -152,7 +152,7 @@ export function PriceLibrary({ canEdit, onGoto }: TabProps) {
           {page && meta && <CardFooter className="justify-start border-surface/12 text-caption text-on-inverse-muted">当前显示 {page.items.length} 条，其中 {displayedLongContext} 条含长上下文价、{displayedFlagged} 条带审核标记。此计数仅覆盖当前显示条目。</CardFooter>}
         </Card>
       </BentoGrid>
-      <Card>
+      <Card className="finance-table-card">
         <CardHeader
           number={3}
           title={<>价格库条目{page?.library && <Count n={page.total} />}</>}

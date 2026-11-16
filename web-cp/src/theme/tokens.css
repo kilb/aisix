@@ -1,19 +1,54 @@
 /* 双端逐字节共享的运维语义令牌。浅色默认、深色仅由手动开关设置。
-   旧变量名保留兼容；蓝色承载交互，青绿与琥珀区分数据和状态。 */
+   旧变量名保留兼容；墨黑承载交互，丁香紫与青柠仅作重点强调。 */
 :root {
   color-scheme: light;
-  --bento-canvas: #F4F7FB;
+  /* 模板语义角色；旧页面别名继续兼容。 */
+  --native-select-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4.5 6.5 8 10l3.5-3.5' fill='none' stroke='%236B6B64' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  --native-check-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 6.25 4.75 8.5 9.5 3.5' fill='none' stroke='%23FFFFFF' stroke-width='1.75' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  --ink-solid: #111110;
+  --lilac: #E3D0FF;
+  --lime: #D5F95F;
+  --sunken: var(--well);
+  --sunken-strong: var(--stone);
+  --fg: var(--foreground);
+  --fg-2: var(--ink-soft);
+  --fg-3: var(--muted-foreground);
+  --fg-4: #9C9C94;
+  --fg-inverse: #FFFFFF;
+  --bento-fg-inverse: #FFFFFF;
+  --tint: rgb(17 17 16 / 0.05);
+  --tint-strong: rgb(17 17 16 / 0.09);
+  --tone-bg: var(--card);
+  --r-field: 14px;
+  --r-tile: 20px;
+  --r-check: 4px;
+  --r-bar: 4px;
+  --r-dot: 2px;
+  --field-border: var(--border);
+  --overlay: rgb(17 17 16 / 0.35);
+  --shadow-drawer: 0 12px 32px rgb(17 17 16 / 0.14);
+  --shadow-focus: 0 0 0 4px var(--focus-halo);
+  --shadow-edge: inset 0 0 0 1px var(--border);
+  --shadow-lamp: inset 0 0 0 1.5px var(--ring);
+  --shadow-pop: 0 18px 36px -14px rgb(17 17 16 / 0.24);
+  --chart-1: #6250D6;
+  --chart-2: #EB6834;
+  --chart-3: #1BAF7A;
+  --chart-4: #EDA100;
+  --chart-5: #E87BA4;
+
+  --bento-canvas: #F3F2EE;
   --bento-surface: #FFFFFF;
-  --bento-well: #EDF3F9;
-  --bento-stone: #DCE5F0;
-  --bento-line: #DCE4EE;
-  --bento-graphite: #64748B;
-  --bento-ink: #17243A;
-  --bento-ink-soft: #40516B;
-  --bento-muted: #5D6D83;
-  --bento-inverse-muted: #B6C4D6;
-  --bento-accent: #0891B2;
-  --brand-dot: #2563EB;
+  --bento-well: #F5F4F0;
+  --bento-stone: #ECEBE6;
+  --bento-line: #E5E4DF;
+  --bento-graphite: #7A7A73;
+  --bento-ink: #111110;
+  --bento-ink-soft: #4A4A45;
+  --bento-muted: #6B6B64;
+  --bento-inverse-muted: #A8A8A0;
+  --bento-accent: #E3D0FF;
+  --brand-dot: #111110;
 
   --background: var(--bento-canvas);
   --foreground: var(--bento-ink);
@@ -32,8 +67,8 @@
   --destructive: var(--danger);
   --destructive-foreground: var(--bento-surface);
   --border: var(--bento-line);
-  --input: #7C8FA9;
-  --ring: var(--brand);
+  --input: #898980;
+  --ring: var(--info);
   --radius: 8px;
   --sidebar: var(--card);
   --sidebar-foreground: var(--foreground);
@@ -41,24 +76,24 @@
   --sidebar-border: var(--border);
 
   /* 状态始终附文字与形状；品牌交互与结果语义分别着色。 */
-  --info: #0E7490;
-  --success: #0F766E;
-  --warning: #B45309;
-  --danger: #BC303D;
-  --info-soft: #ECF8FC;
-  --success-soft: #ECF8F4;
-  --warning-soft: #FFF7E8;
-  --danger-soft: #FFF0F2;
-  --brand: #2563EB;
+  --info: #6250D6;
+  --success: #006300;
+  --warning: #5E4300;
+  --danger: #B42F2F;
+  --info-soft: #F0E8FA;
+  --success-soft: #E6F4E3;
+  --warning-soft: #FFF3D6;
+  --danger-soft: #FBE9E9;
+  --brand: #111110;
   --brand-ink: var(--brand);
   --wash-1: transparent;
   --wash-2: transparent;
   --route-1: var(--brand);
-  --route-2: #0E7490;
-  --route-3: #0F766E;
-  --route-4: #B45309;
-  --route-5: #7C3AED;
-  --route-6: #B93A65;
+  --route-2: #6250D6;
+  --route-3: #006300;
+  --route-4: #5E4300;
+  --route-5: #6250D6;
+  --route-6: #AD4880;
 
   --bg: var(--background);
   --surface: var(--card);
@@ -72,7 +107,7 @@
   --text-muted: var(--muted-foreground);
   --divider: var(--border);
   --input-border: var(--input);
-  --input-border-hover: #57769D;
+  --input-border-hover: #6B6B64;
   --box-border: var(--input);
   --focus: var(--ring);
   --focus-halo: color-mix(in srgb, var(--brand) 12%, transparent);
@@ -80,7 +115,7 @@
   --error: var(--danger);
   --hover: color-mix(in srgb, var(--brand) 6%, transparent);
   --press: color-mix(in srgb, var(--brand) 10%, transparent);
-  --row-hover: #EEF4FC;
+  --row-hover: #F5F4F0;
   --chip: var(--muted);
   --skeleton: var(--bento-well);
   --scrollbar: var(--bento-graphite);
@@ -96,8 +131,8 @@
   --lamp-disabled: var(--bento-graphite);
   --shadow-xs: none;
   --shadow-sm: none;
-  --shadow-card: none;
-  --shadow-float: none;
+  --shadow-card: 0 0 0 1px rgb(17 17 16 / 0.05), 0 1px 2px rgb(17 17 16 / 0.04);
+  --shadow-float: 0 0 0 1px rgb(17 17 16 / 0.05), 0 24px 48px -28px rgb(17 17 16 / 0.32);
   --shadow-btn: none;
 
   /* 旧页面角色继续指向同一主题，禁止新增第二套色值。 */
@@ -129,16 +164,16 @@
   --wide: 100%;
 
   /* 运营界面采用紧凑字级；旧 size API 仍保留，但不再生成巨型数字。 */
-  --type-title: 28px;
-  --type-title-line-height: 36px;
-  --type-hero: 32px;
-  --type-display: 32px;
-  --type-figure: 28px;
-  --type-value: 28px;
+  --type-title: 15px;
+  --type-title-line-height: 21px;
+  --type-hero: 44px;
+  --type-display: 34px;
+  --type-figure: 30px;
+  --type-value: 30px;
   --type-lead: 14px;
-  --card-pad: 16px;
-  --card-gap: 12px;
-  --page-heading-gap: 12px;
+  --card-pad: 20px;
+  --card-gap: 16px;
+  --page-heading-gap: 16px;
   --s-1: 4px;
   --s-2: 8px;
   --s-3: 12px;
@@ -155,17 +190,17 @@
   --fs-20: 19px;
   --fs-24: 24px;
   --fs-32: var(--type-display);
-  --fs-44: var(--type-title);
+  --fs-44: var(--type-display);
   --lh-body: 1.5;
   --lh-table: 1.45;
   --lh-heading: 1.2;
   --tracking-heading: -0.02em;
-  --r-input: 8px;
-  --r-card: 14px;
-  --r-button: 8px;
-  --r-chip: 4px;
-  --r-panel: 14px;
-  --r-rail: 20px;
+  --r-input: 9999px;
+  --r-card: 28px;
+  --r-button: 9999px;
+  --r-chip: 9999px;
+  --r-panel: 28px;
+  --r-rail: 28px;
   --r-round: 9999px;
   --h-control: 40px;
   --h-control-sm: 32px;
@@ -179,56 +214,60 @@
   --t-lens: 0ms;
   --ease-out: ease-out;
   --ease-spring: ease-out;
-  --font-sans: "Geist", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", system-ui, sans-serif;
+  --font-sans: "Manrope Variable", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", system-ui, sans-serif;
   --font-mono: "Geist Mono", "Noto Sans SC", ui-monospace, "SF Mono", Menlo, monospace;
 }
 
 /* 深色按用途重新分层，保持相同语义和手动主题选择。 */
 :root[data-theme="dark"] {
-  --row-hover: #23334D;
+  --native-select-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4.5 6.5 8 10l3.5-3.5' fill='none' stroke='%23B8B8AE' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  --native-check-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 6.25 4.75 8.5 9.5 3.5' fill='none' stroke='%23111110' stroke-width='1.75' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  --fg-inverse: #111110;
+  --bento-fg-inverse: #111110;
+  --row-hover: #292925;
   color-scheme: dark;
-  --bento-canvas: #101827;
-  --bento-surface: #192438;
-  --bento-well: #24334A;
-  --bento-stone: #42556F;
-  --bento-line: #35465F;
-  --bento-graphite: #95A7C0;
-  --bento-ink: #EAF0F9;
-  --bento-ink-soft: #C7D4E8;
-  --bento-muted: #AEBDD2;
-  --bento-accent: #38BDF8;
-  --primary-foreground: #10203A;
-  --destructive-foreground: #2B111A;
-  --input: #7188A6;
-  --info: #67D2ED;
-  --success: #63D4BD;
-  --warning: #F7C573;
-  --danger: #FF9DA8;
-  --info-soft: #193A4B;
-  --success-soft: #173C37;
-  --warning-soft: #42321E;
-  --danger-soft: #462733;
-  --route-2: #67D2ED;
-  --route-3: #63D4BD;
-  --tooltip-bg: #EAF0F9;
-  --tooltip-text: #101827;
+  --bento-canvas: #111110;
+  --bento-surface: #1D1D1A;
+  --bento-well: #292925;
+  --bento-stone: #46463E;
+  --bento-line: #44443D;
+  --bento-graphite: #A8A8A0;
+  --bento-ink: #F3F2EE;
+  --bento-ink-soft: #D4D4CB;
+  --bento-muted: #B8B8AE;
+  --bento-accent: #D8BEFA;
+  --primary-foreground: #111110;
+  --destructive-foreground: #111110;
+  --input: #85857B;
+  --info: #C6B1F5;
+  --success: #8BD67D;
+  --warning: #FFD26A;
+  --danger: #FF9696;
+  --info-soft: #30263E;
+  --success-soft: #20381D;
+  --warning-soft: #403319;
+  --danger-soft: #422222;
+  --route-2: #C6B1F5;
+  --route-3: #8BD67D;
+  --tooltip-bg: #F3F2EE;
+  --tooltip-text: #111110;
   --mark-tile: #121211;
-  --brand: #7CB7FF;
-  --brand-dot: #7CB7FF;
-  --input-border-hover: #A3BBDD;
-  --route-4: #F7C573;
-  --route-5: #C5A7FF;
-  --route-6: #F1A4C4;
-  --shadow-float: none;
+  --brand: #D5F95F;
+  --brand-dot: #D5F95F;
+  --input-border-hover: #B8B8AE;
+  --route-4: #FFD26A;
+  --route-5: #D8BEFA;
+  --route-6: #EEB3D2;
+  --shadow-float: 0 0 0 1px rgb(255 255 255 / 0.08), 0 24px 48px -28px rgb(0 0 0 / 0.55);
 }
 
 @media (max-width: 719px) {
   :root {
-    --type-title: 26px;
-    --type-title-line-height: 34px;
-    --type-hero: 32px;
-    --type-display: 28px;
-    --type-figure: 28px;
+    --type-title: 15px;
+    --type-title-line-height: 21px;
+    --type-hero: 36px;
+    --type-display: 30px;
+    --type-figure: 30px;
   }
 }
 
@@ -246,4 +285,71 @@
     --h-control: 44px;
     --h-control-sm: 44px;
   }
+}
+
+/* 彩色区域只改变当前容器的语义前景，精确金额和状态文字仍可读。 */
+[data-tone="ink"], [data-tone="inverse"] {
+  --well: #292925;
+  --stone: #46463E;
+  --fg-inverse: #111110;
+  --card: #111110;
+  --foreground: #FFFFFF;
+  --card-foreground: #FFFFFF;
+  --ink-soft: #C9C9C2;
+  --muted-foreground: #A8A8A0;
+  --text-2: #C9C9C2;
+  --text-muted: #A8A8A0;
+  --border: rgb(255 255 255 / 0.10);
+  --tint: rgb(255 255 255 / 0.10);
+  --tint-strong: rgb(255 255 255 / 0.16);
+  --tone-bg: #111110;
+  --ring: #D5F95F;
+}
+[data-tone="lilac"], [data-tone="lime"] {
+  --well: #F5F4F0;
+  --stone: #ECEBE6;
+  --fg-inverse: #FFFFFF;
+  --foreground: #111110;
+  --card-foreground: #111110;
+  --ink-soft: #36322D;
+  --muted-foreground: #4A453F;
+  --text-2: #36322D;
+  --text-muted: #4A453F;
+  --border: rgb(17 17 16 / 0.12);
+  --tint: rgb(17 17 16 / 0.08);
+  --tint-strong: rgb(17 17 16 / 0.14);
+  --ring: #6250D6;
+}
+[data-tone="lilac"] { --card: #E3D0FF; --tone-bg: #E3D0FF; }
+[data-tone="lime"] { --card: #D5F95F; --tone-bg: #D5F95F; }
+
+[data-tone="surface"], [data-tone="default"] {
+  --well: var(--bento-well);
+  --stone: var(--bento-stone);
+  --fg-inverse: var(--bento-fg-inverse);
+  --card: var(--bento-surface);
+  --foreground: var(--bento-ink);
+  --card-foreground: var(--bento-ink);
+  --ink-soft: var(--bento-ink-soft);
+  --muted-foreground: var(--bento-muted);
+  --text-2: var(--bento-ink-soft);
+  --text-muted: var(--bento-muted);
+  --border: var(--bento-line);
+  --tone-bg: var(--bento-surface);
+}
+:root, [data-tone] {
+  --field-border: var(--border);
+  --fg: var(--foreground);
+  --fg-2: var(--ink-soft);
+  --fg-3: var(--muted-foreground);
+  --color-fg: var(--foreground);
+  --color-fg-2: var(--ink-soft);
+  --color-fg-3: var(--muted-foreground);
+  --color-hairline: var(--border);
+  --color-tint: var(--tint);
+  --color-tint-strong: var(--tint-strong);
+  --color-sunken: var(--well);
+  --color-sunken-strong: var(--stone);
+  --color-lilac: var(--lilac);
+  --color-lime: var(--lime);
 }

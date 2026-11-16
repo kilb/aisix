@@ -1,9 +1,10 @@
 import "./operations.css";
+import "./Keys.css";
 import { parseBeijingInput } from "../lib/time";
 import { keySearchText } from "../lib/operationalRecords";
 import { useRecordTable } from "../lib/recordTable";
 import { RecordTools, RecordPager } from "../components/RecordTools";
-/** 布局：[01 租户范围 12]；[02 密钥 6][03 正常 6]；[列表 12 / 创建时表单 5 + 列表 7]。 */
+/** 当前租户的范围、概况与密钥列表按通栏顺序显示。 */
 import { Fragment, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import type { TabProps } from "../App";
 import { GatewayTooOld } from "../components/GatewayTooOld";
@@ -43,7 +44,7 @@ import {
   type GroupChoice,
   type Refusal,
 } from "./Tenants";
-import { BentoGrid, Card, CardHeader, PageHeader, span } from "../components/page";
+import { Card, CardHeader, Metric, PageHeader } from "../components/page";
 import { Button } from "../ui/Button";
 import { FormDialog } from "../ui/FormDialog";
 import { useRefusalFocus } from "../ui/Field";
@@ -78,7 +79,7 @@ export function Keys({ canEdit }: TabProps) {
 
   return (
     <div className="cp-operations cp-keys">
-      {/* 桌面与平板：范围 12；概况 6 + 6；密钥表单与明细保留独立状态。 */}
+      {/* 租户切换保留独立的数据边界，密钥列表占满工作区。 */}
       <PageHeader
         title="密钥"
         eyebrow="客户管理"
@@ -97,9 +98,9 @@ export function Keys({ canEdit }: TabProps) {
           </Button>
         }
       />
-      <BentoGrid className="mb-3">
-        <Card className={span.d12}>
-          <CardHeader number={1} title="租户范围" description="平台内部密钥可按名称模式授权模型，明文可随时复制；客户密钥只能使用租户已授权的模型，在这里仅显示前缀，明文由客户在自己的门户复制。切换租户会清除当前显示的新密钥明文。" />
+      <div className="keys-scope">
+        <Card className="keys-scope-card">
+          <div className="keys-scope-heading"><h2 className="text-title text-fg">租户范围</h2><p className="text-caption text-fg-3">切换租户会清除当前新建结果。</p></div>
           {list.error && (
             <div className="note crit" role="alert">
               {list.error}{" "}
@@ -127,7 +128,7 @@ export function Keys({ canEdit }: TabProps) {
             </div>
           )}
         </Card>
-      </BentoGrid>
+      </div>
       {/* 以租户作为实例键：切换时清除旧租户状态，包括一次性密钥明文。 */}
       {tenantId && <TenantKeys key={tenantId} tenantId={tenantId} canEdit={canEdit} tick={tick} />}
     </div>
@@ -283,22 +284,24 @@ function TenantKeys({ tenantId, canEdit, tick }: { tenantId: string; canEdit: bo
   const open = creating && canEdit && tenant.status !== "pending";
   return (
     <>
-      <Card className="keys-overview mb-3" aria-label={`${tenant.name} 的密钥概况`}>
-        <dl className="compact-overview-facts">
-          <div><dt>密钥</dt><dd>{keys === null ? "—" : fmtInt(keys.length)}</dd></div>
-          <div><dt>正常</dt><dd>{live ? fmtInt(live.length) : "—"}</dd></div>
-          <div><dt>已停用</dt><dd>{disabled ? fmtInt(disabled.length) : "—"}</dd></div>
-          <div><dt>已过期（未停用）</dt><dd>{expired ? fmtInt(expired.length) : "—"}</dd></div>
-        </dl>
-      </Card>
-      <BentoGrid className={open ? "is-creating" : undefined}>
+      <section className="key-stats" aria-label={`${tenant.name} 的密钥概况`}>
+        {([
+          ["密钥", keys === null ? "—" : fmtInt(keys.length)],
+          ["正常", live ? fmtInt(live.length) : "—"],
+          ["已停用", disabled ? fmtInt(disabled.length) : "—"],
+          ["已过期（未停用）", expired ? fmtInt(expired.length) : "—"],
+        ] as const).map(([label, value]) => (
+          <Card key={label} className="key-stat"><CardHeader title={label} /><Metric size="value">{value}</Metric></Card>
+        ))}
+      </section>
+      <div className="keys-workspace">
         <FormDialog open={open} onOpenChange={(next) => { setCreating(next); if (!next) setMinted(null); }} busy={createBusy} title={minted ? "密钥已创建" : "新建密钥"} description="选择分组、模型范围与使用限制。未填写的限制沿用租户上限。">
           {minted ? <div ref={createdResult} tabIndex={-1} aria-label="密钥已创建" className="key-created-result"><MintedNote minted={minted} onClose={() => { setCreating(false); setMinted(null); }} /></div> : <CreateForm tenant={tenant} names={names} catalogError={catalog.error} choices={choices}
             onBusyChange={setCreateBusy}
             onMinted={(m) => { setMinted(m); keyList.setData((list) => list ? [...list, m.key] : [m.key]); void refresh(); }}
             onCancel={() => setCreating(false)} />}
         </FormDialog>
-        <Card key="key-list" className={span.d12} aria-label={`${tenant.name} 的密钥`}>
+        <Card key="key-list" className="keys-list" aria-label={`${tenant.name} 的密钥`}>
           <CardHeader
             number={open ? 5 : 4}
             className="sm:flex-nowrap [&>div:first-child]:flex-1"
@@ -379,7 +382,7 @@ function TenantKeys({ tenantId, canEdit, tick }: { tenantId: string; canEdit: bo
                           <KeySecretCell k={k} tenant={tenant} onError={setPlaintextError} />
                           <span className="ops-cell-secondary">创建者：<Creator k={k} members={members.data} /></span>
                         </td>
-                        <td className="side-opt text-text-2">{ownerOf(k, tenant, members.data)}</td>
+                        <td className="side-opt text-fg-2">{ownerOf(k, tenant, members.data)}</td>
                         <td>
                           <span className="block max-w-[280px] truncate" title={modelsOf(k, tenant, names)}>
                             {modelsOf(k, tenant, names)}
@@ -389,7 +392,7 @@ function TenantKeys({ tenantId, canEdit, tick }: { tenantId: string; canEdit: bo
                           <KeyGroupCell k={k} />
                           <StrayNote k={k} tenant={tenant} />
                         </td>
-                        <td className="side-opt text-text-2">{limitsOf(k)}</td>
+                        <td className="side-opt text-fg-2">{limitsOf(k)}</td>
                         <td>
                           <Status k={k} tenant={tenant} members={members.data} />
                         </td>
@@ -437,7 +440,7 @@ function TenantKeys({ tenantId, canEdit, tick }: { tenantId: string; canEdit: bo
             </>
           )}
         </Card>
-      </BentoGrid>
+      </div>
     </>
   );
 }
@@ -562,19 +565,19 @@ function KeyActions({
   );
 }
 
-/** A newly minted key's plaintext, the one time it exists outside the caller's hands. */
+/** 新建密钥始终以遮罩呈现，明文仅交给复制回调。 */
 function MintedNote({ minted, onClose }: { minted: MintedKey; onClose: () => void }) {
   const [copied, setCopied] = useState<string | null>(null);
 
   return (
     <div className="note warn" role="region" aria-label="密钥已创建">
-      <strong>密钥「{minted.key.label}」已创建。</strong>现在可以复制并交给使用方；之后也能在密钥列表里随时点「复制」再次获取明文，关闭本提示不影响。
+      <strong>密钥「{minted.key.label}」已创建。</strong>现在可以复制并交给使用方；之后也能在密钥列表里再次复制，关闭本提示不影响。
       <div className="mt-3 flex flex-wrap items-start gap-2">
-        <code className="tn-token" aria-label="密钥明文">
-          {minted.plaintext}
+        <code className="tn-token" aria-label="密钥前缀">
+          {minted.key.prefix}…
         </code>
         <div className="tn-actions">
-          <CopyButton text={minted.plaintext} onFailed={() => setCopied("无法写入剪贴板，请手动选中复制")} />
+          <CopyButton text={minted.plaintext} onFailed={() => setCopied("无法写入剪贴板，请允许剪贴板权限后重试。")} />
           <Button type="button" onClick={onClose}>
             关闭
           </Button>
@@ -733,7 +736,7 @@ function CreateForm({
     .join("；");
 
   return (
-    <fieldset ref={part} className="tn-sub tn-create">
+    <fieldset ref={part} className="tn-sub tn-create key-create-form">
       <legend className="sr-only">新建密钥</legend>
       <TextField label="名称" value={label} onChange={setLabel} error={at("/label")} />
       {tenant.is_internal ? (

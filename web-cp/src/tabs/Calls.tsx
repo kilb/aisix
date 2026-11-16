@@ -12,8 +12,8 @@ export function Calls(props: TabProps) {
   const [listVisited, setListVisited] = useState(!eventId);
   useEffect(() => { if (!eventId) setListVisited(true); }, [eventId]);
   useLayoutEffect(() => { window.scrollTo({ top: 0, left: 0, behavior: "instant" }); }, [eventId]);
-  return <div className="measurement-records">
-    {(listVisited || !eventId) && <div style={{ display: eventId ? "none" : undefined }}><Charges {...props} /></div>}
+  return <div className="measurement-records calls-workspace">
+    {(listVisited || !eventId) && <div className="calls-list" hidden={Boolean(eventId)}><Charges {...props} /></div>}
     {eventId && <CallLogDetails eventId={eventId} backHref={callListHash(query)} />}
   </div>;
 }

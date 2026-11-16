@@ -157,6 +157,8 @@ export function PublicModelDetail({
       {!routingEditor && <div className="mb-4"><RoutePolicy routing={model.effective_routing} /></div>}
       <section className="pm-detail-overview" aria-label="公共模型账号概览">
         <div className="pm-detail-identity"><Lamp state={model.retired_at ? "disabled" : "applied"}>{model.retired_at ? "已停用" : "在用"}</Lamp><span>标识 <code>{model.id}</code></span><span>创建于 {fmtBeijing(model.created_at)}</span></div>
+        <details className="pm-detail-meta" open={routingEditor ? undefined : true}>
+        <summary>模型信息与授权</summary>
         <dl className="pm-detail-facts">
           <div><dt>启用服务账号</dt><dd>{served.length.toLocaleString("zh-CN")}</dd></div>
           <div><dt>启用优先级层</dt><dd>{enabledPriorities.length.toLocaleString("zh-CN")}</dd></div>
@@ -166,6 +168,7 @@ export function PublicModelDetail({
           <div><dt>密钥</dt><dd>{model.reachable_keys.toLocaleString("zh-CN")}</dd></div>
         </dl>
         <p className="hint">完整映射 {model.served_by.length} 个；未启用的映射仍保留。公共模型的稳定标识承接授权与基准价。重新生成只修复模型文档，不修改优先级、权重或启停状态。</p>
+        </details>
         {model.retired_at ? <p className="note warn" role="status">模型已停用，恢复后仍需重新接入账号。</p> : served.length === 0 && <p className="note warn" role="status"><strong>无可用账号</strong>：模型仍保留在列表中，授权不受影响，但请求会以 503 失败（无可用上游）。请添加服务账号。</p>}
       </section>
       <div className="pm-detail-workspace">

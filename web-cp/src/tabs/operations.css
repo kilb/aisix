@@ -17,16 +17,16 @@
 }
 .cp-operations .ops-snapshot .bento-card-header { margin-bottom: 12px; }
 .cp-operations .ops-snapshot .bento-card-footer { padding-top: 16px; }
-.cp-operations .ops-snapshot .metric { font-size: 32px; font-weight: 500; line-height: 40px; }
-.cp-operations .ops-snapshot dd .metric { font-size: 24px; line-height: 32px; }
-.cp-operations .ops-snapshot :is(dt, .text-micro, .text-meta) { font-size: 13px; line-height: 20px; }
-.cp-operations .ops-snapshot .bento-card-header :is(h2, h3) { font-size: 15px; line-height: 24px; }
+.cp-operations .ops-snapshot .metric { font-size: var(--text-display); font-weight: 500; line-height: 40px; }
+.cp-operations .ops-snapshot dd .metric { font-size: var(--text-metric); line-height: 32px; }
+.cp-operations .ops-snapshot :is(dt, .text-micro, .text-meta) { font-size: var(--text-small); line-height: 20px; }
+.cp-operations .ops-snapshot .bento-card-header :is(h2, h3) { font-size: var(--text-title); line-height: 24px; }
 .cp-operations .ops-form-section {
   margin-top: 24px;
   padding-top: 20px;
   border-top: 1px solid var(--line);
 }
-.cp-operations .ops-target-list { border-radius: 8px; }
+.cp-operations .ops-target-list { border-radius: var(--r-field); }
 .cp-operations .ops-target-row { padding: 16px; row-gap: 12px; }
 .cp-operations .ops-form-footer {
   min-height: 76px;
@@ -37,7 +37,7 @@
 .cp-operations .ops-form-footer .hint { margin-right: auto; }
 .cp-operations :is(.ops-target-row, .ops-editor) .field-problem { margin-top: 6px; }
 .cp-operations .ops-row-field > label { gap: 8px; }
-.cp-operations .ops-group-badge { font-family: inherit; border-radius: 4px; }
+.cp-operations .ops-group-badge { font-family: inherit; border-radius: var(--r-bar); }
 .cp-operations .ops-group-badge > span:last-child { overflow-wrap: anywhere; }
 .cp-operations :is(.tn-part, .tn-foot, .tn-bleed) { --ops-pad: var(--pad, 24px); }
 .cp-operations .tn-part { margin-inline: calc(-1 * var(--ops-pad)); padding-inline: var(--ops-pad); }
@@ -48,12 +48,12 @@
 .cp-operations .tn-bleed > .dt-wrap { --dt-edge: var(--ops-pad); }
 .cp-operations .side-panel > :last-child.tn-part { margin-bottom: calc(-1 * var(--ops-pad)); }
 .cp-operations .tn-scope label { min-height: 44px; }
-.cp-operations .tn-strip { border-radius: 8px; }
+.cp-operations .tn-strip { border-radius: var(--r-field); }
 .cp-operations .tn-strip > div { padding: 12px 16px; }
 .cp-operations .tn-strip dd { overflow-wrap: anywhere; }
-.cp-operations .tn-checks.tn-box { border-radius: 8px; }
-.cp-operations .tn-checks.tn-groups { border-radius: 8px; }
-.cp-operations .tn-section > :is(legend, h3) { font-size: 15px; line-height: 24px; }
+.cp-operations .tn-checks.tn-box { border-radius: var(--r-field); }
+.cp-operations .tn-checks.tn-groups { border-radius: var(--r-field); }
+.cp-operations .tn-section > :is(legend, h3) { font-size: var(--text-title); line-height: 24px; }
 .cp-operations .audit-detail { display: grid; gap: 6px; white-space: normal; }
 .cp-operations .audit-field { display: block; overflow-wrap: anywhere; }
 .cp-operations .audit-field .lab { margin-right: 4px; }
@@ -63,12 +63,12 @@
   padding: 4px;
   gap: 4px;
   border: 1px solid var(--line);
-  border-radius: 8px;
+  border-radius: var(--r-field);
   background: var(--well);
 }
 @media (max-width: 719px) {
   .cp-operations .ops-snapshot { padding-block: 16px; }
-  .cp-operations .ops-snapshot .metric { font-size: 28px; line-height: 36px; }
+  .cp-operations .ops-snapshot .metric { font-size: var(--text-metric); line-height: 36px; }
   .cp-operations .ops-target-row { padding: 12px; }
   .cp-operations .ops-form-footer { gap: 8px; }
   .cp-operations .ops-form-footer > .btn { flex: 1 1 auto; }
@@ -87,7 +87,7 @@
 .cp-operations .ch-tools > .panel .ch-save { margin-inline: 0; padding-inline: 0; }
 .cp-operations .ch-tools .bento-card-header { margin-bottom: 16px; }
 .cp-operations .ch-section details > summary { min-height: 44px; padding-block: 12px; cursor: pointer; }
-.cp-operations .ch-section details > summary:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; border-radius: 4px; }
+.cp-operations .ch-section details > summary:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; border-radius: var(--r-bar); }
 .cp-operations .ops-editor .tn-checks.tn-groups { grid-template-columns: minmax(0, 1fr); }
 
 /* 账号名保持可读换行，不让模型区标题标签撑破编辑器。 */

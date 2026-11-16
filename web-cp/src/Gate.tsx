@@ -3,7 +3,7 @@ import { ApiError, login, type Operator } from "./lib/api";
 import { messageFor } from "./lib/errors";
 import type { Theme } from "./lib/useTheme";
 import { Button } from "./ui/Button";
-import { Moon, Sun } from "lucide-react";
+import { ArrowRight, Moon, Sun } from "lucide-react";
 
 /**
  * The login gate. The Dashboard edits the gateways' configuration, so
@@ -73,7 +73,7 @@ export function Gate({
           onSubmit={submit}
         >
           <div className="mb-6">
-            <h2 className="text-stat font-semibold">运维登录</h2>
+            <h2 className="text-heading font-extrabold">运维登录</h2>
             <p className="mt-2 text-caption text-muted-foreground">使用平台分配的运维账号继续。</p>
           </div>
           {notice && (
@@ -103,7 +103,7 @@ export function Gate({
             />
           </label>
           <Button kind="primary" type="submit" block busy={busy} busyLabel="校验中…" className="mt-0">
-            登录
+            登录 <ArrowRight aria-hidden />
           </Button>
           {err && (
             <div className="note crit mt-4 mb-0" role="alert">

@@ -151,7 +151,7 @@ export function Groups({ canEdit }: TabProps) {
           {refusal}
         </div>
       )}
-      <Card className="mb-3">
+      <Card className="finance-facts-card">
         <dl className="compact-overview-facts">
           <div><dt>分组 · 全部</dt><dd>{rows === null ? "—" : fmtInt(rows.length)}</dd></div>
           <div><dt>租户引用</dt><dd>{referenceCount(rows, "tenants")}</dd></div>
@@ -160,7 +160,7 @@ export function Groups({ canEdit }: TabProps) {
         </dl>
         <p className="text-caption text-muted">默认分组：{rows === null ? "—" : rows.find((group) => group.is_default)?.display_name ?? "未设置"}。预约修订只统计默认换算率，单模型覆盖在分组明细中查看。</p>
       </Card>
-      <Card className="mb-0">
+      <Card className="finance-table-card">
         <CardHeader number={3} className="mb-0" title={<>全部分组{rows && <Count n={rows.length} />}</>} />
         {rows === null ? (
           !error && <Loading />

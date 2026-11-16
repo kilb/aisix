@@ -3,17 +3,22 @@ import { STACK_START_TIMEOUT_MS, fundTenant, startStack, type ApiClient, type Js
 import { chooseSelect, selectOptions } from "./select";
 
 /**
- * The Keys tab, the operator's side of API keys: minting (the plaintext shown
- * once), the operator's switch, revocation and the per-key group override.
- * Against the real stack; what a tenant does goes through the real `/api`
- * (ruling 10), and every key is judged by the real gateway.
- *
- * Keys are minted only on approved tenants, so these hold whether or not the
- * control plane refuses a key for a pending tenant.
+ * 运维侧密钥的创建遮罩、复制、开关、吊销与分组覆盖。
+ * 沿用真实控制面与网关验证；租户动作通过真实 /api 完成。
+ * 密钥只为已审核租户创建，创建响应中的凭据只保留在 Node 内存。
  */
 
 let stack: Stack;
 const models: Record<string, Json> = {};
+const browserLogs = new WeakMap<Page, string[]>();
+// 创建响应只留在测试进程中，trace 也不得保存响应里的密钥。
+test.use({ trace: "off" });
+test.beforeEach(({ page }) => {
+  const lines: string[] = [];
+  browserLogs.set(page, lines);
+  page.on("console", message => lines.push(message.text()));
+  page.on("pageerror", error => lines.push(error.message));
+});
 
 const PASSWORD = "t6-e2e-pass-3b8d";
 /** How long a switch on the control plane may take to reach the gateway. */
@@ -122,7 +127,37 @@ async function openKeys(page: Page, org?: string): Promise<void> {
 const keyTable = (page: Page) => page.getByRole("table", { name: "密钥列表" });
 const keyRow = (page: Page, label: string) => keyTable(page).getByRole("row").filter({ hasText: label });
 
-test("新建内部密钥：明文可随时再次复制，用它能调网关", async ({ page }) => {
+/** 密钥从真实创建响应进入 Node 内存，不能从页面取明文。 */
+function createdSecret(page: Page): Promise<string> {
+  return page.waitForResponse(response => /\/admin\/tenants\/[^/]+\/keys$/.test(new URL(response.url()).pathname) && response.request().method() === "POST").then(async response => {
+    expect(response.status()).toBe(201);
+    const body: { plaintext?: unknown } = await response.json();
+    if (typeof body.plaintext !== "string") throw new Error("密钥创建响应缺少明文凭据");
+    expect(/^sk-rt-[A-Za-z0-9]{16,}$/.test(body.plaintext)).toBe(true);
+    return body.plaintext;
+  });
+}
+
+/** 每个通道独立检查；只返回布尔值，失败输出也不携带凭据。 */
+async function secretPrivate(page: Page, secret: string): Promise<void> {
+  const leaks = await page.evaluate(value => ({
+    text: (document.body.textContent ?? "").includes(value),
+    html: document.documentElement.outerHTML.includes(value),
+    attributes: [...document.querySelectorAll("*")].some(element => [...element.attributes].some(attribute => attribute.value.includes(value))),
+    inputs: [...document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>("input, textarea")].some(input => input.value.includes(value)),
+    storage: JSON.stringify([Object.entries(localStorage), Object.entries(sessionStorage)]).includes(value),
+    cookie: document.cookie.includes(value),
+    url: location.href.includes(value),
+  }), secret);
+  expect(leaks).toEqual({ text: false, html: false, attributes: false, inputs: false, storage: false, cookie: false, url: false });
+  const logs = browserLogs.get(page);
+  expect(logs).toBeDefined();
+  expect(logs!.some(line => line.includes(secret))).toBe(false);
+  await expect(page.getByLabel("密钥明文", { exact: true })).toHaveCount(0);
+  await expect(page.getByRole("textbox", { name: "手动复制密钥", exact: true })).toHaveCount(0);
+}
+
+test("新建内部密钥：始终遮罩并可复制，用创建响应中的密钥能调网关", async ({ page }) => {
   const logged: string[] = [];
   page.on("console", (m) => logged.push(m.text()));
   // A customer whose name sorts before the platform's own tenant, so that
@@ -151,21 +186,21 @@ test("新建内部密钥：明文可随时再次复制，用它能调网关", as
   // offered by its display name with the routing name beside it.
   await chooseSelect(form.getByLabel("分组（必选）"), { label: "通用分组（shared）" });
   await form.getByLabel("模型（可写通配）").fill("chat-t6-*");
+  const creation = createdSecret(page);
   await form.getByRole("button", { name: "创建" }).click();
 
   const notice = page.getByRole("region", { name: "密钥已创建" });
   await expect(notice).toBeVisible();
   await expect(notice.getByRole("button", { name: "复制" })).toBeVisible();
-  const shown = notice.getByLabel("密钥明文");
-  const plaintext = ((await shown.textContent()) ?? "").trim();
-  expect(plaintext).toMatch(/^sk-rt-[A-Za-z0-9]{16,}$/);
+  const plaintext = await creation;
+  await expect(notice).toContainText(`${plaintext.slice(0, 12)}…`);
+  await secretPrivate(page, plaintext);
 
-  // The key the page showed is the real one: the gateway serves it, for the
-  // models its pattern names only.
+  // 创建响应中的密钥只能访问其名称模式授权的模型。
   await expect.poll(() => chatStatus(plaintext), { timeout: KEY_READY_MS }).toBe(200);
   expect(await chatStatus(plaintext, "other-t6-e2e")).not.toBe(200);
 
-  // Shown, and kept nowhere else.
+  // 页面只显示前缀，不把凭据写入其他浏览器状态。
   expect(page.url()).not.toContain(plaintext);
   const stored = await page.evaluate(() =>
     JSON.stringify([Object.entries(localStorage), Object.entries(sessionStorage)]),
@@ -188,6 +223,7 @@ test("新建内部密钥：明文可随时再次复制，用它能调网关", as
   await expect(keyRow(page, "ops-key-t6")).toContainText(`${plaintext.slice(0, 12)}…`);
   expect(await page.content()).not.toContain(plaintext);
   expect(logged.join("\n")).not.toContain(plaintext);
+  await secretPrivate(page, plaintext);
 });
 
 test("内部密钥的明文可以再次复制；客户租户的密钥没有复制", async ({ page }) => {
@@ -218,11 +254,12 @@ test("内部密钥的明文可以再次复制；客户租户的密钥没有复�
   await expect(keyRow(page, "ops-reveal-t6").getByRole("button", { name: /^(显示|隐藏)$/ })).toHaveCount(0);
   await expect(keyRow(page, "ops-reveal-t6")).not.toContainText(minted);
 
-  // 复制 reveals it again and copies it in one click.
+  // 复制只将凭据交给剪贴板，页面仍不显示完整值。
   await keyRow(page, "ops-reveal-t6").getByRole("button", { name: "复制密钥", exact: true }).click();
   await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(minted);
   await expect(keyRow(page, "ops-reveal-t6").getByRole("button", { name: "已复制", exact: true })).toHaveText("");
   await expect(keyRow(page, "ops-reveal-t6")).not.toContainText(minted);
+  await secretPrivate(page, minted);
   // The value copied is the key the gateway serves.
   await expect.poll(() => chatStatus(minted), { timeout: KEY_READY_MS }).toBe(200);
 
@@ -422,11 +459,13 @@ test("给客户租户新建密钥：只能调用所选模型，限额与过期�
   await form.getByLabel("并发").fill("2");
   await form.getByLabel("每分钟请求").fill("30");
   await form.getByLabel("过期时间").fill("2031-01-02T03:04");
+  const creation = createdSecret(page);
   await form.getByRole("button", { name: "创建" }).click();
 
   const created = page.getByRole("region", { name: "密钥已创建" });
-  const plaintext = ((await created.getByLabel("密钥明文").textContent()) ?? "").trim();
-  expect(plaintext).toMatch(/^sk-rt-[A-Za-z0-9]{16,}$/);
+  await expect(created).toBeVisible();
+  const plaintext = await creation;
+  await secretPrivate(page, plaintext);
   await expect.poll(() => chatStatus(plaintext), { timeout: KEY_READY_MS }).toBe(200);
   expect(await chatStatus(plaintext, "other-t6-e2e")).not.toBe(200);
 
@@ -504,10 +543,12 @@ test("全部范围租户新建密钥：可从全部公共模型里选，只选�
 
   await form.getByLabel("名称").fill("allpick-key-t6");
   await choices.getByRole("checkbox", { name: "pub-t6-e2e" }).check();
+  const creation = createdSecret(page);
   await form.getByRole("button", { name: "创建" }).click();
   const created = page.getByRole("region", { name: "密钥已创建" });
-  const plaintext = ((await created.getByLabel("密钥明文").textContent()) ?? "").trim();
-  expect(plaintext).toMatch(/^sk-rt-[A-Za-z0-9]{16,}$/);
+  await expect(created).toBeVisible();
+  const plaintext = await creation;
+  await secretPrivate(page, plaintext);
 
   // The gateway serves the one model chosen, and only it. A key of the same
   // tenant that picks no models is served pub2: the refusal is the narrowed
@@ -576,10 +617,11 @@ test("分组只选一个：分组没有上游账号时先警告并要求确认�
   await form.getByRole("button", { name: "创建" }).click();
   await expect(form.getByRole("alert")).toContainText("grp-none-6b2");
   expect((await stack.admin.get(`/admin/tenants/${t.id}/keys`)).items).toEqual([]);
+  const creation = createdSecret(page);
   await form.getByRole("button", { name: "确认创建" }).click();
-  const plaintext = (
-    (await page.getByRole("region", { name: "密钥已创建" }).getByLabel("密钥明文").textContent()) ?? ""
-  ).trim();
+  const plaintext = await creation;
+  await expect(page.getByRole("region", { name: "密钥已创建" })).toBeVisible();
+  await secretPrivate(page, plaintext);
   const listed = (await stack.admin.get(`/admin/tenants/${t.id}/keys`)).items as Json[];
   const stored = listed.find((k) => k.label === "unreach-key-t6");
   expect(stored.group.name).toBe("grp-none-6b2");
@@ -608,10 +650,11 @@ test("为客户租户新建密钥：从租户的分组里选一个，创建后�
   await expect((await selectOptions(select)).filter({ hasText: "Alpha 分组 7c1" })).toContainText("grp-alpha-7c1");
   await page.keyboard.press("Escape");
   await chooseSelect(select, { label: "Alpha 分组 7c1（grp-alpha-7c1）" });
+  const creation = createdSecret(page);
   await form.getByRole("button", { name: "创建" }).click();
-  await expect
-    .poll(() => page.getByRole("region", { name: "密钥已创建" }).getByLabel("密钥明文").textContent())
-    .toMatch(/^sk-rt-[A-Za-z0-9]{16,}$/);
+  const plaintext = await creation;
+  await expect(page.getByRole("region", { name: "密钥已创建" })).toBeVisible();
+  await secretPrivate(page, plaintext);
   await page.getByRole("region", { name: "密钥已创建" }).getByRole("button", { name: "关闭" }).click();
 
   const listed = (await stack.admin.get(`/admin/tenants/${t.id}/keys`)).items as Json[];

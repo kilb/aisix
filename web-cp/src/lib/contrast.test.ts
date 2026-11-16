@@ -80,3 +80,21 @@ test("凹槽局部次级文字在浅深主题及嵌套面板上保持 AA", () =>
       assert.equal(local[semantic], global[semantic]);
   }
 });
+
+// 选中胶囊在浅深主题和局部彩卡上使用同一对前景/反色，不能出现白底白字。
+test("反色前景在浅深主题及局部彩卡上均达到AA", () => {
+  const css = readFileSync(new URL("../theme/tokens.css", import.meta.url), "utf8");
+  for (const theme of ["light", "dark"] as const) {
+    const T = readTokens(css, theme);
+    assert.ok(contrastRatio(T["--fg"]!, T["--fg-inverse"]!) >= 4.5, theme);
+  }
+  for (const tone of ["ink", "lilac", "lime"] as const) {
+    const selector = tone === "ink" ? /\[data-tone="ink"\], \[data-tone="inverse"\]\s*\{([^}]+)\}/ : /\[data-tone="lilac"\], \[data-tone="lime"\]\s*\{([^}]+)\}/;
+    const declarations = selector.exec(css)?.[1];
+    assert.ok(declarations, tone);
+    const local = readTokens(`${css}\n:root {${declarations}}`, "light");
+    assert.ok(contrastRatio(local["--foreground"]!, local["--fg-inverse"]!) >= 4.5, tone);
+    for (const background of ["--well", "--stone"])
+      assert.ok(contrastRatio(local["--foreground"]!, local[background]!) >= 4.5, `${tone} control text on ${background}`);
+  }
+});

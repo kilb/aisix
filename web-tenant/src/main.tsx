@@ -3,11 +3,9 @@ import { createRoot } from "react-dom/client";
 import "./index.css";
 import { App } from "./App";
 import { ToastProvider } from "./ui/Toast";
-// 中文字体随构建自托管，保留现有 Geist Latin 字形与中点度量。
-import "@fontsource/noto-sans-sc/300.css";
+// 中文沿用自托管字体，拉丁字符与数字使用模板的 Manrope。
 import "@fontsource/noto-sans-sc/400.css";
-import "@fontsource/noto-sans-sc/500.css";
-import "@fontsource/noto-sans-sc/700.css";
+import "./assets/fonts/fonts.css";
 
 /**
  * The invitation token, if the page was opened from an invitation link

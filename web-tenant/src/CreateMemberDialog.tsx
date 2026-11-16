@@ -53,7 +53,7 @@ export function CreateMemberDialog({ roles, labels, onInactive, onCreated }: {
               <X aria-hidden />
             </Button>
           </div>
-          <Dialog.Description className="mt-4 text-body text-ink-soft">
+          <Dialog.Description className="mt-2 text-body text-fg-3">
             直接为新成员设置登录账号。新成员可使用邮箱和初始密码登录本组织；已有账号的密码不会被修改。
           </Dialog.Description>
           <CreateMember

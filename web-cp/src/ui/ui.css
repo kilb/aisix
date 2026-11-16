@@ -31,7 +31,7 @@
 
 /* ── Buttons: shape and colour are Tailwind classes (Button.tsx); here only
    the busy spinner and the disabled-reason tooltip. ─────────────── */
-.btn:focus-visible { box-shadow: 0 0 0 4px var(--focus-halo); }
+.btn:focus-visible { box-shadow: var(--shadow-focus); }
 .btn.is-busy:disabled {
   opacity: 1;
   cursor: progress;
@@ -51,7 +51,7 @@
   margin: auto;
   border: 1.5px solid currentColor;
   border-right-color: transparent;
-  border-radius: 50%;
+  border-radius: var(--r-round);
   animation: ui-spin 0.7s linear infinite;
 }
 @keyframes ui-spin {
@@ -78,7 +78,7 @@
   border-radius: var(--r-chip);
   background: var(--tooltip-bg);
   color: var(--tooltip-text);
-  font-size: 12px;
+  font-size: var(--text-caption);
   font-weight: 400;
   line-height: 1.45;
   white-space: normal;
@@ -138,7 +138,7 @@
 .f > label > span:first-child,
 .f-label {
   color: var(--foreground);
-  font-size: 14px;
+  font-size: var(--text-body);
   font-weight: 500;
   line-height: 20px;
 }
@@ -172,7 +172,7 @@ label.f:has(> input[type="radio"]:first-child) > span {
   display: block;
   margin: 6px 0 0;
   color: var(--danger);
-  font-size: 13px;
+  font-size: var(--text-small);
   font-weight: 500;
   line-height: 1.4;
 }
@@ -185,14 +185,14 @@ label.f:has(> input[type="radio"]:first-child) > span {
 .field > .hint {
   margin: 6px 0 0;
   color: var(--muted-foreground);
-  font-size: 13px;
+  font-size: var(--text-small);
   line-height: 1.45;
 }
 .json-editor textarea {
   min-height: 320px;
   padding: 12px;
   font-family: var(--font-mono);
-  font-size: 13px;
+  font-size: var(--text-small);
   line-height: 1.6;
 }
 select.select-sm {
@@ -200,7 +200,7 @@ select.select-sm {
   height: var(--h-control-sm);
   padding-left: 10px;
   padding-right: 32px;
-  font-size: 13px;
+  font-size: var(--text-small);
   background-position: right 8px center;
 }
 
@@ -221,9 +221,9 @@ select.select-sm {
   flex: none;
   width: 8px;
   height: 8px;
-  border-radius: 50%;
+  border-radius: var(--r-round);
   background: var(--c);
-  box-shadow: inset 0 0 0 1.5px var(--ring);
+  box-shadow: var(--shadow-lamp);
 }
 .lamp[data-lamp="applied"] {
   --c: var(--lamp-applied);
@@ -238,12 +238,12 @@ select.select-sm {
 .lamp[data-lamp="rejected"] {
   --c: var(--lamp-rejected);
 }
-.lamp[data-lamp="rejected"]::before { border-radius: 2px; }
+.lamp[data-lamp="rejected"]::before { border-radius: var(--r-dot); }
 .lamp[data-lamp="disabled"] {
   --c: var(--lamp-disabled);
 }
 :is(h1, h2, h3) :is(.lamp, .rollout) {
-  font-size: 14px;
+  font-size: var(--text-body);
   font-weight: 400;
   letter-spacing: 0;
 }
@@ -258,7 +258,7 @@ select.select-sm {
   border-radius: var(--r-chip);
   background: var(--muted);
   color: var(--text-2);
-  font-size: 12px;
+  font-size: var(--text-caption);
   font-weight: 500;
   line-height: 1;
   white-space: nowrap;
@@ -290,7 +290,7 @@ select.select-sm {
   flex: none;
   width: 8px;
   height: 8px;
-  border-radius: 2px;
+  border-radius: var(--r-dot);
   background: var(--c, var(--route-1));
 }
 
@@ -356,7 +356,7 @@ select.select-sm {
 .dt {
   width: 100%;
   border-collapse: collapse;
-  font-size: 14px;
+  font-size: var(--text-body);
   line-height: 1.4;
 }
 .dt th {
@@ -368,7 +368,7 @@ select.select-sm {
   border-bottom: 1px solid var(--border);
   background: color-mix(in srgb, var(--background) 45%, var(--card));
   color: var(--muted-foreground);
-  font-size: 12px;
+  font-size: var(--text-caption);
   font-family: var(--font-sans);
   font-weight: 500;
   letter-spacing: 0;
@@ -440,7 +440,7 @@ select.select-sm {
   display: block;
   margin-top: 2px;
   color: var(--muted-foreground);
-  font-size: 12px;
+  font-size: var(--text-caption);
   line-height: 1.45;
 }
 .dt code {
@@ -498,7 +498,7 @@ select.select-sm {
 .skeleton i {
   display: block;
   height: 10px;
-  border-radius: 9999px;
+  border-radius: var(--r-round);
   background: var(--skeleton);
   animation: none;
 }
@@ -544,7 +544,7 @@ select.select-sm {
   width: max-content;
   max-width: 44ch;
   color: var(--muted-foreground);
-  font-size: 12px;
+  font-size: var(--text-caption);
   line-height: 1.45;
   white-space: normal;
   text-wrap: balance;
@@ -579,7 +579,7 @@ select.select-sm {
   border-radius: var(--radius);
   background: var(--popover);
   color: var(--popover-foreground);
-  font-size: 14px;
+  font-size: var(--text-body);
   font-weight: 500;
   line-height: 1.45;
   animation: none;
@@ -589,7 +589,7 @@ select.select-sm {
   flex: none;
   width: 8px;
   height: 8px;
-  border-radius: 50%;
+  border-radius: var(--r-round);
   background: var(--success);
 }
 .toast.is-leaving {
@@ -628,7 +628,7 @@ select.select-sm {
 .side-head > h2 {
   min-width: 0;
   overflow: hidden;
-  font-size: 17px;
+  font-size: var(--text-brand);
   line-height: 26px;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -715,15 +715,47 @@ main { counter-reset: bento-card; }
 /* 三项实测值并列排布，单元格保持两行，保留真实零与未知。 */
 .usage-performance { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px 10px; margin: 0; min-width: 0; text-align: right; font-variant-numeric: tabular-nums; }
 .usage-performance > div { min-width: 0; }
-.usage-performance dt { color: var(--muted-foreground); font-size: 12px; line-height: 16px; white-space: nowrap; }
-.usage-performance dd { margin: 2px 0 0; color: var(--foreground); font-size: 13px; line-height: 18px; overflow-wrap: anywhere; }
+.usage-performance dt { color: var(--muted-foreground); font-size: var(--text-caption); line-height: 16px; white-space: nowrap; }
+.usage-performance dd { margin: 2px 0 0; color: var(--foreground); font-size: var(--text-small); line-height: 18px; overflow-wrap: anywhere; }
 
 /* 紧凑统计条用于列表概况，不以大块数字卡挤压实际记录。 */
 .compact-overview-facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); align-items: start; gap: 12px 20px; margin: 0; }
 .compact-overview-facts > div { min-width: 0; }
-.compact-overview-facts dt { color: var(--muted-foreground); font-size: 12px; line-height: 18px; }
-.compact-overview-facts dd { margin: 4px 0 0; color: var(--foreground); font-size: 24px; font-weight: 400; line-height: 32px; font-variant-numeric: tabular-nums; }
-.pricing-tier-coverage { display: flex; flex-wrap: wrap; gap: 6px 12px; color: var(--muted-foreground); font-size: 12px; }
-.pricing-tier-coverage > span { padding: 3px 8px; border-radius: 5px; background: var(--muted); }
+.compact-overview-facts dt { color: var(--muted-foreground); font-size: var(--text-caption); line-height: 18px; }
+.compact-overview-facts dd { margin: 4px 0 0; color: var(--foreground); font-size: var(--text-metric); font-weight: 400; line-height: 32px; font-variant-numeric: tabular-nums; }
+.pricing-tier-coverage { display: flex; flex-wrap: wrap; gap: 6px 12px; color: var(--muted-foreground); font-size: var(--text-caption); }
+.pricing-tier-coverage > span { padding: 3px 8px; border-radius: var(--r-field); background: var(--muted); }
 .pricing-tier-coverage strong { margin-left: 6px; color: var(--foreground); font-weight: 500; }
 .public-model-overview { margin-bottom: 14px; }
+
+/* 模板控件与卡片层级，行为继续由已有原语负责。 */
+.btn > svg { width: 16px; height: 16px; }
+.btn[data-kind="primary"]:not([data-icon-only]) > svg { width: 28px; height: 28px; padding: 6px; border-radius: var(--r-round); background: var(--lime); color: var(--ink-solid); }
+.panel { border-color: var(--border); border-radius: var(--r-card); box-shadow: var(--shadow-card); }
+.panel:is([data-tone="ink"], [data-tone="inverse"], [data-tone="lilac"], [data-tone="lime"]) { background: var(--card); border-color: transparent; box-shadow: none; }
+.bento-page-header { gap: 12px 16px; margin-bottom: 16px; }
+.bento-page-header h1 { font-weight: 800; }
+.bento-card-header :is(h2,h3) { font-size: var(--text-title); font-weight: 700; line-height: 1.4; }
+.metric { font-weight: 800; letter-spacing: -.035em; }
+.bento-card { gap: 16px; }
+.bento-split > * { grid-column: 1 / -1; position: static; }
+.bento-stat { border-radius: var(--r-card); padding: 18px; }
+.tag { border-radius: var(--r-round); background: var(--tint); border-color: transparent; }
+.sections-switch { border-radius: var(--r-round); }
+textarea, .ui-dropdown { border-radius: var(--r-field); }
+
+/* 卡片间距与表格模式由原语显式选择，避免业务页重复套容器。 */
+.bento-card[data-padding="md"] { padding: 20px; }
+.bento-card[data-padding="sm"] { padding: 16px; }
+.bento-card[data-padding="table"] { padding: 0; overflow: hidden; }
+.bento-card[data-padding="table"] > .bento-card-header { padding: 20px 20px 0; }
+.bento-card[data-padding="table"] > .bento-card-footer { padding: 0 20px 20px; }
+.bento-card[data-padding="none"] { padding: 0; }
+.lamp::before { display: none; }
+.lamp-icon { width: 14px; height: 14px; flex: none; color: var(--c); fill: currentColor; }
+.lamp-icon-mark { fill: none; stroke: var(--card); stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+.lamp[data-lamp="pending"] { --c: var(--warning); }
+.lamp[data-lamp="pending"] .lamp-icon-mark { stroke: var(--card); }
+
+.bento-card[data-padding="table"] > .dt-wrap { --dt-edge: 20px; width: 100%; margin: 0; }
+.bento-card[data-padding="table"] > :is(.record-table-toolbar, .record-table-pager) { margin-inline: 20px; }

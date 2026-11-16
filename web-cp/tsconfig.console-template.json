@@ -1,0 +1,4 @@
+{
+  "extends": "./tsconfig.json",
+  "include": ["e2e-real/console-template.spec.ts", "playwright.console-template.config.ts"]
+}

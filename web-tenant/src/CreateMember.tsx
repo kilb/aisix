@@ -91,7 +91,7 @@ export function CreateMember({ roles, labels, onInactive, onCreated, onBusyChang
   return (
     <form ref={form} className="create-member-form" aria-label="创建账号" aria-busy={busy} onSubmit={submit}>
       <fieldset className="create-member-group" disabled={busy}>
-        <legend className="text-body font-medium">账号信息</legend>
+        <legend className="text-title font-bold">账号信息</legend>
         <div className="create-member-fields">
           <Field label="邮箱" error={errors.email} hint="新成员将使用此邮箱登录">
             {(aria) => <input type="email" autoComplete="off" required value={email} onChange={(e) => setEmail(e.target.value)} disabled={busy} {...aria} />}
@@ -102,7 +102,7 @@ export function CreateMember({ roles, labels, onInactive, onCreated, onBusyChang
         </div>
       </fieldset>
       <fieldset className="create-member-group" disabled={busy}>
-        <legend className="text-body font-medium">登录与权限</legend>
+        <legend className="text-title font-bold">登录与权限</legend>
         <div className="create-member-fields">
           <Field label="初始密码" error={errors.password} hint={<>至少 {MIN_PASSWORD_CHARS} 个字符，请通过安全渠道交给新成员</>}>
             {(aria) => <input type="password" autoComplete="new-password" required value={password} onChange={(e) => setPassword(e.target.value)} disabled={busy} {...aria} />}
@@ -118,7 +118,7 @@ export function CreateMember({ roles, labels, onInactive, onCreated, onBusyChang
       </fieldset>
       {error && <div className="note crit" role="alert">{error}</div>}
       <div className="create-member-footer">
-        {busy && <p className="mr-auto text-caption text-ink-soft" role="status">正在创建账号，请等待结果。</p>}
+        {busy && <p className="mr-auto text-caption text-fg-3" role="status">正在创建账号，请等待结果。</p>}
         <Button type="button" disabled={busy} onClick={onCancel}>取消</Button>
         <Button kind="primary" type="submit" busy={busy} busyLabel="创建账号中…">创建账号</Button>
       </div>

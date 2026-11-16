@@ -14,7 +14,7 @@ import { usdRateText } from "../../lib/rateUnits";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
 import { EmptyState } from "../../ui/EmptyState";
-import { BentoGrid, Card, CardHeader, PageHeader, span } from "../../components/page";
+import { Card, CardHeader, PageHeader } from "../../components/page";
 import { formatCount } from "../../lib/chartFormat";
 import { useHashQuery } from "../../lib/useHashQuery";
 import { currentQueryResult, type QueryResult } from "../../lib/queryResult";
@@ -142,17 +142,16 @@ export function Charges(_props: TabProps) {
         dataLead="按计费尝试逐条展示，同一请求可能有多条记录。失败但已产生用量的调用仍按实际用量计费。"
         description="售价与成本以人民币计；成本未知显示 —。无需计费的调用不收费，原因保留在每行。"
         actions={
-          <Button className="finance-icon-button" aria-label="刷新" title="刷新" type="button" icon="refresh" onClick={() => void loadFirst(filter)}></Button>
+          <Button className="charge-icon-button" aria-label="刷新" title="刷新" type="button" icon="refresh" onClick={() => void loadFirst(filter)}></Button>
         }
       />
-      {(filter.from || filter.to || filter.member_id || filter.provider_key_id || filter.request_id) && <p className="hint" role="status">当前已应用范围条件：{[filter.from ? "开始 " + fmtBeijing(filter.from) : null, filter.to ? "结束 " + fmtBeijing(filter.to) + "（不含）" : null, filter.member_id ? "成员 " + filter.member_id : null, filter.provider_key_id ? "上游账号 " + filter.provider_key_id : null, filter.request_id ? "请求 " + filter.request_id : null].filter(Boolean).join("；")}</p>}
-      <BentoGrid>
-      <Card className={`${span.d12} charge-workspace`}>
+      <Card className="charge-workspace">
         <CardHeader
           number={1}
           title="调用计费记录"
           description={rows === null ? (error ? "当前筛选结果读取失败，请重试。" : "正在读取当前筛选结果。") : `当前筛选已加载 ${formatCount(rows.length)} 条${next === null ? "，已到记录末尾。" : "，可继续加载。"}`}
         />
+        <div className="charge-filter-controls">
         <form
           className="charge-primary-filters"
           onSubmit={(e) => {
@@ -227,14 +226,16 @@ export function Charges(_props: TabProps) {
         </form>
         <UsageRecordFilters scope="admin" value={usageRecordFilterValues(query)} onChange={patch => update(patch)} />
         <ChargeScopeFilters key={JSON.stringify([filter.from, filter.to, filter.member_id, filter.provider_key_id, filter.request_id, filter.model_id])} filter={filter} onChange={set} />
+        {(filter.from || filter.to || filter.member_id || filter.provider_key_id || filter.request_id) && <p className="charge-scope-summary" role="status">当前已应用范围条件：{[filter.from ? "开始 " + fmtBeijing(filter.from) : null, filter.to ? "结束 " + fmtBeijing(filter.to) + "（不含）" : null, filter.member_id ? "成员 " + filter.member_id : null, filter.provider_key_id ? "上游账号 " + filter.provider_key_id : null, filter.request_id ? "请求 " + filter.request_id : null].filter(Boolean).join("；")}</p>}
         {linked.length > 0 && (
-          <div className="mt-3 flex flex-wrap items-center gap-3 rounded-cell border border-border bg-well/50 px-3 py-2" role="status">
+          <div className="charge-linked-scope" role="status">
             <span className="hint">只看 {linked.join("，")}（按上述筛选查询，也含已通过重计价更正的调用，条数可能与计价状态的次数不同）</span>
             <Button type="button" size="sm" className="ml-auto" onClick={() => set({ error_code: undefined, model_id: undefined })}>
               清除
             </Button>
           </div>
         )}
+        </div>
         {error && (
           <div className="note crit" role="alert">
             {error}
@@ -292,15 +293,19 @@ export function Charges(_props: TabProps) {
                             aria-controls={`charge-check-${c.seq}`}
                             aria-label={`${shown ? "收起" : "展开"}用量明细 ${c.event_id}`}
                             title={shown ? "收起用量明细" : "展开用量明细"}
-                            className="finance-icon-button"
-                            onClick={() =>
+                            className="charge-icon-button"
+                            onClick={() => {
                               setOpen((prev) => {
                                 const next = new Set(prev);
                                 if (next.has(c.seq)) next.delete(c.seq);
                                 else next.add(c.seq);
                                 return next;
-                              })
-                            }
+                              });
+                              if (!shown) requestAnimationFrame(() => {
+                                // 展开后先让明细起点可见，横向位置仍由局部滚动区管理。
+                                document.getElementById(`charge-check-${c.seq}`)?.querySelector("h4")?.scrollIntoView({ block: "nearest", inline: "nearest", behavior: "instant" });
+                              });
+                            }}
                           >
                             <ChevronDown aria-hidden style={{ transform: shown ? "rotate(180deg)" : undefined }} />
                           </Button>
@@ -323,7 +328,6 @@ export function Charges(_props: TabProps) {
         )}
 
       </Card>
-      </BentoGrid>
     </>
   );
 }
@@ -334,7 +338,7 @@ function ChargeScopeFilters({ filter, onChange }: { filter: ChargeFilter; onChan
   const [draft, setDraft] = useState({ from: dateValue(filter.from), to: dateValue(filter.to), member_id: filter.member_id ?? "", provider_key_id: filter.provider_key_id ?? "", request_id: filter.request_id ?? "", model_id: filter.model_id ?? "" });
   const [error, setError] = useState("");
   const active = Boolean(filter.from || filter.to || filter.member_id || filter.provider_key_id || filter.request_id || filter.model_id);
-  return <details className="my-4 min-w-0 rounded-cell border border-border px-4 py-3">
+  return <details className="charge-scope-filters">
     <summary className="cursor-pointer text-caption font-medium">时间与归属筛选{active ? " · 已应用" : ""}</summary>
     <form className="mt-4 grid min-w-0 gap-4 sm:grid-cols-2 xl:grid-cols-3" onSubmit={event => {
       event.preventDefault();
@@ -392,7 +396,7 @@ export function ChargeCheck({ c }: { c: Charge }) {
   const reported = reportedCounters(c.usage);
   const recomputed = chargeFromLines(c.lines, c.cny_per_usd_e4, c.discount_bps);
   return (
-    <div className="charge-check grid min-w-0 gap-4 rounded-cell border border-border bg-well/50 p-4 text-ink-soft lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
+    <div className="charge-check text-ink-soft">
       <section className="min-w-0" aria-label={`计费数量 ${c.event_id}`}>
         <h4 className="mb-2 text-caption font-medium">计费数量</h4>
         {c.lines === null ? (
@@ -402,6 +406,7 @@ export function ChargeCheck({ c }: { c: Charge }) {
         ) : c.lines.length === 0 ? (
           <p className="text-caption text-muted-foreground">这次调用没有计费的数量。</p>
         ) : (
+          <div className="charge-quantities-scroll" role="region" aria-label="计费数量明细表格滚动区域" tabIndex={0}>
           <table className="charge-quantities-table w-full text-caption">
             <thead className="text-muted-foreground">
               <tr>
@@ -422,6 +427,7 @@ export function ChargeCheck({ c }: { c: Charge }) {
               ))}
             </tbody>
           </table>
+          </div>
         )}
         {c.lines !== null && c.lines.length > 0 && c.cny_per_usd_e4 !== null && (
           <p className="mt-3 text-caption text-text-2">

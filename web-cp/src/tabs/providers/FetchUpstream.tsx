@@ -130,7 +130,7 @@ export function FetchUpstream({
     <div className="panel ch-fetch mb-0" role="group" aria-label="获取上游模型">
       <CardHeader number={6} title="获取上游模型" />
       <div className="flex flex-wrap items-start gap-3">
-        <span aria-hidden="true" className="grid size-11 shrink-0 place-items-center rounded-cell border border-line bg-well text-ink-soft">
+        <span aria-hidden="true" className="grid size-11 shrink-0 place-items-center rounded-field border border-hairline bg-sunken text-fg-2">
           <CloudDownload className="size-4" />
         </span>
         <p className="hint min-w-0 flex-1 basis-56 text-caption">
@@ -176,7 +176,7 @@ export function FetchUpstream({
           <div className="mt-5 flex flex-wrap items-center gap-x-6 gap-y-3">
             <label className="relative block w-full sm:w-72">
               <span className="sr-only">搜索上游模型</span>
-              <Search aria-hidden className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted" />
+              <Search aria-hidden className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-fg-3" />
               <input className="pl-9" value={query} onChange={(e) => setQuery(e.target.value)} placeholder="按上游模型名称筛选" />
             </label>
             <label className="ch-tick gap-2 text-caption">
@@ -216,13 +216,13 @@ export function FetchUpstream({
                     <td>
                       <span className="mono font-mono text-caption">{id}</span>
                     </td>
-                    <td className={selectable(state) ? "text-caption" : "ch-fetch-muted text-caption text-muted"}>{stateText(state)}</td>
+                    <td className={selectable(state) ? "text-caption" : "ch-fetch-muted text-caption text-fg-3"}>{stateText(state)}</td>
                   </tr>
                 );
               })}
               {shown.length === 0 && (
                 <tr>
-                  <td colSpan={3} className="text-muted">
+                  <td colSpan={3} className="text-fg-3">
                     没有匹配的上游模型。
                   </td>
                 </tr>
@@ -235,7 +235,7 @@ export function FetchUpstream({
               一次最多映射 {MAX_BULK_MODELS} 个上游模型，已选 {picked.length} 个，请减少选择后再写入。
             </div>
           )}
-          <div className="ch-save ops-form-footer -mx-[var(--pad)] -mb-[var(--pad)] mt-6 flex flex-wrap items-center justify-end gap-x-4 gap-y-2 rounded-b-card border-t border-line bg-well px-[var(--pad)] py-3 [&_.hint]:text-ink-soft">
+          <div className="ch-save ops-form-footer -mx-[var(--pad)] -mb-[var(--pad)] mt-6 flex flex-wrap items-center justify-end gap-x-4 gap-y-2 rounded-b-card border-t border-hairline bg-sunken px-[var(--pad)] py-3 [&_.hint]:text-fg-2">
             <span className="hint mr-auto text-caption tabular-nums">已选 {picked.length} 个</span>
             <Button
               type="button"

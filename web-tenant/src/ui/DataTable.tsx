@@ -28,6 +28,7 @@ export function DataTable({
   return (
     <div className={cn("dt-wrap", scroll && "dt-scroll", className)} role="region" aria-label={label ? `${label}表格滚动区域` : "表格滚动区域"} tabIndex={0}>
       <table className={cn("dt", compact && "dt-compact", tableClassName)} aria-label={label}>
+        <caption className="vh">{label ?? "数据列表"}</caption>
         {children}
       </table>
     </div>

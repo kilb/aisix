@@ -202,7 +202,7 @@ export function GroupDetail({
           </Button>
         }
       />
-      <BentoGrid className="mb-3">
+      <BentoGrid className="finance-overview">
         <Card className={span.d7}>
           <CardHeader number={1} title="默认换算率 · 当前分组" />
           <Metric size={group.default_rate.current?.cny_per_usd == null ? "value" : "hero"}>{group.default_rate.current?.cny_per_usd ?? "未设置"}</Metric>

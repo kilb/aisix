@@ -65,7 +65,7 @@
 
 .cost-model-toggle:focus-visible,
 .cost-upcoming-baseline > summary:focus-visible {
-  outline: 2px solid var(--color-ink);
+  outline: 2px solid var(--ring);
   outline-offset: 3px;
   border-radius: var(--radius-bar);
 }
@@ -118,9 +118,10 @@
 
 .cost-detail-section {
   min-inline-size: 0;
-  padding: 1rem;
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-cell);
+  padding: 1rem 0;
+  border: 0;
+  border-top: 1px solid var(--color-border);
+  border-radius: 0;
 }
 
 .cost-detail-section h3,
@@ -210,9 +211,8 @@
 .cost-rate-revisions li {
   display: grid;
   gap: 0.25rem;
-  padding: 0.75rem;
-  border-radius: var(--radius-chip);
-  background: var(--color-well);
+  padding: 0.75rem 0;
+  border-top: 1px solid var(--color-border);
   font-size: var(--text-caption);
   font-variant-numeric: tabular-nums;
 }

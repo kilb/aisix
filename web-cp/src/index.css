@@ -6,7 +6,6 @@
 
 @import "tailwindcss";
 @import "tw-animate-css";
-@import "@fontsource/noto-sans-sc/600.css" layer(base);
 @import "./theme/tokens.css";
 @import "./theme/base.css" layer(base);
 @import "./ui/ui.css" layer(legacy);
@@ -35,6 +34,18 @@
   --text-*: initial;
   /* canonical palette；旧 background/card 等语义别名保持双端页面兼容。 */
   --color-canvas: var(--background);
+  --color-fg: var(--foreground);
+  --color-fg-2: var(--ink-soft);
+  --color-fg-3: var(--muted-foreground);
+  --color-fg-4: var(--fg-4);
+  --color-fg-inverse: var(--fg-inverse);
+  --color-hairline: var(--border);
+  --color-tint: var(--tint);
+  --color-tint-strong: var(--tint-strong);
+  --color-sunken: var(--well);
+  --color-sunken-strong: var(--stone);
+  --color-lilac: var(--lilac);
+  --color-lime: var(--lime);
   --color-surface: var(--card);
   --color-well: var(--well);
   --color-stone: var(--stone);
@@ -84,7 +95,7 @@
   --text-hero--line-height: 1.1;
   --text-hero--letter-spacing: -0.025em;
   --text-display: var(--type-display);
-  --text-display--line-height: 40px;
+  --text-display--line-height: 1.25;
   --text-display--letter-spacing: -0.025em;
   --text-figure: var(--type-figure);
   --text-figure--line-height: 1.2;
@@ -92,26 +103,38 @@
   --text-value: var(--type-value);
   --text-value--line-height: 1.25;
   --text-value--letter-spacing: -0.015em;
+  --text-heading: 20px;
+  --text-heading--line-height: 1.35;
+  --text-small: 13px;
+  --text-small--line-height: 1.5;
+  --text-metric: 30px;
+  --text-metric--line-height: 1.1;
+  --text-metric-lg: 44px;
+  --text-metric-lg--line-height: 1.05;
+  --text-metric-xl: 76px;
+  --text-metric-xl--line-height: .9;
   --text-title: var(--type-title);
   --text-title--line-height: var(--type-title-line-height);
   --text-title--letter-spacing: -0.025em;
   --text-lead: var(--type-lead);
   --text-lead--line-height: 1.6;
-  --text-stat: 17px;
+  --text-stat: 15px;
   --text-stat--line-height: 26px;
   --text-brand: 17px;
   --text-brand--line-height: 1.2;
   --text-brand--letter-spacing: -0.02em;
   --text-body: 14px;
   --text-body--line-height: 1.5;
-  --text-caption: 13px;
+  --text-caption: 12px;
   --text-caption--line-height: 1.45;
   --text-meta: 12px;
   --text-meta--line-height: 1.4;
   --text-meta--letter-spacing: 0;
-  --text-micro: 12px;
+  --text-micro: 11px;
   --text-micro--line-height: 1.35;
 
+  --radius-tile: var(--r-tile);
+  --radius-field: var(--r-field);
   --radius-card: var(--r-card);
   --radius-cell: 8px;
   --radius-chip: var(--r-chip);
@@ -123,11 +146,12 @@
   --radius-2xl: var(--r-card);
   --shadow-xs: none;
   --shadow-sm: none;
-  --shadow-card: none;
-  --shadow-float: none;
+  --shadow-card: var(--shadow-card);
+  --shadow-float: var(--shadow-float);
+  --shadow-pop: var(--shadow-pop);
   --shadow-btn: none;
-  --breakpoint-tablet: 45rem;
-  --breakpoint-desktop: 68.75rem;
+  --breakpoint-tablet: 48rem;
+  --breakpoint-desktop: 80rem;
 }
 
 @layer base {

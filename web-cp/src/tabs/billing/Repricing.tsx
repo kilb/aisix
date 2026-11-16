@@ -285,7 +285,7 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
   const unknown = mine?.kind === "unknown";
 
   const formCard = canEdit && (
-    <Card className={span.d5Wide}>
+    <div className="finance-dialog-body">
       <form
         ref={formRef}
         aria-label="新建重新计价"
@@ -295,7 +295,7 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
         }}
       >
 
-        <div className="grid gap-x-4 tablet:grid-cols-2 desktop:grid-cols-1">
+        <div className="grid gap-x-4 tablet:grid-cols-2">
           <Field label="开始" error={problems.from}>
             {(aria) => (
               <input
@@ -321,7 +321,7 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
             )}
           </Field>
         </div>
-        <div className="grid gap-x-4 tablet:grid-cols-3 desktop:grid-cols-1">
+        <div className="grid gap-x-4 tablet:grid-cols-3">
           <Field label="模型">
             <Select value={form.model_id} disabled={busy} onValueChange={(value) => set("model_id", value)}>
               <option value="">全部</option>
@@ -376,7 +376,7 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
           </Button>
         </CardFooter>
       </form>
-    </Card>
+    </div>
   );
 
   const result = shown && (
@@ -401,8 +401,8 @@ export function Repricing({ operator, canEdit, refreshShell }: TabProps) {
         valueLabel={`${formatCount(shown.changed)} / ${formatCount(shown.events)}`}
         className="mb-5"
       />
-      <div className={cn("grid items-start gap-4", shown.by_tenant.length > 0 && "2xl:grid-cols-[minmax(260px,340px)_minmax(0,1fr)]")}>
-        <div className="bl-box max-w-md 2xl:max-w-none">
+      <div className="finance-repricing-result">
+        <div className="bl-box finance-repricing-totals">
           <DataTable label="合计">
             <tbody>
               <tr>

@@ -1,4 +1,5 @@
 import "./operations.css";
+import "./Resources.css";
 import { resourceSearchText } from "../lib/operationalRecords";
 import { useRecordTable } from "../lib/recordTable";
 import { RecordTools, RecordPager } from "../components/RecordTools";
@@ -16,9 +17,8 @@ import { Button } from "../ui/Button";
 import { useRefusalFocus } from "../ui/Field";
 import { OperationalTable as DataTable, Loading } from "../components/OperationalTable";
 import { EmptyState } from "../ui/EmptyState";
-import { CardHeader, PageHeader, Split } from "../components/page";
+import { Card, CardHeader, PageHeader, Stat, StatGrid } from "../components/page";
 import { Eye, Pencil, Plus, RefreshCw } from "lucide-react";
-import { InventorySummary, countGroups } from "./providers/OperationsBento";
 import { Select } from "../ui/Select";
 
 /**
@@ -75,7 +75,6 @@ export function Resources({ canEdit, initialSection }: TabProps) {
   return (
     <div className="cp-operations cp-resources">
       <PageHeader
-        eyebrow="RESOURCES · 完整配置"
         title="全部资源"
         dataLead={<>当前查看「{info.label}」资源。保留完整 JSON、服务端校验与版本冲突恢复。</>}
         actions={
@@ -111,7 +110,7 @@ function KindPage({ info, canEdit }: { info: KindInfo; canEdit: boolean }) {
   const [conflict, setConflict] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [panel, focusRefusal] = useRefusalFocus<HTMLDivElement>();
+  const [panel, focusRefusal] = useRefusalFocus<HTMLElement>();
 
   const [managedFilter, setManagedFilter] = useState("");
   const [rolloutFilter, setRolloutFilter] = useState("");
@@ -223,9 +222,8 @@ function KindPage({ info, canEdit }: { info: KindInfo; canEdit: boolean }) {
   const editingId = editing?.mode === "edit" ? editing.id : null;
 
   const list = (
-    <div className="panel mb-0">
+    <Card className="resources-list" aria-label={`${info.label}资源列表`}>
       <CardHeader
-        number={3}
         description="按网关的资源定义直接编辑 JSON 文档。保存时由控制面按网关的规则校验，问题列在编辑框下方。"
         as="h2"
         title={
@@ -265,12 +263,12 @@ function KindPage({ info, canEdit }: { info: KindInfo; canEdit: boolean }) {
                 <th className="right">版本</th>
                 <th>管理方</th>
                 <th>下发状态</th>
-                <th />
+                <th><span className="sr-only">操作</span></th>
               </tr>
             </thead>
             <tbody>
               {table.rows.map((r) => (
-                <tr key={r.id} className={editingId === r.id ? "bg-well" : undefined}>
+                <tr key={r.id} className={editingId === r.id ? "bg-sunken" : undefined}>
                   <td><span className="ops-cell-main">{nameOf(r.doc) ?? <span className="hint font-normal">（未命名）</span>}</span>
                     <code
                       className="ops-cell-secondary"
@@ -296,13 +294,12 @@ function KindPage({ info, canEdit }: { info: KindInfo; canEdit: boolean }) {
           <RecordPager table={table} label="资源文档" />
         </>
       )}
-    </div>
+    </Card>
   );
 
   const editor = editing && (
-    <div ref={panel} className="panel mb-0">
+    <section ref={panel} className="panel resources-editor" data-tone="surface" aria-label={`${info.label}文档设置`}>
       <CardHeader
-        number={4}
         as="h2"
         title={
           <span className="inline-flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 break-all">
@@ -325,7 +322,7 @@ function KindPage({ info, canEdit }: { info: KindInfo; canEdit: boolean }) {
           {failure}
         </div>
       )}
-      <div className="-mx-[var(--pad)] -mb-[var(--pad)] mt-6 flex flex-wrap items-center gap-2 rounded-b-card border-t border-line bg-well px-[var(--pad)] py-3 [&_.hint]:text-ink-soft">
+      <div className="resources-editor-footer">
         {editing.mode === "edit" && editable && !confirmDelete && (
           <Button type="button" disabled={busy} onClick={() => setConfirmDelete(true)}>
             删除
@@ -360,34 +357,21 @@ function KindPage({ info, canEdit }: { info: KindInfo; canEdit: boolean }) {
           )}
         </span>
       </div>
-    </div>
+    </section>
   );
 
-  const rolloutLabels: Record<string, string> = {
-    pending: "待下发", propagating: "下发中", applied: "已生效", rejected: "被拒绝", no_gateways: "无在线网关",
-  };
   const derivedCount = items?.filter((r) => !info.writable || r.managed_by !== null).length ?? 0;
   return (
     <>
-      <InventorySummary
-        title={`${info.label} · 当前类型`}
-        total={items?.length ?? null}
-        totalLabel={`仅统计 ${info.kind}`}
-        breakdown={countGroups(items?.map((r) => rolloutLabels[r.rollout.state] ?? r.rollout.state) ?? [])}
-        breakdownLabel="当前类型的资源下发状态"
-        secondaryTitle="派生或只读的资源"
-        secondaryValue={items ? derivedCount : null}
-        secondaryFoot="派生文档在租户、密钥或公共模型等来源页维护；完整文档仍可在这里查看。"
-        error={error !== null}
-        secondaryError={error !== null}
-        onRetry={() => void reload()}
-      >
-        <dl className="ops-facts">
-          <div><dt>手工维护的资源</dt><dd>{items ? items.length - derivedCount : "—"}</dd></div>
-          <div><dt>当前类型操作</dt><dd>{writable ? "可编辑手工资源" : "只读"}</dd></div>
-        </dl>
-      </InventorySummary>
-      <Split asideWidth="minmax(460px, 44%)" main={list} aside={editing?.mode === "new" ? undefined : editor || undefined} />
+      {editing?.mode !== "edit" && (
+        <StatGrid className="resources-summary" aria-label={`${info.label}资源概况`}>
+          <Stat label="当前类型资源" value={items?.length ?? "—"} foot={info.kind} />
+          <Stat label="已生效" value={items ? items.filter((r) => r.rollout.state === "applied").length : "—"} foot="网关已确认应用的资源" />
+          <Stat label="派生或只读" value={items ? derivedCount : "—"} foot="在对应租户、密钥或公共模型页维护" />
+          <Stat label="手工维护" value={items ? items.length - derivedCount : "—"} foot={writable ? "可编辑手工资源" : "当前账号只读"} />
+        </StatGrid>
+      )}
+      {editing?.mode === "edit" ? editor : list}
       {editing?.mode === "new" && <FormDialog open onOpenChange={(next) => { if (!next) setEditing(null); }} busy={busy} title={`新建${info.label}`} description="文档经服务端校验后保存。验证失败会保留输入。">{editor}</FormDialog>}
     </>
   );

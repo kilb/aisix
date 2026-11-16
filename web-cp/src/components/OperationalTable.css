@@ -3,14 +3,15 @@
 .panel > .dt-wrap.ops-record-table { width: auto; }
 .ops-record-table > .dt { width: 100%; min-width: 0; table-layout: auto; }
 .ops-record-table > .dt :is(th, td) { min-width: 0; max-width: none; white-space: normal; overflow-wrap: anywhere; vertical-align: top; }
-.ops-record-table > .dt th { padding: 12px; font-size: 12px; line-height: 18px; color: var(--muted-foreground); font-weight: 500; }
-.ops-record-table > .dt > :is(tbody, tfoot) > tr > td { padding: 10px 12px; font-size: 13px; line-height: 21px; }
+.ops-record-table > .dt th { padding: 12px; font-size: var(--text-caption); line-height: 18px; color: var(--muted-foreground); font-weight: 500; }
+.ops-record-table > .dt > :is(tbody, tfoot) > tr > td { padding: 10px 12px; font-size: var(--text-small); line-height: 21px; }
 /* 标识和说明按内容分配余宽，短字段只取所需空间，避免固定比例挤窄长值。 */
 @container (min-width: 761px) {
   .ops-record-table > .dt td[data-label]:first-child { min-width: 12rem; }
   .ops-record-table > .dt td:is([data-label="接口地址"], [data-label="上游账号 / 路由目标"], [data-label="详情"]) { min-width: 15rem; }
   .ops-record-table > .dt td:is([data-label="模型"], [data-label="上游模型名称"], [data-label="邮箱"], [data-label="成员"]) { min-width: 10rem; }
   .ops-record-table > .dt td:is([data-label="状态"], [data-label="下发"], [data-label="下发状态"], [data-label="角色"], [data-label="分类"], [data-label="类型"], [data-label="启用"], [data-label="版本"], [data-label="已应用修订"], [data-label="计费方式"], [data-label="成员 / 密钥"]) { width: 1%; min-width: 6rem; }
+  .ops-record-table > .dt td[data-label="状态"] { min-width: 7rem; }
   .ops-record-table > .dt td:is([data-label="创建时间"], [data-label="最近心跳"], [data-label="时间 / 编号"]) { width: 9rem; min-width: 9rem; font-variant-numeric: tabular-nums; }
   .ops-record-table > .dt td[data-label="操作"] { width: 1%; min-width: 6rem; white-space: normal; }
   .ops-record-table > .dt td[data-label="操作"]:has(.ops-table-actions > :nth-child(3)) { min-width: 8.25rem; }
@@ -33,12 +34,12 @@
 .ops-record-table .ops-table-action:hover { background: var(--well); }
 .ops-record-table .ops-table-action svg { width: 16px; height: 16px; }
 .ops-record-table .ops-cell-main { display: block; font-weight: 500; color: var(--ink); }
-.ops-record-table .ops-cell-secondary { display: block; margin-top: 4px; color: var(--muted-foreground); font-size: 12px; line-height: 18px; }
+.ops-record-table .ops-cell-secondary { display: block; margin-top: 4px; color: var(--muted-foreground); font-size: var(--text-caption); line-height: 18px; }
 .ops-record-table .ops-cell-facts { display: grid; gap: 5px; margin: 0; }
 .ops-record-table .ops-cell-facts > div { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 12px; }
-.ops-record-table .ops-cell-facts dt { color: var(--muted-foreground); font-size: 12px; }
+.ops-record-table .ops-cell-facts dt { color: var(--muted-foreground); font-size: var(--text-caption); }
 .ops-record-table .ops-cell-facts dd { margin: 0; color: var(--ink); font-variant-numeric: tabular-nums; }
-.ops-record-table .ops-number-field { display: grid; grid-template-columns: minmax(0, 1fr) minmax(44px, 60px); align-items: center; gap: 8px; text-align: left; font-size: 12px; color: var(--muted-foreground); }
+.ops-record-table .ops-number-field { display: grid; grid-template-columns: minmax(0, 1fr) minmax(44px, 60px); align-items: center; gap: 8px; text-align: left; font-size: var(--text-caption); color: var(--muted-foreground); }
 .ops-record-table .ops-number-field + .ops-number-field { margin-top: 6px; }
 .ops-record-table .ops-number-field input { width: 100%; min-width: 0; max-width: 100%; }
 /* 窄工作区按字段阅读，完整内容仍随页面展开。 */
@@ -51,7 +52,7 @@
   .ops-record-table > .dt > tbody > tr > :first-child,
   .ops-record-table > .dt > :is(tbody, tfoot) > tr > .ops-table-detail,
   .ops-record-table > .dt > tbody > tr > td:last-child:has(.btn, .two-step) { grid-column: 1 / -1; }
-  .ops-record-table > .dt > tbody > tr > :is(td, th)[data-label]::before { content: attr(data-label); display: block; margin-bottom: 6px; color: var(--muted-foreground); font-size: 12px; line-height: 18px; font-weight: 400; }
+  .ops-record-table > .dt > tbody > tr > :is(td, th)[data-label]::before { content: attr(data-label); display: block; margin-bottom: 6px; color: var(--muted-foreground); font-size: var(--text-caption); line-height: 18px; font-weight: 400; }
   .ops-record-table .ops-table-actions { justify-content: flex-start; }
   .cp-operations .ops-record-table .dt :is(th, td).side-opt { display: block; }
   .ops-record-table td .cell-note { margin-left: 0; }

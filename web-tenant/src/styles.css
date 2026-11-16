@@ -14,7 +14,7 @@
   right: 6px;
   width: 7px;
   height: 7px;
-  border-radius: 50%;
+  border-radius: var(--r-round);
   background: var(--brand-dot);
 }
 .boot,
@@ -128,7 +128,7 @@
   display: block;
   width: 4px;
   height: 4px;
-  border-radius: 50%;
+  border-radius: var(--r-round);
   background: transparent;
 }
 .route-topnav [aria-selected="true"] .stop { background: var(--bento-accent); }
@@ -143,7 +143,7 @@
   place-items: center;
   width: 32px;
   height: 32px;
-  border-radius: 50%;
+  border-radius: var(--r-round);
   background: var(--well);
   color: var(--foreground);
   font-family: var(--font-mono);
@@ -420,9 +420,9 @@
   line-height: 1.45;
 }
 .levels .bind {
-  border-color: var(--foreground);
-  outline: 1px solid var(--foreground);
-  outline-offset: -1px;
+  border-color: var(--field-border);
+  outline: none;
+  background: var(--tint-strong);
 }
 .levels .bind .lv,
 .levels .bind .m {
@@ -434,7 +434,7 @@
   align-items: center;
   height: 20px;
   padding: 0 8px;
-  border-radius: 9999px;
+  border-radius: var(--r-round);
   background: var(--primary);
   color: var(--primary-foreground);
   font-size: var(--text-meta);
@@ -467,9 +467,9 @@
   background: var(--row-hover);
 }
 .picks-cards .pick:has(input:checked) {
-  border-color: var(--foreground);
-  outline: 1px solid var(--foreground);
-  outline-offset: -1px;
+  border-color: var(--field-border);
+  outline: none;
+  background: var(--tint-strong);
 }
 .picks-cards .pick input {
   margin-top: 2px;

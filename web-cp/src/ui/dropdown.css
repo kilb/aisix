@@ -2,7 +2,7 @@
   /* 紧凑表格沿用表单令牌，触发器与弹层各自约束宽度。 */
   .ui-select-field { display: inline-flex; width: 100%; min-width: 0; max-width: 100%; flex-direction: column; gap: 4px; vertical-align: middle; }
   .ui-select-field-compact { width: auto; max-width: min(240px, 100%); }
-  .ui-select-validation { color: var(--danger); font-size: 12px; line-height: 18px; white-space: normal; }
+  .ui-select-validation { color: var(--danger); font-size: var(--text-caption); line-height: 18px; white-space: normal; }
   .ui-select-trigger,
   .ui-menu-trigger {
     display: inline-flex;
@@ -13,18 +13,18 @@
     justify-content: space-between;
     gap: 8px;
     padding: 0 12px;
-    border: 1px solid var(--input);
+    border: 1px solid var(--field-border);
     border-radius: var(--r-input);
-    background: var(--card);
+    background: var(--well);
     color: var(--foreground);
     font: inherit;
-    font-size: 14px;
+    font-size: var(--text-body);
     line-height: 20px;
     text-align: left;
     cursor: pointer;
   }
   .ui-select-trigger { width: 100%; }
-  .ui-select-compact { width: auto; max-width: min(240px, 100%); min-height: var(--h-control-sm); padding-inline: 10px; font-size: 13px; }
+  .ui-select-compact { width: auto; max-width: min(240px, 100%); min-height: var(--h-control-sm); padding-inline: 10px; font-size: var(--text-small); }
   .ui-select-value { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .ui-select-chevron { display: inline-flex; flex: none; width: 16px; height: 16px; color: var(--muted-foreground); }
   .ui-select-chevron > svg { width: 16px; height: 16px; }
@@ -34,7 +34,7 @@
   .ui-menu-trigger:enabled:hover { background: var(--well); }
   .ui-select-trigger[data-state="open"] { border-color: var(--ring); background: var(--card); }
   .ui-menu-trigger[data-state="open"] { background: var(--well); color: var(--brand); }
-  :is(.ui-select-trigger, .ui-menu-trigger):focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; box-shadow: 0 0 0 4px var(--focus-halo); }
+  :is(.ui-select-trigger, .ui-menu-trigger):focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; box-shadow: var(--shadow-focus); }
   :is(.ui-select-trigger, .ui-menu-trigger)[aria-invalid="true"] { border-color: var(--danger); border-style: dashed; }
   :is(.ui-select-trigger, .ui-menu-trigger):disabled { opacity: .5; cursor: not-allowed; background: var(--muted); }
   .ui-dropdown {
@@ -43,18 +43,19 @@
     padding: 4px;
     overflow-x: hidden;
     border: 1px solid var(--border);
-    border-radius: var(--r-input);
+    border-radius: var(--r-field);
+    box-shadow: var(--shadow-pop);
     background: var(--popover);
     color: var(--popover-foreground);
     font-family: var(--font-sans);
-    font-size: 13px;
+    font-size: var(--text-small);
     line-height: 20px;
     text-align: left;
   }
   .ui-select-content { min-width: min(var(--radix-select-trigger-width), calc(100vw - 24px)); max-height: min(320px, var(--radix-select-content-available-height)); }
   .ui-dropdown-viewport { padding: 0; }
   .record-table-toolbar .ui-select-trigger { min-height: var(--h-control); }
-  .record-table-page-size .ui-select-trigger { width: auto; min-width: 64px; min-height: var(--h-control-sm); padding-inline: 8px; border-color: transparent; background: transparent; font-size: 12px; font-variant-numeric: tabular-nums; }
+  .record-table-page-size .ui-select-trigger { width: auto; min-width: 64px; min-height: var(--h-control-sm); padding-inline: 8px; border-color: transparent; background: transparent; font-size: var(--text-caption); font-variant-numeric: tabular-nums; }
   .record-table-page-size .ui-select-trigger:enabled:hover { background: var(--well); }
   .f.filter > .ui-select-field { width: auto; flex: 1 1 auto; }
   /* 普通筛选栏沿用常规高度；独立紧凑触发器与分页保持原尺寸。 */
@@ -63,7 +64,7 @@
   .ui-multiselect-content,
   .ui-menu-content { min-width: min(160px, calc(100vw - 24px)); max-height: min(320px, var(--radix-dropdown-menu-content-available-height)); overflow-y: auto; }
   .ui-multiselect-content { min-width: min(var(--radix-dropdown-menu-trigger-width), calc(100vw - 24px)); }
-  .ui-dropdown-item { position: relative; display: flex; min-height: var(--h-control-sm); align-items: center; gap: 8px; padding: 6px 10px; border-radius: 5px; outline: 0; overflow-wrap: anywhere; white-space: normal; user-select: none; cursor: pointer; }
+  .ui-dropdown-item { position: relative; display: flex; min-height: var(--h-control-sm); align-items: center; gap: 8px; padding: 6px 10px; border-radius: var(--r-field); outline: 0; overflow-wrap: anywhere; white-space: normal; user-select: none; cursor: pointer; }
   .ui-select-option { padding-right: 34px; }
   .ui-dropdown-item[data-highlighted] { background: var(--row-hover); color: var(--brand); }
   .ui-dropdown-item[data-state="checked"] { font-weight: 500; }
@@ -71,7 +72,7 @@
   .ui-dropdown-item[data-disabled] { color: var(--muted-foreground); opacity: .55; cursor: not-allowed; }
   .ui-dropdown-check { position: absolute; right: 10px; top: 0; bottom: 0; display: flex; align-items: center; }
   .ui-dropdown-check > svg { width: 16px; height: 16px; }
-  .ui-dropdown-label { padding: 6px 10px; color: var(--muted-foreground); font-size: 12px; }
+  .ui-dropdown-label { padding: 6px 10px; color: var(--muted-foreground); font-size: var(--text-caption); }
   .ui-select-scroll { display: flex; height: 24px; align-items: center; justify-content: center; background: var(--popover); }
   .ui-select-scroll > svg { width: 14px; height: 14px; }
   @media (max-width: 719px), (pointer: coarse) {

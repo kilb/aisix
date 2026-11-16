@@ -42,12 +42,12 @@ export interface ButtonProps extends ComponentProps<"button"> {
 
 /** shadcn/ui's button, in this app's four kinds and two sizes. */
 const buttonClass = cva(
-  "btn relative inline-flex shrink-0 cursor-pointer select-none items-center justify-center gap-2 whitespace-nowrap rounded-(--r-button) text-body font-medium leading-5 transition-colors duration-120 disabled:cursor-not-allowed disabled:opacity-50 aria-disabled:cursor-not-allowed aria-disabled:opacity-50 [&_svg]:size-4 [&_svg]:shrink-0",
+  "btn relative inline-flex shrink-0 cursor-pointer select-none items-center justify-center gap-2 whitespace-nowrap rounded-(--r-button) text-small font-semibold leading-5 transition-colors duration-120 disabled:cursor-not-allowed disabled:opacity-50 aria-disabled:cursor-not-allowed aria-disabled:opacity-50 [&_svg]:shrink-0",
   {
     variants: {
       kind: {
         primary: "border border-primary bg-primary text-primary-foreground enabled:hover:bg-primary/90",
-        secondary: "border border-line bg-card text-foreground enabled:hover:border-input enabled:hover:bg-foreground/5",
+        secondary: "border border-transparent bg-card text-foreground shadow-card enabled:hover:bg-well",
         danger: "border border-destructive bg-destructive text-destructive-foreground enabled:hover:bg-destructive/90",
         quiet: "border border-transparent text-text-2 enabled:hover:bg-foreground/6 enabled:hover:text-foreground",
       },
@@ -107,6 +107,8 @@ export function Button({
     <button
       {...rest}
       type={type}
+      data-kind={kind}
+      data-icon-only={iconOnly || undefined}
       className={classes}
       disabled={busy || (disabled && !reasoned)}
       aria-disabled={reasoned || undefined}

@@ -5,7 +5,7 @@ import { CopyButton } from "./CopyButton";
 /** 获取明文已被拒绝，调用页负责显示错误。 */
 class RevealRefused extends Error {}
 
-/** 正常只显示遮罩与复制图标；剪贴板失败时保留可手工选择的明文。 */
+/** 始终只显示遮罩与复制图标；明文仅在组件内存与剪贴板通道中流转。 */
 export function KeySecret({
   prefix,
   reveal,
@@ -51,8 +51,7 @@ export function KeySecret({
         />
         {clipboard && plaintext !== null && (
           <span className="hint cell-note" role="status">
-            无法写入剪贴板，请手动选中下方密钥复制
-            <input readOnly aria-label="手动复制密钥" value={plaintext} onFocus={(event) => event.currentTarget.select()} />
+            无法写入剪贴板，请允许剪贴板权限后重试。
           </span>
         )}
       </span>

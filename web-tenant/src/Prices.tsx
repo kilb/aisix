@@ -15,7 +15,7 @@ import { EmptyState } from "./ui/EmptyState";
 import { RecordTablePager, RecordTableToolbar } from "./ui/RecordTable";
 import { Button } from "./ui/Button";
 import { CopyButton } from "./ui/CopyButton";
-import { BentoGrid, Card, CardHeader, CardMessage, MetricSkeleton, PageHeader, span } from "./components/page";
+import { BentoGrid, Card, CardHeader, CardMessage, Metric, MetricSkeleton, PageHeader, span } from "./components/page";
 
 function failure(e: unknown): string {
   return e instanceof ApiError ? messageFor(e) : String(e);
@@ -60,25 +60,34 @@ export function Prices({ initialGroup }: { initialGroup: string | null }) {
   const header = <PageHeader title="模型与价格" dataLead="查看美元基准价，或选择分组比较实际人民币单价与倍率。" />;
   if (err !== null) return <>{header}<Card><CardHeader title="当前价格" /><div role="alert"><CardMessage>{err}</CardMessage></div></Card></>;
   if (quote === null) return <>{header}<BentoGrid>
-    <Card className={span.d8}><CardHeader title="当前组织优惠" /><MetricSkeleton className="h-24" /><p className="text-body text-muted">正在读取组织现价与报价时刻…</p></Card>
-    <Card className={span.d4}><CardHeader title="可计价模型" /><MetricSkeleton /></Card>
-    <Card className={span.d12}><CardHeader title="模型价格目录" /><Loading /></Card>
+    <Card tone="lilac" padding="sm" className={span.d4}><CardHeader title="当前组织优惠" /><MetricSkeleton /><p className="text-caption text-fg-3">正在读取当前报价…</p></Card>
+    <Card padding="sm" className={span.d4}><CardHeader title="可计价模型" /><MetricSkeleton /></Card>
+    <Card padding="sm" className={span.d4}><CardHeader title="报价时刻" /><MetricSkeleton /></Card>
+    <Card padding="table" className={span.d12}><CardHeader title="模型价格目录" className="px-3" /><Loading /></Card>
   </BentoGrid></>;
   if (quote.groups.length === 0) return <>{header}<Card><CardHeader title="当前价格" /><EmptyState text="运营尚未为本组织分配分组，暂时没有可查看的价格。" /></Card></>;
 
   return <>
     {header}
     <BentoGrid className="tenant-prices">
-      <Card className={`${span.d12} price-summary price-summary-compact`}>
-        <dl className="price-summary-facts">
-          <div><dt>当前组织优惠</dt><dd>{quote.discount_bps === null ? "未知" : discountPercent(quote.discount_bps)}</dd><span>分组人民币报价已计入优惠</span></div>
-          <div><dt>可计价模型</dt><dd>{catalog.length.toLocaleString("en-US")}</dd><span>{quote.groups.length.toLocaleString("en-US")} 个可用分组</span></div>
-          <div className="price-summary-time"><dt>报价时刻</dt><dd>{fmtBeijing(quote.as_of)}</dd><span>{quote.valid_until === null ? "当前报价未设置失效时刻" : `有效至 ${fmtBeijing(quote.valid_until)}`}</span></div>
-        </dl>
+      <Card tone="lilac" padding="sm" className={span.d4} aria-label="当前组织优惠">
+        <p className="text-small font-semibold text-fg-2">当前组织优惠</p>
+        <Metric>{quote.discount_bps === null ? "未知" : discountPercent(quote.discount_bps)}</Metric>
+        <p className="text-caption text-fg-3">分组人民币报价已计入优惠</p>
+      </Card>
+      <Card padding="sm" className={span.d4} aria-label="可计价模型">
+        <p className="text-small font-semibold text-fg-2">可计价模型</p>
+        <Metric>{catalog.length.toLocaleString("en-US")}</Metric>
+        <p className="text-caption text-fg-3">{quote.groups.length.toLocaleString("en-US")} 个可用分组</p>
+      </Card>
+      <Card padding="sm" className={`${span.d4} price-summary-time`} aria-label="报价时刻">
+        <p className="text-small font-semibold text-fg-2">报价时刻</p>
+        <p className="tabular text-title text-fg">{fmtBeijing(quote.as_of)}</p>
+        <p className="text-caption text-fg-3">{quote.valid_until === null ? "当前报价未设置失效时刻" : `有效至 ${fmtBeijing(quote.valid_until)}`}</p>
         <details className="price-quote-explainer"><summary>价格如何计算</summary><p>倍率 = 换算率 ×（1 − 组织优惠）。人民币单价按美元基准价乘以倍率计算。当前报价不改变历史账单；历史费用使用调用时的费率。</p></details>
       </Card>
-      <Card className={span.d12}>
-        <CardHeader title="模型价格目录" />
+      <Card padding="table" className={span.d12}>
+        <CardHeader title="模型价格目录" className="px-3" />
         <PriceCatalog quote={quote} groupId={selectedGroup} onGroupChange={(value) => setGroupFilter({ linkedGroup: initialGroup, value })} />
         <p className="price-estimate-note text-caption text-muted">已列出的单价按价卡确定；“未提供价格”的项目不按零计费。“含估算”表示调用的部分 token 用量由网关估算，与单价无关，具体调用会在用量页单独标注。</p>
       </Card>
@@ -100,6 +109,12 @@ function PriceScopes({ items, value, onChange, label }: {
   onChange: (value: string) => void;
   label: string;
 }) {
+  if (items.length >= 5) return <div className="price-scope-select">
+    <Select aria-label={label} value={value} onValueChange={onChange}>
+      <option value="">Base USD</option>
+      {items.map((item) => <option key={item.id} value={item.id}>{item.display_name}{item.multiplier === undefined ? "" : ` ${item.multiplier}×`}</option>)}
+    </Select>
+  </div>;
   return <div role="group" aria-label={label} className="price-scope-buttons">
     <button type="button" data-price-scope="" aria-pressed={value === ""} onClick={() => onChange("")}>Base USD</button>
     {items.map((item) => <button type="button" key={item.id} data-price-scope={item.id} aria-pressed={value === item.id} onClick={() => onChange(item.id)}>

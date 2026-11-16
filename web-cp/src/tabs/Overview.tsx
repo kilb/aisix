@@ -9,6 +9,7 @@ import { BentoGrid, Card, CardFooter, CardHeader, CardMessage, Metric, MetricSke
 import { RankBars } from "../components/charts";
 import { ApiMetricsPanel } from "../components/ApiMetricsPanel";
 import "./providers/OperationsBento.css";
+import "./Overview.css";
 import { Lamp } from "../ui/Lamp";
 import { TwoStep } from "../ui/TwoStep";
 import { Select } from "../ui/Select";
@@ -147,16 +148,16 @@ export function Overview({ operator, onGoto }: TabProps) {
   const waiting = s ? s.pending + s.propagating : null;
   const currentState = !s ? "正在读取下发状态" : blocked || s.projection_stalled ? "配置下发被阻止" : s.reconcile_blocked ? "环境清理已暂停" : s.rejected.length > 0 ? "有资源被网关拒绝" : s.unsafe.length > 0 ? "网关忽略了必需字段" : waiting ? "配置正在下发" : s.online_instances === 0 ? "尚无在线网关" : s.partially_compatible.length > 0 ? "配置部分兼容" : "当前配置已下发";
   return (
-    <>
+    <div className="overview-page">
       <PageHeader
         title="运行概况"
         dataLead={s ? <>当前有 {fmtInt(s.online_instances)} 个在线网关，{fmtInt(s.pending)} 个资源待下发、{fmtInt(s.propagating)} 个资源下发中。{error && "刷新失败，以下保留最近成功结果。"}</> : "查看环境、网关心跳、配置下发与最近 24 小时的计价健康。"}
       />
-      <BentoGrid aria-label="运行概况">
+      <BentoGrid className="overview-grid" aria-label="运行概况">
         <div className={span.d12}>
           <div className="metric-toolbar">
             <div className="min-w-0">
-              <p className="text-caption font-medium text-muted">API 请求统计</p>
+              <p className="text-caption font-medium text-fg-3">API 请求统计</p>
             </div>
             <div className="metric-toolbar-controls">
               <label className="f filter m-0">
@@ -177,8 +178,8 @@ export function Overview({ operator, onGoto }: TabProps) {
           ) : (
             <>
               <div className="ops-metric-line">
-                <Metric size="hero">{fmtInt(waiting ?? 0)}</Metric>
-                <div className="text-caption text-muted"><p>尚未完成下发的资源</p><p className="mt-2 text-ink">{currentState}</p></div>
+                <Metric size="value">{fmtInt(waiting ?? 0)}</Metric>
+                <div className="text-caption text-fg-3"><p>尚未完成下发的资源</p><p className="mt-2 text-fg">{currentState}</p></div>
               </div>
               <CardFooter>
                 <RankBars
@@ -188,22 +189,22 @@ export function Overview({ operator, onGoto }: TabProps) {
                   ]}
                   accessibleLabel={`当前 ${fmtInt(s.pending)} 个资源待下发，${fmtInt(s.propagating)} 个资源下发中`}
                 />
-                <p className="mt-3 text-caption text-muted">待下发：尚未写入 kine。下发中：在线网关尚未全部应用。</p>
+                <p className="mt-3 text-caption text-fg-3">待下发：尚未写入 kine。下发中：在线网关尚未全部应用。</p>
               </CardFooter>
             </>
           )}
           {error && s && <p className="note crit" role="alert">读取失败：{error}</p>}
-          <div className="mt-5 grid gap-3 border-t border-ink/7 pt-5 tablet:grid-cols-2">
-            <div><p className="text-micro text-muted">环境</p><p className="mt-1 break-all font-mono text-caption">{env?.env_id ?? "—"}</p></div>
-            <div><p className="text-micro text-muted">控制面版本</p><p className="mt-1 break-all font-mono text-caption">{env?.cp_version ?? "—"}</p></div>
+          <div className="mt-4 grid gap-4 border-t border-hairline pt-4 tablet:grid-cols-2">
+            <div><p className="text-micro text-fg-3">环境</p><p className="mt-1 break-all font-mono text-caption">{env?.env_id ?? "—"}</p></div>
+            <div><p className="text-micro text-fg-3">控制面版本</p><p className="mt-1 break-all font-mono text-caption">{env?.cp_version ?? "—"}</p></div>
           </div>
           {envError && <p className="note crit" role="alert">读取环境信息失败：{envError}</p>}
         </Card>
 
         <Card className={span.d4} tone="inverse">
-          <CardHeader number={4} title="在线网关" actions={<span className="text-micro text-on-inverse-muted">当前心跳</span>} />
-          {s ? <Metric size="display">{fmtInt(s.online_instances)}</Metric> : error ? <CardMessage onRetry={() => void readSummary()}>心跳数据暂不可用。</CardMessage> : <MetricSkeleton />}
-          <p className="mt-4 text-caption text-on-inverse-muted">近期发过心跳的网关实例。离线详情与凭据在网关页查看。</p>
+          <CardHeader number={4} title="在线网关" actions={<span className="text-micro text-fg-3">当前心跳</span>} />
+          {s ? <Metric size="value">{fmtInt(s.online_instances)}</Metric> : error ? <CardMessage onRetry={() => void readSummary()}>心跳数据暂不可用。</CardMessage> : <MetricSkeleton />}
+          <p className="mt-4 text-caption text-fg-3">近期发过心跳的网关实例。离线详情与凭据在网关页查看。</p>
           <CardFooter>
             <dl className="ops-facts">
               <div><dt>已返回的拒绝资源</dt><dd>{s ? fmtInt(s.rejected.length) : "—"}</dd></div>
@@ -227,17 +228,17 @@ export function Overview({ operator, onGoto }: TabProps) {
         <Card className={span.d3}>
           <CardHeader number={6} title="不可用价格版本" />
           {pricingView ? <Metric size="figure">{fmtInt(pricingView.invalid.length)}</Metric> : pricingError ? <CardMessage>暂不可用。</CardMessage> : <MetricSkeleton />}
-          <p className="mt-4 text-caption text-muted">计价引擎会跳过这些版本。具体原因在计价状态页查看。</p>
+          <p className="mt-4 text-caption text-fg-3">计价引擎会跳过这些版本。具体原因在计价状态页查看。</p>
           {pricingView && pricingView.invalid.length > 0 && <p className="note warn" role="status">有价格版本不可用，请查看计价状态。</p>}
         </Card>
 
         <Card className={span.d4}>
           <CardHeader number={7} title="已更正计价 · 最近 24 小时" />
           {pricing ? pricing.corrected_last_24h ? <Metric size="figure">{fmtInt(pricing.corrected_last_24h.total)}</Metric> : <CardMessage>控制面未提供已更正计数。</CardMessage> : pricingError ? <CardMessage>暂不可用。</CardMessage> : <MetricSkeleton />}
-          <p className="mt-4 text-caption text-muted">最近 24 小时已经通过重新计价更正的调用，不计入仍未计价的数量。</p>
+          <p className="mt-4 text-caption text-fg-3">最近 24 小时已经通过重新计价更正的调用，不计入仍未计价的数量。</p>
         </Card>
 
-        <Card className={span.d7}>
+        <Card className={span.d12}>
           <CardHeader number={8} title="被拒绝的资源" description="网关加载时拒绝了这些资源，它们没有生效。原因由网关给出。" />
           {s === null ? error ? <CardMessage onRetry={() => void readSummary()}>读取失败，请重试。</CardMessage> : <MetricSkeleton /> : s.rejected.length === 0 ? (
             <CardMessage><Lamp state="applied">没有被拒绝的资源。</Lamp></CardMessage>
@@ -257,7 +258,7 @@ export function Overview({ operator, onGoto }: TabProps) {
           {s && s.rejections_truncated.length > 0 && <p className="note warn">以下网关的拒绝明细超过返回上限：{s.rejections_truncated.join("、")}。当前列表未包含全部拒绝记录。</p>}
         </Card>
 
-        <Card className={span.d5Wide}>
+        <Card className={span.d12}>
           <CardHeader number={9} title="部分兼容" description="网关加载了这些资源，但忽略了其中的部分字段。" />
           {s === null ? error ? <CardMessage onRetry={() => void readSummary()}>读取失败，请重试。</CardMessage> : <MetricSkeleton /> : s.partially_compatible.length === 0 ? (
             <CardMessage><Lamp state="applied">所有网关都完整加载了配置。</Lamp></CardMessage>
@@ -342,6 +343,6 @@ export function Overview({ operator, onGoto }: TabProps) {
           </Card>
         )}
       </BentoGrid>
-    </>
+    </div>
   );
 }

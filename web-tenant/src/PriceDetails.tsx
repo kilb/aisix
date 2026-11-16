@@ -55,11 +55,12 @@ function TierPrices({ name, tier, currency }: { name: string; tier: TierQuote<Di
   const tierName = name === "default" ? "标准" : name;
   return <section className="price-tier" aria-labelledby={heading}>
     <header className="price-tier-header">
-      <h4 id={heading} className="text-stat font-medium">{tierName}</h4>
-      <p className="text-caption text-muted">{currency === "USD" ? "美元基准单价" : "组织实际单价（已含优惠）"}</p>
+      <h4 id={heading} className="text-title text-fg">{tierName}</h4>
+      <p className="text-caption text-fg-3">{currency === "USD" ? "美元基准单价" : "组织实际单价（已含优惠）"}</p>
     </header>
     <div className="price-matrix-scroll" role="region" aria-label={`${tierName}档完整模型单价`}>
       <table className="price-matrix" role="table" aria-label="完整模型单价">
+        <caption className="vh">{tierName}档完整价格，金额按各计费项目的单位显示。</caption>
         <colgroup>
           <col className="price-item-column" />
           <col className="price-unit-column" />
@@ -92,7 +93,7 @@ function TierPrices({ name, tier, currency }: { name: string; tier: TierQuote<Di
 
 export function PriceDetails({ tiers, currency = "CNY" }: { tiers: Record<string, TierQuote<DisplayPriceRate>>; currency?: "CNY" | "USD" }) {
   return <div className="price-details">
-    <p className="text-caption text-muted">长上下文按包含缓存、音频和图像的整个输入 token 数选择价格列，整次请求使用本段价格。回退价格仅说明计费规则，不代表模型支持该模态。窄屏按计费项目逐项显示各上下文段的价格。</p>
+    <p className="text-caption text-fg-3">长上下文按包含缓存、音频和图像的整个输入 token 数选择价格列，整次请求使用本段价格。回退价格仅说明计费规则，不代表模型支持该模态。窄屏按计费项目逐项显示各上下文段的价格。</p>
     {Object.entries(tiers).sort(([a], [b]) => a === "default" ? -1 : b === "default" ? 1 : a.localeCompare(b))
       .map(([name, tier]) => <TierPrices key={name} name={name} tier={tier} currency={currency} />)}
   </div>;

@@ -1,17 +1,28 @@
-/* 费用与状态各自保留可读宽度；长名称和完整金额可换行。 */
-@media (min-width: 1051px) {
-  .tenant-keys .keys-list .dt :is(th, td):nth-child(1) { width: 12%; }
-  .tenant-keys .keys-list .dt :is(th, td):nth-child(2) { width: 15%; }
-  .tenant-keys .keys-list .dt :is(th, td):nth-child(3) { width: 8%; }
-  .tenant-keys .keys-list .dt :is(th, td):nth-child(4) { width: 11%; }
-  .tenant-keys .keys-list .dt :is(th, td):nth-child(5) { width: 9%; }
-  .tenant-keys .keys-list .dt :is(th, td):nth-child(6) { width: 8%; }
-  .tenant-keys .keys-list .dt :is(th, td):nth-child(7) { width: 14%; }
-  .tenant-keys .keys-list .dt :is(th, td):nth-child(8) { width: 9%; }
-  .tenant-keys .keys-list .dt :is(th, td):last-child { width: 14%; }
-}
+/* 名称占用剩余宽度；金额与操作保留稳定列宽，横向滚动仅留在表格中。 */
+.tenant-keys .keys-list .dt { min-width: 1080px; table-layout: fixed; }
+.tenant-keys .keys-list .dt :is(th, td):nth-child(2) { width: 5rem; }
+.tenant-keys .keys-list .dt :is(th, td):nth-child(3) { width: 8rem; }
+.tenant-keys .keys-list .dt :is(th, td):nth-child(4) { width: 7rem; }
+.tenant-keys .keys-list .dt :is(th, td):nth-child(5) { width: 8rem; }
+.tenant-keys .keys-list .dt :is(th, td):nth-child(6) { width: 9rem; }
+.tenant-keys .keys-list .dt :is(th, td):nth-child(7) { width: 8rem; }
+.tenant-keys .keys-list .dt :is(th, td):last-child { width: 9rem; }
+.keys-list .key-name { display: block; min-width: 0; overflow-wrap: anywhere; }
+.keys-list .key-prefix { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; color: var(--muted-foreground); }
+.keys-list .key-prefix > code { font-size: var(--text-caption); }
 .keys-list .dt td[data-label="已用费用"] { overflow-wrap: anywhere; white-space: normal; }
-.keys-list .key-detail-link { display: inline-flex; min-height: 44px; align-items: center; color: var(--foreground); text-decoration: underline; text-underline-offset: 3px; }
-.keys-list .key-detail-link:hover { color: var(--primary); }
+.keys-list .key-detail-link { display: inline-flex; min-height: 36px; align-items: center; color: var(--foreground); font-weight: 700; text-underline-offset: 3px; }
+.keys-list .key-detail-link:hover { text-decoration: underline; }
 .keys-list .key-detail-link:focus-visible { outline: 2px solid var(--ring); outline-offset: 3px; }
-.keys-list .dt td[data-label="操作"] .acts { flex-wrap: wrap; justify-content: flex-end; }
+.keys-list .dt td[data-label="操作"] > .acts { flex-wrap: wrap; justify-content: flex-end; }
+.tenant-members-list .dt { min-width: 900px; table-layout: fixed; }
+.tenant-members-list .dt :is(th, td):nth-child(2) { width: 6rem; }
+.tenant-members-list .dt :is(th, td):nth-child(3) { width: 9rem; }
+.tenant-members-list .dt :is(th, td):nth-child(4) { width: 10rem; }
+.tenant-members-list .dt :is(th, td):nth-child(5) { width: 11rem; }
+.tenant-members-list .dt :is(th, td):last-child { width: 6rem; }
+.tenant-invites-list .dt { min-width: 760px; table-layout: fixed; }
+.tenant-invites-list .dt :is(th, td):nth-child(2) { width: 6rem; }
+.tenant-invites-list .dt :is(th, td):nth-child(3) { width: 8rem; }
+.tenant-invites-list .dt :is(th, td):nth-child(4) { width: 11rem; }
+.tenant-invites-list .dt :is(th, td):last-child { width: 5rem; }

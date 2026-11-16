@@ -1,4 +1,5 @@
 import "./operations.css";
+import "./Cache.css";
 import { useRecordTable } from "../lib/recordTable";
 import { RecordTools, RecordPager } from "../components/RecordTools";
 import { useEffect, useId, useState } from "react";
@@ -18,9 +19,8 @@ import { OperationalTable as DataTable, Loading } from "../components/Operationa
 import { EmptyState } from "../ui/EmptyState";
 import { Lamp } from "../ui/Lamp";
 import { TwoStep } from "../ui/TwoStep";
-import { CardHeader, PageHeader, Split } from "../components/page";
+import { Card, CardHeader, PageHeader, Stat, StatGrid } from "../components/page";
 import { Plus, RefreshCw } from "lucide-react";
-import { InventorySummary, countGroups } from "./providers/OperationsBento";
 import { Select } from "../ui/Select";
 
 /** A cache policy document; fields the form does not show are kept as stored. */
@@ -103,7 +103,7 @@ export function Cache({ canEdit, onGoto }: TabProps) {
   const [deleteFailure, setDeleteFailure] = useState<{ id: string; error: unknown } | null>(null);
   const scopeProblemId = useId();
   const ttlProblemId = useId();
-  const [panel, focusRefusal] = useRefusalFocus<HTMLDivElement>();
+  const [panel, focusRefusal] = useRefusalFocus<HTMLElement>();
 
   useEffect(() => {
     let live = true;
@@ -253,9 +253,8 @@ export function Cache({ canEdit, onGoto }: TabProps) {
   const ttlMissing = form !== null && !readOnly && form.ttl.trim() === "";
 
   const list = (
-    <div className="panel mb-0">
+    <Card className="cache-list" aria-label="全部缓存策略">
       <CardHeader
-        number={3}
         description="命中缓存的请求直接由网关应答，不再转发给上游。平台部署中缓存条目只在同一租户的 API 密钥之间共享（team 范围）。"
         as="h2"
         title={
@@ -284,12 +283,12 @@ export function Cache({ canEdit, onGoto }: TabProps) {
                 <th className="right">缓存时长（秒）</th>
                 <th>启用</th>
                 <th>下发状态</th>
-                <th />
+                <th><span className="sr-only">操作</span></th>
               </tr>
             </thead>
             <tbody>
               {table.rows.map((p) => (
-                <tr key={p.id} className={form?.id === p.id ? "bg-well" : undefined}>
+                <tr key={p.id} className={form?.id === p.id ? "bg-sunken" : undefined}>
                   <td className="font-medium">{p.doc.name}</td>
                   <td>
                     <code className="tag font-mono">{p.doc.scope ?? "—"}</code>
@@ -333,13 +332,12 @@ export function Cache({ canEdit, onGoto }: TabProps) {
           <RecordPager table={table} label="缓存策略" />
         </>
       )}
-    </div>
+    </Card>
   );
 
   const editor = form && (
-    <div ref={panel} className="panel mb-0">
+    <section ref={panel} className="panel cache-editor" data-tone="surface" aria-label="缓存策略设置">
       <CardHeader
-        number={4}
         as="h2"
         title={
           <span className="inline-flex flex-wrap items-center gap-x-3 gap-y-1">
@@ -358,95 +356,98 @@ export function Cache({ canEdit, onGoto }: TabProps) {
           )}
         </div>
       )}
-      <div className="grid gap-x-4 tablet:grid-cols-2 desktop:grid-cols-1">
-        <label className="f tablet:col-span-2 desktop:col-span-1">
-          <span>名称</span>
-          <input value={form.name} disabled={readOnly} onChange={(e) => set({ name: e.target.value })} />
-        </label>
-        <div className="min-w-0">
+      <section className="cache-settings" aria-labelledby="cache-settings-title">
+        <h3 id="cache-settings-title" className="text-title text-fg">策略设置</h3>
+        <div className="cache-fields">
           <label className="f">
-            <span>范围</span>
-            {form.envScoped ? (
-              <input value={ENV_SCOPE} disabled />
-            ) : (
-              <Select
-                value={form.scope}
+            <span>名称</span>
+            <input value={form.name} disabled={readOnly} onChange={(e) => set({ name: e.target.value })} />
+          </label>
+          <div className="min-w-0">
+            <label className="f">
+              <span>范围</span>
+              {form.envScoped ? (
+                <input value={ENV_SCOPE} disabled />
+              ) : (
+                <Select
+                  value={form.scope}
+                  disabled={readOnly}
+                  aria-invalid={scopeProblem ? true : undefined}
+                  aria-describedby={scopeProblem ? scopeProblemId : undefined}
+                  onValueChange={(value) => set({ scope: value })}
+                >
+                  {(options?.scopes ?? []).map((s) => (
+                    <option key={s} value={s}>
+                      {s}
+                    </option>
+                  ))}
+                </Select>
+              )}
+            </label>
+            {scopeProblem && (
+              <p id={scopeProblemId} className="field-problem">
+                {scopeProblem}
+              </p>
+            )}
+            {options?.descriptions[form.scope] && (
+              <p className="hint -mt-2 mb-4 text-caption">{options.descriptions[form.scope]}</p>
+            )}
+          </div>
+          <div className="min-w-0">
+            <label className="f">
+              <span>缓存时长（秒）</span>
+              <input
+                type="number"
+                min={1}
+                step={1}
+                required
+                value={form.ttl}
                 disabled={readOnly}
-                aria-invalid={scopeProblem ? true : undefined}
-                aria-describedby={scopeProblem ? scopeProblemId : undefined}
-                onValueChange={(value) => set({ scope: value })}
-              >
-                {(options?.scopes ?? []).map((s) => (
-                  <option key={s} value={s}>
-                    {s}
-                  </option>
-                ))}
-              </Select>
+                aria-invalid={ttlMissing || ttlProblem ? true : undefined}
+                aria-describedby={ttlMissing || ttlProblem ? ttlProblemId : undefined}
+                onChange={(e) => set({ ttl: e.target.value })}
+              />
+            </label>
+            {(ttlMissing || ttlProblem) && (
+              <p id={ttlProblemId} className="field-problem">
+                {ttlMissing ? "必填" : ttlProblem}
+              </p>
             )}
-          </label>
-          {scopeProblem && (
-            <p id={scopeProblemId} className="field-problem">
-              {scopeProblem}
-            </p>
-          )}
-          {options?.descriptions[form.scope] && (
-            <p className="hint -mt-2 mb-4 text-caption">{options.descriptions[form.scope]}</p>
-          )}
-        </div>
-        <div className="min-w-0">
+          </div>
+          <div className="min-w-0">
+            <label className="f">
+              <span>作用于</span>
+              {form.otherTarget !== null ? (
+                <input value={form.otherTarget} disabled />
+              ) : (
+                <Select value={form.target} disabled={readOnly} onValueChange={(value) => set({ target: value })}>
+                  <option value="">全部请求</option>
+                  {form.target && !models.items?.some((m) => m.id === form.target) && (
+                    <option value={form.target}>{form.target}</option>
+                  )}
+                  {(models.items ?? []).map((m) => (
+                    <option key={m.id} value={m.id}>
+                      {m.doc.display_name ?? m.id}
+                    </option>
+                  ))}
+                </Select>
+              )}
+            </label>
+            {form.otherTarget !== null && (
+              <p className="hint -mt-2 mb-4 text-caption">这种写法的作用范围只能在「全部资源」页修改，保存时原样保留。</p>
+            )}
+          </div>
           <label className="f">
-            <span>缓存时长（秒）</span>
             <input
-              type="number"
-              min={1}
-              step={1}
-              required
-              value={form.ttl}
+              type="checkbox"
+              checked={form.enabled}
               disabled={readOnly}
-              aria-invalid={ttlMissing || ttlProblem ? true : undefined}
-              aria-describedby={ttlMissing || ttlProblem ? ttlProblemId : undefined}
-              onChange={(e) => set({ ttl: e.target.value })}
+              onChange={(e) => set({ enabled: e.target.checked })}
             />
+            <span>启用</span>
           </label>
-          {(ttlMissing || ttlProblem) && (
-            <p id={ttlProblemId} className="field-problem">
-              {ttlMissing ? "必填" : ttlProblem}
-            </p>
-          )}
         </div>
-        <div className="min-w-0 tablet:col-span-2 desktop:col-span-1">
-          <label className="f">
-            <span>作用于</span>
-            {form.otherTarget !== null ? (
-              <input value={form.otherTarget} disabled />
-            ) : (
-              <Select value={form.target} disabled={readOnly} onValueChange={(value) => set({ target: value })}>
-                <option value="">全部请求</option>
-                {form.target && !models.items?.some((m) => m.id === form.target) && (
-                  <option value={form.target}>{form.target}</option>
-                )}
-                {(models.items ?? []).map((m) => (
-                  <option key={m.id} value={m.id}>
-                    {m.doc.display_name ?? m.id}
-                  </option>
-                ))}
-              </Select>
-            )}
-          </label>
-          {form.otherTarget !== null && (
-            <p className="hint -mt-2 mb-4 text-caption">这种写法的作用范围只能在「全部资源」页修改，保存时原样保留。</p>
-          )}
-        </div>
-        <label className="f tablet:col-span-2 desktop:col-span-1">
-          <input
-            type="checkbox"
-            checked={form.enabled}
-            disabled={readOnly}
-            onChange={(e) => set({ enabled: e.target.checked })}
-          />
-          <span>启用</span>
-        </label>
-      </div>
+      </section>
       {conflict && <ConflictNote onReload={() => void reloadForm()} />}
       {failure && (
         <div className="note crit" role="alert">
@@ -462,7 +463,7 @@ export function Cache({ canEdit, onGoto }: TabProps) {
           )}
         </div>
       )}
-      <div className="-mx-[var(--pad)] -mb-[var(--pad)] mt-2 flex flex-wrap justify-end gap-2 rounded-b-card border-t border-line bg-well px-[var(--pad)] py-3 [&_.hint]:text-ink-soft">
+      <div className="cache-editor-footer">
         <Button type="button" onClick={() => setForm(null)}>
           {readOnly ? "关闭" : "取消"}
         </Button>
@@ -479,15 +480,14 @@ export function Cache({ canEdit, onGoto }: TabProps) {
           </Button>
         )}
       </div>
-    </div>
+    </section>
   );
 
   return (
     <div className="cp-operations cp-cache">
       <PageHeader
-        eyebrow="CACHE · 应答缓存"
-        title="缓存策略"
-        dataLead={policies.items ? <>已配置 {policies.items.length} 条缓存策略，其中 {policies.items.filter((p) => p.doc.enabled !== false).length} 条启用。命中后由网关直接应答。</> : "按租户范围与模型配置应答缓存。"}
+        title={form?.id != null ? "编辑缓存策略" : "缓存策略"}
+        dataLead={form?.id != null ? "按作用范围、缓存时长与模型调整策略，保存后查看网关下发状态。" : policies.items ? <>已配置 {policies.items.length} 条缓存策略，其中 {policies.items.filter((p) => p.doc.enabled !== false).length} 条启用。命中后由网关直接应答。</> : "按租户范围与模型配置应答缓存。"}
         actions={
           <>
             <Button
@@ -500,7 +500,8 @@ export function Cache({ canEdit, onGoto }: TabProps) {
               <RefreshCw aria-hidden />
               刷新
             </Button>
-            {canEdit && (
+            {form?.id != null && <Button type="button" onClick={() => setForm(null)}>返回策略列表</Button>}
+            {canEdit && form?.id == null && (
               <Button kind="primary" type="button" disabled={!options} onClick={startNew}>
                 <Plus aria-hidden />
                 新建缓存策略
@@ -509,30 +510,20 @@ export function Cache({ canEdit, onGoto }: TabProps) {
           </>
         }
       />
-      <InventorySummary
-        title="缓存策略 · 当前配置"
-        total={policies.items?.length ?? null}
-        totalLabel="已保存策略"
-        breakdown={countGroups(policies.items?.map((p) => p.doc.scope || "未声明范围") ?? [])}
-        breakdownLabel="按已保存的缓存范围统计"
-        secondaryTitle="已启用的缓存策略"
-        secondaryValue={policies.items ? policies.items.filter((p) => p.doc.enabled !== false).length : null}
-        secondaryFoot="启用状态来自策略配置；各网关是否已应用请查看下方下发状态。"
-        error={policies.error !== null}
-        secondaryError={policies.error !== null}
-        onRetry={() => void policies.reload()}
-      >
-        <dl className="ops-facts">
-          <div><dt>已停用</dt><dd>{policies.items ? policies.items.filter((p) => p.doc.enabled === false).length : "—"}</dd></div>
-          <div><dt>env 范围 · 此表单只读</dt><dd>{policies.items ? policies.items.filter((p) => p.doc.scope === ENV_SCOPE).length : "—"}</dd></div>
-        </dl>
-      </InventorySummary>
+      {form?.id == null && (
+        <StatGrid className="cache-summary" aria-label="缓存策略概况">
+          <Stat label="已保存策略" value={policies.items?.length ?? "—"} foot="命中后由网关直接应答" />
+          <Stat label="已启用" value={policies.items ? policies.items.filter((p) => p.doc.enabled !== false).length : "—"} foot="各网关是否已应用请查看下发状态" />
+          <Stat label="已停用" value={policies.items ? policies.items.filter((p) => p.doc.enabled === false).length : "—"} foot="停用策略不参与缓存应答" />
+          <Stat label="env 范围" value={policies.items ? policies.items.filter((p) => p.doc.scope === ENV_SCOPE).length : "—"} foot="此表单只读；平台部署使用 team 范围" />
+        </StatGrid>
+      )}
       {optionsError && (
         <div className="note crit" role="alert">
           {optionsError}
         </div>
       )}
-      <Split asideWidth="minmax(340px, 30%)" main={list} aside={form?.id === null ? undefined : editor || undefined} />
+      {form?.id != null ? editor : list}
       {form?.id === null && <FormDialog open onOpenChange={(next) => { if (!next) setForm(null); }} busy={busy} title="新建缓存策略" description="按作用范围与模型设置缓存；校验失败保留输入。">{editor}</FormDialog>}
     </div>
   );

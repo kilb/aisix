@@ -8,14 +8,12 @@ import { fmtMicroCny } from "../../lib/money";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
 import { EmptyState } from "../../ui/EmptyState";
-import { BentoGrid, Card, CardFooter, CardHeader, CardMessage, Metric, MetricSkeleton, PageHeader, span } from "../../components/page";
-import { RankBars } from "../../components/charts";
+import { BentoGrid, Card, CardHeader, CardMessage, Metric, MetricSkeleton, PageHeader } from "../../components/page";
 import { exactInteger, formatCount } from "../../lib/chartFormat";
-import { SIDE_OPEN } from "../Tenants";
 import { AccountPanel, AccountState, MODE_LABEL } from "./AccountPanel";
 import { Select } from "../../ui/Select";
 
-// 桌面/平板：6 + 6；账户列表与详情：12。
+// 概况使用四项紧凑指标，账户列表与详情各占整行。
 /** 账户: every tenant's balance and credit limit, and one tenant's billing in a side panel. */
 export function Accounts({ canEdit, operator, onGoto }: TabProps) {
   const [items, setItems] = useState<BillingAccount[] | null>(null);
@@ -71,48 +69,39 @@ export function Accounts({ canEdit, operator, onGoto }: TabProps) {
           <Button type="button" icon="refresh" className="finance-icon-button" aria-label="刷新" title="刷新账户" onClick={() => void load()} />
         }
       />
-      <BentoGrid className="mb-3" aria-label="账户概况">
-        <Card className={span.d6}>
-          <CardHeader number={1} title={`客户租户 · ${snapshotLabel}`} description="统计全部客户租户，不含平台内部租户。" />
+      <BentoGrid className="finance-stats" aria-label="账户概况">
+        <Card className="finance-stat">
+          <CardHeader title="客户租户" description={snapshotLabel} />
           {customers === null ? (error ? <CardMessage onRetry={() => void load()}>账户快照读取失败</CardMessage> : <MetricSkeleton />) : (
             <>
-              <Metric size="hero">{fmtInt(customers.length)}</Metric>
-              <CardFooter>
-                <RankBars
-                  accessibleLabel={`全部 ${fmtInt(customers.length)} 个客户租户中，${fmtInt(stopped ?? 0)} 个额度已用尽`}
-                  items={[
-                    { label: "额度未用尽", value: customers.length - (stopped ?? 0), displayValue: fmtInt(customers.length - (stopped ?? 0)) },
-                    { label: "额度已用尽", value: stopped ?? 0, displayValue: fmtInt(stopped ?? 0) },
-                  ]}
-                />
-              </CardFooter>
+              <Metric size="figure">{fmtInt(customers.length)}</Metric>
+              <p className="text-caption text-fg-3">额度未用尽 {fmtInt(customers.length - (stopped ?? 0))} 个，不含平台内部租户。</p>
             </>
           )}
         </Card>
-        <Card className={span.d6} tone="inverse">
-          <CardHeader number={2} title={`客户余额合计 · ${snapshotLabel}`} description="余额与信用额度分开记录；组织预算另行限制调用。" />
+        <Card className="finance-stat finance-balance-stat" tone="inverse">
+          <CardHeader title="客户余额合计" description={snapshotLabel} />
           {customers === null ? (error ? <CardMessage onRetry={() => void load()}>账户快照读取失败</CardMessage> : <MetricSkeleton />) : (
             <>
-              <Metric size="value" className="break-all">{balance === null ? "金额不可精确汇总" : fmtMicroCny(balance)}</Metric>
-              <CardFooter>
-                <dl className="grid gap-4 border-t border-surface/12 pt-5 tablet:grid-cols-2">
-                  <div>
-                    <dt className="font-mono text-meta text-on-inverse-muted">待审批充值</dt>
-                    <dd className="mt-2 text-value font-normal tabular-nums">{pending === null ? "不可精确汇总" : formatCount(pending)}</dd>
-                  </div>
-                  <div>
-                    <dt className="font-mono text-meta text-on-inverse-muted">可用额度计算</dt>
-                    <dd className="mt-2 text-body">余额 + 信用额度</dd>
-                  </div>
-                </dl>
-              </CardFooter>
+              <Metric size="figure" className="break-all">{balance === null ? "金额不可精确汇总" : fmtMicroCny(balance)}</Metric>
+              <p className="text-caption text-fg-3">可用额度 = 余额 + 信用额度，组织预算另行限制调用。</p>
             </>
           )}
+        </Card>
+        <Card className="finance-stat">
+          <CardHeader title="额度已用尽" description="全部客户租户" />
+          {customers === null ? (error ? <CardMessage>账户快照不可用</CardMessage> : <MetricSkeleton />) : <Metric size="figure">{fmtInt(stopped ?? 0)}</Metric>}
+          <p className="text-caption text-fg-3">额度用尽后停止调用。</p>
+        </Card>
+        <Card className="finance-stat">
+          <CardHeader title="待审批充值" description="全部客户租户" />
+          {customers === null ? (error ? <CardMessage>账户快照不可用</CardMessage> : <MetricSkeleton />) : <Metric size="figure">{pending === null ? "不可精确汇总" : formatCount(pending)}</Metric>}
+          <p className="text-caption text-fg-3">批准后计入对应租户余额。</p>
         </Card>
       </BentoGrid>
-      <div className={open ? SIDE_OPEN : "with-side"}>
+      <div className="finance-record-layout">
         <div className="side-main min-w-0">
-          <Card className="mb-0">
+          <Card className="finance-table-card">
             <CardHeader
               number={3}
               description="可用额度 = 余额 + 信用额度，用尽即停止调用（预付透支到 0，后付同样透支到 0，月底结算）。平台内部租户不受限制，排在最后。"

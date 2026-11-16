@@ -68,7 +68,7 @@ export function CallLogDetails({ eventId, backHref }: { eventId: string; backHre
 
   return <div className="call-log-page">
     <PageHeader title="调用日志详情" dataLead="查看本次计费尝试的结果、错误信息与已保存事件。" description="仅展示已采集内容；未采集的请求或响应正文无法补回。"
-      actions={<><a className="btn btn-secondary call-log-back" href={backHref}>返回调用记录</a><Button icon="refresh" aria-label="刷新调用日志" title="刷新调用日志" onClick={() => { setResult(null); setReads(value => value + 1); }} /></>} />
+      actions={<><a className="btn btn-secondary call-log-back" href={backHref}>返回调用记录</a><Button className="call-log-refresh" icon="refresh" aria-label="刷新调用日志" title="刷新调用日志" onClick={() => { setResult(null); setReads(value => value + 1); }} /></>} />
     <p className="call-log-event-id">事件 <code>{eventId}</code></p>
     {!data && <Loading />}
     {data && <>
@@ -76,7 +76,7 @@ export function CallLogDetails({ eventId, backHref }: { eventId: string; backHre
       {data.chargeError && <p className="note crit" role="alert">计价记录读取失败：{data.chargeError}</p>}
       {!stored && !charge && !data.eventError && !data.chargeError && <p className="note" role="status">未找到此调用记录，记录可能已过保留期或事件编号不存在。</p>}
       {(stored || charge) && <>
-        <Card aria-label="调用结果与错误">
+        <Card className="call-log-result" aria-label="调用结果与错误">
           <CardHeader title="调用结果与错误" />
           <Fields items={[
             ["HTTP 状态", event?.status_code ?? charge?.status_code],
@@ -91,7 +91,8 @@ export function CallLogDetails({ eventId, backHref }: { eventId: string; backHre
           ]} />
           {errorMessage ? <LogText key={`${eventId}-error`} label="错误信息" text={errorMessage} /> : <p className="hint mt-4">此事件未记录错误信息。</p>}
         </Card>
-        <Card aria-label="请求与实际目标">
+        <Card className="call-log-record" aria-label="调用详情">
+        <section className="call-log-section" aria-label="请求与实际目标">
           <CardHeader title="请求与实际目标" />
           <Fields items={[
             ["请求 ID", stored?.request_id ?? event?.request_id],
@@ -113,8 +114,8 @@ export function CallLogDetails({ eventId, backHref }: { eventId: string; backHre
             ["网关 ID", stored?.dp_id],
             ["上报批次", stored?.batch_id],
           ]} />
-        </Card>
-        <Card aria-label="时间与性能">
+        </section>
+        <section className="call-log-section" aria-label="时间与性能">
           <CardHeader title="时间与性能" description="时间均为北京时间；未记录的实测指标不补零。" />
           <Fields items={[
             ["完成时间", timeValue(stored?.occurred_at ?? charge?.occurred_at)],
@@ -127,8 +128,8 @@ export function CallLogDetails({ eventId, backHref }: { eventId: string; backHre
           ]} />
           {charge?.usage_estimated === true && <p className="hint">{ESTIMATED_THROUGHPUT_NOTE}</p>}
           <RequestTimingDetails data={event ? event.request_timing : charge?.request_timing} />
-        </Card>
-        <Card aria-label="用量与计费">
+        </section>
+        <section className="call-log-section" aria-label="用量与计费">
           <CardHeader title="用量与计费" />
           {charge ? <>
             <Fields items={[
@@ -137,15 +138,16 @@ export function CallLogDetails({ eventId, backHref }: { eventId: string; backHre
               ["售价（元）", charge.charge_micro_cny === null ? "未知" : fmtMicroCny(charge.charge_micro_cny)],
               ["成本（元）", charge.cost_micro_cny === null ? "未知" : fmtMicroCny(charge.cost_micro_cny)],
             ]} />
-            <div className="mt-4 min-w-0"><ChargeCheck c={charge} /></div>
+            <div className="call-log-charge-check"><ChargeCheck c={charge} /></div>
           </> : <><p className="hint">此事件没有可用的计价记录。</p>{event && <>
             <Fields items={[["原始输入 Token", event.prompt_tokens], ["原始输出 Token", event.completion_tokens], ["原始缓存命中 Token（输入子集）", event.cached_prompt_tokens], ["原始缓存读取 Token（追加）", event.cache_read_tokens], ["原始缓存创建 Token（追加）", event.cache_creation_tokens], ["原始推理 Token", event.reasoning_tokens], ["上游总 Token", event.total_tokens]]} />
             <UsageIoAuditDetails data={event} />
           </>}</>}
-        </Card>
-        <Card aria-label="已保存事件">
+        </section>
+        <section className="call-log-section" aria-label="已保存事件">
           <CardHeader title="已保存事件" description="已保存的事件字段与错误信息经过脱敏。正文长度不代表保存了正文内容。" />
           {stored ? <LogText key={`${eventId}-json`} label="事件 JSON" text={JSON.stringify(stored, null, 2)} collapsed /> : !data.eventError && <p className="hint">原始事件未保存或已过保留期；以上仍展示可用的计价记录。</p>}
+        </section>
         </Card>
       </>}
     </>}

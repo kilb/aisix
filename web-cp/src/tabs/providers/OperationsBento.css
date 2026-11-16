@@ -1,75 +1,20 @@
-/* 当前配置采用连续摘要，表格始终是主要操作面。 */
-.ops-summary {
-  min-width: 0;
-  margin-bottom: 16px;
-  padding: 14px 0 16px;
-  border-block: 1px solid var(--line);
-}
-.ops-summary > h2 {
-  margin: 0 0 12px;
-  color: var(--ink);
-  font-size: 17px;
-  font-weight: 600;
-  line-height: 26px;
-}
-.ops-summary-grid {
-  display: grid;
-  grid-template-columns: minmax(0, .75fr) minmax(0, 1.25fr) minmax(0, 1fr);
-  align-items: start;
-  gap: 18px;
-}
-.ops-summary-grid > * { min-width: 0; }
-.ops-summary-grid > * + * {
-  padding-left: 18px;
-  border-left: 1px solid var(--line);
-}
-.ops-summary-label,
-.ops-summary-note {
-  color: var(--text-muted);
-  font-size: 13px;
-  line-height: 20px;
-  overflow-wrap: anywhere;
-}
-.ops-summary-label { margin: 0 0 8px; }
-.ops-summary-note { max-width: 65ch; margin-top: 8px; }
-.ops-summary .metric { font-size: 26px; font-weight: 500; line-height: 34px; }
-.ops-summary .bento-card-message { min-height: 80px; }
-.ops-facts { display: grid; gap: 0; margin-top: 8px; }
-.ops-facts > div {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 4px 16px;
-  padding: 5px 0;
-  border-top: 1px solid var(--line);
-}
-.ops-facts dt { color: var(--text-muted); font-size: 13px; line-height: 20px; }
-.ops-facts dd {
-  margin: 0;
-  color: var(--ink);
-  font-size: 14px;
-  font-weight: 500;
-  font-variant-numeric: tabular-nums;
-}
-.ops-editor-grid {
-  display: grid;
-  grid-template-columns: repeat(12, minmax(0, 1fr));
-  align-items: start;
-  gap: 20px;
-}
-.ops-editor-grid > * { min-width: 0; grid-column: 1 / -1; }
-@media (max-width: 899px) {
-  .ops-summary-grid { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 20px; }
-  .ops-summary-breakdown { grid-column: 1 / -1; grid-row: 2; }
-  .ops-summary-grid > .ops-summary-breakdown { padding: 16px 0 0; border-left: 0; border-top: 1px solid var(--line); }
-  .ops-summary-grid > .ops-summary-secondary { padding-left: 20px; }
-}
-@media (max-width: 539px) {
-  .ops-summary { padding-block: 16px 20px; }
-  .ops-summary > h2 { margin-bottom: 16px; }
-  .ops-summary-grid { gap: 16px; }
-  .ops-summary-grid > .ops-summary-secondary { padding-left: 16px; }
-  .ops-summary .metric { font-size: 28px; line-height: 36px; }
-  .ops-facts > div { display: grid; gap: 2px; }
-}
+/* 列表页使用一行紧凑指标，主表始终占满下一行。 */
+.ops-summary { min-width: 0; margin: 0; }
+.ops-summary-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; }
+.ops-summary-grid > .panel { min-width: 0; margin: 0; padding: 18px; border-radius: var(--radius-card); }
+.ops-summary-label { margin: 0 0 8px; color: var(--color-fg-3); font-size: var(--text-caption); line-height: 1.45; }
+.ops-summary-note { max-width: 65ch; margin-top: 8px; color: var(--color-fg-3); font-size: var(--text-caption); line-height: 1.45; overflow-wrap: anywhere; }
+.ops-summary .metric { font-size: var(--text-metric); font-weight: 800; line-height: 1.1; letter-spacing: -.035em; }
+.ops-summary .bento-card-message { min-height: 40px; }
+.ops-summary-distribution { display: grid; gap: 6px; margin: 0; }
+.ops-summary-distribution > div, .ops-facts > div { display: flex; align-items: baseline; justify-content: space-between; gap: 8px 16px; }
+.ops-summary-distribution dt { min-width: 0; color: var(--color-fg-2); font-size: var(--text-small); overflow-wrap: anywhere; }
+.ops-summary-distribution dd { flex: none; margin: 0; font-size: var(--text-small); font-weight: 700; font-variant-numeric: tabular-nums; }
+.ops-facts { display: grid; gap: 12px; margin: 0; }
+.ops-facts dt { min-width: 0; color: var(--color-fg-3); font-size: var(--text-caption); }
+.ops-facts dd { margin: 0; color: var(--color-fg); font-size: var(--text-title); font-weight: 700; font-variant-numeric: tabular-nums; }
+.ops-facts > div + div { padding-top: 12px; border-top: 1px solid var(--color-hairline); }
+.ops-editor-grid { display: grid; grid-template-columns: minmax(0, 1fr); align-items: start; gap: 16px; }
+.ops-editor-grid > * { min-width: 0; }
+@media (max-width: 1279px) { .ops-summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 359px) { .ops-summary-grid { grid-template-columns: minmax(0, 1fr); } }

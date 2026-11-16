@@ -3,7 +3,7 @@ import "./models/ModelManagement.css";
 import { FORM_FOOTER, RowField, ServedGroups, GENERATED_STRATEGY, type Target, type ModelDoc, type AccountDoc, type Model, type Catalog, type SchemaInfo } from "./models/catalog";
 import { RoutingModeField } from "../ui/RoutingModeField";
 import { Eye, Pencil, Plus, RefreshCw, Trash2, Waypoints } from "lucide-react";
-import { Fragment, useEffect, useRef, useState, type ReactNode } from "react";
+import { Fragment, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import type { TabProps } from "../App";
 import { ConflictNote } from "../components/ConflictNote";
 import { FormDialog } from "../ui/FormDialog";
@@ -99,6 +99,12 @@ export function Models({ canEdit, onGoto }: TabProps) {
   const [publicsError, setPublicsError] = useState<string | null>(null);
   const [schema, setSchema] = useState<SchemaInfo | null>(null);
   const [open, setOpen] = useState<Open | null>(null);
+  // 隐去长列表后从当前对象标题进入，避免沿用列表中段的滚动位置。
+  useLayoutEffect(() => {
+    if (open?.mode !== "edit") return;
+    window.scrollTo({ top: 0, left: 0, behavior: "instant" });
+    document.getElementById("workspace-main")?.focus({ preventScroll: true });
+  }, [open]);
   const [note, setNote] = useState<Note | null>(null);
   // Whether 内部直连 rows are listed. Off by default: they are the targets a
   // public model's routing document dispatches to, one per serving account,
@@ -267,15 +273,15 @@ export function Models({ canEdit, onGoto }: TabProps) {
       />
     );
   }
-  // 编辑区打开时仍保留全部列，表格在卡片内部滚动。
+  // 编辑现有模型时隐藏列表，只保留当前对象的完整工作区。
   const split = editor !== null && open?.mode !== "new";
 
   return (
     <div className="cp-operations cp-models">
       <PageHeader
         eyebrow="MODELS · 模型目录"
-        title="模型目录"
-        dataLead={models.items ? <>当前有 {counts.facing} 个对外公共模型、{counts.manual} 个手工模型和 {counts.internal} 个内部直连目标。</> : "查看模型清单，维护手工模型与路由。"}
+        title={split && editing ? nameOf(editing) : "模型目录"}
+        dataLead={split ? "维护当前模型的上游连接、路由目标与故障冷却。" : models.items ? <>当前有 {counts.facing} 个对外公共模型、{counts.manual} 个手工模型和 {counts.internal} 个内部直连目标。</> : "查看模型清单，维护手工模型与路由。"}
         actions={
           <>
             <Button type="button" className="ops-icon-button" aria-label="刷新" title="刷新模型目录" onClick={refresh}><RefreshCw aria-hidden /></Button>
@@ -294,7 +300,7 @@ export function Models({ canEdit, onGoto }: TabProps) {
           </>
         }
       />
-      {!editor && <InventorySummary
+      {!split && <InventorySummary
         title="模型文档 · 当前配置"
         total={models.items?.length ?? null}
         totalLabel="含内部直连目标"
@@ -312,7 +318,7 @@ export function Models({ canEdit, onGoto }: TabProps) {
           <div><dt>内部直连目标</dt><dd>{models.items ? counts.internal : "—"}</dd></div>
         </dl>
       </InventorySummary>}
-      <div className="mb-6 grid gap-3 empty:hidden [&>.note]:m-0">
+      <div className="grid gap-3 empty:hidden [&>.note]:m-0">
         <Msg note={note} />
         {deleteFailure &&
           (deleteFailure.error.code === "version_mismatch" ? (
@@ -366,7 +372,7 @@ export function Models({ canEdit, onGoto }: TabProps) {
         )}
       >
         {editor && (open?.mode === "new" ? <FormDialog open onOpenChange={(next) => { if (!next) setOpen(null); }} title={open.shape === "routing" ? "新建路由模型" : "新建直连模型"}>{editor}</FormDialog> : <div className="ops-editor">{editor}</div>)}
-        <Card className="ops-list mb-0">
+        {!split && <Card className="ops-list mb-0">
           <CardHeader
             number={editor ? 4 : 3}
             title="全部模型"
@@ -380,7 +386,7 @@ export function Models({ canEdit, onGoto }: TabProps) {
             }
             className="mb-0 items-center"
             actions={
-              <label className="inline-flex cursor-pointer items-center gap-2 text-caption text-ink-soft">
+              <label className="inline-flex cursor-pointer items-center gap-2 text-caption text-fg-2">
                 <input type="checkbox" checked={showInternal} onChange={(e) => setShowInternal(e.target.checked)} />
                 <span>显示内部直连模型（{counts.internal}）</span>
               </label>
@@ -413,7 +419,7 @@ export function Models({ canEdit, onGoto }: TabProps) {
                   const from = src.kind === "public" ? publicById?.get(src.id) : undefined;
                   return (
                     <Fragment key={m.id}>
-                      <tr className={editing?.id === m.id ? "bg-well" : undefined}>
+                      <tr className={editing?.id === m.id ? "bg-sunken" : undefined}>
                         <td className="font-medium">
                           <span className="model-list-name" title={nameOf(m)}>
                             {nameOf(m)}
@@ -422,7 +428,7 @@ export function Models({ canEdit, onGoto }: TabProps) {
                         <td className="whitespace-normal">
                           <Source model={m} source={src} from={from} publicRead={publicById !== null} catalog={catalog} />
                         </td>
-                        <td className="text-ink-soft">{SHAPE_LABEL[shape]}{shape === "routing" && <RoutePolicy routing={m.doc.routing} defaultStrategy={schema && "preset" in schema ? schema.preset : null} compact />}</td>
+                        <td className="text-fg-2">{SHAPE_LABEL[shape]}{shape === "routing" && <RoutePolicy routing={m.doc.routing} defaultStrategy={schema && "preset" in schema ? schema.preset : null} compact />}</td>
                         <td className="whitespace-normal">
                           <div className="model-list-target">
                             <Upstream model={m} catalog={catalog} />
@@ -493,7 +499,7 @@ export function Models({ canEdit, onGoto }: TabProps) {
             </DataTable>
           )}
           <RecordTablePager {...table} total={table.filteredCount} onPageChange={table.setPage} onPageSizeChange={table.setPageSize} label="模型分页" />
-        </Card>
+        </Card>}
       </div>
     </div>
   );
@@ -509,7 +515,7 @@ function Upstream({ model, catalog }: { model: Model; catalog: Catalog }) {
         <>
           <div className="flex flex-wrap items-baseline gap-x-1.5">
             <span>{account?.doc.display_name || doc.provider_key_id || "—"}</span>
-            <span className="text-muted">·</span>
+            <span className="text-fg-3">·</span>
             <code className="text-caption">{doc.model_name ?? "—"}</code>
           </div>
           <ServedGroups>{groupsOf(model, catalog)}</ServedGroups>
@@ -561,14 +567,14 @@ function Source({
   // The row a caller names is 对外; the per-account documents behind it are
   // 内部直连 — reachable only as that row's targets, never granted or priced.
   const shared = (
-    <div className="sub mt-1 max-w-[16rem] min-w-0 font-mono text-meta [overflow-wrap:anywhere]">
+    <div className="sub mt-1 max-w-[16rem] min-w-0 font-mono text-caption [overflow-wrap:anywhere]">
       {publicRead ? (name ?? `${source.id}（公共模型已不在列表）`) : "…"}
     </div>
   );
   if (!source.generated)
     return (
       <>
-        <span className="tag border-ink/20 bg-surface text-ink">对外</span>
+        <span className="tag border-ink/20 bg-surface text-fg">对外</span>
         {shared}
       </>
     );
@@ -576,7 +582,7 @@ function Source({
     <>
       <span className="tag border-dashed">内部直连</span>
       {shared}
-      <div className="sub font-mono text-meta">{account ? `账号：${account.doc.display_name || account.id}` : "账号：已不存在"}</div>
+      <div className="sub font-mono text-caption">{account ? `账号：${account.doc.display_name || account.id}` : "账号：已不存在"}</div>
     </>
   );
 }
@@ -955,7 +961,7 @@ function ModelForm({
         <div className="ops-form-section model-form-section @container">
           <h4 className="mb-3 text-body font-semibold">路由目标（{rows.length}）</h4>
           <div className="ops-target-list model-target-list">
-            <div aria-hidden="true" className={cn(MANUAL_ROW, "hidden border-b border-line bg-well px-3 py-2 text-caption font-medium text-ink-soft @lg:grid")}>
+            <div aria-hidden="true" className={cn(MANUAL_ROW, "hidden border-b border-hairline bg-sunken px-3 py-2 text-caption font-medium text-fg-2 @lg:grid")}>
               <span>目标模型</span>
               <span>权重</span>
               <span>优先级</span>
@@ -964,7 +970,7 @@ function ModelForm({
             {rows.map((r, i) => {
               const target = catalog.models.get(r.modelId);
               return (
-                <div key={r.key} className={cn(MANUAL_ROW, "ops-target-row border-line p-3 not-last:border-b")} role="group" aria-label={`目标 ${i + 1}`}>
+                <div key={r.key} className={cn(MANUAL_ROW, "ops-target-row border-hairline p-3 not-last:border-b")} role="group" aria-label={`目标 ${i + 1}`}>
                   <div className="col-span-2 min-w-0 @lg:col-span-1">
                     <RowField label="目标模型" error={targetAt(r, "model_id")}>
                       {(aria) => (

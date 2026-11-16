@@ -50,9 +50,9 @@ export function SectionHost({
   return (
     <div className="sections min-w-0" role="region" aria-label={label}>
       {shown.length > 1 && (
-        <div className="sections-switch mb-7 min-h-11 gap-1 rounded-full border-0 bg-well p-1" role="group" aria-label={`${label}分区`}>
+        <div className="sections-switch mb-4 min-h-11 gap-1 rounded-full border-0 bg-well p-1" role="group" aria-label={`${label}分区`}>
           {shown.map((s) => (
-            <button key={s.id} type="button" className="h-11 shrink-0 rounded-full px-4 font-mono text-meta font-medium text-ink-soft after:hidden hover:bg-surface hover:text-ink aria-pressed:bg-ink aria-pressed:text-surface" aria-pressed={s.id === current.id} onClick={() => setOpen(s.id)}>
+            <button key={s.id} type="button" className="h-11 shrink-0 rounded-full px-4 text-small font-semibold text-ink-soft after:hidden hover:bg-surface hover:text-ink aria-pressed:bg-ink aria-pressed:text-surface" aria-pressed={s.id === current.id} onClick={() => setOpen(s.id)}>
               {s.label}
             </button>
           ))}

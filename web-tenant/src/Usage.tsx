@@ -264,7 +264,7 @@ const MAX_DAYS = { day: 92, month: 731 } as const;
 /** A card that is a region named by its heading. */
 function Section({ title, number, children }: { title: string; number: number; children: ReactNode }) {
   return (
-    <Card role="region" aria-label={title} className={`${span.d12} usage-record-section`}>
+    <Card padding="table" role="region" aria-label={title} className={`${span.d12} usage-record-section`}>
       <CardHeader number={number} title={title} />
       {children}
     </Card>
@@ -320,7 +320,7 @@ export function Usage({ member, page = "analysis" }: { member: SessionMember; pa
   return (
     <div className="measurement-page">
       <PageHeader title={page === "calls" ? "调用记录" : "用量分析"} dataLead={member.role === "member" ? "查看你的密钥范围；每次计费尝试单独记录。" : "查看全组织用量与费用；每次计费尝试单独记录。"} />
-      <div className="flex min-w-0 flex-col gap-3">
+      <div className="flex min-w-0 flex-col gap-4">
         {readErr && (
           <div className="note crit" role="alert">
             {readErr}
@@ -429,7 +429,7 @@ function Summary({ keys, showKeys, ownScope, models }: { keys: TenantKey[]; show
   const metricsTo = range?.to ?? (query.get("to") || fallback.to);
   return (
     <BentoGrid>
-      <div className={`${span.d12} metric-scope`}>
+      <Card className={`${span.d12} metric-scope`} padding="sm" aria-label="用量分析筛选">
         <Filters>
           <Field label="开始日期"><input type="date" value={fromDate} onChange={e => setFromDate(e.target.value)} /></Field>
           <Field label="结束日期"><input type="date" value={toDate} onChange={e => setToDate(e.target.value)} /></Field>
@@ -440,7 +440,7 @@ function Summary({ keys, showKeys, ownScope, models }: { keys: TenantKey[]; show
         </Filters>
         <p className="hint">分析最多查询 92 天或 1500 个时间桶，超出范围请调整。按月汇总仍可查询原有历史范围。</p>
         <p className="hint">{fmtBeijing(metricsFrom)} — {fmtBeijing(metricsTo)}</p>
-      </div>
+      </Card>
       <ApiMetricsPanel refreshKey={refresh} scope="tenant" enabled={range !== null} from={metricsFrom} to={metricsTo} apiKeyId={keyId || undefined} modelId={query.get("model_id") || undefined} memberId={query.get("member_id") || undefined} view={metricViewOf(query.get("view"))} onViewChange={view => update({ view, from: metricsFrom, to: metricsTo })} numberStart={1} className={span.d12} />
       <Section title="用量汇总" number={7}>
         <p className="hint">{rangeLabel}</p>
@@ -469,7 +469,8 @@ function Summary({ keys, showKeys, ownScope, models }: { keys: TenantKey[]; show
         {rows === null && <ChartSkeleton />}
         {rows !== null && rows.length === 0 && !err && !tooLong && range && <CardMessage>所选范围内没有用量</CardMessage>}
         {rows !== null && rows.length > 0 && (
-          <DataTable label="用量汇总">
+          <DataTable label="用量汇总" tableClassName="usage-summary-table">
+            <colgroup><col className="usage-summary-period" /><col className="usage-summary-model" /><col className="usage-summary-count" /><col className="usage-summary-cost" /><col className="usage-summary-quantities" /></colgroup>
             <thead>
               <tr>
                 <th>期间</th>
@@ -643,7 +644,7 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
       {query.get("member_id") && <p className="hint" role="status">已按成员 {query.get("member_id")} 筛选。</p>}
       <p className="hint">文字搜索仅筛选已加载记录；调用结果与更多筛选作用于全部匹配记录。</p>
       <p className="hint">首字仅显示实测值；含估算用量的 TPS 标为 ≈，仅供参考。用量标记无法区分输入或输出估算。无内容、非流式或旧记录未采集时显示 —，TPS 不使用总用时估算。</p>
-      <p className="mt-4 text-caption text-muted">调用记录按计费尝试逐条展示，同一请求可能有多条记录。{rows !== null ? `已加载 ${rows.length.toLocaleString("en-US")} 条${next !== null ? "，还有更多记录" : ""}；这些记录不代表整个汇总窗口的成功率或延迟分布。` : ""}</p>
+      <p className="mt-4 text-caption text-fg-3">调用记录按计费尝试逐条展示，同一请求可能有多条记录。{rows !== null ? `已加载 ${rows.length.toLocaleString("en-US")} 条${next !== null ? "，还有更多记录" : ""}；这些记录不代表整个汇总窗口的成功率或延迟分布。` : ""}</p>
       {err && (
         <div className="note crit" role="alert">
           {err}

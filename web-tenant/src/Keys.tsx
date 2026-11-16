@@ -26,7 +26,7 @@ import { Field, useRefusalFocus } from "./ui/Field";
 import { KeySecret } from "./ui/KeySecret";
 import { Lamp, type LampState } from "./ui/Lamp";
 import { TwoStep } from "./ui/TwoStep";
-import { BentoGrid, Card, CardHeader, PageHeader, span } from "./components/page";
+import { BentoGrid, Card, CardHeader, Metric, PageHeader, span } from "./components/page";
 import { formatCount } from "./lib/chartFormat";
 import { cn } from "./lib/cn";
 import { beijingInputValue, fmtBeijing, parseBeijingInput } from "./lib/time";
@@ -39,7 +39,7 @@ import { Select } from "./ui/Select";
 import { Menu } from "./ui/Menu";
 import "./Keys.css";
 
-// 桌面：5 + 7 / 12 / 12；平板与手机按卡片顺序各占整行。
+// 费用摘要与密钥表格分别通栏，宽表仅在表格区域内滚动。
 
 type Caps = Org["limits"];
 
@@ -188,20 +188,11 @@ export function Keys({
   });
 
   const visibleScope = manager ? "全组织密钥" : "我的密钥";
-  const readyKeys = items?.filter((key) => stateOf(key).lamp === "applied").length;
-  const stateCounts = items === null ? [] : [
-    { label: "配置可用", value: 0 },
-    { label: "平台停用", value: 0 },
-    { label: "主动停用", value: 0 },
-    { label: "已过期", value: 0 },
-    { label: "分组不可用", value: 0 },
-  ];
-  for (const key of items ?? []) {
-    const index = key.disabled_by_platform ? 1 : key.disabled ? 2
-      : key.expires_at && Date.parse(key.expires_at) <= Date.now() ? 3 : !key.group_available ? 4 : 0;
-    const bucket = stateCounts[index];
-    if (bucket) bucket.value += 1;
-  }
+  // 费用缺失不补零；摘要和列表使用同一批精确金额。
+  const totalCost = items === null || costs === null ? null : items.reduce<bigint | null>((total, key) => {
+    const amount = costs.items.get(key.id)?.chargedMicroCny;
+    return total === null || amount === null || amount === undefined ? null : total + amount;
+  }, 0n);
 
   return (
     <>
@@ -209,23 +200,20 @@ export function Keys({
         actions={active && <Button kind="primary" onClick={() => { setMinted(null); setCreateOpen(true); }}><Plus aria-hidden />新建密钥</Button>}
         title="API 密钥"
         eyebrow={visibleScope}
-        dataLead={items === null ? "管理调用凭据、模型范围与使用限制。" : <>
-          当前可见 <span className="font-medium text-ink">{formatCount(items.length)}</span> 把密钥，
-          其中 <span className="font-medium text-ink">{formatCount(readyKeys ?? 0)}</span> 把配置可用。
-          {active ? "实际调用仍受组织授权和额度约束。" : "组织已停用，所有密钥暂时无法调用。"}
-        </>}
+        dataLead={`${visibleScope}，管理调用凭据、模型范围与使用限制。`}
       />
       <BentoGrid className="tenant-keys">
-        <Card className={`${span.d12} keys-overview`} aria-label="密钥配置状态概览">
-          <dl className="compact-overview-facts">
-            <div><dt>当前可见密钥</dt><dd>{items === null ? "—" : formatCount(items.length)}</dd></div>
-            {stateCounts.map((state) => <div key={state.label}><dt>{state.label}</dt><dd>{formatCount(state.value)}</dd></div>)}
-          </dl>
-          <p className="text-caption text-muted">{manager ? "全组织密钥" : "我的密钥"} · 配置状态不代表实时调用结果，实际调用受组织授权和额度约束。</p>
+        <Card tone="lilac" padding="sm" className={`${span.d12} keys-expense-summary`} aria-label="密钥本月费用">
+          <div className="flex flex-wrap items-center justify-between gap-4">
+            <div className="min-w-0">
+              <p className="text-small font-semibold text-fg-2">本月已计价费用</p>
+              <Metric size="value" className="mt-2">{costErr ? "读取失败" : items === null || costs === null ? "—" : totalCost === null ? "未知" : fmtMicroCny(totalCost)}</Metric>
+            </div>
+            <p className="max-w-xl text-caption text-fg-3">{when(costs?.from ?? costRange.from)} 至 {when(costs?.to ?? costRange.to)}（UTC+8，不含结束时间）。<br />仅含当前可见密钥的已计价金额；待计价与处理中记录见列表。</p>
+          </div>
         </Card>
-        <Card className={cn(span.d12, "keys-list")}>
+        <Card padding="table" className={cn(span.d12, "keys-list")}>
           <CardHeader number={3} title="密钥列表" description="复制或查看明文会重新获取密钥；吊销后立即失效，无法恢复。" actions={<Button onClick={() => void load()}>刷新列表</Button>} />
-          <p className="hint">本月费用：{when(costs?.from ?? costRange.from)} 至 {when(costs?.to ?? costRange.to)}（UTC+8，不含结束时间）。只含已计价金额；待计价与处理中记录另列。</p>
           {costErr && <div className="note crit" role="alert">费用读取失败：{costErr}<Button onClick={() => void load()}>重新读取费用</Button></div>}
           <RecordTableToolbar search={{ value: table.query, onChange: table.setQuery, label: "搜索密钥", placeholder: "名称、公开前缀、归属或分组" }}>
             <Field label="密钥状态"><Select value={stateFilter} onValueChange={setStateFilter} size="compact"><option value="">全部状态</option>{["可用", "已被平台停用", "已停用", "已过期"].map((value) => <option key={value}>{value}</option>)}</Select></Field>
@@ -251,12 +239,11 @@ export function Keys({
               <thead>
                 <tr>
                   <th>名称</th>
-                  <th>前缀</th>
                   <th>归属</th>
                   <th>模型</th>
                   <th>分组</th>
                   <th>限制</th>
-                  <th>本月费用</th>
+                  <th className="num">本月费用</th>
                   <th>状态</th>
                   <th>
                     <span className="vh">操作</span>
@@ -273,28 +260,28 @@ export function Keys({
                   return (
                     <tr key={k.id}>
                       <td data-label="名称">
-                        <span className="trunc [--trunc:144px] min-[1800px]:[--trunc:160px]" title={k.label}>
+                        <span className="key-name" title={k.label}>
                           <a className="key-detail-link" href={detailHref}>{k.label}</a>
                         </span>
-                      </td>
-                      <td data-label="前缀">
-                        <KeySecret
-                          prefix={k.prefix}
-                          className="acts mt-1.5 flex w-max justify-start min-[1800px]:mt-0 min-[1800px]:ml-2 min-[1800px]:inline-flex"
-                          reveal={() => keyApi.reveal(k.id)}
-                          unavailable={
-                            k.plaintext_available ? null : "该密钥创建于旧版本，无法再次查看；如需明文请新建密钥"
-                          }
-                          onError={(e) =>
-                            setActionErr(
-                              e instanceof ApiError && e.code === "plaintext_unavailable"
-                                ? messageFor(e)
-                                : e instanceof ApiError
-                                  ? formMessageFor(e)
-                                  : failure(e),
-                            )
-                          }
-                        />
+                        <span className="key-prefix">
+                          <KeySecret
+                            prefix={k.prefix}
+                            className="acts inline-flex shrink-0"
+                            reveal={() => keyApi.reveal(k.id)}
+                            unavailable={
+                              k.plaintext_available ? null : "该密钥创建于旧版本，无法再次查看；如需明文请新建密钥"
+                            }
+                            onError={(e) =>
+                              setActionErr(
+                                e instanceof ApiError && e.code === "plaintext_unavailable"
+                                  ? messageFor(e)
+                                  : e instanceof ApiError
+                                    ? formMessageFor(e)
+                                    : failure(e),
+                              )
+                            }
+                          />
+                        </span>
                       </td>
                       <td data-label="归属">
                         <span className="trunc" style={{ "--trunc": "128px" } as CSSProperties} title={owner}>
@@ -319,7 +306,7 @@ export function Keys({
                       <td className="tabular" data-label="限制">
                         <span className="block">{limitsOf(k)}</span>
                       </td>
-                      <td className="tabular" data-label="已用费用">
+                      <td className="num tabular" data-label="已用费用">
                         <span className="block">{costErr ? "读取失败" : costs === null ? "读取中…" : cost === undefined ? "未读取" : cost.chargedMicroCny === null ? "未知" : fmtMicroCny(cost.chargedMicroCny)}</span>
                         {cost && keyCostNotes(cost).map(note => <span className="hint cell-note" key={note}>{note}</span>)}
                       </td>
@@ -370,7 +357,7 @@ export function Keys({
           {items !== null && <RecordTablePager page={table.page} pageSize={table.pageSize} onPageChange={table.setPage} onPageSizeChange={table.setPageSize} total={table.filteredCount} label="密钥" />}
         </Card>
         {active && <FormDialog open={createOpen} onOpenChange={(next) => { setCreateOpen(next); if (!next) setMinted(null); }} busy={createBusy} title={minted ? "密钥已创建" : "新建密钥"} description="先选择计价分组，再设置模型范围与限制。留空的限制沿用组织上限。">
-          {minted ? <div ref={createdResult} tabIndex={-1} aria-label="密钥已创建" className="key-created-result"><ShownOnce title="密钥明文（可再次复制）" value={minted} onDone={() => { setCreateOpen(false); setMinted(null); }}><span className="hint">密钥已创建。复制后即可使用；之后也可以在密钥列表里重新获取明文。</span></ShownOnce></div> : <KeyForm
+          {minted ? <div ref={createdResult} tabIndex={-1} aria-label="密钥已创建" className="key-created-result"><ShownOnce title="密钥已创建" masked value={minted} onDone={() => { setCreateOpen(false); setMinted(null); }}><span className="hint">密钥已隐藏，复制后即可使用；之后也可以在密钥列表里重新复制。</span></ShownOnce></div> : <KeyForm
             me={member}
             manager={manager}
             catalog={catalog}

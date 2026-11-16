@@ -1,0 +1,10 @@
+/* 概况页先展示请求指标，再按配置与计价主题组织卡片。 */
+.overview-page { display: grid; min-width: 0; gap: 16px; }
+.overview-page > .page-header { margin: 0; }
+.overview-grid > .panel { margin: 0; }
+.overview-page .ops-metric-line { display: flex; flex-wrap: wrap; align-items: center; gap: 16px; }
+.overview-page .overview-grid > .panel .metric { font-size: var(--text-metric); line-height: 1.1; font-weight: 800; letter-spacing: -.035em; }
+.overview-page .rows { margin: 0; }
+.overview-page .row-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.overview-page .rollout-errors { margin-top: 8px; color: var(--color-fg-2); font-size: var(--text-small); overflow-wrap: anywhere; }
+.overview-page .rows > li { min-width: 0; padding-block: 12px; overflow-wrap: anywhere; }

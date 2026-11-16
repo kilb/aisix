@@ -8,14 +8,14 @@ export type SuccessSummaryTotals = Pick<ApiMetricValues, "requests" | "succeeded
 export function ApiOutcomeComposition({ totals }: { totals?: Pick<SuccessSummaryTotals, "requests" | "succeeded_requests" | "failed_requests" | "unknown_outcome_requests"> }) {
   const shares = requestOutcomeShares(totals);
   const parts = [
-    { label: "成功", count: totals?.succeeded_requests, className: "bg-[var(--success)]" },
-    { label: "失败", count: totals?.failed_requests, className: "bg-[var(--danger)]" },
-    { label: "未知", count: totals?.unknown_outcome_requests, className: "bg-muted" },
+    { label: "成功", count: totals?.succeeded_requests, className: "bg-success" },
+    { label: "失败", count: totals?.failed_requests, className: "bg-danger" },
+    { label: "未知", count: totals?.unknown_outcome_requests, className: "bg-fg-3" },
   ] as const;
   const description = `最终请求构成：成功 ${formatCount(parts[0].count)}，失败 ${formatCount(parts[1].count)}，未知 ${formatCount(parts[2].count)}，共 ${formatCount(totals?.requests)}`;
   return <div role="group" aria-label="最终请求构成" className="mt-5">
-    {shares === null ? <div aria-hidden="true" className="h-2.5 rounded-full bg-ink/7" /> : <div role="img" aria-label={description} className="flex h-2.5 overflow-hidden rounded-full bg-ink/7">{shares.map((share, index) => <span key={index} className={parts[index]?.className} style={{ width: `${share * 100}%` }} />)}</div>}
-    <p className="mt-3 text-caption text-muted">请求构成：{parts.map(part => `${part.label} ${formatCount(part.count)}`).join(" · ")}。按全部最终请求展示，未知结果保留。</p>
+    {shares === null ? <div aria-hidden="true" className="h-2.5 rounded-full bg-tint" /> : <div role="img" aria-label={description} className="flex h-2.5 overflow-hidden rounded-full bg-tint">{shares.map((share, index) => <span key={index} className={parts[index]?.className} style={{ width: `${share * 100}%` }} />)}</div>}
+    <p className="mt-3 text-caption text-fg-3">请求构成：{parts.map(part => `${part.label} ${formatCount(part.count)}`).join(" · ")}。按全部最终请求展示，未知结果保留。</p>
   </div>;
 }
 
@@ -29,14 +29,14 @@ export function ApiSuccessSummary({ totals }: { totals?: SuccessSummaryTotals })
   ];
   return <div role="group" aria-label="请求成功率摘要" className="metric-success min-w-0">
     <dl className="m-0 grid grid-cols-2 gap-x-6 gap-y-4 desktop:grid-cols-4">
-      {items.map(item => <div key={item.label} className="min-w-0"><dt className="text-micro text-muted">{item.label}</dt><dd className="m-0 mt-2"><Metric size="display" className="font-medium">{item.value}</Metric></dd></div>)}
+      {items.map(item => <div key={item.label} className="min-w-0"><dt className="text-micro text-fg-3">{item.label}</dt><dd className="m-0 mt-2"><Metric size="display" className="font-medium">{item.value}</Metric></dd></div>)}
     </dl>
     <ApiOutcomeComposition totals={totals} />
-    <dl className="m-0 mt-5 flex flex-wrap gap-x-6 gap-y-2 border-t border-ink/7 pt-4 text-caption">
-      <div><dt className="text-muted">已知结果样本（分母）</dt><dd className="m-0 mt-1 tabular-nums">{formatCount(totals?.known_outcome_requests)}</dd></div>
-      <div><dt className="text-muted">最终请求</dt><dd className="m-0 mt-1 tabular-nums">{formatCount(totals?.requests)}</dd></div>
-      <div><dt className="text-muted">最终状态未知的尝试</dt><dd className="m-0 mt-1 tabular-nums">{formatCount(totals?.unknown_final_attempts)}</dd></div>
+    <dl className="m-0 mt-5 flex flex-wrap gap-x-6 gap-y-2 border-t border-hairline pt-4 text-caption">
+      <div><dt className="text-fg-3">已知结果样本（分母）</dt><dd className="m-0 mt-1 tabular-nums">{formatCount(totals?.known_outcome_requests)}</dd></div>
+      <div><dt className="text-fg-3">最终请求</dt><dd className="m-0 mt-1 tabular-nums">{formatCount(totals?.requests)}</dd></div>
+      <div><dt className="text-fg-3">最终状态未知的尝试</dt><dd className="m-0 mt-1 tabular-nums">{formatCount(totals?.unknown_final_attempts)}</dd></div>
     </dl>
-    <p className="mt-3 text-caption text-muted">成功 ÷（成功 + 失败）；未知结果单列，不进入成功率分母。</p>
+    <p className="mt-3 text-caption text-fg-3">成功 ÷（成功 + 失败）；未知结果单列，不进入成功率分母。</p>
   </div>;
 }
