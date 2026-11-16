@@ -1,77 +1,67 @@
 import { useEffect, useState } from "react";
 import type { TabProps } from "../App";
 import { Card, CardHeader, CardMessage, Metric, MetricSkeleton, PageHeader } from "../components/page";
-import { fetchApiMetrics, metricsRangeError, type ApiMetricsResponse } from "../lib/apiMetrics";
 import { formatCount } from "../lib/chartFormat";
 import { errorText } from "../lib/fmt";
 import { fmtMicroCny } from "../lib/money";
 import { beijingInputValue, fmtBeijing, parseBeijingInput } from "../lib/time";
-import { fetchCostTotals, type CostTotals } from "../lib/totals";
+import { fetchProfitSummary, profitRangeError, type ProfitSummary } from "../lib/totals";
 import { useHashQuery } from "../lib/useHashQuery";
 import { Button } from "../ui/Button";
 import "./totals.css";
 
-interface Reading<T> { data: T | null; error: string | null }
-interface TotalsAnswer {
-  key: string;
-  usage: Reading<ApiMetricsResponse>;
-  cost: Reading<CostTotals>;
-}
+interface TotalsAnswer { key: string; data: ProfitSummary | null; error: string | null }
 
-/** 收入与成本保留正式聚合口径；同窗独立查询，不宣称一致快照。 */
+/** 同一数据库快照汇算收入和成本，保留旧 totals 链接的显式时间范围。 */
 export function Totals(_props: TabProps) {
   const [query, update] = useHashQuery();
   const [fallback] = useState(() => {
     const to = new Date();
     return { from: new Date(to.getTime() - 86_400_000).toISOString(), to: to.toISOString() };
   });
-  const from = query.get("from") ?? fallback.from;
-  const to = query.get("to") ?? fallback.to;
+  const from = query.get("from") ?? undefined;
+  const to = query.get("to") ?? undefined;
+  const allTime = from === undefined && to === undefined;
   const [revision, setRevision] = useState(0);
-  const [answer, setAnswer] = useState<TotalsAnswer>({ key: "", usage: { data: null, error: null }, cost: { data: null, error: null } });
+  const [answer, setAnswer] = useState<TotalsAnswer>({ key: "", data: null, error: null });
   const key = JSON.stringify([from, to, revision]);
-  const rangeError = metricsRangeError(from, to)?.replace("；下方历史明细仍按原范围显示", "");
+  const rangeError = profitRangeError(from, to);
   useEffect(() => {
     if (rangeError) return;
     let current = true;
-    setAnswer({ key, usage: { data: null, error: null }, cost: { data: null, error: null } });
-    void fetchApiMetrics("admin", { from, to }).then(data => {
-      if (current) setAnswer(previous => previous.key === key ? { ...previous, usage: { data, error: null } } : previous);
+    setAnswer({ key, data: null, error: null });
+    void fetchProfitSummary(from, to).then(data => {
+      if (current) setAnswer({ key, data, error: null });
     }, (error: unknown) => {
-      if (current) setAnswer(previous => previous.key === key ? { ...previous, usage: { data: null, error: errorText(error) } } : previous);
-    });
-    void fetchCostTotals(from, to).then(data => {
-      if (current) setAnswer(previous => previous.key === key ? { ...previous, cost: { data, error: null } } : previous);
-    }, (error: unknown) => {
-      if (current) setAnswer(previous => previous.key === key ? { ...previous, cost: { data: null, error: errorText(error) } } : previous);
+      if (current) setAnswer({ key, data: null, error: errorText(error) });
     });
     return () => { current = false; };
   }, [key, from, to, rangeError]);
 
-  const usage = !rangeError && answer.key === key ? answer.usage.data : null;
-  const cost = !rangeError && answer.key === key ? answer.cost.data : null;
-  const usageError = rangeError ?? (answer.key === key ? answer.usage.error : null);
-  const costError = rangeError ?? (answer.key === key ? answer.cost.error : null);
-  const loading = !rangeError && (!usage && !usageError || !cost && !costError);
+  const data = !rangeError && answer.key === key ? answer.data : null;
+  const error = rangeError ?? (answer.key === key ? answer.error : null);
+  const loading = !data && !error;
   const retry = () => setRevision(value => value + 1);
   const dateValue = (value: string) => Number.isFinite(Date.parse(value)) ? beijingInputValue(new Date(value)) : value;
-  const changeDate = (name: string, value: string) => update({ from, to, [name]: parseBeijingInput(value) ?? value });
+  const changeDate = (name: string, value: string) => update({ from: from ?? fallback.from, to: to ?? fallback.to, [name]: parseBeijingInput(value) ?? value });
   function selectRange(days: number) {
     const end = new Date();
     update({ from: new Date(end.getTime() - days * 86_400_000).toISOString(), to: end.toISOString() });
   }
-  const revenue = usage?.totals.charged_micro_cny;
-  const unpriced = usage?.totals.unpriced_attempts;
-  const adjusted = usage?.totals.adjusted_micro_cny;
+  const complete = data !== null && data.rowsWithoutCost === 0n && data.unpricedRows === 0n;
+  const costKnown = data !== null && (data.rowsWithCost > 0n || complete);
+  const pending = error ? <CardMessage onRetry={rangeError ? undefined : retry}>{error}</CardMessage> : <MetricSkeleton className="totals-skeleton" />;
   return <div className="totals-page">
-    <PageHeader title="总收入与总成本" description="全站统计 · 按调用发生时间查看已计价收入与已知上游成本。" />
+    <PageHeader title="本利汇算" description="全站调用的总售价、历史上游成本与利润率，人民币。" />
     <section className="totals-scope" aria-label="统计时间范围">
       <div className="totals-dates">
-        <label className="f"><span>开始时间（UTC+8）</span><input type="datetime-local" step="1" value={dateValue(from)} onChange={event => changeDate("from", event.target.value)} /></label>
-        <label className="f"><span>结束时间（不含）</span><input type="datetime-local" step="1" value={dateValue(to)} onChange={event => changeDate("to", event.target.value)} /></label>
+        <label className="f"><span>开始时间（UTC+8）</span><input type="datetime-local" step="1" disabled={allTime} value={dateValue(from ?? fallback.from)} onChange={event => changeDate("from", event.target.value)} /></label>
+        <label className="f"><span>结束时间（不含）</span><input type="datetime-local" step="1" disabled={allTime} value={dateValue(to ?? fallback.to)} onChange={event => changeDate("to", event.target.value)} /></label>
       </div>
       <div className="totals-actions">
         <div className="totals-presets" aria-label="快捷时间范围">
+          <Button size="sm" kind="quiet" aria-pressed={allTime} onClick={() => update({ from: undefined, to: undefined })}>全部时间</Button>
+          <Button size="sm" kind="quiet" aria-pressed={!allTime} onClick={() => update({ from: from ?? fallback.from, to: to ?? fallback.to })}>指定时间段</Button>
           <Button size="sm" kind="quiet" onClick={() => selectRange(1)}>最近 24 小时</Button>
           <Button size="sm" kind="quiet" onClick={() => selectRange(7)}>最近 7 天</Button>
           <Button size="sm" kind="quiet" onClick={() => selectRange(30)}>最近 30 天</Button>
@@ -80,39 +70,54 @@ export function Totals(_props: TabProps) {
       </div>
     </section>
     {rangeError && <p className="totals-error" role="alert">{rangeError}</p>}
-    <p className="totals-window">{fmtBeijing(from)} — {fmtBeijing(to)}（UTC+8，结束时间不含），最多查询 92 天。</p>
+    <p className="totals-window">{allTime ? "全部时间 · 人民币会计历史。" : `${fmtBeijing(from ?? "")} — ${fmtBeijing(to ?? "")}（UTC+8，结束时间不含）`}</p>
     {loading && <span role="status" className="sr-only">正在加载总量统计</span>}
     <div className="totals-metrics">
-      <Card className="totals-metric" aria-label="总收入统计" aria-busy={!usage && !usageError}>
-        <CardHeader title="调用收入" description="已计价收费，含净费用调整，人民币" />
-        {usage ? <>
-          <Metric size="figure" className="totals-value">{revenue == null ? "—" : fmtMicroCny(revenue)}</Metric>
+      <Card className="totals-metric" aria-label="总收入统计" aria-busy={loading}>
+        <CardHeader title="总售价 · 调用收入" description="已计价收费，含净费用调整" />
+        {data ? <>
+          <Metric size="figure" className="totals-value">{fmtMicroCny(data.revenueMicroCny)}</Metric>
           <dl className="totals-facts">
-            <div><dt>计费尝试</dt><dd>{formatCount(usage.totals.billing_attempts)}</dd></div>
-            <div><dt>待计价尝试</dt><dd>{formatCount(unpriced)}</dd></div>
-            <div><dt>已含费用调整</dt><dd>{adjusted == null ? "—" : fmtMicroCny(adjusted)}</dd></div>
+            <div><dt>计价记录</dt><dd>{formatCount(data.rows)}</dd></div>
+            <div><dt>待计价记录</dt><dd>{formatCount(data.unpricedRows)}</dd></div>
+            <div><dt>已含费用调整</dt><dd>{fmtMicroCny(data.adjustedMicroCny)}</dd></div>
           </dl>
-          {revenue == null ? <p className="totals-warning" role="status">收入金额未提供，暂不显示总额。</p> : unpriced == null ? <p className="totals-warning" role="status">计价覆盖信息未提供，无法确认收入是否完整。</p> : unpriced > 0 ? <p className="totals-warning" role="status">{formatCount(unpriced)} 次尝试仍待计价，当前为已计价收入小计，完成计价后可能变化。</p> : null}
-        </> : usageError ? <CardMessage onRetry={rangeError ? undefined : retry}>{usageError}</CardMessage> : <MetricSkeleton className="totals-skeleton" />}
-        <p className="totals-note">收入包含已计费重试，费用调整已计入且不重复相加。计费尝试包含免费与待计价尝试，待计价不代表免费。</p>
+          {data.unpricedRows > 0n && <p className="totals-warning" role="status">{formatCount(data.unpricedRows)} 笔记录仍待计价，当前为已计价收入小计，完成计价后可能变化。</p>}
+        </> : pending}
+        <p className="totals-note">收入包含已计费重试，费用调整已计入且不重复相加。充值流水不计入调用收入。</p>
       </Card>
-      <Card className="totals-metric" aria-label="总成本统计" aria-busy={!cost && !costError}>
-        <CardHeader title="已计费记录的已知成本" description="历史上游成本，人民币" />
-        {cost ? <>
-          <Metric size="figure" className="totals-value">{cost.knownCostMicroCny === null ? "—" : fmtMicroCny(cost.knownCostMicroCny)}</Metric>
+      <Card className="totals-metric" aria-label="总成本统计" aria-busy={loading}>
+        <CardHeader title={complete ? "总成本" : "已知成本小计"} description="已计费记录的历史上游成本" />
+        {data ? <>
+          <Metric size="figure" className="totals-value">{costKnown ? fmtMicroCny(data.knownCostMicroCny) : "—"}</Metric>
           <dl className="totals-facts">
-            <div><dt>成本已知的记录</dt><dd>{formatCount(cost.rowsWithCost)}</dd></div>
-            <div><dt>成本缺失的记录</dt><dd>{formatCount(cost.rowsWithoutCost)}</dd></div>
+            <div><dt>成本已知的记录</dt><dd>{formatCount(data.rowsWithCost)}</dd></div>
+            <div><dt>成本缺失的记录</dt><dd>{formatCount(data.rowsWithoutCost)}</dd></div>
+            <div><dt>缺失成本对应收入</dt><dd>{fmtMicroCny(data.revenueWithoutCostMicroCny)}</dd></div>
           </dl>
-          {cost.rowsWithoutCost !== null && cost.rowsWithoutCost > 0n ? <p className="totals-warning" role="status">{formatCount(cost.rowsWithoutCost)} 笔记录缺失成本，当前仅为已知成本小计，不代表完整总成本。</p> : cost.knownCostMicroCny === null ? <p className="totals-warning" role="status">金额或覆盖数据不完整，暂不显示总额。</p> : cost.rowsWithCost === 0n ? <p className="totals-note">此窗口没有已收费或已重定价记录。</p> : null}
-        </> : costError ? <CardMessage onRetry={rangeError ? undefined : retry}>{costError}</CardMessage> : <MetricSkeleton className="totals-skeleton" />}
-        <p className="totals-note">仅含已收费或存在费用调整的记录。未定价、豁免及无应收费用的调用不在此成本范围内；未知成本不按零计算。</p>
+          {!complete && <p className="totals-warning" role="status">{data.rowsWithoutCost > 0n ? `${formatCount(data.rowsWithoutCost)} 笔已计费记录缺失成本。` : "仍有待计价记录。"}当前仅为已知成本小计，不代表完整总成本。</p>}
+        </> : pending}
+        <p className="totals-note">成本仅含已收费或存在费用调整的记录。未知成本不按零计算，不使用当前费率估算历史成本。</p>
+      </Card>
+      <Card className="totals-metric" aria-label="利润率统计" aria-busy={loading}>
+        <CardHeader title="完整利润率" description="利润 ÷ 总售价" />
+        {data ? <>
+          <Metric size="figure" className="totals-value">{data.marginPct === null ? "—" : `${data.marginPct}%`}</Metric>
+          <dl className="totals-facts">
+            <div><dt>完整利润</dt><dd>{data.profitMicroCny === null ? "—" : fmtMicroCny(data.profitMicroCny)}</dd></div>
+            <div><dt>已知成本部分收入</dt><dd>{fmtMicroCny(data.revenueWithCostMicroCny)}</dd></div>
+            <div><dt>已知成本部分利润</dt><dd>{data.knownProfitMicroCny === null ? "—" : fmtMicroCny(data.knownProfitMicroCny)}</dd></div>
+            <div><dt>已知成本部分利润率</dt><dd>{data.knownMarginPct === null ? "—" : `${data.knownMarginPct}%`}</dd></div>
+          </dl>
+          {!complete ? <p className="totals-warning" role="status">收入或成本尚不完整，完整利润与利润率未知；已知部分只对成本已知的同一批记录汇算。</p> : data.marginPct === null ? <p className="totals-note">总售价不大于零时，利润率无定义。</p> : null}
+        </> : pending}
+        <p className="totals-note">利润率按收入加权汇算，不平均各模型的百分比；亏损保留负值。</p>
       </Card>
     </div>
     <section className="totals-method" aria-label="统计口径">
       <h2>统计口径</h2>
-      <p>收入汇总已计价调用收费与净费用调整，以原调用的用量发生时间归期；充值流水不计入收入，费用调整的入账时间不改变归期。成本使用同范围内当笔记录的已知上游成本，缺失成本单列，不使用当前费率重新估算。</p>
-      <p>两项统计使用相同时间窗口，分别独立查询；记录持续写入或重定价时，结果可能存在短暂差异。</p>
+      <p>本页仅汇总人民币会计历史。总售价汇总已计价调用收费与净费用调整，以原调用的用量发生时间归期；费用调整的入账时间不改变归期。成本采用同范围内当笔已计费记录的历史上游成本。</p>
+      <p>收入、成本与覆盖笔数来自同一统计快照。成本缺失或仍有待计价记录时，不推算完整利润；已知部分的利润以成本已知记录的收入减去其成本。</p>
     </section>
   </div>;
 }

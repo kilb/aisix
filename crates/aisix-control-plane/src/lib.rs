@@ -399,6 +399,10 @@ where
         WriteCtx::of(&state),
         stopping.clone(),
     ));
+    tasks.push(billing::profit_projection::spawn(
+        state.db.clone(),
+        stopping.clone(),
+    ));
     tasks.push(native_objects::spawn(state.clone(), stopping.clone()));
     tasks.push(model_assessments::spawn(state.clone(), stopping.clone()));
     if let Some((listener, tls, _)) = dp {

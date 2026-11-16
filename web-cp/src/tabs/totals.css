@@ -8,7 +8,7 @@
 .totals-page .totals-actions { display: flex; flex: 1 1 auto; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 16px; min-width: 0; }
 .totals-page .totals-presets { display: flex; flex-wrap: wrap; gap: 4px; }
 .totals-page .totals-window { margin: 0; color: var(--text-muted); font-size: var(--text-caption); overflow-wrap: anywhere; }
-.totals-page .totals-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; min-width: 0; }
+.totals-page .totals-metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; min-width: 0; }
 .totals-page .totals-metric { display: flex; flex-direction: column; min-width: 0; gap: 18px; }
 .totals-page .totals-metric .bento-card-header { margin-bottom: 0; }
 .totals-page .totals-value { overflow-wrap: anywhere; }
@@ -25,6 +25,9 @@
 .totals-page .totals-method { display: grid; gap: 8px; padding: 16px 0; border-top: 1px solid var(--border); color: var(--text-muted); font-size: var(--text-caption); }
 .totals-page .totals-method h2 { margin: 0; color: var(--foreground); font-size: var(--text-small); font-weight: 600; }
 .totals-page .totals-method p { margin: 0; line-height: 1.7; }
+@media (min-width: 768px) and (max-width: 1100px) {
+  .totals-page .totals-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
 @media (max-width: 767px) {
   .totals-page .totals-metrics { grid-template-columns: minmax(0, 1fr); }
   .totals-page .totals-dates { width: 100%; }

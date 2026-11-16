@@ -28,6 +28,8 @@ pub mod lookup_requests;
 pub mod marks;
 pub mod money;
 pub mod plans;
+pub mod profit_projection;
+pub mod profit_summary;
 pub mod range;
 pub mod reconcile;
 pub mod repricing;
