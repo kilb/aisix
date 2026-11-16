@@ -15,6 +15,7 @@ import { RecordTablePager } from "../ui/RecordTable";
 import { Card, CardHeader, PageHeader } from "./page";
 import { DataTable } from "../ui/DataTable";
 import { TrendChart } from "./charts";
+import { OUTPUT_THROUGHPUT_NOTE } from "./UsagePerformance";
 import "./DirectModelMonitoring.css";
 
 function formatTps(value: number | null | undefined): string {
@@ -58,7 +59,7 @@ function ModelRow({ model }: { model: DirectModelMetricRow }) {
         <div><dt>上游首帧延迟</dt><dd>P50 {formatDuration(model.upstream_ttft_ms.p50)} · P95 {formatDuration(model.upstream_ttft_ms.p95)} · P99 {formatDuration(model.upstream_ttft_ms.p99)}<Sample value={model.upstream_ttft_ms} /></dd></div>
         <div><dt>客户端首 token 延迟</dt><dd>P50 {formatDuration(model.first_token_latency_ms.p50)} · P95 {formatDuration(model.first_token_latency_ms.p95)}<Sample value={model.first_token_latency_ms} /></dd></div>
         <div><dt>上游尝试耗时</dt><dd>P50 {formatDuration(model.attempt_duration_ms.p50)} · P95 {formatDuration(model.attempt_duration_ms.p95)}<Sample value={model.attempt_duration_ms} /></dd></div>
-        <div><dt>生成吞吐分布</dt><dd>P50 {formatTps(model.throughput_tps.p50)} · P95 {formatTps(model.throughput_tps.p95)}<Sample value={model.throughput_tps} /></dd></div>
+        <div><dt title={OUTPUT_THROUGHPUT_NOTE}>输出 TPS 分布</dt><dd>P50 {formatTps(model.throughput_tps.p50)} · P95 {formatTps(model.throughput_tps.p95)}<Sample value={model.throughput_tps} /></dd></div>
         <div><dt>成功与未知结果</dt><dd>成功 {formatCount(model.succeeded_attempts)} · 失败 {formatCount(model.failed_attempts)} · 未知 {formatCount(model.unknown_outcome_attempts)}</dd></div>
         <div><dt>归属与排除记录</dt><dd>归属 {formatCount(model.attributed_attempts)} · 排除 {formatCount(model.excluded_attempts)} · 无法确认派发 {formatCount(model.unmeasured_attempts)}</dd></div>
         <div><dt>Token 用量样本</dt><dd>已报告 {formatCount(model.tokens.known_usage_attempts)} · 未报告 {formatCount(model.tokens.unknown_usage_attempts)}</dd></div>
@@ -155,17 +156,17 @@ export function DirectModelMonitoring() {
       <section><h2>失败率</h2><strong>{formatRatio(totals?.failure_rate)}</strong><p>失败 {formatCount(totals?.failed_attempts)} · 成功 {formatCount(totals?.succeeded_attempts)} · 未知 {formatCount(totals?.unknown_outcome_attempts)}</p></section>
       <section><h2>首 token 延迟 · P50</h2><strong>{formatDuration(totals?.first_token_latency_ms.p50)}</strong><p>实测 {formatCount(totals?.first_token_latency_ms.sample_count)} · 上游首帧 P50 {formatDuration(totals?.upstream_ttft_ms.p50)}</p></section>
       <section><h2>缓存 token 命中率</h2><strong>{formatRatio(totals?.tokens.cache_hit_rate)}</strong><p>命中 {formatCount(totals?.tokens.cache_measured_hit_tokens)} / 已采样输入 {formatCount(totals?.tokens.cache_measured_input_tokens)} · 未报告 {formatCount(totals?.tokens.cache_missing_attempts)}</p></section>
-      <section><h2>生成吞吐 · TPS</h2><strong>{formatTps(totals?.throughput_tps.avg)}</strong><p>实测 {formatCount(totals?.throughput_tps.sample_count)} · 缺失 {formatCount(totals?.throughput_tps.missing_count)}</p></section>
+      <section><h2 title={OUTPUT_THROUGHPUT_NOTE}>输出 TPS</h2><strong>{formatTps(totals?.throughput_tps.avg)}</strong><p>实测 {formatCount(totals?.throughput_tps.sample_count)} · 缺失 {formatCount(totals?.throughput_tps.missing_count)}</p></section>
     </div>
     {data && <p className="direct-monitor-window">{fmtBeijing(data.from)} — {fmtBeijing(data.to)}（UTC+8，结束时间不含）</p>}
     <div className="direct-monitor-trends">{trends.map(trend => <Card key={trend.title}><CardHeader title={trend.title} /><TrendChart accessibleLabel={trend.title} points={trend.points} formatValue={trend.format} emptyLabel="当前范围没有实测数据" /></Card>)}</div>
     <Card className="direct-monitor-catalogue" aria-labelledby={`${id}-models`}>
       <div className="direct-monitor-list-toolbar"><h2 id={`${id}-models`}>直连模型<span>{formatCount(data ? models.length : null)} / {formatCount(data?.models.length)}</span></h2>
         <label className="direct-monitor-search"><Search size={16} aria-hidden /><span className="vh">搜索监测模型</span><input type="search" placeholder="搜索已加载模型或账号" value={search} onChange={event => setSearch(event.target.value)} /></label>
-        <label><span className="vh">监测模型排序</span><Select aria-label="监测模型排序" value={order} onValueChange={selectedValue => setOrder(selectedValue)}><option value="name">按模型名称</option><option value="failure">失败率从高到低</option><option value="latency">首帧 P95 从高到低</option><option value="tps">TPS 从高到低</option></Select></label>
+        <label><span className="vh">监测模型排序</span><Select aria-label="监测模型排序" value={order} onValueChange={selectedValue => setOrder(selectedValue)}><option value="name">按模型名称</option><option value="failure">失败率从高到低</option><option value="latency">首帧 P95 从高到低</option><option value="tps">输出 TPS 从高到低</option></Select></label>
       </div>
       <p className="direct-monitor-list-note">搜索与排序只调整模型列表；概览和趋势仍使用完整筛选范围。</p>
-      {data && models.length === 0 ? <EmptyState text={search ? "没有匹配的模型，请调整搜索。" : "当前范围没有直连模型，请调整筛选。"} /> : <DataTable label="直连模型监测" className="direct-monitor-table"><thead><tr><th>模型 / 上游账号</th><th className="num">上游尝试</th><th className="num">失败率</th><th className="num">首 token 延迟 · P50</th><th className="num">缓存 token 命中率</th><th className="num">生成吞吐 · TPS</th><th className="right">操作</th></tr></thead><tbody>{table.rows.map(model => <ModelRow key={`${model.model.id}/${model.provider_key.id ?? ""}`} model={model} />)}</tbody></DataTable>}
+      {data && models.length === 0 ? <EmptyState text={search ? "没有匹配的模型，请调整搜索。" : "当前范围没有直连模型，请调整筛选。"} /> : <DataTable label="直连模型监测" className="direct-monitor-table"><thead><tr><th>模型 / 上游账号</th><th className="num">上游尝试</th><th className="num">失败率</th><th className="num">首 token 延迟 · P50</th><th className="num">缓存 token 命中率</th><th className="num" title={OUTPUT_THROUGHPUT_NOTE}>输出 TPS</th><th className="right">操作</th></tr></thead><tbody>{table.rows.map(model => <ModelRow key={`${model.model.id}/${model.provider_key.id ?? ""}`} model={model} />)}</tbody></DataTable>}
       {data && <RecordTablePager label="监测模型分页" page={table.page} pageSize={table.pageSize} total={table.filteredCount} onPageChange={table.setPage} onPageSizeChange={table.setPageSize} />}
     </Card>
     <details className="direct-monitor-method"><summary>统计口径<ChevronDown size={16} aria-hidden /></summary><div>
@@ -174,7 +175,7 @@ export function DirectModelMonitoring() {
       <p><ArrowDownRight size={16} aria-hidden />失败率分母只包含已知成功与失败；无流量或未知结果不会当作成功。</p>
       <p>上游首帧记录首个流式帧，可能只是元数据；客户端首 token 记录首次交付生成内容。两者不是同一时钟，不能直接相减；缺失记录保留为未知。</p>
       <p>缓存 token 命中率仅计算明确上报缓存计数的尝试，采用命中 token / 同批样本输入；区分输入内的缓存子集与额外缓存读写。未报告缓存计数的尝试单独展示，不按未命中计算。</p>
-      <p>TPS 从成功流式记录的每输出 token 延迟计算：单次为 1000 / TPOT，汇总按输出 token 间隔数加权；无有效采样显示 —。含网关估算用量的记录不纳入实测 TPS，计入缺失；标记无法区分仅输入估算，因此也可能排除输出已由上游报告的记录。调用记录保留 ≈ 参考速度。</p>
+      <p>输出 TPS = 输出 Token（含推理，不含输入）÷ 完整上游耗时（毫秒换算为秒）。汇总使用有效输出 Token 合计 ÷ 有效完整上游耗时合计（毫秒换算为秒）；P50 / P95 使用同一单次完整上游耗时口径。不要求流式或 TTFT；无有效采样显示 —。含网关估算用量的记录不纳入实测输出 TPS，计入缺失；标记无法区分仅输入估算，因此也可能排除输出已由上游报告的记录。调用记录保留 ≈ 参考速度。</p>
     </div></details>
   </div>;
 }

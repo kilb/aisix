@@ -96,3 +96,11 @@ test("含估算用量的列表与详情保留参考 TPS 和独立首字", () => 
   assert.deepEqual([...section[1]!.matchAll(/<dd>(.*?)<\/dd>/g)].map(match => match[1]!), ["0 ms", "2.53 s", "≈ 84.13"]);
   assert.match(text(markup), /输出\s*11\s*Token/);
 });
+
+// 非流式不再整体排除；缺失 TPS 仍由 API 决定，客户端不能补算。
+test("详情显示输出 TPS 完整上游口径，不沿用首帧后的限制", () => {
+  const content = text(renderToStaticMarkup(createElement(DetailsUnderTest, { call: base })));
+  assert.ok(content.includes("输出 TPS"));
+  assert.ok(content.includes("完整上游耗时"));
+  assert.doesNotMatch(content, /非流式或旧记录|TPS 不使用总用时估算/);
+});

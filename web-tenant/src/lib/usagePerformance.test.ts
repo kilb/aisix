@@ -16,7 +16,8 @@ const compiled = await build({
 const loaded = { exports: {} };
 new Function("require", "module", "exports", compiled.outputFiles[0]!.text)(require, loaded, loaded.exports);
 const { UsagePerformance } = loaded.exports as { UsagePerformance: ComponentType<{ data: Record<string, unknown> }> };
-const values = (data: Record<string, unknown>) => [...renderToStaticMarkup(createElement(UsagePerformance, { data })).matchAll(/<dd>(.*?)<\/dd>/g)].map(match => match[1]);
+const markup = (data: Record<string, unknown>) => renderToStaticMarkup(createElement(UsagePerformance, { data }));
+const values = (data: Record<string, unknown>) => [...markup(data).matchAll(/<dd>(.*?)<\/dd>/g)].map(match => match[1]);
 
 test("实测零首字保留，完整耗时和独立TPS分别展示", () => {
   assert.deepEqual(values({ first_token_latency_ms: 0, attempt_duration_ms: 2531, throughput_tps: 84.125, latency_ms: 999 }), ["0 ms", "2.53 s", "84.13"]);
@@ -34,4 +35,16 @@ test("含估算用量保留参考 TPS，首字独立且未知不补数", () => {
   assert.deepEqual(values({ first_token_latency_ms: 0, attempt_duration_ms: 2531, throughput_tps: 84.125, usage_estimated: true }), ["0 ms", "2.53 s", "≈ 84.13"]);
   for (const usage_estimated of [false, null, undefined]) assert.equal(values({ throughput_tps: 84.125, usage_estimated })[2], "84.13");
   assert.deepEqual(values({ first_token_latency_ms: 0, throughput_tps: null, usage_estimated: true }), ["0 ms", "—", "—"]);
+});
+
+// 旧的首帧后速率说明或模糊标签必须失败；数值仍只来自 API。
+test("输出 TPS 明示完整上游耗时口径，独立于输入和首帧时钟", () => {
+  const data = { throughput_tps: 60.391978121, attempt_duration_ms: 4388, first_token_latency_ms: 5072, upstream_ttft_ms: 4136, time_per_output_token_ms: 0.95454545, prompt_tokens: 2, cache_read_tokens: 308467, completion_tokens: 265, reasoning_tokens: 120 };
+  const rendered = markup(data);
+  assert.match(rendered, /<dt>输出 TPS<\/dt>/);
+  assert.match(rendered, /title="输出 Token（含推理，不含输入）÷ 完整上游耗时"/);
+  assert.doesNotMatch(rendered, /首帧后的生成间隔|1000 \/ TPOT/);
+  assert.equal(values(data)[2], "60.39");
+  assert.equal(values({ ...data, throughput_tps: 7.125 })[2], "7.13");
+  assert.equal(values({ ...data, throughput_tps: null })[2], "—");
 });

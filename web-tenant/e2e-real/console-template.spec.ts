@@ -151,6 +151,8 @@ test("key and member dialogs retain complete actions without saving", async ({ p
   await expect(page.getByRole("button", { name: "创建账号", exact: true })).toBeVisible();
 });
 
+const OUTPUT_TPS_TITLE = /^输出 Token（含推理，不含输入）÷ 完整上游耗时(?:；.+)?$/;
+
 test("real call records retain tokens, TTFT, output TPS and right drawer", async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 1000 });
   await login(page, auth.metricsOwner);
@@ -173,10 +175,15 @@ test("real call records retain tokens, TTFT, output TPS and right drawer", async
     await expect(table.getByRole("row").filter({ hasText: requestId })).toHaveCount(count);
   }
   await expect(table.getByRole("columnheader")).toContainText(["时间", "模型"]);
-  await expect(table).toContainText("TPS");
+  const tpsLabels = table.locator("dt").and(table.getByText("输出 TPS", { exact: true }));
+  await expect(tpsLabels).toHaveCount(calls.length);
+  for (const label of await tpsLabels.all()) await expect(label.locator("xpath=..")).toHaveAttribute("title", OUTPUT_TPS_TITLE);
   const details = table.getByRole("button", { name: /详情|查看/ }).first();
   await details.click();
   const drawer = page.getByRole("dialog"); await expect(drawer).toBeVisible();
+  const drawerTps = drawer.locator("dt").and(drawer.getByText("输出 TPS", { exact: true }));
+  await expect(drawerTps).toHaveCount(1);
+  await expect(drawerTps.locator("xpath=..")).toHaveAttribute("title", OUTPUT_TPS_TITLE);
   await expect.poll(async () => {
     const box = await drawer.boundingBox();
     return box ? Math.round(box.x + box.width) : null;

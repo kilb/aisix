@@ -53,3 +53,9 @@ RecordTable为记录集合的筛选分页基础设施，DataTable旧API保持。
 ## 状态和样式钩子
 
 note/ok/warn/crit 以相应语义边框、浅色底与文字呈现；失败 role=alert，成功 role=status 不变。tag、hint、field-problem、cell-note、trunc（title含完整文本）、vh、cur/unit、money/num/tabular 均保留。两步确认、秘密显示、对话框焦点、field refusal、权限和数据请求属于业务合同，换皮不得放宽。
+
+## 输出 TPS
+
+调用记录与详情统一标为“输出 TPS”：输出 Token（含推理，不含输入）÷ 完整上游耗时（秒）。输出以服务端规范化口径为准，已包含的推理 Token 不重复相加，输入与缓存 Token 不进入分子。前端只格式化 API 的 `throughput_tps`，不从 Token、首字、上游首帧、TPOT 或其它耗时重算，不补缺失值、不限幅。历史记录缺少有效输出或完整上游耗时时显示 —；非流式记录不因缺少首帧而被排除。
+
+`usage_estimated === true` 时调用记录保留 ≈ 参考速度；缺少来源标记不推断估算发生在哪一方向。模型监测排除含估算用量的记录，平均值为有效输出 Token 合计 ÷ 有效完整上游耗时合计（秒），P50/P95 采用同口径的单次输出 TPS；无有效采样显示 —。底层 TPOT 指标和模型主动探测的端到端速率保持独立。

@@ -14,6 +14,8 @@ for (const url of [state.adminUrl, state.tenantUrl]) {
 
 const writes = new WeakMap<Page, string[]>();
 const runtimeErrors = new WeakMap<Page, string[]>();
+const OUTPUT_TPS_TITLE = /^输出 Token（含推理，不含输入）÷ 完整上游耗时(?:；.+)?$/;
+
 interface LatencyAnswer { sample_count: number; missing_count: number; avg: number | null; p50: number | null; p95: number | null; p99: number | null }
 interface ValuesAnswer {
   attempts: number; succeeded_attempts: number; failed_attempts: number; failure_rate: number | null;
@@ -39,7 +41,7 @@ async function assertModelValues(page: Page, model: ModelAnswer) {
   await expect(modelField(card, "首 token 延迟 · P50")).toContainText(`上游首帧 ${durationText(model.upstream_ttft_ms.p50)}`);
   await expect(modelField(card, "缓存 token 命中率").locator("dd")).toHaveText(ratioText(model.tokens.cache_hit_rate));
   await expect(modelField(card, "缓存 token 命中率")).toContainText(`命中 ${countText(model.tokens.cache_measured_hit_tokens)} / 已采样输入 ${countText(model.tokens.cache_measured_input_tokens)}`);
-  await expect(modelField(card, "生成吞吐 · TPS").locator("dd")).toHaveText(tpsText(model.throughput_tps.avg));
+  await expect(modelField(card, "输出 TPS").locator("dd")).toHaveText(tpsText(model.throughput_tps.avg));
   const details = card.locator("details");
   await details.locator("summary").click();
   await expect(modelField(card, "上游首帧延迟")).toContainText(`P50 ${durationText(model.upstream_ttft_ms.p50)} · P95 ${durationText(model.upstream_ttft_ms.p95)} · P99 ${durationText(model.upstream_ttft_ms.p99)}`);
@@ -208,13 +210,14 @@ test("direct model monitoring reads real attempt metrics and remains usable on n
   const cards = page.locator("article").filter({ has: page.getByText("上游尝试", { exact: true }) });
   const modelName = [...data.models].sort((left, right) => left.model.name.localeCompare(right.model.name))[0]!.model.name;
   await expect(cards.first().getByRole("heading", { level: 3 })).toHaveText(modelName);
-  for (const label of ["失败率", "首 token 延迟 · P50", "缓存 token 命中率", "生成吞吐 · TPS"]) await expect(page.getByRole("heading", { name: label, exact: true })).toBeVisible();
+  for (const label of ["失败率", "首 token 延迟 · P50", "缓存 token 命中率", "输出 TPS"]) await expect(page.getByRole("heading", { name: label, exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "输出 TPS", exact: true })).toHaveAttribute("title", OUTPUT_TPS_TITLE);
   for (const [label, value] of [
     ["上游尝试", countText(data.totals.attempts)],
     ["失败率", ratioText(data.totals.failure_rate)],
     ["首 token 延迟 · P50", durationText(data.totals.first_token_latency_ms.p50)],
     ["缓存 token 命中率", ratioText(data.totals.tokens.cache_hit_rate)],
-    ["生成吞吐 · TPS", tpsText(data.totals.throughput_tps.avg)],
+    ["输出 TPS", tpsText(data.totals.throughput_tps.avg)],
   ]) {
     const kpi = page.locator("section").filter({ has: page.getByRole("heading", { name: label, exact: true }) });
     await expect(kpi.locator(":scope > strong")).toHaveText(value!);

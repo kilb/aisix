@@ -12,7 +12,7 @@ import { Loading } from "../ui/DataTable";
 import { ChargeCheck } from "../tabs/billing/Charges";
 import { RequestTimingDetails } from "./RequestTimingDetails";
 import { UsageIoAuditDetails } from "./UsageIoAuditDetails";
-import { ESTIMATED_THROUGHPUT_NOTE, formatThroughput } from "./UsagePerformance";
+import { ESTIMATED_THROUGHPUT_NOTE, OUTPUT_THROUGHPUT_NOTE, formatThroughput } from "./UsagePerformance";
 import { Card, CardHeader, PageHeader } from "./page";
 import "./CallLogDetails.css";
 
@@ -27,8 +27,8 @@ interface LogResult {
 const numberValue = (value: unknown) => typeof value === "number" && Number.isFinite(value) ? value : null;
 const timeValue = (value: unknown) => typeof value === "string" && Number.isFinite(Date.parse(value)) ? fmtBeijing(value) : logValue(value);
 
-function Fields({ items }: { items: [string, unknown][] }) {
-  return <dl className="call-log-fields">{items.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{logValue(value)}</dd></div>)}</dl>;
+function Fields({ items }: { items: [string, unknown, string?][] }) {
+  return <dl className="call-log-fields">{items.map(([label, value, title]) => <div key={label}><dt title={title}>{label}</dt><dd>{logValue(value)}</dd></div>)}</dl>;
 }
 
 /** 正文与 JSON 只展示已保存内容，长行换行且复制保持完整。 */
@@ -124,7 +124,7 @@ export function CallLogDetails({ eventId, backHref }: { eventId: string; backHre
             ["上游尝试耗时", formatDuration(numberValue(event?.upstream_latency_ms ?? charge?.attempt_duration_ms))],
             ["客户端总耗时", formatDuration(numberValue(event?.downstream_latency_ms))],
             ["上游首帧延迟", formatDuration(numberValue(event?.upstream_ttft_ms))],
-            ["生成吞吐（Token/s）", formatThroughput(charge)],
+            ["输出 TPS", formatThroughput(charge), OUTPUT_THROUGHPUT_NOTE],
           ]} />
           {charge?.usage_estimated === true && <p className="hint">{ESTIMATED_THROUGHPUT_NOTE}</p>}
           <RequestTimingDetails data={event ? event.request_timing : charge?.request_timing} />

@@ -223,7 +223,7 @@ function CallLogDetails({ call: c }: { call: Call }) {
     <section className="tenant-call-section" aria-label="响应性能">
       <h3>响应性能</h3>
       <UsagePerformance data={c} />
-      <p className="hint">首字仅显示实测值；含估算用量的 TPS 标为 ≈，仅供参考。用量标记无法区分输入或输出估算。无内容、非流式或旧记录未采集时显示 —，TPS 不使用总用时估算。</p>
+      <p className="hint">首字仅显示实测值；输出 TPS 为输出 Token（含推理，不含输入）÷ 完整上游耗时。含估算用量时标为 ≈，仅供参考；用量标记无法区分输入或输出估算。无有效指标或旧记录未采集时显示 —，不以其它指标代替。</p>
     </section>
     <section className="tenant-call-section" aria-label="Token 消耗">
       <h3>Token 消耗</h3>
@@ -643,7 +643,7 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
       <RecordTableToolbar search={{ value: searchQuery, onChange: value => update({ q: value }), label: "搜索已加载调用", placeholder: "模型、密钥、成员或请求 ID" }} />
       {query.get("member_id") && <p className="hint" role="status">已按成员 {query.get("member_id")} 筛选。</p>}
       <p className="hint">文字搜索仅筛选已加载记录；调用结果与更多筛选作用于全部匹配记录。</p>
-      <p className="hint">首字仅显示实测值；含估算用量的 TPS 标为 ≈，仅供参考。用量标记无法区分输入或输出估算。无内容、非流式或旧记录未采集时显示 —，TPS 不使用总用时估算。</p>
+      <p className="hint">首字仅显示实测值；输出 TPS 为输出 Token（含推理，不含输入）÷ 完整上游耗时。含估算用量时标为 ≈，仅供参考；用量标记无法区分输入或输出估算。无有效指标或旧记录未采集时显示 —，不以其它指标代替。</p>
       <p className="mt-4 text-caption text-fg-3">调用记录按计费尝试逐条展示，同一请求可能有多条记录。{rows !== null ? `已加载 ${rows.length.toLocaleString("en-US")} 条${next !== null ? "，还有更多记录" : ""}；这些记录不代表整个汇总窗口的成功率或延迟分布。` : ""}</p>
       {err && (
         <div className="note crit" role="alert">

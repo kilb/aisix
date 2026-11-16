@@ -204,6 +204,8 @@ for (const width of [1440, 390]) {
   });
 }
 
+const OUTPUT_TPS_TITLE = /^输出 Token（含推理，不含输入）÷ 完整上游耗时(?:；.+)?$/;
+
 interface Call extends Record<string, unknown> {
   event_id: string; error_message: string | null; first_token_latency_ms: number | null; throughput_tps: number | null; usage_estimated: boolean | null;
   charge_micro_cny: number | string | null; cost_micro_cny: number | string | null;
@@ -323,7 +325,8 @@ for (const width of [1440, 390]) {
     const eventId = call!.event_id, filter = `calls?event_id=${encodeURIComponent(eventId)}`;
     const filteredRead = page.waitForResponse(response => isCallList(response, eventId)); await navigate(page, filter); expect((await filteredRead).status()).toBe(200);
     const link = page.getByRole("link", { name: `查看调用日志 ${eventId}`, exact: true }), row = page.getByRole("row").filter({ has: link });
-    await expect(row).toHaveCount(1); await checkDuration(field(row, "首字"), call!.first_token_latency_ms); await checkThroughput(field(row, "TPS"), call!);
+    await expect(row).toHaveCount(1); await checkDuration(field(row, "首字"), call!.first_token_latency_ms); await checkThroughput(field(row, "输出 TPS"), call!);
+    await expect(field(row, "输出 TPS").locator("xpath=..")).toHaveAttribute("title", OUTPUT_TPS_TITLE);
     await expect(row.getByText(estimate(call!), { exact: true })).toBeVisible();
     const fee = await row.locator("td").filter({ has: page.getByText("售价", { exact: true }) }).innerText();
     const split = fee.indexOf("成本"); expect(split).toBeGreaterThanOrEqual(0);
@@ -338,7 +341,8 @@ for (const width of [1440, 390]) {
     await expect(page.getByRole("table", { name: "计费明细", exact: true })).toBeHidden();
     const performance = page.getByRole("region", { name: "时间与性能", exact: true });
     await checkDuration(field(performance, "首 Token 延迟"), typeof stored.event.first_token_latency_ms === "number" ? stored.event.first_token_latency_ms : call!.first_token_latency_ms);
-    await checkThroughput(field(performance, "生成吞吐（Token/s）"), call!);
+    await checkThroughput(field(performance, "输出 TPS"), call!);
+    await expect(field(performance, "输出 TPS").locator("xpath=preceding-sibling::dt[1]")).toHaveAttribute("title", OUTPUT_TPS_TITLE);
     const message = stored.event.error_message ?? call!.error_message; expect(typeof message).toBe("string"); expect((message as string).length).toBeGreaterThan(0);
     await expect(page.getByRole("region", { name: "错误信息", exact: true }).locator("pre")).toHaveText(message as string);
     await expect(page.getByRole("button", { name: "复制错误信息", exact: true })).toBeVisible();

@@ -2,6 +2,8 @@ import { expect, test, type Locator, type Page } from "@playwright/test";
 import { mkdirSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
+const OUTPUT_TPS_TITLE = /^输出 Token（含推理，不含输入）÷ 完整上游耗时(?:；.+)?$/;
+
 interface Scenario { kind: "positive" | "missing"; event_id: string; request_id: string; tenant_auth: "metricsOwner" }
 interface CallRecord {
   event_id: string; request_id: string; first_token_latency_ms: number | null; attempt_duration_ms: number | null; throughput_tps: number | null;
@@ -128,18 +130,19 @@ test("real-call-list-preserves-measured-performance-token-usage-and-unknowns", a
       await expect(definition(tokens, label)).toHaveText(value == null ? "—" : `${new Intl.NumberFormat("en-US").format(value)} Token`);
     }
     const performance = row.getByLabel("响应性能", { exact: true });
+    await expect(definition(performance, "输出 TPS").locator("xpath=..")).toHaveAttribute("title", OUTPUT_TPS_TITLE);
     await expectDuration(definition(performance, "首字"), call.first_token_latency_ms);
     await expectDuration(definition(performance, "总用时"), call.attempt_duration_ms);
     if (scenario.kind === "positive") {
       expect(call.first_token_latency_ms).not.toBeNull(); expect(call.first_token_latency_ms!).toBeGreaterThanOrEqual(0);
       expect(call.throughput_tps).not.toBeNull(); expect(call.throughput_tps!).toBeGreaterThan(0);
-      expect(Number((await definition(performance, "TPS").innerText()).replaceAll(",", ""))).toBeCloseTo(call.throughput_tps!, 2);
+      expect(Number((await definition(performance, "输出 TPS").innerText()).replaceAll(",", ""))).toBeCloseTo(call.throughput_tps!, 2);
       expect(call.usage_input_tokens).toBeGreaterThan(0); expect(call.usage?.completion_tokens).toBeGreaterThan(0);
       expect(call.charge.status).toBe("charged"); expect(call.charge.calculation.final_micro_cny).not.toBeNull();
       await expectCharge(row.locator('td[data-label="费用"]'), call.charge.calculation.final_micro_cny!);
     } else {
       expect(call.first_token_latency_ms).toBeNull(); expect(call.throughput_tps).toBeNull();
-      await expect(definition(performance, "TPS")).toHaveText("—");
+      await expect(definition(performance, "输出 TPS")).toHaveText("—");
     }
     await expect(row).toContainText("按字节估算 Token");
     await screenshot(page, `tenant-call-list-1440-${scenario.kind}.png`);
@@ -157,6 +160,10 @@ test("real-call-drawer-keeps-fee-details-keyboard-focus-and-no-extra-requests", 
   await expect(dialog).toBeVisible();
   for (const label of ["请求信息", "响应性能", "Token 消耗", "费用计算", "计费明细"]) await expect(dialog.getByRole("heading", { name: label, exact: true })).toBeVisible();
   await expect(dialog.getByText(positive.request_id, { exact: true })).toBeVisible();
+  const performance = dialog.getByRole("region", { name: "响应性能", exact: true }).getByLabel("响应性能", { exact: true });
+  await expect(definition(performance, "输出 TPS").locator("xpath=..")).toHaveAttribute("title", OUTPUT_TPS_TITLE);
+  expect(call.throughput_tps).not.toBeNull(); expect(call.throughput_tps!).toBeGreaterThan(0);
+  expect(Number((await definition(performance, "输出 TPS").innerText()).replaceAll(",", ""))).toBeCloseTo(call.throughput_tps!, 2);
   await expectCharge(definition(dialog.getByRole("region", { name: "费用计算", exact: true }), "最终费用"), call.charge.calculation.final_micro_cny!);
   for (let i = 0; i < 6; i++) {
     await page.keyboard.press("Tab");
