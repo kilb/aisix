@@ -176,7 +176,10 @@ test("public-model-route-edit-preserves-targets-settings-and-price-entry", async
   await checkLayout(page, form, "public-route-edit-1440");
   await expect(page.getByRole("heading", { name: "基准价联动", exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "重新生成", exact: true })).toBeEnabled();
-  await chooseSelect(form.getByRole("combobox", { name: "同级分配方式", exact: true }), { label: "同级按请求加权轮询" });
+  const strategy = form.getByRole("combobox", { name: "同级分配方式", exact: true });
+  await expect(strategy).toHaveText("同级按请求加权轮询");
+  // 公共模型省略默认轮询策略；选择非默认策略后，读回必须明确包含该键。
+  await chooseSelect(strategy, { label: "同级固定顺序" });
   await form.getByLabel("重试次数", { exact: true }).fill("2");
   await form.getByLabel("最多切换几个目标", { exact: true }).fill("0");
   await form.getByLabel("额外重试的状态码", { exact: true }).fill("408");
@@ -193,7 +196,7 @@ test("public-model-route-edit-preserves-targets-settings-and-price-entry", async
   expect((await saved).status()).toBe(200);
   await settle(page);
   const stored = await api(page, `/admin/public-models/${model.id}`);
-  expect(stored.routing).toMatchObject({ strategy: "round_robin", retries: 2, max_fallbacks: 0, retry_on_429: true, fallback_on_statuses: [408] });
+  expect(stored.routing).toMatchObject({ strategy: "failover", retries: 2, max_fallbacks: 0, retry_on_429: true, fallback_on_statuses: [408] });
   expect(stored.served_by).toHaveLength(1);
   expect(stored.served_by[0]).toMatchObject({ provider_key_id: accountId, upstream_model: upstream, priority: 30, weight: 7, enabled: true });
   await expect(target.getByLabel("优先级", { exact: true })).toHaveValue("30");
@@ -202,6 +205,7 @@ test("public-model-route-edit-preserves-targets-settings-and-price-entry", async
   await expect(page.getByRole("heading", { name: "公共模型与路由", exact: true, level: 1 })).toBeVisible();
   await page.getByRole("searchbox", { name: "搜索公共模型", exact: true }).fill(name);
   await page.getByRole("button", { name, exact: true }).click();
+  await expect(strategy).toHaveText("同级固定顺序");
   await expect(form.getByLabel("重试次数", { exact: true })).toHaveValue("2");
 });
 
