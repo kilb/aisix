@@ -61,6 +61,7 @@ import { createServer, connect } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { uniquePorts } from "./cp-dev-ports.mjs";
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const OPERATOR_EMAIL = "ops@e2e.local";
@@ -569,15 +570,21 @@ async function startTelemetryRelay(host, targetPort) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+  const choosePort = uniquePorts({
+    "http-port": port(args["http-port"], "http-port"),
+    "dp-port": port(args["dp-port"], "dp-port"),
+    "kine-port": port(args["kine-port"], "kine-port"),
+    ...(args.gateway !== undefined ? { "proxy-port": port(args["proxy-port"], "proxy-port") } : {}),
+  }, freePort);
   const pgUrl = process.env.CP_E2E_PG_URL;
   if (!pgUrl) return fail("CP_E2E_PG_URL is required");
   const kineBin = process.env.CP_E2E_KINE_BIN || "kine";
   const cpBin = resolve(REPO, process.env.CP_E2E_BIN || "target/debug/aisix-control-plane");
   assertFresh(cpBin);
 
-  const httpPort = port(args["http-port"], "http-port") ?? (await freePort());
-  const dpPort = port(args["dp-port"], "dp-port") ?? (await freePort());
-  const kinePort = port(args["kine-port"], "kine-port") ?? (await freePort());
+  const httpPort = await choosePort("http-port");
+  const dpPort = await choosePort("dp-port");
+  const kinePort = await choosePort("kine-port");
   const etcdPrefix = args["etcd-prefix"] ?? "/aisix";
   const staleSecs = args["stale-secs"] ?? "10";
 
@@ -664,8 +671,8 @@ async function main() {
 
   if (args.gateway !== undefined) {
     const name = args["gateway-name"] ?? "stack-gw";
-    const proxyPort = port(args["proxy-port"], "proxy-port") ?? (await freePort());
-    const metricsPort = await freePort();
+    const proxyPort = await choosePort("proxy-port");
+    const metricsPort = await choosePort("metrics-port");
     const issued = await api(httpUrl, "POST", "/admin/gateways/credentials", cookie, { name });
     const gwDir = join(tempDir, "gateway");
     const gwEnv = { ...baseEnv() };

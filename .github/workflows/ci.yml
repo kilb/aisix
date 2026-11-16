@@ -36,6 +36,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
+      # trainer 是独立 workspace，主 workspace 的测试不会执行它。
+      - name: PGO trainer tests
+        run: cargo test --manifest-path bench/pgo-training/trainer/Cargo.toml --locked
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: check guardrails without provider features
@@ -716,6 +719,8 @@ jobs:
         with:
           # Same version as the e2e jobs: see the note on `version` there.
           version: 11
+      - name: control-plane stack port tests
+        run: node --test scripts/cp-dev-ports.test.mjs
       - name: tsc --noEmit
         run: |
           # tests/e2e locks with pnpm, so `npm ci` cannot install it. It installs

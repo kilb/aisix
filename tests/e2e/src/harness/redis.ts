@@ -1,5 +1,6 @@
 import { connect } from "node:net";
 import { onCI } from "./etcd.js";
+import { redactUrlForLog } from "./url-redact.js";
 
 /**
  * What a Redis endpoint turned out to be:
@@ -18,25 +19,60 @@ export type RedisNeed = "any" | "vector" | "plain";
 
 const ATTEMPTS = 3;
 
-function hostPort(url: string): { host: string; port: number } | null {
-  const m = /^redis:\/\/(?:[^@/]*@)?([^:/]+)(?::(\d+))?/.exec(url);
-  if (!m) return null;
-  return { host: m[1], port: m[2] ? Number(m[2]) : 6379 };
+interface RedisTarget {
+  host: string;
+  port: number;
+  auth?: string[];
 }
 
-/** The first reply chunk to one RESP command, or `null` on error/timeout. */
-function firstReply(url: string, command: string, timeoutMs: number): Promise<string | null> {
-  const target = hostPort(url);
-  if (!target) return Promise.resolve(null);
+function redisTarget(raw: string): RedisTarget | null {
+  try {
+    const url = new URL(raw);
+    if (url.protocol !== "redis:" || !url.hostname) return null;
+    const username = decodeURIComponent(url.username);
+    const password = decodeURIComponent(url.password);
+    return {
+      host: url.hostname.replace(/^\[|\]$/g, ""),
+      port: url.port ? Number(url.port) : 6379,
+      auth: username ? ["AUTH", username, password] : password ? ["AUTH", password] : undefined,
+    };
+  } catch (error) {
+    if (error instanceof TypeError || error instanceof URIError) return null;
+    throw error;
+  }
+}
+
+/** The first RESP reply line, or `null` on error/timeout. */
+function firstReply(target: RedisTarget, command: string, deadline: number): Promise<string | null> {
   return new Promise((resolve) => {
-    const sock = connect(target, () => sock.write(`${command}\r\n`));
+    let authenticated = !target.auth;
+    let reply = "";
+    const sock = connect({ host: target.host, port: target.port }, () => {
+      // RESP 的字节长度保留空格、CRLF 与非 ASCII 密码，不把凭据拼成内联命令。
+      const auth = target.auth;
+      sock.write(auth
+        ? `*${auth.length}\r\n${auth.map((part) => `$${Buffer.byteLength(part)}\r\n${part}\r\n`).join("")}`
+        : `${command}\r\n`);
+    });
     const done = (v: string | null) => {
+      clearTimeout(timer);
       sock.destroy();
       resolve(v);
     };
-    sock.once("data", (buf) => done(buf.toString()));
+    // AUTH 和实际命令共用绝对期限，零碎响应不能刷新探测预算。
+    const timer = setTimeout(() => done(null), Math.max(0, deadline - Date.now()));
+    sock.on("data", (buf) => {
+      reply += buf.toString();
+      const end = reply.indexOf("\r\n");
+      if (end < 0) return;
+      const line = reply.slice(0, end + 2);
+      if (authenticated || line !== "+OK\r\n") return done(line);
+      authenticated = true;
+      reply = "";
+      sock.write(`${command}\r\n`);
+    });
     sock.once("error", () => done(null));
-    sock.setTimeout(timeoutMs, () => done(null));
+    sock.once("end", () => done(null));
   });
 }
 
@@ -48,22 +84,28 @@ function firstReply(url: string, command: string, timeoutMs: number): Promise<st
 export async function probeRedis(url: string): Promise<RedisCapability> {
   // Plaintext RESP probe: a rediss:// target cannot be probed this way —
   // that is "unknown", not "unsupported".
-  if (/^rediss:\/\//.test(url) || !hostPort(url)) return "unknown";
+  const target = redisTarget(url);
+  if (!target) return "unknown";
+  let found: RedisCapability = "unreachable";
   for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
-    const pong = await firstReply(url, "PING", 1000 * attempt);
-    if (pong === null) {
-      if (attempt < ATTEMPTS) await new Promise((r) => setTimeout(r, 500 * attempt));
-      continue;
+    // 每次原有的 1/2/3 秒预算覆盖连接、AUTH、PING 与 FT._LIST，不增加重试次数。
+    const deadline = Date.now() + 1000 * attempt;
+    const pong = await firstReply(target, "PING", deadline);
+    if (pong !== null) {
+      found = "unknown";
+      if (pong.startsWith("+PONG")) {
+        const ft = await firstReply(target, "FT._LIST", deadline);
+        if (ft?.startsWith("*")) return "vector";
+        // 只有明确的未知命令才能证明不支持向量搜索；LOADING 仍需在原预算内重试。
+        if (ft !== null && /^-ERR unknown command/i.test(ft)) return "plain";
+        if (!ft?.startsWith("-LOADING")) return "unknown";
+      } else if (!pong.startsWith("-LOADING")) {
+        return "unknown";
+      }
     }
-    if (!pong.startsWith("+PONG")) return "unknown";
-    const ft = await firstReply(url, "FT._LIST", 1000 * attempt);
-    if (ft?.startsWith("*")) return "vector";
-    // Only an explicit unknown-command error PROVES the capability is
-    // absent; anything else proves nothing either way.
-    if (ft !== null && /^-ERR unknown command/i.test(ft)) return "plain";
-    return "unknown";
+    if (attempt < ATTEMPTS) await new Promise((r) => setTimeout(r, 500 * attempt));
   }
-  return "unreachable";
+  return found;
 }
 
 function satisfies(found: RedisCapability, need: RedisNeed): boolean {
@@ -87,7 +129,7 @@ export async function redisReady(url: string, need: RedisNeed): Promise<boolean>
   if (satisfies(found, need)) return true;
   if (onCI()) {
     throw new Error(
-      `redis at ${url} is ${found}, but this suite needs ${need === "any" ? "a reachable redis" : `a ${need} redis`}. ` +
+      `redis at ${redactUrlForLog(url)} is ${found}, but this suite needs ${need === "any" ? "a reachable redis" : `a ${need} redis`}. ` +
         "Skipping here would drop the suite and still pass the run. Check the redis services in " +
         ".github/workflows/ci.yml against AISIX_E2E_REDIS / AISIX_E2E_REDIS_PLAIN.",
     );
