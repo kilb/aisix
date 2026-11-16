@@ -307,7 +307,7 @@ for (const surface of ['admin', 'tenant']) {
           keys: '密钥',
           operators: '运维账号',
           resources: '全部资源',
-          totals: '总收入与总成本'
+          totals: '本利汇算'
         } : {
           usage: '用量分析',
           calls: '调用记录',
@@ -504,109 +504,109 @@ function detailValue(region, label) {
     exact: true
   })).locator('xpath=following-sibling::dd[1]');
 }
+// 本利汇算改为一份原子快照；历史金额独立校验，真实新增失败只允许零费用。
+function layoutMoney(raw) {
+  const value = BigInt(raw), absolute = value < 0n ? -value : value;
+  const whole = (absolute / 1000000n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  let fraction = (absolute % 1000000n).toString().padStart(6, '0');
+  while (fraction.length > 2 && fraction.endsWith('0')) fraction = fraction.slice(0, -1);
+  return `${value < 0n ? '-' : ''}¥${whole}.${fraction}`;
+}
 for (const width of [1440, 1280, 390, 1920]) {
-  test(`admin total revenue and unknown cost match retained real charges and both APIs at ${width}`, async ({ page }) => {
+  test(`admin revenue and unknown full profit match retained charges and one atomic snapshot at ${width}`, async ({ page }) => {
     await page.setViewportSize({ width, height: 1000 });
     const base = await login(page, 'admin'), oracle = totalsOracle();
-    expect(oracle.revenueMicroCny, 'read-only original money snapshot is positive').toBe('79');
+    expect(oracle.revenueMicroCny, 'original read-only business money remains positive').toBe('79');
     expect(oracle.missingCostRows).toBe(2); expect(oracle.knownCostRows).toBe(0);
     const query = new URLSearchParams(oracle.window);
     await navigate(page, base, 'totals?' + query);
-    await expect(page.locator('main h1')).toHaveText('总收入与总成本');
-    const [metrics, margin, charges] = await Promise.all([
-      get(page, '/admin/usage/metrics?' + query),
-      get(page, '/admin/pricing/margin?' + query),
-      get(page, '/admin/pricing/charges?' + query + '&limit=50'),
+    await expect(page.locator('main h1')).toHaveText('本利汇算');
+    const [snapshot, charges] = await Promise.all([
+      get(page, '/admin/billing/profit-summary?' + query),
+      get(page, '/admin/pricing/charges?' + query + '&limit=200'),
     ]);
-    for (const key of ['charged_micro_cny', 'adjusted_micro_cny', 'billing_attempts', 'unpriced_attempts']) {
-      expect(Object.hasOwn(metrics.totals, key), key + ' exists on wire').toBe(true);
+    const data = snapshot.totals;
+    for (const key of ['charged_micro_cny', 'adjusted_micro_cny', 'known_cost_micro_cny', 'charged_with_cost_micro_cny', 'rows_with_cost', 'rows_without_cost', 'rows', 'unpriced_rows']) {
+      expect(Object.hasOwn(data, key), key + ' exists on wire').toBe(true);
+      expect(typeof data[key], key + ' is a precise decimal string').toBe('string');
+      expect(data[key]).toMatch(/^-?\d+$/);
     }
-    expect(typeof metrics.totals.charged_micro_cny).toBe('string');
-    expect(typeof metrics.totals.adjusted_micro_cny).toBe('string');
-    expect(BigInt(metrics.totals.charged_micro_cny)).toBe(79n);
-    expect(BigInt(metrics.totals.adjusted_micro_cny)).toBe(BigInt(oracle.netAdjustmentsMicroCny));
-    expect(metrics.totals.billing_attempts).toBe(5);
-    expect(metrics.totals.unpriced_attempts).toBe(2);
-    expect(charges.items.map(row => row.event_id).sort()).toEqual(oracle.originalCharges.map(row => row.event_id).sort());
+    expect(charges.next_before, 'the independent money oracle includes every actual row').toBeNull();
+    const expectedIds = [...oracle.originalCharges, ...(oracle.additionalRealCharges ?? [])].map(row => row.event_id).sort();
+    expect(charges.items.map(row => row.event_id).sort()).toEqual(expectedIds);
+    for (const row of charges.items) for (const key of ['charge_micro_cny', 'adjusted_micro_cny', 'cost_micro_cny']) {
+      expect(Object.hasOwn(row, key), key + ' exists in the raw record').toBe(true);
+      expect(row[key] === null || Number.isSafeInteger(row[key]), key + ' is exact in this retained sample').toBe(true);
+    }
     const originalBase = oracle.originalCharges.reduce((sum, row) => sum + BigInt(row.charge_micro_cny ?? 0), 0n);
     const originalAdjustments = oracle.originalAdjustments.reduce((sum, row) => sum + BigInt(row.delta_micro_cny), 0n);
     const apiBase = charges.items.reduce((sum, row) => sum + BigInt(row.charge_micro_cny ?? 0), 0n);
+    const apiAdjustments = charges.items.reduce((sum, row) => sum + BigInt(row.adjusted_micro_cny ?? 0), 0n);
     expect(originalBase).toBe(79n); expect(originalAdjustments).toBe(0n); expect(apiBase).toBe(originalBase);
-    expect(originalBase + originalAdjustments, 'original charge snapshots plus net deltas independently reproduce income').toBe(BigInt(metrics.totals.charged_micro_cny));
-    expect(margin.items.length).toBeGreaterThan(0);
-    for (const item of margin.items) for (const key of ['cost_micro_cny', 'rows', 'rows_without_cost']) {
-      expect(Object.hasOwn(item, key), key + ' exists on wire').toBe(true);
+    expect(apiAdjustments).toBe(originalAdjustments);
+    for (const added of oracle.additionalRealCharges ?? []) {
+      const actual = charges.items.find(row => row.event_id === added.event_id);
+      expect(actual.charge_micro_cny, 'new rows came from real local transport failures').toBe(0);
+      expect(actual.error_class).toBe('transport');
     }
-    const known = margin.items.reduce((sum, item) => sum + BigInt(item.rows), 0n);
-    const missing = margin.items.reduce((sum, item) => sum + BigInt(item.rows_without_cost), 0n);
-    const cost = margin.items.reduce((sum, item) => sum + BigInt(item.cost_micro_cny), 0n);
-    expect(known).toBe(0n); expect(missing).toBe(2n); expect(cost).toBe(0n);
+    expect(BigInt(data.charged_micro_cny)).toBe(originalBase + originalAdjustments);
+    expect(BigInt(data.adjusted_micro_cny)).toBe(BigInt(oracle.netAdjustmentsMicroCny));
+    expect(BigInt(data.rows)).toBe(BigInt(charges.items.length));
+    expect(BigInt(data.unpriced_rows)).toBe(2n);
+    const known = BigInt(charges.items.filter(row => row.cost_micro_cny !== null).length);
+    const missing = BigInt(charges.items.filter(row => row.cost_micro_cny === null).length);
+    const cost = charges.items.reduce((sum, row) => sum + BigInt(row.cost_micro_cny ?? 0), 0n);
+    expect(missing).toBeGreaterThanOrEqual(BigInt(oracle.missingCostRows));
+    expect(BigInt(data.rows_with_cost)).toBe(known); expect(BigInt(data.rows_without_cost)).toBe(missing);
+    expect(BigInt(data.known_cost_micro_cny)).toBe(cost);
     const revenue = page.getByRole('region', { name: '总收入统计', exact: true });
     const costRegion = page.getByRole('region', { name: '总成本统计', exact: true });
-    await expect(revenue.getByRole('heading', { name: '调用收入', exact: true })).toBeVisible();
+    const profit = page.getByRole('region', { name: '利润率统计', exact: true });
     await expect(revenue.locator('.metric')).toHaveText('¥0.000079');
-    await expect(detailValue(revenue, '计费尝试')).toHaveText('5');
-    await expect(detailValue(revenue, '待计价尝试')).toHaveText('2');
+    expect(BigInt(data.rows), 'this real sample distinguishes all records from unpriced records').not.toBe(BigInt(data.unpriced_rows));
+    await expect(revenue.locator('dd').filter({ hasText: new RegExp('^' + String(charges.items.length) + '$') })).toHaveCount(1);
+    await expect(revenue.locator('dd').filter({ hasText: /^2$/ })).toHaveCount(1);
     await expect(detailValue(revenue, '已含费用调整')).toHaveText('¥0.00');
-    await expect(costRegion.locator('.metric')).toHaveText('—');
-    await expect(costRegion.getByText('¥0.00', { exact: true })).toHaveCount(0);
-    await expect(detailValue(costRegion, '成本缺失的记录')).toHaveText('2');
-    await expect(detailValue(costRegion, '成本已知的记录')).toHaveText('0');
-    await expect(costRegion.getByText('2 笔记录缺失成本，当前仅为已知成本小计，不代表完整总成本。', { exact: true })).toBeVisible();
+    await expect(costRegion.locator('.metric')).toHaveText(known === 0n ? '—' : layoutMoney(cost));
+    await expect(detailValue(costRegion, '成本缺失的记录')).toHaveText(String(missing));
+    await expect(detailValue(costRegion, '成本已知的记录')).toHaveText(String(known));
+    await expect(profit.locator('.metric')).toHaveText('—');
+    await expect(detailValue(profit, '完整利润')).toHaveText('—');
+    await expect(profit.getByText('收入或成本尚不完整，完整利润与利润率未知；已知部分只对成本已知的同一批记录汇算。', { exact: true })).toBeVisible();
     await noOverflow(page);
     if (width === 1920) {
       const main = await page.locator('main').boundingBox(); expect(main.x).toBe(268); expect(main.x + main.width).toBe(1904);
     }
-    await test.info().attach('real-revenue-and-cost-oracles', {
-      body: JSON.stringify({ window: oracle.window, chargedMicroCny: metrics.totals.charged_micro_cny, originalBase: originalBase.toString(), originalAdjustments: originalAdjustments.toString(), knownCostRows: known.toString(), missingCostRows: missing.toString() }),
-      contentType: 'application/json',
+    await test.info().attach('real-revenue-cost-and-profit-oracles', {
+      body: JSON.stringify({ window: oracle.window, snapshot: data, originalBase: originalBase.toString(), originalAdjustments: originalAdjustments.toString(), knownCostRows: known.toString(), missingCostRows: missing.toString() }), contentType: 'application/json',
     });
     await capture(page, 'admin-totals-real-income-and-unknown-cost-' + width);
   });
 }
-test('admin total empty window is zero and changing the preset keeps both aggregate windows identical', async ({
-  page
-}) => {
+test('admin empty profit window is zero and all-time uses one complete atomic scope', async ({ page }) => {
   const base = await login(page, 'admin');
-  const query = new URLSearchParams({
-    from: '2026-10-01T00:00:00Z',
-    to: '2026-10-02T00:00:00Z'
-  });
+  const query = new URLSearchParams({ from: '2026-10-01T00:00:00Z', to: '2026-10-02T00:00:00Z' });
   await navigate(page, base, 'totals?' + query);
-  const [metrics, margin] = await Promise.all([get(page, '/admin/usage/metrics?' + query), get(page, '/admin/pricing/margin?' + query)]);
-  expect(Object.hasOwn(metrics.totals, 'charged_micro_cny')).toBe(true);
-  expect(typeof metrics.totals.charged_micro_cny).toBe('string');
-  expect(BigInt(metrics.totals.charged_micro_cny)).toBe(0n);
-  expect(metrics.totals.billing_attempts).toBe(0);
-  expect(margin.items).toEqual([]);
-  await expect(page.getByRole('region', {
-    name: '总收入统计',
-    exact: true
-  }).locator('.metric')).toHaveText('¥0.00');
-  await expect(page.getByRole('region', {
-    name: '总成本统计',
-    exact: true
-  }).locator('.metric')).toHaveText('¥0.00');
+  const snapshot = await get(page, '/admin/billing/profit-summary?' + query);
+  expect(Object.hasOwn(snapshot, 'from')).toBe(true); expect(Object.hasOwn(snapshot, 'to')).toBe(true);
+  expect(Date.parse(snapshot.from)).toBe(Date.parse(query.get('from'))); expect(Date.parse(snapshot.to)).toBe(Date.parse(query.get('to')));
+  for (const key of ['charged_micro_cny', 'adjusted_micro_cny', 'known_cost_micro_cny', 'charged_with_cost_micro_cny', 'rows_with_cost', 'rows_without_cost', 'rows', 'unpriced_rows']) {
+    expect(Object.hasOwn(snapshot.totals, key), key + ' exists in empty scope').toBe(true);
+    expect(snapshot.totals[key]).toBe('0');
+  }
+  await expect(page.getByRole('region', { name: '总收入统计', exact: true }).locator('.metric')).toHaveText('¥0.00');
+  await expect(page.getByRole('region', { name: '总成本统计', exact: true }).locator('.metric')).toHaveText('¥0.00');
+  await expect(page.getByRole('region', { name: '利润率统计', exact: true }).locator('.metric')).toHaveText('—');
   await capture(page, 'admin-totals-real-empty-window');
-  const responses = Promise.all(['/admin/usage/metrics', '/admin/pricing/margin'].map(path => page.waitForResponse(r => new URL(r.url()).pathname === path && r.request().method() === 'GET')));
-  await page.getByRole('button', {
-    name: '最近 7 天',
-    exact: true
-  }).click();
-  const answers = await responses;
-  for (const answer of answers) expect(answer.status()).toBe(200);
-  const scopes = answers.map(r => {
-    const q = new URL(r.url()).searchParams;
-    return {
-      from: q.get('from'),
-      to: q.get('to')
-    };
-  });
-  expect(scopes[0]).toEqual(scopes[1]);
-  expect(new Date(scopes[0].to).getTime() - new Date(scopes[0].from).getTime()).toBe(7 * 24 * 60 * 60 * 1000);
-  await settle(page);
-  await noOverflow(page);
-  expect(health.get(page).responses.filter(x => x.path === '/admin/pricing/charges'), 'total statistics does not page charge rows').toEqual([]);
+  const waiting = page.waitForResponse(r => new URL(r.url()).pathname === '/admin/billing/profit-summary' && !new URL(r.url()).search && r.request().method() === 'GET');
+  await page.getByRole('button', { name: '全部时间', exact: true }).click();
+  const answer = await waiting; expect(answer.status()).toBe(200);
+  const all = await answer.json();
+  expect(Object.hasOwn(all, 'from')).toBe(true); expect(Object.hasOwn(all, 'to')).toBe(true);
+  expect(all.from).toBeNull(); expect(all.to).toBeNull(); expect(BigInt(all.totals.charged_micro_cny)).toBe(79n);
+  await expect(page.getByRole('button', { name: '全部时间', exact: true })).toHaveAttribute('aria-pressed', 'true');
+  await settle(page); await noOverflow(page);
+  expect(health.get(page).responses.filter(x => x.path === '/admin/pricing/charges'), 'the product summary never pages charge rows').toEqual([]);
 });
 test('tenant navigation and cookie cannot reach operator cost statistics', async ({ page }) => {
   const base = await login(page, 'tenant');
