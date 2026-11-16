@@ -20,6 +20,21 @@ const { DirectModelMonitoring } = loaded.exports as { DirectModelMonitoring: Com
 const markup = renderToStaticMarkup(createElement(DirectModelMonitoring));
 const text = markup.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
 
+// 恢复 24 小时或名称排序会分别使这两个默认展示断言失败。
+test("上游监测默认展示过去一小时", () => {
+  const times = [...markup.matchAll(/<input type="datetime-local"[^>]*value="([^"]+)"/g)].map(match => Date.parse(`${match[1]}+08:00`));
+  assert.equal(times.length, 2);
+  assert.ok(times.every(Number.isFinite));
+  assert.equal(times[1]! - times[0]!, 60 * 60 * 1000);
+});
+
+test("上游监测默认按失败率从高到低排序", () => {
+  const control = markup.match(/<button[^>]*aria-label="监测模型排序"[^>]*>[\s\S]*?<\/button>/)?.[0];
+  assert.ok(control, "必须渲染模型排序控件");
+  assert.match(control, /data-value="failure"/);
+  assert.match(control, />失败率从高到低</);
+});
+
 test("监测概览和模型表统一标为输出 TPS", () => {
   assert.match(markup, /<h2[^>]*>输出 TPS<\/h2>/);
   assert.match(markup, /<th[^>]*>输出 TPS<\/th>/);

@@ -72,7 +72,7 @@ function ModelRow({ model }: { model: DirectModelMetricRow }) {
 }
 
 type RequestState = { key: string; data: DirectModelMetricsResponse | null; error: string | null };
-const DEFAULT_RANGE_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_RANGE_MS = 60 * 60 * 1000;
 
 /** 输入完整条件后再查询，避免录入 UUID 时逐字触发无效请求。 */
 function ModelScopeFilters({ request, onApply }: { request: DirectModelMetricsQuery; onApply: (patch: Record<string, string>) => void }) {
@@ -113,7 +113,7 @@ export function DirectModelMonitoring() {
   const loadKey = `${requestKey}/${revision}`;
   const [state, setState] = useState<RequestState | null>(null);
   const [search, setSearch] = useState("");
-  const [order, setOrder] = useState("name");
+  const [order, setOrder] = useState("failure");
   const shown = state?.key === loadKey ? state : null;
   const data = rangeError ? null : shown?.data ?? null;
   const error = rangeError ?? shown?.error ?? null;
