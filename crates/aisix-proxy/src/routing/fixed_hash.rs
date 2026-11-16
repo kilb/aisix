@@ -121,6 +121,7 @@ pub(super) fn request_key(
     Ok(hash_key)
 }
 
+#[inline(never)]
 pub(super) fn resolve(
     registry: &RoutingRegistry,
     runtime: &crate::ModelRuntimeStatusTracker,
