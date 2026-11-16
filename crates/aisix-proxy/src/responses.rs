@@ -1254,6 +1254,11 @@ async fn dispatch(
             _ => None,
         };
         if let Some(hit) = hit {
+            crate::routing::validate_fixed_hash_cache_hit(
+                &model_entry.value,
+                client,
+                &auth.entry.id,
+            )?;
             let cache = crate::response_cache::CacheTelemetry::hit(&hit);
             // The cache answered for the entry the caller addressed: set the
             // target attribution before the output chain below can refuse it,

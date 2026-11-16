@@ -8,6 +8,7 @@ pub(super) struct FixedHashPool {
     accounts_generation: u64,
     allowed_groups: Vec<String>,
     targets: Vec<AttemptModel>,
+    tag_targets: Vec<RoutingTarget>,
     ring: HashRing,
 }
 
@@ -56,7 +57,7 @@ impl FixedHashPool {
             // 环点以真实账号资源标识命名，展示别名不参与本模式的归属。
             declarations.push(RoutingTarget {
                 model: account_id.to_string(),
-                model_id: None,
+                model_id: Some(entry.id.clone()),
                 ..configured.clone()
             });
         }
@@ -92,9 +93,32 @@ impl FixedHashPool {
             accounts_generation: snapshot.provider_keys.generation(),
             allowed_groups: groups.to_vec(),
             targets: keep.iter().map(|&index| targets[index].clone()).collect(),
+            tag_targets: declarations,
             ring,
         })
     }
+}
+
+pub(super) fn request_key(
+    routing: &Routing,
+    req: &RoutingRequest<'_>,
+) -> Result<String, ProxyError> {
+    if routing.strategy != RoutingStrategy::ConsistentHash
+        || routing.hash_on.as_ref().is_none_or(Vec::is_empty)
+    {
+        return Err(ProxyError::InvalidRequest(
+            "routing.hash_failover=false requires consistent_hash and an explicit hash_on chain"
+                .into(),
+        ));
+    }
+    let hash_key = resolve_hash_key(routing, req);
+    if hash_key.is_empty() {
+        return Err(ProxyError::InvalidRequest(
+            "routing.hash_on did not find a non-empty request header or other configured source"
+                .into(),
+        ));
+    }
+    Ok(hash_key)
 }
 
 pub(super) fn resolve(
@@ -109,21 +133,7 @@ pub(super) fn resolve(
         .routing
         .as_ref()
         .ok_or(ProxyError::ProviderUnavailable)?;
-    if routing.strategy != RoutingStrategy::ConsistentHash
-        || routing.hash_on.as_ref().is_none_or(Vec::is_empty)
-    {
-        return Err(ProxyError::InvalidRequest(
-            "routing.hash_failover=false requires consistent_hash and an explicit hash_on chain"
-                .into(),
-        ));
-    }
-    let hash_key = resolve_hash_key(routing, &req);
-    if hash_key.is_empty() {
-        return Err(ProxyError::InvalidRequest(
-            "routing.hash_on did not find a non-empty request header or other configured source"
-                .into(),
-        ));
-    }
+    let hash_key = request_key(routing, &req)?;
     let mut scope = FNV_OFFSET_BASIS;
     for group in req.allowed_groups {
         scope = fnv1a_extend(scope, &(group.len() as u64).to_le_bytes());
@@ -168,11 +178,11 @@ pub(super) fn resolve(
     if !selected.model.ip_allowed(req.source_ip) {
         return Err(ProxyError::ModelIpRestricted(name.to_string()));
     }
-    let allowed_by_tags = eligible_targets(&routing.targets, req.tags);
-    if !allowed_by_tags.iter().any(|target| {
-        target.model_id.as_deref() == Some(selected.id.as_str())
-            || (target.model_id.is_none() && target.model == selected.model.display_name)
-    }) || req.serves.is_some_and(|serves| !serves(&selected.model))
+    let allowed_by_tags = eligible_targets(&pool.tag_targets, req.tags);
+    if !allowed_by_tags
+        .iter()
+        .any(|target| target.model_id.as_deref() == Some(selected.id.as_str()))
+        || req.serves.is_some_and(|serves| !serves(&selected.model))
     {
         return Err(ProxyError::ProviderUnavailable);
     }

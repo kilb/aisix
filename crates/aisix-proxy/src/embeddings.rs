@@ -741,6 +741,11 @@ async fn dispatch(
             &client_ctx.source_ip,
         )?;
         if let Some(hit) = gate.lookup().await {
+            crate::routing::validate_fixed_hash_cache_hit(
+                &model_entry.value,
+                client_ctx,
+                &auth.entry.id,
+            )?;
             // The upstream was never called, so nothing was consumed —
             // release the reservation without spending tokens, exactly as
             // the chat gate does, and report the tokens the entry saved.

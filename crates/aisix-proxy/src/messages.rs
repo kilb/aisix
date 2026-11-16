@@ -900,6 +900,11 @@ async fn dispatch(
             &client.source_ip,
         )?;
         if let Some(hit) = gate.lookup().await {
+            crate::routing::validate_fixed_hash_cache_hit(
+                &model_entry.value,
+                client,
+                &auth.entry.id,
+            )?;
             let cache = crate::response_cache::CacheTelemetry::hit(&hit);
             // Answered from the cache, whichever way it exits: correct the
             // target attribution before the output chain below can refuse it,

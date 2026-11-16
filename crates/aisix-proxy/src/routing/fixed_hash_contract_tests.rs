@@ -260,3 +260,133 @@ fn fixed_hash_cannot_promote_a_backup_when_the_primary_cools() {
     status.mark_cooldown("id-a", Duration::from_secs(60), "test");
     assert!(pick(&registry, &status, &snapshot, &group, &headers, None).is_err());
 }
+
+#[test]
+fn fixed_hash_default_tag_fallback_uses_only_its_authorized_scope() {
+    // 未授权账号的标签匹配不能压掉已授权账号的 default 回退。
+    let snapshot = snapshot();
+    for (id, group) in [("account-a", "ga"), ("account-b", "gb")] {
+        let entry = snapshot.provider_keys.get_by_id(id).unwrap();
+        let mut provider = (*entry.value).clone();
+        provider.groups = vec![group.to_string()];
+        snapshot
+            .provider_keys
+            .insert(ResourceEntry::new(id, provider, 2));
+    }
+    let mut group = group(false);
+    let routing = Arc::make_mut(&mut group).routing.as_mut().unwrap();
+    routing.targets[0].tags = Some(vec!["default".to_string()]);
+    routing.targets[1].tags = Some(vec!["premium".to_string()]);
+    let headers = headers(0);
+    let attempts = resolve_attempt_models(
+        &RoutingRegistry::new(),
+        &crate::ModelRuntimeStatusTracker::new(),
+        &LivePricingIndex::new(),
+        &snapshot,
+        "sessions",
+        "group-id",
+        &group,
+        RoutingRequest {
+            tags: &["premium".to_string()],
+            headers: Some(&headers),
+            allowed_groups: &["ga".to_string()],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(
+        attempts[0].model.provider_key_id.as_deref(),
+        Some("account-a")
+    );
+}
+
+#[tokio::test]
+async fn fixed_hash_cache_hits_still_require_the_configured_session_header() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // 必须先证明已命中缓存；删掉任一入口的会话检查后，该入口会返回 200。
+    for (endpoint, body) in [
+        (
+            "/v1/messages",
+            json!({"model":"sessions","max_tokens":10,"messages":[{"role":"user","content":"hello"}]}),
+        ),
+        ("/v1/responses", json!({"model":"sessions","input":"hello"})),
+        (
+            "/v1/embeddings",
+            json!({"model":"sessions","input":"hello"}),
+        ),
+    ] {
+        let peer = MockServer::builder().start().await;
+        Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id":"cmpl-cached","object":"chat.completion","created":0,"model":"upstream",
+                "choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],
+                "data":[{"object":"embedding","index":0,"embedding":[1.0,0.0]}],
+                "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+            }))).expect(1).mount(&peer).await;
+        let snapshot = snapshot();
+        for account in ["account-a", "account-b"] {
+            let entry = snapshot.provider_keys.get_by_id(account).unwrap();
+            let mut provider = (*entry.value).clone();
+            provider.api_base = Some(format!("{}/v1", peer.uri()));
+            snapshot
+                .provider_keys
+                .insert(ResourceEntry::new(account, provider, 2));
+        }
+        snapshot
+            .models
+            .insert(ResourceEntry::new("group-id", (*group(false)).clone(), 1));
+        snapshot.apikeys.insert(ResourceEntry::new(
+            "cache-caller",
+            serde_json::from_value::<aisix_core::ApiKey>(json!({
+                "key_hash":aisix_core::ApiKey::hash_bearer("fixed-cache-key"),"allowed_models":["*"]
+            }))
+            .unwrap(),
+            1,
+        ));
+        snapshot.cache_policies.insert(ResourceEntry::new("cache-policy",
+            serde_json::from_value::<aisix_core::CachePolicy>(json!({
+                "name":"fixed-cache","enabled":true,"backend":"memory","ttl_seconds":60,"applies_to":"all"
+            })).unwrap(),1));
+        let hub = Arc::new(aisix_gateway::Hub::new());
+        hub.register_specialized(
+            "openai",
+            Arc::new(aisix_provider_openai::OpenAiBridge::new()),
+        );
+        let config = serde_json::from_value::<aisix_core::ProxyConfig>(json!({
+            "addr":"127.0.0.1:0","expose_debug_headers":true
+        }))
+        .unwrap();
+        let app = crate::build_router(crate::ProxyState::new(
+            aisix_core::snapshot::SnapshotHandle::new(snapshot),
+            hub,
+            &config,
+        ));
+        let request = |session: bool| {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri(endpoint)
+                .header("authorization", "Bearer fixed-cache-key")
+                .header("content-type", "application/json");
+            if session {
+                request = request.header("session-id", "fixed-cache-session");
+            }
+            request.body(Body::from(body.to_string())).unwrap()
+        };
+        let first = app.clone().oneshot(request(true)).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK, "{endpoint}");
+        let hit = app.clone().oneshot(request(true)).await.unwrap();
+        assert_eq!(hit.status(), StatusCode::OK, "{endpoint}");
+        assert_eq!(
+            hit.headers().get(crate::chat::CACHE_HEADER).unwrap(),
+            "hit",
+            "{endpoint}"
+        );
+        let missing = app.oneshot(request(false)).await.unwrap();
+        assert_eq!(missing.status(), StatusCode::BAD_REQUEST, "{endpoint}");
+    }
+}

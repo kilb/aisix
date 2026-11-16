@@ -1518,6 +1518,30 @@ fn resolve_hash_key(routing: &Routing, req: &RoutingRequest<'_>) -> String {
     String::new()
 }
 
+/// 缓存命中不会走派发解析，但固定来源的请求要求仍须成立；miss 不重复解析。
+pub(crate) fn validate_fixed_hash_cache_hit(
+    model: &Model,
+    client: &crate::client_ip::ClientContext,
+    api_key_id: &str,
+) -> Result<(), ProxyError> {
+    if let Some(routing) = model
+        .routing
+        .as_ref()
+        .filter(|r| !r.hash_failover_or_default())
+    {
+        fixed_hash::request_key(
+            routing,
+            &RoutingRequest {
+                headers: Some(&client.headers),
+                api_key_id,
+                source_ip: &client.source_ip,
+                ..Default::default()
+            },
+        )?;
+    }
+    Ok(())
+}
+
 /// Extract a cookie's value from the request's `Cookie` header(s):
 /// `name=value` pairs separated by `;`, first match wins. Values are taken
 /// verbatim (no unquoting) — the key only needs to be stable, not parsed.
