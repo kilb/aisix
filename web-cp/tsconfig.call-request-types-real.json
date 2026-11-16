@@ -1,0 +1,4 @@
+{
+  "extends": "./tsconfig.json",
+  "include": ["src", "e2e-real/call-request-types-454.spec.ts", "playwright.call-request-types-real.config.ts"]
+}
