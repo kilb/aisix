@@ -79,6 +79,33 @@ impl DispatchFailure {
         self.routing = routing;
         self
     }
+
+    fn with_refused_target(
+        self,
+        state: &ProxyState,
+        routing: &mut RoutingTelemetry,
+        target: crate::attempt::AttemptTarget<'_>,
+        provider_key_id: &str,
+    ) -> Self {
+        let (index, kind) = routing.begin_attempt(target);
+        routing.record(
+            state,
+            AttemptRecord {
+                index,
+                kind,
+                target_model: target.target_model.to_owned(),
+                target_model_id: target.model_id.to_owned(),
+                provider_key_id: provider_key_id.to_owned(),
+                status: self.err.status().as_u16(),
+                success: false,
+                error_class: crate::attempt::error_class(&self.err).to_owned(),
+                error_message: crate::attempt::gateway_error_message(&self.err),
+                latency_ms: 0,
+                dispatched: false,
+            },
+        );
+        self.with_routing(std::mem::take(routing))
+    }
 }
 
 // Per-attempt cooldown decision lives in `crate::cooldown` so every
@@ -1930,22 +1957,6 @@ async fn dispatch(
             (attempts, None)
         };
 
-    // 缓存命中前拒绝覆盖规则注入的私有引用；实际派发仍用选定账号复验。
-    if !virtual_entry.value.is_ensemble() {
-        for attempt in &attempt_models {
-            let Ok(key) = crate::dispatch::resolve_provider_key(snapshot, &attempt.model) else {
-                continue;
-            };
-            let Some(bridge) = crate::dispatch::resolve_bridge(&state.hub, &key.value) else {
-                continue;
-            };
-            if bridge.wire_protocol() == "openai" {
-                crate::native_api::voices::chat_voice_after_overrides(req, &key.value)
-                    .map_err(&with_model)?;
-            }
-        }
-    }
-
     // For non-routing requests, surface a misconfigured bridge as a
     // proper 503 rather than burying it inside a generic Bridge error.
     // Routing requests rely on the loop's `is_retryable` path so a
@@ -2104,9 +2115,25 @@ async fn dispatch(
             };
 
             if bridge.wire_protocol() == "openai" {
+                let mut reject_voice = |error| {
+                    with_model(error).with_refused_target(
+                        state,
+                        &mut stream_routing,
+                        crate::attempt::AttemptTarget {
+                            display_name: &model.display_name,
+                            target_model: if is_routing_request {
+                                &model.display_name
+                            } else {
+                                ""
+                            },
+                            model_id: &attempt.id,
+                        },
+                        &pk_entry.id,
+                    )
+                };
                 if let Some(voice) =
                     crate::native_api::voices::chat_voice_after_overrides(req, &pk_entry.value)
-                        .map_err(&with_model)?
+                        .map_err(&mut reject_voice)?
                 {
                     crate::native_api::voices::validate_voice_for_target(
                         state,
@@ -2120,7 +2147,7 @@ async fn dispatch(
                         aisix_core::models::EndpointFamily::ChatCompletions,
                     )
                     .await
-                    .map_err(&with_model)?;
+                    .map_err(&mut reject_voice)?;
                 }
             }
 
@@ -3014,6 +3041,24 @@ async fn dispatch(
         cc.no_cache = true;
         cc.no_store = true;
     }
+    // 只有实际可读的缓存才检查全部候选；不安全时旁路缓存，不让未选中的备用配置拒绝请求。
+    // 真正派发仍在所选目标上执行完整的私有引用校验。
+    if policy_cache.is_some()
+        && !cc.no_cache
+        && attempt_models.iter().any(|attempt| {
+            let Ok(key) = crate::dispatch::resolve_provider_key(snapshot, &attempt.model) else {
+                return false;
+            };
+            let Some(bridge) = crate::dispatch::resolve_bridge(&state.hub, &key.value) else {
+                return false;
+            };
+            bridge.wire_protocol() == "openai"
+                && crate::native_api::voices::chat_voice_after_overrides(req, &key.value).is_err()
+        })
+    {
+        cc.no_cache = true;
+        cc.no_store = true;
+    }
 
     // Cache lookup keyed on the *virtual* model name so a re-request
     // hits the cache regardless of which target served the original,
@@ -3556,9 +3601,25 @@ async fn dispatch(
         };
 
         if bridge.wire_protocol() == "openai" {
+            let mut reject_voice = |error| {
+                with_model(error).with_refused_target(
+                    state,
+                    &mut routing,
+                    crate::attempt::AttemptTarget {
+                        display_name: &model.display_name,
+                        target_model: if is_routing_request {
+                            &model.display_name
+                        } else {
+                            ""
+                        },
+                        model_id: &attempt.id,
+                    },
+                    &pk_entry.id,
+                )
+            };
             if let Some(voice) =
                 crate::native_api::voices::chat_voice_after_overrides(req, &pk_entry.value)
-                    .map_err(&with_model)?
+                    .map_err(&mut reject_voice)?
             {
                 crate::native_api::voices::validate_voice_for_target(
                     state,
@@ -3572,7 +3633,7 @@ async fn dispatch(
                     aisix_core::models::EndpointFamily::ChatCompletions,
                 )
                 .await
-                .map_err(&with_model)?;
+                .map_err(&mut reject_voice)?;
             }
         }
 

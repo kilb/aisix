@@ -2013,6 +2013,7 @@ pub(crate) async fn exported_for(
 
 #[cfg(test)]
 mod tests {
+    include!("chat_voice_cache_tests.rs");
     include!("request_timing_tests.rs");
     include!("ttft_capture_tests.rs");
     use super::*;
