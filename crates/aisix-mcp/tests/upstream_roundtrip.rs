@@ -801,11 +801,14 @@ enum Paging {
     /// This many pages, one tool each, every tool carrying a
     /// [`LARGE_DESCRIPTION_BYTES`] description.
     LargePages(usize),
+    /// 空工具页，每个继续游标恰好 1 MiB，且互不相同。
+    LargeCursors(usize),
 }
 
 /// A description size well inside one page's own transport cap, so only the
 /// pages added together can outgrow what a downstream client reads.
 const LARGE_DESCRIPTION_BYTES: usize = 6 * 1024 * 1024;
+const LARGE_CURSOR_BYTES: usize = 1024 * 1024;
 
 /// A real MCP server that hands its tool list out a page at a time — the
 /// `nextCursor` contract of `tools/list`.
@@ -828,6 +831,17 @@ impl ServerHandler for PagedServer {
         if page == 0 {
             return Err(ErrorData::invalid_params("unknown cursor", None));
         }
+        if let Paging::LargeCursors(pages) = self.0 {
+            let mut result = ListToolsResult::with_all_items(Vec::new());
+            if page < pages {
+                let next = (page + 1).to_string();
+                result.next_cursor = Some(format!(
+                    "page-{}{next}",
+                    "0".repeat(LARGE_CURSOR_BYTES - 5 - next.len())
+                ));
+            }
+            return Ok(result);
+        }
         if page >= 2 && matches!(self.0, Paging::StallsOnPageTwo) {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         }
@@ -843,7 +857,7 @@ impl ServerHandler for PagedServer {
         let mut result = ListToolsResult::with_all_items(vec![tool]);
         let last = match self.0 {
             Paging::ThreePages => page == 3,
-            Paging::LargePages(pages) => page == pages,
+            Paging::LargePages(pages) | Paging::LargeCursors(pages) => page == pages,
             Paging::Endless | Paging::SelfLoop | Paging::CursorCycle | Paging::StallsOnPageTwo => {
                 false
             }
@@ -957,6 +971,45 @@ async fn tools_list_stops_before_requesting_a_self_loop_cursor_again() {
 #[tokio::test]
 async fn tools_list_stops_before_requesting_an_a_b_a_cursor_cycle_again() {
     assert_cursor_cycle_stops(Paging::CursorCycle, 3).await;
+}
+
+#[tokio::test]
+async fn tools_list_empty_pages_cannot_retain_cursor_bytes_past_the_budget() {
+    let (addr, calls) = spawn_counted_paged_server(Paging::LargeCursors(16)).await;
+    let upstream = McpUpstream::new(format!("http://{addr}/mcp"));
+    let held = RmcpBridge::connect(&upstream).await.expect("connect");
+    let ephemeral = EphemeralBridge::new(upstream);
+    for bridge in [&held as &dyn McpBridge, &ephemeral] {
+        let before = calls.load(Ordering::SeqCst);
+        let err = bridge
+            .list_tools()
+            .await
+            .expect_err("15 MiB of distinct cursors must fail even without tools");
+        assert!(
+            matches!(&err, aisix_mcp::McpError::Request(message)
+                if message.contains("cursor") && message.contains("bytes")),
+            "{err}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst) - before,
+            15,
+            "the cursor beyond the 14 MiB budget must not be cloned or requested"
+        );
+    }
+}
+
+#[tokio::test]
+async fn tools_list_accepts_cursor_bytes_exactly_at_the_budget() {
+    let (addr, calls) = spawn_counted_paged_server(Paging::LargeCursors(15)).await;
+    let upstream = McpUpstream::new(format!("http://{addr}/mcp"));
+    let held = RmcpBridge::connect(&upstream).await.expect("connect");
+    let ephemeral = EphemeralBridge::new(upstream);
+    for bridge in [&held as &dyn McpBridge, &ephemeral] {
+        let before = calls.load(Ordering::SeqCst);
+        let tools = bridge.list_tools().await.expect("14 MiB of cursors fits");
+        assert!(tools.is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst) - before, 15);
+    }
 }
 
 /// Pages that each fit their own transport cap but together outgrow what a

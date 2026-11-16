@@ -1091,6 +1091,8 @@ impl McpBridge for RmcpBridge {
             let mut bytes = serialized_bytes(&empty, MAX_TOOL_LIST_BYTES).map_err(too_large)?;
             let mut params = None;
             let mut seen_cursors = HashSet::new();
+            // 去重集合单独受同一字节上限约束，空工具页也不能绕过。
+            let mut cursor_bytes = 0;
             for _ in 0..MAX_TOOL_LIST_PAGES {
                 let page = self
                     .running
@@ -1113,11 +1115,18 @@ impl McpBridge for RmcpBridge {
                 let Some(cursor) = page.next_cursor else {
                     return Ok(tools);
                 };
-                if !seen_cursors.insert(cursor.clone()) {
+                if seen_cursors.contains(&cursor) {
                     return Err(McpError::Request(
                         "upstream tools/list repeated a pagination cursor".to_string(),
                     ));
                 }
+                if cursor.len() > MAX_TOOL_LIST_BYTES - cursor_bytes {
+                    return Err(McpError::Request(format!(
+                        "upstream tools/list pagination cursors exceed {MAX_TOOL_LIST_BYTES} bytes"
+                    )));
+                }
+                cursor_bytes += cursor.len();
+                seen_cursors.insert(cursor.clone());
                 params =
                     Some(rmcp::model::PaginatedRequestParams::default().with_cursor(Some(cursor)));
             }
