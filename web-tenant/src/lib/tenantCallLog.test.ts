@@ -105,15 +105,36 @@ test("详情显示输出 TPS 完整上游口径，不沿用首帧后的限制", 
   assert.doesNotMatch(content, /非流式或旧记录|TPS 不使用总用时估算/);
 });
 
+function upstreamTimingValue(markup: string, name: string): string {
+  const row = markup.match(new RegExp(`<div[^>]*data-upstream-timing-field="${name}"[^>]*>(.*?)</div>`, "s"));
+  assert.ok(row, `缺少 ${name} 阶段字段`);
+  const dd = row[1]!.match(/<dd[^>]*>(.*?)<\/dd>/s);
+  assert.ok(dd, `缺少 ${name} 阶段值`);
+  return dd[1]!.replace(/<[^>]+>/g, "");
+}
+
 // 新阶段必须接到同一调用详情，不能从已有总耗时或首字补出历史值。
 test("调用详情展示同一上游尝试的 HTTP 阶段偏移，缺失保持未知", () => {
   const renderDetails = (extra: Record<string, unknown>) => renderToStaticMarkup(createElement(DetailsUnderTest, { call: { ...base, ...extra } }));
   const recorded = renderDetails({ upstream_timing: { http_send_started_ms: 0, response_headers_ms: 136004, first_content_ms: 136008 } });
   assert.match(recorded, /aria-label="上游 HTTP 阶段"/);
-  assert.match(recorded, /data-upstream-timing-field="http_send_started_ms"[^>]*>.*?<dd[^>]*>0 ms<\/dd>/s);
-  assert.match(recorded, /data-upstream-timing-field="response_headers_ms"[^>]*>.*?<dd[^>]*>136,004 ms<\/dd>/s);
+  assert.equal(upstreamTimingValue(recorded, "http_send_started_ms"), "0 ms");
+  assert.equal(upstreamTimingValue(recorded, "response_headers_ms"), "136,004 ms");
   const missing = renderDetails({ first_token_latency_ms: 1000, attempt_duration_ms: 3000 });
   for (const key of ["http_send_started_ms", "response_headers_ms", "first_response_byte_ms", "first_protocol_frame_ms", "first_canonical_chunk_ms", "first_content_ms"]) {
-    assert.match(missing, new RegExp(`data-upstream-timing-field="${key}"[^>]*>.*?<dd[^>]*>—<\\/dd>`, "s"));
+    assert.equal(upstreamTimingValue(missing, key), "—");
   }
+});
+
+// 删除本行的值仍保留下一行相同值，跨行查找会错误通过此负控。
+test("上游阶段断言不能借用下一行的相同值", () => {
+  const markup = renderToStaticMarkup(createElement(DetailsUnderTest, { call: { ...base, upstream_timing: { http_send_started_ms: 0, response_headers_ms: 0 } } }));
+  const row = markup.match(/<div[^>]*data-upstream-timing-field="http_send_started_ms"[^>]*>.*?<\/div>/s);
+  assert.ok(row, "负控必须找到实际的 HTTP 客户端阶段行");
+  const withoutValue = markup.replace(row[0], row[0].replace(/<dd[^>]*>.*?<\/dd>/s, ""));
+  assert.notEqual(withoutValue, markup, "负控必须实际移除本行的值");
+  assert.equal(upstreamTimingValue(withoutValue, "response_headers_ms"), "0 ms");
+  assert.throws(() => upstreamTimingValue(withoutValue, "http_send_started_ms"), /缺少 http_send_started_ms 阶段值/);
+  const withoutRow = markup.replace(row[0], "");
+  assert.throws(() => upstreamTimingValue(withoutRow, "http_send_started_ms"), /缺少 http_send_started_ms 阶段/);
 });
