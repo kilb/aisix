@@ -223,7 +223,9 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
         }
         // Billing accounts. The tenant matches nothing: 404 once the role
         // check passed, so no limit is written.
-        ("GET", "/admin/billing/accounts") => (path.to_string(), None),
+        ("GET", "/admin/billing/accounts") | ("GET", "/admin/billing/profit-summary") => {
+            (path.to_string(), None)
+        }
         ("GET" | "PATCH", "/admin/tenants/{id}/billing") => (
             format!("/admin/tenants/{}/billing", Uuid::nil()),
             (method == "PATCH").then(|| json!({"credit_limit_cny": "1.00"})),
