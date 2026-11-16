@@ -1,0 +1,207 @@
+/* 模型编辑使用整行工作区；字段按用途分组，不再叠加卡片边框。 */
+form.model-editor-form.panel > *,
+.cp-publicroutes form.ops-routing-form.panel > * {
+  max-width: none;
+  min-width: 0;
+}
+
+.model-editor-form,
+.cp-publicroutes .ops-routing-form {
+  --pad: 20px;
+}
+
+.model-editor-form > .bento-card-header,
+.cp-publicroutes .ops-routing-form > .bento-card-header {
+  margin-bottom: 18px;
+}
+
+.model-editor-form .model-form-section,
+.cp-publicroutes .pm-route-section {
+  margin: 0;
+  padding: 18px 0;
+  border-top: 1px solid var(--border);
+}
+
+.model-editor-form .model-form-section > h3,
+.cp-publicroutes .pm-section-heading h3 {
+  margin: 0 0 12px;
+  color: var(--foreground);
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 22px;
+}
+
+.model-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
+  gap: 12px 20px;
+}
+
+.model-upstream-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.model-identity-grid > div:only-child { grid-column: 1 / -1; }
+.model-form-grid > *,
+.cp-publicroutes .pm-routing-settings > * { min-width: 0; }
+.model-form-grid .field,
+.model-form-grid .f,
+.cp-publicroutes .pm-routing-settings .field,
+.cp-publicroutes .pm-routing-settings .f { margin-bottom: 0; }
+.model-account-groups { grid-column: 1 / -1; margin: 0; }
+.model-form-grid .hint { margin-top: 6px; font-size: 12px; line-height: 19px; }
+.model-identity-grid > div > .hint { margin-bottom: 0; }
+
+.model-document-meta { display: grid; gap: 8px; margin: 0; padding-top: 2px; }
+.model-document-meta > div { display: flex; flex-wrap: wrap; gap: 4px 12px; }
+.model-document-meta dt { color: var(--muted-foreground); font-size: 12px; line-height: 20px; }
+.model-document-meta dd { min-width: 0; margin: 0; font-size: 12px; line-height: 20px; overflow-wrap: anywhere; }
+
+/* 冷却控件沿用原有输入与校验，作为目标的一行配置呈现。 */
+.model-cooldown > div,
+.cp-publicroutes .pm-target-cooldown > div {
+  display: grid;
+  grid-template-columns: minmax(120px, .5fr) minmax(0, 1.5fr);
+  align-items: start;
+  gap: 8px 20px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.model-cooldown > div > .check,
+.cp-publicroutes .pm-target-cooldown > div > .check { margin: 0; }
+.model-cooldown > div > .grid,
+.cp-publicroutes .pm-target-cooldown > div > .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.model-cooldown .field,
+.cp-publicroutes .pm-target-cooldown .field { margin: 0; }
+.model-cooldown > div > :is(p, details, .btn),
+.cp-publicroutes .pm-target-cooldown > div > :is(p, details, .btn) { grid-column: 1 / -1; margin: 0; }
+.model-cooldown > div > .btn,
+.cp-publicroutes .pm-target-cooldown > div > .btn { justify-self: start; }
+.model-cooldown details > summary,
+.cp-publicroutes :is(.pm-target-cooldown, .pm-routing-explanation) summary {
+  width: fit-content;
+  max-width: 100%;
+  padding-block: 4px;
+  color: var(--muted-foreground);
+  font-size: 12px;
+  line-height: 20px;
+  cursor: pointer;
+}
+.model-cooldown summary:focus-visible,
+.cp-publicroutes summary:focus-visible { outline: 2px solid var(--ring); outline-offset: 3px; border-radius: 3px; }
+
+.model-editor-form .model-target-list,
+.cp-publicroutes .pm-target-list { border: 0; border-radius: 0; }
+.model-editor-form .model-target-list > [aria-hidden],
+.cp-publicroutes .pm-target-list > [aria-hidden] { padding-inline: 0; background: transparent; color: var(--muted-foreground); }
+.model-editor-form .model-target-list .ops-target-row,
+.cp-publicroutes .pm-target-list .ops-target-row { padding: 14px 0; border-color: var(--border); row-gap: 12px; }
+.cp-publicroutes .pm-target-account { overflow-wrap: anywhere; }
+.cp-publicroutes .pm-target-cooldown { padding-top: 10px; border-top: 1px dashed var(--border); }
+.cp-publicroutes .pm-target-cooldown > div { grid-template-columns: minmax(120px, .4fr) minmax(0, 1.6fr); }
+.cp-publicroutes .pm-target-cooldown .hint { font-size: 12px; line-height: 19px; }
+
+form.model-editor-form > .model-form-footer,
+.cp-publicroutes form.ops-routing-form > .model-form-footer {
+  min-height: 0;
+  margin: 0;
+  padding: 14px 0 0;
+  border-top: 1px solid var(--border);
+  border-radius: 0;
+  background: transparent;
+}
+
+/* 状态摘要占用一条信息带，主区留给模型和路由。 */
+.cp-publicroutes .public-model-overview {
+  margin: 0 0 18px;
+  padding: 14px 0;
+  border-block: 1px solid var(--border);
+}
+.cp-publicroutes .compact-overview-facts {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 12px 20px;
+  margin: 0 0 10px;
+}
+.cp-publicroutes .compact-overview-facts > div { min-width: 0; }
+.cp-publicroutes .compact-overview-facts dt { color: var(--muted-foreground); font-size: 12px; line-height: 20px; }
+.cp-publicroutes .compact-overview-facts dd { margin: 2px 0 0; font-size: 22px; font-weight: 500; line-height: 30px; font-variant-numeric: tabular-nums; }
+.cp-publicroutes .compact-overview-facts [data-tone="success"] dd { color: var(--success); }
+.cp-publicroutes .compact-overview-facts [data-tone="warning"] dd { color: var(--warning); }
+.cp-publicroutes .public-model-overview > p { margin: 0; font-size: 12px; line-height: 20px; }
+.cp-publicroutes .pm-list-section { gap: 14px; }
+.cp-publicroutes .pm-list-section > .bento-card-header h2 { font-size: 16px; line-height: 24px; }
+
+.cp-publicroutes .pm-pricing-state {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 7px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 20px;
+}
+.cp-publicroutes .pm-pricing-state[data-state="priced"] { color: var(--success); background: var(--success-soft); }
+.cp-publicroutes .pm-pricing-state[data-state="unpriced"] { color: var(--warning); background: var(--warning-soft); }
+.cp-publicroutes .pm-models-table th:first-child { width: 28%; }
+.cp-publicroutes .pm-models-table th:nth-child(2) { width: auto; }
+.cp-publicroutes .pm-models-table th:nth-child(3) { width: 8.5rem; }
+.cp-publicroutes .pm-models-table th:nth-child(4),
+.cp-publicroutes .pm-models-table th:nth-child(5) { width: 5rem; }
+.cp-publicroutes .pm-models-table th:nth-child(6) { width: 5.5rem; }
+.cp-publicroutes .pm-models-table td { white-space: normal; overflow-wrap: anywhere; }
+
+.cp-publicroutes .pm-detail-overview { padding: 0 0 18px; margin-bottom: 18px; border-bottom: 1px solid var(--border); }
+.cp-publicroutes .pm-detail-identity { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 18px; margin-bottom: 16px; color: var(--muted-foreground); font-size: 12px; line-height: 20px; }
+.cp-publicroutes .pm-detail-identity > span { min-width: 0; overflow-wrap: anywhere; }
+.cp-publicroutes .pm-detail-facts { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 12px 20px; margin: 0 0 10px; }
+.cp-publicroutes .pm-detail-facts dt { color: var(--muted-foreground); font-size: 12px; line-height: 20px; }
+.cp-publicroutes .pm-detail-facts dd { margin: 2px 0 0; color: var(--foreground); font-size: 22px; font-weight: 500; line-height: 30px; font-variant-numeric: tabular-nums; }
+.cp-publicroutes .pm-detail-overview > .hint { margin: 0; font-size: 12px; line-height: 20px; }
+.cp-publicroutes .pm-detail-overview > .note { margin: 12px 0 0; }
+.cp-publicroutes .pm-detail-workspace { display: grid; gap: 20px; min-width: 0; }
+.cp-publicroutes .pm-section-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 16px; margin-bottom: 10px; }
+.cp-publicroutes .pm-section-heading h3 { margin: 0; }
+.cp-publicroutes .pm-section-count { margin-left: 4px; color: var(--muted-foreground); font-size: 12px; font-weight: 400; font-variant-numeric: tabular-nums; }
+.cp-publicroutes .pm-routing-explanation { margin: 0 0 12px; }
+.cp-publicroutes .pm-routing-explanation > div { padding: 8px 0; }
+.cp-publicroutes .pm-routing-settings { gap: 14px 20px; margin-bottom: 14px; }
+.cp-publicroutes .pm-routing-settings .hint { margin-top: 6px; font-size: 12px; line-height: 19px; }
+.cp-publicroutes .pm-maintenance-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 2fr); align-items: start; gap: 24px; }
+.cp-publicroutes .pm-maintenance-section { min-width: 0; padding-top: 16px; border-top: 1px solid var(--border); }
+.cp-publicroutes .pm-maintenance-section > .bento-card-header { margin-bottom: 12px; }
+.cp-publicroutes .pm-maintenance-section .library-one > h3 { display: none; }
+.cp-publicroutes .pm-maintenance-section .library-card-block { padding: 0; border-radius: 0; background: transparent; }
+
+/* 模型目录给名称与关联目标优先分配宽度，长标识在列内换行。 */
+.cp-models .model-list-name,
+.cp-models .model-list-target { display: block; min-width: 0; overflow-wrap: anywhere; }
+.cp-models .ops-list .dt { width: 100%; min-width: 0; table-layout: fixed; }
+.cp-models .ops-list .dt > thead th:first-child { width: 28%; }
+.cp-models .ops-list .dt > thead th:nth-child(2) { width: 7rem; }
+.cp-models .ops-list .dt > thead th:nth-child(3) { width: 10rem; }
+.cp-models .ops-list .dt > thead th:nth-child(4) { width: auto; }
+.cp-models .ops-list .dt > thead th:nth-child(5) { width: 6rem; }
+.cp-models .ops-list .dt > thead th:last-child { width: 128px; }
+.cp-models .ops-list .dt > tbody > tr > td { min-width: 0; white-space: normal; overflow-wrap: anywhere; }
+
+@media (max-width: 1099px) {
+  .cp-publicroutes .pm-detail-facts { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .cp-publicroutes .compact-overview-facts { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .model-upstream-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .model-upstream-grid > div:nth-child(3) { grid-column: 1 / -1; }
+}
+
+@media (max-width: 719px) {
+  .model-editor-form,
+  .cp-publicroutes .ops-routing-form { --pad: 16px; }
+  .model-form-grid,
+  .cp-publicroutes .pm-maintenance-grid { grid-template-columns: minmax(0, 1fr); }
+  .cp-publicroutes .compact-overview-facts,
+  .cp-publicroutes .pm-detail-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+  .model-cooldown > div,
+  .cp-publicroutes .pm-target-cooldown > div { grid-template-columns: minmax(0, 1fr); }
+  .cp-publicroutes .pm-detail-identity { gap: 6px 12px; }
+  .cp-publicroutes .pm-detail-identity > span:last-child { flex-basis: 100%; }
+}

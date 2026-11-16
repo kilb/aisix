@@ -268,16 +268,16 @@ export function PublicModels({ canEdit, onGoto, initialSection, sectionVisit, re
           {refusal}
         </div>
       )}
-      <Card className="public-model-overview" aria-label="公共模型状态概览">
+      <section className="public-model-overview" aria-label="公共模型状态概览">
         <dl className="compact-overview-facts">
           <div><dt>在用公共模型</dt><dd>{live ? live.length.toLocaleString("zh-CN") : "—"}</dd></div>
-          <div><dt>已定价</dt><dd>{pricingCounts?.priced ?? "—"}</dd></div>
-          <div><dt>缺少基准价</dt><dd>{pricingCounts?.no_baseline ?? "—"}</dd></div>
-          <div><dt>缺少分组换算率</dt><dd>{pricingCounts?.missing_rates ?? "—"}</dd></div>
-          <div><dt>没有可用账号</dt><dd>{unavailable ? unavailable.length.toLocaleString("zh-CN") : "—"}</dd></div>
+          <div data-tone="success"><dt>已定价</dt><dd>{pricingCounts?.priced ?? "—"}</dd></div>
+          <div data-tone="warning"><dt>缺少基准价</dt><dd>{pricingCounts?.no_baseline ?? "—"}</dd></div>
+          <div data-tone="warning"><dt>缺少分组换算率</dt><dd>{pricingCounts?.missing_rates ?? "—"}</dd></div>
+          <div data-tone="warning"><dt>没有可用账号</dt><dd>{unavailable ? unavailable.length.toLocaleString("zh-CN") : "—"}</dd></div>
         </dl>
         <p className="text-caption text-muted">{rows && live ? `全部 ${rows.length.toLocaleString("zh-CN")} 个 · 已停用 ${(rows.length - live.length).toLocaleString("zh-CN")} 个。` : "统计来自完整公共模型列表。"}无可用账号时请求会以 503 失败，进入模型详情可核对路由与账号映射。</p>
-      </Card>
+      </section>
       <FormDialog open={createOpen} onOpenChange={setCreateOpen} title="新建公共模型" description="设置租户调用的模型名称。创建后，在路由中添加服务账号。" busy={creating || writeGate.busy}>
               <form ref={form} aria-label="新建公共模型" onSubmit={(e) => void create(e)}>
                 <FormGrid>
@@ -303,7 +303,7 @@ export function PublicModels({ canEdit, onGoto, initialSection, sectionVisit, re
                 </CardFooter>
               </form>
       </FormDialog>
-        <Card className="mb-0">
+        <Card className="pm-list-section mb-0">
           <CardHeader number={3} title={<>全部公共模型{rows && <Count n={rows.length} />}</>} description="名称与稳定标识保留；授权租户和密钥统计包含全部模型授权。" />
           {rows === null ? (
             error ? <CardMessage onRetry={() => void load()}>读取失败，请重试</CardMessage> : <ChartSkeleton />
@@ -334,7 +334,7 @@ export function PublicModels({ canEdit, onGoto, initialSection, sectionVisit, re
                   return (
                     <tr data-finance-record key={m.id} data-model={m.id}>
                       <td data-label="名称">
-                        <button type="button" className="link-button pm-model-link" onClick={() => select(m.id)}>
+                        <button type="button" className="link-button pm-model-link" aria-label={m.name} onClick={() => select(m.id)}>
                           <span>{m.name}</span><span className="pm-model-id mono">{m.id}</span>
                         </button>
                       </td>
@@ -345,10 +345,10 @@ export function PublicModels({ canEdit, onGoto, initialSection, sectionVisit, re
                         ) : priced === null ? (
                           "…"
                         ) : priced.kind === "priced" ? (
-                          "已定价"
+                          <span className="pm-pricing-state" data-state="priced">已定价</span>
                         ) : (
                           <>
-                            <span className="pm-unpriced">未定价</span>
+                            <span className="pm-pricing-state" data-state="unpriced">未定价</span>
                             <div className="cell-note">{unpricedReason(priced)}</div>
                           </>
                         )}

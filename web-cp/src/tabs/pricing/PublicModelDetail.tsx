@@ -9,11 +9,11 @@ import { Button } from "../../ui/Button";
 import { DataTable } from "../../ui/DataTable";
 import { GroupList } from "../../ui/GroupName";
 import { useToast } from "../../ui/Toast";
-import { BentoGrid, Card, CardHeader, Metric, PageHeader, span } from "../../components/page";
+import { Card, CardHeader, PageHeader } from "../../components/page";
 import { Lamp } from "../../ui/Lamp";
 import { RoutePolicy } from "../../ui/RoutePolicy";
 import { LibrarySyncOne } from "./LibrarySync";
-import { CardFooter, Count, WithForms } from "./kit";
+import { CardFooter, Count } from "./kit";
 
 /**
  * The accounts serving a model, as the routing document orders them: one
@@ -111,8 +111,8 @@ export function PublicModelDetail({
     canEdit || model.served_by.length > 0 ? (
       <>
         {canEdit && (
-          <Card className="mb-0">
-            <CardHeader number={4} title="重新生成" description="按当前表格重写生成的模型文档，不改变表格本身。" />
+          <section className="pm-maintenance-section" aria-label="重新生成模型文档">
+            <CardHeader as="h3" title="重新生成" description="按当前表格重写生成的模型文档，不改变表格本身。" />
             {error && (
               <div className="note crit mt-0" role="alert">
                 重新生成失败：{error}
@@ -128,14 +128,14 @@ export function PublicModelDetail({
                 重新生成
               </Button>
             </CardFooter>
-          </Card>
+          </section>
         )}
         {/* 账号接入后生成的路由文档才可绑定基准价。 */}
         {model.served_by.length > 0 && (
-          <Card className="mb-0">
-            <CardHeader number={canEdit ? 5 : 4} title="基准价联动" description="从价格库核对并同步当前模型的完整价格。" />
+          <section className="pm-maintenance-section" aria-label="基准价联动">
+            <CardHeader as="h3" title="基准价联动" description="从价格库核对并同步当前模型的完整价格。" />
             <LibrarySyncOne modelId={model.id} canEdit={canEdit} current={null} onSynced={onChanged} />
-          </Card>
+          </section>
         )}
       </>
     ) : undefined;
@@ -145,7 +145,7 @@ export function PublicModelDetail({
       <PageHeader
         eyebrow="公共模型与路由 / 账号与定价"
         title={<span className="pm-model-title">{model.name}</span>}
-        dataLead={served.length > 0 ? <>由 {served.length.toLocaleString("zh-CN")} 个启用账号服务，分布在 {enabledPriorities.length.toLocaleString("zh-CN")} 个优先级层。按优先级分层展示，实际选路见当前策略；表中优先级从高到低，同层按权重排列。</> : "当前没有启用的账号映射，请先到上游账号重新接入。"}
+        dataLead="维护服务账号、路由策略与基准价。账号按优先级分层，同层遵循已保存的选路策略。"
         actions={
           <Button type="button" onClick={onBack}>
             <ArrowLeft aria-hidden />
@@ -155,28 +155,20 @@ export function PublicModelDetail({
       />
       {loadError && <div className="note crit" role="alert">完整列表读取失败，请刷新核对：{loadError}</div>}
       {!routingEditor && <div className="mb-4"><RoutePolicy routing={model.effective_routing} /></div>}
-      <p className="mb-6 text-body text-ink-soft">
-        标识 <code className="break-all">{model.id}</code>，创建于 {fmtBeijing(model.created_at)}。授权租户 {model.reachable_tenants} 个、密钥 {model.reachable_keys} 个。
-      </p>
-      <BentoGrid className="mb-3" aria-label="公共模型账号概览">
-        <Card className={span.d7}>
-          <CardHeader number={1} title="启用服务账号" description="当前模型 · 仅统计启用的接入映射" />
-          <Metric size="hero">{served.length.toLocaleString("zh-CN")}</Metric>
-          <dl className="pm-routing-summary mt-6">
-            <div><dt>启用优先级层</dt><dd>{enabledPriorities.length.toLocaleString("zh-CN")}</dd></div>
-            <div><dt>最高启用优先级</dt><dd>{enabledPriorities[0] ?? "—"}</dd></div>
-            <div><dt>全部账号映射</dt><dd>{model.served_by.length.toLocaleString("zh-CN")}</dd></div>
-          </dl>
-          <CardFooter className="justify-start text-caption text-muted">账号和优先级以完整映射表为准；未启用的映射保留在表中。</CardFooter>
-        </Card>
-        <Card tone="inverse" className={span.d5Wide}>
-          <CardHeader number={2} title="已停用账号映射" description="当前模型 · 恢复前核对上游模型与分组" />
-          <Metric size="display">{disabledCount.toLocaleString("zh-CN")}</Metric>
-          <p className="mt-4 text-body text-on-inverse-muted">公共模型的稳定标识承接授权与基准价。重新生成只修复模型文档，不会修改优先级、权重或启停状态。</p>
-          <CardFooter className="justify-start border-surface/12 text-caption text-on-inverse-muted">{model.retired_at ? "模型已停用，恢复后仍需重新接入账号。" : `模型在用 · 授权租户 ${model.reachable_tenants} 个 · 密钥 ${model.reachable_keys} 个`}</CardFooter>
-        </Card>
-      </BentoGrid>
-      <WithForms forms={aside}>
+      <section className="pm-detail-overview" aria-label="公共模型账号概览">
+        <div className="pm-detail-identity"><Lamp state={model.retired_at ? "disabled" : "applied"}>{model.retired_at ? "已停用" : "在用"}</Lamp><span>标识 <code>{model.id}</code></span><span>创建于 {fmtBeijing(model.created_at)}</span></div>
+        <dl className="pm-detail-facts">
+          <div><dt>启用服务账号</dt><dd>{served.length.toLocaleString("zh-CN")}</dd></div>
+          <div><dt>启用优先级层</dt><dd>{enabledPriorities.length.toLocaleString("zh-CN")}</dd></div>
+          <div><dt>最高启用优先级</dt><dd>{enabledPriorities[0] ?? "—"}</dd></div>
+          <div><dt>已停用账号映射</dt><dd>{disabledCount.toLocaleString("zh-CN")}</dd></div>
+          <div><dt>授权租户</dt><dd>{model.reachable_tenants.toLocaleString("zh-CN")}</dd></div>
+          <div><dt>密钥</dt><dd>{model.reachable_keys.toLocaleString("zh-CN")}</dd></div>
+        </dl>
+        <p className="hint">完整映射 {model.served_by.length} 个；未启用的映射仍保留。公共模型的稳定标识承接授权与基准价。重新生成只修复模型文档，不修改优先级、权重或启停状态。</p>
+        {model.retired_at ? <p className="note warn" role="status">模型已停用，恢复后仍需重新接入账号。</p> : served.length === 0 && <p className="note warn" role="status"><strong>无可用账号</strong>：模型仍保留在列表中，授权不受影响，但请求会以 503 失败（无可用上游）。请添加服务账号。</p>}
+      </section>
+      <div className="pm-detail-workspace">
         {routingEditor ?? <Card className="pm-mapping-card mb-0">
           <CardHeader
             number={3}
@@ -244,7 +236,8 @@ export function PublicModelDetail({
             </DataTable>
           )}
         </Card>}
-      </WithForms>
+        {aside && <div className="pm-maintenance-grid">{aside}</div>}
+      </div>
     </div>
   );
 }

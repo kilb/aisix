@@ -371,20 +371,18 @@ export function PublicRoutingForm({
   return (
     <form ref={form} className="panel ops-routing-form mb-0" aria-label={title} onSubmit={submit}>
       <CardHeader
-        number={3}
         title={title}
-        className="mb-5"
-        description={`公共模型「${publicModel.name}」的路由：每个目标是一个为它服务的上游账号。选路设置和目标都在这里改，点「保存」一并写入；移除目标立即生效。`}
+        description="选路设置和目标改动一起保存；移除目标立即生效。每个目标对应一个服务账号。"
       />
-      <div className="@container">
-        <div className="mb-4"><RoutePolicy routing={publicModel.effective_routing} /></div>
-        <h4 className="mb-3 text-body font-semibold">选路设置</h4>
+      <section className="pm-route-section @container" aria-label="选路设置">
+        <div className="pm-section-heading"><h3>选路设置</h3><RoutePolicy routing={publicModel.effective_routing} compact /></div>
+        <details className="pm-routing-explanation"><summary>查看当前选路规则</summary><RoutePolicy routing={publicModel.effective_routing} /></details>
         {bad && (
           <div className="note crit mt-0" role="alert">
             {bad}
           </div>
         )}
-        <div className="grid gap-x-4 @md:grid-cols-2 @3xl:grid-cols-3">
+        <div className="pm-routing-settings grid gap-x-4 @md:grid-cols-2 @3xl:grid-cols-3">
           <RoutingModeField
             value={{ strategy: draft.strategy, affinity: draft.affinity }}
             onChange={(next) => setSettings((previous) => ({ ...previous, ...next }))}
@@ -456,16 +454,16 @@ export function PublicRoutingForm({
           <input type="checkbox" disabled={locked} checked={draft.retryOn429} onChange={(e) => set("retryOn429", e.target.checked)} />{" "}
           <span>429 也参与重试和切换</span>
         </label>
-      </div>
+      </section>
 
-      <div className="ops-form-section @container">
-        <h4 className="mb-3 text-body font-semibold">路由目标（{targets.length}）</h4>
+      <section className="ops-form-section pm-route-section @container" aria-label="路由目标">
+        <div className="pm-section-heading"><h3>路由目标 <span className="pm-section-count">{targets.length}</span></h3><span className="text-caption text-muted">按优先级从高到低使用</span></div>
         {targets.length === 0 && additions.length === 0 ? (
           <p className="hint rounded-cell border border-dashed border-line px-4 py-6 text-center text-caption">
             还没有账号服务这个模型：请求会以「上游不可用」失败。{!readOnly && "用下面的「添加目标」加一个账号。"}
           </p>
         ) : (
-          <div className="ops-target-list overflow-hidden rounded-cell border border-line">
+          <div className="ops-target-list pm-target-list">
             <div aria-hidden="true" className={cn(TARGET_ROW, "hidden border-b border-line bg-well px-3 py-2 text-caption font-medium text-ink-soft @3xl:grid")}>
               <span>账号</span>
               <span>上游模型名称</span>
@@ -491,7 +489,7 @@ export function PublicRoutingForm({
                     accountShown={false}
                     heading={
                       <>
-                        <div className="truncate pt-2 font-medium @3xl:pt-1.5" title={accountName}>
+                        <div className="pm-target-account pt-2 font-medium @3xl:pt-1.5" title={accountName}>
                           <span className="font-normal text-muted">账号：</span>
                           {accountName}
                         </div>
@@ -602,7 +600,7 @@ export function PublicRoutingForm({
             优先级高的一组先用，这一组都不可用时才用下一组；同组选择遵循上面的已存策略。上游模型名称留空即用公共模型的名称。
           </p>
         </div>
-      </div>
+      </section>
 
       {(outcome || err) && (
         <div className="note crit" role="alert">
@@ -620,7 +618,7 @@ export function PublicRoutingForm({
         </div>
       )}
 
-      <div className={FORM_FOOTER}>
+      <div className={cn(FORM_FOOTER, "model-form-footer")}>
         <Button type="button" disabled={writing} onClick={onClose}>
           关闭
         </Button>
@@ -751,7 +749,7 @@ function TargetRow({
       <div className="col-span-2 flex min-h-11 items-center justify-end @md:col-span-1 @md:col-start-3 @md:row-start-1 @3xl:col-start-5">
         {action}
       </div>
-      <div className="col-span-full"><CooldownEditor value={draft.cooldown ?? null} disabled={locked} onChange={(cooldown) => onChange({ cooldown })} onValidityChange={(cooldownProblem) => onChange({ cooldownProblem })} error={refusal?.fields.cooldown} /></div>
+      <div className="pm-target-cooldown col-span-full"><CooldownEditor value={draft.cooldown ?? null} disabled={locked} onChange={(cooldown) => onChange({ cooldown })} onValidityChange={(cooldownProblem) => onChange({ cooldownProblem })} error={refusal?.fields.cooldown} /></div>
       {message !== "" && (
         <div className="note crit col-span-full m-0" role="alert">
           {message}

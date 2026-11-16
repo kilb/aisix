@@ -1,4 +1,5 @@
 import "./operations.css";
+import "./models/ModelManagement.css";
 import { FORM_FOOTER, RowField, ServedGroups, GENERATED_STRATEGY, type Target, type ModelDoc, type AccountDoc, type Model, type Catalog, type SchemaInfo } from "./models/catalog";
 import { RoutingModeField } from "../ui/RoutingModeField";
 import { Eye, Pencil, Plus, RefreshCw, Trash2, Waypoints } from "lucide-react";
@@ -247,7 +248,7 @@ export function Models({ canEdit, onGoto }: TabProps) {
     onClose: () => setOpen(null),
   };
 
-  // 编辑表单与列表并排，目标行始终保留完整字段。
+  // 编辑表单独占整行，列表与目标字段保留完整工作区宽度。
   let editor: ReactNode = null;
   if (open?.mode === "new") {
     editor = <ModelForm key={`new-${open.shape}`} model={null} shape={open.shape} readOnly={false} onReload={() => undefined} {...formProps} />;
@@ -413,7 +414,7 @@ export function Models({ canEdit, onGoto }: TabProps) {
                     <Fragment key={m.id}>
                       <tr className={editing?.id === m.id ? "bg-well" : undefined}>
                         <td className="font-medium">
-                          <span className={cn("block truncate", split ? "max-w-[12rem]" : "max-w-[20rem]")} title={nameOf(m)}>
+                          <span className="model-list-name" title={nameOf(m)}>
                             {nameOf(m)}
                           </span>
                         </td>
@@ -422,7 +423,7 @@ export function Models({ canEdit, onGoto }: TabProps) {
                         </td>
                         <td className="text-ink-soft">{SHAPE_LABEL[shape]}{shape === "routing" && <RoutePolicy routing={m.doc.routing} defaultStrategy={schema && "preset" in schema ? schema.preset : null} compact />}</td>
                         <td className="whitespace-normal">
-                          <div className="min-w-56">
+                          <div className="model-list-target">
                             <Upstream model={m} catalog={catalog} />
                           </div>
                         </td>
@@ -843,88 +844,107 @@ function ModelForm({
   const listed = details.filter((d) => !shown.includes(d.path));
 
   return (
-    <form ref={form} className="panel @container mb-0" aria-label={title} onSubmit={submit}>
-      <CardHeader number={3} title={title} className="mb-5" />
-      <div className="grid gap-x-4 @md:grid-cols-2">
-        <div className="min-w-0 @md:col-span-2">
-          <Field label="对外名称" error={at("/display_name")}>
-            {(aria) => <input required disabled={locked} value={name} onChange={(e) => setName(e.target.value)} {...aria} />}
-          </Field>
-          {!isNew && !readOnly && (
-            <p className="hint -mt-2 mb-4 text-caption">
-              {RENAME_HINT}
-              {RENAME_BY_NAME}
-            </p>
-          )}
-        </div>
-
-        {shape === "direct" ? (
-          <>
-            <Field label="上游账号" error={at("/provider_key_id")}>
-              {(aria) => (
-                <Select required disabled={locked} value={accountId} onValueChange={(value) => chooseAccount(value)} {...aria}>
-                  <option value="">（选择上游账号）</option>
-                  {accountOptions.map((o) => (
-                    <option key={o.id} value={o.id}>
-                      {o.label}
-                    </option>
-                  ))}
-                </Select>
-              )}
+    <form ref={form} className="panel model-editor-form @container mb-0" aria-label={title} onSubmit={submit}>
+      <CardHeader title={title} description={shape === "direct" ? "配置上游连接与故障冷却。" : "配置同级分配方式与直连模型目标。"} />
+      <section className="model-form-section" aria-label="基本信息">
+        <h3>基本信息</h3>
+        <div className="model-form-grid model-identity-grid">
+          <div className="min-w-0">
+            <Field label="对外名称" error={at("/display_name")}>
+              {(aria) => <input required disabled={locked} value={name} onChange={(e) => setName(e.target.value)} {...aria} />}
             </Field>
-            <Field label="供应商标识" error={at("/provider")}>
-              {(aria) => (
-                <input required disabled={locked} value={provider} onChange={(e) => setProvider(e.target.value)} {...aria} />
-              )}
-            </Field>
-            {account && (
-              <p className="hint -mt-2 mb-4 flex flex-wrap items-center gap-x-1.5 gap-y-1 text-caption @md:col-span-2">
-                <span>该账号可服务的分组：</span>
-                <GroupBadges groups={account.doc.groups ?? []} empty="—（账号未设分组）" />
+            {!isNew && !readOnly && (
+              <p className="hint -mt-2 mb-4 text-caption">
+                {RENAME_HINT}
+                {RENAME_BY_NAME}
               </p>
             )}
-            <div className="min-w-0 @md:col-span-2">
-              <Field label="上游模型" error={at("/model_name")}>
+          </div>
+          {model && (
+            <dl className="model-document-meta">
+              <div><dt>模型标识</dt><dd><code>{model.id}</code></dd></div>
+              <div><dt>配置版本</dt><dd>{model.version}</dd></div>
+            </dl>
+          )}
+        </div>
+      </section>
+
+      <section className="model-form-section" aria-label={shape === "direct" ? "上游连接" : "选路设置"}>
+        <h3>{shape === "direct" ? "上游连接" : "选路设置"}</h3>
+        <div className={cn("model-form-grid", shape === "direct" ? "model-upstream-grid" : "model-routing-grid")}>
+          {shape === "direct" ? (
+            <>
+              <Field label="上游账号" error={at("/provider_key_id")}>
                 {(aria) => (
-                  <input
-                    required
-                    disabled={locked}
-                    className="font-mono text-caption"
-                    value={upstream}
-                    onChange={(e) => setUpstream(e.target.value)}
-                    {...aria}
-                  />
+                  <Select required disabled={locked} value={accountId} onValueChange={(value) => chooseAccount(value)} {...aria}>
+                    <option value="">（选择上游账号）</option>
+                    {accountOptions.map((o) => (
+                      <option key={o.id} value={o.id}>
+                        {o.label}
+                      </option>
+                    ))}
+                  </Select>
                 )}
               </Field>
+              <Field label="供应商标识" error={at("/provider")}>
+                {(aria) => (
+                  <input required disabled={locked} value={provider} onChange={(e) => setProvider(e.target.value)} {...aria} />
+                )}
+              </Field>
+              <div className="min-w-0">
+                <Field label="上游模型" error={at("/model_name")}>
+                  {(aria) => (
+                    <input
+                      required
+                      disabled={locked}
+                      className="font-mono text-caption"
+                      value={upstream}
+                      onChange={(e) => setUpstream(e.target.value)}
+                      {...aria}
+                    />
+                  )}
+                </Field>
+              </div>
+              {account && (
+                <p className="model-account-groups hint flex flex-wrap items-center gap-x-1.5 gap-y-1 text-caption">
+                  <span>该账号可服务的分组：</span>
+                  <GroupBadges groups={account.doc.groups ?? []} empty="—（账号未设分组）" />
+                </p>
+              )}
+            </>
+          ) : schema && "error" in schema ? (
+            <div className="f">
+              <span>选路策略</span>
+              <div className="note crit m-0" role="alert">
+                {schema.error}
+              </div>
             </div>
-          </>
-        ) : schema && "error" in schema ? (
-          <div className="f">
-            <span>选路策略</span>
-            <div className="note crit m-0" role="alert">
-              {schema.error}
-            </div>
-          </div>
-        ) : (
-          <RoutingModeField
-            value={{ strategy: shownStrategy, affinity }}
-            onChange={(next) => { setStrategy(next.strategy); setAffinity(next.affinity); }}
-            disabled={locked || strategies === null}
-            strategies={strategies}
-            storedHashOn={routing.hash_on}
-            error={at("/routing/strategy")}
-            hashError={at("/routing/hash_on")}
-          />
-        )}
-      </div>
+          ) : (
+            <RoutingModeField
+              value={{ strategy: shownStrategy, affinity }}
+              onChange={(next) => { setStrategy(next.strategy); setAffinity(next.affinity); }}
+              disabled={locked || strategies === null}
+              strategies={strategies}
+              storedHashOn={routing.hash_on}
+              error={at("/routing/strategy")}
+              hashError={at("/routing/hash_on")}
+            />
+          )}
+        </div>
+      </section>
 
-      {shape === "direct" && <CooldownEditor value={cooldown} disabled={locked} onChange={setCooldown} onValidityChange={setCooldownProblem} error={at("/cooldown")} />}
+      {shape === "direct" && (
+        <section className="model-form-section model-cooldown" aria-label="故障冷却配置">
+          <h3>故障冷却</h3>
+          <CooldownEditor value={cooldown} disabled={locked} onChange={setCooldown} onValidityChange={setCooldownProblem} error={at("/cooldown")} />
+        </section>
+      )}
 
 
       {shape === "routing" && (
-        <div className="ops-form-section @container">
+        <div className="ops-form-section model-form-section @container">
           <h4 className="mb-3 text-body font-semibold">路由目标（{rows.length}）</h4>
-          <div className="ops-target-list overflow-hidden rounded-cell border border-line">
+          <div className="ops-target-list model-target-list">
             <div aria-hidden="true" className={cn(MANUAL_ROW, "hidden border-b border-line bg-well px-3 py-2 text-caption font-medium text-ink-soft @lg:grid")}>
               <span>目标模型</span>
               <span>权重</span>
@@ -1039,7 +1059,7 @@ function ModelForm({
         </div>
       )}
 
-      <div className={FORM_FOOTER}>
+      <div className={cn(FORM_FOOTER, "model-form-footer")}>
         {readOnly ? (
           <Button type="button" onClick={onClose}>
             关闭
