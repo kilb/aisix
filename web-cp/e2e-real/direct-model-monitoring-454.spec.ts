@@ -94,7 +94,7 @@ test("#98 defaults to one hour and ranks actual direct-model failure rates with 
   const warning = failedRow.getByRole("cell").nth(2).getByText(ratioText(failed.failure_rate), { exact: true });
   const colors = await warning.evaluate(element => {
     const sample = document.createElement("span");
-    sample.style.color = "var(--color-danger-fg)";
+    sample.style.color = "var(--color-danger)";
     element.append(sample);
     const expected = getComputedStyle(sample).color;
     sample.remove();
