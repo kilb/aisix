@@ -9,7 +9,7 @@ export function CopyButton({
   text,
   label = "复制",
   size,
-  kind = "secondary",
+  kind = "quiet",
   disabled = false,
   disabledReason,
   onFailed,
@@ -22,7 +22,7 @@ export function CopyButton({
   text: string | (() => Promise<string>);
   label?: string;
   size?: "sm";
-  kind?: "primary" | "secondary";
+  kind?: "primary" | "secondary" | "quiet";
   /** Off, with `disabledReason` saying why: the button keeps its place in a row. */
   disabled?: boolean;
   disabledReason?: string;

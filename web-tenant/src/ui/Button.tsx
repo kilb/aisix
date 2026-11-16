@@ -14,7 +14,7 @@ export interface ButtonProps extends ComponentProps<"button"> {
    * `danger` 仅用于破坏性操作第二步，以危险色与确认文字区分；`quiet` 为安静文本操作。
    */
   kind?: ButtonKind;
-  /** 保留 sm 调用接口；两种尺寸均有 44px 命中区。 */
+  /** 默认 40px，sm 为 32px；移动和粗指针统一为 44px。 */
   size?: "sm";
   /** Takes the full width of its container. */
   block?: boolean;
@@ -51,13 +51,13 @@ const buttonClass = cva(
         danger: "border border-destructive bg-destructive text-destructive-foreground enabled:hover:bg-destructive/90",
         quiet: "border border-transparent text-text-2 enabled:hover:bg-foreground/6 enabled:hover:text-foreground",
       },
-      size: { md: "h-11 min-w-11 px-5", sm: "h-11 min-w-11 px-4 text-body" },
+      size: { md: "h-(--h-control) min-h-(--h-control) min-w-(--h-control) px-4", sm: "h-(--h-control-sm) min-h-(--h-control-sm) min-w-(--h-control-sm) px-3 text-caption" },
       iconOnly: { true: "px-0", false: "" },
       block: { true: "w-full", false: "" },
     },
     compoundVariants: [
-      { iconOnly: true, size: "md", className: "w-11" },
-      { iconOnly: true, size: "sm", className: "w-11" },
+      { iconOnly: true, size: "md", className: "w-(--h-control)" },
+      { iconOnly: true, size: "sm", className: "w-(--h-control-sm)" },
       { kind: "quiet", iconOnly: false, size: "md", className: "px-4" },
       { kind: "quiet", iconOnly: false, size: "sm", className: "px-3" },
     ],
@@ -69,7 +69,7 @@ const buttonClass = cva(
  * submit says `type="submit"`.
  */
 export function Button({
-  kind = "secondary",
+  kind: requestedKind,
   size,
   block = false,
   icon,
@@ -87,6 +87,8 @@ export function Button({
 }: ButtonProps) {
   const tipId = useId();
   const iconOnly = explicitIconOnly ?? (icon !== undefined && (children === undefined || children === null || children === false));
+  // 无文字的辅助操作默认使用轻量图标，显式主操作仍保留其语义。
+  const kind = requestedKind ?? (iconOnly ? "quiet" : "secondary");
   // Disabled with a stated reason: focusable, so the reason reaches the keyboard too.
   const reasoned = disabled && !busy && disabledReason !== undefined;
   const classes = cn(

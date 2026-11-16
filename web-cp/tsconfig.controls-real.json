@@ -1,0 +1,7 @@
+{
+  "extends": "./tsconfig.json",
+  "include": [
+    "e2e-real/controls-density.spec.ts",
+    "playwright.controls-real.config.ts"
+  ]
+}

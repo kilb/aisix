@@ -1,19 +1,19 @@
 /* 双端逐字节共享的运维语义令牌。浅色默认、深色仅由手动开关设置。
-   旧变量名保留兼容；墨色承载交互，橙色只标记当前项与重点数据。 */
+   旧变量名保留兼容；蓝色承载交互，青绿与琥珀区分数据和状态。 */
 :root {
   color-scheme: light;
-  --bento-canvas: #ECEAE4;
-  --bento-surface: #FBFAF7;
-  --bento-well: #E1DED6;
-  --bento-stone: #D9D5CB;
-  --bento-line: #D7D4CC;
-  --bento-graphite: #7A7871;
-  --bento-ink: #121211;
-  --bento-ink-soft: #4A4944;
-  --bento-muted: #64635D;
-  --bento-inverse-muted: #A3A29B;
-  --bento-accent: #FF5A1F;
-  --brand-dot: #FF5A1F;
+  --bento-canvas: #F4F7FB;
+  --bento-surface: #FFFFFF;
+  --bento-well: #EDF3F9;
+  --bento-stone: #DCE5F0;
+  --bento-line: #DCE4EE;
+  --bento-graphite: #64748B;
+  --bento-ink: #17243A;
+  --bento-ink-soft: #40516B;
+  --bento-muted: #5D6D83;
+  --bento-inverse-muted: #B6C4D6;
+  --bento-accent: #0891B2;
+  --brand-dot: #2563EB;
 
   --background: var(--bento-canvas);
   --foreground: var(--bento-ink);
@@ -22,7 +22,7 @@
   --popover: var(--card);
   --popover-foreground: var(--foreground);
   --primary: var(--brand);
-  --primary-foreground: var(--bento-surface);
+  --primary-foreground: #FFFFFF;
   --secondary: var(--bento-canvas);
   --secondary-foreground: var(--foreground);
   --muted: var(--bento-canvas);
@@ -32,7 +32,7 @@
   --destructive: var(--danger);
   --destructive-foreground: var(--bento-surface);
   --border: var(--bento-line);
-  --input: #86847E;
+  --input: #7C8FA9;
   --ring: var(--brand);
   --radius: 8px;
   --sidebar: var(--card);
@@ -41,24 +41,24 @@
   --sidebar-border: var(--border);
 
   /* 状态始终附文字与形状；品牌交互与结果语义分别着色。 */
-  --info: #121211;
-  --success: #15764B;
-  --warning: #875900;
-  --danger: #B92E2E;
-  --info-soft: #E1DED6;
-  --success-soft: #EDF8F1;
-  --warning-soft: #FFF7E6;
-  --danger-soft: #FFF0F0;
-  --brand: var(--bento-ink);
+  --info: #0E7490;
+  --success: #0F766E;
+  --warning: #B45309;
+  --danger: #BC303D;
+  --info-soft: #ECF8FC;
+  --success-soft: #ECF8F4;
+  --warning-soft: #FFF7E8;
+  --danger-soft: #FFF0F2;
+  --brand: #2563EB;
   --brand-ink: var(--brand);
   --wash-1: transparent;
   --wash-2: transparent;
   --route-1: var(--brand);
-  --route-2: #68665E;
-  --route-3: #777166;
-  --route-4: var(--bento-graphite);
-  --route-5: var(--bento-ink-soft);
-  --route-6: var(--bento-muted);
+  --route-2: #0E7490;
+  --route-3: #0F766E;
+  --route-4: #B45309;
+  --route-5: #7C3AED;
+  --route-6: #B93A65;
 
   --bg: var(--background);
   --surface: var(--card);
@@ -72,20 +72,20 @@
   --text-muted: var(--muted-foreground);
   --divider: var(--border);
   --input-border: var(--input);
-  --input-border-hover: var(--bento-graphite);
+  --input-border-hover: #57769D;
   --box-border: var(--input);
   --focus: var(--ring);
-  --focus-halo: transparent;
+  --focus-halo: color-mix(in srgb, var(--brand) 12%, transparent);
   --link: var(--brand);
   --error: var(--danger);
-  --hover: color-mix(in srgb, var(--foreground) 5%, transparent);
-  --press: color-mix(in srgb, var(--foreground) 8%, transparent);
-  --row-hover: #F4F3F0;
+  --hover: color-mix(in srgb, var(--brand) 6%, transparent);
+  --press: color-mix(in srgb, var(--brand) 10%, transparent);
+  --row-hover: #EEF4FC;
   --chip: var(--muted);
   --skeleton: var(--bento-well);
   --scrollbar: var(--bento-graphite);
   --scroll-shadow: transparent;
-  --selection: color-mix(in srgb, var(--foreground) 15%, transparent);
+  --selection: color-mix(in srgb, var(--brand) 16%, transparent);
   --tooltip-bg: var(--bento-ink);
   --tooltip-text: var(--bento-surface);
   --route-line: var(--foreground);
@@ -105,7 +105,7 @@
   --paper: var(--card);
   --canvas: var(--background);
   --line: var(--bento-line);
-  --line-press: var(--foreground);
+  --line-press: var(--brand);
   --proceed: var(--success);
   --stop: var(--danger);
   --sign: var(--primary);
@@ -136,9 +136,9 @@
   --type-figure: 28px;
   --type-value: 28px;
   --type-lead: 14px;
-  --card-pad: 18px;
-  --card-gap: 14px;
-  --page-heading-gap: 16px;
+  --card-pad: 16px;
+  --card-gap: 12px;
+  --page-heading-gap: 12px;
   --s-1: 4px;
   --s-2: 8px;
   --s-3: 12px;
@@ -167,8 +167,8 @@
   --r-panel: 14px;
   --r-rail: 20px;
   --r-round: 9999px;
-  --h-control: 44px;
-  --h-control-sm: 44px;
+  --h-control: 40px;
+  --h-control-sm: 32px;
   --h-row: 40px;
   --h-row-compact: 40px;
   --h-head: 40px;
@@ -185,34 +185,40 @@
 
 /* 深色按用途重新分层，保持相同语义和手动主题选择。 */
 :root[data-theme="dark"] {
-  --row-hover: #2B2B26;
+  --row-hover: #23334D;
   color-scheme: dark;
-  --bento-canvas: #1B1B18;
-  --bento-surface: #242420;
-  --bento-well: #30302A;
-  --bento-stone: #605E55;
-  --bento-line: #4C4A42;
-  --bento-graphite: #A6A298;
-  --bento-ink: #F2F0E9;
-  --bento-ink-soft: #D4D0C5;
-  --bento-muted: #B9B6AD;
-  --bento-accent: #FF5A1F;
-  --primary-foreground: #1B1B18;
-  --destructive-foreground: #1B1B18;
-  --input: #99958A;
-  --info: #F2F0E9;
-  --success: #6DD6A1;
-  --warning: #F0C369;
-  --danger: #FF9494;
-  --info-soft: #30302A;
-  --success-soft: #163C2C;
-  --warning-soft: #3F321D;
-  --danger-soft: #45272C;
-  --route-2: #B9B6AD;
-  --route-3: #CAC4B4;
-  --tooltip-bg: #F2F0E9;
-  --tooltip-text: #1B1B18;
+  --bento-canvas: #101827;
+  --bento-surface: #192438;
+  --bento-well: #24334A;
+  --bento-stone: #42556F;
+  --bento-line: #35465F;
+  --bento-graphite: #95A7C0;
+  --bento-ink: #EAF0F9;
+  --bento-ink-soft: #C7D4E8;
+  --bento-muted: #AEBDD2;
+  --bento-accent: #38BDF8;
+  --primary-foreground: #10203A;
+  --destructive-foreground: #2B111A;
+  --input: #7188A6;
+  --info: #67D2ED;
+  --success: #63D4BD;
+  --warning: #F7C573;
+  --danger: #FF9DA8;
+  --info-soft: #193A4B;
+  --success-soft: #173C37;
+  --warning-soft: #42321E;
+  --danger-soft: #462733;
+  --route-2: #67D2ED;
+  --route-3: #63D4BD;
+  --tooltip-bg: #EAF0F9;
+  --tooltip-text: #101827;
   --mark-tile: #121211;
+  --brand: #7CB7FF;
+  --brand-dot: #7CB7FF;
+  --input-border-hover: #A3BBDD;
+  --route-4: #F7C573;
+  --route-5: #C5A7FF;
+  --route-6: #F1A4C4;
   --shadow-float: none;
 }
 
@@ -232,4 +238,12 @@
 [data-theme-changing] *::before,
 [data-theme-changing] *::after {
   transition-property: opacity, transform, translate, scale, rotate, visibility !important;
+}
+
+/* 移动和粗指针保持足够触达；桌面采用同一行一致的常规与紧凑高度。 */
+@media (max-width: 719px), (pointer: coarse) {
+  :root {
+    --h-control: 44px;
+    --h-control-sm: 44px;
+  }
 }

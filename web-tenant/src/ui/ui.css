@@ -1,6 +1,6 @@
 /* Bento 控件样式；交互状态保持 CONTRACT.md，值来自共享 tokens.css。 */
 
-/* 凹槽中的次级文字采用更深一档；嵌套暖白面板继承后仍保持 AA，状态色独立。 */
+/* 凹槽中的次级文字采用更深一档；嵌套白色面板继承后仍保持 AA，状态色独立。 */
 .secret,
 .target,
 .tn-override,
@@ -31,6 +31,7 @@
 
 /* ── Buttons: shape and colour are Tailwind classes (Button.tsx); here only
    the busy spinner and the disabled-reason tooltip. ─────────────── */
+.btn:focus-visible { box-shadow: 0 0 0 4px var(--focus-halo); }
 .btn.is-busy:disabled {
   opacity: 1;
   cursor: progress;
@@ -99,7 +100,7 @@
   min-width: 0;
   margin: 0;
 }
-.f { gap: 8px; }
+.f { gap: 6px; }
 .f-label,
 .field > legend {
   color: var(--foreground);
@@ -520,7 +521,7 @@ main { counter-reset: bento-card; }
   flex-wrap: wrap;
   align-items: flex-end;
   justify-content: space-between;
-  gap: 16px 24px;
+  gap: 12px 20px;
   margin-bottom: var(--page-heading-gap);
 }
 .bento-page-header > :first-child { min-width: 0; flex: 1 1 360px; }
@@ -541,7 +542,7 @@ main { counter-reset: bento-card; }
 /* 旧 inverse 标记保留为兼容钩子，运维信息使用同一面板层级。 */
 .panel[data-tone="inverse"] { background: var(--card); color: var(--foreground); }
 @media (max-width: 719px) {
-  .bento-page-header { gap: 20px; }
+  .bento-page-header { gap: 12px; }
   .bento-page-header h1 { font-size: var(--fs-44); }
   .toasts { right: 16px; left: 16px; align-items: stretch; }
 }
@@ -566,7 +567,7 @@ main { counter-reset: bento-card; }
 .side-head > h2 { overflow: visible; white-space: normal; overflow-wrap: anywhere; }
 @media (max-width: 719px) {
   .panel { --pad: 16px; }
-  .bento-page-header { gap: 12px; margin-bottom: 20px; }
+  .bento-page-header { gap: 12px; margin-bottom: var(--page-heading-gap); }
   .bento-page-header > :first-child { flex-basis: 100%; }
   .bento-page-header h1 { line-height: 34px; }
   .empty { padding: 24px 8px; }

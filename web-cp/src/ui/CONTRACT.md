@@ -4,11 +4,11 @@
 
 ## 视觉与主题
 
-双端使用 Refined 暖石灰视觉：画布 #ECEAE4、暖白面板 #FBFAF7、嵌套区 #E1DED6、墨色 #121211、次级文字 #64635D。主按钮、链接和焦点使用墨色；#FF5A1F 仅用于当前导航小点、实时点与重点图形，不用于浅底小字。成功、警告、失败仍附状态文字与图形。颜色原值集中在 tokens.css，不在业务页面另建主题。
+双端使用冷灰画布 #F4F7FB、白色面板 #FFFFFF、蓝灰嵌套区 #EDF3F9、正文 #17243A、次级文字 #5D6D83。主按钮、链接和焦点使用蓝色 #2563EB；青色 #0891B2 用于强调图形，青绿 #0F766E 与琥珀 #B45309 区分成功和警告。状态仍附文字与图形，普通控件边界使用柔和蓝灰。颜色原值集中在 tokens.css，不在业务页面另建主题。
 
-页面标题28px、手机26px；hero36px、display32px、figure/value28px，手机hero32px、其余28px，指标400字重。正文与导航14px，描述13px，meta/micro最少12px。CardHeader为16px/600，页标题500。中文普通标签使用sans，等宽用于机器标识与代码。面板padding18px、手机16px；内容gap14px、区域16px、面板圆角24px，按钮与输入框圆角8px。默认控件命中区44px；表格compact选择器与菜单在桌面为36px，手机或粗指针恢复44px。面板用细边线分层，不使用投影、装饰渐变或入场位移。
+页面标题28px、手机26px；hero36px、display32px、figure/value28px，手机hero32px、其余28px，指标400字重。正文与导航14px，描述13px，meta/micro最少12px。CardHeader为16px/600，页标题500。中文普通标签使用sans，等宽用于机器标识与代码。面板padding16px；内容与区域gap12px、页头下间距12px、面板圆角14px，按钮与输入框圆角8px。常规控件40px；sm按钮、compact选择器与菜单在桌面为32px，手机或粗指针统一44px。面板用细边线分层，不使用投影、装饰渐变或入场位移。
 
-桌面侧栏224px，距离视口左、上、下24px，与主内容间距24px；圆角24px，暖白面板，菜单独立滚动，账号固定在底部。当前项采用淡墨底、墨字与橙点。页头融入画布；宽表只在自身容器滚动。窄屏使用保留焦点合同的抽屉，距离视口16px，内容按原断点重排。
+桌面侧栏224px，距离视口左、上、下24px，与主内容间距24px；圆角24px，暖白面板，菜单独立滚动，账号固定在底部。当前项采用浅色填充与品牌色小点。页头融入画布；宽表只在自身容器滚动。窄屏使用保留焦点合同的抽屉，距离视口16px，内容按原断点重排。
 
 主题默认浅色，不读取系统主题；现有手动开关、两端独立storage key、preload与同源字体加载保持。深色按画布/面板/嵌套区分层，保留同样的颜色语义和AA对比要求。历史 `--muted` / `--accent` 仍是中性填充别名；canonical text-muted是次级文字，accent映射品牌。on-inverse-muted在旧卡片回归普通面板后映射次级文字，避免浅底浅字。
 
@@ -16,17 +16,17 @@
 
 ## 控件行为
 
-**Button**：kind 为 primary（墨色实底主操作）、secondary（默认轮廓）、danger（危险色破坏性第二步实底）或 quiet。两种 size（默认/sm）均至少44×44；sm 只减少横向 padding。block 填满容器；icon 装饰，无文字时须有 aria-label；type 默认为 button。busy 禁用重复提交、保持标签占位，读屏名称 busyLabel 默认“处理中…”。与 busy 共用锁的其它操作使用 disabled。disabledReason 用于屏幕没有解释的禁用原因：按钮保留焦点，以 aria-disabled 阻止点击，tooltip 同时支持 hover/键盘并接入 aria-describedby。焦点为2px+offset2，不用颜色或移动来制造按压效果。
+**Button**：kind 为 primary（蓝色实底主操作）、secondary（默认柔和轮廓）、danger（危险色破坏性第二步实底）或 quiet（无常驻边框或底色的轻操作）。默认40px，sm为32px，手机或粗指针均44px；没有显式kind的纯图标操作默认quiet。block 填满容器；icon 装饰，无文字时须有 aria-label；type 默认为 button。busy 禁用重复提交、保持标签占位，读屏名称 busyLabel 默认“处理中…”。与 busy 共用锁的其它操作使用 disabled。disabledReason 用于屏幕没有解释的禁用原因：按钮保留焦点，以 aria-disabled 阻止点击，tooltip 同时支持 hover/键盘并接入 aria-describedby。焦点为蓝色2px+offset2，输入与菜单附柔和蓝色光晕，不用移动来制造按压效果。
 
 **Field**：label、hint、error、wide、children API 不变。children 可为 control 或接收 aria 的函数；有 hint/refusal 必须用函数并 spread。label 包裹控件；hint/error 由 useId 连接 aria-describedby；拒绝控件 aria-invalid 与虚线边框，原因文字在下方，危险色不替代原因说明。field-problem 没有 alert role，随字段读出。提交拒绝时 useRefusalFocus 将焦点移到第一处被拒字段，fieldset 选第一个可聚焦控件；没有字段拒绝则保留焦点，由表单 note.crit role=alert 说明。checkbox/radio 可保持18px视觉，但可点击 label 至少44px。
 
-**Select / MultiSelect / Menu**：双端共享同一Radix原语与dropdown.css。单选使用value/onValueChange/options，兼容option/optgroup/Fragment描述符；空字符串保留原值，name/required/form保持原生表单合同。默认表单44px，size=compact桌面36px、手机或粗指针44px；紧凑触发器与表格行对齐，长文字在触发器省略、弹层折行。弹层通过Portal脱离表格overflow，与触发器对齐并在视口边缘翻转/约束；不扩大表格单元格。键盘方向键/Home/End/类型检索与Enter选取由Radix管理；Escape和外点收起并保留焦点合同。MultiSelect保留数组原值，勾选后保持展开。Menu使用label/items，disabled项不能选择，danger项始终附具体操作文字。拒绝态保持aria-invalid/aria-describedby和虚线边框。
+**Select / MultiSelect / Menu**：双端共享同一Radix原语与dropdown.css。单选使用value/onValueChange/options，兼容option/optgroup/Fragment描述符；空字符串保留原值，name/required/form保持原生表单合同。默认表单40px，size=compact桌面32px、手机或粗指针均44px；紧凑触发器与表格行对齐，长文字在触发器省略、弹层折行。弹层通过Portal脱离表格overflow，与触发器对齐并在视口边缘翻转/约束；不扩大表格单元格。键盘方向键/Home/End/类型检索与Enter选取由Radix管理；Escape和外点收起并保留焦点合同。MultiSelect保留数组原值，勾选后保持展开。Menu使用label/items，disabled项不能选择，danger项始终附具体操作文字。拒绝态保持aria-invalid/aria-describedby和虚线边框。
 
 **Toast**：ToastProvider/useToast API 不变，动词对应操作（保存→已保存），底部显示，无入场动作，停留3秒、离开200ms，最多3条。栈是 polite live region，无额外 role，避免与 status/alert 争读。announce 默认 true；只有页面自己的活区已读相同消息才 false。toast 不能是消息的唯一载体。
 
 **TwoStep**：label/onConfirm/disabled/kind/size/ask/warning/busy/busyLabel API 不变。first click 切到精确的“确认<label>”和“取消”；ask=false 时直接执行。确认文字体现破坏性，不依靠颜色。键盘打开后焦点移到取消，第二次 Enter 仅收回；关闭归还原操作，除非页面已将焦点移到拒绝字段。Escape 只收回当前确认、不关闭外层面板。warning role=alert。确认后保持展开，busy 禁用确认和取消，Escape 不得打断；请求结束才收回。busy 名称保留原标签，或采用 busyLabel。切换不播放宽度或淡入动画；上述询问、确认与焦点状态机保持。
 
-**CopyButton**：text 为字符串或按需请求，label 默认“复制”；size/kind/disabled/disabledReason 与 Button 一致；始终只显示 Copy/Check 图标，aria-label/title 保留操作与成功名称；成功 Check 持续1.5秒并 toast；请求中禁止重复。失败通过 onFailed 显示原因，保留手工选择复制路径。
+**CopyButton**：text 为字符串或按需请求，label 默认“复制”；size/kind/disabled/disabledReason 与 Button 一致，kind默认quiet；始终只显示 Copy/Check 图标，aria-label/title 保留操作与成功名称；成功 Check 持续1.5秒并 toast；请求中禁止重复。失败通过 onFailed 显示原因，保留手工选择复制路径。
 
 **KeySecret**：prefix/reveal/unavailable/onError API 不变，明文仅组件内存，刷新丢失，禁止存储/日志/额外缓存。正常只显示前缀遮罩与复制图标，复制按需 reveal 后一次复制；无显示/隐藏控件。没有明文时给禁用原因；clipboard 失败时在按钮下保留 readonly 明文供手动选择，刷新或离页清除。
 

@@ -47,14 +47,14 @@ export function TagInput({
       ) : (
         <ul className="tags">
           {value.map((name) => (
-            <li key={name} className="h-auto min-h-11 max-w-full gap-1 rounded-cell border border-line bg-well py-0 pr-0 pl-3 text-caption text-ink-soft [overflow-wrap:anywhere]">
+            <li key={name} className="h-auto min-h-(--h-control) max-w-full gap-1 rounded-cell border border-line bg-well py-0 pr-0 pl-3 text-caption text-ink-soft [overflow-wrap:anywhere]">
               {name}
               {!readOnly && (
                 <button
                   type="button"
                   aria-label={`移除 ${name}`}
                   title={`移除 ${name}`}
-                  className="size-11 shrink-0 rounded-full text-ink-soft hover:bg-stone hover:text-ink"
+                  className="size-(--h-control) shrink-0 rounded-full text-ink-soft hover:bg-stone hover:text-ink"
                   onClick={() => onChange(value.filter((v) => v !== name))}
                 />
               )}

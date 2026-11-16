@@ -81,21 +81,21 @@ table, .num, .money, .tabular { font-variant-numeric: tabular-nums; }
   font-weight: 400;
 }
 
-/* 普通控件统一 44px；拒绝态同时保留危险色、边型和原因文本。 */
-button { min-width: 44px; min-height: 44px; }
+/* 常规与紧凑控件分别使用共享高度；拒绝态同时保留危险色、边型和原因文本。 */
+button { min-width: var(--h-control); min-height: var(--h-control); }
 input:not([type="checkbox"], [type="radio"], [type="range"], [type="color"], [type="file"]),
 select, textarea {
   width: 100%;
   min-width: 0;
   height: var(--h-control);
-  padding: 0 14px;
+  padding: 0 12px;
   border: 1px solid var(--input);
   border-radius: var(--r-input);
   background-color: var(--card);
   color: var(--foreground);
   font-size: 14px;
   line-height: 20px;
-  transition: border-color 120ms ease, background-color 120ms ease;
+  transition: border-color 120ms ease, background-color 120ms ease, box-shadow 120ms ease;
 }
 input::placeholder, textarea::placeholder { color: var(--muted-foreground); opacity: 1; }
 input::-webkit-inner-spin-button, input::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
@@ -105,6 +105,7 @@ input[type="number"] { -moz-appearance: textfield; appearance: textfield; }
   border-color: var(--ring);
   outline: 2px solid var(--ring);
   outline-offset: 2px;
+  box-shadow: 0 0 0 4px var(--focus-halo);
 }
 :is(input, select, textarea)[aria-invalid="true"] { border-color: var(--danger); border-style: dashed; }
 :is(input, select, textarea):disabled { opacity: 0.5; cursor: not-allowed; background-color: var(--muted); }
@@ -113,7 +114,7 @@ textarea { height: auto; min-height: var(--h-control); padding: 12px 14px; resiz
 select {
   appearance: none;
   padding-right: 36px;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4.5 6.5 8 10l3.5-3.5' fill='none' stroke='%2364635D' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4.5 6.5 8 10l3.5-3.5' fill='none' stroke='%235D6D83' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
   background-repeat: no-repeat;
   background-position: right 12px center;
   background-size: 16px 16px;
@@ -121,7 +122,7 @@ select {
   text-overflow: ellipsis;
 }
 :root[data-theme="dark"] select {
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4.5 6.5 8 10l3.5-3.5' fill='none' stroke='%23ECEAE4' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4.5 6.5 8 10l3.5-3.5' fill='none' stroke='%23AEBDD2' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
 }
 input[type="checkbox"], input[type="radio"] {
   appearance: none;
@@ -141,10 +142,10 @@ input[type="radio"] { border-radius: 50%; }
 input[type="checkbox"]:checked {
   border-color: var(--primary);
   background-color: var(--primary);
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 6.25 4.75 8.5 9.5 3.5' fill='none' stroke='%23FBFAF7' stroke-width='1.75' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 6.25 4.75 8.5 9.5 3.5' fill='none' stroke='%23FFFFFF' stroke-width='1.75' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
 }
 :root[data-theme="dark"] input[type="checkbox"]:checked {
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 6.25 4.75 8.5 9.5 3.5' fill='none' stroke='%23121211' stroke-width='1.75' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 6.25 4.75 8.5 9.5 3.5' fill='none' stroke='%2310203A' stroke-width='1.75' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
 }
 input[type="radio"]:checked { border: 5px solid var(--primary); }
 :is(input[type="checkbox"], input[type="radio"]):focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }

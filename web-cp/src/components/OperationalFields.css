@@ -1,10 +1,10 @@
 /* 专用复合字段仍沿用 label / control / helper / error 的同一层级。 */
-.operational-field { min-width: 0; margin-bottom: 20px; }
+.operational-field { min-width: 0; margin-bottom: 16px; }
 .operational-field > .hint { margin-top: 6px; line-height: 20px; }
 .operational-field > .field-problem { margin-top: 6px; line-height: 20px; }
 .operational-secret > label { gap: 8px; }
 .operational-secret .secret {
-  min-height: 44px;
+  min-height: var(--h-control);
   border-radius: 8px;
   background: var(--well);
 }
@@ -12,7 +12,7 @@
 .operational-tags .tags { gap: 8px; }
 .operational-tags .tags li {
   max-width: 100%;
-  min-height: 44px;
+  min-height: var(--h-control);
   border-radius: 8px;
   font-family: inherit;
   font-size: 13px;

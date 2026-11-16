@@ -6,14 +6,14 @@ import { readTokens } from "./contrast.ts";
 const source = (file: string): string => readFileSync(new URL(`../${file}`, import.meta.url), "utf8");
 
 // 约束令牌与布局声明；真实渲染、焦点和横滚由真实后端 E2E 验收。
-test("refined 使用暖石灰画布、暖白面板、墨色交互与独立橙色强调", () => {
+test("refined 使用冷灰画布、白色面板、蓝色交互与青色强调", () => {
   const tokens = readTokens(source("theme/tokens.css"), "light");
   for (const [name, value] of Object.entries({
-    "--background": "#ECEAE4", "--card": "#FBFAF7", "--well": "#E1DED6",
-    "--foreground": "#121211", "--muted-foreground": "#64635D", "--bento-accent": "#FF5A1F",
-    "--primary": "#121211", "--link": "#121211", "--ring": "#121211",
+    "--background": "#F4F7FB", "--card": "#FFFFFF", "--well": "#EDF3F9",
+    "--foreground": "#17243A", "--muted-foreground": "#5D6D83", "--bento-accent": "#0891B2",
+    "--primary": "#2563EB", "--link": "#2563EB", "--ring": "#2563EB",
   })) assert.equal(tokens[name], value, name);
-  assert.equal(tokens["--h-control"], "44px");
+  assert.equal(tokens["--h-control"], "40px");
   assert.equal(tokens["--shadow-float"], "none");
 });
 

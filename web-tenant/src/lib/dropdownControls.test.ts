@@ -45,8 +45,8 @@ test("选择与操作菜单保留键盘、空值、多选、表单、拒绝状�
     await page.addScriptTag({ content: compiled.outputFiles[0]!.text });
     const role = page.getByRole("combobox", { name: "角色", exact: true });
     await expect(role).toHaveText("全部角色");
-    assert.equal((await role.boundingBox())?.height, 36);
-    assert.equal((await page.getByRole("combobox", { name: "必填角色", exact: true }).boundingBox())?.height, 44);
+    assert.equal((await role.boundingBox())?.height, 32);
+    assert.equal((await page.getByRole("combobox", { name: "必填角色", exact: true }).boundingBox())?.height, 40);
     if (process.env.DROPDOWN_QA_OUTPUT) { await mkdir(process.env.DROPDOWN_QA_OUTPUT, { recursive: true }); await page.screenshot({ path: join(process.env.DROPDOWN_QA_OUTPUT, "dropdown-component-1280.png") }); }
     await page.setViewportSize({ width: 375, height: 667 });
     await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => resolve())));

@@ -18,7 +18,7 @@ export function PageHeader({
       <div className="min-w-0">
         <h1 className="text-title font-semibold">{title}</h1>
         {(dataLead ?? description) != null && (
-          <div className="bento-lead mt-2 text-lead font-normal text-ink-soft">{dataLead ?? description}</div>
+          <div className="bento-lead mt-1.5 text-lead font-normal text-ink-soft">{dataLead ?? description}</div>
         )}
         {dataLead != null && description != null && <div className="mt-1.5 text-caption text-muted">{description}</div>}
       </div>
@@ -92,7 +92,7 @@ export function ChartSkeleton({ className, ...props }: ComponentProps<"div">) {
 
 export function CardMessage({ children, onRetry }: { children: ReactNode; onRetry?: () => void }) {
   return (
-    <div className="bento-card-message flex min-h-24 flex-col items-start justify-center gap-3 text-caption text-muted">
+    <div className="bento-card-message flex min-h-16 flex-col items-start justify-center gap-3 text-caption text-muted">
       <div>{children}</div>
       {onRetry && <Button onClick={onRetry}>重试</Button>}
     </div>
@@ -136,7 +136,7 @@ export function Stat({ label, value, foot, className }: { label: ReactNode; valu
 }
 
 export function Toolbar({ className, ...props }: ComponentProps<"div">) {
-  return <div {...props} className={cn("mb-4 flex flex-wrap items-end gap-3", className)} />;
+  return <div {...props} className={cn("mb-3 flex flex-wrap items-end gap-3", className)} />;
 }
 
 export function DescList({ items, className }: { items: { label: ReactNode; value: ReactNode; key?: string }[]; className?: string }) {

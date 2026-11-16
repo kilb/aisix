@@ -63,7 +63,7 @@ export function SecretInput({
       <div className="f operational-field operational-secret" role="group" aria-label={label} {...aria}>
         <span className="f-label">{label}</span>
         {/* Drawn as the field it stands for: the stored state where the text would be, the actions at its end. */}
-        <div className="secret min-h-11 flex-wrap gap-2 rounded-cell border border-line bg-well p-1 pl-3 text-ink-soft">
+        <div className="secret min-h-(--h-control) flex-wrap gap-2 rounded-cell border border-line bg-well p-1 pl-3 text-ink-soft">
           {mode === "keep" ? (
             <Lamp state="applied">已设置</Lamp>
           ) : (
@@ -77,7 +77,7 @@ export function SecretInput({
               type="button"
               size="sm"
               kind="quiet"
-              className="h-11"
+              className="h-(--h-control-sm)"
               onClick={() => {
                 setMode("replace");
                 onChange("");
@@ -91,7 +91,7 @@ export function SecretInput({
               type="button"
               size="sm"
               kind="quiet"
-              className="h-11"
+              className="h-(--h-control-sm)"
               onClick={() => {
                 setMode("clear");
                 onChange(undefined);
@@ -101,7 +101,7 @@ export function SecretInput({
             </Button>
           )}
           {!readOnly && mode === "clear" && (
-            <Button type="button" size="sm" kind="quiet" className="h-11" onClick={keep}>
+            <Button type="button" size="sm" kind="quiet" className="h-(--h-control-sm)" onClick={keep}>
               撤销
             </Button>
           )}
