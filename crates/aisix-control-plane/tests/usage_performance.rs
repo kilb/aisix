@@ -110,6 +110,21 @@ async fn performance_keeps_unknown_distinct_from_zero_and_never_invents_tps() {
         ("text", json!({"upstream_tpot_ms":"20"}), None),
         ("out-of-range", json!({"upstream_tpot_ms":1e200}), None),
         (
+            "missing-output",
+            json!({"completion_tokens":null,"upstream_tpot_ms":20}),
+            None,
+        ),
+        (
+            "zero-output",
+            json!({"completion_tokens":0,"total_tokens":7,"upstream_tpot_ms":20}),
+            None,
+        ),
+        (
+            "one-output",
+            json!({"completion_tokens":1,"total_tokens":8,"upstream_tpot_ms":20}),
+            None,
+        ),
+        (
             "failed",
             json!({"status_code":503,"error_class":"upstream_status","upstream_tpot_ms":20}),
             None,
@@ -169,4 +184,123 @@ async fn performance_keeps_unknown_distinct_from_zero_and_never_invents_tps() {
             assert_eq!(row.get("attempt_duration_ms"), Some(&duration), "{row}");
         }
     }
+}
+
+// 输入、缓存输入或总量不能成为 TPS 分子；正 TPOT 不能替缺失输出制造采样。
+#[tokio::test]
+async fn throughput_uses_only_output_intervals_on_calls_and_monitoring() {
+    let Some((w, model, owner)) = setup().await else {
+        return;
+    };
+    let provider: String = sqlx::query_scalar(
+        "SELECT doc->>'provider_key_id' FROM gw_resources WHERE kind='models' AND id=$1",
+    )
+    .bind(model)
+    .fetch_one(w.cp.db().pool())
+    .await
+    .expect("模型账号");
+    let cases = [
+        (
+            "small-input",
+            json!({"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}),
+            Some(50.0),
+        ),
+        (
+            "large-input",
+            json!({"prompt_tokens":1000000,"completion_tokens":3,"total_tokens":1000003}),
+            Some(50.0),
+        ),
+        (
+            "cache-input",
+            json!({"prompt_tokens":7,"completion_tokens":3,"total_tokens":10,"cache_read_tokens":1000000,"cache_creation_tokens":1000000}),
+            Some(50.0),
+        ),
+        (
+            "reasoning-output",
+            json!({"prompt_tokens":7,"completion_tokens":0,"reasoning_tokens":3,"total_tokens":10}),
+            Some(50.0),
+        ),
+        (
+            "no-output",
+            json!({"prompt_tokens":1000000,"completion_tokens":0,"total_tokens":1000000}),
+            None,
+        ),
+        (
+            "unreported-output",
+            json!({"prompt_tokens":1000000,"completion_tokens":null,"total_tokens":1000000}),
+            None,
+        ),
+    ];
+    let events = cases
+        .iter()
+        .map(|(id, counters, _)| {
+            let mut fields = json!({"model_id":model,"provider_key_id":provider,"status_code":200,
+            "error_class":"","is_final_attempt":true,"upstream_dispatched":true,
+            "upstream_latency_ms":1040,"upstream_ttft_ms":1000,"upstream_tpot_ms":20});
+            fields
+                .as_object_mut()
+                .expect("性能字段")
+                .extend(counters.as_object().expect("用量字段").clone());
+            usage(&w, id, model, fields)
+        })
+        .collect();
+    let delivered = deliver(&w.dp, Uuid::new_v4(), events).await;
+    assert_eq!(delivered.status, 200, "{delivered:?}");
+    assert_eq!(
+        delivered.body.get("rejected"),
+        Some(&json!(0)),
+        "{delivered:?}"
+    );
+    for (path, cookie) in [
+        ("/api/usage/calls", owner.as_str()),
+        ("/admin/pricing/charges", w.admin.cookie()),
+    ] {
+        let response = w.cp.send("GET", path, Some(cookie), None).await;
+        assert_eq!(response.status, 200, "{response:?}");
+        let rows = response.body["items"].as_array().expect("调用记录");
+        for (id, counters, expected) in &cases {
+            let row = rows
+                .iter()
+                .find(|row| row["event_id"] == *id)
+                .expect("已保存事件");
+            assert_eq!(
+                row.get("throughput_tps"),
+                Some(&expected.map_or(Value::Null, |n| json!(n))),
+                "{path}: {row}"
+            );
+            if *id == "unreported-output" {
+                assert!(
+                    row["usage"].get("completion_tokens").is_none(),
+                    "未报告输出不能变成零: {row}"
+                );
+            } else {
+                assert_eq!(
+                    row["usage"].get("completion_tokens"),
+                    counters.get("completion_tokens"),
+                    "输出计数原样保留: {row}"
+                );
+            }
+        }
+    }
+    let response =
+        w.cp.send(
+            "GET",
+            &format!("/admin/usage/direct-models?model_id={model}"),
+            Some(w.admin.cookie()),
+            None,
+        )
+        .await;
+    assert_eq!(response.status, 200, "{response:?}");
+    let throughput = &response.body["totals"]["throughput_tps"];
+    assert_eq!(
+        throughput.get("sample_count"),
+        Some(&json!(4)),
+        "{response:?}"
+    );
+    assert_eq!(
+        throughput.get("missing_count"),
+        Some(&json!(2)),
+        "{response:?}"
+    );
+    assert_eq!(throughput.get("avg"), Some(&json!(50.0)), "{response:?}");
 }

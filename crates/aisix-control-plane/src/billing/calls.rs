@@ -333,7 +333,7 @@ fn event_milliseconds(event: &Value, field: &str) -> Option<u32> {
         .and_then(|ms| u32::try_from(ms).ok())
 }
 
-/// 复用监测中的 TPOT 口径；不从完整耗时、字节参考或缺失字段推算吞吐。
+/// 复用监测中的输出间隔与 TPOT 口径；不从完整耗时、字节参考或缺失字段推算。
 fn measured_throughput(event: &Value) -> Option<f64> {
     let status = event.get("status_code")?.as_u64()?;
     if !(200..300).contains(&status)
@@ -344,6 +344,24 @@ fn measured_throughput(event: &Value) -> Option<f64> {
         || event.get("cache_status").and_then(Value::as_str) == Some("hit")
         || event.get("upstream_dispatched").and_then(Value::as_bool) == Some(false)
     {
+        return None;
+    }
+    let counter = |name| {
+        event
+            .get("usage")?
+            .get(name)?
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+    };
+    let completion = counter("completion_tokens")?;
+    let reasoning = counter("reasoning_tokens").unwrap_or(0);
+    let additive = counter("prompt_tokens")
+        .zip(counter("total_tokens"))
+        .is_some_and(|(prompt, total)| {
+            aisix_core::reasoning_beside_completion(prompt, completion, reasoning, total)
+        });
+    let output = completion.saturating_add(if additive { reasoning } else { 0 });
+    if output < 2 {
         return None;
     }
     let tpot = event.get("upstream_tpot_ms")?.as_f64()?;
@@ -1151,6 +1169,36 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_tpot_without_reported_output_intervals_does_not_show_positive_throughput() {
+        for output in [Value::Null, json!(0), json!(1), json!("3"), json!(-1)] {
+            let view = serde_json::to_value(CallUsage::from_event(&json!({
+                "status_code":200,"error_class":"","upstream_tpot_ms":20,
+                "usage":{"prompt_tokens":1000000,"completion_tokens":output}
+            })))
+            .expect("性能只读投影");
+            assert_eq!(view.get("throughput_tps"), Some(&Value::Null), "{view}");
+        }
+    }
+
+    #[test]
+    fn throughput_retains_reported_reasoning_as_output_without_counting_input() {
+        for usage in [
+            json!({"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}),
+            json!({"prompt_tokens":1000000,"completion_tokens":3,"total_tokens":1000003}),
+            json!({"prompt_tokens":7,"completion_tokens":0,"reasoning_tokens":3,"total_tokens":10}),
+            json!({"prompt_tokens":7,"completion_tokens":1,"reasoning_tokens":2,"total_tokens":10}),
+            json!({"prompt_tokens":7,"completion_tokens":3,"reasoning_tokens":2,"total_tokens":10}),
+        ] {
+            let view = serde_json::to_value(CallUsage::from_event(&json!({
+                "status_code":200,"error_class":"","upstream_tpot_ms":20,"usage":usage
+            })))
+            .expect("性能只读投影");
+            assert_eq!(view.get("throughput_tps"), Some(&json!(50.0)), "{view}");
+            assert_eq!(view.get("usage"), Some(&usage), "输出与计费计数不改写");
+        }
+    }
 
     #[test]
     fn aggregated_upstream_exchanges_keep_lengths_and_usage_without_a_single_call_reference() {

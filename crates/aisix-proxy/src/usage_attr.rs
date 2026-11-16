@@ -2613,6 +2613,35 @@ fn attach_gateway_embedding_audit(event: &mut UsageEvent) {
 
 #[cfg(test)]
 mod tests {
+    // 输入、缓存输入与上游总量混入分子，或重复增加推理，都会改变此实测间隔。
+    #[test]
+    fn generation_tpot_counts_output_intervals_only() {
+        for (prompt, completion, reasoning, total, cache_read, cache_creation, expected) in [
+            (7, 3, 0, 10, 0, 0, Some(20.0)),
+            (1_000_000, 3, 0, 1_000_003, 0, 0, Some(20.0)),
+            (7, 3, 0, 10, 1_000_000, 1_000_000, Some(20.0)),
+            (7, 3, 2, 10, 0, 0, Some(20.0)),
+            (7, 0, 3, 10, 0, 0, Some(20.0)),
+            (7, 0, 0, 7, 0, 0, None),
+            (7, 1, 0, 8, 0, 0, None),
+        ] {
+            let mut event = UsageEvent {
+                status_code: 200,
+                prompt_tokens: prompt,
+                completion_tokens: completion,
+                reasoning_tokens: reasoning,
+                total_tokens: total,
+                cache_read_tokens: cache_read,
+                cache_creation_tokens: cache_creation,
+                upstream_latency_ms: 1040,
+                upstream_ttft_ms: 1000,
+                ..UsageEvent::default()
+            };
+            stamp_latency_breakdown(&mut event, false);
+            assert_eq!(event.upstream_tpot_ms, expected, "{event:?}");
+        }
+    }
+
     #[tokio::test]
     async fn observed_stream_hold_keeps_peek_cancel_debits_in_the_original_attempt() {
         // 删除 bind 或在发射时清空 observer，会使取消后的首个 bucket 丢量。
