@@ -2111,7 +2111,7 @@ mod shared_dispatch_tests {
         ResourceEntry,
     };
     use serde_json::json;
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     use wiremock::{
         matchers::{header as has_header, method, path},
         Mock, MockServer, ResponseTemplate,
@@ -2149,6 +2149,7 @@ mod shared_dispatch_tests {
         );
         let snapshot = SnapshotHandle::new(snapshot);
         let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let database = directory.path().join("native.sqlite");
         std::fs::OpenOptions::new()
             .write(true)

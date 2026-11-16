@@ -2,6 +2,7 @@
 mod frame_allocation {
     use super::*;
     use aisix_response_reference_test_alloc::AllocationScope;
+    use std::os::unix::fs::PermissionsExt;
 
     fn calibrated_scope() -> AllocationScope {
         let calibration = AllocationScope::start();
@@ -22,6 +23,8 @@ mod frame_allocation {
         crate::client_ip::ClientContext,
     ) {
         let directory = tempfile::tempdir().expect("private component database directory");
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private SQLite directory permissions");
         let handle = SnapshotHandle::new(snapshot("http://127.0.0.1:1/v1", "openai", "openai"));
         let store = crate::native_api::standalone_store::StandaloneNativeStore::open(
             &directory.path().join("native.sqlite"),
