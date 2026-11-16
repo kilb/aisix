@@ -186,7 +186,7 @@ function CallLogRow({ call: c, onDetails }: { call: Call; onDetails: (trigger: H
         <ChevronRight aria-hidden="true" />
       </Button>
     </td>
-    <td className="tabular" data-label="时间">{fmtBeijing(c.occurred_at)}</td>
+    <td className="tabular usage-call-time" data-label="时间"><time dateTime={c.occurred_at}><span>{fmtBeijing(c.occurred_at).split(" ")[0]}</span><span>{fmtBeijing(c.occurred_at).split(" ")[1] ?? "—"}</span></time></td>
     <td data-label="模型 / 请求" className="usage-request-identity">
       <strong>{c.model.name || "—"}</strong>
       <span className="cell-note">密钥 {c.api_key.label || "—"} · 成员 {c.member ? (c.member.display_name ?? "成员") : "—"}</span>
@@ -265,9 +265,9 @@ function defaultRange(group: "day" | "month"): { from: string; to: string } {
 const MAX_DAYS = { day: 92, month: 731 } as const;
 
 /** A card that is a region named by its heading. */
-function Section({ title, number, children }: { title: string; number: number; children: ReactNode }) {
+function Section({ title, number, children, className = "" }: { title: string; number: number; children: ReactNode; className?: string }) {
   return (
-    <Card padding="table" role="region" aria-label={title} className={`${span.d12} usage-record-section`}>
+    <Card padding="table" role="region" aria-label={title} className={`${span.d12} usage-record-section ${className}`}>
       <CardHeader number={number} title={title} />
       {children}
     </Card>
@@ -620,8 +620,8 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
   }
 
   return (
-    <Section title="调用记录" number={8}>
-      <Filters>
+    <Section title="调用记录" number={8} className="usage-calls-section">
+      <UsageRecordFilters scope="tenant" value={recordFilters} onChange={patch => update({ outcome: recordFilters.outcome, ...patch, status: undefined })}>
         <Field label="时间起" error={range ? null : "结束日期不能早于开始日期"}>
           <input type="date" value={fromDate} max={toDate || undefined} onChange={(e) => setFromDate(e.target.value)} />
         </Field>
@@ -643,8 +643,7 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
         <Field label="请求 ID">
           <input autoComplete="off" value={typed} onChange={(e) => { setTyped(e.target.value); setRequestEditing(true); }} />
         </Field>
-      </Filters>
-      <UsageRecordFilters scope="tenant" value={recordFilters} onChange={patch => update({ outcome: recordFilters.outcome, ...patch, status: undefined })} />
+      </UsageRecordFilters>
       <RecordTableToolbar search={{ value: searchQuery, onChange: value => update({ q: value }), label: "搜索已加载调用", placeholder: "模型、密钥、成员或请求 ID" }} />
       {query.get("member_id") && <p className="hint" role="status">已按成员 {query.get("member_id")} 筛选。</p>}
       <p className="hint">文字搜索仅筛选已加载记录；调用结果与更多筛选作用于全部匹配记录。</p>

@@ -41,3 +41,18 @@
   .usage-filters > .field { width: 100%; }
   .usage-record-section > :not(.dt-wrap, .record-table-pager) { margin-inline: 4px; }
 }
+
+/* 调用筛选可随主页面吸顶；表格仍只在自己的区域横向滚动。 */
+.usage-record-section.usage-calls-section { overflow: visible; }
+.usage-calls-section > .usage-record-filters { position: sticky; top: 60px; z-index: 20; padding: 12px; border: 1px solid var(--border); border-radius: var(--r-field); background: var(--card); box-shadow: var(--shadow-card); }
+.usage-calls-section .usage-column-time { width: 7.5rem; }
+.usage-calls-section .usage-column-timing { width: 9rem; }
+.usage-calls-section .usage-call-time time, .usage-calls-section .usage-call-time time > span { display: block; white-space: nowrap; }
+.usage-calls-section .usage-call-time time > span:first-child { color: var(--ink); font-weight: 500; }
+.usage-calls-section .usage-call-time time > span + span { margin-top: 3px; color: var(--muted-foreground); font-size: var(--text-caption); }
+.usage-calls-section .tenant-call-table > .dt > tbody > tr > td { padding-block: 12px; vertical-align: top; }
+.usage-calls-section .tenant-call-table .usage-performance { grid-template-columns: minmax(0, 1fr); gap: 3px; text-align: left; }
+.usage-calls-section .tenant-call-table .usage-performance > div { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.usage-calls-section .tenant-call-table .usage-performance dd { margin: 0; white-space: nowrap; font-weight: 500; }
+@media (min-width: 1100px) { .usage-calls-section .usage-record-filter-grid { max-height: calc(100dvh - 180px); overflow-y: auto; overscroll-behavior: contain; } }
+@media (max-width: 1099px) { .usage-calls-section > .usage-record-filters { position: static; } }

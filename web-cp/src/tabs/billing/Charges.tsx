@@ -152,81 +152,32 @@ export function Charges(_props: TabProps) {
           description={rows === null ? (error ? "当前筛选结果读取失败，请重试。" : "正在读取当前筛选结果。") : `当前筛选已加载 ${formatCount(rows.length)} 条${next === null ? "，已到记录末尾。" : "，可继续加载。"}`}
         />
         <div className="charge-filter-controls">
-        <form
-          className="charge-primary-filters"
-          onSubmit={(e) => {
-            e.preventDefault();
-            set({ event_id: eventDraft.trim() || undefined });
-          }}
-        >
-          <label className="f filter">
-            <span>状态</span>
-            <Select size="compact" value={filter.status ?? ""} onValueChange={(value) => set({ status: value || undefined })}>
-              <option value="">全部</option>
-              {STATUSES.map(([v, l]) => (
-                <option key={v} value={v}>
-                  {l}
-                </option>
-              ))}
+        <UsageRecordFilters scope="admin" value={usageRecordFilterValues(query)} onChange={patch => update(patch)} advancedChildren={<ChargeScopeFilters key={JSON.stringify([filter.from, filter.to, filter.member_id, filter.provider_key_id, filter.request_id, filter.model_id])} filter={filter} onChange={set} />}>
+          <label><span>状态</span>
+            <Select size="compact" value={filter.status ?? ""} onValueChange={value => set({ status: value || undefined })}>
+              <option value="">全部</option>{STATUSES.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
             </Select>
           </label>
-          <label className="f filter">
-            <span>租户</span>
-            <Select size="compact"
-              value={filter.tenant_id ?? ""}
-              onValueChange={(value) => set({ tenant_id: value || undefined, api_key_id: undefined })}
-            >
-              <option value="">全部</option>
-              {filter.tenant_id && !tenants.some((tenant) => tenant.id === filter.tenant_id) && <option value={filter.tenant_id}>已选租户（{filter.tenant_id}，当前列表未提供）</option>}
-              {tenants.map((t) => (
-                <option key={t.id} value={t.id}>
-                  {t.name}
-                </option>
-              ))}
+          <label><span>租户</span>
+            <Select size="compact" value={filter.tenant_id ?? ""} onValueChange={value => set({ tenant_id: value || undefined, api_key_id: undefined })}>
+              <option value="">全部租户</option>
+              {filter.tenant_id && !tenants.some(tenant => tenant.id === filter.tenant_id) && <option value={filter.tenant_id}>已选租户（{filter.tenant_id}，当前列表未提供）</option>}
+              {tenants.map(tenant => <option key={tenant.id} value={tenant.id}>{tenant.name}</option>)}
             </Select>
           </label>
-          <label className="f filter">
-            <span>密钥</span>
-            <Select size="compact"
-              value={filter.api_key_id ?? ""}
-              disabled={!filter.tenant_id && !filter.api_key_id}
-              onValueChange={(value) => set({ api_key_id: value || undefined })}
-            >
-              <option value="">全部</option>
-              {filter.api_key_id && !keys.some((key) => key.id === filter.api_key_id) && <option value={filter.api_key_id}>已选密钥（{filter.api_key_id}，当前列表未提供）</option>}
-              {keys.map((k) => (
-                <option key={k.id} value={k.id}>
-                  {k.label} · {k.prefix}
-                </option>
-              ))}
+          <label><span>密钥</span>
+            <Select size="compact" value={filter.api_key_id ?? ""} disabled={!filter.tenant_id && !filter.api_key_id} onValueChange={value => set({ api_key_id: value || undefined })}>
+              <option value="">全部密钥</option>
+              {filter.api_key_id && !keys.some(key => key.id === filter.api_key_id) && <option value={filter.api_key_id}>已选密钥（{filter.api_key_id}，当前列表未提供）</option>}
+              {keys.map(key => <option key={key.id} value={key.id}>{key.label} · {key.prefix}</option>)}
             </Select>
           </label>
-          <label className="f filter">
-            <input
-              type="checkbox"
-              checked={filter.exclude_status === "nothing_to_bill"}
-              onChange={(e) => set({ exclude_status: e.target.checked ? "nothing_to_bill" : undefined })}
-            />{" "}
-            <span>隐藏无需计费</span>
-          </label>
-          <div className="flex min-w-0 items-center gap-2 max-md:w-full md:ml-auto">
-            <label className="f filter min-w-0 flex-1">
-              <span>事件</span>
-              <input
-                className="min-w-0 text-caption md:w-56"
-                value={eventDraft}
-                onChange={(e) => setEventDraft(e.target.value)}
-                placeholder="事件编号"
-              />
-            </label>
-            <Button type="submit" size="sm">
-              查找
-            </Button>
-          </div>
-        </form>
-        <UsageRecordFilters scope="admin" value={usageRecordFilterValues(query)} onChange={patch => update(patch)} />
-        <ChargeScopeFilters key={JSON.stringify([filter.from, filter.to, filter.member_id, filter.provider_key_id, filter.request_id, filter.model_id])} filter={filter} onChange={set} />
-        {(filter.from || filter.to || filter.member_id || filter.provider_key_id || filter.request_id) && <p className="charge-scope-summary" role="status">当前已应用范围条件：{[filter.from ? "开始 " + fmtBeijing(filter.from) : null, filter.to ? "结束 " + fmtBeijing(filter.to) + "（不含）" : null, filter.member_id ? "成员 " + filter.member_id : null, filter.provider_key_id ? "上游账号 " + filter.provider_key_id : null, filter.request_id ? "请求 " + filter.request_id : null].filter(Boolean).join("；")}</p>}
+          <form className="charge-event-filter" onSubmit={event => { event.preventDefault(); set({ event_id: eventDraft.trim() || undefined }); }}>
+            <label><span>事件</span><input value={eventDraft} onChange={event => setEventDraft(event.target.value)} placeholder="事件编号" /></label>
+            <Button type="submit" size="sm">查找</Button>
+          </form>
+        </UsageRecordFilters>
+        {(filter.from || filter.to || filter.member_id || filter.provider_key_id || filter.request_id || filter.exclude_status) && <p className="charge-scope-summary" role="status">当前已应用范围条件：{[filter.exclude_status === "nothing_to_bill" ? "隐藏无需计费" : null, filter.from ? "开始 " + fmtBeijing(filter.from) : null, filter.to ? "结束 " + fmtBeijing(filter.to) + "（不含）" : null, filter.member_id ? "成员 " + filter.member_id : null, filter.provider_key_id ? "上游账号 " + filter.provider_key_id : null, filter.request_id ? "请求 " + filter.request_id : null].filter(Boolean).join("；")}</p>}
         {linked.length > 0 && (
           <div className="charge-linked-scope" role="status">
             <span className="hint">只看 {linked.join("，")}（按上述筛选查询，也含已通过重计价更正的调用，条数可能与计价状态的次数不同）</span>
@@ -247,9 +198,10 @@ export function Charges(_props: TabProps) {
           <>
             <RecordTools table={table} label="计费明细" loaded></RecordTools>
             <DataTable label="计费明细" className="charge-records" tableClassName="charge-records-table">
-              <colgroup><col className="charge-col-identity" /><col className="charge-col-status" /><col className="charge-col-money" /><col className="charge-col-service" /><col className="charge-col-performance" /><col className="charge-col-tokens" /><col className="charge-col-action" /></colgroup>
+              <colgroup><col className="charge-col-time" /><col className="charge-col-identity" /><col className="charge-col-status" /><col className="charge-col-money" /><col className="charge-col-service" /><col className="charge-col-performance" /><col className="charge-col-tokens" /><col className="charge-col-action" /></colgroup>
               <thead>
                 <tr>
+                  <th>时间</th>
                   <th>调用 / 租户</th>
                   <th>计价结果</th>
                   <th className="num">费用（元）</th>
@@ -267,9 +219,9 @@ export function Charges(_props: TabProps) {
                   return (
                     <Fragment key={c.seq}>
                       <tr data-finance-record>
+                        <td data-label="时间" className="charge-call-time tabular"><time dateTime={c.occurred_at}><span>{fmtBeijing(c.occurred_at).split(" ")[0]}</span><span>{fmtBeijing(c.occurred_at).split(" ")[1] ?? "—"}</span></time></td>
                         <td data-label="调用 / 租户"><span className="font-medium">{modelText(c.model_name, c.model_deleted)}</span>
                           <span className="cell-note">{tenantName(c.tenant_id)}</span>
-                          <span className="cell-note tabular">{fmtBeijing(c.occurred_at)}</span>
                         </td>
                         <td data-label="计价结果">{statusLabel(c.status)}<span className="cell-note">{chargeReason(c)}</span>
                           <span className="cell-note">HTTP {c.status_code ?? "—"}{c.error_class ? ` · ${c.error_class}` : ""}</span>
@@ -313,7 +265,7 @@ export function Charges(_props: TabProps) {
                       </tr>
                       {shown && (
                         <tr className="dt-detail" id={`charge-check-${c.seq}`}>
-                          <td colSpan={7}>
+                          <td colSpan={8}>
                             <ChargeCheck c={c} />
                           </td>
                         </tr>
@@ -338,8 +290,9 @@ function ChargeScopeFilters({ filter, onChange }: { filter: ChargeFilter; onChan
   const [draft, setDraft] = useState({ from: dateValue(filter.from), to: dateValue(filter.to), member_id: filter.member_id ?? "", provider_key_id: filter.provider_key_id ?? "", request_id: filter.request_id ?? "", model_id: filter.model_id ?? "" });
   const [error, setError] = useState("");
   const active = Boolean(filter.from || filter.to || filter.member_id || filter.provider_key_id || filter.request_id || filter.model_id);
-  return <details className="charge-scope-filters">
-    <summary className="cursor-pointer text-caption font-medium">时间与归属筛选{active ? " · 已应用" : ""}</summary>
+  return <section className="charge-scope-filters" aria-label="时间与归属筛选">
+    <h3 className="text-caption font-medium">时间与归属筛选{active ? " · 已应用" : ""}</h3>
+    <label className="charge-hide-unbilled"><input type="checkbox" checked={filter.exclude_status === "nothing_to_bill"} onChange={event => onChange({ exclude_status: event.target.checked ? "nothing_to_bill" : undefined })} /><span>隐藏无需计费</span></label>
     <form className="mt-4 grid min-w-0 gap-4 sm:grid-cols-2 xl:grid-cols-3" onSubmit={event => {
       event.preventDefault();
       // 未修改的时间保留原始精度，改变成员等条件不能截断深链接的毫秒。
@@ -362,7 +315,7 @@ function ChargeScopeFilters({ filter, onChange }: { filter: ChargeFilter; onChan
         <span className="hint">与调用结果、计价状态及租户条件组合查询。</span>
       </div>
     </form>
-  </details>;
+  </section>;
 }
 
 /** The upstream account that served the call, and the model it was asked for. */

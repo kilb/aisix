@@ -3,13 +3,15 @@
 .calls-list[hidden] { display: none; }
 .charge-workspace { min-width: 0; container: charge-records / inline-size; }
 .charge-workspace > .dt-wrap { overflow-x: auto; max-height: none; }
-.charge-records .dt.charge-records-table { width: 100%; min-width: 69rem; table-layout: fixed; }
-.charge-col-identity, .charge-col-service { width: 11rem; }
-.charge-col-status { width: 8rem; }
-.charge-col-money { width: 8rem; }
-.charge-col-performance { width: 10rem; }
-.charge-col-tokens { width: 14rem; }
-.charge-col-action { width: 7rem; }
+.charge-records .dt.charge-records-table { width: 100%; min-width: 65rem; table-layout: fixed; }
+.charge-col-time { width: 7rem; }
+.charge-col-identity { width: 10rem; }
+.charge-col-service { width: 9rem; }
+.charge-col-status { width: 8.5rem; }
+.charge-col-money { width: 6.5rem; }
+.charge-col-performance { width: 8rem; }
+.charge-col-tokens { width: 10rem; }
+.charge-col-action { width: 6rem; }
 .charge-records .charge-records-table > :is(thead, tbody) > tr > :is(th, td) { vertical-align: top; white-space: normal; overflow-wrap: anywhere; }
 .charge-records .cell-note { margin-top: 4px; }
 .charge-records .finance-amount-label { display: block; margin-bottom: 2px; color: var(--color-fg-3); font-size: var(--text-caption); }
@@ -18,23 +20,28 @@
 .charge-icon-button { width: 36px; min-width: 36px; min-height: 36px; padding-inline: 0; }
 .charge-icon-button > svg { width: 16px; height: 16px; }
 
-/* 服务端筛选和已加载记录搜索保持各自语义，控件共同对齐标签基线。 */
-.charge-filter-controls { display: grid; min-width: 0; gap: 16px; }
-.charge-primary-filters { display: flex; min-width: 0; flex-wrap: wrap; align-items: flex-end; gap: 12px; }
-.charge-primary-filters .f.filter { display: flex; min-width: 0; flex-direction: column; gap: 6px; margin: 0; }
-.charge-primary-filters .f.filter > span { color: var(--color-fg-3); font-size: var(--text-caption); line-height: var(--text-caption--line-height); }
-.charge-primary-filters > .f.filter { flex: 0 1 150px; }
-.charge-primary-filters > .f.filter:first-child { flex-basis: 128px; }
-.charge-primary-filters > .f.filter:has(input[type="checkbox"]) { flex-direction: row; align-items: center; min-height: var(--h-control); flex-basis: auto; }
-.charge-primary-filters > div { align-items: flex-end; }
-.charge-workspace .usage-record-filters { margin: 0; }
-.charge-workspace .usage-record-filter-note { margin-top: 8px; }
-.charge-workspace .usage-record-filter-more { border-radius: var(--r-round); font-size: var(--text-small); }
-.charge-scope-filters { min-width: 0; padding-block: 12px; border-top: 1px solid var(--color-hairline); border-bottom: 1px solid var(--color-hairline); }
+/* 工具条留在主页面滚动流内，展开条件不裁剪选择浮层。 */
+.charge-filter-controls { position: sticky; top: 60px; z-index: 20; display: grid; min-width: 0; gap: 10px; padding: 12px; margin-inline: -12px; border: 1px solid var(--border); border-radius: var(--r-field); background: var(--card); box-shadow: var(--shadow-card); }
+.charge-event-filter { display: flex; flex: 1.5 1 170px; align-items: flex-end; gap: 6px; min-width: 0; }
+.charge-event-filter > label { flex: 1; }
+.charge-event-filter > .btn { flex: none; min-height: 36px; }
+.charge-scope-filters { grid-column: 1 / -1; min-width: 0; padding-top: 14px; border-top: 1px solid var(--border); }
+.charge-scope-filters h3 { margin: 0; }
+.charge-scope-filters .charge-hide-unbilled { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
 .charge-scope-summary { margin: 0; color: var(--color-fg-3); font-size: var(--text-caption); overflow-wrap: anywhere; }
-.charge-linked-scope { display: flex; min-width: 0; flex-wrap: wrap; align-items: center; gap: 12px; padding: 12px 0; border-top: 1px solid var(--color-hairline); }
+.charge-linked-scope { display: flex; min-width: 0; flex-wrap: wrap; align-items: center; gap: 12px; padding-top: 10px; border-top: 1px solid var(--color-hairline); }
 .charge-workspace > .record-table-toolbar { padding-top: 4px; }
 .charge-workspace > .record-table-pager { margin-top: 0; }
+.charge-call-time time, .charge-call-time time > span { display: block; white-space: nowrap; }
+.charge-call-time time > span:first-child { color: var(--ink); font-weight: 500; }
+.charge-call-time time > span + span { margin-top: 3px; color: var(--muted-foreground); font-size: var(--text-caption); }
+.charge-records .charge-records-table > :is(thead, tbody) > tr > :is(th, td) { padding-inline: 10px; }
+.charge-records .charge-records-table > tbody > tr[data-finance-record] > td { padding-block: 12px; }
+.charge-records .usage-performance { grid-template-columns: minmax(0, 1fr); gap: 3px; text-align: left; }
+.charge-records .usage-performance > div { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.charge-records .usage-performance dd { margin: 0; white-space: nowrap; font-weight: 500; }
+@media (min-width: 1100px) { .charge-filter-controls .usage-record-filter-grid { max-height: calc(100dvh - 180px); overflow-y: auto; overscroll-behavior: contain; } }
+@media (max-width: 1099px) { .charge-filter-controls { position: static; } }
 
 /* 列表只作错误摘要，独立日志页保留完整内容。 */
 .call-error-summary { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; overflow-wrap: anywhere; margin-top: 5px; color: var(--destructive); font-size: var(--text-caption); line-height: var(--text-caption--line-height); }
@@ -51,7 +58,9 @@
 .charge-check .charge-quantities-table :is(th, td) { white-space: normal; overflow-wrap: anywhere; }
 .charge-records .dt-detail > td > .charge-check { position: sticky; left: 20px; box-sizing: border-box; width: calc(100cqw - 40px); max-width: 100%; contain: inline-size; }
 @media (max-width: 599px) {
-  .charge-primary-filters > .f.filter { flex: 1 1 130px; }
+  .charge-filter-controls { margin-inline: 0; padding: 12px; }
+  .charge-event-filter { flex-basis: 100%; }
+  .charge-event-filter > .btn { min-height: 44px; }
   .charge-icon-button { width: 44px; min-width: 44px; min-height: 44px; }
   .call-log-link { min-height: 44px; }
 }

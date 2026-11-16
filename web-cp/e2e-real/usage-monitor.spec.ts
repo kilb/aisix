@@ -173,8 +173,8 @@ test("admin visible time and identity controls combine before pagination and ret
   expect(linkedAnswer.status()).toBe(200);
   const linkedBody = await linkedAnswer.json();
   expect(linkedBody.items.some((item: { event_id: string }) => item.event_id === sample.event_id)).toBe(true);
-  const controls = page.locator("details").filter({ has: page.locator("summary").filter({ hasText: "时间与归属筛选" }) });
-  await controls.locator("summary").click();
+  await page.getByRole("button", { name: /^更多筛选/ }).click();
+  const controls = page.getByRole("region", { name: "时间与归属筛选", exact: true });
   for (const label of ["开始时间（北京时间）", "结束时间（不含，北京时间）", "模型 ID", "成员 ID", "上游账号 ID", "请求 ID"]) await expect(controls.getByLabel(label, { exact: true })).toBeVisible();
   await controls.getByLabel("请求 ID", { exact: true }).fill("ui-scope-no-match-20261112");
   const refined = page.waitForResponse(response => matching(response, "/admin/pricing/charges", { ...scope, request_id: "ui-scope-no-match-20261112" }));

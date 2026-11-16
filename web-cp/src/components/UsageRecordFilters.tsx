@@ -15,6 +15,7 @@ export interface UsageRecordFiltersProps {
   /** 调用方只公开当前服务端已支持且有权限使用的字段。 */
   fields?: readonly UsageRecordFilterKey[];
   children?: ReactNode;
+  advancedChildren?: ReactNode;
 }
 
 const DEFAULT_FIELDS: readonly UsageRecordFilterKey[] = ["outcome", "http_status", "cache_hit", "service_tier", "operation", "final_attempt", "error_class"];
@@ -47,7 +48,7 @@ function SelectedValue({ value, choices }: { value: string; choices: readonly st
 }
 
 /** 只负责受控筛选，翻页复位与真实服务端查询由记录页面统一执行。 */
-export function UsageRecordFilters({ value, onChange, scope, disabled = false, fields = DEFAULT_FIELDS, children }: UsageRecordFiltersProps) {
+export function UsageRecordFilters({ value, onChange, scope, disabled = false, fields = DEFAULT_FIELDS, children, advancedChildren }: UsageRecordFiltersProps) {
   const id = useId();
   const [expanded, setExpanded] = useState(false);
   const visibleFields = fields.filter(field => field !== "http_status" || scope === "admin");
@@ -58,7 +59,7 @@ export function UsageRecordFilters({ value, onChange, scope, disabled = false, f
   const clear = () => onChange(Object.fromEntries(visibleFields.map(field => [field, ""])) as Partial<UsageRecordFilterValues>);
   return <section className="usage-record-filters" aria-label="调用结果筛选">
     <div className="usage-record-filter-primary">
-      {has("outcome") && <label className="usage-record-filter-outcome"><span id={`${id}-outcome-label`}>调用结果</span><Select aria-labelledby={`${id}-outcome-label`} disabled={disabled} value={value.outcome} onValueChange={selectedValue => choose("outcome", selectedValue)}>
+      {has("outcome") && <label className="usage-record-filter-outcome"><span id={`${id}-outcome-label`}>调用结果</span><Select size="compact" aria-labelledby={`${id}-outcome-label`} disabled={disabled} value={value.outcome} onValueChange={selectedValue => choose("outcome", selectedValue)}>
         <option value="">全部结果</option><option value="succeeded">成功</option><option value="failed">失败</option><option value="retried">已重试</option><option value="unknown">结果未知</option>
         {SelectedValue({ value: value.outcome, choices: ["succeeded", "failed", "retried", "unknown"] })}
       </Select></label>}
@@ -69,12 +70,13 @@ export function UsageRecordFilters({ value, onChange, scope, disabled = false, f
         <fieldset id={`${id}-advanced`} hidden={!expanded} disabled={disabled} className="usage-record-filter-grid">
           <legend className="vh">更多调用条件</legend>
           {has("http_status") && scope === "admin" && <label><span id={`${id}-status-label`}>HTTP 状态码</span><FilterTextInput aria-labelledby={`${id}-status-label`} key={`status/${value.http_status}`} inputMode="numeric" pattern="[1-5][0-9]{2}" maxLength={3} placeholder="例如 400、429、503" value={value.http_status} onCommit={next => choose("http_status", next)} /></label>}
-          {has("error_class") && <label><span id={`${id}-error-label`}>失败类型</span>{scope === "admin" ? <FilterTextInput aria-labelledby={`${id}-error-label`} key={`error/${value.error_class}`} placeholder="填写准确的错误类型" value={value.error_class} onCommit={next => choose("error_class", next)} /> : <Select aria-labelledby={`${id}-error-label`} value={value.error_class} onValueChange={selectedValue => choose("error_class", selectedValue)}><option value="">全部类型</option>{TENANT_ERRORS.map(([key, label]) => <option key={key} value={key}>{label}</option>)}{SelectedValue({ value: value.error_class, choices: TENANT_ERRORS.map(([key]) => key) })}</Select>}</label>}
-          {has("cache_hit") && <label><span id={`${id}-cache-label`}>响应缓存</span><Select aria-labelledby={`${id}-cache-label`} value={value.cache_hit} onValueChange={selectedValue => choose("cache_hit", selectedValue)}><option value="">全部缓存状态</option><option value="true">命中</option><option value="false">未命中（含绕过／禁用）</option>{SelectedValue({ value: value.cache_hit, choices: ["true", "false"] })}</Select></label>}
+          {has("error_class") && <label><span id={`${id}-error-label`}>失败类型</span>{scope === "admin" ? <FilterTextInput aria-labelledby={`${id}-error-label`} key={`error/${value.error_class}`} placeholder="填写准确的错误类型" value={value.error_class} onCommit={next => choose("error_class", next)} /> : <Select size="compact" aria-labelledby={`${id}-error-label`} value={value.error_class} onValueChange={selectedValue => choose("error_class", selectedValue)}><option value="">全部类型</option>{TENANT_ERRORS.map(([key, label]) => <option key={key} value={key}>{label}</option>)}{SelectedValue({ value: value.error_class, choices: TENANT_ERRORS.map(([key]) => key) })}</Select>}</label>}
+          {has("cache_hit") && <label><span id={`${id}-cache-label`}>响应缓存</span><Select size="compact" aria-labelledby={`${id}-cache-label`} value={value.cache_hit} onValueChange={selectedValue => choose("cache_hit", selectedValue)}><option value="">全部缓存状态</option><option value="true">命中</option><option value="false">未命中（含绕过／禁用）</option>{SelectedValue({ value: value.cache_hit, choices: ["true", "false"] })}</Select></label>}
           {has("service_tier") && <label><span id={`${id}-tier-label`}>实际服务档位</span><FilterTextInput aria-labelledby={`${id}-tier-label`} key={`tier/${value.service_tier}`} list={`${id}-tiers`} placeholder="例如 default、fast" value={value.service_tier} onCommit={next => choose("service_tier", next)} /><datalist id={`${id}-tiers`}>{["default", "priority", "fast", "flex", "batch"].map(tier => <option key={tier} value={tier} />)}</datalist></label>}
-          {has("operation") && <label><span id={`${id}-operation-label`}>API 操作</span><Select aria-labelledby={`${id}-operation-label`} value={value.operation} onValueChange={selectedValue => choose("operation", selectedValue)}><option value="">全部操作</option>{OPERATIONS.map(([key, label]) => <option key={key} value={key}>{label}</option>)}{SelectedValue({ value: value.operation, choices: OPERATIONS.map(([key]) => key) })}</Select></label>}
-          {has("final_attempt") && <label><span id={`${id}-attempt-label`}>尝试记录</span><Select aria-labelledby={`${id}-attempt-label`} value={value.final_attempt} onValueChange={selectedValue => choose("final_attempt", selectedValue)}><option value="">全部尝试</option><option value="true">最终尝试</option><option value="false">非最终尝试</option>{SelectedValue({ value: value.final_attempt, choices: ["true", "false"] })}</Select></label>}
+          {has("operation") && <label><span id={`${id}-operation-label`}>API 操作</span><Select size="compact" aria-labelledby={`${id}-operation-label`} value={value.operation} onValueChange={selectedValue => choose("operation", selectedValue)}><option value="">全部操作</option>{OPERATIONS.map(([key, label]) => <option key={key} value={key}>{label}</option>)}{SelectedValue({ value: value.operation, choices: OPERATIONS.map(([key]) => key) })}</Select></label>}
+          {has("final_attempt") && <label><span id={`${id}-attempt-label`}>尝试记录</span><Select size="compact" aria-labelledby={`${id}-attempt-label`} value={value.final_attempt} onValueChange={selectedValue => choose("final_attempt", selectedValue)}><option value="">全部尝试</option><option value="true">最终尝试</option><option value="false">非最终尝试</option>{SelectedValue({ value: value.final_attempt, choices: ["true", "false"] })}</Select></label>}
+          {advancedChildren}
+          <p className="usage-record-filter-note">筛选作用于全部匹配记录；文本条件按 Enter 或移出输入框后应用。结果未知不计入成功或失败。</p>
         </fieldset>
-    <p className="usage-record-filter-note">筛选作用于全部匹配记录；文本条件按 Enter 或移出输入框后应用。结果未知不计入成功或失败。</p>
   </section>;
 }
