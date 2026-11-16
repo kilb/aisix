@@ -115,6 +115,9 @@ pub struct GatewayEmbeddingCall {
 /// the control plane parser expects.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct UsageEvent {
+    /// 单次 HTTP 交换相对 attempt 的时点；未知与多交换均不补造。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_timing: Option<aisix_core::usage_io::UpstreamTiming>,
     /// 仅 HTTP 请求终态携带入口阶段；后台重放与历史记录不补造。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_timing: Option<aisix_core::usage_io::RequestTiming>,
