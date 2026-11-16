@@ -428,7 +428,7 @@ export function Models({ canEdit, onGoto }: TabProps) {
                         <td className="whitespace-normal">
                           <Source model={m} source={src} from={from} publicRead={publicById !== null} catalog={catalog} />
                         </td>
-                        <td className="text-fg-2">{SHAPE_LABEL[shape]}{shape === "routing" && <RoutePolicy routing={m.doc.routing} defaultStrategy={schema && "preset" in schema ? schema.preset : null} compact />}</td>
+                        <td className="model-list-kind text-fg-2">{SHAPE_LABEL[shape]}{shape === "routing" && <RoutePolicy routing={m.doc.routing} defaultStrategy={schema && "preset" in schema ? schema.preset : null} compact />}</td>
                         <td className="whitespace-normal">
                           <div className="model-list-target">
                             <Upstream model={m} catalog={catalog} />
@@ -440,9 +440,8 @@ export function Models({ canEdit, onGoto }: TabProps) {
                         <td className="right">
                           {src.kind === "public" ? (
                             <>
-                              <Button size="sm" className="ops-table-action" aria-label="公共路由" title="打开公共路由" onClick={() => onGoto("public-routes", src.id)}><Waypoints aria-hidden /></Button>
+                              <Button size="sm" className="model-list-route-action" aria-label="公共路由" title="由公共模型生成，在公共路由中维护" onClick={() => onGoto("public-routes", src.id)}><Waypoints aria-hidden /><span>公共路由</span></Button>
                               {src.generated && <Button size="sm" className="ops-table-action" aria-label="查看" title="查看模型" onClick={() => openForm({ mode: "edit", id: m.id })}><Eye aria-hidden /></Button>}
-                              <span className="cell-note ml-auto">由公共模型生成，在公共模型与路由中维护</span>
                             </>
                           ) : deleting?.id === m.id ? (
                             <>
@@ -505,37 +504,47 @@ export function Models({ canEdit, onGoto }: TabProps) {
   );
 }
 
-/** A direct model's account and upstream model, or a routing model's targets, each with its groups. */
+/** 目标和分组并排展示，多目标通过明确计数展开完整清单。 */
 function Upstream({ model, catalog }: { model: Model; catalog: Catalog }) {
   const doc = model.doc;
   switch (shapeOf(doc)) {
     case "direct": {
       const account = doc.provider_key_id ? catalog.accounts.get(doc.provider_key_id) : undefined;
       return (
-        <>
-          <div className="flex flex-wrap items-baseline gap-x-1.5">
+        <div className="model-target-line">
+          <div className="model-target-name">
             <span>{account?.doc.display_name || doc.provider_key_id || "—"}</span>
-            <span className="text-fg-3">·</span>
+            <span className="model-target-separator" aria-hidden> · </span>
             <code className="text-caption">{doc.model_name ?? "—"}</code>
           </div>
-          <ServedGroups>{groupsOf(model, catalog)}</ServedGroups>
-        </>
+          <div className="model-target-groups"><span className="model-target-group-label">可用分组</span>{groupsOf(model, catalog)}</div>
+        </div>
       );
     }
-    case "routing":
+    case "routing": {
+      const targets = doc.routing?.targets ?? [];
+      if (targets.length === 0) return <span className="text-fg-3">尚无路由目标</span>;
+      const targetLine = (t: Target, i: number) => {
+        const target = targetModel(t, catalog);
+        return (
+          <li key={i} className="model-target-line">
+            <span className="model-target-name">{target ? nameOf(target) : `${t.model_id ?? t.model ?? "—"}（模型不存在）`}</span>
+            <div className="model-target-groups"><span className="model-target-group-label">可用分组</span>{groupsOf(target, catalog)}</div>
+          </li>
+        );
+      };
       return (
-        <ul className="grid gap-2">
-          {(doc.routing?.targets ?? []).map((t, i) => {
-            const target = targetModel(t, catalog);
-            return (
-              <li key={i} className="min-w-0">
-                <span>{target ? nameOf(target) : `${t.model_id ?? t.model ?? "—"}（模型不存在）`}</span>
-                <ServedGroups className="mt-0.5">{groupsOf(target, catalog)}</ServedGroups>
-              </li>
-            );
-          })}
-        </ul>
+        <div className="model-targets">
+          <ul className="model-target-list" aria-label="路由目标">{targets.slice(0, 2).map(targetLine)}</ul>
+          {targets.length > 2 && (
+            <details className="model-target-more">
+              <summary>展开其余 {targets.length - 2} 个目标（共 {targets.length} 个）</summary>
+              <ul className="model-target-list" aria-label="其余路由目标">{targets.slice(2).map((target, i) => targetLine(target, i + 2))}</ul>
+            </details>
+          )}
+        </div>
       );
+    }
     default:
       return <span className="sub">在「全部资源」页查看与编辑</span>;
   }
@@ -575,7 +584,7 @@ function Source({
     return (
       <>
         <span className="tag border-ink/20 bg-surface text-fg">对外</span>
-        {shared}
+        {name !== nameOf(model) && shared}
       </>
     );
   return (

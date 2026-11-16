@@ -175,17 +175,39 @@ form.model-editor-form > .model-form-footer,
 .cp-publicroutes .pm-maintenance-section .library-one > h3 { display: none; }
 .cp-publicroutes .pm-maintenance-section .library-card-block { padding: 0; border-radius: 0; background: transparent; }
 
-/* 模型目录给名称与关联目标优先分配宽度，长标识在列内换行。 */
+/* 辅助列保持紧凑，把主要宽度留给目标名称与分组。 */
 .cp-models .model-list-name,
 .cp-models .model-list-target { display: block; min-width: 0; overflow-wrap: anywhere; }
 .cp-models .ops-list .dt { width: 100%; min-width: 0; table-layout: fixed; }
-.cp-models .ops-list .dt > thead th:first-child { width: 28%; }
-.cp-models .ops-list .dt > thead th:nth-child(2) { width: 7rem; }
-.cp-models .ops-list .dt > thead th:nth-child(3) { width: 10rem; }
+.cp-models .ops-list .dt > thead th:first-child { width: 20%; }
+.cp-models .ops-list .dt > thead th:nth-child(2) { width: 6rem; }
+.cp-models .ops-list .dt > thead th:nth-child(3) { width: 8.25rem; }
 .cp-models .ops-list .dt > thead th:nth-child(4) { width: auto; }
-.cp-models .ops-list .dt > thead th:nth-child(5) { width: 6rem; }
-.cp-models .ops-list .dt > thead th:last-child { width: 128px; }
+.cp-models .ops-list .dt > thead th:nth-child(5) { width: 5rem; }
+.cp-models .ops-list .dt > thead th:last-child { width: 9rem; }
 .cp-models .ops-list .dt > tbody > tr > td { min-width: 0; white-space: normal; overflow-wrap: anywhere; }
+.cp-models .model-list-kind > [aria-label] { margin-top: 3px; }
+.cp-models .model-list-kind > [aria-label] > .tag { padding-inline: 0; border: 0; border-radius: 0; background: transparent; font-weight: 500; line-height: 20px; }
+.cp-models .model-list-kind > [aria-label] > code { display: block; margin-left: 0; font-size: var(--text-caption); line-height: 18px; }
+.cp-models .model-list-route-action { gap: 4px; padding-inline: 6px; white-space: nowrap; }
+.cp-models .model-list-route-action svg { width: 15px; height: 15px; }
+
+/* 目标清单不叠卡片；展开后仍保留完整名称和全部分组。 */
+.cp-models .model-target-list { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.cp-models .model-target-line { display: flex; min-width: 0; flex-wrap: wrap; align-items: baseline; gap: 3px 10px; }
+.cp-models .model-target-name { min-width: 0; overflow-wrap: anywhere; }
+.cp-models .model-target-separator { color: var(--color-fg-3); }
+.cp-models .model-target-groups { display: inline-flex; min-width: 0; max-width: 100%; flex-wrap: wrap; align-items: center; gap: 3px 6px; color: var(--color-fg-3); font-size: var(--text-caption); line-height: 20px; }
+.cp-models .model-target-group-label { white-space: nowrap; }
+.cp-models .model-target-more { margin-top: 5px; }
+.cp-models .model-target-more > summary { width: fit-content; max-width: 100%; padding-block: 4px; color: var(--color-fg-2); font-size: var(--text-caption); line-height: 20px; cursor: pointer; }
+.cp-models .model-target-more > summary:focus-visible { border-radius: var(--r-field); outline: 2px solid var(--ring); outline-offset: 2px; }
+.cp-models .model-target-more[open] > summary { margin-bottom: 5px; }
+
+@container (max-width: 760px) {
+  .cp-models .ops-record-table > .dt > tbody > tr > td:nth-child(4) { grid-column: 1 / -1; }
+  .cp-models .model-target-more > summary { min-height: 40px; padding-block: 10px; }
+}
 
 @media (max-width: 1099px) {
   .cp-publicroutes .pm-detail-facts { grid-template-columns: repeat(3, minmax(0, 1fr)); }

@@ -3,6 +3,9 @@
 .cp-providers > .page-header { margin: 0; }
 .cp-providers .ops-editor, .cp-providers .ops-channel-models { min-width: 0; }
 .provider-editor-form { --pad: 24px; }
+/* 账号字段组与模型映射使用同一工作区宽度，不沿用通用表单的阅读宽度。 */
+form.panel.provider-editor-form > :not(.note, h2, .dt-wrap, .targets),
+.provider-editor-form > fieldset.tn-section > :not(.note, .dt-wrap, legend) { max-width: none; }
 .provider-form-section { margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--color-hairline); }
 .provider-form-section > h3 { margin: 0 0 12px; font-size: var(--text-title); font-weight: 700; }
 .provider-form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; align-items: start; }
@@ -10,7 +13,9 @@
 .provider-form-grid :is(.field, .f) { margin-bottom: 0; }
 .provider-editor-form > fieldset { margin-top: 16px; padding-top: 16px; border-color: var(--color-hairline); }
 .provider-editor-form > fieldset legend { font-size: var(--text-title); font-weight: 700; }
-.provider-editor-form .tn-groups { grid-template-columns: repeat(auto-fit, minmax(min(180px, 100%), 1fr)); gap: 12px 16px; }
+.provider-editor-form > fieldset.tn-section > .tn-checks.tn-groups { grid-template-columns: repeat(auto-fit, minmax(min(180px, 100%), 1fr)); gap: 12px 16px; }
+.provider-editor-form .tn-checks.tn-groups > li + li { border-top: 0; }
+.provider-editor-form .tn-groups :is(.grp-route, .tn-note, .tn-error) { overflow-wrap: anywhere; }
 .provider-editor-form > .form-foot { margin-top: 16px; }
 .cp-providers .ops-list { width: 100%; }
 .cp-providers .ch-section { gap: 16px; }
