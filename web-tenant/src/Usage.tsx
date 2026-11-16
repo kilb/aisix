@@ -28,7 +28,7 @@ import { useHashQuery } from "./lib/useHashQuery";
 import { usageRange, usageDateValue, usageRequestKey, metricViewOf } from "./lib/usageNavigation";
 import { ApiMetricsPanel } from "./components/ApiMetricsPanel";
 import { UsagePerformance } from "./components/UsagePerformance";
-import { UsageIoAuditDetails } from "./components/UsageIoAuditDetails";
+import { UsageIoAuditDetails, UsageTokenEstimate } from "./components/UsageIoAuditDetails";
 import { UsageRecordFilters } from "./components/UsageRecordFilters";
 import { usageRecordFilterParams, usageRecordFilterValues } from "./lib/usageRecordFilters";
 
@@ -610,6 +610,7 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
                       <strong>{c.model.name || "—"}</strong>
                       <span className="cell-note">密钥 {c.api_key.label || "—"} · 成员 {c.member ? (c.member.display_name ?? "成员") : "—"}</span>
                       <span className="cell-note">{c.request_id ? <code>{c.request_id}</code> : "—"}</span>
+                      <UsageTokenEstimate data={c} />
                     </td>
                     <td data-label="状态">
                       <CallStatusLamp call={c} />

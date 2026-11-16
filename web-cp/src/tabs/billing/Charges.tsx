@@ -22,8 +22,7 @@ import { chargesQuery } from "../../lib/analysisNavigation";
 import { cn } from "../../lib/cn";
 import { ChevronDown, RotateCcw } from "lucide-react";
 import { UsagePerformance } from "../../components/UsagePerformance";
-import { isSupportedUsageIoAudit } from "../../lib/usageIoAudit";
-import { UsageIoAuditDetails } from "../../components/UsageIoAuditDetails";
+import { UsageIoAuditDetails, UsageTokenEstimate } from "../../components/UsageIoAuditDetails";
 import { UsageRecordFilters } from "../../components/UsageRecordFilters";
 import { usageRecordFilterValues } from "../../lib/usageRecordFilters";
 import "./Charges.css";
@@ -255,7 +254,7 @@ export function Charges(_props: TabProps) {
                   <th className="num">费用（元）</th>
                   <th>服务 / 档位</th>
                   <th>响应性能</th>
-                  <th>用量 / 字节估算</th>
+                  <th>用量 / 按字节估算 Token</th>
                   <th className="right">
                     <span className="vh">日志 / 复核</span>
                   </th>
@@ -283,7 +282,7 @@ export function Charges(_props: TabProps) {
                           <span className="cell-note">档位 {c.service_tier ?? "—"}</span>
                         </td>
                         <td data-label="响应性能"><UsagePerformance data={c} /></td>
-                        <td data-label="用量" className="tabular text-caption"><span title={usageSummary(c.usage) ?? undefined}>输入 {c.usage_input_tokens == null ? "—" : formatCount(c.usage_input_tokens)} / 输出 {c.usage?.completion_tokens == null ? "—" : formatCount(c.usage.completion_tokens)}</span><IoReferenceSummary c={c} /></td>
+                        <td data-label="用量" className="tabular text-caption"><span title={usageSummary(c.usage) ?? undefined}>输入 {c.usage_input_tokens == null ? "—" : formatCount(c.usage_input_tokens)} / 输出 {c.usage?.completion_tokens == null ? "—" : formatCount(c.usage.completion_tokens)}</span><UsageTokenEstimate data={c} /></td>
                         <td data-label="日志 / 复核" className="right">
                           <a className="call-log-link" href={callDetailHash(query, c.event_id)} aria-label={`查看调用日志 ${c.event_id}`}>查看日志</a>
                           <Button
@@ -360,17 +359,6 @@ function ChargeScopeFilters({ filter, onChange }: { filter: ChargeFilter; onChan
       </div>
     </form>
   </details>;
-}
-
-/** 字节估算与实测用量显示在同一条记录，完整口径保留在明细。 */
-function IoReferenceSummary({ c }: { c: Charge }) {
-  const audit = isSupportedUsageIoAudit(c.io_audit) ? c.io_audit : undefined;
-  const reference = audit && c.io_token_reference?.method === "utf8_bytes_div4_v1" ? c.io_token_reference : undefined;
-  const format = (value: number | null | undefined) => value == null ? "—" : new Intl.NumberFormat("en-US").format(value);
-  const partial = audit?.input_text?.complete === false || audit?.output_text?.complete === false;
-  return <span className="cell-note io-token-reference" title="按已观测文本 UTF-8 字节数 ÷ 4 向上取整；未校准，仅供核对，不参与计费。">
-    字节估算 ≈ {format(reference?.input_tokens)} / {format(reference?.output_tokens)}{partial ? "（部分）" : ""}
-  </span>;
 }
 
 /** The upstream account that served the call, and the model it was asked for. */

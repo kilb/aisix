@@ -11,14 +11,14 @@ import { renderToStaticMarkup } from "react-dom/server";
 const require = createRequire(import.meta.url);
 const source = new URL("../tabs/billing/Charges.tsx", import.meta.url);
 const compiled = await build({
-  stdin: { loader: "tsx", contents: `${await readFile(source, "utf8")}\nexport { ChargeCheck as AuditCallDetail };`, resolveDir: fileURLToPath(new URL(".", source)), sourcefile: fileURLToPath(source) },
+  stdin: { loader: "tsx", contents: `${await readFile(source, "utf8")}\nexport { ChargeCheck as AuditCallDetail, UsageTokenEstimate as AuditEstimateSummary };`, resolveDir: fileURLToPath(new URL(".", source)), sourcefile: fileURLToPath(source) },
   bundle: true, platform: "node", format: "cjs", jsx: "automatic", write: false,
   loader: { ".css": "empty" }, define: { "import.meta.env.BASE_URL": '"/"' },
   plugins: [{ name: "single-react-runtime", setup(builder) { builder.onResolve({ filter: /^react(?:\/.*)?$/ }, args => ({ path: require.resolve(args.path), external: true })); } }],
 });
 const component = { exports: {} };
 new Function("require", "module", "exports", compiled.outputFiles[0]!.text)(require, component, component.exports);
-const { AuditCallDetail } = component.exports as { AuditCallDetail: ComponentType<Record<string, unknown>> };
+const { AuditCallDetail, AuditEstimateSummary } = component.exports as { AuditCallDetail: ComponentType<Record<string, unknown>>; AuditEstimateSummary: ComponentType<Record<string, unknown>> };
 
 const audit = {
   version: 1, boundary: "client_exchange", request_body_bytes: 140, response_body_bytes: 95, response_complete: true,
@@ -179,8 +179,8 @@ test("上游部分和真实零不因来源变更而丢失", () => {
   assert.equal(row(markup, "response-body"), "上游响应正文0 字节 · 部分");
   assert.equal(row(markup, "input-text"), "上游输入文本0 UTF-8 字节 · 0 Unicode 字符 · 完整");
   assert.equal(row(markup, "output-text"), "上游输出文本0 UTF-8 字节 · 0 Unicode 字符 · 部分");
-  assert.equal(row(markup, "input-reference"), "输入 Token 参考0 · 完整");
-  assert.equal(row(markup, "output-reference"), "输出 Token 参考0 · 部分");
+  assert.equal(row(markup, "input-reference"), "输入 Token 参考≈ 0 Token（按字节估算） · 完整");
+  assert.equal(row(markup, "output-reference"), "输出 Token 参考≈ 0 Token（按字节估算） · 部分");
 });
 
 // 只显示 response_complete 而凭空补造正文与文本，会使此检查失败。
@@ -244,9 +244,49 @@ test("多次上游交换说明缺少单次 Token 对照，单次不受影响", (
   for (const exchange_count of [1, null, undefined]) {
     const single = render({ io_audit: { ...audit, version: 2, boundary: "upstream_attempt", exchange_count }, io_token_reference: { method: "utf8_bytes_div4_v1", input_tokens: 2, output_tokens: 2 } });
     assert.doesNotMatch(single.replace(/<[^>]+>/g, ""), /包含多次上游交换，暂不提供单次 Token 对照。/);
-    assert.equal(row(single, "input-reference"), "输入 Token 参考2 · 完整");
-    assert.equal(row(single, "output-reference"), "输出 Token 参考2 · 完整");
+    assert.equal(row(single, "input-reference"), "输入 Token 参考≈ 2 Token（按字节估算） · 完整");
+    assert.equal(row(single, "output-reference"), "输出 Token 参考≈ 2 Token（按字节估算） · 完整");
     assert.equal(row(single, "recorded-input"), "记录输入 Token137");
     assert.equal(row(single, "recorded-output"), "记录输出 Token11");
   }
+});
+
+// 将 UTF-8 字节数或上游计费用量误作估算 Token，或省略估算单位，会使此检查失败。
+test("按字节估算明确显示输入输出 Token 数量及单位，不替换记录用量", () => {
+  const markup = render({
+    io_audit: { ...audit, input_text: { utf8_bytes: 23, unicode_scalars: 19, complete: true }, output_text: { utf8_bytes: 9, unicode_scalars: 3, complete: false } },
+    io_token_reference: { method: "utf8_bytes_div4_v1", input_tokens: 6, output_tokens: 3 },
+  });
+  assert.equal(row(markup, "input-reference"), "输入 Token 参考≈ 6 Token（按字节估算） · 完整");
+  assert.equal(row(markup, "output-reference"), "输出 Token 参考≈ 3 Token（按字节估算） · 部分");
+  assert.equal(row(markup, "recorded-input"), "记录输入 Token137");
+  assert.equal(row(markup, "recorded-output"), "记录输出 Token11");
+});
+
+function summary(extra: Record<string, unknown> = {}): string {
+  return renderToStaticMarkup(createElement(AuditEstimateSummary, { data: { ...base, ...extra } })).replace(/<[^>]+>/g, "").trim();
+}
+
+// 把文本字节数、记录用量或输入输出顺序用于摘要，都会改变这两个不同的估算数。
+test("列表按已有估算显示输入输出 Token 数及各自完整性", () => {
+  assert.equal(summary({
+    io_audit: { ...audit, input_text: { utf8_bytes: 23, unicode_scalars: 19, complete: true }, output_text: { utf8_bytes: 9, unicode_scalars: 3, complete: false } },
+    io_token_reference: { method: "utf8_bytes_div4_v1", input_tokens: 6, output_tokens: 3 },
+  }), "按字节估算 Token：输入 ≈ 6 Token / 输出 ≈ 3 Token（部分）");
+});
+
+// 零必须来自已有参考，不能由缺失字段默认而来。
+test("列表区分真实零和没有文本或参考的方向", () => {
+  const empty = { utf8_bytes: 0, unicode_scalars: 0, complete: true };
+  assert.equal(summary({ io_audit: { ...audit, input_text: empty, output_text: empty }, io_token_reference: { method: "utf8_bytes_div4_v1", input_tokens: 0, output_tokens: 0 } }), "按字节估算 Token：输入 ≈ 0 Token / 输出 ≈ 0 Token");
+  assert.equal(summary({ io_audit: { ...audit, output_text: null }, io_token_reference: { method: "utf8_bytes_div4_v1", input_tokens: 2 } }), "按字节估算 Token：输入 ≈ 2 Token / 输出 不可估算（未采集文本）");
+  assert.equal(summary({ io_audit: audit, io_token_reference: { method: "utf8_bytes_div4_v1", input_tokens: 2 } }), "按字节估算 Token：输入 ≈ 2 Token / 输出 不可估算（参考未记录）");
+});
+
+// 不能对缺失、未知口径或多次交换合计自行做除法，生成貌似精确的 Token 数。
+test("列表说明缺失与不适用原因，不伪造 Token 估算", () => {
+  assert.equal(summary(), "按字节估算 Token：未采集文本长度");
+  assert.equal(summary({ io_audit: { ...audit, version: 99 }, io_token_reference: { method: "utf8_bytes_div4_v1", input_tokens: 2, output_tokens: 2 } }), "按字节估算 Token：统计口径暂不支持");
+  assert.equal(summary({ io_audit: { ...audit, version: 2, boundary: "upstream_attempt", exchange_count: 3 }, io_token_reference: { method: "utf8_bytes_div4_v1", input_tokens: 2, output_tokens: 2 } }), "按字节估算 Token：多次上游交换，无法单次估算");
+  assert.equal(summary({ io_audit: audit, io_token_reference: { method: "future_method", input_tokens: 2, output_tokens: 2 } }), "按字节估算 Token：估算方法暂不支持");
 });

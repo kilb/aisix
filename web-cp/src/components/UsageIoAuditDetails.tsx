@@ -13,7 +13,21 @@ function textValue(text: TextMeasurement | null | undefined): string {
 }
 
 function referenceValue(value: number | null | undefined, text: TextMeasurement | null | undefined): string {
-  return value == null || text == null ? "不可用" : `${count.format(value)} · ${state(text.complete)}`;
+  return value == null || text == null ? "不可用" : `≈ ${count.format(value)} Token（按字节估算） · ${state(text.complete)}`;
+}
+
+/** 直接展示后端已有的 Token 估算，不能把正文或文本字节数当作 Token。 */
+export function UsageTokenEstimate({ data }: { data: UsageAuditData }) {
+  const audit = isSupportedUsageIoAudit(data.io_audit) ? data.io_audit : undefined;
+  const reference = data.io_token_reference;
+  const reason = !audit ? data.io_audit == null ? "未采集文本长度" : "统计口径暂不支持"
+    : audit.version === 2 && audit.exchange_count != null && audit.exchange_count > 1 ? "多次上游交换，无法单次估算"
+    : reference != null && reference.method !== "utf8_bytes_div4_v1" ? "估算方法暂不支持" : null;
+  const value = (tokens: number | null | undefined, text: TextMeasurement | null | undefined) => text == null ? "不可估算（未采集文本）"
+    : tokens == null ? "不可估算（参考未记录）" : `≈ ${count.format(tokens)} Token${text.complete ? "" : "（部分）"}`;
+  return <span className="cell-note io-token-reference min-w-0 max-w-full whitespace-normal [overflow-wrap:anywhere]" data-byte-token-estimate title="按已观测文本 UTF-8 字节数 ÷ 4 向上取整；未校准，仅供核对，不参与计费。">
+    按字节估算 Token：{reason ?? <>输入 {value(reference?.input_tokens, audit?.input_text)} / 输出 {value(reference?.output_tokens, audit?.output_text)}</>}
+  </span>;
 }
 
 /** 按记录边界展示独立长度参考，不推断完整计费文本或修改计费用量。 */
