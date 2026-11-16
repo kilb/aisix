@@ -1578,10 +1578,13 @@ async fn anthropic_passthrough_dispatch(
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
             (
-                crate::util::outbound_json(&crate::util::ModelRenamed {
-                    fields,
-                    model: &upstream_model,
-                })?,
+                crate::util::outbound_json(
+                    &crate::util::ModelRenamed {
+                        fields,
+                        model: &upstream_model,
+                    }
+                    .with_default_cache_ttl(),
+                )?,
                 is_stream,
                 None,
             )
@@ -1630,6 +1633,7 @@ async fn anthropic_passthrough_dispatch(
                     &r.default_body_fields,
                 );
             }
+            aisix_provider_anthropic::wire::default_cache_ttl(&mut body);
             // Check if the request wants streaming.
             let is_stream = body
                 .get("stream")
@@ -5905,7 +5909,7 @@ where
         // nothing can extract its text and releasing it after the output
         // check is exactly the bypass hold-back exists to prevent.
         if !overflowed && !buf.is_empty() {
-            let tail = std::mem::take(&mut buf);
+            let mut tail = std::mem::take(&mut buf);
             // The upstream has ended, so this fragment is a final frame it
             // never terminated — complete, just missing its blank line. Parse
             // it like any other frame BEFORE the scan below runs, so its text
@@ -5940,6 +5944,8 @@ where
                     return;
                 }
             }
+            // EOF 尾帧先封口，再交给 live、held 或 fail-open 释放路径。
+            tail.extend_from_slice(b"\n\n");
             if let Some((max_hold, fail_open)) = hold {
                 // Scanned like every other frame — hold it with them, but
                 // under the same size policy: this path reaches `held`
@@ -5995,7 +6001,7 @@ where
                 }
                 // The copy is walked frame by frame, so give the final frame
                 // the terminator the upstream left off.
-                keep_live_copy(&mut live_copy, &[tail.as_slice(), b"\n\n"].concat());
+                keep_live_copy(&mut live_copy, &tail);
                 yield Ok(Bytes::from(tail));
             }
         }
@@ -6973,6 +6979,57 @@ mod tests {
             serde_json::json!({"type": "ephemeral", "ttl": "5m"}),
             "the caller's cache_control must reach the upstream unchanged"
         );
+    }
+
+    #[tokio::test]
+    async fn native_messages_default_cache_ttl_preserves_explicit_values() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                if body["stream"] == true {
+                    ResponseTemplate::new(200).set_body_raw(
+                        concat!(
+                            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_ttl\",\"model\":\"claude\",\"usage\":{\"input_tokens\":1}}}\n\n",
+                            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+                        ),
+                        "text/event-stream",
+                    )
+                } else {
+                    ResponseTemplate::new(200).set_body_json(anthropic_response())
+                }
+            })
+            .mount(&upstream)
+            .await;
+        for stream in [false, true] {
+            for ttl in [None, Some("5m"), Some("1h")] {
+                let snap = new_snap_anthropic(&upstream.uri());
+                snap.models.insert(anthropic_model("ttl-claude"));
+                snap.apikeys.insert(apikey_entry(&["*"]));
+                let mut marker = serde_json::json!({"type": "ephemeral"});
+                if let Some(ttl) = ttl {
+                    marker["ttl"] = serde_json::json!(ttl);
+                }
+                let response = build_app(snap)
+                    .oneshot(make_req(serde_json::json!({
+                        "model": "ttl-claude", "max_tokens": 16, "stream": stream,
+                        "system": [{"type": "text", "text": "shared", "cache_control": marker}],
+                        "messages": [{"role": "user", "content": "hi"}]
+                    })))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let _ = to_bytes(response.into_body(), 65536).await.unwrap();
+                let requests = upstream.received_requests().await.unwrap();
+                let body: serde_json::Value =
+                    serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+                assert_eq!(
+                    body["system"][0]["cache_control"]["ttl"],
+                    ttl.unwrap_or("5m")
+                );
+            }
+        }
     }
 
     /// A semantic model cannot be served on this endpoint. A key restricted
@@ -9670,6 +9727,48 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
             .unwrap();
         assert_eq!(event["message"]["id"], "msg_bdrk_01X", "{wire}");
         assert_eq!(event["message"]["model"], "relay-claude");
+    }
+
+    #[tokio::test]
+    async fn an_unterminated_tail_and_its_closing_error_are_separate_events_in_every_delivery_mode()
+    {
+        struct Hold {
+            cap: usize,
+            fail_open: bool,
+        }
+        impl aisix_guardrails::Guardrail for Hold {
+            fn name(&self) -> &'static str {
+                "tail-frame-policy"
+            }
+            fn stream_output_policy(&self) -> aisix_guardrails::StreamOutputPolicy {
+                aisix_guardrails::StreamOutputPolicy::BufferFull {
+                    max_buffer_bytes: self.cap,
+                    on_exceeded_fail_open: self.fail_open,
+                }
+            }
+        }
+        let chain = |cap, fail_open| {
+            std::sync::Arc::new(aisix_guardrails::GuardrailChain::new(vec![
+                std::sync::Arc::new(Hold { cap, fail_open })
+                    as std::sync::Arc<dyn aisix_guardrails::Guardrail>,
+            ]))
+        };
+        assert!(UNTERMINATED_MESSAGE_START.len() > 128);
+        for policy in [None, Some(chain(4096, false)), Some(chain(1, true))] {
+            let wire = platform_mode_tail(policy).await;
+            let frames: Vec<_> = wire
+                .split("\n\n")
+                .filter(|frame| !frame.is_empty())
+                .collect();
+            assert_eq!(frames.len(), 2, "{wire}");
+            for frame in &frames {
+                let (event, malformed) = crate::redact::parse_sse_json_event(frame.as_bytes());
+                assert!(!malformed, "{frame}");
+                assert!(event.is_some(), "{frame}");
+            }
+            let (error, _) = crate::redact::parse_sse_json_event(frames[1].as_bytes());
+            assert_eq!(error.unwrap()["type"], "error");
+        }
     }
 
     #[tokio::test]

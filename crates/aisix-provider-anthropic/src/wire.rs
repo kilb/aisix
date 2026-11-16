@@ -1597,9 +1597,8 @@ const MIN_THINKING_BUDGET_TOKENS: u32 = 1024;
 /// request within Anthropic's four-breakpoint cap — this function adds at
 /// most two markers, and only to a request that had zero.
 ///
-/// `ttl` is the wire value for the injected markers (`5m` or `1h`); `5m`
-/// is emitted as the bare `{"type":"ephemeral"}` Anthropic treats as the
-/// five-minute default. A *below-minimum-length* prompt is a documented
+/// `ttl` is the wire value for the injected markers (`5m` or `1h`).
+/// A *below-minimum-length* prompt is a documented
 /// silent no-op upstream, so no length gate is applied — but an *empty*
 /// text block is a different case Anthropic rejects with a 400
 /// (`cache_control cannot be set for empty text blocks`), so the marker
@@ -1647,35 +1646,144 @@ pub fn apply_auto_prompt_caching(req: &mut AnthropicRequest<'_>, model: &aisix_c
     }
 }
 
+/// 借用协议节点，在原有序列化遍历中补齐 TTL；不复制正文，也不进入工具参数或 Schema。
+/// TTL 合同见 <https://platform.claude.com/docs/en/build-with-claude/prompt-caching>。
+pub struct DefaultCacheTtl<'a> {
+    value: &'a serde_json::Value,
+    node: CacheTtlNode,
+}
+
+#[derive(Clone, Copy)]
+enum CacheTtlNode {
+    Request,
+    Plain,
+    Messages,
+    Message,
+    Blocks,
+    Block,
+    ResultBlocks,
+    ResultBlock,
+    Marker,
+}
+
+impl<'a> DefaultCacheTtl<'a> {
+    pub fn request(value: &'a serde_json::Value) -> Self {
+        Self {
+            value,
+            node: CacheTtlNode::Request,
+        }
+    }
+
+    pub fn field(key: &str, value: &'a serde_json::Value) -> Self {
+        let node = match key {
+            "cache_control" => CacheTtlNode::Marker,
+            "messages" => CacheTtlNode::Messages,
+            "system" | "tools" => CacheTtlNode::Blocks,
+            _ => CacheTtlNode::Plain,
+        };
+        Self { value, node }
+    }
+}
+
+impl serde::Serialize for DefaultCacheTtl<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{SerializeMap, SerializeSeq};
+        let next = match self.node {
+            CacheTtlNode::Messages => Some(CacheTtlNode::Message),
+            CacheTtlNode::Blocks => Some(CacheTtlNode::Block),
+            CacheTtlNode::ResultBlocks => Some(CacheTtlNode::ResultBlock),
+            _ => None,
+        };
+        if let (Some(node), Some(items)) = (next, self.value.as_array()) {
+            let mut seq = serializer.serialize_seq(Some(items.len()))?;
+            for value in items {
+                seq.serialize_element(&Self { value, node })?;
+            }
+            return seq.end();
+        }
+        if matches!(self.node, CacheTtlNode::Plain) {
+            return self.value.serialize(serializer);
+        }
+        let Some(fields) = self.value.as_object() else {
+            return self.value.serialize(serializer);
+        };
+        let add_ttl = matches!(self.node, CacheTtlNode::Marker)
+            && fields.get("type").and_then(serde_json::Value::as_str) == Some("ephemeral")
+            && !fields.contains_key("ttl");
+        let mut map = serializer.serialize_map(Some(fields.len() + usize::from(add_ttl)))?;
+        for (key, value) in fields {
+            let node = match (self.node, key.as_str()) {
+                (CacheTtlNode::Request, _) => Self::field(key, value).node,
+                (CacheTtlNode::Message, "content") => CacheTtlNode::Blocks,
+                (CacheTtlNode::Block | CacheTtlNode::ResultBlock, "cache_control") => {
+                    CacheTtlNode::Marker
+                }
+                (CacheTtlNode::Block, "content")
+                    if fields.get("type").and_then(serde_json::Value::as_str)
+                        == Some("tool_result") =>
+                {
+                    CacheTtlNode::ResultBlocks
+                }
+                _ => CacheTtlNode::Plain,
+            };
+            map.serialize_entry(key, &Self { value, node })?;
+        }
+        if add_ttl {
+            map.serialize_entry("ttl", "5m")?;
+        }
+        map.end()
+    }
+}
+
+/// 保持官方五分钟缺省值显式，避免兼容渠道把省略的 TTL 改成一小时。
+/// 仅修改协议定义的缓存标记；工具参数和 JSON Schema 都是应用数据。
+pub fn default_cache_ttl(body: &mut serde_json::Value) {
+    for_each_cache_control(body, |marker| {
+        if marker.get("type").and_then(serde_json::Value::as_str) == Some("ephemeral")
+            && !marker.contains_key("ttl")
+        {
+            marker.insert("ttl".into(), serde_json::Value::String("5m".into()));
+        }
+    });
+}
+
 /// Keep only the `cache_control` sub-fields `keep` accepts, on every block
 /// of an Anthropic Messages body a marker can sit on: system blocks, tool
 /// definitions, message content blocks, and the items of a `tool_result`'s
 /// content. For a platform that refuses sub-fields the Anthropic API takes
 /// (`scope`, and whatever it adds next).
 pub fn retain_cache_control_fields(body: &mut serde_json::Value, keep: impl Fn(&str) -> bool) {
+    for_each_cache_control(body, |marker| marker.retain(|key, _| keep(key)));
+}
+
+fn for_each_cache_control(
+    body: &mut serde_json::Value,
+    mut apply: impl FnMut(&mut serde_json::Map<String, serde_json::Value>),
+) {
     fn items(v: Option<&mut serde_json::Value>) -> impl Iterator<Item = &mut serde_json::Value> {
         v.and_then(|v| v.as_array_mut()).into_iter().flatten()
     }
-    let sanitize = |block: &mut serde_json::Value| {
-        if let Some(cc) = block
+    let mut visit = |block: &mut serde_json::Value| {
+        if let Some(marker) = block
             .get_mut("cache_control")
-            .and_then(|c| c.as_object_mut())
+            .and_then(serde_json::Value::as_object_mut)
         {
-            cc.retain(|k, _| keep(k));
+            apply(marker);
         }
     };
+    visit(body);
     for block in items(body.get_mut("system")) {
-        sanitize(block);
+        visit(block);
     }
     for block in items(body.get_mut("tools")) {
-        sanitize(block);
+        visit(block);
     }
     for message in items(body.get_mut("messages")) {
         for block in items(message.get_mut("content")) {
             for item in items(block.get_mut("content")) {
-                sanitize(item);
+                visit(item);
             }
-            sanitize(block);
+            visit(block);
         }
     }
 }
@@ -1692,14 +1800,12 @@ fn is_empty_text_block(block: &serde_json::Value) -> bool {
             .is_none_or(|t| t.trim().is_empty())
 }
 
-/// The marker written by [`inject_cache_breakpoints`]. `1h` carries the
-/// explicit `ttl`; `5m` (and any other value) uses the bare ephemeral
-/// form that defaults to five minutes.
+/// 网关注入的缓存标记显式携带 TTL；未选一小时则使用官方五分钟值。
 fn cache_control_marker(ttl: &str) -> serde_json::Value {
     if ttl == "1h" {
         serde_json::json!({"type": "ephemeral", "ttl": "1h"})
     } else {
-        serde_json::json!({"type": "ephemeral"})
+        serde_json::json!({"type": "ephemeral", "ttl": "5m"})
     }
 }
 
@@ -6616,12 +6722,12 @@ mod tests {
         );
         let wire = injected_wire(&req, "5m");
         // Plain-string system promotes to a one-block array carrying the
-        // 5m marker (bare ephemeral form).
+        // explicit 5m marker.
         assert_eq!(
             wire["system"],
             serde_json::json!([
                 {"type": "text", "text": "big stable prefix",
-                 "cache_control": {"type": "ephemeral"}},
+                 "cache_control": {"type": "ephemeral", "ttl": "5m"}},
             ])
         );
         // Only the final message's last block is marked; earlier turns
@@ -6632,7 +6738,17 @@ mod tests {
         assert_eq!(last["role"], "user");
         assert_eq!(
             last["content"][0]["cache_control"],
-            serde_json::json!({"type": "ephemeral"})
+            serde_json::json!({"type": "ephemeral", "ttl": "5m"})
+        );
+    }
+
+    #[test]
+    fn default_cache_ttl_is_explicitly_five_minutes() {
+        let req = ChatFormat::new("claude", vec![ChatMessage::user("hi")]);
+        let wire = injected_wire(&req, "5m");
+        assert_eq!(
+            wire["messages"][0]["content"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral", "ttl": "5m"})
         );
     }
 
@@ -6654,7 +6770,7 @@ mod tests {
         assert!(wire.get("system").is_none() || wire["system"].is_null());
         assert_eq!(
             wire["messages"][0]["content"][0]["cache_control"],
-            serde_json::json!({"type": "ephemeral"})
+            serde_json::json!({"type": "ephemeral", "ttl": "5m"})
         );
     }
 
@@ -6725,7 +6841,7 @@ mod tests {
         // empty final block does not.
         assert_eq!(
             wire["system"][0]["cache_control"],
-            serde_json::json!({"type": "ephemeral"})
+            serde_json::json!({"type": "ephemeral", "ttl": "5m"})
         );
         assert_eq!(
             wire["messages"][0]["content"][0],
@@ -6749,7 +6865,7 @@ mod tests {
         }
         assert_eq!(
             wire["messages"][0]["content"][0]["cache_control"],
-            serde_json::json!({"type": "ephemeral"})
+            serde_json::json!({"type": "ephemeral", "ttl": "5m"})
         );
     }
 
@@ -6776,7 +6892,7 @@ mod tests {
         assert!(content[1].get("cache_control").is_none());
         assert_eq!(
             content[2]["cache_control"],
-            serde_json::json!({"type": "ephemeral"})
+            serde_json::json!({"type": "ephemeral", "ttl": "5m"})
         );
     }
 
@@ -6803,7 +6919,7 @@ mod tests {
         assert!(sys[0].get("cache_control").is_none());
         assert_eq!(
             sys[1]["cache_control"],
-            serde_json::json!({"type": "ephemeral"})
+            serde_json::json!({"type": "ephemeral", "ttl": "5m"})
         );
     }
 
@@ -10494,6 +10610,68 @@ mod tests {
         assert_eq!(messages[0].content[0]["cache_control"], ec);
         // A blank text block takes no marker: Anthropic rejects one there.
         assert!(messages[1].content[0].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn default_cache_ttl_visits_protocol_markers_and_preserves_application_data() {
+        let marker = serde_json::json!({"type": "ephemeral"});
+        let mut body = serde_json::json!({
+            "cache_control": marker,
+            "system": [{"type": "text", "text": "s", "cache_control": marker}],
+            "tools": [{"name": "t", "cache_control": marker, "input_schema": {
+                "type": "object", "properties": {"cache_control": marker}
+            }}],
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "u", "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+                {"type": "tool_result", "tool_use_id": "x", "cache_control": {"type": "ephemeral", "ttl": "5m"},
+                 "content": [{"type": "text", "text": "r", "cache_control": marker}]},
+                {"type": "tool_use", "id": "y", "name": "t", "input": {"cache_control": marker}},
+                {"type": "text", "text": "invalid ttl stays upstream's decision", "cache_control": {"type": "ephemeral", "ttl": null}},
+            ]}],
+        });
+        let mut borrowed = serde_json::Map::new();
+        for (key, value) in body.as_object().unwrap() {
+            borrowed.insert(
+                key.clone(),
+                serde_json::to_value(DefaultCacheTtl::field(key, value)).unwrap(),
+            );
+        }
+        default_cache_ttl(&mut body);
+        assert_eq!(serde_json::Value::Object(borrowed), body);
+        for marker in [
+            &body["cache_control"],
+            &body["system"][0]["cache_control"],
+            &body["tools"][0]["cache_control"],
+            &body["messages"][0]["content"][1]["content"][0]["cache_control"],
+        ] {
+            assert_eq!(marker["ttl"], "5m");
+        }
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"]["ttl"],
+            "1h"
+        );
+        assert_eq!(
+            body["messages"][0]["content"][1]["cache_control"]["ttl"],
+            "5m"
+        );
+        assert!(body["messages"][0]["content"][3]["cache_control"]
+            .get("ttl")
+            .is_some_and(serde_json::Value::is_null));
+        assert_eq!(
+            body["tools"][0]["input_schema"]["properties"]["cache_control"],
+            marker
+        );
+        assert_eq!(
+            body["messages"][0]["content"][2]["input"]["cache_control"],
+            marker
+        );
+        let preserved = body.clone();
+        default_cache_ttl(&mut body);
+        assert_eq!(body, preserved);
+        let mut unmarked = serde_json::json!({"messages": [{"role": "user", "content": "hi"}]});
+        let preserved = unmarked.clone();
+        default_cache_ttl(&mut unmarked);
+        assert_eq!(unmarked, preserved);
     }
 
     #[test]

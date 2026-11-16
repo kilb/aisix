@@ -264,6 +264,7 @@ fn prepare_outbound_body(
         .unwrap_or_default()
         .to_owned();
     crate::wire::settle_gateway_thinking(req, &mut body, &model, &ctx.provider_key);
+    crate::wire::default_cache_ttl(&mut body);
     Ok(body)
 }
 
@@ -950,6 +951,64 @@ mod tests {
             chunks[1].delta.content.as_deref(),
             Some(r#"{"name":"Ada"}"#)
         );
+    }
+
+    #[tokio::test]
+    async fn default_cache_ttl_reaches_both_bridge_modes_without_overriding_the_caller() {
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                if body["stream"] == true {
+                    ResponseTemplate::new(200).set_body_raw(
+                        concat!(
+                            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_ttl\",\"model\":\"claude\",\"usage\":{\"input_tokens\":1}}}\n\n",
+                            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+                        ),
+                        "text/event-stream",
+                    )
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "id": "msg_x", "type": "message", "role": "assistant",
+                        "model": "claude-sonnet-4-5",
+                        "content": [{"type": "text", "text": "ok"}],
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 1, "output_tokens": 1}
+                    }))
+                }
+            })
+            .mount(&server)
+            .await;
+        let ctx = sample_ctx(&server.uri());
+        for stream in [false, true] {
+            for ttl in [None, Some("5m"), Some("1h")] {
+                let mut asked = req();
+                let mut marker = serde_json::json!({"type": "ephemeral"});
+                if let Some(ttl) = ttl {
+                    marker["ttl"] = serde_json::json!(ttl);
+                }
+                asked.messages[0]
+                    .extra
+                    .insert("cache_control".into(), marker);
+                if stream {
+                    let mut chunks = AnthropicBridge::new()
+                        .chat_stream(&asked, &ctx)
+                        .await
+                        .unwrap();
+                    while chunks.next().await.is_some() {}
+                } else {
+                    AnthropicBridge::new().chat(&asked, &ctx).await.unwrap();
+                }
+                let requests = server.received_requests().await.unwrap();
+                let body: serde_json::Value =
+                    serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+                assert_eq!(
+                    body["system"][0]["cache_control"]["ttl"],
+                    ttl.unwrap_or("5m")
+                );
+            }
+        }
     }
 
     #[tokio::test]

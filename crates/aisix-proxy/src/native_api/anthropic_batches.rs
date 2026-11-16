@@ -172,6 +172,7 @@ pub(crate) async fn create(
             // block 路径也先把本项审计归回原请求，再返回同一个错误。
             audit.merge_input(entry_audit);
             scanned?;
+            aisix_provider_anthropic::wire::default_cache_ttl(params);
             anthropic::refuse_messages_references(
                 &state,
                 &snapshot,

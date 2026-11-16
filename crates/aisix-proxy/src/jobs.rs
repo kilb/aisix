@@ -1614,7 +1614,7 @@ pub(crate) fn relay_job_response_headers(
 }
 
 /// JSON response from upstream bytes with the routing model's id rewrite
-/// applied. Non-JSON upstream bodies (error HTML etc.) relay verbatim.
+/// applied. HTML errors use the shared public envelope; other bodies relay verbatim.
 fn json_response(
     status: StatusCode,
     upstream_headers: &HeaderMap,
@@ -1630,6 +1630,12 @@ fn json_response(
             relay_job_response_headers(&mut resp, upstream_headers, status);
             return resp;
         }
+    }
+    if let Some(mut response) =
+        crate::error::upstream_html_response(status, upstream_headers, &bytes, false)
+    {
+        relay_job_response_headers(&mut response, upstream_headers, status);
+        return response;
     }
     let body = match (rewrite_model, serde_json::from_slice::<Value>(&bytes).ok()) {
         (Some(model), Some(mut v)) => {
@@ -5021,6 +5027,42 @@ mod batch_input_perf_tests;
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn html_errors_are_filtered_before_the_jobs_raw_body_is_relayed() {
+        for platform in [false, true] {
+            let render = || {
+                super::json_response(
+                    axum::http::StatusCode::BAD_GATEWAY,
+                    &axum::http::HeaderMap::new(),
+                    bytes::Bytes::from_static(
+                        b"<!DOCTYPE html><html><title>relay.example 502</title></html>",
+                    ),
+                    None,
+                    None,
+                )
+            };
+            let response = if platform {
+                crate::error::tests::in_platform_mode(render)
+            } else {
+                render()
+            };
+            assert_eq!(
+                response.status(),
+                if platform {
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE
+                } else {
+                    axum::http::StatusCode::BAD_GATEWAY
+                }
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(body.get("error").is_some());
+            assert!(!body.to_string().contains("relay.example"));
+        }
+    }
     /// 这个面判断一把密钥说哪种协议，必须和请求路径实际怎么分派一致：
     /// chat 能用的密钥这里也能用，chat 分派不出去的这里也不收。
     ///

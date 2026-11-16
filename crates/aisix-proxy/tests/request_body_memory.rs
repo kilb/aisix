@@ -483,6 +483,14 @@ fn messages_body(size: (usize, usize)) -> String {
     messages_body_for("claude", size)
 }
 
+// 真实原生分派的缺省 TTL 请求也必须保持两份正文上限，不能改走整份 Value 副本。
+fn messages_with_default_cache_ttl_body(size: (usize, usize)) -> String {
+    let mut body = messages_body(size);
+    assert_eq!(body.pop(), Some('}'));
+    body.push_str(",\"cache_control\":{\"type\":\"ephemeral\"}}");
+    body
+}
+
 fn messages_body_for(model: &str, (images, image_bytes): (usize, usize)) -> String {
     let mut content = vec![serde_json::json!({"type": "text", "text": "Describe these images."})];
     for i in 0..images {
@@ -797,6 +805,24 @@ async fn request_body_is_held_at_most_twice_while_upstream_is_pending() {
                 "messages passthrough (no content capture)",
                 "/v1/messages",
                 messages_body,
+            )
+        },
+        Family {
+            peak: Some(2.0 + MARGIN),
+            capture_content: false,
+            ..Family::new(
+                "messages with default cache TTL (no content capture)",
+                "/v1/messages",
+                messages_with_default_cache_ttl_body,
+            )
+        },
+        Family {
+            peak: Some(2.0 + MARGIN),
+            capture_content: false,
+            ..Family::new(
+                "count_tokens with default cache TTL (no content capture)",
+                "/v1/messages/count_tokens",
+                messages_with_default_cache_ttl_body,
             )
         },
         Family {

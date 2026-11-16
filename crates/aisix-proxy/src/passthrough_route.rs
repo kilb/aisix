@@ -1436,11 +1436,22 @@ async fn dispatch(
         };
     }
 
-    let mut response = Response::builder()
-        .status(status)
-        .body(Body::from(resp_body))
-        .unwrap();
-    copy_safe_headers(&resp_headers, response.headers_mut());
+    let filtered = crate::error::upstream_html_response(
+        status,
+        &resp_headers,
+        &resp_body,
+        protocol == PassthroughProtocol::AnthropicMessages,
+    );
+    let mut response = if let Some(response) = filtered {
+        response
+    } else {
+        let mut response = Response::builder()
+            .status(status)
+            .body(Body::from(resp_body))
+            .unwrap();
+        copy_safe_headers(&resp_headers, response.headers_mut());
+        response
+    };
     if let Ok(hv) = HeaderValue::from_str(&client.request_id) {
         response
             .headers_mut()
@@ -8075,6 +8086,54 @@ fn emit_access_log(
 }
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn html_error_documents_are_filtered_after_the_passthrough_route_records_them() {
+        use aisix_obs::UsageSink;
+        let upstream = MockServer::builder().start().await;
+        let html = "<!DOCTYPE html><html><title>relay.example 502</title></html>";
+        Mock::given(wm_method("POST"))
+            .respond_with(
+                ResponseTemplate::new(502)
+                    .set_body_raw(html, "text/html")
+                    .insert_header("retry-after", "7"),
+            )
+            .mount(&upstream)
+            .await;
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(provider_key_entry("http://unused"));
+        snap.apikeys.insert(apikey_entry("sk-caller", Some(&["*"])));
+        snap.passthrough_routes
+            .insert(inject_route(&upstream.uri()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), Arc::new(Hub::new()), &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let response = crate::build_router(state)
+            .oneshot(relay_request("/passthrough/openai/v1/chat/completions"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+        assert_eq!(response.headers()["retry-after"], "7");
+        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body["error"]["message"],
+            "upstream returned 502 Bad Gateway"
+        );
+        assert!(!body.to_string().contains("relay.example"));
+        let row = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            row.error_message.contains("relay.example"),
+            "{}",
+            row.error_message
+        );
+    }
 
     #[tokio::test]
     async fn compat_claude_native_passthrough_compaction_later_partial() {

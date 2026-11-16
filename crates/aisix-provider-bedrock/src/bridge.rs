@@ -1723,6 +1723,7 @@ impl BedrockBridge {
             // keeps the final say and an override can never reintroduce a
             // URL-borne `model` into the /invoke body.
             apply_body_overrides(&mut body_value, ctx)?;
+            aisix_provider_anthropic::wire::default_cache_ttl(&mut body_value);
             aisix_provider_anthropic::wire::settle_gateway_thinking(
                 &req,
                 &mut body_value,
@@ -2310,7 +2311,9 @@ impl CachePoints {
     /// the five-minute default alone and rejects the field.
     fn point(self, marker: Option<&serde_json::Value>) -> Option<CachePointBlock> {
         let marker = marker?;
-        let ttl = marker.get("ttl").and_then(|t| t.as_str());
+        let ttl = marker
+            .get("ttl")
+            .map_or(Some("5m"), serde_json::Value::as_str);
         self.point_at(ttl)
     }
 
@@ -2415,9 +2418,8 @@ fn inject_cache_points(
     cache: CachePoints,
     ttl: &str,
 ) -> Result<(), BridgeError> {
-    // The marker the Anthropic rails inject: bare for the 5-minute default,
-    // an explicit `ttl` for `1h`.
-    let Some(point) = cache.point_at((ttl == "1h").then_some(ttl)) else {
+    // 与 Anthropic 请求轨道一致，注入标记显式携带五分钟或一小时 TTL。
+    let Some(point) = cache.point_at(Some(ttl)) else {
         return Ok(());
     };
     if matches!(systems.last(), Some(SystemContentBlock::Text(t)) if !t.trim().is_empty()) {
@@ -4158,6 +4160,29 @@ fn check_history_tool_calls(req: &ChatFormat) -> Result<(), BridgeError> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn default_cache_ttl_is_explicit_only_for_claude_converse() {
+        for (marker, expected) in [
+            (serde_json::json!({"type": "ephemeral"}), "5m"),
+            (serde_json::json!({"type": "ephemeral", "ttl": "5m"}), "5m"),
+            (serde_json::json!({"type": "ephemeral", "ttl": "1h"}), "1h"),
+        ] {
+            let point = super::CachePoints::Claude.point(Some(&marker)).unwrap();
+            assert_eq!(point.ttl().map(|ttl| ttl.as_str()), Some(expected));
+            let nova = super::CachePoints::Nova.point(Some(&marker)).unwrap();
+            assert!(nova.ttl().is_none());
+        }
+    }
+
+    #[test]
+    fn converse_only_defaults_an_absent_cache_ttl_field() {
+        for value in [serde_json::Value::Null, serde_json::json!(17)] {
+            let marker = serde_json::json!({"type": "ephemeral", "ttl": value});
+            let point = super::CachePoints::Claude.point(Some(&marker)).unwrap();
+            assert!(point.ttl().is_none());
+        }
+    }
 
     /// `api_base` may carry `user:pass@`, and the endpoint the signer cannot
     /// read is quoted in a 400 the caller sees.
@@ -8971,7 +8996,7 @@ mod tests {
             assert!(assistant[0].get("toolUse").is_some(), "{assistant}");
             assert_eq!(
                 assistant[1],
-                serde_json::json!({"cachePoint": {"type": "default"}})
+                serde_json::json!({"cachePoint": {"type": "default", "ttl": "5m"}})
             );
             // The tool results and the user message after them are one
             // Converse turn: the roles must alternate.
@@ -8979,7 +9004,7 @@ mod tests {
             assert!(results[0].get("toolResult").is_some(), "{results}");
             assert_eq!(
                 results[1],
-                serde_json::json!({"cachePoint": {"type": "default"}})
+                serde_json::json!({"cachePoint": {"type": "default", "ttl": "5m"}})
             );
             assert_eq!(
                 results.as_array().unwrap()[2..],
@@ -8996,7 +9021,7 @@ mod tests {
             assert!(tools[0].get("toolSpec").is_some());
             assert_eq!(
                 tools[1],
-                serde_json::json!({"cachePoint": {"type": "default"}})
+                serde_json::json!({"cachePoint": {"type": "default", "ttl": "5m"}})
             );
         }
     }
@@ -9180,7 +9205,7 @@ mod tests {
         );
         let _ = bridge.chat(&req, &ctx).await;
         let body = responder.captured_body.lock().unwrap().clone().unwrap();
-        let marker = serde_json::json!({"type": "ephemeral"});
+        let marker = serde_json::json!({"type": "ephemeral", "ttl": "5m"});
         assert_eq!(body["system"][0]["cache_control"], marker, "{body}");
         assert_eq!(
             body["messages"][0]["content"][0]["cache_control"], marker,

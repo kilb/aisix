@@ -387,6 +387,7 @@ pub fn shape_request(
     let allowed = allowed_fields(platform);
     obj.retain(|k, _| allowed.contains(&k.as_str()));
 
+    crate::wire::default_cache_ttl(body);
     match platform {
         Platform::Bedrock => {
             crate::wire::retain_cache_control_fields(body, |k| matches!(k, "type" | "ttl"))
@@ -755,6 +756,23 @@ fn filter_bedrock_context_management(obj: &mut Map<String, Value>, betas: &mut B
 }
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn default_cache_ttl_is_explicit_on_both_native_platforms() {
+        for platform in [super::Platform::Bedrock, super::Platform::Vertex] {
+            let mut body = serde_json::json!({
+                "model": "claude", "max_tokens": 16,
+                "system": [{"type": "text", "text": "shared", "cache_control": {"type": "ephemeral"}}],
+                "messages": [{"role": "user", "content": [{"type": "text", "text": "hi", "cache_control": {"type": "ephemeral", "ttl": "1h"}}]}],
+            });
+            super::shape_request(&mut body, platform, "claude", Vec::new());
+            assert_eq!(body["system"][0]["cache_control"]["ttl"], "5m");
+            assert_eq!(
+                body["messages"][0]["content"][0]["cache_control"]["ttl"],
+                "1h"
+            );
+        }
+    }
 
     #[test]
     fn compat_claude_native_platform_on_demand_compaction() {

@@ -1261,6 +1261,7 @@ impl VertexBridge {
             // the final say and an override can never reintroduce a URL-borne
             // `model` into the `:rawPredict` body.
             apply_body_overrides(&mut body_value, ctx)?;
+            aisix_provider_anthropic::wire::default_cache_ttl(&mut body_value);
             aisix_provider_anthropic::wire::settle_gateway_thinking(
                 &req,
                 &mut body_value,
@@ -1389,6 +1390,7 @@ impl VertexBridge {
             // Vertex-specific shaping below (see the non-stream path). Here
             // `stream` is intentionally KEPT in the body.
             apply_body_overrides(&mut body_value, ctx)?;
+            aisix_provider_anthropic::wire::default_cache_ttl(&mut body_value);
             aisix_provider_anthropic::wire::settle_gateway_thinking(
                 &req,
                 &mut body_value,

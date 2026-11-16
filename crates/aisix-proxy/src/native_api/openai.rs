@@ -1245,6 +1245,9 @@ fn validate_lookup_record(
     Ok((target, origin))
 }
 pub(crate) fn raw_body(status: StatusCode, headers: &HeaderMap, bytes: Bytes) -> Response {
+    if let Some(response) = crate::error::upstream_html_response(status, headers, &bytes, false) {
+        return response;
+    }
     let mut response = (status, bytes).into_response();
     for name in [
         "content-type",

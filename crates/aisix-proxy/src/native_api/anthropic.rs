@@ -1342,6 +1342,9 @@ pub(crate) fn raw_body(status: StatusCode, headers: &HeaderMap, bytes: Bytes) ->
                 .into_response();
         }
     }
+    if let Some(response) = crate::error::upstream_html_response(status, headers, &bytes, true) {
+        return response;
+    }
     let mut response = (status, bytes).into_response();
     for name in [
         "content-type",

@@ -781,8 +781,7 @@ impl ProxyError {
         // bridge has best-effort-parsed the upstream envelope into a
         // structured [`UpstreamErrorView`], and for a 4xx we translate
         // its fields into the client's envelope. 5xx and non-JSON bodies
-        // take the generic envelope; every one carries the upstream's own
-        // message.
+        // take the generic envelope; HTML documents carry only their status.
         if let ProxyError::Bridge(aisix_gateway::BridgeError::UpstreamStatus {
             status,
             message,
@@ -873,6 +872,7 @@ impl ProxyError {
             // Stable machine-readable code for SDKs to branch on, distinct
             // from the generic `permission_denied` type shared with
             // ModelForbidden (#557 AC-1).
+            ProxyError::EndpointForbidden(_) => env.with_code("endpoint_not_allowed"),
             ProxyError::ModelIpRestricted(_) => env.with_code("ip_restricted"),
             ProxyError::RouteIpRestricted(_) => env.with_code("ip_restricted"),
             // Stable machine-readable codes so SDKs can branch on the
@@ -1009,7 +1009,8 @@ pub(crate) fn relayed_upstream_envelope(err: &aisix_gateway::BridgeError) -> Opt
 /// `upstream_error` envelope carrying the upstream's own message.
 ///
 /// An upstream that answers with no usable message (an empty body, or an
-/// envelope whose `message` is blank) is named by its status and reason
+/// envelope whose `message` is blank), or an unstructured HTML document,
+/// is named by its status and reason
 /// phrase instead, so the caller never receives an empty `error.message`.
 /// Response headers are deliberately not echoed: a redirect's `Location`
 /// names a host the operator never configured.
@@ -1020,7 +1021,9 @@ fn render_bridge_upstream_envelope(
     wire: aisix_gateway::UpstreamWire,
 ) -> ErrorEnvelope {
     let status_message;
-    let message = if message.trim().is_empty() {
+    let message = if message.trim().is_empty()
+        || ((status >= 500 || parsed.is_none()) && upstream_error_is_html(message.as_bytes()))
+    {
         status_message = upstream_status_message(status);
         status_message.as_str()
     } else {
@@ -1038,6 +1041,57 @@ fn render_bridge_upstream_envelope(
         };
     }
     ErrorEnvelope::new(message.to_string(), "upstream_error")
+}
+
+// HTML 是中间层的诊断页面，不是客户端可操作的 API 错误；只读固定前缀，不解析文档。
+fn upstream_error_is_html(body: &[u8]) -> bool {
+    let body = body.trim_ascii_start();
+    let body = body
+        .strip_prefix(b"\xef\xbb\xbf")
+        .unwrap_or(body)
+        .trim_ascii_start();
+    [
+        b"<!doctype html".as_slice(),
+        b"<html",
+        b"<head",
+        b"<body",
+        b"<!--",
+    ]
+    .iter()
+    .any(|prefix| {
+        body.get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    })
+}
+
+/// 原始字节中转也使用同一个 HTML 判定；运营侧已保留原始诊断，客户端保留 HTTP 重试语义。
+pub(crate) fn upstream_html_response(
+    status: StatusCode,
+    upstream_headers: &axum::http::HeaderMap,
+    body: &[u8],
+    anthropic: bool,
+) -> Option<Response> {
+    if status.is_success() || !upstream_error_is_html(body) {
+        return None;
+    }
+    let error = ProxyError::Bridge(BridgeError::upstream_status(
+        status.as_u16(),
+        upstream_status_message(status.as_u16()),
+    ));
+    let mut response = if anthropic {
+        error.into_anthropic_response()
+    } else {
+        error.into_response()
+    };
+    if !crate::platform_errors::active() {
+        *response.status_mut() = status;
+        for name in ["retry-after", "retry-after-ms"] {
+            if let Some(value) = upstream_headers.get(name) {
+                response.headers_mut().insert(name, value.clone());
+            }
+        }
+    }
+    Some(response)
 }
 
 fn upstream_status_message(status: u16) -> String {
@@ -1390,8 +1444,8 @@ pub(crate) fn anthropic_kind_from_status(status: StatusCode) -> &'static str {
 
 impl ProxyError {
     /// Render this error as an Anthropic-shape `{type:"error", error:
-    /// {type, message}}` HTTP response, plus `error.code` on a guardrail
-    /// refusal ([`anthropic_guardrail_code`]). Used by `/v1/messages` so the
+    /// {type, message}}` HTTP response, plus `error.code` on a guardrail or
+    /// endpoint-family refusal ([`anthropic_guardrail_code`]). Used by `/v1/messages` so the
     /// Anthropic SDK's envelope parser sees a shape the official
     /// SDK and the broader ecosystem both treat as canonical.
     ///
@@ -1433,6 +1487,7 @@ impl ProxyError {
             ProxyError::ContentFiltered { unavailable, .. } => {
                 Some(anthropic_guardrail_code(unavailable.as_deref()))
             }
+            ProxyError::EndpointForbidden(_) => Some("endpoint_not_allowed"),
             _ => None,
         };
         AnthropicErrorEnvelope {
@@ -1863,6 +1918,131 @@ pub(crate) mod tests {
             Some(std::time::Duration::from_secs(30)),
         ));
         assert_eq!(wrapped.retry_after_secs(), None);
+    }
+
+    #[test]
+    fn html_upstream_error_hides_the_document_in_both_envelopes() {
+        let html = "<!DOCTYPE html><html><head><title>relay.example | 502</title></head></html>";
+        let err = ProxyError::Bridge(BridgeError::upstream_status(502, html));
+        for body in [
+            serde_json::to_value(err.envelope()).unwrap(),
+            serde_json::from_str::<serde_json::Value>(&err.anthropic_body()).unwrap(),
+        ] {
+            assert_eq!(
+                body["error"]["message"],
+                "upstream returned 502 Bad Gateway"
+            );
+            assert!(!body.to_string().contains("relay.example"));
+            assert!(!body.to_string().contains("DOCTYPE"));
+        }
+        assert!(err.to_string().contains("relay.example"));
+    }
+
+    #[tokio::test]
+    async fn raw_native_html_errors_are_filtered_in_both_protocols_and_modes() {
+        type RawBody = fn(StatusCode, &axum::http::HeaderMap, bytes::Bytes) -> Response;
+        let renderers: [RawBody; 2] = [
+            crate::native_api::openai::raw_body,
+            crate::native_api::anthropic::raw_body,
+        ];
+        for platform in [false, true] {
+            for render in renderers {
+                let mut headers = axum::http::HeaderMap::new();
+                headers.insert("content-type", "text/html".parse().unwrap());
+                headers.insert("retry-after", "7".parse().unwrap());
+                let make_response = || {
+                    render(
+                        StatusCode::BAD_GATEWAY,
+                        &headers,
+                        bytes::Bytes::from_static(
+                            b"<!DOCTYPE html><html><title>relay.example 502</title></html>",
+                        ),
+                    )
+                };
+                let response = if platform {
+                    in_platform_mode(make_response)
+                } else {
+                    make_response()
+                };
+                assert_eq!(
+                    response.status(),
+                    if platform {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    } else {
+                        StatusCode::BAD_GATEWAY
+                    }
+                );
+                assert_eq!(
+                    response.headers()[axum::http::header::CONTENT_TYPE],
+                    "application/json"
+                );
+                assert_eq!(
+                    response
+                        .headers()
+                        .get("retry-after")
+                        .map(|value| value.as_bytes()),
+                    (!platform).then_some(b"7".as_slice())
+                );
+                let bytes = axum::body::to_bytes(response.into_body(), 65536)
+                    .await
+                    .unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert!(body["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| !message.is_empty()));
+                assert!(!body.to_string().contains("relay.example"));
+                assert!(!body.to_string().contains("DOCTYPE"));
+            }
+        }
+    }
+
+    #[test]
+    fn html_filter_preserves_structured_request_errors_and_plain_text() {
+        let raw = br#"{"error":{"message":"<html> is not a valid model","type":"invalid_request_error","code":"bad_model","param":"model"}}"#;
+        let error = aisix_gateway::upstream_status_of_body(
+            400,
+            raw,
+            None,
+            aisix_gateway::UpstreamWire::OpenAI,
+            aisix_provider_openai::parse_openai_error_envelope,
+        );
+        let body = ProxyError::Bridge(error).envelope();
+        assert_eq!(body.error.message, "<html> is not a valid model");
+        assert_eq!(body.error.code.as_deref(), Some("bad_model"));
+        assert_eq!(body.error.param.as_deref(), Some("model"));
+        for message in ["invalid model", "engine internal panic"] {
+            let error = ProxyError::Bridge(BridgeError::upstream_status(502, message));
+            assert_eq!(error.envelope().error.message, message);
+        }
+        for html in [
+            "  <!DoCtYpE hTmL><html>",
+            "\u{feff}<HTML>",
+            "<!-- edge diagnostic -->",
+        ] {
+            assert!(upstream_error_is_html(html.as_bytes()));
+        }
+        assert!(!upstream_error_is_html(raw));
+    }
+
+    #[test]
+    fn endpoint_refusal_has_a_stable_code_in_every_envelope_and_mode() {
+        let error = ProxyError::EndpointForbidden(aisix_core::models::EndpointFamily::Embeddings);
+        for platform in [false, true] {
+            let render = || {
+                [
+                    serde_json::to_value(error.envelope()).unwrap(),
+                    serde_json::from_str::<serde_json::Value>(&error.anthropic_body()).unwrap(),
+                ]
+            };
+            let envelopes = if platform {
+                in_platform_mode(render)
+            } else {
+                render()
+            };
+            for body in envelopes {
+                assert_eq!(body["error"]["code"], "endpoint_not_allowed");
+            }
+        }
     }
 
     #[test]

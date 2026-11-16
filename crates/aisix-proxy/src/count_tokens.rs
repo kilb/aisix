@@ -943,10 +943,13 @@ async fn count_tokens_to_target(
             _ => None,
         };
         if let Some(fields) = only_model_renamed {
-            crate::util::outbound_json(&crate::util::ModelRenamed {
-                fields,
-                model: &upstream_model,
-            })?
+            crate::util::outbound_json(
+                &crate::util::ModelRenamed {
+                    fields,
+                    model: &upstream_model,
+                }
+                .with_default_cache_ttl(),
+            )?
         } else {
             let mut body = body.into_owned();
 
@@ -987,6 +990,7 @@ async fn count_tokens_to_target(
                 );
             }
 
+            aisix_provider_anthropic::wire::default_cache_ttl(&mut body);
             crate::util::outbound_json(&body)?
         }
     };
@@ -2295,6 +2299,76 @@ mod tests {
         let sent: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
         assert_eq!(sent["model"], "claude-haiku-4-5-20251001");
         assert_eq!(sent["messages"][0]["content"], "hello");
+    }
+
+    #[tokio::test]
+    async fn an_unsupported_count_endpoint_never_creates_a_message_or_invents_a_count() {
+        let upstream = MockServer::builder().start().await;
+        let message = "count_tokens endpoint is not supported for Claude Code accounts";
+        Mock::given(method("POST"))
+            .and(path("/v1/messages/count_tokens"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "type": "error", "error": {"type": "not_found_error", "message": message}
+            })))
+            .mount(&upstream)
+            .await;
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(anthropic_model("count-claude"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let response = build_app(snap)
+            .oneshot(make_req(serde_json::json!({
+                "model": "count-claude", "messages": [{"role": "user", "content": "hi"}]
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "not_found_error");
+        assert_eq!(body["error"]["message"], message);
+        assert!(body.get("input_tokens").is_none());
+        let requests = upstream.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url.path(), "/v1/messages/count_tokens");
+    }
+
+    #[tokio::test]
+    async fn count_tokens_default_cache_ttl_preserves_explicit_values() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages/count_tokens"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"input_tokens": 17})),
+            )
+            .mount(&upstream)
+            .await;
+        for ttl in [None, Some("5m"), Some("1h")] {
+            let snap = new_snap(&upstream.uri());
+            snap.models.insert(anthropic_model("ttl-claude"));
+            snap.apikeys.insert(apikey_entry(&["*"]));
+            let mut marker = serde_json::json!({"type": "ephemeral"});
+            if let Some(ttl) = ttl {
+                marker["ttl"] = serde_json::json!(ttl);
+            }
+            let response = build_app(snap)
+                .oneshot(make_req(serde_json::json!({
+                    "model": "ttl-claude",
+                    "system": [{"type": "text", "text": "shared", "cache_control": marker}],
+                    "messages": [{"role": "user", "content": "hi"}]
+                })))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let _ = to_bytes(response.into_body(), 65536).await.unwrap();
+            let requests = upstream.received_requests().await.unwrap();
+            let body: serde_json::Value =
+                serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+            assert_eq!(
+                body["system"][0]["cache_control"]["ttl"],
+                ttl.unwrap_or("5m")
+            );
+        }
     }
 
     /// A `provider: "byo"` model whose ProviderKey carries

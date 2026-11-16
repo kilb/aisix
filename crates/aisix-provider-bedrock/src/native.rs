@@ -241,8 +241,10 @@ async fn mantle_count_tokens(
         thinking.remove("display");
     }
     let bytes = Vec::from(
-        aisix_gateway::json_body(&Value::Object(count))
-            .map_err(|e| BridgeError::Config(format!("serialize request body: {e}")))?,
+        aisix_gateway::json_body(&aisix_provider_anthropic::wire::DefaultCacheTtl::request(
+            &Value::Object(count),
+        ))
+        .map_err(|e| BridgeError::Config(format!("serialize request body: {e}")))?,
     );
     let url = mantle_count_tokens_url(creds.region());
 
