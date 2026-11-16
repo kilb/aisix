@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import type { TabProps } from "../App";
 import { Card, CardHeader, CardMessage, Metric, MetricSkeleton, PageHeader } from "../components/page";
-import { fetchApiMetrics, metricsRangeError, tokenTrendValue, type ApiMetricsResponse } from "../lib/apiMetrics";
+import { fetchApiMetrics, metricsRangeError, type ApiMetricsResponse } from "../lib/apiMetrics";
 import { formatCount } from "../lib/chartFormat";
 import { errorText } from "../lib/fmt";
 import { fmtMicroCny } from "../lib/money";
@@ -18,7 +18,7 @@ interface TotalsAnswer {
   cost: Reading<CostTotals>;
 }
 
-/** 输入与成本各自保留正式聚合口径；同窗独立查询，不宣称一致快照。 */
+/** 收入与成本保留正式聚合口径；同窗独立查询，不宣称一致快照。 */
 export function Totals(_props: TabProps) {
   const [query, update] = useHashQuery();
   const [fallback] = useState(() => {
@@ -60,9 +60,11 @@ export function Totals(_props: TabProps) {
     const end = new Date();
     update({ from: new Date(end.getTime() - days * 86_400_000).toISOString(), to: end.toISOString() });
   }
-  const tokens = usage?.totals.tokens;
+  const revenue = usage?.totals.charged_micro_cny;
+  const unpriced = usage?.totals.unpriced_attempts;
+  const adjusted = usage?.totals.adjusted_micro_cny;
   return <div className="totals-page">
-    <PageHeader title="总输入与总成本" description="全站统计 · 选择时间窗口，分别查看已记录输入与已知上游成本。" />
+    <PageHeader title="总收入与总成本" description="全站统计 · 按调用发生时间查看已计价收入与已知上游成本。" />
     <section className="totals-scope" aria-label="统计时间范围">
       <div className="totals-dates">
         <label className="f"><span>开始时间（UTC+8）</span><input type="datetime-local" step="1" value={dateValue(from)} onChange={event => changeDate("from", event.target.value)} /></label>
@@ -81,17 +83,18 @@ export function Totals(_props: TabProps) {
     <p className="totals-window">{fmtBeijing(from)} — {fmtBeijing(to)}（UTC+8，结束时间不含），最多查询 92 天。</p>
     {loading && <span role="status" className="sr-only">正在加载总量统计</span>}
     <div className="totals-metrics">
-      <Card className="totals-metric" aria-label="总输入统计" aria-busy={!usage && !usageError}>
-        <CardHeader title="总输入 token" description="已记录用量的输入合计，含已计费重试" />
+      <Card className="totals-metric" aria-label="总收入统计" aria-busy={!usage && !usageError}>
+        <CardHeader title="调用收入" description="已计价收费，含净费用调整，人民币" />
         {usage ? <>
-          <Metric size="figure" className="totals-value" >{formatCount(tokenTrendValue(tokens, "input_tokens"))}</Metric>
+          <Metric size="figure" className="totals-value">{revenue == null ? "—" : fmtMicroCny(revenue)}</Metric>
           <dl className="totals-facts">
-            <div><dt>有用量记录的尝试</dt><dd>{formatCount(tokens?.known_usage_attempts)}</dd></div>
-            <div><dt>缺少用量记录的尝试</dt><dd>{formatCount(tokens?.unknown_usage_attempts)}</dd></div>
+            <div><dt>计费尝试</dt><dd>{formatCount(usage.totals.billing_attempts)}</dd></div>
+            <div><dt>待计价尝试</dt><dd>{formatCount(unpriced)}</dd></div>
+            <div><dt>已含费用调整</dt><dd>{adjusted == null ? "—" : fmtMicroCny(adjusted)}</dd></div>
           </dl>
-          {tokens?.unknown_usage_attempts !== null && tokens?.unknown_usage_attempts !== undefined && tokens.unknown_usage_attempts > 0 && <p className="totals-warning" role="status">存在未记录用量，当前仅为已记录输入小计。</p>}
+          {revenue == null ? <p className="totals-warning" role="status">收入金额未提供，暂不显示总额。</p> : unpriced == null ? <p className="totals-warning" role="status">计价覆盖信息未提供，无法确认收入是否完整。</p> : unpriced > 0 ? <p className="totals-warning" role="status">{formatCount(unpriced)} 次尝试仍待计价，当前为已计价收入小计，完成计价后可能变化。</p> : null}
         </> : usageError ? <CardMessage onRetry={rangeError ? undefined : retry}>{usageError}</CardMessage> : <MetricSkeleton className="totals-skeleton" />}
-        <p className="totals-note">原始输入 + 额外缓存读取 + 额外缓存创建。输入内缓存子集已包含在原始输入中，不重复相加；缺少用量不按零计算。</p>
+        <p className="totals-note">收入包含已计费重试，费用调整已计入且不重复相加。计费尝试包含免费与待计价尝试，待计价不代表免费。</p>
       </Card>
       <Card className="totals-metric" aria-label="总成本统计" aria-busy={!cost && !costError}>
         <CardHeader title="已计费记录的已知成本" description="历史上游成本，人民币" />
@@ -108,7 +111,7 @@ export function Totals(_props: TabProps) {
     </div>
     <section className="totals-method" aria-label="统计口径">
       <h2>统计口径</h2>
-      <p>输入覆盖可见的最终记录及已计费重试；成本覆盖已收费或已重定价记录，两项统计范围不同。成本来自当笔记录，不使用当前费率重新估算。</p>
+      <p>收入汇总已计价调用收费与净费用调整，以原调用的用量发生时间归期；充值流水不计入收入，费用调整的入账时间不改变归期。成本使用同范围内当笔记录的已知上游成本，缺失成本单列，不使用当前费率重新估算。</p>
       <p>两项统计使用相同时间窗口，分别独立查询；记录持续写入或重定价时，结果可能存在短暂差异。</p>
     </section>
   </div>;
