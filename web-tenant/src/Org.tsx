@@ -84,7 +84,7 @@ export function Org({ member, status }: { member: SessionMember; status: TenantS
   }, [refresh]);
 
   const shown = org?.status ?? status;
-  const access = overviewAccess(org?.status ?? "pending", member.role);
+  const access = overviewAccess(shown, member.role);
   useEffect(() => {
     let live = true;
     setRows(null);
