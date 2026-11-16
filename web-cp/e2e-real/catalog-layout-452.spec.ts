@@ -154,8 +154,9 @@ test("upstream-account-connection-and-groups-use-the-editor-width", async ({ pag
     await page.setViewportSize({ width, height: 1000 });
     await navigate(page, "providers");
     await page.getByRole("searchbox", { name: "搜索上游账号", exact: true }).fill(name);
-    const row = page.getByRole("table", { name: "上游账号", exact: true }).getByRole("row").filter({ has: page.getByText(name, { exact: true }) });
-    await row.getByRole("button", { name: "编辑", exact: true }).click();
+    const edit = page.getByRole("table", { name: "上游账号", exact: true }).getByRole("button", { name: "编辑", exact: true }).and(page.locator(`button[data-account-id="${accountId}"]`));
+    await expect(edit).toHaveCount(1);
+    await edit.click();
     const form = page.getByRole("form", { name: `编辑上游账号「${name}」`, exact: true });
     await expect(form).toBeVisible();
     const available = await form.evaluate(element => {

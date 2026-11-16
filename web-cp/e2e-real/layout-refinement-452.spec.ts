@@ -553,9 +553,12 @@ for (const width of [1440, 1280, 390, 1920]) {
     expect(BigInt(data.adjusted_micro_cny)).toBe(BigInt(oracle.netAdjustmentsMicroCny));
     expect(BigInt(data.rows)).toBe(BigInt(charges.items.length));
     expect(BigInt(data.unpriced_rows)).toBe(2n);
-    const known = BigInt(charges.items.filter(row => row.cost_micro_cny !== null).length);
-    const missing = BigInt(charges.items.filter(row => row.cost_micro_cny === null).length);
-    const cost = charges.items.reduce((sum, row) => sum + BigInt(row.cost_micro_cny ?? 0), 0n);
+    // 既有成本覆盖口径只含收费记录；未定价和免收费记录单独统计。
+    const costPopulation = charges.items.filter(row => row.status === 'charged' || row.status === 'adjusted');
+    expect(costPopulation.map(row => row.event_id).sort()).toEqual(oracle.originalCharges.filter(row => row.status === 'charged' || row.status === 'adjusted').map(row => row.event_id).sort());
+    const known = BigInt(costPopulation.filter(row => row.cost_micro_cny !== null).length);
+    const missing = BigInt(costPopulation.filter(row => row.cost_micro_cny === null).length);
+    const cost = costPopulation.reduce((sum, row) => sum + BigInt(row.cost_micro_cny ?? 0), 0n);
     expect(missing).toBeGreaterThanOrEqual(BigInt(oracle.missingCostRows));
     expect(BigInt(data.rows_with_cost)).toBe(known); expect(BigInt(data.rows_without_cost)).toBe(missing);
     expect(BigInt(data.known_cost_micro_cny)).toBe(cost);

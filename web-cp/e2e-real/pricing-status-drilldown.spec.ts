@@ -49,6 +49,8 @@ test.beforeEach(async ({ page }) => {
   expect((await login).status()).toBe(200);
   signedIn = true;
   await expect(page.getByRole("link", { name: "价格", exact: true })).toBeVisible();
+  // 登录后的初始页面请求先结束，避免把上一页的动态窗口当成本页响应。
+  await page.waitForLoadState("networkidle");
 });
 
 test.afterEach(async ({ page }, info) => {
