@@ -333,7 +333,7 @@ fn event_milliseconds(event: &Value, field: &str) -> Option<u32> {
         .and_then(|ms| u32::try_from(ms).ok())
 }
 
-/// 复用监测中的输出间隔与 TPOT 口径；不从完整耗时、字节参考或缺失字段推算。
+/// 输出 Token 除以本次完整上游耗时；首帧、TPOT 与字节参考不能补缺失耗时。
 fn measured_throughput(event: &Value) -> Option<f64> {
     let status = event.get("status_code")?.as_u64()?;
     if !(200..300).contains(&status)
@@ -346,6 +346,7 @@ fn measured_throughput(event: &Value) -> Option<f64> {
     {
         return None;
     }
+    let duration = event_milliseconds(event, "upstream_latency_ms").filter(|ms| *ms > 0)?;
     let counter = |name| {
         event
             .get("usage")?
@@ -361,11 +362,10 @@ fn measured_throughput(event: &Value) -> Option<f64> {
             aisix_core::reasoning_beside_completion(prompt, completion, reasoning, total)
         });
     let output = completion.saturating_add(if additive { reasoning } else { 0 });
-    if output < 2 {
+    if output == 0 {
         return None;
     }
-    let tpot = event.get("upstream_tpot_ms")?.as_f64()?;
-    (1e-100..=1e100).contains(&tpot).then(|| 1000.0 / tpot)
+    Some(f64::from(output) * 1000.0 / f64::from(duration))
 }
 
 fn stored_input_tokens(usage: &Value) -> Option<u64> {
@@ -1171,10 +1171,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_tpot_without_reported_output_intervals_does_not_show_positive_throughput() {
-        for output in [Value::Null, json!(0), json!(1), json!("3"), json!(-1)] {
+    fn throughput_requires_reported_output_and_full_attempt_duration() {
+        for output in [Value::Null, json!(0), json!("3"), json!(-1)] {
             let view = serde_json::to_value(CallUsage::from_event(&json!({
-                "status_code":200,"error_class":"","upstream_tpot_ms":20,
+                "status_code":200,"error_class":"","upstream_latency_ms":100,"upstream_tpot_ms":20,
                 "usage":{"prompt_tokens":1000000,"completion_tokens":output}
             })))
             .expect("性能只读投影");
@@ -1192,12 +1192,54 @@ mod tests {
             json!({"prompt_tokens":7,"completion_tokens":3,"reasoning_tokens":2,"total_tokens":10}),
         ] {
             let view = serde_json::to_value(CallUsage::from_event(&json!({
-                "status_code":200,"error_class":"","upstream_tpot_ms":20,"usage":usage
+                "status_code":200,"error_class":"","upstream_latency_ms":100,"upstream_tpot_ms":20,"usage":usage
             })))
             .expect("性能只读投影");
-            assert_eq!(view.get("throughput_tps"), Some(&json!(50.0)), "{view}");
+            assert_eq!(view.get("throughput_tps"), Some(&json!(30.0)), "{view}");
             assert_eq!(view.get("usage"), Some(&usage), "输出与计费计数不改写");
         }
+    }
+
+    #[test]
+    fn throughput_uses_the_full_attempt_without_tpot_or_first_frame_fallback() {
+        for duration in [
+            Value::Null,
+            json!(0),
+            json!(-1),
+            json!("4388"),
+            json!(0.5),
+            json!(4294967296_u64),
+        ] {
+            let view = serde_json::to_value(CallUsage::from_event(&json!({
+                "status_code":200,"error_class":"","upstream_latency_ms":duration,
+                "upstream_ttft_ms":4136,"downstream_latency_ms":4137,
+                "first_token_latency_ms":5072,"upstream_tpot_ms":252.0/264.0,
+                "usage":{"prompt_tokens":2,"completion_tokens":265,"reasoning_tokens":120,
+                    "cache_read_tokens":308467,"cache_creation_tokens":1576}
+            })))
+            .expect("完整上游时长边界");
+            assert_eq!(view.get("throughput_tps"), Some(&Value::Null), "{view}");
+        }
+        for tpot in [Value::Null, json!(0), json!(20), json!(252.0 / 264.0)] {
+            let view = serde_json::to_value(CallUsage::from_event(&json!({
+                "status_code":200,"error_class":"","upstream_latency_ms":4388,
+                "upstream_ttft_ms":4136,"upstream_tpot_ms":tpot,
+                "usage":{"prompt_tokens":2,"completion_tokens":265,"reasoning_tokens":120,
+                    "cache_read_tokens":308467,"cache_creation_tokens":1576}
+            })))
+            .expect("完整上游均速不依赖旧 TPOT");
+            assert_eq!(
+                view.get("throughput_tps"),
+                Some(&json!(265000.0 / 4388.0)),
+                "{view}"
+            );
+        }
+        let view = serde_json::to_value(CallUsage::from_event(&json!({
+            "status_code":200,"error_class":"","upstream_latency_ms":100,
+            "usage":{"prompt_tokens":7,"completion_tokens":1}
+        })))
+        .expect("单个输出也有完整调用均速");
+        assert_eq!(view.get("throughput_tps"), Some(&json!(10.0)), "{view}");
     }
 
     #[test]

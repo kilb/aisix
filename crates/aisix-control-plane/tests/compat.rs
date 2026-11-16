@@ -1117,6 +1117,15 @@ async fn customer_endpoint_hotfix_rejects_unknown_builds_and_published_hash_look
             "dev+sha-a11ce11",
             "dev+sha-08ff931722b737d40a8942a9e55de94afc9b51d5-extra",
         ),
+        ("dev+sha-a11ce11", "dev+sha-d5d5d72f"),
+        (
+            "dev+sha-a11ce11",
+            "dev+sha-d5d5d72f31ff9f577e3333c11298f963c5a12d92",
+        ),
+        (
+            "dev+sha-a11ce11",
+            "dev+sha-d5d5d72f31ff9f577e3333c11298f963c5a12d93-extra",
+        ),
         ("dev", "dev+sha-08ff931"),
         ("dev+sha-", "dev+sha-08ff931"),
         ("dev+sha-not-a-commit", "dev+sha-08ff931"),
@@ -1230,6 +1239,8 @@ async fn proven_endpoint_builds_preserve_recent_legacy_and_capacity_guards() {
         "dev+sha-4b06ddcb7d4d3918faeb9a02f12c0ed7f4f19bbc",
         "dev+sha-c39f543",
         "dev+sha-c39f54354e1bd6616b2599ff685cdc3289cede78",
+        "dev+sha-d5d5d72",
+        "dev+sha-d5d5d72f31ff9f577e3333c11298f963c5a12d93",
     ]
     .into_iter()
     .enumerate()
@@ -1256,7 +1267,7 @@ async fn proven_endpoint_builds_preserve_recent_legacy_and_capacity_guards() {
     .fetch_one(cp.db().pool())
     .await
     .expect("count simultaneous known build instances");
-    assert_eq!(known_instances, (4, 4));
+    assert_eq!(known_instances, (6, 6));
     let old = Gateway::issue(&cp, &admin).await;
     old.beat("legacy-native-hotfix-v447", "dev+sha-08ff931")
         .await;

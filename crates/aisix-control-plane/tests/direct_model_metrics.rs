@@ -131,9 +131,14 @@ async fn direct_attempts_keep_failed_retries_cache_shapes_and_measured_throughpu
     near(&first_row["tokens"]["cache_hit_rate"], 0.525);
     assert_eq!(first_row["throughput_tps"]["sample_count"], 2);
     assert_eq!(first_row["throughput_tps"]["missing_count"], 2);
-    near(&first_row["throughput_tps"]["avg"], 1000.0 * 50.0 / 700.0);
-    near(&first_row["throughput_tps"]["p50"], 75.0);
-    near(&model(&response, second)["throughput_tps"]["avg"], 200.0);
+    // 新合同按完整上游耗时统计全部输出；平均值按各次耗时加权。
+    near(&first_row["throughput_tps"]["avg"], 52.0);
+    near(&first_row["throughput_tps"]["p50"], 56.25);
+    near(&first_row["throughput_tps"]["p95"], 75.375);
+    near(
+        &model(&response, second)["throughput_tps"]["avg"],
+        73.33333333333333,
+    );
     let no_traffic = model(&response, idle);
     assert_eq!(no_traffic["attempts"], 0);
     assert!(no_traffic
@@ -205,7 +210,7 @@ async fn direct_monitoring_filters_before_aggregation_and_is_operator_only() {
 }
 
 #[tokio::test]
-async fn direct_monitoring_keeps_malformed_and_missing_measurements_unknown() {
+async fn direct_monitoring_uses_full_duration_without_tpot_and_accepts_one_output_token() {
     let Some(w) = world().await else { return };
     let target = seed_model(&w.cp, &w.admin).await;
     let pk = provider(&w, target).await;
@@ -215,6 +220,7 @@ async fn direct_monitoring_keeps_malformed_and_missing_measurements_unknown() {
         ("mon-zero-tpot", json!({"upstream_tpot_ms":0})),
         ("mon-text-tpot", json!({"upstream_tpot_ms":"10"})),
         ("mon-missing-tpot", json!({})),
+        ("mon-one-output", json!({"completion_tokens":1})),
     ] {
         let mut row = usage(
             &w,
@@ -232,14 +238,13 @@ async fn direct_monitoring_keeps_malformed_and_missing_measurements_unknown() {
         w.cp.send("GET", ENDPOINT, Some(w.admin.cookie()), None)
             .await;
     let measured = model(&response, target);
-    assert_eq!(measured["attempts"], 4);
-    assert_eq!(measured["throughput_tps"]["sample_count"], 0);
-    assert_eq!(measured["throughput_tps"]["missing_count"], 4);
-    assert!(measured["throughput_tps"]
-        .get("avg")
-        .expect("明确未知")
-        .is_null());
-    assert_eq!(measured["upstream_ttft_ms"]["missing_count"], 4);
+    assert_eq!(measured["attempts"], 5);
+    assert_eq!(measured["throughput_tps"]["sample_count"], 5);
+    assert_eq!(measured["throughput_tps"]["missing_count"], 0);
+    near(&measured["throughput_tps"]["avg"], 90.0);
+    near(&measured["throughput_tps"]["p50"], 110.0);
+    near(&measured["throughput_tps"]["p95"], 110.0);
+    assert_eq!(measured["upstream_ttft_ms"]["missing_count"], 5);
     let invalid =
         w.cp.send(
             "GET",
@@ -249,6 +254,66 @@ async fn direct_monitoring_keeps_malformed_and_missing_measurements_unknown() {
         )
         .await;
     assert_eq!(invalid.status, 422, "时间桶界限: {invalid:?}");
+}
+
+#[tokio::test]
+async fn direct_monitoring_requires_positive_full_duration_and_measured_successful_usage() {
+    let Some(w) = world().await else { return };
+    let target = seed_model(&w.cp, &w.admin).await;
+    let pk = provider(&w, target).await;
+    let mut rows = Vec::new();
+    for (id, extra) in [
+        ("mon-duration-missing", json!({})),
+        ("mon-duration-null", json!({"upstream_latency_ms":null})),
+        ("mon-duration-zero", json!({"upstream_latency_ms":0})),
+        ("mon-duration-negative", json!({"upstream_latency_ms":-1})),
+        ("mon-duration-text", json!({"upstream_latency_ms":"100"})),
+        ("mon-duration-fraction", json!({"upstream_latency_ms":1.5})),
+        ("mon-usage-missing", json!({"completion_tokens":null})),
+        ("mon-prompt-missing", json!({"prompt_tokens":null})),
+        ("mon-output-zero", json!({"completion_tokens":0})),
+        ("mon-estimated-output", json!({"usage_estimated":true})),
+        (
+            "mon-throughput-failed",
+            json!({"status_code":503,"error_class":"upstream_status"}),
+        ),
+        ("mon-throughput-unknown", json!({"status_code":null})),
+        ("mon-throughput-local", json!({"upstream_dispatched":false})),
+        ("mon-throughput-cache", json!({"cache_status":"hit"})),
+    ] {
+        let mut row = usage(
+            &w,
+            id,
+            target,
+            // 首帧、客户端耗时和旧 TPOT 都不能补造缺失的完整上游耗时。
+            json!({"model_id":target,"provider_key_id":pk,"completion_tokens":11,
+                "upstream_dispatched":true,"upstream_latency_ms":100,
+                "upstream_ttft_ms":10,"downstream_latency_ms":120,"upstream_tpot_ms":5}),
+        );
+        for (key, value) in extra.as_object().expect("无效吞吐样本") {
+            row[key] = value.clone();
+        }
+        if id == "mon-duration-missing" {
+            row.as_object_mut()
+                .expect("真实遥测对象")
+                .remove("upstream_latency_ms");
+        }
+        rows.push(row);
+    }
+    intake(&w, rows).await;
+    let response =
+        w.cp.send("GET", ENDPOINT, Some(w.admin.cookie()), None)
+            .await;
+    let measured = model(&response, target);
+    assert_eq!(measured["attributed_attempts"], 14);
+    assert_eq!(measured["attempts"], 12);
+    assert_eq!(measured["excluded_attempts"], 2);
+    assert_eq!(measured["throughput_tps"]["sample_count"], 0);
+    assert_eq!(measured["throughput_tps"]["missing_count"], 12);
+    assert!(measured["throughput_tps"]
+        .get("avg")
+        .expect("缺失测量不补造吞吐")
+        .is_null());
 }
 
 #[tokio::test]

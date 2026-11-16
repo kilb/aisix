@@ -45,6 +45,14 @@ fn field<'a>(value: &'a Value, name: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("缺少 {name}: {value}"))
 }
 
+fn near(value: &Value, expected: f64) {
+    let actual = value.as_f64().expect("明确返回实测吞吐");
+    assert!(
+        (actual - expected).abs() < 0.000001,
+        "{actual} != {expected}"
+    );
+}
+
 async fn input(cp: &TestCp, id: &str) -> Value {
     database_input(cp.db(), id).await
 }
@@ -547,7 +555,14 @@ async fn all_metrics_scopes_keep_complete_responses_for_missing_and_poisoned_unk
             ("downstream_latency_ms", json!(10 + index * 10)),
             ("upstream_latency_ms", json!(100 + index * 100)),
             ("upstream_ttft_ms", json!(20)),
-            ("upstream_tpot_ms", json!(5)),
+            (
+                "upstream_tpot_ms",
+                match index {
+                    0 => json!("invalid"),
+                    2 => Value::Null,
+                    _ => json!(5),
+                },
+            ),
             ("cache_status", json!("miss")),
             ("status_code", json!(if final_attempt { 200 } else { 503 })),
             (
@@ -607,6 +622,23 @@ async fn all_metrics_scopes_keep_complete_responses_for_missing_and_poisoned_unk
     assert_eq!(baseline[7]["totals"]["attempts"], 4);
     assert_eq!(baseline[8]["totals"]["attempts"], 3);
     assert_eq!(baseline[9]["totals"]["attempts"], 2);
+    // 新合同忽略旧 TPOT；200/100、200/300、200/400 的速率逐次分位，均值按完整耗时加权。
+    for (index, expected) in [(7, 750.0), (8, 1000.0), (9, 2000.0)] {
+        near(
+            &baseline[index]["totals"]["throughput_tps"]["avg"],
+            expected,
+        );
+    }
+    near(
+        &baseline[7]["totals"]["throughput_tps"]["p50"],
+        666.6666666666666,
+    );
+    near(
+        &baseline[8]["totals"]["throughput_tps"]["p50"],
+        1333.3333333333333,
+    );
+    assert_eq!(baseline[7]["totals"]["throughput_tps"]["sample_count"], 3);
+    assert_eq!(baseline[7]["totals"]["throughput_tps"]["missing_count"], 1);
     let forbidden =
         w.cp.send("GET", &requests[7].0, Some(owner.cookie()), None)
             .await;
@@ -619,7 +651,7 @@ async fn all_metrics_scopes_keep_complete_responses_for_missing_and_poisoned_unk
         .expect("制造一条真实历史缺投影");
     assert_eq!(snapshots(&w.cp, &requests).await, baseline);
     sqlx::query(
-        "UPDATE usage_metric_inputs SET u32_prompt_tokens = 0 WHERE event_id LIKE 'input-api-%'",
+        "UPDATE usage_metric_inputs SET u32_prompt_tokens = 0, u32_upstream_latency_ms = 1 WHERE event_id LIKE 'input-api-%'",
     )
     .execute(w.cp.db().pool())
     .await
@@ -627,6 +659,14 @@ async fn all_metrics_scopes_keep_complete_responses_for_missing_and_poisoned_unk
     let poisoned = snapshots(&w.cp, &requests).await;
     assert_ne!(poisoned[0], baseline[0], "请求指标不能永远绕过 ready 投影");
     assert_ne!(poisoned[7], baseline[7], "直连指标不能永远绕过 ready 投影");
+    assert_ne!(
+        poisoned[0]["totals"]["attempt_duration_ms"], baseline[0]["totals"]["attempt_duration_ms"],
+        "请求耗时必须读取 ready 投影中的完整耗时"
+    );
+    assert_ne!(
+        poisoned[7]["totals"]["throughput_tps"], baseline[7]["totals"]["throughput_tps"],
+        "直连吞吐必须读取 ready 投影中的完整耗时"
+    );
     sqlx::query(
         "UPDATE usage_metric_inputs SET projection_version = 9 WHERE event_id LIKE 'input-api-%'",
     )

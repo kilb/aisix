@@ -591,7 +591,7 @@ pub struct DirectMetrics {
     pub first_token_latency_ms: LatencyMetrics,
     pub attempt_duration_ms: LatencyMetrics,
     pub tokens: DirectTokenMetrics,
-    /// 整体平均由输出间隔加权；百分位来自各请求的实测 TPS。
+    /// 有效输出 Token 合计除以完整上游耗时合计；百分位来自单次输出 TPS。
     pub throughput_tps: LatencyMetrics,
 }
 
@@ -688,8 +688,8 @@ fn direct_aggregates() -> String {
     let throughput = "jsonb_build_object(\
         'sample_count', count(*) FILTER (WHERE tps IS NOT NULL), \
         'missing_count', count(*) FILTER (WHERE dispatched AND tps IS NULL), \
-        'avg', 1000.0 * sum(CASE WHEN tps IS NOT NULL THEN output_tokens - 1 END)::numeric \
-          / NULLIF(sum(CASE WHEN tps IS NOT NULL THEN tpot * (output_tokens - 1) END)::numeric, 0), \
+        'avg', 1000.0 * sum(CASE WHEN tps IS NOT NULL THEN output_tokens END)::numeric \
+          / NULLIF(sum(CASE WHEN tps IS NOT NULL THEN attempt_duration END)::numeric, 0), \
         'p50', percentile_cont(0.5) WITHIN GROUP (ORDER BY tps), \
         'p95', percentile_cont(0.95) WITHIN GROUP (ORDER BY tps), \
         'p99', percentile_cont(0.99) WITHIN GROUP (ORDER BY tps))";
@@ -920,7 +920,8 @@ async fn summarize_direct_models(
            THEN reasoning_tokens ELSE 0 END AS output_tokens \
          FROM measured), scoped AS (SELECT *, \
          CASE WHEN dispatched AND outcome = 'succeeded' AND known_usage AND NOT usage_estimated \
-           AND output_tokens > 1 AND tpot IS NOT NULL THEN 1000.0 / tpot END AS tps \
+           AND output_tokens > 0 AND attempt_duration > 0 \
+           THEN 1000.0 * output_tokens / attempt_duration END AS tps \
          FROM classified",
     );
     if let Some(outcome) = q.outcome {

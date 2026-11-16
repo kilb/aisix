@@ -64,7 +64,7 @@ async fn one_event_keeps_reported_tokens_bytes_and_performance_on_both_usage_lis
         assert_eq!(row.get("event_id"), Some(&json!("one-measured-event")));
         assert_eq!(row.get("first_token_latency_ms"), Some(&json!(0)), "{row}");
         assert_eq!(row.get("attempt_duration_ms"), Some(&json!(125)), "{row}");
-        assert_eq!(row.get("throughput_tps"), Some(&json!(40.0)), "{row}");
+        assert_eq!(row.get("throughput_tps"), Some(&json!(24.0)), "{row}");
         assert_eq!(row.get("io_audit"), Some(&audit), "{row}");
         assert_eq!(
             row.get("io_token_reference"),
@@ -102,46 +102,67 @@ async fn performance_keeps_unknown_distinct_from_zero_and_never_invents_tps() {
         (
             "known",
             json!({"first_token_latency_ms":0,"upstream_latency_ms":100,"upstream_tpot_ms":20}),
-            Some(50.0),
+            Some(30.0),
         ),
-        ("missing", json!({}), None),
-        ("zero", json!({"upstream_tpot_ms":0}), None),
-        ("negative", json!({"upstream_tpot_ms":-1}), None),
-        ("text", json!({"upstream_tpot_ms":"20"}), None),
-        ("out-of-range", json!({"upstream_tpot_ms":1e200}), None),
+        (
+            "missing",
+            json!({"upstream_ttft_ms":30,"downstream_latency_ms":50,"upstream_tpot_ms":20}),
+            None,
+        ),
+        (
+            "zero",
+            json!({"upstream_latency_ms":0,"upstream_ttft_ms":30,"downstream_latency_ms":50,"upstream_tpot_ms":20}),
+            None,
+        ),
+        (
+            "negative",
+            json!({"upstream_latency_ms":-1,"upstream_ttft_ms":30,"downstream_latency_ms":50,"upstream_tpot_ms":20}),
+            None,
+        ),
+        (
+            "text",
+            json!({"upstream_latency_ms":"100","upstream_ttft_ms":30,"downstream_latency_ms":50,"upstream_tpot_ms":20}),
+            None,
+        ),
+        (
+            "out-of-range",
+            json!({"upstream_latency_ms":1e200,"upstream_ttft_ms":30,"downstream_latency_ms":50,"upstream_tpot_ms":20}),
+            None,
+        ),
+        ("no-tpot", json!({"upstream_latency_ms":100}), Some(30.0)),
         (
             "missing-output",
-            json!({"completion_tokens":null,"upstream_tpot_ms":20}),
+            json!({"completion_tokens":null,"upstream_latency_ms":100,"upstream_tpot_ms":20}),
             None,
         ),
         (
             "zero-output",
-            json!({"completion_tokens":0,"total_tokens":7,"upstream_tpot_ms":20}),
+            json!({"completion_tokens":0,"total_tokens":7,"upstream_latency_ms":100,"upstream_tpot_ms":20}),
             None,
         ),
         (
             "one-output",
-            json!({"completion_tokens":1,"total_tokens":8,"upstream_tpot_ms":20}),
-            None,
+            json!({"completion_tokens":1,"total_tokens":8,"upstream_latency_ms":100}),
+            Some(10.0),
         ),
         (
             "failed",
-            json!({"status_code":503,"error_class":"upstream_status","upstream_tpot_ms":20}),
+            json!({"status_code":503,"error_class":"upstream_status","upstream_latency_ms":100,"upstream_tpot_ms":20}),
             None,
         ),
         (
             "stream-error",
-            json!({"error_class":"stream_aborted","upstream_tpot_ms":20}),
+            json!({"error_class":"stream_aborted","upstream_latency_ms":100,"upstream_tpot_ms":20}),
             None,
         ),
         (
             "cache",
-            json!({"cache_status":"hit","upstream_tpot_ms":20}),
+            json!({"cache_status":"hit","upstream_latency_ms":100,"upstream_tpot_ms":20}),
             None,
         ),
         (
             "not-dispatched",
-            json!({"upstream_dispatched":false,"upstream_tpot_ms":20}),
+            json!({"upstream_dispatched":false,"upstream_latency_ms":100,"upstream_tpot_ms":20}),
             None,
         ),
     ];
@@ -175,10 +196,14 @@ async fn performance_keeps_unknown_distinct_from_zero_and_never_invents_tps() {
                 Some(&expected.map_or(Value::Null, |n| json!(n))),
                 "{path}: {row}"
             );
-            let (first, duration) = if *id == "known" {
-                (json!(0), json!(100))
+            let first = if *id == "known" {
+                json!(0)
             } else {
-                (Value::Null, Value::Null)
+                Value::Null
+            };
+            let duration = match *id {
+                "missing" | "zero" | "negative" | "text" | "out-of-range" => Value::Null,
+                _ => json!(100),
             };
             assert_eq!(row.get("first_token_latency_ms"), Some(&first), "{row}");
             assert_eq!(row.get("attempt_duration_ms"), Some(&duration), "{row}");
@@ -186,9 +211,9 @@ async fn performance_keeps_unknown_distinct_from_zero_and_never_invents_tps() {
     }
 }
 
-// 输入、缓存输入或总量不能成为 TPS 分子；正 TPOT 不能替缺失输出制造采样。
+// 输入、缓存输入或总量不能成为 TPS 分子；完整上游耗时包含首字等待。
 #[tokio::test]
-async fn throughput_uses_only_output_intervals_on_calls_and_monitoring() {
+async fn throughput_uses_only_output_over_full_upstream_duration_on_calls_and_monitoring() {
     let Some((w, model, owner)) = setup().await else {
         return;
     };
@@ -203,22 +228,32 @@ async fn throughput_uses_only_output_intervals_on_calls_and_monitoring() {
         (
             "small-input",
             json!({"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}),
-            Some(50.0),
+            Some(2.8846153846153846),
         ),
         (
             "large-input",
             json!({"prompt_tokens":1000000,"completion_tokens":3,"total_tokens":1000003}),
-            Some(50.0),
+            Some(2.8846153846153846),
         ),
         (
             "cache-input",
             json!({"prompt_tokens":7,"completion_tokens":3,"total_tokens":10,"cache_read_tokens":1000000,"cache_creation_tokens":1000000}),
-            Some(50.0),
+            Some(2.8846153846153846),
         ),
         (
             "reasoning-output",
             json!({"prompt_tokens":7,"completion_tokens":0,"reasoning_tokens":3,"total_tokens":10}),
-            Some(50.0),
+            Some(2.8846153846153846),
+        ),
+        (
+            "reasoning-subset",
+            json!({"prompt_tokens":7,"completion_tokens":3,"reasoning_tokens":2,"total_tokens":10}),
+            Some(2.8846153846153846),
+        ),
+        (
+            "single-output-no-tpot",
+            json!({"prompt_tokens":7,"completion_tokens":1,"total_tokens":8}),
+            Some(0.9615384615384616),
         ),
         (
             "no-output",
@@ -241,6 +276,12 @@ async fn throughput_uses_only_output_intervals_on_calls_and_monitoring() {
                 .as_object_mut()
                 .expect("性能字段")
                 .extend(counters.as_object().expect("用量字段").clone());
+            if *id == "single-output-no-tpot" {
+                fields
+                    .as_object_mut()
+                    .expect("性能字段")
+                    .remove("upstream_tpot_ms");
+            }
             usage(&w, id, model, fields)
         })
         .collect();
@@ -294,7 +335,7 @@ async fn throughput_uses_only_output_intervals_on_calls_and_monitoring() {
     let throughput = &response.body["totals"]["throughput_tps"];
     assert_eq!(
         throughput.get("sample_count"),
-        Some(&json!(4)),
+        Some(&json!(6)),
         "{response:?}"
     );
     assert_eq!(
@@ -302,7 +343,126 @@ async fn throughput_uses_only_output_intervals_on_calls_and_monitoring() {
         Some(&json!(2)),
         "{response:?}"
     );
-    assert_eq!(throughput.get("avg"), Some(&json!(50.0)), "{response:?}");
+    assert_eq!(
+        throughput.get("avg"),
+        Some(&json!(2.5641025641025643)),
+        "{response:?}"
+    );
+}
+
+// 旧 TPOT 会给出 1047.619；完整上游耗时必须得到 60.391978，且不重复加思考或缓存输入。
+#[tokio::test]
+async fn anthropic_inclusive_output_uses_full_upstream_duration_and_preserves_raw_usage() {
+    let Some((w, model, owner)) = setup().await else {
+        return;
+    };
+    let provider: String = sqlx::query_scalar(
+        "SELECT doc->>'provider_key_id' FROM gw_resources WHERE kind='models' AND id=$1",
+    )
+    .bind(model)
+    .fetch_one(w.cp.db().pool())
+    .await
+    .expect("模型账号");
+    let event = usage(
+        &w,
+        "anthropic-full-duration",
+        model,
+        json!({"request_id":"anthropic-full-duration-request","model_id":model,
+            "provider_key_id":provider,"status_code":200,"error_class":"",
+            "is_final_attempt":true,"upstream_dispatched":true,"inbound_protocol":"anthropic",
+            "prompt_tokens":2,"completion_tokens":265,"reasoning_tokens":120,
+            "cache_read_tokens":308467,"cache_creation_tokens":1576,
+            "cache_usage_reported":true,"finish_reason":"tool_use",
+            "first_token_latency_ms":5072,"downstream_latency_ms":4137,
+            "upstream_latency_ms":4388,"upstream_ttft_ms":4136,
+            "upstream_tpot_ms":0.9545454545454546}),
+    );
+    let delivered = deliver(&w.dp, Uuid::new_v4(), vec![event.clone()]).await;
+    assert_eq!(delivered.status, 200, "{delivered:?}");
+    assert_eq!(
+        delivered.body.get("rejected"),
+        Some(&json!(0)),
+        "{delivered:?}"
+    );
+    for (path, cookie) in [
+        ("/api/usage/calls", owner.as_str()),
+        ("/admin/pricing/charges", w.admin.cookie()),
+    ] {
+        let response = w.cp.send("GET", path, Some(cookie), None).await;
+        assert_eq!(response.status, 200, "{response:?}");
+        let rows = response.body["items"].as_array().expect("调用记录");
+        assert_eq!(rows.len(), 1, "{response:?}");
+        let row = &rows[0];
+        assert_eq!(row.get("event_id"), Some(&json!("anthropic-full-duration")));
+        assert_eq!(row.get("attempt_duration_ms"), Some(&json!(4388)), "{row}");
+        assert_eq!(
+            row.get("first_token_latency_ms"),
+            Some(&json!(5072)),
+            "{row}"
+        );
+        let tps = row["throughput_tps"].as_f64().expect("完整耗时吞吐");
+        assert!((tps - 60.39197812215132).abs() < 1e-9, "{path}: {row}");
+        for (field, expected) in [
+            ("prompt_tokens", 2),
+            ("completion_tokens", 265),
+            ("reasoning_tokens", 120),
+            ("cache_read_tokens", 308467),
+            ("cache_creation_tokens", 1576),
+        ] {
+            assert_eq!(
+                row["usage"].get(field),
+                Some(&json!(expected)),
+                "{field}: {row}"
+            );
+        }
+        assert!(row["usage"].get("total_tokens").is_none(), "{row}");
+    }
+    let response =
+        w.cp.send(
+            "GET",
+            &format!("/admin/usage/direct-models?model_id={model}"),
+            Some(w.admin.cookie()),
+            None,
+        )
+        .await;
+    assert_eq!(response.status, 200, "{response:?}");
+    let models = response.body["models"].as_array().expect("模型统计");
+    assert_eq!(models.len(), 1, "{response:?}");
+    for metrics in [&response.body["totals"], &models[0]] {
+        let throughput = &metrics["throughput_tps"];
+        assert_eq!(throughput.get("sample_count"), Some(&json!(1)), "{metrics}");
+        assert_eq!(
+            throughput.get("missing_count"),
+            Some(&json!(0)),
+            "{metrics}"
+        );
+        for field in ["avg", "p50", "p95", "p99"] {
+            let tps = throughput[field].as_f64().expect("完整耗时统计");
+            assert!((tps - 60.39197812215132).abs() < 1e-9, "{field}: {metrics}");
+        }
+    }
+    let stored: Value = sqlx::query_scalar(
+        "SELECT event FROM usage_events WHERE event_id='anthropic-full-duration'",
+    )
+    .fetch_one(w.cp.db().pool())
+    .await
+    .expect("原始事件");
+    assert_eq!(stored, event, "显示公式不得改写原始 TPOT、计数或身份");
+    let charge_identity: (String, String, String) = sqlx::query_as(
+        "SELECT tenant_id, requested_model_id, request_id FROM pricing_charges_cny \
+         WHERE event_id='anthropic-full-duration'",
+    )
+    .fetch_one(w.cp.db().pool())
+    .await
+    .expect("原事件对应账单");
+    assert_eq!(
+        charge_identity,
+        (
+            w.tenant.to_string(),
+            model.to_string(),
+            "anthropic-full-duration-request".to_owned(),
+        )
+    );
 }
 
 // 将含估算用量混入实测聚合，或在列表隐藏其参考速度，都会改变这些独立结果。
@@ -319,9 +479,9 @@ async fn estimated_usage_keeps_reference_tps_but_not_measured_monitoring_samples
     .await
     .expect("模型账号");
     let cases = [
-        ("reported", Some(false), 10, 1100, 100.0),
-        ("omitted-false", None, 10, 1100, 100.0),
-        ("has-estimate", Some(true), 100, 2000, 10.0),
+        ("reported", Some(false), 10, 1100, 10.0),
+        ("omitted-false", None, 10, 1100, 10.0),
+        ("has-estimate", Some(true), 100, 2000, 5.5),
     ];
     let events = cases
         .iter()
@@ -400,7 +560,7 @@ async fn estimated_usage_keeps_reference_tps_but_not_measured_monitoring_samples
         for field in ["avg", "p50", "p95", "p99"] {
             assert_eq!(
                 throughput.get(field),
-                Some(&json!(100.0)),
+                Some(&json!(10.0)),
                 "{field}: {metrics}"
             );
         }
