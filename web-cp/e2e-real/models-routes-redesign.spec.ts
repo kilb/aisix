@@ -51,7 +51,7 @@ async function navigate(page: Page, route: "models" | "public-routes"): Promise<
 
 async function editModel(page: Page, name: string): Promise<Locator> {
   await navigate(page, "models");
-  await page.getByRole("textbox", { name: "搜索模型", exact: true }).fill(name);
+  await page.getByRole("searchbox", { name: "搜索模型", exact: true }).fill(name);
   const row = page.getByRole("table", { name: "全部模型", exact: true }).getByRole("row").filter({ has: page.getByRole("cell", { name, exact: true }) });
   await row.getByRole("button", { name: "编辑", exact: true }).click();
   const form = page.getByRole("form", { name: `编辑模型「${name}」`, exact: true });
@@ -167,7 +167,7 @@ test("public-model-route-edit-preserves-targets-settings-and-price-entry", async
   const model = await api(page, "/admin/public-models", "POST", { name });
   await api(page, `/admin/provider-keys/${accountId}/channel-models/${model.id}`, "PUT", { upstream_model: upstream, priority: 10, weight: 2, enabled: true });
   await navigate(page, "public-routes");
-  await page.getByRole("textbox", { name: "搜索公共模型", exact: true }).fill(name);
+  await page.getByRole("searchbox", { name: "搜索公共模型", exact: true }).fill(name);
   await page.getByRole("button", { name, exact: true }).click();
   await settle(page);
   const form = page.getByRole("form", { name: `编辑模型「${name}」`, exact: true });
@@ -198,7 +198,7 @@ test("public-model-route-edit-preserves-targets-settings-and-price-entry", async
   await expect(target.getByLabel("权重", { exact: true })).toHaveValue("7");
   await form.getByRole("button", { name: "关闭", exact: true }).click();
   await expect(page.getByRole("heading", { name: "公共模型与路由", exact: true, level: 1 })).toBeVisible();
-  await page.getByRole("textbox", { name: "搜索公共模型", exact: true }).fill(name);
+  await page.getByRole("searchbox", { name: "搜索公共模型", exact: true }).fill(name);
   await page.getByRole("button", { name, exact: true }).click();
   await expect(form.getByLabel("重试次数", { exact: true })).toHaveValue("2");
 });
