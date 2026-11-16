@@ -2,13 +2,15 @@
 //! must exist when it is written, and what points at a document, which
 //! keeps it from being deleted.
 //!
-//! References are read in their id form only. Normalisation has rewritten
-//! every name-form model reference by the time these run, and every other
-//! reference has no name form.
+//! 普通引用已归一为 ID；改名还检查保留名称语义的授权模式和限流条件。
 
 use std::collections::HashMap;
 
 use aisix_core::filesource::{for_each_model_ref_node, model_ref_id_fields};
+use aisix_core::models::{
+    eval_condition_nodes, ConditionInput, ConditionLogic, ConditionNode, ConditionOperator,
+    ConditionValue, PolicyDimension,
+};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use sqlx::PgConnection;
@@ -28,7 +30,7 @@ pub struct Ref {
     pub id: String,
 }
 
-/// A live document that references another, as an `in_use` answer lists it.
+/// 阻止删除或改名的存活引用，错误答案只列出标识与显示名。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Referrer {
     pub kind: Kind,
@@ -291,6 +293,136 @@ pub async fn incoming(
                 })
         })
         .collect())
+}
+
+/// 在资源写锁内查找改名后失效的名称依赖，不改写操作者的模式或条件。
+pub async fn incoming_name_change(
+    conn: &mut PgConnection,
+    before: &str,
+    after: &str,
+) -> Result<Vec<Referrer>, ApiError> {
+    let candidates: Vec<(String, Uuid, Value)> = sqlx::query_as(
+        "SELECT kind, id, doc FROM gw_resources \
+         WHERE NOT deleted AND kind = ANY($1) ORDER BY kind, id",
+    )
+    .bind([Kind::ApiKeys.segment(), Kind::RateLimitPolicies.segment()])
+    .fetch_all(conn)
+    .await
+    .map_err(DbError::from)?;
+    let mut referrers = Vec::new();
+    for (segment, id, doc) in candidates {
+        let kind = if segment == Kind::ApiKeys.segment() {
+            Kind::ApiKeys
+        } else {
+            Kind::RateLimitPolicies
+        };
+        let loses_name = if kind == Kind::ApiKeys {
+            // ID 列表（空列表也包括在内）优先；授权模式是并集，不逐条拒绝。
+            let matches = |name| {
+                doc.get("allowed_models")
+                    .and_then(Value::as_array)
+                    .is_some_and(|patterns| {
+                        patterns
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .any(|pattern| aisix_core::wildcard::wildcard_matches(pattern, name))
+                    })
+            };
+            doc.get("allowed_model_ids").is_none_or(Value::is_null)
+                && matches(before)
+                && !matches(after)
+        } else if let Some(conditions) = doc.get("conditions").filter(|v| !v.is_null()) {
+            let conditions: Vec<ConditionNode> =
+                serde_json::from_value(conditions.clone()).map_err(ApiError::internal)?;
+            conditions_lose_name(&conditions, before, after)
+        } else {
+            false
+        };
+        if loses_name {
+            referrers.push(Referrer {
+                kind,
+                id,
+                name: doc
+                    .get("display_name")
+                    .or_else(|| doc.get("name"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            });
+        }
+    }
+    Ok(referrers)
+}
+
+fn conditions_lose_name(nodes: &[ConditionNode], before: &str, after: &str) -> bool {
+    // 精确写出的旧名称包括否定和集合引用，必须由操作者主动调整。
+    fn names_old(node: &ConditionNode, before: &str) -> bool {
+        match node {
+            ConditionNode::Group(group) => group.children.iter().any(|n| names_old(n, before)),
+            ConditionNode::Leaf(leaf) => {
+                leaf.dimension == PolicyDimension::ModelName
+                    && matches!(
+                        leaf.operator,
+                        ConditionOperator::Eq | ConditionOperator::Ne | ConditionOperator::In
+                    )
+                    && match &leaf.value {
+                        ConditionValue::One(name) => name == before,
+                        ConditionValue::Many(names) => names.iter().any(|name| name == before),
+                    }
+            }
+        }
+    }
+
+    // 每个结果是改名前后的匹配对。其他维度的真假不因改名改变；至多四种对，
+    // 因此嵌套 AND/OR/否定也可有界合并，不把仍有宽泛 OR 分支的条件误判失效。
+    fn outcomes(
+        nodes: &[ConditionNode],
+        logic: ConditionLogic,
+        before: &str,
+        after: &str,
+    ) -> Vec<(bool, bool)> {
+        let and = logic == ConditionLogic::And;
+        let mut result = vec![(and, and)];
+        for node in nodes {
+            let pairs = match node {
+                ConditionNode::Leaf(leaf) if leaf.dimension == PolicyDimension::ModelName => {
+                    let matched = |name| {
+                        eval_condition_nodes(
+                            std::slice::from_ref(node),
+                            &ConditionInput {
+                                model_name: Some(name),
+                                ..ConditionInput::default()
+                            },
+                        )
+                    };
+                    vec![(matched(before), matched(after))]
+                }
+                ConditionNode::Leaf(_) => vec![(false, false), (true, true)],
+                ConditionNode::Group(group) => {
+                    outcomes(&group.children, group.logic, before, after)
+                        .into_iter()
+                        .map(|(a, b)| (a != group.negate, b != group.negate))
+                        .collect()
+                }
+            };
+            let mut next = Vec::with_capacity(4);
+            for &(a, b) in &result {
+                for &(c, d) in &pairs {
+                    let pair = if and {
+                        (a && c, b && d)
+                    } else {
+                        (a || c, b || d)
+                    };
+                    if !next.contains(&pair) {
+                        next.push(pair);
+                    }
+                }
+            }
+            result = next;
+        }
+        result
+    }
+    nodes.iter().any(|node| names_old(node, before))
+        || outcomes(nodes, ConditionLogic::And, before, after).contains(&(true, false))
 }
 
 /// Takes `RESOURCES_LOCK_KEY` to the end of this transaction: every gateway

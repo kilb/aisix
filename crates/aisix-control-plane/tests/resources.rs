@@ -1817,6 +1817,322 @@ async fn a_name_form_reference_to_an_unknown_model_is_422_at_its_path() {
 }
 
 #[tokio::test]
+async fn resource_name_cache_alias_refusal_explains_the_explicit_wildcard_scope() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = Admin::as_role(&cp, OperatorRole::Operator).await;
+    let pk = admin
+        .create("provider_keys", provider_key("acct-alias"))
+        .await;
+    let model = admin.create("models", direct_model("openai/*", &pk)).await;
+    let before = audit_text(&cp).await;
+    let refused = admin
+        .post(
+            "/admin/resources/cache_policies",
+            json!({"doc": {
+                "name": "one-alias", "applies_to": "model:openai/gpt-4o"
+            }}),
+        )
+        .await;
+    assert_eq!(refused.status, 422, "{refused:?}");
+    assert_eq!(refused.body["details"][0]["path"], "/applies_to");
+    let message = refused.body["details"][0]["message"]
+        .as_str()
+        .expect("提示文本");
+    assert!(message.contains("applies_to_model_id"), "{message}");
+    assert!(message.contains("全部别名"), "{message}");
+    assert_eq!(live_count(&cp, "cache_policies").await, 0);
+    assert_eq!(audit_text(&cp).await, before);
+
+    let cache = admin
+        .create(
+            "cache_policies",
+            json!({
+                "name": "whole-wildcard", "applies_to_model_id": model
+            }),
+        )
+        .await;
+    let saved = admin
+        .get(&format!("/admin/resources/cache_policies/{cache}"))
+        .await;
+    assert_eq!(saved.body["doc"]["applies_to_model_id"], model);
+    assert!(saved.body["doc"].get("applies_to").is_none());
+}
+
+async fn internal_pattern_key(cp: &TestCp, admin: &Admin<'_>, patterns: Value) -> String {
+    let internal: Uuid = sqlx::query_scalar("SELECT id FROM tenants WHERE is_internal")
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("平台租户");
+    let group = admin
+        .post(
+            "/admin/provider-groups",
+            json!({
+                "name": unique("rename-group"), "display_name": "改名测试分组",
+                "default_cny_per_usd": "1"
+            }),
+        )
+        .await;
+    assert_eq!(group.status, 201, "{group:?}");
+    let key = admin
+        .post(
+            &format!("/admin/tenants/{internal}/keys"),
+            json!({
+                "label": "rename-key", "allowed_models": patterns, "group_id": group.body["id"]
+            }),
+        )
+        .await;
+    assert_eq!(key.status, 201, "{key:?}");
+    key.body["key"]["id"]
+        .as_str()
+        .expect("密钥标识")
+        .to_string()
+}
+
+fn name_policy(name: &str, conditions: Value) -> Value {
+    json!({"name": name, "conditions": conditions, "limits": {"rpm": 10}})
+}
+
+#[tokio::test]
+async fn resource_name_rename_refuses_lost_key_globs_and_names_the_key() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = Admin::as_role(&cp, OperatorRole::Operator).await;
+    let pk = admin
+        .create("provider_keys", provider_key("acct-key-rename"))
+        .await;
+    for patterns in [
+        json!(["openai/gpt-4o"]),
+        json!(["openai/*"]),
+        json!(["op*ai/*4o"]),
+    ] {
+        let model = admin
+            .create("models", direct_model("openai/gpt-4o", &pk))
+            .await;
+        let key = internal_pattern_key(&cp, &admin, patterns).await;
+        let before = stored(&cp, "models", &model).await;
+        let audit = audit_text(&cp).await;
+        let refused = admin
+            .put(
+                &format!("/admin/resources/models/{model}"),
+                Some("\"1\""),
+                json!({"doc": direct_model("anthropic/claude", &pk)}),
+            )
+            .await;
+        assert_eq!(refused.status, 409, "{refused:?}");
+        assert_eq!(refused.body["code"], "model_name_in_use");
+        assert_eq!(
+            refused.body["referenced_by"],
+            json!([{
+                "kind": "api_keys", "id": key, "name": "rename-key"
+            }])
+        );
+        assert!(!refused.body.to_string().contains("key_hash"));
+        assert!(!refused.body.to_string().contains(SECRET));
+        assert_eq!(stored(&cp, "models", &model).await, before);
+        assert_eq!(audit_text(&cp).await, audit);
+        // 清除本轮资源，下一轮复用同一名称但不复用名称依赖。
+        assert_eq!(
+            admin
+                .delete(&format!("/admin/keys/{key}"), Some("\"1\""))
+                .await
+                .status,
+            204
+        );
+        assert_eq!(
+            admin
+                .delete(&format!("/admin/resources/models/{model}"), Some("\"1\""))
+                .await
+                .status,
+            200
+        );
+    }
+}
+
+#[tokio::test]
+async fn resource_name_rename_refuses_lost_conditional_matches() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = Admin::as_role(&cp, OperatorRole::Operator).await;
+    let pk = admin
+        .create("provider_keys", provider_key("acct-rule-rename"))
+        .await;
+    let leaves = [
+        json!({"dimension": "model_name", "operator": "==", "value": "openai/gpt-4o"}),
+        json!({"dimension": "model_name", "operator": "in", "value": ["openai/gpt-4o", "other"]}),
+        json!({"dimension": "model_name", "operator": "~~", "value": "^openai/gpt-"}),
+        json!({"dimension": "model_name", "operator": "~*", "value": "^OPENAI/GPT-"}),
+        json!({"dimension": "model_name", "operator": "~=", "value": "openai/gpt-4o"}),
+        json!({"logic": "or", "negate": true, "children": [
+            {"dimension": "model_name", "operator": "~~", "value": "^anthropic/"}
+        ]}),
+        json!({"logic": "and", "children": [
+            {"dimension": "provider", "operator": "==", "value": "openai"},
+            {"dimension": "model_name", "operator": "~~", "value": "^openai/"}
+        ]}),
+    ];
+    for (n, condition) in leaves.into_iter().enumerate() {
+        let model = admin
+            .create("models", direct_model("openai/gpt-4o", &pk))
+            .await;
+        let name = format!("rename-rule-{n}");
+        let rule = admin
+            .create(
+                "rate_limit_policies",
+                name_policy(&name, json!([condition])),
+            )
+            .await;
+        let before = stored(&cp, "models", &model).await;
+        let audit = audit_text(&cp).await;
+        let refused = admin
+            .put(
+                &format!("/admin/resources/models/{model}"),
+                Some("\"1\""),
+                json!({"doc": direct_model("anthropic/claude", &pk)}),
+            )
+            .await;
+        assert_eq!(refused.status, 409, "condition {n}: {refused:?}");
+        assert_eq!(refused.body["code"], "model_name_in_use");
+        assert_eq!(
+            refused.body["referenced_by"],
+            json!([{
+                "kind": "rate_limit_policies", "id": rule, "name": name
+            }])
+        );
+        assert_eq!(stored(&cp, "models", &model).await, before);
+        assert_eq!(audit_text(&cp).await, audit);
+        assert_eq!(
+            admin
+                .delete(
+                    &format!("/admin/resources/rate_limit_policies/{rule}"),
+                    Some("\"1\"")
+                )
+                .await
+                .status,
+            200
+        );
+        assert_eq!(
+            admin
+                .delete(&format!("/admin/resources/models/{model}"), Some("\"1\""))
+                .await
+                .status,
+            200
+        );
+    }
+}
+
+#[tokio::test]
+async fn resource_name_rename_keeps_surviving_patterns_and_id_references_usable() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = Admin::as_role(&cp, OperatorRole::Operator).await;
+    let pk = admin
+        .create("provider_keys", provider_key("acct-broad-rename"))
+        .await;
+    let model = admin
+        .create("models", direct_model("openai/gpt-4o", &pk))
+        .await;
+    internal_pattern_key(&cp, &admin, json!(["openai/gpt-4o", "*"])).await;
+    derived(&cp, Kind::ApiKeys, json!({
+        "key_hash": "rename-id-key", "allowed_model_ids": [model], "allowed_models": ["openai/gpt-4o"]
+    })).await;
+    admin
+        .create(
+            "rate_limit_policies",
+            name_policy(
+                "broad-rule",
+                json!([{
+                    "logic": "or", "children": [
+                        {"dimension": "model_name", "operator": "~~", "value": "^openai/"},
+                        {"dimension": "model_name", "operator": "~~", "value": ".*"}
+                    ]
+                }]),
+            ),
+        )
+        .await;
+    let renamed = admin
+        .put(
+            &format!("/admin/resources/models/{model}"),
+            Some("\"1\""),
+            json!({"doc": direct_model("anthropic/claude", &pk)}),
+        )
+        .await;
+    assert_eq!(renamed.status, 200, "{renamed:?}");
+    assert_eq!(renamed.body["doc"]["display_name"], "anthropic/claude");
+    assert_eq!(renamed.body["version"], 2);
+}
+
+#[tokio::test]
+async fn resource_name_rename_sees_a_dependency_committed_while_it_waited_for_the_lock() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = Admin::as_role(&cp, OperatorRole::Operator).await;
+    let pk = admin
+        .create("provider_keys", provider_key("acct-lock-rename"))
+        .await;
+    for kind in [Kind::ApiKeys, Kind::RateLimitPolicies] {
+        let old = unique("lock-old");
+        let model = admin.create("models", direct_model(&old, &pk)).await;
+        let mut tx = cp.db().pool().begin().await.expect("持有资源事务");
+        aisix_control_plane::resources::refs::lock_resources(&mut tx)
+            .await
+            .expect("资源写锁");
+        let path = format!("/admin/resources/models/{model}");
+        let body = json!({"doc": direct_model(&unique("lock-new"), &pk)});
+        let rename = admin.put(&path, Some("\"1\""), body);
+        tokio::pin!(rename);
+        let waiting = async {
+            loop {
+                let n: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'"
+                ).fetch_one(cp.db().pool()).await.expect("等待资源锁的请求");
+                if n > 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        };
+        tokio::select! {
+            r = &mut rename => panic!("改名未等待资源锁: {r:?}"),
+            result = tokio::time::timeout(std::time::Duration::from_secs(10), waiting) => result.expect("改名排队"),
+        }
+        let id = Uuid::new_v4();
+        let doc = if kind == Kind::ApiKeys {
+            json!({"key_hash": unique("lock-hash"), "allowed_models": [format!("{old}*")]})
+        } else {
+            name_policy(
+                "lock-rule",
+                json!([{"dimension": "model_name", "operator": "==", "value": old}]),
+            )
+        };
+        write_resource(
+            &mut tx,
+            &ctx(&cp),
+            ResourceWrite {
+                kind,
+                id,
+                op: WriteOp::Create(&doc),
+                expected_version: None,
+                managed_by: (kind == Kind::ApiKeys).then_some(DERIVED_OWNER),
+            },
+        )
+        .await
+        .expect("同一锁事务中新增名称依赖");
+        tx.commit().await.expect("提交名称依赖");
+        let refused = rename.await;
+        assert_eq!(refused.status, 409, "{kind:?}: {refused:?}");
+        assert_eq!(refused.body["referenced_by"][0]["id"], id.to_string());
+        assert_eq!(refused.body["referenced_by"][0]["kind"], kind.segment());
+        assert_eq!(stored(&cp, "models", &model).await.2, 1);
+    }
+}
+
+#[tokio::test]
 async fn deleting_a_provider_key_a_model_uses_is_409_naming_the_model() {
     let Some(cp) = TestCp::start().await else {
         return;

@@ -103,6 +103,25 @@ pub async fn write_resource(
             check_size(doc)?;
             let current = writable_row(conn, &w).await?;
             let doc = prepare(conn, ctx, &w, doc, &current.doc).await?;
+            if w.kind == Kind::Models {
+                if let (Some(before), Some(after)) = (
+                    current.doc.get("display_name").and_then(Value::as_str),
+                    doc.get("display_name").and_then(Value::as_str),
+                ) {
+                    if before != after {
+                        let referenced_by = refs::incoming_name_change(conn, before, after).await?;
+                        if !referenced_by.is_empty() {
+                            return Err(ApiError {
+                                referenced_by,
+                                ..ApiError::conflict(
+                                    "model_name_in_use",
+                                    "模型旧名称仍被授权模式或限流条件引用，无法改名；请先调整引用资源",
+                                )
+                            });
+                        }
+                    }
+                }
+            }
             let position = keeps_position(w.kind, &current, Some(&doc));
             Ok(store::update(conn, w.kind, w.id, w.expected_version, &doc, position).await?)
         }

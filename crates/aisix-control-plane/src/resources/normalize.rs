@@ -257,7 +257,14 @@ async fn resolve_model_names(
         .filter(|r| !ids.contains_key(&r.name))
         .map(|r| Detail {
             path: r.path.clone(),
-            message: format!("没有名为「{}」的模型", r.name),
+            message: if kind == Kind::CachePolicies && r.name_field == "applies_to" {
+                format!(
+                    "没有名为「{}」的模型；若由通配模型提供，请使用 applies_to_model_id 指定通配模型的 ID；该范围覆盖它的全部别名，不能只限定当前别名",
+                    r.name
+                )
+            } else {
+                format!("没有名为「{}」的模型", r.name)
+            },
         })
         .collect();
     if !missing.is_empty() {
