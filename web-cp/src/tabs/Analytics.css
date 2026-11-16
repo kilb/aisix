@@ -4,10 +4,10 @@
 .analytics-page > .page-header { justify-content: flex-start; }
 .analytics-page .analytics-filters { padding: 16px; }
 .analytics-filter-primary { display: flex; min-width: 0; align-items: flex-end; flex-wrap: wrap; gap: 12px; }
-.analytics-filters .f { min-width: 0; gap: 4px; margin: 0; }
+.analytics-filters .f { flex-direction: column; align-items: stretch; min-width: 0; gap: 4px; margin: 0; }
 .analytics-filters .f > span { color: var(--fg-3); font-size: var(--text-caption); line-height: 18px; }
 .analytics-filters input { width: 100%; min-width: 0; }
-.analytics-filter-date { flex: 0 0 232px; }
+.analytics-filter-date { flex: 0 0 264px; }
 .analytics-filter-tenant { flex: 1 1 160px; }
 .analytics-filter-actions { display: flex; flex: none; align-items: center; flex-wrap: wrap; gap: 8px; }
 .analytics-filter-actions > a { white-space: nowrap; }
