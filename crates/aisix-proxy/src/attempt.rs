@@ -794,6 +794,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn credential_failures_export_no_model_client_span() {
+        for failure in [
+            BridgeError::upstream_status(429, "credential service throttled")
+                .answered_by_credential_endpoint(),
+            BridgeError::TokenExchangeDecode("invalid token response".into()),
+        ] {
+            let trace = std::sync::Arc::new(aisix_obs::RequestTraceBundle::new(None));
+            let mut telemetry =
+                RoutingTelemetry::for_request("group").with_trace(Some(trace.clone()));
+            let (index, kind) = telemetry.begin_attempt(AttemptTarget {
+                display_name: "target",
+                target_model: "target",
+                model_id: "model",
+            });
+            let error = ProxyError::Bridge(failure);
+            telemetry.settle(&AttemptRecord {
+                index,
+                kind,
+                target_model: "target".into(),
+                target_model_id: "model".into(),
+                provider_key_id: "pk".into(),
+                status: error.status().as_u16(),
+                success: false,
+                error_class: error_class(&error).into(),
+                error_message: gateway_error_message(&error),
+                latency_ms: 1,
+                dispatched: attempt_reached_upstream(&error),
+            });
+            assert!(trace.emission(false, index, 0, false).spans.is_empty());
+            // 凭据服务仍是上游依赖；错误分类不等于模型请求已经发出。
+            assert_eq!(error_source(&error), ErrorSource::Upstream);
+        }
+    }
+
     /// One sample of every `BridgeError` variant.
     ///
     /// Hand-written, because the enum carries no reflection — but the
@@ -890,10 +925,13 @@ mod tests {
                 // tried to reach the provider and could not. Excluding these
                 // would hide the outage the family exists to show.
                 BridgeError::Timeout { .. } => (true, "timeout"),
-                BridgeError::UpstreamStatus { .. } => (true, "upstream_status"),
-                BridgeError::UpstreamDecode(_)
-                | BridgeError::UpstreamBodyUnread { .. }
-                | BridgeError::TokenExchangeDecode(_) => (true, "upstream_decode"),
+                BridgeError::UpstreamStatus { wire, .. } => {
+                    (*wire != UpstreamWire::CredentialEndpoint, "upstream_status")
+                }
+                BridgeError::UpstreamDecode(_) | BridgeError::UpstreamBodyUnread { .. } => {
+                    (true, "upstream_decode")
+                }
+                BridgeError::TokenExchangeDecode(_) => (false, "upstream_decode"),
                 BridgeError::UpstreamInBand { .. } => (true, "upstream_in_band"),
                 BridgeError::Transport(_) => (true, "transport"),
                 BridgeError::StreamAborted => (true, "stream_aborted"),
@@ -982,16 +1020,17 @@ mod tests {
     }
 
     /// One mapping behind every `error_source` label: an upstream failure is
-    /// exactly a bridge error that reached the upstream, and no gateway
-    /// refusal shares a class with one. A status decides none of it.
+    /// a bridge error from an upstream dependency, including a credential
+    /// endpoint before model dispatch. A status decides none of it.
     #[test]
     fn error_source_follows_the_failure_and_never_its_status() {
         for err in bridge_error_samples() {
-            let expected = if err.reached_upstream() {
-                ErrorSource::Upstream
-            } else {
-                ErrorSource::Aisix
-            };
+            let expected =
+                if err.reached_upstream() || matches!(err, BridgeError::TokenExchangeDecode(_)) {
+                    ErrorSource::Upstream
+                } else {
+                    ErrorSource::Aisix
+                };
             assert_eq!(error_source(&ProxyError::Bridge(err)), expected);
         }
         let upstream_429 = ProxyError::Bridge(BridgeError::upstream_status(429, "slow down"));

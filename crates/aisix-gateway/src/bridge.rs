@@ -1058,7 +1058,7 @@ impl BridgeError {
         }
     }
 
-    /// Whether the request actually left for the upstream before this
+    /// Whether the request actually left for the model upstream before this
     /// error was raised.
     ///
     /// Gates the `aisix_deployment_*` families, which read as **upstream
@@ -1070,6 +1070,9 @@ impl BridgeError {
     /// them against a deployment reports our own misconfiguration as
     /// provider degradation.
     ///
+    /// 凭据端点的 HTTP 拒绝或成功响应解码失败发生在模型调用之前；
+    /// 保留其状态与重试分类，但不记成模型上游的健康或 CLIENT span。
+    ///
     /// `Timeout` and `Transport` stay `true` on purpose: a connect timeout
     /// or a refused connection means we did try to reach the upstream, and
     /// "unreachable" is exactly the kind of health this family exists to
@@ -1078,15 +1081,15 @@ impl BridgeError {
     /// the network boundary it sits on instead of inheriting a default.
     pub fn reached_upstream(&self) -> bool {
         match self {
+            BridgeError::UpstreamStatus { wire, .. } => *wire != UpstreamWire::CredentialEndpoint,
             BridgeError::Timeout { .. }
-            | BridgeError::UpstreamStatus { .. }
             | BridgeError::UpstreamDecode(_)
             | BridgeError::UpstreamBodyUnread { .. }
-            | BridgeError::TokenExchangeDecode(_)
             | BridgeError::UpstreamInBand { .. }
             | BridgeError::Transport(_)
             | BridgeError::StreamAborted => true,
-            BridgeError::Config(_)
+            BridgeError::TokenExchangeDecode(_)
+            | BridgeError::Config(_)
             | BridgeError::DependencyUnavailable
             | BridgeError::UnsupportedCapability(_)
             | BridgeError::InvalidUpstreamConfig(_)
@@ -1458,6 +1461,37 @@ mod tests {
         }
     }
     use super::*;
+
+    #[test]
+    fn credential_endpoint_failures_do_not_reach_the_model_upstream() {
+        let error = BridgeError::upstream_status_with_retry_after(
+            429,
+            "credential service throttled",
+            Some(Duration::from_secs(2)),
+        )
+        .answered_by_credential_endpoint();
+        assert!(!error.reached_upstream());
+        assert_eq!(error.http_status(), 429);
+        assert_eq!(error.error_type(), "upstream_error");
+        assert!(matches!(
+            error,
+            BridgeError::UpstreamStatus {
+                wire: UpstreamWire::CredentialEndpoint,
+                retry_after: Some(wait),
+                ..
+            } if wait == Duration::from_secs(2)
+        ));
+        assert!(BridgeError::upstream_status(429, "model throttled").reached_upstream());
+    }
+
+    #[test]
+    fn token_exchange_failures_do_not_reach_the_model_upstream() {
+        let error = BridgeError::TokenExchangeDecode("invalid token response".into());
+        assert!(!error.reached_upstream());
+        assert_eq!(error.http_status(), 502);
+        assert_eq!(error.error_type(), "upstream_decode_error");
+        assert!(BridgeError::UpstreamDecode("invalid model response".into()).reached_upstream());
+    }
 
     /// An in-band error with an empty message says so where telemetry reads
     /// it; the stream's error frame keeps what the caller has always been sent.

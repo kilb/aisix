@@ -20,8 +20,8 @@ use aws_sdk_bedrockruntime::types::{CountTokensInput, InvokeModelTokensRequest, 
 use serde_json::Value;
 
 use crate::bridge::{
-    strip_region_prefix, upstream_model, validate_model_id_chars, BedrockBridge, BedrockPublisher,
-    BedrockSecret,
+    strip_region_prefix, upstream_model, validate_model_id_chars, within_attempt, BedrockBridge,
+    BedrockPublisher, BedrockSecret,
 };
 
 /// Whether `/v1/messages` for `upstream_id` takes Bedrock's own Anthropic
@@ -37,6 +37,19 @@ pub(crate) fn serves_anthropic_messages(upstream_id: &str) -> bool {
 
 impl BedrockBridge {
     pub(crate) async fn native_messages(
+        &self,
+        body: Value,
+        ctx: &BridgeContext,
+    ) -> Result<NativeMessages, BridgeError> {
+        within_attempt(
+            ctx.deadline,
+            Instant::now(),
+            self.native_messages_attempt(body, ctx),
+        )
+        .await
+    }
+
+    async fn native_messages_attempt(
         &self,
         mut body: Value,
         ctx: &BridgeContext,
@@ -133,6 +146,19 @@ impl BedrockBridge {
     }
 
     pub(crate) async fn native_count_tokens(
+        &self,
+        body: Value,
+        ctx: &BridgeContext,
+    ) -> Result<Value, BridgeError> {
+        within_attempt(
+            ctx.deadline,
+            Instant::now(),
+            self.native_count_tokens_attempt(body, ctx),
+        )
+        .await
+    }
+
+    async fn native_count_tokens_attempt(
         &self,
         body: Value,
         ctx: &BridgeContext,
@@ -450,7 +476,7 @@ mod tests {
 mod compat_claude_native_tests {
     use super::*;
     use std::sync::Arc;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn context(secret: &str) -> BridgeContext {
@@ -464,6 +490,192 @@ mod compat_claude_native_tests {
         )
         .unwrap();
         BridgeContext::new("req-native-auth", Arc::new(model), Arc::new(pk))
+    }
+
+    #[derive(Debug)]
+    struct LocalCredentialConnector {
+        inner: aws_smithy_runtime_api::client::http::SharedHttpConnector,
+        endpoint: String,
+    }
+
+    impl aws_smithy_runtime_api::client::http::HttpConnector for LocalCredentialConnector {
+        fn call(
+            &self,
+            mut request: aws_smithy_runtime_api::client::orchestrator::HttpRequest,
+        ) -> aws_smithy_runtime_api::client::http::HttpConnectorFuture {
+            request.set_uri(self.endpoint.clone()).unwrap();
+            self.inner.call(request)
+        }
+    }
+
+    async fn native_slow_auth_and_response_share_attempt_deadline(
+        operation: &str,
+        first_event: bool,
+    ) {
+        use aws_smithy_runtime_api::client::http::{
+            http_client_fn, HttpClient, SharedHttpConnector,
+        };
+        use std::time::Duration;
+
+        // 只替换 STS 的网络地址；SDK 的 AssumeRole、签名与响应解码仍走真实 TCP。
+        let sts = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("Action=GetCallerIdentity"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<GetCallerIdentityResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
+                <GetCallerIdentityResult><Arn>arn:aws:iam::123456789012:user/component</Arn>
+                <UserId>component</UserId><Account>123456789012</Account></GetCallerIdentityResult>
+                <ResponseMetadata><RequestId>component-identity</RequestId></ResponseMetadata>
+                </GetCallerIdentityResponse>"#,
+            ))
+            .expect(1)
+            .mount(&sts)
+            .await;
+        let xml = r#"<AssumeRoleResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
+            <AssumeRoleResult><Credentials>
+            <AccessKeyId>ASIA-component-test</AccessKeyId>
+            <SecretAccessKey>component-secret</SecretAccessKey>
+            <SessionToken>component-session</SessionToken>
+            <Expiration>2099-01-01T00:00:00Z</Expiration>
+            </Credentials><AssumedRoleUser>
+            <AssumedRoleId>component:deadline</AssumedRoleId>
+            <Arn>arn:aws:sts::123456789012:assumed-role/component/deadline</Arn>
+            </AssumedRoleUser></AssumeRoleResult>
+            <ResponseMetadata><RequestId>component-request</RequestId></ResponseMetadata>
+            </AssumeRoleResponse>"#;
+        Mock::given(method("POST"))
+            .and(body_string_contains("Action=AssumeRole"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/xml")
+                    .set_body_string(xml)
+                    .set_delay(Duration::from_millis(400)),
+            )
+            .expect(1)
+            .mount(&sts)
+            .await;
+        let endpoint = sts.uri();
+        let credentials_http = aisix_gateway::upstream_tls::build_aws_http_client();
+        let credentials_http = http_client_fn(move |settings, components| {
+            SharedHttpConnector::new(LocalCredentialConnector {
+                inner: credentials_http.http_connector(settings, components),
+                endpoint: endpoint.clone(),
+            })
+        });
+        let runtime = MockServer::start().await;
+        let mut event_body = None;
+        let response = if operation == "invoke-with-response-stream" {
+            use aws_smithy_types::event_stream::{Header, HeaderValue, Message};
+            use base64::Engine as _;
+            let chunk = serde_json::to_vec(&serde_json::json!({"bytes":
+                base64::engine::general_purpose::STANDARD.encode(br#"{"type":"ping"}"#)
+            }))
+            .unwrap();
+            let event = Message::new(bytes::Bytes::from(chunk))
+                .add_header(Header::new(
+                    ":message-type",
+                    HeaderValue::String("event".into()),
+                ))
+                .add_header(Header::new(
+                    ":event-type",
+                    HeaderValue::String("chunk".into()),
+                ))
+                .add_header(Header::new(
+                    ":content-type",
+                    HeaderValue::String("application/json".into()),
+                ));
+            let mut wire = Vec::new();
+            aws_smithy_eventstream::frame::write_message_to(&event, &mut wire).unwrap();
+            event_body = Some(wire.clone());
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/vnd.amazon.eventstream")
+                .set_body_bytes(wire)
+        } else if operation == "count-tokens" {
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"inputTokens": 1}))
+        } else {
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "type":"message","content":[{"type":"text","text":"ok"}]
+            }))
+        };
+        let model = if operation == "count-tokens" {
+            "anthropic.claude-opus-5-5"
+        } else {
+            "us.anthropic.claude-opus-5-5"
+        };
+        let (endpoint, reply) = if first_event {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let wire = event_body.unwrap();
+            let reply = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                assert!(socket.read(&mut request).await.unwrap() > 0);
+                let head = format!("HTTP/1.1 200 OK\r\nContent-Type: application/vnd.amazon.eventstream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", wire.len());
+                socket.write_all(head.as_bytes()).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                let _ = socket.write_all(&wire).await;
+            });
+            (endpoint, Some(reply))
+        } else {
+            Mock::given(method("POST"))
+                .and(path(format!("/model/{model}/{operation}")))
+                .respond_with(response.set_delay(Duration::from_millis(400)))
+                .expect(1)
+                .mount(&runtime)
+                .await;
+            (runtime.uri(), None)
+        };
+        let bridge = BedrockBridge::new()
+            .with_endpoint_override(endpoint)
+            .with_credentials_http(credentials_http);
+        let secret = r#"{"access_key_id":"AKIA-component-test","secret_access_key":"component-secret",
+            "region":"us-east-1","role_arn":"arn:aws:iam::123456789012:role/component"}"#;
+        let ctx = context(secret).with_deadline(Duration::from_millis(600));
+        let body = serde_json::json!({
+            "messages":[{"role":"user","content":"hi"}],
+            "max_tokens":1,"stream":operation == "invoke-with-response-stream"
+        });
+        let started = Instant::now();
+        let result = if operation == "count-tokens" {
+            bridge.native_count_tokens(body, &ctx).await.map(|_| ())
+        } else {
+            bridge.native_messages(body, &ctx).await.map(|_| ())
+        };
+        assert!(
+            matches!(result, Err(BridgeError::Timeout { .. })),
+            "{operation}: slow auth plus response must exhaust one budget: {result:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(900),
+            "{operation}: restarted the deadline after authentication: {:?}",
+            started.elapsed()
+        );
+        if let Some(reply) = reply {
+            reply.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_messages_share_auth_and_invoke_deadline() {
+        native_slow_auth_and_response_share_attempt_deadline("invoke", false).await;
+    }
+
+    #[tokio::test]
+    async fn native_messages_stream_share_auth_and_invoke_deadline() {
+        native_slow_auth_and_response_share_attempt_deadline("invoke-with-response-stream", false)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn native_messages_stream_first_event_share_auth_and_invoke_deadline() {
+        native_slow_auth_and_response_share_attempt_deadline("invoke-with-response-stream", true)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn native_count_tokens_share_auth_and_invoke_deadline() {
+        native_slow_auth_and_response_share_attempt_deadline("count-tokens", false).await;
     }
 
     #[tokio::test]
@@ -534,5 +746,43 @@ mod compat_claude_native_tests {
             .to_str()
             .unwrap()
             .contains("/us-east-1/bedrock/aws4_request"));
+
+        // Runtime 拒绝后，Mantle 回退仍须花同一份计数预算。
+        let _runtime = Mock::given(method("POST"))
+            .and(path("/model/anthropic.claude-opus-5-5/count-tokens"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .insert_header("x-amzn-errortype", "ValidationException")
+                    .set_body_json(serde_json::json!({"message":"The provided model does not support counting tokens."}))
+                    .set_delay(std::time::Duration::from_millis(400)),
+            )
+            .with_priority(1)
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        let _mantle = Mock::given(method("POST"))
+            .and(path("/anthropic/v1/messages/count_tokens"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"input_tokens":77}))
+                    .set_delay(std::time::Duration::from_millis(400)),
+            )
+            .with_priority(1)
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        let result = bridge
+            .native_count_tokens(
+                serde_json::json!({"messages":[{"role":"user","content":"hi"}]}),
+                &context(
+                    r#"{"auth_type":"api_key","api_key":"ABSK-native-test","region":"us-east-1"}"#,
+                )
+                .with_deadline(std::time::Duration::from_millis(600)),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(BridgeError::Timeout { .. })),
+            "{result:?}"
+        );
     }
 }

@@ -774,7 +774,7 @@ fn auth_headers_for(
         .collect())
 }
 
-/// Run `fut` within what is left of a non-streamed attempt's budget.
+/// Run `fut` within what is left of an attempt's budget, until a stream commits.
 ///
 /// The attempt's `deadline`, counted from `started`, bounds everything the
 /// attempt does as a whole — obtaining credentials, downloading media, and
@@ -782,7 +782,7 @@ fn auth_headers_for(
 /// embedding per text) — rather than each phase on its own. The SDK's
 /// operation timeout starts again with each operation, so it cannot be that
 /// bound (<https://docs.aws.amazon.com/sdk-for-rust/latest/dg/timeouts.html>).
-async fn within_attempt<T>(
+pub(crate) async fn within_attempt<T>(
     deadline: Option<std::time::Duration>,
     started: Instant,
     fut: impl std::future::Future<Output = Result<T, BridgeError>>,
