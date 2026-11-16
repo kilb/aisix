@@ -49,6 +49,30 @@ function performanceValues(markup: string): string[] {
   return [...cell[1]!.matchAll(/<dd>(.*?)<\/dd>/g)].map(match => match[1]!);
 }
 
+// 时间必须是首格，详情入口不能再占用时间列之前的位置。
+test("调用列表把独立时间放在首列", () => {
+  const first = row().match(/<tbody><tr>(<td.*?<\/td>)/s)?.[1];
+  assert.ok(first, "调用列表必须渲染记录行");
+  assert.match(first, /data-label="时间"/);
+  assert.match(first, /<time dateTime="2026-11-16T02:00:00Z">/);
+  assert.match(first, /2026-11-16.*10:00:00/s);
+});
+
+// 缺失和非法标记不能因延迟为零或存在首字被推断成非流、流。
+test("调用列表只按明确布尔标记显示流和非流，旧记录保持未知", () => {
+  const typeCell = (extra: Record<string, unknown>) => {
+    const cell = row(extra).match(/<td[^>]*data-label="请求类型"[^>]*>(.*?)<\/td>/s);
+    assert.ok(cell, "调用列表必须有请求类型列");
+    return text(cell[1]!);
+  };
+  assert.equal(typeCell({ stream: true }), "流");
+  assert.equal(typeCell({ stream: false }), "非流");
+  for (const stream of [undefined, null, "false", 0]) {
+    assert.equal(typeCell({ stream, first_token_latency_ms: 0 }), "未知");
+    assert.equal(typeCell({ stream, first_token_latency_ms: 1200 }), "未知");
+  }
+});
+
 // 丢失实际用量或把缓存、推理重复相加，都会使这两个独立计数改变。
 test("调用列表显示记录输入输出 Token，不能由估算或缓存子项代替", () => {
   const cell = tokenCell(row());

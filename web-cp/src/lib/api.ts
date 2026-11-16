@@ -1018,6 +1018,8 @@ export interface UpstreamTiming {
 }
 
 export interface Charge extends UsageAuditData {
+  /** 明确采集的客户端流式意图；旧记录缺失时保持未知。 */
+  stream?: boolean | null;
   upstream_timing?: UpstreamTiming | null;
   request_timing?: RequestTiming | null;
   first_token_latency_ms?: number | null;

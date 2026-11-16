@@ -12,6 +12,7 @@
 .usage-record-section .dt { display: table; min-width: 1040px; table-layout: fixed; }
 .usage-column-action { width: 44px; }
 .usage-column-time { width: 10rem; }
+.usage-column-type { width: 4.5rem; }
 .usage-column-request { width: auto; }
 .usage-column-state { width: 8rem; }
 .usage-column-timing { width: 9rem; }

@@ -313,6 +313,7 @@ struct ChargeRow {
 const CHARGE_EVENT: &str = "jsonb_build_object(\
     'requested_model', ue.event->'requested_model', \
     'operation', ue.event->'operation', \
+    'stream', ue.event->'stream', \
     'status_code', ue.event->'status_code', \
     'error_class', ue.event->'error_class', \
     'error_message', ue.event->'error_message', \

@@ -198,10 +198,11 @@ export function Charges(_props: TabProps) {
           <>
             <RecordTools table={table} label="计费明细" loaded></RecordTools>
             <DataTable label="计费明细" className="charge-records" tableClassName="charge-records-table">
-              <colgroup><col className="charge-col-time" /><col className="charge-col-identity" /><col className="charge-col-status" /><col className="charge-col-money" /><col className="charge-col-service" /><col className="charge-col-performance" /><col className="charge-col-tokens" /><col className="charge-col-action" /></colgroup>
+              <colgroup><col className="charge-col-time" /><col className="charge-col-type" /><col className="charge-col-identity" /><col className="charge-col-status" /><col className="charge-col-money" /><col className="charge-col-service" /><col className="charge-col-performance" /><col className="charge-col-tokens" /><col className="charge-col-action" /></colgroup>
               <thead>
                 <tr>
                   <th>时间</th>
+                  <th>请求类型</th>
                   <th>调用 / 租户</th>
                   <th>计价结果</th>
                   <th className="num">费用（元）</th>
@@ -220,6 +221,7 @@ export function Charges(_props: TabProps) {
                     <Fragment key={c.seq}>
                       <tr data-finance-record>
                         <td data-label="时间" className="charge-call-time tabular"><time dateTime={c.occurred_at}><span>{fmtBeijing(c.occurred_at).split(" ")[0]}</span><span>{fmtBeijing(c.occurred_at).split(" ")[1] ?? "—"}</span></time></td>
+                        <td data-label="请求类型">{c.stream === true ? "流" : c.stream === false ? "非流" : "未知"}</td>
                         <td data-label="调用 / 租户"><span className="font-medium">{modelText(c.model_name, c.model_deleted)}</span>
                           <span className="cell-note">{tenantName(c.tenant_id)}</span>
                         </td>
@@ -265,7 +267,7 @@ export function Charges(_props: TabProps) {
                       </tr>
                       {shown && (
                         <tr className="dt-detail" id={`charge-check-${c.seq}`}>
-                          <td colSpan={8}>
+                          <td colSpan={9}>
                             <ChargeCheck c={c} />
                           </td>
                         </tr>

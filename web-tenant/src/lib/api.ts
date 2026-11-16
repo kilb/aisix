@@ -683,6 +683,8 @@ export interface UpstreamTiming {
 
 /** `Call`: one call of the organisation, with nothing of the platform's channel. */
 export interface Call extends UsageAuditData {
+  /** 明确采集的客户端流式意图；旧记录缺失时保持未知。 */
+  stream?: boolean | null;
   upstream_timing?: UpstreamTiming | null;
   first_token_latency_ms?: number | null;
   attempt_duration_ms?: number | null;

@@ -181,12 +181,13 @@ function CallTokens({ call }: { call: Call }) {
 
 function CallLogRow({ call: c, onDetails }: { call: Call; onDetails: (trigger: HTMLButtonElement) => void }) {
   return <tr>
+    <td className="tabular usage-call-time" data-label="时间"><time dateTime={c.occurred_at}><span>{fmtBeijing(c.occurred_at).split(" ")[0]}</span><span>{fmtBeijing(c.occurred_at).split(" ")[1] ?? "—"}</span></time></td>
     <td className="usage-row-action">
       <Button kind="quiet" size="sm" aria-haspopup="dialog" aria-label="查看调用详情" title="查看调用详情" className="tenant-icon-action" onClick={event => onDetails(event.currentTarget)}>
         <ChevronRight aria-hidden="true" />
       </Button>
     </td>
-    <td className="tabular usage-call-time" data-label="时间"><time dateTime={c.occurred_at}><span>{fmtBeijing(c.occurred_at).split(" ")[0]}</span><span>{fmtBeijing(c.occurred_at).split(" ")[1] ?? "—"}</span></time></td>
+    <td data-label="请求类型">{c.stream === true ? "流" : c.stream === false ? "非流" : "未知"}</td>
     <td data-label="模型 / 请求" className="usage-request-identity">
       <strong>{c.model.name || "—"}</strong>
       <span className="cell-note">密钥 {c.api_key.label || "—"} · 成员 {c.member ? (c.member.display_name ?? "成员") : "—"}</span>
@@ -653,13 +654,12 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
       {rows !== null && rows.length === 0 && !err && <CardMessage>所选条件下没有调用记录</CardMessage>}
       {rows !== null && rows.length > 0 && (
         <DataTable label="调用记录" className="tenant-call-table">
-          <colgroup><col className="usage-column-action" /><col className="usage-column-time" /><col className="usage-column-request" /><col className="usage-column-state" /><col className="usage-column-timing" /><col className="usage-column-tokens" /><col className="usage-column-charge" /></colgroup>
+          <colgroup><col className="usage-column-time" /><col className="usage-column-action" /><col className="usage-column-type" /><col className="usage-column-request" /><col className="usage-column-state" /><col className="usage-column-timing" /><col className="usage-column-tokens" /><col className="usage-column-charge" /></colgroup>
           <thead>
             <tr>
-              <th>
-                <span className="vh">明细</span>
-              </th>
               <th>时间</th>
+              <th><span className="vh">明细</span></th>
+              <th>请求类型</th>
               <th>模型 / 请求</th>
               <th>状态</th>
               <th className="num">响应性能</th>

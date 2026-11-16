@@ -227,6 +227,7 @@ const EFF_TIER: &str = "(CASE WHEN eff.created_at IS NULL THEN pc.service_tier \
 pub(super) const EVENT_FIELDS: &str = "jsonb_build_object(\
     'requested_model', ue.event->'requested_model', \
     'operation', ue.event->'operation', \
+    'stream', ue.event->'stream', \
     'status_code', ue.event->'status_code', \
     'error_class', ue.event->'error_class', \
     'error_message', ue.event->'error_message', \
@@ -268,6 +269,8 @@ pub struct IoTokenReference {
 /// 详情共用的只读投影，保留缺失、真实零和网关估算来源。
 #[derive(Debug, Serialize)]
 pub struct CallUsage {
+    /// 客户端流式意图仅取显式布尔值；旧事件缺失时保留未知。
+    stream: Option<bool>,
     request_timing: Option<RequestTiming>,
     /// 同一次上游尝试的已观测偏移；缺失或非法时不从其他延迟字段补值。
     upstream_timing: Option<UpstreamTiming>,
@@ -308,6 +311,7 @@ impl CallUsage {
                 }
             });
         Self {
+            stream: ev.get("stream").and_then(Value::as_bool),
             request_timing: ev
                 .get("request_timing")
                 .and_then(|raw| serde_json::from_value(raw.clone()).ok()),
@@ -1150,6 +1154,27 @@ pub async fn admin_summary(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stream_projection_preserves_booleans_and_never_infers_unknown() {
+        for stream in [serde_json::json!(true), serde_json::json!(false)] {
+            let view = serde_json::to_value(super::CallUsage::from_event(&serde_json::json!({
+                "stream": stream,
+            })))
+            .expect("调用只读投影");
+            assert_eq!(view.get("stream"), Some(&stream));
+        }
+        for event in [
+            serde_json::json!({}),
+            serde_json::json!({"stream":null,"first_token_latency_ms":0}),
+            serde_json::json!({"stream":"false","first_token_latency_ms":5}),
+            serde_json::json!({"stream":0,"upstream_ttft_ms":0}),
+        ] {
+            let view =
+                serde_json::to_value(super::CallUsage::from_event(&event)).expect("调用只读投影");
+            assert_eq!(view.get("stream"), Some(&serde_json::Value::Null));
+        }
+    }
+
     #[test]
     fn request_timing_projection_preserves_zero_partial_and_unknown() {
         let unknown =

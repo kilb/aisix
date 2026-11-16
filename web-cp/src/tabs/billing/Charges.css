@@ -3,8 +3,9 @@
 .calls-list[hidden] { display: none; }
 .charge-workspace { min-width: 0; container: charge-records / inline-size; }
 .charge-workspace > .dt-wrap { overflow-x: auto; max-height: none; }
-.charge-records .dt.charge-records-table { width: 100%; min-width: 65rem; table-layout: fixed; }
+.charge-records .dt.charge-records-table { width: 100%; min-width: 69.5rem; table-layout: fixed; }
 .charge-col-time { width: 7rem; }
+.charge-col-type { width: 4.5rem; }
 .charge-col-identity { width: 10rem; }
 .charge-col-service { width: 9rem; }
 .charge-col-status { width: 8.5rem; }

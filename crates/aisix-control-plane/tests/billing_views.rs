@@ -22,7 +22,7 @@ const UPSTREAM_MODEL: &str = "upstream-mdl-9f3";
 const UPSTREAM_ERROR: &str = "upstream secret 4b7";
 
 /// The keys of a `Call`, from the API section.
-const CALL_KEYS: [&str; 24] = [
+const CALL_KEYS: [&str; 25] = [
     "event_id",
     "occurred_at",
     "request_id",
@@ -30,6 +30,7 @@ const CALL_KEYS: [&str; 24] = [
     "api_key",
     "member",
     "operation",
+    "stream",
     "status",
     "status_code",
     "error_class",
@@ -800,6 +801,46 @@ async fn delivered_first_token_is_nullable_and_never_inferred_from_first_frame()
     for id in ["legacy", "no-content"] {
         assert_eq!(of(id).get("first_token_latency_ms"), Some(&Value::Null));
         assert_eq!(of(id).get("attempt_duration_ms"), Some(&Value::Null));
+    }
+}
+
+#[tokio::test]
+async fn call_lists_keep_reported_stream_true_false_and_legacy_unknown() {
+    let Some(w) = world().await else { return };
+    let m = model(&w, "stream-call", Some(w.tenant)).await;
+    let mut streamed = tokens_680();
+    streamed["stream"] = json!(true);
+    let mut unary = tokens_680();
+    unary["stream"] = json!(false);
+    send_all(
+        &w,
+        vec![
+            row(&w, "stream-true", m, "stream-call", streamed),
+            row(&w, "stream-false", m, "stream-call", unary),
+            row(&w, "stream-unknown", m, "stream-call", tokens_680()),
+        ],
+    )
+    .await;
+    let o = owner(&w).await;
+    let viewer = w.cp.admin_login_seeded(OperatorRole::Viewer).await;
+    for response in [
+        get(&w.cp, "/api/usage/calls", &o).await,
+        w.cp.send("GET", "/admin/pricing/charges", Some(viewer.cookie()), None)
+            .await,
+    ] {
+        assert_eq!(response.status, 200, "{response:?}");
+        for (id, expected) in [
+            ("stream-true", json!(true)),
+            ("stream-false", json!(false)),
+            ("stream-unknown", Value::Null),
+        ] {
+            let item = items(&response)
+                .iter()
+                .find(|item| item["event_id"] == id)
+                .expect("本次送入的真实调用记录");
+            // 缺少整个字段会失败，不能让 JSON 索引的默认 null 掩盖投影遗漏。
+            assert_eq!(item.get("stream"), Some(&expected), "{item}");
+        }
     }
 }
 
