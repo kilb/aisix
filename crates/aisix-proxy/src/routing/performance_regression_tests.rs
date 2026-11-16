@@ -513,6 +513,7 @@ fn wrr_warm_colliding_groups_progress_independently() {
     let registry = Arc::new(RoutingRegistry {
         wrr: DashMap::with_shard_amount(2),
         rings: DashMap::new(),
+        fixed_pools: DashMap::new(),
     });
     let targets = vec![RoutingTarget::new("a"), RoutingTarget::new("b")];
     for index in 0..128 {

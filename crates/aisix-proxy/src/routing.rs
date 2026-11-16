@@ -37,6 +37,9 @@
 mod configured_hash;
 #[cfg(test)]
 mod filtered_hash_contract_tests;
+mod fixed_hash;
+#[cfg(test)]
+mod fixed_hash_contract_tests;
 #[cfg(test)]
 mod indexed_contract_tests;
 #[cfg(test)]
@@ -1154,6 +1157,7 @@ impl HashRing {
 pub struct RoutingRegistry {
     wrr: DashMap<TierKey, Mutex<WrrState>>,
     rings: DashMap<TierKey, std::sync::Arc<HashRing>>,
+    fixed_pools: DashMap<(String, u64), std::sync::Arc<fixed_hash::FixedHashPool>>,
 }
 
 impl RoutingRegistry {
@@ -1164,6 +1168,7 @@ impl RoutingRegistry {
             |name: &str| is_configured(name.strip_suffix(PARTIAL_ROUTE_ROTATION).unwrap_or(name));
         self.wrr.retain(|(name, _), _| configured(name));
         self.rings.retain(|(name, _), _| configured(name));
+        self.fixed_pools.retain(|(name, _), _| configured(name));
     }
 
     pub fn new() -> Self {
@@ -1366,6 +1371,7 @@ impl std::fmt::Debug for RoutingRegistry {
         f.debug_struct("RoutingRegistry")
             .field("wrr_tiers", &self.wrr.len())
             .field("rings", &self.rings.len())
+            .field("fixed_pools", &self.fixed_pools.len())
             .finish()
     }
 }
@@ -2156,6 +2162,17 @@ pub(crate) fn resolve_attempt_models(
         }]);
     };
 
+    if !routing.hash_failover_or_default() {
+        return fixed_hash::resolve(
+            routing_registry,
+            runtime_status,
+            snapshot,
+            virtual_name,
+            virtual_model,
+            req,
+        );
+    }
+
     // The API key's provider groups are a hard constraint and come first:
     // a target outside them is not a candidate for anything below, so the
     // routing-tag header can only narrow what is left, and neither a
@@ -2543,6 +2560,7 @@ mod tests {
             fallback_on_statuses: None,
             when_all_unavailable: None,
             hash_on: None,
+            hash_failover: None,
         }
     }
 
