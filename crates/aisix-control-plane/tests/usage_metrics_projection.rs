@@ -1149,3 +1149,128 @@ async fn real_http_ingest_observes_projection_overhead_without_changing_billing_
     assert_measured_phase(&w.cp, "input-observe-baseline", 0).await;
     assert_measured_phase(&w.cp, "input-observe-enabled", 500).await;
 }
+
+// 刷出每个真实服务连接的关系读取计数，不依赖统计收集器的时间窗。
+async fn event_heap_reads(cp: &TestCp) -> i64 {
+    let pool = cp.db().pool();
+    let mut connections = Vec::new();
+    for _ in 0..pool.options().get_max_connections() {
+        let mut conn = pool.acquire().await.expect("收齐独立测试库的服务连接");
+        sqlx::query("SELECT pg_stat_force_next_flush()")
+            .execute(&mut *conn)
+            .await
+            .expect("发布连接已累计的统计");
+        connections.push(conn);
+    }
+    drop(connections);
+    sqlx::query("SELECT pg_stat_clear_snapshot()")
+        .execute(pool)
+        .await
+        .expect("丢弃观察连接的旧统计快照");
+    sqlx::query_scalar(
+        "SELECT (seq_tup_read + idx_tup_fetch)::bigint FROM pg_stat_user_tables \
+         WHERE relname = 'usage_events'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("读取原始事件表的实际堆行访问数")
+}
+
+// 恢复任何无条件 UE 读取都会使真实堆行计数上涨；不靠易抖动的绝对毫秒门槛。
+#[tokio::test]
+async fn ready_request_metrics_do_not_read_the_original_event_heap() {
+    let Some(w) = world().await else { return };
+    pin_fixture_backfill_complete(&w.cp).await;
+    let model = seed_model(&w.cp, &w.admin).await;
+    price(&w.cp, model).await;
+    let owner = w.cp.member_login_seeded(w.tenant, MemberRole::Owner).await;
+    let rows = 400;
+    let events = (0..rows)
+        .map(|n| {
+            let mut event = usage(&w, &format!("input-heap-{n}"), model, tokens_680());
+            event["is_final_attempt"] = json!(true);
+            event
+        })
+        .collect();
+    let delivered = deliver(&w.dp, Uuid::new_v4(), events).await;
+    assert_eq!(delivered.status, 200, "{delivered:?}");
+    assert_eq!(delivered.body["accepted"], rows);
+    let from = (Utc::now() - TimeDelta::minutes(1)).to_rfc3339_opts(SecondsFormat::Secs, true);
+    let to = (Utc::now() + TimeDelta::minutes(1)).to_rfc3339_opts(SecondsFormat::Secs, true);
+    let range = format!("from={from}&to={to}&bucket=hour");
+    for (path, cookie) in [
+        (format!("/api/usage/metrics?{range}"), owner.cookie()),
+        (format!("/admin/usage/metrics?{range}"), w.admin.cookie()),
+        (
+            format!("/admin/tenants/{}/usage/metrics?{range}", w.tenant),
+            w.admin.cookie(),
+        ),
+    ] {
+        let before = event_heap_reads(&w.cp).await;
+        let result = w.cp.send("GET", &path, Some(cookie), None).await;
+        assert_eq!(result.status, 200, "{result:?}");
+        assert_eq!(result.body["totals"]["requests"], rows);
+        assert_eq!(result.body["totals"]["charged_micro_cny"], "272000");
+        let after = event_heap_reads(&w.cp).await;
+        assert_eq!(
+            after, before,
+            "{path}: 已有完整统计输入的请求不应再读取原始事件堆行"
+        );
+    }
+}
+
+// 窗口选择性差异很大；保留的通用计划会把宽窗口误估成少量索引探测。
+#[tokio::test]
+async fn request_metrics_do_not_retain_a_plan_across_different_time_windows() {
+    let Some(w) = world().await else { return };
+    pin_fixture_backfill_complete(&w.cp).await;
+    let model = seed_model(&w.cp, &w.admin).await;
+    price(&w.cp, model).await;
+    let owner = w.cp.member_login_seeded(w.tenant, MemberRole::Owner).await;
+    let mut event = usage(&w, "input-plan", model, tokens_680());
+    event["is_final_attempt"] = json!(true);
+    let delivered = deliver(&w.dp, Uuid::new_v4(), vec![event]).await;
+    assert_eq!(delivered.status, 200, "{delivered:?}");
+    let to = Utc::now() + TimeDelta::minutes(1);
+    let short = format!(
+        "from={}&to={}",
+        (to - TimeDelta::hours(1)).to_rfc3339_opts(SecondsFormat::Secs, true),
+        to.to_rfc3339_opts(SecondsFormat::Secs, true)
+    );
+    let long = format!(
+        "from={}&to={}",
+        (to - TimeDelta::days(30)).to_rfc3339_opts(SecondsFormat::Secs, true),
+        to.to_rfc3339_opts(SecondsFormat::Secs, true)
+    );
+    for (path, cookie) in [
+        (format!("/api/usage/metrics?{short}"), owner.cookie()),
+        (format!("/admin/usage/metrics?{long}"), w.admin.cookie()),
+        (
+            format!("/admin/tenants/{}/usage/metrics?{long}", w.tenant),
+            w.admin.cookie(),
+        ),
+    ] {
+        let response = w.cp.send("GET", &path, Some(cookie), None).await;
+        assert_eq!(response.status, 200, "{response:?}");
+        assert_eq!(response.body["totals"]["requests"], 1);
+        assert_eq!(response.body["totals"]["charged_micro_cny"], "680");
+    }
+    let pool = w.cp.db().pool();
+    let mut connections = Vec::new();
+    let mut retained = 0;
+    for _ in 0..pool.options().get_max_connections() {
+        let mut conn = pool.acquire().await.expect("收齐服务连接检查其各自计划");
+        retained += sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM pg_prepared_statements \
+             WHERE statement LIKE $1 AND statement LIKE $2",
+        )
+        .bind("%pricing_charges_cny%")
+        .bind("%GROUP BY GROUPING SETS%")
+        .persistent(false)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("观察语句不把自己的匹配词写入已准备 SQL");
+        connections.push(conn);
+    }
+    assert_eq!(retained, 0, "请求统计不能跨窗口保留会转为 generic 的计划");
+}

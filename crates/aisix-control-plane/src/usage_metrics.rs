@@ -19,7 +19,7 @@ use crate::billing::calls::{ModelRef, VISIBLE};
 use crate::db::DbError;
 use crate::error::{ApiError, Detail};
 use crate::usage::query_rejected;
-use crate::usage_metrics_projection::METRIC_INPUT;
+use crate::usage_metrics_projection::{CHARGE_METRIC_INPUT, METRIC_FIELDS, METRIC_INPUT};
 use crate::AppState;
 
 const MAX_BUCKETS: i64 = 1500;
@@ -343,7 +343,32 @@ async fn summarize(
         .collect();
     let ids: Vec<String> = names.keys().cloned().collect();
 
-    let mut sql = QueryBuilder::<Postgres>::new("WITH raw AS MATERIALIZED (SELECT ");
+    let mut sql = QueryBuilder::<Postgres>::new(
+        "WITH charge_scope AS NOT MATERIALIZED (SELECT pc.* FROM pricing_charges_cny pc \
+         WHERE pc.occurred_at >= ",
+    );
+    sql.push_bind(from)
+        .push(" AND pc.occurred_at < ")
+        .push_bind(to);
+    for (column, value) in [
+        ("tenant_id", tenant),
+        ("user_id", own_member),
+        ("user_id", q.member_id),
+        ("requested_model_id", q.model_id),
+        ("api_key_id", q.api_key_id),
+    ] {
+        if let Some(value) = value {
+            sql.push(format!(" AND pc.{column} = "))
+                .push_bind(value)
+                .push("::text");
+        }
+    }
+    // 修正按当前范围一次聚合；单消费者明细不物化，避免宽表扫描及排序屏障。
+    sql.push(
+        "), adjusted AS (SELECT pa.event_id, sum(pa.delta_micro_cny)::numeric AS adjusted \
+         FROM pricing_adjustments_cny pa JOIN charge_scope scope ON scope.event_id = pa.event_id \
+         GROUP BY pa.event_id), raw AS NOT MATERIALIZED (SELECT ",
+    );
     let visible = VISIBLE.replace("ue.event->'is_final_attempt'", "ep.json_is_final_attempt");
     sql.push("date_trunc(")
         .push_bind(bucket.unit())
@@ -354,7 +379,7 @@ async fn summarize(
     sql.push(format!("ep.json_is_final_attempt = 'true'::jsonb AS final, \
         (ep.json_is_final_attempt IS NULL OR jsonb_typeof(ep.json_is_final_attempt) <> 'boolean') AS unknown_final, \
         {visible} AS visible, pc.status AS charge_status, pc.charge_micro_cny, \
-        (SELECT sum(pa.delta_micro_cny)::numeric FROM pricing_adjustments_cny pa WHERE pa.event_id = pc.event_id) AS adjusted, \
+        adjusted.adjusted, \
         COALESCE(ep.text_error_class, '') <> '' AS has_error, ep.text_cache_status AS cache_status, "));
     let mut columns: Vec<String> = [
         "prompt_tokens",
@@ -403,25 +428,9 @@ async fn summarize(
     .join(" AND ");
     columns.push(format!("({valid_optional}) AS valid_optional_usage"));
     sql.push(columns.join(", "))
-        .push(" FROM pricing_charges_cny pc JOIN usage_events ue ON ue.event_id = pc.event_id")
-        .push(METRIC_INPUT)
-        .push(" WHERE pc.occurred_at >= ")
-        .push_bind(from)
-        .push(" AND pc.occurred_at < ")
-        .push_bind(to);
-    for (column, value) in [
-        ("tenant_id", tenant),
-        ("user_id", own_member),
-        ("user_id", q.member_id),
-        ("requested_model_id", q.model_id),
-        ("api_key_id", q.api_key_id),
-    ] {
-        if let Some(value) = value {
-            sql.push(format!(" AND pc.{column} = "))
-                .push_bind(value)
-                .push("::text");
-        }
-    }
+        .push(" FROM charge_scope pc LEFT JOIN adjusted ON adjusted.event_id = pc.event_id")
+        .push(CHARGE_METRIC_INPUT)
+        .push(METRIC_FIELDS);
     sql.push("), scoped AS (SELECT *, \
         CASE WHEN raw_status BETWEEN 100 AND 599 THEN raw_status END AS status_code, \
         prompt_tokens IS NOT NULL AND completion_tokens IS NOT NULL AND valid_optional_usage \
@@ -432,6 +441,8 @@ async fn summarize(
         GROUP BY GROUPING SETS ((), (period_start), (model_id)) ORDER BY grouping, period_start, model_id");
     let rows: Vec<AggregateRow> = sql
         .build_query_as()
+        // 窗口选择性由本次参数决定，不让持久语句转用误估宽窗口的通用计划。
+        .persistent(false)
         .fetch_all(&mut *tx)
         .await
         .map_err(DbError::from)?;
@@ -836,6 +847,7 @@ async fn summarize_direct_models(
     sql.push(columns.join(", "))
         .push(" FROM usage_events ue")
         .push(METRIC_INPUT)
+        .push(METRIC_FIELDS)
         .push(" WHERE ue.occurred_at >= ")
         .push_bind(from)
         .push(" AND ue.occurred_at < ")

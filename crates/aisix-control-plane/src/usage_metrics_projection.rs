@@ -10,6 +10,21 @@ pub(crate) const METRIC_INPUT: &str = r#"
    SELECT * FROM usage_metric_input_v1(CASE WHEN ready.event_id IS NULL THEN ue.event END)
    WHERE ready.event_id IS NULL OFFSET 0
  ) fallback ON true
+"#;
+
+// 请求统计已有核定计费归属；只有投影缺失时才访问宽事件表。
+pub(crate) const CHARGE_METRIC_INPUT: &str = r#"
+ LEFT JOIN usage_metric_inputs ready
+   ON ready.event_id = pc.event_id AND ready.projection_version = 1
+ LEFT JOIN LATERAL (
+   SELECT projected.* FROM usage_events ue
+   CROSS JOIN LATERAL usage_metric_input_v1(ue.event) projected
+   WHERE ready.event_id IS NULL AND ue.event_id = pc.event_id OFFSET 0
+ ) fallback ON true
+"#;
+
+// 纯 CASE 投影不设优化屏障，使范围读取和精确聚合仍可选择并行计划。
+pub(crate) const METRIC_FIELDS: &str = r#"
  CROSS JOIN LATERAL (SELECT
   CASE WHEN ready.event_id IS NOT NULL THEN ready.u32_prompt_tokens ELSE fallback.u32_prompt_tokens END AS u32_prompt_tokens,
   CASE WHEN ready.event_id IS NOT NULL THEN ready.u32_completion_tokens ELSE fallback.u32_completion_tokens END AS u32_completion_tokens,
@@ -44,7 +59,6 @@ pub(crate) const METRIC_INPUT: &str = r#"
   CASE WHEN ready.event_id IS NOT NULL THEN ready.json_cache_usage_reported ELSE fallback.json_cache_usage_reported END AS json_cache_usage_reported,
   CASE WHEN ready.event_id IS NOT NULL THEN ready.has_cache_usage_reported ELSE fallback.has_cache_usage_reported END AS has_cache_usage_reported,
   CASE WHEN ready.event_id IS NOT NULL THEN ready.text_service_tier ELSE fallback.text_service_tier END AS text_service_tier
-  OFFSET 0
  ) ep
 "#;
 
