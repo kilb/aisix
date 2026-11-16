@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 import { mkdirSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
@@ -6,7 +6,7 @@ import { join, resolve } from "node:path";
 interface Scenario { kind: "positive" | "partial" | "zero" | "missing" | "multi"; event_id: string; request_id: string; tenant_auth?: string; from?: string; to?: string }
 interface TextLength { utf8_bytes: number; complete: boolean }
 interface Call {
-  event_id: string; usage_input_tokens: number | null; usage: { completion_tokens?: number | null } | null;
+  event_id: string; request_id?: string | null; usage_input_tokens: number | null; usage: { completion_tokens?: number | null } | null;
   io_audit: { version: number; boundary: string; exchange_count?: number | null; input_text?: TextLength | null; output_text?: TextLength | null } | null;
   io_token_reference: { method: string; input_tokens?: number | null; output_tokens?: number | null } | null;
 }
@@ -22,6 +22,14 @@ for (const scenario of cases) {
 const output = resolve(process.env.REFINED_QA_OUTPUT!);
 const count = (value: number) => new Intl.NumberFormat("en-US").format(value);
 const supported = (call: Call) => call.io_audit != null && (call.io_audit.version === 1 && call.io_audit.boundary === "client_exchange" || call.io_audit.version === 2 && call.io_audit.boundary === "upstream_attempt");
+
+// 固定等待字体和两次绘制，不用循环采样等待几何断言变绿。
+async function settleLayout(page: Page): Promise<void> {
+  await page.evaluate(async () => {
+    await document.fonts.ready;
+    await new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+  });
+}
 
 function classify(call: Call, scenario: Scenario): void {
   const audit = call.io_audit;
@@ -105,16 +113,19 @@ for (const scenario of cases) for (const portal of ["admin", "tenant"] as const)
     const index = body.items.findIndex(call => call.event_id === scenario.event_id);
     expect(index, "the real API must return the exact manifest event").toBeGreaterThanOrEqual(0);
     const call = body.items[index]!;
+    expect(call.event_id).toBe(scenario.event_id);
+    if (Object.hasOwn(call, "request_id")) expect(call.request_id).toBe(scenario.request_id);
     classify(call, scenario);
     const row = portal === "admin" ? page.getByRole("row").filter({ has: page.getByRole("link", { name: `查看调用日志 ${scenario.event_id}`, exact: true }) }) : page.getByRole("table", { name: "调用记录", exact: true }).locator("tbody > tr").nth(index);
     await expect(row.locator("[data-byte-token-estimate]")).toHaveText(expectedSummary(call));
-    expect(await page.title()).toMatch(/AISIX/i);
+    await expect(page).toHaveTitle(portal === "admin" ? "Routio 运维台" : "Routio 组织门户");
     await expect(page.getByRole("heading", { name: "调用记录", exact: true }).first()).toBeVisible();
     await expect(page.locator("vite-error-overlay")).toHaveCount(0);
     mkdirSync(join(output, "screenshots"), { recursive: true });
     for (const width of [1440, 390]) {
       await page.setViewportSize({ width, height: 1000 });
       await row.locator("[data-byte-token-estimate]").scrollIntoViewIfNeeded();
+      await settleLayout(page);
       const bounds = await row.locator("[data-byte-token-estimate]").evaluate(element => ({
         page: document.documentElement.scrollWidth, viewport: document.documentElement.clientWidth,
         client: element.clientWidth, scroll: element.scrollWidth, whiteSpace: getComputedStyle(element).whiteSpace,
@@ -125,11 +136,16 @@ for (const scenario of cases) for (const portal of ["admin", "tenant"] as const)
       await page.screenshot({ path: join(output, "screenshots", `byte-token-${portal}-${scenario.kind}-${scenario.event_id}-${width}-list.png`) });
     }
     await page.setViewportSize({ width: 1440, height: 1000 });
+    await settleLayout(page);
     if (portal === "admin") {
       await row.getByRole("link", { name: `查看调用日志 ${scenario.event_id}`, exact: true }).click();
       await expect(page.getByRole("heading", { name: "调用日志详情", exact: true })).toBeVisible();
-    } else await row.getByRole("button", { name: "展开明细", exact: true }).click();
-    const details = page.locator('details[aria-label="输入输出与 Token 参考"]');
+    } else {
+      await row.getByRole("button", { name: "查看调用详情", exact: true }).click();
+      await expect(page.getByRole("dialog", { name: "调用详情", exact: true })).toBeVisible();
+    }
+    const scope = portal === "tenant" ? page.getByRole("dialog", { name: "调用详情", exact: true }) : page;
+    const details = scope.locator('details[aria-label="输入输出与 Token 参考"]');
     await expect(details).toHaveCount(1);
     await details.locator("summary").click();
     for (const direction of ["input", "output"] as const) {
@@ -140,8 +156,11 @@ for (const scenario of cases) for (const portal of ["admin", "tenant"] as const)
     }
     await expect(details.locator('[data-io-field="recorded-input"] dd')).toHaveText(call.usage_input_tokens == null ? "未记录" : count(call.usage_input_tokens));
     await expect(details.locator('[data-io-field="recorded-output"] dd')).toHaveText(call.usage?.completion_tokens == null ? "未记录" : count(call.usage.completion_tokens));
-    await expect(details).toContainText("不用于计费");
+    if (supported(call)) await expect(details).toContainText("不用于计费");
+    else if (call.io_audit == null) await expect(details).toContainText("此记录未采集输入输出长度。");
+    else await expect(details).toContainText("此记录的统计版本或边界暂不支持，长度与参考未展示。");
     await details.scrollIntoViewIfNeeded();
+    await settleLayout(page);
     await page.screenshot({ path: join(output, "screenshots", `byte-token-${portal}-${scenario.kind}-${scenario.event_id}-detail.png`) });
     await test.info().attach("byte-token-console", { body: JSON.stringify(consoleMessages), contentType: "application/json" });
     expect(errors, "real pages must not show application or unexpected HTTP errors").toEqual([]);
