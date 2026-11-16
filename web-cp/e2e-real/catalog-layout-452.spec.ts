@@ -203,8 +203,9 @@ test("public-catalog-row-keeps-a-visible-working-route-management-entry", async 
   await expect(internalForm.getByRole("button", { name: "保存", exact: true })).toHaveCount(0);
   await internalForm.getByRole("button", { name: "关闭", exact: true }).click();
   await navigate(page, "models");
+  await page.getByRole("checkbox", { name: /^显示内部直连模型/ }).uncheck();
   await page.getByRole("searchbox", { name: "搜索模型", exact: true }).fill(name);
-  const row = page.getByRole("table", { name: "全部模型", exact: true }).getByRole("row").filter({ has: page.getByText(name, { exact: true }) });
+  const row = page.getByRole("table", { name: "全部模型", exact: true }).getByRole("row").filter({ has: page.locator("td:first-child").getByText(name, { exact: true }) });
   const manage = row.getByRole("button", { name: "公共路由", exact: true });
   await expect(manage).toBeVisible();
   await expect(manage).toHaveText("公共路由");
