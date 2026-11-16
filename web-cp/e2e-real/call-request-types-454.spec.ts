@@ -29,12 +29,21 @@ for (const surface of ["admin", "tenant"] as const) for (const width of [1440, 3
     await page.setViewportSize({ width, height: 1000 });
     const errors: string[] = [];
     const writes: string[] = [];
+    let authenticated = false;
     page.on("pageerror", error => errors.push(error.message));
+    page.on("console", message => {
+      if (authenticated && message.type() === "error") errors.push("console: " + message.text());
+    });
+    page.on("response", response => {
+      const path = new URL(response.url()).pathname;
+      if (authenticated && /^\/(?:api|admin)\//.test(path) && response.status() >= 400) errors.push(`HTTP ${response.status()} ${path}`);
+    });
     page.on("request", request => {
       const path = new URL(request.url()).pathname;
       if (!["GET", "HEAD"].includes(request.method()) && !/^\/(?:api|admin)\/(?:login|logout)$/.test(path)) writes.push(request.method() + " " + path);
     });
     await login(page, surface);
+    authenticated = true;
     const base = surface === "admin" ? state.adminUrl : state.tenantUrl;
     for (const scenario of fixture.cases) {
       const query = new URLSearchParams(surface === "admin" ? { event_id: scenario.eventId } : { request_id: scenario.requestId });
