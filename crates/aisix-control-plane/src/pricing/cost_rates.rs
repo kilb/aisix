@@ -170,6 +170,7 @@ pub async fn insert_cost_rate(
     actor: Actor<'_>,
 ) -> Result<(CostRateRevision, Vec<PriceWarning>), ApiError> {
     live_account(&mut *conn, row.provider_key_id).await?;
+    bump_pricing_version(&mut *conn).await?;
     starts_now_or_later(&mut *conn, row.effective_from).await?;
     if row.note.chars().count() > MAX_NOTE_CHARS {
         return Err(refused("/note", "说明最多 500 个字符"));
@@ -198,7 +199,6 @@ pub async fn insert_cost_rate(
     .fetch_one(&mut *conn)
     .await
     .map_err(DbError::from)?;
-    bump_pricing_version(&mut *conn).await?;
     audit::record(
         &mut *conn,
         AuditEntry {

@@ -7,7 +7,7 @@
 //! A revision never changes once written: there is no `UPDATE` or `DELETE`
 //! on a revision table here, and a price changes only by a new revision.
 //! Every write refuses an `effective_from` more than [`BACKDATE_TOLERANCE`]
-//! before the database's own `now()`, so a row already priced is never
+//! before the database's own `clock_timestamp()`, so a row already priced is never
 //! priced differently by a revision that arrives later. Correcting past
 //! charges is re-pricing, which appends adjustments and never edits a charge.
 //!
@@ -56,7 +56,7 @@ use crate::audit::{self, Actor, AuditEntry};
 use crate::db::DbError;
 use crate::error::{ApiError, Detail};
 
-/// How far before the database's `now()` a revision may start: the only
+/// How far before the database's `clock_timestamp()` a revision may start: the only
 /// backdating allowed, for the moment between an operator's choice of
 /// "now" and the commit.
 pub const BACKDATE_TOLERANCE: TimeDelta = TimeDelta::seconds(5);
@@ -197,9 +197,7 @@ pub async fn pricing_version(conn: &mut PgConnection) -> Result<Option<i64>, DbE
     // value is "no version" instead of a cast error that would fail the
     // batch on every delivery.
     Ok(sqlx::query_scalar::<_, Option<i64>>(
-        "SELECT CASE WHEN jsonb_typeof(value) = 'number' AND value::text ~ '^-?[0-9]{1,18}$' \
-                     THEN (value::text)::bigint END \
-         FROM cp_settings WHERE key = 'pricing_version'",
+        "SELECT pricing_version_number(value) FROM cp_settings WHERE key = 'pricing_version'",
     )
     .fetch_optional(conn)
     .await?
@@ -648,8 +646,8 @@ pub async fn record_charges(
     .bind(columns.iter().map(|c| c.estimated).collect::<Vec<_>>())
     .bind(columns.iter().map(|c| c.exemption).collect::<Vec<_>>())
     .bind(columns.iter().map(|c| c.error_code).collect::<Vec<_>>())
-    .bind(columns.iter().map(|c| c.lines.clone()).collect::<Vec<_>>())
-    .bind(columns.iter().map(|c| c.warnings.clone()).collect::<Vec<_>>())
+    .bind(columns.iter().map(|c| c.lines).collect::<Vec<_>>())
+    .bind(columns.iter().map(|c| c.warnings).collect::<Vec<_>>())
     .bind(columns.iter().map(|c| c.engine_version).collect::<Vec<_>>())
     .bind(charges.iter().map(|(ident, _)| ident.request_id).collect::<Vec<_>>())
     .fetch_all(conn)
@@ -713,12 +711,12 @@ pub(crate) fn refused(path: &str, message: impl Into<String>) -> ApiError {
 }
 
 /// Refuses a revision that would start more than [`BACKDATE_TOLERANCE`]
-/// before the database's `now()`.
+/// before the database's `clock_timestamp()`.
 pub(crate) async fn starts_now_or_later(
     conn: &mut PgConnection,
     effective_from: DateTime<Utc>,
 ) -> Result<(), ApiError> {
-    let now: DateTime<Utc> = sqlx::query_scalar("SELECT now()")
+    let now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
         .fetch_one(&mut *conn)
         .await
         .map_err(DbError::from)?;
@@ -731,24 +729,43 @@ pub(crate) async fn starts_now_or_later(
     Ok(())
 }
 
-async fn tenant_exists(conn: &mut PgConnection, id: Uuid) -> Result<bool, DbError> {
+async fn lock_discount_tenant(conn: &mut PgConnection, id: Uuid) -> Result<bool, DbError> {
+    // 与 INSERT 的外键锁相同，先于价格版本锁，避免和先锁租户的重计价互等。
     Ok(
-        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM tenants WHERE id = $1)")
+        sqlx::query_scalar::<_, Uuid>("SELECT id FROM tenants WHERE id = $1 FOR KEY SHARE")
             .bind(id)
-            .fetch_one(conn)
-            .await?,
+            .fetch_optional(conn)
+            .await?
+            .is_some(),
     )
 }
 
 /// Tells every cached price book to reload. It also serializes concurrent
 /// price writes on this one row.
 pub(crate) async fn bump_pricing_version(conn: &mut PgConnection) -> Result<(), DbError> {
+    // 先锁住现有行，恢复判断与后续 upsert 看见同一个值；缺行由唯一键冲突串行化。
+    let repairing = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT pricing_version_number(value) FROM cp_settings \
+         WHERE key = 'pricing_version' FOR UPDATE",
+    )
+    .fetch_optional(&mut *conn)
+    .await?
+    .flatten()
+    .is_none();
     sqlx::query(
-        "UPDATE cp_settings SET value = to_jsonb((value::text)::bigint + 1), updated_at = now() \
-         WHERE key = 'pricing_version'",
+        "INSERT INTO cp_settings (key, value) \
+         VALUES ('pricing_version', to_jsonb(nextval('pricing_version_high_water'))) \
+         ON CONFLICT (key) DO UPDATE SET value = to_jsonb(CASE \
+           WHEN pricing_version_number(cp_settings.value) IS NULL \
+             THEN nextval('pricing_version_high_water') \
+           ELSE pricing_version_number(cp_settings.value) + 1 END), \
+           updated_at = clock_timestamp()",
     )
     .execute(conn)
     .await?;
+    if repairing {
+        tracing::error!("cp_settings.pricing_version is missing or malformed; a recovery version above the durable high water was allocated in this price transaction");
+    }
     Ok(())
 }
 
@@ -770,11 +787,13 @@ pub async fn insert_discount(
     row: &NewDiscount,
     actor: Actor<'_>,
 ) -> Result<DiscountRevision, ApiError> {
+    let tenant_exists = lock_discount_tenant(&mut *conn, row.tenant_id).await?;
+    bump_pricing_version(&mut *conn).await?;
     starts_now_or_later(&mut *conn, row.effective_from).await?;
     if row.discount_bps > 10_000 {
         return Err(refused("/discount_bps", "折扣必须在 0 到 10000 个基点之间"));
     }
-    if !tenant_exists(&mut *conn, row.tenant_id).await? {
+    if !tenant_exists {
         return Err(refused("/tenant_id", "租户不存在"));
     }
     let revision: DiscountRevision = sqlx::query_as(
@@ -792,7 +811,6 @@ pub async fn insert_discount(
     .fetch_one(&mut *conn)
     .await
     .map_err(DbError::from)?;
-    bump_pricing_version(&mut *conn).await?;
     audit::record(
         conn,
         AuditEntry {

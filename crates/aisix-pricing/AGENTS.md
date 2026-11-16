@@ -122,7 +122,7 @@ failing unless it was written for them.
 ## A price never starts in the past
 
 - Every price write refuses an `effective_from` more than
-  `BACKDATE_TOLERANCE` (5 s) before the database's own `now()`
+  `BACKDATE_TOLERANCE` (5 s) before the database's own `clock_timestamp()`
   (`crates/aisix-control-plane/src/pricing/store.rs`), for baselines, group
   rates, cost rates and discounts alike, imports included. With no
   backdating, the book at ingest equals the book at the row's `occurred_at`,

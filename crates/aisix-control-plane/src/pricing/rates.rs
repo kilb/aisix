@@ -323,6 +323,7 @@ pub async fn insert_group_rate(
     actor: Actor<'_>,
 ) -> Result<(GroupRateRevision, Vec<PriceWarning>), ApiError> {
     let group = groups::lock_one(&mut *conn, row.group_id, LockMode::Share).await?;
+    bump_pricing_version(&mut *conn).await?;
     starts_now_or_later(&mut *conn, row.effective_from).await?;
     if group.retired_at.is_some() {
         return Err(ApiError::group_retired());
@@ -353,7 +354,6 @@ pub async fn insert_group_rate(
     .fetch_one(&mut *conn)
     .await
     .map_err(DbError::from)?;
-    bump_pricing_version(&mut *conn).await?;
     audit::record(
         &mut *conn,
         AuditEntry {

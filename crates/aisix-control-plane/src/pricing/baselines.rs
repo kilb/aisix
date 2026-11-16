@@ -442,6 +442,7 @@ async fn write_row(
     row: &NewBaseline,
     actor: Actor<'_>,
 ) -> Result<BaselineRevision, ApiError> {
+    bump_pricing_version(&mut *conn).await?;
     starts_now_or_later(&mut *conn, row.effective_from).await?;
     row.card
         .validate()
@@ -484,7 +485,6 @@ async fn write_row(
     .fetch_one(&mut *conn)
     .await
     .map_err(DbError::from)?;
-    bump_pricing_version(&mut *conn).await?;
     audit::record(
         &mut *conn,
         AuditEntry {

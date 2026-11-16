@@ -674,9 +674,8 @@ pub async fn preview(
 /// whole number.
 async fn hold_pricing_version(conn: &mut PgConnection) -> Result<Option<i64>, DbError> {
     Ok(sqlx::query_scalar::<_, Option<i64>>(
-        "SELECT CASE WHEN jsonb_typeof(value) = 'number' AND value::text ~ '^-?[0-9]{1,18}$' \
-                     THEN (value::text)::bigint END \
-         FROM cp_settings WHERE key = 'pricing_version' FOR SHARE",
+        "SELECT pricing_version_number(value) FROM cp_settings \
+         WHERE key = 'pricing_version' FOR SHARE",
     )
     .fetch_optional(conn)
     .await?
