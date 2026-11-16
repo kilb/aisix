@@ -2,6 +2,49 @@
 
 use serde::{Deserialize, Serialize};
 
+/// 同一 attempt 单调起点的毫秒偏移；相邻已知时点作差可加和，缺失不补零。
+/// HTTP 发送起点表示交给客户端执行前，不代表内核或网卡实际写出。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpstreamTiming {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_send_started_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_headers_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_response_byte_ms: Option<u32>,
+    /// 既有 SSE 解析器首次看到完整 data 帧；非 SSE 或未闭合帧保持未知。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_protocol_frame_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_canonical_chunk_ms: Option<u32>,
+    /// 既有首内容观察器把非空内容交给 HTTP server 的时点，不是客户端 ACK。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_content_ms: Option<u32>,
+}
+
+impl UpstreamTiming {
+    pub fn validate(&self) -> bool {
+        let mut previous = 0;
+        for current in [
+            self.http_send_started_ms,
+            self.response_headers_ms,
+            self.first_response_byte_ms,
+            self.first_protocol_frame_ms,
+            self.first_canonical_chunk_ms,
+            self.first_content_ms,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if current < previous {
+                return false;
+            }
+            previous = current;
+        }
+        true
+    }
+}
+
 /// 请求入口的实际阶段测量；缺失表示未观测，零表示窗口短于一毫秒。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RequestTiming {
