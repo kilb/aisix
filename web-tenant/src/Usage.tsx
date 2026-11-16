@@ -274,11 +274,6 @@ function Section({ title, number, children, className = "" }: { title: string; n
   );
 }
 
-/** The filters above a list: labelled controls on one wrapping row. */
-function Filters({ children }: { children: ReactNode }) {
-  return <div className="usage-filters">{children}</div>;
-}
-
 /** The key filter's options: every key an owner or admin sees, a member's own. A billing member holds none. */
 function KeySelect({ keys, value, onChange }: { keys: TenantKey[]; value: string; onChange: (v: string) => void }) {
   return (
