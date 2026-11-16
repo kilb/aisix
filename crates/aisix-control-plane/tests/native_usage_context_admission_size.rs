@@ -503,6 +503,11 @@ impl Fixture {
         );
         let (event_id, outbox, ingested) = rows.first().expect("one event");
         assert_eq!(
+            outbox.get("stream"),
+            context.get("stream"),
+            "{label}: original stream fact belongs to the immutable canonical outbox"
+        );
+        assert_eq!(
             ingested.get("stream"),
             context.get("stream"),
             "{label}: terminal projection preserves true, explicit false, and legacy unknown"

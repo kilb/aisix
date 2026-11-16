@@ -1807,3 +1807,98 @@ async fn batch_group_output_mask_changes_only_its_own_entry_once_without_changin
     );
     shutdown_exporters(&state).await;
 }
+
+// 新请求由真实网关产生；旧请求通过省略新字段的原生准入 HTTP 协议提交。
+#[tokio::test]
+async fn native_stream_fact_is_canonical_before_delivery_and_legacy_stays_unknown() {
+    use aisix_core::native_objects::{
+        configured_native_origin, native_origin_surface, platform_id_key_from_secret,
+        NativeObjectKind, NativeProtocol,
+    };
+
+    for stream in [Some(true), Some(false), None] {
+        let Some(f) = fixture().await else { return };
+        let (state, mut usage) = gateway(&f).await;
+        if let Some(stream) = stream {
+            let (status, body) = json_request(
+                &state,
+                "POST",
+                "/v1/responses",
+                "admission",
+                json!({"model":ALIAS,"background":true,"input":A_TEXT,"stream":stream}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "real native admission: {body}");
+            let accepted = drain(&mut usage);
+            assert!(accepted
+                .iter()
+                .any(|event| event.get("stream") == Some(&json!(stream))));
+        } else {
+            let snapshot = projected_snapshot(&f.cp).await;
+            let provider = snapshot
+                .provider_keys
+                .get_by_id(&f.account.to_string())
+                .unwrap();
+            let boundary = configured_native_origin(
+                &platform_id_key_from_secret(&f.cp.state().pki.platform_id_key_hex()),
+                f.account,
+                &provider.value,
+                NativeProtocol::Openai,
+                NativeObjectKind::Response,
+            )
+            .unwrap();
+            let operation = Uuid::new_v4();
+            let dp = f.cp.dp_client(&f.bundle);
+            let begun = dp.send("POST", "/dp/v1/native-objects/begin", Some(json!({
+                "operation_id":operation,"api_key_id":f.key,"protocol":"openai","kind":"response",
+                "origin":{"surface":native_origin_surface(NativeProtocol::Openai,NativeObjectKind::Response),
+                    "model_id":f.target,"provider_key_id":f.account,"boundary":boundary},
+                "requested_model_id":f.alias,"requested_model":ALIAS,"upstream_model":"gpt-4o-mini",
+                "upstream_provider":"openai","operation":"responses","request_id":Uuid::new_v4(),
+                "asynchronous":true,"usage_context":{"api_key_name":LABEL}
+            }))).await;
+            assert_eq!(
+                begun.status, 200,
+                "legacy admission omits the new stream field"
+            );
+            let bound = dp
+                .send(
+                    "POST",
+                    "/dp/v1/native-objects/bind",
+                    Some(json!({
+                        "operation_id":operation,"api_key_id":f.key,"raw_id":RESPONSE_ID
+                    })),
+                )
+                .await;
+            assert_eq!(bound.status, 200, "legacy object remains resumable");
+        }
+        let (object, operation) = record(&f, RESPONSE_ID).await;
+        let admitted = admission_submission(&f, operation).await;
+        let expected = stream.map(Value::Bool);
+        assert_eq!(admitted.pointer("/usage_context/stream"), expected.as_ref());
+        let (recovery, _observation) = gateway(&f).await;
+        f.provider.complete();
+        let (cancel, stopped) = watch::channel(false);
+        let worker = tokio::spawn(aisix_proxy::native_api::background::run(
+            recovery.clone(),
+            stopped,
+        ));
+        let rows = terminals(&f, object, 1).await;
+        stop(cancel, worker).await;
+        assert_eq!(rows[0].1.get("stream"), expected.as_ref());
+        let raw: Value =
+            sqlx::query_scalar("SELECT event FROM native_terminal_outbox WHERE object_id=$1")
+                .bind(object)
+                .fetch_one(f.cp.db().pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            raw.get("stream"),
+            expected.as_ref(),
+            "stream must be canonical before optional observation projection"
+        );
+        assert_eq!(admission_submission(&f, operation).await, admitted);
+        shutdown_exporters(&state).await;
+        shutdown_exporters(&recovery).await;
+    }
+}

@@ -1680,6 +1680,14 @@ async fn complete(
         let fields = event.as_object_mut().ok_or_else(|| invalid("/usage"))?;
         fields.remove("entry_id");
         fields.remove("terminal_status");
+        // 流式意图是原请求事实，首次 canonical 事件即保存；旧提交缺失时不补造。
+        if let Some(stream) = submitted
+            .usage_context
+            .as_ref()
+            .and_then(|context| context.stream)
+        {
+            fields.insert("stream".to_string(), json!(stream));
+        }
         fields.insert("event_id".to_string(), json!(event_id));
         fields.insert("team_id".to_string(), json!(op.tenant_id));
         fields.insert("api_key_id".to_string(), json!(op.api_key_id));
