@@ -94,6 +94,7 @@ test.afterEach(async ({ page }) => {
 test("routing-catalog-stays-compact-and-all-targets-remain-readable-and-editable", async ({ page }) => {
   const suffix = randomUUID().slice(0, 8);
   const account = await api(page, `/admin/resources/provider_keys/${accountId}`);
+  expect(account.doc.groups?.length, "the real account has a group to check its visible alignment").toBeGreaterThan(0);
   const targets = await Promise.all(Array.from({ length: 5 }, (_, i) => api(page, "/admin/resources/models", "POST", {
     doc: { display_name: `route-${i + 1}-${suffix}${i === 4 ? `-${"long-target-".repeat(8)}` : ""}`, provider_key_id: accountId, provider: account.doc.provider, model_name: upstream },
   })));
@@ -113,6 +114,8 @@ test("routing-catalog-stays-compact-and-all-targets-remain-readable-and-editable
     const firstName = await box(first.getByText(targets[0].doc.display_name, { exact: true }));
     const groupLabel = await box(first.getByText("可用分组", { exact: true }));
     expect(groupLabel.y, "target and available-group label share a line").toBeLessThan(firstName.y + firstName.height);
+    const firstGroup = await box(first.getByText(account.doc.groups[0], { exact: true }));
+    expect(Math.abs(firstGroup.y - firstName.y), "the actual first group shares the target's first line").toBeLessThanOrEqual(12);
     await expect(targetCell.getByText(targets[4].doc.display_name, { exact: true })).not.toBeVisible();
     const expand = targetCell.getByText("展开其余 3 个目标（共 5 个）", { exact: true });
     await expect(expand).toBeVisible();

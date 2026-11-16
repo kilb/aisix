@@ -179,16 +179,17 @@ form.model-editor-form > .model-form-footer,
 .cp-models .model-list-name,
 .cp-models .model-list-target { display: block; min-width: 0; overflow-wrap: anywhere; }
 .cp-models .ops-list .dt { width: 100%; min-width: 0; table-layout: fixed; }
-.cp-models .ops-list .dt > thead th:first-child { width: 18%; }
-.cp-models .ops-list .dt > thead th:nth-child(2) { width: 5.5rem; }
-.cp-models .ops-list .dt > thead th:nth-child(3) { width: 8rem; }
+.cp-models .ops-list .dt > thead th:first-child { width: 14%; }
+.cp-models .ops-list .dt > thead th:nth-child(2) { width: 6rem; }
+.cp-models .ops-list .dt > thead th:nth-child(3) { width: 9rem; }
 .cp-models .ops-list .dt > thead th:nth-child(4) { width: auto; }
 .cp-models .ops-list .dt > thead th:nth-child(5) { width: 7rem; }
 .cp-models .ops-list .dt > thead th:last-child { width: 9rem; }
 .cp-models .ops-list .dt > tbody > tr > td { min-width: 0; white-space: normal; overflow-wrap: anywhere; }
+.cp-models .ops-list .dt > tbody > tr > td:nth-child(2) > .tag { white-space: nowrap; }
 .cp-models .ops-list .dt > tbody > tr > td:nth-child(5) .lamp { white-space: nowrap; }
 .cp-models .model-list-kind > [aria-label] { margin-top: 3px; }
-.cp-models .model-list-kind > [aria-label] > .tag { padding-inline: 0; border: 0; border-radius: 0; background: transparent; font-weight: 500; line-height: 20px; }
+.cp-models .model-list-kind > [aria-label] > .tag { display: block; height: auto; min-height: 20px; padding-inline: 0; border: 0; border-radius: 0; background: transparent; font-weight: 500; line-height: 20px; text-wrap: balance; }
 .cp-models .model-list-kind > [aria-label] > code { display: block; margin-left: 0; font-size: var(--text-caption); line-height: 18px; }
 .cp-models .model-list-route-action { gap: 4px; padding-inline: 6px; white-space: nowrap; }
 .cp-models .model-list-route-action svg { width: 15px; height: 15px; }
@@ -198,8 +199,11 @@ form.model-editor-form > .model-form-footer,
 .cp-models .model-target-line { display: grid; min-width: 0; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); align-items: start; gap: 3px 10px; }
 .cp-models .model-target-name { min-width: 0; overflow-wrap: anywhere; }
 .cp-models .model-target-separator { color: var(--color-fg-3); }
-.cp-models .model-target-groups { display: inline-flex; min-width: 0; max-width: 100%; flex-wrap: wrap; align-items: center; gap: 3px 6px; color: var(--color-fg-3); font-size: var(--text-caption); line-height: 20px; }
+.cp-models .model-target-groups { display: grid; min-width: 0; max-width: 100%; grid-template-columns: max-content minmax(0, 1fr); align-items: start; gap: 3px 6px; color: var(--color-fg-3); font-size: var(--text-caption); line-height: 20px; }
 .cp-models .model-target-group-label { white-space: nowrap; }
+.cp-models .model-target-groups > :not(.model-target-group-label) { min-width: 0; }
+.cp-models .model-target-groups .ops-group-badge { min-width: 0; height: auto; min-height: 20px; align-items: baseline; line-height: 18px; }
+.cp-models .model-target-groups .ops-group-badge > span:last-child { min-width: 0; }
 .cp-models .model-target-more { margin-top: 5px; }
 .cp-models .model-target-more > summary { width: fit-content; max-width: 100%; padding-block: 4px; color: var(--color-fg-2); font-size: var(--text-caption); line-height: 20px; cursor: pointer; }
 .cp-models .model-target-more > summary:focus-visible { border-radius: var(--r-field); outline: 2px solid var(--ring); outline-offset: 2px; }
