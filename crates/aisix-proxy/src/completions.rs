@@ -189,6 +189,7 @@ pub async fn completions(
             );
         }
     };
+    crate::stream_metadata::note_json(&body);
     let request_id = client.request_id.clone();
     crate::span_facts::note_request(
         &client,

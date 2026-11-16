@@ -379,6 +379,7 @@ async fn addressed(
     messages: bool,
     body: Option<Value>,
 ) -> Response {
+    crate::attribution::note_requested_stream(Some(false));
     let started = Instant::now();
     if body.is_none() {
         crate::attribution::note_handler_started(started);
@@ -511,6 +512,7 @@ pub(crate) async fn list(
     headers: HeaderMap,
     RawQuery(query): RawQuery,
 ) -> Response {
+    crate::attribution::note_requested_stream(Some(false));
     let started = Instant::now();
     crate::attribution::note_handler_started(started);
     let snapshot = state.snapshot.load();

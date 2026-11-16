@@ -584,6 +584,7 @@ pub(crate) async fn realtime(
     mut client: ClientContext,
     ws: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
 ) -> Response {
+    crate::attribution::note_requested_stream(Some(true));
     let translation = uri.path() == "/v1/realtime/translations";
     let endpoint = realtime_endpoint(translation);
     let request_id = client.request_id.clone();
@@ -2826,6 +2827,7 @@ async fn run_session(
         elapsed,
     );
     let mut event = UsageEvent {
+        stream: Some(true),
         io_audit: Some(io.finish()),
         request_id: request_id.clone(),
         native_operation_id: journal.as_ref().and_then(|journal| journal.operation_id()),

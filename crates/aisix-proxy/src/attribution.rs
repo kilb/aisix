@@ -189,6 +189,8 @@ pub(crate) struct RouteIdentity {
 /// module docs for why it does not live in [`Resolved`].
 #[derive(Default)]
 pub(crate) struct CancelContext {
+    /// 调用方请求已解析后发布；取消和流终态共享这一事实。
+    pub stream: Option<bool>,
     /// The caller, as the [`ClientContext`] extractor resolved it. `None`
     /// on the routes that resolve their principal themselves — `/mcp` and
     /// `/a2a` never run that extractor — where [`auth`](Self::auth) carries
@@ -1544,6 +1546,15 @@ fn with(f: impl FnOnce(&mut Resolved)) {
 /// Same, for the cancel half of the cell.
 fn with_cancel(f: impl FnOnce(&mut CancelContext)) {
     let _ = CURRENT.try_with(|a| f(&mut a.lock().cancel));
+}
+
+/// 仅记录已经解析的调用方意图；不读取或复制正文。
+pub(crate) fn note_requested_stream(stream: Option<bool>) {
+    with_cancel(|c| c.stream = stream);
+}
+
+pub(crate) fn requested_stream() -> Option<bool> {
+    CURRENT.try_with(|a| a.lock().cancel.stream).ok().flatten()
 }
 
 /// Publish an ensemble's pending sub-calls for the cancel guard to report.

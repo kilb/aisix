@@ -367,6 +367,9 @@ async fn dispatch(
         .to_string();
     let rpc_id = value.get("id").cloned();
     let operation = canonical_operation(&method);
+    crate::attribution::note_requested_stream(
+        (operation != "unknown").then(|| is_streaming_operation(operation)),
+    );
     // A call with no words to capture (a task read, a cancel) reports its
     // JSON-RPC body on a failure row.
     crate::usage_attr::note_failure_request(&snapshot, || value.to_string());

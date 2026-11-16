@@ -498,6 +498,14 @@ pub(crate) async fn responses_operation(
     operation: NativeResponseOperation,
 ) -> Response {
     let started = Instant::now();
+    let stream = match operation.kind {
+        crate::native_api::responses::ResponseOperationKind::Create
+        | crate::native_api::responses::ResponseOperationKind::Retrieve => {
+            crate::stream_metadata::json_intent(&body)
+        }
+        _ => Some(false),
+    };
+    crate::attribution::note_requested_stream(stream);
     // Before anything reads the body: no gateway context tag may reach a
     // guardrail, a log, or an upstream. In platform mode the tags are sealed
     // to the tenant they were handed to: the key's team, or the key itself.

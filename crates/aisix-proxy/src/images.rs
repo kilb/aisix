@@ -114,6 +114,7 @@ pub(crate) async fn image_json(
             );
         }
     };
+    crate::stream_metadata::note_json(&body);
     let request_id = client.request_id.clone();
     let api_key_id = auth.entry.id.clone();
     let model_name = body

@@ -162,6 +162,7 @@ pub(crate) fn emit(
     // chokepoint finds no requested tier there. Note it back, so every row
     // below carries it, the abandoned ensemble's sub-call rows included.
     crate::attribution::note_requested_service_tier(ctx.requested_service_tier.as_deref());
+    crate::attribution::note_requested_stream(ctx.stream);
     // `/mcp` and `/a2a` resolve their principal without this extractor, so
     // they reach here with none — and their own events carry no source IP
     // or user agent either, which is exactly what the default renders.

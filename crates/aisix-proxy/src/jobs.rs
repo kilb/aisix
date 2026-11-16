@@ -3033,6 +3033,7 @@ async fn managed_begin(
 ) -> Result<uuid::Uuid, ProxyError> {
     use crate::native_api::openai;
     use aisix_core::native_objects::{BeginRequest, NativeProtocol};
+    crate::attribution::note_requested_stream(Some(false));
     let operation_id = uuid::Uuid::new_v4();
     let batch_input = kind == aisix_core::native_objects::NativeObjectKind::File
         && input_file_id.is_some()

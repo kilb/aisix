@@ -890,7 +890,7 @@ async fn dispatch(
 
     // The alias the caller addressed, for the usage event's attribution.
     let requested_model =
-        raw_model.unwrap_or_else(|| body_model_name(protocol, raw_shape, &body_bytes));
+        raw_model.unwrap_or_else(|| body_model_name(protocol, raw_shape, &body_bytes, metering));
 
     // Otherwise rate limits AFTER the input guardrail so a content block by
     // local rules doesn't burn an RPM slot (matching the typed endpoints).
@@ -1995,6 +1995,9 @@ fn detect_raw_usage_shape(
     } else {
         None
     };
+    if shape == Some(RawUsageShape::Rerank) {
+        crate::attribution::note_requested_stream(Some(false));
+    }
     // 复用这次原有解码的模型名；护栏提前拒绝也已留下解析成本，不再解析第二遍。
     (shape, shape.map(|_| decoded_body_model_name(&v)))
 }
@@ -2081,6 +2084,7 @@ fn body_model_name(
     protocol: PassthroughProtocol,
     raw_shape: Option<RawUsageShape>,
     body: &[u8],
+    metering: Metering,
 ) -> String {
     if matches!(protocol, PassthroughProtocol::Raw) && raw_shape.is_none() {
         return String::new();
@@ -2090,6 +2094,14 @@ fn body_model_name(
     }) else {
         return String::new();
     };
+    match metering {
+        Metering::Chat | Metering::Anthropic | Metering::Responses
+        | Metering::Completions | Metering::Images => crate::stream_metadata::note_json(&v),
+        Metering::Embeddings | Metering::Rerank => {
+            crate::attribution::note_requested_stream(Some(false));
+        }
+        Metering::Opaque | Metering::DashscopeNative => {}
+    }
     decoded_body_model_name(&v)
 }
 
@@ -9895,12 +9907,12 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
     fn requested_model_comes_only_from_a_detected_envelope() {
         let chat = br#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#;
         assert_eq!(
-            body_model_name(PassthroughProtocol::OpenaiChat, None, chat),
+            body_model_name(PassthroughProtocol::OpenaiChat, None, chat, Metering::Chat),
             "gpt-4o"
         );
         // An opaque body's `model`-shaped key belongs to some other API.
         let opaque = br#"{"model":"whatever","config_name":"x"}"#;
-        assert_eq!(body_model_name(PassthroughProtocol::Raw, None, opaque), "");
+        assert_eq!(body_model_name(PassthroughProtocol::Raw, None, opaque, Metering::Opaque), "");
         // Caller-supplied, so bounded and control-char free before it
         // reaches telemetry.
         let hostile = format!(
@@ -9911,6 +9923,7 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
             PassthroughProtocol::OpenaiResponses,
             None,
             hostile.as_bytes(),
+            Metering::Responses,
         );
         assert_eq!(name.chars().count(), REQUESTED_MODEL_CAP);
         assert!(!name.contains('\0'));

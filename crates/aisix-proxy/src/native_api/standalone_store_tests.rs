@@ -1634,3 +1634,72 @@ mod polling_indexes;
 
 #[path = "standalone_outbox_serialization_tests.rs"]
 pub(super) mod outbox_serialization;
+
+#[tokio::test]
+async fn background_stream_intent_survives_sqlite_reopen_and_outbox() {
+    for (kind, stream) in [
+        (NativeObjectKind::Response, Some(true)),
+        (NativeObjectKind::Response, Some(false)),
+        (NativeObjectKind::Response, None),
+        (NativeObjectKind::MessageBatch, Some(false)),
+        (NativeObjectKind::MessageBatch, None),
+        (NativeObjectKind::EvalRun, Some(false)),
+        (NativeObjectKind::EvalRun, None),
+    ] {
+        let f = Fixture::new().await;
+        let mut begin = f.begin("key-a", kind, true);
+        if let Some(stream) = stream {
+            begin.usage_context = Some(Box::new(
+                serde_json::from_value(json!({"stream":stream})).unwrap(),
+            ));
+        }
+        f.store.begin(begin.clone()).await.unwrap();
+        let record = f
+            .store
+            .bind(BindRequest {
+                existing_record_id: None,
+                objects: vec![],
+                operation_id: begin.operation_id,
+                api_key_id: begin.api_key_id,
+                raw_id: "resp-stream-observation".into(),
+                provider_created_at: None,
+                provider_expires_at: None,
+            })
+            .await
+            .unwrap()
+            .record
+            .unwrap();
+        f.store.close().await;
+        let reopened = f.reopen().await;
+        let leased = reopened
+            .claim(ClaimRequest {
+                limit: 1,
+                record_id: Some(record.record_id),
+                protocol: None,
+                kind: None,
+            })
+            .await
+            .unwrap()
+            .records
+            .remove(0);
+        reopened
+            .complete(CompleteRequest {
+                lease: LeaseToken {
+                    record_id: record.record_id,
+                    generation: leased.lease_generation.unwrap(),
+                },
+                terminal_status: "completed".into(),
+                usage: vec![terminal_usage("")],
+                output_file_ids: vec![],
+            })
+            .await
+            .unwrap();
+        let row = reopened.pending_terminals(1).await.unwrap().remove(0);
+        let wire: serde_json::Value = serde_json::from_str(&row.canonical_event).unwrap();
+        let expected = stream.map(serde_json::Value::Bool);
+        assert_eq!(wire.get("stream"), expected.as_ref(),
+            "a background terminal must retain caller intent, including explicit false and legacy unknown");
+        assert_eq!(wire["request_id"], begin.request_id);
+        reopened.close().await;
+    }
+}

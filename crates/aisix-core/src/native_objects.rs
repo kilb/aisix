@@ -573,6 +573,9 @@ impl NativeInputAudit {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NativeUsageContext {
+    /// 原始调用方的流式意图；旧提交缺失时保留未知。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub api_key_name: String,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -589,7 +592,8 @@ pub struct NativeUsageContext {
 
 impl NativeUsageContext {
     pub fn is_empty(&self) -> bool {
-        self.api_key_name.is_empty()
+        self.stream.is_none()
+            && self.api_key_name.is_empty()
             && self.tags.is_empty()
             && self.jwt_subject.is_empty()
             && self.jwt_provider.is_empty()
@@ -1371,6 +1375,20 @@ mod authority_contract_tests {
 mod usage_context_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn native_stream_observation_round_trips_three_states() {
+        for stream in [Some(true), Some(false), None] {
+            let wire = stream.map_or_else(|| json!({}), |stream| json!({"stream": stream}));
+            let context: NativeUsageContext = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(context.is_empty(), stream.is_none());
+            assert_eq!(
+                serde_json::to_value(context).unwrap(),
+                wire,
+                "old native JSON remains unknown; false must remain an explicit field"
+            );
+        }
+    }
 
     fn old_entry() -> serde_json::Value {
         json!({

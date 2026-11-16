@@ -493,6 +493,7 @@ impl StandaloneNativeStore {
             )
             .ok();
             let mut event = ::aisix_obs::UsageEvent {
+                stream: context.and_then(|context| context.stream),
                 api_key_id: caller.key_id.clone(),
                 team_id: caller.team_id.clone().unwrap_or_default(),
                 user_id: caller.user_id.clone().unwrap_or_default(),
@@ -552,6 +553,7 @@ impl StandaloneNativeStore {
             let fields = wire.as_object().ok_or(Error::Unavailable)?;
             let mut saved = serde_json::Map::new();
             for name in [
+                "stream",
                 "api_key_id",
                 "api_key_name",
                 "team_id",
@@ -2896,6 +2898,7 @@ fn canonical_terminal_event(
     let entry = source.entries.iter().find(|e| e.entry_id == usage.entry_id);
     let context = NativeUsageContext::deserialize(template).map_err(unavailable)?;
     let mut event = ::aisix_obs::UsageEvent {
+        stream: context.stream,
         event_id: event_id.to_string(),
         request_id: source.request_id.clone(),
         occurred_at: ::aisix_obs::UsageEvent::occurred_at(usage.occurred_at),
@@ -2956,6 +2959,8 @@ fn canonical_terminal_event(
         _ => crate::operation::RESPONSES,
     };
     let mut event = crate::usage_attr::prepare_usage_event_fields(surface, event, true, true);
+    // 旧提交缺失的观测保持未知，不能用当前端点契约回填历史文档。
+    event.stream = context.stream;
     event.cache_creation_ttl = event.settled_cache_creation_ttl();
     if let Some(cost) = template.get("_native_cost") {
         let cost: aisix_core::models::ModelCost =

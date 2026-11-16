@@ -1891,6 +1891,7 @@ pub(crate) async fn deliver_one(
              CROSS JOIN LATERAL (
                SELECT jsonb_object_agg(key, value) AS fields
                FROM jsonb_each(jsonb_build_object(
+                 'stream', context.caller->'stream',
                  'api_key_name', context.caller->'api_key_name',
                  'tags', context.caller->'tags',
                  'jwt_subject', context.caller->'jwt_subject',

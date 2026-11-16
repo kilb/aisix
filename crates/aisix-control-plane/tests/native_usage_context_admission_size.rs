@@ -502,6 +502,11 @@ impl Fixture {
             "{label}: one nonempty delivered terminal event"
         );
         let (event_id, outbox, ingested) = rows.first().expect("one event");
+        assert_eq!(
+            ingested.get("stream"),
+            context.get("stream"),
+            "{label}: terminal projection preserves true, explicit false, and legacy unknown"
+        );
         for name in SNAPSHOT_FIELDS {
             let expected = context
                 .get(name)
@@ -609,4 +614,20 @@ async fn legal_public_tag_context_completes_without_truncation_or_duplicate_char
         1_000_000 - small - large,
         "two completions and their replays debit only twice"
     );
+}
+
+#[tokio::test]
+async fn native_stream_metadata_survives_real_cp_terminal_delivery() {
+    let fixture = Fixture::new().await;
+    for (label, stream) in [
+        ("stream_true", Some(true)),
+        ("stream_false", Some(false)),
+        ("legacy_stream_unknown", None),
+    ] {
+        let mut context = snapshot(&fixture.cp, false).await;
+        if let Some(stream) = stream {
+            context["stream"] = json!(stream);
+        }
+        fixture.run(label, context, false).await;
+    }
 }

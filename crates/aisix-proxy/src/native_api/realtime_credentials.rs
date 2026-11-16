@@ -103,6 +103,7 @@ async fn mint(
     body: Result<Json<Value>, JsonRejection>,
     action: Mint,
 ) -> Response {
+    crate::attribution::note_requested_stream(Some(false));
     let started = Instant::now();
     let endpoint = format!("/v1{}", action.path());
     let Json(mut body) = match body {

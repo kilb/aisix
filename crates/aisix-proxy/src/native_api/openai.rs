@@ -902,6 +902,9 @@ async fn begin_requested(
     references: Vec<AcceptedReference>,
     owner_parent_record_id: Option<Uuid>,
 ) -> Result<Registration, ProxyError> {
+    if stage == InferenceStage::Accepted && kind != NativeObjectKind::Response {
+        crate::attribution::note_requested_stream(Some(false));
+    }
     let registry = registry(state)?;
     let api_key_id = api_key_id(auth)?;
     let operation_id = Uuid::new_v4();

@@ -636,6 +636,14 @@ pub async fn speech(
             );
         }
     };
+    crate::attribution::note_requested_stream(body.as_object().and_then(|body| {
+        match body.get("stream_format") {
+            None => Some(false),
+            Some(Value::String(format)) if format == "sse" => Some(true),
+            Some(Value::String(format)) if format == "audio" => Some(false),
+            _ => None,
+        }
+    }));
     let request_id = client.request_id.clone();
     let api_key_id = auth.entry.id.clone();
     let model_name = body
@@ -1594,6 +1602,14 @@ async fn multipart_dispatch(
         })?;
         fields.push((name, file_name, content_type, data));
     }
+
+    crate::attribution::note_requested_stream(if upstream_path == "/audio/transcriptions" {
+        crate::stream_metadata::multipart_intent(
+            fields.iter().map(|(name, _, _, data)| (name.as_str(), data.as_ref())),
+        )
+    } else {
+        Some(false)
+    });
 
     // Extract the `model` field value.
     let model_name = fields

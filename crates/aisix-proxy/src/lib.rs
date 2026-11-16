@@ -38,6 +38,9 @@ mod client_ip;
 mod completions;
 pub(crate) mod cooldown;
 mod count_tokens;
+mod stream_metadata;
+#[cfg(test)]
+mod stream_metadata_tests;
 mod decisions;
 mod decisions_convert;
 mod dispatch;

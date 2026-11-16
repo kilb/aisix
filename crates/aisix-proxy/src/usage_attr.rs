@@ -42,7 +42,9 @@ pub(crate) fn native_usage_context(
                 .as_ref()
                 .is_some_and(|value| !value.is_empty())
     });
-    if caller.api_key_name.as_ref().is_none_or(String::is_empty)
+    let stream = crate::attribution::requested_stream();
+    if stream.is_none()
+        && caller.api_key_name.as_ref().is_none_or(String::is_empty)
         && caller.tags.is_empty()
         && !has_jwt
         && input_audit.is_empty()
@@ -51,6 +53,7 @@ pub(crate) fn native_usage_context(
     }
     let mut event = UsageEvent::default();
     apply_caller_identity(&mut event, client.jwt.as_ref(), caller);
+    event.stream = stream;
     native_usage_context_from_event(event, input_audit)
 }
 
@@ -59,6 +62,7 @@ fn native_usage_context_from_event(
     input_audit: aisix_core::native_objects::NativeInputAudit,
 ) -> Option<Box<aisix_core::native_objects::NativeUsageContext>> {
     let context = aisix_core::native_objects::NativeUsageContext {
+        stream: event.stream,
         api_key_name: event.api_key_name,
         tags: event.tags,
         jwt_subject: event.jwt_subject,
@@ -1612,6 +1616,7 @@ fn stamp_requested_model_id(event: &mut UsageEvent) {
 /// addressed directly names the concrete upstream model it filled in, and
 /// none when reached through a routing model.
 fn stamp_billing_fields(snap: &AisixSnapshot, event: &mut UsageEvent, provider_key_id: &str) {
+    event.stream = event.stream.or_else(crate::attribution::requested_stream);
     if event.event_id.is_empty() {
         event.event_id = uuid::Uuid::new_v4().to_string();
     }
@@ -2118,6 +2123,7 @@ pub(crate) fn prepare_usage_event_fields(
     // present on a family's success path and missing from its error or
     // streaming one (AISIX-Cloud#1461).
     event.operation = surface.operation.to_string();
+    event.stream = event.stream.or_else(|| crate::stream_metadata::fixed_intent(surface));
     event.is_final_attempt = logical_final;
     // 与上游 span 使用同一派发事实；零耗时仍可能是一次实际调用。
     event.upstream_dispatched = Some(dispatched);
