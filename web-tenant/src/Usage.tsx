@@ -34,6 +34,7 @@ import { UsageRecordFilters } from "./components/UsageRecordFilters";
 import { usageRecordFilterParams, usageRecordFilterValues } from "./lib/usageRecordFilters";
 import { formatCount } from "./lib/chartFormat";
 import { CallLogDrawer } from "./CallLogDrawer";
+import "./UsageAnalytics.css";
 
 function failure(e: unknown): string {
   return e instanceof ApiError ? messageFor(e) : String(e);
@@ -430,47 +431,49 @@ function Summary({ keys, showKeys, ownScope, models }: { keys: TenantKey[]; show
   const metricsFrom = range?.from ?? (query.get("from") || fallback.from);
   const metricsTo = range?.to ?? (query.get("to") || fallback.to);
   return (
-    <BentoGrid>
-      <Card className={`${span.d12} metric-scope`} padding="sm" aria-label="用量分析筛选">
-        <Filters>
+    <BentoGrid className="usage-analysis-grid">
+      <Card className="usage-analysis-scope metric-scope" padding="sm" aria-label="用量分析筛选">
+        <div className="usage-analysis-filters">
           <Field label="开始日期"><input type="date" value={fromDate} onChange={e => setFromDate(e.target.value)} /></Field>
           <Field label="结束日期"><input type="date" value={toDate} onChange={e => setToDate(e.target.value)} /></Field>
           {showKeys && <KeySelect keys={keys} value={keyId} onChange={setKeyId} />}
           <Field label="模型"><Select value={query.get("model_id") ?? ""} onValueChange={selectedValue => update({ model_id: selectedValue, from: metricsFrom, to: metricsTo })}><option value="">全部</option>{query.get("model_id") && !models.some(model => model.id === query.get("model_id")) && <option value={query.get("model_id")!}>已选模型（{query.get("model_id")}，当前列表未提供）</option>}{models.map(model => <option key={model.id} value={model.id}>{model.name}</option>)}</Select></Field>
-          <Button onClick={() => setRefresh(value => value + 1)}>刷新分析</Button>
-          <a className="metric-scope-action" href={`#calls?${new URLSearchParams({ ...Object.fromEntries(query), from: metricsFrom, to: metricsTo })}`}>查看调用记录</a>
-        </Filters>
-        <p className="hint">分析最多查询 92 天或 1500 个时间桶，超出范围请调整。按月汇总仍可查询原有历史范围。</p>
-        <p className="hint">{fmtBeijing(metricsFrom)} — {fmtBeijing(metricsTo)}</p>
+          <div className="usage-analysis-actions">
+            <Button onClick={() => setRefresh(value => value + 1)}>刷新分析</Button>
+            <a className="metric-scope-action" href={`#calls?${new URLSearchParams({ ...Object.fromEntries(query), from: metricsFrom, to: metricsTo })}`}>查看调用记录</a>
+          </div>
+        </div>
+        <div className="usage-analysis-range">
+          <p>{fmtBeijing(metricsFrom)} — {fmtBeijing(metricsTo)}（UTC+8）</p>
+          <p>分析最多查询 92 天或 1500 个时间桶；按月汇总可查询原有历史范围。</p>
+        </div>
       </Card>
       <ApiMetricsPanel refreshKey={refresh} scope="tenant" enabled={range !== null} from={metricsFrom} to={metricsTo} apiKeyId={keyId || undefined} modelId={query.get("model_id") || undefined} memberId={query.get("member_id") || undefined} view={metricViewOf(query.get("view"))} onViewChange={view => update({ view, from: metricsFrom, to: metricsTo })} numberStart={1} className={span.d12} />
       <Section title="用量汇总" number={7}>
         <p className="hint">{rangeLabel}</p>
         {visualError && <p className="note crit" role="alert">{visualError}</p>}
         {(query.has("model_id") || query.has("member_id")) && <p className="note warn">下方计费汇总仅按时间和密钥筛选，不应用分析区的模型或成员筛选。</p>}
-        <Filters>
+        <RecordTableToolbar search={{ value: searchQuery, onChange: value => update({ q: value }), label: "搜索汇总模型", placeholder: "模型名称" }}>
           <Field label="汇总方式">
             <Select value={group} onValueChange={(selectedValue) => setGroup(selectedValue as "day" | "month")}>
               <option value="day">按天</option>
               <option value="month">按月</option>
             </Select>
           </Field>
-        </Filters>
-        <RecordTableToolbar search={{ value: searchQuery, onChange: value => update({ q: value }), label: "搜索汇总模型", placeholder: "模型名称" }} />
-        <p className="hint">含估算用量：上游未完整返回用量，部分 token 由网关估算，费用按该用量计费。</p>
-        <p className="hint">
-          按用量发生的时间汇总，不是按计费入账的时间：重新计价后的调整，记在用量发生的那一期。
-          调用尝试次数包含最终尝试，以及已计费或重新计价的重试。
-          {fromDate === "" && toDate === "" && (group === "day" ? "未选日期时汇总最近 30 天。" : "未选日期时汇总最近 12 个月。")}
-        </p>
-        {err && (
-          <div className="note crit" role="alert">
-            {err}
-          </div>
-        )}
+        </RecordTableToolbar>
+        <details className="usage-summary-notes">
+          <summary>计费与汇总口径</summary>
+          <p>含估算用量：上游未完整返回用量，部分 token 由网关估算，费用按该用量计费。</p>
+          <p>
+            按用量发生的时间汇总，不是按计费入账的时间：重新计价后的调整，记在用量发生的那一期。
+            调用尝试次数包含最终尝试，以及已计费或重新计价的重试。
+            {fromDate === "" && toDate === "" && (group === "day" ? "未选日期时汇总最近 30 天。" : "未选日期时汇总最近 12 个月。")}
+          </p>
+        </details>
         {rows === null && <ChartSkeleton />}
         {rows !== null && rows.length === 0 && !err && !tooLong && range && <CardMessage>所选范围内没有用量</CardMessage>}
-        {rows !== null && rows.length > 0 && (
+        {rows !== null && rows.length > 0 && table.filteredCount === 0 && <CardMessage>没有匹配的汇总模型，请调整搜索条件。</CardMessage>}
+        {rows !== null && table.filteredCount > 0 && (
           <DataTable label="用量汇总" tableClassName="usage-summary-table">
             <colgroup><col className="usage-summary-period" /><col className="usage-summary-model" /><col className="usage-summary-count" /><col className="usage-summary-cost" /><col className="usage-summary-quantities" /></colgroup>
             <thead>

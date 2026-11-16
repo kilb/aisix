@@ -96,6 +96,15 @@ test("范围不合法也保留指标框架和原因，不能变成较短的错�
   assert.match(text, /请求数按最终记录统计/);
 });
 
+// 范围已被拒绝时，所有明细视图都应解释不可用，而不是继续等待不会到达的数据。
+test("范围错误时各分析明细明确提示调整筛选，不保留无限加载状态", () => {
+  for (const view of ["requests", "latency", "tokens", "cache", "cost"] as const) {
+    const markup = renderToStaticMarkup(createElement(ApiMetricsPanel, { ...props, view, to: "2027-11-01T00:00:00Z" }));
+    const aside = markup.slice(markup.indexOf("metric-analysis-aside")).replace(/<[^>]+>/g, "");
+    assert.match(aside, /请调整上方的时间范围后查看明细/, view);
+  }
+});
+
 test("无访问范围时不渲染上一身份的指标面板", () => {
   assert.equal(renderToStaticMarkup(createElement(ApiMetricsPanel, { ...props, enabled: false })), "");
 });

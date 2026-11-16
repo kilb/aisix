@@ -1,0 +1,66 @@
+/* 分析页独立约束网格与筛选，不改变调用记录或共享指标的布局。 */
+.usage-analysis-grid { width: 100%; min-width: 0; align-items: start; }
+.usage-analysis-scope { grid-column: 1 / -1; width: 100%; gap: 10px; }
+.usage-analysis-filters { display: flex; min-width: 0; align-items: flex-end; flex-wrap: wrap; gap: 10px 12px; }
+.usage-analysis-filters > .field { flex: 1 1 148px; width: auto; min-width: 0; margin: 0; }
+.usage-analysis-filters > .field:has(input[type="date"]) { flex: 0 1 160px; }
+.usage-analysis-filters .f { gap: 4px; margin: 0; }
+.usage-analysis-filters .f-label,
+.usage-analysis-grid .record-table-toolbar .f-label { color: var(--fg-3); font-size: var(--text-caption); line-height: 18px; }
+.usage-analysis-filters input { width: 100%; min-width: 0; }
+.usage-analysis-actions { display: flex; flex: none; align-items: center; flex-wrap: wrap; gap: 8px 16px; }
+.usage-analysis-actions > .btn,
+.usage-analysis-actions > a { white-space: nowrap; }
+.usage-analysis-range { display: flex; min-width: 0; flex-wrap: wrap; gap: 4px 16px; color: var(--fg-3); font-size: var(--text-caption); line-height: 1.5; }
+.usage-analysis-range p { margin: 0; overflow-wrap: anywhere; }
+.usage-analysis-range p:first-child { font-variant-numeric: tabular-nums; }
+.usage-analysis-grid .metric-analysis > .bento-grid { align-items: start; }
+.usage-analysis-grid .metric-analysis-aside { align-self: start; }
+.usage-analysis-grid .metric-analysis-main > :is(p, [role="group"]) { margin-top: 0; }
+.usage-analysis-grid .metric-primary { padding-bottom: 12px; }
+.usage-analysis-grid .metric-facts { gap: 8px; }
+.usage-analysis-grid .metric-facts > div { padding: 10px 12px; }
+.usage-analysis-grid .metric-facts dd { margin-top: 4px; font-size: var(--fs-16); }
+.usage-analysis-grid .metric-analysis-main > .bento-card-footer { padding-top: 12px; }
+.usage-analysis-grid .metric-analysis-main > .bento-card-footer > div { min-height: 228px; }
+.usage-analysis-grid .metric-analysis-main > .bento-card-footer > p { margin-top: 8px; }
+.usage-analysis-grid .metric-analysis-main > label { margin-bottom: 0; }
+.usage-analysis-grid .metric-analysis-aside .metric-rank { margin-top: 0; }
+.usage-analysis-grid .usage-record-section > .record-table-toolbar { margin-inline: 20px; padding-top: 0; border-top: 0; }
+.usage-analysis-grid .record-table-toolbar > .field { flex: 0 1 160px; margin: 0; }
+.usage-analysis-grid .record-table-search { flex-basis: 240px; }
+.usage-analysis-grid .usage-record-section > :is(.hint, .note, .usage-summary-notes, .bento-card-message) { margin-inline: 20px; }
+.usage-summary-notes { color: var(--fg-3); font-size: var(--text-caption); line-height: 1.5; }
+.usage-summary-notes summary { width: fit-content; cursor: pointer; }
+.usage-summary-notes summary:focus-visible { outline: 2px solid var(--ring); outline-offset: 3px; }
+.usage-summary-notes p { margin: 8px 0 0; }
+.usage-analysis-grid .usage-summary-table { min-width: 780px; }
+.usage-analysis-grid .usage-summary-period { width: 7.5rem; }
+.usage-analysis-grid .usage-summary-model { width: auto; }
+.usage-analysis-grid .usage-summary-count { width: 6.5rem; }
+.usage-analysis-grid .usage-summary-cost { width: 9rem; }
+.usage-analysis-grid .usage-summary-quantities { width: 16rem; }
+@media (min-width: 1200px) {
+  .usage-analysis-grid .metric-analysis-main > .metric-facts { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+@media (min-width: 1024px) {
+  .usage-analysis-grid .metric-analysis-main { grid-column: span 7 / span 7; }
+  .usage-analysis-grid .metric-analysis-aside { grid-column: span 5 / span 5; }
+}
+@media (max-width: 1023px) {
+  .usage-analysis-grid .metric-analysis-main,
+  .usage-analysis-grid .metric-analysis-aside { grid-column: 1 / -1; }
+}
+@media (max-width: 599px) {
+  .usage-analysis-scope { padding: 14px; }
+  .usage-analysis-filters { gap: 10px; }
+  .usage-analysis-filters > .field,
+  .usage-analysis-filters > .field:has(input[type="date"]) { flex: 1 1 calc(50% - 5px); width: calc(50% - 5px); }
+  .usage-analysis-filters input { padding-inline: 8px; }
+  .usage-analysis-actions { flex-basis: 100%; }
+  .usage-analysis-grid .metric-analysis-main,
+  .usage-analysis-grid .metric-analysis-aside { padding: 16px; }
+  .usage-analysis-grid .metric-facts > div { padding: 10px; }
+  .usage-analysis-grid .metric-facts dd { font-size: var(--text-stat); }
+  .usage-analysis-grid .record-table-toolbar > .field { flex-basis: 100%; }
+}
