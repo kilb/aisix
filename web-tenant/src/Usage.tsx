@@ -28,6 +28,7 @@ import { useHashQuery } from "./lib/useHashQuery";
 import { usageRange, usageDateValue, usageRequestKey, metricViewOf } from "./lib/usageNavigation";
 import { ApiMetricsPanel } from "./components/ApiMetricsPanel";
 import { UsagePerformance } from "./components/UsagePerformance";
+import { UpstreamTimingDetails } from "./components/UpstreamTimingDetails";
 import { UsageIoAuditDetails, UsageTokenEstimate } from "./components/UsageIoAuditDetails";
 import { UsageRecordFilters } from "./components/UsageRecordFilters";
 import { usageRecordFilterParams, usageRecordFilterValues } from "./lib/usageRecordFilters";
@@ -225,6 +226,7 @@ function CallLogDetails({ call: c }: { call: Call }) {
       <UsagePerformance data={c} />
       <p className="hint">首字仅显示实测值；输出 TPS 为输出 Token（含推理，不含输入）÷ 完整上游耗时。含估算用量时标为 ≈，仅供参考；用量标记无法区分输入或输出估算。无有效指标或旧记录未采集时显示 —，不以其它指标代替。</p>
     </section>
+    <UpstreamTimingDetails data={c.upstream_timing} />
     <section className="tenant-call-section" aria-label="Token 消耗">
       <h3>Token 消耗</h3>
       <CallTokens call={c} />

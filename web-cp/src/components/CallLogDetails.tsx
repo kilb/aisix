@@ -11,6 +11,7 @@ import { CopyButton } from "../ui/CopyButton";
 import { Loading } from "../ui/DataTable";
 import { ChargeCheck } from "../tabs/billing/Charges";
 import { RequestTimingDetails } from "./RequestTimingDetails";
+import { UpstreamTimingDetails } from "./UpstreamTimingDetails";
 import { UsageIoAuditDetails } from "./UsageIoAuditDetails";
 import { ESTIMATED_THROUGHPUT_NOTE, OUTPUT_THROUGHPUT_NOTE, formatThroughput } from "./UsagePerformance";
 import { Card, CardHeader, PageHeader } from "./page";
@@ -128,6 +129,7 @@ export function CallLogDetails({ eventId, backHref }: { eventId: string; backHre
           ]} />
           {charge?.usage_estimated === true && <p className="hint">{ESTIMATED_THROUGHPUT_NOTE}</p>}
           <RequestTimingDetails data={event ? event.request_timing : charge?.request_timing} />
+          <UpstreamTimingDetails data={event ? event.upstream_timing : charge?.upstream_timing} />
         </section>
         <section className="call-log-section" aria-label="用量与计费">
           <CardHeader title="用量与计费" />

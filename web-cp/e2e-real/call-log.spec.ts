@@ -26,6 +26,32 @@ function listResponse(response: Response, eventId?: string): boolean {
 function field(card: Locator, label: string): Locator {
   return card.locator("dl > div").filter({ has: card.page().locator("dt").getByText(label, { exact: true }) }).locator("dd");
 }
+
+const UPSTREAM_TIMING_FIELDS = [
+  "http_send_started_ms", "response_headers_ms", "first_response_byte_ms",
+  "first_protocol_frame_ms", "first_canonical_chunk_ms", "first_content_ms",
+] as const;
+
+/** 只按真实 API 原值核对原始偏移，缺省和非法值不能从其他时钟补齐。 */
+async function expectUpstreamTiming(scope: Page | Locator, raw: unknown): Promise<void> {
+  const region = scope.getByRole("region", { name: "上游 HTTP 阶段", exact: true });
+  await expect(region).toHaveCount(1);
+  await expect(region).toBeVisible();
+  await expect(region.locator("[data-upstream-timing-field]")).toHaveCount(UPSTREAM_TIMING_FIELDS.length);
+  const timing = raw !== null && typeof raw === "object" && !Array.isArray(raw) ? raw as Readonly<Record<string, unknown>> : null;
+  for (const name of UPSTREAM_TIMING_FIELDS) {
+    const slot = region.locator(`[data-upstream-timing-field="${name}"]`);
+    await expect(slot).toHaveCount(1);
+    const value = timing?.[name];
+    const expected = typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 4_294_967_295
+      ? `${new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 }).format(value)} ms` : "—";
+    await expect(slot.locator("dd")).toHaveText(expected);
+  }
+  await expect(region).toContainText("各值均相对同一次上游尝试起点，按原始毫秒展示，不计算阶段差值");
+  await expect(region).toContainText("不代表操作系统实际写包");
+  await expect(region).toContainText("不代表客户端已收到或确认");
+}
+
 async function settle(page: Page): Promise<void> {
   await page.evaluate(() => document.fonts.ready);
   await page.waitForLoadState("networkidle");
@@ -90,6 +116,7 @@ test("failed call opens its complete saved log, copies content and survives dire
   expect(storedAnswer.status()).toBe(200);
   const stored = await storedAnswer.json() as StoredRecord;
   expect(stored.event_id).toBe(call.event_id);
+  await expectUpstreamTiming(page, stored.event.upstream_timing);
   await expect(page.getByRole("heading", { name: "调用日志详情", exact: true })).toBeVisible();
   expect(await page.title()).toMatch(/AISIX/i);
   await expect(page.getByRole("table", { name: "计费明细", exact: true })).toBeHidden();
@@ -207,6 +234,7 @@ test("long saved logs and billed quantity rows fit narrow detail pages without l
     const stored = await eventAnswer.json() as StoredRecord;
     const priced = await chargeAnswer.json() as { items: ChargeRecord[] };
     expect(stored.event_id).toBe(eventId);
+    await expectUpstreamTiming(page, stored.event.upstream_timing);
     await expect(page.getByRole("heading", { name: "调用日志详情", exact: true })).toBeVisible();
     const json = page.getByRole("region", { name: "事件 JSON", exact: true });
     await json.locator("summary").click();

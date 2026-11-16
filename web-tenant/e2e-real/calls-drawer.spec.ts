@@ -8,6 +8,7 @@ interface Scenario { kind: "positive" | "missing"; event_id: string; request_id:
 interface CallRecord {
   event_id: string; request_id: string; first_token_latency_ms: number | null; attempt_duration_ms: number | null; throughput_tps: number | null;
   usage_input_tokens: number | null; usage: Record<string, number | null> | null;
+  readonly upstream_timing?: Readonly<Record<string, unknown>> | null;
   charge: { status: string; calculation: { final_micro_cny: string | null } };
 }
 function readJson(path: string): any {
@@ -101,6 +102,32 @@ async function showCall(page: Page, scenario: Scenario): Promise<{ row: Locator;
 function definition(area: Locator, label: string): Locator {
   return area.getByText(label, { exact: true }).locator("..").locator("dd");
 }
+
+const UPSTREAM_TIMING_FIELDS = [
+  "http_send_started_ms", "response_headers_ms", "first_response_byte_ms",
+  "first_protocol_frame_ms", "first_canonical_chunk_ms", "first_content_ms",
+] as const;
+
+/** 只按真实 API 原值核对原始偏移，缺省和非法值不能从其他时钟补齐。 */
+async function expectUpstreamTiming(scope: Locator, raw: unknown): Promise<void> {
+  const region = scope.getByRole("region", { name: "上游 HTTP 阶段", exact: true });
+  await expect(region).toHaveCount(1);
+  await expect(region).toBeVisible();
+  await expect(region.locator("[data-upstream-timing-field]")).toHaveCount(UPSTREAM_TIMING_FIELDS.length);
+  const timing = raw !== null && typeof raw === "object" && !Array.isArray(raw) ? raw as Readonly<Record<string, unknown>> : null;
+  for (const name of UPSTREAM_TIMING_FIELDS) {
+    const slot = region.locator(`[data-upstream-timing-field="${name}"]`);
+    await expect(slot).toHaveCount(1);
+    const value = timing?.[name];
+    const expected = typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 4_294_967_295
+      ? `${new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 }).format(value)} ms` : "—";
+    await expect(slot.locator("dd")).toHaveText(expected);
+  }
+  await expect(region).toContainText("各值均相对同一次上游尝试起点，按原始毫秒展示，不计算阶段差值");
+  await expect(region).toContainText("不代表操作系统实际写包");
+  await expect(region).toContainText("不代表客户端已收到或确认");
+}
+
 async function expectDuration(value: Locator, milliseconds: number | null): Promise<void> {
   if (milliseconds === null) { await expect(value).toHaveText("—"); return; }
   const shown = (await value.innerText()).match(/^([\d,.]+) (ms|s)$/);
@@ -160,6 +187,7 @@ test("real-call-drawer-keeps-fee-details-keyboard-focus-and-no-extra-requests", 
   await expect(dialog).toBeVisible();
   for (const label of ["请求信息", "响应性能", "Token 消耗", "费用计算", "计费明细"]) await expect(dialog.getByRole("heading", { name: label, exact: true })).toBeVisible();
   await expect(dialog.getByText(positive.request_id, { exact: true })).toBeVisible();
+  await expectUpstreamTiming(dialog, call.upstream_timing);
   const performance = dialog.getByRole("region", { name: "响应性能", exact: true }).getByLabel("响应性能", { exact: true });
   await expect(definition(performance, "输出 TPS").locator("xpath=..")).toHaveAttribute("title", OUTPUT_TPS_TITLE);
   expect(call.throughput_tps).not.toBeNull(); expect(call.throughput_tps!).toBeGreaterThan(0);
@@ -182,7 +210,7 @@ test("real-call-drawer-keeps-fee-details-keyboard-focus-and-no-extra-requests", 
 // 窄屏抽屉保留完整宽度、内部滚动与可达关闭按钮，页面本身不横向溢出。
 test("real-call-drawer-mobile-fits-scrolls-and-restores-focus", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 667 });
-  const { row } = await showCall(page, positive);
+  const { row, call } = await showCall(page, positive);
   const trigger = row.getByRole("button", { name: "查看调用详情", exact: true });
   await trigger.click();
   const dialog = page.getByRole("dialog", { name: "调用详情", exact: true });
@@ -208,6 +236,7 @@ test("real-call-drawer-mobile-fits-scrolls-and-restores-focus", async ({ page })
   expect(bounds).not.toBeNull(); expect(bounds!.width).toBeGreaterThanOrEqual(360); expect(bounds!.x).toBeGreaterThanOrEqual(0); expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(391);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   expect(await dialog.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
+  await expectUpstreamTiming(dialog, call.upstream_timing);
   const body = dialog.locator(".tenant-call-drawer-body");
   expect(await body.evaluate(element => element.scrollHeight > element.clientHeight)).toBe(true);
   await body.hover(); await page.mouse.wheel(0, 1600);

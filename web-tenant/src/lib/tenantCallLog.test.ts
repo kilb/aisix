@@ -104,3 +104,16 @@ test("详情显示输出 TPS 完整上游口径，不沿用首帧后的限制", 
   assert.ok(content.includes("完整上游耗时"));
   assert.doesNotMatch(content, /非流式或旧记录|TPS 不使用总用时估算/);
 });
+
+// 新阶段必须接到同一调用详情，不能从已有总耗时或首字补出历史值。
+test("调用详情展示同一上游尝试的 HTTP 阶段偏移，缺失保持未知", () => {
+  const renderDetails = (extra: Record<string, unknown>) => renderToStaticMarkup(createElement(DetailsUnderTest, { call: { ...base, ...extra } }));
+  const recorded = renderDetails({ upstream_timing: { http_send_started_ms: 0, response_headers_ms: 136004, first_content_ms: 136008 } });
+  assert.match(recorded, /aria-label="上游 HTTP 阶段"/);
+  assert.match(recorded, /data-upstream-timing-field="http_send_started_ms"[^>]*>.*?<dd[^>]*>0 ms<\/dd>/s);
+  assert.match(recorded, /data-upstream-timing-field="response_headers_ms"[^>]*>.*?<dd[^>]*>136,004 ms<\/dd>/s);
+  const missing = renderDetails({ first_token_latency_ms: 1000, attempt_duration_ms: 3000 });
+  for (const key of ["http_send_started_ms", "response_headers_ms", "first_response_byte_ms", "first_protocol_frame_ms", "first_canonical_chunk_ms", "first_content_ms"]) {
+    assert.match(missing, new RegExp(`data-upstream-timing-field="${key}"[^>]*>.*?<dd[^>]*>—<\\/dd>`, "s"));
+  }
+});

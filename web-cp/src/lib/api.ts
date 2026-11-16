@@ -1007,7 +1007,18 @@ export interface RequestTiming {
   request_body_complete: boolean;
 }
 
+/** 同一次上游尝试起点的观测偏移（毫秒）；缺失不表示零。 */
+export interface UpstreamTiming {
+  http_send_started_ms?: number | null;
+  response_headers_ms?: number | null;
+  first_response_byte_ms?: number | null;
+  first_protocol_frame_ms?: number | null;
+  first_canonical_chunk_ms?: number | null;
+  first_content_ms?: number | null;
+}
+
 export interface Charge extends UsageAuditData {
+  upstream_timing?: UpstreamTiming | null;
   request_timing?: RequestTiming | null;
   first_token_latency_ms?: number | null;
   attempt_duration_ms?: number | null;
@@ -1113,7 +1124,7 @@ export interface StoredUsageEvent {
   team_id: string | null;
   api_key_id: string | null;
   request_id: string | null;
-  event: Record<string, unknown> & UsageAuditData & { request_timing?: RequestTiming | null };
+  event: Record<string, unknown> & UsageAuditData & { request_timing?: RequestTiming | null; upstream_timing?: UpstreamTiming | null };
 }
 
 export const usageEvents = {

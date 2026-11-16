@@ -59,3 +59,9 @@ note/ok/warn/crit 以相应语义边框、浅色底与文字呈现；失败 role
 调用记录与详情统一标为“输出 TPS”：输出 Token（含推理，不含输入）÷ 完整上游耗时（秒）。输出以服务端规范化口径为准，已包含的推理 Token 不重复相加，输入与缓存 Token 不进入分子。前端只格式化 API 的 `throughput_tps`，不从 Token、首字、上游首帧、TPOT 或其它耗时重算，不补缺失值、不限幅。历史记录缺少有效输出或完整上游耗时时显示 —；非流式记录不因缺少首帧而被排除。
 
 `usage_estimated === true` 时调用记录保留 ≈ 参考速度；缺少来源标记不推断估算发生在哪一方向。模型监测排除含估算用量的记录，平均值为有效输出 Token 合计 ÷ 有效完整上游耗时合计（秒），P50/P95 采用同口径的单次输出 TPS；无有效采样显示 —。底层 TPOT 指标和模型主动探测的端到端速率保持独立。
+
+## 上游 HTTP 阶段
+
+调用详情的“上游 HTTP 阶段”只展示 `upstream_timing` 的六个原始观测偏移，单位为毫秒、起点为同一次上游尝试；不计算相邻差值，不与入口阶段或客户端首 Token 时钟相减。HTTP 客户端开始发送记录交给 HTTP 客户端的时点，不表示操作系统实际写包；首次内容交付记录网关交给 HTTP server 的时点，不表示客户端收到或确认。
+
+六字段均可选：`http_send_started_ms`、`response_headers_ms`、`first_response_byte_ms`、`first_protocol_frame_ms`、`first_canonical_chunk_ms`、`first_content_ms`。只有整数且位于 u32 范围的值显示为原始毫秒；零保留，缺失、null 或非法值显示 —，不从 TTFT、完整耗时或其它阶段补算。协议帧与规范化片段可以未采集，非流式记录不拿完整响应补填。历史事件不补写，也不引入逐帧 JSON。
