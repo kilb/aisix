@@ -781,7 +781,8 @@ async fn summarize_direct_models(
           ep.text_inference_stage AS inference_stage, \
           ep.text_native_terminal_status AS native_terminal_status, \
           CASE WHEN jsonb_typeof(ep.json_upstream_dispatched) = 'boolean' \
-            THEN (ep.text_upstream_dispatched)::boolean END AS explicit_dispatch, ",
+            THEN (ep.text_upstream_dispatched)::boolean END AS explicit_dispatch, \
+          COALESCE(ue.event->'usage_estimated' = 'true'::jsonb, FALSE) AS usage_estimated, ",
     );
     let mut columns: Vec<String> = [
         "prompt_tokens",
@@ -906,7 +907,7 @@ async fn summarize_direct_models(
            AND prompt_tokens + completion_tokens <> total_tokens \
            THEN reasoning_tokens ELSE 0 END AS output_tokens \
          FROM measured), scoped AS (SELECT *, \
-         CASE WHEN dispatched AND outcome = 'succeeded' AND known_usage \
+         CASE WHEN dispatched AND outcome = 'succeeded' AND known_usage AND NOT usage_estimated \
            AND output_tokens > 1 AND tpot IS NOT NULL THEN 1000.0 / tpot END AS tps \
          FROM classified",
     );

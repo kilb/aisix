@@ -223,7 +223,7 @@ function CallLogDetails({ call: c }: { call: Call }) {
     <section className="tenant-call-section" aria-label="响应性能">
       <h3>响应性能</h3>
       <UsagePerformance data={c} />
-      <p className="hint">首字与生成 TPS 仅显示实测值；无内容、非流式或旧记录未采集时显示 —。TPS 不使用总用时估算。</p>
+      <p className="hint">首字仅显示实测值；含估算用量的 TPS 标为 ≈，仅供参考。用量标记无法区分输入或输出估算。无内容、非流式或旧记录未采集时显示 —，TPS 不使用总用时估算。</p>
     </section>
     <section className="tenant-call-section" aria-label="Token 消耗">
       <h3>Token 消耗</h3>

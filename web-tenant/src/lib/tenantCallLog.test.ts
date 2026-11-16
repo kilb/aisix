@@ -85,3 +85,14 @@ test("调用详情保留费用复算和遥测缺失说明", () => {
   assert.match(content, /1,137/);
   assert.match(content, /¥0\.001/);
 });
+
+// 列表或详情漏传来源都会把参考速度冒充实测；两处必须保持一致。
+test("含估算用量的列表与详情保留参考 TPS 和独立首字", () => {
+  const call = { ...base, usage_estimated: true };
+  assert.deepEqual(performanceValues(row({ usage_estimated: true })), ["0 ms", "2.53 s", "≈ 84.13"]);
+  const markup = renderToStaticMarkup(createElement(DetailsUnderTest, { call }));
+  const section = markup.match(/<section[^>]*aria-label="响应性能"[^>]*>(.*?)<\/section>/s);
+  assert.ok(section, "详情响应性能必须存在");
+  assert.deepEqual([...section[1]!.matchAll(/<dd>(.*?)<\/dd>/g)].map(match => match[1]!), ["0 ms", "2.53 s", "≈ 84.13"]);
+  assert.match(text(markup), /输出\s*11\s*Token/);
+});

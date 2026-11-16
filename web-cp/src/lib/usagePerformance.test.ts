@@ -28,3 +28,10 @@ test("三项未知不能借响应阶段耗时或Token数量凑出指标", () => 
 test("不可比较的非正或非法吞吐量不显示为实测速度", () => {
   for (const throughput_tps of [0, -1, Infinity, NaN]) assert.equal(values({ throughput_tps })[2], "—");
 });
+
+// 删掉来源标记或连首字一起隐藏，会使这组结果改变。
+test("含估算用量保留参考 TPS，首字独立且未知不补数", () => {
+  assert.deepEqual(values({ first_token_latency_ms: 0, attempt_duration_ms: 2531, throughput_tps: 84.125, usage_estimated: true }), ["0 ms", "2.53 s", "≈ 84.13"]);
+  for (const usage_estimated of [false, null, undefined]) assert.equal(values({ throughput_tps: 84.125, usage_estimated })[2], "84.13");
+  assert.deepEqual(values({ first_token_latency_ms: 0, throughput_tps: null, usage_estimated: true }), ["0 ms", "—", "—"]);
+});

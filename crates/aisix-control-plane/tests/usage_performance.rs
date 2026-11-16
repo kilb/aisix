@@ -304,3 +304,115 @@ async fn throughput_uses_only_output_intervals_on_calls_and_monitoring() {
     );
     assert_eq!(throughput.get("avg"), Some(&json!(50.0)), "{response:?}");
 }
+
+// 将含估算用量混入实测聚合，或在列表隐藏其参考速度，都会改变这些独立结果。
+#[tokio::test]
+async fn estimated_usage_keeps_reference_tps_but_not_measured_monitoring_samples() {
+    let Some((w, target, owner)) = setup().await else {
+        return;
+    };
+    let provider: String = sqlx::query_scalar(
+        "SELECT doc->>'provider_key_id' FROM gw_resources WHERE kind='models' AND id=$1",
+    )
+    .bind(target)
+    .fetch_one(w.cp.db().pool())
+    .await
+    .expect("模型账号");
+    let cases = [
+        ("reported", Some(false), 10, 1100, 100.0),
+        ("omitted-false", None, 10, 1100, 100.0),
+        ("has-estimate", Some(true), 100, 2000, 10.0),
+    ];
+    let events = cases
+        .iter()
+        .map(|(id, estimated, tpot, duration, _)| {
+            let mut fields = json!({"model_id":target,"provider_key_id":provider,
+            "status_code":200,"error_class":"","is_final_attempt":true,"upstream_dispatched":true,
+            "prompt_tokens":7,"completion_tokens":11,"total_tokens":18,
+            "first_token_latency_ms":0,"upstream_latency_ms":duration,"upstream_ttft_ms":1000,
+            "upstream_tpot_ms":tpot});
+            if let Some(estimated) = estimated {
+                fields["usage_estimated"] = json!(estimated);
+            }
+            usage(&w, id, target, fields)
+        })
+        .collect();
+    let delivered = deliver(&w.dp, Uuid::new_v4(), events).await;
+    assert_eq!(delivered.status, 200, "{delivered:?}");
+    assert_eq!(
+        delivered.body.get("rejected"),
+        Some(&json!(0)),
+        "{delivered:?}"
+    );
+    for (path, cookie) in [
+        ("/api/usage/calls", owner.as_str()),
+        ("/admin/pricing/charges", w.admin.cookie()),
+    ] {
+        let response = w.cp.send("GET", path, Some(cookie), None).await;
+        assert_eq!(response.status, 200, "{response:?}");
+        let rows = response.body["items"].as_array().expect("调用记录");
+        for (id, estimated, _, _, tps) in &cases {
+            let row = rows
+                .iter()
+                .find(|row| row["event_id"] == *id)
+                .expect("已保存事件");
+            assert_eq!(
+                row.get("throughput_tps"),
+                Some(&json!(tps)),
+                "参考速度不隐藏: {row}"
+            );
+            assert_eq!(
+                row.get("usage_estimated"),
+                Some(&estimated.map_or(Value::Null, |v| json!(v))),
+                "原始来源保留: {row}"
+            );
+            assert_eq!(
+                row.get("first_token_latency_ms"),
+                Some(&json!(0)),
+                "首字独立保留: {row}"
+            );
+            assert_eq!(
+                row["usage"].get("completion_tokens"),
+                Some(&json!(11)),
+                "用量与计费不改写: {row}"
+            );
+        }
+    }
+    let response =
+        w.cp.send(
+            "GET",
+            &format!("/admin/usage/direct-models?model_id={target}"),
+            Some(w.admin.cookie()),
+            None,
+        )
+        .await;
+    assert_eq!(response.status, 200, "{response:?}");
+    let rows = response.body["models"].as_array().expect("模型统计");
+    assert_eq!(rows.len(), 1, "{response:?}");
+    for metrics in [&response.body["totals"], &rows[0]] {
+        let throughput = &metrics["throughput_tps"];
+        assert_eq!(throughput.get("sample_count"), Some(&json!(2)), "{metrics}");
+        assert_eq!(
+            throughput.get("missing_count"),
+            Some(&json!(1)),
+            "{metrics}"
+        );
+        for field in ["avg", "p50", "p95", "p99"] {
+            assert_eq!(
+                throughput.get(field),
+                Some(&json!(100.0)),
+                "{field}: {metrics}"
+            );
+        }
+        assert_eq!(
+            metrics["tokens"].get("completion_tokens"),
+            Some(&json!(33)),
+            "仅排除 TPS 样本，不删除用量: {metrics}"
+        );
+        assert_eq!(
+            metrics["first_token_latency_ms"].get("sample_count"),
+            Some(&json!(3)),
+            "首字采样独立: {metrics}"
+        );
+    }
+}

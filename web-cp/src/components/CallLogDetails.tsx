@@ -12,6 +12,7 @@ import { Loading } from "../ui/DataTable";
 import { ChargeCheck } from "../tabs/billing/Charges";
 import { RequestTimingDetails } from "./RequestTimingDetails";
 import { UsageIoAuditDetails } from "./UsageIoAuditDetails";
+import { ESTIMATED_THROUGHPUT_NOTE, formatThroughput } from "./UsagePerformance";
 import { Card, CardHeader, PageHeader } from "./page";
 import "./CallLogDetails.css";
 
@@ -122,8 +123,9 @@ export function CallLogDetails({ eventId, backHref }: { eventId: string; backHre
             ["上游尝试耗时", formatDuration(numberValue(event?.upstream_latency_ms ?? charge?.attempt_duration_ms))],
             ["客户端总耗时", formatDuration(numberValue(event?.downstream_latency_ms))],
             ["上游首帧延迟", formatDuration(numberValue(event?.upstream_ttft_ms))],
-            ["生成吞吐（Token/s）", charge?.throughput_tps],
+            ["生成吞吐（Token/s）", formatThroughput(charge)],
           ]} />
+          {charge?.usage_estimated === true && <p className="hint">{ESTIMATED_THROUGHPUT_NOTE}</p>}
           <RequestTimingDetails data={event ? event.request_timing : charge?.request_timing} />
         </Card>
         <Card aria-label="用量与计费">
