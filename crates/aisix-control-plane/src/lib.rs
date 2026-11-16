@@ -10,6 +10,7 @@ extern crate self as aisix_control_plane;
 
 use std::future::Future;
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use tokio::sync::{watch, Semaphore};
@@ -107,6 +108,8 @@ pub struct AppState {
     pub model_probes: Arc<Semaphore>,
     /// Where the price library is fetched from ([`pricing::library`]).
     pub library: Arc<pricing::library::Source>,
+    /// 首轮密钥追平与已知资源投影完成后保持就绪，后续配置更新不扰动探针。
+    pub ready: Arc<AtomicBool>,
 }
 
 /// A booted control plane. Dropping it stops everything it runs.
@@ -282,20 +285,7 @@ where
     // A tenant left behind does not stop the boot: housekeeping tries every
     // tick.
     housekeeping::replace_generated_grants(&db, &write_ctx).await;
-    // Keys an older release wrote. A tenant left behind, whatever the reason,
-    // is tried again by every housekeeping tick, so it does not stop the
-    // boot: refusing to start would only stop the control plane serving
-    // everything else.
-    let caught_up = keys::catch_up(&db, &write_ctx, keys::KEY_DOC_VERSION)
-        .await
-        .map_err(|e| BootError::KeyDocuments(format!("{}: {}", e.code, e.message)))?;
-    if !caught_up.failed.is_empty() {
-        tracing::error!(
-            tenants = ?caught_up.failed,
-            "the key documents of these tenants could not be rewritten at boot (each \
-             reason is logged above); housekeeping tries them again every tick"
-        );
-    }
+    // 旧密钥由监听启动后的首轮 housekeeping 追平；阻塞的租户不能挡住健康检查。
     let passwords = PasswordGate::new(ARGON2_GATE_PERMITS)?;
     let creds = CredentialCache::load(&db.dedicated(CREDENTIALS_POOL_SIZE)).await?;
     let dp_tls = match dp::listener::server_tls(&pki, &cfg.dp_hosts, true) {
@@ -366,6 +356,7 @@ where
         upstream_models: Arc::new(upstream_models::Cache::default()),
         model_probes: Arc::new(Semaphore::new(model_probes::MAX_IN_FLIGHT)),
         library: Arc::new(library),
+        ready: Arc::new(AtomicBool::new(false)),
     };
 
     // Nothing fails from here on, so nothing spawned below is left behind

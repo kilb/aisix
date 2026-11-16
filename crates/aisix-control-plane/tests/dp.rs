@@ -687,6 +687,7 @@ async fn neither_listener_serves_the_others_paths() {
     let gw = cp.dp_client(&bundle);
     for (method, path) in [
         ("GET", "/healthz"),
+        ("GET", "/readyz"),
         ("GET", "/admin/session"),
         ("POST", "/admin/login"),
         ("GET", "/admin/gateways/instances"),

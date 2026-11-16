@@ -194,6 +194,160 @@ async fn all_projected(db: &Db) {
     .await;
 }
 
+#[tokio::test]
+async fn future_kinds_do_not_block_known_rows_across_batches() {
+    let Some(endpoint) = support::kine_endpoint() else {
+        return;
+    };
+    let Some(bare) = BareDatabase::new().await else {
+        return;
+    };
+    let (db, env) = (&bare.db, &bare.env);
+    let first = create_key(db, env, "before-future").await;
+    // 超过一个投影批次，且不允许把未知行伪记为已投影。
+    for _ in 0..70 {
+        sqlx::query("INSERT INTO gw_resources (kind, id, doc) VALUES ('future_kind', $1, $2)")
+            .bind(Uuid::new_v4())
+            .bind(json!({"future": "opaque"}))
+            .execute(db.pool())
+            .await
+            .expect("insert a newer control plane's row");
+    }
+    let last = create_key(db, env, "after-future").await;
+    let kine = KineClient::connect(&endpoint)
+        .await
+        .expect("connect to kine");
+    assert_eq!(
+        projector::project_once(db, &kine, &ctx(env))
+            .await
+            .expect("skip unknown kinds"),
+        2
+    );
+    let raw = raw_kine(&endpoint).await;
+    for id in [first, last] {
+        assert!(row_state(db, Kind::ProviderKeys, id).await.projected());
+        assert!(raw_get(&raw, &key_for(env, Kind::ProviderKeys, id))
+            .await
+            .is_some());
+    }
+    assert_eq!(dirty_rows(db).await, 70);
+    assert_eq!(raw_keys(&raw, &env.env_prefix()).await.len(), 2);
+    assert_eq!(
+        projector::project_once(db, &kine, &ctx(env))
+            .await
+            .expect("repeat pass"),
+        0
+    );
+}
+
+#[tokio::test]
+async fn reconcile_preserves_future_kind_keys_including_tombstones_and_unseen_rows() {
+    let Some(endpoint) = support::kine_endpoint() else {
+        return;
+    };
+    let Some(bare) = BareDatabase::new().await else {
+        return;
+    };
+    let (db, env) = (&bare.db, &bare.env);
+    let known = create_key(db, env, "known-live").await;
+    let kine = KineClient::connect(&endpoint)
+        .await
+        .expect("connect to kine");
+    projector::project_once(db, &kine, &ctx(env))
+        .await
+        .expect("project known row");
+    let raw = raw_kine(&endpoint).await;
+    let mut future = Vec::new();
+    for (deleted, projected) in [(false, false), (false, true), (true, false), (true, true)] {
+        let id = Uuid::new_v4();
+        sqlx::query("INSERT INTO gw_resources (kind, id, doc, deleted, projected_version) VALUES ('future_kind', $1, '{}', $2, $3)")
+            .bind(id)
+            .bind(deleted)
+            .bind(projected.then_some(1i64))
+            .execute(db.pool())
+            .await
+            .expect("insert a future row");
+        future.push(format!("{}future_kind/{id}", env.env_prefix()));
+    }
+    // 新副本可能已写 kine，但旧副本尚未在本次数据库快照读到该行。
+    future.push(format!(
+        "{}another_future_kind/{}",
+        env.env_prefix(),
+        Uuid::new_v4()
+    ));
+    for key in &future {
+        raw_put(&raw, key, b"opaque future bytes").await;
+    }
+    let before: Vec<_> =
+        futures::future::join_all(future.iter().map(|key| raw_get(&raw, key))).await;
+    assert!(
+        before.iter().all(Option::is_some),
+        "future keys must exist before reconcile"
+    );
+    for allow_deletes in [false, true] {
+        let stray = format!("{}models/{}", env.env_prefix(), Uuid::new_v4());
+        raw_put(&raw, &stray, b"{}").await;
+        let report = projector::reconcile(db, &kine, &ctx(env), allow_deletes)
+            .await
+            .expect("reconcile a mixed-version table");
+        let after: Vec<_> =
+            futures::future::join_all(future.iter().map(|key| raw_get(&raw, key))).await;
+        assert_eq!(
+            after, before,
+            "future values and their revisions must stay untouched"
+        );
+        assert_eq!(report.deleted_strays, 1, "known stray is still removed");
+        assert_eq!(report.marked_dirty, 0);
+        assert_eq!(raw_get(&raw, &stray).await, None);
+        assert!(raw_get(&raw, &key_for(env, Kind::ProviderKeys, known))
+            .await
+            .is_some());
+    }
+    let rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM gw_resources WHERE kind = 'future_kind'")
+            .fetch_one(db.pool())
+            .await
+            .expect("count preserved future rows");
+    assert_eq!(rows, 4);
+}
+
+#[tokio::test]
+async fn an_older_control_plane_never_prunes_future_kind_tombstones() {
+    let Some(endpoint) = support::kine_endpoint() else {
+        return;
+    };
+    let Some(bare) = BareDatabase::new().await else {
+        return;
+    };
+    let (db, env) = (&bare.db, &bare.env);
+    let known = create_key(db, env, "known-tombstone").await;
+    write_all(db, env, vec![(Kind::ProviderKeys, known, Op::Delete)]).await;
+    let kine = KineClient::connect(&endpoint)
+        .await
+        .expect("connect to kine");
+    projector::project_once(db, &kine, &ctx(env))
+        .await
+        .expect("project known delete");
+    let future = Uuid::new_v4();
+    sqlx::query("INSERT INTO gw_resources (kind, id, doc, deleted, projected_version) VALUES ('future_kind', $1, '{}', true, 1)")
+        .bind(future).execute(db.pool()).await.expect("future tombstone");
+    sqlx::query("UPDATE gw_resources SET updated_at = now() - interval '3 days'")
+        .execute(db.pool())
+        .await
+        .expect("age both tombstones");
+    assert_eq!(
+        housekeeping::prune_tombstones(db, Duration::from_secs(86_400))
+            .await
+            .expect("prune known tombstone"),
+        1
+    );
+    let rows: Vec<(String, Uuid)> = sqlx::query_as("SELECT kind, id FROM gw_resources")
+        .fetch_all(db.pool())
+        .await
+        .expect("remaining future row");
+    assert_eq!(rows, vec![("future_kind".to_string(), future)]);
+}
+
 // ---- kine, read and written directly -------------------------------------
 
 async fn raw_kine(endpoint: &str) -> Client {

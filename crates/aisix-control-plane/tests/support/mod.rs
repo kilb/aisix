@@ -194,7 +194,7 @@ impl Drop for TestDatabase {
     }
 }
 
-fn test_config(database_url: &str) -> CpConfig {
+pub fn test_config(database_url: &str) -> CpConfig {
     CpConfig {
         database_url: database_url.to_string(),
         master_key: MasterKey(TEST_MASTER_KEY),
@@ -232,9 +232,25 @@ async fn boot_with(
     library: &str,
 ) -> Running {
     let library = reqwest::Url::parse(library).expect("a library address");
-    aisix_control_plane::start_with_sources(cfg, std::future::pending(), catalogue, policy, library)
-        .await
-        .expect("the control plane boots")
+    let running = aisix_control_plane::start_with_sources(
+        cfg,
+        std::future::pending(),
+        catalogue,
+        policy,
+        library,
+    )
+    .await
+    .expect("the control plane boots");
+    // 普通测试仍以一次密钥追平完成为准备边界；启动并发探针测试直接调用 start。
+    let ctx = aisix_control_plane::resources::write::WriteCtx::of(&running.state);
+    aisix_control_plane::keys::catch_up(
+        &running.state.db,
+        &ctx,
+        aisix_control_plane::keys::KEY_DOC_VERSION,
+    )
+    .await
+    .expect("initial key catch-up attempt");
+    running
 }
 
 /// A running control plane on its own database.

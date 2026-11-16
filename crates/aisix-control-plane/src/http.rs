@@ -67,6 +67,7 @@ pub enum MinRole {
 /// route as each role its row does not name.
 pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
     ("GET", "/healthz", MinRole::Public),
+    ("GET", "/readyz", MinRole::Public),
     ("POST", "/admin/login", MinRole::Public),
     ("POST", "/admin/logout", MinRole::Public),
     ("GET", "/admin/session", MinRole::Public),
@@ -877,6 +878,7 @@ pub const INACTIVE_TENANT_ROUTES: &[(&str, &str)] = &[
 pub fn browser_router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .route("/admin/login", post(operators::login))
         .route("/admin/logout", post(operators::logout))
         .route("/admin/session", get(operators::session))
@@ -1348,6 +1350,36 @@ fn body_rejection(rejection: &JsonRejection) -> ApiError {
 /// database outage does not take the listener out of a load balancer.
 async fn healthz() -> Json<Value> {
     Json(json!({ "status": "ok" }))
+}
+
+// 首次成功前检查真实进度；未知种类留给较新副本，不阻塞本副本就绪。
+async fn readyz(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> Result<Json<Value>, ApiError> {
+    use std::sync::atomic::Ordering;
+
+    if !state.ready.load(Ordering::Acquire) {
+        let kinds: Vec<&str> = crate::resources::Kind::ALL
+            .into_iter()
+            .map(crate::resources::Kind::segment)
+            .collect();
+        let ready: bool = sqlx::query_scalar(
+            "SELECT NOT EXISTS (SELECT 1 FROM tenant_keys \
+               WHERE revoked_at IS NULL AND doc_version < $1) \
+             AND NOT EXISTS (SELECT 1 FROM gw_resources \
+               WHERE kind = ANY($2) AND projected_version IS DISTINCT FROM version)",
+        )
+        .bind(crate::keys::KEY_DOC_VERSION)
+        .bind(kinds)
+        .fetch_one(state.db.pool())
+        .await
+        .map_err(|_| ApiError::unavailable())?;
+        if !ready {
+            return Err(ApiError::unavailable());
+        }
+        state.ready.store(true, Ordering::Release);
+    }
+    Ok(Json(json!({ "status": "ok" })))
 }
 
 #[cfg(test)]

@@ -36,6 +36,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// (`aisix-etcd` `LOAD_PAGE_SIZE`).
 const PAGE_SIZE: i64 = 500;
 
+// 与网关配置加载相同：压缩使固定修订号失效时，最多从头重读三次。
+const COMPACTION_RESTARTS: usize = 3;
+
 /// The largest answer decoded from kine. kine merges whatever is pending
 /// into one message, so tonic's 4 MiB default is no bound at all on what a
 /// read returns; the gateway raises it the same way
@@ -271,6 +274,7 @@ impl KineWriter for KineClient {
         let mut start = prefix.as_bytes().to_vec();
         let mut revision = 0;
         let mut out = Vec::new();
+        let mut restarts = 0;
         loop {
             let mut options = GetOptions::new()
                 .with_range(range_end.clone())
@@ -278,7 +282,28 @@ impl KineWriter for KineClient {
             if revision > 0 {
                 options = options.with_revision(revision);
             }
-            let resp = Self::bounded(self.kv().get(start.clone(), Some(options))).await?;
+            // 保留具体状态到这里，避免将别的 OutOfRange 或普通故障当成压缩重试。
+            let resp =
+                tokio::time::timeout(REQUEST_TIMEOUT, self.kv().get(start.clone(), Some(options)))
+                    .await
+                    .map_err(|_| KineError::Timeout(REQUEST_TIMEOUT))?;
+            let resp = match resp {
+                Ok(resp) => resp,
+                Err(etcd_client::Error::GRpcStatus(ref status))
+                    if restarts < COMPACTION_RESTARTS
+                        && status.code() == tonic::Code::OutOfRange
+                        && status
+                            .message()
+                            .contains("required revision has been compacted") =>
+                {
+                    restarts += 1;
+                    start = prefix.as_bytes().to_vec();
+                    revision = 0;
+                    out.clear();
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            };
             if revision == 0 {
                 revision = resp.header().map_or(0, |h| h.revision());
             }

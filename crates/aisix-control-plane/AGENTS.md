@@ -454,10 +454,11 @@ statement.
   through the projector and that check. An admin action that writes kine
   (reconcile) is handed to the leader through `cp_settings` and never written
   beside it.
-- **Rows go in ascending `seq` and a pass never skips one.** `seq` is commit
+- **Known rows go in ascending `seq` and a pass never skips one.** `seq` is commit
   order because `write_resource` holds the resources lock. A pass stops at the
   first row it cannot project. That keeps "the key written last is live" meaning
   "everything before it is live", which the e2e readiness gate relies on.
+  新种类是例外：旧副本保留其脏状态并继续处理已知行；reconcile 永不删除未知命名空间。
 - **One database owns an environment's prefix.** The claim
   `<prefix>/_cp/<env_id>/owner` names it. The leader re-reads the claim on
   every pass and before each batch, and stops writing when it is not the

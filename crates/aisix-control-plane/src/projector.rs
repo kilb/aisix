@@ -454,11 +454,13 @@ async fn project_pending(
     mine: Uuid,
 ) -> Result<usize, ProjectError> {
     let mut projected = 0;
+    let mut after = i64::MIN;
     loop {
         let rows: Vec<RawDirtyRow> = sqlx::query_as(
             "SELECT kind, id, seq, version, deleted, doc, kine_mod_revision FROM gw_resources \
-             WHERE projected_version IS DISTINCT FROM version ORDER BY seq LIMIT $1",
+             WHERE projected_version IS DISTINCT FROM version AND seq > $1 ORDER BY seq LIMIT $2",
         )
+        .bind(after)
         .bind(BATCH)
         .fetch_all(&mut *conn)
         .await?;
@@ -467,6 +469,11 @@ async fn project_pending(
         }
         let full = rows.len() as i64 == BATCH;
         for row in rows {
+            after = row.2;
+            // 新副本的种类由认识它的副本处理；游标前进，但不伪记为已投影。
+            if Kind::from_segment(&row.0).is_none() {
+                continue;
+            }
             project_row(conn, kine, ctx, row).await?;
             projected += 1;
         }
@@ -696,7 +703,13 @@ async fn reconcile_on(
             continue;
         }
         match std::str::from_utf8(key) {
-            Ok(key) => strays.push((key.to_string(), kv.mod_revision)),
+            Ok(key) => {
+                // 未知命名空间可能属于较新副本，即使本次数据库快照没有该行也不能删。
+                let segment = key[prefix.len()..].split('/').next().unwrap_or("");
+                if Kind::from_segment(segment).is_some() {
+                    strays.push((key.to_string(), kv.mod_revision));
+                }
+            }
             Err(_) => unreadable += 1,
         }
     }

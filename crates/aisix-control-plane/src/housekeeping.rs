@@ -273,6 +273,8 @@ pub fn spawn(db: Db, ctx: WriteCtx, mut shutdown: watch::Receiver<bool>) -> Join
 pub async fn prune_tombstones(db: &Db, older_than: Duration) -> Result<u64, DbError> {
     let older_than = older_than.as_secs_f64();
     let models = Kind::Models.segment();
+    // 旧副本不替新种类决定 tombstone 的保留期限。
+    let kinds: Vec<&str> = Kind::ALL.into_iter().map(Kind::segment).collect();
     db.tx(move |conn| {
         async move {
             sqlx::query("SELECT pg_advisory_xact_lock($1)")
@@ -282,6 +284,7 @@ pub async fn prune_tombstones(db: &Db, older_than: Duration) -> Result<u64, DbEr
             Ok(sqlx::query(
                 "DELETE FROM gw_resources r WHERE r.deleted AND r.projected_version = r.version \
                  AND r.updated_at < now() - make_interval(secs => $1) \
+                 AND r.kind = ANY($3) \
                  AND NOT (r.kind = $2 AND r.managed_by LIKE 'public:%' \
                    AND r.managed_by <> ('public:' || r.id::text) \
                    AND (EXISTS (SELECT 1 FROM tenants t WHERE r.id = ANY(t.allowed_model_ids)) \
@@ -292,6 +295,7 @@ pub async fn prune_tombstones(db: &Db, older_than: Duration) -> Result<u64, DbEr
             )
             .bind(older_than)
             .bind(models)
+            .bind(kinds)
             .execute(&mut *conn)
             .await?
             .rows_affected())

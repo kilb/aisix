@@ -16,6 +16,265 @@ use serde_json::json;
 use support::{TempFile, TestCp};
 use uuid::Uuid;
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn health_serves_during_key_catch_up_and_ready_waits_for_known_projection() {
+    use aisix_control_plane::auth::OperatorRole;
+    use aisix_control_plane::keys::KEY_DOC_VERSION;
+    use aisix_control_plane::projector::{key_for, PROJECTOR_LOCK_KEY};
+    use aisix_control_plane::resources::Kind;
+    use aisix_control_plane::tenants::TenantStatus;
+    use sqlx::Connection;
+
+    let Some(endpoint) = support::kine_endpoint() else {
+        return;
+    };
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let tenant = cp.seed_tenant(TenantStatus::Active).await;
+    let key = support::world::seed_key(&cp, &admin, tenant, None).await;
+    let key_id = Uuid::parse_str(&key).expect("key id");
+    let mut holder = sqlx::PgConnection::connect(cp.database_url())
+        .await
+        .expect("lock connection");
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(PROJECTOR_LOCK_KEY)
+        .execute(&mut holder)
+        .await
+        .expect("hold projector");
+    sqlx::query("BEGIN")
+        .execute(&mut holder)
+        .await
+        .expect("begin tenant lock");
+    sqlx::query("SELECT id FROM tenants WHERE id = $1 FOR UPDATE")
+        .bind(tenant)
+        .execute(&mut holder)
+        .await
+        .expect("hold catch-up tenant");
+    sqlx::query("UPDATE tenant_keys SET doc_version = 0 WHERE id = $1")
+        .bind(key_id)
+        .execute(cp.db().pool())
+        .await
+        .expect("mark old document");
+    sqlx::query("INSERT INTO gw_resources (kind, id, doc) VALUES ('future_kind', $1, '{}')")
+        .bind(Uuid::new_v4())
+        .execute(cp.db().pool())
+        .await
+        .expect("future row");
+
+    let mut cfg = support::test_config(cp.database_url());
+    cfg.kine_endpoint = endpoint.clone();
+    let running = tokio::time::timeout(
+        Duration::from_secs(2),
+        aisix_control_plane::start(cfg, std::future::pending()),
+    )
+    .await
+    .expect("HTTP boot must not wait for a locked catch-up tenant")
+    .expect("start another replica");
+    let url = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("HTTP client");
+    let health = client
+        .get(format!("{url}/healthz"))
+        .send()
+        .await
+        .expect("health request");
+    assert_eq!(health.status(), 200);
+    assert_eq!(
+        health
+            .json::<serde_json::Value>()
+            .await
+            .expect("health JSON"),
+        json!({"status":"ok"})
+    );
+    let ready = client
+        .get(format!("{url}/readyz"))
+        .send()
+        .await
+        .expect("readiness request");
+    assert_eq!(ready.status(), 503, "locked key rewrite must not be ready");
+    sqlx::query("COMMIT")
+        .execute(&mut holder)
+        .await
+        .expect("release tenant");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let version: i32 = sqlx::query_scalar("SELECT doc_version FROM tenant_keys WHERE id = $1")
+            .bind(key_id)
+            .fetch_one(cp.db().pool())
+            .await
+            .expect("read document version");
+        if version == KEY_DOC_VERSION {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "background catch-up did not finish"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        client
+            .get(format!("{url}/readyz"))
+            .send()
+            .await
+            .expect("pending projection")
+            .status(),
+        503
+    );
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(PROJECTOR_LOCK_KEY)
+        .execute(&mut holder)
+        .await
+        .expect("release projector");
+    loop {
+        let ready = client
+            .get(format!("{url}/readyz"))
+            .send()
+            .await
+            .expect("read readiness");
+        if ready.status() == 200 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "known resources were never ready"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut kine = etcd_client::Client::connect([endpoint], None)
+        .await
+        .expect("read real kine");
+    assert_eq!(
+        kine.get(key_for(cp.env(), Kind::ApiKeys, key_id), None)
+            .await
+            .expect("projected key")
+            .kvs()
+            .len(),
+        1
+    );
+    let unknown_dirty: i64 = sqlx::query_scalar("SELECT count(*) FROM gw_resources WHERE kind = 'future_kind' AND projected_version IS NULL")
+        .fetch_one(cp.db().pool()).await.expect("future row is untouched");
+    assert_eq!(unknown_dirty, 1);
+    // 就绪是启动门；后续配置写入不把已服务的实例反复移出负载均衡。
+    sqlx::query("UPDATE tenant_keys SET doc_version = 0 WHERE id = $1")
+        .bind(key_id)
+        .execute(cp.db().pool())
+        .await
+        .expect("a later old-replica write");
+    assert_eq!(
+        client
+            .get(format!("{url}/readyz"))
+            .send()
+            .await
+            .expect("sticky readiness")
+            .status(),
+        200
+    );
+}
+
+#[tokio::test]
+async fn a_failed_initial_key_rewrite_stays_unready_until_a_later_retry_projects_it() {
+    use aisix_control_plane::auth::OperatorRole;
+    use aisix_control_plane::resources::write::WriteCtx;
+    use aisix_control_plane::tenants::TenantStatus;
+
+    let Some(endpoint) = support::kine_endpoint() else {
+        return;
+    };
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let tenant = cp.seed_tenant(TenantStatus::Active).await;
+    let key = support::world::seed_key(&cp, &admin, tenant, None).await;
+    let key_id = Uuid::parse_str(&key).expect("key id");
+    sqlx::query("UPDATE tenants SET allowed_model_ids = ARRAY[$2::uuid] WHERE id = $1")
+        .bind(tenant)
+        .bind(Uuid::new_v4())
+        .execute(cp.db().pool())
+        .await
+        .expect("missing model reference");
+    sqlx::query("UPDATE tenant_keys SET doc_version = 0 WHERE id = $1")
+        .bind(key_id)
+        .execute(cp.db().pool())
+        .await
+        .expect("old document");
+    let mut cfg = support::test_config(cp.database_url());
+    cfg.kine_endpoint = endpoint;
+    let running = aisix_control_plane::start(cfg, std::future::pending())
+        .await
+        .expect("serve diagnostics despite failed rewrite");
+    let ctx = WriteCtx::of(&running.state);
+    aisix_control_plane::housekeeping::tick(&running.state.db, &ctx).await;
+    let version: i32 = sqlx::query_scalar("SELECT doc_version FROM tenant_keys WHERE id = $1")
+        .bind(key_id)
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("failed version unchanged");
+    assert_eq!(version, 0);
+    // 先排除未投影行这个独立条件，503 必须由失败的旧密钥文档本身决定。
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM gw_resources WHERE projected_version IS DISTINCT FROM version",
+        )
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("known projection progress");
+        if pending == 0 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "known rows did not project");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let url = format!("http://{}/readyz", running.http_addr);
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("HTTP client");
+    let pending = client
+        .get(&url)
+        .send()
+        .await
+        .expect("readiness after failed rewrite");
+    assert_eq!(pending.status(), 503);
+    let body = pending
+        .json::<serde_json::Value>()
+        .await
+        .expect("neutral diagnostic");
+    assert_eq!(body["code"], "unavailable");
+    assert!(
+        body.get("details").is_none(),
+        "diagnostic must not disclose database or tenant details"
+    );
+    sqlx::query("UPDATE tenants SET allowed_model_ids = '{}' WHERE id = $1")
+        .bind(tenant)
+        .execute(cp.db().pool())
+        .await
+        .expect("repair missing reference");
+    aisix_control_plane::housekeeping::tick(&running.state.db, &ctx).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if client
+            .get(&url)
+            .send()
+            .await
+            .expect("retry readiness")
+            .status()
+            == 200
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "repaired key never became ready");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 #[tokio::test]
 async fn the_first_boot_mints_an_env_id_and_later_boots_keep_it() {
     let Some(cp) = TestCp::start().await else {
@@ -861,6 +1120,7 @@ fn only_the_resources_module_writes_gw_resources() {
                                         "r.deleted"
                                             | "r.projected_version = r.version"
                                             | "r.updated_at < now() - make_interval(secs => $1)"
+                                            | "r.kind = any($3)"
                                     )
                                 })
                             })
