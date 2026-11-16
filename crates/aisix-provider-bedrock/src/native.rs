@@ -498,6 +498,11 @@ mod compat_claude_native_tests {
         endpoint: String,
     }
 
+    #[cfg(test)]
+    fn credential_http_client() -> aws_smithy_runtime_api::client::http::SharedHttpClient {
+        aisix_gateway::upstream_tls::build_aws_http_client()
+    }
+
     impl aws_smithy_runtime_api::client::http::HttpConnector for LocalCredentialConnector {
         fn call(
             &self,
@@ -555,7 +560,7 @@ mod compat_claude_native_tests {
             .mount(&sts)
             .await;
         let endpoint = sts.uri();
-        let credentials_http = aisix_gateway::upstream_tls::build_aws_http_client();
+        let credentials_http = credential_http_client();
         let credentials_http = http_client_fn(move |settings, components| {
             SharedHttpConnector::new(LocalCredentialConnector {
                 inner: credentials_http.http_connector(settings, components),
