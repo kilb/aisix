@@ -17,3 +17,8 @@ test("调用记录组合筛选保留 false 与精确时间，拒绝额外权限�
   const values = { from: "2026-11-11T16:00:00.000Z", to: "2026-11-12T16:00:00.000Z", member_id: "member-a", provider_key_id: "account-b", request_id: "request-c", outcome: "failed", http_status: "503", error_class: "upstream_status", cache_hit: "false", service_tier: "fast", operation: "responses", final_attempt: "false" };
   assert.deepEqual(chargesQuery(new URLSearchParams({ ...values, role: "admin", limit: "10000", before: "99" })), values);
 });
+
+test("计价状态链接保留空档位、空模型和固定计价窗口，不丢分组及排除更正条件", () => {
+  const values = { status: "unpriced", error_code: "missing_tier_price", model_id: "", pricing_tier: "", group_id: "", priced_since: "2026-11-09T10:00:00Z", priced_before: "2026-11-10T10:00:00Z", exclude_corrected: "true" };
+  assert.deepEqual(chargesQuery(new URLSearchParams(values)), values);
+});

@@ -245,6 +245,13 @@ pub struct ChargesQuery {
     model_id: Option<String>,
     /// The charge's `error_code`; `unknown` matches a charge stored with none.
     error_code: Option<String>,
+    /// 空串明确匹配没有记录分组的行；不传则不限分组。
+    group_id: Option<String>,
+    /// 状态页的档位表达式；空串明确匹配未报告档位。
+    pricing_tier: Option<String>,
+    priced_since: Option<DateTime<Utc>>,
+    priced_before: Option<DateTime<Utc>>,
+    exclude_corrected: Option<bool>,
     from: Option<DateTime<Utc>>,
     to: Option<DateTime<Utc>>,
     member_id: Option<String>,
@@ -496,6 +503,9 @@ fn model_ids<'a>(raw: impl Iterator<Item = &'a str>) -> Vec<Uuid> {
 /// charge stored without one), newest first by `seq`, paged as
 /// [`crate::usage::list_events`] is. A charge's tenant and member are the
 /// ones its key belongs to, never what its usage row claims.
+/// `priced_since` / `priced_before` 按计价时刻取半开窗口，与发生时间独立；
+/// `group_id`、`pricing_tier` 保留状态页的分组方式（空串是未记录值），
+/// `exclude_corrected=true` 排除已有重计价更正的行。
 ///
 /// Each charge carries `cost_micro_cny`, what its row cost the platform at
 /// the serving account's cost rate: `null` when the cost is unknown, never
@@ -530,6 +540,17 @@ pub async fn list_charges(
     if let (Some(from), Some(to)) = (q.from, q.to) {
         crate::billing::range::checked_range(from, to, None)?;
     }
+    if let (Some(since), Some(before)) = (q.priced_since, q.priced_before) {
+        if before <= since {
+            return Err(refused("/priced_before", "计价结束时间必须晚于开始时间"));
+        }
+    }
+    let group_id = q
+        .group_id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .map(|id| Uuid::parse_str(id).map_err(|_| refused("/group_id", "标识不合法")))
+        .transpose()?;
     let member_id = q
         .member_id
         .as_deref()
@@ -587,6 +608,31 @@ pub async fn list_charges(
     if let Some(model_id) = q.model_id {
         sql.push(" AND pc.requested_model_id = ")
             .push_bind(model_id);
+    }
+    if q.group_id.is_some() {
+        match group_id {
+            Some(id) => {
+                sql.push(" AND pc.group_id = ").push_bind(id);
+            }
+            None => {
+                sql.push(" AND pc.group_id IS NULL");
+            }
+        }
+    }
+    if let Some(tier) = q.pricing_tier {
+        sql.push(" AND (")
+            .push(store::PRICING_TIER)
+            .push(") = ")
+            .push_bind(tier);
+    }
+    if let Some(since) = q.priced_since {
+        sql.push(" AND pc.priced_at >= ").push_bind(since);
+    }
+    if let Some(before) = q.priced_before {
+        sql.push(" AND pc.priced_at < ").push_bind(before);
+    }
+    if q.exclude_corrected == Some(true) {
+        sql.push(" AND NOT ").push(store::CORRECTED);
     }
     match q.error_code.as_deref() {
         None => {}
@@ -714,16 +760,21 @@ fn counted(by_code: Vec<(String, i64)>) -> Value {
 /// (`truncated` when there were more; `unpriced_last_24h.by_code` still
 /// counts every reason in full). `pricing_version` is null when the stored
 /// version is missing or malformed.
+/// `window: {since, until}` 给出本次状态计数使用的计价时间半开窗口。
 pub async fn status(
     auth: OperatorAuth,
     State(state): State<AppState>,
 ) -> Result<Json<Value>, ApiError> {
     auth.require(OperatorRole::Viewer)?;
     let prices = state.prices.clone();
-    let (version, invalid, by_code, corrected, details, truncated) = state
+    let (until, version, invalid, by_code, corrected, details, truncated) = state
         .db
         .tx(move |conn| {
             async move {
+                // now() 在事务中固定，与状态计数及明细使用同一计价窗口。
+                let until: DateTime<Utc> = sqlx::query_scalar("SELECT now()")
+                    .fetch_one(&mut *conn)
+                    .await?;
                 let version = store::pricing_version(&mut *conn).await?;
                 let book = prices.current(&mut *conn).await?;
                 let invalid: Vec<Value> = book
@@ -782,12 +833,15 @@ pub async fn status(
                         })
                     })
                     .collect();
-                Ok::<_, DbError>((version, invalid, by_code, corrected, details, truncated))
+                Ok::<_, DbError>((
+                    until, version, invalid, by_code, corrected, details, truncated,
+                ))
             }
             .boxed()
         })
         .await?;
     Ok(Json(json!({
+        "window": {"since": until - chrono::TimeDelta::hours(24), "until": until},
         "pricing_version": version,
         "invalid_revisions": invalid,
         "unpriced_last_24h": counted(by_code),

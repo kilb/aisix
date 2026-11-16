@@ -118,8 +118,9 @@ test("每种未计价写明模型和处理办法，可直接打开对应的计�
   await row.getByRole("button", { name: "查看调用" }).click();
   await expect(page.getByRole("heading", { name: "计费明细" })).toBeVisible();
   await expect(page.getByRole("status").filter({ hasText: "只看" })).toContainText(`原因：未定价，模型：${model.name}`);
-  // The list cannot narrow to the row's window or leave corrected calls out, and says so.
-  await expect(page.getByRole("status").filter({ hasText: "只看" })).toContainText("不限分组/档位与时间");
+  // 状态链接保留本次计价窗口，并排除已经更正的调用。
+  await expect(page.getByRole("status").filter({ hasText: "只看" })).toContainText("计价时间");
+  await expect(page.getByRole("status").filter({ hasText: "只看" })).toContainText("排除已更正");
   const charges = page.getByRole("table", { name: "计费明细" });
   await expect(charges.getByRole("row")).toHaveCount(3);
   for (const r of await charges.getByRole("row").all()) {
@@ -149,7 +150,7 @@ test("每种未计价写明模型和处理办法，可直接打开对应的计�
   await stack.admin.post(`/admin/billing/repricing/${run.id}/apply`, {});
 
   await page.getByRole("button", { name: "刷新" }).click();
-  await expect(charges.getByRole("row").nth(1).getByRole("cell").nth(4)).toHaveText("未定价 · 已通过重计价更正");
+  await expect(page.getByText("没有符合条件的计费记录。", { exact: true })).toBeVisible();
   // 计费明细 is under 计费 (owner, 2026-11-11), so 计价状态 is a tab away.
   await page.getByRole("tab", { name: "价格", exact: true }).click();
   await page.getByRole("button", { name: "计价状态" }).click();

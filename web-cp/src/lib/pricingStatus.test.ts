@@ -114,6 +114,18 @@ test("a kind's link opens 计费明细 on its unpriced calls of that reason and 
   assert.equal(takeChargesFilter(), null);
 });
 
+test("状态详情链接保留固定计价窗口、分组和未报告档位，排除已更正", () => {
+  const window = { since: "2026-11-09T10:00:00Z", until: "2026-11-10T10:00:00Z" };
+  const scoped = { ...status, window };
+  const v = statusView(scoped);
+  const base = { status: "unpriced", exclude_corrected: "true", priced_since: window.since, priced_before: window.until };
+  assert.deepEqual(v.details[0]!.filter, { ...base, error_code: "missing_tier_price", model_id: "m-sol", pricing_tier: "auto" });
+  assert.deepEqual(v.details[1]!.filter, { ...base, error_code: "missing_rate", model_id: "m-old", group_id: "g1" });
+  assert.deepEqual(v.details[2]!.filter, { ...base, error_code: "unknown_model", model_id: "" });
+  const missing = statusView({ ...scoped, unpriced_details: { truncated: false, items: [{ ...status.unpriced_details.items[0]!, service_tier: "" }] } });
+  assert.deepEqual(missing.details[0]!.filter, { ...base, error_code: "missing_tier_price", model_id: "m-sol", pricing_tier: "" });
+});
+
 test("every reason says what to do; a tier the upstream did not report is said so", () => {
   for (const code of Object.keys({ missing_price: 1, missing_rate: 1, no_group: 1, invalid_price: 1, missing_dimension_price: 1, unknown_api_key: 1 })) {
     assert.notEqual(remedy({ code, service_tier: null, group: null }), "未记录原因", code);

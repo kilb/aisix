@@ -132,6 +132,9 @@ export function Charges(_props: TabProps) {
   const linked = [
     filter.error_code ? `原因：${reasonLabel(filter.error_code)}` : null,
     filter.model_id ? `模型：${rows?.find((c) => c.requested_model_id === filter.model_id)?.model_name ?? filter.model_id}` : null,
+    filter.model_id === "" ? "模型：未记录" : null,
+    filter.group_id !== undefined ? `分组：${filter.group_id || "未记录"}` : null,
+    filter.pricing_tier !== undefined ? `档位：${filter.pricing_tier || "未报告"}` : null,
   ].filter((x): x is string => x !== null);
 
   return (
@@ -180,8 +183,8 @@ export function Charges(_props: TabProps) {
         {(filter.from || filter.to || filter.member_id || filter.provider_key_id || filter.request_id || filter.exclude_status) && <p className="charge-scope-summary" role="status">当前已应用范围条件：{[filter.exclude_status === "nothing_to_bill" ? "隐藏无需计费" : null, filter.from ? "开始 " + fmtBeijing(filter.from) : null, filter.to ? "结束 " + fmtBeijing(filter.to) + "（不含）" : null, filter.member_id ? "成员 " + filter.member_id : null, filter.provider_key_id ? "上游账号 " + filter.provider_key_id : null, filter.request_id ? "请求 " + filter.request_id : null].filter(Boolean).join("；")}</p>}
         {linked.length > 0 && (
           <div className="charge-linked-scope" role="status">
-            <span className="hint">只看 {linked.join("，")}（按上述筛选查询，也含已通过重计价更正的调用，条数可能与计价状态的次数不同）</span>
-            <Button type="button" size="sm" className="ml-auto" onClick={() => set({ error_code: undefined, model_id: undefined })}>
+            <span className="hint">只看 {linked.join("，")}{filter.priced_since && filter.priced_before ? `（计价时间 ${fmtBeijing(filter.priced_since)} 至 ${fmtBeijing(filter.priced_before)}，结束时间不含在内${filter.exclude_corrected === "true" ? "；排除已更正，后续状态变化会改变结果" : ""}）` : "（按上述筛选查询，也含已通过重计价更正的调用）"}</span>
+            <Button type="button" size="sm" className="ml-auto" onClick={() => set({ error_code: undefined, model_id: undefined, group_id: undefined, pricing_tier: undefined, priced_since: undefined, priced_before: undefined, exclude_corrected: undefined })}>
               清除
             </Button>
           </div>

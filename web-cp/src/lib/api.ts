@@ -1086,6 +1086,13 @@ export interface Charge extends UsageAuditData {
 }
 
 export interface ChargeFilter extends UsageRecordApiFilters {
+  /** 状态页按计价时刻筛选；与调用发生时间 from/to 独立。 */
+  priced_since?: string;
+  priced_before?: string;
+  /** 空串明确匹配未记录分组或未报告档位，不表示全部。 */
+  group_id?: string;
+  pricing_tier?: string;
+  exclude_corrected?: string;
   from?: string;
   to?: string;
   member_id?: string;
@@ -1109,7 +1116,7 @@ export interface ChargeFilter extends UsageRecordApiFilters {
 export const charges = {
   async list(f: ChargeFilter = {}): Promise<{ items: Charge[]; next_before: number | null }> {
     const q = new URLSearchParams();
-    for (const [k, v] of Object.entries(f)) if (v !== undefined && v !== "") q.set(k, String(v));
+    for (const [k, v] of Object.entries(f)) if (v !== undefined && (v !== "" || ["model_id", "group_id", "pricing_tier"].includes(k))) q.set(k, String(v));
     const qs = q.toString();
     return (await call<{ items: Charge[]; next_before: number | null }>("GET", `/admin/pricing/charges${qs ? `?${qs}` : ""}`)).data;
   },
@@ -1158,6 +1165,8 @@ export interface UnpricedDetail {
 
 /** The pricing health: version, unusable revisions and the last 24 hours' unpriced charges by code. */
 export interface PricingStatus {
+  /** 新控制面返回本次计数的计价时间半开窗口；旧版本可能没有。 */
+  window?: { since: string; until: string };
   pricing_version: number | null;
   invalid_revisions: InvalidRevision[];
   /** Charges still unpriced; those a re-pricing run corrected are in `corrected_last_24h`. */

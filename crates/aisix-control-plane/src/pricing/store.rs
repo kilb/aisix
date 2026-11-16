@@ -209,13 +209,18 @@ pub async fn pricing_version(conn: &mut PgConnection) -> Result<Option<i64>, DbE
 /// The charges stored unpriced in the last 24 hours, by when they were
 /// priced, over the charge `pc`.
 const UNPRICED_LAST_DAY: &str =
-    "pc.status = 'unpriced' AND pc.priced_at >= now() - interval '24 hours'";
+    "pc.status = 'unpriced' AND pc.priced_at >= now() - interval '24 hours' AND pc.priced_at < now()";
+
+// 状态分组与明细筛选共用同一档位：批量优先，未报告保留为空串。
+pub(super) const PRICING_TIER: &str =
+    "CASE WHEN ue.event->'is_batch' = 'true'::jsonb THEN 'batch' \
+     ELSE COALESCE(ue.event->>'service_tier', '') END";
 
 /// Whether an applied re-pricing run has corrected the charge `pc`: it has
 /// an adjustment, which only an apply writes, and for a charge stored
 /// unpriced only when the run charged it. The charge itself still reads
 /// `unpriced`: it is written once.
-const CORRECTED: &str =
+pub(super) const CORRECTED: &str =
     "EXISTS (SELECT 1 FROM pricing_adjustments_cny pa WHERE pa.event_id = pc.event_id)";
 
 /// The charges stored unpriced in the last 24 hours (by when they were
@@ -285,9 +290,7 @@ pub async fn unpriced_details(
 ) -> Result<(Vec<UnpricedDetail>, bool), DbError> {
     let mut rows: Vec<UnpricedDetail> = sqlx::query_as(&format!(
         "SELECT COALESCE(pc.error_code, 'unknown') AS code, pc.requested_model_id, \
-           CASE WHEN pc.error_code = 'missing_tier_price' THEN \
-             CASE WHEN ue.event->'is_batch' = 'true'::jsonb THEN 'batch' \
-                  ELSE COALESCE(ue.event->>'service_tier', '') END END AS service_tier, \
+           CASE WHEN pc.error_code = 'missing_tier_price' THEN {PRICING_TIER} END AS service_tier, \
            CASE WHEN pc.error_code = 'missing_rate' THEN pc.group_id END AS group_id, \
            count(*)::bigint AS count, max(pc.occurred_at) AS latest_at, \
            max(NULLIF(ue.event->>'requested_model', '')) AS sent_model \

@@ -1,0 +1,4 @@
+{
+  "extends": "./tsconfig.json",
+  "include": ["e2e-real/pricing-status-drilldown.spec.ts", "playwright.pricing-drilldown-real.config.ts"]
+}

@@ -133,7 +133,7 @@ export function PricingStatus({ onGoto }: TabProps) {
                             onGoto("billing", "charges");
                           }}
                         >
-                          查看调用
+                          {d.kind === "detail" ? "查看调用" : "查看该原因全部调用"}
                         </Button>
                       </td>
                     </tr>

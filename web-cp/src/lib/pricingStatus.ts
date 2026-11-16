@@ -74,8 +74,14 @@ export function remedy(d: Pick<UnpricedDetail, "code" | "service_tier" | "group"
 }
 
 /** The 计费明细 filter that lists one kind's calls. */
-export function chargesFilterFor(d: Pick<UnpricedDetail, "code" | "model">): ChargeFilter {
-  return { status: "unpriced", error_code: d.code, ...(d.model.id ? { model_id: d.model.id } : {}) };
+export function chargesFilterFor(d: Pick<UnpricedDetail, "code" | "model"> & Partial<Pick<UnpricedDetail, "service_tier" | "group">>, window?: PricingStatus["window"]): ChargeFilter {
+  if (!window) return { status: "unpriced", error_code: d.code, ...(d.model.id ? { model_id: d.model.id } : {}) };
+  return {
+    status: "unpriced", error_code: d.code, model_id: d.model.id ?? "",
+    priced_since: window.since, priced_before: window.until, exclude_corrected: "true",
+    ...(d.code === "missing_tier_price" ? { pricing_tier: d.service_tier ?? "" } : {}),
+    ...(d.code === "missing_rate" ? { group_id: d.group?.id ?? "" } : {}),
+  };
 }
 
 /** A model as a status or charge row shows it: its name, marked when it is deleted; "—" for none. */
@@ -136,7 +142,7 @@ export function statusView(s: PricingStatus) {
             : "—",
       latestAt: d.latest_at,
       remedy: remedy(d),
-      filter: chargesFilterFor(d),
+      filter: chargesFilterFor(d, s.window),
     })),
     unlisted: unlistedByCode(s.unpriced_last_24h.by_code, s.unpriced_details?.items ?? [], s.unpriced_details?.truncated ?? false).map(
       (r) => ({
@@ -144,7 +150,7 @@ export function statusView(s: PricingStatus) {
         code: r.code,
         label: reasonLabel(r.code),
         count: r.count,
-        filter: { status: "unpriced", error_code: r.code },
+        filter: { status: "unpriced", error_code: r.code, ...(s.window ? { priced_since: s.window.since, priced_before: s.window.until, exclude_corrected: "true" } : {}) },
       }),
     ),
     detailsTruncated: s.unpriced_details?.truncated ?? false,
