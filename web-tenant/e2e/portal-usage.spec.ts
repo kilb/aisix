@@ -146,7 +146,7 @@ async function pricedModel(world: BillingWorld, name: string): Promise<string> {
 /** The names a tenant must never read, anywhere in the page or in what the API sent it. */
 const CHANNEL = ["acct-ui-7c1", "grp-ui-5d2", "upstream-mdl-ui-9f3", "upstream-", "sk-acct-", "ECONNREFUSED", "127.0.0.1"];
 
-test("调用记录逐次列出模型、密钥、状态与费用，展开后看到计费明细", async ({ page }) => {
+test("调用记录逐次列出模型、密钥、状态与费用，抽屉内看到计费明细", async ({ page }) => {
   const world = await seedBillingWorld(stack);
   expect(await chat(stack, world.key.plaintext, "chat-ui")).toBe(200);
   await logged(world.owner, 1);
@@ -161,13 +161,14 @@ test("调用记录逐次列出模型、密钥、状态与费用，展开后看�
   await expect(cells.nth(7)).toHaveText(SHARED_DISPLAY_NAME);
   await expect(cells.nth(8)).toHaveText("¥0.011");
 
-  await rows.first().getByRole("button", { name: "展开明细" }).click();
-  const detail = log.getByRole("table", { name: "计费明细" });
+  await rows.first().getByRole("button", { name: "查看调用详情", exact: true }).click();
+  const drawer = page.getByRole("dialog", { name: "调用详情", exact: true });
+  const detail = drawer.getByRole("table", { name: "计费明细" });
   await expect(detail.locator("tbody > tr")).toHaveCount(2);
   await expect(detail.getByRole("row").filter({ hasText: "输入" }).getByRole("cell")).toHaveText(["输入", "5", "¥1,000.00"]);
   await expect(detail.getByRole("row").filter({ hasText: "输出" }).getByRole("cell")).toHaveText(["输出", "3", "¥2,000.00"]);
   // No discount, so nothing says one was taken.
-  await expect(log.getByText(/组织折扣/)).toHaveCount(0);
+  await expect(drawer.getByText(/组织折扣/)).toHaveCount(0);
 });
 
 test("有组织折扣时，计费明细的单价标明为折扣前，并说明这次按组织折扣减免了多少", async ({ page }) => {
@@ -187,13 +188,14 @@ test("有组织折扣时，计费明细的单价标明为折扣前，并说明�
   // 5 input tokens at ¥1,000/M and 3 output at ¥2,000/M is ¥0.011 before
   // the discount; 10 % off leaves ¥0.0099.
   await expect(rows.first().getByRole("cell").nth(8)).toHaveText("¥0.0099");
-  await rows.first().getByRole("button", { name: "展开明细" }).click();
-  const detail = log.getByRole("table", { name: "计费明细" });
+  await rows.first().getByRole("button", { name: "查看调用详情", exact: true }).click();
+  const drawer = page.getByRole("dialog", { name: "调用详情", exact: true });
+  const detail = drawer.getByRole("table", { name: "计费明细" });
   // The unit prices are the group's, before the discount, and say so.
   await expect(detail.getByRole("columnheader")).toHaveText(["计量", "数量", "折扣前单价（元/百万）"]);
   await expect(detail.getByRole("row").filter({ hasText: "输入" }).getByRole("cell")).toHaveText(["输入", "5", "¥1,000.00"]);
   await expect(detail.getByRole("row").filter({ hasText: "输出" }).getByRole("cell")).toHaveText(["输出", "3", "¥2,000.00"]);
-  await expect(log.getByText("本次按组织折扣计费：在折扣前的价格上减免 10%。")).toBeVisible();
+  await expect(drawer.getByText("本次按组织折扣计费：在折扣前的价格上减免 10%。")).toBeVisible();
 });
 
 test("调用记录与汇总里没有任何上游渠道、账号、分组或上游模型名", async ({ page }) => {
@@ -202,8 +204,11 @@ test("调用记录与汇总里没有任何上游渠道、账号、分组或上�
   await logged(world.owner, 1);
   const { log, summary } = await openUsage(page, world.owner);
   await expect(logRows(log)).toHaveCount(1);
-  await logRows(log).first().getByRole("button", { name: "展开明细" }).click();
-  await expect(log.getByRole("table", { name: "计费明细" })).toBeVisible();
+  await logRows(log).first().getByRole("button", { name: "查看调用详情", exact: true }).click();
+  const drawer = page.getByRole("dialog", { name: "调用详情", exact: true });
+  await expect(drawer.getByRole("table", { name: "计费明细" })).toBeVisible();
+  const html = await page.content();
+  await drawer.getByRole("button", { name: "关闭调用详情", exact: true }).click();
   await expect(summary.getByRole("table", { name: "用量汇总" }).locator("tbody > tr")).toHaveCount(1);
 
   for (const region of [log, summary]) {
@@ -213,7 +218,6 @@ test("调用记录与汇总里没有任何上游渠道、账号、分组或上�
   // The group's display name is what a tenant may read; its routing name never is.
   expect(await log.innerText()).toContain(SHARED_DISPLAY_NAME);
   // The page's markup, attributes included, and the log as the API sent it.
-  const html = await page.content();
   expect(html).toContain(SHARED_DISPLAY_NAME);
   for (const channel of [...CHANNEL, "shared"]) expect(html).not.toContain(channel);
   const raw = JSON.stringify((await (await signedIn(world.owner)).get("/api/usage/calls")).items);

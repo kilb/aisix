@@ -99,12 +99,12 @@ test("真实输出后中断流式调用，安全原因与实际已产生用量�
   await login(page, stack, world.owner);
   await page.getByRole("tab", { name: "用量", exact: true }).click();
   const row = await filterCall(page, observation.requestId);
-  await row.getByRole("button", { name: "展开明细", exact: true }).click();
-  const log = page.getByRole("region", { name: "调用记录", exact: true });
-  await expect(log.getByText("客户端断开连接", { exact: true })).toBeVisible();
-  await expect(log.getByText("调用未完成，但已产生用量，按已产生用量计费", { exact: true })).toBeVisible();
-  await expect(log.getByText("费用计算", { exact: true })).toBeVisible();
-  if (call.charge.estimated) await expect(log.getByText(/估算/).first()).toBeVisible();
+  await row.getByRole("button", { name: "查看调用详情", exact: true }).click();
+  const detail = page.getByRole("dialog", { name: "调用详情", exact: true });
+  await expect(detail.getByText("客户端断开连接", { exact: true })).toBeVisible();
+  await expect(detail.getByText("调用未完成，但已产生用量，按已产生用量计费", { exact: true })).toBeVisible();
+  await expect(detail.getByText("费用计算", { exact: true })).toBeVisible();
+  if (call.charge.estimated) await expect(detail.getByText(/估算/).first()).toBeVisible();
   const balance = await world.api.get("/api/billing/balance");
   expect(BigInt(balance.calculation.usage_micro_cny)).toBe(BigInt(calculation.original_micro_cny));
 });

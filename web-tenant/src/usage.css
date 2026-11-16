@@ -64,7 +64,7 @@
 .usage-request-identity code { font-size: 11px; line-height: 17px; overflow-wrap: anywhere; }
 .usage-timing-value { display: block; font-variant-numeric: tabular-nums; white-space: normal; }
 .usage-timing-value > span { display: block; margin-bottom: 2px; color: var(--muted-foreground); font-size: 12px; line-height: 18px; }
-.usage-row-action .btn { width: 44px; padding-inline: 0; }
+.usage-row-action .btn { width: var(--h-control-sm); padding-inline: 0; }
 .usage-record-section td[data-label="状态"] .lamp { max-width: 100%; white-space: normal; }
 .tenant-call-tokens { display: grid; gap: 4px; margin: 0; font-variant-numeric: tabular-nums; }
 .tenant-call-tokens > div { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
