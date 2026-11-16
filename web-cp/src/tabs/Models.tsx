@@ -293,7 +293,7 @@ export function Models({ canEdit, onGoto }: TabProps) {
           </>
         }
       />
-      <InventorySummary
+      {!editor && <InventorySummary
         title="模型文档 · 当前配置"
         total={models.items?.length ?? null}
         totalLabel="含内部直连目标"
@@ -310,7 +310,7 @@ export function Models({ canEdit, onGoto }: TabProps) {
           <div><dt>手工创建</dt><dd>{models.items ? counts.manual : "—"}</dd></div>
           <div><dt>内部直连目标</dt><dd>{models.items ? counts.internal : "—"}</dd></div>
         </dl>
-      </InventorySummary>
+      </InventorySummary>}
       <div className="mb-6 grid gap-3 empty:hidden [&>.note]:m-0">
         <Msg note={note} />
         {deleteFailure &&

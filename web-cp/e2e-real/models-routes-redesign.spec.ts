@@ -52,10 +52,11 @@ async function navigate(page: Page, route: "models" | "public-routes"): Promise<
 async function editModel(page: Page, name: string): Promise<Locator> {
   await navigate(page, "models");
   await page.getByRole("searchbox", { name: "搜索模型", exact: true }).fill(name);
-  const row = page.getByRole("table", { name: "全部模型", exact: true }).getByRole("row").filter({ has: page.getByRole("cell", { name, exact: true }) });
+  const row = page.getByRole("table", { name: "全部模型", exact: true }).getByRole("row").filter({ has: page.getByText(name, { exact: true }) });
   await row.getByRole("button", { name: "编辑", exact: true }).click();
   const form = page.getByRole("form", { name: `编辑模型「${name}」`, exact: true });
   await expect(form).toBeVisible();
+  await expect(page.getByRole("heading", { name: "模型文档 · 当前配置", exact: true })).toHaveCount(0);
   return form;
 }
 
@@ -153,6 +154,7 @@ test("manual-direct-model-edit-uses-full-width-and-persists-every-field", async 
   expect(response.status()).toBe(200);
   expect(response.request().headers()["if-match"]).toMatch(new RegExp(`^(?:W/)?"?${model.version}"?$`));
   await expect(form).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "模型文档 · 当前配置", exact: true })).toBeVisible();
   const stored = await api(page, `/admin/resources/models/${model.id}`);
   expect(stored.doc).toMatchObject({ ...model.doc, display_name: `${name}-edited`, model_name: `${upstream}-ui-edited`, cooldown: { enabled: true, default_seconds: 45, max_seconds: 900 } });
   expect(stored.version).toBeGreaterThan(model.version);
@@ -174,7 +176,7 @@ test("public-model-route-edit-preserves-targets-settings-and-price-entry", async
   await checkLayout(page, form, "public-route-edit-1440");
   await expect(page.getByRole("heading", { name: "基准价联动", exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "重新生成", exact: true })).toBeEnabled();
-  await chooseSelect(form.getByLabel("同级分配方式", { exact: true }), { label: "同级按请求加权轮询" });
+  await chooseSelect(form.getByRole("combobox", { name: "同级分配方式", exact: true }), { label: "同级按请求加权轮询" });
   await form.getByLabel("重试次数", { exact: true }).fill("2");
   await form.getByLabel("最多切换几个目标", { exact: true }).fill("0");
   await form.getByLabel("额外重试的状态码", { exact: true }).fill("408");
@@ -212,7 +214,7 @@ test("manual-routing-model-adds-and-removes-targets-through-the-editor", async (
   await form.getByRole("button", { name: "添加目标", exact: true }).click();
   const rows = form.getByRole("group", { name: /^目标 \d+$/ });
   await expect(rows).toHaveCount(2);
-  await chooseSelect(rows.nth(1).getByLabel("目标模型", { exact: true }), second.id);
+  await chooseSelect(rows.nth(1).getByRole("combobox", { name: "目标模型", exact: true }), second.id);
   await rows.nth(1).getByLabel("权重", { exact: true }).fill("4");
   await rows.nth(1).getByLabel("优先级", { exact: true }).fill("0");
   await checkLayout(page, form, "manual-routing-edit-1440");
