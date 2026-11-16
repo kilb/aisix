@@ -1,0 +1,33 @@
+/* 页头、筛选和指标各占整行，避免指标的跨列类生成隐式页面列。 */
+.analytics-page.measurement-page { width: 100%; grid-template-columns: minmax(0, 1fr); align-items: start; }
+.analytics-page > * { grid-column: 1 / -1; width: 100%; min-width: 0; }
+.analytics-page > .page-header { justify-content: flex-start; }
+.analytics-page .analytics-filters { padding: 16px; }
+.analytics-filter-primary { display: flex; min-width: 0; align-items: flex-end; flex-wrap: wrap; gap: 12px; }
+.analytics-filters .f { min-width: 0; gap: 4px; margin: 0; }
+.analytics-filters .f > span { color: var(--fg-3); font-size: var(--text-caption); line-height: 18px; }
+.analytics-filters input { width: 100%; min-width: 0; }
+.analytics-filter-date { flex: 0 0 232px; }
+.analytics-filter-tenant { flex: 1 1 160px; }
+.analytics-filter-actions { display: flex; flex: none; align-items: center; flex-wrap: wrap; gap: 8px; }
+.analytics-filter-actions > a { white-space: nowrap; }
+.analytics-filter-extra { display: grid; min-width: 0; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--hairline); }
+.analytics-page .metric-analysis > .bento-grid { align-items: start; }
+.analytics-page .metric-analysis-aside { align-self: start; }
+.analytics-page .metric-analysis-main > p { margin-top: 0; }
+.analytics-page .metric-analysis-main > .bento-card-footer { padding-top: 8px; }
+.analytics-page .metric-analysis-main > .bento-card-footer > div { min-height: 228px; }
+.analytics-page .metric-analysis-main > .bento-card-footer > p { margin-top: 8px; }
+.analytics-page .metric-analysis-details .metric-facts { gap: 12px 24px; }
+.analytics-page .metric-facts dd { margin-top: 4px; }
+@media (max-width: 1279px) {
+  .analytics-page .metric-analysis-main,
+  .analytics-page .metric-analysis-aside { grid-column: 1 / -1; }
+}
+@media (max-width: 719px) {
+  .analytics-filter-primary { gap: 10px; }
+  .analytics-filter-date,
+  .analytics-filter-tenant { flex-basis: 100%; }
+  .analytics-filter-actions { flex-basis: 100%; }
+  .analytics-filter-extra { grid-template-columns: minmax(0, 1fr); }
+}
