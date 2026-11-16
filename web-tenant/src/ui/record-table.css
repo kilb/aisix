@@ -120,3 +120,9 @@
 .record-table-search input[type="search"] { background: var(--well); border-color: transparent; border-radius: var(--r-round); padding-inline: 16px; }
 .record-table-page-controls { gap: 4px; }
 .record-table-page-button::before { box-shadow: var(--shadow-card); border-color: transparent; }
+
+/* 表头与正文沿用同一列边界，浅色行带帮助横向追踪较宽的数据表。 */
+.dt > thead > tr > th:not(:first-child):not(:last-child) { padding-inline: 10px; }
+.dt > tbody > tr > td { border-bottom-color: color-mix(in srgb, var(--border) 72%, transparent); }
+.dt > tbody > tr:nth-child(even):not(.dt-detail):not(:hover):not(:focus-within) { background-color: color-mix(in srgb, var(--well) 24%, var(--card)); }
+.dt > tbody > tr.dt-detail > td { border-bottom-color: var(--border); }
