@@ -71,7 +71,7 @@ for (const app of ["admin", "tenant"] as const) {
       health.authenticated = true;
       await settle(page);
       expect(new URL(page.url()).origin).toBe(origin);
-      await expect(page).toHaveTitle(/AISIX/i);
+      await expect(page).toHaveTitle(app === "admin" ? "Routio 运维台" : "Routio 组织门户");
       await expect(page.locator("main")).toBeVisible();
       await expect(page.locator("vite-error-overlay")).toHaveCount(0);
     });
