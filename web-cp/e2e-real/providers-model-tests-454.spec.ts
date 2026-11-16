@@ -48,7 +48,7 @@ test("#96 saved channel mappings are counted once per account and manual direct 
   await expect(table.getByRole("columnheader", { name: "映射模型数量", exact: true })).toBeVisible();
   for (const [index, account] of fixture.accounts.entries()) {
     await page.getByRole("searchbox", { name: "搜索上游账号", exact: true }).fill(account.name);
-    const row = table.getByRole("row").filter({ has: table.getByRole("cell", { name: account.name, exact: true }) });
+    const row = table.getByRole("row").filter({ has: page.getByRole("cell", { name: account.name, exact: true }) });
     const cell = row.getByRole("cell").nth(4);
     await expect(cell).toHaveText(index === 2 ? "0未映射" : String([2, 1][index]));
   }
