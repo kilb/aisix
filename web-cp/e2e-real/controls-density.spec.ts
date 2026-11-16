@@ -127,6 +127,8 @@ for (const app of ["admin", "tenant"] as const) {
         await page.setViewportSize(viewport);
         await height(regular, viewport.width < 720 ? 44 : 40);
         await height(compact, viewport.width < 720 ? 44 : 32);
+        // 缩窄后的旧焦点可能留在屏外，先滚动到用户实际可见的触发器。
+        await compact.scrollIntoViewIfNeeded();
         await compact.focus();
         await page.keyboard.press("ArrowDown");
         const list = page.getByRole("listbox");
