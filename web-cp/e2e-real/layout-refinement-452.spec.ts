@@ -307,7 +307,7 @@ for (const surface of ['admin', 'tenant']) {
           keys: '密钥',
           operators: '运维账号',
           resources: '全部资源',
-          totals: '总输入与总成本'
+          totals: '总收入与总成本'
         } : {
           usage: '用量分析',
           calls: '调用记录',
@@ -505,75 +505,63 @@ function detailValue(region, label) {
   })).locator('xpath=following-sibling::dd[1]');
 }
 for (const width of [1440, 1280, 390, 1920]) {
-  test(`admin total input and unknown cost match retained real events and both APIs at ${width}`, async ({
-    page
-  }) => {
-    await page.setViewportSize({
-      width,
-      height: 1000
-    });
-    const base = await login(page, 'admin'),
-      oracle = totalsOracle();
-    expect(oracle.inputTokens, 'this retained real scenario has a nonzero additive cache input').toBe(620152);
-    expect(oracle.missingCostRows).toBe(2);
-    expect(oracle.knownCostRows).toBe(0);
+  test(`admin total revenue and unknown cost match retained real charges and both APIs at ${width}`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 1000 });
+    const base = await login(page, 'admin'), oracle = totalsOracle();
+    expect(oracle.revenueMicroCny, 'read-only original money snapshot is positive').toBe('79');
+    expect(oracle.missingCostRows).toBe(2); expect(oracle.knownCostRows).toBe(0);
     const query = new URLSearchParams(oracle.window);
     await navigate(page, base, 'totals?' + query);
-    const [metrics, margin] = await Promise.all([get(page, '/admin/usage/metrics?' + query), get(page, '/admin/pricing/margin?' + query)]);
-    for (const key of ['input_tokens', 'known_usage_attempts', 'unknown_usage_attempts']) expect(Object.hasOwn(metrics.totals.tokens, key), key + ' exists on wire').toBe(true);
-    expect(metrics.totals.tokens.input_tokens).toBe(oracle.inputTokens);
-    expect(metrics.totals.tokens.known_usage_attempts).toBe(5);
-    expect(metrics.totals.tokens.unknown_usage_attempts).toBe(0);
+    await expect(page.locator('main h1')).toHaveText('总收入与总成本');
+    const [metrics, margin, charges] = await Promise.all([
+      get(page, '/admin/usage/metrics?' + query),
+      get(page, '/admin/pricing/margin?' + query),
+      get(page, '/admin/pricing/charges?' + query + '&limit=50'),
+    ]);
+    for (const key of ['charged_micro_cny', 'adjusted_micro_cny', 'billing_attempts', 'unpriced_attempts']) {
+      expect(Object.hasOwn(metrics.totals, key), key + ' exists on wire').toBe(true);
+    }
+    expect(typeof metrics.totals.charged_micro_cny).toBe('string');
+    expect(typeof metrics.totals.adjusted_micro_cny).toBe('string');
+    expect(BigInt(metrics.totals.charged_micro_cny)).toBe(79n);
+    expect(BigInt(metrics.totals.adjusted_micro_cny)).toBe(BigInt(oracle.netAdjustmentsMicroCny));
+    expect(metrics.totals.billing_attempts).toBe(5);
+    expect(metrics.totals.unpriced_attempts).toBe(2);
+    expect(charges.items.map(row => row.event_id).sort()).toEqual(oracle.originalCharges.map(row => row.event_id).sort());
+    const originalBase = oracle.originalCharges.reduce((sum, row) => sum + BigInt(row.charge_micro_cny ?? 0), 0n);
+    const originalAdjustments = oracle.originalAdjustments.reduce((sum, row) => sum + BigInt(row.delta_micro_cny), 0n);
+    const apiBase = charges.items.reduce((sum, row) => sum + BigInt(row.charge_micro_cny ?? 0), 0n);
+    expect(originalBase).toBe(79n); expect(originalAdjustments).toBe(0n); expect(apiBase).toBe(originalBase);
+    expect(originalBase + originalAdjustments, 'original charge snapshots plus net deltas independently reproduce income').toBe(BigInt(metrics.totals.charged_micro_cny));
     expect(margin.items.length).toBeGreaterThan(0);
-    for (const item of margin.items) for (const key of ['cost_micro_cny', 'rows', 'rows_without_cost']) expect(Object.hasOwn(item, key), key + ' exists on wire').toBe(true);
-    const known = margin.items.reduce((s, x) => s + BigInt(x.rows), 0n),
-      missing = margin.items.reduce((s, x) => s + BigInt(x.rows_without_cost), 0n),
-      cost = margin.items.reduce((s, x) => s + BigInt(x.cost_micro_cny), 0n);
-    expect(known).toBe(BigInt(oracle.knownCostRows));
-    expect(missing).toBe(BigInt(oracle.missingCostRows));
-    expect(cost).toBe(0n);
-    const input = page.getByRole('region', {
-        name: '总输入统计',
-        exact: true
-      }),
-      costRegion = page.getByRole('region', {
-        name: '总成本统计',
-        exact: true
-      });
-    await expect(input.locator('.metric')).toHaveText('620,152');
-    await expect(detailValue(input, '有用量记录的尝试')).toHaveText('5');
-    await expect(detailValue(input, '缺少用量记录的尝试')).toHaveText('0');
+    for (const item of margin.items) for (const key of ['cost_micro_cny', 'rows', 'rows_without_cost']) {
+      expect(Object.hasOwn(item, key), key + ' exists on wire').toBe(true);
+    }
+    const known = margin.items.reduce((sum, item) => sum + BigInt(item.rows), 0n);
+    const missing = margin.items.reduce((sum, item) => sum + BigInt(item.rows_without_cost), 0n);
+    const cost = margin.items.reduce((sum, item) => sum + BigInt(item.cost_micro_cny), 0n);
+    expect(known).toBe(0n); expect(missing).toBe(2n); expect(cost).toBe(0n);
+    const revenue = page.getByRole('region', { name: '总收入统计', exact: true });
+    const costRegion = page.getByRole('region', { name: '总成本统计', exact: true });
+    await expect(revenue.getByRole('heading', { name: '调用收入', exact: true })).toBeVisible();
+    await expect(revenue.locator('.metric')).toHaveText('¥0.000079');
+    await expect(detailValue(revenue, '计费尝试')).toHaveText('5');
+    await expect(detailValue(revenue, '待计价尝试')).toHaveText('2');
+    await expect(detailValue(revenue, '已含费用调整')).toHaveText('¥0.00');
     await expect(costRegion.locator('.metric')).toHaveText('—');
-    await expect(costRegion.getByText('¥0.00', {
-      exact: true
-    })).toHaveCount(0);
+    await expect(costRegion.getByText('¥0.00', { exact: true })).toHaveCount(0);
     await expect(detailValue(costRegion, '成本缺失的记录')).toHaveText('2');
     await expect(detailValue(costRegion, '成本已知的记录')).toHaveText('0');
-    await expect(costRegion.getByText('2 笔记录缺失成本，当前仅为已知成本小计，不代表完整总成本。', {
-      exact: true
-    })).toBeVisible();
-    const raw = await Promise.all(oracle.eventIds.map(id => get(page, '/admin/usage/events/' + id)));
-    expect(raw).toHaveLength(5);
-    const sum = raw.reduce((s, x) => s + BigInt(x.event.prompt_tokens ?? 0) + BigInt(x.event.cache_read_tokens ?? 0) + BigInt(x.event.cache_creation_tokens ?? 0), 0n);
-    expect(sum, 'raw provider event counters independently reproduce the observed additive cache input').toBe(BigInt(oracle.inputTokens));
+    await expect(costRegion.getByText('2 笔记录缺失成本，当前仅为已知成本小计，不代表完整总成本。', { exact: true })).toBeVisible();
     await noOverflow(page);
     if (width === 1920) {
-      const main = await page.locator('main').boundingBox();
-      expect(main.x).toBe(268);
-      expect(main.x + main.width).toBe(1904);
+      const main = await page.locator('main').boundingBox(); expect(main.x).toBe(268); expect(main.x + main.width).toBe(1904);
     }
-    await test.info().attach('real-totals-oracles', {
-      body: JSON.stringify({
-        window: oracle.window,
-        inputTokens: metrics.totals.tokens.input_tokens,
-        rawInput: sum.toString(),
-        knownCostRows: known.toString(),
-        missingCostRows: missing.toString(),
-        costMicroCny: cost.toString()
-      }),
-      contentType: 'application/json'
+    await test.info().attach('real-revenue-and-cost-oracles', {
+      body: JSON.stringify({ window: oracle.window, chargedMicroCny: metrics.totals.charged_micro_cny, originalBase: originalBase.toString(), originalAdjustments: originalAdjustments.toString(), knownCostRows: known.toString(), missingCostRows: missing.toString() }),
+      contentType: 'application/json',
     });
-    await capture(page, 'admin-totals-real-cache-and-unknown-cost-' + width);
+    await capture(page, 'admin-totals-real-income-and-unknown-cost-' + width);
   });
 }
 test('admin total empty window is zero and changing the preset keeps both aggregate windows identical', async ({
@@ -586,14 +574,15 @@ test('admin total empty window is zero and changing the preset keeps both aggreg
   });
   await navigate(page, base, 'totals?' + query);
   const [metrics, margin] = await Promise.all([get(page, '/admin/usage/metrics?' + query), get(page, '/admin/pricing/margin?' + query)]);
-  expect(Object.hasOwn(metrics.totals.tokens, 'input_tokens')).toBe(true);
-  expect(metrics.totals.tokens.input_tokens).toBe(0);
+  expect(Object.hasOwn(metrics.totals, 'charged_micro_cny')).toBe(true);
+  expect(typeof metrics.totals.charged_micro_cny).toBe('string');
+  expect(BigInt(metrics.totals.charged_micro_cny)).toBe(0n);
   expect(metrics.totals.billing_attempts).toBe(0);
   expect(margin.items).toEqual([]);
   await expect(page.getByRole('region', {
-    name: '总输入统计',
+    name: '总收入统计',
     exact: true
-  }).locator('.metric')).toHaveText('0');
+  }).locator('.metric')).toHaveText('¥0.00');
   await expect(page.getByRole('region', {
     name: '总成本统计',
     exact: true
