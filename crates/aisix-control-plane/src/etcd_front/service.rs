@@ -110,9 +110,9 @@ pub const MAX_RANGES: usize = 8;
 
 /// How long a range waits for a place among [`MAX_RANGES`] before it is
 /// refused `ResourceExhausted`. Waiting rather than refusing at once: a
-/// refused page restarts the gateway's whole load after its backoff (1 s
-/// doubling to 60 s, without jitter), so a fleet restarted together would
-/// otherwise retry in lockstep.
+/// refused page restarts the gateway's whole load after its jittered backoff
+/// (1 s doubling to 60 s), and waiting avoids restarting the whole load for
+/// a brief burst of concurrent reads.
 pub const RANGE_WAIT: Duration = Duration::from_secs(10);
 
 /// The largest watch answer the front reads from kine: 64 MiB. kine merges

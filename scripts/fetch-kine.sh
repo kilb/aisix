@@ -40,7 +40,7 @@ mkdir -p "$(dirname "$dest")"
 tmp="$(mktemp "${dest}.download.XXXXXX")"
 trap 'rm -f "$tmp"' EXIT
 
-curl -fsSL --retry 3 --output "$tmp" "$KINE_URL"
+curl -fsSL --retry 3 --connect-timeout 10 --max-time 300 --output "$tmp" "$KINE_URL"
 if ! is_pinned "$tmp"; then
   echo "fetch-kine: refusing ${KINE_URL}: sha256 is $(sha256sum "$tmp" | cut -d' ' -f1), expected ${KINE_SHA256}" >&2
   exit 1

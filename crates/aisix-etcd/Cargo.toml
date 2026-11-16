@@ -23,6 +23,7 @@ base64.workspace = true
 chrono.workspace = true
 ring.workspace = true
 hex.workspace = true
+rand.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

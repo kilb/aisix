@@ -1794,8 +1794,16 @@ impl<P: ConfigProvider> Supervisor<P> {
         self.drain_pending_cache_writes().await;
     }
 
-    async fn watch_loop(&self, mut cancel: tokio::sync::watch::Receiver<bool>) {
-        let mut backoff = ExpBackoff::default();
+    async fn watch_loop(&self, cancel: tokio::sync::watch::Receiver<bool>) {
+        self.watch_loop_with_backoff(cancel, ExpBackoff::default())
+            .await;
+    }
+
+    async fn watch_loop_with_backoff(
+        &self,
+        mut cancel: tokio::sync::watch::Receiver<bool>,
+        mut backoff: ExpBackoff,
+    ) {
         // The wait that preceded the current cycle, and when that cycle
         // reached steady state (applied its read and opened its watches).
         let mut preceding_delay = Duration::ZERO;
@@ -6293,7 +6301,10 @@ mod tests {
         });
         let sup = Arc::new(Supervisor::new(provider.clone(), "/aisix"));
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        let run = tokio::spawn(sup.run(cancel_rx));
+        let run = tokio::spawn(async move {
+            sup.watch_loop_with_backoff(cancel_rx, crate::backoff::nominal_backoff())
+                .await;
+        });
         while provider.reads.lock().unwrap().len() <= cycles {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
