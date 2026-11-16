@@ -13,10 +13,11 @@ export interface RoutingModeFieldProps {
 }
 
 export function RoutingModeField({ value: draft, onChange, disabled, strategies, error, hashError, storedHashOn }: RoutingModeFieldProps) {
-  // 调用方可以传完整草稿，但本控件只能更新自己负责的两个字段。
-  const value: RoutingModeValue = { strategy: draft.strategy, affinity: draft.affinity };
+  // 调用方可以传完整草稿，但本控件只更新路由模式相关字段。
+  const value: RoutingModeValue = { strategy: draft.strategy, affinity: draft.affinity, ...(draft.hashFailover === undefined ? {} : { hashFailover: draft.hashFailover }) };
   const mode = routingModeOf(value);
   const policy = routingPolicy(value);
+  const fixed = value.strategy === "consistent_hash" && value.hashFailover === false;
   const allowed = (strategy: string) => strategies === undefined || strategies?.includes(strategy) === true;
   const otherStrategies = (strategies ?? []).filter((strategy) => !["consistent_hash", "round_robin", "failover"].includes(strategy));
   const changed = (choice: string) => {
@@ -26,19 +27,33 @@ export function RoutingModeField({ value: draft, onChange, disabled, strategies,
   return <>
     <Field label="同级分配方式" error={error} hint={<>
       <span className="block">当前：{policy.title}（{value.strategy}）{value.strategy === "consistent_hash" ? `，${policy.affinityLabel}` : ""}。{policy.help}</span>
-      <span className="block">priority 越大越先用；备组设较低 priority 和正权重。weight=0 可能被过滤，不能代替备组。仅显式选择推荐项并保存才改变亲和配置。</span>
-      <span className="block">错误切换与冷却独立；max_fallbacks 限制整条候选链，可能到不了低优先级备组。Responses 会话续接优先原归属。</span>
+      {fixed ? <>
+        <span className="block">多个同优先级、正权重的主用目标才能分流；只有一个最高优先级目标时，会话仍使用它，不会自动提升备组。</span>
+        <span className="block">账号池、权重、优先级和授权范围不变时，重启后可重新计算归属；修改账号池或权重可能重映射。缺少全部显式亲和来源时返回 400。</span>
+      </> : <>
+        <span className="block">priority 越大越先用；备组设较低 priority 和正权重。weight=0 可能被过滤，不能代替备组。仅显式选择预设并保存才改变亲和配置。</span>
+        <span className="block">错误切换与冷却独立；max_fallbacks 限制整条候选链，可能到不了低优先级备组。Responses 会话续接优先原归属。</span>
+      </>}
     </>}>
       {(aria) => <Select value={mode} disabled={disabled || strategies === null} onValueChange={(selectedValue) => changed(selectedValue)} {...aria}>
         {mode === "preserve" && <option value="preserve">保留当前配置：{policy.title}{value.strategy === "consistent_hash" ? ` · ${policy.affinityLabel}` : ""}</option>}
+        <option value="session" disabled={!allowed("consistent_hash")}>会话固定 · 同一会话使用同一上游账号</option>
         <option value="api_key" disabled={!allowed("consistent_hash")}>推荐：同级加权一致性哈希 · API key ID 亲和</option>
         <option value="round_robin" disabled={!allowed("round_robin")}>同级按请求加权轮询</option>
         <option value="failover" disabled={!allowed("failover")}>同级固定顺序</option>
         {otherStrategies.map((strategy) => <option key={strategy} value={`strategy:${strategy}`}>{routingPolicy({ ...value, strategy }).title}（{strategy}）</option>)}
       </Select>}
     </Field>
-    {value.strategy === "consistent_hash" && <Field label="亲和来源" error={hashError} hint="API key ID 是稳定的密钥资源标识，不使用密钥明文。权重分配 key 空间，不保证请求份额；目标或权重变化可能改变映射。">
-      {(aria) => <Select value={value.affinity} disabled={disabled} onValueChange={(selectedValue) => onChange({ ...value, affinity: selectedValue as RoutingModeValue["affinity"] })} {...aria}>
+    {value.strategy === "consistent_hash" && <Field label="亲和来源" error={hashError} hint={value.affinity === "session" ? "按顺序读取 x-claude-code-session-id、session-id、thread-id 的首个非空值；全部缺失时报错，不回退 API key 或空值。" : "API key ID 是稳定的密钥资源标识，不使用密钥明文。权重分配 key 空间，不保证请求份额；目标或权重变化可能改变映射。"}>
+      {(aria) => <Select value={value.affinity} disabled={disabled} onValueChange={(selectedValue) => {
+        if (selectedValue === "session" || selectedValue === "api_key") onChange(selectRoutingMode(value, selectedValue));
+        else {
+          const next = { ...value, affinity: selectedValue as RoutingModeValue["affinity"] };
+          if (selectedValue === "default" && value.hashFailover !== undefined) next.hashFailover = undefined;
+          onChange(next);
+        }
+      }} {...aria}>
+        <option value="session" disabled={!allowed("consistent_hash")}>会话请求头（缺失时报错）</option>
         <option value="default">网关默认：请求头 → API key ID</option>
         <option value="api_key">API key ID 亲和</option>
         {(storedHashOn !== undefined || value.affinity === "custom") && <option value="custom">保留已存自定义来源链</option>}

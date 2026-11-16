@@ -1810,6 +1810,8 @@ export interface PublicModelRouting {
   fallback_on_statuses?: number[];
   when_all_unavailable?: string;
   hash_on?: unknown[];
+  /** 仅一致性哈希使用；false 固定目标，缺省允许故障切换。 */
+  hash_failover?: boolean;
   [field: string]: unknown;
 }
 

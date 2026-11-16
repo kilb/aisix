@@ -2,23 +2,36 @@ import type { PublicModelRouting } from "./api.ts";
 
 export interface RoutingModeValue {
   strategy: string;
-  affinity: "default" | "api_key" | "custom";
+  affinity: "default" | "api_key" | "session" | "custom";
+  hashFailover?: boolean;
 }
 
-export type RoutingMode = "api_key" | "round_robin" | "failover" | "preserve";
+export type RoutingMode = "session" | "api_key" | "round_robin" | "failover" | "preserve";
+
+const SESSION_HEADERS = ["x-claude-code-session-id", "session-id", "thread-id"] as const;
+
+export function sessionHashSources(): { type: "header"; name: string }[] {
+  return SESSION_HEADERS.map((name) => ({ type: "header", name }));
+}
 
 export function routingValueOf(routing: PublicModelRouting, defaultStrategy: string): RoutingModeValue {
   const source = routing.hash_on?.[0];
   const apiKey = routing.hash_on?.length === 1 && source !== null && typeof source === "object" &&
     Object.keys(source).length === 1 && "type" in source && source.type === "api_key";
+  const session = routing.hash_failover === false && routing.hash_on?.length === SESSION_HEADERS.length &&
+    routing.hash_on.every((entry, index) => entry !== null && typeof entry === "object" &&
+      Object.keys(entry).length === 2 && "type" in entry && entry.type === "header" &&
+      "name" in entry && entry.name === SESSION_HEADERS[index]);
   return {
     strategy: typeof routing.strategy === "string" && routing.strategy !== "" ? routing.strategy : defaultStrategy,
-    affinity: routing.hash_on === undefined ? "default" : apiKey ? "api_key" : "custom",
+    affinity: routing.hash_on === undefined ? "default" : session ? "session" : apiKey ? "api_key" : "custom",
+    ...(typeof routing.hash_failover === "boolean" ? { hashFailover: routing.hash_failover } : {}),
   };
 }
 
 export function routingModeOf(value: RoutingModeValue): RoutingMode {
-  if (value.strategy === "consistent_hash" && value.affinity === "api_key") return "api_key";
+  if (value.strategy === "consistent_hash" && value.affinity === "session" && value.hashFailover === false) return "session";
+  if (value.strategy === "consistent_hash" && value.affinity === "api_key" && value.hashFailover !== false) return "api_key";
   if (value.strategy === "round_robin" || value.strategy === "failover") return value.strategy;
   return "preserve";
 }
@@ -26,8 +39,11 @@ export function routingModeOf(value: RoutingModeValue): RoutingMode {
 // 只有显式选推荐项才将亲和来源改成 API key 资源 ID；其它字段由原表单保存。
 export function selectRoutingMode<T extends RoutingModeValue>(value: T, mode: RoutingMode): T {
   if (mode === "preserve") return value;
-  if (mode === "api_key") return { ...value, strategy: "consistent_hash", affinity: "api_key" };
-  return { ...value, strategy: mode };
+  if (mode === "session") return { ...value, strategy: "consistent_hash", affinity: "session", hashFailover: false };
+  const next = mode === "api_key" ? { ...value, strategy: "consistent_hash", affinity: "api_key" as const } : { ...value, strategy: mode };
+  if (value.hashFailover !== undefined) next.hashFailover = undefined;
+  else delete next.hashFailover;
+  return next;
 }
 
 const policies: Record<string, { title: string; help: string }> = {
@@ -41,9 +57,11 @@ const policies: Record<string, { title: string; help: string }> = {
 
 // 表单和已保存摘要共用策略解释，避免把推荐项误当成当前配置。
 export function routingPolicy(value: RoutingModeValue) {
+  const fixed = value.strategy === "consistent_hash" && value.hashFailover === false;
   return {
     ...(policies[value.strategy] ?? { title: value.strategy, help: "保留已存策略及参数。" }),
-    affinityLabel: value.affinity === "api_key" ? "API key ID 亲和" :
+    ...(fixed ? { title: value.affinity === "session" ? "会话固定" : "固定亲和目标", help: "先按配置账号池确定目标，再检查其健康与权限；原目标不可用时请求失败，不切换账号。" } : {}),
+    affinityLabel: value.affinity === "session" ? "会话请求头，不回退 API key" : value.affinity === "api_key" ? "API key ID 亲和" :
       value.affinity === "custom" ? "自定义亲和来源链" : "网关默认：请求头 → API key ID",
   };
 }

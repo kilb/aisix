@@ -343,6 +343,8 @@ export function PublicRoutingForm({
   const bad = schema && "error" in schema ? schema.error : null;
   const shown = [
     "/routing/strategy",
+    "/routing/hash_on",
+    "/routing/hash_failover",
     "/routing/retries",
     "/routing/max_fallbacks",
     "/routing/retry_on_429",
@@ -384,12 +386,12 @@ export function PublicRoutingForm({
         )}
         <div className="pm-routing-settings grid gap-x-4 @md:grid-cols-2 @3xl:grid-cols-3">
           <RoutingModeField
-            value={{ strategy: draft.strategy, affinity: draft.affinity }}
-            onChange={(next) => setSettings((previous) => ({ ...previous, ...next }))}
+            value={{ strategy: draft.strategy, affinity: draft.affinity, ...(draft.hashFailover === undefined ? {} : { hashFailover: draft.hashFailover }) }}
+            onChange={(next) => setSettings((previous) => ({ ...previous, ...next, hashFailover: next.hashFailover }))}
             disabled={locked || strategies === null}
             strategies={strategies}
             storedHashOn={stored.hash_on}
-            error={at("/routing/strategy")}
+            error={at("/routing/strategy") ?? at("/routing/hash_failover")}
             hashError={at("/routing/hash_on")}
           />
           <Field label="全部不可用时的处理" hint="只针对后台健康检查报告全部目标不健康。全部目标都在故障冷却时仍会尝试。" error={at("/routing/when_all_unavailable")}>

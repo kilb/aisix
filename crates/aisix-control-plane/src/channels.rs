@@ -336,9 +336,8 @@ fn settable_routing_keys() -> std::collections::BTreeSet<String> {
 /// The column holds what the operator changed, so a setting equal to the
 /// default it is compared against here is not written: a default that moves
 /// in a later gateway release then reaches the model instead of being pinned
-/// by a value nobody chose. The three defaults are those of the gateway's
-/// code (`Routing::*_or_default`, and [`DEFAULT_STRATEGY`] for the one this
-/// module itself decides) — `retries` has none (it defers to the deployment's
+/// by a value nobody chose. 默认值由网关的 `Routing::*_or_default` 和本模块的
+/// [`DEFAULT_STRATEGY`] 定义。`retries` has none (it defers to the deployment's
 /// `upstream.retries`), and `max_fallbacks`'s is derived from the target
 /// count, so neither is ever treated as a default.
 ///
@@ -389,7 +388,7 @@ fn checked_routing(settings: &Value) -> Result<Value, Vec<Detail>> {
     // Validated as a whole routing block with no targets: the schema then
     // decides the strategy enum, the status range and the hash chain's
     // shape, exactly as it does for a hand-written model.
-    let mut probe_routing = kept.clone();
+    let mut probe_routing = settings.clone();
     probe_routing
         .entry("strategy".to_string())
         .or_insert_with(|| Value::String(DEFAULT_STRATEGY.to_string()));
@@ -421,6 +420,7 @@ fn checked_routing(settings: &Value) -> Result<Value, Vec<Detail>> {
 fn at_default(key: &str, value: &Value) -> bool {
     match key {
         "strategy" => value.as_str() == Some(DEFAULT_STRATEGY),
+        "hash_failover" => value.as_bool() == Some(true),
         "retry_on_429" => value.as_bool() == Some(false),
         "when_all_unavailable" => value.as_str() == Some("fail"),
         "fallback_on_statuses" => value.as_array().is_some_and(Vec::is_empty),

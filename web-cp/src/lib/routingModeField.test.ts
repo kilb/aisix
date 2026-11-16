@@ -127,12 +127,12 @@ test("真实路由菜单保留选项值、schema禁用、自定义来源与未�
     await expect(affinity).toHaveAttribute("data-value", "custom");
     await mode.click();
     await expect(page.getByRole("option", { name: /^保留当前配置/ })).toHaveAttribute("aria-selected", "true");
-    await expect.poll(() => page.getByRole("option").evaluateAll(options => options.map(option => option.getAttribute("data-value")))).toEqual(["preserve", "api_key", "round_robin", "failover"]);
+    await expect.poll(() => page.getByRole("option").evaluateAll(options => options.map(option => option.getAttribute("data-value")))).toEqual(["preserve", "session", "api_key", "round_robin", "failover"]);
     await page.keyboard.press("Escape");
     await expect(custom.getByRole("status", { name: "路由更改", exact: true })).toHaveText("[]");
     await affinity.click();
     await expect(page.getByRole("option", { name: "保留已存自定义来源链", exact: true })).toHaveAttribute("aria-selected", "true");
-    await expect.poll(() => page.getByRole("option").evaluateAll(options => options.map(option => option.getAttribute("data-value")))).toEqual(["default", "api_key", "custom"]);
+    await expect.poll(() => page.getByRole("option").evaluateAll(options => options.map(option => option.getAttribute("data-value")))).toEqual(["session", "default", "api_key", "custom"]);
     await page.keyboard.press("Escape");
     await mode.click();
     await page.getByRole("option", { name: "推荐：同级加权一致性哈希 · API key ID 亲和", exact: true }).click();
@@ -144,8 +144,9 @@ test("真实路由菜单保留选项值、schema禁用、自定义来源与未�
     const unknownMode = unknown.getByRole("combobox", { name: "同级分配方式", exact: true });
     await unknownMode.click();
     await expect(page.getByRole("option", { name: /^保留当前配置/ })).toHaveAttribute("aria-selected", "true");
-    await expect.poll(() => page.getByRole("option").evaluateAll(options => options.map(option => option.getAttribute("data-value")))).toEqual(["preserve", "api_key", "round_robin", "failover", "strategy:least_cost"]);
+    await expect.poll(() => page.getByRole("option").evaluateAll(options => options.map(option => option.getAttribute("data-value")))).toEqual(["preserve", "session", "api_key", "round_robin", "failover", "strategy:least_cost"]);
     await expect(page.getByRole("option", { name: "推荐：同级加权一致性哈希 · API key ID 亲和", exact: true })).toHaveAttribute("aria-disabled", "true");
+    await expect(page.getByRole("option", { name: "会话固定 · 同一会话使用同一上游账号", exact: true })).toHaveAttribute("aria-disabled", "true");
     await expect(page.getByRole("option", { name: "同级固定顺序", exact: true })).toHaveAttribute("aria-disabled", "true");
     await expect(page.getByRole("option", { name: "同级按请求加权轮询", exact: true })).toBeEnabled();
     await page.keyboard.press("Escape");
@@ -180,4 +181,28 @@ test("an explicit mode selection updates only strategy and affinity, leaving unr
   assert.ok(isValidElement<{ onValueChange: (value: string) => void }>(select));
   select.props.onValueChange("api_key");
   assert.deepEqual(changed, { strategy: "consistent_hash", affinity: "api_key" });
+});
+
+test("会话固定菜单显示账号池边界，切回密钥亲和不会残留禁止切换", { timeout: 30_000 }, async () => {
+  const browser = await chromium.launch();
+  try {
+    const page = await browser.newPage();
+    await page.setContent('<div id="root"></div>');
+    await page.addScriptTag({ content: browserCompiled.outputFiles[0]!.text });
+    const region = page.getByRole("region", { name: "自定义", exact: true });
+    const mode = region.getByRole("combobox", { name: "同级分配方式", exact: true });
+    await mode.click();
+    await page.getByRole("option", { name: "会话固定 · 同一会话使用同一上游账号", exact: true }).click();
+    await expect(mode).toHaveAttribute("data-value", "session");
+    assert.deepEqual(JSON.parse(await region.getByRole("status", { name: "路由草稿", exact: true }).innerText()), { strategy: "consistent_hash", affinity: "session", hashFailover: false, retries: "9" });
+    await expect(region).toContainText("多个同优先级、正权重的主用目标才能分流");
+    await expect(region).toContainText("原目标不可用时请求失败，不切换账号");
+    for (const header of ["x-claude-code-session-id", "session-id", "thread-id"]) await expect(region).toContainText(header);
+    await expect(region).toContainText("不回退 API key 或空值");
+    await mode.click();
+    await page.getByRole("option", { name: "推荐：同级加权一致性哈希 · API key ID 亲和", exact: true }).click();
+    const ordinary = JSON.parse(await region.getByRole("status", { name: "路由草稿", exact: true }).innerText());
+    assert.deepEqual(ordinary, { strategy: "consistent_hash", affinity: "api_key", retries: "9" });
+    await expect(mode).toHaveAttribute("data-value", "api_key");
+  } finally { await browser.close(); }
 });

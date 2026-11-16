@@ -21,6 +21,7 @@ import { messageFor, problemAt } from "../lib/errors";
 import { errorText } from "../lib/fmt";
 import { modelClass, modelSource, type ModelClass, type ModelSource } from "../lib/modelSource";
 import { draftOf as routingDraftOf, sameRouting } from "../lib/publicRouting";
+import { sessionHashSources } from "../lib/routingModes";
 import { inUseText } from "../lib/retireWarning";
 import { defaultAt, enumAt, loadSchema } from "../lib/schema";
 import { useResource } from "../lib/useResource";
@@ -690,6 +691,7 @@ function ModelForm({
   const [upstream, setUpstream] = useState(initial.upstream);
   const [strategy, setStrategy] = useState(initial.strategy);
   const [affinity, setAffinity] = useState(routingDraftOf(routing, "").affinity);
+  const [hashFailover, setHashFailover] = useState(routingDraftOf(routing, "").hashFailover);
   const [cooldown, setCooldown] = useState(doc.cooldown ?? null);
   const [cooldownProblem, setCooldownProblem] = useState<string | null>(null);
   const [rows, setRows] = useState(initial.rows);
@@ -792,9 +794,17 @@ function ModelForm({
     const nextRouting = isNew ? {} : { ...routing };
     if (isNew ? shownStrategy !== "" : strategy !== initial.strategy) nextRouting.strategy = shownStrategy;
     if (shownStrategy === "consistent_hash") {
+      if (affinity === "session") nextRouting.hash_on = sessionHashSources();
       if (affinity === "api_key") nextRouting.hash_on = [{ type: "api_key" }];
       else if (affinity === "default") delete nextRouting.hash_on;
-    } else if (strategy !== initial.strategy) delete nextRouting.hash_on;
+      if (hashFailover !== routing.hash_failover) {
+        if (hashFailover === undefined) delete nextRouting.hash_failover;
+        else nextRouting.hash_failover = hashFailover;
+      }
+    } else if (strategy !== initial.strategy) {
+      delete nextRouting.hash_on;
+      delete nextRouting.hash_failover;
+    }
     const rowsChanged = rows.map(rowFields).join() !== initial.rows.map(rowFields).join();
     if (isNew || rowsChanged) nextRouting.targets = rows.map(targetOf);
     next.routing = nextRouting;
@@ -834,7 +844,7 @@ function ModelForm({
       ? ["/display_name", "/provider_key_id", "/provider", "/model_name"]
       : [
           "/display_name",
-          ...(strategyShown ? ["/routing/strategy"] : []),
+          ...(strategyShown ? ["/routing/strategy", "/routing/hash_on", "/routing/hash_failover"] : []),
           ...rows
             .filter((r) => sentRows.includes(r.key))
             .flatMap((r) =>
@@ -921,12 +931,12 @@ function ModelForm({
             </div>
           ) : (
             <RoutingModeField
-              value={{ strategy: shownStrategy, affinity }}
-              onChange={(next) => { setStrategy(next.strategy); setAffinity(next.affinity); }}
+              value={{ strategy: shownStrategy, affinity, ...(hashFailover === undefined ? {} : { hashFailover }) }}
+              onChange={(next) => { setStrategy(next.strategy); setAffinity(next.affinity); setHashFailover(next.hashFailover); }}
               disabled={locked || strategies === null}
               strategies={strategies}
               storedHashOn={routing.hash_on}
-              error={at("/routing/strategy")}
+              error={at("/routing/strategy") ?? at("/routing/hash_failover")}
               hashError={at("/routing/hash_on")}
             />
           )}

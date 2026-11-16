@@ -25,6 +25,58 @@ use uuid::Uuid;
 /// The operators' public-model routes.
 const PUBLICS: &str = "/admin/public-models";
 
+// 通过正式保存和生成资源验证固定会话参数，不触发上游请求。
+#[tokio::test]
+async fn fixed_session_routing_round_trips_without_losing_false_on_regeneration() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let key = provider_key(&cp, &op, "acct-session-fixed").await;
+    let (id, _) = create_public(&cp, &op, "pub-session-fixed").await;
+    assert_eq!(put_channel(&cp, &op, key, id, json!({})).await.status, 200);
+    let settings = json!({
+        "strategy": "consistent_hash", "hash_failover": false,
+        "hash_on": [{"type": "header", "name": "x-claude-code-session-id"},
+            {"type": "header", "name": "session-id"}, {"type": "header", "name": "thread-id"}],
+        "retries": 0, "max_fallbacks": 0,
+    });
+    let saved = patch_public(&cp, &op, id, json!({"routing": settings})).await;
+    assert_eq!(saved.status, 200, "{saved:?}");
+    assert_eq!(saved.body["routing"], settings);
+    assert_eq!(saved.body["effective_routing"]["hash_failover"], false);
+    assert_eq!(
+        put_channel(&cp, &op, key, id, json!({"weight": 3}))
+            .await
+            .status,
+        200
+    );
+    let stored = public_model(&cp, &op, id).await;
+    assert_eq!(stored["routing"], settings);
+    let generated = live(&cp, Kind::Models, id).await;
+    assert_eq!(generated["routing"]["hash_failover"], false);
+    assert_eq!(generated["routing"]["hash_on"], settings["hash_on"]);
+    for invalid in [
+        json!({"strategy": "round_robin", "hash_failover": false}),
+        json!({"strategy": "failover", "hash_failover": true}),
+        json!({"strategy": "consistent_hash", "hash_failover": false}),
+        json!({"strategy": "consistent_hash", "hash_failover": false, "hash_on": []}),
+        json!({"strategy": "consistent_hash", "hash_failover": "false", "hash_on": settings["hash_on"]}),
+    ] {
+        let refused = patch_public(&cp, &op, id, json!({"routing": invalid})).await;
+        assert_eq!(refused.status, 422, "{refused:?}");
+        assert_eq!(public_model(&cp, &op, id).await["routing"], settings);
+    }
+    let ordinary = json!({"strategy": "consistent_hash", "hash_failover": true, "hash_on": [{"type": "api_key"}]});
+    let saved = patch_public(&cp, &op, id, json!({"routing": ordinary})).await;
+    assert_eq!(saved.status, 200, "{saved:?}");
+    assert!(
+        saved.body["routing"].get("hash_failover").is_none(),
+        "{saved:?}"
+    );
+    assert_eq!(saved.body["routing"]["hash_on"], ordinary["hash_on"]);
+}
+
 // 配置经真实 API、数据库和生成资源往返，拒绝的配置不能改动已有值。
 #[tokio::test]
 async fn channel_cooldown_round_trips_and_effective_routing_reads_the_saved_document() {

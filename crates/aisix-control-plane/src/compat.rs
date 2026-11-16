@@ -46,6 +46,8 @@ pub enum Trigger {
     Present,
     /// The field holds this string.
     Equals(&'static str),
+    /// 字段恰好为指定布尔值；字符串、null 和缺省不触发。
+    BoolEquals(bool),
     /// The field is a list holding this string.
     Contains(&'static str),
 }
@@ -104,6 +106,14 @@ const CUSTOMER_ENDPOINT_EXPANSION_DEV_SHA: &str = "08ff931722b737d40a8942a9e55de
 /// `allowed_provider_groups`, which its own row already refuses while such
 /// a gateway is registered.
 pub const FIELD_FLOORS: &[FieldFloor] = &[
+    FieldFloor {
+        kind: Kind::Models,
+        pointer: "/routing/hash_failover",
+        trigger: Trigger::BoolEquals(false),
+        since: Since::ThisRelease,
+        widens: routing_targets_widen,
+        why: "an older gateway ignores fixed-target routing and may switch a session to another account",
+    },
     FieldFloor {
         kind: Kind::CachePolicies,
         pointer: "/scope",
@@ -351,6 +361,7 @@ fn triggered(floor: &FieldFloor, doc: &Value) -> bool {
     match (doc.pointer(floor.pointer), floor.trigger) {
         (Some(value), Trigger::Present) => !value.is_null(),
         (Some(value), Trigger::Equals(wanted)) => value.as_str() == Some(wanted),
+        (Some(value), Trigger::BoolEquals(wanted)) => value.as_bool() == Some(wanted),
         (Some(value), Trigger::Contains(wanted)) => value
             .as_array()
             .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(wanted))),
@@ -361,6 +372,27 @@ fn triggered(floor: &FieldFloor, doc: &Value) -> bool {
 /// For a row whose field no kept value can widen.
 fn never(_stored: &Value, _doc: &Value) -> bool {
     false
+}
+
+// 保留固定模式时，新增目标会扩大旧网关可访问的账号；删除、重排和改名不扩大。
+fn routing_targets_widen(stored: &Value, doc: &Value) -> bool {
+    fn targets(value: &Value) -> &[Value] {
+        value
+            .pointer("/routing/targets")
+            .and_then(Value::as_array)
+            .map_or(&[][..], Vec::as_slice)
+    }
+    fn reference(target: &Value) -> Option<&Value> {
+        target
+            .get("model_id")
+            .filter(|value| !value.is_null())
+            .or_else(|| target.get("model"))
+    }
+    targets(doc).iter().any(|target| {
+        !targets(stored)
+            .iter()
+            .any(|before| reference(before) == reference(target))
+    })
 }
 
 /// Whether an api key reaches more after a replace of `stored` by `doc`,
@@ -900,6 +932,77 @@ mod tests {
     }
 
     #[test]
+    fn fixed_hash_floor_is_false_specific_and_rechecks_only_target_growth() {
+        let model = |flag: Value, targets: Value| {
+            json!({
+                "display_name": "session-fixed",
+                "routing": {"strategy": "consistent_hash", "hash_failover": flag, "targets": targets},
+            })
+        };
+        let one = json!([{"model_id": "a", "priority": 0, "weight": 1}]);
+        let fixed = model(json!(false), one.clone());
+        let floors: Vec<FieldFloor> = FIELD_FLOORS
+            .iter()
+            .copied()
+            .filter(|floor| floor.pointer == "/routing/hash_failover")
+            .collect();
+        assert_eq!(floors.len(), 1);
+        assert_eq!(floors[0].trigger, Trigger::BoolEquals(false));
+        assert!(check_against(
+            &floors,
+            Kind::Models,
+            &fixed,
+            &versions(&["1.8.2"]),
+            "1.9.0"
+        )
+        .is_err());
+        assert_eq!(
+            check_against(
+                &floors,
+                Kind::Models,
+                &fixed,
+                &versions(&["1.9.0"]),
+                "1.9.0"
+            ),
+            Ok(())
+        );
+        for flag in [json!(true), Value::Null, json!("false"), json!(0)] {
+            let ordinary = model(flag, one.clone());
+            assert_eq!(
+                check_against(
+                    &floors,
+                    Kind::Models,
+                    &ordinary,
+                    &versions(&["1.8.2"]),
+                    "1.9.0"
+                ),
+                Ok(())
+            );
+            assert!(newly_triggered(&floors, Kind::Models, &ordinary, &fixed).is_empty());
+        }
+        let absent = json!({"routing": {"targets": one}});
+        assert!(newly_triggered(&floors, Kind::Models, &absent, &fixed).is_empty());
+        assert_eq!(
+            newly_triggered(&floors, Kind::Models, &fixed, &absent).len(),
+            1
+        );
+        assert!(newly_triggered(&floors, Kind::Models, &fixed, &fixed).is_empty());
+        let wider = model(json!(false), json!([{"model_id": "a"}, {"model_id": "b"}]));
+        assert_eq!(
+            newly_triggered(&floors, Kind::Models, &wider, &fixed).len(),
+            1
+        );
+        assert!(newly_triggered(&floors, Kind::Models, &fixed, &wider).is_empty());
+        let renamed = json!({"display_name": "renamed", "routing": fixed["routing"]});
+        assert!(newly_triggered(&floors, Kind::Models, &renamed, &fixed).is_empty());
+        let reweighted = model(
+            json!(false),
+            json!([{"model_id": "a", "priority": 1, "weight": 2}]),
+        );
+        assert!(newly_triggered(&floors, Kind::Models, &reweighted, &fixed).is_empty());
+    }
+
+    #[test]
     fn a_kept_field_is_judged_again_when_the_key_reaches_more() {
         fn again(doc: &Value, stored: &Value) -> usize {
             newly_triggered(FIELD_FLOORS, Kind::ApiKeys, doc, stored).len()
@@ -1131,6 +1234,7 @@ mod tests {
         assert_eq!(
             rows,
             [
+                (Kind::Models, "/routing/hash_failover"),
                 (Kind::CachePolicies, "/scope"),
                 (Kind::ApiKeys, "/allowed_endpoints"),
                 (Kind::ApiKeys, "/allowed_provider_groups"),

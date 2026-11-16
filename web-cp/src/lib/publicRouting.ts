@@ -1,5 +1,5 @@
 import type { PublicModelRouting } from "./api.ts";
-import { routingValueOf, type RoutingModeValue } from "./routingModes.ts";
+import { routingValueOf, sessionHashSources, type RoutingModeValue } from "./routingModes.ts";
 
 /**
  * The routing settings of a public model, as 模型与路由 edits them.
@@ -44,7 +44,7 @@ export function statusesOf(text: string): number[] | null {
 }
 
 /** The settings this form has a control for; every other key is carried over. */
-const EDITED = ["strategy", "hash_on", "retries", "max_fallbacks", "retry_on_429", "fallback_on_statuses", "when_all_unavailable"];
+const EDITED = ["strategy", "hash_on", "hash_failover", "retries", "max_fallbacks", "retry_on_429", "fallback_on_statuses", "when_all_unavailable"];
 
 /**
  * The body to send for `draft`.
@@ -70,8 +70,10 @@ export function routingBody(
   }
   if (draft.strategy !== "" && draft.strategy !== defaultStrategy) body.strategy = draft.strategy;
   if (draft.strategy === "consistent_hash") {
+    if (draft.affinity === "session") body.hash_on = sessionHashSources();
     if (draft.affinity === "api_key") body.hash_on = [{ type: "api_key" }];
     if (draft.affinity === "custom" && stored.hash_on !== undefined) body.hash_on = stored.hash_on;
+    if (draft.hashFailover !== undefined) body.hash_failover = draft.hashFailover;
   } else if (draft.strategy === (stored.strategy ?? defaultStrategy) && stored.hash_on !== undefined) {
     // 未切换策略时保留旧配置；切离哈希策略时才移除亲和来源。
     body.hash_on = stored.hash_on;
@@ -85,6 +87,7 @@ export function routingBody(
   const untouched = {
     strategy: draft.strategy === initial.strategy,
     hash_on: draft.strategy === initial.strategy && draft.affinity === initial.affinity,
+    hash_failover: draft.strategy === initial.strategy && draft.affinity === initial.affinity && draft.hashFailover === initial.hashFailover,
     retries: draft.retries === initial.retries,
     max_fallbacks: draft.maxFallbacks === initial.maxFallbacks,
     retry_on_429: draft.retryOn429 === initial.retryOn429,
