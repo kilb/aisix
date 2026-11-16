@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { directProbeTargets, probeDuration, probeRate, probeMeasurements, probeResultMessage, probeRequestPlan, capabilityChecks, capabilityStatus, capabilityDuration, runDirectProbeBatch, DirectProbeNotSent, type DirectProbeResult, type DirectProbeCapability } from "./directModelProbe.ts";
+import { directProbeTargets, savedProbeRows, probeDuration, probeRate, probeMeasurements, probeResultMessage, probeRequestPlan, capabilityChecks, capabilityStatus, capabilityDuration, runDirectProbeBatch, DirectProbeNotSent, type DirectProbeResult, type DirectProbeCapability, type DirectProbeRow } from "./directModelProbe.ts";
 
 const available = (id: string): DirectProbeResult => ({
   model_id: id, status: "available", ttft_ms: null, total_duration_ms: 1000,
@@ -9,6 +9,56 @@ const available = (id: string): DirectProbeResult => ({
     status: "not_tested", checks: { json: null, instruction: null, arithmetic: null, sorting: null },
     total_duration_ms: null, usage: null, error: null, note: null,
   }, fidelity: { status: "not_tested", reason: "未验证" },
+});
+
+// 批量补测不能重发已有结果或发送情况不明的请求；筛选不改变完整目标集合。
+test("测试剩余只选未发送行，保留失败、过期、运行和中断记录供显式逐行操作", async () => {
+  const helpers = await import("./directModelProbe.ts");
+  assert.equal(typeof helpers.remainingProbeTargets, "function");
+  const ids = ["new", "not-sent", "ok", "failed", "timeout", "unsupported", "running", "interrupted"];
+  const rows = savedProbeRows(ids.map((id) => ({ id, name: id, provider: "", upstream: id, account: "" })), []);
+  rows[1]!.error = "测试服务繁忙，未调用上游";
+  for (const [index, status] of [[2, "available"], [3, "failed"], [4, "timeout"], [5, "unsupported"]] as const) {
+    rows[index]!.status = status;
+    rows[index]!.result = { ...available(ids[index]!), status };
+  }
+  rows[6]!.status = "running";
+  rows[7]!.history = { state: "interrupted" } as DirectProbeRow["history"];
+  assert.deepEqual(helpers.remainingProbeTargets(rows).map((target) => target.id), ["new", "not-sent"]);
+});
+
+// 任意未选行被清空或更新串行到其它模型，都会丢失操作者已取得的结果。
+test("开始剩余或逐行测试只重置所选模型，其它结果保持原样", async () => {
+  const helpers = await import("./directModelProbe.ts");
+  assert.equal(typeof helpers.prepareProbeRows, "function");
+  const rows = savedProbeRows(["done", "pending"].map((id) => ({ id, name: id, provider: "", upstream: id, account: "" })), []);
+  rows[0]!.status = "available";
+  rows[0]!.result = available("done");
+  rows[1]!.error = "未发送";
+  const next = helpers.prepareProbeRows(rows, [rows[1]!.target]);
+  assert.equal(next[0], rows[0]);
+  assert.deepEqual(next[1], { ...rows[1], status: "not_tested", result: null, error: null, history: null });
+  const retry = helpers.prepareProbeRows(next, [rows[0]!.target]);
+  assert.equal(retry[1], next[1]);
+  assert.equal(retry[0]!.result, null);
+  assert.equal(rows[0]!.result?.status, "available");
+});
+
+// 单测其它行之后，先前运行中的存档仍须跟随后端结束，不能永远停在旧状态。
+test("补测期间保留的历史行继续接收持久进度，不覆盖本轮尚未存档的结果", async () => {
+  const helpers = await import("./directModelProbe.ts");
+  assert.equal(typeof helpers.mergeProbeHistory, "function");
+  const targets = ["current", "saved"].map((id) => ({ id, name: id, provider: "", upstream: id, account: "" }));
+  const saved = { id: "record", model_id: "saved", state: "running", result: null } as unknown as NonNullable<DirectProbeRow["history"]>;
+  const rows = savedProbeRows(targets, [saved]);
+  rows[0]!.result = available("current");
+  rows[0]!.status = "available";
+  const completed = { ...saved, state: "completed" as const, result: available("saved") };
+  const merged = helpers.mergeProbeHistory(targets, rows, [completed]);
+  assert.equal(merged[0], rows[0]);
+  assert.equal(merged[1]!.status, "available");
+  assert.equal(merged[1]!.history, completed);
+  assert.equal(merged[1]!.result, completed.result);
 });
 
 // 若只选可见模型、漏掉 embedding 或对重复 id 发两次请求，此断言必须失败。

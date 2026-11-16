@@ -168,6 +168,17 @@ export interface DirectProbeRow {
   history: DirectProbeHistory | null;
 }
 
+/** 只补尚未发送的目标；中断记录的已发调用仍可能完成，须由操作者逐行决定重试。 */
+export function remainingProbeTargets(rows: readonly DirectProbeRow[]): DirectProbeTarget[] {
+  return rows.filter((row) => row.status === "not_tested" && row.history?.state !== "interrupted").map((row) => row.target);
+}
+
+/** 固定本轮选择，保留其余模型的已取得结果，不因补测或逐行测试清空整表。 */
+export function prepareProbeRows(rows: readonly DirectProbeRow[], selected: readonly DirectProbeTarget[]): DirectProbeRow[] {
+  const ids = new Set(selected.map((target) => target.id));
+  return rows.map((row) => ids.has(row.target.id) ? { ...row, status: "not_tested", result: null, error: null, history: null } : row);
+}
+
 /** 每条记录保留同一轮基础与能力结果，不借用其它轮次填空。 */
 export function savedProbeRows(targets: readonly DirectProbeTarget[], records: readonly DirectProbeHistory[]): DirectProbeRow[] {
   const saved = new Map<string, DirectProbeHistory>();
@@ -179,5 +190,17 @@ export function savedProbeRows(targets: readonly DirectProbeTarget[], records: r
       status: history?.state === "running" ? "running" : history?.result?.status ?? "not_tested",
       error: history?.state === "interrupted" ? "本次测试中断，未取得最终结果；已发调用仍可能完成。" : null,
     };
+  });
+}
+
+/** 未参与本轮的历史行仍跟随服务端进度；本轮结果仅补同一采样的存档信息。 */
+export function mergeProbeHistory(targets: readonly DirectProbeTarget[], rows: readonly DirectProbeRow[] | null, records: readonly DirectProbeHistory[]): DirectProbeRow[] {
+  const restored = savedProbeRows(targets, records);
+  if (rows === null) return restored;
+  const byModel = new Map(restored.map((row) => [row.target.id, row]));
+  return rows.map((row) => {
+    const saved = byModel.get(row.target.id);
+    if (row.history !== null && saved?.history) return saved;
+    return row.result && saved?.result?.checked_at === row.result.checked_at ? { ...row, history: saved.history } : row;
   });
 }

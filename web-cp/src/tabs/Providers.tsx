@@ -1,14 +1,15 @@
 import "./operations.css";
 import "./providers/ProviderManagement.css";
 import { Eye, Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { TabProps } from "../App";
 import { ConflictNote } from "../components/ConflictNote";
 import { Field, useRefusalFocus } from "../ui/Field";
 import { Msg, type Note } from "../components/Msg";
 import { RolloutBadge } from "../components/RolloutBadge";
 import { REDACTED, SecretInput } from "../components/SecretInput";
-import { ApiError, groups as groupsApi, settings, tenants, type AdminKey, type ResourceView, type Tenant } from "../lib/api";
+import { ApiError, groups as groupsApi, publicModels, settings, tenants, type AdminKey, type ResourceView, type Tenant } from "../lib/api";
+import { providerMappingCounts } from "../lib/providerMappings";
 import { messageFor, problemAt } from "../lib/errors";
 import { errorText, maskUrl } from "../lib/fmt";
 import { enumAt, loadSchema } from "../lib/schema";
@@ -100,6 +101,9 @@ export function Providers({ canEdit }: TabProps) {
   const groups = useLoad(() => groupsApi.list(), []);
   const [schema, setSchema] = useState<SchemaInfo | null>(null);
   const [open, setOpen] = useState<Open | null>(null);
+  // 一次读取全部真实映射；退出账号编辑时重读，包含模型区刚保存的变更。
+  const mappings = useLoad(() => publicModels.list(), [open?.mode === "edit"]);
+  const mappingCounts = useMemo(() => mappings.data === null ? null : providerMappingCounts(mappings.data), [mappings.data]);
   // 隐去长列表后从当前对象标题进入，避免沿用列表中段的滚动位置。
   useLayoutEffect(() => {
     if (open?.mode !== "edit") return;
@@ -206,7 +210,7 @@ export function Providers({ canEdit }: TabProps) {
         dataLead={editing ? "维护当前账号的连接、分组和模型映射。" : pk.items ? <>已配置 {pk.items.length} 个上游账号，覆盖 {assignedGroups.size} 个分组。账号的协议、模型映射和密钥在此维护。</> : "维护上游连接、协议族、分组与模型映射。"}
         actions={
           <>
-            <Button type="button" className="ops-icon-button" aria-label="刷新" title="刷新上游账号" onClick={() => void pk.reload()}><RefreshCw aria-hidden /></Button>
+            <Button type="button" className="ops-icon-button" aria-label="刷新" title="刷新上游账号" onClick={() => { void pk.reload(); void mappings.reload(); }}><RefreshCw aria-hidden /></Button>
             {canEdit && (!open || open.mode === "new") && (
               <Button ref={createTrigger} kind="primary" disabled={opening} onClick={() => void openNew()}>
                 <Plus aria-hidden />
@@ -323,6 +327,7 @@ export function Providers({ canEdit }: TabProps) {
             actions={pk.items && <span className="text-caption text-fg-3 tabular-nums">{pk.items.length} 个</span>}
           />
           <RecordTableToolbar search={{ value: accountTable.query, onChange: accountTable.setQuery, label: "搜索上游账号", placeholder: "名称、标识、协议族、供应商或分组" }}><label className="text-caption">协议族<Select size="compact" value={adapterFilter} onValueChange={(value) => setAdapterFilter(value)}><option value="">全部协议族</option>{[...new Set((pk.items ?? []).map((a) => a.doc.adapter).filter((a): a is string => Boolean(a)))].sort().map((adapter) => <option key={adapter} value={adapter}>{adapter}</option>)}</Select></label></RecordTableToolbar>
+          {mappings.error && <p className="note warn" role="alert">映射模型数量读取失败，暂无法判断账号是否未映射，请刷新后重试。</p>}
           {pk.items === null ? (
             !pk.error && <Loading />
           ) : pk.items.length === 0 ? (
@@ -335,6 +340,7 @@ export function Providers({ canEdit }: TabProps) {
                   <th>协议 / 供应商</th>
                   <th>接口地址</th>
                   <th>分组</th>
+                  <th>映射模型数量</th>
                   <th>状态</th>
                   <th className="right">操作</th>
                 </tr>
@@ -359,6 +365,12 @@ export function Providers({ canEdit }: TabProps) {
                     </td>
                     <td className="whitespace-normal">
                       <GroupBadges groups={a.doc.groups ?? []} />
+                    </td>
+                    <td title="按未退役公共模型的已保存映射统计，包含禁用映射。">
+                      {mappingCounts === null || mappings.error ? "—" : <>
+                        <span className="tabular-nums">{mappingCounts.get(a.id) ?? 0}</span>
+                        {!mappingCounts.has(a.id) && <span className="ops-cell-secondary text-warning">未映射</span>}
+                      </>}
                     </td>
                     <td>
                       <RolloutBadge rollout={a.rollout} />
