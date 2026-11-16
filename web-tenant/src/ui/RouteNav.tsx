@@ -134,8 +134,9 @@ export function RouteNav<Id extends string>({
       onKeyDown={onKeyDown}
     >
       <span ref={lens} className="lens" aria-hidden="true" />
-      {items.map((t) => (
-        <button
+      {items.map((t) => {
+        const Icon = t.icon;
+        return <button
           key={t.id}
           type="button"
           role="tab"
@@ -147,9 +148,10 @@ export function RouteNav<Id extends string>({
           onClick={() => onSelect(t.id)}
         >
           <span className="stop" aria-hidden="true" />
+          {Icon && <Icon className="route-icon" aria-hidden />}
           <span className="name">{t.label}</span>
-        </button>
-      ))}
+        </button>;
+      })}
     </nav>
   );
 }

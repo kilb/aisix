@@ -1,7 +1,8 @@
 /* 分段导航采用模板胶囊，选中态直接跟随语义前景，不依赖装饰滑块布局。 */
 .route { position: relative; display: inline-flex; min-width: 0; max-width: 100%; align-items: center; gap: 4px; }
 .route > .lens, .route > button > .stop { display: none; }
-.route > button { position: relative; min-width: 44px; min-height: var(--h-control-sm); padding: 6px 16px; border: 0; background: transparent; color: var(--fg-3); font-size: var(--text-small); font-weight: 600; cursor: pointer; }
+.route > button { position: relative; display: inline-flex; min-width: 44px; min-height: var(--h-control-sm); align-items: center; justify-content: center; gap: 8px; padding: 6px 16px; border: 0; background: transparent; color: var(--fg-3); font-size: var(--text-small); font-weight: 600; cursor: pointer; }
+.route-icon { width: 16px; height: 16px; flex: none; }
 .route > button:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
 .route-seg { flex-wrap: wrap; padding: 4px; border-radius: var(--r-round); background: var(--tint); }
 .route-seg > button { flex: 1; border-radius: var(--r-round); }

@@ -19,6 +19,7 @@ import { SidebarMenuButton, SidebarShell } from "./ui/Sidebar";
 import { ThemeToggle } from "./ui/ThemeToggle";
 import { Gate } from "./Gate";
 import { Org, ROLE_LABEL } from "./Org";
+import "./App.css";
 
 // 业务页按实际导航加载，登录与概览不再下载全部管理表单。
 const AccountSettings = lazy(() => import("./AccountSettings").then((module) => ({ default: module.AccountSettings })));
@@ -283,7 +284,7 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
         </div>
       )}
 
-      <main id="workspace-main" tabIndex={-1} className="page shell-content">
+      <main id="workspace-main" tabIndex={-1} className={current === "account" ? "page shell-content" : "page shell-content tenant-data-content"}>
         <section
           key={`${tenant.id}:${member.id}:${member.role}:${tenant.status}`}
           id={`tab-${current}`}

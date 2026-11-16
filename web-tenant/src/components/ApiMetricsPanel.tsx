@@ -1,5 +1,6 @@
 import { Select } from "../ui/Select";
 import { useEffect, useId, useRef, useState } from "react";
+import { Activity, Braces, Database, ReceiptText, Timer, type LucideIcon } from "lucide-react";
 import { fetchApiMetrics, maximumMetricIndex, metricsRangeError, rankMetricModels, requestRateSummary, sampleCoverage, tokenTrendValue, type ApiMetricValues, type ApiMetricsResponse, type MetricsBucket, type MetricsLatency, type MetricsScope } from "../lib/apiMetrics";
 import { formatCount, formatDuration, formatRatio, normalizeExactValues } from "../lib/chartFormat";
 import { cn } from "../lib/cn";
@@ -33,7 +34,13 @@ export type ApiMetricView = "requests" | "latency" | "tokens" | "cache" | "cost"
 type LatencyKind = "first_token_latency_ms" | "response_latency_ms" | "attempt_duration_ms";
 type CacheKind = "tokens" | "response";
 type TokenKind = "input_tokens" | "completion_tokens";
-const VIEWS: { value: ApiMetricView; label: string }[] = [{ value: "requests", label: "请求" }, { value: "latency", label: "延迟" }, { value: "tokens", label: "Token" }, { value: "cache", label: "缓存" }, { value: "cost", label: "费用" }];
+const VIEWS: { value: ApiMetricView; label: string; icon: LucideIcon }[] = [
+  { value: "requests", label: "请求", icon: Activity },
+  { value: "latency", label: "延迟", icon: Timer },
+  { value: "tokens", label: "Token", icon: Braces },
+  { value: "cache", label: "缓存", icon: Database },
+  { value: "cost", label: "费用", icon: ReceiptText },
+];
 const TOKEN_LABELS: Record<TokenKind, string> = { input_tokens: "已记录输入 token", completion_tokens: "已记录输出 token" };
 const TOKEN_NOTE = "趋势只包含有可用用量记录的尝试，也包含已计费重试；缺失用量不当作零。可用记录可能含网关估算，不等于上游精确报告。输入合计为原始输入 + 额外缓存读取 + 额外缓存创建，输入内缓存子集不重复相加。";
 const LATENCY_LABELS: Record<LatencyKind, string> = { first_token_latency_ms: "首 token 延迟", response_latency_ms: "响应延迟", attempt_duration_ms: "上游尝试完整耗时" };
@@ -190,7 +197,7 @@ export function ApiMetricsPanel({ scope, enabled, from, to, bucket, modelId, mem
           const index = VIEWS.findIndex(option => option.value === item.value);
           const next = event.key === "Home" ? VIEWS[0] : event.key === "End" ? VIEWS[VIEWS.length - 1] : event.key === "ArrowRight" ? VIEWS[(index + 1) % VIEWS.length] : event.key === "ArrowLeft" ? VIEWS[(index - 1 + VIEWS.length) % VIEWS.length] : undefined;
           if (next) { event.preventDefault(); selectView(next.value); viewButtons.current[next.value]?.focus(); }
-        }} className="metric-tab">{item.label}</button>)}
+        }} className="metric-tab inline-flex items-center justify-center gap-2 whitespace-nowrap max-[599px]:flex-1 max-[599px]:gap-1 max-[599px]:px-1.5"><item.icon className="size-4 shrink-0" aria-hidden /><span>{item.label}</span></button>)}
       </div>
       <BentoGrid id={panelId} role="tabpanel" aria-labelledby={`${choiceId}-${view}`} tabIndex={0}>
       <Card tone="lilac" className={cn(span.d7, "metric-analysis-main")}>

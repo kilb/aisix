@@ -1,0 +1,2 @@
+/* 数据页与顶部位置栏对齐，长文与账号表单继续保留各自的可读宽度。 */
+.sidebar-shell .shell-content.tenant-data-content { max-width: none; margin-inline: 0; }
