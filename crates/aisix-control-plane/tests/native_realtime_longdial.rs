@@ -705,14 +705,20 @@ async fn ordinary_ws_long_dial_renews_the_real_lease_before_natural_expiry_and_p
         loop {
             let sample = lease_sample(&f).await;
             same_identity(&f, &initial, &sample);
-            assert!(
-                sample.coverage != "complete" && sample.accounting_state != "settled",
-                "plain close cannot imply complete supplier coverage"
+            assert_ne!(
+                sample.accounting_state, "settled",
+                "plain close cannot settle incomplete supplier coverage"
             );
-            if sample.state == "closed"
-                && sample.coverage == "unknown"
-                && sample.accounting_state == "awaiting_reconciliation"
-            {
+            // Socket 关闭先于持久 checkpoint；live 仍可保留上一条已收费事实的 complete。
+            if sample.state == "closed" {
+                assert_eq!(
+                    sample.coverage, "unknown",
+                    "plain close must leave supplier coverage unknown"
+                );
+                assert_eq!(
+                    sample.accounting_state, "awaiting_reconciliation",
+                    "plain close must retain unconfirmed coverage for reconciliation"
+                );
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
