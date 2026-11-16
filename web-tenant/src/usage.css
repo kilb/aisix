@@ -1,37 +1,3 @@
-/* 用量展开保留完整公式，较窄屏幕由各表格独立滚动。 */
-.usage-detail > td {
-  padding: 20px var(--dt-edge, 28px) 24px;
-  background: var(--color-well);
-  color: var(--color-ink);
-  white-space: normal;
-}
-.dt tbody tr.usage-detail:hover {
-  background: var(--color-well);
-}
-.dt tr:has(+ tr.usage-detail) > td {
-  border-bottom: 0;
-}
-.usage-detail h3 {
-  margin-bottom: 8px;
-  font-size: var(--text-meta);
-  line-height: var(--text-meta--line-height);
-  font-family: var(--font-mono);
-  font-weight: 400;
-}
-.usage-detail .dt-wrap {
-  --dt-edge: 12px;
-  max-width: 720px;
-  border: 1px solid var(--color-line);
-  border-radius: var(--radius-cell);
-  background: var(--color-surface);
-}
-.usage-detail .dt th {
-  background: var(--color-surface);
-}
-.usage-detail .hint {
-  margin-top: 8px;
-  color: var(--color-ink-soft);
-}
 .usage-qty {
   display: inline-flex;
   flex-wrap: wrap;
@@ -74,30 +40,6 @@
   font-size: 13px;
   line-height: 20px;
 }
-.usage-detail h3 {
-  margin-top: 16px;
-  font-family: inherit;
-  font-size: 15px;
-  line-height: 24px;
-  font-weight: 600;
-}
-.usage-detail [aria-label="费用计算"] {
-  margin-bottom: 20px;
-  padding-bottom: 20px;
-  border-bottom: 1px solid var(--color-line);
-}
-.usage-detail [aria-label="费用计算"] :is(p, dd) {
-  overflow-wrap: anywhere;
-}
-.usage-detail [aria-label="费用计算"] dt {
-  color: var(--color-muted);
-  font-size: 13px;
-  line-height: 20px;
-}
-.usage-detail [aria-label="费用计算"] dd {
-  margin: 4px 0 0;
-  font-variant-numeric: tabular-nums;
-}
 @media (max-width: 599px) {
   .usage-filters {
     gap: 16px 12px;
@@ -105,19 +47,17 @@
   .usage-filters > .field {
     width: 100%;
   }
-  .usage-detail > td {
-    padding: 16px;
-  }
 }
 
-/* 请求身份合并为一列，性能值分两行，主表保持六列而不是横向十一列。 */
+/* 时间、性能、用量与费用紧凑呈现，剩余宽度留给模型和请求标识。 */
 .usage-record-section .dt { table-layout: fixed; }
 .usage-column-action { width: 52px; }
-.usage-column-time { width: 15%; }
+.usage-column-time { width: 9rem; }
 .usage-column-request { width: auto; }
-.usage-column-state { width: 15%; }
-.usage-column-timing { width: 24%; }
-.usage-column-charge { width: 17%; }
+.usage-column-state { width: 7rem; }
+.usage-column-timing { width: 12rem; }
+.usage-column-tokens { width: 12rem; }
+.usage-column-charge { width: 8rem; }
 .usage-record-section .dt :is(td, th) { white-space: normal; min-width: 0; overflow-wrap: anywhere; }
 .usage-request-identity > strong { display: block; font-weight: 500; }
 .usage-request-identity .cell-note { display: block; margin-top: 6px; color: var(--muted-foreground); font-size: 12px; line-height: 18px; }
@@ -126,7 +66,27 @@
 .usage-timing-value > span { display: block; margin-bottom: 2px; color: var(--muted-foreground); font-size: 12px; line-height: 18px; }
 .usage-row-action .btn { width: 44px; padding-inline: 0; }
 .usage-record-section td[data-label="状态"] .lamp { max-width: 100%; white-space: normal; }
-.usage-detail .dt-wrap { max-width: 100%; }
+.tenant-call-tokens { display: grid; gap: 4px; margin: 0; font-variant-numeric: tabular-nums; }
+.tenant-call-tokens > div { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.tenant-call-tokens dt { color: var(--muted-foreground); font-size: 12px; line-height: 18px; }
+.tenant-call-tokens dd { margin: 0; font-size: 13px; line-height: 20px; }
+.tenant-call-usage .cell-note { display: block; margin-top: 6px; color: var(--muted-foreground); font-size: 12px; line-height: 18px; text-align: left; }
+.tenant-call-table { container: tenant-calls / inline-size; }
+
+/* 侧栏占宽后按表格实际可用空间切换，避免中等屏幕把模型列挤到零。 */
+@container tenant-calls (max-width: 960px) {
+  .dt { display: block; width: 100%; }
+  .dt > colgroup { display: none; }
+  .dt > thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+  .dt > tbody { display: block; }
+  .dt > tbody > tr { position: relative; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 14px; padding: 12px; border-bottom: 1px solid var(--color-line); }
+  .dt > tbody > tr > td { display: block; width: auto; min-height: 0; height: auto; padding: 0; border: 0; text-align: left; }
+  .dt > tbody > tr > td[data-label]::before { display: block; margin-bottom: 6px; content: attr(data-label); color: var(--muted-foreground); font-size: 12px; line-height: 18px; }
+  .dt > tbody > tr > .usage-row-action { grid-column: 2; grid-row: 1; justify-self: end; }
+  .dt > tbody > tr > td[data-label="时间"] { grid-column: 1; grid-row: 1; }
+  .dt > tbody > tr > :is(.usage-request-identity, [data-label="响应性能"], [data-label="Token 消耗"], [data-label="费用"]) { grid-column: 1 / -1; }
+  .dt :is(.usage-performance, .tenant-call-tokens) { text-align: left; max-width: 24rem; }
+}
 
 @media (max-width: 1050px) {
   .usage-record-section .dt { display: block; width: 100%; }
@@ -140,10 +100,7 @@
   .usage-record-section .dt > tbody > tr > td[data-label="时间"] { grid-column: 1; grid-row: 1; }
   .usage-record-section .dt > tbody > tr > .usage-request-identity { grid-column: 1 / -1; }
   .usage-record-section .dt > tbody > tr > td[data-label="费用"] { grid-column: 1 / -1; }
-  .usage-record-section .dt > tbody > tr.usage-detail { display: block; padding: 0; }
-  .usage-record-section .dt > tbody > tr.usage-detail > td { padding: 16px; }
-  .usage-detail .dt > tbody > tr { padding-inline: 12px; }
 }
 
 .usage-record-section .usage-request-identity .cell-note { margin-top: 2px; }
-@media (max-width: 1050px) { .usage-record-section .dt > tbody > tr { gap: 10px 14px; padding-block: 12px; } .usage-record-section td[data-label="响应性能"] { grid-column: 1 / -1; } .usage-record-section .usage-performance { text-align: left; max-width: 24rem; } }
+@media (max-width: 1050px) { .usage-record-section .dt > tbody > tr { gap: 10px 14px; padding-block: 12px; } .usage-record-section td:is([data-label="响应性能"], [data-label="Token 消耗"]) { grid-column: 1 / -1; } .usage-record-section :is(.usage-performance, .tenant-call-tokens) { text-align: left; max-width: 24rem; } }

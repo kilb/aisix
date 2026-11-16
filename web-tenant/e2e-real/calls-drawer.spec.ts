@@ -1,0 +1,193 @@
+import { expect, test, type Locator, type Page } from "@playwright/test";
+import { mkdirSync, readFileSync } from "node:fs";
+import { join, resolve } from "node:path";
+
+interface Scenario { kind: "positive" | "missing"; event_id: string; request_id: string; tenant_auth: "metricsOwner" }
+interface CallRecord {
+  event_id: string; request_id: string; first_token_latency_ms: number | null; attempt_duration_ms: number | null; throughput_tps: number | null;
+  usage_input_tokens: number | null; usage: Record<string, number | null> | null;
+  charge: { status: string; calculation: { final_micro_cny: string | null } };
+}
+function readJson(path: string): any {
+  try { return JSON.parse(readFileSync(path, "utf8")); }
+  catch { throw new Error("Real drawer acceptance state could not be read"); }
+}
+const session = resolve(process.env.REFINED_QA_SESSION!);
+const state = readJson(join(session, "public.json"));
+const auth = readJson(join(session, "local-auth.json"));
+const output = resolve(process.env.REFINED_QA_OUTPUT!);
+if (state.ready !== true || state.realBackend !== true || state.mockUpstream !== false) throw new Error("Real isolated backend is required");
+for (const field of ["tenantUrl", "adminUrl", "httpUrl"]) {
+  const url = new URL(state[field]);
+  if (!["http:", "https:"].includes(url.protocol) || !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname) || url.username || url.password) throw new Error("Only isolated loopback acceptance URLs are allowed");
+}
+const baseUrl: string = state.tenantUrl;
+const scenarios = state.byteTokenEvidence?.cases as Scenario[] | undefined;
+if (!Array.isArray(scenarios) || !scenarios.some(item => item.kind === "positive") || !scenarios.some(item => item.kind === "missing") || scenarios.some(item => item.tenant_auth !== "metricsOwner" || !item.event_id || !item.request_id)) throw new Error("Real positive and missing call evidence is required");
+if (!state.tokenUiFixture?.apiKeyId || !state.tokenUiFixture?.tenantId) throw new Error("Real tenant and API key scope is required");
+const positive = scenarios.find(item => item.kind === "positive")!;
+const missing = scenarios.find(item => item.kind === "missing")!;
+const runtimeErrors = new WeakMap<Page, string[]>();
+const apiRequests = new WeakMap<Page, string[]>();
+const authenticated = new WeakMap<Page, boolean>();
+
+test.beforeEach(async ({ page }) => {
+  const errors: string[] = [];
+  const reads: string[] = [];
+  runtimeErrors.set(page, errors); apiRequests.set(page, reads); authenticated.set(page, false);
+  page.on("pageerror", () => errors.push("pageerror"));
+  page.on("console", message => {
+    if (message.type() !== "error") return;
+    const bootstrap = !authenticated.get(page) && /401|Unauthorized/.test(message.text()) && /\/(?:api\/me|api\/session)(?:\?|$)/.test(message.location().url);
+    if (!bootstrap) errors.push("console error");
+  });
+  page.on("response", response => {
+    const path = new URL(response.url()).pathname;
+    if (response.status() < 400 || !/^\/(?:api|admin)\//.test(path)) return;
+    if (response.status() === 401 && !authenticated.get(page) && ["/api/me", "/api/session"].includes(path)) return;
+    errors.push(`HTTP ${response.status()} ${path}`);
+  });
+  page.on("request", request => {
+    const url = new URL(request.url());
+    if (/^\/(?:api|admin)\//.test(url.pathname)) reads.push(`${request.method()} ${url.pathname}${url.search}`);
+  });
+  const who = auth.metricsOwner;
+  if (typeof who?.email !== "string" || typeof who?.password !== "string") throw new Error("Isolated owner login is required");
+  await page.goto(baseUrl);
+  await expect(page.getByLabel("邮箱", { exact: true })).toBeVisible();
+  try {
+    await page.getByLabel("邮箱", { exact: true }).fill(who.email);
+    await page.getByLabel("口令", { exact: true }).fill(who.password);
+  } catch { throw new Error("Isolated owner credentials could not be entered"); }
+  const response = page.waitForResponse(answer => new URL(answer.url()).pathname === "/api/login" && answer.request().method() === "POST");
+  await page.getByRole("button", { name: "登录", exact: true }).click();
+  expect((await response).status()).toBe(200);
+  authenticated.set(page, true);
+});
+
+test.afterEach(async ({ page }) => {
+  expect(runtimeErrors.get(page)).toEqual([]);
+  expect(apiRequests.get(page)!.filter(request => !request.startsWith("GET ") && !/^POST \/api\/(?:login|logout)$/.test(request)), "only explicit local session writes are allowed").toEqual([]);
+  const status = await page.evaluate(async () => (await fetch("/api/logout", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" })).status);
+  expect(status).toBe(204);
+});
+
+async function showCall(page: Page, scenario: Scenario): Promise<{ row: Locator; call: CallRecord }> {
+  const query = new URLSearchParams({ api_key_id: state.tokenUiFixture.apiKeyId, request_id: scenario.request_id });
+  await page.goto(`${baseUrl}/#calls?${query}`);
+  await page.evaluate(() => document.fonts.ready);
+  await page.waitForLoadState("networkidle");
+  expect(new URL(page.url()).hash).toContain("#calls?");
+  await expect(page).toHaveTitle(/AISIX/i);
+  await expect(page.getByRole("heading", { name: "调用记录", exact: true }).first()).toBeVisible();
+  const answer = await page.evaluate(async path => {
+    const response = await fetch(path, { credentials: "include" });
+    return { status: response.status, body: await response.json() };
+  }, `/api/usage/calls?${query}`);
+  expect(answer.status).toBe(200);
+  const matches = answer.body.items.filter((item: CallRecord) => item.event_id === scenario.event_id);
+  expect(matches).toHaveLength(1);
+  const call = matches[0] as CallRecord;
+  expect(call.request_id).toBe(scenario.request_id);
+  const row = page.getByRole("table", { name: "调用记录", exact: true }).getByRole("row").filter({ hasText: scenario.request_id });
+  await expect(row).toHaveCount(1);
+  await expect(row).toBeVisible();
+  return { row, call };
+}
+function definition(area: Locator, label: string): Locator {
+  return area.getByText(label, { exact: true }).locator("..").locator("dd");
+}
+async function expectDuration(value: Locator, milliseconds: number | null): Promise<void> {
+  if (milliseconds === null) { await expect(value).toHaveText("—"); return; }
+  const shown = (await value.innerText()).match(/^([\d,.]+) (ms|s)$/);
+  expect(shown, "recorded duration must retain its unit").not.toBeNull();
+  const multiplier = shown![2] === "s" ? 1000 : 1;
+  expect(Math.abs(Number(shown![1]!.replaceAll(",", "")) * multiplier - milliseconds)).toBeLessThanOrEqual(multiplier / 200 + 0.0001);
+}
+async function expectCharge(value: Locator, finalMicroCny: string): Promise<void> {
+  const shown = (await value.innerText()).match(/(-)?¥([\d,]+)(?:\.(\d+))?/);
+  expect(shown, "charged amount must show a precise currency value").not.toBeNull();
+  expect((shown![3] ?? "").length).toBeLessThanOrEqual(6);
+  const micro = (BigInt(shown![2]!.replaceAll(",", "")) * 1_000_000n + BigInt((shown![3] ?? "").padEnd(6, "0"))) * (shown![1] ? -1n : 1n);
+  expect(micro.toString()).toBe(finalMicroCny);
+}
+async function screenshot(page: Page, name: string): Promise<void> {
+  mkdirSync(join(output, "screenshots"), { recursive: true });
+  await page.screenshot({ path: join(output, "screenshots", name), fullPage: false });
+}
+
+// 列表使用真实调用的API字段逐项核对；缺失不能被默认为零或由总用时推算。
+test("real-call-list-preserves-measured-performance-token-usage-and-unknowns", async ({ page }) => {
+  for (const scenario of [positive, missing]) {
+    const { row, call } = await showCall(page, scenario);
+    for (const field of ["first_token_latency_ms", "attempt_duration_ms", "throughput_tps", "usage_input_tokens", "usage"]) expect(Object.hasOwn(call, field), field).toBe(true);
+    const tokens = row.getByLabel("记录 Token 消耗", { exact: true });
+    for (const [label, value] of [["输入", call.usage_input_tokens], ["输出", call.usage?.completion_tokens]] as const) {
+      await expect(definition(tokens, label)).toHaveText(value == null ? "—" : `${new Intl.NumberFormat("en-US").format(value)} Token`);
+    }
+    const performance = row.getByLabel("响应性能", { exact: true });
+    await expectDuration(definition(performance, "首字"), call.first_token_latency_ms);
+    await expectDuration(definition(performance, "总用时"), call.attempt_duration_ms);
+    if (scenario.kind === "positive") {
+      expect(call.first_token_latency_ms).not.toBeNull(); expect(call.first_token_latency_ms!).toBeGreaterThanOrEqual(0);
+      expect(call.throughput_tps).not.toBeNull(); expect(call.throughput_tps!).toBeGreaterThan(0);
+      expect(Number((await definition(performance, "TPS").innerText()).replaceAll(",", ""))).toBeCloseTo(call.throughput_tps!, 2);
+      expect(call.usage_input_tokens).toBeGreaterThan(0); expect(call.usage?.completion_tokens).toBeGreaterThan(0);
+      expect(call.charge.status).toBe("charged"); expect(call.charge.calculation.final_micro_cny).not.toBeNull();
+      await expectCharge(row.locator('td[data-label="费用"]'), call.charge.calculation.final_micro_cny!);
+    } else {
+      expect(call.first_token_latency_ms).toBeNull(); expect(call.throughput_tps).toBeNull();
+      await expect(definition(performance, "TPS")).toHaveText("—");
+    }
+    await expect(row).toContainText("按字节估算 Token");
+    await screenshot(page, `tenant-call-list-1440-${scenario.kind}.png`);
+  }
+  await expect(page.getByText(/旧记录未采集/)).toBeVisible();
+});
+
+// 打开详情不请求逐条数据；Escape、Tab约束与遮罩关闭保留原行焦点。
+test("real-call-drawer-keeps-fee-details-keyboard-focus-and-no-extra-requests", async ({ page }) => {
+  const { row, call } = await showCall(page, positive);
+  const trigger = row.getByRole("button", { name: "查看调用详情", exact: true });
+  const before = apiRequests.get(page)!.length;
+  await trigger.click();
+  const dialog = page.getByRole("dialog", { name: "调用详情", exact: true });
+  await expect(dialog).toBeVisible();
+  for (const label of ["请求信息", "响应性能", "Token 消耗", "费用计算", "计费明细"]) await expect(dialog.getByRole("heading", { name: label, exact: true })).toBeVisible();
+  await expect(dialog.getByText(positive.request_id, { exact: true })).toBeVisible();
+  await expectCharge(definition(dialog.getByRole("region", { name: "费用计算", exact: true }), "最终费用"), call.charge.calculation.final_micro_cny!);
+  for (let i = 0; i < 6; i++) {
+    await page.keyboard.press("Tab");
+    expect(await dialog.evaluate(element => element.contains(document.activeElement)), "Tab must stay inside the detail drawer").toBe(true);
+  }
+  await screenshot(page, "tenant-call-drawer-1440.png");
+  await page.keyboard.press("Escape");
+  await expect(dialog).toHaveCount(0); await expect(trigger).toBeFocused();
+  await trigger.click(); await expect(dialog).toBeVisible();
+  await page.mouse.click(8, 120);
+  await expect(dialog).toHaveCount(0); await expect(trigger).toBeFocused();
+  await page.waitForLoadState("networkidle");
+  expect(apiRequests.get(page)!.slice(before), "detail open and close must not create an API fan-out").toEqual([]);
+});
+
+// 窄屏抽屉保留完整宽度、内部滚动与可达关闭按钮，页面本身不横向溢出。
+test("real-call-drawer-mobile-fits-scrolls-and-restores-focus", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 667 });
+  const { row } = await showCall(page, positive);
+  const trigger = row.getByRole("button", { name: "查看调用详情", exact: true });
+  await trigger.click();
+  const dialog = page.getByRole("dialog", { name: "调用详情", exact: true });
+  await expect(dialog).toBeVisible();
+  const bounds = await dialog.boundingBox();
+  expect(bounds).not.toBeNull(); expect(bounds!.width).toBeGreaterThanOrEqual(360); expect(bounds!.x).toBeGreaterThanOrEqual(0); expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(391);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  expect(await dialog.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
+  const body = dialog.locator(".tenant-call-drawer-body");
+  expect(await body.evaluate(element => element.scrollHeight > element.clientHeight)).toBe(true);
+  await body.hover(); await page.mouse.wheel(0, 1600);
+  await expect.poll(() => body.evaluate(element => element.scrollTop)).toBeGreaterThan(0);
+  await expect(dialog.getByRole("button", { name: "关闭调用详情", exact: true })).toBeInViewport();
+  await screenshot(page, "tenant-call-drawer-390.png");
+  await dialog.getByRole("button", { name: "关闭调用详情", exact: true }).click();
+  await expect(dialog).toHaveCount(0); await expect(trigger).toBeFocused();
+});

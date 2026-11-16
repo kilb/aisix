@@ -1,5 +1,5 @@
 import { Select } from "./ui/Select";
-import { Fragment, useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { ChevronRight } from "lucide-react";
 import {
   ApiError,
@@ -31,6 +31,8 @@ import { UsagePerformance } from "./components/UsagePerformance";
 import { UsageIoAuditDetails, UsageTokenEstimate } from "./components/UsageIoAuditDetails";
 import { UsageRecordFilters } from "./components/UsageRecordFilters";
 import { usageRecordFilterParams, usageRecordFilterValues } from "./lib/usageRecordFilters";
+import { formatCount } from "./lib/chartFormat";
+import { CallLogDrawer } from "./CallLogDrawer";
 
 function failure(e: unknown): string {
   return e instanceof ApiError ? messageFor(e) : String(e);
@@ -165,6 +167,90 @@ function FeeCalculation({ call }: { call: Call }) {
       <UsageIoAuditDetails data={call} />
     </section>
   );
+}
+
+/** 实际记录用量与按字节估算分开，缓存与推理子项不在列表重复相加。 */
+function CallTokens({ call }: { call: Call }) {
+  return <dl className="tenant-call-tokens" aria-label="记录 Token 消耗">
+    <div><dt>输入</dt><dd>{formatCount(call.usage_input_tokens)}{call.usage_input_tokens == null ? "" : " Token"}</dd></div>
+    <div><dt>输出</dt><dd>{formatCount(call.usage?.completion_tokens)}{call.usage?.completion_tokens == null ? "" : " Token"}</dd></div>
+  </dl>;
+}
+
+function CallLogRow({ call: c, onDetails }: { call: Call; onDetails: (trigger: HTMLButtonElement) => void }) {
+  return <tr>
+    <td className="usage-row-action">
+      <Button kind="quiet" size="sm" aria-haspopup="dialog" aria-label="查看调用详情" title="查看调用详情" className="tenant-icon-action" onClick={event => onDetails(event.currentTarget)}>
+        <ChevronRight aria-hidden="true" />
+      </Button>
+    </td>
+    <td className="tabular" data-label="时间">{fmtBeijing(c.occurred_at)}</td>
+    <td data-label="模型 / 请求" className="usage-request-identity">
+      <strong>{c.model.name || "—"}</strong>
+      <span className="cell-note">密钥 {c.api_key.label || "—"} · 成员 {c.member ? (c.member.display_name ?? "成员") : "—"}</span>
+      <span className="cell-note">{c.request_id ? <code>{c.request_id}</code> : "—"}</span>
+    </td>
+    <td data-label="状态">
+      <CallStatusLamp call={c} />
+      <span className="cell-note">分组 {c.charge.group ? c.charge.group.display_name : "—"}</span>
+    </td>
+    <td className="num" data-label="响应性能"><UsagePerformance data={c} /></td>
+    <td className="num tenant-call-usage" data-label="Token 消耗">
+      <CallTokens call={c} />
+      {c.usage_estimated === true && <span className="cell-note">含网关估算用量</span>}
+      <UsageTokenEstimate data={c} />
+    </td>
+    <td className="num" data-label="费用">{chargeText(c)}</td>
+  </tr>;
+}
+
+/** 同一条记录的详情按小标题分区，保留历史费用公式与完整计价行。 */
+function CallLogDetails({ call: c }: { call: Call }) {
+  return <>
+    <section className="tenant-call-section" aria-label="请求信息">
+      <h3>请求信息</h3>
+      <dl className="tenant-call-facts">
+        <div><dt>请求 ID</dt><dd><code>{c.request_id || "—"}</code></dd></div>
+        <div><dt>调用时间</dt><dd>{fmtBeijing(c.occurred_at)}</dd></div>
+        <div><dt>模型</dt><dd>{c.model.name || "—"}</dd></div>
+        <div><dt>状态</dt><dd><CallStatusLamp call={c} /></dd></div>
+        <div><dt>密钥</dt><dd>{c.api_key.label || "—"}</dd></div>
+        <div><dt>成员</dt><dd>{c.member?.display_name ?? (c.member ? "成员" : "—")}</dd></div>
+        <div><dt>计价分组</dt><dd>{c.charge.group?.display_name ?? "—"}</dd></div>
+        <div><dt>费用</dt><dd>{chargeText(c)}</dd></div>
+      </dl>
+    </section>
+    <section className="tenant-call-section" aria-label="响应性能">
+      <h3>响应性能</h3>
+      <UsagePerformance data={c} />
+      <p className="hint">首字与生成 TPS 仅显示实测值；无内容、非流式或旧记录未采集时显示 —。TPS 不使用总用时估算。</p>
+    </section>
+    <section className="tenant-call-section" aria-label="Token 消耗">
+      <h3>Token 消耗</h3>
+      <CallTokens call={c} />
+      <p className="hint">输入与输出均为已记录用量，未记录的用量显示 —。{c.usage_estimated === true ? "本次含网关估算用量，费用按该用量计费。" : ""}</p>
+      <UsageTokenEstimate data={c} />
+    </section>
+    <div className="tenant-call-section"><FeeCalculation call={c} /></div>
+    <section className="tenant-call-section" aria-label="计费明细">
+      <h3>计费明细</h3>
+      {c.charge.lines === null ? <p className="hint">这次调用的金额由一次未记录费率明细的重新定价更正，费率明细不可知。</p>
+        : c.charge.lines.length === 0 ? <p className="hint">{c.charge.status === "pending" ? "尚未计价，计费项未知" : "这次调用没有计费项"}</p>
+        : <DataTable label="计费明细" compact>
+          <thead><tr><th>计量</th><th className="num">数量</th><th className="num">折扣前单价（元/百万）</th><th className="num">折后单价（元/百万）</th></tr></thead>
+          <tbody>{c.charge.lines.map(line => <tr key={line.dimension}>
+            <td data-label="计量">{dimensionLabel(line.dimension)}</td>
+            <td className="num" data-label="数量">{line.quantity}</td>
+            <td className="num" data-label="折扣前单价（元/百万）">{line.rate_cny === null ? "—" : unitPrice(line.dimension, line.rate_cny)}</td>
+            <td className="num" data-label="折后单价（元/百万）">{(() => {
+              const rate = line.rate_cny === null ? null : discountedRate(line.rate_cny, c.charge.discount_bps);
+              return rate === null ? "—" : unitPrice(line.dimension, rate);
+            })()}</td>
+          </tr>)}</tbody>
+        </DataTable>}
+      {(c.charge.discount_bps ?? 0) > 0 && <p className="hint">本次按组织折扣计费：在折扣前的价格上减免 {percentOf(c.charge.discount_bps ?? 0)}。</p>}
+    </section>
+  </>;
 }
 
 /** The summary's span when no date is chosen: the last 30 days by day, the last 12 months by month. */
@@ -467,7 +553,8 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
   });
   const loadedSearch = useRef("");
   loadedSearch.current = searchQuery;
-  const [open, setOpen] = useState<Set<string>>(new Set());
+  const [selected, setSelected] = useState<Call | null>(null);
+  const detailTrigger = useRef<HTMLButtonElement>(null);
   const ticket = useRef(0);
 
   useEffect(() => {
@@ -480,7 +567,7 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
     const mine = ++ticket.current;
     morePending.current = false;
     setMore(false);
-    setOpen(new Set());
+    setSelected(null);
     if (!range) {
       setResult({ key: requestKey, rows: [], next: null, error: null });
       return;
@@ -526,14 +613,6 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
     }
   }
 
-  function toggle(id: string) {
-    setOpen((cur) => {
-      const n = new Set(cur);
-      if (!n.delete(id)) n.add(id);
-      return n;
-    });
-  }
-
   return (
     <Section title="调用记录" number={8}>
       <Filters>
@@ -563,6 +642,7 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
       <RecordTableToolbar search={{ value: searchQuery, onChange: value => update({ q: value }), label: "搜索已加载调用", placeholder: "模型、密钥、成员或请求 ID" }} />
       {query.get("member_id") && <p className="hint" role="status">已按成员 {query.get("member_id")} 筛选。</p>}
       <p className="hint">文字搜索仅筛选已加载记录；调用结果与更多筛选作用于全部匹配记录。</p>
+      <p className="hint">首字与生成 TPS 仅显示实测值；无内容、非流式或旧记录未采集时显示 —，不以总用时估算 TPS。</p>
       <p className="mt-4 text-caption text-muted">调用记录按计费尝试逐条展示，同一请求可能有多条记录。{rows !== null ? `已加载 ${rows.length.toLocaleString("en-US")} 条${next !== null ? "，还有更多记录" : ""}；这些记录不代表整个汇总窗口的成功率或延迟分布。` : ""}</p>
       {err && (
         <div className="note crit" role="alert">
@@ -572,8 +652,8 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
       {rows === null && <ChartSkeleton />}
       {rows !== null && rows.length === 0 && !err && <CardMessage>所选条件下没有调用记录</CardMessage>}
       {rows !== null && rows.length > 0 && (
-        <DataTable label="调用记录">
-          <colgroup><col className="usage-column-action" /><col className="usage-column-time" /><col className="usage-column-request" /><col className="usage-column-state" /><col className="usage-column-timing" /><col className="usage-column-charge" /></colgroup>
+        <DataTable label="调用记录" className="tenant-call-table">
+          <colgroup><col className="usage-column-action" /><col className="usage-column-time" /><col className="usage-column-request" /><col className="usage-column-state" /><col className="usage-column-timing" /><col className="usage-column-tokens" /><col className="usage-column-charge" /></colgroup>
           <thead>
             <tr>
               <th>
@@ -583,87 +663,15 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
               <th>模型 / 请求</th>
               <th>状态</th>
               <th className="num">响应性能</th>
+              <th className="num">Token 消耗</th>
               <th className="num">费用</th>
             </tr>
           </thead>
           <tbody>
-            {table.rows.map((c) => {
-              const expanded = open.has(c.event_id);
-              return (
-                <Fragment key={c.event_id}>
-                  <tr>
-                    <td className="usage-row-action">
-                      <Button
-                        kind="quiet"
-                        size="sm"
-                        aria-expanded={expanded}
-                        aria-label={expanded ? "收起明细" : "展开明细"}
-                        title={expanded ? "收起明细" : "展开明细"}
-                        className="tenant-icon-action"
-                        onClick={() => toggle(c.event_id)}
-                      >
-                        <ChevronRight aria-hidden="true" className={expanded ? "rotate-90 transition-transform" : "transition-transform"} />
-                      </Button>
-                    </td>
-                    <td className="tabular" data-label="时间">{fmtBeijing(c.occurred_at)}</td>
-                    <td data-label="模型 / 请求" className="usage-request-identity">
-                      <strong>{c.model.name || "—"}</strong>
-                      <span className="cell-note">密钥 {c.api_key.label || "—"} · 成员 {c.member ? (c.member.display_name ?? "成员") : "—"}</span>
-                      <span className="cell-note">{c.request_id ? <code>{c.request_id}</code> : "—"}</span>
-                      <UsageTokenEstimate data={c} />
-                    </td>
-                    <td data-label="状态">
-                      <CallStatusLamp call={c} />
-                      <span className="cell-note">分组 {c.charge.group ? c.charge.group.display_name : "—"}</span>
-                    </td>
-                    <td className="num" data-label="响应性能"><UsagePerformance data={c} /></td>
-                    <td className="num" data-label="费用">{chargeText(c)}</td>
-                  </tr>
-                  {expanded && (
-                    <tr className="usage-detail">
-                      <td colSpan={6}>
-                        <FeeCalculation call={c} />
-                        <h3>计费明细</h3>
-                        {c.charge.lines === null ? (
-                          <p className="hint">这次调用的金额由一次未记录费率明细的重新定价更正，费率明细不可知。</p>
-                        ) : c.charge.lines.length === 0 ? (
-                          <p className="hint">{c.charge.status === "pending" ? "尚未计价，计费项未知" : "这次调用没有计费项"}</p>
-                        ) : (
-                          <DataTable label="计费明细" compact>
-                            <thead>
-                              <tr>
-                                <th>计量</th>
-                                <th className="num">数量</th>
-                                <th className="num">折扣前单价（元/百万）</th>
-                                <th className="num">折后单价（元/百万）</th>
-                              </tr>
-                            </thead>
-                            <tbody>
-                              {c.charge.lines.map((l) => (
-                                <tr key={l.dimension}>
-                                  <td data-label="计量">{dimensionLabel(l.dimension)}</td>
-                                  <td className="num" data-label="数量">{l.quantity}</td>
-                                  <td className="num" data-label="折扣前单价（元/百万）">{l.rate_cny === null ? "—" : unitPrice(l.dimension, l.rate_cny)}</td>
-                                  <td className="num" data-label="折后单价（元/百万）">{(() => {
-                                    const rate = l.rate_cny === null ? null : discountedRate(l.rate_cny, c.charge.discount_bps);
-                                    return rate === null ? "—" : unitPrice(l.dimension, rate);
-                                  })()}</td>
-                                </tr>
-                              ))}
-                            </tbody>
-                          </DataTable>
-                        )}
-                        {(c.charge.discount_bps ?? 0) > 0 && (
-                          <p className="hint">
-                            本次按组织折扣计费：在折扣前的价格上减免 {percentOf(c.charge.discount_bps ?? 0)}。
-                          </p>
-                        )}
-                      </td>
-                    </tr>
-                  )}
-                </Fragment>
-              );
-            })}
+            {table.rows.map(call => <CallLogRow key={call.event_id} call={call} onDetails={trigger => {
+              detailTrigger.current = trigger;
+              setSelected(call);
+            }} />)}
           </tbody>
         </DataTable>
       )}
@@ -677,6 +685,10 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
         loadedCount={rows?.length} hasNext={rows !== null && (table.page < table.pageCount || next !== null)}
         busy={more} label="调用记录"
       />
+
+      <CallLogDrawer call={selected} onOpenChange={open => { if (!open) setSelected(null); }} returnFocusRef={detailTrigger}>
+        {selected && <CallLogDetails call={selected} />}
+      </CallLogDrawer>
 
     </Section>
   );
