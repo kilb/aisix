@@ -1,3 +1,4 @@
+.sidebar-shell .shell-content.totals-shell-content { max-width: none; margin-inline: 0; }
 .totals-page { display: grid; width: 100%; min-width: 0; gap: 16px; }
 .totals-page > .page-header { margin: 0; }
 .totals-page .totals-scope { display: flex; flex-wrap: wrap; align-items: end; gap: 12px 20px; padding: 16px; border: 1px solid var(--border); border-radius: var(--r-card); background: var(--card); }

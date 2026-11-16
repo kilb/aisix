@@ -507,7 +507,7 @@ export function App() {
           </Button>
         </div>
       </header>
-      <div className="workspace shell-content">
+      <div className={`workspace shell-content${current === "totals" ? " totals-shell-content" : ""}`}>
         {signOutError && <div className="note crit" role="alert">{signOutError}</div>}
         <main id="workspace-main" tabIndex={-1}>
           <section id={`tab-${current}`} role="region" aria-labelledby={`stop-${current}`}>
