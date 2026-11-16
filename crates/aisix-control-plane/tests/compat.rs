@@ -1207,3 +1207,96 @@ async fn customer_endpoint_hotfix_waits_for_the_complete_recent_fleet_to_support
         .expect("read the accepted hotfix grant");
     assert_eq!(stored, doc);
 }
+
+// 精确已知产物可热修复混部，但真实旧原生实例仍由完整窗口保护。
+#[tokio::test]
+async fn proven_endpoint_builds_preserve_recent_legacy_and_capacity_guards() {
+    let Some(cp) = TestCp::start_stamped("dev+sha-a11ce11").await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let known = Gateway::issue(&cp, &admin).await;
+    let families = json!([
+        "images",
+        "files",
+        "conversations",
+        "containers",
+        "vector_stores",
+        "skills",
+        "evals"
+    ]);
+    for (index, version) in [
+        "dev+sha-4b06ddc",
+        "dev+sha-4b06ddcb7d4d3918faeb9a02f12c0ed7f4f19bbc",
+        "dev+sha-c39f543",
+        "dev+sha-c39f54354e1bd6616b2599ff685cdc3289cede78",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        known
+            .beat(&format!("known-native-hotfix-v447-{index}"), version)
+            .await;
+        let id = Uuid::new_v4();
+        let doc = json!({"key_hash":format!("known-hotfix-{id}"), "allowed_model_ids":[], "allowed_endpoints":families});
+        write_key(&cp, id, doc.clone(), false)
+            .await
+            .expect("known support survives a CP-only hotfix");
+        let stored: Value = sqlx::query_scalar("SELECT doc FROM gw_resources WHERE id=$1")
+            .bind(id)
+            .fetch_one(cp.db().pool())
+            .await
+            .expect("read the persisted complete grant");
+        assert_eq!(stored, doc);
+    }
+    let known_instances: (i64, i64) = sqlx::query_as(
+        "SELECT count(*), count(DISTINCT version) FROM dp_instances WHERE dp_id=$1::uuid",
+    )
+    .bind(&known.dp_id)
+    .fetch_one(cp.db().pool())
+    .await
+    .expect("count simultaneous known build instances");
+    assert_eq!(known_instances, (4, 4));
+    let old = Gateway::issue(&cp, &admin).await;
+    old.beat("legacy-native-hotfix-v447", "dev+sha-08ff931")
+        .await;
+    age_instance(&cp, "legacy-native-hotfix-v447", "23 hours 59 minutes").await;
+    sqlx::query("UPDATE dp_credentials SET revoked_at=now() WHERE dp_id=$1::uuid")
+        .bind(&old.dp_id)
+        .execute(cp.db().pool())
+        .await
+        .expect("revoke only this test credential");
+    let id = Uuid::new_v4();
+    let doc = json!({"key_hash":format!("legacy-hotfix-{id}"), "allowed_model_ids":[], "allowed_endpoints":families});
+    let error = write_key(&cp, id, doc.clone(), false)
+        .await
+        .expect_err("offline revoked legacy still counts");
+    assert_eq!(
+        (error.status.as_u16(), error.code),
+        (422, "gateway_too_old")
+    );
+    let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM gw_resources WHERE id=$1")
+        .bind(id)
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("count refused grant");
+    assert_eq!(stored, 0);
+    age_instance(&cp, "legacy-native-hotfix-v447", "24 hours 1 minute").await;
+    sqlx::query("UPDATE dp_credentials SET instance_cap_hit_at=now() WHERE dp_id=$1::uuid")
+        .bind(&known.dp_id)
+        .execute(cp.db().pool())
+        .await
+        .expect("record incomplete test fleet");
+    let error = write_key(&cp, id, doc.clone(), false)
+        .await
+        .expect_err("known versions cannot bypass a cap hit");
+    assert_eq!(error.code, "gateway_too_old");
+    sqlx::query("UPDATE dp_credentials SET instance_cap_hit_at=NULL WHERE dp_id=$1::uuid")
+        .bind(&known.dp_id)
+        .execute(cp.db().pool())
+        .await
+        .expect("restore only the test cap marker");
+    write_key(&cp, id, doc, false)
+        .await
+        .expect("honestly aged complete known fleet supports expansion");
+}

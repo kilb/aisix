@@ -93,6 +93,17 @@ const API_KEY_ENDPOINTS_SINCE: Since = Since::ThisRelease;
 // 首个已发布并验证支持客户接口隔离的网关源码；控制面独立热修复仍识别其真实标记。
 const CUSTOMER_ENDPOINT_EXPANSION_DEV_SHA: &str = "08ff931722b737d40a8942a9e55de94afc9b51d5";
 
+// 仅列入已核对源码、部署产物及回归证据的能力基线；两组能力独立判断。
+const CUSTOMER_ENDPOINT_EXPANSION_DEV_SHAS: &[&str] = &[
+    CUSTOMER_ENDPOINT_EXPANSION_DEV_SHA,
+    "4b06ddcb7d4d3918faeb9a02f12c0ed7f4f19bbc",
+    "c39f54354e1bd6616b2599ff685cdc3289cede78",
+];
+const NATIVE_ENDPOINT_EXPANSION_DEV_SHAS: &[&str] = &[
+    "4b06ddcb7d4d3918faeb9a02f12c0ed7f4f19bbc",
+    "c39f54354e1bd6616b2599ff685cdc3289cede78",
+];
+
 /// Every field older gateways would misread in a way that opens what it
 /// closes, or that quietly withholds what it grants. A new field whose
 /// absence is fail-open on an older gateway gets a row here, and so does a
@@ -249,8 +260,9 @@ fn supports_customer_endpoint_expansion(version: &str, cp_version: &str) -> bool
     };
     dev_sha(version).is_some_and(|sha| {
         sha == cp_sha
-            || sha == CUSTOMER_ENDPOINT_EXPANSION_DEV_SHA
-            || sha == &CUSTOMER_ENDPOINT_EXPANSION_DEV_SHA[..7]
+            || CUSTOMER_ENDPOINT_EXPANSION_DEV_SHAS
+                .iter()
+                .any(|known| sha == *known || sha == &known[..7])
     })
 }
 
@@ -277,7 +289,11 @@ fn supports_native_endpoint_expansion(version: &str, cp_version: &str) -> bool {
         CUSTOMER_ENDPOINT_EXPANSION_DEV_SHA,
         "e411f9428fa1f744421c895f72a8c71940d5a4fc",
     ];
-    gateway == control_plane && !legacy.iter().any(|sha| sha.starts_with(gateway.as_str()))
+    !legacy.iter().any(|sha| sha.starts_with(gateway.as_str()))
+        && (gateway == control_plane
+            || NATIVE_ENDPOINT_EXPANSION_DEV_SHAS
+                .iter()
+                .any(|known| gateway == *known || gateway == &known[..7]))
 }
 
 fn native_endpoint_expansion(kind: Kind, doc: &Value, stored: &Value) -> bool {
@@ -1355,6 +1371,45 @@ mod tests {
             "1.99.0+sha-98cd765",
             "dev+sha-12ab345"
         ));
+    }
+
+    // 已验证旧产物不能因控制面热修复换提交而失去已有能力，假前缀仍拒绝。
+    #[test]
+    fn proven_customer_and_native_builds_survive_control_plane_hotfixes() {
+        const CP: &str = "dev+sha-a11ce11";
+        for known in [
+            "4b06ddcb7d4d3918faeb9a02f12c0ed7f4f19bbc",
+            "c39f54354e1bd6616b2599ff685cdc3289cede78",
+        ] {
+            for sha in [known, &known[..7]] {
+                let version = format!("dev+sha-{sha}");
+                assert!(supports_customer_endpoint_expansion(&version, CP));
+                assert!(supports_native_endpoint_expansion(&version, CP));
+                for cp in ["dev", "dev+sha-", "dev+sha-invalid", "1.9.0+sha-a11ce11"] {
+                    assert!(!supports_customer_endpoint_expansion(&version, cp));
+                    assert!(!supports_native_endpoint_expansion(&version, cp));
+                }
+            }
+            let wrong_full = format!("{}0", &known[..39]);
+            assert_ne!(wrong_full, known);
+            for sha in [&known[..8], wrong_full.as_str(), &format!("{known}-extra")] {
+                let version = format!("dev+sha-{sha}");
+                assert!(!supports_customer_endpoint_expansion(&version, CP));
+                assert!(!supports_native_endpoint_expansion(&version, CP));
+            }
+        }
+        for version in [
+            "dev",
+            "dev+sha-",
+            "dev+sha-invalid",
+            "dev+sha-abcd123",
+            "dev+sha-08ff931",
+            "dev+sha-e411f94",
+            "dev+sha-9aa52c3",
+            "dev+sha-f05f494",
+        ] {
+            assert!(!supports_native_endpoint_expansion(version, CP));
+        }
     }
 
     #[test]
