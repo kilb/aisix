@@ -57,6 +57,8 @@
   .record-table-page-size .ui-select-trigger { width: auto; min-width: 64px; min-height: var(--h-control-sm); padding-inline: 8px; border-color: transparent; background: transparent; font-size: 12px; font-variant-numeric: tabular-nums; }
   .record-table-page-size .ui-select-trigger:enabled:hover { background: var(--well); }
   .f.filter > .ui-select-field { width: auto; flex: 1 1 auto; }
+  /* 普通筛选栏沿用常规高度；独立紧凑触发器与分页保持原尺寸。 */
+  .f.filter .ui-select-trigger { min-height: var(--h-control); }
   td .ui-select-trigger { max-width: min(240px, 100%); }
   .ui-multiselect-content,
   .ui-menu-content { min-width: min(160px, calc(100vw - 24px)); max-height: min(320px, var(--radix-dropdown-menu-content-available-height)); overflow-y: auto; }

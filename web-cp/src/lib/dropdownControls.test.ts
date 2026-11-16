@@ -18,6 +18,7 @@ const compiled = await build({
       const [multi, setMulti] = useState([]);
       const [action, setAction] = useState("无操作");
       const options = [{value:"",label:"全部角色"},{value:"admin",label:"管理员"},{value:"disabled",label:"不可用角色",disabled:true},{value:"member",label:"这是一个很长的成员角色名称用于验证窄屏弹层不会越过视口边缘"}];
+      if (document.getElementById("root").dataset.journey === "filters") return <><div style={{display:"flex",alignItems:"end",gap:12}}><label className="f filter">筛选角色<Select value={value} onValueChange={setValue} options={options} size="compact" /></label><input aria-label="筛选文本" /></div><label>独立紧凑选择<Select value={value} onValueChange={setValue} options={options} size="compact" /></label></>;
       return <><form onSubmit={event=>event.preventDefault()}>
         <label>角色<Select name="role" value={value} onValueChange={setValue} options={options} size="compact" /></label>
         <label>必填角色<Select value={value} onValueChange={setValue} options={options} required /></label>
@@ -108,5 +109,24 @@ test("选择与操作菜单保留键盘、空值、多选、表单、拒绝状�
       await expect(page.getByRole("menu")).toHaveCount(0);
     }
     assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
+
+// 筛选语境覆盖旧 compact 描述，但不能把独立分页类控件也放大。
+test("普通筛选的下拉与输入同高，独立紧凑选择保留32px", { timeout: 15_000 }, async () => {
+  const browser = await chromium.launch();
+  try {
+    const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+    await page.setContent(`<style>${styles}</style><div id="root" data-journey="filters"></div>`);
+    await page.addScriptTag({ content: compiled.outputFiles[0]!.text });
+    const filter = page.getByRole("combobox", { name: "筛选角色", exact: true });
+    const input = page.getByRole("textbox", { name: "筛选文本", exact: true });
+    const compact = page.getByRole("combobox", { name: "独立紧凑选择", exact: true });
+    assert.equal((await filter.boundingBox())?.height, 40);
+    assert.equal((await input.boundingBox())?.height, 40);
+    assert.equal((await compact.boundingBox())?.height, 32);
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => resolve())));
+    for (const control of [filter, input, compact]) assert.equal((await control.boundingBox())?.height, 44);
   } finally { await browser.close(); }
 });

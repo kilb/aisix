@@ -214,7 +214,7 @@ export function Charges(_props: TabProps) {
             <label className="f filter min-w-0 flex-1">
               <span>事件</span>
               <input
-                className="h-11 min-w-0 text-caption md:w-56"
+                className="min-w-0 text-caption md:w-56"
                 value={eventDraft}
                 onChange={(e) => setEventDraft(e.target.value)}
                 placeholder="事件编号"
