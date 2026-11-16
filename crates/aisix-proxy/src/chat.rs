@@ -3041,10 +3041,10 @@ async fn dispatch(
         cc.no_cache = true;
         cc.no_store = true;
     }
-    // 只有实际可读的缓存才检查全部候选；不安全时旁路缓存，不让未选中的备用配置拒绝请求。
+    // 只有实际可读或可写的缓存才检查全部候选；不安全时旁路缓存，不让未选中的备用配置拒绝请求。
     // 真正派发仍在所选目标上执行完整的私有引用校验。
     if policy_cache.is_some()
-        && !cc.no_cache
+        && (!cc.no_cache || !cc.no_store)
         && attempt_models.iter().any(|attempt| {
             let Ok(key) = crate::dispatch::resolve_provider_key(snapshot, &attempt.model) else {
                 return false;

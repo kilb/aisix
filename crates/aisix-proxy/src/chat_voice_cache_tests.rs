@@ -147,13 +147,25 @@ mod chat_voice_cache_tests {
     }
 
     async fn call(app: Router, streaming: bool) -> (StatusCode, Option<String>, String) {
+        call_with_cache_control(app, streaming, None).await
+    }
+
+    async fn call_with_cache_control(
+        app: Router,
+        streaming: bool,
+        directive: Option<&str>,
+    ) -> (StatusCode, Option<String>, String) {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json");
+        if let Some(directive) = directive {
+            request = request.header("cache-control", directive);
+        }
         let response = run(
             app,
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header("authorization", "Bearer sk-caller")
-                .header("content-type", "application/json")
+            request
                 .body(Body::from(payload(streaming).to_string()))
                 .unwrap(),
         )
@@ -288,10 +300,9 @@ mod chat_voice_cache_tests {
         assert!(fallback.received_requests().await.unwrap().is_empty());
     }
 
-    #[tokio::test]
-    async fn chat_voice_cache_unsafe_override_does_not_write_a_future_cache_hit() {
+    async fn unsafe_override_does_not_write_a_future_cache_hit(directive: Option<&str>) {
         let (app, state, primary, fallback) = fixture(true, false, true).await;
-        let (status, cache, body) = call(app.clone(), false).await;
+        let (status, cache, body) = call_with_cache_control(app.clone(), false, directive).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(cache.as_deref(), Some("bypass"));
         assert!(body.contains("HEALTHY_PRIMARY"), "{body}");
@@ -324,5 +335,15 @@ mod chat_voice_cache_tests {
         }
         assert_eq!(primary.received_requests().await.unwrap().len(), 1);
         assert!(fallback.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn chat_voice_cache_unsafe_override_does_not_write_a_future_cache_hit() {
+        unsafe_override_does_not_write_a_future_cache_hit(None).await;
+    }
+
+    #[tokio::test]
+    async fn chat_voice_cache_no_cache_cannot_write_unsafe_override_response() {
+        unsafe_override_does_not_write_a_future_cache_hit(Some("no-cache")).await;
     }
 }
