@@ -246,7 +246,7 @@ export function Charges(_props: TabProps) {
           <>
             <RecordTools table={table} label="计费明细" loaded></RecordTools>
             <DataTable label="计费明细" className="charge-records" tableClassName="charge-records-table">
-              <colgroup><col className="charge-col-identity" /><col className="charge-col-status" /><col className="charge-col-money" /><col className="charge-col-service" /><col className="charge-col-performance" /><col /><col className="charge-col-action" /></colgroup>
+              <colgroup><col className="charge-col-identity" /><col className="charge-col-status" /><col className="charge-col-money" /><col className="charge-col-service" /><col className="charge-col-performance" /><col className="charge-col-tokens" /><col className="charge-col-action" /></colgroup>
               <thead>
                 <tr>
                   <th>调用 / 租户</th>

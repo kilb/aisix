@@ -11,6 +11,54 @@ for (const url of [state.adminUrl, state.tenantUrl]) {
   if (!["127.0.0.1", "localhost"].includes(new URL(url).hostname)) throw new Error("Only isolated loopback URLs are allowed");
 }
 
+// 回归真实截图中的窄 Token 列：边界内换行也可能逐字竖排，须同时检验阅读宽度与行高。
+test("admin-call-records-token-column-stays-readable", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await login(page, "admin");
+  await page.goto(`${state.adminUrl}/#calls`);
+  await settle(page);
+  const table = page.getByRole("table", { name: "计费明细", exact: true });
+  const rows = table.locator("tbody > tr[data-finance-record]");
+  await expect(rows.first()).toBeVisible();
+  const geometry = await rows.evaluateAll(records => records.map(row => ({
+    height: row.getBoundingClientRect().height,
+    cells: [...row.querySelectorAll("td")].map(cell => ({ label: cell.getAttribute("data-label"), width: cell.getBoundingClientRect().width })),
+  })));
+  await test.info().attach("call-record-column-widths", { body: JSON.stringify(geometry), contentType: "application/json" });
+  for (const row of geometry) {
+    expect(row.cells).toHaveLength(7);
+    expect(row.cells.find(cell => cell.label === "用量")!.width, "Token counts and estimates need a readable column").toBeGreaterThanOrEqual(160);
+    expect(row.height, "summary rows must not become vertical paragraphs").toBeLessThanOrEqual(180);
+  }
+  await expect(table.getByText(/按字节估算 Token/).first()).toBeVisible();
+  await checkCells(table);
+  await table.scrollIntoViewIfNeeded();
+  await capture(page, "admin-call-records-readable-1440");
+});
+
+test("admin-call-records-use-fields-when-main-area-is-narrow", async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 1000 });
+  await login(page, "admin");
+  await page.goto(`${state.adminUrl}/#calls`);
+  await settle(page);
+  const table = page.getByRole("table", { name: "计费明细", exact: true });
+  const first = table.locator("tbody > tr[data-finance-record]").first();
+  for (const width of [1280, 900, 390]) {
+    await page.setViewportSize({ width, height: 1000 });
+    await expect(first, "a narrow main area must use labelled fields instead of seven squeezed columns").toHaveCSS("display", "grid");
+    expect((await first.locator('[data-label="用量"]').boundingBox())!.width).toBeGreaterThanOrEqual(240);
+    await checkCells(table);
+    const expand = first.getByRole("button", { name: /^展开用量明细 / });
+    await expand.click();
+    await expect(first.getByRole("button", { name: /^收起用量明细 / })).toHaveAttribute("aria-expanded", "true");
+    await expect(table.locator("tbody > tr.dt-detail").first()).toBeVisible();
+    await first.getByRole("button", { name: /^收起用量明细 / }).click();
+    await expect(expand).toHaveAttribute("aria-expanded", "false");
+    await first.scrollIntoViewIfNeeded();
+    await capture(page, `admin-call-records-fields-${width}`);
+  }
+});
+
 async function settle(page: Page): Promise<void> {
   await page.evaluate(() => document.fonts.ready);
   await page.waitForLoadState("networkidle");
