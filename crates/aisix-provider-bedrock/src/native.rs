@@ -523,7 +523,7 @@ mod compat_claude_native_tests {
         use std::time::Duration;
 
         // 只替换 STS 的网络地址；SDK 的 AssumeRole、签名与响应解码仍走真实 TCP。
-        let sts = MockServer::start().await;
+        let sts = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(body_string_contains("Action=GetCallerIdentity"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
@@ -567,7 +567,7 @@ mod compat_claude_native_tests {
                 endpoint: endpoint.clone(),
             })
         });
-        let runtime = MockServer::start().await;
+        let runtime = MockServer::builder().start().await;
         let mut event_body = None;
         let response = if operation == "invoke-with-response-stream" {
             use aws_smithy_types::event_stream::{Header, HeaderValue, Message};
