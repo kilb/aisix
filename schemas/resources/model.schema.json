@@ -575,6 +575,44 @@
     },
     "Routing": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "hash_failover"
+            ]
+          },
+          "then": {
+            "properties": {
+              "strategy": {
+                "enum": [
+                  "consistent_hash"
+                ]
+              }
+            },
+            "required": [
+              "strategy"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "hash_failover": {
+                "const": false
+              }
+            },
+            "required": [
+              "hash_failover"
+            ]
+          },
+          "then": {
+            "required": [
+              "hash_on"
+            ]
+          }
+        }
+      ],
       "properties": {
         "fallback_on_statuses": {
           "description": "Additional upstream HTTP status codes that participate in retries and failover. By default a non-429 4xx response is treated as a caller error and returned as-is; providers that use 4xx codes for transient conditions (model overload, queue full, quota exhaustion) can be listed here, for example `[408, 409]`. 5xx codes are already retryable, so listing them changes nothing. Authentication (`401`/`403`) and validation (`400`) codes should only be listed when the provider is known to use them for transient failures.",
@@ -585,6 +623,11 @@
             "type": "integer"
           },
           "type": "array"
+        },
+        "hash_failover": {
+          "default": true,
+          "description": "Whether consistent hashing may select another upstream account when the selected account is unavailable. Defaults to `true`. When `false`, the configured account pool determines one account before availability checks, and an unavailable selection fails without choosing another. An explicit, non-empty `hash_on` chain is required. Changes to the configured pool, weights, priority or authorization scope may change the selection; restarting with the same configuration does not.",
+          "type": "boolean"
         },
         "hash_on": {
           "description": "Where the `consistent_hash` hash key comes from: an ordered chain of sources, the first non-empty value winning. Defaults to the `x-aisix-routing-key` request header, falling back to the caller's API key id. Only valid with `strategy: consistent_hash`.",

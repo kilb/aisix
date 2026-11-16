@@ -1302,6 +1302,27 @@ pub fn model_root_schema(strict: bool) -> Value {
     apply_model_ref_alternatives(&mut schema);
     apply_effort_mapping_tokens(&mut schema, strict);
     apply_internal_default(&mut schema);
+    if strict {
+        // 新写入的固定哈希必须明确来源；旧文档仍按宽松读合同保留整行。
+        if let Some(routing) = schema.pointer_mut("/definitions/Routing") {
+            routing["allOf"] = json!([
+                {
+                    "if": {"required": ["hash_failover"]},
+                    "then": {
+                        "required": ["strategy"],
+                        "properties": {"strategy": {"enum": ["consistent_hash"]}}
+                    }
+                },
+                {
+                    "if": {
+                        "required": ["hash_failover"],
+                        "properties": {"hash_failover": {"const": false}}
+                    },
+                    "then": {"required": ["hash_on"]}
+                }
+            ]);
+        }
+    }
     schema
 }
 

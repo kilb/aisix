@@ -1178,6 +1178,7 @@ const EXTRA_RELAXATIONS: &[(&str, &[&str])] = &[
     (
         "model",
         &[
+            "/definitions/Routing/allOf",
             "/oneOf/0/not/anyOf",
             "/oneOf/1/not/anyOf",
             "/oneOf/2/not/anyOf",

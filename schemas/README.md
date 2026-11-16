@@ -120,7 +120,7 @@ so a consumer that models the lenient set as "the strict set with
 | `oidc_provider` | `tag_claims` is any object of strings, or `null` read as none: the key pattern, the non-empty path and the 32-entry cap are write-path limits, for the reason given under `team` — a row lost to one would stop the provider authenticating its callers |
 | `team`, `user` | `tags` is any object of strings, or `null` read as no tags: the key pattern, the 1–128-character value length and the 32-entry cap are write-path limits, so a stored row stays loadable if a later release relaxes them — for an `api_key` a row lost to one would stop the key authenticating |
 | `budget` | the per-scope shape is not checked — `tag` only and always for scope `tag`, `scope_ref` for every other scope, `exhausted_members` only for `team_member`: a row missing its target matches no request, which is no worse than not loading it |
-| `model` | the per-kind `not`/`anyOf` lists that forbid a knob a kind never resolves are shorter — a stored row keeps loading and `Model::strip_kind_inapplicable` drops the dead knob; and an `effort_mapping` target value may be empty, which the write path refuses |
+| `model` | the per-kind `not`/`anyOf` lists that forbid a knob a kind never resolves are shorter — a stored row keeps loading and `Model::strip_kind_inapplicable` drops the dead knob; an `effort_mapping` target value may be empty; and the write-only `hash_failover` strategy/source coupling is absent (an unusable fixed-hash setting fails the request without discarding the stored model) |
 
 Three of those are worth spelling out. A half-written `McpToolRef` entry
 has to keep DESERIALIZING, not merely validating: the loader skips a row

@@ -336,6 +336,20 @@ pub struct Routing {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1))]
     pub hash_on: Option<Vec<HashOnSource>>,
+    /// Whether consistent hashing may select another upstream account when
+    /// the selected account is unavailable. Defaults to `true`. When `false`,
+    /// the configured account pool determines one account before availability
+    /// checks, and an unavailable selection fails without choosing another.
+    /// An explicit, non-empty `hash_on` chain is required. Changes to the
+    /// configured pool, weights, priority or authorization scope may change
+    /// the selection; restarting with the same configuration does not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(default = "hash_failover_schema_default")]
+    pub hash_failover: Option<bool>,
+}
+
+fn hash_failover_schema_default() -> Option<bool> {
+    Some(true)
 }
 
 /// Reported when a stored `strategy: weighted` row loads as `round_robin`.
@@ -461,6 +475,10 @@ pub fn retired_routing_rewrite(labels: &[&str]) -> String {
 }
 
 impl Routing {
+    pub fn hash_failover_or_default(&self) -> bool {
+        self.hash_failover.unwrap_or(true)
+    }
+
     // No `retries_or_default()`: an unset group budget no longer means
     // zero, it means "defer to the target, then to the deployment default".
     // Resolving that needs the target Model and the DP config, so it lives
@@ -551,6 +569,7 @@ mod tests {
             fallback_on_statuses: None,
             when_all_unavailable: None,
             hash_on: None,
+            hash_failover: None,
         };
         assert_eq!(r.max_fallbacks_or_default(), 0);
     }
@@ -566,6 +585,7 @@ mod tests {
             fallback_on_statuses: None,
             when_all_unavailable: None,
             hash_on: None,
+            hash_failover: None,
         };
         assert_eq!(r.max_fallbacks_or_default(), 0);
     }

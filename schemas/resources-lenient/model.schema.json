@@ -573,6 +573,11 @@
           },
           "type": "array"
         },
+        "hash_failover": {
+          "default": true,
+          "description": "Whether consistent hashing may select another upstream account when the selected account is unavailable. Defaults to `true`. When `false`, the configured account pool determines one account before availability checks, and an unavailable selection fails without choosing another. An explicit, non-empty `hash_on` chain is required. Changes to the configured pool, weights, priority or authorization scope may change the selection; restarting with the same configuration does not.",
+          "type": "boolean"
+        },
         "hash_on": {
           "description": "Where the `consistent_hash` hash key comes from: an ordered chain of sources, the first non-empty value winning. Defaults to the `x-aisix-routing-key` request header, falling back to the caller's API key id. Only valid with `strategy: consistent_hash`.",
           "items": {
