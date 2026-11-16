@@ -462,6 +462,7 @@ struct ExporterHealthWire {
     name: String,
     delivered_batches: u64,
     failed_batches: u64,
+    rejected: u64,
     last_error: Option<String>,
     last_failure_unix: Option<i64>,
     last_success_unix: Option<i64>,
@@ -473,6 +474,7 @@ impl ExporterHealthWire {
             name,
             delivered_batches: stats.delivered_batches,
             failed_batches: stats.failed_batches,
+            rejected: stats.rejected,
             last_error: stats
                 .last_error
                 .as_ref()
@@ -933,6 +935,7 @@ managed:
                     aisix_obs::SinkStatsSnapshot {
                         delivered_batches: 3,
                         failed_batches: 1,
+                        rejected: 7,
                         last_error: Some("HTTP 503: upstream sad".into()),
                         last_failure_unix: Some(1_770_000_000),
                         last_success_unix: Some(1_770_000_100),
@@ -968,10 +971,12 @@ managed:
         assert_eq!(health.len(), 2);
         assert_eq!(health[0]["name"], "alpha-exporter");
         assert_eq!(health[0]["delivered_batches"], 0);
+        assert_eq!(health[0].get("rejected"), Some(&serde_json::json!(0)));
         assert_eq!(health[0]["last_error"], serde_json::Value::Null);
         assert_eq!(health[1]["name"], "zeta-exporter");
         assert_eq!(health[1]["delivered_batches"], 3);
         assert_eq!(health[1]["failed_batches"], 1);
+        assert_eq!(health[1].get("rejected"), Some(&serde_json::json!(7)));
         assert_eq!(health[1]["last_error"], "HTTP 503: upstream sad");
         assert_eq!(health[1]["last_failure_unix"], 1_770_000_000_i64);
         assert_eq!(health[1]["last_success_unix"], 1_770_000_100_i64);

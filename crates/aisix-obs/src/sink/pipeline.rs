@@ -125,9 +125,8 @@ pub struct SinkStatsSnapshot {
     pub last_error: Option<String>,
     /// Unix seconds of the most recent successful batch delivery.
     pub last_success_unix: Option<i64>,
-    /// Unix seconds of the most recent dropped batch. Unlike
-    /// `last_error` this persists across later successes — it answers
-    /// "when did this exporter last lose data".
+    /// 最近一次批次丢弃或接收方部分拒收的 Unix 秒数；后续完整成功不清除，
+    /// 用于回答此 exporter 最近何时丢失数据。
     pub last_failure_unix: Option<i64>,
 }
 
@@ -148,6 +147,8 @@ impl SinkStats {
     }
     fn add_rejected(&self, n: u64) {
         self.rejected.fetch_add(n, Ordering::Relaxed);
+        self.last_failure_unix
+            .store(now_unix_secs(), Ordering::Relaxed);
     }
     fn add_retries(&self, n: u64) {
         self.retries.fetch_add(n, Ordering::Relaxed);

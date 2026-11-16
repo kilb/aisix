@@ -2610,8 +2610,17 @@ fn parse_host_port(endpoint: &str) -> anyhow::Result<(String, u16)> {
             p.parse::<u16>()
                 .map_err(|e| anyhow::anyhow!("invalid port {p:?} in {shown:?}: {e}"))?,
         ),
-        // No explicit port — default to the etcd v3 port.
-        (h, None) => (h, 2379),
+        // 显式 HTTP(S) 跟随客户端的 scheme 默认端口；裸 host 保留既有诊断约定。
+        (h, None) => (
+            h,
+            if endpoint.starts_with("https://") {
+                443
+            } else if endpoint.starts_with("http://") {
+                80
+            } else {
+                2379
+            },
+        ),
     };
     if host.is_empty() {
         anyhow::bail!("endpoint {shown:?} has no host");
@@ -4756,7 +4765,14 @@ mcp_servers:
             );
             assert_eq!(
                 parse_host_port(endpoint).unwrap(),
-                (expected.to_string(), 2379),
+                (
+                    expected.to_string(),
+                    if endpoint.starts_with("https://") {
+                        443
+                    } else {
+                        2379
+                    },
+                ),
                 "{endpoint}"
             );
         }
@@ -4938,10 +4954,28 @@ mcp_servers:
     }
 
     #[test]
-    fn parse_host_port_defaults_to_2379_when_port_is_omitted() {
-        let (h, p) = parse_host_port("http://etcd.aisix.cloud").unwrap();
-        assert_eq!(h, "etcd.aisix.cloud");
-        assert_eq!(p, 2379);
+    fn parse_host_port_uses_scheme_defaults_and_keeps_bare_host_contract() {
+        for (endpoint, host, port) in [
+            ("http://etcd.aisix.cloud", "etcd.aisix.cloud", 80),
+            ("https://etcd.aisix.cloud", "etcd.aisix.cloud", 443),
+            ("etcd.aisix.cloud", "etcd.aisix.cloud", 2379),
+            ("http://[::1]", "::1", 80),
+            ("https://[::1]", "::1", 443),
+            ("[::1]", "::1", 2379),
+            (
+                "http://user:secret@etcd.aisix.cloud",
+                "etcd.aisix.cloud",
+                80,
+            ),
+            (
+                "https://user:secret@etcd.aisix.cloud",
+                "etcd.aisix.cloud",
+                443,
+            ),
+            ("user:secret@etcd.aisix.cloud", "etcd.aisix.cloud", 2379),
+        ] {
+            assert_eq!(parse_host_port(endpoint).unwrap(), (host.into(), port));
+        }
     }
 
     #[test]
@@ -4971,7 +5005,7 @@ mcp_servers:
         }
         assert_eq!(
             parse_host_port("https://user:hunter2@etcd.example.com").unwrap(),
-            ("etcd.example.com".to_string(), 2379),
+            ("etcd.example.com".to_string(), 443),
         );
         for err in [
             parse_host_port("https://user:hunter2@host:abc").unwrap_err(),

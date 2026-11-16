@@ -3967,12 +3967,23 @@ mod tests {
                 BTreeMap::new(),
                 otlp_test_client(),
             );
+            let before = chrono::Utc::now().timestamp();
             let stats = stats_after_one_delivery(sink, 3).await;
             let body = case.body;
             assert_eq!(stats.rejected, case.rejected, "{body}");
             assert_eq!(stats.last_error.as_deref(), case.last_error, "{body}");
             assert_eq!(stats.sent, 3, "{body}");
             assert_eq!((stats.delivered_batches, stats.dropped), (1, 0), "{body}");
+            assert_eq!(stats.failed_batches, 0, "{body}");
+            assert_eq!(
+                stats.last_failure_unix.is_some(),
+                case.rejected > 0,
+                "{body}: 只有真实拒收才记录数据丢失时间",
+            );
+            if let Some(last_failure) = stats.last_failure_unix {
+                assert!(last_failure >= before, "{body}");
+                assert!(last_failure <= chrono::Utc::now().timestamp(), "{body}");
+            }
             assert_eq!(
                 stats.retries, 0,
                 "{body}: a partial success is never retried"
