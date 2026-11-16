@@ -2133,6 +2133,235 @@ async fn resource_name_rename_sees_a_dependency_committed_while_it_waited_for_th
 }
 
 #[tokio::test]
+async fn resource_alias_rename_refuses_an_exact_key_name_served_only_by_the_wildcard() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = Admin::as_role(&cp, OperatorRole::Operator).await;
+    let pk = admin
+        .create("provider_keys", provider_key("alias-key-account"))
+        .await;
+    let model = admin.create("models", direct_model("openai/*", &pk)).await;
+    let key = internal_pattern_key(&cp, &admin, json!(["openai/gpt-4o"])).await;
+    let before = stored(&cp, "models", &model).await;
+    let audit = audit_text(&cp).await;
+    let r = admin
+        .put(
+            &format!("/admin/resources/models/{model}"),
+            Some("\"1\""),
+            json!({"doc": direct_model("anthropic/*", &pk)}),
+        )
+        .await;
+    assert_eq!(r.status, 409, "{r:?}");
+    assert_eq!(
+        r.body["referenced_by"],
+        json!([{"kind": "api_keys", "id": key, "name": "rename-key"}])
+    );
+    assert_eq!(stored(&cp, "models", &model).await, before);
+    assert_eq!(audit_text(&cp).await, audit);
+}
+
+#[tokio::test]
+async fn resource_alias_rename_refuses_exact_and_set_rate_names() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = Admin::as_role(&cp, OperatorRole::Operator).await;
+    let pk = admin
+        .create("provider_keys", provider_key("alias-rate-account"))
+        .await;
+    let model = admin.create("models", direct_model("openai/*", &pk)).await;
+    for (operator, value) in [
+        ("==", json!("openai/gpt-4o")),
+        ("in", json!(["openai/gpt-4o", "other"])),
+    ] {
+        let rule = admin
+            .create(
+                "rate_limit_policies",
+                name_policy(
+                    "alias-rate",
+                    json!([{
+                        "dimension": "model_name", "operator": operator, "value": value
+                    }]),
+                ),
+            )
+            .await;
+        let r = admin
+            .put(
+                &format!("/admin/resources/models/{model}"),
+                Some("\"1\""),
+                json!({"doc": direct_model("anthropic/*", &pk)}),
+            )
+            .await;
+        assert_eq!(r.status, 409, "{operator}: {r:?}");
+        assert_eq!(
+            r.body["referenced_by"],
+            json!([{"kind": "rate_limit_policies", "id": rule, "name": "alias-rate"}])
+        );
+        assert_eq!(
+            admin
+                .delete(
+                    &format!("/admin/resources/rate_limit_policies/{rule}"),
+                    Some("\"1\"")
+                )
+                .await
+                .status,
+            200
+        );
+    }
+}
+
+#[tokio::test]
+async fn resource_alias_rename_allows_another_exact_or_wildcard_to_keep_the_name_live() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = Admin::as_role(&cp, OperatorRole::Operator).await;
+    let pk = admin
+        .create("provider_keys", provider_key("alias-survivor-account"))
+        .await;
+    internal_pattern_key(&cp, &admin, json!(["openai/gpt-4o"])).await;
+    admin
+        .create(
+            "rate_limit_policies",
+            name_policy(
+                "alias-survivor-rate",
+                json!([{
+                    "dimension": "model_name", "operator": "==", "value": "openai/gpt-4o"
+                }]),
+            ),
+        )
+        .await;
+    for backup in ["openai/gpt-4o", "openai/gpt-*"] {
+        let model = admin.create("models", direct_model("openai/*", &pk)).await;
+        let survivor = admin.create("models", direct_model(backup, &pk)).await;
+        let r = admin
+            .put(
+                &format!("/admin/resources/models/{model}"),
+                Some("\"1\""),
+                json!({"doc": direct_model("anthropic/*", &pk)}),
+            )
+            .await;
+        assert_eq!(r.status, 200, "backup {backup}: {r:?}");
+        assert_eq!(
+            admin
+                .delete(&format!("/admin/resources/models/{model}"), Some("\"2\""))
+                .await
+                .status,
+            200
+        );
+        assert_eq!(
+            admin
+                .delete(
+                    &format!("/admin/resources/models/{survivor}"),
+                    Some("\"1\"")
+                )
+                .await
+                .status,
+            200
+        );
+    }
+}
+
+#[tokio::test]
+async fn resource_alias_rename_does_not_count_internal_or_non_direct_fallbacks() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = Admin::as_role(&cp, OperatorRole::Operator).await;
+    let pk = admin
+        .create("provider_keys", provider_key("alias-hidden-account"))
+        .await;
+    let target = admin.create("models", direct_model("target", &pk)).await;
+    let model = admin.create("models", direct_model("openai/*", &pk)).await;
+    internal_pattern_key(&cp, &admin, json!(["openai/gpt-4o"])).await;
+    for backup in [
+        json!({"display_name": "openai/gpt-*", "routing": {"targets": [{"model_id": target}]}}),
+        {
+            let mut doc = direct_model("openai/gpt-*", &pk);
+            doc["internal"] = json!(true);
+            doc
+        },
+    ] {
+        let survivor = admin.create("models", backup).await;
+        let r = admin
+            .put(
+                &format!("/admin/resources/models/{model}"),
+                Some("\"1\""),
+                json!({"doc": direct_model("anthropic/*", &pk)}),
+            )
+            .await;
+        assert_eq!(r.status, 409, "{r:?}");
+        assert_eq!(
+            admin
+                .delete(
+                    &format!("/admin/resources/models/{survivor}"),
+                    Some("\"1\"")
+                )
+                .await
+                .status,
+            200
+        );
+    }
+}
+
+#[tokio::test]
+async fn resource_alias_rename_keeps_broad_grants_and_regex_unchanged() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = Admin::as_role(&cp, OperatorRole::Operator).await;
+    let pk = admin
+        .create("provider_keys", provider_key("alias-broad-account"))
+        .await;
+    let model = admin.create("models", direct_model("openai/*", &pk)).await;
+    internal_pattern_key(&cp, &admin, json!(["openai/gpt-4o", "*"])).await;
+    admin
+        .create(
+            "rate_limit_policies",
+            name_policy(
+                "alias-broad-rate",
+                json!([{
+                    "dimension": "model_name", "operator": "~~", "value": ".*"
+                }]),
+            ),
+        )
+        .await;
+    let r = admin
+        .put(
+            &format!("/admin/resources/models/{model}"),
+            Some("\"1\""),
+            json!({"doc": direct_model("anthropic/*", &pk)}),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+}
+
+#[tokio::test]
+async fn resource_alias_rename_does_not_claim_an_internal_exact_shadow_was_callable() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = Admin::as_role(&cp, OperatorRole::Operator).await;
+    let pk = admin
+        .create("provider_keys", provider_key("alias-shadow-account"))
+        .await;
+    let model = admin.create("models", direct_model("openai/*", &pk)).await;
+    let mut hidden = direct_model("openai/gpt-4o", &pk);
+    hidden["internal"] = json!(true);
+    admin.create("models", hidden).await;
+    internal_pattern_key(&cp, &admin, json!(["openai/gpt-4o"])).await;
+    let r = admin
+        .put(
+            &format!("/admin/resources/models/{model}"),
+            Some("\"1\""),
+            json!({"doc": direct_model("anthropic/*", &pk)}),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+}
+
+#[tokio::test]
 async fn deleting_a_provider_key_a_model_uses_is_409_naming_the_model() {
     let Some(cp) = TestCp::start().await else {
         return;

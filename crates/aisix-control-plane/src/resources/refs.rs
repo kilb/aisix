@@ -298,9 +298,41 @@ pub async fn incoming(
 /// 在资源写锁内查找改名后失效的名称依赖，不改写操作者的模式或条件。
 pub async fn incoming_name_change(
     conn: &mut PgConnection,
+    model_id: Uuid,
     before: &str,
     after: &str,
+    replacement: &Value,
 ) -> Result<Vec<Referrer>, ApiError> {
+    // 通配行还提供具体别名；只枚举配置明确写出的名称，不采样 glob/regex 语言。
+    let aliases = if before.contains('*') {
+        let rows: Vec<(Uuid, Value)> = sqlx::query_as(
+            "SELECT id, doc FROM gw_resources WHERE kind = 'models' AND NOT deleted",
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(DbError::from)?;
+        let catalog = rows
+            .into_iter()
+            .map(|(id, doc)| {
+                serde_json::from_value::<aisix_core::Model>(doc)
+                    .map(|model| (id, model))
+                    .map_err(ApiError::internal)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Some((
+            catalog,
+            serde_json::from_value::<aisix_core::Model>(replacement.clone())
+                .map_err(ApiError::internal)?,
+        ))
+    } else {
+        None
+    };
+    let alias_lost = |name: &str| {
+        aliases.as_ref().is_some_and(|(catalog, replacement)| {
+            catalog_serves_name(catalog, name, None)
+                && !catalog_serves_name(catalog, name, Some((model_id, replacement)))
+        })
+    };
     let candidates: Vec<(String, Uuid, Value)> = sqlx::query_as(
         "SELECT kind, id, doc FROM gw_resources \
          WHERE NOT deleted AND kind = ANY($1) ORDER BY kind, id",
@@ -329,12 +361,23 @@ pub async fn incoming_name_change(
                     })
             };
             doc.get("allowed_model_ids").is_none_or(Value::is_null)
-                && matches(before)
                 && !matches(after)
+                && (matches(before)
+                    || doc
+                        .get("allowed_models")
+                        .and_then(Value::as_array)
+                        .is_some_and(|names| {
+                            names
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .filter(|name| !name.contains('*'))
+                                .any(&alias_lost)
+                        }))
         } else if let Some(conditions) = doc.get("conditions").filter(|v| !v.is_null()) {
             let conditions: Vec<ConditionNode> =
                 serde_json::from_value(conditions.clone()).map_err(ApiError::internal)?;
             conditions_lose_name(&conditions, before, after)
+                || conditions_name_alias_lost(&conditions, &alias_lost)
         } else {
             false
         };
@@ -351,6 +394,48 @@ pub async fn incoming_name_change(
         }
     }
     Ok(referrers)
+}
+
+/// 与调用方名称解析一致：精确行（包括 internal 遮挡）优先，别名只走公开直连单星行。
+fn catalog_serves_name(
+    catalog: &[(Uuid, aisix_core::Model)],
+    name: &str,
+    replacement: Option<(Uuid, &aisix_core::Model)>,
+) -> bool {
+    let models = || {
+        catalog.iter().map(|(id, model)| {
+            replacement
+                .filter(|(changed, _)| changed == id)
+                .map_or(model, |(_, model)| model)
+        })
+    };
+    if let Some(exact) = models().find(|model| model.display_name == name) {
+        return !exact.internal;
+    }
+    models().any(|model| {
+        !model.internal
+            && !model.is_routing()
+            && !model.is_ensemble()
+            && !model.is_semantic()
+            && aisix_core::wildcard::wildcard_capture(&model.display_name, name).is_some()
+    })
+}
+
+fn conditions_name_alias_lost(nodes: &[ConditionNode], alias_lost: &impl Fn(&str) -> bool) -> bool {
+    nodes.iter().any(|node| match node {
+        ConditionNode::Group(group) => conditions_name_alias_lost(&group.children, alias_lost),
+        ConditionNode::Leaf(leaf) => {
+            leaf.dimension == PolicyDimension::ModelName
+                && matches!(
+                    leaf.operator,
+                    ConditionOperator::Eq | ConditionOperator::Ne | ConditionOperator::In
+                )
+                && match &leaf.value {
+                    ConditionValue::One(name) => alias_lost(name),
+                    ConditionValue::Many(names) => names.iter().any(|name| alias_lost(name)),
+                }
+        }
+    })
 }
 
 fn conditions_lose_name(nodes: &[ConditionNode], before: &str, after: &str) -> bool {

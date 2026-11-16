@@ -109,7 +109,8 @@ pub async fn write_resource(
                     doc.get("display_name").and_then(Value::as_str),
                 ) {
                     if before != after {
-                        let referenced_by = refs::incoming_name_change(conn, before, after).await?;
+                        let referenced_by =
+                            refs::incoming_name_change(conn, w.id, before, after, &doc).await?;
                         if !referenced_by.is_empty() {
                             return Err(ApiError {
                                 referenced_by,
