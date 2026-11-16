@@ -31,3 +31,8 @@ test("上游监测有可分享入口且允许只读运维角色访问", () => {
   assert.equal(adminHash("upstream-monitoring"), "#upstream-monitoring");
   for (const role of ["admin", "operator", "viewer"]) assert.equal(canSeeAdminTab("upstream-monitoring", role), true);
 });
+
+test("总量统计有独立可分享的运维入口", () => {
+  assert.equal(adminRouteOf("#totals?from=2026-11-01T00%3A00%3A00Z").tab, "totals");
+  for (const role of ["admin", "operator", "viewer"]) assert.equal(canSeeAdminTab("totals", role), true);
+});

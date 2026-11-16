@@ -1,0 +1,33 @@
+.totals-page { display: grid; width: 100%; min-width: 0; gap: 16px; }
+.totals-page > .page-header { margin: 0; }
+.totals-page .totals-scope { display: flex; flex-wrap: wrap; align-items: end; gap: 12px 20px; padding: 16px; border: 1px solid var(--border); border-radius: var(--r-card); background: var(--card); }
+.totals-page .totals-dates { display: flex; flex-wrap: wrap; gap: 12px; min-width: 0; }
+.totals-page .totals-dates .f { flex: 1 1 220px; min-width: 0; margin: 0; }
+.totals-page .totals-dates input { width: 100%; min-width: 0; }
+.totals-page .totals-actions { display: flex; flex: 1 1 auto; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 16px; min-width: 0; }
+.totals-page .totals-presets { display: flex; flex-wrap: wrap; gap: 4px; }
+.totals-page .totals-window { margin: 0; color: var(--text-muted); font-size: var(--text-caption); overflow-wrap: anywhere; }
+.totals-page .totals-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; min-width: 0; }
+.totals-page .totals-metric { display: flex; flex-direction: column; min-width: 0; gap: 18px; }
+.totals-page .totals-metric .bento-card-header { margin-bottom: 0; }
+.totals-page .totals-value { overflow-wrap: anywhere; }
+.totals-page .totals-skeleton { width: min(100%, 280px); height: 52px; }
+.totals-page .totals-facts { display: grid; gap: 8px; margin: 0; padding-top: 12px; border-top: 1px solid var(--border); }
+.totals-page .totals-facts > div { display: flex; justify-content: space-between; gap: 16px; font-size: var(--text-caption); }
+.totals-page .totals-facts dt { color: var(--text-muted); }
+.totals-page .totals-facts dd { margin: 0; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.totals-page .totals-note, .totals-page .totals-warning, .totals-page .totals-error { margin: 0; font-size: var(--text-caption); line-height: 1.6; overflow-wrap: anywhere; }
+.totals-page .totals-note { color: var(--text-muted); }
+.totals-page .totals-metric > .totals-note:last-child { margin-top: auto; }
+.totals-page .totals-warning { color: var(--warning); }
+.totals-page .totals-error { color: var(--danger); }
+.totals-page .totals-method { display: grid; gap: 8px; padding: 16px 0; border-top: 1px solid var(--border); color: var(--text-muted); font-size: var(--text-caption); }
+.totals-page .totals-method h2 { margin: 0; color: var(--foreground); font-size: var(--text-small); font-weight: 600; }
+.totals-page .totals-method p { margin: 0; line-height: 1.7; }
+@media (max-width: 767px) {
+  .totals-page .totals-metrics { grid-template-columns: minmax(0, 1fr); }
+  .totals-page .totals-dates { width: 100%; }
+  .totals-page .totals-dates .f { flex-basis: 100%; }
+  .totals-page .totals-actions { width: 100%; }
+  .totals-page .totals-presets { flex: 1 1 100%; }
+}

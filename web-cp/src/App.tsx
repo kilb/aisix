@@ -25,6 +25,7 @@ import { RouteNav } from "./ui/RouteNav";
 import { SidebarMenuButton, SidebarShell } from "./ui/Sidebar";
 import {
   Activity,
+  ChartNoAxesCombined,
   Braces,
   Building2,
   DatabaseZap,
@@ -44,6 +45,7 @@ import {
 import { takeChargesFilter } from "./lib/pricingStatus";
 import { adminRouteOf, adminHash, canSeeAdminTab } from "./lib/navigation";
 const Analytics = lazy(() => import("./tabs/Analytics").then(module => ({ default: module.Analytics })));
+const Totals = lazy(() => import("./tabs/Totals").then(module => ({ default: module.Totals })));
 const DirectModelMonitoring = lazy(() => import("./components/DirectModelMonitoring").then(module => ({ default: module.DirectModelMonitoring })));
 const Calls = lazy(() => import("./tabs/Calls").then(module => ({ default: module.Calls })));
 const ModelTests = lazy(() => import("./tabs/ModelTests").then(module => ({ default: module.ModelTests })));
@@ -65,6 +67,7 @@ const Tenants = lazy(() => import("./tabs/Tenants").then(module => ({ default: m
 const TABS = [
   { id: "overview", label: "概览", icon: LayoutDashboard, group: "运行" },
   { id: "analytics", label: "用量分析", icon: LayoutDashboard, group: "运行" },
+  { id: "totals", label: "总量统计", icon: ChartNoAxesCombined, group: "运行" },
   { id: "calls", label: "调用记录", icon: ScrollText, group: "运行" },
   { id: "upstream-monitoring", label: "上游监测", icon: Activity, group: "运行" },
   { id: "providers", label: "上游账号", icon: Plug, group: "接入" },
@@ -215,6 +218,8 @@ function Page({ tab, ...props }: TabProps & { tab: TabId }) {
   switch (tab) {
     case "analytics":
       return <Analytics {...props} />;
+    case "totals":
+      return <Totals {...props} />;
     case "calls":
       return <Calls {...props} />;
     case "upstream-monitoring":
