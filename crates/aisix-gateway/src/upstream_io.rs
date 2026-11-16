@@ -95,39 +95,29 @@ struct ResponseBodyLimitExceeded;
 type BodyError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 #[derive(Default)]
-pub(crate) struct HttpTiming {
-    pub(crate) started: Option<Instant>,
-    send: Option<Instant>,
-    headers: Option<Instant>,
-    byte: Option<Instant>,
-    frame: Option<Instant>,
-    pub(crate) canonical: Option<Instant>,
-    pub(crate) content: Option<Instant>,
-    pub(crate) ambiguous: bool,
+struct HttpTiming {
+    started: Option<Instant>,
+    samples: aisix_core::usage_io::UpstreamTiming,
+    ambiguous: bool,
 }
 
 impl HttpTiming {
-    pub(crate) fn snapshot(&self) -> Option<aisix_core::usage_io::UpstreamTiming> {
-        let started = self.started?;
-        self.send?;
-        if self.ambiguous {
-            return None;
-        }
-        let offset = |at: Option<Instant>| {
-            at.map(|at| {
-                at.saturating_duration_since(started)
-                    .as_millis()
-                    .min(u128::from(u32::MAX)) as u32
-            })
-        };
-        Some(aisix_core::usage_io::UpstreamTiming {
-            http_send_started_ms: offset(self.send),
-            response_headers_ms: offset(self.headers),
-            first_response_byte_ms: offset(self.byte),
-            first_protocol_frame_ms: offset(self.frame),
-            first_canonical_chunk_ms: offset(self.canonical),
-            first_content_ms: offset(self.content),
+    fn offset_at(&self, at: Instant) -> Option<u32> {
+        self.started.map(|started| {
+            at.saturating_duration_since(started)
+                .as_millis()
+                .min(u128::from(u32::MAX)) as u32
         })
+    }
+
+    fn now(&self) -> Option<u32> {
+        self.started?;
+        self.offset_at(Instant::now())
+    }
+
+    fn snapshot(&self) -> Option<aisix_core::usage_io::UpstreamTiming> {
+        self.samples.http_send_started_ms?;
+        (!self.ambiguous).then_some(self.samples)
     }
 }
 
@@ -156,6 +146,66 @@ struct Exchange {
     output_partial: bool,
     output_adapter_complete: Option<bool>,
     output_terminal: bool,
+}
+
+/// 直接复用已有交换的 Arc 和锁；后续标记不再查找外层集合。
+#[derive(Clone)]
+pub struct HttpTimingObserver(Arc<Mutex<Exchange>>);
+
+impl std::fmt::Debug for HttpTimingObserver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpTimingObserver").finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for HttpTimingObserver {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for HttpTimingObserver {}
+
+impl HttpTimingObserver {
+    fn with_timing<T>(&self, observe: impl FnOnce(&mut HttpTiming) -> T) -> T {
+        let mut exchange = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        observe(&mut exchange.timing)
+    }
+
+    pub fn snapshot(&self) -> Option<aisix_core::usage_io::UpstreamTiming> {
+        self.with_timing(|timing| timing.snapshot())
+    }
+
+    pub fn note_canonical_chunk(&self) {
+        self.with_timing(|timing| {
+            if timing.samples.first_canonical_chunk_ms.is_none() {
+                timing.samples.first_canonical_chunk_ms = timing.now();
+            }
+        });
+    }
+
+    pub fn note_first_content(&self) {
+        self.with_timing(|timing| {
+            if timing.samples.first_content_ms.is_none() {
+                timing.samples.first_content_ms = timing.now();
+            }
+        });
+    }
+
+    pub fn note_first_content_at(&self, at: Instant) {
+        self.with_timing(|timing| {
+            if timing.samples.first_content_ms.is_none() {
+                timing.samples.first_content_ms = timing.offset_at(at);
+            }
+        });
+    }
+
+    pub(crate) fn bind_attempt(&self, started: Option<Instant>) {
+        self.with_timing(|timing| timing.started = started);
+    }
+
+    pub(crate) fn invalidate(&self) {
+        self.with_timing(|timing| timing.ambiguous = true);
+    }
 }
 
 impl Exchange {
@@ -337,18 +387,13 @@ impl Eq for UpstreamIoObserver {}
 
 impl UpstreamIoObserver {
     /// 时序使用已有 local 的持久句柄；不增加 heap 分配，也不受长度折叠/关闭影响。
-    pub(crate) fn with_http_timing<T>(
-        &self,
-        observe: impl FnOnce(&mut HttpTiming) -> T,
-    ) -> Option<T> {
-        let local = self
-            .0
+    pub(crate) fn http_timing_observer(&self) -> Option<HttpTimingObserver> {
+        self.0
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .local
-            .clone()?;
-        let mut exchange = local.lock().unwrap_or_else(|p| p.into_inner());
-        Some(observe(&mut exchange.timing))
+            .clone()
+            .map(HttpTimingObserver)
     }
 
     pub fn new(protocol: Protocol) -> Self {
@@ -568,8 +613,10 @@ impl UpstreamIoObserver {
 
     pub fn begin_response(&self, content_type: Option<&str>) {
         self.update(|exchange| {
-            if exchange.timing.send.is_some() && exchange.timing.headers.is_none() {
-                exchange.timing.headers = Some(Instant::now());
+            if exchange.timing.samples.http_send_started_ms.is_some()
+                && exchange.timing.samples.response_headers_ms.is_none()
+            {
+                exchange.timing.samples.response_headers_ms = exchange.timing.now();
             }
             let mime = content_type
                 .unwrap_or("")
@@ -593,9 +640,11 @@ impl UpstreamIoObserver {
 
     pub fn observe_response_body(&self, bytes: &[u8]) {
         self.update(|exchange| {
-            if !bytes.is_empty() && exchange.timing.send.is_some() && exchange.timing.byte.is_none()
+            if !bytes.is_empty()
+                && exchange.timing.samples.http_send_started_ms.is_some()
+                && exchange.timing.samples.first_response_byte_ms.is_none()
             {
-                exchange.timing.byte = Some(Instant::now());
+                exchange.timing.samples.first_response_byte_ms = exchange.timing.now();
             }
             *exchange.response_bytes.get_or_insert(0) = exchange
                 .response_bytes
@@ -603,11 +652,11 @@ impl UpstreamIoObserver {
                 .saturating_add(bytes.len() as u64);
             if let Some(output) = &mut exchange.output {
                 output.feed(bytes);
-                if exchange.timing.send.is_some()
-                    && exchange.timing.frame.is_none()
+                if exchange.timing.samples.http_send_started_ms.is_some()
+                    && exchange.timing.samples.first_protocol_frame_ms.is_none()
                     && output.has_sse_frame()
                 {
-                    exchange.timing.frame = Some(Instant::now());
+                    exchange.timing.samples.first_protocol_frame_ms = exchange.timing.now();
                 }
             }
         });
@@ -615,8 +664,11 @@ impl UpstreamIoObserver {
 
     fn observe_rejected_response_bytes(&self, bytes: usize) {
         self.update(|exchange| {
-            if bytes > 0 && exchange.timing.send.is_some() && exchange.timing.byte.is_none() {
-                exchange.timing.byte = Some(Instant::now());
+            if bytes > 0
+                && exchange.timing.samples.http_send_started_ms.is_some()
+                && exchange.timing.samples.first_response_byte_ms.is_none()
+            {
+                exchange.timing.samples.first_response_byte_ms = exchange.timing.now();
             }
             *exchange.response_bytes.get_or_insert(0) = exchange
                 .response_bytes
@@ -1144,7 +1196,9 @@ pub async fn send(
         observer.finish_request();
     }
     crate::response_tap::note_http_dispatch();
-    observer.with_http_timing(|timing| timing.send = Some(Instant::now()));
+    if let Some(timing) = observer.http_timing_observer() {
+        timing.with_timing(|timing| timing.samples.http_send_started_ms = timing.now());
+    }
     let response = client.execute(request).await?;
     Ok(wrap_response(response, observer))
 }

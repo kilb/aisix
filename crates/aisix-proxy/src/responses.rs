@@ -4578,6 +4578,7 @@ fn observe_responses_sse_frame(
             usage.upstream_ttft_ms = crate::attempt::measured_ms(ttft);
             usage.upstream_ttft = Some(ttft);
             crate::attribution::note_upstream_first_frame();
+            crate::attribution::note_upstream_canonical_chunk();
         }
         // `resp_…` off any frame that carries the response object —
         // `response.created` is the first, so a stream that dies

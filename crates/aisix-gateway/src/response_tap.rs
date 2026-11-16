@@ -108,34 +108,7 @@ pub struct UpstreamResponseCapture {
     pub timing: Option<HttpTimingObserver>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HttpTimingObserver(crate::upstream_io::UpstreamIoObserver);
-
-impl HttpTimingObserver {
-    pub fn snapshot(&self) -> Option<aisix_core::usage_io::UpstreamTiming> {
-        self.0
-            .with_http_timing(|timing| timing.snapshot())
-            .flatten()
-    }
-
-    pub fn note_canonical_chunk(&self) {
-        self.0.with_http_timing(|timing| {
-            timing.canonical.get_or_insert_with(Instant::now);
-        });
-    }
-
-    pub fn note_first_content(&self) {
-        self.0.with_http_timing(|timing| {
-            timing.content.get_or_insert_with(Instant::now);
-        });
-    }
-
-    pub fn note_first_content_at(&self, at: Instant) {
-        self.0.with_http_timing(|timing| {
-            timing.content.get_or_insert(at);
-        });
-    }
-}
+pub use crate::upstream_io::HttpTimingObserver;
 
 impl UpstreamResponseCapture {
     /// 纯读取，不改变失败或取消时仍需完整结算的上游等待窗口。
@@ -383,17 +356,20 @@ pub fn note_buffered_stream() {
 pub(crate) fn note_upstream_io(observer: &crate::upstream_io::UpstreamIoObserver) {
     let _ = TAP.try_with(|tap| {
         let mut current = tap.lock();
-        observer.with_http_timing(|timing| timing.started = current.attempt_started);
+        let timing = observer.http_timing_observer();
+        if let Some(timing) = &timing {
+            timing.bind_attempt(current.attempt_started);
+        }
         if current.io.is_none() {
-            current.timing = Some(HttpTimingObserver(observer.clone()));
+            current.timing = timing;
         } else {
             // 多个交换不能拼成单一时间线，已经取走的句柄也必须失效。
             if let Some(previous) = current.timing.take() {
-                previous
-                    .0
-                    .with_http_timing(|timing| timing.ambiguous = true);
+                previous.invalidate();
             }
-            observer.with_http_timing(|timing| timing.ambiguous = true);
+            if let Some(timing) = timing {
+                timing.invalidate();
+            }
         }
         if let Some(aggregate) = &current.io {
             aggregate.append(observer);

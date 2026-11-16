@@ -5147,6 +5147,7 @@ fn update_anthropic_usage(
         acc.upstream_ttft_ms = crate::attempt::measured_ms(ttft);
         acc.upstream_ttft = Some(ttft);
         crate::attribution::note_upstream_first_frame();
+        crate::attribution::note_upstream_canonical_chunk();
     }
     if let Some(usage) = anthropic_event_usage(json) {
         acc.usage_accumulator.update(usage);

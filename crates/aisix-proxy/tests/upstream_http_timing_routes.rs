@@ -516,3 +516,85 @@ async fn retry_usage_rows_keep_their_own_http_exchange_and_content_ownership() -
     assert!(events.try_recv().is_err());
     Ok(())
 }
+
+async fn completions_timing(parts: Vec<(Duration, Bytes)>) -> TestResult<UpstreamTiming> {
+    let mut upstream = upstream(vec![Reply {
+        status: StatusCode::OK,
+        content_type: "text/event-stream",
+        header_delay: GAP,
+        parts,
+    }])
+    .await?;
+    let (router, mut events) = app(&upstream.base, Family::Chat, 0)?;
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/completions")
+        .header("authorization", "Bearer clock-caller")
+        .header("content-type", "application/json")
+        .extension(ConnectInfo("127.0.0.1:41000".parse::<SocketAddr>()?))
+        .body(Body::from(
+            json!({"model":"clock-model","prompt":"hello","stream":true,"max_tokens":16})
+                .to_string(),
+        ))?;
+    let response = tokio::time::timeout(DEADLINE, router.oneshot(request)).await??;
+    // 完整消费真实 TelemetryBody；这里不将旧 completions 的状态分类作为新契约。
+    let _ = tokio::time::timeout(DEADLINE, to_bytes(response.into_body(), 1048576)).await??;
+    let event = event(&mut events).await?;
+    let (path, body) = tokio::time::timeout(DEADLINE, upstream.requests.recv())
+        .await?
+        .ok_or("missing completions upstream request")?;
+    assert_eq!(path, "/v1/completions");
+    assert_eq!(body.get("prompt").and_then(Value::as_str), Some("hello"));
+    assert_eq!(body.get("stream").and_then(Value::as_bool), Some(true));
+    assert!(events.try_recv().is_err());
+    event
+        .upstream_timing
+        .ok_or_else(|| "completions event lacks HTTP timing".into())
+}
+
+// 旧 completions 原样转发字节，不产生 canonical chunk；半帧不能被隐式 hook 计作一个。
+#[tokio::test]
+async fn opaque_completions_split_sse_has_a_raw_frame_without_a_canonical_chunk() -> TestResult {
+    let frame = sse(json!({
+        "id":"cmpl-clock","object":"text_completion","model":"upstream-clock",
+        "choices":[{"index":0,"text":"clock-output","finish_reason":"stop"}],
+        "usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}
+    }));
+    let cut = frame.len() / 2;
+    let timing = completions_timing(vec![
+        (GAP, Bytes::copy_from_slice(&frame.as_bytes()[..cut])),
+        (GAP, Bytes::copy_from_slice(&frame.as_bytes()[cut..])),
+        (Duration::ZERO, Bytes::from_static(b"data: [DONE]\n\n")),
+    ])
+    .await?;
+    let (_, _, byte) = raw_phases(timing)?;
+    let frame = measured(timing.first_protocol_frame_ms, "complete completions frame")?;
+    assert!(
+        frame >= byte + 45,
+        "the raw frame must wait for the separately delivered terminator"
+    );
+    assert_eq!(
+        timing.first_canonical_chunk_ms, None,
+        "opaque byte forwarding must not manufacture a canonical chunk"
+    );
+    Ok(())
+}
+
+// EOF 前只有未闭合事件时，首字节仍可测，raw frame 与 canonical 均应未知。
+#[tokio::test]
+async fn opaque_completions_unterminated_sse_has_no_frame_or_canonical_chunk() -> TestResult {
+    let timing = completions_timing(vec![(
+        GAP,
+        Bytes::from_static(
+            b"data: {\"id\":\"cmpl-clock\",\"choices\":[{\"index\":0,\"text\":\"clock-output\"}]}",
+        ),
+    )])
+    .await?;
+    raw_phases(timing)?;
+    assert_eq!(timing.first_protocol_frame_ms, None);
+    assert_eq!(
+        timing.first_canonical_chunk_ms, None,
+        "an unterminated byte fragment must not become a canonical chunk"
+    );
+    Ok(())
+}

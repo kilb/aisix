@@ -2198,15 +2198,14 @@ pub(crate) fn note_upstream_wait_end(success: bool) {
 /// The winning attempt's first streamed frame arrived. Every stream that
 /// stamps `upstream_ttft_ms` calls this at the same point.
 pub(crate) fn note_upstream_first_frame() {
-    let token_surface = CURRENT
-        .try_with(|a| a.lock().first_token.is_some())
-        .unwrap_or(false);
-    if token_surface {
-        if let Some(timing) = upstream_stream_timing().http {
-            timing.note_canonical_chunk();
-        }
-    }
     note_upstream_first_frame_at(Instant::now());
+}
+
+/// 仅已解析的原生帧消费者调用；原始字节透传不制造 canonical 样本。
+pub(crate) fn note_upstream_canonical_chunk() {
+    if let Some(timing) = upstream_stream_timing().http {
+        timing.note_canonical_chunk();
+    }
 }
 
 fn note_upstream_first_frame_at(at: Instant) {
