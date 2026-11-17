@@ -23,7 +23,7 @@
 use std::sync::{Arc, OnceLock};
 
 use aisix_core::config::OutboundTlsConfig;
-use aisix_core::models::provider_key::UpstreamConnection;
+use aisix_core::models::provider_key::{ProviderKeyTls, UpstreamConnection};
 
 use crate::upstream_http::error_with_causes;
 
@@ -501,6 +501,95 @@ pub fn rustls_client_config() -> Arc<rustls::ClientConfig> {
             ))
         })
         .clone()
+}
+
+type ProviderRustlsConfigs = std::collections::HashMap<ProviderKeyTls, Arc<rustls::ClientConfig>>;
+const PROVIDER_RUSTLS_CONFIG_LIMIT: usize = 128;
+
+/// 为目标账号叠加 TLS 设置；无覆盖时直接复用部署配置，不访问账号缓存。
+pub fn rustls_client_config_for_provider_key(
+    tls: Option<&ProviderKeyTls>,
+) -> std::io::Result<Arc<rustls::ClientConfig>> {
+    let Some(tls) = tls.filter(|tls| !tls.is_noop()) else {
+        return Ok(rustls_client_config());
+    };
+    static CONFIGS: OnceLock<std::sync::Mutex<ProviderRustlsConfigs>> = OnceLock::new();
+    let cache = CONFIGS.get_or_init(Default::default);
+    if let Some(config) = cache
+        .lock()
+        .map_err(|_| std::io::Error::other("provider TLS cache unavailable"))?
+        .get(tls)
+        .cloned()
+    {
+        return Ok(config);
+    }
+    // 仅首次建连解析该覆盖；构建期间不持锁，其他账号无需等待证书解析。
+    let settings = provider_key_tls_settings(&crate::upstream_http::config().tls, tls)?;
+    let config = Arc::new(build_rustls_client_config(&settings));
+    let mut configs = cache
+        .lock()
+        .map_err(|_| std::io::Error::other("provider TLS cache unavailable"))?;
+    Ok(cache_provider_rustls_config(
+        &mut configs,
+        tls.clone(),
+        config,
+    ))
+}
+
+fn cache_provider_rustls_config(
+    cache: &mut ProviderRustlsConfigs,
+    tls: ProviderKeyTls,
+    config: Arc<rustls::ClientConfig>,
+) -> Arc<rustls::ClientConfig> {
+    if let Some(existing) = cache.get(&tls) {
+        return Arc::clone(existing);
+    }
+    // 配置滚动更新不能无限保留旧 CA；淘汰只释放缓存引用，不影响已打开连接。
+    if cache.len() >= PROVIDER_RUSTLS_CONFIG_LIMIT {
+        if let Some(old) = cache.keys().next().cloned() {
+            cache.remove(&old);
+        }
+    }
+    cache.insert(tls, Arc::clone(&config));
+    config
+}
+
+fn provider_key_tls_settings(
+    deployment: &TlsSettings,
+    tls: &ProviderKeyTls,
+) -> std::io::Result<TlsSettings> {
+    let mut settings = deployment.clone();
+    if let Some(pem) = tls.ca_cert.as_ref().filter(|pem| !pem.trim().is_empty()) {
+        let invalid = || {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "provider_key.tls.ca_cert contains no usable CA certificate",
+            )
+        };
+        let certs = rustls_pemfile::certs(&mut pem.as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| invalid())?;
+        if certs.is_empty() {
+            return Err(invalid());
+        }
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in certs {
+            roots.add(cert).map_err(|_| invalid())?;
+        }
+        let mut combined = deployment
+            .extra_ca_pem
+            .as_deref()
+            .cloned()
+            .unwrap_or_default();
+        if !combined.is_empty() && !combined.ends_with(b"\n") {
+            combined.push(b'\n');
+        }
+        combined.extend_from_slice(pem.as_bytes());
+        settings.extra_ca_pem = Some(Arc::new(combined));
+    }
+    // 与 HTTP 客户端一致：账号可显式关闭校验，不能重置部署的 trust 或 mTLS 身份。
+    settings.verify &= tls.verify;
+    Ok(settings)
 }
 
 fn build_rustls_client_config(tls: &TlsSettings) -> rustls::ClientConfig {
@@ -1665,4 +1754,5 @@ X17A3EVrPDGV+ue9g6YKFfXOu9oCcTkopNofEBIVGAG/IyLsYxscDNuO
         let _ = client_for_provider_key(&shared_client(), Some(&tls_conn(tls.clone())));
         assert!(cached(&tls_conn(tls)));
     }
+    include!("upstream_tls_provider_key_tests.rs");
 }

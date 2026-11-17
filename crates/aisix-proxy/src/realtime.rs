@@ -474,11 +474,13 @@ fn decode_chunked(mut raw: &[u8]) -> Option<(Vec<u8>, bool)> {
 /// provider's `/v1/chat/completions` worked.
 async fn connect_upstream(
     request: tokio_tungstenite::tungstenite::handshake::client::Request,
+    tls: Option<aisix_core::models::provider_key::ProviderKeyTls>,
     written: Arc<AtomicBool>,
 ) -> UpstreamDial {
     connect_upstream_within(
         aisix_gateway::upstream_http::config().connect_timeout,
         request,
+        tls,
         written,
     )
     .await
@@ -498,6 +500,7 @@ async fn connect_upstream(
 async fn connect_upstream_within(
     budget: Option<Duration>,
     request: tokio_tungstenite::tungstenite::handshake::client::Request,
+    tls: Option<aisix_core::models::provider_key::ProviderKeyTls>,
     written: Arc<AtomicBool>,
 ) -> UpstreamDial {
     let (back, mut handed_back) = tokio::sync::oneshot::channel();
@@ -520,7 +523,12 @@ async fn connect_upstream_within(
         let port = uri.port_u16().unwrap_or(if secure { 443 } else { 80 });
         let mut stream = aisix_gateway::upstream_dial::connect(host, port, secure).await?;
         if secure {
-            stream = aisix_gateway::upstream_dial::connect_tls(stream, host).await?;
+            stream = aisix_gateway::upstream_dial::connect_tls_for_provider_key(
+                stream,
+                host,
+                tls.as_ref(),
+            )
+            .await?;
         }
         let stream = HandedBack {
             written,
@@ -551,10 +559,11 @@ async fn connect_upstream_within(
 /// 同一拨号 future 等待期间持续续租；权威失败不能变成供应商故障或触发重拨。
 async fn connect_with_authority(
     request: tokio_tungstenite::tungstenite::handshake::client::Request,
+    tls: Option<aisix_core::models::provider_key::ProviderKeyTls>,
     renewal: &mut Option<crate::native_api::realtime_journal::LeaseRenewal>,
     written: Arc<AtomicBool>,
 ) -> Result<UpstreamConnection, SessionDialFailure> {
-    let dial = connect_upstream(request, written);
+    let dial = connect_upstream(request, tls, written);
     tokio::pin!(dial);
     loop {
         tokio::select! {
@@ -842,6 +851,7 @@ struct Prepared {
     journal: Option<crate::native_api::realtime_journal::Journal>,
     initial_configuration: Option<Value>,
     upstream_request: tokio_tungstenite::tungstenite::handshake::client::Request,
+    upstream_tls: Option<aisix_core::models::provider_key::ProviderKeyTls>,
     reservation: aisix_ratelimit::MultiReservation,
     model_reservation: aisix_ratelimit::MultiReservation,
     requested_model: String,
@@ -1163,6 +1173,7 @@ async fn prepare_for(
         initial_configuration: None,
         model_entry,
         upstream_request,
+        upstream_tls: pk_entry.value.tls.clone().filter(|tls| !tls.is_noop()),
         reservation,
         model_reservation,
         requested_model,
@@ -1905,7 +1916,25 @@ impl SessionMeter<'_> {
             Some(key) if !key.value.can_access(&snap, self.requested_model) => {
                 return Some(ProxyError::ModelForbidden(self.requested_model.to_string()))
             }
-            Some(_) => {}
+            Some(key) => {
+                if let Err(error) = crate::endpoint_acl::check_endpoint(
+                    &key.value,
+                    aisix_core::models::EndpointFamily::Realtime,
+                ) {
+                    return Some(error);
+                }
+                // 只复核已打开连接的账号；模型后来换绑不能替旧连接取得新组权限。
+                if !key.value.allowed_provider_groups.is_empty()
+                    && !snap.provider_keys.get_by_id(self.pk_id).is_some_and(|pk| {
+                        crate::routing::provider_key_in_groups(
+                            &pk.value,
+                            &key.value.allowed_provider_groups,
+                        )
+                    })
+                {
+                    return Some(crate::routing::no_target_in_groups(self.requested_model));
+                }
+            }
             None => return Some(ProxyError::ApiKeyDisabled),
         }
         crate::budget::enforce_key(self.state, &snap, self.auth)
@@ -1932,6 +1961,7 @@ async fn run_session(
         mut journal,
         initial_configuration,
         upstream_request,
+        upstream_tls,
         reservation,
         model_reservation,
         requested_model,
@@ -1979,6 +2009,7 @@ async fn run_session(
     let handshake_written = Arc::new(AtomicBool::new(false));
     let (upstream, upgrade_request_id) = match connect_with_authority(
         upstream_request,
+        upstream_tls,
         &mut renewal,
         Arc::clone(&handshake_written),
     )
@@ -2139,6 +2170,9 @@ async fn run_session(
             let model = crate::usage_attr::usage_event_model_label(&snap, &requested_model);
             let unresolved_pk = crate::usage_attr::ResolvedPk::unresolved();
             let labels = crate::usage_attr::usage_event_labels(&model, &unresolved_pk);
+            // 租约已取消；先释放并发额度，再发布终态，关闭确认不再占用额度。
+            drop(reservation);
+            drop(model_reservation);
             if let Some(refused) = &refused {
                 let names = crate::client_ip::exported_header_names(&snap, true);
                 if !names.is_empty() {
@@ -2158,19 +2192,20 @@ async fn run_session(
                     /* terminal */ true,
                     /* dispatched */ true,
                 );
-                return;
+            } else {
+                emit_usage(
+                    &state,
+                    &snap,
+                    crate::operation::REALTIME,
+                    event,
+                    labels,
+                    None,
+                    client.trace.as_ref(),
+                    true,
+                    handshake_written.load(Ordering::Relaxed),
+                );
             }
-            emit_usage(
-                &state,
-                &snap,
-                crate::operation::REALTIME,
-                event,
-                labels,
-                None,
-                client.trace.as_ref(),
-                true,
-                handshake_written.load(Ordering::Relaxed),
-            );
+            finish_failed_client_close(&mut client_rx).await;
             return;
         }
     };
@@ -3040,6 +3075,25 @@ fn session_refusal_error(text: &str) -> Option<BridgeError> {
 /// How long a session that the client closed waits for the upstream to
 /// acknowledge its own close before dropping the connection.
 const UPSTREAM_CLOSE_ACK: Duration = Duration::from_secs(2);
+
+/// 失败侧也完成关闭握手；否则客户端已发但尚未读取的工作帧会把 Close 冲成 TCP RST。
+async fn finish_failed_client_close(client: &mut futures::stream::SplitStream<WebSocket>) {
+    let _ = tokio::time::timeout(UPSTREAM_CLOSE_ACK, async {
+        let mut bytes = 0_usize;
+        for _ in 0..128 {
+            match client.next().await {
+                Some(Ok(AxMessage::Text(text))) => bytes = bytes.saturating_add(text.len()),
+                Some(Ok(AxMessage::Binary(body))) => bytes = bytes.saturating_add(body.len()),
+                Some(Ok(AxMessage::Ping(_) | AxMessage::Pong(_))) => {}
+                Some(Ok(AxMessage::Close(_))) | Some(Err(_)) | None => break,
+            }
+            if bytes >= REALTIME_MAX_MESSAGE_BYTES {
+                break;
+            }
+        }
+    })
+    .await;
+}
 
 /// Close the upstream socket and wait, briefly, for its acknowledgement,
 /// so the upstream sees a completed handshake rather than a reset. A text frame
@@ -3952,7 +4006,12 @@ mod tests {
         // rather than fail it.
         let err = tokio::time::timeout(
             Duration::from_secs(5),
-            connect_upstream_within(Some(budget), request, Arc::new(AtomicBool::new(false))),
+            connect_upstream_within(
+                Some(budget),
+                request,
+                None,
+                Arc::new(AtomicBool::new(false)),
+            ),
         )
         .await
         .expect("the dial must end on its own budget")
@@ -4854,7 +4913,7 @@ mod tests {
             assert!(
                 matches!(
                     err,
-                    ProxyError::AllCandidatesUnavailable {
+                    ProxyError::ProviderGroupsUnavailable {
                         retry_after_secs: None
                     }
                 ),
@@ -6285,4 +6344,6 @@ mod tests {
     }
     include!("realtime_frame_perf_tests.rs");
     include!("realtime_asr_contract_tests.rs");
+    include!("realtime_policy_tests.rs");
+    include!("realtime_tls_tests.rs");
 }

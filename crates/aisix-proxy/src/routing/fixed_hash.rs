@@ -29,6 +29,7 @@ impl FixedHashPool {
         let mut targets = Vec::with_capacity(routing.targets.len());
         let mut declarations = Vec::with_capacity(routing.targets.len());
         let mut seen = std::collections::HashSet::with_capacity(routing.targets.len());
+        let mut excluded_by_groups = false;
         for configured in &routing.targets {
             // 先完整解析配置；缺失或已撤销的引用不能悄悄从环中消失。
             let entry = match configured.model_id.as_deref() {
@@ -45,7 +46,11 @@ impl FixedHashPool {
                 .provider_keys
                 .get_by_id(account_id)
                 .ok_or(ProxyError::ProviderUnavailable)?;
-            if !provider_key_in_groups(&account.value, groups) || !seen.insert(entry.id.clone()) {
+            if !provider_key_in_groups(&account.value, groups) {
+                excluded_by_groups = true;
+                continue;
+            }
+            if !seen.insert(entry.id.clone()) {
                 continue;
             }
             targets.push(AttemptModel {
@@ -60,6 +65,10 @@ impl FixedHashPool {
                 model_id: Some(entry.id.clone()),
                 ..configured.clone()
             });
+        }
+        if targets.is_empty() && excluded_by_groups {
+            log_provider_group_refusal();
+            return Err(ProxyError::ProviderGroupsPoolEmpty);
         }
         let positive = targets.iter().any(|target| target.weight > 0);
         let priority = targets

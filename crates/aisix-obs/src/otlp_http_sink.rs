@@ -504,6 +504,10 @@ impl OtlpHttpFanOut {
 #[path = "otlp_fan_out_work_tests.rs"]
 mod fan_out_work_tests;
 
+#[cfg(test)]
+#[path = "exporter_fingerprint_tests.rs"]
+mod fingerprint_tests;
+
 impl Default for OtlpHttpFanOut {
     fn default() -> Self {
         Self::new()
@@ -529,9 +533,26 @@ fn fingerprint_exporter(exporter: &ObservabilityExporter) -> u64 {
     };
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     kind.hash(&mut hasher);
-    exporter.request_headers.hash(&mut hasher);
-    exporter.upstream_response_headers.hash(&mut hasher);
+    hash_header_selection(&exporter.request_headers, &mut hasher);
+    hash_header_selection(&exporter.upstream_response_headers, &mut hasher);
     hasher.finish()
+}
+
+// header 选择是集合：组内重排不撤销队列，组间移动或增删仍改变指纹。
+// 此函数也在逐事件路径上运行；独立哈希后求和，无需复制、排序或共享缓存。
+fn hash_header_selection(headers: &[String], hasher: &mut impl std::hash::Hasher) {
+    use std::hash::{Hash, Hasher};
+    if headers.len() <= 1 {
+        headers.hash(hasher);
+        return;
+    }
+    headers.len().hash(hasher);
+    let sum = headers.iter().fold(0_u64, |sum, header| {
+        let mut header_hasher = std::collections::hash_map::DefaultHasher::new();
+        header.hash(&mut header_hasher);
+        sum.wrapping_add(header_hasher.finish())
+    });
+    sum.hash(hasher);
 }
 
 /// Hash an `otlp_http` exporter's delivery-relevant config. A change to any

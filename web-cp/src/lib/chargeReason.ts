@@ -64,6 +64,9 @@ export function nothingToBillReason(c: Pick<Charge, "status_code" | "error_class
   const cls = c.error_class ?? "";
   const status = c.status_code !== null && c.status_code > 0 ? c.status_code : null;
   if (cls === CLIENT_GONE) return ["调用方中断", attempt].filter(Boolean).join(" · ");
+  if (cls === "provider_groups_unavailable") {
+    return ["请求被拒绝", "供应商分组内没有可用目标", attempt].filter(Boolean).join(" · ");
+  }
   if (UPSTREAM_FAILURES.has(cls)) {
     const upstream = status !== null && !(status >= 200 && status < 300) && !NO_UPSTREAM_STATUS.has(cls) ? status : null;
     const what = upstream !== null ? `上游 ${upstream}` : (UPSTREAM_WORDS[cls] ?? "上游出错");

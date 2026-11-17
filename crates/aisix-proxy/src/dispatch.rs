@@ -246,9 +246,13 @@ pub(crate) fn is_first_party_anthropic(snapshot: &AisixSnapshot, model: &Model) 
 /// that names the route in [`ProviderKey::apis`], which is how one
 /// credential reaches a vendor's OpenAI path and its Anthropic path both.
 ///
-/// 未配置 `apis` 时，`openai` 提供方或 `openai` 适配器默认原生支持
-/// `/v1/responses`。配置了映射后以它为准；省略 `responses` 会将请求
-/// 转换为 Chat Completions。平台适配器仍使用各平台自己的接口。
+/// `/v1/responses` has no such declaration to lean on: the Responses API
+/// is a strict superset of chat completions rather than a rename, so
+/// `adapter: openai` says nothing about whether the route exists. Absent
+/// an `apis` map the gateway falls back to the vendor id — only OpenAI
+/// itself is assumed to serve it — and once the map exists it is the
+/// answer, so an operator whose OpenAI-compatible endpoint has no
+/// `/v1/responses` gets the request translated rather than 404'd upstream.
 pub(crate) fn serves_natively(
     snapshot: &AisixSnapshot,
     model: &Model,
@@ -306,10 +310,7 @@ pub(crate) fn serves_natively_with(
         }
         ApiSurface::Responses => match declared {
             Some(apis) => apis.responses.is_some(),
-            None => {
-                model.provider.as_deref() == Some("openai")
-                    || pk.is_some_and(|p| p.adapter == Some(aisix_core::Adapter::Openai))
-            }
+            None => model.provider.as_deref() == Some("openai"),
         },
     }
 }
@@ -1075,9 +1076,12 @@ mod tests {
         .unwrap()
     }
 
-    /// 没有 `apis` 映射时保留提供方推断，以及 Anthropic 适配器的 Messages 能力。
+    /// No `apis` map — every surface resolves exactly as it did before the
+    /// field existed. This is the guard that stored configuration keeps its
+    /// behavior: the vendor id decides `/v1/responses`, the vendor id or
+    /// the anthropic adapter decides `/v1/messages`.
     #[test]
-    fn without_apis_the_vendor_and_anthropic_adapter_inference_is_unchanged() {
+    fn without_apis_the_vendor_inference_is_unchanged() {
         let snap = snapshot_with_pk_json(
             "pk-1",
             r#"{"display_name":"o","secret":"k","api_base":"https://up/v1","provider":"openai","adapter":"openai"}"#,
@@ -1096,24 +1100,45 @@ mod tests {
     }
 
     #[test]
-    fn responses_default_agrees_for_native_dispatch_and_fixed_counting() {
-        // 原生分发与固定计数必须采用同一默认值；显式省略及平台适配器仍关闭。
-        for (adapter, apis, expected) in [
-            ("openai", None, true),
-            ("openai", Some(serde_json::json!({})), false),
-            ("openai", Some(serde_json::json!({"messages":{}})), false),
-            ("openai", Some(serde_json::json!({"responses":{}})), true),
-            ("anthropic", None, false),
-            ("azure-openai", None, false),
-            ("bedrock", None, false),
-            ("vertex", None, false),
+    fn responses_counter_default_preserves_ordinary_native_dispatch_policy() {
+        // 固定计数默认可选 OpenAI 兼容账号，普通推理仍按原有策略选路。
+        for (adapter, apis, native_expected, counter_expected) in [
+            ("openai", None, false, true),
+            ("openai", Some(serde_json::json!({})), false, false),
+            (
+                "openai",
+                Some(serde_json::json!({"messages":{}})),
+                false,
+                false,
+            ),
+            (
+                "openai",
+                Some(serde_json::json!({"responses":{}})),
+                true,
+                true,
+            ),
+            ("anthropic", None, false, false),
+            ("azure-openai", None, false, false),
+            ("bedrock", None, false, false),
+            ("vertex", None, false, false),
             (
                 "azure-openai",
                 Some(serde_json::json!({"responses":{}})),
                 false,
+                false,
             ),
-            ("bedrock", Some(serde_json::json!({"responses":{}})), false),
-            ("vertex", Some(serde_json::json!({"responses":{}})), false),
+            (
+                "bedrock",
+                Some(serde_json::json!({"responses":{}})),
+                false,
+                false,
+            ),
+            (
+                "vertex",
+                Some(serde_json::json!({"responses":{}})),
+                false,
+                false,
+            ),
         ] {
             let mut key = serde_json::json!({
                 "display_name":"counter", "api_key":"local-only", "provider":"custom",
@@ -1134,14 +1159,14 @@ mod tests {
             ));
             assert_eq!(
                 serves_natively(&snap, &model, ApiSurface::Responses),
-                expected,
+                native_expected,
                 "native dispatch: {key}",
             );
             let configuration = crate::token_counting::configuration(&snap, ApiSurface::Responses)
                 .unwrap()
                 .unwrap();
             let resolved = configuration.resolve(&snap, "m-1", &model);
-            assert_eq!(resolved.is_ok(), expected, "fixed counting: {key}");
+            assert_eq!(resolved.is_ok(), counter_expected, "fixed counting: {key}");
             if let Ok(counter) = resolved {
                 assert_eq!(counter.key.id, "pk-1");
                 assert_eq!(counter.model_name, "x");

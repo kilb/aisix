@@ -58,6 +58,15 @@ test("a request the gateway refused says so, with its status", () => {
   assert.equal(nothingToBillReason({ status_code: 403, error_class: null, attempt_kind: "initial", attempt_index: 0 }), "请求被拒绝 · 403");
 });
 
+test("a provider-group refusal names the routing constraint without calling it an upstream failure", () => {
+  for (const status_code of [503, null]) {
+    assert.equal(
+      nothingToBillReason({ status_code, error_class: "provider_groups_unavailable", attempt_kind: "initial", attempt_index: 0 }),
+      "请求被拒绝 · 供应商分组内没有可用目标",
+    );
+  }
+});
+
 test("a caller that hung up is not a request the gateway refused", () => {
   assert.equal(nothingToBillReason({ status_code: 499, error_class: "client_disconnected", attempt_kind: "initial", attempt_index: 0 }), "调用方中断");
   assert.equal(

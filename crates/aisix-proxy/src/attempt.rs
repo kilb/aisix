@@ -362,8 +362,9 @@ impl DeferredAttempt {
 ///
 /// Both read it from here so the two cannot drift into two vocabularies
 /// again. An upstream failure reports its [`routing_error_class`], a
-/// semantic router's failed decision `semantic_decision_failed`, and every
-/// other failure its [`ProxyError::kind`].
+/// semantic router's failed decision `semantic_decision_failed`, a provider-group
+/// refusal `provider_groups_unavailable`, and every other failure its
+/// [`ProxyError::kind`].
 ///
 /// NOT the client-facing envelope's `error.type`, which stays
 /// [`ProxyError::kind`]: that one is public API, and for a bridge error it
@@ -374,6 +375,9 @@ pub(crate) fn error_class(err: &ProxyError) -> &'static str {
         // Its `error.type` is the generic `api_error`, which would hide
         // the failure among every other gateway-side fault.
         ProxyError::SemanticDecisionFailed { .. } => "semantic_decision_failed",
+        ProxyError::ProviderGroupsUnavailable { .. } | ProxyError::ProviderGroupsPoolEmpty => {
+            "provider_groups_unavailable"
+        }
         other => other.kind(),
     }
 }
@@ -712,6 +716,8 @@ pub(crate) fn attempt_reached_upstream(err: &ProxyError) -> bool {
         | ProxyError::ProviderUnavailable
         | ProxyError::SemanticDecisionFailed { .. }
         | ProxyError::AllCandidatesUnavailable { .. }
+        | ProxyError::ProviderGroupsUnavailable { .. }
+        | ProxyError::ProviderGroupsPoolEmpty
         | ProxyError::BudgetExceeded(_)
         | ProxyError::BudgetUnverified
         | ProxyError::AccountUnavailable

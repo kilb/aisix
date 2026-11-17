@@ -1935,18 +1935,21 @@ fn targets_in_groups<'a>(
     )
 }
 
+// 两种既有公开错误共用固定运营诊断，不输出调用方提供的模型或路由名。
+fn log_provider_group_refusal() {
+    tracing::warn!(
+        error_class = "provider_groups_unavailable",
+        "nothing the request addressed is in the API key's provider groups",
+    );
+}
+
 /// What a grouped key is told when nothing inside its groups is left: the
 /// answer every upstream being unavailable gets, naming no group, tag or
 /// target, so the refusal cannot be used to learn how a model is grouped.
-/// The one refusal every provider-group gate returns; `addressed` is what the
-/// caller named (a model, a router, a passthrough route) and reaches only the
-/// debug log.
-pub(crate) fn no_target_in_groups(addressed: &str) -> ProxyError {
-    tracing::debug!(
-        addressed = %addressed,
-        "nothing the request addressed is in the API key's provider groups",
-    );
-    ProxyError::AllCandidatesUnavailable {
+/// 各入口共用同一运营分类；日志只带固定原因，不输出调用方提供的模型或路由名。
+pub(crate) fn no_target_in_groups(_addressed: &str) -> ProxyError {
+    log_provider_group_refusal();
+    ProxyError::ProviderGroupsUnavailable {
         retry_after_secs: None,
     }
 }
@@ -1963,7 +1966,7 @@ fn no_routing_target_in_groups(addressed: &str, routing: &Routing) -> ProxyError
     if crate::platform_errors::active()
         && routing.when_all_unavailable_or_default() == WhenAllUnavailablePolicy::Fail
     {
-        return ProxyError::AllCandidatesUnavailable {
+        return ProxyError::ProviderGroupsUnavailable {
             retry_after_secs: Some(FALLBACK_ALL_UNHEALTHY_RETRY_AFTER.as_secs()),
         };
     }
@@ -3943,7 +3946,7 @@ mod tests {
         for outside in ["model-b", "model-none"] {
             let err = check_group_access(&snap, outside, &model(outside), &alpha).unwrap_err();
             assert!(
-                matches!(err, ProxyError::AllCandidatesUnavailable { .. }),
+                matches!(err, ProxyError::ProviderGroupsUnavailable { .. }),
                 "{err:?}"
             );
             assert_names_no_group_or_member(&err);
@@ -4016,7 +4019,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, ProxyError::AllCandidatesUnavailable { .. }),
+            matches!(err, ProxyError::ProviderGroupsUnavailable { .. }),
             "{err:?}"
         );
         assert_names_no_group_or_member(&err);
@@ -4122,7 +4125,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, ProxyError::AllCandidatesUnavailable { .. }),
+            matches!(err, ProxyError::ProviderGroupsUnavailable { .. }),
             "{err:?}"
         );
         assert_names_no_group_or_member(&err);
@@ -4171,7 +4174,7 @@ mod tests {
         assert!(
             matches!(
                 err,
-                ProxyError::AllCandidatesUnavailable {
+                ProxyError::ProviderGroupsUnavailable {
                     retry_after_secs: None
                 }
             ),
@@ -4278,7 +4281,7 @@ mod tests {
         assert!(
             matches!(
                 err,
-                ProxyError::AllCandidatesUnavailable {
+                ProxyError::ProviderGroupsUnavailable {
                     retry_after_secs: None
                 }
             ),
@@ -4288,7 +4291,7 @@ mod tests {
         // A model on a provider key with no group is outside every group.
         assert!(matches!(
             resolve_direct(&snap, "model-none", &allowed),
-            Err(ProxyError::AllCandidatesUnavailable { .. })
+            Err(ProxyError::ProviderGroupsUnavailable { .. })
         ));
         assert_eq!(resolve_direct(&snap, "model-b", &[]).unwrap(), ["model-b"]);
     }

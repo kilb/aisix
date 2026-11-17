@@ -7523,7 +7523,7 @@ mod tests {
         assert!(
             matches!(
                 err,
-                ProxyError::AllCandidatesUnavailable {
+                ProxyError::ProviderGroupsUnavailable {
                     retry_after_secs: None
                 }
             ),

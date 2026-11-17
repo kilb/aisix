@@ -905,6 +905,7 @@ async fn summarize_direct_models(
            'invalid_api_key', 'authentication_error', 'permission_denied', 'model_not_found', \
            'resource_not_found', 'response_not_found', 'video_not_found', \
            'websocket_upgrade_required', 'provider_unavailable', 'all_candidates_unavailable', \
+           'provider_groups_unavailable', \
            'semantic_decision_failed', 'content_filter', 'billing_error', 'rate_limit_exceeded', \
            'dependency_unavailable')) AS excluded, \
          CASE WHEN inference_stage = 'terminal' AND native_terminal_status = 'cancelled' THEN 'unknown' \

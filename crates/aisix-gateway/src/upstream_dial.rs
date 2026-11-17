@@ -61,9 +61,20 @@ async fn tcp(host: &str, port: u16) -> io::Result<TcpStream> {
 /// Run the deployment's outbound TLS over a stream from [`connect`]. `host` is
 /// spelled as there.
 pub async fn connect_tls(stream: UpstreamStream, host: &str) -> io::Result<UpstreamStream> {
+    connect_tls_for_provider_key(stream, host, None).await
+}
+
+/// 仅目标连接应用账号 TLS 覆盖；到 HTTPS 代理自身的连接仍使用部署设置。
+pub async fn connect_tls_for_provider_key(
+    stream: UpstreamStream,
+    host: &str,
+    tls: Option<&aisix_core::models::provider_key::ProviderKeyTls>,
+) -> io::Result<UpstreamStream> {
     let name = rustls::pki_types::ServerName::try_from(bare(host).to_owned())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    let tls = tokio_rustls::TlsConnector::from(crate::upstream_tls::rustls_client_config());
+    let tls = tokio_rustls::TlsConnector::from(
+        crate::upstream_tls::rustls_client_config_for_provider_key(tls)?,
+    );
     Ok(Box::new(tls.connect(name, stream).await?))
 }
 

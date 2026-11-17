@@ -370,6 +370,12 @@ pub enum ProxyError {
     /// [`aisix_core::WhenAllUnavailablePolicy`].
     #[error("all routing candidates are unavailable")]
     AllCandidatesUnavailable { retry_after_secs: Option<u64> },
+    /// 分组约束没有留下可用目标；客户端仍收到既有不可用错误，运营分类单独记录。
+    #[error("all routing candidates are unavailable")]
+    ProviderGroupsUnavailable { retry_after_secs: Option<u64> },
+    /// 固定哈希的分组过滤清空了账号池；保留该路径既有的 provider_unavailable 公开错误。
+    #[error("no bridge registered for provider")]
+    ProviderGroupsPoolEmpty,
     /// Caller-visible message MUST NOT carry the matched-pattern detail.
     /// Per #153, leaking the matched literal back to the caller defeats
     /// the point of an output guardrail (the whole purpose is to keep the
@@ -629,9 +635,12 @@ impl ProxyError {
             | ProxyError::UnusableTarget(_)
             | ProxyError::TargetRefused(_) => StatusCode::BAD_REQUEST,
             ProxyError::WebSocketUpgradeRequired { status, .. } => *status,
-            ProxyError::ProviderUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            ProxyError::ProviderUnavailable | ProxyError::ProviderGroupsPoolEmpty => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             ProxyError::SemanticDecisionFailed { .. } => StatusCode::SERVICE_UNAVAILABLE,
-            ProxyError::AllCandidatesUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            ProxyError::AllCandidatesUnavailable { .. }
+            | ProxyError::ProviderGroupsUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             ProxyError::ContentFiltered { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             ProxyError::BudgetExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
             ProxyError::BudgetUnverified => StatusCode::SERVICE_UNAVAILABLE,
@@ -694,11 +703,14 @@ impl ProxyError {
             | ProxyError::TargetRefused(_) => "invalid_request_error",
             ProxyError::WebSocketUpgradeRequired { .. } => "websocket_upgrade_required",
             ProxyError::RequestTooLarge { .. } => "invalid_request_error",
-            ProxyError::ProviderUnavailable => "provider_unavailable",
+            ProxyError::ProviderUnavailable | ProxyError::ProviderGroupsPoolEmpty => {
+                "provider_unavailable"
+            }
             // A gateway-side dependency failed, like `JwksUnavailable`;
             // `error.code` carries the distinction.
             ProxyError::SemanticDecisionFailed { .. } => "api_error",
-            ProxyError::AllCandidatesUnavailable { .. } => "all_candidates_unavailable",
+            ProxyError::AllCandidatesUnavailable { .. }
+            | ProxyError::ProviderGroupsUnavailable { .. } => "all_candidates_unavailable",
             ProxyError::ContentFiltered { .. } => "content_filter",
             ProxyError::BudgetExceeded(_) => "billing_error",
             // A gateway-side dependency failed, like `JwksUnavailable`;
@@ -742,7 +754,8 @@ impl ProxyError {
         match self {
             ProxyError::RateLimit(e) | ProxyError::ModelRateLimit(e) => e.retry_after_secs(),
             ProxyError::PolicyRateLimit { source, .. } => source.retry_after_secs(),
-            ProxyError::AllCandidatesUnavailable { retry_after_secs } => *retry_after_secs,
+            ProxyError::AllCandidatesUnavailable { retry_after_secs }
+            | ProxyError::ProviderGroupsUnavailable { retry_after_secs } => *retry_after_secs,
             // Source the Retry-After header from the same value the 429
             // body carries (prd-09b §5.8 retry_after_seconds), so the
             // header and body agree — SDKs back off on the header.

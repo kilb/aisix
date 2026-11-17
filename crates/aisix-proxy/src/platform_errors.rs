@@ -1611,7 +1611,9 @@ mod tests {
             | ProxyError::TargetRefused(_)
             | ProxyError::ProviderUnavailable
             | ProxyError::SemanticDecisionFailed { .. }
-            | ProxyError::AllCandidatesUnavailable { .. } => false,
+            | ProxyError::AllCandidatesUnavailable { .. }
+            | ProxyError::ProviderGroupsUnavailable { .. }
+            | ProxyError::ProviderGroupsPoolEmpty => false,
             ProxyError::Bridge(e) => matches!(e, BridgeError::RequestTooLarge { .. }),
         }
     }
@@ -1673,6 +1675,10 @@ mod tests {
             ProxyError::AllCandidatesUnavailable {
                 retry_after_secs: Some(30),
             },
+            ProxyError::ProviderGroupsUnavailable {
+                retry_after_secs: Some(30),
+            },
+            ProxyError::ProviderGroupsPoolEmpty,
             ProxyError::ContentFiltered {
                 message: "blocked".into(),
                 unavailable: None,
