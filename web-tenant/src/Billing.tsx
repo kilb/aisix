@@ -50,10 +50,16 @@ function moneyText(value: number | string | bigint): string {
 const NOTE_MAX = 500;
 const REFERENCE_MAX = 128;
 
-/** One figure of the balance: its label over the amount, a tile of the card's grid. */
+/** 主余额与辅助事实共享精确读数，辅助项不再嵌套底板。 */
 function Reading({ label, value, hero = false }: { label: string; value: ReactNode; hero?: boolean }) {
+  if (!hero) return (
+    <div className="min-w-0 billing-reading billing-reading-fact">
+      <dt>{label}</dt>
+      <dd><Metric className="text-fg">{value}</Metric></dd>
+    </div>
+  );
   return (
-    <div className={cn("min-w-0 billing-reading", hero ? "billing-reading-primary" : "rounded-tile bg-tint p-4")}>
+    <div className="min-w-0 billing-reading billing-reading-primary">
       <span className="text-small font-semibold text-fg-2">{label}</span>
       <Metric size={hero ? "display" : "value"} className="mt-2 text-fg">{value}</Metric>
     </div>
@@ -199,11 +205,11 @@ function BalancePanel({
           {!known && teamErr && <TeamFailed err={teamErr} onRetry={onRetryTeam} />}
           <div className="entries billing-entries grid gap-4">
             <Reading hero label="余额" value={<Money micro={balance.calculation.balance_micro_cny} />} />
-            <div className="grid gap-3 tablet:grid-cols-3">
+            <dl className="billing-account-facts">
             <Reading label="信用额度" value={<Money micro={balance.calculation.credit_limit_micro_cny} />} />
             <Reading label="可用额度" value={<Money micro={balance.calculation.available_micro_cny} />} />
             <Reading label="待审批的充值" value={`${balance.pending_topups.toLocaleString("en-US")} 笔`} />
-            </div>
+            </dl>
           </div>
           <BalanceCalculation balance={balance} />
         </>

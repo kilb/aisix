@@ -3,9 +3,11 @@
 .tenant-billing .billing-reading .metric { min-width: 0; margin-top: 6px; font-size: var(--fs-24); line-height: 1.35; font-weight: 600; letter-spacing: -.02em; white-space: normal; overflow-wrap: anywhere; }
 .tenant-billing .billing-reading-primary .metric { font-size: var(--type-display); }
 .tenant-billing .billing-entries > .billing-reading { padding-bottom: 16px; }
-.tenant-billing .billing-entries > .grid { grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr)); gap: 12px; }
-.tenant-billing .billing-reading:not(.billing-reading-primary) { padding: 12px 16px; }
-.tenant-billing .billing-reading > span { font-size: var(--text-small); line-height: 20px; font-weight: 500; }
+.tenant-billing .billing-account-facts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; margin: 0; }
+.tenant-billing .billing-reading-fact { padding: 0; }
+.tenant-billing .billing-reading-fact + .billing-reading-fact { border-left: 1px solid var(--border); padding-left: 16px; }
+.tenant-billing .billing-reading > :is(span, dt) { font-size: var(--text-small); line-height: 20px; font-weight: 500; }
+.tenant-billing .billing-reading-fact dd { margin: 0; }
 .tenant-billing .billing-calculation { gap: 8px; }
 .billing-calculation > h3 { margin: 0; font-size: var(--text-title); line-height: 22px; }
 .billing-calculation > p { min-width: 0; margin: 0; line-height: 1.7; overflow-wrap: anywhere; }
@@ -19,6 +21,10 @@
 .tenant-billing .dt .money { font-size: inherit; font-weight: 500; line-height: inherit; }
 .tenant-billing .dt .money .cur { font-size: inherit; }
 .tenant-billing .dt td[data-label="说明"] { min-width: 0; }
+@media (max-width: 719px) {
+  .tenant-billing .billing-account-facts { grid-template-columns: minmax(0, 1fr); gap: 12px; }
+  .tenant-billing .billing-reading-fact + .billing-reading-fact { border-left: 0; border-top: 1px solid var(--border); padding: 12px 0 0; }
+}
 @media (max-width: 599px) {
   .tenant-billing .billing-reading-primary .metric { font-size: var(--type-figure); }
   .tenant-billing .billing-reading .metric { font-size: var(--fs-24); }

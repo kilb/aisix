@@ -3,7 +3,7 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { startStack, STACK_START_TIMEOUT_MS, type Stack, type ApiClient } from "../e2e/stack";
 import { seedBillingWorld, memberKey, chat, type BillingWorld, type Login } from "../e2e/world";
-import { observe, health, login, go, shot, noOverflow, contained, get, value, money, performance, performanceValues, noTextOverlap, allowFailure, output } from "./frontend-unified-456.helpers";
+import { observe, health, login, go, shot, noOverflow, contained, get, metricValue, money, performance, performanceValues, noTextOverlap, allowFailure, output } from "./frontend-unified-456.helpers";
 
 // 预期来自用户场景和可访问合同；不读取产品源码，不替换响应，不保存口令或密钥。
 let stack: Stack;
@@ -52,7 +52,7 @@ test("11-portal-has-1440-content-cap-and-usable-mobile-shell",async({page})=>{
 });
 test("12-key-statistics-are-real-and-same-day-date-is-once",async({page})=>{
   await owner(page);await go(page,stack.previewUrl,"keys");const stats=page.getByRole("region",{name:"密钥统计",exact:true});
-  await expect(value(stats,"当前可见密钥")).toHaveText("3");await expect(value(stats,"当前可用")).toHaveText("2");await expect(value(stats,"当前不可用")).toHaveText("1");await expect(value(stats,"本月已计价费用")).toHaveText("¥0.055");
+  await expect(metricValue(stats,"当前可见密钥")).toHaveText("3");await expect(metricValue(stats,"当前可用")).toHaveText("2");await expect(metricValue(stats,"当前不可用")).toHaveText("1");await expect(metricValue(stats,"本月已计价费用")).toHaveText("¥0.055");
   for(const dd of await stats.locator("dd").all()){const size=await dd.evaluate(el=>parseFloat(getComputedStyle(el).fontSize));expect(size,"compact key readouts").toBeLessThanOrEqual(24);}
   const from=new Date(Date.now()-24*3600_000).toISOString(),to=new Date().toISOString();await go(page,stack.previewUrl,`keys?key=${world.key.id}&from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`);
   const table=page.getByRole("table",{name:"密钥计量明细",exact:true});await expect(table).toContainText(world.model.name);await expect(table).toContainText(world.laterModel!.name);
@@ -61,7 +61,8 @@ test("12-key-statistics-are-real-and-same-day-date-is-once",async({page})=>{
 });
 test("13-price-summary-and-columns-stay-compact-and-exact",async({page})=>{
   await owner(page);await go(page,stack.previewUrl,"prices");const table=page.getByRole("table",{name:"模型单价",exact:true});await expect(table).toContainText(world.model.name);const model=table.locator("tbody[data-price-model]").filter({has:page.getByText(world.model.name,{exact:true})});await expect(model.locator('[data-price-group="base"] [data-label="输入"]')).toHaveText("$1,000.00");await expect(model.locator('[data-price-group="base"] [data-label="输出"]')).toHaveText("$2,000.00");
-  for(const name of ["当前组织优惠","可计价模型","报价时刻"]){const summary=page.getByLabel(name,{exact:true});await expect(summary).toBeVisible();expect((await summary.boundingBox())!.height).toBeLessThanOrEqual(105);}
+  const summaries=["当前组织优惠","可计价模型","报价时刻"].map(name=>page.getByLabel(name,{exact:true}));const boxes=await Promise.all(summaries.map(summary=>summary.boundingBox()));expect(new Set(boxes.map(box=>Math.round(box!.y))).size,"three desktop price summaries share one row").toBe(1);
+  for(const [index,summary] of summaries.entries()){await expect(summary).toBeVisible();const numeric=summary.getByText(index===0?"0%":index===1?"1":/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/,{exact:true});await expect(numeric).toBeVisible();expect(await numeric.evaluate(el=>parseFloat(getComputedStyle(el).fontSize)),"compact summary value font").toBeLessThanOrEqual(24);const minHeight=await summary.evaluate(el=>getComputedStyle(el).minHeight);expect(["auto","0px"],"summary height follows content without a fixed empty floor").toContain(minHeight);const box=boxes[index]!;if(index>0)expect(box.x,"summary cards do not overlap").toBeGreaterThanOrEqual(boxes[index-1]!.x+boxes[index-1]!.width);const clipped=await summary.evaluate(el=>{const b=el.getBoundingClientRect(),walk=document.createTreeWalker(el,NodeFilter.SHOW_TEXT);let node:Node|null;while((node=walk.nextNode())){if(!node.textContent?.trim())continue;const range=document.createRange();range.selectNodeContents(node);if([...range.getClientRects()].some(r=>r.left<b.left-1||r.right>b.right+1||r.top<b.top-1||r.bottom>b.bottom+1))return true;}return false;});expect(clipped,"summary text stays within its own card").toBe(false);}
   for(const width of [1440,390]){await page.setViewportSize({width,height:1000});await noOverflow(page);await contained(table);await shot(page,"tenant-price-columns-"+width);}
 });
 test("14-balance-ledger-keeps-11000-charge-and-readable-layout",async({page})=>{
@@ -82,10 +83,10 @@ test("16-member-ranking-and-detail-use-nonzero-real-usage",async({page})=>{
 });
 test("17-member-scope-remains-restricted-at-real-API-boundary",async({page})=>{
   await login(page,stack.previewUrl,world.members[0]!,"/api");for(const path of ["/api/members","/api/members/usage"]){allowFailure(page,403,path);const code=await page.evaluate(async path=>(await fetch(path,{credentials:"include"})).status,path);expect(code).toBe(403);}
-  const own=(await get(page,"/api/usage/calls?limit=200")).items;expect(own).toHaveLength(3);expect(own.every((x:any)=>Object.hasOwn(x.charge,"amount_micro_cny")&&x.charge.amount_micro_cny===11000)).toBe(true);await go(page,stack.previewUrl,"keys");await expect(value(page.getByRole("region",{name:"密钥统计",exact:true}),"当前可见密钥")).toHaveText("1");
+  const own=(await get(page,"/api/usage/calls?limit=200")).items;expect(own).toHaveLength(3);expect(own.every((x:any)=>Object.hasOwn(x.charge,"amount_micro_cny")&&x.charge.amount_micro_cny===11000)).toBe(true);await go(page,stack.previewUrl,"keys");await expect(metricValue(page.getByRole("region",{name:"密钥统计",exact:true}),"当前可见密钥")).toHaveText("1");
   const billing=await signed(world.members[2]!);expect((await billing.request("GET","/api/members")).status).toBe(403);
 });
 test("18-usage-columns-and-calls-performance-retain-money-on-mobile",async({page})=>{
   await owner(page);await go(page,stack.previewUrl,"calls");const table=page.getByRole("table",{name:"调用记录",exact:true});await performance(table);const rows=(await get(page,"/api/usage/calls?limit=200")).items;expect(rows).toHaveLength(6);await performanceValues(table,rows);const billed=rows.filter((x:any)=>x.charge.status==="charged");expect(billed).toHaveLength(fixtureCalls);expect(billed.reduce((sum:number,x:any)=>sum+x.charge.amount_micro_cny,0)).toBe(55000);
-  for(const width of [1440,390]){await page.setViewportSize({width,height:1000});await noOverflow(page);await contained(table);await shot(page,"tenant-calls-performance-"+width);await go(page,stack.previewUrl,"usage");for(const t of await page.getByRole("table").all())await contained(t);await noOverflow(page);await shot(page,"tenant-usage-columns-"+width);await go(page,stack.previewUrl,"calls");}
+  for(const width of [1440,390]){await page.setViewportSize({width,height:1000});await noOverflow(page);await contained(table);if(width===390){const open=table.getByRole("button",{name:"查看调用详情",exact:true}).first();await open.focus();await expect(open).toBeInViewport();await open.click();const drawer=page.getByRole("dialog",{name:"调用详情",exact:true});await expect(drawer).toBeVisible();await shot(page,"tenant-real-call-drawer-390");await drawer.getByRole("button",{name:"关闭调用详情",exact:true}).click();await table.getByLabel("响应性能",{exact:true}).first().scrollIntoViewIfNeeded();await expect(table.getByLabel("响应性能",{exact:true}).first()).toBeInViewport();}await shot(page,"tenant-calls-performance-"+width);await go(page,stack.previewUrl,"usage");for(const t of await page.getByRole("table").all())await contained(t);await noOverflow(page);await shot(page,"tenant-usage-columns-"+width);await go(page,stack.previewUrl,"calls");}
 });
