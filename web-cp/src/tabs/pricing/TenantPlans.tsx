@@ -92,8 +92,21 @@ export function TenantPlans({ canEdit }: TabProps) {
 }
 
 export function TenantDiscountSettings({ tenant, canEdit, refresh, openCreate = false }: { tenant: PlanTenant; canEdit: boolean; refresh: number; openCreate?: boolean }) {
-  const [create, setCreate] = useState(openCreate);
+  const [create, setCreate] = useState(openCreate && canEdit);
   const [revision, setRevision] = useState(0);
+  useEffect(() => {
+    if (!openCreate || !canEdit) return;
+    setCreate(true);
+    const current = new URL(window.location.href);
+    const [route, search] = current.hash.split("?", 2);
+    const query = new URLSearchParams(search);
+    if (query.get("action") !== "new-discount" || query.get("tenant") !== tenant.tenant_id) return;
+    query.delete("action");
+    current.hash = `${route}?${query}`;
+    // 消费一次性打开意图并同步外壳参数；弹窗由自身状态继续保持打开。
+    window.history.replaceState(window.history.state, "", current);
+    window.dispatchEvent(new HashChangeEvent("hashchange"));
+  }, [openCreate, canEdit, tenant.tenant_id]);
   return <>
     <TenantDiscountDetail tenant={tenant} canEdit={canEdit} refresh={`${refresh}:${revision}`} onCreate={() => setCreate(true)} />
     {create && canEdit && <DiscountDialog tenant={tenant} onClose={() => setCreate(false)} onSaved={async () => {

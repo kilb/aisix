@@ -99,11 +99,11 @@ export async function performance(table: Locator): Promise<void> {
 }
 
 // 原始 API 数值与用户可见单位独立核对，不能把所有值改成横线后仍然绿灯。
-export async function performanceValues(table: Locator, calls: any[]): Promise<void> {
+export async function performanceValues(table: Locator, calls: any[], admin = false): Promise<void> {
   expect(calls.length, "real performance rows exist").toBeGreaterThan(0);
   for (const call of calls) {
     for (const key of ["request_id", "first_token_latency_ms", "attempt_duration_ms", "throughput_tps"]) expect(Object.hasOwn(call,key), `explicit ${key}`).toBe(true);
-    const row=table.getByRole("row").filter({hasText:call.request_id});await expect(row).toHaveCount(1);
+    const row=admin?table.getByRole("row").filter({has:table.page().getByRole("link",{name:`查看调用日志 ${call.event_id}`,exact:true})}):table.getByRole("row").filter({hasText:call.request_id});await expect(row).toHaveCount(1);
     const area=row.getByLabel("响应性能",{exact:true});
     for(const [label,key] of [["首字","first_token_latency_ms"],["总用时","attempt_duration_ms"]]){
       const dd=area.getByText(label,{exact:true}).locator("..").locator("dd");

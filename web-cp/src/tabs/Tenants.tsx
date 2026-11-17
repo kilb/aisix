@@ -354,8 +354,27 @@ export function Tenants({ operator, canEdit, onGoto, routeQuery, refreshShell }:
   const [tick, setTick] = useState(0);
   const lifetime = useLifetime();
   const selectedRef = useRef(selected);
+  const previousSelection = useRef(selected);
+  const tenantOpeners = useRef(new Map<string, HTMLAnchorElement>());
+  const workspace = useRef<HTMLDivElement>(null);
   selectedRef.current = selected;
   const listSeq = useRef(0);
+
+  useEffect(() => {
+    const previous = previousSelection.current;
+    previousSelection.current = selected;
+    if (selected || !previous) return;
+    const frame = requestAnimationFrame(() => {
+      const link = tenantOpeners.current.get(previous);
+      if (link) link.focus({ preventScroll: true });
+      else {
+        const heading = workspace.current?.querySelector<HTMLHeadingElement>("h1");
+        heading?.setAttribute("tabindex", "-1");
+        heading?.focus({ preventScroll: true });
+      }
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [selected]);
 
   const loadList = useCallback(async () => {
     // A read that answers after a later one must not replace it.
@@ -450,7 +469,7 @@ export function Tenants({ operator, canEdit, onGoto, routeQuery, refreshShell }:
   }
 
   return (
-    <div className={`cp-operations cp-tenants${selected ? " tenant-hub finance-workspace" : ""}`}>
+    <div ref={workspace} className={`cp-operations cp-tenants${selected ? " tenant-hub finance-workspace" : ""}`}>
       {/* 编辑状态独立显示，避免概览和列表分散当前操作。 */}
       <PageHeader
         title={selected ? detail?.name ?? "租户详情" : showDefaults ? "新租户默认值" : "租户"}
@@ -549,7 +568,7 @@ export function Tenants({ operator, canEdit, onGoto, routeQuery, refreshShell }:
                       <tr key={t.id}>
                         <td>
                           <span className="flex min-w-0 items-center gap-2">
-                            <a className="link-button tn-name" title={t.name} href={tenantHash(t.id)}>{t.name}</a>
+                            <a ref={(node) => { if (node) tenantOpeners.current.set(t.id, node); else tenantOpeners.current.delete(t.id); }} className="link-button tn-name" title={t.name} href={tenantHash(t.id)}>{t.name}</a>
                             {t.is_internal && <span className="tag">平台内部</span>}
                           </span>
                         </td>

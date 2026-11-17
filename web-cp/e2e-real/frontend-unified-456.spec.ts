@@ -58,17 +58,20 @@ test("02-eight-tenant-views-survive-refresh-and-back",async({page})=>{
   const nav=page.getByRole("navigation",{name:"租户设置",exact:true});await expect(nav.getByRole("link")).toHaveCount(8);
   for(const [view,label] of views){const link=nav.getByRole("link",{name:label,exact:true});await link.click();await settleDetail(page,view,"tenants");await expect(link).toHaveAttribute("aria-current","page");await page.reload();await settleDetail(page,view,"tenants");}
   await page.goBack();await expect(page.locator("main h1")).toHaveText(world.tenantName);await noOverflow(page);
+  await go(page,stack.previewUrl,"tenants");const entry=page.getByRole("table",{name:"租户列表",exact:true}).getByRole("link",{name:world.tenantName,exact:true});await entry.click();await settleDetail(page,"basic","tenants");await page.getByRole("button",{name:"返回租户列表",exact:true}).click();await expect(entry).toBeFocused();await entry.click();await page.goBack();await expect(entry).toBeFocused();
 });
 test("03-pricing-tenant-entry-converges-on-discounts",async({page})=>{
+  await stack.admin.post("/admin/pricing/discounts",{tenant_id:world.tenantId,discount_bps:1000,effective_from:new Date(Date.now()+3_600_000).toISOString()});
   await admin(page);await go(page,stack.previewUrl,"pricing?section=plans");
   const table=page.getByRole("table",{name:"租户折扣",exact:true});await table.getByRole("link",{name:world.tenantName,exact:true}).click();
   await settleDetail(page,"discounts","pricing");await expect(page.getByRole("navigation",{name:"租户设置"}).getByRole("link",{name:"折扣记录",exact:true})).toHaveAttribute("aria-current","page");
   await page.getByRole("button",{name:"返回租户方案",exact:true}).click();await expect(table).toBeVisible();
+  await page.getByRole("button",{name:"新租户折扣",exact:true}).click();const picker=page.getByRole("dialog",{name:"新租户折扣",exact:true});await expect(picker.getByRole("button",{name:"前往设置折扣",exact:true})).toBeDisabled();await picker.getByLabel("搜索租户",{exact:true}).fill(world.tenantName);await chooseSelect(picker.getByRole("combobox",{name:"租户",exact:true}),world.tenantId);await picker.getByRole("button",{name:"前往设置折扣",exact:true}).click();await settleDetail(page,"discounts","pricing");expect(new URLSearchParams(new URL(page.url()).hash.split("?")[1]).get("action")).toBeNull();const form=page.getByRole("dialog",{name:"新折扣",exact:true});await expect(form).toBeVisible();await expect(form).toContainText(world.tenantName);await expect(form.getByRole("combobox",{name:"租户",exact:true})).toHaveCount(0);await shot(page,"cp-discount-picker-arrives-at-hub");await form.getByRole("button",{name:"取消",exact:true}).click();await page.reload();await settleDetail(page,"discounts","pricing");await expect(page.getByRole("dialog")).toHaveCount(0);
 });
 test("04-key-icons-confirm-and-persist-real-state",async({page})=>{
   const isolated=await seedTenant(stack);const api=await tenantClient(stack,isolated);const minted=await api.post("/api/keys",{label:"state-proof-456 · 研发团队生产与灰度服务共用网关凭据长名称可读性检查"});
   await expect.poll(()=>keyStatus(minted.plaintext),{timeout:30_000}).toBe(200);
-  await admin(page);await go(page,stack.previewUrl,"keys");await chooseSelect(page.getByLabel("租户",{exact:true}),{label:isolated.tenantName});
+  await admin(page);await go(page,stack.previewUrl,"keys");await chooseSelect(page.getByRole("combobox",{name:"租户",exact:true}),{label:isolated.tenantName});
   const row=page.getByRole("table",{name:"密钥列表",exact:true}).getByRole("row").filter({hasText:"state-proof-456"});
   for(const name of ["停用","吊销"]){const action=row.getByRole("button",{name,exact:true});await expect(action).toHaveText("");await expect(action.locator("svg")).toHaveCount(1);await expect(action).toHaveAttribute("title",new RegExp(name));await action.hover();}
   await row.getByRole("button",{name:"停用",exact:true}).click();expect((await stack.admin.get(`/admin/keys/${minted.key.id}`)).disabled).toBe(false);
@@ -80,7 +83,7 @@ test("04-key-icons-confirm-and-persist-real-state",async({page})=>{
 });
 test("05-credentials-precede-two-real-instances-newest-first",async({page})=>{
   await admin(page);await go(page,stack.previewUrl,"gateways");
-  const credentials=page.getByRole("heading",{name:"网关凭据",exact:true});const instances=page.getByRole("heading",{name:"网关实例",exact:true});
+  const credentials=page.getByRole("region",{name:"网关凭据",exact:true}).getByRole("heading",{name:"网关凭据 2",exact:true});const instances=page.getByRole("heading",{name:"网关实例",exact:true});
   await expect(credentials).toBeVisible();await expect(instances).toBeVisible();expect((await credentials.boundingBox())!.y).toBeLessThan((await instances.boundingBox())!.y);
   const table=page.getByRole("table",{name:"网关实例",exact:true});await expect(table.locator("tbody tr")).toHaveCount(2);
   await expect(table.locator("tbody tr").first()).toContainText("aaa-newer-456");await expect(table.locator("tbody tr").last()).toContainText("stack-gw");
@@ -103,5 +106,5 @@ test("08-admin-summary-and-table-columns-fit-desktop-mobile",async({page})=>{
 });
 test("09-calls-keep-labelled-performance-and-exact-charge",async({page})=>{
   await admin(page);await go(page,stack.previewUrl,`calls?tenant_id=${world.tenantId}`);const table=page.getByRole("table",{name:"计费明细",exact:true});await performance(table);
-  const rows=await get(page,`/admin/pricing/charges?tenant_id=${world.tenantId}&limit=200`);await performanceValues(table,rows.items);expect(rows.items.filter((x:any)=>x.status==="charged").map((x:any)=>x.charge_micro_cny)).toEqual([11000]);await expect(table).toContainText(money(11000));await noOverflow(page);
+  const rows=await get(page,`/admin/pricing/charges?tenant_id=${world.tenantId}&limit=200`);const calls=[];for(const charge of rows.items){const stored=await get(page,`/admin/usage/events/${charge.event_id}`);expect(stored.event_id).toBe(charge.event_id);expect(Object.hasOwn(stored,"request_id")).toBe(true);expect(typeof stored.request_id).toBe("string");calls.push({...charge,request_id:stored.request_id});}await test.info().attach("real-charge-and-performance-oracle",{body:JSON.stringify(calls.map(x=>({event_id:x.event_id,request_id:x.request_id,charge_micro_cny:x.charge_micro_cny,first_token_latency_ms:x.first_token_latency_ms,attempt_duration_ms:x.attempt_duration_ms,throughput_tps:x.throughput_tps,usage:x.usage}))),contentType:"application/json"});await performanceValues(table,calls,true);expect(rows.items.filter((x:any)=>x.status==="charged").map((x:any)=>x.charge_micro_cny)).toEqual([11000]);await expect(table).toContainText(money(11000));await noOverflow(page);
 });

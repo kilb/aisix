@@ -25,7 +25,7 @@ test.beforeAll(async()=>{
   for(let n=0;n<3;n++)expect(await chat(stack,alice.plaintext,world.model.name)).toBe(200);
   expect(await chat(stack,bob.plaintext,world.model.name)).toBe(200);
   expect(await chat(stack,world.key.plaintext,world.laterModel!.name)).toBe(200);
-  await expect.poll(async()=>{const items=(await ownerApi.get("/api/usage/calls?limit=200")).items;return items.length===6&&items.every((x:any)=>x.charge.status!=="pending");},{timeout:30_000}).toBe(true);
+  await expect.poll(async()=>{const items=(await ownerApi.get("/api/usage/calls?limit=200")).items;const charged=items.filter((x:any)=>x.charge.status==="charged"),pending=items.filter((x:any)=>x.charge.status==="pending");return items.length===6&&charged.length===5&&pending.length===1&&charged.every((x:any)=>x.charge.amount_micro_cny===11000);},{timeout:30_000}).toBe(true);
   const stored=await ownerApi.request("GET",`/api/keys/${bob.id}`);await ownerApi.patch(`/api/keys/${bob.id}`,{disabled:true},stored.version!);
   pendingEmail=`pending-${world.tenantId.slice(0,8)}@unified456.test`;await stack.admin.post(`/admin/tenants/${world.tenantId}/invites`,{email:pendingEmail,role:"member"});
   writeFileSync(join(output!,"environment-public.json"),JSON.stringify({realBackend:true,authorizedUpstreamFixture:true,tenantUrl:stack.previewUrl,httpUrl:stack.httpUrl,tenantId:world.tenantId,expected:{members:4,pendingInvites:1,keys:3,availableKeys:2,chargedMicroCny:55000,totalCalls:6}}));
