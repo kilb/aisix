@@ -87,6 +87,7 @@ pub async fn project_once(db: &Db) -> Result<usize, DbError> {
         .fetch_all(&mut *tx)
         .await?;
         let written: i64 = sqlx::query_scalar(PROJECT_SQL)
+            .persistent(false)
             .bind(&ids)
             .fetch_one(&mut *tx)
             .await?;

@@ -2,7 +2,7 @@
 WITH locked AS MATERIALIZED (
   SELECT unnest($1::text[]) AS event_id
 ), fresh AS MATERIALIZED (
-  SELECT * FROM billing_profit_current(ARRAY(SELECT event_id FROM locked))
+  SELECT * FROM billing_profit_current($1::text[])
 ), delta AS MATERIALIZED (
   SELECT (f.occurred_at AT TIME ZONE 'UTC')::date AS day,
          f.charged_micro_cny - COALESCE(old.charged_micro_cny, 0) AS charged_micro_cny,

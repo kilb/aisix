@@ -1448,3 +1448,130 @@ async fn profit_summary_plans_never_scan_complete_day_charges_for_empty_partial_
         );
     }
 }
+
+// 空队列上准备的旧计划不能在历史快速增长后把一个短批变成整表扫描。
+#[tokio::test]
+async fn profit_projection_replans_after_empty_queue_and_large_history() {
+    let Some(bare) = BareDatabase::new().await else {
+        return;
+    };
+    let one = bare.db.dedicated(1);
+    let db = &one;
+    async fn idle(db: &Db) {
+        drop(db.pool().acquire().await.expect("连接真实的单连接池"));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while db.pool().num_idle() != 1 {
+            assert!(Instant::now() < deadline, "投影连接没有归还池");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+    // 固定冷统计条件；不能让自动ANALYZE在增长中替产品修复缓存计划。
+    sqlx::query("ALTER TABLE pricing_charges_cny SET (autovacuum_enabled=false)")
+        .execute(db.pool())
+        .await
+        .expect("保持收费表冷统计");
+    sqlx::query("ALTER TABLE billing_profit_rows SET (autovacuum_enabled=false)")
+        .execute(db.pool())
+        .await
+        .expect("保持快照表冷统计");
+    sqlx::query("ALTER TABLE billing_profit_pending SET (autovacuum_enabled=false)")
+        .execute(db.pool())
+        .await
+        .expect("保持脏队列冷统计");
+    let connection: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(db.pool())
+        .await
+        .expect("记录真实投影连接");
+    for _ in 0..8 {
+        idle(db).await;
+        assert_eq!(project_once(db).await.expect("空队列投影成功"), 0);
+    }
+    let cached: (i64, i64) = sqlx::query_as(
+        "SELECT COALESCE(sum(generic_plans),0)::bigint, COALESCE(sum(custom_plans),0)::bigint \
+         FROM pg_prepared_statements WHERE statement LIKE '%billing_profit_current%' \
+           AND statement NOT LIKE '%pg_prepared_statements%'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("记录真实计划复用次数");
+    eprintln!(
+        "warm projection connection={connection}, generic={}, custom={}",
+        cached.0, cached.1
+    );
+    const ROWS: i64 = 1_000_000;
+    const PREVIOUS: i64 = ROWS - 256;
+    sqlx::query(
+        "INSERT INTO usage_events(event_id, dp_id, batch_id, occurred_at, event) \
+         SELECT 'profit-matrix-multiple_tenants-enabled-1000-4-0-' || lpad(n::text, 9, '0'), \
+           '00000000-0000-0000-0000-000000000001'::uuid, \
+           '00000000-0000-0000-0000-000000000001'::uuid, \
+           '2026-11-17T00:00:00Z'::timestamptz, '{\"test_fixture\":true}'::jsonb \
+         FROM generate_series(1, $1) n",
+    )
+    .bind(ROWS)
+    .execute(db.pool())
+    .await
+    .expect("准备真实历史用量");
+    sqlx::query(
+        "INSERT INTO pricing_charges_cny \
+         (event_id, tenant_id, api_key_id, user_id, requested_model_id, occurred_at, \
+          status, charge_micro_cny, cost_micro_cny, engine_version) \
+         SELECT event_id, 'test-tenant', 'test-key', '', 'test-model', occurred_at, \
+           'charged', 680, NULL, $1 FROM usage_events",
+    )
+    .bind(i64::from(ENGINE_VERSION))
+    .execute(db.pool())
+    .await
+    .expect("准备真实历史收费");
+    sqlx::query(
+        "INSERT INTO billing_profit_rows \
+         (event_id, occurred_at, charged_micro_cny, adjusted_micro_cny, known_cost_micro_cny, \
+          charged_with_cost_micro_cny, rows_with_cost, rows_without_cost, unpriced_rows, rows) \
+         SELECT event_id, occurred_at, 680, 0, 0, 0, 0, 1, 0, 1 FROM usage_events \
+         WHERE event_id > 'profit-matrix-multiple_tenants-enabled-1000-4-0-000000256'",
+    )
+    .execute(db.pool())
+    .await
+    .expect("准备已投影历史快照");
+    sqlx::query(
+        "INSERT INTO billing_profit_daily \
+         (day, charged_micro_cny, adjusted_micro_cny, known_cost_micro_cny, \
+          charged_with_cost_micro_cny, rows_with_cost, rows_without_cost, unpriced_rows, rows) \
+         SELECT '2026-11-17'::date, $1::numeric * 680, 0, 0, 0, 0, $1::numeric, 0, $1::numeric",
+    )
+    .bind(PREVIOUS)
+    .execute(db.pool())
+    .await
+    .expect("准备同一历史日汇总");
+    let signature = "SELECT count(*)::bigint, sum(charge_micro_cny)::bigint, \
+        md5(string_agg(event_id || ':' || charge_micro_cny::text || ':' || status, '' ORDER BY seq)) \
+        FROM pricing_charges_cny";
+    let before: (i64, i64, String) = sqlx::query_as(signature)
+        .fetch_one(db.pool())
+        .await
+        .expect("读取原始金额指纹");
+    assert_eq!((before.0, before.1), (ROWS, ROWS * 680));
+    assert_eq!(before.2.len(), 32);
+    let same_connection: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(db.pool())
+        .await
+        .expect("复核增长后的投影连接");
+    assert_eq!(same_connection, connection);
+    idle(db).await;
+    // 仍使用产品原有150ms SQL与250ms整批预算；超时返回0也不能冒充处理成功。
+    assert_eq!(project_once(db).await.expect("增长后短批仍成功"), 256);
+    let after: (i64, i64, String) = sqlx::query_as(signature)
+        .fetch_one(db.pool())
+        .await
+        .expect("复查原始金额指纹");
+    assert_eq!(after, before, "后台投影不得改写收费来源");
+    let progress: (i64, i64, String) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM billing_profit_pending), \
+           (SELECT count(*) FROM billing_profit_rows), \
+           (SELECT charged_micro_cny::text FROM billing_profit_daily WHERE day = '2026-11-17')",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("复查实际短批与历史金额");
+    assert_eq!(progress, (ROWS - 256, ROWS, (ROWS * 680).to_string()));
+}
