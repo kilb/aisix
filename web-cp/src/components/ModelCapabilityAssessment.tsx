@@ -1,6 +1,6 @@
 import { Select } from "../ui/Select";
 import { Download, FileSearch, Play, RefreshCw, Square } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type FormEvent } from "react";
 import { ApiError, type ResourceView } from "../lib/api";
 import {
   ASSESSMENT_DIMENSIONS, ASSESSMENT_STATES, assessmentCost, assessmentDelta, assessmentPercent,
@@ -14,7 +14,7 @@ import { useHashQuery } from "../lib/useHashQuery";
 import type { AccountDoc, ModelDoc } from "../tabs/models/catalog";
 import { FormDialog } from "../ui/FormDialog";
 import { Button } from "../ui/Button";
-import { Field } from "../ui/Field";
+import { Field, useRefusalFocus } from "../ui/Field";
 import { RecordTablePager, type RecordPageSize } from "../ui/RecordTable";
 import { OperationalTable, Loading } from "./OperationalTable";
 import { Card, CardHeader } from "./page";
@@ -84,6 +84,9 @@ export function ModelCapabilityAssessment({ models, accounts, loadError }: {
   const [note, setNote] = useState("");
   const [verifiedAt, setVerifiedAt] = useState("");
   const [independent, setIndependent] = useState(false);
+  const [planAttempted, setPlanAttempted] = useState(false);
+  const [planForm, focusPlanRefusal] = useRefusalFocus<HTMLFormElement>();
+  const independenceProblemId = useId();
   const [mode, setMode] = useState<AssessmentMode>("quick");
   const [run, setRun] = useState<AssessmentRun | null>(null);
   const [busy, setBusy] = useState(false);
@@ -98,6 +101,13 @@ export function ModelCapabilityAssessment({ models, accounts, loadError }: {
   const reference = targets.find((target) => target.model_id === referenceId);
   const candidate = targets.find((target) => target.model_id === candidateId);
   const selectionError = assessmentSelectionError(reference, candidate, independent);
+  const referenceProblem = !reference ? "请选择已保存的参考模型。" : null;
+  const candidateProblem = !candidate ? "请选择已保存的被测模型。" : reference && (reference.model_id === candidate.model_id || reference.account_id === candidate.account_id) ? selectionError : null;
+  const independenceProblem = !independent ? "请审定参考来源并确认供应渠道独立性。" : null;
+  const noteProblem = !note.trim() ? "请填写来源核实说明。" : Array.from(note.trim()).length > 256 ? "来源核实说明最多256字。" : null;
+  const verified = parseBeijingInput(verifiedAt);
+  const verifiedProblem = !verifiedAt ? "请填写来源核实时间（北京时间）。" : !verified || Date.parse(verified) > Date.now() ? "核实时间须为有效的北京时间，且不能晚于当前时间。" : null;
+  const planInvalid = Boolean(selectionError || noteProblem || verifiedProblem);
   const currentRun = run?.id === selectedId ? run : null;
 
   useEffect(() => {
@@ -156,9 +166,11 @@ export function ModelCapabilityAssessment({ models, accounts, loadError }: {
 
   function plan(event: FormEvent) {
     event.preventDefault();
+    setPlanAttempted(true);
+    setError(null);
     const verified = parseBeijingInput(verifiedAt);
-    if (selectionError || !reference || !candidate || !note.trim() || !verified || Date.parse(verified) > Date.now()) {
-      setError(selectionError ?? "请填写参考来源核实说明和有效的核实时间（北京时间，不能晚于当前时间）。");
+    if (selectionError || !reference || !candidate || noteProblem || !verified || Date.parse(verified) > Date.now()) {
+      focusPlanRefusal();
       return;
     }
     const input = (target: AssessmentTargetInput): AssessmentTargetInput => ({ model_id: target.model_id, model_version: target.model_version, provider_key_version: target.provider_key_version });
@@ -197,25 +209,26 @@ export function ModelCapabilityAssessment({ models, accounts, loadError }: {
   }
 
   return <section className="model-assessment" id="model-tests-assessment" role="tabpanel" aria-labelledby="model-tests-assessment-tab">
-    <div className="assessment-create-toolbar"><p className="assessment-help">Quick：20 次生成调用；Full：160 次生成调用。生成计划（不调用模型）后，审核预算再显式开始。</p><Button kind="primary" icon="plus" onClick={() => setPlanOpen(true)}>新建能力对照</Button></div>
+    <div className="assessment-create-toolbar"><p className="assessment-help">Quick：20 次生成调用；Full：160 次生成调用。生成计划（不调用模型）后，审核预算再显式开始。</p><Button kind="primary" icon="plus" onClick={() => { setPlanAttempted(false); setError(null); setPlanOpen(true); }}>新建能力对照</Button></div>
     <FormDialog open={planOpen} onOpenChange={setPlanOpen} title="新建能力对照" description="在固定合成题集内比较两个渠道的能力。结果不认证模型身份。" busy={busy}>
-      <form className="assessment-plan-form" onSubmit={plan}>
+      <form ref={planForm} className="assessment-plan-form" noValidate onSubmit={plan}>
         <fieldset disabled={busy || loadError || models === null || accounts === null}>
           <legend className="vh">参考与被测</legend>
           <div className="assessment-form-grid">
-            <Field label="可信参考模型" hint="只可选择已保存的具体模型及其账号。">{(aria) => <Select {...aria} required value={referenceId} onValueChange={(selectedValue) => setReferenceId(selectedValue)}><option value="">选择参考模型</option>{targets.map((target) => <option key={target.model_id} value={target.model_id}>{target.model_name} · {target.account_name}</option>)}</Select>}</Field>
-            <Field label="被测模型" hint="须与参考使用不同模型、不同账号；账号不同不证明渠道独立。">{(aria) => <Select {...aria} required value={candidateId} onValueChange={(selectedValue) => setCandidateId(selectedValue)}><option value="">选择被测模型</option>{targets.map((target) => <option key={target.model_id} value={target.model_id}>{target.model_name} · {target.account_name}</option>)}</Select>}</Field>
+            <Field label="可信参考模型" hint="必填，只可选择已保存的具体模型及其账号。" error={planAttempted ? referenceProblem : null}>{(aria) => <Select {...aria} required value={referenceId} onValueChange={(selectedValue) => setReferenceId(selectedValue)}><option value="">选择参考模型</option>{targets.map((target) => <option key={target.model_id} value={target.model_id}>{target.model_name} · {target.account_name}</option>)}</Select>}</Field>
+            <Field label="被测模型" hint="必填，须与参考使用不同模型、不同账号；账号不同不证明渠道独立。" error={planAttempted ? candidateProblem : null}>{(aria) => <Select {...aria} required value={candidateId} onValueChange={(selectedValue) => setCandidateId(selectedValue)}><option value="">选择被测模型</option>{targets.map((target) => <option key={target.model_id} value={target.model_id}>{target.model_name} · {target.account_name}</option>)}</Select>}</Field>
             <Field label="参考来源"><Select value={kind} onValueChange={(selectedValue) => setKind(selectedValue as AssessmentSource["kind"])}><option value="direct_provider">官方直连</option><option value="verified_channel">已核实的独立渠道</option></Select></Field>
-            <Field label="来源核实时间（北京时间）"><input required type="datetime-local" value={verifiedAt} max={beijingInputValue(new Date()).slice(0, 16)} onChange={(event) => setVerifiedAt(event.target.value)} /></Field>
-            <Field label="来源核实说明" hint="说明参考渠道和核实依据，最多256字；请勿填入密钥或含凭据的地址。">{(aria) => <textarea {...aria} required maxLength={256} rows={2} value={note} onChange={(event) => setNote(event.target.value)} />}</Field>
+            <Field label="来源核实时间（北京时间）" hint="必填，填写实际核实时间，不能晚于当前时间。" error={planAttempted ? verifiedProblem : null}>{(aria) => <input {...aria} required type="datetime-local" value={verifiedAt} max={beijingInputValue(new Date()).slice(0, 16)} onChange={(event) => setVerifiedAt(event.target.value)} />}</Field>
+            <Field label="来源核实说明" hint="必填，说明参考渠道和核实依据，最多256字；请勿填入密钥或含凭据的地址。" error={planAttempted ? noteProblem : null}>{(aria) => <textarea {...aria} required maxLength={256} rows={2} value={note} onChange={(event) => setNote(event.target.value)} />}</Field>
             <Field label="固定题集模式"><Select value={mode} onValueChange={(selectedValue) => setMode(selectedValue as AssessmentMode)}><option value="quick">Quick · 10 对 / 20 次生成调用 · 仅描述</option><option value="full">Full · 80 对 / 160 次生成调用</option></Select></Field>
           </div>
-          <label className="assessment-checkbox"><input type="checkbox" checked={independent} onChange={(event) => setIndependent(event.target.checked)} /><span>我已核实参考来源，并审定参考与被测的供应渠道独立性。</span></label>
+          <label className="assessment-checkbox"><input type="checkbox" required checked={independent} aria-invalid={planAttempted && independenceProblem ? true : undefined} aria-describedby={planAttempted && independenceProblem ? independenceProblemId : undefined} onChange={(event) => setIndependent(event.target.checked)} /><span>我已核实参考来源，并审定参考与被测的供应渠道独立性。（必选）</span></label>
+          {planAttempted && independenceProblem && <p className="field-problem" id={independenceProblemId}>{independenceProblem}</p>}
         </fieldset>
         {loadError ? <p className="note crit" role="alert">模型或账号资源加载失败，请刷新资源后再生成计划。</p> : models === null || accounts === null ? <p role="status">正在加载可选模型与账号…</p> : targets.length < 2 ? <p className="note warn">需要至少两个已保存的具体模型与不同账号。</p> : null}
-        {selectionError && reference && candidate ? <p className="assessment-help">{selectionError}</p> : null}
+        {planAttempted && planInvalid && <p className="note crit" role="alert">请补充或修正标记的字段，再生成计划。</p>}
         <p className="assessment-help">Quick：20 次生成调用；Full：160 次生成调用。生成计划不调用模型；审核冻结预算与费用后，还需显式开始。工具题只评第一轮选择与参数，不运行工具；代码题不执行返回代码。</p>
-        <Button type="submit" kind="primary" busy={busy} busyLabel="请求处理中…" disabled={Boolean(selectionError) || !note.trim() || !verifiedAt || loadError || models === null || accounts === null}><FileSearch aria-hidden="true" />生成计划（不调用模型）</Button>
+        <Button type="submit" kind="primary" busy={busy} busyLabel="请求处理中…" disabled={loadError || models === null || accounts === null || targets.length < 2}><FileSearch aria-hidden="true" />生成计划（不调用模型）</Button>
       </form>
       {error && <p className="note crit" role="alert">{error}</p>}
     </FormDialog>
