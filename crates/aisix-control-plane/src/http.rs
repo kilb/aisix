@@ -145,6 +145,11 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
         "/admin/gateways/instances",
         MinRole::Op(OperatorRole::Viewer),
     ),
+    (
+        "POST",
+        "/admin/gateways/instances/{dp_id}/{instance_id}/retire",
+        MinRole::Op(OperatorRole::Admin),
+    ),
     // Gateway resources.
     (
         "GET",
@@ -904,6 +909,10 @@ pub fn browser_router(state: AppState) -> Router {
             post(gateways::revoke_credential),
         )
         .route("/admin/gateways/instances", get(gateways::list_instances))
+        .route(
+            "/admin/gateways/instances/{dp_id}/{instance_id}/retire",
+            post(gateways::retire_instance),
+        )
         .route("/admin/schemas/{resource}", get(resources::api::schema))
         .route(
             "/admin/resources/{kind}",

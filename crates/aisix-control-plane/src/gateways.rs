@@ -369,6 +369,7 @@ struct InstanceRow {
     config_hash: Option<String>,
     online: bool,
     last_seen_at: DateTime<Utc>,
+    retired_at: Option<DateTime<Utc>>,
     exporter_health: Value,
     rejected_count: i64,
     usage_event_drops: Value,
@@ -380,6 +381,7 @@ struct InstanceRow {
 /// against this control plane's version; `usage_event_drops` is the usage
 /// events the process reported in its last beat as dropped since it
 /// started, by reason, `{}` for none.
+/// `retired_at` 记录管理员确认的退役时间；离线本身不代表退役。
 pub async fn list_instances(
     auth: OperatorAuth,
     State(state): State<AppState>,
@@ -389,7 +391,7 @@ pub async fn list_instances(
     let rows: Vec<InstanceRow> = sqlx::query_as(
         "SELECT i.dp_id, c.name AS credential_name, i.instance_id, i.hostname, i.version, \
          i.uptime_seconds, i.applied_revision, i.config_hash, \
-         i.last_seen_at > now() - make_interval(secs => $1) AS online, i.last_seen_at, \
+         i.last_seen_at > now() - make_interval(secs => $1) AS online, i.last_seen_at, i.retired_at, \
          i.exporter_health, jsonb_array_length(i.rejected_resources)::bigint AS rejected_count, \
          i.usage_event_drops \
          FROM dp_instances i JOIN dp_credentials c ON c.dp_id = i.dp_id \
@@ -415,6 +417,7 @@ pub async fn list_instances(
                 "config_hash": row.config_hash,
                 "online": row.online,
                 "last_seen_at": row.last_seen_at,
+                "retired_at": row.retired_at,
                 "exporter_health": row.exporter_health,
                 "rejected_count": row.rejected_count,
                 "usage_event_drops": row.usage_event_drops,
@@ -422,6 +425,79 @@ pub async fn list_instances(
         })
         .collect();
     Ok(Json(json!({ "items": items })))
+}
+
+#[derive(Deserialize)]
+pub struct RetireInstanceBody {
+    #[serde(default)]
+    confirmed_stopped: bool,
+}
+
+/// 管理员确认特定离线进程已停止并禁用；不撤销凭据，任何后续心跳都会清除标记。
+pub async fn retire_instance(
+    auth: OperatorAuth,
+    State(state): State<AppState>,
+    Path((dp_id, instance_id)): Path<(String, String)>,
+    ApiJson(body): ApiJson<RetireInstanceBody>,
+) -> Result<Json<Value>, ApiError> {
+    auth.require(OperatorRole::Admin)?;
+    if !body.confirmed_stopped {
+        return Err(ApiError::validation(vec![Detail {
+            path: "/confirmed_stopped".to_string(),
+            message: "请确认此进程已停止并禁用".to_string(),
+        }]));
+    }
+    let dp_id = Uuid::parse_str(&dp_id).map_err(|_| ApiError::not_found())?;
+    let stale_secs = stale_window_secs(&state.cfg);
+    let retired_at = state
+        .db
+        .tx(move |conn| {
+            async move {
+                // 与心跳串行判断，不能先读离线再无条件覆盖已经恢复的实例。
+                let row: Option<(bool, Option<DateTime<Utc>>)> = sqlx::query_as(
+                    "SELECT last_seen_at > now() - make_interval(secs => $3), retired_at \
+                     FROM dp_instances WHERE dp_id=$1 AND instance_id=$2 FOR UPDATE",
+                )
+                .bind(dp_id)
+                .bind(&instance_id)
+                .bind(stale_secs)
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(DbError::from)?;
+                let (online, retired_at) = row.ok_or_else(ApiError::not_found)?;
+                if online {
+                    return Err(ApiError::conflict("gateway_instance_online", "在线实例不能退役"));
+                }
+                if let Some(retired_at) = retired_at {
+                    return Ok(json!({"dp_id":dp_id, "instance_id":instance_id, "retired_at":retired_at}));
+                }
+                let retired_at: DateTime<Utc> = sqlx::query_scalar(
+                    "UPDATE dp_instances SET retired_at=now() \
+                     WHERE dp_id=$1 AND instance_id=$2 RETURNING retired_at",
+                )
+                .bind(dp_id)
+                .bind(&instance_id)
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(DbError::from)?;
+                audit::record(
+                    conn,
+                    AuditEntry {
+                        actor: Actor::Operator(&auth),
+                        action: "gateway_instance.retire",
+                        target_kind: "gateway_instance",
+                        target_id: Some(format!("{dp_id}/{instance_id}")),
+                        tenant_id: None,
+                        detail: json!({"dp_id":dp_id, "instance_id":instance_id, "retired_at":retired_at, "confirmed_stopped":true}),
+                    },
+                )
+                .await?;
+                Ok(json!({"dp_id":dp_id, "instance_id":instance_id, "retired_at":retired_at}))
+            }
+            .boxed()
+        })
+        .await?;
+    Ok(Json(retired_at))
 }
 
 /// Whether a gateway reporting the heartbeat version `instance` runs the

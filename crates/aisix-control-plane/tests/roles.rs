@@ -61,6 +61,10 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
             format!("/admin/gateways/credentials/{}/revoke", Uuid::new_v4()),
             None,
         ),
+        ("POST", "/admin/gateways/instances/{dp_id}/{instance_id}/retire") => (
+            format!("/admin/gateways/instances/{}/roles-missing/retire", Uuid::new_v4()),
+            Some(json!({"confirmed_stopped": true})),
+        ),
         // Gateway resources. The single-resource routes name an id that
         // matches nothing: past the role check, a read answers 404 and a
         // write without If-Match 428, so nothing is written.

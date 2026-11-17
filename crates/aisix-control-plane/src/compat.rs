@@ -12,6 +12,7 @@
 //! - the gateways judged are every instance heard from within
 //!   [`FLEET_WINDOW`], online or not, each by the version it last reported:
 //!   one offline for a while still serves what it loaded and may come back;
+//! - 固定计数仅排除管理员明确退役的离线进程；心跳会清除标记，其他 kind 不排除；
 //! - a version that does not read as a release or an unstamped build
 //!   refuses ([`GatewayVersion::Unrecognized`]);
 //! - while any credential has had to turn a new instance away within the
@@ -99,12 +100,14 @@ const CUSTOMER_ENDPOINT_EXPANSION_DEV_SHA: &str = "08ff931722b737d40a8942a9e55de
 // 仅列入已核对源码、部署产物及回归证据的能力基线；两组能力独立判断。
 const CUSTOMER_ENDPOINT_EXPANSION_DEV_SHAS: &[&str] = &[
     CUSTOMER_ENDPOINT_EXPANSION_DEV_SHA,
+    "d887d328e6a033caf26ac7d6bbcae86efef1d5b2",
     "4b06ddcb7d4d3918faeb9a02f12c0ed7f4f19bbc",
     "c39f54354e1bd6616b2599ff685cdc3289cede78",
     "d5d5d72f31ff9f577e3333c11298f963c5a12d93",
     "641ccf95bc96569e565d23845c9c3f612c662703",
 ];
 const NATIVE_ENDPOINT_EXPANSION_DEV_SHAS: &[&str] = &[
+    "d887d328e6a033caf26ac7d6bbcae86efef1d5b2",
     "4b06ddcb7d4d3918faeb9a02f12c0ed7f4f19bbc",
     "c39f54354e1bd6616b2599ff685cdc3289cede78",
     "d5d5d72f31ff9f577e3333c11298f963c5a12d93",
@@ -319,12 +322,26 @@ fn supports_native_endpoint_expansion(version: &str, cp_version: &str) -> bool {
                 .any(|known| gateway == *known || gateway == &known[..7]))
 }
 
-// 新计数能力不继承任何既有开发构建白名单；只信同一控制面构建的精确 SHA。
+// 计数能力独立核实，不能继承更早的接口能力基线。
+const TOKEN_COUNTING_DEV_SHAS: &[&str] = &[
+    "119796c3d1794a299835aa86ac324e90ba40e4fa",
+    "5a2b3bc92cbfc71703d7ba1b2e2fe1e554c4c7a2",
+    "d887d328e6a033caf26ac7d6bbcae86efef1d5b2",
+];
+
+// 已验产物只接受完整 SHA 或明确的七位标记，其余开发构建仍要求与控制面精确一致。
 pub(crate) fn supports_token_counting(version: &str, cp_version: &str) -> bool {
     supports_token_counting_since(version, cp_version, &TOKEN_COUNTING_SINCE)
 }
 
 fn supports_token_counting_since(version: &str, cp_version: &str, since: &Since) -> bool {
+    if version.strip_prefix("dev+sha-").is_some_and(|sha| {
+        TOKEN_COUNTING_DEV_SHAS
+            .iter()
+            .any(|known| sha.eq_ignore_ascii_case(known) || sha.eq_ignore_ascii_case(&known[..7]))
+    }) {
+        return true;
+    }
     match (
         GatewayVersion::parse(version),
         GatewayVersion::parse(cp_version),
@@ -724,8 +741,11 @@ pub async fn gate(
         return Ok(());
     }
     let versions: Vec<String> = sqlx::query_scalar(&format!(
-        "SELECT version FROM dp_instances WHERE last_seen_at > now() - {FLEET_WINDOW}"
+        "SELECT version FROM dp_instances WHERE last_seen_at > now() - {FLEET_WINDOW} \
+         AND (NOT $1 OR retired_at IS NULL)"
     ))
+    // 只缩小固定计数的清单；通用发行门槛同样使用它，其他 kind 保留完整窗口。
+    .bind(token_counting)
     .fetch_all(&mut *conn)
     .await
     .map_err(DbError::from)?;
@@ -735,7 +755,7 @@ pub async fn gate(
             .filter(|version| !supports_token_counting(version, &ctx.cp_version))
             .count();
         if unsupported > 0 {
-            return Err(too_old(floor.pointer, format!("固定计数账号需要全部网关支持当前发行版或与控制面完全相同的开发构建；当前有 {unsupported} 个实例无法确认支持")));
+            return Err(too_old(floor.pointer, format!("固定计数账号需要全部未退役网关支持当前发行版或已确认支持的开发构建；当前有 {unsupported} 个实例无法确认支持")));
         }
     }
     if customer_expansion {
