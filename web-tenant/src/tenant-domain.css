@@ -10,6 +10,7 @@
 .tenant-form { min-width: 0; }
 .tenant-form > .field { min-width: 0; margin: 0; }
 .tenant-key-form > .field.wide { grid-column: 1 / -1; }
+.form-dialog-body > .panel:has(.tenant-key-form) { box-shadow: none; }
 .tenant-form-actions {
   display: flex;
   flex-wrap: wrap;
@@ -20,12 +21,12 @@
   border-top: 1px solid var(--border);
 }
 .tenant-key-form > .field.wide:has(fieldset) {
-  padding-block: 16px;
+  padding-block: 12px;
   border-block-start: 1px solid var(--border);
 }
-.tenant-key-form fieldset.field { margin: 0; }
+.tenant-key-form fieldset.field { margin: 0; padding: 0; border: 0; }
 .tenant-key-form fieldset.field > legend {
-  margin-bottom: 12px;
+  margin-bottom: 8px;
   color: var(--foreground);
   font-weight: 600;
 }
@@ -38,24 +39,24 @@
 .tenant-key-form .picks-cards {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr));
-  gap: 12px;
+  gap: 8px;
 }
+/* 选项用留白和选中底色区分；仅输入控件与键盘焦点保留边界。 */
 .tenant-key-form .pick {
   display: flex;
   gap: 8px;
   min-height: 44px;
   min-width: 0;
   padding: 12px;
-  border: 1px solid var(--border);
+  border: 0;
   border-radius: var(--r-field);
-  background: var(--background);
+  background: transparent;
   align-items: flex-start;
   line-height: 1.5;
   overflow-wrap: anywhere;
 }
+.tenant-key-form .pick:hover { background: var(--tint); }
 .tenant-key-form .pick:has(input:checked) {
-  border-color: var(--border);
-  outline: none;
   background: var(--tint-strong);
 }
 .tenant-key-form .pick:has(input:focus-visible) {

@@ -79,6 +79,23 @@ for (const width of [1440, 390]) {
       await expect(options.first()).toBeVisible();
       expect(await options.count(), "real model choices are present").toBeGreaterThan(1);
       await page.waitForLoadState("networkidle");
+      const framing = await form.evaluate(element => {
+        const bordered = (node: Element) => {
+          const css = getComputedStyle(node);
+          return [css.borderTopWidth, css.borderRightWidth, css.borderBottomWidth, css.borderLeftWidth].some(width => parseFloat(width) > 0);
+        };
+        return {
+          optionFrames: [...element.querySelectorAll(".pick")].filter(bordered).length,
+          fieldsetFrames: [...element.querySelectorAll("fieldset")].filter(bordered).length,
+          textInputBorder: bordered(element.querySelector('input:not([type="checkbox"]):not([type="radio"])')!),
+          nestedCardShadow: element.closest(".form-dialog") ? getComputedStyle(element.closest(".panel")!).boxShadow : null,
+        };
+      });
+      expect(framing.optionFrames, "individual choices do not add a card frame to every model").toBe(0);
+      expect(framing.fieldsetFrames, "fieldset semantics do not add nested group frames").toBe(0);
+      expect(framing.textInputBorder, "editable inputs retain a visible boundary").toBe(true);
+      if (flow === "create") expect(framing.nestedCardShadow, "the dialog does not contain another framed card").toBe("none");
+      await test.info().attach("observed-form-framing", { body: JSON.stringify(framing), contentType: "application/json" });
       await page.screenshot({ path: join(output, `portal-${flow}-${width}.png`) });
 
       // 每个真实选项有独立命中区域，文字与相邻选项不能相互覆盖。
@@ -89,7 +106,22 @@ for (const width of [1440, 390]) {
       expect(whole).not.toBeNull();
       expect(section!.width / whole!.width, "model scope uses the available form width").toBeGreaterThan(.95);
       const wanted = options.first();
+      await options.last().uncheck();
       await wanted.check();
+      await expect(wanted).toBeChecked();
+      const choiceBackground = await wanted.evaluate(input => getComputedStyle(input.closest("label")!).backgroundColor);
+      const emptyBackground = await options.last().evaluate(input => getComputedStyle(input.closest("label")!).backgroundColor);
+      expect(choiceBackground, "selected models retain a distinct soft fill").not.toBe(emptyBackground);
+      await wanted.focus();
+      await page.keyboard.press("Space");
+      await expect(wanted).not.toBeChecked();
+      const focus = await wanted.evaluate(input => {
+        const css = getComputedStyle(input.closest("label")!);
+        return { width: parseFloat(css.outlineWidth), style: css.outlineStyle };
+      });
+      expect(focus.width, "keyboard navigation retains a visible focus ring").toBeGreaterThanOrEqual(2);
+      expect(focus.style).not.toBe("none");
+      await page.keyboard.press("Space");
       await expect(wanted).toBeChecked();
       const search = models.getByRole("searchbox", { name: "搜索模型", exact: true });
       const modelName = await wanted.getAttribute("aria-label") ?? (await wanted.locator("..").innerText()).trim();
