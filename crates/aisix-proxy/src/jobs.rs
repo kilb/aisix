@@ -580,21 +580,10 @@ pub(crate) fn upstream_url(
         Adapter::AzureOpenai => {
             // Resource-scoped Azure route: {base}/openai{path}?api-version=…
             // (files/batches/fine-tuning are not deployment-scoped).
-            let base = target
-                .pk_entry
-                .value
-                .api_base
-                .as_deref()
-                .map(str::trim)
-                .filter(|b| !b.is_empty())
-                .ok_or_else(|| {
-                    ProxyError::TargetRefused(format!(
-                        "azure provider_key {:?} has no api_base",
-                        target.pk_entry.value.display_name
-                    ))
-                })?
-                .trim_end_matches('/')
-                .to_string();
+            let base = aisix_provider_azure_openai::AzureUpstreamRef::api_base_url(
+                target.pk_entry.value.api_base.as_deref(),
+            )
+            .map_err(ProxyError::Bridge)?;
             let mut url = format!("{base}/openai{path}");
             let has_api_version = query
                 .split('&')
@@ -7287,6 +7276,67 @@ mod tests {
     }
 
     // ---- azure ----
+
+    // 上传、轮询、归因下载都经过同一个地址函数，去掉共享解析必须变红。
+    #[test]
+    fn azure_api_base_matrix_covers_every_job_resource_path() {
+        for (base, root) in [
+            ("acme", "https://acme.openai.azure.com"),
+            (
+                "https://acme.openai.azure.com/openai/",
+                "https://acme.openai.azure.com",
+            ),
+            (
+                "HTTP://corp.example:8080/proxy/openai/v1/",
+                "HTTP://corp.example:8080/proxy",
+            ),
+            (
+                "https://corp.example/proxy/openai",
+                "https://corp.example/proxy",
+            ),
+            (
+                "http://acme.openai.azure.com/proxy",
+                "http://acme.openai.azure.com/proxy",
+            ),
+            (
+                "https://user:private-password@corp.example/openai/v1",
+                "https://user:private-password@corp.example",
+            ),
+        ] {
+            let model = serde_json::from_value(serde_json::json!({
+                "display_name":"jobs-az","provider":"azure-openai","model_name":"gpt-4o","provider_key_id":PK_A
+            })).unwrap();
+            let target = JobTarget {
+                model_entry: Arc::new(ResourceEntry::new("m-az", model, 1)),
+                pk_entry: Arc::new(azure_pk(PK_A, base)),
+                secret: "az-secret".into(),
+                adapter: Adapter::AzureOpenai,
+                extra_headers: Vec::new(),
+                forwarded_client: Default::default(),
+            };
+            for path in [
+                "/files",
+                "/files/file_1/content",
+                "/batches",
+                "/batches/batch_1",
+                "/batches/batch_1/cancel",
+                "/fine_tuning/jobs",
+            ] {
+                assert_eq!(
+                    upstream_url(&target, path, "").unwrap(),
+                    format!("{root}/openai{path}?api-version=2024-10-21")
+                );
+                assert_eq!(
+                    upstream_url(&target, path, "limit=7").unwrap(),
+                    format!("{root}/openai{path}?limit=7&api-version=2024-10-21")
+                );
+                assert_eq!(
+                    upstream_url(&target, path, "api-version=2025-01-01-preview&limit=7").unwrap(),
+                    format!("{root}/openai{path}?api-version=2025-01-01-preview&limit=7")
+                );
+            }
+        }
+    }
 
     #[tokio::test]
     async fn azure_adapter_uses_api_key_header_and_resource_scoped_path() {

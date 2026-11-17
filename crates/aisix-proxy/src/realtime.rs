@@ -1014,20 +1014,10 @@ async fn prepare_for(
                     "the configured adapter does not expose the Translation WebSocket API".into(),
                 ));
             }
-            let base = pk_entry
-                .value
-                .api_base
-                .as_deref()
-                .map(str::trim)
-                .filter(|b| !b.is_empty())
-                .ok_or_else(|| {
-                    ProxyError::TargetRefused(format!(
-                        "azure provider_key {:?} has no api_base",
-                        pk_entry.value.display_name
-                    ))
-                })?
-                .trim_end_matches('/')
-                .to_string();
+            let base = aisix_provider_azure_openai::AzureUpstreamRef::api_base_url(
+                pk_entry.value.api_base.as_deref(),
+            )
+            .map_err(ProxyError::Bridge)?;
             let url = format!(
                 "{}/openai/realtime?api-version={AZURE_REALTIME_API_VERSION}&deployment={}",
                 to_ws_scheme(&base)?,
@@ -1279,10 +1269,16 @@ async fn authenticate_realtime_token(
 }
 
 fn to_ws_scheme(url: &str) -> Result<String, ProxyError> {
-    if let Some(rest) = url.strip_prefix("https://") {
-        Ok(format!("wss://{rest}"))
-    } else if let Some(rest) = url.strip_prefix("http://") {
-        Ok(format!("ws://{rest}"))
+    if url
+        .get(..8)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
+    {
+        Ok(format!("wss://{}", &url[8..]))
+    } else if url
+        .get(..7)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http://"))
+    {
+        Ok(format!("ws://{}", &url[7..]))
     } else if url.starts_with("ws://") || url.starts_with("wss://") {
         Ok(url.to_string())
     } else {
@@ -4634,6 +4630,63 @@ mod tests {
             1,
             "closing or rejecting new work must not redial the provider"
         );
+    }
+
+    // 最终握手地址与凭据由真实 prepare 生成，不另造一套测试解析器。
+    #[tokio::test]
+    async fn azure_api_base_matrix_reaches_the_realtime_handshake() {
+        for (base, expected) in [
+            ("acme", "wss://acme.openai.azure.com/openai/realtime"),
+            (
+                "https://acme.openai.azure.com/openai/v1/",
+                "wss://acme.openai.azure.com/openai/realtime",
+            ),
+            (
+                "HTTP://corp.example:8080/proxy/openai",
+                "ws://corp.example:8080/proxy/openai/realtime",
+            ),
+            (
+                "HTTPS://corp.example/proxy/openai/v1",
+                "wss://corp.example/proxy/openai/realtime",
+            ),
+            (
+                "http://acme.openai.azure.com/proxy",
+                "ws://acme.openai.azure.com/proxy/openai/realtime",
+            ),
+            (
+                "https://user:private-password@corp.example/openai/v1",
+                "wss://user:private-password@corp.example/openai/realtime",
+            ),
+        ] {
+            let handle = SnapshotHandle::new(snapshot(base, "azure-openai", "azure-openai"));
+            let live = handle.load();
+            let state = crate::ProxyState::new(handle.clone(), Arc::new(Hub::new()), &cfg());
+            let key: ApiKey =
+                serde_json::from_str(r#"{"key_hash":"h","allowed_models":["*"]}"#).unwrap();
+            let auth = crate::auth::AuthenticatedKey::new(
+                &live,
+                Arc::new(ResourceEntry::new("k-1", key, 1)),
+                None,
+                false,
+            );
+            let params = HashMap::from([("model".to_string(), "rt-model".to_string())]);
+            let prepared = prepare(
+                &state,
+                &live,
+                &params,
+                &HeaderMap::new(),
+                &ClientContext::default(),
+                auth,
+            )
+            .await
+            .unwrap();
+            let req = prepared.upstream_request;
+            assert_eq!(
+                req.uri().to_string(),
+                format!("{expected}?api-version=2024-10-01-preview&deployment=gpt-realtime")
+            );
+            assert_eq!(req.headers().get("api-key").unwrap(), "sk-up");
+        }
     }
 
     /// 虚拟父级（routing / ensemble / semantic）不能走 `/v1/realtime`。

@@ -344,6 +344,7 @@ pub struct AzureUpstreamRef {
     /// proxy / private-VPC / mock deployments requires accepting
     /// arbitrary hosts.
     ///
+    /// 尾部 `/openai` 或 `/openai/v1` 由各路由补回，其余配置路径保留。
     /// **Path preservation**: an `api_base` with an internal path
     /// segment (e.g. `https://corp-proxy/azure-passthrough`) is
     /// preserved verbatim. The bridge appends `/openai/deployments/<d>/...`
@@ -396,7 +397,21 @@ impl AzureUpstreamRef {
     /// the dispatch to an attacker-pinned API version.
     pub fn resolve(deployment: &str, api_base: Option<&str>) -> Result<Self, BridgeError> {
         validate_url_token("deployment name", deployment)?;
+        let (resource, root) = Self::resolve_api_base(api_base)?;
+        Ok(Self {
+            resource: resource.to_string(),
+            deployment: deployment.to_string(),
+            api_version: Self::DEFAULT_API_VERSION.to_string(),
+            upstream_override: if resource.is_empty() {
+                root.map(str::to_string)
+            } else {
+                None
+            },
+        })
+    }
 
+    // 借用配置里的根地址，所有 Azure 路由只解析一次，不额外分配临时 URL。
+    fn resolve_api_base(api_base: Option<&str>) -> Result<(&str, Option<&str>), BridgeError> {
         let base = api_base.unwrap_or_default().trim();
         if base.is_empty() {
             return Err(BridgeError::InvalidUpstreamConfig(
@@ -406,73 +421,79 @@ impl AzureUpstreamRef {
                     .into(),
             ));
         }
-
-        if let Some(rest) = base
-            .strip_prefix("https://")
-            .or_else(|| base.strip_prefix("http://"))
-        {
-            // Canonical form: split off the leading host segment
-            // before the first `.`. If the remainder of the host is
-            // `openai.azure.com` and the segment is a resource name,
-            // extract the resource as today. Otherwise (another host, or
-            // a URL whose authority carries more than a resource name)
-            // fall through to the verbatim-override path.
-            if let Some((host_resource, host_tail)) = rest.split_once('.') {
-                let host_tail_trimmed = host_tail.trim_end_matches('/');
-                let host_tail_core = host_tail_trimmed
-                    .split_once('/')
-                    .map(|(host, _path)| host)
-                    .unwrap_or(host_tail_trimmed);
-                if host_tail_core == "openai.azure.com"
-                    && validate_url_token("resource name", host_resource).is_ok()
-                {
-                    return Ok(Self {
-                        resource: host_resource.to_string(),
-                        deployment: deployment.to_string(),
-                        api_version: Self::DEFAULT_API_VERSION.to_string(),
-                        upstream_override: None,
-                    });
-                }
-            }
-
-            // Verbatim-override branch — corporate proxy / private
-            // endpoint / mock service. Defence-in-depth checks mirror
-            // the Vertex sibling fix (#390): reject query and fragment
-            // because each opens an injection / api-version-downgrade
-            // vector. Scheme is already constrained to `http://` or
-            // `https://` by the outer `strip_prefix` chain.
-            // The value is not quoted back: a query string is where an
-            // operator pastes a key (`?subscription-key=…`), and this error
-            // reaches the caller.
-            if base.contains('?') {
-                return Err(BridgeError::InvalidUpstreamConfig(
-                    "azure api_base must not contain a query string \
-                     (the bridge appends `?api-version=…`; an operator-supplied \
-                     query would either merge or override the pinned api-version)"
-                        .to_string(),
-                ));
-            }
-            if base.contains('#') {
-                return Err(BridgeError::InvalidUpstreamConfig(
-                    "azure api_base must not contain a fragment".to_string(),
-                ));
-            }
-            let override_base = base.trim_end_matches('/').to_string();
-            return Ok(Self {
-                resource: String::new(),
-                deployment: deployment.to_string(),
-                api_version: Self::DEFAULT_API_VERSION.to_string(),
-                upstream_override: Some(override_base),
-            });
+        // 拒绝信息不回显配置：query 或 userinfo 里可能带着凭据。
+        if base.contains('?') {
+            return Err(BridgeError::InvalidUpstreamConfig(
+                "azure api_base must not contain a query string \
+                 (the bridge appends `?api-version=…`; an operator-supplied \
+                 query would either merge or override the pinned api-version)"
+                    .to_string(),
+            ));
         }
-
-        // Bare-resource shorthand (`acme-east` → canonical Azure URL).
+        if base.contains('#') {
+            return Err(BridgeError::InvalidUpstreamConfig(
+                "azure api_base must not contain a fragment".to_string(),
+            ));
+        }
+        let has_http_scheme = ["https://", "http://"].into_iter().any(|scheme| {
+            base.get(..scheme.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
+        });
+        if has_http_scheme {
+            // 只去掉已知 API 前缀，内部路径、scheme 与 userinfo 按配置使用。
+            let root = base.trim_end_matches('/');
+            let root = root
+                .strip_suffix("/openai/v1")
+                .or_else(|| root.strip_suffix("/openai"))
+                .unwrap_or_else(|| {
+                    // 已粘贴的正式部署端点仍纠正到根；每次只去掉一个已知后缀。
+                    root.rsplit_once("/openai/deployments/")
+                        .filter(|(_, suffix)| {
+                            suffix.split_once('/').is_some_and(|(deployment, route)| {
+                                !deployment.is_empty()
+                                    && deployment.bytes().all(|b| {
+                                        b.is_ascii_alphanumeric() || b == b'-' || b == b'_'
+                                    })
+                                    && matches!(
+                                        route,
+                                        "chat/completions"
+                                            | "completions"
+                                            | "embeddings"
+                                            | "images/generations"
+                                            | "images/edits"
+                                            | "audio/speech"
+                                            | "audio/transcriptions"
+                                            | "audio/translations"
+                                    )
+                            })
+                        })
+                        .map_or(root, |(prefix, _)| prefix)
+                })
+                .trim_end_matches('/');
+            if let Some(resource) = root
+                .strip_prefix("https://")
+                .and_then(|host| host.strip_suffix(".openai.azure.com"))
+                .filter(|resource| {
+                    !resource.is_empty()
+                        && resource
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                })
+            {
+                return Ok((resource, Some(root)));
+            }
+            return Ok(("", Some(root)));
+        }
         validate_url_token("api_base resource name", base)?;
-        Ok(Self {
-            resource: base.to_string(),
-            deployment: deployment.to_string(),
-            api_version: Self::DEFAULT_API_VERSION.to_string(),
-            upstream_override: None,
+        Ok((base, None))
+    }
+
+    /// 资源级路由和实时握手共用部署路由的根地址；不要求部署名。
+    pub fn api_base_url(api_base: Option<&str>) -> Result<std::borrow::Cow<'_, str>, BridgeError> {
+        let (resource, root) = Self::resolve_api_base(api_base)?;
+        Ok(match root {
+            Some(base) => std::borrow::Cow::Borrowed(base),
+            None => std::borrow::Cow::Owned(format!("https://{resource}.openai.azure.com")),
         })
     }
 
@@ -1467,6 +1488,80 @@ mod tests {
             parse_stream_chunk("{not-json", None).unwrap_err(),
             BridgeError::UpstreamDecode(_)
         ));
+    }
+
+    // 重复拼接路由前缀、丢掉配置的 scheme 或内部路径都会使这组合同失败。
+    #[test]
+    fn azure_api_base_matrix_keeps_the_configured_root_on_deployment_routes() {
+        for (base, root) in [
+            ("acme", "https://acme.openai.azure.com"),
+            (
+                "https://acme.openai.azure.com/openai/deployments/x/chat/completions",
+                "https://acme.openai.azure.com",
+            ),
+            (
+                "http://user:private-password@acme.openai.azure.com/proxy/openai/deployments/x/embeddings",
+                "http://user:private-password@acme.openai.azure.com/proxy",
+            ),
+            (
+                "https://corp.example/proxy/openai/deployments/x/unknown",
+                "https://corp.example/proxy/openai/deployments/x/unknown",
+            ),
+            (
+                "https://acme.openai.azure.com/openai/v1/",
+                "https://acme.openai.azure.com",
+            ),
+            (
+                "HTTPS://corp.example/proxy/openai",
+                "HTTPS://corp.example/proxy",
+            ),
+            (
+                "HTTP://corp.example:8080/proxy/openai/v1/",
+                "HTTP://corp.example:8080/proxy",
+            ),
+            (
+                "http://acme.openai.azure.com/",
+                "http://acme.openai.azure.com",
+            ),
+            (
+                "https://acme.openai.azure.com/proxy/openai/v1",
+                "https://acme.openai.azure.com/proxy",
+            ),
+            (
+                "https://corp.example/proxy//openai",
+                "https://corp.example/proxy",
+            ),
+            (
+                "https://user:private-password@corp.example/proxy/openai/v1",
+                "https://user:private-password@corp.example/proxy",
+            ),
+            (
+                "https://corp.example/openai/v1beta",
+                "https://corp.example/openai/v1beta",
+            ),
+            (
+                "https://corp.example/proxy/openai/deployments/x/chat/completions/openai",
+                "https://corp.example/proxy/openai/deployments/x/chat/completions",
+            ),
+        ] {
+            let resolved = AzureUpstreamRef::resolve("dep", Some(base)).unwrap();
+            let root_url = AzureUpstreamRef::api_base_url(Some(base)).unwrap();
+            assert_eq!(root_url, root);
+            if base.contains("://") {
+                assert!(matches!(root_url, std::borrow::Cow::Borrowed(_)));
+            }
+            for (actual, route) in [
+                (resolved.chat_completions_url(), "chat/completions"),
+                (resolved.embeddings_url(), "embeddings"),
+                (resolved.images_url(), "images/generations"),
+            ] {
+                assert_eq!(
+                    actual,
+                    format!("{root}/openai/deployments/dep/{route}?api-version=2024-10-21")
+                );
+            }
+            assert!(!format!("{resolved:?}").contains("private-password"));
+        }
     }
 
     #[test]
