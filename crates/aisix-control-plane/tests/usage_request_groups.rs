@@ -720,6 +720,8 @@ async fn public_error_candidates_preserve_masked_unknown_and_known_group_results
     for (id, value) in [
         ("absent-error", None),
         ("null-error", Some(Value::Null)),
+        ("empty-error", Some(json!(""))),
+        ("nonstring-error", Some(json!(503))),
         ("raw-public", Some(json!("content_filtered"))),
     ] {
         let mut event = attempt(&w, model, id, id, json!({"status_code":502}));
@@ -743,6 +745,8 @@ async fn public_error_candidates_preserve_masked_unknown_and_known_group_results
             "failed",
             vec![
                 "absent-error",
+                "empty-error",
+                "nonstring-error",
                 "null-error",
                 "ordinary-denied",
                 "raw-public",
@@ -751,16 +755,18 @@ async fn public_error_candidates_preserve_masked_unknown_and_known_group_results
         ),
         ("content_filtered", vec!["filtered-public"]),
     ] {
-        let response = get(
-            &w.cp,
-            &format!("/api/usage/calls?group_requests=true&error_class={error}"),
-            &owner,
-        )
-        .await;
-        let mut actual = ids(items(&response));
-        actual.sort();
-        assert_eq!(actual, expected, "公开错误映射的索引候选不能改变结果");
-        assert!(!response.body.to_string().contains("private"));
-        assert!(!response.body.to_string().contains("internal-hidden-model"));
+        for grouped in [false, true] {
+            let response = get(
+                &w.cp,
+                &format!("/api/usage/calls?group_requests={grouped}&error_class={error}"),
+                &owner,
+            )
+            .await;
+            let mut actual = ids(items(&response));
+            actual.sort();
+            assert_eq!(actual, expected, "公开错误映射的索引候选不能改变结果");
+            assert!(!response.body.to_string().contains("private"));
+            assert!(!response.body.to_string().contains("internal-hidden-model"));
+        }
     }
 }

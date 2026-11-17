@@ -631,12 +631,18 @@ impl CallFilters {
             if tenant {
                 let candidates = crate::billing::calls::tenant_error_candidates(error);
                 if !candidates.is_empty() {
-                    sql.push(" AND ")
+                    sql.push(" AND ue.event_id IS NOT NULL AND ")
+                        .push(CALL_ERROR)
+                        .push(" <> '' AND ")
                         .push(CALL_ERROR)
                         .push(" = ANY(")
                         .push_bind(candidates)
                         .push(")");
                 }
+            } else {
+                sql.push(" AND ue.event_id IS NOT NULL AND ")
+                    .push(CALL_ERROR)
+                    .push(" <> ''");
             }
             sql.push(" AND ");
             if tenant {

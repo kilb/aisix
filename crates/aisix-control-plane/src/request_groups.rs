@@ -61,7 +61,7 @@ fn trace_predicate(ue: &str) -> String {
     )
 }
 
-/// 两个互斥分支使历史行走事件主键，追踪行走0059的组索引。
+/// 两个互斥分支使历史行走事件主键，追踪行复用既有请求索引。
 /// CP记录的租户、成员和密钥共同限定授权范围，不相信事件的team_id。
 fn members_sql() -> String {
     members_sql_for("pc_anchor", "ue_anchor")
@@ -102,6 +102,7 @@ const REPRESENTATIVE_ORDER: &str = "CASE \
     member.occurred_at DESC, member.seq DESC";
 
 /// 列表先筛选pc/ue候选，再确认候选是组的代表，避免先为全史选代表。
+/// 布尔代表校验避免跨子查询等值的稀有匹配误估，保留按序有界候选。
 /// 游标取代表行pc.seq，晚交付的旧失败不能改变已完成请求的分页位置。
 /// 指定任意组内事件时保留该锚点，详情不会因它不是最新行而消失。
 pub(crate) fn from_sql(anchored: bool, extra_joins: &str) -> String {
@@ -113,7 +114,7 @@ pub(crate) fn from_sql(anchored: bool, extra_joins: &str) -> String {
              {extra_joins} \
              JOIN LATERAL (SELECT member.event_id FROM ({members}) member \
                  ORDER BY {REPRESENTATIVE_ORDER} LIMIT 1) representative \
-                 ON representative.event_id = pc.event_id \
+                 ON CASE WHEN representative.event_id = pc.event_id THEN true ELSE false END \
              WHERE true"
         );
     }

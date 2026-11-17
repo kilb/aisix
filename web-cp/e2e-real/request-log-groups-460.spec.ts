@@ -142,7 +142,8 @@ async function expectFee(row: Locator, surface: Surface, expected: string | null
   const amount = surface === "admin" ? row.locator('td[data-label="费用（元）"] .finance-amount-value') : row.locator('td[data-label="费用"]');
   await expect(amount).toBeVisible();
   if (expected === null) {
-    await expect(amount).toContainText("未知");
+    if (surface === "admin") await expect(amount).toHaveText("—");
+    else await expect(amount).toHaveText(/^金额未知(?:（含调整）)?$/);
     return;
   }
   const match = (await amount.innerText()).match(/[¥￥](-?[\d,]+)(?:\.(\d+))?/);
@@ -350,3 +351,39 @@ for (const surface of ["admin", "tenant"] as const) for (const width of [1440, 3
     }
   });
 }
+
+// 已保存的缺价记录必须区别于真实零收费；未知金额不从缺失字段补零。
+test("admin preserves unknown and zero fees on real retained requests", async ({ page }) => {
+  await login(page, "admin");
+  const unpriced = await readAll<ChargeRecord>(page, "/admin/pricing/charges", { status: "unpriced" });
+  let unknown: GroupRow | undefined;
+  for (const record of unpriced) {
+    const detail = await jsonGet<{ items: GroupRow[] }>(page, queryPath("/admin/pricing/charges", { group_requests: true, event_id: record.event_id }));
+    const candidate = detail.items[0];
+    if (candidate && Object.hasOwn(candidate.request_group, "charge_micro_cny") && candidate.request_group.charge_micro_cny === null) {
+      unknown = candidate;
+      break;
+    }
+  }
+  expect(unknown, "a real retained unpriced request is required; do not synthesize telemetry").toBeDefined();
+  const zero = oracles.find(oracle => oracle.originalTotal === "0");
+  expect(zero, "a distinct real zero-fee request is required").toBeDefined();
+  for (const [eventId, expected] of [[unknown!.event_id, null], [zero!.representative, "0"]] as const) {
+    const stored = await jsonGet<StoredRecord>(page, `/admin/usage/events/${encodeURIComponent(eventId)}`);
+    const at = Date.parse(stored.occurred_at);
+    const params = new URLSearchParams({ event_id: eventId, from: new Date(at - 60_000).toISOString(), to: new Date(at + 60_000).toISOString() });
+    const response = page.waitForResponse(answer => {
+      const url = new URL(answer.url());
+      return url.pathname === "/admin/pricing/charges" && url.searchParams.get("event_id") === eventId && url.searchParams.get("group_requests") === "true";
+    });
+    await page.goto(`${state.adminUrl}/#calls?${params}`);
+    expect((await response).status()).toBe(200);
+    await settle(page);
+    const row = page.getByRole("table", { name: "计费明细", exact: true }).locator("tbody > tr").filter({ has: page.locator("td[data-label=请求类型]") });
+    await expect(row).toHaveCount(1);
+    const records = await jsonGet<{ items: GroupRow[] }>(page, queryPath("/admin/pricing/charges", { group_requests: true, event_id: eventId }));
+    expect(Object.hasOwn(records.items[0].request_group, "charge_micro_cny"), "null and zero must both be explicitly reported").toBe(true);
+    expect(records.items[0].request_group.charge_micro_cny).toBe(expected);
+    await expectFee(row, "admin", expected);
+  }
+});
