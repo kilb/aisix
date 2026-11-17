@@ -1,4 +1,5 @@
 // 本地真实套接字复现运行中的授权收窄；使用正式 snapshot 发布，不调用外部供应商。
+#[cfg(test)]
 mod retained_policy {
     use super::*;
     use std::sync::atomic::AtomicUsize;

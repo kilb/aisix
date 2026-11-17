@@ -35,7 +35,10 @@ async fn a_viewer_reads_one_complete_record_by_its_event_id_with_the_recorded_er
         "model_id":model,"upstream_provider":"openai","upstream_model":"served-model",
         "status_code":529,"error_class":"upstream_status","error_message":error_message,
         "is_final_attempt":true,"upstream_latency_ms":381,"downstream_latency_ms":402,
-        "io_audit":io_audit,"future_field":{"nested":[1,false,{"detail":"preserved"}]}
+        "io_audit":io_audit,"future_field":{
+            "nested":[1,false,{"detail":"preserved"}],
+            "correlation_id":"2657ca97-1fae-4eb7-9f8a-892088708913"
+        }
     })
     .as_object()
     .expect("已记录字段")
@@ -189,7 +192,7 @@ async fn admin_record_reads_redact_credentials_without_rewriting_the_stored_even
         json!({
             "error_class":"upstream_status","error_message":message,"status_code":401,
             "request_headers":{"Authorization":format!("Basic {bearer}"),"x-api-key":"opaque-upstream-secret"},
-            "future_field":{"api_key":"opaque-future-secret","api_key_id":"safe-key-id","entries":[{"client_secret":"opaque-client-secret","note":secret}],"url":"redis://redis-user:redis-password@public.example/0?token=redis-query-secret"}
+            "future_field":{"api_key":"opaque-future-secret","api_key_id":"safe-key-id","entries":[{"client_secret":"opaque-client-secret","note":secret}],"url":"redis://redis-user:redis-password@public.example/0?token=redis-query-secret","access_token":"2657ca97-1fae-4eb7-9f8a-892088708913","account_id":"123456789012"}
         }),
     );
     let accepted = deliver(&w.dp, Uuid::new_v4(), vec![event.clone()]).await;
@@ -216,6 +219,8 @@ async fn admin_record_reads_redact_credentials_without_rewriting_the_stored_even
             "opaque-future-secret",
             "opaque-client-secret",
             "redis-query-secret",
+            "2657ca97-1fae-4eb7-9f8a-892088708913",
+            "123456789012",
         ] {
             assert!(!raw.contains(value), "管理记录不能返回凭据 {value}：{raw}");
         }
@@ -228,6 +233,13 @@ async fn admin_record_reads_redact_credentials_without_rewriting_the_stored_even
         detail.body.pointer("/event/future_field/api_key_id"),
         Some(&json!("safe-key-id"))
     );
+    for field in ["access_token", "account_id"] {
+        assert_eq!(
+            detail.body.pointer(&format!("/event/future_field/{field}")),
+            Some(&json!("<redacted>")),
+            "凭据槽及独立云账号仍须存在并脱敏：{field}"
+        );
+    }
     let stored: Value = sqlx::query_scalar("SELECT event FROM usage_events WHERE event_id=$1")
         .bind("detail-secrets")
         .fetch_one(w.cp.db().pool())

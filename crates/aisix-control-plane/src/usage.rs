@@ -751,6 +751,10 @@ pub(crate) fn admin_event_view(value: &mut Value) {
         }
         Value::Array(values) => values.iter_mut().for_each(admin_event_view),
         Value::String(text) => {
+            // 完整 UUID 是记录标识；全数字的末段不是独立云账号，凭据槽已在上层隐藏。
+            if Uuid::parse_str(text).is_ok() {
+                return;
+            }
             // 先移除完整 URL 的查询凭据；共享脱敏会把内部 host 改为不可解析的占位符。
             if text.contains("://") && reqwest::Url::parse(text).is_ok() {
                 *text = aisix_core::redact_url_for_log(text);
