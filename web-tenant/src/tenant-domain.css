@@ -9,6 +9,7 @@
 
 .tenant-form { min-width: 0; }
 .tenant-form > .field { min-width: 0; margin: 0; }
+.tenant-key-form > .field.wide { grid-column: 1 / -1; }
 .tenant-form-actions {
   display: flex;
   flex-wrap: wrap;
@@ -28,12 +29,20 @@
   color: var(--foreground);
   font-weight: 600;
 }
+.tenant-key-form fieldset.field > .grid + .grid { margin-top: 12px; }
+.tenant-key-form .picks:not(.picks-cards) {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr));
+  gap: 8px;
+}
 .tenant-key-form .picks-cards {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr));
   gap: 12px;
 }
 .tenant-key-form .pick {
+  display: flex;
+  gap: 8px;
   min-height: 44px;
   min-width: 0;
   padding: 12px;
@@ -41,6 +50,7 @@
   border-radius: var(--r-field);
   background: var(--background);
   align-items: flex-start;
+  line-height: 1.5;
   overflow-wrap: anywhere;
 }
 .tenant-key-form .pick:has(input:checked) {
