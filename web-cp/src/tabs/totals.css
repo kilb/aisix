@@ -1,37 +1,87 @@
-.sidebar-shell .shell-content.totals-shell-content { max-width: none; margin-inline: 0; }
-.totals-page { display: grid; width: 100%; min-width: 0; gap: 16px; }
+/* 汇算沿用页面壳的内容宽度；图形与明细各自为单层分区。 */
+.totals-page { display: grid; width: 100%; min-width: 0; gap: 20px; }
 .totals-page > .page-header { margin: 0; }
-.totals-page .totals-scope { display: flex; flex-wrap: wrap; align-items: end; gap: 12px 20px; padding: 16px; border: 1px solid var(--border); border-radius: var(--r-card); background: var(--card); }
+.totals-page .totals-scope { display: flex; flex-wrap: wrap; align-items: end; gap: 12px 20px; }
 .totals-page .totals-dates { display: flex; flex-wrap: wrap; gap: 12px; min-width: 0; }
 .totals-page .totals-dates .f { flex: 1 1 220px; min-width: 0; margin: 0; }
 .totals-page .totals-dates input { width: 100%; min-width: 0; }
 .totals-page .totals-actions { display: flex; flex: 1 1 auto; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 16px; min-width: 0; }
 .totals-page .totals-presets { display: flex; flex-wrap: wrap; gap: 4px; }
-.totals-page .totals-window { margin: 0; color: var(--text-muted); font-size: var(--text-caption); overflow-wrap: anywhere; }
-.totals-page .totals-metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; min-width: 0; }
-.totals-page .totals-metric { display: flex; flex-direction: column; min-width: 0; gap: 18px; }
+.totals-page .totals-presets .btn[aria-pressed="true"] { background: var(--color-ink); color: var(--color-surface); }
+.totals-page .totals-window { margin: 0; color: var(--color-fg-3); font-size: var(--text-caption); overflow-wrap: anywhere; }
+.totals-page .totals-visuals { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr); gap: 16px; min-width: 0; }
+.totals-page .totals-visuals > .panel { min-width: 0; margin: 0; }
+.totals-page .totals-visuals .bento-card-header { margin-bottom: 24px; }
+.totals-page .totals-metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 32px; min-width: 0; padding-block: 24px 4px; border-top: 1px solid var(--color-hairline); }
+.totals-page .totals-metric { display: flex; flex-direction: column; min-width: 0; gap: 16px; }
 .totals-page .totals-metric .bento-card-header { margin-bottom: 0; }
-.totals-page .totals-value { overflow-wrap: anywhere; }
+.totals-page .totals-metric .bento-card-header h2 { font-size: var(--text-body); }
+.totals-page .totals-value { overflow-wrap: anywhere; font-size: var(--text-metric); line-height: var(--text-metric--line-height); }
 .totals-page .totals-skeleton { width: min(100%, 280px); height: 52px; }
-.totals-page .totals-facts { display: grid; gap: 8px; margin: 0; padding-top: 12px; border-top: 1px solid var(--border); }
+.totals-page .totals-facts { display: grid; gap: 8px; margin: 0; padding-top: 12px; border-top: 1px solid var(--color-hairline); }
 .totals-page .totals-facts > div { display: flex; justify-content: space-between; gap: 16px; font-size: var(--text-caption); }
-.totals-page .totals-facts dt { color: var(--text-muted); }
-.totals-page .totals-facts dd { margin: 0; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.totals-page .totals-facts dt { color: var(--color-fg-3); }
+.totals-page .totals-facts dd { min-width: 0; margin: 0; text-align: right; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 .totals-page .totals-note, .totals-page .totals-warning, .totals-page .totals-error { margin: 0; font-size: var(--text-caption); line-height: 1.6; overflow-wrap: anywhere; }
-.totals-page .totals-note { color: var(--text-muted); }
+.totals-page .totals-note { color: var(--color-fg-3); }
 .totals-page .totals-metric > .totals-note:last-child { margin-top: auto; }
 .totals-page .totals-warning { color: var(--warning); }
 .totals-page .totals-error { color: var(--danger); }
-.totals-page .totals-method { display: grid; gap: 8px; padding: 16px 0; border-top: 1px solid var(--border); color: var(--text-muted); font-size: var(--text-caption); }
-.totals-page .totals-method h2 { margin: 0; color: var(--foreground); font-size: var(--text-small); font-weight: 600; }
-.totals-page .totals-method p { margin: 0; line-height: 1.7; }
-@media (min-width: 768px) and (max-width: 1100px) {
-  .totals-page .totals-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.totals-page .totals-method { display: grid; gap: 8px; padding: 16px 0; border-top: 1px solid var(--color-hairline); color: var(--color-fg-3); font-size: var(--text-caption); }
+.totals-page .totals-method h2 { margin: 0; color: var(--color-fg); font-size: var(--text-small); font-weight: 600; }
+.totals-page .totals-method p { max-width: 100ch; margin: 0; line-height: 1.7; }
+
+/* 金额始终单独精确排版；柱长只来自共享的整数归一化函数。 */
+.totals-comparison { margin: 0; }
+.totals-comparison > dl { display: grid; gap: 22px; margin: 0; }
+.totals-comparison-row { display: grid; min-width: 0; grid-template-columns: minmax(0, 1fr) minmax(0, auto); gap: 8px 16px; }
+.totals-comparison-row > dt { color: var(--color-fg-2); font-size: var(--text-small); }
+.totals-comparison-row > dd { display: contents; }
+.totals-comparison-amount { grid-column: 2; grid-row: 1; max-width: 100%; text-align: right; overflow-wrap: anywhere; color: var(--color-fg); font-size: var(--text-small); font-weight: 600; font-variant-numeric: tabular-nums; }
+.totals-comparison-track { position: relative; grid-column: 1 / -1; grid-row: 2; height: 28px; border-radius: var(--r-bar); background: var(--color-tint); }
+.totals-comparison-zero { position: absolute; inset-block: -3px; width: 1px; background: var(--color-fg-4); }
+.totals-comparison-bar { position: absolute; inset-block: 0; border-radius: var(--r-bar); }
+.totals-comparison-revenue { background: var(--color-ink); }
+.totals-comparison-cost { background: var(--color-lilac); }
+.totals-comparison-profit { background: var(--color-lime); }
+.totals-comparison-bar[data-negative] { background: var(--danger); }
+.totals-comparison-bar[data-zero] { border-left: 2px solid var(--color-fg-3); }
+.totals-comparison-track[data-unknown] { background: transparent; border: 1px dashed var(--color-fg-4); }
+.totals-comparison-track[data-unknown] .totals-comparison-zero { display: none; }
+.totals-comparison-unknown { display: flex; height: 100%; align-items: center; justify-content: center; color: var(--color-fg-3); font-size: var(--text-micro); }
+.totals-comparison figcaption { margin-top: 20px; color: var(--color-fg-3); font-size: var(--text-caption); line-height: 1.6; }
+
+/* 圆环表达已计费记录的覆盖笔数，颜色同时配有文字图例。 */
+.totals-coverage { display: flex; min-width: 0; align-items: center; flex-wrap: wrap; justify-content: center; gap: 16px; margin: 0; }
+.totals-coverage-ring { position: relative; width: 152px; flex: 0 0 152px; }
+.totals-coverage-ring svg { display: block; width: 100%; height: auto; }
+.totals-coverage-track { stroke: var(--color-sunken-strong); }
+.totals-coverage-known { stroke: var(--color-ink); }
+.totals-coverage-ring > div { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; }
+.totals-coverage-ring strong { color: var(--color-fg); font-size: var(--text-heading); font-variant-numeric: tabular-nums; }
+.totals-coverage-ring span { color: var(--color-fg-3); font-size: var(--text-caption); }
+.totals-coverage figcaption { min-width: 0; flex: 1 1 190px; }
+.totals-coverage-legend { display: grid; gap: 14px; margin: 0 0 18px; }
+.totals-coverage-legend > div { display: flex; justify-content: space-between; gap: 12px; font-size: var(--text-small); }
+.totals-coverage-legend dt { display: flex; align-items: center; gap: 8px; color: var(--color-fg-2); }
+.totals-coverage-legend dd { margin: 0; color: var(--color-fg); font-weight: 600; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.totals-coverage-dot { width: 10px; height: 10px; flex: none; border-radius: var(--r-dot); background: var(--color-ink); }
+.totals-coverage-dot[data-unknown] { background: var(--color-sunken-strong); box-shadow: var(--shadow-edge); }
+.totals-coverage figcaption p { margin: 8px 0 0; color: var(--color-fg-3); font-size: var(--text-caption); line-height: 1.6; }
+@media (max-width: 1199px) {
+  .totals-page .totals-visuals { grid-template-columns: minmax(0, 1fr); }
+  .totals-coverage { justify-content: flex-start; }
+  .totals-coverage figcaption { max-width: 440px; }
+}
+@media (max-width: 899px) {
+  .totals-page .totals-metrics { grid-template-columns: minmax(0, 1fr); gap: 24px; }
+  .totals-page .totals-metric + .totals-metric { padding-top: 24px; border-top: 1px solid var(--color-hairline); }
 }
 @media (max-width: 767px) {
-  .totals-page .totals-metrics { grid-template-columns: minmax(0, 1fr); }
   .totals-page .totals-dates { width: 100%; }
   .totals-page .totals-dates .f { flex-basis: 100%; }
   .totals-page .totals-actions { width: 100%; }
   .totals-page .totals-presets { flex: 1 1 100%; }
+  .totals-coverage { gap: 12px; }
+  .totals-coverage-ring { margin-inline: auto; }
 }

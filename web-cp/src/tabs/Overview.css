@@ -8,3 +8,10 @@
 .overview-page .row-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
 .overview-page .rollout-errors { margin-top: 8px; color: var(--color-fg-2); font-size: var(--text-small); overflow-wrap: anywhere; }
 .overview-page .rows > li { min-width: 0; padding-block: 12px; overflow-wrap: anywhere; }
+/* 跨页查看是轻量链接，不与刷新和恢复操作争夺按钮层级。 */
+.overview-page .overview-detail-link { display: inline-flex; min-height: 36px; align-items: center; gap: 4px; color: var(--color-fg-2); font-size: var(--text-caption); font-weight: 500; text-decoration: none; white-space: nowrap; }
+.overview-page .overview-detail-link:hover { color: var(--color-fg); text-decoration: underline; text-underline-offset: 4px; }
+.overview-page .overview-detail-link:focus-visible { outline: 2px solid var(--ring); outline-offset: 4px; border-radius: var(--r-check); }
+@media (max-width: 599px) {
+  .overview-page .overview-detail-link { min-height: 44px; }
+}

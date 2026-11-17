@@ -99,6 +99,8 @@ export interface TabProps {
   initialSection?: string;
   /** Counts the links that named a section, so asking for the same one again still switches. */
   sectionVisit?: number;
+  /** 当前页面的深链参数，随浏览器前进、后退同步。 */
+  routeQuery?: URLSearchParams;
   /** Reads the shell's attention markers again, after a page changed what they show. */
   refreshShell: () => void;
 }
@@ -266,6 +268,7 @@ export function App() {
   const [signOutError, setSignOutError] = useState<string | null>(null);
   const [tab, setTabOnly] = useState<TabId>("overview");
   const [section, setSection] = useState<string | undefined>(undefined);
+  const [routeQuery, setRouteQuery] = useState(() => adminRouteOf(window.location.hash).query);
   // Each link that names a section bumps this: the same section asked for twice
   // must still switch, and the name alone would not change.
   const [sectionVisit, setSectionVisit] = useState(0);
@@ -281,6 +284,7 @@ export function App() {
     const hash = `#${route.tab}${search ? `?${search}` : ""}`;
     setTabOnly(route.tab);
     setSection(route.query.get("section") ?? undefined);
+    setRouteQuery(route.query);
     if (s !== undefined) setSectionVisit((n) => n + 1);
     window.location.hash = hash;
   }, []);
@@ -294,6 +298,7 @@ export function App() {
       const route = adminRouteOf(window.location.hash);
       setTabOnly(route.tab);
       setSection(route.query.get("section") ?? undefined);
+      setRouteQuery(route.query);
     };
     apply();
     window.addEventListener("hashchange", apply);
@@ -344,9 +349,9 @@ export function App() {
     setOperator(op);
     setSignOutError(null);
     setSessionEnded(false);
-    // 日志分享链接登录后仍打开原事件，避免跳回概览丢失定位。
+    // 日志与租户分享链接登录后仍打开原详情，避免丢失定位。
     const destination = adminRouteOf(window.location.hash);
-    if (destination.tab !== "calls" || !destination.query.get("detail")) setTab("overview");
+    if (!(destination.tab === "calls" && destination.query.get("detail")) && !(destination.tab === "tenants" && destination.query.get("tenant"))) setTab("overview");
   }, []);
 
   // Signed out only once the control plane has revoked the session (or says
@@ -371,7 +376,7 @@ export function App() {
   // 切换页面先回到标题；同页筛选、轮询和表单更新保留阅读位置。
   useLayoutEffect(() => {
     window.scrollTo({ top: 0, left: 0, behavior: "instant" });
-  }, [current, operator?.id]);
+  }, [current, operator?.id, routeQuery.get("tenant"), routeQuery.get("view")]);
 
   if (bootError) {
     return (
@@ -520,6 +525,7 @@ export function App() {
               refreshShell={shell.refresh}
               initialSection={section}
               sectionVisit={sectionVisit}
+              routeQuery={routeQuery}
             />}
             </Suspense>
           </section>

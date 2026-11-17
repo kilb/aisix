@@ -20,7 +20,7 @@ import { useHashQuery } from "../../lib/useHashQuery";
 import { currentQueryResult, type QueryResult } from "../../lib/queryResult";
 import { chargesQuery } from "../../lib/analysisNavigation";
 import { cn } from "../../lib/cn";
-import { ChevronDown, RotateCcw } from "lucide-react";
+import { ChevronDown, FileText, RotateCcw } from "lucide-react";
 import { UsagePerformance } from "../../components/UsagePerformance";
 import { UsageIoAuditDetails, UsageTokenEstimate } from "../../components/UsageIoAuditDetails";
 import { UsageRecordFilters } from "../../components/UsageRecordFilters";
@@ -211,7 +211,7 @@ export function Charges(_props: TabProps) {
                   <th className="num">费用（元）</th>
                   <th>服务 / 档位</th>
                   <th>响应性能</th>
-                  <th>用量 / 按字节估算 Token</th>
+                  <th>Token 消耗</th>
                   <th className="right">
                     <span className="vh">日志 / 复核</span>
                   </th>
@@ -225,7 +225,7 @@ export function Charges(_props: TabProps) {
                       <tr data-finance-record>
                         <td data-label="时间" className="charge-call-time tabular"><time dateTime={c.occurred_at}><span>{fmtBeijing(c.occurred_at).split(" ")[0]}</span><span>{fmtBeijing(c.occurred_at).split(" ")[1] ?? "—"}</span></time></td>
                         <td data-label="请求类型">{c.stream === true ? "流" : c.stream === false ? "非流" : "未知"}</td>
-                        <td data-label="调用 / 租户"><span className="font-medium">{modelText(c.model_name, c.model_deleted)}</span>
+                        <td data-label="调用 / 租户"><span className="charge-model-name">{modelText(c.model_name, c.model_deleted)}</span>
                           <span className="cell-note">{tenantName(c.tenant_id)}</span>
                         </td>
                         <td data-label="计价结果">{statusLabel(c.status)}<span className="cell-note">{chargeReason(c)}</span>
@@ -240,9 +240,12 @@ export function Charges(_props: TabProps) {
                           <span className="cell-note">档位 {c.service_tier ?? "—"}</span>
                         </td>
                         <td data-label="响应性能"><UsagePerformance data={c} /></td>
-                        <td data-label="用量" className="tabular text-caption"><span title={usageSummary(c.usage) ?? undefined}>输入 {c.usage_input_tokens == null ? "—" : formatCount(c.usage_input_tokens)} / 输出 {c.usage?.completion_tokens == null ? "—" : formatCount(c.usage.completion_tokens)}</span><UsageTokenEstimate data={c} /></td>
+                        <td data-label="Token 消耗" className="tabular text-caption"><dl className="charge-call-tokens" aria-label="记录 Token 消耗" title={usageSummary(c.usage) ?? undefined}>
+                          <div><dt>输入</dt><dd>{c.usage_input_tokens == null ? "—" : formatCount(c.usage_input_tokens)}</dd></div>
+                          <div><dt>输出</dt><dd>{c.usage?.completion_tokens == null ? "—" : formatCount(c.usage.completion_tokens)}</dd></div>
+                        </dl><UsageTokenEstimate data={c} /></td>
                         <td data-label="日志 / 复核" className="right">
-                          <a className="call-log-link" href={callDetailHash(query, c.event_id)} aria-label={`查看调用日志 ${c.event_id}`}>查看日志</a>
+                          <a className="call-log-link" href={callDetailHash(query, c.event_id)} aria-label={`查看调用日志 ${c.event_id}`} title="查看调用日志"><FileText aria-hidden /></a>
                           <Button
                             kind="quiet"
                             size="sm"

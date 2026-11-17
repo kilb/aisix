@@ -1,10 +1,9 @@
 import { useRecordTable } from "../../lib/recordTable";
 import { RecordTools, RecordPager } from "../../components/RecordTools";
-import { createContext, useContext, useEffect, useRef, useState, type ComponentType, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ComponentType, type ReactNode } from "react";
 import type { TabProps } from "../../App";
 import { Msg, type Note } from "../../components/Msg";
 import {
-  ApiError,
   billing,
   type Budget,
   type BillingAccount,
@@ -21,7 +20,6 @@ import { DataTable, Loading } from "../../ui/DataTable";
 import { EmptyState } from "../../ui/EmptyState";
 import { Field, useRefusalFocus } from "../../ui/Field";
 import { Lamp } from "../../ui/Lamp";
-import { SidePanel } from "../../ui/SidePanel";
 import { useToast } from "../../ui/Toast";
 import { TwoStep } from "../../ui/TwoStep";
 import { refusal, useLoad } from "../Tenants";
@@ -51,15 +49,11 @@ export interface RegionProps {
 
 export const MONEY_HINT = "请输入金额，最多两位小数";
 
-// 每个账户详情独立编号；区域本身不改变子表单的生命周期或写入锁。
-const RegionNumber = createContext<number | undefined>(undefined);
-
 /** A region of the panel under its own heading, a `region` named by it. */
 export function Region({ label, children }: { label: string; children: ReactNode }) {
-  const number = useContext(RegionNumber);
   return (
     <section className="bl-region" role="region" aria-label={label}>
-      <CardHeader as="h3" number={number} title={label} />
+      <CardHeader as="h3" title={label} />
       {children}
     </section>
   );
@@ -606,7 +600,7 @@ function Quotas({ account, quotaRev }: RegionProps) {
   const table = useRecordTable({ items: (budgets.data ?? []).filter((b) => (!scopeFilter || b.scope === scopeFilter) && (!kindFilter || b.kind === kindFilter) && (!quotaStatus || (b.exhausted ? "exhausted" : "available") === quotaStatus)), searchText: (b) => [b.id, b.target.id, b.target.label], resetKey: `${account.tenant_id}:${scopeFilter}:${kindFilter}:${quotaStatus}` });
   return (
     <Region label="额度">
-      <p className="hint">周期预算继续按 UTC 边界结算，起止以 UTC+8 显示。这个租户在每一级设置的额度。组织额度在下方的「组织额度」里设置；成员与密钥的额度由租户自己管理，这里只读。</p>
+      <p className="hint">周期预算继续按 UTC 边界结算，起止以 UTC+8 显示。这个租户在每一级设置的额度。组织额度在上方的「组织额度」里设置；成员与密钥的额度由租户自己管理，这里只读。</p>
       {budgets.error ? (
         <Failed message={budgets.error} onRetry={() => void budgets.reload()} />
       ) : budgets.data === null ? (
@@ -680,73 +674,30 @@ function FailMode({ onGoto }: RegionProps) {
 
 // ── the panel ───────────────────────────────────────────────────────────────
 
-/** The regions of the panel, top to bottom. Later tasks append theirs. */
-export const PANEL_REGIONS: { id: string; Component: ComponentType<RegionProps> }[] = [
-  { id: "balance", Component: BalanceCard },
-  { id: "billing-mode", Component: BillingMode },
-  { id: "credit-limit", Component: CreditLimit },
-  { id: "ledger", Component: Ledger },
-  { id: "period-summary", Component: PeriodSummary },
-  { id: "usage-summary", Component: UsageSummary },
-  { id: "quotas", Component: Quotas },
-  { id: "org-quota", Component: OrgQuota },
-  { id: "credit", Component: CreditForm },
-  { id: "fail-mode", Component: FailMode },
+type AccountView = "billing" | "quotas" | "activity";
+
+// 租户设置菜单复用原有账务区域，表单与账务接口保持原有行为。
+export const PANEL_REGIONS: { id: string; view: AccountView; Component: ComponentType<RegionProps> }[] = [
+  { id: "balance", view: "billing", Component: BalanceCard },
+  { id: "billing-mode", view: "billing", Component: BillingMode },
+  { id: "credit-limit", view: "billing", Component: CreditLimit },
+  { id: "credit", view: "billing", Component: CreditForm },
+  { id: "org-quota", view: "quotas", Component: OrgQuota },
+  { id: "quotas", view: "quotas", Component: Quotas },
+  { id: "fail-mode", view: "quotas", Component: FailMode },
+  { id: "ledger", view: "activity", Component: Ledger },
+  { id: "period-summary", view: "activity", Component: PeriodSummary },
+  { id: "usage-summary", view: "activity", Component: UsageSummary },
 ];
 
-/**
- * One tenant's billing, beside the account list. The account shown is the
- * list's, kept current by the actions that settle a new one; the panel
- * reads it fresh once when it opens, so a stale list never misleads.
- */
-export function AccountPanel({
-  account,
-  canEdit,
-  isAdmin,
-  onChanged,
-  onGoto,
-  onClose,
-}: RegionProps & {
-  onClose: () => void;
-}) {
-  const [note, setNote] = useState<Note | null>(null);
+export function AccountPanel({ view, ...props }: RegionProps & { view: AccountView }) {
   const [quotaRev, setQuotaRev] = useState(0);
-  const tenantId = account.tenant_id;
-  useEffect(() => {
-    const controller = new AbortController();
-    setNote(null);
-    billing
-      .account(tenantId, controller.signal)
-      .then(onChanged)
-      .catch((e: unknown) => {
-        if (controller.signal.aborted) return;
-        setNote({ text: e instanceof ApiError ? errorText(e) : String(e), kind: "crit" });
-      });
-    return () => controller.abort();
-    // Once per tenant opened; `onChanged` is the list's own setter.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tenantId]);
-  return (
-    <SidePanel
-      title={<span title={account.tenant_name}>{account.tenant_name}</span>}
-      label={`租户计费：${account.tenant_name}`}
-      extra={account.is_internal ? <span className="tag">平台内部</span> : undefined}
-      onClose={onClose}
-    >
-      <Msg note={note} />
-      {PANEL_REGIONS.map(({ id, Component }, index) => (
-        <RegionNumber.Provider key={`${tenantId}/${id}`} value={index + 1 - (!isAdmin && index > 8 ? 1 : 0)}>
-          <Component
-            account={account}
-            canEdit={canEdit}
-            isAdmin={isAdmin}
-            onChanged={onChanged}
-            onGoto={onGoto}
-            quotaRev={quotaRev}
-            onQuotasChanged={() => setQuotaRev((n) => n + 1)}
-          />
-        </RegionNumber.Provider>
-      ))}
-    </SidePanel>
-  );
+  return <div className="tenant-account" aria-label={`租户计费：${props.account.tenant_name}`}>
+    {PANEL_REGIONS.filter((region) => region.view === view).map(({ id, Component }) => <Component
+      key={`${props.account.tenant_id}/${id}`}
+      {...props}
+      quotaRev={quotaRev}
+      onQuotasChanged={() => setQuotaRev((revision) => revision + 1)}
+    />)}
+  </div>;
 }

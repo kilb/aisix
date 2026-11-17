@@ -1,4 +1,4 @@
-import { useId } from "react";
+import { useId, type CSSProperties } from "react";
 import { fmtCnyPerMillion, perThousandOfPerMillion } from "./lib/money";
 import { dimensionLabels, type Dimension, type DisplayPriceRate, type TierQuote } from "./lib/priceQuote";
 
@@ -58,8 +58,8 @@ function TierPrices({ name, tier, currency }: { name: string; tier: TierQuote<Di
       <h4 id={heading} className="text-title text-fg">{tierName}</h4>
       <p className="text-caption text-fg-3">{currency === "USD" ? "美元基准单价" : "组织实际单价（已含优惠）"}</p>
     </header>
-    <div className="price-matrix-scroll" role="region" aria-label={`${tierName}档完整模型单价`}>
-      <table className="price-matrix" role="table" aria-label="完整模型单价">
+    <div className="price-matrix-scroll" role="region" aria-label={`${tierName}档完整模型单价`} tabIndex={0}>
+      <table className="price-matrix" role="table" aria-label="完整模型单价" style={{ "--price-band-count": columns.length } as CSSProperties}>
         <caption className="vh">{tierName}档完整价格，金额按各计费项目的单位显示。</caption>
         <colgroup>
           <col className="price-item-column" />

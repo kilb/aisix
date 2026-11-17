@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import type { TabProps } from "../App";
 import { Card, CardHeader, CardMessage, Metric, MetricSkeleton, PageHeader } from "../components/page";
 import { formatCount } from "../lib/chartFormat";
+import { CostCoverage, ProfitComparison } from "../components/ProfitSummaryCharts";
 import { errorText } from "../lib/fmt";
 import { fmtMicroCny } from "../lib/money";
 import { beijingInputValue, fmtBeijing, parseBeijingInput } from "../lib/time";
@@ -72,8 +73,18 @@ export function Totals(_props: TabProps) {
     {rangeError && <p className="totals-error" role="alert">{rangeError}</p>}
     <p className="totals-window">{allTime ? "全部时间 · 人民币会计历史。" : `${fmtBeijing(from ?? "")} — ${fmtBeijing(to ?? "")}（UTC+8，结束时间不含）`}</p>
     {loading && <span role="status" className="sr-only">正在加载总量统计</span>}
-    <div className="totals-metrics">
-      <Card className="totals-metric" aria-label="总收入统计" aria-busy={loading}>
+    <div className="totals-visuals">
+      <Card className="totals-comparison-card" aria-busy={loading}>
+        <CardHeader title="收入与成本对照" description="同一统计快照 · 人民币" />
+        {data ? <ProfitComparison data={data} /> : pending}
+      </Card>
+      <Card className="totals-coverage-card" aria-busy={loading}>
+        <CardHeader title="成本记录覆盖" description="已计费记录的历史成本完整度" />
+        {data ? <CostCoverage data={data} /> : pending}
+      </Card>
+    </div>
+    <div className="totals-metrics" aria-label="汇算明细">
+      <section className="totals-metric" aria-label="总收入统计" aria-busy={loading}>
         <CardHeader title="总售价 · 调用收入" description="已计价收费，含净费用调整" />
         {data ? <>
           <Metric size="figure" className="totals-value">{fmtMicroCny(data.revenueMicroCny)}</Metric>
@@ -85,8 +96,8 @@ export function Totals(_props: TabProps) {
           {data.unpricedRows > 0n && <p className="totals-warning" role="status">{formatCount(data.unpricedRows)} 笔记录仍待计价，当前为已计价收入小计，完成计价后可能变化。</p>}
         </> : pending}
         <p className="totals-note">收入包含已计费重试，费用调整已计入且不重复相加。充值流水不计入调用收入。</p>
-      </Card>
-      <Card className="totals-metric" aria-label="总成本统计" aria-busy={loading}>
+      </section>
+      <section className="totals-metric" aria-label="总成本统计" aria-busy={loading}>
         <CardHeader title={complete ? "总成本" : "已知成本小计"} description="已计费记录的历史上游成本" />
         {data ? <>
           <Metric size="figure" className="totals-value">{costKnown ? fmtMicroCny(data.knownCostMicroCny) : "—"}</Metric>
@@ -98,8 +109,8 @@ export function Totals(_props: TabProps) {
           {!complete && <p className="totals-warning" role="status">{data.rowsWithoutCost > 0n ? `${formatCount(data.rowsWithoutCost)} 笔已计费记录缺失成本。` : "仍有待计价记录。"}当前仅为已知成本小计，不代表完整总成本。</p>}
         </> : pending}
         <p className="totals-note">成本仅含已收费或存在费用调整的记录。未知成本不按零计算，不使用当前费率估算历史成本。</p>
-      </Card>
-      <Card className="totals-metric" aria-label="利润率统计" aria-busy={loading}>
+      </section>
+      <section className="totals-metric" aria-label="利润率统计" aria-busy={loading}>
         <CardHeader title="完整利润率" description="利润 ÷ 总售价" />
         {data ? <>
           <Metric size="figure" className="totals-value">{data.marginPct === null ? "—" : `${data.marginPct}%`}</Metric>
@@ -112,7 +123,7 @@ export function Totals(_props: TabProps) {
           {!complete ? <p className="totals-warning" role="status">收入或成本尚不完整，完整利润与利润率未知；已知部分只对成本已知的同一批记录汇算。</p> : data.marginPct === null ? <p className="totals-note">总售价不大于零时，利润率无定义。</p> : null}
         </> : pending}
         <p className="totals-note">利润率按收入加权汇算，不平均各模型的百分比；亏损保留负值。</p>
-      </Card>
+      </section>
     </div>
     <section className="totals-method" aria-label="统计口径">
       <h2>统计口径</h2>

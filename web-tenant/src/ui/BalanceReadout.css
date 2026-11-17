@@ -1,0 +1,12 @@
+/* 余额层级保持原有顺序，长金额在自身区域内折行。 */
+.balance-readout.bento-card { gap: 16px; }
+.balance-readout [data-testid="readout-amount"] .metric { margin: 0; max-width: 100%; font-size: var(--type-figure); line-height: 1.35; font-weight: 650; letter-spacing: -.025em; overflow-wrap: anywhere; }
+.balance-readout > p { margin: 0; }
+.balance-readout > ol { margin: 0; padding: 0; list-style: none; gap: 12px; }
+.balance-readout li { gap: 6px; padding-top: 12px; }
+.balance-readout li > span:nth-child(2) { font-size: var(--fs-20); line-height: 1.45; font-weight: 500; letter-spacing: -.01em; }
+.balance-readout .money .cur { font-size: .8em; }
+.budget-account-amounts { margin: 0; gap: 16px 24px; }
+.budget-account-amounts > div { min-width: 0; }
+.budget-account-amounts dd { margin: 6px 0 0; }
+.budget-account-amounts .metric { font-size: var(--fs-24); line-height: 1.4; font-weight: 600; letter-spacing: -.02em; overflow-wrap: anywhere; }

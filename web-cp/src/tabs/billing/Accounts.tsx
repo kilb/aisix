@@ -10,15 +10,15 @@ import { DataTable, Loading } from "../../ui/DataTable";
 import { EmptyState } from "../../ui/EmptyState";
 import { BentoGrid, Card, CardHeader, CardMessage, Metric, MetricSkeleton, PageHeader } from "../../components/page";
 import { exactInteger, formatCount } from "../../lib/chartFormat";
-import { AccountPanel, AccountState, MODE_LABEL } from "./AccountPanel";
+import { tenantHash } from "../../lib/navigation";
+import { AccountState, MODE_LABEL } from "./AccountPanel";
 import { Select } from "../../ui/Select";
 
-// 概况使用四项紧凑指标，账户列表与详情各占整行。
-/** 账户: every tenant's balance and credit limit, and one tenant's billing in a side panel. */
-export function Accounts({ canEdit, operator, onGoto }: TabProps) {
+// 概况使用四项紧凑指标，账户列表占满工作区。
+/** 账户快照中的租户名称统一进入租户详情页。 */
+export function Accounts(_props: TabProps) {
   const [items, setItems] = useState<BillingAccount[] | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [selected, setSelected] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -32,15 +32,9 @@ export function Accounts({ canEdit, operator, onGoto }: TabProps) {
     void load();
   }, [load]);
 
-  // An action in the panel settled a new state of one account: the list shows it too.
-  const take = useCallback((account: BillingAccount) => {
-    setItems((list) => list && list.map((a) => (a.tenant_id === account.tenant_id ? account : a)));
-  }, []);
-
   const [modeFilter, setModeFilter] = useState("");
   const [balanceFilter, setBalanceFilter] = useState("");
   const table = useRecordTable({ items: (items ?? []).filter((a) => (!modeFilter || a.billing_mode === modeFilter) && (!balanceFilter || (a.exhausted ? "exhausted" : "available") === balanceFilter)), searchText: (a) => [a.tenant_id, a.tenant_name], resetKey: `${modeFilter}:${balanceFilter}` });
-  const open = items?.find((a) => a.tenant_id === selected) ?? null;
   // The figures count the customer tenants: the platform's own is never stopped and carries no balance to watch.
   const customers = items?.filter((a) => !a.is_internal) ?? null;
   // 全量账户快照用整数求和；无法精确表示的上游数值不冒充已知金额。
@@ -142,15 +136,13 @@ export function Accounts({ canEdit, operator, onGoto }: TabProps) {
                       <tr data-finance-record key={a.tenant_id}>
                         <td data-label="租户">
                           <span className="flex min-w-0 items-center gap-2">
-                            <button
-                              type="button"
+                            <a
                               className="link-button bl-name"
                               title={a.tenant_name}
-                              aria-expanded={selected === a.tenant_id}
-                              onClick={() => setSelected(a.tenant_id)}
+                              href={tenantHash(a.tenant_id, "billing", "billing")}
                             >
                               {a.tenant_name}
-                            </button>
+                            </a>
                             {a.is_internal && <span className="tag">平台内部</span>}
                           </span>
                           <span className="cell-note">{MODE_LABEL[a.billing_mode] ?? a.billing_mode}</span>
@@ -170,16 +162,6 @@ export function Accounts({ canEdit, operator, onGoto }: TabProps) {
             )}
           </Card>
         </div>
-        {open && (
-          <AccountPanel
-            account={open}
-            canEdit={canEdit}
-            isAdmin={operator.role === "admin"}
-            onChanged={take}
-            onGoto={onGoto}
-            onClose={() => setSelected(null)}
-          />
-        )}
       </div>
     </>
   );

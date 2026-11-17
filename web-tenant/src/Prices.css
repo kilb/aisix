@@ -1,5 +1,5 @@
 /* 价格目录与详情复用模板令牌；报价值和区间保持完整。 */
-.price-quote-explainer { border-top: 1px solid var(--hairline); padding-top: 12px; font-size: var(--text-caption); color: var(--fg-3); }
+.price-quote-explainer { margin-inline: 12px; font-size: var(--text-caption); color: var(--fg-3); }
 .price-quote-explainer summary { min-height: 36px; display: flex; align-items: center; cursor: pointer; color: var(--fg-2); font-weight: 600; }
 .price-quote-explainer summary::after { content: "+"; margin-left: auto; }
 .price-quote-explainer[open] summary::after { content: "−"; }
@@ -13,11 +13,12 @@
 .price-scope-buttons > button:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
 .price-catalog { min-width: 0; max-width: 100%; margin-top: 0; container-type: inline-size; }
 .price-catalog > .dt-wrap { width: 100%; min-width: 0; max-width: 100%; }
-.price-catalog > .dt-wrap > .dt { width: 100%; min-width: 58rem; table-layout: fixed; }
+.price-catalog > .dt-wrap > .dt { width: 100%; min-width: 66rem; table-layout: fixed; }
 .price-summary-model { width: auto; }
-.price-summary-multiplier { width: 120px; }
-.price-summary-amount { width: 140px; }
-.price-catalog .price-model-row > :is(th,td) { height: auto; padding: 12px; vertical-align: middle; }
+.price-summary-multiplier { width: 108px; }
+.price-summary-amount { width: 132px; }
+.price-summary-cache-write { width: 192px; }
+.price-catalog .price-model-row > :is(th,td) { height: auto; padding: 8px 12px; vertical-align: middle; }
 .price-catalog .dt > tbody { border-bottom: 1px solid var(--hairline); }
 .price-catalog .price-model-row > th { position: static; z-index: auto; border: 0; text-align: left; background: transparent; color: var(--fg); font-family: var(--font-sans); font-size: var(--text-small); white-space: normal; }
 .price-catalog .price-rate-amount { display: block; white-space: normal; overflow-wrap: anywhere; font-weight: 600; font-variant-numeric: tabular-nums; }
@@ -28,6 +29,15 @@
 .price-catalog .price-multiplier .cell-note { white-space: normal; font-size: var(--text-caption); }
 .price-catalog :is(.num, .price-multiplier-value) { font-variant-numeric: tabular-nums; }
 .price-catalog .cell-note { white-space: normal; }
+.price-catalog .price-cache-hour { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: flex-end; gap: 2px 8px; }
+.price-cache-hour > span { min-width: 0; }
+.price-catalog .price-cache-hour .price-rate-amount { font-size: var(--text-caption); font-weight: 400; }
+.tenant-prices > .price-summary-card.bento-card { gap: 6px; padding: 16px 20px; min-height: 0; }
+.price-summary-card > p { margin: 0; }
+.price-summary-card .metric { font-size: var(--fs-24); line-height: 1.3; font-weight: 650; letter-spacing: -.025em; overflow-wrap: anywhere; }
+.price-summary-time > .tabular { font-size: var(--fs-20); line-height: 1.5; }
+.price-summary-card .bento-card-header { margin-bottom: 0; }
+.price-summary-card .bento-metric-skeleton { height: 36px; }
 .price-estimate-note { margin-top: 0; border-top: 1px solid var(--hairline); padding: 12px; }
 .price-group-filter { display: grid; gap: 6px; font-size: var(--text-caption); color: var(--fg-3); }
 .price-group-filter > select { min-width: 140px; }
@@ -81,9 +91,13 @@
 .price-matrix-scroll {
   min-width: 0;
   max-width: 100%;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
 }
+.price-matrix-scroll:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
 .price-matrix {
   width: 100%;
+  min-width: calc(18rem + var(--price-band-count, 1) * 11rem);
   border-collapse: collapse;
   table-layout: fixed;
   font-size: var(--text-body);
@@ -166,7 +180,7 @@
 
 /* 窄屏将上下文价格纵向列在同一计费项目下，数值不隐藏、不舍入。 */
 @media (max-width: 719px) {
-  .price-matrix, .price-matrix > tbody { display: block; width: 100%; }
+  .price-matrix, .price-matrix > tbody { display: block; width: 100%; min-width: 0; }
   .price-matrix > colgroup { display: none; }
   .price-matrix > thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
   .price-matrix tr { display: grid; grid-template-columns: minmax(0, 1fr) auto; padding-block: 12px; border-bottom: 1px solid var(--hairline); }

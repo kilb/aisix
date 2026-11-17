@@ -64,6 +64,76 @@
   border-radius: 0;
   background: transparent;
 }
+/* 名称、身份与配置各占一列；复制明文不会改变表格布局。 */
+.cp-keys .key-name {
+  font-size: var(--text-body);
+  line-height: 24px;
+}
+.cp-keys .key-secret-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  margin-top: 4px;
+  color: var(--muted-foreground);
+}
+.cp-keys .key-secret-line > code {
+  white-space: nowrap;
+}
+.cp-keys .key-secret-line .tn-actions {
+  display: inline-flex;
+  margin: 0;
+}
+.cp-keys .key-models {
+  display: block;
+  overflow-wrap: anywhere;
+}
+.cp-keys .key-row-actions {
+  gap: 2px;
+  align-items: flex-start;
+}
+.cp-keys .key-row-actions > .btn svg,
+.cp-keys .key-row-actions > .two-step > .btn svg {
+  width: 16px;
+  height: 16px;
+}
+.cp-keys .key-row-actions > .two-step.is-asking {
+  flex-basis: 100%;
+}
+@container (min-width: 761px) {
+  .cp-keys .keys-list .ops-record-table > .dt {
+    min-width: 1180px;
+    table-layout: fixed;
+  }
+  .cp-keys .keys-list .ops-record-table > .dt .key-identity-column {
+    width: 22%;
+    min-width: 16rem;
+  }
+  .cp-keys .keys-list .ops-record-table > .dt .key-owner-column {
+    width: 17%;
+  }
+  .cp-keys .keys-list .ops-record-table > .dt .key-model-column {
+    width: 15%;
+    min-width: 10rem;
+  }
+  .cp-keys .keys-list .ops-record-table > .dt :is(th, td):nth-child(4) {
+    width: 10%;
+  }
+  .cp-keys .keys-list .ops-record-table > .dt .key-limit-column {
+    width: 8%;
+  }
+  .cp-keys .keys-list .ops-record-table > .dt :is(th, td):nth-child(6) {
+    width: 10%;
+  }
+  .cp-keys .keys-list .ops-record-table > .dt .key-created-column {
+    width: 12%;
+    min-width: 0;
+  }
+  .cp-keys .keys-list .ops-record-table > .dt .key-actions-column {
+    width: 6%;
+    min-width: 0;
+  }
+}
 /* 弹窗置于 Portal 内，以表单自身作用域保持字段与操作区的布局。 */
 .form-dialog:has(.key-create-form) {
   width: min(880px, calc(100vw - 32px));

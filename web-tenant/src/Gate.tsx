@@ -66,7 +66,6 @@ export function Gate({
     setBusy(true);
     try {
       const session = await request();
-      setPassword("");
       onIn(session);
     } catch (e) {
       setErr(e instanceof ApiError ? describe(e) : "请求失败");
@@ -75,14 +74,24 @@ export function Gate({
     }
   }
 
-  function submit(e: React.FormEvent) {
+  function submit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
-    const name = displayName.trim() || undefined;
+    if (busy) return;
+    // 自动填充可直接更新控件；提交读取表单，避免依赖它是否触发 React 的 change。
+    const data = new FormData(e.currentTarget);
+    const enteredPassword = String(data.get("password") ?? "");
+    const enteredEmail = String(data.get("email") ?? "").trim();
+    const enteredOrgName = String(data.get("organization") ?? "").trim();
+    const name = String(data.get("display_name") ?? "").trim() || undefined;
+    setPassword(enteredPassword);
+    if (data.has("email")) setEmail(enteredEmail);
+    if (data.has("organization")) setOrgName(enteredOrgName);
+    if (data.has("display_name")) setDisplayName(name ?? "");
     if (invite === null && mode === "login") {
-      void attempt(() => login(email.trim(), password), messageFor);
+      void attempt(() => login(enteredEmail, enteredPassword), messageFor);
       return;
     }
-    if (!longEnough(password)) {
+    if (!longEnough(enteredPassword)) {
       setErr(TOO_SHORT);
       return;
     }
@@ -92,7 +101,7 @@ export function Gate({
       // `email_taken`, which only the inviter can sort out; the text does not
       // say why.
       void attempt(
-        () => acceptInvite(invite, password, name),
+        () => acceptInvite(invite, enteredPassword, name),
         (e) =>
           e.code === "not_found"
             ? "邀请无效或已过期"
@@ -101,12 +110,14 @@ export function Gate({
               : formMessageFor(e),
       );
     } else {
-      void attempt(() => signup(orgName.trim(), email.trim(), password, name), formMessageFor);
+      void attempt(() => signup(enteredOrgName, enteredEmail, enteredPassword, name), formMessageFor);
     }
   }
 
   function switchMode(next: Mode) {
+    if (next === mode) return;
     setMode(next);
+    setPassword("");
     setErr(null);
   }
 
@@ -117,10 +128,13 @@ export function Gate({
   }
 
   const hinted = invite !== null || mode === "signup";
+  const formId = `tenant-${invite !== null ? "invite" : mode}`;
   const passwordField = (
     <Field label="口令" hint={hinted ? <>至少 {MIN_PASSWORD_CHARS} 个字符</> : undefined}>
       {(aria) => (
         <input
+          id={`${formId}-password`}
+          name="password"
           type="password"
           autoComplete={invite === null && mode === "login" ? "current-password" : "new-password"}
           required
@@ -135,6 +149,9 @@ export function Gate({
   const displayNameField = (
     <Field label="显示名">
       <input
+        id={`${formId}-display-name`}
+        name="display_name"
+        type="text"
         autoComplete="name"
         placeholder="选填"
         value={displayName}
@@ -195,7 +212,7 @@ export function Gate({
           {invite !== null ? (
             <>
               <p className="hint">设置口令后即加入邀请你的组织，之后用受邀的邮箱和这个口令登录。</p>
-              <form className="gate-form" onSubmit={submit}>
+              <form id={formId} name={formId} method="post" className="gate-form" aria-label="接受邀请" onSubmit={submit}>
                 {passwordField}
                 {displayNameField}
                 <Button kind="primary" block type="submit" busy={busy}>
@@ -217,10 +234,13 @@ export function Gate({
                 className="gate-modes"
               />
               <div id={`tab-${mode}`} role="tabpanel" aria-labelledby={`stop-${mode}`}>
-                <form className="gate-form" onSubmit={submit}>
+                <form key={mode} id={formId} name={formId} method="post" className="gate-form" aria-label={title} onSubmit={submit}>
                   {mode === "signup" && (
                     <Field label="组织名称">
                       <input
+                        id={`${formId}-organization`}
+                        name="organization"
+                        type="text"
                         autoComplete="organization"
                         required
                         value={orgName}
@@ -230,8 +250,12 @@ export function Gate({
                   )}
                   <Field label="邮箱">
                     <input
+                      id={`${formId}-email`}
+                      name="email"
                       type="email"
                       autoComplete="username"
+                      autoCapitalize="none"
+                      spellCheck={false}
                       required
                       value={email}
                       onChange={(e) => setEmail(e.target.value)}

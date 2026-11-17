@@ -35,6 +35,14 @@
 .gateway-bundle-env {
   max-height: 40rem;
 }
+.cp-gateways .gateways-list .two-step > .btn svg {
+  width: 16px;
+  height: 16px;
+}
+/* 时间是独立比较列，凭据与实例保持上下排列。 */
+.cp-gateways .gateway-time-column {
+  font-variant-numeric: tabular-nums;
+}
 .gateway-bundle-footer {
   display: flex;
   flex-wrap: wrap;

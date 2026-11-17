@@ -1,0 +1,25 @@
+/* 金额只调整字号和换行，账户快照与流水计算不在样式层重算。 */
+.tenant-billing { align-items: start; }
+.tenant-billing .billing-reading .metric { min-width: 0; margin-top: 6px; font-size: var(--fs-24); line-height: 1.35; font-weight: 600; letter-spacing: -.02em; white-space: normal; overflow-wrap: anywhere; }
+.tenant-billing .billing-reading-primary .metric { font-size: var(--type-display); }
+.tenant-billing .billing-entries > .billing-reading { padding-bottom: 16px; }
+.tenant-billing .billing-entries > .grid { grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr)); gap: 12px; }
+.tenant-billing .billing-reading:not(.billing-reading-primary) { padding: 12px 16px; }
+.tenant-billing .billing-reading > span { font-size: var(--text-small); line-height: 20px; font-weight: 500; }
+.tenant-billing .billing-calculation { gap: 8px; }
+.billing-calculation > h3 { margin: 0; font-size: var(--text-title); line-height: 22px; }
+.billing-calculation > p { min-width: 0; margin: 0; line-height: 1.7; overflow-wrap: anywhere; }
+.tenant-billing .dt :is(th, td) { padding: 10px 12px; font-size: var(--text-small); line-height: 20px; }
+.tenant-billing .dt td { white-space: normal; overflow-wrap: anywhere; }
+.tenant-billing :is(.billing-topups-table, .billing-ledger-table) { width: 100%; min-width: 1080px; table-layout: fixed; }
+.tenant-billing .billing-ledger-table td[data-label="本笔余额计算"] { min-width: 0; white-space: normal; }
+.billing-ledger-formula { display: flex; flex-wrap: wrap; gap: 2px 6px; font-size: var(--text-caption); line-height: 20px; }
+.billing-ledger-formula > span { min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
+.billing-ledger-description { display: block; max-width: 100%; line-height: 20px; overflow-wrap: anywhere; }
+.tenant-billing .dt .money { font-size: inherit; font-weight: 500; line-height: inherit; }
+.tenant-billing .dt .money .cur { font-size: inherit; }
+.tenant-billing .dt td[data-label="说明"] { min-width: 0; }
+@media (max-width: 599px) {
+  .tenant-billing .billing-reading-primary .metric { font-size: var(--type-figure); }
+  .tenant-billing .billing-reading .metric { font-size: var(--fs-24); }
+}

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useId, useRef, useState, type CSSProperties } from "react";
-import { Pause, Play, Plus } from "lucide-react";
+import { Pause, Play, Plus, Trash2 } from "lucide-react";
 import {
   ApiError,
   groups as groupApi,
@@ -188,6 +188,7 @@ export function Keys({
   });
 
   const visibleScope = manager ? "全组织密钥" : "我的密钥";
+  const usableCount = items === null ? null : active ? items.filter(key => stateOf(key).text === "可用").length : 0;
   // 费用缺失不补零；摘要和列表使用同一批精确金额。
   const totalCost = items === null || costs === null ? null : items.reduce<bigint | null>((total, key) => {
     const amount = costs.items.get(key.id)?.chargedMicroCny;
@@ -203,14 +204,14 @@ export function Keys({
         dataLead={`${visibleScope}，管理调用凭据、模型范围与使用限制。`}
       />
       <BentoGrid className="tenant-keys">
-        <Card tone="lilac" padding="sm" className={`${span.d12} keys-expense-summary`} aria-label="密钥本月费用">
-          <div className="flex flex-wrap items-center justify-between gap-4">
-            <div className="min-w-0">
-              <p className="text-small font-semibold text-fg-2">本月已计价费用</p>
-              <Metric size="value" className="mt-2">{costErr ? "读取失败" : items === null || costs === null ? "—" : totalCost === null ? "未知" : fmtMicroCny(totalCost)}</Metric>
-            </div>
-            <p className="max-w-xl text-caption text-fg-3">{when(costs?.from ?? costRange.from)} 至 {when(costs?.to ?? costRange.to)}（UTC+8，不含结束时间）。<br />仅含当前可见密钥的已计价金额；待计价与处理中记录见列表。</p>
-          </div>
+        <Card padding="sm" className={`${span.d12} keys-expense-summary`} aria-label="密钥统计">
+          <dl className="keys-summary-grid">
+            <div><dt>当前可见密钥</dt><dd><Metric>{items === null ? "—" : formatCount(items.length)}</Metric><p>{manager ? "组织内全部密钥" : "归属于我的密钥"}</p></dd></div>
+            <div><dt>当前可用</dt><dd><Metric>{usableCount === null ? "—" : formatCount(usableCount)}</Metric><p>组织与密钥状态均可用</p></dd></div>
+            <div><dt>当前不可用</dt><dd><Metric>{items === null || usableCount === null ? "—" : formatCount(items.length - usableCount)}</Metric><p>含停用、过期及分组不可用</p></dd></div>
+            <div className="keys-summary-cost"><dt>本月已计价费用</dt><dd><Metric>{costErr ? "读取失败" : items === null || costs === null ? "—" : totalCost === null ? "未知" : fmtMicroCny(totalCost)}</Metric><p>仅统计当前可见密钥</p></dd></div>
+          </dl>
+          <p className="keys-summary-period">费用期间：{when(costs?.from ?? costRange.from)} 至 {when(costs?.to ?? costRange.to)}（UTC+8，不含结束时间）。待计价与处理中记录见列表；数量不受下方筛选影响。</p>
         </Card>
         <Card padding="table" className={cn(span.d12, "keys-list")}>
           <CardHeader number={3} title="密钥列表" description="复制或查看明文会重新获取密钥；吊销后立即失效，无法恢复。" actions={<Button onClick={() => void load()}>刷新列表</Button>} />
@@ -327,6 +328,7 @@ export function Keys({
                             <Button
                               size="sm"
                               kind="quiet"
+                              iconOnly
                               className="tenant-icon-action"
                               aria-label={k.disabled ? "启用" : "停用"}
                               title={k.disabled ? "启用" : "停用"}
@@ -341,6 +343,8 @@ export function Keys({
                           <TwoStep
                             label="吊销"
                             size="sm"
+                            kind="quiet"
+                            icon={<Trash2 aria-hidden="true" />}
                             warning="吊销后立即失效，且无法恢复"
                             disabled={busy === k.id}
                             busy={busy === k.id && acting === "revoke"}

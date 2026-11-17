@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ArrowLeft } from "lucide-react";
 import type { TabProps } from "../../App";
 import { EffectiveFrom, sendAt, type EffectiveResolver } from "../../components/EffectiveFrom";
 import { ApiError, pricing, tenantPricing, tenants, type Detail, type DiscountRevision, type Tenant, type TenantDiscountSummary, type TenantPlan } from "../../lib/api";
@@ -8,6 +7,7 @@ import { errorText, fmtInt } from "../../lib/fmt";
 import { fmtBeijing } from "../../lib/time";
 import { discountBps, fmtPercent } from "../../lib/percent";
 import { useRecordTable } from "../../lib/recordTable";
+import { tenantHash } from "../../lib/navigation";
 import { FormDialog } from "../../ui/FormDialog";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
@@ -32,9 +32,7 @@ function discountWords(revision: DiscountRevision | null): string {
 export function TenantPlans({ canEdit }: TabProps) {
   const [list, setList] = useState<TenantDiscountSummary[] | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [selected, setSelected] = useState<PlanTenant | null>(null);
-  const [create, setCreate] = useState<{ tenant: PlanTenant | null } | null>(null);
-  const [refresh, setRefresh] = useState(0);
+  const [create, setCreate] = useState(false);
   const [status, setStatus] = useState("offers");
   const listGeneration = useRef(0);
   const load = useCallback(async () => {
@@ -57,8 +55,7 @@ export function TenantPlans({ canEdit }: TabProps) {
   const offers = list?.filter(hasOffer).length ?? 0;
 
   return <>
-    {selected ? <TenantDiscountDetail key={selected.tenant_id} tenant={selected} refresh={refresh} canEdit={canEdit} onBack={() => setSelected(null)} onCreate={() => setCreate({ tenant: selected })} /> : <>
-      <PageHeader title="租户方案" dataLead={list ? `${fmtInt(offers)} 个租户有当前或预约优惠，${fmtInt(list.length)} 个租户配置过折扣。` : "正在读取租户折扣。"} description="折扣从实际分组售价中减免，例如 20% 表示减免 20%、实付 80%。新折扣只影响现在或将来的计费。" actions={canEdit && <Button kind="primary" icon="plus" onClick={() => setCreate({ tenant: null })}>新租户折扣</Button>} />
+      <PageHeader title="租户方案" dataLead={list ? `${fmtInt(offers)} 个租户有当前或预约优惠，${fmtInt(list.length)} 个租户配置过折扣。` : "正在读取租户折扣。"} description="折扣从实际分组售价中减免，例如 20% 表示减免 20%、实付 80%。新折扣只影响现在或将来的计费。" actions={canEdit && <Button kind="primary" icon="plus" onClick={() => setCreate(true)}>新租户折扣</Button>} />
       <Card className="finance-table-card tenant-discount-list">
         <CardHeader title={<>租户折扣{list && <Count n={list.length} />}</>} description="点击租户查看完整修改记录；已恢复原价的租户可在「全部已配置」中查看。" />
         {error && <div className="note crit" role="alert">{error} <Button size="sm" onClick={() => void load()}>重试</Button></div>}
@@ -75,7 +72,7 @@ export function TenantPlans({ canEdit }: TabProps) {
                 const { current, upcoming } = row.discount;
                 const next = upcoming[0];
                 return <tr data-finance-record key={row.tenant_id}>
-                  <td data-label="租户"><button type="button" className="link-button bl-name" onClick={() => setSelected(row)}>{row.tenant_name}</button><span className="cell-note">{row.tenant_id}</span></td>
+                  <td data-label="租户"><a className="link-button bl-name" href={tenantHash(row.tenant_id, "discounts", "pricing")}>{row.tenant_name}</a><span className="cell-note">{row.tenant_id}</span></td>
                   <td data-label="当前优惠">{discountWords(current)}</td>
                   <td data-label="生效时间" className="tabular">{current ? fmtBeijing(current.effective_from) : "未设置"}</td>
                   <td data-label="下一次变更">{next ? <>{discountWords(next)}<span className="cell-note tabular">{fmtBeijing(next.effective_from)}</span>{upcoming.length > 1 && <span className="cell-note">共 {fmtInt(upcoming.length)} 个预约版本</span>}</> : "—"}</td>
@@ -87,17 +84,26 @@ export function TenantPlans({ canEdit }: TabProps) {
           <RecordTablePager page={records.page} pageSize={records.pageSize} onPageChange={records.setPage} onPageSizeChange={records.setPageSize} total={records.filteredCount} label="租户折扣分页" />
         </>}
       </Card>
-    </>}
-    {create && canEdit && <DiscountDialog tenant={create.tenant} onClose={() => setCreate(null)} onSaved={async (tenant) => {
-      await load();
-      setSelected(tenant);
-      setRefresh((value) => value + 1);
-      setCreate(null);
+    {create && canEdit && <TenantPicker onClose={() => setCreate(false)} onSelect={(tenantId) => {
+      setCreate(false);
+      window.location.hash = `${tenantHash(tenantId, "discounts", "pricing")}&action=new-discount`;
     }} />}
   </>;
 }
 
-function TenantDiscountDetail({ tenant, refresh, canEdit, onBack, onCreate }: { tenant: PlanTenant; refresh: number; canEdit: boolean; onBack(): void; onCreate(): void }) {
+export function TenantDiscountSettings({ tenant, canEdit, refresh, openCreate = false }: { tenant: PlanTenant; canEdit: boolean; refresh: number; openCreate?: boolean }) {
+  const [create, setCreate] = useState(openCreate);
+  const [revision, setRevision] = useState(0);
+  return <>
+    <TenantDiscountDetail tenant={tenant} canEdit={canEdit} refresh={`${refresh}:${revision}`} onCreate={() => setCreate(true)} />
+    {create && canEdit && <DiscountDialog tenant={tenant} onClose={() => setCreate(false)} onSaved={async () => {
+      setRevision((value) => value + 1);
+      setCreate(false);
+    }} />}
+  </>;
+}
+
+function TenantDiscountDetail({ tenant, refresh, canEdit, onCreate }: { tenant: PlanTenant; refresh: string; canEdit: boolean; onCreate(): void }) {
   const [plan, setPlan] = useState<TenantPlan | null>(null);
   const [history, setHistory] = useState<DiscountRevision[] | null>(null);
   const [before, setBefore] = useState<number | null>(null);
@@ -153,7 +159,7 @@ function TenantDiscountDetail({ tenant, refresh, canEdit, onBack, onCreate }: { 
   }
 
   return <div role="region" aria-label={`租户折扣 ${tenant.tenant_name}`}>
-    <PageHeader title={tenant.tenant_name} dataLead="租户折扣与完整修改记录" description="折扣从实际分组售价中减免；0% 表示恢复原价。历史账单保持原有价格。" actions={<><Button onClick={onBack}><ArrowLeft aria-hidden />返回租户方案</Button>{canEdit && <Button kind="primary" icon="plus" onClick={onCreate}>新折扣</Button>}</>} />
+    <div className="tenant-section-heading"><div><h2>租户折扣</h2><p className="hint">折扣从实际分组售价中减免；0% 表示恢复原价。历史账单保持原有价格。</p></div>{canEdit && <Button kind="primary" icon="plus" onClick={onCreate}>新折扣</Button>}</div>
     {error && <div className="note crit" role="alert">{error} <Button size="sm" onClick={() => void load()}>重试</Button></div>}
     <div className="tenant-discount-summary" role="region" aria-label="折扣">
       {plan ? <dl className="compact-overview-facts">
@@ -185,41 +191,40 @@ function TenantDiscountDetail({ tenant, refresh, canEdit, onBack, onCreate }: { 
   </div>;
 }
 
-function DiscountDialog({ tenant, onClose, onSaved }: { tenant: PlanTenant | null; onClose(): void; onSaved(tenant: PlanTenant): Promise<void> }) {
+function TenantPicker({ onClose, onSelect }: { onClose(): void; onSelect(tenantId: string): void }) {
+  const [list, setList] = useState<Tenant[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
+  const [tenantId, setTenantId] = useState("");
+  const load = useCallback(async () => {
+    try { setList(await tenants.list()); setError(null); }
+    catch (cause) { setError(errorText(cause)); }
+  }, []);
+  useEffect(() => { void load(); }, [load]);
+  const needle = query.trim().toLocaleLowerCase();
+  const choices = (list ?? []).filter((item) => item.id === tenantId || !needle || item.name.toLocaleLowerCase().includes(needle) || item.id.toLocaleLowerCase().includes(needle));
+  return <FormDialog open onOpenChange={(open) => { if (!open) onClose(); }} title="新租户折扣" description="选择租户后，在租户页设置折扣。">
+    <form className="tenant-discount-form" aria-label="选择折扣租户" onSubmit={(event) => { event.preventDefault(); if (tenantId) onSelect(tenantId); }}>
+      <Field label="搜索租户"><input type="search" autoComplete="off" placeholder="租户名称或 ID" value={query} onChange={(event) => setQuery(event.target.value)} /></Field>
+      {error && <div className="note crit" role="alert">{error} <Button size="sm" onClick={() => void load()}>重试</Button></div>}
+      <Field label="租户"><Select aria-label="租户" value={tenantId} onValueChange={setTenantId} disabled={list === null} options={[{ value: "", label: list === null ? "读取租户中…" : "请选择租户" }, ...choices.map((item) => ({ value: item.id, label: `${item.name} · ${item.id}` }))]} /></Field>
+      {list !== null && choices.length === 0 && <p className="hint" role="status">没有匹配的租户，请修改搜索条件。</p>}
+      <CardFooter><Button type="submit" kind="primary" disabled={!tenantId}>前往设置折扣</Button></CardFooter>
+    </form>
+  </FormDialog>;
+}
+
+function DiscountDialog({ tenant, onClose, onSaved }: { tenant: PlanTenant; onClose(): void; onSaved(tenant: PlanTenant): Promise<void> }) {
   const toast = useToast();
   const [form, focusRefusal] = useRefusalFocus<HTMLFormElement>();
-  const [list, setList] = useState<Tenant[] | null>(null);
-  const [listError, setListError] = useState<string | null>(null);
-  const [query, setQuery] = useState("");
-  const [tenantId, setTenantId] = useState(tenant?.tenant_id ?? "");
-  const [preview, setPreview] = useState<TenantPlan | null>(null);
-  const [previewError, setPreviewError] = useState<string | null>(null);
+  const tenantId = tenant.tenant_id;
   const [percent, setPercent] = useState("");
   const resolver = useRef<EffectiveResolver>({ immediate: true, stamp: () => new Date().toISOString() });
   const [details, setDetails] = useState<Detail[]>([]);
   const [failure, setFailure] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const savingRef = useRef(false);
-  const title = tenant ? "新折扣" : "新租户折扣";
-  const loadTenants = useCallback(async () => {
-    try {
-      setList(await tenants.list());
-      setListError(null);
-    } catch (e) {
-      setListError(errorText(e));
-    }
-  }, []);
-  useEffect(() => { if (!tenant) void loadTenants(); }, [tenant, loadTenants]);
-  useEffect(() => {
-    if (tenant || !tenantId) return;
-    let active = true;
-    setPreview(null);
-    setPreviewError(null);
-    pricing.tenantPlan(tenantId).then((plan) => { if (active) setPreview(plan); }, (error: unknown) => { if (active) setPreviewError(errorText(error)); });
-    return () => { active = false; };
-  }, [tenant, tenantId]);
-  const needle = query.trim().toLocaleLowerCase();
-  const choices = (list ?? []).filter((item) => item.id === tenantId || !needle || item.name.toLocaleLowerCase().includes(needle) || item.id.toLocaleLowerCase().includes(needle));
+  const title = "新折扣";
 
   async function save(e: React.FormEvent) {
     e.preventDefault();
@@ -245,7 +250,7 @@ function DiscountDialog({ tenant, onClose, onSaved }: { tenant: PlanTenant | nul
         return;
       }
       toast("已保存");
-      await onSaved(tenant ?? { tenant_id: tenantId, tenant_name: list?.find((item) => item.id === tenantId)?.name ?? tenantId });
+      await onSaved(tenant);
     } catch (err) {
       if (err instanceof ApiError && err.status === 422 && err.details.length > 0) {
         setDetails(err.details);
@@ -262,15 +267,7 @@ function DiscountDialog({ tenant, onClose, onSaved }: { tenant: PlanTenant | nul
   const stray = details.filter((detail) => !["/tenant_id", "/discount_bps", "/effective_from"].includes(detail.path));
   return <FormDialog open onOpenChange={(open) => { if (!open) onClose(); }} busy={saving} title={title} description="只影响现在或将来开始生效的计费。历史账单保持原有价格。">
     <form ref={form} className="tenant-discount-form" aria-label={title} onSubmit={(event) => void save(event)} noValidate>
-      {tenant ? <div className="tenant-discount-form-tenant"><span className="text-caption text-muted">租户</span><strong>{tenant.tenant_name}</strong></div> : <>
-        <Field label="搜索租户"><input type="search" autoComplete="off" placeholder="租户名称或 ID" value={query} onChange={(event) => setQuery(event.target.value)} /></Field>
-        {listError && <div className="note crit" role="alert">{listError} <Button size="sm" onClick={() => void loadTenants()}>重试</Button></div>}
-        <Field label="租户" error={problemAt(details, (path) => path === "/tenant_id")}>
-          {(aria) => <Select {...aria} aria-label="租户" value={tenantId} onValueChange={setTenantId} disabled={list === null} options={[{ value: "", label: list === null ? "读取租户中…" : "请选择租户" }, ...choices.map((item) => ({ value: item.id, label: `${item.name} · ${item.id}` }))]} />}
-        </Field>
-        {list !== null && choices.length === 0 && <p className="hint" role="status">没有匹配的租户，请修改搜索条件。</p>}
-        {tenantId && <div className="tenant-discount-preview" role="region" aria-label="折扣">{preview?.tenant_id === tenantId ? <p className="text-caption text-muted">当前优惠（减免） <strong data-testid="current-discount">{preview.discount.current && preview.discount.current.discount_bps > 0 ? fmtPercent(preview.discount.current.discount_bps) : "无折扣"}</strong></p> : previewError ? <p className="note crit" role="alert">{previewError}</p> : <Loading />}</div>}
-      </>}
+      <div className="tenant-discount-form-tenant"><span className="text-caption text-muted">租户</span><strong>{tenant.tenant_name}</strong></div>
       <Field label="折扣（%）" hint="填写减免比例，例如 20 表示减免 20%、实付 80%；填写 0 表示恢复原价。" error={problemAt(details, (path) => path === "/discount_bps")}>
         {(aria) => <input {...aria} inputMode="decimal" autoComplete="off" value={percent} onChange={(event) => setPercent(event.target.value)} />}
       </Field>

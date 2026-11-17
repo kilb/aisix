@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { rankCurrentMemberCosts } from "./memberBento.ts";
+import * as memberBento from "./memberBento.ts";
 
 const people = [
   { id: "a", email: "a@example.test", display_name: "成员甲" },
@@ -45,4 +46,39 @@ test("缺失或坏费用不能冒充零；明确零和负调整保持原值", ()
     { id: "a", label: "成员甲", amount: -1000001n },
   ]);
   assert.deepEqual(rankCurrentMemberCosts([], []), []);
+});
+
+test("活跃只由窗口内已记录调用决定，不由账号正常或停用决定", () => {
+  const members = [
+    { id: "enabled", email: "enabled@example.test", display_name: null, disabled: false },
+    { id: "disabled", email: "disabled@example.test", display_name: "曾调用的成员", disabled: true },
+    { id: "another", email: "another@example.test", display_name: null, disabled: false },
+  ];
+  assert.deepEqual(memberBento.rankCurrentMemberActivity?.(members, [
+    { member_id: "enabled", requests: 0 },
+    { member_id: "disabled", requests: 8 },
+    { member_id: "another", requests: 3 },
+    { member_id: "removed", requests: 9000 },
+  ]), [
+    { id: "disabled", label: "曾调用的成员", requests: 8n },
+    { id: "another", label: "another@example.test", requests: 3n },
+  ]);
+});
+
+test("缺失、负数或不安全调用数不能生成完整活跃统计", () => {
+  for (const requests of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.equal(memberBento.rankCurrentMemberActivity?.(people, [
+      { member_id: "a", requests: 2 },
+      { member_id: "b", requests },
+    ]), null);
+  }
+  assert.equal(memberBento.rankCurrentMemberActivity?.(people, [{ member_id: "a", requests: 2 }]), null);
+});
+
+test("零调用与没有成员均生成明确空排行", () => {
+  assert.deepEqual(memberBento.rankCurrentMemberActivity?.(people, [
+    { member_id: "a", requests: 0 },
+    { member_id: "b", requests: 0 },
+  ]), []);
+  assert.deepEqual(memberBento.rankCurrentMemberActivity?.([], []), []);
 });

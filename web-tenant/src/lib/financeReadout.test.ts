@@ -21,6 +21,7 @@ const compiled = await build({
     sourcefile: "finance-readout-component.ts",
   },
   bundle: true,
+  loader: { ".css": "empty" },
   platform: "node",
   format: "cjs",
   jsx: "automatic",

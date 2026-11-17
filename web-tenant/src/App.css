@@ -1,2 +1,15 @@
-/* 数据页与顶部位置栏对齐，长文与账号表单继续保留各自的可读宽度。 */
-.sidebar-shell .shell-content.tenant-data-content { max-width: none; margin-inline: 0; }
+/* 页内容与粘性工具栏共用宽度，侧栏、抽屉与表格滚动继续由各自容器负责。 */
+.sidebar-shell :is(.shell-content, .shell-view-header, .shell-note) {
+  width: 100%;
+  max-width: 1440px;
+  margin-inline: auto;
+}
+
+/* 组织信息直接排在导航中，避免在侧栏里再套一层卡片。 */
+.sidebar-shell .shell-sidebar-context {
+  padding: 4px 8px 12px;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  background: transparent;
+}
+.sidebar-shell .tenant-context-avatar { background: var(--well); }

@@ -1,0 +1,63 @@
+/* 成员页保持平铺层级：统计、排行和单一列表区域共享页面网格。 */
+.tenant-members .members-stat { display: flex; min-width: 0; flex-direction: column; gap: 10px; }
+.members-stat-label { color: var(--ink-soft); font-size: var(--text-small); font-weight: 600; }
+.members-stat .metric { overflow-wrap: anywhere; }
+.members-stat-note { margin-top: auto; color: var(--muted-foreground); font-size: var(--text-caption); }
+.members-window { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px 20px; color: var(--muted-foreground); font-size: var(--text-caption); }
+.members-window p { max-width: 80ch; }
+.members-ranking-card { display: flex; flex-direction: column; }
+.members-ranking { display: grid; min-width: 0; gap: 18px; margin: 0; padding: 0; list-style: none; }
+.members-ranking li { display: flex; min-width: 0; align-items: center; gap: 14px; }
+.members-rank-position { width: 16px; flex: 0 0 16px; color: var(--muted-foreground); font-size: var(--text-caption); font-variant-numeric: tabular-nums; }
+.members-rank-entry { min-width: 0; flex: 1; }
+.members-rank-line { display: flex; min-width: 0; justify-content: space-between; align-items: baseline; gap: 16px; font-size: var(--text-small); }
+.members-rank-line a { min-width: 0; overflow: hidden; color: var(--foreground); font-weight: 600; text-overflow: ellipsis; white-space: nowrap; text-underline-offset: 3px; }
+.members-rank-line a:hover { text-decoration: underline; }
+.members-rank-line .tabular { flex-shrink: 0; }
+.members-rank-track { height: 6px; overflow: hidden; margin-top: 8px; border-radius: var(--r-bar); background: var(--well); }
+.members-rank-track > span { display: block; height: 100%; border-radius: var(--r-bar); background: var(--chart-1); }
+.members-activity-ranking .members-rank-track > span { background: var(--chart-3); }
+.members-ranking-foot { margin-top: auto; padding-top: 18px; color: var(--muted-foreground); font-size: var(--text-caption); }
+.members-tabs { display: flex; min-width: 0; flex-wrap: wrap; gap: 24px; margin-inline: 20px; border-bottom: 1px solid var(--border); }
+.members-tabs > button { display: inline-flex; min-height: 48px; align-items: center; gap: 8px; margin-bottom: -1px; padding: 12px 0; border: 0; border-bottom: 2px solid transparent; background: transparent; color: var(--muted-foreground); font-size: var(--text-small); font-weight: 600; cursor: pointer; }
+.members-tabs > button[data-state="active"] { border-bottom-color: var(--foreground); color: var(--foreground); }
+.members-tabs > button > span { color: var(--muted-foreground); font-size: var(--text-caption); font-variant-numeric: tabular-nums; }
+.members-tab-panel { min-width: 0; padding-top: 20px; }
+.members-tab-panel[hidden] { display: none; }
+.members-tab-panel > :is(.record-table-toolbar, .record-table-pager, .note) { margin-inline: 20px; }
+.members-tab-panel > .record-table-pager { padding-bottom: 12px; }
+.members-tab-panel > .dt-wrap { --dt-edge: 20px; }
+.members-directory > .note { margin-inline: 20px; }
+.members-invite-description { margin: 0 20px 16px; color: var(--muted-foreground); font-size: var(--text-caption); }
+.members-name { display: block; min-width: 0; color: var(--foreground); font-weight: 600; overflow-wrap: anywhere; text-underline-offset: 3px; }
+.members-name:hover { text-decoration: underline; }
+.members-detail-action { display: inline-flex; width: 40px; min-height: 44px; align-items: center; justify-content: center; border-radius: var(--r-button); color: var(--ink-soft); }
+.members-detail-action:hover { background: var(--well); color: var(--foreground); }
+.members-detail-action svg, .members-invites-table .btn svg, .member-detail .btn svg { width: 18px; height: 18px; }
+.members-tabs > button:focus-visible, .members-name:focus-visible, .members-detail-action:focus-visible, .members-rank-line a:focus-visible { outline: 2px solid var(--ring); outline-offset: 3px; }
+.members-table .dt { min-width: 1060px; table-layout: fixed; }
+.members-table .dt :is(th, td):nth-child(2) { width: 5.25rem; }
+.members-table .dt :is(th, td):nth-child(3) { width: 8rem; }
+.members-table .dt :is(th, td):nth-child(4) { width: 7.5rem; }
+.members-table .dt :is(th, td):nth-child(5) { width: 6rem; }
+.members-table .dt :is(th, td):nth-child(6) { width: 9rem; }
+.members-table .dt :is(th, td):nth-child(7) { width: 10rem; }
+.members-table .dt :is(th, td):last-child { width: 3.5rem; }
+.members-invites-table .dt { min-width: 880px; table-layout: fixed; }
+.members-invites-table .dt :is(th, td):nth-child(2) { width: 5.25rem; }
+.members-invites-table .dt :is(th, td):nth-child(3) { width: 7rem; }
+.members-invites-table .dt :is(th, td):nth-child(4) { width: 7.5rem; }
+.members-invites-table .dt :is(th, td):nth-child(5) { width: 11.25rem; }
+.members-invites-table .dt :is(th, td):last-child { width: 3.5rem; }
+.member-usage-summary { display: flex; min-width: 0; flex-wrap: wrap; gap: 24px 64px; padding-bottom: 20px; border-bottom: 1px solid var(--border); }
+.member-usage-summary dt { color: var(--muted-foreground); font-size: var(--text-small); }
+.member-usage-summary dd { margin-top: 8px; }
+.member-detail .bento-card > .member-usage-summary { margin-inline: 20px; }
+.member-detail .bento-card[aria-label="本月用量明细"] > :is(h3, p, [role="note"]) { margin-inline: 20px; }
+.member-detail .bento-card[aria-label="本月用量明细"] > [role="note"] { padding-bottom: 20px; }
+@media (max-width: 639px) {
+  .members-tabs { gap: 20px; }
+  .members-rank-line { flex-wrap: wrap; gap: 2px 12px; }
+  .members-rank-line a { max-width: 100%; }
+  .members-window { gap: 8px; }
+}

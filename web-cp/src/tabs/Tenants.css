@@ -592,3 +592,66 @@ td .tn-flag {
 /* 密钥分组的显示名和路由名各占一行，避免长显示名挤窄路由标识。 */
 .key-group-cell { display: grid; min-width: 0; max-width: 100%; gap: 4px; }
 .key-group-cell > :is(.grp, .tn-note) { display: block; min-width: 0; max-width: 100%; margin: 0; white-space: normal; overflow-wrap: anywhere; }
+
+/* 统一详情只保留一层工作面；顶部菜单覆盖租户的全部既有设置。 */
+.tenant-hub { gap: 16px; }
+.tenant-hub > .page-header h1 { font-size: var(--text-heading); line-height: var(--text-heading--line-height); }
+.tenant-identity { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; color: var(--color-fg-3); font-size: var(--text-small); }
+.tenant-identity > span:first-child { overflow-wrap: anywhere; }
+.tenant-hub-nav { display: flex; flex-wrap: wrap; gap: 4px 20px; border-bottom: 1px solid var(--color-hairline); }
+.tenant-hub-nav > a { display: inline-flex; align-items: center; min-height: 44px; padding: 8px 0; border-bottom: 2px solid transparent; color: var(--color-fg-3); font-size: var(--text-small); font-weight: 500; text-decoration: none; white-space: nowrap; }
+.tenant-hub-nav > a:hover { color: var(--color-fg); }
+.tenant-hub-nav > a[aria-current="page"] { border-bottom-color: var(--color-fg); color: var(--color-fg); font-weight: 600; }
+.tenant-hub-nav > a:focus-visible { outline: 2px solid var(--ring); outline-offset: 3px; }
+.tenant-hub-content { min-width: 0; padding: 20px; border: 1px solid var(--color-hairline); border-radius: var(--radius-card); background: var(--color-surface); }
+.tenant-section-heading { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: 12px 20px; margin-bottom: 16px; }
+.tenant-section-heading h2 { margin: 0; font-size: var(--text-body); font-weight: 600; line-height: var(--text-body--line-height); }
+.tenant-section-heading .hint { margin: 6px 0 0; font-size: var(--text-small); }
+.tenant-basic-facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 32px; margin: 0; }
+.tenant-basic-facts > div { display: grid; grid-template-columns: 88px minmax(0, 1fr); align-items: start; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--color-hairline); }
+.tenant-basic-facts dt { color: var(--color-fg-3); font-size: var(--text-small); }
+.tenant-basic-facts dd { min-width: 0; margin: 0; overflow-wrap: anywhere; font-size: var(--text-small); }
+.tenant-hub .tn-part { margin: 20px 0 0; padding: 20px 0 0; }
+.tenant-hub-content > .tn-part:first-child { margin-top: 0; padding-top: 0; border-top: 0; }
+.tenant-hub :is(.tn-part > legend, .tn-part > h3, .tn-sub > legend) { font-size: var(--text-body); font-weight: 600; }
+.tenant-hub .tn-part > .hint { margin-bottom: 12px; }
+.tenant-hub .tn-foot { padding-top: 12px; margin-top: 12px; }
+.tenant-hub .tn-bleed { margin-top: 12px; }
+.tenant-hub.finance-workspace .ops-record-table > .dt { min-width: 0; }
+.tenant-hub .tn-checks.tn-groups { grid-template-columns: minmax(0, 1fr); border-radius: var(--r-input); }
+.tenant-hub .tn-checks.tn-groups > li { padding: 8px 12px; }
+
+/* 账务区域以分隔线连续排列，不再包入侧栏或重复卡片。 */
+.tenant-hub .bl-region { margin: 20px 0 0; padding: 20px 0 0; border-color: var(--color-hairline); }
+.tenant-hub .bl-region:first-child { margin-top: 0; padding-top: 0; border-top: 0; }
+.tenant-hub .bl-region > .bento-card-header { margin-bottom: 12px; }
+.tenant-hub .bl-region .bento-card-header h3 { font-size: var(--text-body); font-weight: 600; }
+.tenant-hub .bl-region > .dt-wrap { --dt-edge: 12px; margin: 12px 0 0; }
+.tenant-hub .bl-region > .dt-wrap:last-child { margin-bottom: 0; }
+.tenant-hub :is(.bl-more, .bl-card-foot) { margin: 12px 0 0; padding: 12px 0 0; }
+.tenant-hub .bl-tiles { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0 24px; }
+.tenant-hub .bl-tiles > div { padding: 10px 0; }
+.tenant-hub .bl-tiles dd, .tenant-hub .bl-tiles dd.money { margin-top: 4px; font-size: var(--text-title); line-height: var(--text-title--line-height); }
+.tenant-hub .bl-controls.bl-filters { grid-template-columns: repeat(auto-fit, minmax(160px, 220px)); }
+.tenant-hub .bl-controls.bl-inline > .field { flex: 0 1 280px; }
+.tenant-hub .bl-box { border: 0; border-radius: 0; border-block: 1px solid var(--color-hairline); }
+.tenant-hub :is(.tenant-discount-summary, .tenant-discount-history) { margin: 0; padding: 0; border: 0; border-radius: 0; background: transparent; box-shadow: none; }
+.tenant-hub .tenant-discount-summary { padding-bottom: 20px; }
+.tenant-hub .tenant-discount-history { padding-top: 20px; border-top: 1px solid var(--color-hairline); }
+.tenant-hub .tenant-discount-history .bento-card-header { margin-bottom: 12px; }
+.tenant-hub .tenant-discount-history .bento-card-header h2 { font-size: var(--text-body); font-weight: 600; }
+.tenant-hub .dt[aria-label="余额流水"] { table-layout: fixed; }
+.tenant-hub .dt[aria-label="余额流水"] :is(th, td):first-child { width: 20%; }
+.tenant-hub .dt[aria-label="余额流水"] :is(th, td):nth-child(2) { width: 9%; }
+.tenant-hub .dt[aria-label="余额流水"] :is(th, td):is(:nth-child(3), :nth-child(4)) { width: 16%; }
+.tenant-hub .dt[aria-label="余额流水"] td:last-child { white-space: normal; overflow-wrap: anywhere; }
+@media (max-width: 767px) {
+  .tenant-hub-content { padding: 16px; }
+  .tenant-basic-facts { grid-template-columns: minmax(0, 1fr); }
+  .tenant-hub .bl-tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 479px) {
+  .tenant-hub-nav { gap: 0 16px; }
+  .tenant-hub .bl-controls.bl-inline > .field { flex-basis: 100%; }
+  .tenant-hub .bl-tiles { grid-template-columns: minmax(0, 1fr); }
+}

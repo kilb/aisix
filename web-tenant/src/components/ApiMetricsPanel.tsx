@@ -10,6 +10,7 @@ import { fmtMicroCny } from "../lib/money";
 import { bucketStart, fmtBeijing, metricPeriodLabel } from "../lib/time";
 import { RankBars, TrendChart, type TrendPoint } from "./charts";
 import { BentoGrid, Card, CardFooter, CardHeader, CardMessage, Metric, span } from "./page";
+import "./metrics-density.css";
 
 export interface ApiMetricsPanelProps {
   scope: MetricsScope;

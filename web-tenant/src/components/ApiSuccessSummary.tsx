@@ -1,6 +1,7 @@
 import { requestOutcomeShares, type ApiMetricValues } from "../lib/apiMetrics";
 import { formatCount, formatRatio } from "../lib/chartFormat";
 import { Metric } from "./page";
+import "./metrics-density.css";
 
 export type SuccessSummaryTotals = Pick<ApiMetricValues, "requests" | "succeeded_requests" | "failed_requests" | "unknown_outcome_requests" | "known_outcome_requests" | "unknown_final_attempts" | "success_rate">;
 

@@ -1,5 +1,4 @@
 /* 筛选、记录与精确金额都在同一通栏内，宽表只在自身区域滚动。 */
-.usage-qty { display: inline-flex; flex-wrap: wrap; gap: 4px 12px; color: var(--fg-2); }
 .usage-filters { display: flex; min-width: 0; align-items: flex-end; flex-wrap: wrap; gap: 12px; margin-bottom: 0; }
 .usage-filters > .field { width: 184px; max-width: 100%; min-width: 0; margin: 0; }
 .usage-filters .f { margin: 0; }
@@ -9,27 +8,29 @@
 .usage-record-section > .hint,
 .metric-scope > .hint { margin: 0; color: var(--fg-3); font-size: var(--fs-12); line-height: 1.5; }
 .usage-record-section > :not(.dt-wrap, .record-table-pager) { margin-inline: 12px; }
-.usage-record-section .dt { display: table; min-width: 1040px; table-layout: fixed; }
-.usage-column-action { width: 44px; }
+.usage-record-section .dt { display: table; min-width: 74rem; table-layout: fixed; }
+.usage-column-action { width: calc(var(--h-control-sm) + 32px); }
 .usage-column-time { width: 10rem; }
 .usage-column-type { width: 4.5rem; }
 .usage-column-request { width: auto; }
-.usage-column-state { width: 8rem; }
-.usage-column-timing { width: 9rem; }
-.usage-column-tokens { width: 9rem; }
-.usage-column-charge { width: 7rem; }
+.usage-column-state { width: 9.5rem; }
+.usage-column-timing { width: 10rem; }
+.usage-column-tokens { width: 10rem; }
+.usage-column-charge { width: 9.5rem; }
 .usage-record-section .dt :is(td, th) { min-width: 0; white-space: normal; overflow-wrap: anywhere; }
 .usage-request-identity > strong { display: block; color: var(--fg); font-weight: 700; }
 .usage-request-identity .cell-note { display: block; margin-top: 4px; color: var(--fg-3); font-size: var(--fs-12); line-height: 1.5; }
 .usage-request-identity code { font-size: var(--fs-12); line-height: 1.5; overflow-wrap: anywhere; }
 .usage-timing-value { display: block; font-variant-numeric: tabular-nums; white-space: normal; }
 .usage-timing-value > span { display: block; margin-bottom: 2px; color: var(--fg-3); font-size: var(--fs-12); line-height: 1.5; }
+.usage-row-action { text-align: right; }
 .usage-row-action .btn { width: var(--h-control-sm); padding-inline: 0; }
 .usage-record-section td[data-label="状态"] .lamp { max-width: 100%; white-space: normal; }
 .tenant-call-tokens { display: grid; gap: 4px; margin: 0; font-variant-numeric: tabular-nums; }
-.tenant-call-tokens > div { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.tenant-call-tokens > div { display: flex; align-items: baseline; justify-content: flex-start; gap: 6px; white-space: nowrap; }
 .tenant-call-tokens dt { color: var(--fg-3); font-size: var(--fs-12); line-height: 1.5; }
 .tenant-call-tokens dd { margin: 0; color: var(--fg); font-size: var(--fs-13); line-height: 1.5; font-weight: 600; }
+.tenant-call-usage { text-align: left; }
 .tenant-call-usage .cell-note { display: block; margin-top: 6px; color: var(--fg-3); font-size: var(--fs-12); line-height: 1.5; text-align: left; }
 .tenant-call-table { min-width: 0; max-width: 100%; overflow-x: auto; }
 .usage-record-section .usage-summary-table { min-width: 860px; }
@@ -45,15 +46,17 @@
 
 /* 调用筛选可随主页面吸顶；表格仍只在自己的区域横向滚动。 */
 .usage-record-section.usage-calls-section { overflow: visible; }
-.usage-calls-section > .usage-record-filters { position: sticky; top: 60px; z-index: 20; padding: 12px; border: 1px solid var(--border); border-radius: var(--r-field); background: var(--card); box-shadow: var(--shadow-card); }
-.usage-calls-section .usage-column-time { width: 7.5rem; }
-.usage-calls-section .usage-column-timing { width: 9rem; }
+.usage-calls-section > .usage-record-filters { position: sticky; top: 60px; z-index: 20; padding: 12px 0; border: 0; border-bottom: 1px solid var(--border); border-radius: 0; background: var(--card); box-shadow: none; }
+.usage-calls-section > .usage-call-notes { margin-block: 10px; }
+.usage-calls-section > .hint { margin-block: 8px; }
+.usage-calls-section .usage-column-time { width: 7.25rem; }
+.usage-calls-section .usage-column-timing { width: 10rem; }
+.usage-calls-section .tenant-call-table > .dt > thead > tr > th { white-space: nowrap; }
 .usage-calls-section .usage-call-time time, .usage-calls-section .usage-call-time time > span { display: block; white-space: nowrap; }
 .usage-calls-section .usage-call-time time > span:first-child { color: var(--ink); font-weight: 500; }
 .usage-calls-section .usage-call-time time > span + span { margin-top: 3px; color: var(--muted-foreground); font-size: var(--text-caption); }
 .usage-calls-section .tenant-call-table > .dt > tbody > tr > td { padding-block: 12px; vertical-align: top; }
 .usage-calls-section .tenant-call-table .usage-performance { grid-template-columns: minmax(0, 1fr); gap: 3px; text-align: left; }
-.usage-calls-section .tenant-call-table .usage-performance > div { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.usage-calls-section .tenant-call-table .usage-performance > div { display: inline-flex; width: max-content; align-items: baseline; justify-content: flex-start; gap: 6px; white-space: nowrap; }
 .usage-calls-section .tenant-call-table .usage-performance dd { margin: 0; white-space: nowrap; font-weight: 500; }
 @media (min-width: 1100px) { .usage-calls-section .usage-record-filter-grid { max-height: calc(100dvh - 180px); overflow-y: auto; overscroll-behavior: contain; } }
-@media (max-width: 1099px) { .usage-calls-section > .usage-record-filters { position: static; } }

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ArrowLeft } from "lucide-react";
+import { ArrowLeft, Check, KeyRound, Pencil, Plus, Trash2, UserMinus } from "lucide-react";
 import { ApiError, budgets as budgetApi, members as memberApi, type Budget, type Member, type MemberRole, type SessionMember, type TenantStatus } from "./lib/api";
 import { memberUsage, type MemberUsageSummary } from "./lib/memberUsage";
 import { formMessageFor, messageFor } from "./lib/errors";
@@ -18,6 +18,7 @@ import { Field } from "./ui/Field";
 import { Lamp } from "./ui/Lamp";
 import { Select } from "./ui/Select";
 import { TwoStep } from "./ui/TwoStep";
+import "./Members.css";
 
 const PERIOD = { day: "每日", week: "每周", month: "每月" };
 const SET_BY = { operator: "平台", org_admin: "组织管理员", member: "成员" };
@@ -98,7 +99,7 @@ export function MemberDetail({ memberId, member, status, onBack, onSelfChanged, 
   const roleOptions = (member.role === "owner" ? ["owner", "admin", "member", "billing"] : ["admin", "member", "billing"]) as MemberRole[];
   const memberBudgets = budgets?.filter((budget) => budget.scope === "member" && budget.target.id === memberId) ?? [];
   const usageRow = usage?.items.find((row) => row.member_id === memberId);
-  return <>
+  return <div className="member-detail">
     <PageHeader title={person?.display_name ?? person?.email ?? "成员详情"} description={person?.display_name ? person.email : undefined} actions={<Button onClick={onBack}><ArrowLeft aria-hidden />返回成员列表</Button>} />
     {actionError && <div className="note crit mb-4" role="alert">{actionError}</div>}
     {notice && <div className="note ok mb-4" role="status">{notice}</div>}
@@ -115,7 +116,7 @@ export function MemberDetail({ memberId, member, status, onBack, onSelfChanged, 
         <div className="flex flex-wrap items-end gap-3">
           {active && managesPerson ? <>
             <Field label="角色"><Select value={role} onValueChange={(value) => setRole(value as MemberRole)} disabled={busy !== null} options={roleOptions.map((value) => ({ value, label: ROLE_LABEL[value] }))} /></Field>
-            {role !== person.role && <TwoStep label="更改角色" disabled={busy !== null} busy={busy === "role"} warning={role === "billing" ? "账单角色不持有密钥，该成员的密钥将停止工作。" : self ? "更改自己的角色可能失去当前管理权限。" : "该成员的访问权限将随角色更改。"} onConfirm={() => void act("role", () => memberApi.setRole(person.id, role), self ? onSelfChanged : undefined)} />}
+            {role !== person.role && <TwoStep label="更改角色" icon={<Check aria-hidden="true" />} disabled={busy !== null} busy={busy === "role"} warning={role === "billing" ? "账单角色不持有密钥，该成员的密钥将停止工作。" : self ? "更改自己的角色可能失去当前管理权限。" : "该成员的访问权限将随角色更改。"} onConfirm={() => void act("role", () => memberApi.setRole(person.id, role), self ? onSelfChanged : undefined)} />}
           </> : <p>角色：{ROLE_LABEL[person.role]}</p>}
         </div>
       </Card>
@@ -124,7 +125,7 @@ export function MemberDetail({ memberId, member, status, onBack, onSelfChanged, 
         {!active ? <CardMessage>组织未启用，无法读取用量。</CardMessage> : usageError ? <CardMessage onRetry={() => void load()}>成员用量读取失败：{usageError}</CardMessage> : usage === null ? <Loading /> : usageRow ? <MemberUsageDetails usage={usageRow} /> : <CardMessage>暂无该成员的用量数据。</CardMessage>}
       </Card>
       <Card padding="table" role="region" aria-label="成员额度">
-        <CardHeader title="成员额度" description="各项成员额度独立生效；组织与密钥额度仍然适用。" actions={active && <Button onClick={() => setBudgetDialog({ budget: null })}>设置成员额度</Button>} />
+        <CardHeader title="成员额度" description="各项成员额度独立生效；组织与密钥额度仍然适用。" actions={active && <Button iconOnly aria-label="设置成员额度" title="设置成员额度" onClick={() => setBudgetDialog({ budget: null })}><Plus aria-hidden="true" /></Button>} />
         {!active ? <CardMessage>组织未启用，无法读取额度。</CardMessage> : budgetError ? <CardMessage onRetry={() => void load()}>成员额度读取失败：{budgetError}</CardMessage> : budgets === null ? <Loading /> : memberBudgets.length === 0 ? <p className="hint">不限制</p> : <DataTable label="成员额度">
           <thead><tr><th>周期</th><th className="num">限额</th><th className="num">本期已用</th><th className="num">剩余</th><th>设置方</th><th><span className="vh">操作</span></th></tr></thead>
           <tbody>{memberBudgets.map((budget) => <tr key={budget.id}>
@@ -133,20 +134,20 @@ export function MemberDetail({ memberId, member, status, onBack, onSelfChanged, 
             <td className="num" data-label="本期已用"><span className="tabular">{fmtMicroCny(budget.spent_micro_cny)}</span><BudgetProgress className="mt-2" value={exactRatio(budget.spent_micro_cny, budget.limit_micro_cny)} accessibleLabel={`本期已用 ${fmtMicroCny(budget.spent_micro_cny)}，限额 ${fmtMicroCny(budget.limit_micro_cny)}`} /></td>
             <td className="num tabular" data-label="剩余">{fmtMicroCny(budget.remaining_micro_cny)}{budget.exhausted ? "（已用尽）" : ""}</td>
             <td data-label="设置方">{SET_BY[budget.set_by]}</td>
-            <td className="right" data-label="操作">{budget.set_by !== "operator" ? <div className="flex flex-wrap justify-end gap-2"><Button size="sm" disabled={busy !== null} onClick={() => setBudgetDialog({ budget })}>调整额度</Button><TwoStep label="移除额度" size="sm" disabled={busy !== null} busy={busy === budget.id} warning="移除后不再受此项成员额度限制，其他额度仍然适用。" onConfirm={() => void act(budget.id, () => budgetApi.remove(budget.id))} /></div> : <span className="hint">由平台管理</span>}</td>
+            <td className="right" data-label="操作">{budget.set_by !== "operator" ? <div className="flex flex-wrap justify-end gap-2"><Button size="sm" iconOnly aria-label="调整额度" title="调整额度" disabled={busy !== null} onClick={() => setBudgetDialog({ budget })}><Pencil aria-hidden="true" /></Button><TwoStep label="移除额度" icon={<Trash2 aria-hidden="true" />} size="sm" disabled={busy !== null} busy={busy === budget.id} warning="移除后不再受此项成员额度限制，其他额度仍然适用。" onConfirm={() => void act(budget.id, () => budgetApi.remove(budget.id))} /></div> : <span className="hint">由平台管理</span>}</td>
           </tr>)}</tbody>
         </DataTable>}
       </Card>
       <Card role="region" aria-label="登录与访问">
         <CardHeader title="登录与访问" />
         <div className="grid gap-4 tablet:grid-cols-2">
-          <div><h3 className="mb-2 font-medium">登录密码</h3>{self ? <p className="hint">请在个人账户中修改自己的密码。</p> : active && managesPerson ? <><p className="mb-3 hint">重置后，该成员的现有登录会话将结束，需要使用新密码重新登录。</p><Button disabled={busy !== null} onClick={() => setPasswordOpen(true)}>重置密码</Button></> : <p className="hint">{!active ? "组织未启用，无法重置密码。" : "只有组织所有者可以重置所有者的密码。"}</p>}</div>
+          <div><h3 className="mb-2 font-medium">登录密码</h3>{self ? <p className="hint">请在个人账户中修改自己的密码。</p> : active && managesPerson ? <><p className="mb-3 hint">重置后，该成员的现有登录会话将结束，需要使用新密码重新登录。</p><Button iconOnly aria-label="重置密码" title="重置密码" disabled={busy !== null} onClick={() => setPasswordOpen(true)}><KeyRound aria-hidden="true" /></Button></> : <p className="hint">{!active ? "组织未启用，无法重置密码。" : "只有组织所有者可以重置所有者的密码。"}</p>}</div>
           <div><h3 className="mb-2 font-medium">账号状态</h3><p className="hint">{person.disabled ? "该账号已被平台停用，请联系平台管理员恢复。" : "该账号正常。账号启停由平台管理员管理。"}</p></div>
         </div>
-        {managesPerson && <div className="border-t border-divider pt-4"><h3 className="mb-2 font-medium">移除成员</h3><p className="mb-3 hint">移除后将结束登录会话并吊销该成员的所有密钥。</p><TwoStep label="移除成员" disabled={busy !== null} busy={busy === "remove"} warning={self ? "你将离开此组织，所有密钥会被吊销。" : "该成员的所有密钥会被吊销。"} onConfirm={() => void act("remove", () => memberApi.remove(person.id), self ? onLeft : onBack)} /></div>}
+        {managesPerson && <div className="border-t border-divider pt-4"><h3 className="mb-2 font-medium">移除成员</h3><p className="mb-3 hint">移除后将结束登录会话并吊销该成员的所有密钥。</p><TwoStep label="移除成员" icon={<UserMinus aria-hidden="true" />} disabled={busy !== null} busy={busy === "remove"} warning={self ? "你将离开此组织，所有密钥会被吊销。" : "该成员的所有密钥会被吊销。"} onConfirm={() => void act("remove", () => memberApi.remove(person.id), self ? onLeft : onBack)} /></div>}
       </Card>
     </div>}
     {person && budgetDialog && <MemberBudgetDialog memberId={person.id} budget={budgetDialog.budget} onClose={() => setBudgetDialog(null)} onInactive={onSelfChanged} onSaved={() => { setBudgetDialog(null); setNotice("成员额度已保存。"); void load(); }} />}
     {person && passwordOpen && <ResetMemberPassword memberId={person.id} onClose={() => setPasswordOpen(false)} onInactive={onSelfChanged} onSaved={() => { setPasswordOpen(false); setNotice("密码已重置。该成员需要使用新密码重新登录。"); }} />}
-  </>;
+  </div>;
 }

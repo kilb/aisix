@@ -17,7 +17,7 @@ export function AccountSettings({ member, onSignOut }: { member: SessionMember; 
           { label: "角色", value: ROLE_LABEL[member.role] ?? member.role },
         ]} className="account-profile-list tablet:grid-cols-1" />
       </Card>
-      <ChangePassword minimumLength={MIN_PASSWORD_CHARS} />
+      <ChangePassword minimumLength={MIN_PASSWORD_CHARS} username={member.email} />
       <Card className="account-session">
         <CardHeader title="当前会话" description="在共用设备上完成工作后，请退出登录。" actions={<Button onClick={onSignOut}>登出</Button>} />
       </Card>

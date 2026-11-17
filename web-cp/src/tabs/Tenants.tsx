@@ -1,10 +1,11 @@
 import "./operations.css";
 import "./Tenants.css";
+import "./FinanceWorkspace.css";
 import { keySearchText } from "../lib/operationalRecords";
 import { useRecordTable } from "../lib/recordTable";
 import { RecordTools, RecordPager } from "../components/RecordTools";
 /** 租户列表通栏显示，详情与默认配置独立占据工作区。 */
-import { Fragment, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import { Fragment, lazy, Suspense, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import type { TabProps } from "../App";
 import { ConflictNote } from "../components/ConflictNote";
 import { GatewayTooOld } from "../components/GatewayTooOld";
@@ -12,6 +13,7 @@ import { Msg, type Note } from "../components/Msg";
 import { RolloutBadge } from "../components/RolloutBadge";
 import {
   ApiError,
+  billing,
   groupPrices,
   groups as groupsApi,
   keys as keysApi,
@@ -33,6 +35,7 @@ import {
 import { messageFor } from "../lib/errors";
 import { generatedDirect } from "../lib/generatedDirect";
 import { errorText, fmtInt, fmtTime } from "../lib/fmt";
+import { TENANT_VIEWS, tenantHash, tenantViewOf, type TenantSource, type TenantView } from "../lib/navigation";
 import { Card, CardHeader, Metric, MetricSkeleton, PageHeader } from "../components/page";
 import { Button } from "../ui/Button";
 import { useRefusalFocus } from "../ui/Field";
@@ -41,9 +44,11 @@ import { OperationalTable as DataTable, Loading } from "../components/Operationa
 import { EmptyState } from "../ui/EmptyState";
 import { GroupName } from "../ui/GroupName";
 import { Lamp, type LampState } from "../ui/Lamp";
-import { SidePanel } from "../ui/SidePanel";
 import { TwoStep } from "../ui/TwoStep";
 import { Select } from "../ui/Select";
+import { AccountPanel } from "./billing/AccountPanel";
+
+const TenantDiscountSettings = lazy(() => import("./pricing/TenantPlans").then((module) => ({ default: module.TenantDiscountSettings })));
 
 export const STATUS_LABEL: Record<Tenant["status"], string> = {
   pending: "待审核",
@@ -330,7 +335,7 @@ export function unreachableWarning(groups: string[], whose: string): string {
 /** 详情与列表保留独立状态；窄屏顺序堆叠，宽屏各占六列。 */
 export const SIDE_OPEN = "with-side is-open tn-bento-side";
 
-export function Tenants({ operator, canEdit }: TabProps) {
+export function Tenants({ operator, canEdit, onGoto, routeQuery, refreshShell }: TabProps) {
   const [filter, setFilter] = useState<Tenant["status"] | "">("");
   // Every tenant, whatever the filter: the figures above the list count them all.
   const [all, setAll] = useState<Tenant[] | null>(null);
@@ -338,15 +343,17 @@ export function Tenants({ operator, canEdit }: TabProps) {
   const [rowError, setRowError] = useState<{ id: string; error: unknown } | null>(null);
 
   const [acting, setActing] = useState<string | null>(null);
-  const [selected, setSelected] = useState<string | null>(null);
-  const [detail, setDetail] = useState<Tenant | null>(null);
+  const selected = routeQuery?.get("tenant") || null;
+  const view = tenantViewOf(routeQuery?.get("view"));
+  const source: TenantSource = routeQuery?.get("from") === "billing" ? "billing" : routeQuery?.get("from") === "pricing" ? "pricing" : "tenants";
+  const [detailView, setDetail] = useState<Tenant | null>(null);
+  const detail = detailView?.id === selected ? detailView : null;
   const [detailError, setDetailError] = useState<string | null>(null);
   const [showDefaults, setShowDefaults] = useState(false);
   // Bumped by 刷新: the open tenant's page reads its lists again.
   const [tick, setTick] = useState(0);
   const lifetime = useLifetime();
   const selectedRef = useRef(selected);
-  const tenantOpeners = useRef(new Map<string, HTMLButtonElement>());
   selectedRef.current = selected;
   const listSeq = useRef(0);
 
@@ -391,7 +398,9 @@ export function Tenants({ operator, canEdit }: TabProps) {
     setDetailError(null);
     try {
       const view = await tenants.get(id);
-      setDetail((current) => (selectedRef.current === id ? view : current));
+      if (selectedRef.current !== id) return;
+      setDetail((current) => current?.id === id && current.version > view.version ? current : view);
+      setAll((list) => list && list.map((current) => current.id === id && view.version >= current.version ? view : current));
     } catch (e) {
       if (selectedRef.current === id) setDetailError(errorText(e));
     }
@@ -422,10 +431,7 @@ export function Tenants({ operator, canEdit }: TabProps) {
   }
 
   function closeDetail() {
-    const id = selectedRef.current;
-    setSelected(null);
-    // 列表重新挂载后将焦点交还给打开详情的租户。
-    requestAnimationFrame(() => { if (id) tenantOpeners.current.get(id)?.focus(); });
+    onGoto(source, source === "billing" ? "accounts" : source === "pricing" ? "plans" : undefined);
   }
 
   async function act(t: Tenant, run: (id: string) => Promise<Tenant>) {
@@ -435,6 +441,7 @@ export function Tenants({ operator, canEdit }: TabProps) {
       settle(await run(t.id));
       // The filter may leave the tenant out now.
       await loadList();
+      refreshShell();
     } catch (e) {
       setRowError({ id: t.id, error: e });
     } finally {
@@ -443,19 +450,19 @@ export function Tenants({ operator, canEdit }: TabProps) {
   }
 
   return (
-    <div className="cp-operations cp-tenants">
+    <div className={`cp-operations cp-tenants${selected ? " tenant-hub finance-workspace" : ""}`}>
       {/* 编辑状态独立显示，避免概览和列表分散当前操作。 */}
       <PageHeader
         title={selected ? detail?.name ?? "租户详情" : showDefaults ? "新租户默认值" : "租户"}
         eyebrow="客户管理"
-        dataLead={selected ? "管理模型授权、可用分组、限额与成员。" : showDefaults ? "设置之后创建的租户使用的初始限额与分组。" : listError ? "租户列表读取失败；已有统计保留最近成功读取的值。" : all === null ? "读取租户的当前状态与授权范围。" : `当前共有 ${fmtInt(all.length)} 个租户，${count("pending")} 个待审核。`}
-        description="客户经租户门户自助注册后在这里审核；批准前它不能自行创建密钥，名下的密钥也都不可用。停用租户会让它的全部密钥立即失效，恢复后重新可用。"
+        dataLead={selected ? <span className="tenant-identity"><span>{selected}</span>{detail && <><TenantStatus status={detail.status} /><RolloutBadge rollout={detail.rollout} />{detail.is_internal && <span className="tag">平台内部</span>}</>}</span> : showDefaults ? "设置之后创建的租户使用的初始限额与分组。" : listError ? "租户列表读取失败；已有统计保留最近成功读取的值。" : all === null ? "读取租户的当前状态与授权范围。" : `当前共有 ${fmtInt(all.length)} 个租户，${count("pending")} 个待审核。`}
+        description={selected ? undefined : "客户经租户门户自助注册后在这里审核；批准前它不能自行创建密钥，名下的密钥也都不可用。停用租户会让它的全部密钥立即失效，恢复后重新可用。"}
         actions={
           <>
             <Button type="button" icon="refresh" onClick={refreshAll}>
               刷新
             </Button>
-            {selected && <Button type="button" onClick={closeDetail}>返回租户列表</Button>}
+            {selected && <Button type="button" onClick={closeDetail}>返回{source === "billing" ? "账户列表" : source === "pricing" ? "租户方案" : "租户列表"}</Button>}
             {!selected && operator.role === "admin" && (
               <Button type="button" aria-expanded={showDefaults} onClick={() => setShowDefaults((open) => !open)}>
                 {showDefaults ? "返回租户列表" : "新租户默认值"}
@@ -481,7 +488,11 @@ export function Tenants({ operator, canEdit }: TabProps) {
         </section>
       )}
 
-      {showDefaults && operator.role === "admin" && <DefaultsPanel number={3} />}
+      {!selected && showDefaults && operator.role === "admin" && <DefaultsPanel number={3} />}
+
+      {selected && <nav className="tenant-hub-nav" aria-label="租户设置">
+        {TENANT_VIEWS.map((item) => <a key={item.id} href={tenantHash(selected, item.id, source)} aria-current={view === item.id ? "page" : undefined}>{item.label}</a>)}
+      </nav>}
 
       <div className="tenant-workspace">
         {!selected && !showDefaults && <div className="side-main min-w-0">
@@ -538,16 +549,7 @@ export function Tenants({ operator, canEdit }: TabProps) {
                       <tr key={t.id}>
                         <td>
                           <span className="flex min-w-0 items-center gap-2">
-                            <button
-                              type="button"
-                              ref={(node) => { if (node) tenantOpeners.current.set(t.id, node); else tenantOpeners.current.delete(t.id); }}
-                              className="link-button tn-name"
-                              title={t.name}
-                              aria-expanded={selected === t.id}
-                              onClick={() => setSelected(t.id)}
-                            >
-                              {t.name}
-                            </button>
+                            <a className="link-button tn-name" title={t.name} href={tenantHash(t.id)}>{t.name}</a>
                             {t.is_internal && <span className="tag">平台内部</span>}
                           </span>
                         </td>
@@ -622,11 +624,16 @@ export function Tenants({ operator, canEdit }: TabProps) {
             tenant={detail}
             canEdit={canEdit}
             tick={tick}
-            number={showDefaults && operator.role === "admin" ? 5 : 4}
+            view={view}
+            openDiscount={routeQuery?.get("action") === "new-discount"}
+            isAdmin={operator.role === "admin"}
+            onGoto={onGoto}
             onView={settle}
             onRefresh={() => void refresh(detail.id)}
             onReload={() => void loadDetail(detail.id)}
-            onClose={closeDetail}
+            onAct={(run) => void act(detail, run)}
+            acting={acting === detail.id}
+            actionError={rowError?.id === detail.id ? rowError.error : null}
           />
         )}
       </div>
@@ -645,138 +652,98 @@ interface PartProps {
 }
 
 function TenantDetail({
-  tenant,
-  canEdit,
-  tick,
-  onView,
-  onRefresh,
-  onReload,
-  onClose,
+  tenant, canEdit, tick, view, openDiscount, isAdmin, onGoto, onView, onRefresh, onReload, onAct, acting, actionError,
 }: {
   tenant: Tenant;
   canEdit: boolean;
-  /** Changes when the operator asks for everything to be read again. */
   tick: number;
-  number: number;
+  view: TenantView;
+  openDiscount: boolean;
+  isAdmin: boolean;
+  onGoto: TabProps["onGoto"];
   onView: (view: Tenant) => void;
   onRefresh: () => void;
   onReload: () => void;
-  onClose: () => void;
+  onAct: (run: (id: string) => Promise<Tenant>) => void;
+  acting: boolean;
+  actionError: unknown;
 }) {
-  // Read again with every version of the tenant: a grant made elsewhere can
-  // name a model created after the last read.
+  // 各读取独立发起；保存仍按当前租户版本校验冲突。
   const catalog = useLoad(() => resources.list<ModelDoc>("models"), [tenant.version, tick]);
-  // The public models, live and retired: the live ones are what the all scope
-  // covers, since a retired model's documents are gone.
   const publics = useLoad<PublicModel[]>(() => publicModels.list(), [tenant.version, tick]);
   const groups = useLoad(() => groupsApi.list(), [tick]);
-  // Every model a group can price, with its baseline: a granted model with
-  // none is a call nobody can bill yet.
   const prices = useLoad(() => groupPrices.list(), [tick]);
   const members = useLoad(() => tenants.members(tenant.id), [tenant.id, tick]);
-  // Every change to the tenant's row can change what its keys are given.
   const keyList = useLoad(() => tenants.keys(tenant.id), [tenant.id, tenant.version, tick]);
-
-  const save = useCallback(
-    async (changes: TenantChanges) => {
-      const view = await tenants.update(tenant.id, changes, tenant.version);
-      onView(view);
-      return view;
-    },
-    [tenant.id, tenant.version, onView],
-  );
-
-  const choices = useMemo(
-    () => groupChoices(groups.data, tenant.allowed_provider_groups),
-    [groups.data, tenant.allowed_provider_groups],
-  );
-  const priced = useMemo(
-    () =>
-      prices.data === null
-        ? null
-        : new Set((prices.data ?? []).filter((r) => r.baseline.current !== null).map((r) => r.model_id)),
-    [prices.data],
-  );
+  const save = useCallback(async (changes: TenantChanges) => {
+    const result = await tenants.update(tenant.id, changes, tenant.version);
+    onView(result);
+    return result;
+  }, [tenant.id, tenant.version, onView]);
+  const choices = useMemo(() => groupChoices(groups.data, tenant.allowed_provider_groups), [groups.data, tenant.allowed_provider_groups]);
+  const priced = useMemo(() => prices.data === null ? null : new Set(prices.data.filter((row) => row.baseline.current !== null).map((row) => row.model_id)), [prices.data]);
   const part = { tenant, canEdit, save, onReload };
 
-  return (
-    <SidePanel
-      title={<span title={tenant.name}>{tenant.name}</span>}
-      label={`租户详情：${tenant.name}`}
-      extra={<RolloutBadge rollout={tenant.rollout} />}
-      onClose={onClose}
-    >
-      <dl className="tn-strip">
-        <div>
-          <dt>状态</dt>
-          <dd>
-            <TenantStatus status={tenant.status} />
-          </dd>
+  return <section className="tenant-hub-content" aria-label={`租户详情：${tenant.name}`}>
+    {view === "basic" && <>
+      <section className="tenant-basics" aria-label="基本信息">
+        <div className="tenant-section-heading"><h2>基本信息</h2>
+          {canEdit && <div className="tn-actions">
+            {tenant.status === "pending" && <Button size="sm" busy={acting} busyLabel="批准中…" onClick={() => onAct(tenants.approve)}>批准租户</Button>}
+            {tenant.status === "active" && !tenant.is_internal && <TwoStep label="停用租户" size="sm" busy={acting} warning="停用后该租户的全部密钥立即失效。" onConfirm={() => onAct(tenants.suspend)} />}
+            {tenant.status === "suspended" && <Button size="sm" busy={acting} busyLabel="恢复中…" onClick={() => onAct(tenants.reactivate)}>恢复租户</Button>}
+          </div>}
         </div>
-        <div>
-          <dt>计费方式</dt>
-          <dd>{BILLING_LABEL[tenant.billing_mode] ?? tenant.billing_mode}</dd>
-        </div>
-        <div>
-          <dt>成员</dt>
-          <dd className="tabular">{fmtInt(tenant.member_count)}</dd>
-        </div>
-        <div>
-          <dt>密钥</dt>
-          <dd className="tabular">{fmtInt(tenant.key_count)}</dd>
-        </div>
-      </dl>
-      {tenant.is_internal && <p className="hint mt-3 text-caption">平台内部租户：它的密钥是运维密钥，没有成员</p>}
-
-      <GrantsPart
-        {...part}
-        catalog={catalog.data}
-        catalogError={catalog.error}
-        publics={publics.data?.filter((p: PublicModel) => p.retired_at === null).map((p: PublicModel) => p.id) ?? null}
-        publicsError={publics.error}
-        onReloadPublics={() => void publics.reload()}
-        priced={priced}
-      />
-      <GroupsPart
-        {...part}
-        choices={choices}
-        groupsError={groups.error}
-        keys={keyList.data}
-        keysError={keyList.error}
-        onReloadKeys={() => void keyList.reload()}
-      />
+        <dl className="tenant-basic-facts">
+          <div><dt>租户名称</dt><dd>{tenant.name}</dd></div>
+          <div><dt>租户 ID</dt><dd>{tenant.id}</dd></div>
+          <div><dt>状态</dt><dd><TenantStatus status={tenant.status} /></dd></div>
+          <div><dt>计费方式</dt><dd>{BILLING_LABEL[tenant.billing_mode] ?? tenant.billing_mode}</dd></div>
+          <div><dt>成员 / 密钥</dt><dd>{fmtInt(tenant.member_count)} / {fmtInt(tenant.key_count)}</dd></div>
+          <div><dt>创建时间</dt><dd>{fmtTime(tenant.created_at)}</dd></div>
+          <div><dt>批准时间</dt><dd>{tenant.approved_at ? fmtTime(tenant.approved_at) : "尚未批准"}</dd></div>
+          <div><dt>配置下发</dt><dd><RolloutBadge rollout={tenant.rollout} /></dd></div>
+        </dl>
+        {tenant.is_internal && <p className="hint">平台内部租户的密钥是运维密钥，没有成员。</p>}
+        {actionError != null && <Failure error={actionError} />}
+      </section>
       <LimitsPart {...part} />
+    </>}
+    {view === "access" && <>
+      <GrantsPart {...part} catalog={catalog.data} catalogError={catalog.error} publics={publics.data?.filter((model) => model.retired_at === null).map((model) => model.id) ?? null} publicsError={publics.error} onReloadPublics={() => void publics.reload()} priced={priced} />
+      <GroupsPart {...part} choices={choices} groupsError={groups.error} keys={keyList.data} keysError={keyList.error} onReloadKeys={() => void keyList.reload()} />
+    </>}
+    {view === "members" && (tenant.is_internal ? <EmptyState text="平台内部租户没有成员。" /> : <>
+      <MembersPart tenantId={tenant.id} members={members.data} error={members.error} canEdit={canEdit} onChanged={(member) => {
+        members.setData((list) => list && list.map((item) => item.id === member.id ? member : item));
+        void keyList.reload();
+        onRefresh();
+      }} />
+      {canEdit && <InvitePart tenant={tenant} />}
+    </>)}
+    {view === "keys" && <KeysPart tenant={tenant} keys={keyList.data} error={keyList.error} members={members.data} choices={choices} canEdit={canEdit} onSaved={(key) => {
+      keyList.setData((list) => list && list.map((item) => item.id === key.id ? key : item));
+      onRefresh();
+    }} onReload={() => void keyList.reload()} />}
+    {(view === "billing" || view === "quotas" || view === "activity") && <TenantBilling key={tenant.id} tenantId={tenant.id} view={view} tick={tick} canEdit={canEdit} isAdmin={isAdmin} onGoto={onGoto} onTenantChanged={onReload} />}
+    {view === "discounts" && <Suspense fallback={<Loading />}><TenantDiscountSettings tenant={{ tenant_id: tenant.id, tenant_name: tenant.name }} canEdit={canEdit} refresh={tick} openCreate={openDiscount} /></Suspense>}
+  </section>;
+}
 
-      {!tenant.is_internal && (
-        <MembersPart
-          tenantId={tenant.id}
-          members={members.data}
-          error={members.error}
-          canEdit={canEdit}
-          onChanged={(m) => {
-            members.setData((list) => list && list.map((x) => (x.id === m.id ? m : x)));
-            void keyList.reload();
-            onRefresh();
-          }}
-        />
-      )}
-      {!tenant.is_internal && canEdit && <InvitePart tenant={tenant} />}
-
-      <KeysPart
-        tenant={tenant}
-        keys={keyList.data}
-        error={keyList.error}
-        members={members.data}
-        choices={choices}
-        canEdit={canEdit}
-        onSaved={(k) => {
-          keyList.setData((list) => list && list.map((x) => (x.id === k.id ? k : x)));
-          onRefresh();
-        }}
-        onReload={() => void keyList.reload()}
-      />
-    </SidePanel>
-  );
+function TenantBilling({ tenantId, view, tick, canEdit, isAdmin, onGoto, onTenantChanged }: {
+  tenantId: string;
+  view: "billing" | "quotas" | "activity";
+  tick: number;
+  canEdit: boolean;
+  isAdmin: boolean;
+  onGoto: TabProps["onGoto"];
+  onTenantChanged: () => void;
+}) {
+  const account = useLoad(() => billing.account(tenantId), [tenantId, tick]);
+  return <>
+    {account.error && <div className="note crit" role="alert">{account.error} <Button size="sm" onClick={() => void account.reload()}>重试</Button></div>}
+    {account.data ? <AccountPanel account={account.data} view={view} canEdit={canEdit} isAdmin={isAdmin} onGoto={onGoto} onChanged={(next) => { account.setData(next); onTenantChanged(); }} /> : !account.error && <Loading />}
+  </>;
 }
 
 /** One choice in a list of checkboxes, with a note beside it and its refusal under it. */

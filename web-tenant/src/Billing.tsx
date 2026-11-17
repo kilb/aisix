@@ -34,6 +34,7 @@ import { BentoGrid, Card, CardHeader, Metric, PageHeader, span } from "./compone
 import { TrendChart } from "./components/charts";
 import { exactInteger, normalizeExactValues } from "./lib/chartFormat";
 import { cn } from "./lib/cn";
+import "./Billing.css";
 
 function failure(e: unknown): string {
   return e instanceof ApiError ? messageFor(e) : String(e);
@@ -52,9 +53,9 @@ const REFERENCE_MAX = 128;
 /** One figure of the balance: its label over the amount, a tile of the card's grid. */
 function Reading({ label, value, hero = false }: { label: string; value: ReactNode; hero?: boolean }) {
   return (
-    <div className={cn("entry min-w-0 billing-reading", !hero && "rounded-tile bg-tint p-4")}>
+    <div className={cn("min-w-0 billing-reading", hero ? "billing-reading-primary" : "rounded-tile bg-tint p-4")}>
       <span className="text-small font-semibold text-fg-2">{label}</span>
-      <div className="val"><Metric size={hero ? "display" : "value"} className="mt-2 whitespace-normal break-all text-fg">{value}</Metric></div>
+      <Metric size={hero ? "display" : "value"} className="mt-2 text-fg">{value}</Metric>
     </div>
   );
 }
@@ -219,7 +220,7 @@ function BalanceCalculation({ balance }: { balance: Balance }) {
   const [topups, usage, adjustments, total] = values;
   const matches = topups == null || usage == null || adjustments == null || total == null ? null : topups - usage + adjustments === total;
   return (
-    <section aria-label="余额计算" className="grid gap-2 border-t border-hairline pt-4 text-small text-fg-2">
+    <section aria-label="余额计算" className="billing-calculation grid gap-2 border-t border-hairline pt-4 text-small text-fg-2">
       <h3 className="text-title text-fg">余额计算</h3>
       <p className="break-words tabular">累计到账 {moneyText(f.topups_micro_cny)} − 原始扣费 {moneyText(f.usage_micro_cny)} + 余额调整（{moneyText(f.adjustments_micro_cny)}）{matches ? " = " : "；账户余额 "}{moneyText(f.balance_micro_cny)}</p>
       {matches === false && <p className="note crit" role="alert">流水合计与账户余额不一致，请联系管理员核对。</p>}
@@ -623,7 +624,7 @@ function TopupList({ reloadKey, onLoaded }: { reloadKey: number; onLoaded: (item
       {!records.loaded && !err && <Loading />}
       {records.loaded && items.length === 0 && !err && <EmptyState text={records.query ? "已加载记录中没有匹配的充值记录" : "所选范围内没有充值记录"} mark="route" />}
       {items.length > 0 && (
-        <DataTable label="充值记录" tableClassName="table-fixed min-w-[64rem]">
+        <DataTable label="充值记录" tableClassName="billing-topups-table">
           <colgroup><col className="w-32" /><col className="w-28" /><col className="w-28" /><col className="w-32" /><col className="w-36" /><col className="w-36" /><col /></colgroup>
           <thead>
             <tr>
@@ -767,7 +768,7 @@ function Ledger({ topups }: { topups: Topup[] | null }) {
         {!records.loaded && range && <Loading />}
         {records.loaded && rows.length === 0 && !err && <EmptyState text={records.query ? "已加载记录中没有匹配的流水" : "所选范围内没有流水"} mark="route" />}
         {rows.length > 0 && (
-          <DataTable label="余额流水" tableClassName="table-fixed min-w-[64rem]">
+          <DataTable label="余额流水" tableClassName="billing-ledger-table">
             <colgroup><col className="w-36" /><col className="w-20" /><col className="w-32" /><col className="w-32" /><col className="w-64" /><col /></colgroup>
             <thead>
               <tr>
@@ -791,10 +792,10 @@ function Ledger({ topups }: { topups: Topup[] | null }) {
                     <Money micro={r.calculation.after_micro_cny} />
                   </td>
                   <td className="tabular" data-label="本笔余额计算">
-                    {fmtMicroCny(r.calculation.before_micro_cny)} +（{fmtMicroCny(r.calculation.amount_micro_cny)}）= <Money micro={r.calculation.after_micro_cny} />
+                    <span className="billing-ledger-formula"><span>{fmtMicroCny(r.calculation.before_micro_cny)}</span><span>+（{fmtMicroCny(r.calculation.amount_micro_cny)}）</span><span>= <Money micro={r.calculation.after_micro_cny} /></span></span>
                   </td>
                   <td data-label="说明">
-                    <span className="trunc" title={explain(r)}>
+                    <span className="billing-ledger-description">
                       {explain(r)}
                     </span>
                   </td>

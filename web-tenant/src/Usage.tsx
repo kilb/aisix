@@ -182,11 +182,6 @@ function CallTokens({ call }: { call: Call }) {
 function CallLogRow({ call: c, onDetails }: { call: Call; onDetails: (trigger: HTMLButtonElement) => void }) {
   return <tr>
     <td className="tabular usage-call-time" data-label="时间"><time dateTime={c.occurred_at}><span>{fmtBeijing(c.occurred_at).split(" ")[0]}</span><span>{fmtBeijing(c.occurred_at).split(" ")[1] ?? "—"}</span></time></td>
-    <td className="usage-row-action">
-      <Button kind="quiet" size="sm" aria-haspopup="dialog" aria-label="查看调用详情" title="查看调用详情" className="tenant-icon-action" onClick={event => onDetails(event.currentTarget)}>
-        <ChevronRight aria-hidden="true" />
-      </Button>
-    </td>
     <td data-label="请求类型">{c.stream === true ? "流" : c.stream === false ? "非流" : "未知"}</td>
     <td data-label="模型 / 请求" className="usage-request-identity">
       <strong>{c.model.name || "—"}</strong>
@@ -197,13 +192,18 @@ function CallLogRow({ call: c, onDetails }: { call: Call; onDetails: (trigger: H
       <CallStatusLamp call={c} />
       <span className="cell-note">分组 {c.charge.group ? c.charge.group.display_name : "—"}</span>
     </td>
-    <td className="num" data-label="响应性能"><UsagePerformance data={c} /></td>
-    <td className="num tenant-call-usage" data-label="Token 消耗">
+    <td data-label="响应性能"><UsagePerformance data={c} /></td>
+    <td className="tenant-call-usage" data-label="Token 消耗">
       <CallTokens call={c} />
       {c.usage_estimated === true && <span className="cell-note">含网关估算用量</span>}
       <UsageTokenEstimate data={c} />
     </td>
     <td className="num" data-label="费用">{chargeText(c)}</td>
+    <td className="usage-row-action">
+      <Button kind="quiet" size="sm" aria-haspopup="dialog" aria-label="查看调用详情" title="查看调用详情" className="tenant-icon-action" onClick={event => onDetails(event.currentTarget)}>
+        <ChevronRight aria-hidden="true" />
+      </Button>
+    </td>
   </tr>;
 }
 
@@ -345,13 +345,11 @@ function Quantities({ q }: { q: Record<string, number> | null }) {
   });
   if (names.length === 0) return <>—</>;
   return (
-    <span className="usage-qty">
+    <dl className="usage-summary-quantities-list">
       {names.map((d) => (
-        <span key={d}>
-          {dimensionLabel(d)} {q[d]}
-        </span>
+        <div key={d}><dt>{dimensionLabel(d)}</dt><dd>{q[d]}</dd></div>
       ))}
-    </span>
+    </dl>
   );
 }
 
@@ -485,11 +483,11 @@ function Summary({ keys, showKeys, ownScope, models }: { keys: TenantKey[]; show
               {table.rows.map((r) => (
                 <tr key={`${r.period_start}/${r.model.id ?? r.model.name}`}>
                   <td className="tabular" data-label="期间">{periodLabel(r.period_start, group)}</td>
-                  <td data-label="模型">{summaryModel(r)}</td>
+                  <td data-label="模型" className="usage-summary-model-name">{summaryModel(r)}</td>
                   <td className="num" data-label="调用次数">{r.requests}</td>
                   <td className="num" data-label="费用">
-                    {Number.isSafeInteger(r.charged_micro_cny) ? fmtMicroCny(r.charged_micro_cny) : "未知"}
-                    {r.estimated_requests > 0 ? "（含估算）" : ""}
+                    <span className="usage-summary-amount">{Number.isSafeInteger(r.charged_micro_cny) ? fmtMicroCny(r.charged_micro_cny) : "未知"}</span>
+                    {r.estimated_requests > 0 && <span className="cell-note">含估算用量</span>}
                   </td>
                   <td data-label="计量">
                     <Quantities q={r.quantities} />
@@ -639,12 +637,18 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
         <Field label="请求 ID">
           <input autoComplete="off" value={typed} onChange={(e) => { setTyped(e.target.value); setRequestEditing(true); }} />
         </Field>
+        <Field label="搜索已加载调用">
+          <input type="search" value={searchQuery} onChange={event => update({ q: event.target.value })} placeholder="模型、密钥、成员或请求 ID" />
+        </Field>
       </UsageRecordFilters>
-      <RecordTableToolbar search={{ value: searchQuery, onChange: value => update({ q: value }), label: "搜索已加载调用", placeholder: "模型、密钥、成员或请求 ID" }} />
       {query.get("member_id") && <p className="hint" role="status">已按成员 {query.get("member_id")} 筛选。</p>}
-      <p className="hint">文字搜索仅筛选已加载记录；调用结果与更多筛选作用于全部匹配记录。</p>
-      <p className="hint">首字仅显示实测值；输出 TPS 为输出 Token（含推理，不含输入）÷ 完整上游耗时。含估算用量时标为 ≈，仅供参考；用量标记无法区分输入或输出估算。无有效指标或旧记录未采集时显示 —，不以其它指标代替。</p>
-      <p className="mt-4 text-caption text-fg-3">调用记录按计费尝试逐条展示，同一请求可能有多条记录。{rows !== null ? `已加载 ${rows.length.toLocaleString("en-US")} 条${next !== null ? "，还有更多记录" : ""}；这些记录不代表整个汇总窗口的成功率或延迟分布。` : ""}</p>
+      <details className="usage-summary-notes usage-call-notes">
+        <summary>筛选、性能与计费口径</summary>
+        <p>文字搜索仅筛选已加载记录；调用结果与更多筛选作用于全部匹配记录。</p>
+        <p>首字仅显示实测值；输出 TPS 为输出 Token（含推理，不含输入）÷ 完整上游耗时。含估算用量时标为 ≈，仅供参考；用量标记无法区分输入或输出估算。无有效指标或旧记录未采集时显示 —，不以其它指标代替。</p>
+        <p>调用记录按计费尝试逐条展示，同一请求可能有多条记录；已加载记录不代表整个汇总窗口的成功率或延迟分布。</p>
+      </details>
+      {rows !== null && <p className="hint">已加载 {rows.length.toLocaleString("en-US")} 条{next !== null ? "，还有更多记录" : ""}</p>}
       {err && (
         <div className="note crit" role="alert">
           {err}
@@ -654,17 +658,17 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
       {rows !== null && rows.length === 0 && !err && <CardMessage>所选条件下没有调用记录</CardMessage>}
       {rows !== null && rows.length > 0 && (
         <DataTable label="调用记录" className="tenant-call-table">
-          <colgroup><col className="usage-column-time" /><col className="usage-column-action" /><col className="usage-column-type" /><col className="usage-column-request" /><col className="usage-column-state" /><col className="usage-column-timing" /><col className="usage-column-tokens" /><col className="usage-column-charge" /></colgroup>
+          <colgroup><col className="usage-column-time" /><col className="usage-column-type" /><col className="usage-column-request" /><col className="usage-column-state" /><col className="usage-column-timing" /><col className="usage-column-tokens" /><col className="usage-column-charge" /><col className="usage-column-action" /></colgroup>
           <thead>
             <tr>
               <th>时间</th>
-              <th><span className="vh">明细</span></th>
               <th>请求类型</th>
               <th>模型 / 请求</th>
               <th>状态</th>
-              <th className="num">响应性能</th>
-              <th className="num">Token 消耗</th>
+              <th>响应性能</th>
+              <th>Token 消耗</th>
               <th className="num">费用</th>
+              <th><span className="vh">明细</span></th>
             </tr>
           </thead>
           <tbody>

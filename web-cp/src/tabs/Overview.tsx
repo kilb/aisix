@@ -5,6 +5,7 @@ import { environment, pricingStatus, rollout, type Environment, type PricingStat
 import { errorText, fmtInt } from "../lib/fmt";
 import { statusView } from "../lib/pricingStatus";
 import { Button } from "../ui/Button";
+import { ChevronRight } from "lucide-react";
 import { BentoGrid, Card, CardFooter, CardHeader, CardMessage, Metric, MetricSkeleton, PageHeader, span } from "../components/page";
 import { RankBars } from "../components/charts";
 import { ApiMetricsPanel } from "../components/ApiMetricsPanel";
@@ -215,7 +216,7 @@ export function Overview({ operator, onGoto }: TabProps) {
         </Card>
 
         <Card className={span.d5} aria-label="计价异常">
-          <CardHeader number={5} title="未计价调用 · 最近 24 小时" actions={<Button size="sm" onClick={() => onGoto("pricing", "status")}>去「价格 · 计价状态」</Button>} />
+          <CardHeader number={5} title="未计价调用 · 最近 24 小时" actions={<a className="overview-detail-link" href="#pricing?section=status">计价状态<ChevronRight size={16} aria-hidden="true" /></a>} />
           {pricingView ? <Metric size="figure">{fmtInt(pricingView.unpricedTotal)}</Metric> : pricingError ? <CardMessage onRetry={() => void readPricing()}>读取计价状态失败：{pricingError}</CardMessage> : <MetricSkeleton />}
           {pricingView && (
             <CardFooter>

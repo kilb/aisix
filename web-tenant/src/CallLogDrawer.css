@@ -14,12 +14,12 @@
 .tenant-call-section dt { color: var(--fg-3); font-size: var(--fs-12); line-height: 1.5; }
 .tenant-call-section dd { margin-top: 4px; color: var(--fg); font-size: var(--fs-13); line-height: 1.5; font-variant-numeric: tabular-nums; }
 .tenant-call-facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin: 0; }
-.tenant-call-facts > div { min-width: 0; padding: 12px; border-radius: var(--r-input); background: var(--tint); }
+.tenant-call-facts > div { min-width: 0; padding: 8px 0; border-bottom: 1px solid var(--hairline); }
 .tenant-call-facts > div:first-child { grid-column: 1 / -1; }
 .tenant-call-facts code { font-size: var(--fs-12); }
-.tenant-call-drawer .usage-performance { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; width: 100%; max-width: none; text-align: left; }
-.tenant-call-drawer .usage-performance > div { display: block; padding: 12px; border-radius: var(--r-input); background: var(--tint); }
-.tenant-call-drawer .usage-performance dd { margin-top: 6px; font-size: var(--fs-20); font-weight: 700; }
+.tenant-call-drawer .usage-performance { display: flex; flex-wrap: wrap; gap: 8px 28px; width: 100%; max-width: none; text-align: left; }
+.tenant-call-drawer .usage-performance > div { display: inline-flex; align-items: baseline; gap: 6px; white-space: nowrap; }
+.tenant-call-drawer .usage-performance dd { margin: 0; font-size: var(--fs-16); font-weight: 600; }
 .tenant-call-drawer .tenant-call-tokens { max-width: 420px; }
 .tenant-call-drawer .dt-wrap { --dt-edge: 0px; max-width: 100%; margin-top: 12px; }
 .tenant-call-drawer .dt { table-layout: fixed; width: 100%; }
@@ -33,9 +33,7 @@
   .tenant-call-drawer-header { padding: 16px; }
   .tenant-call-drawer-body { padding: 0 16px 16px; }
   .tenant-call-facts { gap: 8px; }
-  .tenant-call-drawer .usage-performance { grid-template-columns: minmax(0, 1fr); gap: 8px; }
-  .tenant-call-drawer .usage-performance > div { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
-  .tenant-call-drawer .usage-performance dd { margin: 0; }
+  .tenant-call-drawer .usage-performance { gap: 8px 20px; }
   .tenant-call-drawer .dt :is(td, th) { padding-inline: 4px; font-size: var(--fs-12); }
 }
 @media (prefers-reduced-motion: reduce) { .tenant-call-drawer { animation: none; } }

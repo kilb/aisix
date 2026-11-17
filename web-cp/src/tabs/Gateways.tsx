@@ -24,7 +24,7 @@ import { EmptyState } from "../ui/EmptyState";
 import { Lamp } from "../ui/Lamp";
 import { TwoStep } from "../ui/TwoStep";
 import { Card, CardHeader, PageHeader, Stat, StatGrid } from "../components/page";
-import { Plus } from "lucide-react";
+import { Plus, Trash2 } from "lucide-react";
 import { Select } from "../ui/Select";
 
 /** How often the instances are read again: about one gateway heartbeat. */
@@ -109,8 +109,11 @@ export function Gateways({ operator }: TabProps) {
 
   const [onlineFilter, setOnlineFilter] = useState("");
   const [versionFilter, setVersionFilter] = useState("");
-  const table = useRecordTable({ items: (instances ?? []).filter((i) => (!onlineFilter || (i.online ? "online" : "offline") === onlineFilter) && (!versionFilter || (i.version_matches_cp === null ? "unknown" : i.version_matches_cp ? "match" : "mismatch") === versionFilter)), searchText: (i) => [i.instance_id, i.hostname, i.credential_name, i.version], resetKey: `${onlineFilter}:${versionFilter}` });
-  const credentialTable = useRecordTable({ items: credentials ?? [], searchText: (c) => [c.dp_id, c.name, c.revoked_at ? "已吊销" : "未吊销"] });
+  // 实例接口按 first_seen_at 升序返回，反转后按首次注册时间倒序展示，不以心跳替代。
+  const newestInstances = [...(instances ?? [])].reverse();
+  const newestCredentials = [...(credentials ?? [])].sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
+  const table = useRecordTable({ items: newestInstances.filter((i) => (!onlineFilter || (i.online ? "online" : "offline") === onlineFilter) && (!versionFilter || (i.version_matches_cp === null ? "unknown" : i.version_matches_cp ? "match" : "mismatch") === versionFilter)), searchText: (i) => [i.instance_id, i.hostname, i.credential_name, i.version], resetKey: `${onlineFilter}:${versionFilter}` });
+  const credentialTable = useRecordTable({ items: newestCredentials, searchText: (c) => [c.dp_id, c.name, c.revoked_at ? "已吊销" : "未吊销"] });
   const online = instances?.filter((i) => i.online).length ?? 0;
   const skewed = instances?.filter((i) => i.version_matches_cp === false).length ?? 0;
   const valid = credentials?.filter((c) => !c.revoked_at).length ?? 0;
@@ -123,9 +126,8 @@ export function Gateways({ operator }: TabProps) {
         dataLead={instances ? <>已记录 {fmtInt(instances.length)} 个网关实例，其中 {fmtInt(online)} 个在线、{fmtInt(instances.length - online)} 个离线。</> : "查看网关的当前心跳、版本与连接凭据。"}
         actions={
           isAdmin && (
-            <Button kind="primary" onClick={() => setIssuing(true)}>
+            <Button kind="primary" iconOnly aria-label="签发网关凭据" title="签发网关凭据" onClick={() => setIssuing(true)}>
               <Plus aria-hidden />
-              签发网关凭据
             </Button>
           )
         }
@@ -140,11 +142,92 @@ export function Gateways({ operator }: TabProps) {
 
       {bundle && <Bundle bundle={bundle} onClose={() => setBundle(null)} />}
 
+      <Card className="gateways-list" aria-label="网关凭据">
+        <CardHeader
+          as="h2"
+          title={
+            <span className="inline-flex items-center gap-2">
+              网关凭据
+              {credentials && credentials.length > 0 && <span className="tag">{fmtInt(credentials.length)}</span>}
+            </span>
+          }
+          description="按签发时间倒序。网关凭据是控制面签发的客户端证书，网关凭它连接控制面。"
+        />
+        {isAdmin && <FormDialog open={issuing} onOpenChange={setIssuing} title="签发网关凭据" description="签发用于连接控制面的客户端证书，不会改变现有网关。">
+          <IssueForm
+            onCancel={() => setIssuing(false)}
+            onIssued={(b) => {
+              setIssuing(false);
+              setNote(null);
+              setBundle(b);
+              void readCredentials();
+            }}
+          />
+        </FormDialog>}
+        <Msg note={note} />
+        {credentialsError && (
+          <div className="note crit" role="alert">
+            读取失败：{credentialsError}
+          </div>
+        )}
+        {credentials === null ? (
+          !credentialsError && <Loading />
+        ) : credentials.length === 0 ? (
+          <EmptyState mark="gateway" text="还没有签发过网关凭据。" />
+        ) : (
+          <>
+            <RecordTools table={credentialTable} label="网关凭据" />
+            <DataTable label="网关凭据">
+              <thead>
+                <tr>
+                  <th>名称 / ID</th>
+                  <th>状态</th>
+                  <th>签发时间</th>
+                  <th>有效期至</th>
+                  <th><span className="sr-only">操作</span></th>
+                </tr>
+              </thead>
+              <tbody>
+                {credentialTable.rows.map((c) => (
+                  <tr key={c.dp_id}>
+                    <td>
+                      <strong className="ops-cell-main">{c.name}</strong>
+                      <code className="ops-cell-secondary" title={c.dp_id}>{c.dp_id}</code>
+                    </td>
+                    <td>
+                      {c.revoked_at ? (
+                        <><Lamp state="disabled">已吊销</Lamp><span className="ops-cell-secondary">{fmtTime(c.revoked_at)}</span></>
+                      ) : <Lamp state="applied">未吊销</Lamp>}
+                    </td>
+                    <td className="gateway-time-column text-fg-3"><time dateTime={c.created_at}>{fmtTime(c.created_at)}</time></td>
+                    <td className="text-fg-3">{fmtTime(c.not_after)}</td>
+                    <td className="right">
+                      {isAdmin && !c.revoked_at && (
+                        <TwoStep
+                          label="吊销"
+                          kind="quiet"
+                          icon={<Trash2 aria-hidden="true" />}
+                          size="sm"
+                          disabled={busy}
+                          busy={revoking === c.dp_id}
+                          warning={`吊销网关凭据「${c.name}」后，使用这份凭据的网关将被控制面拒绝连接，且无法恢复。`}
+                          onConfirm={() => void revoke(c)}
+                        />
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </DataTable>
+            <RecordPager table={credentialTable} label="网关凭据" />
+          </>
+        )}
+      </Card>
       <Card className="gateways-list" aria-label="网关实例">
         <CardHeader
           as="h2"
           title="网关实例"
-          description="每个发过心跳的网关进程一行。超过控制面设定的时间没有心跳即为离线。"
+          description="按首次注册时间倒序，每个发过心跳的网关进程一行。超过控制面设定的时间没有心跳即为离线。"
         />
         {instancesError && (
           <div className="note crit" role="alert">
@@ -194,83 +277,6 @@ export function Gateways({ operator }: TabProps) {
               </tbody>
             </DataTable>
             <RecordPager table={table} label="网关实例" />
-          </>
-        )}
-      </Card>
-      <Card className="gateways-list" aria-label="网关凭据">
-        <CardHeader
-          as="h2"
-          title={
-            <span className="inline-flex items-center gap-2">
-              网关凭据
-              {credentials && credentials.length > 0 && <span className="tag">{fmtInt(credentials.length)}</span>}
-            </span>
-          }
-          description="网关凭据是控制面签发的客户端证书，网关凭它连接控制面。"
-        />
-        {isAdmin && <FormDialog open={issuing} onOpenChange={setIssuing} title="签发网关凭据" description="签发用于连接控制面的客户端证书，不会改变现有网关。">
-          <IssueForm
-            onCancel={() => setIssuing(false)}
-            onIssued={(b) => {
-              setIssuing(false);
-              setNote(null);
-              setBundle(b);
-              void readCredentials();
-            }}
-          />
-        </FormDialog>}
-        <Msg note={note} />
-        {credentialsError && (
-          <div className="note crit" role="alert">
-            读取失败：{credentialsError}
-          </div>
-        )}
-        {credentials === null ? (
-          !credentialsError && <Loading />
-        ) : credentials.length === 0 ? (
-          <EmptyState mark="gateway" text="还没有签发过网关凭据。" />
-        ) : (
-          <>
-            <RecordTools table={credentialTable} label="网关凭据" />
-            <DataTable label="网关凭据">
-              <thead>
-                <tr>
-                  <th>名称 / ID</th>
-                  <th>状态</th>
-                  <th>有效期至</th>
-                  <th><span className="sr-only">操作</span></th>
-                </tr>
-              </thead>
-              <tbody>
-                {credentialTable.rows.map((c) => (
-                  <tr key={c.dp_id}>
-                    <td>
-                      <strong className="ops-cell-main">{c.name}</strong>
-                      <code className="ops-cell-secondary" title={c.dp_id}>{c.dp_id}</code>
-                    </td>
-                    <td>
-                      {c.revoked_at ? (
-                        <><Lamp state="disabled">已吊销</Lamp><span className="ops-cell-secondary">{fmtTime(c.revoked_at)}</span></>
-                      ) : <Lamp state="applied">未吊销</Lamp>}
-                    </td>
-                    <td className="text-fg-3">{fmtTime(c.not_after)}</td>
-                    <td className="right">
-                      {isAdmin && !c.revoked_at && (
-                        <TwoStep
-                          label="吊销"
-                          size="sm"
-                          disabled={busy}
-                          busy={revoking === c.dp_id}
-                          warning={`吊销网关凭据「${c.name}」后，使用这份凭据的网关将被控制面拒绝连接，且无法恢复。`}
-                          onConfirm={() => void revoke(c)}
-                        />
-                      )}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </DataTable>
-            <RecordPager table={credentialTable} label="网关凭据" />
           </>
         )}
       </Card>

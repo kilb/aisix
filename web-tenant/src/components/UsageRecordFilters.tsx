@@ -58,7 +58,7 @@ export function UsageRecordFilters({ value, onChange, scope, disabled = false, f
   const choose = (field: UsageRecordFilterKey, next: string) => onChange({ [field]: next });
   const clear = () => onChange(Object.fromEntries(visibleFields.map(field => [field, ""])) as Partial<UsageRecordFilterValues>);
   return <section className="usage-record-filters" aria-label="调用结果筛选">
-    <div className="usage-record-filter-primary">
+    <div className="usage-record-filter-primary" role="group" aria-label="调用筛选工具条" tabIndex={0}>
       {has("outcome") && <label className="usage-record-filter-outcome"><span id={`${id}-outcome-label`}>调用结果</span><Select size="compact" aria-labelledby={`${id}-outcome-label`} disabled={disabled} value={value.outcome} onValueChange={selectedValue => choose("outcome", selectedValue)}>
         <option value="">全部结果</option><option value="succeeded">成功</option><option value="failed">失败</option><option value="retried">已重试</option><option value="unknown">结果未知</option>
         {SelectedValue({ value: value.outcome, choices: ["succeeded", "failed", "retried", "unknown"] })}

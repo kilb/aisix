@@ -60,7 +60,15 @@ function KeyUsage({ keyId }: { keyId: string }) {
   }, [requestKey, keyId, from, to, rangeError]);
   const current = answer.key === requestKey ? answer : null;
   const table = useRecordTable({ items: current?.rows ?? [], resetKey: requestKey });
-  return <BentoGrid>
+  // 日期在当前页只出现一次，同日的每个模型仍各占一行。
+  const dateGroups = new Map<string, UsageSummaryRow[]>();
+  for (const row of table.rows) {
+    const label = row.model.id === null && row.model.name === "other" ? "跨期合并" : periodLabel(row.period_start, "day");
+    const rows = dateGroups.get(label);
+    if (rows) rows.push(row);
+    else dateGroups.set(label, [row]);
+  }
+  return <BentoGrid className="key-usage-detail">
     <Card className={span.d12} aria-label="密钥用量范围">
       <CardHeader title="用量明细" description="仅统计当前密钥。默认最近 30 个北京自然日，最多查询 92 天。" />
       <div className="usage-filters">
@@ -75,17 +83,18 @@ function KeyUsage({ keyId }: { keyId: string }) {
     <ApiMetricsPanel scope="tenant" enabled={!rangeError} from={from} to={to} bucket="day" apiKeyId={keyId} refreshKey={refresh} className={span.d12} />
     {!rangeError && <Card padding="table" className={span.d12} aria-label="密钥计量明细">
       <CardHeader title="按日与模型的计量明细" description="按用量发生时间汇总，包含已计费重试及历史费用调整。缺失记录显示未知，不视为免费或零用量。" />
-      {current?.error ? <CardMessage onRetry={() => setRefresh(value => value + 1)}>{current.error}</CardMessage> : current?.rows === null || !current ? <Loading /> : current.rows.length === 0 ? <CardMessage>所选范围内没有用量</CardMessage> : <DataTable label="密钥计量明细">
+      {current?.error ? <CardMessage onRetry={() => setRefresh(value => value + 1)}>{current.error}</CardMessage> : current?.rows === null || !current ? <Loading /> : current.rows.length === 0 ? <CardMessage>所选范围内没有用量</CardMessage> : <DataTable label="密钥计量明细" tableClassName="key-usage-table">
+        <colgroup><col className="key-usage-date-column" /><col className="key-usage-model-column" /><col className="key-usage-count-column" /><col className="key-usage-cost-column" /><col /></colgroup>
         <thead><tr><th>日期</th><th>模型</th><th className="num">调用尝试</th><th className="num">已计价费用</th><th>计量维度</th></tr></thead>
-        <tbody>{table.rows.map((row, index) => {
+        {[...dateGroups].map(([date, rows]) => <tbody key={date}>{rows.map((row, index) => {
           const amount = exactInteger(row.charged_micro_cny);
           const merged = row.model.id === null && row.model.name === "other";
           return <tr key={`${row.period_start}/${row.model.id ?? row.model.name}/${index}`}>
-            <td data-label="日期">{merged ? "跨期合并" : periodLabel(row.period_start, "day")}</td><td data-label="模型">{merged ? "其他（合并记录）" : row.model.name || "未授权或未知模型"}</td>
+            {index === 0 && <th scope="rowgroup" rowSpan={rows.length} className="key-usage-date" data-label="日期">{date}</th>}<td data-label="模型">{merged ? "其他（合并记录）" : row.model.name || "未授权或未知模型"}</td>
             <td className="num tabular" data-label="调用尝试">{formatCount(row.requests)}</td><td data-label="已计价费用" className="num tabular">{amount === null ? "未知" : fmtMicroCny(amount)}{row.estimated_requests > 0 ? "（含估算）" : ""}</td>
             <td data-label="计量维度"><KeyQuantities quantities={row.quantities} /></td>
           </tr>;
-        })}</tbody>
+        })}</tbody>)}
       </DataTable>}
       {current?.rows && !current.error && <RecordTablePager page={table.page} pageSize={table.pageSize} onPageChange={table.setPage} onPageSizeChange={table.setPageSize} total={table.filteredCount} label="密钥计量记录" />}
     </Card>}
@@ -166,7 +175,7 @@ export function KeyDetail({ keyId, onBack, member, status, onSelfChanged }: {
   return <>
     {header}
     {saved && <p className="note" role="status">密钥修改已保存</p>}
-    <Card className="mb-4" aria-label="密钥配置摘要">
+    <Card className="mb-4 key-config-summary" aria-label="密钥配置摘要">
       <CardHeader title="密钥配置" />
       <dl className="compact-overview-facts">
         <div><dt>公开前缀</dt><dd><code>{key.prefix}</code></dd></div>

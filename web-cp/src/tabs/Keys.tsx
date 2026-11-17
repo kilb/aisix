@@ -55,6 +55,7 @@ import { EmptyState } from "../ui/EmptyState";
 import { Lamp } from "../ui/Lamp";
 import { TwoStep } from "../ui/TwoStep";
 import { Select } from "../ui/Select";
+import { Layers, Power, PowerOff, Trash2 } from "lucide-react";
 
 /** The roles that manage every key of their tenant, and so may mint one for someone else. */
 const MANAGERS: Member["role"][] = ["owner", "admin"];
@@ -89,13 +90,13 @@ export function Keys({ canEdit }: TabProps) {
           <Button
             type="button"
             icon="refresh"
+            aria-label="刷新密钥"
+            title="刷新密钥"
             onClick={() => {
               void list.reload();
               setTick((n) => n + 1);
             }}
-          >
-            刷新
-          </Button>
+          />
         }
       />
       <div className="keys-scope">
@@ -275,7 +276,7 @@ function TenantKeys({ tenantId, canEdit, tick }: { tenantId: string; canEdit: bo
     );
   }
 
-  const columns = canEdit ? 7 : 6;
+  const columns = canEdit ? 8 : 7;
   const keys = keyList.data;
   const snapshotTime = Date.now();
   const live = keys?.filter((k) => !k.effective_disabled && !(k.expires_at !== null && Date.parse(k.expires_at) <= snapshotTime));
@@ -326,11 +327,11 @@ function TenantKeys({ tenantId, canEdit, tick }: { tenantId: string; canEdit: bo
                   size="sm"
                   type="button"
                   icon="plus"
+                  aria-label="新建密钥"
+                  title="新建密钥"
                   aria-expanded={creating}
                   onClick={() => { setMinted(null); setCreating(true); }}
-                >
-                  新建密钥
-                </Button>
+                />
               )
             }
           />
@@ -365,26 +366,29 @@ function TenantKeys({ tenantId, canEdit, tick }: { tenantId: string; canEdit: bo
               <DataTable label="密钥列表">
                 <thead>
                   <tr>
-                    <th>名称 / 前缀</th>
-                    <th className="side-opt">成员</th>
-                    <th>模型</th>
+                    <th className="key-identity-column">名称 / 密钥</th>
+                    <th className="key-owner-column">归属 / 创建者</th>
+                    <th className="key-model-column">模型</th>
                     <th>分组</th>
-                    <th className="side-opt">限额</th>
+                    <th className="key-limit-column">限额</th>
                     <th>状态</th>
-                    {canEdit && <th className="right">操作</th>}
+                    <th className="key-created-column">创建时间</th>
+                    {canEdit && <th className="key-actions-column right">操作</th>}
                   </tr>
                 </thead>
                 <tbody>
                   {table.rows.map((k) => (
                     <Fragment key={k.id}>
                       <tr>
-                        <td><span className="ops-cell-main">{k.label}</span>
-                          <KeySecretCell k={k} tenant={tenant} onError={setPlaintextError} />
+                        <td className="key-identity-column"><span className="ops-cell-main key-name">{k.label}</span>
+                          <div className="key-secret-line"><KeySecretCell k={k} tenant={tenant} onError={setPlaintextError} /></div>
+                        </td>
+                        <td className="key-owner-column">
+                          <span className="ops-cell-main">{ownerOf(k, tenant, members.data)}</span>
                           <span className="ops-cell-secondary">创建者：<Creator k={k} members={members.data} /></span>
                         </td>
-                        <td className="side-opt text-fg-2">{ownerOf(k, tenant, members.data)}</td>
-                        <td>
-                          <span className="block max-w-[280px] truncate" title={modelsOf(k, tenant, names)}>
+                        <td className="key-model-column">
+                          <span className="key-models" title={modelsOf(k, tenant, names)}>
                             {modelsOf(k, tenant, names)}
                           </span>
                         </td>
@@ -392,12 +396,13 @@ function TenantKeys({ tenantId, canEdit, tick }: { tenantId: string; canEdit: bo
                           <KeyGroupCell k={k} />
                           <StrayNote k={k} tenant={tenant} />
                         </td>
-                        <td className="side-opt text-fg-2">{limitsOf(k)}</td>
+                        <td className="key-limit-column text-fg-2">{limitsOf(k)}</td>
                         <td>
                           <Status k={k} tenant={tenant} members={members.data} />
                         </td>
+                        <td className="key-created-column text-fg-3"><time dateTime={k.created_at}>{fmtTime(k.created_at)}</time></td>
                         {canEdit && (
-                          <td className="right">
+                          <td className="key-actions-column right">
                             <KeyActions
                               k={k}
                               editing={editing === k.id}
@@ -445,13 +450,7 @@ function TenantKeys({ tenantId, canEdit, tick }: { tenantId: string; canEdit: bo
   );
 }
 
-/**
- * A key's prefix, and, for the platform's own tenant, its plaintext: `复制`
- * reveals and copies it, and `显示` puts it in place of the prefix. A
- * customer tenant's key shows the prefix alone: operators mint the platform's
- * own keys and must be able to copy one again, while a customer's key is the
- * customer's to reveal in its own portal.
- */
+/** 平台内部密钥保留前缀与复制；客户租户的明文只由其门户提供。 */
 function KeySecretCell({
   k,
   tenant,
@@ -518,21 +517,27 @@ function KeyActions({
 
   return (
     <>
-      <div className="tn-actions justify-end">
+      <div className="tn-actions ops-table-actions key-row-actions">
         {k.disabled ? (
           <Button
             type="button"
             size="sm"
+            kind="quiet"
+            iconOnly
+            aria-label="启用"
+            title="启用"
             disabled={busy}
             busy={acting === "switch"}
             busyLabel="启用"
             onClick={() => void setDisabled(false)}
           >
-            启用
+            <Power aria-hidden="true" />
           </Button>
         ) : (
           <TwoStep
             label="停用"
+            kind="quiet"
+            icon={<PowerOff aria-hidden="true" />}
             size="sm"
             disabled={busy}
             busy={acting === "switch"}
@@ -542,12 +547,14 @@ function KeyActions({
         )}
         {/* A legacy key minted without a group takes one once; one that has a group never changes it. */}
         {k.group === null && (
-          <Button type="button" size="sm" aria-expanded={editing} onClick={onEdit}>
-            选择分组
+          <Button type="button" size="sm" kind="quiet" iconOnly aria-label="选择分组" title="选择分组" aria-expanded={editing} disabled={busy} onClick={onEdit}>
+            <Layers aria-hidden="true" />
           </Button>
         )}
         <TwoStep
           label="吊销"
+          kind="quiet"
+          icon={<Trash2 aria-hidden="true" />}
           size="sm"
           disabled={busy}
           busy={acting === "revoke"}

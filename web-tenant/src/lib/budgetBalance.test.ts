@@ -23,6 +23,7 @@ const compiled = await build({
     sourcefile: "budget-balance-component.ts",
   },
   bundle: true,
+  loader: { ".css": "empty" },
   platform: "node",
   format: "cjs",
   jsx: "automatic",

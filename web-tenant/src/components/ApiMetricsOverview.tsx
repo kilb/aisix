@@ -6,6 +6,7 @@ import { fmtMicroCny } from "../lib/money";
 import { fmtBeijing, metricPeriodLabel } from "../lib/time";
 import { TrendChart } from "./charts";
 import { BentoGrid, Card, CardHeader, CardMessage, Metric, span } from "./page";
+import "./metrics-density.css";
 
 interface ApiMetricsOverviewProps {
   scope: MetricsScope;
@@ -52,7 +53,7 @@ export function ApiMetricsOverview({ scope, from, to, data, error, onRetry, clas
       <p className="mt-3 text-caption text-fg-3">实测样本 {formatCount(totals?.first_token_latency_ms.sample_count)} · 无实测值 {formatCount(totals?.first_token_latency_ms.missing_count)}</p>
       <p className="mt-2 text-caption text-fg-3">无值包含非流式与历史记录；P95/P99 见分析。</p>
     </Card>
-    <Card padding="sm" data-metric-kpi="cost" aria-labelledby={`${id}-cost`} className={costText.length > 10 ? "col-span-2 tablet:col-span-1" : undefined}>
+    <Card padding="sm" data-metric-kpi="cost" aria-labelledby={`${id}-cost`}>
       <h2 id={`${id}-cost`}>已计价费用</h2>
       <Metric size="value" className="min-w-0 max-w-full overflow-x-auto whitespace-nowrap text-heading tablet:text-value">{costText}</Metric>
       <p className="mt-3 text-caption text-fg-3">待计价尝试 {formatCount(totals?.unpriced_attempts)}</p>

@@ -2,6 +2,7 @@ import { useId, type ReactNode } from "react";
 import { fmtMicroCny } from "../lib/money";
 import { cn } from "../lib/cn";
 import { Card, CardHeader, Metric, span } from "../components/page";
+import "./BalanceReadout.css";
 
 export type ReadoutLevel = "organization" | "member" | "key";
 
@@ -50,7 +51,7 @@ export function BalanceReadout({
 }) {
   const heading = useId();
   return (
-    <Card tone="inverse" className={cn(span.d4, "tablet:col-span-12")} role="region" aria-labelledby={heading}>
+    <Card tone="inverse" className={cn(span.d4, "tablet:col-span-12 balance-readout")} role="region" aria-labelledby={heading}>
       <div id={heading}><CardHeader number={2} title="可用额度" /></div>
       <p className="text-caption text-on-inverse-muted">现在还能花</p>
       {picker}

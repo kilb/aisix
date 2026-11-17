@@ -1,0 +1,22 @@
+/* 共享指标以可比较的读数层级呈现，金额保留完整精度并在容器内换行。 */
+.overview-kpis > .bento-card { gap: 8px; padding: 16px 20px; }
+.overview-kpis .metric,
+.overview-kpis [data-metric-kpi="cost"] .metric { min-width: 0; max-width: 100%; font-size: var(--fs-24); line-height: 1.3; font-weight: 650; letter-spacing: -.025em; white-space: normal; overflow-wrap: anywhere; overflow-x: visible; }
+.overview-kpis p { font-size: var(--text-caption); line-height: 1.6; }
+.metric-analysis-main.bento-card,
+.metric-analysis-aside.bento-card { gap: 16px; }
+.metric-analysis .metric-primary { padding-bottom: 12px; }
+.metric-analysis .metric-primary > div:first-child { margin-bottom: 6px; }
+.metric-analysis .metric-primary .metric { font-size: var(--type-figure); line-height: 1.3; font-weight: 650; letter-spacing: -.025em; }
+.metric-analysis .metric-facts { gap: 8px 12px; }
+.metric-analysis .metric-facts > div { padding: 10px 12px; }
+.metric-analysis .metric-facts dd { margin-top: 4px; font-size: var(--fs-20); line-height: 1.45; font-weight: 600; }
+.metric-analysis .metric-analysis-aside .metric-facts dd { font-size: var(--fs-16); }
+.metric-success .metric { font-size: var(--fs-24); line-height: 1.3; font-weight: 650; letter-spacing: -.02em; }
+.metric-success > dl:first-child { column-gap: 20px; row-gap: 12px; }
+.metric-success > dl:first-child dd { margin-top: 4px; }
+@media (max-width: 599px) {
+  .overview-kpis > .bento-card { padding: 16px; }
+  .metric-analysis .metric-primary .metric { font-size: var(--fs-24); }
+  .metric-analysis .metric-facts dd { font-size: var(--fs-16); }
+}

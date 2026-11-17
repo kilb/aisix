@@ -3,27 +3,29 @@
 .calls-list[hidden] { display: none; }
 .charge-workspace { min-width: 0; container: charge-records / inline-size; }
 .charge-workspace > .dt-wrap { overflow-x: auto; max-height: none; }
-.charge-records .dt.charge-records-table { width: 100%; min-width: 69.5rem; table-layout: fixed; }
-.charge-col-time { width: 7rem; }
+.charge-records .dt.charge-records-table { width: 100%; min-width: 81rem; table-layout: fixed; }
+.charge-col-time { width: 7.25rem; }
 .charge-col-type { width: 4.5rem; }
-.charge-col-identity { width: 10rem; }
-.charge-col-service { width: 9rem; }
-.charge-col-status { width: 8.5rem; }
-.charge-col-money { width: 6.5rem; }
-.charge-col-performance { width: 8rem; }
-.charge-col-tokens { width: 10rem; }
-.charge-col-action { width: 6rem; }
+.charge-col-identity { width: auto; }
+.charge-col-service { width: 11rem; }
+.charge-col-status { width: 11rem; }
+.charge-col-money { width: 7.25rem; }
+.charge-col-performance { width: 10rem; }
+.charge-col-tokens { width: 11rem; }
+.charge-col-action { width: 6.5rem; }
 .charge-records .charge-records-table > :is(thead, tbody) > tr > :is(th, td) { vertical-align: top; white-space: normal; overflow-wrap: anywhere; }
+.charge-records .charge-records-table > thead > tr > th { white-space: nowrap; }
+.charge-model-name { display: block; color: var(--foreground); font-weight: 600; }
 .charge-records .cell-note { margin-top: 4px; }
 .charge-records .finance-amount-label { display: block; margin-bottom: 2px; color: var(--color-fg-3); font-size: var(--text-caption); }
-.charge-records .finance-amount-value { font-weight: 700; font-variant-numeric: tabular-nums; }
+.charge-records .finance-amount-value { white-space: nowrap; font-weight: 700; font-variant-numeric: tabular-nums; }
 .charge-records .io-token-reference { color: var(--color-fg-3); font-size: var(--text-caption); line-height: var(--text-caption--line-height); }
 .charge-icon-button { width: 36px; min-width: 36px; min-height: 36px; padding-inline: 0; }
 .charge-icon-button > svg { width: 16px; height: 16px; }
 
 /* 工具条留在主页面滚动流内，展开条件不裁剪选择浮层。 */
-.charge-filter-controls { position: sticky; top: 60px; z-index: 20; display: grid; min-width: 0; gap: 10px; padding: 12px; margin-inline: -12px; border: 1px solid var(--border); border-radius: var(--r-field); background: var(--card); box-shadow: var(--shadow-card); }
-.charge-event-filter { display: flex; flex: 1.5 1 170px; align-items: flex-end; gap: 6px; min-width: 0; }
+.charge-filter-controls { position: sticky; top: 60px; z-index: 20; display: grid; min-width: 0; gap: 10px; padding: 12px 0; border: 0; border-bottom: 1px solid var(--border); border-radius: 0; background: var(--card); box-shadow: none; }
+.charge-event-filter { display: flex; flex: 1.5 0 190px; align-items: flex-end; gap: 6px; min-width: 190px; }
 .charge-event-filter > label { flex: 1; }
 .charge-event-filter > .btn { flex: none; min-height: 36px; }
 .charge-scope-filters { grid-column: 1 / -1; min-width: 0; padding-top: 14px; border-top: 1px solid var(--border); }
@@ -39,15 +41,20 @@
 .charge-records .charge-records-table > :is(thead, tbody) > tr > :is(th, td) { padding-inline: 10px; }
 .charge-records .charge-records-table > tbody > tr[data-finance-record] > td { padding-block: 12px; }
 .charge-records .usage-performance { grid-template-columns: minmax(0, 1fr); gap: 3px; text-align: left; }
-.charge-records .usage-performance > div { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.charge-records .usage-performance > div { display: inline-flex; width: max-content; align-items: baseline; justify-content: flex-start; gap: 6px; white-space: nowrap; }
 .charge-records .usage-performance dd { margin: 0; white-space: nowrap; font-weight: 500; }
+.charge-call-tokens { display: grid; gap: 3px; margin: 0; }
+.charge-call-tokens > div { display: inline-flex; width: max-content; align-items: baseline; gap: 6px; white-space: nowrap; }
+.charge-call-tokens dt { color: var(--muted-foreground); font-size: var(--text-caption); }
+.charge-call-tokens dd { margin: 0; color: var(--foreground); font-size: var(--text-small); font-weight: 500; }
 @media (min-width: 1100px) { .charge-filter-controls .usage-record-filter-grid { max-height: calc(100dvh - 180px); overflow-y: auto; overscroll-behavior: contain; } }
-@media (max-width: 1099px) { .charge-filter-controls { position: static; } }
 
 /* 列表只作错误摘要，独立日志页保留完整内容。 */
 .call-error-summary { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; overflow-wrap: anywhere; margin-top: 5px; color: var(--destructive); font-size: var(--text-caption); line-height: var(--text-caption--line-height); }
-.call-log-link { display: inline-flex; align-items: center; justify-content: center; min-height: 36px; padding: 6px 10px; border-radius: var(--r-round); background: var(--color-tint); color: var(--color-fg); font-size: var(--text-caption); font-weight: 600; text-decoration: none; }
+.call-log-link { display: inline-flex; align-items: center; justify-content: center; width: 36px; min-height: 36px; padding: 0; border-radius: var(--r-round); color: var(--color-fg); text-decoration: none; }
+.call-log-link > svg { width: 16px; height: 16px; }
 .call-log-link:hover { background: var(--color-tint-strong); }
+.call-log-link:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
 
 /* 复核是同一条记录的连续分区，数量表不与其它信息挤在半列里。 */
 .charge-check { display: grid; min-width: 0; gap: 16px; padding-block: 16px; border-top: 1px solid var(--color-hairline); overflow-wrap: anywhere; }
@@ -59,9 +66,8 @@
 .charge-check .charge-quantities-table :is(th, td) { white-space: normal; overflow-wrap: anywhere; }
 .charge-records .dt-detail > td > .charge-check { position: sticky; left: 20px; box-sizing: border-box; width: calc(100cqw - 40px); max-width: 100%; contain: inline-size; }
 @media (max-width: 599px) {
-  .charge-filter-controls { margin-inline: 0; padding: 12px; }
-  .charge-event-filter { flex-basis: 100%; }
   .charge-event-filter > .btn { min-height: 44px; }
   .charge-icon-button { width: 44px; min-width: 44px; min-height: 44px; }
-  .call-log-link { min-height: 44px; }
+  .charge-col-action { width: 7.5rem; }
+  .call-log-link { width: 44px; min-height: 44px; }
 }

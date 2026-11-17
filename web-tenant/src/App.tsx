@@ -138,6 +138,8 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
     setInvite(null);
     setSignOutError(null);
     setNotice(null);
+    // 更新地址并卸载认证表单，让密码管理器识别异步登录已成功。
+    window.history.replaceState(null, "", "#org");
     openSection("org");
   }, [openSection]);
 
@@ -284,7 +286,7 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
         </div>
       )}
 
-      <main id="workspace-main" tabIndex={-1} className={current === "account" ? "page shell-content" : "page shell-content tenant-data-content"}>
+      <main id="workspace-main" tabIndex={-1} className="page shell-content">
         <section
           key={`${tenant.id}:${member.id}:${member.role}:${tenant.status}`}
           id={`tab-${current}`}

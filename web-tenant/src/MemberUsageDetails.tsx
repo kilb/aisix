@@ -3,6 +3,7 @@ import { memberChargeLabel } from "./lib/memberUsagePresentation";
 import { formatCount } from "./lib/chartFormat";
 import { DataTable } from "./ui/DataTable";
 import { Metric } from "./components/page";
+import "./Members.css";
 
 const QUANTITY_LABEL: Record<string, string> = {
   input: "输入", output: "输出", cache_read: "缓存读", cache_write: "缓存写",
@@ -14,9 +15,9 @@ const QUANTITY_LABEL: Record<string, string> = {
 export function MemberUsageDetails({ usage }: { usage: MemberUsage }) {
   const quantities = Object.entries(usage.quantities);
   return <>
-    <dl className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-      <div className="rounded-tile bg-sunken p-4"><dt className="text-small font-semibold text-fg-2">已计费费用</dt><dd className="mt-2"><Metric>{memberChargeLabel(usage)}</Metric></dd></div>
-      <div className="rounded-tile bg-sunken p-4"><dt className="text-small font-semibold text-fg-2">调用次数</dt><dd className="mt-2"><Metric>{formatCount(usage.requests)}</Metric></dd></div>
+    <dl className="member-usage-summary">
+      <div><dt>已计费费用</dt><dd><Metric>{memberChargeLabel(usage)}</Metric></dd></div>
+      <div><dt>已记录调用</dt><dd><Metric>{formatCount(usage.requests)}</Metric></dd></div>
     </dl>
     <h3 className="text-title font-bold">计费用量</h3>
     {quantities.length === 0 ? <p className="hint">{usage.unknown_quantity_requests > 0 ? "计费用量未知" : "暂无已记录的计费用量"}</p> : <DataTable label="计费用量">

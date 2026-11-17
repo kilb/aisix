@@ -59,10 +59,10 @@ export function Prices({ initialGroup }: { initialGroup: string | null }) {
   const selectedGroup = quote?.groups.some((group) => group.id === requestedGroup) ? requestedGroup : "";
   const header = <PageHeader title="模型与价格" dataLead="查看美元基准价，或选择分组比较实际人民币单价与倍率。" />;
   if (err !== null) return <>{header}<Card><CardHeader title="当前价格" /><div role="alert"><CardMessage>{err}</CardMessage></div></Card></>;
-  if (quote === null) return <>{header}<BentoGrid>
-    <Card tone="lilac" padding="sm" className={span.d4}><CardHeader title="当前组织优惠" /><MetricSkeleton /><p className="text-caption text-fg-3">正在读取当前报价…</p></Card>
-    <Card padding="sm" className={span.d4}><CardHeader title="可计价模型" /><MetricSkeleton /></Card>
-    <Card padding="sm" className={span.d4}><CardHeader title="报价时刻" /><MetricSkeleton /></Card>
+  if (quote === null) return <>{header}<BentoGrid className="tenant-prices">
+    <Card tone="lilac" padding="sm" className={`${span.d4} price-summary-card`}><CardHeader title="当前组织优惠" /><MetricSkeleton /><p className="text-caption text-fg-3">正在读取当前报价…</p></Card>
+    <Card padding="sm" className={`${span.d4} price-summary-card`}><CardHeader title="可计价模型" /><MetricSkeleton /></Card>
+    <Card padding="sm" className={`${span.d4} price-summary-card`}><CardHeader title="报价时刻" /><MetricSkeleton /></Card>
     <Card padding="table" className={span.d12}><CardHeader title="模型价格目录" className="px-3" /><Loading /></Card>
   </BentoGrid></>;
   if (quote.groups.length === 0) return <>{header}<Card><CardHeader title="当前价格" /><EmptyState text="运营尚未为本组织分配分组，暂时没有可查看的价格。" /></Card></>;
@@ -70,24 +70,24 @@ export function Prices({ initialGroup }: { initialGroup: string | null }) {
   return <>
     {header}
     <BentoGrid className="tenant-prices">
-      <Card tone="lilac" padding="sm" className={span.d4} aria-label="当前组织优惠">
+      <Card tone="lilac" padding="sm" className={`${span.d4} price-summary-card`} aria-label="当前组织优惠">
         <p className="text-small font-semibold text-fg-2">当前组织优惠</p>
         <Metric>{quote.discount_bps === null ? "未知" : discountPercent(quote.discount_bps)}</Metric>
         <p className="text-caption text-fg-3">分组人民币报价已计入优惠</p>
       </Card>
-      <Card padding="sm" className={span.d4} aria-label="可计价模型">
+      <Card padding="sm" className={`${span.d4} price-summary-card`} aria-label="可计价模型">
         <p className="text-small font-semibold text-fg-2">可计价模型</p>
         <Metric>{catalog.length.toLocaleString("en-US")}</Metric>
         <p className="text-caption text-fg-3">{quote.groups.length.toLocaleString("en-US")} 个可用分组</p>
       </Card>
-      <Card padding="sm" className={`${span.d4} price-summary-time`} aria-label="报价时刻">
+      <Card padding="sm" className={`${span.d4} price-summary-card price-summary-time`} aria-label="报价时刻">
         <p className="text-small font-semibold text-fg-2">报价时刻</p>
         <p className="tabular text-title text-fg">{fmtBeijing(quote.as_of)}</p>
         <p className="text-caption text-fg-3">{quote.valid_until === null ? "当前报价未设置失效时刻" : `有效至 ${fmtBeijing(quote.valid_until)}`}</p>
-        <details className="price-quote-explainer"><summary>价格如何计算</summary><p>倍率 = 换算率 ×（1 − 组织优惠）。人民币单价按美元基准价乘以倍率计算。当前报价不改变历史账单；历史费用使用调用时的费率。</p></details>
       </Card>
       <Card padding="table" className={span.d12}>
         <CardHeader title="模型价格目录" className="px-3" />
+        <details className="price-quote-explainer"><summary>价格如何计算</summary><p>倍率 = 换算率 ×（1 − 组织优惠）。人民币单价按美元基准价乘以倍率计算。当前报价不改变历史账单；历史费用使用调用时的费率。</p></details>
         <PriceCatalog quote={quote} groupId={selectedGroup} onGroupChange={(value) => setGroupFilter({ linkedGroup: initialGroup, value })} />
         <p className="price-estimate-note text-caption text-muted">已列出的单价按价卡确定；“未提供价格”的项目不按零计费。“含估算”表示调用的部分 token 用量由网关估算，与单价无关，具体调用会在用量页单独标注。</p>
       </Card>
@@ -150,7 +150,7 @@ function PriceCatalog({ quote, groupId, onGroupChange }: { quote: PriceQuoteList
     <div className="price-scope-note"><p>{group?.description || (currency === "USD" ? "美元基准价，不含分组换算与组织优惠。" : "分组人民币单价，已含组织优惠。")}</p><p>{currency === "USD" ? "美元" : "元"}/百万 token · 点击模型查看完整价格</p></div>
     {unavailable ? <CardMessage>暂无法读取美元基准价，请稍后刷新或选择分组查看人民币报价。</CardMessage>
       : table.rows.length === 0 ? <EmptyState text={table.query ? "没有符合筛选条件的模型价格。" : "当前范围暂时没有可计价的模型。"} mark="route" /> : <div className="price-catalog" role="region" aria-label="模型价格"><DataTable label="模型单价">
-        <colgroup><col className="price-summary-model" /><col className="price-summary-multiplier" />{Array.from({ length: 4 }, (_, index) => <col key={index} className="price-summary-amount" />)}</colgroup>
+        <colgroup><col className="price-summary-model" /><col className="price-summary-multiplier" />{Array.from({ length: 3 }, (_, index) => <col key={index} className="price-summary-amount" />)}<col className="price-summary-cache-write" /></colgroup>
         <thead><tr><th>模型</th><th className="num">{currency === "USD" ? "价格基准" : "倍率"}</th><th className="num">输入</th><th className="num">输出</th><th className="num">缓存读</th><th className="num">缓存写</th></tr></thead>
         {table.rows.map((model) => <ModelRow key={model.model_id} model={model} tier={effectiveTier} groupId={groupId} discountBps={quote.discount_bps} />)}
       </DataTable></div>}
@@ -187,7 +187,7 @@ function ModelRow({ model, discountBps, tier, groupId }: { model: CatalogEntry; 
       <td className="num" data-label="输出"><PriceRateValue rate={rate("output")} currency={currency} /></td>
       <td className="num" data-label="缓存读"><PriceRateValue rate={rate("cache_read")} currency={currency} /></td>
       <td className="num" data-label="缓存写"><PriceRateValue rate={rate("cache_write")} currency={currency} />
-        {oneHour?.fallback_from === undefined && oneHourValue != null && <span className="hint cell-note">1 小时缓存写 <PriceRateValue rate={oneHour} currency={currency} /></span>}
+        {oneHour?.fallback_from === undefined && oneHourValue != null && <span className="hint cell-note price-cache-hour"><span>1 小时缓存写</span><PriceRateValue rate={oneHour} currency={currency} /></span>}
       </td>
     </tr>
     <Dialog.Root open={open} onOpenChange={setOpen}>
