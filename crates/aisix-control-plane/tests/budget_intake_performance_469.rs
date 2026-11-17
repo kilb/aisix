@@ -24,8 +24,22 @@ const OPENING_BALANCE: i64 = 100_000_000;
 const ROW_CHARGE: i64 = 680;
 const QUOTA_LIMIT: i64 = 50_000;
 
-#[derive(Clone, Default)]
-struct Queries(Arc<Mutex<Vec<(String, u64)>>>);
+#[derive(Clone)]
+struct Queries {
+    records: Arc<Mutex<Vec<(String, u64)>>>,
+    _registry_guard: tracing::Dispatch,
+}
+
+impl Default for Queries {
+    fn default() -> Self {
+        Self {
+            records: Arc::default(),
+            // 其他测试可能先注册查询日志；保留额外分发器，使兴趣重建枚举订阅者，
+            // 避免单分发器快捷路径读取那条线程的默认订阅者而缓存为禁用。
+            _registry_guard: tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()),
+        }
+    }
+}
 
 #[derive(Default)]
 struct QueryFields {
@@ -54,7 +68,7 @@ impl<S: Subscriber> Layer<S> for Queries {
         if event.metadata().target() == "sqlx::query" {
             let mut fields = QueryFields::default();
             event.record(&mut fields);
-            self.0
+            self.records
                 .lock()
                 .expect("query records")
                 .push((fields.statement, fields.returned));
@@ -64,7 +78,7 @@ impl<S: Subscriber> Layer<S> for Queries {
 
 impl Queries {
     fn matching(&self, table: &str) -> Vec<(String, u64)> {
-        self.0
+        self.records
             .lock()
             .expect("query records")
             .iter()
