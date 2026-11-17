@@ -16,6 +16,7 @@ interface Counting { messages_count_tokens?: Target; responses_input_tokens?: Ta
 const path = "/admin/resources/token_counting";
 const output = resolve(process.env.TOKEN_COUNTING_QA_OUTPUT!);
 let stack: Stack;
+let billingAudit: { tenantId: string; before: { items: unknown[] } } | undefined;
 const fixture: Record<string, Resource> = {};
 const sourceVersion = "same-source-version-2026-01-01";
 const viewer = { email: "viewer-counting-457@e2e.local", password: "isolated-viewer-counting-457" };
@@ -68,12 +69,13 @@ async function login(page: Page, who = stack.operator, direct = false): Promise<
   const response = page.waitForResponse(reply => new URL(reply.url()).pathname === "/admin/login" && reply.request().method() === "POST");
   await page.getByRole("button", { name: "登录", exact: true }).click();
   expect((await response).status()).toBe(200);
+  await expect(page.locator("[data-tab]").first()).toBeVisible();
   await page.goto(`${stack.previewUrl}/#providers${direct ? "?section=token-counting" : ""}`);
   if (!direct) {
     await expect(page.getByRole("table", { name: "上游账号", exact: true })).toBeVisible();
     await page.getByRole("navigation", { name: "上游账号管理", exact: true }).getByRole("link", { name: "Token计数", exact: true }).click();
   }
-  expect(new URLSearchParams(page.url().split("?")[1]).get("section")).toBe("token-counting");
+  await expect(page).toHaveURL(`${stack.previewUrl}/#providers?section=token-counting`);
   await expect(page.getByRole("region", { name: "Token计数", exact: true })).toBeVisible();
 }
 async function save(page: Page, region: Locator): Promise<void> {
@@ -117,9 +119,26 @@ test.beforeAll(async () => {
   fixture.modelB = await model("source-b-default", fixture.sourceB, "anthropic");
   fixture.modelR = await model("source-r-default", fixture.sourceR, "openai");
   mkdirSync(output, { recursive: true });
+  const environment = await stack.admin.get("/admin/environment");
+  expect(environment.cp_version).toBe("dev+sha-119796c");
+  writeFileSync(join(output, "cp-environment-version.json"), JSON.stringify({ request: "GET /admin/environment", cp_version: environment.cp_version, env_id: environment.env_id, realBackend: true }));
   writeFileSync(join(output, "environment-public.json"), JSON.stringify({ realBackend: true, mockUpstream: false, officialProviderCalls: "NOT EXECUTED", httpUrl: stack.httpUrl, adminUrl: stack.previewUrl, proxyUrl: stack.proxyUrl, cpDatabase: stack.cpDatabase, fixtureIds: Object.fromEntries(Object.entries(fixture).map(([name, resource]) => [name, resource.id])) }));
 });
-test.afterAll(async () => { await stack?.stop(); });
+test.afterAll(async () => {
+  try {
+    if (billingAudit) {
+      await expect.poll(async () => (await stack.admin.get(`/admin/pricing/charges?tenant_id=${billingAudit!.tenantId}&limit=100`)).items.length, { timeout: 30_000, message: "each of the six denied real requests has its explicit zero-charge record" }).toBe(6);
+      const after = await stack.admin.get(`/admin/tenants/${billingAudit.tenantId}/billing/ledger`);
+      const charges = await stack.admin.get(`/admin/pricing/charges?tenant_id=${billingAudit.tenantId}&limit=100`);
+      writeFileSync(join(output, "457-denial-billing.json"), JSON.stringify({ before: billingAudit.before, after, charges }));
+      expect(after.items, "denied source/helper models add no debit to the real credit ledger").toEqual(billingAudit.before.items);
+      for (const charge of charges.items) {
+        expect(Object.hasOwn(charge, "charge_micro_cny"), "a missing charge is not a reported zero").toBe(true);
+        expect(charge.charge_micro_cny).toBe(0);
+      }
+    }
+  } finally { await stack?.stop(); }
+});
 
 test("457: fixed count accounts persist by source Model ID, propagate, reject stale snapshots, protect references and disable", async ({ page }) => {
   const failures: string[] = [];
@@ -160,20 +179,51 @@ test("457: fixed count accounts persist by source Model ID, propagate, reject st
   const tenant = await stack.admin.post("/admin/tenants", { name: "457-source-acl-only" });
   await stack.admin.patch(`/admin/tenants/${tenant.id}`, { allowed_model_ids: [fixture.modelA.id], allowed_provider_groups: ["shared"] }, tenant.version);
   await stack.admin.post(`/admin/tenants/${tenant.id}/credits`, { amount_cny: "10.00", reason: "隔离权限验收，不发送生成请求" });
+  const fundedLedger = await stack.admin.get(`/admin/tenants/${tenant.id}/billing/ledger`);
+  expect(fundedLedger.items).toHaveLength(1);
+  expect(fundedLedger.items[0].amount_micro_cny).toBe(10_000_000);
+  billingAudit = { tenantId: tenant.id, before: fundedLedger };
   const groups = await stack.admin.get("/admin/provider-groups");
   const shared = groups.items.find((group: { name: string }) => group.name === "shared");
   expect(shared).toBeDefined();
-  const caller = await stack.admin.post(`/admin/tenants/${tenant.id}/keys`, { label: "457-source-only", group_id: shared.id, allowed_endpoints: ["chat_completions", "messages", "count_tokens", "responses", "models"] });
+  const caller = await stack.admin.post(`/admin/tenants/${tenant.id}/keys`, { label: "457-source-only", group_id: shared.id });
+  const projectedCaller = await stack.admin.get(`/admin/resources/api_keys/${caller.key.id}`);
+  const endpointFamilies: string[] | null | undefined = projectedCaller.doc.allowed_endpoints;
+  // 公开 schema 规定省略/null 允许全部端点；显式列表必须含被测端点，防止把端点拒绝误当模型 ACL。
+  if (endpointFamilies != null) expect(endpointFamilies).toEqual(expect.arrayContaining(["count_tokens", "responses", "chat_completions", "models"]));
+  writeFileSync(join(output, "457-caller-endpoint-grants.json"), JSON.stringify({ keyId: caller.key.id, fieldPresent: Object.hasOwn(projectedCaller.doc, "allowed_endpoints"), allowed_endpoints: endpointFamilies ?? null, absentOrNullMeansEveryEndpoint: true }));
   const headers = { authorization: `Bearer ${caller.plaintext}`, "content-type": "application/json" };
   await expect.poll(async () => { const result = await fetch(`${stack.proxyUrl}/v1/models`, { headers }); await result.arrayBuffer(); return result.status; }, { timeout: 30_000 }).toBe(200);
+  const wires: object[] = [];
+  const capture = async (endpoint: string, body: Record<string, unknown>) => {
+    const response = await fetch(`${stack.proxyUrl}${endpoint}`, { method: "POST", headers, body: JSON.stringify(body) });
+    const text = await response.text();
+    const answer = { status: response.status, headers: Object.fromEntries(response.headers.entries()), body: text };
+    wires.push({ method: "POST", endpoint, requestHeaders: { authorization: "Bearer <redacted fixture key>", "content-type": "application/json" }, requestBody: body, response: answer });
+    writeFileSync(join(output, "457-denial-wire.json"), JSON.stringify(wires, null, 2));
+    return answer;
+  };
+  // 既有平台黑盒合同要求无权与不存在的模型完全同形；不能套用 standalone 的 403。
+  const shape = (answer: { status: number; headers: Record<string, string>; body: string }, modelName: string) => ({
+    status: answer.status,
+    headers: Object.fromEntries(Object.entries(answer.headers).map(([name, value]) => [name, ["date", "x-aisix-request-id"].includes(name) ? "<per response>" : value.replaceAll(modelName, "<model>")])),
+    body: answer.body.replaceAll(modelName, "<model>"),
+  });
   for (const [endpoint, request] of [
     ["/v1/messages/count_tokens", { model: "457-source-b-default", messages: [{ role: "user", content: "blocked by source model ACL" }] }],
     ["/v1/responses/input_tokens", { model: "457-source-r-default", input: "blocked by source model ACL" }],
     ["/v1/chat/completions", { model: "457-helper-paid-model", messages: [{ role: "user", content: "helper receives no generation grant" }] }],
   ] as const) {
-    const refused = await fetch(`${stack.proxyUrl}${endpoint}`, { method: "POST", headers, body: JSON.stringify(request) });
-    expect(refused.status, `${endpoint} retains caller ACL before any upstream request`).toBe(403);
-    await refused.arrayBuffer();
+    const refused = await capture(endpoint, request);
+    const absentName = "457-does-not-exist-control";
+    const absent = await capture(endpoint, { ...request, model: absentName });
+    expect(refused.status, `${endpoint} retains platform model invisibility before any upstream request`).toBe(404);
+    expect(absent.status).toBe(404);
+    const protocolError = JSON.parse(refused.body) as { error: { type: string; message: string } };
+    expect(protocolError.error).toMatchObject({ type: expect.any(String), message: expect.any(String) });
+    expect(protocolError.error.type).toBe(endpoint === "/v1/messages/count_tokens" ? "not_found_error" : "model_not_found");
+    expect(protocolError.error.message.length).toBeGreaterThan(0);
+    expect(shape(refused, request.model)).toEqual(shape(absent, absentName));
   }
   const tenantRead = await stack.admin.get(`/admin/tenants/${tenant.id}`);
   expect(tenantRead.allowed_model_ids).toEqual([fixture.modelA.id]);
@@ -202,7 +252,9 @@ test("457: fixed count accounts persist by source Model ID, propagate, reject st
   expect(popupBounds!.x + popupBounds!.width).toBeLessThanOrEqual(391);
   expect(popupBounds!.y).toBeGreaterThanOrEqual(0);
   expect(popupBounds!.y + popupBounds!.height).toBeLessThanOrEqual(1001);
-  await page.screenshot({ path: join(output, "457-counting-source-options-390.png"), fullPage: true });
+  await popup.screenshot({ path: join(output, "457-counting-source-popup-390.png") });
+  await page.screenshot({ path: join(output, "457-counting-source-options-390.png"), fullPage: false });
+  await expect(popup).toBeVisible();
   writeFileSync(join(output, "457-counting-source-options-bounds.json"), JSON.stringify({ viewport: { width: 390, height: 1000 }, popup: popupBounds }));
   await page.keyboard.press("Escape");
   await expect(popup).toHaveCount(0);
