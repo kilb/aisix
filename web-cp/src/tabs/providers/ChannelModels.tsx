@@ -673,7 +673,7 @@ export function ChannelModels({
                 label="新的公共模型名称"
                 onChange={setNewName}
                 disabled={creating || busy}
-                className="min-w-0 w-full flex-1 sm:min-w-[14rem]"
+                className="min-w-0 w-full basis-full sm:basis-0 sm:flex-1 sm:min-w-[14rem]"
               />
               <Button
                 type="button"
