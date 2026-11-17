@@ -246,6 +246,79 @@ pub struct TenantPlan {
     discount: DiscountPlan,
 }
 
+#[derive(Debug, Serialize)]
+struct TenantPlanSummary {
+    tenant_id: Uuid,
+    tenant_name: String,
+    discount: DiscountPlan,
+}
+
+/// 已配置折扣的租户，按名称和 id 排序；撤销优惠的租户仍保留供查阅历史。
+pub async fn tenants(
+    auth: OperatorAuth,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
+    auth.require(OperatorRole::Viewer)?;
+    let items = state
+        .db
+        .tx(move |conn| {
+            async move {
+                let tenants: Vec<(Uuid, String)> = sqlx::query_as(
+                    "SELECT t.id, t.name FROM tenants t \
+                     WHERE EXISTS (SELECT 1 FROM pricing_discount_revisions d WHERE d.tenant_id = t.id) \
+                     ORDER BY t.name, t.id",
+                )
+                .fetch_all(&mut *conn)
+                .await
+                .map_err(DbError::from)?;
+                let ids: Vec<Uuid> = tenants.iter().map(|(id, _)| *id).collect();
+                // 两次批量读取复用单租户视图的生效及同时间覆盖规则，不逐租户查询。
+                let current: Vec<DiscountRevision> = sqlx::query_as(&format!(
+                    "SELECT DISTINCT ON (tenant_id) {DISCOUNT_COLUMNS} \
+                     FROM pricing_discount_revisions \
+                     WHERE tenant_id = ANY($1) AND effective_from <= now() \
+                     ORDER BY tenant_id, effective_from DESC, revision_id DESC"
+                ))
+                .bind(&ids)
+                .fetch_all(&mut *conn)
+                .await
+                .map_err(DbError::from)?;
+                let mut current: HashMap<Uuid, DiscountRevision> = current
+                    .into_iter()
+                    .map(|revision| (revision.tenant_id, revision))
+                    .collect();
+                let upcoming: Vec<DiscountRevision> = sqlx::query_as(&format!(
+                    "SELECT DISTINCT ON (tenant_id, effective_from) {DISCOUNT_COLUMNS} \
+                     FROM pricing_discount_revisions \
+                     WHERE tenant_id = ANY($1) AND effective_from > now() \
+                     ORDER BY tenant_id, effective_from, revision_id DESC"
+                ))
+                .bind(&ids)
+                .fetch_all(&mut *conn)
+                .await
+                .map_err(DbError::from)?;
+                let mut by_tenant: HashMap<Uuid, Vec<DiscountRevision>> = HashMap::new();
+                for revision in upcoming {
+                    by_tenant.entry(revision.tenant_id).or_default().push(revision);
+                }
+                Ok::<_, DbError>(tenants
+                    .into_iter()
+                    .map(|(tenant_id, tenant_name)| TenantPlanSummary {
+                        tenant_id,
+                        tenant_name,
+                        discount: DiscountPlan {
+                            current: current.remove(&tenant_id),
+                            upcoming: by_tenant.remove(&tenant_id).unwrap_or_default(),
+                        },
+                    })
+                    .collect::<Vec<_>>())
+            }
+            .boxed()
+        })
+        .await?;
+    Ok(Json(json!({ "items": items })))
+}
+
 /// `GET /admin/pricing/tenants/{id}` → `TenantPlan`. An unknown or malformed
 /// tenant id is `404`.
 pub async fn tenant(

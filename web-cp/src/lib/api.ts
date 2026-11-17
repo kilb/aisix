@@ -680,6 +680,10 @@ export const pricing = {
   async tenantPlan(tenantId: string): Promise<TenantPlan> {
     return (await call<TenantPlan>("GET", `/admin/pricing/tenants/${seg(tenantId)}`)).data;
   },
+  /** 所有配置过折扣的租户，含已恢复原价与仅有预约版本的租户。 */
+  async tenantPlans(): Promise<TenantDiscountSummary[]> {
+    return (await call<{ items: TenantDiscountSummary[] }>("GET", "/admin/pricing/tenants")).data.items;
+  },
 };
 
 // ── pricing: cost rates ─────────────────────────────────────────────────────
@@ -757,8 +761,24 @@ export interface TenantPlan {
   discount: { current: DiscountRevision | null; upcoming: DiscountRevision[] };
 }
 
+export interface TenantDiscountSummary extends TenantPlan {
+  tenant_name: string;
+}
+
+export interface DiscountPage {
+  items: DiscountRevision[];
+  next_before: number | null;
+}
+
 /** A tenant's discount revisions: an append-only list, one write per change. */
 export const tenantPricing = {
+  /** 按修改版本倒序读取；before 沿用上一页的 next_before。 */
+  async listDiscounts(q: { tenant_id: string; limit?: number; before?: number }): Promise<DiscountPage> {
+    const params = new URLSearchParams({ tenant_id: q.tenant_id });
+    if (q.limit !== undefined) params.set("limit", String(q.limit));
+    if (q.before !== undefined) params.set("before", String(q.before));
+    return (await call<DiscountPage>("GET", `/admin/pricing/discounts?${params}`)).data;
+  },
   async createDiscount(body: { tenant_id: string; effective_from: string; discount_bps: number }): Promise<DiscountRevision> {
     return (await call<DiscountRevision>("POST", "/admin/pricing/discounts", body)).data;
   },

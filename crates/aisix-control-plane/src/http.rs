@@ -467,6 +467,11 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
     ),
     (
         "GET",
+        "/admin/pricing/tenants",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
+    (
+        "GET",
         "/admin/pricing/tenants/{id}",
         MinRole::Op(OperatorRole::Viewer),
     ),
@@ -1021,6 +1026,7 @@ pub fn browser_router(state: AppState) -> Router {
         .route("/admin/pricing/charges", get(pricing::api::list_charges))
         .route("/admin/pricing/status", get(pricing::api::status))
         .route("/admin/pricing/models", get(billing::plans::models))
+        .route("/admin/pricing/tenants", get(billing::plans::tenants))
         .route("/admin/pricing/tenants/{id}", get(billing::plans::tenant))
         .route("/admin/pricing/margin", get(pricing::margin::list))
         .route("/admin/billing/profit-summary", get(billing::profit_summary::get))

@@ -1,4 +1,54 @@
-/* 已结束版本使用中性文字，保留状态说明。 */
-.plan-ended {
-  color: var(--color-ink-soft);
+/* 租户折扣使用通栏清单，身份列可换行，时间列保留完整北京时间。 */
+.tenant-discount-table,
+.tenant-discount-history-table {
+  table-layout: fixed;
 }
+
+.tenant-discount-col-name { width: 27%; }
+.tenant-discount-col-offer { width: 15%; }
+.tenant-discount-col-time { width: 21%; }
+.tenant-discount-col-next { width: 23%; }
+.tenant-discount-col-status { width: 14%; }
+.tenant-discount-history-col-offer { width: 14%; }
+.tenant-discount-history-col-time { width: 22%; }
+.tenant-discount-history-col-status { width: 14%; }
+.tenant-discount-history-col-actor { width: 28%; }
+
+:is(.tenant-discount-table, .tenant-discount-history-table) > tbody > tr > td {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.tenant-discount-table .cell-note { max-width: none; }
+.tenant-discount-summary { padding-block: 0 20px; }
+.tenant-discount-summary .compact-overview-facts { margin-bottom: 12px; }
+
+.tenant-discount-upcoming {
+  display: grid;
+  gap: 8px;
+  margin: 12px 0 0;
+  padding: 12px 0 0;
+  border-top: 1px solid var(--border);
+  list-style: none;
+  font-size: var(--text-caption);
+  font-variant-numeric: tabular-nums;
+}
+
+.tenant-discount-history-footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-top: 16px;
+}
+
+.tenant-discount-history-footer .hint { margin: 0; }
+
+/* 对话框字段各占整行，不再并排挤压租户选择与生效时间。 */
+.tenant-discount-form { display: grid; gap: 16px; }
+.tenant-discount-form > .field,
+.tenant-discount-form > .bento-card-footer { margin: 0; }
+.tenant-discount-form-tenant,
+.tenant-discount-effective { display: grid; gap: 8px; min-width: 0; }
+.tenant-discount-form-tenant strong { overflow-wrap: anywhere; font-size: var(--text-body); }

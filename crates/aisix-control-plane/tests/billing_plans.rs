@@ -495,6 +495,124 @@ async fn a_tenant_plan_has_a_discount_and_no_overrides() {
 }
 
 #[tokio::test]
+async fn configured_tenant_plans_keep_cancelled_and_scheduled_discounts() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let viewer = cp.admin_login_seeded(OperatorRole::Viewer).await;
+    let mut tenants = Vec::new();
+    for name in [
+        "active-discount",
+        "future-discount",
+        "cancelled-discount",
+        "no-discount",
+    ] {
+        let tenant = create(&cp, &admin, "/admin/tenants", json!({"name": name})).await;
+        tenants.push(id_of(&tenant, "/id"));
+    }
+    let now = db_now(&cp).await;
+    discount(&cp, &admin, tenants[0], now, 1000).await;
+    let active = discount(&cp, &admin, tenants[0], now, 2000).await;
+    let later = now + TimeDelta::hours(1);
+    discount(&cp, &admin, tenants[1], later, 3000).await;
+    let scheduled = discount(&cp, &admin, tenants[1], later, 4000).await;
+    let stop = discount(&cp, &admin, tenants[1], later + TimeDelta::hours(1), 0).await;
+    let resume = discount(&cp, &admin, tenants[1], later + TimeDelta::hours(2), 5000).await;
+    let cancellation_start = db_now(&cp).await;
+    discount(&cp, &admin, tenants[2], cancellation_start, 1000).await;
+    let cancelled = discount(&cp, &admin, tenants[2], cancellation_start, 0).await;
+
+    let r = get(&cp, &viewer, "/admin/pricing/tenants").await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let items = r.body["items"].as_array().expect("tenant plan items");
+    assert_eq!(items.len(), 3, "only configured tenants: {r:?}");
+    let ids: Vec<Uuid> = items.iter().map(|row| id_of(row, "/tenant_id")).collect();
+    assert_eq!(
+        ids,
+        vec![tenants[0], tenants[2], tenants[1]],
+        "name order, no unconfigured tenant: {r:?}"
+    );
+    assert_eq!(items[0]["tenant_name"], "active-discount", "{r:?}");
+    assert_eq!(
+        items[0]["discount"]["current"]["revision_id"], active,
+        "{r:?}"
+    );
+    assert_eq!(
+        items[0]["discount"]["current"]["discount_bps"], 2000,
+        "{r:?}"
+    );
+    assert_eq!(items[0]["discount"]["upcoming"], json!([]), "{r:?}");
+    assert_eq!(items[1]["tenant_name"], "cancelled-discount", "{r:?}");
+    assert_eq!(
+        items[1]["discount"]["current"]["revision_id"], cancelled,
+        "{r:?}"
+    );
+    assert_eq!(
+        items[1]["discount"]["current"].get("discount_bps"),
+        Some(&json!(0)),
+        "{r:?}"
+    );
+    assert_eq!(items[2]["tenant_name"], "future-discount", "{r:?}");
+    assert_eq!(
+        items[2]["discount"].get("current"),
+        Some(&Value::Null),
+        "{r:?}"
+    );
+    assert_eq!(
+        revision_ids(&items[2]["discount"]["upcoming"]),
+        vec![scheduled, stop, resume],
+        "{r:?}"
+    );
+}
+
+#[tokio::test]
+async fn tenant_discount_history_pages_include_superseded_and_cancelled_revisions() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let viewer = cp.admin_login_seeded(OperatorRole::Viewer).await;
+    let tenant = seed_tenant(&cp, &admin).await;
+    let other = seed_tenant(&cp, &admin).await;
+    let now = db_now(&cp).await;
+    let first = discount(&cp, &admin, tenant, now, 1000).await;
+    let current = discount(&cp, &admin, tenant, now, 2000).await;
+    let later = now + TimeDelta::hours(1);
+    let superseded = discount(&cp, &admin, tenant, later, 3000).await;
+    let scheduled = discount(&cp, &admin, tenant, later, 4000).await;
+    let cancelled = discount(&cp, &admin, tenant, later + TimeDelta::hours(1), 0).await;
+    discount(&cp, &admin, other, later, 9000).await;
+    let path = format!("/admin/pricing/discounts?tenant_id={tenant}&limit=2");
+
+    let r = get(&cp, &viewer, &path).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(
+        revision_ids(&r.body["items"]),
+        vec![cancelled, scheduled],
+        "{r:?}"
+    );
+    assert_eq!(r.body.get("next_before"), Some(&json!(scheduled)), "{r:?}");
+    assert_eq!(
+        r.body["items"][0].get("discount_bps"),
+        Some(&json!(0)),
+        "{r:?}"
+    );
+    let r = get(&cp, &viewer, &format!("{path}&before={scheduled}")).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(
+        revision_ids(&r.body["items"]),
+        vec![superseded, current],
+        "{r:?}"
+    );
+    assert_eq!(r.body.get("next_before"), Some(&json!(current)), "{r:?}");
+    let r = get(&cp, &viewer, &format!("{path}&before={current}")).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(revision_ids(&r.body["items"]), vec![first], "{r:?}");
+    assert_eq!(r.body.get("next_before"), Some(&Value::Null), "{r:?}");
+}
+
+#[tokio::test]
 async fn the_sell_routes_are_gone() {
     let Some(cp) = TestCp::start().await else {
         return;
@@ -521,7 +639,11 @@ async fn only_operators_read_price_views() {
     let tenant = cp.seed_tenant(TenantStatus::Active).await;
     let member = cp.member_login_seeded(tenant, MemberRole::Owner).await;
     let plan = format!("/admin/pricing/tenants/{tenant}");
-    for path in ["/admin/pricing/models", plan.as_str()] {
+    for path in [
+        "/admin/pricing/models",
+        "/admin/pricing/tenants",
+        plan.as_str(),
+    ] {
         let r = get(&cp, &viewer, path).await;
         assert_eq!(r.status, 200, "{path} as a viewer: {r:?}");
         let r = cp.send("GET", path, Some(member.cookie()), None).await;
