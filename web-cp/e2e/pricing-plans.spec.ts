@@ -1,4 +1,8 @@
 import { randomUUID } from "node:crypto";
+import { execFile } from "node:child_process";
+import { mkdir } from "node:fs/promises";
+import { join } from "node:path";
+import { promisify } from "node:util";
 import { expect, test, type Locator, type Page } from "@playwright/test";
 import { STACK_START_TIMEOUT_MS, startStack, type Stack } from "./stack";
 import { chat, seedTenant } from "./world";
@@ -21,6 +25,17 @@ test.beforeAll(async () => {
 });
 
 test.afterAll(async () => {
+  const backupDir = process.env.CP_E2E_BACKUP_DIR;
+  if (stack && backupDir) {
+    const pgUrl = process.env.CP_E2E_PG_URL;
+    if (!pgUrl) throw new Error("CP_E2E_PG_URL is required for the test database backup");
+    await mkdir(backupDir, { recursive: true, mode: 0o700 });
+    await Promise.all([stack.cpDatabase, stack.cpDatabase.replace(/^cp_/, "kine_")].map(async (database) => {
+      const url = new URL(pgUrl);
+      url.pathname = `/${database}`;
+      await promisify(execFile)("pg_dump", ["--format=custom", `--file=${join(backupDir, `${database}.dump`)}`, url.toString()], { timeout: 30_000 });
+    }));
+  }
   await stack?.stop();
 });
 
@@ -232,10 +247,7 @@ test("完整历史跨页保留同一生效时间的每次修改，新折扣追�
   await expect(history.locator("tbody tr")).toHaveCount(53);
   await expect(detail.getByRole("button", { name: "读取更早记录", exact: true })).toHaveCount(0);
   const percentages = await history.getByRole("cell").filter({ hasText: /^\d+(?:\.\d+)?%$/ }).allTextContents();
-  expect(new Set(percentages).size).toBe(53);
-  for (const percent of [1, 2, 3, 50, 51, 52, 53]) {
-    await expect(history.getByRole("cell", { name: `${percent}%`, exact: true })).toBeVisible();
-  }
+  expect(percentages).toEqual(Array.from({ length: 53 }, (_, index) => `${53 - index}%`));
   await expect(history.locator("tbody tr").first().getByRole("cell", { name: "53%", exact: true })).toBeVisible();
   await expect(history.locator("tbody tr").last().getByRole("cell", { name: "1%", exact: true })).toBeVisible();
   await expect(history.locator("tbody tr").last()).toContainText(displayTime(effectiveFrom));

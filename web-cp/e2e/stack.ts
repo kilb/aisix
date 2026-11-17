@@ -152,6 +152,8 @@ export async function fundTenant(admin: ApiClient, tenantId: string): Promise<vo
 }
 
 export interface Stack {
+  /** 本轮独立控制面数据库的名称，供验收结束前备份。 */
+  readonly cpDatabase: string;
   /** The Dashboard, served from `dist/` by `vite preview`. */
   previewUrl: string;
   /** The control plane's browser listener (`/admin`, `/api`). */
@@ -380,6 +382,7 @@ export async function startStack(opts: { telemetryRelay?: boolean; mockUpstream?
     const admin = new ApiClient(ready.httpUrl);
     await admin.post("/admin/login", ready.operator);
     return {
+      cpDatabase: ready.cpDatabase,
       previewUrl,
       httpUrl: ready.httpUrl,
       proxyUrl: ready.gateway.proxyUrl,

@@ -99,11 +99,13 @@ const CUSTOMER_ENDPOINT_EXPANSION_DEV_SHAS: &[&str] = &[
     "4b06ddcb7d4d3918faeb9a02f12c0ed7f4f19bbc",
     "c39f54354e1bd6616b2599ff685cdc3289cede78",
     "d5d5d72f31ff9f577e3333c11298f963c5a12d93",
+    "641ccf95bc96569e565d23845c9c3f612c662703",
 ];
 const NATIVE_ENDPOINT_EXPANSION_DEV_SHAS: &[&str] = &[
     "4b06ddcb7d4d3918faeb9a02f12c0ed7f4f19bbc",
     "c39f54354e1bd6616b2599ff685cdc3289cede78",
     "d5d5d72f31ff9f577e3333c11298f963c5a12d93",
+    "641ccf95bc96569e565d23845c9c3f612c662703",
 ];
 
 /// Every field older gateways would misread in a way that opens what it
@@ -1390,6 +1392,7 @@ mod tests {
             "4b06ddcb7d4d3918faeb9a02f12c0ed7f4f19bbc",
             "c39f54354e1bd6616b2599ff685cdc3289cede78",
             "d5d5d72f31ff9f577e3333c11298f963c5a12d93",
+            "641ccf95bc96569e565d23845c9c3f612c662703",
         ] {
             for sha in [known, &known[..7]] {
                 let version = format!("dev+sha-{sha}");
