@@ -213,6 +213,23 @@ async fn fixture_full_audit(
     platform: bool,
     io_audit: bool,
 ) -> Fixture {
+    fixture_full_audit_with_limit(
+        stream_timeout,
+        block_input,
+        platform,
+        io_audit,
+        Some(1048576),
+    )
+    .await
+}
+
+async fn fixture_full_audit_with_limit(
+    stream_timeout: bool,
+    block_input: bool,
+    platform: bool,
+    io_audit: bool,
+    body_limit: Option<usize>,
+) -> Fixture {
     let (sent, upstream_calls) = mpsc::unbounded_channel();
     let upstream_messages = Arc::new(Mutex::new(Vec::new()));
     let captured = io_audit.then(|| upstream_messages.clone());
@@ -325,9 +342,11 @@ async fn fixture_full_audit(
             ));
     }
     let snapshot = SnapshotHandle::new(snapshot);
-    let config =
-        serde_json::from_value(json!({"addr":"127.0.0.1:0","request_body_limit_bytes":1048576}))
-            .unwrap();
+    let mut config = json!({"addr":"127.0.0.1:0"});
+    if let Some(limit) = body_limit {
+        config["request_body_limit_bytes"] = json!(limit);
+    }
+    let config: ProxyConfig = serde_json::from_value(config).unwrap();
     let (tx, usage) = mpsc::channel(32);
     let (audit_tx, audit_updates) = mpsc::channel(32);
     let sink = aisix_obs::UsageSink::new(tx);
@@ -416,6 +435,121 @@ async fn completed(socket: &mut Client) -> Value {
             return value;
         }
     }
+}
+
+#[tokio::test]
+async fn websocket_default_body_limit_accepts_ping_and_a_response_round() {
+    for body_limit in [None, Some(0)] {
+        let mut f = fixture_full_audit_with_limit(false, false, false, false, body_limit).await;
+        let mut socket = connect(&f).await;
+        let nonce = Uuid::new_v4().as_bytes().to_vec();
+        socket
+            .send(ClientMessage::Ping(nonce.clone()))
+            .await
+            .unwrap();
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+            .await
+            .expect("默认配置应及时回复 Ping")
+            .expect("默认配置不应断开连接")
+            .expect("默认配置应接受非空控制帧");
+        assert_eq!(reply, ClientMessage::Pong(nonce));
+        assert!(f.upstream_calls.try_recv().is_err(), "Ping 不得触发上游");
+        socket
+            .send(ClientMessage::Text(
+                json!({"type":"response.create","model":"native-model","input":"prepare","generate":false})
+                    .to_string(),
+            ))
+            .await
+            .unwrap();
+        let response = completed(&mut socket).await;
+        assert_eq!(response["response"]["status"], "completed");
+        assert_eq!(response["response"]["model"], "native-model");
+        let sent = f.upstream_calls.recv().await.unwrap();
+        assert_eq!(sent["type"], "response.create");
+        assert_eq!(sent["model"], "provider-model");
+        socket.close(None).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn websocket_finite_body_limit_still_caps_frames_and_fragmented_messages() {
+    use tokio_tungstenite::tungstenite::protocol::frame::{
+        coding::{Data, OpCode},
+        Frame,
+    };
+    for fragmented in [false, true] {
+        let mut f = fixture_full_audit_with_limit(false, false, false, false, Some(256)).await;
+        let mut socket = connect(&f).await;
+        let nonce = Uuid::new_v4().as_bytes().to_vec();
+        socket
+            .send(ClientMessage::Ping(nonce.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            socket.next().await.unwrap().unwrap(),
+            ClientMessage::Pong(nonce)
+        );
+        let payload =
+            json!({"type":"response.create","model":"native-model","input":"x".repeat(300)})
+                .to_string();
+        assert!(payload.len() > 256);
+        if fragmented {
+            let split = payload.len() / 2;
+            assert!(split < 256 && payload.len() - split < 256);
+            socket
+                .send(ClientMessage::Frame(Frame::message(
+                    payload.as_bytes()[..split].to_vec(),
+                    OpCode::Data(Data::Text),
+                    false,
+                )))
+                .await
+                .unwrap();
+            socket
+                .send(ClientMessage::Frame(Frame::message(
+                    payload.as_bytes()[split..].to_vec(),
+                    OpCode::Data(Data::Continue),
+                    true,
+                )))
+                .await
+                .unwrap();
+        } else {
+            socket.send(ClientMessage::Text(payload)).await.unwrap();
+        }
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+            .await
+            .expect("超限帧或消息应终止连接");
+        assert!(
+            matches!(
+                reply,
+                None | Some(Err(_)) | Some(Ok(ClientMessage::Close(_)))
+            ),
+            "超限请求不得进入应用分派：{reply:?}"
+        );
+        assert!(f.upstream_calls.try_recv().is_err(), "超限请求不得触发上游");
+    }
+}
+
+#[tokio::test]
+async fn websocket_default_body_limit_keeps_the_protocol_frame_cap() {
+    let mut f = fixture_full_audit_with_limit(false, false, false, false, None).await;
+    let mut socket = connect(&f).await;
+    let oversized = "x".repeat((16 << 20) + 1);
+    // 客户端可能在服务端读到超限帧头并关闭后才完成发送。
+    let _ = socket.send(ClientMessage::Text(oversized)).await;
+    let reply = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+        .await
+        .expect("缺省协议帧上限应及时生效");
+    assert!(
+        matches!(
+            reply,
+            None | Some(Err(_)) | Some(Ok(ClientMessage::Close(_)))
+        ),
+        "HTTP 无限正文不能取消协议帧上限：{reply:?}"
+    );
+    assert!(
+        f.upstream_calls.try_recv().is_err(),
+        "超限协议帧不得触发上游"
+    );
 }
 
 #[tokio::test]

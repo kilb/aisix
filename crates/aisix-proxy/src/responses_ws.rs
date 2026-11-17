@@ -549,16 +549,20 @@ pub(crate) async fn responses_websocket(
     );
     let guard = crate::DrainGuard::new(state.livez.clone());
     let limit = state.request_body_limit_for("/v1/responses");
+    // HTTP 正文的 0 表示不额外限额；WebSocket 仍保留库的 64 MiB 消息、16 MiB 帧上限。
+    let ws = if limit == 0 {
+        ws
+    } else {
+        ws.max_message_size(limit).max_frame_size(limit)
+    };
     let span = tracing::Span::current();
-    ws.max_message_size(limit)
-        .max_frame_size(limit)
-        .on_upgrade(move |socket| {
-            async move {
-                run_session(state, client, peer, socket).await;
-                drop(guard);
-            }
-            .instrument(span)
-        })
+    ws.on_upgrade(move |socket| {
+        async move {
+            run_session(state, client, peer, socket).await;
+            drop(guard);
+        }
+        .instrument(span)
+    })
 }
 
 struct Create {
