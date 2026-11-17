@@ -21,15 +21,29 @@ test("fixed counter account choices follow each protocol's direct endpoint contr
     [{ provider: "anthropic" }, true, false],
     [{ provider: "openai" }, false, true],
     [{ provider: "other", adapter: "anthropic" }, true, false],
-    [{ provider: "other", adapter: "openai" }, false, false],
+    [{ provider: "other", adapter: "openai" }, false, true],
+    [{ provider: "other", adapter: "openai", apis: null }, false, true],
+    [{ provider: "other", adapter: "openai", apis: {} }, false, false],
+    [{ provider: "other", adapter: "openai", apis: { messages: {} } }, true, false],
+    [{ provider: "other", adapter: "openai", apis: { responses: null } }, false, false],
+    [{ provider: "other", adapter: "openai", apis: { responses: {} } }, false, true],
+    [{ provider: "other", adapter: "openai", apis: { messages: {}, responses: {} } }, true, true],
+    [{ provider: "other" }, false, false],
     [{ provider: "other", apis: { messages: {} } }, true, false],
     [{ provider: "other", apis: { responses: {} } }, false, true],
     [{ provider: "openai", apis: {} }, false, false],
+    [{ provider: "openai", apis: { messages: {} } }, true, false],
     [{ provider: "openai", apis: { responses: null } }, false, false],
     [{ provider: "anthropic", apis: {} }, true, false],
     [{ provider: "openai", apis: null }, false, true],
     ...["bedrock", "vertex", "azure-openai"].map((adapter) => [
       { provider: "anthropic", adapter, apis: { messages: {}, responses: {} } }, false, false,
+    ] as const),
+    ...["bedrock", "vertex", "azure-openai"].map((adapter) => [
+      { provider: "openai", adapter }, false, false,
+    ] as const),
+    ...["bedrock", "vertex", "azure-openai"].map((adapter) => [
+      { provider: "openai", adapter, apis: null }, false, false,
     ] as const),
   ] as const;
   for (const [account, messages, responses] of cases) {

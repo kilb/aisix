@@ -127,7 +127,7 @@ pub fn token_count_provider_serves(key: &super::ProviderKey, surface: super::Api
         }
         ApiSurface::Responses => match &key.apis {
             Some(apis) => apis.responses.is_some(),
-            None => key.provider == "openai",
+            None => key.provider == "openai" || key.adapter == Some(Adapter::Openai),
         },
     }
 }

@@ -305,9 +305,9 @@ async fn prepare(
     refuse_self_reference(w, &doc)?;
     refuse_retired_groups(&refs::retired_groups(conn, w.kind, &doc).await?)?;
     refs::check_outgoing(conn, w.kind, &doc).await?;
-    super::token_counting::check(conn, w.kind, &doc).await?;
+    let default_responses = super::token_counting::check(conn, w, &doc, stored).await?;
     super::realtime_sip::check(conn, ctx, w, &projected, stored).await?;
-    compat::gate(conn, ctx, w.kind, &doc, stored).await?;
+    compat::gate(conn, ctx, w.kind, &doc, stored, default_responses).await?;
     secrets::seal(&ctx.mk, w.kind, w.id, &mut doc);
     Ok(doc)
 }

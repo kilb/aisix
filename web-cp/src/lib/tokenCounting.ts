@@ -15,7 +15,7 @@ export interface TokenCountAccountDoc {
 export function tokenCountProviderServes(account: TokenCountAccountDoc, key: TokenCountKey): boolean {
   if (["bedrock", "vertex", "azure-openai"].includes(account.adapter ?? "")) return false;
   if (key === "messages_count_tokens") return account.provider === "anthropic" || account.adapter === "anthropic" || account.apis?.messages != null;
-  return account.apis != null ? account.apis.responses != null : account.provider === "openai";
+  return account.apis != null ? account.apis.responses != null : account.provider === "openai" || account.adapter === "openai";
 }
 
 export interface TokenCountSourceDoc {

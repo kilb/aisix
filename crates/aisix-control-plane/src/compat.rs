@@ -94,6 +94,9 @@ const API_KEY_ENDPOINTS_SINCE: Since = Since::ThisRelease;
 // 首次发布只固定这一处；写入门禁与 rollout 共用同一个发行门槛。
 const TOKEN_COUNTING_SINCE: Since = Since::ThisRelease;
 
+// 自定义账号的默认 Responses 计数语义晚于固定计数 kind，不继承旧构建白名单。
+const DEFAULT_RESPONSES_COUNTER_SINCE: Since = Since::ThisRelease;
+
 // 首个已发布并验证支持客户接口隔离的网关源码；控制面独立热修复仍识别其真实标记。
 const CUSTOMER_ENDPOINT_EXPANSION_DEV_SHA: &str = "08ff931722b737d40a8942a9e55de94afc9b51d5";
 
@@ -342,6 +345,14 @@ fn supports_token_counting_since(version: &str, cp_version: &str, since: &Since)
     }) {
         return true;
     }
+    supports_since_exact_dev(version, cp_version, since)
+}
+
+pub(crate) fn supports_default_responses_counter(version: &str, cp_version: &str) -> bool {
+    supports_since_exact_dev(version, cp_version, &DEFAULT_RESPONSES_COUNTER_SINCE)
+}
+
+fn supports_since_exact_dev(version: &str, cp_version: &str, since: &Since) -> bool {
     match (
         GatewayVersion::parse(version),
         GatewayVersion::parse(cp_version),
@@ -725,11 +736,13 @@ pub async fn gate(
     kind: Kind,
     doc: &Value,
     stored: &Value,
+    default_responses: Option<&'static str>,
 ) -> Result<(), ApiError> {
     let token_counting_floor = newly_triggered(FIELD_FLOORS, kind, doc, stored)
         .into_iter()
         .find(|floor| floor.kind == Kind::TokenCounting);
-    let token_counting = token_counting_floor.is_some();
+    let token_counting = token_counting_floor.is_some() || default_responses.is_some();
+    let counter_pointer = default_responses.or(token_counting_floor.map(|floor| floor.pointer));
     let customer_expansion = customer_endpoint_expansion(kind, doc, stored);
     let native_expansion = native_endpoint_expansion(kind, doc, stored);
     let floors: Vec<(&FieldFloor, Version)> = newly_triggered(FIELD_FLOORS, kind, doc, stored)
@@ -744,11 +757,20 @@ pub async fn gate(
         "SELECT version FROM dp_instances WHERE last_seen_at > now() - {FLEET_WINDOW} \
          AND (NOT $1 OR retired_at IS NULL)"
     ))
-    // 只缩小固定计数的清单；通用发行门槛同样使用它，其他 kind 保留完整窗口。
+    // 只缩小固定计数及其依赖账号的清单，其他写入保留完整窗口。
     .bind(token_counting)
     .fetch_all(&mut *conn)
     .await
     .map_err(DbError::from)?;
+    if let Some(pointer) = default_responses {
+        let unsupported = versions
+            .iter()
+            .filter(|version| !supports_default_responses_counter(version, &ctx.cp_version))
+            .count();
+        if unsupported > 0 {
+            return Err(too_old(pointer, format!("自定义账号的默认 Responses 固定计数需要全部未退役网关支持当前发行版；当前有 {unsupported} 个实例无法确认支持")));
+        }
+    }
     if let Some(floor) = token_counting_floor {
         let unsupported = versions
             .iter()
@@ -808,9 +830,9 @@ pub async fn gate(
                  部分网关实例未被记录，无法确认全部网关实例的版本"
                 ),
             )
-        } else if let Some(floor) = token_counting_floor {
+        } else if let Some(pointer) = counter_pointer {
             (
-                floor.pointer,
+                pointer,
                 "24 小时内有网关凭据达到实例上限，无法确认全部网关支持固定计数账号".to_string(),
             )
         } else {
@@ -833,7 +855,7 @@ pub async fn gate(
         .map_err(DbError::from)?;
         if full {
             return Err(too_old(
-                token_counting_floor.map_or("/allowed_endpoints", |floor| floor.pointer),
+                counter_pointer.unwrap_or("/allowed_endpoints"),
                 if token_counting {
                     "网关凭据的实例记录已达上限，无法确认全部网关支持固定计数账号"
                 } else {

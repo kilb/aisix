@@ -252,6 +252,8 @@ impl Fleet {
         } else {
             false
         };
+        let default_responses_live = token_counting_live
+            && crate::resources::token_counting::default_responses_live(conn).await?;
         let rejections_truncated = rows
             .iter()
             .filter(|(_, _, online, _, rejected, _)| *online && reports_a_full_list(rejected))
@@ -264,8 +266,13 @@ impl Fleet {
                     let mut rejections = rejections_of(env, &rejected);
                     let id = env.env_id.to_string();
                     if token_counting_live
-                        && cp_version
-                            .is_some_and(|cp| !crate::compat::supports_token_counting(&version, cp))
+                        && cp_version.is_some_and(|cp| {
+                            !crate::compat::supports_token_counting(&version, cp)
+                                || (default_responses_live
+                                    && !crate::compat::supports_default_responses_counter(
+                                        &version, cp,
+                                    ))
+                        })
                         && !rejections
                             .iter()
                             .any(|(kind, rid, _)| *kind == Kind::TokenCounting && *rid == id)

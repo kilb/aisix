@@ -89,7 +89,22 @@ fn token_counting_provider_protocol_contract() {
         (
             json!({"provider":"custom", "adapter":"openai"}),
             false,
+            true,
+        ),
+        (
+            json!({"provider":"custom", "adapter":"openai", "apis":{}}),
             false,
+            false,
+        ),
+        (
+            json!({"provider":"custom", "adapter":"openai", "apis":{"messages":{}}}),
+            true,
+            false,
+        ),
+        (
+            json!({"provider":"custom", "adapter":"openai", "apis":{"responses":{}}}),
+            false,
+            true,
         ),
         (json!({"provider":"openai", "apis":{}}), false, false),
         (
@@ -112,6 +127,21 @@ fn token_counting_provider_protocol_contract() {
             false,
             false,
         ),
+        (
+            json!({"provider":"openai", "adapter":"azure-openai"}),
+            false,
+            false,
+        ),
+        (
+            json!({"provider":"openai", "adapter":"bedrock", "apis":{"responses":{}}}),
+            false,
+            false,
+        ),
+        (
+            json!({"provider":"openai", "adapter":"vertex", "apis":{"responses":{}}}),
+            false,
+            false,
+        ),
     ] {
         let mut value = json!({"display_name":"counter", "api_key":"local-only"});
         value
@@ -130,6 +160,20 @@ fn token_counting_provider_protocol_contract() {
             "{value}"
         );
     }
+}
+
+#[test]
+fn token_counting_file_accepts_openai_compatible_counter_without_apis() {
+    let input = json!({
+        "_format_version":"1",
+        "provider_keys":[{
+            "display_name":"counter", "api_key":"local-only", "provider":"custom",
+            "adapter":"openai", "api_base":"https://counter.example.com/v1"
+        }],
+        "token_counting":[{"responses_input_tokens":{"provider_key":"counter"}}]
+    })
+    .to_string();
+    assert!(aisix_core::filesource::load_from_str(&input, "counter.json", 1, &|_| None).is_ok());
 }
 
 #[test]

@@ -243,18 +243,13 @@ pub enum ApiSurface {
 ///   decides WHERE the Anthropic wire lives, for the verbatim
 ///   passthrough and for the bridge that translates into it alike;
 ///   without one it is `api_base`.
-/// - `responses` is **authoritative**. Once this map exists, `/v1/responses`
-///   is served natively only if it is listed. The Responses API is a strict
-///   superset of chat completions rather than a rename, so an
-///   OpenAI-compatible endpoint serving one does not necessarily serve the
-///   other, and `adapter: openai` is not evidence either way. Leaving it
-///   out is how an operator says "this endpoint has no `/v1/responses`" and
-///   gets the request translated to chat completions instead of 404'd
-///   upstream.
+/// - `responses` 以此映射为准：配置了映射后，只有列出该项才原生使用
+///   `/v1/responses`；省略该项表示上游不支持此接口，请求将转换为
+///   Chat Completions。
 ///
-/// With no map at all, each falls back to what the gateway inferred
-/// before this field existed: `/v1/messages` from the vendor id or the
-/// `anthropic` adapter, `/v1/responses` from the vendor id alone.
+/// 未配置映射时，`provider: openai` 或 `adapter: openai` 的账号默认支持
+/// `/v1/responses`；`provider: anthropic` 或 `adapter: anthropic` 的账号
+/// 默认支持 `/v1/messages`。平台适配器仍使用各平台自己的接口。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 pub struct ProviderApis {
     /// OpenAI-wire `/v1/responses`.
