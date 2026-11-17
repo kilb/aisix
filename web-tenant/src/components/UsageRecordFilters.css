@@ -1,4 +1,4 @@
-/* 主筛选桌面保持单行，附加条件在工具条下展开，选择浮层由 Portal 承接。 */
+/* 主筛选在卡片内紧凑排列，附加条件在下方展开，选择浮层由 Portal 承接。 */
 .usage-record-filters { min-width: 0; margin: 0; }
 .usage-record-filter-primary { display: flex; align-items: flex-end; flex-wrap: nowrap; gap: 10px; min-width: 0; overflow-x: auto; overscroll-behavior-x: contain; padding: 2px 2px 6px; margin: -2px -2px -6px; }
 .usage-record-filter-primary:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
@@ -7,24 +7,53 @@
 .usage-record-filter-primary > .usage-record-filter-outcome { flex: 0 0 112px; min-width: 112px; }
 .usage-record-filter-primary :is(input, select, .ui-select-trigger) { height: 36px; min-height: 36px; width: 100%; min-width: 0; max-width: 100%; font: inherit; color: var(--ink); }
 .usage-record-filter-primary .field > .f { margin: 0; }
+.usage-record-filter-actions { display: flex; flex: none; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
 .usage-record-filter-more { display: inline-flex; flex: none; align-items: center; justify-content: center; gap: 6px; min-height: 36px; padding: 7px 10px; border: 1px solid var(--line); border-radius: var(--r-round); cursor: pointer; color: var(--ink-soft); font-size: var(--text-caption); line-height: 20px; white-space: nowrap; }
 .usage-record-filter-more:hover { background: var(--well); color: var(--ink); }
 .usage-record-filter-more:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
 .usage-record-filter-more[aria-expanded="true"] { border-color: var(--ink); color: var(--ink); }
 .usage-record-filter-more[aria-expanded="true"] > svg:last-child { transform: rotate(180deg); }
-.usage-record-filter-primary > .btn[data-icon-only] { flex: none; width: 36px; min-width: 36px; min-height: 36px; padding: 0; }
+.usage-record-filter-actions > .btn[data-icon-only] { flex: none; width: 36px; min-width: 36px; min-height: 36px; padding: 0; }
 .usage-record-filter-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); min-width: 0; gap: 14px 16px; margin: 14px 0 0; padding: 14px 0 0; border: 0; border-top: 1px solid var(--line); }
 .usage-record-filter-grid[hidden] { display: none; }
 .usage-record-filter-note { grid-column: 1 / -1; margin: 0; color: var(--muted-foreground); font-size: var(--text-caption); line-height: 20px; }
 @media (max-width: 719px) {
   .usage-record-filter-primary { gap: 10px 12px; }
-  .usage-record-filter-primary :is(input, select, .ui-select-trigger), .usage-record-filter-more, .usage-record-filter-primary > .btn[data-icon-only] { min-height: 44px; height: 44px; }
+  .usage-record-filter-primary :is(input, select, .ui-select-trigger), .usage-record-filter-more, .usage-record-filter-actions > .btn[data-icon-only] { min-height: 44px; height: 44px; }
   .usage-record-filter-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @media (max-width: 479px) { .usage-record-filter-grid { grid-template-columns: minmax(0, 1fr); } }
 
-/* 页面差异与组件同层，避免 legacy 层的宽度和留白被组件通用规则覆盖。 */
-.usage-calls-section > .usage-record-filters { margin-inline: 0; }
-.usage-calls-section .usage-record-filter-primary > .field:has(input[type="date"]) { flex: 0 0 146px; min-width: 146px; }
-.usage-calls-section .usage-record-filter-primary > .field:has(input:not([type])) { flex: 1 0 168px; min-width: 168px; }
-.usage-calls-section .usage-record-filter-primary > .field:has(input[type="search"]) { flex: 1.5 0 240px; min-width: 240px; }
+/* 筛选与结果是同级表面，吸顶只覆盖筛选自身，不受表格裁剪。 */
+.call-record-layout { display: flex; flex-direction: column; gap: 16px; min-width: 0; max-width: 100%; }
+.call-record-layout > .call-filter-card { flex: none; align-self: stretch; top: 68px; min-width: 0; margin: 0; padding: 14px 20px; border-radius: var(--r-tile); }
+.call-record-layout > .call-table-card { min-width: 0; width: 100%; margin: 0; }
+.call-record-layout > .call-filter-card .usage-record-filter-grid { max-height: min(420px, calc(100dvh - 300px)); overflow-y: auto; overscroll-behavior: contain; }
+@media (max-width: 719px) {
+  .call-record-layout > .call-filter-card { top: 76px; padding: 12px; }
+  .call-record-layout .usage-record-filter-primary { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: end; overflow: visible; gap: 10px 12px; margin: 0; padding: 0; }
+  .call-record-layout .usage-record-filter-primary > :is(label, .field, .usage-record-filter-outcome, .charge-event-filter) { min-width: 0; width: auto; }
+  .call-record-layout .usage-record-filter-more { justify-self: start; }
+  .call-record-layout > .call-filter-card .usage-record-filter-grid { max-height: min(320px, calc(100dvh - 520px)); min-height: 80px; }
+}
+
+/* 日期与身份条件分成两行，窄屏保留两列，不让整页承接横向溢出。 */
+.usage-call-layout > .usage-record-filters { margin-inline: 0; }
+.usage-call-layout .usage-record-filter-primary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); align-items: end; overflow: visible; margin: 0; padding: 0; }
+.usage-call-layout .usage-record-filter-primary > :is(label, .field) { min-width: 0; width: auto; }
+.usage-call-layout .usage-record-filter-more { justify-self: start; }
+@media (max-width: 719px) { .usage-call-layout .usage-record-filter-primary { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+
+.call-record-layout > .call-table-card > .record-table-toolbar { padding-inline: 20px; }
+.call-record-layout > .call-table-card > :is(.usage-call-notes, .hint, .note) { margin-inline: 20px; }
+@media (max-width: 1199px) { .call-record-layout .usage-record-filter-primary { flex-wrap: wrap; overflow-x: visible; } }
+@media (max-width: 719px) {
+  .call-record-layout > .call-table-card > .record-table-toolbar { padding-inline: 12px; }
+  .call-record-layout > .call-table-card > :is(.usage-call-notes, .hint, .note) { margin-inline: 12px; }
+}
+
+@media (max-width: 479px) {
+  .call-record-layout .usage-record-filter-actions { gap: 4px; }
+  .call-record-layout .usage-record-filter-more { gap: 2px; padding-inline: 4px; }
+  .call-record-layout .usage-record-filter-more > svg:first-child { display: none; }
+}

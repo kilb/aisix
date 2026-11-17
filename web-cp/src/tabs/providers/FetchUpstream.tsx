@@ -5,7 +5,6 @@ import { messageFor } from "../../lib/errors";
 import { errorText } from "../../lib/fmt";
 import { MAX_BULK_MODELS, appliedText, selectable, stateOf, stateText } from "../../lib/upstreamBulk";
 import { Button } from "../../ui/Button";
-import { CardHeader } from "../../components/page";
 import { DataTable } from "../../ui/DataTable";
 import { why } from "../../ui/UpstreamModelPicker";
 import { useRecordTable } from "../../lib/recordTable";
@@ -127,8 +126,7 @@ export function FetchUpstream({
 
   return (
     // A group, not a region: the section around it is the region named 模型.
-    <div className="panel ch-fetch mb-0" role="group" aria-label="获取上游模型">
-      <CardHeader number={6} title="获取上游模型" />
+    <div className="ch-fetch min-w-0 [--pad:0px]" role="group" aria-label="获取上游模型">
       <div className="flex flex-wrap items-start gap-3">
         <span aria-hidden="true" className="grid size-11 shrink-0 place-items-center rounded-field border border-hairline bg-sunken text-fg-2">
           <CloudDownload className="size-4" />

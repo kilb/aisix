@@ -27,6 +27,7 @@ interface LogResult {
 
 const numberValue = (value: unknown) => typeof value === "number" && Number.isFinite(value) ? value : null;
 const timeValue = (value: unknown) => typeof value === "string" && Number.isFinite(Date.parse(value)) ? fmtBeijing(value) : logValue(value);
+const DOWNSTREAM_TIMING_NOTE = "各接口按已有处理起点计时；Chat、Messages、Responses 流式通常截至首次下游协议输出（可能只有元数据），并非首个生成内容。其他接口可能统计完整响应、整段流或会话；不代表客户端完整请求耗时。";
 
 function Fields({ items }: { items: [string, unknown, string?][] }) {
   return <dl className="call-log-fields">{items.map(([label, value, title]) => <div key={label}><dt title={title}>{label}</dt><dd>{logValue(value)}</dd></div>)}</dl>;
@@ -197,10 +198,14 @@ export function CallLogDetails({ eventId, backHref }: { eventId: string; backHre
             ["接收时间", timeValue(stored?.received_at)],
             ["首 Token 延迟", formatDuration(numberValue(event?.first_token_latency_ms ?? charge?.first_token_latency_ms))],
             ["上游尝试耗时", formatDuration(numberValue(event?.upstream_latency_ms ?? charge?.attempt_duration_ms))],
-            ["客户端总耗时", formatDuration(numberValue(event?.downstream_latency_ms))],
+            ["下游响应阶段耗时", formatDuration(numberValue(event?.downstream_latency_ms)), DOWNSTREAM_TIMING_NOTE],
             ["上游首帧延迟", formatDuration(numberValue(event?.upstream_ttft_ms))],
             ["输出 TPS", formatThroughput(charge), OUTPUT_THROUGHPUT_NOTE],
           ]} />
+          <details className="mt-3 text-caption text-muted">
+            <summary className="cursor-pointer">计时口径</summary>
+            <p className="mt-2">{DOWNSTREAM_TIMING_NOTE}</p>
+          </details>
           {charge?.usage_estimated === true && <p className="hint">{ESTIMATED_THROUGHPUT_NOTE}</p>}
           <RequestTimingDetails data={event ? event.request_timing : charge?.request_timing} />
           <UpstreamTimingDetails data={event ? event.upstream_timing : charge?.upstream_timing} />

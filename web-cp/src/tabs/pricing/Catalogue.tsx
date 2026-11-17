@@ -15,6 +15,7 @@ import { CardLines } from "./LibrarySync";
 import { Count } from "./kit";
 import { ChevronDown } from "lucide-react";
 import { Select } from "../../ui/Select";
+import "./Catalogue.css";
 
 /** A row's identity: a key can appear again with a later `effective_from`. */
 const rowId = (e: CatalogueEntry) => `${e.key}@${e.effective_from ?? ""}`;
@@ -73,7 +74,7 @@ export function Catalogue(_props: TabProps) {
           <RecordTableToolbar search={{ value: records.query, onChange: records.setQuery, label: "搜索目录", placeholder: "目录标识或别名" }}>
             <label className="f filter"><span>来源</span><Select size="compact" value={source} onValueChange={(value) => setSource(value)}><option value="">全部</option><option value="sourced">附来源链接</option><option value="missing">无来源链接</option></Select></label>
           </RecordTableToolbar>
-          <DataTable label="价格目录">
+          <DataTable label="价格目录" tableClassName="catalogue-table">
             <colgroup>
               <col className="catalogue-col-name" />
               <col className="catalogue-col-alias" />
@@ -114,10 +115,10 @@ export function Catalogue(_props: TabProps) {
                             href={e.source_url}
                             target="_blank"
                             rel="noreferrer noopener"
-                            className="trunc inline-flex min-h-11 min-w-11 items-center [--trunc:15rem]"
+                            className="catalogue-source-link"
                             title={e.source_url}
                           >
-                            {e.source_url}
+                            {new URL(e.source_url).host}
                           </a>
                         ) : (
                           "—"
@@ -127,11 +128,17 @@ export function Catalogue(_props: TabProps) {
                         {e.effective_from ? `${fmtBeijing(e.effective_from)} 起` : (e.as_of ?? "—")}
                         {e.effective_from && e.as_of && <div className="cell-note">抄录于 {e.as_of}</div>}
                       </td>
-                      {/* 说明先显示三行摘要，完整内容可在标题和展开条目中查看。 */}
-                      <td data-label="说明" className="w-full max-w-0 text-caption text-muted">
-                        <span className="line-clamp-3" title={e.notes ?? undefined}>
-                          {e.notes ?? "—"}
-                        </span>
+                      {/* 默认行保留轻量入口，来源说明原文随完整条目展开。 */}
+                      <td data-label="说明">
+                        {e.notes ? <Button
+                          size="sm"
+                          kind="quiet"
+                          type="button"
+                          aria-label={`查看 ${e.key} 的说明`}
+                          aria-expanded={expanded}
+                          className="catalogue-notes-button"
+                          onClick={() => setOpen(expanded ? null : id)}
+                        >{expanded ? "收起说明" : "查看说明"}</Button> : "—"}
                       </td>
                       <td data-label="操作" className="right">
                         <Button
@@ -152,6 +159,15 @@ export function Catalogue(_props: TabProps) {
                       <tr className="dt-detail">
                         <td colSpan={6} className="whitespace-normal">
                           <div className="catalogue-entry-detail grid gap-6 p-4">
+                            <div className="catalogue-provenance">
+                              <h3>来源与说明</h3>
+                              <dl>
+                                <div><dt>来源页面</dt><dd>{e.source_url ? <a href={e.source_url} target="_blank" rel="noreferrer noopener">{e.source_url}</a> : "—"}</dd></div>
+                                <div><dt>抄录日期</dt><dd>{e.as_of ?? "—"}</dd></div>
+                                {e.effective_from && <div><dt>生效时间</dt><dd>{fmtBeijing(e.effective_from)} 起</dd></div>}
+                              </dl>
+                              {e.notes && <p className="catalogue-notes-full">{e.notes}</p>}
+                            </div>
                             <div className="min-w-0">
                               <div className="library-card-block">
                                 <p className="m-0 font-medium">完整价格 · 美元</p>

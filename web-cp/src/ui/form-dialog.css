@@ -5,7 +5,7 @@
 .form-dialog-description { margin: 4px 0 0; max-width: 64ch; color: var(--muted-foreground); font-size: var(--text-small); line-height: 1.55; }
 .form-dialog-close { flex: none; width: 44px; padding: 0; margin: -8px -8px -8px 0; }
 .form-dialog-body { min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 20px; }
-.form-dialog-body > .panel { padding: 0; border: 0; border-radius: 0; }
+.form-dialog-body > .panel { padding: 0; border: 0; border-radius: 0; box-shadow: none; }
 .form-dialog-body > .panel > .bento-card-header { display: none; }
 .form-dialog-body :is(.finance-form-grid, .tenant-key-form) { row-gap: 16px; }
 .form-dialog-body form > :last-child { margin-bottom: 0; }

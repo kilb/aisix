@@ -4,7 +4,7 @@
   flex-wrap: wrap;
   align-items: flex-end;
   gap: 12px 16px;
-  margin: 4px 0;
+  margin-block: 4px;
 }
 .record-table-toolbar > * { min-width: 0; }
 .record-table-search { flex: 1 1 240px; max-width: 420px; }

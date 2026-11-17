@@ -137,8 +137,11 @@
 .tenant-context { flex-direction: row; align-items: center; gap: 10px; }
 .tenant-context-copy { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
 .tenant-context-avatar { display: grid; flex: none; width: 36px; height: 36px; place-items: center; border-radius: var(--r-field); background: var(--card); color: var(--foreground); font-weight: 800; }
-.overview-account-reading { display: grid; gap: 8px; padding: 16px; border-radius: var(--radius-tile); background: var(--tint); }
+.overview-account-reading { display: grid; gap: 8px; padding: 0; border-radius: 0; background: transparent; }
 .overview-account-reading :is(.metric, p, dl) { margin-top: 0; }
+/* 空额度采用行内提示，让实际可用数值留在预算页的主要视区。 */
+.tenant-budgets .empty { flex-direction: row; justify-content: flex-start; gap: 8px; margin: 0 20px 20px; padding: 0; text-align: left; }
+.tenant-budgets .empty > .icon { flex: none; }
 @media (max-width: 1023px) {
   .tenant-account { grid-template-columns: minmax(0, 1fr); }
   .tenant-gate .gate-introduction, .tenant-gate .gate-panel { grid-column: 1 / -1; }

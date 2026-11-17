@@ -16,7 +16,7 @@ import { exactInteger, formatCount } from "../../lib/chartFormat";
 import { Lamp } from "../../ui/Lamp";
 import { Select } from "../../ui/Select";
 
-// 桌面/平板：12；6 + 6；12。
+// 核对、统计与明细各占通栏，避免孤立半宽指标留下空位。
 /**
  * "对账": whether each tenant's ledger matches what moved it, the calls
  * charged with no ledger entry, the calls stored unpriced in the last 24
@@ -182,13 +182,13 @@ export function Reconciliation(_props: TabProps) {
               )}
             </Card>
 
-            <Card aria-label="已计费但未入账" className={span.d6} tone="inverse">
-              <CardHeader number={2} title="已计费但未入账" />
-              <Metric size="hero">{formatCount(answer.charged_without_entry)}</Metric>
-              <p className="mt-3 font-mono text-meta text-on-inverse-muted">笔调用</p>
-              <p className="mt-5 text-caption text-on-inverse-muted">
-                {filtered ? "仅统计所选租户。" : "统计全部租户。"}已计费的调用在账本里没有对应流水。
-              </p>
+            <Card aria-label="已计费但未入账" className={`${span.d12} finance-reconciliation-count`}>
+              <CardHeader
+                number={2}
+                title="已计费但未入账"
+                description={`${filtered ? "仅统计所选租户。" : "统计全部租户。"}已计费的调用在账本里没有对应流水。`}
+                actions={<div className="flex items-baseline gap-2"><Metric>{formatCount(answer.charged_without_entry)}</Metric><span className="text-caption text-muted">笔调用</span></div>}
+              />
             </Card>
 
             <Card aria-label="近 24 小时未计价" className={span.d12}>

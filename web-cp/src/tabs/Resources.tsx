@@ -299,17 +299,17 @@ function KindPage({ info, canEdit }: { info: KindInfo; canEdit: boolean }) {
   );
 
   const editor = editing && (
-    <section ref={panel} className="panel resources-editor" data-tone="surface" aria-label={`${info.label}文档设置`}>
-      <CardHeader
+    <section ref={panel} className={editing.mode === "new" ? "resources-editor" : "panel resources-editor"} data-tone="surface" aria-label={`${info.label}文档设置`}>
+      {editing.mode === "edit" && <CardHeader
         as="h2"
         title={
           <span className="inline-flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 break-all">
-            {editing.mode === "new" ? `新建${info.label}` : (current && nameOf(current.doc)) || editing.id}
+            {(current && nameOf(current.doc)) || editing.id}
             {current && <RolloutBadge rollout={current.rollout} />}
           </span>
         }
-        description={editing.mode === "edit" ? <code className="break-all">{editing.id}</code> : undefined}
-      />
+        description={<code className="break-all">{editing.id}</code>}
+      />}
       {editing.mode === "edit" && derived && <div className="note mt-0">{MANAGED_NOTE}</div>}
       {editing.mode === "edit" && !derived && !canEdit && <p className="hint mb-3">当前账号只读。</p>}
       <JsonEditor

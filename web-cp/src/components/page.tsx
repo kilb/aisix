@@ -123,7 +123,7 @@ export function Grid({ className, ...props }: ComponentProps<"div">) {
 }
 
 export function StatGrid({ className, ...props }: ComponentProps<"div">) {
-  return <div {...props} className={cn("bento-stat-grid mb-(--card-gap) grid gap-(--card-gap) tablet:grid-cols-2 desktop:grid-cols-4", className)} />;
+  return <div {...props} className={cn("bento-stat-grid mb-(--card-gap) grid grid-cols-2 gap-(--card-gap) desktop:grid-cols-4", className)} />;
 }
 
 export function Stat({ label, value, foot, className }: { label: ReactNode; value: ReactNode; foot?: ReactNode; className?: string }) {

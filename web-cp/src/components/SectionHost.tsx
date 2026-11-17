@@ -1,6 +1,7 @@
 import { useEffect, useState, type ComponentType } from "react";
 import type { TabProps } from "../App";
 import type { OperatorRole } from "../lib/api";
+import { adminRouteOf } from "../lib/navigation";
 import { EmptyState } from "../ui/EmptyState";
 
 /** One section of a tab that holds several: a page of its own, shown to operators of `minRole` and above. */
@@ -33,8 +34,14 @@ export function SectionHost({
   const shown = sections.filter((s) => RANK[props.operator.role] >= RANK[s.minRole]);
   const [open, setOpen] = useState<string | null>(initialSection ?? null);
   useEffect(() => {
-    if (initialSection) setOpen(initialSection);
+    setOpen(initialSection ?? null);
   }, [initialSection, sectionVisit]);
+  const selectSection = (id: string) => {
+    const route = adminRouteOf(window.location.hash);
+    // 仅更新分区，保留当前页的租户选择与其它筛选参数。
+    route.query.set("section", id);
+    window.location.hash = `#${route.tab}?${route.query.toString()}`;
+  };
   // A section this build does not register yet closes nothing: the first one stands in.
   const current = shown.find((s) => s.id === open) ?? shown[0];
 
@@ -52,7 +59,7 @@ export function SectionHost({
       {shown.length > 1 && (
         <div className="sections-switch mb-4 min-h-11 gap-1 rounded-full border-0 bg-well p-1" role="group" aria-label={`${label}分区`}>
           {shown.map((s) => (
-            <button key={s.id} type="button" className="h-11 shrink-0 rounded-full px-4 text-small font-semibold text-ink-soft after:hidden hover:bg-surface hover:text-ink aria-pressed:bg-ink aria-pressed:text-surface" aria-pressed={s.id === current.id} onClick={() => setOpen(s.id)}>
+            <button key={s.id} type="button" className="h-11 shrink-0 rounded-full px-4 text-small font-semibold text-ink-soft after:hidden hover:bg-surface hover:text-ink aria-pressed:bg-ink aria-pressed:text-surface" aria-pressed={s.id === current.id} onClick={() => selectSection(s.id)}>
               {s.label}
             </button>
           ))}

@@ -704,8 +704,14 @@ export function KeyForm({
         </div>
       )}
       <form ref={form} className="tenant-form tenant-key-form grid min-w-0 gap-x-7 gap-y-5 tablet:grid-cols-2" onSubmit={submit} noValidate>
-        <Field label="名称" wide error={errs.label}>
+        <Field label="名称" error={errs.label}>
           {(aria) => <input value={label} onChange={(e) => setLabel(e.target.value)} {...aria} />}
+        </Field>
+
+        <Field label="过期时间" hint="留空表示永不过期；时间采用 UTC+8" error={errs.expires}>
+          {(aria) => (
+            <input type="datetime-local" value={expires} onChange={(e) => setExpires(e.target.value)} {...aria} />
+          )}
         </Field>
 
         {/* The group, as radio cards: one per group the organisation is
@@ -777,7 +783,7 @@ export function KeyForm({
         <div className="field wide">
           <fieldset className="field" aria-describedby={modelsDescribedBy}>
             <legend>可用模型</legend>
-            <div className="grid gap-3">
+            <div className="key-model-scope-options">
               <label className="pick">
                 <input
                   type="radio"
@@ -895,19 +901,13 @@ export function KeyForm({
           </Field>
         </>}
 
-        <Field label="过期时间" wide hint="留空表示永不过期；时间采用 UTC+8" error={errs.expires}>
-          {(aria) => (
-            <input type="datetime-local" value={expires} onChange={(e) => setExpires(e.target.value)} {...aria} />
-          )}
-        </Field>
-
-        {initial && <Field label="密钥状态" wide hint={initial.disabled_by_platform ? "平台已停用此密钥，只有平台可以重新启用。" : "停用后无法调用，重新启用仍受组织授权和额度约束。"}>
+        {initial && <Field label="密钥状态" hint={initial.disabled_by_platform ? "平台已停用此密钥，只有平台可以重新启用。" : "停用后无法调用，重新启用仍受组织授权和额度约束。"}>
           <Select value={disabled ? "disabled" : "enabled"} disabled={initial.disabled_by_platform} onValueChange={value => setDisabled(value === "disabled")}>
             <option value="enabled">启用</option><option value="disabled">停用</option>
           </Select>
         </Field>}
-        {initial ? <div className="field wide"><span className="f-label">归属成员</span><p>{initial.owner === null ? "组织" : initial.owner.id === me.id ? "我" : initial.owner.display_name ?? "成员"}（只读）</p><p className="hint">密钥创建后不能更换归属成员；如需更换，请新建密钥。</p></div> : manager && (
-          <Field label="归属成员" wide error={errs.owner}>
+        {initial ? <div className="field"><span className="f-label">归属成员</span><p>{initial.owner === null ? "组织" : initial.owner.id === me.id ? "我" : initial.owner.display_name ?? "成员"}（只读）</p><p className="hint">密钥创建后不能更换归属成员；如需更换，请新建密钥。</p></div> : manager && (
+          <Field label="归属成员" error={errs.owner}>
             {(aria) => (
               <Select value={owner} onValueChange={setOwner} {...aria}>
                 <option value="">我</option>

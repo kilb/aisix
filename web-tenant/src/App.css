@@ -13,3 +13,8 @@
   background: transparent;
 }
 .sidebar-shell .tenant-context-avatar { background: var(--well); }
+
+/* 窄屏优先收紧面包屑，两个操作保留完整触控宽度与页面内边距。 */
+@media (max-width: 719px) {
+  .sidebar-shell .shell-user-tools { flex-shrink: 0; }
+}

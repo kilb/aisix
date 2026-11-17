@@ -1,6 +1,6 @@
 import { useRecordTable } from "../../lib/recordTable";
 import { RecordTools, RecordPager } from "../../components/RecordTools";
-import { Fragment, useCallback, useEffect, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { TabProps } from "../../App";
 import { charges, tenants as tenantsApi, type AdminKey, type Charge, type ChargeFilter, type Tenant } from "../../lib/api";
 import { callDetailHash, callOutcomeLabel } from "../../lib/callLog";
@@ -55,6 +55,19 @@ export function Charges(_props: TabProps) {
   const rows = shown?.rows ?? null;
   const next = shown?.next ?? null;
   const error = shown?.error ?? null;
+  const resultsLoading = rows === null && !error;
+  const resultCard = useRef<HTMLElement>(null);
+  const [resultHeight, setResultHeight] = useState(0);
+  // 只记已完成结果卡的几何高度；加载仍清空旧行，深滚动不因占位变短而被夹回。
+  useLayoutEffect(() => {
+    const card = resultCard.current;
+    if (resultsLoading || !card) return;
+    const measure = () => setResultHeight(card.getBoundingClientRect().height);
+    const observer = new ResizeObserver(measure);
+    observer.observe(card);
+    measure();
+    return () => observer.disconnect();
+  }, [resultsLoading]);
   const activeKey = useRef(filterKey);
   activeKey.current = filterKey;
   const [loadingMore, setLoadingMore] = useState(false);
@@ -145,13 +158,8 @@ export function Charges(_props: TabProps) {
           <Button className="charge-icon-button" aria-label="刷新" title="刷新" type="button" icon="refresh" onClick={() => void loadFirst(filter)}></Button>
         }
       />
-      <Card className="charge-workspace" padding="table">
-        <CardHeader
-          number={1}
-          title="调用计费记录"
-          description={rows === null ? (error ? "当前筛选结果读取失败，请重试。" : "正在读取当前筛选结果。") : `当前筛选已加载 ${formatCount(rows.length)} 条${next === null ? "，已到记录末尾。" : "，可继续加载。"}`}
-        />
-        <div className="charge-filter-controls sticky-filters">
+      <div className="call-record-layout" data-loading={resultsLoading}>
+        <section className="charge-filter-controls call-filter-card sticky-filters" aria-label="调用记录筛选">
         <UsageRecordFilters scope="admin" value={usageRecordFilterValues(query)} onChange={patch => update(patch)} advancedChildren={<ChargeScopeFilters key={JSON.stringify([filter.from, filter.to, filter.member_id, filter.provider_key_id, filter.request_id, filter.model_id])} filter={filter} onChange={set} />}>
           <label><span>状态</span>
             <Select size="compact" value={filter.status ?? ""} onValueChange={value => set({ status: value || undefined })}>
@@ -186,7 +194,13 @@ export function Charges(_props: TabProps) {
             </Button>
           </div>
         )}
-        </div>
+        </section>
+      <Card ref={resultCard} style={{ minHeight: resultsLoading ? resultHeight : undefined }} className="charge-workspace call-table-card" padding="table" role="region" aria-label="调用计费记录">
+        <CardHeader
+          number={1}
+          title="调用计费记录"
+          description={rows === null ? (error ? "当前筛选结果读取失败，请重试。" : "正在读取当前筛选结果。") : `当前筛选已加载 ${formatCount(rows.length)} 条${next === null ? "，已到记录末尾。" : "，可继续加载。"}`}
+        />
         {error && (
           <div className="note crit" role="alert">
             {error}
@@ -291,6 +305,7 @@ export function Charges(_props: TabProps) {
         )}
 
       </Card>
+      </div>
     </>
   );
 }

@@ -1,62 +1,83 @@
-/* 沿用控制台原语；记录自然分页，窄屏按字段重排而不横向滚动。 */
-.model-assessment { display: grid; gap: 16px; min-width: 0; }
-.model-assessment :is(fieldset, .panel, form, details) { min-width: 0; }
-.model-assessment fieldset { margin: 0; padding: 0; border: 0; }
-.model-assessment .bento-card-header { margin-bottom: 16px; }
-.assessment-form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
-.assessment-form-grid :is(select, input, textarea) { width: 100%; min-width: 0; max-width: 100%; }
-.assessment-checkbox { display: flex; align-items: center; gap: 10px; min-height: 44px; margin-block: 16px; font-size: var(--text-body); line-height: 1.6; }
-.assessment-checkbox input { width: 18px; height: 18px; flex: none; accent-color: var(--color-fg); }
-.assessment-help { margin-block: 12px; color: var(--color-fg-3); font-size: var(--text-small); line-height: 1.7; overflow-wrap: anywhere; }
-.assessment-run-id, .assessment-secondary { display: block; margin-top: 6px; color: var(--color-fg-3); font-size: var(--text-small); font-weight: 400; overflow-wrap: anywhere; }
-.assessment-targets { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; padding-block: 16px; border-block: 1px solid var(--color-hairline); }
-.assessment-targets > div { min-width: 0; }
-.assessment-targets :is(strong, span, code) { display: block; margin-top: 6px; overflow-wrap: anywhere; }
-.assessment-targets h3 { margin: 0; color: var(--color-fg-3); font-size: var(--text-small); font-weight: 400; }
-.assessment-targets strong { font-size: var(--text-title); font-weight: 500; }
-.assessment-targets :is(span, code) { color: var(--color-fg-3); font-size: var(--text-small); }
-.assessment-budget { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; margin: 16px 0; }
-.assessment-budget > div { min-width: 0; }
-.assessment-budget dt { font-size: var(--text-small); color: var(--color-fg-3); }
-.assessment-budget dd { margin: 8px 0 0; font-size: var(--text-title); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
-.assessment-metadata { margin-block: 16px; padding: 12px 16px; background: var(--color-sunken); border-radius: var(--radius-field); font-size: var(--text-small); }
-.model-assessment summary { min-height: 44px; padding-block: 10px; cursor: pointer; }
-.assessment-metadata dl { display: grid; gap: 12px; margin-block: 12px; }
-.assessment-metadata dt { color: var(--color-fg-3); }
-.assessment-metadata dd { margin: 4px 0 0; overflow-wrap: anywhere; }
-.assessment-start { margin-block: 16px; padding: 16px; border: 1px solid var(--color-hairline); border-radius: var(--radius-field); font-size: var(--text-body); }
-.assessment-start > .btn { margin-top: 12px; }
-.assessment-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-block: 16px; font-size: var(--text-small); }
-.assessment-progress { margin-top: 20px; font-size: var(--text-body); }
-.assessment-progress-bar { display: block; width: 100%; height: 5px; margin-block: 12px; border: 0; border-radius: var(--r-round); appearance: none; background: var(--color-sunken); accent-color: var(--color-fg); }
-.assessment-progress-bar::-webkit-progress-bar { background: var(--color-sunken); }
-.assessment-progress-bar::-webkit-progress-value { background: var(--color-fg); }
-.assessment-progress-bar::-moz-progress-bar { background: var(--color-fg); }
-.assessment-counts { padding-block: 16px; border-block: 1px solid var(--color-hairline); }
-.assessment-result-title { margin-top: 16px; font-size: var(--text-title); font-weight: 600; }
-.assessment-warnings { margin: 12px 0; padding-left: 20px; color: var(--color-fg-2); font-size: var(--text-small); line-height: 1.7; overflow-wrap: anywhere; }
-.model-assessment .dt :is(th, td) { white-space: normal; overflow-wrap: anywhere; }
-.model-assessment .dt th { font-weight: 500; }
-.model-assessment .dt th:first-child { width: 25%; }
-.model-assessment .dt [aria-current="true"] { background: var(--color-sunken); }
-.assessment-answer { max-width: 100%; margin-block: 8px; white-space: pre-wrap; overflow-wrap: anywhere; font-size: var(--text-small); }
-@media (max-width: 720px) {
-  .assessment-form-grid, .assessment-targets { grid-template-columns: minmax(0, 1fr); }
-  .assessment-budget { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
-  .assessment-counts { grid-template-columns: minmax(0, 1fr); }
-  .assessment-start .btn { max-width: 100%; white-space: normal; }
-}
-
+/* 历史先行，详情按摘要、预算、结果阅读；证据按需展开。 */
+.model-assessment, .assessment-details { display: grid; gap: 16px; min-width: 0; }
+.model-assessment :is(fieldset, .panel, form, details), .assessment-plan-form fieldset { min-width: 0; }
+.model-assessment fieldset, .assessment-plan-form fieldset { margin: 0; padding: 0; border: 0; }
 .model-assessment > .panel { margin: 0; }
+.model-assessment .bento-card-header { margin-bottom: 0; }
+.assessment-details { scroll-margin-top: 76px; outline: none; }
+.assessment-details:focus-visible { outline: 2px solid var(--ring); outline-offset: 4px; border-radius: var(--radius-card); }
 .assessment-create-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px 16px; }
 .assessment-create-toolbar > .assessment-help { max-width: 76ch; margin: 0; }
 .assessment-plan-form { min-width: 0; }
-.assessment-plan-form .assessment-form-grid { gap: 16px; }
+.assessment-form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.assessment-form-grid :is(select, input, textarea) { width: 100%; min-width: 0; max-width: 100%; }
 .assessment-plan-form .field { margin: 0; }
 .assessment-plan-form > .btn { margin-top: 4px; }
-.assessment-targets > div { padding: 16px; border-radius: var(--radius-tile); background: var(--color-sunken); }
-.assessment-targets { padding: 0; border: 0; }
-.assessment-targets strong { font-size: var(--text-title); font-weight: 700; }
-.assessment-budget dd { font-size: var(--text-title); font-weight: 700; }
-.assessment-metadata { border-radius: var(--radius-tile); }
-.assessment-start { border-radius: var(--radius-tile); background: var(--color-sunken); border-color: transparent; }
+.assessment-checkbox { display: flex; align-items: flex-start; gap: 10px; min-height: 44px; margin-block: 12px; font-size: var(--text-body); line-height: 1.6; }
+.assessment-checkbox input { width: 18px; height: 18px; flex: none; margin-top: 3px; accent-color: var(--color-fg); }
+.assessment-help { margin-block: 8px; color: var(--color-fg-3); font-size: var(--text-small); line-height: 1.7; overflow-wrap: anywhere; }
+.assessment-run-id, .assessment-secondary { display: block; margin-top: 4px; color: var(--color-fg-3); font-size: var(--text-small); font-weight: 400; overflow-wrap: anywhere; }
+.model-assessment .assessment-run { gap: 12px; }
+.assessment-run > .assessment-help { margin: 0; }
+.assessment-targets { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 24px; padding-block: 12px; border-block: 1px solid var(--color-hairline); }
+.assessment-targets > div { min-width: 0; }
+.assessment-targets :is(strong, span, code) { display: block; margin-top: 4px; overflow-wrap: anywhere; }
+.assessment-targets h3 { margin: 0; color: var(--color-fg-3); font-size: var(--text-small); font-weight: 400; }
+.assessment-targets strong { font-size: var(--text-title); font-weight: 600; }
+.assessment-targets :is(span, code) { color: var(--color-fg-3); font-size: var(--text-small); }
+.assessment-budget { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px 24px; margin: 0; }
+.assessment-budget > div { min-width: 0; }
+.assessment-budget dt { font-size: var(--text-small); color: var(--color-fg-3); }
+.assessment-budget dd { margin: 4px 0 0; font-size: var(--text-body); font-weight: 600; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.assessment-status { display: grid; gap: 8px; }
+.assessment-status .assessment-help { margin: 0; }
+.assessment-progress { font-size: var(--text-body); }
+.assessment-progress-bar { display: block; width: 100%; height: 5px; margin: 0; border: 0; border-radius: var(--r-round); appearance: none; background: var(--color-sunken); accent-color: var(--color-fg); }
+.assessment-progress-bar::-webkit-progress-bar { background: var(--color-sunken); }
+.assessment-progress-bar::-webkit-progress-value { background: var(--color-fg); }
+.assessment-progress-bar::-moz-progress-bar { background: var(--color-fg); }
+.assessment-counts { gap: 8px 24px; }
+.assessment-start { margin: 0; padding-block: 12px; border-block: 1px solid var(--color-hairline); font-size: var(--text-body); }
+.assessment-start > p { margin: 0; }
+.assessment-start > .btn { margin-top: 0; }
+.assessment-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin: 0; font-size: var(--text-small); }
+.assessment-result-title { margin: 0; padding-top: 12px; border-top: 1px solid var(--color-hairline); font-size: var(--text-title); font-weight: 600; }
+.assessment-metadata, .assessment-explanation { margin: 0; font-size: var(--text-small); }
+.assessment-metadata { border-top: 1px solid var(--color-hairline); }
+.model-assessment summary { min-height: 44px; padding-block: 10px; cursor: pointer; font-size: var(--text-small); }
+.model-assessment summary:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; border-radius: var(--radius-field); }
+.assessment-metadata dl { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 24px; margin-block: 8px; }
+.assessment-metadata dt { color: var(--color-fg-3); }
+.assessment-metadata dd { margin: 4px 0 0; overflow-wrap: anywhere; }
+.assessment-warnings { margin: 8px 0; padding-left: 20px; color: var(--color-fg-2); font-size: var(--text-small); line-height: 1.7; overflow-wrap: anywhere; }
+.model-assessment .dt :is(th, td) { white-space: normal; overflow-wrap: anywhere; }
+.model-assessment .dt th { font-weight: 500; }
+.model-assessment .dt [aria-current="true"] { background: var(--color-sunken); }
+.assessment-history .dt [data-label="操作"] .btn { white-space: nowrap; }
+.assessment-samples-disclosure { padding: 0 20px; border-top: 1px solid var(--color-hairline); }
+.assessment-samples-disclosure > summary { font-size: var(--text-title); font-weight: 600; }
+.assessment-samples-disclosure > summary > span { margin-left: 12px; color: var(--color-fg-3); font-size: var(--text-small); font-weight: 400; }
+.assessment-samples-disclosure > .panel { padding: 12px 0 0; border: 0; border-radius: 0; box-shadow: none; background: transparent; }
+.assessment-answer { max-width: 100%; margin-block: 8px; white-space: pre-wrap; overflow-wrap: anywhere; font-size: var(--text-small); }
+@container (min-width: 761px) {
+  .model-assessment .dt { table-layout: fixed; }
+  .assessment-history .dt th:nth-child(1) { width: 30%; }
+  .assessment-history .dt th:nth-child(2) { width: 21%; }
+  .assessment-history .dt th:nth-child(3) { width: 24%; }
+  .assessment-history .dt th:nth-child(4) { width: 13%; }
+  .assessment-history .dt th:nth-child(5) { width: 12%; }
+  .assessment-run .dt th:nth-child(1) { width: 25%; }
+  .assessment-run .dt th:nth-child(2) { width: 25%; }
+  .assessment-run .dt th:nth-child(3) { width: 25%; }
+  .assessment-run .dt th:nth-child(4) { width: 25%; }
+}
+@media (max-width: 720px) {
+  .assessment-form-grid, .assessment-targets, .assessment-metadata dl { grid-template-columns: minmax(0, 1fr); }
+  .assessment-targets { gap: 16px; }
+  .assessment-budget { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+  .assessment-counts { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .assessment-counts dt { font-size: var(--text-caption); }
+  .assessment-start .btn { max-width: 100%; white-space: normal; }
+  .assessment-samples-disclosure { padding-inline: 0; }
+  .assessment-samples-disclosure > summary > span { display: block; margin-left: 0; }
+}

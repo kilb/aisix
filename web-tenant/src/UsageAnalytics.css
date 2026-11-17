@@ -39,7 +39,13 @@
 .usage-summary-quantities-list dd { margin: 0; color: var(--fg); font-variant-numeric: tabular-nums; }
 @media (max-width: 599px) {
   .usage-analysis-scope { padding: 14px; }
-  .usage-analysis-filters { gap: 10px; }
+  .usage-analysis-filters { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; overflow: visible; }
+  .usage-analysis-filters > .field,
+  .usage-analysis-filters > .field:has(input[type="date"]) { min-width: 0; }
+  .usage-analysis-actions { grid-column: 1 / -1; justify-content: space-between; }
   .usage-analysis-filters input { padding-inline: 8px; }
   .usage-analysis-grid .record-table-toolbar > .field { flex-basis: 100%; }
+}
+@media (max-width: 359px) {
+  .usage-analysis-filters { grid-template-columns: minmax(0, 1fr); }
 }

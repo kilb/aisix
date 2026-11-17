@@ -52,6 +52,8 @@
 .finance-workspace .finance-stat > .bento-card-header { margin-bottom: 0; }
 .finance-workspace .finance-stat .metric { overflow-wrap: anywhere; font-size: var(--text-metric); line-height: var(--text-metric--line-height); }
 .finance-workspace .finance-balance-stat .metric { font-size: var(--text-heading); line-height: var(--text-heading--line-height); letter-spacing: normal; }
+.finance-workspace .finance-reconciliation-count > .bento-card-header { margin-bottom: 0; }
+.finance-workspace .finance-reconciliation-count .metric { font-size: var(--text-metric); line-height: var(--text-metric--line-height); }
 .finance-workspace .finance-overview { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; margin-bottom: 16px; }
 .finance-workspace .finance-overview > .panel:first-child { grid-column: span 2; }
 .finance-workspace .finance-overview > .panel:nth-child(2) { grid-column: span 1; }
@@ -84,7 +86,10 @@
 .finance-workspace .bl-box:not(:has(thead)) .dt { min-width: 0; }
 .finance-workspace .dt > :is(thead, tbody, tfoot) > tr > :is(th, td) { vertical-align: top; }
 .finance-workspace .dt .num { text-align: right; font-variant-numeric: tabular-nums; }
+/* 金额保持完整单行，由记录表自身横滚承接宽度；无表头汇总区仍可自然换行。 */
+.finance-workspace .dt:has(> thead) td:is(.money, [data-label^="¥/百万"]) { white-space: nowrap; }
 .finance-workspace .dt .cell-note { overflow-wrap: anywhere; }
+.finance-workspace .record-table-toolbar input[type="checkbox"] { height: 18px; min-height: 18px; }
 .finance-workspace .finance-groups-table .row-actions { min-width: 0; max-width: 100%; flex-wrap: wrap; }
 .finance-workspace .finance-groups-table .two-step-warn { white-space: normal; overflow-wrap: anywhere; }
 .finance-workspace .finance-groups-table .row-actions .btn { white-space: nowrap; }
@@ -150,7 +155,6 @@
   .finance-workspace .finance-overview > .panel:nth-child(n) { grid-column: auto; }
 }
 @media (max-width: 599px) {
-  .finance-workspace .finance-stats { grid-template-columns: minmax(0, 1fr); }
   .finance-workspace .sections-switch { width: 100%; border-radius: var(--radius-tile); }
   .finance-workspace .finance-icon-button { width: 44px; min-width: 44px; min-height: 44px; }
   .finance-workspace .library-expanded-price { padding: 16px; }

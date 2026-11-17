@@ -65,8 +65,10 @@ export function UsageRecordFilters({ value, onChange, scope, disabled = false, c
         {SelectedValue({ value: value.outcome, choices: ["succeeded", "failed", "retried", "unknown"] })}
       </Select></label>}
       {children}
-      <Button kind="quiet" className="usage-record-filter-more" disabled={disabled} aria-controls={`${id}-advanced`} aria-expanded={expanded} onClick={() => setExpanded(value => !value)}><Filter size={16} aria-hidden /><span>更多筛选{advanced > 0 ? `（${advanced}）` : ""}</span><ChevronDown size={16} aria-hidden /></Button>
-      {active > 0 && <Button kind="quiet" iconOnly aria-label="清除调用结果筛选" title="清除调用结果筛选" disabled={disabled} onClick={clear}><RotateCcw size={16} aria-hidden /></Button>}
+      <div className="usage-record-filter-actions">
+        <Button kind="quiet" className="usage-record-filter-more" disabled={disabled} aria-controls={`${id}-advanced`} aria-expanded={expanded} onClick={() => setExpanded(value => !value)}><Filter size={16} aria-hidden /><span>更多筛选{advanced > 0 ? `（${advanced}）` : ""}</span><ChevronDown size={16} aria-hidden /></Button>
+        {active > 0 && <Button kind="quiet" iconOnly aria-label="清除调用结果筛选" title="清除调用结果筛选" disabled={disabled} onClick={clear}><RotateCcw size={16} aria-hidden /></Button>}
+      </div>
     </div>
         <fieldset id={`${id}-advanced`} hidden={!expanded} disabled={disabled} className="usage-record-filter-grid">
           <legend className="vh">更多调用条件</legend>

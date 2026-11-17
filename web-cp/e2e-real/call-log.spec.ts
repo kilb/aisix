@@ -27,6 +27,71 @@ function field(card: Locator, label: string): Locator {
   return card.locator("dl > div").filter({ has: card.page().locator("dt").getByText(label, { exact: true }) }).locator("dd");
 }
 
+// 把协议首帧改称客户端总耗时、交换字段或给缺失首字补零，都会失败。
+test("下游响应阶段独立展示真实失败记录，不冒充客户端总耗时或首字", async ({ page }) => {
+  await login(page);
+  const read = (path: string) => page.evaluate(async url => {
+    const response = await fetch(url, { credentials: "same-origin" });
+    return { status: response.status, data: await response.json() as unknown };
+  }, `${base}${path}`);
+  const answer = await read("/admin/pricing/charges?outcome=failed&group_requests=true&limit=50");
+  expect(answer.status).toBe(200);
+  const { items } = answer.data as { items: ChargeRecord[] };
+  expect(items.length, "隔离环境必须已有真实失败调用，不能伪造遥测行").toBeGreaterThan(0);
+  let stored: StoredRecord | undefined;
+  for (const call of items) {
+    const response = await read(`/admin/usage/events/${encodeURIComponent(call.event_id)}`);
+    if (response.status === 404) continue;
+    expect(response.status).toBe(200);
+    const candidate = response.data as StoredRecord;
+    stored = candidate;
+    break;
+  }
+  expect(stored, "真实失败调用必须能读取已保存事件").toBeDefined();
+  const event = stored!.event;
+  const duration = (value: unknown): string => {
+    if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return "—";
+    return value < 1000 ? `${new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 }).format(value)} ms` : `${new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 }).format(value / 1000)} s`;
+  };
+  await page.goto(`${base}/#calls?outcome=failed&detail=${encodeURIComponent(stored!.event_id)}`);
+  await expect(page.getByRole("heading", { name: "调用日志详情", exact: true })).toBeVisible();
+  await settle(page);
+  const timing = page.getByRole("region", { name: "时间与性能", exact: true });
+  await expect(field(timing, "下游响应阶段耗时")).toHaveText(duration(event.downstream_latency_ms));
+  await expect(timing.locator("dt").getByText("客户端总耗时", { exact: true })).toHaveCount(0);
+  const label = timing.locator("dt").getByText("下游响应阶段耗时", { exact: true });
+  await expect(label).toHaveAttribute("title", /各接口.*处理起点/);
+  await expect(label).toHaveAttribute("title", /首次下游协议输出.*元数据/);
+  await expect(label).toHaveAttribute("title", /不代表客户端完整请求耗时/);
+  await expect(field(timing, "首 Token 延迟")).toHaveText(duration(event.first_token_latency_ms));
+  const policy = timing.locator("details").filter({ has: page.locator("summary").getByText("计时口径", { exact: true }) });
+  const toggle = policy.locator("summary");
+  const note = policy.locator("p");
+  await expect(toggle).toBeVisible();
+  await expect(note).toBeHidden();
+  await toggle.focus();
+  await page.keyboard.press("Shift+Tab");
+  await page.keyboard.press("Tab");
+  await expect(toggle).toBeFocused();
+  await page.keyboard.press("Enter");
+  await expect(note).toBeVisible();
+  await expect(note).toHaveText((await label.getAttribute("title"))!);
+  await page.keyboard.press("Enter");
+  await expect(note).toBeHidden();
+  await test.info().attach("delivery-latency-safe-proof", { body: JSON.stringify({ event_id: stored!.event_id, downstream_latency_ms: event.downstream_latency_ms ?? null, first_token_latency_ms: event.first_token_latency_ms ?? null, upstream_latency_ms: event.upstream_latency_ms ?? null }), contentType: "application/json" });
+  await label.scrollIntoViewIfNeeded();
+  await page.screenshot({ path: join(output, "delivery-latency-details-desktop.png"), fullPage: false });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await label.scrollIntoViewIfNeeded();
+  await expect(label).toBeVisible();
+  await expect(field(timing, "下游响应阶段耗时")).toHaveText(duration(event.downstream_latency_ms));
+  await toggle.click();
+  await expect(note).toBeVisible();
+  await expect(note).toHaveText((await label.getAttribute("title"))!);
+  await note.scrollIntoViewIfNeeded();
+  await page.screenshot({ path: join(output, "delivery-latency-details-mobile.png"), fullPage: false });
+});
+
 const UPSTREAM_TIMING_FIELDS = [
   "http_send_started_ms", "response_headers_ms", "first_response_byte_ms",
   "first_protocol_frame_ms", "first_canonical_chunk_ms", "first_content_ms",

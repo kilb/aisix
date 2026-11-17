@@ -1,0 +1,27 @@
+/* 名称与日期保留可读宽度，说明按需展开；横滚只发生在表格内。 */
+.finance-workspace .catalogue-table {
+  min-width: 68rem;
+  table-layout: fixed;
+}
+.catalogue-table .catalogue-col-name { width: 34%; }
+.catalogue-table .catalogue-col-alias { width: 10%; }
+.catalogue-table .catalogue-col-source { width: 25%; }
+.catalogue-table .catalogue-col-date { width: 18%; }
+.catalogue-table .catalogue-col-notes { width: 8%; }
+.catalogue-table .catalogue-col-actions { width: 5%; }
+.catalogue-table td[data-label="条目"] code { white-space: nowrap; }
+.catalogue-table .catalogue-source-link {
+  display: inline-flex;
+  align-items: center;
+  min-height: 44px;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+.catalogue-table .catalogue-notes-button { padding-inline: 0; white-space: nowrap; }
+.catalogue-table td[data-label="日期"] { white-space: nowrap; }
+.catalogue-provenance h3 { margin: 0 0 12px; font-size: var(--text-body); font-weight: 600; }
+.catalogue-provenance dl { display: grid; gap: 8px; margin: 0; }
+.catalogue-provenance dl > div { display: grid; grid-template-columns: 5rem minmax(0, 1fr); gap: 12px; }
+.catalogue-provenance dt { color: var(--muted-foreground); }
+.catalogue-provenance dd { margin: 0; overflow-wrap: anywhere; }
+.catalogue-notes-full { margin: 16px 0 0; color: var(--muted-foreground); white-space: pre-wrap; overflow-wrap: anywhere; }

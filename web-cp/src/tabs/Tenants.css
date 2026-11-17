@@ -616,7 +616,7 @@ td .tn-flag {
 .tenant-hub :is(.tn-part > legend, .tn-part > h3, .tn-sub > legend) { font-size: var(--text-body); font-weight: 600; }
 .tenant-hub .tn-part > .hint { margin-bottom: 12px; }
 .tenant-hub .tn-foot { padding-top: 12px; margin-top: 12px; }
-.tenant-hub .tn-bleed { margin-top: 12px; }
+.cp-operations.tenant-hub .tn-bleed { margin: 12px 0 0; }
 .tenant-hub.finance-workspace .ops-record-table > .dt { min-width: 0; }
 .tenant-hub .tn-checks.tn-groups { grid-template-columns: minmax(0, 1fr); border-radius: var(--r-field); }
 .tenant-hub .tn-checks.tn-groups > li { padding: 8px 12px; }

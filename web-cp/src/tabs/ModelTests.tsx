@@ -25,7 +25,7 @@ export function ModelTests({ operator, initialSection, sectionVisit, onGoto }: T
     onGoto("model-tests", next);
   }
   return <div className="cp-operations cp-modeltests">
-    <PageHeader eyebrow="MODELS · 模型测试" title="模型测试" dataLead="显式发起直连测试，查看进度与已保存历史。测试可能产生上游费用。" />
+    <PageHeader eyebrow="MODELS · 模型测试" title="模型测试" dataLead={section === "assessment" ? "比较参考与被测渠道的固定题集表现。查看历史与生成计划不调用模型，开始对照可能产生上游费用。" : "显式发起直连测试，查看进度与已保存历史。测试可能产生上游费用。"} />
     <div className="model-tests-tabs flex flex-wrap" role="tablist" aria-label="模型测试视图">
       {(["current", "history", "assessment"] as const).map((value) => <Button
         key={value} type="button" role="tab" id={`model-tests-${value}-tab`}

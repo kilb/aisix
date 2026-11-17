@@ -658,8 +658,7 @@ export function ChannelModels({
           />
         </FormDialog>
         <FormDialog open={createOpen} onOpenChange={setCreateOpen} title="新建公共模型" description="使用上游模型名称创建公共入口，价格仍在公共模型上维护。" busy={busy || creating}>
-          <div className="panel ch-create mb-0">
-            <CardHeader number={7} title="新建公共模型" />
+          <div className="ch-create min-w-0">
             <div className="flex items-start gap-3">
               <span aria-hidden="true" className="grid size-11 shrink-0 place-items-center rounded-field border border-hairline bg-sunken text-fg-2">
                 <Plus className="size-4" />

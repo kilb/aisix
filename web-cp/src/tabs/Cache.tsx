@@ -36,7 +36,14 @@ interface CachePolicyDoc {
 
 /** The scope a platform deployment never offers: it shares entries across tenants. */
 const ENV_SCOPE = "env";
-const ENV_NOTE = "平台部署不提供 env 范围，请改为 team";
+const ENV_NOTE = "平台部署不提供环境共享，请改为租户共享。";
+// 展示文案与提交值分开；后续 schema 新增的合法值仍原样展示。
+const SCOPE_COPY: Record<string, { label: string; description: string }> = {
+  api_key: { label: "单个 API 密钥", description: "缓存仅供发起请求的 API 密钥使用，其他密钥不共享。" },
+  team: { label: "租户共享", description: "同一租户的 API 密钥共享缓存，不同租户之间互不共享；未归属租户的密钥独立缓存。" },
+  env: { label: "环境共享", description: "环境内的所有 API 密钥共享缓存。平台部署不提供此范围。" },
+};
+const scopeLabel = (value: string) => SCOPE_COPY[value]?.label ?? value;
 /** What a new policy's scope starts at: entries shared within one tenant. */
 const PRESELECTED_SCOPE = "team";
 /** Refusal details shown beside their own input; the others stay in the list under the form. */
@@ -251,11 +258,12 @@ export function Cache({ canEdit, onGoto }: TabProps) {
   const ttlProblem = problemAt("/ttl_seconds");
   const listedDetails = failure?.details.filter((d) => !FIELD_PATHS.includes(d.path)) ?? [];
   const ttlMissing = form !== null && !readOnly && form.ttl.trim() === "";
+  const scopeDescription = form ? SCOPE_COPY[form.scope]?.description ?? options?.descriptions[form.scope] : undefined;
 
   const list = (
     <Card className="cache-list" aria-label="全部缓存策略">
       <CardHeader
-        description="命中缓存的请求直接由网关应答，不再转发给上游。平台部署中缓存条目只在同一租户的 API 密钥之间共享（team 范围）。"
+        description="命中缓存的请求直接由网关应答，不再转发给上游。平台部署中可按租户共享缓存，或仅供单个 API 密钥使用。"
         as="h2"
         title={
           <span className="inline-flex items-center gap-2">
@@ -291,7 +299,7 @@ export function Cache({ canEdit, onGoto }: TabProps) {
                 <tr key={p.id} className={form?.id === p.id ? "bg-sunken" : undefined}>
                   <td className="font-medium">{p.doc.name}</td>
                   <td>
-                    <code className="tag font-mono">{p.doc.scope ?? "—"}</code>
+                    <span className="tag">{p.doc.scope ? scopeLabel(p.doc.scope) : "—"}</span>
                   </td>
                   <td>{appliesToText(p.doc)}</td>
                   <td className="right num">{p.doc.ttl_seconds ?? "—"}</td>
@@ -336,8 +344,8 @@ export function Cache({ canEdit, onGoto }: TabProps) {
   );
 
   const editor = form && (
-    <section ref={panel} className="panel cache-editor" data-tone="surface" aria-label="缓存策略设置">
-      <CardHeader
+    <section ref={panel} className={form.id === null ? "cache-editor cache-editor-create" : "panel cache-editor"} data-tone={form.id === null ? undefined : "surface"} aria-label="缓存策略设置">
+      {form.id !== null && <CardHeader
         as="h2"
         title={
           <span className="inline-flex flex-wrap items-center gap-x-3 gap-y-1">
@@ -345,7 +353,7 @@ export function Cache({ canEdit, onGoto }: TabProps) {
             {current && <RolloutBadge rollout={current.rollout} />}
           </span>
         }
-      />
+      />}
       {form.envScoped && (
         <div className="note warn mt-0">
           {ENV_NOTE}{" "}
@@ -367,7 +375,7 @@ export function Cache({ canEdit, onGoto }: TabProps) {
             <label className="f">
               <span>范围</span>
               {form.envScoped ? (
-                <input value={ENV_SCOPE} disabled />
+                <input value={scopeLabel(ENV_SCOPE)} disabled />
               ) : (
                 <Select
                   value={form.scope}
@@ -378,7 +386,7 @@ export function Cache({ canEdit, onGoto }: TabProps) {
                 >
                   {(options?.scopes ?? []).map((s) => (
                     <option key={s} value={s}>
-                      {s}
+                      {scopeLabel(s)}
                     </option>
                   ))}
                 </Select>
@@ -389,8 +397,8 @@ export function Cache({ canEdit, onGoto }: TabProps) {
                 {scopeProblem}
               </p>
             )}
-            {options?.descriptions[form.scope] && (
-              <p className="hint -mt-2 mb-4 text-caption">{options.descriptions[form.scope]}</p>
+            {scopeDescription && (
+              <p className="hint -mt-2 mb-4 text-caption">{scopeDescription}</p>
             )}
           </div>
           <div className="min-w-0">
@@ -515,7 +523,7 @@ export function Cache({ canEdit, onGoto }: TabProps) {
           <Stat label="已保存策略" value={policies.items?.length ?? "—"} foot="命中后由网关直接应答" />
           <Stat label="已启用" value={policies.items ? policies.items.filter((p) => p.doc.enabled !== false).length : "—"} foot="各网关是否已应用请查看下发状态" />
           <Stat label="已停用" value={policies.items ? policies.items.filter((p) => p.doc.enabled === false).length : "—"} foot="停用策略不参与缓存应答" />
-          <Stat label="env 范围" value={policies.items ? policies.items.filter((p) => p.doc.scope === ENV_SCOPE).length : "—"} foot="此表单只读；平台部署使用 team 范围" />
+          <Stat label="环境共享" value={policies.items ? policies.items.filter((p) => p.doc.scope === ENV_SCOPE).length : "—"} foot="此表单只读；平台部署使用租户共享" />
         </StatGrid>
       )}
       {optionsError && (

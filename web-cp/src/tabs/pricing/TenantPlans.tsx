@@ -189,7 +189,7 @@ function TenantDiscountDetail({ tenant, refresh, canEdit, onCreate }: { tenant: 
         <DataTable label="折扣修改记录" tableClassName="tenant-discount-history-table">
           <colgroup><col className="tenant-discount-history-col-offer" /><col className="tenant-discount-history-col-time" /><col className="tenant-discount-history-col-status" /><col className="tenant-discount-history-col-time" /><col className="tenant-discount-history-col-actor" /></colgroup>
           <thead><tr><th>折扣（减免）</th><th>生效时间</th><th>版本状态</th><th>修改时间</th><th>修改人</th></tr></thead>
-          <tbody>{history.length === 0 && <tr><td colSpan={5}><EmptyState text="这个租户还没有折扣修改记录。" /></td></tr>}{history.map((revision) => <tr data-finance-record key={revision.revision_id}>
+          <tbody>{history.map((revision) => <tr data-finance-record key={revision.revision_id}>
             <td data-label="折扣（减免）">{fmtPercent(revision.discount_bps)}{revision.discount_bps === 0 && <span className="cell-note">恢复原价</span>}</td>
             <td data-label="生效时间" className="tabular">{fmtBeijing(revision.effective_from)}</td>
             <td data-label="版本状态">{plan?.discount.current?.revision_id === revision.revision_id ? "当前生效" : plan?.discount.upcoming.some((item) => item.revision_id === revision.revision_id) ? "已预约" : Date.parse(revision.effective_from) > Date.now() ? "已被替代" : "已结束"}</td>
@@ -197,6 +197,7 @@ function TenantDiscountDetail({ tenant, refresh, canEdit, onCreate }: { tenant: 
             <td data-label="修改人">{revision.created_by ?? "—"}</td>
           </tr>)}</tbody>
         </DataTable>
+        {history.length === 0 && <EmptyState text="这个租户还没有折扣修改记录。" />}
         {moreError && <div className="note crit" role="alert">{moreError}</div>}
         <div className="tenant-discount-history-footer"><p className="hint" role="status">已读取 {fmtInt(history.length)} 条{before === null ? "，已显示全部修改记录。" : "，可继续读取更早记录。"}</p>{before !== null && <Button onClick={() => void more()} disabled={refreshing} busy={reading} busyLabel="读取中…">读取更早记录</Button>}</div>
       </>}

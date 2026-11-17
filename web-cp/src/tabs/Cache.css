@@ -22,6 +22,12 @@
 .cache-settings > h3 {
   margin: 0 0 16px;
 }
+/* 新建弹窗已有外层边界，字段区直接铺开；编辑页保留原有分区。 */
+.cache-editor-create .cache-settings {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: 0;
+}
 .cache-fields {
   display: grid;
   grid-template-columns: minmax(0, 1fr);

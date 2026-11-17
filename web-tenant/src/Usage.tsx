@@ -1,5 +1,5 @@
 import { Select } from "./ui/Select";
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode, type Ref } from "react";
 import { ChevronRight } from "lucide-react";
 import {
   ApiError,
@@ -354,9 +354,9 @@ function defaultRange(group: "day" | "month"): { from: string; to: string } {
 const MAX_DAYS = { day: 92, month: 731 } as const;
 
 /** A card that is a region named by its heading. */
-function Section({ title, number, children, className = "" }: { title: string; number: number; children: ReactNode; className?: string }) {
+function Section({ title, number, children, className = "", ref, style }: { title: string; number: number; children: ReactNode; className?: string; ref?: Ref<HTMLElement>; style?: CSSProperties }) {
   return (
-    <Card padding="table" role="region" aria-label={title} className={`${span.d12} usage-record-section ${className}`}>
+    <Card ref={ref} style={style} padding="table" role="region" aria-label={title} className={`${span.d12} usage-record-section ${className}`}>
       <CardHeader number={number} title={title} />
       {children}
     </Card>
@@ -632,6 +632,19 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
   const rows = shown?.rows ?? null;
   const next = shown?.next ?? null;
   const err = shown?.error ?? null;
+  const resultsLoading = rows === null;
+  const resultCard = useRef<HTMLElement>(null);
+  const [resultHeight, setResultHeight] = useState(0);
+  // 只记已完成结果卡的几何高度；加载仍清空旧行，深滚动不因占位变短而被夹回。
+  useLayoutEffect(() => {
+    const card = resultCard.current;
+    if (resultsLoading || !card) return;
+    const measure = () => setResultHeight(card.getBoundingClientRect().height);
+    const observer = new ResizeObserver(measure);
+    observer.observe(card);
+    measure();
+    return () => observer.disconnect();
+  }, [resultsLoading]);
   const activeKey = useRef(requestKey);
   activeKey.current = requestKey;
   const searchQuery = query.get("q") ?? "";
@@ -703,8 +716,8 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
   }
 
   return (
-    <Section title="调用记录" number={8} className="usage-calls-section">
-      <UsageRecordFilters className="sticky-filters" scope="tenant" value={recordFilters} onChange={patch => update({ outcome: recordFilters.outcome, ...patch, status: undefined })}>
+    <div className="call-record-layout usage-call-layout" data-loading={resultsLoading}>
+      <UsageRecordFilters className="call-filter-card sticky-filters" scope="tenant" value={recordFilters} onChange={patch => update({ outcome: recordFilters.outcome, ...patch, status: undefined })}>
         <Field label="时间起" error={range ? null : "结束日期不能早于开始日期"}>
           <input type="date" value={fromDate} max={toDate || undefined} onChange={(e) => setFromDate(e.target.value)} />
         </Field>
@@ -730,6 +743,7 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
           <input type="search" value={searchQuery} onChange={event => update({ q: event.target.value })} placeholder="模型、密钥、成员或请求 ID" />
         </Field>
       </UsageRecordFilters>
+      <Section ref={resultCard} style={{ minHeight: resultsLoading ? resultHeight : undefined }} title="调用记录" number={8} className="usage-calls-section call-table-card">
       {query.get("member_id") && <p className="hint" role="status">已按成员 {query.get("member_id")} 筛选。</p>}
       <details className="usage-summary-notes usage-call-notes">
         <summary>筛选、性能与计费口径</summary>
@@ -784,5 +798,6 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
       </CallLogDrawer>
 
     </Section>
+    </div>
   );
 }

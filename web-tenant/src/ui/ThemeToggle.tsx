@@ -12,7 +12,7 @@ export function ThemeToggle({ theme, onToggle }: { theme: Theme; onToggle: () =>
       aria-label={`切换到${next}`}
       title={`切换到${next}`}
     >
-      {next}
+      <span className="cp-theme-label">{next}</span>
     </Button>
   );
 }
