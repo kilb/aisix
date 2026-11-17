@@ -941,6 +941,61 @@ async fn websocket_empty_input_still_runs_unconditional_guardrail() {
 }
 
 #[tokio::test]
+async fn websocket_peer_normal_close_is_acknowledged_and_releases_active_rounds() {
+    use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame};
+    for active in [false, true] {
+        let mut f = fixture_full_audit_with_limit(false, false, false, false, None).await;
+        let mut socket = connect(&f).await;
+        if active {
+            socket
+                .send(ClientMessage::Text(
+                    json!({"type":"response.create","model":"native-model","input":"hang"})
+                        .to_string(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(event(&mut socket).await["type"], "response.created");
+            f.upstream_calls.recv().await.unwrap();
+        }
+        let close = CloseFrame {
+            code: CloseCode::Normal,
+            reason: format!("complete-{}", Uuid::new_v4()).into(),
+        };
+        socket
+            .send(ClientMessage::Close(Some(close.clone())))
+            .await
+            .unwrap();
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(2), socket.next())
+            .await
+            .expect("正常关闭应及时回复 Close")
+            .expect("正常关闭应有回复帧")
+            .expect("正常关闭不能直接断开 TCP");
+        assert_eq!(reply, ClientMessage::Close(Some(close)));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while f.livez.in_flight() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("正常关闭必须释放 session 与轮次排空守卫");
+        if active {
+            let usage = tokio::time::timeout(std::time::Duration::from_secs(2), f.usage.recv())
+                .await
+                .expect("活动轮取消必须及时计量")
+                .unwrap();
+            assert_eq!(usage.status_code, 499);
+            assert_eq!(usage.error_class, "client_disconnected");
+            assert!(usage.is_final_attempt);
+        }
+        assert!(f.upstream_calls.try_recv().is_err());
+        assert!(
+            f.usage.try_recv().is_err(),
+            "关闭不得重复计量或制造空会话用量"
+        );
+    }
+}
+
+#[tokio::test]
 async fn websocket_close_cancels_active_round_and_emits_one_final() {
     let mut f = fixture().await;
     let mut socket = connect(&f).await;

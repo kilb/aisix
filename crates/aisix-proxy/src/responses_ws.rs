@@ -909,6 +909,12 @@ fn run_session(
                             }
                             Some(Ok(Message::Ping(bytes))) => { if writer.send(Message::Pong(bytes)).await.is_err() { break; } }
                             Some(Ok(Message::Pong(_))) => {}
+                            Some(Ok(Message::Close(_))) => {
+                                tasks.abort_all();
+                                // 库已排队关闭回复；先取消轮次，再有界冲刷，避免客户端收到异常断连。
+                                let _ = tokio::time::timeout(Duration::from_secs(2), writer.flush()).await;
+                                break;
+                            }
                             Some(Ok(Message::Binary(_))) => { if writer.send(Message::Text(error_event(ProxyError::InvalidRequest("WebSocket events must be JSON text".into()), None).to_string())).await.is_err() { break; } }
                             _ => break,
                         }
