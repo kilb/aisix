@@ -597,6 +597,7 @@ async fn dispatch(
                     None,
                     trace,
                     /* dispatched */ false,
+                    None,
                 );
                 return err.into_response();
             }
@@ -699,6 +700,7 @@ async fn dispatch(
                 None,
                 trace,
                 /* dispatched */ false,
+                None,
             );
             return jsonrpc_guardrail_block(
                 rpc_id,
@@ -784,6 +786,7 @@ async fn dispatch(
                         None,
                         trace,
                         /* dispatched */ false,
+                        None,
                     );
                     return jsonrpc_guardrail_block(
                         rpc_id,
@@ -856,6 +859,7 @@ async fn dispatch(
                         None,
                         trace,
                         /* dispatched */ false,
+                        None,
                     );
                     return jsonrpc_guardrail_block(
                         rpc_id,
@@ -951,8 +955,7 @@ async fn dispatch(
     // endpoint keeps absorbing a per-server failure (its tools drop out of
     // the list, a call to it fails as a tool error), so one server cannot
     // fail the whole surface.
-    let token_exchange_failure = gateway.token_exchange_failure();
-    let user_oauth_failure = gateway.user_oauth_failure();
+    let observations = gateway.observations();
     let opening = matches!(
         peek.as_ref().and_then(|p| p.method.as_deref()),
         Some("initialize" | "server/discover")
@@ -971,7 +974,6 @@ async fn dispatch(
     // Cloned out before the gateway is handed to the transport, which clones
     // it per session; the slot itself is shared, so this handle sees what the
     // handler writes.
-    let tools_list_counts = gateway.tools_list_counts();
     // The deployment's body cap replaces rmcp's own 4 MiB default inside
     // the service; the proxy-level read above already enforced the same
     // limit, so the two layers can never disagree.
@@ -990,7 +992,7 @@ async fn dispatch(
     crate::attribution::note_upstream_wait_end(true);
     let latency = started.elapsed();
 
-    if let (Some(_), Some(failure)) = (scope, token_exchange_failure.get().cloned()) {
+    if let (Some(_), Some(failure)) = (scope, observations.token_exchange_failure().cloned()) {
         let response =
             crate::error::ProxyError::McpTokenExchange(failure.failure.clone()).into_response();
         let error = crate::error::ProxyError::McpTokenExchange(failure.failure);
@@ -1016,12 +1018,15 @@ async fn dispatch(
                 // the re-exchange after the upstream rejected a token.
                 /* dispatched */
                 failure.reached_upstream,
+                None,
             );
         }
         return response;
     }
 
-    if let (Some(server), Some(failure)) = (user_oauth_scope, user_oauth_failure.get().cloned()) {
+    if let (Some(server), Some(failure)) =
+        (user_oauth_scope, observations.user_oauth_failure().cloned())
+    {
         let response = crate::mcp_oauth::failure_response(&snapshot, server, failure.failure);
         if is_tool_call {
             emit_tool_call_usage(
@@ -1044,6 +1049,7 @@ async fn dispatch(
                 None,
                 trace,
                 /* dispatched */ failure.reached_upstream,
+                None,
             );
         }
         return response;
@@ -1053,7 +1059,7 @@ async fn dispatch(
     // the upstreams did return tools is an ACL misconfiguration the operator
     // has to be able to see without turning on debug logging; an upstream
     // that returned nothing is not (and already warns when it failed).
-    if let Some(counts) = tools_list_counts.get().copied() {
+    if let Some(counts) = observations.tools_list_counts() {
         log.tools = Some(counts);
         if counts.returned == 0 && counts.total > 0 {
             if acl_has_grant {
@@ -1115,6 +1121,7 @@ async fn dispatch(
                         None,
                         trace,
                         /* dispatched */ true,
+                        None,
                     );
                 }
                 return (StatusCode::BAD_GATEWAY, "invalid upstream response").into_response();
@@ -1156,6 +1163,7 @@ async fn dispatch(
                         None,
                         trace,
                         /* dispatched */ true,
+                        None,
                     );
                     return jsonrpc_guardrail_block(
                         rpc_id,
@@ -1205,6 +1213,7 @@ async fn dispatch(
             capture.as_ref(),
             trace,
             /* dispatched */ true,
+            observations.tool_call_failure(),
         );
         return response;
     }
@@ -1861,6 +1870,7 @@ fn emit_tool_call_usage(
     // quota rejection or an input-guardrail block, which refuse before any
     // upstream contact and must not export an upstream CLIENT span.
     dispatched: bool,
+    tool_failure: Option<aisix_mcp::ToolCallFailure>,
 ) {
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
@@ -1878,10 +1888,13 @@ fn emit_tool_call_usage(
         request_headers: request_headers.clone(),
         guardrail_blocked: refusal.is_some_and(crate::error::ProxyError::is_guardrail_block),
         error_class: refusal
-            .map(|e| crate::attempt::error_class(e).to_string())
-            .unwrap_or_default(),
+            .map(crate::attempt::error_class)
+            .or(tool_failure.map(aisix_mcp::ToolCallFailure::error_class))
+            .unwrap_or_default()
+            .to_string(),
         error_message: refusal
             .map(crate::attempt::gateway_error_message)
+            .or(tool_failure.map(aisix_mcp::ToolCallFailure::error_message))
             .unwrap_or_default(),
         guardrail_monitor_hits,
         applied_guardrails: guardrail_chain
@@ -3142,6 +3155,67 @@ mod tests {
             rx.try_recv().is_err(),
             "initialize must not emit a usage event"
         );
+    }
+
+    // 不记录 bridge 的失败原因时，HTTP 200 会被错误计为成功。
+    #[tokio::test]
+    async fn upstream_tool_failure_is_recorded_on_aggregate_and_scoped_calls() {
+        use aisix_obs::UsageSink;
+        let app = axum::Router::new().route(
+            "/fail",
+            axum::routing::get(|| async {
+                (StatusCode::SERVICE_UNAVAILABLE, "upstream failure details")
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        for (path, name) in [("/mcp", "rest__fail"), ("/mcp/rest", "fail")] {
+            let snapshot =
+                snapshot_with_mcp_server_limits(&[("ak-1", TOKEN, serde_json::json!({}))]);
+            let server = serde_json::from_value(serde_json::json!({
+                "name":"rest", "type":"openapi", "url":format!("http://{addr}"),
+                "spec":{"openapi":"3.1.0","info":{"title":"test","version":"1"},
+                    "paths":{"/fail":{"get":{"operationId":"fail"}}}}
+            }))
+            .unwrap();
+            snapshot
+                .mcp_servers
+                .insert(ResourceEntry::new("rest", server, 1));
+            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            let state = ProxyState::new(
+                SnapshotHandle::new(snapshot),
+                Arc::new(aisix_gateway::Hub::new()),
+                &cfg(),
+            )
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+            let request = HttpRequest::post(path)
+                .header("host", "mcp.aisix.example.com")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .header("accept", "application/json, text/event-stream")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"jsonrpc":"2.0","id":7,
+                    "method":"tools/call","params":{"name":name,"arguments":{}}})
+                    .to_string(),
+                ))
+                .unwrap();
+            let response = build_router(state).oneshot(request).await.unwrap();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap();
+            assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(value["result"]["isError"].as_bool(), Some(true), "{value}");
+            let event = rx.try_recv().expect("调用失败也恰好产生一条记录");
+            assert_eq!(event.status_code, 200);
+            assert_eq!(event.error_class, "upstream_status", "{path}");
+            assert_eq!(event.error_message, "upstream MCP server returned HTTP 503");
+            assert!(!event.error_message.contains("details"));
+            assert!(rx.try_recv().is_err());
+        }
     }
 
     /// A caller that hangs up while the call is still being processed.

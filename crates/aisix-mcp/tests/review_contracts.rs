@@ -246,7 +246,7 @@ async fn denied_inventory_does_not_use_the_callers_byte_budget() {
     let mcp = McpGateway::new(bridges).with_tool_acl(ToolAcl::from_allowed(Some(&[
         "allowed__tool_1".to_string(),
     ])));
-    let counts = mcp.tools_list_counts();
+    let counts = mcp.observations();
     let addr = gateway(mcp).await;
     let client = ()
         .serve(StreamableHttpClientTransport::from_uri(format!(
@@ -260,7 +260,7 @@ async fn denied_inventory_does_not_use_the_callers_byte_budget() {
         .expect("permitted inventory fits budget");
     assert_eq!(result.tools.len(), 1);
     assert_eq!(result.tools[0].name, "allowed__tool_1");
-    let counts = counts.get().expect("handler records counts");
+    let counts = counts.tools_list_counts().expect("handler records counts");
     assert_eq!((counts.total, counts.returned), (2, 1));
     client.cancel().await.expect("close client");
 }
@@ -369,7 +369,7 @@ async fn denied_tools_are_still_counted_before_acl_filtering() {
         .expect("connect upstream");
     let mcp = McpGateway::new([("counted".into(), Arc::new(bridge) as Arc<dyn McpBridge>)])
         .with_tool_acl(ToolAcl::from_allowed(Some(&[])));
-    let counts = mcp.tools_list_counts();
+    let counts = mcp.observations();
     let addr = gateway(mcp).await;
     let client = ()
         .serve(StreamableHttpClientTransport::from_uri(format!(
@@ -383,7 +383,9 @@ async fn denied_tools_are_still_counted_before_acl_filtering() {
         .expect("empty list")
         .tools
         .is_empty());
-    let counts = counts.get().expect("handler must record counts");
+    let counts = counts
+        .tools_list_counts()
+        .expect("handler must record counts");
     assert_eq!((counts.total, counts.returned), (2, 0));
     client.cancel().await.expect("close client");
 }

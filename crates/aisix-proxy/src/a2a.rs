@@ -581,6 +581,10 @@ async fn dispatch(
     match result {
         Ok(response_value) => {
             call.facts.observe_result(&response_value);
+            let in_band = A2aFailure::in_band(&response_value);
+            if in_band.is_some() {
+                crate::usage_attr::note_client_error_body(&snapshot, || response_value.to_string());
+            }
             if meters_content(call.operation) {
                 call.text
                     .response
@@ -694,7 +698,7 @@ async fn dispatch(
                 trace.as_ref(),
                 /* dispatched */ true,
                 /* refusal */ None,
-                /* failure */ None,
+                in_band.as_ref(),
             );
             axum::Json(response_value).into_response()
         }
@@ -892,6 +896,13 @@ async fn dispatch_stream(
             // Read the task's progress off the event on its way past —
             // the relay itself stays verbatim.
             guard.call.facts.observe_result(&value);
+            if let Some(failure) = A2aFailure::in_band(&value) {
+                guard.failure.get_or_insert(failure);
+                crate::usage_attr::note_client_error_body(
+                    &guard.state.snapshot.load(),
+                    || value.to_string(),
+                );
+            }
             if meters_content(guard.call.operation) {
                 guard
                     .call
@@ -937,7 +948,7 @@ async fn dispatch_stream(
             // loop exit instead reported every such completed task as
             // abandoned. For the same reason a review releases everything
             // it holds at the terminal event rather than at EOF.
-            if ends {
+            if ends || guard.failure.is_some() {
                 guard.call.stream.reached_end = true;
             }
             for event in released {
@@ -1554,6 +1565,15 @@ struct A2aFailure {
 }
 
 impl A2aFailure {
+    // 官方 JSON-RPC binding 可在 HTTP 200 内返回错误；记录固定文本，避免泄露正文。
+    fn in_band(envelope: &serde_json::Value) -> Option<Self> {
+        let code = envelope.get("error")?.get("code")?.as_i64()?;
+        Some(Self {
+            class: "upstream_in_band",
+            message: format!("upstream agent returned JSON-RPC error {code}"),
+        })
+    }
+
     fn of(err: &A2aError) -> Self {
         Self {
             class: match err {
@@ -2854,6 +2874,100 @@ mod tests {
                 .unwrap();
         });
         format!("http://{addr}/a2a")
+    }
+
+    // 删除失败分类或把错误后的断开记成 499，都应使契约断言变红。
+    #[tokio::test]
+    async fn json_rpc_errors_are_recorded_for_unary_and_open_streams() {
+        use aisix_obs::UsageSink;
+        let envelope = serde_json::json!({"jsonrpc":"2.0","id":1,
+            "error":{"code":-32001,"message":"private agent detail"}});
+        let response_envelope = envelope.clone();
+        let app = axum::Router::new().route("/a2a", axum::routing::post(
+            move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let envelope = response_envelope.clone();
+                async move {
+                    if body["method"] == "message/stream" {
+                        let stream = async_stream::stream! {
+                            yield Ok::<_, std::convert::Infallible>(format!("data: {envelope}\n\n"));
+                            std::future::pending::<()>().await;
+                        };
+                        ([(header::CONTENT_TYPE, "text/event-stream")], Body::from_stream(stream)).into_response()
+                    } else { axum::Json(envelope).into_response() }
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        for (method, guarded) in [
+            ("message/send", false),
+            ("message/stream", false),
+            ("message/stream", true),
+        ] {
+            let snapshot = snapshot_with(
+                &format!("http://{addr}/a2a"),
+                true,
+                serde_json::json!(["*"]),
+            );
+            if guarded {
+                let guardrail = serde_json::from_value(serde_json::json!({
+                    "name":"read-answer", "kind":"keyword", "hook_point":"output",
+                    "patterns":[{"kind":"literal","value":"forbiddenword"}]
+                }))
+                .unwrap();
+                crate::seed_env_scoped_guardrail(
+                    &snapshot,
+                    ResourceEntry::new("read-answer", guardrail, 1),
+                );
+            }
+            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            let state = ProxyState::new(
+                SnapshotHandle::new(snapshot),
+                Arc::new(aisix_gateway::Hub::new()),
+                &proxy_cfg(),
+            )
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+            let response = build_router(state)
+                .oneshot(
+                    HttpRequest::post("/a2a/invoice")
+                        .header("content-type", "application/json")
+                        .header("authorization", format!("Bearer {TOKEN}"))
+                        .body(Body::from(
+                            serde_json::json!({"jsonrpc":"2.0","id":1,"method":method}).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut body = response.into_body().into_data_stream();
+            let bytes = tokio::time::timeout(Duration::from_secs(2), body.next())
+                .await
+                .expect("错误不能等待上游 EOF")
+                .expect("错误帧")
+                .unwrap();
+            if method == "message/send" {
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+                    envelope
+                );
+            } else {
+                assert!(std::str::from_utf8(&bytes)
+                    .unwrap()
+                    .contains("\"code\":-32001"));
+            }
+            drop(body);
+            let event = rx.try_recv().expect("终结记录");
+            assert_eq!(event.status_code, 200, "{method}");
+            assert_eq!(event.error_class, "upstream_in_band", "{method}");
+            assert_eq!(
+                event.error_message,
+                "upstream agent returned JSON-RPC error -32001"
+            );
+            assert!(!event.error_message.contains("private"));
+            assert!(rx.try_recv().is_err());
+        }
     }
 
     /// Drive one A2A request through the real router and return the usage

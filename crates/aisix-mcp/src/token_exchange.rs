@@ -432,17 +432,20 @@ mod tests {
     use super::test_logs::capture_logs;
     use super::*;
 
-    /// A loopback address nothing listens on, so a connect is refused at once.
-    fn refused_url(path: &str) -> String {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        format!("http://{}{path}", listener.local_addr().unwrap())
+    // 只绑定、不监听，并持有到请求结束，避免并发测试抢到端口而答成别的错误。
+    fn refused_url(path: &str) -> (tokio::net::TcpSocket, String) {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let url = format!("http://{}{path}", socket.local_addr().unwrap());
+        (socket, url)
     }
 
     #[tokio::test]
     async fn a_failed_exchange_logs_its_cause_and_no_credential() {
+        let (_socket, token_url) = refused_url("/token");
         let cfg = TokenExchangeConfig {
             profile: Some(McpTokenExchangeProfile::EntraObo),
-            token_url: refused_url("/token"),
+            token_url,
             client_id: "cid".into(),
             client_secret: "obo-secret-LEAK".into(),
             scopes: vec!["api://x/.default".into()],
@@ -502,7 +505,8 @@ mod tests {
             assert!(result.is_err(), "{path}");
             logs.push(logged);
         }
-        let (result, logged) = capture_logs(exchange(&cfg(refused_url("/token")), "subject")).await;
+        let (_socket, token_url) = refused_url("/token");
+        let (result, logged) = capture_logs(exchange(&cfg(token_url), "subject")).await;
         assert!(result.is_err());
         logs.push(logged);
         let auth = TokenExchangeAuth {

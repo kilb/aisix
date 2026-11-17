@@ -35,6 +35,57 @@ pub enum McpError {
     /// can be refreshed.
     #[error("upstream MCP request failed: {0}")]
     Unauthorized(String),
+
+    /// 已知原因的上游失败，detail 只沿用已有的操作员日志文本。
+    #[error("{detail}")]
+    Upstream {
+        failure: ToolCallFailure,
+        detail: String,
+    },
+}
+
+/// 请求记录上的失败原因；固定消息不包含工具返回的内容。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolCallFailure {
+    ToolError,
+    UpstreamStatus(u16),
+    Timeout,
+    Transport,
+    JsonRpc(i32),
+    Undecodable,
+    CredentialUnavailable,
+    PermissionDenied,
+    ToolNotFound,
+}
+
+impl ToolCallFailure {
+    pub fn error_class(self) -> &'static str {
+        match self {
+            Self::ToolError => "tool_error",
+            Self::UpstreamStatus(_) => "upstream_status",
+            Self::Timeout => "timeout",
+            Self::Transport => "transport",
+            Self::JsonRpc(_) => "upstream_in_band",
+            Self::Undecodable => "upstream_decode",
+            Self::CredentialUnavailable => "credential_error",
+            Self::PermissionDenied => "permission_denied",
+            Self::ToolNotFound => "tool_not_found",
+        }
+    }
+
+    pub fn error_message(self) -> String {
+        match self {
+            Self::ToolError => "MCP tool returned isError".to_string(),
+            Self::UpstreamStatus(status) => format!("upstream MCP server returned HTTP {status}"),
+            Self::Timeout => "upstream MCP server timed out".to_string(),
+            Self::Transport => "upstream MCP server connection failed".to_string(),
+            Self::JsonRpc(code) => format!("upstream MCP server returned JSON-RPC error {code}"),
+            Self::Undecodable => "upstream MCP server returned an undecodable response".to_string(),
+            Self::CredentialUnavailable => "MCP upstream credential unavailable".to_string(),
+            Self::PermissionDenied => "MCP tool access denied".to_string(),
+            Self::ToolNotFound => "MCP tool not found".to_string(),
+        }
+    }
 }
 
 impl From<UserOAuthFailure> for McpError {
@@ -56,6 +107,27 @@ impl From<TokenExchangeFailure> for McpError {
 }
 
 impl McpError {
+    pub fn tool_call_failure(&self) -> Option<ToolCallFailure> {
+        match self {
+            Self::Upstream { failure, .. } => Some(*failure),
+            Self::Unauthorized(_) => Some(ToolCallFailure::UpstreamStatus(401)),
+            Self::TokenExchange(_) | Self::UserOAuth(_) => {
+                Some(ToolCallFailure::CredentialUnavailable)
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn into_credential_failure(self) -> Self {
+        match self {
+            Self::Connect(_) => Self::Upstream {
+                failure: ToolCallFailure::CredentialUnavailable,
+                detail: self.to_string(),
+            },
+            other => other,
+        }
+    }
+
     /// Mark a token-exchange failure as one that followed upstream contact:
     /// the upstream rejected the previous token with a `401` and it was the
     /// re-exchange that failed.

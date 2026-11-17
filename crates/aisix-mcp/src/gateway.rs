@@ -54,7 +54,8 @@ use crate::bridge::{
     McpAuth, McpBridge,
 };
 use crate::error::{
-    McpError, TokenExchangeError, TokenExchangeFailure, UserOAuthError, UserOAuthFailure,
+    McpError, TokenExchangeError, TokenExchangeFailure, ToolCallFailure, UserOAuthError,
+    UserOAuthFailure,
 };
 use crate::openapi::OpenApiBridge;
 
@@ -483,6 +484,33 @@ pub struct ToolsListCounts {
     pub returned: u32,
 }
 
+/// 请求观测彼此独立，只保存每类的首条结果；不参与客户端响应判定。
+#[derive(Default)]
+pub struct GatewayObservations {
+    tools_list: OnceLock<ToolsListCounts>,
+    auth_failure: OnceLock<TokenExchangeError>,
+    user_oauth_failure: OnceLock<UserOAuthError>,
+    tool_call_failure: OnceLock<ToolCallFailure>,
+}
+
+impl GatewayObservations {
+    pub fn tools_list_counts(&self) -> Option<ToolsListCounts> {
+        self.tools_list.get().copied()
+    }
+
+    pub fn token_exchange_failure(&self) -> Option<&TokenExchangeError> {
+        self.auth_failure.get()
+    }
+
+    pub fn user_oauth_failure(&self) -> Option<&UserOAuthError> {
+        self.user_oauth_failure.get()
+    }
+
+    pub fn tool_call_failure(&self) -> Option<ToolCallFailure> {
+        self.tool_call_failure.get().copied()
+    }
+}
+
 /// Aggregates N upstream MCP servers behind one downstream MCP server surface.
 /// Cheap to clone (the upstream set is shared); the Streamable HTTP transport
 /// clones it per session.
@@ -490,22 +518,8 @@ pub struct ToolsListCounts {
 pub struct McpGateway {
     upstreams: Arc<[NamedUpstream]>,
     tool_acl: ToolAcl,
-    /// The `tools/list` counts, written once by the handler and read by the
-    /// mount when it emits the access log. Shared with every clone the
-    /// transport makes. It holds the FIRST list a gateway served, which is
-    /// the request's own only for a per-request gateway — the `/mcp` mount
-    /// builds one from `*_for_request`; a gateway kept alive across requests
-    /// (conformance server, tests) keeps the first numbers forever.
-    tools_list: Arc<OnceLock<ToolsListCounts>>,
-    /// The first token-exchange failure an upstream operation hit while
-    /// serving the request, shared with every clone like `tools_list`. The
-    /// single-server endpoint answers it with an HTTP status rather than
-    /// inside a JSON-RPC result, where a client never looks for an
-    /// authorization challenge.
-    auth_failure: Arc<OnceLock<TokenExchangeError>>,
-    /// The same, for an `oauth2_authorization_code` server: the HTTP status
-    /// is where an MCP client looks for the sign-in challenge.
-    user_oauth_failure: Arc<OnceLock<UserOAuthError>>,
+    // 每请求一个共享容器，传输克隆只增一次引用；四个独立槽互不覆盖。
+    observations: Arc<GatewayObservations>,
     /// When set, this gateway serves exactly one upstream under its **original**
     /// tool names: `tools/list` strips the `<server>__` namespace prefix and
     /// `tools/call` accepts both the bare and the prefixed form. ACL decisions
@@ -568,9 +582,7 @@ impl McpGateway {
             upstreams: deduped.into(),
             tool_acl: ToolAcl::allow_all(),
             scoped: None,
-            tools_list: Arc::new(OnceLock::new()),
-            auth_failure: Arc::new(OnceLock::new()),
-            user_oauth_failure: Arc::new(OnceLock::new()),
+            observations: Arc::new(GatewayObservations::default()),
         }
     }
 
@@ -582,28 +594,10 @@ impl McpGateway {
         self
     }
 
-    /// Handle on this request's [`ToolsListCounts`], for the mount to read
-    /// after the transport has run the handler. Clone it BEFORE handing the
-    /// gateway to [`streamable_http_service`] — the slot is shared with every
-    /// clone the transport makes, so the counts the handler writes are
-    /// visible through this handle. Only meaningful on a gateway built per
-    /// request ([`McpGateway::from_snapshot_for_request`] and its scoped
-    /// twin); the slot is written once for the life of the gateway.
-    pub fn tools_list_counts(&self) -> Arc<OnceLock<ToolsListCounts>> {
-        self.tools_list.clone()
-    }
-
-    /// Handle on the first token-exchange failure this gateway hit, read by
-    /// the mount after the transport ran — cloned out the same way as
-    /// [`McpGateway::tools_list_counts`].
-    pub fn token_exchange_failure(&self) -> Arc<OnceLock<TokenExchangeError>> {
-        self.auth_failure.clone()
-    }
-
-    /// Handle on the first per-user OAuth failure this gateway hit, cloned
-    /// out the same way as [`McpGateway::token_exchange_failure`].
-    pub fn user_oauth_failure(&self) -> Arc<OnceLock<UserOAuthError>> {
-        self.user_oauth_failure.clone()
+    /// 请求私有的观测句柄，交给传输前克隆，处理完成后读取。
+    /// 复用 gateway 的 clone 生命周期；跨请求复用的 gateway 仍保留首条观测。
+    pub fn observations(&self) -> Arc<GatewayObservations> {
+        self.observations.clone()
     }
 
     /// Whether the single upstream of a scoped gateway can be called for this
@@ -643,10 +637,10 @@ impl McpGateway {
         }
         match error {
             McpError::TokenExchange(error) => {
-                let _ = self.auth_failure.set(error.clone());
+                let _ = self.observations.auth_failure.set(error.clone());
             }
             McpError::UserOAuth(error) => {
-                let _ = self.user_oauth_failure.set(error.clone());
+                let _ = self.observations.user_oauth_failure.set(error.clone());
             }
             _ => {}
         }
@@ -918,7 +912,7 @@ impl ServerHandler for McpGateway {
             ));
         }
         // total 保留 ACL 前的可用工具数，returned 才是调用者实际看见的数。
-        let _ = self.tools_list.set(ToolsListCounts {
+        let _ = self.observations.tools_list.set(ToolsListCounts {
             total,
             returned: result.tools.len() as u32,
         });
@@ -990,6 +984,10 @@ impl ServerHandler for McpGateway {
         // form so grants mean the same thing on every endpoint; the message
         // echoes the caller's own spelling.
         if !self.tool_acl.permits(&namespaced) {
+            let _ = self
+                .observations
+                .tool_call_failure
+                .set(ToolCallFailure::PermissionDenied);
             return Err(ErrorData::invalid_params(
                 format!("tool '{request_name}' is not available"),
                 None,
@@ -1010,6 +1008,9 @@ impl ServerHandler for McpGateway {
 
         let result = bridge.call_tool(tool, arguments).await.map_err(|error| {
             self.note_auth_failure(&error);
+            if let Some(failure) = error.tool_call_failure() {
+                let _ = self.observations.tool_call_failure.set(failure);
+            }
             // Generic client-facing message; the upstream's detail (which may
             // include its URL) is logged server-side, not surfaced to the agent.
             tracing::warn!(
@@ -1026,6 +1027,13 @@ impl ServerHandler for McpGateway {
                 None,
             )
         })?;
+
+        if result.is_error {
+            let failure = result
+                .upstream_status
+                .map_or(ToolCallFailure::ToolError, ToolCallFailure::UpstreamStatus);
+            let _ = self.observations.tool_call_failure.set(failure);
+        }
 
         // Always a final (`Complete`) response: the gateway never asks the
         // downstream agent for more input (MRTR stays un-relayed — see
@@ -1230,6 +1238,50 @@ fn into_call_tool_result(result: crate::McpToolResult) -> Result<CallToolResult,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 合并容器不能合并槽位，也不能让下一个请求继承上一个请求的故障。
+    #[test]
+    fn request_observations_are_independent_and_shared_only_with_clones() {
+        let gateway = McpGateway::new(std::iter::empty());
+        let clone = gateway.clone();
+        let observed = gateway.observations();
+        clone.note_auth_failure(&McpError::TokenExchange(TokenExchangeError {
+            failure: TokenExchangeFailure::Unavailable,
+            reached_upstream: true,
+        }));
+        clone.note_auth_failure(&McpError::UserOAuth(UserOAuthError {
+            failure: UserOAuthFailure::Unavailable,
+            reached_upstream: false,
+        }));
+        clone
+            .observations
+            .tool_call_failure
+            .set(ToolCallFailure::ToolError)
+            .unwrap();
+        clone
+            .observations
+            .tools_list
+            .set(ToolsListCounts {
+                total: 4,
+                returned: 2,
+            })
+            .unwrap();
+        assert!(observed.token_exchange_failure().unwrap().reached_upstream);
+        assert!(!observed.user_oauth_failure().unwrap().reached_upstream);
+        assert_eq!(
+            observed.tool_call_failure(),
+            Some(ToolCallFailure::ToolError)
+        );
+        assert_eq!(
+            observed.tools_list_counts().map(|c| (c.total, c.returned)),
+            Some((4, 2))
+        );
+        let other = McpGateway::new(std::iter::empty()).observations();
+        assert!(other.token_exchange_failure().is_none());
+        assert!(other.user_oauth_failure().is_none());
+        assert!(other.tool_call_failure().is_none());
+        assert!(other.tools_list_counts().is_none());
+    }
 
     /// The rmcp-typed list (initialize negotiation, `server/discover`) and
     /// the string list (the proxy's `MCP-Protocol-Version` header gate) are

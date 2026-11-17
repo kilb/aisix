@@ -340,6 +340,7 @@ async fn propagates_tool_level_error_as_ok() {
     // An upstream tool that reports failure must reach the agent as a tool
     // result with is_error=true — NOT as a transport/protocol Err.
     let gateway = McpGateway::new([("alpha".to_string(), bridge_to("alpha").await)]);
+    let observations = gateway.observations();
     let gw_addr = spawn_gateway(gateway).await;
     let client = ()
         .serve(StreamableHttpClientTransport::from_uri(format!(
@@ -353,7 +354,48 @@ async fn propagates_tool_level_error_as_ok() {
         .await
         .expect("tool-level error must be Ok(error_result), not a protocol Err");
     assert_eq!(result.is_error, Some(true), "tool-level error flag lost");
+    assert_eq!(
+        observations.tool_call_failure(),
+        Some(aisix_mcp::ToolCallFailure::ToolError)
+    );
+    assert!(observations.token_exchange_failure().is_none());
+    assert!(observations.user_oauth_failure().is_none());
     assert_eq!(first_text(&result), "boom");
+}
+
+// 上游的真实 SDK 错误与网关返回的通用协议错误各守原有合同。
+#[tokio::test]
+async fn records_json_rpc_failure_without_changing_the_downstream_error() {
+    let gateway = McpGateway::new([("alpha".to_string(), bridge_to("alpha").await)]);
+    let observed = gateway.observations();
+    let addr = spawn_gateway(gateway).await;
+    let client = ()
+        .serve(StreamableHttpClientTransport::from_uri(format!(
+            "http://{addr}/mcp"
+        )))
+        .await
+        .expect("downstream client");
+    let error = client
+        .call_tool(CallToolRequestParams::new("alpha__missing"))
+        .await
+        .expect_err("上游拒绝未知工具");
+    match error {
+        rmcp::ServiceError::McpError(error) => {
+            assert_eq!(error.code.0, -32603);
+            assert_eq!(
+                error.message,
+                "upstream MCP server 'alpha' failed to call tool"
+            );
+        }
+        other => panic!("协议错误不能变成传输错误: {other}"),
+    }
+    assert_eq!(
+        observed.tool_call_failure(),
+        Some(aisix_mcp::ToolCallFailure::JsonRpc(-32602))
+    );
+    assert!(observed.token_exchange_failure().is_none());
+    assert!(observed.user_oauth_failure().is_none());
+    client.cancel().await.expect("close client");
 }
 
 #[tokio::test]

@@ -226,11 +226,12 @@ pub const BUILTIN_DETECTORS: &[(&str, &str, Option<MatchValidator>)] = &[
         r"(?-u:\b)\d{17}[0-9Xx](?-u:\b)",
         Some(china_id_checksum),
     ),
-    // 13–19 digit PAN (bank/credit card), Luhn-verified.
+    // 连续 13–19 位或常用 4-4-4-4(-3)、4-6-5、4-6-4 分组，均校验 Luhn。
+    // 分组首段限定卡号前缀，避免年份吞掉后面的卡号；同前缀的前导数字仍可能覆盖它。
     (
         "bank_card",
-        r"(?-u:\b)\d{13,19}(?-u:\b)",
-        Some(luhn_checksum),
+        r"(?-u:\b)(?:\d{13,19}|(?:2[2-7]\d{2}|[3-689]\d{3})(?:[ -]\d{4}){3}(?:[ -]\d{3})?|(?:2[2-7]\d{2}|[3-689]\d{3})[ -]\d{6}[ -]\d{4,5})(?-u:\b)",
+        Some(bank_card_checksum),
     ),
     ("us_ssn", r"(?-u:\b)\d{3}-\d{2}-\d{4}(?-u:\b)", None),
     (
@@ -288,10 +289,24 @@ fn china_id_checksum(s: &str) -> bool {
 }
 
 /// Luhn check for payment-card numbers.
+fn bank_card_checksum(s: &str) -> bool {
+    if luhn_checksum(s) {
+        return true;
+    }
+    // 分组 19 位也可能是 16 位卡号加三位尾数，整个匹配一并屏蔽。
+    if s.bytes().filter(u8::is_ascii_digit).count() != 19 || !s.contains([' ', '-']) {
+        return false;
+    }
+    s.char_indices()
+        .filter(|(_, c)| c.is_ascii_digit())
+        .nth(15)
+        .is_some_and(|(end, _)| luhn_checksum(&s[..=end]))
+}
+
 fn luhn_checksum(s: &str) -> bool {
     let mut sum = 0u32;
     let mut double = false;
-    for b in s.bytes().rev() {
+    for b in s.bytes().rev().filter(|b| !matches!(b, b' ' | b'-')) {
         if !b.is_ascii_digit() {
             return false;
         }
@@ -679,6 +694,47 @@ mod tests {
         let r = g.redact_input_text("card 4111111111111111 ok").unwrap();
         assert_eq!(r.text, "card [BANK_CARD_REDACTED] ok");
         assert!(g.redact_input_text("card 4111111111111112 ok").is_none());
+    }
+
+    // 恢复只含连续数字的模式，分隔卡号的屏蔽与拒绝都必须变红。
+    #[tokio::test]
+    async fn grouped_bank_cards_are_screened_without_normalizing_the_text() {
+        let mask = guardrail(vec![builtin("bank_card", PiiAction::Mask)]);
+        let block = guardrail(vec![builtin("bank_card", PiiAction::Block)]);
+        for card in [
+            "4111 1111 1111 1111",
+            "4111-1111-1111-1111",
+            "3782 822463 10005",
+            "3056-930902-5904",
+            "6222 0212 3456 7890 128",
+            "4111 1111 1111 1111 123",
+        ] {
+            let text = format!("卡号{card}已登记");
+            let redacted = mask
+                .redact_input_text(&text)
+                .unwrap_or_else(|| panic!("未识别 {card}"));
+            assert_eq!(redacted.text, "卡号[BANK_CARD_REDACTED]已登记");
+            assert_eq!(redacted.counts.get("bank_card"), Some(&1));
+            assert!(block.check_input(&req(&text)).await.is_block());
+            assert!(mask.redact_output_text(&text).is_some());
+        }
+        for text in [
+            "4111 1111 1111 1112",
+            "ref4111 1111 1111 1111",
+            "4111 1111 1111 1111x",
+            "1234 5678 9012 3456",
+            "6222 0212 3456 7890 123",
+            "4111111111111111123",
+        ] {
+            assert!(mask.redact_input_text(text).is_none(), "{text}");
+            assert!(!block.check_input(&req(text)).await.is_block(), "{text}");
+        }
+        assert_eq!(
+            mask.redact_input_text("2026 4111 1111 1111 1111")
+                .expect("年份不吞掉卡号")
+                .text,
+            "2026 [BANK_CARD_REDACTED]"
+        );
     }
 
     #[test]

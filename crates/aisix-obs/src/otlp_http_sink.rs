@@ -1137,13 +1137,11 @@ fn span_flags(span: &crate::trace::SpanEmit, trace: &crate::trace::TraceEmission
     flags
 }
 
-/// `error.type` of a CLIENT span, or `None` when the operation did not
-/// fail. Any status outside 1xx–3xx is a failure, except 499: a caller
-/// that hung up cancelled the call on purpose, which the conventions say
-/// not to record as an error.
+/// 调用 span 的失败类型；HTTP 200 内的协议失败也保留 error_class。
+/// 调用者主动断开的 499 按约定不标为调用失败。
 fn client_error_type(event: &UsageEvent) -> Option<String> {
     let status = event.status_code;
-    if status < 400 || status == CLIENT_CLOSED_REQUEST {
+    if status == CLIENT_CLOSED_REQUEST || (status < 400 && event.error_class.is_empty()) {
         return None;
     }
     Some(error_type_value(event))
@@ -2337,6 +2335,21 @@ mod tests {
         }
         let spans = status_of(499, "client_disconnected");
         for span in &spans {
+            assert!(span.get("status").is_none());
+            assert!(attr(span, "error.type").is_none());
+        }
+        // 去掉低于 400 状态的失败分类，调用 span 必须变红；HTTP span 仍成功。
+        let spans = status_of(200, "tool_error");
+        assert!(spans[0].get("status").is_none());
+        assert!(attr(&spans[0], "error.type").is_none());
+        for client in &spans[1..] {
+            assert_eq!(client["status"]["code"], STATUS_ERROR);
+            assert_eq!(
+                attr(client, "error.type").unwrap()["stringValue"],
+                "tool_error"
+            );
+        }
+        for span in &status_of(200, "") {
             assert!(span.get("status").is_none());
             assert!(attr(span, "error.type").is_none());
         }
