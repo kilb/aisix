@@ -50,6 +50,10 @@ test("an empty selection is none, and a name pattern is shown as written", () =>
   );
 });
 
+test("an explicit empty name-pattern override grants no model", () => {
+  assert.equal(keyModels({ allowed_models: [], model_ids: [CHAT] }, allScope, names), "无");
+});
+
 test("an all-scope tenant marks a model it does not reach, whatever its stored list says", () => {
   // Narrowed to a hand-made model once, then widened back to `all`: the
   // stored list still names it, but the scope no longer reaches it, so the

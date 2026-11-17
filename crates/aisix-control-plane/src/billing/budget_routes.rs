@@ -1,5 +1,4 @@
-//! An organization's quota, set by operators: the `team` level, which caps
-//! every key of one tenant (`/admin/tenants/{id}/budgets`).
+//! 平台通过 `/admin/tenants/{id}/budgets` 设置组织额度，也可为单个密钥设置平台额度。
 //!
 //! An operator reads every level of the tenant's quotas, and creates, edits
 //! and deletes the ones an operator set (`set_by 'operator'`). A quota set at
@@ -159,6 +158,8 @@ pub async fn list(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NewQuota {
+    scope: Option<String>,
+    scope_ref: Option<String>,
     #[serde(default)]
     kind: Option<String>,
     #[serde(default)]
@@ -177,7 +178,7 @@ fn invalid(path: &str, message: &str) -> ApiError {
 /// or `cumulative`; a periodic quota's period is `day`, `week` or `month`
 /// (the default), a cumulative one has none. What is wrong is added to
 /// `problems` at `/kind`, `/period` and `/limit_cny`.
-fn terms(
+pub(crate) fn terms(
     kind: Option<&str>,
     period: Option<&str>,
     limit_cny: &str,
@@ -218,13 +219,14 @@ fn terms(
     (kind, period, limit)
 }
 
-/// `POST /admin/tenants/{id}/budgets` with `{kind?, period?, limit_cny}` →
-/// `201 Budget`: the organization's quota (scope `team`, `set_by
-/// "operator"`), settled before the answer. `kind` is `periodic` (the
+/// `POST /admin/tenants/{id}/budgets` with
+/// `{scope?, scope_ref?, kind?, period?, limit_cny}` → `201 Budget`.
+/// 未指定范围时仍设置组织额度，也可明确为同租户密钥设置平台额度；成员范围不开放。
+/// Every quota is `set_by "operator"`, settled before the answer. `kind` is `periodic` (the
 /// default) or `cumulative`; a periodic quota's `period` is `day`, `week` or
 /// `month` (the default), and a cumulative one has none. `422` at `/kind`,
-/// `/period`, `/limit_cny` (yuan and fen above 0) and, for the internal
-/// tenant, which takes no quota, at `/tenant_id`; `409 budget_exists` when
+/// `/period`, `/limit_cny` (yuan and fen above 0) and, for an internal
+/// tenant's organization quota, at `/tenant_id`; `409 budget_exists` when
 /// the tenant already has an operator quota of that kind and period; `404`
 /// for no such tenant.
 pub async fn create(
@@ -236,6 +238,19 @@ pub async fn create(
     auth.require(OperatorRole::Operator)?;
     let id = Uuid::parse_str(&id).map_err(|_| ApiError::not_found())?;
     let mut problems = Vec::new();
+    let scope = match req.scope.as_deref() {
+        None | Some("team") => BudgetScope::Team,
+        Some("api_key") => BudgetScope::ApiKey,
+        Some(_) => return Err(invalid("/scope", "额度层级应为 team 或 api_key")),
+    };
+    let scope_ref = match req.scope_ref.as_deref() {
+        None if scope == BudgetScope::Team => id,
+        Some(raw) => Uuid::parse_str(raw).map_err(|_| invalid("/scope_ref", "额度对象不存在"))?,
+        None => return Err(invalid("/scope_ref", "请选择密钥")),
+    };
+    if scope == BudgetScope::Team && scope_ref != id {
+        return Err(invalid("/scope_ref", "额度对象不存在"));
+    }
     let (kind, period, limit) = terms(
         req.kind.as_deref(),
         req.period.as_deref(),
@@ -253,8 +268,8 @@ pub async fn create(
                 // The billing lock, as the domain write takes it too.
                 let (tenant, _) = tenants::lock_billing(&mut *conn, id).await?;
                 let new = NewBudget {
-                    scope: BudgetScope::Team,
-                    scope_ref: id,
+                    scope,
+                    scope_ref,
                     set_by: SetBy::Operator,
                     kind,
                     period,
@@ -265,9 +280,10 @@ pub async fn create(
                 let row = budgets::create(&mut *conn, &ctx, &tenant, new, Actor::Operator(&auth))
                     .await
                     .map_err(|e| {
-                        // The only target an operator names is the tenant,
-                        // which only the internal one fails.
-                        if e.details.iter().any(|d| d.path == "/scope_ref") {
+                        // 组织额度保留旧的内部租户拒绝位置；密钥额度沿用目标校验。
+                        if scope == BudgetScope::Team
+                            && e.details.iter().any(|d| d.path == "/scope_ref")
+                        {
                             invalid("/tenant_id", "内部租户不设额度")
                         } else {
                             e

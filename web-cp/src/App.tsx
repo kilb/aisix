@@ -349,9 +349,9 @@ export function App() {
     setOperator(op);
     setSignOutError(null);
     setSessionEnded(false);
-    // 日志与租户分享链接登录后仍打开原详情，避免丢失定位。
+    // 日志、租户与密钥分享链接登录后仍打开原详情，避免丢失定位。
     const destination = adminRouteOf(window.location.hash);
-    if (!(destination.tab === "calls" && destination.query.get("detail")) && !(destination.tab === "tenants" && destination.query.get("tenant"))) setTab("overview");
+    if (!(destination.tab === "calls" && destination.query.get("detail")) && !(destination.tab === "tenants" && destination.query.get("tenant")) && !(destination.tab === "keys" && destination.query.get("key"))) setTab("overview");
   }, []);
 
   // Signed out only once the control plane has revoked the session (or says

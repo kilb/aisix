@@ -287,6 +287,8 @@ export interface NewKey {
   group_id?: string;
   rate_limit?: KeyLimits;
   expires_at?: string;
+  /** 与密钥在同一事务创建；省略则不设置密钥费用额度。 */
+  budget?: Pick<NewBudget, "kind" | "period" | "limit_cny">;
 }
 
 /** PATCH 只提交变化项；null 清除该密钥的覆盖值，归属成员不可更改。 */

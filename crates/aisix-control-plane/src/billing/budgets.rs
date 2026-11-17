@@ -4,7 +4,7 @@
 //! |---|---|---|
 //! | Organization quota | `team`, the tenant id | `operator` |
 //! | Member quota | `member`, the member id | `org_admin` |
-//! | Key quota | `api_key`, the key id | `org_admin` or `member` |
+//! | Key quota | `api_key`, the key id | `operator`, `org_admin` or `member` |
 //!
 //! Who may write each level is the routes' to enforce. No write compares
 //! one level with another: a child may exceed its parent, and the gateway
@@ -57,7 +57,7 @@ use super::money::cny_string;
 use crate::audit::{self, Actor, AuditEntry};
 use crate::db::DbError;
 use crate::error::{ApiError, Detail};
-use crate::resources::write::WriteCtx;
+use crate::resources::write::{write_resource, ResourceWrite, WriteCtx, WriteOp};
 use crate::resources::Kind as ResourceKind;
 use crate::tenants::{self, TenantRow};
 
@@ -66,7 +66,7 @@ use crate::tenants::{self, TenantRow};
 pub const MAX_BUDGETS_PER_TENANT: i64 = 100;
 
 /// What a quota caps.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BudgetScope {
     /// Every key of the tenant.
@@ -261,16 +261,6 @@ pub struct ChargedRow {
     pub api_key_id: Uuid,
     pub price_instant: DateTime<Utc>,
     pub amount: i64,
-}
-
-/// Whether a charge of `row` counts against `b` at all.
-fn applies(b: &BudgetRow, row: &ChargedRow) -> bool {
-    b.tenant_id == row.tenant_id
-        && match b.scope {
-            BudgetScope::Team => b.scope_ref == row.tenant_id,
-            BudgetScope::Member => row.member_id == Some(b.scope_ref),
-            BudgetScope::ApiKey => b.scope_ref == row.api_key_id,
-        }
 }
 
 /// The spend row of `b` a charge priced at `at` counts in: its period's
@@ -514,17 +504,54 @@ pub async fn count_charges(
     if tenant_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let quotas: Vec<BudgetRow> = live_rows(&mut *conn, &tenant_ids)
-        .await?
-        .into_iter()
-        .filter(|b| mode == CountMode::Usage || b.period.is_none())
-        .collect();
+    let mut member_ids: Vec<Uuid> = rows.iter().filter_map(|row| row.member_id).collect();
+    member_ids.sort_unstable();
+    member_ids.dedup();
+    let mut key_ids: Vec<Uuid> = rows.iter().map(|row| row.api_key_id).collect();
+    key_ids.sort_unstable();
+    key_ids.dedup();
+    // 只读取本批实际涉及的三层对象，复用额度的 scope/scope_ref 索引。
+    let raws: Vec<RawRow> = sqlx::query_as(&format!(
+        "SELECT {COLUMNS} FROM billing_budgets_cny \
+         WHERE tenant_id = ANY($1) AND deleted_at IS NULL \
+           AND ($4::boolean OR period IS NULL) \
+           AND ((scope = 'team' AND scope_ref = ANY($1)) \
+             OR (scope = 'member' AND scope_ref = ANY($2)) \
+             OR (scope = 'api_key' AND scope_ref = ANY($3)))"
+    ))
+    .bind(&tenant_ids)
+    .bind(member_ids)
+    .bind(key_ids)
+    .bind(mode == CountMode::Usage)
+    .fetch_all(&mut *conn)
+    .await?;
+    if raws.is_empty() {
+        return Ok(Vec::new());
+    }
+    let quotas: Vec<BudgetRow> = raws.into_iter().map(decode).collect::<Result<_, _>>()?;
+    let mut by_subject: HashMap<(Uuid, BudgetScope, Uuid), Vec<&BudgetRow>> = HashMap::new();
+    let mut by_id = HashMap::with_capacity(quotas.len());
+    for b in &quotas {
+        by_subject
+            .entry((b.tenant_id, b.scope, b.scope_ref))
+            .or_default()
+            .push(b);
+        by_id.insert(b.id, b);
+    }
     let mut sums: BTreeMap<(Uuid, DateTime<Utc>), i64> = BTreeMap::new();
     for row in rows {
-        for b in quotas.iter().filter(|b| applies(b, row)) {
-            if let Some(start) = counts_in(b, row.price_instant) {
-                let sum = sums.entry((b.id, start)).or_default();
-                *sum = sum.saturating_add(row.amount);
+        let subjects = [
+            Some((row.tenant_id, BudgetScope::Team, row.tenant_id)),
+            row.member_id
+                .map(|id| (row.tenant_id, BudgetScope::Member, id)),
+            Some((row.tenant_id, BudgetScope::ApiKey, row.api_key_id)),
+        ];
+        for subject in subjects.into_iter().flatten() {
+            for b in by_subject.get(&subject).into_iter().flatten() {
+                if let Some(start) = counts_in(b, row.price_instant) {
+                    let sum = sums.entry((b.id, start)).or_default();
+                    *sum = sum.saturating_add(row.amount);
+                }
             }
         }
     }
@@ -557,7 +584,7 @@ pub async fn count_charges(
     let mut flag: Vec<Uuid> = totals
         .into_iter()
         .filter_map(|(id, start, spent, now)| {
-            let b = quotas.iter().find(|b| b.id == id)?;
+            let b = by_id.get(&id)?;
             let reached = spent >= b.limit_micro_cny;
             let crossed = match b.period {
                 Some(period) => {
@@ -587,6 +614,20 @@ pub(crate) async fn project(
     }
     let now = db_now(&mut *conn).await?;
     let spends = spends(&mut *conn, &rows, now).await?;
+    let resource_ids: Vec<Uuid> = rows.iter().map(|b| b.id).collect();
+    // 批量读取当前文档；未变化的额度不再各自发起一次资源查询。
+    let documents: Vec<(Uuid, Value, bool)> = sqlx::query_as(
+        "SELECT id, doc, deleted FROM gw_resources WHERE kind = $1 AND id = ANY($2)",
+    )
+    .bind(ResourceKind::Budgets.segment())
+    .bind(resource_ids)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(DbError::from)?;
+    let documents: HashMap<Uuid, (Value, bool)> = documents
+        .into_iter()
+        .map(|(id, doc, deleted)| (id, (doc, deleted)))
+        .collect();
     let owner = marks::owner(tenant_id);
     let mut ids = Vec::with_capacity(rows.len());
     let mut period_starts = Vec::with_capacity(rows.len());
@@ -594,7 +635,25 @@ pub(crate) async fn project(
     for b in &rows {
         let spent = spends.get(&b.id).copied().unwrap_or(0);
         let doc = budget_doc(b, spent, now);
-        tenants::put(&mut *conn, ctx, ResourceKind::Budgets, b.id, &doc, &owner).await?;
+        let op = match documents.get(&b.id) {
+            Some((current, false)) if *current == doc => None,
+            Some((_, false)) => Some(WriteOp::Replace(&doc)),
+            _ => Some(WriteOp::Create(&doc)),
+        };
+        if let Some(op) = op {
+            write_resource(
+                &mut *conn,
+                ctx,
+                ResourceWrite {
+                    kind: ResourceKind::Budgets,
+                    id: b.id,
+                    op,
+                    expected_version: None,
+                    managed_by: Some(&owner),
+                },
+            )
+            .await?;
+        }
         let reached = spent >= b.limit_micro_cny;
         ids.push(b.id);
         match b.period {
@@ -640,15 +699,16 @@ fn check_limit(limit_micro_cny: i64) -> Result<(), ApiError> {
 }
 
 /// Whether `scope_ref` names a target of `tenant`'s own for `scope`: the
-/// tenant itself, one of its live members or one of its live keys. The
-/// internal tenant has none: it is never marked.
+/// tenant itself, one of its live members or one of its live keys.
+/// 内部租户只接受平台设置的密钥额度，仍不设组织余额、组织及成员额度。
 async fn target_is_own(
     conn: &mut PgConnection,
     tenant: &TenantRow,
     scope: BudgetScope,
     scope_ref: Uuid,
+    set_by: SetBy,
 ) -> Result<bool, DbError> {
-    if tenant.is_internal {
+    if tenant.is_internal && !(scope == BudgetScope::ApiKey && set_by == SetBy::Operator) {
         return Ok(false);
     }
     let sql = match scope {
@@ -726,7 +786,7 @@ pub async fn create(
         _ => {}
     }
     check_limit(new.limit_micro_cny)?;
-    if !target_is_own(&mut *conn, &tenant, new.scope, new.scope_ref).await? {
+    if !target_is_own(&mut *conn, &tenant, new.scope, new.scope_ref, new.set_by).await? {
         return Err(invalid("/scope_ref", "额度对象不存在"));
     }
     if new.set_by != SetBy::Operator {

@@ -1363,11 +1363,24 @@ async fn waits_for_the_account_first(
         tokio::time::sleep(Duration::from_millis(5)).await;
     };
     let inverted = holds_resources_lock(cp.db(), waiting).await;
+    let group_taken: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = $1 AND granted \
+         AND locktype = 'relation' AND relation = 'provider_groups'::regclass \
+         AND mode IN ('RowShareLock','RowExclusiveLock','ShareRowExclusiveLock','ExclusiveLock','AccessExclusiveLock'))",
+    )
+    .bind(waiting)
+    .fetch_one(cp.db().pool())
+    .await
+    .expect("read the waiter's group locks");
     holder.rollback().await.expect("release the account");
     let r = request.await.expect("join");
     assert!(
         !inverted,
         "{what} took the resources lock before the account: the lock order is inverted"
+    );
+    assert!(
+        !group_taken,
+        "{what} took a group row lock before the account"
     );
     r.status
 }
@@ -1655,6 +1668,30 @@ async fn every_marking_path_takes_the_account_before_the_resources_lock() {
                 "POST",
                 "/api/budgets".to_string(),
                 Some(json!({"scope": "member", "scope_ref": own_member, "limit_cny": "0.01"})),
+            ),
+            201,
+        ),
+        (
+            "POST /admin/tenants/{id}/keys (initial budget)",
+            tenant,
+            route(
+                "POST",
+                format!("/admin/tenants/{tenant}/keys"),
+                Some(
+                    json!({"label": "initial-admin-lock-469", "budget": {"kind": "cumulative", "limit_cny": "0.01"}}),
+                ),
+            ),
+            201,
+        ),
+        (
+            "POST /api/keys (initial budget)",
+            tenant,
+            member_route(
+                "POST",
+                "/api/keys".to_string(),
+                Some(
+                    json!({"label": "initial-owner-lock-469", "budget": {"kind": "cumulative", "limit_cny": "0.01"}}),
+                ),
             ),
             201,
         ),

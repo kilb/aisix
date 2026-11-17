@@ -29,7 +29,7 @@ export function keyModels(
   tenant: { effective_model_ids: string[] },
   names: Map<string, string> | null,
 ): string {
-  if (key.allowed_models?.length) return key.allowed_models.join("、");
+  if (key.allowed_models !== null && key.allowed_models !== undefined) return key.allowed_models.length ? key.allowed_models.join("、") : "无";
   if (key.model_ids === null || key.model_ids === undefined) return "全部授权模型";
   if (key.model_ids.length === 0) return "无";
   return key.model_ids

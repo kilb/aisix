@@ -282,16 +282,16 @@ statement.
   `customer_usd_money_refuses_the_upgrade_and_names_the_counts` and
   `a_platform_with_only_internal_usd_history_migrates`
   (`tests/billing_migration.rs`) pin both sides.
-- **The internal tenant is priced and posted, and never marked.** Its usage
+- **The internal tenant is priced and posted, and has no balance mark.** Its usage
   is charged at its keys' group rates and debited from its ledger like any
   customer's, postpaid, so its balance runs negative as the platform's own
-  consumption. `marks::project` and `marks::settle_locked` return before
-  writing anything for it (`is_internal`): it gets no balance mark and no
-  blocking quota mark, so nothing refuses its traffic when the balance or a
-  quota crosses. An operator credit settles the negative balance for
+  consumption. 内部租户不设置组织余额、组织或成员额度；只有平台明确为单个内部密钥
+  配置的 `operator` / `api_key` 额度会经现有预算投影与结算阻止该密钥继续调用。
+  没有配置额度的内部密钥继续不限额，正常用量批次不会因余额变负而触发标记结算。
+  An operator credit settles the negative balance for
   bookkeeping; it is the only thing the tenant's ledger needs from a human.
-  A charge path that stops posting for `is_internal`, or a mark path that
-  starts writing one, is the regression to look for here.
+  A charge path that stops posting for `is_internal`, a balance mark for it,
+  or an internal key quota that does not enforce its limit is a regression.
 - **The ledger is append-only.** `billing_ledger_cny` and
   `pricing_adjustments_cny` take inserts only: a trigger refuses every
   `UPDATE`, `DELETE` and `TRUNCATE` (migrations `0014`, `0018`, and their
@@ -405,7 +405,7 @@ statement.
   `stalled_lookups_never_hold_up_usage_intake` pins it.
 - **Each quota level writes only its own rows, and no write compares
   levels.** A quota is a `billing_budgets` row with its own document, one per
-  setter: the operators' `team` rows (`set_by 'operator'`), an owner's or
+  setter: the operators' `team` and `api_key` rows (`set_by 'operator'`), an owner's or
   admin's `member` and `api_key` rows (`org_admin`), and a member's
   `api_key` rows on its own keys (`member`). An operator writes only
   `operator` rows; an owner or admin writes the tenant's own levels, a

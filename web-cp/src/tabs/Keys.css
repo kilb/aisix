@@ -147,6 +147,7 @@
 .key-create-form > :is(.tn-field, .tn-limits, .note, .tn-foot, .gateway-too-old) {
   grid-column: 1 / -1;
 }
+.key-create-form > .field:first-child { grid-column: 1 / -1; }
 .key-create-form .f,
 .key-create-form .tn-field {
   margin-bottom: 0;
@@ -173,6 +174,12 @@
   padding: 12px 16px;
   background: var(--color-sunken);
 }
+/* 模型名有完整两列空间，整行可点击，复选框不随长名称收缩。 */
+.key-create-form .key-model-options.tn-checks { grid-template-columns: repeat(2, minmax(0, 1fr)); max-height: 20rem; overflow-y: auto; }
+.key-model-picker > .hint { margin-top: 8px; }
+.key-model-picker > .field { margin-top: 12px; }
+.key-model-options label { display: flex; width: 100%; min-width: 0; align-items: flex-start; gap: 8px; line-height: 1.5; }
+.key-model-options label > input { flex: none; margin-top: 3px; }
 .key-create-form .tn-foot {
   gap: 8px;
   margin: 0;
@@ -197,4 +204,5 @@
   .key-create-form {
     grid-template-columns: minmax(0, 1fr);
   }
+  .key-create-form .key-model-options.tn-checks { grid-template-columns: minmax(0, 1fr); }
 }

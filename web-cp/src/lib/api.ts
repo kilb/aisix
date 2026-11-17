@@ -321,6 +321,23 @@ export interface NewKey {
   rate_limit?: { concurrency?: number; rpm?: number };
   /** RFC 3339. */
   expires_at?: string;
+  budget?: NewKeyBudget;
+}
+
+export interface NewKeyBudget {
+  limit_cny: string;
+  kind: "periodic" | "cumulative";
+  period?: "day" | "week" | "month";
+}
+
+export interface AdminKeyChanges {
+  label?: string;
+  model_ids?: string[] | null;
+  allowed_models?: string[] | null;
+  group_id?: string;
+  rate_limit?: { concurrency?: number; rpm?: number } | null;
+  disabled?: boolean;
+  expires_at?: string | null;
 }
 
 /** A key at creation, with its plaintext. A later reveal answers the same plaintext. */
@@ -531,6 +548,9 @@ export const tenants = {
 };
 
 export const keys = {
+  async get(id: string): Promise<AdminKey> {
+    return (await call<AdminKey>("GET", `/admin/keys/${seg(id)}`)).data;
+  },
   /** Never store or log the plaintext: neither this answer nor a reveal of it. */
   async create(tenantId: string, body: NewKey): Promise<MintedKey> {
     return (await call<MintedKey>("POST", `/admin/tenants/${seg(tenantId)}/keys`, body)).data;
@@ -551,7 +571,7 @@ export const keys = {
    */
   async update(
     id: string,
-    changes: { disabled?: boolean; group_id?: string },
+    changes: AdminKeyChanges,
     version: number,
   ): Promise<AdminKey> {
     return (await call<AdminKey>("PATCH", `/admin/keys/${seg(id)}`, changes, version)).data;
@@ -1023,6 +1043,11 @@ export async function createOrgQuota(
   body: { kind: "periodic" | "cumulative"; period?: "day" | "week" | "month"; limit_cny: string },
 ): Promise<Budget> {
   return (await call<Budget>("POST", `/admin/tenants/${seg(tenantId)}/budgets`, body)).data;
+}
+
+/** 运维为指定密钥设置独立额度；组织额度继续独立生效。 */
+export async function createKeyQuota(tenantId: string, keyId: string, body: NewKeyBudget): Promise<Budget> {
+  return (await call<Budget>("POST", `/admin/tenants/${seg(tenantId)}/budgets`, { ...body, scope: "api_key", scope_ref: keyId })).data;
 }
 
 /** Operator and up; only a quota the operator set (`403 budget_managed` otherwise). */

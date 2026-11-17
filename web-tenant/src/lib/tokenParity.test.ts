@@ -29,6 +29,11 @@ test("门户与运维台的金额工具逐字节一致", () => {
   assert.ok(mine.equals(cp));
 });
 
+test("门户与运维台的密钥额度金额工具逐字节一致", () => {
+  const [mine, cp] = both("lib/keyBudget.ts");
+  assert.ok(mine.equals(cp));
+});
+
 test("门户与运维台的记录筛选分页逻辑逐字节一致", () => {
   const [mine, cp] = both("lib/recordTable.ts");
   assert.ok(mine.equals(cp));

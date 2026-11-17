@@ -33,6 +33,7 @@ import { beijingInputValue, fmtBeijing, parseBeijingInput } from "./lib/time";
 import { keySettingsPatch } from "./lib/keySettings";
 import { fetchKeyCosts, keyCostNotes, keyMonthRange, type KeyCosts } from "./lib/keyUsage";
 import { fmtMicroCny } from "./lib/money";
+import { isKeyBudgetAmount } from "./lib/keyBudget";
 import { useRecordTable } from "./lib/recordTable";
 import { RecordTablePager, RecordTableToolbar } from "./ui/RecordTable";
 import { Select } from "./ui/Select";
@@ -474,7 +475,7 @@ export function stateOf(k: TenantKey): { text: string; lamp: LampState; note?: s
   return { text: "可用", lamp: "applied", note: k.expires_at ? `${when(k.expires_at)} 到期` : undefined };
 }
 
-type Field = "label" | "group" | "models" | "concurrency" | "rpm" | "expires" | "owner";
+type Field = "label" | "group" | "models" | "concurrency" | "rpm" | "expires" | "owner" | "budget";
 type FieldErrors = Partial<Record<Field, string>>;
 
 /** The form field a refusal's JSON path names, or null for one the form has no field for. */
@@ -486,6 +487,7 @@ function fieldOf(path: string): Field | null {
   if (path === "/rate_limit/rpm") return "rpm";
   if (path === "/expires_at") return "expires";
   if (path === "/member_id") return "owner";
+  if (path === "/budget" || path.startsWith("/budget/")) return "budget";
   return null;
 }
 
@@ -547,6 +549,8 @@ export function KeyForm({
   const [concurrency, setConcurrency] = useState(initial?.rate_limit.concurrency?.toString() ?? "");
   const [rpm, setRpm] = useState(initial?.rate_limit.rpm?.toString() ?? "");
   const [expires, setExpires] = useState(initial?.expires_at ? beijingInputValue(new Date(initial.expires_at)) : "");
+  const [budgetAmount, setBudgetAmount] = useState("");
+  const [budgetPeriod, setBudgetPeriod] = useState<"cumulative" | "day" | "week" | "month">("cumulative");
   const [disabled, setDisabled] = useState(initial?.disabled ?? false);
   // Empty: the caller.
   const [owner, setOwner] = useState("");
@@ -580,6 +584,8 @@ export function KeyForm({
     const r = limit(rpm);
     if (c.problem) found.concurrency = c.problem;
     if (r.problem) found.rpm = r.problem;
+    const amount = budgetAmount.trim();
+    if (!initial && amount !== "" && !isKeyBudgetAmount(amount)) found.budget = "请输入大于 0 的金额，最多两位小数";
     let expiresAt: string | undefined;
     if (expires) {
       const at = parseBeijingInput(expires);
@@ -600,6 +606,9 @@ export function KeyForm({
     if (c.value !== undefined || r.value !== undefined) body.rate_limit = { concurrency: c.value, rpm: r.value };
     if (expiresAt) body.expires_at = expiresAt;
     if (manager && owner) body.member_id = owner;
+    if (!initial && amount !== "") body.budget = budgetPeriod === "cumulative"
+      ? { kind: "cumulative", limit_cny: amount }
+      : { kind: "periodic", period: budgetPeriod, limit_cny: amount };
     setBusy(true);
     onBusyChange(true);
     try {
@@ -622,6 +631,8 @@ export function KeyForm({
       setConcurrency("");
       setRpm("");
       setExpires("");
+      setBudgetAmount("");
+      setBudgetPeriod("cumulative");
       setOwner("");
       onCreated?.(plaintext);
     } catch (e) {
@@ -872,6 +883,17 @@ export function KeyForm({
         <Field label="每分钟请求" hint={capHint(caps?.key_rpm_max, caps)} error={errs.rpm}>
           {(aria) => <input inputMode="numeric" value={rpm} onChange={(e) => setRpm(e.target.value)} {...aria} />}
         </Field>
+
+        {!initial && <>
+          <Field label="费用额度（元）" hint="留空表示不限制；仍受组织、成员和平台额度约束。" error={errs.budget}>
+            {(aria) => <input inputMode="decimal" autoComplete="off" value={budgetAmount} disabled={busy} onChange={(event) => setBudgetAmount(event.target.value)} {...aria} />}
+          </Field>
+          <Field label="额度周期" hint="累计额度从创建时开始统计；周期额度按 UTC 自然周期统计。">
+            <Select value={budgetPeriod} disabled={busy || budgetAmount.trim() === ""} onValueChange={(value) => setBudgetPeriod(value as typeof budgetPeriod)} options={[
+              { value: "cumulative", label: "累计" }, { value: "day", label: "每天" }, { value: "week", label: "每周" }, { value: "month", label: "每月" },
+            ]} />
+          </Field>
+        </>}
 
         <Field label="过期时间" wide hint="留空表示永不过期；时间采用 UTC+8" error={errs.expires}>
           {(aria) => (

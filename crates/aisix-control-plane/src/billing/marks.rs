@@ -100,7 +100,7 @@ pub fn balance_doc(tenant_id: Uuid, mode: BillingMode, exhausted: bool) -> Value
 /// Writes `tenant`'s balance document as its account now stands, records
 /// what it says on the account and clears the account's flag, then writes
 /// the document of every live quota of the tenant as its spend now stands
-/// (`budgets::project`). Writes nothing for the internal tenant. The caller
+/// (`budgets::project`). 内部租户只投影明确设置的密钥额度，不设置余额额度。 The caller
 /// holds the tenant's billing lock (`tenants::lock_billing`); the account is
 /// read under it.
 pub async fn project(
@@ -109,7 +109,12 @@ pub async fn project(
     tenant: &TenantRow,
 ) -> Result<(), ApiError> {
     if tenant.is_internal {
-        return Ok(());
+        sqlx::query("UPDATE billing_accounts SET marks_dirty = false WHERE tenant_id = $1")
+            .bind(tenant.id)
+            .execute(&mut *conn)
+            .await
+            .map_err(DbError::from)?;
+        return budgets::project(conn, ctx, tenant.id).await;
     }
     let account = ledger::lock_account(&mut *conn, tenant.id).await?;
     let exhausted = exhausted(account.balance_micro_cny, account.credit_limit_micro_cny);
@@ -247,16 +252,15 @@ pub async fn settle(db: &Db, ctx: &WriteCtx, tenant_id: Uuid) -> Result<(), ApiE
 }
 
 /// Takes tenant `tenant_id`'s billing lock and projects its marks, unless
-/// it is pending or the internal tenant. A pending tenant projects nothing,
-/// and its approval writes the marks; the internal tenant is never marked.
-/// Either one's flag is cleared, so that no pass finds it again.
+/// it is pending. A pending tenant projects nothing, and its approval writes
+/// the marks. 内部租户继续跳过余额标记，仅结算明确设置的密钥额度。
 pub(crate) async fn settle_locked(
     conn: &mut PgConnection,
     ctx: &WriteCtx,
     tenant_id: Uuid,
 ) -> Result<(), ApiError> {
     let (tenant, _) = tenants::lock_billing(&mut *conn, tenant_id).await?;
-    if tenant.status == TenantStatus::Pending || tenant.is_internal {
+    if tenant.status == TenantStatus::Pending {
         sqlx::query("UPDATE billing_accounts SET marks_dirty = false WHERE tenant_id = $1")
             .bind(tenant_id)
             .execute(conn)

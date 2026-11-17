@@ -58,6 +58,7 @@ use uuid::Uuid;
 
 use crate::audit::{self, Actor, AuditEntry};
 use crate::auth::{MemberAuth, OperatorAuth, OperatorRole, KEY_HOLDERS};
+use crate::billing::budgets::{self, BudgetScope, NewBudget, SetBy};
 use crate::compat;
 use crate::db::{Db, DbError};
 use crate::error::{ApiError, Detail};
@@ -1178,6 +1179,13 @@ fn audit_entry<'a>(
     }
 }
 
+struct KeyCreation<'a> {
+    member_id: Option<Uuid>,
+    group_id: Option<&'a str>,
+    changes: Changes,
+    budget: Option<(InitialKeyBudget, SetBy)>,
+}
+
 /// Mints a key of tenant `t`, bound to `member_id` (already checked to be a
 /// live member of `t`), naming `group_id` (or `t`'s one assigned group when
 /// it is left out) and as `changes` set it, writes its document and records
@@ -1189,11 +1197,15 @@ async fn create_key(
     conn: &mut PgConnection,
     ctx: &WriteCtx,
     t: &TenantRow,
-    member_id: Option<Uuid>,
-    group_id: Option<&str>,
-    changes: Changes,
+    creation: KeyCreation<'_>,
     by: Actor<'_>,
 ) -> Result<(KeyRow, String), ApiError> {
+    let KeyCreation {
+        member_id,
+        group_id,
+        changes,
+        budget,
+    } = creation;
     let group = crate::groups::key_group(&mut *conn, t, group_id).await?;
     let changes = Changes {
         group: Some(group),
@@ -1261,6 +1273,10 @@ async fn create_key(
     .await
     .map_err(DbError::from)?;
     let key = raw.into_row()?;
+    // 预算资源先入投影序列，避免Kine逐行发布时先开放尚未发布额度的密钥。
+    if let Some((requested, set_by)) = budget {
+        create_initial_budget(&mut *conn, ctx, t, key.id, requested, set_by, by).await?;
+    }
     let active = member_active(&mut *conn, key.member_id).await?;
     project(&mut *conn, ctx, t, &key, active, KEY_DOC_VERSION, true).await?;
     audit::record(
@@ -1571,6 +1587,66 @@ pub(crate) fn on_api(e: ApiError) -> ApiError {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct InitialKeyBudget {
+    kind: Option<String>,
+    period: Option<String>,
+    limit_cny: String,
+}
+
+/// 初始额度与密钥共用外层事务；调用方已在分组及资源锁之前取得账务锁。
+async fn create_initial_budget(
+    conn: &mut PgConnection,
+    ctx: &WriteCtx,
+    tenant: &TenantRow,
+    key_id: Uuid,
+    requested: InitialKeyBudget,
+    set_by: SetBy,
+    actor: Actor<'_>,
+) -> Result<(), ApiError> {
+    let mut problems = Vec::new();
+    let (kind, period, limit) = crate::billing::budget_routes::terms(
+        requested.kind.as_deref(),
+        requested.period.as_deref(),
+        &requested.limit_cny,
+        &mut problems,
+    );
+    let at_budget = |mut error: ApiError| {
+        for detail in &mut error.details {
+            detail.path = format!("/budget{}", detail.path);
+        }
+        error
+    };
+    if !problems.is_empty() {
+        return Err(at_budget(ApiError::validation(problems)));
+    }
+    let (created_by_kind, created_by) = match actor {
+        Actor::Operator(auth) => ("operator", Some(auth.id)),
+        Actor::Member { id, .. } => ("member", Some(id)),
+        Actor::System | Actor::Anonymous { .. } | Actor::Unidentified => ("system", None),
+    };
+    budgets::create(
+        conn,
+        ctx,
+        tenant,
+        NewBudget {
+            scope: BudgetScope::ApiKey,
+            scope_ref: key_id,
+            set_by,
+            kind,
+            period,
+            limit_micro_cny: limit,
+            created_by_kind,
+            created_by,
+        },
+        actor,
+    )
+    .await
+    .map_err(at_budget)?;
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateKey {
     label: String,
     /// Left out: the caller. `null`: nobody. A member of the tenant: only
@@ -1584,6 +1660,7 @@ pub struct CreateKey {
     group_id: Option<String>,
     rate_limit: Option<LimitsBody>,
     expires_at: Option<String>,
+    budget: Option<InitialKeyBudget>,
 }
 
 #[derive(Deserialize)]
@@ -1629,6 +1706,7 @@ pub struct AdminCreateKey {
     group_id: Option<String>,
     rate_limit: Option<LimitsBody>,
     expires_at: Option<String>,
+    budget: Option<InitialKeyBudget>,
 }
 
 #[derive(Deserialize)]
@@ -1700,7 +1778,7 @@ pub async fn get(
 }
 
 /// `POST /api/keys` with `{label, member_id?, model_ids?, group_id?,
-/// rate_limit?, expires_at?}` → `201 {key: TenantKey, plaintext}`. At most
+/// rate_limit?, expires_at?, budget?}` → `201 {key: TenantKey, plaintext}`. At most
 /// [`MINTS_PER_MINUTE`] a minute per member (`429 busy`); `503
 /// unavailable` while a registered gateway is too old for the key's
 /// fields.
@@ -1716,6 +1794,9 @@ pub async fn create(
         .db
         .tx(move |conn| {
             async move {
+                if req.budget.is_some() {
+                    tenants::lock_billing(&mut *conn, auth.tenant_id).await?;
+                }
                 let (auth, tenant) = holder(&mut *conn, &auth).await?;
                 refuse_mint_flood(&mut *conn, auth.id).await?;
                 let member_id = match req.member_id {
@@ -1743,9 +1824,21 @@ pub async fn create(
                     &mut *conn,
                     &ctx,
                     &tenant,
-                    member_id,
-                    group_id.as_deref(),
-                    changes,
+                    KeyCreation {
+                        member_id,
+                        group_id: group_id.as_deref(),
+                        changes,
+                        budget: req.budget.map(|budget| {
+                            (
+                                budget,
+                                if auth.can_manage_all_keys() {
+                                    SetBy::OrgAdmin
+                                } else {
+                                    SetBy::Member
+                                },
+                            )
+                        }),
+                    },
                     member_actor(&auth),
                 )
                 .await?;
@@ -1935,7 +2028,7 @@ pub async fn admin_list(
 }
 
 /// `POST /admin/tenants/{id}/keys` with `{label, member_id?, model_ids?,
-/// allowed_models?, group_id?, rate_limit?, expires_at?}` →
+/// allowed_models?, group_id?, rate_limit?, expires_at?, budget?}` →
 /// `201 {key: AdminKey, plaintext}`, in an active or a suspended tenant. A
 /// pending tenant is `409 tenant_state`: it gives the gateways nothing until
 /// it is approved, and a key would need its team and its member's user.
@@ -1952,7 +2045,11 @@ pub async fn admin_create(
         .db
         .tx(move |conn| {
             async move {
-                let tenant = tenants::lock(&mut *conn, tenant_id).await?;
+                let tenant = if req.budget.is_some() {
+                    tenants::lock_billing(&mut *conn, tenant_id).await?.0
+                } else {
+                    tenants::lock(&mut *conn, tenant_id).await?
+                };
                 if tenant.status == TenantStatus::Pending {
                     return Err(ApiError::conflict(
                         "tenant_state",
@@ -1976,9 +2073,12 @@ pub async fn admin_create(
                     &mut *conn,
                     &ctx,
                     &tenant,
-                    member_id,
-                    group_id.as_deref(),
-                    changes,
+                    KeyCreation {
+                        member_id,
+                        group_id: group_id.as_deref(),
+                        changes,
+                        budget: req.budget.map(|budget| (budget, SetBy::Operator)),
+                    },
                     Actor::Operator(&auth),
                 )
                 .await?;
