@@ -1014,10 +1014,21 @@ async fn prepare_for(
                     "the configured adapter does not expose the Translation WebSocket API".into(),
                 ));
             }
-            let base = aisix_provider_azure_openai::AzureUpstreamRef::api_base_url(
-                pk_entry.value.api_base.as_deref(),
-            )
-            .map_err(ProxyError::Bridge)?;
+            let configured_base = pk_entry
+                .value
+                .api_base
+                .as_deref()
+                .unwrap_or_default()
+                .trim();
+            // 原生 WS 配置沿用已有握手地址；HTTP 与裸资源名走共享根解析。
+            let base = if configured_base.starts_with("ws://")
+                || configured_base.starts_with("wss://")
+            {
+                std::borrow::Cow::Borrowed(configured_base.trim_end_matches('/'))
+            } else {
+                aisix_provider_azure_openai::AzureUpstreamRef::api_base_url(Some(configured_base))
+                    .map_err(ProxyError::Bridge)?
+            };
             let url = format!(
                 "{}/openai/realtime?api-version={AZURE_REALTIME_API_VERSION}&deployment={}",
                 to_ws_scheme(&base)?,
@@ -4636,6 +4647,18 @@ mod tests {
     #[tokio::test]
     async fn azure_api_base_matrix_reaches_the_realtime_handshake() {
         for (base, expected) in [
+            (
+                "wss://acme.openai.azure.com",
+                "wss://acme.openai.azure.com/openai/realtime",
+            ),
+            (
+                "ws://corp.example/proxy/",
+                "ws://corp.example/proxy/openai/realtime",
+            ),
+            (
+                "wss://user:private-password@corp.example/proxy/",
+                "wss://user:private-password@corp.example/proxy/openai/realtime",
+            ),
             ("acme", "wss://acme.openai.azure.com/openai/realtime"),
             (
                 "https://acme.openai.azure.com/openai/v1/",
