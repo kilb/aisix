@@ -1,6 +1,6 @@
 /* 分析页独立约束网格与筛选，不改变调用记录或共享指标的布局。 */
 .usage-analysis-grid { width: 100%; min-width: 0; align-items: start; }
-.usage-analysis-scope { position: sticky; top: 60px; z-index: 20; grid-column: 1 / -1; width: 100%; gap: 8px; border: 0; border-bottom: 1px solid var(--border); border-radius: 0; background: var(--card); box-shadow: none; }
+.usage-analysis-scope { grid-column: 1 / -1; gap: 8px; }
 .usage-analysis-filters { display: flex; min-width: 0; align-items: flex-end; flex-wrap: nowrap; gap: 10px 12px; overflow-x: auto; overscroll-behavior-x: contain; padding: 2px 2px 6px; margin: -2px -2px -6px; }
 .usage-analysis-filters > .field { flex: 1 0 148px; width: auto; min-width: 148px; margin: 0; }
 .usage-analysis-filters > .field:has(input[type="date"]) { flex: 0 0 154px; min-width: 154px; }

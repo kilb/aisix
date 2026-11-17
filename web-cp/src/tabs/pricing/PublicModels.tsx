@@ -158,6 +158,7 @@ export function PublicModels({ canEdit, onGoto, initialSection, sectionVisit, re
     return (
       <PublicModelDetail
         model={open}
+        baselinePrices={prices?.get(open.id) ?? null}
         writeGate={writeGate}
         canEdit={canEdit}
         onBack={() => select(null)}

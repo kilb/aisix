@@ -24,7 +24,7 @@
 @media (max-width: 479px) { .usage-record-filter-grid { grid-template-columns: minmax(0, 1fr); } }
 
 /* 页面差异与组件同层，避免 legacy 层的宽度和留白被组件通用规则覆盖。 */
-.usage-calls-section > .usage-record-filters { margin-inline: 12px; }
+.usage-calls-section > .usage-record-filters { margin-inline: 0; }
 .usage-calls-section .usage-record-filter-primary > .field:has(input[type="date"]) { flex: 0 0 146px; min-width: 146px; }
 .usage-calls-section .usage-record-filter-primary > .field:has(input:not([type])) { flex: 1 0 168px; min-width: 168px; }
 .usage-calls-section .usage-record-filter-primary > .field:has(input[type="search"]) { flex: 1.5 0 240px; min-width: 240px; }

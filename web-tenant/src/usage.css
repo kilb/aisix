@@ -46,7 +46,7 @@
 
 /* 调用筛选可随主页面吸顶；表格仍只在自己的区域横向滚动。 */
 .usage-record-section.usage-calls-section { overflow: visible; }
-.usage-calls-section > .usage-record-filters { position: sticky; top: 60px; z-index: 20; padding: 12px 0; border: 0; border-bottom: 1px solid var(--border); border-radius: 0; background: var(--card); box-shadow: none; }
+.usage-calls-section > .usage-record-filters { padding: 12px 20px; }
 .usage-calls-section > .usage-call-notes { margin-block: 10px; }
 .usage-calls-section > .hint { margin-block: 8px; }
 .usage-calls-section .usage-column-time { width: 7.25rem; }

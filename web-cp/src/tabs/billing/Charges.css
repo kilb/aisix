@@ -1,7 +1,7 @@
 /* 调用记录使用模板的通栏清单；宽度只由表格滚动区承接。 */
 .calls-workspace, .calls-list { min-width: 0; max-width: 100%; }
 .calls-list[hidden] { display: none; }
-.charge-workspace { min-width: 0; container: charge-records / inline-size; }
+.charge-workspace { min-width: 0; overflow: visible; container: charge-records / inline-size; }
 .charge-workspace > .dt-wrap { overflow-x: auto; max-height: none; }
 .charge-records .dt.charge-records-table { width: 100%; min-width: 81rem; table-layout: fixed; }
 .charge-col-time { width: 7.25rem; }
@@ -24,7 +24,7 @@
 .charge-icon-button > svg { width: 16px; height: 16px; }
 
 /* 工具条留在主页面滚动流内，展开条件不裁剪选择浮层。 */
-.charge-filter-controls { position: sticky; top: 60px; z-index: 20; display: grid; min-width: 0; gap: 10px; padding: 12px 0; border: 0; border-bottom: 1px solid var(--border); border-radius: 0; background: var(--card); box-shadow: none; }
+.charge-filter-controls { display: grid; gap: 10px; padding: 12px 20px; }
 .charge-event-filter { display: flex; flex: 1.5 0 190px; align-items: flex-end; gap: 6px; min-width: 190px; }
 .charge-event-filter > label { flex: 1; }
 .charge-event-filter > .btn { flex: none; min-height: 36px; }

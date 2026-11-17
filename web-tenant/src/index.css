@@ -9,6 +9,7 @@
 @import "./theme/tokens.css";
 @import "./theme/base.css" layer(base);
 @import "./ui/ui.css" layer(legacy);
+@import "./ui/StickyFilters.css" layer(components);
 @import "./styles.css" layer(legacy);
 @import "./components/metrics.css" layer(legacy);
 @import "./usage.css" layer(legacy);

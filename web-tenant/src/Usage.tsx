@@ -426,7 +426,7 @@ function Summary({ keys, showKeys, ownScope, models }: { keys: TenantKey[]; show
   const metricsTo = range?.to ?? (query.get("to") || fallback.to);
   return (
     <BentoGrid className="usage-analysis-grid">
-      <Card className="usage-analysis-scope metric-scope" padding="sm" aria-label="用量分析筛选">
+      <Card className="usage-analysis-scope metric-scope sticky-filters" padding="sm" aria-label="用量分析筛选">
         <div className="usage-analysis-filters">
           <Field label="开始日期"><input type="date" value={fromDate} onChange={e => setFromDate(e.target.value)} /></Field>
           <Field label="结束日期"><input type="date" value={toDate} onChange={e => setToDate(e.target.value)} /></Field>
@@ -615,7 +615,7 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
 
   return (
     <Section title="调用记录" number={8} className="usage-calls-section">
-      <UsageRecordFilters scope="tenant" value={recordFilters} onChange={patch => update({ outcome: recordFilters.outcome, ...patch, status: undefined })}>
+      <UsageRecordFilters className="sticky-filters" scope="tenant" value={recordFilters} onChange={patch => update({ outcome: recordFilters.outcome, ...patch, status: undefined })}>
         <Field label="时间起" error={range ? null : "结束日期不能早于开始日期"}>
           <input type="date" value={fromDate} max={toDate || undefined} onChange={(e) => setFromDate(e.target.value)} />
         </Field>

@@ -12,6 +12,7 @@ export interface UsageRecordFiltersProps {
   onChange: (patch: Partial<UsageRecordFilterValues>) => void;
   scope: "admin" | "tenant";
   disabled?: boolean;
+  className?: string;
   /** 调用方只公开当前服务端已支持且有权限使用的字段。 */
   fields?: readonly UsageRecordFilterKey[];
   children?: ReactNode;
@@ -48,7 +49,7 @@ function SelectedValue({ value, choices }: { value: string; choices: readonly st
 }
 
 /** 只负责受控筛选，翻页复位与真实服务端查询由记录页面统一执行。 */
-export function UsageRecordFilters({ value, onChange, scope, disabled = false, fields = DEFAULT_FIELDS, children, advancedChildren }: UsageRecordFiltersProps) {
+export function UsageRecordFilters({ value, onChange, scope, disabled = false, className = "", fields = DEFAULT_FIELDS, children, advancedChildren }: UsageRecordFiltersProps) {
   const id = useId();
   const [expanded, setExpanded] = useState(false);
   const visibleFields = fields.filter(field => field !== "http_status" || scope === "admin");
@@ -57,7 +58,7 @@ export function UsageRecordFilters({ value, onChange, scope, disabled = false, f
   const advanced = visibleFields.filter(field => field !== "outcome" && value[field] !== "").length;
   const choose = (field: UsageRecordFilterKey, next: string) => onChange({ [field]: next });
   const clear = () => onChange(Object.fromEntries(visibleFields.map(field => [field, ""])) as Partial<UsageRecordFilterValues>);
-  return <section className="usage-record-filters" aria-label="调用结果筛选">
+  return <section className={`usage-record-filters ${className}`} aria-label="调用结果筛选">
     <div className="usage-record-filter-primary" role="group" aria-label="调用筛选工具条" tabIndex={0}>
       {has("outcome") && <label className="usage-record-filter-outcome"><span id={`${id}-outcome-label`}>调用结果</span><Select size="compact" aria-labelledby={`${id}-outcome-label`} disabled={disabled} value={value.outcome} onValueChange={selectedValue => choose("outcome", selectedValue)}>
         <option value="">全部结果</option><option value="succeeded">成功</option><option value="failed">失败</option><option value="retried">已重试</option><option value="unknown">结果未知</option>

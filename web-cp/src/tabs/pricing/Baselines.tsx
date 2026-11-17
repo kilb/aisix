@@ -411,6 +411,41 @@ export function Baselines({ canEdit, onGoto }: TabProps) {
   );
 }
 
+/** 公共模型使用同一套完整价格功能，进入选项卡后才读取价格数据。 */
+export function PublicModelBaseline({ modelId, canEdit, prices, onSaved }: { modelId: string; canEdit: boolean; prices: ModelGroupPriceRow | null; onSaved: () => Promise<void> }) {
+  const [row, setRow] = useState<BaselineRow | null>(null);
+  const [catalogue, setCatalogue] = useState<CatalogueEntry[]>([]);
+  const [loaded, setLoaded] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const latest = useRef(0);
+  const load = useCallback(async () => {
+    const current = ++latest.current;
+    try {
+      const rows = await baselines.list();
+      if (current !== latest.current) return;
+      setRow(rows.find((item) => item.model_id === modelId) ?? null);
+      setError(null);
+    } catch (failure) {
+      if (current === latest.current) setError(errorText(failure));
+    } finally {
+      if (current === latest.current) setLoaded(true);
+    }
+  }, [modelId]);
+  useEffect(() => { void load(); return () => { latest.current++; }; }, [load]);
+  useEffect(() => {
+    if (!canEdit) return;
+    let active = true;
+    void pricing.catalogue().then((result) => { if (active) setCatalogue(result.items); }, () => undefined);
+    return () => { active = false; };
+  }, [canEdit]);
+  return <Card className="pm-baseline-card mb-0">
+    <CardHeader title="基准价" description="完整美元价格、生效版本与各分组售价。" />
+    {error ? <div className="note crit" role="alert">基准价读取失败：{error}<Button type="button" onClick={() => void load()}>重试</Button></div> : !loaded ? <p className="hint">正在读取完整基准价…</p> : row ?
+      <BaselinePanel inline row={row} canEdit={canEdit} catalogue={catalogue} doc={null} prices={prices} onClose={() => undefined} onSaved={async () => { await load(); await onSaved(); }} /> :
+      <p className="hint">该模型尚未进入可计价清单，请先接入上游账号。</p>}
+  </Card>;
+}
+
 function BaselinePanel({
   row,
   canEdit,
@@ -419,7 +454,9 @@ function BaselinePanel({
   prices,
   onClose,
   onSaved,
+  inline = false,
 }: {
+  inline?: boolean;
   row: BaselineRow;
   canEdit: boolean;
   catalogue: CatalogueEntry[];
@@ -512,8 +549,8 @@ function BaselinePanel({
       ),
   );
 
-  return (
-    <SidePanel title={row.name} label={`${row.name} 的基准价`} onClose={onClose}>
+  const content = (
+    <>
       {canEdit && <><Button kind="primary" icon="plus" onClick={() => setCreateOpen(true)}>新基准价</Button><FormDialog open={createOpen} onOpenChange={setCreateOpen} busy={saving} title="新基准价" description="选择目录或录入完整价卡，明确生效时间。只影响此后调用，历史账单不变。">
         <form ref={form} className="baseline-form mt-5" aria-label="新基准价" onSubmit={(e) => void save(e)} noValidate>
 
@@ -639,6 +676,7 @@ function BaselinePanel({
         <p className="hint text-caption">现行基准价乘以每个分组现行的换算率，按每百万 token 计；这是租户折扣之前的价格。</p>
         <GroupMatrix row={prices} />
       </section>
-    </SidePanel>
+    </>
   );
+  return inline ? <div className="pm-baseline-panel" role="region" aria-label={`${row.name} 的基准价`}>{content}</div> : <SidePanel title={row.name} label={`${row.name} 的基准价`} onClose={onClose}>{content}</SidePanel>;
 }

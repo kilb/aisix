@@ -148,13 +148,13 @@ export function Charges(_props: TabProps) {
           <Button className="charge-icon-button" aria-label="刷新" title="刷新" type="button" icon="refresh" onClick={() => void loadFirst(filter)}></Button>
         }
       />
-      <Card className="charge-workspace">
+      <Card className="charge-workspace" padding="table">
         <CardHeader
           number={1}
           title="调用计费记录"
           description={rows === null ? (error ? "当前筛选结果读取失败，请重试。" : "正在读取当前筛选结果。") : `当前筛选已加载 ${formatCount(rows.length)} 条${next === null ? "，已到记录末尾。" : "，可继续加载。"}`}
         />
-        <div className="charge-filter-controls">
+        <div className="charge-filter-controls sticky-filters">
         <UsageRecordFilters scope="admin" value={usageRecordFilterValues(query)} onChange={patch => update(patch)} advancedChildren={<ChargeScopeFilters key={JSON.stringify([filter.from, filter.to, filter.member_id, filter.provider_key_id, filter.request_id, filter.model_id])} filter={filter} onChange={set} />}>
           <label><span>状态</span>
             <Select size="compact" value={filter.status ?? ""} onValueChange={value => set({ status: value || undefined })}>

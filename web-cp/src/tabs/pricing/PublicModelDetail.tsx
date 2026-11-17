@@ -1,6 +1,6 @@
 import { useState, type ReactNode } from "react";
 import { ArrowLeft } from "lucide-react";
-import { ApiError, channelModels, type PublicModel, type ServedBy } from "../../lib/api";
+import { ApiError, channelModels, type PublicModel, type ServedBy, type ModelGroupPriceRow } from "../../lib/api";
 import { runPublicModelWrite, type PublicModelWriteGate } from "../../lib/publicModelWriteGate";
 import { messageFor } from "../../lib/errors";
 import { errorText } from "../../lib/fmt";
@@ -12,8 +12,9 @@ import { useToast } from "../../ui/Toast";
 import { Card, CardHeader, PageHeader } from "../../components/page";
 import { Lamp } from "../../ui/Lamp";
 import { RoutePolicy } from "../../ui/RoutePolicy";
-import { LibrarySyncOne } from "./LibrarySync";
-import { CardFooter, Count } from "./kit";
+import { PublicModelBaseline } from "./Baselines";
+import { RouteNav } from "../../ui/RouteNav";
+import { Count } from "./kit";
 
 /**
  * The accounts serving a model, as the routing document orders them: one
@@ -54,12 +55,14 @@ export function PublicModelDetail({
   onBack,
   onChanged,
   routingEditor,
+  baselinePrices,
   writeGate,
   loadError,
 }: {
   writeGate: PublicModelWriteGate;
   loadError?: string | null;
   routingEditor?: ReactNode;
+  baselinePrices: ModelGroupPriceRow | null;
   model: PublicModel;
   canEdit: boolean;
   onBack: () => void;
@@ -69,6 +72,8 @@ export function PublicModelDetail({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
+  const [view, setView] = useState<"edit" | "routes" | "baseline">(routingEditor ? "edit" : "routes");
+  const [baselineVisited, setBaselineVisited] = useState(false);
 
   const served = model.served_by.filter((s) => s.enabled);
   const ordered = tiers(model.served_by);
@@ -107,39 +112,6 @@ export function PublicModelDetail({
     });
   }
 
-  const aside =
-    canEdit || model.served_by.length > 0 ? (
-      <>
-        {canEdit && (
-          <section className="pm-maintenance-section" aria-label="重新生成模型文档">
-            <CardHeader as="h3" title="重新生成" description="按当前表格重写生成的模型文档，不改变表格本身。" />
-            {error && (
-              <div className="note crit mt-0" role="alert">
-                重新生成失败：{error}
-              </div>
-            )}
-            {note && (
-              <div className="note mt-0" role="status">
-                {note}
-              </div>
-            )}
-            <CardFooter className="mt-2">
-              <Button type="button" disabled={writeGate.busy} busy={busy} busyLabel="重新生成中…" onClick={() => void regenerate()}>
-                重新生成
-              </Button>
-            </CardFooter>
-          </section>
-        )}
-        {/* 账号接入后生成的路由文档才可绑定基准价。 */}
-        {model.served_by.length > 0 && (
-          <section className="pm-maintenance-section" aria-label="基准价联动">
-            <CardHeader as="h3" title="基准价联动" description="从价格库核对并同步当前模型的完整价格。" />
-            <LibrarySyncOne modelId={model.id} canEdit={canEdit} current={null} onSynced={onChanged} />
-          </section>
-        )}
-      </>
-    ) : undefined;
-
   return (
     <div className="public-model-detail" role="region" aria-label={`公共模型 ${model.name}`}>
       <PageHeader
@@ -154,7 +126,6 @@ export function PublicModelDetail({
         }
       />
       {loadError && <div className="note crit" role="alert">完整列表读取失败，请刷新核对：{loadError}</div>}
-      {!routingEditor && <div className="mb-4"><RoutePolicy routing={model.effective_routing} /></div>}
       <section className="pm-detail-overview" aria-label="公共模型账号概览">
         <div className="pm-detail-identity"><Lamp state={model.retired_at ? "disabled" : "applied"}>{model.retired_at ? "已停用" : "在用"}</Lamp><span>标识 <code>{model.id}</code></span><span>创建于 {fmtBeijing(model.created_at)}</span></div>
         <details className="pm-detail-meta" open={routingEditor ? undefined : true}>
@@ -171,13 +142,24 @@ export function PublicModelDetail({
         </details>
         {model.retired_at ? <p className="note warn" role="status">模型已停用，恢复后仍需重新接入账号。</p> : served.length === 0 && <p className="note warn" role="status"><strong>无可用账号</strong>：模型仍保留在列表中，授权不受影响，但请求会以 503 失败（无可用上游）。请添加服务账号。</p>}
       </section>
+      <RouteNav label="公共模型设置" look="underline" items={[
+        ...(routingEditor ? [{ id: "edit" as const, label: "编辑模型" }] : []),
+        { id: "routes" as const, label: "路由明细" },
+        { id: "baseline" as const, label: "基准价" },
+      ]} current={view} onSelect={(next) => { setView(next); if (next === "baseline") setBaselineVisited(true); }} />
       <div className="pm-detail-workspace">
-        {routingEditor ?? <Card className="pm-mapping-card mb-0">
+        {routingEditor && <div id="tab-edit" role="tabpanel" aria-labelledby="stop-edit" hidden={view !== "edit"}>{routingEditor}</div>}
+        <div id="tab-routes" role="tabpanel" aria-labelledby="stop-routes" hidden={view !== "routes"}>
+        <Card className="pm-mapping-card mb-0">
           <CardHeader
             number={3}
-            title={<>服务账号<Count n={served.length} /></>}
+            title={<>路由明细<Count n={served.length} /></>}
             description={`完整映射 ${model.served_by.length} 个，启用 ${served.length} 个。优先级高者在前，同层权重高者在前。`}
+            actions={canEdit && <Button type="button" icon="refresh" title="按已保存的账号映射重新生成模型文档" disabled={writeGate.busy} busy={busy} busyLabel="重新生成中…" onClick={() => void regenerate()}>重新生成</Button>}
           />
+          {error && <div className="note crit" role="alert">重新生成失败：{error}</div>}
+          {note && <div className="note" role="status">{note}</div>}
+          <div className="mb-4"><RoutePolicy routing={model.effective_routing} /></div>
           {served.length === 0 ? (
             <div className="note warn mb-0 mt-0" role="status">
               <strong>无可用账号</strong>：所有服务该模型的账号都已停用或取消接入。模型仍保留在列表中，授权不受影响，但请求会以
@@ -238,8 +220,11 @@ export function PublicModelDetail({
               </tbody>
             </DataTable>
           )}
-        </Card>}
-        {aside && <div className="pm-maintenance-grid">{aside}</div>}
+        </Card>
+        </div>
+        <div id="tab-baseline" role="tabpanel" aria-labelledby="stop-baseline" hidden={view !== "baseline"}>
+          {baselineVisited && <PublicModelBaseline key={model.id} modelId={model.id} canEdit={canEdit} prices={baselinePrices} onSaved={onChanged} />}
+        </div>
       </div>
     </div>
   );

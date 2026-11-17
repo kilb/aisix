@@ -1,0 +1,23 @@
+/* 悬浮表面与所属表格同宽；控件留白由页面内边距提供。 */
+.sticky-filters {
+  position: sticky;
+  top: 60px;
+  z-index: 20;
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  margin-inline: 0;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  background: var(--card);
+  box-shadow: none;
+}
+@supports ((backdrop-filter: blur(12px)) or (-webkit-backdrop-filter: blur(12px))) {
+  .sticky-filters {
+    background: color-mix(in srgb, var(--card) 84%, transparent);
+    -webkit-backdrop-filter: blur(12px);
+    backdrop-filter: blur(12px);
+  }
+}

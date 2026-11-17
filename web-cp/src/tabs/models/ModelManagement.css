@@ -169,11 +169,6 @@ form.model-editor-form > .model-form-footer,
 .cp-publicroutes .pm-routing-explanation > div { padding: 8px 0; }
 .cp-publicroutes .pm-routing-settings { gap: 16px; margin-bottom: 14px; }
 .cp-publicroutes .pm-routing-settings .hint { margin-top: 6px; font-size: var(--text-caption); line-height: 19px; }
-.cp-publicroutes .pm-maintenance-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 2fr); align-items: start; gap: 16px; }
-.cp-publicroutes .pm-maintenance-section { min-width: 0; padding: 24px; border: 0; border-radius: var(--radius-card); background: var(--color-surface); box-shadow: var(--shadow-card); }
-.cp-publicroutes .pm-maintenance-section > .bento-card-header { margin-bottom: 12px; }
-.cp-publicroutes .pm-maintenance-section .library-one > h3 { display: none; }
-.cp-publicroutes .pm-maintenance-section .library-card-block { padding: 0; border-radius: 0; background: transparent; }
 
 /* 辅助列保持紧凑，把主要宽度留给目标名称与分组。 */
 .cp-models .model-list-name,
@@ -224,8 +219,7 @@ form.model-editor-form > .model-form-footer,
 @media (max-width: 719px) {
   .model-editor-form,
   .cp-publicroutes .ops-routing-form { --pad: 16px; }
-  .model-form-grid,
-  .cp-publicroutes .pm-maintenance-grid { grid-template-columns: minmax(0, 1fr); }
+  .model-form-grid { grid-template-columns: minmax(0, 1fr); }
   .cp-publicroutes .compact-overview-facts,
   .cp-publicroutes .pm-detail-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
   .model-cooldown > div,
@@ -242,8 +236,19 @@ form.model-editor-form > .model-form-footer,
 .cp-publicroutes .pm-detail-meta > summary { width: fit-content; min-height: 40px; padding: 8px 12px; border-radius: var(--r-round); background: var(--color-sunken-strong); color: var(--color-fg-2); cursor: pointer; }
 .cp-publicroutes .pm-detail-meta .pm-detail-facts { margin-top: 16px; }
 .cp-publicroutes .pm-detail-meta > .hint { color: var(--color-fg-3); font-size: var(--text-caption); }
-.cp-publicroutes .pm-maintenance-section .library-one { margin: 0; }
 .cp-publicroutes .pm-pricing-state::before { content: ''; width: 6px; height: 6px; flex: none; border-radius: var(--r-round); background: currentColor; }
 .form-dialog .model-editor-form { --pad: 0px; padding: 0; border: 0; border-radius: 0; background: transparent; box-shadow: none; }
 .form-dialog .model-editor-form > .bento-card-header h2 { display: none; }
-@media (max-width: 719px) { .cp-publicroutes .pm-maintenance-section { padding: 16px; } }
+
+/* 详情选项卡共用通栏宽度，隐藏时保留编辑草稿。 */
+.cp-publicroutes .pm-detail-workspace > [role="tabpanel"] { min-width: 0; width: 100%; }
+.cp-publicroutes .pm-detail-workspace > [hidden] { display: none; }
+.cp-publicroutes .pm-baseline-panel { min-width: 0; }
+
+.cp-publicroutes .pm-mapping-card > .bento-card-header { flex-wrap: nowrap; align-items: flex-start; }
+.cp-publicroutes .pm-mapping-card > .bento-card-header > div:first-child { flex: 1; }
+
+/* 通栏价格页直接展示版本内容，避免在主卡片内再套圆角卡片。 */
+.cp-publicroutes .pm-baseline-panel .baseline-version { padding: 0; border: 0; border-radius: 0; }
+.cp-publicroutes .pm-baseline-panel > section { margin-top: 16px; padding-top: 16px; }
+.cp-publicroutes .pm-baseline-panel .baseline-version-list > .baseline-version + .baseline-version { padding-top: 16px; border-top: 1px solid var(--color-border); }
