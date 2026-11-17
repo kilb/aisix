@@ -368,6 +368,8 @@ async fn run(cfg: HeartbeatConfig, cancel: &mut watch::Receiver<bool>) {
         "heartbeat started (mTLS)",
     );
 
+    // 取消发送端关闭后只按原节拍发送，避免 changed 立即返回导致自旋。
+    let mut cancel_open = true;
     loop {
         tokio::select! {
             _ = ticker.tick() => {
@@ -377,8 +379,10 @@ async fn run(cfg: HeartbeatConfig, cancel: &mut watch::Receiver<bool>) {
                     Err(e) => tracing::warn!(error = %format_args!("{e:#}"), "heartbeat failed"),
                 }
             }
-            _ = cancel.changed() => {
-                if *cancel.borrow() {
+            changed = cancel.changed(), if cancel_open => {
+                if changed.is_err() {
+                    cancel_open = false;
+                } else if *cancel.borrow() {
                     tracing::info!("heartbeat shutting down");
                     return;
                 }
@@ -1417,6 +1421,49 @@ managed:
             mtls,
         );
         assert_eq!(c.interval, Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn a_dropped_cancel_sender_leaves_the_heartbeat_running() {
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/dp/heartbeat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = cfg_with_bundle(
+            format!("{}/dp/heartbeat", server.uri()),
+            write_test_bundle(dir.path()),
+        );
+        cfg.interval = Duration::from_millis(200);
+        let (cancel_tx, cancel) = watch::channel(false);
+        let worker = spawn(cfg, cancel);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while server.received_requests().await.unwrap().is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "the first heartbeat never arrived"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // 自旋会阻止暂停的时钟前进；关闭取消发送端不等于停止心跳。
+        tokio::time::pause();
+        drop(cancel_tx);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!worker.is_finished());
+        tokio::time::resume();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while server.received_requests().await.unwrap().len() < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "no heartbeat after cancel sender drop"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
     }
 
     #[test]

@@ -345,6 +345,7 @@ impl SinkPipeline {
     /// Drain → batch → deliver until the channel closes or `cancel` flips
     /// true. Performs one final flush on shutdown. Delivery failures are
     /// counted and logged, never propagated.
+    /// 取消发送端关闭但值仍为 false 时，继续处理队列直到队列关闭。
     pub async fn run(mut self, mut cancel: watch::Receiver<bool>) {
         let mut ticker = tokio::time::interval(self.cfg.flush_interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -353,6 +354,8 @@ impl SinkPipeline {
         // `cancel` is borrowed by the select below for as long as each
         // iteration lasts, including the arm bodies.
         let mut shutdown = cancel.clone();
+        // 关闭后不再等待取消通知，避免 changed 立即返回导致自旋。
+        let mut cancel_open = true;
 
         tracing::info!(
             sink = %self.sink.name(),
@@ -383,8 +386,10 @@ impl SinkPipeline {
                 _ = ticker.tick() => {
                     self.flush(&mut buffer, None, &mut shutdown).await;
                 }
-                _ = cancel.changed() => {
-                    if *cancel.borrow() {
+                changed = cancel.changed(), if cancel_open => {
+                    if changed.is_err() {
+                        cancel_open = false;
+                    } else if *cancel.borrow() {
                         self.drain(&mut buffer, &mut shutdown).await;
                         tracing::info!(sink = %self.sink.name(), "sink pipeline shutting down");
                         torn_down.0 = None;
@@ -936,6 +941,28 @@ mod tests {
         assert_eq!(s.failed_batches, 0);
         assert!(s.last_success_unix.is_some(), "success timestamp recorded");
         assert!(s.last_failure_unix.is_none(), "no batch was dropped");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_cancel_sender_leaves_the_worker_serving_its_queue() {
+        let sink = FakeSink::new(Mode::Ok);
+        let mut c = cfg();
+        c.flush_interval = Duration::from_secs(1);
+        let (handle, worker) = SinkPipeline::new(sink.clone(), c);
+        let (cancel_tx, cancel) = watch::channel(false);
+        let started = tokio::time::Instant::now();
+        let worker = tokio::spawn(worker.run(cancel));
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        drop(cancel_tx);
+
+        // 自旋会使暂停的时钟无法前进；仍持有数据发送端，不能靠关闭队列触发投递。
+        assert!(handle.try_enqueue(rec(0)));
+        tokio::time::sleep_until(started + Duration::from_secs(1) + TICK).await;
+        assert_eq!(sink.delivered(), 1);
+        assert!(!worker.is_finished());
+
+        drop(handle);
+        worker.await.unwrap();
     }
 
     #[tokio::test]

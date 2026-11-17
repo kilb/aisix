@@ -503,6 +503,8 @@ async fn run(
         "telemetry sender started (mTLS)",
     );
 
+    // 取消发送端关闭后继续等待队列与时钟，避免 changed 立即返回导致自旋。
+    let mut cancel_open = true;
     loop {
         tokio::select! {
             // New event from the proxy. Buffer it; flush if we hit
@@ -536,7 +538,7 @@ async fn run(
                     flush(&client, &cfg, &metrics, &mut state, &mut buffer, &mut rx, Retry::Allowed, cancel).await;
                 }
             }
-            _ = cancel.changed() => {}
+            changed = cancel.changed(), if cancel_open => cancel_open = changed.is_ok(),
         }
         // A POST that reached the control plane cleared the waiting mark;
         // whatever is still queued behind it waits from now.
@@ -2824,6 +2826,47 @@ mod tests {
             assert_recorded_events(&batches, &ordered_events(2)),
             vec![2]
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_cancel_sender_leaves_the_worker_delivering() {
+        let (server, batches) = recording_server(200).await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = TelemetryConfig::new(
+            format!("{}/dp/telemetry", server.uri()),
+            write_test_bundle(dir.path()),
+        );
+        let (tx, rx) = tokio::sync::mpsc::channel(QUEUE_CAPACITY);
+        let (cancel_tx, mut cancel) = watch::channel(false);
+        let worker = tokio::spawn(async move {
+            run(cfg, Metrics::new(false), rx, &mut cancel).await;
+        });
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        drop(cancel_tx);
+        // 自旋会阻止暂停的时钟前进；该等待不依赖 HTTP 的完成速度。
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(!worker.is_finished());
+
+        tokio::time::resume();
+        for event in ordered_events(2) {
+            tx.try_send(event).unwrap();
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while batches.lock().unwrap().is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no flush after cancel sender drop"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            assert_recorded_events(&batches, &ordered_events(2)),
+            vec![2]
+        );
+        assert!(!worker.is_finished());
+
+        drop(tx);
+        worker.await.unwrap();
     }
 
     #[tokio::test]
