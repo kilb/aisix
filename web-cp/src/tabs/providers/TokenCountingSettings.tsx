@@ -2,9 +2,10 @@ import { useMemo, useState } from "react";
 import { Plus, RefreshCw, Trash2 } from "lucide-react";
 import { ApiError, type Detail, type ResourceView, type TokenCounting, type TokenCountTarget } from "../../lib/api";
 import { messageFor, problemAt } from "../../lib/errors";
-import { tokenCountBody, tokenCountProblems, tokenCountSources, selectTokenCountSource, TOKEN_COUNT_TARGETS, type TokenCountChanges, type TokenCountKey, type TokenCountSourceDoc, type TokenCountSource } from "../../lib/tokenCounting";
+import { tokenCountBody, tokenCountProblems, tokenCountSources, selectTokenCountSource, tokenCountProviderServes, TOKEN_COUNT_TARGETS, type TokenCountAccountDoc, type TokenCountChanges, type TokenCountKey, type TokenCountSourceDoc, type TokenCountSource } from "../../lib/tokenCounting";
 import { useResource } from "../../lib/useResource";
 import { ConflictNote } from "../../components/ConflictNote";
+import { GatewayTooOld } from "../../components/GatewayTooOld";
 import { RolloutBadge } from "../../components/RolloutBadge";
 import { Card, CardHeader } from "../../components/page";
 import { Loading } from "../../components/OperationalTable";
@@ -12,12 +13,7 @@ import { Button } from "../../ui/Button";
 import { Field, useRefusalFocus } from "../../ui/Field";
 import { Select } from "../../ui/Select";
 
-interface AccountDoc {
-  display_name?: string;
-  adapter?: string | null;
-  provider?: string;
-}
-type Account = ResourceView<AccountDoc>;
+type Account = ResourceView<TokenCountAccountDoc>;
 const LABELS: Record<TokenCountKey, string> = {
   messages_count_tokens: "Messages · count_tokens",
   responses_input_tokens: "Responses · input_tokens",
@@ -110,13 +106,15 @@ function TokenCountingForm({ current, accounts, models, canEdit, create, save, o
       {TOKEN_COUNT_TARGETS.map((key) => {
         const target = body[key] ?? null;
         const accountMissing = target && !accountNames.has(target.provider_key_id);
+        const selectedAccount = accounts.find((account) => account.id === target?.provider_key_id);
+        const accountInvalid = selectedAccount && !tokenCountProviderServes(selectedAccount.doc, key);
         return <fieldset key={key} disabled={!editable || busy} className="min-w-0 rounded-field border border-hairline p-4">
           <legend className="px-2 text-body font-semibold">{LABELS[key]}</legend>
-          <Field label="计数账号" hint={`仅用于 /v1/${key === "messages_count_tokens" ? "messages/count_tokens" : "responses/input_tokens"}`} error={at(`/${key}/provider_key_id`)}>
+          <Field label="计数账号" hint={`仅用于 /v1/${key === "messages_count_tokens" ? "messages/count_tokens" : "responses/input_tokens"}`} error={at(`/${key}/provider_key_id`) ?? (accountMissing ? "账号已不存在，请重新选择或关闭此计数接口" : accountInvalid ? "当前账号不支持此计数协议，请重新选择或关闭此计数接口" : undefined)}>
             {(aria) => <Select {...aria} aria-label="计数账号" value={target?.provider_key_id ?? ""} onValueChange={(id) => change(key, id === "" ? null : { ...(target ?? { model_mappings: [] }), provider_key_id: id })}>
               <option value="">未启用（沿用原上游）</option>
               {accountMissing && <option value={target.provider_key_id}>账号已不存在 · {target.provider_key_id}</option>}
-              {accounts.map((account) => <option key={account.id} value={account.id}>{account.doc.display_name || account.id} · {account.doc.adapter || account.doc.provider || "未声明协议族"} ({account.id})</option>)}
+              {accounts.filter((account) => account.id === target?.provider_key_id || tokenCountProviderServes(account.doc, key)).map((account) => <option key={account.id} value={account.id} disabled={!tokenCountProviderServes(account.doc, key)}>{account.doc.display_name || account.id} · {account.doc.adapter || account.doc.provider || "未声明协议族"} ({account.id}){!tokenCountProviderServes(account.doc, key) ? " · 不支持此计数协议" : ""}</option>)}
             </Select>}
           </Field>
           {target && <div className="mt-4 grid gap-4">
@@ -158,7 +156,7 @@ function TokenCountingForm({ current, accounts, models, canEdit, create, save, o
         </fieldset>;
       })}
     </div>
-    {failure?.code === "version_mismatch" ? <ConflictNote onReload={onReload} /> : failure && <div className="note crit" role="alert">无法保存Token计数：{messageFor(failure)}{failure.status ? `（HTTP ${failure.status}）` : ""}</div>}
+    {failure?.code === "version_mismatch" ? <ConflictNote onReload={onReload} /> : failure?.code === "gateway_too_old" ? <GatewayTooOld error={failure} allowRetirement /> : failure && <div className="note crit" role="alert">无法保存Token计数：{messageFor(failure)}{failure.status ? `（HTTP ${failure.status}）` : ""}</div>}
     {details.length > 0 && <div className="note crit" role="alert"><ul>{details.map((detail, i) => <li key={i}><code>{detail.path}</code>：{detail.message}</li>)}</ul></div>}
     {saved && <p className="note ok" role="status">Token计数设置已保存。</p>}
     {current?.managed_by != null && <p className="hint">此配置由 {current.managed_by} 管理，请在对应来源修改。</p>}

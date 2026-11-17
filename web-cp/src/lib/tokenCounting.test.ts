@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import * as counting from "./tokenCounting.ts";
 import { tokenCountBody, tokenCountSources, tokenCountProblems, selectTokenCountSource } from "./tokenCounting.ts";
 import type { ResourceView, TokenCounting } from "./api.ts";
 
@@ -13,6 +14,29 @@ const models = [
   source("wildcard", { display_name: "claude-*", model_name: "*", provider_key_id: "account-a" }),
   source("ensemble", { ensemble: {}, model_name: "name", provider_key_id: "account-a" }),
 ];
+
+test("fixed counter account choices follow each protocol's direct endpoint contract", () => {
+  assert.equal(typeof counting.tokenCountProviderServes, "function");
+  const cases = [
+    [{ provider: "anthropic" }, true, false],
+    [{ provider: "openai" }, false, true],
+    [{ provider: "other", adapter: "anthropic" }, true, false],
+    [{ provider: "other", adapter: "openai" }, false, false],
+    [{ provider: "other", apis: { messages: {} } }, true, false],
+    [{ provider: "other", apis: { responses: {} } }, false, true],
+    [{ provider: "openai", apis: {} }, false, false],
+    [{ provider: "openai", apis: { responses: null } }, false, false],
+    [{ provider: "anthropic", apis: {} }, true, false],
+    [{ provider: "openai", apis: null }, false, true],
+    ...["bedrock", "vertex", "azure-openai"].map((adapter) => [
+      { provider: "anthropic", adapter, apis: { messages: {}, responses: {} } }, false, false,
+    ] as const),
+  ] as const;
+  for (const [account, messages, responses] of cases) {
+    assert.equal(counting.tokenCountProviderServes(account, "messages_count_tokens"), messages, JSON.stringify(account));
+    assert.equal(counting.tokenCountProviderServes(account, "responses_input_tokens"), responses, JSON.stringify(account));
+  }
+});
 
 test("source choices preserve same-name account identity and include generated direct targets only", () => {
   assert.deepEqual(tokenCountSources(models).map((m) => m.id), ["direct-a", "direct-b"]);

@@ -11,7 +11,7 @@ const TEXT: Record<string, string> = {
   not_found: "资源不存在或已被删除",
   unknown_kind: "不支持的资源类型",
   validation_failed: "提交的内容未通过校验",
-  gateway_too_old: "有在线网关的版本过旧，不认识这项配置；请先升级网关",
+  gateway_too_old: "最近 24 小时内上报过的网关实例版本过低，或无法确认全部实例支持这项配置；请检查网关实例",
   name_taken: "名称已被使用",
   email_taken: "该邮箱已被使用",
   in_use: "该资源仍被其他资源引用，无法删除",

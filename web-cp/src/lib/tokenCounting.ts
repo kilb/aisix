@@ -4,6 +4,20 @@ export const TOKEN_COUNT_TARGETS = ["messages_count_tokens", "responses_input_to
 export type TokenCountKey = (typeof TOKEN_COUNT_TARGETS)[number];
 export type TokenCountChanges = Partial<Record<TokenCountKey, TokenCountTarget | null>>;
 
+export interface TokenCountAccountDoc {
+  display_name?: string;
+  adapter?: string | null;
+  provider?: string;
+  apis?: { messages?: unknown | null; responses?: unknown | null } | null;
+}
+
+// 与 aisix_core::token_count_provider_serves 保持一致，只接受直接提供计数协议的账号。
+export function tokenCountProviderServes(account: TokenCountAccountDoc, key: TokenCountKey): boolean {
+  if (["bedrock", "vertex", "azure-openai"].includes(account.adapter ?? "")) return false;
+  if (key === "messages_count_tokens") return account.provider === "anthropic" || account.adapter === "anthropic" || account.apis?.messages != null;
+  return account.apis != null ? account.apis.responses != null : account.provider === "openai";
+}
+
 export interface TokenCountSourceDoc {
   display_name?: string;
   model_name?: string;

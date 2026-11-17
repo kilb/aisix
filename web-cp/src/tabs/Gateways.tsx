@@ -24,7 +24,7 @@ import { EmptyState } from "../ui/EmptyState";
 import { Lamp } from "../ui/Lamp";
 import { TwoStep } from "../ui/TwoStep";
 import { Card, CardHeader, PageHeader, Stat, StatGrid } from "../components/page";
-import { Plus, Trash2 } from "lucide-react";
+import { Archive, Plus, Trash2 } from "lucide-react";
 import { Select } from "../ui/Select";
 
 /** How often the instances are read again: about one gateway heartbeat. */
@@ -59,6 +59,11 @@ export function Gateways({ operator }: TabProps) {
   // the page reloads, and is never written to storage, the URL or a log.
   const [bundle, setBundle] = useState<IssuedCredential | null>(null);
   const [issuing, setIssuing] = useState(false);
+  const [retireTarget, setRetireTarget] = useState<Instance | null>(null);
+  const [retireConfirmed, setRetireConfirmed] = useState(false);
+  const [retireBusy, setRetireBusy] = useState(false);
+  const [retireError, setRetireError] = useState<string | null>(null);
+  const [retireNote, setRetireNote] = useState<Note | null>(null);
 
   const readCredentials = useCallback(async () => {
     try {
@@ -104,6 +109,28 @@ export function Gateways({ operator }: TabProps) {
     } finally {
       setBusy(false);
       setRevoking(null);
+    }
+  }
+
+  async function retire() {
+    if (!retireTarget || !retireConfirmed || retireTarget.online) return;
+    setRetireBusy(true);
+    setRetireError(null);
+    setRetireNote(null);
+    try {
+      await gateways.retire(retireTarget.dp_id, retireTarget.instance_id);
+      setRetireNote({ kind: "ok", text: `已退役实例「${retireTarget.hostname || retireTarget.instance_id}」，历史记录已保留。` });
+      setRetireTarget(null);
+      try {
+        setInstances(await gateways.instances());
+        setInstancesError(null);
+      } catch (e) {
+        setInstancesError(errorText(e));
+      }
+    } catch (e) {
+      setRetireError(errorText(e));
+    } finally {
+      setRetireBusy(false);
     }
   }
 
@@ -229,6 +256,16 @@ export function Gateways({ operator }: TabProps) {
           title="网关实例"
           description="按首次注册时间倒序，每个发过心跳的网关进程一行。超过控制面设定的时间没有心跳即为离线。"
         />
+        <Msg note={retireNote} />
+        {isAdmin && <FormDialog open={retireTarget !== null} onOpenChange={(open) => { if (!open) setRetireTarget(null); }} title="退役网关实例" description="退役只适用于已停止且不会重新启用的离线实例，不会停止网关进程。" busy={retireBusy}>
+          <form className="grid gap-4" onSubmit={(event) => { event.preventDefault(); void retire(); }}>
+            <p>实例：<strong>{retireTarget?.hostname || retireTarget?.instance_id}</strong>（<code>{retireTarget?.instance_id}</code>）</p>
+            <p className="hint">退役后，该实例不再阻挡固定 Token 计数配置；版本、最近心跳等历史记录保留。若再次收到心跳，退役状态会自动清除，该实例会重新参与版本检查。</p>
+            <label className="flex items-start gap-2"><input type="checkbox" checked={retireConfirmed} disabled={retireBusy} onChange={(event) => setRetireConfirmed(event.target.checked)} /><span>我确认已停止此实例，且不会重新启用它。</span></label>
+            {retireError && <div className="note crit" role="alert">无法退役：{retireError}</div>}
+            <div className="flex justify-end gap-2"><Button type="button" disabled={retireBusy} onClick={() => setRetireTarget(null)}>取消</Button><Button type="submit" kind="primary" disabled={!retireConfirmed} busy={retireBusy} busyLabel="正在退役">确认退役</Button></div>
+          </form>
+        </FormDialog>}
         {instancesError && (
           <div className="note crit" role="alert">
             读取失败：{instancesError}
@@ -250,6 +287,7 @@ export function Gateways({ operator }: TabProps) {
                   <th className="right">已应用修订</th>
                   <th>最近心跳</th>
                   <th>状态</th>
+                  <th><span className="sr-only">操作</span></th>
                 </tr>
               </thead>
               <tbody>
@@ -270,7 +308,10 @@ export function Gateways({ operator }: TabProps) {
                     <td className="right num">{i.applied_revision}</td>
                     <td className="text-fg-3">{fmtTime(i.last_seen_at)}</td>
                     <td>
-                      <Lamp state={i.online ? "applied" : "disabled"}>{i.online ? "在线" : "离线"}</Lamp>
+                      <Lamp state={i.online ? "applied" : "disabled"}>{i.retired_at ? "已退役" : i.online ? "在线" : "离线"}</Lamp>
+                    </td>
+                    <td className="right">
+                      {isAdmin && !i.online && !i.retired_at && <Button type="button" kind="quiet" size="sm" iconOnly aria-label="退役" title="退役" disabled={retireBusy} onClick={() => { setRetireTarget(i); setRetireConfirmed(false); setRetireError(null); }}><Archive aria-hidden /></Button>}
                     </td>
                   </tr>
                 ))}

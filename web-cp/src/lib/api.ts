@@ -357,6 +357,7 @@ export interface Instance {
   config_hash: string | null;
   online: boolean;
   last_seen_at: string;
+  retired_at?: string | null;
   exporter_health: unknown;
   rejected_count: number;
   /** null when the two versions cannot be compared, such as an unstamped build. */
@@ -585,6 +586,9 @@ export const keys = {
 export const gateways = {
   async instances(): Promise<Instance[]> {
     return (await call<{ items: Instance[] }>("GET", "/admin/gateways/instances")).data.items;
+  },
+  async retire(dpId: string, instanceId: string): Promise<void> {
+    await call<unknown>("POST", `/admin/gateways/instances/${seg(dpId)}/${seg(instanceId)}/retire`, { confirmed_stopped: true });
   },
   async credentials(): Promise<Credential[]> {
     return (await call<{ items: Credential[] }>("GET", "/admin/gateways/credentials")).data.items;

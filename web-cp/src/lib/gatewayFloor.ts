@@ -63,3 +63,8 @@ export function blockingInstances(instances: Instance[], minimums: string[], now
     return v === null || floors.some((floor) => olderThan(v, floor));
   });
 }
+
+// 固定计数还按构建标记判断能力；前端不推断标记新旧，列出未退役的近期实例供核对。
+export function tokenCountReviewInstances(instances: Instance[], now: number): Instance[] {
+  return instances.filter((instance) => instance.retired_at == null && now - Date.parse(instance.last_seen_at) <= FLEET_WINDOW_MS);
+}
