@@ -2306,6 +2306,19 @@ async fn anthropic_passthrough_dispatch(
         // Billed from here on: a caller that leaves during the scan below, or
         // the commit and cache write after it, still owes this answer.
         crate::attribution::note_answered_usage(metrics.answered(snapshot, model_id));
+        // 已回答的 token 在取消时仍记账；审核结束前继续持有原并发槽。
+        let tokens = total_tokens_with_cache(
+            metrics.prompt_tokens,
+            metrics.completion_tokens,
+            metrics.cache_creation_tokens,
+            metrics.cache_read_tokens,
+        );
+        for held in [reservation.as_mut(), member_reservation.as_mut()]
+            .into_iter()
+            .flatten()
+        {
+            held.owe_tokens(tokens);
+        }
 
         // #448 (#22): run output guardrails on the passthrough response.
         // The body is forwarded verbatim, so extract its text (content
@@ -3487,6 +3500,19 @@ async fn cross_provider_dispatch(
         || crate::chat::estimation_output_text(&resp),
     );
     crate::attribution::note_answered_usage(answered.answered(snapshot, model_id));
+    // 已回答的 token 在取消时仍记账；审核结束前继续持有原并发槽。
+    let tokens = total_tokens_with_cache(
+        answered.prompt_tokens,
+        answered.completion_tokens,
+        answered.cache_creation_tokens,
+        answered.cache_read_tokens,
+    );
+    for held in [reservation.as_mut(), member_reservation.as_mut()]
+        .into_iter()
+        .flatten()
+    {
+        held.owe_tokens(tokens);
+    }
     let mut output_verdict = aisix_guardrails::GuardrailVerdict::Allow;
     if !resolved_chain.is_empty() {
         let (verdict, hits) = aisix_guardrails::Guardrail::check_output_non_segment_observed(

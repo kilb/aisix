@@ -3043,6 +3043,19 @@ async fn responses_to_target(
         if bill_tokens {
             if let Some(u) = usage.as_ref() {
                 crate::attribution::note_answered_usage(u.answered(snapshot, model_id));
+                // 已回答的 token 在取消时仍记账；审核结束前继续持有原并发槽。
+                let tokens = total_tokens_with_cache(
+                    u.prompt_tokens,
+                    u.completion_tokens,
+                    u.cache_creation_tokens,
+                    u.cache_read_tokens,
+                );
+                for held in [reservation.as_mut(), member_reservation.as_mut()]
+                    .into_iter()
+                    .flatten()
+                {
+                    held.owe_tokens(tokens);
+                }
             }
         }
 
@@ -3812,6 +3825,19 @@ async fn responses_cross_provider_to_target(
     // Billed from here on: a caller that leaves during the scan below, or the
     // commit and cache write after it, still owes this answer.
     crate::attribution::note_answered_usage(usage.answered(snapshot, model_id));
+    // 已回答的 token 在取消时仍记账；审核结束前继续持有原并发槽。
+    let tokens = total_tokens_with_cache(
+        usage.prompt_tokens,
+        usage.completion_tokens,
+        usage.cache_creation_tokens,
+        usage.cache_read_tokens,
+    );
+    for held in [reservation.as_mut(), member_reservation.as_mut()]
+        .into_iter()
+        .flatten()
+    {
+        held.owe_tokens(tokens);
+    }
 
     // #719: run output guardrails on the bridged response before re-encoding
     // it as Responses JSON — the assistant text + tool calls are

@@ -10425,21 +10425,89 @@ data: [DONE]\n\n";
     /// scan, and hand back the one row the request leaves.
     async fn cancelled_during_the_output_scan(
         snap: AisixSnapshot,
-        req: Request<Body>,
+        mut req: Request<Body>,
         upstream: &MockServer,
+        through_group: bool,
     ) -> aisix_obs::UsageEvent {
         use aisix_obs::UsageSink;
         use aisix_provider_anthropic::AnthropicBridge;
 
+        // 删除产品的欠额登记应让 token 检查失败；提前 commit 应让并发检查失败。
+        let probe_limits: aisix_core::RateLimit =
+            serde_json::from_value(serde_json::json!({"tpm": 40, "concurrency": 1})).unwrap();
+        snap.apikeys.insert(apikey_entry_with_limits(
+            "sk-caller",
+            &["*"],
+            Some(serde_json::json!({"tpm": 40, "concurrency": 1})),
+        ));
+        let checks_held_slot = matches!(req.uri().path(), "/v1/messages" | "/v1/responses");
+        let mut probe_keys = vec!["key-id-1".to_string()];
+        if checks_held_slot {
+            let (parts, body) = req.into_parts();
+            let bytes = to_bytes(body, 1_048_576).await.unwrap();
+            let mut body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let name = body["model"].as_str().unwrap().to_owned();
+            let entry = snap.models.get_by_name(&name).unwrap();
+            let mut model = (*entry.value).clone();
+            model.rate_limit = Some(probe_limits.clone());
+            snap.models.insert(ResourceEntry::new(&entry.id, model, 2));
+            probe_keys.push(format!("model:{name}"));
+            let policy: aisix_core::models::RateLimitPolicy =
+                serde_json::from_value(serde_json::json!({
+                    "name": "output-cancel-model", "scope": "model", "scope_ref": entry.id,
+                    "window": "minute", "max_tokens": 40
+                }))
+                .unwrap();
+            snap.rate_limit_policies
+                .insert(ResourceEntry::new("output-cancel-policy", policy, 1));
+            probe_keys.push(format!("policy:model:{}:output-cancel-policy", entry.id));
+            if through_group {
+                snap.models.insert(routing_entry(
+                    "output-cancel-group",
+                    "failover",
+                    &[&name],
+                    Some(0),
+                    None,
+                    None,
+                ));
+                body["model"] = serde_json::json!("output-cancel-group");
+            }
+            req = Request::from_parts(parts, Body::from(body.to_string()));
+        }
         let hub = Arc::new(Hub::new());
         hub.register_specialized("openai", Arc::new(openai_test_bridge()));
         hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
         let scanner = slow_output_scanner(&state).await;
+        let limiter = Arc::clone(&state.limiter);
         let app = build_router(state);
 
-        cancel_in_flight(app, req).await;
+        let pending = tokio::spawn(app.oneshot(req));
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while scanner.received_requests().await.unwrap().is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("请求没有进入输出审核");
+        if checks_held_slot {
+            for key in &probe_keys {
+                if key.starts_with("policy:") {
+                    continue;
+                }
+                let blocked = limiter.pre_commit(key, &probe_limits).await;
+                assert!(
+                    matches!(
+                        blocked,
+                        Err(aisix_ratelimit::RateLimitError::Concurrency { .. })
+                    ),
+                    "{key}: 审核尚未结束，不能提前释放并发槽"
+                );
+            }
+        }
+        pending.abort();
+        assert!(pending.await.unwrap_err().is_cancelled());
         assert_eq!(
             upstream.received_requests().await.unwrap().len(),
             1,
@@ -10455,6 +10523,22 @@ data: [DONE]\n\n";
             rx.try_recv().is_err(),
             "the answered attempt is the request's only row"
         );
+        let expected_tokens = u64::from(event.prompt_tokens)
+            + u64::from(event.completion_tokens)
+            + u64::from(event.cache_read_tokens)
+            + u64::from(event.cache_creation_tokens);
+        for key in &probe_keys {
+            let actual = limiter.peek(key, &probe_limits).await.unwrap();
+            assert_eq!(
+                actual.tpm_used, expected_tokens,
+                "{key}: TPM 漏记，使用行仍收费: {event:?}"
+            );
+            let blocked = limiter.pre_commit(key, &probe_limits).await;
+            assert!(
+                matches!(blocked, Err(aisix_ratelimit::RateLimitError::Tokens { .. })),
+                "{key}: 取消不能归还已消费 token"
+            );
+        }
         event
     }
 
@@ -10464,44 +10548,46 @@ data: [DONE]\n\n";
     /// shape, the cache counters on top of the prompt.
     #[tokio::test]
     async fn a_native_messages_answer_abandoned_during_its_scan_is_billed() {
-        let upstream = MockServer::builder().start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/messages"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "msg_won",
-                "type": "message",
-                "role": "assistant",
-                "model": "claude-3-5-haiku-20241022",
-                "content": [{"type": "text", "text": "answered"}],
-                "stop_reason": "end_turn",
-                "usage": {
-                    "input_tokens": 31,
-                    "output_tokens": 17,
-                    "cache_read_input_tokens": 4,
-                    "cache_creation_input_tokens": 6
-                }
-            })))
-            .mount(&upstream)
-            .await;
-        let snap = AisixSnapshot::new();
-        snap.provider_keys
-            .insert(matrix_anthropic_pk(&upstream.uri()));
-        snap.models.insert(anthropic_model_entry("my-claude"));
-        snap.apikeys
-            .insert(apikey_entry("sk-caller", &["my-claude"]));
-        let req = cancellable_request(
-            "/v1/messages",
-            serde_json::json!({
-                "model": "my-claude",
-                "max_tokens": 64,
-                "messages": [{"role": "user", "content": "hi"}]
-            }),
-        );
+        for through_group in [false, true] {
+            let upstream = MockServer::builder().start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/messages"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "msg_won",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "claude-3-5-haiku-20241022",
+                    "content": [{"type": "text", "text": "answered"}],
+                    "stop_reason": "end_turn",
+                    "usage": {
+                        "input_tokens": 31,
+                        "output_tokens": 17,
+                        "cache_read_input_tokens": 4,
+                        "cache_creation_input_tokens": 6
+                    }
+                })))
+                .mount(&upstream)
+                .await;
+            let snap = AisixSnapshot::new();
+            snap.provider_keys
+                .insert(matrix_anthropic_pk(&upstream.uri()));
+            snap.models.insert(anthropic_model_entry("my-claude"));
+            snap.apikeys
+                .insert(apikey_entry("sk-caller", &["my-claude"]));
+            let req = cancellable_request(
+                "/v1/messages",
+                serde_json::json!({
+                    "model": "my-claude",
+                    "max_tokens": 64,
+                    "messages": [{"role": "user", "content": "hi"}]
+                }),
+            );
 
-        let event = cancelled_during_the_output_scan(snap, req, &upstream).await;
-        assert_eq!(billed(&event), (31, 17, 0, 0, 4, 6), "{event:?}");
-        assert_eq!(event.model_id, "model-anthropic-1");
-        assert_eq!(event.provider_request_id, "msg_won");
+            let event = cancelled_during_the_output_scan(snap, req, &upstream, through_group).await;
+            assert_eq!(billed(&event), (31, 17, 0, 0, 4, 6), "{event:?}");
+            assert_eq!(event.model_id, "model-anthropic-1");
+            assert_eq!(event.provider_request_id, "msg_won");
+        }
     }
 
     /// `/v1/messages` translated onto a Chat Completions upstream: the row
@@ -10509,118 +10595,124 @@ data: [DONE]\n\n";
     /// prompt, exactly as the success row would.
     #[tokio::test]
     async fn a_translated_messages_answer_abandoned_during_its_scan_is_billed() {
-        let upstream = MockServer::builder().start().await;
-        Mock::given(method("POST"))
-            .and(path("/chat/completions"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "cmpl-won",
-                "model": "gpt-4o",
-                "choices": [{
-                    "index": 0,
-                    "message": {"role": "assistant", "content": "answered"},
-                    "finish_reason": "stop"
-                }],
-                "usage": {
-                    "prompt_tokens": 31,
-                    "completion_tokens": 17,
-                    "total_tokens": 48,
-                    "prompt_tokens_details": {"cached_tokens": 8}
-                }
-            })))
-            .mount(&upstream)
-            .await;
-        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
-        let req = cancellable_request(
-            "/v1/messages",
-            serde_json::json!({
-                "model": "my-gpt4",
-                "max_tokens": 64,
-                "messages": [{"role": "user", "content": "hi"}]
-            }),
-        );
+        for through_group in [false, true] {
+            let upstream = MockServer::builder().start().await;
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "cmpl-won",
+                    "model": "gpt-4o",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "answered"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {
+                        "prompt_tokens": 31,
+                        "completion_tokens": 17,
+                        "total_tokens": 48,
+                        "prompt_tokens_details": {"cached_tokens": 8}
+                    }
+                })))
+                .mount(&upstream)
+                .await;
+            let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+            let req = cancellable_request(
+                "/v1/messages",
+                serde_json::json!({
+                    "model": "my-gpt4",
+                    "max_tokens": 64,
+                    "messages": [{"role": "user", "content": "hi"}]
+                }),
+            );
 
-        let event = cancelled_during_the_output_scan(snap, req, &upstream).await;
-        assert_eq!(billed(&event), (31, 17, 48, 8, 0, 0), "{event:?}");
-        assert_eq!(event.model_id, "model-id-1");
+            let event = cancelled_during_the_output_scan(snap, req, &upstream, through_group).await;
+            assert_eq!(billed(&event), (31, 17, 48, 8, 0, 0), "{event:?}");
+            assert_eq!(event.model_id, "model-id-1");
+        }
     }
 
     /// `/v1/responses` relayed to a Responses upstream, its scan inside the
     /// attempt like the Messages relay's.
     #[tokio::test]
     async fn a_native_responses_answer_abandoned_during_its_scan_is_billed() {
-        let upstream = MockServer::builder().start().await;
-        Mock::given(method("POST"))
-            .and(wiremock::matchers::path_regex("responses$"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "resp_won",
-                "object": "response",
-                "status": "completed",
-                "model": "gpt-4o",
-                "service_tier": "priority",
-                "output": [{
-                    "type": "message",
-                    "id": "msg_1",
-                    "role": "assistant",
+        for through_group in [false, true] {
+            let upstream = MockServer::builder().start().await;
+            Mock::given(method("POST"))
+                .and(wiremock::matchers::path_regex("responses$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "resp_won",
+                    "object": "response",
                     "status": "completed",
-                    "content": [{"type": "output_text", "text": "answered", "annotations": []}]
-                }],
-                "usage": {
-                    "input_tokens": 31,
-                    "output_tokens": 17,
-                    "total_tokens": 48,
-                    "input_tokens_details": {"cached_tokens": 8}
-                }
-            })))
-            .mount(&upstream)
-            .await;
-        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
-        let req = cancellable_request(
-            "/v1/responses",
-            serde_json::json!({"model": "my-gpt4", "input": "hi"}),
-        );
+                    "model": "gpt-4o",
+                    "service_tier": "priority",
+                    "output": [{
+                        "type": "message",
+                        "id": "msg_1",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [{"type": "output_text", "text": "answered", "annotations": []}]
+                    }],
+                    "usage": {
+                        "input_tokens": 31,
+                        "output_tokens": 17,
+                        "total_tokens": 48,
+                        "input_tokens_details": {"cached_tokens": 8}
+                    }
+                })))
+                .mount(&upstream)
+                .await;
+            let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+            let req = cancellable_request(
+                "/v1/responses",
+                serde_json::json!({"model": "my-gpt4", "input": "hi"}),
+            );
 
-        let event = cancelled_during_the_output_scan(snap, req, &upstream).await;
-        assert_eq!(billed(&event), (31, 17, 48, 8, 0, 0), "{event:?}");
-        assert_eq!(event.service_tier.as_deref(), Some("priority"));
-        assert_eq!(event.provider_request_id, "resp_won");
+            let event = cancelled_during_the_output_scan(snap, req, &upstream, through_group).await;
+            assert_eq!(billed(&event), (31, 17, 48, 8, 0, 0), "{event:?}");
+            assert_eq!(event.service_tier.as_deref(), Some("priority"));
+            assert_eq!(event.provider_request_id, "resp_won");
+        }
     }
 
     /// `/v1/responses` translated onto a native Anthropic upstream: the row
     /// keeps Anthropic's shape.
     #[tokio::test]
     async fn a_translated_responses_answer_abandoned_during_its_scan_is_billed() {
-        let upstream = MockServer::builder().start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/messages"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "msg_won",
-                "type": "message",
-                "role": "assistant",
-                "model": "claude-3-5-haiku-20241022",
-                "content": [{"type": "text", "text": "answered"}],
-                "stop_reason": "end_turn",
-                "usage": {
-                    "input_tokens": 31,
-                    "output_tokens": 17,
-                    "cache_read_input_tokens": 4,
-                    "cache_creation_input_tokens": 6
-                }
-            })))
-            .mount(&upstream)
-            .await;
-        let snap = AisixSnapshot::new();
-        snap.provider_keys
-            .insert(matrix_anthropic_pk(&upstream.uri()));
-        snap.models.insert(anthropic_model_entry("my-claude"));
-        snap.apikeys
-            .insert(apikey_entry("sk-caller", &["my-claude"]));
-        let req = cancellable_request(
-            "/v1/responses",
-            serde_json::json!({"model": "my-claude", "input": "hi"}),
-        );
+        for through_group in [false, true] {
+            let upstream = MockServer::builder().start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/messages"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "msg_won",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "claude-3-5-haiku-20241022",
+                    "content": [{"type": "text", "text": "answered"}],
+                    "stop_reason": "end_turn",
+                    "usage": {
+                        "input_tokens": 31,
+                        "output_tokens": 17,
+                        "cache_read_input_tokens": 4,
+                        "cache_creation_input_tokens": 6
+                    }
+                })))
+                .mount(&upstream)
+                .await;
+            let snap = AisixSnapshot::new();
+            snap.provider_keys
+                .insert(matrix_anthropic_pk(&upstream.uri()));
+            snap.models.insert(anthropic_model_entry("my-claude"));
+            snap.apikeys
+                .insert(apikey_entry("sk-caller", &["my-claude"]));
+            let req = cancellable_request(
+                "/v1/responses",
+                serde_json::json!({"model": "my-claude", "input": "hi"}),
+            );
 
-        let event = cancelled_during_the_output_scan(snap, req, &upstream).await;
-        assert_eq!(billed(&event), (31, 17, 0, 0, 4, 6), "{event:?}");
+            let event = cancelled_during_the_output_scan(snap, req, &upstream, through_group).await;
+            assert_eq!(billed(&event), (31, 17, 0, 0, 4, 6), "{event:?}");
+        }
     }
 
     /// The single-shot family scans after its winner settled, like chat.
@@ -10650,7 +10742,7 @@ data: [DONE]\n\n";
             serde_json::json!({"model": "my-gpt4", "prompt": "hi"}),
         );
 
-        let event = cancelled_during_the_output_scan(snap, req, &upstream).await;
+        let event = cancelled_during_the_output_scan(snap, req, &upstream, false).await;
         assert_eq!(billed(&event), (31, 17, 48, 8, 0, 0), "{event:?}");
         assert_eq!(event.provider_request_id, "cmpl-won");
     }
@@ -10680,7 +10772,7 @@ data: [DONE]\n\n";
             serde_json::json!({"model": "my-gpt4", "prompt": "a cat"}),
         );
 
-        let event = cancelled_during_the_output_scan(snap, req, &upstream).await;
+        let event = cancelled_during_the_output_scan(snap, req, &upstream, false).await;
         assert_eq!(billed(&event), (31, 17, 48, 0, 0, 0), "{event:?}");
         assert_eq!(
             event.modality_tokens.prompt_image_tokens,
@@ -10725,7 +10817,7 @@ data: [DONE]\n\n";
             .body(Body::from(body))
             .unwrap();
 
-        let event = cancelled_during_the_output_scan(snap, req, &upstream).await;
+        let event = cancelled_during_the_output_scan(snap, req, &upstream, false).await;
         assert_eq!(billed(&event), (31, 17, 48, 0, 0, 0), "{event:?}");
         assert_eq!(event.audio_duration_seconds, 11.5, "{event:?}");
     }
