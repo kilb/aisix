@@ -230,7 +230,7 @@ test("折扣租户列表区分当前、预约、已取消和从未配置，名�
   await expect(page.getByTestId("current-discount")).toHaveText("无折扣");
   await expect(history.locator("tbody tr")).toHaveCount(2);
   await expect(history.getByRole("cell", { name: "15%", exact: true })).toBeVisible();
-  await expect(history.getByRole("cell", { name: "0%", exact: true })).toBeVisible();
+  await expect(history.getByRole("cell", { name: "0% 恢复原价", exact: true })).toBeVisible();
   await expect(history).toContainText(displayTime(expired.effective_from));
   await expect(history).toContainText(displayTime(revoked.effective_from));
   await page.screenshot({ path: testInfo.outputPath("cancelled-history.png"), fullPage: true });
@@ -267,7 +267,7 @@ test("完整历史跨页保留同一生效时间的每次修改，新折扣追�
   if (await earlier.isVisible()) await earlier.click();
   await expect(history.locator("tbody tr")).toHaveCount(55);
   for (const percent of [0, 1, 22.5, 53]) {
-    await expect(history.getByRole("cell", { name: `${percent}%`, exact: true })).toBeVisible();
+    await expect(history.getByRole("cell", { name: percent === 0 ? "0% 恢复原价" : `${percent}%`, exact: true })).toBeVisible();
   }
   const stored = await stack.admin.get(`/admin/pricing/discounts?tenant_id=${tenant.tenantId}&limit=100`);
   expect(stored.items).toHaveLength(55);
