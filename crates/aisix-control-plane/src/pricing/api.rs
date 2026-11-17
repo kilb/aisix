@@ -233,8 +233,12 @@ pub async fn create_discount(
 /// The statuses a charge can have.
 const STATUSES: [&str; 4] = ["charged", "exempt", "nothing_to_bill", "unpriced"];
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 pub struct ChargesQuery {
+    group_requests: Option<bool>,
+    include_attempts: Option<bool>,
+    attempts_after: Option<i64>,
+    attempt_limit: Option<i64>,
     event_id: Option<String>,
     status: Option<String>,
     /// Every status but this one.
@@ -318,6 +322,7 @@ struct ChargeRow {
 /// served it.
 /// 已记录用量、估算来源与独立长度测量也在此显式投影。
 const CHARGE_EVENT: &str = "jsonb_build_object(\
+    'request_id', ue.request_id, \
     'requested_model', ue.event->'requested_model', \
     'operation', ue.event->'operation', \
     'stream', ue.event->'stream', \
@@ -356,6 +361,7 @@ const CHARGE_EVENT: &str = "jsonb_build_object(\
 struct ChargeItem {
     #[serde(flatten)]
     row: ChargeRow,
+    request_id: Option<String>,
     /// The model's name: its document's, the public model's, or the name the
     /// call sent; `None` when the call named no model.
     model_name: Option<String>,
@@ -496,6 +502,83 @@ fn model_ids<'a>(raw: impl Iterator<Item = &'a str>) -> Vec<Uuid> {
     ids
 }
 
+fn charge_select(_grouped: bool) -> String {
+    let seq = "pc.seq";
+    format!(
+        "SELECT {seq}, pc.event_id, pc.tenant_id, pc.api_key_id, pc.user_id, \
+                pc.requested_model_id, pc.occurred_at, pc.price_instant, pc.status, \
+                pc.charge_micro_cny, pc.cost_micro_usd, pc.cost_source, pc.group_id, \
+                pc.baseline_revision_id, pc.rate_revision_id, pc.cny_per_usd_e4, \
+                pc.rate_is_model_override, pc.discount_revision_id, pc.discount_bps, \
+                pc.service_tier, pc.requested_service_tier, pc.long_context_above, pc.estimated, \
+                pc.exemption, pc.error_code, pc.lines, pc.warnings, pc.engine_version, \
+                pc.priced_at, pc.cost_micro_cny, \
+                (SELECT SUM(pa.delta_micro_cny)::bigint FROM pricing_adjustments_cny pa \
+                 WHERE pa.event_id = pc.event_id) AS adjusted_micro_cny, \
+                CASE WHEN ue.event_id IS NOT NULL THEN {CHARGE_EVENT} END AS ev"
+    )
+}
+
+async fn charge_items(
+    conn: &mut PgConnection,
+    rows: Vec<ChargeRow>,
+) -> Result<Vec<ChargeItem>, DbError> {
+    let names = model_names(
+        conn,
+        &model_ids(rows.iter().map(|r| r.requested_model_id.as_str())),
+    )
+    .await?;
+    let account_ids = model_ids(
+        rows.iter()
+            .filter_map(|r| r.ev.as_ref())
+            .filter_map(|ev| ev.get("provider_key_id").and_then(Value::as_str)),
+    );
+    let accounts = account_names(conn, &account_ids).await?;
+    let items: Vec<ChargeItem> = rows
+        .into_iter()
+        .map(|row| {
+            let mut ev = row.ev.clone().unwrap_or(Value::Null);
+            if let Some(message) = ev.get_mut("error_message") {
+                crate::usage::admin_event_view(message);
+            }
+            let (model_name, model_deleted) = shown_model(
+                &names,
+                &row.requested_model_id,
+                ev_text(&ev, "requested_model"),
+            );
+            let upstream_account_id = ev_text(&ev, "provider_key_id");
+            let account = upstream_account_id
+                .as_deref()
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .and_then(|id| accounts.get(&id));
+            ChargeItem {
+                request_id: ev_text(&ev, "request_id"),
+                upstream_account_name: account.map(|a| a.name.clone()).filter(|n| !n.is_empty()),
+                upstream_account_deleted: upstream_account_id.is_some()
+                    && account.is_none_or(|a| !a.live),
+                upstream_account_id,
+                upstream_model: ev_text(&ev, "upstream_model"),
+                usage: CallUsage::from_event(&ev),
+                model_name,
+                model_deleted,
+                operation: ev_text(&ev, "operation"),
+                status_code: ev
+                    .get("status_code")
+                    .and_then(Value::as_u64)
+                    .and_then(|c| u16::try_from(c).ok())
+                    .filter(|c| *c > 0),
+                error_class: ev_text(&ev, "error_class"),
+                error_message: ev_text(&ev, "error_message"),
+                attempt_kind: ev_text(&ev, "attempt_kind").unwrap_or_else(|| "initial".into()),
+                attempt_index: ev.get("attempt_index").and_then(Value::as_u64).unwrap_or(0),
+                is_final_attempt: ev.get("is_final_attempt").and_then(Value::as_bool),
+                row,
+            }
+        })
+        .collect();
+    Ok(items)
+}
+
 /// `GET /admin/pricing/charges` → `{items: [Charge], next_before}`: the
 /// charge of one `event_id` (zero or one item), or charges by `status` (or
 /// every status but `exclude_status`), `tenant_id`, `api_key_id`, `model_id`
@@ -526,7 +609,23 @@ pub async fn list_charges(
     query: Result<Query<ChargesQuery>, QueryRejection>,
 ) -> Result<Json<Value>, ApiError> {
     auth.require(OperatorRole::Viewer)?;
-    let Query(q) = query.map_err(query_rejected)?;
+    let Query(mut q) = query.map_err(query_rejected)?;
+    let grouping = crate::request_groups::GroupQuery {
+        group_requests: q.group_requests,
+        include_attempts: q.include_attempts,
+        attempts_after: q.attempts_after,
+        attempt_limit: q.attempt_limit,
+    };
+    grouping.validate(q.event_id.as_deref())?;
+    let grouped = grouping.enabled();
+    // 详情沿已授权事件读取整条链，不把列表结果筛选带入单次尝试。
+    if grouping.include_attempts == Some(true) {
+        q = ChargesQuery {
+            event_id: q.event_id,
+            ..Default::default()
+        };
+    }
+    let anchored = grouped && q.event_id.is_some();
     if let Some(status) = q.status.as_deref() {
         if !STATUSES.contains(&status) {
             return Err(refused("status", "未知的计费状态"));
@@ -572,26 +671,22 @@ pub async fn list_charges(
     };
     filters.validate(false)?;
     let limit = page_limit(q.limit);
-    let mut sql = QueryBuilder::<Postgres>::new(format!(
-        "SELECT pc.seq, pc.event_id, pc.tenant_id, pc.api_key_id, pc.user_id, \
-                pc.requested_model_id, pc.occurred_at, pc.price_instant, pc.status, \
-                pc.charge_micro_cny, pc.cost_micro_usd, pc.cost_source, pc.group_id, \
-                pc.baseline_revision_id, pc.rate_revision_id, pc.cny_per_usd_e4, \
-                pc.rate_is_model_override, pc.discount_revision_id, pc.discount_bps, \
-                pc.service_tier, pc.requested_service_tier, pc.long_context_above, pc.estimated, \
-                pc.exemption, pc.error_code, pc.lines, pc.warnings, pc.engine_version, \
-                pc.priced_at, pc.cost_micro_cny, \
-                (SELECT SUM(pa.delta_micro_cny)::bigint FROM pricing_adjustments_cny pa \
-                 WHERE pa.event_id = pc.event_id) AS adjusted_micro_cny, \
-                CASE WHEN ue.event_id IS NOT NULL THEN {CHARGE_EVENT} END AS ev \
-         FROM pricing_charges_cny pc LEFT JOIN usage_events ue ON ue.event_id = pc.event_id \
-         WHERE true"
-    ));
+    let mut sql = QueryBuilder::<Postgres>::new(charge_select(grouped));
+    if grouped {
+        sql.push(crate::request_groups::from_sql(anchored, ""));
+    } else {
+        sql.push(" FROM pricing_charges_cny pc LEFT JOIN usage_events ue ON ue.event_id = pc.event_id WHERE true");
+    }
     if let Some(before) = q.before {
         sql.push(" AND pc.seq < ").push_bind(before);
     }
     if let Some(event_id) = q.event_id {
-        sql.push(" AND pc.event_id = ").push_bind(event_id);
+        sql.push(if grouped {
+            " AND pc_anchor.event_id = "
+        } else {
+            " AND pc.event_id = "
+        })
+        .push_bind(event_id);
     }
     if let Some(status) = q.status {
         sql.push(" AND pc.status = ").push_bind(status);
@@ -666,65 +761,72 @@ pub async fn list_charges(
     filters.push(&mut sql, "pc.service_tier", false);
     sql.push(" ORDER BY pc.seq DESC LIMIT ")
         .push_bind(limit + 1);
-    let mut conn = state.db.pool().acquire().await.map_err(DbError::from)?;
+    let mut conn = state.db.pool().begin().await.map_err(DbError::from)?;
+    if grouped {
+        // 同一响应的代表、组摘要与尝试页共用快照，避免终态晚到造成互相矛盾。
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .execute(&mut *conn)
+            .await
+            .map_err(DbError::from)?;
+    }
     let rows: Vec<ChargeRow> = sql
         .build_query_as()
         .fetch_all(&mut *conn)
         .await
         .map_err(DbError::from)?;
     let (rows, next_before) = page(rows, limit, |r| r.seq);
-    let names = model_names(
-        &mut conn,
-        &model_ids(rows.iter().map(|r| r.requested_model_id.as_str())),
-    )
-    .await?;
-    let account_ids = model_ids(
-        rows.iter()
-            .filter_map(|r| r.ev.as_ref())
-            .filter_map(|ev| ev.get("provider_key_id").and_then(Value::as_str)),
-    );
-    let accounts = account_names(&mut conn, &account_ids).await?;
-    let items: Vec<ChargeItem> = rows
-        .into_iter()
-        .map(|row| {
-            let mut ev = row.ev.clone().unwrap_or(Value::Null);
-            if let Some(message) = ev.get_mut("error_message") {
-                crate::usage::admin_event_view(message);
+    let items = charge_items(&mut conn, rows).await?;
+    let mut items: Vec<Value> = items.into_iter().map(|item| json!(item)).collect();
+    if grouped {
+        let ids: Vec<String> = items
+            .iter()
+            .filter_map(|item| item["event_id"].as_str().map(str::to_owned))
+            .collect();
+        let summaries = crate::request_groups::summaries(&mut conn, &ids, false).await?;
+        for item in &mut items {
+            if let Some(summary) = item["event_id"].as_str().and_then(|id| summaries.get(id)) {
+                item["request_group"] = summary.clone();
             }
-            let (model_name, model_deleted) = shown_model(
-                &names,
-                &row.requested_model_id,
-                ev_text(&ev, "requested_model"),
-            );
-            let upstream_account_id = ev_text(&ev, "provider_key_id");
-            let account = upstream_account_id
-                .as_deref()
-                .and_then(|id| Uuid::parse_str(id).ok())
-                .and_then(|id| accounts.get(&id));
-            ChargeItem {
-                upstream_account_name: account.map(|a| a.name.clone()).filter(|n| !n.is_empty()),
-                upstream_account_deleted: upstream_account_id.is_some()
-                    && account.is_none_or(|a| !a.live),
-                upstream_account_id,
-                upstream_model: ev_text(&ev, "upstream_model"),
-                usage: CallUsage::from_event(&ev),
-                model_name,
-                model_deleted,
-                operation: ev_text(&ev, "operation"),
-                status_code: ev
-                    .get("status_code")
-                    .and_then(Value::as_u64)
-                    .and_then(|c| u16::try_from(c).ok())
-                    .filter(|c| *c > 0),
-                error_class: ev_text(&ev, "error_class"),
-                error_message: ev_text(&ev, "error_message"),
-                attempt_kind: ev_text(&ev, "attempt_kind").unwrap_or_else(|| "initial".into()),
-                attempt_index: ev.get("attempt_index").and_then(Value::as_u64).unwrap_or(0),
-                is_final_attempt: ev.get("is_final_attempt").and_then(Value::as_bool),
-                row,
+        }
+        if grouping.include_attempts == Some(true) {
+            if let Some(item) = items.first_mut() {
+                let event_id = item["event_id"].as_str().unwrap_or_default().to_owned();
+                let (attempt_ids, next) = crate::request_groups::attempt_page(
+                    &mut conn,
+                    &event_id,
+                    grouping.attempts_after,
+                    grouping.attempt_limit,
+                )
+                .await?;
+                let mut attempts_sql = QueryBuilder::<Postgres>::new(charge_select(false));
+                attempts_sql.push(" FROM pricing_charges_cny pc LEFT JOIN usage_events ue ON ue.event_id = pc.event_id WHERE pc.event_id = ANY(").push_bind(&attempt_ids).push(") ORDER BY pc.seq ASC");
+                let attempt_rows = attempts_sql
+                    .build_query_as::<ChargeRow>()
+                    .fetch_all(&mut *conn)
+                    .await
+                    .map_err(DbError::from)?;
+                let mut attempts: Vec<Value> = charge_items(&mut conn, attempt_rows)
+                    .await?
+                    .into_iter()
+                    .map(|attempt| json!(attempt))
+                    .collect();
+                let mut stored_ids = attempt_ids;
+                stored_ids.push(event_id.clone());
+                let events = crate::request_groups::stored_events(&mut conn, &stored_ids).await?;
+                for attempt in &mut attempts {
+                    attempt["stored_event"] = attempt["event_id"]
+                        .as_str()
+                        .and_then(|id| events.get(id))
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                }
+                item["stored_event"] = events.get(&event_id).cloned().unwrap_or(Value::Null);
+                item["attempts"] = json!(attempts);
+                item["next_attempt_after"] = json!(next);
             }
-        })
-        .collect();
+        }
+    }
+    conn.commit().await.map_err(DbError::from)?;
     Ok(Json(json!({ "items": items, "next_before": next_before })))
 }
 

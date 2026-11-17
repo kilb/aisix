@@ -1,6 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ApiError, charges, usageEvents, type Charge, type StoredUsageEvent } from "../lib/api";
-import { logValue } from "../lib/callLog";
+import { attemptKindLabel, callOutcomeLabel, logValue } from "../lib/callLog";
 import { formatDuration } from "../lib/chartFormat";
 import { errorText } from "../lib/fmt";
 import { fmtMicroCny } from "../lib/money";
@@ -13,7 +13,7 @@ import { ChargeCheck } from "../tabs/billing/Charges";
 import { RequestTimingDetails } from "./RequestTimingDetails";
 import { UpstreamTimingDetails } from "./UpstreamTimingDetails";
 import { UsageIoAuditDetails } from "./UsageIoAuditDetails";
-import { ESTIMATED_THROUGHPUT_NOTE, OUTPUT_THROUGHPUT_NOTE, formatThroughput } from "./UsagePerformance";
+import { ESTIMATED_THROUGHPUT_NOTE, OUTPUT_THROUGHPUT_NOTE, UsagePerformance, formatThroughput } from "./UsagePerformance";
 import { Card, CardHeader, PageHeader } from "./page";
 import "./CallLogDetails.css";
 
@@ -42,23 +42,71 @@ function LogText({ label, text, collapsed = false }: { label: string; text: stri
   </section>;
 }
 
-/** 精确读取一条事件，与其计价结果并行；列表不会逐行预取详情。 */
+/** 链和已保存日志由服务端一次批量读取，不随尝试数逐行请求。 */
+export function RequestAttemptChain({ charge, loading, error, onMore }: { charge: Charge; loading: boolean; error: string | null; onMore?: () => void }) {
+  const group = charge.request_group;
+  if (!group) return null;
+  return <Card aria-label="故障转移与重试链">
+    <CardHeader title="故障转移与重试链" description={`已加载 ${charge.attempts?.length ?? 0} / ${group.attempt_count} 次尝试；费用汇总所有实际计费尝试及其调整。`} />
+    <Fields items={[
+      ["故障转移次数", group.failover_count], ["同目标重试次数", group.retry_count],
+      ["已保存最终结果", group.complete],
+      ["请求总售价", group.charge_micro_cny === null ? "未知" : fmtMicroCny(group.charge_micro_cny)],
+      ["累计费用调整", fmtMicroCny(group.adjusted_micro_cny)],
+      ["请求总成本", group.cost_micro_cny == null ? "未知" : fmtMicroCny(group.cost_micro_cny)],
+    ]} />
+    {!group.complete && <p className="hint">尚无最终结果记录，当前展示最新已保存的尝试。</p>}
+    {[...(charge.attempts ?? [])].sort((a, b) => a.attempt_index - b.attempt_index).map(attempt => {
+      const label = `尝试 ${attempt.attempt_index + 1}`;
+      return <article key={attempt.event_id} data-attempt-event={attempt.event_id} className="call-log-attempt">
+        <h3>{label} · {attemptKindLabel(attempt.attempt_kind)} · {callOutcomeLabel(attempt)}{attempt.is_final_attempt === true ? " · 最终尝试" : ""}</h3>
+        <Fields items={[
+          ["事件编号", attempt.event_id], ["完成时间", fmtBeijing(attempt.occurred_at)],
+          ["HTTP 状态", attempt.status_code], ["错误类别", attempt.error_class],
+          ["上游账号", attempt.upstream_account_name ?? attempt.upstream_account_id], ["上游模型", attempt.upstream_model],
+          ["本次售价", attempt.charge_micro_cny === null ? "未知" : fmtMicroCny(attempt.charge_micro_cny)],
+          ["本次费用调整", attempt.adjusted_micro_cny === null ? "无调整" : fmtMicroCny(attempt.adjusted_micro_cny)],
+        ]} />
+        <UsagePerformance data={attempt} />
+        {attempt.error_message ? <LogText label={`${label}错误信息`} text={attempt.error_message} /> : <p className="hint">此尝试未记录错误信息。</p>}
+        <details className="call-log-attempt-charge"><summary>查看本次计价明细</summary><ChargeCheck c={attempt} /></details>
+        {attempt.stored_event ? <LogText label={`${label}事件 JSON`} text={JSON.stringify(attempt.stored_event, null, 2)} collapsed /> : <p className="hint">此尝试的原始事件未保存或已过保留期。</p>}
+      </article>;
+    })}
+    {loading && <p role="status" className="hint">正在读取尝试记录…</p>}
+    {error && <p role="alert" className="note crit">尝试记录读取失败：{error}</p>}
+    {onMore && <Button kind="quiet" size="sm" disabled={loading} onClick={onMore}>{error ? "重试读取尝试" : "加载更多尝试"}</Button>}
+  </Card>;
+}
+
+/** 详情按事件锚点读取整个请求；仅无可用组记录时回读单条事件。 */
 export function CallLogDetails({ eventId, backHref }: { eventId: string; backHref: string }) {
   const [result, setResult] = useState<LogResult | null>(null);
   const [reads, setReads] = useState(0);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [attemptError, setAttemptError] = useState<string | null>(null);
+  const generation = useRef(0);
+  const morePending = useRef(false);
   useEffect(() => {
-    let live = true;
-    void Promise.allSettled([usageEvents.get(eventId), charges.list({ event_id: eventId, limit: 1 })]).then(([event, priced]) => {
-      if (!live) return;
-      setResult({
-        eventId,
-        stored: event.status === "fulfilled" ? event.value : null,
-        charge: priced.status === "fulfilled" ? priced.value.items[0] ?? null : null,
-        eventError: event.status === "rejected" ? event.reason instanceof ApiError && event.reason.status === 404 ? null : errorText(event.reason) : null,
-        chargeError: priced.status === "rejected" ? errorText(priced.reason) : null,
-      });
-    });
-    return () => { live = false; };
+    const mine = ++generation.current;
+    morePending.current = false;
+    setLoadingMore(false);
+    setAttemptError(null);
+    void (async () => {
+      let charge: Charge | null = null;
+      let chargeError: string | null = null;
+      try {
+        charge = (await charges.list({ event_id: eventId, group_requests: true, include_attempts: true, limit: 1 })).items[0] ?? null;
+      } catch (cause) { chargeError = errorText(cause); }
+      let stored = charge?.stored_event ?? null;
+      let eventError: string | null = null;
+      if (!stored) {
+        try { stored = await usageEvents.get(charge?.event_id ?? eventId); }
+        catch (cause) { eventError = cause instanceof ApiError && cause.status === 404 ? null : errorText(cause); }
+      }
+      if (generation.current === mine) setResult({ eventId, stored, charge, eventError, chargeError });
+    })();
+    return () => { generation.current += 1; };
   }, [eventId, reads]);
   const data = result?.eventId === eventId ? result : null;
   const stored = data?.stored;
@@ -67,10 +115,34 @@ export function CallLogDetails({ eventId, backHref }: { eventId: string; backHre
   const message = event?.error_message ?? charge?.error_message;
   const errorMessage = typeof message === "string" && message.length > 0 ? message : null;
 
+  async function loadMoreAttempts() {
+    const after = charge?.next_attempt_after;
+    if (!charge || after == null || morePending.current) return;
+    const mine = generation.current;
+    morePending.current = true;
+    setLoadingMore(true);
+    setAttemptError(null);
+    try {
+      const row = (await charges.list({ event_id: eventId, group_requests: true, include_attempts: true, attempts_after: after, limit: 1 })).items[0];
+      if (generation.current !== mine) return;
+      if (!row) { setAttemptError("未找到此请求的后续尝试记录，请刷新详情。"); return; }
+      setResult(previous => {
+        if (!previous || previous.eventId !== eventId) return previous;
+        const attempts = new Map((previous.charge?.attempts ?? []).map(attempt => [attempt.event_id, attempt]));
+        for (const attempt of row.attempts ?? []) attempts.set(attempt.event_id, attempt);
+        return { ...previous, charge: { ...row, attempts: [...attempts.values()] }, stored: row.stored_event ?? previous.stored };
+      });
+    } catch (cause) {
+      if (generation.current === mine) setAttemptError(errorText(cause));
+    } finally {
+      if (generation.current === mine) { setLoadingMore(false); morePending.current = false; }
+    }
+  }
+
   return <div className="call-log-page">
-    <PageHeader title="调用日志详情" dataLead="查看本次计费尝试的结果、错误信息与已保存事件。" description="仅展示已采集内容；未采集的请求或响应正文无法补回。"
+    <PageHeader title="调用日志详情" dataLead="查看请求最终结果、完整故障转移与重试链，以及每次尝试的已保存日志。" description="仅展示已采集内容；未采集的请求或响应正文无法补回。"
       actions={<><a className="btn btn-secondary call-log-back" href={backHref}>返回调用记录</a><Button className="call-log-refresh" icon="refresh" aria-label="刷新调用日志" title="刷新调用日志" onClick={() => { setResult(null); setReads(value => value + 1); }} /></>} />
-    <p className="call-log-event-id">事件 <code>{eventId}</code></p>
+    <p className="call-log-event-id">事件 <code>{charge?.event_id ?? eventId}</code></p>
     {!data && <Loading />}
     {data && <>
       {data.eventError && <p className="note crit" role="alert">事件读取失败：{data.eventError}</p>}
@@ -92,6 +164,8 @@ export function CallLogDetails({ eventId, backHref }: { eventId: string; backHre
           ]} />
           {errorMessage ? <LogText key={`${eventId}-error`} label="错误信息" text={errorMessage} /> : <p className="hint mt-4">此事件未记录错误信息。</p>}
         </Card>
+        {charge?.request_group && <RequestAttemptChain charge={charge} loading={loadingMore} error={attemptError}
+          onMore={charge.next_attempt_after != null ? () => void loadMoreAttempts() : undefined} />}
         <Card className="call-log-record" aria-label="调用详情">
         <section className="call-log-section" aria-label="请求与实际目标">
           <CardHeader title="请求与实际目标" />
@@ -133,6 +207,7 @@ export function CallLogDetails({ eventId, backHref }: { eventId: string; backHre
         </section>
         <section className="call-log-section" aria-label="用量与计费">
           <CardHeader title="用量与计费" />
+          {charge?.request_group && <p className="hint">以下计价明细属于当前展示的代表尝试；请求总费用与各次尝试费用见上方尝试链。</p>}
           {charge ? <>
             <Fields items={[
               ["计价状态", { charged: "已计价", exempt: "免计费", nothing_to_bill: "无需计费", unpriced: "未计价" }[charge.status]],

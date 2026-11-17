@@ -19,3 +19,18 @@ export function logValue(value: unknown): string {
   if (typeof value === "number" || typeof value === "string") return String(value);
   return JSON.stringify(value);
 }
+
+export function attemptKindLabel(kind: string | null | undefined): string {
+  return ({ initial: "首次尝试", retry: "同目标重试", fallback: "故障转移" } as Record<string, string>)[kind ?? ""] ?? "类型未记录";
+}
+
+/** 已记录错误优先于2xx；缺少最终标记或有效状态时保持未知。 */
+export function callOutcomeLabel(call: { status_code: number | null; error_class: string | null; is_final_attempt: boolean | null; request_group?: { complete: boolean } }): string {
+  if (call.request_group?.complete === false) return "结果未知";
+  if (call.is_final_attempt === false) return "已重试";
+  if (call.is_final_attempt !== true) return "结果未知";
+  if (call.error_class) return "失败";
+  const code = call.status_code;
+  if (code == null || code < 100 || code >= 600) return "结果未知";
+  return code >= 200 && code < 300 ? "成功" : "失败";
+}

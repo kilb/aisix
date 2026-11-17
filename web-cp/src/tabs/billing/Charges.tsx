@@ -3,7 +3,7 @@ import { RecordTools, RecordPager } from "../../components/RecordTools";
 import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import type { TabProps } from "../../App";
 import { charges, tenants as tenantsApi, type AdminKey, type Charge, type ChargeFilter, type Tenant } from "../../lib/api";
-import { callDetailHash } from "../../lib/callLog";
+import { callDetailHash, callOutcomeLabel } from "../../lib/callLog";
 import { chargeReason } from "../../lib/chargeReason";
 import { errorText } from "../../lib/fmt";
 import { fmtMicroCny } from "../../lib/money";
@@ -38,12 +38,9 @@ const STATUSES: [string, string][] = [
 const statusLabel = (s: string) => STATUSES.find(([v]) => v === s)?.[1] ?? s;
 
 /**
- * 计费明细 (under 计费): every charge with its pricing reason, the upstream
- * account and model that served it and its usage, filterable and paged. A
- * row opens to what checks it: the billed quantities at their rates, the
- * counters the upstream reported, and the charge recomputed from the lines
- * by the engine's formula beside the amount billed. A link
- * from 计价状态 opens it on that kind's calls (its status, reason and model).
+ * 同一请求由服务端合并并分页，列表汇总请求费用，保留代表尝试的性能。
+ * 行内复核仍使用该次尝试保存的计价行与费率，完整尝试链在日志详情展示。
+ * 计价状态的深链接保留状态、原因与模型筛选。
  * 时间、调用结果与身份条件均由服务端在分页前筛选；重计价后的记录仍然可见。
  */
 export function Charges(_props: TabProps) {
@@ -66,7 +63,7 @@ export function Charges(_props: TabProps) {
   // The charges whose check row is open, by seq.
   const [open, setOpen] = useState<Set<number>>(() => new Set());
   const generation = useRef(0);
-  const table = useRecordTable({ items: rows ?? [], searchText: (c) => [c.event_id, c.model_name ?? "", c.requested_model_id, c.tenant_id], resetKey: JSON.stringify(filter) });
+  const table = useRecordTable({ items: rows ?? [], searchText: (c) => [c.request_id ?? "", c.event_id, c.model_name ?? "", c.requested_model_id, c.tenant_id], resetKey: JSON.stringify(filter) });
 
   const loadFirst = useCallback(async (f: ChargeFilter) => {
     const g = ++generation.current;
@@ -77,7 +74,7 @@ export function Charges(_props: TabProps) {
     // otherwise ask for this filter with the previous filter's cursor.
     setLoadingMore(false);
     try {
-      const page = await charges.list({ ...f, limit: 50 });
+      const page = await charges.list({ ...f, group_requests: true, limit: 50 });
       if (g !== generation.current || activeKey.current !== requestedKey) return;
       setResult({ key: requestedKey, rows: page.items, next: page.next_before, error: null });
     } catch (e) {
@@ -114,7 +111,7 @@ export function Charges(_props: TabProps) {
     setLoadingMore(true);
     setResult(current => current?.key === requestedKey ? { ...current, error: null } : current);
     try {
-      const page = await charges.list({ ...filter, before: next, limit: 50 });
+      const page = await charges.list({ ...filter, group_requests: true, before: next, limit: 50 });
       if (g !== generation.current || activeKey.current !== requestedKey) return;
       setResult(current => current?.key === requestedKey ? { ...current, rows: [...(current.rows ?? []), ...page.items], next: page.next_before, error: null } : current);
     } catch (e) {
@@ -141,9 +138,9 @@ export function Charges(_props: TabProps) {
     <>
       <PageHeader
         title="调用记录"
-        eyebrow="CALLS · 计费尝试"
-        dataLead="按计费尝试逐条展示，同一请求可能有多条记录。失败但已产生用量的调用仍按实际用量计费。"
-        description="售价与成本以人民币计；成本未知显示 —。无需计费的调用不收费，原因保留在每行。"
+        eyebrow="CALLS · 请求日志"
+        dataLead="同一请求合并一行，优先展示最终成功结果。费用汇总所有实际计费尝试，详情保留完整故障转移与重试链。"
+        description="售价与成本以人民币计；未知金额显示 —。缺少有效追踪信息的旧记录无法可靠合并，保留单条展示。"
         actions={
           <Button className="charge-icon-button" aria-label="刷新" title="刷新" type="button" icon="refresh" onClick={() => void loadFirst(filter)}></Button>
         }
@@ -227,13 +224,19 @@ export function Charges(_props: TabProps) {
                         <td data-label="请求类型">{c.stream === true ? "流" : c.stream === false ? "非流" : "未知"}</td>
                         <td data-label="调用 / 租户"><span className="charge-model-name">{modelText(c.model_name, c.model_deleted)}</span>
                           <span className="cell-note">{tenantName(c.tenant_id)}</span>
+                          <span className="cell-note break-all"><code>{c.request_id || "—"}</code></span>
                         </td>
-                        <td data-label="计价结果">{statusLabel(c.status)}<span className="cell-note">{chargeReason(c)}</span>
+                        <td data-label="计价结果"><span className="call-outcome">{callOutcomeLabel(c)}</span><span className="cell-note">{statusLabel(c.status)} · {chargeReason(c)}</span>
+                          {c.request_group && <>
+                            {c.request_group.failover_count > 0 && <span className="cell-note">故障转移 {c.request_group.failover_count} 次</span>}
+                            {c.request_group.retry_count > 0 && <span className="cell-note">同目标重试 {c.request_group.retry_count} 次</span>}
+                            {!c.request_group.complete && <span className="cell-note">尚无最终结果记录</span>}
+                          </>}
                           <span className="cell-note">HTTP {c.status_code ?? "—"}{c.error_class ? ` · ${c.error_class}` : ""}</span>
                           {c.error_message && <span className="call-error-summary">{c.error_message}</span>}
                         </td>
-                        <td data-label="费用（元）" className="num"><span className="finance-amount-label">售价</span><span className="finance-amount-value">{c.charge_micro_cny === null ? "—" : fmtMicroCny(c.charge_micro_cny)}</span>
-                          <span className="cell-note">成本 {c.cost_micro_cny === null ? "—" : fmtMicroCny(c.cost_micro_cny)}</span>
+                        <td data-label="费用（元）" className="num"><span className="finance-amount-label">售价</span><span className="finance-amount-value">{c.request_group ? c.request_group.charge_micro_cny === null ? "—" : fmtMicroCny(c.request_group.charge_micro_cny) : c.charge_micro_cny === null ? "—" : fmtMicroCny(c.charge_micro_cny)}</span>
+                          <span className="cell-note">成本 {c.request_group ? c.request_group.cost_micro_cny == null ? "—" : fmtMicroCny(c.request_group.cost_micro_cny) : c.cost_micro_cny === null ? "—" : fmtMicroCny(c.cost_micro_cny)}</span>
                         </td>
                         <td data-label="服务 / 档位">
                           <Upstream c={c} />

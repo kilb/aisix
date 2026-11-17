@@ -547,7 +547,7 @@ export interface Page<T> {
 }
 
 /** The query a ledger or summary request takes; a left-out part is not sent. */
-function queryOf(q: Record<string, string | number | undefined>): string {
+function queryOf(q: Record<string, string | number | boolean | undefined>): string {
   const p = new URLSearchParams();
   for (const [k, v] of Object.entries(q)) if (v !== undefined && v !== "") p.set(k, String(v));
   const s = p.toString();
@@ -681,8 +681,25 @@ export interface UpstreamTiming {
   first_content_ms?: number | null;
 }
 
+/** 仅展示层汇总；单次尝试的计价记录与公式仍保持原值。 */
+export interface RequestGroup {
+  attempt_count: number;
+  failover_count: number;
+  retry_count: number;
+  charge_micro_cny: string | null;
+  adjusted_micro_cny: string;
+  complete: boolean;
+}
+
 /** `Call`: one call of the organisation, with nothing of the platform's channel. */
 export interface Call extends UsageAuditData {
+  request_group?: RequestGroup;
+  attempts?: Call[];
+  next_attempt_after?: number | null;
+  attempt_kind?: string | null;
+  attempt_index?: number | null;
+  is_final_attempt?: boolean | null;
+  error_message?: string | null;
   /** 明确采集的客户端流式意图；旧记录缺失时保持未知。 */
   stream?: boolean | null;
   upstream_timing?: UpstreamTiming | null;
@@ -703,6 +720,10 @@ export interface Call extends UsageAuditData {
 }
 
 export interface CallsQuery extends UsageRecordApiFilters {
+  group_requests?: boolean;
+  include_attempts?: boolean;
+  attempts_after?: number;
+  event_id?: string;
   member_id?: string;
   from?: string;
   to?: string;

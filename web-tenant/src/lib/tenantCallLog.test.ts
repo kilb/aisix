@@ -162,3 +162,44 @@ test("上游阶段断言不能借用下一行的相同值", () => {
   const withoutRow = markup.replace(row[0], "");
   assert.throws(() => upstreamTimingValue(withoutRow, "http_send_started_ms"), /缺少 http_send_started_ms 阶段/);
 });
+
+// 隐藏故障转移或把同目标重试算入次数、回退到代表行费用都会改变此输出。
+test("合并请求显示服务端故障转移次数与全部尝试最终费用", () => {
+  const request_group = { attempt_count: 4, failover_count: 1, retry_count: 2, charge_micro_cny: "9007199254740993", adjusted_micro_cny: "11", complete: true };
+  const markup = row({ request_group });
+  assert.match(text(markup), /故障转移 1 次/);
+  assert.match(text(markup), /同目标重试 2 次/);
+  const amount = markup.match(/<td[^>]*data-label="费用"[^>]*>(.*?)<\/td>/s);
+  assert.ok(amount);
+  assert.equal(text(amount[1]!), "¥9,007,199,254.740993（含调整）");
+  assert.match(text(row({ request_group: { ...request_group, charge_micro_cny: null } })), /金额未知/);
+});
+
+// 删除任一次记录或将第一条错误覆盖为最终成功文案，链上的独立断言会失败。
+test("请求详情保留完整尝试链及每次安全错误和费用", () => {
+  const attempts = [
+    { ...base, event_id: "attempt-0", attempt_index: 0, attempt_kind: "initial", is_final_attempt: false, status: "retried", error_class: "upstream_unavailable", error_message: "上游暂不可用" },
+    { ...base, event_id: "attempt-1", attempt_index: 1, attempt_kind: "retry", is_final_attempt: false, status: "retried", error_class: "rate_limited", error_message: "请求过于频繁" },
+    { ...base, event_id: "attempt-2", attempt_index: 2, attempt_kind: "fallback", is_final_attempt: true, status: "succeeded", error_message: null },
+  ];
+  const markup = renderToStaticMarkup(createElement(DetailsUnderTest, { call: { ...base, attempts,
+    request_group: { attempt_count: 3, failover_count: 1, retry_count: 1, charge_micro_cny: "3000", adjusted_micro_cny: "0", complete: true } } }));
+  assert.match(markup, /aria-label="故障转移与重试链"/);
+  for (const attempt of attempts) {
+    assert.match(markup, new RegExp(`data-attempt-event="${attempt.event_id}"`));
+    assert.ok(text(markup).includes(attempt.event_id));
+  }
+  assert.match(text(markup), /已加载 3 \/ 3 次尝试/);
+  assert.match(text(markup), /上游暂不可用/);
+  assert.match(text(markup), /请求过于频繁/);
+  assert.match(text(markup), /故障转移/);
+  assert.match(text(markup), /同目标重试/);
+});
+
+// 后到达的早期错误不能排在最终成功之后，导致链的展示顺序反转。
+test("请求详情按尝试编号展示迟到日志", () => {
+  const attempts = [2, 0, 1].map(index => ({ ...base, event_id: `attempt-${index}`, attempt_index: index, attempt_kind: index === 2 ? "fallback" : "retry" }));
+  const markup = renderToStaticMarkup(createElement(DetailsUnderTest, { call: { ...base, attempts,
+    request_group: { attempt_count: 3, failover_count: 1, retry_count: 1, charge_micro_cny: "3000", adjusted_micro_cny: "0", complete: true } } }));
+  assert.deepEqual([...markup.matchAll(/data-attempt-event="([^"]+)"/g)].map(match => match[1]), ["attempt-0", "attempt-1", "attempt-2"]);
+});

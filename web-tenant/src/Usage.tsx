@@ -95,6 +95,10 @@ function percentOf(bps: number): string {
 
 /** What a call's 费用 cell says. */
 function chargeText(c: Call): string {
+  if (c.request_group) {
+    const group = c.request_group;
+    return `${group.charge_micro_cny === null ? "金额未知" : fmtMicroCny(group.charge_micro_cny)}${group.adjusted_micro_cny !== "0" ? "（含调整）" : ""}`;
+  }
   const { charge } = c;
   switch (charge.status) {
     case "charged": {
@@ -141,7 +145,7 @@ function FeeCalculation({ call }: { call: Call }) {
         </>
       )}
       {charge.estimated && <p className="hint">含估算用量：上游未完整返回用量，部分 token 由网关估算，费用按该用量计费。</p>}
-      {call.status === "retried" && <p className="hint">这里展示本次尝试的费用，同一请求的其他计费尝试单独记录。</p>}
+      {call.request_group && <p className="hint">以下费用公式与计价行属于最终展示的这次尝试；整个请求的费用包含链中所有实际计费尝试。</p>}
       {f.final_micro_cny === null ? <p>待计价，最终金额未知。</p> : (
         <>
           <dl className="grid gap-x-6 gap-y-1 sm:grid-cols-3">
@@ -190,6 +194,11 @@ function CallLogRow({ call: c, onDetails }: { call: Call; onDetails: (trigger: H
     </td>
     <td data-label="状态">
       <CallStatusLamp call={c} />
+      {c.request_group && <>
+        {c.request_group.failover_count > 0 && <span className="cell-note">故障转移 {c.request_group.failover_count} 次</span>}
+        {c.request_group.retry_count > 0 && <span className="cell-note">同目标重试 {c.request_group.retry_count} 次</span>}
+        {!c.request_group.complete && <span className="cell-note">尚无最终结果记录</span>}
+      </>}
       <span className="cell-note">分组 {c.charge.group ? c.charge.group.display_name : "—"}</span>
     </td>
     <td data-label="响应性能"><UsagePerformance data={c} /></td>
@@ -208,7 +217,12 @@ function CallLogRow({ call: c, onDetails }: { call: Call; onDetails: (trigger: H
 }
 
 /** 同一条记录的详情按小标题分区，保留历史费用公式与完整计价行。 */
-function CallLogDetails({ call: c }: { call: Call }) {
+function CallLogDetails({ call: c, loadingAttempts = false, attemptError = null, onMoreAttempts }: {
+  call: Call;
+  loadingAttempts?: boolean;
+  attemptError?: string | null;
+  onMoreAttempts?: () => void;
+}) {
   return <>
     <section className="tenant-call-section" aria-label="请求信息">
       <h3>请求信息</h3>
@@ -223,6 +237,24 @@ function CallLogDetails({ call: c }: { call: Call }) {
         <div><dt>费用</dt><dd>{chargeText(c)}</dd></div>
       </dl>
     </section>
+    {c.request_group && <section className="tenant-call-section" aria-label="故障转移与重试链">
+      <h3>故障转移与重试链</h3>
+      <p>故障转移 {c.request_group.failover_count} 次 · 同目标重试 {c.request_group.retry_count} 次</p>
+      <p className="hint">已加载 {c.attempts?.length ?? 0} / {c.request_group.attempt_count} 次尝试；请求费用汇总所有实际计费尝试及其调整。</p>
+      {!c.request_group.complete && <p className="hint">尚无最终结果记录，当前展示最新已保存的尝试。</p>}
+      {[...(c.attempts ?? [])].sort((a, b) => (a.attempt_index ?? Number.MAX_SAFE_INTEGER) - (b.attempt_index ?? Number.MAX_SAFE_INTEGER)).map(attempt => <article className="tenant-call-attempt" data-attempt-event={attempt.event_id} key={attempt.event_id}>
+        <h4>尝试 {attempt.attempt_index == null ? "未知" : attempt.attempt_index + 1} · {{ initial: "首次尝试", retry: "同目标重试", fallback: "故障转移" }[attempt.attempt_kind ?? ""] ?? "类型未记录"}{attempt.is_final_attempt === true ? " · 最终尝试" : ""}</h4>
+        <p>{fmtBeijing(attempt.occurred_at)} · <CallStatusLamp call={attempt} /></p>
+        <p>费用 {chargeText(attempt)}</p>
+        {attempt.error_message ? <p className="note crit">{attempt.error_message}</p> : attempt.error_class ? <p className="note crit">{ERROR_LABEL[attempt.error_class] ?? "调用未完成"}</p> : null}
+        <UsagePerformance data={attempt} />
+        <details><summary>查看本次已保存日志</summary><pre tabIndex={0}>{JSON.stringify(attempt, null, 2)}</pre></details>
+        <p className="hint">事件 <code>{attempt.event_id}</code></p>
+      </article>)}
+      {loadingAttempts && <p className="hint" role="status">正在读取尝试记录…</p>}
+      {attemptError && <p className="note crit" role="alert">尝试记录读取失败：{attemptError}</p>}
+      {onMoreAttempts && <Button kind="quiet" size="sm" disabled={loadingAttempts} onClick={onMoreAttempts}>{attemptError ? "重试读取尝试" : "加载更多尝试"}</Button>}
+    </section>}
     <section className="tenant-call-section" aria-label="响应性能">
       <h3>响应性能</h3>
       <UsagePerformance data={c} />
@@ -255,6 +287,62 @@ function CallLogDetails({ call: c }: { call: Call }) {
       {(c.charge.discount_bps ?? 0) > 0 && <p className="hint">本次按组织折扣计费：在折扣前的价格上减免 {percentOf(c.charge.discount_bps ?? 0)}。</p>}
     </section>
   </>;
+}
+
+/** 打开详情才读取完整链；关闭或切换请求后，迟到的响应不能覆盖当前详情。 */
+function CallLogDetailsLoader({ call }: { call: Call }) {
+  const [detail, setDetail] = useState<Call | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [refresh, setRefresh] = useState(0);
+  const generation = useRef(0);
+  const pending = useRef(false);
+  useEffect(() => {
+    const mine = ++generation.current;
+    setDetail(null);
+    setLoading(true);
+    setError(null);
+    pending.current = true;
+    usageCalls({ event_id: call.event_id, group_requests: true, include_attempts: true, limit: 1 }).then(page => {
+      if (generation.current !== mine) return;
+      const row = page.items[0];
+      if (row) setDetail(row);
+      else setError("未找到此请求的尝试记录，记录可能已过保留期。");
+    }, cause => {
+      if (generation.current === mine) setError(failure(cause));
+    }).finally(() => {
+      if (generation.current === mine) { setLoading(false); pending.current = false; }
+    });
+    return () => { generation.current += 1; };
+  }, [call.event_id, refresh]);
+
+  async function loadMore() {
+    if (pending.current) return;
+    if (!detail) { setRefresh(value => value + 1); return; }
+    const after = detail.next_attempt_after;
+    if (after == null) return;
+    const mine = generation.current;
+    pending.current = true;
+    setLoading(true);
+    setError(null);
+    try {
+      const page = await usageCalls({ event_id: call.event_id, group_requests: true, include_attempts: true, attempts_after: after, limit: 1 });
+      if (generation.current !== mine) return;
+      const row = page.items[0];
+      if (!row) { setError("未找到此请求的后续尝试记录，请重新打开详情。"); return; }
+      setDetail(previous => {
+        const attempts = new Map((previous?.attempts ?? []).map(attempt => [attempt.event_id, attempt]));
+        for (const attempt of row.attempts ?? []) attempts.set(attempt.event_id, attempt);
+        return { ...row, attempts: [...attempts.values()] };
+      });
+    } catch (cause) {
+      if (generation.current === mine) setError(failure(cause));
+    } finally {
+      if (generation.current === mine) { setLoading(false); pending.current = false; }
+    }
+  }
+  return <CallLogDetails call={detail ?? call} loadingAttempts={loading} attemptError={error}
+    onMoreAttempts={!detail || detail.next_attempt_after != null ? () => void loadMore() : undefined} />;
 }
 
 /** The summary's span when no date is chosen: the last 30 days by day, the last 12 months by month. */
@@ -318,7 +406,7 @@ export function Usage({ member, page = "analysis" }: { member: SessionMember; pa
   const showKeys = member.role !== "billing";
   return (
     <div className="measurement-page">
-      <PageHeader title={page === "calls" ? "调用记录" : "用量分析"} dataLead={member.role === "member" ? "查看你的密钥范围；每次计费尝试单独记录。" : "查看全组织用量与费用；每次计费尝试单独记录。"} />
+      <PageHeader title={page === "calls" ? "调用记录" : "用量分析"} dataLead={member.role === "member" ? "查看你的密钥范围；同一请求合并展示，详情保留每次尝试。" : "查看全组织用量与费用；同一请求合并展示，详情保留每次尝试。"} />
       <div className="flex min-w-0 flex-col gap-4">
         {readErr && (
           <div className="note crit" role="alert">
@@ -531,6 +619,7 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
   const range = usageRange(query);
   const request = {
     ...range,
+    group_requests: true,
     limit: pageSize,
     ...(keyId ? { api_key_id: keyId } : {}),
     ...(modelId ? { model_id: modelId } : {}),
@@ -646,7 +735,7 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
         <summary>筛选、性能与计费口径</summary>
         <p>文字搜索仅筛选已加载记录；调用结果与更多筛选作用于全部匹配记录。</p>
         <p>首字仅显示实测值；输出 TPS 为输出 Token（含推理，不含输入）÷ 完整上游耗时。含估算用量时标为 ≈，仅供参考；用量标记无法区分输入或输出估算。无有效指标或旧记录未采集时显示 —，不以其它指标代替。</p>
-        <p>调用记录按计费尝试逐条展示，同一请求可能有多条记录；已加载记录不代表整个汇总窗口的成功率或延迟分布。</p>
+        <p>同一请求合并一行，优先展示最终成功结果；费用汇总全部实际计费尝试。详情保留故障转移、同目标重试与每次已保存日志。缺少有效追踪信息的旧记录无法可靠合并，保留单条展示。</p>
       </details>
       {rows !== null && <p className="hint">已加载 {rows.length.toLocaleString("en-US")} 条{next !== null ? "，还有更多记录" : ""}</p>}
       {err && (
@@ -691,7 +780,7 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
       />
 
       <CallLogDrawer call={selected} onOpenChange={open => { if (!open) setSelected(null); }} returnFocusRef={detailTrigger}>
-        {selected && <CallLogDetails call={selected} />}
+        {selected && <CallLogDetailsLoader key={selected.event_id} call={selected} />}
       </CallLogDrawer>
 
     </Section>

@@ -17,6 +17,12 @@
 .tenant-call-facts > div { min-width: 0; padding: 8px 0; border-bottom: 1px solid var(--hairline); }
 .tenant-call-facts > div:first-child { grid-column: 1 / -1; }
 .tenant-call-facts code { font-size: var(--fs-12); }
+.tenant-call-attempt { min-width: 0; padding: 16px 0; border-top: 1px solid var(--hairline); }
+.tenant-call-attempt h4 { margin-bottom: 8px; font-weight: 700; }
+.tenant-call-attempt p { margin-block: 8px; }
+.tenant-call-attempt details { margin-top: 12px; }
+.tenant-call-attempt summary { cursor: pointer; font-size: var(--fs-12); }
+.tenant-call-attempt pre { max-height: 24rem; overflow: auto; padding: 12px; white-space: pre-wrap; overflow-wrap: anywhere; background: var(--well); font-size: var(--fs-12); line-height: 1.6; }
 .tenant-call-drawer .usage-performance { display: flex; flex-wrap: wrap; gap: 8px 28px; width: 100%; max-width: none; text-align: left; }
 .tenant-call-drawer .usage-performance > div { display: inline-flex; align-items: baseline; gap: 6px; white-space: nowrap; }
 .tenant-call-drawer .usage-performance dd { margin: 0; font-size: var(--fs-16); font-weight: 600; }

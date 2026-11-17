@@ -5,7 +5,7 @@ import { callListHash } from "../lib/callLog";
 import { CallLogDetails } from "../components/CallLogDetails";
 import { Charges } from "./billing/Charges";
 
-/** 沿用计费尝试粒度；详情独立寻址，返回保留已加载页与局部搜索。 */
+/** 请求由服务端合并；详情独立寻址，返回保留已加载页与局部搜索。 */
 export function Calls(props: TabProps) {
   const [query] = useHashQuery();
   const eventId = query.get("detail");

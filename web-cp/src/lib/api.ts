@@ -1057,7 +1057,23 @@ export interface UpstreamTiming {
   first_content_ms?: number | null;
 }
 
+/** 仅展示层汇总；单次尝试的计价记录与公式仍保持原值。 */
+export interface RequestGroup {
+  attempt_count: number;
+  failover_count: number;
+  retry_count: number;
+  charge_micro_cny: string | null;
+  cost_micro_cny?: string | null;
+  adjusted_micro_cny: string;
+  complete: boolean;
+}
+
 export interface Charge extends UsageAuditData {
+  request_id?: string | null;
+  request_group?: RequestGroup;
+  attempts?: Charge[];
+  next_attempt_after?: number | null;
+  stored_event?: StoredUsageEvent | null;
   /** 明确采集的客户端流式意图；旧记录缺失时保持未知。 */
   stream?: boolean | null;
   upstream_timing?: UpstreamTiming | null;
@@ -1126,6 +1142,9 @@ export interface Charge extends UsageAuditData {
 }
 
 export interface ChargeFilter extends UsageRecordApiFilters {
+  group_requests?: boolean;
+  include_attempts?: boolean;
+  attempts_after?: number;
   /** 状态页按计价时刻筛选；与调用发生时间 from/to 独立。 */
   priced_since?: string;
   priced_before?: string;

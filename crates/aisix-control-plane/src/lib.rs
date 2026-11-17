@@ -44,6 +44,7 @@ pub mod operators;
 pub mod pki;
 pub mod pricing;
 pub mod projector;
+pub(crate) mod request_groups;
 pub mod resources;
 pub mod rollout;
 pub mod settings;

@@ -628,6 +628,16 @@ impl CallFilters {
             }
         }
         if let Some(error) = &self.error_class {
+            if tenant {
+                let candidates = crate::billing::calls::tenant_error_candidates(error);
+                if !candidates.is_empty() {
+                    sql.push(" AND ")
+                        .push(CALL_ERROR)
+                        .push(" = ANY(")
+                        .push_bind(candidates)
+                        .push(")");
+                }
+            }
             sql.push(" AND ");
             if tenant {
                 sql.push(&outcome).push(" = 'failed' AND (");

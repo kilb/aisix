@@ -8,6 +8,7 @@ export interface ChargeCalculation {
 }
 
 export interface FormulaCall extends BaseCall {
+  attempts?: FormulaCall[];
   latency_ms: number | null;
   first_token_latency_ms: number | null;
   attempt_duration_ms: number | null;
@@ -32,7 +33,7 @@ export interface FormulaLedgerItem extends LedgerItem {
   calculation: { before_micro_cny: string; amount_micro_cny: string; after_micro_cny: string };
 }
 
-function query(q: Record<string, string | number | undefined>): string {
+function query(q: Record<string, string | number | boolean | undefined>): string {
   const params = new URLSearchParams();
   for (const [key, value] of Object.entries(q)) if (value !== undefined && value !== "") params.set(key, String(value));
   return params.size ? `?${params}` : "";
