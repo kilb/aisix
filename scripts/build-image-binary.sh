@@ -18,9 +18,8 @@
 #
 # pgo runs the three phases, FAIL-CLOSED — any phase failing fails the script
 # and no binary is staged:
-#   A. instrumented build (-Cprofile-generate) in target-pgo-gen/; on arm64 it
-#      uses about 20 GB of RAM plus swap, and running short shows up as a
-#      killed build with no compile error;
+#   A. 在 target-pgo-gen/ 中进行插桩构建 (-Cprofile-generate)，并禁用
+#      LLVM MachineOutliner（见下方阶段 A 的构建参数）；
 #   B. train.sh drives the committed shape matrix through it and merges the
 #      .profraw files with the pinned toolchain's own llvm-profdata;
 #   C. optimized build (-Cprofile-use) in target-pgo/, so profile builds never
@@ -74,7 +73,11 @@ case "$MODE" in
         ;;
     pgo)
         PGO_DIR="$ROOT/target-pgo-data"
-        RUSTFLAGS="-Cprofile-generate=$PGO_DIR" CARGO_TARGET_DIR="$ROOT/target-pgo-gen" \
+        # 仅插桩阶段禁用 MachineOutliner，降低 ARM64 fat LTO 构建的内存峰值。
+        # 该机器码优化发生在 IR 插桩之后，不改变采样计数；阶段 C 仍使用
+        # LLVM 默认值构建发布二进制。此参数随 Rust 1.93.1 / LLVM 21 核对，
+        # 升级工具链时需要重新确认。
+        RUSTFLAGS="-Cprofile-generate=$PGO_DIR -Cllvm-args=-enable-machine-outliner=never" CARGO_TARGET_DIR="$ROOT/target-pgo-gen" \
             cargo build --locked --release --bin aisix
         CARGO_TARGET_DIR="$ROOT/bench/pgo-training/trainer/target" cargo build --locked --release \
             --manifest-path bench/pgo-training/trainer/Cargo.toml

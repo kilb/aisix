@@ -28,12 +28,11 @@ use std::sync::Arc;
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-// Heap profiling is on from the first allocation, so a profile can be taken
-// from a gateway that is already misbehaving, and the automatic dump near
-// the memory limit has something to write. One allocation in every 2 MiB
-// (2^21 bytes) on average is sampled with its stack. jemalloc reads this
-// symbol at startup and then `_RJEM_MALLOC_CONF`, which overrides it — an
-// operator turns sampling off with `_RJEM_MALLOC_CONF=prof_active:false`.
+// 从首次分配起启用堆采样，确保异常网关可导出快照，接近内存上限时的自动
+// 转储也有数据可写。平均每分配 2 MiB（2^21 字节）采样一次并记录调用栈。
+// jemalloc 启动时先读取此符号，再用 `_RJEM_MALLOC_CONF` 覆盖，但仅限
+// 非 secure-exec 进程：官方镜像在二进制上设置了 file capability，默认
+// 非 root 用户运行时 jemalloc 会忽略该环境变量。
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 #[export_name = "_rjem_malloc_conf"]
 pub static MALLOC_CONF: Option<&'static u8> =

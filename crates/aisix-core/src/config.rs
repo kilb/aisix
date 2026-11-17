@@ -1362,9 +1362,8 @@ impl Default for DebugListenerConfig {
     }
 }
 
-/// `observability.heap_profiling`. Heap sampling itself is always on in the
-/// shipped Linux build and is tuned through jemalloc's own
-/// `_RJEM_MALLOC_CONF` environment variable, not here.
+/// `observability.heap_profiling`。发布的 Linux 构建默认启用堆采样，
+/// 采样本身不在此处配置。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(default)]

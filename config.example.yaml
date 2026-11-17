@@ -286,9 +286,7 @@ observability:
   debug:
     enabled: true
     addr: "127.0.0.1:9091"
-  # Heap sampling is always on in the Linux build (one sample per 2 MiB
-  # allocated on average). Turn it off without a rebuild with the jemalloc
-  # environment variable `_RJEM_MALLOC_CONF=prof_active:false`.
+  # Linux 构建默认启用堆采样（平均每分配 2 MiB 采样一次）。
   heap_profiling:
     # Write a heap profile to `dir` when resident memory crosses each
     # threshold — a fraction of the container's memory limit, or of the
