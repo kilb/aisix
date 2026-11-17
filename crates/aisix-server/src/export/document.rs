@@ -832,12 +832,51 @@ where
                  source collision is resolved"
             ));
         }
+        shorten_f32_settings(kind, &mut doc);
         resugar(&mut doc, &id, diag);
         escape_dollars(&mut doc);
         redact(&mut doc, &id);
         out.push(doc);
     }
     out
+}
+
+// 仅修正 Rust 资源模型明确声明为 f32 的配置槽，不遍历或猜测其他数字。
+// 此转换只在操作员导出配置时执行；f64 价格、整数金额和自由 JSON 均不经过它。
+fn shorten_f32_settings(kind: &str, doc: &mut Value) {
+    match kind {
+        "guardrails" => {
+            for path in ["/deny_threshold", "/allow_threshold"] {
+                shorten_f32_slot(doc.pointer_mut(path));
+            }
+        }
+        "cache_policies" => shorten_f32_slot(doc.pointer_mut("/semantic/threshold")),
+        "models" => {
+            shorten_f32_slot(doc.pointer_mut("/semantic/match/threshold"));
+            if let Some(Value::Array(routes)) = doc.pointer_mut("/semantic/routes") {
+                for route in routes {
+                    shorten_f32_slot(route.get_mut("threshold"));
+                }
+            }
+            if let Some(Value::Array(panel)) = doc.pointer_mut("/ensemble/panel") {
+                for member in panel {
+                    shorten_f32_slot(member.get_mut("temperature"));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn shorten_f32_slot(value: Option<&mut Value>) {
+    if let Some(value) = value {
+        if let Some(number) = value.as_f64() {
+            // 这里只解析单个 f32 的短十进制，使用标准库，不改变 serde_json 的解析特性。
+            if let Ok(short) = (number as f32).to_string().parse::<f64>() {
+                *value = Value::from(short);
+            }
+        }
+    }
 }
 
 /// Escape every `$` as `$$` in every string *value* (not object keys —

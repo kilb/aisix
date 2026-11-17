@@ -2122,3 +2122,138 @@ fn token_counting_export_blocks_valid_embedding_source_models() {
     })).unwrap(), 1));
     assert!(!build_export_document(&snap, true).blocking.is_empty());
 }
+
+// 只缩短模型中声明为 f32 的槽；自由 JSON、f64、整数金额保持不变。
+#[test]
+fn f32_settings_export_as_short_decimals_without_changing_other_numbers() {
+    let snap = AisixSnapshot::new();
+    let guardrail = serde_json::from_value(json!({
+        "name": "topic", "kind": "semantic", "embedding_model": "embed",
+        "deny_examples": ["x"], "deny_threshold": 0.9, "allow_threshold": 0.812
+    }))
+    .unwrap();
+    snap.guardrails
+        .insert(ResourceEntry::new("g", guardrail, 1));
+    let policy = serde_json::from_value(json!({
+        "name": "faq", "applies_to": "all",
+        "semantic": {"embedding_model": "embed", "threshold": 0.92}
+    }))
+    .unwrap();
+    snap.cache_policies
+        .insert(ResourceEntry::new("cp", policy, 1));
+    snap.models.insert(ResourceEntry::new("router", model_value(json!({
+        "display_name": "router", "semantic": {
+            "embedding_model": "embed", "match": {"threshold": 0.9123},
+            "routes": [{"name": "code", "target": "direct", "examples": ["code"], "threshold": 0.812}],
+            "default": "direct"
+        }
+    })), 1));
+    snap.models.insert(ResourceEntry::new(
+        "ensemble",
+        model_value(json!({
+            "display_name": "panel", "ensemble": {
+                "panel": [{"model": "direct", "temperature": 0.7, "seed": 9007199254740993_u64}],
+                "judge": {"model": "direct"}
+            }
+        })),
+        1,
+    ));
+    snap.models.insert(ResourceEntry::new(
+        "direct",
+        model_value(json!({
+            "display_name": "direct", "provider": "openai", "model_name": "test",
+            "cost": {"input_per_1k": 0.12345678901234566, "output_per_1k": 0.0}
+        })),
+        1,
+    ));
+    let key = serde_json::from_value(json!({
+        "display_name": "key", "api_key": "test-value", "request": {"default_body_fields": {
+            "threshold": 0.12345678901234566, "micro_cny": 9007199254740993_u64,
+            "amount": "9007199254.740993", "zero": 0
+        }}
+    }))
+    .unwrap();
+    snap.provider_keys.insert(ResourceEntry::new("pk", key, 1));
+
+    let doc = build_export_document(&snap, true);
+    let guardrail = &find(&doc, "guardrails")[0];
+    assert_eq!(guardrail["deny_threshold"].to_string(), "0.9");
+    assert_eq!(guardrail["allow_threshold"].to_string(), "0.812");
+    assert_eq!(
+        find(&doc, "cache_policies")[0]["semantic"]["threshold"].to_string(),
+        "0.92"
+    );
+    let models = find(&doc, "models");
+    let router = models
+        .iter()
+        .find(|m| m["display_name"] == "router")
+        .unwrap();
+    assert_eq!(
+        router["semantic"]["match"]["threshold"].to_string(),
+        "0.9123"
+    );
+    assert_eq!(
+        router["semantic"]["routes"][0]["threshold"].to_string(),
+        "0.812"
+    );
+    let ensemble = models
+        .iter()
+        .find(|m| m["display_name"] == "panel")
+        .unwrap();
+    assert_eq!(
+        ensemble["ensemble"]["panel"][0]["temperature"].to_string(),
+        "0.7"
+    );
+    assert_eq!(
+        ensemble["ensemble"]["panel"][0]["seed"].to_string(),
+        "9007199254740993"
+    );
+    let direct = models
+        .iter()
+        .find(|m| m["display_name"] == "direct")
+        .unwrap();
+    assert_eq!(
+        direct["cost"]["input_per_1k"].to_string(),
+        "0.12345678901234566"
+    );
+    let body = &find(&doc, "provider_keys")[0]["request"]["default_body_fields"];
+    assert_eq!(body["threshold"].to_string(), "0.12345678901234566");
+    assert_eq!(body["micro_cny"].to_string(), "9007199254740993");
+    assert_eq!(body["amount"], "9007199254.740993");
+    assert_eq!(body["zero"], 0);
+    let yaml = super::super::yaml_emit::emit_yaml(&doc).unwrap();
+    let parsed = yaml_rust2::YamlLoader::load_from_str(&yaml).unwrap();
+    assert_eq!(
+        parsed[0]["guardrails"][0]["deny_threshold"].as_f64(),
+        Some(0.9)
+    );
+}
+
+#[test]
+fn f32_export_zero_extremes_and_nonfinite_semantics_stay_unchanged() {
+    for (number, expected) in [
+        (0.0, "0.0"),
+        (-0.0, "-0.0"),
+        (-0.5, "-0.5"),
+        (f32::MAX, "3.4028235e+38"),
+        (f32::from_bits(1), "1e-45"),
+        (f32::NAN, "null"),
+        (f32::INFINITY, "null"),
+        (f32::NEG_INFINITY, "null"),
+    ] {
+        let snap = AisixSnapshot::new();
+        let mut policy: aisix_core::models::CachePolicy = serde_json::from_value(json!({
+            "name": "faq", "applies_to": "all",
+            "semantic": {"embedding_model": "embed", "threshold": 0.9}
+        }))
+        .unwrap();
+        policy.semantic.as_mut().unwrap().threshold = number;
+        snap.cache_policies
+            .insert(ResourceEntry::new("cp", policy, 1));
+        let doc = build_export_document(&snap, false);
+        assert_eq!(
+            find(&doc, "cache_policies")[0]["semantic"]["threshold"].to_string(),
+            expected
+        );
+    }
+}

@@ -23,7 +23,7 @@ use std::io::Write as _;
 use async_trait::async_trait;
 use http::header::{CONTENT_ENCODING, CONTENT_TYPE};
 use http::{HeaderMap, HeaderName, HeaderValue};
-use serde::Deserialize;
+use serde::{ser::SerializeMap, Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 use super::{
@@ -123,8 +123,8 @@ impl ObservabilitySink for DatadogSink {
         }
 
         // 1. One JSON log object per record → a single JSON array body.
-        let logs: Vec<Value> = batch.records.iter().map(|r| self.to_log(r)).collect();
-        let raw = serde_json::to_vec(&Value::Array(logs))
+        let logs: Vec<_> = batch.records.iter().map(|r| self.to_log(r)).collect();
+        let raw = serde_json::to_vec(&logs)
             .map_err(|e| SinkError::Permanent(format!("datadog: json encode: {e}")))?;
 
         // 2. gzip the JSON (Datadog accepts `Content-Encoding: gzip`).
@@ -194,6 +194,28 @@ impl ObservabilitySink for DatadogSink {
     }
 }
 
+// 保留映射后的普通字段；含 f32 的字段借用原事件，在最终 JSON 序列化时直写。
+struct DatadogLog<'a> {
+    fields: Map<String, Value>,
+    usage: &'a crate::usage::UsageEvent,
+}
+
+impl Serialize for DatadogLog<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        for (key, value) in &self.fields {
+            map.serialize_entry(key, value)?;
+        }
+        if let Some(similarity) = self.usage.cache_similarity.filter(|v| v.is_finite()) {
+            map.serialize_entry("aisix.cache_similarity", &similarity)?;
+        }
+        if !self.usage.guardrail_scores.is_empty() {
+            map.serialize_entry("aisix.guardrail_scores", &self.usage.guardrail_scores)?;
+        }
+        map.end()
+    }
+}
+
 impl DatadogSink {
     /// Map one canonical record to a Datadog log JSON object.
     ///
@@ -207,7 +229,7 @@ impl DatadogSink {
     /// Datadog log and an OTLP span agree on them; the remainder land
     /// under an `aisix.` prefix. The Datadog reserved attributes (`ddsource`,
     /// `ddtags`, `service`, `message`) are set as siblings.
-    fn to_log(&self, record: &SinkRecord) -> Value {
+    fn to_log<'a>(&self, record: &'a SinkRecord) -> DatadogLog<'a> {
         let mut obj = Map::new();
 
         // Datadog reserved attributes.
@@ -223,6 +245,9 @@ impl DatadogSink {
         // (or `aisix.`) key. Empty strings are skipped; numeric 0 / false stay.
         if let Ok(Value::Object(fields)) = serde_json::to_value(&record.usage) {
             for (key, value) in fields {
+                if matches!(key.as_str(), "cache_similarity" | "guardrail_scores") {
+                    continue;
+                }
                 let Some(rendered) = render_scalar(&value) else {
                     continue;
                 };
@@ -288,7 +313,10 @@ impl DatadogSink {
             }
         }
 
-        Value::Object(obj)
+        DatadogLog {
+            fields: obj,
+            usage: &record.usage,
+        }
     }
 }
 
@@ -498,6 +526,93 @@ mod tests {
         EventBatch::new(records.into_iter().map(Arc::new).collect())
     }
 
+    // 检查最终 JSON 数值，不能让正确前缀掩盖额外的小数位。
+    #[tokio::test]
+    async fn f32_log_fields_keep_short_decimals_without_rounding_other_numbers() {
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path(POST_PATH))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+        let sink = sink_for(&server, &[]);
+        let record = SinkRecord::metadata_only(UsageEvent {
+            cache_similarity: Some(0.9123),
+            guardrail_scores: vec![aisix_core::GuardrailScore {
+                score: 0.812,
+                threshold: 0.9,
+                ..Default::default()
+            }],
+            prompt_tokens: u32::MAX,
+            cost_usd: 0.12345678901234566,
+            ..UsageEvent::default()
+        });
+        sink.append_batch(&batch_of(vec![record]), &IdempotencyMarker::None)
+            .await
+            .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let mut gzip = flate2::read::GzDecoder::new(&requests[0].body[..]);
+        let mut wire = String::new();
+        std::io::Read::read_to_string(&mut gzip, &mut wire).unwrap();
+        assert!(
+            wire.contains(r#""aisix.cache_similarity":0.9123,"#),
+            "{wire}"
+        );
+        assert!(wire.contains(r#""score":0.812,"#), "{wire}");
+        assert!(wire.contains(r#""threshold":0.9,"#), "{wire}");
+        assert!(
+            wire.contains(r#""gen_ai.usage.input_tokens":4294967295,"#),
+            "{wire}"
+        );
+        assert!(
+            wire.contains(r#""aisix.cost_usd":0.12345678901234566,"#),
+            "{wire}"
+        );
+        let log: Value = serde_json::from_str(&wire).unwrap();
+        assert_eq!(log[0]["gen_ai.usage.output_tokens"], 0);
+    }
+
+    #[tokio::test]
+    async fn f32_log_zero_and_nonfinite_semantics_stay_unchanged() {
+        let server = MockServer::builder().start().await;
+        let sink = sink_for(&server, &[]);
+        for (number, expected) in [
+            (0.0, Some("0.0")),
+            (-0.0, Some("-0.0")),
+            (-0.5, Some("-0.5")),
+            (f32::NAN, None),
+            (f32::INFINITY, None),
+            (f32::NEG_INFINITY, None),
+        ] {
+            let record = SinkRecord::metadata_only(UsageEvent {
+                cache_similarity: Some(number),
+                guardrail_scores: vec![aisix_core::GuardrailScore {
+                    score: number,
+                    threshold: number,
+                    ..Default::default()
+                }],
+                ..UsageEvent::default()
+            });
+            let wire = serde_json::to_string(&sink.to_log(&record)).unwrap();
+            let log: Value = serde_json::from_str(&wire).unwrap();
+            assert_eq!(
+                log.get("aisix.cache_similarity")
+                    .map(Value::to_string)
+                    .as_deref(),
+                expected
+            );
+            assert_eq!(
+                log["aisix.guardrail_scores"][0]["score"].to_string(),
+                expected.unwrap_or("null")
+            );
+            assert_eq!(
+                log["aisix.guardrail_scores"][0]["threshold"].to_string(),
+                expected.unwrap_or("null")
+            );
+        }
+    }
+
     /// An error body that never ends is read only as far as the excerpt
     /// needs, compressed or not, instead of being buffered whole first.
     #[tokio::test]
@@ -534,7 +649,9 @@ mod tests {
     async fn output_tokens_include_reasoning_counted_beside_the_completion() {
         let server = MockServer::builder().start().await;
         let sink = sink_for(&server, &[]);
-        let log = |event: UsageEvent| sink.to_log(&SinkRecord::metadata_only(event));
+        let log = |event: UsageEvent| {
+            serde_json::to_value(sink.to_log(&SinkRecord::metadata_only(event))).unwrap()
+        };
 
         let gemini = log(UsageEvent {
             prompt_tokens: 100,
@@ -563,7 +680,9 @@ mod tests {
     async fn input_tokens_include_cache_in_either_accounting_shape() {
         let server = MockServer::builder().start().await;
         let sink = sink_for(&server, &[]);
-        let log = |event: UsageEvent| sink.to_log(&SinkRecord::metadata_only(event));
+        let log = |event: UsageEvent| {
+            serde_json::to_value(sink.to_log(&SinkRecord::metadata_only(event))).unwrap()
+        };
 
         let anthropic = log(UsageEvent {
             prompt_tokens: 10,

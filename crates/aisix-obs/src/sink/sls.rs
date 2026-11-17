@@ -246,13 +246,27 @@ fn to_log(record: &SinkRecord) -> Result<Log, SinkError> {
         for (key, value) in fields {
             // One field per cost-attribution tag, so each is a column an
             // SLS query can filter on without parsing JSON.
-            if key == "tags" {
+            if matches!(
+                key.as_str(),
+                "tags" | "cache_similarity" | "guardrail_scores"
+            ) {
                 continue;
             }
             if let Some(rendered) = render_scalar(&value) {
                 log.add_content_kv(key, rendered);
             }
         }
+    }
+    // 两个含 f32 的字段保留原类型直写，避免 Value 将分数扩为 f64。
+    if let Some(similarity) = record.usage.cache_similarity.filter(|v| v.is_finite()) {
+        let rendered = serde_json::to_string(&similarity)
+            .map_err(|e| SinkError::Permanent(format!("sls: serialize usage: {e}")))?;
+        log.add_content_kv("cache_similarity", rendered);
+    }
+    if !record.usage.guardrail_scores.is_empty() {
+        let rendered = serde_json::to_string(&record.usage.guardrail_scores)
+            .map_err(|e| SinkError::Permanent(format!("sls: serialize usage: {e}")))?;
+        log.add_content_kv("guardrail_scores", rendered);
     }
     for (key, value) in &record.usage.tags {
         log.add_content_kv(format!("tags.{key}"), value.as_str());
@@ -516,6 +530,79 @@ mod tests {
 
     fn batch_of(records: Vec<SinkRecord>) -> EventBatch {
         EventBatch::new(records.into_iter().map(Arc::new).collect())
+    }
+
+    // 分数按原生 f32 的短小数显示，金额和大整数仍保留原精度。
+    #[tokio::test]
+    async fn f32_log_fields_keep_short_decimals_without_rounding_other_numbers() {
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path(POST_PATH))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let record = SinkRecord::metadata_only(UsageEvent {
+            cache_similarity: Some(0.9123),
+            guardrail_scores: vec![aisix_core::GuardrailScore {
+                score: 0.812,
+                threshold: 0.9,
+                ..Default::default()
+            }],
+            prompt_tokens: u32::MAX,
+            cost_usd: 0.12345678901234566,
+            ..UsageEvent::default()
+        });
+        sink_for(&server)
+            .append_batch(&batch_of(vec![record]), &IdempotencyMarker::None)
+            .await
+            .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let contents = decode_single_log(&requests[0]);
+        assert_eq!(contents["cache_similarity"], "0.9123");
+        let scores: serde_json::Value =
+            serde_json::from_str(&contents["guardrail_scores"]).unwrap();
+        assert_eq!(scores[0]["score"].to_string(), "0.812");
+        assert_eq!(scores[0]["threshold"].to_string(), "0.9");
+        assert_eq!(contents["prompt_tokens"], "4294967295");
+        assert_eq!(contents["cost_usd"], "0.12345678901234566");
+        assert_eq!(contents["completion_tokens"], "0");
+    }
+
+    #[test]
+    fn f32_log_zero_and_nonfinite_semantics_stay_unchanged() {
+        for (number, expected) in [
+            (0.0, Some("0.0")),
+            (-0.0, Some("-0.0")),
+            (-0.5, Some("-0.5")),
+            (f32::NAN, None),
+            (f32::INFINITY, None),
+            (f32::NEG_INFINITY, None),
+        ] {
+            let record = SinkRecord::metadata_only(UsageEvent {
+                cache_similarity: Some(number),
+                guardrail_scores: vec![aisix_core::GuardrailScore {
+                    score: number,
+                    threshold: number,
+                    ..Default::default()
+                }],
+                ..UsageEvent::default()
+            });
+            let log = super::to_log(&record).unwrap();
+            let contents: HashMap<_, _> = log
+                .contents()
+                .iter()
+                .map(|c| (c.key().as_str(), c.value().as_str()))
+                .collect();
+            assert_eq!(contents.get("cache_similarity").copied(), expected);
+            let scores: serde_json::Value =
+                serde_json::from_str(contents["guardrail_scores"]).unwrap();
+            assert_eq!(scores[0]["score"].to_string(), expected.unwrap_or("null"));
+            assert_eq!(
+                scores[0]["threshold"].to_string(),
+                expected.unwrap_or("null")
+            );
+        }
     }
 
     #[tokio::test]
