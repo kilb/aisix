@@ -123,3 +123,5 @@ export async function noTextOverlap(area: Locator): Promise<void> {
   });
   expect(overlaps,"distinct balance formula text must not overlap").toEqual([]);
 }
+
+export function metricValue(region: Locator, name: string): Locator { return value(region,name).locator(":scope > .metric"); }
