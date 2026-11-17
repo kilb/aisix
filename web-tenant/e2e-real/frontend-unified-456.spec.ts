@@ -3,7 +3,7 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { startStack, STACK_START_TIMEOUT_MS, type Stack, type ApiClient } from "../e2e/stack";
 import { seedBillingWorld, memberKey, chat, type BillingWorld, type Login } from "../e2e/world";
-import { observe, health, login, go, shot, noOverflow, contained, get, metricValue, money, performance, performanceValues, noTextOverlap, allowFailure, output } from "./frontend-unified-456.helpers";
+import { observe, health, login, go, shot, noOverflow, contained, get, metricValue, money, performance, performanceValues, metricViews, noTextOverlap, allowFailure, output } from "./frontend-unified-456.helpers";
 
 // 预期来自用户场景和可访问合同；不读取产品源码，不替换响应，不保存口令或密钥。
 let stack: Stack;
@@ -53,8 +53,9 @@ test("11-portal-has-1440-content-cap-and-usable-mobile-shell",async({page})=>{
 test("12-key-statistics-are-real-and-same-day-date-is-once",async({page})=>{
   await owner(page);await go(page,stack.previewUrl,"keys");const stats=page.getByRole("region",{name:"密钥统计",exact:true});
   await expect(metricValue(stats,"当前可见密钥")).toHaveText("3");await expect(metricValue(stats,"当前可用")).toHaveText("2");await expect(metricValue(stats,"当前不可用")).toHaveText("1");await expect(metricValue(stats,"本月已计价费用")).toHaveText("¥0.055");
-  for(const dd of await stats.locator("dd").all()){const size=await dd.evaluate(el=>parseFloat(getComputedStyle(el).fontSize));expect(size,"compact key readouts").toBeLessThanOrEqual(24);}
+  const metrics=stats.locator("dd > .metric");await expect(metrics).toHaveCount(4);for(const metric of await metrics.all()){const size=await metric.evaluate(el=>parseFloat(getComputedStyle(el).fontSize));expect(size,"compact key readouts").toBeLessThanOrEqual(24);}
   const from=new Date(Date.now()-24*3600_000).toISOString(),to=new Date().toISOString();await go(page,stack.previewUrl,`keys?key=${world.key.id}&from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`);
+  for(const width of [1440,390]){await page.setViewportSize({width,height:1000});await metricViews(page,"tenant-key-"+width);await noOverflow(page);}
   const table=page.getByRole("table",{name:"密钥计量明细",exact:true});await expect(table).toContainText(world.model.name);await expect(table).toContainText(world.laterModel!.name);
   const dates=table.locator('tbody th[scope="rowgroup"]');await expect(dates).toHaveCount(1);await expect(dates).toHaveAttribute("rowspan","2");const raw=(await dates.innerText()).trim();expect(raw).toMatch(/\d{4}-\d{2}-\d{2}/);expect((await table.innerText()).split(raw).length-1).toBe(1);
   await page.setViewportSize({width:390,height:1000});await noOverflow(page);await contained(table);await shot(page,"tenant-key-metrics-date-group-390");

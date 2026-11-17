@@ -31,7 +31,7 @@
 .metric-primary { min-width: 0; margin: 0; padding-bottom: 16px; border-bottom: 1px solid var(--hairline); }
 .metric-primary .metric { font-size: var(--type-display); line-height: 1.1; }
 .metric-facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; min-width: 0; margin: 0; }
-.metric-facts > div { min-width: 0; padding: 12px; border-radius: var(--r-input); background: var(--tint); }
+.metric-facts > div { min-width: 0; padding: 12px 0; border: 0; border-bottom: 1px solid var(--hairline); border-radius: 0; background: transparent; box-shadow: none; }
 .metric-facts dt { color: var(--fg-3); font-size: var(--fs-12); line-height: 1.5; }
 .metric-facts dd { margin: 6px 0 0; color: var(--fg); font-size: var(--fs-20); line-height: 1.35; font-weight: 700; letter-spacing: -0.02em; overflow-wrap: anywhere; }
 .metric-analysis-main > label { max-width: 400px; }
@@ -87,7 +87,7 @@
   .metric-tab { min-width: 44px; padding-inline: 10px; }
   .metric-scope-controls .f { flex-basis: 100%; }
   .metric-facts { gap: 8px; }
-  .metric-facts > div { padding: 10px; }
+  .metric-facts > div { padding: 10px 0; }
   .metric-facts dd { font-size: var(--fs-16); }
   .metric-chart-plot { height: 184px; }
 }

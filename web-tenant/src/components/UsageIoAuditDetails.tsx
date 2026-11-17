@@ -26,7 +26,7 @@ export function UsageTokenEstimate({ data }: { data: UsageAuditData }) {
   const value = (tokens: number | null | undefined, text: TextMeasurement | null | undefined) => text == null ? "不可估算（未采集文本）"
     : tokens == null ? "不可估算（参考未记录）" : `≈ ${count.format(tokens)} Token${text.complete ? "" : "（部分）"}`;
   return <span className="cell-note io-token-reference min-w-0 max-w-full whitespace-normal [overflow-wrap:anywhere]" data-byte-token-estimate title="按已观测文本 UTF-8 字节数 ÷ 4 向上取整；未校准，仅供核对，不参与计费。">
-    按字节估算 Token：{reason ?? <>输入 {value(reference?.input_tokens, audit?.input_text)} / 输出 {value(reference?.output_tokens, audit?.output_text)}</>}
+    按字节估算 Token：{reason ?? <><span className="io-token-reference-pair whitespace-nowrap">输入 {value(reference?.input_tokens, audit?.input_text)}</span>{" / "}<span className="io-token-reference-pair whitespace-nowrap">输出 {value(reference?.output_tokens, audit?.output_text)}</span></>}
   </span>;
 }
 

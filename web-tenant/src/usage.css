@@ -8,14 +8,14 @@
 .usage-record-section > .hint,
 .metric-scope > .hint { margin: 0; color: var(--fg-3); font-size: var(--fs-12); line-height: 1.5; }
 .usage-record-section > :not(.dt-wrap, .record-table-pager) { margin-inline: 12px; }
-.usage-record-section .dt { display: table; min-width: 74rem; table-layout: fixed; }
+.usage-record-section .dt { display: table; min-width: 78rem; table-layout: fixed; }
 .usage-column-action { width: calc(var(--h-control-sm) + 32px); }
 .usage-column-time { width: 10rem; }
 .usage-column-type { width: 4.5rem; }
 .usage-column-request { width: auto; }
 .usage-column-state { width: 9.5rem; }
 .usage-column-timing { width: 10rem; }
-.usage-column-tokens { width: 10rem; }
+.usage-column-tokens { width: 14rem; }
 .usage-column-charge { width: 9.5rem; }
 .usage-record-section .dt :is(td, th) { min-width: 0; white-space: normal; overflow-wrap: anywhere; }
 .usage-request-identity > strong { display: block; color: var(--fg); font-weight: 700; }

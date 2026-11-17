@@ -114,3 +114,15 @@ export async function performanceValues(table: Locator, calls: any[], admin = fa
     if(call.throughput_tps===null)await expect(tps).toHaveText("—");else expect(Number((await tps.innerText()).replaceAll(",",""))).toBeCloseTo(call.throughput_tps,2);
   }
 }
+
+// 用真实派生样式验证扁平 facts；原版带底色与圆角的节点必定失败，空选择也失败。
+export async function flatFacts(page: Page, label: string): Promise<void> {
+  const facts=page.locator("dl.metric-facts:visible > div:visible");expect(await facts.count(),"the selected metrics view has real facts").toBeGreaterThan(0);
+  const actual=await facts.evaluateAll(nodes=>nodes.map(el=>{const c=getComputedStyle(el);return {term:el.querySelector("dt")?.textContent?.trim(),background:c.backgroundColor,image:c.backgroundImage,radius:[c.borderTopLeftRadius,c.borderTopRightRadius,c.borderBottomLeftRadius,c.borderBottomRightRadius],shadow:c.boxShadow,borders:[c.borderTopWidth,c.borderLeftWidth,c.borderRightWidth],bottom:c.borderBottomWidth,padding:[c.paddingLeft,c.paddingRight]};}));
+  await test.info().attach("flat-facts-"+label,{body:JSON.stringify({groups:await page.locator("dl.metric-facts:visible").evaluateAll(nodes=>nodes.map(el=>({className:el.className,aside:el.closest("aside")!==null}))),facts:actual}),contentType:"application/json"});
+  for(const item of actual){expect(item.background,item.term).toBe("rgba(0, 0, 0, 0)");expect(item.image,item.term).toBe("none");expect(item.radius,item.term).toEqual(["0px","0px","0px","0px"]);expect(item.shadow,item.term).toBe("none");expect(item.borders,item.term).toEqual(["0px","0px","0px"]);expect(parseFloat(item.bottom),"a light bottom separator is allowed").toBeLessThanOrEqual(1);expect(item.padding,item.term).toEqual(["0px","0px"]);}
+}
+export async function metricViews(page: Page, label: string): Promise<void> {
+  const tabs=page.getByRole("tablist").filter({has:page.getByRole("tab",{name:"请求",exact:true})});await expect(tabs).toHaveCount(1);await expect(tabs.getByRole("tab")).toHaveCount(5);
+  for(const [name,key] of [["请求","requests"],["延迟","latency"],["Token","tokens"],["缓存","cache"],["费用","cost"]]){const tab=tabs.getByRole("tab",{name,exact:true});await tab.click();await expect(tab).toHaveAttribute("aria-selected","true");await settle(page);await flatFacts(page,label+"-"+key);if(key==="requests"||key==="latency")await shot(page,label+"-"+key+"-flat-facts");}
+}

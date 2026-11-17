@@ -6,7 +6,7 @@ import { join, resolve } from "node:path";
 import { startStack, STACK_START_TIMEOUT_MS, type Stack } from "../e2e/stack";
 import { seedTenant, chat, tenantClient, type BillingWorld } from "../e2e/world";
 import { chooseSelect } from "../e2e/select";
-import { observe, health, login, go, shot, noOverflow, contained, get, value, money, performance, performanceValues, allowWrite, output } from "./frontend-unified-456.helpers";
+import { observe, health, login, go, shot, noOverflow, contained, get, value, money, performance, performanceValues, metricViews, allowWrite, output } from "./frontend-unified-456.helpers";
 
 // 用户要求及 owner 的可访问合同先于实现；金额由授权上游 5×1000+3×2000 独立计算。
 let stack: Stack;
@@ -102,7 +102,7 @@ test("07-overview-light-price-action-and-global-card-sweep",async({page})=>{
 });
 test("08-admin-summary-and-table-columns-fit-desktop-mobile",async({page})=>{
   await admin(page);
-  for(const width of [1440,390]){await page.setViewportSize({width,height:1000});for(const route of ["analytics","keys","billing",detail("activity")]){await go(page,stack.previewUrl,route);for(const table of await page.getByRole("table").all())await contained(table);await noOverflow(page);await shot(page,`cp-${route.split("?")[0]}-columns-${width}`);}}
+  for(const width of [1440,390]){await page.setViewportSize({width,height:1000});for(const route of ["analytics","keys","billing",detail("activity")]){await go(page,stack.previewUrl,route);if(route==="analytics")await metricViews(page,"cp-analytics-"+width);for(const table of await page.getByRole("table").all())await contained(table);await noOverflow(page);await shot(page,`cp-${route.split("?")[0]}-columns-${width}`);}}
 });
 test("09-calls-keep-labelled-performance-and-exact-charge",async({page})=>{
   await admin(page);await go(page,stack.previewUrl,`calls?tenant_id=${world.tenantId}`);const table=page.getByRole("table",{name:"计费明细",exact:true});await performance(table);
