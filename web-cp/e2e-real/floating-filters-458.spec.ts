@@ -81,11 +81,22 @@ for (const width of [1440, 390]) {
         const context = canvas.getContext("2d")!;
         context.fillStyle = css.backgroundColor;
         context.fillRect(0, 0, 1, 1);
-        return { alpha: context.getImageData(0, 0, 1, 1).data[3], blur: css.backdropFilter };
+        return {
+          alpha: context.getImageData(0, 0, 1, 1).data[3], blur: css.backdropFilter,
+          radii: [css.borderTopLeftRadius, css.borderTopRightRadius, css.borderBottomRightRadius, css.borderBottomLeftRadius].map(parseFloat),
+          borders: [css.borderTopWidth, css.borderRightWidth, css.borderBottomWidth, css.borderLeftWidth].map(parseFloat),
+          borderColor: css.borderTopColor, shadow: css.boxShadow,
+        };
       });
       expect(style.alpha, "the filter surface has an actual translucent fill").toBeGreaterThan(0);
       expect(style.alpha, "the filter surface is not an opaque rectangle").toBeLessThan(255);
       expect(style.blur, "underlying table content is softened").toMatch(/blur\(/);
+      expect(style.radii.every(radius => radius >= 8), "the floating surface has readable rounded corners").toBe(true);
+      expect(style.borders.every(border => border >= 1), "the floating surface has a complete visible border").toBe(true);
+      expect(style.borderColor).not.toBe("rgba(0, 0, 0, 0)");
+      expect(style.shadow, "the floating surface is distinct from the table underneath").not.toBe("none");
+      mkdirSync(join(output, "screenshots"), { recursive: true });
+      await page.screenshot({ path: join(output, "screenshots", `${surface}-${width}-before-scroll.png`), animations: "disabled" });
       const before = await geometry(bar);
       const scroll = await bar.evaluate(element => {
         let root = element.parentElement;

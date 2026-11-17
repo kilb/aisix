@@ -8,15 +8,14 @@
   min-width: 0;
   max-width: 100%;
   margin-inline: 0;
-  border: 0;
-  border-bottom: 1px solid var(--border);
-  border-radius: 0;
-  background: var(--card);
-  box-shadow: none;
+  border: 1px solid color-mix(in srgb, var(--foreground) 12%, var(--border));
+  border-radius: var(--r-field);
+  background: color-mix(in srgb, var(--card) 94%, var(--lilac));
+  box-shadow: var(--shadow-float);
 }
 @supports ((backdrop-filter: blur(12px)) or (-webkit-backdrop-filter: blur(12px))) {
   .sticky-filters {
-    background: color-mix(in srgb, var(--card) 84%, transparent);
+    background: color-mix(in srgb, color-mix(in srgb, var(--card) 94%, var(--lilac)) 88%, transparent);
     -webkit-backdrop-filter: blur(12px);
     backdrop-filter: blur(12px);
   }
