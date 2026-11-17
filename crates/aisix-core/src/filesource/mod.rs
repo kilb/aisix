@@ -56,10 +56,10 @@ use crate::models::{
     validate_a2a_agent, validate_apikey, validate_cache_policy, validate_claim_mapping,
     validate_guardrail, validate_guardrail_attachment, validate_mcp_auth_settings,
     validate_mcp_server, validate_model, validate_observability_exporter, validate_oidc_provider,
-    validate_passthrough_route, validate_provider_key, validate_rate_limit_policy, A2aAgent,
-    ApiKey, CachePolicy, ClaimMapping, Guardrail, GuardrailAttachment, McpAuthSettings, McpServer,
-    Model, ObservabilityExporter, OidcProvider, PassthroughRoute, ProviderKey, RateLimitPolicy,
-    SchemaError,
+    validate_passthrough_route, validate_provider_key, validate_rate_limit_policy,
+    validate_token_counting, A2aAgent, ApiKey, CachePolicy, ClaimMapping, Guardrail,
+    GuardrailAttachment, McpAuthSettings, McpServer, Model, ObservabilityExporter, OidcProvider,
+    PassthroughRoute, ProviderKey, RateLimitPolicy, SchemaError, TokenCounting,
 };
 use crate::resource::ResourceEntry;
 use crate::AisixSnapshot;
@@ -132,7 +132,8 @@ pub(crate) fn url_has_credentials(url: &str) -> bool {
 }
 
 /// Fixed processing order for the fourteen resource collections.
-const KINDS: [(&str, IdentityField); 14] = [
+const KINDS: [(&str, IdentityField); 15] = [
+    ("token_counting", IdentityField::Fixed("token_counting")),
     ("provider_keys", IdentityField::DisplayName),
     ("models", IdentityField::DisplayName),
     ("api_keys", IdentityField::DisplayName),
@@ -188,6 +189,7 @@ const fn pair(field: &'static str, name_field: &'static str) -> ModelRefIdField 
 /// export` rewrites it back to the name form, and a field one of them
 /// knows about and the other does not is a silent round-trip loss.
 pub fn model_ref_id_fields(kind: &str) -> &'static [ModelRefIdField] {
+    const TOKEN_COUNTING: [ModelRefIdField; 1] = [pair("model_id", "model")];
     const API_KEYS: [ModelRefIdField; 1] = [pair("allowed_model_ids", "allowed_models")];
     const MODELS: [ModelRefIdField; 4] = [
         pair("model_id", "model"),
@@ -205,6 +207,7 @@ pub fn model_ref_id_fields(kind: &str) -> &'static [ModelRefIdField] {
     ];
     const GUARDRAILS: [ModelRefIdField; 1] = [pair("embedding_model_id", "embedding_model")];
     match kind {
+        "token_counting" => &TOKEN_COUNTING,
         "api_keys" => &API_KEYS,
         "models" => &MODELS,
         "cache_policies" => &CACHE_POLICIES,
@@ -328,6 +331,13 @@ pub fn for_each_model_ref_node(
             f(root);
             if let Some(Value::Object(semantic)) = root.get_mut("semantic") {
                 f(semantic);
+            }
+        }
+        "token_counting" => {
+            for block in ["messages_count_tokens", "responses_input_tokens"] {
+                if let Some(target) = root.get_mut(block) {
+                    objects_in(target, "model_mappings", f);
+                }
             }
         }
         "models" => {
@@ -643,6 +653,7 @@ pub fn load_from_str(
     let mut oidc_providers: Vec<(String, String, OidcProvider)> = Vec::new();
     let mut claim_mappings: Vec<(String, String, ClaimMapping)> = Vec::new();
     let mut passthrough_routes: Vec<(String, String, PassthroughRoute)> = Vec::new();
+    let mut token_counting: Vec<(String, String, TokenCounting)> = Vec::new();
     let mut mcp_auth_settings: Vec<(String, String, McpAuthSettings)> = Vec::new();
 
     for mut entry in prepared {
@@ -722,6 +733,7 @@ pub fn load_from_str(
         }
 
         let sugar_result = match entry.kind {
+            "token_counting" => desugar::desugar_token_counting(&mut entry.doc, &identity_maps),
             "models" => desugar::desugar_model(&mut entry.doc, &identity_maps),
             "api_keys" => desugar::desugar_api_key(&mut entry.doc, env),
             "rate_limit_policies" => {
@@ -742,6 +754,11 @@ pub fn load_from_str(
         }
 
         match entry.kind {
+            "token_counting" => {
+                if let Some(t) = finish(&scope, &entry.doc, validate_token_counting, &mut errors) {
+                    token_counting.push((id, scope, t));
+                }
+            }
             "provider_keys" => {
                 if let Some(t) = finish(&scope, &entry.doc, validate_provider_key, &mut errors) {
                     provider_keys.push((id, scope, t));
@@ -1150,6 +1167,55 @@ pub fn load_from_str(
         }
     }
 
+    for (_, scope, settings) in &token_counting {
+        for (block, surface, target) in [
+            (
+                "messages_count_tokens",
+                crate::models::ApiSurface::Messages,
+                &settings.messages_count_tokens,
+            ),
+            (
+                "responses_input_tokens",
+                crate::models::ApiSurface::Responses,
+                &settings.responses_input_tokens,
+            ),
+        ] {
+            let Some(target) = target else {
+                continue;
+            };
+            let key = provider_keys
+                .iter()
+                .find(|(id, _, _)| id == &target.provider_key_id);
+            match key {
+                None => errors.push(LoadError {
+                    scope: scope.clone(),
+                    message: format!("token_counting {block}.provider_key_id does not resolve to a provider key defined in this file"),
+                }),
+                Some((_, _, key)) if !crate::models::token_count_provider_serves(key, surface) => errors.push(LoadError {
+                    scope: scope.clone(),
+                    message: format!("token_counting {block} provider key does not serve the required protocol"),
+                }),
+                Some(_) => {}
+            }
+            for mapping in &target.model_mappings {
+                let source = models.iter().find(|(id, _, _)| id == &mapping.model_id);
+                let valid = source.is_some_and(|(_, _, model)| {
+                    !model.is_embedding()
+                        && model.routing.is_none()
+                        && model.ensemble.is_none()
+                        && model.semantic.is_none()
+                        && !model.display_name.contains('*')
+                        && model.model_name.as_deref().is_some_and(|name| {
+                            !name.contains('*') && name == mapping.source_model_name
+                        })
+                });
+                if !valid {
+                    errors.push(LoadError { scope: scope.clone(), message: format!("token_counting mapping model_id {:?} must resolve to an exact direct model without embedding metadata and with matching source_model_name", mapping.model_id) });
+                }
+            }
+        }
+    }
+
     errors.extend(realtime_sip::check(&provider_keys, &models, &apikeys));
     if !errors.is_empty() {
         return Err(fail(errors));
@@ -1221,6 +1287,11 @@ pub fn load_from_str(
     for (id, _, v) in mcp_auth_settings {
         snapshot
             .mcp_auth_settings
+            .insert(ResourceEntry::new(id, v, revision));
+    }
+    for (id, _, v) in token_counting {
+        snapshot
+            .token_counting
             .insert(ResourceEntry::new(id, v, revision));
     }
     Ok(snapshot)

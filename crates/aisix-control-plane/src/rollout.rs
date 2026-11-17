@@ -211,9 +211,28 @@ impl Fleet {
         env: &EnvSettings,
         stale_secs: f64,
     ) -> Result<Fleet, DbError> {
-        let rows: Vec<(String, String, bool, i64, Value)> = sqlx::query_as(
+        Self::load_for_version(conn, env, stale_secs, None).await
+    }
+
+    /// 新计数 kind 的应用状态还核对构建能力，不能依赖可能截断的 unknown_kind 明细。
+    pub async fn load_with_version(
+        conn: &mut PgConnection,
+        env: &EnvSettings,
+        stale_secs: f64,
+        cp_version: &str,
+    ) -> Result<Fleet, DbError> {
+        Self::load_for_version(conn, env, stale_secs, Some(cp_version)).await
+    }
+
+    async fn load_for_version(
+        conn: &mut PgConnection,
+        env: &EnvSettings,
+        stale_secs: f64,
+        cp_version: Option<&str>,
+    ) -> Result<Fleet, DbError> {
+        let rows: Vec<(String, String, bool, i64, Value, String)> = sqlx::query_as(
             "SELECT instance_id, hostname, last_seen_at > now() - make_interval(secs => $1), \
-               applied_revision, rejected_resources \
+               applied_revision, rejected_resources, version \
              FROM dp_instances ORDER BY first_seen_at, dp_id, instance_id",
         )
         .bind(stale_secs)
@@ -225,20 +244,45 @@ impl Fleet {
         ))
         .fetch_one(&mut *conn)
         .await?;
+        // 删除后的行不再需要新 kind 能力，不能把旧网关的成功删除一直标成拒绝。
+        let token_counting_live = if cp_version.is_some() {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT 1 FROM gw_resources WHERE kind='token_counting' AND NOT deleted)",
+            ).fetch_one(&mut *conn).await?
+        } else {
+            false
+        };
         let rejections_truncated = rows
             .iter()
-            .filter(|(_, _, online, _, rejected)| *online && reports_a_full_list(rejected))
+            .filter(|(_, _, online, _, rejected, _)| *online && reports_a_full_list(rejected))
             .map(|(instance_id, ..)| instance_id.clone())
             .collect();
         let instances = rows
             .into_iter()
             .map(
-                |(instance_id, hostname, online, applied_revision, rejected)| InstanceView {
-                    instance_id,
-                    hostname,
-                    online,
-                    applied_revision,
-                    rejections: rejections_of(env, &rejected),
+                |(instance_id, hostname, online, applied_revision, rejected, version)| {
+                    let mut rejections = rejections_of(env, &rejected);
+                    let id = env.env_id.to_string();
+                    if token_counting_live
+                        && cp_version
+                            .is_some_and(|cp| !crate::compat::supports_token_counting(&version, cp))
+                        && !rejections
+                            .iter()
+                            .any(|(kind, rid, _)| *kind == Kind::TokenCounting && *rid == id)
+                    {
+                        rejections.push((
+                            Kind::TokenCounting,
+                            id,
+                            "此网关版本未确认支持 Token 计数配置".to_string(),
+                        ));
+                    }
+                    InstanceView {
+                        instance_id,
+                        hostname,
+                        online,
+                        applied_revision,
+                        rejections,
+                    }
                 },
             )
             .collect();
@@ -376,7 +420,13 @@ pub async fn summary(
 ) -> Result<Json<Value>, ApiError> {
     auth.require(OperatorRole::Viewer)?;
     let mut conn = state.db.pool().acquire().await.map_err(DbError::from)?;
-    let fleet = Fleet::load(&mut conn, &state.env, stale_window_secs(&state.cfg)).await?;
+    let fleet = Fleet::load_with_version(
+        &mut conn,
+        &state.env,
+        stale_window_secs(&state.cfg),
+        &state.cfg.cp_version,
+    )
+    .await?;
     /// `(kind, id, name, projected, kine_revision)` of a stored document.
     type DocumentState = (String, Uuid, Option<String>, bool, Option<i64>);
     let rows: Vec<DocumentState> = sqlx::query_as(

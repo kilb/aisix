@@ -21,6 +21,7 @@ use super::pricing::Pricing;
 use super::provider_key::ProviderKey;
 use super::rate_limit_policy::RateLimitPolicy;
 use super::team::Team;
+use super::token_counting::TokenCounting;
 use super::user::User;
 use crate::resource::ResourceEntry;
 use crate::snapshot::ResourceTable;
@@ -82,6 +83,7 @@ pub struct AisixSnapshot {
     /// one enabled `oidc_providers` row it activates the `/mcp`
     /// RFC 9728 discovery surface (AISIX-Cloud#1143).
     pub mcp_auth_settings: ResourceTable<McpAuthSettings>,
+    pub token_counting: ResourceTable<TokenCounting>,
     /// The environment's own pricing documents:
     /// `/aisix/<env>/pricing/<uuid>`. Indexed by `key`, and consulted
     /// before [`AisixSnapshot::global_pricing`] so an organization can
@@ -131,6 +133,7 @@ impl AisixSnapshot {
             + self.claim_mappings.len()
             + self.passthrough_routes.len()
             + self.mcp_auth_settings.len()
+            + self.token_counting.len()
             + self.pricing.len()
             + self.global_pricing.len()
             + self.teams.len()

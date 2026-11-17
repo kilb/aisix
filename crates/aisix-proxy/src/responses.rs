@@ -1386,6 +1386,18 @@ async fn dispatch(
     // targets whose Provider Key serves `/v1/responses` natively take the
     // verbatim passthrough; every other target is bridged through ChatFormat
     // (#825), so a group can mix and fail over across both kinds.
+    // 只在免费计数分支读取配置和遍历引用；生成、压缩和流不增加正文工作。
+    let counter = if operation.kind == ResponseOperationKind::InputTokens
+        && operation.origin.is_none()
+        && affinity.origin().is_none()
+        && affinity.registered_origin().is_none()
+        && !affinity.has_pending_reasoning_authority()
+        && crate::token_counting::responses_inline(body)
+    {
+        crate::token_counting::configuration(snapshot, aisix_core::ApiSurface::Responses)?
+    } else {
+        None
+    };
     let budget_gate = crate::budget::gate(state, snapshot);
     let native_capability = |model: &aisix_core::Model| {
         crate::dispatch::serves_natively(snapshot, model, aisix_core::ApiSurface::Responses)
@@ -1405,9 +1417,10 @@ async fn dispatch(
             source_ip: &client.source_ip,
             context_origin: affinity.origin(),
             budget: Some(&budget_gate),
-            serves: (!operation.is_create()
-                || durable_background
-                || affinity.registered_origin().is_some())
+            serves: (counter.is_none()
+                && (!operation.is_create()
+                    || durable_background
+                    || affinity.registered_origin().is_some()))
             .then_some(&native_capability as &dyn Fn(&aisix_core::Model) -> bool),
             allowed_groups: &auth.key().allowed_provider_groups,
         },
@@ -1468,7 +1481,7 @@ async fn dispatch(
         // telemetry attribution tags on the emitted UsageEvent
         // (#867). Recorded on the AttemptRecord (success + failure)
         // so both the winner and each failed-attempt event can attribute it.
-        let pk_id = target.model.provider_key_id.clone().unwrap_or_default();
+        let mut pk_id = target.model.provider_key_id.clone().unwrap_or_default();
         // Same-target retries before failing over, honoured exactly like
         // chat.rs / messages.rs (#641) and resolved per target so a direct
         // model gets a budget too.
@@ -1554,6 +1567,13 @@ async fn dispatch(
                 continue 'targets;
             }
         };
+        let fixed = counter
+            .as_ref()
+            .map(|counter| counter.resolve(snapshot, &target.id, &target.model))
+            .transpose()?;
+        if let Some(counter) = &fixed {
+            pk_id = counter.key.id.clone();
+        }
         for attempt_idx in 0..=budget.attempts {
             // Upstream `Retry-After` when the last failure carried one, else
             // exponential backoff + jitter, before re-hitting the SAME target
@@ -1586,11 +1606,12 @@ async fn dispatch(
             let mark = affinity
                 .response_mark(&target.id, is_routing_request)
                 .sealing_ids(state.platform(), &owner);
-            let native = crate::dispatch::serves_natively(
-                snapshot,
-                &target.model,
-                aisix_core::ApiSurface::Responses,
-            );
+            let native = fixed.is_some()
+                || crate::dispatch::serves_natively(
+                    snapshot,
+                    &target.model,
+                    aisix_core::ApiSurface::Responses,
+                );
             crate::attribution::note_translated_dispatch(!native);
             let result = if native {
                 match crate::native_api::origin::admit_native_reasoning_references_with_affinity(
@@ -1614,6 +1635,7 @@ async fn dispatch(
                             affinity,
                             mark,
                             &target.model,
+                            fixed.as_ref(),
                             &target.id,
                             timeouts,
                             request_id,
@@ -1667,7 +1689,9 @@ async fn dispatch(
                 Ok(mut success) => {
                     let latency_ms = ms_since(attempt_started);
                     // Feed the least_latency EWMA for this target.
-                    state.runtime_status.record_latency(&target.id, latency_ms);
+                    if fixed.is_none() {
+                        state.runtime_status.record_latency(&target.id, latency_ms);
+                    }
                     let terminal_status = success
                         .usage
                         .as_ref()
@@ -2069,6 +2093,7 @@ async fn responses_to_target(
     // The context tags this attempt's response carries back.
     mark: crate::responses_affinity::ResponseMark,
     model: &Arc<aisix_core::Model>,
+    counter: Option<&crate::token_counting::ResolvedCounter>,
     model_id: &str,
     // Deadlines resolved by the caller across target → group → deployment
     // default (`routing::effective_timeouts`); this fn only applies them.
@@ -2118,7 +2143,13 @@ async fn responses_to_target(
             .iter()
             .map(|e| &*e.value),
     );
-    let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
+    let pk_entry = match counter {
+        Some(counter) => {
+            crate::attribution::note_count_target(counter);
+            Arc::clone(&counter.key)
+        }
+        None => crate::dispatch::resolve_provider_key(snapshot, model)?,
+    };
     crate::native_api::skills::validate_openai_skills_for_target(
         state,
         auth,
@@ -2135,7 +2166,10 @@ async fn responses_to_target(
     // UsageEvent (#867).
     let provider_key_id = pk_entry.id.clone();
     let api_key = crate::dispatch::require_api_key(&pk_entry.value, model)?.to_string();
-    let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
+    let upstream_model = match counter {
+        Some(counter) => counter.model_name.clone(),
+        None => crate::dispatch::require_upstream_model(model)?.to_string(),
+    };
 
     let asynchronous = operation.is_create()
         && state.native_objects.is_some()
@@ -2382,12 +2416,54 @@ async fn responses_to_target(
     // request-level timeout. Streaming must NOT use it (it would cap the
     // whole stream); the streaming branch below enforces the per-chunk
     // read timeout instead.
-    if !is_stream {
+    if !is_stream || counter.is_some() {
         if let Some(d) = timeouts.request {
             req = req.timeout(d);
         }
     }
     let send_started = Instant::now();
+    // 免费辅助请求到此已经完成一次最终序列化，不进入源推理的健康、忙碌或冷却状态。
+    if let Some(counter) = counter {
+        let upstream = crate::responses_ws::send_native(req, None, send_started)
+            .await
+            .map_err(ProxyError::Bridge)?;
+        let status = upstream.status();
+        if !status.is_success() {
+            return Err(ProxyError::Bridge(
+                aisix_provider_openai::held_route_http_error(upstream).await,
+            ));
+        }
+        let headers = upstream.headers().clone();
+        let (count, bytes) = crate::native_api::responses::read_body(upstream, None, false).await?;
+        if let Some(error) = responses_body_in_band_error(&count) {
+            return Err(ProxyError::Bridge(error));
+        }
+        let mut response = Response::new(axum::body::Body::from(bytes));
+        *response.status_mut() = status;
+        apply_passthrough_headers(&mut response, &headers, request_id, state.platform());
+        crate::native_api::responses::relay_headers(&mut response, &headers);
+        return Ok(ResponseDispatchSuccess {
+            response,
+            provider: counter.key.provider.to_ascii_lowercase(),
+            // 终态日志需要显式零值 usage，count 数字不是被消费的 token。
+            usage: Some(ResponseUsage {
+                inference_stage: Some(aisix_core::native_objects::InferenceStage::Management),
+                provider_request_id: crate::usage_attr::provider_response_id(&count),
+                ..Default::default()
+            }),
+            model_id: model_id.to_string(),
+            provider_key_id,
+            upstream_model,
+            routing: RoutingTelemetry::default(),
+            guardrail_blocked: false,
+            guardrail_block_message: String::new(),
+            usage_handled_by_stream: false,
+            output_redactions: crate::redact::RedactionCounts::new(),
+            output_monitor_hits: Vec::new(),
+            captured_content: None,
+            cache: crate::response_cache::CacheTelemetry::default(),
+        });
+    }
     // least_busy: count this target as in-flight for the upstream call
     // (mirrors chat.rs). Non-streaming / error paths drop the guard at
     // function return; the streaming branch moves it into the

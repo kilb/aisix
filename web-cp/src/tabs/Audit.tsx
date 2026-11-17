@@ -37,6 +37,7 @@ const TARGET_KINDS: { kind: string; label: string }[] = [
   { kind: "guardrail_attachments", label: "护栏挂载" },
   { kind: "observability_exporters", label: "可观测性导出" },
   { kind: "budget_policy", label: "预算策略" },
+  { kind: "token_counting", label: "Token计数" },
 ];
 
 const ACTOR_KIND: Record<string, string> = { member: "租户成员", system: "系统", anonymous: "匿名" };

@@ -6,7 +6,7 @@
 use aisix_core::models::schema::{self, SchemaError};
 use aisix_core::models::{
     ApiKey, Budget, BudgetPolicy, CachePolicy, Guardrail, GuardrailAttachment, Model,
-    ObservabilityExporter, ProviderKey, RateLimitPolicy, Team, User,
+    ObservabilityExporter, ProviderKey, RateLimitPolicy, Team, TokenCounting, User,
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -26,6 +26,7 @@ pub fn validate_strict(kind: Kind, doc: &Value) -> Result<(), Vec<Detail>> {
         Kind::GuardrailAttachments => schema::validate_guardrail_attachment(doc),
         Kind::ObservabilityExporters => schema::validate_observability_exporter(doc),
         Kind::BudgetPolicy => schema::validate_budget_policy(doc),
+        Kind::TokenCounting => schema::validate_token_counting(doc),
         Kind::Teams => schema::validate_team(doc),
         Kind::Users => schema::validate_user(doc),
         Kind::ApiKeys => schema::validate_apikey(doc),
@@ -45,6 +46,7 @@ pub fn validate_strict(kind: Kind, doc: &Value) -> Result<(), Vec<Detail>> {
         Kind::GuardrailAttachments => parse::<GuardrailAttachment>(doc).map(drop),
         Kind::ObservabilityExporters => parse::<ObservabilityExporter>(doc).map(drop),
         Kind::BudgetPolicy => parse::<BudgetPolicy>(doc).map(drop),
+        Kind::TokenCounting => parse::<TokenCounting>(doc).map(drop),
         Kind::Teams => parse::<Team>(doc).map(drop),
         Kind::Users => parse::<User>(doc).map(drop),
         Kind::ApiKeys => parse::<ApiKey>(doc).map(drop),
@@ -65,6 +67,7 @@ pub fn validate_lenient(kind: Kind, doc: &Value) -> Result<(), SchemaError> {
         Kind::GuardrailAttachments => schema::validate_guardrail_attachment_lenient(doc),
         Kind::ObservabilityExporters => schema::validate_observability_exporter_lenient(doc),
         Kind::BudgetPolicy => schema::validate_budget_policy_lenient(doc),
+        Kind::TokenCounting => schema::validate_token_counting_lenient(doc),
         Kind::Teams => schema::validate_team_lenient(doc),
         Kind::Users => schema::validate_user_lenient(doc),
         Kind::ApiKeys => schema::validate_apikey_lenient(doc),

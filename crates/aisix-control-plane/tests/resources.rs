@@ -312,6 +312,7 @@ fn generic_fixtures(
             Kind::BudgetPolicy,
             json!({"closed_grace_seconds": 60, "fail_mode": "sticky"}),
         ),
+        (Kind::TokenCounting, json!({})),
     ]
 }
 

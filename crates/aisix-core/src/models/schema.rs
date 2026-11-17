@@ -71,6 +71,7 @@ pub struct Schemas {
     pub claim_mapping: Validator,
     pub passthrough_route: Validator,
     pub mcp_auth_settings: Validator,
+    pub token_counting: Validator,
     pub pricing: Validator,
     pub team: Validator,
     pub user: Validator,
@@ -89,7 +90,7 @@ pub static LENIENT_SCHEMAS: Lazy<Arc<Schemas>> = Lazy::new(|| Arc::new(Schemas::
 /// [`resource_root_schema`] takes. The published schema files and the
 /// validator sets are built from this list, so a new resource cannot reach
 /// one without reaching the other.
-pub const RESOURCES: [&str; 20] = [
+pub const RESOURCES: [&str; 21] = [
     "model",
     "api_key",
     "provider_key",
@@ -105,6 +106,7 @@ pub const RESOURCES: [&str; 20] = [
     "claim_mapping",
     "passthrough_route",
     "mcp_auth_settings",
+    "token_counting",
     "pricing",
     "team",
     "user",
@@ -144,6 +146,7 @@ pub fn resource_root_schema(resource: &str, strict: bool) -> Value {
         "claim_mapping" => claim_mapping_root_schema(),
         "passthrough_route" => passthrough_route_root_schema(),
         "mcp_auth_settings" => mcp_auth_settings_root_schema(),
+        "token_counting" => token_counting_root_schema(),
         "pricing" => pricing_root_schema(),
         "team" => team_root_schema(strict),
         "user" => user_root_schema(strict),
@@ -184,6 +187,7 @@ impl Schemas {
             claim_mapping: build("claim_mapping"),
             passthrough_route: build("passthrough_route"),
             mcp_auth_settings: build("mcp_auth_settings"),
+            token_counting: build("token_counting"),
             pricing: build("pricing"),
             team: build("team"),
             user: build("user"),
@@ -7607,4 +7611,59 @@ mod tests {
             "a guardrail kind was added to or removed from the write schema"
         );
     }
+}
+
+/// 固定令牌计数配置的规范结构。
+pub fn token_counting_root_schema() -> Value {
+    let mut schema = struct_root_schema::<crate::models::TokenCounting>(false);
+    for (definition, fields) in [
+        ("TokenCountTarget", &["provider_key_id"][..]),
+        (
+            "TokenCountModelMapping",
+            &["model_id", "source_model_name", "model_name"][..],
+        ),
+    ] {
+        for field in fields {
+            // serde 的空串容错值不是可写配置的默认值。
+            schema["definitions"][definition]["properties"][*field]
+                .as_object_mut()
+                .expect("required token counting string property")
+                .remove("default");
+        }
+    }
+    schema["definitions"]["TokenCountTarget"]["required"] = json!(["provider_key_id"]);
+    schema["definitions"]["TokenCountModelMapping"]["required"] =
+        json!(["model_id", "source_model_name", "model_name"]);
+    schema
+}
+
+pub fn validate_token_counting(value: &Value) -> Result<(), SchemaError> {
+    validate(&SCHEMAS.token_counting, value)?;
+    validate_token_counting_mappings(value)
+}
+
+pub fn validate_token_counting_lenient(value: &Value) -> Result<(), SchemaError> {
+    validate(&LENIENT_SCHEMAS.token_counting, value)?;
+    validate_token_counting_mappings(value)
+}
+
+fn validate_token_counting_mappings(value: &Value) -> Result<(), SchemaError> {
+    for block in ["messages_count_tokens", "responses_input_tokens"] {
+        let mut seen = std::collections::HashSet::new();
+        for mapping in value[block]["model_mappings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            if let Some(id) = mapping["model_id"].as_str() {
+                if !seen.insert(id) {
+                    return Err(SchemaError {
+                        path: format!("/{block}/model_mappings"),
+                        message: format!("duplicate model_id {id:?}"),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
 }

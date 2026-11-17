@@ -10,7 +10,7 @@
 use aisix_core::resource::ResourceEntry;
 use aisix_core::{
     A2aAgent, ApiKey, CachePolicy, Guardrail, McpServer, Model, ObservabilityExporter,
-    PassthroughRoute, ProviderKey,
+    PassthroughRoute, ProviderKey, TokenCounting,
 };
 use dashmap::DashMap;
 use std::sync::Arc;
@@ -64,6 +64,12 @@ pub trait ConfigStore: Send + Sync + 'static {
     async fn get_a2a_agent(&self, id: &str) -> Result<Option<ResourceEntry<A2aAgent>>, StoreError>;
     async fn list_a2a_agents(&self) -> Result<Vec<ResourceEntry<A2aAgent>>, StoreError>;
 
+    async fn get_token_counting(
+        &self,
+        id: &str,
+    ) -> Result<Option<ResourceEntry<TokenCounting>>, StoreError>;
+    async fn list_token_counting(&self) -> Result<Vec<ResourceEntry<TokenCounting>>, StoreError>;
+
     async fn get_passthrough_route(
         &self,
         id: &str,
@@ -86,6 +92,7 @@ pub struct InMemoryStore {
     mcp_servers: DashMap<String, ResourceEntry<McpServer>>,
     a2a_agents: DashMap<String, ResourceEntry<A2aAgent>>,
     passthrough_routes: DashMap<String, ResourceEntry<PassthroughRoute>>,
+    token_counting: DashMap<String, ResourceEntry<TokenCounting>>,
 }
 
 impl InMemoryStore {
@@ -179,6 +186,16 @@ impl ConfigStore for InMemoryStore {
 
     async fn list_a2a_agents(&self) -> Result<Vec<ResourceEntry<A2aAgent>>, StoreError> {
         Ok(self.a2a_agents.iter().map(|r| r.clone()).collect())
+    }
+
+    async fn get_token_counting(
+        &self,
+        id: &str,
+    ) -> Result<Option<ResourceEntry<TokenCounting>>, StoreError> {
+        Ok(self.token_counting.get(id).map(|r| r.clone()))
+    }
+    async fn list_token_counting(&self) -> Result<Vec<ResourceEntry<TokenCounting>>, StoreError> {
+        Ok(self.token_counting.iter().map(|r| r.clone()).collect())
     }
 
     async fn get_passthrough_route(

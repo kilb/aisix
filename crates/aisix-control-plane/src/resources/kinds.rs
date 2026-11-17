@@ -17,6 +17,7 @@ pub enum Kind {
     GuardrailAttachments,
     ObservabilityExporters,
     BudgetPolicy,
+    TokenCounting,
     Teams,
     Users,
     ApiKeys,
@@ -24,7 +25,7 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub const ALL: [Kind; 12] = [
+    pub const ALL: [Kind; 13] = [
         Kind::Models,
         Kind::ProviderKeys,
         Kind::CachePolicies,
@@ -33,6 +34,7 @@ impl Kind {
         Kind::GuardrailAttachments,
         Kind::ObservabilityExporters,
         Kind::BudgetPolicy,
+        Kind::TokenCounting,
         Kind::Teams,
         Kind::Users,
         Kind::ApiKeys,
@@ -51,6 +53,7 @@ impl Kind {
             Kind::GuardrailAttachments => "guardrail_attachments",
             Kind::ObservabilityExporters => "observability_exporters",
             Kind::BudgetPolicy => "budget_policy",
+            Kind::TokenCounting => "token_counting",
             Kind::Teams => "teams",
             Kind::Users => "users",
             Kind::ApiKeys => "api_keys",
@@ -74,6 +77,7 @@ impl Kind {
             Kind::GuardrailAttachments => "guardrail_attachment",
             Kind::ObservabilityExporters => "observability_exporter",
             Kind::BudgetPolicy => "budget_policy",
+            Kind::TokenCounting => "token_counting",
             Kind::Teams => "team",
             Kind::Users => "user",
             Kind::ApiKeys => "api_key",
@@ -96,6 +100,7 @@ impl Kind {
             | Kind::RateLimitPolicies
             | Kind::GuardrailAttachments
             | Kind::BudgetPolicy
+            | Kind::TokenCounting
             | Kind::Teams
             | Kind::Users
             | Kind::ApiKeys
@@ -129,7 +134,7 @@ impl Kind {
     /// Whether the environment has at most one row of the kind, whose id is
     /// the `env_id`.
     pub fn is_singleton(self) -> bool {
-        self == Kind::BudgetPolicy
+        matches!(self, Kind::BudgetPolicy | Kind::TokenCounting)
     }
 }
 

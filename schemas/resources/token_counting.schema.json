@@ -1,0 +1,77 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": false,
+  "definitions": {
+    "TokenCountModelMapping": {
+      "additionalProperties": false,
+      "description": "源模型的精确版本与固定账号模型之间的映射。",
+      "properties": {
+        "model_id": {
+          "description": "源直接模型的资源 ID，不接受通配符。",
+          "minLength": 1,
+          "type": "string"
+        },
+        "model_name": {
+          "description": "固定计数账号使用的上游模型名。",
+          "minLength": 1,
+          "type": "string"
+        },
+        "source_model_name": {
+          "description": "保存映射时源模型的上游模型名；源模型版本变化后映射失效。",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "model_id",
+        "source_model_name",
+        "model_name"
+      ],
+      "type": "object"
+    },
+    "TokenCountTarget": {
+      "additionalProperties": false,
+      "description": "一个计数接口的固定账号。映射以源模型资源 ID 唯一标识。",
+      "properties": {
+        "model_mappings": {
+          "default": [],
+          "description": "源模型到固定账号模型的显式映射。未列出的模型保留源上游模型名。",
+          "items": {
+            "$ref": "#/definitions/TokenCountModelMapping"
+          },
+          "type": "array"
+        },
+        "provider_key_id": {
+          "description": "固定计数账号的 Provider Key 资源 ID。",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "provider_key_id"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "为环境的免费令牌计数接口选择固定账号。未配置的接口沿用模型账号。",
+  "properties": {
+    "messages_count_tokens": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/TokenCountTarget"
+        }
+      ],
+      "description": "Messages 令牌计数使用的账号与模型映射。"
+    },
+    "responses_input_tokens": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/TokenCountTarget"
+        }
+      ],
+      "description": "Responses 输入令牌计数使用的账号与模型映射。"
+    }
+  },
+  "title": "TokenCounting",
+  "type": "object"
+}

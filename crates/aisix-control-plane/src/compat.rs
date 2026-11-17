@@ -90,6 +90,9 @@ impl FieldFloor {
 // allowed_endpoints 的通用门槛与客户新增族共用发行版本，正式发布只固定这一处。
 const API_KEY_ENDPOINTS_SINCE: Since = Since::ThisRelease;
 
+// 首次发布只固定这一处；写入门禁与 rollout 共用同一个发行门槛。
+const TOKEN_COUNTING_SINCE: Since = Since::ThisRelease;
+
 // 首个已发布并验证支持客户接口隔离的网关源码；控制面独立热修复仍识别其真实标记。
 const CUSTOMER_ENDPOINT_EXPANSION_DEV_SHA: &str = "08ff931722b737d40a8942a9e55de94afc9b51d5";
 
@@ -121,6 +124,22 @@ const NATIVE_ENDPOINT_EXPANSION_DEV_SHAS: &[&str] = &[
 /// `allowed_provider_groups`, which its own row already refuses while such
 /// a gateway is registered.
 pub const FIELD_FLOORS: &[FieldFloor] = &[
+    FieldFloor {
+        kind: Kind::TokenCounting,
+        pointer: "/messages_count_tokens",
+        trigger: Trigger::Present,
+        since: TOKEN_COUNTING_SINCE,
+        widens: messages_counter_changed,
+        why: "an older gateway ignores the fixed token-counting account and keeps using the source account",
+    },
+    FieldFloor {
+        kind: Kind::TokenCounting,
+        pointer: "/responses_input_tokens",
+        trigger: Trigger::Present,
+        since: TOKEN_COUNTING_SINCE,
+        widens: responses_counter_changed,
+        why: "an older gateway ignores the fixed token-counting account and keeps using the source account",
+    },
     FieldFloor {
         kind: Kind::Models,
         pointer: "/routing/hash_failover",
@@ -298,6 +317,44 @@ fn supports_native_endpoint_expansion(version: &str, cp_version: &str) -> bool {
             || NATIVE_ENDPOINT_EXPANSION_DEV_SHAS
                 .iter()
                 .any(|known| gateway == *known || gateway == &known[..7]))
+}
+
+// 新计数能力不继承任何既有开发构建白名单；只信同一控制面构建的精确 SHA。
+pub(crate) fn supports_token_counting(version: &str, cp_version: &str) -> bool {
+    supports_token_counting_since(version, cp_version, &TOKEN_COUNTING_SINCE)
+}
+
+fn supports_token_counting_since(version: &str, cp_version: &str, since: &Since) -> bool {
+    match (
+        GatewayVersion::parse(version),
+        GatewayVersion::parse(cp_version),
+    ) {
+        (GatewayVersion::Release(version), _) => minimum(since, cp_version)
+            .is_some_and(|minimum| !version.cmp_precedence(&minimum).is_lt()),
+        (GatewayVersion::Dev, GatewayVersion::Dev) => {
+            let sha = |raw: &str| {
+                raw.strip_prefix("dev+sha-")
+                    .filter(|sha| {
+                        (7..=40).contains(&sha.len())
+                            && sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    })
+                    .map(str::to_ascii_lowercase)
+            };
+            match (sha(version), sha(cp_version)) {
+                (Some(gateway), Some(control_plane)) => gateway == control_plane,
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+fn messages_counter_changed(stored: &Value, doc: &Value) -> bool {
+    stored.get("messages_count_tokens") != doc.get("messages_count_tokens")
+}
+
+fn responses_counter_changed(stored: &Value, doc: &Value) -> bool {
+    stored.get("responses_input_tokens") != doc.get("responses_input_tokens")
 }
 
 fn native_endpoint_expansion(kind: Kind, doc: &Value, stored: &Value) -> bool {
@@ -644,7 +701,7 @@ fn too_old(pointer: &str, message: String) -> ApiError {
 /// has been incomplete within that window. With no gateway registered the
 /// write passes. A write that sets no floored field, or only fields whose
 /// minimum this control plane cannot judge, reads nothing.
-/// 客户新增族扩权不适用上述不读库约定，必须另外核实真实构建支持。
+/// 客户新增族扩权和固定计数配置不适用上述不读库约定，必须另外核实真实构建支持。
 pub async fn gate(
     conn: &mut PgConnection,
     ctx: &WriteCtx,
@@ -652,6 +709,10 @@ pub async fn gate(
     doc: &Value,
     stored: &Value,
 ) -> Result<(), ApiError> {
+    let token_counting_floor = newly_triggered(FIELD_FLOORS, kind, doc, stored)
+        .into_iter()
+        .find(|floor| floor.kind == Kind::TokenCounting);
+    let token_counting = token_counting_floor.is_some();
     let customer_expansion = customer_endpoint_expansion(kind, doc, stored);
     let native_expansion = native_endpoint_expansion(kind, doc, stored);
     let floors: Vec<(&FieldFloor, Version)> = newly_triggered(FIELD_FLOORS, kind, doc, stored)
@@ -659,7 +720,7 @@ pub async fn gate(
         .filter_map(|f| minimum(&f.since, &ctx.cp_version).map(|m| (f, m)))
         .collect();
     let first = floors.first();
-    if first.is_none() && !customer_expansion && !native_expansion {
+    if first.is_none() && !customer_expansion && !native_expansion && !token_counting {
         return Ok(());
     }
     let versions: Vec<String> = sqlx::query_scalar(&format!(
@@ -668,6 +729,15 @@ pub async fn gate(
     .fetch_all(&mut *conn)
     .await
     .map_err(DbError::from)?;
+    if let Some(floor) = token_counting_floor {
+        let unsupported = versions
+            .iter()
+            .filter(|version| !supports_token_counting(version, &ctx.cp_version))
+            .count();
+        if unsupported > 0 {
+            return Err(too_old(floor.pointer, format!("固定计数账号需要全部网关支持当前发行版或与控制面完全相同的开发构建；当前有 {unsupported} 个实例无法确认支持")));
+        }
+    }
     if customer_expansion {
         let unsupported = versions
             .iter()
@@ -718,6 +788,11 @@ pub async fn gate(
                  部分网关实例未被记录，无法确认全部网关实例的版本"
                 ),
             )
+        } else if let Some(floor) = token_counting_floor {
+            (
+                floor.pointer,
+                "24 小时内有网关凭据达到实例上限，无法确认全部网关支持固定计数账号".to_string(),
+            )
         } else {
             (
                 "/allowed_endpoints",
@@ -726,7 +801,7 @@ pub async fn gate(
         };
         return Err(too_old(pointer, message));
     }
-    if customer_expansion || native_expansion {
+    if customer_expansion || native_expansion || token_counting {
         // 旧逻辑可无标记淘汰 Dev 实例；满额清单不能证明未遗漏旧构建。
         // 保留全部行判断，直到正常清理降到上限以下，不能仅统计最近 24 小时。
         let full: bool = sqlx::query_scalar(
@@ -738,8 +813,13 @@ pub async fn gate(
         .map_err(DbError::from)?;
         if full {
             return Err(too_old(
-                "/allowed_endpoints",
-                "网关凭据的实例记录已达上限，无法确认全部网关支持客户接口扩展".to_string(),
+                token_counting_floor.map_or("/allowed_endpoints", |floor| floor.pointer),
+                if token_counting {
+                    "网关凭据的实例记录已达上限，无法确认全部网关支持固定计数账号"
+                } else {
+                    "网关凭据的实例记录已达上限，无法确认全部网关支持客户接口扩展"
+                }
+                .to_string(),
             ));
         }
     }
@@ -751,6 +831,34 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    // 发布后固定门槛不能随控制面补丁升级抬升，否则已有配置会错误变成未应用。
+    #[test]
+    fn token_counting_pinned_release_floor_survives_control_plane_upgrades() {
+        let floor = Since::Version("1.9.0");
+        for cp_version in ["1.9.1+sha-bbbbbbb", "1.10.0+sha-bbbbbbb"] {
+            assert!(supports_token_counting_since(
+                "1.9.0+sha-aaaaaaa",
+                cp_version,
+                &floor
+            ));
+            assert!(!supports_token_counting_since(
+                "1.8.9+sha-aaaaaaa",
+                cp_version,
+                &floor
+            ));
+            assert!(!supports_token_counting_since(
+                "1.9.0-rc.1+sha-aaaaaaa",
+                cp_version,
+                &floor
+            ));
+            assert!(!supports_token_counting_since(
+                "1.9.0+sha-aaaaaaa",
+                cp_version,
+                &Since::ThisRelease
+            ));
+        }
+    }
 
     fn versions(raw: &[&str]) -> Vec<GatewayVersion> {
         raw.iter().map(|v| GatewayVersion::parse(v)).collect()
@@ -1261,6 +1369,8 @@ mod tests {
         assert_eq!(
             rows,
             [
+                (Kind::TokenCounting, "/messages_count_tokens"),
+                (Kind::TokenCounting, "/responses_input_tokens"),
                 (Kind::Models, "/routing/hash_failover"),
                 (Kind::CachePolicies, "/scope"),
                 (Kind::ApiKeys, "/allowed_endpoints"),

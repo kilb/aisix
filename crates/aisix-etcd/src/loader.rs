@@ -30,10 +30,10 @@ use aisix_core::models::{
     validate_guardrail_lenient, validate_mcp_auth_settings_lenient, validate_mcp_policy_lenient,
     validate_mcp_server_lenient, validate_model_lenient, validate_observability_exporter_lenient,
     validate_oidc_provider_lenient, validate_passthrough_route_lenient,
-    validate_provider_key_lenient, validate_rate_limit_policy_lenient, A2aAgent, ApiKey,
-    CachePolicy, ClaimMapping, Guardrail, GuardrailAttachment, McpAuthSettings, McpPolicy,
-    McpServer, Model, ObservabilityExporter, OidcProvider, PassthroughRoute, ProviderKey,
-    RateLimitPolicy, SchemaError,
+    validate_provider_key_lenient, validate_rate_limit_policy_lenient,
+    validate_token_counting_lenient, A2aAgent, ApiKey, CachePolicy, ClaimMapping, Guardrail,
+    GuardrailAttachment, McpAuthSettings, McpPolicy, McpServer, Model, ObservabilityExporter,
+    OidcProvider, PassthroughRoute, ProviderKey, RateLimitPolicy, SchemaError, TokenCounting,
 };
 use aisix_core::models::{
     validate_budget_lenient, validate_budget_policy_lenient, validate_pricing_lenient,
@@ -539,6 +539,18 @@ pub fn build_snapshot(prefixes: &PrefixSet, entries: &[RawEntry]) -> (AisixSnaps
                     &mut stats,
                 ) {
                     snapshot.claim_mappings.insert(entry);
+                }
+            }
+            "token_counting" => {
+                if let Some(entry) = validate_and_parse::<TokenCounting>(
+                    &raw.key,
+                    raw.revision,
+                    parsed,
+                    &value,
+                    validate_token_counting_lenient,
+                    &mut stats,
+                ) {
+                    snapshot.token_counting.insert(entry);
                 }
             }
             "mcp_auth_settings" => {
@@ -2248,6 +2260,46 @@ mod tests {
         );
         for r in &stats.rejections {
             assert_eq!(r.kind, RejectionKind::SchemaFailed);
+        }
+    }
+
+    #[test]
+    fn token_counting_loads_future_fields_and_indexes_without_reference_order_dependencies() {
+        let entries = vec![raw(
+            "/aisix/token_counting/env",
+            br#"{
+                "future_root":true,
+                "messages_count_tokens":{
+                    "provider_key_id":"not-loaded-yet",
+                    "future_target":true,
+                    "model_mappings":[{"model_id":"source-not-loaded-yet", "source_model_name":"v1", "model_name":"counter-v1", "future_mapping":true}]
+                }
+            }"#,
+            7,
+        )];
+        let (snapshot, stats) = build_snapshot(&env_prefixes(), &entries);
+        assert_eq!(stats.accepted, 1, "{:?}", stats.rejections);
+        assert_eq!(snapshot.total_entries(), 1);
+        let row = snapshot.token_counting.get_by_id("env").unwrap();
+        let target = row.messages_count_tokens.as_ref().unwrap();
+        assert!(target.mappings_valid());
+        assert_eq!(
+            target
+                .mapping_for("source-not-loaded-yet")
+                .unwrap()
+                .model_name,
+            "counter-v1"
+        );
+        for field in ["future_root", "future_target", "future_mapping"] {
+            assert!(
+                stats
+                    .partial_rows
+                    .iter()
+                    .flat_map(|row| &row.fields)
+                    .any(|path| path.contains(field)),
+                "missing {field}: {:?}",
+                stats.partial_rows
+            );
         }
     }
 }

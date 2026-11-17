@@ -474,6 +474,8 @@ mod tests {
             "credential_mode",
             "credential_ref", // names an environment credential
             "max_tokens",
+            "messages_count_tokens",  // 计数接口配置块，不含凭据
+            "responses_input_tokens", // 计数接口配置块，不含凭据
             "token_exchange_profile", // names a protocol
             "token_url",
         ];

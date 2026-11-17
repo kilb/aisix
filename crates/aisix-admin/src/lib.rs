@@ -22,6 +22,7 @@
 //! - `GET /admin/v1/a2a_agents` and `GET /admin/v1/a2a_agents/:id`
 //! - `GET /admin/v1/passthrough_routes` and
 //!   `GET /admin/v1/passthrough_routes/:id`
+//! - `GET /admin/v1/token_counting` and `GET /admin/v1/token_counting/:id`
 //! - `GET /admin/v1/models/status`, `GET /admin/v1/health`
 //!
 //! The resource write endpoints (POST/PUT/DELETE, including api-key
@@ -58,6 +59,7 @@ mod provider_keys_handlers;
 mod redaction;
 mod state;
 pub mod store;
+mod token_counting_handlers;
 
 pub use auth::AdminAuth;
 pub use error::{AdminError, ErrorBody};
@@ -167,6 +169,8 @@ pub fn build_router(state: AdminState) -> Router {
             "/admin/v1/a2a_agents/:id",
             get(a2a_agents_handlers::get_a2a_agent),
         )
+        .route("/admin/v1/token_counting", get(token_counting_handlers::list_token_counting))
+        .route("/admin/v1/token_counting/:id", get(token_counting_handlers::get_token_counting))
         .route(
             "/admin/v1/passthrough_routes",
             get(passthrough_routes_handlers::list_passthrough_routes),
@@ -528,6 +532,66 @@ mod tests {
             admin_keys: vec!["admin-secret".into()],
             tls: None,
         }
+    }
+
+    #[tokio::test]
+    async fn token_counting_admin_reads_live_snapshot_and_has_no_write_routes() {
+        let snapshot = AisixSnapshot::new();
+        snapshot
+            .token_counting
+            .insert(aisix_core::ResourceEntry::new(
+                "env",
+                aisix_core::TokenCounting::default(),
+                1,
+            ));
+        let handle = SnapshotHandle::new(snapshot);
+        let store: Arc<dyn ConfigStore> = Arc::new(FileManagedStore::new(handle.clone()));
+        let app = build_router(AdminState::new(handle.clone(), store, &cfg()));
+        let anonymous = Request::builder()
+            .uri("/admin/v1/token_counting")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            run(app.clone(), anonymous).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let response = run(
+            app.clone(),
+            auth_req("GET", "/admin/v1/token_counting", None),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body.as_array().unwrap().len(), 1);
+        assert_eq!(body[0]["id"], "env");
+        assert_eq!(
+            run(
+                app.clone(),
+                auth_req("GET", "/admin/v1/token_counting/env", None)
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        for method in ["POST", "PUT", "DELETE"] {
+            assert_eq!(
+                run(
+                    app.clone(),
+                    auth_req(method, "/admin/v1/token_counting/env", None)
+                )
+                .await
+                .status(),
+                StatusCode::METHOD_NOT_ALLOWED
+            );
+        }
+        handle.store(AisixSnapshot::new());
+        assert_eq!(
+            body_json(run(app, auth_req("GET", "/admin/v1/token_counting", None)).await).await,
+            json!([])
+        );
+        let openapi: Value = serde_json::from_str(admin_openapi_json()).unwrap();
+        assert!(openapi["components"]["schemas"]["TokenCounting"].is_object());
+        assert!(openapi["paths"]["/admin/v1/token_counting"]["get"].is_object());
     }
 
     fn build_state() -> AdminState {
@@ -1118,6 +1182,7 @@ mod tests {
             };
         }
         impl_failing_store! {
+            { aisix_core::TokenCounting, get_token_counting, list_token_counting }
             { Model, get_model, list_models }
             { ApiKey, get_apikey, list_apikeys }
             { ProviderKey, get_provider_key, list_provider_keys }
@@ -1193,6 +1258,7 @@ mod tests {
             };
         }
         impl_hanging_store! {
+            { aisix_core::TokenCounting, get_token_counting, list_token_counting }
             { Model, get_model, list_models }
             { ApiKey, get_apikey, list_apikeys }
             { ProviderKey, get_provider_key, list_provider_keys }
@@ -1798,7 +1864,7 @@ mod tests {
         // The FULL matrix — every route spelling × every write method.
         // A partial revert (say, PUT re-added on one {id} route) must
         // fail here; a sampled subset would let it through.
-        const ROUTE_SPELLINGS: [&str; 9] = [
+        const ROUTE_SPELLINGS: [&str; 10] = [
             "models",
             "api_keys",
             "apikeys", // former spelling: same removed write path
@@ -1806,6 +1872,7 @@ mod tests {
             "guardrails",
             "cache_policies",
             "observability_exporters",
+            "token_counting",
             "mcp_servers",
             "a2a_agents",
         ];

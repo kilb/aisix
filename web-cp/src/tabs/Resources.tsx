@@ -36,6 +36,7 @@ const KINDS = [
   { kind: "guardrail_attachments", label: "护栏挂载", writable: true },
   { kind: "observability_exporters", label: "可观测性导出", writable: true },
   { kind: "budget_policy", label: "预算策略", writable: true },
+  { kind: "token_counting", label: "Token计数", writable: true },
   { kind: "teams", label: "团队", writable: false },
   { kind: "users", label: "用户", writable: false },
   { kind: "api_keys", label: "API 密钥", writable: false },
@@ -48,7 +49,7 @@ type KindInfo = (typeof KINDS)[number];
 const MANAGED_NOTE = "由租户与密钥管理生成，在对应页面修改";
 
 /** The one row a kind may hold at most (its id is the environment's). */
-const SINGLETONS: readonly string[] = ["budget_policy"];
+const SINGLETONS: readonly string[] = ["budget_policy", "token_counting"];
 
 type Doc = Record<string, unknown>;
 

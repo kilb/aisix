@@ -1941,3 +1941,46 @@ api_keys:
     load_from_str(contents, "x", 1, &|name| Some(env_placeholder(name)))
         .expect("a file with two key_env entries loads under placeholders");
 }
+
+#[test]
+fn token_counting_file_resolves_references_and_validates_source_snapshot() {
+    let input = r#"
+_format_version: "1"
+provider_keys:
+  - display_name: counter
+    provider: anthropic
+    api_key: local-test-secret
+models:
+  - display_name: source
+    provider: anthropic
+    model_name: claude-v1
+    provider_key: counter
+token_counting:
+  - messages_count_tokens:
+      provider_key: counter
+      model_mappings:
+        - model: source
+          source_model_name: claude-v1
+          model_name: claude-v1
+"#;
+    let snapshot = load(input, &HashMap::new()).unwrap();
+    assert_eq!(snapshot.total_entries(), 3);
+    for invalid in [
+        input.replace(
+            "model_name: claude-v1\n    provider_key",
+            "model_name: '*'\n    provider_key",
+        ),
+        input.replace("source_model_name: claude-v1", "source_model_name: stale"),
+        input.replace("model: source", "model: '*'"),
+        input
+            .replace("display_name: source", "display_name: '*'")
+            .replace("model: source", "model: '*'"),
+        input.replace(
+            "provider_key: counter\n      model_mappings",
+            "provider_key: missing\n      model_mappings",
+        ),
+        format!("{input}\n  - {{}}"),
+    ] {
+        assert!(load(&invalid, &HashMap::new()).is_err(), "{invalid}");
+    }
+}

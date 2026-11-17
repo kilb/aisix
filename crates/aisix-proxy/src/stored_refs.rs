@@ -363,7 +363,7 @@ fn find_in(body: &Value, root: &str, check: &dyn Fn(&Value) -> Visit) -> Option<
     find_under(value, &mut root.to_string(), check)
 }
 
-fn responses_reference(body: &Value) -> Option<String> {
+pub(crate) fn responses_reference(body: &Value) -> Option<String> {
     for field in ["conversation", "prompt"] {
         if names(body.get(field)) {
             return Some(field.to_string());
@@ -475,7 +475,7 @@ fn chat_reference(req: &aisix_gateway::ChatFormat) -> Option<String> {
     None
 }
 
-fn messages_reference(body: &Value) -> Option<String> {
+pub(crate) fn messages_reference(body: &Value) -> Option<String> {
     match body.get("container") {
         Some(Value::String(s)) if !s.is_empty() => return Some("container".into()),
         Some(container @ Value::Object(_)) => {

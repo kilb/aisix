@@ -160,6 +160,7 @@ fn destination_fields(kind: Kind) -> &'static [&'static str] {
         | Kind::RateLimitPolicies
         | Kind::GuardrailAttachments
         | Kind::BudgetPolicy
+        | Kind::TokenCounting
         | Kind::Teams
         | Kind::Users
         | Kind::ApiKeys

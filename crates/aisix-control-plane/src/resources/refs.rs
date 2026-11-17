@@ -139,6 +139,12 @@ pub fn outgoing(kind: Kind, doc: &Value) -> Vec<Ref> {
 
     let field = |name: &str| doc.get(name);
     match kind {
+        Kind::TokenCounting => {
+            for block in ["messages_count_tokens", "responses_input_tokens"] {
+                let path = format!("/{block}/provider_key_id");
+                push(path.clone(), Kind::ProviderKeys, doc.pointer(&path));
+            }
+        }
         Kind::ProviderKeys => {
             push(
                 "/realtime_sip/api_key_id".into(),

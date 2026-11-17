@@ -709,3 +709,36 @@ mod tests {
         assert!(err.contains("gpt-4o"), "unexpected: {err}");
     }
 }
+
+pub(crate) fn desugar_token_counting(doc: &mut Value, maps: &IdentityMaps) -> Result<(), String> {
+    for block in ["messages_count_tokens", "responses_input_tokens"] {
+        let Some(target) = doc.get_mut(block).and_then(Value::as_object_mut) else {
+            continue;
+        };
+        desugar_provider_key_ref(target, maps, &format!("{block}."))?;
+        for mapping in target
+            .get_mut("model_mappings")
+            .and_then(Value::as_array_mut)
+            .into_iter()
+            .flatten()
+        {
+            let Some(node) = mapping.as_object_mut() else {
+                continue;
+            };
+            let Some(name) = node.remove("model") else {
+                continue;
+            };
+            let name = name
+                .as_str()
+                .ok_or_else(|| "token_counting mapping model must be a string".to_string())?;
+            let id = maps
+                .get("models")
+                .and_then(|models| models.get(name))
+                .ok_or_else(|| {
+                    format!("token_counting mapping references unknown model {name:?}")
+                })?;
+            node.insert("model_id".into(), Value::String(id.clone()));
+        }
+    }
+    Ok(())
+}

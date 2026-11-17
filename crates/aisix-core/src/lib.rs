@@ -80,6 +80,9 @@ pub use models::{
     SchemaError, StreamDoneMarker, Tags, Team, TelemetryKind, TelemetryTags, User,
     WhenAllUnavailablePolicy, DEFAULT_COOLDOWN_TRIGGER_STATUSES,
 };
+pub use models::{
+    token_count_provider_serves, TokenCountModelMapping, TokenCountTarget, TokenCounting,
+};
 pub use resource::{Resource, ResourceEntry};
 pub use sched::{demote_current_thread, run_demoted};
 pub use similarity::{best_similarity, best_similarity_by, cosine_similarity};

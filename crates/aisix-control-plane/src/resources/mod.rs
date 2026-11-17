@@ -15,6 +15,7 @@ mod realtime_sip;
 pub mod refs;
 pub mod secrets;
 pub mod store;
+mod token_counting;
 pub mod validate;
 pub mod write;
 

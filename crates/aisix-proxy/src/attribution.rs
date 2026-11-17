@@ -1380,6 +1380,15 @@ pub(crate) fn note_target(model: &Model, provider_key_id: &str) {
     });
 }
 
+/// 免费辅助调用保留源模型身份，实际账号和模型名单独记入传输归属。
+pub(crate) fn note_count_target(counter: &crate::token_counting::ResolvedCounter) {
+    with(|r| {
+        r.provider = counter.key.provider.clone();
+        r.upstream_model = counter.model_name.clone();
+        r.provider_key_id = counter.key.id.clone();
+    });
+}
+
 /// Overwrite the target half with what a CACHE HIT may honestly claim.
 ///
 /// A hit contacts no upstream, so nothing was dispatched to and the line

@@ -13,6 +13,10 @@ left unpinned would demand the next release's gateways once the next release
 ships. An `-rc.N` tag needs no edit: an rc control plane reads its own stamp
 and asks for that rc.
 
+The token-counting field floors and capability checks share
+`TOKEN_COUNTING_SINCE`; pin that constant once so save-time validation and
+rollout status keep the same minimum gateway version.
+
 ```bash
 git tag vX.Y.Z <commit>
 git push origin vX.Y.Z

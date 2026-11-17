@@ -187,6 +187,26 @@ export interface ResourceView<D = Record<string, unknown>> {
   rollout: Rollout;
 }
 
+// 环境级免费计数接口使用的固定账号与精确源模型绑定。
+export interface TokenCountModelMapping {
+  model_id: string;
+  source_model_name: string;
+  model_name: string;
+  [field: string]: unknown;
+}
+
+export interface TokenCountTarget {
+  provider_key_id: string;
+  model_mappings?: TokenCountModelMapping[];
+  [field: string]: unknown;
+}
+
+export interface TokenCounting {
+  messages_count_tokens?: TokenCountTarget | null;
+  responses_input_tokens?: TokenCountTarget | null;
+  [field: string]: unknown;
+}
+
 export interface TenantLimits {
   concurrency?: number;
   rpm?: number;

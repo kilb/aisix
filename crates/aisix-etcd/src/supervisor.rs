@@ -2494,6 +2494,7 @@ fn merge_snapshot(dst: &AisixSnapshot, src: &AisixSnapshot) {
         claim_mappings,
         passthrough_routes,
         mcp_auth_settings,
+        token_counting,
         pricing,
         global_pricing,
         teams,
@@ -2543,6 +2544,9 @@ fn merge_snapshot(dst: &AisixSnapshot, src: &AisixSnapshot) {
     for e in passthrough_routes.entries() {
         dst.passthrough_routes.insert_arc(e);
     }
+    for e in token_counting.entries() {
+        dst.token_counting.insert_arc(e);
+    }
     for e in mcp_auth_settings.entries() {
         dst.mcp_auth_settings.insert_arc(e);
     }
@@ -2589,6 +2593,7 @@ fn remove_from_snapshot(snap: &AisixSnapshot, kind: &str, id: &str) {
         claim_mappings,
         passthrough_routes,
         mcp_auth_settings,
+        token_counting,
         pricing,
         global_pricing,
         teams,
@@ -2638,6 +2643,9 @@ fn remove_from_snapshot(snap: &AisixSnapshot, kind: &str, id: &str) {
         }
         "passthrough_routes" => {
             passthrough_routes.remove(id);
+        }
+        "token_counting" => {
+            token_counting.remove(id);
         }
         "mcp_auth_settings" => {
             mcp_auth_settings.remove(id);
@@ -2735,6 +2743,7 @@ fn snapshot_has(snap: &AisixSnapshot, kind: &str, id: &str) -> bool {
         claim_mappings,
         passthrough_routes,
         mcp_auth_settings,
+        token_counting,
         pricing,
         global_pricing,
         teams,
@@ -2758,6 +2767,7 @@ fn snapshot_has(snap: &AisixSnapshot, kind: &str, id: &str) -> bool {
         "claim_mappings" => claim_mappings.get_by_id(id).is_some(),
         "passthrough_routes" => passthrough_routes.get_by_id(id).is_some(),
         "mcp_auth_settings" => mcp_auth_settings.get_by_id(id).is_some(),
+        "token_counting" => token_counting.get_by_id(id).is_some(),
         "pricing" => pricing.get_by_id(id).is_some(),
         "global_pricing" => global_pricing.get_by_id(id).is_some(),
         "teams" => teams.get_by_id(id).is_some(),
@@ -2800,6 +2810,7 @@ fn resource_counts(snap: &AisixSnapshot) -> BTreeMap<String, usize> {
         ("claim_mappings", snap.claim_mappings.len()),
         ("passthrough_routes", snap.passthrough_routes.len()),
         ("mcp_auth_settings", snap.mcp_auth_settings.len()),
+        ("token_counting", snap.token_counting.len()),
         ("pricing", snap.pricing.len()),
         ("global_pricing", snap.global_pricing.len()),
         ("teams", snap.teams.len()),
@@ -4794,6 +4805,8 @@ mod tests {
         // The MCP OAuth discovery settings row (#1143) —
         // configuring the resource URL mid-run must activate the
         // discovery surface without a resync.
+        const VALID_TOKEN_COUNTING: &[u8] =
+            br#"{"messages_count_tokens":{"provider_key_id":"pk-1"}}"#;
         const VALID_MCP_AUTH_SETTINGS: &[u8] = br#"{
             "resource_url": "https://gw.example.com/mcp"
         }"#;
@@ -4812,6 +4825,11 @@ mod tests {
 
         for (key, body, _kind) in [
             ("/aisix/provider_keys/pk-1", VALID_PROVIDER_KEY, "PK"),
+            (
+                "/aisix/token_counting/env-1",
+                VALID_TOKEN_COUNTING,
+                "TokenCounting",
+            ),
             ("/aisix/guardrails/g-1", VALID_GUARDRAIL, "Guardrail"),
             (
                 "/aisix/guardrail_attachments/ga-1",
@@ -4852,6 +4870,7 @@ mod tests {
 
         let snap = sup.handle().load();
         assert_eq!(snap.provider_keys.len(), 1, "ProviderKey not merged");
+        assert_eq!(snap.token_counting.len(), 1, "TokenCounting not merged");
         assert_eq!(snap.guardrails.len(), 1, "Guardrail not merged");
         assert_eq!(
             snap.guardrail_attachments.len(),
@@ -4928,6 +4947,10 @@ mod tests {
         assert_eq!(sup.handle().load().claim_mappings.len(), 1);
         assert!(sup.apply_delete("/aisix/claim_mappings/cm-1"));
         assert!(sup.handle().load().claim_mappings.is_empty());
+        assert!(sup.apply_put(&entry("/aisix/token_counting/env-1", br#"{}"#, 2)));
+        assert_eq!(sup.handle().load().token_counting.len(), 1);
+        assert!(sup.apply_delete("/aisix/token_counting/env-1"));
+        assert!(sup.handle().load().token_counting.is_empty());
         assert!(sup.apply_delete("/aisix/mcp_auth_settings/env-1"));
         assert!(sup.handle().load().mcp_auth_settings.is_empty());
     }

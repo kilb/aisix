@@ -597,6 +597,11 @@ async fn loader_picks_up_every_direct_write() {
     let key_hash = aisix_core::ApiKey::hash_bearer("sk-loader-it");
     let writes = [
         (
+            "token_counting",
+            "env-loader-1",
+            json!({"responses_input_tokens":{"provider_key_id":"pk-loader-1"}}),
+        ),
+        (
             "models",
             "m-loader-1",
             json!({
@@ -697,9 +702,10 @@ async fn loader_picks_up_every_direct_write() {
          likely a subkey drift against the match arms in \
          aisix_etcd::loader: {stats:?}"
     );
-    assert_eq!(stats.accepted, 8, "expected 8 entries; got {stats:?}");
+    assert_eq!(stats.accepted, 9, "expected 9 entries; got {stats:?}");
 
     // Each resource table should now have exactly one entry.
+    assert_eq!(snap.token_counting.len(), 1);
     assert_eq!(snap.models.len(), 1);
     assert_eq!(snap.apikeys.len(), 1);
     assert_eq!(snap.provider_keys.len(), 1);
@@ -802,4 +808,22 @@ async fn admin_reads_survive_a_token_the_server_forgets() {
         )
         .await
         .expect("cleanup");
+}
+
+#[tokio::test]
+async fn token_counting_round_trip_through_real_etcd() {
+    let Some(url) = etcd_url() else {
+        eprintln!("skipping: ADMIN_TEST_ETCD_URL not set");
+        return;
+    };
+    direct_write_read_round_trip(
+        &url,
+        "token_counting",
+        "/admin/v1/token_counting",
+        "env-it",
+        json!({"responses_input_tokens":{"provider_key_id":"pk-it", "model_mappings":[{
+            "model_id":"m-it", "source_model_name":"source-v1", "model_name":"counter-v1"
+        }]}}),
+    )
+    .await;
 }

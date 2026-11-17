@@ -177,7 +177,13 @@ pub async fn list(
     auth.require(OperatorRole::Viewer)?;
     let kind = kind_of(&kind)?;
     let mut conn = state.db.pool().acquire().await.map_err(DbError::from)?;
-    let fleet = Fleet::load(&mut conn, &state.env, stale_window_secs(&state.cfg)).await?;
+    let fleet = Fleet::load_with_version(
+        &mut conn,
+        &state.env,
+        stale_window_secs(&state.cfg),
+        &state.cfg.cp_version,
+    )
+    .await?;
     let items: Vec<ResourceView> = store::list(&mut conn, kind)
         .await?
         .into_iter()
@@ -201,7 +207,13 @@ pub async fn get(
         .filter(|row| !row.deleted)
         .ok_or_else(ApiError::not_found)?;
     let etag = format!("\"{}\"", row.version);
-    let fleet = Fleet::load(&mut conn, &state.env, stale_window_secs(&state.cfg)).await?;
+    let fleet = Fleet::load_with_version(
+        &mut conn,
+        &state.env,
+        stale_window_secs(&state.cfg),
+        &state.cfg.cp_version,
+    )
+    .await?;
     Ok(([(header::ETAG, etag)], Json(ResourceView::of(row, &fleet))).into_response())
 }
 
@@ -249,7 +261,9 @@ pub async fn create(
                 )
                 .await?;
                 // Read in the transaction, so a write that commits is answered.
-                let fleet = Fleet::load(&mut *conn, &ctx.env, ctx.stale_secs).await?;
+                let fleet =
+                    Fleet::load_with_version(&mut *conn, &ctx.env, ctx.stale_secs, &ctx.cp_version)
+                        .await?;
                 Ok::<_, ApiError>((row, fleet))
             }
             .boxed()
@@ -312,7 +326,9 @@ pub async fn replace(
                 )
                 .await?;
                 // Read in the transaction, so a write that commits is answered.
-                let fleet = Fleet::load(&mut *conn, &ctx.env, ctx.stale_secs).await?;
+                let fleet =
+                    Fleet::load_with_version(&mut *conn, &ctx.env, ctx.stale_secs, &ctx.cp_version)
+                        .await?;
                 Ok::<_, ApiError>((row, fleet))
             }
             .boxed()
@@ -379,7 +395,9 @@ pub async fn delete(
                 )
                 .await?;
                 // Read in the transaction, so a write that commits is answered.
-                let fleet = Fleet::load(&mut *conn, &ctx.env, ctx.stale_secs).await?;
+                let fleet =
+                    Fleet::load_with_version(&mut *conn, &ctx.env, ctx.stale_secs, &ctx.cp_version)
+                        .await?;
                 Ok::<_, ApiError>((row, fleet))
             }
             .boxed()

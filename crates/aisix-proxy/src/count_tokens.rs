@@ -68,6 +68,7 @@ use axum::extract::State;
 use axum::http::{HeaderName, HeaderValue};
 use axum::response::Response;
 use serde_json::Value;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::auth::{AnthropicAuthenticatedKey, AuthenticatedKey};
@@ -586,9 +587,14 @@ async fn dispatch(
         None => crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?,
     };
 
-    // Resolve the attempt list (routing-aware). count_tokens is
-    // Anthropic-only, so we attempt the group's Anthropic targets in
-    // order; a direct model resolves to itself (#471).
+    // 未配置时保持源协议能力过滤；固定计数只替代上游能力，源模型策略仍完整执行。
+    let counter = if crate::stored_refs::messages_reference(body).is_none() {
+        crate::token_counting::configuration(snapshot, aisix_core::ApiSurface::Messages)?
+    } else {
+        None
+    };
+    let source_capability =
+        |model: &aisix_core::Model| counts_anthropic_tokens(state, snapshot, model);
     let budget_gate = crate::budget::gate(state, snapshot);
     let attempt_models = crate::routing::resolve_attempt_models(
         &state.routing,
@@ -605,7 +611,9 @@ async fn dispatch(
             source_ip: &client.source_ip,
             context_origin: None,
             budget: Some(&budget_gate),
-            serves: Some(&|model| counts_anthropic_tokens(state, snapshot, model)),
+            serves: counter
+                .is_none()
+                .then_some(&source_capability as &dyn Fn(&aisix_core::Model) -> bool),
             allowed_groups: &auth.key().allowed_provider_groups,
         },
     )?;
@@ -636,10 +644,8 @@ async fn dispatch(
     let mut last_err: Option<ProxyError> = None;
     let mut any_anthropic = false;
     for (target_idx, target) in attempt_models.iter().enumerate() {
-        // count_tokens has no upstream equivalent outside the Anthropic
-        // protocol; skip foreign targets in a mixed group rather than
-        // dispatching to an upstream that would 404.
-        if !counts_anthropic_tokens(state, snapshot, &target.model) {
+        // 未配置固定计数时，混合组仍跳过不能原生计数的源目标。
+        if counter.is_none() && !counts_anthropic_tokens(state, snapshot, &target.model) {
             continue;
         }
         any_anthropic = true;
@@ -702,6 +708,14 @@ async fn dispatch(
                 continue;
             }
         };
+        let fixed = counter
+            .as_ref()
+            .map(|counter| counter.resolve(snapshot, &target.id, &target.model))
+            .transpose()?;
+        let pk_id = fixed
+            .as_ref()
+            .map(|counter| counter.key.id.clone())
+            .unwrap_or(pk_id);
         // Same-target retries before failing over, like the other
         // group-capable endpoints. This loop had fail-over only: a
         // transient 502 on the sole Anthropic target failed the request
@@ -715,12 +729,15 @@ async fn dispatch(
         let has_usable_fallback = attempt_models[target_idx + 1..]
             .iter()
             .any(|t| counts_anthropic_tokens(state, snapshot, &t.model));
-        let budget = crate::routing::effective_retries(
+        let mut budget = crate::routing::effective_retries(
             &target.model,
             crate::routing::group_retries_of(&model_entry.value),
             state.default_retries,
             has_usable_fallback,
         );
+        if fixed.is_some() {
+            budget.attempts = 0;
+        }
         for attempt_idx in 0..=budget.attempts {
             if attempt_idx > 0 {
                 let hint = last_err.as_ref().and_then(|e| match e {
@@ -736,6 +753,7 @@ async fn dispatch(
                 snapshot,
                 body,
                 &target.model,
+                fixed.as_ref(),
                 &target.id,
                 crate::routing::effective_timeouts(
                     &target.model,
@@ -784,6 +802,10 @@ async fn dispatch(
                             dispatched: crate::attempt::attempt_reached_upstream(&e),
                         },
                     );
+                    // 固定计数只尝试一次，任何失败都不回源或进入其他模型。
+                    if fixed.is_some() {
+                        return Err(e);
+                    }
                     let retryable = matches!(
                         &e,
                         ProxyError::Bridge(be) if crate::routing::is_retryable(be, retry_on_429, fallback_statuses)
@@ -883,6 +905,7 @@ async fn count_tokens_to_target(
     snapshot: &aisix_core::AisixSnapshot,
     body: &Value,
     model: &aisix_core::Model,
+    counter: Option<&crate::token_counting::ResolvedCounter>,
     model_id: &str,
     // Deadlines resolved by the caller across target → group → deployment
     // default (`routing::effective_timeouts`); this fn only applies them.
@@ -891,11 +914,23 @@ async fn count_tokens_to_target(
     client: &ClientContext,
 ) -> Result<CountTokensSuccess, ProxyError> {
     let attempt_started = Instant::now();
-    let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
-    let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
+    let (pk_entry, upstream_model) = match counter {
+        Some(counter) => {
+            crate::attribution::note_count_target(counter);
+            (Arc::clone(&counter.key), counter.model_name.clone())
+        }
+        None => (
+            crate::dispatch::resolve_provider_key(snapshot, model)?,
+            crate::dispatch::require_upstream_model(model)?.to_string(),
+        ),
+    };
     // Every target this route dispatches to speaks the caller's protocol.
     crate::attribution::note_translated_dispatch(false);
-    if let Some(bridge) = crate::dispatch::anthropic_platform_bridge(&state.hub, snapshot, model) {
+    if let Some(bridge) = counter
+        .is_none()
+        .then(|| crate::dispatch::anthropic_platform_bridge(&state.hub, snapshot, model))
+        .flatten()
+    {
         return platform_count_tokens(
             state,
             bridge,
@@ -921,7 +956,11 @@ async fn count_tokens_to_target(
         // and the count it returns must be the count for the body the sibling
         // route would actually send — which, for Anthropic's own API, is also
         // without unsigned thinking blocks.
-        let body = if crate::dispatch::is_first_party_anthropic(snapshot, model) {
+        let first_party = counter.map_or_else(
+            || crate::dispatch::is_first_party_anthropic(snapshot, model),
+            |counter| counter.key.provider == "anthropic",
+        );
+        let body = if first_party {
             aisix_provider_anthropic::strip_unsigned_thinking_blocks(body)
         } else {
             aisix_provider_anthropic::strip_billing_header_attribution(body)
@@ -1072,7 +1111,9 @@ async fn count_tokens_to_target(
         aisix_gateway::upstream_io::send(req, aisix_gateway::upstream_io::Protocol::Messages)
             .await
             .map_err(|e| {
-                state.health.record_failure(&model.display_name);
+                if counter.is_none() {
+                    state.health.record_failure(&model.display_name);
+                }
                 crate::dispatch::reqwest_error_to_bridge(&e, send_started)
             })
             .map_err(ProxyError::Bridge)?;
@@ -1082,7 +1123,7 @@ async fn count_tokens_to_target(
 
     if !status.is_success() {
         let err = aisix_provider_anthropic::map_http_error(status, upstream_resp).await;
-        if status.is_server_error() {
+        if status.is_server_error() && counter.is_none() {
             state.health.record_failure(&model.display_name);
         }
         return Err(ProxyError::Bridge(err));
@@ -1095,7 +1136,9 @@ async fn count_tokens_to_target(
         .bytes()
         .await
         .map_err(|e| {
-            state.health.record_failure(&model.display_name);
+            if counter.is_none() {
+                state.health.record_failure(&model.display_name);
+            }
             aisix_gateway::upstream_body_read_error(&e)
         })
         .map_err(ProxyError::Bridge)?;
@@ -1106,7 +1149,9 @@ async fn count_tokens_to_target(
         return Err(ProxyError::Bridge(err));
     }
 
-    state.health.record_success(&model.display_name);
+    if counter.is_none() {
+        state.health.record_success(&model.display_name);
+    }
 
     let mut resp = axum::response::Response::new(axum::body::Body::from(body_bytes));
     // The upstream's content type; a fixed one in platform mode.
@@ -1134,9 +1179,9 @@ async fn count_tokens_to_target(
         // never of the vendor: a `byo` + `adapter: anthropic` key already
         // reported `byo` on /v1/chat/completions, and a Provider Key that
         // declares `apis.messages` brings any vendor down this path.
-        provider: model
-            .provider
-            .as_deref()
+        provider: counter
+            .map(|counter| counter.key.provider.as_str())
+            .or(model.provider.as_deref())
             .unwrap_or("unknown")
             .to_ascii_lowercase(),
         upstream_model,

@@ -26,6 +26,7 @@ import { ChannelModels } from "./providers/ChannelModels";
 import { GroupBadges } from "./providers/GroupBadges";
 import { InventorySummary, countGroups } from "./providers/OperationsBento";
 import { RealtimeSipBindingForm } from "./providers/RealtimeSipBindingForm";
+import { TokenCountingSettings } from "./providers/TokenCountingSettings";
 import { isRealtimeSipProjectPath, realtimeSipBody, realtimeSipDraft, realtimeSipErrors, realtimeSipProjectBody, realtimeSipProjectDraft, realtimeSipProjectError, type RealtimeSipBinding, type RealtimeSipErrors, type RealtimeSipField, type RealtimeSipRequest } from "../lib/realtimeSipBinding";
 import { Select } from "../ui/Select";
 
@@ -66,7 +67,7 @@ const FORM_FOOTER =
   "ops-form-footer -mx-[var(--pad)] -mb-[var(--pad)] mt-6 flex max-w-none flex-wrap items-center justify-end gap-2 rounded-b-card border-t border-hairline bg-sunken px-[var(--pad)] py-3 [&_.hint]:text-fg-2";
 
 /** How a referrer's kind is named on this page. */
-const KIND_LABEL: Record<string, string> = { models: "模型" };
+const KIND_LABEL: Record<string, string> = { models: "模型", token_counting: "Token计数" };
 
 /**
  * The refusal details each field of the account form shows beside itself;
@@ -95,7 +96,8 @@ function nameOf(a: Account): string {
  * Upstream accounts (`provider_keys`): the list, the form, a two-step
  * delete, and the platform's provider groups on each account.
  */
-export function Providers({ canEdit }: TabProps) {
+export function Providers({ canEdit, initialSection }: TabProps) {
+  const tokenCounting = initialSection === "token-counting";
   const pk = useResource<ProviderKeyDoc>("provider_keys");
   // The live groups an account may list: chosen by display name, stored by routing name.
   const groups = useLoad(() => groupsApi.list(), []);
@@ -206,12 +208,12 @@ export function Providers({ canEdit }: TabProps) {
     <div className="cp-operations cp-providers">
       <PageHeader
         eyebrow="PROVIDERS · 上游连接"
-        title={editing ? nameOf(editing) : "上游账号"}
-        dataLead={editing ? "维护当前账号的连接、分组和模型映射。" : pk.items ? <>已配置 {pk.items.length} 个上游账号，覆盖 {assignedGroups.size} 个分组。账号的协议、模型映射和密钥在此维护。</> : "维护上游连接、协议族、分组与模型映射。"}
+        title={tokenCounting ? "Token计数" : editing ? nameOf(editing) : "上游账号"}
+        dataLead={tokenCounting ? "为当前环境的两条免费计数接口管理固定账号与精确模型映射。" : editing ? "维护当前账号的连接、分组和模型映射。" : pk.items ? <>已配置 {pk.items.length} 个上游账号，覆盖 {assignedGroups.size} 个分组。账号的协议、模型映射和密钥在此维护。</> : "维护上游连接、协议族、分组与模型映射。"}
         actions={
           <>
             <Button type="button" className="ops-icon-button" aria-label="刷新" title="刷新上游账号" onClick={() => { void pk.reload(); void mappings.reload(); }}><RefreshCw aria-hidden /></Button>
-            {canEdit && (!open || open.mode === "new") && (
+            {!tokenCounting && canEdit && (!open || open.mode === "new") && (
               <Button ref={createTrigger} kind="primary" disabled={opening} onClick={() => void openNew()}>
                 <Plus aria-hidden />
                 新增上游账号
@@ -220,6 +222,11 @@ export function Providers({ canEdit }: TabProps) {
           </>
         }
       />
+      <nav aria-label="上游账号管理" className="mb-4 flex w-fit flex-wrap gap-1 rounded-field border border-hairline bg-well p-1">
+        <a href="#providers" aria-current={!tokenCounting ? "page" : undefined} className={`inline-flex min-h-11 items-center rounded-field px-4 text-small font-semibold ${!tokenCounting ? "bg-card text-foreground shadow-card" : "text-fg-2"}`}>上游账号</a>
+        <a href="#providers?section=token-counting" aria-current={tokenCounting ? "page" : undefined} className={`inline-flex min-h-11 items-center rounded-field px-4 text-small font-semibold ${tokenCounting ? "bg-card text-foreground shadow-card" : "text-fg-2"}`}>Token计数</a>
+      </nav>
+      {tokenCounting ? <TokenCountingSettings accounts={pk.items} accountsError={pk.error} onAccountsReload={() => void pk.reload()} canEdit={canEdit} /> : <>
       {!editing && <InventorySummary
         title="上游账号 · 当前配置"
         total={pk.items?.length ?? null}
@@ -443,6 +450,7 @@ export function Providers({ canEdit }: TabProps) {
           </div>
         )}
       </div>
+      </>}
     </div>
   );
 }

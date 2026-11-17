@@ -410,6 +410,80 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
         ),
     );
 
+    for settings in snapshot.token_counting.entries() {
+        for (block, surface, target) in [
+            (
+                "messages_count_tokens",
+                aisix_core::ApiSurface::Messages,
+                &settings.messages_count_tokens,
+            ),
+            (
+                "responses_input_tokens",
+                aisix_core::ApiSurface::Responses,
+                &settings.responses_input_tokens,
+            ),
+        ] {
+            let Some(target) = target else {
+                continue;
+            };
+            if !target.mappings_valid() {
+                diag.blocking.push(format!(
+                    "token_counting {block} contains invalid or duplicate model mappings"
+                ));
+            }
+            if let Some(key) = snapshot.provider_keys.get_by_id(&target.provider_key_id) {
+                if !aisix_core::token_count_provider_serves(&key.value, surface) {
+                    diag.blocking.push(format!(
+                        "token_counting {block} provider key does not serve the required protocol"
+                    ));
+                }
+            }
+            for mapping in &target.model_mappings {
+                let Some(source) = snapshot.models.get_by_id(&mapping.model_id) else {
+                    continue;
+                };
+                if source.is_embedding()
+                    || source.routing.is_some()
+                    || source.ensemble.is_some()
+                    || source.semantic.is_some()
+                    || source.display_name.contains('*')
+                    || !source.model_name.as_deref().is_some_and(|name| {
+                        !name.contains('*') && name == mapping.source_model_name
+                    })
+                {
+                    diag.blocking.push(format!("token_counting {block} mapping model_id {:?} must name an exact direct model without embedding metadata and with matching source_model_name", mapping.model_id));
+                }
+            }
+        }
+    }
+
+    push_kind(
+        &mut collections,
+        "token_counting",
+        emit_entries(
+            &snapshot.token_counting,
+            |_| "token_counting".to_string(),
+            "token_counting",
+            &mut diag,
+            |doc, identity, diag| {
+                for block in ["messages_count_tokens", "responses_input_tokens"] {
+                    if let Some(target) = doc.get_mut(block) {
+                        resugar_provider_key(target, identity, &provider_key_names, diag);
+                    }
+                }
+                resugar_model_refs(
+                    doc,
+                    "token_counting",
+                    "token_counting",
+                    identity,
+                    &model_names,
+                    diag,
+                );
+            },
+            |_, _| {},
+        ),
+    );
+
     // guardrail_attachments are emitted above as their own collection, with
     // every id reference rewritten to the identity its collection is keyed by.
 
@@ -1008,7 +1082,7 @@ fn resugar_model_refs(
                      not among the exported models — emitted under `{name_field}` as a name \
                      that resolves to nothing (dangling reference in the source data)"
                 );
-                if kind == "models" {
+                if matches!(kind, "models" | "token_counting") {
                     blocking.push(message);
                 } else {
                     warnings.push(message);

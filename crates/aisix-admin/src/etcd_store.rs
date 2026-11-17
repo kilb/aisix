@@ -22,7 +22,7 @@
 use aisix_core::resource::ResourceEntry;
 use aisix_core::{
     A2aAgent, ApiKey, CachePolicy, Guardrail, McpServer, Model, ObservabilityExporter,
-    PassthroughRoute, ProviderKey,
+    PassthroughRoute, ProviderKey, TokenCounting,
 };
 use aisix_etcd::{kv_client, CallError, LazyEtcdClient};
 use etcd_client::GetOptions;
@@ -377,6 +377,25 @@ impl ConfigStore for EtcdConfigStore {
     async fn list_a2a_agents(&self) -> Result<Vec<ResourceEntry<A2aAgent>>, StoreError> {
         Ok(self
             .list_range::<A2aAgent>(A2A_AGENTS_SUBKEY)
+            .await?
+            .into_iter()
+            .map(|(id, v, rev)| ResourceEntry::new(id, v, rev))
+            .collect())
+    }
+
+    async fn get_token_counting(
+        &self,
+        id: &str,
+    ) -> Result<Option<ResourceEntry<TokenCounting>>, StoreError> {
+        let key = self.key_for("token_counting", id);
+        Ok(self
+            .get_one::<TokenCounting>(&key)
+            .await?
+            .map(|(v, rev)| ResourceEntry::new(id, v, rev)))
+    }
+    async fn list_token_counting(&self) -> Result<Vec<ResourceEntry<TokenCounting>>, StoreError> {
+        Ok(self
+            .list_range::<TokenCounting>("token_counting")
             .await?
             .into_iter()
             .map(|(id, v, rev)| ResourceEntry::new(id, v, rev))

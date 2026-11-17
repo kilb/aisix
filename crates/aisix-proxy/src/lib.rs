@@ -114,6 +114,7 @@ mod stream_metadata_tests;
 mod stream_timeout;
 #[cfg(test)]
 mod test_log;
+mod token_counting;
 mod token_estimate;
 mod unread_body;
 mod unsized_audio;

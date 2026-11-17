@@ -15,7 +15,7 @@ use aisix_core::resource::ResourceEntry;
 use aisix_core::snapshot::{ResourceTable, SnapshotHandle};
 use aisix_core::{
     A2aAgent, AisixSnapshot, ApiKey, CachePolicy, Guardrail, McpServer, Model,
-    ObservabilityExporter, PassthroughRoute, ProviderKey,
+    ObservabilityExporter, PassthroughRoute, ProviderKey, TokenCounting,
 };
 
 use crate::store::{ConfigStore, StoreError};
@@ -70,6 +70,7 @@ macro_rules! impl_file_managed_store {
 }
 
 impl_file_managed_store! {
+    { TokenCounting, token_counting, get_token_counting, list_token_counting }
     { Model, models, get_model, list_models }
     { ApiKey, apikeys, get_apikey, list_apikeys }
     { ProviderKey, provider_keys, get_provider_key, list_provider_keys }

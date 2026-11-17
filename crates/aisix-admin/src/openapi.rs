@@ -2044,6 +2044,10 @@ const SCALAR_HTML: &str = r#"<!DOCTYPE html>
 /// schemas must exist before this crate compiles.
 const RESOURCE_SCHEMAS: &[(&str, &str)] = &[
     (
+        "TokenCounting",
+        include_str!("../../../schemas/resources/token_counting.schema.json"),
+    ),
+    (
         "Model",
         include_str!("../../../schemas/resources/model.schema.json"),
     ),
@@ -2131,6 +2135,39 @@ pub(crate) fn merged_openapi() -> &'static str {
             }
 
             doc["components"]["schemas"][*name] = schema;
+        }
+
+        doc["components"]["schemas"]["TokenCountingEntry"] = serde_json::json!({
+            "type": "object",
+            "required": ["id", "value", "revision"],
+            "properties": {
+                "id": {"type":"string", "description":"Resource ID."},
+                "value": {"$ref":"#/components/schemas/TokenCounting", "description":"Fixed token counting settings."},
+                "revision": {"type":"integer", "description":"Resource revision."}
+            }
+        });
+        doc["tags"].as_array_mut().expect("OpenAPI tags array").push(serde_json::json!({"name":"Token Counting", "description":"Fixed accounts for free token counting requests."}));
+        for (path, single) in [("/admin/v1/token_counting", false), ("/admin/v1/token_counting/{id}", true)] {
+            let schema = if single {
+                serde_json::json!({"$ref":"#/components/schemas/TokenCountingEntry"})
+            } else {
+                serde_json::json!({"type":"array", "items":{"$ref":"#/components/schemas/TokenCountingEntry"}})
+            };
+            let mut operation = serde_json::json!({
+                "summary": if single { "Get token counting settings" } else { "List token counting settings" },
+                "description": "Inspect the environment's fixed accounts for free token counting requests.",
+                "tags": ["Token Counting"],
+                "security": [{"AdminBearer":[]}],
+                "responses": {"200":{"description":"Token counting settings.", "content":{"application/json":{"schema":schema}}}}
+            });
+            for (status, description) in [("401", "Missing or invalid admin key"), ("500", "Configuration store operation failed")] {
+                operation["responses"][status] = serde_json::json!({"description":description, "content":{"application/json":{"schema":{"$ref":"#/components/schemas/AdminError"}}}});
+            }
+            if single {
+                operation["responses"]["404"] = serde_json::json!({"description":"Resource not found", "content":{"application/json":{"schema":{"$ref":"#/components/schemas/AdminError"}}}});
+                operation["parameters"] = serde_json::json!([{"name":"id", "in":"path", "required":true, "description":"Token counting resource ID.", "example":"env", "schema":{"type":"string"}}]);
+            }
+            doc["paths"][path] = serde_json::json!({"get":operation});
         }
 
         // Rewrite `$ref: #/definitions/X` → `$ref: #/components/schemas/X`
@@ -2671,6 +2708,8 @@ mod tests {
             "/admin/v1/mcp_servers/{id}",
             "/admin/v1/a2a_agents",
             "/admin/v1/a2a_agents/{id}",
+            "/admin/v1/token_counting",
+            "/admin/v1/token_counting/{id}",
             "/admin/v1/passthrough_routes",
             "/admin/v1/passthrough_routes/{id}",
             "/admin/v1/guardrails",
@@ -2758,6 +2797,8 @@ mod tests {
             "/admin/v1/mcp_servers/{id}",
             "/admin/v1/a2a_agents",
             "/admin/v1/a2a_agents/{id}",
+            "/admin/v1/token_counting",
+            "/admin/v1/token_counting/{id}",
             "/admin/v1/passthrough_routes",
             "/admin/v1/passthrough_routes/{id}",
             "/admin/v1/guardrails",

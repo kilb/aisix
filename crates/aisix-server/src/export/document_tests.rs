@@ -2006,3 +2006,119 @@ fn api_keys_sharing_a_display_name_fall_back_to_hash_names() {
         doc.warnings
     );
 }
+
+#[test]
+fn token_counting_references_survive_export_reload() {
+    let snap = AisixSnapshot::new();
+    snap.provider_keys.insert(ResourceEntry::new(
+        "pk",
+        serde_json::from_value(
+            json!({"display_name":"counter", "provider":"anthropic", "api_key":"local-only"}),
+        )
+        .unwrap(),
+        1,
+    ));
+    snap.models.insert(ResourceEntry::new("m", model_value(json!({
+        "display_name":"source", "provider":"anthropic", "model_name":"claude-v1", "provider_key_id":"pk"
+    })), 1));
+    let settings: aisix_core::models::TokenCounting = serde_json::from_value(json!({
+        "messages_count_tokens":{"provider_key_id":"pk", "model_mappings":[{
+            "model_id":"m", "source_model_name":"claude-v1", "model_name":"claude-v1"
+        }]}
+    }))
+    .unwrap();
+    snap.token_counting
+        .insert(ResourceEntry::new("env", settings, 1));
+    let doc = build_export_document(&snap, true);
+    let exported = find(&doc, "token_counting");
+    assert_eq!(exported.len(), 1);
+    assert_eq!(
+        exported[0]["messages_count_tokens"]["provider_key"],
+        "counter"
+    );
+    assert_eq!(
+        exported[0]["messages_count_tokens"]["model_mappings"][0]["model"],
+        "source"
+    );
+    assert!(doc.blocking.is_empty(), "{:?}", doc.blocking);
+    let file = serde_json::to_string(&json!({
+        "_format_version":"1",
+        "provider_keys": find(&doc,"provider_keys"),
+        "models":find(&doc,"models"),
+        "token_counting":exported,
+    }))
+    .unwrap();
+    let loaded = aisix_core::filesource::load_from_str(&file, "export.json", 2, &|_| None).unwrap();
+    let target = loaded.token_counting.entries()[0]
+        .value
+        .messages_count_tokens
+        .clone()
+        .unwrap();
+    assert_eq!(
+        target.provider_key_id,
+        aisix_core::filesource::derive_id("provider_keys", "counter")
+    );
+    assert_eq!(
+        target.model_mappings[0].model_id,
+        aisix_core::filesource::derive_id("models", "source")
+    );
+    assert_eq!(target.model_mappings[0].source_model_name, "claude-v1");
+}
+
+#[test]
+fn token_counting_export_blocks_targets_that_file_mode_cannot_load() {
+    for (provider, display_name, version) in [
+        ("anthropic", "source", "changed-version"),
+        ("anthropic", "source-*", "v1"),
+        ("openai", "source", "v1"),
+    ] {
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(ResourceEntry::new(
+            "pk",
+            serde_json::from_value(json!({
+                "display_name":"counter", "provider":provider, "api_key":"local-only"
+            }))
+            .unwrap(),
+            1,
+        ));
+        snap.models.insert(ResourceEntry::new("m", model_value(json!({
+            "display_name":display_name, "provider":"anthropic", "model_name":version, "provider_key_id":"pk"
+        })), 1));
+        snap.token_counting.insert(ResourceEntry::new(
+            "env",
+            serde_json::from_value::<aisix_core::TokenCounting>(json!({
+                "messages_count_tokens":{"provider_key_id":"pk", "model_mappings":[{
+                    "model_id":"m", "source_model_name":"v1", "model_name":"counter-v1"
+                }]}
+            }))
+            .unwrap(),
+            1,
+        ));
+        let document = build_export_document(&snap, true);
+        assert!(
+            !document.blocking.is_empty(),
+            "{provider}/{display_name}/{version}"
+        );
+    }
+}
+
+#[test]
+fn token_counting_export_blocks_valid_embedding_source_models() {
+    let snap = AisixSnapshot::new();
+    snap.provider_keys.insert(ResourceEntry::new(
+        "pk",
+        serde_json::from_value(
+            json!({"display_name":"counter", "provider":"openai", "api_key":"local-only"}),
+        )
+        .unwrap(),
+        1,
+    ));
+    let source = json!({"display_name":"source", "provider":"openai", "model_name":"embedding-v1", "provider_key_id":"pk", "embedding":{"dimensions":1536}});
+    aisix_core::models::validate_model(&source).unwrap();
+    snap.models
+        .insert(ResourceEntry::new("m", model_value(source), 1));
+    snap.token_counting.insert(ResourceEntry::new("env", serde_json::from_value::<aisix_core::TokenCounting>(json!({
+        "responses_input_tokens":{"provider_key_id":"pk", "model_mappings":[{"model_id":"m", "source_model_name":"embedding-v1", "model_name":"counter-v1"}]}
+    })).unwrap(), 1));
+    assert!(!build_export_document(&snap, true).blocking.is_empty());
+}

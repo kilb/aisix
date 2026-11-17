@@ -1236,6 +1236,7 @@ fn every_refused_model_reference_id_is_a_declared_field() {
 
     // (resources-file collection, the resource whose schema declares it)
     for (kind, resource) in [
+        ("token_counting", "token_counting"),
         ("api_keys", "api_key"),
         ("models", "model"),
         ("cache_policies", "cache_policy"),
@@ -1254,7 +1255,11 @@ fn every_refused_model_reference_id_is_a_declared_field() {
                 "{kind} refuses `{id_field}`, which the {resource} schema does not declare"
             );
             assert!(
-                declares(&schema, name_field),
+                // 计数映射只持久化 ID；model 是文件源专用的名称简写。
+                declares(&schema, name_field)
+                    || (kind == "token_counting"
+                        && id_field == "model_id"
+                        && name_field == "model"),
                 "{kind} rewrites `{id_field}` to `{name_field}`, which the {resource} schema \
                  does not declare"
             );
@@ -1699,6 +1704,11 @@ const UNKNOWN_FIELD_TOLERANCE: &[Probe] = &[
                    "match": [{"claim": "sub", "op": "exact", "values": ["a"]}],
                    "resolve": {"api_key_id": "k"}})
         },
+    },
+    Probe {
+        resource: "token_counting",
+        pointer: "/messages_count_tokens/model_mappings/0",
+        document: || json!({"messages_count_tokens":{"provider_key_id":"pk", "model_mappings":[{"model_id":"m", "source_model_name":"v1", "model_name":"v1"}]}}),
     },
     Probe {
         resource: "mcp_auth_settings",
