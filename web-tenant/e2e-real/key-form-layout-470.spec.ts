@@ -109,6 +109,9 @@ for (const width of [1440, 390]) {
       await options.last().uncheck();
       await wanted.check();
       await expect(wanted).toBeChecked();
+      // 移开鼠标，避免悬停底色掩盖选中底色缺失的回归。
+      await page.mouse.move(0, 0);
+      await page.evaluate(() => new Promise(resolveFrame => requestAnimationFrame(() => requestAnimationFrame(resolveFrame))));
       const choiceBackground = await wanted.evaluate(input => getComputedStyle(input.closest("label")!).backgroundColor);
       const emptyBackground = await options.last().evaluate(input => getComputedStyle(input.closest("label")!).backgroundColor);
       expect(choiceBackground, "selected models retain a distinct soft fill").not.toBe(emptyBackground);
