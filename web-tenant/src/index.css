@@ -14,6 +14,7 @@
 @import "./components/metrics.css" layer(legacy);
 @import "./usage.css" layer(legacy);
 @import "./tenant-domain.css" layer(legacy);
+@import "./components/card-palette.css";
 
 /* Dark is a choice the viewer makes with the toggle (<html data-theme>),
    never the system setting. */

@@ -1,0 +1,31 @@
+/* 用户数据卡片沿用当前主题表面；费用偏暖、成功率偏绿，避免整块紫色或黑色抢占层级。 */
+.shell-content .bento-card:is([data-tone="lilac"], [data-tone="lime"], [data-tone="ink"], [data-tone="inverse"]) {
+  --well: var(--bento-well);
+  --stone: var(--bento-stone);
+  --fg-inverse: var(--bento-fg-inverse);
+  --foreground: var(--bento-ink);
+  --card-foreground: var(--bento-ink);
+  --ink-soft: var(--bento-ink-soft);
+  --muted-foreground: var(--bento-muted);
+  --text-2: var(--bento-ink-soft);
+  --text-muted: var(--bento-muted);
+  --border: var(--bento-line);
+  --tint: color-mix(in srgb, var(--bento-ink) 5%, transparent);
+  --tint-strong: color-mix(in srgb, var(--bento-ink) 9%, transparent);
+  --tone-bg: var(--card);
+  --ring: var(--info);
+  border-color: var(--border);
+  box-shadow: var(--shadow-card);
+}
+
+.shell-content .bento-card[data-tone="lilac"] {
+  --card: color-mix(in srgb, var(--chart-2) 4%, var(--bento-surface));
+}
+
+.shell-content .bento-card:is([data-tone="ink"], [data-tone="inverse"]) {
+  --card: color-mix(in srgb, var(--chart-2) 8%, var(--bento-surface));
+}
+
+.shell-content .bento-card[data-tone="lime"] {
+  --card: color-mix(in srgb, var(--success) 7%, var(--bento-surface));
+}
