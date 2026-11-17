@@ -33,7 +33,11 @@ test.afterAll(async () => {
     await Promise.all([stack.cpDatabase, stack.cpDatabase.replace(/^cp_/, "kine_")].map(async (database) => {
       const url = new URL(pgUrl);
       url.pathname = `/${database}`;
-      await promisify(execFile)("pg_dump", ["--format=custom", `--file=${join(backupDir, `${database}.dump`)}`, url.toString()], { timeout: 30_000 });
+      try {
+        await promisify(execFile)("pg_dump", ["--format=custom", `--file=${join(backupDir, `${database}.dump`)}`, url.toString()], { timeout: 30_000 });
+      } catch (_error: unknown) {
+        throw new Error(`pg_dump failed for test database ${database}`);
+      }
     }));
   }
   await stack?.stop();
