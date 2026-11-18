@@ -1179,7 +1179,12 @@ pub async fn send_unobserved(
 ) -> Result<reqwest::Response, reqwest::Error> {
     let (client, request) = req.build_split();
     let request = request?;
-    crate::response_tap::note_http_dispatch();
+    crate::response_tap::note_http_dispatch_to(|| {
+        (
+            request.url().scheme(),
+            &request.url()[url::Position::BeforeHost..url::Position::BeforePath],
+        )
+    });
     client.execute(request).await
 }
 
@@ -1203,7 +1208,12 @@ pub async fn send(
         observer.begin_request_body();
         observer.finish_request();
     }
-    crate::response_tap::note_http_dispatch();
+    crate::response_tap::note_http_dispatch_to(|| {
+        (
+            request.url().scheme(),
+            &request.url()[url::Position::BeforeHost..url::Position::BeforePath],
+        )
+    });
     if let Some(timing) = observer.http_timing_observer() {
         timing.with_timing(|timing| timing.samples.http_send_started_ms = timing.now());
     }

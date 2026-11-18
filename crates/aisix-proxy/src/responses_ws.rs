@@ -235,6 +235,10 @@ pub(crate) async fn send_native(
     };
     let (client, built) = request.build_split();
     let request = built.map_err(|e| crate::dispatch::reqwest_error_to_bridge(&e, started))?;
+    aisix_gateway::response_tap::note_websocket_origin(
+        request.url().scheme(),
+        &request.url()[url::Position::BeforeHost..url::Position::BeforePath],
+    );
     let mut event: Value = request
         .body()
         .and_then(reqwest::Body::as_bytes)

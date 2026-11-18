@@ -519,6 +519,9 @@ async fn connect_upstream_within(
     let (back, mut handed_back) = tokio::sync::oneshot::channel();
     let dial = async {
         let uri = request.uri();
+        if let (Some(scheme), Some(authority)) = (uri.scheme_str(), uri.authority()) {
+            aisix_gateway::response_tap::note_websocket_origin(scheme, authority.as_str());
+        }
         let secure = match uri.scheme_str() {
             Some("wss") => true,
             Some("ws") => false,

@@ -34,6 +34,7 @@
 //!      (`.internal`, `.local` per RFC 6762, `.localhost` per RFC 6761,
 //!      `.home.arpa` per RFC 8375, and the `.svc` names of a Kubernetes
 //!      cluster). A public host such as a provider's documentation link stays.
+//!    - 平台当前尝试所连接的上游来源上的完整链接。调用方的其他公共链接仍可用于排查输入。
 //!    - A bearer token (`Bearer <token>`, RFC 6750 §2.1), and keys whose
 //!      prefix names them: `sk-` (the OpenAI and Anthropic key shape, as in
 //!      the OpenAI 401 fixture in `aisix-provider-openai`), AWS access key
@@ -69,6 +70,9 @@ static GCP_PROJECT: LazyLock<Regex> =
     LazyLock::new(|| re(r#"(\bprojects/|[?&]project=)[^/\s"'?#&,;`]+|(\bin project )[0-9]+\b"#));
 static URL_AUTHORITY: LazyLock<Regex> =
     LazyLock::new(|| re(r#"(?i)\b(https?|wss?)://([^/\s"'?#<>\\]+)"#));
+// 错误里的完整链接可能带运营方部署名或查询参数，不能只掩盖主机。
+static ERROR_URL: LazyLock<Regex> =
+    LazyLock::new(|| re(r#"(?i)\b(?:https?|wss?)://[^\s"'<>\\`]+"#));
 static BEARER: LazyLock<Regex> = LazyLock::new(|| re(r"(?i)\b(bearer\s+)([A-Za-z0-9._~+/-]+=*)"));
 static PREFIXED_KEY: LazyLock<Regex> = LazyLock::new(|| {
     re(r"\b(?:sk-[A-Za-z0-9_-]{16,}|A[KS]IA[0-9A-Z]{16}\b|ya29\.[A-Za-z0-9_.-]{8,})")
@@ -84,6 +88,26 @@ fn re(pattern: &str) -> Regex {
 /// leave half a credential that no longer matches.
 pub fn scrub_upstream_error_text(text: &str) -> String {
     let mut text = text.to_owned();
+    if text.contains("://") {
+        if let Some(origin) = crate::response_tap::active_upstream_origin() {
+            text = ERROR_URL
+                .replace_all(&text, |c: &Captures<'_>| {
+                    let link = &c[0];
+                    let candidate = link.trim_end_matches(['.', ',', ';', ':', '!', '?', ')', '}']);
+                    if url::Url::parse(candidate).is_ok_and(|url| {
+                        crate::response_tap::origin_id(
+                            url.scheme(),
+                            &url[url::Position::BeforeHost..url::Position::BeforePath],
+                        ) == origin
+                    }) {
+                        format!("{REDACTED}{}", &link[candidate.len()..])
+                    } else {
+                        link.to_owned()
+                    }
+                })
+                .into_owned();
+        }
+    }
     for needle in credential_needles() {
         if text.contains(needle.as_str()) {
             text = text.replace(needle.as_str(), REDACTED);
@@ -219,6 +243,28 @@ fn is_internal_host(host_port: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn platform_only_scrubs_urls_from_the_connected_upstream() {
+        let tap = std::sync::Arc::new(crate::response_tap::ResponseHeaderTap::default());
+        tap.track_upstream_origin();
+        let input = "https://API.EXAMPLE.ORG:443/route?id=1, https://api.example.org:444/file.";
+        let want = "<redacted>, https://api.example.org:444/file.";
+        crate::response_tap::sync_scope(&tap, || {
+            crate::response_tap::note_http_dispatch_to(|| ("https", "api.example.org"));
+            assert_eq!(scrub_upstream_error_text(input), want);
+            crate::response_tap::sync_scope(&crate::response_tap::detached(), || {
+                assert_eq!(scrub_upstream_error_text(input), want);
+            });
+            crate::response_tap::note_http_dispatch_to(|| ("http", "127.0.0.1:8111"));
+            assert_eq!(
+                scrub_upstream_error_text("http://127.0.0.1:8111/route."),
+                "<redacted>."
+            );
+            assert_eq!(scrub_upstream_error_text(input), input);
+        });
+        assert_eq!(scrub_upstream_error_text(input), input);
+    }
 
     fn with_sent<T>(credentials: &[&str], f: impl FnOnce() -> T) -> T {
         let tap = std::sync::Arc::new(crate::response_tap::ResponseHeaderTap::new(

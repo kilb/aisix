@@ -903,10 +903,14 @@ impl RequestAttribution {
             counts_as_llm: self.counts_as_llm,
             dispatch: std::sync::atomic::AtomicU8::new(DISPATCH_UNRECORDED),
         }
+        .in_platform_mode(self.platform)
     }
 
     /// This cell, for a request the gateway serves in platform mode when `on`.
     pub(crate) fn in_platform_mode(mut self, on: bool) -> Self {
+        if on {
+            self.response_tap.track_upstream_origin();
+        }
         self.platform = on;
         self
     }

@@ -14,6 +14,8 @@
 //! for about a failed call, and an error response carries no body id.
 
 use std::collections::BTreeMap;
+use std::hash::{DefaultHasher, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -233,6 +235,8 @@ pub struct ResponseHeaderTap {
     /// caller's request, for [`crate::upstream_error_scrub`]. Kept across
     /// attempts: an error a fallback relays may quote an earlier one.
     sent_credentials: Mutex<Vec<String>>,
+    /// 0 表示独立部署，1 表示尚未派发；其余值只标识当前上游，不保存 URL。
+    upstream_origin: AtomicU64,
     /// See [`note_served_input_tokens`].
     served_input_tokens: Mutex<Option<u32>>,
 }
@@ -256,7 +260,21 @@ impl ResponseHeaderTap {
             request_id,
             latest: Mutex::default(),
             sent_credentials: Mutex::default(),
+            upstream_origin: AtomicU64::default(),
             served_input_tokens: Mutex::default(),
+        }
+    }
+
+    /// 平台模式将本次请求实际访问过的上游地址从错误文字中移除。
+    pub fn track_upstream_origin(&self) {
+        self.upstream_origin.store(1, Ordering::Relaxed);
+    }
+
+    fn note_origin<'a>(&self, origin: impl FnOnce() -> (&'a str, &'a str)) {
+        if self.upstream_origin.load(Ordering::Relaxed) != 0 {
+            let (scheme, authority) = origin();
+            self.upstream_origin
+                .store(origin_id(scheme, authority), Ordering::Relaxed);
         }
     }
 
@@ -384,6 +402,14 @@ pub fn note_http_dispatch() {
     let _ = TAP.try_with(|tap| tap.lock().http_dispatched = true);
 }
 
+/// 与原派发标记共用任务上下文和锁；平台的成功请求只处理现有 URI 的借用切片。
+pub fn note_http_dispatch_to<'a>(origin: impl FnOnce() -> (&'a str, &'a str)) {
+    let _ = TAP.try_with(|tap| {
+        tap.lock().http_dispatched = true;
+        tap.note_origin(origin);
+    });
+}
+
 /// Install `tap` for everything `fut` does.
 pub fn scope<F: std::future::Future>(
     tap: Arc<ResponseHeaderTap>,
@@ -485,6 +511,40 @@ pub fn note_sent_credential(value: &str) {
     });
 }
 
+/// WebSocket 复用或建立连接时也记录本轮实际来源，不读取协议内容。
+pub fn note_websocket_origin(scheme: &str, authority: &str) {
+    let _ = TAP.try_with(|tap| tap.note_origin(|| (scheme, authority)));
+}
+
+pub(crate) fn active_upstream_origin() -> Option<u64> {
+    TAP.try_with(|tap| tap.upstream_origin.load(Ordering::Relaxed))
+        .ok()
+        .filter(|id| *id > 1)
+}
+
+/// URI 已由相应传输解析。忽略用户信息和默认端口；WebSocket 使用 HTTP 升级。
+pub(crate) fn origin_id(scheme: &str, authority: &str) -> u64 {
+    let secure = scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("wss");
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    let authority = authority
+        .strip_suffix(if secure { ":443" } else { ":80" })
+        .unwrap_or(authority);
+    let mut hasher = DefaultHasher::new();
+    hasher.write_u8(u8::from(secure));
+    for part in authority.as_bytes().chunks(64) {
+        if part.iter().any(u8::is_ascii_uppercase) {
+            let mut folded = [0u8; 64];
+            let slice = &mut folded[..part.len()];
+            slice.copy_from_slice(part);
+            slice.make_ascii_lowercase();
+            hasher.write(slice);
+        } else {
+            hasher.write(part);
+        }
+    }
+    hasher.finish().max(2)
+}
+
 /// A tap for work the request hands to a task of its own (a realtime session
 /// after its upgrade): the request's id and the credentials it noted, so that
 /// an error read there is scrubbed as one read on the request would be.
@@ -496,6 +556,9 @@ pub fn detached() -> Arc<ResponseHeaderTap> {
     *tap.sent_credentials
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = sent_credentials();
+    if let Ok(origin) = TAP.try_with(|parent| parent.upstream_origin.load(Ordering::Relaxed)) {
+        tap.upstream_origin.store(origin, Ordering::Relaxed);
+    }
     Arc::new(tap)
 }
 

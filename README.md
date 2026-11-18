@@ -227,6 +227,19 @@ Plus specialized handling for vendor quirks (e.g. DeepSeek reasoning content) an
 **rerank / embeddings** vendors (Cohere, Jina). Details in
 [adapter protocol families](https://docs.api7.ai/ai-gateway/providers/adapters).
 
+### Refusals and errors on public model routes
+
+When `proxy.platform.enabled` is set, a public model can route across accounts. Clients can distinguish these outcomes in both buffered replies and streams.
+
+| Outcome | What the client receives |
+|---|---|
+| The model declines to answer | A successful reply can contain ordinary assistant text, a structured `refusal`, or a refusal stop reason. The gateway preserves the model's answer. |
+| The upstream rejects the caller's request | An upstream speaking the client's protocol can return its own `400`, `413` or `422` diagnostic, including the error code and parameter where supplied. A URL pointing at the serving upstream is redacted. Links to other public origins, such as a caller's file, remain available for troubleshooting. |
+| The serving account has exhausted its balance or reached its spend limit | The gateway reports `503` with code `upstream_unavailable`. The account's billing details stay private. |
+| A translated upstream call or another upstream failure ends the request | The gateway returns its own error class. A stream that has already started reports the failure in its protocol's error event. |
+
+Clients can use the protocol's explicit refusal or error fields to distinguish these cases. [OpenAI refusal fields](https://developers.openai.com/api/docs/guides/structured-outputs) · [Anthropic stop reasons](https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons)
+
 ## ☁️ Choose an AISIX Product
 
 Same gateway binary, same proxy API — in every form the gateway runs in your environment.

@@ -83,6 +83,18 @@ fn app(upstream: &MockServer, kind: Upstream, platform: bool) -> axum::Router {
 /// [`app`], with a block-capable output guardrail that holds a stream back
 /// whole when `held`. Its keyword is in no answer here.
 fn app_with(upstream: &MockServer, kind: Upstream, platform: bool, held: bool) -> axum::Router {
+    app_at(upstream, kind, platform, held, &upstream.uri())
+}
+
+const TEST_UPSTREAM_HOST: &str = "provider.example.org";
+
+fn app_at(
+    upstream: &MockServer,
+    kind: Upstream,
+    platform: bool,
+    held: bool,
+    api_base: &str,
+) -> axum::Router {
     let (provider, adapter, model_name, secret) = match kind {
         Upstream::OpenAi => ("openai", "openai", "gpt-4o", SECRET.to_string()),
         Upstream::Anthropic => (
@@ -104,7 +116,7 @@ fn app_with(upstream: &MockServer, kind: Upstream, platform: bool, held: bool) -
     let pk: aisix_core::ProviderKey = serde_json::from_value(json!({
         "display_name": "relay-up",
         "secret": secret,
-        "api_base": upstream.uri(),
+        "api_base": api_base,
         "provider": provider,
         "adapter": adapter,
     }))
@@ -136,7 +148,11 @@ fn app_with(upstream: &MockServer, kind: Upstream, platform: bool, held: bool) -
         crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-held", row, 1));
     }
 
-    let client = aisix_gateway::client_builder().no_proxy().build().unwrap();
+    let client = aisix_gateway::client_builder()
+        .no_proxy()
+        .resolve(TEST_UPSTREAM_HOST, *upstream.address())
+        .build()
+        .unwrap();
     let hub = Arc::new(Hub::new());
     hub.register_specialized(
         "openai",
@@ -248,6 +264,98 @@ fn sse_payloads(text: &str) -> Vec<(Option<String>, Value)> {
 }
 
 // ── buffered: one native request error per family ──────────────────────────
+
+/// 上游地址和调用方资源同时出现在错误里时，调用方仍可定位失败的输入。
+#[tokio::test]
+async fn platform_request_error_only_hides_the_serving_upstream_url() {
+    let server = MockServer::builder().start().await;
+    let asset = "https://files.example.org/customer/image.png";
+    let origin = format!("http://{TEST_UPSTREAM_HOST}:{}", server.address().port());
+    let endpoint = format!("{origin}/deployment/route-108?revision=42");
+    let message = format!("Invalid image URL {asset} at {endpoint}.");
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(openai_error(
+            &message,
+            "invalid_request_error",
+            Some("image_url"),
+            Some("invalid_image_url"),
+        )))
+        .mount(&server)
+        .await;
+    for (platform, shown) in [(true, REDACTED), (false, endpoint.as_str())] {
+        let (status, body) = post(
+            app_at(&server, Upstream::OpenAi, platform, false, &origin),
+            "/v1/chat/completions",
+            chat_body(false),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let error = &serde_json::from_str::<Value>(&body).unwrap()["error"];
+        assert_eq!(
+            error["message"],
+            format!("Invalid image URL {asset} at {shown}.")
+        );
+        assert_eq!(error["code"], "invalid_image_url");
+        assert_eq!(error["param"], "image_url");
+        if platform {
+            assert_eq!(error["type"], "invalid_request_error");
+        }
+    }
+}
+
+#[tokio::test]
+async fn platform_keeps_model_refusal_text_and_hides_the_same_url_in_stream_errors() {
+    let server = MockServer::builder().start().await;
+    let origin = format!("http://{TEST_UPSTREAM_HOST}:{}", server.address().port());
+    let link = format!("{origin}/route-108");
+    let refusal = format!("I cannot provide this attachment. See {link}.");
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::body_partial_json(
+            json!({"stream":true}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            format!(
+                "data: {}\n\ndata: [DONE]\n\n",
+                openai_error(
+                    &format!("Invalid image URL at {link}."),
+                    "invalid_request_error",
+                    Some("image_url"),
+                    Some("invalid_image_url")
+                )
+            ),
+            "text/event-stream",
+        ))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id":"model-reply", "object":"chat.completion", "created":1, "model":"gpt-4o",
+            "choices":[{"index":0,"message":{"role":"assistant","content":null,"refusal":refusal},
+                "finish_reason":"stop"}]
+        })))
+        .with_priority(6)
+        .mount(&server)
+        .await;
+    let app = app_at(&server, Upstream::OpenAi, true, false, &origin);
+    let (status, body) = post(app.clone(), "/v1/chat/completions", chat_body(false)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["choices"][0]["message"]["refusal"],
+        refusal
+    );
+    let (status, body) = post(app, "/v1/chat/completions", chat_body(true)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let frames = sse_payloads(&body);
+    let error = frames
+        .iter()
+        .find_map(|(_, value)| value.get("error"))
+        .unwrap();
+    assert_eq!(
+        error["message"],
+        format!("Invalid image URL at {REDACTED}.")
+    );
+    assert_eq!(error["code"], "invalid_image_url");
+}
 
 /// An OpenAI-shape context overflow on chat reaches the caller with the
 /// upstream's own status, type, code, param and message: what the OpenAI SDK
