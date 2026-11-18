@@ -8,6 +8,7 @@
 //! https://docs.vllm.ai/en/v0.33.0/features/reasoning_outputs/
 //! added/done 正文与后续 delta 共同组成可见输出：
 //! https://github.com/openai/openai-python/blob/141a89aa7fbb7f13a979bda930831a5fe38bc3a4/src/openai/lib/streaming/responses/_responses.py#L397-L430
+//! 客户端工具搜索可携带非空对象参数，见 https://developers.openai.com/api/docs/guides/tools-tool-search
 
 use std::time::Instant;
 
@@ -139,6 +140,9 @@ fn response_item_has_content(item: &Value) -> bool {
                 || response_parts_have_content(&item["content"])
         }
         Some("function_call" | "mcp_call") => nonempty(&item["arguments"]),
+        Some("tool_search_call") => item["arguments"]
+            .as_object()
+            .is_some_and(|args| !args.is_empty()),
         Some("custom_tool_call") => nonempty(&item["input"]),
         Some("code_interpreter_call") => nonempty(&item["code"]),
         _ => false,
@@ -358,6 +362,8 @@ mod tests {
             json!({"type":"response.output_item.added","item":{"type":"function_call","name":"tool","arguments":"{}"}}),
             json!({"type":"response.output_item.done","item":{"type":"custom_tool_call","name":"apply_patch","input":"patch"}}),
             json!({"type":"response.output_item.done","item":{"type":"mcp_call","name":"tool","arguments":"{}"}}),
+            json!({"type":"response.output_item.added","item":{"type":"tool_search_call","arguments":{"goal":"find a tool"}}}),
+            json!({"type":"response.output_item.done","item":{"type":"tool_search_call","arguments":{"goal":"find a tool"}}}),
             json!({"type":"response.output_item.done","item":{"type":"code_interpreter_call","code":"print(1)"}}),
         ] {
             let mut observer = Observer::new(Wire::Responses, Instant::now());
@@ -381,6 +387,7 @@ mod tests {
             json!({"type":"response.mcp_call_arguments.done","arguments":"{}"}),
             json!({"type":"response.code_interpreter_call_code.done","code":"print(1)"}),
             json!({"type":"response.completed","response":{"output":[{"type":"message","content":[{"type":"output_text","text":"first"}]}]}}),
+            json!({"type":"response.completed","response":{"output":[{"type":"tool_search_call","arguments":{"goal":"find a tool"}}]}}),
         ] {
             let mut observer = Observer::new(Wire::Responses, Instant::now());
             observer.feed(&event(value.clone()));
@@ -396,6 +403,8 @@ mod tests {
         for value in [
             json!({"type":"response.content_part.added","part":{"type":"output_text","text":""}}),
             json!({"type":"response.output_item.added","item":{"type":"function_call","name":"tool","arguments":""}}),
+            json!({"type":"response.output_item.added","item":{"type":"tool_search_call","arguments":{}}}),
+            json!({"type":"response.completed","response":{"output":[{"type":"tool_search_call","arguments":{}},{"type":"other","arguments":{"goal":"unrelated"}}]}}),
             json!({"type":"response.output_item.done","item":{"type":"reasoning","encrypted_content":"opaque","summary":[]}}),
             json!({"type":"response.output_text.done","text":""}),
             json!({"type":"response.completed","response":{"output":[],"usage":{"output_tokens":1}}}),

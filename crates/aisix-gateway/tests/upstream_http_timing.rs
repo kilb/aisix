@@ -2,7 +2,7 @@ use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aisix_core::usage_io::UpstreamTiming;
+use aisix_core::usage_io::{TextMeasurement, UpstreamTiming};
 use aisix_gateway::response_tap::{self, HttpTimingObserver, ResponseHeaderTap};
 use aisix_gateway::upstream_io::{self, Protocol};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -381,6 +381,79 @@ async fn raw_content_requires_a_complete_valid_nonempty_generated_event() -> Tes
         },
     ))
     .await?;
+    Ok(())
+}
+
+// 工具搜索首轮可以只交付结构化参数，首内容时钟与已有的文本长度口径独立。
+#[tokio::test]
+async fn responses_tool_search_arguments_start_the_upstream_content_clock() -> TestResult {
+    let cases = [
+        (
+            r#"{"type":"response.output_item.added","item":{"type":"tool_search_call","arguments":{}}}"#,
+            false,
+            false,
+        ),
+        (
+            r#"{"type":"response.output_item.done","item":{"type":"tool_search_call","arguments":[{"goal":"inside array"}]}}"#,
+            false,
+            false,
+        ),
+        (
+            r#"{"type":"response.output_item.done","item":{"type":"tool_search_call","arguments":{"goal":"find shipping"}}}"#,
+            true,
+            false,
+        ),
+        (
+            r#"{"type":"response.output_item.added","item":{"arguments":{"goal":"find shipping"},"type":"tool_search_call"}}"#,
+            true,
+            false,
+        ),
+        (
+            r#"{"type":"response.completed","response":{"output":[{"arguments":{"goal":"find shipping"},"type":"tool_search_call"}]}}"#,
+            true,
+            true,
+        ),
+        (
+            r#"{"type":"response.completed","response":{"output":[{"type":"tool_search_call","arguments":{}},{"type":"future_item","arguments":{"goal":"other item"}}]}}"#,
+            false,
+            true,
+        ),
+    ];
+    for (event, has_content, terminal_snapshot) in cases {
+        let body = format!("data: {event}\n\n");
+        let server = server(Some(headers(body.len())), Duration::ZERO).await?;
+        let tap = tap();
+        tap.begin_attempt(Instant::now());
+        let response = response_tap::scope(Arc::clone(&tap), async {
+            TestResult::Ok(
+                upstream_io::send(client()?.get(&server.url), Protocol::Responses).await?,
+            )
+        })
+        .await?;
+        server.body.send(body.clone().into_bytes())?;
+        assert_eq!(response.bytes().await?.as_ref(), body.as_bytes());
+        let audit = tap.capture().io.ok_or("missing I/O observer")?.snapshot();
+        assert_eq!(audit.response_body_bytes, Some(body.len() as u64));
+        assert!(audit.response_complete);
+        assert_eq!(
+            audit.output_text,
+            terminal_snapshot.then_some(TextMeasurement {
+                utf8_bytes: 0,
+                unicode_scalars: 0,
+                complete: false,
+            }),
+            "{event}"
+        );
+        assert_eq!(
+            snapshot(&timing(&tap)?)?
+                .upstream_first_content_ms
+                .is_some(),
+            has_content,
+            "{event}"
+        );
+        drop(server.body);
+        server.task.await??;
+    }
     Ok(())
 }
 

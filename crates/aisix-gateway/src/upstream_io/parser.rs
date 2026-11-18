@@ -55,6 +55,8 @@ struct Frame {
     array: bool,
     phase: u8,
     key: &'static str,
+    tool_search_call: bool,
+    nonempty_arguments_object: bool,
 }
 
 struct Path<'a>(&'a [Frame]);
@@ -427,6 +429,8 @@ struct JsonObserver {
     protocol: Protocol,
     sse: bool,
     request: bool,
+    // 仅原生 Responses SSE 等待首内容时需要识别结构化工具搜索参数。
+    observe_tool_search: bool,
     stack: Vec<Frame>,
     string: Option<JsonString>,
     primitive: Label,
@@ -443,6 +447,7 @@ impl JsonObserver {
             protocol,
             sse,
             request: false,
+            observe_tool_search: false,
             stack: Vec::with_capacity(16),
             string: None,
             primitive: Label::default(),
@@ -961,6 +966,15 @@ impl JsonObserver {
                             // 新工具载体可能含有文字；未解释的槽不能成为完整的零。
                             self.event.incomplete = true;
                         }
+                        if string.metadata
+                            && self.observe_tool_search
+                            && path.last() == "type"
+                            && string.label.text() == "tool_search_call"
+                        {
+                            if let Some(item) = self.stack.last_mut() {
+                                item.tool_search_call = true;
+                            }
+                        }
                         self.value_done();
                     }
                 }
@@ -1027,6 +1041,8 @@ impl JsonObserver {
                     array: byte == b'[',
                     phase: 0,
                     key: "",
+                    tool_search_call: false,
+                    nonempty_arguments_object: false,
                 });
             }
             b'}' | b']' => {
@@ -1043,6 +1059,21 @@ impl JsonObserver {
                 if !valid {
                     self.invalid = true;
                     return;
+                }
+                if self.observe_tool_search {
+                    if !frame.array && frame.phase == 3 {
+                        if let Some(item) =
+                            self.stack.last_mut().filter(|item| item.key == "arguments")
+                        {
+                            item.nonempty_arguments_object = true;
+                        }
+                    }
+                    // 在同一 item 闭合时合并两个字段，使首内容判定与键序无关。
+                    if frame.tool_search_call && frame.nonempty_arguments_object {
+                        let path = Path(&self.stack);
+                        self.event.content |=
+                            path.is(&["item"]) || path.is(&["response", "output", "#"]);
+                    }
                 }
                 if let Some(compact) = &mut self.compact {
                     compact.count.character(char::from(byte));
@@ -1340,6 +1371,7 @@ impl ResponseObserver {
             // typed 路径按实际正文选择 JSON/SSE；上游 MIME 可能只是 text/plain。
             self.sse = !matches!(bytes[first], b'{' | b'[');
             self.json.sse = self.sse;
+            self.json.observe_tool_search = self.sse && self.protocol == Protocol::Responses;
             self.partial |= self.sse && self.leading_horizontal_whitespace;
             self.wire_detected = true;
             &bytes[first..]
@@ -1481,6 +1513,7 @@ impl ResponseObserver {
             };
             if content {
                 self.first_sse_content = Some(Instant::now());
+                self.json.observe_tool_search = false;
             }
         }
         if self.protocol == Protocol::Realtime {
