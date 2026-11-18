@@ -26,6 +26,8 @@ const CALLER_KEY = "sk-e2e-client-tool-search";
 const PLATFORM_ENV = "E2E_CLIENT_TOOL_SEARCH_ID_SECRET";
 const PLATFORM_SECRET = "e0e5d4c3b2a190876543210fedcba9876543210abcdef0123456789abcdef012";
 const PRIVATE_MARKER = "provider_private";
+const UPSTREAM_RESPONSE_ID = `chatcmpl_${PRIVATE_MARKER}`;
+const UPSTREAM_MODEL = "chat-only-model";
 const SEARCH_CALL_ID = `call_${PRIVATE_MARKER}_search`;
 const SECOND_SEARCH_CALL_ID = `call_${PRIVATE_MARKER}_search_again`;
 const LOOKUP_CALL_ID = `call_${PRIVATE_MARKER}_lookup`;
@@ -181,7 +183,7 @@ async function startChatProvider(): Promise<{
       if (!body.stream) {
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({
-          id: `chatcmpl_${PRIVATE_MARKER}`, object: "chat.completion", created: 1_700_000_000,
+          id: UPSTREAM_RESPONSE_ID, object: "chat.completion", created: 1_700_000_000,
           model: body.model,
           choices: [{ index: 0, message: { role: "assistant", content, ...(calls.length ? { tool_calls: calls } : {}) }, finish_reason: finishReason }],
           usage,
@@ -191,7 +193,7 @@ async function startChatProvider(): Promise<{
       res.writeHead(200, { "content-type": "text/event-stream" });
       const chunk = (delta: Json, finish: string | null = null, tokenUsage?: Json) =>
         res.write(`data: ${JSON.stringify({
-          id: `chatcmpl_${PRIVATE_MARKER}`, object: "chat.completion.chunk", created: 1_700_000_000,
+          id: UPSTREAM_RESPONSE_ID, object: "chat.completion.chunk", created: 1_700_000_000,
           model: body.model, choices: [{ index: 0, delta, finish_reason: finish }],
           ...(tokenUsage ? { usage: tokenUsage } : {}),
         })}\n\n`);
@@ -224,11 +226,19 @@ function events(text: string): Json[] {
   });
 }
 
-function completed(text: string, stream: boolean): Json {
-  if (!stream) return JSON.parse(text) as Json;
+function completed(text: string, stream: boolean, requestedModel: string): Json {
+  const identity = { id: UPSTREAM_RESPONSE_ID, model: requestedModel };
+  if (!stream) {
+    const response = JSON.parse(text) as Json;
+    expect(response).toMatchObject(identity);
+    return response;
+  }
   const frames = events(text);
   expect(frames.filter((event) => event.type === "response.completed"), text).toHaveLength(1);
   expect(frames.some((event) => event.type === "response.failed"), text).toBe(false);
+  for (const event of frames) {
+    if (event.response) expect(event.response).toMatchObject(identity);
+  }
   return frames.find((event) => event.type === "response.completed")!.response;
 }
 
@@ -237,7 +247,7 @@ function expectPlatformCall(item: Json, upstreamId: string): void {
   expect(item.id.length).toBeGreaterThan(0);
   expect(typeof item.call_id).toBe("string");
   expect(item.call_id.length).toBeGreaterThan(0);
-  expect(item.call_id).not.toBe(upstreamId);
+  expect(item.call_id).toBe(upstreamId);
 }
 
 function expectStreamItem(text: string, item: Json): void {
@@ -309,7 +319,7 @@ describe("platform Responses client tool search through a Chat-only custom provi
         secret: "sk-test-upstream", api_base: upstream.baseUrl,
       });
       await seed.createModel({
-        display_name: `client-search-${provider}`, provider, model_name: "chat-only-model",
+        display_name: `client-search-${provider}`, provider, model_name: UPSTREAM_MODEL,
         provider_key_id: pk.id, retries: 0,
       });
     }
@@ -330,10 +340,11 @@ describe("platform Responses client tool search through a Chat-only custom provi
 
   async function post(provider: string, stream: boolean, input: unknown[], tools: unknown[] = [ORIGINAL_TOOL, SEARCH]): Promise<{ text: string; response: Json; sent: Received }> {
     const before = upstream!.received.length;
+    const requestedModel = `client-search-${provider}`;
     const res = await fetch(`${app!.proxyUrl}/v1/responses`, {
       method: "POST",
       headers: { authorization: `Bearer ${CALLER_KEY}`, "content-type": "application/json" },
-      body: JSON.stringify({ model: `client-search-${provider}`, input, tools, tool_choice: "auto", parallel_tool_calls: true, stream }),
+      body: JSON.stringify({ model: requestedModel, input, tools, tool_choice: "auto", parallel_tool_calls: true, stream }),
     });
     const text = await res.text();
     expect(res.status, text).toBe(200);
@@ -341,8 +352,11 @@ describe("platform Responses client tool search through a Chat-only custom provi
     const sent = upstream!.received[before];
     expect(sent.path).toBe("/v1/chat/completions");
     expect(sent.body.stream === true).toBe(stream);
-    expect(text).not.toContain(PRIVATE_MARKER);
-    return { text, response: completed(text, stream), sent };
+    expect(sent.body.model).toBe(UPSTREAM_MODEL);
+    const response = completed(text, stream, requestedModel);
+    const calls = response.output.filter((item: Json) => item.call_id !== undefined);
+    expect(calls.map((item: Json) => item.call_id)).toEqual(sent.calls.map((call) => call.id));
+    return { text, response, sent };
   }
 
   for (const provider of ["rpm", "matrix"]) {
