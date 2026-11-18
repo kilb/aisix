@@ -1229,6 +1229,7 @@ fn unwrap_custom_tool_input(arguments: &str) -> String {
 pub struct ResponsesReplyContext {
     custom_tools: std::collections::BTreeSet<String>,
     client_tool_search: Option<String>,
+    declared_special_prefixes: std::collections::BTreeSet<String>,
     /// Chat function name → `(namespace, sub-tool name)`.
     namespace_tools: std::collections::BTreeMap<String, (String, String)>,
     echo: Map<String, Value>,
@@ -1261,7 +1262,8 @@ impl Default for ResponsesReplyContext {
 impl ResponsesReplyContext {
     pub fn from_request(body: &Value) -> Self {
         let tools = request_tools(body);
-        let namespace_tools = namespace_tool_map(&tools);
+        let top_level = top_level_function_names(&tools);
+        let namespace_tools = namespace_tool_map(&tools, &top_level);
         let mut custom_tools: std::collections::BTreeSet<String> = tools
             .iter()
             .filter(|t| t.get("type").and_then(Value::as_str) == Some("custom"))
@@ -1287,12 +1289,24 @@ impl ResponsesReplyContext {
                 }
             }
         }
+        let client_tool_search = tools
+            .iter()
+            .any(client_tool_search)
+            .then(|| tool_search_chat_name(&tools));
+        // 仅保存既是特殊工具名严格前缀、又是显式完整工具名的例外。
+        let mut declared_special_prefixes = std::collections::BTreeSet::new();
+        for special in custom_tools.iter().chain(&client_tool_search) {
+            for (end, _) in special.char_indices().skip(1) {
+                let prefix = &special[..end];
+                if top_level.contains(prefix) {
+                    declared_special_prefixes.insert(prefix.to_owned());
+                }
+            }
+        }
         Self {
             custom_tools,
-            client_tool_search: tools
-                .iter()
-                .any(client_tool_search)
-                .then(|| tool_search_chat_name(&tools)),
+            client_tool_search,
+            declared_special_prefixes,
             namespace_tools,
             echo: response_echo_fields(body),
         }
@@ -1303,6 +1317,26 @@ impl ResponsesReplyContext {
     pub fn echo_previous_response_id(&mut self, id: &str) {
         self.echo
             .insert("previous_response_id".into(), Value::String(id.to_string()));
+    }
+
+    fn special_name_starts_with(&self, name: &str) -> bool {
+        use std::ops::Bound::{Included, Unbounded};
+        self.client_tool_search
+            .as_deref()
+            .is_some_and(|tool| tool.starts_with(name))
+            || self
+                .custom_tools
+                .range::<str, _>((Included(name), Unbounded))
+                .next()
+                .is_some_and(|tool| tool.starts_with(name))
+    }
+
+    fn partial_special_name(&self, name: &str) -> bool {
+        self.special_name_starts_with(name)
+            && self.client_tool_search.as_deref() != Some(name)
+            && !self.custom_tools.contains(name)
+            && !self.declared_special_prefixes.contains(name)
+            && !self.namespace_tools.contains_key(name)
     }
 
     fn tool_call<'a>(&'a self, chat_name: &'a str) -> ReplyToolCall<'a> {
@@ -1327,8 +1361,10 @@ impl ResponsesReplyContext {
 /// uses it — the sub-tool's bare name, which a model sometimes answers with
 /// instead. A real Chat name always takes precedence over a bare fallback,
 /// and a caller's top-level function keeps its original name.
-fn namespace_tool_map(tools: &[Value]) -> std::collections::BTreeMap<String, (String, String)> {
-    let top_level = top_level_function_names(tools);
+fn namespace_tool_map(
+    tools: &[Value],
+    top_level: &std::collections::BTreeSet<&str>,
+) -> std::collections::BTreeMap<String, (String, String)> {
     let members: Vec<(String, String)> = tools
         .iter()
         .filter(|t| t.get("type").and_then(Value::as_str) == Some("namespace"))
@@ -2797,6 +2833,25 @@ impl ResponsesSseEncoder {
                         },
                     );
                 }
+                let state = self.tool_calls.get_mut(&oai_index).expect("just inserted");
+                // 已收参数、工具名仍有歧义时，上游既可能重发全名，也可能只发后缀。
+                let joined;
+                let name = if !name.is_empty()
+                    && !state.item_added
+                    && !state.arguments.is_empty()
+                    && !state.name.is_empty()
+                    && self.reply.partial_special_name(&state.name)
+                    && !(name.starts_with(&state.name) && self.reply.special_name_starts_with(name))
+                {
+                    joined = format!("{}{name}", state.name);
+                    if self.reply.special_name_starts_with(&joined) {
+                        &joined
+                    } else {
+                        name
+                    }
+                } else {
+                    name
+                };
                 let (custom, search, namespace) = match self.reply.tool_call(name) {
                     ReplyToolCall::Custom { name, namespace } => (
                         true,
@@ -2814,7 +2869,6 @@ impl ResponsesSseEncoder {
                     ),
                     ReplyToolCall::Function { .. } => (false, false, None),
                 };
-                let state = self.tool_calls.get_mut(&oai_index).expect("just inserted");
                 if !id.is_empty() {
                     state.call_id = id.to_string();
                 }
@@ -2835,8 +2889,12 @@ impl ResponsesSseEncoder {
                 }
 
                 // Emit output_item.added once the call id + name are known.
-                let opening =
-                    !state.item_added && !state.call_id.is_empty() && !state.name.is_empty();
+                let opening = !state.item_added
+                    && (!name.is_empty() || !id.is_empty())
+                    && !state.call_id.is_empty()
+                    && !state.name.is_empty()
+                    && (state.arguments.is_empty()
+                        || !self.reply.partial_special_name(&state.name));
                 // 普通函数的参数可能先于 id 或名称到达。首次公布时补发所有已收参数。
                 let has_buffered_prefix = opening && !state.arguments.is_empty();
                 if opening {
@@ -6125,15 +6183,104 @@ mod tests {
         assert_eq!(item["arguments"], "{\"cmd\":\"ls\"}");
     }
 
-    #[test]
-    fn function_arguments_arriving_before_the_call_identity_stream_when_the_item_opens() {
-        let tool_chunk = |call| ChatChunk {
+    fn tool_chunk(call: Value) -> ChatChunk {
+        ChatChunk {
             delta: ChatDelta {
                 tool_calls: Some(vec![call]),
                 ..Default::default()
             },
             ..content_chunk("")
-        };
+        }
+    }
+
+    #[test]
+    fn buffered_arguments_wait_for_a_partial_special_tool_name() {
+        for (tool, prefix, name, kind, field, body, expected) in [
+            (
+                json!({"type":"custom", "name":"apply_patch"}),
+                "apply_",
+                "apply_patch",
+                "custom_tool_call",
+                "input",
+                r#"{"content":"example"}"#,
+                json!("example"),
+            ),
+            (
+                json!({"type":"tool_search", "execution":"client"}),
+                "tool_",
+                "tool_search",
+                "tool_search_call",
+                "arguments",
+                r#"{"query":"example"}"#,
+                json!({"query":"example"}),
+            ),
+            (
+                json!({"type":"custom", "name":"aa_patch"}),
+                "a",
+                "aa_patch",
+                "custom_tool_call",
+                "input",
+                r#"{"content":"example"}"#,
+                json!("example"),
+            ),
+        ] {
+            for completion in [name, name.strip_prefix(prefix).unwrap()] {
+                let ctx = ResponsesReplyContext::from_request(&json!({"tools":[tool]}));
+                let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, ctx);
+                let first = enc.next_events(&tool_chunk(json!({"function":{"arguments":body}})));
+                assert_eq!(
+                    types_of(&first),
+                    ["response.created", "response.in_progress"]
+                );
+                assert!(enc
+                    .next_events(&tool_chunk(
+                        json!({"id":"call_1", "function":{"name":prefix}})
+                    ))
+                    .is_empty());
+                let mut items =
+                    enc.next_events(&tool_chunk(json!({"function":{"name":completion}})));
+                assert_eq!(types_of(&items), ["response.output_item.added"]);
+                assert_eq!(items[0].data["item"]["type"], kind);
+                items.extend(enc.force_finish());
+                assert!(!types_of(&items).contains(&"response.function_call_arguments.delta"));
+                let item = &items.last().unwrap().data["response"]["output"][0];
+                assert_eq!(item["type"], kind);
+                assert_eq!(item[field], expected);
+            }
+        }
+    }
+
+    #[test]
+    fn declared_function_can_be_a_prefix_of_a_custom_tool_name() {
+        let function = json!({"type":"function", "name":"apply_"});
+        let custom = json!({"type":"custom", "name":"apply_patch"});
+        for request in [
+            json!({"tools":[function, custom]}),
+            json!({"tools":[custom], "input":[{"type":"additional_tools", "tools":[function]}]}),
+        ] {
+            let mut enc = ResponsesSseEncoder::new(
+                "resp_1",
+                "m",
+                0,
+                ResponsesReplyContext::from_request(&request),
+            );
+            enc.next_events(&tool_chunk(json!({"function":{"arguments":"{}"}})));
+            let opened = enc.next_events(&tool_chunk(
+                json!({"id":"call_1", "function":{"name":"apply_"}}),
+            ));
+            assert_eq!(
+                types_of(&opened),
+                [
+                    "response.output_item.added",
+                    "response.function_call_arguments.delta"
+                ]
+            );
+            assert_eq!(opened[1].data["delta"], "{}");
+        }
+    }
+
+    #[test]
+    fn function_arguments_arriving_before_the_call_identity_stream_when_the_item_opens() {
         for (first, opens, expected) in [
             (
                 json!({"index": 0, "function": {"name": "lookup", "arguments": "{\"a\":"}}),
