@@ -140,6 +140,17 @@ pub(crate) async fn summaries(
         return Ok(HashMap::new());
     }
     let members = members_sql();
+    let (cost_field, cost_join) = if tenant {
+        ("", "")
+    } else {
+        (
+            ", 'cost_micro_cny', CASE WHEN BOOL_AND(cost.amount IS NOT NULL \
+                OR member.status IN ('exempt', 'nothing_to_bill')) \
+                THEN (SUM(COALESCE(cost.amount, 0))::numeric)::text END",
+            "LEFT JOIN pricing_cost_backfills b ON b.event_id = member.event_id \
+             CROSS JOIN LATERAL (SELECT COALESCE(member.cost_micro_cny, b.cost_micro_cny) AS amount) cost",
+        )
+    };
     let sql = format!(
         "SELECT pc_anchor.event_id, jsonb_build_object(\
              'attempt_count', COUNT(*)::bigint, \
@@ -148,31 +159,19 @@ pub(crate) async fn summaries(
              'complete', BOOL_OR(member.group_event->'is_final_attempt' = 'true'::jsonb) IS TRUE, \
              'charge_micro_cny', CASE WHEN BOOL_AND(member.status <> 'unpriced' OR adjusted.amount IS NOT NULL) \
                  THEN (SUM(COALESCE(member.charge_micro_cny, 0)::numeric + COALESCE(adjusted.amount, 0))::numeric)::text END, \
-             'adjusted_micro_cny', (SUM(COALESCE(adjusted.amount, 0))::numeric)::text, \
-             'cost_micro_cny', CASE WHEN BOOL_AND(member.cost_micro_cny IS NOT NULL \
-                    OR member.status IN ('exempt', 'nothing_to_bill')) \
-                 THEN (SUM(COALESCE(member.cost_micro_cny, 0))::numeric)::text END \
+             'adjusted_micro_cny', (SUM(COALESCE(adjusted.amount, 0))::numeric)::text {cost_field} \
          ) AS summary \
          FROM pricing_charges_cny pc_anchor \
          LEFT JOIN usage_events ue_anchor ON ue_anchor.event_id = pc_anchor.event_id \
          CROSS JOIN LATERAL ({members}) member \
+         {cost_join} \
          LEFT JOIN LATERAL (SELECT SUM(pa.delta_micro_cny)::numeric AS amount \
              FROM pricing_adjustments_cny pa WHERE pa.event_id = member.event_id) adjusted ON true \
          WHERE pc_anchor.event_id = ANY($1) \
          GROUP BY pc_anchor.event_id"
     );
     let rows: Vec<(String, Value)> = sqlx::query_as(&sql).bind(ids).fetch_all(conn).await?;
-    Ok(rows
-        .into_iter()
-        .map(|(id, mut summary)| {
-            if tenant {
-                if let Some(fields) = summary.as_object_mut() {
-                    fields.remove("cost_micro_cny");
-                }
-            }
-            (id, summary)
-        })
-        .collect())
+    Ok(rows.into_iter().collect())
 }
 
 /// 尝试详情按存储序号续读，不在组列表的页边界截断。

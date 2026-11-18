@@ -26,7 +26,8 @@ pub async fn project_once(db: &Db) -> Result<usize, DbError> {
             .await?;
         // 源表正被维护时立即让路，不占共享池连接等待表锁。
         sqlx::query(
-            "LOCK TABLE pricing_charges_cny, pricing_adjustments_cny IN ACCESS SHARE MODE NOWAIT",
+            "LOCK TABLE pricing_charges_cny, pricing_adjustments_cny, pricing_cost_backfills \
+             IN ACCESS SHARE MODE NOWAIT",
         )
         .execute(&mut *tx)
         .await?;

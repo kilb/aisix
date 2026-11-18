@@ -585,3 +585,492 @@ async fn a_cost_rate_is_audited_and_append_only() {
     }
     assert_eq!(w.cp.count("pricing_cost_rates").await, 1);
 }
+
+async fn admin_get(w: &World, path: &str) -> Value {
+    let r = w.cp.send("GET", path, Some(w.admin.cookie()), None).await;
+    assert_eq!(r.status, 200, "{path}: {r:?}");
+    r.body
+}
+
+async fn cost_backfill(w: &World, account: Uuid, who: &OperatorSession, body: Value) -> Resp {
+    w.cp.send(
+        "POST",
+        &format!("/admin/provider-keys/{account}/cost-backfill"),
+        Some(who.cookie()),
+        Some(body),
+    )
+    .await
+}
+
+fn event<'a>(list: &'a Value, id: &str) -> &'a Value {
+    list["items"]
+        .as_array()
+        .expect("计费记录")
+        .iter()
+        .find(|item| item["event_id"] == id)
+        .unwrap_or_else(|| panic!("缺少计费记录 {id}: {list}"))
+}
+
+#[tokio::test]
+async fn an_unacknowledged_first_page_replays_at_the_same_rate_and_counts_its_own_writes() {
+    let Some(mut w) = world().await else { return };
+    w.admin = w.cp.admin_login_seeded(OperatorRole::Admin).await;
+    let model = worked_model(&w, worked_card()).await;
+    let account = seed_provider_key(&w.cp, &w.admin).await;
+    send(
+        &w,
+        (0..257)
+            .map(|i| row(&w, &format!("replay-{i:03}"), model, Some(account)))
+            .collect(),
+    )
+    .await;
+    set_rate(&w, account, None, Some("0.2"), db_now(&w.cp).await).await;
+    let changes_at = db_now(&w.cp).await + TimeDelta::seconds(6);
+    set_rate(&w, account, None, Some("0.9"), changes_at).await;
+    let prepared = cost_backfill(&w, account, &w.admin, json!({"prepare": true})).await;
+    assert_eq!(prepared.status, 200, "{prepared:?}");
+    assert_eq!(prepared.body["examined"], 0);
+    assert_eq!(w.cp.count("pricing_cost_backfills").await, 0);
+    let token = prepared.body["next_after"]
+        .as_str()
+        .expect("首次实际写入前已有游标");
+    let page = json!({"after": token});
+    // 两个客户端并发重传首批，即使实际只有一次写入，两份回执都能确认本次操作的 256 笔。
+    let (first, concurrent) = tokio::join!(
+        cost_backfill(&w, account, &w.admin, page.clone()),
+        cost_backfill(&w, account, &w.admin, page.clone())
+    );
+    for response in [first, concurrent] {
+        assert_eq!(response.status, 200, "{response:?}");
+        assert_eq!(response.body["filled"], 256);
+    }
+    assert_eq!(w.cp.count("pricing_cost_backfills").await, 256);
+    let wait = changes_at - db_now(&w.cp).await;
+    if let Ok(duration) = wait.to_std() {
+        tokio::time::sleep(duration + std::time::Duration::from_millis(20)).await;
+    }
+    assert!(db_now(&w.cp).await >= changes_at);
+    // 客户端未保存首批回执，此时费率已变化，仍只能用原游标重放。
+    let replay = cost_backfill(&w, account, &w.admin, page).await;
+    assert_eq!(replay.status, 200, "{replay:?}");
+    assert_eq!(replay.body["examined"], 256);
+    assert_eq!(replay.body["filled"], 256);
+    let token = replay.body["next_after"].as_str().expect("第 257 笔");
+    let last = cost_backfill(&w, account, &w.admin, json!({"after":token})).await;
+    assert_eq!(
+        last.body,
+        json!({"examined":1, "filled":1, "next_after":null})
+    );
+    let amounts: (i64, i64, i64) = sqlx::query_as(
+        "SELECT count(*), min(cost_micro_cny), max(cost_micro_cny) FROM pricing_cost_backfills",
+    )
+    .fetch_one(w.cp.db().pool())
+    .await
+    .expect("补填金额");
+    assert_eq!(amounts, (257, 8_000_000, 8_000_000));
+}
+
+#[tokio::test]
+async fn cost_backfill_uses_the_first_positive_adjustment_even_after_a_second_repricing() {
+    let Some(mut w) = world().await else { return };
+    w.admin = w.cp.admin_login_seeded(OperatorRole::Admin).await;
+    let model = seed_model(&w.cp, &w.admin).await;
+    let account = seed_provider_key(&w.cp, &w.admin).await;
+    group_rate(&w.cp, "7").await;
+    let legacy = row(&w, "legacy-first", model, Some(account));
+    send(&w, vec![row(&w, "corrected", model, Some(account))]).await;
+    let charges = format!("/admin/pricing/charges?model_id={model}");
+    let unpriced = admin_get(&w, &charges).await;
+    assert_eq!(event(&unpriced, "corrected")["error_code"], "missing_price");
+
+    let from = db_now(&w.cp).await - TimeDelta::hours(1);
+    let reprice = async |expected_delta: i64| {
+        let preview =
+            w.cp.send(
+                "POST",
+                "/admin/billing/repricing",
+                Some(w.admin.cookie()),
+                Some(
+                    json!({"from": from, "to": db_now(&w.cp).await, "model_id": model,
+                        "reason": "补录模型基准价，核对历史成本"}),
+                ),
+            )
+            .await;
+        assert_eq!(preview.status, 201, "{preview:?}");
+        assert_eq!(
+            preview.body["delta_micro_cny"], expected_delta,
+            "{preview:?}"
+        );
+        let id = preview.body["id"].as_str().expect("重定价标识");
+        let applied =
+            w.cp.send(
+                "POST",
+                &format!("/admin/billing/repricing/{id}/apply"),
+                Some(w.admin.cookie()),
+                Some(json!({})),
+            )
+            .await;
+        assert_eq!(applied.status, 200, "{applied:?}");
+        Uuid::parse_str(id).expect("重定价 UUID")
+    };
+    // 调用首次实际收费时的基准是 10 + 30 = 40 美元，租户费率 7。
+    insert_baseline(&w.cp, model, db_now(&w.cp).await, worked_card())
+        .await
+        .expect("首笔正额调整使用的基准");
+    let first = reprice(280_000_000).await;
+
+    // 旧版本的首笔正额调整没有保存行。即使后续调整保存明细，原始成本仍应未知。
+    send(&w, vec![legacy]).await;
+    let delayed = admin_get(&w, &charges).await;
+    assert_eq!(
+        event(&delayed, "legacy-first")["error_code"],
+        "missing_price"
+    );
+    sqlx::query(
+        "INSERT INTO pricing_adjustments_cny
+           (run_id, event_id, delta_micro_cny, baseline_revision_id, rate_revision_id,
+            engine_version, reason, created_by)
+         SELECT run_id, 'legacy-first', delta_micro_cny, baseline_revision_id, rate_revision_id,
+                engine_version, reason, created_by
+         FROM pricing_adjustments_cny WHERE run_id = $1 AND event_id = 'corrected'",
+    )
+    .bind(first)
+    .execute(w.cp.db().pool())
+    .await
+    .expect("无行明细的旧版调整");
+
+    // 第二次把两笔调用各上调到 ¥560，与第一次基准及稍后生效的账户费率可区分。
+    let doubled = serde_json::from_value(json!({"default":{"base":{"input":"20","output":"60"}}}))
+        .expect("第二次基准");
+    insert_baseline(&w.cp, model, db_now(&w.cp).await, doubled)
+        .await
+        .expect("提高模型基准");
+    reprice(560_000_000).await;
+    set_rate(&w, account, None, Some("0.3"), db_now(&w.cp).await).await;
+    let before = admin_get(&w, &charges).await;
+    for id in ["corrected", "legacy-first"] {
+        assert_eq!(event(&before, id)["adjusted_micro_cny"], 560_000_000);
+        assert_eq!(event(&before, id).get("cost_micro_cny"), Some(&Value::Null));
+    }
+    let ledger = format!("/admin/tenants/{}/billing/ledger", w.tenant);
+    let before_ledger = admin_get(&w, &ledger).await;
+    let fill = cost_backfill(&w, account, &w.admin, json!({})).await;
+    assert_eq!(fill.status, 200, "{fill:?}");
+    assert_eq!(fill.body.get("filled"), Some(&json!(1)), "{fill:?}");
+    let after = admin_get(&w, &charges).await;
+    assert_eq!(
+        event(&after, "corrected").get("cost_micro_cny"),
+        Some(&json!(12_000_000))
+    );
+    assert_eq!(
+        event(&after, "legacy-first").get("cost_micro_cny"),
+        Some(&Value::Null)
+    );
+    assert_eq!(
+        event(&after, "corrected")["adjusted_micro_cny"],
+        560_000_000
+    );
+    assert_eq!(admin_get(&w, &ledger).await, before_ledger);
+}
+
+#[tokio::test]
+async fn explicit_cost_backfill_uses_original_lines_and_only_changes_missing_account_costs() {
+    let Some(mut w) = world().await else { return };
+    w.admin = w.cp.admin_login_seeded(OperatorRole::Admin).await;
+    let model = worked_model(&w, worked_card()).await;
+    let other_model = worked_model(&w, worked_card()).await;
+    let account = seed_provider_key(&w.cp, &w.admin).await;
+    let other_account = seed_provider_key(&w.cp, &w.admin).await;
+    let discount = w.cp.send(
+        "POST", "/admin/pricing/discounts", Some(w.admin.cookie()),
+        Some(json!({"tenant_id": w.tenant, "effective_from": db_now(&w.cp).await, "discount_bps": 5_000})),
+    ).await;
+    assert_eq!(discount.status, 201, "{discount:?}");
+    // 每次调用按原始美元基准计 40 美元，租户费率 7、五折，因此每笔实收 140 元。
+    send(
+        &w,
+        vec![
+            row(&w, "override", model, Some(account)),
+            row(&w, "default", other_model, Some(account)),
+            row(&w, "foreign", model, Some(other_account)),
+            row(&w, "unattributed", model, None),
+        ],
+    )
+    .await;
+    // 已经确定的 0 成本不能按新费率重写。
+    set_rate(&w, account, Some(model), Some("0"), db_now(&w.cp).await).await;
+    send(&w, vec![row(&w, "known-zero", model, Some(account))]).await;
+    let active = set_rate(&w, account, Some(model), Some("0.2"), db_now(&w.cp).await).await;
+    set_rate(&w, account, None, Some("0.3"), db_now(&w.cp).await).await;
+    set_rate(
+        &w,
+        account,
+        Some(model),
+        Some("9"),
+        db_now(&w.cp).await + TimeDelta::days(1),
+    )
+    .await;
+    insert_baseline(
+        &w.cp,
+        model,
+        db_now(&w.cp).await,
+        serde_json::from_value(json!({"default":{"base":{"input":"100","output":"300"}}}))
+            .expect("新基准"),
+    )
+    .await
+    .expect("调高现行基准");
+
+    let charges = format!("/admin/pricing/charges?tenant_id={}", w.tenant);
+    let before = admin_get(&w, &charges).await;
+    assert_eq!(
+        event(&before, "override").get("cost_micro_cny"),
+        Some(&Value::Null)
+    );
+    assert_eq!(
+        event(&before, "known-zero").get("cost_micro_cny"),
+        Some(&json!(0))
+    );
+    let ledger = format!("/admin/tenants/{}/billing/ledger", w.tenant);
+    let before_ledger = admin_get(&w, &ledger).await;
+    assert_eq!(before_ledger["items"].as_array().expect("流水").len(), 5);
+    let billing = format!("/admin/tenants/{}/billing", w.tenant);
+    assert_eq!(
+        admin_get(&w, &billing).await["balance_micro_cny"],
+        -700_000_000
+    );
+
+    for role in [OperatorRole::Viewer, OperatorRole::Operator] {
+        let who = w.cp.admin_login_seeded(role).await;
+        assert_eq!(
+            cost_backfill(&w, account, &who, json!({})).await.status,
+            403
+        );
+    }
+    assert_eq!(admin_get(&w, &charges).await, before);
+    let (a, b) = tokio::join!(
+        cost_backfill(&w, account, &w.admin, json!({})),
+        cost_backfill(&w, account, &w.admin, json!({})),
+    );
+    assert_eq!(a.status, 200, "{a:?}");
+    assert_eq!(b.status, 200, "{b:?}");
+    assert_eq!(
+        a.body["filled"].as_u64().expect("新增笔数") + b.body["filled"].as_u64().expect("新增笔数"),
+        2
+    );
+    for answer in [a, b] {
+        assert_eq!(answer.body.get("next_after"), Some(&Value::Null));
+    }
+
+    let after = admin_get(&w, &charges).await;
+    for (id, expected_cost) in [
+        ("override", json!(8_000_000)),
+        ("default", json!(12_000_000)),
+        ("known-zero", json!(0)),
+        ("foreign", Value::Null),
+        ("unattributed", Value::Null),
+    ] {
+        let charge = event(&after, id);
+        assert_eq!(
+            charge.get("cost_micro_cny"),
+            Some(&expected_cost),
+            "{charge}"
+        );
+        assert_eq!(charge["charge_micro_cny"], 140_000_000, "{charge}");
+    }
+    let revision = active["revision"]["revision_id"]
+        .as_i64()
+        .expect("费率版本");
+    assert_eq!(
+        event(&after, "override")["cost_source"],
+        json!({"kind": "account_rate", "revision_id": revision, "cny_per_usd": "0.2",
+               "model_override": true, "backfilled": true})
+    );
+    let attribution: (Uuid, Uuid, i64) = sqlx::query_as(
+        "SELECT created_by, provider_key_id, rate_revision_id FROM pricing_cost_backfills WHERE event_id = 'override'",
+    )
+    .fetch_one(w.cp.db().pool()).await.expect("操作员补填记录");
+    assert_eq!(attribution, (w.admin.id, account, revision));
+    assert_eq!(
+        charge_and_cost(&w.cp, "override").await,
+        (Some(140_000_000), None)
+    );
+    assert_eq!(
+        event(&after, "known-zero")["cost_source"],
+        event(&before, "known-zero")["cost_source"]
+    );
+
+    let grouped = admin_get(
+        &w,
+        &format!("{charges}&group_requests=true&event_id=override"),
+    )
+    .await;
+    assert_eq!(
+        event(&grouped, "override")["request_group"]["cost_micro_cny"],
+        "8000000"
+    );
+    let now = db_now(&w.cp).await;
+    let margin = admin_get(
+        &w,
+        &format!(
+            "/admin/pricing/margin?from={}&to={}&provider_key_id={account}&model_id={model}",
+            (now - TimeDelta::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            (now + TimeDelta::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        ),
+    )
+    .await;
+    assert_eq!(margin["items"][0]["cost_micro_cny"], 8_000_000, "{margin}");
+    assert_eq!(
+        margin["items"][0]["profit_micro_cny"], 272_000_000,
+        "{margin}"
+    );
+    let totals = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let reply =
+                w.cp.send(
+                    "GET",
+                    "/admin/billing/profit-summary",
+                    Some(w.admin.cookie()),
+                    None,
+                )
+                .await;
+            if reply.status != 503 || reply.body["code"] != "profit_summary_catching_up" {
+                assert_eq!(reply.status, 200, "{reply:?}");
+                break reply.body;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("等待利润日报完成投影");
+    assert_eq!(
+        totals["totals"]["known_cost_micro_cny"], "20000000",
+        "{totals}"
+    );
+    assert_eq!(totals["totals"]["rows_with_cost"], "3", "{totals}");
+    assert_eq!(totals["totals"]["rows_without_cost"], "2", "{totals}");
+
+    let retried = cost_backfill(&w, account, &w.admin, json!({})).await;
+    assert_eq!(retried.status, 200, "{retried:?}");
+    assert_eq!(retried.body.get("filled"), Some(&json!(0)));
+    let changes: Vec<(Uuid, String, Value)> = sqlx::query_as(
+        "SELECT actor_id, target_id, detail FROM audit_log WHERE action = 'pricing.cost_backfill'",
+    )
+    .fetch_all(w.cp.db().pool())
+    .await
+    .expect("补填审计");
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].0, w.admin.id);
+    assert_eq!(changes[0].1, account.to_string());
+    assert_eq!(changes[0].2["filled"], 2);
+    assert_eq!(admin_get(&w, &ledger).await, before_ledger);
+    assert_eq!(
+        admin_get(&w, &billing).await["balance_micro_cny"],
+        -700_000_000
+    );
+}
+
+#[tokio::test]
+async fn explicit_cost_backfill_pages_past_unknown_rows_and_refuses_a_superseded_rate() {
+    let Some(mut w) = world().await else { return };
+    w.admin = w.cp.admin_login_seeded(OperatorRole::Admin).await;
+    let model = worked_model(&w, worked_card()).await;
+    let another_model = worked_model(&w, worked_card()).await;
+    let account = seed_provider_key(&w.cp, &w.admin).await;
+    let mut batch: Vec<_> = (0..256)
+        .map(|i| row(&w, &format!("earlier-{i:03}"), model, Some(account)))
+        .collect();
+    batch.push(row(&w, "last", another_model, Some(account)));
+    let delayed = row(&w, "delayed", another_model, Some(account));
+    send(&w, batch).await;
+    // 当前版本已不再生成美元成本。按 0032 迁移前的格式插入历史行，保留其真实收费明细。
+    sqlx::query(
+        "WITH old_event AS (
+            INSERT INTO usage_events(event_id, dp_id, batch_id, occurred_at, team_id, api_key_id, event)
+            SELECT 'legacy-usd', dp_id, batch_id, occurred_at, team_id, api_key_id,
+                   event || jsonb_build_object('event_id', 'legacy-usd')
+              FROM usage_events WHERE event_id = 'last' RETURNING event_id
+         )
+         INSERT INTO pricing_charges_cny(event_id, tenant_id, api_key_id, user_id, requested_model_id,
+             occurred_at, price_instant, status, charge_micro_cny, cost_micro_usd, group_id,
+             baseline_revision_id, rate_revision_id, lines, engine_version)
+         SELECT old_event.event_id, c.tenant_id, c.api_key_id, c.user_id, c.requested_model_id,
+                c.occurred_at, c.price_instant, c.status, c.charge_micro_cny, 40000, c.group_id,
+                c.baseline_revision_id, c.rate_revision_id, c.lines, c.engine_version
+           FROM old_event, pricing_charges_cny c WHERE c.event_id = 'last'",
+    ).execute(w.cp.db().pool()).await.expect("迁移前记录");
+    set_rate(
+        &w,
+        account,
+        None,
+        Some("2"),
+        db_now(&w.cp).await + TimeDelta::days(1),
+    )
+    .await;
+    let first = cost_backfill(&w, account, &w.admin, json!({})).await;
+    assert_eq!(first.status, 200, "{first:?}");
+    assert_eq!(first.body["examined"], 256);
+    assert_eq!(first.body["filled"], 0);
+    let cursor = first.body["next_after"].as_str().expect("还有一页");
+    // 两页之间费率被修改时，操作员需从头开始，不混用两次费率。
+    set_rate(
+        &w,
+        account,
+        Some(another_model),
+        Some("0"),
+        db_now(&w.cp).await,
+    )
+    .await;
+    let stale = cost_backfill(&w, account, &w.admin, json!({"after": cursor})).await;
+    assert_eq!(stale.status, 409, "{stale:?}");
+    assert_eq!(stale.body["code"], "cost_backfill_stale");
+    let last_event = "/admin/pricing/charges?event_id=last";
+    assert_eq!(
+        event(&admin_get(&w, last_event).await, "last").get("cost_micro_cny"),
+        Some(&Value::Null)
+    );
+
+    let restarted = cost_backfill(&w, account, &w.admin, json!({})).await;
+    assert_eq!(restarted.status, 200, "{restarted:?}");
+    assert_eq!(restarted.body["examined"], 256);
+    assert_eq!(restarted.body["filled"], 0);
+    let cursor = restarted.body["next_after"]
+        .as_str()
+        .expect("重新确认后还有一页");
+    // 旧调用刚送达，成本应留待下次操作，本次检查仍截止在第一页开始时。
+    send(&w, vec![delayed]).await;
+    let last = cost_backfill(&w, account, &w.admin, json!({"after": cursor})).await;
+    assert_eq!(last.status, 200, "{last:?}");
+    assert_eq!(last.body["examined"], 2);
+    assert_eq!(last.body["filled"], 1);
+    assert_eq!(last.body.get("next_after"), Some(&Value::Null));
+    assert_eq!(
+        event(&admin_get(&w, last_event).await, "last").get("cost_micro_cny"),
+        Some(&json!(0))
+    );
+    let unknown = admin_get(&w, "/admin/pricing/charges?event_id=earlier-000").await;
+    assert_eq!(
+        event(&unknown, "earlier-000").get("cost_micro_cny"),
+        Some(&Value::Null)
+    );
+    let legacy = admin_get(&w, "/admin/pricing/charges?event_id=legacy-usd").await;
+    let legacy = event(&legacy, "legacy-usd");
+    assert_eq!(legacy["cost_micro_usd"], 40_000);
+    assert_eq!(legacy.get("cost_micro_cny"), Some(&Value::Null));
+    assert_eq!(w.cp.count("pricing_cost_backfills").await, 1);
+    let delayed_path = "/admin/pricing/charges?event_id=delayed";
+    assert_eq!(
+        event(&admin_get(&w, delayed_path).await, "delayed").get("cost_micro_cny"),
+        Some(&Value::Null)
+    );
+    let first = cost_backfill(&w, account, &w.admin, json!({})).await;
+    assert_eq!(first.status, 200, "{first:?}");
+    let cursor = first.body["next_after"].as_str().expect("新一轮第二页");
+    let last = cost_backfill(&w, account, &w.admin, json!({"after": cursor})).await;
+    assert_eq!(last.status, 200, "{last:?}");
+    assert_eq!(last.body["examined"], 3);
+    assert_eq!(last.body["filled"], 1);
+    assert_eq!(
+        event(&admin_get(&w, delayed_path).await, "delayed").get("cost_micro_cny"),
+        Some(&json!(0))
+    );
+}

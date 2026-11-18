@@ -138,7 +138,7 @@ const ACCOUNT_COLUMNS: &str = "id, COALESCE(doc->>'display_name', '') AS display
                                COALESCE(doc->>'provider', '') AS provider";
 
 /// The live account `id`; `404` when no live provider key has that id.
-async fn live_account(conn: &mut PgConnection, id: Uuid) -> Result<Account, ApiError> {
+pub(super) async fn live_account(conn: &mut PgConnection, id: Uuid) -> Result<Account, ApiError> {
     sqlx::query_as(&format!(
         "SELECT {ACCOUNT_COLUMNS} FROM gw_resources WHERE kind = $1 AND id = $2 AND NOT deleted"
     ))

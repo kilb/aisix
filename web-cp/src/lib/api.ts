@@ -803,6 +803,16 @@ export const costRates = {
   async account(id: string): Promise<AccountCostRates> {
     return (await call<AccountCostRates>("GET", `/admin/provider-keys/${seg(id)}/cost-rates`)).data;
   },
+  async backfill(id: string, body: { prepare: true } | { after: string }, signal: AbortSignal) {
+    type Page = { examined: number; filled: number; next_after: string | null };
+    const { data } = await call<Page>("POST", `/admin/provider-keys/${seg(id)}/cost-backfill`, body, undefined, signal);
+    if (!data || !Number.isSafeInteger(data.examined) || !Number.isSafeInteger(data.filled)
+      || data.filled < 0 || data.examined < data.filled
+      || !(data.next_after === null || (typeof data.next_after === "string" && data.next_after.length > 0 && (!("after" in body) || data.next_after !== body.after)))) {
+      throw new ApiError("控制面未返回有效的补填结果", 200, "bad_response", [], [], null);
+    }
+    return data;
+  },
   /** Operator and up. `model_id` null is the account's default; `cny_per_usd` null ends a model's override. */
   async write(
     id: string,

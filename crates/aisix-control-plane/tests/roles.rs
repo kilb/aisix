@@ -205,6 +205,10 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
             format!("/admin/provider-keys/{}/cost-rates", Uuid::nil()),
             Some(json!({"model_id": null, "cny_per_usd": "0.3", "effective_from": chrono::Utc::now()})),
         ),
+        ("POST", "/admin/provider-keys/{id}/cost-backfill") => (
+            format!("/admin/provider-keys/{}/cost-backfill", Uuid::nil()),
+            Some(json!({})),
+        ),
         ("POST", "/admin/pricing/discounts") => (
             path.to_string(),
             Some(json!({

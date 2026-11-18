@@ -22,8 +22,8 @@ pub use book::{
 };
 pub use catalogue::{Catalogue, CatalogueEntry, CatalogueError};
 pub use engine::{
-    charge_micro_cny, price_event, BaselineRef, ChargeLine, CostPriced, DiscountRef, Exemption,
-    Outcome, Payer, PricedEvent, PricingError, PricingWarning, RateRef,
+    charge_micro_cny, cost_of_lines, price_event, BaselineRef, ChargeLine, CostPriced, DiscountRef,
+    Exemption, Outcome, Payer, PricedEvent, PricingError, PricingWarning, RateRef,
 };
 pub use quote::{
     BaselineLongContextQuote, BaselinePriceRate, BaselineTierQuote, CustomerQuote,

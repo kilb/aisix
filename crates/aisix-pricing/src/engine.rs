@@ -11,7 +11,7 @@
 //! rate, rounded the same way, with no discount.
 
 use chrono::{DateTime, TimeDelta, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::book::{Baseline, PriceBook, RateInEffect};
 use crate::rates::{CnyPerUsd, Dimension, MicroCny, Rate, Rates, ServiceTier};
@@ -159,7 +159,7 @@ pub struct DiscountRef {
 }
 
 /// One billed dimension: `quantity` units at `rate` per million.
-#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChargeLine {
     pub dimension: Dimension,
     pub quantity: u64,
@@ -473,7 +473,9 @@ pub fn price_event(
     let discount = discount_at(book, &payer.tenant_id, price_instant)?;
     let charge = charge_micro_cny(&lines, rate.cny, discount.map_or(0, |d| d.bps))?;
 
-    let cost = cost_of(book, u, &lines, price_instant);
+    let cost = u.provider_key_id.as_deref().and_then(|account| {
+        cost_of_lines(book, account, &u.requested_model_id, &lines, price_instant)
+    });
 
     Ok(PricedEvent {
         charge,
@@ -531,18 +533,18 @@ pub fn charge_micro_cny(
 /// What the upstream account that served the row cost the platform: the
 /// charge's own `lines` at the account's cost rate for the requested model,
 /// through [`charge_micro_cny`] with no discount, so the one rounding is the
-/// charge's. `None` when the row names no account, the account has no cost
+/// charge's. `None` when the account has no cost
 /// rate in force at `at`, the revision in force cannot be read, or the
 /// amount does not fit in `i64`: the cost is then unknown, and the charge
 /// stands.
-fn cost_of(
+pub fn cost_of_lines(
     book: &PriceBook,
-    u: &BillableUsage,
+    account: &str,
+    requested_model_id: &str,
     lines: &[ChargeLine],
     at: DateTime<Utc>,
 ) -> Option<CostPriced> {
-    let account = u.provider_key_id.as_deref()?;
-    let rate = book.cost_rate(account, &u.requested_model_id, at)?.ok()?;
+    let rate = book.cost_rate(account, requested_model_id, at)?.ok()?;
     let amount = charge_micro_cny(lines, rate.cny, 0).ok()?;
     Some(CostPriced {
         amount,

@@ -26,6 +26,7 @@ import { useToast } from "../../ui/Toast";
 import { BentoGrid, Card, CardHeader, CardMessage, Metric, MetricSkeleton, PageHeader, span } from "../../components/page";
 import { inForce, isZeroRate, scheduledWords } from "./GroupDetail";
 import { BaselineSourceBadge } from "./Baselines";
+import { HistoricalCostBackfill } from "./HistoricalCostBackfill";
 import { PriceCardDetails } from "./PriceCardDetails";
 import { CardFooter, Count, FormGrid, WithForms } from "./kit";
 import { Select } from "../../ui/Select";
@@ -39,11 +40,13 @@ import { Select } from "../../ui/Select";
 export function CostAccountDetail({
   account,
   canEdit,
+  isAdmin,
   onBack,
   onChanged,
 }: {
   account: CostAccount;
   canEdit: boolean;
+  isAdmin: boolean;
   onBack: () => void;
   onChanged: () => Promise<void>;
 }) {
@@ -98,6 +101,7 @@ export function CostAccountDetail({
             }}
           />
         )}
+        {isAdmin && <HistoricalCostBackfill key={account.id} accountId={account.id} />}
       </>
     ) : null;
   return (

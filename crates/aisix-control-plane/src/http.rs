@@ -445,6 +445,11 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
         MinRole::Op(OperatorRole::Operator),
     ),
     (
+        "POST",
+        "/admin/provider-keys/{id}/cost-backfill",
+        MinRole::Op(OperatorRole::Admin),
+    ),
+    (
         "GET",
         "/admin/pricing/discounts",
         MinRole::Op(OperatorRole::Viewer),
@@ -1027,6 +1032,10 @@ pub fn browser_router(state: AppState) -> Router {
         .route(
             "/admin/provider-keys/{id}/cost-rates",
             get(pricing::cost_rates::list_account).post(pricing::cost_rates::create),
+        )
+        .route(
+            "/admin/provider-keys/{id}/cost-backfill",
+            post(pricing::cost_backfill::fill),
         )
         .route(
             "/admin/pricing/discounts",

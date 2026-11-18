@@ -505,17 +505,26 @@ fn model_ids<'a>(raw: impl Iterator<Item = &'a str>) -> Vec<Uuid> {
     ids
 }
 
+const COST_BACKFILL_JOINS: &str =
+    " LEFT JOIN pricing_cost_backfills b ON b.event_id = pc.event_id \
+    LEFT JOIN pricing_cost_rates cost_rate ON cost_rate.revision_id = b.rate_revision_id ";
+
 fn charge_select(_grouped: bool) -> String {
     let seq = "pc.seq";
     format!(
         "SELECT {seq}, pc.event_id, pc.tenant_id, pc.api_key_id, pc.user_id, \
                 pc.requested_model_id, pc.occurred_at, pc.price_instant, pc.status, \
-                pc.charge_micro_cny, pc.cost_micro_usd, pc.cost_source, pc.group_id, \
+                pc.charge_micro_cny, pc.cost_micro_usd, pc.group_id, \
+                CASE WHEN pc.cost_micro_cny IS NULL AND b.event_id IS NOT NULL THEN \
+                    jsonb_build_object('kind', 'account_rate', 'revision_id', b.rate_revision_id, \
+                        'cny_per_usd', trim_scale(cost_rate.cny_per_usd_e4 * 0.0001::numeric)::text, \
+                        'model_override', cost_rate.model_id IS NOT NULL, 'backfilled', true) \
+                    ELSE pc.cost_source END AS cost_source, \
                 pc.baseline_revision_id, pc.rate_revision_id, pc.cny_per_usd_e4, \
                 pc.rate_is_model_override, pc.discount_revision_id, pc.discount_bps, \
                 pc.service_tier, pc.requested_service_tier, pc.long_context_above, pc.estimated, \
                 pc.exemption, pc.error_code, pc.lines, pc.warnings, pc.engine_version, \
-                pc.priced_at, pc.cost_micro_cny, \
+                pc.priced_at, COALESCE(pc.cost_micro_cny, b.cost_micro_cny) AS cost_micro_cny, \
                 (SELECT SUM(pa.delta_micro_cny)::bigint FROM pricing_adjustments_cny pa \
                  WHERE pa.event_id = pc.event_id) AS adjusted_micro_cny, \
                 CASE WHEN ue.event_id IS NOT NULL THEN {CHARGE_EVENT} END AS ev"
@@ -593,9 +602,10 @@ async fn charge_items(
 /// `group_id`、`pricing_tier` 保留状态页的分组方式（空串是未记录值），
 /// `exclude_corrected=true` 排除已有重计价更正的行。
 ///
-/// Each charge carries `cost_micro_cny`, what its row cost the platform at
-/// the serving account's cost rate: `null` when the cost is unknown, never
-/// 0. `cost_micro_usd` is a row priced before cost became a rate.
+/// `cost_micro_cny` 是摄入时记下的上游账户成本，或运营显式补填的历史成本。
+/// 未知为 `null`，已知的零成本为 `0`。补填结果用 `cost_source.backfilled` 标明，
+/// 携带所用费率修订。后续更正首次计费的调用可按首次计费明细补填。
+/// 原以美元计价的历史成本保存在 `cost_micro_usd`。
 /// `adjusted_micro_cny` is the sum of its re-pricing adjustments, `null`
 /// when no run corrected it. `model_name` names its model even once the
 /// model is deleted (`model_deleted`); `status_code`, `error_class`,
@@ -676,9 +686,16 @@ pub async fn list_charges(
     let limit = page_limit(q.limit);
     let mut sql = QueryBuilder::<Postgres>::new(charge_select(grouped));
     if grouped {
-        sql.push(crate::request_groups::from_sql(anchored, ""));
+        sql.push(crate::request_groups::from_sql(
+            anchored,
+            COST_BACKFILL_JOINS,
+        ));
     } else {
-        sql.push(" FROM pricing_charges_cny pc LEFT JOIN usage_events ue ON ue.event_id = pc.event_id WHERE true");
+        sql.push(
+            " FROM pricing_charges_cny pc LEFT JOIN usage_events ue ON ue.event_id = pc.event_id",
+        )
+        .push(COST_BACKFILL_JOINS)
+        .push(" WHERE true");
     }
     if let Some(before) = q.before {
         sql.push(" AND pc.seq < ").push_bind(before);
@@ -802,7 +819,12 @@ pub async fn list_charges(
                 )
                 .await?;
                 let mut attempts_sql = QueryBuilder::<Postgres>::new(charge_select(false));
-                attempts_sql.push(" FROM pricing_charges_cny pc LEFT JOIN usage_events ue ON ue.event_id = pc.event_id WHERE pc.event_id = ANY(").push_bind(&attempt_ids).push(") ORDER BY pc.seq ASC");
+                attempts_sql
+                    .push(" FROM pricing_charges_cny pc LEFT JOIN usage_events ue ON ue.event_id = pc.event_id")
+                    .push(COST_BACKFILL_JOINS)
+                    .push(" WHERE pc.event_id = ANY(")
+                    .push_bind(&attempt_ids)
+                    .push(") ORDER BY pc.seq ASC");
                 let attempt_rows = attempts_sql
                     .build_query_as::<ChargeRow>()
                     .fetch_all(&mut *conn)

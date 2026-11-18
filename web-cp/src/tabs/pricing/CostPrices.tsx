@@ -20,7 +20,7 @@ import { Select } from "../../ui/Select";
  * A cost is the same official price a tenant's charge is built on, times the
  * account's rate: the platform's cost for a call, never shown to a tenant.
  */
-export function CostPrices({ canEdit }: TabProps) {
+export function CostPrices({ canEdit, operator }: TabProps) {
   const [rows, setRows] = useState<{ account: CostAccount; default: CostRatePlan }[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
@@ -46,7 +46,7 @@ export function CostPrices({ canEdit }: TabProps) {
   });
   const open = rows?.find((r) => r.account.id === selected)?.account ?? null;
   if (open) {
-    return <CostAccountDetail account={open} canEdit={canEdit} onBack={() => setSelected(null)} onChanged={load} />;
+    return <CostAccountDetail account={open} canEdit={canEdit} isAdmin={operator.role === "admin"} onBack={() => setSelected(null)} onChanged={load} />;
   }
   const configured = rows?.filter((r) => r.default.current?.cny_per_usd != null).length ?? 0;
   const scheduledCount = rows?.reduce((n, r) => n + r.default.upcoming.length, 0) ?? 0;

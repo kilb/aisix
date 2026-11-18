@@ -6,9 +6,8 @@
 //! charge less the cost, and the margin is that profit as a percentage of
 //! the charge, both over the rows whose cost is known ([`margin_pct`]).
 //!
-//! A row's cost is known only when it names the account that served it and
-//! that account has a cost rate in force for the model; a row priced before
-//! cost became a rate has no CNY cost either. A cost nobody knows never
+//! A row's cost can come from its original snapshot or an explicit historical
+//! cost backfill for the serving account. A cost nobody knows never
 //! enters the cost side, and is never read as 0: such rows are counted apart
 //! (`rows_without_cost`) rather than dropped silently, so an operator can
 //! see how much of a period's charge the cost side does not cover — and
@@ -171,17 +170,19 @@ pub async fn list(
                                  WHERE pa.event_id = c.event_id)), 0)::bigint) \
                   AS charged, \
                 (COALESCE(SUM(c.charge_micro_cny) \
-                          FILTER (WHERE c.cost_micro_cny IS NOT NULL), 0)::bigint \
+                          FILTER (WHERE cost.amount IS NOT NULL), 0)::bigint \
                  + COALESCE(SUM((SELECT COALESCE(SUM(pa.delta_micro_cny)::bigint, 0) \
                                  FROM pricing_adjustments_cny pa \
                                  WHERE pa.event_id = c.event_id)) \
-                            FILTER (WHERE c.cost_micro_cny IS NOT NULL), 0)::bigint) \
+                            FILTER (WHERE cost.amount IS NOT NULL), 0)::bigint) \
                   AS charged_with_cost, \
-                COALESCE(SUM(c.cost_micro_cny), 0)::bigint AS cost, \
-                (COUNT(*) FILTER (WHERE c.cost_micro_cny IS NOT NULL))::bigint AS rows, \
-                (COUNT(*) FILTER (WHERE c.cost_micro_cny IS NULL))::bigint \
+                COALESCE(SUM(cost.amount), 0)::bigint AS cost, \
+                (COUNT(*) FILTER (WHERE cost.amount IS NOT NULL))::bigint AS rows, \
+                (COUNT(*) FILTER (WHERE cost.amount IS NULL))::bigint \
                   AS rows_without_cost \
          FROM pricing_charges_cny c \
+         LEFT JOIN pricing_cost_backfills b ON b.event_id = c.event_id \
+         CROSS JOIN LATERAL (SELECT COALESCE(c.cost_micro_cny, b.cost_micro_cny) AS amount) cost \
          LEFT JOIN tenant_keys k ON k.id::text = c.api_key_id \
          LEFT JOIN provider_groups g ON g.id = COALESCE(c.group_id, k.group_id) \
          LEFT JOIN gw_resources r ON r.kind = 'models' AND NOT r.deleted \
