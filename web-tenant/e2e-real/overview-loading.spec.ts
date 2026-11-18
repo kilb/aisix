@@ -57,3 +57,63 @@ test("已认证概览不等组织资料返回才开始读取统计", async ({ co
     expect((await context.request.post(new URL("api/logout", base).href, { data: {} })).status()).toBe(204);
   }
 });
+
+for (const portal of ["tenant", "admin"] as const) {
+  test(`${portal} 概览按摘要读取，进入分析后加载同一窗口的完整指标`, async ({ context, page }, info) => {
+    const origin = new URL(portal === "tenant" ? baseUrl : state.adminUrl);
+    if (!["http:", "https:"].includes(origin.protocol) || !["localhost", "127.0.0.1", "[::1]"].includes(origin.hostname) || origin.username || origin.password) throw new Error("需要本地隔离门户");
+    const prefix = portal === "tenant" ? "/api" : "/admin";
+    const metricPath = prefix + "/usage/metrics";
+    const account = portal === "tenant" ? auth.metricsOwner : auth.operator;
+    const login = await context.request.post(new URL(prefix + "/login", origin).href, { data: account });
+    expect(login.status()).toBe(200);
+    const metricRequests: string[] = [];
+    page.on("request", request => {
+      if (new URL(request.url()).pathname === metricPath) metricRequests.push(request.url());
+    });
+    const metrics = () => page.waitForResponse(r => new URL(r.url()).pathname === metricPath && r.request().method() === "GET");
+    try {
+      const landing = metrics();
+      await page.goto(new URL(portal === "tenant" ? "#org" : "#overview", origin).href);
+      const compact = await landing;
+      expect(compact.status()).toBe(200);
+      expect(new URL(compact.url()).searchParams.get("view")).toBe("overview");
+      const summary = await compact.json();
+      const overview = page.getByRole("group", { name: "API 指标概览" });
+      await expect(overview).toHaveAttribute("aria-busy", "false");
+      await expect(overview.locator('[data-metric-kpi="requests"]').getByText(summary.totals.requests.toLocaleString("en-US"), { exact: true })).toBeVisible();
+      expect(metricRequests).toHaveLength(1);
+      const overviewRequests = metricRequests.length;
+      const next = metrics();
+      await page.getByRole("link", { name: /^查看用量分析/ }).click();
+      const analysis = await next;
+      expect(analysis.status()).toBe(200);
+      expect(new URL(analysis.url()).searchParams.has("view")).toBe(false);
+      await expect(page.getByRole("region", { name: "完整 API 指标" })).toHaveAttribute("aria-busy", "false");
+      expect(metricRequests).toHaveLength(2);
+
+      const full = await analysis.json();
+      expect([summary.from, summary.to, summary.bucket]).toEqual([full.from, full.to, full.bucket]);
+      expect(summary.models).toEqual([]);
+      expect(full.totals).toHaveProperty("tokens");
+      expect(summary.totals).not.toHaveProperty("tokens");
+      const counts = ["requests", "succeeded_requests", "failed_requests", "unknown_outcome_requests", "unknown_final_attempts", "billing_attempts", "known_outcome_requests", "unpriced_attempts", "success_rate", "charged_micro_cny"];
+      for (const field of counts) {
+        expect(full.totals).toHaveProperty(field);
+        expect(summary.totals).toHaveProperty(field, full.totals[field]);
+      }
+      const { p50, sample_count, missing_count } = full.totals.first_token_latency_ms;
+      expect(summary.totals.first_token_latency_ms).toStrictEqual({ p50, sample_count, missing_count });
+      expect(full.series.length).toBeGreaterThan(0);
+      expect(summary.series).toStrictEqual(full.series.map((row: { period_start: string; requests: number; first_token_latency_ms: { avg: number | null } }) => ({
+        period_start: row.period_start, requests: row.requests, first_token_latency_ms: { avg: row.first_token_latency_ms.avg },
+      })));
+      await info.attach("overview-comparison", {
+        body: JSON.stringify({ portal, overviewRequests, analysisRequests: metricRequests.length - overviewRequests, totalRequests: full.totals.requests, periods: full.series.length, p50, sample_count, missing_count }),
+        contentType: "application/json",
+      });
+    } finally {
+      expect((await context.request.post(new URL(prefix + "/logout", origin).href, { data: {} })).status()).toBe(204);
+    }
+  });
+}

@@ -117,6 +117,116 @@ async fn p99_keeps_null_zero_small_samples_and_full_range_percentiles() {
     );
 }
 
+#[tokio::test]
+async fn overview_only_returns_visible_cards_and_trends_for_the_same_scope() {
+    let Some(w) = world().await else { return };
+    let model = seed_model(&w.cp, &w.admin).await;
+    let owner = w.cp.member_login_seeded(w.tenant, MemberRole::Owner).await;
+    let from = DateTime::from_timestamp(Utc::now().timestamp().div_euclid(3600) * 3600, 0)
+        .expect("整点")
+        - TimeDelta::hours(4);
+    let mut rows = Vec::new();
+    for (n, (hour, ttft)) in [(0, Some(0)), (0, Some(20)), (2, Some(1200)), (2, None)]
+        .into_iter()
+        .enumerate()
+    {
+        let mut row = event(&w, &format!("overview-{n}"), model, json!({}));
+        row["occurred_at"] = json!((from + TimeDelta::hours(hour)).to_rfc3339());
+        if let Some(ttft) = ttft {
+            row["first_token_latency_ms"] = json!(ttft);
+        }
+        rows.push(row);
+    }
+    let other = w.cp.member_login_seeded(w.tenant, MemberRole::Member).await;
+    let other_key = seed_key(&w.cp, &w.admin, w.tenant, Some(other.id)).await;
+    rows.push(event(&w, "overview-other", model, json!({
+        "api_key_id": other_key, "occurred_at": from.to_rfc3339(), "first_token_latency_ms": 9000,
+    })));
+    intake(&w, rows).await;
+    let window = format!(
+        "from={}&to={}&bucket=hour&api_key_id={}",
+        from.to_rfc3339_opts(SecondsFormat::Secs, true),
+        (from + TimeDelta::hours(4)).to_rfc3339_opts(SecondsFormat::Secs, true),
+        w.key
+    );
+    for (path, cookie) in [
+        ("/api/usage/metrics".to_owned(), owner.cookie()),
+        ("/admin/usage/metrics".to_owned(), w.admin.cookie()),
+        (
+            format!("/admin/tenants/{}/usage/metrics", w.tenant),
+            w.admin.cookie(),
+        ),
+    ] {
+        let full =
+            w.cp.send("GET", &format!("{path}?{window}"), Some(cookie), None)
+                .await;
+        let overview =
+            w.cp.send(
+                "GET",
+                &format!("{path}?{window}&view=overview"),
+                Some(cookie),
+                None,
+            )
+            .await;
+        let t = totals(&overview);
+        let full_t = totals(&full);
+        assert!(full_t.get("tokens").is_some());
+        assert!(t.get("tokens").is_none(), "概览不返回完整分析");
+        assert_eq!(overview.body.get("models"), Some(&json!([])));
+        for field in [
+            "requests",
+            "succeeded_requests",
+            "failed_requests",
+            "known_outcome_requests",
+            "unknown_outcome_requests",
+            "unknown_final_attempts",
+            "success_rate",
+            "billing_attempts",
+            "unpriced_attempts",
+            "charged_micro_cny",
+        ] {
+            assert_eq!(
+                &t[field],
+                full_t.get(field).expect("完整指标字段存在"),
+                "{field}"
+            );
+            assert!(t.get(field).is_some(), "{field}");
+        }
+        near(&t["first_token_latency_ms"]["p50"], 20.0);
+        assert_eq!(t["first_token_latency_ms"]["sample_count"], 3);
+        assert_eq!(t["first_token_latency_ms"]["missing_count"], 1);
+        for field in ["from", "to", "bucket"] {
+            assert_eq!(
+                overview.body.get(field),
+                full.body.get(field).filter(|v| !v.is_null())
+            );
+        }
+        let periods = overview.body["series"].as_array().expect("概览时间桶");
+        assert_eq!(periods.len(), 4);
+        for (i, period) in periods.iter().enumerate() {
+            let reference = &full.body["series"][i];
+            assert_eq!(
+                period,
+                &json!({"period_start":reference["period_start"], "requests":reference["requests"],
+                "first_token_latency_ms":{"avg":reference["first_token_latency_ms"]["avg"]}})
+            );
+        }
+    }
+    let hidden =
+        w.cp.send(
+            "GET",
+            &format!("/api/usage/metrics?{window}&view=overview"),
+            Some(other.cookie()),
+            None,
+        )
+        .await;
+    assert_eq!(totals(&hidden)["requests"], 0);
+    assert_eq!(
+        totals(&hidden)["first_token_latency_ms"].get("p50"),
+        Some(&Value::Null)
+    );
+}
+
 async fn intake(w: &World, events: Vec<Value>) {
     for batch in events.chunks(500) {
         let response = deliver(&w.dp, Uuid::new_v4(), batch.to_vec()).await;
@@ -528,6 +638,17 @@ async fn repricing_is_exact_above_javascript_integer_range_and_never_multiplies_
     assert_eq!(t["adjusted_micro_cny"], "9007199254741000");
     assert_eq!(t["tokens"]["prompt_tokens"], 2);
     assert_eq!(t["unpriced_attempts"], 0);
+    let overview =
+        w.cp.send(
+            "GET",
+            "/api/usage/metrics?view=overview",
+            Some(owner.cookie()),
+            None,
+        )
+        .await;
+    let summary = totals(&overview);
+    assert_eq!(summary["charged_micro_cny"], "9007199254741002");
+    assert_eq!(summary["billing_attempts"], 2);
 }
 
 #[tokio::test]

@@ -75,6 +75,26 @@ pub async fn migrate_rest(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateErr
     migrator.run(&mut *conn).await
 }
 
+/// 在升级后的原库上启动真实 HTTP 服务；返回的 TestCp 负责清理这个独立测试库。
+pub async fn into_test_cp(pool: PgPool) -> super::TestCp {
+    let options = pool.connect_options();
+    let name = options.get_database().expect("迁移测试库名").to_owned();
+    let server_url = gate_var("CP_TEST_DATABASE_URL").expect("迁移测试数据库地址");
+    let url = with_database(&server_url, &name);
+    let cfg = super::test_config(&url);
+    let slot = tokio::time::timeout(super::DATABASE_SLOT_WAIT, super::DATABASE_SLOTS.acquire())
+        .await
+        .expect("等待测试服务的数据库连接配额")
+        .expect("测试配额始终开放");
+    let database = std::sync::Arc::new(super::TestDatabase {
+        server_url,
+        name,
+        url,
+        _slot: slot,
+    });
+    super::TestCp::boot(database, cfg).await
+}
+
 /// Closes `pool` and drops the database behind it.
 pub async fn drop_database(pool: PgPool) {
     let Some(name) = pool.connect_options().get_database().map(str::to_string) else {

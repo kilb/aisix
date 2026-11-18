@@ -142,6 +142,28 @@ async fn managers_get_one_whitelisted_batch_with_key_record_ownership_and_zero_m
         );
         assert!(to > now - TimeDelta::minutes(1) && to <= now + TimeDelta::minutes(1));
     }
+    for target in [second.id, zero.id, outsider.id] {
+        let person = get(&w, &owner, &format!("/api/members?member_id={target}")).await;
+        let usage = get(
+            &w,
+            &owner,
+            &format!("/api/members/usage?member_id={target}"),
+        )
+        .await;
+        if target == outsider.id {
+            assert!(items(&person).is_empty());
+            assert!(items(&usage).is_empty());
+        } else {
+            assert_eq!(items(&person).len(), 1);
+            assert_eq!(items(&person)[0]["id"], json!(target));
+            assert_eq!(items(&usage).len(), 1);
+            assert_eq!(items(&usage)[0]["member_id"], json!(target));
+            assert_eq!(
+                items(&usage)[0]["charged_micro_cny"],
+                if target == second.id { "680" } else { "0" }
+            );
+        }
+    }
     let outsider_session = w.cp.member_login_as(&outsider).await;
     let outside = get(&w, &outsider_session, "/api/members/usage").await;
     assert_eq!(items(&outside).len(), 1);

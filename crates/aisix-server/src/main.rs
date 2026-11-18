@@ -1155,9 +1155,12 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
     // + same cp_base URL host. We derive the
     // /dp/telemetry URL from the /dp/heartbeat URL by swapping the
     // path suffix so the two stay in lock-step on cp_base changes.
-    let telemetry_cfg = heartbeat_cfg
-        .as_ref()
-        .map(|h| telemetry::TelemetryConfig::new(telemetry_url(&h.url), h.mtls.clone()));
+    let telemetry_cfg = heartbeat_cfg.as_ref().map(|h| {
+        (
+            telemetry::TelemetryConfig::new(telemetry_url(&h.url), h.mtls.clone()),
+            &h.dp_id,
+        )
+    });
     // Steps 7-8: build Hub, shared components, then routers.
     let hub = Arc::new(build_hub());
     // env_id is resolved by now (managed provisioning / sidecar restore
@@ -1187,9 +1190,23 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
     // proxy has finished serving: see `telemetry::stop_after`.
     let (usage_stop_tx, usage_stop_rx) = watch::channel(false);
     let (usage_sink, telemetry_task) = match telemetry_cfg {
-        Some(cfg) => {
-            let (sink, handle) = telemetry::spawn(cfg, (*metrics).clone(), usage_stop_rx);
+        Some((telemetry_cfg, dp_id)) => {
+            let (sink, handle) = if let Some(path) = &cfg.managed.usage_spool_dir {
+                telemetry::spawn_spooled(
+                    telemetry_cfg,
+                    (*metrics).clone(),
+                    usage_stop_rx,
+                    Path::new(path),
+                    &cfg.etcd.env_id,
+                    dp_id,
+                )?
+            } else {
+                telemetry::spawn(telemetry_cfg, (*metrics).clone(), usage_stop_rx)
+            };
             (sink, Some(handle))
+        }
+        None if cfg.managed.usage_spool_dir.is_some() => {
+            anyhow::bail!("managed.usage_spool_dir requires managed telemetry");
         }
         None => (aisix_obs::UsageSink::disabled(), None),
     };

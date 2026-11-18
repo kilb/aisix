@@ -18,6 +18,7 @@ use crate::AppState;
 
 #[derive(Default, Deserialize)]
 pub struct UsageQuery {
+    member_id: Option<Uuid>,
     from: Option<DateTime<Utc>>,
     to: Option<DateTime<Utc>>,
 }
@@ -51,16 +52,23 @@ struct MemberUsage {
 async fn summarize(
     state: &AppState,
     tenant: Uuid,
+    member: Option<Uuid>,
     from: DateTime<Utc>,
     to: DateTime<Utc>,
 ) -> Result<Vec<MemberUsage>, ApiError> {
+    // 两种范围使用不同语句，使重复访问详情仍能直接按成员索引查找。
+    let (charge_member, live_member) = if member.is_some() {
+        ("AND pc.user_id = $4::uuid::text", "AND id = $4")
+    } else {
+        ("", "")
+    };
     let sql = format!(
         "WITH scoped AS MATERIALIZED (\
            SELECT pc.user_id, pc.status, pc.charge_micro_cny, pc.estimated, \
                   {ADJUSTED} AS adjusted, eff.created_at AS corrected_at, {EFF_LINES} AS lines \
            FROM pricing_charges_cny pc JOIN usage_events ue ON ue.event_id = pc.event_id \
            {EFFECTIVE} \
-           WHERE pc.tenant_id = $1::text AND pc.user_id <> '' \
+           WHERE pc.tenant_id = $1::text AND pc.user_id <> '' {charge_member} \
              AND pc.occurred_at >= $2 AND pc.occurred_at < $3 AND {VISIBLE}\
          ), totals AS (\
            SELECT user_id, count(*)::bigint AS requests, \
@@ -76,7 +84,7 @@ async fn summarize(
          ), quantities AS (\
            SELECT user_id, jsonb_object_agg(dimension, quantity) AS quantities FROM dimensions GROUP BY user_id\
          ), member_ids AS (\
-           SELECT id::text AS user_id FROM members WHERE tenant_id = $1::uuid AND removed_at IS NULL \
+           SELECT id::text AS user_id FROM members WHERE tenant_id = $1::uuid AND removed_at IS NULL {live_member} \
            UNION SELECT user_id FROM totals\
          ) \
          SELECT ids.user_id AS member_id, COALESCE(t.requests, 0) AS requests, \
@@ -89,10 +97,14 @@ async fn summarize(
          FROM member_ids ids LEFT JOIN totals t ON t.user_id = ids.user_id \
          LEFT JOIN quantities q ON q.user_id = ids.user_id ORDER BY ids.user_id"
     );
-    let rows = sqlx::query_as::<_, StoredUsage>(&sql)
+    let mut rows = sqlx::query_as::<_, StoredUsage>(&sql)
         .bind(tenant)
         .bind(from)
-        .bind(to)
+        .bind(to);
+    if let Some(member) = member {
+        rows = rows.bind(member);
+    }
+    let rows = rows
         .fetch_all(state.db.pool())
         .await
         .map_err(DbError::from)?;
@@ -134,7 +146,7 @@ pub async fn get(
         q.to.unwrap_or(now),
         Some(Group::Day),
     )?;
-    let items = summarize(&state, auth.tenant_id, from, to).await?;
+    let items = summarize(&state, auth.tenant_id, q.member_id, from, to).await?;
     Ok(Json(
         serde_json::json!({"from": from, "to": to, "items": items}),
     ))

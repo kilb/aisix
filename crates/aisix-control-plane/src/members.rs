@@ -23,7 +23,8 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use axum::extract::{Path, State};
+use axum::extract::rejection::QueryRejection;
+use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -33,7 +34,7 @@ use rand_core::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use sqlx::PgConnection;
+use sqlx::{PgConnection, QueryBuilder};
 use uuid::Uuid;
 
 use crate::audit::{self, Actor, AuditEntry};
@@ -345,15 +346,22 @@ async fn live_member(
 }
 
 /// The live members of `tenant_id`, oldest first.
-async fn members_of(conn: &mut PgConnection, tenant_id: Uuid) -> Result<Value, ApiError> {
-    let raw: Vec<RawMember> = sqlx::query_as(&format!(
-        "SELECT {COLUMNS} FROM members WHERE tenant_id = $1 AND removed_at IS NULL \
-         ORDER BY created_at, id"
-    ))
-    .bind(tenant_id)
-    .fetch_all(conn)
-    .await
-    .map_err(DbError::from)?;
+async fn members_of(
+    conn: &mut PgConnection,
+    tenant_id: Uuid,
+    member_id: Option<Uuid>,
+) -> Result<Value, ApiError> {
+    let mut sql = QueryBuilder::new(format!("SELECT {COLUMNS} FROM members WHERE tenant_id = "));
+    sql.push_bind(tenant_id).push(" AND removed_at IS NULL");
+    if let Some(id) = member_id {
+        sql.push(" AND id = ").push_bind(id);
+    }
+    let raw: Vec<RawMember> = sql
+        .push(" ORDER BY created_at, id")
+        .build_query_as()
+        .fetch_all(conn)
+        .await
+        .map_err(DbError::from)?;
     let items = raw
         .into_iter()
         .map(|r| MemberRow::from_raw(r).map(|row| row.view()))
@@ -1480,6 +1488,11 @@ pub async fn models(
     Ok(Json(json!({ "items": items })))
 }
 
+#[derive(Deserialize)]
+pub struct MemberFilter {
+    pub member_id: Option<Uuid>,
+}
+
 /// `GET /api/members` → `{items: [Member]}`. Open while the tenant is
 /// pending or suspended too, so that a member can be found to be removed
 /// (`DELETE /api/members/{id}`). A read: the caller is judged as the
@@ -1487,10 +1500,14 @@ pub async fn models(
 pub async fn list(
     auth: MemberAuth,
     State(state): State<AppState>,
+    query: Result<Query<MemberFilter>, QueryRejection>,
 ) -> Result<Json<Value>, ApiError> {
     auth.require(&[MemberRole::Owner, MemberRole::Admin])?;
+    let Query(filter) = query.map_err(crate::usage::query_rejected)?;
     let mut conn = state.db.pool().acquire().await.map_err(DbError::from)?;
-    Ok(Json(members_of(&mut conn, auth.tenant_id).await?))
+    Ok(Json(
+        members_of(&mut conn, auth.tenant_id, filter.member_id).await?,
+    ))
 }
 
 #[derive(Deserialize)]
@@ -1662,7 +1679,7 @@ pub async fn admin_list(
     if !exists {
         return Err(ApiError::not_found());
     }
-    Ok(Json(members_of(&mut conn, id).await?))
+    Ok(Json(members_of(&mut conn, id, None).await?))
 }
 
 /// `POST /admin/tenants/{id}/invites` with `{email, role}` → `201 {id,

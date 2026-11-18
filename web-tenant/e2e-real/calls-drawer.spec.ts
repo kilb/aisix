@@ -105,7 +105,7 @@ function definition(area: Locator, label: string): Locator {
 
 const UPSTREAM_TIMING_FIELDS = [
   "http_send_started_ms", "response_headers_ms", "first_response_byte_ms",
-  "first_protocol_frame_ms", "first_canonical_chunk_ms", "first_content_ms",
+  "first_protocol_frame_ms", "first_canonical_chunk_ms", "upstream_first_content_ms", "first_content_ms",
 ] as const;
 
 /** 只按真实 API 原值核对原始偏移，缺省和非法值不能从其他时钟补齐。 */
@@ -114,6 +114,8 @@ async function expectUpstreamTiming(scope: Locator, raw: unknown): Promise<void>
   await expect(region).toHaveCount(1);
   await expect(region).toBeVisible();
   await expect(region.locator("[data-upstream-timing-field]")).toHaveCount(UPSTREAM_TIMING_FIELDS.length);
+  await expect(region.locator('[data-upstream-timing-field="upstream_first_content_ms"] dt')).toHaveText("上游首个内容帧");
+  await expect(region.locator('[data-upstream-timing-field="first_content_ms"] dt')).toHaveText("首次内容交付");
   const timing = raw !== null && typeof raw === "object" && !Array.isArray(raw) ? raw as Readonly<Record<string, unknown>> : null;
   for (const name of UPSTREAM_TIMING_FIELDS) {
     const slot = region.locator(`[data-upstream-timing-field="${name}"]`);
@@ -177,14 +179,35 @@ test("real-call-list-preserves-measured-performance-token-usage-and-unknowns", a
   await expect(page.getByText(/旧记录未采集/)).toBeVisible();
 });
 
-// 打开详情不请求逐条数据；Escape、Tab约束与遮罩关闭保留原行焦点。
+// 同一次列表浏览中重开详情复用已读尝试；键盘与遮罩关闭均保留触发按钮焦点。
 test("real-call-drawer-keeps-fee-details-keyboard-focus-and-no-extra-requests", async ({ page }) => {
   const { row, call } = await showCall(page, positive);
   const trigger = row.getByRole("button", { name: "查看调用详情", exact: true });
   const before = apiRequests.get(page)!.length;
+  const response = page.waitForResponse(reply => {
+    const url = new URL(reply.url());
+    return reply.ok() && url.pathname === "/api/usage/calls" && url.searchParams.get("event_id") === call.event_id && url.searchParams.get("include_attempts") === "true";
+  });
   await trigger.click();
+  const detail = await (await response).json() as { items: { attempts: { event_id: string }[] }[] };
+  expect(detail.items).toHaveLength(1);
+  const attempts = detail.items[0]!.attempts;
+  expect(attempts.length).toBeGreaterThan(0);
   const dialog = page.getByRole("dialog", { name: "调用详情", exact: true });
   await expect(dialog).toBeVisible();
+  const chain = dialog.getByRole("region", { name: "故障转移与重试链", exact: true });
+  async function expectAttempts() {
+    await expect(chain.locator("article[data-attempt-event]")).toHaveCount(attempts.length);
+    for (const attempt of attempts) {
+      const article = chain.locator(`article[data-attempt-event="${attempt.event_id}"]`);
+      await expect(article.getByText(attempt.event_id, { exact: true })).toBeVisible();
+      const log = article.locator("details");
+      await log.locator("summary").click();
+      await expect(log.locator("pre")).toHaveText(JSON.stringify(attempt, null, 2));
+      await log.locator("summary").click();
+    }
+  }
+  await expectAttempts();
   for (const label of ["请求信息", "响应性能", "Token 消耗", "费用计算", "计费明细"]) await expect(dialog.getByRole("heading", { name: label, exact: true })).toBeVisible();
   await expect(dialog.getByText(positive.request_id, { exact: true })).toBeVisible();
   await expectUpstreamTiming(dialog, call.upstream_timing);
@@ -201,10 +224,17 @@ test("real-call-drawer-keeps-fee-details-keyboard-focus-and-no-extra-requests", 
   await page.keyboard.press("Escape");
   await expect(dialog).toHaveCount(0); await expect(trigger).toBeFocused();
   await trigger.click(); await expect(dialog).toBeVisible();
+  await expectAttempts();
   await page.mouse.click(8, 120);
   await expect(dialog).toHaveCount(0); await expect(trigger).toBeFocused();
   await page.waitForLoadState("networkidle");
-  expect(apiRequests.get(page)!.slice(before), "detail open and close must not create an API fan-out").toEqual([]);
+  const reads = apiRequests.get(page)!.slice(before);
+  expect(reads, "重复打开同一条调用只读取一次详情").toHaveLength(1);
+  const [method, target] = reads[0]!.split(" ");
+  const url = new URL(target!, baseUrl);
+  expect(method).toBe("GET");
+  expect(url.pathname).toBe("/api/usage/calls");
+  expect(Object.fromEntries(url.searchParams)).toEqual({ event_id: call.event_id, group_requests: "true", include_attempts: "true", limit: "1" });
 });
 
 // 窄屏抽屉保留完整宽度、内部滚动与可达关闭按钮，页面本身不横向溢出。

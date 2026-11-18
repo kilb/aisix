@@ -1084,8 +1084,8 @@ impl HashRing {
         I: IntoIterator<Item = &'a RoutingTarget>,
         I::IntoIter: Clone,
     {
-        Self::build_named(fingerprint, targets, scale, |target| {
-            std::borrow::Cow::Borrowed(target.model.as_str())
+        Self::build_named(fingerprint, targets, scale, |target, _| {
+            (std::borrow::Cow::Borrowed(target.model.as_str()), 0)
         })
     }
 
@@ -1093,7 +1093,7 @@ impl HashRing {
         fingerprint: u64,
         targets: I,
         scale: RingScale,
-        mut model_name: impl FnMut(&'a RoutingTarget) -> std::borrow::Cow<'a, str>,
+        mut point_range: impl FnMut(&'a RoutingTarget, usize) -> (std::borrow::Cow<'a, str>, usize),
     ) -> Self
     where
         I: IntoIterator<Item = &'a RoutingTarget>,
@@ -1112,8 +1112,9 @@ impl HashRing {
         let total_points = units.iter().sum::<u64>() as usize * RING_POINTS_PER_UNIT;
         let mut points = Vec::with_capacity(total_points);
         for (idx, (target, units)) in targets.zip(&units).enumerate() {
-            let model_name = model_name(target);
-            for i in 0..(*units as usize) * RING_POINTS_PER_UNIT {
+            let count = *units as usize * RING_POINTS_PER_UNIT;
+            let (model_name, start) = point_range(target, count);
+            for i in start..start + count {
                 let mut h = fnv1a_extend(FNV_OFFSET_BASIS, model_name.as_bytes());
                 h = fnv1a_extend(h, &[0]);
                 h = fnv1a_extend(h, &(i as u32).to_le_bytes());
@@ -1153,8 +1154,26 @@ impl HashRing {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RoutingGenerations {
+    models: u64,
+    accounts: u64,
+    keys: u64,
+}
+
+impl RoutingGenerations {
+    fn of(snapshot: &AisixSnapshot) -> Self {
+        Self {
+            models: snapshot.models.generation(),
+            accounts: snapshot.provider_keys.generation(),
+            keys: snapshot.apikeys.generation(),
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct RoutingRegistry {
+    published: std::sync::RwLock<Option<RoutingGenerations>>,
     wrr: DashMap<TierKey, Mutex<WrrState>>,
     rings: DashMap<TierKey, std::sync::Arc<HashRing>>,
     fixed_pools: DashMap<(String, u64), std::sync::Arc<fixed_hash::FixedHashPool>>,
@@ -1169,6 +1188,64 @@ impl RoutingRegistry {
         self.wrr.retain(|(name, _), _| configured(name));
         self.rings.retain(|(name, _), _| configured(name));
         self.fixed_pools.retain(|(name, _), _| configured(name));
+    }
+
+    pub(crate) fn reconcile_snapshot(&self, snapshot: &AisixSnapshot) {
+        let current = RoutingGenerations::of(snapshot);
+        let mut published = self
+            .published
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *published == Some(current) {
+            return;
+        }
+        let models_changed = published.is_none_or(|old| old.models != current.models);
+        if models_changed {
+            self.retain_configured(&|name| snapshot.models.get_by_name(name).is_some());
+            self.rings.retain(|(name, _), ring| {
+                let name = name.strip_suffix(PARTIAL_ROUTE_ROTATION).unwrap_or(name);
+                ring.configured.as_ref().is_none_or(|tier| {
+                    snapshot
+                        .models
+                        .get_by_name(name)
+                        .is_some_and(|entry| std::sync::Arc::ptr_eq(&entry.value, &tier.owner))
+                })
+            });
+        }
+        if models_changed || published.is_none_or(|old| old.accounts != current.accounts) {
+            // 这些池的命中本就要求模型表和账号表的版本完全一致。
+            self.fixed_pools.clear();
+        } else if published.is_some_and(|old| old.keys != current.keys) {
+            // 仅有带权限范围的暖池时才需核对当前 key；同一范围可由多个 key 共用。
+            let mut active = None;
+            self.fixed_pools.retain(|_, pool| {
+                pool.allowed_groups.is_empty()
+                    || active
+                        .get_or_insert_with(|| {
+                            snapshot
+                                .apikeys
+                                .matching_entries(|entry| {
+                                    !entry.value.allowed_provider_groups.is_empty()
+                                })
+                                .into_iter()
+                                .map(|entry| entry.value.allowed_provider_groups.clone())
+                                .collect::<std::collections::HashSet<_>>()
+                        })
+                        .contains(&pool.allowed_groups)
+            });
+        }
+        *published = Some(current);
+    }
+
+    // 仅在建环后插入时与发布互斥；热命中不取此锁，旧请求可继续使用自己算出的结果。
+    fn cache_if_current(&self, snapshot: &AisixSnapshot, insert: impl FnOnce()) {
+        let published = self
+            .published
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if published.is_none_or(|current| current == RoutingGenerations::of(snapshot)) {
+            insert();
+        }
     }
 
     pub fn new() -> Self {

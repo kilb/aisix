@@ -6,9 +6,10 @@ pub(super) struct FixedHashPool {
     owner: Arc<Model>,
     models_generation: u64,
     accounts_generation: u64,
-    allowed_groups: Vec<String>,
+    pub(super) allowed_groups: Vec<String>,
     targets: Vec<AttemptModel>,
-    tag_targets: Vec<RoutingTarget>,
+    selected_declarations: Vec<RoutingTarget>,
+    known_tags: std::collections::HashSet<String>,
     ring: HashRing,
 }
 
@@ -77,7 +78,7 @@ impl FixedHashPool {
             .map(|target| target.priority)
             .max()
             .ok_or(ProxyError::ProviderUnavailable)?;
-        let keep: Vec<_> = targets
+        let mut keep: Vec<_> = targets
             .iter()
             .enumerate()
             .filter_map(|(index, target)| {
@@ -87,24 +88,65 @@ impl FixedHashPool {
         if keep.is_empty() {
             return Err(ProxyError::ProviderUnavailable);
         }
+        // 独立账号保留原有声明顺序和环点；共享账号按稳定模型 ID 分配不重叠的点序号。
+        let mut accounts = std::collections::HashSet::with_capacity(keep.len());
+        if keep
+            .iter()
+            .any(|&i| !accounts.insert(&declarations[i].model))
+        {
+            keep.sort_unstable_by(|&a, &b| targets[a].id.cmp(&targets[b].id));
+        }
         let selected_declarations: Vec<_> = keep
             .iter()
             .map(|&index| declarations[index].clone())
             .collect();
-        let ring = HashRing::build(
+        let mut next_point = std::collections::HashMap::<&str, usize>::new();
+        let ring = HashRing::build_named(
             tier_fingerprint(&selected_declarations),
             &selected_declarations,
             RingScale::of(selected_declarations.iter()),
+            |target, count| {
+                let next = next_point.entry(target.model.as_str()).or_default();
+                let start = *next;
+                *next += count;
+                (std::borrow::Cow::Borrowed(target.model.as_str()), start)
+            },
         );
+        // 标签的匹配及默认回退基于整个授权池，包括被优先级或权重排除的声明。
+        let known_tags = declarations
+            .iter()
+            .filter_map(|target| target.tags.as_ref())
+            .flatten()
+            .cloned()
+            .collect();
         Ok(Self {
             owner: owner.clone(),
             models_generation: snapshot.models.generation(),
             accounts_generation: snapshot.provider_keys.generation(),
             allowed_groups: groups.to_vec(),
             targets: keep.iter().map(|&index| targets[index].clone()).collect(),
-            tag_targets: declarations,
+            selected_declarations,
+            known_tags,
             ring,
         })
+    }
+
+    fn admits_tags(&self, selected: usize, requested: &[String]) -> bool {
+        if self.known_tags.is_empty() {
+            return true;
+        }
+        let target = &self.selected_declarations[selected];
+        if requested.iter().any(|tag| self.known_tags.contains(tag)) {
+            target.matches_request_tags(requested)
+        } else if requested.is_empty()
+            && !self
+                .known_tags
+                .contains(aisix_core::models::routing::DEFAULT_ROUTING_TAG)
+        {
+            true
+        } else {
+            target.is_default_target()
+        }
     }
 }
 
@@ -164,7 +206,9 @@ pub(super) fn resolve(
                 routing,
                 req.allowed_groups,
             )?);
-            registry.fixed_pools.insert(key, pool.clone());
+            registry.cache_if_current(snapshot, || {
+                registry.fixed_pools.insert(key, pool.clone());
+            });
             pool
         }
     };
@@ -188,10 +232,7 @@ pub(super) fn resolve(
     if !selected.model.ip_allowed(req.source_ip) {
         return Err(ProxyError::ModelIpRestricted(name.to_string()));
     }
-    let allowed_by_tags = eligible_targets(&pool.tag_targets, req.tags);
-    if !allowed_by_tags
-        .iter()
-        .any(|target| target.model_id.as_deref() == Some(selected.id.as_str()))
+    if !pool.admits_tags(point.1 as usize, req.tags)
         || req.serves.is_some_and(|serves| !serves(&selected.model))
     {
         return Err(ProxyError::ProviderUnavailable);

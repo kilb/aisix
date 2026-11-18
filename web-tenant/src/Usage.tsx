@@ -15,7 +15,7 @@ import { formulaCalls as usageCalls, type FormulaCall as Call } from "./lib/form
 import { discountedRate, feeMicroCny } from "./lib/formula";
 import { formMessageFor, messageFor } from "./lib/errors";
 import { fmtCnyPerMillion, fmtMicroCny, perThousandOfPerMillion } from "./lib/money";
-import { beijingRange, defaultCalendarRange, fmtBeijing, periodLabel, todayBeijing } from "./lib/time";
+import { beijingRange, defaultCalendarRange, fmtBeijing, periodLabel, todayBeijing, usagePeriodLabel } from "./lib/time";
 import { filterRecords, useRecordTable, type RecordPageSize } from "./lib/recordTable";
 import { RecordTablePager, RecordTableToolbar } from "./ui/RecordTable";
 import { Button } from "./ui/Button";
@@ -290,8 +290,10 @@ function CallLogDetails({ call: c, loadingAttempts = false, attemptError = null,
   </>;
 }
 
+type AttemptPages = WeakMap<Call, { page: ReturnType<typeof usageCalls>; expiresAt: number }>;
+
 /** 打开详情才读取完整链；关闭或切换请求后，迟到的响应不能覆盖当前详情。 */
-function CallLogDetailsLoader({ call }: { call: Call }) {
+function CallLogDetailsLoader({ call, firstPages }: { call: Call; firstPages: AttemptPages }) {
   const [detail, setDetail] = useState<Call | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -304,18 +306,28 @@ function CallLogDetailsLoader({ call }: { call: Call }) {
     setLoading(true);
     setError(null);
     pending.current = true;
-    usageCalls({ event_id: call.event_id, group_requests: true, include_attempts: true, limit: 1 }).then(page => {
-      if (generation.current !== mine) return;
+    let cached = firstPages.get(call);
+    if (!cached || cached.expiresAt <= Date.now()) {
+      const page = usageCalls({ event_id: call.event_id, group_requests: true, include_attempts: true, limit: 1 });
+      cached = { page, expiresAt: Infinity };
+      firstPages.set(call, cached);
+    }
+    const entry = cached;
+    entry.page.then(page => {
       const row = page.items[0];
+      // 重开时可复用刚读到的终态；进行中、空结果或失败必须重新读取。
+      if (entry.expiresAt === Infinity) entry.expiresAt = row?.request_group?.complete ? Date.now() + 30_000 : 0;
+      if (generation.current !== mine) return;
       if (row) setDetail(row);
       else setError("未找到此请求的尝试记录，记录可能已过保留期。");
     }, cause => {
+      entry.expiresAt = 0;
       if (generation.current === mine) setError(failure(cause));
     }).finally(() => {
       if (generation.current === mine) { setLoading(false); pending.current = false; }
     });
     return () => { generation.current += 1; };
-  }, [call.event_id, refresh]);
+  }, [call, firstPages, refresh]);
 
   async function loadMore() {
     if (pending.current) return;
@@ -571,7 +583,7 @@ function Summary({ keys, showKeys, ownScope, models }: { keys: TenantKey[]; show
             <tbody>
               {table.rows.map((r) => (
                 <tr key={`${r.period_start}/${r.model.id ?? r.model.name}`}>
-                  <td className="tabular" data-label="期间">{periodLabel(r.period_start, group)}</td>
+                  <td className="tabular" data-label="期间">{usagePeriodLabel(r, group)}</td>
                   <td data-label="模型" className="usage-summary-model-name">{summaryModel(r)}</td>
                   <td className="num" data-label="调用次数">{r.requests}</td>
                   <td className="num" data-label="费用">
@@ -657,6 +669,7 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
   const loadedSearch = useRef("");
   loadedSearch.current = searchQuery;
   const [selected, setSelected] = useState<Call | null>(null);
+  const [firstAttemptPages] = useState<AttemptPages>(() => new WeakMap());
   const detailTrigger = useRef<HTMLButtonElement>(null);
   const ticket = useRef(0);
 
@@ -795,7 +808,7 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
       />
 
       <CallLogDrawer call={selected} onOpenChange={open => { if (!open) setSelected(null); }} returnFocusRef={detailTrigger}>
-        {selected && <CallLogDetailsLoader key={selected.event_id} call={selected} />}
+        {selected && <CallLogDetailsLoader key={selected.event_id} call={selected} firstPages={firstAttemptPages} />}
       </CallLogDrawer>
 
     </Section>

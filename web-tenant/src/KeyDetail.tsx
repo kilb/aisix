@@ -1,11 +1,12 @@
 import { useEffect, useLayoutEffect, useState } from "react";
+import { keyLimitText } from "./lib/keyRateLimits";
 import { ArrowLeft, Pencil } from "lucide-react";
 import { KeyForm, stateOf, when } from "./Keys";
 import { ApiError, groups as groupApi, keys as keyApi, models as modelApi, org as readOrg, usageSummary, type Org, type PortalGroup, type PortalModel, type SessionMember, type TenantKey, type TenantStatus, type UsageSummaryRow } from "./lib/api";
 import { formMessageFor } from "./lib/errors";
 import { exactInteger, formatCount } from "./lib/chartFormat";
 import { fmtMicroCny } from "./lib/money";
-import { beijingRange, defaultCalendarRange, fmtBeijing, periodLabel } from "./lib/time";
+import { beijingRange, defaultCalendarRange, fmtBeijing, usagePeriodLabel } from "./lib/time";
 import { metricsRangeError } from "./lib/apiMetrics";
 import { usageDateValue, usageRange } from "./lib/usageNavigation";
 import { useHashQuery } from "./lib/useHashQuery";
@@ -63,7 +64,7 @@ function KeyUsage({ keyId }: { keyId: string }) {
   // 日期在当前页只出现一次，同日的每个模型仍各占一行。
   const dateGroups = new Map<string, UsageSummaryRow[]>();
   for (const row of table.rows) {
-    const label = row.model.id === null && row.model.name === "other" ? "跨期合并" : periodLabel(row.period_start, "day");
+    const label = usagePeriodLabel(row, "day");
     const rows = dateGroups.get(label);
     if (rows) rows.push(row);
     else dateGroups.set(label, [row]);
@@ -136,10 +137,18 @@ export function KeyDetail({ keyId, onBack, member, status, onSelfChanged }: {
     const failed = (error: unknown) => { if (live) setReadErr(failure(error)); };
     void modelApi.list().then(items => { if (live) setCatalog(items); }, failed);
     void groupApi.list().then(items => { if (live) setGroups(items); }, failed);
-    void readOrg().then(org => { if (live) setCaps(org.limits); }, failed);
     return () => { live = false; };
   }, [active, editing]);
   const key = answer.id === keyId ? answer.key : null;
+  const needCaps = (active && editing) || (key !== null && key.effective_rate_limit === undefined);
+  useEffect(() => {
+    if (!needCaps) return;
+    let live = true;
+    void readOrg().then(org => { if (live) setCaps(org.limits); }, error => {
+      if (live) { setCaps(null); setReadErr(failure(error)); }
+    });
+    return () => { live = false; };
+  }, [needCaps, keyId, revision]);
   const error = answer.id === keyId ? answer.error : null;
   const header = <PageHeader
     title={editing ? "修改密钥" : key?.label ?? "密钥详情"}
@@ -182,8 +191,8 @@ export function KeyDetail({ keyId, onBack, member, status, onSelfChanged }: {
         <div><dt>归属</dt><dd>{key.owner === null ? "组织" : key.owner.id === member.id ? "我" : key.owner.display_name ?? "成员"}</dd></div>
         <div><dt>分组</dt><dd>{key.group?.display_name ?? "未选择分组"}{!key.group_available ? "（不可用）" : ""}</dd></div>
         <div><dt>模型范围</dt><dd>{key.model_ids === null ? "全部组织授权" : `${formatCount(key.model_ids.length)} 个指定模型`}</dd></div>
-        <div><dt>并发限制</dt><dd>{key.rate_limit.concurrency === undefined ? "沿用组织上限" : formatCount(key.rate_limit.concurrency)}</dd></div>
-        <div><dt>每分钟请求</dt><dd>{key.rate_limit.rpm === undefined ? "沿用组织上限" : formatCount(key.rate_limit.rpm)}</dd></div>
+        <div><dt>并发限制</dt><dd>{keyLimitText(key, "concurrency", caps)}</dd></div>
+        <div><dt>每分钟请求</dt><dd>{keyLimitText(key, "rpm", caps)}</dd></div>
         <div><dt>状态</dt><dd><Lamp state={state.lamp}>{state.text}</Lamp></dd></div>
         <div><dt>有效期</dt><dd>{key.expires_at ? when(key.expires_at) : "永不过期"}</dd></div>
         <div><dt>创建时间</dt><dd>{when(key.created_at)}</dd></div>

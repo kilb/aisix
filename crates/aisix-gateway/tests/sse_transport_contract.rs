@@ -1,4 +1,6 @@
-use aisix_gateway::sse::{SseDecoder, SseEvent, SseFrameSplitter};
+use std::ops::ControlFlow;
+
+use aisix_gateway::sse::{drain_complete_frames, SseDecoder, SseEvent, SseFrameSplitter};
 
 #[test]
 fn frame_delivery_preserves_coalesced_bytes_partial_tail_and_every_chunk_cut() {
@@ -59,4 +61,75 @@ fn many_complete_frames_do_not_spend_the_incomplete_frame_budget() {
     splitter.push(b"data:b\n\n");
     assert_eq!(splitter.next_frame().unwrap(), Some(b"data:b\n\n".to_vec()));
     assert!(splitter.next_frame().unwrap().is_none());
+}
+
+#[test]
+fn decoder_after_a_coalesced_batch_resumes_split_crlf_and_preserves_the_eof_tail() {
+    let mut decoder = SseDecoder::with_max_frame_bytes(16);
+    let mut batch = b"data: a\n\n".repeat(1024);
+    batch.extend_from_slice(b"data: b\r\n\r");
+    let mut expected = vec![SseEvent::Data("a".into()); 1024];
+    expected.push(SseEvent::Data("b".into()));
+    assert_eq!(decoder.feed(batch.as_slice()).unwrap(), expected);
+    assert!(decoder.feed(&b"\ndata: c\r\n"[..]).unwrap().is_empty());
+    assert_eq!(
+        decoder.feed(&b"\r\ndata: tail"[..]).unwrap(),
+        [SseEvent::Data("c".into())]
+    );
+    assert_eq!(
+        decoder.finish().unwrap(),
+        Some(SseEvent::Data("tail".into()))
+    );
+}
+
+#[test]
+fn decoder_delivers_large_batch_before_reporting_the_oversized_tail() {
+    let mut decoder = SseDecoder::with_max_frame_bytes(8);
+    let mut batch = b"data:a\n\n".repeat(512);
+    batch.extend_from_slice(b"123456789");
+    assert_eq!(
+        decoder.feed(batch.as_slice()).unwrap(),
+        vec![SseEvent::Data("a".into()); 512]
+    );
+    assert_eq!(decoder.feed(&b"data:b\n\n"[..]).unwrap_err().limit, 8);
+    assert_eq!(decoder.finish().unwrap_err().limit, 8);
+}
+
+#[test]
+fn borrowed_drain_resumes_after_a_partial_frame_and_consumes_a_visitor_stop() {
+    let mut buf = b"data: first\r\ndata: sec".to_vec();
+    let mut scanned = 0;
+    assert_eq!(
+        drain_complete_frames::<()>(&mut buf, &mut scanned, |_| panic!("incomplete frame")),
+        ControlFlow::Continue(())
+    );
+    buf.extend_from_slice(b"ond\r\n\r\ndata: terminal\n\ndata: unread\n\ndata: tail");
+    let mut frames = Vec::new();
+    assert_eq!(
+        drain_complete_frames(&mut buf, &mut scanned, |frame| {
+            frames.push(frame.to_vec());
+            if frame == b"data: terminal\n\n" {
+                ControlFlow::Break("terminal")
+            } else {
+                ControlFlow::Continue(())
+            }
+        }),
+        ControlFlow::Break("terminal")
+    );
+    assert_eq!(
+        frames,
+        [
+            b"data: first\r\ndata: second\r\n\r\n".to_vec(),
+            b"data: terminal\n\n".to_vec(),
+        ]
+    );
+    assert_eq!(buf, b"data: unread\n\ndata: tail");
+    assert_eq!(
+        drain_complete_frames::<()>(&mut buf, &mut scanned, |frame| {
+            assert_eq!(frame, b"data: unread\n\n");
+            ControlFlow::Continue(())
+        }),
+        ControlFlow::Continue(())
+    );
+    assert_eq!(buf, b"data: tail");
 }

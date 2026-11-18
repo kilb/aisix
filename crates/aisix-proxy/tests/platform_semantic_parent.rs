@@ -170,3 +170,118 @@ async fn semantic_parent_request_errors_match_for_grouped_and_ungrouped_keys() {
     }
     assert_eq!(upstream.received_requests().await.unwrap().len(), 6);
 }
+
+#[tokio::test]
+async fn in_flight_route_keeps_example_vectors_across_snapshot_publication() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    for warm in [false, true] {
+        let upstream = MockServer::start().await;
+        let snapshot = AisixSnapshot::new();
+        let provider: ProviderKey = serde_json::from_value(json!({
+            "display_name": "provider", "secret": "test-secret", "provider": "openai",
+            "adapter": "openai", "api_base": format!("{}/v1", upstream.uri())
+        }))
+        .unwrap();
+        snapshot
+            .provider_keys
+            .insert(ResourceEntry::new("pk", provider, 1));
+        for name in ["matched", "default"] {
+            let model: Model = serde_json::from_value(json!({
+                "display_name": name, "provider": "openai", "model_name": name,
+                "provider_key_id": "pk"
+            }))
+            .unwrap();
+            snapshot.models.insert(ResourceEntry::new(name, model, 1));
+        }
+        let embedding: Model = serde_json::from_value(json!({
+            "display_name": "embed", "provider": "openai", "model_name": "embed",
+            "provider_key_id": "pk", "embedding": {"dimensions": 2}
+        }))
+        .unwrap();
+        snapshot
+            .models
+            .insert(ResourceEntry::new("embed", embedding, 1));
+        let router: Model = serde_json::from_value(json!({
+            "display_name": "router", "semantic": {
+                "embedding_model": "embed", "default": "default",
+                "routes": [{"name": "route", "target": "matched", "examples": ["example"]}],
+                "match": {"threshold": 0.5}
+            }
+        }))
+        .unwrap();
+        snapshot
+            .models
+            .insert(ResourceEntry::new("router", router, 1));
+        let key: ApiKey = serde_json::from_value(json!({
+            "key_hash": "8b6712790a2089c67aa97a2d80022df18cc65c7814350e33baebe79aab508891",
+            "allowed_models": ["*"]
+        }))
+        .unwrap();
+        snapshot.apikeys.insert(ResourceEntry::new("key", key, 1));
+        let config: ProxyConfig = serde_json::from_value(json!({"addr": "127.0.0.1:0"})).unwrap();
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized(
+            "openai",
+            Arc::new(aisix_provider_openai::OpenAiBridge::new()),
+        );
+        let handle = SnapshotHandle::new(snapshot);
+        let state = ProxyState::new(handle.clone(), hub, &config).without_cache();
+        let app = build_router(state.clone());
+        let remove_router = Arc::new(AtomicBool::new(!warm));
+        let remove_on_embed = remove_router.clone();
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(move |req: &wiremock::Request| {
+                // 请求已进入嵌入调用，再发布下一版快照。
+                if remove_on_embed.load(Ordering::Acquire) {
+                    let next = (*handle.load()).clone();
+                    assert!(next.models.remove("router").is_some());
+                    handle.store(next);
+                }
+                let body: Value = req.body_json().unwrap();
+                let count = body["input"].as_array().map_or(1, Vec::len);
+                let data: Vec<_> = (0..count).map(|index| {
+                    json!({"object": "embedding", "index": index, "embedding": [1.0, 0.0]})
+                }).collect();
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "object": "list", "model": "embed", "data": data,
+                    "usage": {"prompt_tokens": 1, "total_tokens": 1}
+                }))
+            })
+            .mount(&upstream)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(|req: &wiremock::Request| {
+                let body: Value = req.body_json().unwrap();
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "id": "chatcmpl-local", "object": "chat.completion", "created": 1,
+                    "model": body["model"], "choices": [{
+                        "index": 0, "message": {"role": "assistant", "content": body["model"]},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                }))
+            })
+            .mount(&upstream)
+            .await;
+        let body =
+            json!({"model": "router", "messages": [{"role": "user", "content": "user text"}]});
+        if warm {
+            let (status, answer) = request(app.clone(), "/v1/chat/completions", body.clone()).await;
+            assert_eq!(status, StatusCode::OK, "{answer}");
+            assert_eq!(answer["choices"][0]["message"]["content"], "matched");
+            assert_eq!(state.semantic_cache.entry_count(), 1);
+            remove_router.store(true, Ordering::Release);
+        }
+        let (status, answer) = request(app, "/v1/chat/completions", body).await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        assert_eq!(
+            answer["choices"][0]["message"]["content"], "matched",
+            "warm={warm}"
+        );
+        assert!(state.snapshot.load().models.get_by_name("router").is_none());
+        assert_eq!(state.semantic_cache.entry_count(), 0);
+    }
+}

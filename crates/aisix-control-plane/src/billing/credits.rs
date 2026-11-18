@@ -23,6 +23,7 @@ use super::marks;
 use super::topups::{self, Origin};
 use crate::audit::{self, Actor, AuditEntry};
 use crate::auth::{OperatorAuth, OperatorRole};
+use crate::db::DbError;
 use crate::error::ApiError;
 use crate::http::ApiJson;
 use crate::resources::write::WriteCtx;
@@ -34,13 +35,16 @@ use crate::AppState;
 pub struct NewCredit {
     amount_cny: String,
     #[serde(default)]
+    operation_id: Option<Uuid>,
+    #[serde(default)]
     reason: Option<String>,
     #[serde(default)]
     reference: Option<String>,
 }
 
 /// `POST /admin/tenants/{id}/credits` with `{amount_cny, reason,
-/// reference?}` → `201 AdminTopup`, posted and settled before the answer.
+/// reference?, operation_id?}` → `201 AdminTopup`, posted and settled before the answer.
+/// 同一租户重送同一操作返回初次回执。金额、原因或凭证号不同时返回 409。
 /// `422` at `/amount_cny` unless it is yuan and fen above 0 and at most
 /// ¥99,999,999.99, at `/reason` unless it is 1 to 500 characters, not blank and
 /// free of control characters, and at `/reference` when it is over 128
@@ -70,7 +74,7 @@ pub async fn create(
         return Err(ApiError::validation(problems));
     }
     let ctx = WriteCtx::of(&state);
-    let row = state
+    let receipt = state
         .db
         .tx(move |conn| {
             async move {
@@ -79,6 +83,29 @@ pub async fn create(
                 let (tenant, _) = tenants::lock_billing(&mut *conn, tenant_id).await?;
                 if tenant.status == TenantStatus::Pending {
                     return Err(ApiError::not_found());
+                }
+                if let Some(operation_id) = req.operation_id {
+                    // 租户锁已经串行化同一租户的所有入账，读到的都是已提交回执。
+                    let receipt: Option<Value> = sqlx::query_scalar(
+                        "SELECT receipt FROM billing_credit_receipts WHERE tenant_id = $1 AND operation_id = $2",
+                    )
+                    .bind(tenant_id)
+                    .bind(operation_id)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(DbError::from)?;
+                    if let Some(receipt) = receipt {
+                        if receipt["amount_micro_cny"].as_i64() == Some(amount)
+                            && receipt["credit_reason"].as_str() == Some(reason.as_str())
+                            && receipt["reference"].as_str() == Some(reference.as_str())
+                        {
+                            return Ok(receipt);
+                        }
+                        return Err(ApiError::conflict(
+                            "credit_operation_conflict",
+                            "该入账操作的金额、原因或凭证号与首次提交不一致",
+                        ));
+                    }
                 }
                 let row = topups::insert_approved(
                     &mut *conn,
@@ -113,10 +140,25 @@ pub async fn create(
                     },
                 )
                 .await?;
-                Ok::<_, ApiError>(row)
+                let mut receipt = topups::to_admin(&row);
+                if let Some(operation_id) = req.operation_id {
+                    receipt["operation_id"] = json!(operation_id);
+                    sqlx::query(
+                        "INSERT INTO billing_credit_receipts (tenant_id, operation_id, topup_id, receipt) \
+                         VALUES ($1, $2, $3, $4)",
+                    )
+                    .bind(tenant_id)
+                    .bind(operation_id)
+                    .bind(row.id)
+                    .bind(&receipt)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(DbError::from)?;
+                }
+                Ok::<_, ApiError>(receipt)
             }
             .boxed()
         })
         .await?;
-    Ok((StatusCode::CREATED, Json(topups::to_admin(&row))))
+    Ok((StatusCode::CREATED, Json(receipt)))
 }

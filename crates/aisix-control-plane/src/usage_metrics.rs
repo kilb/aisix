@@ -8,10 +8,12 @@ use std::collections::{BTreeMap, HashMap};
 
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path, Query, State};
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{Postgres, QueryBuilder};
+use serde_json::Value;
+use sqlx::{PgConnection, Postgres, QueryBuilder, Transaction};
 use uuid::Uuid;
 
 use crate::auth::{MemberAuth, MemberRole, OperatorAuth, OperatorRole};
@@ -65,6 +67,7 @@ pub struct MetricsQuery {
     from: Option<DateTime<Utc>>,
     to: Option<DateTime<Utc>>,
     bucket: Option<Bucket>,
+    view: Option<String>,
     tenant_id: Option<Uuid>,
     member_id: Option<Uuid>,
     model_id: Option<Uuid>,
@@ -159,10 +162,10 @@ impl Default for Metrics {
 }
 
 #[derive(Serialize)]
-pub struct MetricsPeriod {
+pub struct MetricsPeriod<T = Metrics> {
     pub period_start: DateTime<Utc>,
     #[serde(flatten)]
-    pub metrics: Metrics,
+    pub metrics: T,
 }
 
 #[derive(Serialize)]
@@ -173,12 +176,12 @@ pub struct MetricsModel {
 }
 
 #[derive(Serialize)]
-pub struct MetricsResponse {
+pub struct MetricsResponse<T = Metrics, P = T> {
     pub from: DateTime<Utc>,
     pub to: DateTime<Utc>,
     pub bucket: Bucket,
-    pub totals: Metrics,
-    pub series: Vec<MetricsPeriod>,
+    pub totals: T,
+    pub series: Vec<MetricsPeriod<P>>,
     /// 全部分组，不截断；未知或租户无权限的模型合并为空模型。
     pub models: Vec<MetricsModel>,
 }
@@ -245,10 +248,26 @@ fn token_sum(field: &str) -> String {
     format!("COALESCE(sum(CASE WHEN visible AND known_usage THEN {field} ELSE 0 END)::bigint, 0)")
 }
 
-fn aggregates() -> String {
+fn request_and_charge_fields() -> String {
     let requests = count("final");
     let succeeded = count("final AND status_code BETWEEN 200 AND 299 AND NOT has_error");
     let failed = count("final AND (has_error OR status_code NOT BETWEEN 200 AND 299)");
+    format!(
+        "'requests', {requests}, 'succeeded_requests', {succeeded}, 'failed_requests', {failed}, \
+         'unknown_outcome_requests', {}, 'unknown_final_attempts', {}, \
+         'known_outcome_requests', {succeeded} + {failed}, \
+         'success_rate', {succeeded}::double precision / NULLIF({succeeded} + {failed}, 0), \
+         'unpriced_attempts', {}, 'billing_attempts', {}, 'charged_micro_cny', \
+         (COALESCE(sum(CASE WHEN charge_status = 'charged' THEN charge_micro_cny ELSE 0 END)::numeric, 0) \
+         + COALESCE(sum(adjusted)::numeric, 0))::text",
+        count("final AND status_code IS NULL AND NOT has_error"),
+        count("unknown_final"),
+        count("visible AND charge_status = 'unpriced' AND adjusted IS NULL"),
+        count("visible")
+    )
+}
+
+fn aggregates() -> String {
     let hit = count("final AND cache_status = 'hit'");
     let miss = count("final AND cache_status = 'miss'");
     let input = token_sum(
@@ -256,14 +275,14 @@ fn aggregates() -> String {
     );
     let cached = token_sum("COALESCE(cached_prompt_tokens, 0) + COALESCE(cache_read_tokens, 0)");
     let mut fields = vec![
-        format!("'requests', {requests}, 'succeeded_requests', {succeeded}, 'failed_requests', {failed}"),
-        format!("'unknown_outcome_requests', {}, 'unknown_final_attempts', {}", count("final AND status_code IS NULL AND NOT has_error"), count("unknown_final")),
-        format!("'known_outcome_requests', {succeeded} + {failed}, 'success_rate', {succeeded}::double precision / NULLIF({succeeded} + {failed}, 0)"),
-        format!("'unpriced_attempts', {}, 'adjusted_micro_cny', COALESCE(sum(adjusted)::numeric, 0)::text", count("visible AND charge_status = 'unpriced' AND adjusted IS NULL")),
-        format!("'billing_attempts', {}, 'charged_micro_cny', \
-          (COALESCE(sum(CASE WHEN charge_status = 'charged' THEN charge_micro_cny ELSE 0 END)::numeric, 0) \
-           + COALESCE(sum(adjusted)::numeric, 0))::text", count("visible")),
-        format!("'first_token_latency_ms', {}, 'response_latency_ms', {}, 'attempt_duration_ms', {}", latency("ttft", "final"), latency("response_latency", "final"), latency("attempt_duration", "visible")),
+        request_and_charge_fields(),
+        "'adjusted_micro_cny', COALESCE(sum(adjusted)::numeric, 0)::text".into(),
+        format!(
+            "'first_token_latency_ms', {}, 'response_latency_ms', {}, 'attempt_duration_ms', {}",
+            latency("ttft", "final"),
+            latency("response_latency", "final"),
+            latency("attempt_duration", "visible")
+        ),
     ];
     let mut tokens: Vec<String> = [
         "prompt_tokens",
@@ -303,19 +322,42 @@ struct AggregateRow {
     metrics: sqlx::types::Json<Metrics>,
 }
 
+async fn metric_model_names(
+    conn: &mut PgConnection,
+    tenant: Option<Uuid>,
+) -> Result<HashMap<String, String>, ApiError> {
+    let allowed = if let Some(tenant) = tenant {
+        Some(crate::tenants::scope_model_ids(conn, tenant).await?)
+    } else {
+        None
+    };
+    let model_rows: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT id, COALESCE(doc->>'display_name', '') FROM gw_resources \
+         WHERE kind = 'models' AND NOT deleted AND ($1::uuid[] IS NULL OR id = ANY($1))",
+    )
+    .bind(allowed)
+    .fetch_all(conn)
+    .await
+    .map_err(DbError::from)?;
+    Ok(model_rows
+        .into_iter()
+        .map(|(id, name)| (id.to_string(), name))
+        .collect())
+}
+
 async fn summarize(
     state: &AppState,
     q: MetricsQuery,
     tenant: Option<Uuid>,
     own_member: Option<Uuid>,
-) -> Result<Json<MetricsResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let (from, to, bucket) = checked_window(&q)?;
     let mut tx = state.db.pool().begin().await.map_err(DbError::from)?;
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
         .execute(&mut *tx)
         .await
         .map_err(DbError::from)?;
-    let allowed = if let Some(tenant) = tenant {
+    if let Some(tenant) = tenant {
         let exists: bool =
             sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM tenants WHERE id = $1)")
                 .bind(tenant)
@@ -325,22 +367,13 @@ async fn summarize(
         if !exists {
             return Err(ApiError::not_found());
         }
-        Some(crate::tenants::scope_model_ids(&mut tx, tenant).await?)
+    }
+    let overview = q.view.as_deref() == Some("overview");
+    let names = if overview {
+        HashMap::new()
     } else {
-        None
+        metric_model_names(&mut tx, tenant).await?
     };
-    let model_rows: Vec<(Uuid, String)> = sqlx::query_as(
-        "SELECT id, COALESCE(doc->>'display_name', '') FROM gw_resources \
-         WHERE kind = 'models' AND NOT deleted AND ($1::uuid[] IS NULL OR id = ANY($1))",
-    )
-    .bind(allowed)
-    .fetch_all(&mut *tx)
-    .await
-    .map_err(DbError::from)?;
-    let names: HashMap<String, String> = model_rows
-        .into_iter()
-        .map(|(id, name)| (id.to_string(), name))
-        .collect();
     let ids: Vec<String> = names.keys().cloned().collect();
 
     let mut sql = QueryBuilder::<Postgres>::new(
@@ -431,11 +464,17 @@ async fn summarize(
         .push(" FROM charge_scope pc LEFT JOIN adjusted ON adjusted.event_id = pc.event_id")
         .push(CHARGE_METRIC_INPUT)
         .push(METRIC_FIELDS);
-    sql.push("), scoped AS (SELECT *, \
+    sql.push(
+        "), scoped AS (SELECT *, \
         CASE WHEN raw_status BETWEEN 100 AND 599 THEN raw_status END AS status_code, \
         prompt_tokens IS NOT NULL AND completion_tokens IS NOT NULL AND valid_optional_usage \
           AND COALESCE(cached_prompt_tokens, 0) + COALESCE(cache_write_tokens, 0) <= prompt_tokens \
-          AS known_usage FROM raw) SELECT \
+          AS known_usage FROM raw)",
+    );
+    if overview {
+        return summarize_overview(sql, tx, from, to, bucket).await;
+    }
+    sql.push(" SELECT \
         CASE WHEN GROUPING(period_start) = 0 THEN 1 WHEN GROUPING(model_id) = 0 THEN 2 ELSE 0 END AS grouping, \
         period_start, model_id, ").push(aggregates()).push(" AS metrics FROM scoped \
         GROUP BY GROUPING SETS ((), (period_start), (model_id)) ORDER BY grouping, period_start, model_id");
@@ -471,25 +510,120 @@ async fn summarize(
             _ => {}
         }
     }
-    let mut series = Vec::new();
-    let mut period = bucket.floor(from)?;
-    while period < to {
-        series.push(MetricsPeriod {
-            period_start: period,
-            metrics: periods.remove(&period).unwrap_or_default(),
-        });
-        period = period
-            .checked_add_signed(TimeDelta::seconds(bucket.seconds()))
-            .ok_or_else(|| refused("/to", "时间不合法"))?;
-    }
     Ok(Json(MetricsResponse {
         from,
         to,
         bucket,
         totals,
-        series,
+        series: fill_periods(from, to, bucket, periods, Metrics::default)?,
         models,
-    }))
+    })
+    .into_response())
+}
+
+fn fill_periods<T>(
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    bucket: Bucket,
+    mut periods: BTreeMap<DateTime<Utc>, T>,
+    empty: impl Fn() -> T,
+) -> Result<Vec<MetricsPeriod<T>>, ApiError> {
+    let mut series = Vec::new();
+    let mut period = bucket.floor(from)?;
+    while period < to {
+        series.push(MetricsPeriod {
+            period_start: period,
+            metrics: periods.remove(&period).unwrap_or_else(&empty),
+        });
+        period = period
+            .checked_add_signed(TimeDelta::seconds(bucket.seconds()))
+            .ok_or_else(|| refused("/to", "时间不合法"))?;
+    }
+    Ok(series)
+}
+
+#[derive(Deserialize, Serialize)]
+struct OverviewTotals {
+    requests: i64,
+    succeeded_requests: i64,
+    failed_requests: i64,
+    known_outcome_requests: i64,
+    unknown_outcome_requests: i64,
+    unknown_final_attempts: i64,
+    success_rate: Option<f64>,
+    billing_attempts: i64,
+    unpriced_attempts: i64,
+    charged_micro_cny: String,
+    first_token_latency_ms: OverviewMedian,
+}
+
+#[derive(Deserialize, Serialize)]
+struct OverviewMedian {
+    p50: Option<f64>,
+    sample_count: i64,
+    missing_count: i64,
+}
+
+#[derive(Default, Deserialize, Serialize)]
+struct OverviewPeriod {
+    requests: i64,
+    first_token_latency_ms: OverviewMean,
+}
+
+#[derive(Default, Deserialize, Serialize)]
+struct OverviewMean {
+    avg: Option<f64>,
+}
+
+/// 首页只需要总范围的精确 P50；分桶仅统计请求数与首 token 的实测平均值。
+async fn summarize_overview(
+    mut sql: QueryBuilder<'_, Postgres>,
+    mut tx: Transaction<'_, Postgres>,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    bucket: Bucket,
+) -> Result<Response, ApiError> {
+    sql.push(", overview AS MATERIALIZED (SELECT period_start, final, unknown_final, status_code, \
+        has_error, charge_status, adjusted, charge_micro_cny, visible, ttft FROM scoped) \
+        SELECT NULL::timestamptz AS period_start, jsonb_build_object(")
+        .push(request_and_charge_fields())
+        .push(", 'first_token_latency_ms', jsonb_build_object( \
+          'p50', percentile_cont(0.5) WITHIN GROUP (ORDER BY ttft) FILTER (WHERE final), \
+          'sample_count', count(*) FILTER (WHERE final AND ttft IS NOT NULL), \
+          'missing_count', count(*) FILTER (WHERE final AND ttft IS NULL))) FROM overview \
+        UNION ALL SELECT period_start, jsonb_build_object('requests', count(*) FILTER (WHERE final), \
+          'first_token_latency_ms', jsonb_build_object('avg', avg(ttft) FILTER (WHERE final))) \
+        FROM overview GROUP BY period_start");
+    let rows: Vec<(Option<DateTime<Utc>>, Value)> = sql
+        .build_query_as()
+        .persistent(false)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(DbError::from)?;
+    tx.commit().await.map_err(DbError::from)?;
+    let mut totals = None;
+    let mut periods = BTreeMap::new();
+    for (period, metrics) in rows {
+        if let Some(period) = period {
+            periods.insert(
+                period,
+                serde_json::from_value(metrics).map_err(ApiError::internal)?,
+            );
+        } else {
+            totals = Some(
+                serde_json::from_value::<OverviewTotals>(metrics).map_err(ApiError::internal)?,
+            );
+        }
+    }
+    Ok(Json(MetricsResponse {
+        from,
+        to,
+        bucket,
+        totals: totals.ok_or_else(|| ApiError::internal("概览汇总缺失"))?,
+        series: fill_periods(from, to, bucket, periods, OverviewPeriod::default)?,
+        models: vec![],
+    })
+    .into_response())
 }
 
 /// 活跃租户所有角色可读；普通成员的过滤条件只会在自身历史归属上继续收窄。
@@ -497,7 +631,7 @@ pub async fn tenant(
     auth: MemberAuth,
     State(state): State<AppState>,
     query: Result<Query<MetricsQuery>, QueryRejection>,
-) -> Result<Json<MetricsResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     auth.require_active()?;
     auth.require(&[
         MemberRole::Owner,
@@ -522,7 +656,7 @@ pub async fn admin(
     auth: OperatorAuth,
     State(state): State<AppState>,
     query: Result<Query<MetricsQuery>, QueryRejection>,
-) -> Result<Json<MetricsResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     auth.require(OperatorRole::Viewer)?;
     let Query(q) = query.map_err(query_rejected)?;
     let tenant = q.tenant_id;
@@ -534,7 +668,7 @@ pub async fn admin_tenant(
     State(state): State<AppState>,
     Path(id): Path<String>,
     query: Result<Query<MetricsQuery>, QueryRejection>,
-) -> Result<Json<MetricsResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     auth.require(OperatorRole::Viewer)?;
     let tenant = Uuid::parse_str(&id).map_err(|_| ApiError::not_found())?;
     let Query(q) = query.map_err(query_rejected)?;
@@ -793,7 +927,7 @@ async fn summarize_direct_models(
           ep.text_native_terminal_status AS native_terminal_status, \
           CASE WHEN jsonb_typeof(ep.json_upstream_dispatched) = 'boolean' \
             THEN (ep.text_upstream_dispatched)::boolean END AS explicit_dispatch, \
-          COALESCE(ue.event->'usage_estimated' = 'true'::jsonb, FALSE) AS usage_estimated, ",
+          COALESCE(ready.usage_estimated, ue.event->'usage_estimated' = 'true'::jsonb, FALSE) AS usage_estimated, ",
     );
     let mut columns: Vec<String> = [
         "prompt_tokens",

@@ -28,12 +28,10 @@ async function login(page: Page, email = stack.operator.email, password = stack.
 
 async function openPanel(page: Page, world: BillingWorld): Promise<Locator> {
   await page
-    .getByRole("table", { name: "账户列表" })
-    .locator("tbody tr")
-    .filter({ hasText: world.tenantName })
-    .getByRole("button", { name: world.tenantName })
+    .getByRole("table", { name: "账户列表", exact: true })
+    .getByRole("link", { name: world.tenantName, exact: true })
     .click();
-  return page.getByRole("dialog");
+  return page.getByRole("region", { name: `租户详情：${world.tenantName}`, exact: true });
 }
 
 const credit = (panel: Locator): Locator => panel.getByRole("region", { name: "直接入账", exact: true });
@@ -151,8 +149,8 @@ test("入账请求没有得到回答时，表单锁定，关闭面板后重开�
   await context.setOffline(false);
 
   // Closing the panel must not hand a fresh, unlocked form back.
-  await panel.getByRole("button", { name: "关闭" }).click();
-  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await page.getByRole("button", { name: "返回账户列表", exact: true }).click();
+  await expect(panel).toHaveCount(0);
   panel = await openPanel(page, world);
   form = credit(panel);
   await expect(form.getByRole("alert").filter({ hasText: "入账结果未知" })).toBeVisible();
@@ -203,8 +201,8 @@ test("入账请求途中关闭面板再打开：新表单在旧请求有结果�
   await arrived;
 
   // Closed while the credit is on its way, and opened again: locked.
-  await panel.getByRole("button", { name: "关闭" }).click();
-  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await page.getByRole("button", { name: "返回账户列表", exact: true }).click();
+  await expect(panel).toHaveCount(0);
   panel = await openPanel(page, world);
   form = credit(panel);
   await expect(form.getByRole("status")).toContainText("上一笔入账仍在等待结果");
@@ -262,8 +260,8 @@ test("入账请求途中关闭面板，随后被拒绝：重开的表单解锁�
   await form.getByRole("button", { name: "确认入账" }).click();
   await arrived;
 
-  await panel.getByRole("button", { name: "关闭" }).click();
-  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await page.getByRole("button", { name: "返回账户列表", exact: true }).click();
+  await expect(panel).toHaveCount(0);
   panel = await openPanel(page, world);
   form = credit(panel);
   await expect(form.getByRole("status")).toContainText("上一笔入账仍在等待结果");

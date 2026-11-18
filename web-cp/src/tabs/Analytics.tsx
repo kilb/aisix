@@ -24,7 +24,7 @@ export function Analytics(_props: TabProps) {
   const dateValue = (value: string) => Number.isFinite(Date.parse(value)) ? beijingInputValue(new Date(value)) : value;
   const changeDate = (key: string, value: string) => update({ from, to, [key]: parseBeijingInput(value) ?? value });
   const calls = new URLSearchParams();
-  for (const key of ["model_id", "api_key_id", "tenant_id", "from", "to"]) {
+  for (const key of ["model_id", "api_key_id", "member_id", "tenant_id", "from", "to"]) {
     const value = key === "from" ? from : key === "to" ? to : query.get(key);
     if (value) calls.set(key, value);
   }

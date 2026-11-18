@@ -477,7 +477,7 @@ fn reconcile_runtime_state(
         // Health and routing cursors key on the operator-facing name;
         // per-target runtime status keys on the row id.
         health.retain_configured(&|name| models.get_by_name(name).is_some());
-        routing.retain_configured(&|name| models.get_by_name(name).is_some());
+        routing.reconcile_snapshot(&view.snapshot);
         runtime_status.retain_configured(&|id| models.get_by_id(id).is_some());
     });
 }
@@ -540,7 +540,7 @@ impl ProxyState {
 
     pub fn new(snapshot: SnapshotHandle<AisixSnapshot>, hub: Arc<Hub>, cfg: &ProxyConfig) -> Self {
         let metrics = Arc::new(Metrics::new(false));
-        let semantic_cache = Arc::new(crate::semantic::SemanticVectorCache::default());
+        let semantic_cache = crate::semantic::SemanticVectorCache::live(&snapshot);
         let guardrail_index = LiveGuardrailIndex::new_with_sink(
             snapshot.clone(),
             None,
@@ -621,7 +621,7 @@ impl ProxyState {
         cfg: &ProxyConfig,
     ) -> Self {
         let metrics = Arc::new(Metrics::new(false));
-        let semantic_cache = Arc::new(crate::semantic::SemanticVectorCache::default());
+        let semantic_cache = crate::semantic::SemanticVectorCache::live(&snapshot);
         let guardrail_index = LiveGuardrailIndex::new_with_sink(
             snapshot.clone(),
             None,
@@ -689,7 +689,7 @@ impl ProxyState {
         cache: Option<CacheBackends>,
         cfg: &ProxyConfig,
     ) -> Self {
-        let semantic_cache = Arc::new(crate::semantic::SemanticVectorCache::default());
+        let semantic_cache = crate::semantic::SemanticVectorCache::live(&snapshot);
         let guardrail_index = LiveGuardrailIndex::new_with_sink(
             snapshot.clone(),
             None,

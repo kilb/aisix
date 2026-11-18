@@ -772,6 +772,28 @@ async fn a_member_reads_its_own_levels_only() {
         sorted(&[mine.id.to_string(), on_key.id.to_string()]),
         "{r:?}"
     );
+    for reader in [&t.owner, &t.m] {
+        let own_member = tsend(
+            &w.cp,
+            reader,
+            "GET",
+            &format!("/api/budgets?member_id={}", t.m.id),
+            None,
+        )
+        .await;
+        assert_eq!(own_member.status, 200);
+        assert_eq!(ids(&own_member), vec![mine.id.to_string()]);
+    }
+    let other_member = tsend(
+        &w.cp,
+        &t.m,
+        "GET",
+        &format!("/api/budgets?member_id={}", t.owner.id),
+        None,
+    )
+    .await;
+    assert_eq!(other_member.status, 200);
+    assert!(ids(&other_member).is_empty());
     let everything = sorted(&[
         id(&team),
         mine.id.to_string(),

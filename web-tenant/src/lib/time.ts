@@ -1,3 +1,5 @@
+import type { UsageSummaryRow } from "./api";
+
 // 两端共用同一时间口径；保存和传输 UTC，界面及自然日统计使用北京时间。
 export type CalendarGroup = "day" | "month";
 export type TimeBucket = "minute" | "hour" | "day";
@@ -65,6 +67,11 @@ export function periodLabel(start: string, group: CalendarGroup): string {
   const at = new Date(start);
   const day = Number.isNaN(at.getTime()) ? start.slice(0, 10) : todayBeijing(at);
   return group === "day" ? day : day.slice(0, 7);
+}
+
+/** 合并行的起始日期只是服务端保留的首个期间。 */
+export function usagePeriodLabel(row: Pick<UsageSummaryRow, "period_start" | "model">, group: CalendarGroup): string {
+  return row.model.id === null && row.model.name === "other" ? "合并期间（可能跨期）" : periodLabel(row.period_start, group);
 }
 
 export function metricPeriodLabel(start: string, bucket: TimeBucket): string {

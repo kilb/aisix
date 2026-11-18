@@ -31,6 +31,7 @@ import { formatCount } from "./lib/chartFormat";
 import { cn } from "./lib/cn";
 import { beijingInputValue, fmtBeijing, parseBeijingInput } from "./lib/time";
 import { keySettingsPatch } from "./lib/keySettings";
+import { keyLimitText } from "./lib/keyRateLimits";
 import { fetchKeyCosts, keyCostNotes, keyMonthRange, type KeyCosts } from "./lib/keyUsage";
 import { fmtMicroCny } from "./lib/money";
 import { isKeyBudgetAmount } from "./lib/keyBudget";
@@ -169,17 +170,6 @@ export function Keys({
     return [...names, ...(gone > 0 ? [`${formatCount(gone)} 个已不在授权内`] : [])].join("、");
   }
 
-  function limitsOf(k: TenantKey): string {
-    // A limit the key leaves unset follows the organisation's cap.
-    const one = (label: string, own?: number, cap?: number) =>
-      own !== undefined ? `${label} ${count(own)}` : cap !== undefined ? `${label} ≤${count(cap)}` : null;
-    const parts = [
-      one("并发", k.rate_limit.concurrency, caps?.key_concurrency_max),
-      one("每分钟", k.rate_limit.rpm, caps?.key_rpm_max),
-    ].filter((p) => p !== null);
-    return parts.length > 0 ? parts.join(" · ") : "不限";
-  }
-
   function creatorOf(k: TenantKey): string {
     if (k.created_by?.kind === "operator") return "平台管理员";
     if (k.created_by?.kind !== "member") return "未知";
@@ -315,7 +305,7 @@ export function Keys({
                         />
                       </td>
                       <td className="tabular" data-label="限制">
-                        <span className="block">{limitsOf(k)}</span>
+                        <span className="block">并发 {keyLimitText(k, "concurrency", caps)} · 每分钟 {keyLimitText(k, "rpm", caps)}</span>
                       </td>
                       <td className="num tabular" data-label="已用费用">
                         <span className="block">{costErr ? "读取失败" : costs === null ? "读取中…" : cost === undefined ? "未读取" : cost.chargedMicroCny === null ? "未知" : fmtMicroCny(cost.chargedMicroCny)}</span>

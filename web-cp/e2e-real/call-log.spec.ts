@@ -56,6 +56,7 @@ test("下游响应阶段独立展示真实失败记录，不冒充客户端总�
   await page.goto(`${base}/#calls?outcome=failed&detail=${encodeURIComponent(stored!.event_id)}`);
   await expect(page.getByRole("heading", { name: "调用日志详情", exact: true })).toBeVisible();
   await settle(page);
+  await expectUpstreamTiming(page, event.upstream_timing);
   const timing = page.getByRole("region", { name: "时间与性能", exact: true });
   await expect(field(timing, "下游响应阶段耗时")).toHaveText(duration(event.downstream_latency_ms));
   await expect(timing.locator("dt").getByText("客户端总耗时", { exact: true })).toHaveCount(0);
@@ -94,7 +95,7 @@ test("下游响应阶段独立展示真实失败记录，不冒充客户端总�
 
 const UPSTREAM_TIMING_FIELDS = [
   "http_send_started_ms", "response_headers_ms", "first_response_byte_ms",
-  "first_protocol_frame_ms", "first_canonical_chunk_ms", "first_content_ms",
+  "first_protocol_frame_ms", "first_canonical_chunk_ms", "upstream_first_content_ms", "first_content_ms",
 ] as const;
 
 /** 只按真实 API 原值核对原始偏移，缺省和非法值不能从其他时钟补齐。 */
@@ -103,6 +104,8 @@ async function expectUpstreamTiming(scope: Page | Locator, raw: unknown): Promis
   await expect(region).toHaveCount(1);
   await expect(region).toBeVisible();
   await expect(region.locator("[data-upstream-timing-field]")).toHaveCount(UPSTREAM_TIMING_FIELDS.length);
+  await expect(region.locator('[data-upstream-timing-field="upstream_first_content_ms"] dt')).toHaveText("上游首个内容帧");
+  await expect(region.locator('[data-upstream-timing-field="first_content_ms"] dt')).toHaveText("首次内容交付");
   const timing = raw !== null && typeof raw === "object" && !Array.isArray(raw) ? raw as Readonly<Record<string, unknown>> : null;
   for (const name of UPSTREAM_TIMING_FIELDS) {
     const slot = region.locator(`[data-upstream-timing-field="${name}"]`);
@@ -174,16 +177,35 @@ test("failed call opens its complete saved log, copies content and survives dire
   const link = page.getByRole("link", { name: `查看调用日志 ${call.event_id}`, exact: true });
   const row = page.getByRole("row").filter({ has: link });
   await expect(row.locator(".call-error-summary")).toHaveText(call.error_message!);
-  const detailPath = `/admin/usage/events/${encodeURIComponent(call.event_id)}`;
-  const detailAnswer = page.waitForResponse(response => new URL(response.url()).pathname === detailPath);
+  expect(requests.get(page)!.some(request => new URLSearchParams(request.search).get("include_attempts") === "true"), "列表不得预取完整尝试").toBe(false);
+  const detailAnswer = page.waitForResponse(response => {
+    const params = new URL(response.url()).searchParams;
+    return listResponse(response, call.event_id) && params.get("group_requests") === "true" && params.get("include_attempts") === "true";
+  });
   await link.click();
   const storedAnswer = await detailAnswer;
   expect(storedAnswer.status()).toBe(200);
-  const stored = await storedAnswer.json() as StoredRecord;
+  type Attempt = { event_id: string; stored_event: StoredRecord };
+  const { items: groups } = await storedAnswer.json() as { items: (Attempt & { attempts: Attempt[] })[] };
+  expect(groups).toHaveLength(1);
+  const group = groups[0]!;
+  expect(group.event_id).toBe(call.event_id);
+  const stored = group.stored_event;
   expect(stored.event_id).toBe(call.event_id);
+  expect(group.attempts.map(attempt => attempt.event_id)).toContain(call.event_id);
+  const chain = page.getByRole("region", { name: "故障转移与重试链", exact: true });
+  await expect(chain.locator("article[data-attempt-event]")).toHaveCount(group.attempts.length);
+  for (const attempt of group.attempts) {
+    const article = chain.locator(`article[data-attempt-event="${attempt.event_id}"]`);
+    await expect(article.getByRole("definition").and(article.getByText(attempt.event_id, { exact: true }))).toBeVisible();
+    const json = article.getByRole("region", { name: /事件 JSON$/ });
+    await json.locator("summary").click();
+    await expect(json.locator("pre")).toHaveText(JSON.stringify(attempt.stored_event, null, 2));
+    await json.locator("summary").click();
+  }
   await expectUpstreamTiming(page, stored.event.upstream_timing);
   await expect(page.getByRole("heading", { name: "调用日志详情", exact: true })).toBeVisible();
-  expect(await page.title()).toMatch(/AISIX/i);
+  await expect(page).toHaveTitle("Routio 运维台");
   await expect(page.getByRole("table", { name: "计费明细", exact: true })).toBeHidden();
   const errorsCard = page.getByRole("region", { name: "调用结果与错误", exact: true });
   await expect(field(errorsCard, "HTTP 状态")).toHaveText(String(stored.event.status_code ?? call.status_code ?? "未记录"));
@@ -218,14 +240,31 @@ test("failed call opens its complete saved log, copies content and survives dire
   await json.locator("summary").click();
   await expect(message.locator("pre")).toBeVisible();
   await expect(json.locator("pre")).toBeVisible();
+  const visibleLogs = [message.locator("pre"), json.locator("pre")];
+  for (const attempt of group.attempts) {
+    const article = chain.locator(`article[data-attempt-event="${attempt.event_id}"]`);
+    const raw = article.getByRole("region", { name: /事件 JSON$/ });
+    if (!await raw.locator("pre").isVisible()) await raw.locator("summary").click();
+    await expect(raw.locator("pre")).toHaveText(JSON.stringify(attempt.stored_event, null, 2));
+    visibleLogs.push(raw.locator("pre"));
+    const error = attempt.stored_event.event.error_message;
+    if (typeof error === "string" && error.length > 0) {
+      const log = article.getByRole("region", { name: /错误信息$/ });
+      if (!await log.locator("pre").isVisible()) await log.locator("summary").click();
+      await expect(log.locator("pre")).toHaveText(error);
+      visibleLogs.push(log.locator("pre"));
+    }
+  }
   mkdirSync(join(output, "screenshots"), { recursive: true });
   for (const width of [390, 900, 1440]) {
     await page.setViewportSize({ width, height: 1000 });
     await expect(page.getByRole("link", { name: "返回调用记录", exact: true })).toBeVisible();
-    const bounds = await page.evaluate(() => ({ viewport: document.documentElement.clientWidth, page: document.documentElement.scrollWidth, content: [...document.querySelectorAll(".call-log-text pre")].filter(element => element.getBoundingClientRect().width > 0).map(element => ({ client: element.clientWidth, scroll: element.scrollWidth })) }));
-    expect(bounds.content).toHaveLength(2);
-    expect(bounds.page, `page width at ${width}`).toBeLessThanOrEqual(bounds.viewport + 1);
-    for (const block of bounds.content) expect(block.scroll, `long log wraps at ${width}`).toBeLessThanOrEqual(block.client + 1);
+    await expect(page.locator(".call-log-text pre:visible")).toHaveCount(visibleLogs.length);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(1);
+    for (const log of visibleLogs) {
+      await expect(log).toBeVisible();
+      expect(await log.evaluate(element => element.scrollWidth - element.clientWidth), `日志应在 ${width}px 折行`).toBeLessThanOrEqual(1);
+    }
     await page.screenshot({ path: join(output, "screenshots", `call-log-${width}.png`) });
   }
   await page.getByRole("link", { name: "返回调用记录", exact: true }).click();

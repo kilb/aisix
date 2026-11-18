@@ -238,3 +238,52 @@ test("版本冲突保留服务端配置，重新载入后才能保存", async ({
   await page.getByRole("button", { name: "保存配置", exact: true }).click(); expect((await saved).status()).toBe(200);
   expect((await get<Key>(page, `/admin/keys/${key.id}`)).label).toBe(`${label}-mine`);
 });
+
+test("组织限额收紧后两个门户展示生效值并保留密钥原配置", async ({ page, browser }) => {
+  const tenantUrl: string = state.tenantUrl;
+  if (!["127.0.0.1", "localhost"].includes(new URL(tenantUrl).hostname)) throw new Error("需要隔离租户门户");
+  const suffix = crypto.randomUUID();
+  const owner = { email: `owner-${suffix}@key-limits.test`, password: crypto.randomUUID() };
+  const portal = await browser.newPage();
+  await portal.goto(tenantUrl);
+  const signup = await request<{ tenant: { id: string } }>(portal, "POST", "/api/signup", { ...owner, org_name: `限额验收 ${suffix}` });
+  expect(signup.status).toBe(201);
+  const tenantId = signup.body.tenant.id;
+  const path = `/admin/tenants/${tenantId}`;
+  const approved = await request(page, "POST", path + "/approve", {});
+  expect(approved.status).toBe(200);
+  const current = await get<{ version: number }>(page, path);
+  const group = (await get<{ items: Group[] }>(page, "/admin/provider-groups")).items[0];
+  if (!group) throw new Error("隔离控制面需要已有分组");
+  const configured = await request<{ version: number }>(page, "PATCH", path, {
+    allowed_provider_groups: [group.name], limits: { key_concurrency_max: 10, key_rpm_max: 60 },
+  }, current.version);
+  expect(configured.status).toBe(200);
+  const label = `限额密钥 ${suffix}`;
+  const created = await request<{ key: Key }>(page, "POST", path + "/keys", { group_id: group.id, label, rate_limit: { concurrency: 8 } });
+  expect(created.status).toBe(201);
+  const reduced = await request(page, "PATCH", path, { limits: { key_concurrency_max: 5, key_rpm_max: 60 } }, configured.body.version);
+  expect(reduced.status).toBe(200);
+
+  await page.goto(`${state.adminUrl}/#keys?tenant=${tenantId}`);
+  const adminRow = page.getByRole("row").filter({ has: page.getByRole("link", { name: label, exact: true }) });
+  for (const value of ["5（密钥配置 8）", "60（沿用组织上限）"]) await expect(adminRow).toContainText(value);
+  await adminRow.getByRole("button", { name: "编辑密钥", exact: true }).click();
+  await expect(page.getByLabel("并发", { exact: true })).toHaveValue("8");
+  await expect(page.getByLabel("每分钟请求", { exact: true })).toHaveValue("");
+  const effective = page.getByText(/当前生效限额/);
+  for (const value of ["5（密钥配置 8）", "60（沿用组织上限）"]) await expect(effective).toContainText(value);
+
+  await portal.getByLabel("邮箱", { exact: true }).fill(owner.email);
+  await portal.getByLabel("口令", { exact: true }).fill(owner.password);
+  const loggedIn = portal.waitForResponse(response => new URL(response.url()).pathname === "/api/login");
+  await portal.getByRole("button", { name: "登录", exact: true }).click();
+  expect((await loggedIn).status()).toBe(200);
+  await portal.goto(`${tenantUrl}/#keys`);
+  const link = portal.getByRole("link", { name: label, exact: true });
+  const tenantRow = portal.getByRole("row").filter({ has: link });
+  for (const value of ["5（密钥配置 8）", "60（沿用组织上限）"]) await expect(tenantRow).toContainText(value);
+  await link.click();
+  for (const value of ["5（密钥配置 8）", "60（沿用组织上限）"]) await expect(portal.getByText(value, { exact: true })).toBeVisible();
+  await portal.close();
+});

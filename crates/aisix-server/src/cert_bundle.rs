@@ -146,7 +146,7 @@ async fn load_pem(
 ///
 ///   x-aisix://env/<env_id>
 ///   x-aisix://dp/<dp_id>
-fn parse_san_uris(pem: &str) -> anyhow::Result<(String, String)> {
+pub(crate) fn parse_san_uris(pem: &str) -> anyhow::Result<(String, String)> {
     let (_, p) = parse_x509_pem(pem.as_bytes()).map_err(|e| anyhow!("decode PEM: {e:?}"))?;
     let (_, cert) =
         X509Certificate::from_der(&p.contents).map_err(|e| anyhow!("parse X.509: {e:?}"))?;

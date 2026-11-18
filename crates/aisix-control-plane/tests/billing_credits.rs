@@ -155,6 +155,126 @@ async fn until_lock_waiters(pool: &PgPool, n: i64) {
 }
 
 #[tokio::test]
+async fn a_credit_operation_replays_one_receipt_and_one_posting_per_tenant() {
+    let Some(d) = desk().await else { return };
+    let pool = d.cp.db().pool();
+    let operation = Uuid::new_v4();
+    let body = json!({
+        "operation_id": operation, "amount_cny": "12.30", "reason": REASON, "reference": "bank-42"
+    });
+    let (first, concurrent) = tokio::join!(
+        credit(&d.cp, &d.admin, d.tenant, body.clone()),
+        credit(&d.cp, &d.admin, d.tenant, body.clone()),
+    );
+    assert_eq!(first.status, 201, "{first:?}");
+    assert_eq!(concurrent.status, 201, "{concurrent:?}");
+    assert_eq!(concurrent.body, first.body);
+    assert_eq!(first.body["operation_id"], json!(operation));
+    let topup = Uuid::parse_str(first.body["id"].as_str().expect("receipt id")).expect("uuid");
+
+    // 入账后即使租户改名，丢失回包的客户端重送仍取得原收据。
+    sqlx::query("UPDATE tenants SET name = $2 WHERE id = $1")
+        .bind(d.tenant)
+        .bind("Renamed Credit Co")
+        .execute(pool)
+        .await
+        .expect("rename tenant");
+    let mut replay = body.clone();
+    replay["amount_cny"] = json!("12.3");
+    let recovered = credit(&d.cp, &d.admin, d.tenant, replay).await;
+    assert_eq!(recovered.status, 201, "{recovered:?}");
+    assert_eq!(recovered.body, first.body);
+    for (field, value) in [
+        ("amount_cny", "12.31"),
+        ("reason", "other"),
+        ("reference", ""),
+    ] {
+        let mut changed = body.clone();
+        changed[field] = json!(value);
+        let r = credit(&d.cp, &d.admin, d.tenant, changed).await;
+        assert_eq!(r.status, 409, "{r:?}");
+        assert_eq!(r.body["code"], "credit_operation_conflict", "{r:?}");
+    }
+    assert_eq!(topup_rows(pool).await, 1);
+    assert_eq!(
+        entries(pool, d.tenant).await,
+        vec![("topup".into(), 12_300_000, 12_300_000, Some(topup))]
+    );
+    assert_eq!(balance(pool, d.tenant).await, 12_300_000);
+    assert_eq!(audits(pool, "billing.topup.credit").await.len(), 1);
+
+    let other =
+        d.cp.send(
+            "POST",
+            "/admin/tenants",
+            Some(d.admin.cookie()),
+            Some(json!({"name":"Other Credit Co"})),
+        )
+        .await;
+    assert_eq!(other.status, 201, "{other:?}");
+    let other = Uuid::parse_str(other.body["id"].as_str().expect("tenant id")).expect("uuid");
+    let separate = credit(&d.cp, &d.admin, other, body).await;
+    assert_eq!(separate.status, 201, "{separate:?}");
+    assert_ne!(separate.body["id"], first.body["id"]);
+    assert_eq!(balance(pool, other).await, 12_300_000);
+}
+
+#[tokio::test]
+async fn disconnecting_before_the_credit_receipt_can_be_recovered_by_replay() {
+    let Some(d) = desk().await else { return };
+    let d = Arc::new(d);
+    let pool = d.cp.db().pool();
+    let body = json!({"operation_id":Uuid::new_v4(), "amount_cny":"3", "reason":REASON});
+    let mut held = pool.begin().await.expect("begin");
+    ledger::lock_account(&mut held, d.tenant)
+        .await
+        .expect("hold account");
+    let first = tokio::spawn({
+        let d = Arc::clone(&d);
+        let body = body.clone();
+        async move { credit(&d.cp, &d.admin, d.tenant, body).await }
+    });
+    // 请求已进入入账事务并等待账户锁，此时关闭 HTTP 客户端收不到首次回包。
+    until_lock_waiters(pool, 1).await;
+    first.abort();
+    assert!(first.await.expect_err("client disconnected").is_cancelled());
+    held.commit().await.expect("unlock account");
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while topup_rows(pool).await == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("first request committed after its client disconnected");
+    let original = entries(pool, d.tenant).await;
+    assert_eq!(original.len(), 1);
+    let topup = original[0].3.expect("posted topup id");
+    let recovered = credit(&d.cp, &d.admin, d.tenant, body).await;
+    assert_eq!(recovered.status, 201, "{recovered:?}");
+    assert_eq!(recovered.body["id"], json!(topup));
+    assert_eq!(
+        entries(pool, d.tenant).await,
+        vec![("topup".into(), 3_000_000, 3_000_000, Some(topup))]
+    );
+    assert_eq!(balance(pool, d.tenant).await, 3_000_000);
+    assert_eq!(topup_rows(pool).await, 1);
+    assert_eq!(audits(pool, "billing.topup.credit").await.len(), 1);
+}
+
+#[tokio::test]
+async fn credits_without_an_operation_id_still_post_independently() {
+    let Some(d) = desk().await else { return };
+    let body = json!({"amount_cny":"1", "reason":REASON, "reference":"shared"});
+    let first = credit(&d.cp, &d.admin, d.tenant, body.clone()).await;
+    let second = credit(&d.cp, &d.admin, d.tenant, body).await;
+    assert_eq!(first.status, 201, "{first:?}");
+    assert_eq!(second.status, 201, "{second:?}");
+    assert_ne!(first.body["id"], second.body["id"]);
+    assert_eq!(balance(d.cp.db().pool(), d.tenant).await, 2_000_000);
+}
+
+#[tokio::test]
 async fn an_operator_credit_needs_a_reason_and_posts_one_entry() {
     let Some(d) = desk().await else { return };
     let pool = d.cp.db().pool();

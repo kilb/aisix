@@ -46,12 +46,12 @@
 //! `guardrail_coverage`'s census asserts the reporting half over the
 //! surfaces it reads out of the router, so this cannot regress quietly.
 //!
-//! Scope: Anthropic-backed models only. `count_tokens` has no upstream
-//! equivalent for OpenAI/Gemini/DeepSeek, so a non-Anthropic Model is
-//! rejected with a 400 at the gateway boundary (parallel to `/v1/rerank`
-//! §168 / `/v1/responses` §4.6) rather than dispatched to an upstream
-//! that would 404 — and rather than the gateway emitting a misleading
-//! 404 of its own, which was the bug this route closes.
+//! 默认沿用源账号的 Messages 计数能力，也支持托管 Claude 的原生计数。
+//! 对于内联输入，运维可通过 `token_counting.messages_count_tokens` 指定
+//! 独立的 Messages 计数账号，并按源模型配置映射。返回值由实际计数模型决定。
+//! OpenAI 桥接通过 Chat Completions 生成回答；Responses 的计数契约包含
+//! 该协议的角色和消息边界。只声明 `apis.responses` 的源账号仍返回 400。
+//! <https://developers.openai.com/api/docs/guides/token-counting>
 //!
 //! Reference:
 //! - Anthropic Count Message Tokens API:
@@ -2133,18 +2133,40 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
-    /// A non-Anthropic Model has no upstream count_tokens surface;
-    /// reject at the boundary with 400 (Anthropic-shape) rather than
-    /// 404-ing the caller or dispatching to an upstream that would 404.
+    /// 同一模型的 Responses 原生计数可用时，Messages 仍不能将它作为 Chat 的计数。
     #[tokio::test]
-    async fn non_anthropic_provider_returns_400() {
+    async fn native_responses_count_is_scoped_to_responses() {
+        let upstream = MockServer::builder().start().await;
+        let count = serde_json::json!({"object":"response.input_tokens","input_tokens":17});
+        Mock::given(method("POST"))
+            .and(path("/v1/responses/input_tokens"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&count))
+            .mount(&upstream)
+            .await;
         let snap = AisixSnapshot::new();
-        let pk_json = r#"{"display_name":"openai-up","secret":"sk-openai","api_base":"https://api.openai.com","provider":"openai","adapter":"openai"}"#;
-        let pk: aisix_core::ProviderKey = serde_json::from_str(pk_json).unwrap();
+        let pk = serde_json::from_value(serde_json::json!({
+            "display_name":"openai-up","api_key":"test-key","api_base":format!("{}/v1", upstream.uri()),
+            "provider":"openai","adapter":"openai","apis":{"responses":{}}
+        })).unwrap();
         snap.provider_keys.insert(ResourceEntry::new(PK_ID, pk, 1));
         snap.models.insert(openai_model("gpt-model"));
         snap.apikeys.insert(apikey_entry(&["*"]));
         let app = build_app(snap);
+
+        let native = Request::post("/v1/responses/input_tokens")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::json!({"model":"gpt-model","input":"hi"}).to_string(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(native).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+            count
+        );
 
         let resp = app
             .oneshot(make_req(serde_json::json!({
@@ -2160,6 +2182,13 @@ mod tests {
         assert_eq!(v["error"]["type"], "invalid_request_error");
         let message = v["error"]["message"].as_str().unwrap();
         assert!(message.contains("Anthropic"), "got {message:?}");
+        let requests = upstream.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url.path(), "/v1/responses/input_tokens");
+        assert_eq!(
+            requests[0].body_json::<serde_json::Value>().unwrap()["model"],
+            "gpt-4o"
+        );
     }
 
     /// Regression: a >1024-byte upstream error body whose 1024th byte

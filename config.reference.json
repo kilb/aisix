@@ -40,7 +40,8 @@
       "heartbeat_interval_secs": 15,
       "mtls_dir": "/var/lib/aisix/mtls",
       "snapshot_cache_enabled": false,
-      "snapshot_cache_path": null
+      "snapshot_cache_path": null,
+      "usage_spool_dir": null
     },
     "native_objects": null,
     "observability": {

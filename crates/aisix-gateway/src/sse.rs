@@ -35,7 +35,8 @@
 //!   own, which parses to nothing.
 
 use std::borrow::Cow;
-use std::ops::Range;
+use std::convert::Infallible;
+use std::ops::{ControlFlow, Range};
 
 /// Default bound on the bytes one frame may buffer before its terminating
 /// blank line arrives. A stream has no total size, so the bound is per
@@ -106,6 +107,36 @@ pub fn find_frame_end_from(buf: &[u8], from: usize) -> Option<usize> {
     scan(buf, from).map(|(_, end)| end)
 }
 
+/// Visit complete frames in order and remove the visited prefix in one step.
+/// A break consumes the frame that caused it and leaves the following bytes
+/// unread. Keep `scanned` with `buf` to resume an incomplete frame on the next
+/// call, or reset it when discarding buffered bytes.
+pub fn drain_complete_frames<B>(
+    buf: &mut Vec<u8>,
+    scanned: &mut usize,
+    mut visit: impl FnMut(&[u8]) -> ControlFlow<B>,
+) -> ControlFlow<B> {
+    let mut consumed = 0;
+    let mut from = *scanned;
+    let result = loop {
+        let Some(end) = find_frame_end_from(&buf[consumed..], from) else {
+            from = buf.len() - consumed;
+            break ControlFlow::Continue(());
+        };
+        from = 0;
+        let start = consumed;
+        consumed += end;
+        if let ControlFlow::Break(value) = visit(&buf[start..consumed]) {
+            break ControlFlow::Break(value);
+        }
+    };
+    *scanned = from;
+    if consumed != 0 {
+        buf.drain(..consumed);
+    }
+    result
+}
+
 /// Like [`find_frame_end`], also saying where the frame's content ends:
 /// `buf[..content_end]` is its lines without the last one's terminator, and
 /// `buf[content_end..frame_end]` is that terminator plus the blank line —
@@ -154,12 +185,7 @@ impl SseFrameSplitter {
     /// once the incomplete frame has outgrown the bound. The bytes stay
     /// buffered either way — [`Self::take_rest`] hands them over.
     pub fn next_frame(&mut self) -> Result<Option<Vec<u8>>, SseFrameTooLarge> {
-        if self.after_cr && !self.buf.is_empty() {
-            self.after_cr = false;
-            if self.buf[0] == b'\n' && self.scanned == 0 {
-                self.scanned = 1;
-            }
-        }
+        self.resume_after_cr();
         match scan(&self.buf, self.scanned) {
             Some((_, end)) => {
                 let frame: Vec<u8> = self.buf.drain(..end).collect();
@@ -177,6 +203,33 @@ impl SseFrameSplitter {
                 Ok(None)
             }
         }
+    }
+
+    #[inline]
+    fn resume_after_cr(&mut self) {
+        if self.after_cr && !self.buf.is_empty() {
+            self.after_cr = false;
+            if self.buf[0] == b'\n' && self.scanned == 0 {
+                self.scanned = 1;
+            }
+        }
+    }
+
+    fn drain_frames(&mut self, mut visit: impl FnMut(&[u8])) -> Result<(), SseFrameTooLarge> {
+        self.resume_after_cr();
+        let ends_in_cr = self.buf.ends_with(b"\r");
+        let ControlFlow::Continue(()) =
+            drain_complete_frames::<Infallible>(&mut self.buf, &mut self.scanned, |frame| {
+                visit(frame);
+                ControlFlow::Continue(())
+            });
+        self.after_cr |= self.buf.is_empty() && ends_in_cr;
+        if self.buf.len() > self.max_frame_bytes {
+            return Err(SseFrameTooLarge {
+                limit: self.max_frame_bytes,
+            });
+        }
+        Ok(())
     }
 
     /// The buffered bytes of the incomplete frame.
@@ -371,20 +424,17 @@ impl SseDecoder {
         }
         self.frames.push(&bytes.into());
         let mut events = Vec::new();
-        loop {
-            match self.frames.next_frame() {
-                Ok(Some(frame)) => events.extend(decode_event(&frame)),
-                Ok(None) => return Ok(events),
-                Err(err) => {
-                    self.frames.take_rest();
-                    if events.is_empty() {
-                        return Err(err);
-                    }
-                    self.overflow = Some(err);
-                    return Ok(events);
-                }
+        let result = self
+            .frames
+            .drain_frames(|frame| events.extend(decode_event(frame)));
+        if let Err(err) = result {
+            self.frames.take_rest();
+            if events.is_empty() {
+                return Err(err);
             }
+            self.overflow = Some(err);
         }
+        Ok(events)
     }
 
     /// Flush the unterminated trailing frame, if any. Call once the body

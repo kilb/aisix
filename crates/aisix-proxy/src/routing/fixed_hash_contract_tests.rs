@@ -390,3 +390,240 @@ async fn fixed_hash_cache_hits_still_require_the_configured_session_header() {
         assert_eq!(missing.status(), StatusCode::BAD_REQUEST, "{endpoint}");
     }
 }
+
+#[test]
+fn shared_account_targets_each_receive_their_weight_and_survive_reordering() {
+    let snapshot = snapshot();
+    let mut b = (*snapshot.models.get_by_id("id-b").unwrap().value).clone();
+    b.provider_key_id = Some("account-a".into());
+    snapshot.models.insert(ResourceEntry::new("id-b", b, 2));
+    let group = group(false);
+    let mut reversed = (*group).clone();
+    reversed.routing.as_mut().unwrap().targets.reverse();
+    let reversed = Arc::new(reversed);
+    let registry = RoutingRegistry::new();
+    let restarted = RoutingRegistry::new();
+    let status = crate::ModelRuntimeStatusTracker::new();
+    let mut counts = std::collections::HashMap::new();
+    for session in 0..512 {
+        let h = headers(session);
+        let first = pick(&registry, &status, &snapshot, &group, &h, None).unwrap();
+        let after = pick(&restarted, &status, &snapshot, &reversed, &h, None).unwrap();
+        assert_eq!(first[0].id, after[0].id, "session {session}");
+        *counts.entry(first[0].id.clone()).or_insert(0) += 1;
+    }
+    for id in ["id-a", "id-b"] {
+        assert!((150..=362).contains(&counts[id]), "{counts:?}");
+    }
+}
+
+#[test]
+fn fixed_hash_warm_tag_work_does_not_grow_with_pool_size() {
+    use aisix_response_reference_test_alloc::AllocationScope;
+    let mut samples = Vec::new();
+    for count in [4, 128] {
+        let snapshot = snapshot();
+        let mut group = group(false);
+        let routing = Arc::make_mut(&mut group).routing.as_mut().unwrap();
+        routing.targets.clear();
+        for index in 0..count {
+            let id = format!("member-{index:03}");
+            let mut model = (*snapshot.models.get_by_id("id-a").unwrap().value).clone();
+            model.display_name = id.clone();
+            snapshot.models.insert(ResourceEntry::new(&id, model, 1));
+            let mut target = RoutingTarget::by_id(&id);
+            target.tags = Some(vec!["premium".into()]);
+            routing.targets.push(target);
+        }
+        let registry = RoutingRegistry::new();
+        let status = crate::ModelRuntimeStatusTracker::new();
+        let pricing = LivePricingIndex::new();
+        let h = headers(2);
+        let tags = vec!["premium".into()];
+        let invoke = || {
+            resolve_attempt_models(
+                &registry,
+                &status,
+                &pricing,
+                &snapshot,
+                "sessions",
+                "group-id",
+                &group,
+                RoutingRequest {
+                    headers: Some(&h),
+                    tags: &tags,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        };
+        let warm = invoke();
+        let scope = AllocationScope::start();
+        let actual = invoke();
+        let allocations = scope.finish();
+        assert_eq!(actual[0].id, warm[0].id);
+        samples.push(allocations.calls);
+    }
+    eprintln!("warm fixed hash allocations for 4/128 members: {samples:?}");
+    assert_eq!(
+        samples[0], samples[1],
+        "warm allocations for 4/128 members: {samples:?}"
+    );
+}
+
+#[test]
+fn publishing_a_changed_group_retires_old_hash_state_even_after_old_requests_finish() {
+    for failover in [true, false] {
+        let old = snapshot();
+        let old_group = group(failover);
+        old.models
+            .insert(ResourceEntry::from_arc("group-id", old_group.clone(), 1));
+        let registry = RoutingRegistry::new();
+        let status = crate::ModelRuntimeStatusTracker::new();
+        let h = headers(0);
+        let caches = || registry.rings.len() + registry.fixed_pools.len();
+        registry.reconcile_snapshot(&old);
+        pick(&registry, &status, &old, &old_group, &h, None).unwrap();
+        assert_eq!(caches(), 1);
+
+        let current = old.clone();
+        let mut changed = (*old_group).clone();
+        for target in &mut changed.routing.as_mut().unwrap().targets {
+            target.priority = Some(7);
+        }
+        let changed = Arc::new(changed);
+        current
+            .models
+            .insert(ResourceEntry::from_arc("group-id", changed.clone(), 2));
+        registry.reconcile_snapshot(&current);
+        assert_eq!(caches(), 0, "publication must retire the old cache");
+        pick(&registry, &status, &old, &old_group, &h, None).unwrap();
+        assert_eq!(caches(), 0, "late old request reinserted a retired cache");
+        pick(&registry, &status, &current, &changed, &h, None).unwrap();
+        assert_eq!(caches(), 1);
+    }
+}
+
+#[test]
+fn independent_accounts_keep_their_existing_sessions() {
+    // 已发布版本的 32 个归属；即使两个实现一致改用新的哈希，也不能让这个检查通过。
+    let snapshot = snapshot();
+    let group = group(false);
+    let registry = RoutingRegistry::new();
+    let status = crate::ModelRuntimeStatusTracker::new();
+    for (session, expected) in "bbaaabababbbbbaaaaababaabbbbbaab".chars().enumerate() {
+        let attempts = pick(
+            &registry,
+            &status,
+            &snapshot,
+            &group,
+            &headers(session),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            attempts[0].id,
+            format!("id-{expected}"),
+            "session {session}"
+        );
+    }
+}
+
+#[test]
+fn fixed_hash_tag_fallback_considers_authorized_backups_without_selecting_them() {
+    let snapshot = snapshot();
+    let registry = RoutingRegistry::new();
+    let status = crate::ModelRuntimeStatusTracker::new();
+    let pricing = LivePricingIndex::new();
+    let h = headers(0);
+    for primary_default in [false, true] {
+        let mut group = group(false);
+        let targets = &mut Arc::make_mut(&mut group).routing.as_mut().unwrap().targets;
+        targets[0].priority = Some(1);
+        targets[0].tags = primary_default.then(|| vec!["default".into()]);
+        targets[1].tags = Some(vec!["premium".into()]);
+        for (tags, allowed) in [
+            (vec![], true),
+            (vec!["unknown".into()], primary_default),
+            (vec!["premium".into()], false),
+        ] {
+            let result = resolve_attempt_models(
+                &registry,
+                &status,
+                &pricing,
+                &snapshot,
+                "sessions",
+                "group-id",
+                &group,
+                RoutingRequest {
+                    headers: Some(&h),
+                    tags: &tags,
+                    ..Default::default()
+                },
+            );
+            if allowed {
+                assert_eq!(result.unwrap()[0].id, "id-a");
+            } else {
+                assert!(matches!(result, Err(ProxyError::ProviderUnavailable)));
+            }
+        }
+    }
+}
+
+#[test]
+fn retired_authorization_scope_cannot_repopulate_a_fixed_pool() {
+    let old = snapshot();
+    let provider = old.provider_keys.get_by_id("account-a").unwrap();
+    let mut allowed = (*provider.value).clone();
+    allowed.groups = vec!["premium".into()];
+    old.provider_keys
+        .insert(ResourceEntry::new("account-a", allowed, 2));
+    for id in ["caller-a", "caller-b"] {
+        let key = serde_json::from_value(json!({
+            "key_hash": aisix_core::ApiKey::hash_bearer(id),
+            "allowed_provider_groups": ["premium"], "allowed_models":["*"]
+        }))
+        .unwrap();
+        old.apikeys.insert(ResourceEntry::new(id, key, 1));
+    }
+    let group = group(false);
+    old.models
+        .insert(ResourceEntry::from_arc("group-id", group.clone(), 1));
+    let registry = RoutingRegistry::new();
+    let status = crate::ModelRuntimeStatusTracker::new();
+    let pricing = LivePricingIndex::new();
+    let h = headers(0);
+    let invoke = |snapshot| {
+        resolve_attempt_models(
+            &registry,
+            &status,
+            &pricing,
+            snapshot,
+            "sessions",
+            "group-id",
+            &group,
+            RoutingRequest {
+                headers: Some(&h),
+                allowed_groups: &["premium".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    };
+    registry.reconcile_snapshot(&old);
+    assert_eq!(invoke(&old)[0].id, "id-a");
+    let warm = registry.fixed_pools.iter().next().unwrap().value().clone();
+
+    let next = old.clone();
+    next.apikeys.remove("caller-a");
+    registry.reconcile_snapshot(&next);
+    assert!(Arc::ptr_eq(
+        registry.fixed_pools.iter().next().unwrap().value(),
+        &warm
+    ));
+    next.apikeys.remove("caller-b");
+    registry.reconcile_snapshot(&next);
+    assert!(registry.fixed_pools.is_empty());
+    assert_eq!(invoke(&old)[0].id, "id-a");
+    assert!(registry.fixed_pools.is_empty());
+}

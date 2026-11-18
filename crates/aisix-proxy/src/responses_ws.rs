@@ -98,12 +98,46 @@ impl<S: futures::Sink<UpMessage> + Unpin> futures::Sink<UpMessage> for ObservedU
 
 #[derive(Default)]
 struct SessionConnection {
-    upstreams: HashMap<String, Arc<UpstreamConnection>>,
+    upstreams: HashMap<String, Arc<TargetConnection>>,
+}
+
+type TargetConnection = Mutex<Option<Arc<UpstreamConnection>>>;
+
+impl SessionConnection {
+    fn target(&mut self, identity: String) -> Result<Arc<TargetConnection>, BridgeError> {
+        if let Some(slot) = self.upstreams.get(&identity) {
+            return Ok(slot.clone());
+        }
+        if self.upstreams.len() >= UPSTREAM_CONNECTIONS {
+            // 有调用持有或等待的握手槽也占配额；失败或取消后空槽可以回收。
+            self.upstreams.retain(|_, slot| {
+                Arc::strong_count(slot) > 1
+                    || slot
+                        .try_lock()
+                        .is_ok_and(|slot| slot.as_ref().is_some_and(|up| up.is_open()))
+            });
+            if self.upstreams.len() >= UPSTREAM_CONNECTIONS {
+                return Err(BridgeError::Config(
+                    "WebSocket upstream connection budget exhausted; open a new client connection"
+                        .into(),
+                ));
+            }
+        }
+        let slot = Arc::new(Mutex::new(None));
+        self.upstreams.insert(identity, slot.clone());
+        Ok(slot)
+    }
 }
 
 struct UpstreamConnection {
     commands: mpsc::Sender<UpstreamCommand>,
     task: tokio::task::AbortHandle,
+}
+
+impl UpstreamConnection {
+    fn is_open(&self) -> bool {
+        !self.task.is_finished() && !self.commands.is_closed()
+    }
 }
 
 impl Drop for UpstreamConnection {
@@ -200,7 +234,7 @@ pub(crate) async fn send_native(
         .await;
     };
     let (client, built) = request.build_split();
-    let mut request = built.map_err(|e| crate::dispatch::reqwest_error_to_bridge(&e, started))?;
+    let request = built.map_err(|e| crate::dispatch::reqwest_error_to_bridge(&e, started))?;
     let mut event: Value = request
         .body()
         .and_then(reqwest::Body::as_bytes)
@@ -229,124 +263,23 @@ pub(crate) async fn send_native(
         identity.update(value.as_bytes());
     }
     let target = format!("{:x}", identity.finalize());
-    let mut connection = round.connection.lock().await;
-    connection
-        .upstreams
-        .retain(|_, upstream| !upstream.task.is_finished() && !upstream.commands.is_closed());
-    if connection
-        .upstreams
-        .get(&target)
-        .is_some_and(|upstream| upstream.task.is_finished())
-    {
-        connection.upstreams.remove(&target);
-    }
-    if !connection.upstreams.contains_key(&target) {
-        // 不驱逐连接缓存或活跃轮；不同账号/动态头边界的总数同样必须有界。
-        if connection.upstreams.len() >= UPSTREAM_CONNECTIONS {
-            return Err(BridgeError::Config(
-                "WebSocket upstream connection budget exhausted; open a new client connection"
-                    .into(),
-            ));
-        }
-        *request.method_mut() = Method::GET;
-        *request.version_mut() = axum::http::Version::HTTP_11;
-        *request.body_mut() = None;
-        request.headers_mut().remove(header::CONTENT_LENGTH);
-        request.headers_mut().remove(header::CONTENT_TYPE);
-        for name in [
-            "sec-websocket-protocol",
-            "sec-websocket-extensions",
-            "sec-websocket-accept",
-        ] {
-            request.headers_mut().remove(name);
-        }
-        request.headers_mut().insert(
-            header::CONNECTION,
-            header::HeaderValue::from_static("Upgrade"),
-        );
-        request.headers_mut().insert(
-            header::UPGRADE,
-            header::HeaderValue::from_static("websocket"),
-        );
-        request.headers_mut().insert(
-            "sec-websocket-version",
-            header::HeaderValue::from_static("13"),
-        );
-        let key = tokio_tungstenite::tungstenite::handshake::client::generate_key();
-        let expected = tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
-        request.headers_mut().insert(
-            "sec-websocket-key",
-            header::HeaderValue::from_str(&key)
-                .map_err(|_| BridgeError::Config("WebSocket handshake key is invalid".into()))?,
-        );
-        // 使用同一个 reqwest client，继承账号私有CA、解析地址和环境代理。
-        let send = client.execute(request);
-        let response = match deadline {
-            Some(limit) => tokio::time::timeout(limit.saturating_sub(started.elapsed()), send)
-                .await
-                .map_err(|_| BridgeError::Timeout {
-                    elapsed_ms: started.elapsed().as_millis() as u64,
-                    cause: String::new(),
-                })?,
-            None => send.await,
-        }
-        .map_err(|e| crate::dispatch::reqwest_error_to_bridge(&e, started))?;
-        aisix_gateway::note_upstream_response(response.headers());
-        if response.status() != StatusCode::SWITCHING_PROTOCOLS {
-            if response.status().is_success() {
-                return Err(BridgeError::UpstreamDecode(
-                    "upstream did not accept WebSocket upgrade".into(),
-                ));
-            }
-            return Ok(response);
-        }
-        let valid = response
-            .headers()
-            .get("sec-websocket-accept")
-            .and_then(|v| v.to_str().ok())
-            == Some(expected.as_str())
-            && response
-                .headers()
-                .get(header::UPGRADE)
-                .and_then(|v| v.to_str().ok())
-                .is_some_and(|v| v.eq_ignore_ascii_case("websocket"))
-            && response
-                .headers()
-                .get(header::CONNECTION)
-                .and_then(|v| v.to_str().ok())
-                .is_some_and(|v| {
-                    v.split(',')
-                        .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
-                });
-        if !valid {
-            return Err(BridgeError::UpstreamDecode(
-                "invalid WebSocket handshake".into(),
-            ));
-        }
-        let upgraded = response
-            .upgrade()
+    let expires =
+        deadline.map(|limit| tokio::time::Instant::now() + limit.saturating_sub(started.elapsed()));
+    let connect = connect_target(&round.connection, target, client, request, started, expires);
+    let handshake = match expires {
+        Some(at) => tokio::time::timeout_at(at, connect)
             .await
-            .map_err(|e| crate::dispatch::reqwest_error_to_bridge(&e, started))?;
-        let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
-            max_message_size: Some(aisix_gateway::sse::MAX_SSE_FRAME_BYTES),
-            max_frame_size: Some(aisix_gateway::sse::MAX_SSE_FRAME_BYTES),
-            ..Default::default()
-        };
-        let socket = UpSocket::from_raw_socket(upgraded, Role::Client, Some(config)).await;
-        let (commands, receive) = mpsc::channel(ACTIVE_RESPONSES * 2);
-        let task = tokio::spawn(run_upstream(socket, receive).instrument(tracing::Span::current()));
-        connection.upstreams.insert(
-            target.clone(),
-            Arc::new(UpstreamConnection {
-                commands,
-                task: task.abort_handle(),
-            }),
-        );
-    }
-    let Some(upstream) = connection.upstreams.get(&target).cloned() else {
-        return Err(BridgeError::DependencyUnavailable);
+            .map_err(|_| handshake_timeout(started))?,
+        None => connect.await,
+    }?;
+    let upstream = match handshake {
+        Handshake::Ready(upstream) => upstream,
+        Handshake::Rejected(response) => return Ok(response),
     };
-    drop(connection);
+    // 已就绪的 future 可以在 timeout_at 到点时先被轮询，过期轮不能再投递 create。
+    if expires.is_some_and(|at| at <= tokio::time::Instant::now()) {
+        return Err(handshake_timeout(started));
+    }
     let token = crate::request_id::new_request_id();
     let (output, mut events) = mpsc::channel::<String>(UPSTREAM_EVENT_QUEUE);
     // 每轮句柄随命令进入连接任务；共享套接字不能读取任务局部的“最新”观测。
@@ -357,12 +290,11 @@ pub(crate) async fn send_native(
         token: token.clone(),
         payload,
         output,
-        expires: deadline
-            .map(|limit| tokio::time::Instant::now() + limit.saturating_sub(started.elapsed())),
+        expires,
         io: io.clone(),
     });
-    let sent = match deadline {
-        Some(limit) => tokio::time::timeout(limit.saturating_sub(started.elapsed()), send)
+    let sent = match expires {
+        Some(at) => tokio::time::timeout_at(at, send)
             .await
             .is_ok_and(|result| result.is_ok()),
         None => send.await.is_ok(),
@@ -399,6 +331,124 @@ pub(crate) async fn send_native(
     Ok(response.into())
 }
 
+enum Handshake {
+    Ready(Arc<UpstreamConnection>),
+    Rejected(reqwest::Response),
+}
+
+fn handshake_timeout(started: Instant) -> BridgeError {
+    BridgeError::Timeout {
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        cause: String::new(),
+    }
+}
+
+async fn connect_target(
+    session: &Mutex<SessionConnection>,
+    identity: String,
+    client: reqwest::Client,
+    mut request: reqwest::Request,
+    started: Instant,
+    expires: Option<tokio::time::Instant>,
+) -> Result<Handshake, BridgeError> {
+    // 会话锁只负责取槽；等待 101 的只有同一身份的请求。
+    let slot = session.lock().await.target(identity)?;
+    let mut cached = slot.lock().await;
+    // 目标锁和计时器可能同时就绪，已经到期的轮不能发起新的握手。
+    if expires.is_some_and(|at| at <= tokio::time::Instant::now()) {
+        return Err(handshake_timeout(started));
+    }
+    if let Some(upstream) = cached.as_ref().filter(|up| up.is_open()) {
+        return Ok(Handshake::Ready(upstream.clone()));
+    }
+    *request.method_mut() = Method::GET;
+    *request.version_mut() = axum::http::Version::HTTP_11;
+    *request.body_mut() = None;
+    request.headers_mut().remove(header::CONTENT_LENGTH);
+    request.headers_mut().remove(header::CONTENT_TYPE);
+    for name in [
+        "sec-websocket-protocol",
+        "sec-websocket-extensions",
+        "sec-websocket-accept",
+    ] {
+        request.headers_mut().remove(name);
+    }
+    request.headers_mut().insert(
+        header::CONNECTION,
+        header::HeaderValue::from_static("Upgrade"),
+    );
+    request.headers_mut().insert(
+        header::UPGRADE,
+        header::HeaderValue::from_static("websocket"),
+    );
+    request.headers_mut().insert(
+        "sec-websocket-version",
+        header::HeaderValue::from_static("13"),
+    );
+    let key = tokio_tungstenite::tungstenite::handshake::client::generate_key();
+    let expected = tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
+    request.headers_mut().insert(
+        "sec-websocket-key",
+        header::HeaderValue::from_str(&key)
+            .map_err(|_| BridgeError::Config("WebSocket handshake key is invalid".into()))?,
+    );
+    // 使用同一个 reqwest client，继承账号私有CA、解析地址和环境代理。
+    let response = client
+        .execute(request)
+        .await
+        .map_err(|e| crate::dispatch::reqwest_error_to_bridge(&e, started))?;
+    aisix_gateway::note_upstream_response(response.headers());
+    if response.status() != StatusCode::SWITCHING_PROTOCOLS {
+        if response.status().is_success() {
+            return Err(BridgeError::UpstreamDecode(
+                "upstream did not accept WebSocket upgrade".into(),
+            ));
+        }
+        return Ok(Handshake::Rejected(response));
+    }
+    let valid = response
+        .headers()
+        .get("sec-websocket-accept")
+        .and_then(|v| v.to_str().ok())
+        == Some(expected.as_str())
+        && response
+            .headers()
+            .get(header::UPGRADE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.eq_ignore_ascii_case("websocket"))
+        && response
+            .headers()
+            .get(header::CONNECTION)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| {
+                v.split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+            });
+    if !valid {
+        return Err(BridgeError::UpstreamDecode(
+            "invalid WebSocket handshake".into(),
+        ));
+    }
+    let upgraded = response
+        .upgrade()
+        .await
+        .map_err(|e| crate::dispatch::reqwest_error_to_bridge(&e, started))?;
+    let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+        max_message_size: Some(aisix_gateway::sse::MAX_SSE_FRAME_BYTES),
+        max_frame_size: Some(aisix_gateway::sse::MAX_SSE_FRAME_BYTES),
+        ..Default::default()
+    };
+    let socket = UpSocket::from_raw_socket(upgraded, Role::Client, Some(config)).await;
+    let (commands, receive) = mpsc::channel(ACTIVE_RESPONSES * 2);
+    let task = tokio::spawn(run_upstream(socket, receive).instrument(tracing::Span::current()));
+    let upstream = Arc::new(UpstreamConnection {
+        commands,
+        task: task.abort_handle(),
+    });
+    *cached = Some(upstream.clone());
+    Ok(Handshake::Ready(upstream))
+}
+
 fn is_terminal(event: &Value) -> bool {
     matches!(
         event.get("type").and_then(Value::as_str),
@@ -417,6 +467,11 @@ where
         tokio::select! {
             command = commands.recv() => match command {
                 Some(UpstreamCommand::Create { lane, token, payload, output, expires, io }) => {
+                    if expires.is_some_and(|at| at <= tokio::time::Instant::now()) {
+                        io.fail_request();
+                        io.fail_response();
+                        continue;
+                    }
                     if rounds.contains_key(&lane) { break; }
                     io.begin_response(Some("application/json"));
                     rounds.insert(lane, UpstreamRound { token, response_id: None, output, io: io.clone(), terminal: false });
@@ -503,7 +558,21 @@ const FAILED_STREAM: &[u8] = b"data: {\"type\":\"error\",\"error\":{\"type\":\"a
 
 fn native_event_frame(text: &str) -> Bytes {
     // WS事件允许带JSON排版换行；每行均加data前缀，不能把后续行当作SSE字段丢掉。
-    Bytes::from(format!("data: {}\n\n", text.replace('\n', "\ndata: ")))
+    let mut frame = String::with_capacity(text.len() + 8);
+    frame.push_str("data: ");
+    let mut rest = text;
+    while let Some(end) = memchr::memchr2(b'\r', b'\n', rest.as_bytes()) {
+        frame.push_str(&rest[..end]);
+        frame.push_str("\ndata: ");
+        let cr = rest.as_bytes()[end] == b'\r';
+        rest = &rest[end + 1..];
+        if cr {
+            rest = rest.strip_prefix('\n').unwrap_or(rest);
+        }
+    }
+    frame.push_str(rest);
+    frame.push_str("\n\n");
+    Bytes::from(frame)
 }
 
 fn stream_failure_response() -> reqwest::Response {
@@ -1213,6 +1282,120 @@ async fn dispatch_round(
 mod tests {
     use super::*;
 
+    #[test]
+    fn handshake_slots_count_pending_owners_and_reclaim_abandoned_targets() {
+        let mut session = SessionConnection::default();
+        let mut pending: Vec<_> = (0..UPSTREAM_CONNECTIONS)
+            .map(|index| session.target(index.to_string()).unwrap())
+            .collect();
+        assert!(matches!(
+            session.target("overflow".into()),
+            Err(BridgeError::Config(_))
+        ));
+        assert!(Arc::ptr_eq(
+            &pending[0],
+            &session.target("0".into()).unwrap()
+        ));
+        let abandoned = Arc::downgrade(pending.last().unwrap());
+        pending.pop();
+        let replacement = session.target("replacement".into()).unwrap();
+        assert!(abandoned.upgrade().is_none());
+        assert_eq!(session.upstreams.len(), UPSTREAM_CONNECTIONS);
+        assert!(Arc::ptr_eq(
+            &replacement,
+            &session.target("replacement".into()).unwrap()
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn handshake_rechecks_expiry_as_the_target_lock_becomes_available() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = reqwest::Client::new();
+        let request = client
+            .post(format!(
+                "http://{}/v1/responses",
+                listener.local_addr().unwrap()
+            ))
+            .build()
+            .unwrap();
+        let session = Mutex::new(SessionConnection::default());
+        let slot = session.lock().await.target("cold".into()).unwrap();
+        let held = slot.lock().await;
+        let budget = Duration::from_secs(1);
+        let expires = tokio::time::Instant::now() + budget;
+        let mut connect = std::pin::pin!(connect_target(
+            &session,
+            "cold".into(),
+            client,
+            request,
+            Instant::now(),
+            Some(expires)
+        ));
+        assert!(futures::poll!(connect.as_mut()).is_pending());
+        tokio::time::advance(budget).await;
+        drop(held);
+        // 锁和截止计时器同时就绪，第一次取得锁的轮询必须立即超时。
+        assert!(matches!(
+            futures::poll!(connect.as_mut()),
+            std::task::Poll::Ready(Err(BridgeError::Timeout { .. }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn handshake_waiters_keep_their_deadlines_and_recover_from_cancelled_owner() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1/responses", listener.local_addr().unwrap());
+        let session = Arc::new(Mutex::new(SessionConnection::default()));
+        let client = reqwest::Client::new();
+        let start = |lane: &'static str, deadline| {
+            let attempted = Arc::new(AtomicBool::new(false));
+            let round = RoundTransport {
+                connection: session.clone(),
+                stream_id: Some(lane.into()),
+                create_attempted: attempted.clone(),
+            };
+            let request = client.post(&url).body(r#"{"model":"local"}"#);
+            let task = tokio::spawn(ROUND.scope(round, async move {
+                send_native(request, deadline, Instant::now()).await
+            }));
+            (attempted, task)
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (owner_attempted, owner) = start("owner", None);
+            let (held, _) = listener.accept().await.unwrap();
+            let (expired_attempted, short) = start("short", Some(Duration::from_millis(80)));
+            assert!(matches!(
+                short.await.unwrap(),
+                Err(BridgeError::Timeout { .. })
+            ));
+            assert!(!expired_attempted.load(Ordering::Acquire));
+
+            let (_, next) = start("next", None);
+            let (_, other) = start("other", None);
+            owner.abort();
+            assert!(owner.await.unwrap_err().is_cancelled());
+            assert!(!owner_attempted.load(Ordering::Acquire));
+            drop(held);
+
+            // 创建者取消后两名等待者都能继续，且只在同一条替代连接派发。
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let _next_body = next.await.unwrap().unwrap();
+            let _other_body = other.await.unwrap().unwrap();
+            let mut lanes = Vec::new();
+            for _ in 0..2 {
+                let message = socket.next().await.unwrap().unwrap();
+                let event: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+                assert_eq!(event["type"], "response.create");
+                lanes.push(event["stream_id"].as_str().unwrap().to_owned());
+            }
+            lanes.sort();
+            assert_eq!(lanes, ["next", "other"]);
+        })
+        .await
+        .expect("等待者必须在首个握手保持悬挂时独立超时，并在取消后复用新连接");
+    }
+
     struct HeldCloseFlush {
         close: oneshot::Receiver<()>,
         flushing: Option<oneshot::Sender<()>>,
@@ -1341,7 +1524,7 @@ mod tests {
         // 该请求无自定义头，连接身份仅含 URL；将关闭中的连接放进相同缓存槽。
         let target = format!("{:x}", Sha256::digest(url.as_bytes()));
         let connection = Arc::new(Mutex::new(SessionConnection {
-            upstreams: [(target, upstream)].into(),
+            upstreams: [(target, Arc::new(Mutex::new(Some(upstream))))].into(),
         }));
         let transport = RoundTransport {
             connection,

@@ -1416,6 +1416,8 @@ pub struct TenantKeyView {
     /// its group is no longer one of the tenant's, which closes the key.
     group_available: bool,
     rate_limit: KeyLimits,
+    /// 网关实际使用的单钥限额，包含租户的单钥上限。
+    effective_rate_limit: KeyLimits,
     /// The tenant's own switch, which `PATCH /api/keys/{id}` sets.
     disabled: bool,
     /// Switched off by the platform; only the platform switches it on.
@@ -1439,6 +1441,7 @@ fn tenant_views(
         .map(|k| {
             let group_available = k.group.is_some() && !closed_for_group(t, &k);
             TenantKeyView {
+                effective_rate_limit: effective_limits(t, &k),
                 id: k.id,
                 label: k.label,
                 prefix: k.key_prefix,
@@ -1529,6 +1532,7 @@ pub struct AdminKeyView {
     /// The group the key names, fixed at creation, with its routing name.
     group: Option<KeyGroup>,
     effective_provider_groups: Vec<String>,
+    effective_rate_limit: KeyLimits,
     rate_limit: KeyLimits,
     /// The operators' switch, which `PATCH /admin/keys/{id}` sets: the key
     /// stays off while it is set, whatever the tenant does.
@@ -1550,6 +1554,7 @@ pub struct AdminKeyView {
 fn admin_view(t: &TenantRow, k: KeyRow, member_active: bool) -> AdminKeyView {
     AdminKeyView {
         effective_provider_groups: effective_groups(t, &k),
+        effective_rate_limit: effective_limits(t, &k),
         effective_disabled: effective_disabled(t, &k, member_active),
         id: k.id,
         tenant_id: k.tenant_id,
@@ -2536,6 +2541,12 @@ mod tests {
             ),
         ] {
             assert_eq!(build_key_doc(&t, &k, true)["rate_limit"], want, "{k:?}");
+            let admin = json!(admin_view(&t, k.clone(), true));
+            let tenant = json!(tenant_views(&t, vec![k.clone()], HashMap::new()));
+            for view in [&admin, &tenant[0]] {
+                assert_eq!(view["effective_rate_limit"], want);
+                assert_eq!(view["rate_limit"], json!(k.rate_limit));
+            }
         }
         // The tenant-wide limits are the tenant's policy, not the key's.
         let d = build_key_doc(&capped(None, None), &asking(None, None), true);

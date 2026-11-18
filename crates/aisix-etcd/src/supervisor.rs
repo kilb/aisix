@@ -1103,21 +1103,13 @@ impl<P: ConfigProvider> Supervisor<P> {
             match source.provider.load_all().await {
                 Ok((entries, rev)) => {
                     source.clear_refusal();
-                    read_ok.push(&source.prefix.prefix);
-                    for entry in entries {
-                        match all.entry(entry.key.clone()) {
-                            std::collections::btree_map::Entry::Occupied(mut slot) => {
-                                // Two reads of one key are two points in
-                                // time; keep the later write.
-                                if entry.revision > slot.get().revision {
-                                    slot.insert(entry);
-                                }
-                            }
-                            std::collections::btree_map::Entry::Vacant(slot) => {
-                                slot.insert(entry);
-                            }
-                        }
+                    let prefix = source.prefix.prefix.as_str();
+                    if read_ok.iter().any(|parent| under(parent, prefix)) {
+                        // 子范围的成功读取也确认哪些键已被删除。拒读时仍由外层负责。
+                        all.retain(|key, _| !under(prefix, key));
                     }
+                    read_ok.push(prefix);
+                    all.extend(entries.into_iter().map(|entry| (entry.key.clone(), entry)));
                     revisions.push(Some(rev));
                 }
                 Err(err) if source.tolerates(&err) => {
@@ -1151,7 +1143,7 @@ impl<P: ConfigProvider> Supervisor<P> {
                 // being gone, which carrying the old row over would undo.
                 // A deleted price would come back to life, priced at
                 // whatever it used to cost.
-                if read_ok.iter().any(|p| entry.key.starts_with(p)) {
+                if read_ok.iter().any(|p| under(p, &entry.key)) {
                     continue;
                 }
                 all.entry(entry.key.clone()).or_insert(entry);
@@ -1938,6 +1930,15 @@ impl<P: ConfigProvider> Supervisor<P> {
                     streams.push(stream);
                     watching.push(&source.prefix.prefix);
                 }
+                Err(err)
+                    if watching.iter().any(|parent| {
+                        under(parent, source.prefix.prefix.trim_end_matches('/'))
+                    }) =>
+                {
+                    // 父订阅已从其范围读取点开始，覆盖子范围；稍后会滤掉子读取点前的重播。
+                    tracing::warn!(prefix = %source.prefix.prefix, error = %err,
+                        "using the covering parent watch after the child watch could not be created");
+                }
                 Err(err) if source.tolerates(&err) => {
                     // No stream for this prefix this cycle. It is retried
                     // whenever the cycle restarts — which is what a
@@ -1957,19 +1958,26 @@ impl<P: ConfigProvider> Supervisor<P> {
         // delivered, and put back a row that was changed or deleted since.
         // Each key therefore belongs to ONE live watch: the most specific
         // prefix being watched that contains it, the same longest-prefix
-        // rule the initial load resolves keys by. Every other watch's copy
-        // is dropped. A prefix with no live watch this cycle (its watch was
-        // refused) owns nothing, so the outer watch keeps delivering its
-        // keys.
-        let owners: Vec<Vec<String>> = watching
+        // rule the initial load resolves keys by.
+        // 子范围只读成功、未能订阅时，外层只接手晚于该次读取的事件。
+        let owners: Vec<Vec<(&str, i64)>> = watching
             .iter()
             .map(|mine| {
-                let mine = mine.trim_end_matches('/');
-                watching
+                self.sources
                     .iter()
-                    .map(|other| other.trim_end_matches('/'))
-                    .filter(|other| other.len() > mine.len() && under(mine, other))
-                    .map(str::to_string)
+                    .zip(&load.revisions)
+                    .filter_map(|(source, revision)| {
+                        let inner = source.prefix.prefix.as_str();
+                        if !under(mine, inner.trim_end_matches('/')) {
+                            return None;
+                        }
+                        let through = if watching.contains(&inner) {
+                            i64::MAX
+                        } else {
+                            (*revision)?
+                        };
+                        Some((inner, through))
+                    })
                     .collect()
             })
             .collect();
@@ -1979,11 +1987,15 @@ impl<P: ConfigProvider> Supervisor<P> {
             futures::stream::select_all(streams.into_iter().zip(owners).map(|(s, inner)| {
                 s.filter(move |item| {
                     let foreign = match item {
-                        Ok(WatchEvent::Put(raw)) => Some(raw.key.as_str()),
-                        Ok(WatchEvent::Delete { key, .. }) => Some(key.as_str()),
+                        Ok(WatchEvent::Put(raw)) => Some((raw.key.as_str(), raw.revision)),
+                        Ok(WatchEvent::Delete { key, revision }) => Some((key.as_str(), *revision)),
                         _ => None,
                     }
-                    .is_some_and(|key| inner.iter().any(|prefix| under(prefix, key)));
+                    .is_some_and(|(key, revision)| {
+                        inner
+                            .iter()
+                            .any(|(prefix, through)| revision <= *through && under(prefix, key))
+                    });
                     futures::future::ready(!foreign)
                 })
                 .map(Watched::Event)
@@ -2838,6 +2850,7 @@ mod tests {
     use std::sync::Mutex;
 
     struct FakeProvider {
+        refuse_watch: bool,
         entries: Mutex<Vec<RawEntry>>,
         revision: i64,
         events: Mutex<Vec<Result<WatchEvent, ProviderError>>>,
@@ -2846,6 +2859,7 @@ mod tests {
     impl FakeProvider {
         fn new(entries: Vec<RawEntry>, revision: i64) -> Self {
             Self {
+                refuse_watch: false,
                 entries: Mutex::new(entries),
                 revision,
                 events: Mutex::new(Vec::new()),
@@ -2871,6 +2885,9 @@ mod tests {
             Box<dyn futures::Stream<Item = Result<WatchEvent, ProviderError>> + Send + Unpin>,
             ProviderError,
         > {
+            if self.refuse_watch {
+                return Err(ProviderError::Rejected("watch refused".into()));
+            }
             let events: Vec<_> = self.events.lock().unwrap().drain(..).collect();
             Ok(Box::new(stream::iter(events)))
         }
@@ -3531,6 +3548,68 @@ mod tests {
             "a successful read replaces the retained rows"
         );
         assert!(replaced.global_pricing.get_by_id("g-2").is_some());
+    }
+
+    #[tokio::test]
+    async fn nested_price_read_replaces_deleted_rows_only_on_success() {
+        let outer = ScopedProvider::serving(
+            vec![
+                entry("/aisix/global/pricing/p", VALID_PRICE, 10),
+                entry("/aisix/models/m", VALID_MODEL, 10),
+            ],
+            10,
+        );
+        for (inner, expected_prices) in [
+            (ScopedProvider::serving(vec![], 12), 0),
+            (ScopedProvider::refusing(), 1),
+        ] {
+            let sup = Supervisor::with_sources(
+                vec![
+                    (WatchedPrefix::environment("/aisix"), outer.clone()),
+                    (WatchedPrefix::global(GLOBAL_PREFIX), inner),
+                ],
+                SnapshotCache::disabled(),
+            );
+            sup.load_once().await.unwrap();
+            let snap = sup.handle().load();
+            assert_eq!(snap.global_pricing.len(), expected_prices);
+            assert_eq!(snap.models.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn nested_price_read_watermark_applies_when_the_inner_watch_is_refused() {
+        let price = "/aisix/global/pricing/p";
+        let other = "/aisix/global/pricing/other";
+        let outer = FakeProvider::new(vec![], 10).with_events(vec![
+            Ok(WatchEvent::Put(entry(price, VALID_PRICE, 11))),
+            Ok(WatchEvent::Delete {
+                key: other.into(),
+                revision: 12,
+            }),
+            Ok(WatchEvent::Put(entry(
+                "/aisix/global/pricing/new",
+                VALID_PRICE,
+                16,
+            ))),
+        ]);
+        let inner = FakeProvider {
+            refuse_watch: true,
+            ..FakeProvider::new(vec![entry(other, VALID_PRICE, 15)], 15)
+        };
+        let sup = Supervisor::with_sources(
+            vec![
+                (WatchedPrefix::environment("/aisix"), Arc::new(outer)),
+                (WatchedPrefix::global(GLOBAL_PREFIX), Arc::new(inner)),
+            ],
+            SnapshotCache::disabled(),
+        );
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        sup.cycle(&rx, &mut None).await.unwrap();
+        let snap = sup.handle().load();
+        assert!(snap.global_pricing.get_by_id("p").is_none());
+        assert!(snap.global_pricing.get_by_id("other").is_some());
+        assert!(snap.global_pricing.get_by_id("new").is_some());
     }
 
     #[tokio::test]

@@ -157,7 +157,7 @@ export function ApiMetricsPanel({ scope, enabled, from, to, bucket, modelId, mem
   const [answer, setAnswer] = useState<{ key: string; data: ApiMetricsResponse | null; error: string | null }>({ key: "", data: null, error: null });
   const choiceId = useId();
   const rangeError = metricsRangeError(from, to, bucket);
-  const key = JSON.stringify([scope, from, to, bucket, modelId, memberId, apiKeyId, tenantId, refreshKey, revision]);
+  const key = JSON.stringify([scope, compact, from, to, bucket, modelId, memberId, apiKeyId, tenantId, refreshKey, revision]);
   useEffect(() => {
     if (!enabled || rangeError) {
       setAnswer({ key: "", data: null, error: null });
@@ -165,13 +165,13 @@ export function ApiMetricsPanel({ scope, enabled, from, to, bucket, modelId, mem
     }
     let current = true;
     setAnswer({ key, data: null, error: null });
-    void fetchApiMetrics(scope, { from, to, bucket, model_id: modelId, member_id: memberId, api_key_id: apiKeyId, tenant_id: scope === "admin" ? tenantId : undefined }).then(data => {
+    void fetchApiMetrics(scope, { from, to, bucket, view: compact ? "overview" : undefined, model_id: modelId, member_id: memberId, api_key_id: apiKeyId, tenant_id: scope === "admin" ? tenantId : undefined }).then(data => {
       if (current) setAnswer({ key, data, error: null });
     }).catch((error: unknown) => {
       if (current) setAnswer({ key, data: null, error: error instanceof Error ? error.message : "API 指标加载失败，请重试。" });
     });
     return () => { current = false; };
-  }, [enabled, key, rangeError, scope, from, to, bucket, modelId, memberId, apiKeyId, tenantId]);
+  }, [enabled, key, rangeError, scope, compact, from, to, bucket, modelId, memberId, apiKeyId, tenantId]);
   if (!enabled) return null;
   const data = answer.key === key ? answer.data : null;
   const error = rangeError ?? (answer.key === key ? answer.error : null);

@@ -1,10 +1,6 @@
-/**
- * A direct credit has no idempotency key: the request may have been stored while the
- * answer was lost (dropped connection, a proxy's 5xx). The outcome of such a failure is
- * unknown, so the caller must not hand the form back to the operator to retry.
- * Only the shape of `status` is read, without importing `ApiError` itself, so this file
- * loads directly under node:test.
- */
+import type { CreditedTopup } from "./api";
+import { isCnyAmount } from "./money.ts";
+
 export function isUnknownOutcome(e: unknown): boolean {
   const answer = typeof e === "object" && e !== null ? (e as { status?: unknown; code?: unknown }) : {};
   // Only the control plane's own 4xx answer proves nothing was stored. Anything else (a network failure,
@@ -24,65 +20,109 @@ export async function sendCredit<T>(post: () => Promise<T>): Promise<CreditOutco
   }
 }
 
-/**
- * Where a tenant's direct credit stands outside any one form: `pending` while
- * a request is on its way, `unknown` once it ended without a definite answer.
- */
 export type CreditLock = "pending" | "unknown";
 
-/**
- * The per-tenant credit locks. They live outside the form, so closing the
- * panel (or opening another tenant) never hands a fresh, unlocked form back,
- * and they are observable, so a form opened while a credit is still on its
- * way follows that credit to its end: locked while it is pending, and kept
- * locked if it turns out unknown. A credit refused after its form closed
- * leaves the refusal here, for the tenant's next form to say until another
- * credit is sent: nothing was credited, and a form that just unlocks says
- * nothing of it. They last for this page load only; a reload starts clean,
- * as the operator then reads the ledger anyway.
- */
-export function createCreditLocks() {
+export interface CreditRequest {
+  operation_id: string;
+  amount_cny: string;
+  reason: string;
+  reference?: string;
+}
+
+type CreditInput = Omit<CreditRequest, "operation_id"> & { operation_id?: string };
+
+/** 只有服务端确认了这笔操作，表单才能丢弃浏览器中保存的原请求。 */
+export function matchesCreditReceipt(value: unknown, tenantId: string, sent: CreditInput): value is CreditedTopup {
+  if (!value || typeof value !== "object" || !isCnyAmount(sent.amount_cny, { allowZero: false })) return false;
+  const row = value as Record<string, unknown>;
+  const [yuan, fen = ""] = sent.amount_cny.split(".");
+  const microCny = Number(yuan) * 1_000_000 + Number(fen.padEnd(2, "0")) * 10_000;
+  return typeof row.id === "string" && /^[\da-f]{8}-(?:[\da-f]{4}-){3}[\da-f]{12}$/i.test(row.id)
+    && row.tenant_id === tenantId && row.operation_id === sent.operation_id
+    && row.status === "approved" && row.origin === "operator"
+    && row.amount_micro_cny === microCny && row.credit_reason === sent.reason
+    && row.reference === (sent.reference ?? "");
+}
+
+type TabStorage = Pick<Storage, "getItem" | "setItem" | "removeItem">;
+
+/** 在调用前保存原请求；刷新后上次的结果未知，只能按原编号重试。 */
+export function createCreditLocks(storage: () => TabStorage = () => window.sessionStorage) {
   const locks = new Map<string, CreditLock>();
   const refusals = new Map<string, string>();
   const listeners = new Set<() => void>();
   const changed = () => {
     for (const listener of listeners) listener();
   };
+  const key = (tenant: string) => `aisix.billing.credit.${tenant}`;
+  const saved = (tenant: string): string | null => {
+    try {
+      return storage().getItem(key(tenant));
+    } catch (error) {
+      if (!(error instanceof DOMException)) throw error;
+      // 禁用标签页存储时表单仍可显示；提交前的持久化会报告错误。
+      return null;
+    }
+  };
+  const get = (tenant: string): CreditLock | null => locks.get(tenant) ?? (saved(tenant) !== null ? "unknown" : null);
+  function request(tenant: string): CreditRequest | null {
+    const raw = saved(tenant);
+    if (raw === null) return null;
+    try {
+      const body = JSON.parse(raw);
+      if (
+        typeof body?.operation_id !== "string" || !body.operation_id ||
+        typeof body.amount_cny !== "string" || typeof body.reason !== "string" ||
+        (body.reference !== undefined && typeof body.reference !== "string")
+      ) return null;
+      return body;
+    } catch (error) {
+      if (!(error instanceof SyntaxError)) throw error;
+      return null;
+    }
+  }
+  function clear(tenant: string) {
+    try {
+      storage().removeItem(key(tenant));
+    } catch (error) {
+      if (!(error instanceof DOMException)) throw error;
+      // 写回执后标签页存储可能变成只读；残留记录仍以原操作编号恢复。
+    }
+    locks.delete(tenant);
+  }
   return {
-    get(tenant: string): CreditLock | null {
-      return locks.get(tenant) ?? null;
-    },
-    /**
-     * Takes the lock for a new credit, synchronously, so a second confirm
-     * cannot get in: false while another credit of the tenant is on its way
-     * or unresolved.
-     */
-    acquire(tenant: string): boolean {
+    get,
+    request,
+    acquire(tenant: string, body: CreditRequest): boolean {
       if (locks.has(tenant)) return false;
+      const tab = storage();
+      if (tab.getItem(key(tenant)) !== null) return false;
+      tab.setItem(key(tenant), JSON.stringify(body));
       locks.set(tenant, "pending");
       refusals.delete(tenant);
       changed();
       return true;
     },
-    /**
-     * The credit ended: an unknown outcome keeps the lock until the operator
-     * has checked; any other frees it. `refused` is what a refusal says when
-     * no form is left to show it.
-     */
+    retry(tenant: string): CreditRequest | null {
+      if (get(tenant) !== "unknown") return null;
+      const original = request(tenant);
+      if (original === null) return null;
+      locks.set(tenant, "pending");
+      changed();
+      return original;
+    },
     settle(tenant: string, outcome: CreditOutcome<unknown>["kind"], refused?: string): void {
       if (outcome === "unknown") locks.set(tenant, "unknown");
-      else locks.delete(tenant);
+      else clear(tenant);
       if (outcome === "refused" && refused !== undefined) refusals.set(tenant, refused);
       changed();
     },
-    /** What the tenant's last credit, refused after its form closed, was refused for; `null` for none. */
     refusal(tenant: string): string | null {
       return refusals.get(tenant) ?? null;
     },
-    /** The operator has checked an unknown credit and starts over; a credit still on its way keeps its lock. */
     release(tenant: string): void {
-      if (locks.get(tenant) !== "unknown") return;
-      locks.delete(tenant);
+      if (get(tenant) !== "unknown") return;
+      clear(tenant);
       changed();
     },
     subscribe(listener: () => void): () => void {

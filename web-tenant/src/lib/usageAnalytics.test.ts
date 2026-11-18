@@ -69,7 +69,7 @@ test("跨期other加入总计与其他分组，两个趋势都保留不可绘制
   assert.doesNotMatch(requests + costTrend, /<svg/);
   const models = text(render("UsageModelsCard", rows));
   assert.match(models, /1可识别模型/);
-  assert.match(models, /其他/);
+  assert.match(models, /“其他”合并了超出展示上限的分组，可能跨期/);
   assert.match(models, /¥7\.00 · 70\.0%/);
 });
 

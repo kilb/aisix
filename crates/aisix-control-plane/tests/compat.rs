@@ -146,6 +146,41 @@ async fn age_instance(cp: &TestCp, instance: &str, interval: &str) {
 }
 
 #[tokio::test]
+async fn twelve_hour_rate_save_checks_the_registered_gateway_build() {
+    let Some(cp) = TestCp::start_stamped("dev+sha-abcdef0").await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let gw = Gateway::issue(&cp, &admin).await;
+    let key = create(
+        &cp,
+        &admin,
+        "provider_keys",
+        json!({"display_name":"rate-account", "provider":"openai", "api_key":"test-secret"}),
+    )
+    .await;
+    assert_eq!(key.status, 201, "{key:?}");
+    let mut model = json!({"display_name":"priced", "provider":"openai", "model_name":"priced",
+        "provider_key_id":key.body["id"], "cost":{"input_per_1k":1,"output_per_1k":2,"cache_write_12h_per_1k":5}});
+    gw.beat("price-instance", "dev+sha-0123456").await;
+    refused_at(
+        &create(&cp, &admin, "models", model.clone()).await,
+        "/cost/cache_write_12h_per_1k",
+    );
+    gw.beat("price-instance", "dev+sha-abcdef0").await;
+    let current = create(&cp, &admin, "models", model.clone()).await;
+    assert_eq!(current.status, 201, "{current:?}");
+    gw.beat("price-instance", "1.8.2").await;
+    model["display_name"] = json!("no-12h-rate");
+    model["cost"]
+        .as_object_mut()
+        .unwrap()
+        .remove("cache_write_12h_per_1k");
+    let legacy = create(&cp, &admin, "models", model).await;
+    assert_eq!(legacy.status, 201, "{legacy:?}");
+}
+
+#[tokio::test]
 async fn a_team_scoped_cache_policy_is_refused_while_an_older_gateway_is_registered() {
     let Some((cp, admin, gw)) = setup().await else {
         return;

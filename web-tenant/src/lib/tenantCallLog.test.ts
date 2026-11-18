@@ -140,12 +140,14 @@ function upstreamTimingValue(markup: string, name: string): string {
 // 新阶段必须接到同一调用详情，不能从已有总耗时或首字补出历史值。
 test("调用详情展示同一上游尝试的 HTTP 阶段偏移，缺失保持未知", () => {
   const renderDetails = (extra: Record<string, unknown>) => renderToStaticMarkup(createElement(DetailsUnderTest, { call: { ...base, ...extra } }));
-  const recorded = renderDetails({ upstream_timing: { http_send_started_ms: 0, response_headers_ms: 136004, first_content_ms: 136008 } });
+  const recorded = renderDetails({ upstream_timing: { http_send_started_ms: 0, response_headers_ms: 136004, upstream_first_content_ms: 136006, first_content_ms: 136008 } });
   assert.match(recorded, /aria-label="上游 HTTP 阶段"/);
   assert.equal(upstreamTimingValue(recorded, "http_send_started_ms"), "0 ms");
   assert.equal(upstreamTimingValue(recorded, "response_headers_ms"), "136,004 ms");
+  assert.equal(upstreamTimingValue(recorded, "upstream_first_content_ms"), "136,006 ms");
+  assert.equal(upstreamTimingValue(recorded, "first_content_ms"), "136,008 ms");
   const missing = renderDetails({ first_token_latency_ms: 1000, attempt_duration_ms: 3000 });
-  for (const key of ["http_send_started_ms", "response_headers_ms", "first_response_byte_ms", "first_protocol_frame_ms", "first_canonical_chunk_ms", "first_content_ms"]) {
+  for (const key of ["http_send_started_ms", "response_headers_ms", "first_response_byte_ms", "first_protocol_frame_ms", "first_canonical_chunk_ms", "upstream_first_content_ms", "first_content_ms"]) {
     assert.equal(upstreamTimingValue(missing, key), "—");
   }
 });

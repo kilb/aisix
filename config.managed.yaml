@@ -278,6 +278,9 @@ managed:
   # The cache contains unencrypted credentials; restrict directory access.
   snapshot_cache_enabled: false
   snapshot_cache_path: "/var/lib/aisix/config_cache.json"
+  # Optional local usage queue. Use an absolute owner-only directory backed
+  # by storage dedicated to this gateway instance. See docs/usage-spool.md.
+  usage_spool_dir: null
 
   # Heartbeat interval, in seconds. The DP POSTs a heartbeat to
   # the control plane every interval; the CP marks the DP "connected" on its

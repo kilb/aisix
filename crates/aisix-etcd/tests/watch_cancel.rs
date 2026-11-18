@@ -16,7 +16,10 @@
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use aisix_etcd::{ConfigProvider, EtcdConfigProvider, ProviderError, Supervisor, WatchEvent};
+use aisix_etcd::{
+    ConfigProvider, EtcdConfigProvider, ProviderError, SnapshotCache, Supervisor, WatchEvent,
+    WatchedPrefix,
+};
 use futures::StreamExt;
 
 #[derive(Clone)]
@@ -104,6 +107,7 @@ enum WatchAnswer {
     },
     /// Refuses the watch in the create response itself.
     RefusedAtCreate,
+    CreatedThenDelete,
 }
 
 /// An etcd over real HTTP/2 whose Range answers revision 1 with no
@@ -165,6 +169,26 @@ async fn spawn_cancelling_etcd(
                                 false,
                             )
                             .unwrap();
+                        }
+                        WatchAnswer::CreatedThenDelete => {
+                            body.send_data(
+                                watch_response_frame(0, true, false, 0, "").into(),
+                                false,
+                            )
+                            .unwrap();
+                            // 修订 2 删除目录价格。WatchResponse.events 内含 Event{DELETE, kv}。
+                            let key = b"/aisix/global/pricing/p";
+                            let mut kv = vec![0x0a, key.len() as u8];
+                            kv.extend(key);
+                            kv.extend([0x18, 2]);
+                            let mut event = vec![0x08, 1, 0x12, kv.len() as u8];
+                            event.extend(kv);
+                            let mut msg = vec![0x0a, 2, 0x18, 2, 0x5a, event.len() as u8];
+                            msg.extend(event);
+                            let mut frame = vec![0];
+                            frame.extend((msg.len() as u32).to_be_bytes());
+                            frame.extend(msg);
+                            body.send_data(frame.into(), false).unwrap();
                         }
                         WatchAnswer::RefusedAtCreate => {
                             body.send_data(
@@ -264,6 +288,38 @@ async fn a_watch_refused_at_create_is_a_watch_error() {
     assert!(
         msg.contains("cancelled the watch as it was created"),
         "{msg}"
+    );
+}
+
+#[tokio::test]
+async fn an_invalid_child_watch_id_keeps_a_covering_parent_watch_live() {
+    let (outer, _, _) = spawn_cancelling_etcd(WatchAnswer::CreatedThenDelete).await;
+    let (inner, _, _) = spawn_cancelling_etcd(WatchAnswer::RefusedAtCreate).await;
+    let mut sources = Vec::new();
+    for (endpoint, scope) in [
+        (outer, WatchedPrefix::environment("/aisix")),
+        (inner, WatchedPrefix::global("/aisix/global/")),
+    ] {
+        let provider =
+            EtcdConfigProvider::connect(&[endpoint], scope.prefix.clone(), None, None, None)
+                .await
+                .unwrap();
+        sources.push((scope, Arc::new(provider)));
+    }
+    let supervisor = Arc::new(Supervisor::with_sources(sources, SnapshotCache::disabled()));
+    let (cancel, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(supervisor.clone().run(rx));
+    let applied = tokio::time::timeout(Duration::from_secs(3), async {
+        while supervisor.watch_status().snapshot().revision < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    cancel.send(true).unwrap();
+    task.await.unwrap();
+    assert!(
+        applied.is_ok(),
+        "the parent must apply the catalog deletion at revision 2"
     );
 }
 

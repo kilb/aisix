@@ -14,7 +14,8 @@
 
 use std::collections::HashMap;
 
-use axum::extract::{Path, State};
+use axum::extract::rejection::QueryRejection;
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use chrono::{DateTime, Utc};
@@ -425,6 +426,7 @@ fn is_mine(b: &BudgetRow, me: Uuid, keys: &[Uuid]) -> bool {
 pub async fn member_list(
     auth: MemberAuth,
     State(state): State<AppState>,
+    query: Result<Query<members::MemberFilter>, QueryRejection>,
 ) -> Result<Json<Value>, ApiError> {
     auth.require_active()?;
     auth.require(&[
@@ -433,11 +435,15 @@ pub async fn member_list(
         MemberRole::Billing,
         MemberRole::Member,
     ])?;
+    let Query(filter) = query.map_err(crate::usage::query_rejected)?;
+    if auth.role == MemberRole::Member && filter.member_id.is_some_and(|id| id != auth.id) {
+        return Ok(Json(json!({ "items": [] })));
+    }
     let mut conn = state.db.pool().acquire().await.map_err(DbError::from)?;
     let tenant = tenants::find(&mut conn, auth.tenant_id).await?;
     let now = budgets::db_now(&mut conn).await?;
-    let mut rows = budgets::list(&mut conn, tenant.id, now).await?;
-    if auth.role == MemberRole::Member {
+    let mut rows = budgets::list_scoped(&mut conn, tenant.id, now, filter.member_id).await?;
+    if auth.role == MemberRole::Member && filter.member_id.is_none() {
         let keys = keys_of(&mut conn, tenant.id, auth.id).await?;
         rows.retain(|(b, _)| is_mine(b, auth.id, &keys));
     }

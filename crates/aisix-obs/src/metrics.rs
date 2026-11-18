@@ -592,6 +592,9 @@ pub const M_LOG_LINES_DROPPED_TOTAL: &str = "aisix_log_lines_dropped_total";
 /// (`budget_policy.fail_mode: closed`) starts rejecting budgeted traffic
 /// once this reaches the policy's `closed_grace_seconds`.
 pub const M_USAGE_DELIVERY_UNHEALTHY_SECONDS: &str = "aisix_usage_delivery_unhealthy_seconds";
+pub const M_USAGE_SPOOL_BATCHES: &str = "aisix_usage_spool_batches";
+pub const M_USAGE_SPOOL_BYTES: &str = "aisix_usage_spool_bytes";
+pub const M_USAGE_SPOOL_FAILURES_TOTAL: &str = "aisix_usage_spool_failures_total";
 /// jemalloc's own byte counts, by `stat`: `allocated` (live objects),
 /// `active` (pages backing them), `resident` (allocator pages in RAM),
 /// `mapped`, `retained` (unmapped from RAM but kept reserved) and
@@ -838,7 +841,7 @@ struct MetricsInner {
 /// Every `reason` `aisix_usage_event_drops_total` is recorded with today,
 /// one [`UsageDropTally`] slot each: the queue's (`sink_full`,
 /// `sink_closed`, `sink_disabled`) and the sender's.
-const USAGE_DROP_REASONS: [&str; 7] = [
+const USAGE_DROP_REASONS: [&str; 9] = [
     "sink_full",
     "sink_closed",
     "sink_disabled",
@@ -846,6 +849,8 @@ const USAGE_DROP_REASONS: [&str; 7] = [
     "send_unconfirmed",
     "oversized",
     "retry_budget_exhausted",
+    "spool_full",
+    "spool_write_failed",
 ];
 
 /// The per-reason drop counts behind [`Metrics::usage_event_drop_totals`].
@@ -1361,6 +1366,23 @@ impl Metrics {
     /// Usage delivery to the control plane.
     pub fn usage_delivery(&self) -> &crate::usage_delivery::UsageDeliveryHealth {
         &self.inner.usage_delivery
+    }
+
+    /// 本机等待投递及待人工对账的计费用量批次。
+    pub fn record_usage_spool_depth(&self, pending: usize, reconciliation: usize, bytes: u64) {
+        metrics::with_local_recorder(&self.inner.recorder, || {
+            metrics::gauge!(M_USAGE_SPOOL_BATCHES, "state" => "pending").set(pending as f64);
+            metrics::gauge!(M_USAGE_SPOOL_BATCHES, "state" => "reconciliation")
+                .set(reconciliation as f64);
+            metrics::gauge!(M_USAGE_SPOOL_BYTES).set(bytes as f64);
+        });
+    }
+
+    /// 按固定原因记录本地队列与投递异常。
+    pub fn record_usage_spool_failure(&self, reason: &'static str) {
+        metrics::with_local_recorder(&self.inner.recorder, || {
+            metrics::counter!(M_USAGE_SPOOL_FAILURES_TOTAL, "reason" => reason).increment(1);
+        });
     }
 
     /// Record what one configuration apply cost.

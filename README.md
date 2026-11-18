@@ -151,6 +151,13 @@ Covered by 183 end-to-end scenario files (496 cases) that run against real gatew
 - **Anthropic Messages API** — `POST /v1/messages` as a first-class route, working against
   **any** configured upstream: requests and responses (including streaming) are translated
   both ways when a model points at a non-Anthropic provider.
+- **Input token counts** — `POST /v1/messages/count_tokens` uses a Messages-compatible
+  counter. For inline requests you can set `token_counting.messages_count_tokens.provider_key_id`
+  to a compatible counting account and use `model_mappings` to select the counting model.
+  Its count reflects that model. Without a configured counter, a Messages request translated
+  to OpenAI Chat Completions returns HTTP 400 on preflight. OpenAI's
+  `POST /v1/responses/input_tokens` counts inputs for Responses requests, including their
+  message framing. [OpenAI token counting](https://developers.openai.com/api/docs/guides/token-counting)
 - **Routing & failover** — virtual/routing models with six strategies: `round_robin`
   (smooth weighted round-robin), `consistent_hash` (session affinity keyed by header /
   cookie / API key / client IP), `failover`, plus metric-based `least_cost`,

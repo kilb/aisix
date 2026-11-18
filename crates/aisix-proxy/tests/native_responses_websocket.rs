@@ -809,6 +809,91 @@ async fn websocket_native_tool_continuation_keeps_connection_and_one_final_per_r
     );
 }
 
+async fn send_handshake_lane(socket: &mut Client, lane: &str) {
+    let create =
+        json!({"type":"response.create","model":"native-model","stream_id":lane,"input":"probe"});
+    socket
+        .send(ClientMessage::Text(create.to_string()))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn websocket_handshake_on_another_target_keeps_the_warm_lane_moving() {
+    let f = fixture().await;
+    let mut socket = connect(&f).await;
+    send_handshake_lane(&mut socket, "warm").await;
+    assert_eq!(completed(&mut socket).await["stream_id"], "warm");
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let providers = &f.snapshot.load().provider_keys;
+    let warm = providers
+        .get_by_id(PROVIDER)
+        .unwrap()
+        .value
+        .as_ref()
+        .clone();
+    let mut cold = warm.clone();
+    cold.api_base = Some(format!("http://{}", listener.local_addr().unwrap()));
+    providers.insert(aisix_core::ResourceEntry::new(PROVIDER, cold, 2));
+    send_handshake_lane(&mut socket, "cold").await;
+    let (_unanswered, _) =
+        tokio::time::timeout(std::time::Duration::from_secs(3), listener.accept())
+            .await
+            .expect("冷目标已收到连接，尚未发送 101")
+            .unwrap();
+
+    providers.insert(aisix_core::ResourceEntry::new(PROVIDER, warm, 3));
+    send_handshake_lane(&mut socket, "hot").await;
+    let reply = tokio::time::timeout(std::time::Duration::from_secs(2), completed(&mut socket))
+        .await
+        .expect("热连接应在冷目标的 101 放行前完成");
+    assert_eq!(reply["stream_id"], "hot");
+}
+
+#[tokio::test]
+async fn websocket_handshake_preserves_pretty_json_line_endings() {
+    let f = fixture().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let providers = &f.snapshot.load().provider_keys;
+    let mut key = providers
+        .get_by_id(PROVIDER)
+        .unwrap()
+        .value
+        .as_ref()
+        .clone();
+    key.api_base = Some(format!("http://{}", listener.local_addr().unwrap()));
+    providers.insert(aisix_core::ResourceEntry::new(PROVIDER, key, 2));
+    let mut socket = connect(&f).await;
+    send_handshake_lane(&mut socket, "lf").await;
+    let (tcp, _) = tokio::time::timeout(std::time::Duration::from_secs(3), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut provider = tokio_tungstenite::accept_async(tcp).await.unwrap();
+    for (lane, separator) in [("lf", "\n"), ("crlf", "\r\n"), ("cr", "\r")] {
+        if lane != "lf" {
+            send_handshake_lane(&mut socket, lane).await;
+        }
+        let create = provider.next().await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(create.to_text().unwrap()).unwrap()["stream_id"],
+            lane
+        );
+        let id = format!("resp_{lane}");
+        let text = "line\nline\r\n雪";
+        let terminal = json!({"type":"response.completed","stream_id":lane,"response":{"id":id,"status":"completed","object":"response","output":[{"type":"message","content":[{"type":"output_text","text":text}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}});
+        let payload = serde_json::to_string_pretty(&terminal)
+            .unwrap()
+            .replace('\n', separator);
+        provider.send(ClientMessage::Text(payload)).await.unwrap();
+        let reply = event(&mut socket).await;
+        assert_eq!(reply["type"], "response.completed", "{lane}");
+        assert_eq!(reply["response"]["id"], id);
+        assert_eq!(reply["response"]["output"][0]["content"][0]["text"], text);
+    }
+}
+
 #[tokio::test]
 async fn websocket_lanes_are_concurrent_and_same_lane_is_fifo() {
     let f = fixture().await;

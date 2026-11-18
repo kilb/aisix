@@ -178,7 +178,7 @@ test("成员列表只显示费用与精确不限文案，详情可以直达、�
   await openDetail(page, member);
   for (const name of ["成员信息", "本月用量明细", "成员额度", "登录与访问"]) await expect(page.getByRole("region", { name, exact: true })).toBeVisible();
   const usage = page.getByRole("region", { name: "本月用量明细", exact: true });
-  for (const name of ["已计费费用", "调用次数", "计费用量"]) await expect(usage.getByText(name, { exact: true })).toBeVisible();
+  for (const name of ["已计费费用", "已记录调用", "计费用量"]) await expect(usage.getByText(name, { exact: true })).toBeVisible();
   await expect(page.getByRole("region", { name: "成员信息", exact: true })).toContainText(member.email);
   await expect(page.getByRole("region", { name: "成员额度", exact: true }).getByText("不限制", { exact: true })).toBeVisible();
   const access = page.getByRole("region", { name: "登录与访问", exact: true });
@@ -192,6 +192,45 @@ test("成员列表只显示费用与精确不限文案，详情可以直达、�
   expect(new URL(page.url()).hash.split("?")[0]).toBe("#members");
   await page.getByRole("searchbox", { name: "搜索成员", exact: true }).fill(member.email);
   await expect(row).toBeVisible();
+});
+
+test("成员详情仅读取目标成员的资料、用量和额度", async ({ page, browser }) => {
+  await login(page);
+  const target = await createMember(page);
+  const other = await createMember(page);
+  for (const [row, limit] of [[target, "12.34"], [other, "98.76"]] as const) {
+    const created = await api(page, "POST", "/api/budgets", {
+      scope: "member", scope_ref: row.id, period: "month", limit_cny: limit,
+    });
+    expect(created.status).toBe(201);
+  }
+  const detailPaths = ["/api/members", "/api/members/usage", "/api/budgets"];
+  const reads = detailPaths.map(path => waitForApi(page, "GET", path));
+  await page.goto(baseUrl + "/#members?member=" + encodeURIComponent(target.id));
+  const responses = await Promise.all(reads);
+  for (const response of responses) {
+    expect(response.status()).toBe(200);
+    const rows = object(await response.json()).items;
+    expect(Array.isArray(rows)).toBe(true);
+    expect(rows).toHaveLength(1);
+    const row = object((rows as unknown[])[0]);
+    const path = new URL(response.url()).pathname;
+    const id = path === "/api/members" ? row.id : path === "/api/budgets" ? object(row.target).id : row.member_id;
+    expect(id).toBe(target.id);
+  }
+  await expect(page.getByRole("heading", { level: 1, name: target.displayName, exact: true })).toBeVisible();
+  await expect(page.getByRole("region", { name: "本月用量明细", exact: true })).toContainText("¥0.00");
+  const quotas = page.getByRole("region", { name: "成员额度", exact: true });
+  await expect(quotas).toContainText("¥12.34");
+  await expect(quotas).not.toContainText("¥98.76");
+  await withActor(browser, other, async memberPage => {
+    for (const path of ["/api/members", "/api/members/usage"]) {
+      expect((await api(memberPage, "GET", path + "?member_id=" + target.id)).status).toBe(403);
+    }
+    const hidden = await api(memberPage, "GET", "/api/budgets?member_id=" + target.id);
+    expect(hidden.status).toBe(200);
+    expect(object(hidden.body).items).toEqual([]);
+  });
 });
 
 test("详情角色保存有确认且持久化，管理员不能修改隔离所有者", async ({ page, browser }) => {

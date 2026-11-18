@@ -19,7 +19,7 @@
 //!   undefined value — is dropped, exactly as every failure was before. A
 //!   connection that could not be made is the exception: nothing was sent,
 //!   so it is re-sent whatever the control plane last said.
-//!   There is still no persistent disk queue: a batch is given up on once
+//!   With the default in-memory queue, a batch is given up on once
 //!   its OLDEST event is [`RETRY_BUDGET`] old (which can be before its
 //!   first attempt, since the sender is single in-flight), or once the
 //!   control plane has answered and refused it [`MAX_ANSWERED_FAILURES`]
@@ -60,6 +60,8 @@ use aisix_obs::usage::DurableUsageRequest;
 use aisix_obs::{Metrics, UsageEvent, UsageEventLabels, UsageIoAuditUpdate, UsageSink};
 
 use crate::heartbeat::MtlsBundle;
+
+mod spool;
 
 /// Maximum number of events accumulated per outbound POST: the most one
 /// batch may carry at the control plane (`MAX_EVENTS_PER_BATCH`), which
@@ -295,7 +297,41 @@ impl TelemetryConfig {
 pub fn spawn(
     cfg: TelemetryConfig,
     metrics: Metrics,
+    cancel: watch::Receiver<bool>,
+) -> (UsageSink, tokio::task::JoinHandle<()>) {
+    spawn_inner(cfg, metrics, cancel, None)
+}
+
+pub fn spawn_spooled(
+    cfg: TelemetryConfig,
+    metrics: Metrics,
+    cancel: watch::Receiver<bool>,
+    path: &std::path::Path,
+    env_id: &str,
+    dp_id: &str,
+) -> anyhow::Result<(UsageSink, tokio::task::JoinHandle<()>)> {
+    let leaf =
+        std::fs::read(&cfg.mtls.client_cert_path).context("read usage spool client certificate")?;
+    let (certificate_env, certificate_dp) =
+        crate::cert_bundle::parse_san_uris(std::str::from_utf8(&leaf)?)?;
+    anyhow::ensure!(
+        !env_id.is_empty()
+            && !dp_id.is_empty()
+            && certificate_env == env_id
+            && certificate_dp == dp_id,
+        "usage spool gateway identity does not match the client certificate"
+    );
+    let client = build_client_with_leaf(&cfg.mtls, &leaf)?;
+    let spool = spool::Spool::open(path, &cfg.url, env_id, dp_id)
+        .with_context(|| format!("open managed.usage_spool_dir {}", path.display()))?;
+    Ok(spawn_inner(cfg, metrics, cancel, Some((spool, client))))
+}
+
+fn spawn_inner(
+    cfg: TelemetryConfig,
+    metrics: Metrics,
     mut cancel: watch::Receiver<bool>,
+    spool: Option<(spool::Spool, reqwest::Client)>,
 ) -> (UsageSink, tokio::task::JoinHandle<()>) {
     let (tx, rx) = tokio::sync::mpsc::channel(QUEUE_CAPACITY);
     let (io_tx, io_rx) = tokio::sync::mpsc::channel(MAX_BATCH);
@@ -313,8 +349,17 @@ pub fn spawn(
     let mut io_cancel = cancel.clone();
     let mut durable_cancel = cancel.clone();
     let handle = tokio::spawn(async move {
+        let ordinary_cfg = cfg.clone();
+        let ordinary = async move {
+            match spool {
+                Some((spool, client)) => {
+                    spool::run(ordinary_cfg, client, spool, metrics, rx, cancel).await
+                }
+                None => run(ordinary_cfg, metrics, rx, &mut cancel).await,
+            }
+        };
         tokio::join!(
-            run(cfg.clone(), metrics, rx, &mut cancel),
+            ordinary,
             run_io_updates(cfg.clone(), io_rx, &mut io_cancel)
                 .instrument(tracing::info_span!("telemetry", kind = "io_audit_update")),
             run_durable(cfg, durable_rx, &mut durable_cancel)
@@ -1492,10 +1537,14 @@ async fn send(
 /// expand this PR's scope. The two clients are independently
 /// constructed so a botched bundle on one path doesn't cascade.
 fn build_client(mtls: &MtlsBundle) -> anyhow::Result<reqwest::Client> {
-    let ca_pem = std::fs::read(&mtls.ca_cert_path)
-        .with_context(|| format!("read {}", mtls.ca_cert_path.display()))?;
     let cert_pem = std::fs::read(&mtls.client_cert_path)
         .with_context(|| format!("read {}", mtls.client_cert_path.display()))?;
+    build_client_with_leaf(mtls, &cert_pem)
+}
+
+fn build_client_with_leaf(mtls: &MtlsBundle, cert_pem: &[u8]) -> anyhow::Result<reqwest::Client> {
+    let ca_pem = std::fs::read(&mtls.ca_cert_path)
+        .with_context(|| format!("read {}", mtls.ca_cert_path.display()))?;
     let key_pem = std::fs::read(&mtls.client_key_path)
         .with_context(|| format!("read {}", mtls.client_key_path.display()))?;
 
@@ -1505,7 +1554,7 @@ fn build_client(mtls: &MtlsBundle) -> anyhow::Result<reqwest::Client> {
     if !key_pem.ends_with(b"\n") {
         identity_pem.push(b'\n');
     }
-    identity_pem.extend_from_slice(&cert_pem);
+    identity_pem.extend_from_slice(cert_pem);
     let identity = reqwest::Identity::from_pem(&identity_pem)
         .context("build mTLS Identity from client cert + key")?;
 
@@ -1542,6 +1591,7 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     include!("telemetry_durable_tests.rs");
+    include!("telemetry/spool_tests.rs");
 
     fn write_test_bundle(dir: &Path) -> MtlsBundle {
         let ca_kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
@@ -1556,6 +1606,14 @@ mod tests {
 
         let leaf_kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
         let mut leaf_params = CertificateParams::new(vec!["dp-test".to_string()]).unwrap();
+        for uri in [
+            format!("x-aisix://env/{SPOOL_ENV}"),
+            format!("x-aisix://dp/{SPOOL_DP}"),
+        ] {
+            leaf_params
+                .subject_alt_names
+                .push(rcgen::SanType::URI(uri.try_into().unwrap()));
+        }
         leaf_params.distinguished_name = {
             let mut dn = DistinguishedName::new();
             dn.push(rcgen::DnType::CommonName, "dp-test");

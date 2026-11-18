@@ -257,6 +257,40 @@ async fn direct_monitoring_uses_full_duration_without_tpot_and_accepts_one_outpu
 }
 
 #[tokio::test]
+async fn direct_monitoring_uses_ready_estimated_flags_and_reads_old_events_for_missing_flags() {
+    let Some(w) = world().await else { return };
+    let target = seed_model(&w.cp, &w.admin).await;
+    let pk = provider(&w, target).await;
+    let event = usage(
+        &w,
+        "estimated-projection",
+        target,
+        json!({"model_id":target,"provider_key_id":pk,"prompt_tokens":10,"completion_tokens":2,
+               "upstream_dispatched":true,"upstream_latency_ms":100,"usage_estimated":true}),
+    );
+    intake(&w, vec![event]).await;
+    // 将已就绪的值和原事件区分开，才能证明就绪时没有提前读取原事件。
+    for (version, flag, expected) in [(1_i32, Some(false), 1), (1, None, 0), (9, Some(false), 0)] {
+        let written = sqlx::query(
+            "UPDATE usage_metric_inputs SET projection_version = $1, usage_estimated = $2 \
+             WHERE event_id = 'estimated-projection'",
+        )
+        .bind(version)
+        .bind(flag)
+        .execute(w.cp.db().pool())
+        .await
+        .expect("构建就绪、未回填和未知版本的投影");
+        assert_eq!(written.rows_affected(), 1);
+        let response =
+            w.cp.send("GET", ENDPOINT, Some(w.admin.cookie()), None)
+                .await;
+        let measured = model(&response, target);
+        assert_eq!(measured["throughput_tps"]["sample_count"], expected);
+        assert_eq!(measured["throughput_tps"]["missing_count"], 1 - expected);
+    }
+}
+
+#[tokio::test]
 async fn direct_monitoring_requires_positive_full_duration_and_measured_successful_usage() {
     let Some(w) = world().await else { return };
     let target = seed_model(&w.cp, &w.admin).await;

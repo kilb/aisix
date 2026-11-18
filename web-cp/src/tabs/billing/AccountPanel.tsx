@@ -14,7 +14,7 @@ import {
 } from "../../lib/api";
 import { errorText } from "../../lib/fmt";
 import { fmtMicroCny, isCnyAmount, microCnyToInput } from "../../lib/money";
-import { fmtBeijing, periodLabel, todayBeijing, beijingRange, defaultCalendarRange, budgetPeriodRange } from "../../lib/time";
+import { fmtBeijing, periodLabel, todayBeijing, beijingRange, defaultCalendarRange, budgetPeriodRange, usagePeriodLabel } from "../../lib/time";
 import { Button } from "../../ui/Button";
 import { DataTable, Loading } from "../../ui/DataTable";
 import { EmptyState } from "../../ui/EmptyState";
@@ -543,7 +543,7 @@ function UsageSummary({ account }: RegionProps) {
       tenantId={account.tenant_id}
       stamp={account.balance_micro_cny}
       load={(q) => billing.usageSummary(account.tenant_id, q)}
-      searchText={(r) => [periodLabel(r.period_start, "day"), r.model.id ?? "", usageModel(r.model)]}
+      searchText={(r) => [usagePeriodLabel(r, "day"), r.model.id ?? "", usageModel(r.model)]}
       render={(rows, group) => (
         <DataTable label="用量汇总" compact>
           <thead>
@@ -558,7 +558,7 @@ function UsageSummary({ account }: RegionProps) {
           <tbody>
             {rows.map((r) => (
               <tr data-finance-record key={`${r.period_start}/${r.model.id ?? r.model.name}`}>
-                <td data-label="期间" className="tabular">{periodLabel(r.period_start, group)}</td>
+                <td data-label="期间" className="tabular">{usagePeriodLabel(r, group)}</td>
                 <td data-label="模型">{usageModel(r.model)}</td>
                 <td data-label="调用次数" className="num">{formatCount(r.requests)}</td>
                 <td data-label="费用" className="num">{fmtMicroCny(r.charged_micro_cny)}</td>

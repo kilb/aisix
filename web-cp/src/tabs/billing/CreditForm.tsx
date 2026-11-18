@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { billing } from "../../lib/api";
-import { creditLocks, sendCredit } from "../../lib/creditOutcome";
+import { creditLocks, sendCredit, type CreditRequest } from "../../lib/creditOutcome";
 import { errorText } from "../../lib/fmt";
+import { assessmentRequestId as newOperationId } from "../../lib/modelAssessment";
 import { isCnyAmount } from "../../lib/money";
 import { Button } from "../../ui/Button";
 import { Field, useRefusalFocus } from "../../ui/Field";
@@ -32,11 +33,10 @@ function Form({ account, onChanged }: RegionProps) {
   const [local, setLocal] = useState<Problems>({});
   const [refused, setRefused] = useState<ReturnType<typeof refusal> | null>(null);
   const [stale, setStale] = useState<string | null>(null);
-  // The tenant's credit lock, which outlives this form: a credit sent from a form since closed
-  // is still followed here. An unknown outcome may have been stored while its answer was lost:
-  // the form stays locked until the operator has checked and starts over.
+  // 回包丢失或标签页刷新后沿用原操作；同一笔未核实的入账不能再次创建。
   const lock = useSyncExternalStore(creditLocks.subscribe, () => creditLocks.get(account.tenant_id));
   const unknown = lock === "unknown";
+  const saved = lock ? creditLocks.request(account.tenant_id) : null;
   // A credit this form did not send is still on its way.
   const elsewhere = lock === "pending" && !busy;
   // A credit refused after the form that sent it closed: nothing was credited.
@@ -65,20 +65,34 @@ function Form({ account, onChanged }: RegionProps) {
     return true;
   }
 
-  async function send() {
-    // The lock is taken synchronously before anything is sent: a second confirm, or another
-    // form of the same tenant, cannot get in.
-    if (Object.keys(check(amount, reason)).length > 0 || !creditLocks.acquire(account.tenant_id)) return;
-    setBusy(true);
-    const outcome = await sendCredit(() =>
-      billing.credit(account.tenant_id, {
+  async function send(retry = false) {
+    let body: CreditRequest | null;
+    if (retry) {
+      body = creditLocks.retry(account.tenant_id);
+      if (!body) return;
+    } else {
+      if (Object.keys(check(amount, reason)).length > 0) return;
+      body = {
+        operation_id: newOperationId(),
         amount_cny: amount.trim(),
         reason: reason.trim(),
         ...(reference.trim() !== "" ? { reference: reference.trim() } : {}),
-      }),
-    );
-    if (outcome.kind === "unknown") {
+      };
+      try {
+        if (!creditLocks.acquire(account.tenant_id, body)) return;
+      } catch (error) {
+        if (!(error instanceof DOMException)) throw error;
+        setStale("浏览器无法保存待确认的入账，本次尚未提交。请检查标签页的存储权限后重试。");
+        return;
+      }
+    }
+    setBusy(true);
+    setStale(null);
+    const outcome = await sendCredit(() => billing.credit(account.tenant_id, body));
+    if (outcome.kind === "unknown" || (retry && outcome.kind === "refused")) {
+      // 本次重试被拒绝，也不能据此判定上一次的入账结果。
       creditLocks.settle(account.tenant_id, "unknown");
+      if (outcome.kind === "refused") setStale(`重试未完成：${errorText(outcome.error)}`);
       setBusy(false);
       return;
     }
@@ -125,6 +139,7 @@ function Form({ account, onChanged }: RegionProps) {
     setReference("");
     setLocal({});
     setRefused(null);
+    setStale(null);
     creditLocks.release(account.tenant_id);
   }
 
@@ -137,15 +152,15 @@ function Form({ account, onChanged }: RegionProps) {
         <div className="grid gap-x-4 sm:grid-cols-2">
           <Field label="金额（元）" error={amountProblem}>
             {(aria) => (
-              <input inputMode="decimal" value={amount} disabled={busy || lock !== null} onChange={(e) => setAmount(e.target.value)} {...aria} />
+              <input inputMode="decimal" value={saved?.amount_cny ?? amount} disabled={busy || lock !== null} onChange={(e) => setAmount(e.target.value)} {...aria} />
             )}
           </Field>
           <Field label="凭证号" error={refused?.at.get("/reference") ?? null}>
-            {(aria) => <input value={reference} maxLength={128} disabled={busy || lock !== null} onChange={(e) => setReference(e.target.value)} {...aria} />}
+            {(aria) => <input value={saved ? (saved.reference ?? "") : reference} maxLength={128} disabled={busy || lock !== null} onChange={(e) => setReference(e.target.value)} {...aria} />}
           </Field>
         </div>
         <Field label="原因" error={reasonProblem}>
-          {(aria) => <input value={reason} maxLength={500} disabled={busy || lock !== null} onChange={(e) => setReason(e.target.value)} {...aria} />}
+          {(aria) => <input value={saved?.reason ?? reason} maxLength={500} disabled={busy || lock !== null} onChange={(e) => setReason(e.target.value)} {...aria} />}
         </Field>
         {!unknown && (
           <div className="right flex justify-end">
@@ -173,8 +188,9 @@ function Form({ account, onChanged }: RegionProps) {
       )}
       {unknown && (
         <div className="note crit" role="alert">
-          入账结果未知：请先在「计费 · 充值审批」中把状态选为「已批准」、来源选为「平台入账」，按租户、原因与凭证号确认这笔入账是否已记录，再决定是否重试。本面板「余额流水」里的「充值」条目不分租户申请的充值与平台入账，不能据此判断。
+          入账结果未知。{saved && "重试会使用原操作编号，已入账的款项只计一次。"}也可以在「计费 · 充值审批」中按「平台入账」、租户、原因与凭证号核对记录。
           <div className="bl-row-actions mt-3">
+            {saved && <Button type="button" size="sm" onClick={() => void send(true)}>重试这笔入账</Button>}
             <Button type="button" size="sm" busy={checking} busyLabel="刷新中…" onClick={() => void recheck()}>
               刷新余额与流水
             </Button>

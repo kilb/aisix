@@ -48,6 +48,7 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use serde_json::Value;
+use std::ops::ControlFlow;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -5464,19 +5465,17 @@ fn drain_anthropic_sse_frames_with_outputs(
     if acc.reached_end || acc.stream_failure.is_some() {
         return Some(0);
     }
-    while let Some(end) = aisix_gateway::sse::find_frame_end_from(buf, *scanned) {
-        let frame: Vec<u8> = buf.drain(..end).collect();
-        *scanned = 0;
+    aisix_gateway::sse::drain_complete_frames(buf, scanned, |frame| {
         // The frame's WHOLE payload, not just its first `data:` line: this
         // is what feeds `response_text`, the text the end-of-stream output
         // guardrail scans, and a payload split over several `data:` lines
         // parses only once they are joined (#1100).
-        let (json, malformed) = crate::redact::parse_sse_json_event(&frame);
+        let (json, malformed) = crate::redact::parse_sse_json_event(frame);
         if malformed {
             acc.malformed_sse_data = true;
-            acc.malformed_payload = crate::redact::frame_payload(&frame);
+            acc.malformed_payload = crate::redact::frame_payload(frame);
             acc.note_stream_failure(crate::stream_timeout::RawStreamFailure::UpstreamDecode);
-            return Some(frame.len());
+            return ControlFlow::Break(frame.len());
         }
         let mut reports_failure = false;
         if let Some(json) = &json {
@@ -5489,8 +5488,8 @@ fn drain_anthropic_sse_frames_with_outputs(
                 response_text_cap,
             );
         }
-        let forwarded = restamp_anthropic_frame(&frame, client_facing_model);
-        let forwarded = forwarded.as_deref().unwrap_or(&frame);
+        let forwarded = restamp_anthropic_frame(frame, client_facing_model);
+        let forwarded = forwarded.as_deref().unwrap_or(frame);
         // The upstream's error event reaches the caller as sent, less the
         // credentials this request sent it; in platform mode, as the class
         // of the error it reports.
@@ -5511,11 +5510,11 @@ fn drain_anthropic_sse_frames_with_outputs(
             }
         }
         if acc.reached_end || acc.stream_failure.is_some() {
-            return Some(0);
+            return ControlFlow::Break(0);
         }
-    }
-    *scanned = buf.len();
-    None
+        ControlFlow::Continue(())
+    })
+    .break_value()
 }
 
 /// The caller-facing `model` restamped onto one relayed Anthropic frame, in

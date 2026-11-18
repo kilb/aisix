@@ -49,7 +49,7 @@ use aisix_core::models::BudgetPeriod;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sqlx::PgConnection;
+use sqlx::{PgConnection, QueryBuilder};
 use uuid::Uuid;
 
 use super::marks;
@@ -290,14 +290,21 @@ pub async fn db_now(conn: &mut PgConnection) -> Result<DateTime<Utc>, DbError> {
 async fn live_rows(
     conn: &mut PgConnection,
     tenant_ids: &[Uuid],
+    member: Option<Uuid>,
 ) -> Result<Vec<BudgetRow>, DbError> {
-    let raws: Vec<RawRow> = sqlx::query_as(&format!(
-        "SELECT {COLUMNS} FROM billing_budgets_cny \
-         WHERE tenant_id = ANY($1) AND deleted_at IS NULL ORDER BY created_at, id"
-    ))
-    .bind(tenant_ids)
-    .fetch_all(conn)
-    .await?;
+    let mut sql = QueryBuilder::new(format!(
+        "SELECT {COLUMNS} FROM billing_budgets_cny WHERE tenant_id = ANY("
+    ));
+    sql.push_bind(tenant_ids).push(") AND deleted_at IS NULL");
+    if let Some(id) = member {
+        sql.push(" AND scope = 'member' AND scope_ref = ")
+            .push_bind(id);
+    }
+    let raws: Vec<RawRow> = sql
+        .push(" ORDER BY created_at, id")
+        .build_query_as()
+        .fetch_all(conn)
+        .await?;
     raws.into_iter().map(decode).collect()
 }
 
@@ -352,7 +359,17 @@ pub async fn list(
     tenant_id: Uuid,
     now: DateTime<Utc>,
 ) -> Result<Vec<(BudgetRow, i64)>, DbError> {
-    let rows = live_rows(&mut *conn, &[tenant_id]).await?;
+    list_scoped(conn, tenant_id, now, None).await
+}
+
+/// 成员详情仅读取该成员的额度及花费，组织列表保留各级额度。
+pub(super) async fn list_scoped(
+    conn: &mut PgConnection,
+    tenant_id: Uuid,
+    now: DateTime<Utc>,
+    member: Option<Uuid>,
+) -> Result<Vec<(BudgetRow, i64)>, DbError> {
+    let rows = live_rows(&mut *conn, &[tenant_id], member).await?;
     let spends = spends(conn, &rows, now).await?;
     Ok(rows
         .into_iter()
@@ -608,7 +625,7 @@ pub(crate) async fn project(
     ctx: &WriteCtx,
     tenant_id: Uuid,
 ) -> Result<(), ApiError> {
-    let rows = live_rows(&mut *conn, &[tenant_id]).await?;
+    let rows = live_rows(&mut *conn, &[tenant_id], None).await?;
     if rows.is_empty() {
         return Ok(());
     }

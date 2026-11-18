@@ -25,6 +25,7 @@ use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
 use serde_json::Value;
 use std::borrow::Cow;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -4672,13 +4673,11 @@ fn drain_responses_sse_frames(
     if failure.is_some() || acc.as_ref().is_some_and(|usage| usage.reached_end) {
         return true;
     }
-    while let Some(end) = aisix_gateway::sse::find_frame_end_from(buf, *scanned) {
-        let frame: Vec<u8> = buf.drain(..end).collect();
-        *scanned = 0;
+    aisix_gateway::sse::drain_complete_frames(buf, scanned, |frame| {
         // This site only READS the frame — the bytes forwarded to the client
         // are the ones below.
         let terminal = observe_responses_sse_frame(
-            &frame,
+            frame,
             acc,
             capture.as_deref_mut(),
             failure,
@@ -4687,8 +4686,8 @@ fn drain_responses_sse_frames(
         );
         // The caller-facing model and the context tags (and in platform mode
         // the sealed ids) in one splice pass.
-        let tagged = mark.restamp_and_tag_sse_frame(&frame, client_facing_model);
-        let forwarded = tagged.as_deref().unwrap_or(&frame);
+        let tagged = mark.restamp_and_tag_sse_frame(frame, client_facing_model);
+        let forwarded = tagged.as_deref().unwrap_or(frame);
         // A failure the upstream reported reaches the caller as sent, less the
         // credentials this request sent it; in platform mode, as the class of
         // the error it reports.
@@ -4703,11 +4702,11 @@ fn drain_responses_sse_frames(
             out.extend_from_slice(forwarded);
         }
         if terminal {
-            return true;
+            return ControlFlow::Break(());
         }
-    }
-    *scanned = buf.len();
-    false
+        ControlFlow::Continue(())
+    })
+    .is_break()
 }
 
 /// Read one complete SSE frame into a stream's accounting: the first frame's

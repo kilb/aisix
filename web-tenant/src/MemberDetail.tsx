@@ -61,13 +61,13 @@ export function MemberDetail({ memberId, member, status, onBack, onSelfChanged, 
       } catch (error) { if (id === loadId.current) refused(failure(error)); }
     }
     await Promise.all([
-      read(memberApi.list, (people) => {
+      read(() => memberApi.list(memberId), (people) => {
         const target = people.find((row) => row.id === memberId) ?? null;
         setPerson(target);
         setFound(true);
         if (target) setRole(target.role);
       }, setPersonError),
-      ...(active ? [read(memberUsage, setUsage, setUsageError), read(budgetApi.list, setBudgets, setBudgetError)] : []),
+      ...(active ? [read(() => memberUsage(memberId), setUsage, setUsageError), read(() => budgetApi.list(memberId), setBudgets, setBudgetError)] : []),
     ]);
   }, [memberId, active]);
   useEffect(() => {

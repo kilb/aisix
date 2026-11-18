@@ -83,13 +83,14 @@ pub async fn backfill_once(db: &Db) -> Result<Backfilled, DbError> {
     sqlx::query("SET LOCAL statement_timeout = '2s'")
         .execute(&mut *tx)
         .await?;
-    let state: Option<(i64, Option<i64>, bool)> = sqlx::query_as(
-        "SELECT after_seq, high_seq, complete FROM usage_metric_input_backfill \
-         WHERE version = 1 FOR UPDATE SKIP LOCKED",
+    let state: Option<(i32, i64, Option<i64>, bool)> = sqlx::query_as(
+        "SELECT version, after_seq, high_seq, complete FROM usage_metric_input_backfill \
+         WHERE version = (SELECT version FROM usage_metric_input_backfill WHERE version IN (1, 2) \
+             ORDER BY complete, version LIMIT 1) FOR UPDATE SKIP LOCKED",
     )
     .fetch_optional(&mut *tx)
     .await?;
-    let Some((after, high, complete)) = state else {
+    let Some((version, after, high, complete)) = state else {
         tx.commit().await?;
         return Ok(Backfilled::default());
     };
@@ -115,20 +116,22 @@ pub async fn backfill_once(db: &Db) -> Result<Backfilled, DbError> {
         .fetch_one(&mut *tx)
         .await?;
     let complete = examined < BACKFILL_BATCH && locked == examined;
-    sqlx::query(
+    let others_complete: bool = sqlx::query_scalar(
         "UPDATE usage_metric_input_backfill SET after_seq = $1, high_seq = $2, complete = $3 \
-         WHERE version = 1",
+         WHERE version = $4 RETURNING NOT EXISTS (SELECT 1 FROM usage_metric_input_backfill \
+             WHERE version IN (1, 2) AND version <> $4 AND NOT complete)",
     )
     .bind(if complete { high } else { next })
     .bind(high)
     .bind(complete)
-    .execute(&mut *tx)
+    .bind(version)
+    .fetch_one(&mut *tx)
     .await?;
     tx.commit().await?;
     Ok(Backfilled {
         examined,
         written,
         deferred: examined - locked,
-        complete,
+        complete: complete && others_complete,
     })
 }

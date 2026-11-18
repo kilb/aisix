@@ -269,6 +269,7 @@ export interface TenantKey {
   /** Whether that group still routes to the organisation: false closes the key. */
   group_available: boolean;
   rate_limit: KeyLimits;
+  effective_rate_limit?: KeyLimits;
   /** The organisation's own switch. */
   disabled: boolean;
   /** The platform's switch, which only the platform turns off again. */
@@ -391,8 +392,8 @@ export const keys = {
 };
 
 export const members = {
-  async list(): Promise<Member[]> {
-    return (await call<{ items: Member[] }>("GET", "/members")).data.items;
+  async list(memberId?: string): Promise<Member[]> {
+    return (await call<{ items: Member[] }>("GET", `/members${queryOf({ member_id: memberId })}`)).data.items;
   },
   async setRole(id: string, role: MemberRole): Promise<Member> {
     return (await call<Member>("PATCH", `/members/${at(id)}`, { role })).data;
@@ -615,8 +616,8 @@ export interface NewBudget {
 
 export const budgets = {
   /** Every level for an owner, an admin or a billing member; a member's own for a member. */
-  async list(): Promise<Budget[]> {
-    return (await call<{ items: Budget[] }>("GET", "/budgets")).data.items;
+  async list(memberId?: string): Promise<Budget[]> {
+    return (await call<{ items: Budget[] }>("GET", `/budgets${queryOf({ member_id: memberId })}`)).data.items;
   },
   async create(body: NewBudget): Promise<Budget> {
     return (await call<Budget>("POST", "/budgets", body)).data;
@@ -683,6 +684,7 @@ export interface UpstreamTiming {
   first_response_byte_ms?: number | null;
   first_protocol_frame_ms?: number | null;
   first_canonical_chunk_ms?: number | null;
+  upstream_first_content_ms?: number | null;
   first_content_ms?: number | null;
 }
 

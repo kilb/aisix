@@ -2,7 +2,16 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
-import { beijingInputValue, beijingRange, bucketStart, budgetPeriodRange, defaultCalendarRange, fmtBeijing, metricPeriodLabel, parseBeijingInput, periodLabel, todayBeijing } from "./time.ts";
+import { beijingInputValue, beijingRange, bucketStart, budgetPeriodRange, defaultCalendarRange, fmtBeijing, metricPeriodLabel, parseBeijingInput, periodLabel, todayBeijing, usagePeriodLabel } from "./time.ts";
+
+test("跨期汇总保留合并标签；同名的真实模型和已失去授权的模型仍显示实际期间", () => {
+  const period_start = "2026-11-30T16:00:00Z";
+  const merged = { period_start, model: { id: null, name: "other" } };
+  assert.equal(usagePeriodLabel(merged, "day"), "合并期间（可能跨期）");
+  assert.equal(usagePeriodLabel(merged, "month"), "合并期间（可能跨期）");
+  assert.equal(usagePeriodLabel({ period_start, model: { id: "model-1", name: "other" } }, "day"), "2026-12-01");
+  assert.equal(usagePeriodLabel({ period_start, model: { id: null, name: "" } }, "month"), "2026-12");
+});
 
 test("北京时间日期区间含首尾两天，API 保存 UTC instant", () => {
   assert.deepEqual(beijingRange("2026-11-01", "2026-11-07"), { from: "2026-10-31T16:00:00.000Z", to: "2026-11-07T16:00:00.000Z" });

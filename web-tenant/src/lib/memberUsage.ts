@@ -19,6 +19,7 @@ export interface MemberUsageSummary {
   items: MemberUsage[];
 }
 
-export async function memberUsage(): Promise<MemberUsageSummary> {
-  return (await call<MemberUsageSummary>("GET", "/members/usage")).data;
+export async function memberUsage(memberId?: string): Promise<MemberUsageSummary> {
+  const query = memberId ? `?${new URLSearchParams({ member_id: memberId })}` : "";
+  return (await call<MemberUsageSummary>("GET", `/members/usage${query}`)).data;
 }

@@ -99,7 +99,7 @@ export function UsageModelsCard({ rows, summary, error, rangeLabel, number, clas
           accessibleLabel={`${rangeLabel}费用最高的 ${shown.length} 个模型分组及其费用占比`}
         />}
         <CardFooter>
-          <p className="text-caption text-fg-3">{ranked.length > shown.length ? `展示费用前 ${shown.length} 个分组，共 ${ranked.length} 个。` : "按各模型已计费用量汇总。"}{!canShowShare && total !== null ? "费用含负数调整或合计为零时，不计算占比。" : ""}{summary.hasMergedPeriods ? "“其他”为跨期合并分组，不计入可识别模型数。" : ""}</p>
+          <p className="text-caption text-fg-3">{ranked.length > shown.length ? `展示费用前 ${shown.length} 个分组，共 ${ranked.length} 个。` : "按各模型已计费用量汇总。"}{!canShowShare && total !== null ? "费用含负数调整或合计为零时，不计算占比。" : ""}{summary.hasMergedPeriods ? "“其他”合并了超出展示上限的分组，可能跨期，不计入可识别模型数。" : ""}</p>
         </CardFooter>
       </>}
     </Card>

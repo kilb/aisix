@@ -64,7 +64,7 @@ impl HashRing {
 }
 
 pub(super) struct ConfiguredTier {
-    owner: std::sync::Arc<Model>,
+    pub(super) owner: std::sync::Arc<Model>,
     model_generation: std::sync::atomic::AtomicU64,
     declarations: Vec<usize>,
     names: Vec<String>,
@@ -225,10 +225,10 @@ impl RoutingRegistry {
                     fingerprint,
                     declarations.iter().map(|&index| &routing.targets[index]),
                     scale,
-                    |_| {
+                    |_, _| {
                         let name = names[next].as_str();
                         next += 1;
-                        std::borrow::Cow::Borrowed(name)
+                        (std::borrow::Cow::Borrowed(name), 0)
                     },
                 );
                 ring.configured = Some(ConfiguredTier {
@@ -239,7 +239,9 @@ impl RoutingRegistry {
                     lookup,
                 });
                 let ring = std::sync::Arc::new(ring);
-                self.rings.insert(key, ring.clone());
+                self.cache_if_current(snapshot, || {
+                    self.rings.insert(key, ring.clone());
+                });
                 ring
             });
             let Some(configured) = ring.configured.as_ref() else {

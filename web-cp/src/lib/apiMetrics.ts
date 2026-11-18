@@ -6,6 +6,7 @@ export interface ApiMetricsQuery {
   from: string;
   to: string;
   bucket?: MetricsBucket;
+  view?: "overview";
   model_id?: string;
   member_id?: string;
   api_key_id?: string;

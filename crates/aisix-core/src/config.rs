@@ -359,6 +359,10 @@ pub struct ManagedConfig {
     #[serde(default)]
     pub snapshot_cache_path: Option<String>,
 
+    /// 可选的本地计费用量队列。每个托管网关实例单独使用一个持久目录。
+    #[serde(default)]
+    pub usage_spool_dir: Option<String>,
+
     /// Heartbeat interval, in seconds. The DP POSTs a heartbeat to
     /// the control plane every `heartbeat_interval_secs`; CP surfaces a DP as
     /// "connected" on its first heartbeat. Clamped to [5, 300] by
@@ -386,6 +390,7 @@ impl Default for ManagedConfig {
             dp_id_file: Self::default_dp_id_file(),
             snapshot_cache_enabled: false,
             snapshot_cache_path: None,
+            usage_spool_dir: None,
             heartbeat_interval_secs: Self::default_heartbeat_interval_secs(),
         }
     }
@@ -2561,6 +2566,19 @@ impl Config {
             return Err(BootstrapError::Config(
                 "etcd.user and etcd.password_env must be set together".to_string(),
             ));
+        }
+
+        if let Some(path) = &self.managed.usage_spool_dir {
+            if !self.managed.is_managed()
+                || path.trim() != path
+                || !Path::new(path).is_absolute()
+                || Path::new(path).file_name().is_none()
+            {
+                return Err(BootstrapError::Config(
+                    "managed.usage_spool_dir requires an absolute directory path in managed mode"
+                        .into(),
+                ));
+            }
         }
 
         if let Some(native) = &self.native_objects {
@@ -6206,6 +6224,24 @@ managed:
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn usage_spool_requires_an_absolute_directory_in_managed_mode() {
+        for (setting, valid) in [
+            ("enabled: true, usage_spool_dir: /var/lib/aisix/usage", true),
+            ("enabled: true, usage_spool_dir: usage", false),
+            ("enabled: true, usage_spool_dir: /", false),
+            ("enabled: true, usage_spool_dir: ''", false),
+            (
+                "enabled: false, usage_spool_dir: /var/lib/aisix/usage",
+                false,
+            ),
+        ] {
+            let file = write_yaml(&format!("etcd:\n  endpoints: [http://127.0.0.1:2379]\nproxy:\n  addr: 127.0.0.1:3000\nadmin:\n  admin_keys: [k1]\nmanaged: {{{setting}}}\n"));
+            let result = Config::load_from_path(Some(file.path()));
+            assert_eq!(result.is_ok(), valid, "{setting}: {result:?}");
         }
     }
 

@@ -28,6 +28,7 @@ import {
 } from "../lib/api";
 import { errorText, fmtInt, fmtTime } from "../lib/fmt";
 import { keyModels } from "../lib/keyModels";
+import { keyLimitText } from "../lib/keyRateLimits";
 import { adminKeySettingsPatch } from "../lib/keySettingsAdmin";
 import { isKeyBudgetAmount, keyBudgetAmountInput } from "../lib/keyBudget";
 import { fmtMicroCny } from "../lib/money";
@@ -157,11 +158,8 @@ function modelsOf(k: AdminKey, tenant: Tenant, names: Map<string, string> | null
   return keyModels(k, tenant, names);
 }
 
-function limitsOf(k: AdminKey): string {
-  const parts: string[] = [];
-  if (k.rate_limit.concurrency !== undefined) parts.push(`并发 ${k.rate_limit.concurrency}`);
-  if (k.rate_limit.rpm !== undefined) parts.push(`每分钟 ${k.rate_limit.rpm}`);
-  return parts.length > 0 ? parts.join(" · ") : "不限制";
+function limitsOf(key: AdminKey, tenant: Tenant): string {
+  return `并发 ${keyLimitText(key, "concurrency", tenant.limits)} · 每分钟 ${keyLimitText(key, "rpm", tenant.limits)}`;
 }
 
 function Status({ k, tenant, members }: { k: AdminKey; tenant: Tenant; members: Member[] | null }) {
@@ -299,6 +297,7 @@ function TenantKeys({ tenantId, editingId, canEdit, tick }: { tenantId: string; 
       {keyList.data === null ? !keyList.error && <Loading /> : !current ? <EmptyState text="未找到该租户的密钥，可能已被吊销。" /> : <>
         <Card className="key-editor-page">
           <CardHeader title={current.label} description={`${tenant.name} · ${current.prefix} · 密钥配置与下方费用额度分别保存。`} />
+          <p className="hint">当前生效限额：{limitsOf(current, tenant)}</p>
           {editSaved === current.id && <div className="note" role="status">密钥配置已保存</div>}
           {canEdit ? <CreateForm key={`${current.id}:${current.version}`} initial={current} tenant={tenant} names={names} catalogError={catalog.error} choices={choices} onBusyChange={setEditBusy}
             onSaved={next => { saved(next); setEditSaved(next.id); }} onMinted={() => undefined} onCancel={() => { window.location.hash = listHref; }} onReload={() => void keyList.reload()} /> : <p className="hint">当前账号仅可查看密钥。</p>}
@@ -426,7 +425,7 @@ function TenantKeys({ tenantId, editingId, canEdit, tick }: { tenantId: string; 
                           <KeyGroupCell k={k} />
                           <StrayNote k={k} tenant={tenant} />
                         </td>
-                        <td className="key-limit-column text-fg-2">{limitsOf(k)}</td>
+                        <td className="key-limit-column text-fg-2">{limitsOf(k, tenant)}</td>
                         <td>
                           <Status k={k} tenant={tenant} members={members.data} />
                         </td>

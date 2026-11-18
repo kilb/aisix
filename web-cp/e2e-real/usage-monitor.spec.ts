@@ -152,6 +152,36 @@ test("legacy failed-call links retain outcome when combining and clearing filter
   expect(new URLSearchParams(page.url().split("?")[1]).has("status")).toBe(false);
 });
 
+test("成员用量分析下钻只显示该成员的调用", async ({ page }) => {
+  const base = await login(page, "admin");
+  const initial = page.waitForResponse(response => matching(response, "/admin/pricing/charges", {}));
+  await page.goto(`${base}/#calls`);
+  const all = await initial;
+  expect(all.status()).toBe(200);
+  type Call = { user_id: string | null; event_id: string; occurred_at: string };
+  const calls = (await all.json() as { items: Call[] }).items.filter(row => row.user_id);
+  const first = calls[0];
+  if (!first?.user_id) throw new Error("需要带成员归属的真实调用");
+  const another = calls.find(row => row.user_id !== first.user_id && Math.abs(Date.parse(row.occurred_at) - Date.parse(first.occurred_at)) < 90 * 86400_000);
+  if (!another) throw new Error("需要同一查询窗口内能被成员条件排除的真实调用");
+  const dates = [Date.parse(first.occurred_at), Date.parse(another.occurred_at)];
+  const range = { from: new Date(Math.min(...dates) - 1000).toISOString(), to: new Date(Math.max(...dates) + 1000).toISOString() };
+  await page.goto(`${base}/#analytics?${new URLSearchParams(range)}`);
+  await page.getByRole("button", { name: /^更多筛选/ }).click();
+  await page.getByLabel("成员 ID", { exact: true }).fill(first.user_id);
+  const link = page.getByRole("link", { name: "查看调用记录", exact: true });
+  await expect(link).toHaveAttribute("href", new RegExp(`member_id=${first.user_id}`));
+  const memberFilter = { ...range, member_id: first.user_id };
+  const answer = page.waitForResponse(response => matching(response, "/admin/pricing/charges", memberFilter));
+  await link.click();
+  const scoped = await answer;
+  expect(scoped.status()).toBe(200);
+  const items = (await scoped.json() as { items: Call[] }).items;
+  expect(items.map(row => row.event_id)).toContain(first.event_id);
+  expect(items.map(row => row.event_id)).not.toContain(another.event_id);
+  expect(items.every(row => row.user_id === first.user_id)).toBe(true);
+});
+
 test("admin visible time and identity controls combine before pagination and retain precise deep links", async ({ page }) => {
   const base = await login(page, "admin");
   const first = page.waitForResponse(response => matching(response, "/admin/pricing/charges", {}));

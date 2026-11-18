@@ -703,6 +703,117 @@ async fn historical_rows(db: &Db, count: i64) {
     .expect("准备真实历史候选");
 }
 
+async fn wait_for_metric_table_lock(pool: &sqlx::PgPool, mode: &str) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let waiting: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE NOT granted AND mode = $1 \
+             AND database = (SELECT oid FROM pg_database WHERE datname = current_database()) \
+             AND relation IN ('usage_events'::regclass, 'usage_metric_inputs'::regclass))",
+        )
+        .bind(mode)
+        .fetch_one(pool)
+        .await
+        .expect("观察迁移和并发写入的真实锁队列");
+        if waiting {
+            return;
+        }
+        assert!(Instant::now() < deadline, "未出现 {mode} 等待者");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+#[tokio::test]
+async fn estimated_flag_upgrade_from_62_fences_live_writes_and_reads_history_until_backfilled() {
+    use support::migrate::{database_at, into_test_cp, migrate_rest};
+
+    let Some(pool) = database_at(62).await else {
+        return;
+    };
+    const INSERT: &str = "INSERT INTO usage_events(event_id,dp_id,batch_id,occurred_at,event) \
+                          VALUES ($1,$2,$2,now(),$3)";
+    let model = Uuid::new_v4();
+    let provider = Uuid::new_v4();
+    for (id, estimated, output) in [("old-estimated", true, 99), ("old-measured", false, 2)] {
+        sqlx::query(INSERT)
+            .bind(id)
+            .bind(provider)
+            .bind(json!({
+                "model_id":model, "provider_key_id":provider, "upstream_dispatched":true,
+                "status_code":200, "prompt_tokens":8, "completion_tokens":output,
+                "upstream_latency_ms":100, "usage_estimated":estimated
+            }))
+            .execute(&pool)
+            .await
+            .expect("旧版触发器写真正的 v1 历史行");
+    }
+    sqlx::query("UPDATE usage_metric_input_backfill SET complete = true, high_seq = 2, after_seq = 2 WHERE version = 1")
+        .execute(&pool).await.expect("旧回填已完成");
+    // 让 DDL 排在投影锁上，再让源表写入排队；没有源表围栏时旧触发器会漏过新上界。
+    let mut blocker = pool.begin().await.expect("占住投影表");
+    sqlx::query("LOCK TABLE usage_metric_inputs IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *blocker)
+        .await
+        .expect("延迟 DDL");
+    let (migration, _, _) = tokio::join!(
+        migrate_rest(&pool),
+        async {
+            wait_for_metric_table_lock(&pool, "AccessExclusiveLock").await;
+            sqlx::query(INSERT)
+                .bind("during-upgrade")
+                .bind(provider)
+                .bind(json!({"usage_estimated":true}))
+                .execute(&pool)
+                .await
+                .expect("并发写入");
+        },
+        async {
+            wait_for_metric_table_lock(&pool, "RowExclusiveLock").await;
+            blocker.commit().await.expect("放行 DDL 和写入");
+        },
+    );
+    migration.expect("0062 连续升级到 0064");
+    let applied: Vec<i64> = sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success AND version BETWEEN 62 AND 64 ORDER BY version")
+        .fetch_all(&pool).await.expect("连续迁移版本");
+    assert_eq!(applied, [62, 63, 64]);
+    let mut paused = pool.begin().await.expect("暂停后台历史回填");
+    let high: i64 = sqlx::query_scalar("SELECT high_seq FROM usage_metric_input_backfill WHERE version = 2 AND NOT complete FOR UPDATE")
+        .fetch_one(&mut *paused).await.expect("独立游标锁定旧数据边界");
+    let (seq, flag): (i64, Option<bool>) = sqlx::query_as("SELECT seq, usage_estimated FROM usage_events JOIN usage_metric_inputs USING (event_id) WHERE event_id = 'during-upgrade'")
+        .fetch_one(&pool).await.expect("检查并发源事件和投影");
+    assert!(seq > high);
+    assert_eq!(flag, Some(true), "上界以外只能由实时触发器补齐");
+    let cp = into_test_cp(pool).await;
+    let viewer = cp.admin_login_seeded(OperatorRole::Viewer).await;
+    let endpoint = format!("/admin/usage/direct-models?model_id={model}");
+    let before = cp.get_with_cookie(&endpoint, viewer.cookie()).await;
+    assert_eq!(before.status, 200, "{before:?}");
+    let throughput = &before.body["totals"]["throughput_tps"];
+    assert_eq!(throughput["sample_count"], 1);
+    assert_eq!(throughput["missing_count"], 1);
+    near(&throughput["avg"], 20.0);
+    for id in ["old-estimated", "old-measured"] {
+        assert_eq!(
+            field(&input(&cp, id).await, "usage_estimated"),
+            &Value::Null
+        );
+    }
+    paused.commit().await.expect("恢复回填");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !backfill_once(cp.db()).await.expect("补齐旧事件").complete {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("后台任务或本轮调用完成独立游标");
+    for (id, flag) in [("old-estimated", true), ("old-measured", false)] {
+        assert_eq!(input(&cp, id).await["usage_estimated"], flag);
+    }
+    let after = cp.get_with_cookie(&endpoint, viewer.cookie()).await;
+    assert_eq!(after.status, 200, "{after:?}");
+    assert_eq!(after.body["totals"], before.body["totals"]);
+}
+
 #[tokio::test]
 async fn backfill_can_pause_resume_without_downgrading_future_inputs_or_extending_high_water() {
     let Some(bare) = BareDatabase::new().await else {

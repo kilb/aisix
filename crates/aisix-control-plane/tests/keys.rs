@@ -1187,6 +1187,26 @@ async fn a_key_may_not_exceed_its_tenants_grants_or_caps() {
     assert_eq!(r.status, 200, "{r:?}");
     assert_eq!(r.body["rate_limit"], json!({"rpm": 30}));
     assert_eq!(r.body["model_ids"], Value::Null);
+
+    // 收紧组织上限后，两个门户都能读到当前投影限额和原始配置。
+    patch_tenant_ok(
+        &cp,
+        &admin,
+        tenant,
+        json!({"limits": {"key_concurrency_max": 2, "key_rpm_max": 20}}),
+    )
+    .await;
+    let effective = json!({"concurrency": 2, "rpm": 20});
+    for (id, configured) in [(&picked, json!({"rpm": 30})), (&plain, json!({}))] {
+        assert_eq!(key_doc(&cp, id).await["rate_limit"], effective);
+        let admin_key = on_admin_key(&cp, &admin, "GET", id, None).await;
+        let tenant_key = on_key(&cp, &owner, "GET", id, None).await;
+        for key in [admin_key, tenant_key] {
+            assert_eq!(key.status, 200, "{key:?}");
+            assert_eq!(key.body["rate_limit"], configured);
+            assert_eq!(key.body["effective_rate_limit"], effective);
+        }
+    }
 }
 
 #[tokio::test]
@@ -1984,6 +2004,7 @@ async fn a_tenants_view_of_a_key_shows_the_display_name_never_the_name() {
             "created_by",
             "disabled",
             "disabled_by_platform",
+            "effective_rate_limit",
             "expires_at",
             "group",
             "group_available",
@@ -2035,6 +2056,7 @@ async fn operators_mint_and_manage_any_tenants_keys() {
             "disabled_by_tenant",
             "effective_disabled",
             "effective_provider_groups",
+            "effective_rate_limit",
             "expires_at",
             "group",
             "id",

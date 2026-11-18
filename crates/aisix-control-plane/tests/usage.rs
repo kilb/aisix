@@ -1230,6 +1230,71 @@ async fn raw_dp_connection(
         .expect("the mTLS handshake")
 }
 
+#[tokio::test]
+async fn a_committed_usage_delivery_without_a_read_receipt_replays_once() {
+    use support::world::{price, seed_model, tokens_680, usage, world};
+
+    let Some(w) = world().await else {
+        return;
+    };
+    let cp = &w.cp;
+    let model = seed_model(cp, &w.admin).await;
+    price(cp, model).await;
+    let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let bundle = cp.issue_bundle(&admin, "gw-usage-lost-receipt").await;
+    let dp = cp.dp_client(&bundle);
+    let probe = dp
+        .telemetry_raw(None, Vec::new())
+        .await
+        .expect("capability answer");
+    assert_eq!((probe.status, probe.header(DEDUP)), (400, Some("1")));
+    assert_nothing_stored(cp).await;
+
+    let id = Uuid::new_v4();
+    let event_id = "paid-usage-before-restart";
+    let body = json!({"events": [usage(&w, event_id, model, tokens_680())]});
+    let encoded = serde_json::to_vec(&body).expect("serialize usage batch");
+    let mut disconnected = raw_dp_connection(cp, &bundle).await;
+    let headers = format!(
+        "POST /dp/telemetry HTTP/1.1\r\nhost: localhost\r\ncontent-type: application/json\r\n\
+         x-aisix-usage-batch-id: {id}\r\ncontent-length: {}\r\n\r\n",
+        encoded.len()
+    );
+    disconnected
+        .write_all(headers.as_bytes())
+        .await
+        .expect("send headers");
+    disconnected.write_all(&encoded).await.expect("send usage");
+    disconnected.flush().await.expect("flush usage");
+
+    // 让服务端完成实际事务，客户端在读取任何 HTTP 回执前断开。
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while batch_row(cp, id).await.is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the first delivery reaches PostgreSQL");
+    drop(disconnected);
+
+    let retried = dp.telemetry(id, &body).await;
+    assert_eq!(retried.header(DEDUP), Some("1"));
+    assert_eq!(answer(&retried), (200, counts(0, 0, 0)));
+    assert_eq!(batch_row(cp, id).await, Some((1, 1, 0, 0, 2)));
+    assert_eq!(cp.count("usage_events").await, 1);
+    let charge_and_debit: (i64, i64, i64) = sqlx::query_as(
+        "SELECT charge_micro_cny, \
+          (SELECT count(*) FROM billing_ledger_cny WHERE event_id = $1), \
+          (SELECT COALESCE(sum(amount_micro_cny), 0)::bigint FROM billing_ledger_cny WHERE event_id = $1) \
+         FROM pricing_charges_cny WHERE event_id = $1",
+    )
+    .bind(event_id)
+    .fetch_one(cp.db().pool())
+    .await
+    .expect("the original charge and its ledger debit");
+    assert_eq!(charge_and_debit, (680, 1, -680));
+}
+
 /// A delivery whose headers arrive and whose body stops halfway holds a
 /// body slot only for a bounded wait: it is then answered 408, which the
 /// gateway re-sends, and its slot goes to the delivery queued behind it.

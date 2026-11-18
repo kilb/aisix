@@ -17,15 +17,17 @@
 //! in isolation; the async embedding call lives in [`resolve`].
 
 use std::borrow::Cow;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, RwLock};
 
 use dashmap::DashMap;
 
 use aisix_core::models::{
-    resolve_model_ref, EmbeddingFailureMode, OnEmbeddingFailure, Semantic, SemanticClassifier,
-    SemanticRoute, TYPESAFE_PROVIDER,
+    resolve_model_ref, EmbeddingFailureMode, GuardrailKind, OnEmbeddingFailure, Semantic,
+    SemanticClassifier, SemanticRoute, TYPESAFE_PROVIDER,
 };
 use aisix_core::resource::ResourceEntry;
+use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::{AisixSnapshot, Model};
 use aisix_gateway::{EmbeddingRequest, EmbeddingUsageSource, EmbeddingVector};
 use aisix_obs::{
@@ -184,6 +186,14 @@ pub(crate) fn failure_target<'a>(
     }
 }
 
+type SemanticVectorKey = (String, u32, String);
+
+#[derive(Debug)]
+struct ConfiguredVectors {
+    generations: (u64, u64),
+    keys: HashSet<SemanticVectorKey>,
+}
+
 /// Per-instance cache of route example-utterance embeddings, populated
 /// lazily on the first request that needs them and reused across requests
 /// so a steady-state request's logical embedding batch contains only the
@@ -193,10 +203,96 @@ pub(crate) fn failure_target<'a>(
 /// noise and nothing would report it.
 #[derive(Debug, Default)]
 pub struct SemanticVectorCache {
-    vectors: DashMap<(String, u32, String), Arc<Vec<f32>>>,
+    vectors: DashMap<SemanticVectorKey, Arc<Vec<f32>>>,
+    configured: RwLock<Option<ConfiguredVectors>>,
 }
 
 impl SemanticVectorCache {
+    pub(crate) fn live(snapshot: &SnapshotHandle<AisixSnapshot>) -> Arc<Self> {
+        let cache = Arc::new(Self::default());
+        let weak = Arc::downgrade(&cache);
+        snapshot.subscribe_before_publish(move |view| {
+            if let Some(cache) = weak.upgrade() {
+                cache.retain_configured(&view.snapshot);
+            }
+        });
+        cache
+    }
+
+    fn retain_configured(&self, snapshot: &AisixSnapshot) {
+        let generations = (
+            snapshot.models.generation(),
+            snapshot.guardrails.generation(),
+        );
+        if self
+            .configured
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|active| active.generations == generations)
+        {
+            return;
+        }
+        let mut active = HashSet::new();
+        for model in snapshot.models.entries() {
+            if let Some(semantic) = model
+                .value
+                .semantic
+                .as_ref()
+                .filter(|s| s.classifier.is_none())
+            {
+                Self::add_examples(
+                    &mut active,
+                    snapshot,
+                    &semantic.embedding_model_ref(snapshot),
+                    semantic.routes.iter().flat_map(|route| &route.examples),
+                );
+            }
+        }
+        for guardrail in snapshot.guardrails.entries() {
+            if let GuardrailKind::Semantic(config) = &guardrail.value.config {
+                let alias = resolve_model_ref(
+                    snapshot,
+                    &config.embedding_model,
+                    config.embedding_model_id.as_deref(),
+                );
+                Self::add_examples(
+                    &mut active,
+                    snapshot,
+                    &alias,
+                    config.deny_examples.iter().chain(&config.allow_examples),
+                );
+            }
+        }
+        // 保持配置更新与缓存插入互斥，避免旧请求在清理后重新插入旧示例。
+        let mut configured = self
+            .configured
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.vectors.retain(|key, _| active.contains(key));
+        *configured = Some(ConfiguredVectors {
+            generations,
+            keys: active,
+        });
+    }
+
+    fn add_examples<'a>(
+        active: &mut HashSet<SemanticVectorKey>,
+        snapshot: &AisixSnapshot,
+        alias: &str,
+        examples: impl Iterator<Item = &'a String>,
+    ) {
+        let Some(entry) = snapshot.models.get_by_name(alias) else {
+            return;
+        };
+        let Some(embedding) = &entry.value.embedding else {
+            return;
+        };
+        let scope = Self::vector_scope(&entry.id, &entry.value);
+        active
+            .extend(examples.map(|example| (scope.clone(), embedding.dimensions, example.clone())));
+    }
+
     /// What a cached vector is only valid for: the row, and the upstream
     /// model and account that row embeds with. A row can be repointed at
     /// another model of the same dimensions in place.
@@ -208,7 +304,7 @@ impl SemanticVectorCache {
         )
     }
 
-    /// Embeddings cached; nothing is ever evicted.
+    /// 当前保留的配置示例向量数。
     pub fn entry_count(&self) -> u64 {
         self.vectors.len() as u64
     }
@@ -231,10 +327,17 @@ impl SemanticVectorCache {
         text: &str,
         vec: Arc<Vec<f32>>,
     ) {
-        self.vectors.insert(
-            (vector_scope.to_string(), dimensions, text.to_string()),
-            vec,
-        );
+        let key = (vector_scope.to_string(), dimensions, text.to_string());
+        let configured = self
+            .configured
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if configured
+            .as_ref()
+            .is_none_or(|active| active.keys.contains(&key))
+        {
+            self.vectors.insert(key, vec);
+        }
     }
 }
 
@@ -444,19 +547,22 @@ async fn decide_by_embedding(
     // Assemble the prompt (index 0) with every uncached example text as one
     // logical embedding batch. Providers without batch input may split it
     // into multiple upstream calls. Steady state: only the prompt is uncached.
-    let mut pending: Vec<String> = Vec::new();
+    let mut examples = HashMap::<&str, Option<Arc<Vec<f32>>>>::new();
+    let mut pending = Vec::new();
     for route in &semantic.routes {
         for ex in &route.examples {
-            if state.semantic_cache.get(&vector_scope, dims, ex).is_none()
-                && !pending.iter().any(|p| p == ex)
-            {
-                pending.push(ex.clone());
-            }
+            examples.entry(ex.as_str()).or_insert_with(|| {
+                let cached = state.semantic_cache.get(&vector_scope, dims, ex);
+                if cached.is_none() {
+                    pending.push(ex.as_str());
+                }
+                cached
+            });
         }
     }
     let mut to_embed: Vec<String> = Vec::with_capacity(1 + pending.len());
     to_embed.push(prompt.to_string());
-    to_embed.extend(pending.iter().cloned());
+    to_embed.extend(pending.iter().map(|text| (*text).to_owned()));
 
     // Deadline chain for the embed sub-call: the router-level knob wins,
     // then the embedding model's own `timeout`, then the deployment
@@ -538,12 +644,13 @@ async fn decide_by_embedding(
     let prompt_vec = iter
         .next()
         .expect("embed_texts returns at least the prompt vector");
-    for text in &pending {
-        if let Some(v) = iter.next() {
-            state
-                .semantic_cache
-                .insert(&vector_scope, dims, text, Arc::new(v));
-        }
+    for (text, vector) in pending.into_iter().zip(iter) {
+        let vector = Arc::new(vector);
+        state
+            .semantic_cache
+            .insert(&vector_scope, dims, text, Arc::clone(&vector));
+        // 请求可能仍在使用上一个快照，因此本次判断直接使用已取得的向量。
+        examples.insert(text, Some(vector));
     }
 
     let route_vecs: Vec<Vec<Arc<Vec<f32>>>> = semantic
@@ -553,7 +660,7 @@ async fn decide_by_embedding(
             route
                 .examples
                 .iter()
-                .filter_map(|ex| state.semantic_cache.get(&vector_scope, dims, ex))
+                .filter_map(|ex| examples.get(ex.as_str()).and_then(|slot| slot.clone()))
                 .collect()
         })
         .collect();
@@ -1350,6 +1457,53 @@ mod tests {
             },
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn snapshot_publication_reclaims_removed_semantic_examples() {
+        let snap = AisixSnapshot::new();
+        let embedding: Model = serde_json::from_value(serde_json::json!({
+            "display_name": "bge-m3",
+            "provider": "openai",
+            "provider_key_id": "pk-1",
+            "model_name": "upstream-embedding",
+            "embedding": {"dimensions": 2}
+        }))
+        .unwrap();
+        let scope = SemanticVectorCache::vector_scope("embedding", &embedding);
+        snap.models
+            .insert(ResourceEntry::new("embedding", embedding, 1));
+        snap.models
+            .insert(ResourceEntry::new("router", router_model(), 1));
+        let guardrail: aisix_core::models::Guardrail = serde_json::from_value(serde_json::json!({
+            "name": "semantic-guardrail", "kind": "semantic",
+            "embedding_model": "bge-m3", "deny_threshold": 0.75,
+            "deny_examples": ["prototype"]
+        }))
+        .unwrap();
+        snap.guardrails
+            .insert(ResourceEntry::new("guardrail", guardrail, 1));
+        let state = select_state(&snap);
+        let cache = &state.semantic_cache;
+        let cached_example = arc(vec![1.0, 0.0]);
+        let exemplar = Arc::downgrade(&cached_example);
+        cache.insert(&scope, 2, "a", cached_example);
+        cache.insert(&scope, 2, "prototype", arc(vec![0.0, 1.0]));
+        assert_eq!(cache.entry_count(), 2);
+
+        state.snapshot.store(snap.clone());
+        assert_eq!(cache.entry_count(), 2);
+
+        snap.models.remove("router");
+        state.snapshot.store(snap.clone());
+        assert!(exemplar.upgrade().is_none());
+        assert!(cache.get(&scope, 2, "prototype").is_some());
+        // 旧请求晚到的嵌入结果不会重新保留已删除的示例。
+        cache.insert(&scope, 2, "a", arc(vec![1.0, 0.0]));
+        assert!(cache.get(&scope, 2, "a").is_none());
+        snap.guardrails.remove("guardrail");
+        state.snapshot.store(snap);
+        assert_eq!(cache.entry_count(), 0);
     }
 
     /// A route target deleted under a healthy `default` costs the route, not

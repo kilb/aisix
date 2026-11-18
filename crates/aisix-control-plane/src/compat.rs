@@ -94,6 +94,8 @@ const API_KEY_ENDPOINTS_SINCE: Since = Since::ThisRelease;
 // 首次发布只固定这一处；写入门禁与 rollout 共用同一个发行门槛。
 const TOKEN_COUNTING_SINCE: Since = Since::ThisRelease;
 
+const CACHE_WRITE_12H: &str = "/cost/cache_write_12h_per_1k";
+
 // 自定义账号的默认 Responses 计数语义晚于固定计数 kind，不继承旧构建白名单。
 const DEFAULT_RESPONSES_COUNTER_SINCE: Since = Since::ThisRelease;
 
@@ -156,7 +158,7 @@ pub const FIELD_FLOORS: &[FieldFloor] = &[
     },
     FieldFloor {
         kind: Kind::Models,
-        pointer: "/cost/cache_write_12h_per_1k",
+        pointer: CACHE_WRITE_12H,
         trigger: Trigger::Present,
         since: Since::ThisRelease,
         widens: never,
@@ -244,8 +246,8 @@ pub const FLEET_WINDOW: &str = "interval '24 hours'";
 pub enum GatewayVersion {
     /// A stamped release, `X.Y.Z[-pre]+sha-…`, without its build metadata.
     Release(Version),
-    /// An unstamped build, `dev` or `dev+sha-…`, which counts as current.
-    Dev,
+    /// 开发构建；保留可验证的 SHA 供需要核实构建的门槛使用。
+    Dev(Option<String>),
     /// Anything else, an empty version included: it satisfies no floor.
     Unrecognized,
 }
@@ -253,7 +255,10 @@ pub enum GatewayVersion {
 impl GatewayVersion {
     pub fn parse(raw: &str) -> GatewayVersion {
         if raw == "dev" || raw.starts_with("dev+") {
-            return GatewayVersion::Dev;
+            let sha = raw.strip_prefix("dev+sha-").filter(|sha| {
+                (7..=40).contains(&sha.len()) && sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+            });
+            return GatewayVersion::Dev(sha.map(str::to_ascii_lowercase));
         }
         match Version::parse(raw) {
             Ok(mut version) => {
@@ -274,7 +279,7 @@ pub fn minimum(since: &Since, cp_version: &str) -> Option<Version> {
         Since::Version(v) => Version::parse(v).ok(),
         Since::ThisRelease => match GatewayVersion::parse(cp_version) {
             GatewayVersion::Release(v) => Some(v),
-            GatewayVersion::Dev | GatewayVersion::Unrecognized => None,
+            GatewayVersion::Dev(_) | GatewayVersion::Unrecognized => None,
         },
     }
 }
@@ -361,25 +366,15 @@ pub(crate) fn supports_default_responses_counter(version: &str, cp_version: &str
 }
 
 fn supports_since_exact_dev(version: &str, cp_version: &str, since: &Since) -> bool {
-    match (
-        GatewayVersion::parse(version),
-        GatewayVersion::parse(cp_version),
-    ) {
-        (GatewayVersion::Release(version), _) => minimum(since, cp_version)
+    matches_proven_build(&GatewayVersion::parse(version), cp_version, since)
+}
+
+fn matches_proven_build(gateway: &GatewayVersion, cp_version: &str, since: &Since) -> bool {
+    match gateway {
+        GatewayVersion::Release(version) => minimum(since, cp_version)
             .is_some_and(|minimum| !version.cmp_precedence(&minimum).is_lt()),
-        (GatewayVersion::Dev, GatewayVersion::Dev) => {
-            let sha = |raw: &str| {
-                raw.strip_prefix("dev+sha-")
-                    .filter(|sha| {
-                        (7..=40).contains(&sha.len())
-                            && sha.bytes().all(|byte| byte.is_ascii_hexdigit())
-                    })
-                    .map(str::to_ascii_lowercase)
-            };
-            match (sha(version), sha(cp_version)) {
-                (Some(gateway), Some(control_plane)) => gateway == control_plane,
-                _ => false,
-            }
+        GatewayVersion::Dev(Some(sha)) => {
+            matches!(GatewayVersion::parse(cp_version), GatewayVersion::Dev(Some(cp_sha)) if &cp_sha == sha)
         }
         _ => false,
     }
@@ -457,6 +452,9 @@ impl FloorViolation {
             unrecognized,
             ..
         } = self;
+        if self.pointer == CACHE_WRITE_12H && *unrecognized > 0 {
+            return format!("有 {} 个网关未确认支持十二小时缓存写入单价，需使用支持该字段的发行版或与控制面相同的开发构建", below + unrecognized);
+        }
         match (below, unrecognized) {
             (_, 0) => format!("需要网关版本 ≥ {minimum}，当前有 {below} 个实例低于此版本"),
             (0, _) => {
@@ -668,11 +666,41 @@ fn judge(
     })
 }
 
+// 十二小时费率直接影响支出预算；开发版须能证明读取此字段。
+fn judge_price_floor(
+    floor: &FieldFloor,
+    cp_version: &str,
+    fleet: &[GatewayVersion],
+) -> Result<(), FloorViolation> {
+    let required = minimum(&floor.since, cp_version);
+    let mut below = 0;
+    let mut unrecognized = 0;
+    for gateway in fleet {
+        if matches_proven_build(gateway, cp_version, &floor.since) {
+            continue;
+        }
+        if matches!(gateway, GatewayVersion::Release(_)) && required.is_some() {
+            below += 1;
+        } else {
+            unrecognized += 1;
+        }
+    }
+    if below == 0 && unrecognized == 0 {
+        return Ok(());
+    }
+    Err(FloorViolation {
+        pointer: floor.pointer,
+        minimum: required.map_or_else(|| cp_version.to_owned(), |v| v.to_string()),
+        below,
+        unrecognized,
+    })
+}
+
 /// Whether every gateway of `fleet` reads every floored field a document
 /// `doc` of `kind` sets, judged by a control plane reporting `cp_version`:
 /// a set field fails when its minimum is known and a release gateway is
-/// older, or a gateway's version cannot be read. An unstamped (`dev`)
-/// gateway meets every floor.
+/// older, or a gateway's version cannot be read.
+/// 十二小时费率还要求开发网关能证实与控制面来自同一构建。
 pub fn check(
     kind: Kind,
     doc: &Value,
@@ -682,9 +710,8 @@ pub fn check(
     check_against(FIELD_FLOORS, kind, doc, fleet, cp_version)
 }
 
-/// Whether a gateway reporting `version` meets every row of
-/// [`FIELD_FLOORS`], judged by a control plane reporting `cp_version`; a row
-/// whose minimum it cannot judge is met.
+/// 共享实例淘汰标记只记录可判定的发行版本门槛。需要验证开发构建的字段
+/// 在保存时也检查实例清单是否满额，避免让其他配置继承其限制。
 pub fn meets_every_floor(version: &str, cp_version: &str) -> bool {
     let fleet = [GatewayVersion::parse(version)];
     FIELD_FLOORS.iter().all(|floor| {
@@ -701,7 +728,9 @@ pub fn check_against(
     cp_version: &str,
 ) -> Result<(), FloorViolation> {
     for floor in newly_triggered(floors, kind, doc, &Value::Null) {
-        if let Some(minimum) = minimum(&floor.since, cp_version) {
+        if floor.pointer == CACHE_WRITE_12H {
+            judge_price_floor(floor, cp_version, fleet)?;
+        } else if let Some(minimum) = minimum(&floor.since, cp_version) {
             judge(floor, &minimum, fleet)?;
         }
     }
@@ -737,7 +766,7 @@ fn too_old(pointer: &str, message: String) -> ApiError {
 /// has been incomplete within that window. With no gateway registered the
 /// write passes. A write that sets no floored field, or only fields whose
 /// minimum this control plane cannot judge, reads nothing.
-/// 客户新增族扩权和固定计数配置不适用上述不读库约定，必须另外核实真实构建支持。
+/// 客户新增族扩权、固定计数和十二小时费率必须另外核实构建支持。
 pub async fn gate(
     conn: &mut PgConnection,
     ctx: &WriteCtx,
@@ -746,19 +775,31 @@ pub async fn gate(
     stored: &Value,
     default_responses: Option<&'static str>,
 ) -> Result<(), ApiError> {
-    let token_counting_floor = newly_triggered(FIELD_FLOORS, kind, doc, stored)
-        .into_iter()
+    let triggered = newly_triggered(FIELD_FLOORS, kind, doc, stored);
+    let price_floor = triggered
+        .iter()
+        .copied()
+        .find(|floor| floor.pointer == CACHE_WRITE_12H);
+    let token_counting_floor = triggered
+        .iter()
+        .copied()
         .find(|floor| floor.kind == Kind::TokenCounting);
     let token_counting = token_counting_floor.is_some() || default_responses.is_some();
     let counter_pointer = default_responses.or(token_counting_floor.map(|floor| floor.pointer));
     let customer_expansion = customer_endpoint_expansion(kind, doc, stored);
     let native_expansion = native_endpoint_expansion(kind, doc, stored);
-    let floors: Vec<(&FieldFloor, Version)> = newly_triggered(FIELD_FLOORS, kind, doc, stored)
+    let floors: Vec<(&FieldFloor, Version)> = triggered
         .into_iter()
+        .filter(|f| f.pointer != CACHE_WRITE_12H)
         .filter_map(|f| minimum(&f.since, &ctx.cp_version).map(|m| (f, m)))
         .collect();
     let first = floors.first();
-    if first.is_none() && !customer_expansion && !native_expansion && !token_counting {
+    if first.is_none()
+        && price_floor.is_none()
+        && !customer_expansion
+        && !native_expansion
+        && !token_counting
+    {
         return Ok(());
     }
     let versions: Vec<String> = sqlx::query_scalar(&format!(
@@ -819,6 +860,10 @@ pub async fn gate(
         .iter()
         .map(|version| GatewayVersion::parse(version))
         .collect();
+    if let Some(price_floor) = price_floor {
+        judge_price_floor(price_floor, &ctx.cp_version, &fleet)
+            .map_err(|v| too_old(v.pointer, v.message()))?;
+    }
     for (floor, minimum) in &floors {
         judge(floor, minimum, &fleet).map_err(|v| too_old(v.pointer, v.message()))?;
     }
@@ -838,6 +883,11 @@ pub async fn gate(
                  部分网关实例未被记录，无法确认全部网关实例的版本"
                 ),
             )
+        } else if price_floor.is_some() {
+            (
+                CACHE_WRITE_12H,
+                "24 小时内有网关凭据达到实例上限，无法确认全部网关支持十二小时费率".to_string(),
+            )
         } else if let Some(pointer) = counter_pointer {
             (
                 pointer,
@@ -851,7 +901,7 @@ pub async fn gate(
         };
         return Err(too_old(pointer, message));
     }
-    if customer_expansion || native_expansion || token_counting {
+    if customer_expansion || native_expansion || token_counting || price_floor.is_some() {
         // 旧逻辑可无标记淘汰 Dev 实例；满额清单不能证明未遗漏旧构建。
         // 保留全部行判断，直到正常清理降到上限以下，不能仅统计最近 24 小时。
         let full: bool = sqlx::query_scalar(
@@ -863,8 +913,12 @@ pub async fn gate(
         .map_err(DbError::from)?;
         if full {
             return Err(too_old(
-                counter_pointer.unwrap_or("/allowed_endpoints"),
-                if token_counting {
+                counter_pointer
+                    .or(price_floor.map(|f| f.pointer))
+                    .unwrap_or("/allowed_endpoints"),
+                if price_floor.is_some() {
+                    "网关凭据的实例记录已达上限，无法确认全部网关支持十二小时费率"
+                } else if token_counting {
                     "网关凭据的实例记录已达上限，无法确认全部网关支持固定计数账号"
                 } else {
                     "网关凭据的实例记录已达上限，无法确认全部网关支持客户接口扩展"
@@ -983,7 +1037,13 @@ mod tests {
             check(Kind::CachePolicies, &doc, &dev, "1.9.0+sha-c"),
             Ok(())
         );
-        assert_eq!(dev, [GatewayVersion::Dev, GatewayVersion::Dev]);
+        assert_eq!(
+            dev,
+            [
+                GatewayVersion::Dev(None),
+                GatewayVersion::Dev(Some("1234abc".into()))
+            ]
+        );
     }
 
     #[test]
@@ -1114,6 +1174,25 @@ mod tests {
             newly_triggered(&floors, Kind::ApiKeys, &with, &with).len(),
             0
         );
+    }
+
+    #[test]
+    fn twelve_hour_spend_rate_requires_proven_builds() {
+        let doc = json!({"cost":{"cache_write_12h_per_1k":2.5}});
+        for (cp, gw, allowed) in [
+            ("dev+sha-abcdef0", "dev+sha-0123456", false),
+            ("dev+sha-abcdef0", "1.8.2", false),
+            ("1.9.0", "dev+sha-abcdef0", false),
+            ("dev", "dev", false),
+            ("dev+sha-invalid", "dev+sha-invalid", false),
+            ("dev+sha-abcdef0", "dev+sha-abcdef0", true),
+            ("1.9.0", "1.9.0", true),
+            ("1.9.0", "1.9.1", true),
+            ("1.9.0", "1.9.0-rc.1", false),
+        ] {
+            let result = check(Kind::Models, &doc, &versions(&[gw]), cp);
+            assert_eq!(result.is_ok(), allowed, "CP {cp}, gateway {gw}: {result:?}");
+        }
     }
 
     #[test]
@@ -1645,10 +1724,10 @@ mod tests {
             GatewayVersion::parse("1.9.0-rc.1+sha-abc1234"),
             GatewayVersion::Release(semver::Version::parse("1.9.0-rc.1").expect("a version"))
         );
-        assert_eq!(GatewayVersion::parse("dev"), GatewayVersion::Dev);
+        assert_eq!(GatewayVersion::parse("dev"), GatewayVersion::Dev(None));
         assert_eq!(
             GatewayVersion::parse("dev+sha-abc1234"),
-            GatewayVersion::Dev
+            GatewayVersion::Dev(Some("abc1234".into()))
         );
     }
 }

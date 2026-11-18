@@ -1,3 +1,4 @@
+import { matchesCreditReceipt } from "./creditOutcome.ts";
 import type { UsageAuditData } from "./usageIoAudit";
 import type { UsageRecordApiFilters } from "./usageRecordFilters";
 /**
@@ -296,6 +297,7 @@ export interface AdminKey {
   /** What the gateway is given: the key's group's name, or the old rule for a groupless key. */
   effective_provider_groups: string[];
   rate_limit: { concurrency?: number; rpm?: number };
+  effective_rate_limit?: { concurrency?: number; rpm?: number };
   /** The operators' switch. */
   disabled: boolean;
   /** The tenant's own switch. */
@@ -1001,15 +1003,22 @@ export const billing = {
   async budgets(tenantId: string, signal?: AbortSignal): Promise<Budget[]> {
     return (await call<{ items: Budget[] }>("GET", `/admin/tenants/${seg(tenantId)}/budgets`, undefined, undefined, signal)).data.items;
   },
-  /** Admin only: credits the tenant now. `amount_cny` is yuan and fen above 0; answers the top-up the backend recorded. Not idempotent: send once. */
-  async credit(tenantId: string, body: { amount_cny: string; reason: string; reference?: string }): Promise<CreditedTopup> {
-    return (await call<CreditedTopup>("POST", `/admin/tenants/${seg(tenantId)}/credits`, body)).data;
+  /** 同一租户的入账操作编号可重复提交，服务端返回已记录的充值。 */
+  async credit(tenantId: string, body: { amount_cny: string; reason: string; reference?: string; operation_id?: string }): Promise<CreditedTopup> {
+    const { data } = await call<unknown>("POST", `/admin/tenants/${seg(tenantId)}/credits`, body);
+    if (!matchesCreditReceipt(data, tenantId, body)) {
+      throw new ApiError("服务端未返回与本次入账匹配的回执", 201, "bad_response", [], [], null);
+    }
+    return data;
   },
 };
 
 /** The top-up an operator credit recorded. */
 export interface CreditedTopup {
   id: string;
+  tenant_id: string;
+  operation_id?: string;
+  status: "approved";
   origin: "operator";
   amount_micro_cny: number;
   reference: string;
@@ -1109,6 +1118,7 @@ export interface UpstreamTiming {
   first_response_byte_ms?: number | null;
   first_protocol_frame_ms?: number | null;
   first_canonical_chunk_ms?: number | null;
+  upstream_first_content_ms?: number | null;
   first_content_ms?: number | null;
 }
 

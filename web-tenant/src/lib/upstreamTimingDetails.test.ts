@@ -17,7 +17,7 @@ const loaded = { exports: {} };
 new Function("require", "module", "exports", compiled.outputFiles[0]!.text)(require, loaded, loaded.exports);
 const { UpstreamTimingDetails } = loaded.exports as { UpstreamTimingDetails: ComponentType<{ data?: Record<string, unknown> | null }> };
 const render = (data?: Record<string, unknown> | null) => renderToStaticMarkup(createElement(UpstreamTimingDetails, { data }));
-const fields = ["http_send_started_ms", "response_headers_ms", "first_response_byte_ms", "first_protocol_frame_ms", "first_canonical_chunk_ms", "first_content_ms"];
+const fields = ["http_send_started_ms", "response_headers_ms", "first_response_byte_ms", "first_protocol_frame_ms", "first_canonical_chunk_ms", "upstream_first_content_ms", "first_content_ms"];
 function value(markup: string, name: string): string {
   const row = markup.match(new RegExp(`<div[^>]*data-upstream-timing-field="${name}"[^>]*>(.*?)</div>`, "s"));
   assert.ok(row, `缺少 ${name} 阶段字段`);
@@ -26,7 +26,7 @@ function value(markup: string, name: string): string {
   return dd[1]!.replace(/<[^>]+>/g, "");
 }
 
-test("上游 HTTP 阶段始终列出六项，历史缺失保留未知", () => {
+test("上游 HTTP 阶段始终列出七项，历史缺失保留未知", () => {
   for (const data of [undefined, null, {}]) {
     const markup = render(data);
     assert.match(markup, /<section[^>]*aria-label="上游 HTTP 阶段"/);
@@ -36,8 +36,8 @@ test("上游 HTTP 阶段始终列出六项，历史缺失保留未知", () => {
 });
 
 test("同一次尝试的 offset 保留零及原始整数毫秒，不相减或舍入为秒", () => {
-  const markup = render({ http_send_started_ms: 0, response_headers_ms: 2500, first_response_byte_ms: 17, first_protocol_frame_ms: 65536, first_canonical_chunk_ms: 4294967295, first_content_ms: 42 });
-  const expected = ["0 ms", "2,500 ms", "17 ms", "65,536 ms", "4,294,967,295 ms", "42 ms"];
+  const markup = render({ http_send_started_ms: 0, response_headers_ms: 17, first_response_byte_ms: 42, first_protocol_frame_ms: 2500, first_canonical_chunk_ms: 65536, upstream_first_content_ms: 65000, first_content_ms: 4294967295 });
+  const expected = ["0 ms", "17 ms", "42 ms", "2,500 ms", "65,536 ms", "65,000 ms", "4,294,967,295 ms"];
   fields.forEach((field, index) => assert.equal(value(markup, field), expected[index]));
   assert.match(markup, /相对同一次上游尝试起点/);
   assert.match(markup, /不计算阶段差值/);
@@ -49,13 +49,16 @@ test("所有阶段严格拒绝非法 u32，缺失协议与规范化片段不补�
     for (const field of fields) assert.equal(value(markup, field), "—", `${field} 不得接受 ${String(invalid)}`);
   }
   const partial = render({ response_headers_ms: 10, first_content_ms: 20 });
+  assert.equal(value(partial, "upstream_first_content_ms"), "—");
+  assert.equal(value(render({ upstream_first_content_ms: 0 }), "upstream_first_content_ms"), "0 ms");
+  assert.equal(value(render({ upstream_first_content_ms: 19 }), "first_content_ms"), "—");
   assert.equal(value(partial, "first_protocol_frame_ms"), "—");
   assert.equal(value(partial, "first_canonical_chunk_ms"), "—");
 });
 
 test("阶段标签和边界说明不把客户端调用或内容交付描述为网络确认", () => {
   const markup = render({});
-  for (const label of ["交给 HTTP 客户端", "收到响应头", "首个响应体字节", "首个协议帧", "首个规范化片段", "首次内容交付"]) assert.match(markup, new RegExp(`<dt[^>]*>${label}</dt>`));
+  for (const label of ["交给 HTTP 客户端", "收到响应头", "首个响应体字节", "首个协议帧", "首个规范化片段", "上游首个内容帧", "首次内容交付"]) assert.match(markup, new RegExp(`<dt[^>]*>${label}</dt>`));
   assert.match(markup, /交给 HTTP 客户端表示开始调用 HTTP 客户端，不代表操作系统实际写包/);
   assert.match(markup, /首次内容交付表示网关交给 HTTP server，不代表客户端已收到或确认/);
 });
