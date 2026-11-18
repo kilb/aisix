@@ -2835,7 +2835,11 @@ impl ResponsesSseEncoder {
                 }
 
                 // Emit output_item.added once the call id + name are known.
-                if !state.item_added && !state.call_id.is_empty() && !state.name.is_empty() {
+                let opening =
+                    !state.item_added && !state.call_id.is_empty() && !state.name.is_empty();
+                // 普通函数的参数可能先于 id 或名称到达。首次公布时补发所有已收参数。
+                let has_buffered_prefix = opening && !state.arguments.is_empty();
+                if opening {
                     state.item_added = true;
                     let output_index = state.output_index;
                     let item = if state.search {
@@ -2851,9 +2855,14 @@ impl ResponsesSseEncoder {
                     ));
                 }
 
-                if !arguments.is_empty() {
+                if has_buffered_prefix || !arguments.is_empty() {
                     let state = self.tool_calls.get_mut(&oai_index).expect("present");
                     state.arguments.push_str(arguments);
+                    let delta = if has_buffered_prefix {
+                        state.arguments.as_str()
+                    } else {
+                        arguments
+                    };
                     // A custom tool's fragments are the function-call
                     // wrapper's JSON, not the freeform input the caller
                     // asked for; they are buffered and emitted as one
@@ -2862,15 +2871,12 @@ impl ResponsesSseEncoder {
                     // pieces of `{"content":"…"}` under an event type whose
                     // payload is supposed to be the input itself.
                     if state.item_added && !state.custom && !state.search {
-                        let (item_id, output_index) = (state.item_id(), state.output_index);
-                        events.push(self.event(
-                            "response.function_call_arguments.delta",
-                            json!({
-                                "item_id": item_id,
-                                "output_index": output_index,
-                                "delta": arguments,
-                            }),
-                        ));
+                        let data = json!({
+                            "item_id": state.item_id(),
+                            "output_index": state.output_index,
+                            "delta": delta,
+                        });
+                        events.push(self.event("response.function_call_arguments.delta", data));
                     }
                 }
             }
@@ -6117,6 +6123,59 @@ mod tests {
         assert_eq!(item["type"], "function_call");
         assert_eq!(item["call_id"], "call_1");
         assert_eq!(item["arguments"], "{\"cmd\":\"ls\"}");
+    }
+
+    #[test]
+    fn function_arguments_arriving_before_the_call_identity_stream_when_the_item_opens() {
+        let tool_chunk = |call| ChatChunk {
+            delta: ChatDelta {
+                tool_calls: Some(vec![call]),
+                ..Default::default()
+            },
+            ..content_chunk("")
+        };
+        for (first, opens, expected) in [
+            (
+                json!({"index": 0, "function": {"name": "lookup", "arguments": "{\"a\":"}}),
+                json!({"index": 0, "id": "call_1"}),
+                "{\"a\":",
+            ),
+            (
+                json!({"index": 0, "id": "call_1", "function": {"arguments": "{\"a\":"}}),
+                json!({"index": 0, "function": {"name": "lookup", "arguments": "1"}}),
+                "{\"a\":1",
+            ),
+        ] {
+            let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools());
+            let first = enc.next_events(&tool_chunk(first));
+            assert_eq!(
+                types_of(&first),
+                ["response.created", "response.in_progress"]
+            );
+            let opening = enc.next_events(&tool_chunk(opens));
+            assert_eq!(
+                types_of(&opening),
+                [
+                    "response.output_item.added",
+                    "response.function_call_arguments.delta"
+                ]
+            );
+            assert_eq!(opening[0].data["item"]["arguments"], "");
+            assert_eq!(opening[1].data["item_id"], opening[0].data["item"]["id"]);
+            assert_eq!(opening[1].data["delta"], expected);
+            let metadata = tool_chunk(json!({"index": 0, "function": {"arguments": ""}}));
+            assert!(enc.next_events(&metadata).is_empty());
+            let suffix = tool_chunk(json!({"index": 0, "function": {"arguments": "2}"}}));
+            let tail = enc.next_events(&suffix);
+            assert_eq!(types_of(&tail), ["response.function_call_arguments.delta"]);
+            assert_eq!(tail[0].data["delta"], "2}");
+            let done = enc.force_finish();
+            assert_eq!(done[0].data["arguments"], format!("{expected}2}}"));
+            assert_eq!(
+                done[2].data["response"]["output"][0]["arguments"],
+                done[0].data["arguments"]
+            );
+        }
     }
 
     /// One custom-tool call, streamed: the item opens as a
