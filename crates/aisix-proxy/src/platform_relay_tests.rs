@@ -590,6 +590,65 @@ async fn a_translated_dispatchs_400_keeps_its_class() {
     assert!(!body.contains("Field required"), "{body}");
 }
 
+/// 平台隐藏已耗尽的上游账户；普通限流和无法识别的专码仍为 429。
+#[tokio::test]
+async fn openai_billing_429_uses_the_platform_outage_envelope() {
+    for (code, account) in [
+        ("credit_balance_exhausted", true),
+        ("organization_spend_limit_exceeded", true),
+        ("project_spend_limit_exceeded", true),
+        ("organization_usage_limit_exceeded", true),
+        ("insufficient_quota", true),
+        ("slow_down", false),
+        ("rate_limit_exceeded", false),
+        ("unknown_quota_code", false),
+    ] {
+        let kind = if account || code == "unknown_quota_code" {
+            "insufficient_quota"
+        } else {
+            "rate_limit_error"
+        };
+        let upstream = json_upstream(
+            "chat/completions",
+            429,
+            openai_error("provider account details", kind, None, Some(code)),
+        )
+        .await;
+        let (status, body) = post(
+            app(&upstream, Upstream::OpenAi, true),
+            "/v1/chat/completions",
+            chat_body(false),
+        )
+        .await;
+        let (want_status, want_code) = if account {
+            (StatusCode::SERVICE_UNAVAILABLE, "upstream_unavailable")
+        } else {
+            (StatusCode::TOO_MANY_REQUESTS, "rate_limit_exceeded")
+        };
+        assert_eq!(status, want_status, "{code}: {body}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["error"]["code"], want_code, "{body}");
+        assert!(!body.contains("provider account details"), "{body}");
+        if code == "credit_balance_exhausted" {
+            let (direct_status, direct_body) = post(
+                app(&upstream, Upstream::OpenAi, false),
+                "/v1/chat/completions",
+                chat_body(false),
+            )
+            .await;
+            assert_eq!(
+                direct_status,
+                StatusCode::TOO_MANY_REQUESTS,
+                "{direct_body}"
+            );
+            assert_eq!(
+                serde_json::from_str::<Value>(&direct_body).unwrap()["error"]["code"],
+                code
+            );
+        }
+    }
+}
+
 /// A native upstream's 401, 429 and 5xx are not request errors: they keep
 /// the classes, with none of the upstream's text.
 #[tokio::test]

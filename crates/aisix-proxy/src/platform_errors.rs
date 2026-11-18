@@ -432,6 +432,24 @@ fn classify_upstream(
                 .any(|t| tokens.contains(&t))
         })
     };
+    // OpenAI 的这些专码表示账号已无可用额度；普通 429 仍按限流呈现。
+    // https://developers.openai.com/api/docs/guides/error-codes
+    // https://developers.openai.com/cookbook/examples/how_to_handle_rate_limits
+    if wire == UpstreamWire::OpenAI
+        && status == Some(429)
+        && matches!(
+            view.and_then(|v| v.code.as_deref()),
+            Some(
+                "credit_balance_exhausted"
+                    | "organization_spend_limit_exceeded"
+                    | "project_spend_limit_exceeded"
+                    | "organization_usage_limit_exceeded"
+                    | "insufficient_quota"
+            )
+        )
+    {
+        return PlatformErrorClass::UpstreamUnavailable;
+    }
     // The platform's account (its spend limit, its credit, its organization's
     // standing), not the caller's request: the platform's to fix, as an
     // upstream 401 or 403 is, and never relayed, since it describes an account

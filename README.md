@@ -235,7 +235,7 @@ When `proxy.platform.enabled` is set, a public model can route across accounts. 
 |---|---|
 | The model declines to answer | A successful reply can contain ordinary assistant text, a structured `refusal`, or a refusal stop reason. The gateway preserves the model's answer. |
 | The upstream rejects the caller's request | An upstream speaking the client's protocol can return its own `400`, `413` or `422` diagnostic, including the error code and parameter where supplied. A URL pointing at the serving upstream is redacted. Links to other public origins, such as a caller's file, remain available for troubleshooting. |
-| The serving account has exhausted its balance or reached its spend limit | The gateway reports `503` with code `upstream_unavailable`. The account's billing details stay private. |
+| The serving account has exhausted its balance or reached its spend limit | The gateway reports `503` with code `upstream_unavailable`. This includes recognized account-limit codes sent with upstream HTTP 429. Ordinary upstream throttling is returned as 429 with code `rate_limit_exceeded`. |
 | A translated upstream call or another upstream failure ends the request | The gateway returns its own error class. A stream that has already started reports the failure in its protocol's error event. |
 
 Clients can use the protocol's explicit refusal or error fields to distinguish these cases. [OpenAI refusal fields](https://developers.openai.com/api/docs/guides/structured-outputs) · [Anthropic stop reasons](https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons)
