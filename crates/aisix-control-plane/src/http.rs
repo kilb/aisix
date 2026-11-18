@@ -264,6 +264,11 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
     ),
     (
         "GET",
+        "/admin/provider-groups/{id}/models",
+        MinRole::Op(OperatorRole::Viewer),
+    ),
+    (
+        "GET",
         "/admin/provider-groups/{id}/rates",
         MinRole::Op(OperatorRole::Viewer),
     ),
@@ -957,6 +962,7 @@ pub fn browser_router(state: AppState) -> Router {
             "/admin/provider-groups/{id}/make-default",
             post(groups::make_default),
         )
+        .route("/admin/provider-groups/{id}/models", get(groups::model_options))
         .route(
             "/admin/provider-groups/{id}/rates",
             get(groups::list_rates).post(groups::create_rate),

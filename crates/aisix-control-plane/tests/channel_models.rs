@@ -213,6 +213,194 @@ fn assert_422_at(r: &Resp, path: &str) {
     assert_eq!(paths, vec![path], "{r:?}");
 }
 
+#[tokio::test]
+async fn group_model_choices_follow_the_serving_accounts_and_the_tenants_grants() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let shared = support::world::group_id(&cp, "shared").await;
+    let other = support::seed_group(&cp, &op, "isolated").await;
+    let primary = provider_key(&cp, &op, "shared-account").await;
+    let (active, _) = create_public(&cp, &op, "available-model").await;
+    let (disabled, _) = create_public(&cp, &op, "routed-elsewhere").await;
+    let (ungranted, _) = create_public(&cp, &op, "operator-only-model").await;
+    for id in [active, disabled, ungranted] {
+        let saved = put_channel(&cp, &op, primary, id, json!({})).await;
+        assert_eq!(saved.status, 200, "{saved:?}");
+    }
+    let secondary = cp.send("POST", "/admin/resources/provider_keys", Some(op.cookie()),
+        Some(json!({"doc": {"display_name": "isolated-account", "provider": "openai", "api_key": "test", "groups": ["isolated"]}}))).await;
+    assert_eq!(secondary.status, 201, "{secondary:?}");
+    let key: Uuid = serde_json::from_value(secondary.body["id"].clone()).expect("account id");
+    assert_eq!(
+        put_channel(&cp, &op, key, disabled, json!({})).await.status,
+        200
+    );
+    assert_eq!(
+        put_channel(&cp, &op, primary, disabled, json!({"enabled":false}))
+            .await
+            .status,
+        200
+    );
+    let tenant = tenant_granted(&cp, &op, &[active, disabled]).await;
+    let member = cp
+        .member_login_seeded(tenant, aisix_control_plane::auth::MemberRole::Owner)
+        .await;
+
+    let rates = cp
+        .get_with_cookie(
+            &format!("/admin/provider-groups/{shared}/rates"),
+            op.cookie(),
+        )
+        .await;
+    assert_eq!(rates.status, 200, "{rates:?}");
+    let offered: Vec<&str> = rates.body["models"]
+        .as_array()
+        .expect("rate choices")
+        .iter()
+        .map(|m| m["name"].as_str().expect("model name"))
+        .collect();
+    assert_eq!(offered, ["available-model", "operator-only-model"]);
+
+    for (path, cookie, expected) in [
+        (
+            format!("/admin/provider-groups/{shared}/models"),
+            op.cookie(),
+            vec![active, ungranted],
+        ),
+        (
+            format!("/admin/provider-groups/{other}/models"),
+            op.cookie(),
+            vec![disabled],
+        ),
+        (
+            format!("/api/models?group_id={shared}"),
+            member.cookie(),
+            vec![active],
+        ),
+        (
+            "/api/models".to_string(),
+            member.cookie(),
+            vec![active, disabled],
+        ),
+    ] {
+        let response = cp.get_with_cookie(&path, cookie).await;
+        assert_eq!(response.status, 200, "{path}: {response:?}");
+        let ids: Vec<Uuid> = response.body["items"]
+            .as_array()
+            .expect("choices")
+            .iter()
+            .map(|m| serde_json::from_value(m["id"].clone()).expect("model id"))
+            .collect();
+        assert_eq!(ids, expected, "{path}");
+    }
+    for id in [other, Uuid::new_v4()] {
+        let refused = cp
+            .get_with_cookie(&format!("/api/models?group_id={id}"), member.cookie())
+            .await;
+        assert_422_at(&refused, "/group_id");
+    }
+    // 其他版本的控制面可写入账户启停状态；这里直接验证持久化状态的目录读侧。
+    for is_disabled in [true, false] {
+        sqlx::query("UPDATE gw_resources SET doc = jsonb_set(doc, '{disabled}', to_jsonb($2::boolean)) WHERE kind = 'provider_keys' AND id = $1")
+            .bind(primary).bind(is_disabled).execute(cp.db().pool()).await.expect("account status");
+        let response = cp
+            .get_with_cookie(&format!("/api/models?group_id={shared}"), member.cookie())
+            .await;
+        assert_eq!(response.status, 200, "{response:?}");
+        let expected = if is_disabled {
+            json!([])
+        } else {
+            json!([{"id": active, "name":"available-model"}])
+        };
+        assert_eq!(response.body["items"], expected);
+    }
+}
+
+#[tokio::test]
+async fn rates_remain_manageable_after_a_group_loses_its_last_channel() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let op = cp.admin_login_seeded(OperatorRole::Operator).await;
+    let group = support::world::group_id(&cp, "shared").await;
+    let account = provider_key(&cp, &op, "shared-account").await;
+    let path = format!("/admin/provider-groups/{group}/rates");
+    let now = support::world::db_now(&cp).await;
+    let (model, _) = create_public(&cp, &op, "previously-serving").await;
+    assert_eq!(
+        put_channel(&cp, &op, account, model, json!({}))
+            .await
+            .status,
+        200
+    );
+    let write =
+        |rate: Value, start| json!({"model_id":model, "cny_per_usd":rate, "effective_from":start});
+    let current = cp
+        .send(
+            "POST",
+            &path,
+            Some(op.cookie()),
+            Some(write(json!("4"), now)),
+        )
+        .await;
+    assert_eq!(current.status, 201, "{current:?}");
+    assert_eq!(
+        put_channel(&cp, &op, account, model, json!({"enabled":false}))
+            .await
+            .status,
+        200
+    );
+    let read = cp.get_with_cookie(&path, op.cookie()).await;
+    assert_eq!(read.status, 200, "{read:?}");
+    assert_eq!(read.body["models"], json!([]));
+    let retained = &read.body["unavailable_models"][0];
+    assert_eq!(retained["model_id"], json!(model));
+    assert_eq!(retained["rate"]["current"]["cny_per_usd"], "4");
+
+    let end = support::world::db_now(&cp).await;
+    let ended = cp
+        .send(
+            "POST",
+            &path,
+            Some(op.cookie()),
+            Some(write(Value::Null, end)),
+        )
+        .await;
+    assert_eq!(ended.status, 201, "{ended:?}");
+    let read = cp.get_with_cookie(&path, op.cookie()).await;
+    assert_eq!(read.body["unavailable_models"], json!([]));
+
+    let future = end + chrono::TimeDelta::hours(2);
+    let saved = cp
+        .send(
+            "POST",
+            &path,
+            Some(op.cookie()),
+            Some(write(json!("8"), future)),
+        )
+        .await;
+    assert_eq!(saved.status, 201, "{saved:?}");
+    let read = cp.get_with_cookie(&path, op.cookie()).await;
+    assert_eq!(
+        read.body["unavailable_models"][0]["rate"]["upcoming"][0]["cny_per_usd"],
+        "8"
+    );
+    assert_eq!(
+        put_channel(&cp, &op, account, model, json!({"enabled":true}))
+            .await
+            .status,
+        200
+    );
+    let read = cp.get_with_cookie(&path, op.cookie()).await;
+    assert_eq!(read.body["unavailable_models"], json!([]));
+    assert_eq!(
+        read.body["models"][0]["rate"]["upcoming"][0]["cny_per_usd"],
+        "8"
+    );
+}
+
 /// An upstream account, created as `who`; its id.
 async fn provider_key(cp: &TestCp, who: &OperatorSession, name: &str) -> Uuid {
     let r = cp

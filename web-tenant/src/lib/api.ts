@@ -335,8 +335,8 @@ export interface IssuedInvite {
 const at = (id: string) => encodeURIComponent(id);
 
 export const models = {
-  async list(): Promise<PortalModel[]> {
-    return (await call<{ items: PortalModel[] }>("GET", "/models")).data.items;
+  async list(groupId?: string): Promise<PortalModel[]> {
+    return (await call<{ items: PortalModel[] }>("GET", groupId ? `/models?group_id=${at(groupId)}` : "/models")).data.items;
   },
 };
 

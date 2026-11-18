@@ -684,18 +684,44 @@ function CreateForm({ tenant, names, catalogError, choices, onMinted, onCancel, 
   const [refused, setRefused] = useState<Refusal | null>(null);
   const [busy, setBusy] = useState(false);
   const [part, focusRefusal] = useRefusalFocus<HTMLFormElement>();
-  const grants = useMemo(() => tenant.effective_model_ids.map(id => ({ id, name: names?.get(id) ?? id })).sort((a, b) => a.name.localeCompare(b.name)), [tenant.effective_model_ids, names]);
+  const groupId = initial?.group?.id ?? idOf(choices, group);
+  const modelGroupId = modelScope === "selected" ? groupId : "";
+  const [groupCatalog, setGroupCatalog] = useState<{ id: string; models: Map<string, string> | null; error: string | null } | null>(null);
+  const savedModelIds = useMemo(() => new Set(initial?.model_ids ?? []), [initial?.model_ids]);
+  useEffect(() => {
+    if (!modelGroupId) return;
+    const controller = new AbortController();
+    setGroupCatalog(null);
+    groupsApi.models(modelGroupId, controller.signal).then(rows => {
+      if (controller.signal.aborted) return;
+      const available = new Map(rows.map(row => [row.id, row.name]));
+      setGroupCatalog({ id: modelGroupId, models: available, error: null });
+      setModels(previous => previous.filter(id => savedModelIds.has(id) || available.has(id)));
+    }, failure => {
+      if (!controller.signal.aborted) setGroupCatalog({ id: modelGroupId, models: null, error: errorText(failure) });
+    });
+    return () => controller.abort();
+  }, [modelGroupId, savedModelIds]);
+  const scoped = groupCatalog?.id === modelGroupId ? groupCatalog : null;
+  const grants = useMemo(() => tenant.effective_model_ids
+    .filter(id => !modelGroupId || scoped?.models?.has(id))
+    .map(id => ({ id, name: scoped?.models?.get(id) ?? names?.get(id) ?? id }))
+    .sort((a, b) => a.name.localeCompare(b.name)), [tenant.effective_model_ids, names, modelGroupId, scoped]);
   const grantedIds = useMemo(() => new Set(grants.map(model => model.id)), [grants]);
   const selectedIds = useMemo(() => new Set(models), [models]);
   const matchesModel = modelNameMatcher(modelSearch);
   const visible = grants.filter(model => matchesModel(model.name));
-  const unavailable = names === null ? [] : models.filter(id => !grantedIds.has(id));
+  const modelListReady = modelGroupId ? Boolean(scoped?.models) : names !== null;
+  const unavailable = initial && modelListReady ? models.filter(id => savedModelIds.has(id) && !grantedIds.has(id)) : [];
+  const selectedModels = models.filter(id => savedModelIds.has(id) || grantedIds.has(id));
+  const waitingForModels = modelGroupId !== "" && !modelListReady && (!initial || models.some(id => !savedModelIds.has(id)));
   const at = (path: string) => refused?.at.get(path);
   const patternsError = [...(refused?.at ?? [])].filter(([path]) => atList("/allowed_models")(path)).map(([, message]) => message).join("；");
 
   async function submit() {
     const problems = new Map<string, string>();
-    if (!initial && modelScope === "selected" && models.length === 0) problems.set("/model_ids", "请选择至少一个模型，或改为不限制模型");
+    if (!initial && modelScope === "selected" && selectedModels.length === 0) problems.set("/model_ids", "请选择至少一个模型，或改为不限制模型");
+    if (waitingForModels) problems.set("/model_ids", "请等分组模型读取成功后再保存选择");
     if (!initial && modelScope === "patterns" && patterns.trim() === "") problems.set("/allowed_models", "请填写模型名称模式，或改为不限制模型");
     for (const [name, value] of [["concurrency", concurrency], ["rpm", rpm]] as const) {
       if (value.trim() !== "" && (!/^\d+$/.test(value.trim()) || Number(value) < 1 || Number(value) > 4_294_967_295)) problems.set(`/rate_limit/${name}`, "请输入大于零的有效整数，留空沿用租户限制");
@@ -709,8 +735,8 @@ function CreateForm({ tenant, names, catalogError, choices, onMinted, onCancel, 
     if (rpm.trim()) limits.rpm = Number(rpm);
     const selectedPatterns = initial?.allowed_models && patterns === initialPatterns ? initial.allowed_models : patterns.split(/[\s,，、]+/).filter(Boolean);
     const body: NewKey = { label };
-    if (group) body.group_id = initial?.group?.id ?? idOf(choices, group);
-    if (modelScope === "selected") body.model_ids = models;
+    if (group) body.group_id = groupId;
+    if (modelScope === "selected") body.model_ids = selectedModels;
     if (modelScope === "patterns") body.allowed_models = selectedPatterns;
     if (limits.concurrency !== undefined || limits.rpm !== undefined) body.rate_limit = limits;
     if (expiresAt !== null) body.expires_at = expiresAt;
@@ -718,7 +744,7 @@ function CreateForm({ tenant, names, catalogError, choices, onMinted, onCancel, 
     setBusy(true); onBusyChange(true); setRefused(null); setSent(body);
     try {
       if (initial) {
-        const patch = adminKeySettingsPatch(initial, { label, scope: modelScope, modelIds: models, patterns: selectedPatterns, groupId: body.group_id ?? "", rateLimit: limits, disabled, expiresAt });
+        const patch = adminKeySettingsPatch(initial, { label, scope: modelScope, modelIds: selectedModels, patterns: selectedPatterns, groupId: body.group_id ?? "", rateLimit: limits, disabled, expiresAt });
         onSaved?.(Object.keys(patch).length ? await keysApi.update(initial.id, patch, initial.version) : initial);
       } else onMinted(await keysApi.create(tenant.id, body));
     } catch (error) { setRefused(refusal(error, placedInForm)); focusRefusal(); }
@@ -740,8 +766,9 @@ function CreateForm({ tenant, names, catalogError, choices, onMinted, onCancel, 
       {modelScope === "selected" && <>
         <TextField label="搜索模型" value={modelSearch} onChange={setModelSearch} disabled={busy} placeholder="按模型名称搜索" hint="* 可匹配任意字符。保存当前选中的模型，以后新增的匹配模型需另行选择。" />
         {modelSearch.includes("*") && visible.length > 0 && <Button size="sm" disabled={busy || visible.every(model => selectedIds.has(model.id))} onClick={() => setModels(previous => [...new Set([...previous, ...visible.map(model => model.id)])])}>选择全部匹配模型</Button>}
-        {grants.length === 0 ? <p className="hint">该租户还没有授权模型，请先在租户页授权。</p> : visible.length === 0 ? <p className="hint">没有匹配的模型</p> : <ul className="tn-checks tn-box key-model-options">{visible.map(model => <Check key={model.id} label={model.name} checked={selectedIds.has(model.id)} disabled={busy} onChange={checked => setModels(previous => checked ? [...previous, model.id] : previous.filter(id => id !== model.id))} error={at(`/model_ids/${sent?.model_ids?.indexOf(model.id) ?? -1}`)} />)}</ul>}
-        {unavailable.length > 0 && <><p className="hint">以下已选模型已不在当前授权中，可取消勾选后保存：</p><ul className="tn-checks key-model-options">{unavailable.map(id => <Check key={id} label={`${names?.get(id) ?? id}（已不可用）`} checked disabled={busy} onChange={() => setModels(previous => previous.filter(value => value !== id))} />)}</ul></>}
+        {modelGroupId && !modelListReady ? (scoped?.error ? <p className="note crit" role="alert">分组模型读取失败：{scoped.error}</p> : <p className="hint">正在读取分组模型…</p>) :
+          grants.length === 0 ? <p className="hint">{modelGroupId ? "此分组没有该租户可用的模型。" : "该租户还没有授权模型，请先在租户页授权。"}</p> : visible.length === 0 ? <p className="hint">没有匹配的模型</p> : <ul className="tn-checks tn-box key-model-options">{visible.map(model => <Check key={model.id} label={model.name} checked={selectedIds.has(model.id)} disabled={busy} onChange={checked => setModels(previous => checked ? [...previous, model.id] : previous.filter(id => id !== model.id))} error={at(`/model_ids/${sent?.model_ids?.indexOf(model.id) ?? -1}`)} />)}</ul>}
+        {unavailable.length > 0 && <><p className="hint">以下已选模型当前不可用，可取消勾选后保存：</p><ul className="tn-checks key-model-options">{unavailable.map(id => <Check key={id} label={`${names?.get(id) ?? id}（已不可用）`} checked disabled={busy} onChange={() => setModels(previous => previous.filter(value => value !== id))} />)}</ul></>}
         {models.length === 0 && initial && <p className="hint">未选择任何模型，此密钥将不能调用模型。</p>}
       </>}
       {modelScope === "patterns" && <TextField label="模型名称模式" value={patterns} onChange={setPatterns} disabled={busy} placeholder="例如 gpt-4o*, claude-*" hint="多个模式用逗号或空格分开。留空将不授权任何模型；不限制请选择上方选项。" error={patternsError || undefined} />}
@@ -754,7 +781,7 @@ function CreateForm({ tenant, names, catalogError, choices, onMinted, onCancel, 
     {refused?.tooOld ? <GatewayTooOld error={refused.tooOld} /> : refused?.general && <div className="note crit col-span-full" role="alert">{refused.general}</div>}
     <div className="tn-foot right col-span-full">
       <Button type="button" disabled={busy} onClick={onCancel}>{initial ? "返回列表" : "取消"}</Button>
-      {initial ? <Button kind="primary" type="submit" disabled={busy} busy={busy}>保存配置</Button> : <TwoStep label="创建" kind="primary" disabled={busy || group === ""} busy={busy} ask={() => group !== "" && !(choices.find(choice => choice.name === group)?.accounts.length ?? 0)} warning={unreachableWarning(choices.filter(choice => choice.name === group).map(choice => choice.display_name), "这个密钥")} onConfirm={() => void submit()} />}
+      {initial ? <Button kind="primary" type="submit" disabled={busy || waitingForModels} busy={busy}>保存配置</Button> : <TwoStep label="创建" kind="primary" disabled={busy || group === "" || waitingForModels} busy={busy} ask={() => group !== "" && !(choices.find(choice => choice.name === group)?.accounts.length ?? 0)} warning={unreachableWarning(choices.filter(choice => choice.name === group).map(choice => choice.display_name), "这个密钥")} onConfirm={() => void submit()} />}
     </div>
   </form>;
 }

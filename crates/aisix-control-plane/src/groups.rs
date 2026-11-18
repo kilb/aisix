@@ -990,9 +990,41 @@ pub async fn make_default(
     Ok(Json(answer))
 }
 
+/// 管理员建钥匙时可选择的组内模型。
+pub async fn model_options(
+    auth: OperatorAuth,
+    State(state): State<AppState>,
+    Path(raw): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    auth.require(OperatorRole::Viewer)?;
+    let mut conn = state.db.pool().acquire().await.map_err(DbError::from)?;
+    let group = read_one(&mut conn, group_id(&raw)?).await?;
+    if group.retired_at.is_some() {
+        return Err(ApiError::not_found());
+    }
+    crate::channels::model_options(&mut conn, Some(&group.name), None).await
+}
+
+/// 租户可选分组与门户的分组列表相同。未分配、已停用和不存在的分组返回相同错误。
+pub(crate) async fn model_group_name(
+    conn: &mut PgConnection,
+    tenant: &TenantRow,
+    raw: &str,
+) -> Result<String, ApiError> {
+    let id = Uuid::parse_str(raw).map_err(|_| group_unavailable())?;
+    sqlx::query_scalar(
+        "SELECT name FROM provider_groups WHERE id = $1 AND retired_at IS NULL AND name = ANY($2)",
+    )
+    .bind(id)
+    .bind(&tenant.allowed_provider_groups)
+    .fetch_optional(conn)
+    .await
+    .map_err(DbError::from)?
+    .ok_or_else(group_unavailable)
+}
+
 /// `GET /admin/provider-groups/{id}/rates` → `{group, default, models:
-/// [{model_id, name, rate}]}`, over every live model but a channel's
-/// generated direct document, which is priced through its public model.
+/// [{model_id, name, rate}], unavailable_models}`. 已离组但仍有覆盖或预约的模型可继续管理。
 pub async fn list_rates(
     auth: OperatorAuth,
     State(state): State<AppState>,
@@ -1011,16 +1043,50 @@ pub async fn list_rates(
                 let default = rates::rate_plan(&mut *conn, id, None).await?;
                 // A channel's generated direct document takes no rate of its
                 // own (`rates::insert_group_rate`), so it is not offered one.
-                let models = crate::channels::priceable_models(&mut *conn).await?;
+                let models =
+                    crate::channels::selectable_models(&mut *conn, Some(&row.name), None).await?;
+                // 曾有覆盖的公共模型失去最后一个渠道后，仍可查看和结束覆盖。
+                let available_ids: Vec<Uuid> = models.iter().map(|(id, _)| *id).collect();
+                let previous: Vec<(Uuid, String)> = sqlx::query_as(
+                    "SELECT DISTINCT p.id, p.name FROM pricing_group_rates gr \
+                     JOIN public_models p ON p.id = gr.model_id AND p.retired_at IS NULL \
+                     WHERE gr.group_id = $1 AND NOT (p.id = ANY($2)) ORDER BY p.name, p.id",
+                )
+                .bind(id)
+                .bind(&available_ids)
+                .fetch_all(&mut *conn)
+                .await
+                .map_err(DbError::from)?;
                 let mut items = Vec::with_capacity(models.len());
-                for (model_id, name) in models {
+                let mut unavailable = Vec::new();
+                let candidates = models
+                    .into_iter()
+                    .map(|row| (row, true))
+                    .chain(previous.into_iter().map(|row| (row, false)));
+                for ((model_id, name), available) in candidates {
                     let rate = rates::rate_plan(&mut *conn, id, Some(model_id)).await?;
-                    items.push(json!({"model_id": model_id, "name": name, "rate": rate}));
+                    if !available
+                        && rate
+                            .current
+                            .as_ref()
+                            .and_then(|r| r.cny_per_usd.as_ref())
+                            .is_none()
+                        && rate.upcoming.is_empty()
+                    {
+                        continue;
+                    }
+                    let item = json!({"model_id": model_id, "name": name, "rate": rate});
+                    if available {
+                        items.push(item);
+                    } else {
+                        unavailable.push(item);
+                    }
                 }
                 Ok::<_, ApiError>(json!({
                     "group": group,
                     "default": default,
                     "models": items,
+                    "unavailable_models": unavailable,
                 }))
             }
             .boxed()

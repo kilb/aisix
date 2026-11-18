@@ -195,15 +195,47 @@ pub async fn is_generated_direct(conn: &mut PgConnection, model_id: Uuid) -> Res
 /// same test as [`generated_direct_of`] in SQL. The baseline list, a group's
 /// rate list and the charge list read it.
 pub async fn priceable_models(conn: &mut PgConnection) -> Result<Vec<(Uuid, String)>, DbError> {
+    selectable_models(conn, None, None).await
+}
+
+/// 指定分组后，公共模型必须有该组可用的渠道；手工管理的模型沿用原有目录。
+/// 租户授权是额外的交集，生成的直连模型只通过其公共模型对外提供。
+pub(crate) async fn selectable_models(
+    conn: &mut PgConnection,
+    group: Option<&str>,
+    grants: Option<&[Uuid]>,
+) -> Result<Vec<(Uuid, String)>, DbError> {
     Ok(sqlx::query_as(
         "SELECT r.id, COALESCE(r.doc->>'display_name', '') FROM gw_resources r \
+         LEFT JOIN public_models p ON p.id = r.id \
          WHERE r.kind = $1 AND NOT r.deleted \
+           AND ($2::uuid[] IS NULL OR r.id = ANY($2)) \
            AND NOT EXISTS (SELECT 1 FROM channel_models cm WHERE cm.direct_model_id = r.id) \
+           AND ($3::text IS NULL OR p.id IS NULL OR (p.enabled AND p.retired_at IS NULL AND EXISTS ( \
+               SELECT 1 FROM channel_models cm JOIN gw_resources pk \
+                 ON pk.kind = 'provider_keys' AND pk.id = cm.provider_key_id AND NOT pk.deleted \
+               WHERE cm.public_model_id = p.id AND cm.enabled AND pk.doc->'groups' ? $3 \
+                 AND pk.doc->'disabled' IS DISTINCT FROM 'true'::jsonb))) \
          ORDER BY 2, 1",
     )
     .bind(Kind::Models.segment())
+    .bind(grants)
+    .bind(group)
     .fetch_all(conn)
     .await?)
+}
+
+pub(crate) async fn model_options(
+    conn: &mut PgConnection,
+    group: Option<&str>,
+    grants: Option<&[Uuid]>,
+) -> Result<Json<Value>, ApiError> {
+    let items: Vec<_> = selectable_models(conn, group, grants)
+        .await?
+        .into_iter()
+        .map(|(id, name)| json!({ "id": id, "name": name }))
+        .collect();
+    Ok(Json(json!({ "items": items })))
 }
 
 /// The direct model document for one channel model.

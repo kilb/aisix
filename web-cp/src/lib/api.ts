@@ -1794,6 +1794,8 @@ export interface GroupRates {
   group: Group;
   default: RatePlan;
   models: { model_id: string; name: string; rate: RatePlan }[];
+  /** 已离组且仍有现行覆盖或预约的模型。 */
+  unavailable_models?: GroupRates["models"];
 }
 
 /** What a group charges for one model: its rate in force and, with a baseline, the ¥/M that follows. */
@@ -1842,7 +1844,10 @@ export const groups = {
   async makeDefault(id: string): Promise<Group> {
     return (await call<Group>("POST", `/admin/provider-groups/${seg(id)}/make-default`, {})).data;
   },
-  /** Every live model's rate in the group, by model name. */
+  async models(id: string, signal?: AbortSignal): Promise<{ id: string; name: string }[]> {
+    return (await call<{ items: { id: string; name: string }[] }>("GET", `/admin/provider-groups/${seg(id)}/models`, undefined, undefined, signal)).data.items;
+  },
+  /** Models available to the group and their rates, by model name. */
   async rates(id: string): Promise<GroupRates> {
     return (await call<GroupRates>("GET", `/admin/provider-groups/${seg(id)}/rates`)).data;
   },

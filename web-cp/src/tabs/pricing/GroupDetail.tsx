@@ -136,11 +136,14 @@ export function GroupDetail({
 
   // A model with no baseline cannot be priced at any rate, so those come first:
   // they are what an operator opens this page to find.
-  const rows = rates ? [...rates.models].sort((a, b) => {
+  const availableRows = rates ? [...rates.models].sort((a, b) => {
     const ap = prices.get(a.model_id)?.baseline.current ? 1 : 0;
     const bp = prices.get(b.model_id)?.baseline.current ? 1 : 0;
     return ap - bp || a.name.localeCompare(b.name);
   }) : [];
+  const unavailableRows = rates?.unavailable_models ?? [];
+  const unavailableIds = new Set(unavailableRows.map(row => row.model_id));
+  const rows = [...availableRows, ...unavailableRows];
   const [priceState, setPriceState] = useState("");
   const records = useRecordTable({
     items: rows.filter((row) => priceState === "" || (priceState === "baseline" ? Boolean(prices.get(row.model_id)?.baseline.current) : priceState === "missing" ? !prices.get(row.model_id)?.baseline.current : row.rate.current?.cny_per_usd != null)),
@@ -173,13 +176,13 @@ export function GroupDetail({
       </>
     ) : null;
   const later = scheduledWords(group.default_rate, "默认");
-  const unpriced = rows.filter((row) => !prices.get(row.model_id)?.baseline.current).length;
+  const unpriced = availableRows.filter((row) => !prices.get(row.model_id)?.baseline.current).length;
 
   return (
     <div className="grp-detail" role="region" aria-label={`分组 ${group.display_name}`}>
       <PageHeader
         eyebrow="价格 / 分组明细"
-        dataLead={rates ? `${group.display_name} 的 ${fmtInt(rows.length)} 个模型中，${fmtInt(unpriced)} 个缺少现行基准价。` : "读取分组模型换算率与最近 30 天毛利。"}
+        dataLead={rates ? `${group.display_name} 的 ${fmtInt(availableRows.length)} 个可用模型中，${fmtInt(unpriced)} 个缺少现行基准价。` : "读取分组模型换算率与最近 30 天毛利。"}
         title={
           <span className="inline-flex flex-wrap items-center gap-x-3 gap-y-1">
             <span className="min-w-0 break-all">{group.display_name}</span>
@@ -216,7 +219,7 @@ export function GroupDetail({
         <Card tone="inverse" className={span.d5Wide}>
           <CardHeader number={2} title="缺少现行基准价的模型" />
           {rates ? <Metric size="display">{fmtInt(unpriced)}</Metric> : error ? <CardMessage onRetry={() => void load()}>数据读取失败</CardMessage> : <MetricSkeleton />}
-          <p className="mt-4 text-caption text-on-inverse-muted">范围：此分组全部 {rates ? fmtInt(rows.length) : "—"} 个模型。未定价模型排在明细最前。</p>
+          <p className="mt-4 text-caption text-on-inverse-muted">范围：此分组 {rates ? fmtInt(availableRows.length) : "—"} 个可用模型。未定价模型排在明细最前。</p>
           <p className="mt-6 border-t border-surface/12 pt-4 text-caption text-on-inverse-muted">毛利明细只覆盖最近 30 天；已知成本与成本未知收入分开列出。</p>
         </Card>
       </BentoGrid>
@@ -270,6 +273,7 @@ export function GroupDetail({
                         <span className="trunc" title={row.name}>
                           {row.name}
                         </span>
+                        {unavailableIds.has(row.model_id) && <span className="cell-note">当前分组不可用</span>}
                       </td>
                       <td data-label="基准价 输入" className="num">
                         {!baseline ? <span className="grp-unpriced">未定价</span> : head?.input ? `$${head.input} / 百万 tokens` : "—"}

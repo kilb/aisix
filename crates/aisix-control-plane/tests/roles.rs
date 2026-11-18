@@ -107,10 +107,7 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
             path.replace("{id}", &Uuid::nil().to_string()),
             Some(json!({})),
         ),
-        ("GET", "/admin/provider-groups/{id}/rates") => (
-            format!("/admin/provider-groups/{}/rates", Uuid::nil()),
-            None,
-        ),
+        ("GET", "/admin/provider-groups/{id}/rates") | ("GET", "/admin/provider-groups/{id}/models") => (path.replace("{id}", &Uuid::nil().to_string()), None),
         ("POST", "/admin/provider-groups/{id}/rates") => (
             format!("/admin/provider-groups/{}/rates", Uuid::nil()),
             Some(json!({"model_id": null, "cny_per_usd": "7.2", "effective_from": chrono::Utc::now()})),

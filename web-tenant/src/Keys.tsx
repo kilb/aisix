@@ -510,7 +510,7 @@ function capHint(cap: number | undefined, caps: Caps | null): string {
 export function KeyForm({
   me,
   manager,
-  catalog,
+  catalog: orgCatalog,
   groups,
   caps,
   people,
@@ -545,6 +545,10 @@ export function KeyForm({
   // with the key and never changed afterwards.
   const [group, setGroup] = useState(initial?.group?.id ?? "");
   const [modelScope, setModelScope] = useState<"inherited" | "selected">(initial && initial.model_ids !== null ? "selected" : "inherited");
+  const [groupModels, setGroupModels] = useState<{ group: string; items: PortalModel[] | null; error: string | null } | null>(null);
+  const [modelRetry, setModelRetry] = useState(0);
+  const currentGroupModels = groupModels?.group === group ? groupModels : null;
+  const catalog = group ? currentGroupModels?.items ?? null : orgCatalog;
   const [modelSearch, setModelSearch] = useState("");
   const [picked, setPicked] = useState<string[]>(initial?.model_ids ?? []);
   const [concurrency, setConcurrency] = useState(initial?.rate_limit.concurrency?.toString() ?? "");
@@ -559,6 +563,9 @@ export function KeyForm({
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [form, focusRefusal] = useRefusalFocus<HTMLFormElement>();
+  // 已有密钥即使分组停用或目录载入失败，也可以保存其他字段。
+  const needsGroupModels = group !== "" && modelScope === "selected" && catalog === null
+    && (!initial || picked.some(id => !initial.model_ids?.includes(id)));
   const noModels = !initial && modelScope === "selected" && picked.length === 0;
   const modelsEmptyMessage = "请至少选择一个模型，或改为不限制模型";
 
@@ -568,8 +575,23 @@ export function KeyForm({
     if (!initial?.group && groups !== null && groups.length === 1) setGroup(groups[0]?.id ?? "");
   }, [groups, initial?.group]);
 
+  useEffect(() => {
+    if (!group) return;
+    let current = true;
+    void modelApi.list(group).then(items => {
+      if (!current) return;
+      const keep = new Set([...items.map(model => model.id), ...(initial?.model_ids ?? [])]);
+      setPicked(previous => previous.filter(id => keep.has(id)));
+      setGroupModels({ group, items, error: null });
+    }, error => {
+      if (current) setGroupModels({ group, items: null, error: failure(error) });
+    });
+    return () => { current = false; };
+  }, [group, initial?.model_ids, modelRetry]);
+
   async function submit(e: React.FormEvent) {
     e.preventDefault();
+    if (needsGroupModels) return;
     setErr(null);
     const found: FieldErrors = {};
     // The group is what the key is priced at, so it is never left to the
@@ -830,13 +852,18 @@ export function KeyForm({
                   {unavailableModels.length > 0 && <div className="picks key-model-cards [overflow-wrap:anywhere]">
                     {unavailableModels.map(modelId => <label key={modelId} className="pick min-w-0">
                       <input type="checkbox" checked onChange={() => setPicked(was => was.filter(value => value !== modelId))} />
-                      已不在组织授权内（{modelId}）
+                      {orgCatalog?.find(model => model.id === modelId)?.name ?? modelId}（当前不可用）
                     </label>)}
                   </div>}
-                  {catalog === null ? (
+                  {currentGroupModels?.error ? (
+                    <div className="field-problem" role="alert">
+                      分组模型读取失败：{currentGroupModels.error}{" "}
+                      <Button size="sm" onClick={() => { setGroupModels(null); setModelRetry(value => value + 1); }}>重试</Button>
+                    </div>
+                  ) : catalog === null ? (
                     <span className="hint">载入中…</span>
                   ) : catalog.length === 0 ? (
-                    <span className="hint">组织还没有获授权的模型</span>
+                    <span className="hint">{group ? "该分组暂无已授权的模型" : "组织还没有获授权的模型"}</span>
                   ) : visibleModels.length === 0 ? (
                     <span className="hint">没有匹配的模型</span>
                   ) : (
@@ -926,7 +953,7 @@ export function KeyForm({
             kind="primary"
             type="submit"
             busy={busy}
-            disabled={noGroup || noModels}
+            disabled={noGroup || noModels || needsGroupModels}
             disabledReason={noModels ? modelsEmptyMessage : undefined}
           >
             {initial ? "保存修改" : "新建密钥"}

@@ -1455,12 +1455,18 @@ pub async fn org(auth: MemberAuth, State(state): State<AppState>) -> Result<Json
     })))
 }
 
+#[derive(Deserialize)]
+pub struct ModelFilter {
+    pub group_id: Option<String>,
+}
+
 /// `GET /api/models` → `{items: [{id, name}]}`: the live models the tenant
 /// reaches through its model scope, by their platform name only, in name
 /// order.
 pub async fn models(
     auth: MemberAuth,
     State(state): State<AppState>,
+    query: Result<Query<ModelFilter>, QueryRejection>,
 ) -> Result<Json<Value>, ApiError> {
     auth.require_active()?;
     auth.require(&[
@@ -1471,21 +1477,17 @@ pub async fn models(
     ])?;
     let mut conn = state.db.pool().acquire().await.map_err(DbError::from)?;
     let tenant = tenants::find(&mut conn, auth.tenant_id).await?;
-    let rows: Vec<(Uuid, String)> = sqlx::query_as(
-        "SELECT r.id, COALESCE(r.doc->>'display_name', '') FROM gw_resources r \
-         WHERE r.kind = $2 AND NOT r.deleted AND r.id = ANY($1) \
-         ORDER BY 2, 1",
+    let Query(filter) = query.map_err(crate::usage::query_rejected)?;
+    let group = match filter.group_id {
+        Some(id) => Some(crate::groups::model_group_name(&mut conn, &tenant, &id).await?),
+        None => None,
+    };
+    crate::channels::model_options(
+        &mut conn,
+        group.as_deref(),
+        Some(&tenant.effective_model_ids),
     )
-    .bind(&tenant.effective_model_ids)
-    .bind(Kind::Models.segment())
-    .fetch_all(&mut *conn)
     .await
-    .map_err(DbError::from)?;
-    let items: Vec<Value> = rows
-        .into_iter()
-        .map(|(id, name)| json!({ "id": id, "name": name }))
-        .collect();
-    Ok(Json(json!({ "items": items })))
 }
 
 #[derive(Deserialize)]
