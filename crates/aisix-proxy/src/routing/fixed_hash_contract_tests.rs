@@ -124,7 +124,9 @@ fn account_disabled_preserves_fixed_owner_and_allows_normal_failover() {
     let ordinary = group(true);
     let headers = headers(0);
     let select = |group: &Arc<Model>| pick(&registry, &status, &snapshot, group, &headers, None);
+    registry.reconcile_snapshot(&snapshot);
     let before = select(&fixed).unwrap();
+    let pinned_online = snapshot.clone();
     let id = before[0].model.provider_key_id.as_deref().unwrap();
     let original = snapshot.provider_keys.get_by_id(id).unwrap();
     let mut changed = serde_json::to_value(&*original.value).unwrap();
@@ -134,10 +136,18 @@ fn account_disabled_preserves_fixed_owner_and_allows_normal_failover() {
         serde_json::from_value(changed).unwrap(),
         2,
     ));
+    registry.reconcile_snapshot(&snapshot);
     assert_eq!(
         select(&fixed).err().unwrap().status(),
         axum::http::StatusCode::SERVICE_UNAVAILABLE
     );
+    let offline_pool = registry.fixed_pools.iter().next().unwrap().value().clone();
+    let late = pick(&registry, &status, &pinned_online, &fixed, &headers, None).unwrap();
+    assert_eq!(late[0].id, before[0].id);
+    assert!(Arc::ptr_eq(
+        registry.fixed_pools.iter().next().unwrap().value(),
+        &offline_pool
+    ));
     let active = select(&ordinary).unwrap();
     assert!(!active.is_empty());
     assert!(active
@@ -146,6 +156,7 @@ fn account_disabled_preserves_fixed_owner_and_allows_normal_failover() {
     snapshot
         .provider_keys
         .insert(ResourceEntry::new(id, (*original.value).clone(), 3));
+    registry.reconcile_snapshot(&snapshot);
     assert_eq!(select(&fixed).unwrap()[0].id, before[0].id);
 }
 

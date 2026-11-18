@@ -2255,9 +2255,6 @@ pub(crate) fn resolve_attempt_models(
         {
             return Err(no_target_in_groups(virtual_name));
         }
-        if crate::dispatch::model_provider_disabled(snapshot, virtual_model) {
-            return Err(crate::dispatch::DISABLED_PROVIDER);
-        }
         if let Some(gate) = req.budget {
             gate.check_model(virtual_model)?;
         }
@@ -2421,10 +2418,13 @@ pub(crate) fn resolve_attempt_models(
             "routing model has no target that resolves to a Model".into(),
         ));
     }
-    candidates
-        .retain(|candidate| !crate::dispatch::model_provider_disabled(snapshot, &candidate.model));
-    if candidates.is_empty() {
-        return Err(crate::dispatch::DISABLED_PROVIDER);
+    if snapshot.provider_keys.has_routing_disabled() {
+        candidates.retain(|candidate| {
+            !crate::dispatch::model_provider_disabled(snapshot, &candidate.model)
+        });
+        if candidates.is_empty() {
+            return Err(crate::dispatch::DISABLED_PROVIDER);
+        }
     }
     // `weight: 0` takes a target out of rotation on the strategies that read
     // weight, which is how an operator drains one, as long as another

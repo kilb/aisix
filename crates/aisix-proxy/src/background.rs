@@ -72,9 +72,10 @@ impl CheckSchedule {
         snapshot: &AisixSnapshot,
         now: Instant,
     ) -> (Vec<Arc<ResourceEntry<Model>>>, Option<Instant>) {
+        let has_disabled = snapshot.provider_keys.has_routing_disabled();
         let checked = snapshot.models.matching_entries(|e| {
             enabled_check(&e.value).is_some()
-                && !dispatch::model_provider_disabled(snapshot, &e.value)
+                && !(has_disabled && dispatch::model_provider_disabled(snapshot, &e.value))
         });
         // A row that left and came back is checked as soon as it returns.
         let present: HashSet<&str> = checked.iter().map(|e| e.id.as_str()).collect();
@@ -204,7 +205,9 @@ async fn run_one(
     request_id: &str,
 ) {
     // 人工下架不属于探活失败；恢复时沿用账号原有的健康状态。
-    if dispatch::model_provider_disabled(&snapshot, model) {
+    if snapshot.provider_keys.has_routing_disabled()
+        && dispatch::model_provider_disabled(&snapshot, model)
+    {
         return;
     }
     let outcome = check_direct_model(&snapshot, &hub, id, model, cfg, request_id).await;

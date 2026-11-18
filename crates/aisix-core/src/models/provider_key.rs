@@ -723,6 +723,10 @@ pub enum StreamDoneMarker {
 }
 
 impl Resource for ProviderKey {
+    fn routing_disabled_filter() -> Option<fn(&Self) -> bool> {
+        Some(|account| account.disabled)
+    }
+
     fn id(&self) -> &str {
         &self.runtime_id
     }

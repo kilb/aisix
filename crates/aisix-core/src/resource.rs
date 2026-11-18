@@ -30,6 +30,14 @@ pub trait Resource: Send + Sync + 'static {
     /// `name → id` lookups and for duplicate-detection on create/update.
     fn name(&self) -> &str;
 
+    /// 为需要在路由前排除停用行的资源维护计数；其他种类无需建立索引。
+    fn routing_disabled_filter() -> Option<fn(&Self) -> bool>
+    where
+        Self: Sized,
+    {
+        None
+    }
+
     /// Prefix segment used for the etcd key (e.g. `"models"`, `"apikeys"`).
     /// Constant per type.
     fn kind() -> &'static str

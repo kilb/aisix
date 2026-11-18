@@ -65,6 +65,7 @@ pub struct ResourceTable<T: Resource> {
     /// emptiness checks on the hot path go through this counter
     /// instead — one relaxed load, O(1) regardless of shard count.
     count: AtomicUsize,
+    routing_disabled_count: AtomicUsize,
     /// Stamp bumped on every mutation of THIS table and carried across
     /// [`Clone`]. See [`ResourceTable::generation`].
     generation: AtomicU64,
@@ -80,11 +81,18 @@ impl<T: Resource> Clone for ResourceTable<T> {
     fn clone(&self) -> Self {
         let by_id = self.by_id.clone();
         let count = AtomicUsize::new(by_id.len());
+        let routing_disabled_count = T::routing_disabled_filter().map_or(0, |disabled| {
+            by_id
+                .iter()
+                .filter(|row| disabled(&row.value().value))
+                .count()
+        });
         Self {
             by_id,
             by_name: self.by_name.clone(),
             wildcards: self.wildcards.clone(),
             count,
+            routing_disabled_count: AtomicUsize::new(routing_disabled_count),
             generation: AtomicU64::new(self.generation.load(Ordering::Acquire)),
         }
     }
@@ -97,6 +105,7 @@ impl<T: Resource> Default for ResourceTable<T> {
             by_name: DashMap::new(),
             wildcards: DashMap::new(),
             count: AtomicUsize::new(0),
+            routing_disabled_count: AtomicUsize::new(0),
             // Empty and never mutated: an unconfigured kind keeps
             // generation 0 forever, so two empty tables compare equal
             // and no consumer rebuilds anything for them.
@@ -182,7 +191,15 @@ impl<T: Resource> ResourceTable<T> {
             // A rename off a wildcard name must not leave the old row behind.
             self.wildcards.remove(id.as_ref());
         }
-        if self.by_id.insert(id, entry).is_some() {
+        // 与 count 相同，新禁用行先计入，旧禁用行在替换后移出。
+        let disabled = T::routing_disabled_filter();
+        if disabled.is_some_and(|test| test(&entry.value)) {
+            self.routing_disabled_count.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(old) = self.by_id.insert(id, entry) {
+            if disabled.is_some_and(|test| test(&old.value)) {
+                self.routing_disabled_count.fetch_sub(1, Ordering::Relaxed);
+            }
             self.count.fetch_sub(1, Ordering::Relaxed);
         }
         self.bump_generation();
@@ -191,12 +208,20 @@ impl<T: Resource> ResourceTable<T> {
     /// Remove by id; also removes the matching name index entry.
     pub fn remove(&self, id: &str) -> Option<Arc<ResourceEntry<T>>> {
         let (_, entry) = self.by_id.remove(id)?;
+        if T::routing_disabled_filter().is_some_and(|disabled| disabled(&entry.value)) {
+            self.routing_disabled_count.fetch_sub(1, Ordering::Relaxed);
+        }
         self.wildcards.remove(id);
         self.count.fetch_sub(1, Ordering::Relaxed);
         let name = entry.value.name();
         self.by_name.remove_if(name, |_, v| v.as_ref() == id);
         self.bump_generation();
         Some(entry)
+    }
+
+    /// 账号都上架时，路由组可跳过整个候选停用检查。
+    pub fn has_routing_disabled(&self) -> bool {
+        self.routing_disabled_count.load(Ordering::Relaxed) != 0
     }
 
     pub fn get_by_id(&self, id: &str) -> Option<Arc<ResourceEntry<T>>> {
@@ -550,6 +575,36 @@ mod tests {
             },
             1,
         )
+    }
+
+    #[test]
+    fn disabled_account_count_tracks_clone_replace_remove_and_restore() {
+        use crate::ProviderKey;
+
+        let account = |id: &str, disabled: bool| {
+            let row: ProviderKey = serde_json::from_value(serde_json::json!({
+                "provider": "openai", "display_name": id, "api_key": "test", "disabled": disabled,
+            }))
+            .unwrap();
+            ResourceEntry::new(id, row, 1)
+        };
+        let table = ResourceTable::new();
+        table.insert(account("a", false));
+        table.insert(account("b", false));
+        assert!(!table.has_routing_disabled());
+        table.insert(account("a", true));
+        table.insert(account("a", true));
+        table.insert(account("b", true));
+        let copy = table.clone();
+        table.remove("a");
+        assert!(table.has_routing_disabled());
+        table.insert(account("b", false));
+        assert!(!table.has_routing_disabled());
+        assert!(!table.clone().has_routing_disabled());
+        copy.insert_arc(Arc::new(account("b", false)));
+        assert!(copy.has_routing_disabled());
+        copy.remove("a");
+        assert!(!copy.has_routing_disabled());
     }
 
     /// The wildcard index is a second index over the same rows, so the only

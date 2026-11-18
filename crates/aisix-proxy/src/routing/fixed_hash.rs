@@ -1,13 +1,19 @@
 use super::*;
 use std::sync::Arc;
 
+#[derive(Clone)]
+struct FixedTarget {
+    attempt: AttemptModel,
+    disabled: bool,
+}
+
 // 仅缓存配置账号池，不保存任何会话标识或会话归属。
 pub(super) struct FixedHashPool {
     owner: Arc<Model>,
     models_generation: u64,
     accounts_generation: u64,
     pub(super) allowed_groups: Vec<String>,
-    targets: Vec<AttemptModel>,
+    targets: Vec<FixedTarget>,
     selected_declarations: Vec<RoutingTarget>,
     known_tags: std::collections::HashSet<String>,
     ring: HashRing,
@@ -54,11 +60,14 @@ impl FixedHashPool {
             if !seen.insert(entry.id.clone()) {
                 continue;
             }
-            targets.push(AttemptModel {
-                id: entry.id.clone(),
-                model: entry.value.clone(),
-                priority: configured.priority_or_default(),
-                weight: configured.weight_or_default(),
+            targets.push(FixedTarget {
+                attempt: AttemptModel {
+                    id: entry.id.clone(),
+                    model: entry.value.clone(),
+                    priority: configured.priority_or_default(),
+                    weight: configured.weight_or_default(),
+                },
+                disabled: account.disabled,
             });
             // 环点以真实账号资源标识命名，展示别名不参与本模式的归属。
             declarations.push(RoutingTarget {
@@ -71,18 +80,19 @@ impl FixedHashPool {
             log_provider_group_refusal();
             return Err(ProxyError::ProviderGroupsPoolEmpty);
         }
-        let positive = targets.iter().any(|target| target.weight > 0);
+        let positive = targets.iter().any(|target| target.attempt.weight > 0);
         let priority = targets
             .iter()
-            .filter(|target| !positive || target.weight > 0)
-            .map(|target| target.priority)
+            .filter(|target| !positive || target.attempt.weight > 0)
+            .map(|target| target.attempt.priority)
             .max()
             .ok_or(ProxyError::ProviderUnavailable)?;
         let mut keep: Vec<_> = targets
             .iter()
             .enumerate()
             .filter_map(|(index, target)| {
-                (target.priority == priority && (!positive || target.weight > 0)).then_some(index)
+                (target.attempt.priority == priority && (!positive || target.attempt.weight > 0))
+                    .then_some(index)
             })
             .collect();
         if keep.is_empty() {
@@ -94,7 +104,7 @@ impl FixedHashPool {
             .iter()
             .any(|&i| !accounts.insert(&declarations[i].model))
         {
-            keep.sort_unstable_by(|&a, &b| targets[a].id.cmp(&targets[b].id));
+            keep.sort_unstable_by(|&a, &b| targets[a].attempt.id.cmp(&targets[b].attempt.id));
         }
         let selected_declarations: Vec<_> = keep
             .iter()
@@ -229,9 +239,10 @@ pub(super) fn resolve(
         .ok_or(ProxyError::ProviderUnavailable)?;
 
     // 从这里起只能检查选中的账号，任何拒绝都不能触发缩池重算。
-    if crate::dispatch::model_provider_disabled(snapshot, &selected.model) {
+    if selected.disabled {
         return Err(crate::dispatch::DISABLED_PROVIDER);
     }
+    let selected = &selected.attempt;
     if !selected.model.ip_allowed(req.source_ip) {
         return Err(ProxyError::ModelIpRestricted(name.to_string()));
     }
